@@ -1,0 +1,28 @@
+# build output
+/build/
+/out/
+*.obj
+*.lib
+*.dll
+*.pdb
+*.exp
+*.ilk
+
+# IDE / tooling
+.vs/
+.vscode/
+*.user
+CMakeUserPresets.json
+
+# vendored SDK binaries (commit headers/sources per each SDK's license; keep large
+# prebuilt binaries out unless intentionally vendoring them)
+/third_party/**/bin/
+/third_party/**/lib/
+
+# Unity binding build artifacts (the .dll is copied into Assets/Plugins by build)
+bindings/unity/**/Library/
+bindings/unity/**/Temp/
+bindings/unity/**/obj/
+
+# local config / surveyed data that shouldn't be shared verbatim
+*.local.json
