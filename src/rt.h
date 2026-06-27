@@ -71,5 +71,6 @@ void rt_commit         (RtCore* c);                   /* enqueue CMD_COMMIT + dr
 
 /* ---- audio thread: drain the command ring, then mix one block into `bus` ---- */
 void rt_render(RtCore* c, float* bus, uint32_t nframes, const BwTimestamp* ts);
+void rt_get_listener(RtCore* c, float p[3], float q[4]);   /* audio thread: active pose */
 
 #endif /* BW_RT_H */

@@ -49,6 +49,7 @@ add_library(bw_core OBJECT
   src/layout.c
   src/dbap.c
   src/align.c
+  src/binaural.c
   ${CJSON_C}
 )
 target_include_directories(bw_core PUBLIC src ${dr_wav_SOURCE_DIR} ${CJSON_INC})
@@ -141,6 +142,10 @@ if(BWAUDIO_BUILD_TESTS)
   add_executable(bw_dsp_test   test/dsp_test.c)
   target_link_libraries(bw_dsp_test PRIVATE bw_core)
   add_test(NAME dsp COMMAND bw_dsp_test)
+
+  add_executable(bw_monitor_test test/monitor_test.c)
+  target_link_libraries(bw_monitor_test PRIVATE bw_core)
+  add_test(NAME monitor COMMAND bw_monitor_test)
 
   # Optional: AddressSanitizer build of the sound test (M3 unload-safety / UAF check).
   option(BWAUDIO_ASAN "Build bw_sound_test with AddressSanitizer" OFF)

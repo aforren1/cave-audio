@@ -307,6 +307,13 @@ void rt_render(RtCore* c, float* bus, uint32_t nframes, const BwTimestamp* ts) {
     align_process(c->aligner, bus, nframes);   /* per-speaker gain trim + delay (output stage) */
 }
 
+/* Active listener pose, for the binaural monitor. Audio thread only (same thread as
+ * rt_render, which is the sole writer of the active fields) — no extra synchronization. */
+void rt_get_listener(RtCore* c, float p[3], float q[4]) {
+    memcpy(p, c->lis.p_active, sizeof(float) * 3);
+    memcpy(q, c->lis.q_active, sizeof(float) * 4);
+}
+
 /* ---- control-thread API (enqueue) ---- */
 
 uint32_t rt_source_create(RtCore* c) {

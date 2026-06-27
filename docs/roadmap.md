@@ -83,6 +83,21 @@ engines. Don't start with the engine bindings.
 - `bw_set_listener_pose` orientation feeds the monitor; array render ignores it.
 - **Done when:** the `binaural` profile produces a convincing headphone render of the
   array with no Dante hardware present, and `both` runs array+monitor concurrently.
+- **Status: ~done (first cut).** `binaural.c` is the head-oriented 26→stereo monitor —
+  each bus channel is a virtual speaker at its surveyed bearing from the listener,
+  projected onto the head's right axis and constant-power panned to L/R (a 1st-order
+  W/X ambisonic encode + two cardioid decoders). `engine.c` wires all three profiles:
+  `cave` (26→device), `binaural` (26→memory→2-ch device via the monitor), and `both`
+  (a 26-ch array sink + a 2-ch monitor sink sharing a double-buffer). The listener
+  quaternion drives the monitor; the array render ignores it. `bw_monitor_test` verifies
+  L/R directionality, median balance, and a 180° head turn flipping the image;
+  `bw_smoke` runs all three profile lifecycles end-to-end (offline sink). **Remaining for
+  full M5:** (1) the production HRTF decode — a higher-order ambisonic encode → single
+  ambisonics→binaural decode via **Steam Audio** (slots in behind `monitor_process`;
+  needs the SDK, unverifiable by ear here); (2) a real **stereo output backend** (WASAPI)
+  so binaural/both reach headphones — today the 2-ch sink is the offline null sink (or a
+  2-ch ASIO driver if one is registered). An interactive sokol scene is the natural way
+  to evaluate "convincing".
 
 ## M6 — OptiTrack ingest
 - `natnet.c`: off-wire NatNet consumer; `track_internal` path samples freshest pose

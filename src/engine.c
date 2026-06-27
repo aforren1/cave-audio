@@ -9,21 +9,44 @@
 #include "sink.h"
 #include "rt.h"
 #include "layout.h"
+#include "binaural.h"
 
 #include <stdlib.h>
 #include <string.h>
 
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>           /* InterlockedExchange for the 'both' buffer handoff */
+
 #define BW_VOICE_CAP 256       /* max simultaneous sources */
 #define BW_SOUND_CAP 256       /* max loaded sounds */
 
+/* The three profiles (docs/architecture.md):
+ *   cave     — render the 26-ch array straight to a 26-ch device (ASIO/DVS).
+ *   binaural — render the array into memory, decode to a 2-ch device (the monitor).
+ *   both     — array to a 26-ch device AND the monitor to a 2-ch device, concurrently.
+ * The monitor uses the listener's head orientation; the array render ignores it.
+ *
+ * NOTE: binaural/both assume the device(s) run at cfg.block_size (true for the null sink;
+ * a renegotiating ASIO device would need the scratch buffers resized). A real stereo output
+ * backend (WASAPI) is still TODO — today the 2-ch sink is ASIO (if a stereo driver opens) or
+ * the offline null sink. */
 struct BwEngine {
     BwConfig    cfg;
     int         started;
     const char* last_error;        /* points at errbuf or a literal; NULL when clean */
     char        errbuf[256];
+    BwProfile   profile;
 
-    BwSink*     sink;              /* device/offline sink; owns the audio thread */
     RtCore*     rt;               /* rings + voice/sound tables + mixer (rt.c) */
+    Monitor*    monitor;          /* binaural/both: 26->stereo decode */
+    uint32_t    cap;              /* scratch capacity in frames (== cfg.block_size) */
+
+    BwSink*     sink;             /* primary: cave 26ch / binaural 2ch / both array 26ch */
+    float*      scratch26;        /* binaural: 26-ch array render before the monitor */
+
+    BwSink*     sink_mon;         /* both: the monitor (2-ch) device */
+    float*      mon_buf[2];       /* both: stereo double-buffer (each 2*cap), array thread -> monitor thread */
+    volatile LONG mon_idx;        /* both: index of the latest published buffer */
 };
 
 static void set_error(BwEngine* e, const char* msg) {
@@ -32,10 +55,43 @@ static void set_error(BwEngine* e, const char* msg) {
     e->last_error = (msg && e->errbuf[0]) ? e->errbuf : msg;
 }
 
-/* The audio block (sink's audio thread): drain the command ring and mix into `bus`. */
-static void engine_render(void* user, float* bus, uint32_t nframes, const BwTimestamp* ts) {
+/* cave: the 26-ch array goes straight to the device. */
+static void render_cave(void* user, float* dev, uint32_t n, const BwTimestamp* ts) {
+    rt_render(((BwEngine*)user)->rt, dev, n, ts);
+}
+
+/* binaural: render the 26-ch array to scratch, then decode to the 2-ch device. */
+static void render_binaural(void* user, float* dev2, uint32_t n, const BwTimestamp* ts) {
     BwEngine* e = (BwEngine*)user;
-    rt_render(e->rt, bus, nframes, ts);
+    if (n > e->cap) n = e->cap;
+    rt_render(e->rt, e->scratch26, n, ts);
+    float p[3], q[4];
+    rt_get_listener(e->rt, p, q);
+    monitor_process(e->monitor, e->scratch26, p, q, dev2, n);
+}
+
+/* both, array thread: render the array to the 26-ch device, decode the monitor into the
+ * back buffer, and publish it for the monitor thread. */
+static void render_both_array(void* user, float* dev26, uint32_t n, const BwTimestamp* ts) {
+    BwEngine* e = (BwEngine*)user;
+    rt_render(e->rt, dev26, n, ts);
+    uint32_t m = (n > e->cap) ? e->cap : n;
+    LONG cur = e->mon_idx;
+    float p[3], q[4];
+    rt_get_listener(e->rt, p, q);
+    monitor_process(e->monitor, dev26, p, q, e->mon_buf[1 - cur], m);
+    InterlockedExchange(&e->mon_idx, 1 - cur);          /* publish (full barrier) */
+}
+
+/* both, monitor thread: play the latest published stereo buffer. */
+static void render_both_monitor(void* user, float* dev2, uint32_t n, const BwTimestamp* ts) {
+    BwEngine* e = (BwEngine*)user;
+    (void)ts;
+    uint32_t m = (n > e->cap) ? e->cap : n;
+    const float* src = e->mon_buf[e->mon_idx];          /* planar [L(cap), R(cap)] */
+    memset(dev2, 0, sizeof(float) * (size_t)n * 2);
+    memcpy(dev2,     src,            sizeof(float) * m); /* L */
+    memcpy(dev2 + n, src + e->cap,   sizeof(float) * m); /* R */
 }
 
 /* ---- lifecycle ---- */
@@ -47,31 +103,71 @@ BwEngine* bw_create(const BwConfig* cfg) {
     e->cfg = *cfg;
     if (e->cfg.sample_rate == 0) e->cfg.sample_rate = 48000;   /* sane defaults */
     if (e->cfg.block_size  == 0) e->cfg.block_size  = 256;
+    e->profile = e->cfg.profile;
     e->rt = rt_create(BW_VOICE_CAP, BW_SOUND_CAP, e->cfg.sample_rate, BW_CHANNELS);
     if (!e->rt) { free(e); return NULL; }
+
     /* Load the surveyed speaker geometry if given; otherwise keep the default grid. A load
-     * failure is non-fatal (engine usable with the default layout) but surfaces via
-     * bw_last_error. Done here, before bw_start, so the audio thread isn't running. */
+     * failure is non-fatal (usable with the default layout) but surfaces via bw_last_error.
+     * Done here, before bw_start, so the audio thread isn't running. L is the effective
+     * layout (default or loaded) — the binaural monitor needs the same geometry. */
+    Layout L = layout_default();
     if (e->cfg.layout_path && e->cfg.layout_path[0]) {
-        Layout L;
         if (layout_load(e->cfg.layout_path, e->cfg.sample_rate, &L, e->errbuf, sizeof e->errbuf))
             rt_set_layout(e->rt, &L);
         else
             set_error(e, e->errbuf[0] ? e->errbuf : "bw_create: layout load failed");
     }
+    if (e->profile == BW_PROFILE_BINAURAL || e->profile == BW_PROFILE_BOTH) {
+        e->monitor = monitor_create(&L, e->cfg.sample_rate);
+        if (!e->monitor) { rt_destroy(e->rt); free(e); return NULL; }
+    }
     return e;
+}
+
+/* Close any open device(s) and free the start-time scratch. Monitor sink (consumer) first,
+ * then the array sink (producer), so the monitor thread stops reading mon_buf before we free
+ * it. Each bw_sink_close joins its audio thread. */
+static void engine_close_devices(BwEngine* e) {
+    if (e->sink_mon) { bw_sink_close(e->sink_mon); e->sink_mon = NULL; }
+    if (e->sink)     { bw_sink_close(e->sink);     e->sink     = NULL; }
+    free(e->scratch26);  e->scratch26  = NULL;
+    free(e->mon_buf[0]); e->mon_buf[0] = NULL;
+    free(e->mon_buf[1]); e->mon_buf[1] = NULL;
 }
 
 int bw_start(BwEngine* e) {
     if (!e) return 1;                                  /* BW_ERR_CONFIG (docs/api.md) */
     if (e->started) return 0;
     e->errbuf[0] = 0; e->last_error = NULL;
-    e->sink = bw_sink_open(e->cfg.sample_rate, e->cfg.block_size, BW_CHANNELS,
-                           engine_render, e, e->errbuf, sizeof e->errbuf);
-    if (!e->sink) { set_error(e, e->errbuf[0] ? e->errbuf : "bw_start: no audio sink"); return 2; /* BW_ERR_DEVICE */ }
-    if (bw_sink_start(e->sink) != 0) {
+    const uint32_t sr = e->cfg.sample_rate, bs = e->cfg.block_size;
+    e->cap = bs;
+
+    if (e->profile == BW_PROFILE_CAVE) {
+        e->sink = bw_sink_open(sr, bs, BW_CHANNELS, render_cave, e, e->errbuf, sizeof e->errbuf);
+    } else if (e->profile == BW_PROFILE_BINAURAL) {
+        e->scratch26 = (float*)calloc((size_t)bs * BW_CHANNELS, sizeof(float));
+        if (e->scratch26)
+            e->sink = bw_sink_open(sr, bs, 2, render_binaural, e, e->errbuf, sizeof e->errbuf);
+    } else { /* both: a 26-ch array sink + a 2-ch monitor sink sharing a double-buffer */
+        e->mon_buf[0] = (float*)calloc((size_t)bs * 2, sizeof(float));
+        e->mon_buf[1] = (float*)calloc((size_t)bs * 2, sizeof(float));
+        e->mon_idx = 0;
+        if (e->mon_buf[0] && e->mon_buf[1]) {
+            e->sink = bw_sink_open(sr, bs, BW_CHANNELS, render_both_array, e, e->errbuf, sizeof e->errbuf);
+            if (e->sink)
+                e->sink_mon = bw_sink_open(sr, bs, 2, render_both_monitor, e, e->errbuf, sizeof e->errbuf);
+        }
+    }
+
+    if (!e->sink || (e->profile == BW_PROFILE_BOTH && !e->sink_mon)) {
+        set_error(e, e->errbuf[0] ? e->errbuf : "bw_start: device open failed");
+        engine_close_devices(e);
+        return 2;                                       /* BW_ERR_DEVICE */
+    }
+    if (bw_sink_start(e->sink) != 0 || (e->sink_mon && bw_sink_start(e->sink_mon) != 0)) {
         set_error(e, "bw_start: sink failed to start");
-        bw_sink_close(e->sink); e->sink = NULL;
+        engine_close_devices(e);
         return 2;
     }
     e->started = 1;
@@ -80,14 +176,15 @@ int bw_start(BwEngine* e) {
 
 int bw_stop(BwEngine* e) {
     if (!e) return 1;
-    if (e->sink) { bw_sink_close(e->sink); e->sink = NULL; }   /* joins the audio thread */
+    engine_close_devices(e);                            /* joins the audio thread(s) */
     e->started = 0;
     return 0;
 }
 
 void bw_destroy(BwEngine* e) {
     if (!e) return;
-    if (e->sink) bw_sink_close(e->sink);                       /* stop audio before freeing rt */
+    engine_close_devices(e);                            /* stop audio before freeing rt/monitor */
+    monitor_destroy(e->monitor);
     rt_destroy(e->rt);
     free(e);
 }

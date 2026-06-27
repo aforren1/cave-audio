@@ -64,9 +64,9 @@ src/
   layout.h / layout.c  speaker geometry load (cave_layout.json via cJSON) + default grid. [M4]
   dbap.h / dbap.c      listener-relative, constant-power DBAP gain solve. [M4]
   align.h / align.c    per-speaker gain trim + delay-line output stage. [M4]
-  binaural.c           26->ambisonics->HRTF monitor (Steam Audio). [M5]
+  binaural.h/binaural.c  head-oriented 26->stereo monitor (Steam Audio HRTF is the upgrade). [M5]
   natnet.c             OptiTrack pose ingest (off-wire, see docs/build.md). [M6]
-test/                  bw_smoke, bw_audio_smoke, bw_rt_test, bw_sound_test, bw_dsp_test (layout/DBAP/align).
+test/                  bw_smoke (3 profiles), bw_audio_smoke, bw_rt_test, bw_sound_test, bw_dsp_test, bw_monitor_test.
 bindings/
   unity/               P/Invoke + BwAudio/BwEmitter (see docs/integration.md).
   unreal/              module + component.
@@ -88,16 +88,17 @@ cmake --build build --config RelWithDebInfo
 ctest --test-dir build -C RelWithDebInfo      # runs the bw_smoke lifecycle check
 ```
 
-**Current state (M4):** builds `bwaudio.dll` + five tests. `bw_start` opens a device sink
-(null/ASIO behind `sink.h`, `BWAUDIO_SINK=null|asio`) and runs the audio loop. `rt.c` is
-the concurrency spine (two SPSC rings, voice + sound tables, commit snapshot, generation
-handles) + retire-ack; the whole `bw_*` API forwards to it. `sound.c` decodes wav (dr_wav)
-and `mix_voice` plays `sound->pcm` with a gain ramp. **Spatialization is real now:**
-`layout.c` loads the surveyed geometry (`cave_layout.json` via cJSON, default grid
-otherwise), `dbap.c` is the listener-relative constant-power gain solve (dirty-gated in
-`compute_gains`), and `align.c` applies the per-speaker gain trim + delay after the mix.
-Still placeholder: the binaural monitor (M5) and OptiTrack ingest (M6). Do not bake ASIO
-assumptions outside `asio_sink.cpp`. The atomics in `rt.c` need `/experimental:c11atomics`
+**Current state (M5):** builds `bwaudio.dll` + six tests. `rt.c` is the concurrency spine
+(two SPSC rings, voice + sound tables, commit snapshot, generation handles) + retire-ack;
+the whole `bw_*` API forwards to it. `sound.c` decodes wav (dr_wav) and `mix_voice` plays
+`sound->pcm` with a gain ramp. Spatialization is real: `layout.c` loads the surveyed
+geometry, `dbap.c` is the listener-relative constant-power gain solve, `align.c` applies
+the per-speaker gain trim + delay. **`binaural.c` is the head-oriented 26→stereo monitor**,
+and `engine.c` wires all three profiles (`cave` 26→device, `binaural` 26→2ch via the
+monitor, `both` array+monitor on two sinks via a double-buffer). Remaining: the production
+Steam Audio HRTF decode + a real stereo output backend (WASAPI) — today binaural/both
+output to the null sink (no headphone playback yet); and OptiTrack ingest (M6). Do not bake
+ASIO assumptions outside `asio_sink.cpp`. The atomics in `rt.c` need `/experimental:c11atomics`
 on MSVC (wired in CMake); `-DBWAUDIO_ASAN=ON` builds `bw_sound_test` under ASan.
 
 ## What NOT to do
