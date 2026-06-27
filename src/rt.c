@@ -447,6 +447,8 @@ RtCore* rt_create(uint32_t voice_cap, uint32_t sound_cap, uint32_t sample_rate, 
     if (!c->voices || !c->gen || !c->inuse || !c->freelist || !c->sounds || !c->sfreelist) {
         rt_destroy(c); return NULL;
     }
+    c->lis.q_active[3]  = 1.0f;        /* default head orientation = identity (facing forward) */
+    c->lis.q_pending[3] = 1.0f;
     c->layout  = layout_default();
     c->aligner = align_create(channels, &c->layout);
     if (!c->aligner) { rt_destroy(c); return NULL; }

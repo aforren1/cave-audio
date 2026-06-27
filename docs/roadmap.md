@@ -94,10 +94,11 @@ engines. Don't start with the engine bindings.
   `bw_smoke` runs all three profile lifecycles end-to-end (offline sink). **Remaining for
   full M5:** (1) the production HRTF decode — a higher-order ambisonic encode → single
   ambisonics→binaural decode via **Steam Audio** (slots in behind `monitor_process`;
-  needs the SDK, unverifiable by ear here); (2) a real **stereo output backend** (WASAPI)
-  so binaural/both reach headphones — today the 2-ch sink is the offline null sink (or a
-  2-ch ASIO driver if one is registered). An interactive sokol scene is the natural way
-  to evaluate "convincing".
+  needs the SDK, unverifiable by ear here); (2) optionally a dedicated **WASAPI** stereo
+  backend — though live headphone output already works today through any 2-ch **ASIO**
+  driver (ASIO4ALL / FlexASIO / the registered Steinberg built-in), so a WASAPI backend is
+  a convenience, not a blocker. An interactive scene (raylib) is the natural way to evaluate
+  "convincing".
 
 ## M6 — OptiTrack ingest
 - `natnet.c`: off-wire NatNet consumer; `track_internal` path samples freshest pose

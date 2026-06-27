@@ -26,10 +26,10 @@
  *   both     — array to a 26-ch device AND the monitor to a 2-ch device, concurrently.
  * The monitor uses the listener's head orientation; the array render ignores it.
  *
- * NOTE: binaural/both assume the device(s) run at cfg.block_size (true for the null sink;
- * a renegotiating ASIO device would need the scratch buffers resized). A real stereo output
- * backend (WASAPI) is still TODO — today the 2-ch sink is ASIO (if a stereo driver opens) or
- * the offline null sink. */
+ * NOTE: the binaural/both monitor path is sized to cfg.block_size; a device block of a
+ * different size (a renegotiating ASIO device) renders silence for that block rather than
+ * garbage (the cave array renders any size). Live headphone output works through a 2-ch ASIO
+ * driver (ASIO4ALL / FlexASIO / the Steinberg built-in); a dedicated WASAPI backend is future. */
 struct BwEngine {
     BwConfig    cfg;
     int         started;
@@ -60,38 +60,41 @@ static void render_cave(void* user, float* dev, uint32_t n, const BwTimestamp* t
     rt_render(((BwEngine*)user)->rt, dev, n, ts);
 }
 
-/* binaural: render the 26-ch array to scratch, then decode to the 2-ch device. */
+/* binaural: render the 26-ch array to scratch, then decode to the 2-ch device. The scratch
+ * and the planar L/R layout are sized to cap (== block_size); a device block of a different
+ * size (a renegotiating ASIO device) outputs silence rather than garbage. */
 static void render_binaural(void* user, float* dev2, uint32_t n, const BwTimestamp* ts) {
     BwEngine* e = (BwEngine*)user;
-    if (n > e->cap) n = e->cap;
+    if (n != e->cap) { memset(dev2, 0, sizeof(float) * (size_t)n * 2); return; }
     rt_render(e->rt, e->scratch26, n, ts);
     float p[3], q[4];
     rt_get_listener(e->rt, p, q);
     monitor_process(e->monitor, e->scratch26, p, q, dev2, n);
 }
 
-/* both, array thread: render the array to the 26-ch device, decode the monitor into the
- * back buffer, and publish it for the monitor thread. */
+/* both, array thread: render the array to the 26-ch device (any block size), then — when the
+ * block matches cap — decode the monitor into the back buffer and publish it. */
 static void render_both_array(void* user, float* dev26, uint32_t n, const BwTimestamp* ts) {
     BwEngine* e = (BwEngine*)user;
     rt_render(e->rt, dev26, n, ts);
-    uint32_t m = (n > e->cap) ? e->cap : n;
-    LONG cur = e->mon_idx;
+    if (n != e->cap) return;                            /* off-spec block: skip the fixed-size monitor publish */
+    LONG cur = e->mon_idx;                              /* producer is the sole writer of mon_idx */
     float p[3], q[4];
     rt_get_listener(e->rt, p, q);
-    monitor_process(e->monitor, dev26, p, q, e->mon_buf[1 - cur], m);
-    InterlockedExchange(&e->mon_idx, 1 - cur);          /* publish (full barrier) */
+    monitor_process(e->monitor, dev26, p, q, e->mon_buf[1 - cur], n);
+    InterlockedExchange(&e->mon_idx, 1 - cur);          /* publish the back buffer (full barrier) */
 }
 
 /* both, monitor thread: play the latest published stereo buffer. */
 static void render_both_monitor(void* user, float* dev2, uint32_t n, const BwTimestamp* ts) {
     BwEngine* e = (BwEngine*)user;
     (void)ts;
-    uint32_t m = (n > e->cap) ? e->cap : n;
-    const float* src = e->mon_buf[e->mon_idx];          /* planar [L(cap), R(cap)] */
     memset(dev2, 0, sizeof(float) * (size_t)n * 2);
-    memcpy(dev2,     src,            sizeof(float) * m); /* L */
-    memcpy(dev2 + n, src + e->cap,   sizeof(float) * m); /* R */
+    if (n != e->cap) return;                            /* off-spec block: silence */
+    LONG cur = InterlockedCompareExchange(&e->mon_idx, 0, 0);  /* atomic acquire read of the index */
+    const float* src = e->mon_buf[cur];                 /* planar [L(cap), R(cap)], cap == n here */
+    memcpy(dev2,     src,          sizeof(float) * n);  /* L */
+    memcpy(dev2 + n, src + e->cap, sizeof(float) * n);  /* R */
 }
 
 /* ---- lifecycle ---- */

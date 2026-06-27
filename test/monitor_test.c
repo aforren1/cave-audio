@@ -59,14 +59,15 @@ int main(void) {
     decode_channel(m, left, ident);
     CHECK(e_left() > e_right() * 1.2, "left speaker is louder in the left ear");
 
-    /* 2. median-plane speaker -> balanced */
+    /* 2. median-plane speaker -> balanced, at the constant-power level (each ear = sqrt(0.5)) */
     decode_channel(m, center, ident);
     CHECK(fabs(e_left() - e_right()) < 0.01 * (e_left() + e_right()) + 1e-6, "median speaker is balanced L≈R");
+    CHECK(fabs(e_left() - (double)N * 0.70710678) < 0.02 * (double)N, "median decode at the constant-power level");
 
     /* 3. rotating the head 180° flips the right speaker to the left ear */
     decode_channel(m, right, yaw180);
     CHECK(e_left() > e_right() * 1.2, "head turned 180°: the right speaker now favors the left ear");
-    CHECK(fabs(e_left()  - rR) < 1e-4 && fabs(e_right() - rL) < 1e-4, "180° turn swaps L/R exactly");
+    CHECK(fabs(e_left()  - rR) < 1e-4 && fabs(e_right() - rL) < 1e-4, "180° turn swaps L/R (to float tolerance)");
 
     /* 4. finite + energy-bearing */
     decode_channel(m, right, ident);
