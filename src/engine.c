@@ -13,6 +13,7 @@
 #include <string.h>
 
 #define BW_VOICE_CAP 256       /* max simultaneous sources */
+#define BW_SOUND_CAP 256       /* max loaded sounds */
 
 struct BwEngine {
     BwConfig    cfg;
@@ -21,15 +22,8 @@ struct BwEngine {
     char        errbuf[256];
 
     BwSink*     sink;              /* device/offline sink; owns the audio thread */
-    RtCore*     rt;               /* rings + voice table + mixer (rt.c) */
-
-    uint32_t    next_sound;        /* M3: real sound handles; stub counter for now */
+    RtCore*     rt;               /* rings + voice/sound tables + mixer (rt.c) */
 };
-
-/* Sound handles are (index | generation<<16); the M2 stub uses gen 1. M3 replaces this. */
-static uint32_t make_sound_handle(uint32_t index) {
-    return (index & 0xFFFFu) | (1u << 16);
-}
 
 static void set_error(BwEngine* e, const char* msg) {
     if (!e) return;
@@ -52,8 +46,7 @@ BwEngine* bw_create(const BwConfig* cfg) {
     e->cfg = *cfg;
     if (e->cfg.sample_rate == 0) e->cfg.sample_rate = 48000;   /* sane defaults */
     if (e->cfg.block_size  == 0) e->cfg.block_size  = 256;
-    e->next_sound = 1;
-    e->rt = rt_create(BW_VOICE_CAP, e->cfg.sample_rate, BW_CHANNELS);
+    e->rt = rt_create(BW_VOICE_CAP, BW_SOUND_CAP, e->cfg.sample_rate, BW_CHANNELS);
     if (!e->rt) { free(e); return NULL; }
     return e;
 }
@@ -92,16 +85,18 @@ const char* bw_last_error(BwEngine* e) {
     return e ? e->last_error : NULL;
 }
 
-/* ---- assets (M3 implements real wav loading) ---- */
+/* ---- assets ---- */
 
 BwSound bw_load_sound(BwEngine* e, const char* path) {
-    (void)path;                 /* M3: dr_wav decode + buffer lifetime */
     if (!e) return 0;
-    return make_sound_handle(e->next_sound++);
+    e->errbuf[0] = 0;
+    BwSound snd = rt_load_sound(e->rt, path, e->errbuf, sizeof e->errbuf);
+    if (snd == 0) set_error(e, e->errbuf[0] ? e->errbuf : "bw_load_sound: failed");
+    return snd;
 }
 
 void bw_unload_sound(BwEngine* e, BwSound snd) {
-    (void)e; (void)snd;         /* M3: retire-ack handshake (docs/concurrency.md) */
+    if (e) rt_unload_sound(e->rt, snd);   /* safe any time; retire-acked internally */
 }
 
 /* ---- sources (forward to the rt core) ---- */
@@ -116,8 +111,7 @@ void bw_source_play(BwEngine* e, BwSource s, BwSound snd, bool loop)    { if (e)
 void bw_source_stop(BwEngine* e, BwSource s)                           { if (e) rt_source_stop(e->rt, s); }
 
 void bw_play_oneshot(BwEngine* e, BwSound snd, float x, float y, float z, float gain) {
-    (void)e; (void)snd; (void)x; (void)y; (void)z; (void)gain;
-    /* M3: allocate a transient voice, play, and auto-recycle it on EVT_VOICE_ENDED. */
+    if (e) rt_play_oneshot(e->rt, snd, x, y, z, gain);
 }
 
 /* ---- listener ---- */

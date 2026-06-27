@@ -3,9 +3,10 @@
 #
 # Milestones realized so far (docs/roadmap.md):
 #   M0 — builds/links a stub library.
-#   M1 — device-sink abstraction + audio loop: a null (offline) sink always, and the
-#        real ASIO backend when the Steinberg ASIO SDK is vendored under
-#        third_party/asiosdk/ (see third_party/README.md). DSP is still M2+.
+#   M1 — device-sink abstraction + audio loop (null sink always; ASIO when the SDK is
+#        vendored under third_party/asiosdk/, see third_party/README.md).
+#   M2 — concurrency spine in rt.c (SPSC rings, voice table, commit snapshot).
+#   M3 — wav playback (sound.c + dr_wav via FetchContent) + the retire-ack handshake.
 cmake_minimum_required(VERSION 3.20)
 project(bwaudio LANGUAGES C VERSION 0.0.1)
 
@@ -22,16 +23,26 @@ if(MSVC)
   add_compile_definitions(_CRT_SECURE_NO_WARNINGS)
 endif()
 
+# ---- dr_wav (single-header wav loader), fetched + pinned (not vendored in git) ----
+# Pinned to the wav-0.14.5 release commit. To bump: change the SHA. Offline builds can set
+# -DFETCHCONTENT_SOURCE_DIR_DR_WAV=<dir containing dr_wav.h> to use a local copy instead.
+include(FetchContent)
+FetchContent_Declare(dr_wav
+  URL https://raw.githubusercontent.com/mackron/dr_libs/fa931f3285ced10ace628f7f1ac951e1951e7ea6/dr_wav.h
+  DOWNLOAD_NO_EXTRACT TRUE)
+FetchContent_MakeAvailable(dr_wav)   # populates ${dr_wav_SOURCE_DIR}/dr_wav.h (no CMakeLists to add)
+
 # ---- core library (public C ABI in include/bwaudio.h) ----
 add_library(bwaudio SHARED
   src/engine.c
   src/rt.c
+  src/sound.c
   src/sink.c
   src/null_sink.c
 )
 target_include_directories(bwaudio
   PUBLIC  include
-  PRIVATE src)
+  PRIVATE src ${dr_wav_SOURCE_DIR})
 target_compile_definitions(bwaudio PRIVATE BW_BUILD_DLL)
 if(MSVC)
   target_compile_options(bwaudio PRIVATE /W4)
@@ -94,10 +105,22 @@ if(BWAUDIO_BUILD_TESTS)
   endif()
   add_test(NAME audio_sink COMMAND bw_audio_smoke)
 
-  # concurrency-spine check: drives the rt core off the RT path (compiles rt.c in)
-  add_executable(bw_rt_test test/rt_test.c src/rt.c)   # rt.c gets the atomics flag via its source property
-  target_include_directories(bw_rt_test PRIVATE src)
+  # concurrency-spine check: drives the rt core off the RT path (rt.c now needs sound.c)
+  add_executable(bw_rt_test test/rt_test.c src/rt.c src/sound.c)   # rt.c gets the atomics flag via its source property
+  target_include_directories(bw_rt_test PRIVATE src ${dr_wav_SOURCE_DIR})
   add_test(NAME rt COMMAND bw_rt_test)
+
+  # wav + mixing + retire-ack check: drives rt + sound off the RT path
+  add_executable(bw_sound_test test/sound_test.c src/rt.c src/sound.c)
+  target_include_directories(bw_sound_test PRIVATE src ${dr_wav_SOURCE_DIR})
+  add_test(NAME sound COMMAND bw_sound_test)
+  # Optional: build the sound test with AddressSanitizer to prove the unload-while-playing
+  # path is free of use-after-free (the M3 "done when"). Run: cmake -DBWAUDIO_ASAN=ON ...
+  option(BWAUDIO_ASAN "Build bw_sound_test with AddressSanitizer" OFF)
+  if(BWAUDIO_ASAN AND MSVC)
+    target_compile_options(bw_sound_test PRIVATE /fsanitize=address)
+    target_link_options(bw_sound_test PRIVATE /INCREMENTAL:NO)
+  endif()
 
   # keep the .dll next to the dll-linked test exe
   if(WIN32)

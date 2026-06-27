@@ -1,10 +1,12 @@
 /*
  * rt.c — real-time core. Two SPSC rings + voice table + commit snapshot + generation
- * handles, exactly as specified in docs/concurrency.md. The mixing is an M2 placeholder
- * (generated tone -> one position-derived channel, block-linear gain ramp); M3 swaps in
- * wav playback and M4 the DBAP 26-gain solve. Nothing here allocates/locks on rt_render.
+ * handles, exactly as specified in docs/concurrency.md, plus the Sound table and the
+ * retire-ack handshake. M3 mixes wav playback (mix_voice reads sound->pcm); routing is
+ * still the M2 placeholder (one position-derived channel) until M4's DBAP solve. Nothing
+ * here allocates/locks on rt_render.
  */
 #include "rt.h"
+#include "sound.h"
 
 #include <math.h>
 #include <stdatomic.h>
@@ -18,20 +20,18 @@
 
 #define RING_CAP 4096          /* power of two; sized for a worst-case frame burst */
 #define EVT_CAP  1024          /* power of two */
-#define TWO_PI   6.283185307179586
 
 typedef struct { Cmd slots[RING_CAP]; _Atomic uint32_t write, read; } CmdRing;
 typedef struct { Evt slots[EVT_CAP];  _Atomic uint32_t write, read; } EvtRing;
 
 typedef struct {
     uint16_t gen;
-    bool     active, playing, loop, dirty;
-    uint32_t sound;                         /* bound sound handle; M3: const Sound* */
-    uint32_t cursor;                        /* M3: sample cursor into the sound */
+    bool     active, playing, loop, dirty, oneshot;
+    const SoundData* sound;                 /* bound sound (NULL when idle); audio reads pcm */
+    uint32_t cursor;                        /* sample cursor into sound->pcm */
     float    pos_pending[3], pos_active[3];
     float    gain_user;
     float    gtarget[BW_CHANNELS], gcur[BW_CHANNELS];
-    double   phase;                         /* M2 placeholder oscillator state */
 } Voice;
 
 typedef struct {
@@ -39,19 +39,31 @@ typedef struct {
     float p_active[3],  q_active[4];
 } Listener;
 
+typedef struct {
+    SoundData data;
+    uint16_t  gen;
+    uint8_t   inuse;
+    uint8_t   retiring;                     /* unload requested; awaiting EVT_SOUND_RETIRED ack */
+} SoundSlot;
+
 struct RtCore {
     uint32_t voice_cap, channels, sample_rate;
     Voice*   voices;
     Listener lis;
     CmdRing  cmds;
     EvtRing  events;
-    double   dphase;                        /* M2 test tone: radians/sample */
 
-    /* control-thread-owned handle allocation */
-    uint16_t* gen;                          /* current generation per slot */
-    uint8_t*  inuse;                        /* 1 while a slot is allocated (double-free guard) */
-    uint32_t* freelist;                     /* stack of free indices */
+    /* control-thread-owned voice handle allocation */
+    uint16_t* gen;                          /* current generation per voice slot */
+    uint8_t*  inuse;                        /* 1 while a voice slot is allocated */
+    uint32_t* freelist;
     uint32_t  free_count;
+
+    /* control-thread-owned sound table + handle allocation */
+    SoundSlot* sounds;
+    uint32_t   sound_cap;
+    uint32_t*  sfreelist;
+    uint32_t   sfree_count;
 };
 
 /* ---- ring primitives ---- */
@@ -96,6 +108,34 @@ static void recycle_handle(RtCore* c, uint16_t idx) {
     }
 }
 
+/* sound-handle allocation (mirrors the voice allocator) */
+static uint32_t salloc_sound(RtCore* c) {
+    if (c->sfree_count == 0) return 0;
+    uint32_t idx = c->sfreelist[--c->sfree_count];
+    uint16_t g = (uint16_t)(c->sounds[idx].gen + 1);
+    if (g == 0) g = 1;
+    c->sounds[idx].gen = g;
+    c->sounds[idx].inuse = 1;
+    c->sounds[idx].retiring = 0;
+    return BW_MK_H(idx, g);
+}
+
+static void srecycle_sound(RtCore* c, uint16_t idx) {
+    if (idx < c->sound_cap && c->sounds[idx].inuse) {
+        c->sounds[idx].inuse = 0;
+        c->sounds[idx].retiring = 0;
+        c->sfreelist[c->sfree_count++] = idx;
+    }
+}
+
+/* control-thread resolve: the slot iff the handle is its current occupant */
+static SoundSlot* sound_slot_ctrl(RtCore* c, uint32_t h) {
+    uint16_t i = BW_H_IDX(h);
+    if (i >= c->sound_cap) return NULL;
+    SoundSlot* s = &c->sounds[i];
+    return (s->inuse && s->gen == BW_H_GEN(h)) ? s : NULL;
+}
+
 static void drain_events(RtCore* c) {                          /* control thread */
     EvtRing* r = &c->events;
     uint32_t rd = atomic_load_explicit(&r->read,  memory_order_relaxed);
@@ -103,8 +143,11 @@ static void drain_events(RtCore* c) {                          /* control thread
     for (; rd != w; ++rd) {
         const Evt* ev = &r->slots[rd & (EVT_CAP - 1)];
         switch (ev->type) {
-        case EVT_VOICE_ENDED:    recycle_handle(c, BW_H_IDX(ev->handle)); break; /* M3 emits these */
-        case EVT_SOUND_RETIRED:  /* M3: free the sound buffer here */          break;
+        case EVT_VOICE_ENDED:    recycle_handle(c, BW_H_IDX(ev->handle)); break;
+        case EVT_SOUND_RETIRED: {        /* audio dropped all refs: free pcm + recycle the slot */
+            SoundSlot* s = sound_slot_ctrl(c, ev->handle);
+            if (s) { sound_unload(&s->data); srecycle_sound(c, BW_H_IDX(ev->handle)); }
+        } break;
         }
     }
     atomic_store_explicit(&r->read, rd, memory_order_release);
@@ -117,6 +160,14 @@ static Voice* voice_for(RtCore* c, uint32_t h) {
     if (i >= c->voice_cap) return NULL;
     Voice* v = &c->voices[i];
     return (v->active && v->gen == BW_H_GEN(h)) ? v : NULL;    /* stale gen => dropped */
+}
+
+/* audio-thread resolve: handle -> published SoundData (NULL if stale/retired) */
+static const SoundData* sound_for(RtCore* c, uint32_t h) {
+    uint16_t i = BW_H_IDX(h);
+    if (i >= c->sound_cap) return NULL;
+    SoundSlot* s = &c->sounds[i];
+    return (s->inuse && s->gen == BW_H_GEN(h)) ? &s->data : NULL;
 }
 
 static void drain_commands(RtCore* c) {
@@ -133,14 +184,15 @@ static void drain_commands(RtCore* c) {
             v->active = true; v->gain_user = 1.f; v->dirty = true;
         } break;
         case CMD_SRC_DESTROY: { Voice* v = voice_for(c, cmd->handle);
-            if (v) { v->active = false; v->playing = false; v->sound = 0; } } break;
+            if (v) { v->active = false; v->playing = false; v->sound = NULL; } } break;
         case CMD_SET_POS: { Voice* v = voice_for(c, cmd->handle);
             if (v) memcpy(v->pos_pending, &cmd->u.pos, sizeof v->pos_pending); } break;
         case CMD_SET_GAIN: { Voice* v = voice_for(c, cmd->handle);
             if (v) { v->gain_user = cmd->u.gain.g; v->dirty = true; } } break;
         case CMD_PLAY: { Voice* v = voice_for(c, cmd->handle);
-            if (v) { v->sound = cmd->u.play.sound; v->cursor = 0; v->loop = cmd->u.play.loop != 0;
-                     v->playing = true; v->dirty = true; v->phase = 0.0; } } break;
+            const SoundData* s = sound_for(c, cmd->u.play.sound);
+            if (v && s) { v->sound = s; v->cursor = 0; v->loop = cmd->u.play.loop != 0;
+                          v->oneshot = cmd->u.play.oneshot != 0; v->playing = true; v->dirty = true; } } break;
         case CMD_STOP: { Voice* v = voice_for(c, cmd->handle);
             if (v) v->playing = false; } break;
         case CMD_SET_LISTENER:
@@ -162,8 +214,13 @@ static void drain_commands(RtCore* c) {
             }
         } break;
         case CMD_SOUND_RETIRE: {
-            /* M3 detaches voices referencing the sound, then acks. M2 has no sound table,
-             * so ack immediately to exercise the retire-ack path. */
+            /* Detach every voice still bound to this sound, then ack so the control thread
+             * frees the buffer exactly once the audio thread has provably let go. */
+            const SoundData* s = sound_for(c, cmd->handle);
+            if (s) {
+                for (uint32_t i = 0; i < c->voice_cap; ++i)
+                    if (c->voices[i].sound == s) { c->voices[i].playing = false; c->voices[i].sound = NULL; }
+            }
             Evt ev = { .type = EVT_SOUND_RETIRED, .handle = cmd->handle };
             evt_push(&c->events, &ev);
         } break;
@@ -181,25 +238,42 @@ static void compute_gains(RtCore* c, Voice* v) {
     v->gtarget[ch] = v->gain_user;
 }
 
-/* M2 placeholder for mix_voice: generated tone, per-channel block-linear gcur->gtarget
- * ramp (invariant 4). M3 replaces the tone with sound->pcm at v->cursor. */
-static void mix_voice(RtCore* c, Voice* v, float* bus, uint32_t n) {
+/* Mix one voice: read its sound at the cursor (looping or ending), spatialize through the
+ * per-channel block-linear gcur->gtarget ramp (invariant 4), and accumulate into the bus.
+ * Routing (gtarget) is still the M2 placeholder until M4. On a non-looping end the voice
+ * stops; a oneshot additionally acks EVT_VOICE_ENDED so the control thread recycles its
+ * transient handle. */
+static void mix_voice(RtCore* c, Voice* v, uint16_t idx, float* bus, uint32_t n) {
+    const SoundData* snd = v->sound;
     float step[BW_CHANNELS];
     for (uint32_t ch = 0; ch < c->channels; ++ch)
         step[ch] = (v->gtarget[ch] - v->gcur[ch]) / (float)n;
 
-    double phase = v->phase;
+    uint32_t cur = v->cursor;
+    bool ended = false;
     for (uint32_t i = 0; i < n; ++i) {
-        float s = (float)sin(phase);
-        phase += c->dphase;
-        if (phase >= TWO_PI) phase -= TWO_PI;
+        if (cur >= snd->frames) {
+            if (v->loop) cur = 0;
+            else         ended = true;
+        }
+        float s = ended ? 0.f : snd->pcm[cur];
+        if (!ended) ++cur;
         for (uint32_t ch = 0; ch < c->channels; ++ch) {
             bus[(size_t)ch * n + i] += v->gcur[ch] * s;
             v->gcur[ch] += step[ch];
         }
     }
-    v->phase = phase;
+    v->cursor = cur;
     for (uint32_t ch = 0; ch < c->channels; ++ch) v->gcur[ch] = v->gtarget[ch]; /* land exactly */
+
+    if (ended) {
+        v->playing = false;
+        if (v->oneshot) {
+            v->active = false;                 /* transient voice is finished */
+            Evt ev = { .type = EVT_VOICE_ENDED, .handle = BW_MK_H(idx, v->gen) };
+            evt_push(&c->events, &ev);
+        }
+    }
 }
 
 void rt_render(RtCore* c, float* bus, uint32_t nframes, const BwTimestamp* ts) {
@@ -214,9 +288,9 @@ void rt_render(RtCore* c, float* bus, uint32_t nframes, const BwTimestamp* ts) {
     memset(bus, 0, sizeof(float) * (size_t)nframes * c->channels);
     for (uint32_t i = 0; i < c->voice_cap; ++i) {
         Voice* v = &c->voices[i];
-        if (!v->active || !v->playing) continue;
+        if (!v->active || !v->playing || !v->sound) continue;
         if (v->dirty) { compute_gains(c, v); v->dirty = false; }
-        mix_voice(c, v, bus, nframes);
+        mix_voice(c, v, (uint16_t)i, bus, nframes);
     }
 }
 
@@ -256,8 +330,11 @@ void rt_source_set_gain(RtCore* c, uint32_t h, float linear) {
 }
 
 void rt_source_play(RtCore* c, uint32_t h, uint32_t sound, bool loop) {
+    SoundSlot* s = sound_slot_ctrl(c, sound);
+    if (!s || s->retiring) return;          /* invalid or being unloaded: drop the play so the
+                                             * audio thread can never bind a retiring sound */
     Cmd cmd = { .type = CMD_PLAY, .handle = h };
-    cmd.u.play.sound = sound; cmd.u.play.loop = loop ? 1u : 0u;
+    cmd.u.play.sound = sound; cmd.u.play.loop = loop ? 1u : 0u; cmd.u.play.oneshot = 0u;
     cmd_push(&c->cmds, &cmd);
 }
 
@@ -279,30 +356,80 @@ void rt_commit(RtCore* c) {
     drain_events(c);                    /* consume VOICE_ENDED / SOUND_RETIRED acks */
 }
 
+/* ---- assets (control thread; file I/O + alloc) ---- */
+
+uint32_t rt_load_sound(RtCore* c, const char* path, char* err, size_t errcap) {
+    SoundData d;
+    if (!sound_load(path, c->sample_rate, &d, err, errcap)) return 0;
+    uint32_t h = salloc_sound(c);
+    if (!h) {
+        sound_unload(&d);
+        if (err && errcap) { strncpy(err, "sound: table full", errcap - 1); err[errcap - 1] = 0; }
+        return 0;
+    }
+    c->sounds[BW_H_IDX(h)].data = d;     /* published to the audio thread when a CMD_PLAY references it */
+    return h;
+}
+
+void rt_unload_sound(RtCore* c, uint32_t sound) {
+    SoundSlot* s = sound_slot_ctrl(c, sound);
+    if (!s || s->retiring) return;       /* invalid or already retiring: idempotent no-op */
+    s->retiring = 1;                     /* refuse new binds (rt_source_play checks this) */
+    Cmd cmd = { .type = CMD_SOUND_RETIRE, .handle = sound };
+    cmd_push(&c->cmds, &cmd);            /* on ring-full the buffer lingers until rt_destroy */
+}
+
+/* Fire-and-forget: a transient voice that recycles itself on EVT_VOICE_ENDED. Its position
+ * takes effect on the next rt_commit (the engine's per-frame commit). */
+void rt_play_oneshot(RtCore* c, uint32_t sound, float x, float y, float z, float gain) {
+    SoundSlot* s = sound_slot_ctrl(c, sound);
+    if (!s || s->retiring) return;
+    if (!(isfinite(x) && isfinite(y) && isfinite(z) && isfinite(gain) && gain >= 0.f)) return;
+    uint32_t h = alloc_handle(c);
+    if (!h) return;
+    Cmd create = { .type = CMD_SRC_CREATE, .handle = h };
+    if (!cmd_push(&c->cmds, &create)) { recycle_handle(c, BW_H_IDX(h)); return; }
+    rt_source_set_pos(c, h, x, y, z);
+    rt_source_set_gain(c, h, gain);
+    Cmd play = { .type = CMD_PLAY, .handle = h };
+    play.u.play.sound = sound; play.u.play.loop = 0u; play.u.play.oneshot = 1u;
+    cmd_push(&c->cmds, &play);
+}
+
 /* ---- lifecycle ---- */
 
-RtCore* rt_create(uint32_t voice_cap, uint32_t sample_rate, uint32_t channels) {
-    if (voice_cap == 0 || voice_cap > 0xFFFFu ||
+RtCore* rt_create(uint32_t voice_cap, uint32_t sound_cap, uint32_t sample_rate, uint32_t channels) {
+    if (voice_cap == 0 || voice_cap > 0xFFFFu || sound_cap == 0 || sound_cap > 0xFFFFu ||
         channels  == 0 || channels  > BW_CHANNELS || sample_rate == 0)
         return NULL;
     RtCore* c = (RtCore*)calloc(1, sizeof *c);
     if (!c) return NULL;
     c->voice_cap   = voice_cap;
+    c->sound_cap   = sound_cap;
     c->channels    = channels;
     c->sample_rate = sample_rate;
-    c->dphase      = TWO_PI * 440.0 / (double)sample_rate;     /* M2 test tone: 440 Hz */
-    c->voices   = (Voice*)   calloc(voice_cap, sizeof(Voice));
-    c->gen      = (uint16_t*)calloc(voice_cap, sizeof(uint16_t));
-    c->inuse    = (uint8_t*) calloc(voice_cap, sizeof(uint8_t));
-    c->freelist = (uint32_t*)calloc(voice_cap, sizeof(uint32_t));
-    if (!c->voices || !c->gen || !c->inuse || !c->freelist) { rt_destroy(c); return NULL; }
+    c->voices    = (Voice*)    calloc(voice_cap, sizeof(Voice));
+    c->gen       = (uint16_t*) calloc(voice_cap, sizeof(uint16_t));
+    c->inuse     = (uint8_t*)  calloc(voice_cap, sizeof(uint8_t));
+    c->freelist  = (uint32_t*) calloc(voice_cap, sizeof(uint32_t));
+    c->sounds    = (SoundSlot*)calloc(sound_cap, sizeof(SoundSlot));
+    c->sfreelist = (uint32_t*) calloc(sound_cap, sizeof(uint32_t));
+    if (!c->voices || !c->gen || !c->inuse || !c->freelist || !c->sounds || !c->sfreelist) {
+        rt_destroy(c); return NULL;
+    }
     /* push indices so the first alloc hands out slot 0, then 1, ... */
-    for (uint32_t i = 0; i < voice_cap; ++i) c->freelist[c->free_count++] = voice_cap - 1 - i;
+    for (uint32_t i = 0; i < voice_cap; ++i) c->freelist[c->free_count++]   = voice_cap - 1 - i;
+    for (uint32_t i = 0; i < sound_cap; ++i) c->sfreelist[c->sfree_count++] = sound_cap - 1 - i;
     return c;
 }
 
 void rt_destroy(RtCore* c) {
     if (!c) return;
+    if (c->sounds)                                  /* free any pcm still loaded */
+        for (uint32_t i = 0; i < c->sound_cap; ++i)
+            if (c->sounds[i].inuse) sound_unload(&c->sounds[i].data);
+    free(c->sfreelist);
+    free(c->sounds);
     free(c->freelist);
     free(c->inuse);
     free(c->gen);

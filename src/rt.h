@@ -35,10 +35,10 @@ typedef struct {
     uint8_t  type;
     uint32_t handle;                 /* source or sound handle */
     union {
-        struct { float x, y, z; }                    pos;
-        struct { float g; }                          gain;
-        struct { uint32_t sound; uint8_t loop; }     play;
-        struct { float px, py, pz, qx, qy, qz, qw; } lis;
+        struct { float x, y, z; }                      pos;
+        struct { float g; }                            gain;
+        struct { uint32_t sound; uint8_t loop, oneshot; } play;
+        struct { float px, py, pz, qx, qy, qz, qw; }   lis;
     } u;
 } Cmd;
 
@@ -49,8 +49,12 @@ typedef struct { uint8_t type; uint32_t handle; } Evt;
 typedef struct RtCore RtCore;   /* opaque */
 
 /* ---- lifecycle (control thread; allocates) ---- */
-RtCore* rt_create(uint32_t voice_cap, uint32_t sample_rate, uint32_t channels);
+RtCore* rt_create(uint32_t voice_cap, uint32_t sound_cap, uint32_t sample_rate, uint32_t channels);
 void    rt_destroy(RtCore* c);
+
+/* ---- assets (control thread; file I/O + alloc) ---- */
+uint32_t rt_load_sound  (RtCore* c, const char* path, char* err, size_t errcap); /* 0 on failure */
+void     rt_unload_sound(RtCore* c, uint32_t sound);  /* safe any time; retire-acked internally */
 
 /* ---- control thread: handle allocation is synchronous, the rest enqueue ---- */
 uint32_t rt_source_create(RtCore* c);                 /* 0 if the table is full */
@@ -59,6 +63,7 @@ void rt_source_set_pos (RtCore* c, uint32_t h, float x, float y, float z);
 void rt_source_set_gain(RtCore* c, uint32_t h, float linear);
 void rt_source_play    (RtCore* c, uint32_t h, uint32_t sound, bool loop);
 void rt_source_stop    (RtCore* c, uint32_t h);
+void rt_play_oneshot   (RtCore* c, uint32_t sound, float x, float y, float z, float gain);
 void rt_set_listener   (RtCore* c, const float p[3], const float q[4]);
 void rt_commit         (RtCore* c);                   /* enqueue CMD_COMMIT + drain events */
 

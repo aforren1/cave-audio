@@ -41,7 +41,18 @@ The ASIO backend requires a driver exposing **≥26 output channels** (Dante Vir
 Soundcard in production). On a machine without one, `bw_asio_sink_open` rejects the
 driver and the engine uses the null sink.
 
+## dr_wav (wav loading, M3)
+
+**Not vendored here.** CMake fetches it via `FetchContent`, pinned to the **wav-0.14.5**
+release commit (`fa931f3285ced10ace628f7f1ac951e1951e7ea6`) — see the `dr_wav` block in
+`CMakeLists.txt`. dr_wav is public domain / MIT-0 and a single header; pinning to a commit
+keeps builds reproducible even though upstream `master` moves often. To bump the version,
+change the SHA. For an offline build, point CMake at a local copy:
+
+```sh
+cmake -S . -B build -DFETCHCONTENT_SOURCE_DIR_DR_WAV=/path/to/dir-containing-dr_wav.h ...
+```
+
 ## Later milestones
 
 - **Steam Audio** (M5, binaural) → `third_party/steamaudio/`
-- **dr_wav** (M3, wav loading) → `third_party/dr_wav.h`

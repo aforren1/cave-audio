@@ -60,18 +60,19 @@ src/
   sink.h / sink.c      device-sink abstraction + backend dispatch. [M1]
   null_sink.c          offline (no-hardware) sink: threaded silence + timestamps. [M1]
   asio_sink.cpp        ASIO host: driver load, bufferSwitch, sample-pos timestamp. [M1]
+  sound.h / sound.c    wav decode to mono float via dr_wav (Sound table lives in rt.c). [M3]
   binaural.c           26->ambisonics->HRTF monitor (Steam Audio). [M5]
   dbap.c               listener-relative gain solve. [M4]
   layout.c             speaker geometry load + per-speaker gain/delay alignment. [M4]
-  sound.c              wav load (dr_wav), buffer lifetime. [M3]
   natnet.c             OptiTrack pose ingest (off-wire, see docs/build.md). [M6]
-test/                  bw_smoke (lifecycle), bw_audio_smoke (audio loop), bw_rt_test (rings/commit).
+test/                  bw_smoke, bw_audio_smoke, bw_rt_test (rings/commit), bw_sound_test (wav/retire).
 bindings/
   unity/               P/Invoke + BwAudio/BwEmitter (see docs/integration.md).
   unreal/              module + component.
 docs/                  Specs. Start here.
 examples/              cave_layout.json (see docs/layout-schema.md).
-third_party/           asiosdk/ (GPLv3 option; fetch per third_party/README.md), steamaudio/, dr_wav.h
+third_party/           asiosdk/ (GPLv3 option, vendored), steamaudio/; dr_wav is fetched by
+                       CMake (FetchContent, pinned) — see third_party/README.md.
 ```
 
 ## Build
@@ -86,14 +87,16 @@ cmake --build build --config RelWithDebInfo
 ctest --test-dir build -C RelWithDebInfo      # runs the bw_smoke lifecycle check
 ```
 
-**Current state (M2):** builds `bwaudio.dll` + three tests. `bw_start` opens a device
+**Current state (M3):** builds `bwaudio.dll` + four tests. `bw_start` opens a device
 sink (null/ASIO behind `sink.h`, `BWAUDIO_SINK=null|asio`) and runs the audio loop.
-`rt.c` is the concurrency spine: two SPSC rings, the voice table, `drain_commands`, the
-staging→active commit snapshot, and generation-counted handles; the `bw_source_*` /
-`bw_set_listener_pose` / `bw_commit` API forwards to it. **The mixer is a placeholder**
-(a test tone routed to one position-derived channel with a gain ramp) until M3 (wav) and
-M4 (DBAP). Do not bake ASIO assumptions outside `asio_sink.cpp`. The atomics in `rt.c`
-need `/experimental:c11atomics` on MSVC (wired in CMake).
+`rt.c` is the concurrency spine (two SPSC rings, voice + sound tables, `drain_commands`,
+the staging→active commit snapshot, generation-counted handles) plus the retire-ack
+handshake; the whole `bw_*` per-frame + asset API forwards to it. `sound.c` decodes wav
+to mono float (dr_wav), and `mix_voice` plays `sound->pcm` with a per-block gain ramp.
+**Routing is still a placeholder** (one position-derived channel) until M4's DBAP solve.
+Do not bake ASIO assumptions outside `asio_sink.cpp`. The atomics in `rt.c` need
+`/experimental:c11atomics` on MSVC (wired in CMake); `-DBWAUDIO_ASAN=ON` builds
+`bw_sound_test` under AddressSanitizer for the unload-safety check.
 
 ## What NOT to do
 

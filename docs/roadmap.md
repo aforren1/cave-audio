@@ -49,6 +49,15 @@ engines. Don't start with the engine bindings.
 - `bw_load_sound`/`bw_play`/`bw_play_oneshot`.
 - **Done when:** multiple wav voices mix to chosen channels; unloading a playing
   sound is safe (no use-after-free, verified under ASan on the control side).
+- **Status: ✅ done.** `src/sound.c` decodes wav to mono float via dr_wav (fetched +
+  pinned, see third_party/README.md); `rt.c` gained the Sound table, generation-counted
+  sound handles, and the full retire-ack handshake (`bw_unload_sound` → `CMD_SOUND_RETIRE`
+  → audio detaches voices + acks `EVT_SOUND_RETIRED` → control frees the buffer).
+  `mix_voice` reads `sound->pcm` at the cursor (loop/end), and a oneshot recycles its
+  transient voice via `EVT_VOICE_ENDED`. Routing is still the M2 placeholder until M4.
+  `bw_sound_test` verifies multi-voice mixing, natural end, oneshot recycle, and
+  unload-while-playing — and **passes clean under AddressSanitizer** (`-DBWAUDIO_ASAN=ON`),
+  discharging the no-use-after-free criterion.
 
 ## M4 — DBAP + layout + alignment
 - `layout.c` (load surveyed geometry; per-speaker gain/delay), `dbap.c`
