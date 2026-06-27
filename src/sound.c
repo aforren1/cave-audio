@@ -30,6 +30,7 @@ bool sound_load(const char* path, uint32_t want_rate, SoundData* out, char* err,
     if (!interleaved)               { set_err(err, errcap, "sound: cannot open/decode wav"); return false; }
     if (channels == 0 || frames == 0) { drwav_free(interleaved, NULL); set_err(err, errcap, "sound: empty wav"); return false; }
     if (rate != want_rate)          { drwav_free(interleaved, NULL); set_err(err, errcap, "sound: sample-rate mismatch (no resampling)"); return false; }
+    if (frames > 0xFFFFFFFFu)        { drwav_free(interleaved, NULL); set_err(err, errcap, "sound: too many frames (>4G; SoundData.frames is 32-bit)"); return false; }
 
     float* mono = (float*)malloc((size_t)frames * sizeof(float));
     if (!mono) { drwav_free(interleaved, NULL); set_err(err, errcap, "sound: out of memory"); return false; }

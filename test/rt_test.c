@@ -62,6 +62,7 @@ static int fails = 0;
 int main(void) {
     const char* WAV = "bw_rt_const.wav";           /* constant 1.0 so peak == gain exactly */
     if (!write_const_wav(WAV, 1.0f, 8 * N)) { printf("FAIL: write wav\n"); return 1; }
+    CHECK(rt_create(1000, 1000, RATE, CH) == NULL, "rt_create rejects caps that could overflow the event ring");
     RtCore* c = rt_create(64, 8, RATE, CH);        /* voice_cap, sound_cap, rate, channels */
     CHECK(c != NULL, "rt_create");
     if (!c) { remove(WAV); return 1; }

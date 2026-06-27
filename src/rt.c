@@ -77,6 +77,14 @@ static bool cmd_push(CmdRing* r, const Cmd* c) {
     return true;
 }
 
+/* Free slots, from the producer's view. The audio thread only advances `read` (frees
+ * space), so once the single producer sees >= k free it can push k commands atomically. */
+static uint32_t cmd_free(const CmdRing* r) {
+    uint32_t w  = atomic_load_explicit(&r->write, memory_order_relaxed);
+    uint32_t rd = atomic_load_explicit(&r->read,  memory_order_acquire);
+    return RING_CAP - (w - rd);
+}
+
 static bool evt_push(EvtRing* r, const Evt* e) {              /* audio thread */
     uint32_t w  = atomic_load_explicit(&r->write, memory_order_relaxed);
     uint32_t rd = atomic_load_explicit(&r->read,  memory_order_acquire);
@@ -376,7 +384,7 @@ void rt_unload_sound(RtCore* c, uint32_t sound) {
     if (!s || s->retiring) return;       /* invalid or already retiring: idempotent no-op */
     s->retiring = 1;                     /* refuse new binds (rt_source_play checks this) */
     Cmd cmd = { .type = CMD_SOUND_RETIRE, .handle = sound };
-    cmd_push(&c->cmds, &cmd);            /* on ring-full the buffer lingers until rt_destroy */
+    if (!cmd_push(&c->cmds, &cmd)) s->retiring = 0;   /* ring full: revert so it can be retried */
 }
 
 /* Fire-and-forget: a transient voice that recycles itself on EVT_VOICE_ENDED. Its position
@@ -385,10 +393,15 @@ void rt_play_oneshot(RtCore* c, uint32_t sound, float x, float y, float z, float
     SoundSlot* s = sound_slot_ctrl(c, sound);
     if (!s || s->retiring) return;
     if (!(isfinite(x) && isfinite(y) && isfinite(z) && isfinite(gain) && gain >= 0.f)) return;
+    /* A oneshot enqueues 4 commands (CREATE/SET_POS/SET_GAIN/PLAY) that must all land, or
+     * the transient voice is created-but-never-played and leaks (it never ends -> never
+     * acks EVT_VOICE_ENDED -> never recycled). Reserve room for all 4 up front so a
+     * ring-full case drops the whole oneshot rather than half of it. */
+    if (cmd_free(&c->cmds) < 4) return;
     uint32_t h = alloc_handle(c);
     if (!h) return;
     Cmd create = { .type = CMD_SRC_CREATE, .handle = h };
-    if (!cmd_push(&c->cmds, &create)) { recycle_handle(c, BW_H_IDX(h)); return; }
+    cmd_push(&c->cmds, &create);              /* the 4 pushes are guaranteed by cmd_free >= 4 */
     rt_source_set_pos(c, h, x, y, z);
     rt_source_set_gain(c, h, gain);
     Cmd play = { .type = CMD_PLAY, .handle = h };
@@ -402,6 +415,11 @@ RtCore* rt_create(uint32_t voice_cap, uint32_t sound_cap, uint32_t sample_rate, 
     if (voice_cap == 0 || voice_cap > 0xFFFFu || sound_cap == 0 || sound_cap > 0xFFFFu ||
         channels  == 0 || channels  > BW_CHANNELS || sample_rate == 0)
         return NULL;
+    /* Bound the event ring: between two control-thread drains the audio thread emits at
+     * most one EVT_VOICE_ENDED per voice plus one EVT_SOUND_RETIRED per sound, so
+     * EVT_CAP >= voice_cap + sound_cap makes the event ring un-overflowable (acks can
+     * never be silently dropped on the audio thread). */
+    if ((uint64_t)voice_cap + sound_cap > EVT_CAP) return NULL;
     RtCore* c = (RtCore*)calloc(1, sizeof *c);
     if (!c) return NULL;
     c->voice_cap   = voice_cap;
