@@ -19,6 +19,10 @@ CMakeUserPresets.json
 /third_party/**/bin/
 /third_party/**/lib/
 
+# Steinberg ASIO SDK — fetched locally per third_party/README.md, not redistributed
+# through this repo. CMake auto-detects it at third_party/asiosdk/.
+/third_party/asiosdk/
+
 # Unity binding build artifacts (the .dll is copied into Assets/Plugins by build)
 bindings/unity/**/Library/
 bindings/unity/**/Temp/

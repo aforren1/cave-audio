@@ -9,17 +9,28 @@
  * docs/concurrency.md and will replace the placeholders below.
  */
 #include "bwaudio.h"
+#include "sink.h"
 
 #include <stdlib.h>
 #include <string.h>
 
+#define BW_CHANNELS 26             /* the array width; see docs/architecture.md */
+
 /* Opaque engine object. The real one (docs/internal-types.md) carries the rings,
- * voice table, bus, and layout; the stub only needs enough to be a valid handle. */
+ * voice table, bus, and layout; M1 adds the device sink + audio loop, but DSP
+ * (mixing/DBAP) is still M2+, so the block just emits silence. */
 struct BwEngine {
     BwConfig    cfg;
     int         started;
-    const char* last_error;     /* points at a static string; NULL when clean */
-    uint32_t    next_source;    /* hands out distinct, non-zero stub handles    */
+    const char* last_error;        /* points at errbuf or a literal; NULL when clean */
+    char        errbuf[256];
+
+    BwSink*     sink;              /* device/offline sink; owns the audio thread */
+    /* audio-thread diagnostics (written only by engine_render) */
+    uint64_t    blocks_rendered;
+    uint64_t    last_sample_pos;
+
+    uint32_t    next_source;       /* hands out distinct, non-zero stub handles */
     uint32_t    next_sound;
 };
 
@@ -29,32 +40,63 @@ static uint32_t make_handle(uint32_t index) {
     return (index & 0xFFFFu) | (1u << 16);
 }
 
+static void set_error(BwEngine* e, const char* msg) {
+    if (!e) return;
+    if (msg && msg != e->errbuf) { strncpy(e->errbuf, msg, sizeof e->errbuf - 1); e->errbuf[sizeof e->errbuf - 1] = 0; }
+    e->last_error = (msg && e->errbuf[0]) ? e->errbuf : msg;
+}
+
+/* The audio block. Runs on the sink's audio thread. M1: 26 channels of silence +
+ * timestamp capture. M2 drains the command ring here; M3+ mixes voices; the output
+ * stage (align_speakers) and the binaural tap follow (see docs/concurrency.md). */
+static void engine_render(void* user, float* bus, uint32_t nframes, const BwTimestamp* ts) {
+    BwEngine* e = (BwEngine*)user;
+    memset(bus, 0, sizeof(float) * (size_t)nframes * BW_CHANNELS);
+    e->last_sample_pos = ts->sample_pos;
+    e->blocks_rendered += 1;
+}
+
 /* ---- lifecycle ---- */
 
 BwEngine* bw_create(const BwConfig* cfg) {
     if (!cfg) return NULL;
     BwEngine* e = (BwEngine*)calloc(1, sizeof *e);
     if (!e) return NULL;
-    e->cfg        = *cfg;
+    e->cfg = *cfg;
+    if (e->cfg.sample_rate == 0) e->cfg.sample_rate = 48000;   /* sane defaults */
+    if (e->cfg.block_size  == 0) e->cfg.block_size  = 256;
     e->next_source = 1;
     e->next_sound  = 1;
     return e;
 }
 
 int bw_start(BwEngine* e) {
-    if (!e) return 1;           /* BW_ERR_CONFIG; see docs/api.md error codes */
-    e->started = 1;             /* no device opened yet (M1) */
+    if (!e) return 1;                                  /* BW_ERR_CONFIG (docs/api.md) */
+    if (e->started) return 0;
+    e->errbuf[0] = 0; e->last_error = NULL;
+    e->sink = bw_sink_open(e->cfg.sample_rate, e->cfg.block_size, BW_CHANNELS,
+                           engine_render, e, e->errbuf, sizeof e->errbuf);
+    if (!e->sink) { set_error(e, e->errbuf[0] ? e->errbuf : "bw_start: no audio sink"); return 2; /* BW_ERR_DEVICE */ }
+    if (bw_sink_start(e->sink) != 0) {
+        set_error(e, "bw_start: sink failed to start");
+        bw_sink_close(e->sink); e->sink = NULL;
+        return 2;
+    }
+    e->started = 1;
     return 0;
 }
 
 int bw_stop(BwEngine* e) {
     if (!e) return 1;
+    if (e->sink) { bw_sink_close(e->sink); e->sink = NULL; }
     e->started = 0;
     return 0;
 }
 
 void bw_destroy(BwEngine* e) {
-    free(e);                    /* free(NULL) is a no-op */
+    if (!e) return;
+    if (e->sink) bw_sink_close(e->sink);
+    free(e);
 }
 
 const char* bw_last_error(BwEngine* e) {

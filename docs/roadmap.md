@@ -13,10 +13,17 @@ engines. Don't start with the engine bindings.
   in CMake but vendoring is deferred until M1 actually needs ASIO.
 
 ## M1 — ASIO sink, silence
-- `asio_sink.c`: driver load → `ASIOCreateBuffers` → `ASIOStart`, writing 26 channels
+- `asio_sink.cpp`: driver load → `ASIOCreateBuffers` → `ASIOStart`, writing 26 channels
   of silence to DVS. Capture the sample-position/`systemTime` timestamp.
 - **Done when:** DVS shows 26 active output channels and a stable callback with no
   dropouts; timestamp advances monotonically.
+- **Status: ~done, pending DVS hardware.** A device-sink seam (`src/sink.h`) keeps ASIO
+  isolated; `asio_sink.cpp` implements the full bring-up against the vendored ASIO SDK
+  and **compiles, links, and runs** (driver load → init → channel-count check → graceful
+  fallback verified on real, non-DVS hardware). A `null_sink.c` offline backend runs the
+  same render loop with no hardware and **verifies the stable-callback + monotonic-
+  timestamp** criterion (`bw_audio_smoke`). The remaining piece — *26 active channels in
+  DVS with no dropouts* — needs a Dante Virtual Soundcard endpoint to confirm on site.
 
 ## M2 — Concurrency spine
 - Two SPSC rings, the voice table, `drain_commands`, the commit snapshot, generation

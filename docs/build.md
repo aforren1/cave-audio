@@ -77,6 +77,17 @@ time, which is lower-latency than marshaling pose through the engine each frame.
 
 Keep the callback allocation-free and lock-free per the invariants in `CLAUDE.md`.
 
+### Implementation note (M1)
+
+This sequence lives in `src/asio_sink.cpp`, behind the device-agnostic `src/sink.h`
+seam (so ASIO types never leak into the engine). It compiles only when the ASIO SDK is
+vendored — fetch it per [`../third_party/README.md`](../third_party/README.md); CMake
+auto-detects `third_party/asiosdk/` and prints `ASIO backend ENABLED`. Without it, the
+offline `null_sink.c` backend builds instead, so the library always builds and the audio
+loop is testable with no hardware. Pick a backend at runtime with `BWAUDIO_SINK`
+(`null` | `asio`; default is ASIO with null fallback). The ASIO backend rejects any
+driver exposing fewer than 26 output channels.
+
 ## Verify before shipping
 
 Several claims in these specs depend on third-party terms/APIs that move faster than this doc.
