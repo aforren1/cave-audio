@@ -14,7 +14,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-#define BW_CHANNELS 26             /* the array width; see docs/architecture.md */
+/* BW_CHANNELS (the array width) comes from sink.h. */
 
 /* Opaque engine object. The real one (docs/internal-types.md) carries the rings,
  * voice table, bus, and layout; M1 adds the device sink + audio loop, but DSP
@@ -26,9 +26,6 @@ struct BwEngine {
     char        errbuf[256];
 
     BwSink*     sink;              /* device/offline sink; owns the audio thread */
-    /* audio-thread diagnostics (written only by engine_render) */
-    uint64_t    blocks_rendered;
-    uint64_t    last_sample_pos;
 
     uint32_t    next_source;       /* hands out distinct, non-zero stub handles */
     uint32_t    next_sound;
@@ -50,10 +47,8 @@ static void set_error(BwEngine* e, const char* msg) {
  * timestamp capture. M2 drains the command ring here; M3+ mixes voices; the output
  * stage (align_speakers) and the binaural tap follow (see docs/concurrency.md). */
 static void engine_render(void* user, float* bus, uint32_t nframes, const BwTimestamp* ts) {
-    BwEngine* e = (BwEngine*)user;
+    (void)user; (void)ts;
     memset(bus, 0, sizeof(float) * (size_t)nframes * BW_CHANNELS);
-    e->last_sample_pos = ts->sample_pos;
-    e->blocks_rendered += 1;
 }
 
 /* ---- lifecycle ---- */

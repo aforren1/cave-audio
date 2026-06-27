@@ -66,6 +66,13 @@ inline int32_t to_i32(float v) {
     return (int32_t)(v * 2147483647.0f);
 }
 
+/* Sample types convert_out knows how to write. Channels with any other type are
+ * rejected at open(), so the audio callback never hits convert_out's default case. */
+inline bool type_supported(long type) {
+    return type == ASIOSTFloat32LSB || type == ASIOSTInt32LSB ||
+           type == ASIOSTInt24LSB   || type == ASIOSTInt16LSB;
+}
+
 /* Convert one channel of the planar float bus to the driver's native sample type. */
 void convert_out(void* dst, const float* src, long n, long type) {
     switch (type) {
@@ -96,8 +103,7 @@ void convert_out(void* dst, const float* src, long n, long type) {
         }
         break;
     }
-    default:                                         /* unknown type: emit silence */
-        memset(dst, 0, (size_t)n * sizeof(float));
+    default:                                         /* unreachable: rejected at open() */
         break;
     }
 }
@@ -164,11 +170,11 @@ void asio_stop(BwSink* base) {
 }
 void asio_close(BwSink* base) {
     AsioSink* s = (AsioSink*)base;
-    asio_stop(base);
+    g_sink = nullptr;            /* stop dispatching to this sink before tearing it down */
+    asio_stop(base);            /* ASIOStop; then DisposeBuffers deregisters callbacks */
     ASIODisposeBuffers();
     ASIOExit();
     if (asioDrivers) asioDrivers->removeCurrentDriver();
-    g_sink = nullptr;
     free(s->bus);
     free(s);
 }
@@ -220,10 +226,20 @@ extern "C" BwSink* bw_asio_sink_open(uint32_t sample_rate, uint32_t block_size,
         return nullptr;
     }
 
+    /* The driver dictates the true block size; BwConfig.block_size is only a hint, and
+     * the nframes passed to the render callback (== bufsize, the bus is sized to it) is
+     * authoritative. Clamp the hint into range and honour the driver's granularity so
+     * ASIOCreateBuffers never gets an invalid size. */
     long bmin = 0, bmax = 0, bpref = 0, bgran = 0;
     ASIOGetBufferSize(&bmin, &bmax, &bpref, &bgran);
     long bufsize = (long)block_size;
-    if (bufsize < bmin || bufsize > bmax) bufsize = bpref;   /* fall back to preferred */
+    if (bufsize < bmin || bufsize > bmax) {
+        bufsize = bpref;                                              /* out of range */
+    } else if (bgran > 0) {
+        bufsize -= (bufsize - bmin) % bgran;                         /* snap to bmin + k*bgran */
+    } else if (bgran == -1 && (bufsize & (bufsize - 1)) != 0) {
+        bufsize = bpref;                                             /* driver wants powers of two */
+    }
 
     AsioSink* s = (AsioSink*)calloc(1, sizeof *s);
     if (!s) { set_err(err, errcap, "asio: out of memory"); ASIOExit(); asioDrivers->removeCurrentDriver(); return nullptr; }
@@ -248,28 +264,37 @@ extern "C" BwSink* bw_asio_sink_open(uint32_t sample_rate, uint32_t block_size,
     s->callbacks.asioMessage          = &asioMessage;
     s->callbacks.bufferSwitchTimeInfo = &bufferSwitchTimeInfo;
 
-    g_sink = s;   /* callbacks may fire during/after ASIOCreateBuffers */
-    if (ASIOCreateBuffers(s->bufferInfos, (long)channels, bufsize, &s->callbacks) != ASE_OK) {
-        set_err(err, errcap, "asio: ASIOCreateBuffers failed");
-        g_sink = nullptr; ASIOExit(); asioDrivers->removeCurrentDriver(); free(s);
-        return nullptr;
-    }
-
+    /* Learn each output channel's sample type (needs only ASIOInit, not buffers) and
+     * reject any we cannot convert, so the audio callback never meets an unhandled type
+     * (which could write the wrong byte width into the driver buffer). */
     for (uint32_t c = 0; c < channels; ++c) {
         s->channelInfos[c].channel = (long)c;
         s->channelInfos[c].isInput = ASIOFalse;
         ASIOGetChannelInfo(&s->channelInfos[c]);
+        if (!type_supported(s->channelInfos[c].type)) {
+            set_err(err, errcap, "asio: driver uses an unsupported output sample type");
+            ASIOExit(); asioDrivers->removeCurrentDriver(); free(s);
+            return nullptr;
+        }
     }
 
+    /* Allocate the bus and publish g_sink BEFORE ASIOCreateBuffers: a driver may pre-roll
+     * a bufferSwitch during CreateBuffers, and that callback reads g_sink->bus and the
+     * channel sample types — both must already be valid, or it dereferences a null bus. */
     s->bus = (float*)calloc((size_t)bufsize * channels, sizeof(float));
     if (!s->bus) {
         set_err(err, errcap, "asio: bus alloc failed");
-        ASIODisposeBuffers(); g_sink = nullptr; ASIOExit(); asioDrivers->removeCurrentDriver(); free(s);
+        ASIOExit(); asioDrivers->removeCurrentDriver(); free(s);
         return nullptr;
     }
 
-    long a = 0, b = 0;
+    g_sink = s;
+    if (ASIOCreateBuffers(s->bufferInfos, (long)channels, bufsize, &s->callbacks) != ASE_OK) {
+        set_err(err, errcap, "asio: ASIOCreateBuffers failed");
+        g_sink = nullptr; ASIOExit(); asioDrivers->removeCurrentDriver(); free(s->bus); free(s);
+        return nullptr;
+    }
+
     s->post_output = (ASIOOutputReady() == ASE_OK);
-    (void)a; (void)b;
     return &s->base;
 }

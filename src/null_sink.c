@@ -31,7 +31,13 @@ static uint64_t qpc_now(void) {
     return (uint64_t)c.QuadPart;
 }
 static uint64_t ticks_to_ns(uint64_t ticks, uint64_t freq) {
-    return ticks * 1000000000ull / freq;   /* freq ~1e7; safe for hours of runtime */
+    /* Split the scale so ticks*1e9 cannot overflow uint64 — the naive form wraps after
+     * only ~30 min at a 10 MHz QPC. This stays exact for centuries of runtime. */
+    return (ticks / freq) * 1000000000ull + (ticks % freq) * 1000000000ull / freq;
+}
+
+static void null_set_err(char* err, size_t cap, const char* msg) {
+    if (err && cap) { strncpy(err, msg, cap - 1); err[cap - 1] = 0; }
 }
 
 static DWORD WINAPI null_thread(LPVOID arg) {
@@ -101,11 +107,11 @@ static const BwSinkVtbl NULL_VT = { null_start, null_stop, null_close, null_back
 BwSink* bw_null_sink_open(uint32_t sample_rate, uint32_t block_size, uint32_t channels,
                           BwRenderFn render, void* user, char* err, size_t errcap) {
     if (!render || channels == 0 || block_size == 0 || sample_rate == 0) {
-        if (err && errcap) strncpy(err, "null_sink: bad arguments", errcap - 1);
+        null_set_err(err, errcap, "null_sink: bad arguments");
         return NULL;
     }
     NullSink* s = (NullSink*)calloc(1, sizeof *s);
-    if (!s) { if (err && errcap) strncpy(err, "null_sink: out of memory", errcap - 1); return NULL; }
+    if (!s) { null_set_err(err, errcap, "null_sink: out of memory"); return NULL; }
     s->base.vt     = &NULL_VT;
     s->sample_rate = sample_rate;
     s->block_size  = block_size;
@@ -115,7 +121,7 @@ BwSink* bw_null_sink_open(uint32_t sample_rate, uint32_t block_size, uint32_t ch
     s->bus = (float*)calloc((size_t)block_size * channels, sizeof(float));
     if (!s->bus) {
         free(s);
-        if (err && errcap) strncpy(err, "null_sink: bus alloc failed", errcap - 1);
+        null_set_err(err, errcap, "null_sink: bus alloc failed");
         return NULL;
     }
     return &s->base;

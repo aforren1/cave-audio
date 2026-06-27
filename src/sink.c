@@ -15,20 +15,31 @@ BwSink* bw_sink_open(uint32_t sample_rate, uint32_t block_size, uint32_t channel
     const char* want = getenv("BWAUDIO_SINK");
     const int force_null = (want && strcmp(want, "null") == 0);
 
+    char asio_err[256] = {0};
 #ifdef BW_HAVE_ASIO
     if (!force_null) {
         /* Production path: try the real device first. */
-        char asio_err[256] = {0};
         BwSink* a = bw_asio_sink_open(sample_rate, block_size, channels, render, user,
                                       asio_err, sizeof asio_err);
         if (a) return a;
-        /* keep the ASIO reason around in case the null sink also fails */
-        if (err && errcap) { strncpy(err, asio_err, errcap - 1); err[errcap - 1] = 0; }
     }
 #else
     (void)force_null;
 #endif
-    return bw_null_sink_open(sample_rate, block_size, channels, render, user, err, errcap);
+
+    char null_err[256] = {0};
+    BwSink* n = bw_null_sink_open(sample_rate, block_size, channels, render, user,
+                                  null_err, sizeof null_err);
+    if (n) return n;
+
+    /* Both failed: report the ASIO (production) reason if we have one, so the null
+     * sink's message can't clobber the real device-failure diagnostic. */
+    if (err && errcap) {
+        const char* msg = asio_err[0] ? asio_err : null_err;
+        strncpy(err, msg, errcap - 1);
+        err[errcap - 1] = 0;
+    }
+    return NULL;
 }
 
 int         bw_sink_start(BwSink* s)   { return s ? s->vt->start(s) : 1; }

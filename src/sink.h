@@ -22,6 +22,10 @@
 #include <stddef.h>
 #include <stdint.h>
 
+/* The CAVE array width — the single source of truth shared by the engine, the sinks'
+ * callers, and the tests (see docs/architecture.md). */
+#define BW_CHANNELS 26
+
 /* Hardware-anchored timestamp captured at the top of each block. Mirrors what ASIO
  * delivers via ASIOTime (sample position + nanosecond systemTime); the null sink
  * synthesizes it from QueryPerformanceCounter. */

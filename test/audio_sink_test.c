@@ -27,7 +27,7 @@ typedef struct {
 static void on_render(void* user, float* bus, uint32_t nframes, const BwTimestamp* ts) {
     Probe* p = (Probe*)user;
     /* prove the bus is writable for the full block (the engine would mix here) */
-    memset(bus, 0, sizeof(float) * (size_t)nframes * 26);
+    memset(bus, 0, sizeof(float) * (size_t)nframes * BW_CHANNELS);
 
     if (!p->first) {
         if (ts->system_time_ns < p->prev_ns)  p->time_monotonic = 0;
@@ -47,7 +47,7 @@ int main(void) {
     memset(&p, 0, sizeof p);
     p.first = 1; p.time_monotonic = 1; p.pos_monotonic = 1;
 
-    const uint32_t SR = 48000, BS = 256, CH = 26;
+    const uint32_t SR = 48000, BS = 256, CH = BW_CHANNELS;
     char err[256] = {0};
     BwSink* s = bw_null_sink_open(SR, BS, CH, on_render, &p, err, sizeof err);
     if (!s) { fprintf(stderr, "FAIL: open: %s\n", err[0] ? err : "(no message)"); return 1; }
