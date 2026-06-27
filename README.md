@@ -33,6 +33,22 @@ in one process behind one audio callback.
 Start with [`CLAUDE.md`](./CLAUDE.md), then [`docs/architecture.md`](./docs/architecture.md).
 Full doc index is in `CLAUDE.md`.
 
+## Playground
+
+An interactive [raylib](https://www.raylib.com/) scene to audition the binaural monitor by
+ear — move a sound source around the 26-speaker array and turn your head, hear it on
+headphones in real time:
+
+```
+cmake -S . -B build -DBWAUDIO_BUILD_PLAYGROUND=ON
+cmake --build build --config RelWithDebInfo --target bw_playground
+./build/RelWithDebInfo/bw_playground          # WASD move source, R/F up/down, Q/E turn head
+```
+
+It drives the `binaural` profile straight to headphones through an auto-picked 2-ch ASIO
+driver (ASIO4ALL / FlexASIO / the Steinberg built-in); without one it runs silently (visual
+only). Opt-in so the default build stays lean. Source: [`examples/playground.c`](./examples/playground.c).
+
 ## Platform & licensing
 
 Windows-only (ASIO). Links the Steinberg ASIO SDK under its GPLv3 option and Steam

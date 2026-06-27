@@ -184,17 +184,20 @@ const BwSinkVtbl ASIO_VT = { asio_start, asio_stop, asio_close, asio_backend };
 
 } /* namespace */
 
-/* Pick a driver: BWAUDIO_ASIO_DRIVER env override, else the first registered name. */
-static bool choose_driver(char* out, size_t cap) {
-    const char* env = getenv("BWAUDIO_ASIO_DRIVER");
-    if (env && *env) { strncpy(out, env, cap - 1); out[cap - 1] = 0; return true; }
-    if (!asioDrivers) return false;
-    char names[16][32];
-    char* ptrs[16];
-    for (int i = 0; i < 16; ++i) ptrs[i] = names[i];
-    long n = asioDrivers->getDriverNames(ptrs, 16);
-    if (n <= 0) return false;
-    strncpy(out, names[0], cap - 1); out[cap - 1] = 0;
+/* Load + init driver `name` and confirm it has >= `channels` outputs. On success the driver
+ * stays loaded+inited; on failure it is fully cleaned up. (ASIO callbacks have no user ptr,
+ * so only one driver is ever live.) */
+static bool try_driver(const char* name, uint32_t channels) {
+    if (!loadAsioDriver((char*)name)) return false;
+    ASIODriverInfo di; memset(&di, 0, sizeof di);
+    di.asioVersion = 2;
+    di.sysRef      = GetDesktopWindow();
+    if (ASIOInit(&di) != ASE_OK) { asioDrivers->removeCurrentDriver(); return false; }
+    long nin = 0, nout = 0;
+    if (ASIOGetChannels(&nin, &nout) != ASE_OK || nout < (long)channels) {
+        ASIOExit(); asioDrivers->removeCurrentDriver();
+        return false;
+    }
     return true;
 }
 
@@ -204,25 +207,25 @@ extern "C" BwSink* bw_asio_sink_open(uint32_t sample_rate, uint32_t block_size,
     if (g_sink)                 { set_err(err, errcap, "asio: a driver is already open"); return nullptr; }
     if (!render || channels == 0 || channels > 64) { set_err(err, errcap, "asio: bad arguments"); return nullptr; }
 
+    /* Auto-pick: BWAUDIO_ASIO_DRIVER if set, else the first registered driver that opens with
+     * enough output channels (so binaural finds a 2-ch headphone driver — ASIO4ALL / FlexASIO /
+     * the Steinberg built-in — and cave finds a >=26-ch one, without configuration). */
     char drv[64] = {0};
-    if (!choose_driver(drv, sizeof drv) || !loadAsioDriver(drv)) {
-        set_err(err, errcap, "asio: no driver could be loaded");
-        return nullptr;
+    bool opened = false;
+    const char* env = getenv("BWAUDIO_ASIO_DRIVER");
+    if (env && *env) {
+        strncpy(drv, env, sizeof drv - 1);
+        opened = try_driver(drv, channels);
+    } else if (asioDrivers) {
+        char names[16][32];
+        char* ptrs[16];
+        for (int i = 0; i < 16; ++i) ptrs[i] = names[i];
+        long ndrv = asioDrivers->getDriverNames(ptrs, 16);
+        for (long i = 0; i < ndrv && !opened; ++i)
+            if (try_driver(names[i], channels)) { strncpy(drv, names[i], sizeof drv - 1); opened = true; }
     }
-
-    ASIODriverInfo di; memset(&di, 0, sizeof di);
-    di.asioVersion = 2;
-    di.sysRef      = GetDesktopWindow();
-    if (ASIOInit(&di) != ASE_OK) {
-        set_err(err, errcap, di.errorMessage[0] ? di.errorMessage : "asio: ASIOInit failed");
-        asioDrivers->removeCurrentDriver();
-        return nullptr;
-    }
-
-    long nin = 0, nout = 0;
-    if (ASIOGetChannels(&nin, &nout) != ASE_OK || nout < (long)channels) {
-        set_err(err, errcap, "asio: driver exposes fewer than the required output channels");
-        ASIOExit(); asioDrivers->removeCurrentDriver();
+    if (!opened) {
+        set_err(err, errcap, "asio: no driver opened with enough output channels");
         return nullptr;
     }
 

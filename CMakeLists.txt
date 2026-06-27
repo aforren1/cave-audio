@@ -154,3 +154,27 @@ if(BWAUDIO_BUILD_TESTS)
     target_link_options(bw_sound_test PRIVATE /INCREMENTAL:NO)
   endif()
 endif()
+
+# ---- Optional: interactive raylib playground (evaluate the binaural monitor by ear) ----
+# Opt-in so the default build stays lean: cmake -S . -B build -DBWAUDIO_BUILD_PLAYGROUND=ON
+# Drives the binaural profile live to headphones (auto-picked 2-ch ASIO driver). Links the
+# public ABI (bwaudio.h, propagated by the bwaudio target) + raylib; uses its own dr_wav copy
+# to generate the source wav.
+option(BWAUDIO_BUILD_PLAYGROUND "Build the interactive raylib playground (fetches raylib)" OFF)
+if(BWAUDIO_BUILD_PLAYGROUND)
+  set(BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)        # raylib: skip its own examples/games
+  FetchContent_Declare(raylib
+    GIT_REPOSITORY https://github.com/raysan5/raylib.git
+    GIT_TAG 5.5                                       # release tag (stable); pin to a SHA if desired
+    GIT_SHALLOW TRUE)
+  FetchContent_MakeAvailable(raylib)
+
+  add_executable(bw_playground examples/playground.c)
+  target_include_directories(bw_playground PRIVATE ${dr_wav_SOURCE_DIR})
+  target_link_libraries(bw_playground PRIVATE bwaudio raylib)
+  if(WIN32)
+    add_custom_command(TARGET bw_playground POST_BUILD
+      COMMAND ${CMAKE_COMMAND} -E copy_if_different
+              $<TARGET_FILE:bwaudio> $<TARGET_FILE_DIR:bw_playground>)   # bwaudio.dll next to the exe
+  endif()
+endif()

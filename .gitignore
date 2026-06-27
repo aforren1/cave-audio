@@ -31,3 +31,6 @@ bindings/unity/**/obj/
 
 # local config / surveyed data that shouldn't be shared verbatim
 *.local.json
+
+# playground scratch (the demo generates this at startup, removes it on clean exit)
+playground_src.wav
