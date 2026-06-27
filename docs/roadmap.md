@@ -8,6 +8,9 @@ engines. Don't start with the engine bindings.
 - CMake project, `third_party/` vendored (asiosdk, steamaudio, dr_wav).
 - `include/bwaudio.h` compiles; stub `engine.c` returns a valid opaque handle.
 - **Done when:** library builds and links on the target Windows toolchain.
+- **Status: ✅ done** — `CMakeLists.txt` builds `bwaudio.dll` from a stub `src/engine.c`
+  and a passing `bw_smoke` lifecycle test (MSVC 19.4x / VS2022). `third_party/` is wired
+  in CMake but vendoring is deferred until M1 actually needs ASIO.
 
 ## M1 — ASIO sink, silence
 - `asio_sink.c`: driver load → `ASIOCreateBuffers` → `ASIOStart`, writing 26 channels

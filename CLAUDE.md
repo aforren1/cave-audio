@@ -69,19 +69,22 @@ docs/                  Specs. Start here.
 third_party/           asiosdk/ (GPLv3 option), steamaudio/, dr_wav.h
 ```
 
-## Build (intended — not yet implemented)
+## Build
 
 Target: **Windows only** (ASIO is Windows-only; DVS is Windows/macOS). CMake.
 A future cross-platform move means abstracting the device layer (ASIO is just the
 Windows sink) — do not bake ASIO assumptions outside `asio_sink.c`.
 
 ```
-cmake -S . -B build -G "Visual Studio 17 2022"
+cmake -S . -B build -G "Visual Studio 17 2022" -A x64
 cmake --build build --config RelWithDebInfo
+ctest --test-dir build -C RelWithDebInfo      # runs the bw_smoke lifecycle check
 ```
 
-When you add a build system, wire these placeholder commands into reality and
-update this section.
+**Current state (M0):** this builds `bwaudio.dll` + the `bw_smoke` test from a stub
+`src/engine.c` — the library links and hands back valid handles, but there is no audio
+thread or DSP yet. ASIO/DBAP/binaural land in M1+ (see `docs/roadmap.md`); `third_party/`
+is wired in CMake but not yet required by the stub.
 
 ## What NOT to do
 
