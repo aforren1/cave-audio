@@ -20,6 +20,7 @@
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 
 #define SR   48000u
 #define NSPK 26
@@ -69,9 +70,13 @@ int main(void) {
     if (!e) { printf("bw_create failed\n"); return 1; }
     if (bw_start(e) != 0) {
         const char* err = bw_last_error(e);
-        printf("bw_start: %s — no audio (install ASIO4ALL for headphone output); the scene still runs.\n",
+        printf("bw_start: %s — no audio (install/select an ASIO driver, e.g. ASIO4ALL); the scene still runs.\n",
                err ? err : "?");
     }
+    const char* backend = bw_audio_backend(e);                /* "asio:<driver>", "null", or "none" */
+    int silent = (strncmp(backend, "asio", 4) != 0);          /* anything but a real ASIO device = no sound */
+    printf("audio backend: %s%s\n", backend,
+           silent ? "   (SILENT — set BWAUDIO_ASIO_DRIVER to your headphone driver)" : "");
 
     BwSound  snd = bw_load_sound(e, WAV);
     BwSource src = bw_source_create(e);
@@ -144,7 +149,11 @@ int main(void) {
         DrawText("WASD/RF: move source   Q/E: turn head   right-drag: orbit   wheel: zoom   ESC: quit", 12, 12, 18, RAYWHITE);
         DrawText(TextFormat("source = (%.2f, %.2f, %.2f)   head yaw = %.0f deg",
                             source_pos.x, source_pos.y, source_pos.z, head_yaw * 57.2958f), 12, 36, 18, LIGHTGRAY);
-        DrawText("head: orange nose = facing   red ear = right (audio R)   white ear = left   (binaural via ASIO)", 12, 60, 16, GRAY);
+        DrawText("head: orange nose = facing   red ear = right (audio R)   white ear = left", 12, 60, 16, GRAY);
+        if (silent)
+            DrawText("audio: NULL sink — NO SOUND (set BWAUDIO_ASIO_DRIVER; see console)", 12, 84, 18, RED);
+        else
+            DrawText(TextFormat("audio: %s", backend), 12, 84, 18, GREEN);
         EndDrawing();
     }
 

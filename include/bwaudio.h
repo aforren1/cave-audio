@@ -68,6 +68,9 @@ BW_API int       bw_start(BwEngine* e);   /* opens device(s), starts audio threa
 BW_API int       bw_stop(BwEngine* e);
 BW_API void      bw_destroy(BwEngine* e);
 BW_API const char* bw_last_error(BwEngine* e); /* human-readable; NULL if none */
+/* Backend actually in use after bw_start: "asio:<driver>", "null" (offline/SILENT), or
+ * "none" (not started). Lets a client confirm it got a real device, not a silent fallback. */
+BW_API const char* bw_audio_backend(BwEngine* e);
 
 /* ---- assets (control thread; file I/O; do at load time) ---- */
 BW_API BwSound bw_load_sound(BwEngine* e, const char* path); /* 0 = failure */

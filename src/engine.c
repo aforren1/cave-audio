@@ -19,6 +19,7 @@
 
 #define BW_VOICE_CAP 256       /* max simultaneous sources */
 #define BW_SOUND_CAP 256       /* max loaded sounds */
+#define BW_MAX_BLOCK 8192      /* upper bound on a device's frames-per-block (ASIO picks its own) */
 
 /* The three profiles (docs/architecture.md):
  *   cave     — render the 26-ch array straight to a 26-ch device (ASIO/DVS).
@@ -26,10 +27,11 @@
  *   both     — array to a 26-ch device AND the monitor to a 2-ch device, concurrently.
  * The monitor uses the listener's head orientation; the array render ignores it.
  *
- * NOTE: the binaural/both monitor path is sized to cfg.block_size; a device block of a
- * different size (a renegotiating ASIO device) renders silence for that block rather than
- * garbage (the cave array renders any size). Live headphone output works through a 2-ch ASIO
- * driver (ASIO4ALL / FlexASIO / the Steinberg built-in); a dedicated WASAPI backend is future. */
+ * NOTE: an ASIO driver picks its own buffer size, usually != cfg.block_size. binaural sizes
+ * its render scratch to BW_MAX_BLOCK and renders whatever block the device dictates, so it works
+ * with any driver. The 'both' double-buffer still assumes the two devices share cfg.block_size (a
+ * mismatched monitor block is silenced; the array renders any size). Live headphone output works
+ * through a 2-ch ASIO driver (ASIO4ALL / FlexASIO / the Steinberg built-in); WASAPI is future. */
 struct BwEngine {
     BwConfig    cfg;
     int         started;
@@ -60,12 +62,12 @@ static void render_cave(void* user, float* dev, uint32_t n, const BwTimestamp* t
     rt_render(((BwEngine*)user)->rt, dev, n, ts);
 }
 
-/* binaural: render the 26-ch array to scratch, then decode to the 2-ch device. The scratch
- * and the planar L/R layout are sized to cap (== block_size); a device block of a different
- * size (a renegotiating ASIO device) outputs silence rather than garbage. */
+/* binaural: render the 26-ch array to scratch, then decode to the 2-ch device. The scratch is
+ * sized to BW_MAX_BLOCK, so any device block size works (the binaural decode uses n internally
+ * and consistently — no cross-buffer offset to keep in sync, unlike 'both'). */
 static void render_binaural(void* user, float* dev2, uint32_t n, const BwTimestamp* ts) {
     BwEngine* e = (BwEngine*)user;
-    if (n != e->cap) { memset(dev2, 0, sizeof(float) * (size_t)n * 2); return; }
+    if (n > BW_MAX_BLOCK) { memset(dev2, 0, sizeof(float) * (size_t)n * 2); return; }
     rt_render(e->rt, e->scratch26, n, ts);
     float p[3], q[4];
     rt_get_listener(e->rt, p, q);
@@ -149,7 +151,7 @@ int bw_start(BwEngine* e) {
     if (e->profile == BW_PROFILE_CAVE) {
         e->sink = bw_sink_open(sr, bs, BW_CHANNELS, render_cave, e, e->errbuf, sizeof e->errbuf);
     } else if (e->profile == BW_PROFILE_BINAURAL) {
-        e->scratch26 = (float*)calloc((size_t)bs * BW_CHANNELS, sizeof(float));
+        e->scratch26 = (float*)calloc((size_t)BW_MAX_BLOCK * BW_CHANNELS, sizeof(float));
         if (e->scratch26)
             e->sink = bw_sink_open(sr, bs, 2, render_binaural, e, e->errbuf, sizeof e->errbuf);
     } else { /* both: a 26-ch array sink + a 2-ch monitor sink sharing a double-buffer */
@@ -194,6 +196,11 @@ void bw_destroy(BwEngine* e) {
 
 const char* bw_last_error(BwEngine* e) {
     return e ? e->last_error : NULL;
+}
+
+const char* bw_audio_backend(BwEngine* e) {
+    if (!e || !e->sink) return "none";
+    return bw_sink_backend(e->sink);   /* binaural/both: the primary (headphone/array) device */
 }
 
 /* ---- assets ---- */
