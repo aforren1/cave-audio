@@ -17,6 +17,7 @@
 #define DR_WAV_IMPLEMENTATION
 #include "dr_wav.h"
 
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 
@@ -84,8 +85,9 @@ int main(void) {
 
     InitWindow(1000, 700, "bwaudio - binaural playground");
     SetTargetFPS(60);
-    Camera3D cam = { .position = { 5, 5, 5 }, .target = { 0, 0.5f, 0 }, .up = { 0, 1, 0 },
+    Camera3D cam = { .target = { 0, 0.5f, 0 }, .up = { 0, 1, 0 },
                      .fovy = 55, .projection = CAMERA_PERSPECTIVE };
+    float cam_yaw = 45.0f * DEG2RAD, cam_pitch = 33.0f * DEG2RAD, cam_dist = 8.4f;  /* arcball orbit state */
 
     while (!WindowShouldClose()) {
         float dt = GetFrameTime();
@@ -98,6 +100,21 @@ int main(void) {
         if (IsKeyDown(KEY_F)) source_pos.y -= mv;
         if (IsKeyDown(KEY_Q)) head_yaw += rt;
         if (IsKeyDown(KEY_E)) head_yaw -= rt;
+
+        /* arcball camera: right-drag orbits around the array, the wheel zooms */
+        if (IsMouseButtonDown(MOUSE_BUTTON_RIGHT)) {
+            Vector2 md = GetMouseDelta();
+            cam_yaw   -= md.x * 0.005f;
+            cam_pitch += md.y * 0.005f;
+            if (cam_pitch >  1.5f) cam_pitch =  1.5f;       /* clamp shy of the poles */
+            if (cam_pitch < -1.5f) cam_pitch = -1.5f;
+        }
+        cam_dist -= GetMouseWheelMove() * 0.6f;
+        if (cam_dist < 1.5f)  cam_dist = 1.5f;
+        if (cam_dist > 25.0f) cam_dist = 25.0f;
+        cam.position.x = cam.target.x + cam_dist * cosf(cam_pitch) * sinf(cam_yaw);
+        cam.position.y = cam.target.y + cam_dist * sinf(cam_pitch);
+        cam.position.z = cam.target.z + cam_dist * cosf(cam_pitch) * cosf(cam_yaw);
 
         Quaternion q = QuaternionFromAxisAngle((Vector3){ 0, 1, 0 }, head_yaw);
 
@@ -124,7 +141,7 @@ int main(void) {
                        0.06f, 0.0f, 10, ORANGE);                    /* nose -> facing */
         EndMode3D();
 
-        DrawText("WASD: move source   R/F: up/down   Q/E: turn head   ESC: quit", 12, 12, 18, RAYWHITE);
+        DrawText("WASD/RF: move source   Q/E: turn head   right-drag: orbit   wheel: zoom   ESC: quit", 12, 12, 18, RAYWHITE);
         DrawText(TextFormat("source = (%.2f, %.2f, %.2f)   head yaw = %.0f deg",
                             source_pos.x, source_pos.y, source_pos.z, head_yaw * 57.2958f), 12, 36, 18, LIGHTGRAY);
         DrawText("head: orange nose = facing   red ear = right (audio R)   white ear = left   (binaural via ASIO)", 12, 60, 16, GRAY);
