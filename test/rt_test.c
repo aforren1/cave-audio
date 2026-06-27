@@ -100,6 +100,25 @@ int main(void) {
     CHECK(chan_energy(9) > 0.0, "new voice routes to ch9 (valid set applied)");
     CHECK(chan_energy(4) == 0.0, "stale handle's set_pos was dropped");
 
+    /* 6. double-destroy is idempotent (must not corrupt the free-list) */
+    rt_source_destroy(c, h2);
+    rt_source_destroy(c, h2);                       /* second call is a harmless no-op */
+    render2(c);
+    uint32_t h3 = rt_source_create(c);              /* slot must still be allocatable */
+    CHECK(h3 != 0, "create after double-destroy still works");
+    rt_source_play(c, h3, FAKE_SOUND, true);
+    rt_source_set_pos(c, h3, 6.0f, 0, 0);
+    rt_commit(c); render2(c);
+    CHECK(chan_energy(6) > 0.0, "voice after double-destroy routes correctly");
+
+    /* 7. non-finite inputs are rejected at the boundary (no UB / NaN on the audio thread) */
+    rt_source_set_pos(c, h3, NAN, 0, 0);            /* must be ignored */
+    rt_source_set_gain(c, h3, INFINITY);           /* must be ignored */
+    rt_commit(c); render2(c);
+    double e6 = chan_energy(6);
+    CHECK(e6 > 0.0 && isfinite(e6), "voice unmoved and bus finite after NaN/Inf inputs");
+    CHECK(chan_energy(0) == 0.0, "no spurious routing from bad inputs");
+
     rt_destroy(c);
     if (fails) { printf("rt_test: %d FAILURES\n", fails); return 1; }
     printf("rt_test OK (commit snapshot, generation drop, routing, gain all verified)\n");

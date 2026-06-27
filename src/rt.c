@@ -11,6 +11,11 @@
 #include <stdlib.h>
 #include <string.h>
 
+#if defined(_MSC_VER)
+#include <xmmintrin.h>     /* _MM_SET_FLUSH_ZERO_MODE */
+#include <pmmintrin.h>     /* _MM_SET_DENORMALS_ZERO_MODE */
+#endif
+
 #define RING_CAP 4096          /* power of two; sized for a worst-case frame burst */
 #define EVT_CAP  1024          /* power of two */
 #define TWO_PI   6.283185307179586
@@ -44,6 +49,7 @@ struct RtCore {
 
     /* control-thread-owned handle allocation */
     uint16_t* gen;                          /* current generation per slot */
+    uint8_t*  inuse;                        /* 1 while a slot is allocated (double-free guard) */
     uint32_t* freelist;                     /* stack of free indices */
     uint32_t  free_count;
 };
@@ -76,11 +82,18 @@ static uint32_t alloc_handle(RtCore* c) {
     uint16_t g = (uint16_t)(c->gen[idx] + 1);
     if (g == 0) g = 1;                                        /* skip 0 (invalid handle) */
     c->gen[idx] = g;
+    c->inuse[idx] = 1;
     return BW_MK_H(idx, g);
 }
 
 static void recycle_handle(RtCore* c, uint16_t idx) {
-    if (idx < c->voice_cap) c->freelist[c->free_count++] = idx;
+    /* Idempotent: only a currently-allocated slot is returned to the free-list, so a
+     * double-destroy (or a destroy racing a future EVT_VOICE_ENDED) can neither double-
+     * free the index nor overflow free_count past voice_cap. */
+    if (idx < c->voice_cap && c->inuse[idx]) {
+        c->inuse[idx] = 0;
+        c->freelist[c->free_count++] = idx;
+    }
 }
 
 static void drain_events(RtCore* c) {                          /* control thread */
@@ -191,6 +204,12 @@ static void mix_voice(RtCore* c, Voice* v, float* bus, uint32_t n) {
 
 void rt_render(RtCore* c, float* bus, uint32_t nframes, const BwTimestamp* ts) {
     (void)ts;
+#if defined(_MSC_VER)
+    /* Flush denormals to zero on the audio thread: gain ramps toward 0 (e.g. a voice
+     * moving off a channel) otherwise produce subnormals that stall the FP pipeline. */
+    _MM_SET_FLUSH_ZERO_MODE(_MM_FLUSH_ZERO_ON);
+    _MM_SET_DENORMALS_ZERO_MODE(_MM_DENORMALS_ZERO_ON);
+#endif
     drain_commands(c);
     memset(bus, 0, sizeof(float) * (size_t)nframes * c->channels);
     for (uint32_t i = 0; i < c->voice_cap; ++i) {
@@ -207,23 +226,30 @@ uint32_t rt_source_create(RtCore* c) {
     uint32_t h = alloc_handle(c);
     if (!h) return 0;
     Cmd cmd = { .type = CMD_SRC_CREATE, .handle = h };
-    cmd_push(&c->cmds, &cmd);
+    if (!cmd_push(&c->cmds, &cmd)) {        /* ring full (should never happen): don't leak the slot */
+        recycle_handle(c, BW_H_IDX(h));
+        return 0;
+    }
     return h;
 }
 
 void rt_source_destroy(RtCore* c, uint32_t h) {
     Cmd cmd = { .type = CMD_SRC_DESTROY, .handle = h };
-    cmd_push(&c->cmds, &cmd);
-    recycle_handle(c, BW_H_IDX(h));     /* generations make immediate reuse safe (no ack) */
+    /* Recycle only if the destroy was actually enqueued, so a dropped command can't leave
+     * the voice active while the index is handed out again. recycle is idempotent, so a
+     * double-destroy is harmless. */
+    if (cmd_push(&c->cmds, &cmd)) recycle_handle(c, BW_H_IDX(h));
 }
 
 void rt_source_set_pos(RtCore* c, uint32_t h, float x, float y, float z) {
+    if (!(isfinite(x) && isfinite(y) && isfinite(z))) return;  /* keep NaN/Inf off the audio thread */
     Cmd cmd = { .type = CMD_SET_POS, .handle = h };
     cmd.u.pos.x = x; cmd.u.pos.y = y; cmd.u.pos.z = z;
     cmd_push(&c->cmds, &cmd);
 }
 
 void rt_source_set_gain(RtCore* c, uint32_t h, float linear) {
+    if (!isfinite(linear) || linear < 0.f) return;             /* reject NaN/Inf/negative gain */
     Cmd cmd = { .type = CMD_SET_GAIN, .handle = h };
     cmd.u.gain.g = linear;
     cmd_push(&c->cmds, &cmd);
@@ -267,8 +293,9 @@ RtCore* rt_create(uint32_t voice_cap, uint32_t sample_rate, uint32_t channels) {
     c->dphase      = TWO_PI * 440.0 / (double)sample_rate;     /* M2 test tone: 440 Hz */
     c->voices   = (Voice*)   calloc(voice_cap, sizeof(Voice));
     c->gen      = (uint16_t*)calloc(voice_cap, sizeof(uint16_t));
+    c->inuse    = (uint8_t*) calloc(voice_cap, sizeof(uint8_t));
     c->freelist = (uint32_t*)calloc(voice_cap, sizeof(uint32_t));
-    if (!c->voices || !c->gen || !c->freelist) { rt_destroy(c); return NULL; }
+    if (!c->voices || !c->gen || !c->inuse || !c->freelist) { rt_destroy(c); return NULL; }
     /* push indices so the first alloc hands out slot 0, then 1, ... */
     for (uint32_t i = 0; i < voice_cap; ++i) c->freelist[c->free_count++] = voice_cap - 1 - i;
     return c;
@@ -277,6 +304,7 @@ RtCore* rt_create(uint32_t voice_cap, uint32_t sample_rate, uint32_t channels) {
 void rt_destroy(RtCore* c) {
     if (!c) return;
     free(c->freelist);
+    free(c->inuse);
     free(c->gen);
     free(c->voices);
     free(c);
