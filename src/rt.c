@@ -7,6 +7,9 @@
  */
 #include "rt.h"
 #include "sound.h"
+#include "layout.h"
+#include "dbap.h"
+#include "align.h"
 
 #include <math.h>
 #include <stdatomic.h>
@@ -64,6 +67,10 @@ struct RtCore {
     uint32_t   sound_cap;
     uint32_t*  sfreelist;
     uint32_t   sfree_count;
+
+    /* spatialization (set at create/load time; read by the audio thread) */
+    Layout   layout;
+    Aligner* aligner;
 };
 
 /* ---- ring primitives ---- */
@@ -237,13 +244,10 @@ static void drain_commands(RtCore* c) {
     atomic_store_explicit(&r->read, rd, memory_order_release);
 }
 
-/* M2 placeholder for dbap_gains: route a voice to a single channel from its x position. */
+/* DBAP gain solve (M4): listener-relative, dirty-gated. CMD_COMMIT re-dirties a voice on a
+ * position change and dirties all voices on a listener move (gains are listener-relative). */
 static void compute_gains(RtCore* c, Voice* v) {
-    for (uint32_t ch = 0; ch < c->channels; ++ch) v->gtarget[ch] = 0.f;
-    int ch = (int)v->pos_active[0];
-    if (ch < 0) ch = 0;
-    if (ch >= (int)c->channels) ch = (int)c->channels - 1;
-    v->gtarget[ch] = v->gain_user;
+    dbap_gains(v->pos_active, c->lis.p_active, &c->layout, v->gain_user, v->gtarget);
 }
 
 /* Mix one voice: read its sound at the cursor (looping or ending), spatialize through the
@@ -300,6 +304,7 @@ void rt_render(RtCore* c, float* bus, uint32_t nframes, const BwTimestamp* ts) {
         if (v->dirty) { compute_gains(c, v); v->dirty = false; }
         mix_voice(c, v, (uint16_t)i, bus, nframes);
     }
+    align_process(c->aligner, bus, nframes);   /* per-speaker gain trim + delay (output stage) */
 }
 
 /* ---- control-thread API (enqueue) ---- */
@@ -435,14 +440,32 @@ RtCore* rt_create(uint32_t voice_cap, uint32_t sound_cap, uint32_t sample_rate, 
     if (!c->voices || !c->gen || !c->inuse || !c->freelist || !c->sounds || !c->sfreelist) {
         rt_destroy(c); return NULL;
     }
+    c->layout  = layout_default();
+    c->aligner = align_create(channels, &c->layout);
+    if (!c->aligner) { rt_destroy(c); return NULL; }
     /* push indices so the first alloc hands out slot 0, then 1, ... */
     for (uint32_t i = 0; i < voice_cap; ++i) c->freelist[c->free_count++]   = voice_cap - 1 - i;
     for (uint32_t i = 0; i < sound_cap; ++i) c->sfreelist[c->sfree_count++] = sound_cap - 1 - i;
     return c;
 }
 
+/* Replace the speaker layout. Control thread, call BEFORE bw_start (or while stopped) —
+ * it swaps the aligner the audio thread reads, so it is not safe concurrently with
+ * rt_render. Voices recompute their DBAP gains on the next render (created dirty). */
+void rt_set_layout(RtCore* c, const Layout* L) {
+    if (!c || !L) return;
+    Aligner* a = align_create(c->channels, L);
+    if (!a) return;                         /* keep the old layout on alloc failure */
+    c->layout = *L;
+    align_destroy(c->aligner);
+    c->aligner = a;
+    for (uint32_t i = 0; i < c->voice_cap; ++i)
+        if (c->voices[i].active) c->voices[i].dirty = true;
+}
+
 void rt_destroy(RtCore* c) {
     if (!c) return;
+    align_destroy(c->aligner);
     if (c->sounds)                                  /* free any pcm still loaded */
         for (uint32_t i = 0; i < c->sound_cap; ++i)
             if (c->sounds[i].inuse) sound_unload(&c->sounds[i].data);

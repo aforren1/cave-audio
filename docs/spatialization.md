@@ -44,6 +44,27 @@ Sketch (listener-relative DBAP):
 `r` (blur) and the distance-attenuation curve are the two tuning knobs; expose them
 in the layout/config so they can be dialed against the real array.
 
+### Implemented formulation (M4 first cut, `dbap.c`)
+
+For each speaker `k` (positions in room space):
+
+1. **Proximity** — blurred source→speaker distance `d_k = sqrt(|src − spk_k|² + r²)`,
+   weight `p_k = 1 / d_k^a` (rolloff exponent `a = 2`). `r` controls how many speakers
+   share energy and removes the singularity at `src == spk_k`.
+2. **Listener-relative direction** — multiply by `dir_k = 0.5 + 0.5·cos∠(src−lis, spk_k−lis)`
+   ∈ [0,1], emphasizing speakers in the source's *bearing from the listener* so an
+   off-centre listener still gets the right distribution. (If the source sits on the
+   listener, the bearing is undefined and `dir_k = 1` for all — omnidirectional.)
+3. **Constant power** — normalize `g_k ← g_k / ‖g‖₂` so `Σ g_k² = 1`.
+4. **Level** — scale all gains by `user_gain · atten(|src − lis|)`, where the inverse
+   distance-attenuation `atten = clamp((ref/max(d,ref))^rolloff, min, 1)`.
+
+So a source *at* a speaker localizes to that speaker (it has the smallest `d_k` and a
+`dir_k ≈ 1`), two speakers split a source between them, the total power is
+`user_gain·atten` regardless of position, and the distribution shifts as the listener
+moves. The exponents/`r`/curve are tuning knobs to dial against the real array; this is a
+first cut, not a final psychoacoustic model.
+
 > Implementation note: keep the math in `dbap.c` pure and listener-position-driven.
 > A listener move dirties every voice (concurrency.md), so this runs for all active
 > voices on move frames — keep it allocation-free and tight.

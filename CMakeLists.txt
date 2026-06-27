@@ -7,6 +7,7 @@
 #        vendored under third_party/asiosdk/, see third_party/README.md).
 #   M2 — concurrency spine in rt.c (SPSC rings, voice table, commit snapshot).
 #   M3 — wav playback (sound.c + dr_wav via FetchContent) + the retire-ack handshake.
+#   M4 — DBAP spatialization: layout.c (cave_layout.json via cJSON) + dbap.c + align.c.
 cmake_minimum_required(VERSION 3.20)
 project(bwaudio LANGUAGES C VERSION 0.0.1)
 
@@ -23,33 +24,53 @@ if(MSVC)
   add_compile_definitions(_CRT_SECURE_NO_WARNINGS)
 endif()
 
-# ---- dr_wav (single-header wav loader), fetched + pinned (not vendored in git) ----
-# Pinned to the wav-0.14.5 release commit. To bump: change the SHA. Offline builds can set
-# -DFETCHCONTENT_SOURCE_DIR_DR_WAV=<dir containing dr_wav.h> to use a local copy instead.
+# ---- third-party single-header / single-file deps, fetched + pinned (not vendored) ----
+# Offline builds can override with -DFETCHCONTENT_SOURCE_DIR_<NAME>=<dir>. See third_party/README.md.
 include(FetchContent)
 FetchContent_Declare(dr_wav
   URL https://raw.githubusercontent.com/mackron/dr_libs/fa931f3285ced10ace628f7f1ac951e1951e7ea6/dr_wav.h
+  DOWNLOAD_NO_EXTRACT TRUE)                                   # wav-0.14.5
+FetchContent_Declare(cjson_src
+  URL https://raw.githubusercontent.com/DaveGamble/cJSON/c859b25da02955fef659d658b8f324b5cde87be3/cJSON.c
+  DOWNLOAD_NO_EXTRACT TRUE)                                   # v1.7.19
+FetchContent_Declare(cjson_hdr
+  URL https://raw.githubusercontent.com/DaveGamble/cJSON/c859b25da02955fef659d658b8f324b5cde87be3/cJSON.h
   DOWNLOAD_NO_EXTRACT TRUE)
-FetchContent_MakeAvailable(dr_wav)   # populates ${dr_wav_SOURCE_DIR}/dr_wav.h (no CMakeLists to add)
+FetchContent_MakeAvailable(dr_wav cjson_src cjson_hdr)
+set(CJSON_C   "${cjson_src_SOURCE_DIR}/cJSON.c")
+set(CJSON_INC "${cjson_hdr_SOURCE_DIR}")
+
+# ---- shared core (everything except the public ABI shim and the device sinks) ----
+# An OBJECT library so the off-RT-path tests can compile the core in directly and reach
+# its internals, without re-listing sources per target.
+add_library(bw_core OBJECT
+  src/rt.c
+  src/sound.c
+  src/layout.c
+  src/dbap.c
+  src/align.c
+  ${CJSON_C}
+)
+target_include_directories(bw_core PUBLIC src ${dr_wav_SOURCE_DIR} ${CJSON_INC})
+if(MSVC)
+  target_compile_options(bw_core PRIVATE /W4)
+  # rt.c uses C11 <stdatomic.h>, gated behind /experimental:c11atomics (directory-scoped,
+  # so it applies wherever rt.c is compiled). cJSON is third-party: silence its warnings.
+  set_source_files_properties(src/rt.c PROPERTIES COMPILE_OPTIONS /experimental:c11atomics)
+  set_source_files_properties(${CJSON_C} PROPERTIES COMPILE_OPTIONS /W0)
+endif()
 
 # ---- core library (public C ABI in include/bwaudio.h) ----
 add_library(bwaudio SHARED
   src/engine.c
-  src/rt.c
-  src/sound.c
   src/sink.c
   src/null_sink.c
+  $<TARGET_OBJECTS:bw_core>
 )
-target_include_directories(bwaudio
-  PUBLIC  include
-  PRIVATE src ${dr_wav_SOURCE_DIR})
+target_include_directories(bwaudio PUBLIC include PRIVATE src ${dr_wav_SOURCE_DIR} ${CJSON_INC})
 target_compile_definitions(bwaudio PRIVATE BW_BUILD_DLL)
 if(MSVC)
   target_compile_options(bwaudio PRIVATE /W4)
-  # rt.c uses C11 <stdatomic.h>, which MSVC gates behind /experimental:c11atomics. Scope
-  # the flag to that one C file (it is rejected on the C++ ASIO sources) — the property is
-  # directory-wide, so it also covers rt.c in the bw_rt_test target.
-  set_source_files_properties(src/rt.c PROPERTIES COMPILE_OPTIONS /experimental:c11atomics)
 endif()
 if(WIN32)
   target_link_libraries(bwaudio PRIVATE winmm)   # timeBeginPeriod in null_sink.c
@@ -93,11 +114,14 @@ if(BWAUDIO_BUILD_TESTS)
   add_executable(bw_smoke test/smoke.c)
   target_link_libraries(bw_smoke PRIVATE bwaudio)
   add_test(NAME smoke COMMAND bw_smoke)
-  # Keep the lifecycle test hermetic: force the offline sink so it never grabs a real
-  # ASIO device. Drop this env var to exercise the ASIO path on hardware.
-  set_tests_properties(smoke PROPERTIES ENVIRONMENT "BWAUDIO_SINK=null")
+  set_tests_properties(smoke PROPERTIES ENVIRONMENT "BWAUDIO_SINK=null")   # hermetic: no real device
+  if(WIN32)
+    add_custom_command(TARGET bw_smoke POST_BUILD
+      COMMAND ${CMAKE_COMMAND} -E copy_if_different
+              $<TARGET_FILE:bwaudio> $<TARGET_FILE_DIR:bw_smoke>)           # .dll next to the .exe
+  endif()
 
-  # audio-loop check: drives the null sink directly (compiles the sink sources in)
+  # audio-loop check: drives the null sink directly (no core needed)
   add_executable(bw_audio_smoke test/audio_sink_test.c src/sink.c src/null_sink.c)
   target_include_directories(bw_audio_smoke PRIVATE src)
   if(WIN32)
@@ -105,27 +129,23 @@ if(BWAUDIO_BUILD_TESTS)
   endif()
   add_test(NAME audio_sink COMMAND bw_audio_smoke)
 
-  # concurrency-spine check: drives the rt core off the RT path (rt.c now needs sound.c)
-  add_executable(bw_rt_test test/rt_test.c src/rt.c src/sound.c)   # rt.c gets the atomics flag via its source property
-  target_include_directories(bw_rt_test PRIVATE src ${dr_wav_SOURCE_DIR})
+  # off-RT-path checks that compile the core in (bw_core PUBLIC includes propagate)
+  add_executable(bw_rt_test    test/rt_test.c)
+  target_link_libraries(bw_rt_test PRIVATE bw_core)
   add_test(NAME rt COMMAND bw_rt_test)
 
-  # wav + mixing + retire-ack check: drives rt + sound off the RT path
-  add_executable(bw_sound_test test/sound_test.c src/rt.c src/sound.c)
-  target_include_directories(bw_sound_test PRIVATE src ${dr_wav_SOURCE_DIR})
+  add_executable(bw_sound_test test/sound_test.c)
+  target_link_libraries(bw_sound_test PRIVATE bw_core)
   add_test(NAME sound COMMAND bw_sound_test)
-  # Optional: build the sound test with AddressSanitizer to prove the unload-while-playing
-  # path is free of use-after-free (the M3 "done when"). Run: cmake -DBWAUDIO_ASAN=ON ...
+
+  add_executable(bw_dsp_test   test/dsp_test.c)
+  target_link_libraries(bw_dsp_test PRIVATE bw_core)
+  add_test(NAME dsp COMMAND bw_dsp_test)
+
+  # Optional: AddressSanitizer build of the sound test (M3 unload-safety / UAF check).
   option(BWAUDIO_ASAN "Build bw_sound_test with AddressSanitizer" OFF)
   if(BWAUDIO_ASAN AND MSVC)
     target_compile_options(bw_sound_test PRIVATE /fsanitize=address)
     target_link_options(bw_sound_test PRIVATE /INCREMENTAL:NO)
-  endif()
-
-  # keep the .dll next to the dll-linked test exe
-  if(WIN32)
-    add_custom_command(TARGET bw_smoke POST_BUILD
-      COMMAND ${CMAKE_COMMAND} -E copy_if_different
-              $<TARGET_FILE:bwaudio> $<TARGET_FILE_DIR:bw_smoke>)
   endif()
 endif()

@@ -65,6 +65,17 @@ engines. Don't start with the engine bindings.
 - `dirty`-gated recompute; listener move dirties all voices.
 - **Done when:** a source panned around the array localizes correctly for a centered
   listener, and tracks sensibly as the listener position is moved synthetically.
+- **Status: ✅ done.** `layout.c` loads `cave_layout.json` (via cJSON, fetched+pinned) into
+  the `Layout` struct — positions, per-speaker gain_db→linear and delay_ms→samples, the
+  DBAP blur `r` and distance-attenuation curve — with a default 3×3×3 grid when no file is
+  given; `dbap.c` is the listener-relative, constant-power gain solve (see
+  spatialization.md); `align.c` is the per-speaker gain trim + delay-line output stage.
+  `rt.c` calls `dbap_gains` in the dirty-gated `compute_gains` and runs `align_process`
+  after the mix; the engine loads the layout at `bw_create`. `bw_dsp_test` verifies it:
+  a source at each speaker localizes to that channel, the solve is constant-power, two
+  speakers split, moving the listener shifts the distribution, and align applies gain+delay;
+  it also round-trips the committed `examples/cave_layout.json`. The DBAP exponents/r/curve
+  are the documented tuning knobs to dial against the real array.
 
 ## M5 — Binaural monitor
 - `binaural.c`: 26→ambisonics encode (head-oriented) → single ambisonics→binaural

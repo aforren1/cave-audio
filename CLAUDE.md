@@ -61,18 +61,19 @@ src/
   null_sink.c          offline (no-hardware) sink: threaded silence + timestamps. [M1]
   asio_sink.cpp        ASIO host: driver load, bufferSwitch, sample-pos timestamp. [M1]
   sound.h / sound.c    wav decode to mono float via dr_wav (Sound table lives in rt.c). [M3]
+  layout.h / layout.c  speaker geometry load (cave_layout.json via cJSON) + default grid. [M4]
+  dbap.h / dbap.c      listener-relative, constant-power DBAP gain solve. [M4]
+  align.h / align.c    per-speaker gain trim + delay-line output stage. [M4]
   binaural.c           26->ambisonics->HRTF monitor (Steam Audio). [M5]
-  dbap.c               listener-relative gain solve. [M4]
-  layout.c             speaker geometry load + per-speaker gain/delay alignment. [M4]
   natnet.c             OptiTrack pose ingest (off-wire, see docs/build.md). [M6]
-test/                  bw_smoke, bw_audio_smoke, bw_rt_test (rings/commit), bw_sound_test (wav/retire).
+test/                  bw_smoke, bw_audio_smoke, bw_rt_test, bw_sound_test, bw_dsp_test (layout/DBAP/align).
 bindings/
   unity/               P/Invoke + BwAudio/BwEmitter (see docs/integration.md).
   unreal/              module + component.
 docs/                  Specs. Start here.
 examples/              cave_layout.json (see docs/layout-schema.md).
-third_party/           asiosdk/ (GPLv3 option, vendored), steamaudio/; dr_wav is fetched by
-                       CMake (FetchContent, pinned) — see third_party/README.md.
+third_party/           asiosdk/ (GPLv3 option, vendored), steamaudio/; dr_wav + cJSON are
+                       fetched by CMake (FetchContent, pinned) — see third_party/README.md.
 ```
 
 ## Build
@@ -87,16 +88,17 @@ cmake --build build --config RelWithDebInfo
 ctest --test-dir build -C RelWithDebInfo      # runs the bw_smoke lifecycle check
 ```
 
-**Current state (M3):** builds `bwaudio.dll` + four tests. `bw_start` opens a device
-sink (null/ASIO behind `sink.h`, `BWAUDIO_SINK=null|asio`) and runs the audio loop.
-`rt.c` is the concurrency spine (two SPSC rings, voice + sound tables, `drain_commands`,
-the staging→active commit snapshot, generation-counted handles) plus the retire-ack
-handshake; the whole `bw_*` per-frame + asset API forwards to it. `sound.c` decodes wav
-to mono float (dr_wav), and `mix_voice` plays `sound->pcm` with a per-block gain ramp.
-**Routing is still a placeholder** (one position-derived channel) until M4's DBAP solve.
-Do not bake ASIO assumptions outside `asio_sink.cpp`. The atomics in `rt.c` need
-`/experimental:c11atomics` on MSVC (wired in CMake); `-DBWAUDIO_ASAN=ON` builds
-`bw_sound_test` under AddressSanitizer for the unload-safety check.
+**Current state (M4):** builds `bwaudio.dll` + five tests. `bw_start` opens a device sink
+(null/ASIO behind `sink.h`, `BWAUDIO_SINK=null|asio`) and runs the audio loop. `rt.c` is
+the concurrency spine (two SPSC rings, voice + sound tables, commit snapshot, generation
+handles) + retire-ack; the whole `bw_*` API forwards to it. `sound.c` decodes wav (dr_wav)
+and `mix_voice` plays `sound->pcm` with a gain ramp. **Spatialization is real now:**
+`layout.c` loads the surveyed geometry (`cave_layout.json` via cJSON, default grid
+otherwise), `dbap.c` is the listener-relative constant-power gain solve (dirty-gated in
+`compute_gains`), and `align.c` applies the per-speaker gain trim + delay after the mix.
+Still placeholder: the binaural monitor (M5) and OptiTrack ingest (M6). Do not bake ASIO
+assumptions outside `asio_sink.cpp`. The atomics in `rt.c` need `/experimental:c11atomics`
+on MSVC (wired in CMake); `-DBWAUDIO_ASAN=ON` builds `bw_sound_test` under ASan.
 
 ## What NOT to do
 

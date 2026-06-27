@@ -53,6 +53,14 @@ change the SHA. For an offline build, point CMake at a local copy:
 cmake -S . -B build -DFETCHCONTENT_SOURCE_DIR_DR_WAV=/path/to/dir-containing-dr_wav.h ...
 ```
 
+## cJSON (layout parsing, M4)
+
+**Not vendored here.** CMake fetches `cJSON.c` + `cJSON.h` via `FetchContent`, pinned to the
+**v1.7.19** release commit (`c859b25da02955fef659d658b8f324b5cde87be3`); cJSON is MIT and two
+files, compiled straight into `bw_core`. `layout.c` uses it to parse `cave_layout.json`. Bump
+by changing the SHA; offline builds can override `FETCHCONTENT_SOURCE_DIR_CJSON_SRC` /
+`..._CJSON_HDR`.
+
 ## Later milestones
 
 - **Steam Audio** (M5, binaural) → `third_party/steamaudio/`

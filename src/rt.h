@@ -17,6 +17,7 @@
 #define BW_RT_H
 
 #include "sink.h"          /* BwTimestamp, BW_CHANNELS */
+#include "layout.h"        /* Layout (for rt_set_layout) */
 
 #include <stdbool.h>
 #include <stdint.h>
@@ -51,6 +52,7 @@ typedef struct RtCore RtCore;   /* opaque */
 /* ---- lifecycle (control thread; allocates) ---- */
 RtCore* rt_create(uint32_t voice_cap, uint32_t sound_cap, uint32_t sample_rate, uint32_t channels);
 void    rt_destroy(RtCore* c);
+void    rt_set_layout(RtCore* c, const Layout* L);   /* call before bw_start / while stopped */
 
 /* ---- assets (control thread; file I/O + alloc) ---- */
 uint32_t rt_load_sound  (RtCore* c, const char* path, char* err, size_t errcap); /* 0 on failure */

@@ -8,6 +8,7 @@
 #include "bwaudio.h"
 #include "sink.h"
 #include "rt.h"
+#include "layout.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -48,6 +49,16 @@ BwEngine* bw_create(const BwConfig* cfg) {
     if (e->cfg.block_size  == 0) e->cfg.block_size  = 256;
     e->rt = rt_create(BW_VOICE_CAP, BW_SOUND_CAP, e->cfg.sample_rate, BW_CHANNELS);
     if (!e->rt) { free(e); return NULL; }
+    /* Load the surveyed speaker geometry if given; otherwise keep the default grid. A load
+     * failure is non-fatal (engine usable with the default layout) but surfaces via
+     * bw_last_error. Done here, before bw_start, so the audio thread isn't running. */
+    if (e->cfg.layout_path && e->cfg.layout_path[0]) {
+        Layout L;
+        if (layout_load(e->cfg.layout_path, e->cfg.sample_rate, &L, e->errbuf, sizeof e->errbuf))
+            rt_set_layout(e->rt, &L);
+        else
+            set_error(e, e->errbuf[0] ? e->errbuf : "bw_create: layout load failed");
+    }
     return e;
 }
 
