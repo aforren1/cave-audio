@@ -32,6 +32,17 @@ engines. Don't start with the engine bindings.
 - A test voice playing a generated tone routed to one channel, moved via `set_pos`.
 - **Done when:** triggering/moving a voice from a test main thread is glitch-free and
   ThreadSanitizer/Helgrind is clean on the ring (test the ring logic off the RT path).
+- **Status: ~done.** `src/rt.c` (behind `src/rt.h`) implements the two SPSC rings,
+  voice table, `drain_commands`, the staging→active commit snapshot, generation-counted
+  handles + free-list, and the event ring; the full `bw_source_*` / `bw_set_listener_pose`
+  / `bw_commit` API forwards to it. `bw_rt_test` drives the consumer off the RT path and
+  verifies the commit snapshot, generation stale-drop, play/stop, gain scaling, and
+  position routing. The mixer is a **placeholder** — a 440 Hz test tone routed to one
+  position-derived channel with a per-block gain ramp; M3 swaps in wav playback
+  (`mix_voice` reading `sound->pcm`) and M4 the DBAP 26-gain solve. Remaining: the
+  ThreadSanitizer/Helgrind pass needs a Clang/Linux build (MSVC has no TSan) — see
+  `docs/build.md`; and the `bw_play_oneshot` / `EVT_VOICE_ENDED` natural-end recycle path
+  lands with M3.
 
 ## M3 — wav + voice mixing
 - `sound.c` (dr_wav load, buffer lifetime, retire-ack), `mix_voice` with gain ramp.

@@ -1,24 +1,19 @@
 /*
- * engine.c — M0 stub implementation of the bwaudio public C ABI.
- *
- * This milestone exists only to prove the library builds, links, and hands back
- * a valid opaque handle (see docs/roadmap.md "M0 — Scaffolding"). Every call is a
- * no-op beyond bookkeeping: there is no audio thread, no ASIO device, no rings,
- * and no DSP yet. Those arrive in M1+ per the roadmap. The real types (Voice,
- * Sound, Layout, the SPSC rings) are specified in docs/internal-types.h and
- * docs/concurrency.md and will replace the placeholders below.
+ * engine.c — public C ABI: lifecycle, the device sink, and the control-thread side of
+ * the API. The real-time machinery (rings, voice table, commit snapshot, mixing) lives
+ * in rt.c behind sink.h's render callback; engine.c forwards the per-frame bw_* calls to
+ * it. M0 = builds/links; M1 = device sink + audio loop; M2 = the concurrency spine.
+ * Sounds (bw_load_sound) are still stubs until M3.
  */
 #include "bwaudio.h"
 #include "sink.h"
+#include "rt.h"
 
 #include <stdlib.h>
 #include <string.h>
 
-/* BW_CHANNELS (the array width) comes from sink.h. */
+#define BW_VOICE_CAP 256       /* max simultaneous sources */
 
-/* Opaque engine object. The real one (docs/internal-types.md) carries the rings,
- * voice table, bus, and layout; M1 adds the device sink + audio loop, but DSP
- * (mixing/DBAP) is still M2+, so the block just emits silence. */
 struct BwEngine {
     BwConfig    cfg;
     int         started;
@@ -26,14 +21,13 @@ struct BwEngine {
     char        errbuf[256];
 
     BwSink*     sink;              /* device/offline sink; owns the audio thread */
+    RtCore*     rt;               /* rings + voice table + mixer (rt.c) */
 
-    uint32_t    next_source;       /* hands out distinct, non-zero stub handles */
-    uint32_t    next_sound;
+    uint32_t    next_sound;        /* M3: real sound handles; stub counter for now */
 };
 
-/* Handles are (index | generation<<16); 0 is invalid (see include/bwaudio.h).
- * The stub uses a fixed generation of 1 and a monotonically increasing index. */
-static uint32_t make_handle(uint32_t index) {
+/* Sound handles are (index | generation<<16); the M2 stub uses gen 1. M3 replaces this. */
+static uint32_t make_sound_handle(uint32_t index) {
     return (index & 0xFFFFu) | (1u << 16);
 }
 
@@ -43,12 +37,10 @@ static void set_error(BwEngine* e, const char* msg) {
     e->last_error = (msg && e->errbuf[0]) ? e->errbuf : msg;
 }
 
-/* The audio block. Runs on the sink's audio thread. M1: 26 channels of silence +
- * timestamp capture. M2 drains the command ring here; M3+ mixes voices; the output
- * stage (align_speakers) and the binaural tap follow (see docs/concurrency.md). */
+/* The audio block (sink's audio thread): drain the command ring and mix into `bus`. */
 static void engine_render(void* user, float* bus, uint32_t nframes, const BwTimestamp* ts) {
-    (void)user; (void)ts;
-    memset(bus, 0, sizeof(float) * (size_t)nframes * BW_CHANNELS);
+    BwEngine* e = (BwEngine*)user;
+    rt_render(e->rt, bus, nframes, ts);
 }
 
 /* ---- lifecycle ---- */
@@ -60,8 +52,9 @@ BwEngine* bw_create(const BwConfig* cfg) {
     e->cfg = *cfg;
     if (e->cfg.sample_rate == 0) e->cfg.sample_rate = 48000;   /* sane defaults */
     if (e->cfg.block_size  == 0) e->cfg.block_size  = 256;
-    e->next_source = 1;
-    e->next_sound  = 1;
+    e->next_sound = 1;
+    e->rt = rt_create(BW_VOICE_CAP, e->cfg.sample_rate, BW_CHANNELS);
+    if (!e->rt) { free(e); return NULL; }
     return e;
 }
 
@@ -83,14 +76,15 @@ int bw_start(BwEngine* e) {
 
 int bw_stop(BwEngine* e) {
     if (!e) return 1;
-    if (e->sink) { bw_sink_close(e->sink); e->sink = NULL; }
+    if (e->sink) { bw_sink_close(e->sink); e->sink = NULL; }   /* joins the audio thread */
     e->started = 0;
     return 0;
 }
 
 void bw_destroy(BwEngine* e) {
     if (!e) return;
-    if (e->sink) bw_sink_close(e->sink);
+    if (e->sink) bw_sink_close(e->sink);                       /* stop audio before freeing rt */
+    rt_destroy(e->rt);
     free(e);
 }
 
@@ -98,45 +92,46 @@ const char* bw_last_error(BwEngine* e) {
     return e ? e->last_error : NULL;
 }
 
-/* ---- assets ---- */
+/* ---- assets (M3 implements real wav loading) ---- */
 
 BwSound bw_load_sound(BwEngine* e, const char* path) {
     (void)path;                 /* M3: dr_wav decode + buffer lifetime */
     if (!e) return 0;
-    return make_handle(e->next_sound++);
+    return make_sound_handle(e->next_sound++);
 }
 
 void bw_unload_sound(BwEngine* e, BwSound snd) {
     (void)e; (void)snd;         /* M3: retire-ack handshake (docs/concurrency.md) */
 }
 
-/* ---- sources ---- */
+/* ---- sources (forward to the rt core) ---- */
 
 BwSource bw_source_create(BwEngine* e) {
-    if (!e) return 0;
-    return make_handle(e->next_source++);
+    return e ? rt_source_create(e->rt) : 0;
 }
+void bw_source_destroy(BwEngine* e, BwSource s)                          { if (e) rt_source_destroy(e->rt, s); }
+void bw_source_set_pos(BwEngine* e, BwSource s, float x, float y, float z) { if (e) rt_source_set_pos(e->rt, s, x, y, z); }
+void bw_source_set_gain(BwEngine* e, BwSource s, float linear)          { if (e) rt_source_set_gain(e->rt, s, linear); }
+void bw_source_play(BwEngine* e, BwSource s, BwSound snd, bool loop)    { if (e) rt_source_play(e->rt, s, snd, loop); }
+void bw_source_stop(BwEngine* e, BwSource s)                           { if (e) rt_source_stop(e->rt, s); }
 
-void bw_source_destroy(BwEngine* e, BwSource s)                          { (void)e; (void)s; }
-void bw_source_set_pos(BwEngine* e, BwSource s, float x, float y, float z) {
-    (void)e; (void)s; (void)x; (void)y; (void)z;                        /* M2: enqueue CMD_SET_POS */
-}
-void bw_source_set_gain(BwEngine* e, BwSource s, float linear)          { (void)e; (void)s; (void)linear; }
-void bw_source_play(BwEngine* e, BwSource s, BwSound snd, bool loop)    { (void)e; (void)s; (void)snd; (void)loop; }
-void bw_source_stop(BwEngine* e, BwSource s)                           { (void)e; (void)s; }
 void bw_play_oneshot(BwEngine* e, BwSound snd, float x, float y, float z, float gain) {
     (void)e; (void)snd; (void)x; (void)y; (void)z; (void)gain;
+    /* M3: allocate a transient voice, play, and auto-recycle it on EVT_VOICE_ENDED. */
 }
 
 /* ---- listener ---- */
 
 void bw_set_listener_pose(BwEngine* e, float px, float py, float pz,
                                        float qx, float qy, float qz, float qw) {
-    (void)e; (void)px; (void)py; (void)pz; (void)qx; (void)qy; (void)qz; (void)qw;
+    if (!e) return;
+    const float p[3] = { px, py, pz };
+    const float q[4] = { qx, qy, qz, qw };
+    rt_set_listener(e->rt, p, q);
 }
 
 /* ---- frame boundary ---- */
 
 void bw_commit(BwEngine* e) {
-    (void)e;                    /* M2: enqueue CMD_COMMIT + drain the event ring */
+    if (e) rt_commit(e->rt);
 }

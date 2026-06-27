@@ -25,6 +25,7 @@ endif()
 # ---- core library (public C ABI in include/bwaudio.h) ----
 add_library(bwaudio SHARED
   src/engine.c
+  src/rt.c
   src/sink.c
   src/null_sink.c
 )
@@ -34,6 +35,10 @@ target_include_directories(bwaudio
 target_compile_definitions(bwaudio PRIVATE BW_BUILD_DLL)
 if(MSVC)
   target_compile_options(bwaudio PRIVATE /W4)
+  # rt.c uses C11 <stdatomic.h>, which MSVC gates behind /experimental:c11atomics. Scope
+  # the flag to that one C file (it is rejected on the C++ ASIO sources) — the property is
+  # directory-wide, so it also covers rt.c in the bw_rt_test target.
+  set_source_files_properties(src/rt.c PROPERTIES COMPILE_OPTIONS /experimental:c11atomics)
 endif()
 if(WIN32)
   target_link_libraries(bwaudio PRIVATE winmm)   # timeBeginPeriod in null_sink.c
@@ -88,6 +93,11 @@ if(BWAUDIO_BUILD_TESTS)
     target_link_libraries(bw_audio_smoke PRIVATE winmm)
   endif()
   add_test(NAME audio_sink COMMAND bw_audio_smoke)
+
+  # concurrency-spine check: drives the rt core off the RT path (compiles rt.c in)
+  add_executable(bw_rt_test test/rt_test.c src/rt.c)   # rt.c gets the atomics flag via its source property
+  target_include_directories(bw_rt_test PRIVATE src)
+  add_test(NAME rt COMMAND bw_rt_test)
 
   # keep the .dll next to the dll-linked test exe
   if(WIN32)

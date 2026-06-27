@@ -55,7 +55,8 @@ See `docs/concurrency.md` for the full model and reference code.
 ```
 include/bwaudio.h      Public C ABI (authoritative contract).
 src/
-  engine.c             create/start/stop/destroy + audio loop. [M0/M1; rings/voices M2]
+  engine.c             public ABI: lifecycle + sink + forwards per-frame calls to rt. [M0/M1/M2]
+  rt.h / rt.c          rings, voice table, commit snapshot, generation handles, mixer. [M2]
   sink.h / sink.c      device-sink abstraction + backend dispatch. [M1]
   null_sink.c          offline (no-hardware) sink: threaded silence + timestamps. [M1]
   asio_sink.cpp        ASIO host: driver load, bufferSwitch, sample-pos timestamp. [M1]
@@ -64,7 +65,7 @@ src/
   layout.c             speaker geometry load + per-speaker gain/delay alignment. [M4]
   sound.c              wav load (dr_wav), buffer lifetime. [M3]
   natnet.c             OptiTrack pose ingest (off-wire, see docs/build.md). [M6]
-test/                  bw_smoke (lifecycle), bw_audio_smoke (audio loop).
+test/                  bw_smoke (lifecycle), bw_audio_smoke (audio loop), bw_rt_test (rings/commit).
 bindings/
   unity/               P/Invoke + BwAudio/BwEmitter (see docs/integration.md).
   unreal/              module + component.
@@ -85,13 +86,14 @@ cmake --build build --config RelWithDebInfo
 ctest --test-dir build -C RelWithDebInfo      # runs the bw_smoke lifecycle check
 ```
 
-**Current state (M1):** builds `bwaudio.dll` + two tests. `bw_start` opens a device
-sink and runs an audio loop that emits 26 channels of silence and captures the block
-timestamp. Two backends behind `sink.h`: the **null sink** (offline, always built;
-verified by `bw_audio_smoke`) and the **ASIO sink** (built when the SDK is vendored —
-see `third_party/README.md`). Select with `BWAUDIO_SINK=null|asio` (default: ASIO with
-null fallback). DSP — mixing, DBAP, binaural — is still M2+. Do not bake ASIO
-assumptions outside `asio_sink.cpp`.
+**Current state (M2):** builds `bwaudio.dll` + three tests. `bw_start` opens a device
+sink (null/ASIO behind `sink.h`, `BWAUDIO_SINK=null|asio`) and runs the audio loop.
+`rt.c` is the concurrency spine: two SPSC rings, the voice table, `drain_commands`, the
+staging→active commit snapshot, and generation-counted handles; the `bw_source_*` /
+`bw_set_listener_pose` / `bw_commit` API forwards to it. **The mixer is a placeholder**
+(a test tone routed to one position-derived channel with a gain ramp) until M3 (wav) and
+M4 (DBAP). Do not bake ASIO assumptions outside `asio_sink.cpp`. The atomics in `rt.c`
+need `/experimental:c11atomics` on MSVC (wired in CMake).
 
 ## What NOT to do
 

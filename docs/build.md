@@ -8,7 +8,17 @@ ASIO assumptions confined to `asio_sink.c`. On other platforms the device backen
 would be ALSA/JACK (Linux) or CoreAudio (macOS), and you would *not* use ASIO there.
 
 Build system: CMake + MSVC (Visual Studio 2022 toolset). The core is C (C11 with
-`stdatomic.h`); Steam Audio and ASIO glue are C/C++.
+`stdatomic.h`); Steam Audio and ASIO glue are C/C++. MSVC gates C11 atomics behind
+`/experimental:c11atomics`; CMake scopes that flag to `src/rt.c` (the only file that uses
+them).
+
+**Race-checking the rings.** The `bw_rt_test` target drives the SPSC ring/commit logic
+off the real-time path (single-threaded, deterministic) and is what runs under `ctest` on
+MSVC. The full ThreadSanitizer/Helgrind pass the roadmap calls for needs a **Clang or
+Linux** build (MSVC ships no TSan, and Helgrind is Valgrind/Linux): build `rt.c` + a
+two-thread driver with `clang -fsanitize=thread` (or run under Helgrind) and exercise one
+producer pushing commands while one consumer drains. Keep that driver off the RT path —
+never let the sanitizer harness add allocation/locks to the callback.
 
 ## Dependencies
 
