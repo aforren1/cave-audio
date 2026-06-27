@@ -115,15 +115,19 @@ int main(void) {
         for (int k = 0; k < NSPK; ++k) DrawSphere(speakers[k], 0.10f, (Color){ 120, 120, 140, 255 });
         DrawLine3D((Vector3){ 0, 0, 0 }, source_pos, (Color){ 200, 80, 80, 180 });
         DrawSphere(source_pos, 0.18f, RED);
-        DrawSphere((Vector3){ 0, 0, 0 }, 0.16f, SKYBLUE);     /* the head, at the array centre */
-        DrawLine3D((Vector3){ 0, 0, 0 }, Vector3Scale(fwd,   0.9f), GREEN);  /* facing */
-        DrawLine3D((Vector3){ 0, 0, 0 }, Vector3Scale(right, 0.9f), RED);    /* right ear */
+        /* the head, at the array centre, with a face that turns with the listener pose:
+         * an orange nose marks "forward", colour-coded ears mark the L/R audio channels. */
+        DrawSphere((Vector3){ 0, 0, 0 }, 0.16f, SKYBLUE);
+        DrawSphere(Vector3Scale(right,  0.17f), 0.055f, RED);       /* right ear -> audio R */
+        DrawSphere(Vector3Scale(right, -0.17f), 0.055f, RAYWHITE);  /* left ear  -> audio L */
+        DrawCylinderEx(Vector3Scale(fwd, 0.13f), Vector3Scale(fwd, 0.30f),
+                       0.06f, 0.0f, 10, ORANGE);                    /* nose -> facing */
         EndMode3D();
 
         DrawText("WASD: move source   R/F: up/down   Q/E: turn head   ESC: quit", 12, 12, 18, RAYWHITE);
         DrawText(TextFormat("source = (%.2f, %.2f, %.2f)   head yaw = %.0f deg",
                             source_pos.x, source_pos.y, source_pos.z, head_yaw * 57.2958f), 12, 36, 18, LIGHTGRAY);
-        DrawText("blue = head   green = facing   red = right ear   (binaural via ASIO)", 12, 60, 16, GRAY);
+        DrawText("head: orange nose = facing   red ear = right (audio R)   white ear = left   (binaural via ASIO)", 12, 60, 16, GRAY);
         EndDrawing();
     }
 
