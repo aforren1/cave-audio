@@ -78,15 +78,27 @@ bool layout_load(const char* path, uint32_t sample_rate, Layout* out, char* err,
     cJSON* dbap = cJSON_GetObjectItemCaseSensitive(root, "dbap");
     if (cJSON_IsObject(dbap)) {
         cJSON* rr = cJSON_GetObjectItemCaseSensitive(dbap, "rolloff_r");
-        if (cJSON_IsNumber(rr)) out->rolloff_r = (float)rr->valuedouble;
+        if (cJSON_IsNumber(rr)) {
+            if (!(rr->valuedouble > 0.0)) { set_err(err, errcap, "layout: dbap.rolloff_r must be > 0"); goto done; }
+            out->rolloff_r = (float)rr->valuedouble;
+        }
         cJSON* da = cJSON_GetObjectItemCaseSensitive(dbap, "distance_attenuation");
         if (cJSON_IsObject(da)) {
             cJSON* ref = cJSON_GetObjectItemCaseSensitive(da, "reference_distance_m");
-            if (cJSON_IsNumber(ref)) out->atten_ref_m = (float)ref->valuedouble;
+            if (cJSON_IsNumber(ref)) {
+                if (!(ref->valuedouble > 0.0)) { set_err(err, errcap, "layout: reference_distance_m must be > 0"); goto done; }
+                out->atten_ref_m = (float)ref->valuedouble;
+            }
             cJSON* ro = cJSON_GetObjectItemCaseSensitive(da, "rolloff");
-            if (cJSON_IsNumber(ro)) out->atten_rolloff = (float)ro->valuedouble;
+            if (cJSON_IsNumber(ro)) {
+                if (!(ro->valuedouble > 0.0)) { set_err(err, errcap, "layout: distance_attenuation.rolloff must be > 0"); goto done; }
+                out->atten_rolloff = (float)ro->valuedouble;
+            }
             cJSON* mg = cJSON_GetObjectItemCaseSensitive(da, "min_gain_db");
-            if (cJSON_IsNumber(mg)) out->atten_min_lin = db_to_lin(mg->valuedouble);
+            if (cJSON_IsNumber(mg)) {
+                if (mg->valuedouble > 0.0) { set_err(err, errcap, "layout: min_gain_db must be <= 0"); goto done; }
+                out->atten_min_lin = db_to_lin(mg->valuedouble);
+            }
         }
     }
 
@@ -94,7 +106,8 @@ bool layout_load(const char* path, uint32_t sample_rate, Layout* out, char* err,
     memset(seen, 0, sizeof seen);
     uint32_t maxdelay = 0;
     for (int i = 0; i < (int)BW_CHANNELS; ++i) {
-        cJSON* sp   = cJSON_GetArrayItem(speakers, i);
+        cJSON* sp = cJSON_GetArrayItem(speakers, i);
+        if (!cJSON_IsObject(sp)) { set_err(err, errcap, "layout: speaker entry is not an object"); goto done; }
         cJSON* idxj = cJSON_GetObjectItemCaseSensitive(sp, "index");
         cJSON* posj = cJSON_GetObjectItemCaseSensitive(sp, "position");
         if (!cJSON_IsNumber(idxj) || !cJSON_IsArray(posj) || cJSON_GetArraySize(posj) != 3) {
@@ -112,9 +125,20 @@ bool layout_load(const char* path, uint32_t sample_rate, Layout* out, char* err,
             spk->pos[c] = (float)v->valuedouble;
         }
         cJSON* gj = cJSON_GetObjectItemCaseSensitive(sp, "gain_db");
-        spk->gain_lin = cJSON_IsNumber(gj) ? db_to_lin(gj->valuedouble) : 1.0f;
+        if (cJSON_IsNumber(gj)) {
+            double db = gj->valuedouble;
+            if (!(db >= -100.0 && db <= 24.0)) { set_err(err, errcap, "layout: gain_db out of range [-100, 24]"); goto done; }
+            spk->gain_lin = db_to_lin(db);
+        } else {
+            spk->gain_lin = 1.0f;
+        }
         cJSON* dj = cJSON_GetObjectItemCaseSensitive(sp, "delay_ms");
-        double dms = (cJSON_IsNumber(dj) && dj->valuedouble > 0.0) ? dj->valuedouble : 0.0;
+        double dms = 0.0;
+        if (cJSON_IsNumber(dj)) {
+            dms = dj->valuedouble;
+            if (dms < 0.0) dms = 0.0;
+            if (dms > 1000.0) { set_err(err, errcap, "layout: delay_ms too large (> 1000 ms)"); goto done; }
+        }
         uint32_t dsamp = (uint32_t)(dms * 1e-3 * (double)sample_rate + 0.5);
         spk->delay_samples = dsamp;
         if (dsamp > maxdelay) maxdelay = dsamp;

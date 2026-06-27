@@ -50,6 +50,25 @@ static int write_layout_json(const char* path) {
     return k == 26;
 }
 
+/* a grid layout with overridable rolloff_r and speaker-0 gain_db/delay_ms (for negative tests) */
+static int write_layout_with(const char* path, double rolloff_r, double g0_db, double d0_ms) {
+    FILE* f = fopen(path, "wb");
+    if (!f) return 0;
+    const float ax[3] = { -1.5f, 0.f, 1.5f };
+    fprintf(f, "{ \"dbap\": { \"rolloff_r\": %g }, \"speakers\": [\n", rolloff_r);
+    int k = 0;
+    for (int yi = 0; yi < 3; ++yi) for (int xi = 0; xi < 3; ++xi) for (int zi = 0; zi < 3; ++zi) {
+        if (ax[xi] == 0 && ax[yi] == 0 && ax[zi] == 0) continue;
+        double g = (k == 0) ? g0_db : 0.0, d = (k == 0) ? d0_ms : 0.0;
+        fprintf(f, "  {\"index\":%d,\"position\":[%g,%g,%g],\"gain_db\":%g,\"delay_ms\":%g}%s\n",
+                k, ax[xi], ax[yi], ax[zi], g, d, (k == 25) ? "" : ",");
+        ++k;
+    }
+    fprintf(f, "] }\n");
+    fclose(f);
+    return k == 26;
+}
+
 int main(void) {
     /* 1. default layout */
     Layout LD = layout_default();
@@ -132,6 +151,17 @@ int main(void) {
                   "delay shifts the impulse by 4 samples");
             align_destroy(a);
         }
+    }
+
+    /* 7b. layout_load rejects out-of-range values (so bad JSON can't reach the audio thread) */
+    {
+        const char* BJ = "bw_bad_layout.json";
+        Layout B;
+        write_layout_with(BJ, 0.0, 0.0, 0.0);     CHECK(!layout_load(BJ, RATE, &B, err, sizeof err), "rolloff_r=0 is rejected");
+        write_layout_with(BJ, 0.7, 1000.0, 0.0);  CHECK(!layout_load(BJ, RATE, &B, err, sizeof err), "gain_db=1000 is rejected");
+        write_layout_with(BJ, 0.7, 0.0, 1.0e7);   CHECK(!layout_load(BJ, RATE, &B, err, sizeof err), "huge delay_ms is rejected");
+        write_layout_with(BJ, 0.7, 0.0, 0.0);     CHECK( layout_load(BJ, RATE, &B, err, sizeof err), "valid layout still loads");
+        remove(BJ);
     }
 
     /* 8. the committed example layout parses with this loader (schema-vs-parser integration) */
