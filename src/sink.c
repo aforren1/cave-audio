@@ -60,3 +60,4 @@ int         bw_sink_start(BwSink* s)   { return s ? s->vt->start(s) : 1; }
 void        bw_sink_stop(BwSink* s)    { if (s) s->vt->stop(s); }
 void        bw_sink_close(BwSink* s)   { if (s) s->vt->close(s); }
 const char* bw_sink_backend(BwSink* s) { return s ? s->vt->backend(s) : "none"; }
+uint32_t    bw_sink_block_size(BwSink* s) { return s ? s->vt->block_size(s) : 0; }

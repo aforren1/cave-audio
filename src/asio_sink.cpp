@@ -179,8 +179,9 @@ void asio_close(BwSink* base) {
     free(s);
 }
 const char* asio_backend(BwSink* base) { return ((AsioSink*)base)->name; }
+uint32_t asio_block_size(BwSink* base) { return (uint32_t)((AsioSink*)base)->buffer_size; }
 
-const BwSinkVtbl ASIO_VT = { asio_start, asio_stop, asio_close, asio_backend };
+const BwSinkVtbl ASIO_VT = { asio_start, asio_stop, asio_close, asio_backend, asio_block_size };
 
 } /* namespace */
 

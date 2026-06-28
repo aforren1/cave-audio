@@ -48,6 +48,7 @@ typedef struct {
     void        (*stop)(BwSink*);
     void        (*close)(BwSink*);
     const char* (*backend)(BwSink*);
+    uint32_t    (*block_size)(BwSink*);   /* actual frames per callback (driver dictates for ASIO) */
 } BwSinkVtbl;
 
 struct BwSink { const BwSinkVtbl* vt; };
@@ -62,6 +63,7 @@ int          bw_sink_start(BwSink* s);   /* begin the callback loop; 0 = ok     
 void         bw_sink_stop(BwSink* s);    /* stop the loop; safe if already stopped */
 void         bw_sink_close(BwSink* s);   /* stop (if needed) + release             */
 const char*  bw_sink_backend(BwSink* s); /* e.g. "asio:DVS" or "null"              */
+uint32_t     bw_sink_block_size(BwSink* s); /* actual frames per block; 0 if none  */
 
 /* Backend constructors used by bw_sink_open. null is always present; asio only when
  * BW_HAVE_ASIO is defined (third_party/asiosdk vendored — see third_party/README.md). */

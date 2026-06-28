@@ -43,6 +43,7 @@ struct BwEngine {
 
     RtCore*     rt;               /* rings + voice/sound tables + mixer (rt.c) */
     Monitor*    monitor;          /* binaural/both: 26->stereo decode */
+    Layout      layout;           /* effective speaker geometry (for the Steam decoder at start) */
     uint32_t    cap;              /* scratch capacity in frames (== cfg.block_size) */
 
     BwSink*     sink;             /* primary: cave 26ch / binaural 2ch / both array 26ch */
@@ -144,15 +145,10 @@ BwEngine* bw_create(const BwConfig* cfg) {
         else
             set_error(e, e->errbuf[0] ? e->errbuf : "bw_create: layout load failed");
     }
+    e->layout = L;                                  /* kept for the Steam decoder, built at bw_start */
     if (e->profile == BW_PROFILE_BINAURAL || e->profile == BW_PROFILE_BOTH) {
         e->monitor = monitor_create(&L, e->cfg.sample_rate);
         if (!e->monitor) { rt_destroy(e->rt); free(e); return NULL; }
-#ifdef BW_HAVE_STEAMAUDIO
-        /* production HRTF decode; non-fatal — render falls back to the simple-pan monitor if NULL.
-         * frameSize = cfg.block_size; render_binaural feeds the device block, which equals
-         * block_size for the null sink and a matching ASIO driver (off-size blocks fall to silence). */
-        e->steam = steam_monitor_create(&L, e->cfg.sample_rate, e->cfg.block_size, e->cfg.hrtf_path);
-#endif
     }
     return e;
 }
@@ -163,6 +159,9 @@ BwEngine* bw_create(const BwConfig* cfg) {
 static void engine_close_devices(BwEngine* e) {
     if (e->sink_mon) { bw_sink_close(e->sink_mon); e->sink_mon = NULL; }
     if (e->sink)     { bw_sink_close(e->sink);     e->sink     = NULL; }
+#ifdef BW_HAVE_STEAMAUDIO
+    if (e->steam)    { steam_monitor_destroy(e->steam); e->steam = NULL; }   /* after the audio thread joins */
+#endif
     if (e->tracker)  { rt_set_tracker(e->rt, NULL); natnet_close(e->tracker); e->tracker = NULL; }  /* after audio stops */
     free(e->scratch26);  e->scratch26  = NULL;
     free(e->mon_buf[0]); e->mon_buf[0] = NULL;
@@ -198,6 +197,16 @@ int bw_start(BwEngine* e) {
         engine_close_devices(e);
         return 2;                                       /* BW_ERR_DEVICE */
     }
+
+#ifdef BW_HAVE_STEAMAUDIO
+    /* production HRTF decode for binaural/both. phonon's effect frameSize is fixed at create and
+     * must equal the device block n, which the ASIO driver dictates (!= cfg.block_size in general)
+     * — so build it now that the sink is open and its real block size is known. Non-fatal: render
+     * falls back to the simple-pan monitor if NULL. Torn down in engine_close_devices. */
+    if (e->profile == BW_PROFILE_BINAURAL || e->profile == BW_PROFILE_BOTH)
+        e->steam = steam_monitor_create(&e->layout, e->cfg.sample_rate,
+                                        bw_sink_block_size(e->sink), e->cfg.hrtf_path);
+#endif
 
     /* track_internal: ingest OptiTrack pose ourselves and sample it on the audio thread.
      * Configured via env (no NatNet specifics in BwConfig). Non-fatal: a failure leaves the
@@ -243,10 +252,7 @@ int bw_stop(BwEngine* e) {
 
 void bw_destroy(BwEngine* e) {
     if (!e) return;
-    engine_close_devices(e);                            /* stop audio before freeing rt/monitor */
-#ifdef BW_HAVE_STEAMAUDIO
-    steam_monitor_destroy(e->steam);
-#endif
+    engine_close_devices(e);                            /* stop audio + tear down the Steam decoder */
     monitor_destroy(e->monitor);
     rt_destroy(e->rt);
     free(e);
