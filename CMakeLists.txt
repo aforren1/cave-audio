@@ -50,6 +50,7 @@ add_library(bw_core OBJECT
   src/dbap.c
   src/align.c
   src/binaural.c
+  src/ambisonics.c
   src/natnet.c
   ${CJSON_C}
 )
@@ -108,6 +109,21 @@ else()
   message(STATUS "bwaudio: ASIO backend disabled (no SDK at ${ASIO_SDK_DIR}); null sink only")
 endif()
 
+# ---- optional Steam Audio backend (production binaural HRTF decode; later occlusion/reflections) ----
+# Apache-2.0 (GPLv3-compatible). Auto-enabled when the prebuilt phonon SDK is vendored at
+# third_party/steamaudio/ (third_party/README.md). Stage 1 of the production monitor (the SH encode
+# in src/ambisonics.c) is always built + tested; stage 2 (the ambisonics->binaural HRTF decode, gated
+# BW_HAVE_STEAMAUDIO) supersedes the first-cut pan in binaural.c and lands with the SDK, on-SDK-verified.
+set(STEAMAUDIO_DIR "${CMAKE_SOURCE_DIR}/third_party/steamaudio" CACHE PATH "Steam Audio (phonon) SDK root")
+if(EXISTS "${STEAMAUDIO_DIR}/include/phonon.h")
+  target_include_directories(bwaudio PRIVATE "${STEAMAUDIO_DIR}/include")
+  target_link_libraries(bwaudio PRIVATE "${STEAMAUDIO_DIR}/lib/windows-x64/phonon.lib")
+  target_compile_definitions(bwaudio PRIVATE BW_HAVE_STEAMAUDIO)
+  message(STATUS "bwaudio: Steam Audio ENABLED (${STEAMAUDIO_DIR})")
+else()
+  message(STATUS "bwaudio: Steam Audio disabled (no SDK at ${STEAMAUDIO_DIR}); binaural uses the first-cut pan")
+endif()
+
 # ---- tests ----
 # ---- track monitor example (console; prints the live track_internal pose) ----
 add_executable(bw_track_monitor examples/track_monitor.c)
@@ -161,6 +177,10 @@ if(BWAUDIO_BUILD_TESTS)
   add_executable(bw_natnet_test test/natnet_test.c)
   target_link_libraries(bw_natnet_test PRIVATE bw_core)
   add_test(NAME natnet COMMAND bw_natnet_test)
+
+  add_executable(bw_ambi_test test/ambi_test.c)
+  target_link_libraries(bw_ambi_test PRIVATE bw_core)
+  add_test(NAME ambi COMMAND bw_ambi_test)
 
   # Optional: AddressSanitizer build of the sound test (M3 unload-safety / UAF check).
   option(BWAUDIO_ASAN "Build bw_sound_test with AddressSanitizer" OFF)

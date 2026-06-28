@@ -91,14 +91,17 @@ engines. Don't start with the engine bindings.
   (a 26-ch array sink + a 2-ch monitor sink sharing a double-buffer). The listener
   quaternion drives the monitor; the array render ignores it. `bw_monitor_test` verifies
   L/R directionality, median balance, and a 180° head turn flipping the image;
-  `bw_smoke` runs all three profile lifecycles end-to-end (offline sink). **Remaining for
-  full M5:** (1) the production HRTF decode — a higher-order ambisonic encode → single
-  ambisonics→binaural decode via **Steam Audio** (slots in behind `monitor_process`;
-  needs the SDK, unverifiable by ear here); (2) optionally a dedicated **WASAPI** stereo
-  backend — though live headphone output already works today through any 2-ch **ASIO**
-  driver (ASIO4ALL / FlexASIO / the registered Steinberg built-in), so a WASAPI backend is
-  a convenience, not a blocker. An interactive scene (raylib) is the natural way to evaluate
-  "convincing".
+  `bw_smoke` runs all three profile lifecycles end-to-end (offline sink). **Production HRTF
+  decode — in progress, two stages:** (1) **stage 1 done** — the 26→16-ch 3rd-order ambisonic
+  **encode** (`ambisonics.c`, ACN/SN3D real SH), unit-tested (`bw_ambi_test`); it is the
+  SDK-independent front half of the production monitor. (2) **stage 2 pending the SDK** — the
+  single **ambisonics→binaural HRTF decode via Steam Audio**, which supersedes the first-cut pan
+  in `binaural.c`. CMake auto-detects the prebuilt phonon SDK at `third_party/steamaudio/`
+  (`BWAUDIO_WITH_STEAMAUDIO`); the decode is `iplAmbisonicsDecodeEffect` boilerplate but needs
+  the SDK to compile + verify by ear (and to confirm the SH convention match — see
+  `ambisonics.h`). **Optional:** a dedicated **WASAPI** stereo backend — though live headphone
+  output already works through any 2-ch **ASIO** driver (ASIO4ALL / FlexASIO / the Steinberg
+  built-in), so it is a convenience, not a blocker. The raylib playground is the by-ear bench.
 
 ## M6 — OptiTrack ingest
 - `natnet.c`: off-wire NatNet consumer; `track_internal` path samples freshest pose
