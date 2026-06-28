@@ -11,7 +11,8 @@
 #include "layout.h"
 #include "binaural.h"
 #include "natnet.h"
-#include "steam_decode.h"   /* phonon-free interface; impl linked only when BW_HAVE_STEAMAUDIO */
+#include "steam_decode.h"   /* phonon-free interfaces; impls linked only when BW_HAVE_STEAMAUDIO */
+#include "steam_scene.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -55,6 +56,7 @@ struct BwEngine {
 
     NatNet*     tracker;          /* track_internal: NatNet pose ingest (NULL otherwise) */
     SteamMonitor* steam;          /* production HRTF decode (binaural/both); NULL = first-cut pan */
+    SteamScene*   scene;          /* materials occlusion sim (off-thread); NULL without the SDK */
 };
 
 static void set_error(BwEngine* e, const char* msg) {
@@ -150,6 +152,10 @@ BwEngine* bw_create(const BwConfig* cfg) {
         e->monitor = monitor_create(&L, e->cfg.sample_rate);
         if (!e->monitor) { rt_destroy(e->rt); free(e); return NULL; }
     }
+#ifdef BW_HAVE_STEAMAUDIO
+    /* materials occlusion sim (off-thread); non-fatal — occlusion is just unavailable if it fails */
+    e->scene = steam_scene_create(e->rt, e->cfg.sample_rate, e->cfg.block_size, BW_VOICE_CAP);
+#endif
     return e;
 }
 
@@ -253,6 +259,9 @@ int bw_stop(BwEngine* e) {
 void bw_destroy(BwEngine* e) {
     if (!e) return;
     engine_close_devices(e);                            /* stop audio + tear down the Steam decoder */
+#ifdef BW_HAVE_STEAMAUDIO
+    steam_scene_destroy(e->scene);                      /* join the occlusion sim thread before rt is freed */
+#endif
     monitor_destroy(e->monitor);
     rt_destroy(e->rt);
     free(e);
@@ -287,13 +296,42 @@ BwSource bw_source_create(BwEngine* e) {
     return e ? rt_source_create(e->rt) : 0;
 }
 void bw_source_destroy(BwEngine* e, BwSource s)                          { if (e) rt_source_destroy(e->rt, s); }
-void bw_source_set_pos(BwEngine* e, BwSource s, float x, float y, float z) { if (e) rt_source_set_pos(e->rt, s, x, y, z); }
+void bw_source_set_pos(BwEngine* e, BwSource s, float x, float y, float z) {
+    if (!e) return;
+    rt_source_set_pos(e->rt, s, x, y, z);
+#ifdef BW_HAVE_STEAMAUDIO
+    if (e->scene) steam_scene_set_pos(e->scene, s, x, y, z);   /* keep the occlusion sim in sync */
+#endif
+}
 void bw_source_set_gain(BwEngine* e, BwSource s, float linear)          { if (e) rt_source_set_gain(e->rt, s, linear); }
 void bw_source_play(BwEngine* e, BwSource s, BwSound snd, bool loop)    { if (e) rt_source_play(e->rt, s, snd, loop); }
 void bw_source_stop(BwEngine* e, BwSource s)                           { if (e) rt_source_stop(e->rt, s); }
 
 void bw_play_oneshot(BwEngine* e, BwSound snd, float x, float y, float z, float gain) {
     if (e) rt_play_oneshot(e->rt, snd, x, y, z, gain);
+}
+
+/* ---- materials / occlusion (no-ops without the Steam Audio backend) ---- */
+
+void bw_scene_set_mesh(BwEngine* e, const float* verts, int nverts, const int* tris, int ntris,
+                       const float absorption[3], float scattering, const float transmission[3]) {
+#ifdef BW_HAVE_STEAMAUDIO
+    if (e && e->scene) steam_scene_set_mesh(e->scene, verts, nverts, tris, ntris, absorption, scattering, transmission);
+#else
+    (void)e; (void)verts; (void)nverts; (void)tris; (void)ntris; (void)absorption; (void)scattering; (void)transmission;
+#endif
+}
+
+void bw_source_set_occlusion(BwEngine* e, BwSource s, bool on) {
+#ifdef BW_HAVE_STEAMAUDIO
+    if (e && e->scene) steam_scene_set_occlusion(e->scene, s, on);
+#else
+    (void)e; (void)s; (void)on;
+#endif
+}
+
+float bw_source_get_occlusion(BwEngine* e, BwSource s) {
+    return e ? rt_get_occlusion(e->rt, s) : 1.0f;
 }
 
 /* ---- listener ---- */

@@ -64,6 +64,7 @@ void    rt_set_tracker(RtCore* c, const PoseSlot* slot);
  * before the DBAP pan. Called from the off-thread occlusion sim (not the control thread). Stale/
  * recycled handles are dropped; the audio thread ramps to it (no zipper). */
 void    rt_set_occlusion(RtCore* c, uint32_t handle, float transmittance);
+float   rt_get_occlusion(RtCore* c, uint32_t handle);   /* control thread: published factor (1 = clear) */
 
 /* ---- assets (control thread; file I/O + alloc) ---- */
 uint32_t rt_load_sound  (RtCore* c, const char* path, char* err, size_t errcap); /* 0 on failure */

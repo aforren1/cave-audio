@@ -85,6 +85,18 @@ BW_API void     bw_source_play(BwEngine* e, BwSource s, BwSound snd, bool loop);
 BW_API void     bw_source_stop(BwEngine* e, BwSource s);
 BW_API void     bw_play_oneshot(BwEngine* e, BwSound snd, float x, float y, float z, float gain);
 
+/* ---- materials / occlusion (control thread; needs the Steam Audio build) ----
+ * Set the occluding geometry (room space, RH metres; tris are CCW vertex-index triples) with one
+ * material (3-band absorption/transmission + scattering, each 0..1). Load-time. No-op without the
+ * Steam Audio backend. */
+BW_API void     bw_scene_set_mesh(BwEngine* e, const float* verts, int nverts, const int* tris, int ntris,
+                                  const float absorption[3], float scattering, const float transmission[3]);
+/* Enable per-source occlusion: geometry between the source and listener attenuates it (ramped).
+ * Per-frame-safe. No-op without the Steam Audio backend. */
+BW_API void     bw_source_set_occlusion(BwEngine* e, BwSource s, bool on);
+/* Read the source's current occlusion factor (1 = clear .. 0 = fully blocked) — for HUD/diagnostics. */
+BW_API float    bw_source_get_occlusion(BwEngine* e, BwSource s);
+
 /* ---- listener (control thread; skip if track_internal) ---- */
 /* Position in room space. Quaternion is head orientation; used by the binaural
  * monitor only — the array render ignores orientation (real speakers, real ears). */

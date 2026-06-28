@@ -531,6 +531,15 @@ void rt_set_occlusion(RtCore* c, uint32_t handle, float transmittance) {
     v->occ_target = transmittance;
 }
 
+/* Read back a voice's published occlusion factor (1 = clear) — for HUD/diagnostics; 1 if stale. */
+float rt_get_occlusion(RtCore* c, uint32_t handle) {
+    if (!c) return 1.f;
+    uint16_t idx = BW_H_IDX(handle);
+    if (idx >= c->voice_cap) return 1.f;
+    Voice* v = &c->voices[idx];
+    return (v->gen == BW_H_GEN(handle) && v->active) ? v->occ_target : 1.f;
+}
+
 void rt_destroy(RtCore* c) {
     if (!c) return;
     align_destroy(c->aligner);
