@@ -31,7 +31,8 @@
 /* Command ring payload (control -> audio). Fixed-size POD, no framing. */
 enum {
     CMD_SRC_CREATE = 0, CMD_SRC_DESTROY, CMD_SET_POS, CMD_SET_GAIN,
-    CMD_PLAY, CMD_STOP, CMD_SET_LISTENER, CMD_COMMIT, CMD_SOUND_RETIRE
+    CMD_PLAY, CMD_STOP, CMD_SET_LISTENER, CMD_COMMIT, CMD_SOUND_RETIRE,
+    CMD_SET_REFLECTIONS
 };
 typedef struct {
     uint8_t  type;
@@ -41,6 +42,7 @@ typedef struct {
         struct { float g; }                            gain;
         struct { uint32_t sound; uint8_t loop, oneshot; } play;
         struct { float px, py, pz, qx, qy, qz, qw; }   lis;
+        struct { uint8_t on; }                         refl;
     } u;
 } Cmd;
 
@@ -59,6 +61,15 @@ void    rt_set_layout(RtCore* c, const Layout* L);   /* call before bw_start / w
  * freshest head pose from it at block time, overriding the committed listener. NULL detaches.
  * Set before the audio thread starts / after it stops (the audio thread reads the pointer). */
 void    rt_set_tracker(RtCore* c, const PoseSlot* slot);
+
+/* Post-mix aux-send tap: rt_render calls it on the AUDIO thread AFTER the voice loop and BEFORE
+ * align_process, handing it the 26-ch bus, the block size, the active listener pose, and the summed
+ * mono aux send (the post-occlusion/directivity signal of voices opted in via rt_source_set_reflections).
+ * A phonon-free seam — the reflection bed registers a tap that convolves `aux` and sums onto `bus`.
+ * Set while the audio thread is stopped (the audio thread reads the pointer). NULL detaches. */
+typedef void (*RtBusTap)(void* ud, float* bus, uint32_t n, const float* lp, const float* lq, const float* aux);
+void    rt_set_bus_tap(RtCore* c, RtBusTap tap, void* ud);
+void    rt_source_set_reflections(RtCore* c, uint32_t h, bool on);   /* gate this voice into the aux send */
 
 /* Publish a voice's occlusion transmittance (1 = clear .. 0 = blocked), applied to its mono signal
  * before the DBAP pan. Called from the off-thread occlusion sim (not the control thread). Stale/

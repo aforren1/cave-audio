@@ -67,6 +67,19 @@ static int write_ambix4_wav(const char* path, float w, float y, float z, float x
 static int fails = 0;
 #define CHECK(cond, msg) do { if (!(cond)) { printf("FAIL: %s\n", (msg)); ++fails; } } while (0)
 
+/* stub bus tap: counts calls, measures the aux-send energy, and writes a marker onto bus channel 0
+ * (to prove the tap can sum onto the bus, like the reflection bed would). */
+static int      g_tap_calls;
+static uint32_t g_tap_n;
+static double   g_aux_energy;
+static void test_tap(void* ud, float* bus, uint32_t n, const float* lp, const float* lq, const float* aux) {
+    (void)ud; (void)lp; (void)lq;
+    ++g_tap_calls; g_tap_n = n;
+    double e = 0; for (uint32_t i = 0; i < n; ++i) e += fabs(aux[i]);
+    g_aux_energy = e;
+    for (uint32_t i = 0; i < n; ++i) bus[0 * (size_t)n + i] += 0.125f;
+}
+
 int main(void) {
     LD = layout_default();                          /* listener stays at the origin (centre) */
     const char* WAV = "bw_rt_const.wav";
@@ -224,8 +237,30 @@ int main(void) {
         CHECK(0, "could not write ambix test wavs");
     }
 
+    /* 13. bus tap + reflection aux send: the tap is called once per block with the summed mono send
+     *     of opted-in voices, and it can sum onto the bus; opting out removes the voice. */
+    RtCore* ct = rt_create(8, 4, RATE, CH);
+    CHECK(ct != NULL, "rt_create (tap)");
+    if (ct) {
+        uint32_t st = rt_load_sound(ct, WAV, err, sizeof err);
+        uint32_t vt = rt_source_create(ct);
+        rt_source_play(ct, vt, st, true);
+        rt_source_set_pos(ct, vt, LD.speakers[4].pos[0], LD.speakers[4].pos[1], LD.speakers[4].pos[2]);
+        rt_source_set_reflections(ct, vt, true);
+        rt_set_bus_tap(ct, test_tap, NULL);
+        g_tap_calls = 0; g_aux_energy = 0; g_tap_n = 0;
+        rt_commit(ct); render2(ct);
+        CHECK(g_tap_calls == 2 && g_tap_n == (uint32_t)N, "bus tap called once per block with the block size");
+        CHECK(g_aux_energy > 0.0, "aux send carries the opted-in voice's signal");
+        CHECK(chan_energy(0) > 0.0, "tap can sum onto the bus");
+        rt_source_set_reflections(ct, vt, false);    /* opt out -> aux is silent */
+        g_aux_energy = -1.0; rt_commit(ct); render2(ct);
+        CHECK(g_aux_energy == 0.0, "opting out removes the voice from the aux send");
+        rt_destroy(ct);
+    }
+
     remove(WAV);
     if (fails) { printf("rt_test: %d FAILURES\n", fails); return 1; }
-    printf("rt_test OK (DBAP, commit, gen-drop, gain, occlusion, EQ, directivity, ambisonic bed verified)\n");
+    printf("rt_test OK (DBAP, commit, gen-drop, gain, occlusion, EQ, directivity, bed, reflection-tap verified)\n");
     return 0;
 }

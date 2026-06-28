@@ -24,6 +24,7 @@
 
 #define RING_CAP 4096          /* power of two; sized for a worst-case frame burst */
 #define EVT_CAP  1024          /* power of two */
+#define BW_RT_MAX_BLOCK 8192   /* aux-send scratch cap; must be >= any device block (matches engine's BW_MAX_BLOCK) */
 
 typedef struct { Cmd slots[RING_CAP]; _Atomic uint32_t write, read; } CmdRing;
 typedef struct { Evt slots[EVT_CAP];  _Atomic uint32_t write, read; } EvtRing;
@@ -41,6 +42,7 @@ typedef struct {
      * create). occ_cur ramps toward the gated published value, applied to the mono signal pre-pan. */
     float    occ_cur;
     float    dir_cur;                        /* directivity ramp (source-radiation gain, pre-pan) */
+    bool     refl_send;                      /* opted into the reflection aux send (CMD_SET_REFLECTIONS) */
     /* per-band transmission EQ state (audio-thread-only). eqg_cur are the slewed band gains; eq_co
      * are the 3 sections' live coefficients {b0,b1,b2,a1,a2}, INTERPOLATED toward the block's target
      * per sample so the spectral envelope never steps at a block boundary (invariant 4). The 4
@@ -105,6 +107,12 @@ struct RtCore {
     /* readback of the active listener pose, published by the audio thread each block so the
      * control thread can sample it race-free (bw_get_listener_pose — visuals/logging). */
     PoseSlot readback;
+
+    /* post-mix aux-send tap (the reflection bed): a phonon-free hook the audio thread calls after the
+     * voice loop. `aux` is the summed mono send (opted-in voices); set while stopped. */
+    RtBusTap bus_tap;
+    void*    bus_tap_ud;
+    float*   aux;                /* BW_RT_MAX_BLOCK mono samples; the per-block aux send scratch */
 };
 
 /* ---- ring primitives ---- */
@@ -310,6 +318,8 @@ static void drain_commands(RtCore* c) {
                           v->oneshot = cmd->u.play.oneshot != 0; v->playing = true; v->dirty = true; } } break;
         case CMD_STOP: { Voice* v = voice_for(c, cmd->handle);
             if (v) v->playing = false; } break;
+        case CMD_SET_REFLECTIONS: { Voice* v = voice_for(c, cmd->handle);
+            if (v) v->refl_send = cmd->u.refl.on != 0; } break;
         case CMD_SET_LISTENER:
             memcpy(c->lis.p_pending, &cmd->u.lis.px, sizeof(float) * 3);
             memcpy(c->lis.q_pending, &cmd->u.lis.qx, sizeof(float) * 4);
@@ -380,8 +390,9 @@ static void compute_gains(RtCore* c, Voice* v) {
  * Routing (gtarget) is still the M2 placeholder until M4. On a non-looping end the voice
  * stops; a oneshot additionally acks EVT_VOICE_ENDED so the control thread recycles its
  * transient handle. */
-static void mix_voice(RtCore* c, Voice* v, uint16_t idx, float* bus, uint32_t n) {
+static void mix_voice(RtCore* c, Voice* v, uint16_t idx, float* bus, uint32_t n, float* aux) {
     const SoundData* snd = v->sound;
+    const bool send = aux && v->refl_send;          /* contribute to the reflection aux send? */
     float step[BW_CHANNELS];
     for (uint32_t ch = 0; ch < c->channels; ++ch)
         step[ch] = (v->gtarget[ch] - v->gcur[ch]) / (float)n;
@@ -435,6 +446,7 @@ static void mix_voice(RtCore* c, Voice* v, uint16_t idx, float* bus, uint32_t n)
             }
         }
         s *= v->occ_cur * v->dir_cur;                           /* occlusion level + directivity, pre-pan */
+        if (send) aux[i] += s;                                  /* reflection send: post-occ/dir emitted energy */
         if (!ended) ++cur;
         v->occ_cur += occ_step;
         v->dir_cur += dir_step;
@@ -525,13 +537,18 @@ void rt_render(RtCore* c, float* bus, uint32_t nframes, const BwTimestamp* ts) {
     }
 
     memset(bus, 0, sizeof(float) * (size_t)nframes * c->channels);
+    /* the reflection aux send: collected this block if a tap is registered + the block fits the scratch */
+    float* aux = (c->bus_tap && nframes <= BW_RT_MAX_BLOCK) ? c->aux : NULL;
+    if (aux) memset(aux, 0, sizeof(float) * (size_t)nframes);
     for (uint32_t i = 0; i < c->voice_cap; ++i) {
         Voice* v = &c->voices[i];
         if (!v->active || !v->playing || !v->sound) continue;
         if (v->dirty) { compute_gains(c, v); v->dirty = false; }
-        if (v->sound->channels > 1) mix_bed  (c, v, (uint16_t)i, bus, nframes);   /* ambisonic bed */
-        else                        mix_voice(c, v, (uint16_t)i, bus, nframes);   /* mono point source */
+        if (v->sound->channels > 1) mix_bed  (c, v, (uint16_t)i, bus, nframes);        /* ambisonic bed */
+        else                        mix_voice(c, v, (uint16_t)i, bus, nframes, aux);   /* mono point source */
     }
+    if (aux)   /* reflection bed: convolve the aux send + sum onto the bus BEFORE align (so it gets trim+delay too) */
+        c->bus_tap(c->bus_tap_ud, bus, nframes, c->lis.p_active, c->lis.q_active, aux);
     align_process(c->aligner, bus, nframes);   /* per-speaker gain trim + delay (output stage) */
     pose_write(&c->readback, c->lis.p_active, c->lis.q_active);   /* publish for control-thread readback */
 }
@@ -583,6 +600,12 @@ void rt_source_set_gain(RtCore* c, uint32_t h, float linear) {
     if (!isfinite(linear) || linear < 0.f) return;             /* reject NaN/Inf/negative gain */
     Cmd cmd = { .type = CMD_SET_GAIN, .handle = h };
     cmd.u.gain.g = linear;
+    cmd_push(&c->cmds, &cmd);
+}
+
+void rt_source_set_reflections(RtCore* c, uint32_t h, bool on) {
+    Cmd cmd = { .type = CMD_SET_REFLECTIONS, .handle = h };
+    cmd.u.refl.on = on ? 1u : 0u;
     cmd_push(&c->cmds, &cmd);
 }
 
@@ -701,13 +724,14 @@ RtCore* rt_create(uint32_t voice_cap, uint32_t sound_cap, uint32_t sample_rate, 
     c->occ_val    = (_Atomic float*)   calloc(voice_cap, sizeof(_Atomic float));
     c->occ_eq     = (_Atomic uint64_t*)calloc(voice_cap, sizeof(_Atomic uint64_t));
     c->occ_dir    = (_Atomic float*)   calloc(voice_cap, sizeof(_Atomic float));
+    c->aux        = (float*)   calloc(BW_RT_MAX_BLOCK, sizeof(float));   /* reflection aux-send scratch */
     c->gen       = (uint16_t*) calloc(voice_cap, sizeof(uint16_t));
     c->inuse     = (uint8_t*)  calloc(voice_cap, sizeof(uint8_t));
     c->freelist  = (uint32_t*) calloc(voice_cap, sizeof(uint32_t));
     c->sounds    = (SoundSlot*)calloc(sound_cap, sizeof(SoundSlot));
     c->sfreelist = (uint32_t*) calloc(sound_cap, sizeof(uint32_t));
-    if (!c->voices || !c->occ_handle || !c->occ_val || !c->occ_eq || !c->occ_dir || !c->gen ||
-        !c->inuse || !c->freelist || !c->sounds || !c->sfreelist) {
+    if (!c->voices || !c->occ_handle || !c->occ_val || !c->occ_eq || !c->occ_dir || !c->aux ||
+        !c->gen || !c->inuse || !c->freelist || !c->sounds || !c->sfreelist) {
         rt_destroy(c); return NULL;
     }
     const uint64_t eq_flat = eq_pack((float[3]){ 1.f, 1.f, 1.f });
@@ -760,6 +784,10 @@ void rt_set_layout(RtCore* c, const Layout* L) {
 
 void rt_set_tracker(RtCore* c, const PoseSlot* slot) {
     if (c) c->tracker = slot;               /* audio thread reads it; set while stopped */
+}
+
+void rt_set_bus_tap(RtCore* c, RtBusTap tap, void* ud) {
+    if (c) { c->bus_tap = tap; c->bus_tap_ud = ud; }   /* audio thread reads them; set while stopped */
 }
 
 /* Publish a voice's occlusion transmittance (1 = clear, 0 = blocked). Called from the off-thread
@@ -824,6 +852,7 @@ void rt_destroy(RtCore* c) {
     free(c->freelist);
     free(c->inuse);
     free(c->gen);
+    free(c->aux);
     free((void*)c->occ_dir);            /* cast drops the _Atomic qualifier for free() */
     free((void*)c->occ_eq);
     free((void*)c->occ_val);
