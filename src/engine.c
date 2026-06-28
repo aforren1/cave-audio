@@ -11,6 +11,7 @@
 #include "layout.h"
 #include "binaural.h"
 #include "natnet.h"
+#include "steam_decode.h"   /* phonon-free interface; impl linked only when BW_HAVE_STEAMAUDIO */
 
 #include <stdlib.h>
 #include <string.h>
@@ -52,6 +53,7 @@ struct BwEngine {
     volatile LONG mon_idx;        /* both: index of the latest published buffer */
 
     NatNet*     tracker;          /* track_internal: NatNet pose ingest (NULL otherwise) */
+    SteamMonitor* steam;          /* production HRTF decode (binaural/both); NULL = first-cut pan */
 };
 
 static void set_error(BwEngine* e, const char* msg) {
@@ -83,6 +85,9 @@ static void render_binaural(void* user, float* dev2, uint32_t n, const BwTimesta
     rt_render(e->rt, e->scratch26, n, ts);
     float p[3], q[4];
     rt_get_listener(e->rt, p, q);
+#ifdef BW_HAVE_STEAMAUDIO
+    if (e->steam) { steam_monitor_process(e->steam, e->scratch26, p, q, dev2, n); return; }
+#endif
     monitor_process(e->monitor, e->scratch26, p, q, dev2, n);
 }
 
@@ -95,6 +100,10 @@ static void render_both_array(void* user, float* dev26, uint32_t n, const BwTime
     LONG cur = e->mon_idx;                              /* producer is the sole writer of mon_idx */
     float p[3], q[4];
     rt_get_listener(e->rt, p, q);
+#ifdef BW_HAVE_STEAMAUDIO
+    if (e->steam) steam_monitor_process(e->steam, dev26, p, q, e->mon_buf[1 - cur], n);
+    else
+#endif
     monitor_process(e->monitor, dev26, p, q, e->mon_buf[1 - cur], n);
     InterlockedExchange(&e->mon_idx, 1 - cur);          /* publish the back buffer (full barrier) */
 }
@@ -138,6 +147,10 @@ BwEngine* bw_create(const BwConfig* cfg) {
     if (e->profile == BW_PROFILE_BINAURAL || e->profile == BW_PROFILE_BOTH) {
         e->monitor = monitor_create(&L, e->cfg.sample_rate);
         if (!e->monitor) { rt_destroy(e->rt); free(e); return NULL; }
+#ifdef BW_HAVE_STEAMAUDIO
+        /* production HRTF decode; non-fatal — render falls back to the simple-pan monitor if NULL */
+        e->steam = steam_monitor_create(&L, e->cfg.sample_rate, BW_MAX_BLOCK, e->cfg.hrtf_path);
+#endif
     }
     return e;
 }
@@ -229,6 +242,9 @@ int bw_stop(BwEngine* e) {
 void bw_destroy(BwEngine* e) {
     if (!e) return;
     engine_close_devices(e);                            /* stop audio before freeing rt/monitor */
+#ifdef BW_HAVE_STEAMAUDIO
+    steam_monitor_destroy(e->steam);
+#endif
     monitor_destroy(e->monitor);
     rt_destroy(e->rt);
     free(e);

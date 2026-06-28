@@ -94,12 +94,14 @@ engines. Don't start with the engine bindings.
   `bw_smoke` runs all three profile lifecycles end-to-end (offline sink). **Production HRTF
   decode — in progress, two stages:** (1) **stage 1 done** — the 26→16-ch 3rd-order ambisonic
   **encode** (`ambisonics.c`, ACN/SN3D real SH), unit-tested (`bw_ambi_test`); it is the
-  SDK-independent front half of the production monitor. (2) **stage 2 pending the SDK** — the
-  single **ambisonics→binaural HRTF decode via Steam Audio**, which supersedes the first-cut pan
-  in `binaural.c`. CMake auto-detects the prebuilt phonon SDK at `third_party/steamaudio/`
-  (`BWAUDIO_WITH_STEAMAUDIO`); the decode is `iplAmbisonicsDecodeEffect` boilerplate but needs
-  the SDK to compile + verify by ear (and to confirm the SH convention match — see
-  `ambisonics.h`). **Optional:** a dedicated **WASAPI** stereo backend — though live headphone
+  SDK-independent front half of the production monitor. (2) **stage 2 written, gated** —
+  `steam_decode.c` is the **ambisonics→binaural HRTF decode via Steam Audio**
+  (`iplAmbisonicsDecodeEffect`), wired into `engine.c` for binaural + both with the simple-pan
+  monitor as the fallback. It is build-only-with-SDK (`BW_HAVE_STEAMAUDIO`; CMake auto-detects
+  `third_party/steamaudio/`) and **not yet compiled/verified** — pending the SDK, like
+  `asio_sink.cpp` at M1. The load-bearing unknowns are the three CONVENTION helpers in
+  `steam_decode.c` (SH normalization SN3D-vs-N3D, room↔ambisonic axes, head-orientation frame);
+  reading the phonon ambisonics source (if vendored) or a by-ear check pins them. **Optional:** a dedicated **WASAPI** stereo backend — though live headphone
   output already works through any 2-ch **ASIO** driver (ASIO4ALL / FlexASIO / the Steinberg
   built-in), so it is a convenience, not a blocker. The raylib playground is the by-ear bench.
 
