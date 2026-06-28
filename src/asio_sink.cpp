@@ -27,6 +27,7 @@ extern "C" {
 
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 
@@ -245,6 +246,31 @@ extern "C" BwSink* bw_asio_sink_open(uint32_t sample_rate, uint32_t block_size,
         bufsize = bpref;                                             /* driver wants powers of two */
     }
 
+    /* Confirm the driver can actually run at the requested rate before committing. DVS is
+     * fixed-rate (set in Dante Controller), and the engine is already built at cfg.sample_rate, so a
+     * mismatch must fail loudly with the device's actual rate rather than run the whole engine at
+     * the wrong rate. Query first (ASIOCanSampleRate), set, then re-query — some drivers report OK
+     * but ignore the set. (BWAUDIO_ASIO_DRIVER pins the driver if the auto-pick chose a wrong one.) */
+    if (ASIOCanSampleRate((ASIOSampleRate)sample_rate) != ASE_OK) {
+        ASIOSampleRate cur = 0; ASIOGetSampleRate(&cur);
+        char m[176];
+        snprintf(m, sizeof m, "asio: driver '%s' cannot run at %u Hz (device is at %.0f Hz; set DVS/Dante "
+                 "to %u Hz or match cfg.sample_rate to the device)", drv, sample_rate, (double)cur, sample_rate);
+        set_err(err, errcap, m);
+        ASIOExit(); asioDrivers->removeCurrentDriver(); return nullptr;
+    }
+    if (ASIOSetSampleRate((ASIOSampleRate)sample_rate) != ASE_OK) {
+        set_err(err, errcap, "asio: ASIOSetSampleRate failed for a rate the driver reported it could do");
+        ASIOExit(); asioDrivers->removeCurrentDriver(); return nullptr;
+    }
+    ASIOSampleRate got = 0;
+    if (ASIOGetSampleRate(&got) == ASE_OK && (got < (double)sample_rate - 1.0 || got > (double)sample_rate + 1.0)) {
+        char m[176];
+        snprintf(m, sizeof m, "asio: driver '%s' stayed at %.0f Hz, not the requested %u Hz", drv, (double)got, sample_rate);
+        set_err(err, errcap, m);
+        ASIOExit(); asioDrivers->removeCurrentDriver(); return nullptr;
+    }
+
     AsioSink* s = (AsioSink*)calloc(1, sizeof *s);
     if (!s) { set_err(err, errcap, "asio: out of memory"); ASIOExit(); asioDrivers->removeCurrentDriver(); return nullptr; }
     s->base.vt      = &ASIO_VT;
@@ -255,8 +281,6 @@ extern "C" BwSink* bw_asio_sink_open(uint32_t sample_rate, uint32_t block_size,
     s->user         = user;
     strncpy(s->name, "asio:", sizeof s->name - 1);
     strncat(s->name, drv, sizeof s->name - strlen(s->name) - 1);
-
-    ASIOSetSampleRate((ASIOSampleRate)sample_rate);   /* best-effort; DVS is fixed-rate */
 
     for (uint32_t c = 0; c < channels; ++c) {
         s->bufferInfos[c].isInput    = ASIOFalse;
