@@ -262,9 +262,10 @@ the bus. `bw_reflections_config` is **load-time** (the IR length + ambisonic ord
 `bw_start`); zero fields take defaults (`ir_seconds` 1.0, `order` 1, `num_rays` 4096, `num_bounces`
 16), `enabled = 0` means no bed is created and the engine behaves exactly as without it.
 `bw_source_set_reflections` is the per-frame, non-blocking opt-in of a source into the bed's wet send
-(with the bed disabled or no SDK, it gates a send that goes nowhere). v1 ships Steam Audio's
-**parametric (FDN) reverb**; the hybrid early-reflection convolution path is a pending follow-up.
-No-op without the Steam Audio build. Full model: [materials.md](.\materials.md).
+(with the bed disabled or no SDK, it gates a send that goes nowhere). The bed runs Steam Audio's
+**HYBRID** reverb — omni early-reflection convolution + parametric (FDN) tail, decoded across the 26
+speakers (the listener-centric IR is order-0, so the convolution is omni; see
+[materials.md](.\materials.md)). No-op without the Steam Audio build.
 
 ## Handle scheme
 

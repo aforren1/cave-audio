@@ -75,7 +75,20 @@ coefficients are clamped to `[0,1]` and NaN/Inf-sanitized before reaching phonon
 setters are **enforced** load-time: a call after `bw_start` is rejected with a `bw_last_error`
 (the occlusion + reflection sims share one `IPLScene`, and a mesh swap can't run concurrently with
 the reflection thread's ray tracing). The single-material `bw_scene_set_mesh` remains the `nmat==1`
-convenience. The same per-triangle materials drive **both** occlusion (per-band
+convenience.
+
+### Reflection bed: hybrid reverb (omni early reflections + parametric tail)
+
+The reflection bed runs Steam Audio's **HYBRID** reverb: an early-reflection **convolution** plus a
+**parametric (FDN)** late tail. One subtlety drove the implementation: the simulator's reflection IR
+for a *listener-centric* reverb source is **order-0** — only the W (omni) ambisonic channel is
+populated; reading the directional channels (`numChannels > 1`) access-violates inside phonon's
+overlap-save convolution (reproduced down to a one-channel isolation test against phonon 4.8.1). So
+the convolution is run as a **single omni channel** and the resulting `[W,0,0,…]` field is decoded
+across the 26 speakers. That is the right model for a diffuse bed anyway — omni early reflections add
+room character on top of the parametric tail, and neither part is directional for a single
+listener-centric source. (Per-source, position-dependent directional early reflections would need a
+per-source reflection stream, which is out of scope for the shared bed.) The same per-triangle materials drive **both** occlusion (per-band
 transmission) and the reflection bed (absorption/scattering), because both simulators share one
 committed `IPLScene`. A per-triangle smoke test confirms a source behind a `concrete` triangle is
 occluded to ~0.015 while one behind a high-transmission triangle passes at ~0.6.
