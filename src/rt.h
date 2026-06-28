@@ -60,6 +60,11 @@ void    rt_set_layout(RtCore* c, const Layout* L);   /* call before bw_start / w
  * Set before the audio thread starts / after it stops (the audio thread reads the pointer). */
 void    rt_set_tracker(RtCore* c, const PoseSlot* slot);
 
+/* Publish a voice's occlusion transmittance (1 = clear .. 0 = blocked), applied to its mono signal
+ * before the DBAP pan. Called from the off-thread occlusion sim (not the control thread). Stale/
+ * recycled handles are dropped; the audio thread ramps to it (no zipper). */
+void    rt_set_occlusion(RtCore* c, uint32_t handle, float transmittance);
+
 /* ---- assets (control thread; file I/O + alloc) ---- */
 uint32_t rt_load_sound  (RtCore* c, const char* path, char* err, size_t errcap); /* 0 on failure */
 void     rt_unload_sound(RtCore* c, uint32_t sound);  /* safe any time; retire-acked internally */

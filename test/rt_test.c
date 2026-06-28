@@ -130,9 +130,21 @@ int main(void) {
     double e4 = total_energy();
     CHECK(e4 > 0.0 && isfinite(e4) && argmax_channel() == 4, "voice unmoved and bus finite after NaN/Inf inputs");
 
+    /* 8. occlusion attenuates the mono signal pre-pan (ramped), fed via rt_set_occlusion */
+    double e_clear = e4;                              /* h3 un-occluded, at channel 4 */
+    rt_set_occlusion(c, h3, 0.5f); render2(c);
+    CHECK(fabs(total_energy() / e_clear - 0.5) < 0.05, "occlusion 0.5 ~ half energy");
+    rt_set_occlusion(c, h3, 0.0f); render2(c);
+    CHECK(total_energy() < e_clear * 0.02, "occlusion 0 ~ silent");
+    rt_set_occlusion(c, h3, 1.0f); render2(c);
+    CHECK(fabs(total_energy() / e_clear - 1.0) < 0.02, "occlusion restored to 1 ~ full");
+    uint32_t stale_occ = BW_MK_H(BW_H_IDX(h3), (uint16_t)(BW_H_GEN(h3) + 7));
+    rt_set_occlusion(c, stale_occ, 0.0f); render2(c);
+    CHECK(total_energy() > e_clear * 0.5, "occlusion on a stale handle is dropped");
+
     rt_destroy(c);
     remove(WAV);
     if (fails) { printf("rt_test: %d FAILURES\n", fails); return 1; }
-    printf("rt_test OK (DBAP routing, commit snapshot, generation drop, gain all verified)\n");
+    printf("rt_test OK (DBAP routing, commit snapshot, generation drop, gain, occlusion verified)\n");
     return 0;
 }

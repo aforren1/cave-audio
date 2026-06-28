@@ -35,6 +35,10 @@ typedef struct {
     float    pos_pending[3], pos_active[3];
     float    gain_user;
     float    gtarget[BW_CHANNELS], gcur[BW_CHANNELS];
+    /* occlusion transmittance (1 = clear, 0 = fully blocked) applied to the mono signal before the
+     * DBAP pan. occ_target is published by the off-thread occlusion sim; occ_cur ramps to it. */
+    volatile float occ_target;
+    float          occ_cur;
 } Voice;
 
 typedef struct {
@@ -205,6 +209,7 @@ static void drain_commands(RtCore* c) {
             memset(v, 0, sizeof *v);
             v->gen = BW_H_GEN(cmd->handle);
             v->active = true; v->gain_user = 1.f; v->dirty = true;
+            v->occ_target = v->occ_cur = 1.f;       /* clear (un-occluded) by default */
         } break;
         case CMD_SRC_DESTROY: { Voice* v = voice_for(c, cmd->handle);
             if (v) { v->active = false; v->playing = false; v->sound = NULL; } } break;
@@ -268,6 +273,7 @@ static void mix_voice(RtCore* c, Voice* v, uint16_t idx, float* bus, uint32_t n)
     float step[BW_CHANNELS];
     for (uint32_t ch = 0; ch < c->channels; ++ch)
         step[ch] = (v->gtarget[ch] - v->gcur[ch]) / (float)n;
+    const float occ_step = (v->occ_target - v->occ_cur) / (float)n;   /* occlusion ramp (invariant 4) */
 
     uint32_t cur = v->cursor;
     bool ended = false;
@@ -276,14 +282,16 @@ static void mix_voice(RtCore* c, Voice* v, uint16_t idx, float* bus, uint32_t n)
             if (v->loop) cur = 0;
             else         ended = true;
         }
-        float s = ended ? 0.f : snd->pcm[cur];
+        float s = (ended ? 0.f : snd->pcm[cur]) * v->occ_cur;   /* occlude the mono signal pre-pan */
         if (!ended) ++cur;
+        v->occ_cur += occ_step;
         for (uint32_t ch = 0; ch < c->channels; ++ch) {
             bus[(size_t)ch * n + i] += v->gcur[ch] * s;
             v->gcur[ch] += step[ch];
         }
     }
     v->cursor = cur;
+    v->occ_cur = v->occ_target;                                  /* land exactly */
     for (uint32_t ch = 0; ch < c->channels; ++ch) v->gcur[ch] = v->gtarget[ch]; /* land exactly */
 
     if (ended) {
@@ -506,6 +514,21 @@ void rt_set_layout(RtCore* c, const Layout* L) {
 
 void rt_set_tracker(RtCore* c, const PoseSlot* slot) {
     if (c) c->tracker = slot;               /* audio thread reads it; set while stopped */
+}
+
+/* Publish a voice's occlusion transmittance (1 = clear, 0 = blocked). Called from the off-thread
+ * occlusion sim, NOT the control thread — so it touches no rings/free-list, only a single aligned
+ * float the audio thread ramps toward. Gen-checked: a stale/recycled handle is dropped (a brief
+ * mismatch on slot reuse self-corrects on the next sim tick; the smoothed ramp hides it). */
+void rt_set_occlusion(RtCore* c, uint32_t handle, float transmittance) {
+    if (!c) return;
+    uint16_t idx = BW_H_IDX(handle);
+    if (idx >= c->voice_cap) return;
+    Voice* v = &c->voices[idx];
+    if (v->gen != BW_H_GEN(handle) || !v->active) return;
+    if (transmittance < 0.f) transmittance = 0.f;
+    if (transmittance > 1.f) transmittance = 1.f;
+    v->occ_target = transmittance;
 }
 
 void rt_destroy(RtCore* c) {
