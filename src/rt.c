@@ -221,9 +221,11 @@ static const SoundData* sound_for(RtCore* c, uint32_t h) {
  * rides the existing occ_cur scalar. fc's are fixed, so the trig (cos w0 / alpha) is precomputed
  * per sample-rate at rt_create; only A=sqrt(g) varies per update => no transcendentals per sample. */
 enum { EQ_LOWSHELF = 0, EQ_PEAK = 1, EQ_HIGHSHELF = 2 };
-#define EQ_FLOOR 0.0625f       /* per-band floor (-24 dB), matching Steam's normalizeGains */
-#define EQ_SLEW  0.5f          /* per-block band-gain glide toward the published target */
-#define EQ_FLAT  0xFFFFFFFFFFFFull   /* eq_pack({1,1,1}): the flat (passthrough) tilt, as a constant */
+#define EQ_SLEW     0.5f       /* per-block band-gain glide toward the published target */
+#define EQ_FLAT     0xFFFFFFFFFFFFull /* eq_pack({1,1,1}): the flat (passthrough) tilt, as a constant */
+#define EQ_FLAT_EPS 0.001f     /* band gains within +/-0.1% (~0.009 dB) of unity count as flat -> EQ bypassed
+                                * (a deliberately inaudible threshold that keeps un-occluded voices off the
+                                * biquad path; the per-band attenuation floor lives in steam_scene.c). */
 
 /* pack 3 band gains (each clamped to [0,1]) into one u64 = 3x16-bit, for a tear-free atomic publish */
 static inline uint64_t eq_pack(const float g[3]) {
@@ -375,7 +377,7 @@ static void mix_voice(RtCore* c, Voice* v, uint16_t idx, float* bus, uint32_t n)
     bool flat = true;
     for (int b = 0; b < 3; ++b) {
         v->eqg_cur[b] += (gt[b] - v->eqg_cur[b]) * EQ_SLEW;
-        if (v->eqg_cur[b] < 0.999f || v->eqg_cur[b] > 1.001f) flat = false;
+        if (v->eqg_cur[b] < 1.f - EQ_FLAT_EPS || v->eqg_cur[b] > 1.f + EQ_FLAT_EPS) flat = false;
     }
     if (!flat) v->eq_engaged = 1;
     float co_tgt[3][5], co_step[3][5];

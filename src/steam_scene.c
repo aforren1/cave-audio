@@ -47,6 +47,8 @@ struct SteamScene {
 };
 
 enum { FEAT_OCC = 1, FEAT_DIR = 2 };
+#define EQ_BAND_FLOOR 0.0625f   /* -24 dB per-band floor (matches Steam's normalizeGains): the broadband
+                                 * attenuation rides the level scalar, so the EQ tilt never fully silences a band */
 
 static IPLVector3 vec3(const float p[3]) { IPLVector3 v = { p[0], p[1], p[2] }; return v; }
 static void identity_cs(IPLCoordinateSpace3* cs, const float origin[3]) {
@@ -189,7 +191,7 @@ static DWORD WINAPI sim_thread(LPVOID arg) {
                     if (raw[b] > maxg) maxg = raw[b];
                 }
                 if (maxg <= 1e-6f) level = 0.f;          /* fully blocked: silence via level, flat bands */
-                else { level = maxg; for (int b = 0; b < 3; ++b) { bands[b] = raw[b] / maxg; if (bands[b] < 0.0625f) bands[b] = 0.0625f; } }
+                else { level = maxg; for (int b = 0; b < 3; ++b) { bands[b] = raw[b] / maxg; if (bands[b] < EQ_BAND_FLOOR) bands[b] = EQ_BAND_FLOOR; } }
             }
             if (snap_feat[i] & FEAT_DIR) dir = d->directivity;
             rt_set_direct(s->rt, snap_h[i], level, bands, dir);
