@@ -91,7 +91,9 @@ BW_API void     bw_source_stop(BwEngine* e, BwSource s);
 BW_API void     bw_play_oneshot(BwEngine* e, BwSound snd, float x, float y, float z, float gain);
 
 /* ---- ambisonic beds (control thread; a world-locked soundfield decoded straight to the 26 speakers,
- * not DBAP-panned — for diffuse/ambient content). Play a bw_load_ambix asset; no position. ---- */
+ * not DBAP-panned — for diffuse/ambient content). Play a bw_load_ambix asset; no position. Occlusion
+ * and directivity do NOT apply to a bed (it is world-locked diffuse). bw_bed_play requires a
+ * multichannel asset and bw_source_play a mono one — a mismatch is rejected (see bw_last_error). ---- */
 BW_API BwBed bw_bed_create(BwEngine* e);
 BW_API void  bw_bed_play(BwEngine* e, BwBed b, BwSound snd, bool loop);
 BW_API void  bw_bed_set_gain(BwEngine* e, BwBed b, float linear);   /* master gain, ramped */

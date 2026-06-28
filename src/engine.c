@@ -300,7 +300,14 @@ BwSound bw_load_ambix(BwEngine* e, const char* path) {
 
 /* ---- ambisonic beds: a bed is a voice that plays a multichannel asset; mix_bed decodes it ---- */
 BwBed bw_bed_create(BwEngine* e)                                { return bw_source_create(e); }
-void  bw_bed_play(BwEngine* e, BwBed b, BwSound snd, bool loop) { bw_source_play(e, b, snd, loop); }
+void  bw_bed_play(BwEngine* e, BwBed b, BwSound snd, bool loop) {
+    if (!e) return;
+    if (rt_sound_channels(e->rt, snd) <= 1) {       /* a bed needs an ambisonic (multichannel) asset */
+        set_error(e, "bw_bed_play: asset is mono — load it with bw_load_ambix (a 4/9/16-ch AmbiX file)");
+        return;
+    }
+    rt_source_play(e->rt, b, snd, loop);            /* direct: bypass bw_source_play's mono-only guard */
+}
 void  bw_bed_set_gain(BwEngine* e, BwBed b, float linear)       { bw_source_set_gain(e, b, linear); }
 void  bw_bed_stop(BwEngine* e, BwBed b)                         { bw_source_stop(e, b); }
 void  bw_bed_destroy(BwEngine* e, BwBed b)                      { bw_source_destroy(e, b); }
@@ -327,11 +334,23 @@ void bw_source_set_pos(BwEngine* e, BwSource s, float x, float y, float z) {
 #endif
 }
 void bw_source_set_gain(BwEngine* e, BwSource s, float linear)          { if (e) rt_source_set_gain(e->rt, s, linear); }
-void bw_source_play(BwEngine* e, BwSource s, BwSound snd, bool loop)    { if (e) rt_source_play(e->rt, s, snd, loop); }
+void bw_source_play(BwEngine* e, BwSource s, BwSound snd, bool loop) {
+    if (!e) return;
+    if (rt_sound_channels(e->rt, snd) > 1) {        /* a multichannel asset is a bed, not a point source */
+        set_error(e, "bw_source_play: asset is multichannel — use bw_bed_play (or bw_load_sound for a point source)");
+        return;
+    }
+    rt_source_play(e->rt, s, snd, loop);
+}
 void bw_source_stop(BwEngine* e, BwSource s)                           { if (e) rt_source_stop(e->rt, s); }
 
 void bw_play_oneshot(BwEngine* e, BwSound snd, float x, float y, float z, float gain) {
-    if (e) rt_play_oneshot(e->rt, snd, x, y, z, gain);
+    if (!e) return;
+    if (rt_sound_channels(e->rt, snd) > 1) {
+        set_error(e, "bw_play_oneshot: asset is multichannel — oneshots are point sources (use bw_load_sound)");
+        return;
+    }
+    rt_play_oneshot(e->rt, snd, x, y, z, gain);
 }
 
 /* ---- materials / occlusion (no-ops without the Steam Audio backend) ---- */

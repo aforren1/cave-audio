@@ -191,4 +191,6 @@ void sound_unload(SoundData* s) {
     s->pcm = NULL;
     s->frames = 0;
     s->sample_rate = 0;
+    s->channels = 0;
+    s->order = 0;
 }

@@ -346,7 +346,10 @@ static void drain_commands(RtCore* c) {
 
 /* Build the ambisonic bed decode matrix from the layout: for each speaker, sample the SH basis at
  * its direction (room -> ambisonic axes: room x=right/y=up/z=back -> ambi x=front/y=left/z=up) and
- * scale by (2l+1)/L. World-locked: directions are from the room origin, not the moving listener. */
+ * scale by (2l+1)/L. World-locked: directions are from the room origin, not the moving listener.
+ * This is the projection/sampling decode, which assumes a roughly UNIFORM speaker distribution; the
+ * cave grid is only approximately uniform, so it is good for a diffuse bed but a pseudo-inverse
+ * (mode-matching) decode would be exact — a refinement, not needed for v1's diffuse content. */
 static void build_bed_decode(RtCore* c) {
     const float invL = 1.0f / (float)c->channels;
     for (uint32_t s = 0; s < c->channels; ++s) {
@@ -637,6 +640,13 @@ uint32_t rt_load_ambix(RtCore* c, const char* path, char* err, size_t errcap) {
     }
     c->sounds[BW_H_IDX(h)].data = d;
     return h;
+}
+
+/* Channel count of a loaded asset (control thread): 1 = mono point source, 4/9/16 = ambisonic bed.
+ * 0 if the handle is invalid. Lets the engine reject a type-mismatched play (mono on a bed / vice versa). */
+uint16_t rt_sound_channels(RtCore* c, uint32_t sound) {
+    SoundSlot* s = sound_slot_ctrl(c, sound);
+    return s ? s->data.channels : 0;
 }
 
 void rt_unload_sound(RtCore* c, uint32_t sound) {
