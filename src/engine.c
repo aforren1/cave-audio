@@ -295,7 +295,15 @@ void bw_unload_sound(BwEngine* e, BwSound snd) {
 BwSource bw_source_create(BwEngine* e) {
     return e ? rt_source_create(e->rt) : 0;
 }
-void bw_source_destroy(BwEngine* e, BwSource s)                          { if (e) rt_source_destroy(e->rt, s); }
+void bw_source_destroy(BwEngine* e, BwSource s) {
+    if (!e) return;
+#ifdef BW_HAVE_STEAMAUDIO
+    /* clear the occlusion shadow first so the sim tears down this source's IPLSource and stops
+     * simulating the slot (else it leaks + a recycled slot inherits stale enabled/position). */
+    if (e->scene) steam_scene_set_occlusion(e->scene, s, false);
+#endif
+    rt_source_destroy(e->rt, s);
+}
 void bw_source_set_pos(BwEngine* e, BwSource s, float x, float y, float z) {
     if (!e) return;
     rt_source_set_pos(e->rt, s, x, y, z);

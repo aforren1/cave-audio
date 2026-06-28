@@ -58,10 +58,11 @@ static void apply_mesh(SteamScene* s, IPLVector3* verts, int nverts, IPLTriangle
     s->mesh_mi = (IPLint32*)calloc((size_t)ntris, sizeof(IPLint32));   /* all triangles -> material 0 */
     if (!s->mesh_mi) { free(verts); free(tris); s->mesh_verts = NULL; s->mesh_tris = NULL; return; }
 
-    static IPLMaterial mat_store; mat_store = mat;       /* must outlive the create call */
     IPLStaticMeshSettings ms; memset(&ms, 0, sizeof ms);
     ms.numVertices = nverts; ms.numTriangles = ntris; ms.numMaterials = 1;
-    ms.vertices = verts; ms.triangles = tris; ms.materialIndices = s->mesh_mi; ms.materials = &mat_store;
+    /* iplStaticMeshCreate deep-copies the materials array synchronously, so the by-value `mat`
+     * parameter (a stable local for the call's duration) suffices — no shared static needed. */
+    ms.vertices = verts; ms.triangles = tris; ms.materialIndices = s->mesh_mi; ms.materials = &mat;
     if (iplStaticMeshCreate(s->scene, &ms, &s->mesh) == IPL_STATUS_SUCCESS) {
         iplStaticMeshAdd(s->mesh, s->scene);
         iplSceneCommit(s->scene);
@@ -123,23 +124,35 @@ static DWORD WINAPI sim_thread(LPVOID arg) {
             if (!s->srcs[i]) continue;
             IPLSimulationInputs in; memset(&in, 0, sizeof in);
             in.flags = IPL_SIMULATIONFLAGS_DIRECT;
-            in.directFlags = IPL_DIRECTSIMULATIONFLAGS_OCCLUSION;
+            /* occlusion (geometry) + transmission (material), so a glass wall and a concrete wall
+             * differ — without TRANSMISSION the material coefficients would be dead inputs. */
+            in.directFlags = IPL_DIRECTSIMULATIONFLAGS_OCCLUSION | IPL_DIRECTSIMULATIONFLAGS_TRANSMISSION;
             identity_cs(&in.source, &snap_p[i*3]);
             in.occlusionType = IPL_OCCLUSIONTYPE_VOLUMETRIC;   /* smooth partial occlusion */
             in.occlusionRadius = 0.3f;
             in.numOcclusionSamples = 16;
+            in.numTransmissionRays = 1;                        /* single occluding surface (our wall) */
             iplSourceSetInputs(s->srcs[i], IPL_SIMULATIONFLAGS_DIRECT, &in);
         }
 
-        /* 5. run + publish (occlusion factor: 1 = clear, 0 = blocked) */
-        if (s->mesh) {
-            iplSimulatorRunDirect(s->simulator);
-            for (uint32_t i = 0; i < cap; ++i) {
-                if (!s->srcs[i]) continue;
+        /* 5. run + publish a single transmittance scalar (1 = clear, 0 = blocked). No geometry =>
+         * clear, so a removed/failed mesh never leaves a voice stuck attenuated. */
+        int have_mesh = (s->mesh != NULL);
+        if (have_mesh) iplSimulatorRunDirect(s->simulator);
+        for (uint32_t i = 0; i < cap; ++i) {
+            if (!s->srcs[i]) continue;
+            float occ = 1.0f;
+            if (have_mesh) {
                 IPLSimulationOutputs out; memset(&out, 0, sizeof out);
                 iplSourceGetOutputs(s->srcs[i], IPL_SIMULATIONFLAGS_DIRECT, &out);
-                rt_set_occlusion(s->rt, snap_h[i], out.direct.occlusion);
+                /* combine geometric occlusion with the material's mean transmittance: the unoccluded
+                 * fraction passes fully, the occluded fraction passes by the material. (A per-band
+                 * transmission EQ for timbre — vs this level-only scalar — is future work.) */
+                const IPLDirectEffectParams* d = &out.direct;
+                float tr = (d->transmission[0] + d->transmission[1] + d->transmission[2]) / 3.0f;
+                occ = d->occlusion + (1.0f - d->occlusion) * tr;
             }
+            rt_set_occlusion(s->rt, snap_h[i], occ);
         }
 
         Sleep(1000 / SIM_HZ);
@@ -219,9 +232,15 @@ void steam_scene_set_pos(SteamScene* s, uint32_t handle, float x, float y, float
     uint16_t idx = BW_H_IDX(handle);
     if (idx >= s->voice_cap) return;
     EnterCriticalSection(&s->lock);
-    if (s->shadow[idx].handle == handle) {     /* only for the current occupant */
-        s->shadow[idx].pos[0] = x; s->shadow[idx].pos[1] = y; s->shadow[idx].pos[2] = z;
+    /* Reconcile the slot to the calling occupant: if the handle changed (slot reused, or this is the
+     * first call before set_occlusion), adopt it and clear `enabled` — the new occupant hasn't asked
+     * for occlusion. Then always record the position, so a set_pos-before-set_occlusion ordering
+     * still lands the position (previously it was silently dropped, simulating at the origin). */
+    if (s->shadow[idx].handle != handle) {
+        s->shadow[idx].handle  = handle;
+        s->shadow[idx].enabled = 0;
     }
+    s->shadow[idx].pos[0] = x; s->shadow[idx].pos[1] = y; s->shadow[idx].pos[2] = z;
     LeaveCriticalSection(&s->lock);
 }
 

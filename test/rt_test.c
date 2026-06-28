@@ -142,6 +142,16 @@ int main(void) {
     rt_set_occlusion(c, stale_occ, 0.0f); render2(c);
     CHECK(total_energy() > e_clear * 0.5, "occlusion on a stale handle is dropped");
 
+    /* 9. slot recycling clears occlusion: a publish for the prior occupant never attenuates the
+     *    voice that reuses its slot (the audio thread gates the publish on its own generation). */
+    rt_set_occlusion(c, h3, 0.0f); render2(c);
+    CHECK(total_energy() < e_clear * 0.02, "h3 fully occluded before recycling");
+    rt_source_destroy(c, h3); render2(c);
+    uint32_t h4 = rt_source_create(c);
+    CHECK(BW_H_IDX(h4) == BW_H_IDX(h3) && h4 != h3, "occlusion: slot reused with a bumped generation");
+    rt_source_play(c, h4, snd, true); set_pos_spk(c, h4, 4); rt_commit(c); render2(c);
+    CHECK(total_energy() > e_clear * 0.5, "recycled voice is clear despite the prior occupant's occlusion");
+
     rt_destroy(c);
     remove(WAV);
     if (fails) { printf("rt_test: %d FAILURES\n", fails); return 1; }

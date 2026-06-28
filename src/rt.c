@@ -35,10 +35,10 @@ typedef struct {
     float    pos_pending[3], pos_active[3];
     float    gain_user;
     float    gtarget[BW_CHANNELS], gcur[BW_CHANNELS];
-    /* occlusion transmittance (1 = clear, 0 = fully blocked) applied to the mono signal before the
-     * DBAP pan. occ_target is published by the off-thread occlusion sim; occ_cur ramps to it. */
-    volatile float occ_target;
-    float          occ_cur;
+    /* occlusion ramp state (audio-thread-only). The published target lives in the RtCore.occ_*
+     * atomic arrays (outside this memset'd struct, so the off-thread sim never races a voice
+     * create). occ_cur ramps toward the gated published value, applied to the mono signal pre-pan. */
+    float    occ_cur;
 } Voice;
 
 typedef struct {
@@ -59,6 +59,12 @@ struct RtCore {
     Listener lis;
     CmdRing  cmds;
     EvtRing  events;
+
+    /* occlusion handoff (off-thread sim -> audio thread), parallel to `voices` but OUTSIDE the
+     * Voice struct so CMD_SRC_CREATE's memset never races a concurrent sim publish. The sim stores
+     * (occ_handle, occ_val); the audio thread gates on its own v->gen (which it owns) and applies. */
+    _Atomic uint32_t* occ_handle;           /* handle the sim last published for (0 = none) */
+    _Atomic float*    occ_val;              /* published transmittance (1 = clear) */
 
     /* control-thread-owned voice handle allocation */
     uint16_t* gen;                          /* current generation per voice slot */
@@ -205,11 +211,17 @@ static void drain_commands(RtCore* c) {
         const Cmd* cmd = &r->slots[rd & (RING_CAP - 1)];
         switch (cmd->type) {
         case CMD_SRC_CREATE: {
-            Voice* v = &c->voices[BW_H_IDX(cmd->handle)];
+            uint16_t idx = BW_H_IDX(cmd->handle);
+            Voice* v = &c->voices[idx];
             memset(v, 0, sizeof *v);
             v->gen = BW_H_GEN(cmd->handle);
             v->active = true; v->gain_user = 1.f; v->dirty = true;
-            v->occ_target = v->occ_cur = 1.f;       /* clear (un-occluded) by default */
+            v->occ_cur = 1.f;                       /* clear (un-occluded) by default */
+            /* drop any publish the sim left for the prior occupant of this slot (both stores are
+             * atomic, so a concurrent sim publish for the old handle can't tear; either way the new
+             * gen won't match it). */
+            atomic_store_explicit(&c->occ_handle[idx], 0u,   memory_order_relaxed);
+            atomic_store_explicit(&c->occ_val[idx],    1.f,  memory_order_relaxed);
         } break;
         case CMD_SRC_DESTROY: { Voice* v = voice_for(c, cmd->handle);
             if (v) { v->active = false; v->playing = false; v->sound = NULL; } } break;
@@ -273,7 +285,13 @@ static void mix_voice(RtCore* c, Voice* v, uint16_t idx, float* bus, uint32_t n)
     float step[BW_CHANNELS];
     for (uint32_t ch = 0; ch < c->channels; ++ch)
         step[ch] = (v->gtarget[ch] - v->gcur[ch]) / (float)n;
-    const float occ_step = (v->occ_target - v->occ_cur) / (float)n;   /* occlusion ramp (invariant 4) */
+    /* gate the sim's publish on our own generation (we own v->gen, so this is race-free): apply the
+     * published transmittance only if it was published for THIS occupant, else treat as clear. Read
+     * once into a local so the ramp aims at and lands on the same value (invariant 4 — no jump). */
+    const uint32_t myh = BW_MK_H(idx, v->gen);
+    const float occ_tgt = (atomic_load_explicit(&c->occ_handle[idx], memory_order_acquire) == myh)
+                        ? atomic_load_explicit(&c->occ_val[idx], memory_order_relaxed) : 1.0f;
+    const float occ_step = (occ_tgt - v->occ_cur) / (float)n;   /* occlusion ramp (invariant 4) */
 
     uint32_t cur = v->cursor;
     bool ended = false;
@@ -291,7 +309,7 @@ static void mix_voice(RtCore* c, Voice* v, uint16_t idx, float* bus, uint32_t n)
         }
     }
     v->cursor = cur;
-    v->occ_cur = v->occ_target;                                  /* land exactly */
+    v->occ_cur = occ_tgt;                                        /* land exactly (same local) */
     for (uint32_t ch = 0; ch < c->channels; ++ch) v->gcur[ch] = v->gtarget[ch]; /* land exactly */
 
     if (ended) {
@@ -478,14 +496,19 @@ RtCore* rt_create(uint32_t voice_cap, uint32_t sound_cap, uint32_t sample_rate, 
     c->channels    = channels;
     c->sample_rate = sample_rate;
     c->voices    = (Voice*)    calloc(voice_cap, sizeof(Voice));
+    c->occ_handle = (_Atomic uint32_t*)calloc(voice_cap, sizeof(_Atomic uint32_t));
+    c->occ_val    = (_Atomic float*)   calloc(voice_cap, sizeof(_Atomic float));
     c->gen       = (uint16_t*) calloc(voice_cap, sizeof(uint16_t));
     c->inuse     = (uint8_t*)  calloc(voice_cap, sizeof(uint8_t));
     c->freelist  = (uint32_t*) calloc(voice_cap, sizeof(uint32_t));
     c->sounds    = (SoundSlot*)calloc(sound_cap, sizeof(SoundSlot));
     c->sfreelist = (uint32_t*) calloc(sound_cap, sizeof(uint32_t));
-    if (!c->voices || !c->gen || !c->inuse || !c->freelist || !c->sounds || !c->sfreelist) {
+    if (!c->voices || !c->occ_handle || !c->occ_val || !c->gen || !c->inuse || !c->freelist ||
+        !c->sounds || !c->sfreelist) {
         rt_destroy(c); return NULL;
     }
+    for (uint32_t i = 0; i < voice_cap; ++i)   /* occlusion starts clear (handle 0 = no publish) */
+        atomic_store_explicit(&c->occ_val[i], 1.0f, memory_order_relaxed);
     c->lis.q_active[3]  = 1.0f;        /* default head orientation = identity (facing forward) */
     c->lis.q_pending[3] = 1.0f;
     c->readback.q[3]    = 1.0f;        /* readback identity until the first block publishes */
@@ -517,27 +540,28 @@ void rt_set_tracker(RtCore* c, const PoseSlot* slot) {
 }
 
 /* Publish a voice's occlusion transmittance (1 = clear, 0 = blocked). Called from the off-thread
- * occlusion sim, NOT the control thread — so it touches no rings/free-list, only a single aligned
- * float the audio thread ramps toward. Gen-checked: a stale/recycled handle is dropped (a brief
- * mismatch on slot reuse self-corrects on the next sim tick; the smoothed ramp hides it). */
+ * occlusion sim, NOT the control thread — so it touches no rings/free-list and (crucially) NONE of
+ * the audio-thread-owned Voice fields: it just deposits (handle, value) into the atomic publish
+ * slot. The audio thread gates on its own generation when it consumes, so a stale/recycled handle
+ * is dropped there (race-free, since the sim never reads v->gen/v->active). */
 void rt_set_occlusion(RtCore* c, uint32_t handle, float transmittance) {
     if (!c) return;
     uint16_t idx = BW_H_IDX(handle);
     if (idx >= c->voice_cap) return;
-    Voice* v = &c->voices[idx];
-    if (v->gen != BW_H_GEN(handle) || !v->active) return;
     if (transmittance < 0.f) transmittance = 0.f;
     if (transmittance > 1.f) transmittance = 1.f;
-    v->occ_target = transmittance;
+    atomic_store_explicit(&c->occ_val[idx],    transmittance, memory_order_relaxed);
+    atomic_store_explicit(&c->occ_handle[idx], handle,        memory_order_release);
 }
 
-/* Read back a voice's published occlusion factor (1 = clear) — for HUD/diagnostics; 1 if stale. */
+/* Read back a voice's published occlusion factor (1 = clear) — for HUD/diagnostics; 1 if the latest
+ * publish was for a different occupant. Race-free: reads only the atomic publish slot. */
 float rt_get_occlusion(RtCore* c, uint32_t handle) {
     if (!c) return 1.f;
     uint16_t idx = BW_H_IDX(handle);
     if (idx >= c->voice_cap) return 1.f;
-    Voice* v = &c->voices[idx];
-    return (v->gen == BW_H_GEN(handle) && v->active) ? v->occ_target : 1.f;
+    return (atomic_load_explicit(&c->occ_handle[idx], memory_order_acquire) == handle)
+         ? atomic_load_explicit(&c->occ_val[idx], memory_order_relaxed) : 1.f;
 }
 
 void rt_destroy(RtCore* c) {
@@ -551,6 +575,8 @@ void rt_destroy(RtCore* c) {
     free(c->freelist);
     free(c->inuse);
     free(c->gen);
+    free((void*)c->occ_val);            /* cast drops the _Atomic qualifier for free() */
+    free((void*)c->occ_handle);
     free(c->voices);
     free(c);
 }
