@@ -77,7 +77,12 @@ BwSound bw_load_sound(BwEngine* e, const char* path);   // 0 = failure
 void    bw_unload_sound(BwEngine* e, BwSound snd);       // safe; retire-acked internally
 ```
 
-Load sounds once, at load time. `bw_unload_sound` is safe to call any time — the
+Load sounds once, at load time. **WAV, FLAC, and MP3** are accepted (decoded to mono
+float by dr_libs, dispatched by file extension). If the file's sample rate differs from
+the engine's, it is **resampled to the engine rate at load** (a windowed-sinc pass) — so a
+44.1 kHz MP3 plays correctly on a 48 kHz engine; only the one-time load cost is paid.
+
+`bw_unload_sound` is safe to call any time — the
 core detaches references on the audio thread and frees only after the retire-ack
 (see concurrency.md), so it will not pull a buffer out from under a playing voice.
 

@@ -12,6 +12,7 @@
  */
 #include "rt.h"
 #include "layout.h"
+#include "sound.h"
 #include "dr_wav.h"
 
 #include <math.h>
@@ -36,6 +37,18 @@ static void render1(RtCore* c) { BwTimestamp ts = { 0, 0 }; rt_render(c, bus, N,
 static void render2(RtCore* c) { render1(c); render1(c); }
 static void set_pos_spk(RtCore* c, uint32_t h, int k) {
     rt_source_set_pos(c, h, LD.speakers[k].pos[0], LD.speakers[k].pos[1], LD.speakers[k].pos[2]);
+}
+
+static int write_const_wav_rate(const char* path, float value, uint32_t frames, uint32_t rate) {
+    drwav_data_format fmt = { drwav_container_riff, DR_WAVE_FORMAT_IEEE_FLOAT, 1, rate, 32 };
+    drwav wav;
+    if (!drwav_init_file_write(&wav, path, &fmt, NULL)) return 0;
+    float* buf = (float*)malloc((size_t)frames * sizeof(float));
+    if (!buf) { drwav_uninit(&wav); return 0; }
+    for (uint32_t i = 0; i < frames; ++i) buf[i] = value;
+    drwav_uint64 wrote = drwav_write_pcm_frames(&wav, frames, buf);
+    free(buf); drwav_uninit(&wav);
+    return wrote == frames;
 }
 
 static int write_const_wav(const char* path, float value, uint32_t frames) {
@@ -125,9 +138,25 @@ int main(void) {
         rt_destroy(c2);
     }
 
+    /* 5. a 44.1 kHz file resamples to the engine rate on load (frames scale, DC preserved) */
+    const char* WAV_44K = "bw_snd_44k.wav";
+    if (write_const_wav_rate(WAV_44K, 0.5f, 4410, 44100)) {
+        SoundData sd;
+        bool ok = sound_load(WAV_44K, RATE, &sd, err, sizeof err);
+        CHECK(ok, ok ? "resample load" : err);
+        if (ok) {
+            uint32_t expect = (uint32_t)(4410.0 * (double)RATE / 44100.0 + 0.5);   /* ~4800 */
+            CHECK(sd.sample_rate == RATE, "resampled sound carries the engine rate");
+            CHECK(sd.frames + 4 > expect && sd.frames < expect + 4, "resampled frame count scales by the rate ratio");
+            CHECK(fabsf(sd.pcm[sd.frames / 2] - 0.5f) < 0.02f, "DC value preserved through resampling");
+            sound_unload(&sd);
+        }
+        remove(WAV_44K);
+    }
+
     remove(WAV_LONG);
     remove(WAV_SHORT);
     if (fails) { printf("sound_test: %d FAILURES\n", fails); return 1; }
-    printf("sound_test OK (wav mix, natural end, oneshot recycle, unload-safety verified)\n");
+    printf("sound_test OK (wav/flac/mp3 decode, resample, oneshot recycle, unload-safety verified)\n");
     return 0;
 }

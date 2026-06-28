@@ -27,16 +27,19 @@ endif()
 # ---- third-party single-header / single-file deps, fetched + pinned (not vendored) ----
 # Offline builds can override with -DFETCHCONTENT_SOURCE_DIR_<NAME>=<dir>. See third_party/README.md.
 include(FetchContent)
-FetchContent_Declare(dr_wav
-  URL https://raw.githubusercontent.com/mackron/dr_libs/fa931f3285ced10ace628f7f1ac951e1951e7ea6/dr_wav.h
-  DOWNLOAD_NO_EXTRACT TRUE)                                   # wav-0.14.5
+# dr_libs (dr_wav / dr_flac / dr_mp3): one pinned snapshot of the whole header-only repo, so the
+# commit lives in exactly ONE place. The gzipped tarball (~220 KB) is smaller than the raw headers,
+# and CMake strips the single top-level dir, so ${dr_libs_SOURCE_DIR} holds the headers directly.
+FetchContent_Declare(dr_libs
+  URL https://github.com/mackron/dr_libs/archive/fa931f3285ced10ace628f7f1ac951e1951e7ea6.tar.gz
+  DOWNLOAD_EXTRACT_TIMESTAMP TRUE)                            # wav-0.14.5 / flac-0.13.3 / mp3-0.7.3, PD or MIT-0
 FetchContent_Declare(cjson_src
   URL https://raw.githubusercontent.com/DaveGamble/cJSON/c859b25da02955fef659d658b8f324b5cde87be3/cJSON.c
   DOWNLOAD_NO_EXTRACT TRUE)                                   # v1.7.19
 FetchContent_Declare(cjson_hdr
   URL https://raw.githubusercontent.com/DaveGamble/cJSON/c859b25da02955fef659d658b8f324b5cde87be3/cJSON.h
   DOWNLOAD_NO_EXTRACT TRUE)
-FetchContent_MakeAvailable(dr_wav cjson_src cjson_hdr)
+FetchContent_MakeAvailable(dr_libs cjson_src cjson_hdr)
 set(CJSON_C   "${cjson_src_SOURCE_DIR}/cJSON.c")
 set(CJSON_INC "${cjson_hdr_SOURCE_DIR}")
 
@@ -54,7 +57,7 @@ add_library(bw_core OBJECT
   src/natnet.c
   ${CJSON_C}
 )
-target_include_directories(bw_core PUBLIC src ${dr_wav_SOURCE_DIR} ${CJSON_INC})
+target_include_directories(bw_core PUBLIC src ${dr_libs_SOURCE_DIR} ${CJSON_INC})
 target_link_libraries(bw_core PUBLIC ws2_32)   # natnet.c uses Winsock (propagates to consumers)
 if(MSVC)
   target_compile_options(bw_core PRIVATE /W4)
@@ -71,7 +74,7 @@ add_library(bwaudio SHARED
   src/null_sink.c
   $<TARGET_OBJECTS:bw_core>
 )
-target_include_directories(bwaudio PUBLIC include PRIVATE src ${dr_wav_SOURCE_DIR} ${CJSON_INC})
+target_include_directories(bwaudio PUBLIC include PRIVATE src ${dr_libs_SOURCE_DIR} ${CJSON_INC})
 target_compile_definitions(bwaudio PRIVATE BW_BUILD_DLL)
 if(MSVC)
   target_compile_options(bwaudio PRIVATE /W4)
@@ -211,7 +214,7 @@ if(BWAUDIO_BUILD_PLAYGROUND)
   FetchContent_MakeAvailable(raylib)
 
   add_executable(bw_playground examples/playground.c)
-  target_include_directories(bw_playground PRIVATE ${dr_wav_SOURCE_DIR})
+  target_include_directories(bw_playground PRIVATE ${dr_libs_SOURCE_DIR})
   target_link_libraries(bw_playground PRIVATE bwaudio raylib)
   if(WIN32)
     add_custom_command(TARGET bw_playground POST_BUILD
