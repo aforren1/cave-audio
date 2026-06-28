@@ -29,6 +29,21 @@ static void w_rb(Buf* o, int32_t id, float x, float y, float z,
     w_i16(o, (int16_t)(valid ? 1 : 0));        /* params: bit 0 = tracking valid */
 }
 
+/* a NAT_MODELDEF rigid-body description: type(1) + sizeInBytes + [name\0, int32 ID, filler] */
+static void w_rbdesc(Buf* o, const char* name, int32_t id, int filler) {
+    w_i32(o, 1);
+    w_i32(o, (int32_t)(strlen(name) + 1) + 4 + filler);    /* sizeInBytes: name\0 + ID + opaque tail */
+    w_cstr(o, name);
+    w_i32(o, id);
+    for (int i = 0; i < filler; ++i) o->b[o->n++] = 0xAB;  /* marker arrays etc. we skip via size */
+}
+/* a non-rigidbody description to be skipped: type + sizeInBytes + opaque body */
+static void w_otherdesc(Buf* o, int32_t type, int body) {
+    w_i32(o, type);
+    w_i32(o, body);
+    for (int i = 0; i < body; ++i) o->b[o->n++] = 0xCD;
+}
+
 /* NatNet 3.x frame prefix (no size prefixes): frameNumber, 1 markerset (2 markers), 1 other */
 static void build_prefix_v3(Buf* o) {
     w_i32(o, 42);                              /* frameNumber */
@@ -81,9 +96,24 @@ int main(void) {
     CHECK(!natnet_parse_frame(o.b, 10, 3, 1, 0, p, q, &tv), "truncated frame -> false");
     CHECK(!natnet_parse_frame(o.b, o.n, 2, 5, 0, p, q, &tv), "NatNet < 3 rejected");
 
+    /* --- NAT_MODELDEF name -> streaming ID resolution (NatNet 4.x) --- */
+    Buf d = { 0 };
+    w_i32(&d, 3);                              /* nDatasets */
+    w_otherdesc(&d, 0, 8);                     /* a markerset description, skipped via sizeInBytes */
+    w_rbdesc(&d, "Head", 12, 20);
+    w_rbdesc(&d, "Wand", 5, 12);
+    int32_t rid = -1;
+    CHECK(natnet_resolve_name(d.b, d.n, 4, 1, "Wand", &rid) && rid == 5,  "resolve name Wand -> 5");
+    CHECK(natnet_resolve_name(d.b, d.n, 4, 1, "Head", &rid) && rid == 12, "resolve name Head -> 12");
+    CHECK(!natnet_resolve_name(d.b, d.n, 4, 1, "Nope", &rid), "resolve missing name -> false");
+    CHECK(!natnet_resolve_name(d.b, d.n, 3, 1, "Head", &rid), "resolve needs NatNet >= 4");
+    for (size_t k = 0; k < d.n; ++k)
+        (void)natnet_resolve_name(d.b, k, 4, 1, "Head", &rid);   /* truncation-safe (ASan-clean) */
+
     /* --- pose seqlock roundtrip --- */
     PoseSlot slot; memset(&slot, 0, sizeof slot);
     float wp[3] = { 1, 2, 3 }, wq[4] = { 0, 0, 0, 1 }, rp[3], rq[4];
+    CHECK(!pose_read(&slot, rp, rq), "fresh slot -> pose_read false (never published)");
     pose_write(&slot, wp, wq);
     CHECK(pose_read(&slot, rp, rq), "pose_read after write");
     CHECK(rp[0] == 1 && rp[1] == 2 && rp[2] == 3 && rq[3] == 1, "pose roundtrip values");

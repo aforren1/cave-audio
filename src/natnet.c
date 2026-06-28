@@ -24,9 +24,11 @@
 
 /* ---- pure parser ---------------------------------------------------------- */
 
-#define NAT_FRAMEOFDATA   7
-#define NAT_CONNECT       0
-#define NAT_SERVERINFO    1
+#define NAT_FRAMEOFDATA       7
+#define NAT_CONNECT           0
+#define NAT_SERVERINFO        1
+#define NAT_REQUEST_MODELDEF  4
+#define NAT_MODELDEF          5
 
 /* little-endian, bounds-checked cursor readers (the wire is LE; x86 is LE, so memcpy is fine) */
 static bool rd_i32(const uint8_t* b, size_t len, size_t* off, int32_t* out) {
@@ -122,6 +124,39 @@ bool natnet_parse_frame(const uint8_t* p, size_t len, int major, int minor,
     return false;
 }
 
+bool natnet_resolve_name(const uint8_t* p, size_t len, int major, int minor,
+                         const char* want_name, int32_t* out_id) {
+    (void)minor;
+    if (major < 4 || !want_name || !out_id) return false;  /* per-description size prefix is NatNet 4.0+ */
+    size_t off = 0;
+    int32_t nDatasets;
+    if (!rd_i32(p, len, &off, &nDatasets) || nDatasets < 0) return false;
+    for (int32_t i = 0; i < nDatasets; ++i) {
+        int32_t type, size;
+        if (!rd_i32(p, len, &off, &type)) return false;
+        if (!rd_i32(p, len, &off, &size) || size < 0) return false;
+        size_t next = off + (size_t)size;
+        if (next > len || next < off) return false;        /* size field within bounds (overflow-safe) */
+        if (type == 1) {                                   /* rigid body description: name\0, int32 ID, ... */
+            char name[256];
+            size_t k = 0, no = off;
+            bool term = false;
+            while (no < next && k < sizeof name - 1) {
+                char c = (char)p[no++];
+                if (c == 0) { term = true; break; }
+                name[k++] = c;
+            }
+            name[k] = 0;
+            if (term && no + 4 <= next) {
+                int32_t id; memcpy(&id, p + no, 4);
+                if (strcmp(name, want_name) == 0) { *out_id = id; return true; }
+            }
+        }
+        off = next;                                        /* skip the rest of this description */
+    }
+    return false;
+}
+
 /* ---- consumer (Winsock; on-hardware-pending) ------------------------------ */
 
 #define WIN32_LEAN_AND_MEAN
@@ -182,6 +217,38 @@ static bool handshake_version(const NatNetConfig* cfg, int* major, int* minor) {
     return (*major > 0);
 }
 
+/* Request the model definitions from the server and resolve a rigid-body name to its streaming
+ * ID. Returns true and sets *out_id on success. Needs a server (command port). */
+static bool resolve_name_via_modeldef(const NatNetConfig* cfg, int major, int minor,
+                                      const char* name, int32_t* out_id) {
+    if (!cfg->server || !cfg->server[0]) return false;
+    SOCKET s = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if (s == INVALID_SOCKET) return false;
+    DWORD tmo = 800;
+    setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (const char*)&tmo, sizeof tmo);
+
+    struct sockaddr_in srv; memset(&srv, 0, sizeof srv);
+    srv.sin_family = AF_INET;
+    srv.sin_port   = htons(cfg->command_port ? cfg->command_port : 1510);
+    inet_pton(AF_INET, cfg->server, &srv.sin_addr);
+
+    uint8_t req[4]; uint16_t id = NAT_REQUEST_MODELDEF, nb = 0;
+    memcpy(req, &id, 2); memcpy(req + 2, &nb, 2);
+    sendto(s, (const char*)req, sizeof req, 0, (struct sockaddr*)&srv, sizeof srv);
+
+    bool found = false;
+    for (int tries = 0; tries < 8 && !found; ++tries) {        /* skip any data frames that arrive first */
+        uint8_t buf[65536];
+        int got = recv(s, (char*)buf, sizeof buf, 0);
+        if (got < 4) break;
+        uint16_t msg; memcpy(&msg, buf, 2);
+        if (msg == NAT_MODELDEF)
+            found = natnet_resolve_name(buf + 4, (size_t)got - 4, major, minor, name, out_id);
+    }
+    closesocket(s);
+    return found;
+}
+
 static DWORD WINAPI receiver(LPVOID arg) {
     NatNet* nn = (NatNet*)arg;
     uint8_t buf[65536];                                        /* max UDP datagram */
@@ -216,9 +283,27 @@ NatNet* natnet_open(const NatNetConfig* cfg, char* err, size_t errcap) {
     nn->rigid_body = cfg->rigid_body;
     nn->pose.q[3] = 1.0f;                                       /* identity until the first frame */
 
-    /* Bitstream version: explicit config wins, else handshake, else default to 3.1. */
-    nn->major = cfg->major; nn->minor = cfg->minor;
-    if (nn->major <= 0 && !handshake_version(cfg, &nn->major, &nn->minor)) { nn->major = 3; nn->minor = 1; }
+    /* Bitstream version. The server knows its own version, so when one is configured the
+     * handshake is authoritative — it can't be desynced by a wrong BWAUDIO_NATNET_VERSION (a
+     * 4.0-vs-4.1 mistake silently mis-parses the size-prefixed sections). The env value is only
+     * a fallback for a pure multicast listen with no command channel; 3.1 is the last resort. */
+    nn->major = 0; nn->minor = 0;
+    if (cfg->server && cfg->server[0]) handshake_version(cfg, &nn->major, &nn->minor);
+    if (nn->major <= 0) { nn->major = cfg->major; nn->minor = cfg->minor; }
+    if (nn->major <= 0) { nn->major = 3; nn->minor = 1; }
+
+    /* Track by name: resolve to a streaming ID via the model definitions (needs a server). A
+     * miss is fatal here — the caller asked for a specific body, so don't silently track another. */
+    if (cfg->rigid_body_name && cfg->rigid_body_name[0]) {
+        if (!cfg->server || !cfg->server[0]) {
+            nn_err(err, errcap, "natnet: tracking by name needs BWAUDIO_NATNET_SERVER"); goto fail;
+        }
+        int32_t id;
+        if (!resolve_name_via_modeldef(cfg, nn->major, nn->minor, cfg->rigid_body_name, &id)) {
+            nn_err(err, errcap, "natnet: rigid body name not found in model definitions"); goto fail;
+        }
+        nn->rigid_body = id;
+    }
 
     nn->sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
     if (nn->sock == INVALID_SOCKET) { nn_err(err, errcap, "natnet: socket() failed"); goto fail; }
@@ -262,8 +347,12 @@ const PoseSlot* natnet_pose(const NatNet* nn) { return nn ? &nn->pose : NULL; }
 void natnet_close(NatNet* nn) {
     if (!nn) return;
     InterlockedExchange(&nn->stop, 1);
-    if (nn->sock != INVALID_SOCKET) closesocket(nn->sock);     /* unblock recvfrom */
+    /* Join FIRST: the receiver's recvfrom has a 200 ms timeout, so it returns and sees ->stop
+     * on its own within one tick. Closing the socket here (from another thread) before the join
+     * would risk the SOCKET handle being recycled by another subsystem and the receiver issuing
+     * recvfrom on a foreign socket. Close only after the thread has exited and released it. */
     if (nn->thread) { WaitForSingleObject(nn->thread, INFINITE); CloseHandle(nn->thread); }
+    if (nn->sock != INVALID_SOCKET) closesocket(nn->sock);
     free(nn);
     WSACleanup();
 }

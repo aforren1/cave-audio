@@ -75,6 +75,10 @@ struct RtCore {
     /* internal tracker (track_internal): the audio thread samples this each block, overriding
      * the committed listener. Set while the audio thread is stopped; NULL = no internal tracker. */
     const PoseSlot* tracker;
+
+    /* readback of the active listener pose, published by the audio thread each block so the
+     * control thread can sample it race-free (bw_get_listener_pose — visuals/logging). */
+    PoseSlot readback;
 };
 
 /* ---- ring primitives ---- */
@@ -323,6 +327,15 @@ void rt_render(RtCore* c, float* bus, uint32_t nframes, const BwTimestamp* ts) {
         mix_voice(c, v, (uint16_t)i, bus, nframes);
     }
     align_process(c->aligner, bus, nframes);   /* per-speaker gain trim + delay (output stage) */
+    pose_write(&c->readback, c->lis.p_active, c->lis.q_active);   /* publish for control-thread readback */
+}
+
+void rt_read_pose(RtCore* c, float p[3], float q[4]) {
+    if (!c) return;
+    if (!pose_read(&c->readback, p, q)) {       /* lost the seqlock race (rare): best-effort direct read */
+        memcpy(p, c->lis.p_active, sizeof(float) * 3);
+        memcpy(q, c->lis.q_active, sizeof(float) * 4);
+    }
 }
 
 /* Active listener pose, for the binaural monitor. Audio thread only (same thread as
@@ -467,6 +480,7 @@ RtCore* rt_create(uint32_t voice_cap, uint32_t sound_cap, uint32_t sample_rate, 
     }
     c->lis.q_active[3]  = 1.0f;        /* default head orientation = identity (facing forward) */
     c->lis.q_pending[3] = 1.0f;
+    c->readback.q[3]    = 1.0f;        /* readback identity until the first block publishes */
     c->layout  = layout_default();
     c->aligner = align_create(channels, &c->layout);
     if (!c->aligner) { rt_destroy(c); return NULL; }

@@ -109,6 +109,15 @@ else()
 endif()
 
 # ---- tests ----
+# ---- track monitor example (console; prints the live track_internal pose) ----
+add_executable(bw_track_monitor examples/track_monitor.c)
+target_link_libraries(bw_track_monitor PRIVATE bwaudio)
+if(WIN32)
+  add_custom_command(TARGET bw_track_monitor POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            $<TARGET_FILE:bwaudio> $<TARGET_FILE_DIR:bw_track_monitor>)   # bwaudio.dll next to the exe
+endif()
+
 option(BWAUDIO_BUILD_TESTS "Build the bwaudio tests" ON)
 if(BWAUDIO_BUILD_TESTS)
   enable_testing()

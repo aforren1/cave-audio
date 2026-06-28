@@ -27,6 +27,8 @@ typedef struct {
     uint16_t    data_port;     /* NatNet data port (default 1511) */
     uint16_t    command_port;  /* NatNet command port (default 1510) */
     int32_t     rigid_body;    /* streaming ID to track; <= 0 => first rigid body in the frame */
+    const char* rigid_body_name; /* track by name instead of ID; resolved to an ID via the model
+                                  * definitions at open (needs `server`). NULL/"" => use rigid_body. */
     int         major, minor;  /* NatNet bitstream version; <= 0 => handshake, else default 3.1 */
 } NatNetConfig;
 
@@ -47,5 +49,11 @@ void            natnet_close(NatNet* nn);
  * over-reads. Requires NatNet major >= 3 (earlier versions embed per-RB marker data). */
 bool natnet_parse_frame(const uint8_t* payload, size_t len, int major, int minor,
                         int32_t want_id, float pos[3], float quat[4], bool* tracking_valid);
+
+/* Pure parser (no socket): scan a NAT_MODELDEF (descriptions) payload for the rigid body named
+ * want_name and return its streaming ID via *out_id. Uses the per-description size prefix to skip
+ * datasets, so it needs NatNet major >= 4 (Motive's modern bitstream). Bounds-checked. */
+bool natnet_resolve_name(const uint8_t* payload, size_t len, int major, int minor,
+                         const char* want_name, int32_t* out_id);
 
 #endif /* BW_NATNET_H */

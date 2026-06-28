@@ -122,12 +122,26 @@ configured by environment variable (kept out of `BwConfig` so the ABI stays stab
 | `BWAUDIO_NATNET_DATA_PORT`    | `1511`          | NatNet data port                              |
 | `BWAUDIO_NATNET_SERVER`       | (unset)         | Motive server IP, for the version handshake   |
 | `BWAUDIO_NATNET_COMMAND_PORT` | `1510`          | NatNet command port (handshake)               |
-| `BWAUDIO_NATNET_RIGIDBODY`    | `0`             | rigid-body streaming ID (0 ⇒ first in frame)  |
+| `BWAUDIO_NATNET_RIGIDBODY`    | `0`             | body to track: a streaming **ID**, or a **name** (resolved via model defs — needs `SERVER`); 0 ⇒ first in frame |
 | `BWAUDIO_NATNET_VERSION`      | auto, else 3.1  | bitstream version `major.minor` override      |
 | `BWAUDIO_NATNET_IFACE`        | any NIC         | local interface IP to bind/join on            |
 
-A NatNet open failure is non-fatal: the engine runs on the committed/default listener and the
-reason surfaces via `bw_last_error`.
+If `BWAUDIO_NATNET_RIGIDBODY` is non-numeric it is treated as a rigid-body **name** and resolved
+to its streaming ID at startup via the model definitions (a `NAT_REQUEST_MODELDEF` exchange) — this
+needs `BWAUDIO_NATNET_SERVER` and NatNet ≥ 4; a name that doesn't resolve fails the open (the
+engine then runs untracked, with the reason in `bw_last_error`). A NatNet open failure is
+non-fatal: the engine runs on the committed/default listener until tracking data arrives.
+
+### Reading back the pose
+
+```c
+void bw_get_listener_pose(BwEngine* e, float p[3], float q[4]);
+```
+
+Returns the pose the engine is currently rendering with — the committed pose, or, under
+`track_internal`, the freshest tracked pose. Safe to poll from the control thread (published by
+the audio thread through a seqlock). For visuals, logging, or bringing up the tracker (see the
+`bw_track_monitor` example). Returns identity until the first audio block / tracked frame.
 
 ## Frame boundary
 

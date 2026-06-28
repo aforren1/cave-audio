@@ -39,6 +39,7 @@ static inline void pose_write(PoseSlot* s, const float p[3], const float q[4]) {
 static inline bool pose_read(const PoseSlot* s, float p[3], float q[4]) {
     for (int t = 0; t < 8; ++t) {
         long s0 = _InterlockedCompareExchange((volatile long*)&s->seq, 0, 0);  /* barriered read */
+        if (s0 == 0) return false;                  /* never published — caller keeps its own pose */
         if (s0 & 1) continue;                       /* writer mid-update */
         memcpy(p, s->p, sizeof s->p);
         memcpy(q, s->q, sizeof s->q);

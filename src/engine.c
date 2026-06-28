@@ -62,8 +62,12 @@ static void set_error(BwEngine* e, const char* msg) {
 
 /* env helpers for the track_internal (NatNet) config — keeps the NatNet wiring out of BwConfig */
 static const char* env_or(const char* name, const char* def) { const char* v = getenv(name); return (v && v[0]) ? v : def; }
-static uint16_t    env_u16(const char* name, uint16_t def)    { const char* v = getenv(name); return (v && v[0]) ? (uint16_t)strtoul(v, NULL, 10) : def; }
-static int32_t     env_i32(const char* name, int32_t def)     { const char* v = getenv(name); return (v && v[0]) ? (int32_t)strtol(v, NULL, 10) : def; }
+static uint16_t    env_u16(const char* name, uint16_t def)    {
+    const char* v = getenv(name);
+    if (!v || !v[0]) return def;
+    unsigned long u = strtoul(v, NULL, 10);
+    return (u == 0 || u > 65535) ? def : (uint16_t)u;   /* out-of-range port -> default, not a truncation */
+}
 
 /* cave: the 26-ch array goes straight to the device. */
 static void render_cave(void* user, float* dev, uint32_t n, const BwTimestamp* ts) {
@@ -185,13 +189,18 @@ int bw_start(BwEngine* e) {
      * engine running on the committed/default listener and surfaces via bw_last_error. Done
      * before bw_sink_start so the pose slot is wired before the audio thread reads it. */
     if (e->cfg.track_internal) {
+        /* BWAUDIO_NATNET_RIGIDBODY is a streaming ID if fully numeric, else a rigid-body name. */
+        const char* rb = getenv("BWAUDIO_NATNET_RIGIDBODY");
+        int32_t rb_id = 0; const char* rb_name = NULL;
+        if (rb && rb[0]) { char* end; long v = strtol(rb, &end, 10); if (*end == 0) rb_id = (int32_t)v; else rb_name = rb; }
         NatNetConfig nc = {
-            .multicast    = env_or("BWAUDIO_NATNET_MULTICAST", "239.255.42.99"),
-            .server       = getenv("BWAUDIO_NATNET_SERVER"),
-            .local_iface  = getenv("BWAUDIO_NATNET_IFACE"),
-            .data_port    = env_u16("BWAUDIO_NATNET_DATA_PORT", 1511),
-            .command_port = env_u16("BWAUDIO_NATNET_COMMAND_PORT", 1510),
-            .rigid_body   = env_i32("BWAUDIO_NATNET_RIGIDBODY", 0),
+            .multicast       = env_or("BWAUDIO_NATNET_MULTICAST", "239.255.42.99"),
+            .server          = getenv("BWAUDIO_NATNET_SERVER"),
+            .local_iface     = getenv("BWAUDIO_NATNET_IFACE"),
+            .data_port       = env_u16("BWAUDIO_NATNET_DATA_PORT", 1511),
+            .command_port    = env_u16("BWAUDIO_NATNET_COMMAND_PORT", 1510),
+            .rigid_body      = rb_id,
+            .rigid_body_name = rb_name,
             .major = 0, .minor = 0,
         };
         const char* ver = getenv("BWAUDIO_NATNET_VERSION");
@@ -271,6 +280,11 @@ void bw_set_listener_pose(BwEngine* e, float px, float py, float pz,
     const float p[3] = { px, py, pz };
     const float q[4] = { qx, qy, qz, qw };
     rt_set_listener(e->rt, p, q);
+}
+
+void bw_get_listener_pose(BwEngine* e, float p[3], float q[4]) {
+    if (!e || !p || !q) return;
+    rt_read_pose(e->rt, p, q);
 }
 
 /* ---- frame boundary ---- */

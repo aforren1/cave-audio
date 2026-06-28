@@ -91,6 +91,11 @@ BW_API void     bw_play_oneshot(BwEngine* e, BwSound snd, float x, float y, floa
 BW_API void bw_set_listener_pose(BwEngine* e, float px, float py, float pz,
                                               float qx, float qy, float qz, float qw);
 
+/* Read back the listener pose the engine is currently rendering with — the committed pose, or,
+ * under track_internal, the freshest tracked pose. For visuals/logging/debugging tracking; safe
+ * to poll from the control thread. Fills p[3] (position) and q[4] (orientation xyzw). */
+BW_API void bw_get_listener_pose(BwEngine* e, float p[3], float q[4]);
+
 /* ---- frame boundary ----
  * Promotes this frame's position/pose updates as one coherent snapshot and drains
  * the event ring (voice-ended, sound-retired). Call once per frame after pushing
