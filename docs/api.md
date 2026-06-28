@@ -103,6 +103,27 @@ own coordinate system at the boundary (see integration.md). `bw_play_oneshot` is
 fire-and-forget path: it allocates a transient voice internally and recycles it on
 end, so the caller holds no handle.
 
+## Ambisonic beds (control thread)
+
+```c
+BwSound bw_load_ambix(BwEngine* e, const char* path);   // AmbiX (ACN/SN3D); 4/9/16 ch -> order 1/2/3
+BwBed   bw_bed_create  (BwEngine* e);
+void    bw_bed_play    (BwEngine* e, BwBed b, BwSound snd, bool loop);
+void    bw_bed_set_gain(BwEngine* e, BwBed b, float linear);   // master gain, ramped
+void    bw_bed_stop    (BwEngine* e, BwBed b);
+void    bw_bed_destroy (BwEngine* e, BwBed b);
+```
+
+A **bed** is a pre-encoded **AmbiX** (ACN ordering, SN3D normalization) soundfield decoded
+**straight to the 26 speakers** — *not* DBAP-panned — for diffuse/ambient content. It is
+**world-locked** (the soundfield is fixed to the room; the physical speakers are world-fixed,
+so the listener moving through it is handled by the real acoustics, and the binaural monitor's
+head-tracking applies downstream). Load with `bw_load_ambix` (a multichannel asset; mono and other
+channel counts are rejected), then drive with the `bw_bed_*` family — no position, just a master
+gain. Internally a bed is a voice playing a multichannel asset, so handles/lifetime match
+`bw_source_*`. The decode is a static SN3D sampling decode `(2l+1)·Y_k(dir_s)/L`, rebuilt from the
+layout. FLAC is the natural container for lossless multichannel beds; MP3 cannot carry ambisonics.
+
 ## Listener (control thread; skip if `track_internal`)
 
 ```c

@@ -142,12 +142,14 @@ engines. Don't start with the engine bindings.
 - **Done when:** an Unreal scene drives the same library identically.
 
 ## Later / optional
-- Steam Audio **occlusion** feeding the per-source path — **implemented** (`src/steam_scene.c`, the
-  third simulation thread; `bw_scene_set_mesh` / `bw_source_set_occlusion`). v1 is a level-only scalar
-  (geometric occlusion × material mean transmittance); the per-band transmission EQ, **directivity**,
-  and **reflections** remain to build — **model in [materials.md](materials.md)**.
-- Ambisonic diffuse bed for ambient/reverb with a static decode matrix (the reflection
-  bed in [materials.md](materials.md)).
+- Steam Audio materials — **occlusion + per-band transmission EQ + directivity implemented**
+  (`src/steam_scene.c` sim thread; `src/rt.c` applies a 3-biquad transmission EQ + a directivity gain
+  on the pre-pan stage). `bw_scene_set_mesh` / `bw_source_set_occlusion` / `bw_source_set_directivity`.
+  The **reflection bed** is the remaining materials piece — **model in [materials.md](materials.md)**.
+- **Ambisonic bed — implemented** (`bw_load_ambix` + `bw_bed_*`): a file-fed AmbiX soundfield decoded
+  to the 26-ch bus via a static SN3D sampling decode (`rt.c` `build_bed_decode`/`mix_bed`). The
+  reflection bed reuses the same SH→26 decode.
+- Audio file formats — **WAV/FLAC/MP3 + resample-on-load implemented** (`src/sound.c`, dr_libs).
 - `bw_source_create_stream` for procedural/engine-generated audio.
 - Cross-platform device backend abstraction (ALSA/JACK/CoreAudio) behind the sink
   interface.

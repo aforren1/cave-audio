@@ -108,15 +108,20 @@ interactive **raylib playground** (`examples/playground.c`, opt-in `-DBWAUDIO_BU
 auditions binaural by ear. The **production Steam Audio HRTF decode** is built + running:
 `ambisonics.c` (3rd-order encode) → `steam_decode.c` (phonon `iplAmbisonicsDecodeEffect`), gated
 `BW_HAVE_STEAMAUDIO` (phonon built from the `third_party/steam-audio` submodule; see
-third_party/README.md), with the simple-pan monitor as the no-SDK fallback. **Materials occlusion is
-implemented** (`steam_scene.c`, same gate): a third "simulation thread" owns an `IPLScene` + mesh +
-`IPLSimulator`, ray-traces volumetric occlusion + transmission at 30 Hz, and publishes one
-transmittance scalar per source into the mixer via a pair of per-voice atomics (`rt`'s `occ_handle`/
-`occ_val`) the audio thread gates on its own generation + ramps; `bw_scene_set_mesh` /
-`bw_source_set_occlusion` drive it and the playground wall is a real occluder. v1 is level-only
-(geometry × material mean transmittance — concrete vs glass differ); the per-band transmission EQ,
-directivity, and the reflection bed are the next increments (docs/materials.md). Remaining: the by-ear
-headphone check; and live Motive verification of M6 (parser + lifecycle are tested off-wire). Do not bake ASIO assumptions
+third_party/README.md), with the simple-pan monitor as the no-SDK fallback. **Materials: occlusion +
+per-band transmission EQ + source directivity are implemented** (`steam_scene.c`, same gate): a third
+"simulation thread" owns an `IPLScene` + mesh + `IPLSimulator`, ray-traces volumetric occlusion +
+transmission + directivity at 30 Hz, and publishes per source a (level, 3-band tilt, directivity-gain)
+set via per-voice atomics (`rt`'s `occ_handle`/`occ_val`/`occ_eq`/`occ_dir`) gated on the audio
+thread's own generation; the audio thread applies a 3-biquad transmission EQ (so a wall *muffles*, not
+just attenuates — rate-derived, runs at 96 kHz too), a directivity dipole gain, and the level — all
+ramped per sample. `bw_scene_set_mesh` / `bw_source_set_occlusion` / `bw_source_set_directivity` /
+`bw_source_set_orientation` drive it; the playground wall is a real occluder. The **reflection bed**
+is the remaining materials piece. An **ambisonic bed** is implemented too (`bw_load_ambix` + `bw_bed_*`):
+a file-fed AmbiX soundfield decoded world-locked to the 26-ch bus (`rt.c` `build_bed_decode`/`mix_bed`,
+phonon-free), reusing the SH→26 decode the reflection bed will need. `sound.c` now decodes **WAV/FLAC/MP3**
+(dr_libs, one pinned repo fetch) and **resamples to the engine rate at load** (windowed-sinc).
+Remaining: the by-ear headphone check; and live Motive verification of M6 (parser + lifecycle are tested off-wire). Do not bake ASIO assumptions
 outside `asio_sink.cpp`, and do not link the NatNet SDK (proprietary; reference only — GPLv3).
 The atomics in `rt.c` need `/experimental:c11atomics` on MSVC (wired in CMake); `pose.h` uses
 Interlocked intrinsics instead, so `natnet.c`/tests need no extra flag. `-DBWAUDIO_ASAN=ON`
