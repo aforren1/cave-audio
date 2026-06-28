@@ -26,12 +26,15 @@
 
 #define REFL_HZ          12      /* reflection sim rate (reverb changes slowly; cheaper than occlusion) */
 #define REFL_DIFFUSE     1024    /* diffuse-reflection sample directions */
-/* HYBRID = early-reflection convolution + parametric (FDN) late tail. The simulator's reflection IR
- * for a listener-centric reverb source is order-0 (only the W/omni ambisonic channel is populated;
- * reading channels 1+ access-violates in phonon's overlap-save convolution — verified down to a
- * 1-channel repro). So the convolution is run as ONE channel (omni). That is the right model for a
- * diffuse bed anyway: omni early reflections add room character over the parametric tail, and the
- * result is spread (world-locked) across the 26 speakers via the W ambisonic decode. */
+/* HYBRID = early-reflection convolution + parametric (FDN) late tail. Empirically, for this
+ * listener-centric reverb source only the W (omni) channel of the reflection IR is validly readable:
+ * applying the convolution with numChannels>1 access-violates inside phonon's overlap-save
+ * convolution at channel index 1 (the IR's directional channels are unmapped in this configuration —
+ * verified down to a single-channel repro + a debugger trace: channel 0 mapped, channel 1 not). The
+ * exact upstream cause is phonon-internal; whatever it is, running the convolution as ONE channel
+ * (omni) is the RT-safe path that works. That is the right model for a diffuse bed anyway: omni early
+ * reflections add room character over the parametric tail, spread (world-locked) across the 26
+ * speakers via the W ambisonic decode. (Directional early reflections would need a per-source stream.) */
 #define REFL_TYPE        IPL_REFLECTIONEFFECTTYPE_HYBRID
 #define REFL_CONV_CH     1       /* convolution/effect channel count: omni (W) only — see above */
 

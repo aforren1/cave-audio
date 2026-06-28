@@ -80,12 +80,13 @@ convenience.
 ### Reflection bed: hybrid reverb (omni early reflections + parametric tail)
 
 The reflection bed runs Steam Audio's **HYBRID** reverb: an early-reflection **convolution** plus a
-**parametric (FDN)** late tail. One subtlety drove the implementation: the simulator's reflection IR
-for a *listener-centric* reverb source is **order-0** — only the W (omni) ambisonic channel is
-populated; reading the directional channels (`numChannels > 1`) access-violates inside phonon's
-overlap-save convolution (reproduced down to a one-channel isolation test against phonon 4.8.1). So
-the convolution is run as a **single omni channel** and the resulting `[W,0,0,…]` field is decoded
-across the 26 speakers. That is the right model for a diffuse bed anyway — omni early reflections add
+**parametric (FDN)** late tail. One subtlety drove the implementation: for this *listener-centric*
+reverb source, only the **W (omni) channel** of the reflection IR is validly readable — applying the
+convolution with `numChannels > 1` access-violates inside phonon's overlap-save convolution at
+channel index 1 (the IR's directional channels are unmapped in this configuration; reproduced down
+to a one-channel isolation test + a debugger trace against phonon 4.8.1 — channel 0 mapped, channel 1
+not). The exact upstream cause is phonon-internal; regardless, the convolution is run as a **single
+omni channel** and the resulting `[W,0,0,…]` field is decoded across the 26 speakers. That is the right model for a diffuse bed anyway — omni early reflections add
 room character on top of the parametric tail, and neither part is directional for a single
 listener-centric source. (Per-source, position-dependent directional early reflections would need a
 per-source reflection stream, which is out of scope for the shared bed.) The same per-triangle materials drive **both** occlusion (per-band
