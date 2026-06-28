@@ -75,6 +75,7 @@ float   rt_get_directivity(RtCore* c, uint32_t handle); /* control thread: publi
 
 /* ---- assets (control thread; file I/O + alloc) ---- */
 uint32_t rt_load_sound  (RtCore* c, const char* path, char* err, size_t errcap); /* 0 on failure */
+uint32_t rt_load_ambix  (RtCore* c, const char* path, char* err, size_t errcap); /* multichannel bed asset */
 void     rt_unload_sound(RtCore* c, uint32_t sound);  /* safe any time; retire-acked internally */
 
 /* ---- control thread: handle allocation is synchronous, the rest enqueue ---- */

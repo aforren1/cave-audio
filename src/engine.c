@@ -290,6 +290,21 @@ void bw_unload_sound(BwEngine* e, BwSound snd) {
     if (e) rt_unload_sound(e->rt, snd);   /* safe any time; retire-acked internally */
 }
 
+BwSound bw_load_ambix(BwEngine* e, const char* path) {
+    if (!e) return 0;
+    e->errbuf[0] = 0;
+    BwSound snd = rt_load_ambix(e->rt, path, e->errbuf, sizeof e->errbuf);
+    if (snd == 0) set_error(e, e->errbuf[0] ? e->errbuf : "bw_load_ambix: failed");
+    return snd;
+}
+
+/* ---- ambisonic beds: a bed is a voice that plays a multichannel asset; mix_bed decodes it ---- */
+BwBed bw_bed_create(BwEngine* e)                                { return bw_source_create(e); }
+void  bw_bed_play(BwEngine* e, BwBed b, BwSound snd, bool loop) { bw_source_play(e, b, snd, loop); }
+void  bw_bed_set_gain(BwEngine* e, BwBed b, float linear)       { bw_source_set_gain(e, b, linear); }
+void  bw_bed_stop(BwEngine* e, BwBed b)                         { bw_source_stop(e, b); }
+void  bw_bed_destroy(BwEngine* e, BwBed b)                      { bw_source_destroy(e, b); }
+
 /* ---- sources (forward to the rt core) ---- */
 
 BwSource bw_source_create(BwEngine* e) {

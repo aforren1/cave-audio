@@ -45,6 +45,7 @@ typedef struct BwEngine BwEngine;   /* opaque */
  * reused) fails validation on the audio side and is silently dropped. 0 = invalid. */
 typedef uint32_t BwSound;
 typedef uint32_t BwSource;
+typedef uint32_t BwBed;       /* an ambisonic-bed voice (world-locked soundfield); see bw_bed_* */
 
 typedef enum {
     BW_PROFILE_CAVE     = 0,  /* 26-ch bus -> ASIO/DVS. Listener POSITION only. */
@@ -73,8 +74,12 @@ BW_API const char* bw_last_error(BwEngine* e); /* human-readable; NULL if none *
 BW_API const char* bw_audio_backend(BwEngine* e);
 
 /* ---- assets (control thread; file I/O; do at load time) ---- */
-BW_API BwSound bw_load_sound(BwEngine* e, const char* path); /* 0 = failure */
+BW_API BwSound bw_load_sound(BwEngine* e, const char* path); /* mono point-source asset; 0 = failure */
 BW_API void    bw_unload_sound(BwEngine* e, BwSound snd);    /* safe: retire-acked internally */
+/* Load a pre-encoded AmbiX (ACN/SN3D) soundfield, KEEPING its channels (4/9/16 -> order 1/2/3). Plays
+ * via bw_bed_* as a world-locked diffuse bed decoded to the 26 speakers; resampled to the engine rate
+ * at load if needed. 0 = failure (bad channel count / decode error). */
+BW_API BwSound bw_load_ambix(BwEngine* e, const char* path);
 
 /* ---- sources (control thread; non-blocking, enqueue only) ---- */
 BW_API BwSource bw_source_create(BwEngine* e);              /* handle returned synchronously */
@@ -84,6 +89,14 @@ BW_API void     bw_source_set_gain(BwEngine* e, BwSource s, float linear);
 BW_API void     bw_source_play(BwEngine* e, BwSource s, BwSound snd, bool loop);
 BW_API void     bw_source_stop(BwEngine* e, BwSource s);
 BW_API void     bw_play_oneshot(BwEngine* e, BwSound snd, float x, float y, float z, float gain);
+
+/* ---- ambisonic beds (control thread; a world-locked soundfield decoded straight to the 26 speakers,
+ * not DBAP-panned — for diffuse/ambient content). Play a bw_load_ambix asset; no position. ---- */
+BW_API BwBed bw_bed_create(BwEngine* e);
+BW_API void  bw_bed_play(BwEngine* e, BwBed b, BwSound snd, bool loop);
+BW_API void  bw_bed_set_gain(BwEngine* e, BwBed b, float linear);   /* master gain, ramped */
+BW_API void  bw_bed_stop(BwEngine* e, BwBed b);
+BW_API void  bw_bed_destroy(BwEngine* e, BwBed b);
 
 /* ---- materials / occlusion (control thread; needs the Steam Audio build) ----
  * Set the occluding geometry (room space, RH metres; tris are CCW vertex-index triples) with one

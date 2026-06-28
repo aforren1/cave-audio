@@ -10,6 +10,7 @@
 #include "layout.h"
 #include "dbap.h"
 #include "align.h"
+#include "ambisonics.h"   /* SH->26 decode for ambisonic beds */
 
 #include <math.h>
 #include <stdatomic.h>
@@ -93,6 +94,9 @@ struct RtCore {
     /* spatialization (set at create/load time; read by the audio thread) */
     Layout   layout;
     Aligner* aligner;
+    /* ambisonic bed decode: [speaker][ACN] = (2l+1)*Y_k^SN3D(speaker_dir)/L (sampling decode, SN3D),
+     * rebuilt from the layout whenever it changes. A bed voice decodes its SH channels through this. */
+    float    bed_decode[BW_CHANNELS][BW_AMBI_CH];
 
     /* internal tracker (track_internal): the audio thread samples this each block, overriding
      * the committed listener. Set while the audio thread is stopped; NULL = no internal tracker. */
@@ -340,9 +344,31 @@ static void drain_commands(RtCore* c) {
     atomic_store_explicit(&r->read, rd, memory_order_release);
 }
 
+/* Build the ambisonic bed decode matrix from the layout: for each speaker, sample the SH basis at
+ * its direction (room -> ambisonic axes: room x=right/y=up/z=back -> ambi x=front/y=left/z=up) and
+ * scale by (2l+1)/L. World-locked: directions are from the room origin, not the moving listener. */
+static void build_bed_decode(RtCore* c) {
+    const float invL = 1.0f / (float)c->channels;
+    for (uint32_t s = 0; s < c->channels; ++s) {
+        const float* p = c->layout.speakers[s].pos;
+        float len = sqrtf(p[0]*p[0] + p[1]*p[1] + p[2]*p[2]);
+        float ad[3];
+        if (len < 1e-6f) { ad[0] = 1.f; ad[1] = 0.f; ad[2] = 0.f; }          /* degenerate: face front */
+        else { ad[0] = -p[2]/len; ad[1] = -p[0]/len; ad[2] = p[1]/len; }     /* (-z,-x,y) = ambisonic axes */
+        float y[BW_AMBI_CH];
+        ambi_encode_sn3d(ad, y);
+        for (int k = 0; k < BW_AMBI_CH; ++k) {
+            int l = (int)floorf(sqrtf((float)k));                            /* ACN order of channel k */
+            c->bed_decode[s][k] = (float)(2*l + 1) * y[k] * invL;
+        }
+    }
+}
+
 /* DBAP gain solve (M4): listener-relative, dirty-gated. CMD_COMMIT re-dirties a voice on a
- * position change and dirties all voices on a listener move (gains are listener-relative). */
+ * position change and dirties all voices on a listener move (gains are listener-relative). A bed
+ * voice (multi-channel asset) has no DBAP position — its master gain rides gtarget[0]. */
 static void compute_gains(RtCore* c, Voice* v) {
+    if (v->sound && v->sound->channels > 1) { v->gtarget[0] = v->gain_user; return; }
     dbap_gains(v->pos_active, c->lis.p_active, &c->layout, v->gain_user, v->gtarget);
 }
 
@@ -436,6 +462,42 @@ static void mix_voice(RtCore* c, Voice* v, uint16_t idx, float* bus, uint32_t n)
     }
 }
 
+/* Mix an ambisonic BED voice: decode its SH channels straight onto the 26-ch bus through the static
+ * decode matrix (world-locked — no DBAP, occlusion, or directivity), with a master-gain ramp on
+ * gcur[0]. Looping / natural end / oneshot-ack are identical to mix_voice. */
+static void mix_bed(RtCore* c, Voice* v, uint16_t idx, float* bus, uint32_t n) {
+    const SoundData* snd = v->sound;
+    const int nch = (int)snd->channels;
+    const float g_step = (v->gtarget[0] - v->gcur[0]) / (float)n;   /* master gain ramp (invariant 4) */
+    uint32_t cur = v->cursor;
+    bool ended = false;
+    for (uint32_t i = 0; i < n; ++i) {
+        if (cur >= snd->frames) { if (v->loop) cur = 0; else ended = true; }
+        if (!ended) {
+            const float* sh = &snd->pcm[(size_t)cur * nch];
+            const float g = v->gcur[0];
+            for (uint32_t s = 0; s < c->channels; ++s) {
+                const float* D = c->bed_decode[s];
+                float acc = 0.f;
+                for (int k = 0; k < nch; ++k) acc += sh[k] * D[k];
+                bus[(size_t)s * n + i] += g * acc;
+            }
+            ++cur;
+        }
+        v->gcur[0] += g_step;
+    }
+    v->cursor = cur;
+    v->gcur[0] = v->gtarget[0];
+    if (ended) {
+        v->playing = false;
+        if (v->oneshot) {
+            v->active = false;
+            Evt ev = { .type = EVT_VOICE_ENDED, .handle = BW_MK_H(idx, v->gen) };
+            evt_push(&c->events, &ev);
+        }
+    }
+}
+
 void rt_render(RtCore* c, float* bus, uint32_t nframes, const BwTimestamp* ts) {
     (void)ts;
 #if defined(_MSC_VER)
@@ -464,7 +526,8 @@ void rt_render(RtCore* c, float* bus, uint32_t nframes, const BwTimestamp* ts) {
         Voice* v = &c->voices[i];
         if (!v->active || !v->playing || !v->sound) continue;
         if (v->dirty) { compute_gains(c, v); v->dirty = false; }
-        mix_voice(c, v, (uint16_t)i, bus, nframes);
+        if (v->sound->channels > 1) mix_bed  (c, v, (uint16_t)i, bus, nframes);   /* ambisonic bed */
+        else                        mix_voice(c, v, (uint16_t)i, bus, nframes);   /* mono point source */
     }
     align_process(c->aligner, bus, nframes);   /* per-speaker gain trim + delay (output stage) */
     pose_write(&c->readback, c->lis.p_active, c->lis.q_active);   /* publish for control-thread readback */
@@ -562,6 +625,20 @@ uint32_t rt_load_sound(RtCore* c, const char* path, char* err, size_t errcap) {
     return h;
 }
 
+/* Load a multichannel AmbiX asset into the sound table (plays as an ambisonic bed via mix_bed). */
+uint32_t rt_load_ambix(RtCore* c, const char* path, char* err, size_t errcap) {
+    SoundData d;
+    if (!sound_load_ambix(path, c->sample_rate, &d, err, errcap)) return 0;
+    uint32_t h = salloc_sound(c);
+    if (!h) {
+        sound_unload(&d);
+        if (err && errcap) { strncpy(err, "ambix: sound table full", errcap - 1); err[errcap - 1] = 0; }
+        return 0;
+    }
+    c->sounds[BW_H_IDX(h)].data = d;
+    return h;
+}
+
 void rt_unload_sound(RtCore* c, uint32_t sound) {
     SoundSlot* s = sound_slot_ctrl(c, sound);
     if (!s || s->retiring) return;       /* invalid or already retiring: idempotent no-op */
@@ -649,6 +726,7 @@ RtCore* rt_create(uint32_t voice_cap, uint32_t sound_cap, uint32_t sample_rate, 
     c->layout  = layout_default();
     c->aligner = align_create(channels, &c->layout);
     if (!c->aligner) { rt_destroy(c); return NULL; }
+    build_bed_decode(c);                        /* ambisonic bed decode from the default layout */
     /* push indices so the first alloc hands out slot 0, then 1, ... */
     for (uint32_t i = 0; i < voice_cap; ++i) c->freelist[c->free_count++]   = voice_cap - 1 - i;
     for (uint32_t i = 0; i < sound_cap; ++i) c->sfreelist[c->sfree_count++] = sound_cap - 1 - i;
@@ -665,6 +743,7 @@ void rt_set_layout(RtCore* c, const Layout* L) {
     c->layout = *L;
     align_destroy(c->aligner);
     c->aligner = a;
+    build_bed_decode(c);                         /* re-derive the bed decode for the new geometry */
     for (uint32_t i = 0; i < c->voice_cap; ++i)
         if (c->voices[i].active) c->voices[i].dirty = true;
 }

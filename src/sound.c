@@ -122,6 +122,66 @@ bool sound_load(const char* path, uint32_t want_rate, SoundData* out, char* err,
     out->pcm = mono;
     out->frames = (uint32_t)frames;
     out->sample_rate = want_rate;                     /* now at the engine rate */
+    out->channels = 1;
+    out->order = 0;
+    return true;
+}
+
+/* Resample an interleaved [n_in x ch] buffer to fout (each channel via resample_mono). New buffer +
+ * *n_out frames; NULL on OOM. */
+static float* resample_interleaved(const float* in, uint64_t n_in, unsigned int ch,
+                                   uint32_t fin, uint32_t fout, uint64_t* n_out) {
+    float* mono = (float*)malloc((size_t)n_in * sizeof(float));
+    if (!mono) return NULL;
+    float* outbuf = NULL; uint64_t no = 0;
+    for (unsigned int k = 0; k < ch; ++k) {
+        for (uint64_t i = 0; i < n_in; ++i) mono[i] = in[i * ch + k];
+        uint64_t nk = 0;
+        float* rk = resample_mono(mono, n_in, fin, fout, &nk);
+        if (!rk) { free(mono); free(outbuf); return NULL; }
+        if (!outbuf) {                                /* first channel sets the output length */
+            no = nk;
+            outbuf = (float*)malloc((size_t)no * ch * sizeof(float));
+            if (!outbuf) { free(rk); free(mono); return NULL; }
+        }
+        uint64_t lim = nk < no ? nk : no;
+        for (uint64_t i = 0; i < lim; ++i) outbuf[i * ch + k] = rk[i];
+        for (uint64_t i = lim; i < no; ++i) outbuf[i * ch + k] = 0.f;   /* pad if a channel rounded short */
+        free(rk);
+    }
+    free(mono);
+    *n_out = no;
+    return outbuf;
+}
+
+bool sound_load_ambix(const char* path, uint32_t want_rate, SoundData* out, char* err, size_t errcap) {
+    memset(out, 0, sizeof *out);
+    if (!path) { set_err(err, errcap, "ambix: null path"); return false; }
+
+    unsigned int channels = 0, rate = 0;
+    uint64_t frames = 0;
+    float* inter = decode_any(path, &channels, &rate, &frames);
+    if (!inter)               { set_err(err, errcap, "ambix: cannot open/decode (wav/flac/mp3)"); return false; }
+    if (frames == 0)          { free(inter); set_err(err, errcap, "ambix: empty file"); return false; }
+    if (channels != 4 && channels != 9 && channels != 16) {
+        free(inter); set_err(err, errcap, "ambix: channel count must be 4, 9, or 16 (1st/2nd/3rd order)"); return false;
+    }
+    uint16_t order = (channels == 4) ? 1 : (channels == 9) ? 2 : 3;
+
+    if (rate != want_rate) {                          /* resample each SH channel to the engine rate */
+        uint64_t nout = 0;
+        float* res = resample_interleaved(inter, frames, channels, rate, want_rate, &nout);
+        free(inter);
+        if (!res) { set_err(err, errcap, "ambix: out of memory (resample)"); return false; }
+        inter = res; frames = nout;
+    }
+    if (frames > 0xFFFFFFFFu) { free(inter); set_err(err, errcap, "ambix: too many frames (>4G)"); return false; }
+
+    out->pcm = inter;
+    out->frames = (uint32_t)frames;
+    out->sample_rate = want_rate;
+    out->channels = (uint16_t)channels;
+    out->order = order;
     return true;
 }
 

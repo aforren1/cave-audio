@@ -51,6 +51,19 @@ static int write_const_wav(const char* path, float value, uint32_t frames) {
     return wrote == frames;
 }
 
+/* write a 4-channel (1st-order AmbiX) wav with constant W/Y/Z/X per frame (ACN order, SN3D) */
+static int write_ambix4_wav(const char* path, float w, float y, float z, float x, uint32_t frames) {
+    drwav_data_format fmt = { drwav_container_riff, DR_WAVE_FORMAT_IEEE_FLOAT, 4, RATE, 32 };
+    drwav wav;
+    if (!drwav_init_file_write(&wav, path, &fmt, NULL)) return 0;
+    float* buf = (float*)malloc((size_t)frames * 4 * sizeof(float));
+    if (!buf) { drwav_uninit(&wav); return 0; }
+    for (uint32_t i = 0; i < frames; ++i) { buf[i*4+0]=w; buf[i*4+1]=y; buf[i*4+2]=z; buf[i*4+3]=x; }
+    drwav_uint64 wrote = drwav_write_pcm_frames(&wav, frames, buf);
+    free(buf); drwav_uninit(&wav);
+    return wrote == frames;
+}
+
 static int fails = 0;
 #define CHECK(cond, msg) do { if (!(cond)) { printf("FAIL: %s\n", (msg)); ++fails; } } while (0)
 
@@ -173,8 +186,46 @@ int main(void) {
     CHECK(fabs(total_energy() / e4b - 1.0) < 0.02, "directivity restored to 1 ~ full energy");
 
     rt_destroy(c);
+
+    /* 12. ambisonic bed: a W-only field decodes equally to all speakers; a front-encoded 1st-order
+     *     field favors the front speaker (room -z) over the back one (+z). */
+    const char* AMB_OMNI = "bw_amb_omni.wav", *AMB_FRONT = "bw_amb_front.wav";
+    if (write_ambix4_wav(AMB_OMNI, 0.5f, 0.f, 0.f, 0.f, 4 * N) &&
+        write_ambix4_wav(AMB_FRONT, 0.5f, 0.f, 0.f, 0.5f, 4 * N)) {     /* W,Y,Z,X — X(ACN3) = front */
+        RtCore* cb = rt_create(8, 4, RATE, CH);
+        CHECK(cb != NULL, "rt_create (bed)");
+        if (cb) {
+            uint32_t so = rt_load_ambix(cb, AMB_OMNI, err, sizeof err);
+            CHECK(so != 0, err[0] ? err : "load ambix omni");
+            uint32_t b1 = rt_source_create(cb);
+            rt_source_play(cb, b1, so, true);
+            rt_commit(cb); render2(cb);
+            CHECK(chan_energy(0) > 0.0 && fabs(chan_energy(25) / chan_energy(0) - 1.0) < 0.02,
+                  "omni (W-only) bed decodes equally across speakers");
+            rt_source_stop(cb, b1); render2(cb);
+
+            int s_front = -1, s_back = -1;
+            for (int s = 0; s < CH; ++s)
+                if (fabsf(LD.speakers[s].pos[0]) < 0.1f && fabsf(LD.speakers[s].pos[1]) < 0.1f) {
+                    if (LD.speakers[s].pos[2] < -1.0f) s_front = s;
+                    if (LD.speakers[s].pos[2] >  1.0f) s_back  = s;
+                }
+            uint32_t sf = rt_load_ambix(cb, AMB_FRONT, err, sizeof err);
+            CHECK(sf != 0, "load ambix front");
+            uint32_t b2 = rt_source_create(cb);
+            rt_source_play(cb, b2, sf, true);
+            rt_commit(cb); render2(cb);
+            CHECK(s_front >= 0 && s_back >= 0 && chan_energy(s_front) > chan_energy(s_back) * 1.5,
+                  "front-encoded bed favors the front speaker");
+            rt_destroy(cb);
+        }
+        remove(AMB_OMNI); remove(AMB_FRONT);
+    } else {
+        CHECK(0, "could not write ambix test wavs");
+    }
+
     remove(WAV);
     if (fails) { printf("rt_test: %d FAILURES\n", fails); return 1; }
-    printf("rt_test OK (DBAP routing, commit snapshot, generation drop, gain, occlusion, EQ verified)\n");
+    printf("rt_test OK (DBAP, commit, gen-drop, gain, occlusion, EQ, directivity, ambisonic bed verified)\n");
     return 0;
 }

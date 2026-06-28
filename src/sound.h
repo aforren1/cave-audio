@@ -10,19 +10,25 @@
 #include <stddef.h>
 #include <stdint.h>
 
-/* Decoded sound: mono float PCM. Point sources are mono; multi-channel files are
- * downmixed at load. Owned by the control thread; the audio thread reads pcm only via a
- * voice binding and only until the retire-ack frees it (docs/concurrency.md). */
+/* Decoded sound: interleaved float PCM. A point source is mono (channels == 1, downmixed at load);
+ * an ambisonic BED keeps its AmbiX channels (channels == 4/9/16, order 1/2/3). Owned by the control
+ * thread; the audio thread reads pcm only via a voice binding and only until the retire-ack frees it. */
 typedef struct {
-    float*   pcm;            /* `frames` mono samples; NULL when empty */
+    float*   pcm;            /* `frames` * `channels` interleaved samples; NULL when empty */
     uint32_t frames;
     uint32_t sample_rate;
+    uint16_t channels;       /* 1 = mono point source; 4/9/16 = ambisonic bed */
+    uint16_t order;          /* ambisonic order (0 for mono; 1/2/3 for a bed) */
 } SoundData;
 
-/* Decode a wav file to mono float. Fails (false + message in `err`) on a missing/
- * unreadable file, a decode error, an empty file, or a sample-rate != want_rate
- * (M3 does no resampling). On success `out` owns pcm; free it with sound_unload. */
+/* Decode wav/flac/mp3 to MONO float (downmixing multi-channel), resampling to want_rate if the file
+ * rate differs. Fails (false + message in `err`) on a missing/unreadable file, decode error, or empty
+ * file. On success `out` owns pcm; free it with sound_unload. */
 bool sound_load(const char* path, uint32_t want_rate, SoundData* out, char* err, size_t errcap);
+
+/* Decode an AmbiX (ACN/SN3D) file KEEPING its channels (4/9/16 -> order 1/2/3), resampling per
+ * channel to want_rate if needed. Rejects other channel counts. Same ownership as sound_load. */
+bool sound_load_ambix(const char* path, uint32_t want_rate, SoundData* out, char* err, size_t errcap);
 
 void sound_unload(SoundData* s);   /* frees pcm; safe on a zeroed/empty SoundData */
 
