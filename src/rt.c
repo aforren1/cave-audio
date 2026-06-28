@@ -71,6 +71,10 @@ struct RtCore {
     /* spatialization (set at create/load time; read by the audio thread) */
     Layout   layout;
     Aligner* aligner;
+
+    /* internal tracker (track_internal): the audio thread samples this each block, overriding
+     * the committed listener. Set while the audio thread is stopped; NULL = no internal tracker. */
+    const PoseSlot* tracker;
 };
 
 /* ---- ring primitives ---- */
@@ -297,6 +301,20 @@ void rt_render(RtCore* c, float* bus, uint32_t nframes, const BwTimestamp* ts) {
     _MM_SET_DENORMALS_ZERO_MODE(_MM_DENORMALS_ZERO_ON);
 #endif
     drain_commands(c);
+
+    /* track_internal: sample the freshest tracked head pose at block time, overriding the
+     * committed listener (lower latency than routing pose through the command ring). A position
+     * change dirties every voice, since DBAP gains are all listener-relative. */
+    if (c->tracker) {
+        float tp[3], tq[4];
+        if (pose_read(c->tracker, tp, tq)) {
+            bool moved = memcmp(c->lis.p_active, tp, sizeof tp) != 0;
+            memcpy(c->lis.p_active, tp, sizeof tp);
+            memcpy(c->lis.q_active, tq, sizeof tq);
+            if (moved) for (uint32_t i = 0; i < c->voice_cap; ++i) c->voices[i].dirty = true;
+        }
+    }
+
     memset(bus, 0, sizeof(float) * (size_t)nframes * c->channels);
     for (uint32_t i = 0; i < c->voice_cap; ++i) {
         Voice* v = &c->voices[i];
@@ -470,6 +488,10 @@ void rt_set_layout(RtCore* c, const Layout* L) {
     c->aligner = a;
     for (uint32_t i = 0; i < c->voice_cap; ++i)
         if (c->voices[i].active) c->voices[i].dirty = true;
+}
+
+void rt_set_tracker(RtCore* c, const PoseSlot* slot) {
+    if (c) c->tracker = slot;               /* audio thread reads it; set while stopped */
 }
 
 void rt_destroy(RtCore* c) {

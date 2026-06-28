@@ -24,6 +24,10 @@ CMakeUserPresets.json
 # through this repo. CMake auto-detects it at third_party/asiosdk/.
 /third_party/asiosdk/
 
+# NatNet SDK — proprietary (NaturalPoint). Used only as a wire-format reference; the
+# engine parses the stream off-wire and does NOT link it (GPLv3). Not redistributed here.
+/third_party/NatNetSDK/
+
 # Unity binding build artifacts (the .dll is copied into Assets/Plugins by build)
 bindings/unity/**/Library/
 bindings/unity/**/Temp/

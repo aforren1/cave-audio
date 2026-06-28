@@ -50,9 +50,11 @@ add_library(bw_core OBJECT
   src/dbap.c
   src/align.c
   src/binaural.c
+  src/natnet.c
   ${CJSON_C}
 )
 target_include_directories(bw_core PUBLIC src ${dr_wav_SOURCE_DIR} ${CJSON_INC})
+target_link_libraries(bw_core PUBLIC ws2_32)   # natnet.c uses Winsock (propagates to consumers)
 if(MSVC)
   target_compile_options(bw_core PRIVATE /W4)
   # rt.c uses C11 <stdatomic.h>, gated behind /experimental:c11atomics (directory-scoped,
@@ -74,7 +76,7 @@ if(MSVC)
   target_compile_options(bwaudio PRIVATE /W4)
 endif()
 if(WIN32)
-  target_link_libraries(bwaudio PRIVATE winmm)   # timeBeginPeriod in null_sink.c
+  target_link_libraries(bwaudio PRIVATE winmm ws2_32)   # winmm: timeBeginPeriod (null_sink); ws2_32: natnet
 endif()
 
 # ---- optional ASIO backend (production: 26ch -> DVS -> Dante) ----
@@ -146,6 +148,10 @@ if(BWAUDIO_BUILD_TESTS)
   add_executable(bw_monitor_test test/monitor_test.c)
   target_link_libraries(bw_monitor_test PRIVATE bw_core)
   add_test(NAME monitor COMMAND bw_monitor_test)
+
+  add_executable(bw_natnet_test test/natnet_test.c)
+  target_link_libraries(bw_natnet_test PRIVATE bw_core)
+  add_test(NAME natnet COMMAND bw_natnet_test)
 
   # Optional: AddressSanitizer build of the sound test (M3 unload-safety / UAF check).
   option(BWAUDIO_ASAN "Build bw_sound_test with AddressSanitizer" OFF)

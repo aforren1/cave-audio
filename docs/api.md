@@ -109,6 +109,26 @@ Position is used by both consumers. Orientation (the quaternion) is used by the
 **binaural monitor only**; the array render ignores it. If `track_internal` is true,
 do not call this — the core samples the freshest OptiTrack pose at block time.
 
+### Internal tracking (`track_internal`, M6)
+
+With `track_internal = true` the core ingests OptiTrack/NatNet pose itself and samples the
+freshest head pose on the **audio thread at block time** — lower latency than pushing pose
+through the command ring — overriding any `bw_set_listener_pose`. The NatNet specifics are
+configured by environment variable (kept out of `BwConfig` so the ABI stays stable):
+
+| Variable                      | Default         | Meaning                                       |
+|-------------------------------|-----------------|-----------------------------------------------|
+| `BWAUDIO_NATNET_MULTICAST`    | `239.255.42.99` | data multicast group (empty ⇒ unicast)        |
+| `BWAUDIO_NATNET_DATA_PORT`    | `1511`          | NatNet data port                              |
+| `BWAUDIO_NATNET_SERVER`       | (unset)         | Motive server IP, for the version handshake   |
+| `BWAUDIO_NATNET_COMMAND_PORT` | `1510`          | NatNet command port (handshake)               |
+| `BWAUDIO_NATNET_RIGIDBODY`    | `0`             | rigid-body streaming ID (0 ⇒ first in frame)  |
+| `BWAUDIO_NATNET_VERSION`      | auto, else 3.1  | bitstream version `major.minor` override      |
+| `BWAUDIO_NATNET_IFACE`        | any NIC         | local interface IP to bind/join on            |
+
+A NatNet open failure is non-fatal: the engine runs on the committed/default listener and the
+reason surfaces via `bw_last_error`.
+
 ## Frame boundary
 
 ```c

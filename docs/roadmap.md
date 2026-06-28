@@ -105,6 +105,22 @@ engines. Don't start with the engine bindings.
   at block time.
 - **Done when:** with `track_internal = true`, moving the tracked rigid body moves the
   rendered listener with low latency and no engine in the loop.
+- **Status: ~done (parser + handoff verified; live capture on-hardware-pending).** `natnet.c`
+  parses the NatNet **FrameOfData** multicast/unicast stream **off-wire** — the SDK is
+  proprietary and would conflict with GPLv3 under distribution, so it is used only as a
+  wire-format reference, never linked (see `build.md`). The parser walks to the selected rigid
+  body's pose, fully bounds-checked: it handles the NatNet 3.x/4.0 variable-length sections and
+  the 4.1+ per-section size prefix, and rejects truncated/old-version packets without
+  over-reading. A receiver thread publishes the pose into a **seqlock** (`pose.h`, single-writer
+  / single-reader, bounded-retry so the audio thread never blocks); with `track_internal = true`
+  `rt_render` samples the freshest pose at block time — overriding the committed listener and
+  dirtying every voice on a move (lower latency than routing pose through the command ring). The
+  consumer auto-negotiates the bitstream version via a `NAT_CONNECT` handshake (env-overridable;
+  config is via `BWAUDIO_NATNET_*`, see `api.md`). `bw_natnet_test` verifies the parser (v3 and
+  v4.1, rigid-body select, the tracking-valid flag, truncation safety) and the seqlock roundtrip;
+  the open→receive→join socket lifecycle is verified live (UDP socket + multicast join, clean
+  thread join on close). **Remaining:** confirm against a real Motive server — actual pose
+  reception and the room-space calibration (Motive origin → CAVE centre) need the rig on site.
 
 ## M7 — Unity binding
 - P/Invoke binding, `BwAudio` bootstrap, `BwEmitter`, the `Room` coordinate helper.

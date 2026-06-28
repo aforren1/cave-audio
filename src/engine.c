@@ -10,6 +10,7 @@
 #include "rt.h"
 #include "layout.h"
 #include "binaural.h"
+#include "natnet.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -49,6 +50,8 @@ struct BwEngine {
     BwSink*     sink_mon;         /* both: the monitor (2-ch) device */
     float*      mon_buf[2];       /* both: stereo double-buffer (each 2*cap), array thread -> monitor thread */
     volatile LONG mon_idx;        /* both: index of the latest published buffer */
+
+    NatNet*     tracker;          /* track_internal: NatNet pose ingest (NULL otherwise) */
 };
 
 static void set_error(BwEngine* e, const char* msg) {
@@ -56,6 +59,11 @@ static void set_error(BwEngine* e, const char* msg) {
     if (msg && msg != e->errbuf) { strncpy(e->errbuf, msg, sizeof e->errbuf - 1); e->errbuf[sizeof e->errbuf - 1] = 0; }
     e->last_error = (msg && e->errbuf[0]) ? e->errbuf : msg;
 }
+
+/* env helpers for the track_internal (NatNet) config — keeps the NatNet wiring out of BwConfig */
+static const char* env_or(const char* name, const char* def) { const char* v = getenv(name); return (v && v[0]) ? v : def; }
+static uint16_t    env_u16(const char* name, uint16_t def)    { const char* v = getenv(name); return (v && v[0]) ? (uint16_t)strtoul(v, NULL, 10) : def; }
+static int32_t     env_i32(const char* name, int32_t def)     { const char* v = getenv(name); return (v && v[0]) ? (int32_t)strtol(v, NULL, 10) : def; }
 
 /* cave: the 26-ch array goes straight to the device. */
 static void render_cave(void* user, float* dev, uint32_t n, const BwTimestamp* ts) {
@@ -136,6 +144,7 @@ BwEngine* bw_create(const BwConfig* cfg) {
 static void engine_close_devices(BwEngine* e) {
     if (e->sink_mon) { bw_sink_close(e->sink_mon); e->sink_mon = NULL; }
     if (e->sink)     { bw_sink_close(e->sink);     e->sink     = NULL; }
+    if (e->tracker)  { rt_set_tracker(e->rt, NULL); natnet_close(e->tracker); e->tracker = NULL; }  /* after audio stops */
     free(e->scratch26);  e->scratch26  = NULL;
     free(e->mon_buf[0]); e->mon_buf[0] = NULL;
     free(e->mon_buf[1]); e->mon_buf[1] = NULL;
@@ -170,6 +179,28 @@ int bw_start(BwEngine* e) {
         engine_close_devices(e);
         return 2;                                       /* BW_ERR_DEVICE */
     }
+
+    /* track_internal: ingest OptiTrack pose ourselves and sample it on the audio thread.
+     * Configured via env (no NatNet specifics in BwConfig). Non-fatal: a failure leaves the
+     * engine running on the committed/default listener and surfaces via bw_last_error. Done
+     * before bw_sink_start so the pose slot is wired before the audio thread reads it. */
+    if (e->cfg.track_internal) {
+        NatNetConfig nc = {
+            .multicast    = env_or("BWAUDIO_NATNET_MULTICAST", "239.255.42.99"),
+            .server       = getenv("BWAUDIO_NATNET_SERVER"),
+            .local_iface  = getenv("BWAUDIO_NATNET_IFACE"),
+            .data_port    = env_u16("BWAUDIO_NATNET_DATA_PORT", 1511),
+            .command_port = env_u16("BWAUDIO_NATNET_COMMAND_PORT", 1510),
+            .rigid_body   = env_i32("BWAUDIO_NATNET_RIGIDBODY", 0),
+            .major = 0, .minor = 0,
+        };
+        const char* ver = getenv("BWAUDIO_NATNET_VERSION");
+        if (ver && ver[0]) { nc.major = atoi(ver); const char* d = strchr(ver, '.'); nc.minor = d ? atoi(d + 1) : 0; }
+        e->tracker = natnet_open(&nc, e->errbuf, sizeof e->errbuf);
+        if (e->tracker) rt_set_tracker(e->rt, natnet_pose(e->tracker));
+        else            set_error(e, e->errbuf[0] ? e->errbuf : "track_internal: NatNet open failed");
+    }
+
     if (bw_sink_start(e->sink) != 0 || (e->sink_mon && bw_sink_start(e->sink_mon) != 0)) {
         set_error(e, "bw_start: sink failed to start");
         engine_close_devices(e);

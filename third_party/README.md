@@ -35,11 +35,23 @@ backend disabled`) and the library still builds and links.
 **Sink selection at runtime** (see `src/sink.c`):
 - default — try ASIO, fall back to the null (offline) sink if no usable device;
 - `BWAUDIO_SINK=null` — force the offline sink (CI, desk debugging, no hardware);
-- `BWAUDIO_SINK=asio` — ask for ASIO explicitly (still falls back if unavailable).
+- `BWAUDIO_SINK=asio` — require ASIO; if no driver opens it **fails** (no silent
+  null fallback), so a missing device surfaces instead of playing silence.
 
-The ASIO backend requires a driver exposing **≥26 output channels** (Dante Virtual
-Soundcard in production). On a machine without one, `bw_asio_sink_open` rejects the
-driver and the engine uses the null sink.
+The `cave`/`both` array path needs a driver exposing **≥26 output channels** (Dante
+Virtual Soundcard in production); `binaural` needs only 2. The auto-pick tries the
+registered drivers and uses the first that opens with enough outputs (override with
+`BWAUDIO_ASIO_DRIVER`); `bw_audio_backend()` reports which one opened.
+
+## NatNet SDK (OptiTrack pose, M6) — reference only, NOT linked
+
+NaturalPoint's NatNet SDK is **proprietary** and would conflict with GPLv3 under
+distribution, so the engine parses the documented FrameOfData wire protocol itself in
+`src/natnet.c` and **does not link the SDK**. A local copy at `third_party/NatNetSDK/`
+(gitignored, not redistributed) is useful only as a wire-format reference — the sample
+`Samples/PacketClient/PacketClient.cpp` `Unpack*` functions are the authoritative layout,
+and `include/NatNetTypes.h` has the message IDs / default ports / multicast group. Nothing
+in `third_party/NatNetSDK/` is required to build; M6 needs no vendored dependency.
 
 ## dr_wav (wav loading, M3)
 

@@ -18,6 +18,7 @@
 
 #include "sink.h"          /* BwTimestamp, BW_CHANNELS */
 #include "layout.h"        /* Layout (for rt_set_layout) */
+#include "pose.h"          /* PoseSlot (for rt_set_tracker) */
 
 #include <stdbool.h>
 #include <stdint.h>
@@ -53,6 +54,11 @@ typedef struct RtCore RtCore;   /* opaque */
 RtCore* rt_create(uint32_t voice_cap, uint32_t sound_cap, uint32_t sample_rate, uint32_t channels);
 void    rt_destroy(RtCore* c);
 void    rt_set_layout(RtCore* c, const Layout* L);   /* call before bw_start / while stopped */
+
+/* Attach the internal tracker's pose slot (track_internal). When set, rt_render samples the
+ * freshest head pose from it at block time, overriding the committed listener. NULL detaches.
+ * Set before the audio thread starts / after it stops (the audio thread reads the pointer). */
+void    rt_set_tracker(RtCore* c, const PoseSlot* slot);
 
 /* ---- assets (control thread; file I/O + alloc) ---- */
 uint32_t rt_load_sound  (RtCore* c, const char* path, char* err, size_t errcap); /* 0 on failure */

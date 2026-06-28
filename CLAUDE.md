@@ -88,18 +88,26 @@ cmake --build build --config RelWithDebInfo
 ctest --test-dir build -C RelWithDebInfo      # runs the bw_smoke lifecycle check
 ```
 
-**Current state (M5):** builds `bwaudio.dll` + six tests. `rt.c` is the concurrency spine
+**Current state (M6):** builds `bwaudio.dll` + seven tests. `rt.c` is the concurrency spine
 (two SPSC rings, voice + sound tables, commit snapshot, generation handles) + retire-ack;
 the whole `bw_*` API forwards to it. `sound.c` decodes wav (dr_wav) and `mix_voice` plays
 `sound->pcm` with a gain ramp. Spatialization is real: `layout.c` loads the surveyed
 geometry, `dbap.c` is the listener-relative constant-power gain solve, `align.c` applies
-the per-speaker gain trim + delay. **`binaural.c` is the head-oriented 26→stereo monitor**,
-and `engine.c` wires all three profiles (`cave` 26→device, `binaural` 26→2ch via the
-monitor, `both` array+monitor on two sinks via a double-buffer). Remaining: the production
-Steam Audio HRTF decode + a real stereo output backend (WASAPI) — today binaural/both
-output to the null sink (no headphone playback yet); and OptiTrack ingest (M6). Do not bake
-ASIO assumptions outside `asio_sink.cpp`. The atomics in `rt.c` need `/experimental:c11atomics`
-on MSVC (wired in CMake); `-DBWAUDIO_ASAN=ON` builds `bw_sound_test` under ASan.
+the per-speaker gain trim + delay. `binaural.c` is the head-oriented 26→stereo monitor, and
+`engine.c` wires all three profiles (`cave` 26→device, `binaural` 26→2ch via the monitor,
+`both` array+monitor on two sinks via a double-buffer). Binaural/both reach headphones live
+through an auto-picked 2-ch **ASIO** driver (sizes its render scratch to the device block, so
+any driver buffer size works); `bw_audio_backend()` reports the device actually opened.
+**`natnet.c` is M6: an off-wire NatNet (OptiTrack) FrameOfData parser + a seqlock pose handoff
+(`pose.h`); with `track_internal` the audio thread samples the freshest head pose at block
+time** (`rt_set_tracker`), configured via `BWAUDIO_NATNET_*` env (see docs/api.md). An
+interactive **raylib playground** (`examples/playground.c`, opt-in `-DBWAUDIO_BUILD_PLAYGROUND=ON`)
+auditions binaural by ear. Remaining: the production Steam Audio HRTF decode; and live Motive
+verification of M6 (parser + lifecycle are tested off-wire). Do not bake ASIO assumptions
+outside `asio_sink.cpp`, and do not link the NatNet SDK (proprietary; reference only — GPLv3).
+The atomics in `rt.c` need `/experimental:c11atomics` on MSVC (wired in CMake); `pose.h` uses
+Interlocked intrinsics instead, so `natnet.c`/tests need no extra flag. `-DBWAUDIO_ASAN=ON`
+builds `bw_sound_test` under ASan.
 
 ## What NOT to do
 
