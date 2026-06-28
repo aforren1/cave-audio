@@ -40,10 +40,14 @@ typedef struct {
      * create). occ_cur ramps toward the gated published value, applied to the mono signal pre-pan. */
     float    occ_cur;
     float    dir_cur;                        /* directivity ramp (source-radiation gain, pre-pan) */
-    /* per-band transmission EQ state (audio-thread-only). eqg_cur are the slewed band gains; the
-     * 4 history arrays are the 3 biquad sections' Direct-Form-I state. */
+    /* per-band transmission EQ state (audio-thread-only). eqg_cur are the slewed band gains; eq_co
+     * are the 3 sections' live coefficients {b0,b1,b2,a1,a2}, INTERPOLATED toward the block's target
+     * per sample so the spectral envelope never steps at a block boundary (invariant 4). The 4
+     * history arrays are the Direct-Form-I state; eq_engaged gates the chain (bypassed when settled flat). */
     float    eqg_cur[3];
+    float    eq_co[3][5];
     float    eq_x1[3], eq_x2[3], eq_y1[3], eq_y2[3];
+    int      eq_engaged;
 } Voice;
 
 typedef struct {
@@ -218,7 +222,8 @@ static const SoundData* sound_for(RtCore* c, uint32_t h) {
  * per sample-rate at rt_create; only A=sqrt(g) varies per update => no transcendentals per sample. */
 enum { EQ_LOWSHELF = 0, EQ_PEAK = 1, EQ_HIGHSHELF = 2 };
 #define EQ_FLOOR 0.0625f       /* per-band floor (-24 dB), matching Steam's normalizeGains */
-#define EQ_SLEW  0.5f          /* per-block band-gain glide toward the published target (no click) */
+#define EQ_SLEW  0.5f          /* per-block band-gain glide toward the published target */
+#define EQ_FLAT  0xFFFFFFFFFFFFull   /* eq_pack({1,1,1}): the flat (passthrough) tilt, as a constant */
 
 /* pack 3 band gains (each clamped to [0,1]) into one u64 = 3x16-bit, for a tear-free atomic publish */
 static inline uint64_t eq_pack(const float g[3]) {
@@ -278,6 +283,7 @@ static void drain_commands(RtCore* c) {
             v->occ_cur = 1.f;                       /* clear (un-occluded) by default */
             v->dir_cur = 1.f;                       /* on-axis/omni by default */
             v->eqg_cur[0] = v->eqg_cur[1] = v->eqg_cur[2] = 1.f;   /* flat EQ (history zeroed by memset) */
+            for (int b = 0; b < 3; ++b) v->eq_co[b][0] = 1.f;     /* passthrough coeffs {1,0,0,0,0} */
             /* drop any publish the sim left for the prior occupant of this slot (the stores are
              * atomic, so a concurrent sim publish for the old handle can't tear; either way the new
              * gen won't match it). */
@@ -360,22 +366,25 @@ static void mix_voice(RtCore* c, Voice* v, uint16_t idx, float* bus, uint32_t n)
     const float dir_tgt = mine ? atomic_load_explicit(&c->occ_dir[idx], memory_order_relaxed) : 1.0f;
     const float dir_step = (dir_tgt - v->dir_cur) / (float)n;
 
-    /* per-band EQ: read the gated tilt once, glide the band gains, recompute the 3 biquads from the
-     * rate-derived prototypes. Bypassed (no per-sample filtering) when the voice is effectively flat. */
+    /* per-band EQ: read the gated tilt once + glide the band gains; compute this block's TARGET
+     * biquad coeffs and interpolate the live coeffs (eq_co) toward them per sample, so the spectral
+     * envelope never steps at a block boundary (invariant 4). Target is passthrough when flat; the
+     * chain is bypassed once it has fully settled flat. */
     float gt[3];
-    eq_unpack(mine ? atomic_load_explicit(&c->occ_eq[idx], memory_order_relaxed)
-                   : eq_pack((float[3]){1.f,1.f,1.f}), gt);
-    bool eq_on = false;
-    float co[3][5];
+    eq_unpack(mine ? atomic_load_explicit(&c->occ_eq[idx], memory_order_relaxed) : EQ_FLAT, gt);
+    bool flat = true;
     for (int b = 0; b < 3; ++b) {
         v->eqg_cur[b] += (gt[b] - v->eqg_cur[b]) * EQ_SLEW;
-        if (v->eqg_cur[b] < 0.999f || v->eqg_cur[b] > 1.001f) eq_on = true;
+        if (v->eqg_cur[b] < 0.999f || v->eqg_cur[b] > 1.001f) flat = false;
     }
-    if (eq_on) {
-        for (int b = 0; b < 3; ++b)
-            eq_coeffs(c->eq_proto[b].type, c->eq_proto[b].cw0, c->eq_proto[b].alpha, v->eqg_cur[b], co[b]);
-    } else {                                                     /* flat: drop stale filter history */
-        for (int b = 0; b < 3; ++b) { v->eq_x1[b]=v->eq_x2[b]=v->eq_y1[b]=v->eq_y2[b]=0.f; }
+    if (!flat) v->eq_engaged = 1;
+    float co_tgt[3][5], co_step[3][5];
+    if (v->eq_engaged) {
+        for (int b = 0; b < 3; ++b) {
+            if (flat) { co_tgt[b][0] = 1.f; co_tgt[b][1] = co_tgt[b][2] = co_tgt[b][3] = co_tgt[b][4] = 0.f; }
+            else eq_coeffs(c->eq_proto[b].type, c->eq_proto[b].cw0, c->eq_proto[b].alpha, v->eqg_cur[b], co_tgt[b]);
+            for (int k = 0; k < 5; ++k) co_step[b][k] = (co_tgt[b][k] - v->eq_co[b][k]) / (float)n;
+        }
     }
 
     uint32_t cur = v->cursor;
@@ -386,11 +395,12 @@ static void mix_voice(RtCore* c, Voice* v, uint16_t idx, float* bus, uint32_t n)
             else         ended = true;
         }
         float s = ended ? 0.f : snd->pcm[cur];
-        if (eq_on) {                                            /* 3 biquads in series (DF-I) */
+        if (v->eq_engaged) {                                    /* 3 biquads (DF-I), coeffs interpolated per sample */
             for (int b = 0; b < 3; ++b) {
-                float y = co[b][0]*s + co[b][1]*v->eq_x1[b] + co[b][2]*v->eq_x2[b]
-                                     - co[b][3]*v->eq_y1[b] - co[b][4]*v->eq_y2[b];
+                float* co = v->eq_co[b];
+                float y = co[0]*s + co[1]*v->eq_x1[b] + co[2]*v->eq_x2[b] - co[3]*v->eq_y1[b] - co[4]*v->eq_y2[b];
                 v->eq_x2[b]=v->eq_x1[b]; v->eq_x1[b]=s; v->eq_y2[b]=v->eq_y1[b]; v->eq_y1[b]=y; s=y;
+                for (int k = 0; k < 5; ++k) co[k] += co_step[b][k];   /* glide toward the block target */
             }
         }
         s *= v->occ_cur * v->dir_cur;                           /* occlusion level + directivity, pre-pan */
@@ -405,6 +415,13 @@ static void mix_voice(RtCore* c, Voice* v, uint16_t idx, float* bus, uint32_t n)
     v->cursor = cur;
     v->occ_cur = occ_tgt;                                        /* land exactly (same local) */
     v->dir_cur = dir_tgt;
+    if (v->eq_engaged) {
+        for (int b = 0; b < 3; ++b) for (int k = 0; k < 5; ++k) v->eq_co[b][k] = co_tgt[b][k];   /* land coeffs */
+        if (flat) {                                              /* settled to passthrough: bypass + reset history */
+            v->eq_engaged = 0;
+            for (int b = 0; b < 3; ++b) { v->eq_x1[b]=v->eq_x2[b]=v->eq_y1[b]=v->eq_y2[b]=0.f; }
+        }
+    }
     for (uint32_t ch = 0; ch < c->channels; ++ch) v->gcur[ch] = v->gtarget[ch]; /* land exactly */
 
     if (ended) {
@@ -661,8 +678,11 @@ void rt_set_tracker(RtCore* c, const PoseSlot* slot) {
  * is dropped there (race-free, since the sim never reads v->gen/v->active). */
 /* Unified per-source direct-effect publish: broadband `level`, 3-band transmission `bands` (each in
  * [0,1], normalized so the loudest is 1 — the audio thread's EQ tilt), and a `dir` directivity gain.
- * All stores are relaxed; occ_handle is written LAST with release, so the audio side only consumes a
- * complete (level, bands, dir) set for the matching occupant — never a torn cross-field/occupant mix. */
+ * occ_handle is written LAST with release, so a publish for a DIFFERENT occupant is never half-applied
+ * (the audio thread's gen-gate flips atomically with the handle). For a LIVE voice the handle is
+ * unchanged across re-publishes, so the three fields can be observed one 30 Hz tick apart (e.g. level
+ * from update N, bands/dir from N+1) — a bounded cross-field staleness that is harmless because the
+ * audio thread ramps/glides all three toward their targets every block (no jump). */
 void rt_set_direct(RtCore* c, uint32_t handle, float level, const float bands[3], float dir) {
     if (!c) return;
     uint16_t idx = BW_H_IDX(handle);
