@@ -204,26 +204,67 @@ bw_unload_sound(eng, steps);
 bw_stop(eng); bw_destroy(eng);
 ```
 
-## Materials, occlusion, directivity & reflections (control thread; Steam Audio build)
+## Materials & scene geometry (control thread; load-time)
 
-These calls drive Steam Audio's scene simulation. They are no-ops (safe to call) without the
-`BW_HAVE_STEAMAUDIO` build. The full model is [materials.md](.\materials.md); the per-call
-threading contract:
+```c
+BwMaterial bw_material_preset(BwEngine* e, const char* name);  // 0 = default ("generic" or miss/full)
+BwMaterial bw_material_define(BwEngine* e, const float absorption[3], float scattering,
+                                           const float transmission[3]);
+void bw_scene_set_mesh    (BwEngine* e, const float* verts, int nverts, const int* tris, int ntris,
+                           const float absorption[3], float scattering, const float transmission[3]);
+void bw_scene_set_mesh_mat(BwEngine* e, const float* verts, int nverts, const int* tris, int ntris,
+                           const BwMaterial* tri_material);     // one token per triangle
+void bw_scene_set_box     (BwEngine* e, float w, float h, float d, const BwMaterial faces[6]); // -x,+x,-y,+y,-z,+z
+```
 
-| Call | When | Threading |
-|------|------|-----------|
-| `bw_material_preset` / `bw_material_define` | load-time | control thread; mints an engine-scoped `BwMaterial` token (`0` = built-in default). Works with or without the SDK. Fixed table (64). |
-| `bw_scene_set_mesh` / `bw_scene_set_mesh_mat` / `bw_scene_set_box` | **load-time** (before `bw_start`) | control thread; allocates + hands geometry to the off-thread sim under a lock. **Enforced**: a call after `bw_start` is rejected (sets `bw_last_error`) — the occlusion + reflection sims share one `IPLScene` and a mesh swap can't run concurrently with ray tracing. |
-| `bw_source_set_occlusion` | per-frame | non-blocking; enqueues. The sim ray-traces at a low rate and publishes a transmittance the audio thread ramps. |
-| `bw_source_set_directivity` / `_preset` / `bw_source_set_orientation` | per-frame | non-blocking; enqueues. Independent of occlusion. |
-| `bw_source_get_occlusion` / `bw_source_get_directivity` | any time | control thread; reads the latest published scalar (HUD/diagnostics). |
-| `bw_reflections_config` | **load-time** (before `bw_start`) | control thread; copies the config. The bed (IR length, order) is baked at `bw_start`. |
-| `bw_source_set_reflections` | per-frame | non-blocking; gates the source's send into the shared reverb bed. |
+A `BwMaterial` is an **opaque, engine-scoped token** (a small index; `0` is always the built-in
+`generic` default). Mint with a preset name (11 presets, case-insensitive, Steam Audio's published
+coefficients — `"generic"` returns `0` without minting) or custom 3-band coefficients (clamped to
+`[0,1]`, NaN-sanitized). The table is fixed (64 entries); on overflow / unknown name the mint returns
+`0` and sets `bw_last_error`. Tokens are **not** generation-checked handles — they stay valid for the
+engine's life; per-triangle indices out of range clamp to the default.
 
-`BwMaterial` tokens are table indices, not generation-checked handles — they stay valid for the
-engine's life. Per-triangle material indices out of range clamp to the default. The reflection bed
-v1 ships Steam Audio's **parametric (FDN) reverb**; the hybrid early-reflection convolution path is
-a pending follow-up (see [materials.md](.\materials.md)).
+Geometry is in **room space (RH metres)**, triangles CCW; `bw_scene_set_box` builds an origin-centred
+shoebox with **inward-facing** normals (the listener is inside). The same per-triangle materials feed
+**both** occlusion (per-band transmission) and the reflection bed (absorption/scattering) — one shared
+`IPLScene`. These setters are **enforced load-time**: a call after `bw_start` is rejected (sets
+`bw_last_error`), because an `iplSceneCommit` cannot run concurrently with the reflection thread's ray
+tracing (phonon's own rule). v1 assumes a static scene. All of the above are **no-ops without the
+`BW_HAVE_STEAMAUDIO` build** (token minting still works — it is plain table state).
+
+## Occlusion & directivity (control thread; per-frame except where noted)
+
+```c
+void  bw_source_set_occlusion (BwEngine* e, BwSource s, bool on);
+float bw_source_get_occlusion (BwEngine* e, BwSource s);   // 1 = clear .. 0 = blocked (HUD)
+void  bw_source_set_orientation(BwEngine* e, BwSource s, float qx, float qy, float qz, float qw);
+void  bw_source_set_directivity(BwEngine* e, BwSource s, float weight, float power); // 0=omni/.5=card/1=fig8
+void  bw_source_set_directivity_preset(BwEngine* e, BwSource s, BwDirectivity pattern);
+float bw_source_get_directivity(BwEngine* e, BwSource s);   // 1 = on-axis/omni .. 0 = null (HUD)
+```
+
+The setters are **non-blocking, enqueue-only** (safe in the hot loop). The off-thread sim ray-traces
+at a low rate and publishes a per-source scalar (+ a 3-band transmission tilt for occlusion) that the
+**audio thread ramps** — never a jump. Occlusion and directivity are independent (a source can be
+directional without being occluded). The `_get_` reads return the latest published scalar for
+HUD/diagnostics and are safe to poll. No-ops without the Steam Audio build.
+
+## Reflection bed (control thread)
+
+```c
+typedef struct { float ir_seconds; uint32_t order, num_rays, num_bounces; int enabled; uint32_t reserved[4]; } BwReflectionConfig;
+void bw_reflections_config   (BwEngine* e, const BwReflectionConfig* cfg);  // LOAD-TIME (before bw_start)
+void bw_source_set_reflections(BwEngine* e, BwSource s, bool on);           // per-frame; gates the wet send
+```
+
+A single shared **listener-centric reverb bed** decoded straight to the 26 channels and summed onto
+the bus. `bw_reflections_config` is **load-time** (the IR length + ambisonic order are baked at
+`bw_start`); zero fields take defaults (`ir_seconds` 1.0, `order` 1, `num_rays` 4096, `num_bounces`
+16), `enabled = 0` means no bed is created and the engine behaves exactly as without it.
+`bw_source_set_reflections` is the per-frame, non-blocking opt-in of a source into the bed's wet send
+(with the bed disabled or no SDK, it gates a send that goes nowhere). v1 ships Steam Audio's
+**parametric (FDN) reverb**; the hybrid early-reflection convolution path is a pending follow-up.
+No-op without the Steam Audio build. Full model: [materials.md](.\materials.md).
 
 ## Handle scheme
 
