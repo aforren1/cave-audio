@@ -64,6 +64,9 @@ void    rt_set_tracker(RtCore* c, const PoseSlot* slot);
  * before the DBAP pan. Called from the off-thread occlusion sim (not the control thread). Stale/
  * recycled handles are dropped; the audio thread ramps to it (no zipper). */
 void    rt_set_occlusion(RtCore* c, uint32_t handle, float transmittance);
+/* Occlusion with a 3-band transmission tilt: broadband `level` + normalized `band_gains[3]` (the
+ * audio thread applies a 3-biquad EQ). Same off-thread publisher + handle gate as rt_set_occlusion. */
+void    rt_set_occlusion_eq(RtCore* c, uint32_t handle, float level, const float band_gains[3]);
 float   rt_get_occlusion(RtCore* c, uint32_t handle);   /* control thread: published factor (1 = clear) */
 
 /* ---- assets (control thread; file I/O + alloc) ---- */

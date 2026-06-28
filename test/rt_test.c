@@ -152,9 +152,21 @@ int main(void) {
     rt_source_play(c, h4, snd, true); set_pos_spk(c, h4, 4); rt_commit(c); render2(c);
     CHECK(total_energy() > e_clear * 0.5, "recycled voice is clear despite the prior occupant's occlusion");
 
+    /* 10. per-band transmission EQ: a low-band cut darkens the (DC) test signal; flat restores it.
+     *     The const wav is DC, which sits in the low-shelf band, so band[0] sets its level. */
+    double e4b = total_energy();                          /* h4 clear at channel 4 */
+    const float lo_cut[3] = { 0.0625f, 1.f, 1.f };        /* kill the low band, keep mid/high */
+    rt_set_occlusion_eq(c, h4, 1.0f, lo_cut);
+    for (int k = 0; k < 12; ++k) render2(c);             /* let the band-gain glide settle */
+    CHECK(total_energy() < e4b * 0.1, "low-band EQ cut darkens the DC signal (level held at 1.0)");
+    const float flat[3] = { 1.f, 1.f, 1.f };
+    rt_set_occlusion_eq(c, h4, 1.0f, flat);
+    for (int k = 0; k < 12; ++k) render2(c);
+    CHECK(fabs(total_energy() / e4b - 1.0) < 0.02, "flat EQ restores full level (bypass re-engaged)");
+
     rt_destroy(c);
     remove(WAV);
     if (fails) { printf("rt_test: %d FAILURES\n", fails); return 1; }
-    printf("rt_test OK (DBAP routing, commit snapshot, generation drop, gain, occlusion verified)\n");
+    printf("rt_test OK (DBAP routing, commit snapshot, generation drop, gain, occlusion, EQ verified)\n");
     return 0;
 }

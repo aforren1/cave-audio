@@ -135,24 +135,32 @@ static DWORD WINAPI sim_thread(LPVOID arg) {
             iplSourceSetInputs(s->srcs[i], IPL_SIMULATIONFLAGS_DIRECT, &in);
         }
 
-        /* 5. run + publish a single transmittance scalar (1 = clear, 0 = blocked). No geometry =>
-         * clear, so a removed/failed mesh never leaves a voice stuck attenuated. */
+        /* 5. run + publish a broadband level + a 3-band transmission tilt (the spectral shape of the
+         * occluded sound). No geometry => clear, so a removed/failed mesh never leaves a voice stuck
+         * attenuated. Per band: raw = occlusion + (1-occlusion)*transmission[b]; the broadband LEVEL
+         * is max(raw) and the normalized tilt raw/max (floored) is the EQ — matching Steam Audio's
+         * own split (tilt in the EQ, level in the scalar). */
         int have_mesh = (s->mesh != NULL);
         if (have_mesh) iplSimulatorRunDirect(s->simulator);
         for (uint32_t i = 0; i < cap; ++i) {
             if (!s->srcs[i]) continue;
-            float occ = 1.0f;
-            if (have_mesh) {
-                IPLSimulationOutputs out; memset(&out, 0, sizeof out);
-                iplSourceGetOutputs(s->srcs[i], IPL_SIMULATIONFLAGS_DIRECT, &out);
-                /* combine geometric occlusion with the material's mean transmittance: the unoccluded
-                 * fraction passes fully, the occluded fraction passes by the material. (A per-band
-                 * transmission EQ for timbre — vs this level-only scalar — is future work.) */
-                const IPLDirectEffectParams* d = &out.direct;
-                float tr = (d->transmission[0] + d->transmission[1] + d->transmission[2]) / 3.0f;
-                occ = d->occlusion + (1.0f - d->occlusion) * tr;
+            if (!have_mesh) { rt_set_occlusion(s->rt, snap_h[i], 1.0f); continue; }   /* clear: flat EQ */
+            IPLSimulationOutputs out; memset(&out, 0, sizeof out);
+            iplSourceGetOutputs(s->srcs[i], IPL_SIMULATIONFLAGS_DIRECT, &out);
+            const IPLDirectEffectParams* d = &out.direct;
+            float raw[3], maxg = 0.f;
+            for (int b = 0; b < 3; ++b) {
+                raw[b] = d->occlusion + (1.0f - d->occlusion) * d->transmission[b];
+                if (raw[b] > maxg) maxg = raw[b];
             }
-            rt_set_occlusion(s->rt, snap_h[i], occ);
+            if (maxg <= 1e-6f) {
+                const float flat[3] = { 1.f, 1.f, 1.f };
+                rt_set_occlusion_eq(s->rt, snap_h[i], 0.0f, flat);     /* fully blocked: silence via level */
+            } else {
+                float g[3];
+                for (int b = 0; b < 3; ++b) { g[b] = raw[b] / maxg; if (g[b] < 0.0625f) g[b] = 0.0625f; }
+                rt_set_occlusion_eq(s->rt, snap_h[i], maxg, g);
+            }
         }
 
         Sleep(1000 / SIM_HZ);

@@ -39,6 +39,10 @@ typedef struct {
      * atomic arrays (outside this memset'd struct, so the off-thread sim never races a voice
      * create). occ_cur ramps toward the gated published value, applied to the mono signal pre-pan. */
     float    occ_cur;
+    /* per-band transmission EQ state (audio-thread-only). eqg_cur are the slewed band gains; the
+     * 4 history arrays are the 3 biquad sections' Direct-Form-I state. */
+    float    eqg_cur[3];
+    float    eq_x1[3], eq_x2[3], eq_y1[3], eq_y2[3];
 } Voice;
 
 typedef struct {
@@ -64,7 +68,9 @@ struct RtCore {
      * Voice struct so CMD_SRC_CREATE's memset never races a concurrent sim publish. The sim stores
      * (occ_handle, occ_val); the audio thread gates on its own v->gen (which it owns) and applies. */
     _Atomic uint32_t* occ_handle;           /* handle the sim last published for (0 = none) */
-    _Atomic float*    occ_val;              /* published transmittance (1 = clear) */
+    _Atomic float*    occ_val;              /* published broadband level (1 = clear) */
+    _Atomic uint64_t* occ_eq;               /* published 3-band transmission tilt (3x16-bit, gated by occ_handle) */
+    struct { float cw0, alpha; int type; } eq_proto[3];   /* per-band biquad prototypes, rate-derived at create */
 
     /* control-thread-owned voice handle allocation */
     uint16_t* gen;                          /* current generation per voice slot */
@@ -203,6 +209,57 @@ static const SoundData* sound_for(RtCore* c, uint32_t h) {
     return (s->inuse && s->gen == BW_H_GEN(h)) ? &s->data : NULL;
 }
 
+/* ---- per-band transmission EQ (matches Steam Audio's default direct-effect EQ) ----
+ * Three RBJ biquads in series — low-shelf @800, peaking @~2530, high-shelf @8000 — applied to the
+ * mono voice signal. The band *gains* are the spectral tilt of occluded sound; the broadband level
+ * rides the existing occ_cur scalar. fc's are fixed, so the trig (cos w0 / alpha) is precomputed
+ * per sample-rate at rt_create; only A=sqrt(g) varies per update => no transcendentals per sample. */
+enum { EQ_LOWSHELF = 0, EQ_PEAK = 1, EQ_HIGHSHELF = 2 };
+#define EQ_FLOOR 0.0625f       /* per-band floor (-24 dB), matching Steam's normalizeGains */
+#define EQ_SLEW  0.5f          /* per-block band-gain glide toward the published target (no click) */
+
+/* pack 3 band gains (each clamped to [0,1]) into one u64 = 3x16-bit, for a tear-free atomic publish */
+static inline uint64_t eq_pack(const float g[3]) {
+    uint64_t p = 0;
+    for (int i = 0; i < 3; ++i) {
+        float v = g[i] < 0.f ? 0.f : (g[i] > 1.f ? 1.f : g[i]);
+        p |= (uint64_t)(uint16_t)(v * 65535.f + 0.5f) << (16 * i);
+    }
+    return p;
+}
+static inline void eq_unpack(uint64_t p, float g[3]) {
+    for (int i = 0; i < 3; ++i) g[i] = (float)((p >> (16 * i)) & 0xFFFFu) * (1.f / 65535.f);
+}
+
+/* RBJ Audio-EQ-Cookbook coefficients (a0-normalized, Direct Form I). cw0/alpha are precomputed per
+ * filter; g is the linear band gain (A = sqrt(g)). out = {b0,b1,b2,a1,a2}. */
+static void eq_coeffs(int type, float cw0, float alpha, float g, float out[5]) {
+    float A = sqrtf(g), b0, b1, b2, a0, a1, a2;
+    if (type == EQ_PEAK) {
+        a0 = 1.f + alpha / A; a1 = -2.f * cw0;        a2 = 1.f - alpha / A;
+        b0 = 1.f + alpha * A; b1 = -2.f * cw0;        b2 = 1.f - alpha * A;
+    } else {
+        float t = 2.f * sqrtf(A) * alpha;
+        if (type == EQ_LOWSHELF) {
+            a0 =  (A + 1) + (A - 1) * cw0 + t;
+            a1 = -2.f * ((A - 1) + (A + 1) * cw0);
+            a2 =  (A + 1) + (A - 1) * cw0 - t;
+            b0 =  A * ((A + 1) - (A - 1) * cw0 + t);
+            b1 =  2.f * A * ((A - 1) - (A + 1) * cw0);
+            b2 =  A * ((A + 1) - (A - 1) * cw0 - t);
+        } else { /* EQ_HIGHSHELF */
+            a0 =  (A + 1) - (A - 1) * cw0 + t;
+            a1 =  2.f * ((A - 1) - (A + 1) * cw0);
+            a2 =  (A + 1) - (A - 1) * cw0 - t;
+            b0 =  A * ((A + 1) + (A - 1) * cw0 + t);
+            b1 = -2.f * A * ((A - 1) + (A + 1) * cw0);
+            b2 =  A * ((A + 1) + (A - 1) * cw0 - t);
+        }
+    }
+    float inv = 1.f / a0;
+    out[0] = b0 * inv; out[1] = b1 * inv; out[2] = b2 * inv; out[3] = a1 * inv; out[4] = a2 * inv;
+}
+
 static void drain_commands(RtCore* c) {
     CmdRing* r = &c->cmds;
     uint32_t rd = atomic_load_explicit(&r->read,  memory_order_relaxed);
@@ -217,11 +274,13 @@ static void drain_commands(RtCore* c) {
             v->gen = BW_H_GEN(cmd->handle);
             v->active = true; v->gain_user = 1.f; v->dirty = true;
             v->occ_cur = 1.f;                       /* clear (un-occluded) by default */
-            /* drop any publish the sim left for the prior occupant of this slot (both stores are
+            v->eqg_cur[0] = v->eqg_cur[1] = v->eqg_cur[2] = 1.f;   /* flat EQ (history zeroed by memset) */
+            /* drop any publish the sim left for the prior occupant of this slot (the stores are
              * atomic, so a concurrent sim publish for the old handle can't tear; either way the new
              * gen won't match it). */
             atomic_store_explicit(&c->occ_handle[idx], 0u,   memory_order_relaxed);
             atomic_store_explicit(&c->occ_val[idx],    1.f,  memory_order_relaxed);
+            atomic_store_explicit(&c->occ_eq[idx], eq_pack((float[3]){1.f,1.f,1.f}), memory_order_relaxed);
         } break;
         case CMD_SRC_DESTROY: { Voice* v = voice_for(c, cmd->handle);
             if (v) { v->active = false; v->playing = false; v->sound = NULL; } } break;
@@ -289,9 +348,27 @@ static void mix_voice(RtCore* c, Voice* v, uint16_t idx, float* bus, uint32_t n)
      * published transmittance only if it was published for THIS occupant, else treat as clear. Read
      * once into a local so the ramp aims at and lands on the same value (invariant 4 — no jump). */
     const uint32_t myh = BW_MK_H(idx, v->gen);
-    const float occ_tgt = (atomic_load_explicit(&c->occ_handle[idx], memory_order_acquire) == myh)
-                        ? atomic_load_explicit(&c->occ_val[idx], memory_order_relaxed) : 1.0f;
+    const bool mine = atomic_load_explicit(&c->occ_handle[idx], memory_order_acquire) == myh;
+    const float occ_tgt = mine ? atomic_load_explicit(&c->occ_val[idx], memory_order_relaxed) : 1.0f;
     const float occ_step = (occ_tgt - v->occ_cur) / (float)n;   /* occlusion ramp (invariant 4) */
+
+    /* per-band EQ: read the gated tilt once, glide the band gains, recompute the 3 biquads from the
+     * rate-derived prototypes. Bypassed (no per-sample filtering) when the voice is effectively flat. */
+    float gt[3];
+    eq_unpack(mine ? atomic_load_explicit(&c->occ_eq[idx], memory_order_relaxed)
+                   : eq_pack((float[3]){1.f,1.f,1.f}), gt);
+    bool eq_on = false;
+    float co[3][5];
+    for (int b = 0; b < 3; ++b) {
+        v->eqg_cur[b] += (gt[b] - v->eqg_cur[b]) * EQ_SLEW;
+        if (v->eqg_cur[b] < 0.999f || v->eqg_cur[b] > 1.001f) eq_on = true;
+    }
+    if (eq_on) {
+        for (int b = 0; b < 3; ++b)
+            eq_coeffs(c->eq_proto[b].type, c->eq_proto[b].cw0, c->eq_proto[b].alpha, v->eqg_cur[b], co[b]);
+    } else {                                                     /* flat: drop stale filter history */
+        for (int b = 0; b < 3; ++b) { v->eq_x1[b]=v->eq_x2[b]=v->eq_y1[b]=v->eq_y2[b]=0.f; }
+    }
 
     uint32_t cur = v->cursor;
     bool ended = false;
@@ -300,7 +377,15 @@ static void mix_voice(RtCore* c, Voice* v, uint16_t idx, float* bus, uint32_t n)
             if (v->loop) cur = 0;
             else         ended = true;
         }
-        float s = (ended ? 0.f : snd->pcm[cur]) * v->occ_cur;   /* occlude the mono signal pre-pan */
+        float s = ended ? 0.f : snd->pcm[cur];
+        if (eq_on) {                                            /* 3 biquads in series (DF-I) */
+            for (int b = 0; b < 3; ++b) {
+                float y = co[b][0]*s + co[b][1]*v->eq_x1[b] + co[b][2]*v->eq_x2[b]
+                                     - co[b][3]*v->eq_y1[b] - co[b][4]*v->eq_y2[b];
+                v->eq_x2[b]=v->eq_x1[b]; v->eq_x1[b]=s; v->eq_y2[b]=v->eq_y1[b]; v->eq_y1[b]=y; s=y;
+            }
+        }
+        s *= v->occ_cur;                                        /* broadband occlusion level, pre-pan */
         if (!ended) ++cur;
         v->occ_cur += occ_step;
         for (uint32_t ch = 0; ch < c->channels; ++ch) {
@@ -498,17 +583,35 @@ RtCore* rt_create(uint32_t voice_cap, uint32_t sound_cap, uint32_t sample_rate, 
     c->voices    = (Voice*)    calloc(voice_cap, sizeof(Voice));
     c->occ_handle = (_Atomic uint32_t*)calloc(voice_cap, sizeof(_Atomic uint32_t));
     c->occ_val    = (_Atomic float*)   calloc(voice_cap, sizeof(_Atomic float));
+    c->occ_eq     = (_Atomic uint64_t*)calloc(voice_cap, sizeof(_Atomic uint64_t));
     c->gen       = (uint16_t*) calloc(voice_cap, sizeof(uint16_t));
     c->inuse     = (uint8_t*)  calloc(voice_cap, sizeof(uint8_t));
     c->freelist  = (uint32_t*) calloc(voice_cap, sizeof(uint32_t));
     c->sounds    = (SoundSlot*)calloc(sound_cap, sizeof(SoundSlot));
     c->sfreelist = (uint32_t*) calloc(sound_cap, sizeof(uint32_t));
-    if (!c->voices || !c->occ_handle || !c->occ_val || !c->gen || !c->inuse || !c->freelist ||
-        !c->sounds || !c->sfreelist) {
+    if (!c->voices || !c->occ_handle || !c->occ_val || !c->occ_eq || !c->gen || !c->inuse ||
+        !c->freelist || !c->sounds || !c->sfreelist) {
         rt_destroy(c); return NULL;
     }
-    for (uint32_t i = 0; i < voice_cap; ++i)   /* occlusion starts clear (handle 0 = no publish) */
-        atomic_store_explicit(&c->occ_val[i], 1.0f, memory_order_relaxed);
+    const uint64_t eq_flat = eq_pack((float[3]){ 1.f, 1.f, 1.f });
+    for (uint32_t i = 0; i < voice_cap; ++i) {   /* occlusion starts clear (handle 0 = no publish) */
+        atomic_store_explicit(&c->occ_val[i], 1.0f,    memory_order_relaxed);
+        atomic_store_explicit(&c->occ_eq[i],  eq_flat, memory_order_relaxed);
+    }
+    /* precompute the 3 EQ band prototypes from the runtime sample rate (so the EQ is correct at
+     * 48/96/192k). fc's: low-shelf 800, peaking at the geometric centre, high-shelf 8000. */
+    {
+        const float fc[3]  = { 800.f, sqrtf(800.f * 8000.f), 8000.f };
+        const int   ty[3]  = { EQ_LOWSHELF, EQ_PEAK, EQ_HIGHSHELF };
+        const float two_pi = 6.28318530717958648f;
+        for (int i = 0; i < 3; ++i) {
+            float w0 = two_pi * fc[i] / (float)sample_rate, sw0 = sinf(w0);
+            c->eq_proto[i].cw0   = cosf(w0);
+            c->eq_proto[i].alpha = (ty[i] == EQ_PEAK) ? sw0 * ((8000.f - 800.f) / fc[1]) * 0.5f   /* band-edge Q */
+                                                      : sw0 / (2.f * 0.70710678f);                /* shelf Q=0.707 */
+            c->eq_proto[i].type  = ty[i];
+        }
+    }
     c->lis.q_active[3]  = 1.0f;        /* default head orientation = identity (facing forward) */
     c->lis.q_pending[3] = 1.0f;
     c->readback.q[3]    = 1.0f;        /* readback identity until the first block publishes */
@@ -545,13 +648,23 @@ void rt_set_tracker(RtCore* c, const PoseSlot* slot) {
  * slot. The audio thread gates on its own generation when it consumes, so a stale/recycled handle
  * is dropped there (race-free, since the sim never reads v->gen/v->active). */
 void rt_set_occlusion(RtCore* c, uint32_t handle, float transmittance) {
+    const float flat[3] = { 1.f, 1.f, 1.f };
+    rt_set_occlusion_eq(c, handle, transmittance, flat);   /* broadband level, no spectral tilt */
+}
+
+/* As above, but with a 3-band transmission tilt: `level` is the broadband attenuation and
+ * `band_gains` (each in [0,1], normalized so the loudest band is 1) is the spectral shape the audio
+ * thread applies through its 3-biquad EQ. Stores are gated by the same occ_handle written last with
+ * release, so the audio side never reads a torn (level, tilt) pair across occupants. */
+void rt_set_occlusion_eq(RtCore* c, uint32_t handle, float level, const float band_gains[3]) {
     if (!c) return;
     uint16_t idx = BW_H_IDX(handle);
     if (idx >= c->voice_cap) return;
-    if (transmittance < 0.f) transmittance = 0.f;
-    if (transmittance > 1.f) transmittance = 1.f;
-    atomic_store_explicit(&c->occ_val[idx],    transmittance, memory_order_relaxed);
-    atomic_store_explicit(&c->occ_handle[idx], handle,        memory_order_release);
+    if (level < 0.f) level = 0.f;
+    if (level > 1.f) level = 1.f;
+    atomic_store_explicit(&c->occ_val[idx], level,             memory_order_relaxed);
+    atomic_store_explicit(&c->occ_eq[idx],  eq_pack(band_gains), memory_order_relaxed);
+    atomic_store_explicit(&c->occ_handle[idx], handle,         memory_order_release);
 }
 
 /* Read back a voice's published occlusion factor (1 = clear) — for HUD/diagnostics; 1 if the latest
@@ -575,7 +688,8 @@ void rt_destroy(RtCore* c) {
     free(c->freelist);
     free(c->inuse);
     free(c->gen);
-    free((void*)c->occ_val);            /* cast drops the _Atomic qualifier for free() */
+    free((void*)c->occ_eq);             /* cast drops the _Atomic qualifier for free() */
+    free((void*)c->occ_val);
     free((void*)c->occ_handle);
     free(c->voices);
     free(c);
