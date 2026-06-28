@@ -27,6 +27,14 @@ SteamScene* steam_scene_create(RtCore* rt, uint32_t sample_rate, uint32_t frame_
 void steam_scene_set_mesh(SteamScene* s, const float* verts, int nverts, const int* tris, int ntris,
                           const float absorption[3], float scattering, const float transmission[3]);
 
+/* Set occluding geometry with PER-TRIANGLE materials. nmat materials are given as flat arrays:
+ * absorption[nmat*3], scattering[nmat], transmission[nmat*3] (each band/coeff 0..1). tri_material
+ * is ntris entries, each an index in [0,nmat) (out-of-range clamps to 0). Replaces any prior mesh.
+ * (steam_scene_set_mesh is the nmat==1 case.) */
+void steam_scene_set_mesh_mat(SteamScene* s, const float* verts, int nverts, const int* tris, int ntris,
+                              int nmat, const float* absorption, const float* scattering,
+                              const float* transmission, const int* tri_material);
+
 /* Per-source controls (by bw source handle). Occlusion + directivity are independent features (a
  * source can be directional without being occluded). directivity: weight 0=omni / .5=cardioid /
  * 1=fig-8, power>=1 sharpens; the dipole axis is the source forward (fwd). source_gone clears all

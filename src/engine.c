@@ -24,6 +24,23 @@
 #define BW_VOICE_CAP 256       /* max simultaneous sources */
 #define BW_SOUND_CAP 256       /* max loaded sounds */
 #define BW_MAX_BLOCK 8192      /* upper bound on a device's frames-per-block (ASIO picks its own) */
+#define BW_MAX_MATERIALS 64    /* material-table capacity (token == index; [0] = default) */
+
+/* Named material presets. Coefficients are Steam Audio's published example materials: 3-band
+ * absorption (low/mid/high), scattering, 3-band transmission. The default (index 0) is "generic". */
+static const struct { const char* name; float absorption[3], scattering, transmission[3]; } BW_PRESETS[] = {
+    { "generic",  {0.10f,0.20f,0.30f}, 0.05f, {0.100f,0.050f,0.030f} },
+    { "brick",    {0.03f,0.04f,0.07f}, 0.05f, {0.015f,0.015f,0.015f} },
+    { "concrete", {0.05f,0.07f,0.08f}, 0.05f, {0.015f,0.002f,0.001f} },
+    { "ceramic",  {0.01f,0.02f,0.02f}, 0.05f, {0.060f,0.044f,0.011f} },
+    { "gravel",   {0.60f,0.70f,0.80f}, 0.05f, {0.031f,0.012f,0.008f} },
+    { "carpet",   {0.24f,0.69f,0.73f}, 0.05f, {0.020f,0.005f,0.003f} },
+    { "glass",    {0.06f,0.03f,0.02f}, 0.05f, {0.060f,0.044f,0.011f} },
+    { "plaster",  {0.12f,0.06f,0.04f}, 0.05f, {0.056f,0.056f,0.004f} },
+    { "wood",     {0.11f,0.07f,0.06f}, 0.05f, {0.070f,0.014f,0.005f} },
+    { "metal",    {0.20f,0.07f,0.06f}, 0.05f, {0.200f,0.025f,0.010f} },
+    { "rock",     {0.13f,0.20f,0.24f}, 0.05f, {0.015f,0.002f,0.001f} },
+};
 
 /* The three profiles (docs/architecture.md):
  *   cave     — render the 26-ch array straight to a 26-ch device (ASIO/DVS).
@@ -60,6 +77,11 @@ struct BwEngine {
     SteamScene*   scene;          /* materials occlusion sim (off-thread); NULL without the SDK */
     SteamReflect* reflect;        /* reflection bed (created at bw_start if configured); NULL otherwise */
     BwReflectionConfig refl_cfg;  /* set via bw_reflections_config before bw_start */
+
+    /* material table (control-thread): token == index; [0] is the built-in default. Coefficients are
+     * resolved to per-triangle materials when a mesh is set. */
+    struct { float absorption[3], scattering, transmission[3]; } materials[BW_MAX_MATERIALS];
+    uint32_t      num_materials;
 };
 
 static void set_error(BwEngine* e, const char* msg) {
@@ -138,6 +160,14 @@ BwEngine* bw_create(const BwConfig* cfg) {
     e->profile = e->cfg.profile;
     e->rt = rt_create(BW_VOICE_CAP, BW_SOUND_CAP, e->cfg.sample_rate, BW_CHANNELS);
     if (!e->rt) { free(e); return NULL; }
+
+    /* material table: token 0 is always the built-in "generic" default (BW_PRESETS[0]). */
+    for (int b = 0; b < 3; ++b) {
+        e->materials[0].absorption[b]   = BW_PRESETS[0].absorption[b];
+        e->materials[0].transmission[b] = BW_PRESETS[0].transmission[b];
+    }
+    e->materials[0].scattering = BW_PRESETS[0].scattering;
+    e->num_materials = 1;
 
     /* Load the surveyed speaker geometry if given; otherwise keep the default grid. A load
      * failure is non-fatal (usable with the default layout) but surfaces via bw_last_error.
@@ -371,12 +401,111 @@ void bw_play_oneshot(BwEngine* e, BwSound snd, float x, float y, float z, float 
 
 /* ---- materials / occlusion (no-ops without the Steam Audio backend) ---- */
 
+#ifdef BW_HAVE_STEAMAUDIO
+/* Geometry is LOAD-TIME only: the occlusion sim and the reflection bed share one IPLScene, and an
+ * iplSceneCommit (mesh swap) cannot run concurrently with the reflection thread's ray tracing. The
+ * setters therefore reject calls after bw_start (returns 1 + sets the error). Pre-start the occlusion
+ * sim serializes the commit with its own run on its single thread, so it is safe. */
+static int scene_locked(BwEngine* e) {
+    if (!e || !e->scene) return 1;
+    if (e->started) { set_error(e, "scene geometry is load-time only — set it before bw_start"); return 1; }
+    return 0;
+}
+#endif
+
 void bw_scene_set_mesh(BwEngine* e, const float* verts, int nverts, const int* tris, int ntris,
                        const float absorption[3], float scattering, const float transmission[3]) {
 #ifdef BW_HAVE_STEAMAUDIO
-    if (e && e->scene) steam_scene_set_mesh(e->scene, verts, nverts, tris, ntris, absorption, scattering, transmission);
+    if (scene_locked(e)) return;
+    steam_scene_set_mesh(e->scene, verts, nverts, tris, ntris, absorption, scattering, transmission);
 #else
     (void)e; (void)verts; (void)nverts; (void)tris; (void)ntris; (void)absorption; (void)scattering; (void)transmission;
+#endif
+}
+
+/* Clamp a coefficient to [0,1] and sanitize non-finite input (NaN/Inf -> 0): the `!(x>=0)` test is
+ * true for NaN and negatives, so both map to 0 — keeping garbage out of phonon's ray/reverb math. */
+static float clamp01(float x) { if (!(x >= 0.f)) return 0.f; return (x > 1.f) ? 1.f : x; }
+
+/* Material tokens are plain control-thread state — the table exists with or without the SDK, so
+ * minting works regardless; the mesh setters that consume the tokens are the SDK-gated no-ops. */
+BwMaterial bw_material_define(BwEngine* e, const float absorption[3], float scattering, const float transmission[3]) {
+    if (!e) return 0;
+    if (!absorption || !transmission) { set_error(e, "bw_material_define: NULL coefficients"); return 0; }
+    if (e->num_materials >= BW_MAX_MATERIALS) { set_error(e, "bw_material_define: material table full"); return 0; }
+    uint32_t i = e->num_materials++;
+    for (int b = 0; b < 3; ++b) { e->materials[i].absorption[b] = clamp01(absorption[b]); e->materials[i].transmission[b] = clamp01(transmission[b]); }
+    e->materials[i].scattering = clamp01(scattering);
+    return (BwMaterial)i;
+}
+
+BwMaterial bw_material_preset(BwEngine* e, const char* name) {
+    if (!e || !name) return 0;
+    for (size_t k = 0; k < sizeof BW_PRESETS / sizeof BW_PRESETS[0]; ++k)
+        if (_stricmp(name, BW_PRESETS[k].name) == 0)
+            /* "generic" (preset 0) IS the built-in default — return the canonical token 0 rather than
+             * minting a duplicate slot (callers tag many surfaces with it; don't burn the table). */
+            return (k == 0) ? 0
+                            : bw_material_define(e, BW_PRESETS[k].absorption, BW_PRESETS[k].scattering, BW_PRESETS[k].transmission);
+    set_error(e, "bw_material_preset: unknown preset name");
+    return 0;
+}
+
+void bw_scene_set_mesh_mat(BwEngine* e, const float* verts, int nverts, const int* tris, int ntris,
+                           const BwMaterial* tri_material) {
+#ifdef BW_HAVE_STEAMAUDIO
+    if (scene_locked(e)) return;
+    uint32_t nmat = e->num_materials;                    /* flatten the table to the arrays steam_scene wants */
+    float absorption[BW_MAX_MATERIALS*3], transmission[BW_MAX_MATERIALS*3], scattering[BW_MAX_MATERIALS];
+    for (uint32_t k = 0; k < nmat; ++k) {
+        for (int b = 0; b < 3; ++b) { absorption[k*3+b] = e->materials[k].absorption[b]; transmission[k*3+b] = e->materials[k].transmission[b]; }
+        scattering[k] = e->materials[k].scattering;
+    }
+    /* BwMaterial tokens ARE the indices (uint32 -> int, small values); steam_scene clamps any out-of-range. */
+    steam_scene_set_mesh_mat(e->scene, verts, nverts, tris, ntris, (int)nmat,
+                             absorption, scattering, transmission, (const int*)tri_material);
+#else
+    (void)e; (void)verts; (void)nverts; (void)tris; (void)ntris; (void)tri_material;
+#endif
+}
+
+#ifdef BW_HAVE_STEAMAUDIO
+/* Emit triangle (i0,i1,i2) into tris[*n], flipping the last two indices if needed so the face normal
+ * points toward the origin (inward — the listener is inside the box). */
+static void emit_inward(const float* v, int* tris, int* n, int i0, int i1, int i2) {
+    const float *p0 = &v[i0*3], *p1 = &v[i1*3], *p2 = &v[i2*3];
+    float e1x = p1[0]-p0[0], e1y = p1[1]-p0[1], e1z = p1[2]-p0[2];
+    float e2x = p2[0]-p0[0], e2y = p2[1]-p0[1], e2z = p2[2]-p0[2];
+    float nx = e1y*e2z - e1z*e2y, ny = e1z*e2x - e1x*e2z, nz = e1x*e2y - e1y*e2x;
+    float cx = (p0[0]+p1[0]+p2[0])/3.f, cy = (p0[1]+p1[1]+p2[1])/3.f, cz = (p0[2]+p1[2]+p2[2])/3.f;
+    if (nx*(-cx) + ny*(-cy) + nz*(-cz) < 0.f) { int tmp = i1; i1 = i2; i2 = tmp; }   /* normal points outward -> flip */
+    tris[*n*3+0] = i0; tris[*n*3+1] = i1; tris[*n*3+2] = i2; (*n)++;
+}
+#endif
+
+void bw_scene_set_box(BwEngine* e, float w, float h, float d, const BwMaterial faces[6]) {
+#ifdef BW_HAVE_STEAMAUDIO
+    if (scene_locked(e)) return;
+    if (!(w > 0.f) || !(h > 0.f) || !(d > 0.f)) {   /* reject zero/negative/NaN dims (degenerate triangles) */
+        set_error(e, "bw_scene_set_box: w/h/d must be positive");
+        return;
+    }
+    float hw = w*0.5f, hh = h*0.5f, hd = d*0.5f;
+    float verts[8*3] = {
+        -hw,-hh,-hd,   hw,-hh,-hd,   hw, hh,-hd,  -hw, hh,-hd,
+        -hw,-hh, hd,   hw,-hh, hd,   hw, hh, hd,  -hw, hh, hd };
+    static const int quad[6][4] = {            /* face order: -x,+x,-y,+y,-z,+z (matches faces[6]) */
+        {0,4,7,3}, {1,2,6,5}, {0,1,5,4}, {3,7,6,2}, {0,3,2,1}, {4,5,6,7} };
+    int tris[12*3]; BwMaterial tri_mat[12]; int n = 0;
+    for (int f = 0; f < 6; ++f) {
+        BwMaterial m = faces ? faces[f] : 0;
+        int a = quad[f][0], b = quad[f][1], c = quad[f][2], dd = quad[f][3];
+        emit_inward(verts, tris, &n, a, b, c);  tri_mat[n-1] = m;
+        emit_inward(verts, tris, &n, a, c, dd); tri_mat[n-1] = m;
+    }
+    bw_scene_set_mesh_mat(e, verts, 8, tris, 12, tri_mat);
+#else
+    (void)e; (void)w; (void)h; (void)d; (void)faces;
 #endif
 }
 

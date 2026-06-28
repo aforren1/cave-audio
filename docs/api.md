@@ -204,6 +204,27 @@ bw_unload_sound(eng, steps);
 bw_stop(eng); bw_destroy(eng);
 ```
 
+## Materials, occlusion, directivity & reflections (control thread; Steam Audio build)
+
+These calls drive Steam Audio's scene simulation. They are no-ops (safe to call) without the
+`BW_HAVE_STEAMAUDIO` build. The full model is [materials.md](.\materials.md); the per-call
+threading contract:
+
+| Call | When | Threading |
+|------|------|-----------|
+| `bw_material_preset` / `bw_material_define` | load-time | control thread; mints an engine-scoped `BwMaterial` token (`0` = built-in default). Works with or without the SDK. Fixed table (64). |
+| `bw_scene_set_mesh` / `bw_scene_set_mesh_mat` / `bw_scene_set_box` | **load-time** (before `bw_start`) | control thread; allocates + hands geometry to the off-thread sim under a lock. **Enforced**: a call after `bw_start` is rejected (sets `bw_last_error`) — the occlusion + reflection sims share one `IPLScene` and a mesh swap can't run concurrently with ray tracing. |
+| `bw_source_set_occlusion` | per-frame | non-blocking; enqueues. The sim ray-traces at a low rate and publishes a transmittance the audio thread ramps. |
+| `bw_source_set_directivity` / `_preset` / `bw_source_set_orientation` | per-frame | non-blocking; enqueues. Independent of occlusion. |
+| `bw_source_get_occlusion` / `bw_source_get_directivity` | any time | control thread; reads the latest published scalar (HUD/diagnostics). |
+| `bw_reflections_config` | **load-time** (before `bw_start`) | control thread; copies the config. The bed (IR length, order) is baked at `bw_start`. |
+| `bw_source_set_reflections` | per-frame | non-blocking; gates the source's send into the shared reverb bed. |
+
+`BwMaterial` tokens are table indices, not generation-checked handles — they stay valid for the
+engine's life. Per-triangle material indices out of range clamp to the default. The reflection bed
+v1 ships Steam Audio's **parametric (FDN) reverb**; the hybrid early-reflection convolution path is
+a pending follow-up (see [materials.md](.\materials.md)).
+
 ## Handle scheme
 
 `BwSound` and `BwSource` are opaque `uint32_t` = `(index | generation<<16)`. A stale

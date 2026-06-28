@@ -106,6 +106,27 @@ BW_API void  bw_bed_destroy(BwEngine* e, BwBed b);
  * Steam Audio backend. */
 BW_API void     bw_scene_set_mesh(BwEngine* e, const float* verts, int nverts, const int* tris, int ntris,
                                   const float absorption[3], float scattering, const float transmission[3]);
+
+/* An acoustic material — an opaque, engine-scoped token. 0 is always a built-in generic default.
+ * Mint materials at LOAD time (the table is fixed-capacity); a token indexes both occlusion
+ * (per-band transmission) and the reflection bed (absorption/scattering). */
+typedef uint32_t BwMaterial;
+/* Mint a material from a named preset (case-insensitive): "generic", "brick", "concrete", "ceramic",
+ * "gravel", "carpet", "glass", "plaster", "wood", "metal", "rock". Returns 0 (the default material,
+ * NOT an error sentinel) on an unknown name or a full table — check bw_last_error to distinguish. */
+BW_API BwMaterial bw_material_preset(BwEngine* e, const char* name);
+/* Mint a custom material: 3-band absorption + 3-band transmission (low/mid/high, each 0..1) and a
+ * scattering coefficient (0..1). Returns the new token, or 0 if the material table is full. */
+BW_API BwMaterial bw_material_define(BwEngine* e, const float absorption[3], float scattering, const float transmission[3]);
+/* Set occluding geometry with PER-TRIANGLE materials: tri_material is ntris BwMaterial tokens (one
+ * per triangle; out-of-range clamps to the default). Same room frame + winding as bw_scene_set_mesh.
+ * Load-time. No-op without the Steam Audio backend. */
+BW_API void     bw_scene_set_mesh_mat(BwEngine* e, const float* verts, int nverts, const int* tris, int ntris,
+                                      const BwMaterial* tri_material);
+/* Convenience: a shoebox enclosure of size w x h x d metres, centred at the origin, with one
+ * material per face. faces[6] = (-x,+x,-y,+y,-z,+z); each a BwMaterial token (0 = default). Triangle
+ * normals face inward (the listener is inside). Load-time. No-op without the Steam Audio backend. */
+BW_API void     bw_scene_set_box(BwEngine* e, float w, float h, float d, const BwMaterial faces[6]);
 /* Enable per-source occlusion: geometry between the source and listener attenuates it (ramped).
  * Per-frame-safe. No-op without the Steam Audio backend. */
 BW_API void     bw_source_set_occlusion(BwEngine* e, BwSource s, bool on);

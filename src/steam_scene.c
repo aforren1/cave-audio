@@ -35,12 +35,14 @@ struct SteamScene {
     int           mesh_dirty;
     IPLVector3*   pend_verts; int pend_nverts;     /* pending mesh (control thread) */
     IPLTriangle*  pend_tris;  int pend_ntris;
-    IPLMaterial   pend_mat;
+    IPLMaterial*  pend_mats;   int pend_nmat;       /* pending materials + per-triangle index */
+    IPLint32*     pend_tri_mat;
 
     IPLSource*    srcs;            /* [voice_cap], sim-thread-only IPLSource per slot (NULL = none) */
     IPLVector3*   mesh_verts;      /* kept alive for the committed mesh's lifetime */
     IPLTriangle*  mesh_tris;
     IPLint32*     mesh_mi;
+    IPLMaterial*  mesh_mats;
 
     HANDLE        thread;
     volatile LONG stop;
@@ -74,19 +76,19 @@ static void oriented_cs(IPLCoordinateSpace3* cs, const float origin[3], const fl
 }
 
 /* (sim thread) rebuild the committed static mesh from the pending arrays */
+/* Adopt the pending mesh buffers (verts/tris/tri_mat/mats, all heap, ownership transferred) as the
+ * committed geometry. iplStaticMeshCreate reads them all during the call; we keep them alive for the
+ * mesh's lifetime (freed on the next apply_mesh / destroy) to stay robust to phonon referencing
+ * rather than copying. */
 static void apply_mesh(SteamScene* s, IPLVector3* verts, int nverts, IPLTriangle* tris, int ntris,
-                       IPLMaterial mat) {
+                       IPLMaterial* mats, int nmat, IPLint32* tri_mat) {
     if (s->mesh) { iplStaticMeshRemove(s->mesh, s->scene); iplStaticMeshRelease(&s->mesh); s->mesh = NULL; }
-    free(s->mesh_verts); free(s->mesh_tris); free(s->mesh_mi);
-    s->mesh_verts = verts; s->mesh_tris = tris;
-    s->mesh_mi = (IPLint32*)calloc((size_t)ntris, sizeof(IPLint32));   /* all triangles -> material 0 */
-    if (!s->mesh_mi) { free(verts); free(tris); s->mesh_verts = NULL; s->mesh_tris = NULL; return; }
+    free(s->mesh_verts); free(s->mesh_tris); free(s->mesh_mi); free(s->mesh_mats);
+    s->mesh_verts = verts; s->mesh_tris = tris; s->mesh_mi = tri_mat; s->mesh_mats = mats;
 
     IPLStaticMeshSettings ms; memset(&ms, 0, sizeof ms);
-    ms.numVertices = nverts; ms.numTriangles = ntris; ms.numMaterials = 1;
-    /* iplStaticMeshCreate deep-copies the materials array synchronously, so the by-value `mat`
-     * parameter (a stable local for the call's duration) suffices — no shared static needed. */
-    ms.vertices = verts; ms.triangles = tris; ms.materialIndices = s->mesh_mi; ms.materials = &mat;
+    ms.numVertices = nverts; ms.numTriangles = ntris; ms.numMaterials = nmat;
+    ms.vertices = verts; ms.triangles = tris; ms.materialIndices = tri_mat; ms.materials = mats;
     if (iplStaticMeshCreate(s->scene, &ms, &s->mesh) == IPL_STATUS_SUCCESS) {
         iplStaticMeshAdd(s->mesh, s->scene);
         iplSceneCommit(s->scene);
@@ -108,13 +110,15 @@ static DWORD WINAPI sim_thread(LPVOID arg) {
 
     while (!s->stop) {
         /* 1. snapshot the shadow + take the pending mesh */
-        IPLVector3* verts = NULL; IPLTriangle* tris = NULL; int nverts = 0, ntris = 0; IPLMaterial mat;
-        memset(&mat, 0, sizeof mat);
+        IPLVector3* verts = NULL; IPLTriangle* tris = NULL; int nverts = 0, ntris = 0;
+        IPLMaterial* mats = NULL; int nmat = 0; IPLint32* tri_mat = NULL;
         EnterCriticalSection(&s->lock);
         if (s->mesh_dirty) {
             s->mesh_dirty = 0;
-            verts = s->pend_verts; tris = s->pend_tris; nverts = s->pend_nverts; ntris = s->pend_ntris; mat = s->pend_mat;
+            verts = s->pend_verts; tris = s->pend_tris; nverts = s->pend_nverts; ntris = s->pend_ntris;
+            mats = s->pend_mats; nmat = s->pend_nmat; tri_mat = s->pend_tri_mat;
             s->pend_verts = NULL; s->pend_tris = NULL;     /* ownership moves to the sim thread */
+            s->pend_mats = NULL; s->pend_tri_mat = NULL;
         }
         for (uint32_t i = 0; i < cap; ++i) {
             snap_h[i]    = s->shadow[i].handle;
@@ -127,7 +131,8 @@ static DWORD WINAPI sim_thread(LPVOID arg) {
         LeaveCriticalSection(&s->lock);
 
         /* 2. apply geometry change */
-        if (verts && tris) apply_mesh(s, verts, nverts, tris, ntris, mat);
+        if (verts && tris && mats && tri_mat) apply_mesh(s, verts, nverts, tris, ntris, mats, nmat, tri_mat);
+        else { free(verts); free(tris); free(mats); free(tri_mat); }   /* partial set: drop it intact */
 
         /* 3. reconcile IPLSources against the snapshot: a source exists iff it has any feature. */
         int changed = 0;
@@ -239,24 +244,50 @@ fail:
     return NULL;
 }
 
-void steam_scene_set_mesh(SteamScene* s, const float* verts, int nverts, const int* tris, int ntris,
-                          const float absorption[3], float scattering, const float transmission[3]) {
-    if (!s || nverts <= 0 || ntris <= 0) return;
-    IPLVector3*  v = (IPLVector3*)malloc((size_t)nverts * sizeof(IPLVector3));
-    IPLTriangle* t = (IPLTriangle*)malloc((size_t)ntris * sizeof(IPLTriangle));
-    if (!v || !t) { free(v); free(t); return; }
+/* Copy the caller's geometry + materials into freshly-allocated pending buffers and publish them to
+ * the sim thread under the lock. nmat materials come as flat float arrays; tri_material may be NULL
+ * (all triangles -> material 0) and out-of-range indices clamp to 0. All-or-nothing: a partial
+ * allocation frees what it got and leaves the prior mesh in place. */
+static void set_mesh_internal(SteamScene* s, const float* verts, int nverts, const int* tris, int ntris,
+                              int nmat, const float* absorption, const float* scattering,
+                              const float* transmission, const int* tri_material) {
+    if (!s || nverts <= 0 || ntris <= 0 || nmat <= 0) return;
+    if (!verts || !tris || !absorption || !scattering || !transmission) return;   /* tri_material may be NULL */
+    IPLVector3*  v  = (IPLVector3*)malloc((size_t)nverts * sizeof(IPLVector3));
+    IPLTriangle* t  = (IPLTriangle*)malloc((size_t)ntris  * sizeof(IPLTriangle));
+    IPLMaterial* m  = (IPLMaterial*)malloc((size_t)nmat   * sizeof(IPLMaterial));
+    IPLint32*    mi = (IPLint32*)   malloc((size_t)ntris  * sizeof(IPLint32));
+    if (!v || !t || !m || !mi) { free(v); free(t); free(m); free(mi); return; }
     for (int i = 0; i < nverts; ++i) v[i] = (IPLVector3){ verts[i*3+0], verts[i*3+1], verts[i*3+2] };
     for (int i = 0; i < ntris;  ++i) { t[i].indices[0] = tris[i*3+0]; t[i].indices[1] = tris[i*3+1]; t[i].indices[2] = tris[i*3+2]; }
-    IPLMaterial m; memset(&m, 0, sizeof m);
-    for (int b = 0; b < 3; ++b) { m.absorption[b] = absorption[b]; m.transmission[b] = transmission[b]; }
-    m.scattering = scattering;
+    for (int k = 0; k < nmat;   ++k) {
+        memset(&m[k], 0, sizeof m[k]);
+        for (int b = 0; b < 3; ++b) { m[k].absorption[b] = absorption[k*3+b]; m[k].transmission[b] = transmission[k*3+b]; }
+        m[k].scattering = scattering[k];
+    }
+    for (int i = 0; i < ntris;  ++i) {
+        int idx = tri_material ? tri_material[i] : 0;
+        mi[i] = (idx >= 0 && idx < nmat) ? (IPLint32)idx : 0;
+    }
 
     EnterCriticalSection(&s->lock);
-    free(s->pend_verts); free(s->pend_tris);   /* drop any un-consumed prior pending mesh */
+    free(s->pend_verts); free(s->pend_tris); free(s->pend_mats); free(s->pend_tri_mat);   /* drop un-consumed prior */
     s->pend_verts = v; s->pend_nverts = nverts;
     s->pend_tris = t;  s->pend_ntris = ntris;
-    s->pend_mat = m; s->mesh_dirty = 1;
+    s->pend_mats = m;  s->pend_nmat = nmat;
+    s->pend_tri_mat = mi; s->mesh_dirty = 1;
     LeaveCriticalSection(&s->lock);
+}
+
+void steam_scene_set_mesh(SteamScene* s, const float* verts, int nverts, const int* tris, int ntris,
+                          const float absorption[3], float scattering, const float transmission[3]) {
+    set_mesh_internal(s, verts, nverts, tris, ntris, 1, absorption, &scattering, transmission, NULL);
+}
+
+void steam_scene_set_mesh_mat(SteamScene* s, const float* verts, int nverts, const int* tris, int ntris,
+                              int nmat, const float* absorption, const float* scattering,
+                              const float* transmission, const int* tri_material) {
+    set_mesh_internal(s, verts, nverts, tris, ntris, nmat, absorption, scattering, transmission, tri_material);
 }
 
 /* (caller holds s->lock) adopt `handle` as the slot's occupant; if it changed (slot reused, or first
@@ -341,8 +372,8 @@ void steam_scene_destroy(SteamScene* s) {
     if (s->scene)     iplSceneRelease(&s->scene);
     if (s->context)   iplContextRelease(&s->context);
     DeleteCriticalSection(&s->lock);
-    free(s->mesh_verts); free(s->mesh_tris); free(s->mesh_mi);
-    free(s->pend_verts); free(s->pend_tris);
+    free(s->mesh_verts); free(s->mesh_tris); free(s->mesh_mi); free(s->mesh_mats);
+    free(s->pend_verts); free(s->pend_tris); free(s->pend_mats); free(s->pend_tri_mat);
     free(s->shadow); free(s->srcs);
     free(s);
 }

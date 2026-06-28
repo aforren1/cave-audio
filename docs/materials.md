@@ -42,9 +42,43 @@ A **material** is `IPLMaterial`: frequency-banded coefficients in Steam Audio's 
 | `scattering`     | 0..1      | fraction reflected diffusely vs specularly (surface roughness)      |
 | `transmission[3]`| 0..1/band | fraction passing *through* the surface — the **spectral tilt** of occluded sound |
 
-The engine ships a **named palette of presets** (`concrete`, `brick`, `plaster`, `wood`, `glass`,
-`carpet`, `curtain`, `tile`, `metal`, `anechoic`) plus custom materials. Materials are **static** —
+The engine ships a **named palette of presets** — `generic` (the built-in default, token 0),
+`brick`, `concrete`, `ceramic`, `gravel`, `carpet`, `glass`, `plaster`, `wood`, `metal`, `rock`
+(Steam Audio's published example coefficients) — plus custom materials. Materials are **static** —
 a surface's material never changes at audio rate.
+
+### Implemented C ABI (control thread, load-time)
+
+A `BwMaterial` is an **opaque engine-scoped token** (a small integer; `0` is always the built-in
+`generic` default). Mint tokens, then attach them to geometry per-triangle. All of this is
+load-time (do it before `bw_start`); minting works with or without the Steam Audio build, but the
+geometry setters are no-ops without it.
+
+```c
+BwMaterial m_wall = bw_material_preset(e, "concrete");          // named preset (case-insensitive)
+float abs3[3] = {0.1f,0.1f,0.1f}, trn3[3] = {0.6f,0.6f,0.6f};
+BwMaterial m_open = bw_material_define(e, abs3, 0.5f, trn3);    // custom 3-band absorption/scattering/transmission
+
+// per-triangle: one BwMaterial token per triangle (out-of-range clamps to the default)
+BwMaterial tri_mat[N] = { m_wall, m_wall, m_open, /* … */ };
+bw_scene_set_mesh_mat(e, verts, nverts, tris, ntris, tri_mat);
+
+// or a shoebox room: w×h×d metres centred at origin, one material per face
+BwMaterial faces[6] = { m_wall,m_wall,m_wall,m_open,m_wall,m_wall };  // -x,+x,-y,+y,-z,+z
+bw_scene_set_box(e, 6.f, 3.f, 6.f, faces);                      // triangle normals face inward
+```
+
+`bw_material_preset` returns `0` for `"generic"` (it *is* the default token — no slot is minted, so
+tagging many surfaces with it never exhausts the table) and also `0` (the default, **not** an error
+sentinel) on an unknown name or a full table — check `bw_last_error` to distinguish those. Custom
+coefficients are clamped to `[0,1]` and NaN/Inf-sanitized before reaching phonon. The geometry
+setters are **enforced** load-time: a call after `bw_start` is rejected with a `bw_last_error`
+(the occlusion + reflection sims share one `IPLScene`, and a mesh swap can't run concurrently with
+the reflection thread's ray tracing). The single-material `bw_scene_set_mesh` remains the `nmat==1`
+convenience. The same per-triangle materials drive **both** occlusion (per-band
+transmission) and the reflection bed (absorption/scattering), because both simulators share one
+committed `IPLScene`. A per-triangle smoke test confirms a source behind a `concrete` triangle is
+occluded to ~0.015 while one behind a high-transmission triangle passes at ~0.6.
 
 Note the occlusion *amount* is separate from the material: Steam Audio's `IPLDirectEffectParams`
 carries a **scalar `occlusion`** (how much of the direct path is blocked, a geometry/ray result)
