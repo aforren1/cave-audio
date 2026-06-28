@@ -7,10 +7,11 @@
  * by-ear evaluation the automated tests can't do. Uses only the public C ABI (bwaudio.h);
  * raylib's raymath provides the vector/quaternion math.
  *
- * A wall demonstrates two acoustic situations: move the source in FRONT of it to hear a
- * specular reflection (rendered as a mirror-image source — a second DBAP voice), or BEHIND it
- * for occlusion (the direct path is blocked and attenuated). The image-source reflection has no
- * delay or material filtering yet — that's the future Steam Audio reflection path (materials.md).
+ * A wall demonstrates two acoustic situations: move the source in FRONT of it to hear a specular
+ * reflection (a mirror-image source — a second DBAP voice; no delay/material yet, materials.md), or
+ * BEHIND it for OCCLUSION — REAL Steam Audio occlusion: the engine's off-thread sim ray-traces the
+ * wall blocking the line to the listener and attenuates the source (the HUD shows the live factor).
+ * Occlusion needs the Steam Audio build; without it bw_source_set_occlusion is a no-op (no blocking).
  *
  * Keys 1-4 switch the localization test signal (pink noise / pink bursts / click train / 1 kHz
  * tone) — broadband + sharp onsets localise best; the tone is there to feel the ambiguity.
@@ -139,6 +140,19 @@ static void draw_wall(Vector3 c, Vector3 u, Vector3 v, float hw, float hh, Color
     DrawLine3D(a, b, line); DrawLine3D(b, d, line); DrawLine3D(d, ee, line); DrawLine3D(ee, a, line);
 }
 
+/* register the wall quad as the occluding scene geometry (one concrete-ish material) */
+static void push_wall_mesh(BwEngine* e, Vector3 c, Vector3 u, Vector3 v, float hw, float hh) {
+    Vector3 a  = Vector3Add(Vector3Add(c, Vector3Scale(u, -hw)), Vector3Scale(v, -hh));
+    Vector3 b  = Vector3Add(Vector3Add(c, Vector3Scale(u,  hw)), Vector3Scale(v, -hh));
+    Vector3 d  = Vector3Add(Vector3Add(c, Vector3Scale(u,  hw)), Vector3Scale(v,  hh));
+    Vector3 ee = Vector3Add(Vector3Add(c, Vector3Scale(u, -hw)), Vector3Scale(v,  hh));
+    float verts[12] = { a.x, a.y, a.z,  b.x, b.y, b.z,  d.x, d.y, d.z,  ee.x, ee.y, ee.z };
+    int   tris[6]   = { 0, 1, 2,  0, 2, 3 };
+    float absorption[3]   = { 0.1f, 0.1f, 0.1f };
+    float transmission[3] = { 0.05f, 0.05f, 0.05f };          /* concrete-ish: blocks most */
+    bw_scene_set_mesh(e, verts, 4, tris, 2, absorption, 0.5f, transmission);
+}
+
 int main(void) {
     _putenv("BWAUDIO_SINK=asio");                             /* headphone output via a 2-ch ASIO driver */
 
@@ -193,6 +207,11 @@ int main(void) {
     Vector3 wall_u, wall_v; wall_basis(wall_n, &wall_u, &wall_v);
     int refl_audible = 1, occ_audible = 1;                   /* T / G toggles */
 
+    /* register the wall as REAL occluding geometry and enable occlusion on the direct source
+     * (the engine's Steam Audio sim attenuates it when the wall blocks the line to the listener) */
+    push_wall_mesh(e, wall_c, wall_u, wall_v, wall_hw, wall_hh);
+    bw_source_set_occlusion(e, src, true);
+
     InitWindow(1000, 700, "bwaudio - binaural playground");
     SetTargetFPS(60);
     Camera3D cam = { .target = { 0, 0.5f, 0 }, .up = { 0, 1, 0 },
@@ -210,10 +229,12 @@ int main(void) {
         if (IsKeyDown(KEY_F)) source_pos.y -= mv;
         if (IsKeyDown(KEY_Q)) head_yaw += rt;
         if (IsKeyDown(KEY_E)) head_yaw -= rt;
-        if (IsKeyDown(KEY_LEFT_BRACKET))  wall_c = Vector3Add(wall_c, Vector3Scale(wall_n, -mv));
-        if (IsKeyDown(KEY_RIGHT_BRACKET)) wall_c = Vector3Add(wall_c, Vector3Scale(wall_n,  mv));
+        if (IsKeyDown(KEY_LEFT_BRACKET) || IsKeyDown(KEY_RIGHT_BRACKET)) {
+            wall_c = Vector3Add(wall_c, Vector3Scale(wall_n, IsKeyDown(KEY_LEFT_BRACKET) ? -mv : mv));
+            push_wall_mesh(e, wall_c, wall_u, wall_v, wall_hw, wall_hh);   /* update the occluder (sim throttles) */
+        }
         if (IsKeyPressed(KEY_T)) refl_audible = !refl_audible;
-        if (IsKeyPressed(KEY_G)) occ_audible  = !occ_audible;
+        if (IsKeyPressed(KEY_G)) { occ_audible = !occ_audible; bw_source_set_occlusion(e, src, occ_audible); }
         for (int i = 0; i < NSIG; ++i)                       /* 1-4: switch the test signal */
             if (IsKeyPressed(KEY_ONE + i)) {
                 cur_sig = i;
@@ -252,16 +273,15 @@ int main(void) {
         if (same_side && seg_plane(L, image, wall_c, wall_n, &t, &hit) && t > 0 && t < 1 &&
             in_panel(hit, wall_c, wall_u, wall_v, wall_hw, wall_hh)) { refl_valid = 1; refl_pt = hit; }
 
-        int occluded = 0;
-        if (!same_side && seg_plane(source_pos, L, wall_c, wall_n, &t, &hit) && t > 0 && t < 1 &&
-            in_panel(hit, wall_c, wall_u, wall_v, wall_hw, wall_hh)) { occluded = 1; }
-
         bw_source_set_pos(e, src, source_pos.x, source_pos.y, source_pos.z);
-        bw_source_set_gain(e, src, (occ_audible && occluded) ? SRC_GAIN * OCC_GAIN : SRC_GAIN);
+        bw_source_set_gain(e, src, SRC_GAIN);                 /* occlusion is now applied by the engine */
         bw_source_set_pos(e, refl, image.x, image.y, image.z);
         bw_source_set_gain(e, refl, (refl_audible && refl_valid) ? SRC_GAIN * REFL_GAIN : 0.0f);
         bw_set_listener_pose(e, 0, 0, 0, q.x, q.y, q.z, q.w);
         bw_commit(e);
+
+        float occ = bw_source_get_occlusion(e, src);          /* real Steam Audio occlusion (1 = clear) */
+        int occluded = occ < 0.85f;
 
         Vector3 right = Vector3RotateByQuaternion((Vector3){ 1, 0, 0 }, q);
         Vector3 fwd   = Vector3RotateByQuaternion((Vector3){ 0, 0, -1 }, q);
@@ -305,10 +325,10 @@ int main(void) {
                             source_pos.x, source_pos.y, source_pos.z, head_yaw * 57.2958f),
                  12, 32, 16, (Color){ 215, 215, 225, 255 });
         DrawText(TextFormat("signal [1-4]: %s", SIG_NAMES[cur_sig]), 12, 54, 18, (Color){ 110, 200, 255, 255 });
-        DrawText(TextFormat("%s    [T] reflection %s   [G] occlusion %s",
+        DrawText(TextFormat("%s    [T] reflection %s   [G] occlusion %s (%.0f%% audible)",
                             refl_valid ? "REFLECTING - audible image source" :
-                            (occluded ? "OCCLUDING - direct path blocked" : "wall: no interaction"),
-                            refl_audible ? "ON" : "off", occ_audible ? "ON" : "off"),
+                            (occluded ? "OCCLUDED - Steam Audio attenuates the source" : "wall: clear line of sight"),
+                            refl_audible ? "ON" : "off", occ_audible ? "ON" : "off", occ * 100.0f),
                  12, 78, 16, refl_valid ? ORANGE : (occluded ? (Color){ 245, 140, 140, 255 } : (Color){ 200, 200, 210, 255 }));
         if (silent)
             DrawText("audio: NULL sink - NO SOUND (set BWAUDIO_ASIO_DRIVER; see console)", 12, 100, 16, (Color){ 255, 110, 110, 255 });
