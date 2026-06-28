@@ -14,6 +14,7 @@
 .vscode/
 *.user
 CMakeUserPresets.json
+.claude/            # Claude Code local session config (permission cache, machine-local paths)
 
 # vendored SDK binaries (commit headers/sources per each SDK's license; keep large
 # prebuilt binaries out unless intentionally vendoring them)

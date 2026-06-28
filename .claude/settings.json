@@ -1,9 +1,0 @@
-{
-  "permissions": {
-    "allow": [
-      "Bash(git -C c:/Users/adf44/source/cpp/cave-audio diff 791c3e4 a11ef10 -- src/engine.c)",
-      "Bash(cmake -S . -B build -DBWAUDIO_BUILD_PLAYGROUND=ON)",
-      "Bash(ctest --test-dir build -C RelWithDebInfo)"
-    ]
-  }
-}
