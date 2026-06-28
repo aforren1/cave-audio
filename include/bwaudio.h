@@ -109,6 +109,26 @@ BW_API void     bw_scene_set_mesh(BwEngine* e, const float* verts, int nverts, c
 /* Enable per-source occlusion: geometry between the source and listener attenuates it (ramped).
  * Per-frame-safe. No-op without the Steam Audio backend. */
 BW_API void     bw_source_set_occlusion(BwEngine* e, BwSource s, bool on);
+
+/* ---- reflection bed (materials; needs the Steam Audio build) ----
+ * A single shared listener-centric reverb bed (Steam Audio hybrid reverb), decoded straight to the
+ * 26 speakers and summed onto the bus. Configure at LOAD time (the IR length + order are baked at
+ * bw_start), then opt sources into its wet send. v1 assumes a static scene (set geometry before
+ * bw_start). No-op without the Steam Audio backend. */
+typedef struct {
+    float    ir_seconds;     /* reverb tail / IR length; 0 -> default 1.0 (range ~0.5..2.0) */
+    uint32_t order;          /* reflection ambisonic order, 1 or 2; 0 -> default 1 */
+    uint32_t num_rays;       /* off-thread ray budget; 0 -> default 4096 */
+    uint32_t num_bounces;    /* off-thread bounce depth; 0 -> default 16 */
+    int      enabled;        /* 0 = no bed created (engine behaves exactly as today) */
+    uint32_t reserved[4];    /* zero; reserved so the struct can grow without an ABI break */
+} BwReflectionConfig;
+/* Set the reflection config. Load-time only (between bw_create and bw_start); copies the struct,
+ * zero fields take defaults. No-op without the Steam Audio backend. */
+BW_API void     bw_reflections_config(BwEngine* e, const BwReflectionConfig* cfg);
+/* Opt a source into the shared bed's wet send (per-frame-safe, enqueue-only). With the bed disabled
+ * or no SDK, this just gates a send that goes nowhere. */
+BW_API void     bw_source_set_reflections(BwEngine* e, BwSource s, bool on);
 /* Read the source's current occlusion factor (1 = clear .. 0 = fully blocked) — for HUD/diagnostics. */
 BW_API float    bw_source_get_occlusion(BwEngine* e, BwSource s);
 

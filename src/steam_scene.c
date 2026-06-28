@@ -328,6 +328,9 @@ void steam_scene_source_gone(SteamScene* s, uint32_t handle) {
     LeaveCriticalSection(&s->lock);
 }
 
+void* steam_scene_ipl_context(SteamScene* s) { return s ? (void*)s->context : NULL; }
+void* steam_scene_ipl_scene  (SteamScene* s) { return s ? (void*)s->scene   : NULL; }
+
 void steam_scene_destroy(SteamScene* s) {
     if (!s) return;
     if (s->thread) { InterlockedExchange(&s->stop, 1); WaitForSingleObject(s->thread, INFINITE); CloseHandle(s->thread); }

@@ -119,7 +119,10 @@ endif()
 # BW_HAVE_STEAMAUDIO) supersedes the first-cut pan in binaural.c and lands with the SDK, on-SDK-verified.
 set(STEAMAUDIO_DIR "${CMAKE_SOURCE_DIR}/third_party/steamaudio" CACHE PATH "Steam Audio (phonon) SDK root")
 if(EXISTS "${STEAMAUDIO_DIR}/include/phonon.h")
-  target_sources(bwaudio PRIVATE src/steam_decode.c src/steam_scene.c)   # HRTF decode + occlusion (with-SDK)
+  target_sources(bwaudio PRIVATE src/steam_decode.c src/steam_scene.c src/steam_reflect.c)  # HRTF decode + occlusion + reflections (with-SDK)
+  if(MSVC)   # steam_reflect.c uses C11 <stdatomic.h> (the IR-publish seqlock), like rt.c
+    set_source_files_properties(src/steam_reflect.c PROPERTIES COMPILE_OPTIONS /experimental:c11atomics)
+  endif()
   target_include_directories(bwaudio PRIVATE "${STEAMAUDIO_DIR}/include")
   target_link_libraries(bwaudio PRIVATE "${STEAMAUDIO_DIR}/lib/windows-x64/phonon.lib")
   target_compile_definitions(bwaudio PRIVATE BW_HAVE_STEAMAUDIO)

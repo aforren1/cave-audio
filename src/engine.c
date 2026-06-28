@@ -13,6 +13,7 @@
 #include "natnet.h"
 #include "steam_decode.h"   /* phonon-free interfaces; impls linked only when BW_HAVE_STEAMAUDIO */
 #include "steam_scene.h"
+#include "steam_reflect.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -57,6 +58,8 @@ struct BwEngine {
     NatNet*     tracker;          /* track_internal: NatNet pose ingest (NULL otherwise) */
     SteamMonitor* steam;          /* production HRTF decode (binaural/both); NULL = first-cut pan */
     SteamScene*   scene;          /* materials occlusion sim (off-thread); NULL without the SDK */
+    SteamReflect* reflect;        /* reflection bed (created at bw_start if configured); NULL otherwise */
+    BwReflectionConfig refl_cfg;  /* set via bw_reflections_config before bw_start */
 };
 
 static void set_error(BwEngine* e, const char* msg) {
@@ -166,6 +169,9 @@ static void engine_close_devices(BwEngine* e) {
     if (e->sink_mon) { bw_sink_close(e->sink_mon); e->sink_mon = NULL; }
     if (e->sink)     { bw_sink_close(e->sink);     e->sink     = NULL; }
 #ifdef BW_HAVE_STEAMAUDIO
+    /* after the audio thread joins (sinks closed above): unregister the tap, then destroy the bed —
+     * its IR aliases the bed source, so it must die before steam_scene_destroy (bw_destroy, later). */
+    if (e->reflect)  { rt_set_bus_tap(e->rt, NULL, NULL); steam_reflect_destroy(e->reflect); e->reflect = NULL; }
     if (e->steam)    { steam_monitor_destroy(e->steam); e->steam = NULL; }   /* after the audio thread joins */
 #endif
     if (e->tracker)  { rt_set_tracker(e->rt, NULL); natnet_close(e->tracker); e->tracker = NULL; }  /* after audio stops */
@@ -212,6 +218,16 @@ int bw_start(BwEngine* e) {
     if (e->profile == BW_PROFILE_BINAURAL || e->profile == BW_PROFILE_BOTH)
         e->steam = steam_monitor_create(&e->layout, e->cfg.sample_rate,
                                         bw_sink_block_size(e->sink), e->cfg.hrtf_path);
+
+    /* reflection bed: a separate reflections sim + the audio-thread convolution registered as the rt
+     * bus tap. Same frameSize-fixed-at-create reason as the monitor — build it now. Non-fatal: if it
+     * fails, no tap is registered and the engine runs dry. Needs the occlusion scene (shared geometry). */
+    if (e->scene && e->refl_cfg.enabled) {
+        e->reflect = steam_reflect_create(e->scene, e->rt, &e->layout, e->cfg.sample_rate,
+                                          bw_sink_block_size(e->sink), e->refl_cfg.order,
+                                          e->refl_cfg.ir_seconds, e->refl_cfg.num_rays, e->refl_cfg.num_bounces);
+        if (e->reflect) rt_set_bus_tap(e->rt, steam_reflect_tap, e->reflect);
+    }
 #endif
 
     /* track_internal: ingest OptiTrack pose ourselves and sample it on the audio thread.
@@ -374,6 +390,20 @@ void bw_source_set_occlusion(BwEngine* e, BwSource s, bool on) {
 
 float bw_source_get_occlusion(BwEngine* e, BwSource s) {
     return e ? rt_get_occlusion(e->rt, s) : 1.0f;
+}
+
+void bw_reflections_config(BwEngine* e, const BwReflectionConfig* cfg) {
+    if (!e || !cfg) return;
+    e->refl_cfg = *cfg;                                         /* applied at bw_start; zero -> defaults */
+    if (e->refl_cfg.ir_seconds <= 0.f) e->refl_cfg.ir_seconds = 1.0f;
+    if (e->refl_cfg.order == 0)        e->refl_cfg.order       = 1;
+    if (e->refl_cfg.order > 2)         e->refl_cfg.order       = 2;   /* v1: order 1 or 2 (3 = 16ch is heavy) */
+    if (e->refl_cfg.num_rays == 0)     e->refl_cfg.num_rays    = 4096;
+    if (e->refl_cfg.num_bounces == 0)  e->refl_cfg.num_bounces = 16;
+}
+
+void bw_source_set_reflections(BwEngine* e, BwSource s, bool on) {
+    if (e) rt_source_set_reflections(e->rt, s, on);             /* phonon-free; the tap consumes the send */
 }
 
 void bw_source_set_orientation(BwEngine* e, BwSource s, float qx, float qy, float qz, float qw) {

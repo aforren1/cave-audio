@@ -37,6 +37,13 @@ void steam_scene_set_orientation(SteamScene* s, uint32_t handle, float fx, float
 void steam_scene_set_pos        (SteamScene* s, uint32_t handle, float x, float y, float z);
 void steam_scene_source_gone    (SteamScene* s, uint32_t handle);
 
+/* Borrow the underlying phonon objects (void* = opaque IPLContext / IPLScene) so the reflection bed
+ * can build a reflections simulator on the SAME committed geometry. Valid for the scene's lifetime;
+ * the reflection bed must be destroyed before the scene. (v1 assumes a static scene during playback —
+ * set the mesh before bw_start; concurrent commits + reflection reads are not synchronized.) */
+void* steam_scene_ipl_context(SteamScene* s);
+void* steam_scene_ipl_scene(SteamScene* s);
+
 void steam_scene_destroy(SteamScene* s);   /* stops the sim thread, releases phonon objects */
 
 #endif /* BW_STEAM_SCENE_H */
