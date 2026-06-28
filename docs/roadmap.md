@@ -134,8 +134,9 @@ engines. Don't start with the engine bindings.
 
 ## Later / optional
 - Steam Audio occlusion + reflections feeding the per-source and diffuse paths
-  (no new dependency).
-- Ambisonic diffuse bed for ambient/reverb with a static decode matrix.
+  (no new dependency) — **materials/geometry model designed in [materials.md](materials.md)**.
+- Ambisonic diffuse bed for ambient/reverb with a static decode matrix (the reflection
+  bed in [materials.md](materials.md)).
 - `bw_source_create_stream` for procedural/engine-generated audio.
 - Cross-platform device backend abstraction (ALSA/JACK/CoreAudio) behind the sink
   interface.

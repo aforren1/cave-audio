@@ -73,6 +73,43 @@ files, compiled straight into `bw_core`. `layout.c` uses it to parse `cave_layou
 by changing the SHA; offline builds can override `FETCHCONTENT_SOURCE_DIR_CJSON_SRC` /
 `..._CJSON_HDR`.
 
-## Later milestones
+## Steam Audio (binaural decode, M5 upgrade; occlusion/reflections later)
 
-- **Steam Audio** (M5, binaural) → `third_party/steamaudio/`
+**Apache-2.0**, which is one-way compatible with GPLv3 — so, unlike the ASIO and NatNet SDKs,
+Steam Audio is a *clean, redistributable* dependency: it can be linked and shipped under the repo
+`LICENSE` with no special handling.
+
+**Use the prebuilt SDK, not the source repo.** [`ValveSoftware/steam-audio`](https://github.com/ValveSoftware/steam-audio)
+is the full C++ SDK *source* — building it pulls in Embree / Radeon Rays (ray tracing), an FFT
+library, and a large CMake tree. We don't need any of that: the engine links the small prebuilt
+**`phonon` C API** (the `IPLContext` / `IPLMaterial` / ambisonics→binaural path — see
+[../docs/spatialization.md](../docs/spatialization.md) and [../docs/materials.md](../docs/materials.md)).
+So a git *submodule of the source* is the wrong tool; fetch the released SDK instead.
+
+**Fetch** (from the [Releases](https://github.com/ValveSoftware/steam-audio/releases), pin a version):
+
+```sh
+# from the repo root
+curl -fsSL -o steamaudio.zip https://github.com/ValveSoftware/steam-audio/releases/download/vX.Y.Z/steamaudio_api.zip
+unzip steamaudio.zip
+mv steamaudio third_party/steamaudio     # CMake looks for third_party/steamaudio/include/phonon.h
+```
+
+Expected layout after vendoring:
+
+```
+third_party/steamaudio/
+  include/   phonon.h, phonon_version.h, ...
+  lib/windows-x64/   phonon.dll, phonon.lib
+```
+
+**Build wiring:** deferred — it lands with the code that uses it (the production HRTF decode behind
+`monitor_process`, then occlusion/reflections). At that point CMake auto-detects
+`third_party/steamaudio/include/phonon.h` and links `phonon` under a `BWAUDIO_WITH_STEAMAUDIO`
+flag, exactly like the ASIO block. Because Apache-2.0 permits redistribution, a pinned
+**FetchContent** of the release zip is also an option (cleaner than manual vendoring); the binaries
+are still kept out of git (below) for size, not licensing.
+
+> If you specifically want to build Steam Audio from source (to patch it, or for an unsupported
+> platform), *then* a submodule of the source repo makes sense — but it's a much larger build and
+> isn't needed for normal use.

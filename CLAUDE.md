@@ -127,6 +127,7 @@ builds `bw_sound_test` under ASan.
 - `docs/concurrency.md` — threading model, SPSC rings, commit snapshot, lifetimes. **Most load-bearing.**
 - `docs/api.md` — C ABI reference and per-call threading semantics.
 - `docs/spatialization.md` — DBAP, moving observer, binaural decode (3rd-order), speaker alignment.
+- `docs/materials.md` — material/geometry model → Steam Audio occlusion + reflections → the bus. **Design (Later).**
 - `docs/integration.md` — Unity binding + coordinate seam; Unreal notes.
 - `docs/build.md` — platform, dependencies, licensing, DVS/Dante config.
 - `docs/layout-schema.md` — `cave_layout.json` format: speaker geometry, per-speaker gain/delay, DBAP knobs.

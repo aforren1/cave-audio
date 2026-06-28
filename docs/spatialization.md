@@ -16,7 +16,8 @@ the array origin.
 
 Ambisonics is still the right tool for the **diffuse layer** (ambient beds,
 reflections/reverb), where energy isn't sweet-spot-sensitive and a fixed decode is
-fine. If/when that layer is added, decode it with a static matrix (see below).
+fine. If/when that layer is added, decode it with a static matrix (see below). The
+material-driven build-out of that layer is specified in [materials.md](.\materials.md).
 
 ## The gain solve (`dbap_gains`)
 
