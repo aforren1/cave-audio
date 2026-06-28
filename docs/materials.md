@@ -104,6 +104,15 @@ an occlusion scalar (`occ_gain_cur/target`) and the **biquad state + target coef
 in `bufferSwitch` — and ramps the occlusion gain. Both glides satisfy invariant 4 (no
 discontinuity), but they are their *own* mechanism, not the DBAP gain ramp.
 
+### Source directivity (cheap, per source)
+
+A simple radiation model is worth having and nearly free: an **aperture** (cone width, directive ↔
+omnidirectional) plus a **face-listener** toggle (keep the source on-axis toward the listener), à la
+IRCAM Spat's "aperture" / "relative direction." It maps straight onto Steam Audio's Direct Effect
+**`IPLDirectivity`** — a per-source gain from the source's orientation and the source→listener vector —
+applied on the same pre-pan mono stage as occlusion, so it reuses the occlusion glide and adds no
+panning cost. A source facing away is a strong perceptual cue we currently ignore.
+
 ### Reflections + reverb — a diffuse ambisonic bed
 
 Steam Audio's **`IPLSimulator`** (off-thread) ray-traces each reflection-enabled source against the
@@ -132,6 +141,16 @@ Why ambisonic-and-fixed-decode rather than per-image-source DBAP:
   across the 3×3 m roam is acceptable (the explicit split in [spatialization.md](.\spatialization.md)).
 - A **lower ambisonic order suffices** for a diffuse bed (1st–2nd; the direct binaural monitor uses
   3rd), keeping the reflection channel count and convolution cheap.
+
+**Bounding the convolution cost — hybrid reverb (the default).** Convolving a full IR (early + a long
+diffuse tail) every block is the feature's CPU cost centre (below). Steam Audio's **hybrid reverb**
+splits it the way IRCAM Spat and most production reverbs do: a **short ray-traced early-reflection
+IR** — the part that carries spatial cues — convolved as above, plus a **parametric / FDN late tail**
+synthesised from the simulator's estimated per-band decay (RT60; `reverb_estimator` /
+`hybrid_reverb_estimator` in the SDK). The convolution then runs against a *short* IR and the long
+tail is a cheap recursive reverb sharing the same ambisonic→bus decode — far less CPU for the same
+perceived space. This is the **default** for the reflection bed; full-length-IR convolution is the
+high-fidelity option.
 
 > **Out of scope — sharp early reflections.** Strong, directional first-order reflections localize
 > more than diffuse reverb and could be rendered as image-source DBAP "voices." But those image
@@ -218,6 +237,23 @@ the second, bus-bypassing binaural consumer this design forbids, and desync the 
 reflection content. (If reflection quality on headphones ever demands it, the only sanctioned
 exception must be documented explicitly and reconciled with the single-seam rule.)
 
+## Geometric default, perceptual option
+
+Everything above is the **geometric** path — materials + scene → ray-traced reflections — and it is
+the **default**, because the CAVE mostly simulates physical situations. But geometry isn't always
+wanted (abstract or musical content, or scenes with no usable mesh), and the *perceptual* school
+(IRCAM Spat) is the alternative: drive a parametric reverb from a handful of listener-tested knobs —
+**presence** (direct vs reverb), **warmth** / **brillance** (LF/HF balance), **room presence**,
+**reverberance** (decay time), **envelopment** — instead of geometry.
+
+It is cheap to tack on *because the hybrid reverb already provides the engine*: the FDN late tail
+(above) exposes exactly the parameters a thin perceptual mapping targets (per-band RT60, early/late
+balance, band EQ), so a perceptual layer is a control mapping, **no new DSP**, landing on the same
+bus. So the design supports both — **geometric by default**, with an optional **perceptual mode**
+that bypasses the scene and drives the late-reverb parameters directly (per source, or as one shared
+bed). The two are mutually exclusive *per source*: a source is either physically simulated or
+perceptually placed.
+
 ## Data surface / API (additive; load-time setup, per-frame-safe toggles)
 
 All additive and optional — an engine with no scene behaves exactly as today. Names provisional:
@@ -237,7 +273,12 @@ void bw_reflections_config(BwEngine*, const BwReflectionConfig*);  /* IR length,
 /* per-source toggles (per-frame-safe: enqueue only) */
 void bw_source_set_reflections(BwEngine*, BwSource, bool on);
 void bw_source_set_occlusion  (BwEngine*, BwSource, bool on);     /* level identical with occlusion off — distance stays in DBAP */
+void bw_source_set_directivity(BwEngine*, BwSource, float aperture, bool face_listener);  /* radiation cone */
 ```
+
+A **perceptual reverb mode** (above) would add a small `bw_perceptual_config` (presence / warmth /
+brillance / reverberance / envelopment) that drives the late-reverb engine when a source has no
+geometric reflections — a load-time/while-running parameter set, not per-block.
 
 Two provisioning routes: **Unity/Unreal** push room-space geometry + materials at load time (the game
 owns the scene — [integration.md](.\integration.md)); **standalone** uses a scene JSON (a future
@@ -249,14 +290,16 @@ Reflections are the cost centre; the knobs are **start-time** sizing decisions, 
 
 | Knob                       | Effect                                          | Default       |
 |----------------------------|-------------------------------------------------|---------------|
-| shared bed vs per-source   | **the** cost control — one convolution vs N     | shared bed    |
+| hybrid reverb (early IR + FDN tail) | **the** cost control — convolve a short IR, not a long one | on (default) |
+| shared bed vs per-source   | one convolution vs N                            | shared bed    |
 | reflection ambisonic order | bed directionality vs channel count / IR width  | 1st–2nd       |
-| IR length                  | reverb tail vs partitioned-convolution cost     | ~1–2 s        |
+| early-IR length            | early-reflection convolution cost (tail is the cheap FDN) | ~50–200 ms |
 | rays / bounces             | reflection accuracy vs ray-trace cost (off-thread) | moderate   |
 | simulation update rate     | reflection responsiveness vs CPU (off-thread)   | 10–30 Hz      |
 
-The shared listener-centric bed bounds the audio-thread convolution to a single partitioned FFT
-regardless of source count; per-source reflection streams are opt-in and each add a convolution.
+Two multiplicative cost controls: **hybrid reverb** keeps each convolution short (early IR only; the
+long tail is a cheap recursive reverb), and the **shared listener-centric bed** bounds it to a single
+convolution regardless of source count. Per-source reflection streams are opt-in and each add one.
 
 ## The real room
 
@@ -271,9 +314,14 @@ dominate. A deployment requirement, noted here so it is designed for, not discov
   SDK and establishes the ambisonics/decode-effect plumbing this design reuses (no new dependency,
   [build.md](.\build.md)).
 - **Then, cheapest first:** per-source **occlusion** (Direct Effect, occlusion + transmission only) —
-  a small per-voice gain+EQ glide, immediate payoff.
+  a small per-voice gain+EQ glide, immediate payoff — and **directivity** rides the same pre-pan
+  stage for nearly free.
 - **Then:** the **reflection bed** — the simulation thread, the IPLSource registration, the pointer-
   swap IR handoff, the `IPLReflectionEffect` convolution, and the `IPLAmbisonicsDecodeEffect` to the
-  26-ch bus; **v1 = a single shared listener-centric bed, static (load-time) scene**.
-- **Out of scope (v1):** dynamic/runtime geometry, per-image-source DBAP early reflections, source
-  directivity, GPU (TrueAudio Next) convolution, runtime order/IR-length changes.
+  26-ch bus; **v1 = a single shared listener-centric bed, hybrid reverb (short early IR + FDN tail),
+  static (load-time) scene**.
+- **Optional, non-default:** the **perceptual reverb mode** (geometry-free) — a thin mapping onto the
+  FDN late tail, for abstract content.
+- **Out of scope (v1):** dynamic/runtime geometry, per-image-source DBAP early reflections, **Doppler**
+  (a per-voice fractional-delay line — relevant for fast sources, noted for later), full-length-IR
+  convolution, GPU (TrueAudio Next) convolution, runtime order/IR-length changes.
