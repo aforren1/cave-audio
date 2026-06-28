@@ -18,8 +18,9 @@
 typedef struct SteamMonitor SteamMonitor;
 
 /* Build the decoder for the 26-ch monitor. hrtf_path = NULL uses the built-in HRTF, else a SOFA
- * file. max_block bounds the per-block frame count (the phonon frameSize). NULL on failure. */
-SteamMonitor* steam_monitor_create(const Layout* L, uint32_t sample_rate, uint32_t max_block,
+ * file. block_size is the phonon frameSize — phonon effects process EXACTLY this many samples per
+ * apply, so it must equal the device block n passed to steam_monitor_process. NULL on failure. */
+SteamMonitor* steam_monitor_create(const Layout* L, uint32_t sample_rate, uint32_t block_size,
                                    const char* hrtf_path);
 
 /* Encode the planar 26-ch bus to ambisonics and HRTF-decode to planar stereo out (L at out[0..n),

@@ -32,9 +32,9 @@ struct SteamMonitor {
     IPLHRTF                    hrtf;
     IPLAmbisonicsDecodeEffect  decode;
     uint32_t                   channels;      /* 26 */
-    uint32_t                   max_block;
+    uint32_t                   frame_size;    /* phonon frameSize == the per-block n (fixed at create) */
     float                      encode[BW_CHANNELS][BW_AMBI_CH];  /* fixed 26→16 SH matrix */
-    float*                     ambi;          /* 16 * max_block, planar scratch */
+    float*                     ambi;          /* 16 * frame_size, planar scratch */
 };
 
 /* CONVENTION 1 — axes. Map a room-space direction (x=right, y=up, z=back) to the ambisonic
@@ -83,13 +83,13 @@ static void head_basis(const float q[4], IPLCoordinateSpace3* cs) {
     cs->origin = (IPLVector3){ 0, 0, 0 };
 }
 
-SteamMonitor* steam_monitor_create(const Layout* L, uint32_t sample_rate, uint32_t max_block,
+SteamMonitor* steam_monitor_create(const Layout* L, uint32_t sample_rate, uint32_t block_size,
                                    const char* hrtf_path) {
-    if (!L) return NULL;
+    if (!L || block_size == 0) return NULL;
     SteamMonitor* m = (SteamMonitor*)calloc(1, sizeof *m);
     if (!m) return NULL;
     m->channels = BW_CHANNELS;
-    m->max_block = max_block;
+    m->frame_size = block_size;
 
     IPLContextSettings cs = { 0 };
     cs.version = STEAMAUDIO_VERSION;
@@ -97,7 +97,7 @@ SteamMonitor* steam_monitor_create(const Layout* L, uint32_t sample_rate, uint32
 
     IPLAudioSettings as = { 0 };
     as.samplingRate = (IPLint32)sample_rate;
-    as.frameSize    = (IPLint32)max_block;
+    as.frameSize    = (IPLint32)block_size;   /* phonon effects process exactly frameSize samples/apply */
 
     IPLHRTFSettings hs = { 0 };
     hs.type   = hrtf_path ? IPL_HRTFTYPE_SOFA : IPL_HRTFTYPE_DEFAULT;
@@ -124,7 +124,7 @@ SteamMonitor* steam_monitor_create(const Layout* L, uint32_t sample_rate, uint32
         sh_encode(dir, m->encode[k]);
     }
 
-    m->ambi = (float*)calloc((size_t)BW_AMBI_CH * max_block, sizeof(float));
+    m->ambi = (float*)calloc((size_t)BW_AMBI_CH * block_size, sizeof(float));
     if (!m->ambi) { steam_monitor_destroy(m); return NULL; }
     return m;
 }
@@ -133,7 +133,9 @@ void steam_monitor_process(SteamMonitor* m, const float* bus26, const float p[3]
                            float* out, uint32_t n) {
     (void)p;
     if (!m || n == 0) return;
-    if (n > m->max_block) n = m->max_block;
+    /* phonon's effect was created for exactly frame_size samples — an off-spec device block
+     * (a renegotiating ASIO device != cfg.block_size) renders silence rather than crash. */
+    if (n != m->frame_size) { memset(out, 0, sizeof(float) * (size_t)n * 2); return; }
 
     /* encode: ambi[k][i] = sum over speakers of encode[spk][k] * bus[spk][i] (planar, stride n) */
     memset(m->ambi, 0, sizeof(float) * (size_t)BW_AMBI_CH * n);

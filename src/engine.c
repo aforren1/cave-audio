@@ -148,8 +148,10 @@ BwEngine* bw_create(const BwConfig* cfg) {
         e->monitor = monitor_create(&L, e->cfg.sample_rate);
         if (!e->monitor) { rt_destroy(e->rt); free(e); return NULL; }
 #ifdef BW_HAVE_STEAMAUDIO
-        /* production HRTF decode; non-fatal — render falls back to the simple-pan monitor if NULL */
-        e->steam = steam_monitor_create(&L, e->cfg.sample_rate, BW_MAX_BLOCK, e->cfg.hrtf_path);
+        /* production HRTF decode; non-fatal — render falls back to the simple-pan monitor if NULL.
+         * frameSize = cfg.block_size; render_binaural feeds the device block, which equals
+         * block_size for the null sink and a matching ASIO driver (off-size blocks fall to silence). */
+        e->steam = steam_monitor_create(&L, e->cfg.sample_rate, e->cfg.block_size, e->cfg.hrtf_path);
 #endif
     }
     return e;

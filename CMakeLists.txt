@@ -120,6 +120,11 @@ if(EXISTS "${STEAMAUDIO_DIR}/include/phonon.h")
   target_include_directories(bwaudio PRIVATE "${STEAMAUDIO_DIR}/include")
   target_link_libraries(bwaudio PRIVATE "${STEAMAUDIO_DIR}/lib/windows-x64/phonon.lib")
   target_compile_definitions(bwaudio PRIVATE BW_HAVE_STEAMAUDIO)
+  if(WIN32)
+    add_custom_command(TARGET bwaudio POST_BUILD
+      COMMAND ${CMAKE_COMMAND} -E copy_if_different
+              "${STEAMAUDIO_DIR}/lib/windows-x64/phonon.dll" $<TARGET_FILE_DIR:bwaudio>)   # runtime dep
+  endif()
   message(STATUS "bwaudio: Steam Audio ENABLED (${STEAMAUDIO_DIR}); binaural uses the HRTF decode")
 else()
   message(STATUS "bwaudio: Steam Audio disabled (no SDK at ${STEAMAUDIO_DIR}); binaural uses the first-cut pan")
