@@ -4,11 +4,20 @@
  *
  * Build-only-with-SDK: compiled ONLY when the prebuilt phonon SDK is vendored
  * (third_party/steamaudio/, BWAUDIO_WITH_STEAMAUDIO in CMake). It links phonon and has NOT been
- * compiled in this environment — like asio_sink.cpp at M1, treat it as pending on-SDK
- * verification. The three CONVENTION assumptions below (SH normalization, room↔ambisonic axes,
- * head-orientation frame) are the load-bearing unknowns; they are isolated in small helpers so a
- * by-ear check in the playground (does a front source image in front? does turning the head
- * rotate the field the right way?) localizes any fix.
+ * compiled in this environment — like asio_sink.cpp at M1, treat it as pending on-SDK verification.
+ *
+ * Convention status (confirmed against the phonon C API headers/docs):
+ *  - CONVENTION 3 (axes/orientation) is CONFIRMED: phonon is right-handed, +x right, +y up,
+ *    -z ahead — identical to the engine's room frame, so head_basis() passes the head vectors
+ *    through unchanged.
+ *  - CONVENTIONS 1+2 (the ambisonic axis mapping + SH normalization) are the load-bearing risk:
+ *    IPLAmbisonicsDecodeEffectParams carries NO ambisonics-type field, so the decode consumes a
+ *    FIXED internal convention (it does not honour IPLAMBISONICSTYPE_SN3D/N3D here). A hand-rolled
+ *    encode must match it byte-for-byte. The ROBUST fix — do this once the SDK is in — is to derive
+ *    the 26x16 matrix from Steam Audio's OWN iplAmbisonicsEncodeEffect (encode a unit impulse per
+ *    speaker direction, capture the 16 gains): then the encode provably matches the decode and the
+ *    SN3D-vs-N3D + axis question disappears. The hand-rolled SN3D path below is the interim; a
+ *    by-ear check (front source images in front?) flags a mismatch.
  */
 #include "steam_decode.h"
 #include "ambisonics.h"
@@ -59,9 +68,9 @@ static void qrot(const float q[4], const float v[3], float o[3]) {
     o[2] = v[2] + w * tz + (x * ty - y * tx);
 }
 
-/* CONVENTION 3 — head orientation frame. Build Steam Audio's listener basis from the room head
- * quaternion. Assumes the engine's room frame matches phonon's (x=right, y=up, -z=ahead). VERIFY
- * with CONVENTION 1; if head-turn rotates the wrong way, flip the mapping here. */
+/* CONVENTION 3 — head orientation frame. CONFIRMED: phonon is right-handed x=right/y=up/-z=ahead
+ * (C API docs), identical to the engine's room frame, so the head's ahead/up/right vectors pass
+ * through unchanged into IPLCoordinateSpace3. */
 static void head_basis(const float q[4], IPLCoordinateSpace3* cs) {
     const float fwd[3] = { 0, 0, -1 }, up[3] = { 0, 1, 0 }, rgt[3] = { 1, 0, 0 };
     float a[3], u[3], r[3];
