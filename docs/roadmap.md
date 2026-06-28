@@ -94,17 +94,18 @@ engines. Don't start with the engine bindings.
   `bw_smoke` runs all three profile lifecycles end-to-end (offline sink). **Production HRTF
   decode — in progress, two stages:** (1) **stage 1 done** — the 26→16-ch 3rd-order ambisonic
   **encode** (`ambisonics.c`, ACN/SN3D real SH), unit-tested (`bw_ambi_test`); it is the
-  SDK-independent front half of the production monitor. (2) **stage 2 written, gated** —
+  SDK-independent front half of the production monitor. (2) **stage 2 BUILT + RUNNING** —
   `steam_decode.c` is the **ambisonics→binaural HRTF decode via Steam Audio**
   (`iplAmbisonicsDecodeEffect`), wired into `engine.c` for binaural + both with the simple-pan
-  monitor as the fallback. It is build-only-with-SDK (`BW_HAVE_STEAMAUDIO`; CMake auto-detects
-  `third_party/steamaudio/`) and **not yet compiled/verified** — pending the SDK, like
-  `asio_sink.cpp` at M1. The ambisonic CONVENTION (the real unknown) is now RESOLVED + unit-tested
-  (`bw_ambi_test` vs phonon's hardcoded SH constants): phonon decodes orthonormal/N3D real SH, so
-  the SN3D encode is scaled by `ambi_phonon_scale = sqrt(2l+1)/sqrt(4pi)`. See the helpers in
-  `steam_decode.c` (SH normalization SN3D-vs-N3D, room↔ambisonic axes, head-orientation frame);
-  resolved against the vendored phonon source (`third_party/steam-audio` @480dd64). Remaining is
-  mechanical: build phonon from the submodule, compile `steam_decode.c`, confirm by ear. **Optional:** a dedicated **WASAPI** stereo backend — though live headphone
+  monitor as the fallback (`BW_HAVE_STEAMAUDIO`; CMake auto-detects `third_party/steamaudio/`).
+  **phonon was built from the vendored submodule** (minimal core; see third_party/README.md) and
+  `steam_decode.c` compiles + runs: `bw_smoke` drives the real `iplContextCreate → iplHRTFCreate →
+  iplAmbisonicsDecodeEffectApply` path each block. The ambisonic CONVENTION is RESOLVED +
+  unit-tested (`bw_ambi_test` vs phonon's hardcoded SH constants): phonon decodes orthonormal/N3D
+  real SH, so the SN3D encode is scaled by `ambi_phonon_scale = sqrt(2l+1)/sqrt(4pi)`; axes +
+  orientation match phonon as written. phonon's effect frameSize is fixed at create, so the decoder
+  is built at the sink's actual block size (`bw_sink_block_size`). Remaining: the **by-ear** check
+  on headphones (a free 2-ch ASIO driver). **Optional:** a dedicated **WASAPI** stereo backend — though live headphone
   output already works through any 2-ch **ASIO** driver (ASIO4ALL / FlexASIO / the Steinberg
   built-in), so it is a convenience, not a blocker. The raylib playground is the by-ear bench.
 

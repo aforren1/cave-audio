@@ -91,13 +91,39 @@ conversion fix the v4.8.1 binaries lack. Two reasons the source is the right ven
    NatNet). See [../docs/spatialization.md](../docs/spatialization.md) / [../docs/materials.md](../docs/materials.md).
 2. **Gets the fix.** Building from the pinned commit yields a `phonon` lib that includes it.
 
-**Linking (when stage 2 is compiled):** build phonon from the submodule (its `core/` CMake; pulls
-Embree / FFT — see Steam Audio's build docs), which produces `phonon.dll` + `phonon.lib`. Point the
-engine's `STEAMAUDIO_DIR` at the built `include/` + `lib/windows-x64/`, or drop them at
-`third_party/steamaudio/` (the path CMake's `BWAUDIO_WITH_STEAMAUDIO` block auto-detects, mirroring
-the ASIO block). A prebuilt **release** zip is the lighter alternative if the ambisonics fix isn't
-needed. Apache-2.0 permits redistribution, so the built binaries are kept out of git for size only.
+**Building phonon (minimal core, Windows x64).** This recipe produces a `phonon.dll`/`phonon.lib`
+that links cleanly into `bwaudio.dll`. Run from `third_party/steam-audio/core/build`:
 
-> The submodule pins the dependency at a known commit; `git submodule update --init` fetches it.
-> It is a *reference + build source*, not auto-built by our CMake — the heavy phonon build is a
-> deliberate, separate step taken when stage 2 is turned on.
+```sh
+git submodule update --init third_party/steam-audio          # fetch the pinned source
+
+# 1. Fetch ONLY the required deps, with the SHARED CRT (/MD) — see the CRT note below.
+#    flatbuffers is a build tool (flatc); zlib/pffft/mysofa are linked into phonon.
+python get_dependencies.py --dependency flatbuffers -p windows -a x64 -t vs2022
+for d in zlib pffft mysofa; do
+  python get_dependencies.py --dependency $d --sharedcrt -p windows -a x64 -t vs2022
+done
+
+# 2. Generate the phonon project (--minimal drops Embree / IPP / GPU / sample apps).
+python build.py -p windows -a x64 -t vs2022 -c release --minimal -o generate
+
+# 3. Build JUST the phonon target with the DYNAMIC CRT, and skip phonon_test (a CRT-fragile exe).
+cmake -DSTEAMAUDIO_STATIC_RUNTIME=OFF build/windows-vs2022-x64
+cmake --build build/windows-vs2022-x64 --config Release --target phonon
+```
+
+> **CRT gotcha (the build's one trap).** phonon defaults to `STEAMAUDIO_STATIC_RUNTIME=ON` (`/MT`),
+> but its deps' CMake (mysofa especially) ignore the runtime flag and build `/MD`. Mixing them gives
+> `unresolved external __imp_fgetc / __stdio_common_vsscanf`. Make **everything `/MD`**: `--sharedcrt`
+> on the deps **and** `-DSTEAMAUDIO_STATIC_RUNTIME=OFF` on phonon. `/MD` also matches our `bwaudio.dll`.
+
+**Stage it** where `BWAUDIO_WITH_STEAMAUDIO` auto-detects it (mirroring the ASIO block):
+
+```
+third_party/steamaudio/
+  include/   phonon.h, phonon_version.h        # from core/src/core/ + the generated build dir
+  lib/windows-x64/   phonon.lib, phonon.dll    # from build/windows-vs2022-x64/src/core/Release/
+```
+
+A prebuilt **release** zip is the lighter alternative if the ambisonics fix isn't needed. Apache-2.0
+permits redistribution, so the built binaries are kept out of git (gitignored) for size only.
