@@ -325,3 +325,20 @@ dominate. A deployment requirement, noted here so it is designed for, not discov
 - **Out of scope (v1):** dynamic/runtime geometry, per-image-source DBAP early reflections, **Doppler**
   (a per-voice fractional-delay line — relevant for fast sources, noted for later), full-length-IR
   convolution, GPU (TrueAudio Next) convolution, runtime order/IR-length changes.
+
+## Implementation status
+
+- **Occlusion — implemented** (`src/steam_scene.c`, gated on the Steam Audio build; `bw_scene_set_mesh`
+  + `bw_source_set_occlusion` + `bw_source_get_occlusion`). The third "simulation thread" is real: it
+  owns an `IPLScene` + `IPLStaticMesh` (one material) + an `IPLSimulator`, ray-traces **volumetric**
+  occlusion + transmission at 30 Hz, and publishes one transmittance scalar per source. The control
+  thread feeds geometry + per-source enable/position through a locked shadow; the audio thread reads
+  the published value lock-free and **ramps** it (invariant 4). The sim → audio handoff is a pair of
+  per-voice atomics (`occ_handle`/`occ_val`) the audio thread gates on its own generation — the sim
+  never touches audio-owned voice state, so there is no data race and a recycled slot can't inherit a
+  stale occlusion. The playground wall is a real scene mesh.
+  - **v1 is level-only:** the published scalar combines the geometric occlusion with the material's
+    *mean* transmittance (so concrete vs glass differ in level). The **per-band transmission EQ**
+    (the spectral tilt / biquad described above — the "3-band EQ" half of the direct stage) is **not
+    yet built**; that and **directivity** are the next increment on this same pre-pan stage.
+- **Reflection bed, perceptual mode, directivity — designed, not yet implemented** (this document).

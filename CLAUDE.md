@@ -65,6 +65,9 @@ src/
   dbap.h / dbap.c      listener-relative, constant-power DBAP gain solve. [M4]
   align.h / align.c    per-speaker gain trim + delay-line output stage. [M4]
   binaural.h/binaural.c  head-oriented 26->stereo monitor (Steam Audio HRTF is the upgrade). [M5]
+  ambisonics.h/.c      3rd-order ACN/SN3D encode (+ phonon N3D scale) for the Steam decode. [M5]
+  steam_decode.h/.c    production ambisonics->stereo HRTF decode via phonon (with-SDK). [M5]
+  steam_scene.h/.c     materials occlusion: IPLScene+IPLSimulator on a sim thread (with-SDK). [materials]
   natnet.c             OptiTrack pose ingest (off-wire, see docs/build.md). [M6]
 test/                  bw_smoke (3 profiles), bw_audio_smoke, bw_rt_test, bw_sound_test, bw_dsp_test, bw_monitor_test.
 bindings/
@@ -88,7 +91,7 @@ cmake --build build --config RelWithDebInfo
 ctest --test-dir build -C RelWithDebInfo      # runs the bw_smoke lifecycle check
 ```
 
-**Current state (M6):** builds `bwaudio.dll` + seven tests. `rt.c` is the concurrency spine
+**Current state (M6 + occlusion):** builds `bwaudio.dll` + eight tests. `rt.c` is the concurrency spine
 (two SPSC rings, voice + sound tables, commit snapshot, generation handles) + retire-ack;
 the whole `bw_*` API forwards to it. `sound.c` decodes wav (dr_wav) and `mix_voice` plays
 `sound->pcm` with a gain ramp. Spatialization is real: `layout.c` loads the surveyed
@@ -105,7 +108,14 @@ interactive **raylib playground** (`examples/playground.c`, opt-in `-DBWAUDIO_BU
 auditions binaural by ear. The **production Steam Audio HRTF decode** is built + running:
 `ambisonics.c` (3rd-order encode) → `steam_decode.c` (phonon `iplAmbisonicsDecodeEffect`), gated
 `BW_HAVE_STEAMAUDIO` (phonon built from the `third_party/steam-audio` submodule; see
-third_party/README.md), with the simple-pan monitor as the no-SDK fallback. Remaining: the by-ear
+third_party/README.md), with the simple-pan monitor as the no-SDK fallback. **Materials occlusion is
+implemented** (`steam_scene.c`, same gate): a third "simulation thread" owns an `IPLScene` + mesh +
+`IPLSimulator`, ray-traces volumetric occlusion + transmission at 30 Hz, and publishes one
+transmittance scalar per source into the mixer via a pair of per-voice atomics (`rt`'s `occ_handle`/
+`occ_val`) the audio thread gates on its own generation + ramps; `bw_scene_set_mesh` /
+`bw_source_set_occlusion` drive it and the playground wall is a real occluder. v1 is level-only
+(geometry × material mean transmittance — concrete vs glass differ); the per-band transmission EQ,
+directivity, and the reflection bed are the next increments (docs/materials.md). Remaining: the by-ear
 headphone check; and live Motive verification of M6 (parser + lifecycle are tested off-wire). Do not bake ASIO assumptions
 outside `asio_sink.cpp`, and do not link the NatNet SDK (proprietary; reference only — GPLv3).
 The atomics in `rt.c` need `/experimental:c11atomics` on MSVC (wired in CMake); `pose.h` uses

@@ -142,8 +142,10 @@ engines. Don't start with the engine bindings.
 - **Done when:** an Unreal scene drives the same library identically.
 
 ## Later / optional
-- Steam Audio occlusion + reflections feeding the per-source and diffuse paths
-  (no new dependency) — **materials/geometry model designed in [materials.md](materials.md)**.
+- Steam Audio **occlusion** feeding the per-source path — **implemented** (`src/steam_scene.c`, the
+  third simulation thread; `bw_scene_set_mesh` / `bw_source_set_occlusion`). v1 is a level-only scalar
+  (geometric occlusion × material mean transmittance); the per-band transmission EQ, **directivity**,
+  and **reflections** remain to build — **model in [materials.md](materials.md)**.
 - Ambisonic diffuse bed for ambient/reverb with a static decode matrix (the reflection
   bed in [materials.md](materials.md)).
 - `bw_source_create_stream` for procedural/engine-generated audio.
