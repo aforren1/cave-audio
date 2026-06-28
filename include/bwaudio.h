@@ -97,6 +97,22 @@ BW_API void     bw_source_set_occlusion(BwEngine* e, BwSource s, bool on);
 /* Read the source's current occlusion factor (1 = clear .. 0 = fully blocked) — for HUD/diagnostics. */
 BW_API float    bw_source_get_occlusion(BwEngine* e, BwSource s);
 
+/* ---- directivity (control thread; needs the Steam Audio build) ----
+ * Source radiation pattern. Sources are omni by default; set a weighted-dipole pattern + the
+ * source's forward orientation, and a listener off the source's forward axis hears it attenuated.
+ * Independent of occlusion (a source can be directional without being occluded). */
+typedef enum { BW_DIR_OMNI = 0, BW_DIR_CARDIOID = 1, BW_DIR_FIGURE8 = 2 } BwDirectivity;
+/* Source orientation as a quaternion (same room frame + handedness as bw_set_listener_pose); the
+ * dipole axis is the source's forward (-z rotated by q). Per-frame-safe. No-op without the SDK. */
+BW_API void     bw_source_set_orientation(BwEngine* e, BwSource s, float qx, float qy, float qz, float qw);
+/* Radiation pattern: weight 0=omni (off) .. 0.5=cardioid .. 1=figure-8; power>=1 sharpens the lobe.
+ * Per-frame-safe. No-op without the Steam Audio backend. */
+BW_API void     bw_source_set_directivity(BwEngine* e, BwSource s, float weight, float power);
+/* Named-preset sugar over bw_source_set_directivity (OMNI disables it). */
+BW_API void     bw_source_set_directivity_preset(BwEngine* e, BwSource s, BwDirectivity pattern);
+/* Read the source's current directivity gain (1 = on-axis/omni .. 0 = full null) — HUD/diagnostics. */
+BW_API float    bw_source_get_directivity(BwEngine* e, BwSource s);
+
 /* ---- listener (control thread; skip if track_internal) ---- */
 /* Position in room space. Quaternion is head orientation; used by the binaural
  * monitor only — the array render ignores orientation (real speakers, real ears). */

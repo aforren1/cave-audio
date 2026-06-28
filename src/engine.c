@@ -298,9 +298,9 @@ BwSource bw_source_create(BwEngine* e) {
 void bw_source_destroy(BwEngine* e, BwSource s) {
     if (!e) return;
 #ifdef BW_HAVE_STEAMAUDIO
-    /* clear the occlusion shadow first so the sim tears down this source's IPLSource and stops
-     * simulating the slot (else it leaks + a recycled slot inherits stale enabled/position). */
-    if (e->scene) steam_scene_set_occlusion(e->scene, s, false);
+    /* clear ALL scene features (occlusion + directivity) so the sim tears down this source's
+     * IPLSource and stops simulating the slot (else it leaks + a recycled slot inherits stale state). */
+    if (e->scene) steam_scene_source_gone(e->scene, s);
 #endif
     rt_source_destroy(e->rt, s);
 }
@@ -340,6 +340,38 @@ void bw_source_set_occlusion(BwEngine* e, BwSource s, bool on) {
 
 float bw_source_get_occlusion(BwEngine* e, BwSource s) {
     return e ? rt_get_occlusion(e->rt, s) : 1.0f;
+}
+
+void bw_source_set_orientation(BwEngine* e, BwSource s, float qx, float qy, float qz, float qw) {
+#ifdef BW_HAVE_STEAMAUDIO
+    if (!e || !e->scene) return;
+    /* the dipole axis is the source forward = q * (0,0,-1) * q^-1 */
+    float fx = -2.0f * (qw * qy + qx * qz);
+    float fy =  2.0f * (qw * qx - qy * qz);
+    float fz = -1.0f + 2.0f * (qx * qx + qy * qy);
+    steam_scene_set_orientation(e->scene, s, fx, fy, fz);
+#else
+    (void)e; (void)s; (void)qx; (void)qy; (void)qz; (void)qw;
+#endif
+}
+
+void bw_source_set_directivity(BwEngine* e, BwSource s, float weight, float power) {
+#ifdef BW_HAVE_STEAMAUDIO
+    if (e && e->scene) steam_scene_set_directivity(e->scene, s, weight, power);
+#else
+    (void)e; (void)s; (void)weight; (void)power;
+#endif
+}
+
+void bw_source_set_directivity_preset(BwEngine* e, BwSource s, BwDirectivity pattern) {
+    float weight = 0.0f, power = 1.0f;
+    if      (pattern == BW_DIR_CARDIOID) weight = 0.5f;
+    else if (pattern == BW_DIR_FIGURE8)  weight = 1.0f;   /* OMNI -> weight 0 (off) */
+    bw_source_set_directivity(e, s, weight, power);
+}
+
+float bw_source_get_directivity(BwEngine* e, BwSource s) {
+    return e ? rt_get_directivity(e->rt, s) : 1.0f;
 }
 
 /* ---- listener ---- */

@@ -27,9 +27,15 @@ SteamScene* steam_scene_create(RtCore* rt, uint32_t sample_rate, uint32_t frame_
 void steam_scene_set_mesh(SteamScene* s, const float* verts, int nverts, const int* tris, int ntris,
                           const float absorption[3], float scattering, const float transmission[3]);
 
-/* Enable/disable occlusion for a source (by its bw source handle), and feed its room-space pos. */
-void steam_scene_set_occlusion(SteamScene* s, uint32_t handle, int on);
-void steam_scene_set_pos      (SteamScene* s, uint32_t handle, float x, float y, float z);
+/* Per-source controls (by bw source handle). Occlusion + directivity are independent features (a
+ * source can be directional without being occluded). directivity: weight 0=omni / .5=cardioid /
+ * 1=fig-8, power>=1 sharpens; the dipole axis is the source forward (fwd). source_gone clears all
+ * features on destroy so the sim tears the IPLSource down and a recycled slot starts clean. */
+void steam_scene_set_occlusion  (SteamScene* s, uint32_t handle, int on);
+void steam_scene_set_directivity(SteamScene* s, uint32_t handle, float weight, float power);
+void steam_scene_set_orientation(SteamScene* s, uint32_t handle, float fx, float fy, float fz);
+void steam_scene_set_pos        (SteamScene* s, uint32_t handle, float x, float y, float z);
+void steam_scene_source_gone    (SteamScene* s, uint32_t handle);
 
 void steam_scene_destroy(SteamScene* s);   /* stops the sim thread, releases phonon objects */
 

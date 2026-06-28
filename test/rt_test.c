@@ -164,6 +164,14 @@ int main(void) {
     for (int k = 0; k < 12; ++k) render2(c);
     CHECK(fabs(total_energy() / e4b - 1.0) < 0.02, "flat EQ restores full level (bypass re-engaged)");
 
+    /* 11. directivity rides its own pre-pan gain ramp (the dir term of rt_set_direct). */
+    rt_set_direct(c, h4, 1.0f, flat, 0.5f);
+    for (int k = 0; k < 4; ++k) render2(c);
+    CHECK(fabs(total_energy() / e4b - 0.5) < 0.05, "directivity 0.5 ~ half (same linear scale as occlusion)");
+    rt_set_direct(c, h4, 1.0f, flat, 1.0f);
+    for (int k = 0; k < 4; ++k) render2(c);
+    CHECK(fabs(total_energy() / e4b - 1.0) < 0.02, "directivity restored to 1 ~ full energy");
+
     rt_destroy(c);
     remove(WAV);
     if (fails) { printf("rt_test: %d FAILURES\n", fails); return 1; }

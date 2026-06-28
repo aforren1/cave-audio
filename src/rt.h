@@ -67,7 +67,11 @@ void    rt_set_occlusion(RtCore* c, uint32_t handle, float transmittance);
 /* Occlusion with a 3-band transmission tilt: broadband `level` + normalized `band_gains[3]` (the
  * audio thread applies a 3-biquad EQ). Same off-thread publisher + handle gate as rt_set_occlusion. */
 void    rt_set_occlusion_eq(RtCore* c, uint32_t handle, float level, const float band_gains[3]);
+/* Full direct-effect publish: broadband level + 3-band tilt + directivity gain, in one handle-gated
+ * store set. The off-thread sim calls this per source; the audio thread ramps level/dir and EQ. */
+void    rt_set_direct(RtCore* c, uint32_t handle, float level, const float bands[3], float dir);
 float   rt_get_occlusion(RtCore* c, uint32_t handle);   /* control thread: published factor (1 = clear) */
+float   rt_get_directivity(RtCore* c, uint32_t handle); /* control thread: published gain (1 = on-axis) */
 
 /* ---- assets (control thread; file I/O + alloc) ---- */
 uint32_t rt_load_sound  (RtCore* c, const char* path, char* err, size_t errcap); /* 0 on failure */

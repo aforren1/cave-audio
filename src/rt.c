@@ -39,6 +39,7 @@ typedef struct {
      * atomic arrays (outside this memset'd struct, so the off-thread sim never races a voice
      * create). occ_cur ramps toward the gated published value, applied to the mono signal pre-pan. */
     float    occ_cur;
+    float    dir_cur;                        /* directivity ramp (source-radiation gain, pre-pan) */
     /* per-band transmission EQ state (audio-thread-only). eqg_cur are the slewed band gains; the
      * 4 history arrays are the 3 biquad sections' Direct-Form-I state. */
     float    eqg_cur[3];
@@ -70,6 +71,7 @@ struct RtCore {
     _Atomic uint32_t* occ_handle;           /* handle the sim last published for (0 = none) */
     _Atomic float*    occ_val;              /* published broadband level (1 = clear) */
     _Atomic uint64_t* occ_eq;               /* published 3-band transmission tilt (3x16-bit, gated by occ_handle) */
+    _Atomic float*    occ_dir;              /* published directivity gain (1 = on-axis/omni, gated by occ_handle) */
     struct { float cw0, alpha; int type; } eq_proto[3];   /* per-band biquad prototypes, rate-derived at create */
 
     /* control-thread-owned voice handle allocation */
@@ -274,6 +276,7 @@ static void drain_commands(RtCore* c) {
             v->gen = BW_H_GEN(cmd->handle);
             v->active = true; v->gain_user = 1.f; v->dirty = true;
             v->occ_cur = 1.f;                       /* clear (un-occluded) by default */
+            v->dir_cur = 1.f;                       /* on-axis/omni by default */
             v->eqg_cur[0] = v->eqg_cur[1] = v->eqg_cur[2] = 1.f;   /* flat EQ (history zeroed by memset) */
             /* drop any publish the sim left for the prior occupant of this slot (the stores are
              * atomic, so a concurrent sim publish for the old handle can't tear; either way the new
@@ -281,6 +284,7 @@ static void drain_commands(RtCore* c) {
             atomic_store_explicit(&c->occ_handle[idx], 0u,   memory_order_relaxed);
             atomic_store_explicit(&c->occ_val[idx],    1.f,  memory_order_relaxed);
             atomic_store_explicit(&c->occ_eq[idx], eq_pack((float[3]){1.f,1.f,1.f}), memory_order_relaxed);
+            atomic_store_explicit(&c->occ_dir[idx],    1.f,  memory_order_relaxed);
         } break;
         case CMD_SRC_DESTROY: { Voice* v = voice_for(c, cmd->handle);
             if (v) { v->active = false; v->playing = false; v->sound = NULL; } } break;
@@ -351,6 +355,10 @@ static void mix_voice(RtCore* c, Voice* v, uint16_t idx, float* bus, uint32_t n)
     const bool mine = atomic_load_explicit(&c->occ_handle[idx], memory_order_acquire) == myh;
     const float occ_tgt = mine ? atomic_load_explicit(&c->occ_val[idx], memory_order_relaxed) : 1.0f;
     const float occ_step = (occ_tgt - v->occ_cur) / (float)n;   /* occlusion ramp (invariant 4) */
+    /* directivity (source-radiation gain): own ramp — it tracks source/listener motion, so a raw
+     * per-block jump would zipper (invariant 4). Gated on the same handle. */
+    const float dir_tgt = mine ? atomic_load_explicit(&c->occ_dir[idx], memory_order_relaxed) : 1.0f;
+    const float dir_step = (dir_tgt - v->dir_cur) / (float)n;
 
     /* per-band EQ: read the gated tilt once, glide the band gains, recompute the 3 biquads from the
      * rate-derived prototypes. Bypassed (no per-sample filtering) when the voice is effectively flat. */
@@ -385,9 +393,10 @@ static void mix_voice(RtCore* c, Voice* v, uint16_t idx, float* bus, uint32_t n)
                 v->eq_x2[b]=v->eq_x1[b]; v->eq_x1[b]=s; v->eq_y2[b]=v->eq_y1[b]; v->eq_y1[b]=y; s=y;
             }
         }
-        s *= v->occ_cur;                                        /* broadband occlusion level, pre-pan */
+        s *= v->occ_cur * v->dir_cur;                           /* occlusion level + directivity, pre-pan */
         if (!ended) ++cur;
         v->occ_cur += occ_step;
+        v->dir_cur += dir_step;
         for (uint32_t ch = 0; ch < c->channels; ++ch) {
             bus[(size_t)ch * n + i] += v->gcur[ch] * s;
             v->gcur[ch] += step[ch];
@@ -395,6 +404,7 @@ static void mix_voice(RtCore* c, Voice* v, uint16_t idx, float* bus, uint32_t n)
     }
     v->cursor = cur;
     v->occ_cur = occ_tgt;                                        /* land exactly (same local) */
+    v->dir_cur = dir_tgt;
     for (uint32_t ch = 0; ch < c->channels; ++ch) v->gcur[ch] = v->gtarget[ch]; /* land exactly */
 
     if (ended) {
@@ -584,19 +594,21 @@ RtCore* rt_create(uint32_t voice_cap, uint32_t sound_cap, uint32_t sample_rate, 
     c->occ_handle = (_Atomic uint32_t*)calloc(voice_cap, sizeof(_Atomic uint32_t));
     c->occ_val    = (_Atomic float*)   calloc(voice_cap, sizeof(_Atomic float));
     c->occ_eq     = (_Atomic uint64_t*)calloc(voice_cap, sizeof(_Atomic uint64_t));
+    c->occ_dir    = (_Atomic float*)   calloc(voice_cap, sizeof(_Atomic float));
     c->gen       = (uint16_t*) calloc(voice_cap, sizeof(uint16_t));
     c->inuse     = (uint8_t*)  calloc(voice_cap, sizeof(uint8_t));
     c->freelist  = (uint32_t*) calloc(voice_cap, sizeof(uint32_t));
     c->sounds    = (SoundSlot*)calloc(sound_cap, sizeof(SoundSlot));
     c->sfreelist = (uint32_t*) calloc(sound_cap, sizeof(uint32_t));
-    if (!c->voices || !c->occ_handle || !c->occ_val || !c->occ_eq || !c->gen || !c->inuse ||
-        !c->freelist || !c->sounds || !c->sfreelist) {
+    if (!c->voices || !c->occ_handle || !c->occ_val || !c->occ_eq || !c->occ_dir || !c->gen ||
+        !c->inuse || !c->freelist || !c->sounds || !c->sfreelist) {
         rt_destroy(c); return NULL;
     }
     const uint64_t eq_flat = eq_pack((float[3]){ 1.f, 1.f, 1.f });
-    for (uint32_t i = 0; i < voice_cap; ++i) {   /* occlusion starts clear (handle 0 = no publish) */
+    for (uint32_t i = 0; i < voice_cap; ++i) {   /* occlusion/directivity start clear (handle 0 = no publish) */
         atomic_store_explicit(&c->occ_val[i], 1.0f,    memory_order_relaxed);
         atomic_store_explicit(&c->occ_eq[i],  eq_flat, memory_order_relaxed);
+        atomic_store_explicit(&c->occ_dir[i], 1.0f,    memory_order_relaxed);
     }
     /* precompute the 3 EQ band prototypes from the runtime sample rate (so the EQ is correct at
      * 48/96/192k). fc's: low-shelf 800, peaking at the geometric centre, high-shelf 8000. */
@@ -647,24 +659,28 @@ void rt_set_tracker(RtCore* c, const PoseSlot* slot) {
  * the audio-thread-owned Voice fields: it just deposits (handle, value) into the atomic publish
  * slot. The audio thread gates on its own generation when it consumes, so a stale/recycled handle
  * is dropped there (race-free, since the sim never reads v->gen/v->active). */
-void rt_set_occlusion(RtCore* c, uint32_t handle, float transmittance) {
-    const float flat[3] = { 1.f, 1.f, 1.f };
-    rt_set_occlusion_eq(c, handle, transmittance, flat);   /* broadband level, no spectral tilt */
-}
-
-/* As above, but with a 3-band transmission tilt: `level` is the broadband attenuation and
- * `band_gains` (each in [0,1], normalized so the loudest band is 1) is the spectral shape the audio
- * thread applies through its 3-biquad EQ. Stores are gated by the same occ_handle written last with
- * release, so the audio side never reads a torn (level, tilt) pair across occupants. */
-void rt_set_occlusion_eq(RtCore* c, uint32_t handle, float level, const float band_gains[3]) {
+/* Unified per-source direct-effect publish: broadband `level`, 3-band transmission `bands` (each in
+ * [0,1], normalized so the loudest is 1 — the audio thread's EQ tilt), and a `dir` directivity gain.
+ * All stores are relaxed; occ_handle is written LAST with release, so the audio side only consumes a
+ * complete (level, bands, dir) set for the matching occupant — never a torn cross-field/occupant mix. */
+void rt_set_direct(RtCore* c, uint32_t handle, float level, const float bands[3], float dir) {
     if (!c) return;
     uint16_t idx = BW_H_IDX(handle);
     if (idx >= c->voice_cap) return;
-    if (level < 0.f) level = 0.f;
-    if (level > 1.f) level = 1.f;
-    atomic_store_explicit(&c->occ_val[idx], level,             memory_order_relaxed);
-    atomic_store_explicit(&c->occ_eq[idx],  eq_pack(band_gains), memory_order_relaxed);
-    atomic_store_explicit(&c->occ_handle[idx], handle,         memory_order_release);
+    if (level < 0.f) level = 0.f; if (level > 1.f) level = 1.f;
+    if (dir   < 0.f) dir   = 0.f; if (dir   > 1.f) dir   = 1.f;
+    atomic_store_explicit(&c->occ_val[idx],  level,          memory_order_relaxed);
+    atomic_store_explicit(&c->occ_eq[idx],   eq_pack(bands), memory_order_relaxed);
+    atomic_store_explicit(&c->occ_dir[idx],  dir,            memory_order_relaxed);
+    atomic_store_explicit(&c->occ_handle[idx], handle,       memory_order_release);
+}
+
+void rt_set_occlusion(RtCore* c, uint32_t handle, float transmittance) {
+    const float flat[3] = { 1.f, 1.f, 1.f };
+    rt_set_direct(c, handle, transmittance, flat, 1.f);    /* broadband level, no tilt, omni */
+}
+void rt_set_occlusion_eq(RtCore* c, uint32_t handle, float level, const float band_gains[3]) {
+    rt_set_direct(c, handle, level, band_gains, 1.f);      /* level + tilt, omni */
 }
 
 /* Read back a voice's published occlusion factor (1 = clear) — for HUD/diagnostics; 1 if the latest
@@ -675,6 +691,15 @@ float rt_get_occlusion(RtCore* c, uint32_t handle) {
     if (idx >= c->voice_cap) return 1.f;
     return (atomic_load_explicit(&c->occ_handle[idx], memory_order_acquire) == handle)
          ? atomic_load_explicit(&c->occ_val[idx], memory_order_relaxed) : 1.f;
+}
+
+/* Read back the published directivity gain (1 = on-axis/omni) — for HUD/diagnostics. */
+float rt_get_directivity(RtCore* c, uint32_t handle) {
+    if (!c) return 1.f;
+    uint16_t idx = BW_H_IDX(handle);
+    if (idx >= c->voice_cap) return 1.f;
+    return (atomic_load_explicit(&c->occ_handle[idx], memory_order_acquire) == handle)
+         ? atomic_load_explicit(&c->occ_dir[idx], memory_order_relaxed) : 1.f;
 }
 
 void rt_destroy(RtCore* c) {
@@ -688,7 +713,8 @@ void rt_destroy(RtCore* c) {
     free(c->freelist);
     free(c->inuse);
     free(c->gen);
-    free((void*)c->occ_eq);             /* cast drops the _Atomic qualifier for free() */
+    free((void*)c->occ_dir);            /* cast drops the _Atomic qualifier for free() */
+    free((void*)c->occ_eq);
     free((void*)c->occ_val);
     free((void*)c->occ_handle);
     free(c->voices);
