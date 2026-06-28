@@ -79,37 +79,25 @@ by changing the SHA; offline builds can override `FETCHCONTENT_SOURCE_DIR_CJSON_
 Steam Audio is a *clean, redistributable* dependency: it can be linked and shipped under the repo
 `LICENSE` with no special handling.
 
-**Use the prebuilt SDK, not the source repo.** [`ValveSoftware/steam-audio`](https://github.com/ValveSoftware/steam-audio)
-is the full C++ SDK *source* — building it pulls in Embree / Radeon Rays (ray tracing), an FFT
-library, and a large CMake tree. We don't need any of that: the engine links the small prebuilt
-**`phonon` C API** (the `IPLContext` / `IPLMaterial` / ambisonics→binaural path — see
-[../docs/spatialization.md](../docs/spatialization.md) and [../docs/materials.md](../docs/materials.md)).
-So a git *submodule of the source* is the wrong tool; fetch the released SDK instead.
+**Vendored as a source submodule** at `third_party/steam-audio`, pinned to
+[`ValveSoftware/steam-audio`](https://github.com/ValveSoftware/steam-audio) **v4.8.1+10
+(`480dd64`)** — chosen over a prebuilt release because those extra commits include an ambisonics
+conversion fix the v4.8.1 binaries lack. Two reasons the source is the right vendor here:
 
-**Fetch** (from the [Releases](https://github.com/ValveSoftware/steam-audio/releases), pin a version):
+1. **Convention reference.** `steam_decode.c` hand-encodes 3rd-order ambisonics to feed phonon's
+   `iplAmbisonicsDecodeEffect`, which exposes no normalization parameter — so the encode must match
+   phonon's *internal* SH convention exactly. The source (`core/src/core/sh.*`,
+   `ambisonics_encode_effect.cpp`) is the authoritative answer (used like `PacketClient.cpp` was for
+   NatNet). See [../docs/spatialization.md](../docs/spatialization.md) / [../docs/materials.md](../docs/materials.md).
+2. **Gets the fix.** Building from the pinned commit yields a `phonon` lib that includes it.
 
-```sh
-# from the repo root
-curl -fsSL -o steamaudio.zip https://github.com/ValveSoftware/steam-audio/releases/download/vX.Y.Z/steamaudio_api.zip
-unzip steamaudio.zip
-mv steamaudio third_party/steamaudio     # CMake looks for third_party/steamaudio/include/phonon.h
-```
+**Linking (when stage 2 is compiled):** build phonon from the submodule (its `core/` CMake; pulls
+Embree / FFT — see Steam Audio's build docs), which produces `phonon.dll` + `phonon.lib`. Point the
+engine's `STEAMAUDIO_DIR` at the built `include/` + `lib/windows-x64/`, or drop them at
+`third_party/steamaudio/` (the path CMake's `BWAUDIO_WITH_STEAMAUDIO` block auto-detects, mirroring
+the ASIO block). A prebuilt **release** zip is the lighter alternative if the ambisonics fix isn't
+needed. Apache-2.0 permits redistribution, so the built binaries are kept out of git for size only.
 
-Expected layout after vendoring:
-
-```
-third_party/steamaudio/
-  include/   phonon.h, phonon_version.h, ...
-  lib/windows-x64/   phonon.dll, phonon.lib
-```
-
-**Build wiring:** deferred — it lands with the code that uses it (the production HRTF decode behind
-`monitor_process`, then occlusion/reflections). At that point CMake auto-detects
-`third_party/steamaudio/include/phonon.h` and links `phonon` under a `BWAUDIO_WITH_STEAMAUDIO`
-flag, exactly like the ASIO block. Because Apache-2.0 permits redistribution, a pinned
-**FetchContent** of the release zip is also an option (cleaner than manual vendoring); the binaries
-are still kept out of git (below) for size, not licensing.
-
-> If you specifically want to build Steam Audio from source (to patch it, or for an unsupported
-> platform), *then* a submodule of the source repo makes sense — but it's a much larger build and
-> isn't needed for normal use.
+> The submodule pins the dependency at a known commit; `git submodule update --init` fetches it.
+> It is a *reference + build source*, not auto-built by our CMake — the heavy phonon build is a
+> deliberate, separate step taken when stage 2 is turned on.
