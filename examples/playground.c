@@ -12,8 +12,11 @@
  * for occlusion (the direct path is blocked and attenuated). The image-source reflection has no
  * delay or material filtering yet — that's the future Steam Audio reflection path (materials.md).
  *
- * Controls: WASD/RF move source, Q/E turn head, [ ] slide wall, T reflection, G occlusion,
- *           right-drag orbit, wheel zoom, ESC quit.
+ * Keys 1-4 switch the localization test signal (pink noise / pink bursts / click train / 1 kHz
+ * tone) — broadband + sharp onsets localise best; the tone is there to feel the ambiguity.
+ *
+ * Controls: WASD/RF move source, Q/E turn head, [ ] slide wall, 1-4 signal, T reflection,
+ *           G occlusion, right-drag orbit, wheel zoom, ESC quit.
  * Build: cmake -S . -B build -DBWAUDIO_BUILD_PLAYGROUND=ON && cmake --build build
  */
 #include "bwaudio.h"
@@ -42,22 +45,58 @@ static int default_speakers(Vector3* out) {
     return k;
 }
 
-/* 1 s of mono broadband noise (good for localization) -> a float wav the engine can load */
-static int write_noise_wav(const char* path) {
+/* ---- localization test signals (synthesised at startup; see the note on the HUD) ----
+ * Choice of signal matters: broadband + sharp onsets localise best, and HF content is what lets
+ * you hear elevation / front-back. 0 pink noise (general), 1 pink-noise bursts (crisp onsets),
+ * 2 click train (transients, precedence), 3 a 1 kHz tone (deliberately ambiguous, to feel the limit). */
+#define SIG_SECS 2u
+#define SIGLEN   (SR * SIG_SECS)
+#define NSIG     4
+static const char* SIG_NAMES[NSIG] = { "pink noise", "pink bursts", "click train", "1 kHz tone (ambiguous)" };
+
+static float white(unsigned int* s) {            /* white noise sample in ~[-1,1] from an LCG */
+    *s = *s * 1664525u + 1013904223u;
+    return (float)((int)(*s >> 9) - (1 << 22)) / (float)(1 << 22);
+}
+static float pink(float w, float b[7]) {         /* Paul Kellet pink filter */
+    b[0] = 0.99886f * b[0] + w * 0.0555179f;  b[1] = 0.99332f * b[1] + w * 0.0750759f;
+    b[2] = 0.96900f * b[2] + w * 0.1538520f;  b[3] = 0.86650f * b[3] + w * 0.3104856f;
+    b[4] = 0.55000f * b[4] + w * 0.5329522f;  b[5] = -0.7616f * b[5] - w * 0.0168980f;
+    float p = b[0] + b[1] + b[2] + b[3] + b[4] + b[5] + b[6] + w * 0.5362f;
+    b[6] = w * 0.115926f;
+    return p * 0.11f;
+}
+static void gen_signal(int which, float* buf, uint32_t n) {
+    unsigned int s = 22222u;
+    float b[7] = { 0 };
+    const uint32_t period = SR / 5;              /* 200 ms; divides SIGLEN exactly -> seamless loop */
+    if (which == 0) {                            /* continuous pink noise */
+        for (uint32_t i = 0; i < n; ++i) buf[i] = pink(white(&s), b) * 0.55f;
+    } else if (which == 1) {                     /* pink bursts: 100 ms on / 100 ms off, 5 ms fades */
+        const uint32_t on = period / 2, ramp = SR / 200;
+        for (uint32_t i = 0; i < n; ++i) {
+            float p = pink(white(&s), b) * 0.55f, env = 0.0f;
+            uint32_t ph = i % period;
+            if (ph < ramp)              env = (float)ph / ramp;
+            else if (ph < on - ramp)    env = 1.0f;
+            else if (ph < on)           env = (float)(on - ph) / ramp;
+            buf[i] = p * env;
+        }
+    } else if (which == 2) {                     /* click train: 5/s, ~3 ms decaying broadband ticks */
+        const uint32_t clicklen = SR / 333;
+        for (uint32_t i = 0; i < n; ++i) {
+            uint32_t ph = i % period;
+            buf[i] = (ph < clicklen) ? white(&s) * expf(-6.0f * (float)ph / clicklen) * 0.6f : 0.0f;
+        }
+    } else {                                     /* 1 kHz sine — narrowband, ambiguous on purpose */
+        for (uint32_t i = 0; i < n; ++i) buf[i] = sinf(2.0f * PI * 1000.0f * (float)i / SR) * 0.3f;
+    }
+}
+static int write_wav(const char* path, const float* buf, uint32_t n) {
     drwav_data_format fmt = { drwav_container_riff, DR_WAVE_FORMAT_IEEE_FLOAT, 1, SR, 32 };
     drwav wav;
     if (!drwav_init_file_write(&wav, path, &fmt, NULL)) return 0;
-    const drwav_uint64 n = SR;
-    float* buf = (float*)malloc((size_t)n * sizeof(float));
-    if (!buf) { drwav_uninit(&wav); return 0; }
-    unsigned int s = 12345u;                                  /* deterministic LCG noise */
-    for (drwav_uint64 i = 0; i < n; ++i) {
-        s = s * 1664525u + 1013904223u;
-        float r = (float)((int)(s >> 9) - (1 << 22)) / (float)(1 << 22);
-        buf[i] = r * 0.15f;
-    }
     drwav_write_pcm_frames(&wav, n, buf);
-    free(buf);
     drwav_uninit(&wav);
     return 1;
 }
@@ -103,8 +142,12 @@ static void draw_wall(Vector3 c, Vector3 u, Vector3 v, float hw, float hh, Color
 int main(void) {
     _putenv("BWAUDIO_SINK=asio");                             /* headphone output via a 2-ch ASIO driver */
 
-    const char* WAV = "playground_src.wav";
-    if (!write_noise_wav(WAV)) { printf("could not write %s\n", WAV); return 1; }
+    /* synthesise the localization test signals to wav (the engine loads sounds from file) */
+    const char* sig_files[NSIG] = { "pg_pink.wav", "pg_bursts.wav", "pg_clicks.wav", "pg_tone.wav" };
+    float* sigbuf = (float*)malloc((size_t)SIGLEN * sizeof(float));
+    if (!sigbuf) { printf("out of memory\n"); return 1; }
+    for (int i = 0; i < NSIG; ++i) { gen_signal(i, sigbuf, SIGLEN); write_wav(sig_files[i], sigbuf, SIGLEN); }
+    free(sigbuf);
 
     BwConfig cfg = {
         .profile = BW_PROFILE_BINAURAL, .layout_path = NULL, .hrtf_path = NULL,
@@ -122,16 +165,19 @@ int main(void) {
     printf("audio backend: %s%s\n", backend,
            silent ? "   (SILENT — set BWAUDIO_ASIO_DRIVER to your headphone driver)" : "");
 
-    BwSound  snd = bw_load_sound(e, WAV);
+    BwSound sounds[NSIG];
+    for (int i = 0; i < NSIG; ++i) sounds[i] = bw_load_sound(e, sig_files[i]);
+    int cur_sig = 0;
+
     BwSource src = bw_source_create(e);
     bw_source_set_gain(e, src, SRC_GAIN);
-    bw_source_play(e, src, snd, true);
+    bw_source_play(e, src, sounds[cur_sig], true);
 
     /* a second voice rendered at the source's mirror image across the wall — an audible
      * single specular reflection, using only the existing per-source DBAP path (no delay or
      * material filtering yet; that's the future Steam Audio reflection path, docs/materials.md) */
     BwSource refl = bw_source_create(e);
-    bw_source_play(e, refl, snd, true);
+    bw_source_play(e, refl, sounds[cur_sig], true);
     bw_source_set_gain(e, refl, 0.0f);
 
     Vector3 speakers[NSPK];
@@ -168,6 +214,12 @@ int main(void) {
         if (IsKeyDown(KEY_RIGHT_BRACKET)) wall_c = Vector3Add(wall_c, Vector3Scale(wall_n,  mv));
         if (IsKeyPressed(KEY_T)) refl_audible = !refl_audible;
         if (IsKeyPressed(KEY_G)) occ_audible  = !occ_audible;
+        for (int i = 0; i < NSIG; ++i)                       /* 1-4: switch the test signal */
+            if (IsKeyPressed(KEY_ONE + i)) {
+                cur_sig = i;
+                bw_source_play(e, src,  sounds[i], true);
+                bw_source_play(e, refl, sounds[i], true);
+            }
 
         /* arcball camera: right-drag orbits around the array, the wheel zooms */
         if (IsMouseButtonDown(MOUSE_BUTTON_RIGHT)) {
@@ -244,26 +296,30 @@ int main(void) {
                        0.06f, 0.0f, 10, ORANGE);                    /* nose -> facing */
         EndMode3D();
 
-        DrawText("WASD/RF move source   Q/E head   [ ] move wall   T reflection   G occlusion   right-drag orbit   wheel zoom", 12, 12, 16, RAYWHITE);
+        /* readable HUD: a dark backing panel + bright text (ASCII only — raylib's default font
+         * has no em-dash/box glyphs) */
+        DrawRectangle(0, 0, GetScreenWidth(), 124, (Color){ 0, 0, 0, 185 });
+        DrawText("WASD/RF move source   Q/E turn head   [ ] move wall   1-4 signal   T reflection   G occlusion   right-drag orbit   wheel zoom",
+                 12, 10, 15, RAYWHITE);
         DrawText(TextFormat("source (%.2f, %.2f, %.2f)   head %.0f deg",
-                            source_pos.x, source_pos.y, source_pos.z, head_yaw * 57.2958f), 12, 34, 16, LIGHTGRAY);
+                            source_pos.x, source_pos.y, source_pos.z, head_yaw * 57.2958f),
+                 12, 32, 16, (Color){ 215, 215, 225, 255 });
+        DrawText(TextFormat("signal [1-4]: %s", SIG_NAMES[cur_sig]), 12, 54, 18, (Color){ 110, 200, 255, 255 });
         DrawText(TextFormat("%s    [T] reflection %s   [G] occlusion %s",
-                            refl_valid ? "REFLECTING — audible image source" :
-                            (occluded ? "OCCLUDING — direct path blocked" : "wall: no interaction"),
-                            refl_audible ? "ON" : "off", occ_audible ? "ON" : "off"), 12, 56, 16,
-                 refl_valid ? ORANGE : (occluded ? (Color){ 230, 120, 120, 255 } : GRAY));
-        DrawText("green = direct (red = occluded)   orange = reflected path + image source   "
-                 "(image source has no delay/material filter yet — that's the Steam Audio path)", 12, 78, 13, GRAY);
+                            refl_valid ? "REFLECTING - audible image source" :
+                            (occluded ? "OCCLUDING - direct path blocked" : "wall: no interaction"),
+                            refl_audible ? "ON" : "off", occ_audible ? "ON" : "off"),
+                 12, 78, 16, refl_valid ? ORANGE : (occluded ? (Color){ 245, 140, 140, 255 } : (Color){ 200, 200, 210, 255 }));
         if (silent)
-            DrawText("audio: NULL sink — NO SOUND (set BWAUDIO_ASIO_DRIVER; see console)", 12, 98, 16, RED);
+            DrawText("audio: NULL sink - NO SOUND (set BWAUDIO_ASIO_DRIVER; see console)", 12, 100, 16, (Color){ 255, 110, 110, 255 });
         else
-            DrawText(TextFormat("audio: %s", backend), 12, 98, 16, GREEN);
+            DrawText(TextFormat("audio: %s", backend), 12, 100, 16, (Color){ 110, 235, 130, 255 });
         EndDrawing();
     }
 
     CloseWindow();
     bw_stop(e);
     bw_destroy(e);
-    remove(WAV);
+    for (int i = 0; i < NSIG; ++i) remove(sig_files[i]);
     return 0;
 }
