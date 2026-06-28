@@ -27,3 +27,12 @@ void ambi_encode_sn3d(const float dir[3], float y[BW_AMBI_CH]) {
     y[14] = 1.9364917f * z * (x * x - yy * yy);              /*      m=+2    */
     y[15] = 0.7905694f * x * (x * x - 3.0f * yy * yy);       /*      m=+3    */
 }
+
+/* sqrt(2l+1)/sqrt(4pi) per ACN channel — SN3D (AmbiX) -> phonon's orthonormal real SH (see header).
+ * 1/sqrt(4pi)=0.2820948, sqrt(3)/sqrt(4pi)=0.4886025, sqrt(5)/sqrt(4pi)=0.6307832, sqrt(7)/..=0.7463527. */
+const float ambi_phonon_scale[BW_AMBI_CH] = {
+    0.2820948f,                                                                     /* l=0 */
+    0.4886025f, 0.4886025f, 0.4886025f,                                             /* l=1 */
+    0.6307832f, 0.6307832f, 0.6307832f, 0.6307832f, 0.6307832f,                     /* l=2 */
+    0.7463527f, 0.7463527f, 0.7463527f, 0.7463527f, 0.7463527f, 0.7463527f, 0.7463527f  /* l=3 */
+};

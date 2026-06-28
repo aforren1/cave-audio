@@ -38,6 +38,16 @@ int main(void) {
     for (int i = 0; i < BW_AMBI_CH; ++i) finite &= isfinite(y[i]);
     CHECK(finite && EQ(y[0], 1), "diagonal: finite and W=1");
 
+    /* phonon interop: SN3D encode * ambi_phonon_scale must reproduce phonon's orthonormal SH
+     * (third_party/steam-audio core/src/core/sh/spherical_harmonics.cc hardcoded constants). At
+     * AmbiX front (x=1) = phonon Google +x: W=0.282095, ACN3(x)=0.488603, ACN6(l2,m0)=-0.315392,
+     * ACN8(l2,m2)=0.546274 — confirms the SN3D->N3D/sqrt(4pi) match the decode needs. */
+    ambi_encode_sn3d((const float[]){ 1, 0, 0 }, y);
+    CHECK(EQ(y[0] * ambi_phonon_scale[0],  0.282095f), "phonon W = 0.282095");
+    CHECK(EQ(y[3] * ambi_phonon_scale[3],  0.488603f), "phonon ACN3 (front) = 0.488603");
+    CHECK(EQ(y[6] * ambi_phonon_scale[6], -0.315392f), "phonon ACN6 (l=2,m=0) = -0.315392");
+    CHECK(EQ(y[8] * ambi_phonon_scale[8],  0.546274f), "phonon ACN8 (l=2,m=2) = 0.546274");
+
     if (fails) { printf("ambi_test: %d FAILURES\n", fails); return 1; }
     printf("ambi_test OK (3rd-order ACN/SN3D encode at cardinal directions)\n");
     return 0;

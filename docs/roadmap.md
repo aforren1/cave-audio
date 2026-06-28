@@ -99,9 +99,12 @@ engines. Don't start with the engine bindings.
   (`iplAmbisonicsDecodeEffect`), wired into `engine.c` for binaural + both with the simple-pan
   monitor as the fallback. It is build-only-with-SDK (`BW_HAVE_STEAMAUDIO`; CMake auto-detects
   `third_party/steamaudio/`) and **not yet compiled/verified** — pending the SDK, like
-  `asio_sink.cpp` at M1. The load-bearing unknowns are the three CONVENTION helpers in
+  `asio_sink.cpp` at M1. The ambisonic CONVENTION (the real unknown) is now RESOLVED + unit-tested
+  (`bw_ambi_test` vs phonon's hardcoded SH constants): phonon decodes orthonormal/N3D real SH, so
+  the SN3D encode is scaled by `ambi_phonon_scale = sqrt(2l+1)/sqrt(4pi)`. See the helpers in
   `steam_decode.c` (SH normalization SN3D-vs-N3D, room↔ambisonic axes, head-orientation frame);
-  reading the phonon ambisonics source (if vendored) or a by-ear check pins them. **Optional:** a dedicated **WASAPI** stereo backend — though live headphone
+  resolved against the vendored phonon source (`third_party/steam-audio` @480dd64). Remaining is
+  mechanical: build phonon from the submodule, compile `steam_decode.c`, confirm by ear. **Optional:** a dedicated **WASAPI** stereo backend — though live headphone
   output already works through any 2-ch **ASIO** driver (ASIO4ALL / FlexASIO / the Steinberg
   built-in), so it is a convenience, not a blocker. The raylib playground is the by-ear bench.
 

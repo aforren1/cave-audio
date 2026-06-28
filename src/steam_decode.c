@@ -6,18 +6,16 @@
  * (third_party/steamaudio/, BWAUDIO_WITH_STEAMAUDIO in CMake). It links phonon and has NOT been
  * compiled in this environment — like asio_sink.cpp at M1, treat it as pending on-SDK verification.
  *
- * Convention status (confirmed against the phonon C API headers/docs):
- *  - CONVENTION 3 (axes/orientation) is CONFIRMED: phonon is right-handed, +x right, +y up,
- *    -z ahead — identical to the engine's room frame, so head_basis() passes the head vectors
- *    through unchanged.
- *  - CONVENTIONS 1+2 (the ambisonic axis mapping + SH normalization) are the load-bearing risk:
- *    IPLAmbisonicsDecodeEffectParams carries NO ambisonics-type field, so the decode consumes a
- *    FIXED internal convention (it does not honour IPLAMBISONICSTYPE_SN3D/N3D here). A hand-rolled
- *    encode must match it byte-for-byte. The ROBUST fix — do this once the SDK is in — is to derive
- *    the 26x16 matrix from Steam Audio's OWN iplAmbisonicsEncodeEffect (encode a unit impulse per
- *    speaker direction, capture the 16 gains): then the encode provably matches the decode and the
- *    SN3D-vs-N3D + axis question disappears. The hand-rolled SN3D path below is the interim; a
- *    by-ear check (front source images in front?) flags a mismatch.
+ * Convention status — all three RESOLVED against the phonon source (third_party/steam-audio @480dd64):
+ *  - CONVENTION 1 (axes): room_to_ambi_dir matches phonon's net AmbiX assignment (sh.cpp
+ *    convertedDirection: front=-z, left=-x, up=+y). ACN ordering matches.
+ *  - CONVENTION 2 (normalization): phonon decodes orthonormal real SH (N3D/sqrt(4pi)); the SN3D
+ *    encode is scaled by ambi_phonon_scale = sqrt(2l+1)/sqrt(4pi), VERIFIED in bw_ambi_test against
+ *    phonon's hardcoded SH constants. (Deriving the matrix from iplAmbisonicsEncodeEffect is an
+ *    equivalent alternative.)
+ *  - CONVENTION 3 (orientation): phonon is right-handed x=right/y=up/-z=ahead = the room frame.
+ *  Still pending: this file's phonon API CALLS (context/HRTF/decode create+apply) compile only with
+ *  the SDK and are unverified by ear — like asio_sink.cpp at M1.
  */
 #include "steam_decode.h"
 #include "ambisonics.h"
@@ -49,12 +47,16 @@ static void room_to_ambi_dir(const float r[3], float a[3]) {
     a[2] =  r[1];   /* up    */
 }
 
-/* CONVENTION 2 — normalization. ambi_encode_sn3d is SN3D (AmbiX). If the linked phonon build's
- * ambisonics are N3D, scale ACN n of degree l by sqrt(2l+1) here. Left as SN3D pending verify. */
+/* CONVENTION 2 — normalization. RESOLVED from the phonon source: iplAmbisonicsDecodeEffect takes no
+ * ambisonics-type param and decodes orthonormal real SH (= N3D/sqrt(4pi); core/.../sh/spherical_harmonics.cc,
+ * audio_buffer.h "N3D is used internally for everything"). Scale the SN3D encode per ACN channel by
+ * ambi_phonon_scale = sqrt(2l+1)/sqrt(4pi); bw_ambi_test verifies the product against phonon's
+ * hardcoded SH constants. (Deriving the matrix from iplAmbisonicsEncodeEffect is an equivalent path.) */
 static void sh_encode(const float room_dir[3], float y[BW_AMBI_CH]) {
     float a[3];
     room_to_ambi_dir(room_dir, a);
-    ambi_encode_sn3d(a, y);
+    ambi_encode_sn3d(a, y);                                          /* SN3D, AmbiX axes */
+    for (int k = 0; k < BW_AMBI_CH; ++k) y[k] *= ambi_phonon_scale[k];  /* -> phonon orthonormal SH */
 }
 
 /* rotate vector v by quaternion q (xyzw) */
