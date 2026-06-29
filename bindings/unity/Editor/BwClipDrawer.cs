@@ -59,10 +59,17 @@ namespace CaveAudio.EditorTools
             _nextScan = EditorApplication.timeSinceStartup + 2.0;
             string root = Application.streamingAssetsPath;
             if (!Directory.Exists(root)) { _files = Array.Empty<string>(); return; }
-            _files = Directory.GetFiles(root, "*.*", SearchOption.AllDirectories)
-                .Where(f => Exts.Contains(Path.GetExtension(f).ToLowerInvariant()))
-                .Select(f => f.Substring(root.Length + 1).Replace('\\', '/'))
-                .OrderBy(s => s, StringComparer.OrdinalIgnoreCase).ToArray();
+            try
+            {
+                _files = Directory.GetFiles(root, "*.*", SearchOption.AllDirectories)
+                    .Where(f => Exts.Contains(Path.GetExtension(f).ToLowerInvariant()))
+                    .Select(f => f.Substring(root.Length + 1).Replace('\\', '/'))
+                    .OrderBy(s => s, StringComparer.OrdinalIgnoreCase).ToArray();
+            }
+            catch (Exception)   // an inaccessible subdir / reparse point shouldn't break the inspector
+            {
+                if (_files == null) _files = Array.Empty<string>();   // keep the last good list if we had one
+            }
         }
     }
 }

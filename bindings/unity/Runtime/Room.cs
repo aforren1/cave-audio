@@ -7,9 +7,19 @@ namespace CaveAudio
 {
     public static class Room
     {
-        /// <summary>Set once from CAVE registration (the rigid transform that maps Unity world to the
-        /// physical room origin/axes). Identity is the baseline (just the handedness flip below).</summary>
+        /// <summary>Set once from CAVE registration: the transform mapping Unity world to the physical
+        /// room origin/axes. Identity is the baseline (just the handedness flip below). It should be a
+        /// RIGID transform (rotation + translation, no scale/shear) — Pos() tolerates any affine, but
+        /// Rot() extracts a rotation (ill-defined under reflection/non-uniform scale) and ReversesWinding
+        /// assumes the linear part is well-formed.</summary>
         public static Matrix4x4 UnityToRoom = Matrix4x4.identity;
+
+        /// <summary>True if baking <paramref name="localToWorld"/>-transformed geometry into room space
+        /// reverses triangle winding (so the caller swaps two indices to keep front faces). Folds the
+        /// Z-flip in Pos(), UnityToRoom, AND the object's own scale — a negative/mirrored scale flips
+        /// winding by itself, so a fixed reversal would be wrong for it.</summary>
+        public static bool ReversesWinding(Matrix4x4 localToWorld)
+            => (-1f * UnityToRoom.determinant * localToWorld.determinant) < 0f;   // the -1 is the Z negation
 
         /// <summary>Unity world position -> room space (RH metres).</summary>
         public static Vector3 Pos(Vector3 v)

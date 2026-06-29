@@ -43,8 +43,7 @@ namespace CaveAudio
 
         void Awake()
         {
-            if (Instance != null) { Destroy(gameObject); return; }   // native globals persist across play sessions
-            Instance = this; DontDestroyOnLoad(gameObject);
+            if (Instance != null) { Destroy(gameObject); return; }   // a working manager already owns the engine
 
             var cfg = new BwConfig {
                 profile = profile,
@@ -53,7 +52,7 @@ namespace CaveAudio
                 trackInternal = !feedListener,
             };
             _eng = Bw.bw_create(in cfg);
-            if (_eng == IntPtr.Zero) { Debug.LogError("[BwAudio] bw_create failed"); return; }
+            if (_eng == IntPtr.Zero) { Debug.LogError("[BwAudio] bw_create failed"); return; }   // Instance NOT claimed
 
             // load-time configuration MUST precede bw_start
             if (enableReflections)
@@ -69,8 +68,11 @@ namespace CaveAudio
             if (Bw.bw_start(_eng) != 0)
             {
                 Debug.LogError("[BwAudio] bw_start failed: " + Bw.LastError(_eng));
-                Bw.bw_destroy(_eng); _eng = IntPtr.Zero; return;
+                Bw.bw_destroy(_eng); _eng = IntPtr.Zero; return;     // Instance NOT claimed -> another manager can try
             }
+
+            // Only claim the singleton once we have a live engine, so a failed init leaves Instance free.
+            Instance = this; DontDestroyOnLoad(gameObject);
             Debug.Log("[BwAudio] started, backend=" + Bw.Backend(_eng));
         }
 
@@ -139,17 +141,21 @@ namespace CaveAudio
             Debug.Log($"[BwAudio] acoustic scene: {verts.Count / 3} verts, {tris.Count / 3} tris, {cache.Count} material(s)");
         }
 
-        // Append a Unity mesh, transformed local -> world -> room space. Room.Pos negates Z (LH->RH),
-        // which mirrors the geometry, so the triangle winding is reversed to keep front faces.
+        // Append a Unity mesh, transformed local -> world -> room space. Whether the winding must be
+        // reversed to keep front faces depends on the SIGN of the full linear map's determinant (the
+        // Z-flip in Room.Pos, UnityToRoom, AND the object's own scale — a negative/mirrored scale flips
+        // winding by itself), not just the Z-flip. Room.ReversesWinding folds all three together.
         static void AddMesh(List<float> verts, List<int> tris, List<uint> triMat, Mesh mesh, Matrix4x4 l2w, uint mat)
         {
             int baseIdx = verts.Count / 3;
             var mv = mesh.vertices;
             foreach (var lv in mv) { var p = Room.Pos(l2w.MultiplyPoint3x4(lv)); verts.Add(p.x); verts.Add(p.y); verts.Add(p.z); }
+            bool reverse = Room.ReversesWinding(l2w);
             var mt = mesh.triangles;
             for (int i = 0; i < mt.Length; i += 3)
             {
-                tris.Add(baseIdx + mt[i]); tris.Add(baseIdx + mt[i + 2]); tris.Add(baseIdx + mt[i + 1]); // reversed winding
+                int a = baseIdx + mt[i], b = baseIdx + mt[i + 1], c = baseIdx + mt[i + 2];
+                if (reverse) { tris.Add(a); tris.Add(c); tris.Add(b); } else { tris.Add(a); tris.Add(b); tris.Add(c); }
                 triMat.Add(mat);
             }
         }
@@ -180,13 +186,20 @@ namespace CaveAudio
             tris.Add(baseIdx + i0); tris.Add(baseIdx + i1); tris.Add(baseIdx + i2);
         }
 
+        readonly List<BwEmitter> _pushBuf = new();   // reusable snapshot (Push may unregister mid-loop)
+
         public void Register(BwEmitter e)   { if (!_emitters.Contains(e)) _emitters.Add(e); }
         public void Unregister(BwEmitter e) => _emitters.Remove(e);
 
         void LateUpdate()
         {
             if (!Ready) return;
-            foreach (var e in _emitters) e.Push();                 // all sources first...
+            // Iterate a snapshot: an emitter's onFinished handler may disable it, which runs OnDisable ->
+            // Unregister -> _emitters.Remove mid-loop. Mutating the list under a foreach would throw and
+            // skip the commit. _pushBuf is cleared+refilled (no per-frame allocation after warmup).
+            _pushBuf.Clear();
+            _pushBuf.AddRange(_emitters);
+            foreach (var e in _pushBuf) if (e) e.Push();           // all sources first...
             if (feedListener && listener)
             {
                 var p = Room.Pos(listener.position);

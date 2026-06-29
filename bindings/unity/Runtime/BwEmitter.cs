@@ -2,6 +2,7 @@
 // source position (and orientation, for directional sources) every frame via BwAudio's centralized
 // push. Audio files live under StreamingAssets and are decoded by the engine (not Unity's AudioClip).
 using System;
+using System.Collections;
 using UnityEngine;
 using UnityEngine.Events;
 
@@ -35,9 +36,25 @@ namespace CaveAudio
 
         void OnEnable()
         {
-            if (Eng == IntPtr.Zero) { enabled = false; return; }   // BwAudio not ready yet
+            if (!TryInit()) StartCoroutine(InitWhenReady());   // create now, or retry until BwAudio is ready
+        }
+
+        // Wait out an init-order race (this emitter enabled before BwAudio finished starting) instead of
+        // permanently disabling. Unity stops the coroutine automatically when the component is disabled.
+        IEnumerator InitWhenReady()
+        {
+            while (!_created) { yield return null; TryInit(); }
+        }
+
+        // Create the engine source + apply settings. Returns false (leaving _created false) if BwAudio
+        // isn't ready yet. Resets _wasPlaying so a recycled component never inherits a stale play edge.
+        bool TryInit()
+        {
+            if (_created) return true;
+            if (Eng == IntPtr.Zero) return false;          // BwAudio not ready -> caller retries
             _src = Bw.bw_source_create(Eng);
             _created = true;
+            _wasPlaying = false;
             Bw.bw_source_set_gain(Eng, _src, gain);
             if (occlusion)   Bw.bw_source_set_occlusion(Eng, _src, true);
             if (reflections) Bw.bw_source_set_reflections(Eng, _src, true);
@@ -52,12 +69,9 @@ namespace CaveAudio
                 }
             }
             Push();
-            if (playOnEnable)
-            {
-                uint snd = BwAudio.Instance.Load(clip);
-                if (snd != 0) Bw.bw_source_play(Eng, _src, snd, loop);
-            }
+            if (playOnEnable) Play();
             BwAudio.Instance.Register(this);
+            return true;
         }
 
         /// <summary>Called once per frame by BwAudio (before the listener + commit).</summary>
@@ -72,7 +86,9 @@ namespace CaveAudio
                 Bw.bw_source_set_orientation(Eng, _src, q.x, q.y, q.z, q.w);
             }
 
-            // playback edge -> onFinished (poll the engine's per-source playing state)
+            // playback edge -> onFinished (poll the engine's per-source playing state). Best-effort: the
+            // play is observed a frame or two after Play() (it's a queued command), and a clip shorter
+            // than the frame interval may never read as playing, so onFinished can be missed for it.
             bool now = Bw.bw_source_is_playing(Eng, _src);
             if (now) _wasPlaying = true;
             else if (_wasPlaying) { _wasPlaying = false; onFinished.Invoke(); }
@@ -111,9 +127,13 @@ namespace CaveAudio
 
         void OnDisable()
         {
-            if (!_created || Eng == IntPtr.Zero) return;
-            if (BwAudio.Instance) BwAudio.Instance.Unregister(this);
-            Bw.bw_source_destroy(Eng, _src);
+            _wasPlaying = false;                 // never carry a stale play edge into a re-enable
+            StopAllCoroutines();                 // cancel a pending InitWhenReady
+            if (_created && Eng != IntPtr.Zero)
+            {
+                if (BwAudio.Instance) BwAudio.Instance.Unregister(this);
+                Bw.bw_source_destroy(Eng, _src);
+            }
             _created = false;
         }
     }

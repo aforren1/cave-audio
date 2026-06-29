@@ -101,6 +101,8 @@ namespace CaveAudio
 
         // ---- listener + frame boundary ----
         [DllImport(DLL, CallingConvention = CC)] public static extern void bw_set_listener_pose(IntPtr e, float px, float py, float pz, float qx, float qy, float qz, float qw);
+        // The engine writes p[0..2] and q[0..3] UNCONDITIONALLY — p must be length>=3, q length>=4, both
+        // non-null, or the native write corrupts memory. Prefer the GetListenerPose helper below.
         [DllImport(DLL, CallingConvention = CC)] public static extern void bw_get_listener_pose(IntPtr e, [Out] float[] p, [Out] float[] q);
         [DllImport(DLL, CallingConvention = CC)] public static extern void bw_commit(IntPtr e);
 
@@ -117,6 +119,16 @@ namespace CaveAudio
         {
             var p = bw_audio_backend(e);
             return p == IntPtr.Zero ? null : Marshal.PtrToStringUTF8(p);
+        }
+
+        /// <summary>Read the listener pose the engine is rendering with. Always allocates the correct
+        /// sizes (position[3], orientation xyzw[4]) — the raw bw_get_listener_pose writes those slots
+        /// unconditionally, so a wrong-sized array would corrupt memory.</summary>
+        public static void GetListenerPose(IntPtr e, out float[] position, out float[] orientation)
+        {
+            position = new float[3];
+            orientation = new float[4];
+            bw_get_listener_pose(e, position, orientation);
         }
     }
 }

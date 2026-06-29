@@ -29,3 +29,18 @@ Initial Unity binding (M7).
   diffuse ambience/music, decoded straight to all 26 speakers.
 - `BwEmitter.IsPlaying` + an `onFinished` UnityEvent, backed by a new engine ABI call
   `bw_source_is_playing` (latest-wins per-source playback readback).
+
+### Hardened (adversarial review)
+
+- `BwAudio` claims the `Instance` singleton only after a successful `bw_start` (a failed init no longer
+  leaves a dead, un-replaceable manager), and iterates a snapshot of the emitter list during the
+  per-frame push (an `onFinished` handler that disables its emitter can no longer mutate the list
+  mid-loop and drop the frame's commit).
+- `BwEmitter` lazily creates its source (a coroutine retries until `BwAudio` is ready) instead of
+  permanently disabling on an init-order race, and resets its play-edge state on disable (no spurious
+  `onFinished` on re-enable).
+- Mesh baking computes the winding flip from the full transform determinant, so a negative/mirrored
+  object scale no longer bakes backward-facing reflectors. `Room.UnityToRoom` is documented as
+  rigid-only.
+- `Bw.GetListenerPose` allocates correctly-sized arrays (the raw call writes fixed slots); the editor
+  clip scan tolerates an inaccessible StreamingAssets subdir.
