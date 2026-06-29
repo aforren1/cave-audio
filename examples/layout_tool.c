@@ -16,9 +16,14 @@
  * the same numbers the JSON stores. The 3D view renders them directly; the audition (which physical
  * speaker sounds) is the ground truth for the channel<->speaker map, the numeric readout for position.
  *
- * Controls: [ ] select speaker (or left-click)   arrows move X/Z, R/F move Y (hold SHIFT = fine)
- *           ENTER type exact "x y z"   PgUp/PgDn gain_db   T tone on/off   N sine/noise
- *           S save   L reload   right-drag/wheel camera   ESC quit
+ * Press P for a DBAP PREVIEW: a pink-noise source moves through your in-progress layout (the tool
+ * rebuilds the engine with the edited positions, since the layout is load-time), so you can hear the
+ * panning — gaps, smoothness, holes — and at the CAVE you walk the room to judge off-center coverage.
+ *
+ * Controls (edit): [ ] select speaker (or left-click)   arrows X/Z, R/F Y (SHIFT = fine)
+ *           ENTER type exact "x y z"   PgUp/PgDn gain_db   T tone on/off   N sine/noise   S save   L reload
+ * Controls (preview, P toggles): WASD/RF move the source   SPACE auto-orbit/near-far/high-low sweep
+ *           Common: right-drag/wheel camera   ESC quit
  * Build: cmake -S . -B build -DBWAUDIO_BUILD_PLAYGROUND=ON && cmake --build build --target bw_layout_tool
  */
 #include "bwaudio.h"
@@ -134,6 +139,73 @@ static int save_json(const char* path) {
     return 1;
 }
 
+/* ---- engine + DBAP preview state (file scope) ---- */
+#define PREV_WAV    "._bw_layout_preview.wav"
+#define TEMP_LAYOUT "._bw_layout_preview.json"
+#define SRC_GAIN    0.7f
+static BwEngine*   e;
+static int         audio;
+static const char* backend = "none";
+static BwSound     pv_sound;
+static BwSource    pv_src;
+static int         preview, pv_orbit, layout_dirty = 1;   /* dirty=1 forces the first preview to rebuild from spk[] */
+static float       pv_t;
+static Vector3     src_pos = { 1.5f, 0.0f, 0.0f };
+
+/* a ~2 s mono 16-bit pink-noise loop for the preview source (broadband -> localises well) */
+static void gen_pink_wav(const char* p) {
+    uint32_t n = SR * 2;
+    short* pcm = (short*)malloc((size_t)n * sizeof(short));
+    if (!pcm) return;
+    unsigned int s = 22222u; float b[7] = { 0 };
+    for (uint32_t i = 0; i < n; ++i) {
+        s = s * 1664525u + 1013904223u;
+        float w = (float)((int)(s >> 9) - (1 << 22)) / (float)(1 << 22);
+        b[0]=0.99886f*b[0]+w*0.0555179f; b[1]=0.99332f*b[1]+w*0.0750759f; b[2]=0.96900f*b[2]+w*0.1538520f;
+        b[3]=0.86650f*b[3]+w*0.3104856f; b[4]=0.55000f*b[4]+w*0.5329522f; b[5]=-0.7616f*b[5]-w*0.0168980f;
+        float pk = (b[0]+b[1]+b[2]+b[3]+b[4]+b[5]+b[6]+w*0.5362f) * 0.11f * 1.5f;
+        b[6] = w * 0.115926f;
+        if (pk > 1) pk = 1; if (pk < -1) pk = -1;
+        pcm[i] = (short)(pk * 22000.0f);
+    }
+    FILE* f = fopen(p, "wb");
+    if (f) {
+        uint32_t sr = SR, databytes = n * 2u, riff = 36u + databytes, byterate = sr * 2u, fmtlen = 16u;
+        uint16_t fmt = 1, ch = 1, bits = 16, align = 2;
+        fwrite("RIFF", 1, 4, f); fwrite(&riff, 4, 1, f); fwrite("WAVE", 1, 4, f);
+        fwrite("fmt ", 1, 4, f); fwrite(&fmtlen, 4, 1, f);
+        fwrite(&fmt, 2, 1, f); fwrite(&ch, 2, 1, f); fwrite(&sr, 4, 1, f);
+        fwrite(&byterate, 4, 1, f); fwrite(&align, 2, 1, f); fwrite(&bits, 2, 1, f);
+        fwrite("data", 1, 4, f); fwrite(&databytes, 4, 1, f);
+        fwrite(pcm, sizeof(short), n, f);
+        fclose(f);
+    }
+    free(pcm);
+}
+
+/* (re)create the cave-profile engine + the (muted) preview source. layout_path NULL = default grid;
+ * the preview rebuilds with a temp file written from spk[] so DBAP pans through the edited positions. */
+static void build_engine(const char* layout_path) {
+    BwConfig cfg = {
+        .profile = BW_PROFILE_CAVE, .layout_path = layout_path, .hrtf_path = NULL,
+        .sample_rate = SR, .block_size = 256, .track_internal = false,
+    };
+    e = bw_create(&cfg);
+    backend = "none"; audio = 0; pv_sound = 0; pv_src = 0;
+    if (!e) return;
+    if (bw_start(e) != 0) {
+        const char* err = bw_last_error(e);
+        printf("bw_start: %s — no audition (need a 26-ch ASIO device / DVS); the editor still runs.\n",
+               err ? err : "?");
+    }
+    backend = bw_audio_backend(e);
+    audio = (strncmp(backend, "asio", 4) == 0);
+    pv_sound = bw_load_sound(e, PREV_WAV);
+    pv_src   = bw_source_create(e);
+    bw_source_play(e, pv_src, pv_sound, true);
+    bw_source_set_gain(e, pv_src, 0.0f);          /* silent until preview mode */
+}
+
 int main(int argc, char** argv) {
     /* headless: `bw_layout_tool --export [file]` writes the layout (default grid, or an existing file
      * with delay_ms recomputed from positions) and exits — scriptable, no window/audio. */
@@ -149,25 +221,11 @@ int main(int argc, char** argv) {
     }
     printf("layout: %s (%s, %d speakers)\n", path, loaded ? "loaded" : "default grid", loaded ? loaded : NSPK);
 
-    /* cave profile so the test signal goes out the 26-ch DVS to the real speakers; falls back to no
-     * audio (editor still works) if no 26-ch ASIO device is present (e.g. off-site, no Dante). */
+    /* cave profile so the test signal / DBAP preview goes out the 26-ch DVS to the real speakers;
+     * falls back to no audio (editor still works) if no 26-ch ASIO device is present (off-site). */
     _putenv("BWAUDIO_SINK=asio");
-    BwConfig cfg = {
-        .profile = BW_PROFILE_CAVE, .layout_path = NULL, .hrtf_path = NULL,
-        .sample_rate = SR, .block_size = 256, .track_internal = false,
-    };
-    BwEngine* e = bw_create(&cfg);
-    const char* backend = "none";
-    int audio = 0;
-    if (e) {
-        if (bw_start(e) != 0) {
-            const char* err = bw_last_error(e);
-            printf("bw_start: %s — no audition (need a 26-ch ASIO device / DVS); the editor still runs.\n",
-                   err ? err : "?");
-        }
-        backend = bw_audio_backend(e);
-        audio = (strncmp(backend, "asio", 4) == 0);
-    }
+    gen_pink_wav(PREV_WAV);                        /* the moving DBAP-preview source signal */
+    build_engine(NULL);                           /* edit-mode engine (the test signal is layout-independent) */
 
     InitWindow(1040, 720, "bwaudio - speaker layout tool");
     SetTargetFPS(60);
@@ -190,10 +248,35 @@ int main(int argc, char** argv) {
             if (IsKeyPressed(KEY_BACKSPACE) && ilen > 0) ibuf[--ilen] = 0;
             if (IsKeyPressed(KEY_ENTER)) {
                 float x, y, z;
-                if (sscanf(ibuf, "%f %f %f", &x, &y, &z) == 3) spk[sel].pos = (Vector3){ x, y, z };
+                if (sscanf(ibuf, "%f %f %f", &x, &y, &z) == 3) { spk[sel].pos = (Vector3){ x, y, z }; layout_dirty = 1; }
                 editing = 0; ilen = 0; ibuf[0] = 0;
             }
             if (IsKeyPressed(KEY_ESCAPE)) { editing = 0; ilen = 0; ibuf[0] = 0; }
+        } else if (preview) {                            /* DBAP preview: move a source, hear it pan */
+            if (IsKeyPressed(KEY_P)) {                   /* back to edit */
+                preview = 0;
+                if (e) { bw_source_set_gain(e, pv_src, 0.0f); bw_commit(e); }
+            } else {
+                if (IsKeyPressed(KEY_SPACE)) pv_orbit = !pv_orbit;
+                float mv = ((IsKeyDown(KEY_LEFT_SHIFT) || IsKeyDown(KEY_RIGHT_SHIFT)) ? 0.4f : 1.5f) * dt;
+                if (pv_orbit) {                          /* hands-free orbit + near/far + high/low sweep */
+                    pv_t += dt;
+                    float az = 0.6f * pv_t, r = 1.6f + 1.0f * sinf(0.8f * pv_t), yy = 1.0f * sinf(1.1f * pv_t);
+                    src_pos = (Vector3){ r * cosf(az), yy, r * sinf(az) };
+                } else {
+                    if (IsKeyDown(KEY_W)) src_pos.z -= mv;
+                    if (IsKeyDown(KEY_S)) src_pos.z += mv;
+                    if (IsKeyDown(KEY_A)) src_pos.x -= mv;
+                    if (IsKeyDown(KEY_D)) src_pos.x += mv;
+                    if (IsKeyDown(KEY_R)) src_pos.y += mv;
+                    if (IsKeyDown(KEY_F)) src_pos.y -= mv;
+                }
+                if (audio) {
+                    bw_source_set_pos(e, pv_src, src_pos.x, src_pos.y, src_pos.z);
+                    bw_set_listener_pose(e, 0, 0, 0, 0, 0, 0, 1);   /* listener at origin; walk the room to test off-center */
+                    bw_commit(e);
+                }
+            }
         } else {
             if (IsKeyPressed(KEY_RIGHT_BRACKET)) sel = (sel + 1) % NSPK;
             if (IsKeyPressed(KEY_LEFT_BRACKET))  sel = (sel + NSPK - 1) % NSPK;
@@ -210,7 +293,7 @@ int main(int argc, char** argv) {
             if (IsKeyPressed(KEY_N)) tone_kind = (tone_kind == BW_TEST_SINE) ? BW_TEST_NOISE : BW_TEST_SINE;
             if (IsKeyPressed(KEY_ENTER)) { editing = 1; ilen = 0; ibuf[0] = 0; }
             if (IsKeyPressed(KEY_S)) { save_flash = save_json(path) ? 2.0f : -2.0f; }
-            if (IsKeyPressed(KEY_L)) load_json(path);
+            if (IsKeyPressed(KEY_L)) { load_json(path); layout_dirty = 1; }
             if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT) && !IsMouseButtonDown(MOUSE_BUTTON_RIGHT)) {  /* click-pick the nearest speaker (not while orbiting) */
                 Ray ray = GetMouseRay(GetMousePosition(), cam);
                 float best = 1e9f; int hit = -1;
@@ -220,10 +303,24 @@ int main(int argc, char** argv) {
                 }
                 if (hit >= 0) sel = hit;
             }
+            if (IsKeyDown(KEY_LEFT) || IsKeyDown(KEY_RIGHT) || IsKeyDown(KEY_UP) || IsKeyDown(KEY_DOWN) ||
+                IsKeyDown(KEY_R) || IsKeyDown(KEY_F) || IsKeyDown(KEY_PAGE_UP) || IsKeyDown(KEY_PAGE_DOWN)) layout_dirty = 1;
+            if (IsKeyPressed(KEY_P) && !editing) {        /* enter DBAP preview — rebuild so it pans through the edited layout */
+                if (driven >= 0 && e) { bw_test_signal(e, (uint32_t)driven, BW_TEST_OFF, 0.0f); driven = -1; }
+                tone_on = 0; pv_orbit = 0; pv_t = 0.0f;   /* each preview session starts manual, fresh orbit phase */
+                if (layout_dirty && e && audio) {     /* rebuild only when there's a device to hear it on */
+                    save_json(TEMP_LAYOUT);
+                    bw_stop(e); bw_destroy(e);
+                    build_engine(TEMP_LAYOUT);
+                    layout_dirty = 0; driven = -1;
+                }
+                preview = 1;
+                if (e) { bw_source_set_gain(e, pv_src, SRC_GAIN); bw_commit(e); }
+            }
         }
 
-        /* drive the selected speaker's channel when auditioning; clear the old one on a change */
-        if (audio) {
+        /* drive the selected speaker's channel when auditioning (edit mode only) */
+        if (audio && !preview) {
             if (tone_on) {
                 if (driven >= 0 && driven != sel) bw_test_signal(e, (uint32_t)driven, BW_TEST_OFF, 0.0f);
                 bw_test_signal(e, (uint32_t)sel, (BwTestKind)tone_kind, TEST_GAIN);
@@ -274,6 +371,10 @@ int main(int argc, char** argv) {
                                : (Color){ 120, 120, 150, 255 };
             DrawSphere(spk[i].pos, is_sel ? 0.15f : 0.10f, col);
         }
+        if (preview) {                                   /* the moving DBAP source */
+            DrawLine3D((Vector3){ 0, 0, 0 }, src_pos, (Color){ 90, 220, 90, 200 });
+            DrawSphere(src_pos, 0.16f, (Color){ 240, 120, 90, 255 });
+        }
         EndMode3D();
 
         /* 2D index labels projected from 3D */
@@ -285,17 +386,25 @@ int main(int argc, char** argv) {
 
         /* HUD */
         DrawRectangle(0, 0, GetScreenWidth(), 96, (Color){ 0, 0, 0, 200 });
-        DrawText("[ ] select (or click)   arrows X/Z  R/F Y  (SHIFT fine)   ENTER type x y z   PgUp/Dn gain   T tone  N sine/noise   S save  L reload",
-                 10, 8, 13, RAYWHITE);
-        DrawText(TextFormat("speaker %d / %d  ->  channel %d   pos (%.3f, %.3f, %.3f)   gain %+.1f dB   delay %.3f ms   dist %.3f m",
-                            sel, NSPK, sel, spk[sel].pos.x, spk[sel].pos.y, spk[sel].pos.z, spk[sel].gain_db, seldel, seld),
-                 10, 30, 16, (Color){ 245, 220, 90, 255 });
-        if (editing)
-            DrawText(TextFormat("type \"x y z\" then ENTER:  %s_", ibuf), 10, 54, 16, (Color){ 120, 245, 140, 255 });
-        else
-            DrawText(TextFormat("tone [T] %s (%s)   save target: %s",
-                                tone_on ? "ON" : "off", tone_kind == BW_TEST_SINE ? "sine" : "noise", path),
-                     10, 54, 15, (Color){ 110, 200, 255, 255 });
+        if (preview) {
+            DrawText("PREVIEW (DBAP)   WASD/RF move source   SPACE auto-orbit   P back to edit",
+                     10, 8, 13, RAYWHITE);
+            DrawText(TextFormat("source (%.2f, %.2f, %.2f)   orbit %s   - walk the room to hear off-center coverage",
+                                src_pos.x, src_pos.y, src_pos.z, pv_orbit ? "ON" : "off"),
+                     10, 30, 16, (Color){ 240, 160, 120, 255 });
+        } else {
+            DrawText("[ ] select (or click)   arrows X/Z  R/F Y  (SHIFT fine)   ENTER type x y z   PgUp/Dn gain   T tone  N noise   P preview   S save  L reload",
+                     10, 8, 13, RAYWHITE);
+            DrawText(TextFormat("speaker %d / %d  ->  channel %d   pos (%.3f, %.3f, %.3f)   gain %+.1f dB   delay %.3f ms   dist %.3f m",
+                                sel, NSPK, sel, spk[sel].pos.x, spk[sel].pos.y, spk[sel].pos.z, spk[sel].gain_db, seldel, seld),
+                     10, 30, 16, (Color){ 245, 220, 90, 255 });
+            if (editing)
+                DrawText(TextFormat("type \"x y z\" then ENTER:  %s_", ibuf), 10, 54, 16, (Color){ 120, 245, 140, 255 });
+            else
+                DrawText(TextFormat("tone [T] %s (%s)   save target: %s",
+                                    tone_on ? "ON" : "off", tone_kind == BW_TEST_SINE ? "sine" : "noise", path),
+                         10, 54, 15, (Color){ 110, 200, 255, 255 });
+        }
         DrawText(audio ? TextFormat("audio: %s  (T drives the selected channel out the array)", backend)
                        : "audio: none - editor only (needs a 26-ch ASIO/DVS device to audition)",
                  10, 76, 14, audio ? (Color){ 110, 235, 130, 255 } : (Color){ 235, 170, 110, 255 });
@@ -308,5 +417,6 @@ int main(int argc, char** argv) {
 
     CloseWindow();
     if (e) { bw_stop(e); bw_destroy(e); }
+    remove(PREV_WAV); remove(TEMP_LAYOUT);
     return 0;
 }

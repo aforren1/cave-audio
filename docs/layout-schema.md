@@ -19,9 +19,13 @@ A complete, valid example lives at [`../examples/cave_layout.json`](../examples/
 You can author this file interactively with **`bw_layout_tool`** (`examples/layout_tool.c`, built with
 `-DBWAUDIO_BUILD_PLAYGROUND=ON`): place each speaker in 3D and **identify it by ear** — since a
 speaker's `index` is its output channel, the tool drives that channel with the test signal
-(`bw_test_signal`) out the cave profile, so you hear which physical speaker you're positioning. It
-exports this schema with `delay_ms` auto-derived from the positions (max-distance alignment). A
-headless `bw_layout_tool --export <file>` writes/normalizes a layout without the GUI.
+(`bw_test_signal`) out the cave profile, so you hear which physical speaker you're positioning. Press
+**P** for a **DBAP preview** — a source pans through your in-progress layout (the tool rebuilds the
+engine with the edited positions, since the layout is load-time) so you can hear gaps/smoothness and
+walk the room to judge off-center coverage. It exports this schema with `delay_ms` auto-derived from
+the positions (max-distance alignment). A headless `bw_layout_tool --export <file>` writes/normalizes
+a layout without the GUI. To audition a saved layout in the full binaural playground:
+`bw_playground cave_layout.json`.
 
 ## Top-level structure
 
