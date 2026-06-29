@@ -30,6 +30,7 @@
  * Controls (edit): [ ] select speaker (or left-click)   arrows X/Z, R/F Y (SHIFT = fine)
  *           ENTER type "x y z"   PgUp/PgDn gain_db   T tone   N sine/noise   C coverage   V observer   S save   L reload
  * Controls (preview, P toggles): WASD/RF move the source   SPACE auto-orbit/near-far/high-low sweep
+ *           B A/B the panner DBAP<->SPCAP live (SPCAP is the fixed-observer sweet-spot panner)
  *           Common: right-drag/wheel camera   ESC quit
  * Build: cmake -S . -B build -DBWAUDIO_BUILD_PLAYGROUND=ON && cmake --build build --target bw_layout_tool
  */
@@ -156,6 +157,7 @@ static const char* backend = "none";
 static BwSound     pv_sound;
 static BwSource    pv_src;
 static int         preview, pv_orbit, layout_dirty = 1;   /* dirty=1 forces the first preview to rebuild from spk[] */
+static int         pv_panner;                             /* 0 = DBAP, 1 = SPCAP (live A/B in preview, B key) */
 static float       pv_t;
 static Vector3     src_pos = { 1.5f, 0.0f, 0.0f };
 
@@ -287,6 +289,10 @@ int main(int argc, char** argv) {
                 if (e) { bw_source_set_gain(e, pv_src, 0.0f); bw_commit(e); }
             } else {
                 if (IsKeyPressed(KEY_SPACE)) pv_orbit = !pv_orbit;
+                if (IsKeyPressed(KEY_B)) {               /* live A/B: DBAP <-> SPCAP (atomic, safe while running) */
+                    pv_panner ^= 1;
+                    if (e) bw_set_panner(e, pv_panner ? BW_PAN_SPCAP : BW_PAN_DBAP);
+                }
                 float mv = ((IsKeyDown(KEY_LEFT_SHIFT) || IsKeyDown(KEY_RIGHT_SHIFT)) ? 0.4f : 1.5f) * dt;
                 if (pv_orbit) {                          /* hands-free orbit + near/far + high/low sweep */
                     pv_t += dt;
@@ -346,7 +352,11 @@ int main(int argc, char** argv) {
                     layout_dirty = 0; driven = -1;
                 }
                 preview = 1;
-                if (e) { bw_source_set_gain(e, pv_src, SRC_GAIN); bw_commit(e); }
+                if (e) {
+                    bw_set_panner(e, pv_panner ? BW_PAN_SPCAP : BW_PAN_DBAP);   /* rebuilt engine defaults to DBAP */
+                    bw_source_set_gain(e, pv_src, SRC_GAIN);
+                    bw_commit(e);
+                }
             }
         }
 
@@ -446,9 +456,10 @@ int main(int argc, char** argv) {
         /* HUD */
         DrawRectangle(0, 0, GetScreenWidth(), 96, (Color){ 0, 0, 0, 200 });
         if (preview) {
-            DrawText("PREVIEW (DBAP)   WASD/RF move source   SPACE auto-orbit   P back to edit",
+            DrawText(TextFormat("PREVIEW   WASD/RF move   SPACE auto-orbit   B panner: %s   P back to edit",
+                                pv_panner ? "SPCAP (fixed)" : "DBAP (moving)"),
                      10, 8, 13, RAYWHITE);
-            DrawText(TextFormat("source (%.2f, %.2f, %.2f)   orbit %s   - walk the room to hear off-center coverage",
+            DrawText(TextFormat("source (%.2f, %.2f, %.2f)   orbit %s   - A/B the panner by ear; walk the room for off-center coverage",
                                 src_pos.x, src_pos.y, src_pos.z, pv_orbit ? "ON" : "off"),
                      10, 30, 16, (Color){ 240, 160, 120, 255 });
         } else {
