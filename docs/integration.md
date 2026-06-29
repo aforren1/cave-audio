@@ -21,9 +21,11 @@ with a known-position test source before trusting anything else.
 
 ## Unity
 
-Drop `bwaudio.dll` in `Assets/Plugins/`. Three pieces: a P/Invoke binding, a
-singleton bootstrap that owns the engine and centralizes the per-frame push, and a
-per-emitter component.
+**Implemented as a UPM package — [`bindings/unity/`](../bindings/unity/) (`com.cave.bwaudio`).**
+See its [README](../bindings/unity/README.md) for install + plugin staging. Four pieces:
+`Bw` (the P/Invoke layer, verified 1:1 against the ABI), `Room` (the coordinate seam), `BwAudio`
+(the singleton manager + centralized per-frame push), and `BwEmitter` (the per-source component).
+The snippets below are the design rationale; the package is the source of truth.
 
 ### Binding
 

@@ -137,6 +137,21 @@ else()
   message(STATUS "bwaudio: Steam Audio disabled (no SDK at ${STEAMAUDIO_DIR}); binaural uses the first-cut pan")
 endif()
 
+# ---- stage runtime DLLs into the Unity package (bindings/unity/Runtime/Plugins/x86_64) ----
+# Gitignored build artifacts; the UPM package picks them up so it "just works" after a build.
+if(WIN32)
+  set(BW_UNITY_PLUGINS "${CMAKE_SOURCE_DIR}/bindings/unity/Runtime/Plugins/x86_64")
+  if(EXISTS "${BW_UNITY_PLUGINS}")
+    add_custom_command(TARGET bwaudio POST_BUILD
+      COMMAND ${CMAKE_COMMAND} -E copy_if_different $<TARGET_FILE:bwaudio> "${BW_UNITY_PLUGINS}")
+    if(BW_STEAMAUDIO_FOUND)
+      add_custom_command(TARGET bwaudio POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                "${STEAMAUDIO_DIR}/lib/windows-x64/phonon.dll" "${BW_UNITY_PLUGINS}")
+    endif()
+  endif()
+endif()
+
 # ---- tests ----
 # ---- track monitor example (console; prints the live track_internal pose) ----
 add_executable(bw_track_monitor examples/track_monitor.c)

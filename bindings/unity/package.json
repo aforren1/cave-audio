@@ -1,0 +1,10 @@
+{
+  "name": "com.cave.bwaudio",
+  "version": "0.1.0",
+  "displayName": "BwAudio (CAVE Spatial Audio)",
+  "description": "Unity control client for the bwaudio spatial-audio engine: a thin P/Invoke binding over the engine's C ABI (no audio crosses the boundary, only control). Drives a 26-speaker CAVE array over ASIO/Dante with a binaural debug monitor. Provides a centralized per-frame push (BwAudio) and a positional emitter (BwEmitter).",
+  "unity": "2021.3",
+  "keywords": [ "audio", "spatial", "ambisonics", "cave", "binaural", "asio" ],
+  "author": { "name": "cave-audio" },
+  "hideInEditor": false
+}

@@ -1,0 +1,5 @@
+# Native plugins are staged here by the engine build (gitignored artifacts).
+*.dll
+*.dll.meta
+*.pdb
+!.gitkeep
