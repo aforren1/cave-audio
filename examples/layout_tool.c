@@ -29,6 +29,8 @@
  *
  * Controls (edit): [ ] select speaker (or left-click)   arrows X/Z, R/F Y (SHIFT = fine)
  *           ENTER type "x y z"   PgUp/PgDn gain_db   T tone   N sine/noise   C coverage   V observer
+ *           G switch the coverage shading: nearest-speaker gap (geometric) <-> the selected panner's
+ *           per-direction rE-localization error (its real solve, cached + recomputed on a throttle)
  *           X score the layout for each panner (DBAP/SPCAP/VBAP rE-localization error)   S save   L reload
  *           B select the target panner   O auto-optimize the layout for it (a hill-climb that minimises
  *           the panner's rE error subject to the constraints; runs live, O again to stop, then S to save).
@@ -259,6 +261,11 @@ static Vector3     src_pos = { 1.5f, 0.0f, 0.0f };
 static int         coverage_on, coverage_moving = 1;   /* default to the moving-observer worst case */
 static Vector3     cov_dir[NCOV];                      /* even (Fibonacci) source directions */
 static Vector3     cov_lis[27];                        /* [0]=origin (fixed); [0..26]=3x3x3 working-volume grid */
+/* coverage overlay metric: 0 = nearest-speaker angular gap (geometric); 1 = the selected panner's
+ * per-direction rE-localization error (cached + recomputed on a throttle, since it runs the real solve). */
+static int         cov_metric, cov_frame;
+static float       cov_err[NCOV];                      /* per-direction rE error (deg) for cov_err_panner */
+static int         cov_err_valid, cov_err_stale, cov_err_panner = -1, cov_err_moving = -1, cov_err_frame;
 
 /* a ~2 s mono 16-bit pink-noise loop for the preview source (broadband -> localises well) */
 static void gen_pink_wav(const char* p) {
@@ -359,6 +366,43 @@ static void score_panner(BwPanner panner, int stride, float* mean_deg, float* wo
     *worst_deg = worst;
 }
 
+/* fill cov_err[] with the selected panner's per-direction rE error (deg), averaged over the observer
+ * model score_panner uses (DBAP: the moving grid when coverage_moving; SPCAP/VBAP: the fixed centre).
+ * Same real solve as the X-score — this is its per-direction breakdown, for the overlay. */
+static void compute_cov_err(BwPanner panner) {
+    static float gains[NCOV * NSPK], srcs[NCOV * 3];
+    float pos[NSPK * 3];
+    for (int i = 0; i < NSPK; ++i) { pos[i*3]=spk[i].pos.x; pos[i*3+1]=spk[i].pos.y; pos[i*3+2]=spk[i].pos.z; }
+    int NL = (panner == BW_PAN_DBAP && coverage_moving) ? 27 : 1;
+    for (int i = 0; i < NCOV; ++i) cov_err[i] = 0.0f;
+    for (int l = 0; l < NL; ++l) {
+        Vector3 Lp = cov_lis[l]; float lisf[3] = { Lp.x, Lp.y, Lp.z };
+        for (int i = 0; i < NCOV; ++i) {
+            srcs[i*3]=Lp.x+COV_R*cov_dir[i].x; srcs[i*3+1]=Lp.y+COV_R*cov_dir[i].y; srcs[i*3+2]=Lp.z+COV_R*cov_dir[i].z;
+        }
+        bw_panner_gains_batch(panner, pos, NSPK, lisf, srcs, NCOV, gains);
+        for (int i = 0; i < NCOV; ++i) {
+            float* g = &gains[i * NSPK];
+            float rE[3] = { 0, 0, 0 };
+            for (int s = 0; s < NSPK; ++s) {
+                float w = g[s] * g[s];
+                Vector3 sd = Vector3Normalize(Vector3Subtract(spk[s].pos, Lp));
+                rE[0] += w*sd.x; rE[1] += w*sd.y; rE[2] += w*sd.z;
+            }
+            float rl = sqrtf(rE[0]*rE[0] + rE[1]*rE[1] + rE[2]*rE[2]);
+            float err = 90.0f;                           /* no energy vector -> count as fully wrong */
+            if (rl >= 1e-9f) {
+                float c = (rE[0]*cov_dir[i].x + rE[1]*cov_dir[i].y + rE[2]*cov_dir[i].z) / rl;
+                if (c > 1.f) c = 1.f; else if (c < -1.f) c = -1.f;
+                err = acosf(c) * 57.2958f;
+            }
+            cov_err[i] += err;
+        }
+    }
+    for (int i = 0; i < NCOV; ++i) cov_err[i] /= (float)NL;
+    cov_err_valid = 1; cov_err_stale = 0; cov_err_panner = panner; cov_err_moving = coverage_moving; cov_err_frame = cov_frame;
+}
+
 /* ---- auto-optimizer: stochastic hill-climb over the free positions, minimising the panner cost
  * (mean + 0.5*worst rE error) subject to the constraints. Runs incrementally (a few trials per frame)
  * so the layout is seen converging and the GUI stays responsive; stop any time and save. ---- */
@@ -379,7 +423,7 @@ static void optimize_step(BwPanner p, int trials) {
         else { spk[s].pos = old; if (++opt_stall > 6*NSPK) { opt_step *= 0.7f; opt_stall = 0; } }  /* revert; shrink when stuck */
         ++opt_iter;
     }
-    layout_dirty = 1; score_stale = 1;
+    layout_dirty = 1; score_stale = 1; cov_err_stale = 1;
 }
 
 int main(int argc, char** argv) {
@@ -463,7 +507,7 @@ int main(int argc, char** argv) {
             if (IsKeyPressed(KEY_BACKSPACE) && ilen > 0) ibuf[--ilen] = 0;
             if (IsKeyPressed(KEY_ENTER)) {
                 float x, y, z;
-                if (sscanf(ibuf, "%f %f %f", &x, &y, &z) == 3) { spk[sel].pos = (Vector3){ x, y, z }; layout_dirty = 1; score_stale = 1; }
+                if (sscanf(ibuf, "%f %f %f", &x, &y, &z) == 3) { spk[sel].pos = (Vector3){ x, y, z }; layout_dirty = 1; score_stale = 1; cov_err_stale = 1; }
                 editing = 0; ilen = 0; ibuf[0] = 0;
             }
             if (IsKeyPressed(KEY_ESCAPE)) { editing = 0; ilen = 0; ibuf[0] = 0; }
@@ -512,13 +556,14 @@ int main(int argc, char** argv) {
             if (IsKeyPressed(KEY_N)) tone_kind = (tone_kind == BW_TEST_SINE) ? BW_TEST_NOISE : BW_TEST_SINE;
             if (IsKeyPressed(KEY_ENTER)) { editing = 1; ilen = 0; ibuf[0] = 0; }
             if (IsKeyPressed(KEY_S)) { save_flash = save_json(path) ? 2.0f : -2.0f; }
-            if (IsKeyPressed(KEY_L)) { load_json(path); load_constraints("constraints.json"); layout_dirty = 1; score_stale = 1; }
+            if (IsKeyPressed(KEY_L)) { load_json(path); load_constraints("constraints.json"); layout_dirty = 1; score_stale = 1; cov_err_stale = 1; }
             if (IsKeyPressed(KEY_K)) {                                 /* snap all speakers to the nearest allowed point */
                 for (int i = 0; i < NSPK; ++i) spk[i].pos = constraint_project(spk[i].pos);
-                layout_dirty = 1; score_stale = 1;
+                layout_dirty = 1; score_stale = 1; cov_err_stale = 1;
             }
             if (IsKeyPressed(KEY_C)) coverage_on = !coverage_on;       /* coverage overlay */
             if (IsKeyPressed(KEY_V)) coverage_moving = !coverage_moving;
+            if (IsKeyPressed(KEY_G)) cov_metric ^= 1;   /* shade: gap <-> selected-panner rE error (cache stays valid) */
             if (IsKeyPressed(KEY_X)) {                                 /* score the layout for each panner */
                 for (int p = 0; p < 3; ++p) score_panner((BwPanner)p, 1, &score_mean[p], &score_worst[p]);
                 scored = 1; score_stale = 0;
@@ -538,7 +583,7 @@ int main(int argc, char** argv) {
                 if (hit >= 0) sel = hit;
             }
             if (IsKeyDown(KEY_LEFT) || IsKeyDown(KEY_RIGHT) || IsKeyDown(KEY_UP) || IsKeyDown(KEY_DOWN) ||
-                IsKeyDown(KEY_R) || IsKeyDown(KEY_F) || IsKeyDown(KEY_PAGE_UP) || IsKeyDown(KEY_PAGE_DOWN)) { layout_dirty = 1; score_stale = 1; }
+                IsKeyDown(KEY_R) || IsKeyDown(KEY_F) || IsKeyDown(KEY_PAGE_UP) || IsKeyDown(KEY_PAGE_DOWN)) { layout_dirty = 1; score_stale = 1; cov_err_stale = 1; }
             if (IsKeyPressed(KEY_P) && !editing) {        /* enter DBAP preview — rebuild so it pans through the edited layout */
                 if (driven >= 0 && e) { bw_test_signal(e, (uint32_t)driven, BW_TEST_OFF, 0.0f); driven = -1; }
                 tone_on = 0; pv_orbit = 0; pv_t = 0.0f;   /* each preview session starts manual, fresh orbit phase */
@@ -601,6 +646,7 @@ int main(int argc, char** argv) {
         float cov_worst = 0.0f, cov_mean = 0.0f;        /* coverage summary, filled by the overlay below */
         int con_bad = 0;
         if (con_loaded) for (int i = 0; i < NSPK; ++i) if (!constraint_ok(spk[i].pos)) ++con_bad;
+        ++cov_frame;
 
         BeginDrawing();
         ClearBackground((Color){ 22, 22, 28, 255 });
@@ -631,7 +677,7 @@ int main(int argc, char** argv) {
             DrawLine3D((Vector3){ 0, 0, 0 }, src_pos, (Color){ 90, 220, 90, 200 });
             DrawSphere(src_pos, 0.16f, (Color){ 240, 120, 90, 255 });
         }
-        if (coverage_on && !preview) {                   /* shade each source direction by its nearest-speaker gap */
+        if (coverage_on && !preview && cov_metric == 0) {  /* shade each direction by its nearest-speaker gap */
             int NL = coverage_moving ? 27 : 1;
             Vector3 sdir[27][26];                         /* speaker directions from each listener sample */
             for (int l = 0; l < NL; ++l)
@@ -657,6 +703,22 @@ int main(int argc, char** argv) {
             float w = worst < -1 ? -1 : (worst > 1 ? 1 : worst);
             cov_worst = acosf(w) * 57.2958f;
             cov_mean  = (float)(macc / NCOV) * 57.2958f;
+        } else if (coverage_on && !preview && cov_metric == 1) {  /* shade by the selected panner's per-dir rE error */
+            /* recompute a structural change (panner/observer/first-entry) immediately so the cubes and the
+             * HUD label never disagree; throttle only the layout-edit churn (which fires every frame mid-optimize) */
+            int structural = (!cov_err_valid || cov_err_panner != pv_panner || cov_err_moving != coverage_moving);
+            if (structural || (cov_err_stale && cov_frame - cov_err_frame >= 6))
+                compute_cov_err((BwPanner)pv_panner);
+            double macc = 0.0;
+            for (int s = 0; s < NCOV; ++s) {
+                float err = cov_err[s];                   /* deg; 0 = exact, >=40 fully red */
+                float t = err / 40.0f; if (t < 0) t = 0; if (t > 1) t = 1;
+                DrawCubeV(Vector3Scale(cov_dir[s], COV_R), (Vector3){ 0.09f, 0.09f, 0.09f },
+                          (Color){ (unsigned char)(230*t+50*(1-t)), (unsigned char)(225*(1-t)+60*t), 75, 205 });
+                if (err > cov_worst) cov_worst = err;
+                macc += err;
+            }
+            cov_mean = (float)(macc / NCOV);
         }
         EndMode3D();
 
@@ -677,7 +739,7 @@ int main(int argc, char** argv) {
                                 src_pos.x, src_pos.y, src_pos.z, pv_orbit ? "ON" : "off"),
                      10, 30, 16, (Color){ 240, 160, 120, 255 });
         } else {
-            DrawText("[ ] select   arrows X/Z  R/F Y (SHIFT)   ENTER type   PgUp/Dn gain   T tone  N noise   C coverage  V obs   X score   K snap   P preview   S save  L reload",
+            DrawText("[ ] select   arrows X/Z  R/F Y (SHIFT)   ENTER type   PgUp/Dn gain   T tone  N noise   C coverage  V obs  G gap/err   X score   K snap   P preview   S save  L reload",
                      10, 8, 13, RAYWHITE);
             DrawText(TextFormat("speaker %d / %d  ->  channel %d   pos (%.3f, %.3f, %.3f)   gain %+.1f dB   delay %.3f ms   dist %.3f m",
                                 sel, NSPK, sel, spk[sel].pos.x, spk[sel].pos.y, spk[sel].pos.z, spk[sel].gain_db, seldel, seld),
@@ -712,12 +774,18 @@ int main(int argc, char** argv) {
                 DrawText(TextFormat("target panner [B]: %s    [O] auto-optimize the layout for it",
                                     panner_names[pv_panner]), 10, yo, 14, (Color){ 180, 200, 240, 255 });
         }
-        if (coverage_on && !preview) {                   /* bottom: the angular-coverage summary */
+        if (coverage_on && !preview) {                   /* bottom: the coverage summary */
             int yb = GetScreenHeight() - 26;
+            const char* obs = coverage_moving ? "moving: mean over working volume" : "fixed: centre sweet spot";
             DrawRectangle(0, yb - 5, GetScreenWidth(), 31, (Color){ 0, 0, 0, 195 });
-            DrawText(TextFormat("angular coverage [%s]   worst direction %.0f deg   mean %.0f deg   green=covered  red=gap   (V toggles observer, C hides)",
-                                coverage_moving ? "moving: mean over working volume" : "fixed: centre sweet spot", cov_worst, cov_mean),
-                     10, yb, 15, cov_worst > 45.0f ? (Color){ 245, 150, 110, 255 } : (Color){ 150, 225, 160, 255 });
+            if (cov_metric == 0)
+                DrawText(TextFormat("nearest-speaker gap [%s]   worst dir %.0f deg   mean %.0f deg   green=covered red=gap   [G] %s rE error",
+                                    obs, cov_worst, cov_mean, panner_names[pv_panner]),
+                         10, yb, 15, cov_worst > 45.0f ? (Color){ 245, 150, 110, 255 } : (Color){ 150, 225, 160, 255 });
+            else
+                DrawText(TextFormat("%s rE error [%s]   worst dir %.0f deg   mean %.0f deg   green=accurate red=off   [G] nearest-speaker gap",
+                                    panner_names[pv_panner], obs, cov_worst, cov_mean),
+                         10, yb, 15, cov_worst > 30.0f ? (Color){ 245, 150, 110, 255 } : (Color){ 150, 225, 160, 255 });
         }
         if (scored && !preview) {                        /* panner-specific rE-localization scores (X) */
             int ys = GetScreenHeight() - (coverage_on ? 52 : 26);

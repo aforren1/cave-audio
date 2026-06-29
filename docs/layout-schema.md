@@ -36,7 +36,11 @@ structure, doorways); the tool draws them (green bounds / red no-go), flags any 
 and **K** snaps all speakers to the nearest allowed point. Press **B** to pick the target panner, then
 **O** to **auto-optimize**: a constrained hill-climb that nudges positions to minimise that panner's rE
 error while staying feasible — it runs live (watch the layout converge, O again to stop, S to save).
-Headless: `--optimize <file> [dbap|spcap|vbap]` runs it to convergence in place. The constraint file:
+Headless: `--optimize <file> [dbap|spcap|vbap]` runs it to convergence in place. The **C** coverage
+overlay shades a direction shell to show where the array is weak; **G** switches its metric between the
+geometric *nearest-speaker gap* and the selected panner's *per-direction rE error* (the spatial
+breakdown of the X-score — green = accurate, red = mislocalised), and **V** toggles the observer model
+(fixed centre vs the moving working volume). The constraint file:
 
 ```jsonc
 {
