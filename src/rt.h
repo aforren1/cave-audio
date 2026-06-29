@@ -32,7 +32,7 @@
 enum {
     CMD_SRC_CREATE = 0, CMD_SRC_DESTROY, CMD_SET_POS, CMD_SET_GAIN,
     CMD_PLAY, CMD_STOP, CMD_SET_LISTENER, CMD_COMMIT, CMD_SOUND_RETIRE,
-    CMD_SET_REFLECTIONS, CMD_TEST_SIGNAL
+    CMD_SET_REFLECTIONS, CMD_TEST_SIGNAL, CMD_SET_DOPPLER, CMD_SET_AIR
 };
 typedef struct {
     uint8_t  type;
@@ -43,6 +43,8 @@ typedef struct {
         struct { uint32_t sound; uint8_t loop, oneshot; } play;
         struct { float px, py, pz, qx, qy, qz, qw; }   lis;
         struct { uint8_t on; }                         refl;
+        struct { uint8_t on; }                         dop;   /* per-voice Doppler enable */
+        struct { uint8_t on; }                         air;   /* per-voice air absorption enable */
         struct { uint32_t channel; uint8_t kind; float gain; } test;  /* debug channel injection */
     } u;
 } Cmd;
@@ -103,6 +105,8 @@ void rt_source_set_pos (RtCore* c, uint32_t h, float x, float y, float z);
 void rt_source_set_gain(RtCore* c, uint32_t h, float linear);
 void rt_source_play    (RtCore* c, uint32_t h, uint32_t sound, bool loop);
 void rt_source_stop    (RtCore* c, uint32_t h);
+void rt_source_set_doppler(RtCore* c, uint32_t h, bool on);          /* propagation: glided delay -> pitch from radial motion */
+void rt_source_set_air_absorption(RtCore* c, uint32_t h, bool on);   /* propagation: distance-driven HF low-pass */
 void rt_play_oneshot   (RtCore* c, uint32_t sound, float x, float y, float z, float gain);
 void rt_set_listener   (RtCore* c, const float p[3], const float q[4]);
 void rt_commit         (RtCore* c);                   /* enqueue CMD_COMMIT + drain events */

@@ -51,6 +51,54 @@ static int write_const_wav(const char* path, float value, uint32_t frames) {
     return wrote == frames;
 }
 
+static int write_sine_wav(const char* path, double freq, uint32_t frames) {
+    drwav_data_format fmt = { drwav_container_riff, DR_WAVE_FORMAT_IEEE_FLOAT, 1, RATE, 32 };
+    drwav wav;
+    if (!drwav_init_file_write(&wav, path, &fmt, NULL)) return 0;
+    float* buf = (float*)malloc((size_t)frames * sizeof(float));
+    if (!buf) { drwav_uninit(&wav); return 0; }
+    for (uint32_t i = 0; i < frames; ++i) buf[i] = (float)sin(2.0 * 3.14159265358979 * freq * i / RATE);
+    drwav_uint64 wrote = drwav_write_pcm_frames(&wav, frames, buf);
+    free(buf); drwav_uninit(&wav);
+    return wrote == frames;
+}
+static int write_impulse_wav(const char* path, uint32_t frames) {
+    drwav_data_format fmt = { drwav_container_riff, DR_WAVE_FORMAT_IEEE_FLOAT, 1, RATE, 32 };
+    drwav wav;
+    if (!drwav_init_file_write(&wav, path, &fmt, NULL)) return 0;
+    float* buf = (float*)calloc((size_t)frames, sizeof(float));
+    if (!buf) { drwav_uninit(&wav); return 0; }
+    buf[0] = 1.0f;                                   /* unit impulse at frame 0, silence after */
+    drwav_uint64 wrote = drwav_write_pcm_frames(&wav, frames, buf);
+    free(buf); drwav_uninit(&wav);
+    return wrote == frames;
+}
+/* render `kb` blocks, summing all 26 channels to mono per sample into out[kb*N]; the per-channel pan
+ * gains are all >= 0 for one source, so the mono sum is a scaled copy of the (propagated) source. */
+static void render_capture_mono(RtCore* c, float* out, int kb) {
+    BwTimestamp ts = { 0, 0 };
+    for (int b = 0; b < kb; ++b) {
+        rt_render(c, bus, N, &ts);
+        for (int i = 0; i < N; ++i) { double s = 0; for (int ch = 0; ch < CH; ++ch) s += bus[(size_t)ch*N + i]; out[b*N + i] = (float)s; }
+    }
+}
+/* same, but move the source on +x from d0 to d1 (one step per block) so the Doppler delay glides */
+static void render_capture_mono_moving(RtCore* c, uint32_t h, float d0, float d1, float* out, int kb) {
+    BwTimestamp ts = { 0, 0 };
+    for (int b = 0; b < kb; ++b) {
+        float d = d0 + (d1 - d0) * ((float)b / (float)(kb - 1));
+        rt_source_set_pos(c, h, d, 0.f, 0.f); rt_commit(c);
+        rt_render(c, bus, N, &ts);
+        for (int i = 0; i < N; ++i) { double s = 0; for (int ch = 0; ch < CH; ++ch) s += bus[(size_t)ch*N + i]; out[b*N + i] = (float)s; }
+    }
+}
+static int count_zc(const float* x, int n) {     /* sign changes (zero crossings) */
+    int z = 0; for (int i = 1; i < n; ++i) if ((x[i-1] <= 0.f) != (x[i] <= 0.f)) ++z; return z;
+}
+static int argmax_abs(const float* x, int n) {
+    int best = 0; float bm = -1.f; for (int i = 0; i < n; ++i) { float a = fabsf(x[i]); if (a > bm) { bm = a; best = i; } } return best;
+}
+
 /* write a 4-channel (1st-order AmbiX) wav with constant W/Y/Z/X per frame (ACN order, SN3D) */
 static int write_ambix4_wav(const char* path, float w, float y, float z, float x, uint32_t frames) {
     drwav_data_format fmt = { drwav_container_riff, DR_WAVE_FORMAT_IEEE_FLOAT, 4, RATE, 32 };
@@ -276,8 +324,89 @@ int main(void) {
         }
     }
 
+    /* propagation effects (opt-in per voice): air absorption (distance low-pass) + Doppler (glided delay) */
+    {
+        RtCore* cp = rt_create(8, 4, RATE, CH);
+        CHECK(cp != NULL, "rt_create (propagation)");
+        if (cp) {
+            /* air absorption: at a far distance, enabling it dulls an 8 kHz tone (same position, so
+             * the panning + distance attenuation are identical — the energy drop is purely the LPF). */
+            const char* SW8 = "bw_rt_sine8k.wav";
+            if (write_sine_wav(SW8, 8000.0, 8 * N)) {
+                uint32_t s8 = rt_load_sound(cp, SW8, err, sizeof err);
+                uint32_t hv = rt_source_create(cp);
+                rt_source_set_pos(cp, hv, 24.f, 0.f, 0.f);          /* far: air cutoff well below 8 kHz */
+                rt_source_play(cp, hv, s8, true);
+                rt_commit(cp); render2(cp); render2(cp);
+                double e_off = total_energy();
+                rt_source_set_air_absorption(cp, hv, true);
+                rt_commit(cp); render2(cp); render2(cp);            /* settle the ramped coeff */
+                double e_on = total_energy();
+                CHECK(e_off > 0.0 && e_on < 0.6 * e_off, "air absorption dulls an 8 kHz tone at distance");
+                rt_source_destroy(cp, hv); rt_commit(cp);
+                remove(SW8);
+            } else CHECK(0, "write 8k sine wav");
+
+            /* Doppler delay: a static source's signal arrives delayed by distance/c. At 3.43 m that's
+             * 480 samples (343 m/s, 48 kHz); an impulse peaks there with Doppler on, at ~0 with it off. */
+            const char* IW = "bw_rt_impulse.wav";
+            if (write_impulse_wav(IW, 16 * N)) {
+                uint32_t si = rt_load_sound(cp, IW, err, sizeof err);
+                float cap[4 * N];
+                uint32_t hoff = rt_source_create(cp);
+                rt_source_set_pos(cp, hoff, 3.43f, 0.f, 0.f);
+                rt_source_play(cp, hoff, si, false);
+                rt_commit(cp);
+                render_capture_mono(cp, cap, 4);
+                int peak_off = argmax_abs(cap, 4 * N);
+                rt_source_destroy(cp, hoff); rt_commit(cp);
+
+                uint32_t hon = rt_source_create(cp);
+                rt_source_set_pos(cp, hon, 3.43f, 0.f, 0.f);
+                rt_source_set_doppler(cp, hon, true);
+                rt_source_play(cp, hon, si, false);
+                rt_commit(cp);
+                render_capture_mono(cp, cap, 4);
+                int peak_on = argmax_abs(cap, 4 * N);
+                CHECK(peak_off < 4, "no Doppler -> impulse arrives immediately");
+                CHECK(peak_on >= 476 && peak_on <= 484, "Doppler -> impulse delayed by distance/c (~480 samples)");
+                rt_source_destroy(cp, hon); rt_commit(cp);
+                remove(IW);
+            } else CHECK(0, "write impulse wav");
+
+            /* Doppler pitch: an approaching source is pitched up vs a static one (more zero crossings).
+             * Both start at 4 m with Doppler on (same initial propagation fill); the moving one glides
+             * in to 0.5 m, so its read pointer outruns its write -> the 1 kHz tone resamples higher. */
+            const char* SW1 = "bw_rt_sine1k.wav";
+            if (write_sine_wav(SW1, 1000.0, 64 * N)) {
+                uint32_t s1 = rt_load_sound(cp, SW1, err, sizeof err);
+                float cap[8 * N];
+                uint32_t hst = rt_source_create(cp);
+                rt_source_set_pos(cp, hst, 4.f, 0.f, 0.f);
+                rt_source_set_doppler(cp, hst, true);
+                rt_source_play(cp, hst, s1, true);
+                rt_commit(cp);
+                render_capture_mono(cp, cap, 8);
+                int zc_static = count_zc(cap, 8 * N);
+                rt_source_destroy(cp, hst); rt_commit(cp);
+
+                uint32_t hmv = rt_source_create(cp);
+                rt_source_set_pos(cp, hmv, 4.f, 0.f, 0.f);
+                rt_source_set_doppler(cp, hmv, true);
+                rt_source_play(cp, hmv, s1, true);
+                rt_commit(cp);
+                render_capture_mono_moving(cp, hmv, 4.f, 0.5f, cap, 8);
+                int zc_moving = count_zc(cap, 8 * N);
+                CHECK(zc_moving > zc_static + 5, "Doppler: an approaching source is pitched up");
+                rt_source_destroy(cp, hmv); rt_commit(cp);
+                remove(SW1);
+            } else CHECK(0, "write 1k sine wav");
+            rt_destroy(cp);
+        }
+    }
+
     remove(WAV);
     if (fails) { printf("rt_test: %d FAILURES\n", fails); return 1; }
-    printf("rt_test OK (DBAP, commit, gen-drop, gain, occlusion, EQ, directivity, bed, reflection-tap, channel-test verified)\n");
+    printf("rt_test OK (DBAP, commit, gen-drop, gain, occlusion, EQ, directivity, bed, reflection-tap, channel-test, air+Doppler verified)\n");
     return 0;
 }

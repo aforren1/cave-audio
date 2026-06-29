@@ -111,6 +111,23 @@ arrival times to a reference. This lives in `align_speakers`, after the mix and
 before the device write, and is driven by per-speaker values in the layout file.
 This is not optional for a real array, but it is trivial DSP.
 
+## Propagation effects (opt-in, per source)
+
+Two physically-motivated, per-voice effects a control client toggles per emitter (default off,
+phonon-free — see `docs/api.md`). Both derive from the source↔listener distance, recomputed each block.
+
+**Doppler** renders the voice through its acoustic propagation delay, `distance / c`. Each voice owns
+a fractional delay ring; the read tap glides toward the target delay across the block, and *the glide
+rate is the resampling ratio* `1 − v_radial/c` — i.e. the pitch shift falls out of the changing delay,
+so no velocity needs to be supplied. Note this is a **per-source** delay (propagation from the source),
+distinct from the **per-speaker** align delay above (which equalises arrival across the array); they
+compose. The delay saturates past ~8 m (bounding the ring); ring indices stay integer (the fractional
+part is a separate float) so a voice running for hours never loses sample precision.
+
+**Air absorption** is a distance-driven one-pole low-pass on the direct path: high frequencies roll off
+with distance (cutoff ≈ 18 kHz near, −650 Hz/m, ≥1.2 kHz). Subtle in-room, pronounced for far virtual
+sources. Both ramp per sample (no zipper) and tap the reflection send *before* themselves.
+
 ## Binaural debug path
 
 The binaural monitor is a **bus→stereo** transform that consumes the same 26-ch bus

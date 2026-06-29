@@ -121,7 +121,14 @@ thread's own generation; the audio thread applies a 3-biquad transmission EQ (so
 just attenuates — rate-derived, runs at 96 kHz too), a directivity dipole gain, and the level — all
 ramped per sample. `bw_scene_set_mesh` / `bw_source_set_occlusion` / `bw_source_set_directivity` /
 `bw_source_set_orientation` drive it; the playground wall is a real occluder. The **reflection bed**
-is the remaining materials piece. An **ambisonic bed** is implemented too (`bw_load_ambix` + `bw_bed_*`):
+is the remaining materials piece. **Opt-in per-source propagation effects** are implemented (phonon-free,
+pure `rt.c` DSP, default off): **Doppler** (`bw_source_set_doppler`) renders each voice through a
+per-voice fractional delay ring (`RtCore.dop_ring`, one power-of-two ring per voice, allocated at
+create) whose delay glides toward `distance/c` — the glide rate is the pitch shift, saturating past
+~8 m; and **air absorption** (`bw_source_set_air_absorption`) a distance-driven one-pole HF low-pass.
+Both compute the source↔listener distance per block, ramp per sample (invariant 4), and tap the
+reflection send *before* themselves (direct path only); indices stay integer so a long-lived voice
+never loses sample precision. An **ambisonic bed** is implemented too (`bw_load_ambix` + `bw_bed_*`):
 a file-fed AmbiX soundfield decoded world-locked to the 26-ch bus (`rt.c` `build_bed_decode`/`mix_bed`,
 phonon-free), reusing the SH→26 decode the reflection bed will need. `sound.c` now decodes **WAV/FLAC/MP3**
 (dr_libs, one pinned repo fetch) and **resamples to the engine rate at load** (windowed-sinc).

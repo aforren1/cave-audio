@@ -257,6 +257,31 @@ at a low rate and publishes a per-source scalar (+ a 3-band transmission tilt fo
 directional without being occluded). The `_get_` reads return the latest published scalar for
 HUD/diagnostics and are safe to poll. No-ops without the Steam Audio build.
 
+## Propagation effects (control thread; per-frame)
+
+```c
+void bw_source_set_doppler        (BwEngine* e, BwSource s, bool on);
+void bw_source_set_air_absorption (BwEngine* e, BwSource s, bool on);
+```
+
+Opt-in, per source, default **off**, and — unlike occlusion/directivity — **pure per-voice DSP that
+needs no Steam Audio build**. Both derive from the live source↔listener distance, recomputed each
+block from the committed positions.
+
+- **Doppler** renders the source through its acoustic propagation delay (`distance / c`). A per-voice
+  fractional delay line glides toward that delay each block; the *glide rate is the pitch shift*
+  (approaching → up, receding → down), so no velocity input is needed — it falls out of motion. The
+  delay (hence the effect) **saturates past ~8 m**, which bounds the ring; enabling adds the real
+  propagation latency. Best for fast movers — subtle for slow ones in a small room.
+- **Air absorption** is a distance-driven one-pole **high-frequency low-pass** (far sources sound
+  duller): cutoff falls ~650 Hz/m from 18 kHz near, down to a ~1.2 kHz floor. Subtle at a few metres,
+  pronounced for sources placed at large *virtual* distances.
+
+Both are **non-blocking, enqueue-only**, ramp on the audio thread (the air coefficient and the Doppler
+delay both glide across the block — no zipper), and are independent of each other and of the panner /
+profile. They apply to the **direct path only** — the reflection wet send is tapped *before* them, so
+reflections keep their own propagation. They do not affect ambisonic beds (world-locked, no position).
+
 ## Channel test / diagnostics (control thread)
 
 ```c

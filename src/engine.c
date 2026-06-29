@@ -604,6 +604,14 @@ void bw_source_set_reflections(BwEngine* e, BwSource s, bool on) {
     if (e) rt_source_set_reflections(e->rt, s, on);             /* phonon-free; the tap consumes the send */
 }
 
+void bw_source_set_doppler(BwEngine* e, BwSource s, bool on) {
+    if (e) rt_source_set_doppler(e->rt, s, on);
+}
+
+void bw_source_set_air_absorption(BwEngine* e, BwSource s, bool on) {
+    if (e) rt_source_set_air_absorption(e->rt, s, on);
+}
+
 void bw_source_set_orientation(BwEngine* e, BwSource s, float qx, float qy, float qz, float qw) {
 #ifdef BW_HAVE_STEAMAUDIO
     if (!e || !e->scene) return;

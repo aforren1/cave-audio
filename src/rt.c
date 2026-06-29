@@ -29,6 +29,13 @@
 #define EVT_CAP  1024          /* power of two */
 #define BW_RT_MAX_BLOCK 8192   /* aux-send scratch cap; must be >= any device block (matches engine's BW_MAX_BLOCK) */
 
+/* propagation effects (opt-in, per voice) */
+#define BW_SPEED_OF_SOUND   343.0f    /* m/s */
+#define BW_DOPPLER_MAX_DIST 8.0f      /* propagation delay saturates past this (bounds the per-voice ring) */
+#define BW_AIR_FC_NEAR   18000.0f     /* air-absorption low-pass cutoff (Hz) at zero distance ... */
+#define BW_AIR_FC_PER_M    650.0f     /* ... falling this many Hz per metre ... */
+#define BW_AIR_FC_FLOOR   1200.0f     /* ... down to this floor */
+
 typedef struct { Cmd slots[RING_CAP]; _Atomic uint32_t write, read; } CmdRing;
 typedef struct { Evt slots[EVT_CAP];  _Atomic uint32_t write, read; } EvtRing;
 
@@ -54,6 +61,14 @@ typedef struct {
     float    eq_co[3][5];
     float    eq_x1[3], eq_x2[3], eq_y1[3], eq_y2[3];
     int      eq_engaged;
+    /* propagation effects (audio-thread-only, opt-in). air_a_cur is the slewed one-pole coeff, air_y1
+     * the filter memory. dop_delay is the current fractional delay (samples), gliding toward distance/c
+     * each block - the glide IS the pitch shift; dop_w indexes this voice's slice of RtCore.dop_ring;
+     * dop_init snaps the delay to distance/c on the first block after enable (no enable glitch). */
+    bool     air_on, dop_on, dop_init;
+    float    air_a_cur, air_y1;
+    float    dop_delay;
+    uint32_t dop_w;
 } Voice;
 
 typedef struct {
@@ -133,6 +148,12 @@ struct RtCore {
     RtBusTap bus_tap;
     void*    bus_tap_ud;
     float*   aux;                /* BW_RT_MAX_BLOCK mono samples; the per-block aux send scratch */
+
+    /* per-voice Doppler delay rings: voice_cap contiguous power-of-two rings of dop_ringlen floats each
+     * (slice idx = dop_ring + idx*dop_ringlen), sized to BW_DOPPLER_MAX_DIST at the engine rate.
+     * Allocated once at create (control thread); the audio thread writes/reads its voice's slice. */
+    float*   dop_ring;
+    uint32_t dop_ringlen;
 };
 
 /* ---- ring primitives ---- */
@@ -301,6 +322,13 @@ static void eq_coeffs(int type, float cw0, float alpha, float g, float out[5]) {
     out[0] = b0 * inv; out[1] = b1 * inv; out[2] = b2 * inv; out[3] = a1 * inv; out[4] = a2 * inv;
 }
 
+/* (re)start a voice's Doppler delay line clean: clear its ring slice + snap the delay next block, so a
+ * fresh enable or a replay doesn't bleed the previous tail through the line. Audio thread (bounded). */
+static void dop_line_reset(RtCore* c, Voice* v, uint16_t idx) {
+    v->dop_w = 0; v->dop_delay = 0.f; v->dop_init = true;
+    memset(c->dop_ring + (size_t)idx * c->dop_ringlen, 0, (size_t)c->dop_ringlen * sizeof(float));
+}
+
 static void drain_commands(RtCore* c) {
     CmdRing* r = &c->cmds;
     uint32_t rd = atomic_load_explicit(&r->read,  memory_order_relaxed);
@@ -316,6 +344,7 @@ static void drain_commands(RtCore* c) {
             v->active = true; v->gain_user = 1.f; v->dirty = true;
             v->occ_cur = 1.f;                       /* clear (un-occluded) by default */
             v->dir_cur = 1.f;                       /* on-axis/omni by default */
+            v->air_a_cur = 1.f;                     /* air low-pass passthrough by default */
             v->eqg_cur[0] = v->eqg_cur[1] = v->eqg_cur[2] = 1.f;   /* flat EQ (history zeroed by memset) */
             for (int b = 0; b < 3; ++b) v->eq_co[b][0] = 1.f;     /* passthrough coeffs {1,0,0,0,0} */
             /* drop any publish the sim left for the prior occupant of this slot (the stores are
@@ -335,11 +364,19 @@ static void drain_commands(RtCore* c) {
         case CMD_PLAY: { Voice* v = voice_for(c, cmd->handle);
             const SoundData* s = sound_for(c, cmd->u.play.sound);
             if (v && s) { v->sound = s; v->cursor = 0; v->loop = cmd->u.play.loop != 0;
-                          v->oneshot = cmd->u.play.oneshot != 0; v->playing = true; v->dirty = true; } } break;
+                          v->oneshot = cmd->u.play.oneshot != 0; v->playing = true; v->dirty = true;
+                          if (v->dop_on) dop_line_reset(c, v, BW_H_IDX(cmd->handle)); } } break;  /* fresh start: no stale tail */
         case CMD_STOP: { Voice* v = voice_for(c, cmd->handle);
             if (v) v->playing = false; } break;
         case CMD_SET_REFLECTIONS: { Voice* v = voice_for(c, cmd->handle);
             if (v) v->refl_send = cmd->u.refl.on != 0; } break;
+        case CMD_SET_DOPPLER: { Voice* v = voice_for(c, cmd->handle);
+            if (v) {
+                if (cmd->u.dop.on && !v->dop_on) dop_line_reset(c, v, BW_H_IDX(cmd->handle));  /* fresh enable */
+                v->dop_on = cmd->u.dop.on != 0;
+            } } break;
+        case CMD_SET_AIR: { Voice* v = voice_for(c, cmd->handle);
+            if (v) v->air_on = cmd->u.air.on != 0; } break;
         case CMD_TEST_SIGNAL: {
             uint32_t ch = cmd->u.test.channel;
             if (ch < c->channels) { c->test_kind[ch] = cmd->u.test.kind; c->test_gain[ch] = cmd->u.test.gain; }
@@ -466,6 +503,34 @@ static void mix_voice(RtCore* c, Voice* v, uint16_t idx, float* bus, uint32_t n,
         }
     }
 
+    /* propagation (opt-in): a distance-driven air-absorption low-pass + a glided Doppler delay line.
+     * Both ride the block: the air coeff ramps (invariant 4); the Doppler delay glides toward
+     * distance/c and the glide rate IS the pitch shift. Indices stay integer (the ring is masked,
+     * the delay's frac is a separate small float) so a long-lived voice never loses sample precision. */
+    float dist = 0.f;
+    if (v->air_on || v->dop_on) {
+        float dx = v->pos_active[0]-c->lis.p_active[0], dy = v->pos_active[1]-c->lis.p_active[1], dz = v->pos_active[2]-c->lis.p_active[2];
+        dist = sqrtf(dx*dx + dy*dy + dz*dz);
+    }
+    float air_a_tgt = 1.f, air_a_step = 0.f;
+    if (v->air_on) {
+        float fc = BW_AIR_FC_NEAR - dist * BW_AIR_FC_PER_M;
+        if (fc < BW_AIR_FC_FLOOR) fc = BW_AIR_FC_FLOOR;
+        air_a_tgt = 1.f - expf(-6.28318530718f * fc / (float)c->sample_rate);
+        if (air_a_tgt > 1.f) air_a_tgt = 1.f;
+        air_a_step = (air_a_tgt - v->air_a_cur) / (float)n;
+    }
+    float dop_tgt = 0.f, dop_step = 0.f, *dring = NULL; uint32_t dmask = 0;
+    if (v->dop_on && c->dop_ring) {
+        float ds = dist / BW_SPEED_OF_SOUND * (float)c->sample_rate;
+        float maxd = (float)(c->dop_ringlen - 2);          /* keep both interpolation taps in-ring */
+        if (ds > maxd) ds = maxd;
+        dop_tgt = ds;
+        if (v->dop_init) { v->dop_delay = ds; v->dop_init = false; }   /* snap on the first block: no enable glitch */
+        dop_step = (dop_tgt - v->dop_delay) / (float)n;
+        dring = c->dop_ring + (size_t)idx * c->dop_ringlen; dmask = c->dop_ringlen - 1;
+    }
+
     uint32_t cur = v->cursor;
     bool ended = false;
     for (uint32_t i = 0; i < n; ++i) {
@@ -483,7 +548,19 @@ static void mix_voice(RtCore* c, Voice* v, uint16_t idx, float* bus, uint32_t n,
             }
         }
         s *= v->occ_cur * v->dir_cur;                           /* occlusion level + directivity, pre-pan */
-        if (send) aux[i] += s;                                  /* reflection send: post-occ/dir emitted energy */
+        if (send) aux[i] += s;                                  /* reflection send: pre-propagation (reflections travel their own paths) */
+        if (v->air_on) {                                        /* air absorption: distance one-pole LPF (direct path) */
+            v->air_y1 += v->air_a_cur * (s - v->air_y1); s = v->air_y1; v->air_a_cur += air_a_step;
+        }
+        if (dring) {                                            /* Doppler: write, read at the gliding fractional delay */
+            dring[v->dop_w & dmask] = s;
+            uint32_t di = (uint32_t)v->dop_delay;               /* integer delay; (dop_w-di) stays integer (no float index) */
+            float    df = v->dop_delay - (float)di;             /* fractional delay [0,1) */
+            float newer = dring[(v->dop_w - di)     & dmask];   /* di samples ago */
+            float older = dring[(v->dop_w - di - 1) & dmask];   /* di+1 samples ago */
+            s = newer * (1.f - df) + older * df;
+            v->dop_w++; v->dop_delay += dop_step;
+        }
         if (!ended) ++cur;
         v->occ_cur += occ_step;
         v->dir_cur += dir_step;
@@ -495,6 +572,8 @@ static void mix_voice(RtCore* c, Voice* v, uint16_t idx, float* bus, uint32_t n,
     v->cursor = cur;
     v->occ_cur = occ_tgt;                                        /* land exactly (same local) */
     v->dir_cur = dir_tgt;
+    if (v->air_on) v->air_a_cur = air_a_tgt;                     /* land the ramped propagation params */
+    if (v->dop_on) v->dop_delay = dop_tgt;
     if (v->eq_engaged) {
         for (int b = 0; b < 3; ++b) for (int k = 0; k < 5; ++k) v->eq_co[b][k] = co_tgt[b][k];   /* land coeffs */
         if (flat) {                                              /* settled to passthrough: bypass + reset history */
@@ -682,6 +761,18 @@ void rt_source_set_reflections(RtCore* c, uint32_t h, bool on) {
     cmd_push(&c->cmds, &cmd);
 }
 
+void rt_source_set_doppler(RtCore* c, uint32_t h, bool on) {
+    Cmd cmd = { .type = CMD_SET_DOPPLER, .handle = h };
+    cmd.u.dop.on = on ? 1u : 0u;
+    cmd_push(&c->cmds, &cmd);
+}
+
+void rt_source_set_air_absorption(RtCore* c, uint32_t h, bool on) {
+    Cmd cmd = { .type = CMD_SET_AIR, .handle = h };
+    cmd.u.air.on = on ? 1u : 0u;
+    cmd_push(&c->cmds, &cmd);
+}
+
 void rt_test_signal(RtCore* c, uint32_t channel, uint8_t kind, float gain) {
     if (!c) return;
     Cmd cmd = { .type = CMD_TEST_SIGNAL };
@@ -812,8 +903,14 @@ RtCore* rt_create(uint32_t voice_cap, uint32_t sound_cap, uint32_t sample_rate, 
     c->freelist  = (uint32_t*) calloc(voice_cap, sizeof(uint32_t));
     c->sounds    = (SoundSlot*)calloc(sound_cap, sizeof(SoundSlot));
     c->sfreelist = (uint32_t*) calloc(sound_cap, sizeof(uint32_t));
+    {   /* Doppler ring pool: power-of-two ring per voice, sized to BW_DOPPLER_MAX_DIST at this rate */
+        uint32_t need = (uint32_t)(BW_DOPPLER_MAX_DIST / BW_SPEED_OF_SOUND * (float)sample_rate) + 2;
+        uint32_t rl = 1; while (rl < need) rl <<= 1;
+        c->dop_ringlen = rl;
+        c->dop_ring = (float*)calloc((size_t)voice_cap * rl, sizeof(float));
+    }
     if (!c->voices || !c->occ_handle || !c->occ_val || !c->occ_eq || !c->occ_dir || !c->play_pub || !c->aux ||
-        !c->gen || !c->inuse || !c->freelist || !c->sounds || !c->sfreelist) {
+        !c->gen || !c->inuse || !c->freelist || !c->sounds || !c->sfreelist || !c->dop_ring) {
         rt_destroy(c); return NULL;
     }
     const uint64_t eq_flat = eq_pack((float[3]){ 1.f, 1.f, 1.f });
@@ -951,6 +1048,7 @@ void rt_destroy(RtCore* c) {
     free(c->freelist);
     free(c->inuse);
     free(c->gen);
+    free(c->dop_ring);
     free(c->aux);
     free((void*)c->occ_dir);            /* cast drops the _Atomic qualifier for free() */
     free((void*)c->play_pub);
