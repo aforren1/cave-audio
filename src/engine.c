@@ -189,6 +189,11 @@ BwEngine* bw_create(const BwConfig* cfg) {
     /* materials occlusion sim (off-thread); non-fatal — occlusion is just unavailable if it fails */
     e->scene = steam_scene_create(e->rt, e->cfg.sample_rate, e->cfg.block_size, BW_VOICE_CAP);
 #endif
+    /* OWN the path strings: the caller's buffers (e.g. a P/Invoke binding's marshalled UTF-8 temporaries)
+     * may be freed once bw_create returns, but bw_start dereferences hrtf_path later — a shallow pointer
+     * copy would dangle. Copy here, free in bw_destroy. _strdup-fail -> NULL = the documented default. */
+    e->cfg.layout_path = cfg->layout_path ? _strdup(cfg->layout_path) : NULL;
+    e->cfg.hrtf_path   = cfg->hrtf_path   ? _strdup(cfg->hrtf_path)   : NULL;
     return e;
 }
 
@@ -310,6 +315,8 @@ void bw_destroy(BwEngine* e) {
 #endif
     monitor_destroy(e->monitor);
     rt_destroy(e->rt);
+    free((void*)e->cfg.layout_path);                    /* owned copies from bw_create */
+    free((void*)e->cfg.hrtf_path);
     free(e);
 }
 
