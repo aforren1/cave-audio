@@ -112,6 +112,8 @@ namespace CaveAudio
         [DllImport(DLL, CallingConvention = CC)] public static extern void bw_set_panner(IntPtr e, BwPanner panner);
         // Diffuse-bed decoder (load-time): sampling (default) or AllRAD (robust on irregular arrays).
         [DllImport(DLL, CallingConvention = CC)] public static extern void bw_set_bed_decoder(IntPtr e, BwBedDecoder decoder);
+        // Offline panner evaluation (no engine handle): out = nsrc*n gains for a layout/panner; for layout scoring.
+        [DllImport(DLL, CallingConvention = CC)] public static extern uint bw_panner_gains_batch(BwPanner panner, float[] positions, uint n, float[] lis, float[] srcs, uint nsrc, [Out] float[] outGains);
 
         // ---- listener + frame boundary ----
         [DllImport(DLL, CallingConvention = CC)] public static extern void bw_set_listener_pose(IntPtr e, float px, float py, float pz, float qx, float qy, float qz, float qw);

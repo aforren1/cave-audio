@@ -212,6 +212,15 @@ BW_API void     bw_set_panner(BwEngine* e, BwPanner panner);
 typedef enum { BW_DECODE_SAMPLING = 0, BW_DECODE_ALLRAD = 1 } BwBedDecoder;
 BW_API void     bw_set_bed_decoder(BwEngine* e, BwBedDecoder decoder);
 
+/* ---- offline panner evaluation (no engine handle; for layout scoring/optimization in tools) ----
+ * The per-speaker gains the given `panner` produces for `nsrc` source positions heard from one
+ * listener `lis`, over a layout of `n` speaker positions (`positions` = n*3 floats, room space). Writes
+ * out[i*n + s] (nsrc*n floats); returns nsrc. Default DBAP/distance tuning. Shares the SPCAP/VBAP
+ * per-listener cache across the batch (efficient over a grid). Pure — uses the same panner solves the
+ * audio path does, so a tool scores a layout against the ACTUAL panner, not a copy. */
+BW_API uint32_t bw_panner_gains_batch(BwPanner panner, const float* positions, uint32_t n,
+                                      const float lis[3], const float* srcs, uint32_t nsrc, float* out);
+
 /* ---- listener (control thread; skip if track_internal) ---- */
 /* Position in room space. Quaternion is head orientation; used by the binaural
  * monitor only — the array render ignores orientation (real speakers, real ears). */

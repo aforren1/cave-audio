@@ -28,7 +28,8 @@
  * number drop as you move speakers to fill the red patches — that is the layout optimization.
  *
  * Controls (edit): [ ] select speaker (or left-click)   arrows X/Z, R/F Y (SHIFT = fine)
- *           ENTER type "x y z"   PgUp/PgDn gain_db   T tone   N sine/noise   C coverage   V observer   S save   L reload
+ *           ENTER type "x y z"   PgUp/PgDn gain_db   T tone   N sine/noise   C coverage   V observer
+ *           X score the layout for each panner (DBAP/SPCAP/VBAP rE-localization error)   S save   L reload
  * Controls (preview, P toggles): WASD/RF move the source   SPACE auto-orbit/near-far/high-low sweep
  *           B A/B the panner DBAP<->SPCAP live (SPCAP is the fixed-observer sweet-spot panner)
  *           Common: right-drag/wheel camera   ESC quit
@@ -227,28 +228,58 @@ static void build_engine(const char* layout_path) {
     bw_source_set_gain(e, pv_src, 0.0f);          /* silent until preview mode */
 }
 
+/* ---- panner-specific layout scoring (offline, via the engine's real solve) ---- */
+static float score_mean[3], score_worst[3];      /* [DBAP, SPCAP, VBAP] rE localization error (deg) */
+static int   scored, score_stale;
+
+/* mean + worst rE localization error (deg) over the shell, from the panner's observer model: DBAP over
+ * the moving listener grid; SPCAP/VBAP from the fixed centre. Uses bw_panner_gains_batch (the ACTUAL
+ * engine solve), so the score reflects what will ship — not a re-implementation. */
+static void score_panner(BwPanner panner, float* mean_deg, float* worst_deg) {
+    static float gains[NCOV * NSPK], srcs[NCOV * 3];
+    float pos[NSPK * 3];
+    for (int i = 0; i < NSPK; ++i) { pos[i*3] = spk[i].pos.x; pos[i*3+1] = spk[i].pos.y; pos[i*3+2] = spk[i].pos.z; }
+    int NL = (panner == BW_PAN_DBAP) ? 27 : 1;     /* DBAP: moving grid; SPCAP/VBAP: fixed centre */
+    double sumerr = 0; float worst = 0; int cnt = 0;
+    for (int l = 0; l < NL; ++l) {
+        Vector3 Lp = cov_lis[l]; float lisf[3] = { Lp.x, Lp.y, Lp.z };
+        for (int i = 0; i < NCOV; ++i) {
+            srcs[i*3]   = Lp.x + COV_R * cov_dir[i].x;
+            srcs[i*3+1] = Lp.y + COV_R * cov_dir[i].y;
+            srcs[i*3+2] = Lp.z + COV_R * cov_dir[i].z;
+        }
+        bw_panner_gains_batch(panner, pos, NSPK, lisf, srcs, NCOV, gains);
+        for (int i = 0; i < NCOV; ++i) {
+            float* g = &gains[i * NSPK];
+            float rE[3] = { 0, 0, 0 };
+            for (int s = 0; s < NSPK; ++s) {        /* energy-weighted speaker-direction vector (rE) */
+                float w = g[s] * g[s];
+                Vector3 sd = Vector3Normalize(Vector3Subtract(spk[s].pos, Lp));
+                rE[0] += w * sd.x; rE[1] += w * sd.y; rE[2] += w * sd.z;
+            }
+            float rl = sqrtf(rE[0]*rE[0] + rE[1]*rE[1] + rE[2]*rE[2]);
+            if (rl < 1e-9f) continue;
+            float c = (rE[0]*cov_dir[i].x + rE[1]*cov_dir[i].y + rE[2]*cov_dir[i].z) / rl;  /* vs intended dir */
+            if (c > 1.f) c = 1.f; else if (c < -1.f) c = -1.f;
+            float err = acosf(c) * 57.2958f;
+            sumerr += err; if (err > worst) worst = err; ++cnt;
+        }
+    }
+    *mean_deg = cnt ? (float)(sumerr / cnt) : 0.f;
+    *worst_deg = worst;
+}
+
 int main(int argc, char** argv) {
     /* headless: `bw_layout_tool --export [file]` writes the layout (default grid, or an existing file
      * with delay_ms recomputed from positions) and exits — scriptable, no window/audio. */
     int export_only = (argc > 1 && strcmp(argv[1], "--export") == 0);
-    const char* path = export_only ? (argc > 2 ? argv[2] : "cave_layout.json")
-                                    : (argc > 1 ? argv[1] : "cave_layout.json");
+    int score_only  = (argc > 1 && strcmp(argv[1], "--score")  == 0);
+    const char* path = (export_only || score_only) ? (argc > 2 ? argv[2] : "cave_layout.json")
+                                                    : (argc > 1 ? argv[1] : "cave_layout.json");
     seed_default();
     int loaded = load_json(path);
-    if (export_only) {
-        if (!save_json(path)) { printf("export failed: %s\n", path); return 1; }
-        printf("exported layout -> %s (from %s)\n", path, loaded ? "existing file" : "default grid");
-        return 0;
-    }
-    printf("layout: %s (%s, %d speakers)\n", path, loaded ? "loaded" : "default grid", loaded ? loaded : NSPK);
 
-    /* cave profile so the test signal / DBAP preview goes out the 26-ch DVS to the real speakers;
-     * falls back to no audio (editor still works) if no 26-ch ASIO device is present (off-site). */
-    _putenv("BWAUDIO_SINK=asio");
-    gen_pink_wav(PREV_WAV);                        /* the moving DBAP-preview source signal */
-    build_engine(NULL);                           /* edit-mode engine (the test signal is layout-independent) */
-
-    /* coverage shell: even directions on a sphere (Fibonacci) + a working-volume listener grid */
+    /* coverage/scoring shell: even directions on a sphere (Fibonacci) + a working-volume listener grid */
     for (int i = 0; i < NCOV; ++i) {
         float y = 1.0f - 2.0f * ((float)i + 0.5f) / NCOV;
         float r = sqrtf(1.0f - y * y), th = (float)i * 2.39996323f;   /* golden angle */
@@ -258,6 +289,27 @@ int main(int argc, char** argv) {
     { const float ax[3] = { -1.0f, 0.0f, 1.0f }, ay[3] = { -0.3f, 0.0f, 0.3f }; int li = 1;   /* listener-movement envelope */
       for (int xi = 0; xi < 3; ++xi) for (int zi = 0; zi < 3; ++zi) for (int yi = 0; yi < 3; ++yi)
           if (!(ax[xi] == 0 && ay[yi] == 0 && ax[zi] == 0)) cov_lis[li++] = (Vector3){ ax[xi], ay[yi], ax[zi] }; }
+
+    if (export_only) {
+        if (!save_json(path)) { printf("export failed: %s\n", path); return 1; }
+        printf("exported layout -> %s (from %s)\n", path, loaded ? "existing file" : "default grid");
+        return 0;
+    }
+    if (score_only) {                              /* headless: score the layout for each panner + exit */
+        printf("layout: %s (%s)\n", path, loaded ? "loaded" : "default grid");
+        for (int p = 0; p < 3; ++p) {
+            float m, w; score_panner((BwPanner)p, &m, &w);
+            printf("  %-14s rE-localize error:  mean %4.1f deg   worst %4.1f deg\n", panner_names[p], m, w);
+        }
+        return 0;
+    }
+    printf("layout: %s (%s, %d speakers)\n", path, loaded ? "loaded" : "default grid", loaded ? loaded : NSPK);
+
+    /* cave profile so the test signal / DBAP preview goes out the 26-ch DVS to the real speakers;
+     * falls back to no audio (editor still works) if no 26-ch ASIO device is present (off-site). */
+    _putenv("BWAUDIO_SINK=asio");
+    gen_pink_wav(PREV_WAV);                        /* the moving DBAP-preview source signal */
+    build_engine(NULL);                           /* edit-mode engine (the test signal is layout-independent) */
 
     InitWindow(1040, 720, "bwaudio - speaker layout tool");
     SetTargetFPS(60);
@@ -280,7 +332,7 @@ int main(int argc, char** argv) {
             if (IsKeyPressed(KEY_BACKSPACE) && ilen > 0) ibuf[--ilen] = 0;
             if (IsKeyPressed(KEY_ENTER)) {
                 float x, y, z;
-                if (sscanf(ibuf, "%f %f %f", &x, &y, &z) == 3) { spk[sel].pos = (Vector3){ x, y, z }; layout_dirty = 1; }
+                if (sscanf(ibuf, "%f %f %f", &x, &y, &z) == 3) { spk[sel].pos = (Vector3){ x, y, z }; layout_dirty = 1; score_stale = 1; }
                 editing = 0; ilen = 0; ibuf[0] = 0;
             }
             if (IsKeyPressed(KEY_ESCAPE)) { editing = 0; ilen = 0; ibuf[0] = 0; }
@@ -329,9 +381,13 @@ int main(int argc, char** argv) {
             if (IsKeyPressed(KEY_N)) tone_kind = (tone_kind == BW_TEST_SINE) ? BW_TEST_NOISE : BW_TEST_SINE;
             if (IsKeyPressed(KEY_ENTER)) { editing = 1; ilen = 0; ibuf[0] = 0; }
             if (IsKeyPressed(KEY_S)) { save_flash = save_json(path) ? 2.0f : -2.0f; }
-            if (IsKeyPressed(KEY_L)) { load_json(path); layout_dirty = 1; }
+            if (IsKeyPressed(KEY_L)) { load_json(path); layout_dirty = 1; score_stale = 1; }
             if (IsKeyPressed(KEY_C)) coverage_on = !coverage_on;       /* coverage overlay */
             if (IsKeyPressed(KEY_V)) coverage_moving = !coverage_moving;
+            if (IsKeyPressed(KEY_X)) {                                 /* score the layout for each panner */
+                for (int p = 0; p < 3; ++p) score_panner((BwPanner)p, &score_mean[p], &score_worst[p]);
+                scored = 1; score_stale = 0;
+            }
             if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT) && !IsMouseButtonDown(MOUSE_BUTTON_RIGHT)) {  /* click-pick the nearest speaker (not while orbiting) */
                 Ray ray = GetMouseRay(GetMousePosition(), cam);
                 float best = 1e9f; int hit = -1;
@@ -342,7 +398,7 @@ int main(int argc, char** argv) {
                 if (hit >= 0) sel = hit;
             }
             if (IsKeyDown(KEY_LEFT) || IsKeyDown(KEY_RIGHT) || IsKeyDown(KEY_UP) || IsKeyDown(KEY_DOWN) ||
-                IsKeyDown(KEY_R) || IsKeyDown(KEY_F) || IsKeyDown(KEY_PAGE_UP) || IsKeyDown(KEY_PAGE_DOWN)) layout_dirty = 1;
+                IsKeyDown(KEY_R) || IsKeyDown(KEY_F) || IsKeyDown(KEY_PAGE_UP) || IsKeyDown(KEY_PAGE_DOWN)) { layout_dirty = 1; score_stale = 1; }
             if (IsKeyPressed(KEY_P) && !editing) {        /* enter DBAP preview — rebuild so it pans through the edited layout */
                 if (driven >= 0 && e) { bw_test_signal(e, (uint32_t)driven, BW_TEST_OFF, 0.0f); driven = -1; }
                 tone_on = 0; pv_orbit = 0; pv_t = 0.0f;   /* each preview session starts manual, fresh orbit phase */
@@ -464,7 +520,7 @@ int main(int argc, char** argv) {
                                 src_pos.x, src_pos.y, src_pos.z, pv_orbit ? "ON" : "off"),
                      10, 30, 16, (Color){ 240, 160, 120, 255 });
         } else {
-            DrawText("[ ] select (or click)   arrows X/Z  R/F Y (SHIFT fine)   ENTER type x y z   PgUp/Dn gain   T tone  N noise   C coverage  V obs   P preview   S save  L reload",
+            DrawText("[ ] select   arrows X/Z  R/F Y (SHIFT fine)   ENTER type   PgUp/Dn gain   T tone  N noise   C coverage  V obs   X score-panners   P preview   S save  L reload",
                      10, 8, 13, RAYWHITE);
             DrawText(TextFormat("speaker %d / %d  ->  channel %d   pos (%.3f, %.3f, %.3f)   gain %+.1f dB   delay %.3f ms   dist %.3f m",
                                 sel, NSPK, sel, spk[sel].pos.x, spk[sel].pos.y, spk[sel].pos.z, spk[sel].gain_db, seldel, seld),
@@ -489,6 +545,14 @@ int main(int argc, char** argv) {
             DrawText(TextFormat("angular coverage [%s]   worst direction %.0f deg   mean %.0f deg   green=covered  red=gap   (V toggles observer, C hides)",
                                 coverage_moving ? "moving: mean over working volume" : "fixed: centre sweet spot", cov_worst, cov_mean),
                      10, yb, 15, cov_worst > 45.0f ? (Color){ 245, 150, 110, 255 } : (Color){ 150, 225, 160, 255 });
+        }
+        if (scored && !preview) {                        /* panner-specific rE-localization scores (X) */
+            int ys = GetScreenHeight() - (coverage_on ? 52 : 26);
+            DrawRectangle(0, ys - 5, GetScreenWidth(), 31, (Color){ 0, 0, 0, 195 });
+            DrawText(TextFormat("panner rE-err [X]%s   DBAP %.0f/%.0f   SPCAP %.0f/%.0f   VBAP %.0f/%.0f   deg mean/worst (lower = layout suits it)",
+                                score_stale ? " STALE" : "",
+                                score_mean[0], score_worst[0], score_mean[1], score_worst[1], score_mean[2], score_worst[2]),
+                     10, ys, 15, score_stale ? (Color){ 210, 210, 130, 255 } : (Color){ 150, 200, 240, 255 });
         }
         EndDrawing();
     }

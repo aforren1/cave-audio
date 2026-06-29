@@ -9,6 +9,9 @@
 #include "sink.h"
 #include "rt.h"
 #include "layout.h"
+#include "dbap.h"          /* offline panner evaluation (bw_panner_gains_batch) */
+#include "spcap.h"
+#include "vbap.h"
 #include "binaural.h"
 #include "natnet.h"
 #include "steam_decode.h"   /* phonon-free interfaces; impls linked only when BW_HAVE_STEAMAUDIO */
@@ -401,6 +404,35 @@ bool bw_source_is_playing(BwEngine* e, BwSource s)                     { return 
 void bw_test_signal(BwEngine* e, uint32_t channel, BwTestKind kind, float gain) { if (e) rt_test_signal(e->rt, channel, (uint8_t)kind, gain); }
 
 void bw_set_panner(BwEngine* e, BwPanner panner) { if (e) rt_set_panner(e->rt, (int)panner); }
+
+/* Offline: the chosen panner's per-speaker gains for `nsrc` source positions heard from one listener,
+ * over a layout given as `n` speaker positions (3 floats each). Default DBAP/distance tuning. Shares
+ * the SPCAP/VBAP per-listener cache across the batch, so it is efficient for grid evaluation. Writes
+ * out[i*n + s]; returns nsrc. Not engine state — pure, for layout scoring/optimization in tools. */
+uint32_t bw_panner_gains_batch(BwPanner panner, const float* positions, uint32_t n,
+                               const float lis[3], const float* srcs, uint32_t nsrc, float* out) {
+    if (!positions || !lis || !srcs || !out || n == 0 || n > BW_CHANNELS || nsrc == 0) return 0;
+    Layout L = layout_default();                         /* default rolloff_r / distance attenuation */
+    L.count = n;
+    for (uint32_t s = 0; s < n; ++s) {
+        L.speakers[s].pos[0] = positions[s*3+0];
+        L.speakers[s].pos[1] = positions[s*3+1];
+        L.speakers[s].pos[2] = positions[s*3+2];
+        L.speakers[s].gain_lin = 1.0f;
+        L.speakers[s].delay_samples = 0;
+    }
+    SpcapState sp; VbapState vb;
+    if (panner == BW_PAN_SPCAP) spcap_reset(&sp);
+    else if (panner == BW_PAN_VBAP) vbap_reset(&vb);
+    for (uint32_t i = 0; i < nsrc; ++i) {
+        const float* src = &srcs[(size_t)i * 3];
+        float* o = &out[(size_t)i * n];
+        if (panner == BW_PAN_SPCAP)     spcap_gains(&sp, src, lis, &L, 1u, 1.0f, o);  /* cache reused across the batch */
+        else if (panner == BW_PAN_VBAP) vbap_gains(&vb, src, lis, &L, 1u, 1.0f, o);
+        else                            dbap_gains(src, lis, &L, 1.0f, o);
+    }
+    return nsrc;
+}
 void bw_set_bed_decoder(BwEngine* e, BwBedDecoder decoder) { if (e) rt_set_bed_decoder(e->rt, (int)decoder); }
 
 uint32_t bw_get_speakers(BwEngine* e, float* xyz, uint32_t cap) {
