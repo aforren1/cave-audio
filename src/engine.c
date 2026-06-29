@@ -604,6 +604,14 @@ void bw_source_set_reflections(BwEngine* e, BwSource s, bool on) {
     if (e) rt_source_set_reflections(e->rt, s, on);             /* phonon-free; the tap consumes the send */
 }
 
+void bw_source_set_reflection_send(BwEngine* e, BwSource s, float gain) {
+    if (e) rt_source_set_reflection_send(e->rt, s, gain);
+}
+
+void bw_source_set_reflection_distance(BwEngine* e, BwSource s, bool on) {
+    if (e) rt_source_set_reflection_distance(e->rt, s, on);
+}
+
 void bw_source_set_doppler(BwEngine* e, BwSource s, bool on) {
     if (e) rt_source_set_doppler(e->rt, s, on);
 }

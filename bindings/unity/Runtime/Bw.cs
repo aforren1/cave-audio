@@ -97,6 +97,8 @@ namespace CaveAudio
         [DllImport(DLL, CallingConvention = CC)] public static extern void bw_reflections_config(IntPtr e, in BwReflectionConfig cfg);
         [DllImport(DLL, CallingConvention = CC)] public static extern void bw_reflections_set_gain(IntPtr e, float linear);
         [DllImport(DLL, CallingConvention = CC)] public static extern void bw_source_set_reflections(IntPtr e, uint s, [MarshalAs(UnmanagedType.I1)] bool on);
+        [DllImport(DLL, CallingConvention = CC)] public static extern void bw_source_set_reflection_send(IntPtr e, uint s, float gain);
+        [DllImport(DLL, CallingConvention = CC)] public static extern void bw_source_set_reflection_distance(IntPtr e, uint s, [MarshalAs(UnmanagedType.I1)] bool on);
 
         // ---- propagation effects (no SDK needed; opt-in per source, default off) ----
         [DllImport(DLL, CallingConvention = CC)] public static extern void  bw_source_set_doppler(IntPtr e, uint s, [MarshalAs(UnmanagedType.I1)] bool on);

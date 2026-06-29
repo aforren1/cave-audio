@@ -35,6 +35,10 @@
 #define BW_AIR_FC_NEAR   18000.0f     /* air-absorption low-pass cutoff (Hz) at zero distance ... */
 #define BW_AIR_FC_PER_M    650.0f     /* ... falling this many Hz per metre ... */
 #define BW_AIR_FC_FLOOR   1200.0f     /* ... down to this floor */
+/* distance->reverb send: the wet-send factor ramps from NEAR_SEND at NEAR_DIST to 1.0 at FAR_DIST */
+#define BW_REFL_NEAR_DIST  1.0f
+#define BW_REFL_FAR_DIST   6.0f
+#define BW_REFL_NEAR_SEND  0.25f
 
 typedef struct { Cmd slots[RING_CAP]; _Atomic uint32_t write, read; } CmdRing;
 typedef struct { Evt slots[EVT_CAP];  _Atomic uint32_t write, read; } EvtRing;
@@ -53,6 +57,9 @@ typedef struct {
     float    occ_cur;
     float    dir_cur;                        /* directivity ramp (source-radiation gain, pre-pan) */
     bool     refl_send;                      /* opted into the reflection aux send (CMD_SET_REFLECTIONS) */
+    bool     refl_dist;                      /* scale the wet send by distance (far = wetter) */
+    float    refl_gain;                      /* per-voice wet-send level (default 1) */
+    float    refl_g_cur;                     /* ramped effective send gain (audio-thread-only) */
     /* per-band transmission EQ state (audio-thread-only). eqg_cur are the slewed band gains; eq_co
      * are the 3 sections' live coefficients {b0,b1,b2,a1,a2}, INTERPOLATED toward the block's target
      * per sample so the spectral envelope never steps at a block boundary (invariant 4). The 4
@@ -346,6 +353,7 @@ static void drain_commands(RtCore* c) {
             v->occ_cur = 1.f;                       /* clear (un-occluded) by default */
             v->dir_cur = 1.f;                       /* on-axis/omni by default */
             v->air_a_cur = 1.f;                     /* air low-pass passthrough by default */
+            v->refl_gain = 1.f;                     /* full wet-send level by default (gated by refl_send) */
             v->eqg_cur[0] = v->eqg_cur[1] = v->eqg_cur[2] = 1.f;   /* flat EQ (history zeroed by memset) */
             for (int b = 0; b < 3; ++b) v->eq_co[b][0] = 1.f;     /* passthrough coeffs {1,0,0,0,0} */
             /* drop any publish the sim left for the prior occupant of this slot (the stores are
@@ -366,11 +374,16 @@ static void drain_commands(RtCore* c) {
             const SoundData* s = sound_for(c, cmd->u.play.sound);
             if (v && s) { v->sound = s; v->cursor = 0; v->loop = cmd->u.play.loop != 0;
                           v->oneshot = cmd->u.play.oneshot != 0; v->playing = true; v->dirty = true;
-                          if (v->dop_on) dop_line_reset(c, v, BW_H_IDX(cmd->handle)); } } break;  /* fresh start: no stale tail */
+                          v->refl_g_cur = 0.f;                  /* fresh start: ramp the wet send up from 0, no stale burst */
+                          if (v->dop_on) dop_line_reset(c, v, BW_H_IDX(cmd->handle)); } } break;
         case CMD_STOP: { Voice* v = voice_for(c, cmd->handle);
             if (v) v->playing = false; } break;
         case CMD_SET_REFLECTIONS: { Voice* v = voice_for(c, cmd->handle);
             if (v) v->refl_send = cmd->u.refl.on != 0; } break;
+        case CMD_SET_REFL_SEND: { Voice* v = voice_for(c, cmd->handle);
+            if (v) { float g = cmd->u.rsend.gain; v->refl_gain = g < 0.f ? 0.f : g; } } break;
+        case CMD_SET_REFL_DIST: { Voice* v = voice_for(c, cmd->handle);
+            if (v) v->refl_dist = cmd->u.rdist.on != 0; } break;
         case CMD_SET_DOPPLER: { Voice* v = voice_for(c, cmd->handle);
             if (v) {
                 if (cmd->u.dop.on && !v->dop_on) dop_line_reset(c, v, BW_H_IDX(cmd->handle));  /* fresh enable */
@@ -502,7 +515,6 @@ static void compute_gains(RtCore* c, Voice* v) {
  * transient handle. */
 static void mix_voice(RtCore* c, Voice* v, uint16_t idx, float* bus, uint32_t n, float* aux) {
     const SoundData* snd = v->sound;
-    const bool send = aux && v->refl_send;          /* contribute to the reflection aux send? */
     float step[BW_CHANNELS];
     for (uint32_t ch = 0; ch < c->channels; ++ch)
         step[ch] = (v->gtarget[ch] - v->gcur[ch]) / (float)n;
@@ -544,10 +556,23 @@ static void mix_voice(RtCore* c, Voice* v, uint16_t idx, float* bus, uint32_t n,
      * distance/c and the glide rate IS the pitch shift. Indices stay integer (the ring is masked,
      * the delay's frac is a separate small float) so a long-lived voice never loses sample precision. */
     float dist = 0.f;
-    if (v->air_on || v->dop_on) {
+    if (v->air_on || v->dop_on || (v->refl_send && v->refl_dist)) {
         float dx = v->pos_active[0]-c->lis.p_active[0], dy = v->pos_active[1]-c->lis.p_active[1], dz = v->pos_active[2]-c->lis.p_active[2];
         dist = sqrtf(dx*dx + dy*dy + dz*dz);
     }
+    /* reverb wet-send level: refl_gain, optionally scaled by distance (near = drier, far = wetter); ramped
+     * (so motion + on/off don't zipper the send). do_send keeps ramping a just-disabled voice down to 0. */
+    float refl_tgt = 0.f;
+    if (aux && v->refl_send) {
+        refl_tgt = v->refl_gain;
+        if (v->refl_dist) {
+            float t = (dist - BW_REFL_NEAR_DIST) / (BW_REFL_FAR_DIST - BW_REFL_NEAR_DIST);
+            if (t < 0.f) t = 0.f; else if (t > 1.f) t = 1.f;
+            refl_tgt *= BW_REFL_NEAR_SEND + (1.f - BW_REFL_NEAR_SEND) * t;
+        }
+    }
+    const float refl_step = (refl_tgt - v->refl_g_cur) / (float)n;
+    const bool do_send = aux && (v->refl_send || v->refl_g_cur > 1e-6f);
     float air_a_tgt = 1.f, air_a_step = 0.f;
     if (v->air_on) {
         float fc = BW_AIR_FC_NEAR - dist * BW_AIR_FC_PER_M;
@@ -584,7 +609,7 @@ static void mix_voice(RtCore* c, Voice* v, uint16_t idx, float* bus, uint32_t n,
             }
         }
         s *= v->occ_cur * v->dir_cur;                           /* occlusion level + directivity, pre-pan */
-        if (send) aux[i] += s;                                  /* reflection send: pre-propagation (reflections travel their own paths) */
+        if (do_send) { aux[i] += s * v->refl_g_cur; v->refl_g_cur += refl_step; }  /* reverb send: pre-propagation, distance/level-scaled */
         if (v->air_on) {                                        /* air absorption: distance one-pole LPF (direct path) */
             v->air_y1 += v->air_a_cur * (s - v->air_y1); s = v->air_y1; v->air_a_cur += air_a_step;
         }
@@ -610,6 +635,7 @@ static void mix_voice(RtCore* c, Voice* v, uint16_t idx, float* bus, uint32_t n,
     v->dir_cur = dir_tgt;
     if (v->air_on) v->air_a_cur = air_a_tgt;                     /* land the ramped propagation params */
     if (v->dop_on) v->dop_delay = dop_tgt;
+    if (do_send)   v->refl_g_cur = refl_tgt;
     if (v->eq_engaged) {
         for (int b = 0; b < 3; ++b) for (int k = 0; k < 5; ++k) v->eq_co[b][k] = co_tgt[b][k];   /* land coeffs */
         if (flat) {                                              /* settled to passthrough: bypass + reset history */
@@ -794,6 +820,19 @@ void rt_source_set_gain(RtCore* c, uint32_t h, float linear) {
 void rt_source_set_reflections(RtCore* c, uint32_t h, bool on) {
     Cmd cmd = { .type = CMD_SET_REFLECTIONS, .handle = h };
     cmd.u.refl.on = on ? 1u : 0u;
+    cmd_push(&c->cmds, &cmd);
+}
+
+void rt_source_set_reflection_send(RtCore* c, uint32_t h, float gain) {
+    if (!isfinite(gain) || gain < 0.f) return;
+    Cmd cmd = { .type = CMD_SET_REFL_SEND, .handle = h };
+    cmd.u.rsend.gain = gain;
+    cmd_push(&c->cmds, &cmd);
+}
+
+void rt_source_set_reflection_distance(RtCore* c, uint32_t h, bool on) {
+    Cmd cmd = { .type = CMD_SET_REFL_DIST, .handle = h };
+    cmd.u.rdist.on = on ? 1u : 0u;
     cmd_push(&c->cmds, &cmd);
 }
 

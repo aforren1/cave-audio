@@ -438,8 +438,53 @@ int main(void) {
         }
     }
 
+    /* distance->reverb send: the per-source wet send scales with the level, and (in distance mode) with
+     * range. Measured via the aux-send energy the bus tap reports (the bed itself needs the SDK). */
+    {
+        RtCore* cr = rt_create(8, 4, RATE, CH);
+        CHECK(cr != NULL, "rt_create (reverb send)");
+        if (cr) {
+            uint32_t rsnd = rt_load_sound(cr, WAV, err, sizeof err);
+            rt_set_bus_tap(cr, test_tap, NULL);
+            uint32_t hr = rt_source_create(cr);
+            rt_source_play(cr, hr, rsnd, true);
+            rt_source_set_pos(cr, hr, 2.f, 0.f, 0.f);
+            rt_source_set_reflections(cr, hr, true);             /* full send, no distance scaling */
+            g_aux_energy = 0; rt_commit(cr); render2(cr);
+            double aux_full = g_aux_energy;
+            rt_source_set_reflection_send(cr, hr, 0.5f);         /* halve the send level */
+            g_aux_energy = 0; rt_commit(cr); render2(cr);
+            double aux_half = g_aux_energy;
+            CHECK(aux_full > 0 && fabs(aux_half - aux_full * 0.5) < aux_full * 0.05, "reflection_send scales the wet send");
+
+            rt_source_set_reflection_send(cr, hr, 1.0f);
+            rt_source_set_reflection_distance(cr, hr, true);     /* near = drier, far = wetter */
+            rt_source_set_pos(cr, hr, 0.5f, 0.f, 0.f);           /* near (< 1 m -> floor send) */
+            g_aux_energy = 0; rt_commit(cr); render2(cr);
+            double aux_near = g_aux_energy;
+            rt_source_set_pos(cr, hr, 8.f, 0.f, 0.f);            /* far (> 6 m -> full send) */
+            g_aux_energy = 0; rt_commit(cr); render2(cr);
+            double aux_far = g_aux_energy;
+            CHECK(aux_near > 0 && aux_far > aux_near * 2.0, "distance->reverb send: far sends more than near");
+
+            /* replay after disabling reflections must not bleed a stale send burst (refl_g_cur reset on play) */
+            rt_source_set_reflection_distance(cr, hr, false);
+            rt_source_set_pos(cr, hr, 2.f, 0.f, 0.f);
+            rt_commit(cr); render2(cr);                          /* send ramps up to full */
+            rt_source_stop(cr, hr);
+            rt_source_set_reflections(cr, hr, false);            /* disable while stopped */
+            rt_commit(cr);
+            rt_source_play(cr, hr, rsnd, true);                  /* replay -> refl_g_cur reset to 0 */
+            g_aux_energy = -1.0; rt_commit(cr);
+            { BwTimestamp ts = { 0, 0 }; rt_render(cr, bus, N, &ts); }   /* first block after replay */
+            CHECK(g_aux_energy == 0.0, "replay after disabling reflections sends no stale burst");
+            rt_source_destroy(cr, hr); rt_commit(cr);
+            rt_destroy(cr);
+        }
+    }
+
     remove(WAV);
     if (fails) { printf("rt_test: %d FAILURES\n", fails); return 1; }
-    printf("rt_test OK (DBAP, commit, gen-drop, gain, occlusion, EQ, directivity, bed, reflection-tap, channel-test, air+Doppler, spread verified)\n");
+    printf("rt_test OK (DBAP, commit, gen-drop, gain, occlusion, EQ, directivity, bed, reflection-tap, channel-test, air+Doppler, spread, reverb-send verified)\n");
     return 0;
 }

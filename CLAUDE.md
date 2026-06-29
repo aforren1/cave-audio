@@ -120,8 +120,13 @@ set via per-voice atomics (`rt`'s `occ_handle`/`occ_val`/`occ_eq`/`occ_dir`) gat
 thread's own generation; the audio thread applies a 3-biquad transmission EQ (so a wall *muffles*, not
 just attenuates — rate-derived, runs at 96 kHz too), a directivity dipole gain, and the level — all
 ramped per sample. `bw_scene_set_mesh` / `bw_source_set_occlusion` / `bw_source_set_directivity` /
-`bw_source_set_orientation` drive it; the playground wall is a real occluder. The **reflection bed**
-is the remaining materials piece. **Opt-in per-source propagation effects** are implemented (phonon-free,
+`bw_source_set_orientation` drive it; the playground wall is a real occluder. The **reflection bed** is
+implemented (`steam_reflect.c`, same gate): an `IPLSimulator` reflections sim → ambisonic IR → the
+SH→26 decode → bus, registered as the rt bus tap at `bw_start`; the `reflect` test proves it's
+*directional*. Sources opt in via `bw_source_set_reflections`, with a per-source wet-send level
+(`bw_source_set_reflection_send`) and an optional **distance→wet** scaling (`bw_source_set_reflection_distance`,
+near = drier / far = wetter; the send gain is distance-derived in `rt.c` and ramped). **Opt-in per-source
+propagation effects** are implemented (phonon-free,
 pure `rt.c` DSP, default off): **Doppler** (`bw_source_set_doppler`) renders each voice through a
 per-voice fractional delay ring (`RtCore.dop_ring`, one power-of-two ring per voice, allocated at
 create) whose delay glides toward `distance/c` — the glide rate is the pitch shift, saturating past

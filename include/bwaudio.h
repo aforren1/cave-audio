@@ -157,6 +157,12 @@ BW_API void     bw_reflections_set_gain(BwEngine* e, float linear);
 /* Opt a source into the shared bed's wet send (per-frame-safe, enqueue-only). With the bed disabled
  * or no SDK, this just gates a send that goes nowhere. */
 BW_API void     bw_source_set_reflections(BwEngine* e, BwSource s, bool on);
+/* Per-source wet-send LEVEL (default 1.0; 0 = none). Scales how much of this source feeds the shared
+ * reverb bed — drive it yourself for a manual dry/wet, or use the distance mode below. Per-frame-safe. */
+BW_API void     bw_source_set_reflection_send(BwEngine* e, BwSource s, float gain);
+/* Distance->wet: when on, the engine scales this source's send by its distance to the listener (near =
+ * drier, far = wetter), on top of the level above. Off by default (constant send). Per-frame-safe. */
+BW_API void     bw_source_set_reflection_distance(BwEngine* e, BwSource s, bool on);
 /* Read the source's current occlusion factor (1 = clear .. 0 = fully blocked) — for HUD/diagnostics. */
 BW_API float    bw_source_get_occlusion(BwEngine* e, BwSource s);
 

@@ -341,6 +341,8 @@ typedef struct { float ir_seconds; uint32_t order, num_rays, num_bounces; int en
 void bw_reflections_config   (BwEngine* e, const BwReflectionConfig* cfg);  // LOAD-TIME (before bw_start)
 void bw_reflections_set_gain (BwEngine* e, float linear);                   // per-frame; live wet level
 void bw_source_set_reflections(BwEngine* e, BwSource s, bool on);           // per-frame; gates the wet send
+void bw_source_set_reflection_send(BwEngine* e, BwSource s, float gain);    // per-source wet-send level (default 1)
+void bw_source_set_reflection_distance(BwEngine* e, BwSource s, bool on);   // far = wetter
 ```
 
 A single shared **listener-centric reverb bed** decoded straight to the 26 channels and summed onto
@@ -349,7 +351,11 @@ the bus. `bw_reflections_config` is **load-time** (the IR length + ambisonic ord
 16, `wet_gain` 1.0), `enabled = 0` means no bed is created and the engine behaves exactly as without
 it. `bw_reflections_set_gain` adjusts the wet level live (a single atomic the audio-thread tap reads).
 `bw_source_set_reflections` is the per-frame, non-blocking opt-in of a source into the bed's wet send
-(with the bed disabled or no SDK, it gates a send that goes nowhere). The bed runs Steam Audio's
+(with the bed disabled or no SDK, it gates a send that goes nowhere). Per source, the send level is
+`bw_source_set_reflection_send` (default 1.0 — drive it for a manual dry/wet), and
+`bw_source_set_reflection_distance` enables an automatic **distance→wet** scaling (near = drier, far =
+wetter, on top of the level). The effective send is computed + **ramped on the audio thread** (in
+`rt.c`, from the source↔listener distance), so motion and on/off don't zipper the send. The bed runs Steam Audio's
 **HYBRID** reverb — **directional** early-reflection convolution (full ambisonic, order = `order`) +
 parametric (FDN) tail, decoded across the 26 speakers (requires the vendored phonon's alignment patch;
 see [materials.md](.\materials.md)). No-op without the Steam Audio build.
