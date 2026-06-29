@@ -57,6 +57,7 @@ typedef struct RtCore RtCore;   /* opaque */
 RtCore* rt_create(uint32_t voice_cap, uint32_t sound_cap, uint32_t sample_rate, uint32_t channels);
 void    rt_destroy(RtCore* c);
 void    rt_set_layout(RtCore* c, const Layout* L);   /* call before bw_start / while stopped */
+void    rt_set_panner(RtCore* c, int panner);        /* 0 = DBAP, 1 = SPCAP; call before bw_start */
 
 /* Attach the internal tracker's pose slot (track_internal). When set, rt_render samples the
  * freshest head pose from it at block time, overriding the committed listener. NULL detaches.

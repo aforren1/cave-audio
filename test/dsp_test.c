@@ -8,6 +8,7 @@
  */
 #include "layout.h"
 #include "dbap.h"
+#include "spcap.h"
 #include "align.h"
 
 #include <math.h>
@@ -183,8 +184,29 @@ int main(void) {
         if (!found) printf("note: examples/cave_layout.json not found from CWD; integration check skipped\n");
     }
 
+    /* 9. SPCAP panner: localization, constant power, multi-speaker spread, non-negative gains */
+    {
+        SpcapState sp; spcap_reset(&sp);
+        float lis[3] = { 0, 0, 0 }, g[CH];
+        int loc_ok = 1, nonneg = 1;
+        for (int k = 0; k < CH; ++k) {
+            spcap_gains(&sp, LD.speakers[k].pos, lis, &LD, 1u, 1.0f, g);   /* source at speaker k's bearing */
+            if (argmax(g, CH) != k) loc_ok = 0;
+            for (int i = 0; i < CH; ++i) if (g[i] < -1e-6f) nonneg = 0;
+        }
+        CHECK(loc_ok, "SPCAP localizes a source at each speaker to that channel");
+        CHECK(nonneg, "SPCAP gains are non-negative");
+
+        float src[3] = { 0.5f, 0.f, 0.5f }, gain = 0.8f;
+        spcap_gains(&sp, src, lis, &LD, 1u, gain, g);
+        double p = 0; int active = 0;
+        for (int k = 0; k < CH; ++k) { p += (double)g[k] * g[k]; if (g[k] > 0.05f * gain) ++active; }
+        CHECK(fabs(sqrt(p) - gain) < 0.02, "SPCAP is constant-power (||g|| ~ user_gain)");
+        CHECK(active >= 3 && active <= 20, "SPCAP spreads across several speakers (not 1, not all)");
+    }
+
     remove(LJ);
     if (fails) { printf("dsp_test: %d FAILURES\n", fails); return 1; }
-    printf("dsp_test OK (layout parse, DBAP localize/power/split/listener-move, align gain+delay)\n");
+    printf("dsp_test OK (layout parse, DBAP + SPCAP localize/power/spread, align gain+delay)\n");
     return 0;
 }

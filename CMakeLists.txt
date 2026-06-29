@@ -51,6 +51,7 @@ add_library(bw_core OBJECT
   src/sound.c
   src/layout.c
   src/dbap.c
+  src/spcap.c
   src/align.c
   src/binaural.c
   src/ambisonics.c

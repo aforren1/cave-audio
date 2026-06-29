@@ -272,6 +272,23 @@ it to "place" a sound. Per-frame-safe, takes effect next block, no `bw_commit` n
 channels at once; `gain 0` / `BW_TEST_OFF` silences one. Works in every profile (cave/both: a raw tone
 on that DVS channel; binaural: that bus channel HRTF'd as its virtual speaker). Needs no SDK.
 
+## Panner & layout query (control thread)
+
+```c
+typedef enum { BW_PAN_DBAP = 0, BW_PAN_SPCAP = 1 } BwPanner;
+void     bw_set_panner(BwEngine* e, BwPanner panner);            // load-time (between create and start)
+uint32_t bw_get_speakers(BwEngine* e, float* xyz, uint32_t cap); // read back the layout; NULL xyz = count only
+```
+
+`bw_set_panner` chooses the per-source panner behind the 26-ch bus. **DBAP** (default) is
+listener-relative, recomputed per frame from the tracked pose — for a **moving** observer roaming the
+array. **SPCAP** is a smooth, all-speaker, placement-correcting sweet-spot panner for a **fixed**
+observer (a static listener: don't track, set the sweet spot once); it conserves loudspeaker power
+across an uneven array. Load-time. Neither affects the diffuse bed / ambisonic paths. See
+[`spatialization.md`](./spatialization.md). `bw_get_speakers` returns the effective layout (the default
+grid or the `layout_path` file) as `cap*3` floats in channel order + the count (26) — for visualizing
+or auditioning the geometry the engine actually pans with.
+
 ## Reflection bed (control thread)
 
 ```c

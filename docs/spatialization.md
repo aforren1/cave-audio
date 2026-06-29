@@ -23,12 +23,17 @@ the array origin.
 > position. The layout tool's coverage overlay scores this case directly (its `V` key picks
 > fixed-centre vs moving-volume), so a layout can be optimized for the observer model the install uses.
 >
-> For best-in-class fixed-observer quality, the upgrade is a sweet-spot, placement-correcting panner:
-> **SPCAP** (speaker-placement correction amplitude panning) conserves loudspeaker power across an
-> uneven array *at the sweet spot*, which DBAP does not. The panner is a swappable module behind the
-> bus seam (`dbap.c` → the 26-ch bus), so adding SPCAP as a selectable mode alongside DBAP is a
-> contained change that touches neither the bus seam nor its consumers — a real option to prioritize
-> for fixed-observer deployments, not a someday-maybe.
+> For best-in-class fixed-observer quality, **SPCAP** (speaker-placement correction amplitude panning)
+> is **implemented as a selectable panner** — `bw_set_panner(e, BW_PAN_SPCAP)` at load time (`spcap.c`,
+> next to `dbap.c` behind the bus seam, touching neither the seam nor its consumers). It weights every
+> speaker by a smooth lobe `((1+cos)/2)^focus` toward the source's bearing from the listener, scaled by
+> a per-speaker **placement correction** `1/local-density` so a *cluster* of speakers doesn't pull the
+> image toward it, then normalises for constant power (with the same distance attenuation as DBAP). The
+> correction is cached and rebuilt only when the listener or layout changes, so the per-voice solve
+> stays alloc/lock-free. **Pick DBAP for a moving observer, SPCAP for a fixed one**; the layout tool's
+> `V` key scores a layout for either model. (VBAP was considered and rejected: it needs a triangulation
+> subsystem, has a direction-dependent source-width artifact, and is brittle on the irregular surveyed
+> array — SPCAP is the better fit for a swappable, robust panner. See the DBAP-vs-VBAP note above.)
 
 Ambisonics is still the right tool for the **diffuse layer** (ambient beds,
 reflections/reverb), where energy isn't sweet-spot-sensitive and a fixed decode is
