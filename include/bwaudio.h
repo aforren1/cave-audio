@@ -88,6 +88,10 @@ BW_API void     bw_source_set_pos(BwEngine* e, BwSource s, float x, float y, flo
 BW_API void     bw_source_set_gain(BwEngine* e, BwSource s, float linear);
 BW_API void     bw_source_play(BwEngine* e, BwSource s, BwSound snd, bool loop);
 BW_API void     bw_source_stop(BwEngine* e, BwSource s);
+/* Is the source's voice still producing audio? Control-thread poll (latest-wins readback): true while
+ * a sound plays, false once a non-loop sound finishes, after stop, or for a stale/destroyed handle.
+ * Best-effort — a sound shorter than the caller's poll interval may never be observed as playing. */
+BW_API bool     bw_source_is_playing(BwEngine* e, BwSource s);
 BW_API void     bw_play_oneshot(BwEngine* e, BwSound snd, float x, float y, float z, float gain);
 
 /* ---- ambisonic beds (control thread; a world-locked soundfield decoded straight to the 26 speakers,

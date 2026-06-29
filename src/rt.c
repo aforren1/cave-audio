@@ -79,6 +79,11 @@ struct RtCore {
     _Atomic float*    occ_val;              /* published broadband level (1 = clear) */
     _Atomic uint64_t* occ_eq;               /* published 3-band transmission tilt (3x16-bit, gated by occ_handle) */
     _Atomic float*    occ_dir;              /* published directivity gain (1 = on-axis/omni, gated by occ_handle) */
+
+    /* per-slot playback state for control-thread readback (rt_source_is_playing): packed
+     * (gen<<1 | playing-bit), republished by the audio thread each block. The gen guards a stale
+     * or recycled handle (a mismatched gen reads as not-playing). */
+    _Atomic uint32_t* play_pub;
     struct { float cw0, alpha; int type; } eq_proto[3];   /* per-band biquad prototypes, rate-derived at create */
 
     /* control-thread-owned voice handle allocation */
@@ -547,6 +552,11 @@ void rt_render(RtCore* c, float* bus, uint32_t nframes, const BwTimestamp* ts) {
         if (v->sound->channels > 1) mix_bed  (c, v, (uint16_t)i, bus, nframes);        /* ambisonic bed */
         else                        mix_voice(c, v, (uint16_t)i, bus, nframes, aux);   /* mono point source */
     }
+    for (uint32_t i = 0; i < c->voice_cap; ++i) {   /* publish playback state for rt_source_is_playing (control thread) */
+        const Voice* v = &c->voices[i];
+        uint32_t st = ((uint32_t)v->gen << 1) | ((v->active && v->playing && v->sound) ? 1u : 0u);
+        atomic_store_explicit(&c->play_pub[i], st, memory_order_release);
+    }
     if (aux)   /* reflection bed: convolve the aux send + sum onto the bus BEFORE align (so it gets trim+delay too) */
         c->bus_tap(c->bus_tap_ud, bus, nframes, c->lis.p_active, c->lis.q_active, aux);
     align_process(c->aligner, bus, nframes);   /* per-speaker gain trim + delay (output stage) */
@@ -559,6 +569,18 @@ void rt_read_pose(RtCore* c, float p[3], float q[4]) {
         memcpy(p, c->lis.p_active, sizeof(float) * 3);
         memcpy(q, c->lis.q_active, sizeof(float) * 4);
     }
+}
+
+/* Control-thread readback: is the source's voice still producing audio? Reads the per-slot state the
+ * audio thread republishes each block, gated on the handle's generation (a stale/recycled handle, or
+ * a finished non-loop voice, reads as not-playing). Best-effort: a sound shorter than a poll interval
+ * may never be observed playing. */
+bool rt_source_is_playing(RtCore* c, uint32_t h) {
+    if (!c || h == 0) return false;
+    uint32_t idx = BW_H_IDX(h);
+    if (idx >= c->voice_cap) return false;
+    uint32_t st = atomic_load_explicit(&c->play_pub[idx], memory_order_acquire);
+    return ((st >> 1) == BW_H_GEN(h)) && (st & 1u) != 0u;
 }
 
 /* Active listener pose, for the binaural monitor. Audio thread only (same thread as
@@ -724,13 +746,14 @@ RtCore* rt_create(uint32_t voice_cap, uint32_t sound_cap, uint32_t sample_rate, 
     c->occ_val    = (_Atomic float*)   calloc(voice_cap, sizeof(_Atomic float));
     c->occ_eq     = (_Atomic uint64_t*)calloc(voice_cap, sizeof(_Atomic uint64_t));
     c->occ_dir    = (_Atomic float*)   calloc(voice_cap, sizeof(_Atomic float));
+    c->play_pub   = (_Atomic uint32_t*)calloc(voice_cap, sizeof(_Atomic uint32_t));
     c->aux        = (float*)   calloc(BW_RT_MAX_BLOCK, sizeof(float));   /* reflection aux-send scratch */
     c->gen       = (uint16_t*) calloc(voice_cap, sizeof(uint16_t));
     c->inuse     = (uint8_t*)  calloc(voice_cap, sizeof(uint8_t));
     c->freelist  = (uint32_t*) calloc(voice_cap, sizeof(uint32_t));
     c->sounds    = (SoundSlot*)calloc(sound_cap, sizeof(SoundSlot));
     c->sfreelist = (uint32_t*) calloc(sound_cap, sizeof(uint32_t));
-    if (!c->voices || !c->occ_handle || !c->occ_val || !c->occ_eq || !c->occ_dir || !c->aux ||
+    if (!c->voices || !c->occ_handle || !c->occ_val || !c->occ_eq || !c->occ_dir || !c->play_pub || !c->aux ||
         !c->gen || !c->inuse || !c->freelist || !c->sounds || !c->sfreelist) {
         rt_destroy(c); return NULL;
     }
@@ -854,6 +877,7 @@ void rt_destroy(RtCore* c) {
     free(c->gen);
     free(c->aux);
     free((void*)c->occ_dir);            /* cast drops the _Atomic qualifier for free() */
+    free((void*)c->play_pub);
     free((void*)c->occ_eq);
     free((void*)c->occ_val);
     free((void*)c->occ_handle);

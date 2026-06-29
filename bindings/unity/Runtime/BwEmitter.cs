@@ -3,6 +3,7 @@
 // push. Audio files live under StreamingAssets and are decoded by the engine (not Unity's AudioClip).
 using System;
 using UnityEngine;
+using UnityEngine.Events;
 
 namespace CaveAudio
 {
@@ -20,9 +21,17 @@ namespace CaveAudio
         public BwDirectivity directivity = BwDirectivity.Omni;
         [Range(1f, 8f)] public float directivityPower = 1f;  // sharpness of the lobe (cardioid/figure-8)
 
+        [Header("Events")]
+        [Tooltip("Fires when the source stops producing audio — a non-looping clip finished, or Stop().")]
+        public UnityEvent onFinished = new UnityEvent();
+
         uint _src;
         bool _created;
+        bool _wasPlaying;     // for the play->stop edge that drives onFinished
         IntPtr Eng => BwAudio.Instance ? BwAudio.Instance.Handle : IntPtr.Zero;
+
+        /// <summary>Is this source still producing audio? (AudioSource.isPlaying equivalent.)</summary>
+        public bool IsPlaying => _created && Eng != IntPtr.Zero && Bw.bw_source_is_playing(Eng, _src);
 
         void OnEnable()
         {
@@ -62,6 +71,11 @@ namespace CaveAudio
                 var q = Room.Rot(transform.rotation);            // the source's forward axis drives the lobe
                 Bw.bw_source_set_orientation(Eng, _src, q.x, q.y, q.z, q.w);
             }
+
+            // playback edge -> onFinished (poll the engine's per-source playing state)
+            bool now = Bw.bw_source_is_playing(Eng, _src);
+            if (now) _wasPlaying = true;
+            else if (_wasPlaying) { _wasPlaying = false; onFinished.Invoke(); }
         }
 
         /// <summary>Play `clip` (or an override), loading it on demand — AudioSource.Play equivalent.</summary>

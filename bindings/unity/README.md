@@ -19,7 +19,9 @@ You **turn Unity's built-in audio off** (see below) and use these instead. It ma
 | `AudioSource.Play()` / `Stop()` | `BwEmitter.Play()` / `Stop()` |
 | `AudioSource.PlayOneShot()` | `BwEmitter.PlayOneShot()` |
 | `AudioSource.volume` | `BwEmitter.Gain` |
+| `AudioSource.isPlaying` | `BwEmitter.IsPlaying` (+ an `onFinished` UnityEvent) |
 | `spatialBlend = 1` (3D) | always 3D — listener-relative DBAP across the 26 speakers |
+| ambient / 2D music | `BwAmbisonicBed` — a world-locked AmbiX soundfield decoded to all 26 speakers |
 | Audio Reverb Zone | the shared **reflection bed** (`BwAudio` reflections + acoustic geometry) |
 | occlusion (3rd-party) | `BwEmitter.occlusion`, ray-traced against the acoustic geometry |
 | output device / AudioMixer | the engine (ASIO/Dante 26-ch + binaural monitor); Unity's audio output is disabled |

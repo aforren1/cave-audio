@@ -95,8 +95,15 @@ void     bw_source_set_pos (BwEngine* e, BwSource s, float x, float y, float z);
 void     bw_source_set_gain(BwEngine* e, BwSource s, float linear);
 void     bw_source_play (BwEngine* e, BwSource s, BwSound snd, bool loop);
 void     bw_source_stop (BwEngine* e, BwSource s);
+bool     bw_source_is_playing(BwEngine* e, BwSource s);  // control-thread poll; see below
 void     bw_play_oneshot(BwEngine* e, BwSound snd, float x, float y, float z, float gain);
 ```
+
+`bw_source_is_playing` is a **latest-wins readback** (like `bw_get_listener_pose`): the audio thread
+republishes each source's playing state every block, gated on the handle's generation. It reads
+`true` while a sound plays, `false` once a non-loop sound finishes, after `stop`, or for a
+stale/destroyed handle. Poll it once per frame to drive an "on finished" signal; it is best-effort
+(a sound shorter than the poll interval may never be observed as playing).
 
 Positions are in **room space, right-handed** — the engine binding converts from its
 own coordinate system at the boundary (see integration.md). `bw_play_oneshot` is the

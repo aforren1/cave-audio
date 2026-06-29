@@ -68,6 +68,7 @@ namespace CaveAudio
         [DllImport(DLL, CallingConvention = CC)] public static extern void bw_source_set_gain(IntPtr e, uint s, float linear);
         [DllImport(DLL, CallingConvention = CC)] public static extern void bw_source_play(IntPtr e, uint s, uint snd, [MarshalAs(UnmanagedType.I1)] bool loop);
         [DllImport(DLL, CallingConvention = CC)] public static extern void bw_source_stop(IntPtr e, uint s);
+        [DllImport(DLL, CallingConvention = CC)] [return: MarshalAs(UnmanagedType.I1)] public static extern bool bw_source_is_playing(IntPtr e, uint s);
         [DllImport(DLL, CallingConvention = CC)] public static extern void bw_play_oneshot(IntPtr e, uint snd, float x, float y, float z, float gain);
 
         // ---- ambisonic beds (world-locked diffuse soundfields) ----

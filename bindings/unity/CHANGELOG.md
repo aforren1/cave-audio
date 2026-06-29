@@ -25,3 +25,7 @@ Initial Unity binding (M7).
   `.wav`/`.flac`/`.mp3` files under StreamingAssets (with a browse button and a missing-file flag)
   instead of a hand-typed path. `BwEmitter` gains AudioSource-style `Play()`/`Stop()`/`Gain`. README
   has a "Replacing Unity audio" mapping table.
+- `BwAmbisonicBed` — world-locked AmbiX soundfield component (wraps `bw_bed_*`): play/stop/gain for
+  diffuse ambience/music, decoded straight to all 26 speakers.
+- `BwEmitter.IsPlaying` + an `onFinished` UnityEvent, backed by a new engine ABI call
+  `bw_source_is_playing` (latest-wins per-source playback readback).
