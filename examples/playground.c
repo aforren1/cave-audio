@@ -7,17 +7,22 @@
  * by-ear evaluation the automated tests can't do. Uses only the public C ABI (bwaudio.h);
  * raylib's raymath provides the vector/quaternion math.
  *
- * A wall demonstrates two acoustic situations: move the source in FRONT of it to hear a specular
- * reflection (a mirror-image source — a second DBAP voice; no delay/material yet, materials.md), or
- * BEHIND it for OCCLUSION — REAL Steam Audio occlusion: the engine's off-thread sim ray-traces the
- * wall blocking the line to the listener and attenuates the source (the HUD shows the live factor).
- * Occlusion needs the Steam Audio build; without it bw_source_set_occlusion is a no-op (no blocking).
+ * A wall demonstrates the materials path: move the source in FRONT of it for a crude specular
+ * reflection (a mirror-image source — a second DBAP voice; the directional reverb BED is a separate,
+ * static-scene feature, see reflsmoke / docs/materials.md), or BEHIND it for OCCLUSION — REAL Steam
+ * Audio occlusion: the off-thread sim ray-traces the wall blocking the line to the listener and
+ * attenuates + spectrally tilts the source by the wall MATERIAL (the HUD shows the live factor).
+ * Press M to cycle the wall material (concrete/glass/carpet/wood/metal) — glass blocks less,
+ * carpet/wood muffle, metal blocks highs, concrete blocks hard. Press Z to cycle the source DIRECTIVITY (omni/cardioid/
+ * figure-8) and aim it with , / . — the listener hears it attenuate off-axis. (Geometry is dynamic
+ * here because the reverb bed is off; with the bed running the scene is locked.) Needs the Steam
+ * Audio build; without it occlusion/materials/directivity are no-ops.
  *
  * Keys 1-4 switch the localization test signal (pink noise / pink bursts / click train / 1 kHz
  * tone) — broadband + sharp onsets localise best; the tone is there to feel the ambiguity.
  *
- * Controls: WASD/RF move source, Q/E turn head, [ ] slide wall, 1-4 signal, T reflection,
- *           G occlusion, right-drag orbit, wheel zoom, ESC quit.
+ * Controls: WASD/RF move source, Q/E turn head, , / . aim source, [ ] slide wall, M material,
+ *           Z directivity, 1-4 signal, T reflection, G occlusion, right-drag orbit, wheel zoom, ESC.
  * Build: cmake -S . -B build -DBWAUDIO_BUILD_PLAYGROUND=ON && cmake --build build
  */
 #include "bwaudio.h"
@@ -140,17 +145,18 @@ static void draw_wall(Vector3 c, Vector3 u, Vector3 v, float hw, float hh, Color
     DrawLine3D(a, b, line); DrawLine3D(b, d, line); DrawLine3D(d, ee, line); DrawLine3D(ee, a, line);
 }
 
-/* register the wall quad as the occluding scene geometry (one concrete-ish material) */
-static void push_wall_mesh(BwEngine* e, Vector3 c, Vector3 u, Vector3 v, float hw, float hh) {
+/* register the wall quad as occluding scene geometry with a chosen material token (cycle with M).
+ * Safe to call at runtime here because the reflection bed isn't enabled (occlusion geometry is
+ * dynamic; it locks only while the reverb bed runs — see docs/materials.md). */
+static void push_wall_mesh(BwEngine* e, Vector3 c, Vector3 u, Vector3 v, float hw, float hh, BwMaterial mat) {
     Vector3 a  = Vector3Add(Vector3Add(c, Vector3Scale(u, -hw)), Vector3Scale(v, -hh));
     Vector3 b  = Vector3Add(Vector3Add(c, Vector3Scale(u,  hw)), Vector3Scale(v, -hh));
     Vector3 d  = Vector3Add(Vector3Add(c, Vector3Scale(u,  hw)), Vector3Scale(v,  hh));
     Vector3 ee = Vector3Add(Vector3Add(c, Vector3Scale(u, -hw)), Vector3Scale(v,  hh));
     float verts[12] = { a.x, a.y, a.z,  b.x, b.y, b.z,  d.x, d.y, d.z,  ee.x, ee.y, ee.z };
     int   tris[6]   = { 0, 1, 2,  0, 2, 3 };
-    float absorption[3]   = { 0.1f, 0.1f, 0.1f };
-    float transmission[3] = { 0.05f, 0.05f, 0.05f };          /* concrete-ish: blocks most */
-    bw_scene_set_mesh(e, verts, 4, tris, 2, absorption, 0.5f, transmission);
+    BwMaterial tri_mat[2] = { mat, mat };
+    bw_scene_set_mesh_mat(e, verts, 4, tris, 2, tri_mat);
 }
 
 int main(void) {
@@ -183,6 +189,22 @@ int main(void) {
     for (int i = 0; i < NSIG; ++i) sounds[i] = bw_load_sound(e, sig_files[i]);
     int cur_sig = 0;
 
+    /* wall material palette (cycle with M): demonstrates bw_material_preset + per-triangle
+     * bw_scene_set_mesh_mat. Each changes the occlusion's level + spectral tilt audibly — glass
+     * transmits more (less blocked), carpet/wood pass low + muffle highs, metal passes bass but
+     * blocks highs, concrete blocks hard. (All are real entries in the engine's preset table.) */
+    const char* mat_names[] = { "concrete", "glass", "carpet", "wood", "metal" };
+    enum { NMAT = 5 };
+    BwMaterial mats[NMAT];
+    for (int i = 0; i < NMAT; ++i) mats[i] = bw_material_preset(e, mat_names[i]);
+    int cur_mat = 0;
+
+    /* source directivity (cycle pattern with Z; aim the source with , and .): omni / cardioid /
+     * figure-8. The listener hears the source attenuated as it is aimed away. */
+    const char* dir_names[] = { "omni", "cardioid", "figure-8" };
+    int   cur_dir = 0;
+    float source_yaw = 0.0f;   /* radians about +y; the source's forward is -z rotated by this */
+
     BwSource src = bw_source_create(e);
     bw_source_set_gain(e, src, SRC_GAIN);
     bw_source_play(e, src, sounds[cur_sig], true);
@@ -209,7 +231,7 @@ int main(void) {
 
     /* register the wall as REAL occluding geometry and enable occlusion on the direct source
      * (the engine's Steam Audio sim attenuates it when the wall blocks the line to the listener) */
-    push_wall_mesh(e, wall_c, wall_u, wall_v, wall_hw, wall_hh);
+    push_wall_mesh(e, wall_c, wall_u, wall_v, wall_hw, wall_hh, mats[cur_mat]);
     bw_source_set_occlusion(e, src, true);
 
     InitWindow(1000, 700, "bwaudio - binaural playground");
@@ -231,8 +253,18 @@ int main(void) {
         if (IsKeyDown(KEY_E)) head_yaw -= rt;
         if (IsKeyDown(KEY_LEFT_BRACKET) || IsKeyDown(KEY_RIGHT_BRACKET)) {
             wall_c = Vector3Add(wall_c, Vector3Scale(wall_n, IsKeyDown(KEY_LEFT_BRACKET) ? -mv : mv));
-            push_wall_mesh(e, wall_c, wall_u, wall_v, wall_hw, wall_hh);   /* update the occluder (sim throttles) */
+            push_wall_mesh(e, wall_c, wall_u, wall_v, wall_hw, wall_hh, mats[cur_mat]); /* update the occluder (sim throttles) */
         }
+        if (IsKeyPressed(KEY_M)) {                            /* cycle the wall material -> occlusion changes */
+            cur_mat = (cur_mat + 1) % NMAT;
+            push_wall_mesh(e, wall_c, wall_u, wall_v, wall_hw, wall_hh, mats[cur_mat]);
+        }
+        if (IsKeyPressed(KEY_Z)) {                            /* cycle source directivity pattern */
+            cur_dir = (cur_dir + 1) % 3;
+            bw_source_set_directivity_preset(e, src, (BwDirectivity)cur_dir);
+        }
+        if (IsKeyDown(KEY_COMMA))  source_yaw += rt;          /* aim the source (for directivity) */
+        if (IsKeyDown(KEY_PERIOD)) source_yaw -= rt;
         if (IsKeyPressed(KEY_T)) refl_audible = !refl_audible;
         if (IsKeyPressed(KEY_G)) { occ_audible = !occ_audible; bw_source_set_occlusion(e, src, occ_audible); }
         for (int i = 0; i < NSIG; ++i)                       /* 1-4: switch the test signal */
@@ -273,14 +305,17 @@ int main(void) {
         if (same_side && seg_plane(L, image, wall_c, wall_n, &t, &hit) && t > 0 && t < 1 &&
             in_panel(hit, wall_c, wall_u, wall_v, wall_hw, wall_hh)) { refl_valid = 1; refl_pt = hit; }
 
+        Quaternion sq = QuaternionFromAxisAngle((Vector3){ 0, 1, 0 }, source_yaw);
         bw_source_set_pos(e, src, source_pos.x, source_pos.y, source_pos.z);
         bw_source_set_gain(e, src, SRC_GAIN);                 /* occlusion is now applied by the engine */
+        bw_source_set_orientation(e, src, sq.x, sq.y, sq.z, sq.w);   /* directivity uses the source's forward */
         bw_source_set_pos(e, refl, image.x, image.y, image.z);
         bw_source_set_gain(e, refl, (refl_audible && refl_valid) ? SRC_GAIN * REFL_GAIN : 0.0f);
         bw_set_listener_pose(e, 0, 0, 0, q.x, q.y, q.z, q.w);
         bw_commit(e);
 
-        float occ = bw_source_get_occlusion(e, src);          /* real Steam Audio occlusion (1 = clear) */
+        float occ   = bw_source_get_occlusion(e, src);        /* real Steam Audio occlusion (1 = clear) */
+        float dgain = bw_source_get_directivity(e, src);      /* 1 = on-axis/omni .. 0 = null */
         int occluded = occ < 0.85f;
 
         Vector3 right = Vector3RotateByQuaternion((Vector3){ 1, 0, 0 }, q);
@@ -298,6 +333,11 @@ int main(void) {
         /* direct path: green when clear, red when the wall occludes it */
         DrawLine3D(L, source_pos, occluded ? (Color){ 230, 70, 70, 255 } : (Color){ 90, 220, 90, 220 });
         DrawSphere(source_pos, 0.18f, RED);
+        if (cur_dir != 0) {                                   /* show the source's aim when directional */
+            Vector3 sfwd = Vector3RotateByQuaternion((Vector3){ 0, 0, -1 }, sq);
+            DrawCylinderEx(Vector3Add(source_pos, Vector3Scale(sfwd, 0.18f)),
+                           Vector3Add(source_pos, Vector3Scale(sfwd, 0.5f)), 0.06f, 0.0f, 8, (Color){ 255, 180, 80, 255 });
+        }
 
         /* reflected path source -> bounce -> listener, and the mirror-image source */
         if (refl_valid) {
@@ -318,18 +358,20 @@ int main(void) {
 
         /* readable HUD: a dark backing panel + bright text (ASCII only — raylib's default font
          * has no em-dash/box glyphs) */
-        DrawRectangle(0, 0, GetScreenWidth(), 124, (Color){ 0, 0, 0, 185 });
-        DrawText("WASD/RF move source   Q/E turn head   [ ] move wall   1-4 signal   T reflection   G occlusion   right-drag orbit   wheel zoom",
-                 12, 10, 15, RAYWHITE);
+        DrawRectangle(0, 0, GetScreenWidth(), 126, (Color){ 0, 0, 0, 190 });
+        DrawText("WASD/RF move  Q/E head  ,/. aim source  [ ] wall  M material  Z directivity  1-4 signal  T refl  G occl  right-drag/wheel camera",
+                 12, 8, 14, RAYWHITE);
         DrawText(TextFormat("source (%.2f, %.2f, %.2f)   head %.0f deg",
                             source_pos.x, source_pos.y, source_pos.z, head_yaw * 57.2958f),
-                 12, 32, 16, (Color){ 215, 215, 225, 255 });
-        DrawText(TextFormat("signal [1-4]: %s", SIG_NAMES[cur_sig]), 12, 54, 18, (Color){ 110, 200, 255, 255 });
+                 12, 30, 16, (Color){ 215, 215, 225, 255 });
+        DrawText(TextFormat("signal [1-4]: %s     material [M]: %s     directivity [Z]: %s  (%.0f%% on-axis)",
+                            SIG_NAMES[cur_sig], mat_names[cur_mat], dir_names[cur_dir], dgain * 100.0f),
+                 12, 52, 15, (Color){ 110, 200, 255, 255 });
         DrawText(TextFormat("%s    [T] reflection %s   [G] occlusion %s (%.0f%% audible)",
                             refl_valid ? "REFLECTING - audible image source" :
                             (occluded ? "OCCLUDED - Steam Audio attenuates the source" : "wall: clear line of sight"),
                             refl_audible ? "ON" : "off", occ_audible ? "ON" : "off", occ * 100.0f),
-                 12, 78, 16, refl_valid ? ORANGE : (occluded ? (Color){ 245, 140, 140, 255 } : (Color){ 200, 200, 210, 255 }));
+                 12, 76, 16, refl_valid ? ORANGE : (occluded ? (Color){ 245, 140, 140, 255 } : (Color){ 200, 200, 210, 255 }));
         if (silent)
             DrawText("audio: NULL sink - NO SOUND (set BWAUDIO_ASIO_DRIVER; see console)", 12, 100, 16, (Color){ 255, 110, 110, 255 });
         else

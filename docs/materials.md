@@ -72,10 +72,11 @@ bw_scene_set_box(e, 6.f, 3.f, 6.f, faces);                      // triangle norm
 tagging many surfaces with it never exhausts the table) and also `0` (the default, **not** an error
 sentinel) on an unknown name or a full table — check `bw_last_error` to distinguish those. Custom
 coefficients are clamped to `[0,1]` and NaN/Inf-sanitized before reaching phonon. The geometry
-setters are **enforced** load-time: a call after `bw_start` is rejected with a `bw_last_error`
-(the occlusion + reflection sims share one `IPLScene`, and a mesh swap can't run concurrently with
-the reflection thread's ray tracing). The single-material `bw_scene_set_mesh` remains the `nmat==1`
-convenience.
+setters **may be called at runtime** for occlusion (the occlusion sim owns the `IPLScene` and
+serializes its own commit + ray trace), but are **rejected while the reflection bed is running** (it
+shares the scene and a mesh swap can't race its ray tracing; the reflection IR assumes a static
+scene) — a locked call sets `bw_last_error`. The single-material `bw_scene_set_mesh` remains the
+`nmat==1` convenience.
 
 ### Reflection bed: hybrid reverb (directional early reflections + parametric tail)
 

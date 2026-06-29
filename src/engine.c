@@ -411,13 +411,14 @@ void bw_play_oneshot(BwEngine* e, BwSound snd, float x, float y, float z, float 
 /* ---- materials / occlusion (no-ops without the Steam Audio backend) ---- */
 
 #ifdef BW_HAVE_STEAMAUDIO
-/* Geometry is LOAD-TIME only: the occlusion sim and the reflection bed share one IPLScene, and an
- * iplSceneCommit (mesh swap) cannot run concurrently with the reflection thread's ray tracing. The
- * setters therefore reject calls after bw_start (returns 1 + sets the error). Pre-start the occlusion
- * sim serializes the commit with its own run on its single thread, so it is safe. */
+/* Geometry CAN change at runtime for occlusion: the occlusion sim owns the IPLScene and serializes
+ * its commit + ray trace on its own single thread, so a mesh swap there is safe (the control thread
+ * only hands it a pending buffer under a lock). It is locked only once the REFLECTION bed is running:
+ * that sim shares the same IPLScene, and an iplSceneCommit cannot race its RunReflections (v1 has no
+ * scene-swap handshake — the reflection IR assumes a static scene). */
 static int scene_locked(BwEngine* e) {
     if (!e || !e->scene) return 1;
-    if (e->started) { set_error(e, "scene geometry is load-time only — set it before bw_start"); return 1; }
+    if (e->reflect) { set_error(e, "scene geometry is locked while the reflection bed is running"); return 1; }
     return 0;
 }
 #endif

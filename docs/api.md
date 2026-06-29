@@ -234,10 +234,11 @@ engine's life; per-triangle indices out of range clamp to the default.
 Geometry is in **room space (RH metres)**, triangles CCW; `bw_scene_set_box` builds an origin-centred
 shoebox with **inward-facing** normals (the listener is inside). The same per-triangle materials feed
 **both** occlusion (per-band transmission) and the reflection bed (absorption/scattering) — one shared
-`IPLScene`. These setters are **enforced load-time**: a call after `bw_start` is rejected (sets
-`bw_last_error`), because an `iplSceneCommit` cannot run concurrently with the reflection thread's ray
-tracing (phonon's own rule). v1 assumes a static scene. All of the above are **no-ops without the
-`BW_HAVE_STEAMAUDIO` build** (token minting still works — it is plain table state).
+`IPLScene`. The geometry **can change at runtime** for occlusion (the occlusion sim owns the scene and
+serializes its own commit + ray trace) — but it is **locked once the reflection bed is running** (that
+sim shares the scene and an `iplSceneCommit` can't race its ray tracing; the reflection IR assumes a
+static scene). A locked call is rejected (sets `bw_last_error`). All of the above are **no-ops without
+the `BW_HAVE_STEAMAUDIO` build** (token minting still works — it is plain table state).
 
 ## Occlusion & directivity (control thread; per-frame except where noted)
 
