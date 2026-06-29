@@ -62,6 +62,24 @@ startup, so it can't be flipped from a runtime script — it's a one-time projec
    listener, then one `bw_commit` — so the audio thread never sees a half-moved frame (this is what
    makes the moving-observer case correct; do not push from individual emitters).
 
+## Acoustic geometry & materials (authoring)
+
+Occlusion and reflections need the room's geometry. Two ways to author it, both **load-time**:
+
+- **Simple box** — tick `Enable Room Box` on `BwAudio`, set the size (metres) and a material preset.
+- **Per-object meshes** — add **`BwAcousticGeometry`** to any object with a mesh (or set a low-poly
+  `Mesh Override`) and assign a **material**. `BwAudio` bakes every one of them (plus the box, if on)
+  into the engine's scene at startup — transforming each mesh from Unity world into room space.
+  Selected/`alwaysDrawGizmo` geometry is drawn as a cyan wireframe in the scene view.
+
+Materials are project assets: **Create → BwAudio → Acoustic Material** (`BwMaterialAsset`) — either a
+named engine preset (`concrete`, `glass`, …) or custom 3-band absorption / scattering / transmission.
+Reference one asset from many objects; it's minted once. No material = the engine default.
+
+> **Keep acoustic meshes SIMPLE** — tens to hundreds of triangles. The engine ray-traces them every
+> frame; render meshes (thousands of tris) are far too heavy. Use a low-poly proxy via `Mesh Override`
+> or a dedicated renderer-less object. Geometry is static (baked once before `bw_start`).
+
 ### Coordinate seam
 
 The engine is **room space, right-handed** (matching OptiTrack); Unity is left-handed. `Room` does

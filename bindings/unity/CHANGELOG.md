@@ -18,3 +18,6 @@ Initial Unity binding (M7).
   `reflections`, and `directivity` toggles, plus a one-shot helper.
 - Editor guardrail (`BwAudioProjectCheck`): warns if Unity's built-in audio is still enabled (the
   engine owns the device) and offers one-click **Tools → BwAudio → Disable Unity Audio**.
+- Acoustic-scene authoring: `BwMaterialAsset` (Create → BwAudio → Acoustic Material; preset or custom
+  3-band) and `BwAcousticGeometry` (mark a mesh as occluding/reflecting, assign a material, scene-view
+  gizmo). `BwAudio` bakes all geometry (+ the optional room box) world→room into one mesh at load.

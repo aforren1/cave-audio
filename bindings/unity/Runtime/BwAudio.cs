@@ -64,12 +64,7 @@ namespace CaveAudio
                 };
                 Bw.bw_reflections_config(_eng, in rc);
             }
-            if (enableRoomBox)
-            {
-                uint m = Bw.bw_material_preset(_eng, roomMaterial);   // 0 (default) on an unknown name
-                var faces = new[] { m, m, m, m, m, m };
-                Bw.bw_scene_set_box(_eng, roomSizeMetres.x, roomSizeMetres.y, roomSizeMetres.z, faces);
-            }
+            SetupScene();   // acoustic geometry + optional room box -> the engine's scene (load-time)
 
             if (Bw.bw_start(_eng) != 0)
             {
@@ -102,6 +97,88 @@ namespace CaveAudio
 
         /// <summary>Mint a material from a named preset (load-time). 0 = the built-in default.</summary>
         public uint MaterialPreset(string name) => Ready ? Bw.bw_material_preset(_eng, name) : 0;
+
+        // ---- acoustic scene baking (load-time) ----------------------------------------------------
+        // Collect every BwAcousticGeometry (+ the optional room box) into ONE mesh and hand it to the
+        // engine. The engine's scene is a single static mesh, so this is a one-time bake before start.
+        void SetupScene()
+        {
+            var geos = FindObjectsOfType<BwAcousticGeometry>();
+            bool haveGeo = geos != null && geos.Length > 0;
+            if (!haveGeo && !enableRoomBox) return;
+
+            // simple path: just a box, nothing else -> the engine's own box helper (inward normals)
+            if (!haveGeo && enableRoomBox)
+            {
+                uint mb = Bw.bw_material_preset(_eng, roomMaterial);
+                var faces = new[] { mb, mb, mb, mb, mb, mb };
+                Bw.bw_scene_set_box(_eng, roomSizeMetres.x, roomSizeMetres.y, roomSizeMetres.z, faces);
+                return;
+            }
+
+            // combined path: geometry (+ optional box), all baked into one mesh
+            var verts = new List<float>(); var tris = new List<int>(); var triMat = new List<uint>();
+            var cache = new Dictionary<BwMaterialAsset, uint>();
+            uint Resolve(BwMaterialAsset a)
+            {
+                if (a == null) return 0;                       // default material
+                if (cache.TryGetValue(a, out var t)) return t; // mint each asset once
+                t = a.Resolve(_eng); cache[a] = t; return t;
+            }
+
+            if (enableRoomBox)
+                AddBox(verts, tris, triMat, roomSizeMetres, Bw.bw_material_preset(_eng, roomMaterial));
+            foreach (var g in geos)
+            {
+                var mesh = g.ResolveMesh();
+                if (mesh == null) { Debug.LogWarning("[BwAudio] BwAcousticGeometry with no mesh: " + g.name); continue; }
+                AddMesh(verts, tris, triMat, mesh, g.transform.localToWorldMatrix, Resolve(g.material));
+            }
+            if (tris.Count == 0) return;
+            Bw.bw_scene_set_mesh_mat(_eng, verts.ToArray(), verts.Count / 3, tris.ToArray(), tris.Count / 3, triMat.ToArray());
+            Debug.Log($"[BwAudio] acoustic scene: {verts.Count / 3} verts, {tris.Count / 3} tris, {cache.Count} material(s)");
+        }
+
+        // Append a Unity mesh, transformed local -> world -> room space. Room.Pos negates Z (LH->RH),
+        // which mirrors the geometry, so the triangle winding is reversed to keep front faces.
+        static void AddMesh(List<float> verts, List<int> tris, List<uint> triMat, Mesh mesh, Matrix4x4 l2w, uint mat)
+        {
+            int baseIdx = verts.Count / 3;
+            var mv = mesh.vertices;
+            foreach (var lv in mv) { var p = Room.Pos(l2w.MultiplyPoint3x4(lv)); verts.Add(p.x); verts.Add(p.y); verts.Add(p.z); }
+            var mt = mesh.triangles;
+            for (int i = 0; i < mt.Length; i += 3)
+            {
+                tris.Add(baseIdx + mt[i]); tris.Add(baseIdx + mt[i + 2]); tris.Add(baseIdx + mt[i + 1]); // reversed winding
+                triMat.Add(mat);
+            }
+        }
+
+        // Append an origin-centred box (room metres), inward-facing normals (the listener is inside).
+        static void AddBox(List<float> verts, List<int> tris, List<uint> triMat, Vector3 size, uint mat)
+        {
+            float hw = size.x * 0.5f, hh = size.y * 0.5f, hd = size.z * 0.5f;
+            var v = new[] {
+                new Vector3(-hw,-hh,-hd), new Vector3(hw,-hh,-hd), new Vector3(hw,hh,-hd), new Vector3(-hw,hh,-hd),
+                new Vector3(-hw,-hh, hd), new Vector3(hw,-hh, hd), new Vector3(hw,hh, hd), new Vector3(-hw,hh, hd) };
+            int baseIdx = verts.Count / 3;
+            foreach (var p in v) { verts.Add(p.x); verts.Add(p.y); verts.Add(p.z); }   // already room space
+            int[][] quad = { new[]{0,4,7,3}, new[]{1,2,6,5}, new[]{0,1,5,4}, new[]{3,7,6,2}, new[]{0,3,2,1}, new[]{4,5,6,7} };
+            foreach (var qd in quad)
+            {
+                EmitInward(v, tris, baseIdx, qd[0], qd[1], qd[2]); triMat.Add(mat);
+                EmitInward(v, tris, baseIdx, qd[0], qd[2], qd[3]); triMat.Add(mat);
+            }
+        }
+
+        // Emit a box triangle, flipping the last two indices so its normal points toward the origin.
+        static void EmitInward(Vector3[] v, List<int> tris, int baseIdx, int i0, int i1, int i2)
+        {
+            Vector3 n = Vector3.Cross(v[i1] - v[i0], v[i2] - v[i0]);
+            Vector3 c = (v[i0] + v[i1] + v[i2]) / 3f;
+            if (Vector3.Dot(n, -c) < 0f) { var t = i1; i1 = i2; i2 = t; }   // normal points outward -> flip
+            tris.Add(baseIdx + i0); tris.Add(baseIdx + i1); tris.Add(baseIdx + i2);
+        }
 
         public void Register(BwEmitter e)   { if (!_emitters.Contains(e)) _emitters.Add(e); }
         public void Unregister(BwEmitter e) => _emitters.Remove(e);
