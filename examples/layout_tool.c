@@ -30,9 +30,13 @@
  * Controls (edit): [ ] select speaker (or left-click)   arrows X/Z, R/F Y (SHIFT = fine)
  *           ENTER type "x y z"   PgUp/PgDn gain_db   T tone   N sine/noise   C coverage   V observer
  *           X score the layout for each panner (DBAP/SPCAP/VBAP rE-localization error)   S save   L reload
+ *           B select the target panner   O auto-optimize the layout for it (a hill-climb that minimises
+ *           the panner's rE error subject to the constraints; runs live, O again to stop, then S to save).
+ *           K snap all speakers to the nearest allowed point. Drop a `constraints.json` next to the layout
+ *           (an allowed `bounds` box + a `nogo` list of boxes for screens/structure) and the tool draws
+ *           them (green bounds / red no-go), flags speakers that violate (red ring), and K projects them in.
  * Controls (preview, P toggles): WASD/RF move the source   SPACE auto-orbit/near-far/high-low sweep
- *           B A/B the panner DBAP<->SPCAP live (SPCAP is the fixed-observer sweet-spot panner)
- *           Common: right-drag/wheel camera   ESC quit
+ *           B A/B the panner DBAP<->SPCAP<->VBAP live   Common: right-drag/wheel camera   ESC quit
  * Build: cmake -S . -B build -DBWAUDIO_BUILD_PLAYGROUND=ON && cmake --build build --target bw_layout_tool
  */
 #include "bwaudio.h"
@@ -148,6 +152,88 @@ static int save_json(const char* path) {
     return 1;
 }
 
+/* ---- placement constraints / barriers (constraints.json: an allowed bounding box + no-go boxes for
+ * screens / structure / doorways) ----  A speaker is valid if it is inside con_bounds and outside every
+ * no-go box. Used to flag violations, to snap a speaker to the nearest allowed point, and (later) as the
+ * optimizer's feasibility projection. */
+typedef struct { Vector3 lo, hi; } Box;
+#define MAXNOGO 24
+static Box con_bounds = { { -3, -3, -3 }, { 3, 3, 3 } };
+static Box con_nogo[MAXNOGO];
+static int con_nnogo, con_loaded;
+
+static int box_in(Box b, Vector3 p) {
+    return p.x >= b.lo.x && p.x <= b.hi.x && p.y >= b.lo.y && p.y <= b.hi.y && p.z >= b.lo.z && p.z <= b.hi.z;
+}
+static int constraint_ok(Vector3 p) {
+    if (!con_loaded) return 1;                            /* no constraints loaded -> all positions allowed */
+    if (!box_in(con_bounds, p)) return 0;
+    for (int i = 0; i < con_nnogo; ++i) if (box_in(con_nogo[i], p)) return 0;
+    return 1;
+}
+/* move p just outside box b through the nearest face that stays inside con_bounds (so a no-go flush
+ * against a bounds wall pushes INTO the room, not out of bounds — else the snap never converges) */
+static Vector3 push_out(Vector3 p, Box b) {
+    const float eps = 1e-3f;
+    Vector3 cand[6] = {
+        { b.lo.x - eps, p.y, p.z }, { b.hi.x + eps, p.y, p.z },
+        { p.x, b.lo.y - eps, p.z }, { p.x, b.hi.y + eps, p.z },
+        { p.x, p.y, b.lo.z - eps }, { p.x, p.y, b.hi.z + eps },
+    };
+    float d[6] = { p.x - b.lo.x, b.hi.x - p.x, p.y - b.lo.y, b.hi.y - p.y, p.z - b.lo.z, b.hi.z - p.z };
+    int best = -1; float bd = 1e30f;
+    for (int i = 0; i < 6; ++i) if (box_in(con_bounds, cand[i]) && d[i] < bd) { bd = d[i]; best = i; }
+    if (best < 0) for (int i = 0; i < 6; ++i) if (d[i] < bd) { bd = d[i]; best = i; }  /* over-constrained: nearest face */
+    return cand[best];
+}
+static Vector3 constraint_project(Vector3 p) {           /* nearest allowed point: clamp to bounds, push out of no-go */
+    if (!con_loaded) return p;
+    for (int pass = 0; pass < 4; ++pass) {               /* a few passes settle overlapping boxes */
+        p.x = Clamp(p.x, con_bounds.lo.x, con_bounds.hi.x);
+        p.y = Clamp(p.y, con_bounds.lo.y, con_bounds.hi.y);
+        p.z = Clamp(p.z, con_bounds.lo.z, con_bounds.hi.z);
+        for (int i = 0; i < con_nnogo; ++i) if (box_in(con_nogo[i], p)) p = push_out(p, con_nogo[i]);
+    }
+    p.x = Clamp(p.x, con_bounds.lo.x, con_bounds.hi.x);  /* final clamp: in-bounds even if over-constrained */
+    p.y = Clamp(p.y, con_bounds.lo.y, con_bounds.hi.y);
+    p.z = Clamp(p.z, con_bounds.lo.z, con_bounds.hi.z);
+    return p;
+}
+static int read_box(cJSON* o, Box* out) {
+    cJSON* mn = cJSON_GetObjectItemCaseSensitive(o, "min");
+    cJSON* mx = cJSON_GetObjectItemCaseSensitive(o, "max");
+    if (!cJSON_IsArray(mn) || cJSON_GetArraySize(mn) != 3 || !cJSON_IsArray(mx) || cJSON_GetArraySize(mx) != 3) return 0;
+    float a[3], b[3];
+    for (int k = 0; k < 3; ++k) {
+        cJSON *ak = cJSON_GetArrayItem(mn, k), *bk = cJSON_GetArrayItem(mx, k);
+        if (!cJSON_IsNumber(ak) || !cJSON_IsNumber(bk)) return 0;
+        a[k] = (float)ak->valuedouble; b[k] = (float)bk->valuedouble;
+    }
+    out->lo = (Vector3){ fminf(a[0],b[0]), fminf(a[1],b[1]), fminf(a[2],b[2]) };  /* tolerate min/max swapped */
+    out->hi = (Vector3){ fmaxf(a[0],b[0]), fmaxf(a[1],b[1]), fmaxf(a[2],b[2]) };
+    return 1;
+}
+static int load_constraints(const char* path) {
+    FILE* f = fopen(path, "rb"); if (!f) return 0;
+    fseek(f, 0, SEEK_END); long n = ftell(f); fseek(f, 0, SEEK_SET);
+    if (n <= 0) { fclose(f); return 0; }
+    char* buf = (char*)malloc((size_t)n + 1); if (!buf) { fclose(f); return 0; }
+    size_t rd = fread(buf, 1, (size_t)n, f); buf[rd] = 0; fclose(f);
+    cJSON* root = cJSON_Parse(buf); free(buf);
+    if (!root) return 0;
+    cJSON* b = cJSON_GetObjectItemCaseSensitive(root, "bounds");
+    if (cJSON_IsObject(b)) read_box(b, &con_bounds);
+    con_nnogo = 0;
+    cJSON* ng = cJSON_GetObjectItemCaseSensitive(root, "nogo");
+    if (cJSON_IsArray(ng)) {
+        cJSON* box;
+        cJSON_ArrayForEach(box, ng) if (con_nnogo < MAXNOGO && read_box(box, &con_nogo[con_nnogo])) ++con_nnogo;
+    }
+    cJSON_Delete(root);
+    con_loaded = 1;
+    return 1;
+}
+
 /* ---- engine + DBAP preview state (file scope) ---- */
 #define PREV_WAV    "._bw_layout_preview.wav"
 #define TEMP_LAYOUT "._bw_layout_preview.json"
@@ -235,22 +321,26 @@ static int   scored, score_stale;
 /* mean + worst rE localization error (deg) over the shell, from the panner's observer model: DBAP over
  * the moving listener grid; SPCAP/VBAP from the fixed centre. Uses bw_panner_gains_batch (the ACTUAL
  * engine solve), so the score reflects what will ship — not a re-implementation. */
-static void score_panner(BwPanner panner, float* mean_deg, float* worst_deg) {
+static void score_panner(BwPanner panner, int stride, float* mean_deg, float* worst_deg) {
     static float gains[NCOV * NSPK], srcs[NCOV * 3];
     float pos[NSPK * 3];
     for (int i = 0; i < NSPK; ++i) { pos[i*3] = spk[i].pos.x; pos[i*3+1] = spk[i].pos.y; pos[i*3+2] = spk[i].pos.z; }
+    if (stride < 1) stride = 1;                     /* >1 subsamples the direction shell (coarse, for the optimizer) */
     int NL = (panner == BW_PAN_DBAP) ? 27 : 1;     /* DBAP: moving grid; SPCAP/VBAP: fixed centre */
     double sumerr = 0; float worst = 0; int cnt = 0;
     for (int l = 0; l < NL; ++l) {
         Vector3 Lp = cov_lis[l]; float lisf[3] = { Lp.x, Lp.y, Lp.z };
-        for (int i = 0; i < NCOV; ++i) {
-            srcs[i*3]   = Lp.x + COV_R * cov_dir[i].x;
-            srcs[i*3+1] = Lp.y + COV_R * cov_dir[i].y;
-            srcs[i*3+2] = Lp.z + COV_R * cov_dir[i].z;
+        int ns = 0;
+        for (int i = 0; i < NCOV; i += stride) {
+            srcs[ns*3]   = Lp.x + COV_R * cov_dir[i].x;
+            srcs[ns*3+1] = Lp.y + COV_R * cov_dir[i].y;
+            srcs[ns*3+2] = Lp.z + COV_R * cov_dir[i].z;
+            ++ns;
         }
-        bw_panner_gains_batch(panner, pos, NSPK, lisf, srcs, NCOV, gains);
-        for (int i = 0; i < NCOV; ++i) {
-            float* g = &gains[i * NSPK];
+        bw_panner_gains_batch(panner, pos, NSPK, lisf, srcs, ns, gains);
+        for (int j = 0; j < ns; ++j) {
+            int i = j * stride;                     /* the cov_dir index this sample came from */
+            float* g = &gains[j * NSPK];
             float rE[3] = { 0, 0, 0 };
             for (int s = 0; s < NSPK; ++s) {        /* energy-weighted speaker-direction vector (rE) */
                 float w = g[s] * g[s];
@@ -269,15 +359,44 @@ static void score_panner(BwPanner panner, float* mean_deg, float* worst_deg) {
     *worst_deg = worst;
 }
 
+/* ---- auto-optimizer: stochastic hill-climb over the free positions, minimising the panner cost
+ * (mean + 0.5*worst rE error) subject to the constraints. Runs incrementally (a few trials per frame)
+ * so the layout is seen converging and the GUI stays responsive; stop any time and save. ---- */
+static int   opt_running, opt_iter, opt_stall;
+static float opt_step = 0.30f, opt_cost;
+
+static float opt_cost_of(BwPanner p) { float m, w; score_panner(p, 4, &m, &w); return m + 0.5f * w; }  /* coarse */
+static float frand(void) { return (float)rand() / ((float)RAND_MAX + 1.0f); }
+
+static void optimize_step(BwPanner p, int trials) {
+    for (int t = 0; t < trials; ++t) {
+        int s = rand() % NSPK;
+        Vector3 old = spk[s].pos;
+        Vector3 cand = { old.x + opt_step * (2*frand()-1), old.y + opt_step * (2*frand()-1), old.z + opt_step * (2*frand()-1) };
+        spk[s].pos = constraint_project(cand);     /* keep the trial feasible */
+        float c = opt_cost_of(p);
+        if (c < opt_cost - 1e-4f) { opt_cost = c; opt_stall = 0; }              /* accept an improvement */
+        else { spk[s].pos = old; if (++opt_stall > 6*NSPK) { opt_step *= 0.7f; opt_stall = 0; } }  /* revert; shrink when stuck */
+        ++opt_iter;
+    }
+    layout_dirty = 1; score_stale = 1;
+}
+
 int main(int argc, char** argv) {
-    /* headless: `bw_layout_tool --export [file]` writes the layout (default grid, or an existing file
-     * with delay_ms recomputed from positions) and exits — scriptable, no window/audio. */
-    int export_only = (argc > 1 && strcmp(argv[1], "--export") == 0);
-    int score_only  = (argc > 1 && strcmp(argv[1], "--score")  == 0);
-    const char* path = (export_only || score_only) ? (argc > 2 ? argv[2] : "cave_layout.json")
-                                                    : (argc > 1 ? argv[1] : "cave_layout.json");
+    /* headless (no window/audio, scriptable):
+     *   --export   [file]            write the layout (default grid, or an existing file with delay_ms recomputed)
+     *   --score    [file]            print each panner's rE-localization error for the layout
+     *   --optimize [file] [panner]   hill-climb the layout for one panner (dbap|spcap|vbap, default dbap),
+     *                                within constraints.json if present, save in place, print before/after */
+    int export_only   = (argc > 1 && strcmp(argv[1], "--export")   == 0);
+    int score_only    = (argc > 1 && strcmp(argv[1], "--score")    == 0);
+    int optimize_only = (argc > 1 && strcmp(argv[1], "--optimize") == 0);
+    const char* path = (export_only || score_only || optimize_only) ? (argc > 2 ? argv[2] : "cave_layout.json")
+                                                                     : (argc > 1 ? argv[1] : "cave_layout.json");
     seed_default();
     int loaded = load_json(path);
+    if (load_constraints("constraints.json"))
+        printf("constraints: bounds + %d no-go box(es) loaded from constraints.json\n", con_nnogo);
 
     /* coverage/scoring shell: even directions on a sphere (Fibonacci) + a working-volume listener grid */
     for (int i = 0; i < NCOV; ++i) {
@@ -298,9 +417,21 @@ int main(int argc, char** argv) {
     if (score_only) {                              /* headless: score the layout for each panner + exit */
         printf("layout: %s (%s)\n", path, loaded ? "loaded" : "default grid");
         for (int p = 0; p < 3; ++p) {
-            float m, w; score_panner((BwPanner)p, &m, &w);
+            float m, w; score_panner((BwPanner)p, 1, &m, &w);
             printf("  %-14s rE-localize error:  mean %4.1f deg   worst %4.1f deg\n", panner_names[p], m, w);
         }
+        return 0;
+    }
+    if (optimize_only) {                           /* headless: optimize in place for one panner + save */
+        BwPanner p = BW_PAN_DBAP;
+        if (argc > 3) { if (!strcmp(argv[3], "spcap")) p = BW_PAN_SPCAP; else if (!strcmp(argv[3], "vbap")) p = BW_PAN_VBAP; }
+        float m0, w0; score_panner(p, 1, &m0, &w0);
+        opt_cost = opt_cost_of(p); opt_step = 0.30f; opt_stall = 0; opt_iter = 0;
+        while (opt_step > 0.02f && opt_iter < 120000) optimize_step(p, 200);   /* run to convergence (step floor) */
+        float m1, w1; score_panner(p, 1, &m1, &w1);
+        if (!save_json(path)) { printf("optimize: save failed: %s\n", path); return 1; }
+        printf("optimized %s for %-5s:  rE mean %.1f -> %.1f deg   worst %.1f -> %.1f deg   (%d iters%s)\n",
+               path, panner_names[p], m0, m1, w0, w1, opt_iter, con_loaded ? ", within constraints" : "");
         return 0;
     }
     printf("layout: %s (%s, %d speakers)\n", path, loaded ? "loaded" : "default grid", loaded ? loaded : NSPK);
@@ -381,12 +512,21 @@ int main(int argc, char** argv) {
             if (IsKeyPressed(KEY_N)) tone_kind = (tone_kind == BW_TEST_SINE) ? BW_TEST_NOISE : BW_TEST_SINE;
             if (IsKeyPressed(KEY_ENTER)) { editing = 1; ilen = 0; ibuf[0] = 0; }
             if (IsKeyPressed(KEY_S)) { save_flash = save_json(path) ? 2.0f : -2.0f; }
-            if (IsKeyPressed(KEY_L)) { load_json(path); layout_dirty = 1; score_stale = 1; }
+            if (IsKeyPressed(KEY_L)) { load_json(path); load_constraints("constraints.json"); layout_dirty = 1; score_stale = 1; }
+            if (IsKeyPressed(KEY_K)) {                                 /* snap all speakers to the nearest allowed point */
+                for (int i = 0; i < NSPK; ++i) spk[i].pos = constraint_project(spk[i].pos);
+                layout_dirty = 1; score_stale = 1;
+            }
             if (IsKeyPressed(KEY_C)) coverage_on = !coverage_on;       /* coverage overlay */
             if (IsKeyPressed(KEY_V)) coverage_moving = !coverage_moving;
             if (IsKeyPressed(KEY_X)) {                                 /* score the layout for each panner */
-                for (int p = 0; p < 3; ++p) score_panner((BwPanner)p, &score_mean[p], &score_worst[p]);
+                for (int p = 0; p < 3; ++p) score_panner((BwPanner)p, 1, &score_mean[p], &score_worst[p]);
                 scored = 1; score_stale = 0;
+            }
+            if (IsKeyPressed(KEY_B)) pv_panner = (pv_panner + 1) % 3;   /* select the target panner (score/optimize) */
+            if (IsKeyPressed(KEY_O)) {                                 /* toggle the auto-optimizer for that panner */
+                opt_running = !opt_running;
+                if (opt_running) { opt_cost = opt_cost_of((BwPanner)pv_panner); opt_step = 0.30f; opt_stall = 0; opt_iter = 0; }
             }
             if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT) && !IsMouseButtonDown(MOUSE_BUTTON_RIGHT)) {  /* click-pick the nearest speaker (not while orbiting) */
                 Ray ray = GetMouseRay(GetMousePosition(), cam);
@@ -408,6 +548,7 @@ int main(int argc, char** argv) {
                     build_engine(TEMP_LAYOUT);
                     layout_dirty = 0; driven = -1;
                 }
+                opt_running = 0;                          /* stop the optimizer when leaving edit for preview */
                 preview = 1;
                 if (e) {
                     bw_set_panner(e, (BwPanner)pv_panner);                      /* rebuilt engine defaults to DBAP */
@@ -415,6 +556,11 @@ int main(int argc, char** argv) {
                     bw_commit(e);
                 }
             }
+        }
+
+        if (opt_running && !editing && !preview) {        /* auto-optimizer: a few hill-climb trials per frame */
+            opt_cost = opt_cost_of((BwPanner)pv_panner);  /* re-baseline so a manual nudge can't wedge the climb */
+            optimize_step((BwPanner)pv_panner, 6);
         }
 
         /* drive the selected speaker's channel when auditioning (edit mode only) */
@@ -453,11 +599,20 @@ int main(int argc, char** argv) {
         float seld   = Vector3Length(spk[sel].pos);
         float seldel = (dmax - seld) / SPEED_OF_SOUND * 1000.0f;
         float cov_worst = 0.0f, cov_mean = 0.0f;        /* coverage summary, filled by the overlay below */
+        int con_bad = 0;
+        if (con_loaded) for (int i = 0; i < NSPK; ++i) if (!constraint_ok(spk[i].pos)) ++con_bad;
 
         BeginDrawing();
         ClearBackground((Color){ 22, 22, 28, 255 });
         BeginMode3D(cam);
         DrawGrid(16, 0.5f);
+        if (con_loaded) {                                /* placement constraints: allowed bounds (green) + no-go (red) */
+            DrawCubeWiresV(Vector3Scale(Vector3Add(con_bounds.lo, con_bounds.hi), 0.5f),
+                           Vector3Subtract(con_bounds.hi, con_bounds.lo), (Color){ 90, 200, 120, 110 });
+            for (int i = 0; i < con_nnogo; ++i)
+                DrawCubeWiresV(Vector3Scale(Vector3Add(con_nogo[i].lo, con_nogo[i].hi), 0.5f),
+                               Vector3Subtract(con_nogo[i].hi, con_nogo[i].lo), (Color){ 235, 90, 90, 170 });
+        }
         DrawLine3D((Vector3){ 0, 0, 0 }, (Vector3){ 1.2f, 0, 0 }, (Color){ 230, 90, 90, 255 });   /* +X */
         DrawLine3D((Vector3){ 0, 0, 0 }, (Vector3){ 0, 1.2f, 0 }, (Color){ 90, 230, 90, 255 });   /* +Y */
         DrawLine3D((Vector3){ 0, 0, 0 }, (Vector3){ 0, 0, 1.2f }, (Color){ 90, 150, 230, 255 });  /* +Z */
@@ -469,6 +624,8 @@ int main(int argc, char** argv) {
                       : is_sel ? (Color){ 245, 220, 90, 255 }
                                : (Color){ 120, 120, 150, 255 };
             DrawSphere(spk[i].pos, is_sel ? 0.15f : 0.10f, col);
+            if (!constraint_ok(spk[i].pos))              /* flag a speaker outside bounds / inside a no-go box */
+                DrawSphereWires(spk[i].pos, is_sel ? 0.20f : 0.16f, 6, 6, (Color){ 245, 80, 80, 255 });
         }
         if (preview) {                                   /* the moving DBAP source */
             DrawLine3D((Vector3){ 0, 0, 0 }, src_pos, (Color){ 90, 220, 90, 200 });
@@ -520,7 +677,7 @@ int main(int argc, char** argv) {
                                 src_pos.x, src_pos.y, src_pos.z, pv_orbit ? "ON" : "off"),
                      10, 30, 16, (Color){ 240, 160, 120, 255 });
         } else {
-            DrawText("[ ] select   arrows X/Z  R/F Y (SHIFT fine)   ENTER type   PgUp/Dn gain   T tone  N noise   C coverage  V obs   X score-panners   P preview   S save  L reload",
+            DrawText("[ ] select   arrows X/Z  R/F Y (SHIFT)   ENTER type   PgUp/Dn gain   T tone  N noise   C coverage  V obs   X score   K snap   P preview   S save  L reload",
                      10, 8, 13, RAYWHITE);
             DrawText(TextFormat("speaker %d / %d  ->  channel %d   pos (%.3f, %.3f, %.3f)   gain %+.1f dB   delay %.3f ms   dist %.3f m",
                                 sel, NSPK, sel, spk[sel].pos.x, spk[sel].pos.y, spk[sel].pos.z, spk[sel].gain_db, seldel, seld),
@@ -539,6 +696,22 @@ int main(int argc, char** argv) {
             DrawText(TextFormat("saved -> %s", path), GetScreenWidth() - 320, 76, 15, (Color){ 120, 245, 140, 255 });
         else if (save_flash < 0)
             DrawText("SAVE FAILED (path not writable?)", GetScreenWidth() - 320, 76, 15, (Color){ 245, 120, 120, 255 });
+        if (con_loaded && !preview) {                    /* placement-constraint status */
+            DrawRectangle(0, 96, 320, 22, (Color){ 0, 0, 0, 175 });
+            DrawText(TextFormat("constraints: %d no-go   %d violating   [K snap to allowed]", con_nnogo, con_bad),
+                     10, 100, 14, con_bad ? (Color){ 245, 130, 130, 255 } : (Color){ 120, 220, 140, 255 });
+        }
+        if (!preview) {                                  /* target panner + auto-optimizer status */
+            int yo = con_loaded ? 122 : 100;
+            DrawRectangle(0, yo - 4, 520, 22, (Color){ 0, 0, 0, 175 });
+            if (opt_running)
+                DrawText(TextFormat("OPTIMIZING %s   cost %.1f   iter %d   step %.2f m%s   [O] stop",
+                                    panner_names[pv_panner], opt_cost, opt_iter, opt_step, editing ? "   (paused)" : ""),
+                         10, yo, 14, (Color){ 120, 245, 160, 255 });
+            else
+                DrawText(TextFormat("target panner [B]: %s    [O] auto-optimize the layout for it",
+                                    panner_names[pv_panner]), 10, yo, 14, (Color){ 180, 200, 240, 255 });
+        }
         if (coverage_on && !preview) {                   /* bottom: the angular-coverage summary */
             int yb = GetScreenHeight() - 26;
             DrawRectangle(0, yb - 5, GetScreenWidth(), 31, (Color){ 0, 0, 0, 195 });

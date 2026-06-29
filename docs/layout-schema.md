@@ -27,6 +27,26 @@ the positions (max-distance alignment). A headless `bw_layout_tool --export <fil
 a layout without the GUI. To audition a saved layout in the full binaural playground:
 `bw_playground cave_layout.json`.
 
+**Scoring, constraints, and auto-optimization.** The tool can also *evaluate* and *improve* a layout
+for a chosen panner. Press **X** (or run `--score <file>`) to print each panner's rE-localization error
+(mean + worst over a direction shell × the working-volume listener grid, via `bw_panner_gains_batch` —
+the same solve that ships, so the score reflects reality). Drop a **`constraints.json`** next to the
+layout to declare where speakers may go — an allowed `bounds` box plus a `nogo` list of boxes (screens,
+structure, doorways); the tool draws them (green bounds / red no-go), flags any speaker that violates,
+and **K** snaps all speakers to the nearest allowed point. Press **B** to pick the target panner, then
+**O** to **auto-optimize**: a constrained hill-climb that nudges positions to minimise that panner's rE
+error while staying feasible — it runs live (watch the layout converge, O again to stop, S to save).
+Headless: `--optimize <file> [dbap|spcap|vbap]` runs it to convergence in place. The constraint file:
+
+```jsonc
+{
+  "bounds": { "min": [-2.5, -1.6, -2.5], "max": [2.5, 1.6, 2.5] },   // allowed placement box (room metres)
+  "nogo": [                                                          // boxes speakers must stay out of
+    { "min": [-1.6, -1.6, -2.6], "max": [1.6, 1.6, -2.25] }          // e.g. the front projection screen
+  ]
+}
+```
+
 ## Top-level structure
 
 ```jsonc
