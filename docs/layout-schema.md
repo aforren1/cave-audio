@@ -16,6 +16,13 @@ consumed by:
 A complete, valid example lives at [`../examples/cave_layout.json`](../examples/cave_layout.json)
 (a 3×3×3 boundary grid minus the center = exactly 26 speakers).
 
+You can author this file interactively with **`bw_layout_tool`** (`examples/layout_tool.c`, built with
+`-DBWAUDIO_BUILD_PLAYGROUND=ON`): place each speaker in 3D and **identify it by ear** — since a
+speaker's `index` is its output channel, the tool drives that channel with the test signal
+(`bw_test_signal`) out the cave profile, so you hear which physical speaker you're positioning. It
+exports this schema with `delay_ms` auto-derived from the positions (max-distance alignment). A
+headless `bw_layout_tool --export <file>` writes/normalizes a layout without the GUI.
+
 ## Top-level structure
 
 ```jsonc

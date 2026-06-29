@@ -258,4 +258,15 @@ if(BWAUDIO_BUILD_PLAYGROUND)
       COMMAND ${CMAKE_COMMAND} -E copy_if_different
               $<TARGET_FILE:bwaudio> $<TARGET_FILE_DIR:bw_playground>)   # bwaudio.dll next to the exe
   endif()
+
+  # Speaker-layout authoring tool: place the 26 speakers + identify each by ear (the channel test
+  # signal) + export cave_layout.json. Compiles its own cJSON copy to read existing layouts.
+  add_executable(bw_layout_tool examples/layout_tool.c ${CJSON_C})
+  target_include_directories(bw_layout_tool PRIVATE ${CJSON_INC})
+  target_link_libraries(bw_layout_tool PRIVATE bwaudio raylib)
+  if(WIN32)
+    add_custom_command(TARGET bw_layout_tool POST_BUILD
+      COMMAND ${CMAKE_COMMAND} -E copy_if_different
+              $<TARGET_FILE:bwaudio> $<TARGET_FILE_DIR:bw_layout_tool>)
+  endif()
 endif()
