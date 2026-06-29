@@ -16,3 +16,5 @@ Initial Unity binding (M7).
   one commit).
 - `BwEmitter` — positional source: transform-driven position/orientation, with `occlusion`,
   `reflections`, and `directivity` toggles, plus a one-shot helper.
+- Editor guardrail (`BwAudioProjectCheck`): warns if Unity's built-in audio is still enabled (the
+  engine owns the device) and offers one-click **Tools → BwAudio → Disable Unity Audio**.

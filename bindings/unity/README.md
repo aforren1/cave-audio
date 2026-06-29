@@ -41,6 +41,16 @@ The engine loads files itself — **do not** use Unity `AudioClip`. Put under `A
 - `cave_layout.json` — surveyed speaker geometry (`cave`/`both` profiles).
 - your audio (`.wav` / `.flac` / `.mp3`; resampled to the engine rate at load).
 
+## Disable Unity's built-in audio (do this once)
+
+The engine **owns** the audio device. Unity's built-in audio pipeline must be **off** — left on it
+opens its own output device (wasted CPU, possible contention for the binaural monitor's headphones)
+and any stray `AudioSource` plays the wrong path instead of the CAVE array.
+
+Tick **Project Settings → Audio → "Disable Unity Audio"** (or run **Tools → BwAudio → Disable Unity
+Audio**). The package's editor check warns on load if it's still enabled. Unity reads this flag at
+startup, so it can't be flipped from a runtime script — it's a one-time project setting.
+
 ## Use
 
 1. Add **`BwAudio`** to one GameObject (it's a singleton, `DontDestroyOnLoad`). Set the profile,

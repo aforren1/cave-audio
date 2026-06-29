@@ -1,0 +1,14 @@
+{
+    "name": "CaveAudio.Editor",
+    "rootNamespace": "CaveAudio.EditorTools",
+    "references": [ "CaveAudio" ],
+    "includePlatforms": [ "Editor" ],
+    "excludePlatforms": [],
+    "allowUnsafeCode": false,
+    "overrideReferences": false,
+    "precompiledReferences": [],
+    "autoReferenced": true,
+    "defineConstraints": [],
+    "versionDefines": [],
+    "noEngineReferences": false
+}
