@@ -616,17 +616,19 @@ int main(int argc, char** argv) {
         draw_head(q);
         EndMode3D();
 
-        /* HUD: a dark backing panel + bright ASCII text (raylib's default font has no em-dash/box glyphs) */
-        DrawRectangle(0, 0, GetScreenWidth(), 122, (Color){ 0, 0, 0, 195 });
+        /* HUD: a dark backing panel + bright ASCII text (raylib's default font has no em-dash/box glyphs).
+         * Scene HUDs use up to three lines from y=52 (the localization scene's propagation line is the
+         * tallest), so the audio-backend line sits below them at y=120 to avoid overlapping. */
+        DrawRectangle(0, 0, GetScreenWidth(), 144, (Color){ 0, 0, 0, 195 });
         DrawText("[TAB] scene   WASD/RF move source   Q/E head   1-4 signal   right-drag/wheel camera   ESC",
                  12, 8, 14, RAYWHITE);
         DrawText(TextFormat("scene %d/%d:  %s", cur_scene + 1, NSCENE, scenes[cur_scene].name),
                  12, 28, 16, (Color){ 235, 235, 120, 255 });
         scenes[cur_scene].hud(52);
         if (backend_silent)
-            DrawText("audio: NULL sink - NO SOUND (set BWAUDIO_ASIO_DRIVER; see console)", 12, 98, 15, (Color){ 255, 110, 110, 255 });
+            DrawText("audio: NULL sink - NO SOUND (set BWAUDIO_ASIO_DRIVER; see console)", 12, 120, 15, (Color){ 255, 110, 110, 255 });
         else
-            DrawText(TextFormat("audio: %s", backend_name), 12, 98, 15, (Color){ 110, 235, 130, 255 });
+            DrawText(TextFormat("audio: %s", backend_name), 12, 120, 15, (Color){ 110, 235, 130, 255 });
         EndDrawing();
     }
 
