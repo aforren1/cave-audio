@@ -14,6 +14,22 @@ here because it works directly from speaker and source **positions** and degrade
 gracefully when the listener is off-center, rather than assuming a listener fixed at
 the array origin.
 
+> **Fixed-observer installs are a supported mode — and some deployments want it immediately.** The
+> case above is the *moving*, tracked listener, but a simpler install that seats the audience at one
+> fixed spot is equally valid. The engine already serves it with **no extra machinery**: don't enable
+> tracking, set the listener once to the sweet spot (or leave it at the origin for a centred spot), and
+> DBAP — being position-based — pans correctly for that fixed point. This is already better than an
+> origin-only ambisonic decode for an off-centre seat, because DBAP uses the *actual* listening
+> position. The layout tool's coverage overlay scores this case directly (its `V` key picks
+> fixed-centre vs moving-volume), so a layout can be optimized for the observer model the install uses.
+>
+> For best-in-class fixed-observer quality, the upgrade is a sweet-spot, placement-correcting panner:
+> **SPCAP** (speaker-placement correction amplitude panning) conserves loudspeaker power across an
+> uneven array *at the sweet spot*, which DBAP does not. The panner is a swappable module behind the
+> bus seam (`dbap.c` → the 26-ch bus), so adding SPCAP as a selectable mode alongside DBAP is a
+> contained change that touches neither the bus seam nor its consumers — a real option to prioritize
+> for fixed-observer deployments, not a someday-maybe.
+
 Ambisonics is still the right tool for the **diffuse layer** (ambient beds,
 reflections/reverb), where energy isn't sweet-spot-sensitive and a fixed decode is
 fine. If/when that layer is added, decode it with a static matrix (see below). The

@@ -20,8 +20,15 @@
  * rebuilds the engine with the edited positions, since the layout is load-time), so you can hear the
  * panning — gaps, smoothness, holes — and at the CAVE you walk the room to judge off-center coverage.
  *
+ * Press C for a COVERAGE overlay: each direction is shaded by its nearest-speaker angular gap (green
+ * = a speaker sits near that direction, red = a hole the DBAP pan would smear across far speakers). V
+ * switches the observer model — both are real deployments: FIXED (a single audience sweet spot, a
+ * supported mode served by a static listener; see docs/spatialization.md) or MOVING (the default:
+ * mean coverage over a grid of listener positions across the working volume). Watch the worst-direction
+ * number drop as you move speakers to fill the red patches — that is the layout optimization.
+ *
  * Controls (edit): [ ] select speaker (or left-click)   arrows X/Z, R/F Y (SHIFT = fine)
- *           ENTER type exact "x y z"   PgUp/PgDn gain_db   T tone on/off   N sine/noise   S save   L reload
+ *           ENTER type "x y z"   PgUp/PgDn gain_db   T tone   N sine/noise   C coverage   V observer   S save   L reload
  * Controls (preview, P toggles): WASD/RF move the source   SPACE auto-orbit/near-far/high-low sweep
  *           Common: right-drag/wheel camera   ESC quit
  * Build: cmake -S . -B build -DBWAUDIO_BUILD_PLAYGROUND=ON && cmake --build build --target bw_layout_tool
@@ -152,6 +159,17 @@ static int         preview, pv_orbit, layout_dirty = 1;   /* dirty=1 forces the 
 static float       pv_t;
 static Vector3     src_pos = { 1.5f, 0.0f, 0.0f };
 
+/* ---- coverage overlay: angular gap to the nearest speaker, over a shell of source directions ----
+ * A geometric proxy for DBAP localization: a direction with no nearby speaker forces the pan to
+ * spread energy to far-off-axis speakers (a hole). Shades each direction green (covered) -> red (gap).
+ * coverage_moving toggles the observer model: fixed = the centre sweet spot; moving = mean over a
+ * working-volume grid of listener positions (this installation's case — see docs/spatialization.md). */
+#define NCOV   380
+#define COV_R  3.0f
+static int         coverage_on, coverage_moving = 1;   /* default to the moving-observer worst case */
+static Vector3     cov_dir[NCOV];                      /* even (Fibonacci) source directions */
+static Vector3     cov_lis[27];                        /* [0]=origin (fixed); [0..26]=3x3x3 working-volume grid */
+
 /* a ~2 s mono 16-bit pink-noise loop for the preview source (broadband -> localises well) */
 static void gen_pink_wav(const char* p) {
     uint32_t n = SR * 2;
@@ -227,6 +245,17 @@ int main(int argc, char** argv) {
     gen_pink_wav(PREV_WAV);                        /* the moving DBAP-preview source signal */
     build_engine(NULL);                           /* edit-mode engine (the test signal is layout-independent) */
 
+    /* coverage shell: even directions on a sphere (Fibonacci) + a working-volume listener grid */
+    for (int i = 0; i < NCOV; ++i) {
+        float y = 1.0f - 2.0f * ((float)i + 0.5f) / NCOV;
+        float r = sqrtf(1.0f - y * y), th = (float)i * 2.39996323f;   /* golden angle */
+        cov_dir[i] = (Vector3){ r * cosf(th), y, r * sinf(th) };
+    }
+    cov_lis[0] = (Vector3){ 0, 0, 0 };
+    { const float ax[3] = { -1.0f, 0.0f, 1.0f }, ay[3] = { -0.3f, 0.0f, 0.3f }; int li = 1;   /* listener-movement envelope */
+      for (int xi = 0; xi < 3; ++xi) for (int zi = 0; zi < 3; ++zi) for (int yi = 0; yi < 3; ++yi)
+          if (!(ax[xi] == 0 && ay[yi] == 0 && ax[zi] == 0)) cov_lis[li++] = (Vector3){ ax[xi], ay[yi], ax[zi] }; }
+
     InitWindow(1040, 720, "bwaudio - speaker layout tool");
     SetTargetFPS(60);
     Camera3D cam = { .target = { 0, 0, 0 }, .up = { 0, 1, 0 }, .fovy = 55, .projection = CAMERA_PERSPECTIVE };
@@ -294,6 +323,8 @@ int main(int argc, char** argv) {
             if (IsKeyPressed(KEY_ENTER)) { editing = 1; ilen = 0; ibuf[0] = 0; }
             if (IsKeyPressed(KEY_S)) { save_flash = save_json(path) ? 2.0f : -2.0f; }
             if (IsKeyPressed(KEY_L)) { load_json(path); layout_dirty = 1; }
+            if (IsKeyPressed(KEY_C)) coverage_on = !coverage_on;       /* coverage overlay */
+            if (IsKeyPressed(KEY_V)) coverage_moving = !coverage_moving;
             if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT) && !IsMouseButtonDown(MOUSE_BUTTON_RIGHT)) {  /* click-pick the nearest speaker (not while orbiting) */
                 Ray ray = GetMouseRay(GetMousePosition(), cam);
                 float best = 1e9f; int hit = -1;
@@ -354,6 +385,7 @@ int main(int argc, char** argv) {
         for (int i = 0; i < NSPK; ++i) { float dd = Vector3Length(spk[i].pos); if (dd > dmax) dmax = dd; }
         float seld   = Vector3Length(spk[sel].pos);
         float seldel = (dmax - seld) / SPEED_OF_SOUND * 1000.0f;
+        float cov_worst = 0.0f, cov_mean = 0.0f;        /* coverage summary, filled by the overlay below */
 
         BeginDrawing();
         ClearBackground((Color){ 22, 22, 28, 255 });
@@ -375,6 +407,33 @@ int main(int argc, char** argv) {
             DrawLine3D((Vector3){ 0, 0, 0 }, src_pos, (Color){ 90, 220, 90, 200 });
             DrawSphere(src_pos, 0.16f, (Color){ 240, 120, 90, 255 });
         }
+        if (coverage_on && !preview) {                   /* shade each source direction by its nearest-speaker gap */
+            int NL = coverage_moving ? 27 : 1;
+            Vector3 sdir[27][26];                         /* speaker directions from each listener sample */
+            for (int l = 0; l < NL; ++l)
+                for (int i = 0; i < NSPK; ++i)
+                    sdir[l][i] = Vector3Normalize(Vector3Subtract(spk[i].pos, cov_lis[l]));
+            float worst = 1.0f; double macc = 0.0;       /* worst = min score (largest gap) */
+            for (int s = 0; s < NCOV; ++s) {
+                Vector3 d = cov_dir[s];                   /* a source DIRECTION, queried from each listener */
+                float acc = 0.0f;                        /* mean over listeners of (max over speakers of alignment) */
+                for (int l = 0; l < NL; ++l) {           /* from listener L, how near is the best speaker to direction d? */
+                    float best = -1.0f;
+                    for (int i = 0; i < NSPK; ++i) { float dp = Vector3DotProduct(d, sdir[l][i]); if (dp > best) best = dp; }
+                    acc += best;
+                }
+                float score = acc / (float)NL;            /* typical coverage of d over the roam (mean, not worst corner) */
+                float t = (score - 0.5f) / 0.366f; if (t < 0) t = 0; if (t > 1) t = 1;   /* >=60 deg gap red, <=30 green */
+                DrawCubeV(Vector3Scale(d, COV_R), (Vector3){ 0.09f, 0.09f, 0.09f },
+                          (Color){ (unsigned char)(230*(1-t)+50*t), (unsigned char)(60*(1-t)+225*t), 75, 205 });
+                if (score < worst) worst = score;
+                float a = score < -1 ? -1 : (score > 1 ? 1 : score);
+                macc += acosf(a);
+            }
+            float w = worst < -1 ? -1 : (worst > 1 ? 1 : worst);
+            cov_worst = acosf(w) * 57.2958f;
+            cov_mean  = (float)(macc / NCOV) * 57.2958f;
+        }
         EndMode3D();
 
         /* 2D index labels projected from 3D */
@@ -393,7 +452,7 @@ int main(int argc, char** argv) {
                                 src_pos.x, src_pos.y, src_pos.z, pv_orbit ? "ON" : "off"),
                      10, 30, 16, (Color){ 240, 160, 120, 255 });
         } else {
-            DrawText("[ ] select (or click)   arrows X/Z  R/F Y  (SHIFT fine)   ENTER type x y z   PgUp/Dn gain   T tone  N noise   P preview   S save  L reload",
+            DrawText("[ ] select (or click)   arrows X/Z  R/F Y (SHIFT fine)   ENTER type x y z   PgUp/Dn gain   T tone  N noise   C coverage  V obs   P preview   S save  L reload",
                      10, 8, 13, RAYWHITE);
             DrawText(TextFormat("speaker %d / %d  ->  channel %d   pos (%.3f, %.3f, %.3f)   gain %+.1f dB   delay %.3f ms   dist %.3f m",
                                 sel, NSPK, sel, spk[sel].pos.x, spk[sel].pos.y, spk[sel].pos.z, spk[sel].gain_db, seldel, seld),
@@ -412,6 +471,13 @@ int main(int argc, char** argv) {
             DrawText(TextFormat("saved -> %s", path), GetScreenWidth() - 320, 76, 15, (Color){ 120, 245, 140, 255 });
         else if (save_flash < 0)
             DrawText("SAVE FAILED (path not writable?)", GetScreenWidth() - 320, 76, 15, (Color){ 245, 120, 120, 255 });
+        if (coverage_on && !preview) {                   /* bottom: the angular-coverage summary */
+            int yb = GetScreenHeight() - 26;
+            DrawRectangle(0, yb - 5, GetScreenWidth(), 31, (Color){ 0, 0, 0, 195 });
+            DrawText(TextFormat("angular coverage [%s]   worst direction %.0f deg   mean %.0f deg   green=covered  red=gap   (V toggles observer, C hides)",
+                                coverage_moving ? "moving: mean over working volume" : "fixed: centre sweet spot", cov_worst, cov_mean),
+                     10, yb, 15, cov_worst > 45.0f ? (Color){ 245, 150, 110, 255 } : (Color){ 150, 225, 160, 255 });
+        }
         EndDrawing();
     }
 
