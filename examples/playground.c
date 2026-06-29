@@ -7,7 +7,8 @@
  *
  * Scenes (cycle with TAB):
  *   1 Localization      — pure listener-relative DBAP. Move a source, turn your head, switch the
- *                         test signal (1-4); hear it localise around the 26-speaker array.
+ *                         test signal (1-4); hear it localise around the 26-speaker array. SPACE
+ *                         auto-moves it: orbit + near/far + high/low, sweeping the whole space.
  *   2 Occlusion+Materials — a real Steam Audio occluder. Push the source BEHIND the wall and the
  *                         off-thread sim attenuates + spectrally tilts it by the wall MATERIAL (M to
  *                         cycle concrete/glass/carpet/wood/metal); in FRONT, a mirror-image source
@@ -212,21 +213,45 @@ static void draw_head(Quaternion q) {
 }
 
 /* ============================= Scene 1: Localization (pure DBAP) ============================= */
-static void loc_enter(void)  { bw_source_set_gain(e, src, SRC_GAIN); }
+/* auto-move (SPACE): a hands-free demo that circles the listener while breathing near<->far and
+ * bobbing high<->low on three incommensurate periods, so the source sweeps the whole space over time. */
+static int   loc_auto;
+static float loc_t;
+enum { LOC_TRAIL = 96 };
+static Vector3 loc_trail[LOC_TRAIL];
+static int     loc_trail_len;
+
+static void loc_enter(void)  { bw_source_set_gain(e, src, SRC_GAIN); loc_auto = 0; loc_trail_len = 0; }
 static void loc_update(float dt) {
-    (void)dt;
+    if (IsKeyPressed(KEY_SPACE)) { loc_auto = !loc_auto; if (loc_auto) { loc_t = 0.0f; loc_trail_len = 0; } }
+    if (loc_auto) {
+        loc_t += dt;
+        float az = 0.62f * loc_t;                         /* circle the listener   (~10 s / orbit) */
+        float r  = 2.0f + 1.2f * sinf(0.90f * loc_t);     /* near <-> far  0.8..3.2 (~7 s) */
+        float y  = 1.2f  * sinf(1.14f * loc_t);           /* low  <-> high -1.2..1.2 (~5.5 s) */
+        source_pos = (Vector3){ r * cosf(az), y, r * sinf(az) };
+        if (loc_trail_len < LOC_TRAIL) loc_trail[loc_trail_len++] = source_pos;
+        else { memmove(loc_trail, loc_trail + 1, (LOC_TRAIL - 1) * sizeof(Vector3)); loc_trail[LOC_TRAIL - 1] = source_pos; }
+    }
     bw_source_set_pos(e, src, source_pos.x, source_pos.y, source_pos.z);
     bw_source_set_gain(e, src, SRC_GAIN);
 }
 static void loc_draw3d(void) {
+    if (loc_auto) {
+        for (int i = 1; i < loc_trail_len; ++i)           /* fading trail of the swept path */
+            DrawLine3D(loc_trail[i - 1], loc_trail[i], (Color){ 90, 220, 90, (unsigned char)(40 + 180 * i / loc_trail_len) });
+        DrawLine3D(source_pos, (Vector3){ source_pos.x, 0, source_pos.z }, (Color){ 90, 220, 90, 60 }); /* height drop line */
+    }
     DrawLine3D((Vector3){ 0, 0, 0 }, source_pos, (Color){ 90, 220, 90, 220 });
     DrawSphere(source_pos, 0.18f, RED);
 }
 static void loc_hud(int y) {
-    DrawText(TextFormat("signal [1-4]: %s   (broadband + sharp onsets localise best; the tone is ambiguous on purpose)",
-                        SIG_NAMES[cur_sig]), 12, y, 15, (Color){ 110, 200, 255, 255 });
-    DrawText(TextFormat("source (%.2f, %.2f, %.2f)   head %.0f deg",
-                        source_pos.x, source_pos.y, source_pos.z, head_yaw * 57.2958f),
+    DrawText(TextFormat("[SPACE] auto-move %s   signal [1-4]: %s   (broadband + sharp onsets localise best)",
+                        loc_auto ? "ON - orbit + near/far + high/low" : "off", SIG_NAMES[cur_sig]),
+             12, y, 15, (Color){ 110, 200, 255, 255 });
+    DrawText(TextFormat("source (%.2f, %.2f, %.2f)   head %.0f deg%s",
+                        source_pos.x, source_pos.y, source_pos.z, head_yaw * 57.2958f,
+                        loc_auto ? "   (WASD paused while auto-move runs)" : ""),
              12, y + 22, 15, (Color){ 200, 200, 210, 255 });
 }
 
