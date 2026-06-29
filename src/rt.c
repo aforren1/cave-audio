@@ -581,14 +581,22 @@ static void mix_voice(RtCore* c, Voice* v, uint16_t idx, float* bus, uint32_t n,
         if (air_a_tgt > 1.f) air_a_tgt = 1.f;
         air_a_step = (air_a_tgt - v->air_a_cur) / (float)n;
     }
-    float dop_tgt = 0.f, dop_step = 0.f, *dring = NULL; uint32_t dmask = 0;
+    float dop_end = 0.f, dop_step = 0.f, *dring = NULL; uint32_t dmask = 0;
     if (v->dop_on && c->dop_ring) {
-        float ds = dist / BW_SPEED_OF_SOUND * (float)c->sample_rate;
+        float ds = dist / BW_SPEED_OF_SOUND * (float)c->sample_rate;   /* raw propagation delay (samples) */
         float maxd = (float)(c->dop_ringlen - 2);          /* keep both interpolation taps in-ring */
         if (ds > maxd) ds = maxd;
-        dop_tgt = ds;
         if (v->dop_init) { v->dop_delay = ds; v->dop_init = false; }   /* snap on the first block: no enable glitch */
-        dop_step = (dop_tgt - v->dop_delay) / (float)n;
+        /* Glide only a FRACTION toward the target each block (~frame-length time constant), not all the
+         * way. Position is committed per video frame (~60 Hz) but we render several blocks per frame; if
+         * the delay snapped to the new distance each block it would apply the pitch shift in bursts (one
+         * block, then static) -> choppy/buzzy. A leaky glide spreads each per-frame step across the
+         * blocks between frames, so the resampling stays continuous; in steady motion the delay's rate
+         * still equals the true closing rate (correct Doppler) with only a small constant lag. */
+        float a = (float)n / (float)c->sample_rate / 0.02f;           /* block_time / tau (tau ~ 20 ms) */
+        if (a > 1.f) a = 1.f; else if (a < 0.08f) a = 0.08f;
+        dop_end = v->dop_delay + (ds - v->dop_delay) * a;
+        dop_step = (dop_end - v->dop_delay) / (float)n;
         dring = c->dop_ring + (size_t)idx * c->dop_ringlen; dmask = c->dop_ringlen - 1;
     }
 
@@ -634,7 +642,7 @@ static void mix_voice(RtCore* c, Voice* v, uint16_t idx, float* bus, uint32_t n,
     v->occ_cur = occ_tgt;                                        /* land exactly (same local) */
     v->dir_cur = dir_tgt;
     if (v->air_on) v->air_a_cur = air_a_tgt;                     /* land the ramped propagation params */
-    if (v->dop_on) v->dop_delay = dop_tgt;
+    if (v->dop_on) v->dop_delay = dop_end;
     if (do_send)   v->refl_g_cur = refl_tgt;
     if (v->eq_engaged) {
         for (int b = 0; b < 3; ++b) for (int k = 0; k < 5; ++k) v->eq_co[b][k] = co_tgt[b][k];   /* land coeffs */
