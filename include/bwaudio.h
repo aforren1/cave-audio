@@ -187,6 +187,10 @@ BW_API void     bw_source_set_doppler(BwEngine* e, BwSource s, bool on);
 /* Air absorption: a distance-driven high-frequency low-pass (far sources sound duller). Subtle at a
  * few metres, pronounced for sources placed at large virtual distances. */
 BW_API void     bw_source_set_air_absorption(BwEngine* e, BwSource s, bool on);
+/* Source spread / size: angular width of the source, 0 = a point (default) .. 1 = wide. Spreads the
+ * source's energy across the speakers around its direction (a waterfall/crowd/ambience that shouldn't
+ * collapse to one point), centred on its direction and constant-power. Works with any panner. */
+BW_API void     bw_source_set_spread(BwEngine* e, BwSource s, float amount);
 
 /* ---- channel test / diagnostics (control thread; no SDK needed) ----
  * Drive a single OUTPUT channel with a built-in test signal, injected AFTER the per-speaker align

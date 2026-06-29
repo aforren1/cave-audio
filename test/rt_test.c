@@ -98,6 +98,13 @@ static int count_zc(const float* x, int n) {     /* sign changes (zero crossings
 static int argmax_abs(const float* x, int n) {
     int best = 0; float bm = -1.f; for (int i = 0; i < n; ++i) { float a = fabsf(x[i]); if (a > bm) { bm = a; best = i; } } return best;
 }
+static double total_l2(void) { double e = 0; for (int i = 0; i < CH * N; ++i) e += (double)bus[i] * bus[i]; return sqrt(e); }
+static int active_channels(double frac) {     /* channels carrying > frac of the total energy */
+    double tot = total_energy(); int z = 0;
+    if (tot <= 0) return 0;
+    for (int ch = 0; ch < CH; ++ch) if (chan_energy(ch) > frac * tot) ++z;
+    return z;
+}
 
 /* write a 4-channel (1st-order AmbiX) wav with constant W/Y/Z/X per frame (ACN order, SN3D) */
 static int write_ambix4_wav(const char* path, float w, float y, float z, float x, uint32_t frames) {
@@ -324,6 +331,32 @@ int main(void) {
         }
     }
 
+    /* source spread: widening a point source spreads its energy across more speakers, constant-power */
+    {
+        RtCore* cs = rt_create(8, 4, RATE, CH);
+        CHECK(cs != NULL, "rt_create (spread)");
+        if (cs) {
+            uint32_t ssnd = rt_load_sound(cs, WAV, err, sizeof err);
+            uint32_t hsp = rt_source_create(cs);
+            rt_source_play(cs, hsp, ssnd, true);
+            set_pos_spk(cs, hsp, 7);                         /* a point at speaker 7 */
+            rt_commit(cs); render2(cs);
+            int    act_point = active_channels(0.03);
+            double l2_point  = total_l2();
+            double share_pt  = chan_energy(argmax_channel()) / total_energy();
+            rt_source_set_spread(cs, hsp, 1.0f);             /* widen to maximum */
+            rt_commit(cs); render2(cs);
+            int    act_spread = active_channels(0.03);
+            double l2_spread  = total_l2();
+            double share_sp   = chan_energy(argmax_channel()) / total_energy();
+            CHECK(act_spread > act_point + 2, "spread widens the source across more speakers");
+            CHECK(share_sp < share_pt, "spread lowers the dominant channel's share");
+            CHECK(l2_point > 0 && fabs(l2_spread - l2_point) / l2_point < 0.02, "spread preserves total power (constant-power)");
+            rt_source_destroy(cs, hsp); rt_commit(cs);
+            rt_destroy(cs);
+        }
+    }
+
     /* propagation effects (opt-in per voice): air absorption (distance low-pass) + Doppler (glided delay) */
     {
         RtCore* cp = rt_create(8, 4, RATE, CH);
@@ -407,6 +440,6 @@ int main(void) {
 
     remove(WAV);
     if (fails) { printf("rt_test: %d FAILURES\n", fails); return 1; }
-    printf("rt_test OK (DBAP, commit, gen-drop, gain, occlusion, EQ, directivity, bed, reflection-tap, channel-test, air+Doppler verified)\n");
+    printf("rt_test OK (DBAP, commit, gen-drop, gain, occlusion, EQ, directivity, bed, reflection-tap, channel-test, air+Doppler, spread verified)\n");
     return 0;
 }

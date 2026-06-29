@@ -69,6 +69,7 @@ typedef struct {
     float    air_a_cur, air_y1;
     float    dop_delay;
     uint32_t dop_w;
+    float    spread;                         /* source angular width 0..1 (0 = point); blends the pan gains */
 } Voice;
 
 typedef struct {
@@ -377,6 +378,8 @@ static void drain_commands(RtCore* c) {
             } } break;
         case CMD_SET_AIR: { Voice* v = voice_for(c, cmd->handle);
             if (v) v->air_on = cmd->u.air.on != 0; } break;
+        case CMD_SET_SPREAD: { Voice* v = voice_for(c, cmd->handle);
+            if (v) { float a = cmd->u.spread.amount; v->spread = a < 0.f ? 0.f : (a > 1.f ? 1.f : a); v->dirty = true; } } break;
         case CMD_TEST_SIGNAL: {
             uint32_t ch = cmd->u.test.channel;
             if (ch < c->channels) { c->test_kind[ch] = cmd->u.test.kind; c->test_gain[ch] = cmd->u.test.gain; }
@@ -445,6 +448,38 @@ static void build_bed_decode(RtCore* c) {
     build_bed_decode_sad(c);
 }
 
+/* Source spread/size: blend the panner's point gains toward a width-controlled lobe centred on the
+ * source direction (from the listener), then renormalise constant-power. spread 0 = the point gains;
+ * 1 = a wide lobe. Panner-agnostic; runs only in the per-block gain solve (not the sample loop). */
+static void spread_gains(RtCore* c, const Voice* v, float* g) {
+    float d[3] = { v->pos_active[0]-c->lis.p_active[0], v->pos_active[1]-c->lis.p_active[1], v->pos_active[2]-c->lis.p_active[2] };
+    float dl = sqrtf(d[0]*d[0] + d[1]*d[1] + d[2]*d[2]);
+    if (dl < 1e-6f) return;                              /* source on the listener: no direction to spread around */
+    d[0]/=dl; d[1]/=dl; d[2]/=dl;
+    double p0 = 0.0; for (uint32_t k = 0; k < c->channels; ++k) p0 += (double)g[k]*g[k];
+    float P = (float)sqrt(p0);                           /* preserve the panner's own power (never re-level) */
+    if (P < 1e-9f) return;
+    float s = v->spread; if (s > 1.f) s = 1.f;
+    float q = 1.5f + (1.f - s) * 6.f;                    /* lobe exponent: wide at s=1, tight as s->0 */
+    float lobe[BW_CHANNELS]; double ln = 0.0;
+    for (uint32_t k = 0; k < c->channels; ++k) {
+        const float* sp = c->layout.speakers[k].pos;
+        float sd[3] = { sp[0]-c->lis.p_active[0], sp[1]-c->lis.p_active[1], sp[2]-c->lis.p_active[2] };
+        float sl = sqrtf(sd[0]*sd[0] + sd[1]*sd[1] + sd[2]*sd[2]);
+        float dot = sl > 1e-6f ? (sd[0]*d[0] + sd[1]*d[1] + sd[2]*d[2]) / sl : 0.f;
+        float w = 0.5f * (1.f + dot); if (w < 0.f) w = 0.f;   /* [0,1], 1 toward the source */
+        lobe[k] = powf(w, q);
+        ln += (double)lobe[k] * lobe[k];
+    }
+    if (ln < 1e-12) return;
+    float lnorm = (float)(P / sqrt(ln));                 /* scale the lobe to the same power P */
+    double bn = 0.0;
+    for (uint32_t k = 0; k < c->channels; ++k) { g[k] = (1.f - s) * g[k] + s * lobe[k] * lnorm; bn += (double)g[k]*g[k]; }
+    if (bn < 1e-12) return;
+    float bnorm = P / (float)sqrt(bn);                   /* the blend isn't norm-P -> renormalise back to P */
+    for (uint32_t k = 0; k < c->channels; ++k) g[k] *= bnorm;
+}
+
 /* DBAP gain solve (M4): listener-relative, dirty-gated. CMD_COMMIT re-dirties a voice on a
  * position change and dirties all voices on a listener move (gains are listener-relative). A bed
  * voice (multi-channel asset) has no DBAP position — its master gain rides gtarget[0]. */
@@ -457,6 +492,7 @@ static void compute_gains(RtCore* c, Voice* v) {
         vbap_gains(&c->vbap, v->pos_active, c->lis.p_active, &c->layout, c->layout_gen, v->gain_user, v->gtarget);
     else
         dbap_gains(v->pos_active, c->lis.p_active, &c->layout, v->gain_user, v->gtarget);
+    if (v->spread > 1e-3f) spread_gains(c, v, v->gtarget);   /* widen the image if this source has size */
 }
 
 /* Mix one voice: read its sound at the cursor (looping or ending), spatialize through the
@@ -770,6 +806,13 @@ void rt_source_set_doppler(RtCore* c, uint32_t h, bool on) {
 void rt_source_set_air_absorption(RtCore* c, uint32_t h, bool on) {
     Cmd cmd = { .type = CMD_SET_AIR, .handle = h };
     cmd.u.air.on = on ? 1u : 0u;
+    cmd_push(&c->cmds, &cmd);
+}
+
+void rt_source_set_spread(RtCore* c, uint32_t h, float amount) {
+    if (!isfinite(amount)) return;
+    Cmd cmd = { .type = CMD_SET_SPREAD, .handle = h };
+    cmd.u.spread.amount = amount;
     cmd_push(&c->cmds, &cmd);
 }
 

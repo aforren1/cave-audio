@@ -128,6 +128,14 @@ part is a separate float) so a voice running for hours never loses sample precis
 with distance (cutoff ≈ 18 kHz near, −650 Hz/m, ≥1.2 kHz). Subtle in-room, pronounced for far virtual
 sources. Both ramp per sample (no zipper) and tap the reflection send *before* themselves.
 
+**Source spread/size** gives a source angular width (a waterfall/crowd shouldn't collapse to a point).
+It runs in the per-block gain solve, not the sample loop: the panner's point gains are blended toward a
+width-controlled lobe `(½(1+cosθ))^q` centred on the source direction (q shrinks as spread→1, widening
+the lobe), then renormalised to *the panner's own power* — so widening redistributes energy without
+re-levelling and keeps the centroid on the source direction. Panner-agnostic; the new gains ramp like
+any other gain change. (A future refinement is true multi-direction panning — MDAP — if the lobe blend
+proves too coarse on the real array.)
+
 ## Binaural debug path
 
 The binaural monitor is a **bus→stereo** transform that consumes the same 26-ch bus

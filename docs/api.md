@@ -282,6 +282,19 @@ delay both glide across the block — no zipper), and are independent of each ot
 profile. They apply to the **direct path only** — the reflection wet send is tapped *before* them, so
 reflections keep their own propagation. They do not affect ambisonic beds (world-locked, no position).
 
+## Source spread / size (control thread; per-frame)
+
+```c
+void bw_source_set_spread(BwEngine* e, BwSource s, float amount);   // 0 = point (default) .. 1 = wide
+```
+
+Angular **width** of a source. A waterfall, a crowd, an engine room, or ambience shouldn't collapse to
+a single point; raise `spread` and the source's energy fans out across the speakers around its
+direction. Implemented in the per-block gain solve (not the sample loop): the panner's point gains are
+blended toward a width-controlled lobe centred on the source direction, then **renormalised to the
+panner's own power** — so widening never changes loudness, and the perceived direction stays put. It's
+**panner-agnostic** (works over DBAP/SPCAP/VBAP) and the change ramps click-free like any gain change.
+
 ## Channel test / diagnostics (control thread)
 
 ```c

@@ -128,7 +128,10 @@ create) whose delay glides toward `distance/c` — the glide rate is the pitch s
 ~8 m; and **air absorption** (`bw_source_set_air_absorption`) a distance-driven one-pole HF low-pass.
 Both compute the source↔listener distance per block, ramp per sample (invariant 4), and tap the
 reflection send *before* themselves (direct path only); indices stay integer so a long-lived voice
-never loses sample precision. An **ambisonic bed** is implemented too (`bw_load_ambix` + `bw_bed_*`):
+never loses sample precision. **Source spread/size** (`bw_source_set_spread`, 0=point..1=wide) is also
+in: the per-block gain solve blends the panner's point gains toward a width-controlled lobe centred on
+the source direction, renormalised to the panner's own power (widening never re-levels) — panner-agnostic.
+An **ambisonic bed** is implemented too (`bw_load_ambix` + `bw_bed_*`):
 a file-fed AmbiX soundfield decoded world-locked to the 26-ch bus (`rt.c` `build_bed_decode`/`mix_bed`,
 phonon-free), reusing the SH→26 decode the reflection bed will need. `sound.c` now decodes **WAV/FLAC/MP3**
 (dr_libs, one pinned repo fetch) and **resamples to the engine rate at load** (windowed-sinc).

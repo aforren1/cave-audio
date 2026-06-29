@@ -612,6 +612,10 @@ void bw_source_set_air_absorption(BwEngine* e, BwSource s, bool on) {
     if (e) rt_source_set_air_absorption(e->rt, s, on);
 }
 
+void bw_source_set_spread(BwEngine* e, BwSource s, float amount) {
+    if (e) rt_source_set_spread(e->rt, s, amount);
+}
+
 void bw_source_set_orientation(BwEngine* e, BwSource s, float qx, float qy, float qz, float qw) {
 #ifdef BW_HAVE_STEAMAUDIO
     if (!e || !e->scene) return;
