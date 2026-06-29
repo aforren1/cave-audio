@@ -32,7 +32,7 @@
 /* propagation effects (opt-in, per voice) */
 #define BW_SPEED_OF_SOUND   343.0f    /* m/s */
 #define BW_DOPPLER_MAX_DIST 8.0f      /* propagation delay saturates past this (bounds the per-voice ring) */
-#define BW_DOPPLER_TAU      0.008f    /* per-pole smoothing time for the delay glide (s); see mix_voice */
+#define BW_DOPPLER_TAU      0.032f    /* per-pole delay low-pass time (s); FFT-tuned, see mix_voice */
 #define BW_AIR_FC_NEAR   18000.0f     /* air-absorption low-pass cutoff (Hz) at zero distance ... */
 #define BW_AIR_FC_PER_M    650.0f     /* ... falling this many Hz per metre ... */
 #define BW_AIR_FC_FLOOR   1200.0f     /* ... down to this floor */
@@ -588,13 +588,15 @@ static void mix_voice(RtCore* c, Voice* v, uint16_t idx, float* bus, uint32_t n,
         float maxd = (float)(c->dop_ringlen - 2);          /* keep both interpolation taps in-ring */
         if (dop_ds > maxd) dop_ds = maxd;
         if (v->dop_init) { v->dop_delay = dop_ds; v->dop_dtgt = dop_ds; v->dop_init = false; }  /* snap: no enable glitch */
-        /* The read delay is smoothed toward distance/c PER SAMPLE with a 2-pole filter (target then
+        /* The read delay is low-passed toward distance/c PER SAMPLE with a 2-pole filter (target then
          * delay, BW_DOPPLER_TAU each). Position is committed per video frame (~60 Hz) but we render many
-         * samples per frame; a per-block glide left a slope corner in the read trajectory at every block
-         * (and every position step), which a pure tone hears as residual grain. Smoothing per sample
-         * through two poles makes the read RATE continuous (no corners), so the pitch glides cleanly; in
-         * steady motion the delay's rate still equals the true closing rate (correct Doppler), with only
-         * a small constant lag. */
+         * samples per frame, so the raw target is a staircase; its fundamental (the commit rate) would
+         * FM-modulate the carrier into audible sidebands (worse at HF). The cutoff (~5 Hz, BW_DOPPLER_TAU
+         * = 32 ms) was set with test/bw_doppler_fft: it keeps the commit-rate sidebands below ~ -45 dB at
+         * 1 kHz / -38 dB at 4 kHz. Low-passing the delay preserves the ramp's SLOPE, so steady-motion
+         * pitch is exact; it only offsets the delay value by ~v*group_delay (sub-millisecond), and
+         * rounds pitch transitions over the group delay (natural). A plain velocity tracker is worse
+         * here (it overshoots each staircase step). */
         dop_k = 1.f / (BW_DOPPLER_TAU * (float)c->sample_rate);
         if (dop_k > 0.5f) dop_k = 0.5f;
         dring = c->dop_ring + (size_t)idx * c->dop_ringlen; dmask = c->dop_ringlen - 1;

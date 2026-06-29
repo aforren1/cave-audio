@@ -194,6 +194,10 @@ if(BWAUDIO_BUILD_TESTS)
   target_link_libraries(bw_rt_test PRIVATE bw_core)
   add_test(NAME rt COMMAND bw_rt_test)
 
+  # Doppler-quality probe (diagnostic; prints an FFT spectrum report, not a ctest)
+  add_executable(bw_doppler_fft test/doppler_fft.c)
+  target_link_libraries(bw_doppler_fft PRIVATE bw_core)
+
   add_executable(bw_sound_test test/sound_test.c)
   target_link_libraries(bw_sound_test PRIVATE bw_core)
   add_test(NAME sound COMMAND bw_sound_test)

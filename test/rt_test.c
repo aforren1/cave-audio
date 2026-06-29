@@ -411,26 +411,39 @@ int main(void) {
              * Both start at 4 m with Doppler on (same initial propagation fill); the moving one glides
              * in to 0.5 m, so its read pointer outruns its write -> the 1 kHz tone resamples higher. */
             const char* SW1 = "bw_rt_sine1k.wav";
-            if (write_sine_wav(SW1, 1000.0, 64 * N)) {
+            if (write_sine_wav(SW1, 1000.0, 128 * N)) {
+                /* The delay smoother is heavy (low cutoff, for a clean spectrum), so warm up past its
+                 * group delay + the ring fill, then measure the STEADY-STATE pitch over the tail. */
+                enum { WARM = 16, KB = 24, TOT = WARM + KB };
                 uint32_t s1 = rt_load_sound(cp, SW1, err, sizeof err);
-                float cap[8 * N];
-                uint32_t hst = rt_source_create(cp);
+                float cap[KB * N];
+                BwTimestamp ts = { 0, 0 };
+
+                uint32_t hst = rt_source_create(cp);                  /* static reference at 4 m */
                 rt_source_set_pos(cp, hst, 4.f, 0.f, 0.f);
                 rt_source_set_doppler(cp, hst, true);
-                rt_source_play(cp, hst, s1, true);
-                rt_commit(cp);
-                render_capture_mono(cp, cap, 8);
-                int zc_static = count_zc(cap, 8 * N);
+                rt_source_play(cp, hst, s1, true); rt_commit(cp);
+                for (int b = 0; b < TOT; ++b) {
+                    rt_render(cp, bus, N, &ts);
+                    if (b >= WARM) for (uint32_t i = 0; i < N; ++i) {
+                        double s = 0; for (int ch = 0; ch < CH; ++ch) s += bus[(size_t)ch*N + i]; cap[(b-WARM)*N + i] = (float)s; }
+                }
+                int zc_static = count_zc(cap, KB * N);
                 rt_source_destroy(cp, hst); rt_commit(cp);
 
-                uint32_t hmv = rt_source_create(cp);
-                rt_source_set_pos(cp, hmv, 4.f, 0.f, 0.f);
+                uint32_t hmv = rt_source_create(cp);                  /* constant approach 7.5 m -> 0.5 m */
                 rt_source_set_doppler(cp, hmv, true);
                 rt_source_play(cp, hmv, s1, true);
-                rt_commit(cp);
-                render_capture_mono_moving(cp, hmv, 4.f, 0.5f, cap, 8);
-                int zc_moving = count_zc(cap, 8 * N);
-                CHECK(zc_moving > zc_static + 5, "Doppler: an approaching source is pitched up");
+                float md = 7.5f; const float mstep = (7.5f - 0.5f) / (TOT - 1);
+                for (int b = 0; b < TOT; ++b) {
+                    rt_source_set_pos(cp, hmv, md, 0.f, 0.f); rt_commit(cp);
+                    rt_render(cp, bus, N, &ts);
+                    if (b >= WARM) for (uint32_t i = 0; i < N; ++i) {
+                        double s = 0; for (int ch = 0; ch < CH; ++ch) s += bus[(size_t)ch*N + i]; cap[(b-WARM)*N + i] = (float)s; }
+                    md -= mstep;
+                }
+                int zc_moving = count_zc(cap, KB * N);
+                CHECK(zc_moving > zc_static + 8, "Doppler: an approaching source is pitched up");
                 rt_source_destroy(cp, hmv); rt_commit(cp);
                 remove(SW1);
             } else CHECK(0, "write 1k sine wav");
