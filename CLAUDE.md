@@ -105,8 +105,9 @@ any driver buffer size works); `bw_audio_backend()` reports the device actually 
 (`pose.h`); with `track_internal` the audio thread samples the freshest head pose at block
 time** (`rt_set_tracker`), configured via `BWAUDIO_NATNET_*` env (see docs/api.md). An
 interactive **raylib playground** (`examples/playground.c`, opt-in `-DBWAUDIO_BUILD_PLAYGROUND=ON`)
-auditions binaural by ear across four feature **scenes** (TAB): localization, occlusion+materials,
-directivity, and a channel-walk speaker check. **`bw_test_signal(channel, kind, gain)`** drives one
+auditions binaural by ear across five feature **scenes** (TAB): localization (with a SPACE auto-move
+sweep), occlusion+materials, directivity, a channel-walk speaker check, and a reverb-bed room (which
+rebuilds the engine on entry/exit, since the bed + room geometry are load-time). **`bw_test_signal(channel, kind, gain)`** drives one
 raw output channel with a 660 Hz sine/noise injected after align (`rt.c`) — a speaker-check / wiring
 tool, not a spatial path. The **production Steam Audio HRTF decode** is built + running:
 `ambisonics.c` (3rd-order encode) → `steam_decode.c` (phonon `iplAmbisonicsDecodeEffect`), gated

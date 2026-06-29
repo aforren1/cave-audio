@@ -18,9 +18,15 @@
  *   4 Channel walk      — bw_test_signal drives ONE raw output channel (speaker-check tool). Step
  *                         channels with LEFT/RIGHT (SPACE auto-walks); in binaural each channel is
  *                         HRTF'd as its virtual speaker, so the tone circles your head as you walk.
+ *   5 Reverb bed        — a static shoebox room + the Steam Audio hybrid reverb bed. Move the source
+ *                         and the room reverb follows; G dry/wet A-B, [ ] wet level. The bed + room
+ *                         geometry are LOAD-time (the room locks once the bed runs), so entering/
+ *                         leaving this scene REBUILDS the engine (a brief audio gap) — the one feature
+ *                         that can't share the interactive engine. Transient signals (clicks/bursts)
+ *                         show the tail best.
  *
  * Global keys: WASD/RF move source, Q/E turn head, 1-4 signal, TAB scene, right-drag/wheel camera, ESC.
- * Needs the Steam Audio build for occlusion/materials/directivity; without it those scenes are no-ops.
+ * Needs the Steam Audio build for occlusion/materials/directivity/reverb; without it those are no-ops.
  * Build: cmake -S . -B build -DBWAUDIO_BUILD_PLAYGROUND=ON && cmake --build build
  */
 #include "bwaudio.h"
@@ -61,6 +67,7 @@ static int default_speakers(Vector3* out) {
 #define SIGLEN   (SR * SIG_SECS)
 #define NSIG     4
 static const char* SIG_NAMES[NSIG] = { "pink noise", "pink bursts", "click train", "1 kHz tone (ambiguous)" };
+static const char* sig_files[NSIG] = { "pg_pink.wav", "pg_bursts.wav", "pg_clicks.wav", "pg_tone.wav" };
 
 static float white(unsigned int* s) {            /* white noise sample in ~[-1,1] from an LCG */
     *s = *s * 1664525u + 1013904223u;
@@ -386,6 +393,44 @@ static void chan_hud(int y) {
              12, y + 22, 15, (Color){ 200, 200, 210, 255 });
 }
 
+/* ============================= Scene 5: Reverb bed (static room) ============================= */
+/* The hybrid reverb bed needs reflections configured + the room geometry set BEFORE bw_start (the
+ * scene locks once the bed runs), so this scene runs on a SEPARATE engine config — build_engine()
+ * rebuilds the engine when crossing this boundary (see switch_scene). */
+#define ROOM_W 8.0f
+#define ROOM_H 4.0f
+#define ROOM_D 8.0f
+static int   rev_on  = 1;
+static float rev_wet = 1.0f;
+
+static void rev_enter(void) {
+    bw_source_set_gain(e, src, SRC_GAIN);
+    bw_source_set_reflections(e, src, rev_on);    /* feed the source into the shared reverb bed */
+    bw_reflections_set_gain(e, rev_wet);
+}
+static void rev_update(float dt) {
+    if (IsKeyPressed(KEY_G)) { rev_on = !rev_on; bw_source_set_reflections(e, src, rev_on); }
+    if (IsKeyDown(KEY_LEFT_BRACKET))  rev_wet = fmaxf(0.0f, rev_wet - 0.7f * dt);
+    if (IsKeyDown(KEY_RIGHT_BRACKET)) rev_wet = fminf(2.0f, rev_wet + 0.7f * dt);
+    bw_reflections_set_gain(e, rev_wet);
+    source_pos.x = Clamp(source_pos.x, -ROOM_W * 0.5f + 0.5f, ROOM_W * 0.5f - 0.5f); /* keep it inside the room */
+    source_pos.y = Clamp(source_pos.y, -ROOM_H * 0.5f + 0.5f, ROOM_H * 0.5f - 0.5f);
+    source_pos.z = Clamp(source_pos.z, -ROOM_D * 0.5f + 0.5f, ROOM_D * 0.5f - 0.5f);
+    bw_source_set_pos(e, src, source_pos.x, source_pos.y, source_pos.z);
+    bw_source_set_gain(e, src, SRC_GAIN);
+}
+static void rev_draw3d(void) {
+    DrawCubeWires((Vector3){ 0, 0, 0 }, ROOM_W, ROOM_H, ROOM_D, (Color){ 90, 110, 150, 130 });
+    DrawLine3D((Vector3){ 0, 0, 0 }, source_pos, (Color){ 90, 220, 90, 200 });
+    DrawSphere(source_pos, 0.18f, RED);
+}
+static void rev_hud(int y) {
+    DrawText(TextFormat("[G] reverb %s   [ ] wet %.2f   move the source - the room reverb follows it",
+                        rev_on ? "ON (wet)" : "off (dry)", rev_wet), 12, y, 15, (Color){ 110, 200, 255, 255 });
+    DrawText("static 8x4x8 m plaster room (Steam Audio hybrid bed) - try clicks [3] or bursts [2] to hear the tail",
+             12, y + 22, 15, (Color){ 200, 200, 210, 255 });
+}
+
 /* ---- scene table ---- */
 typedef struct {
     const char* name;
@@ -399,12 +444,54 @@ static const Scene scenes[] = {
     { "Occlusion & Materials",   occ_enter,  occ_update,  occ_draw3d,  occ_hud  },
     { "Directivity",             dir_enter,  dir_update,  dir_draw3d,  dir_hud  },
     { "Channel walk (speaker check)", chan_enter, chan_update, chan_draw3d, chan_hud },
+    { "Reverb bed (static room)", rev_enter,  rev_update,  rev_draw3d,  rev_hud  },
 };
-enum { NSCENE = sizeof scenes / sizeof scenes[0] };
+enum { NSCENE = sizeof scenes / sizeof scenes[0], SCENE_REVERB = NSCENE - 1 };
 static int cur_scene;
+static int engine_has_reverb;       /* which config the live engine was built in */
 
-/* leave the current scene at a clean baseline, then enter the new one */
+/* (re)build the engine in the interactive (no-bed, dynamic geometry) or reverb (bed + static room)
+ * config, reloading assets + recreating sources. Used at startup and on each reverb-boundary switch. */
+static void build_engine(int with_reverb) {
+    BwConfig cfg = {
+        .profile = BW_PROFILE_BINAURAL, .layout_path = NULL, .hrtf_path = NULL,
+        .sample_rate = SR, .block_size = 256, .track_internal = false,
+    };
+    e = bw_create(&cfg);
+    if (!e) { printf("bw_create failed\n"); exit(1); }
+    if (with_reverb) {
+        BwReflectionConfig rc = { .ir_seconds = 1.0f, .order = 1, .num_rays = 4096,
+                                  .num_bounces = 16, .enabled = 1, .wet_gain = 1.0f };
+        bw_reflections_config(e, &rc);
+        BwMaterial rm = bw_material_preset(e, "plaster");
+        BwMaterial faces[6] = { rm, rm, rm, rm, rm, rm };
+        bw_scene_set_box(e, ROOM_W, ROOM_H, ROOM_D, faces);     /* static room, BEFORE bw_start */
+    }
+    if (bw_start(e) != 0) {
+        const char* err = bw_last_error(e);
+        printf("bw_start: %s — no audio (install/select an ASIO driver, e.g. ASIO4ALL); the scene still runs.\n",
+               err ? err : "?");
+    }
+    backend_name   = bw_audio_backend(e);
+    backend_silent = (strncmp(backend_name, "asio", 4) != 0);
+    for (int i = 0; i < NSIG; ++i) sounds[i] = bw_load_sound(e, sig_files[i]);
+    for (int i = 0; i < NMAT; ++i) mats[i] = bw_material_preset(e, mat_names[i]);
+    src  = bw_source_create(e);  bw_source_play(e, src,  sounds[cur_sig], true);
+    refl = bw_source_create(e);  bw_source_play(e, refl, sounds[cur_sig], true);
+    bw_source_set_gain(e, refl, 0.0f);
+    if (with_reverb) bw_source_set_reflections(e, src, rev_on);
+    engine_has_reverb = with_reverb;
+}
+
+/* leave the current scene at a clean baseline, then enter the new one (rebuilding the engine if we
+ * are crossing the reverb boundary, since the bed + room geometry are load-time) */
 static void switch_scene(int idx) {
+    int want_reverb = (idx == SCENE_REVERB);
+    if (want_reverb != engine_has_reverb) {
+        printf("rebuilding engine: %s\n", want_reverb ? "reverb (bed + static room)" : "interactive");
+        if (e) { bw_stop(e); bw_destroy(e); e = NULL; }
+        build_engine(want_reverb);
+    }
     for (uint32_t ch = 0; ch < NSPK; ++ch) bw_test_signal(e, ch, BW_TEST_OFF, 0.0f);  /* clear channel walk */
     bw_source_set_gain(e, refl, 0.0f);
     bw_source_set_occlusion(e, src, false);
@@ -420,37 +507,16 @@ int main(void) {
     _putenv("BWAUDIO_SINK=asio");                             /* headphone output via a 2-ch ASIO driver */
 
     /* synthesise the localization test signals to wav (the engine loads sounds from file) */
-    const char* sig_files[NSIG] = { "pg_pink.wav", "pg_bursts.wav", "pg_clicks.wav", "pg_tone.wav" };
     float* sigbuf = (float*)malloc((size_t)SIGLEN * sizeof(float));
     if (!sigbuf) { printf("out of memory\n"); return 1; }
     for (int i = 0; i < NSIG; ++i) { gen_signal(i, sigbuf, SIGLEN); write_wav(sig_files[i], sigbuf, SIGLEN); }
     free(sigbuf);
 
-    BwConfig cfg = {
-        .profile = BW_PROFILE_BINAURAL, .layout_path = NULL, .hrtf_path = NULL,
-        .sample_rate = SR, .block_size = 256, .track_internal = false,
-    };
-    e = bw_create(&cfg);
-    if (!e) { printf("bw_create failed\n"); return 1; }
-    if (bw_start(e) != 0) {
-        const char* err = bw_last_error(e);
-        printf("bw_start: %s — no audio (install/select an ASIO driver, e.g. ASIO4ALL); the scene still runs.\n",
-               err ? err : "?");
-    }
-    backend_name   = bw_audio_backend(e);                     /* "asio:<driver>", "null", or "none" */
-    backend_silent = (strncmp(backend_name, "asio", 4) != 0); /* anything but a real ASIO device = no sound */
-    printf("audio backend: %s%s\n", backend_name,
-           backend_silent ? "   (SILENT — set BWAUDIO_ASIO_DRIVER to your headphone driver)" : "");
-
-    for (int i = 0; i < NSIG; ++i) sounds[i] = bw_load_sound(e, sig_files[i]);
-    for (int i = 0; i < NMAT; ++i) mats[i] = bw_material_preset(e, mat_names[i]);  /* mint the wall materials */
     default_speakers(speakers);
     wall_basis(wall_n, &wall_u, &wall_v);
-
-    /* both voices keep playing the selected signal across scene switches; scenes just gate the gain */
-    src  = bw_source_create(e);  bw_source_play(e, src,  sounds[cur_sig], true);
-    refl = bw_source_create(e);  bw_source_play(e, refl, sounds[cur_sig], true);
-    bw_source_set_gain(e, refl, 0.0f);
+    build_engine(0);                                          /* start in the interactive config */
+    printf("audio backend: %s%s\n", backend_name,
+           backend_silent ? "   (SILENT — set BWAUDIO_ASIO_DRIVER to your headphone driver)" : "");
 
     InitWindow(1000, 700, "bwaudio - binaural playground");
     SetTargetFPS(60);
@@ -476,6 +542,8 @@ int main(void) {
                 bw_source_play(e, src,  sounds[i], true);
                 bw_source_play(e, refl, sounds[i], true);
             }
+        /* TAB last in this block ON PURPOSE: a reverb-boundary switch REBUILDS the engine (destroys e,
+         * src, refl), so all per-source calls above must run against the still-valid engine first. */
         if (IsKeyPressed(KEY_TAB)) switch_scene((cur_scene + 1) % NSCENE);
 
         /* arcball camera: right-drag orbits, the wheel zooms */
@@ -524,8 +592,7 @@ int main(void) {
     }
 
     CloseWindow();
-    bw_stop(e);
-    bw_destroy(e);
+    if (e) { bw_stop(e); bw_destroy(e); }
     for (int i = 0; i < NSIG; ++i) remove(sig_files[i]);
     return 0;
 }
