@@ -201,6 +201,14 @@ BW_API uint32_t bw_get_speakers(BwEngine* e, float* xyz, uint32_t cap);
 typedef enum { BW_PAN_DBAP = 0, BW_PAN_SPCAP = 1 } BwPanner;
 BW_API void     bw_set_panner(BwEngine* e, BwPanner panner);
 
+/* Select the diffuse-bed ambisonic decoder (load-time: between bw_create and bw_start). SAMPLING is the
+ * default projection decode; ALLRAD (All-Round Ambisonic Decoding) decodes to a uniform virtual layout
+ * then VBAPs onto the real array — robust on an IRREGULAR/lopsided array (keeps a diffuse field even
+ * with no loud directions, and localizes better), at the cost of a heavier load-time build. Affects the
+ * ambisonic + reflection BEDS only, not the point-source panner. See docs/spatialization.md. */
+typedef enum { BW_DECODE_SAMPLING = 0, BW_DECODE_ALLRAD = 1 } BwBedDecoder;
+BW_API void     bw_set_bed_decoder(BwEngine* e, BwBedDecoder decoder);
+
 /* ---- listener (control thread; skip if track_internal) ---- */
 /* Position in room space. Quaternion is head orientation; used by the binaural
  * monitor only — the array render ignores orientation (real speakers, real ears). */

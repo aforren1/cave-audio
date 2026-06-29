@@ -133,6 +133,30 @@ A second optional mode binauralizes the **sources directly**, bypassing the pann
 useful for isolating whether a problem is in tracking/positioning or in the decode.
 The virtual-speaker tap is the default; the direct mode is a diagnostic.
 
+## Diffuse-bed decode (sampling vs AllRAD)
+
+The diffuse layer (ambisonic beds, the reflection bed) is rendered by a fixed SH→26 **decode matrix**
+applied per block (`build_bed_decode` / `mix_bed` in `rt.c`), built from the speaker geometry at load
+time. Two decoders are selectable with **`bw_set_panner`'s sibling `bw_set_bed_decoder`** (load-time):
+
+- **Sampling (`BW_DECODE_SAMPLING`, default)** — the projection decode `decode[s][k] = (2l+1)·Y_k^SN3D(dir_s)/N`
+  (`build_bed_decode_sad`). Cheap and exact for a *uniform* array, but it over-energises dense regions of
+  an irregular one (every speaker radiates a fixed diffuse energy regardless of position, so a cluster
+  of speakers makes the diffuse field loud from that direction).
+- **AllRAD (`BW_DECODE_ALLRAD`, `allrad.c`)** — All-Round Ambisonic Decoding (Zotter & Frank 2012):
+  sampling-decode to a dense **uniform virtual layout** (a Fibonacci sphere), then **VBAP** each virtual
+  loudspeaker onto the real array (its convex-hull triangulation), then energy-normalise to the sampling
+  decode. The virtual layer is uniform so the decode is well-conditioned there; VBAP absorbs the real
+  array's irregularity. Robust on a lopsided survey, at the cost of a heavier load-time build (a brute-
+  force hull + VBAP over ~240 virtual directions — the audio thread still just applies the matrix).
+
+Validated against the cube grid + a deliberately clustered array (per-direction energy CV / rE error):
+on the near-uniform cube AllRAD matches sampling (≈7% CV, a few degrees); on the **clustered** array it
+cuts the loudness-vs-direction variance from **91%→29%** and the localization error from **34°→18°**.
+AllRAD doesn't touch the point-source panner (DBAP/SPCAP) — it's the diffuse-layer counterpart to the
+placement correction those make for localized sources. The same VBAP/hull machinery is what a future
+VBAP *point* panner would need.
+
 ## Steam Audio usage
 
 Via the **C API** (not the Unity/FMOD integration). Relevant pieces:

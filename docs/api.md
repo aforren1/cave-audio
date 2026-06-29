@@ -276,7 +276,9 @@ on that DVS channel; binaural: that bus channel HRTF'd as its virtual speaker). 
 
 ```c
 typedef enum { BW_PAN_DBAP = 0, BW_PAN_SPCAP = 1 } BwPanner;
+typedef enum { BW_DECODE_SAMPLING = 0, BW_DECODE_ALLRAD = 1 } BwBedDecoder;
 void     bw_set_panner(BwEngine* e, BwPanner panner);            // load-time (between create and start)
+void     bw_set_bed_decoder(BwEngine* e, BwBedDecoder decoder);  // load-time
 uint32_t bw_get_speakers(BwEngine* e, float* xyz, uint32_t cap); // read back the layout; NULL xyz = count only
 ```
 
@@ -284,7 +286,10 @@ uint32_t bw_get_speakers(BwEngine* e, float* xyz, uint32_t cap); // read back th
 listener-relative, recomputed per frame from the tracked pose — for a **moving** observer roaming the
 array. **SPCAP** is a smooth, all-speaker, placement-correcting sweet-spot panner for a **fixed**
 observer (a static listener: don't track, set the sweet spot once); it conserves loudspeaker power
-across an uneven array. Load-time. Neither affects the diffuse bed / ambisonic paths. See
+across an uneven array. Load-time. `bw_set_bed_decoder` chooses the **diffuse-bed** SH→26 decoder:
+**sampling** (default projection decode) or **AllRAD** (decode to a uniform virtual layout + VBAP onto
+the real array — robust on an irregular array, heavier load-time build). It affects the ambisonic +
+reflection beds only, not the point-source panner. Both are load-time; see
 [`spatialization.md`](./spatialization.md). `bw_get_speakers` returns the effective layout (the default
 grid or the `layout_path` file) as `cap*3` floats in channel order + the count (26) — for visualizing
 or auditioning the geometry the engine actually pans with.

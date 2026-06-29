@@ -55,6 +55,7 @@ add_library(bw_core OBJECT
   src/align.c
   src/binaural.c
   src/ambisonics.c
+  src/allrad.c
   src/natnet.c
   ${CJSON_C}
 )

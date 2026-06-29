@@ -401,6 +401,7 @@ bool bw_source_is_playing(BwEngine* e, BwSource s)                     { return 
 void bw_test_signal(BwEngine* e, uint32_t channel, BwTestKind kind, float gain) { if (e) rt_test_signal(e->rt, channel, (uint8_t)kind, gain); }
 
 void bw_set_panner(BwEngine* e, BwPanner panner) { if (e) rt_set_panner(e->rt, (int)panner); }
+void bw_set_bed_decoder(BwEngine* e, BwBedDecoder decoder) { if (e) rt_set_bed_decoder(e->rt, (int)decoder); }
 
 uint32_t bw_get_speakers(BwEngine* e, float* xyz, uint32_t cap) {
     if (!e) return 0;

@@ -12,6 +12,7 @@
 #include "spcap.h"
 #include "align.h"
 #include "ambisonics.h"   /* SH->26 decode for ambisonic beds */
+#include "allrad.h"       /* robust SH->26 decode for irregular arrays */
 
 #include <math.h>
 #include <stdatomic.h>
@@ -112,6 +113,7 @@ struct RtCore {
     _Atomic int panner;      /* 0 = DBAP (moving observer); 1 = SPCAP (fixed observer); atomic for safe A/B */
     uint32_t   layout_gen;   /* bumped on rt_set_layout; the SPCAP cache compares it to self-invalidate */
     SpcapState spcap;        /* SPCAP cache (audio-thread-owned; rebuilt on listener/layout change) */
+    int        bed_decoder;  /* 0 = sampling decode (SAD); 1 = AllRAD (robust on irregular arrays) */
     /* ambisonic bed decode: [speaker][ACN] = (2l+1)*Y_k^SN3D(speaker_dir)/L (sampling decode, SN3D),
      * rebuilt from the layout whenever it changes. A bed voice decodes its SH channels through this. */
     float    bed_decode[BW_CHANNELS][BW_AMBI_CH];
@@ -380,7 +382,7 @@ static void drain_commands(RtCore* c) {
  * This is the projection/sampling decode, which assumes a roughly UNIFORM speaker distribution; the
  * cave grid is only approximately uniform, so it is good for a diffuse bed but a pseudo-inverse
  * (mode-matching) decode would be exact — a refinement, not needed for v1's diffuse content. */
-static void build_bed_decode(RtCore* c) {
+static void build_bed_decode_sad(RtCore* c) {
     const float invL = 1.0f / (float)c->channels;
     for (uint32_t s = 0; s < c->channels; ++s) {
         const float* p = c->layout.speakers[s].pos;
@@ -395,6 +397,13 @@ static void build_bed_decode(RtCore* c) {
             c->bed_decode[s][k] = (float)(2*l + 1) * y[k] * invL;
         }
     }
+}
+
+/* Dispatch the bed decode: AllRAD if selected (and the array triangulates), else the sampling decode. */
+static void build_bed_decode(RtCore* c) {
+    if (c->bed_decoder == 1 && allrad_build_decode(&c->layout, c->bed_decode))
+        return;
+    build_bed_decode_sad(c);
 }
 
 /* DBAP gain solve (M4): listener-relative, dirty-gated. CMD_COMMIT re-dirties a voice on a
@@ -857,6 +866,14 @@ void rt_set_layout(RtCore* c, const Layout* L) {
 void rt_set_panner(RtCore* c, int panner) {
     if (!c) return;
     atomic_store_explicit(&c->panner, (panner == 1) ? 1 : 0, memory_order_release);
+}
+
+/* Select the diffuse-bed decoder: 0 = sampling (SAD, default), 1 = AllRAD. Rebuilds the decode matrix
+ * the audio thread reads, so call BEFORE bw_start (or while stopped), like rt_set_layout. */
+void rt_set_bed_decoder(RtCore* c, int decoder) {
+    if (!c) return;
+    c->bed_decoder = (decoder == 1) ? 1 : 0;
+    build_bed_decode(c);
 }
 
 void rt_set_tracker(RtCore* c, const PoseSlot* slot) {

@@ -10,6 +10,8 @@
 #include "dbap.h"
 #include "spcap.h"
 #include "align.h"
+#include "ambisonics.h"
+#include "allrad.h"
 
 #include <math.h>
 #include <stdio.h>
@@ -205,8 +207,49 @@ int main(void) {
         CHECK(active >= 3 && active <= 20, "SPCAP spreads across several speakers (not 1, not all)");
     }
 
+    /* 10. AllRAD bed decoder: builds, finite, energy ~ the sampling decode, localizes plane waves */
+    {
+        float dec[BW_CHANNELS][BW_AMBI_CH];
+        int ok = allrad_build_decode(&LD, dec);
+        CHECK(ok, "allrad_build_decode succeeds on the default grid");
+        if (ok) {
+            int finite = 1; double ediff = 0;
+            for (int s = 0; s < CH; ++s) for (int k = 0; k < BW_AMBI_CH; ++k) {
+                if (!isfinite(dec[s][k])) finite = 0;
+                int l = (int)floorf(sqrtf((float)k)); ediff += (double)dec[s][k]*dec[s][k]/(2*l+1);
+            }
+            CHECK(finite, "AllRAD matrix is finite");
+            /* the sampling decode's ACTUAL diffuse energy (built from its formula, not a constant), so a
+             * wrong normalization target in AllRAD would fail this rather than match a shared mistake */
+            double esad = 0;
+            for (int s = 0; s < CH; ++s) {
+                float* p = LD.speakers[s].pos; float pl = sqrtf(p[0]*p[0] + p[1]*p[1] + p[2]*p[2]);
+                float ad2[3] = { -p[2]/pl, -p[0]/pl, p[1]/pl }, ys[BW_AMBI_CH]; ambi_encode_sn3d(ad2, ys);
+                for (int k = 0; k < BW_AMBI_CH; ++k) { int l = (int)floorf(sqrtf((float)k));
+                    double d = (double)(2*l+1)*ys[k]/CH; esad += d*d/(2*l+1); }
+            }
+            CHECK(fabs(ediff - esad)/esad < 0.05, "AllRAD diffuse energy matches the sampling decode");
+            int loc_ok = 1;
+            float dirs[3][3] = { { 1, 0, 0 }, { 0, 1, 0.3f }, { -0.5f, 0.2f, -1 } };
+            for (int t = 0; t < 3; ++t) {
+                float* sd = dirs[t]; float sl = sqrtf(sd[0]*sd[0] + sd[1]*sd[1] + sd[2]*sd[2]);
+                float s3[3] = { sd[0]/sl, sd[1]/sl, sd[2]/sl };
+                float ad[3] = { -s3[2], -s3[0], s3[1] }, sh[BW_AMBI_CH]; ambi_encode_sn3d(ad, sh);
+                float rE[3] = { 0, 0, 0 };
+                for (int s = 0; s < CH; ++s) {
+                    float f = 0; for (int k = 0; k < BW_AMBI_CH; ++k) f += dec[s][k]*sh[k];
+                    float* p = LD.speakers[s].pos; float pl = sqrtf(p[0]*p[0] + p[1]*p[1] + p[2]*p[2]);
+                    float w = f*f; rE[0]+=w*p[0]/pl; rE[1]+=w*p[1]/pl; rE[2]+=w*p[2]/pl;
+                }
+                float rl = sqrtf(rE[0]*rE[0] + rE[1]*rE[1] + rE[2]*rE[2]);
+                if (rl <= 0 || (rE[0]*s3[0] + rE[1]*s3[1] + rE[2]*s3[2])/rl < 0.9f) loc_ok = 0;  /* within ~25 deg */
+            }
+            CHECK(loc_ok, "AllRAD localizes plane waves toward their direction");
+        }
+    }
+
     remove(LJ);
     if (fails) { printf("dsp_test: %d FAILURES\n", fails); return 1; }
-    printf("dsp_test OK (layout parse, DBAP + SPCAP localize/power/spread, align gain+delay)\n");
+    printf("dsp_test OK (layout parse, DBAP + SPCAP localize/power/spread, AllRAD bed decode, align gain+delay)\n");
     return 0;
 }

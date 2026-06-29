@@ -21,6 +21,7 @@ namespace CaveAudio
     public enum BwDirectivity : int { Omni = 0, Cardioid = 1, Figure8 = 2 }
     public enum BwTestKind : int { Off = 0, Sine = 1, Noise = 2 }
     public enum BwPanner : int { Dbap = 0, Spcap = 1 }
+    public enum BwBedDecoder : int { Sampling = 0, Allrad = 1 }
 
     [StructLayout(LayoutKind.Sequential)]
     public struct BwConfig
@@ -109,6 +110,8 @@ namespace CaveAudio
         [DllImport(DLL, CallingConvention = CC)] public static extern uint bw_get_speakers(IntPtr e, [Out] float[] xyz, uint cap);
         // Panner selection (load-time): DBAP (moving observer, default) or SPCAP (fixed-observer sweet spot).
         [DllImport(DLL, CallingConvention = CC)] public static extern void bw_set_panner(IntPtr e, BwPanner panner);
+        // Diffuse-bed decoder (load-time): sampling (default) or AllRAD (robust on irregular arrays).
+        [DllImport(DLL, CallingConvention = CC)] public static extern void bw_set_bed_decoder(IntPtr e, BwBedDecoder decoder);
 
         // ---- listener + frame boundary ----
         [DllImport(DLL, CallingConvention = CC)] public static extern void bw_set_listener_pose(IntPtr e, float px, float py, float pz, float qx, float qy, float qz, float qw);
