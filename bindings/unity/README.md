@@ -7,6 +7,26 @@ boundary**. The engine renders the 26-speaker CAVE array over ASIO/Dante and a b
 This is a UPM package: a verified P/Invoke layer (`Bw`) plus two MonoBehaviours — a scene manager
 (`BwAudio`) and a positional emitter (`BwEmitter`) — and the coordinate seam (`Room`).
 
+## Replacing Unity audio (mental model)
+
+You **turn Unity's built-in audio off** (see below) and use these instead. It maps closely:
+
+| Unity built-in audio | This package |
+|---|---|
+| `AudioListener` (on the camera) | `BwAudio.listener` (the tracked head transform) |
+| `AudioSource` | `BwEmitter` |
+| `AudioClip` (imported asset) | a **StreamingAssets file path** — pick it with the `[BwClip]` field; the engine decodes `.wav`/`.flac`/`.mp3` itself and resamples at load |
+| `AudioSource.Play()` / `Stop()` | `BwEmitter.Play()` / `Stop()` |
+| `AudioSource.PlayOneShot()` | `BwEmitter.PlayOneShot()` |
+| `AudioSource.volume` | `BwEmitter.Gain` |
+| `spatialBlend = 1` (3D) | always 3D — listener-relative DBAP across the 26 speakers |
+| Audio Reverb Zone | the shared **reflection bed** (`BwAudio` reflections + acoustic geometry) |
+| occlusion (3rd-party) | `BwEmitter.occlusion`, ray-traced against the acoustic geometry |
+| output device / AudioMixer | the engine (ASIO/Dante 26-ch + binaural monitor); Unity's audio output is disabled |
+
+The big difference: **audio files are raw files in `StreamingAssets`, not imported `AudioClip`s** — the
+engine owns decoding (and avoids Unity's 8-channel output cap entirely).
+
 ## Install
 
 Add to your project's `Packages/manifest.json` (local path or git URL):

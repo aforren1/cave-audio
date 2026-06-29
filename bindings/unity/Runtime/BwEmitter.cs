@@ -9,7 +9,7 @@ namespace CaveAudio
     public sealed class BwEmitter : MonoBehaviour
     {
         [Header("Clip (under StreamingAssets)")]
-        public string clip = "sfx/footsteps.wav";
+        [BwClip] public string clip = "sfx/footsteps.wav";
         public bool loop = true;
         public bool playOnEnable = true;
         [Range(0f, 1f)] public float gain = 1f;
@@ -62,6 +62,24 @@ namespace CaveAudio
                 var q = Room.Rot(transform.rotation);            // the source's forward axis drives the lobe
                 Bw.bw_source_set_orientation(Eng, _src, q.x, q.y, q.z, q.w);
             }
+        }
+
+        /// <summary>Play `clip` (or an override), loading it on demand — AudioSource.Play equivalent.</summary>
+        public void Play(string clipOverride = null)
+        {
+            if (!_created || Eng == IntPtr.Zero) return;
+            uint snd = BwAudio.Instance.Load(clipOverride ?? clip);
+            if (snd != 0) Bw.bw_source_play(Eng, _src, snd, loop);
+        }
+
+        /// <summary>Stop this source — AudioSource.Stop equivalent.</summary>
+        public void Stop() { if (_created && Eng != IntPtr.Zero) Bw.bw_source_stop(Eng, _src); }
+
+        /// <summary>Linear gain — AudioSource.volume equivalent; applies immediately if live.</summary>
+        public float Gain
+        {
+            get => gain;
+            set { gain = value; if (_created && Eng != IntPtr.Zero) Bw.bw_source_set_gain(Eng, _src, value); }
         }
 
         /// <summary>Fire a one-shot at this transform (transient voice; no handle held).</summary>

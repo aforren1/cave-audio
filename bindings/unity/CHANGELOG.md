@@ -21,3 +21,7 @@ Initial Unity binding (M7).
 - Acoustic-scene authoring: `BwMaterialAsset` (Create → BwAudio → Acoustic Material; preset or custom
   3-band) and `BwAcousticGeometry` (mark a mesh as occluding/reflecting, assign a material, scene-view
   gizmo). `BwAudio` bakes all geometry (+ the optional room box) world→room into one mesh at load.
+- Audio-file authoring: `[BwClip]` attribute + `BwClipDrawer` — an editor picker that lists the
+  `.wav`/`.flac`/`.mp3` files under StreamingAssets (with a browse button and a missing-file flag)
+  instead of a hand-typed path. `BwEmitter` gains AudioSource-style `Play()`/`Stop()`/`Gain`. README
+  has a "Replacing Unity audio" mapping table.
