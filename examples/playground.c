@@ -1,29 +1,25 @@
 /*
- * playground.c — interactive raylib scene driving bwaudio's binaural monitor.
+ * playground.c — interactive raylib harness for bwaudio's binaural monitor, split into SCENES,
+ * each auditioning one feature by ear on headphones (the binaural profile, output through a 2-ch
+ * ASIO driver the engine auto-picks — ASIO4ALL / FlexASIO / the Steinberg built-in). This is the
+ * by-ear evaluation the automated tests can't do. Public C ABI only (bwaudio.h); raylib's raymath
+ * provides the vector/quaternion math.
  *
- * Drag a sound source around a 26-speaker CAVE and turn your head; hear the result on
- * headphones in real time (the binaural profile, output through a 2-ch ASIO driver that
- * the engine auto-picks — ASIO4ALL / FlexASIO / the Steinberg built-in). This is the
- * by-ear evaluation the automated tests can't do. Uses only the public C ABI (bwaudio.h);
- * raylib's raymath provides the vector/quaternion math.
+ * Scenes (cycle with TAB):
+ *   1 Localization      — pure listener-relative DBAP. Move a source, turn your head, switch the
+ *                         test signal (1-4); hear it localise around the 26-speaker array.
+ *   2 Occlusion+Materials — a real Steam Audio occluder. Push the source BEHIND the wall and the
+ *                         off-thread sim attenuates + spectrally tilts it by the wall MATERIAL (M to
+ *                         cycle concrete/glass/carpet/wood/metal); in FRONT, a mirror-image source
+ *                         is an audible specular reflection scaled by that material's reflectivity.
+ *   3 Directivity       — a weighted-dipole radiation pattern (Z omni/cardioid/figure-8), aim it
+ *                         with , / . ; the listener hears it attenuate off-axis (HUD shows the lobe).
+ *   4 Channel walk      — bw_test_signal drives ONE raw output channel (speaker-check tool). Step
+ *                         channels with LEFT/RIGHT (SPACE auto-walks); in binaural each channel is
+ *                         HRTF'd as its virtual speaker, so the tone circles your head as you walk.
  *
- * A wall demonstrates the materials path: move the source in FRONT of it for a crude specular
- * reflection (a mirror-image source — a second DBAP voice, its level scaled by the wall material's
- * reflectivity so carpet reflects far less than metal; the full per-band directional reverb BED is a
- * separate, static-scene feature, see reflsmoke / docs/materials.md), or BEHIND it for OCCLUSION — REAL Steam
- * Audio occlusion: the off-thread sim ray-traces the wall blocking the line to the listener and
- * attenuates + spectrally tilts the source by the wall MATERIAL (the HUD shows the live factor).
- * Press M to cycle the wall material (concrete/glass/carpet/wood/metal) — glass blocks less,
- * carpet/wood muffle, metal blocks highs, concrete blocks hard. Press Z to cycle the source DIRECTIVITY (omni/cardioid/
- * figure-8) and aim it with , / . — the listener hears it attenuate off-axis. (Geometry is dynamic
- * here because the reverb bed is off; with the bed running the scene is locked.) Needs the Steam
- * Audio build; without it occlusion/materials/directivity are no-ops.
- *
- * Keys 1-4 switch the localization test signal (pink noise / pink bursts / click train / 1 kHz
- * tone) — broadband + sharp onsets localise best; the tone is there to feel the ambiguity.
- *
- * Controls: WASD/RF move source, Q/E turn head, , / . aim source, [ ] slide wall, M material,
- *           Z directivity, 1-4 signal, T reflection, G occlusion, right-drag orbit, wheel zoom, ESC.
+ * Global keys: WASD/RF move source, Q/E turn head, 1-4 signal, TAB scene, right-drag/wheel camera, ESC.
+ * Needs the Steam Audio build for occlusion/materials/directivity; without it those scenes are no-ops.
  * Build: cmake -S . -B build -DBWAUDIO_BUILD_PLAYGROUND=ON && cmake --build build
  */
 #include "bwaudio.h"
@@ -34,12 +30,17 @@
 #include "dr_wav.h"
 
 #include <math.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
 #define SR   48000u
 #define NSPK 26
+
+#define SRC_GAIN  0.8f
+#define REFL_GAIN 0.5f    /* base image-source level (scaled further by the wall material reflectivity) */
+#define TEST_GAIN 0.3f    /* channel-walk test signal level */
 
 /* the engine's default speaker grid (3x3x3 minus centre) — must match layout_default() */
 static int default_speakers(Vector3* out) {
@@ -52,10 +53,9 @@ static int default_speakers(Vector3* out) {
     return k;
 }
 
-/* ---- localization test signals (synthesised at startup; see the note on the HUD) ----
- * Choice of signal matters: broadband + sharp onsets localise best, and HF content is what lets
- * you hear elevation / front-back. 0 pink noise (general), 1 pink-noise bursts (crisp onsets),
- * 2 click train (transients, precedence), 3 a 1 kHz tone (deliberately ambiguous, to feel the limit). */
+/* ---- localization test signals (synthesised at startup) ----
+ * Choice of signal matters: broadband + sharp onsets localise best, and HF content is what lets you
+ * hear elevation / front-back. 0 pink noise, 1 pink bursts, 2 click train, 3 a 1 kHz tone (ambiguous). */
 #define SIG_SECS 2u
 #define SIGLEN   (SR * SIG_SECS)
 #define NSIG     4
@@ -108,16 +108,11 @@ static int write_wav(const char* path, const float* buf, uint32_t n) {
     return 1;
 }
 
-#define SRC_GAIN  0.8f
-#define REFL_GAIN 0.5f    /* image-source level for a moderately reflective wall */
-#define OCC_GAIN  0.22f   /* direct level when the wall occludes the source */
-
-/* reflect a point across the plane (point c, unit normal n) — the image source */
-static Vector3 reflect_point(Vector3 p, Vector3 c, Vector3 n) {
+/* ---- wall geometry helpers (occlusion + reflection scene) ---- */
+static Vector3 reflect_point(Vector3 p, Vector3 c, Vector3 n) {      /* mirror p across plane (c,n) */
     float d = Vector3DotProduct(Vector3Subtract(p, c), n);
     return Vector3Subtract(p, Vector3Scale(n, 2.0f * d));
 }
-/* where segment a->b crosses plane (c,n): fills t and hit, returns 0 if ~parallel */
 static int seg_plane(Vector3 a, Vector3 b, Vector3 c, Vector3 n, float* t, Vector3* hit) {
     Vector3 ab = Vector3Subtract(b, a);
     float denom = Vector3DotProduct(ab, n);
@@ -126,7 +121,6 @@ static int seg_plane(Vector3 a, Vector3 b, Vector3 c, Vector3 n, float* t, Vecto
     *t = tt; *hit = Vector3Add(a, Vector3Scale(ab, tt));
     return 1;
 }
-/* in-plane basis for a wall with normal n (for the panel extent test + drawing) */
 static void wall_basis(Vector3 n, Vector3* u, Vector3* v) {
     Vector3 up = (fabsf(n.y) > 0.9f) ? (Vector3){ 1, 0, 0 } : (Vector3){ 0, 1, 0 };
     *u = Vector3Normalize(Vector3CrossProduct(up, n));
@@ -146,18 +140,255 @@ static void draw_wall(Vector3 c, Vector3 u, Vector3 v, float hw, float hh, Color
     DrawLine3D(a, b, line); DrawLine3D(b, d, line); DrawLine3D(d, ee, line); DrawLine3D(ee, a, line);
 }
 
-/* register the wall quad as occluding scene geometry with a chosen material token (cycle with M).
- * Safe to call at runtime here because the reflection bed isn't enabled (occlusion geometry is
- * dynamic; it locks only while the reverb bed runs — see docs/materials.md). */
-static void push_wall_mesh(BwEngine* e, Vector3 c, Vector3 u, Vector3 v, float hw, float hh, BwMaterial mat) {
-    Vector3 a  = Vector3Add(Vector3Add(c, Vector3Scale(u, -hw)), Vector3Scale(v, -hh));
-    Vector3 b  = Vector3Add(Vector3Add(c, Vector3Scale(u,  hw)), Vector3Scale(v, -hh));
-    Vector3 d  = Vector3Add(Vector3Add(c, Vector3Scale(u,  hw)), Vector3Scale(v,  hh));
-    Vector3 ee = Vector3Add(Vector3Add(c, Vector3Scale(u, -hw)), Vector3Scale(v,  hh));
+/* ======================= shared playground state (file scope for the scene callbacks) ======================= */
+static BwEngine*   e;
+static BwSource    src, refl;
+static BwSound     sounds[NSIG];
+static const char* backend_name;
+static int         backend_silent;
+
+static Vector3 speakers[NSPK];
+static Vector3 source_pos = { 1.5f, 0.0f, 0.0f };
+static float   head_yaw, source_yaw;
+static int     cur_sig;
+static int     highlight_spk = -1;          /* a scene may highlight one speaker each frame; reset per frame */
+
+/* wall + materials (occlusion scene) */
+static Vector3       wall_c = { 0.0f, 0.6f, -2.2f };
+static const Vector3 wall_n = { 0, 0, 1 };
+static const float   wall_hw = 2.0f, wall_hh = 1.2f;
+static Vector3       wall_u, wall_v;
+static const char*   mat_names[] = { "concrete", "glass", "carpet", "wood", "metal" };
+/* broadband reflectivity (~1 - mean absorption of the same presets): scales the image-source level so
+ * the wall MATERIAL drives reflectivity too — carpet reflects far less than metal/concrete. Broadband
+ * only (one DBAP voice has no per-source EQ); the full per-band material reflection is the reverb bed's job. */
+static const float   mat_refl[] = { 0.93f, 0.96f, 0.45f, 0.92f, 0.89f };
+enum { NMAT = 5 };
+static BwMaterial    mats[NMAT];
+static int           cur_mat, refl_audible = 1, occ_audible = 1;
+static Vector3       occ_image, occ_refl_pt;     /* computed in occ_update, drawn in occ_draw3d */
+static int           occ_refl_valid, occ_occluded;
+static float         occ_factor = 1.0f;
+
+/* directivity scene */
+static const char* dir_names[] = { "omni", "cardioid", "figure-8" };
+static int         cur_dir = 1;                  /* default cardioid so the effect is audible on entry */
+static float       dir_gain = 1.0f;
+
+/* channel-walk scene */
+static int   chan_active, chan_kind = BW_TEST_SINE, chan_auto;
+static float chan_timer;
+
+/* camera (shared) */
+static Camera3D cam;
+static float    cam_yaw = 45.0f * DEG2RAD, cam_pitch = 33.0f * DEG2RAD, cam_dist = 8.4f;
+
+/* register the wall quad as occluding geometry with a material token. Safe at runtime because the
+ * reverb bed isn't enabled (occlusion geometry is dynamic; it locks only while the bed runs). */
+static void push_wall_mesh(BwMaterial mat) {
+    Vector3 a  = Vector3Add(Vector3Add(wall_c, Vector3Scale(wall_u, -wall_hw)), Vector3Scale(wall_v, -wall_hh));
+    Vector3 b  = Vector3Add(Vector3Add(wall_c, Vector3Scale(wall_u,  wall_hw)), Vector3Scale(wall_v, -wall_hh));
+    Vector3 d  = Vector3Add(Vector3Add(wall_c, Vector3Scale(wall_u,  wall_hw)), Vector3Scale(wall_v,  wall_hh));
+    Vector3 ee = Vector3Add(Vector3Add(wall_c, Vector3Scale(wall_u, -wall_hw)), Vector3Scale(wall_v,  wall_hh));
     float verts[12] = { a.x, a.y, a.z,  b.x, b.y, b.z,  d.x, d.y, d.z,  ee.x, ee.y, ee.z };
     int   tris[6]   = { 0, 1, 2,  0, 2, 3 };
     BwMaterial tri_mat[2] = { mat, mat };
     bw_scene_set_mesh_mat(e, verts, 4, tris, 2, tri_mat);
+}
+
+/* ---- shared drawing ---- */
+static void draw_speakers(int hi) {
+    for (int k = 0; k < NSPK; ++k)
+        DrawSphere(speakers[k], k == hi ? 0.16f : 0.10f,
+                   k == hi ? (Color){ 120, 240, 140, 255 } : (Color){ 120, 120, 140, 255 });
+}
+static void draw_head(Quaternion q) {
+    Vector3 right = Vector3RotateByQuaternion((Vector3){ 1, 0, 0 }, q);
+    Vector3 fwd   = Vector3RotateByQuaternion((Vector3){ 0, 0, -1 }, q);
+    DrawSphere((Vector3){ 0, 0, 0 }, 0.16f, SKYBLUE);
+    DrawSphere(Vector3Scale(right,  0.17f), 0.055f, RED);       /* right ear -> audio R */
+    DrawSphere(Vector3Scale(right, -0.17f), 0.055f, RAYWHITE);  /* left ear  -> audio L */
+    DrawCylinderEx(Vector3Scale(fwd, 0.13f), Vector3Scale(fwd, 0.30f), 0.06f, 0.0f, 10, ORANGE); /* nose */
+}
+
+/* ============================= Scene 1: Localization (pure DBAP) ============================= */
+static void loc_enter(void)  { bw_source_set_gain(e, src, SRC_GAIN); }
+static void loc_update(float dt) {
+    (void)dt;
+    bw_source_set_pos(e, src, source_pos.x, source_pos.y, source_pos.z);
+    bw_source_set_gain(e, src, SRC_GAIN);
+}
+static void loc_draw3d(void) {
+    DrawLine3D((Vector3){ 0, 0, 0 }, source_pos, (Color){ 90, 220, 90, 220 });
+    DrawSphere(source_pos, 0.18f, RED);
+}
+static void loc_hud(int y) {
+    DrawText(TextFormat("signal [1-4]: %s   (broadband + sharp onsets localise best; the tone is ambiguous on purpose)",
+                        SIG_NAMES[cur_sig]), 12, y, 15, (Color){ 110, 200, 255, 255 });
+    DrawText(TextFormat("source (%.2f, %.2f, %.2f)   head %.0f deg",
+                        source_pos.x, source_pos.y, source_pos.z, head_yaw * 57.2958f),
+             12, y + 22, 15, (Color){ 200, 200, 210, 255 });
+}
+
+/* ====================== Scene 2: Occlusion & Materials (real Steam Audio) ====================== */
+static void occ_enter(void) {
+    bw_source_set_gain(e, src, SRC_GAIN);
+    bw_source_set_occlusion(e, src, occ_audible);
+    push_wall_mesh(mats[cur_mat]);
+}
+static void occ_update(float dt) {
+    float mv = 2.5f * dt;
+    if (IsKeyDown(KEY_LEFT_BRACKET) || IsKeyDown(KEY_RIGHT_BRACKET)) {
+        wall_c = Vector3Add(wall_c, Vector3Scale(wall_n, IsKeyDown(KEY_LEFT_BRACKET) ? -mv : mv));
+        push_wall_mesh(mats[cur_mat]);
+    }
+    if (IsKeyPressed(KEY_M)) { cur_mat = (cur_mat + 1) % NMAT; push_wall_mesh(mats[cur_mat]); }
+    if (IsKeyPressed(KEY_T)) refl_audible = !refl_audible;
+    if (IsKeyPressed(KEY_G)) { occ_audible = !occ_audible; bw_source_set_occlusion(e, src, occ_audible); }
+
+    /* reflection: the source mirrored across the wall is valid when source + listener are on the same
+     * side and the bounce lands on the panel. occlusion: the direct path crosses the panel. */
+    const Vector3 L = { 0, 0, 0 };
+    occ_image = reflect_point(source_pos, wall_c, wall_n);
+    int same_side = (Vector3DotProduct(Vector3Subtract(source_pos, wall_c), wall_n) > 0)
+                 == (Vector3DotProduct(Vector3Subtract(L, wall_c), wall_n) > 0);
+    float t; Vector3 hit; occ_refl_valid = 0; occ_refl_pt = source_pos;
+    if (same_side && seg_plane(L, occ_image, wall_c, wall_n, &t, &hit) && t > 0 && t < 1 &&
+        in_panel(hit, wall_c, wall_u, wall_v, wall_hw, wall_hh)) { occ_refl_valid = 1; occ_refl_pt = hit; }
+
+    bw_source_set_pos(e, src, source_pos.x, source_pos.y, source_pos.z);
+    bw_source_set_gain(e, src, SRC_GAIN);                       /* occlusion is applied by the engine */
+    bw_source_set_pos(e, refl, occ_image.x, occ_image.y, occ_image.z);
+    bw_source_set_gain(e, refl, (refl_audible && occ_refl_valid) ? SRC_GAIN * REFL_GAIN * mat_refl[cur_mat] : 0.0f);
+
+    occ_factor   = bw_source_get_occlusion(e, src);             /* real Steam Audio occlusion (1 = clear) */
+    occ_occluded = occ_factor < 0.85f;
+}
+static void occ_draw3d(void) {
+    draw_wall(wall_c, wall_u, wall_v, wall_hw, wall_hh,
+              (Color){ 90, 110, 140, 90 }, (Color){ 150, 180, 220, 255 });
+    DrawLine3D((Vector3){ 0, 0, 0 }, source_pos, occ_occluded ? (Color){ 230, 70, 70, 255 } : (Color){ 90, 220, 90, 220 });
+    DrawSphere(source_pos, 0.18f, RED);
+    if (occ_refl_valid) {
+        DrawLine3D(source_pos, occ_refl_pt, ORANGE);
+        DrawLine3D(occ_refl_pt, (Vector3){ 0, 0, 0 }, ORANGE);
+        DrawSphere(occ_refl_pt, 0.06f, ORANGE);
+        DrawSphere(occ_image, 0.14f, (Color){ 230, 160, 60, 130 });
+        DrawLine3D(occ_image, occ_refl_pt, (Color){ 230, 160, 60, 80 });
+    }
+}
+static void occ_hud(int y) {
+    DrawText(TextFormat("[ ] slide wall   M material: %s (refl %.0f%%)   T reflection %s   G occlusion %s",
+                        mat_names[cur_mat], mat_refl[cur_mat] * 100.0f,
+                        refl_audible ? "ON" : "off", occ_audible ? "ON" : "off"),
+             12, y, 15, (Color){ 110, 200, 255, 255 });
+    DrawText(TextFormat("%s   (occlusion %.0f%% audible)",
+                        occ_refl_valid ? "in FRONT: REFLECTING - audible image source" :
+                        (occ_occluded ? "BEHIND: OCCLUDED - Steam Audio attenuates + tilts by material"
+                                      : "wall: clear line of sight"),
+                        occ_factor * 100.0f),
+             12, y + 22, 15, occ_refl_valid ? ORANGE
+                           : (occ_occluded ? (Color){ 245, 140, 140, 255 } : (Color){ 200, 200, 210, 255 }));
+}
+
+/* ============================= Scene 3: Directivity (weighted dipole) ============================= */
+static void dir_enter(void) {
+    bw_source_set_gain(e, src, SRC_GAIN);
+    bw_source_set_directivity_preset(e, src, (BwDirectivity)cur_dir);
+}
+static void dir_update(float dt) {
+    float rt = 1.8f * dt;
+    if (IsKeyPressed(KEY_Z)) { cur_dir = (cur_dir + 1) % 3; bw_source_set_directivity_preset(e, src, (BwDirectivity)cur_dir); }
+    if (IsKeyDown(KEY_COMMA))  source_yaw += rt;
+    if (IsKeyDown(KEY_PERIOD)) source_yaw -= rt;
+    Quaternion sq = QuaternionFromAxisAngle((Vector3){ 0, 1, 0 }, source_yaw);
+    bw_source_set_pos(e, src, source_pos.x, source_pos.y, source_pos.z);
+    bw_source_set_gain(e, src, SRC_GAIN);
+    bw_source_set_orientation(e, src, sq.x, sq.y, sq.z, sq.w);
+    dir_gain = bw_source_get_directivity(e, src);              /* 1 = on-axis/omni .. 0 = null */
+}
+static void dir_draw3d(void) {
+    DrawLine3D((Vector3){ 0, 0, 0 }, source_pos, (Color){ 90, 220, 90, 180 });
+    DrawSphere(source_pos, 0.18f, RED);
+    /* illustrative horizontal lobe (weighted dipole) pointing the source's aim */
+    float w = (cur_dir == 1) ? 0.5f : (cur_dir == 2) ? 1.0f : 0.0f;
+    Vector3 prev = { 0 };
+    for (int i = 0; i <= 48; ++i) {
+        float a = (float)i / 48.0f * 2.0f * PI;                /* angle off the source forward */
+        float g = fabsf((1.0f - w) + w * cosf(a));
+        float r = 0.15f + 0.7f * g, wa = source_yaw + a;
+        Vector3 p = { source_pos.x - r * sinf(wa), source_pos.y, source_pos.z - r * cosf(wa) };
+        if (i > 0) DrawLine3D(prev, p, (Color){ 255, 180, 80, 200 });
+        prev = p;
+    }
+}
+static void dir_hud(int y) {
+    DrawText(TextFormat("directivity [Z]: %s   aim with , / .   (%.0f%% on-axis at the listener)",
+                        dir_names[cur_dir], dir_gain * 100.0f), 12, y, 15, (Color){ 110, 200, 255, 255 });
+    DrawText("move/aim the source so its forward points AWAY from the head and hear it drop",
+             12, y + 22, 15, (Color){ 200, 200, 210, 255 });
+}
+
+/* ============================= Scene 4: Channel walk (bw_test_signal) ============================= */
+static void chan_set(int ch) { bw_test_signal(e, (uint32_t)ch, (BwTestKind)chan_kind, TEST_GAIN); }
+static void chan_enter(void) {
+    bw_source_set_gain(e, src,  0.0f);          /* silence the spatial voices; only the test tone sounds */
+    bw_source_set_gain(e, refl, 0.0f);
+    chan_timer = 0.0f;
+    chan_auto  = 0;                             /* start manual each visit (don't resume a prior auto-walk) */
+    chan_set(chan_active);
+}
+static void chan_update(float dt) {
+    int prev = chan_active;
+    if (IsKeyPressed(KEY_RIGHT)) chan_active = (chan_active + 1) % NSPK;
+    if (IsKeyPressed(KEY_LEFT))  chan_active = (chan_active + NSPK - 1) % NSPK;
+    if (IsKeyPressed(KEY_N))     { chan_kind = (chan_kind == BW_TEST_SINE) ? BW_TEST_NOISE : BW_TEST_SINE; chan_set(chan_active); }
+    if (IsKeyPressed(KEY_SPACE)) chan_auto = !chan_auto;
+    if (chan_auto && (chan_timer += dt) >= 0.7f) { chan_timer = 0.0f; chan_active = (chan_active + 1) % NSPK; }
+    if (chan_active != prev) { bw_test_signal(e, (uint32_t)prev, BW_TEST_OFF, 0.0f); chan_set(chan_active); }
+    highlight_spk = chan_active;
+}
+static void chan_draw3d(void) {
+    DrawLine3D((Vector3){ 0, 0, 0 }, speakers[chan_active], (Color){ 120, 235, 150, 200 });
+}
+static void chan_hud(int y) {
+    DrawText(TextFormat("LEFT/RIGHT step channel   N %s   SPACE auto-walk %s",
+                        chan_kind == BW_TEST_SINE ? "sine" : "noise", chan_auto ? "ON" : "off"),
+             12, y, 15, (Color){ 110, 200, 255, 255 });
+    Vector3 p = speakers[chan_active];
+    DrawText(TextFormat("channel %d / %d   %s   speaker (%.2f, %.2f, %.2f)   (binaural: heard from that direction)",
+                        chan_active, NSPK, chan_kind == BW_TEST_SINE ? "660 Hz sine" : "white noise", p.x, p.y, p.z),
+             12, y + 22, 15, (Color){ 200, 200, 210, 255 });
+}
+
+/* ---- scene table ---- */
+typedef struct {
+    const char* name;
+    void (*enter)(void);
+    void (*update)(float dt);
+    void (*draw3d)(void);
+    void (*hud)(int y);
+} Scene;
+static const Scene scenes[] = {
+    { "Localization (DBAP)",     loc_enter,  loc_update,  loc_draw3d,  loc_hud  },
+    { "Occlusion & Materials",   occ_enter,  occ_update,  occ_draw3d,  occ_hud  },
+    { "Directivity",             dir_enter,  dir_update,  dir_draw3d,  dir_hud  },
+    { "Channel walk (speaker check)", chan_enter, chan_update, chan_draw3d, chan_hud },
+};
+enum { NSCENE = sizeof scenes / sizeof scenes[0] };
+static int cur_scene;
+
+/* leave the current scene at a clean baseline, then enter the new one */
+static void switch_scene(int idx) {
+    for (uint32_t ch = 0; ch < NSPK; ++ch) bw_test_signal(e, ch, BW_TEST_OFF, 0.0f);  /* clear channel walk */
+    bw_source_set_gain(e, refl, 0.0f);
+    bw_source_set_occlusion(e, src, false);
+    bw_source_set_directivity_preset(e, src, BW_DIR_OMNI);
+    bw_source_set_orientation(e, src, 0.0f, 0.0f, 0.0f, 1.0f);   /* clear any aim left by the directivity scene */
+    source_yaw = 0.0f;
+    bw_source_set_gain(e, src, SRC_GAIN);
+    cur_scene = idx;
+    scenes[idx].enter();
 }
 
 int main(void) {
@@ -174,81 +405,38 @@ int main(void) {
         .profile = BW_PROFILE_BINAURAL, .layout_path = NULL, .hrtf_path = NULL,
         .sample_rate = SR, .block_size = 256, .track_internal = false,
     };
-    BwEngine* e = bw_create(&cfg);
+    e = bw_create(&cfg);
     if (!e) { printf("bw_create failed\n"); return 1; }
     if (bw_start(e) != 0) {
         const char* err = bw_last_error(e);
         printf("bw_start: %s — no audio (install/select an ASIO driver, e.g. ASIO4ALL); the scene still runs.\n",
                err ? err : "?");
     }
-    const char* backend = bw_audio_backend(e);                /* "asio:<driver>", "null", or "none" */
-    int silent = (strncmp(backend, "asio", 4) != 0);          /* anything but a real ASIO device = no sound */
-    printf("audio backend: %s%s\n", backend,
-           silent ? "   (SILENT — set BWAUDIO_ASIO_DRIVER to your headphone driver)" : "");
+    backend_name   = bw_audio_backend(e);                     /* "asio:<driver>", "null", or "none" */
+    backend_silent = (strncmp(backend_name, "asio", 4) != 0); /* anything but a real ASIO device = no sound */
+    printf("audio backend: %s%s\n", backend_name,
+           backend_silent ? "   (SILENT — set BWAUDIO_ASIO_DRIVER to your headphone driver)" : "");
 
-    BwSound sounds[NSIG];
     for (int i = 0; i < NSIG; ++i) sounds[i] = bw_load_sound(e, sig_files[i]);
-    int cur_sig = 0;
-
-    /* wall material palette (cycle with M): demonstrates bw_material_preset + per-triangle
-     * bw_scene_set_mesh_mat. Each changes the occlusion's level + spectral tilt audibly — glass
-     * transmits more (less blocked), carpet/wood pass low + muffle highs, metal passes bass but
-     * blocks highs, concrete blocks hard. (All are real entries in the engine's preset table.) */
-    const char* mat_names[] = { "concrete", "glass", "carpet", "wood", "metal" };
-    /* broadband reflectivity (~1 - mean absorption of the same presets), used to scale the image-source
-     * reflection level so the wall MATERIAL audibly drives reflectivity too — carpet reflects far less
-     * than metal/concrete. (The image source is a single DBAP voice, so this is a broadband gain only;
-     * the full per-band material reflection is the static-scene reverb bed's job.) */
-    const float mat_refl[] = { 0.93f, 0.96f, 0.45f, 0.92f, 0.89f };
-    enum { NMAT = 5 };
-    BwMaterial mats[NMAT];
-    for (int i = 0; i < NMAT; ++i) mats[i] = bw_material_preset(e, mat_names[i]);
-    int cur_mat = 0;
-
-    /* source directivity (cycle pattern with Z; aim the source with , and .): omni / cardioid /
-     * figure-8. The listener hears the source attenuated as it is aimed away. */
-    const char* dir_names[] = { "omni", "cardioid", "figure-8" };
-    int   cur_dir = 0;
-    float source_yaw = 0.0f;   /* radians about +y; the source's forward is -z rotated by this */
-
-    BwSource src = bw_source_create(e);
-    bw_source_set_gain(e, src, SRC_GAIN);
-    bw_source_play(e, src, sounds[cur_sig], true);
-
-    /* a second voice rendered at the source's mirror image across the wall — an audible
-     * single specular reflection, using only the existing per-source DBAP path (no delay or
-     * material filtering yet; that's the future Steam Audio reflection path, docs/materials.md) */
-    BwSource refl = bw_source_create(e);
-    bw_source_play(e, refl, sounds[cur_sig], true);
-    bw_source_set_gain(e, refl, 0.0f);
-
-    Vector3 speakers[NSPK];
+    for (int i = 0; i < NMAT; ++i) mats[i] = bw_material_preset(e, mat_names[i]);  /* mint the wall materials */
     default_speakers(speakers);
-    Vector3 source_pos = { 1.5f, 0.0f, 0.0f };
-    float   head_yaw = 0.0f;                                  /* radians, about +y */
+    wall_basis(wall_n, &wall_u, &wall_v);
 
-    /* the reflecting/occluding surface: a vertical wall (normal +z) the source moves in front
-     * of (reflection) or behind (occlusion). Slide it along its normal with [ and ]. */
-    Vector3 wall_c = { 0.0f, 0.6f, -2.2f };
-    const Vector3 wall_n = { 0, 0, 1 };
-    const float wall_hw = 2.0f, wall_hh = 1.2f;
-    Vector3 wall_u, wall_v; wall_basis(wall_n, &wall_u, &wall_v);
-    int refl_audible = 1, occ_audible = 1;                   /* T / G toggles */
-
-    /* register the wall as REAL occluding geometry and enable occlusion on the direct source
-     * (the engine's Steam Audio sim attenuates it when the wall blocks the line to the listener) */
-    push_wall_mesh(e, wall_c, wall_u, wall_v, wall_hw, wall_hh, mats[cur_mat]);
-    bw_source_set_occlusion(e, src, true);
+    /* both voices keep playing the selected signal across scene switches; scenes just gate the gain */
+    src  = bw_source_create(e);  bw_source_play(e, src,  sounds[cur_sig], true);
+    refl = bw_source_create(e);  bw_source_play(e, refl, sounds[cur_sig], true);
+    bw_source_set_gain(e, refl, 0.0f);
 
     InitWindow(1000, 700, "bwaudio - binaural playground");
     SetTargetFPS(60);
-    Camera3D cam = { .target = { 0, 0.5f, 0 }, .up = { 0, 1, 0 },
-                     .fovy = 55, .projection = CAMERA_PERSPECTIVE };
-    float cam_yaw = 45.0f * DEG2RAD, cam_pitch = 33.0f * DEG2RAD, cam_dist = 8.4f;  /* arcball orbit state */
+    cam = (Camera3D){ .target = { 0, 0.5f, 0 }, .up = { 0, 1, 0 }, .fovy = 55, .projection = CAMERA_PERSPECTIVE };
+    switch_scene(0);
 
     while (!WindowShouldClose()) {
         float dt = GetFrameTime();
         float mv = 2.5f * dt, rt = 1.8f * dt;
+
+        /* ---- global navigation (every scene) ---- */
         if (IsKeyDown(KEY_W)) source_pos.z -= mv;
         if (IsKeyDown(KEY_S)) source_pos.z += mv;
         if (IsKeyDown(KEY_A)) source_pos.x -= mv;
@@ -257,35 +445,20 @@ int main(void) {
         if (IsKeyDown(KEY_F)) source_pos.y -= mv;
         if (IsKeyDown(KEY_Q)) head_yaw += rt;
         if (IsKeyDown(KEY_E)) head_yaw -= rt;
-        if (IsKeyDown(KEY_LEFT_BRACKET) || IsKeyDown(KEY_RIGHT_BRACKET)) {
-            wall_c = Vector3Add(wall_c, Vector3Scale(wall_n, IsKeyDown(KEY_LEFT_BRACKET) ? -mv : mv));
-            push_wall_mesh(e, wall_c, wall_u, wall_v, wall_hw, wall_hh, mats[cur_mat]); /* update the occluder (sim throttles) */
-        }
-        if (IsKeyPressed(KEY_M)) {                            /* cycle the wall material -> occlusion changes */
-            cur_mat = (cur_mat + 1) % NMAT;
-            push_wall_mesh(e, wall_c, wall_u, wall_v, wall_hw, wall_hh, mats[cur_mat]);
-        }
-        if (IsKeyPressed(KEY_Z)) {                            /* cycle source directivity pattern */
-            cur_dir = (cur_dir + 1) % 3;
-            bw_source_set_directivity_preset(e, src, (BwDirectivity)cur_dir);
-        }
-        if (IsKeyDown(KEY_COMMA))  source_yaw += rt;          /* aim the source (for directivity) */
-        if (IsKeyDown(KEY_PERIOD)) source_yaw -= rt;
-        if (IsKeyPressed(KEY_T)) refl_audible = !refl_audible;
-        if (IsKeyPressed(KEY_G)) { occ_audible = !occ_audible; bw_source_set_occlusion(e, src, occ_audible); }
-        for (int i = 0; i < NSIG; ++i)                       /* 1-4: switch the test signal */
+        for (int i = 0; i < NSIG; ++i)                        /* 1-4: switch the test signal everywhere */
             if (IsKeyPressed(KEY_ONE + i)) {
                 cur_sig = i;
                 bw_source_play(e, src,  sounds[i], true);
                 bw_source_play(e, refl, sounds[i], true);
             }
+        if (IsKeyPressed(KEY_TAB)) switch_scene((cur_scene + 1) % NSCENE);
 
-        /* arcball camera: right-drag orbits around the array, the wheel zooms */
+        /* arcball camera: right-drag orbits, the wheel zooms */
         if (IsMouseButtonDown(MOUSE_BUTTON_RIGHT)) {
             Vector2 md = GetMouseDelta();
             cam_yaw   -= md.x * 0.005f;
             cam_pitch += md.y * 0.005f;
-            if (cam_pitch >  1.5f) cam_pitch =  1.5f;       /* clamp shy of the poles */
+            if (cam_pitch >  1.5f) cam_pitch =  1.5f;
             if (cam_pitch < -1.5f) cam_pitch = -1.5f;
         }
         cam_dist -= GetMouseWheelMove() * 0.6f;
@@ -295,93 +468,33 @@ int main(void) {
         cam.position.y = cam.target.y + cam_dist * sinf(cam_pitch);
         cam.position.z = cam.target.z + cam_dist * cosf(cam_pitch) * cosf(cam_yaw);
 
+        /* ---- per-scene update, then publish the frame ---- */
+        highlight_spk = -1;
+        scenes[cur_scene].update(dt);
         Quaternion q = QuaternionFromAxisAngle((Vector3){ 0, 1, 0 }, head_yaw);
-
-        /* reflection: the source mirrored across the wall is a valid specular reflection when
-         * source and listener are on the same side and the bounce lands on the panel. occlusion:
-         * the direct path crosses the panel (source pushed behind the wall). */
-        const Vector3 L = { 0, 0, 0 };
-        Vector3 image = reflect_point(source_pos, wall_c, wall_n);
-        float side_src = Vector3DotProduct(Vector3Subtract(source_pos, wall_c), wall_n);
-        float side_lis = Vector3DotProduct(Vector3Subtract(L, wall_c), wall_n);
-        int same_side = (side_src > 0) == (side_lis > 0);
-
-        float t; Vector3 hit;
-        Vector3 refl_pt = source_pos; int refl_valid = 0;
-        if (same_side && seg_plane(L, image, wall_c, wall_n, &t, &hit) && t > 0 && t < 1 &&
-            in_panel(hit, wall_c, wall_u, wall_v, wall_hw, wall_hh)) { refl_valid = 1; refl_pt = hit; }
-
-        Quaternion sq = QuaternionFromAxisAngle((Vector3){ 0, 1, 0 }, source_yaw);
-        bw_source_set_pos(e, src, source_pos.x, source_pos.y, source_pos.z);
-        bw_source_set_gain(e, src, SRC_GAIN);                 /* occlusion is now applied by the engine */
-        bw_source_set_orientation(e, src, sq.x, sq.y, sq.z, sq.w);   /* directivity uses the source's forward */
-        bw_source_set_pos(e, refl, image.x, image.y, image.z);
-        bw_source_set_gain(e, refl, (refl_audible && refl_valid) ? SRC_GAIN * REFL_GAIN * mat_refl[cur_mat] : 0.0f);
         bw_set_listener_pose(e, 0, 0, 0, q.x, q.y, q.z, q.w);
         bw_commit(e);
-
-        float occ   = bw_source_get_occlusion(e, src);        /* real Steam Audio occlusion (1 = clear) */
-        float dgain = bw_source_get_directivity(e, src);      /* 1 = on-axis/omni .. 0 = null */
-        int occluded = occ < 0.85f;
-
-        Vector3 right = Vector3RotateByQuaternion((Vector3){ 1, 0, 0 }, q);
-        Vector3 fwd   = Vector3RotateByQuaternion((Vector3){ 0, 0, -1 }, q);
 
         BeginDrawing();
         ClearBackground((Color){ 25, 25, 30, 255 });
         BeginMode3D(cam);
         DrawGrid(12, 0.5f);
-        for (int k = 0; k < NSPK; ++k) DrawSphere(speakers[k], 0.10f, (Color){ 120, 120, 140, 255 });
-
-        draw_wall(wall_c, wall_u, wall_v, wall_hw, wall_hh,
-                  (Color){ 90, 110, 140, 90 }, (Color){ 150, 180, 220, 255 });
-
-        /* direct path: green when clear, red when the wall occludes it */
-        DrawLine3D(L, source_pos, occluded ? (Color){ 230, 70, 70, 255 } : (Color){ 90, 220, 90, 220 });
-        DrawSphere(source_pos, 0.18f, RED);
-        if (cur_dir != 0) {                                   /* show the source's aim when directional */
-            Vector3 sfwd = Vector3RotateByQuaternion((Vector3){ 0, 0, -1 }, sq);
-            DrawCylinderEx(Vector3Add(source_pos, Vector3Scale(sfwd, 0.18f)),
-                           Vector3Add(source_pos, Vector3Scale(sfwd, 0.5f)), 0.06f, 0.0f, 8, (Color){ 255, 180, 80, 255 });
-        }
-
-        /* reflected path source -> bounce -> listener, and the mirror-image source */
-        if (refl_valid) {
-            DrawLine3D(source_pos, refl_pt, ORANGE);
-            DrawLine3D(refl_pt, L, ORANGE);
-            DrawSphere(refl_pt, 0.06f, ORANGE);
-            DrawSphere(image, 0.14f, (Color){ 230, 160, 60, 130 });
-            DrawLine3D(image, refl_pt, (Color){ 230, 160, 60, 80 });
-        }
-        /* the head, at the array centre, with a face that turns with the listener pose:
-         * an orange nose marks "forward", colour-coded ears mark the L/R audio channels. */
-        DrawSphere((Vector3){ 0, 0, 0 }, 0.16f, SKYBLUE);
-        DrawSphere(Vector3Scale(right,  0.17f), 0.055f, RED);       /* right ear -> audio R */
-        DrawSphere(Vector3Scale(right, -0.17f), 0.055f, RAYWHITE);  /* left ear  -> audio L */
-        DrawCylinderEx(Vector3Scale(fwd, 0.13f), Vector3Scale(fwd, 0.30f),
-                       0.06f, 0.0f, 10, ORANGE);                    /* nose -> facing */
+        draw_speakers(highlight_spk);
+        scenes[cur_scene].draw3d();
+        draw_head(q);
         EndMode3D();
 
-        /* readable HUD: a dark backing panel + bright text (ASCII only — raylib's default font
-         * has no em-dash/box glyphs) */
-        DrawRectangle(0, 0, GetScreenWidth(), 126, (Color){ 0, 0, 0, 190 });
-        DrawText("WASD/RF move  Q/E head  ,/. aim source  [ ] wall  M material  Z directivity  1-4 signal  T refl  G occl  right-drag/wheel camera",
+        /* HUD: a dark backing panel + bright ASCII text (raylib's default font has no em-dash/box glyphs) */
+        DrawRectangle(0, 0, GetScreenWidth(), 122, (Color){ 0, 0, 0, 195 });
+        DrawText("[TAB] scene   WASD/RF move source   Q/E head   1-4 signal   right-drag/wheel camera   ESC",
                  12, 8, 14, RAYWHITE);
-        DrawText(TextFormat("source (%.2f, %.2f, %.2f)   head %.0f deg",
-                            source_pos.x, source_pos.y, source_pos.z, head_yaw * 57.2958f),
-                 12, 30, 16, (Color){ 215, 215, 225, 255 });
-        DrawText(TextFormat("signal [1-4]: %s   material [M]: %s (refl %.0f%%)   directivity [Z]: %s (%.0f%% on-axis)",
-                            SIG_NAMES[cur_sig], mat_names[cur_mat], mat_refl[cur_mat] * 100.0f, dir_names[cur_dir], dgain * 100.0f),
-                 12, 52, 15, (Color){ 110, 200, 255, 255 });
-        DrawText(TextFormat("%s    [T] reflection %s   [G] occlusion %s (%.0f%% audible)",
-                            refl_valid ? "REFLECTING - audible image source" :
-                            (occluded ? "OCCLUDED - Steam Audio attenuates the source" : "wall: clear line of sight"),
-                            refl_audible ? "ON" : "off", occ_audible ? "ON" : "off", occ * 100.0f),
-                 12, 76, 16, refl_valid ? ORANGE : (occluded ? (Color){ 245, 140, 140, 255 } : (Color){ 200, 200, 210, 255 }));
-        if (silent)
-            DrawText("audio: NULL sink - NO SOUND (set BWAUDIO_ASIO_DRIVER; see console)", 12, 100, 16, (Color){ 255, 110, 110, 255 });
+        DrawText(TextFormat("scene %d/%d:  %s", cur_scene + 1, NSCENE, scenes[cur_scene].name),
+                 12, 28, 16, (Color){ 235, 235, 120, 255 });
+        scenes[cur_scene].hud(52);
+        if (backend_silent)
+            DrawText("audio: NULL sink - NO SOUND (set BWAUDIO_ASIO_DRIVER; see console)", 12, 98, 15, (Color){ 255, 110, 110, 255 });
         else
-            DrawText(TextFormat("audio: %s", backend), 12, 100, 16, (Color){ 110, 235, 130, 255 });
+            DrawText(TextFormat("audio: %s", backend_name), 12, 98, 15, (Color){ 110, 235, 130, 255 });
         EndDrawing();
     }
 
