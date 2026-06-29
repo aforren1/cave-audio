@@ -19,11 +19,11 @@
  *                         channels with LEFT/RIGHT (SPACE auto-walks); in binaural each channel is
  *                         HRTF'd as its virtual speaker, so the tone circles your head as you walk.
  *   5 Reverb bed        — a static shoebox room + the Steam Audio hybrid reverb bed. Move the source
- *                         and the room reverb follows; G dry/wet A-B, [ ] wet level. The bed + room
- *                         geometry are LOAD-time (the room locks once the bed runs), so entering/
- *                         leaving this scene REBUILDS the engine (a brief audio gap) — the one feature
- *                         that can't share the interactive engine. Transient signals (clicks/bursts)
- *                         show the tail best.
+ *                         and the room reverb follows; G dry/wet A-B, [ ] wet level, B A/Bs the bed
+ *                         DECODER (sampling vs AllRAD — load-time, so it rebuilds the engine; differs
+ *                         most on an irregular layout). The bed + room geometry are LOAD-time (the room
+ *                         locks once the bed runs), so entering/leaving this scene REBUILDS the engine
+ *                         (a brief audio gap). Transient signals (clicks/bursts) show the tail best.
  *
  * Global keys: WASD/RF move source, Q/E turn head, 1-4 signal, TAB scene, right-drag/wheel camera, ESC.
  * Needs the Steam Audio build for occlusion/materials/directivity/reverb; without it those are no-ops.
@@ -211,6 +211,8 @@ static void draw_head(Quaternion q) {
     DrawCylinderEx(Vector3Scale(fwd, 0.13f), Vector3Scale(fwd, 0.30f), 0.06f, 0.0f, 10, ORANGE); /* nose */
 }
 
+static void build_engine(int with_reverb);   /* fwd: the reverb scene rebuilds to A/B the bed decoder */
+
 /* ============================= Scene 1: Localization (pure DBAP) ============================= */
 /* auto-move (SPACE): a hands-free demo that circles the listener while breathing near<->far and
  * bobbing high<->low on three incommensurate periods, so the source sweeps the whole space over time. */
@@ -394,6 +396,7 @@ static void chan_hud(int y) {
 #define ROOM_D 8.0f
 static int   rev_on  = 1;
 static float rev_wet = 1.0f;
+static int   rev_decoder;                          /* bed decoder: 0 = sampling (SAD), 1 = AllRAD (B to A/B) */
 
 static void rev_enter(void) {
     bw_source_set_gain(e, src, SRC_GAIN);
@@ -401,6 +404,12 @@ static void rev_enter(void) {
     bw_reflections_set_gain(e, rev_wet);
 }
 static void rev_update(float dt) {
+    if (IsKeyPressed(KEY_B)) {                     /* A/B the bed decoder: load-time, so rebuild the engine */
+        rev_decoder ^= 1;
+        if (e) { bw_stop(e); bw_destroy(e); e = NULL; }
+        build_engine(1);
+        rev_enter();                               /* re-apply source gain + reflections + wet on the new engine */
+    }
     if (IsKeyPressed(KEY_G)) { rev_on = !rev_on; bw_source_set_reflections(e, src, rev_on); }
     if (IsKeyDown(KEY_LEFT_BRACKET))  rev_wet = fmaxf(0.0f, rev_wet - 0.7f * dt);
     if (IsKeyDown(KEY_RIGHT_BRACKET)) rev_wet = fminf(2.0f, rev_wet + 0.7f * dt);
@@ -417,9 +426,10 @@ static void rev_draw3d(void) {
     DrawSphere(source_pos, 0.18f, RED);
 }
 static void rev_hud(int y) {
-    DrawText(TextFormat("[G] reverb %s   [ ] wet %.2f   move the source - the room reverb follows it",
-                        rev_on ? "ON (wet)" : "off (dry)", rev_wet), 12, y, 15, (Color){ 110, 200, 255, 255 });
-    DrawText("static 8x4x8 m plaster room (Steam Audio hybrid bed) - try clicks [3] or bursts [2] to hear the tail",
+    DrawText(TextFormat("[G] reverb %s   [ ] wet %.2f   [B] bed decoder: %s   move the source - reverb follows",
+                        rev_on ? "ON (wet)" : "off (dry)", rev_wet, rev_decoder ? "AllRAD" : "sampling"),
+             12, y, 15, (Color){ 110, 200, 255, 255 });
+    DrawText("8x4x8 m plaster room (Steam Audio bed); clicks [3]/bursts [2] show the tail. SAD vs AllRAD differ most on an IRREGULAR layout",
              12, y + 22, 15, (Color){ 200, 200, 210, 255 });
 }
 
@@ -458,6 +468,7 @@ static void build_engine(int with_reverb) {
         BwMaterial rm = bw_material_preset(e, "plaster");
         BwMaterial faces[6] = { rm, rm, rm, rm, rm, rm };
         bw_scene_set_box(e, ROOM_W, ROOM_H, ROOM_D, faces);     /* static room, BEFORE bw_start */
+        bw_set_bed_decoder(e, rev_decoder ? BW_DECODE_ALLRAD : BW_DECODE_SAMPLING);  /* load-time */
     }
     if (bw_start(e) != 0) {
         const char* err = bw_last_error(e);
