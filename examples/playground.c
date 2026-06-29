@@ -9,6 +9,8 @@
  *   1 Localization      — pure listener-relative DBAP. Move a source, turn your head, switch the
  *                         test signal (1-4); hear it localise around the 26-speaker array. SPACE
  *                         auto-moves it: orbit + near/far + high/low, sweeping the whole space.
+ *                         Opt-in propagation effects: V Doppler, B air absorption, X a fast straight
+ *                         flyby (X+V = the race-car pitch sweep; X+B = the brightness pumping with range).
  *   2 Occlusion+Materials — a real Steam Audio occluder. Push the source BEHIND the wall and the
  *                         off-thread sim attenuates + spectrally tilts it by the wall MATERIAL (M to
  *                         cycle concrete/glass/carpet/wood/metal); in FRONT, a mirror-image source
@@ -216,21 +218,35 @@ static void build_engine(int with_reverb);   /* fwd: the reverb scene rebuilds t
 /* ============================= Scene 1: Localization (pure DBAP) ============================= */
 /* auto-move (SPACE): a hands-free demo that circles the listener while breathing near<->far and
  * bobbing high<->low on three incommensurate periods, so the source sweeps the whole space over time. */
-static int   loc_auto;
-static float loc_t;
+static int   loc_auto, loc_flyby, loc_dop, loc_air;    /* loc_dop/loc_air persist across visits */
+static float loc_t, loc_fly_t;
 enum { LOC_TRAIL = 96 };
 static Vector3 loc_trail[LOC_TRAIL];
 static int     loc_trail_len;
 
-static void loc_enter(void)  { bw_source_set_gain(e, src, SRC_GAIN); loc_auto = 0; loc_trail_len = 0; }
+static void loc_enter(void)  {
+    bw_source_set_gain(e, src, SRC_GAIN); loc_auto = 0; loc_flyby = 0; loc_trail_len = 0;
+    bw_source_set_doppler(e, src, loc_dop);            /* re-apply (switch_scene cleared them) */
+    bw_source_set_air_absorption(e, src, loc_air);
+}
 static void loc_update(float dt) {
-    if (IsKeyPressed(KEY_SPACE)) { loc_auto = !loc_auto; if (loc_auto) { loc_t = 0.0f; loc_trail_len = 0; } }
-    if (loc_auto) {
+    if (IsKeyPressed(KEY_SPACE)) { loc_auto = !loc_auto; if (loc_auto) { loc_flyby = 0; loc_t = 0.0f; loc_trail_len = 0; } }
+    if (IsKeyPressed(KEY_X))     { loc_flyby = !loc_flyby; if (loc_flyby) { loc_auto = 0; loc_fly_t = 0.0f; loc_trail_len = 0; } }
+    if (IsKeyPressed(KEY_V)) { loc_dop = !loc_dop; bw_source_set_doppler(e, src, loc_dop); }
+    if (IsKeyPressed(KEY_B)) { loc_air = !loc_air; bw_source_set_air_absorption(e, src, loc_air); }
+    if (loc_flyby) {                                      /* fast straight pass 0.8 m in front: the Doppler demo */
+        loc_fly_t += dt;
+        float period = 3.6f, u = fmodf(loc_fly_t, period) / period;     /* there-and-back, ~7.8 m/s */
+        float x = (u < 0.5f) ? (-7.0f + 28.0f * u) : (7.0f - 28.0f * (u - 0.5f));
+        source_pos = (Vector3){ x, 0.0f, 0.8f };
+    } else if (loc_auto) {
         loc_t += dt;
         float az = 0.62f * loc_t;                         /* circle the listener   (~10 s / orbit) */
         float r  = 2.0f + 1.2f * sinf(0.90f * loc_t);     /* near <-> far  0.8..3.2 (~7 s) */
         float y  = 1.2f  * sinf(1.14f * loc_t);           /* low  <-> high -1.2..1.2 (~5.5 s) */
         source_pos = (Vector3){ r * cosf(az), y, r * sinf(az) };
+    }
+    if (loc_auto || loc_flyby) {
         if (loc_trail_len < LOC_TRAIL) loc_trail[loc_trail_len++] = source_pos;
         else { memmove(loc_trail, loc_trail + 1, (LOC_TRAIL - 1) * sizeof(Vector3)); loc_trail[LOC_TRAIL - 1] = source_pos; }
     }
@@ -252,8 +268,11 @@ static void loc_hud(int y) {
              12, y, 15, (Color){ 110, 200, 255, 255 });
     DrawText(TextFormat("source (%.2f, %.2f, %.2f)   head %.0f deg%s",
                         source_pos.x, source_pos.y, source_pos.z, head_yaw * 57.2958f,
-                        loc_auto ? "   (WASD paused while auto-move runs)" : ""),
+                        (loc_auto || loc_flyby) ? "   (WASD paused while auto-move runs)" : ""),
              12, y + 22, 15, (Color){ 200, 200, 210, 255 });
+    DrawText(TextFormat("propagation:  [V] Doppler %s   [B] air absorption %s   [X] fast flyby %s  (flyby + Doppler = the race-car pitch sweep)",
+                        loc_dop ? "ON" : "off", loc_air ? "ON" : "off", loc_flyby ? "ON" : "off"),
+             12, y + 44, 15, (Color){ 150, 225, 150, 255 });
 }
 
 /* ====================== Scene 2: Occlusion & Materials (real Steam Audio) ====================== */
@@ -501,6 +520,8 @@ static void switch_scene(int idx) {
     bw_source_set_occlusion(e, src, false);
     bw_source_set_directivity_preset(e, src, BW_DIR_OMNI);
     bw_source_set_orientation(e, src, 0.0f, 0.0f, 0.0f, 1.0f);   /* clear any aim left by the directivity scene */
+    bw_source_set_doppler(e, src, false);                        /* propagation effects are localization-scene only */
+    bw_source_set_air_absorption(e, src, false);
     source_yaw = 0.0f;
     bw_source_set_gain(e, src, SRC_GAIN);
     cur_scene = idx;
