@@ -259,15 +259,17 @@ HUD/diagnostics and are safe to poll. No-ops without the Steam Audio build.
 ## Reflection bed (control thread)
 
 ```c
-typedef struct { float ir_seconds; uint32_t order, num_rays, num_bounces; int enabled; uint32_t reserved[4]; } BwReflectionConfig;
+typedef struct { float ir_seconds; uint32_t order, num_rays, num_bounces; int enabled; float wet_gain; uint32_t reserved[3]; } BwReflectionConfig;
 void bw_reflections_config   (BwEngine* e, const BwReflectionConfig* cfg);  // LOAD-TIME (before bw_start)
+void bw_reflections_set_gain (BwEngine* e, float linear);                   // per-frame; live wet level
 void bw_source_set_reflections(BwEngine* e, BwSource s, bool on);           // per-frame; gates the wet send
 ```
 
 A single shared **listener-centric reverb bed** decoded straight to the 26 channels and summed onto
 the bus. `bw_reflections_config` is **load-time** (the IR length + ambisonic order are baked at
 `bw_start`); zero fields take defaults (`ir_seconds` 1.0, `order` 1, `num_rays` 4096, `num_bounces`
-16), `enabled = 0` means no bed is created and the engine behaves exactly as without it.
+16, `wet_gain` 1.0), `enabled = 0` means no bed is created and the engine behaves exactly as without
+it. `bw_reflections_set_gain` adjusts the wet level live (a single atomic the audio-thread tap reads).
 `bw_source_set_reflections` is the per-frame, non-blocking opt-in of a source into the bed's wet send
 (with the bed disabled or no SDK, it gates a send that goes nowhere). The bed runs Steam Audio's
 **HYBRID** reverb — **directional** early-reflection convolution (full ambisonic, order = `order`) +

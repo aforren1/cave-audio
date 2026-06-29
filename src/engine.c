@@ -260,7 +260,8 @@ int bw_start(BwEngine* e) {
     if (e->scene && e->refl_cfg.enabled) {
         e->reflect = steam_reflect_create(e->scene, e->rt, &e->layout, e->cfg.sample_rate,
                                           bw_sink_block_size(e->sink), e->refl_cfg.order,
-                                          e->refl_cfg.ir_seconds, e->refl_cfg.num_rays, e->refl_cfg.num_bounces);
+                                          e->refl_cfg.ir_seconds, e->refl_cfg.num_rays, e->refl_cfg.num_bounces,
+                                          e->refl_cfg.wet_gain);
         if (e->reflect) rt_set_bus_tap(e->rt, steam_reflect_tap, e->reflect);
     }
 #endif
@@ -537,6 +538,15 @@ void bw_reflections_config(BwEngine* e, const BwReflectionConfig* cfg) {
     if (e->refl_cfg.order > 2)         e->refl_cfg.order       = 2;   /* v1: order 1 or 2 (3 = 16ch is heavy) */
     if (e->refl_cfg.num_rays == 0)     e->refl_cfg.num_rays    = 4096;
     if (e->refl_cfg.num_bounces == 0)  e->refl_cfg.num_bounces = 16;
+    if (e->refl_cfg.wet_gain <= 0.f)   e->refl_cfg.wet_gain    = 1.0f;
+}
+
+void bw_reflections_set_gain(BwEngine* e, float linear) {
+#ifdef BW_HAVE_STEAMAUDIO
+    if (e && e->reflect) steam_reflect_set_gain(e->reflect, linear);
+#else
+    (void)e; (void)linear;
+#endif
 }
 
 void bw_source_set_reflections(BwEngine* e, BwSource s, bool on) {

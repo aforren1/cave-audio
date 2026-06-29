@@ -36,11 +36,16 @@ typedef struct SteamReflect SteamReflect;
  * bw_start, off the audio thread, AFTER the sink's true block size is known. */
 SteamReflect* steam_reflect_create(SteamScene* scene, RtCore* rt, const Layout* L,
                                    uint32_t sample_rate, uint32_t block, uint32_t order,
-                                   float ir_seconds, uint32_t num_rays, uint32_t num_bounces);
+                                   float ir_seconds, uint32_t num_rays, uint32_t num_bounces,
+                                   float wet_gain);
 
 /* The rt bus tap (matches RtBusTap): AUDIO thread, after the voice loop, before align_process.
  * ud == the SteamReflect*. Convolves `aux` and sums the decoded 26-ch reverb onto `bus`. */
 void steam_reflect_tap(void* ud, float* bus, uint32_t n, const float* lp, const float* lq, const float* aux);
+
+/* Set the wet level applied to the reverb before it sums onto the bus (linear; 1 = unity). Control
+ * thread, per-frame-safe (a single relaxed atomic the audio-thread tap reads). */
+void steam_reflect_set_gain(SteamReflect* r, float linear);
 
 /* Stop the sim thread + release the owned phonon objects. Call AFTER the audio thread is joined and
  * the tap is unregistered (the IR aliases the bed source), and BEFORE steam_scene_destroy. */

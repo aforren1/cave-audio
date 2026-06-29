@@ -50,6 +50,7 @@ struct SteamReflect {
     uint32_t order, ambi_ch, n;
     IPLint32 ir_size;
     float    duration; uint32_t rays, bounces;
+    _Atomic float wet_gain;     /* control thread sets, audio-thread tap reads (linear; 1 = unity) */
     float*   ambi;              /* ambi_ch * n */
     float*   out26;             /* BW_CHANNELS * n */
 
@@ -157,16 +158,23 @@ void steam_reflect_tap(void* ud, float* bus, uint32_t n, const float* lp, const 
     cs_at(&dp.orientation, (float[3]){ 0.f, 0.f, 0.f });
     iplAmbisonicsDecodeEffectApply(r->dec, &dp, &amb, &o26);
 
-    for (uint32_t s = 0; s < BW_CHANNELS; ++s)          /* sum onto the bus (composes with the dry voices) */
-        for (uint32_t i = 0; i < n; ++i) bus[(size_t)s * n + i] += r->out26[(size_t)s * n + i];
+    const float g = atomic_load_explicit(&r->wet_gain, memory_order_relaxed);   /* live wet level */
+    for (uint32_t s = 0; s < BW_CHANNELS; ++s)          /* sum the wet reverb onto the bus (composes with the dry voices) */
+        for (uint32_t i = 0; i < n; ++i) bus[(size_t)s * n + i] += g * r->out26[(size_t)s * n + i];
+}
+
+void steam_reflect_set_gain(SteamReflect* r, float linear) {
+    if (r) atomic_store_explicit(&r->wet_gain, linear, memory_order_relaxed);
 }
 
 SteamReflect* steam_reflect_create(SteamScene* scene, RtCore* rt, const Layout* L,
                                    uint32_t sample_rate, uint32_t block, uint32_t order,
-                                   float ir_seconds, uint32_t num_rays, uint32_t num_bounces) {
+                                   float ir_seconds, uint32_t num_rays, uint32_t num_bounces,
+                                   float wet_gain) {
     if (!scene || !rt || !L || block == 0 || order < 1 || order > 3) return NULL;
     SteamReflect* r = (SteamReflect*)calloc(1, sizeof *r);
     if (!r) return NULL;
+    atomic_store_explicit(&r->wet_gain, wet_gain, memory_order_relaxed);
     r->ctx       = (IPLContext)steam_scene_ipl_context(scene);
     r->scene_ipl = (IPLScene)steam_scene_ipl_scene(scene);
     if (!r->ctx || !r->scene_ipl) { free(r); return NULL; }

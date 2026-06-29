@@ -27,6 +27,8 @@ Initial Unity binding (M7).
   has a "Replacing Unity audio" mapping table.
 - `BwAmbisonicBed` — world-locked AmbiX soundfield component (wraps `bw_bed_*`): play/stop/gain for
   diffuse ambience/music, decoded straight to all 26 speakers.
+- Reverb wet level: `BwAudio.reverbGain` (inspector) + a live `ReverbGain` property, backed by the
+  new engine config field `wet_gain` + `bw_reflections_set_gain`.
 - `BwEmitter.IsPlaying` + an `onFinished` UnityEvent, backed by a new engine ABI call
   `bw_source_is_playing` (latest-wins per-source playback readback).
 

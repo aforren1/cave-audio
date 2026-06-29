@@ -28,6 +28,7 @@ namespace CaveAudio
         public bool enableReflections = false;
         [Range(0.1f, 3f)] public float reverbSeconds = 1.0f;
         [Range(1, 2)]     public int   reflectionOrder = 1;
+        [Range(0f, 2f)]   public float reverbGain = 1.0f;   // wet level; adjustable live via ReverbGain
 
         [Header("Room box (load-time; optional acoustic geometry)")]
         public bool enableRoomBox = false;
@@ -59,7 +60,7 @@ namespace CaveAudio
             {
                 var rc = new BwReflectionConfig {
                     irSeconds = reverbSeconds, order = (uint)reflectionOrder,
-                    numRays = 0, numBounces = 0, enabled = 1,
+                    numRays = 0, numBounces = 0, enabled = 1, wetGain = reverbGain,
                 };
                 Bw.bw_reflections_config(_eng, in rc);
             }
@@ -99,6 +100,13 @@ namespace CaveAudio
 
         /// <summary>Mint a material from a named preset (load-time). 0 = the built-in default.</summary>
         public uint MaterialPreset(string name) => Ready ? Bw.bw_material_preset(_eng, name) : 0;
+
+        /// <summary>Reverb wet level (linear), adjustable live — the reverb-send equivalent.</summary>
+        public float ReverbGain
+        {
+            get => reverbGain;
+            set { reverbGain = value; if (Ready) Bw.bw_reflections_set_gain(_eng, value); }
+        }
 
         // ---- acoustic scene baking (load-time) ----------------------------------------------------
         // Collect every BwAcousticGeometry (+ the optional room box) into ONE mesh and hand it to the

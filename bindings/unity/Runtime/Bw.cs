@@ -39,7 +39,8 @@ namespace CaveAudio
         public uint  numRays;        // off-thread ray budget; 0 => default 4096
         public uint  numBounces;     // off-thread bounce depth; 0 => default 16
         public int   enabled;        // 0 => no bed created
-        public uint  reserved0, reserved1, reserved2, reserved3;   // matches reserved[4]; keep zero
+        public float wetGain;        // reverb level summed onto the bus; 0 => default 1.0
+        public uint  reserved0, reserved1, reserved2;   // matches reserved[3]; keep zero
     }
 
     /// <summary>Raw P/Invoke entry points. 1:1 with include/bwaudio.h.</summary>
@@ -91,6 +92,7 @@ namespace CaveAudio
 
         // ---- reflection bed ----
         [DllImport(DLL, CallingConvention = CC)] public static extern void bw_reflections_config(IntPtr e, in BwReflectionConfig cfg);
+        [DllImport(DLL, CallingConvention = CC)] public static extern void bw_reflections_set_gain(IntPtr e, float linear);
         [DllImport(DLL, CallingConvention = CC)] public static extern void bw_source_set_reflections(IntPtr e, uint s, [MarshalAs(UnmanagedType.I1)] bool on);
 
         // ---- directivity ----

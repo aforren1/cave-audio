@@ -146,11 +146,14 @@ typedef struct {
     uint32_t num_rays;       /* off-thread ray budget; 0 -> default 4096 */
     uint32_t num_bounces;    /* off-thread bounce depth; 0 -> default 16 */
     int      enabled;        /* 0 = no bed created (engine behaves exactly as today) */
-    uint32_t reserved[4];    /* zero; reserved so the struct can grow without an ABI break */
+    float    wet_gain;       /* linear level of the reverb summed onto the bus; 0 -> default 1.0 */
+    uint32_t reserved[3];    /* zero; reserved so the struct can grow without an ABI break */
 } BwReflectionConfig;
 /* Set the reflection config. Load-time only (between bw_create and bw_start); copies the struct,
  * zero fields take defaults. No-op without the Steam Audio backend. */
 BW_API void     bw_reflections_config(BwEngine* e, const BwReflectionConfig* cfg);
+/* Set the reverb wet level (linear; 1 = unity) live. Per-frame-safe. No-op if the bed isn't running. */
+BW_API void     bw_reflections_set_gain(BwEngine* e, float linear);
 /* Opt a source into the shared bed's wet send (per-frame-safe, enqueue-only). With the bed disabled
  * or no SDK, this just gates a send that goes nowhere. */
 BW_API void     bw_source_set_reflections(BwEngine* e, BwSource s, bool on);
