@@ -32,6 +32,7 @@
 /* propagation effects (opt-in, per voice) */
 #define BW_SPEED_OF_SOUND   343.0f    /* m/s */
 #define BW_DOPPLER_MAX_DIST 8.0f      /* propagation delay saturates past this (bounds the per-voice ring) */
+#define BW_DOPPLER_TAU      0.008f    /* per-pole smoothing time for the delay glide (s); see mix_voice */
 #define BW_AIR_FC_NEAR   18000.0f     /* air-absorption low-pass cutoff (Hz) at zero distance ... */
 #define BW_AIR_FC_PER_M    650.0f     /* ... falling this many Hz per metre ... */
 #define BW_AIR_FC_FLOOR   1200.0f     /* ... down to this floor */
@@ -74,7 +75,7 @@ typedef struct {
      * dop_init snaps the delay to distance/c on the first block after enable (no enable glitch). */
     bool     air_on, dop_on, dop_init;
     float    air_a_cur, air_y1;
-    float    dop_delay;
+    float    dop_delay, dop_dtgt;            /* read delay + its smoothed target (2-pole, per-sample) */
     uint32_t dop_w;
     float    spread;                         /* source angular width 0..1 (0 = point); blends the pan gains */
 } Voice;
@@ -333,7 +334,7 @@ static void eq_coeffs(int type, float cw0, float alpha, float g, float out[5]) {
 /* (re)start a voice's Doppler delay line clean: clear its ring slice + snap the delay next block, so a
  * fresh enable or a replay doesn't bleed the previous tail through the line. Audio thread (bounded). */
 static void dop_line_reset(RtCore* c, Voice* v, uint16_t idx) {
-    v->dop_w = 0; v->dop_delay = 0.f; v->dop_init = true;
+    v->dop_w = 0; v->dop_delay = 0.f; v->dop_dtgt = 0.f; v->dop_init = true;
     memset(c->dop_ring + (size_t)idx * c->dop_ringlen, 0, (size_t)c->dop_ringlen * sizeof(float));
 }
 
@@ -581,22 +582,21 @@ static void mix_voice(RtCore* c, Voice* v, uint16_t idx, float* bus, uint32_t n,
         if (air_a_tgt > 1.f) air_a_tgt = 1.f;
         air_a_step = (air_a_tgt - v->air_a_cur) / (float)n;
     }
-    float dop_end = 0.f, dop_step = 0.f, *dring = NULL; uint32_t dmask = 0;
+    float dop_ds = 0.f, dop_k = 0.f, *dring = NULL; uint32_t dmask = 0;
     if (v->dop_on && c->dop_ring) {
-        float ds = dist / BW_SPEED_OF_SOUND * (float)c->sample_rate;   /* raw propagation delay (samples) */
+        dop_ds = dist / BW_SPEED_OF_SOUND * (float)c->sample_rate;     /* raw propagation delay (samples) */
         float maxd = (float)(c->dop_ringlen - 2);          /* keep both interpolation taps in-ring */
-        if (ds > maxd) ds = maxd;
-        if (v->dop_init) { v->dop_delay = ds; v->dop_init = false; }   /* snap on the first block: no enable glitch */
-        /* Glide only a FRACTION toward the target each block (~frame-length time constant), not all the
-         * way. Position is committed per video frame (~60 Hz) but we render several blocks per frame; if
-         * the delay snapped to the new distance each block it would apply the pitch shift in bursts (one
-         * block, then static) -> choppy/buzzy. A leaky glide spreads each per-frame step across the
-         * blocks between frames, so the resampling stays continuous; in steady motion the delay's rate
-         * still equals the true closing rate (correct Doppler) with only a small constant lag. */
-        float a = (float)n / (float)c->sample_rate / 0.02f;           /* block_time / tau (tau ~ 20 ms) */
-        if (a > 1.f) a = 1.f; else if (a < 0.08f) a = 0.08f;
-        dop_end = v->dop_delay + (ds - v->dop_delay) * a;
-        dop_step = (dop_end - v->dop_delay) / (float)n;
+        if (dop_ds > maxd) dop_ds = maxd;
+        if (v->dop_init) { v->dop_delay = dop_ds; v->dop_dtgt = dop_ds; v->dop_init = false; }  /* snap: no enable glitch */
+        /* The read delay is smoothed toward distance/c PER SAMPLE with a 2-pole filter (target then
+         * delay, BW_DOPPLER_TAU each). Position is committed per video frame (~60 Hz) but we render many
+         * samples per frame; a per-block glide left a slope corner in the read trajectory at every block
+         * (and every position step), which a pure tone hears as residual grain. Smoothing per sample
+         * through two poles makes the read RATE continuous (no corners), so the pitch glides cleanly; in
+         * steady motion the delay's rate still equals the true closing rate (correct Doppler), with only
+         * a small constant lag. */
+        dop_k = 1.f / (BW_DOPPLER_TAU * (float)c->sample_rate);
+        if (dop_k > 0.5f) dop_k = 0.5f;
         dring = c->dop_ring + (size_t)idx * c->dop_ringlen; dmask = c->dop_ringlen - 1;
     }
 
@@ -628,7 +628,9 @@ static void mix_voice(RtCore* c, Voice* v, uint16_t idx, float* bus, uint32_t n,
             float newer = dring[(v->dop_w - di)     & dmask];   /* di samples ago */
             float older = dring[(v->dop_w - di - 1) & dmask];   /* di+1 samples ago */
             s = newer * (1.f - df) + older * df;
-            v->dop_w++; v->dop_delay += dop_step;
+            v->dop_w++;
+            v->dop_dtgt  += (dop_ds      - v->dop_dtgt)  * dop_k;   /* 2-pole, per sample: smooth the target ... */
+            v->dop_delay += (v->dop_dtgt - v->dop_delay) * dop_k;   /* ... then the read delay -> continuous rate */
         }
         if (!ended) ++cur;
         v->occ_cur += occ_step;
@@ -642,8 +644,7 @@ static void mix_voice(RtCore* c, Voice* v, uint16_t idx, float* bus, uint32_t n,
     v->occ_cur = occ_tgt;                                        /* land exactly (same local) */
     v->dir_cur = dir_tgt;
     if (v->air_on) v->air_a_cur = air_a_tgt;                     /* land the ramped propagation params */
-    if (v->dop_on) v->dop_delay = dop_end;
-    if (do_send)   v->refl_g_cur = refl_tgt;
+    if (do_send)   v->refl_g_cur = refl_tgt;                     /* (the Doppler delay self-tracks per sample) */
     if (v->eq_engaged) {
         for (int b = 0; b < 3; ++b) for (int k = 0; k < 5; ++k) v->eq_co[b][k] = co_tgt[b][k];   /* land coeffs */
         if (flat) {                                              /* settled to passthrough: bypass + reset history */
