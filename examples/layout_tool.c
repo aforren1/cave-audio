@@ -157,7 +157,8 @@ static const char* backend = "none";
 static BwSound     pv_sound;
 static BwSource    pv_src;
 static int         preview, pv_orbit, layout_dirty = 1;   /* dirty=1 forces the first preview to rebuild from spk[] */
-static int         pv_panner;                             /* 0 = DBAP, 1 = SPCAP (live A/B in preview, B key) */
+static int         pv_panner;                             /* 0=DBAP 1=SPCAP 2=VBAP (= BwPanner; live A/B, B key) */
+static const char* panner_names[] = { "DBAP (moving)", "SPCAP (fixed)", "VBAP (fixed)" };
 static float       pv_t;
 static Vector3     src_pos = { 1.5f, 0.0f, 0.0f };
 
@@ -290,8 +291,8 @@ int main(int argc, char** argv) {
             } else {
                 if (IsKeyPressed(KEY_SPACE)) pv_orbit = !pv_orbit;
                 if (IsKeyPressed(KEY_B)) {               /* live A/B: DBAP <-> SPCAP (atomic, safe while running) */
-                    pv_panner ^= 1;
-                    if (e) bw_set_panner(e, pv_panner ? BW_PAN_SPCAP : BW_PAN_DBAP);
+                    pv_panner = (pv_panner + 1) % 3;
+                    if (e) bw_set_panner(e, (BwPanner)pv_panner);
                 }
                 float mv = ((IsKeyDown(KEY_LEFT_SHIFT) || IsKeyDown(KEY_RIGHT_SHIFT)) ? 0.4f : 1.5f) * dt;
                 if (pv_orbit) {                          /* hands-free orbit + near/far + high/low sweep */
@@ -353,7 +354,7 @@ int main(int argc, char** argv) {
                 }
                 preview = 1;
                 if (e) {
-                    bw_set_panner(e, pv_panner ? BW_PAN_SPCAP : BW_PAN_DBAP);   /* rebuilt engine defaults to DBAP */
+                    bw_set_panner(e, (BwPanner)pv_panner);                      /* rebuilt engine defaults to DBAP */
                     bw_source_set_gain(e, pv_src, SRC_GAIN);
                     bw_commit(e);
                 }
@@ -457,7 +458,7 @@ int main(int argc, char** argv) {
         DrawRectangle(0, 0, GetScreenWidth(), 96, (Color){ 0, 0, 0, 200 });
         if (preview) {
             DrawText(TextFormat("PREVIEW   WASD/RF move   SPACE auto-orbit   B panner: %s   P back to edit",
-                                pv_panner ? "SPCAP (fixed)" : "DBAP (moving)"),
+                                panner_names[pv_panner]),
                      10, 8, 13, RAYWHITE);
             DrawText(TextFormat("source (%.2f, %.2f, %.2f)   orbit %s   - A/B the panner by ear; walk the room for off-center coverage",
                                 src_pos.x, src_pos.y, src_pos.z, pv_orbit ? "ON" : "off"),

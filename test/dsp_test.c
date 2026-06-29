@@ -9,6 +9,7 @@
 #include "layout.h"
 #include "dbap.h"
 #include "spcap.h"
+#include "vbap.h"
 #include "align.h"
 #include "ambisonics.h"
 #include "allrad.h"
@@ -248,8 +249,27 @@ int main(void) {
         }
     }
 
+    /* 11. VBAP panner: localization, constant power, at most 3 active speakers (the containing triangle) */
+    {
+        VbapState vb; vbap_reset(&vb);
+        float lis[3] = { 0, 0, 0 }, g[CH];
+        int loc_ok = 1;
+        for (int k = 0; k < CH; ++k) {
+            vbap_gains(&vb, LD.speakers[k].pos, lis, &LD, 1u, 1.0f, g);   /* source at speaker k's bearing */
+            if (argmax(g, CH) != k) loc_ok = 0;
+        }
+        CHECK(loc_ok, "VBAP localizes a source at each speaker to that channel");
+
+        float src[3] = { 0.7f, 0.2f, 0.6f }, gain = 0.8f;                  /* ds < 1 m -> atten = 1 */
+        vbap_gains(&vb, src, lis, &LD, 1u, gain, g);
+        double p = 0; int active = 0;
+        for (int k = 0; k < CH; ++k) { p += (double)g[k] * g[k]; if (g[k] > 1e-4f) ++active; }
+        CHECK(fabs(sqrt(p) - gain) < 0.02, "VBAP is constant-power (||g|| ~ user_gain)");
+        CHECK(active >= 1 && active <= 3, "VBAP uses at most 3 speakers (the containing triangle)");
+    }
+
     remove(LJ);
     if (fails) { printf("dsp_test: %d FAILURES\n", fails); return 1; }
-    printf("dsp_test OK (layout parse, DBAP + SPCAP localize/power/spread, AllRAD bed decode, align gain+delay)\n");
+    printf("dsp_test OK (layout parse, DBAP + SPCAP + VBAP, AllRAD bed decode, align gain+delay)\n");
     return 0;
 }

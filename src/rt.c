@@ -10,6 +10,7 @@
 #include "layout.h"
 #include "dbap.h"
 #include "spcap.h"
+#include "vbap.h"
 #include "align.h"
 #include "ambisonics.h"   /* SH->26 decode for ambisonic beds */
 #include "allrad.h"       /* robust SH->26 decode for irregular arrays */
@@ -110,9 +111,10 @@ struct RtCore {
     /* spatialization (set at create/load time; read by the audio thread) */
     Layout    layout;
     Aligner*  aligner;
-    _Atomic int panner;      /* 0 = DBAP (moving observer); 1 = SPCAP (fixed observer); atomic for safe A/B */
-    uint32_t   layout_gen;   /* bumped on rt_set_layout; the SPCAP cache compares it to self-invalidate */
+    _Atomic int panner;      /* 0 = DBAP (moving observer); 1 = SPCAP; 2 = VBAP (both fixed observer); atomic for A/B */
+    uint32_t   layout_gen;   /* bumped on rt_set_layout; the SPCAP/VBAP caches compare it to self-invalidate */
     SpcapState spcap;        /* SPCAP cache (audio-thread-owned; rebuilt on listener/layout change) */
+    VbapState  vbap;         /* VBAP cache (same) */
     int        bed_decoder;  /* 0 = sampling decode (SAD); 1 = AllRAD (robust on irregular arrays) */
     /* ambisonic bed decode: [speaker][ACN] = (2l+1)*Y_k^SN3D(speaker_dir)/L (sampling decode, SN3D),
      * rebuilt from the layout whenever it changes. A bed voice decodes its SH channels through this. */
@@ -411,8 +413,11 @@ static void build_bed_decode(RtCore* c) {
  * voice (multi-channel asset) has no DBAP position — its master gain rides gtarget[0]. */
 static void compute_gains(RtCore* c, Voice* v) {
     if (v->sound && v->sound->channels > 1) { v->gtarget[0] = v->gain_user; return; }
-    if (atomic_load_explicit(&c->panner, memory_order_acquire) == 1)
+    int p = atomic_load_explicit(&c->panner, memory_order_acquire);
+    if (p == 1)
         spcap_gains(&c->spcap, v->pos_active, c->lis.p_active, &c->layout, c->layout_gen, v->gain_user, v->gtarget);
+    else if (p == 2)
+        vbap_gains(&c->vbap, v->pos_active, c->lis.p_active, &c->layout, c->layout_gen, v->gain_user, v->gtarget);
     else
         dbap_gains(v->pos_active, c->lis.p_active, &c->layout, v->gain_user, v->gtarget);
 }
@@ -860,12 +865,12 @@ void rt_set_layout(RtCore* c, const Layout* L) {
         if (c->voices[i].active) c->voices[i].dirty = true;
 }
 
-/* Select the panner: 0 = DBAP (default, moving observer), 1 = SPCAP (fixed observer). Atomic-release
- * store, and the SPCAP cache self-invalidates on listener/layout change, so this is safe to call at
- * runtime (live A/B) as well as before bw_start. */
+/* Select the panner: 0 = DBAP (default, moving observer), 1 = SPCAP, 2 = VBAP (both fixed observer).
+ * Atomic-release store, and the SPCAP/VBAP caches self-invalidate on listener/layout change, so this
+ * is safe to call at runtime (live A/B) as well as before bw_start. */
 void rt_set_panner(RtCore* c, int panner) {
     if (!c) return;
-    atomic_store_explicit(&c->panner, (panner == 1) ? 1 : 0, memory_order_release);
+    atomic_store_explicit(&c->panner, (panner >= 0 && panner <= 2) ? panner : 0, memory_order_release);
 }
 
 /* Select the diffuse-bed decoder: 0 = sampling (SAD, default), 1 = AllRAD. Rebuilds the decode matrix

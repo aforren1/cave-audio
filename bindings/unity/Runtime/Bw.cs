@@ -20,7 +20,7 @@ namespace CaveAudio
     public enum BwProfile : int { Cave = 0, Binaural = 1, Both = 2 }
     public enum BwDirectivity : int { Omni = 0, Cardioid = 1, Figure8 = 2 }
     public enum BwTestKind : int { Off = 0, Sine = 1, Noise = 2 }
-    public enum BwPanner : int { Dbap = 0, Spcap = 1 }
+    public enum BwPanner : int { Dbap = 0, Spcap = 1, Vbap = 2 }
     public enum BwBedDecoder : int { Sampling = 0, Allrad = 1 }
 
     [StructLayout(LayoutKind.Sequential)]

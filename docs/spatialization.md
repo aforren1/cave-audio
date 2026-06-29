@@ -31,9 +31,14 @@ the array origin.
 > image toward it, then normalises for constant power (with the same distance attenuation as DBAP). The
 > correction is cached and rebuilt only when the listener or layout changes, so the per-voice solve
 > stays alloc/lock-free. **Pick DBAP for a moving observer, SPCAP for a fixed one**; the layout tool's
-> `V` key scores a layout for either model. (VBAP was considered and rejected: it needs a triangulation
-> subsystem, has a direction-dependent source-width artifact, and is brittle on the irregular surveyed
-> array — SPCAP is the better fit for a swappable, robust panner. See the DBAP-vs-VBAP note above.)
+> `V` key scores a layout for either model, and its preview `B` key A/Bs the panners live.
+>
+> **VBAP** (`BW_PAN_VBAP`, `vbap.c`) is also selectable: the 2-3 nearest speakers of the hull triangle
+> containing the source carry it — the **sharpest** of the three, also fixed-observer. It needs a clean
+> triangulation, so it suits a *regular* array; it has VBAP's direction-dependent source-width artifact
+> and falls back to DBAP for a non-triangulable array. SPCAP remains the recommended fixed-observer
+> default (smoother, robust on the irregular surveyed array); VBAP is there when pinpoint localization at
+> the sweet spot is the priority. It shares the convex-hull + VBAP solve (`hull.c`) with AllRAD's decode.
 
 Ambisonics is still the right tool for the **diffuse layer** (ambient beds,
 reflections/reverb), where energy isn't sweet-spot-sensitive and a fixed decode is
@@ -153,9 +158,9 @@ time. Two decoders are selectable with **`bw_set_panner`'s sibling `bw_set_bed_d
 Validated against the cube grid + a deliberately clustered array (per-direction energy CV / rE error):
 on the near-uniform cube AllRAD matches sampling (≈7% CV, a few degrees); on the **clustered** array it
 cuts the loudness-vs-direction variance from **91%→29%** and the localization error from **34°→18°**.
-AllRAD doesn't touch the point-source panner (DBAP/SPCAP) — it's the diffuse-layer counterpart to the
-placement correction those make for localized sources. The same VBAP/hull machinery is what a future
-VBAP *point* panner would need.
+AllRAD doesn't touch the point-source panner (DBAP/SPCAP/VBAP) — it's the diffuse-layer counterpart to
+the placement correction those make for localized sources. Its convex-hull + VBAP solve is factored
+into `hull.c`, shared with the `BW_PAN_VBAP` point panner.
 
 ## Steam Audio usage
 

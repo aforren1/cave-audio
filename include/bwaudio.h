@@ -192,13 +192,16 @@ BW_API void     bw_test_signal(BwEngine* e, uint32_t channel, BwTestKind kind, f
  * auditioning the geometry the engine is actually panning with. Control thread; safe any time. */
 BW_API uint32_t bw_get_speakers(BwEngine* e, float* xyz, uint32_t cap);
 
-/* ---- panner selection (load-time: call between bw_create and bw_start) ----
+/* ---- panner selection (load-time, or live: the switch is atomic) ----
  * The per-source panner that writes the 26-ch bus. DBAP (default) is listener-relative, recomputed
  * per frame from the tracked position — for a MOVING observer roaming the array. SPCAP is a smooth,
  * all-speaker, placement-correcting sweet-spot panner for a FIXED observer (a static listener: don't
- * track, set the sweet spot once); it conserves loudspeaker power across an uneven array. Does not
- * affect the diffuse bed / ambisonic paths. See docs/spatialization.md. */
-typedef enum { BW_PAN_DBAP = 0, BW_PAN_SPCAP = 1 } BwPanner;
+ * track, set the sweet spot once); it conserves loudspeaker power across an uneven array. VBAP is the
+ * sharpest (the 2-3 nearest speakers of the containing triangle carry a source) — also fixed-observer,
+ * best when the array triangulates cleanly; it falls back to DBAP for a non-triangulable array. SPCAP
+ * and VBAP assume a fixed listener (with internal tracking their cache rebuilds every block — use DBAP
+ * for a moving observer). Does not affect the diffuse bed / ambisonic paths. See docs/spatialization.md. */
+typedef enum { BW_PAN_DBAP = 0, BW_PAN_SPCAP = 1, BW_PAN_VBAP = 2 } BwPanner;
 BW_API void     bw_set_panner(BwEngine* e, BwPanner panner);
 
 /* Select the diffuse-bed ambisonic decoder (load-time: between bw_create and bw_start). SAMPLING is the
