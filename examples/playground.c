@@ -8,8 +8,9 @@
  * raylib's raymath provides the vector/quaternion math.
  *
  * A wall demonstrates the materials path: move the source in FRONT of it for a crude specular
- * reflection (a mirror-image source — a second DBAP voice; the directional reverb BED is a separate,
- * static-scene feature, see reflsmoke / docs/materials.md), or BEHIND it for OCCLUSION — REAL Steam
+ * reflection (a mirror-image source — a second DBAP voice, its level scaled by the wall material's
+ * reflectivity so carpet reflects far less than metal; the full per-band directional reverb BED is a
+ * separate, static-scene feature, see reflsmoke / docs/materials.md), or BEHIND it for OCCLUSION — REAL Steam
  * Audio occlusion: the off-thread sim ray-traces the wall blocking the line to the listener and
  * attenuates + spectrally tilts the source by the wall MATERIAL (the HUD shows the live factor).
  * Press M to cycle the wall material (concrete/glass/carpet/wood/metal) — glass blocks less,
@@ -194,6 +195,11 @@ int main(void) {
      * transmits more (less blocked), carpet/wood pass low + muffle highs, metal passes bass but
      * blocks highs, concrete blocks hard. (All are real entries in the engine's preset table.) */
     const char* mat_names[] = { "concrete", "glass", "carpet", "wood", "metal" };
+    /* broadband reflectivity (~1 - mean absorption of the same presets), used to scale the image-source
+     * reflection level so the wall MATERIAL audibly drives reflectivity too — carpet reflects far less
+     * than metal/concrete. (The image source is a single DBAP voice, so this is a broadband gain only;
+     * the full per-band material reflection is the static-scene reverb bed's job.) */
+    const float mat_refl[] = { 0.93f, 0.96f, 0.45f, 0.92f, 0.89f };
     enum { NMAT = 5 };
     BwMaterial mats[NMAT];
     for (int i = 0; i < NMAT; ++i) mats[i] = bw_material_preset(e, mat_names[i]);
@@ -310,7 +316,7 @@ int main(void) {
         bw_source_set_gain(e, src, SRC_GAIN);                 /* occlusion is now applied by the engine */
         bw_source_set_orientation(e, src, sq.x, sq.y, sq.z, sq.w);   /* directivity uses the source's forward */
         bw_source_set_pos(e, refl, image.x, image.y, image.z);
-        bw_source_set_gain(e, refl, (refl_audible && refl_valid) ? SRC_GAIN * REFL_GAIN : 0.0f);
+        bw_source_set_gain(e, refl, (refl_audible && refl_valid) ? SRC_GAIN * REFL_GAIN * mat_refl[cur_mat] : 0.0f);
         bw_set_listener_pose(e, 0, 0, 0, q.x, q.y, q.z, q.w);
         bw_commit(e);
 
@@ -364,8 +370,8 @@ int main(void) {
         DrawText(TextFormat("source (%.2f, %.2f, %.2f)   head %.0f deg",
                             source_pos.x, source_pos.y, source_pos.z, head_yaw * 57.2958f),
                  12, 30, 16, (Color){ 215, 215, 225, 255 });
-        DrawText(TextFormat("signal [1-4]: %s     material [M]: %s     directivity [Z]: %s  (%.0f%% on-axis)",
-                            SIG_NAMES[cur_sig], mat_names[cur_mat], dir_names[cur_dir], dgain * 100.0f),
+        DrawText(TextFormat("signal [1-4]: %s   material [M]: %s (refl %.0f%%)   directivity [Z]: %s (%.0f%% on-axis)",
+                            SIG_NAMES[cur_sig], mat_names[cur_mat], mat_refl[cur_mat] * 100.0f, dir_names[cur_dir], dgain * 100.0f),
                  12, 52, 15, (Color){ 110, 200, 255, 255 });
         DrawText(TextFormat("%s    [T] reflection %s   [G] occlusion %s (%.0f%% audible)",
                             refl_valid ? "REFLECTING - audible image source" :
