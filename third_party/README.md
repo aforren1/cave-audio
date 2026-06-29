@@ -91,11 +91,21 @@ conversion fix the v4.8.1 binaries lack. Two reasons the source is the right ven
    NatNet). See [../docs/spatialization.md](../docs/spatialization.md) / [../docs/materials.md](../docs/materials.md).
 2. **Gets the fix.** Building from the pinned commit yields a `phonon` lib that includes it.
 
+There is also one **local patch** we apply before building (`third_party/patches/`): phonon 4.8.1's
+complex `ArrayMath::multiplyAccumulate` reads its accumulator with an *aligned* SSE load on the path
+it takes when the accumulator is *misaligned* — which it always is for the odd ambisonic channels
+(the per-channel FFT stride is `8 mod 16` bytes), so any multichannel reflection effect access-violates
+at channel 1. The one-line fix (`load`→`loadu`) is what lets the reflection bed render **directional**
+early reflections instead of omni-only. Report it upstream and drop the patch once it lands.
+
 **Building phonon (minimal core, Windows x64).** This recipe produces a `phonon.dll`/`phonon.lib`
 that links cleanly into `bwaudio.dll`. Run from `third_party/steam-audio/core/build`:
 
 ```sh
 git submodule update --init third_party/steam-audio          # fetch the pinned source
+
+# 0. Apply our local fixes (see third_party/patches/). REQUIRED for directional reflections.
+git -C third_party/steam-audio apply ../patches/phonon-multiplyaccumulate-align.patch
 
 # 1. Fetch ONLY the required deps, with the SHARED CRT (/MD) — see the CRT note below.
 #    flatbuffers is a build tool (flatc); zlib/pffft/mysofa are linked into phonon.

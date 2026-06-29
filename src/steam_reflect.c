@@ -26,17 +26,14 @@
 
 #define REFL_HZ          12      /* reflection sim rate (reverb changes slowly; cheaper than occlusion) */
 #define REFL_DIFFUSE     1024    /* diffuse-reflection sample directions */
-/* HYBRID = early-reflection convolution + parametric (FDN) late tail. Empirically, for this
- * listener-centric reverb source only the W (omni) channel of the reflection IR is validly readable:
- * applying the convolution with numChannels>1 access-violates inside phonon's overlap-save
- * convolution at channel index 1 (the IR's directional channels are unmapped in this configuration —
- * verified down to a single-channel repro + a debugger trace: channel 0 mapped, channel 1 not). The
- * exact upstream cause is phonon-internal; whatever it is, running the convolution as ONE channel
- * (omni) is the RT-safe path that works. That is the right model for a diffuse bed anyway: omni early
- * reflections add room character over the parametric tail, spread (world-locked) across the 26
- * speakers via the W ambisonic decode. (Directional early reflections would need a per-source stream.) */
+/* HYBRID = early-reflection convolution + parametric (FDN) late tail, rendered as a full ambisonic
+ * field (order `order`, (order+1)^2 channels) so the early reflections are DIRECTIONAL — they decode
+ * to the 26 speakers from the directions they actually arrive. (Requires the patched phonon: Steam
+ * Audio 4.8.1's complex ArrayMath::multiplyAccumulate reads the accumulator with an aligned SSE load
+ * on its unaligned code path, which access-violates on the odd ambisonic channels — numSpectrumSamples
+ * is odd, so the per-channel FFT stride is 8 mod 16. Fixed load->loadu in the vendored build; see
+ * third_party/README.md. A symmetric scene still yields a near-omni field, which is physically right.) */
 #define REFL_TYPE        IPL_REFLECTIONEFFECTTYPE_HYBRID
-#define REFL_CONV_CH     1       /* convolution/effect channel count: omni (W) only — see above */
 
 struct SteamReflect {
     IPLContext   ctx;            /* BORROWED from scene */
@@ -131,19 +128,16 @@ void steam_reflect_tap(void* ud, float* bus, uint32_t n, const float* lp, const 
     IPLReflectionEffectParams rp;
     if (!refl_read(r, &rp)) return;                     /* silent until the first sim publish */
     rp.type = REFL_TYPE;                                /* authoritative: must match the effect's create type */
-    if (rp.numChannels > REFL_CONV_CH) rp.numChannels = REFL_CONV_CH;   /* read only the valid (omni) IR channel */
-    if (rp.irSize > r->ir_size)        rp.irSize       = r->ir_size;
+    if (rp.numChannels > (IPLint32)r->ambi_ch) rp.numChannels = (IPLint32)r->ambi_ch;   /* clamp to the baked order */
+    if (rp.irSize > r->ir_size)                rp.irSize       = r->ir_size;
 
-    /* convolve the mono aux send -> the omni (W) ambisonic channel. r->ambi channels 1..ambi_ch-1
-     * stay zero (calloc'd once; the 1-channel apply only writes channel 0), so the decode below sees
-     * a [W,0,0,..] field and spreads it omnidirectionally across the 26 speakers. */
+    /* convolve the mono aux send -> the full ambisonic reflection field (directional early reflections) */
     float* inP[1]  = { (float*)aux };
-    IPLAudioBuffer in   = { 1, (IPLint32)n, inP };
+    IPLAudioBuffer in  = { 1, (IPLint32)n, inP };
     float* ambP[BW_AMBI_CH];
     for (uint32_t k = 0; k < r->ambi_ch; ++k) ambP[k] = r->ambi + (size_t)k * n;
-    IPLAudioBuffer conv = { REFL_CONV_CH, (IPLint32)n, ambP };          /* effect out: omni channel only */
-    iplReflectionEffectApply(r->refl, &rp, &in, &conv, NULL);   /* NULL mixer: single bed */
-    IPLAudioBuffer amb  = { (IPLint32)r->ambi_ch, (IPLint32)n, ambP };  /* full field [W,0,0,..] for the decode */
+    IPLAudioBuffer amb = { (IPLint32)r->ambi_ch, (IPLint32)n, ambP };
+    iplReflectionEffectApply(r->refl, &rp, &in, &amb, NULL);   /* NULL mixer: single bed */
 
     /* decode ambisonic -> 26 speakers, world-locked (identity orientation matches the sim's world listener) */
     float* outP[BW_CHANNELS];
@@ -197,7 +191,7 @@ SteamReflect* steam_reflect_create(SteamScene* scene, RtCore* rt, const Layout* 
     iplSimulatorCommit(r->sim);
 
     IPLReflectionEffectSettings rs; memset(&rs, 0, sizeof rs);
-    rs.type = REFL_TYPE; rs.irSize = r->ir_size; rs.numChannels = REFL_CONV_CH;   /* omni convolution — see REFL_TYPE note */
+    rs.type = REFL_TYPE; rs.irSize = r->ir_size; rs.numChannels = (IPLint32)r->ambi_ch;   /* full directional ambisonic */
     if (iplReflectionEffectCreate(r->ctx, &as, &rs, &r->refl) != IPL_STATUS_SUCCESS) goto fail;
 
     for (uint32_t s = 0; s < BW_CHANNELS; ++s) {        /* speaker dirs in phonon's cartesian frame (== room) */

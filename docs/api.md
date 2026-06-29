@@ -263,9 +263,9 @@ the bus. `bw_reflections_config` is **load-time** (the IR length + ambisonic ord
 16), `enabled = 0` means no bed is created and the engine behaves exactly as without it.
 `bw_source_set_reflections` is the per-frame, non-blocking opt-in of a source into the bed's wet send
 (with the bed disabled or no SDK, it gates a send that goes nowhere). The bed runs Steam Audio's
-**HYBRID** reverb — omni early-reflection convolution + parametric (FDN) tail, decoded across the 26
-speakers (the listener-centric IR is order-0, so the convolution is omni; see
-[materials.md](.\materials.md)). No-op without the Steam Audio build.
+**HYBRID** reverb — **directional** early-reflection convolution (full ambisonic, order = `order`) +
+parametric (FDN) tail, decoded across the 26 speakers (requires the vendored phonon's alignment patch;
+see [materials.md](.\materials.md)). No-op without the Steam Audio build.
 
 ## Handle scheme
 

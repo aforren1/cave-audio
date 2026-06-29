@@ -77,19 +77,24 @@ setters are **enforced** load-time: a call after `bw_start` is rejected with a `
 the reflection thread's ray tracing). The single-material `bw_scene_set_mesh` remains the `nmat==1`
 convenience.
 
-### Reflection bed: hybrid reverb (omni early reflections + parametric tail)
+### Reflection bed: hybrid reverb (directional early reflections + parametric tail)
 
 The reflection bed runs Steam Audio's **HYBRID** reverb: an early-reflection **convolution** plus a
-**parametric (FDN)** late tail. One subtlety drove the implementation: for this *listener-centric*
-reverb source, only the **W (omni) channel** of the reflection IR is validly readable — applying the
-convolution with `numChannels > 1` access-violates inside phonon's overlap-save convolution at
-channel index 1 (the IR's directional channels are unmapped in this configuration; reproduced down
-to a one-channel isolation test + a debugger trace against phonon 4.8.1 — channel 0 mapped, channel 1
-not). The exact upstream cause is phonon-internal; regardless, the convolution is run as a **single
-omni channel** and the resulting `[W,0,0,…]` field is decoded across the 26 speakers. That is the right model for a diffuse bed anyway — omni early reflections add
-room character on top of the parametric tail, and neither part is directional for a single
-listener-centric source. (Per-source, position-dependent directional early reflections would need a
-per-source reflection stream, which is out of scope for the shared bed.) The same per-triangle materials drive **both** occlusion (per-band
+**parametric (FDN)** late tail, rendered as a **full ambisonic field** (order `order`, decoded across
+the 26 speakers) so the early reflections are **directional** — they arrive from the directions the
+geometry actually reflects them. A symmetric scene with a centred listener correctly collapses to a
+near-omni field (the directional ambisonic channels cancel); asymmetric geometry lights them up
+(verified: an offset source puts ~half the omni energy into a directional channel).
+
+Getting there required fixing a real **Steam Audio 4.8.1 bug** (found via a single-threaded phonon
+repro + a debugger trace): the complex `ArrayMath::multiplyAccumulate` reads its accumulator with an
+*aligned* SSE load on its *unaligned* code path, which access-violates on the odd ambisonic channels
+(the per-channel FFT stride is `8 mod 16` bytes, because `numSpectrumSamples` is always odd). That
+crashed any `numChannels > 1` reflection effect at channel 1. The one-line fix (`load`→`loadu`) is a
+local patch on the vendored phonon — see [third_party/patches/](../third_party/patches/) and
+[third_party/README.md](../third_party/README.md); report it upstream and drop it once it lands.
+
+The same per-triangle materials drive **both** occlusion (per-band
 transmission) and the reflection bed (absorption/scattering), because both simulators share one
 committed `IPLScene`. A per-triangle smoke test confirms a source behind a `concrete` triangle is
 occluded to ~0.015 while one behind a high-transmission triangle passes at ~0.6.
