@@ -96,7 +96,9 @@ complex `ArrayMath::multiplyAccumulate` reads its accumulator with an *aligned* 
 it takes when the accumulator is *misaligned* — which it always is for the odd ambisonic channels
 (the per-channel FFT stride is `8 mod 16` bytes), so any multichannel reflection effect access-violates
 at channel 1. The one-line fix (`load`→`loadu`) is what lets the reflection bed render **directional**
-early reflections instead of omni-only. Report it upstream and drop the patch once it lands.
+early reflections instead of omni-only. This is the open upstream issue
+[ValveSoftware/steam-audio#546](https://github.com/ValveSoftware/steam-audio/issues/546) (symptom only —
+no root cause/fix there yet); drop the patch once a fixed release lands.
 
 **Building phonon (minimal core, Windows x64).** This recipe produces a `phonon.dll`/`phonon.lib`
 that links cleanly into `bwaudio.dll`. Run from `third_party/steam-audio/core/build`:

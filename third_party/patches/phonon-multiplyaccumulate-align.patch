@@ -22,7 +22,11 @@
 # Use float4::loadu for the accumulator read in the unaligned branch (one character: load -> loadu).
 # The aligned branch (only entered when accum IS aligned) is left untouched.
 #
-# Reported upstream: <fill in the ValveSoftware/steam-audio issue/PR link>.
+# Upstream: this is the (still open, root-cause-unknown) ValveSoftware/steam-audio issue #546
+# ("Seg Fault when trying to use Reflection Sim with IPL_REFLECTIONEFFECTTYPE_CONVOLUTION" — crashes
+# at channel i=1 with 4-channel first-order ambisonics). That report has the symptom but not the
+# cause/fix below; worth posting this diagnosis + one-liner there.
+# https://github.com/ValveSoftware/steam-audio/issues/546
 --- a/core/src/core/array_math.cpp
 +++ b/core/src/core/array_math.cpp
 @@ -257,7 +257,7 @@ void ArrayMath::multiplyAccumulate(int size,
