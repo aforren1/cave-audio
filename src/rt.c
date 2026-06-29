@@ -84,6 +84,13 @@ struct RtCore {
      * (gen<<1 | playing-bit), republished by the audio thread each block. The gen guards a stale
      * or recycled handle (a mismatched gen reads as not-playing). */
     _Atomic uint32_t* play_pub;
+
+    /* debug channel test signal (bw_test_signal): audio-thread DSP state, set by CMD_TEST_SIGNAL,
+     * generated + summed onto each channel AFTER align (raw channel). 0 kind = off. */
+    uint8_t  test_kind[BW_CHANNELS];
+    float    test_gain[BW_CHANNELS];
+    float    test_phase[BW_CHANNELS];   /* sine phase accumulator, radians */
+    uint32_t test_noise;                /* shared LCG state for the noise kind */
     struct { float cw0, alpha; int type; } eq_proto[3];   /* per-band biquad prototypes, rate-derived at create */
 
     /* control-thread-owned voice handle allocation */
@@ -325,6 +332,10 @@ static void drain_commands(RtCore* c) {
             if (v) v->playing = false; } break;
         case CMD_SET_REFLECTIONS: { Voice* v = voice_for(c, cmd->handle);
             if (v) v->refl_send = cmd->u.refl.on != 0; } break;
+        case CMD_TEST_SIGNAL: {
+            uint32_t ch = cmd->u.test.channel;
+            if (ch < c->channels) { c->test_kind[ch] = cmd->u.test.kind; c->test_gain[ch] = cmd->u.test.gain; }
+        } break;
         case CMD_SET_LISTENER:
             memcpy(c->lis.p_pending, &cmd->u.lis.px, sizeof(float) * 3);
             memcpy(c->lis.q_pending, &cmd->u.lis.qx, sizeof(float) * 4);
@@ -560,6 +571,25 @@ void rt_render(RtCore* c, float* bus, uint32_t nframes, const BwTimestamp* ts) {
     if (aux)   /* reflection bed: convolve the aux send + sum onto the bus BEFORE align (so it gets trim+delay too) */
         c->bus_tap(c->bus_tap_ud, bus, nframes, c->lis.p_active, c->lis.q_active, aux);
     align_process(c->aligner, bus, nframes);   /* per-speaker gain trim + delay (output stage) */
+
+    /* debug channel test (bw_test_signal): inject a built-in signal onto a raw output channel AFTER
+     * align, so it is independent of the per-speaker trim/delay — a clean speaker-check / wiring tool. */
+    for (uint32_t ch = 0; ch < c->channels; ++ch) {
+        uint8_t k = c->test_kind[ch];
+        if (!k) continue;
+        float g = c->test_gain[ch];
+        float* out = &bus[(size_t)ch * nframes];
+        if (k == 1) {                              /* sine, ~660 Hz */
+            const float inc = 6.2831853f * 660.0f / (float)c->sample_rate;
+            float ph = c->test_phase[ch];
+            for (uint32_t i = 0; i < nframes; ++i) { out[i] += g * sinf(ph); ph += inc; if (ph > 6.2831853f) ph -= 6.2831853f; }
+            c->test_phase[ch] = ph;
+        } else {                                   /* white noise (shared LCG) */
+            uint32_t n = c->test_noise;
+            for (uint32_t i = 0; i < nframes; ++i) { n = n * 1664525u + 1013904223u; out[i] += g * ((float)(n >> 9) * (1.0f / 4194304.0f) - 1.0f); }
+            c->test_noise = n;
+        }
+    }
     pose_write(&c->readback, c->lis.p_active, c->lis.q_active);   /* publish for control-thread readback */
 }
 
@@ -628,6 +658,13 @@ void rt_source_set_gain(RtCore* c, uint32_t h, float linear) {
 void rt_source_set_reflections(RtCore* c, uint32_t h, bool on) {
     Cmd cmd = { .type = CMD_SET_REFLECTIONS, .handle = h };
     cmd.u.refl.on = on ? 1u : 0u;
+    cmd_push(&c->cmds, &cmd);
+}
+
+void rt_test_signal(RtCore* c, uint32_t channel, uint8_t kind, float gain) {
+    if (!c) return;
+    Cmd cmd = { .type = CMD_TEST_SIGNAL };
+    cmd.u.test.channel = channel; cmd.u.test.kind = kind; cmd.u.test.gain = gain;
     cmd_push(&c->cmds, &cmd);
 }
 
@@ -741,6 +778,7 @@ RtCore* rt_create(uint32_t voice_cap, uint32_t sound_cap, uint32_t sample_rate, 
     c->sound_cap   = sound_cap;
     c->channels    = channels;
     c->sample_rate = sample_rate;
+    c->test_noise  = 0x9e3779b9u;       /* non-zero LCG seed for the channel-test noise */
     c->voices    = (Voice*)    calloc(voice_cap, sizeof(Voice));
     c->occ_handle = (_Atomic uint32_t*)calloc(voice_cap, sizeof(_Atomic uint32_t));
     c->occ_val    = (_Atomic float*)   calloc(voice_cap, sizeof(_Atomic float));

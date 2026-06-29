@@ -32,7 +32,7 @@
 enum {
     CMD_SRC_CREATE = 0, CMD_SRC_DESTROY, CMD_SET_POS, CMD_SET_GAIN,
     CMD_PLAY, CMD_STOP, CMD_SET_LISTENER, CMD_COMMIT, CMD_SOUND_RETIRE,
-    CMD_SET_REFLECTIONS
+    CMD_SET_REFLECTIONS, CMD_TEST_SIGNAL
 };
 typedef struct {
     uint8_t  type;
@@ -43,6 +43,7 @@ typedef struct {
         struct { uint32_t sound; uint8_t loop, oneshot; } play;
         struct { float px, py, pz, qx, qy, qz, qw; }   lis;
         struct { uint8_t on; }                         refl;
+        struct { uint32_t channel; uint8_t kind; float gain; } test;  /* debug channel injection */
     } u;
 } Cmd;
 
@@ -70,6 +71,9 @@ void    rt_set_tracker(RtCore* c, const PoseSlot* slot);
 typedef void (*RtBusTap)(void* ud, float* bus, uint32_t n, const float* lp, const float* lq, const float* aux);
 void    rt_set_bus_tap(RtCore* c, RtBusTap tap, void* ud);
 void    rt_source_set_reflections(RtCore* c, uint32_t h, bool on);   /* gate this voice into the aux send */
+/* Debug: drive output `channel` with a built-in test signal (kind 0=off/1=sine/2=noise), injected
+ * AFTER the per-speaker align stage (raw channel). Control thread; takes effect next block. */
+void    rt_test_signal(RtCore* c, uint32_t channel, uint8_t kind, float gain);
 
 /* Publish a voice's occlusion transmittance (1 = clear .. 0 = blocked), applied to its mono signal
  * before the DBAP pan. Called from the off-thread occlusion sim (not the control thread). Stale/

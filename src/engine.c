@@ -398,6 +398,7 @@ void bw_source_play(BwEngine* e, BwSource s, BwSound snd, bool loop) {
 }
 void bw_source_stop(BwEngine* e, BwSource s)                           { if (e) rt_source_stop(e->rt, s); }
 bool bw_source_is_playing(BwEngine* e, BwSource s)                     { return e ? rt_source_is_playing(e->rt, s) : false; }
+void bw_test_signal(BwEngine* e, uint32_t channel, BwTestKind kind, float gain) { if (e) rt_test_signal(e->rt, channel, (uint8_t)kind, gain); }
 
 void bw_play_oneshot(BwEngine* e, BwSound snd, float x, float y, float z, float gain) {
     if (!e) return;

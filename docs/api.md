@@ -257,6 +257,21 @@ at a low rate and publishes a per-source scalar (+ a 3-band transmission tilt fo
 directional without being occluded). The `_get_` reads return the latest published scalar for
 HUD/diagnostics and are safe to poll. No-ops without the Steam Audio build.
 
+## Channel test / diagnostics (control thread)
+
+```c
+typedef enum { BW_TEST_OFF = 0, BW_TEST_SINE = 1, BW_TEST_NOISE = 2 } BwTestKind;
+void bw_test_signal(BwEngine* e, uint32_t channel, BwTestKind kind, float gain);
+```
+
+Drive a single **output channel** with a built-in signal (660 Hz sine or white noise), injected
+**after** the per-speaker align stage — a raw value straight on the channel. This is a **speaker-check
+/ wiring-verification / calibration** tool (walk a tone across all 26 to confirm the channel→speaker
+map, find a dead speaker, set a trim), **not** a spatial path: it bypasses the panner, so don't use
+it to "place" a sound. Per-frame-safe, takes effect next block, no `bw_commit` needed; any number of
+channels at once; `gain 0` / `BW_TEST_OFF` silences one. Works in every profile (cave/both: a raw tone
+on that DVS channel; binaural: that bus channel HRTF'd as its virtual speaker). Needs no SDK.
+
 ## Reflection bed (control thread)
 
 ```c

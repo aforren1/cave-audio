@@ -19,6 +19,7 @@ namespace CaveAudio
 {
     public enum BwProfile : int { Cave = 0, Binaural = 1, Both = 2 }
     public enum BwDirectivity : int { Omni = 0, Cardioid = 1, Figure8 = 2 }
+    public enum BwTestKind : int { Off = 0, Sine = 1, Noise = 2 }
 
     [StructLayout(LayoutKind.Sequential)]
     public struct BwConfig
@@ -100,6 +101,9 @@ namespace CaveAudio
         [DllImport(DLL, CallingConvention = CC)] public static extern void  bw_source_set_directivity(IntPtr e, uint s, float weight, float power);
         [DllImport(DLL, CallingConvention = CC)] public static extern void  bw_source_set_directivity_preset(IntPtr e, uint s, BwDirectivity pattern);
         [DllImport(DLL, CallingConvention = CC)] public static extern float bw_source_get_directivity(IntPtr e, uint s);
+
+        // ---- channel test / diagnostics (drives a raw output channel; speaker-check tool) ----
+        [DllImport(DLL, CallingConvention = CC)] public static extern void bw_test_signal(IntPtr e, uint channel, BwTestKind kind, float gain);
 
         // ---- listener + frame boundary ----
         [DllImport(DLL, CallingConvention = CC)] public static extern void bw_set_listener_pose(IntPtr e, float px, float py, float pz, float qx, float qy, float qz, float qw);

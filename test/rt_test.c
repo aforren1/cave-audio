@@ -259,8 +259,25 @@ int main(void) {
         rt_destroy(ct);
     }
 
+    /* channel test signal: drives a raw output channel (after align), only that channel */
+    {
+        RtCore* cs = rt_create(8, 4, RATE, CH);
+        CHECK(cs != NULL, "rt_create (test signal)");
+        if (cs) {
+            BwTimestamp ts = { 0, 0 };
+            rt_test_signal(cs, 5, 1, 0.5f);      /* sine on channel 5 (drained + injected in one render) */
+            rt_render(cs, bus, N, &ts);
+            double e5 = chan_energy(5);
+            CHECK(e5 > 0.1 && (total_energy() - e5) < 1e-6, "test signal drives only its channel");
+            rt_test_signal(cs, 5, 0, 0.0f);      /* off */
+            rt_render(cs, bus, N, &ts);
+            CHECK(chan_energy(5) < 1e-6, "test signal off -> channel silent");
+            rt_destroy(cs);
+        }
+    }
+
     remove(WAV);
     if (fails) { printf("rt_test: %d FAILURES\n", fails); return 1; }
-    printf("rt_test OK (DBAP, commit, gen-drop, gain, occlusion, EQ, directivity, bed, reflection-tap verified)\n");
+    printf("rt_test OK (DBAP, commit, gen-drop, gain, occlusion, EQ, directivity, bed, reflection-tap, channel-test verified)\n");
     return 0;
 }

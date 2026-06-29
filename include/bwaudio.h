@@ -176,6 +176,16 @@ BW_API void     bw_source_set_directivity_preset(BwEngine* e, BwSource s, BwDire
 /* Read the source's current directivity gain (1 = on-axis/omni .. 0 = full null) — HUD/diagnostics. */
 BW_API float    bw_source_get_directivity(BwEngine* e, BwSource s);
 
+/* ---- channel test / diagnostics (control thread; no SDK needed) ----
+ * Drive a single OUTPUT channel with a built-in test signal, injected AFTER the per-speaker align
+ * stage (a raw value straight on the channel) — a speaker-check / wiring-verification / calibration
+ * tool, NOT a spatial path (it bypasses the panner; don't use it to "place" audio). `channel` is in
+ * [0, 26). Per-frame-safe, takes effect next block, no bw_commit needed; multiple channels at once.
+ * gain 0 or BW_TEST_OFF silences a channel. Composes with the profiles: cave/both -> a raw tone on
+ * that DVS channel/speaker; binaural -> that bus channel HRTF'd as its virtual speaker. */
+typedef enum { BW_TEST_OFF = 0, BW_TEST_SINE = 1, BW_TEST_NOISE = 2 } BwTestKind;
+BW_API void     bw_test_signal(BwEngine* e, uint32_t channel, BwTestKind kind, float gain);
+
 /* ---- listener (control thread; skip if track_internal) ---- */
 /* Position in room space. Quaternion is head orientation; used by the binaural
  * monitor only — the array render ignores orientation (real speakers, real ears). */
