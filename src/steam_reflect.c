@@ -26,6 +26,8 @@
 
 #define REFL_HZ          12      /* reflection sim rate (reverb changes slowly; cheaper than occlusion) */
 #define REFL_DIFFUSE     1024    /* diffuse-reflection sample directions */
+#define REFL_TRANSITION_S 0.25f  /* hybrid transition time: IR length rendered by directional convolution
+                                  * (early reflections); the longer parametric tail is the FDN's job */
 /* HYBRID = early-reflection convolution + parametric (FDN) late tail, rendered as a full ambisonic
  * field (order `order`, (order+1)^2 channels) so the early reflections are DIRECTIONAL — they decode
  * to the 26 speakers from the directions they actually arrive. (Requires the patched phonon: Steam
@@ -99,6 +101,13 @@ static DWORD WINAPI sim_thread(LPVOID arg) {
         IPLSimulationInputs in; memset(&in, 0, sizeof in);
         in.flags = IPL_SIMULATIONFLAGS_REFLECTIONS;
         cs_at(&in.source, lp);                          /* bed source co-located with the listener */
+        /* Hybrid-reverb inputs. These are NOT optional: a zeroed reverbScale nulls the parametric
+         * tail, and a zero transition time leaves the convolution part empty — together they collapse
+         * the bed to silence/omni. reverbScale 1 = use the simulated decay; the transition time is the
+         * length of IR rendered by (directional) convolution, the rest by the parametric FDN. */
+        in.reverbScale[0] = in.reverbScale[1] = in.reverbScale[2] = 1.0f;
+        in.hybridReverbTransitionTime = (r->duration < REFL_TRANSITION_S) ? r->duration : REFL_TRANSITION_S;
+        in.hybridReverbOverlapPercent = 0.25f;
         iplSourceSetInputs(r->bed, IPL_SIMULATIONFLAGS_REFLECTIONS, &in);
 
         IPLSimulationSharedInputs sh; memset(&sh, 0, sizeof sh);

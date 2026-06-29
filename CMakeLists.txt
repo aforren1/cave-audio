@@ -119,6 +119,7 @@ endif()
 # BW_HAVE_STEAMAUDIO) supersedes the first-cut pan in binaural.c and lands with the SDK, on-SDK-verified.
 set(STEAMAUDIO_DIR "${CMAKE_SOURCE_DIR}/third_party/steamaudio" CACHE PATH "Steam Audio (phonon) SDK root")
 if(EXISTS "${STEAMAUDIO_DIR}/include/phonon.h")
+  set(BW_STEAMAUDIO_FOUND TRUE)   # consumed by the with-SDK reflection test below
   target_sources(bwaudio PRIVATE src/steam_decode.c src/steam_scene.c src/steam_reflect.c)  # HRTF decode + occlusion + reflections (with-SDK)
   if(MSVC)   # steam_reflect.c uses C11 <stdatomic.h> (the IR-publish seqlock), like rt.c
     set_source_files_properties(src/steam_reflect.c PROPERTIES COMPILE_OPTIONS /experimental:c11atomics)
@@ -193,6 +194,24 @@ if(BWAUDIO_BUILD_TESTS)
   add_executable(bw_ambi_test test/ambi_test.c)
   target_link_libraries(bw_ambi_test PRIVATE bw_core)
   add_test(NAME ambi COMMAND bw_ambi_test)
+
+  # Directional reflection-bed check (with-SDK only): compiles the steam objects in + links phonon,
+  # drives steam_reflect_tap directly, asserts the reverb is directional. Needs the alignment patch.
+  if(BW_STEAMAUDIO_FOUND)
+    add_executable(bw_reflect_test test/reflect_test.c src/steam_scene.c src/steam_reflect.c)
+    target_include_directories(bw_reflect_test PRIVATE src "${STEAMAUDIO_DIR}/include")
+    target_link_libraries(bw_reflect_test PRIVATE bw_core "${STEAMAUDIO_DIR}/lib/windows-x64/phonon.lib")
+    target_compile_definitions(bw_reflect_test PRIVATE BW_HAVE_STEAMAUDIO)
+    if(MSVC)   # steam_reflect.c's seqlock uses C11 <stdatomic.h>
+      set_source_files_properties(src/steam_reflect.c PROPERTIES COMPILE_OPTIONS /experimental:c11atomics)
+    endif()
+    if(WIN32)
+      add_custom_command(TARGET bw_reflect_test POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                "${STEAMAUDIO_DIR}/lib/windows-x64/phonon.dll" $<TARGET_FILE_DIR:bw_reflect_test>)
+    endif()
+    add_test(NAME reflect COMMAND bw_reflect_test)
+  endif()
 
   # Optional: AddressSanitizer build of the sound test (M3 unload-safety / UAF check).
   option(BWAUDIO_ASAN "Build bw_sound_test with AddressSanitizer" OFF)
