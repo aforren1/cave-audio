@@ -186,6 +186,12 @@ BW_API float    bw_source_get_directivity(BwEngine* e, BwSource s);
 typedef enum { BW_TEST_OFF = 0, BW_TEST_SINE = 1, BW_TEST_NOISE = 2 } BwTestKind;
 BW_API void     bw_test_signal(BwEngine* e, uint32_t channel, BwTestKind kind, float gain);
 
+/* Read back the effective speaker layout (the default grid, or the file from BwConfig.layout_path):
+ * fills `xyz` with up to `cap` speakers' positions (3 floats each: x,y,z room space, in channel/index
+ * order) and returns the total count (26). Pass xyz=NULL to just query the count. For visualizing or
+ * auditioning the geometry the engine is actually panning with. Control thread; safe any time. */
+BW_API uint32_t bw_get_speakers(BwEngine* e, float* xyz, uint32_t cap);
+
 /* ---- listener (control thread; skip if track_internal) ---- */
 /* Position in room space. Quaternion is head orientation; used by the binaural
  * monitor only — the array render ignores orientation (real speakers, real ears). */

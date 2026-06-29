@@ -27,6 +27,8 @@
  *
  * Global keys: WASD/RF move source, Q/E turn head, 1-4 signal, TAB scene, right-drag/wheel camera, ESC.
  * Needs the Steam Audio build for occlusion/materials/directivity/reverb; without it those are no-ops.
+ * Usage: bw_playground [cave_layout.json] — audition with your surveyed layout (renders + pans with the
+ *        engine's actual speaker positions); with no arg it auto-loads ./cave_layout.json or the default grid.
  * Build: cmake -S . -B build -DBWAUDIO_BUILD_PLAYGROUND=ON && cmake --build build
  */
 #include "bwaudio.h"
@@ -48,17 +50,6 @@
 #define SRC_GAIN  0.8f
 #define REFL_GAIN 0.5f    /* base image-source level (scaled further by the wall material reflectivity) */
 #define TEST_GAIN 0.3f    /* channel-walk test signal level */
-
-/* the engine's default speaker grid (3x3x3 minus centre) — must match layout_default() */
-static int default_speakers(Vector3* out) {
-    const float ax[3] = { -1.5f, 0.f, 1.5f };
-    int k = 0;
-    for (int yi = 0; yi < 3; ++yi) for (int xi = 0; xi < 3; ++xi) for (int zi = 0; zi < 3; ++zi) {
-        if (ax[xi] == 0 && ax[yi] == 0 && ax[zi] == 0) continue;
-        out[k++] = (Vector3){ ax[xi], ax[yi], ax[zi] };
-    }
-    return k;
-}
 
 /* ---- localization test signals (synthesised at startup) ----
  * Choice of signal matters: broadband + sharp onsets localise best, and HF content is what lets you
@@ -154,6 +145,7 @@ static BwSource    src, refl;
 static BwSound     sounds[NSIG];
 static const char* backend_name;
 static int         backend_silent;
+static const char* g_layout_path;          /* optional cave_layout.json; NULL = engine default grid */
 
 static Vector3 speakers[NSPK];
 static Vector3 source_pos = { 1.5f, 0.0f, 0.0f };
@@ -454,7 +446,7 @@ static int engine_has_reverb;       /* which config the live engine was built in
  * config, reloading assets + recreating sources. Used at startup and on each reverb-boundary switch. */
 static void build_engine(int with_reverb) {
     BwConfig cfg = {
-        .profile = BW_PROFILE_BINAURAL, .layout_path = NULL, .hrtf_path = NULL,
+        .profile = BW_PROFILE_BINAURAL, .layout_path = g_layout_path, .hrtf_path = NULL,
         .sample_rate = SR, .block_size = 256, .track_internal = false,
     };
     e = bw_create(&cfg);
@@ -474,6 +466,7 @@ static void build_engine(int with_reverb) {
     }
     backend_name   = bw_audio_backend(e);
     backend_silent = (strncmp(backend_name, "asio", 4) != 0);
+    bw_get_speakers(e, (float*)speakers, NSPK);            /* render the geometry the engine pans with */
     for (int i = 0; i < NSIG; ++i) sounds[i] = bw_load_sound(e, sig_files[i]);
     for (int i = 0; i < NMAT; ++i) mats[i] = bw_material_preset(e, mat_names[i]);
     src  = bw_source_create(e);  bw_source_play(e, src,  sounds[cur_sig], true);
@@ -503,8 +496,12 @@ static void switch_scene(int idx) {
     scenes[idx].enter();
 }
 
-int main(void) {
+int main(int argc, char** argv) {
     _putenv("BWAUDIO_SINK=asio");                             /* headphone output via a 2-ch ASIO driver */
+
+    /* optional surveyed layout: argv[1], else ./cave_layout.json if present, else the default grid */
+    g_layout_path = (argc > 1) ? argv[1] : NULL;
+    if (!g_layout_path) { FILE* lf = fopen("cave_layout.json", "rb"); if (lf) { fclose(lf); g_layout_path = "cave_layout.json"; } }
 
     /* synthesise the localization test signals to wav (the engine loads sounds from file) */
     float* sigbuf = (float*)malloc((size_t)SIGLEN * sizeof(float));
@@ -512,10 +509,9 @@ int main(void) {
     for (int i = 0; i < NSIG; ++i) { gen_signal(i, sigbuf, SIGLEN); write_wav(sig_files[i], sigbuf, SIGLEN); }
     free(sigbuf);
 
-    default_speakers(speakers);
     wall_basis(wall_n, &wall_u, &wall_v);
-    build_engine(0);                                          /* start in the interactive config */
-    printf("audio backend: %s%s\n", backend_name,
+    build_engine(0);                                          /* start in the interactive config (fills speakers[]) */
+    printf("layout: %s    audio backend: %s%s\n", g_layout_path ? g_layout_path : "default grid", backend_name,
            backend_silent ? "   (SILENT — set BWAUDIO_ASIO_DRIVER to your headphone driver)" : "");
 
     InitWindow(1000, 700, "bwaudio - binaural playground");

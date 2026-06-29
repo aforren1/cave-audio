@@ -400,6 +400,20 @@ void bw_source_stop(BwEngine* e, BwSource s)                           { if (e) 
 bool bw_source_is_playing(BwEngine* e, BwSource s)                     { return e ? rt_source_is_playing(e->rt, s) : false; }
 void bw_test_signal(BwEngine* e, uint32_t channel, BwTestKind kind, float gain) { if (e) rt_test_signal(e->rt, channel, (uint8_t)kind, gain); }
 
+uint32_t bw_get_speakers(BwEngine* e, float* xyz, uint32_t cap) {
+    if (!e) return 0;
+    uint32_t n = e->layout.count;
+    if (xyz) {
+        uint32_t m = (n < cap) ? n : cap;
+        for (uint32_t i = 0; i < m; ++i) {
+            xyz[i * 3 + 0] = e->layout.speakers[i].pos[0];
+            xyz[i * 3 + 1] = e->layout.speakers[i].pos[1];
+            xyz[i * 3 + 2] = e->layout.speakers[i].pos[2];
+        }
+    }
+    return n;
+}
+
 void bw_play_oneshot(BwEngine* e, BwSound snd, float x, float y, float z, float gain) {
     if (!e) return;
     if (rt_sound_channels(e->rt, snd) > 1) {

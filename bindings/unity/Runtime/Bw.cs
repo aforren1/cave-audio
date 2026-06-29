@@ -104,6 +104,8 @@ namespace CaveAudio
 
         // ---- channel test / diagnostics (drives a raw output channel; speaker-check tool) ----
         [DllImport(DLL, CallingConvention = CC)] public static extern void bw_test_signal(IntPtr e, uint channel, BwTestKind kind, float gain);
+        // Read back the effective speaker layout (xyz = cap*3 floats, x,y,z per speaker); returns the count (26).
+        [DllImport(DLL, CallingConvention = CC)] public static extern uint bw_get_speakers(IntPtr e, [Out] float[] xyz, uint cap);
 
         // ---- listener + frame boundary ----
         [DllImport(DLL, CallingConvention = CC)] public static extern void bw_set_listener_pose(IntPtr e, float px, float py, float pz, float qx, float qy, float qz, float qw);
