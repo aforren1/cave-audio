@@ -21,7 +21,8 @@
  *                         channels with LEFT/RIGHT (SPACE auto-walks); in binaural each channel is
  *                         HRTF'd as its virtual speaker, so the tone circles your head as you walk.
  *   5 Reverb bed        — a static shoebox room + the Steam Audio hybrid reverb bed. Move the source
- *                         and the room reverb follows; G dry/wet A-B, [ ] wet level, B A/Bs the bed
+ *                         and the room reverb follows; G dry/wet A-B, [ ] wet level, V distance->wet
+ *                         (near dry / far wet), B A/Bs the bed
  *                         DECODER (sampling vs AllRAD — load-time, so it rebuilds the engine; differs
  *                         most on an irregular layout). The bed + room geometry are LOAD-time (the room
  *                         locks once the bed runs), so entering/leaving this scene REBUILDS the engine
@@ -421,10 +422,12 @@ static void chan_hud(int y) {
 static int   rev_on  = 1;
 static float rev_wet = 1.0f;
 static int   rev_decoder;                          /* bed decoder: 0 = sampling (SAD), 1 = AllRAD (B to A/B) */
+static int   rev_dist;                             /* distance->wet send (V): near = drier, far = wetter */
 
 static void rev_enter(void) {
     bw_source_set_gain(e, src, SRC_GAIN);
     bw_source_set_reflections(e, src, rev_on);    /* feed the source into the shared reverb bed */
+    bw_source_set_reflection_distance(e, src, rev_dist);
     bw_reflections_set_gain(e, rev_wet);
 }
 static void rev_update(float dt) {
@@ -435,6 +438,7 @@ static void rev_update(float dt) {
         rev_enter();                               /* re-apply source gain + reflections + wet on the new engine */
     }
     if (IsKeyPressed(KEY_G)) { rev_on = !rev_on; bw_source_set_reflections(e, src, rev_on); }
+    if (IsKeyPressed(KEY_V)) { rev_dist = !rev_dist; bw_source_set_reflection_distance(e, src, rev_dist); }
     if (IsKeyDown(KEY_LEFT_BRACKET))  rev_wet = fmaxf(0.0f, rev_wet - 0.7f * dt);
     if (IsKeyDown(KEY_RIGHT_BRACKET)) rev_wet = fminf(2.0f, rev_wet + 0.7f * dt);
     bw_reflections_set_gain(e, rev_wet);
@@ -450,8 +454,9 @@ static void rev_draw3d(void) {
     DrawSphere(source_pos, 0.18f, RED);
 }
 static void rev_hud(int y) {
-    DrawText(TextFormat("[G] reverb %s   [ ] wet %.2f   [B] bed decoder: %s   move the source - reverb follows",
-                        rev_on ? "ON (wet)" : "off (dry)", rev_wet, rev_decoder ? "AllRAD" : "sampling"),
+    DrawText(TextFormat("[G] reverb %s   [ ] wet %.2f   [B] bed decoder: %s   [V] distance->wet %s   move the source",
+                        rev_on ? "ON (wet)" : "off (dry)", rev_wet, rev_decoder ? "AllRAD" : "sampling",
+                        rev_dist ? "ON (near dry / far wet)" : "off"),
              12, y, 15, (Color){ 110, 200, 255, 255 });
     DrawText("8x4x8 m plaster room (Steam Audio bed); clicks [3]/bursts [2] show the tail. SAD vs AllRAD differ most on an IRREGULAR layout",
              12, y + 22, 15, (Color){ 200, 200, 210, 255 });
