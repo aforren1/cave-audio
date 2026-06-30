@@ -10,6 +10,10 @@
 #include "measure.h"
 #include <stddef.h>
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 /* Solve per-speaker trims from the measurements + geometry:
  *   delay_ms[i] aligns every speaker's arrival to the FARTHEST (the latest measured delay -> 0 trim,
  *               nearer speakers delayed to match). The common system latency cancels in the difference.
@@ -26,5 +30,9 @@ void calib_solve(const MeasureResult* m, const float (*pos)[3], const float mic[
  * speaker count must equal `n`. Returns 1 on success, 0 with a message in `err`. */
 int calib_write_layout(const char* in_path, const char* out_path,
                        const float* gain_db, const float* delay_ms, int n, char* err, size_t errcap);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif /* BW_CALIB_H */

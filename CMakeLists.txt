@@ -320,3 +320,26 @@ if(BWAUDIO_BUILD_PLAYGROUND)
               $<TARGET_FILE:bwaudio> $<TARGET_FILE_DIR:bw_layout_tool>)
   endif()
 endif()
+
+# ---- Optional: speaker calibration tool (full-duplex ASIO sweep -> per-speaker delay/gain trims) ----
+# cmake -S . -B build -DBWAUDIO_BUILD_CALIBRATE=ON ; run with --simulate (no hardware) or on the rig.
+option(BWAUDIO_BUILD_CALIBRATE "Build the speaker calibration tool" OFF)
+if(BWAUDIO_BUILD_CALIBRATE)
+  enable_language(CXX)
+  add_executable(bw_calibrate examples/calibrate.cpp)
+  target_link_libraries(bw_calibrate PRIVATE bw_core)
+  if(BWAUDIO_WITH_ASIO)
+    # the tool runs its own full-duplex ASIO host, so it compiles the SDK host sources itself (the
+    # bwaudio DLL keeps them internal) — independent of the engine's output-only asio_sink.
+    target_sources(bw_calibrate PRIVATE
+      ${ASIO_SDK_DIR}/common/asio.cpp
+      ${ASIO_SDK_DIR}/host/asiodrivers.cpp
+      ${ASIO_SDK_DIR}/host/pc/asiolist.cpp)
+    target_include_directories(bw_calibrate PRIVATE ${ASIO_SDK_DIR}/common ${ASIO_SDK_DIR}/host ${ASIO_SDK_DIR}/host/pc)
+    target_compile_definitions(bw_calibrate PRIVATE BW_HAVE_ASIO _CRT_SECURE_NO_WARNINGS)
+    target_link_libraries(bw_calibrate PRIVATE ole32 user32 advapi32)
+    message(STATUS "bwaudio: calibration tool with ASIO capture")
+  else()
+    message(STATUS "bwaudio: calibration tool (simulate only; no ASIO SDK)")
+  endif()
+endif()

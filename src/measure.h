@@ -21,6 +21,10 @@
 
 #include <stdint.h>
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 typedef struct {
     int   delay_samples;   /* IR peak position (system latency + speaker->mic time of flight) */
     float level;           /* in-band mean |H(f)| — broadband sensitivity (linear, ref-normalized) */
@@ -39,5 +43,9 @@ void measure_sweep(float* out, int n, double f1, double f2, double fs);
  * (control thread / offline only) — never call on the audio thread. */
 int measure_response(const float* capture, int ncap, const float* ref, int nref,
                      double f1, double f2, double fs, const double band_hz[2], MeasureResult* out);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif /* BW_MEASURE_H */
