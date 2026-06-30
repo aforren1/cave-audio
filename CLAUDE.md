@@ -143,7 +143,12 @@ Dual-Band", for sharper LF localisation near the sweet spot; `compute_gains` der
 solve so it A/Bs live, and the mixer reads it only when on. An **ambisonic bed** is implemented too (`bw_load_ambix` + `bw_bed_*`):
 a file-fed AmbiX soundfield decoded world-locked to the 26-ch bus (`rt.c` `build_bed_decode`/`mix_bed`,
 phonon-free), reusing the SH→26 decode the reflection bed will need. `sound.c` now decodes **WAV/FLAC/MP3**
-(dr_libs, one pinned repo fetch) and **resamples to the engine rate at load** (windowed-sinc).
+(dr_libs, one pinned repo fetch) and **resamples to the engine rate at load** (windowed-sinc). **Streaming**
+(`bw_load_sound_streaming`, `stream.c`) plays long files without decoding them into RAM: a background
+thread decodes chunks (WAV/FLAC/MP3, downmixed to mono, engine rate required) into a per-stream **SPSC ring**;
+the audio thread `stream_pull`s from the ring in `mix_voice` (no I/O/alloc/locks), distinguishing a true EOF
+from a transient underrun. One voice per stream; the retire handshake detaches voices before the control
+thread closes the stream.
 **Voice management + scheduling**: sources carry a control-side steal **priority** (`bw_source_set_priority`,
 255 = protected) — a full pool steals the lowest-priority voice instead of failing the create; and
 **`bw_source_play_at(start_sample)`** fires a voice sample-accurately off a published dsp clock

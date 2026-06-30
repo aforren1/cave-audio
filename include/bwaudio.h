@@ -75,6 +75,11 @@ BW_API const char* bw_audio_backend(BwEngine* e);
 
 /* ---- assets (control thread; file I/O; do at load time) ---- */
 BW_API BwSound bw_load_sound(BwEngine* e, const char* path); /* mono point-source asset; 0 = failure */
+/* Like bw_load_sound but STREAMED from disk for long files (music/ambience) — the file is not decoded
+ * into RAM; a background thread feeds the voice as it plays. Mono (downmixed) at the engine sample rate
+ * (a rate mismatch fails — pre-convert, or use bw_load_sound which resamples). Plays on one voice at a
+ * time. 0 = failure. WAV/FLAC/MP3. */
+BW_API BwSound bw_load_sound_streaming(BwEngine* e, const char* path);
 BW_API void    bw_unload_sound(BwEngine* e, BwSound snd);    /* safe: retire-acked internally */
 /* Load a pre-encoded AmbiX (ACN/SN3D) soundfield, KEEPING its channels (4/9/16 -> order 1/2/3). Plays
  * via bw_bed_* as a world-locked diffuse bed decoded to the 26 speakers; resampled to the engine rate

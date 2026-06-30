@@ -13,6 +13,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>          /* Sleep, for the streaming-fill wait */
 
 #define N    256
 #define CH   BW_CHANNELS
@@ -590,8 +592,30 @@ int main(void) {
         }
     }
 
+    /* streaming: a streamed sound feeds the mixer through the background ring (the standalone ring
+     * mechanics are covered by stream_test; here we verify the rt integration produces audio). */
+    {
+        RtCore* cst = rt_create(4, 4, RATE, CH);
+        CHECK(cst != NULL, "rt_create (stream)");
+        if (cst) {
+            uint32_t ss = rt_load_sound_streaming(cst, WAV, err, sizeof err);
+            CHECK(ss != 0, err[0] ? err : "rt_load_sound_streaming");
+            if (ss) {
+                uint32_t h = rt_source_create(cst);
+                rt_source_set_pos(cst, h, 1.f, 0.f, 1.f);
+                rt_source_play(cst, h, ss, true);   /* loop a short file */
+                rt_commit(cst);
+                Sleep(60);                          /* let the streaming thread fill the ring */
+                double e = 0;
+                for (int blk = 0; blk < 30; ++blk) { render2(cst); e += total_l2(); }
+                CHECK(e > 1e-3, "streamed voice produces audio through the mixer");
+            }
+            rt_destroy(cst);
+        }
+    }
+
     remove(WAV);
     if (fails) { printf("rt_test: %d FAILURES\n", fails); return 1; }
-    printf("rt_test OK (DBAP, commit, gen-drop, gain, occlusion, EQ, directivity, bed, reflection-tap, channel-test, air+Doppler, spread, reverb-send, dual-band, voice-steal, scheduled-play verified)\n");
+    printf("rt_test OK (DBAP, commit, gen-drop, gain, occlusion, EQ, directivity, bed, reflection-tap, channel-test, air+Doppler, spread, reverb-send, dual-band, voice-steal, scheduled-play, streaming verified)\n");
     return 0;
 }

@@ -101,6 +101,7 @@ float   rt_get_directivity(RtCore* c, uint32_t handle); /* control thread: publi
 
 /* ---- assets (control thread; file I/O + alloc) ---- */
 uint32_t rt_load_sound  (RtCore* c, const char* path, char* err, size_t errcap); /* 0 on failure */
+uint32_t rt_load_sound_streaming(RtCore* c, const char* path, char* err, size_t errcap); /* mono, engine rate, streamed */
 uint32_t rt_load_ambix  (RtCore* c, const char* path, char* err, size_t errcap); /* multichannel bed asset */
 uint16_t rt_sound_channels(RtCore* c, uint32_t sound);   /* 1 = mono, 4/9/16 = bed, 0 = invalid */
 void     rt_unload_sound(RtCore* c, uint32_t sound);  /* safe any time; retire-acked internally */

@@ -345,6 +345,13 @@ BwSound bw_load_sound(BwEngine* e, const char* path) {
     if (snd == 0) set_error(e, e->errbuf[0] ? e->errbuf : "bw_load_sound: failed");
     return snd;
 }
+BwSound bw_load_sound_streaming(BwEngine* e, const char* path) {
+    if (!e) return 0;
+    e->errbuf[0] = 0;
+    BwSound snd = rt_load_sound_streaming(e->rt, path, e->errbuf, sizeof e->errbuf);
+    if (snd == 0) set_error(e, e->errbuf[0] ? e->errbuf : "bw_load_sound_streaming: failed");
+    return snd;
+}
 
 void bw_unload_sound(BwEngine* e, BwSound snd) {
     if (e) rt_unload_sound(e->rt, snd);   /* safe any time; retire-acked internally */

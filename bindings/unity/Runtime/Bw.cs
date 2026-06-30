@@ -62,6 +62,7 @@ namespace CaveAudio
 
         // ---- assets (load time; file I/O) ----
         [DllImport(DLL, CallingConvention = CC)] public static extern uint bw_load_sound(IntPtr e, [MarshalAs(UnmanagedType.LPUTF8Str)] string path);
+        [DllImport(DLL, CallingConvention = CC)] public static extern uint bw_load_sound_streaming(IntPtr e, [MarshalAs(UnmanagedType.LPUTF8Str)] string path);
         [DllImport(DLL, CallingConvention = CC)] public static extern void bw_unload_sound(IntPtr e, uint snd);
         [DllImport(DLL, CallingConvention = CC)] public static extern uint bw_load_ambix(IntPtr e, [MarshalAs(UnmanagedType.LPUTF8Str)] string path);
 

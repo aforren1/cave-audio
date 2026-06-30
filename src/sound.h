@@ -13,12 +13,15 @@
 /* Decoded sound: interleaved float PCM. A point source is mono (channels == 1, downmixed at load);
  * an ambisonic BED keeps its AmbiX channels (channels == 4/9/16, order 1/2/3). Owned by the control
  * thread; the audio thread reads pcm only via a voice binding and only until the retire-ack frees it. */
+struct Stream;   /* forward decl (stream.h); set for a streamed sound, owned by rt.c's StreamSet */
+
 typedef struct {
-    float*   pcm;            /* `frames` * `channels` interleaved samples; NULL when empty */
+    float*   pcm;            /* `frames` * `channels` interleaved samples; NULL when empty or streaming */
     uint32_t frames;
     uint32_t sample_rate;
     uint16_t channels;       /* 1 = mono point source; 4/9/16 = ambisonic bed */
     uint16_t order;          /* ambisonic order (0 for mono; 1/2/3 for a bed) */
+    struct Stream* stream;   /* non-NULL = streamed from disk (mono); the audio thread reads its ring */
 } SoundData;
 
 /* Decode wav/flac/mp3 to MONO float (downmixing multi-channel), resampling to want_rate if the file

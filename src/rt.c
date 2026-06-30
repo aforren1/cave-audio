@@ -7,6 +7,7 @@
  */
 #include "rt.h"
 #include "sound.h"
+#include "stream.h"
 #include "layout.h"
 #include "dbap.h"
 #include "spcap.h"
@@ -50,7 +51,8 @@ typedef struct {
     uint16_t gen;
     bool     active, playing, loop, dirty, oneshot;
     const SoundData* sound;                 /* bound sound (NULL when idle); audio reads pcm */
-    uint32_t cursor;                        /* sample cursor into sound->pcm */
+    uint32_t cursor;                        /* sample cursor into sound->pcm (in-memory sounds) */
+    uint64_t stream_pos;                    /* absolute sample position into a streamed sound's ring */
     uint64_t start_sample;                  /* dsp-sample to begin output (0 = immediate); for scheduled play */
     float    pos_pending[3], pos_active[3];
     float    gain_user;
@@ -167,6 +169,8 @@ struct RtCore {
     RtBusTap bus_tap;
     void*    bus_tap_ud;
     float*   aux;                /* BW_RT_MAX_BLOCK mono samples; the per-block aux send scratch */
+    StreamSet* streams;          /* background file-streaming thread + ring pool (control thread owns lifecycle) */
+    float*   stream_scratch;     /* BW_RT_MAX_BLOCK mono samples; a streaming voice's block, pulled before the mix */
 
     /* per-voice Doppler delay rings: voice_cap contiguous power-of-two rings of dop_ringlen floats each
      * (slice idx = dop_ring + idx*dop_ringlen), sized to BW_DOPPLER_MAX_DIST at the engine rate.
@@ -261,9 +265,13 @@ static void drain_events(RtCore* c) {                          /* control thread
         const Evt* ev = &r->slots[rd & (EVT_CAP - 1)];
         switch (ev->type) {
         case EVT_VOICE_ENDED:    recycle_handle(c, BW_H_IDX(ev->handle)); break;
-        case EVT_SOUND_RETIRED: {        /* audio dropped all refs: free pcm + recycle the slot */
+        case EVT_SOUND_RETIRED: {        /* audio dropped all refs: free pcm / close the stream + recycle the slot */
             SoundSlot* s = sound_slot_ctrl(c, ev->handle);
-            if (s) { sound_unload(&s->data); srecycle_sound(c, BW_H_IDX(ev->handle)); }
+            if (s) {
+                if (s->data.stream) { stream_close(c->streams, s->data.stream); s->data.stream = NULL; }
+                sound_unload(&s->data);
+                srecycle_sound(c, BW_H_IDX(ev->handle));
+            }
         } break;
         }
     }
@@ -383,7 +391,7 @@ static void drain_commands(RtCore* c) {
             if (v) { v->gain_user = cmd->u.gain.g; v->dirty = true; } } break;
         case CMD_PLAY: { Voice* v = voice_for(c, cmd->handle);
             const SoundData* s = sound_for(c, cmd->u.play.sound);
-            if (v && s) { v->sound = s; v->cursor = 0; v->loop = cmd->u.play.loop != 0;
+            if (v && s) { v->sound = s; v->cursor = 0; v->stream_pos = 0; v->loop = cmd->u.play.loop != 0;
                           v->oneshot = cmd->u.play.oneshot != 0; v->playing = true; v->dirty = true;
                           v->start_sample = cmd->u.play.start;  /* 0 = now; else hold output until this dsp-sample */
                           v->refl_g_cur = 0.f;                  /* fresh start: ramp the wet send up from 0, no stale burst */
@@ -633,15 +641,25 @@ static void mix_voice(RtCore* c, Voice* v, uint16_t idx, float* bus, uint32_t n,
         dring = c->dop_ring + (size_t)idx * c->dop_ringlen; dmask = c->dop_ringlen - 1;
     }
 
+    /* streaming sounds: pull this block's mono samples from the background ring (no I/O on the audio
+     * thread). want covers [start, n); a short pull (underrun or EOF) leaves the tail silent. */
+    const int streaming = (snd->stream != NULL);
+    uint32_t strm_got = 0;
+    if (streaming) {
+        uint32_t want = (start < n) ? (n - start) : 0;
+        strm_got = stream_pull(snd->stream, v->stream_pos, c->stream_scratch + start, want);
+        for (uint32_t i = start + strm_got; i < n; ++i) c->stream_scratch[i] = 0.f;
+    }
+
     uint32_t cur = v->cursor;
     bool ended = false;
     for (uint32_t i = 0; i < n; ++i) {
         if (i < start) continue;               /* scheduled start: this voice stays silent (and frozen) until the in-block offset */
-        if (cur >= snd->frames) {
+        if (!streaming && cur >= snd->frames) {
             if (v->loop) cur = 0;
             else         ended = true;
         }
-        float s = ended ? 0.f : snd->pcm[cur];
+        float s = streaming ? c->stream_scratch[i] : (ended ? 0.f : snd->pcm[cur]);
         if (v->eq_engaged) {                                    /* 3 biquads (DF-I), coeffs interpolated per sample */
             for (int b = 0; b < 3; ++b) {
                 float* co = v->eq_co[b];
@@ -666,7 +684,7 @@ static void mix_voice(RtCore* c, Voice* v, uint16_t idx, float* bus, uint32_t n,
             v->dop_dtgt  += (dop_ds      - v->dop_dtgt)  * dop_k;   /* 2-pole, per sample: smooth the target ... */
             v->dop_delay += (v->dop_dtgt - v->dop_delay) * dop_k;   /* ... then the read delay -> continuous rate */
         }
-        if (!ended) ++cur;
+        if (!streaming && !ended) ++cur;
         v->occ_cur += occ_step;
         v->dir_cur += dir_step;
         if (dual) {
@@ -684,6 +702,10 @@ static void mix_voice(RtCore* c, Voice* v, uint16_t idx, float* bus, uint32_t n,
         }
     }
     v->cursor = cur;
+    if (streaming) {                                            /* advance the stream position; end at a true EOF (not underrun) */
+        v->stream_pos += strm_got;
+        if (stream_ended(snd->stream, v->stream_pos)) ended = true;
+    }
     v->occ_cur = occ_tgt;                                        /* land exactly (same local) */
     v->dir_cur = dir_tgt;
     if (v->air_on) v->air_a_cur = air_a_tgt;                     /* land the ramped propagation params */
@@ -976,6 +998,9 @@ void rt_source_play_at(RtCore* c, uint32_t h, uint32_t sound, bool loop, uint64_
     SoundSlot* s = sound_slot_ctrl(c, sound);
     if (!s || s->retiring) return;          /* invalid or being unloaded: drop the play so the
                                              * audio thread can never bind a retiring sound */
+    /* streamed sound: kick the background decode (re-seek + fill) now, off the audio thread. The
+     * voice reads its ring from sample 0; the first blocks may be silent until the ring fills (~ms). */
+    if (s->data.stream) stream_start(s->data.stream, loop ? 1 : 0);
     Cmd cmd = { .type = CMD_PLAY, .handle = h };
     cmd.u.play.sound = sound; cmd.u.play.loop = loop ? 1u : 0u; cmd.u.play.oneshot = 0u;
     cmd.u.play.start = start_sample;
@@ -1012,6 +1037,24 @@ uint32_t rt_load_sound(RtCore* c, const char* path, char* err, size_t errcap) {
         return 0;
     }
     c->sounds[BW_H_IDX(h)].data = d;     /* published to the audio thread when a CMD_PLAY references it */
+    return h;
+}
+
+/* Load a sound for STREAMING (mono point source, engine rate): the file is not decoded into RAM —
+ * a background thread feeds its ring as the voice plays (rt_source_play). 0 + err on failure. */
+uint32_t rt_load_sound_streaming(RtCore* c, const char* path, char* err, size_t errcap) {
+    if (!c) return 0;
+    Stream* st = stream_open(c->streams, path, err, errcap);
+    if (!st) return 0;
+    uint32_t h = salloc_sound(c);
+    if (!h) {
+        stream_close(c->streams, st);
+        if (err && errcap) { strncpy(err, "stream: sound table full", errcap - 1); err[errcap - 1] = 0; }
+        return 0;
+    }
+    SoundData d; memset(&d, 0, sizeof d);
+    d.stream = st; d.channels = 1; d.sample_rate = c->sample_rate;   /* pcm NULL, frames 0: the stream tracks EOF */
+    c->sounds[BW_H_IDX(h)].data = d;
     return h;
 }
 
@@ -1092,6 +1135,8 @@ RtCore* rt_create(uint32_t voice_cap, uint32_t sound_cap, uint32_t sample_rate, 
     c->occ_dir    = (_Atomic float*)   calloc(voice_cap, sizeof(_Atomic float));
     c->play_pub   = (_Atomic uint32_t*)calloc(voice_cap, sizeof(_Atomic uint32_t));
     c->aux        = (float*)   calloc(BW_RT_MAX_BLOCK, sizeof(float));   /* reflection aux-send scratch */
+    c->stream_scratch = (float*)calloc(BW_RT_MAX_BLOCK, sizeof(float));  /* per-block streaming pull scratch */
+    c->streams    = stream_set_create(sample_rate);                     /* background file streaming */
     c->gen       = (uint16_t*) calloc(voice_cap, sizeof(uint16_t));
     c->inuse     = (uint8_t*)  calloc(voice_cap, sizeof(uint8_t));
     c->priority  = (uint8_t*)  calloc(voice_cap, sizeof(uint8_t));
@@ -1105,6 +1150,7 @@ RtCore* rt_create(uint32_t voice_cap, uint32_t sound_cap, uint32_t sample_rate, 
         c->dop_ring = (float*)calloc((size_t)voice_cap * rl, sizeof(float));
     }
     if (!c->voices || !c->occ_handle || !c->occ_val || !c->occ_eq || !c->occ_dir || !c->play_pub || !c->aux ||
+        !c->stream_scratch || !c->streams ||
         !c->gen || !c->inuse || !c->priority || !c->freelist || !c->sounds || !c->sfreelist || !c->dop_ring) {
         rt_destroy(c); return NULL;
     }
@@ -1252,6 +1298,8 @@ void rt_destroy(RtCore* c) {
     free(c->inuse);
     free(c->gen);
     free(c->dop_ring);
+    stream_set_destroy(c->streams);     /* stops the streaming thread, releases every open stream + ring */
+    free(c->stream_scratch);
     free(c->aux);
     free((void*)c->occ_dir);            /* cast drops the _Atomic qualifier for free() */
     free((void*)c->play_pub);
