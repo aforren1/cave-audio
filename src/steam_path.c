@@ -29,6 +29,9 @@ struct SteamPath {
     RtCore*      rt;
     IPLSimulator sim;            /* OWNED: pathing-only simulator */
     IPLProbeBatch probes;        /* OWNED: probes carrying the baked visibility graph */
+    IPLAmbisonicsDecodeEffect dec;  /* OWNED: ambisonic path field -> 26 speakers (custom layout, panning) */
+    IPLVector3   spk[BW_CHANNELS];
+    float*       out26;          /* BW_CHANNELS * n decode scratch */
     uint32_t     order, ambi_ch, n, sample_rate;
 
     CRITICAL_SECTION lock;
@@ -129,12 +132,56 @@ void steam_path_set_source(SteamPath* sp, uint32_t handle, const float pos[3], i
     LeaveCriticalSection(&sp->lock);
 }
 
+void steam_path_set_pos(SteamPath* sp, uint32_t handle, float x, float y, float z) {
+    if (!sp) return;
+    EnterCriticalSection(&sp->lock);
+    int slot = find_slot(sp, handle);                  /* update only; enabling is steam_path_set_source's job */
+    if (slot >= 0) { sp->srcs[slot].pos[0]=x; sp->srcs[slot].pos[1]=y; sp->srcs[slot].pos[2]=z; }
+    LeaveCriticalSection(&sp->lock);
+}
+
 int steam_path_debug_run_get(SteamPath* sp, const float listener[3], uint32_t handle, float eq[3], float* sh) {
     if (!sp) return 0;
     int slot = find_slot(sp, handle);
     if (slot < 0) return 0;
     return run_get(sp, listener, slot, eq, sh);
 }
+
+/* AUDIO thread (rt path tap): decode the summed indirect ambisonic field to the 26 speakers + sum. */
+void steam_path_tap(void* ud, float* bus, uint32_t n, const float* lp, const float* lq, const float* ambi, uint32_t ambi_ch) {
+    SteamPath* sp = (SteamPath*)ud; (void)lp; (void)lq;
+    if (n != sp->n) return;
+    if (ambi_ch > sp->ambi_ch) ambi_ch = sp->ambi_ch;
+    float* ambP[BW_AMBI_CH]; for (uint32_t k=0;k<ambi_ch;++k) ambP[k] = (float*)(ambi + (size_t)k * n);
+    IPLAudioBuffer ab = { (IPLint32)ambi_ch, (IPLint32)n, ambP };
+    float* outP[BW_CHANNELS]; for (uint32_t s=0;s<BW_CHANNELS;++s) outP[s] = sp->out26 + (size_t)s * n;
+    IPLAudioBuffer o26 = { (IPLint32)BW_CHANNELS, (IPLint32)n, outP };
+    IPLAmbisonicsDecodeEffectParams dp; memset(&dp,0,sizeof dp);
+    dp.order = (IPLint32)sp->order; dp.hrtf = NULL; dp.binaural = IPL_FALSE;
+    cs_at(&dp.orientation, (float[3]){0,0,0});
+    iplAmbisonicsDecodeEffectApply(sp->dec, &dp, &ab, &o26);
+    for (uint32_t s=0;s<BW_CHANNELS;++s) for (uint32_t i=0;i<n;++i) bus[(size_t)s*n+i] += sp->out26[(size_t)s*n+i];
+}
+
+static DWORD WINAPI sim_thread(LPVOID arg) {
+    SteamPath* sp = (SteamPath*)arg;
+    BW_THREAD_NAME("bw-sim (pathing)");
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);   /* never preempt the audio callback */
+    float eq[3], sh[BW_AMBI_CH];
+    while (!sp->stop) {
+        float lp[3], lq[4]; rt_read_pose(sp->rt, lp, lq); (void)lq;
+        EnterCriticalSection(&sp->lock); int n = sp->nsrc; LeaveCriticalSection(&sp->lock);
+        for (int i = 0; i < n; ++i) {
+            if (!sp->srcs[i].on) { memset(sh, 0, sizeof(float)*sp->ambi_ch); rt_set_pathing(sp->rt, sp->srcs[i].handle, sh, sp->ambi_ch); continue; }
+            run_get(sp, lp, i, eq, sh);                          /* eq computed but not yet rendered (v1: level is in sh) */
+            rt_set_pathing(sp->rt, sp->srcs[i].handle, sh, sp->ambi_ch);
+        }
+        Sleep(1000 / PATH_HZ);
+    }
+    return 0;
+}
+
+void steam_path_start(SteamPath* sp) { if (sp && !sp->thread) sp->thread = CreateThread(NULL, 0, sim_thread, sp, 0, NULL); }
 
 SteamPath* steam_path_create(SteamScene* scene, RtCore* rt, const Layout* L,
                              uint32_t sample_rate, uint32_t block, uint32_t order) {
@@ -159,6 +206,21 @@ SteamPath* steam_path_create(SteamScene* scene, RtCore* rt, const Layout* L,
     iplSimulatorCommit(sp->sim);
 
     if (do_path_bake(sp, L) == 0) goto fail;
+
+    for (uint32_t s = 0; s < BW_CHANNELS; ++s) {       /* speaker dirs in phonon's cartesian frame (== room) */
+        const float* p = L->speakers[s].pos;
+        float m = sqrtf(p[0]*p[0] + p[1]*p[1] + p[2]*p[2]);
+        sp->spk[s] = (m < 1e-6f) ? (IPLVector3){0,0,-1} : (IPLVector3){ p[0]/m, p[1]/m, p[2]/m };
+    }
+    IPLAudioSettings as; memset(&as,0,sizeof as); as.samplingRate=(IPLint32)sample_rate; as.frameSize=(IPLint32)block;
+    IPLAmbisonicsDecodeEffectSettings ds; memset(&ds,0,sizeof ds);
+    ds.speakerLayout.type = IPL_SPEAKERLAYOUTTYPE_CUSTOM;
+    ds.speakerLayout.numSpeakers = (IPLint32)BW_CHANNELS;
+    ds.speakerLayout.speakers = sp->spk;
+    ds.hrtf = NULL; ds.maxOrder = (IPLint32)order;
+    if (iplAmbisonicsDecodeEffectCreate(sp->ctx, &as, &ds, &sp->dec) != IPL_STATUS_SUCCESS) goto fail;
+    sp->out26 = (float*)calloc((size_t)BW_CHANNELS * block, sizeof(float));
+    if (!sp->out26) goto fail;
     return sp;
 fail:
     steam_path_destroy(sp);
@@ -168,6 +230,8 @@ fail:
 void steam_path_destroy(SteamPath* sp) {
     if (!sp) return;
     if (sp->thread) { InterlockedExchange(&sp->stop,1); WaitForSingleObject(sp->thread, INFINITE); CloseHandle(sp->thread); }
+    if (sp->dec) iplAmbisonicsDecodeEffectRelease(&sp->dec);
+    free(sp->out26);
     for (int i=0;i<sp->nsrc;++i) if (sp->srcs[i].src) { iplSourceRemove(sp->srcs[i].src, sp->sim); iplSourceRelease(&sp->srcs[i].src); }
     if (sp->probes) { iplSimulatorRemoveProbeBatch(sp->sim, sp->probes); iplProbeBatchRelease(&sp->probes); }
     if (sp->sim) iplSimulatorRelease(&sp->sim);

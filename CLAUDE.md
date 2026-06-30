@@ -68,6 +68,8 @@ src/
   ambisonics.h/.c      3rd-order ACN/SN3D encode (+ phonon N3D scale) for the Steam decode. [M5]
   steam_decode.h/.c    production ambisonics->stereo HRTF decode via phonon (with-SDK). [M5]
   steam_scene.h/.c     materials occlusion: IPLScene+IPLSimulator on a sim thread (with-SDK). [materials]
+  steam_reflect.h/.c   reflection bed: IPLSimulator reflections -> ambisonic IR -> SH->26 bus tap (with-SDK). [materials]
+  steam_path.h/.c      sound pathing: indirect routing -> per-voice shCoeffs -> SH-encode -> bus tap (with-SDK). [materials]
   natnet.c             OptiTrack pose ingest (off-wire, see docs/build.md). [M6]
 test/                  bw_smoke (3 profiles), bw_audio_smoke, bw_rt_test, bw_sound_test, bw_dsp_test, bw_monitor_test.
 bindings/
@@ -127,8 +129,15 @@ SH→26 decode → bus, registered as the rt bus tap at `bw_start`; the `reflect
 (`bw_source_set_reflection_send`) and an optional **distance→wet** scaling (`bw_source_set_reflection_distance`,
 near = drier / far = wetter; the send gain is distance-derived in `rt.c` and ramped). **Baked reflections**
 (`BWAUDIO_BAKE=1`, same gate) precompute the reverb at a probe grid at `bw_start` so the sim thread looks it
-up instead of ray-tracing; the `bake` test confirms it stays directional. (Pathing rides the same probe
-machinery and is the next clean follow-on; see docs/materials.md.) **Opt-in per-source
+up instead of ray-tracing; the `bake` test confirms it stays directional. **Sound pathing** is wired end to
+end too (`steam_path.c`, same gate, opt in with `BWAUDIO_PATHING`): a 10 Hz sim thread rides the same probe
+machinery to route a blocked source around occluders / through openings and publishes each opted-in voice's
+ambisonic shCoeffs to `rt.c` (`rt_set_pathing`, handle-gated double buffer); the mixer SH-encodes that
+voice's *un-occluded* signal into a shared ambisonic accumulator (ramped) and the `path` rt tap decodes it
+to the bus via phonon's own decoder (convention consistent encode→decode). `bw_source_set_pathing` opts in;
+the `path` test proves the route bends around a wall with the right direction, the `rt` test proves the
+encode lands on `s·shCoeffs`. The bending-loss EQ is computed but not yet rendered (v1 carries level in
+shCoeffs[0]); see docs/materials.md. **Opt-in per-source
 propagation effects** are implemented (phonon-free,
 pure `rt.c` DSP, default off): **Doppler** (`bw_source_set_doppler`) renders each voice through a
 per-voice fractional delay ring (`RtCore.dop_ring`, one power-of-two ring per voice, allocated at

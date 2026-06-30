@@ -46,6 +46,7 @@
 
 typedef struct { Cmd slots[RING_CAP]; _Atomic uint32_t write, read; } CmdRing;
 typedef struct { Evt slots[EVT_CAP];  _Atomic uint32_t write, read; } EvtRing;
+typedef struct { uint32_t handle; float sh[BW_AMBI_CH]; } PathPub;   /* one double-buffer slot of a voice's path field */
 
 typedef struct {
     uint16_t gen;
@@ -59,6 +60,8 @@ typedef struct {
     float    gtarget[BW_CHANNELS], gcur[BW_CHANNELS];
     float    gtarget_lo[BW_CHANNELS], gcur_lo[BW_CHANNELS];   /* dual-band low (amplitude-norm) band gains */
     float    xover_lp;                                        /* dual-band crossover one-pole LP state */
+    int      path_on;                                         /* gated into the pathing (indirect) render */
+    float    path_sh_cur[BW_AMBI_CH];                         /* ramped path shCoeffs (toward the published target) */
     /* occlusion ramp state (audio-thread-only). The published target lives in the RtCore.occ_*
      * atomic arrays (outside this memset'd struct, so the off-thread sim never races a voice
      * create). occ_cur ramps toward the gated published value, applied to the mono signal pre-pan. */
@@ -171,6 +174,15 @@ struct RtCore {
     float*   aux;                /* BW_RT_MAX_BLOCK mono samples; the per-block aux send scratch */
     StreamSet* streams;          /* background file-streaming thread + ring pool (control thread owns lifecycle) */
     float*   stream_scratch;     /* BW_RT_MAX_BLOCK mono samples; a streaming voice's block, pulled before the mix */
+
+    /* pathing: rt_render SH-encodes pathing voices into path_accum, then path_tap decodes it to the bus.
+     * Per voice the sim publishes shCoeffs via a handle-gated double buffer (path_pub[idx*2 + path_idx]). */
+    RtPathTap path_tap;
+    void*    path_tap_ud;
+    uint32_t path_ambi_ch;       /* (order+1)^2 of the pathing field; 0 = no path tap */
+    float*   path_accum;         /* BW_AMBI_CH * BW_RT_MAX_BLOCK; summed ambisonic indirect field */
+    PathPub* path_pub;           /* voice_cap * 2 (double-buffered per voice) */
+    _Atomic int* path_idx;       /* voice_cap: front-buffer index the sim flips after writing the back */
 
     /* per-voice Doppler delay rings: voice_cap contiguous power-of-two rings of dop_ringlen floats each
      * (slice idx = dop_ring + idx*dop_ringlen), sized to BW_DOPPLER_MAX_DIST at the engine rate.
@@ -401,6 +413,9 @@ static void drain_commands(RtCore* c) {
             if (v) v->playing = false; } break;
         case CMD_SET_REFLECTIONS: { Voice* v = voice_for(c, cmd->handle);
             if (v) v->refl_send = cmd->u.refl.on != 0; } break;
+        case CMD_SET_PATHING: { Voice* v = voice_for(c, cmd->handle);
+            if (v) { v->path_on = cmd->u.path.on != 0;
+                     if (!v->path_on) for (int k = 0; k < BW_AMBI_CH; ++k) v->path_sh_cur[k] = 0.f; } } break;
         case CMD_SET_REFL_SEND: { Voice* v = voice_for(c, cmd->handle);
             if (v) { float g = cmd->u.rsend.gain; v->refl_gain = g < 0.f ? 0.f : g; } } break;
         case CMD_SET_REFL_DIST: { Voice* v = voice_for(c, cmd->handle);
@@ -651,6 +666,20 @@ static void mix_voice(RtCore* c, Voice* v, uint16_t idx, float* bus, uint32_t n,
         for (uint32_t i = start + strm_got; i < n; ++i) c->stream_scratch[i] = 0.f;
     }
 
+    /* pathing: SH-encode the UN-occluded source (the indirect path goes around the occluder, so it is
+     * not occluded by the direct-path occlusion) into the shared ambisonic accumulator. Read the sim's
+     * published field (handle-gated double buffer) once and ramp toward it (invariant 4). */
+    const int path_on = v->path_on && c->path_tap && c->path_ambi_ch;
+    const uint32_t pac = c->path_ambi_ch;
+    float path_tgt[BW_AMBI_CH], path_step[BW_AMBI_CH];
+    if (path_on) {
+        int pf = atomic_load_explicit(&c->path_idx[idx], memory_order_acquire);
+        const PathPub* pp = &c->path_pub[(size_t)idx * 2 + (size_t)pf];
+        const int mine_path = (pp->handle == myh);
+        for (uint32_t k = 0; k < pac; ++k) path_tgt[k] = mine_path ? pp->sh[k] : 0.f;
+        for (uint32_t k = 0; k < pac; ++k) path_step[k] = (path_tgt[k] - v->path_sh_cur[k]) / (float)n;
+    }
+
     uint32_t cur = v->cursor;
     bool ended = false;
     for (uint32_t i = 0; i < n; ++i) {
@@ -660,6 +689,7 @@ static void mix_voice(RtCore* c, Voice* v, uint16_t idx, float* bus, uint32_t n,
             else         ended = true;
         }
         float s = streaming ? c->stream_scratch[i] : (ended ? 0.f : snd->pcm[cur]);
+        const float s_raw = s;                                 /* pre-occlusion source, for the indirect (pathing) field */
         if (v->eq_engaged) {                                    /* 3 biquads (DF-I), coeffs interpolated per sample */
             for (int b = 0; b < 3; ++b) {
                 float* co = v->eq_co[b];
@@ -687,6 +717,10 @@ static void mix_voice(RtCore* c, Voice* v, uint16_t idx, float* bus, uint32_t n,
         if (!streaming && !ended) ++cur;
         v->occ_cur += occ_step;
         v->dir_cur += dir_step;
+        if (path_on) for (uint32_t k = 0; k < pac; ++k) {      /* SH-encode the indirect field (decoded later by the tap) */
+            c->path_accum[(size_t)k * n + i] += s_raw * v->path_sh_cur[k];
+            v->path_sh_cur[k] += path_step[k];
+        }
         if (dual) {
             float lo = v->xover_lp + xover_a * (s - v->xover_lp); v->xover_lp = lo;   /* LP @ 700 Hz */
             float hi = s - lo;                                                        /* complementary HP */
@@ -702,6 +736,7 @@ static void mix_voice(RtCore* c, Voice* v, uint16_t idx, float* bus, uint32_t n,
         }
     }
     v->cursor = cur;
+    if (path_on) for (uint32_t k = 0; k < pac; ++k) v->path_sh_cur[k] = path_tgt[k];   /* land exactly */
     if (streaming) {                                            /* advance the stream position; end at a true EOF (not underrun) */
         v->stream_pos += strm_got;
         if (stream_ended(snd->stream, v->stream_pos)) ended = true;
@@ -801,6 +836,8 @@ void rt_render(RtCore* c, float* bus, uint32_t nframes, const BwTimestamp* ts) {
     /* the reflection aux send: collected this block if a tap is registered + the block fits the scratch */
     float* aux = (c->bus_tap && nframes <= BW_RT_MAX_BLOCK) ? c->aux : NULL;
     if (aux) memset(aux, 0, sizeof(float) * (size_t)nframes);
+    const int path_active = (c->path_tap && c->path_ambi_ch && nframes <= BW_RT_MAX_BLOCK);
+    if (path_active) memset(c->path_accum, 0, sizeof(float) * (size_t)c->path_ambi_ch * nframes);  /* pathing accumulator */
     int rt_active = 0;
     BW_ZONE_BEGIN(zmix, "mix voices");
     for (uint32_t i = 0; i < c->voice_cap; ++i) {
@@ -830,6 +867,11 @@ void rt_render(RtCore* c, float* bus, uint32_t nframes, const BwTimestamp* ts) {
         BW_ZONE_BEGIN(zt, "reflect tap");
         c->bus_tap(c->bus_tap_ud, bus, nframes, c->lis.p_active, c->lis.q_active, aux);
         BW_ZONE_END(zt);
+    }
+    if (path_active) {   /* pathing: decode the summed indirect ambisonic field onto the bus (also pre-align) */
+        BW_ZONE_BEGIN(zp, "path tap");
+        c->path_tap(c->path_tap_ud, bus, nframes, c->lis.p_active, c->lis.q_active, c->path_accum, c->path_ambi_ch);
+        BW_ZONE_END(zp);
     }
     BW_ZONE_BEGIN(za, "align");
     align_process(c->aligner, bus, nframes);   /* per-speaker gain trim + delay (output stage) */
@@ -949,6 +991,33 @@ void rt_source_set_reflections(RtCore* c, uint32_t h, bool on) {
     Cmd cmd = { .type = CMD_SET_REFLECTIONS, .handle = h };
     cmd.u.refl.on = on ? 1u : 0u;
     cmd_push(&c->cmds, &cmd);
+}
+
+void rt_source_set_pathing(RtCore* c, uint32_t h, bool on) {
+    Cmd cmd = { .type = CMD_SET_PATHING, .handle = h };
+    cmd.u.path.on = on ? 1u : 0u;
+    cmd_push(&c->cmds, &cmd);
+}
+
+void rt_set_path_tap(RtCore* c, RtPathTap tap, void* ud, uint32_t ambi_ch) {
+    if (!c) return;
+    c->path_tap = tap; c->path_tap_ud = ud;
+    c->path_ambi_ch = (ambi_ch > BW_AMBI_CH) ? BW_AMBI_CH : ambi_ch;   /* set while the audio thread is stopped */
+}
+
+/* Off-thread pathing sim publishes a voice's shCoeffs: write the back buffer, flip the index (release).
+ * Handle stored alongside so the audio thread drops a stale/recycled slot. */
+void rt_set_pathing(RtCore* c, uint32_t handle, const float* sh, uint32_t ambi_ch) {
+    if (!c || !sh) return;
+    uint32_t idx = BW_H_IDX(handle);
+    if (idx >= c->voice_cap) return;
+    if (ambi_ch > BW_AMBI_CH) ambi_ch = BW_AMBI_CH;
+    int cur = atomic_load_explicit(&c->path_idx[idx], memory_order_relaxed);
+    PathPub* back = &c->path_pub[(size_t)idx * 2 + (size_t)(1 - cur)];
+    back->handle = handle;
+    for (uint32_t k = 0; k < ambi_ch; ++k)        back->sh[k] = sh[k];
+    for (uint32_t k = ambi_ch; k < BW_AMBI_CH; ++k) back->sh[k] = 0.f;
+    atomic_store_explicit(&c->path_idx[idx], 1 - cur, memory_order_release);
 }
 
 void rt_source_set_reflection_send(RtCore* c, uint32_t h, float gain) {
@@ -1136,6 +1205,9 @@ RtCore* rt_create(uint32_t voice_cap, uint32_t sound_cap, uint32_t sample_rate, 
     c->play_pub   = (_Atomic uint32_t*)calloc(voice_cap, sizeof(_Atomic uint32_t));
     c->aux        = (float*)   calloc(BW_RT_MAX_BLOCK, sizeof(float));   /* reflection aux-send scratch */
     c->stream_scratch = (float*)calloc(BW_RT_MAX_BLOCK, sizeof(float));  /* per-block streaming pull scratch */
+    c->path_accum = (float*)calloc((size_t)BW_AMBI_CH * BW_RT_MAX_BLOCK, sizeof(float));  /* pathing ambisonic accumulator */
+    c->path_pub   = calloc((size_t)voice_cap * 2, sizeof *c->path_pub);  /* per-voice double-buffered path field */
+    c->path_idx   = (_Atomic int*)calloc(voice_cap, sizeof(_Atomic int));
     c->streams    = stream_set_create(sample_rate);                     /* background file streaming */
     c->gen       = (uint16_t*) calloc(voice_cap, sizeof(uint16_t));
     c->inuse     = (uint8_t*)  calloc(voice_cap, sizeof(uint8_t));
@@ -1150,7 +1222,7 @@ RtCore* rt_create(uint32_t voice_cap, uint32_t sound_cap, uint32_t sample_rate, 
         c->dop_ring = (float*)calloc((size_t)voice_cap * rl, sizeof(float));
     }
     if (!c->voices || !c->occ_handle || !c->occ_val || !c->occ_eq || !c->occ_dir || !c->play_pub || !c->aux ||
-        !c->stream_scratch || !c->streams ||
+        !c->stream_scratch || !c->streams || !c->path_accum || !c->path_pub || !c->path_idx ||
         !c->gen || !c->inuse || !c->priority || !c->freelist || !c->sounds || !c->sfreelist || !c->dop_ring) {
         rt_destroy(c); return NULL;
     }
@@ -1300,6 +1372,9 @@ void rt_destroy(RtCore* c) {
     free(c->dop_ring);
     stream_set_destroy(c->streams);     /* stops the streaming thread, releases every open stream + ring */
     free(c->stream_scratch);
+    free(c->path_accum);
+    free(c->path_pub);
+    free((void*)c->path_idx);
     free(c->aux);
     free((void*)c->occ_dir);            /* cast drops the _Atomic qualifier for free() */
     free((void*)c->play_pub);

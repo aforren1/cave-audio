@@ -426,11 +426,30 @@ Marginal CPU win for *this* installation (the real-time ray-trace already runs o
 with Tracy headroom), but it enables much higher bake-time quality and is the right default for a
 static room.
 
-## Pathing — not yet wired (same machinery)
+## Pathing — wired (`BWAUDIO_PATHING`)
 
 `IPL_SIMULATIONFLAGS_PATHING` + `iplPathBakerBake` + `IPLSimulationInputs.pathingProbes` route sound
-around occluders / through portals over the same probe network baking now uses. With baked reflections
-working, the probe-transform gotcha above is solved, so pathing is a clean follow-on: bake path data
-on a probe batch, add `IPL_SIMULATIONFLAGS_PATHING` to the sim, opt sources in per-voice, decode the
-path field to the bus like the reflection bed. It only pays off where the space has real occluders to
-bend sound around — verify with a routing-around-a-wall test, best heard at the rig.
+around occluders / through portals over the same probe network baking uses. It's now wired end to
+end (`steam_path.c`, same with-SDK gate, opt in with `BWAUDIO_PATHING` at `bw_start`):
+
+- **Bake (Stage 1, `steam_path_create`).** A probe grid spans the layout (+margin) at mean speaker
+  height, using the SAME OBB-transform convention learned for reflections (centre in the translation
+  column, radius from the basis lengths — see above). `iplPathBakerBake` writes the probe-to-probe
+  visibility graph. The pathing sim's `IPLSimulationSettings.maxOrder` MUST be set to the path order
+  or the path field is silently capped to order-0 (omni, no direction) — the one gotcha unique to
+  pathing. The `path` test proves a route bends around a wall AND that the recovered shCoeffs point
+  the right way (−X toward the source, +Z out the opening).
+- **Render (Stage 2).** A 10 Hz sim thread runs pathing per opted-in source and publishes each one's
+  `IPLPathEffectParams.shCoeffs` to rt.c via `rt_set_pathing` (handle-gated, double-buffered). In the
+  mixer, a pathing voice SH-encodes its UN-occluded signal (`accum[k] += s·shCoeffs[k]` — the
+  indirect path goes around the occluder, so the direct-path occlusion must NOT apply to it) into a
+  shared ambisonic accumulator, ramped per sample (invariant 4). After the voice loop the `path` tap
+  decodes that accumulator to the 26-ch bus through phonon's own `iplAmbisonicsDecodeEffect` — so
+  phonon's ACN/N3D convention is consistent encode-to-decode, no hand-rolled normalization. The
+  `rt` test verifies the encode lands exactly on `s·shCoeffs`; the decode is the same call the
+  (tested) reflection bed uses.
+
+Opt sources in with `bw_source_set_pathing`. The bending-loss EQ (`eqCoeffs[3]`) is computed by the
+sim but not yet rendered — v1 carries the path level in `shCoeffs[0]`; a 3-band transmission-style
+EQ like occlusion's is the obvious follow-on. It only pays off where the space has real occluders to
+bend sound around — best heard at the rig.

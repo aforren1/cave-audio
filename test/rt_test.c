@@ -7,6 +7,7 @@
  */
 #include "rt.h"
 #include "layout.h"
+#include "ambisonics.h"   /* BW_AMBI_CH for the pathing accumulator capture */
 #include "dr_wav.h"
 
 #include <math.h>
@@ -135,6 +136,15 @@ static void test_tap(void* ud, float* bus, uint32_t n, const float* lp, const fl
     double e = 0; for (uint32_t i = 0; i < n; ++i) e += fabs(aux[i]);
     g_aux_energy = e;
     for (uint32_t i = 0; i < n; ++i) bus[0 * (size_t)n + i] += 0.125f;
+}
+
+static int      g_path_calls;
+static uint32_t g_path_chn;
+static float    g_path_cap[BW_AMBI_CH];   /* last-sample value of each accumulator channel */
+static void test_path_tap(void* ud, float* bus, uint32_t n, const float* lp, const float* lq, const float* ambi, uint32_t ambi_ch) {
+    (void)ud; (void)lp; (void)lq; (void)bus;
+    ++g_path_calls; g_path_chn = ambi_ch;
+    for (uint32_t k = 0; k < ambi_ch && k < BW_AMBI_CH; ++k) g_path_cap[k] = ambi[(size_t)k * n + (n - 1)];
 }
 
 int main(void) {
@@ -314,6 +324,34 @@ int main(void) {
         g_aux_energy = -1.0; rt_commit(ct); render2(ct);
         CHECK(g_aux_energy == 0.0, "opting out removes the voice from the aux send");
         rt_destroy(ct);
+    }
+
+    /* 14. pathing render: an opted-in voice SH-encodes its (un-occluded) signal s*shCoeffs into the
+     *     shared ambisonic accumulator, which the path tap receives. The const-1.0 source means the
+     *     landed accumulator equals the published shCoeffs exactly; opting out zeroes it. */
+    RtCore* cp = rt_create(8, 4, RATE, CH);
+    CHECK(cp != NULL, "rt_create (path)");
+    if (cp) {
+        uint32_t sp = rt_load_sound(cp, WAV, err, sizeof err);
+        uint32_t vp = rt_source_create(cp);
+        rt_source_play(cp, vp, sp, true);
+        rt_source_set_pos(cp, vp, LD.speakers[2].pos[0], LD.speakers[2].pos[1], LD.speakers[2].pos[2]);
+        rt_set_path_tap(cp, test_path_tap, NULL, 4);
+        rt_source_set_pathing(cp, vp, true);
+        const float want[4] = { 0.5f, 0.25f, -0.1f, 0.3f };
+        rt_set_pathing(cp, vp, want, 4);                 /* publish a fixed indirect field for this voice */
+        g_path_calls = 0; g_path_chn = 0;
+        rt_commit(cp); render2(cp);                      /* block 1 ramps 0->want, block 2 holds at want */
+        CHECK(g_path_calls == 2 && g_path_chn == 4, "path tap called once per block with the ambi channel count");
+        int matched = 1;
+        for (int k = 0; k < 4; ++k) if (fabs((double)g_path_cap[k] - want[k]) > 1e-3) matched = 0;
+        CHECK(matched, "accumulator lands on s*shCoeffs (s=1) — the indirect field is encoded from the published directions");
+        rt_source_set_pathing(cp, vp, false);            /* opt out -> the accumulator is silent */
+        for (int k = 0; k < 4; ++k) g_path_cap[k] = 9.f;
+        rt_commit(cp); render2(cp);
+        int silent = 1; for (int k = 0; k < 4; ++k) if (fabs((double)g_path_cap[k]) > 1e-6) silent = 0;
+        CHECK(silent, "opting out removes the voice from the pathing render");
+        rt_destroy(cp);
     }
 
     /* channel test signal: drives a raw output channel (after align), only that channel */

@@ -180,6 +180,11 @@ BW_API void     bw_source_set_reflection_send(BwEngine* e, BwSource s, float gai
 /* Distance->wet: when on, the engine scales this source's send by its distance to the listener (near =
  * drier, far = wetter), on top of the level above. Off by default (constant send). Per-frame-safe. */
 BW_API void     bw_source_set_reflection_distance(BwEngine* e, BwSource s, bool on);
+/* Opt a source into sound PATHING: when the direct line is blocked, its sound is routed to the
+ * listener along indirect paths (around occluders / through openings) and decoded to the array from
+ * those arrival directions. Requires the scene geometry + BWAUDIO_PATHING at start; no-op otherwise.
+ * Per-frame-safe (enqueue-only). The indirect field updates at the sim rate (~10 Hz), ramped. */
+BW_API void     bw_source_set_pathing(BwEngine* e, BwSource s, bool on);
 /* Read the source's current occlusion factor (1 = clear .. 0 = fully blocked) — for HUD/diagnostics. */
 BW_API float    bw_source_get_occlusion(BwEngine* e, BwSource s);
 

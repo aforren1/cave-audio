@@ -33,7 +33,7 @@ enum {
     CMD_SRC_CREATE = 0, CMD_SRC_DESTROY, CMD_SET_POS, CMD_SET_GAIN,
     CMD_PLAY, CMD_STOP, CMD_SET_LISTENER, CMD_COMMIT, CMD_SOUND_RETIRE,
     CMD_SET_REFLECTIONS, CMD_TEST_SIGNAL, CMD_SET_DOPPLER, CMD_SET_AIR, CMD_SET_SPREAD,
-    CMD_SET_REFL_SEND, CMD_SET_REFL_DIST
+    CMD_SET_REFL_SEND, CMD_SET_REFL_DIST, CMD_SET_PATHING
 };
 typedef struct {
     uint8_t  type;
@@ -49,6 +49,7 @@ typedef struct {
         struct { float amount; }                       spread;/* per-voice source angular width 0..1 */
         struct { float gain; }                         rsend; /* per-voice reverb wet-send level */
         struct { uint8_t on; }                         rdist; /* per-voice distance->wet scaling enable */
+        struct { uint8_t on; }                         path;  /* per-voice pathing enable */
         struct { uint32_t channel; uint8_t kind; float gain; } test;  /* debug channel injection */
     } u;
 } Cmd;
@@ -82,6 +83,17 @@ void    rt_set_bus_tap(RtCore* c, RtBusTap tap, void* ud);
 void    rt_source_set_reflections(RtCore* c, uint32_t h, bool on);   /* gate this voice into the aux send */
 void    rt_source_set_reflection_send(RtCore* c, uint32_t h, float gain);    /* per-voice wet-send level (default 1) */
 void    rt_source_set_reflection_distance(RtCore* c, uint32_t h, bool on);   /* scale the send by distance (far = wetter) */
+
+/* Pathing seam: rt_render SH-encodes every pathing voice's signal (s * shCoeffs[k]) into a shared
+ * ambisonic accumulator, then hands it to this tap AFTER the voice loop. The tap (steam_path) decodes
+ * the ambisonic field to the 26-ch bus via phonon's own decoder, so phonon's convention is consistent
+ * end-to-end. `ambi` is ambi_ch planar channels of n samples each. Set while stopped; NULL detaches. */
+typedef void (*RtPathTap)(void* ud, float* bus, uint32_t n, const float* lp, const float* lq, const float* ambi, uint32_t ambi_ch);
+void    rt_set_path_tap(RtCore* c, RtPathTap tap, void* ud, uint32_t ambi_ch);
+void    rt_source_set_pathing(RtCore* c, uint32_t h, bool on);      /* gate this voice into the pathing render */
+/* Off-thread pathing sim publishes a voice's path field: shCoeffs[ambi_ch] (the indirect arrival
+ * directions). Handle-gated + double-buffered; the audio thread ramps to it (no zipper). */
+void    rt_set_pathing(RtCore* c, uint32_t handle, const float* sh, uint32_t ambi_ch);
 /* Debug: drive output `channel` with a built-in test signal (kind 0=off/1=sine/2=noise), injected
  * AFTER the per-speaker align stage (raw channel). Control thread; takes effect next block. */
 void    rt_test_signal(RtCore* c, uint32_t channel, uint8_t kind, float gain);

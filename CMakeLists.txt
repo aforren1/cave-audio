@@ -151,7 +151,7 @@ endif()
 set(STEAMAUDIO_DIR "${CMAKE_SOURCE_DIR}/third_party/steamaudio" CACHE PATH "Steam Audio (phonon) SDK root")
 if(EXISTS "${STEAMAUDIO_DIR}/include/phonon.h")
   set(BW_STEAMAUDIO_FOUND TRUE)   # consumed by the with-SDK reflection test below
-  target_sources(bwaudio PRIVATE src/steam_decode.c src/steam_scene.c src/steam_reflect.c)  # HRTF decode + occlusion + reflections (with-SDK)
+  target_sources(bwaudio PRIVATE src/steam_decode.c src/steam_scene.c src/steam_reflect.c src/steam_path.c)  # HRTF decode + occlusion + reflections + pathing (with-SDK)
   if(MSVC)   # steam_reflect.c uses C11 <stdatomic.h> (the IR-publish seqlock), like rt.c
     set_source_files_properties(src/steam_reflect.c PROPERTIES COMPILE_OPTIONS /experimental:c11atomics)
   endif()

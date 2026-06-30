@@ -18,6 +18,7 @@
 #include "profile.h"
 #include "steam_scene.h"
 #include "steam_reflect.h"
+#include "steam_path.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -81,6 +82,8 @@ struct BwEngine {
     SteamScene*   scene;          /* materials occlusion sim (off-thread); NULL without the SDK */
     SteamReflect* reflect;        /* reflection bed (created at bw_start if configured); NULL otherwise */
     BwReflectionConfig refl_cfg;  /* set via bw_reflections_config before bw_start */
+    SteamPath*    path;           /* pathing (BWAUDIO_PATHING); NULL otherwise */
+    float         src_pos[BW_VOICE_CAP][3];  /* control-side per-source positions, so set_pathing has the pos */
 
     /* material table (control-thread): token == index; [0] is the built-in default. Coefficients are
      * resolved to per-triangle materials when a mesh is set. */
@@ -213,6 +216,7 @@ static void engine_close_devices(BwEngine* e) {
     /* after the audio thread joins (sinks closed above): unregister the tap, then destroy the bed —
      * its IR aliases the bed source, so it must die before steam_scene_destroy (bw_destroy, later). */
     if (e->reflect)  { rt_set_bus_tap(e->rt, NULL, NULL); steam_reflect_destroy(e->reflect); e->reflect = NULL; }
+    if (e->path)     { rt_set_path_tap(e->rt, NULL, NULL, 0); steam_path_destroy(e->path); e->path = NULL; }
     if (e->steam)    { steam_monitor_destroy(e->steam); e->steam = NULL; }   /* after the audio thread joins */
 #endif
     if (e->tracker)  { rt_set_tracker(e->rt, NULL); natnet_close(e->tracker); e->tracker = NULL; }  /* after audio stops */
@@ -271,6 +275,15 @@ int bw_start(BwEngine* e) {
                                           e->refl_cfg.ir_seconds, e->refl_cfg.num_rays, e->refl_cfg.num_bounces,
                                           e->refl_cfg.wet_gain, bake);
         if (e->reflect) rt_set_bus_tap(e->rt, steam_reflect_tap, e->reflect);
+    }
+    /* pathing (opt-in BWAUDIO_PATHING): bake the visibility graph, register the order-1 path tap. Sources
+     * opt in via bw_source_set_pathing; the indirect field decodes onto the bus alongside the reflection bed. */
+    {
+        const char* path_env = getenv("BWAUDIO_PATHING");
+        if (e->scene && path_env && path_env[0] && path_env[0] != '0') {
+            e->path = steam_path_create(e->scene, e->rt, &e->layout, e->cfg.sample_rate, bw_sink_block_size(e->sink), 1);
+            if (e->path) { rt_set_path_tap(e->rt, steam_path_tap, e->path, 4 /* (1+1)^2 */); steam_path_start(e->path); }
+        }
     }
 #endif
 
@@ -395,14 +408,18 @@ void bw_source_destroy(BwEngine* e, BwSource s) {
     /* clear ALL scene features (occlusion + directivity) so the sim tears down this source's
      * IPLSource and stops simulating the slot (else it leaks + a recycled slot inherits stale state). */
     if (e->scene) steam_scene_source_gone(e->scene, s);
+    if (e->path)  steam_path_set_source(e->path, s, (float[3]){0,0,0}, 0);   /* stop simulating this slot */
 #endif
     rt_source_destroy(e->rt, s);
 }
 void bw_source_set_pos(BwEngine* e, BwSource s, float x, float y, float z) {
     if (!e) return;
     rt_source_set_pos(e->rt, s, x, y, z);
+    uint16_t idx = (uint16_t)(s & 0xFFFFu);
+    if (idx < BW_VOICE_CAP) { e->src_pos[idx][0]=x; e->src_pos[idx][1]=y; e->src_pos[idx][2]=z; }  /* so set_pathing has the pos */
 #ifdef BW_HAVE_STEAMAUDIO
     if (e->scene) steam_scene_set_pos(e->scene, s, x, y, z);   /* keep the occlusion sim in sync */
+    if (e->path)  steam_path_set_pos(e->path, s, x, y, z);     /* keep the pathing sim in sync */
 #endif
 }
 void bw_source_set_gain(BwEngine* e, BwSource s, float linear)          { if (e) rt_source_set_gain(e->rt, s, linear); }
@@ -627,6 +644,20 @@ void bw_reflections_set_gain(BwEngine* e, float linear) {
 
 void bw_source_set_reflections(BwEngine* e, BwSource s, bool on) {
     if (e) rt_source_set_reflections(e->rt, s, on);             /* phonon-free; the tap consumes the send */
+}
+
+void bw_source_set_pathing(BwEngine* e, BwSource s, bool on) {
+    if (!e) return;
+    rt_source_set_pathing(e->rt, s, on);                        /* gate the voice into the indirect render */
+#ifdef BW_HAVE_STEAMAUDIO
+    if (e->path) {                                              /* register/enable in the sim with the tracked pos */
+        uint16_t idx = (uint16_t)(s & 0xFFFFu);
+        float zero[3] = {0,0,0};
+        steam_path_set_source(e->path, s, (idx < BW_VOICE_CAP) ? e->src_pos[idx] : zero, on);
+    }
+#else
+    (void)on;
+#endif
 }
 
 void bw_source_set_reflection_send(BwEngine* e, BwSource s, float gain) {
