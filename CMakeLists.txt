@@ -74,6 +74,7 @@ add_library(bw_core OBJECT
   src/natnet.c
   src/measure.c
   src/calib.c
+  src/stream.c
   ${CJSON_C}
 )
 target_include_directories(bw_core PUBLIC src ${dr_libs_SOURCE_DIR} ${CJSON_INC})
@@ -83,6 +84,7 @@ if(MSVC)
   # rt.c uses C11 <stdatomic.h>, gated behind /experimental:c11atomics (directory-scoped,
   # so it applies wherever rt.c is compiled). cJSON is third-party: silence its warnings.
   set_source_files_properties(src/rt.c PROPERTIES COMPILE_OPTIONS /experimental:c11atomics)
+  set_source_files_properties(src/stream.c PROPERTIES COMPILE_OPTIONS /experimental:c11atomics)
   set_source_files_properties(${CJSON_C} PROPERTIES COMPILE_OPTIONS /W0)
 endif()
 
@@ -255,6 +257,10 @@ if(BWAUDIO_BUILD_TESTS)
   add_executable(bw_measure_test test/measure_test.c)
   target_link_libraries(bw_measure_test PRIVATE bw_core)
   add_test(NAME measure COMMAND bw_measure_test)
+
+  add_executable(bw_stream_test test/stream_test.c)
+  target_link_libraries(bw_stream_test PRIVATE bw_core)
+  add_test(NAME stream COMMAND bw_stream_test)
 
   add_executable(bw_calib_test test/calib_test.c)
   target_link_libraries(bw_calib_test PRIVATE bw_core)
