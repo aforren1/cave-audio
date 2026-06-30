@@ -14,8 +14,12 @@
  *    phonon's hardcoded SH constants. (Deriving the matrix from iplAmbisonicsEncodeEffect is an
  *    equivalent alternative.)
  *  - CONVENTION 3 (orientation): phonon is right-handed x=right/y=up/-z=ahead = the room frame.
- *  Still pending: this file's phonon API CALLS (context/HRTF/decode create+apply) compile only with
- *  the SDK and are unverified by ear — like asio_sink.cpp at M1.
+ *  - CONVENTION 2b (m<0 sign): the real-SH m<0 channels (ACN 1,4,5,9,10,11) needed NEGATING to match
+ *    phonon's decode (sh_encode below). bw_ambi_test only checked m>=0 (W, front, the zonal/cosine l=2
+ *    terms), so this was invisible until the HRTF decode was exercised — it inverted left/right.
+ *    bw_steam_decode_test now drives the decode and confirms right->right ear, left->left, 180-flip.
+ *  Still pending: HRTF *quality* (timbre / externalization / front-back / elevation) is unverified by
+ *  ear — the smoke test covers gross laterality only.
  */
 #include "steam_decode.h"
 #include "ambisonics.h"
@@ -52,11 +56,19 @@ static void room_to_ambi_dir(const float r[3], float a[3]) {
  * audio_buffer.h "N3D is used internally for everything"). Scale the SN3D encode per ACN channel by
  * ambi_phonon_scale = sqrt(2l+1)/sqrt(4pi); bw_ambi_test verifies the product against phonon's
  * hardcoded SH constants. (Deriving the matrix from iplAmbisonicsEncodeEffect is an equivalent path.) */
+/* ACN channels with m<0 (the sin / "left-right" real harmonics) for order 3: l1 m-1; l2 m-2,-1;
+ * l3 m-3,-2,-1. phonon's real-SH m<0 sign is opposite to this encode's (ambi_test only ever verified
+ * the m>=0 channels against phonon — W, front, the zonal/cosine l2 terms — so the m<0 mismatch was
+ * invisible until the HRTF decode was exercised: it inverted L/R and skewed the inter-channel energy).
+ * Negating these brings the engine's encode into phonon's decode convention. */
+static const int SH_M_NEG[] = { 1, 4, 5, 9, 10, 11 };
+
 static void sh_encode(const float room_dir[3], float y[BW_AMBI_CH]) {
     float a[3];
     room_to_ambi_dir(room_dir, a);
     ambi_encode_sn3d(a, y);                                          /* SN3D, AmbiX axes */
     for (int k = 0; k < BW_AMBI_CH; ++k) y[k] *= ambi_phonon_scale[k];  /* -> phonon orthonormal SH */
+    for (size_t i = 0; i < sizeof SH_M_NEG / sizeof *SH_M_NEG; ++i) y[SH_M_NEG[i]] = -y[SH_M_NEG[i]];
 }
 
 /* rotate vector v by quaternion q (xyzw) */
