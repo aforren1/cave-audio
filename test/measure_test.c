@@ -58,7 +58,43 @@ int main(void) {
     }
     free(sweep);
 
+    /* --- RT60: a synthetic exponential-decay tail with a known reverberation time --- */
+    {
+        const int nir = 1000 + 16000;
+        float* ir = (float*)calloc((size_t)nir, sizeof(float));
+        const double rt60_target = 0.4;                         /* seconds */
+        const double tau = rt60_target * fs / 6.908;            /* envelope time constant (samples) */
+        unsigned seed = 12345u;
+        for (int k = 0; k < nir - 1000; ++k) {
+            seed = seed * 1103515245u + 12345u;
+            double noise = ((double)((seed >> 16) & 0x7fff) / 16384.0) - 1.0;   /* white [-1,1) */
+            ir[1000 + k] = (float)(exp(-(double)k / tau) * noise);
+        }
+        ir[1000] = 1.0f;                                        /* a clear direct spike */
+        RoomResult rr;
+        measure_rt60(ir, nir, 1000, fs, &rr);
+        printf("rt60: %.3f s (target %.2f)\n", rr.rt60, rt60_target);
+        CHECK(fabs(rr.rt60 - rt60_target) < 0.08, "Schroeder RT60 within 80 ms of the target decay");
+        free(ir);
+    }
+
+    /* --- early reflections: a direct + two planted reflections at known delays/levels --- */
+    {
+        const int nir = 8000;
+        float* ir = (float*)calloc((size_t)nir, sizeof(float));
+        ir[2000] = 1.0f; ir[2000 + 300] = 0.4f; ir[2000 + 900] = 0.2f;
+        RoomResult rr;
+        measure_rt60(ir, nir, 2000, fs, &rr);
+        printf("er: count=%d  d0=%d l0=%.2f  d1=%d l1=%.2f\n", rr.er_count,
+               rr.er_count>0?rr.er_delay[0]:0, rr.er_count>0?rr.er_level[0]:0.f,
+               rr.er_count>1?rr.er_delay[1]:0, rr.er_count>1?rr.er_level[1]:0.f);
+        CHECK(rr.er_count >= 2, "found both planted reflections");
+        CHECK(rr.er_delay[0] == 300 && fabs(rr.er_level[0] - 0.4f) < 0.01f, "reflection 1 at +300, level 0.4");
+        CHECK(rr.er_delay[1] == 900 && fabs(rr.er_level[1] - 0.2f) < 0.01f, "reflection 2 at +900, level 0.2");
+        free(ir);
+    }
+
     if (fails) { printf("measure_test: %d FAILURES\n", fails); return 1; }
-    printf("measure_test OK (sweep, deconvolution, delay+gain recovery, band tilt verified)\n");
+    printf("measure_test OK (sweep, deconvolution, delay+gain, band tilt, RT60, early reflections verified)\n");
     return 0;
 }

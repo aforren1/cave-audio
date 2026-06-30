@@ -37,6 +37,17 @@ static const double BAND_HZ[2] = { 300.0, 3000.0 };
 static const int    NSWEEP    = 72000;                 /* 1.5 s sweep */
 static const int    NTAIL     = 24000;                 /* 0.5 s room-decay tail */
 static const int    CAPLEN    = NSWEEP + NTAIL;
+static const int    IR_LEN    = 24000;                 /* 0.5 s room kernel retained per speaker (--save-irs) */
+
+/* minimal mono IEEE-float WAV writer for the retained per-speaker impulse responses */
+static void write_wav_f32(const char* path, const float* x, int n, int fs) {
+    FILE* f = fopen(path, "wb"); if (!f) return;
+    int br = fs * 4, ds = n * 4, sz16 = 16, rc = 36 + ds; short fmt = 3, ch = 1, bps = 32, ba = 4;
+    fwrite("RIFF",1,4,f); fwrite(&rc,4,1,f); fwrite("WAVE",1,4,f);
+    fwrite("fmt ",1,4,f); fwrite(&sz16,4,1,f); fwrite(&fmt,2,1,f); fwrite(&ch,2,1,f);
+    fwrite(&fs,4,1,f); fwrite(&br,4,1,f); fwrite(&ba,2,1,f); fwrite(&bps,2,1,f);
+    fwrite("data",1,4,f); fwrite(&ds,4,1,f); fwrite(x,4,(size_t)n,f); fclose(f);
+}
 
 /* ----- simulate backend: synthesize what an ideal rig would capture for speaker `ch` ----- */
 static void simulate_capture(int ch, const Layout* L, const float* mic, const float* sweep, float* cap) {
@@ -187,15 +198,18 @@ int main(int argc, char** argv) {
     const char* out_path    = NULL;
     const char* driver      = getenv("BWAUDIO_ASIO_DRIVER");
     float mic[3] = { 0.f, 0.f, 0.f };
-    int   mic_in = 0, simulate = 0;
+    int   mic_in = 0, simulate = 0, room = 0;
+    const char* ir_prefix = NULL;
     for (int i = 1; i < argc; ++i) {
         if      (!strcmp(argv[i],"--layout") && i+1<argc) layout_path = argv[++i];
         else if (!strcmp(argv[i],"--out")    && i+1<argc) out_path    = argv[++i];
         else if (!strcmp(argv[i],"--driver") && i+1<argc) driver      = argv[++i];
         else if (!strcmp(argv[i],"--input")  && i+1<argc) mic_in      = atoi(argv[++i]);
         else if (!strcmp(argv[i],"--simulate"))           simulate    = 1;
+        else if (!strcmp(argv[i],"--room"))               room        = 1;   /* RT60 + early reflections report */
+        else if (!strcmp(argv[i],"--save-irs") && i+1<argc) ir_prefix = argv[++i];  /* dump per-speaker IR WAVs */
         else if (!strcmp(argv[i],"--mic") && i+3<argc) { mic[0]=(float)atof(argv[++i]); mic[1]=(float)atof(argv[++i]); mic[2]=(float)atof(argv[++i]); }
-        else { fprintf(stderr, "usage: calibrate [--layout f] [--out f] [--mic x y z] [--input ch] [--driver name] [--simulate]\n"); return 2; }
+        else { fprintf(stderr, "usage: calibrate [--layout f] [--out f] [--mic x y z] [--input ch] [--driver name] [--simulate] [--room] [--save-irs prefix]\n"); return 2; }
     }
     if (!out_path) out_path = layout_path;                    /* in-place by default */
 
@@ -213,6 +227,7 @@ int main(int argc, char** argv) {
     MeasureResult* res = (MeasureResult*)calloc((size_t)n, sizeof(MeasureResult));
     if (!sweep || !cap || !res) { fprintf(stderr, "calibrate: out of memory\n"); return 1; }
     measure_sweep(sweep, NSWEEP, F1, F2, FS);
+    double rt60_sum = 0.0; int rt60_n = 0;                     /* room-report aggregate */
 
 #ifdef BW_HAVE_ASIO
     int asio_up = 0;
@@ -233,7 +248,19 @@ int main(int argc, char** argv) {
         measure_response(cap, CAPLEN, sweep, NSWEEP, F1, F2, FS, BAND_HZ, &res[i]);
         printf("  speaker %2d: delay=%6d  level=%.4f  bands=[%.3f %.3f %.3f]\n",
                i, res[i].delay_samples, res[i].level, res[i].band[0], res[i].band[1], res[i].band[2]);
+        if (room || ir_prefix) {                               /* room report + retained IR kernels */
+            RoomResult rr; static float irbuf[IR_LEN];
+            measure_room(cap, CAPLEN, sweep, NSWEEP, F1, F2, FS, &rr, ir_prefix ? irbuf : NULL, ir_prefix ? IR_LEN : 0);
+            if (room) {
+                printf("            RT60=%.3f s  early reflections:", rr.rt60);
+                for (int e = 0; e < rr.er_count; ++e) printf(" %.1fms/%.2f", rr.er_delay[e] * 1000.0 / FS, rr.er_level[e]);
+                printf("%s\n", rr.er_count ? "" : " (none)");
+                if (rr.rt60 > 0.f) { rt60_sum += rr.rt60; ++rt60_n; }
+            }
+            if (ir_prefix) { char p[512]; snprintf(p, sizeof p, "%s_%02d.wav", ir_prefix, i); write_wav_f32(p, irbuf, IR_LEN, (int)FS); }
+        }
     }
+    if (room && rt60_n) printf("room: mean RT60 ~ %.3f s (the floor on renderable reverb; treat the room to lower it)\n", rt60_sum / rt60_n);
 #ifdef BW_HAVE_ASIO
     if (asio_up) asio_close();
 #endif
