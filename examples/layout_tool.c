@@ -27,6 +27,10 @@
  * mean coverage over a grid of listener positions across the working volume). Watch the worst-direction
  * number drop as you move speakers to fill the red patches — that is the layout optimization.
  *
+ * A raygui control panel (right side, edit mode) mirrors every edit control below — speaker spinner +
+ * gain slider, panner combo, DBAP-knob sliders, the audition/view toggles, and the action buttons — so
+ * it's click-driven now; the keyboard shortcuts all still work (the panel just sets the same requests).
+ *
  * Controls (edit): [ ] select speaker (or left-click)   arrows X/Z, R/F Y (SHIFT = fine)
  *           ENTER type "x y z"   PgUp/PgDn gain_db   T tone   N sine/noise   C coverage   V observer
  *           G switch the coverage shading: nearest-speaker gap (geometric) <-> the selected panner's
@@ -53,10 +57,14 @@
 #include <stdlib.h>
 #include <string.h>
 
+#define RAYGUI_IMPLEMENTATION
+#include "raygui.h"          /* immediate-mode control panel (header-only) */
+
 #define NSPK           26
 #define SR             48000u
 #define SPEED_OF_SOUND 343.0f
 #define TEST_GAIN      0.4f
+#define PANEL_W        300       /* raygui control panel width (right side, edit mode) */
 
 typedef struct { Vector3 pos; float gain_db; } Spk;
 static Spk spk[NSPK];
@@ -490,6 +498,19 @@ int main(int argc, char** argv) {
     SetConfigFlags(FLAG_WINDOW_HIGHDPI | FLAG_MSAA_4X_HINT);   /* native pixel density + smooth 3D edges */
     InitWindow(1040, 720, "bwaudio - speaker layout tool");
     ui_text_init();                                            /* crisp TTF HUD (see ui_text.h) */
+    GuiSetFont(g_ui_font);                                     /* raygui draws through the same crisp atlas */
+    GuiSetStyle(DEFAULT, TEXT_SIZE, 18);
+    GuiSetStyle(DEFAULT, BACKGROUND_COLOR,    0x1c1c24ff);     /* dark theme to match the 3D view */
+    GuiSetStyle(DEFAULT, BASE_COLOR_NORMAL,   0x2c2c38ff);
+    GuiSetStyle(DEFAULT, TEXT_COLOR_NORMAL,   0xc8c8d8ff);
+    GuiSetStyle(DEFAULT, BORDER_COLOR_NORMAL, 0x4a4a5aff);
+    GuiSetStyle(DEFAULT, BASE_COLOR_FOCUSED,  0x3a3a4aff);
+    GuiSetStyle(DEFAULT, TEXT_COLOR_FOCUSED,  0xffffffff);
+    GuiSetStyle(DEFAULT, BORDER_COLOR_FOCUSED,0x6a8acaff);
+    GuiSetStyle(DEFAULT, BASE_COLOR_PRESSED,  0x46506aff);
+    GuiSetStyle(DEFAULT, TEXT_COLOR_PRESSED,  0xffffffff);
+    GuiSetStyle(DEFAULT, BORDER_COLOR_PRESSED,0x8aaae0ff);
+    GuiSetStyle(DEFAULT, LINE_COLOR,          0x40404eff);
     SetTargetFPS(60);
     Camera3D cam = { .target = { 0, 0, 0 }, .up = { 0, 1, 0 }, .fovy = 55, .projection = CAMERA_PERSPECTIVE };
     float cam_yaw = 45.0f * DEG2RAD, cam_pitch = 30.0f * DEG2RAD, cam_dist = 9.0f;
@@ -498,6 +519,10 @@ int main(int argc, char** argv) {
     int   editing = 0, ilen = 0;
     char  ibuf[64] = { 0 };
     float save_flash = 0.0f;
+    /* raygui panel -> key-handler bridge: a click sets a request flag the edit branch consumes next
+     * frame (the panel draws at the bottom of the loop; the handlers run at the top), so buttons reuse
+     * the exact same action code as the keys with no duplication. */
+    int   req_save = 0, req_reload = 0, req_score = 0, req_snap = 0, req_preview = 0, req_opt = 0, req_type = 0;
 
     while (!WindowShouldClose()) {
         float dt = GetFrameTime();
@@ -557,26 +582,27 @@ int main(int argc, char** argv) {
             if (IsKeyDown(KEY_PAGE_DOWN)) spk[sel].gain_db -= 6.0f * dt;
             if (IsKeyPressed(KEY_T)) tone_on = !tone_on;
             if (IsKeyPressed(KEY_N)) tone_kind = (tone_kind == BW_TEST_SINE) ? BW_TEST_NOISE : BW_TEST_SINE;
-            if (IsKeyPressed(KEY_ENTER)) { editing = 1; ilen = 0; ibuf[0] = 0; }
-            if (IsKeyPressed(KEY_S)) { save_flash = save_json(path) ? 2.0f : -2.0f; }
-            if (IsKeyPressed(KEY_L)) { load_json(path); load_constraints("constraints.json"); layout_dirty = 1; score_stale = 1; cov_err_stale = 1; }
-            if (IsKeyPressed(KEY_K)) {                                 /* snap all speakers to the nearest allowed point */
+            if (IsKeyPressed(KEY_ENTER) || req_type) { req_type = 0; editing = 1; ilen = 0; ibuf[0] = 0; }
+            if (IsKeyPressed(KEY_S) || req_save) { req_save = 0; save_flash = save_json(path) ? 2.0f : -2.0f; }
+            if (IsKeyPressed(KEY_L) || req_reload) { req_reload = 0; load_json(path); load_constraints("constraints.json"); layout_dirty = 1; score_stale = 1; cov_err_stale = 1; }
+            if (IsKeyPressed(KEY_K) || req_snap) { req_snap = 0;       /* snap all speakers to the nearest allowed point */
                 for (int i = 0; i < NSPK; ++i) spk[i].pos = constraint_project(spk[i].pos);
                 layout_dirty = 1; score_stale = 1; cov_err_stale = 1;
             }
             if (IsKeyPressed(KEY_C)) coverage_on = !coverage_on;       /* coverage overlay */
             if (IsKeyPressed(KEY_V)) coverage_moving = !coverage_moving;
             if (IsKeyPressed(KEY_G)) cov_metric ^= 1;   /* shade: gap <-> selected-panner rE error (cache stays valid) */
-            if (IsKeyPressed(KEY_X)) {                                 /* score the layout for each panner */
+            if (IsKeyPressed(KEY_X) || req_score) {  req_score = 0;     /* score the layout for each panner */
                 for (int p = 0; p < 3; ++p) score_panner((BwPanner)p, 1, &score_mean[p], &score_worst[p]);
                 scored = 1; score_stale = 0;
             }
             if (IsKeyPressed(KEY_B)) pv_panner = (pv_panner + 1) % 3;   /* select the target panner (score/optimize) */
-            if (IsKeyPressed(KEY_O)) {                                 /* toggle the auto-optimizer for that panner */
+            if (IsKeyPressed(KEY_O) || req_opt) { req_opt = 0;          /* toggle the auto-optimizer for that panner */
                 opt_running = !opt_running;
                 if (opt_running) { opt_cost = opt_cost_of((BwPanner)pv_panner); opt_step = 0.30f; opt_stall = 0; opt_iter = 0; }
             }
-            if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT) && !IsMouseButtonDown(MOUSE_BUTTON_RIGHT)) {  /* click-pick the nearest speaker (not while orbiting) */
+            if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT) && !IsMouseButtonDown(MOUSE_BUTTON_RIGHT)
+                && GetMouseX() < GetScreenWidth() - PANEL_W) {  /* click-pick a speaker (ignore clicks on the panel) */
                 Ray ray = GetMouseRay(GetMousePosition(), cam);
                 float best = 1e9f; int hit = -1;
                 for (int i = 0; i < NSPK; ++i) {
@@ -587,7 +613,7 @@ int main(int argc, char** argv) {
             }
             if (IsKeyDown(KEY_LEFT) || IsKeyDown(KEY_RIGHT) || IsKeyDown(KEY_UP) || IsKeyDown(KEY_DOWN) ||
                 IsKeyDown(KEY_R) || IsKeyDown(KEY_F) || IsKeyDown(KEY_PAGE_UP) || IsKeyDown(KEY_PAGE_DOWN)) { layout_dirty = 1; score_stale = 1; cov_err_stale = 1; }
-            if (IsKeyPressed(KEY_P) && !editing) {        /* enter DBAP preview — rebuild so it pans through the edited layout */
+            if ((IsKeyPressed(KEY_P) || req_preview) && !editing) { req_preview = 0;  /* enter DBAP preview — rebuild so it pans through the edited layout */
                 if (driven >= 0 && e) { bw_test_signal(e, (uint32_t)driven, BW_TEST_OFF, 0.0f); driven = -1; }
                 tone_on = 0; pv_orbit = 0; pv_t = 0.0f;   /* each preview session starts manual, fresh orbit phase */
                 if (layout_dirty && e && audio) {     /* rebuild only when there's a device to hear it on */
@@ -742,7 +768,7 @@ int main(int argc, char** argv) {
                                 src_pos.x, src_pos.y, src_pos.z, pv_orbit ? "ON" : "off"),
                      10, 30, 16, (Color){ 240, 160, 120, 255 });
         } else {
-            ui_text("[ ] select   arrows X/Z  R/F Y (SHIFT)   ENTER type   PgUp/Dn gain   T tone  N noise   C coverage  V obs  G gap/err   X score   K snap   P preview   S save  L reload",
+            ui_text("drag: rotate camera   wheel: zoom   click: pick a speaker   arrows/RF: move it (SHIFT fine)   --  all controls in the panel ->",
                      10, 8, 13, RAYWHITE);
             ui_text(TextFormat("speaker %d / %d  ->  channel %d   pos (%.3f, %.3f, %.3f)   gain %+.1f dB   delay %.3f ms   dist %.3f m",
                                 sel, NSPK, sel, spk[sel].pos.x, spk[sel].pos.y, spk[sel].pos.z, spk[sel].gain_db, seldel, seld),
@@ -797,6 +823,61 @@ int main(int argc, char** argv) {
                                 score_stale ? " STALE" : "",
                                 score_mean[0], score_worst[0], score_mean[1], score_worst[1], score_mean[2], score_worst[2]),
                      10, ys, 15, score_stale ? (Color){ 210, 210, 130, 255 } : (Color){ 150, 200, 240, 255 });
+        }
+
+        /* ---- raygui control panel (edit mode; the keyboard shortcuts all still work) ---- */
+        if (!preview && !editing) {
+            const float pw = PANEL_W, px = (float)GetScreenWidth() - pw;
+            const float x = px + 10, w = pw - 20, rh = 22, gp = 5;
+            float y = 8;
+            GuiPanel((Rectangle){ px, 0, pw, (float)GetScreenHeight() }, NULL);
+
+            GuiLabel((Rectangle){ x, y, w, rh }, "SPEAKER");  y += rh;
+            GuiSpinner((Rectangle){ x, y, w, rh }, NULL, &sel, 0, NSPK - 1, false);  y += rh + gp;
+            GuiLabel((Rectangle){ x, y, w, 16 }, TextFormat("gain  %+.1f dB", spk[sel].gain_db));  y += 16;
+            { float g = spk[sel].gain_db;
+              GuiSliderBar((Rectangle){ x, y, w, rh }, NULL, NULL, &spk[sel].gain_db, -24.0f, 12.0f);
+              if (spk[sel].gain_db != g) layout_dirty = 1; }  y += rh + gp;
+            if (GuiButton((Rectangle){ x, y, w, rh }, "Type X Y Z  [Enter]")) req_type = 1;  y += rh + gp + 6;
+
+            GuiLabel((Rectangle){ x, y, w, rh }, "PANNER (target for score / optimize)");  y += rh;
+            { int prev = pv_panner;
+              GuiComboBox((Rectangle){ x, y, w, rh }, "DBAP;SPCAP;VBAP", &pv_panner);
+              if (pv_panner != prev) { score_stale = 1; cov_err_stale = 1; } }  y += rh + gp;
+            if (GuiButton((Rectangle){ x, y, w/2 - 3, rh }, "Score [X]")) req_score = 1;
+            { bool ob = opt_running;
+              GuiToggle((Rectangle){ x + w/2 + 3, y, w/2 - 3, rh }, opt_running ? "Optimizing.." : "Optimize [O]", &ob);
+              if (ob != (bool)opt_running) req_opt = 1; }  y += rh + gp + 6;
+
+            GuiLabel((Rectangle){ x, y, w, rh }, "DBAP KNOBS");  y += rh;
+            { float v;
+              GuiLabel((Rectangle){ x, y, w, 14 }, TextFormat("blur r  %.2f m", dbap_r));  y += 14;
+              v = dbap_r;       GuiSliderBar((Rectangle){ x, y, w, rh }, NULL, NULL, &dbap_r,       0.05f, 3.0f);  if (dbap_r != v)       layout_dirty = 1;  y += rh + gp;
+              GuiLabel((Rectangle){ x, y, w, 14 }, TextFormat("dist ref  %.2f m", dist_ref));  y += 14;
+              v = dist_ref;     GuiSliderBar((Rectangle){ x, y, w, rh }, NULL, NULL, &dist_ref,     0.25f, 4.0f);  if (dist_ref != v)     layout_dirty = 1;  y += rh + gp;
+              GuiLabel((Rectangle){ x, y, w, 14 }, TextFormat("rolloff  %.2f", dist_rolloff));  y += 14;
+              v = dist_rolloff; GuiSliderBar((Rectangle){ x, y, w, rh }, NULL, NULL, &dist_rolloff, 0.0f,  2.0f);  if (dist_rolloff != v) layout_dirty = 1;  y += rh + gp;
+              GuiLabel((Rectangle){ x, y, w, 14 }, TextFormat("min gain  %.0f dB", dist_min_db));  y += 14;
+              v = dist_min_db;  GuiSliderBar((Rectangle){ x, y, w, rh }, NULL, NULL, &dist_min_db, -60.0f, 0.0f);  if (dist_min_db != v)  layout_dirty = 1;  y += rh + gp + 6; }
+
+            GuiLabel((Rectangle){ x, y, w, rh }, "AUDITION / VIEW");  y += rh;
+            { bool t = tone_on; GuiToggle((Rectangle){ x, y, w/2 - 3, rh }, "Tone [T]", &t); tone_on = t;
+              bool n = (tone_kind == BW_TEST_NOISE);
+              GuiToggle((Rectangle){ x + w/2 + 3, y, w/2 - 3, rh }, n ? "Noise [N]" : "Sine [N]", &n);
+              tone_kind = n ? BW_TEST_NOISE : BW_TEST_SINE; }  y += rh + gp;
+            { bool c = coverage_on; GuiToggle((Rectangle){ x, y, w/2 - 3, rh }, "Coverage [C]", &c); coverage_on = c;
+              bool m = coverage_moving;
+              GuiToggle((Rectangle){ x + w/2 + 3, y, w/2 - 3, rh }, m ? "Moving [V]" : "Fixed [V]", &m);
+              coverage_moving = m; }  y += rh + gp;
+            { bool me = cov_metric;
+              GuiToggle((Rectangle){ x, y, w, rh }, cov_metric ? "Shade: rE error [G]" : "Shade: nearest gap [G]", &me);
+              cov_metric = me; }  y += rh + gp;
+            if (GuiButton((Rectangle){ x, y, w, rh }, "PREVIEW - move a source [P]")) req_preview = 1;  y += rh + gp;
+
+            GuiLine((Rectangle){ x, y, w, 8 }, NULL);  y += 12;
+            if (GuiButton((Rectangle){ x, y, w/2 - 3, rh }, "Snap [K]")) req_snap = 1;
+            if (GuiButton((Rectangle){ x + w/2 + 3, y, w/2 - 3, rh }, "Save [S]")) req_save = 1;  y += rh + gp;
+            if (GuiButton((Rectangle){ x, y, w, rh }, "Reload [L]")) req_reload = 1;
         }
         EndDrawing();
     }

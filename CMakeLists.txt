@@ -349,6 +349,15 @@ if(BWAUDIO_BUILD_PLAYGROUND)
     GIT_SHALLOW TRUE)
   FetchContent_MakeAvailable(raylib)
 
+  # raygui — single-header immediate-mode GUI (header-only). SOURCE_SUBDIR points at a non-existent dir
+  # so MakeAvailable populates the source without building raygui's own CMake examples.
+  FetchContent_Declare(raygui
+    GIT_REPOSITORY https://github.com/raysan5/raygui.git
+    GIT_TAG 4.0
+    GIT_SHALLOW TRUE
+    SOURCE_SUBDIR  not_built)
+  FetchContent_MakeAvailable(raygui)
+
   add_executable(bw_playground examples/playground.c)
   target_include_directories(bw_playground PRIVATE ${dr_libs_SOURCE_DIR})
   target_link_libraries(bw_playground PRIVATE bwaudio raylib)
@@ -361,7 +370,7 @@ if(BWAUDIO_BUILD_PLAYGROUND)
   # Speaker-layout authoring tool: place the 26 speakers + identify each by ear (the channel test
   # signal) + export cave_layout.json. Compiles its own cJSON copy to read existing layouts.
   add_executable(bw_layout_tool examples/layout_tool.c ${CJSON_C})
-  target_include_directories(bw_layout_tool PRIVATE ${CJSON_INC})
+  target_include_directories(bw_layout_tool PRIVATE ${CJSON_INC} ${raygui_SOURCE_DIR}/src)
   target_link_libraries(bw_layout_tool PRIVATE bwaudio raylib)
   if(WIN32)
     add_custom_command(TARGET bw_layout_tool POST_BUILD
