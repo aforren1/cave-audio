@@ -225,6 +225,11 @@ BW_API uint32_t bw_get_speakers(BwEngine* e, float* xyz, uint32_t cap);
  * for a moving observer). Does not affect the diffuse bed / ambisonic paths. See docs/spatialization.md. */
 typedef enum { BW_PAN_DBAP = 0, BW_PAN_SPCAP = 1, BW_PAN_VBAP = 2 } BwPanner;
 BW_API void     bw_set_panner(BwEngine* e, BwPanner panner);
+/* Dual-band panning (off by default): split each source at ~700 Hz and pan the low band with
+ * amplitude (pressure / velocity-vector) normalisation, the high band with the panner's usual power
+ * (energy-vector) normalisation — better low-frequency localisation for a near-centred listener. Wraps
+ * the selected panner; live-toggleable for A/B. Sweet-spot dependent like VBAP (see docs). */
+BW_API void     bw_set_dual_band(BwEngine* e, bool on);
 
 /* Select the diffuse-bed ambisonic decoder (load-time: between bw_create and bw_start). SAMPLING is the
  * default projection decode; ALLRAD (All-Round Ambisonic Decoding) decodes to a uniform virtual layout

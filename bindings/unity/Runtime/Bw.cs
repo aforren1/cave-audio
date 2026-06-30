@@ -117,6 +117,7 @@ namespace CaveAudio
         [DllImport(DLL, CallingConvention = CC)] public static extern uint bw_get_speakers(IntPtr e, [Out] float[] xyz, uint cap);
         // Panner selection (load-time): DBAP (moving observer, default) or SPCAP (fixed-observer sweet spot).
         [DllImport(DLL, CallingConvention = CC)] public static extern void bw_set_panner(IntPtr e, BwPanner panner);
+        [DllImport(DLL, CallingConvention = CC)] public static extern void bw_set_dual_band(IntPtr e, [MarshalAs(UnmanagedType.I1)] bool on);
         // Diffuse-bed decoder (load-time): sampling (default) or AllRAD (robust on irregular arrays).
         [DllImport(DLL, CallingConvention = CC)] public static extern void bw_set_bed_decoder(IntPtr e, BwBedDecoder decoder);
         // Offline panner evaluation (no engine handle): out = nsrc*n gains for a layout/panner; for layout scoring.

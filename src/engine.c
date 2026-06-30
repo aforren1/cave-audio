@@ -407,6 +407,7 @@ bool bw_source_is_playing(BwEngine* e, BwSource s)                     { return 
 void bw_test_signal(BwEngine* e, uint32_t channel, BwTestKind kind, float gain) { if (e) rt_test_signal(e->rt, channel, (uint8_t)kind, gain); }
 
 void bw_set_panner(BwEngine* e, BwPanner panner) { if (e) rt_set_panner(e->rt, (int)panner); }
+void bw_set_dual_band(BwEngine* e, bool on)       { if (e) rt_set_dual_band(e->rt, on); }
 
 /* Offline: the chosen panner's per-speaker gains for `nsrc` source positions heard from one listener,
  * over a layout given as `n` speaker positions (3 floats each). Default DBAP/distance tuning. Shares

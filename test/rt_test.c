@@ -496,8 +496,52 @@ int main(void) {
         }
     }
 
+    /* dual-band panning: low band amplitude-normalised (Sigma|g|=gain), high band power (Sigma g^2=gain^2) */
+    {
+        RtCore* cdb = rt_create(8, 4, RATE, CH);
+        CHECK(cdb != NULL, "rt_create (dual-band)");
+        if (cdb) {
+            const char* LW = "bw_rt_lo.wav";
+            if (write_sine_wav(LW, 200.0, 8 * N)) {              /* a tone below the 700 Hz crossover */
+                uint32_t sl = rt_load_sound(cdb, LW, err, sizeof err);
+                uint32_t hd = rt_source_create(cdb);
+                rt_source_play(cdb, hd, sl, true);
+                rt_source_set_pos(cdb, hd, 1.0f, 0.0f, 1.0f);    /* off-speaker -> spreads across channels */
+                rt_set_dual_band(cdb, 0); rt_commit(cdb); render2(cdb);
+                double l2_off = total_l2(); int amax_off = argmax_channel();
+                rt_set_dual_band(cdb, 1); rt_commit(cdb); render2(cdb);
+                double l2_on = total_l2(); int amax_on = argmax_channel();
+                /* amplitude-norm gains have lower L2 than power-norm for a spread source (the LF relies on
+                 * coherent summation at the listener), and the panning DIRECTION is unchanged. */
+                CHECK(l2_off > 0 && l2_on < 0.85 * l2_off, "dual-band LF uses amplitude norm (lower per-channel power)");
+                CHECK(amax_on == amax_off, "dual-band preserves the localization direction");
+                /* a HIGH tone (above the crossover) is unaffected by dual-band: it stays in the power band */
+                const char* HW = "bw_rt_hi.wav";
+                if (write_sine_wav(HW, 5000.0, 8 * N)) {
+                    uint32_t sh = rt_load_sound(cdb, HW, err, sizeof err);
+                    uint32_t hh = rt_source_create(cdb);
+                    rt_source_play(cdb, hh, sh, true);
+                    rt_source_set_pos(cdb, hh, 1.0f, 0.0f, 1.0f);
+                    rt_set_dual_band(cdb, 0); rt_commit(cdb); render2(cdb); double h_off = total_l2();
+                    rt_set_dual_band(cdb, 1); rt_commit(cdb); render2(cdb); double h_on = total_l2();
+                    double lf_chg = (l2_off - l2_on) / l2_off, hf_chg = h_off > 0 ? fabs(h_on - h_off) / h_off : 1;
+                    CHECK(hf_chg < lf_chg, "dual-band changes the LF band more than the HF band");
+                    rt_source_destroy(cdb, hh); rt_commit(cdb); remove(HW);
+                } else CHECK(0, "write 5 kHz sine");
+                /* the LF (amplitude) band must still attenuate with distance like the HF — the renorm
+                 * targets ||g|| (which carries atten), not bare gain (which would cancel it). */
+                rt_set_dual_band(cdb, 1);
+                rt_source_set_pos(cdb, hd, 1.0f, 0.f, 0.f); rt_commit(cdb); render2(cdb); double lf_near = total_l2();
+                rt_source_set_pos(cdb, hd, 4.0f, 0.f, 0.f); rt_commit(cdb); render2(cdb); double lf_far = total_l2();
+                CHECK(lf_near > 0 && lf_far < 0.5 * lf_near, "dual-band LF attenuates with distance (atten preserved)");
+                rt_source_destroy(cdb, hd); rt_commit(cdb); remove(LW);
+            } else CHECK(0, "write 200 Hz sine");
+            rt_destroy(cdb);
+        }
+    }
+
     remove(WAV);
     if (fails) { printf("rt_test: %d FAILURES\n", fails); return 1; }
-    printf("rt_test OK (DBAP, commit, gen-drop, gain, occlusion, EQ, directivity, bed, reflection-tap, channel-test, air+Doppler, spread, reverb-send verified)\n");
+    printf("rt_test OK (DBAP, commit, gen-drop, gain, occlusion, EQ, directivity, bed, reflection-tap, channel-test, air+Doppler, spread, reverb-send, dual-band verified)\n");
     return 0;
 }

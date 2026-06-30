@@ -136,7 +136,11 @@ reflection send *before* themselves (direct path only); indices stay integer so 
 never loses sample precision. **Source spread/size** (`bw_source_set_spread`, 0=point..1=wide) is also
 in: the per-block gain solve blends the panner's point gains toward a width-controlled lobe centred on
 the source direction, renormalised to the panner's own power (widening never re-levels) — panner-agnostic.
-An **ambisonic bed** is implemented too (`bw_load_ambix` + `bw_bed_*`):
+**Dual-band panning** (`bw_set_dual_band`, off by default, live A/B) wraps the selected panner: a 700 Hz
+complementary crossover splits each voice, the low band panned amplitude-normalised (`Σg = gain`,
+velocity-vector) and the high band power-normalised (the panners' usual `Σg² = gain²`) — SPAT's "VBP
+Dual-Band", for sharper LF localisation near the sweet spot; `compute_gains` derives `gtarget_lo` every
+solve so it A/Bs live, and the mixer reads it only when on. An **ambisonic bed** is implemented too (`bw_load_ambix` + `bw_bed_*`):
 a file-fed AmbiX soundfield decoded world-locked to the 26-ch bus (`rt.c` `build_bed_decode`/`mix_bed`,
 phonon-free), reusing the SH→26 decode the reflection bed will need. `sound.c` now decodes **WAV/FLAC/MP3**
 (dr_libs, one pinned repo fetch) and **resamples to the engine rate at load** (windowed-sinc).

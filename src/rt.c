@@ -41,6 +41,7 @@
 #define BW_REFL_NEAR_DIST  1.0f
 #define BW_REFL_FAR_DIST   6.0f
 #define BW_REFL_NEAR_SEND  0.25f
+#define BW_DUALBAND_FC     700.0f     /* dual-band panning crossover (Hz): amplitude below, power above */
 
 typedef struct { Cmd slots[RING_CAP]; _Atomic uint32_t write, read; } CmdRing;
 typedef struct { Evt slots[EVT_CAP];  _Atomic uint32_t write, read; } EvtRing;
@@ -53,6 +54,8 @@ typedef struct {
     float    pos_pending[3], pos_active[3];
     float    gain_user;
     float    gtarget[BW_CHANNELS], gcur[BW_CHANNELS];
+    float    gtarget_lo[BW_CHANNELS], gcur_lo[BW_CHANNELS];   /* dual-band low (amplitude-norm) band gains */
+    float    xover_lp;                                        /* dual-band crossover one-pole LP state */
     /* occlusion ramp state (audio-thread-only). The published target lives in the RtCore.occ_*
      * atomic arrays (outside this memset'd struct, so the off-thread sim never races a voice
      * create). occ_cur ramps toward the gated published value, applied to the mono signal pre-pan. */
@@ -137,6 +140,8 @@ struct RtCore {
     Layout    layout;
     Aligner*  aligner;
     _Atomic int panner;      /* 0 = DBAP (moving observer); 1 = SPCAP; 2 = VBAP (both fixed observer); atomic for A/B */
+    _Atomic int dual_band;   /* 0 = single (power) panning; 1 = dual-band (amplitude LF / power HF); atomic for A/B */
+    float       xover_a;     /* one-pole LP coeff for the dual-band crossover (BW_DUALBAND_FC), rate-derived */
     uint32_t   layout_gen;   /* bumped on rt_set_layout; the SPCAP/VBAP caches compare it to self-invalidate */
     SpcapState spcap;        /* SPCAP cache (audio-thread-owned; rebuilt on listener/layout change) */
     VbapState  vbap;         /* VBAP cache (same) */
@@ -377,6 +382,7 @@ static void drain_commands(RtCore* c) {
             if (v && s) { v->sound = s; v->cursor = 0; v->loop = cmd->u.play.loop != 0;
                           v->oneshot = cmd->u.play.oneshot != 0; v->playing = true; v->dirty = true;
                           v->refl_g_cur = 0.f;                  /* fresh start: ramp the wet send up from 0, no stale burst */
+                          v->xover_lp = 0.f;                    /* fresh dual-band crossover state */
                           if (v->dop_on) dop_line_reset(c, v, BW_H_IDX(cmd->handle)); } } break;
         case CMD_STOP: { Voice* v = voice_for(c, cmd->handle);
             if (v) v->playing = false; } break;
@@ -508,6 +514,17 @@ static void compute_gains(RtCore* c, Voice* v) {
     else
         dbap_gains(v->pos_active, c->lis.p_active, &c->layout, v->gain_user, v->gtarget);
     if (v->spread > 1e-3f) spread_gains(c, v, v->gtarget);   /* widen the image if this source has size */
+
+    /* dual-band low band: the SAME gain directions, renormalised to amplitude (pressure) sum instead of
+     * power. The target sum is the power gains' OWN magnitude ||g||_2 (= gain_user * distance_atten, set
+     * by the panner) — NOT bare gain_user, which would cancel the distance attenuation and leave a
+     * distant source's bass at full level. So the LF coherent pressure sum matches the HF energy level
+     * at every distance. Always computed (cheap) so dual_band A/Bs live; the mixer reads it only when on. */
+    double gs = 0.0, gp = 0.0;
+    for (uint32_t k = 0; k < c->channels; ++k) { gs += v->gtarget[k]; gp += (double)v->gtarget[k] * v->gtarget[k]; }
+    if (gs > 1e-9) { float sc = (float)(sqrt(gp) / gs);
+        for (uint32_t k = 0; k < c->channels; ++k) v->gtarget_lo[k] = v->gtarget[k] * sc; }
+    else for (uint32_t k = 0; k < c->channels; ++k) v->gtarget_lo[k] = v->gtarget[k];
 }
 
 /* Mix one voice: read its sound at the cursor (looping or ending), spatialize through the
@@ -520,6 +537,14 @@ static void mix_voice(RtCore* c, Voice* v, uint16_t idx, float* bus, uint32_t n,
     float step[BW_CHANNELS];
     for (uint32_t ch = 0; ch < c->channels; ++ch)
         step[ch] = (v->gtarget[ch] - v->gcur[ch]) / (float)n;
+    /* dual-band panning: split each sample at BW_DUALBAND_FC; the low band uses amplitude-normalised
+     * gains (gcur_lo, better LF velocity vector), the high band the power gains. The complementary
+     * 1st-order crossover (hi = s - lo) sums flat, so it composes with everything upstream. */
+    const int dual = atomic_load_explicit(&c->dual_band, memory_order_acquire);
+    const float xover_a = c->xover_a;
+    float step_lo[BW_CHANNELS];
+    if (dual) for (uint32_t ch = 0; ch < c->channels; ++ch)
+        step_lo[ch] = (v->gtarget_lo[ch] - v->gcur_lo[ch]) / (float)n;
     /* gate the sim's publish on our own generation (we own v->gen, so this is race-free): apply the
      * published transmittance only if it was published for THIS occupant, else treat as clear. Read
      * once into a local so the ramp aims at and lands on the same value (invariant 4 — no jump). */
@@ -638,9 +663,18 @@ static void mix_voice(RtCore* c, Voice* v, uint16_t idx, float* bus, uint32_t n,
         if (!ended) ++cur;
         v->occ_cur += occ_step;
         v->dir_cur += dir_step;
-        for (uint32_t ch = 0; ch < c->channels; ++ch) {
-            bus[(size_t)ch * n + i] += v->gcur[ch] * s;
-            v->gcur[ch] += step[ch];
+        if (dual) {
+            float lo = v->xover_lp + xover_a * (s - v->xover_lp); v->xover_lp = lo;   /* LP @ 700 Hz */
+            float hi = s - lo;                                                        /* complementary HP */
+            for (uint32_t ch = 0; ch < c->channels; ++ch) {
+                bus[(size_t)ch * n + i] += v->gcur_lo[ch] * lo + v->gcur[ch] * hi;
+                v->gcur_lo[ch] += step_lo[ch]; v->gcur[ch] += step[ch];
+            }
+        } else {
+            for (uint32_t ch = 0; ch < c->channels; ++ch) {
+                bus[(size_t)ch * n + i] += v->gcur[ch] * s;
+                v->gcur[ch] += step[ch];
+            }
         }
     }
     v->cursor = cur;
@@ -648,6 +682,7 @@ static void mix_voice(RtCore* c, Voice* v, uint16_t idx, float* bus, uint32_t n,
     v->dir_cur = dir_tgt;
     if (v->air_on) v->air_a_cur = air_a_tgt;                     /* land the ramped propagation params */
     if (do_send)   v->refl_g_cur = refl_tgt;                     /* (the Doppler delay self-tracks per sample) */
+    if (dual) for (uint32_t ch = 0; ch < c->channels; ++ch) v->gcur_lo[ch] = v->gtarget_lo[ch];  /* land lo band */
     if (v->eq_engaged) {
         for (int b = 0; b < 3; ++b) for (int k = 0; k < 5; ++k) v->eq_co[b][k] = co_tgt[b][k];   /* land coeffs */
         if (flat) {                                              /* settled to passthrough: bypass + reset history */
@@ -996,6 +1031,7 @@ RtCore* rt_create(uint32_t voice_cap, uint32_t sound_cap, uint32_t sample_rate, 
     c->sound_cap   = sound_cap;
     c->channels    = channels;
     c->sample_rate = sample_rate;
+    c->xover_a     = 1.f - expf(-6.2831853f * BW_DUALBAND_FC / (float)sample_rate);   /* dual-band crossover */
     c->test_noise  = 0x9e3779b9u;       /* non-zero LCG seed for the channel-test noise */
     c->voices    = (Voice*)    calloc(voice_cap, sizeof(Voice));
     c->occ_handle = (_Atomic uint32_t*)calloc(voice_cap, sizeof(_Atomic uint32_t));
@@ -1074,6 +1110,13 @@ void rt_set_layout(RtCore* c, const Layout* L) {
 void rt_set_panner(RtCore* c, int panner) {
     if (!c) return;
     atomic_store_explicit(&c->panner, (panner >= 0 && panner <= 2) ? panner : 0, memory_order_release);
+}
+
+/* Dual-band panning: 0 = off (power panning across the band), 1 = on (amplitude below BW_DUALBAND_FC,
+ * power above). The low-band gains are computed every gain solve, so this is a live A/B atomic. */
+void rt_set_dual_band(RtCore* c, int on) {
+    if (!c) return;
+    atomic_store_explicit(&c->dual_band, on ? 1 : 0, memory_order_release);
 }
 
 /* Select the diffuse-bed decoder: 0 = sampling (SAD, default), 1 = AllRAD. Rebuilds the decode matrix

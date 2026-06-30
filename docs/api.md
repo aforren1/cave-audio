@@ -316,6 +316,7 @@ on that DVS channel; binaural: that bus channel HRTF'd as its virtual speaker). 
 typedef enum { BW_PAN_DBAP = 0, BW_PAN_SPCAP = 1, BW_PAN_VBAP = 2 } BwPanner;
 typedef enum { BW_DECODE_SAMPLING = 0, BW_DECODE_ALLRAD = 1 } BwBedDecoder;
 void     bw_set_panner(BwEngine* e, BwPanner panner);            // load-time (between create and start)
+void     bw_set_dual_band(BwEngine* e, bool on);                // live A/B; wraps the selected panner
 void     bw_set_bed_decoder(BwEngine* e, BwBedDecoder decoder);  // load-time
 uint32_t bw_get_speakers(BwEngine* e, float* xyz, uint32_t cap); // read back the layout; NULL xyz = count only
 ```
@@ -326,7 +327,12 @@ array. **SPCAP** is a smooth, all-speaker, placement-correcting sweet-spot panne
 observer (a static listener: don't track, set the sweet spot once); it conserves loudspeaker power
 across an uneven array. **VBAP** is the sharpest (2-3 nearest speakers), also fixed-observer, best on a
 cleanly-triangulable array (falls back to DBAP otherwise). The switch is atomic (safe live, e.g. the
-layout tool's `B` A/B). `bw_set_bed_decoder` chooses the **diffuse-bed** SH→26 decoder:
+layout tool's `B` A/B). `bw_set_dual_band` (off by default, live-toggleable) **wraps** the selected
+panner: it splits each source at ~700 Hz and pans the low band with **amplitude** (pressure /
+velocity-vector) normalisation, the high band with the panner's usual **power** (energy-vector)
+normalisation — sharper low-frequency localisation for a near-centred listener (SPAT's "VBP
+Dual-Band"). The panning *direction* is unchanged; only the low band's level/coherence differs. It is
+sweet-spot dependent like VBAP, so it's a by-ear/measurement call for a roaming listener. `bw_set_bed_decoder` chooses the **diffuse-bed** SH→26 decoder:
 **sampling** (default projection decode) or **AllRAD** (decode to a uniform virtual layout + VBAP onto
 the real array — robust on an irregular array, heavier load-time build). It affects the ambisonic +
 reflection beds only, not the point-source panner. Both are load-time; see

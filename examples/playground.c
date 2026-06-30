@@ -9,8 +9,8 @@
  *   1 Localization      — pure listener-relative DBAP. Move a source, turn your head, switch the
  *                         test signal (1-4); hear it localise around the 26-speaker array. SPACE
  *                         auto-moves it: orbit + near/far + high/low, sweeping the whole space.
- *                         Opt-in per-source effects: V Doppler, B air absorption, C source size, X a fast
- *                         straight flyby (X+V = the race-car pitch sweep; X+B = the brightness pumping with range).
+ *                         Opt-in per-source effects: V Doppler, B air absorption, C source size, M dual-band
+ *                         (amplitude LF / power HF panning), X a fast straight flyby (X+V = race-car pitch sweep).
  *   2 Occlusion+Materials — a real Steam Audio occluder. Push the source BEHIND the wall and the
  *                         off-thread sim attenuates + spectrally tilts it by the wall MATERIAL (M to
  *                         cycle concrete/glass/carpet/wood/metal); in FRONT, a mirror-image source
@@ -219,7 +219,7 @@ static void build_engine(int with_reverb);   /* fwd: the reverb scene rebuilds t
 /* ============================= Scene 1: Localization (pure DBAP) ============================= */
 /* auto-move (SPACE): a hands-free demo that circles the listener while breathing near<->far and
  * bobbing high<->low on three incommensurate periods, so the source sweeps the whole space over time. */
-static int   loc_auto, loc_flyby, loc_dop, loc_air;    /* loc_dop/loc_air/loc_spread persist across visits */
+static int   loc_auto, loc_flyby, loc_dop, loc_air, loc_dual;   /* loc_dop/loc_air/loc_spread/loc_dual persist */
 static float loc_t, loc_fly_t, loc_spread;
 enum { LOC_TRAIL = 96 };
 static Vector3 loc_trail[LOC_TRAIL];
@@ -230,6 +230,7 @@ static void loc_enter(void)  {
     bw_source_set_doppler(e, src, loc_dop);            /* re-apply (switch_scene cleared them) */
     bw_source_set_air_absorption(e, src, loc_air);
     bw_source_set_spread(e, src, loc_spread);
+    bw_set_dual_band(e, loc_dual);
 }
 static void loc_update(float dt) {
     if (IsKeyPressed(KEY_SPACE)) { loc_auto = !loc_auto; if (loc_auto) { loc_flyby = 0; loc_t = 0.0f; loc_trail_len = 0; } }
@@ -240,6 +241,7 @@ static void loc_update(float dt) {
         loc_spread = (loc_spread < 0.05f) ? 0.4f : (loc_spread < 0.5f) ? 0.7f : (loc_spread < 0.85f) ? 1.0f : 0.0f;
         bw_source_set_spread(e, src, loc_spread);
     }
+    if (IsKeyPressed(KEY_M)) { loc_dual = !loc_dual; bw_set_dual_band(e, loc_dual); }   /* dual-band A/B */
     if (loc_flyby) {                                      /* fast straight pass 0.8 m in front: the Doppler demo */
         loc_fly_t += dt;
         float period = 3.6f, u = fmodf(loc_fly_t, period) / period;     /* there-and-back, ~7.8 m/s */
@@ -276,8 +278,8 @@ static void loc_hud(int y) {
                         source_pos.x, source_pos.y, source_pos.z, head_yaw * 57.2958f,
                         (loc_auto || loc_flyby) ? "   (WASD paused while auto-move runs)" : ""),
              12, y + 22, 15, (Color){ 200, 200, 210, 255 });
-    DrawText(TextFormat("propagation:  [V] Doppler %s   [B] air absorption %s   [X] fast flyby %s   [C] size %.0f%%",
-                        loc_dop ? "ON" : "off", loc_air ? "ON" : "off", loc_flyby ? "ON" : "off", loc_spread * 100.0f),
+    DrawText(TextFormat("propagation:  [V] Doppler %s   [B] air absorption %s   [X] fast flyby %s   [C] size %.0f%%   [M] dual-band %s",
+                        loc_dop ? "ON" : "off", loc_air ? "ON" : "off", loc_flyby ? "ON" : "off", loc_spread * 100.0f, loc_dual ? "ON (LF amp)" : "off"),
              12, y + 44, 15, (Color){ 150, 225, 150, 255 });
 }
 
@@ -533,6 +535,7 @@ static void switch_scene(int idx) {
     bw_source_set_doppler(e, src, false);                        /* propagation/size effects are localization-scene only */
     bw_source_set_air_absorption(e, src, false);
     bw_source_set_spread(e, src, 0.0f);
+    bw_set_dual_band(e, false);
     source_yaw = 0.0f;
     bw_source_set_gain(e, src, SRC_GAIN);
     cur_scene = idx;

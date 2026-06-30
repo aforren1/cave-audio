@@ -65,6 +65,7 @@ void    rt_destroy(RtCore* c);
 void    rt_set_layout(RtCore* c, const Layout* L);   /* call before bw_start / while stopped */
 void    rt_set_panner(RtCore* c, int panner);        /* 0 = DBAP, 1 = SPCAP; call before bw_start */
 void    rt_set_bed_decoder(RtCore* c, int decoder);  /* 0 = sampling (SAD), 1 = AllRAD; before bw_start */
+void    rt_set_dual_band(RtCore* c, int on);         /* dual-band panning (amplitude LF / power HF); live A/B */
 
 /* Attach the internal tracker's pose slot (track_internal). When set, rt_render samples the
  * freshest head pose from it at block time, overriding the committed listener. NULL detaches.

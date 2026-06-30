@@ -96,6 +96,19 @@ first cut, not a final psychoacoustic model.
 > A listener move dirties every voice (concurrency.md), so this runs for all active
 > voices on move frames — keep it allocation-free and tight.
 
+## Dual-band panning (`bw_set_dual_band`, off by default)
+
+The panners normalise gains to constant **power** (`Σg² = gain²`, an energy-vector / `rE` pan) across
+the whole band — right for high frequencies, where the ear localises by energy. Below ~700 Hz the ear
+localises by summed **pressure** (the velocity vector `rV`), where **amplitude** normalisation
+(`Σg = gain`) gives a sharper image (it maximises `|rV|`). Dual-band panning (SPAT's "VBP Dual-Band")
+splits each source at a 700 Hz complementary 1st-order crossover (`hi = s − lo`, sums flat) and pans the
+low band amplitude-normalised, the high band power-normalised. `compute_gains` derives the low-band
+gains (`gtarget_lo`) every solve as the same directions rescaled to `Σg = gain`, so the *direction* is
+unchanged — only the low band's level/coherence. The mixer reads the second gain set only when the
+`dual_band` atomic is on, so it A/Bs live. It is sweet-spot dependent (like VBAP); the dense array +
+small working area is favourable, but whether it helps a *roaming* listener is a by-ear/rig call.
+
 ## Gain ramping
 
 `dbap_gains` writes `gtarget`. The mixer holds `gcur` and interpolates
