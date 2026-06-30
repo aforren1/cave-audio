@@ -64,6 +64,40 @@ the trim automatically).
   off-site. For the *spatial* version, do a second capture pass with in-ear/dummy-head mics → those
   IRs are BRIRs (direction + room); the omni pass gives timbre/reverb only.
 
+## Zylia ZM-1: full 3D from one placement
+
+`--localize` needs the omni mic at ≥5 spots because one omni gives only **distance**. The ZM-1 is 19
+capsules on a rigid ~10 cm sphere, so a single placement already records each sweep arriving at 19
+slightly-different times — and the arrival-time **differences** across the sphere are a
+**direction**. So a speaker's full position falls out of ONE Zylia placement: direction × distance +
+the array centre. This is the `--live` note's "for live 3D you'd need ≥4 fixed mics", delivered.
+
+The solve (`zylia.c`, `zylia_doa` / `zylia_localize`, unit-tested off-hardware in the `zylia` test by
+synthesizing the 19 arrivals from a known position and recovering it to machine precision):
+
+- **Direction** — least-squares fit of the 19 arrivals to the far-field model `τ_i = A − (R/c)(dir_i·d)`,
+  then a Gauss-Newton refine against the exact spherical wavefront. Latency-independent (uses the
+  differences), so it's precise — sub-degree given measure.c's sub-sample IR peak. This is the
+  headline: *where is every speaker, from one spot*, including the screen-hidden ones.
+- **Distance** — `c·(arrival − latency)`. The array is too small for the wavefront curvature across it
+  to self-calibrate the latency at metres (sub-mm of differential delay), so feed a loopback-measured
+  or `--localize`-recovered latency; then the distance is as good as that latency (~7 mm per sample).
+  Fuse with the omni `--localize` when you want both the one-shot directions and a sub-mm distance.
+
+**Spatial room capture** rides the same 19-channel sweep with no new DSP: `--room` already finds each
+early reflection's *time* (`er_delay`); window the 19-ch IR around each one and run `zylia_doa` on
+those arrivals to get each reflection's *direction*. That turns the room report from "how live" into
+"the first slap comes off the **left wall** at 6 ms" — i.e. *which* surface to treat, not just how
+much. (A full ambisonic room IR is the same capture encoded to higher order; the directional
+early-reflection map is the actionable part.)
+
+Integration is a rig-bound shell (like the ASIO capture): the ZM-1 presents as a 19-ch input, so a
+`calibrate --zylia` mode captures the sweep, deconvolves per channel (measure.c), feeds the 19
+arrivals to `zylia_localize`, and writes `cave_layout.json`. One caveat baked into the code: the
+capsule geometry in `zylia_geometry` is a **placeholder** spread — drop in the ZM-1 datasheet/surveyed
+capsule directions before trusting on-hardware DOA (the math is geometry-agnostic; only that table
+must match the real array).
+
 ## What feeds the engine
 
 `cave_layout.json` carries per-speaker `position`, `gain_db`, `delay_ms` (consumed by `dbap.c` +

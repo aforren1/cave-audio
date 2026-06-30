@@ -74,6 +74,7 @@ add_library(bw_core OBJECT
   src/natnet.c
   src/measure.c
   src/calib.c
+  src/zylia.c
   src/stream.c
   ${CJSON_C}
 )
@@ -265,6 +266,10 @@ if(BWAUDIO_BUILD_TESTS)
   add_executable(bw_calib_test test/calib_test.c)
   target_link_libraries(bw_calib_test PRIVATE bw_core)
   add_test(NAME calib COMMAND bw_calib_test)
+
+  add_executable(bw_zylia_test test/zylia_test.c)
+  target_link_libraries(bw_zylia_test PRIVATE bw_core)
+  add_test(NAME zylia COMMAND bw_zylia_test)
 
   # Directional reflection-bed check (with-SDK only): compiles the steam objects in + links phonon,
   # drives steam_reflect_tap directly, asserts the reverb is directional. Needs the alignment patch.

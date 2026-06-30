@@ -62,6 +62,8 @@ src/
   asio_sink.cpp        ASIO host: driver load, bufferSwitch, sample-pos timestamp. [M1]
   sound.h / sound.c    wav decode to mono float via dr_wav (Sound table lives in rt.c). [M3]
   layout.h / layout.c  speaker geometry load (cave_layout.json via cJSON) + default grid. [M4]
+  measure.c/calib.c    bw_calibrate DSP: sweep+deconvolution, trims, trilateration, room report. [calib]
+  zylia.h / zylia.c    Zylia ZM-1 single-position speaker localization (DOA + GN position). [calib]
   dbap.h / dbap.c      listener-relative, constant-power DBAP gain solve. [M4]
   align.h / align.c    per-speaker gain trim + delay-line output stage. [M4]
   binaural.h/binaural.c  head-oriented 26->stereo monitor (Steam Audio HRTF is the upgrade). [M5]
@@ -175,7 +177,14 @@ which recovers positions + the system latency jointly), and a **room report** (`
 reflections — a treatment diagnostic, NOT a model to match: matching double-counts the real room). `--save-irs`
 retains the per-speaker IR kernels (one capture serves trims, the room report, and a future headphone room
 simulator). The ASIO capture compiles but is unverified on hardware; `--simulate` runs the whole pipeline
-hardware-free. See docs/calibration.md.
+hardware-free. **Zylia ZM-1 single-position localization** (`zylia.c`, unit-tested off-hardware via the `zylia`
+test) is the one-placement complement to the multi-position omni survey: the 19-capsule sphere sees each sweep
+arrive at 19 times, so the arrival-time DIFFERENCES give a speaker's DIRECTION from ONE spot (latency-free,
+sub-degree — `zylia_doa`), and with the known latency a Gauss-Newton refine against the exact spherical
+wavefront gives the full position (`zylia_localize`). Distance is latency-limited (the array is too small to
+self-calibrate latency at metres). Spatial room capture reuses the same sweep windowed per early reflection →
+`zylia_doa` → which surface throws it. The 19-ch ASIO capture + the datasheet capsule geometry are the
+rig-bound shell. See docs/calibration.md.
 Remaining: the by-ear headphone check; and live Motive verification of M6 (parser + lifecycle are tested off-wire). Do not bake ASIO assumptions
 outside `asio_sink.cpp`, and do not link the NatNet SDK (proprietary; reference only — GPLv3).
 The atomics in `rt.c` need `/experimental:c11atomics` on MSVC (wired in CMake); `pose.h` uses
