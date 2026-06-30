@@ -52,6 +52,15 @@ int main(int argc, char** argv) {
     cfg.block_size  = 256;
     BwEngine* e = bw_create(&cfg);
     if (!e) { printf("bw_create failed\n"); return 1; }
+
+    /* configure the reflection bed + a box room (load-time; no-op without the Steam Audio SDK) so the
+     * profile includes the audio-thread reverb convolution — the heaviest consumer in the production path. */
+    BwReflectionConfig rc; memset(&rc, 0, sizeof rc);
+    rc.enabled = 1; rc.ir_seconds = 0.8f; rc.order = 1; rc.num_rays = 4096; rc.num_bounces = 8; rc.wet_gain = 1.0f;
+    bw_reflections_config(e, &rc);
+    BwMaterial faces[6] = { 0, 0, 0, 0, 0, 0 };
+    bw_scene_set_box(e, 8.0f, 4.0f, 8.0f, faces);
+
     if (bw_start(e) != 0) { const char* err = bw_last_error(e); printf("bw_start: %s\n", err ? err : "?"); }
 
     const char* WAV = "bw_bench.wav";

@@ -59,7 +59,9 @@ tracy-csvexport bench.tracy            # 3) per-zone CSV to stdout
 
 `tracy-csvexport` emits one row per zone with **count, total, mean, median, min, max, std (ns)**. The
 budget check is the `asio block` / `null block` (and `rt_render`) rows: `mean` and especially `max` must
-sit comfortably below 5333 ns (the 256/48 kHz period). The GUI's Statistics window has the same numbers
+sit comfortably below the block period (**5.33 ms = 5,333,333 ns** at 256/48 kHz). For reference, a
+16-voice load with all propagation effects + the reflection bed measures ~458 us mean / ~1550 us max
+(≈9% / 29% of budget). The GUI's Statistics window has the same numbers
 and an Export-to-CSV button.
 
 ## Real-time scheduling / MMCSS
