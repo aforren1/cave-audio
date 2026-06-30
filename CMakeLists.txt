@@ -72,6 +72,7 @@ add_library(bw_core OBJECT
   src/ambisonics.c
   src/allrad.c
   src/natnet.c
+  src/measure.c
   ${CJSON_C}
 )
 target_include_directories(bw_core PUBLIC src ${dr_libs_SOURCE_DIR} ${CJSON_INC})
@@ -249,6 +250,10 @@ if(BWAUDIO_BUILD_TESTS)
   add_executable(bw_ambi_test test/ambi_test.c)
   target_link_libraries(bw_ambi_test PRIVATE bw_core)
   add_test(NAME ambi COMMAND bw_ambi_test)
+
+  add_executable(bw_measure_test test/measure_test.c)
+  target_link_libraries(bw_measure_test PRIVATE bw_core)
+  add_test(NAME measure COMMAND bw_measure_test)
 
   # Directional reflection-bed check (with-SDK only): compiles the steam objects in + links phonon,
   # drives steam_reflect_tap directly, asserts the reverb is directional. Needs the alignment patch.
