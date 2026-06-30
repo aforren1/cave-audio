@@ -42,6 +42,54 @@ void calib_solve(const MeasureResult* m, const float (*pos)[3], const float mic[
     }
 }
 
+/* Gaussian elimination with partial pivoting on a 4x4 system A*x = b. Returns 0 if singular. */
+static int solve4(double A[4][4], double b[4], double x[4]) {
+    for (int c = 0; c < 4; ++c) {
+        int piv = c;
+        for (int r = c + 1; r < 4; ++r) if (fabs(A[r][c]) > fabs(A[piv][c])) piv = r;
+        if (fabs(A[piv][c]) < 1e-12) return 0;
+        if (piv != c) {
+            for (int j = 0; j < 4; ++j) { double t = A[c][j]; A[c][j] = A[piv][j]; A[piv][j] = t; }
+            double t = b[c]; b[c] = b[piv]; b[piv] = t;
+        }
+        for (int r = c + 1; r < 4; ++r) {
+            double f = A[r][c] / A[c][c];
+            for (int j = c; j < 4; ++j) A[r][j] -= f * A[c][j];
+            b[r] -= f * b[c];
+        }
+    }
+    for (int r = 3; r >= 0; --r) {
+        double s = b[r];
+        for (int j = r + 1; j < 4; ++j) s -= A[r][j] * x[j];
+        x[r] = s / A[r][r];
+    }
+    return 1;
+}
+
+int calib_trilaterate(const double* range, const float (*mic)[3], int K, float* pos_out, double* latency_out) {
+    if (!range || !mic || !pos_out || K < 5) return 0;
+    /* |x - m_k| = range[k] - r, with r = c*tau the unknown latency-range. Squaring and subtracting the
+     * k=0 equation cancels |x|^2 and r^2, leaving a system that's LINEAR in (x, r):
+     *   2*x.(m_k - m_0) - 2*r*(range[k]-range[0]) = |m_k|^2 - |m_0|^2 - range[k]^2 + range[0]^2.
+     * Stack k=1..K-1 and solve the 4x4 normal equations by least squares. */
+    const double m0[3] = { mic[0][0], mic[0][1], mic[0][2] };
+    const double r0 = range[0];
+    const double n0 = m0[0]*m0[0] + m0[1]*m0[1] + m0[2]*m0[2];
+    double AtA[4][4] = {{0}}, Atb[4] = {0};
+    for (int k = 1; k < K; ++k) {
+        double mk[3] = { mic[k][0], mic[k][1], mic[k][2] };
+        double row[4] = { 2.0*(mk[0]-m0[0]), 2.0*(mk[1]-m0[1]), 2.0*(mk[2]-m0[2]), -2.0*(range[k]-r0) };
+        double nk  = mk[0]*mk[0] + mk[1]*mk[1] + mk[2]*mk[2];
+        double rhs = nk - n0 - range[k]*range[k] + r0*r0;
+        for (int a = 0; a < 4; ++a) { for (int bb = 0; bb < 4; ++bb) AtA[a][bb] += row[a]*row[bb]; Atb[a] += row[a]*rhs; }
+    }
+    double th[4];
+    if (!solve4(AtA, Atb, th)) return 0;
+    pos_out[0] = (float)th[0]; pos_out[1] = (float)th[1]; pos_out[2] = (float)th[2];
+    if (latency_out) *latency_out = th[3];
+    return 1;
+}
+
 static char* read_file(const char* path, long* len_out) {
     FILE* f = fopen(path, "rb");
     if (!f) return NULL;
@@ -73,6 +121,44 @@ int calib_write_layout(const char* in_path, const char* out_path,
         cJSON* d  = cJSON_GetObjectItemCaseSensitive(sp, "delay_ms");
         if (g) cJSON_SetNumberValue(g, gain_db[i]);  else cJSON_AddNumberToObject(sp, "gain_db",  gain_db[i]);
         if (d) cJSON_SetNumberValue(d, delay_ms[i]); else cJSON_AddNumberToObject(sp, "delay_ms", delay_ms[i]);
+    }
+
+    outtext = cJSON_Print(root);
+    if (!outtext) FAIL("calib: failed to serialize layout");
+    FILE* f = fopen(out_path, "wb");
+    if (!f) FAIL("calib: cannot open output for writing");
+    fwrite(outtext, 1, strlen(outtext), f); fclose(f);
+    ok = 1;
+fail:
+    free(outtext); cJSON_Delete(root); free(text);
+    return ok;
+    #undef FAIL
+}
+
+int calib_write_positions(const char* in_path, const char* out_path, const float (*pos)[3], int n, char* err, size_t errcap) {
+    #define FAIL(msg) do { if (err && errcap) snprintf(err, errcap, "%s", msg); goto fail; } while (0)
+    char* text = NULL; cJSON* root = NULL; char* outtext = NULL; int ok = 0;
+
+    text = read_file(in_path, NULL);
+    if (!text) { if (err && errcap) snprintf(err, errcap, "calib: cannot read %s", in_path); return 0; }
+    root = cJSON_Parse(text);
+    if (!root) FAIL("calib: layout is not valid JSON");
+    cJSON* speakers = cJSON_GetObjectItemCaseSensitive(root, "speakers");
+    if (!cJSON_IsArray(speakers)) FAIL("calib: layout has no 'speakers' array");
+    if (cJSON_GetArraySize(speakers) != n) FAIL("calib: speaker count does not match the positions");
+
+    for (int i = 0; i < n; ++i) {
+        cJSON* sp = cJSON_GetArrayItem(speakers, i);
+        double xyz[3] = { round(pos[i][0]*1000.0)/1000.0, round(pos[i][1]*1000.0)/1000.0, round(pos[i][2]*1000.0)/1000.0 };
+        cJSON* p = cJSON_GetObjectItemCaseSensitive(sp, "position");
+        if (cJSON_IsArray(p) && cJSON_GetArraySize(p) == 3) {
+            for (int j = 0; j < 3; ++j) cJSON_SetNumberValue(cJSON_GetArrayItem(p, j), xyz[j]);
+        } else {
+            cJSON_DeleteItemFromObjectCaseSensitive(sp, "position");
+            cJSON* arr = cJSON_CreateArray();
+            for (int j = 0; j < 3; ++j) cJSON_AddItemToArray(arr, cJSON_CreateNumber(xyz[j]));
+            cJSON_AddItemToObject(sp, "position", arr);
+        }
     }
 
     outtext = cJSON_Print(root);

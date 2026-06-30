@@ -49,6 +49,14 @@ static void write_wav_f32(const char* path, const float* x, int n, int fs) {
     fwrite("data",1,4,f); fwrite(&ds,4,1,f); fwrite(x,4,(size_t)n,f); fclose(f);
 }
 
+/* read mic positions ("x y z" per line) for --localize; returns the count (<= maxK) */
+static int read_positions(const char* path, float (*out)[3], int maxK) {
+    FILE* f = fopen(path, "r"); if (!f) return 0;
+    int k = 0;
+    while (k < maxK && fscanf(f, "%f %f %f", &out[k][0], &out[k][1], &out[k][2]) == 3) ++k;
+    fclose(f); return k;
+}
+
 /* ----- simulate backend: synthesize what an ideal rig would capture for speaker `ch` ----- */
 static void simulate_capture(int ch, const Layout* L, const float* mic, const float* sweep, float* cap) {
     memset(cap, 0, (size_t)CAPLEN * sizeof(float));
@@ -200,6 +208,7 @@ int main(int argc, char** argv) {
     float mic[3] = { 0.f, 0.f, 0.f };
     int   mic_in = 0, simulate = 0, room = 0;
     const char* ir_prefix = NULL;
+    const char* localize_file = NULL;
     for (int i = 1; i < argc; ++i) {
         if      (!strcmp(argv[i],"--layout") && i+1<argc) layout_path = argv[++i];
         else if (!strcmp(argv[i],"--out")    && i+1<argc) out_path    = argv[++i];
@@ -208,8 +217,9 @@ int main(int argc, char** argv) {
         else if (!strcmp(argv[i],"--simulate"))           simulate    = 1;
         else if (!strcmp(argv[i],"--room"))               room        = 1;   /* RT60 + early reflections report */
         else if (!strcmp(argv[i],"--save-irs") && i+1<argc) ir_prefix = argv[++i];  /* dump per-speaker IR WAVs */
+        else if (!strcmp(argv[i],"--localize") && i+1<argc) localize_file = argv[++i]; /* mic-positions file -> solve speaker positions */
         else if (!strcmp(argv[i],"--mic") && i+3<argc) { mic[0]=(float)atof(argv[++i]); mic[1]=(float)atof(argv[++i]); mic[2]=(float)atof(argv[++i]); }
-        else { fprintf(stderr, "usage: calibrate [--layout f] [--out f] [--mic x y z] [--input ch] [--driver name] [--simulate] [--room] [--save-irs prefix]\n"); return 2; }
+        else { fprintf(stderr, "usage: calibrate [--layout f] [--out f] [--mic x y z] [--input ch] [--driver name] [--simulate] [--room] [--save-irs prefix] [--localize positions.txt]\n"); return 2; }
     }
     if (!out_path) out_path = layout_path;                    /* in-place by default */
 
@@ -235,6 +245,50 @@ int main(int argc, char** argv) {
 #else
     if (!simulate) { fprintf(stderr, "calibrate: built without ASIO; re-run with --simulate or build the ASIO backend\n"); return 1; }
 #endif
+
+    /* --- self-localization: capture at K known mic positions, trilaterate each speaker --- */
+    if (localize_file) {
+        float micpos[64][3];
+        int K = read_positions(localize_file, micpos, 64);
+        if (K < 5) {
+            fprintf(stderr, "calibrate: --localize needs >= 5 non-coplanar mic positions in %s (got %d)\n", localize_file, K);
+#ifdef BW_HAVE_ASIO
+            if (asio_up) asio_close();
+#endif
+            return 1;
+        }
+        printf("localize: %d mic positions, %d speakers each\n", K, n);
+        double* range = (double*)malloc((size_t)n * K * sizeof(double));
+        for (int k = 0; k < K; ++k) {
+            if (!simulate) { printf("  -> place the mic at (%.2f %.2f %.2f) and press Enter...", micpos[k][0], micpos[k][1], micpos[k][2]); fflush(stdout); getchar(); }
+            for (int s = 0; s < n; ++s) {
+                if (simulate) simulate_capture(s, &L, micpos[k], sweep, cap);
+#ifdef BW_HAVE_ASIO
+                else if (!asio_capture(s)) { fprintf(stderr, "calibrate: capture timed out (spk %d, pos %d)\n", s, k); asio_close(); return 1; }
+#endif
+                MeasureResult r; measure_response(cap, CAPLEN, sweep, NSWEEP, F1, F2, FS, BAND_HZ, &r);
+                range[(size_t)s * K + k] = (double)r.delay_samples * 343.0 / FS;   /* c*delay, meters (latency included) */
+            }
+        }
+#ifdef BW_HAVE_ASIO
+        if (asio_up) asio_close();
+#endif
+        float (*pos)[3] = (float(*)[3])malloc((size_t)n * 3 * sizeof(float));
+        int failed = 0;
+        for (int s = 0; s < n; ++s) {
+            double lat = 0;
+            if (!calib_trilaterate(&range[(size_t)s * K], micpos, K, pos[s], &lat)) {
+                fprintf(stderr, "  spk %2d: trilateration failed (degenerate mic positions?)\n", s);
+                pos[s][0] = pos[s][1] = pos[s][2] = 0.f; ++failed;
+            } else {
+                printf("  spk %2d: pos=(%+.3f %+.3f %+.3f)  [system latency %.3f m]\n", s, pos[s][0], pos[s][1], pos[s][2], lat);
+            }
+        }
+        if (!calib_write_positions(layout_path, out_path, pos, n, err, sizeof err)) { fprintf(stderr, "calibrate: %s\n", err); return 1; }
+        printf("localize: wrote %d positions to %s%s\n", n, out_path, failed ? "  (some failed, set to 0)" : "");
+        free(range); free(pos); free(res); free(cap); free(sweep);
+        return 0;
+    }
 
     for (int i = 0; i < n; ++i) {
         if (simulate) {

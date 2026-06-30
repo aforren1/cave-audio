@@ -31,6 +31,18 @@ void calib_solve(const MeasureResult* m, const float (*pos)[3], const float mic[
 int calib_write_layout(const char* in_path, const char* out_path,
                        const float* gain_db, const float* delay_ms, int n, char* err, size_t errcap);
 
+/* Acoustic self-localization: solve one speaker's 3D position from its measured RANGE (= c * delay,
+ * in meters, latency INCLUDED) to K known mic positions. The unknown constant system latency is
+ * recovered jointly (as a range, c*tau) by linear least squares — so no separate loopback is needed.
+ * Needs K >= 5 non-coplanar mic positions (more = more robust). `mic[k]` and `pos_out` are room meters.
+ * Returns 1 + pos_out (+ latency_out = recovered c*tau if non-NULL); 0 if underdetermined/singular.
+ * This sees speakers OPTICAL trackers can't (the sweep passes through acoustically-transparent screens). */
+int calib_trilaterate(const double* range, const float (*mic)[3], int K, float* pos_out, double* latency_out);
+
+/* Write recovered speaker positions back into the layout JSON (sets each speaker's "position" [x,y,z],
+ * preserving everything else). `pos[i]` are room meters; the file's speaker count must equal `n`. */
+int calib_write_positions(const char* in_path, const char* out_path, const float (*pos)[3], int n, char* err, size_t errcap);
+
 #ifdef __cplusplus
 }
 #endif
