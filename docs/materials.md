@@ -396,3 +396,29 @@ dominate. A deployment requirement, noted here so it is designed for, not discov
     (the spectral tilt / biquad described above — the "3-band EQ" half of the direct stage) is **not
     yet built**; that and **directivity** are the next increment on this same pre-pan stage.
 - **Reflection bed, perceptual mode, directivity — designed, not yet implemented** (this document).
+
+## Baking & pathing — available in phonon, deliberately not wired
+
+Steam Audio supports two more reflection/propagation features the engine does **not** currently wire
+up, by choice:
+
+- **Baked reflections** (`iplReflectionsBakerBake` over an `IPLProbeBatch`): precompute the reverb at
+  a probe grid offline so the runtime looks it up instead of ray-tracing. For *this* installation the
+  payoff is marginal — the reflection ray-trace already runs off the audio thread (`steam_reflect.c`,
+  `THREAD_PRIORITY_BELOW_NORMAL`) and the Tracy profile showed CPU headroom, so baking mostly moves an
+  already-off-thread cost offline. Landing it correctly is also non-trivial: `UNIFORMFLOOR` probe
+  generation is sensitive to the floor mesh winding, and the baked **directional** early-reflection
+  retrieval (`BAKECONVOLUTION`) has to be coaxed through the hybrid effect — all of it trial-and-error
+  against phonon's runtime with no way to ear-check it off-site. A spike got the bake running but
+  producing near-silent, non-directional reverb at an off-centre listener; it was reverted rather than
+  shipped half-working.
+- **Pathing** (`IPL_SIMULATIONFLAGS_PATHING`, `iplPathBakerBake`): route sound around occluders /
+  through portals via the same probe network. Only pays off if the space has real occluders to bend
+  sound around — an open CAVE mostly doesn't — and it carries the same probe machinery + blind
+  debugging as baking.
+
+Both are clean extensions if a future space needs them (baking plugs into the bed source's
+`IPLSimulationInputs.baked`; pathing is a per-source field decoded to the bus like the reflection
+bed), and both are best brought up **at the rig**, where the result can actually be heard. Until then
+they stay unwired — phonon exposes them, the seam accommodates them, but the engine doesn't pay for
+features it can't currently verify or benefit from.
