@@ -90,6 +90,26 @@ int calib_trilaterate(const double* range, const float (*mic)[3], int K, float* 
     return 1;
 }
 
+static int dcmp(const void* a, const void* b) {
+    double x = *(const double*)a, y = *(const double*)b; return x < y ? -1 : x > y ? 1 : 0;
+}
+
+void calib_check_drift(const double* range, const float (*pos)[3], const float mic[3], int n, float* deviation_m) {
+    if (!range || !pos || !mic || !deviation_m || n <= 0) return;
+    double* resid = (double*)malloc((size_t)n * sizeof(double));
+    double* tmp   = (double*)malloc((size_t)n * sizeof(double));
+    if (!resid || !tmp) { free(resid); free(tmp); return; }
+    for (int s = 0; s < n; ++s) {                              /* residual = range - expected distance = the common latency if unmoved */
+        double dx = pos[s][0]-mic[0], dy = pos[s][1]-mic[1], dz = pos[s][2]-mic[2];
+        resid[s] = range[s] - sqrt(dx*dx + dy*dy + dz*dz);
+        tmp[s] = resid[s];
+    }
+    qsort(tmp, (size_t)n, sizeof(double), dcmp);              /* median residual = the system latency (outlier-robust) */
+    double med = (n & 1) ? tmp[n/2] : 0.5 * (tmp[n/2 - 1] + tmp[n/2]);
+    for (int s = 0; s < n; ++s) deviation_m[s] = (float)(resid[s] - med);
+    free(resid); free(tmp);
+}
+
 static char* read_file(const char* path, long* len_out) {
     FILE* f = fopen(path, "rb");
     if (!f) return NULL;

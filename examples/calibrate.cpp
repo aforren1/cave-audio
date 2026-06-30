@@ -63,10 +63,14 @@ static void simulate_capture(int ch, const Layout* L, const float* mic, const fl
     const float* p = L->speakers[ch].pos;
     double dist = sqrt((p[0]-mic[0])*(p[0]-mic[0]) + (p[1]-mic[1])*(p[1]-mic[1]) + (p[2]-mic[2])*(p[2]-mic[2]));
     if (dist < 0.05) dist = 0.05;
-    int   delay = 512 + (int)(dist / 343.0 * FS);                 /* system latency + time of flight */
+    double delay_f = 512.0 + dist / 343.0 * FS;                   /* system latency + time of flight (fractional) */
+    int    di = (int)delay_f; float frac = (float)(delay_f - di);
     double sens = 1.0 + 0.15 * sin(ch * 1.3);                     /* deterministic +/- ~1.4 dB wobble */
     float  g    = (float)(sens / dist);                           /* 1/r at the mic */
-    for (int i = 0; i < NSWEEP && delay + i < CAPLEN; ++i) cap[delay + i] = g * sweep[i];
+    for (int i = 0; i < NSWEEP && di + i + 1 < CAPLEN; ++i) {     /* fractional delay via linear interp */
+        cap[di + i]     += g * sweep[i] * (1.f - frac);
+        cap[di + i + 1] += g * sweep[i] * frac;
+    }
 }
 
 #ifdef BW_HAVE_ASIO
@@ -76,6 +80,7 @@ static void simulate_capture(int ch, const Layout* L, const float* mic, const fl
 #include "asio.h"
 #include "asiodrivers.h"
 #include <windows.h>
+#include <conio.h>
 #include <atomic>
 
 extern AsioDrivers* asioDrivers;
@@ -206,7 +211,8 @@ int main(int argc, char** argv) {
     const char* out_path    = NULL;
     const char* driver      = getenv("BWAUDIO_ASIO_DRIVER");
     float mic[3] = { 0.f, 0.f, 0.f };
-    int   mic_in = 0, simulate = 0, room = 0;
+    int   mic_in = 0, simulate = 0, room = 0, check = 0, live_speaker = -1;
+    double known_latency = -1.0;
     const char* ir_prefix = NULL;
     const char* localize_file = NULL;
     for (int i = 1; i < argc; ++i) {
@@ -218,8 +224,11 @@ int main(int argc, char** argv) {
         else if (!strcmp(argv[i],"--room"))               room        = 1;   /* RT60 + early reflections report */
         else if (!strcmp(argv[i],"--save-irs") && i+1<argc) ir_prefix = argv[++i];  /* dump per-speaker IR WAVs */
         else if (!strcmp(argv[i],"--localize") && i+1<argc) localize_file = argv[++i]; /* mic-positions file -> solve speaker positions */
+        else if (!strcmp(argv[i],"--check"))              check       = 1;   /* flag speakers nudged from the stored layout */
+        else if (!strcmp(argv[i],"--live") && i+1<argc)   live_speaker= atoi(argv[++i]); /* live distance readout for one speaker */
+        else if (!strcmp(argv[i],"--latency") && i+1<argc) known_latency = atof(argv[++i]); /* c*tau meters, for --live absolute distance */
         else if (!strcmp(argv[i],"--mic") && i+3<argc) { mic[0]=(float)atof(argv[++i]); mic[1]=(float)atof(argv[++i]); mic[2]=(float)atof(argv[++i]); }
-        else { fprintf(stderr, "usage: calibrate [--layout f] [--out f] [--mic x y z] [--input ch] [--driver name] [--simulate] [--room] [--save-irs prefix] [--localize positions.txt]\n"); return 2; }
+        else { fprintf(stderr, "usage: calibrate [--layout f] [--out f] [--mic x y z] [--input ch] [--driver name] [--simulate] [--room] [--save-irs prefix] [--localize positions.txt] [--check] [--live N] [--latency m]\n"); return 2; }
     }
     if (!out_path) out_path = layout_path;                    /* in-place by default */
 
@@ -267,7 +276,7 @@ int main(int argc, char** argv) {
                 else if (!asio_capture(s)) { fprintf(stderr, "calibrate: capture timed out (spk %d, pos %d)\n", s, k); asio_close(); return 1; }
 #endif
                 MeasureResult r; measure_response(cap, CAPLEN, sweep, NSWEEP, F1, F2, FS, BAND_HZ, &r);
-                range[(size_t)s * K + k] = (double)r.delay_samples * 343.0 / FS;   /* c*delay, meters (latency included) */
+                range[(size_t)s * K + k] = ((double)r.delay_samples + r.delay_frac) * 343.0 / FS; /* c*delay, meters (sub-sample) */
             }
         }
 #ifdef BW_HAVE_ASIO
@@ -287,6 +296,68 @@ int main(int argc, char** argv) {
         if (!calib_write_positions(layout_path, out_path, pos, n, err, sizeof err)) { fprintf(stderr, "calibrate: %s\n", err); return 1; }
         printf("localize: wrote %d positions to %s%s\n", n, out_path, failed ? "  (some failed, set to 0)" : "");
         free(range); free(pos); free(res); free(cap); free(sweep);
+        return 0;
+    }
+
+    /* --- drift check: one fast pass from the mic position, flag anything nudged --- */
+    if (check) {
+        float (*pos)[3] = (float(*)[3])malloc((size_t)n * 3 * sizeof(float));
+        for (int s = 0; s < n; ++s) { pos[s][0]=L.speakers[s].pos[0]; pos[s][1]=L.speakers[s].pos[1]; pos[s][2]=L.speakers[s].pos[2]; }
+        double* range = (double*)malloc((size_t)n * sizeof(double));
+        for (int s = 0; s < n; ++s) {
+            if (simulate) simulate_capture(s, &L, mic, sweep, cap);
+#ifdef BW_HAVE_ASIO
+            else if (!asio_capture(s)) { fprintf(stderr, "calibrate: capture timed out (spk %d)\n", s); asio_close(); return 1; }
+#endif
+            MeasureResult r; measure_response(cap, CAPLEN, sweep, NSWEEP, F1, F2, FS, BAND_HZ, &r);
+            range[s] = ((double)r.delay_samples + r.delay_frac) * 343.0 / FS;
+        }
+#ifdef BW_HAVE_ASIO
+        if (asio_up) asio_close();
+#endif
+        float* dev = (float*)malloc((size_t)n * sizeof(float));
+        calib_check_drift(range, pos, mic, n, dev);
+        const float tol = 0.02f; int flagged = 0;
+        printf("drift check (mic at %.2f %.2f %.2f, tolerance %.0f mm):\n", mic[0], mic[1], mic[2], tol * 1000.f);
+        for (int s = 0; s < n; ++s) {
+            printf("  spk %2d: %+6.1f mm%s\n", s, dev[s] * 1000.0, fabs(dev[s]) > tol ? "   <-- MOVED" : "");
+            if (fabs(dev[s]) > tol) ++flagged;
+        }
+        printf("drift: %d speaker(s) beyond %.0f mm\n", flagged, tol * 1000.f);
+        free(pos); free(range); free(dev); free(res); free(cap); free(sweep);
+        return flagged ? 3 : 0;
+    }
+
+    /* --- live: repeatedly measure one speaker's distance while you position it --- */
+    if (live_speaker >= 0) {
+        if (live_speaker >= n) { fprintf(stderr, "calibrate: --live %d out of range (0..%d)\n", live_speaker, n - 1); return 1; }
+        float* tp = L.speakers[live_speaker].pos;
+        double dx = tp[0]-mic[0], dy = tp[1]-mic[1], dz = tp[2]-mic[2];
+        double target = sqrt(dx*dx + dy*dy + dz*dz);
+        printf("live: speaker %d, target %.3f m from the mic (%.2f %.2f %.2f). Move it; press a key to stop.\n",
+               live_speaker, target, mic[0], mic[1], mic[2]);
+        int iters = simulate ? 4 : (1 << 30);
+        for (int t = 0; t < iters; ++t) {
+            if (simulate) simulate_capture(live_speaker, &L, mic, sweep, cap);
+#ifdef BW_HAVE_ASIO
+            else {
+                if (!asio_capture(live_speaker)) { fprintf(stderr, "\ncalibrate: capture timed out\n"); asio_close(); return 1; }
+                if (_kbhit()) { _getch(); break; }
+            }
+#endif
+            MeasureResult r; measure_response(cap, CAPLEN, sweep, NSWEEP, F1, F2, FS, BAND_HZ, &r);
+            double range = ((double)r.delay_samples + r.delay_frac) * 343.0 / FS;
+            if (known_latency >= 0.0)
+                printf("\r  distance %.3f m   target %.3f   delta %+.1f cm        ", range - known_latency, target, (range - known_latency - target) * 100.0);
+            else
+                printf("\r  range %.3f m (distance + latency; pass --latency m for absolute)        ", range);
+            fflush(stdout);
+        }
+        printf("\n");
+#ifdef BW_HAVE_ASIO
+        if (asio_up) asio_close();
+#endif
+        free(res); free(cap); free(sweep);
         return 0;
     }
 

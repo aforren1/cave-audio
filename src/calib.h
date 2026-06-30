@@ -43,6 +43,14 @@ int calib_trilaterate(const double* range, const float (*mic)[3], int K, float* 
  * preserving everything else). `pos[i]` are room meters; the file's speaker count must equal `n`. */
 int calib_write_positions(const char* in_path, const char* out_path, const float (*pos)[3], int n, char* err, size_t errcap);
 
+/* Drift check: given measured ranges (c*delay, meters, latency included) from ONE mic at `mic` to n
+ * speakers at their STORED positions `pos`, report each speaker's RADIAL deviation (meters) from where
+ * it should be. The unknown common latency is removed as the MEDIAN residual (robust to a few moved
+ * speakers), so a speaker bumped toward/away from the mic shows up as a non-zero deviation — one
+ * fast single-position pass flags anything nudged. (Purely tangential moves don't change the range;
+ * a full re-survey is calib_trilaterate.) */
+void calib_check_drift(const double* range, const float (*pos)[3], const float mic[3], int n, float* deviation_m);
+
 #ifdef __cplusplus
 }
 #endif

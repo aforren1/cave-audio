@@ -124,7 +124,16 @@ int measure_response(const float* capture, int ncap, const float* ref, int nref,
     float* ir = NULL;
     int L = deconvolve(capture, ncap, ref, nref, f1, f2, fs, band_hz, &out->level, out->band, &ir);
     if (!L) return 0;
-    out->delay_samples = ir_peak(ir, 0, ncap < L ? ncap : L);   /* physical arrival = strongest tap */
+    int p = ir_peak(ir, 0, ncap < L ? ncap : L);                /* physical arrival = strongest tap */
+    out->delay_samples = p;
+    /* sub-sample refinement: fit a parabola to |IR| at the peak and its neighbours (true peak of a
+     * band-limited arrival lands between samples). Lifts delay precision from ~7 mm to well under 1 mm. */
+    out->delay_frac = 0.f;
+    if (p >= 1 && p + 1 < L) {
+        float a = fabsf(ir[p-1]), b = fabsf(ir[p]), c = fabsf(ir[p+1]);
+        float den = a - 2.f*b + c;
+        if (den < 0.f) { float d = 0.5f * (a - c) / den; if (d > -0.5f && d < 0.5f) out->delay_frac = d; }
+    }
     free(ir);
     return 1;
 }

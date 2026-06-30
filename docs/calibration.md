@@ -49,6 +49,15 @@ the trim automatically).
   You cannot DSP the room away for a moving listener (reverb is non-invertible, position-dependent),
   so the lever is physical treatment. The binaural monitor (headphones, room-free) is the clean
   reference; comparing array-vs-monitor measures how much the room is adding.
+- **`--check`** — drift detector. One fast pass from the mic position; `calib_check_drift` compares
+  each speaker's measured distance to its stored position (removing the common latency as the median
+  residual, so it's robust to a few moved speakers) and flags anything beyond ~20 mm. Catches a bumped
+  speaker in seconds. Radial only (a purely tangential move doesn't change the distance) — re-run
+  `--localize` for a full re-survey. Exit code 3 if anything is flagged (scriptable).
+- **`--live N`** — positioning aid: repeatedly measures speaker N's distance from the mic while you
+  move it (`--latency m`, from a prior `--localize`, turns the reading into absolute distance + delta
+  from the layout target; press a key to stop). One omni mic gives **distance**, not full 3D — for
+  live 3D you'd need ≥4 fixed mics. Sub-sample peak interpolation puts the reading at well under 1 mm.
 - **`--save-irs prefix`** — dump the per-speaker impulse responses (the deconvolved kernels). One
   capture session therefore serves trims, the room report, AND a future **headphone room simulator**:
   convolving these IRs into the binaural monitor previews the installed sound while developing

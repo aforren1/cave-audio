@@ -27,6 +27,7 @@ extern "C" {
 
 typedef struct {
     int   delay_samples;   /* IR peak position (system latency + speaker->mic time of flight) */
+    float delay_frac;      /* sub-sample refinement of the peak [-0.5,0.5]; true delay = delay_samples + delay_frac */
     float level;           /* in-band mean |H(f)| — broadband sensitivity (linear, ref-normalized) */
     float band[3];         /* low / mid / high mean |H(f)| (diagnostic; not written to the layout) */
 } MeasureResult;

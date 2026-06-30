@@ -56,6 +56,21 @@ int main(void) {
         }
         free(cap);
     }
+    /* --- sub-sample delay: a fractionally-delayed capture recovers the fractional part --- */
+    {
+        const int di = 137; const float frac = 0.4f;            /* true delay 137.4 samples */
+        const int ncap2 = nref + di + 4800;
+        float* capf = (float*)calloc((size_t)ncap2, sizeof(float));
+        for (int i = 0; i < nref; ++i) { capf[di+i] += sweep[i]*(1.f-frac); capf[di+i+1] += sweep[i]*frac; }
+        MeasureResult r;
+        measure_response(capf, ncap2, sweep, nref, f1, f2, fs, band_hz, &r);
+        double rec = r.delay_samples + r.delay_frac;
+        printf("subsample: %d + %.3f = %.3f (want 137.40)\n", r.delay_samples, r.delay_frac, rec);
+        CHECK(r.delay_frac > 0.1f, "sub-sample fraction points toward the true peak");
+        CHECK(fabs(rec - 137.4) < 0.2, "sub-sample estimate well inside the 0.4-sample integer error");
+        free(capf);
+    }
+
     free(sweep);
 
     /* --- RT60: a synthetic exponential-decay tail with a known reverberation time --- */

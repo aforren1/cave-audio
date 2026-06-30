@@ -136,7 +136,25 @@ int main(void) {
         }
     }
 
+    /* drift check: one nudged speaker shows its deviation; the rest stay ~0 (latency removed) */
+    {
+        float pos[5][3] = { {1,0,0}, {0,1.5f,0}, {-1,0,0.5f}, {0,0,2}, {1,1,1} };
+        float mic[3] = { 0,0,0 };
+        double lat = 3.66, range[5];
+        for (int s = 0; s < 5; ++s) {
+            double d = sqrt((double)pos[s][0]*pos[s][0] + pos[s][1]*pos[s][1] + pos[s][2]*pos[s][2]);
+            range[s] = lat + d;
+        }
+        range[2] += 0.05;                                      /* speaker 2 bumped 5 cm farther */
+        float dev[5];
+        calib_check_drift(range, pos, mic, 5, dev);
+        printf("drift: dev=[%.3f %.3f %.3f %.3f %.3f]\n", dev[0], dev[1], dev[2], dev[3], dev[4]);
+        CHECK(fabs(dev[2] - 0.05) < 0.005, "flags the 5 cm nudge on speaker 2");
+        CHECK(fabs(dev[0]) < 0.005 && fabs(dev[1]) < 0.005 && fabs(dev[3]) < 0.005 && fabs(dev[4]) < 0.005,
+              "unmoved speakers read ~0 (common latency removed by the median)");
+    }
+
     if (fails) { printf("calib_test: %d FAILURES\n", fails); return 1; }
-    printf("calib_test OK (delay align, sensitivity EQ, dead-speaker guard, JSON writeback, trilateration, position writeback verified)\n");
+    printf("calib_test OK (delay align, sensitivity EQ, dead-speaker guard, writeback, trilateration, positions, drift-check verified)\n");
     return 0;
 }
