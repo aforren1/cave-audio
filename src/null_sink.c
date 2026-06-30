@@ -8,6 +8,7 @@
  * the audio-thread invariants; the pacing (Sleep) happens *outside* the callback.
  */
 #include "sink.h"
+#include "profile.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -42,6 +43,7 @@ static void null_set_err(char* err, size_t cap, const char* msg) {
 
 static DWORD WINAPI null_thread(LPVOID arg) {
     NullSink* s = (NullSink*)arg;
+    BW_THREAD_NAME("bw-audio (null)");       /* same render() the ASIO callback drives — profile w/o hardware */
     LARGE_INTEGER lf; QueryPerformanceFrequency(&lf);
     const uint64_t freq = (uint64_t)lf.QuadPart;
     timeBeginPeriod(1);                      /* ~1ms Sleep granularity */
@@ -55,8 +57,11 @@ static DWORD WINAPI null_thread(LPVOID arg) {
             .sample_pos     = sample_pos,
             .system_time_ns = ticks_to_ns(qpc_now() - base, freq),
         };
+        BW_ZONE_BEGIN(zb, "null block");
         s->render(s->user, s->bus, s->block_size, &ts);   /* engine produces a block */
         /* null sink: the rendered bus is intentionally discarded. */
+        BW_ZONE_END(zb);
+        BW_FRAME_MARK();
 
         sample_pos  += s->block_size;
         block_index += 1;

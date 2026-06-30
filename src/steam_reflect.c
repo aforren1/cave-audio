@@ -14,6 +14,7 @@
  */
 #include "steam_reflect.h"
 #include "ambisonics.h"   /* BW_AMBI_CH (max ambisonic channel count for scratch sizing) */
+#include "profile.h"
 
 #include <phonon.h>
 
@@ -96,6 +97,8 @@ static int refl_read(SteamReflect* r, IPLReflectionEffectParams* out) {
 
 static DWORD WINAPI sim_thread(LPVOID arg) {
     SteamReflect* r = (SteamReflect*)arg;
+    BW_THREAD_NAME("bw-sim (reflections)");
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);  /* never preempt the audio callback */
     while (!r->stop) {
         float lp[3], lq[4]; rt_read_pose(r->rt, lp, lq); (void)lq;
 
@@ -118,7 +121,9 @@ static DWORD WINAPI sim_thread(LPVOID arg) {
         sh.irradianceMinDistance = 1.0f;
         iplSimulatorSetSharedInputs(r->sim, IPL_SIMULATIONFLAGS_REFLECTIONS, &sh);
 
+        BW_ZONE_BEGIN(zr, "reflection ray-trace");
         iplSimulatorRunReflections(r->sim);
+        BW_ZONE_END(zr);
 
         IPLSimulationOutputs out; memset(&out, 0, sizeof out);
         iplSourceGetOutputs(r->bed, IPL_SIMULATIONFLAGS_REFLECTIONS, &out);

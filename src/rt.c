@@ -14,6 +14,7 @@
 #include "align.h"
 #include "ambisonics.h"   /* SH->26 decode for ambisonic beds */
 #include "allrad.h"       /* robust SH->26 decode for irregular arrays */
+#include "profile.h"      /* Tracy zones/plots (no-ops unless BWAUDIO_TRACY=ON) */
 
 #include <math.h>
 #include <stdatomic.h>
@@ -710,6 +711,7 @@ void rt_render(RtCore* c, float* bus, uint32_t nframes, const BwTimestamp* ts) {
     _MM_SET_FLUSH_ZERO_MODE(_MM_FLUSH_ZERO_ON);
     _MM_SET_DENORMALS_ZERO_MODE(_MM_DENORMALS_ZERO_ON);
 #endif
+    BW_ZONE_BEGIN(zr, "rt_render");
     drain_commands(c);
 
     /* track_internal: sample the freshest tracked head pose at block time, overriding the
@@ -729,21 +731,31 @@ void rt_render(RtCore* c, float* bus, uint32_t nframes, const BwTimestamp* ts) {
     /* the reflection aux send: collected this block if a tap is registered + the block fits the scratch */
     float* aux = (c->bus_tap && nframes <= BW_RT_MAX_BLOCK) ? c->aux : NULL;
     if (aux) memset(aux, 0, sizeof(float) * (size_t)nframes);
+    int rt_active = 0;
+    BW_ZONE_BEGIN(zmix, "mix voices");
     for (uint32_t i = 0; i < c->voice_cap; ++i) {
         Voice* v = &c->voices[i];
         if (!v->active || !v->playing || !v->sound) continue;
+        ++rt_active;
         if (v->dirty) { compute_gains(c, v); v->dirty = false; }
         if (v->sound->channels > 1) mix_bed  (c, v, (uint16_t)i, bus, nframes);        /* ambisonic bed */
         else                        mix_voice(c, v, (uint16_t)i, bus, nframes, aux);   /* mono point source */
     }
+    BW_ZONE_END(zmix);
+    BW_PLOT("rt voices", rt_active);
     for (uint32_t i = 0; i < c->voice_cap; ++i) {   /* publish playback state for rt_source_is_playing (control thread) */
         const Voice* v = &c->voices[i];
         uint32_t st = ((uint32_t)v->gen << 1) | ((v->active && v->playing && v->sound) ? 1u : 0u);
         atomic_store_explicit(&c->play_pub[i], st, memory_order_release);
     }
-    if (aux)   /* reflection bed: convolve the aux send + sum onto the bus BEFORE align (so it gets trim+delay too) */
+    if (aux) {   /* reflection bed: convolve the aux send + sum onto the bus BEFORE align (so it gets trim+delay too) */
+        BW_ZONE_BEGIN(zt, "reflect tap");
         c->bus_tap(c->bus_tap_ud, bus, nframes, c->lis.p_active, c->lis.q_active, aux);
+        BW_ZONE_END(zt);
+    }
+    BW_ZONE_BEGIN(za, "align");
     align_process(c->aligner, bus, nframes);   /* per-speaker gain trim + delay (output stage) */
+    BW_ZONE_END(za);
 
     /* debug channel test (bw_test_signal): inject a built-in signal onto a raw output channel AFTER
      * align, so it is independent of the per-speaker trim/delay — a clean speaker-check / wiring tool. */
@@ -764,6 +776,7 @@ void rt_render(RtCore* c, float* bus, uint32_t nframes, const BwTimestamp* ts) {
         }
     }
     pose_write(&c->readback, c->lis.p_active, c->lis.q_active);   /* publish for control-thread readback */
+    BW_ZONE_END(zr);
 }
 
 void rt_read_pose(RtCore* c, float p[3], float q[4]) {

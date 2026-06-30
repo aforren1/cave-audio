@@ -7,6 +7,7 @@
  * and the audio thread only reads the published occlusion float (rt_set_occlusion).
  */
 #include "steam_scene.h"
+#include "profile.h"
 
 #include <phonon.h>
 
@@ -107,6 +108,8 @@ static DWORD WINAPI sim_thread(LPVOID arg) {
     if (!snap_h || !snap_p || !snap_feat || !snap_dw || !snap_dp || !snap_fwd) {
         free(snap_h); free(snap_p); free(snap_feat); free(snap_dw); free(snap_dp); free(snap_fwd); return 0;
     }
+    BW_THREAD_NAME("bw-sim (occlusion)");
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);  /* never preempt the audio callback */
 
     while (!s->stop) {
         /* 1. snapshot the shadow + take the pending mesh */
@@ -182,7 +185,7 @@ static DWORD WINAPI sim_thread(LPVOID arg) {
          * (floored) is the EQ. Each output is read only for the features that asked for it. */
         int any_src = 0;
         for (uint32_t i = 0; i < cap; ++i) if (s->srcs[i]) { any_src = 1; break; }
-        if (any_src) iplSimulatorRunDirect(s->simulator);
+        if (any_src) { BW_ZONE_BEGIN(zs, "occlusion ray-trace"); iplSimulatorRunDirect(s->simulator); BW_ZONE_END(zs); }
         for (uint32_t i = 0; i < cap; ++i) {
             if (!s->srcs[i]) continue;
             IPLSimulationOutputs out; memset(&out, 0, sizeof out);

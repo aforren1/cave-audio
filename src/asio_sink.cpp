@@ -19,6 +19,7 @@
  */
 extern "C" {
 #include "sink.h"
+#include "profile.h"
 }
 
 #include "asiosys.h"
@@ -112,6 +113,9 @@ void convert_out(void* dst, const float* src, long n, long type) {
 ASIOTime* bufferSwitchTimeInfo(ASIOTime* timeInfo, long index, ASIOBool /*processNow*/) {
     AsioSink* s = g_sink;
     if (!s) return timeInfo;
+    static bool named = false;
+    if (!named) { BW_THREAD_NAME("bw-audio (ASIO)"); named = true; }   /* the driver's callback thread */
+    BW_ZONE_BEGIN(zblk, "asio block");                                 /* one block; vs the period = the RT budget */
 
     BwTimestamp ts;
     ts.sample_pos     = samples_u64(timeInfo->timeInfo.samplePosition);
@@ -119,12 +123,16 @@ ASIOTime* bufferSwitchTimeInfo(ASIOTime* timeInfo, long index, ASIOBool /*proces
 
     s->render(s->user, s->bus, (uint32_t)s->buffer_size, &ts);   /* engine fills the bus */
 
+    BW_ZONE_BEGIN(zcv, "convert_out");
     for (uint32_t c = 0; c < s->channels; ++c) {
         void*        dst = s->bufferInfos[c].buffers[index];
         const float* src = s->bus + (size_t)c * s->buffer_size;
         convert_out(dst, src, s->buffer_size, s->channelInfos[c].type);
     }
+    BW_ZONE_END(zcv);
     if (s->post_output) ASIOOutputReady();
+    BW_ZONE_END(zblk);
+    BW_FRAME_MARK();
     return timeInfo;
 }
 

@@ -15,6 +15,7 @@
 #include "binaural.h"
 #include "natnet.h"
 #include "steam_decode.h"   /* phonon-free interfaces; impls linked only when BW_HAVE_STEAMAUDIO */
+#include "profile.h"
 #include "steam_scene.h"
 #include "steam_reflect.h"
 
@@ -116,10 +117,12 @@ static void render_binaural(void* user, float* dev2, uint32_t n, const BwTimesta
     rt_render(e->rt, e->scratch26, n, ts);
     float p[3], q[4];
     rt_get_listener(e->rt, p, q);
+    BW_ZONE_BEGIN(zbin, "binaural decode");                /* 26 virtual speakers -> HRTF -> 2 ch */
 #ifdef BW_HAVE_STEAMAUDIO
-    if (e->steam) { steam_monitor_process(e->steam, e->scratch26, p, q, dev2, n); return; }
+    if (e->steam) { steam_monitor_process(e->steam, e->scratch26, p, q, dev2, n); BW_ZONE_END(zbin); return; }
 #endif
     monitor_process(e->monitor, e->scratch26, p, q, dev2, n);
+    BW_ZONE_END(zbin);
 }
 
 /* both, array thread: render the array to the 26-ch device (any block size), then — when the

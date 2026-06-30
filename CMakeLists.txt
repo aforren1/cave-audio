@@ -43,6 +43,19 @@ FetchContent_MakeAvailable(dr_libs cjson_src cjson_hdr)
 set(CJSON_C   "${cjson_src_SOURCE_DIR}/cJSON.c")
 set(CJSON_INC "${cjson_hdr_SOURCE_DIR}")
 
+# ---- optional Tracy profiler instrumentation (opt-in; default build stays lean) ----
+# cmake -S . -B build -DBWAUDIO_TRACY=ON, then connect the standalone Tracy profiler to the running
+# engine. ON_DEMAND => the client only collects while a profiler is attached (near-zero idle cost).
+option(BWAUDIO_TRACY "Instrument with the Tracy profiler (fetches Tracy)" OFF)
+if(BWAUDIO_TRACY)
+  set(TRACY_ENABLE    ON CACHE BOOL "" FORCE)
+  set(TRACY_ON_DEMAND ON CACHE BOOL "" FORCE)
+  FetchContent_Declare(tracy
+    URL https://github.com/wolfpld/tracy/archive/refs/tags/v0.13.1.tar.gz
+    DOWNLOAD_EXTRACT_TIMESTAMP TRUE)
+  FetchContent_MakeAvailable(tracy)
+endif()
+
 # ---- shared core (everything except the public ABI shim and the device sinks) ----
 # An OBJECT library so the off-RT-path tests can compile the core in directly and reach
 # its internals, without re-listing sources per target.
@@ -85,6 +98,16 @@ if(MSVC)
 endif()
 if(WIN32)
   target_link_libraries(bwaudio PRIVATE winmm ws2_32)   # winmm: timeBeginPeriod (null_sink); ws2_32: natnet
+endif()
+
+if(BWAUDIO_TRACY)
+  # bw_core is an OBJECT lib: linking TracyClient gives rt.c Tracy's headers (no link step here); the
+  # DLL links the actual client. BW_TRACY flips profile.h's macros on for both compile groups.
+  target_link_libraries(bw_core PRIVATE TracyClient)
+  target_compile_definitions(bw_core PRIVATE BW_TRACY)
+  target_link_libraries(bwaudio PRIVATE TracyClient)
+  target_compile_definitions(bwaudio PRIVATE BW_TRACY)
+  message(STATUS "bwaudio: Tracy profiling ENABLED")
 endif()
 
 # ---- optional ASIO backend (production: 26ch -> DVS -> Dante) ----
@@ -164,6 +187,15 @@ if(WIN32)
   add_custom_command(TARGET bw_track_monitor POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
             $<TARGET_FILE:bwaudio> $<TARGET_FILE_DIR:bw_track_monitor>)   # bwaudio.dll next to the exe
+endif()
+
+# ---- headless profiling bench (representative load for Tracy; build with -DBWAUDIO_TRACY=ON) ----
+add_executable(bw_profile_bench examples/profile_bench.c)
+target_link_libraries(bw_profile_bench PRIVATE bwaudio)
+if(WIN32)
+  add_custom_command(TARGET bw_profile_bench POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            $<TARGET_FILE:bwaudio> $<TARGET_FILE_DIR:bw_profile_bench>)
 endif()
 
 option(BWAUDIO_BUILD_TESTS "Build the bwaudio tests" ON)
