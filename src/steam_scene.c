@@ -14,6 +14,7 @@
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <math.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -24,6 +25,8 @@ struct SteamScene {
     IPLScene      scene;
     IPLSimulator  simulator;
     IPLStaticMesh mesh;            /* current committed geometry (sim-thread-owned; NULL = none) */
+    IPLEmbreeDevice embree;        /* Embree ray tracer (NULL unless opted in + available); released last */
+    IPLSceneType  scene_type;      /* DEFAULT or EMBREE; the reflection sim must match it (shares this scene) */
     RtCore*       rt;
     uint32_t      voice_cap;
 
@@ -224,12 +227,29 @@ SteamScene* steam_scene_create(RtCore* rt, uint32_t sample_rate, uint32_t frame_
     IPLContextSettings cs; memset(&cs, 0, sizeof cs); cs.version = STEAMAUDIO_VERSION;
     if (iplContextCreate(&cs, &s->context) != IPL_STATUS_SUCCESS) goto fail;
 
-    IPLSceneSettings sc; memset(&sc, 0, sizeof sc); sc.type = IPL_SCENETYPE_DEFAULT;
+    /* Ray tracer: default to Steam Audio's built-in, opt into Embree (faster CPU ray tracing) via
+     * BWAUDIO_EMBREE. If the device can't be created (phonon built without Embree, or no runtime), fall
+     * back to default so the flag is always safe. The reflection sim borrows this scene, so it must use
+     * the same scene type — exposed via steam_scene_ipl_scenetype. */
+    s->scene_type = IPL_SCENETYPE_DEFAULT;
+    const char* want_embree = getenv("BWAUDIO_EMBREE");
+    if (want_embree && want_embree[0] && want_embree[0] != '0') {
+        if (iplEmbreeDeviceCreate(s->context, NULL, &s->embree) == IPL_STATUS_SUCCESS) {
+            s->scene_type = IPL_SCENETYPE_EMBREE;
+            fprintf(stderr, "bwaudio: Steam Audio ray tracing on Embree (BWAUDIO_EMBREE)\n");
+        } else {
+            fprintf(stderr, "bwaudio: BWAUDIO_EMBREE set but Embree unavailable; using the default ray tracer\n");
+        }
+    }
+
+    IPLSceneSettings sc; memset(&sc, 0, sizeof sc);
+    sc.type = s->scene_type;
+    sc.embreeDevice = s->embree;                /* ignored unless type == EMBREE */
     if (iplSceneCreate(s->context, &sc, &s->scene) != IPL_STATUS_SUCCESS) goto fail;
 
     IPLSimulationSettings ss; memset(&ss, 0, sizeof ss);
     ss.flags = IPL_SIMULATIONFLAGS_DIRECT;
-    ss.sceneType = IPL_SCENETYPE_DEFAULT;
+    ss.sceneType = s->scene_type;
     ss.maxNumOcclusionSamples = 32;
     ss.maxNumSources = (IPLint32)voice_cap;
     ss.samplingRate = (IPLint32)sample_rate;
@@ -364,6 +384,7 @@ void steam_scene_source_gone(SteamScene* s, uint32_t handle) {
 
 void* steam_scene_ipl_context(SteamScene* s) { return s ? (void*)s->context : NULL; }
 void* steam_scene_ipl_scene  (SteamScene* s) { return s ? (void*)s->scene   : NULL; }
+int   steam_scene_ipl_scenetype(SteamScene* s) { return s ? (int)s->scene_type : 0; }  /* IPLSceneType; reflect sim matches it */
 
 void steam_scene_destroy(SteamScene* s) {
     if (!s) return;
@@ -373,6 +394,7 @@ void steam_scene_destroy(SteamScene* s) {
     if (s->mesh)      iplStaticMeshRelease(&s->mesh);
     if (s->simulator) iplSimulatorRelease(&s->simulator);
     if (s->scene)     iplSceneRelease(&s->scene);
+    if (s->embree)    iplEmbreeDeviceRelease(&s->embree);   /* after the scene that referenced it */
     if (s->context)   iplContextRelease(&s->context);
     DeleteCriticalSection(&s->lock);
     free(s->mesh_verts); free(s->mesh_tris); free(s->mesh_mi); free(s->mesh_mats);

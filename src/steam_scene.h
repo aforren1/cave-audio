@@ -51,6 +51,7 @@ void steam_scene_source_gone    (SteamScene* s, uint32_t handle);
  * set the mesh before bw_start; concurrent commits + reflection reads are not synchronized.) */
 void* steam_scene_ipl_context(SteamScene* s);
 void* steam_scene_ipl_scene(SteamScene* s);
+int   steam_scene_ipl_scenetype(SteamScene* s);   /* IPLSceneType of the shared scene (DEFAULT/EMBREE); reflect sim must match */
 
 void steam_scene_destroy(SteamScene* s);   /* stops the sim thread, releases phonon objects */
 

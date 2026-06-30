@@ -144,6 +144,12 @@ solve so it A/Bs live, and the mixer reads it only when on. An **ambisonic bed**
 a file-fed AmbiX soundfield decoded world-locked to the 26-ch bus (`rt.c` `build_bed_decode`/`mix_bed`,
 phonon-free), reusing the SH→26 decode the reflection bed will need. `sound.c` now decodes **WAV/FLAC/MP3**
 (dr_libs, one pinned repo fetch) and **resamples to the engine rate at load** (windowed-sinc).
+**Voice management + scheduling**: sources carry a control-side steal **priority** (`bw_source_set_priority`,
+255 = protected) — a full pool steals the lowest-priority voice instead of failing the create; and
+**`bw_source_play_at(start_sample)`** fires a voice sample-accurately off a published dsp clock
+(`bw_dsp_time`, device-anchored), the mixer holding it silent until the exact in-block offset. **Ray-tracing
+acceleration**: `BWAUDIO_EMBREE=1` runs both sims on Intel Embree, opt-in with a graceful fallback to the
+default tracer (the vendored prebuilt phonon isn't Embree-built, so it currently falls back — see docs/api.md).
 Remaining: the by-ear headphone check; and live Motive verification of M6 (parser + lifecycle are tested off-wire). Do not bake ASIO assumptions
 outside `asio_sink.cpp`, and do not link the NatNet SDK (proprietary; reference only — GPLv3).
 The atomics in `rt.c` need `/experimental:c11atomics` on MSVC (wired in CMake); `pose.h` uses

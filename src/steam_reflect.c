@@ -192,7 +192,7 @@ SteamReflect* steam_reflect_create(SteamScene* scene, RtCore* rt, const Layout* 
 
     IPLSimulationSettings ss; memset(&ss, 0, sizeof ss);
     ss.flags = IPL_SIMULATIONFLAGS_REFLECTIONS;
-    ss.sceneType = IPL_SCENETYPE_DEFAULT;
+    ss.sceneType = (IPLSceneType)steam_scene_ipl_scenetype(scene);   /* match the borrowed scene (DEFAULT/EMBREE) */
     ss.reflectionType = REFL_TYPE;
     ss.maxNumRays = (IPLint32)num_rays;
     ss.numDiffuseSamples = REFL_DIFFUSE;

@@ -165,6 +165,18 @@ needs `BWAUDIO_NATNET_SERVER` and NatNet ≥ 4; a name that doesn't resolve fail
 engine then runs untracked, with the reason in `bw_last_error`). A NatNet open failure is
 non-fatal: the engine runs on the committed/default listener until tracking data arrives.
 
+### Ray-tracing acceleration (`BWAUDIO_EMBREE`)
+
+The occlusion and reflection sims ray-trace on the Steam Audio scene. Set **`BWAUDIO_EMBREE=1`**
+(any non-empty, non-`0` value) to run them on **Intel Embree** instead of Steam Audio's built-in
+ray tracer — faster, and the lever to pull if you raise scene complexity, ray counts, or bake at
+high probe density. It is **opt-in and safe**: if the linked `phonon` was not built with Embree
+(or the Embree/TBB runtime is missing), the engine logs that Embree is unavailable and falls back
+to the default tracer — no failure. The scene is created once and both sims share it, so the flag
+applies to occlusion and reflections together. **Note:** the vendored prebuilt `phonon.dll` is not
+Embree-enabled (the flag currently falls back); to activate it, drop in a `phonon` built with
+Embree (the SDK's `STEAMAUDIO_ENABLE_EMBREE` path) and ship `embree4.dll` + `tbb*.dll` alongside.
+
 ### Reading back the pose
 
 ```c
