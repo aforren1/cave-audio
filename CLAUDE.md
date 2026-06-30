@@ -184,7 +184,9 @@ sub-degree — `zylia_doa`), and with the known latency a Gauss-Newton refine ag
 wavefront gives the full position (`zylia_localize`). Distance is latency-limited (the array is too small to
 self-calibrate latency at metres). Spatial room capture reuses the same sweep windowed per early reflection →
 `zylia_doa` → which surface throws it. The 19-ch ASIO capture + the datasheet capsule geometry are the
-rig-bound shell. **Per-speaker correction filters** (`--eq`) are the "inverse EQ" upgrade to the scalar
+rig-bound shell; `bw_zylia_probe` (opt-in `-DBWAUDIO_BUILD_CALIBRATE=ON`) is an input-only ASIO live
+per-channel meter to confirm the ZM-1 streams + maps all 19 capsules the moment it's plugged in.
+**Per-speaker correction filters** (`--eq`) are the "inverse EQ" upgrade to the scalar
 trims: `measure_correction` gates the IR to the direct sound (before the first reflection) and inverts that
 magnitude into a minimum-phase FIR (`calib_eq` → the layout `eq` array → applied per channel in `align.c`,
 before gain+delay), so it flattens the SPEAKER not the room (a moving listener can't be room-EQ'd from one

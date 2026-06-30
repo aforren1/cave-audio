@@ -379,4 +379,17 @@ if(BWAUDIO_BUILD_CALIBRATE)
   else()
     message(STATUS "bwaudio: calibration tool (simulate only; no ASIO SDK)")
   endif()
+
+  # ZM-1 hardware bring-up probe (input-only ASIO live meter). No simulate path — it IS the hardware test.
+  add_executable(bw_zylia_probe examples/zylia_probe.cpp)
+  target_link_libraries(bw_zylia_probe PRIVATE bw_core)
+  if(BWAUDIO_WITH_ASIO)
+    target_sources(bw_zylia_probe PRIVATE
+      ${ASIO_SDK_DIR}/common/asio.cpp
+      ${ASIO_SDK_DIR}/host/asiodrivers.cpp
+      ${ASIO_SDK_DIR}/host/pc/asiolist.cpp)
+    target_include_directories(bw_zylia_probe PRIVATE ${ASIO_SDK_DIR}/common ${ASIO_SDK_DIR}/host ${ASIO_SDK_DIR}/host/pc)
+    target_compile_definitions(bw_zylia_probe PRIVATE BW_HAVE_ASIO _CRT_SECURE_NO_WARNINGS)
+    target_link_libraries(bw_zylia_probe PRIVATE ole32 user32 advapi32)
+  endif()
 endif()

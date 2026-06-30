@@ -105,10 +105,20 @@ early-reflection map is the actionable part.)
 
 Integration is a rig-bound shell (like the ASIO capture): the ZM-1 presents as a 19-ch input, so a
 `calibrate --zylia` mode captures the sweep, deconvolves per channel (measure.c), feeds the 19
-arrivals to `zylia_localize`, and writes `cave_layout.json`. One caveat baked into the code: the
-capsule geometry in `zylia_geometry` is a **placeholder** spread — drop in the ZM-1 datasheet/surveyed
-capsule directions before trusting on-hardware DOA (the math is geometry-agnostic; only that table
-must match the real array).
+arrivals to `zylia_localize`, and writes `cave_layout.json`. `--zylia --simulate` synthesizes the 19
+arrivals from the layout and recovers every speaker position exactly, so the math + writeback are
+validated off-hardware; the two-device ASIO capture is the only unbuilt piece. One caveat baked into
+the code: the capsule geometry in `zylia_geometry` is a **placeholder** spread — drop in the ZM-1
+datasheet/surveyed capsule directions before trusting on-hardware DOA (the math is geometry-agnostic;
+only that table must match the real array).
+
+**Bring-up probe.** Before any of that, `bw_zylia_probe` (built with `-DBWAUDIO_BUILD_CALIBRATE=ON`)
+is the "is it talking?" check you can run the moment the ZM-1 is plugged in — input-only, no rig
+needed. `bw_zylia_probe --list` enumerates the ASIO drivers + their channel counts (look for the
+Zylia driver, or ASIO4ALL over its USB-audio interface, showing `in=19`); `bw_zylia_probe` opens it
+and prints a live per-channel RMS meter, so you can confirm all 19 capsules stream and learn which
+channel is which capsule by tapping each and watching its channel jump. A channel stuck at digital
+silence is dead or unmapped. It auto-picks a driver whose name contains "zylia", else `--driver` it.
 
 ## What feeds the engine
 
