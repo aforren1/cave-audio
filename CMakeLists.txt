@@ -296,6 +296,18 @@ if(BWAUDIO_BUILD_TESTS)
                 "${STEAMAUDIO_DIR}/lib/windows-x64/phonon.dll" $<TARGET_FILE_DIR:bw_bake_test>)
     endif()
     add_test(NAME bake COMMAND bw_bake_test)
+
+    # Pathing: routes a source around an occluding wall (visibility bake + pathing sim).
+    add_executable(bw_path_test test/path_test.c src/steam_scene.c src/steam_path.c)
+    target_include_directories(bw_path_test PRIVATE src "${STEAMAUDIO_DIR}/include")
+    target_link_libraries(bw_path_test PRIVATE bw_core "${STEAMAUDIO_DIR}/lib/windows-x64/phonon.lib")
+    target_compile_definitions(bw_path_test PRIVATE BW_HAVE_STEAMAUDIO)
+    if(WIN32)
+      add_custom_command(TARGET bw_path_test POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                "${STEAMAUDIO_DIR}/lib/windows-x64/phonon.dll" $<TARGET_FILE_DIR:bw_path_test>)
+    endif()
+    add_test(NAME path COMMAND bw_path_test)
   endif()
 
   # Optional: AddressSanitizer build of the sound test (M3 unload-safety / UAF check).
