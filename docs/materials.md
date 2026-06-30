@@ -397,28 +397,35 @@ dominate. A deployment requirement, noted here so it is designed for, not discov
     yet built**; that and **directivity** are the next increment on this same pre-pan stage.
 - **Reflection bed, perceptual mode, directivity — designed, not yet implemented** (this document).
 
-## Baking & pathing — available in phonon, deliberately not wired
+## Baking & pathing — BLOCKED by the vendored phonon build (precise diagnosis)
 
-Steam Audio supports two more reflection/propagation features the engine does **not** currently wire
-up, by choice:
+Steam Audio supports baked reflections and pathing; the engine does **not** wire them up, and a
+second, thorough spike pinned down *why* — it is not our code, it is the vendored `phonon.dll`.
 
-- **Baked reflections** (`iplReflectionsBakerBake` over an `IPLProbeBatch`): precompute the reverb at
-  a probe grid offline so the runtime looks it up instead of ray-tracing. For *this* installation the
-  payoff is marginal — the reflection ray-trace already runs off the audio thread (`steam_reflect.c`,
-  `THREAD_PRIORITY_BELOW_NORMAL`) and the Tracy profile showed CPU headroom, so baking mostly moves an
-  already-off-thread cost offline. Landing it correctly is also non-trivial: `UNIFORMFLOOR` probe
-  generation is sensitive to the floor mesh winding, and the baked **directional** early-reflection
-  retrieval (`BAKECONVOLUTION`) has to be coaxed through the hybrid effect — all of it trial-and-error
-  against phonon's runtime with no way to ear-check it off-site. A spike got the bake running but
-  producing near-silent, non-directional reverb at an off-centre listener; it was reverted rather than
-  shipped half-working.
-- **Pathing** (`IPL_SIMULATIONFLAGS_PATHING`, `iplPathBakerBake`): route sound around occluders /
-  through portals via the same probe network. Only pays off if the space has real occluders to bend
-  sound around — an open CAVE mostly doesn't — and it carries the same probe machinery + blind
-  debugging as baking.
+**Baked reflections** (`iplReflectionsBakerBake` over an `IPLProbeBatch`) precompute the reverb at a
+probe grid so the runtime looks it up instead of ray-tracing. The spike got this far:
 
-Both are clean extensions if a future space needs them (baking plugs into the bed source's
-`IPLSimulationInputs.baked`; pathing is a per-source field decoded to the bus like the reflection
-bed), and both are best brought up **at the rig**, where the result can actually be heard. Until then
-they stay unwired — phonon exposes them, the seam accommodates them, but the engine doesn't pay for
-features it can't currently verify or benefit from.
+- **Probe generation works** — `UNIFORMFLOOR` finds no floor in a box mesh whose floor faces down
+  (winding-sensitive), but placing probes manually with one `CENTROID` call per grid point (CENTROID
+  drops a probe at the box centre regardless of geometry) gives full control and a real grid.
+- **The bake works** — `iplReflectionsBakerBake` runs and stores data; `iplProbeBatchGetReverb`
+  reads back genuine reverb times (`[0.10, 0.10, 0.10]` for the test room) from a baked probe.
+- **The runtime retrieval is broken** — with the listener inside the probe grid and the data present,
+  `iplSourceSetInputs(..baked=IPL_TRUE, identifier={REFLECTIONS,REVERB}) → iplSimulatorRunReflections →
+  iplSourceGetOutputs` returns `reverbTimes=[0,0,0]` and a zero-content IR. Coverage, probe-box overlap
+  (probe influence == its generation box), and bake duration/bounces were all ruled out; the retrieved
+  output is a constant, independent of the baked data.
+
+So the *baker* works but the simulator's *baked-lookup* path does not, in this build. The vendored
+phonon is a **custom-patched DLL** (there are `phonon.dll.orig` files; the directional reflection bed
+depends on a hand-applied SSE-alignment fix). That build appears to ship a working baker and a broken
+or absent baked-retrieval path. **Pathing rides the identical `probe → bake → simulator-run` machinery
+(`iplPathBakerBake` + `iplSimulatorRunPathing` + `IPLSimulationInputs.pathingProbes`), so it almost
+certainly hits the same wall.**
+
+Unblocking needs a phonon with working baked retrieval — but swapping the DLL risks losing the
+alignment patch the *directional* real-time bed relies on, so it is a build/validation task, not a
+code change. The wiring itself is understood and small (baking → the bed source's
+`IPLSimulationInputs.baked`; pathing → a per-source field decoded to the bus like the reflection bed)
+and can be re-applied in an afternoon once a phonon build that retrieves baked data is in hand. Best
+done at the rig, where the result can be heard.
