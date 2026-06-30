@@ -44,6 +44,7 @@
 #include "bwaudio.h"
 #include "raylib.h"
 #include "raymath.h"
+#include "ui_text.h"        /* crisp HUD text; ui_text() supersedes raylib's DrawText() */
 #include "cJSON.h"
 
 #include <math.h>
@@ -486,7 +487,9 @@ int main(int argc, char** argv) {
     gen_pink_wav(PREV_WAV);                        /* the moving DBAP-preview source signal */
     build_engine(NULL);                           /* edit-mode engine (the test signal is layout-independent) */
 
+    SetConfigFlags(FLAG_WINDOW_HIGHDPI | FLAG_MSAA_4X_HINT);   /* native pixel density + smooth 3D edges */
     InitWindow(1040, 720, "bwaudio - speaker layout tool");
+    ui_text_init();                                            /* crisp TTF HUD (see ui_text.h) */
     SetTargetFPS(60);
     Camera3D cam = { .target = { 0, 0, 0 }, .up = { 0, 1, 0 }, .fovy = 55, .projection = CAMERA_PERSPECTIVE };
     float cam_yaw = 45.0f * DEG2RAD, cam_pitch = 30.0f * DEG2RAD, cam_dist = 9.0f;
@@ -725,53 +728,53 @@ int main(int argc, char** argv) {
         /* 2D index labels projected from 3D */
         for (int i = 0; i < NSPK; ++i) {
             Vector2 s = GetWorldToScreen(spk[i].pos, cam);
-            DrawText(TextFormat("%d", i), (int)s.x + 6, (int)s.y - 6, i == sel ? 18 : 12,
+            ui_text(TextFormat("%d", i), (int)s.x + 6, (int)s.y - 6, i == sel ? 18 : 12,
                      i == sel ? (Color){ 250, 230, 120, 255 } : (Color){ 150, 150, 170, 220 });
         }
 
         /* HUD */
         DrawRectangle(0, 0, GetScreenWidth(), 96, (Color){ 0, 0, 0, 200 });
         if (preview) {
-            DrawText(TextFormat("PREVIEW   WASD/RF move   SPACE auto-orbit   B panner: %s   P back to edit",
+            ui_text(TextFormat("PREVIEW   WASD/RF move   SPACE auto-orbit   B panner: %s   P back to edit",
                                 panner_names[pv_panner]),
                      10, 8, 13, RAYWHITE);
-            DrawText(TextFormat("source (%.2f, %.2f, %.2f)   orbit %s   - A/B the panner by ear; walk the room for off-center coverage",
+            ui_text(TextFormat("source (%.2f, %.2f, %.2f)   orbit %s   - A/B the panner by ear; walk the room for off-center coverage",
                                 src_pos.x, src_pos.y, src_pos.z, pv_orbit ? "ON" : "off"),
                      10, 30, 16, (Color){ 240, 160, 120, 255 });
         } else {
-            DrawText("[ ] select   arrows X/Z  R/F Y (SHIFT)   ENTER type   PgUp/Dn gain   T tone  N noise   C coverage  V obs  G gap/err   X score   K snap   P preview   S save  L reload",
+            ui_text("[ ] select   arrows X/Z  R/F Y (SHIFT)   ENTER type   PgUp/Dn gain   T tone  N noise   C coverage  V obs  G gap/err   X score   K snap   P preview   S save  L reload",
                      10, 8, 13, RAYWHITE);
-            DrawText(TextFormat("speaker %d / %d  ->  channel %d   pos (%.3f, %.3f, %.3f)   gain %+.1f dB   delay %.3f ms   dist %.3f m",
+            ui_text(TextFormat("speaker %d / %d  ->  channel %d   pos (%.3f, %.3f, %.3f)   gain %+.1f dB   delay %.3f ms   dist %.3f m",
                                 sel, NSPK, sel, spk[sel].pos.x, spk[sel].pos.y, spk[sel].pos.z, spk[sel].gain_db, seldel, seld),
                      10, 30, 16, (Color){ 245, 220, 90, 255 });
             if (editing)
-                DrawText(TextFormat("type \"x y z\" then ENTER:  %s_", ibuf), 10, 54, 16, (Color){ 120, 245, 140, 255 });
+                ui_text(TextFormat("type \"x y z\" then ENTER:  %s_", ibuf), 10, 54, 16, (Color){ 120, 245, 140, 255 });
             else
-                DrawText(TextFormat("tone [T] %s (%s)   save target: %s",
+                ui_text(TextFormat("tone [T] %s (%s)   save target: %s",
                                     tone_on ? "ON" : "off", tone_kind == BW_TEST_SINE ? "sine" : "noise", path),
                          10, 54, 15, (Color){ 110, 200, 255, 255 });
         }
-        DrawText(audio ? TextFormat("audio: %s  (T drives the selected channel out the array)", backend)
+        ui_text(audio ? TextFormat("audio: %s  (T drives the selected channel out the array)", backend)
                        : "audio: none - editor only (needs a 26-ch ASIO/DVS device to audition)",
                  10, 76, 14, audio ? (Color){ 110, 235, 130, 255 } : (Color){ 235, 170, 110, 255 });
         if (save_flash > 0)
-            DrawText(TextFormat("saved -> %s", path), GetScreenWidth() - 320, 76, 15, (Color){ 120, 245, 140, 255 });
+            ui_text(TextFormat("saved -> %s", path), GetScreenWidth() - 320, 76, 15, (Color){ 120, 245, 140, 255 });
         else if (save_flash < 0)
-            DrawText("SAVE FAILED (path not writable?)", GetScreenWidth() - 320, 76, 15, (Color){ 245, 120, 120, 255 });
+            ui_text("SAVE FAILED (path not writable?)", GetScreenWidth() - 320, 76, 15, (Color){ 245, 120, 120, 255 });
         if (con_loaded && !preview) {                    /* placement-constraint status */
             DrawRectangle(0, 96, 320, 22, (Color){ 0, 0, 0, 175 });
-            DrawText(TextFormat("constraints: %d no-go   %d violating   [K snap to allowed]", con_nnogo, con_bad),
+            ui_text(TextFormat("constraints: %d no-go   %d violating   [K snap to allowed]", con_nnogo, con_bad),
                      10, 100, 14, con_bad ? (Color){ 245, 130, 130, 255 } : (Color){ 120, 220, 140, 255 });
         }
         if (!preview) {                                  /* target panner + auto-optimizer status */
             int yo = con_loaded ? 122 : 100;
             DrawRectangle(0, yo - 4, 520, 22, (Color){ 0, 0, 0, 175 });
             if (opt_running)
-                DrawText(TextFormat("OPTIMIZING %s   cost %.1f   iter %d   step %.2f m%s   [O] stop",
+                ui_text(TextFormat("OPTIMIZING %s   cost %.1f   iter %d   step %.2f m%s   [O] stop",
                                     panner_names[pv_panner], opt_cost, opt_iter, opt_step, editing ? "   (paused)" : ""),
                          10, yo, 14, (Color){ 120, 245, 160, 255 });
             else
-                DrawText(TextFormat("target panner [B]: %s    [O] auto-optimize the layout for it",
+                ui_text(TextFormat("target panner [B]: %s    [O] auto-optimize the layout for it",
                                     panner_names[pv_panner]), 10, yo, 14, (Color){ 180, 200, 240, 255 });
         }
         if (coverage_on && !preview) {                   /* bottom: the coverage summary */
@@ -779,18 +782,18 @@ int main(int argc, char** argv) {
             const char* obs = coverage_moving ? "moving: mean over working volume" : "fixed: centre sweet spot";
             DrawRectangle(0, yb - 5, GetScreenWidth(), 31, (Color){ 0, 0, 0, 195 });
             if (cov_metric == 0)
-                DrawText(TextFormat("nearest-speaker gap [%s]   worst dir %.0f deg   mean %.0f deg   green=covered red=gap   [G] %s rE error",
+                ui_text(TextFormat("nearest-speaker gap [%s]   worst dir %.0f deg   mean %.0f deg   green=covered red=gap   [G] %s rE error",
                                     obs, cov_worst, cov_mean, panner_names[pv_panner]),
                          10, yb, 15, cov_worst > 45.0f ? (Color){ 245, 150, 110, 255 } : (Color){ 150, 225, 160, 255 });
             else
-                DrawText(TextFormat("%s rE error [%s]   worst dir %.0f deg   mean %.0f deg   green=accurate red=off   [G] nearest-speaker gap",
+                ui_text(TextFormat("%s rE error [%s]   worst dir %.0f deg   mean %.0f deg   green=accurate red=off   [G] nearest-speaker gap",
                                     panner_names[pv_panner], obs, cov_worst, cov_mean),
                          10, yb, 15, cov_worst > 30.0f ? (Color){ 245, 150, 110, 255 } : (Color){ 150, 225, 160, 255 });
         }
         if (scored && !preview) {                        /* panner-specific rE-localization scores (X) */
             int ys = GetScreenHeight() - (coverage_on ? 52 : 26);
             DrawRectangle(0, ys - 5, GetScreenWidth(), 31, (Color){ 0, 0, 0, 195 });
-            DrawText(TextFormat("panner rE-err [X]%s   DBAP %.0f/%.0f   SPCAP %.0f/%.0f   VBAP %.0f/%.0f   deg mean/worst (lower = layout suits it)",
+            ui_text(TextFormat("panner rE-err [X]%s   DBAP %.0f/%.0f   SPCAP %.0f/%.0f   VBAP %.0f/%.0f   deg mean/worst (lower = layout suits it)",
                                 score_stale ? " STALE" : "",
                                 score_mean[0], score_worst[0], score_mean[1], score_worst[1], score_mean[2], score_worst[2]),
                      10, ys, 15, score_stale ? (Color){ 210, 210, 130, 255 } : (Color){ 150, 200, 240, 255 });

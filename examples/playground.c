@@ -37,6 +37,7 @@
 #include "bwaudio.h"
 #include "raylib.h"
 #include "raymath.h"
+#include "ui_text.h"        /* crisp HUD text; ui_text() supersedes raylib's DrawText() */
 
 #define DR_WAV_IMPLEMENTATION
 #include "dr_wav.h"
@@ -271,14 +272,14 @@ static void loc_draw3d(void) {
     DrawSphere(source_pos, 0.18f, RED);
 }
 static void loc_hud(int y) {
-    DrawText(TextFormat("[SPACE] auto-move %s   signal [1-4]: %s   (broadband + sharp onsets localise best)",
+    ui_text(TextFormat("[SPACE] auto-move %s   signal [1-4]: %s   (broadband + sharp onsets localise best)",
                         loc_auto ? "ON - orbit + near/far + high/low" : "off", SIG_NAMES[cur_sig]),
              12, y, 15, (Color){ 110, 200, 255, 255 });
-    DrawText(TextFormat("source (%.2f, %.2f, %.2f)   head %.0f deg%s",
+    ui_text(TextFormat("source (%.2f, %.2f, %.2f)   head %.0f deg%s",
                         source_pos.x, source_pos.y, source_pos.z, head_yaw * 57.2958f,
                         (loc_auto || loc_flyby) ? "   (WASD paused while auto-move runs)" : ""),
              12, y + 22, 15, (Color){ 200, 200, 210, 255 });
-    DrawText(TextFormat("propagation:  [V] Doppler %s   [B] air absorption %s   [X] fast flyby %s   [C] size %.0f%%   [M] dual-band %s",
+    ui_text(TextFormat("propagation:  [V] Doppler %s   [B] air absorption %s   [X] fast flyby %s   [C] size %.0f%%   [M] dual-band %s",
                         loc_dop ? "ON" : "off", loc_air ? "ON" : "off", loc_flyby ? "ON" : "off", loc_spread * 100.0f, loc_dual ? "ON (LF amp)" : "off"),
              12, y + 44, 15, (Color){ 150, 225, 150, 255 });
 }
@@ -331,11 +332,11 @@ static void occ_draw3d(void) {
     }
 }
 static void occ_hud(int y) {
-    DrawText(TextFormat("[ ] slide wall   M material: %s (refl %.0f%%)   T reflection %s   G occlusion %s",
+    ui_text(TextFormat("[ ] slide wall   M material: %s (refl %.0f%%)   T reflection %s   G occlusion %s",
                         mat_names[cur_mat], mat_refl[cur_mat] * 100.0f,
                         refl_audible ? "ON" : "off", occ_audible ? "ON" : "off"),
              12, y, 15, (Color){ 110, 200, 255, 255 });
-    DrawText(TextFormat("%s   (occlusion %.0f%% audible)",
+    ui_text(TextFormat("%s   (occlusion %.0f%% audible)",
                         occ_refl_valid ? "in FRONT: REFLECTING - audible image source" :
                         (occ_occluded ? "BEHIND: OCCLUDED - Steam Audio attenuates + tilts by material"
                                       : "wall: clear line of sight"),
@@ -376,9 +377,9 @@ static void dir_draw3d(void) {
     }
 }
 static void dir_hud(int y) {
-    DrawText(TextFormat("directivity [Z]: %s   aim with , / .   (%.0f%% on-axis at the listener)",
+    ui_text(TextFormat("directivity [Z]: %s   aim with , / .   (%.0f%% on-axis at the listener)",
                         dir_names[cur_dir], dir_gain * 100.0f), 12, y, 15, (Color){ 110, 200, 255, 255 });
-    DrawText("move/aim the source so its forward points AWAY from the head and hear it drop",
+    ui_text("move/aim the source so its forward points AWAY from the head and hear it drop",
              12, y + 22, 15, (Color){ 200, 200, 210, 255 });
 }
 
@@ -405,11 +406,11 @@ static void chan_draw3d(void) {
     DrawLine3D((Vector3){ 0, 0, 0 }, speakers[chan_active], (Color){ 120, 235, 150, 200 });
 }
 static void chan_hud(int y) {
-    DrawText(TextFormat("LEFT/RIGHT step channel   N %s   SPACE auto-walk %s",
+    ui_text(TextFormat("LEFT/RIGHT step channel   N %s   SPACE auto-walk %s",
                         chan_kind == BW_TEST_SINE ? "sine" : "noise", chan_auto ? "ON" : "off"),
              12, y, 15, (Color){ 110, 200, 255, 255 });
     Vector3 p = speakers[chan_active];
-    DrawText(TextFormat("channel %d / %d   %s   speaker (%.2f, %.2f, %.2f)   (binaural: heard from that direction)",
+    ui_text(TextFormat("channel %d / %d   %s   speaker (%.2f, %.2f, %.2f)   (binaural: heard from that direction)",
                         chan_active, NSPK, chan_kind == BW_TEST_SINE ? "660 Hz sine" : "white noise", p.x, p.y, p.z),
              12, y + 22, 15, (Color){ 200, 200, 210, 255 });
 }
@@ -456,11 +457,11 @@ static void rev_draw3d(void) {
     DrawSphere(source_pos, 0.18f, RED);
 }
 static void rev_hud(int y) {
-    DrawText(TextFormat("[G] reverb %s   [ ] wet %.2f   [B] bed decoder: %s   [V] distance->wet %s   move the source",
+    ui_text(TextFormat("[G] reverb %s   [ ] wet %.2f   [B] bed decoder: %s   [V] distance->wet %s   move the source",
                         rev_on ? "ON (wet)" : "off (dry)", rev_wet, rev_decoder ? "AllRAD" : "sampling",
                         rev_dist ? "ON (near dry / far wet)" : "off"),
              12, y, 15, (Color){ 110, 200, 255, 255 });
-    DrawText("8x4x8 m plaster room (Steam Audio bed); clicks [3]/bursts [2] show the tail. SAD vs AllRAD differ most on an IRREGULAR layout",
+    ui_text("8x4x8 m plaster room (Steam Audio bed); clicks [3]/bursts [2] show the tail. SAD vs AllRAD differ most on an IRREGULAR layout",
              12, y + 22, 15, (Color){ 200, 200, 210, 255 });
 }
 
@@ -560,7 +561,9 @@ int main(int argc, char** argv) {
     printf("layout: %s    audio backend: %s%s\n", g_layout_path ? g_layout_path : "default grid", backend_name,
            backend_silent ? "   (SILENT — set BWAUDIO_ASIO_DRIVER to your headphone driver)" : "");
 
+    SetConfigFlags(FLAG_WINDOW_HIGHDPI | FLAG_MSAA_4X_HINT);   /* native pixel density + smooth 3D edges */
     InitWindow(1000, 700, "bwaudio - binaural playground");
+    ui_text_init();                                            /* crisp TTF HUD (see ui_text.h) */
     SetTargetFPS(60);
     cam = (Camera3D){ .target = { 0, 0.5f, 0 }, .up = { 0, 1, 0 }, .fovy = 55, .projection = CAMERA_PERSPECTIVE };
     switch_scene(0);
@@ -623,15 +626,15 @@ int main(int argc, char** argv) {
          * Scene HUDs use up to three lines from y=52 (the localization scene's propagation line is the
          * tallest), so the audio-backend line sits below them at y=120 to avoid overlapping. */
         DrawRectangle(0, 0, GetScreenWidth(), 144, (Color){ 0, 0, 0, 195 });
-        DrawText("[TAB] scene   WASD/RF move source   Q/E head   1-4 signal   right-drag/wheel camera   ESC",
+        ui_text("[TAB] scene   WASD/RF move source   Q/E head   1-4 signal   right-drag/wheel camera   ESC",
                  12, 8, 14, RAYWHITE);
-        DrawText(TextFormat("scene %d/%d:  %s", cur_scene + 1, NSCENE, scenes[cur_scene].name),
+        ui_text(TextFormat("scene %d/%d:  %s", cur_scene + 1, NSCENE, scenes[cur_scene].name),
                  12, 28, 16, (Color){ 235, 235, 120, 255 });
         scenes[cur_scene].hud(52);
         if (backend_silent)
-            DrawText("audio: NULL sink - NO SOUND (set BWAUDIO_ASIO_DRIVER; see console)", 12, 120, 15, (Color){ 255, 110, 110, 255 });
+            ui_text("audio: NULL sink - NO SOUND (set BWAUDIO_ASIO_DRIVER; see console)", 12, 120, 15, (Color){ 255, 110, 110, 255 });
         else
-            DrawText(TextFormat("audio: %s", backend_name), 12, 120, 15, (Color){ 110, 235, 130, 255 });
+            ui_text(TextFormat("audio: %s", backend_name), 12, 120, 15, (Color){ 110, 235, 130, 255 });
         EndDrawing();
     }
 
