@@ -570,6 +570,7 @@ int main(int argc, char** argv) {
 
     while (!WindowShouldClose()) {
         float dt = GetFrameTime();
+        if (IsKeyPressed(KEY_F11)) ToggleBorderlessWindowed();   /* fullscreen */
         float mv = 2.5f * dt, rt = 1.8f * dt;
 
         /* ---- global navigation (every scene) ---- */
@@ -626,7 +627,7 @@ int main(int argc, char** argv) {
          * Scene HUDs use up to three lines from y=52 (the localization scene's propagation line is the
          * tallest), so the audio-backend line sits below them at y=120 to avoid overlapping. */
         DrawRectangle(0, 0, GetScreenWidth(), 144, (Color){ 0, 0, 0, 195 });
-        ui_text("[TAB] scene   WASD/RF move source   Q/E head   1-4 signal   right-drag/wheel camera   ESC",
+        ui_text("[TAB] scene   WASD/RF move source   Q/E head   1-4 signal   right-drag/wheel camera   F11 fullscreen   ESC",
                  12, 8, 14, RAYWHITE);
         ui_text(TextFormat("scene %d/%d:  %s", cur_scene + 1, NSCENE, scenes[cur_scene].name),
                  12, 28, 16, (Color){ 235, 235, 120, 255 });
