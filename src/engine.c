@@ -405,6 +405,15 @@ void bw_source_play(BwEngine* e, BwSource s, BwSound snd, bool loop) {
     }
     rt_source_play(e->rt, s, snd, loop);
 }
+void bw_source_play_at(BwEngine* e, BwSource s, BwSound snd, bool loop, uint64_t start_sample) {
+    if (!e) return;
+    if (rt_sound_channels(e->rt, snd) > 1) {
+        set_error(e, "bw_source_play_at: asset is multichannel — use a point source");
+        return;
+    }
+    rt_source_play_at(e->rt, s, snd, loop, start_sample);
+}
+uint64_t bw_dsp_time(BwEngine* e)                                     { return e ? rt_dsp_time(e->rt) : 0; }
 void bw_source_stop(BwEngine* e, BwSource s)                           { if (e) rt_source_stop(e->rt, s); }
 bool bw_source_is_playing(BwEngine* e, BwSource s)                     { return e ? rt_source_is_playing(e->rt, s) : false; }
 void bw_test_signal(BwEngine* e, uint32_t channel, BwTestKind kind, float gain) { if (e) rt_test_signal(e->rt, channel, (uint8_t)kind, gain); }

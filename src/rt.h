@@ -41,7 +41,7 @@ typedef struct {
     union {
         struct { float x, y, z; }                      pos;
         struct { float g; }                            gain;
-        struct { uint32_t sound; uint8_t loop, oneshot; } play;
+        struct { uint64_t start; uint32_t sound; uint8_t loop, oneshot; } play;  /* start = dsp-sample to begin (0 = now) */
         struct { float px, py, pz, qx, qy, qz, qw; }   lis;
         struct { uint8_t on; }                         refl;
         struct { uint8_t on; }                         dop;   /* per-voice Doppler enable */
@@ -112,6 +112,7 @@ void rt_source_set_priority(RtCore* c, uint32_t h, int priority);   /* 0 = expen
 void rt_source_set_pos (RtCore* c, uint32_t h, float x, float y, float z);
 void rt_source_set_gain(RtCore* c, uint32_t h, float linear);
 void rt_source_play    (RtCore* c, uint32_t h, uint32_t sound, bool loop);
+void rt_source_play_at (RtCore* c, uint32_t h, uint32_t sound, bool loop, uint64_t start_sample);  /* sample-accurate */
 void rt_source_stop    (RtCore* c, uint32_t h);
 void rt_source_set_doppler(RtCore* c, uint32_t h, bool on);          /* propagation: glided delay -> pitch from radial motion */
 void rt_source_set_air_absorption(RtCore* c, uint32_t h, bool on);   /* propagation: distance-driven HF low-pass */
@@ -125,5 +126,6 @@ void rt_render(RtCore* c, float* bus, uint32_t nframes, const BwTimestamp* ts);
 void rt_get_listener(RtCore* c, float p[3], float q[4]);   /* audio thread: active pose */
 void rt_read_pose(RtCore* c, float p[3], float q[4]);      /* control thread: active pose (seqlock readback) */
 bool rt_source_is_playing(RtCore* c, uint32_t h);         /* control thread: is the source's voice still playing? */
+uint64_t rt_dsp_time(RtCore* c);                          /* control thread: current dsp-sample clock (for scheduling) */
 
 #endif /* BW_RT_H */

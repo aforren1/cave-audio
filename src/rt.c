@@ -51,6 +51,7 @@ typedef struct {
     bool     active, playing, loop, dirty, oneshot;
     const SoundData* sound;                 /* bound sound (NULL when idle); audio reads pcm */
     uint32_t cursor;                        /* sample cursor into sound->pcm */
+    uint64_t start_sample;                  /* dsp-sample to begin output (0 = immediate); for scheduled play */
     float    pos_pending[3], pos_active[3];
     float    gain_user;
     float    gtarget[BW_CHANNELS], gcur[BW_CHANNELS];
@@ -143,6 +144,8 @@ struct RtCore {
     _Atomic int panner;      /* 0 = DBAP (moving observer); 1 = SPCAP; 2 = VBAP (both fixed observer); atomic for A/B */
     _Atomic int dual_band;   /* 0 = single (power) panning; 1 = dual-band (amplitude LF / power HF); atomic for A/B */
     float       xover_a;     /* one-pole LP coeff for the dual-band crossover (BW_DUALBAND_FC), rate-derived */
+    uint64_t    dsp_block;   /* audio-thread: next block's dsp-sample (fallback clock when no device timestamp) */
+    _Atomic uint64_t dsp_now;/* published block-start dsp-sample; control thread reads via rt_dsp_time for scheduling */
     uint32_t   layout_gen;   /* bumped on rt_set_layout; the SPCAP/VBAP caches compare it to self-invalidate */
     SpcapState spcap;        /* SPCAP cache (audio-thread-owned; rebuilt on listener/layout change) */
     VbapState  vbap;         /* VBAP cache (same) */
@@ -382,6 +385,7 @@ static void drain_commands(RtCore* c) {
             const SoundData* s = sound_for(c, cmd->u.play.sound);
             if (v && s) { v->sound = s; v->cursor = 0; v->loop = cmd->u.play.loop != 0;
                           v->oneshot = cmd->u.play.oneshot != 0; v->playing = true; v->dirty = true;
+                          v->start_sample = cmd->u.play.start;  /* 0 = now; else hold output until this dsp-sample */
                           v->refl_g_cur = 0.f;                  /* fresh start: ramp the wet send up from 0, no stale burst */
                           v->xover_lp = 0.f;                    /* fresh dual-band crossover state */
                           if (v->dop_on) dop_line_reset(c, v, BW_H_IDX(cmd->handle)); } } break;
@@ -533,7 +537,7 @@ static void compute_gains(RtCore* c, Voice* v) {
  * Routing (gtarget) is still the M2 placeholder until M4. On a non-looping end the voice
  * stops; a oneshot additionally acks EVT_VOICE_ENDED so the control thread recycles its
  * transient handle. */
-static void mix_voice(RtCore* c, Voice* v, uint16_t idx, float* bus, uint32_t n, float* aux) {
+static void mix_voice(RtCore* c, Voice* v, uint16_t idx, float* bus, uint32_t n, uint32_t start, float* aux) {
     const SoundData* snd = v->sound;
     float step[BW_CHANNELS];
     for (uint32_t ch = 0; ch < c->channels; ++ch)
@@ -632,6 +636,7 @@ static void mix_voice(RtCore* c, Voice* v, uint16_t idx, float* bus, uint32_t n,
     uint32_t cur = v->cursor;
     bool ended = false;
     for (uint32_t i = 0; i < n; ++i) {
+        if (i < start) continue;               /* scheduled start: this voice stays silent (and frozen) until the in-block offset */
         if (cur >= snd->frames) {
             if (v->loop) cur = 0;
             else         ended = true;
@@ -706,13 +711,14 @@ static void mix_voice(RtCore* c, Voice* v, uint16_t idx, float* bus, uint32_t n,
 /* Mix an ambisonic BED voice: decode its SH channels straight onto the 26-ch bus through the static
  * decode matrix (world-locked — no DBAP, occlusion, or directivity), with a master-gain ramp on
  * gcur[0]. Looping / natural end / oneshot-ack are identical to mix_voice. */
-static void mix_bed(RtCore* c, Voice* v, uint16_t idx, float* bus, uint32_t n) {
+static void mix_bed(RtCore* c, Voice* v, uint16_t idx, float* bus, uint32_t n, uint32_t start) {
     const SoundData* snd = v->sound;
     const int nch = (int)snd->channels;
     const float g_step = (v->gtarget[0] - v->gcur[0]) / (float)n;   /* master gain ramp (invariant 4) */
     uint32_t cur = v->cursor;
     bool ended = false;
     for (uint32_t i = 0; i < n; ++i) {
+        if (i < start) continue;               /* scheduled start: silent until the in-block offset */
         if (cur >= snd->frames) { if (v->loop) cur = 0; else ended = true; }
         if (!ended) {
             const float* sh = &snd->pcm[(size_t)cur * nch];
@@ -740,7 +746,13 @@ static void mix_bed(RtCore* c, Voice* v, uint16_t idx, float* bus, uint32_t n) {
 }
 
 void rt_render(RtCore* c, float* bus, uint32_t nframes, const BwTimestamp* ts) {
-    (void)ts;
+    /* dsp clock for sample-accurate scheduling: prefer the device sample position (ASIO/null); fall
+     * back to an internal block counter when no timestamp is supplied (e.g. direct rt_render in tests).
+     * block_start is the absolute dsp-sample of bus[0]; publish it so the control thread can schedule
+     * relative to "now" (rt_dsp_time). */
+    uint64_t block_start = ts ? ts->sample_pos : c->dsp_block;
+    c->dsp_block = block_start + nframes;
+    atomic_store_explicit(&c->dsp_now, block_start, memory_order_relaxed);
 #if defined(_MSC_VER)
     /* Flush denormals to zero on the audio thread: gain ramps toward 0 (e.g. a voice
      * moving off a channel) otherwise produce subnormals that stall the FP pipeline. */
@@ -773,9 +785,17 @@ void rt_render(RtCore* c, float* bus, uint32_t nframes, const BwTimestamp* ts) {
         Voice* v = &c->voices[i];
         if (!v->active || !v->playing || !v->sound) continue;
         ++rt_active;
+        /* scheduled start: hold the voice until the block that contains its start_sample, then begin
+         * at the exact in-block offset (sample-accurate). 0 = play immediately. */
+        uint32_t off = 0;
+        if (v->start_sample > block_start) {
+            uint64_t d = v->start_sample - block_start;
+            if (d >= nframes) continue;                /* starts in a later block: nothing to mix yet */
+            off = (uint32_t)d;
+        }
         if (v->dirty) { compute_gains(c, v); v->dirty = false; }
-        if (v->sound->channels > 1) mix_bed  (c, v, (uint16_t)i, bus, nframes);        /* ambisonic bed */
-        else                        mix_voice(c, v, (uint16_t)i, bus, nframes, aux);   /* mono point source */
+        if (v->sound->channels > 1) mix_bed  (c, v, (uint16_t)i, bus, nframes, off);        /* ambisonic bed */
+        else                        mix_voice(c, v, (uint16_t)i, bus, nframes, off, aux);   /* mono point source */
     }
     BW_ZONE_END(zmix);
     BW_PLOT("rt voices", rt_active);
@@ -833,6 +853,12 @@ bool rt_source_is_playing(RtCore* c, uint32_t h) {
     if (idx >= c->voice_cap) return false;
     uint32_t st = atomic_load_explicit(&c->play_pub[idx], memory_order_acquire);
     return ((st >> 1) == BW_H_GEN(h)) && (st & 1u) != 0u;
+}
+
+/* Control thread: the engine's current dsp-sample clock (the most recently rendered block's first
+ * sample). Schedule a sample-accurate play with rt_source_play_at(.., rt_dsp_time(c) + delay_samples). */
+uint64_t rt_dsp_time(RtCore* c) {
+    return c ? atomic_load_explicit(&c->dsp_now, memory_order_relaxed) : 0;
 }
 
 /* Active listener pose, for the binaural monitor. Audio thread only (same thread as
@@ -943,11 +969,16 @@ void rt_test_signal(RtCore* c, uint32_t channel, uint8_t kind, float gain) {
 }
 
 void rt_source_play(RtCore* c, uint32_t h, uint32_t sound, bool loop) {
+    rt_source_play_at(c, h, sound, loop, 0);   /* 0 = start immediately */
+}
+
+void rt_source_play_at(RtCore* c, uint32_t h, uint32_t sound, bool loop, uint64_t start_sample) {
     SoundSlot* s = sound_slot_ctrl(c, sound);
     if (!s || s->retiring) return;          /* invalid or being unloaded: drop the play so the
                                              * audio thread can never bind a retiring sound */
     Cmd cmd = { .type = CMD_PLAY, .handle = h };
     cmd.u.play.sound = sound; cmd.u.play.loop = loop ? 1u : 0u; cmd.u.play.oneshot = 0u;
+    cmd.u.play.start = start_sample;
     cmd_push(&c->cmds, &cmd);
 }
 

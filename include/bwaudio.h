@@ -91,6 +91,14 @@ BW_API void     bw_source_set_priority(BwEngine* e, BwSource s, int priority);
 BW_API void     bw_source_set_pos(BwEngine* e, BwSource s, float x, float y, float z); /* ROOM space, right-handed */
 BW_API void     bw_source_set_gain(BwEngine* e, BwSource s, float linear);
 BW_API void     bw_source_play(BwEngine* e, BwSource s, BwSound snd, bool loop);
+/* Sample-accurate scheduled play: begin output exactly when the engine's dsp clock reaches
+ * `start_sample` (the voice is silent until then, then starts at the precise in-block sample).
+ * Get "now" from bw_dsp_time and add a delay, e.g. play 0.5 s out: bw_dsp_time(e) + sample_rate/2.
+ * A start_sample already in the past plays immediately (best-effort). 0 = play now (== bw_source_play). */
+BW_API void     bw_source_play_at(BwEngine* e, BwSource s, BwSound snd, bool loop, uint64_t start_sample);
+/* The engine's current dsp-sample clock (most recently rendered block's first sample): the device
+ * sample position when running, an internal block counter otherwise. Monotonic. 0 before the first block. */
+BW_API uint64_t bw_dsp_time(BwEngine* e);
 BW_API void     bw_source_stop(BwEngine* e, BwSource s);
 /* Is the source's voice still producing audio? Control-thread poll (latest-wins readback): true while
  * a sound plays, false once a non-loop sound finishes, after stop, or for a stale/destroyed handle.

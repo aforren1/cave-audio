@@ -564,8 +564,34 @@ int main(void) {
         }
     }
 
+    /* sample-accurate scheduled play: a voice is held silent until its start_sample, then fires */
+    {
+        RtCore* cp = rt_create(4, 4, RATE, CH);
+        CHECK(cp != NULL, "rt_create (schedule)");
+        if (cp) {
+            uint32_t sp = rt_load_sound(cp, WAV, err, sizeof err);
+            uint32_t h  = rt_source_create(cp);
+            rt_source_set_pos(cp, h, 1.f, 0.f, 1.f);
+            rt_source_play_at(cp, h, sp, true, (uint64_t)3 * N);    /* start at the 4th block */
+            rt_commit(cp);
+            double pre = 0; uint64_t pos = 0;
+            for (int blk = 0; blk < 3; ++blk) {                    /* blocks spanning [0, 3N): held silent */
+                BwTimestamp ts = { pos, 0 };
+                rt_render(cp, bus, N, &ts);
+                pre += total_l2();
+                pos += N;
+            }
+            CHECK(pre < 1e-6, "scheduled voice is silent before its start_sample");
+            BwTimestamp ts3 = { pos, 0 };                          /* pos == 3N: the voice fires here */
+            rt_render(cp, bus, N, &ts3);
+            CHECK(total_l2() > 1e-3, "scheduled voice fires at its start_sample");
+            CHECK(rt_dsp_time(cp) == (uint64_t)3 * N, "rt_dsp_time tracks the device sample clock");
+            rt_destroy(cp);
+        }
+    }
+
     remove(WAV);
     if (fails) { printf("rt_test: %d FAILURES\n", fails); return 1; }
-    printf("rt_test OK (DBAP, commit, gen-drop, gain, occlusion, EQ, directivity, bed, reflection-tap, channel-test, air+Doppler, spread, reverb-send, dual-band, voice-steal verified)\n");
+    printf("rt_test OK (DBAP, commit, gen-drop, gain, occlusion, EQ, directivity, bed, reflection-tap, channel-test, air+Doppler, spread, reverb-send, dual-band, voice-steal, scheduled-play verified)\n");
     return 0;
 }
