@@ -377,6 +377,9 @@ void  bw_bed_destroy(BwEngine* e, BwBed b)                      { bw_source_dest
 BwSource bw_source_create(BwEngine* e) {
     return e ? rt_source_create(e->rt) : 0;
 }
+void bw_source_set_priority(BwEngine* e, BwSource s, int priority) {
+    if (e) rt_source_set_priority(e->rt, s, priority);
+}
 void bw_source_destroy(BwEngine* e, BwSource s) {
     if (!e) return;
 #ifdef BW_HAVE_STEAMAUDIO

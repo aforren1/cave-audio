@@ -84,6 +84,10 @@ BW_API BwSound bw_load_ambix(BwEngine* e, const char* path);
 /* ---- sources (control thread; non-blocking, enqueue only) ---- */
 BW_API BwSource bw_source_create(BwEngine* e);              /* handle returned synchronously */
 BW_API void     bw_source_destroy(BwEngine* e, BwSource s);
+/* Voice-steal priority, 0 = expendable .. 255 = protected (default 128). When the voice pool is full,
+ * bw_source_create stops the lowest-priority active source to make room for the new one (so an overload
+ * drops the least-important sound instead of failing the new one). Set high on music/critical SFX. */
+BW_API void     bw_source_set_priority(BwEngine* e, BwSource s, int priority);
 BW_API void     bw_source_set_pos(BwEngine* e, BwSource s, float x, float y, float z); /* ROOM space, right-handed */
 BW_API void     bw_source_set_gain(BwEngine* e, BwSource s, float linear);
 BW_API void     bw_source_play(BwEngine* e, BwSource s, BwSound snd, bool loop);

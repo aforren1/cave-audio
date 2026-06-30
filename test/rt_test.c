@@ -540,8 +540,32 @@ int main(void) {
         }
     }
 
+    /* voice priority + stealing: a create on a full pool stops the lowest-priority active source */
+    {
+        RtCore* cs = rt_create(4, 4, RATE, CH);
+        CHECK(cs != NULL, "rt_create (steal)");
+        if (cs) {
+            uint32_t ss = rt_load_sound(cs, WAV, err, sizeof err);
+            uint32_t hh[4];
+            for (int i = 0; i < 4; ++i) {
+                hh[i] = rt_source_create(cs);
+                rt_source_play(cs, hh[i], ss, true);
+                rt_source_set_priority(cs, hh[i], i == 2 ? 10 : 200);   /* hh[2] is the expendable one */
+            }
+            rt_commit(cs); render2(cs);
+            CHECK(rt_source_is_playing(cs, hh[2]) && rt_source_is_playing(cs, hh[0]), "4 voices fill the pool");
+            uint32_t h5 = rt_source_create(cs);                        /* pool full -> steal hh[2] (priority 10) */
+            CHECK(h5 != 0, "create on a full pool succeeds by stealing");
+            rt_source_play(cs, h5, ss, true);
+            rt_commit(cs); render2(cs);
+            CHECK(!rt_source_is_playing(cs, hh[2]), "the lowest-priority voice was stolen");
+            CHECK(rt_source_is_playing(cs, hh[0]) && rt_source_is_playing(cs, h5), "higher-priority + new voices survive");
+            rt_destroy(cs);
+        }
+    }
+
     remove(WAV);
     if (fails) { printf("rt_test: %d FAILURES\n", fails); return 1; }
-    printf("rt_test OK (DBAP, commit, gen-drop, gain, occlusion, EQ, directivity, bed, reflection-tap, channel-test, air+Doppler, spread, reverb-send, dual-band verified)\n");
+    printf("rt_test OK (DBAP, commit, gen-drop, gain, occlusion, EQ, directivity, bed, reflection-tap, channel-test, air+Doppler, spread, reverb-send, dual-band, voice-steal verified)\n");
     return 0;
 }

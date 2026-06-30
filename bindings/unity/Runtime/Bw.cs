@@ -67,6 +67,7 @@ namespace CaveAudio
 
         // ---- sources (per-frame; non-blocking) ----
         [DllImport(DLL, CallingConvention = CC)] public static extern uint bw_source_create(IntPtr e);
+        [DllImport(DLL, CallingConvention = CC)] public static extern void bw_source_set_priority(IntPtr e, uint s, int priority);
         [DllImport(DLL, CallingConvention = CC)] public static extern void bw_source_destroy(IntPtr e, uint s);
         [DllImport(DLL, CallingConvention = CC)] public static extern void bw_source_set_pos(IntPtr e, uint s, float x, float y, float z);
         [DllImport(DLL, CallingConvention = CC)] public static extern void bw_source_set_gain(IntPtr e, uint s, float linear);

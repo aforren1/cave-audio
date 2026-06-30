@@ -127,6 +127,7 @@ struct RtCore {
     /* control-thread-owned voice handle allocation */
     uint16_t* gen;                          /* current generation per voice slot */
     uint8_t*  inuse;                        /* 1 while a voice slot is allocated */
+    uint8_t*  priority;                     /* per-source steal priority (control-side; 0=expendable..255=protected) */
     uint32_t* freelist;
     uint32_t  free_count;
 
@@ -845,13 +846,33 @@ void rt_get_listener(RtCore* c, float p[3], float q[4]) {
 
 uint32_t rt_source_create(RtCore* c) {
     uint32_t h = alloc_handle(c);
-    if (!h) return 0;
+    if (!h) {                               /* pool full: steal the lowest-priority active source for the new one */
+        int victim = -1, lowest = 256;
+        for (uint32_t i = 0; i < c->voice_cap; ++i)   /* 255 = protected: never stolen */
+            if (c->inuse[i] && c->priority[i] < 255 && (int)c->priority[i] < lowest) { lowest = c->priority[i]; victim = (int)i; }
+        if (victim >= 0) {
+            rt_source_destroy(c, BW_MK_H((uint16_t)victim, c->gen[victim]));   /* stops it + frees the slot */
+            h = alloc_handle(c);
+        }
+        if (!h) return 0;                   /* nothing to steal (or the destroy didn't enqueue): genuinely full */
+    }
+    uint16_t idx = BW_H_IDX(h);
+    c->priority[idx] = 128;                 /* default mid priority until the caller sets one */
     Cmd cmd = { .type = CMD_SRC_CREATE, .handle = h };
     if (!cmd_push(&c->cmds, &cmd)) {        /* ring full (should never happen): don't leak the slot */
-        recycle_handle(c, BW_H_IDX(h));
+        recycle_handle(c, idx);
         return 0;
     }
     return h;
+}
+
+/* Steal priority (control-side only — the audio thread never reads it): 0 = first to be stolen when
+ * the pool is full .. 255 = protected. Take effect immediately; safe any time. */
+void rt_source_set_priority(RtCore* c, uint32_t h, int priority) {
+    if (!c) return;
+    uint16_t idx = BW_H_IDX(h);
+    if (idx < c->voice_cap && c->inuse[idx] && c->gen[idx] == BW_H_GEN(h))
+        c->priority[idx] = (uint8_t)(priority < 0 ? 0 : priority > 255 ? 255 : priority);
 }
 
 void rt_source_destroy(RtCore* c, uint32_t h) {
@@ -1042,6 +1063,7 @@ RtCore* rt_create(uint32_t voice_cap, uint32_t sound_cap, uint32_t sample_rate, 
     c->aux        = (float*)   calloc(BW_RT_MAX_BLOCK, sizeof(float));   /* reflection aux-send scratch */
     c->gen       = (uint16_t*) calloc(voice_cap, sizeof(uint16_t));
     c->inuse     = (uint8_t*)  calloc(voice_cap, sizeof(uint8_t));
+    c->priority  = (uint8_t*)  calloc(voice_cap, sizeof(uint8_t));
     c->freelist  = (uint32_t*) calloc(voice_cap, sizeof(uint32_t));
     c->sounds    = (SoundSlot*)calloc(sound_cap, sizeof(SoundSlot));
     c->sfreelist = (uint32_t*) calloc(sound_cap, sizeof(uint32_t));
@@ -1052,7 +1074,7 @@ RtCore* rt_create(uint32_t voice_cap, uint32_t sound_cap, uint32_t sample_rate, 
         c->dop_ring = (float*)calloc((size_t)voice_cap * rl, sizeof(float));
     }
     if (!c->voices || !c->occ_handle || !c->occ_val || !c->occ_eq || !c->occ_dir || !c->play_pub || !c->aux ||
-        !c->gen || !c->inuse || !c->freelist || !c->sounds || !c->sfreelist || !c->dop_ring) {
+        !c->gen || !c->inuse || !c->priority || !c->freelist || !c->sounds || !c->sfreelist || !c->dop_ring) {
         rt_destroy(c); return NULL;
     }
     const uint64_t eq_flat = eq_pack((float[3]){ 1.f, 1.f, 1.f });
@@ -1195,6 +1217,7 @@ void rt_destroy(RtCore* c) {
     free(c->sfreelist);
     free(c->sounds);
     free(c->freelist);
+    free(c->priority);
     free(c->inuse);
     free(c->gen);
     free(c->dop_ring);

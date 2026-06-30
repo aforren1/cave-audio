@@ -106,8 +106,9 @@ uint16_t rt_sound_channels(RtCore* c, uint32_t sound);   /* 1 = mono, 4/9/16 = b
 void     rt_unload_sound(RtCore* c, uint32_t sound);  /* safe any time; retire-acked internally */
 
 /* ---- control thread: handle allocation is synchronous, the rest enqueue ---- */
-uint32_t rt_source_create(RtCore* c);                 /* 0 if the table is full */
+uint32_t rt_source_create(RtCore* c);                 /* steals the lowest-priority source if the table is full */
 void rt_source_destroy (RtCore* c, uint32_t h);
+void rt_source_set_priority(RtCore* c, uint32_t h, int priority);   /* 0 = expendable .. 255 = protected (default 128) */
 void rt_source_set_pos (RtCore* c, uint32_t h, float x, float y, float z);
 void rt_source_set_gain(RtCore* c, uint32_t h, float linear);
 void rt_source_play    (RtCore* c, uint32_t h, uint32_t sound, bool loop);
