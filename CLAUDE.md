@@ -125,7 +125,10 @@ implemented (`steam_reflect.c`, same gate): an `IPLSimulator` reflections sim �
 SH→26 decode → bus, registered as the rt bus tap at `bw_start`; the `reflect` test proves it's
 *directional*. Sources opt in via `bw_source_set_reflections`, with a per-source wet-send level
 (`bw_source_set_reflection_send`) and an optional **distance→wet** scaling (`bw_source_set_reflection_distance`,
-near = drier / far = wetter; the send gain is distance-derived in `rt.c` and ramped). **Opt-in per-source
+near = drier / far = wetter; the send gain is distance-derived in `rt.c` and ramped). **Baked reflections**
+(`BWAUDIO_BAKE=1`, same gate) precompute the reverb at a probe grid at `bw_start` so the sim thread looks it
+up instead of ray-tracing; the `bake` test confirms it stays directional. (Pathing rides the same probe
+machinery and is the next clean follow-on; see docs/materials.md.) **Opt-in per-source
 propagation effects** are implemented (phonon-free,
 pure `rt.c` DSP, default off): **Doppler** (`bw_source_set_doppler`) renders each voice through a
 per-voice fractional delay ring (`RtCore.dop_ring`, one power-of-two ring per voice, allocated at

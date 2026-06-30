@@ -46,7 +46,7 @@ int main(void) {
     float absorption[3] = { 0.1f, 0.1f, 0.1f }, transmission[3] = { 0.05f, 0.05f, 0.05f };
     steam_scene_set_mesh(scene, verts, 8, tris, 12, absorption, 0.5f, transmission);
 
-    SteamReflect* refl = steam_reflect_create(scene, rt, &L, SR, BLK, /*order*/1, /*ir*/0.5f, /*rays*/4096, /*bounces*/16, /*wet*/1.0f);
+    SteamReflect* refl = steam_reflect_create(scene, rt, &L, SR, BLK, /*order*/1, /*ir*/0.5f, /*rays*/4096, /*bounces*/16, /*wet*/1.0f, /*bake*/0);
     if (!refl) { printf("FAIL: steam_reflect_create\n"); steam_scene_destroy(scene); free(bus); rt_destroy(rt); return 1; }
 
     Sleep(600);                       /* let the off-thread sim accumulate + publish the (2,0,0) IR */

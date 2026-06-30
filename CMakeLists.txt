@@ -282,6 +282,20 @@ if(BWAUDIO_BUILD_TESTS)
                 "${STEAMAUDIO_DIR}/lib/windows-x64/phonon.dll" $<TARGET_FILE_DIR:bw_reflect_test>)
     endif()
     add_test(NAME reflect COMMAND bw_reflect_test)
+
+    add_executable(bw_bake_test test/bake_test.c src/steam_scene.c src/steam_reflect.c)
+    target_include_directories(bw_bake_test PRIVATE src "${STEAMAUDIO_DIR}/include")
+    target_link_libraries(bw_bake_test PRIVATE bw_core "${STEAMAUDIO_DIR}/lib/windows-x64/phonon.lib")
+    target_compile_definitions(bw_bake_test PRIVATE BW_HAVE_STEAMAUDIO)
+    if(MSVC)
+      set_source_files_properties(src/steam_reflect.c PROPERTIES COMPILE_OPTIONS /experimental:c11atomics)
+    endif()
+    if(WIN32)
+      add_custom_command(TARGET bw_bake_test POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                "${STEAMAUDIO_DIR}/lib/windows-x64/phonon.dll" $<TARGET_FILE_DIR:bw_bake_test>)
+    endif()
+    add_test(NAME bake COMMAND bw_bake_test)
   endif()
 
   # Optional: AddressSanitizer build of the sound test (M3 unload-safety / UAF check).

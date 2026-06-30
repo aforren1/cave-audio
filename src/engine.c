@@ -264,10 +264,12 @@ int bw_start(BwEngine* e) {
      * bus tap. Same frameSize-fixed-at-create reason as the monitor — build it now. Non-fatal: if it
      * fails, no tap is registered and the engine runs dry. Needs the occlusion scene (shared geometry). */
     if (e->scene && e->refl_cfg.enabled) {
+        const char* bake_env = getenv("BWAUDIO_BAKE");
+        int bake = (bake_env && bake_env[0] && bake_env[0] != '0');   /* opt-in: precompute the reverb at probes */
         e->reflect = steam_reflect_create(e->scene, e->rt, &e->layout, e->cfg.sample_rate,
                                           bw_sink_block_size(e->sink), e->refl_cfg.order,
                                           e->refl_cfg.ir_seconds, e->refl_cfg.num_rays, e->refl_cfg.num_bounces,
-                                          e->refl_cfg.wet_gain);
+                                          e->refl_cfg.wet_gain, bake);
         if (e->reflect) rt_set_bus_tap(e->rt, steam_reflect_tap, e->reflect);
     }
 #endif

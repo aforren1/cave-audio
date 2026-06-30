@@ -37,7 +37,7 @@ typedef struct SteamReflect SteamReflect;
 SteamReflect* steam_reflect_create(SteamScene* scene, RtCore* rt, const Layout* L,
                                    uint32_t sample_rate, uint32_t block, uint32_t order,
                                    float ir_seconds, uint32_t num_rays, uint32_t num_bounces,
-                                   float wet_gain);
+                                   float wet_gain, int bake);   /* bake!=0: precompute reverb at probes (BWAUDIO_BAKE) */
 
 /* The rt bus tap (matches RtBusTap): AUDIO thread, after the voice loop, before align_process.
  * ud == the SteamReflect*. Convolves `aux` and sums the decoded 26-ch reverb onto `bus`. */

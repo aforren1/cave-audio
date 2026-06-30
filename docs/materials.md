@@ -397,35 +397,40 @@ dominate. A deployment requirement, noted here so it is designed for, not discov
     yet built**; that and **directivity** are the next increment on this same pre-pan stage.
 - **Reflection bed, perceptual mode, directivity — designed, not yet implemented** (this document).
 
-## Baking & pathing — BLOCKED by the vendored phonon build (precise diagnosis)
+## Baked reflections — implemented (`BWAUDIO_BAKE`)
 
-Steam Audio supports baked reflections and pathing; the engine does **not** wire them up, and a
-second, thorough spike pinned down *why* — it is not our code, it is the vendored `phonon.dll`.
+`BWAUDIO_BAKE=1` precomputes the listener-centric reverb at a grid of probes covering the listening
+zone (`steam_reflect.c` `do_bake`, gated `BW_HAVE_STEAMAUDIO`); the reflection sim thread then *looks
+up* the reverb at the listener each tick instead of ray-tracing it. The ray-trace runs once, offline,
+at `bw_start`, and can afford more rays/bounces than real time. The reverb still renders through the
+same hybrid effect + 26-decode, so it stays **directional** — the `bake` test confirms the +X-near
+listener gets +X-biased reverb out of baked data (ratio ≈ 1.4, vs ~1.0 for an omni bed).
 
-**Baked reflections** (`iplReflectionsBakerBake` over an `IPLProbeBatch`) precompute the reverb at a
-probe grid so the runtime looks it up instead of ray-tracing. The spike got this far:
+Two non-obvious things had to be right, both learned by reading the SDK source:
 
-- **Probe generation works** — `UNIFORMFLOOR` finds no floor in a box mesh whose floor faces down
-  (winding-sensitive), but placing probes manually with one `CENTROID` call per grid point (CENTROID
-  drops a probe at the box centre regardless of geometry) gives full control and a real grid.
-- **The bake works** — `iplReflectionsBakerBake` runs and stores data; `iplProbeBatchGetReverb`
-  reads back genuine reverb times (`[0.10, 0.10, 0.10]` for the test room) from a baked probe.
-- **The runtime retrieval is broken** — with the listener inside the probe grid and the data present,
-  `iplSourceSetInputs(..baked=IPL_TRUE, identifier={REFLECTIONS,REVERB}) → iplSimulatorRunReflections →
-  iplSourceGetOutputs` returns `reverbTimes=[0,0,0]` and a zero-content IR. Coverage, probe-box overlap
-  (probe influence == its generation box), and bake duration/bounces were all ruled out; the retrieved
-  output is a constant, independent of the baked data.
+- **Probe placement.** `UNIFORMFLOOR` generation is sensitive to floor-mesh winding (it found no floor
+  in a box whose floor faces down). Placing probes manually with one `CENTROID` call per grid point is
+  robust — but phonon's `generateCentroidProbe` reads the probe **centre from the transform's
+  translation column** and the influence **radius from the basis-column lengths (min/2)** (it treats
+  the matrix as an OBB centre+basis, NOT the documented unit-cube→box mapping). So the translation must
+  be the grid point itself (not a corner), and a box edge of `2*spacing` gives `radius == spacing`, so
+  the probes' influence spheres overlap. Get the translation wrong and the probes land outside their
+  own influence radius of the listener.
+- **Why that matters.** `SimulationManager::lookupBakedReflections` only fills the reverb for sources
+  whose listener has **influencing probes** (`getInfluencingProbes` → `validSimulationData`). Probes
+  off by half a box → no influencing probe → the lookup is silently skipped and the reverb stays zero.
+  (That zero, not a phonon-build fault, was the whole mystery — the Unity integration's identical
+  call sequence is what pointed back at the probe transform.)
 
-So the *baker* works but the simulator's *baked-lookup* path does not, in this build. The vendored
-phonon is a **custom-patched DLL** (there are `phonon.dll.orig` files; the directional reflection bed
-depends on a hand-applied SSE-alignment fix). That build appears to ship a working baker and a broken
-or absent baked-retrieval path. **Pathing rides the identical `probe → bake → simulator-run` machinery
-(`iplPathBakerBake` + `iplSimulatorRunPathing` + `IPLSimulationInputs.pathingProbes`), so it almost
-certainly hits the same wall.**
+Marginal CPU win for *this* installation (the real-time ray-trace already runs off the audio thread
+with Tracy headroom), but it enables much higher bake-time quality and is the right default for a
+static room.
 
-Unblocking needs a phonon with working baked retrieval — but swapping the DLL risks losing the
-alignment patch the *directional* real-time bed relies on, so it is a build/validation task, not a
-code change. The wiring itself is understood and small (baking → the bed source's
-`IPLSimulationInputs.baked`; pathing → a per-source field decoded to the bus like the reflection bed)
-and can be re-applied in an afternoon once a phonon build that retrieves baked data is in hand. Best
-done at the rig, where the result can be heard.
+## Pathing — not yet wired (same machinery)
+
+`IPL_SIMULATIONFLAGS_PATHING` + `iplPathBakerBake` + `IPLSimulationInputs.pathingProbes` route sound
+around occluders / through portals over the same probe network baking now uses. With baked reflections
+working, the probe-transform gotcha above is solved, so pathing is a clean follow-on: bake path data
+on a probe batch, add `IPL_SIMULATIONFLAGS_PATHING` to the sim, opt sources in per-voice, decode the
+path field to the bus like the reflection bed. It only pays off where the space has real occluders to
+bend sound around — verify with a routing-around-a-wall test, best heard at the rig.
