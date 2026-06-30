@@ -142,6 +142,18 @@ bool layout_load(const char* path, uint32_t sample_rate, Layout* out, char* err,
         uint32_t dsamp = (uint32_t)(dms * 1e-3 * (double)sample_rate + 0.5);
         spk->delay_samples = dsamp;
         if (dsamp > maxdelay) maxdelay = dsamp;
+
+        spk->eq_len = 0;                            /* optional per-speaker correction FIR (calibrate writes it) */
+        cJSON* eqj = cJSON_GetObjectItemCaseSensitive(sp, "eq");
+        if (cJSON_IsArray(eqj)) {
+            int m = cJSON_GetArraySize(eqj);
+            if (m > BW_EQ_TAPS) m = BW_EQ_TAPS;
+            for (int t = 0; t < m; ++t) {
+                cJSON* v = cJSON_GetArrayItem(eqj, t);
+                spk->eq[t] = cJSON_IsNumber(v) ? (float)v->valuedouble : 0.f;
+            }
+            spk->eq_len = (uint16_t)m;
+        }
     }
     for (uint32_t i = 0; i < BW_CHANNELS; ++i)
         if (!seen[i]) { set_err(err, errcap, "layout: missing a speaker index in 0..25"); goto done; }

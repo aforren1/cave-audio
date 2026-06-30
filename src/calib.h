@@ -43,6 +43,18 @@ int calib_trilaterate(const double* range, const float (*mic)[3], int K, float* 
  * preserving everything else). `pos[i]` are room meters; the file's speaker count must equal `n`. */
 int calib_write_positions(const char* in_path, const char* out_path, const float (*pos)[3], int n, char* err, size_t errcap);
 
+/* Per-speaker correction FIR with the calibration gate policy: `ir` starts at the direct arrival;
+ * `first_refl` is the samples to the first reflection (0/unknown -> a default ~4 ms window). Gates so
+ * the filter corrects the SPEAKER (direct sound), not the room, then inverts (see measure_correction).
+ * Writes ntaps into `taps`. Returns 1 / 0. */
+int calib_eq(const float* ir, int nir, int first_refl, double fs, int ntaps, float* taps);
+
+/* Write per-speaker correction FIRs into the layout JSON as each speaker's "eq" array (replacing any
+ * prior), preserving everything else. `taps` is n * max_taps row-major; `lens[i]` taps for speaker i
+ * (0 = remove its eq). The file's speaker count must equal `n`. Returns 1 / 0. */
+int calib_write_eq(const char* in_path, const char* out_path, const float* taps, const uint16_t* lens,
+                   int n, int max_taps, char* err, size_t errcap);
+
 /* Drift check: given measured ranges (c*delay, meters, latency included) from ONE mic at `mic` to n
  * speakers at their STORED positions `pos`, report each speaker's RADIAL deviation (meters) from where
  * it should be. The unknown common latency is removed as the MEDIAN residual (robust to a few moved

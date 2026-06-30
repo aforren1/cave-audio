@@ -157,6 +157,28 @@ int main(void) {
         }
     }
 
+    /* 7a. per-speaker correction FIR: a channel's kernel convolves its signal (before gain+delay) */
+    {
+        Layout EQ = layout_default();
+        EQ.speakers[5].eq_len = 3;
+        EQ.speakers[5].eq[0] = 0.5f; EQ.speakers[5].eq[1] = 0.25f; EQ.speakers[5].eq[2] = -0.1f;
+        Aligner* a = align_create(CH, &EQ);
+        CHECK(a != NULL, "align_create (eq)");
+        if (a) {
+            const uint32_t n = 16;
+            float buf[CH * 16];
+            memset(buf, 0, sizeof buf);
+            buf[5 * n + 0] = 1.0f;             /* impulse on the EQ'd channel (gain 1, delay 0) */
+            buf[1 * n + 0] = 1.0f;             /* a non-EQ channel passes through */
+            align_process(a, buf, n);
+            CHECK(fabs(buf[5*n+0] - 0.5f)  < 1e-6 &&
+                  fabs(buf[5*n+1] - 0.25f) < 1e-6 &&
+                  fabs(buf[5*n+2] + 0.1f)  < 1e-6, "correction FIR convolves the channel with its kernel");
+            CHECK(fabs(buf[1*n+0] - 1.0f) < 1e-6, "a channel with no correction passes through");
+            align_destroy(a);
+        }
+    }
+
     /* 7b. layout_load rejects out-of-range values (so bad JSON can't reach the audio thread) */
     {
         const char* BJ = "bw_bad_layout.json";

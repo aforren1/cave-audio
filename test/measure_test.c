@@ -10,6 +10,28 @@
 static int fails = 0;
 #define CHECK(c, msg) do { if (!(c)) { printf("FAIL: %s\n", msg); ++fails; } } while (0)
 
+#define TPI 6.283185307179586
+
+/* |H(f)| of a real FIR h by direct DFT at one frequency. */
+static double mag_at(const float* h, int n, double f, double fs) {
+    double re = 0, im = 0, w = TPI * f / fs;
+    for (int k = 0; k < n; ++k) { re += h[k] * cos(w * k); im -= h[k] * sin(w * k); }
+    return sqrt(re * re + im * im);
+}
+
+/* one RBJ peaking-EQ biquad applied in place over x[] (direct form I). */
+static void peak_biquad(float* x, int n, double f0, double Q, double gain_db, double fs) {
+    double A = pow(10.0, gain_db / 40.0), w0 = TPI * f0 / fs, cw = cos(w0), alpha = sin(w0) / (2.0 * Q);
+    double a0 = 1 + alpha / A;
+    double b0 = (1 + alpha * A) / a0, b1 = (-2 * cw) / a0, b2 = (1 - alpha * A) / a0;
+    double a1 = (-2 * cw) / a0, a2 = (1 - alpha / A) / a0;
+    double x1 = 0, x2 = 0, y1 = 0, y2 = 0;
+    for (int i = 0; i < n; ++i) {
+        double xn = x[i], yn = b0*xn + b1*x1 + b2*x2 - a1*y1 - a2*y2;
+        x2 = x1; x1 = xn; y2 = y1; y1 = yn; x[i] = (float)yn;
+    }
+}
+
 int main(void) {
     const double fs = 48000.0, f1 = 20.0, f2 = 20000.0;
     const double band_hz[2] = { 300.0, 3000.0 };
@@ -109,7 +131,43 @@ int main(void) {
         free(ir);
     }
 
+    /* --- per-speaker correction: a colored direct-sound IR (three peaking biquads) inverted by
+     *     measure_correction must come out flat in-band. This is the speaker-EQ core. --- */
+    {
+        const int nir = 2048, gate = 1024, ntaps = 512;
+        float* col = (float*)calloc((size_t)nir, sizeof(float));
+        col[0] = 1.0f;                                  /* impulse -> the biquads color its response */
+        peak_biquad(col, nir,  300.0, 1.5,  +5.0, fs);
+        peak_biquad(col, nir, 1200.0, 2.0,  +9.0, fs);
+        peak_biquad(col, nir, 5000.0, 1.5,  -7.0, fs);
+
+        float* taps = (float*)calloc((size_t)ntaps, sizeof(float));
+        int ok = measure_correction(col, nir, 0, gate, 20.0, 20000.0, fs, 6.0, 18.0, ntaps, taps);
+        CHECK(ok, "measure_correction succeeds");
+
+        const int ncor = nir + ntaps;
+        float* cor = (float*)calloc((size_t)ncor, sizeof(float));   /* corrected = col * taps */
+        for (int m = 0; m < ncor; ++m) {
+            double s = 0;
+            for (int k = 0; k < ntaps; ++k) { int idx = m - k; if (idx >= 0 && idx < nir) s += taps[k] * col[idx]; }
+            cor[m] = (float)s;
+        }
+
+        double omin = 1e9, omax = 0, cmin = 1e9, cmax = 0;          /* in-band spread before vs after */
+        for (int t = 0; t < 40; ++t) {
+            double f = 120.0 * pow(12000.0 / 120.0, t / 39.0);      /* 120 .. 12000 Hz, log */
+            double mo = mag_at(col, nir, f, fs), mc = mag_at(cor, ncor, f, fs);
+            if (mo < omin) omin = mo; if (mo > omax) omax = mo;
+            if (mc < cmin) cmin = mc; if (mc > cmax) cmax = mc;
+        }
+        double ospread = 20.0 * log10(omax / omin), cspread = 20.0 * log10(cmax / cmin);
+        printf("eq: colored spread=%.1f dB -> corrected spread=%.1f dB\n", ospread, cspread);
+        CHECK(ok && ospread > 10.0, "colored IR is genuinely non-flat (>10 dB in-band)");
+        CHECK(ok && cspread < 3.0,  "minimum-phase correction flattens it to under 3 dB in-band");
+        free(col); free(taps); free(cor);
+    }
+
     if (fails) { printf("measure_test: %d FAILURES\n", fails); return 1; }
-    printf("measure_test OK (sweep, deconvolution, delay+gain, band tilt, RT60, early reflections verified)\n");
+    printf("measure_test OK (sweep, deconvolution, delay+gain, band tilt, RT60, early reflections, speaker EQ verified)\n");
     return 0;
 }

@@ -155,6 +155,51 @@ fail:
     #undef FAIL
 }
 
+int calib_eq(const float* ir, int nir, int first_refl, double fs, int ntaps, float* taps) {
+    if (!ir || !taps) return 0;
+    /* gate to just before the first reflection so we invert the SPEAKER, not the room; if unknown, a
+     * 4 ms window (long enough to resolve the speaker's response, short enough to exclude most rooms). */
+    int gate = (first_refl > 8) ? first_refl - 4 : (int)(0.004 * fs);
+    if (gate > nir) gate = nir;
+    if (gate < 16) return 0;
+    return measure_correction(ir, nir, 0, gate, 30.0, 18000.0, fs, 6.0, 18.0, ntaps, taps);
+}
+
+int calib_write_eq(const char* in_path, const char* out_path, const float* taps, const uint16_t* lens,
+                   int n, int max_taps, char* err, size_t errcap) {
+    #define FAIL(msg) do { if (err && errcap) snprintf(err, errcap, "%s", msg); goto fail; } while (0)
+    char* text = NULL; cJSON* root = NULL; char* outtext = NULL; int ok = 0;
+    text = read_file(in_path, NULL);
+    if (!text) { if (err && errcap) snprintf(err, errcap, "calib: cannot read %s", in_path); return 0; }
+    root = cJSON_Parse(text);
+    if (!root) FAIL("calib: layout is not valid JSON");
+    cJSON* speakers = cJSON_GetObjectItemCaseSensitive(root, "speakers");
+    if (!cJSON_IsArray(speakers)) FAIL("calib: layout has no 'speakers' array");
+    if (cJSON_GetArraySize(speakers) != n) FAIL("calib: speaker count does not match the measurements");
+
+    for (int i = 0; i < n; ++i) {
+        cJSON* sp = cJSON_GetArrayItem(speakers, i);
+        cJSON_DeleteItemFromObjectCaseSensitive(sp, "eq");     /* replace any prior correction */
+        int m = lens[i]; if (m > max_taps) m = max_taps;
+        if (m > 0) {
+            cJSON* arr = cJSON_CreateArray();
+            if (!arr) FAIL("calib: eq array alloc");
+            for (int t = 0; t < m; ++t) cJSON_AddItemToArray(arr, cJSON_CreateNumber((double)taps[(size_t)i*max_taps + t]));
+            cJSON_AddItemToObject(sp, "eq", arr);
+        }
+    }
+    outtext = cJSON_Print(root);
+    if (!outtext) FAIL("calib: failed to serialize layout");
+    FILE* f = fopen(out_path, "wb");
+    if (!f) FAIL("calib: cannot open output for writing");
+    fwrite(outtext, 1, strlen(outtext), f); fclose(f);
+    ok = 1;
+fail:
+    free(outtext); cJSON_Delete(root); free(text);
+    return ok;
+    #undef FAIL
+}
+
 int calib_write_positions(const char* in_path, const char* out_path, const float (*pos)[3], int n, char* err, size_t errcap) {
     #define FAIL(msg) do { if (err && errcap) snprintf(err, errcap, "%s", msg); goto fail; } while (0)
     char* text = NULL; cJSON* root = NULL; char* outtext = NULL; int ok = 0;

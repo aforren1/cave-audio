@@ -12,10 +12,14 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#define BW_EQ_TAPS 512      /* max per-speaker correction-FIR length */
+
 typedef struct {
     float    pos[3];        /* room space, right-handed, meters */
     float    gain_lin;      /* per-speaker level trim (linear) */
     uint32_t delay_samples; /* per-speaker delay for arrival-time alignment */
+    uint16_t eq_len;        /* per-speaker correction-FIR length (0 = none) */
+    float    eq[BW_EQ_TAPS];/* minimum-phase speaker-correction taps (gated direct-sound inverse) */
 } Speaker;
 
 typedef struct {

@@ -85,6 +85,45 @@ int main(void) {
         remove(IN); remove(OUT);
     }
 
+    /* calib_write_eq: per-speaker correction taps round-trip into each speaker's "eq" array */
+    {
+        const char* EIN = "bw_eq_in.json", *EOUT = "bw_eq_out.json";
+        FILE* ef = fopen(EIN, "wb");
+        CHECK(ef != NULL, "open eq in.json");
+        if (ef) {
+            fputs("{\n \"speakers\": [\n"
+                  "  { \"index\": 0, \"position\": [1,0,0] },\n"
+                  "  { \"index\": 1, \"position\": [2,0,0] },\n"
+                  "  { \"index\": 2, \"position\": [3,0,0] }\n ]\n}\n", ef);
+            fclose(ef);
+            const int MT = 4;
+            float taps[12] = { 0.5f, 0.25f, -0.1f, 0.f,   0,0,0,0,   1.0f, 0,0,0 };
+            uint16_t lens[3] = { 3, 0, 1 };
+            char err[256] = {0};
+            CHECK(calib_write_eq(EIN, EOUT, taps, lens, 3, MT, err, sizeof err), err[0] ? err : "calib_write_eq");
+            FILE* rf = fopen(EOUT, "rb");
+            if (rf) {
+                fseek(rf, 0, SEEK_END); long len = ftell(rf); fseek(rf, 0, SEEK_SET);
+                char* buf = (char*)malloc((size_t)len + 1); size_t rd = fread(buf, 1, (size_t)len, rf); buf[rd] = 0; fclose(rf);
+                cJSON* root = cJSON_Parse(buf);
+                CHECK(root != NULL, "reparse written eq layout");
+                if (root) {
+                    cJSON* sps = cJSON_GetObjectItem(root, "speakers");
+                    cJSON* e0 = cJSON_GetObjectItem(cJSON_GetArrayItem(sps, 0), "eq");
+                    cJSON* e1 = cJSON_GetObjectItem(cJSON_GetArrayItem(sps, 1), "eq");
+                    cJSON* e2 = cJSON_GetObjectItem(cJSON_GetArrayItem(sps, 2), "eq");
+                    CHECK(cJSON_IsArray(e0) && cJSON_GetArraySize(e0) == 3, "speaker 0 eq has 3 taps");
+                    CHECK(e0 && fabs(cJSON_GetArrayItem(e0, 1)->valuedouble - 0.25) < 1e-6, "eq tap value round-trips");
+                    CHECK(e1 == NULL, "speaker 1 (length 0) gets no eq array");
+                    CHECK(cJSON_IsArray(e2) && cJSON_GetArraySize(e2) == 1, "speaker 2 eq has 1 tap");
+                    cJSON_Delete(root);
+                }
+                free(buf);
+            }
+            remove(EIN); remove(EOUT);
+        }
+    }
+
     /* self-localization: recover a speaker position + the system latency from ranges (c*delay,
      * latency included) to 6 non-coplanar mic positions. */
     {

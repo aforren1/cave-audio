@@ -178,6 +178,75 @@ void measure_rt60(const float* ir, int nir, int direct_idx, double fs, RoomResul
     }
 }
 
+int measure_correction(const float* ir, int nir, int direct, int gate_len,
+                       double f1, double f2, double fs, double max_boost_db, double max_cut_db,
+                       int ntaps, float* taps) {
+    if (!ir || !taps || direct < 0 || gate_len < 4 || direct + gate_len > nir || ntaps < 1) return 0;
+    const int N = 8192;                       /* generous so the inverted spectrum + cepstrum are smooth */
+    if (ntaps > N) return 0;
+    double* re = (double*)calloc((size_t)N, sizeof(double));
+    double* im = (double*)calloc((size_t)N, sizeof(double));
+    double* lr = (double*)calloc((size_t)N, sizeof(double));   /* target log-magnitude of the correction */
+    if (!re || !im || !lr) { free(re); free(im); free(lr); return 0; }
+
+    /* 1. gate the direct sound (window to before the first reflection -> this corrects the SPEAKER, not
+     *    the room) with a raised-cosine tail fade so the truncation doesn't ring the spectrum. */
+    int gfade = gate_len / 4; if (gfade < 1) gfade = 1;
+    for (int i = 0; i < gate_len; ++i) {
+        double w = 1.0;
+        if (i >= gate_len - gfade) { int j = i - (gate_len - gfade); w = 0.5 + 0.5 * cos(M_PI * (j + 1) / gfade); }
+        re[i] = (double)ir[direct + i] * w;
+    }
+    fft(re, im, N, +1);                        /* 2. G(k) = gated direct-sound spectrum */
+
+    /* 3. in-band geometric-mean level = the reference the correction flattens toward. */
+    int klo = (int)(f1 * N / fs); if (klo < 1) klo = 1;
+    int khi = (int)(f2 * N / fs); if (khi > N / 2) khi = N / 2;
+    if (khi <= klo) { free(re); free(im); free(lr); return 0; }
+    double logsum = 0.0; int cnt = 0;
+    for (int k = klo; k <= khi; ++k) { double m = sqrt(re[k]*re[k] + im[k]*im[k]); if (m > 1e-12) { logsum += log(m); ++cnt; } }
+    double target = (cnt > 0) ? exp(logsum / cnt) : 1.0;
+
+    /* 4. desired |C(k)| = clamp(target/|G|) in-band (regularized so deep nulls aren't fought), 1 out of
+     *    band, raised-cosine crossfade at the edges. Store as log-magnitude (symmetric). */
+    const double maxb = pow(10.0,  max_boost_db / 20.0);
+    const double maxc = pow(10.0, -max_cut_db  / 20.0);
+    /* taper the correction to unity over the bottom/top HALF-OCTAVE only (constant-Q, so it doesn't
+     * eat the midband the way a linear-bin edge does), and fully outside [f1, f2]. */
+    const double flo_in = f1 * 1.41421356, fhi_in = f2 * 0.70710678;   /* +/- half an octave */
+    for (int k = 0; k <= N / 2; ++k) {
+        double m = sqrt(re[k]*re[k] + im[k]*im[k]); if (m < 1e-12) m = 1e-12;
+        double c = target / m; if (c > maxb) c = maxb; if (c < maxc) c = maxc;
+        double fk = (double)k * fs / N, w;
+        if      (fk < f1 || fk > f2) w = 0.0;
+        else if (fk < flo_in)        w = 0.5 - 0.5 * cos(M_PI * log(fk / f1) / log(flo_in / f1));
+        else if (fk > fhi_in)        w = 0.5 - 0.5 * cos(M_PI * log(f2 / fk) / log(f2 / fhi_in));
+        else                         w = 1.0;
+        lr[k] = w * log(c);                    /* w blends the correction toward unity at the band edges */
+    }
+    for (int k = N / 2 + 1; k < N; ++k) lr[k] = lr[N - k];   /* even symmetry */
+
+    /* 5. minimum-phase realization (cepstral): the min-phase phase is the Hilbert transform of the
+     *    log-magnitude. cepstrum -> fold to the causal side -> back -> exp. No latency / pre-ring. */
+    for (int k = 0; k < N; ++k) { re[k] = lr[k]; im[k] = 0.0; }
+    fft(re, im, N, -1);                         /* real cepstrum in re[] */
+    for (int n = 0; n < N; ++n) {
+        double w = (n == 0) ? 1.0 : (n < N / 2) ? 2.0 : (n == N / 2) ? 1.0 : 0.0;
+        re[n] *= w; im[n] *= w;
+    }
+    fft(re, im, N, +1);                         /* re = log-mag, im = min-phase phase */
+    for (int k = 0; k < N; ++k) { double mag = exp(re[k]), ph = im[k]; re[k] = mag * cos(ph); im[k] = mag * sin(ph); }
+    fft(re, im, N, -1);                         /* 6. min-phase correction impulse response */
+
+    int tfade = ntaps / 8; if (tfade < 1) tfade = 1;
+    for (int i = 0; i < ntaps; ++i) {
+        double w = (i >= ntaps - tfade) ? 0.5 + 0.5 * cos(M_PI * (i - (ntaps - tfade) + 1) / tfade) : 1.0;
+        taps[i] = (float)(re[i] * w);
+    }
+    free(re); free(im); free(lr);
+    return 1;
+}
+
 int measure_room(const float* capture, int ncap, const float* ref, int nref,
                  double f1, double f2, double fs, RoomResult* out, float* ir_out, int ir_cap) {
     if (!capture || !ref || !out || ncap <= 0 || nref <= 0) return 0;

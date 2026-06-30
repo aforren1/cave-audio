@@ -67,6 +67,18 @@ int measure_room(const float* capture, int ncap, const float* ref, int nref,
  * direct-arrival sample). Used by measure_room and unit-tested on synthetic IRs. */
 void measure_rt60(const float* ir, int nir, int direct_idx, double fs, RoomResult* out);
 
+/* Design a per-speaker correction FIR from a measured impulse response. The IR is GATED to the direct
+ * sound — `gate_len` samples from `direct`, chosen to end before the first reflection — so the filter
+ * corrects the SPEAKER's own magnitude response, NOT the room (a moving listener can't be room-EQ'd
+ * from one point; that's the same trap as matching RT60). The gated magnitude is inverted in-band
+ * (regularized; boosts capped at `max_boost_db`, cuts at `max_cut_db`, so deep nulls aren't fought)
+ * and realized as a minimum-phase FIR (no added latency or pre-ring), normalized toward unity in-band
+ * so the scalar gain trim still owns overall level. taps[ntaps] receives the kernel. Returns 1 / 0.
+ * Pure + allocates internally — offline/control-thread only. Unit-tested on a synthetic colored IR. */
+int measure_correction(const float* ir, int nir, int direct, int gate_len,
+                       double f1, double f2, double fs, double max_boost_db, double max_cut_db,
+                       int ntaps, float* taps);
+
 #ifdef __cplusplus
 }
 #endif

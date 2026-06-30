@@ -64,6 +64,18 @@ the trim automatically).
   off-site. For the *spatial* version, do a second capture pass with in-ear/dummy-head mics → those
   IRs are BRIRs (direction + room); the omni pass gives timbre/reverb only.
 
+- **`--eq`** — per-speaker correction filters (the "inverse EQ" a system like Zylia SMS computes),
+  written into each speaker's `eq` array. For every speaker it gates the measured IR to the **direct
+  sound** (a window ending before the first reflection `--room` finds, or a default ~4 ms) and inverts
+  that magnitude into a minimum-phase FIR (`measure_correction` → `calib_eq`), so the filter flattens
+  the **speaker's own** response. It deliberately does NOT correct the room: room response is
+  position-dependent across the ~3×3 m listening area, so a single-point room EQ over-fits one spot and
+  makes the others worse — the same double-counting trap as matching RT60. The inversion is regularized
+  (deep nulls aren't fought) and centred on the in-band geometric mean (the scalar `gain_db` trim still
+  owns overall level). The engine applies it as a per-speaker FIR stage in `align.c`, before the
+  gain+delay. With the Zylia you can gate by *direction* (keep the speaker's DOA, reject off-axis
+  reflections) for a cleaner near-free-field correction than an omni gate; that's a follow-on.
+
 ## Zylia ZM-1: full 3D from one placement
 
 `--localize` needs the omni mic at ≥5 spots because one omni gives only **distance**. The ZM-1 is 19

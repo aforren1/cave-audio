@@ -23,6 +23,7 @@ extern "C" {
 #include "measure.h"
 #include "calib.h"
 #include "layout.h"
+#include "zylia.h"
 #include "sink.h"          /* BW_CHANNELS */
 }
 
@@ -211,7 +212,7 @@ int main(int argc, char** argv) {
     const char* out_path    = NULL;
     const char* driver      = getenv("BWAUDIO_ASIO_DRIVER");
     float mic[3] = { 0.f, 0.f, 0.f };
-    int   mic_in = 0, simulate = 0, room = 0, check = 0, live_speaker = -1;
+    int   mic_in = 0, simulate = 0, room = 0, check = 0, live_speaker = -1, eq = 0, zylia = 0;
     double known_latency = -1.0;
     const char* ir_prefix = NULL;
     const char* localize_file = NULL;
@@ -227,8 +228,10 @@ int main(int argc, char** argv) {
         else if (!strcmp(argv[i],"--check"))              check       = 1;   /* flag speakers nudged from the stored layout */
         else if (!strcmp(argv[i],"--live") && i+1<argc)   live_speaker= atoi(argv[++i]); /* live distance readout for one speaker */
         else if (!strcmp(argv[i],"--latency") && i+1<argc) known_latency = atof(argv[++i]); /* c*tau meters, for --live absolute distance */
+        else if (!strcmp(argv[i],"--eq"))                 eq          = 1;   /* per-speaker direct-sound correction FIR */
+        else if (!strcmp(argv[i],"--zylia"))              zylia       = 1;   /* single-position localization with the ZM-1 */
         else if (!strcmp(argv[i],"--mic") && i+3<argc) { mic[0]=(float)atof(argv[++i]); mic[1]=(float)atof(argv[++i]); mic[2]=(float)atof(argv[++i]); }
-        else { fprintf(stderr, "usage: calibrate [--layout f] [--out f] [--mic x y z] [--input ch] [--driver name] [--simulate] [--room] [--save-irs prefix] [--localize positions.txt] [--check] [--live N] [--latency m]\n"); return 2; }
+        else { fprintf(stderr, "usage: calibrate [--layout f] [--out f] [--mic x y z] [--input ch] [--driver name] [--simulate] [--room] [--eq] [--zylia] [--save-irs prefix] [--localize positions.txt] [--check] [--live N] [--latency m]\n"); return 2; }
     }
     if (!out_path) out_path = layout_path;                    /* in-place by default */
 
@@ -299,6 +302,49 @@ int main(int argc, char** argv) {
         return 0;
     }
 
+    /* --- ZM-1 single-position localization: ONE mic placement, 19 capsules -> direction + distance --- */
+    if (zylia) {
+        float dirs[ZYLIA_MICS][3]; float R; zylia_geometry(dirs, &R);
+        const double C = 343.0;
+        const double latency = (known_latency >= 0.0) ? known_latency / C : 0.0;   /* c*tau meters -> seconds */
+        printf("zylia: array at (%.2f %.2f %.2f), 19 capsules, R=%.3f m%s\n",
+               mic[0], mic[1], mic[2], R, simulate ? "  [SIMULATE]" : "");
+        float (*pos)[3] = (float(*)[3])malloc((size_t)n * 3 * sizeof(float));
+        for (int s = 0; s < n; ++s) {
+            double arr[ZYLIA_MICS];
+            if (simulate) {                                    /* exact wavefront from the speaker's true pos */
+                for (int j = 0; j < ZYLIA_MICS; ++j) {
+                    double cx = mic[0]+R*dirs[j][0], cy = mic[1]+R*dirs[j][1], cz = mic[2]+R*dirs[j][2];
+                    double dx = cx-L.speakers[s].pos[0], dy = cy-L.speakers[s].pos[1], dz = cz-L.speakers[s].pos[2];
+                    arr[j] = sqrt(dx*dx+dy*dy+dz*dz)/C + latency;
+                }
+            } else {
+                /* RIG: play the sweep on speaker s, capture the ZM-1's 19 channels, deconvolve each, take its
+                 * sub-sample arrival -> arr[j]. The ZM-1 is a SEPARATE device from the Dante output; its 19
+                 * capsules are mutually sample-locked (one ADC), so the DOA is exact regardless of the
+                 * cross-device clock — but running two ASIO drivers at once is the unbuilt rig piece. */
+                fprintf(stderr, "calibrate: --zylia hardware capture is not wired in this build; use --simulate\n"
+                                "  (the ZM-1 is a second 19-ch input device — see docs/calibration.md)\n");
+#ifdef BW_HAVE_ASIO
+                if (asio_up) asio_close();
+#endif
+                free(pos); free(res); free(cap); free(sweep);
+                return 1;
+            }
+            float p[3], dir[3], dist;
+            if (!zylia_localize(arr, mic, latency, C, p, &dist)) { p[0]=p[1]=p[2]=0.f; dist=0.f; }
+            zylia_doa(arr, dir);
+            pos[s][0]=p[0]; pos[s][1]=p[1]; pos[s][2]=p[2];
+            printf("  spk %2d: dir=(%+.3f %+.3f %+.3f)  pos=(%+.3f %+.3f %+.3f)  dist=%.3f m\n",
+                   s, dir[0],dir[1],dir[2], p[0],p[1],p[2], dist);
+        }
+        if (!calib_write_positions(layout_path, out_path, pos, n, err, sizeof err)) { fprintf(stderr, "calibrate: %s\n", err); return 1; }
+        printf("zylia: wrote %d positions to %s%s\n", n, out_path,
+               (known_latency < 0.0) ? "  (no --latency: directions exact, distances uncalibrated)" : "");
+        free(pos); free(res); free(cap); free(sweep);
+        return 0;
+    }
+
     /* --- drift check: one fast pass from the mic position, flag anything nudged --- */
     if (check) {
         float (*pos)[3] = (float(*)[3])malloc((size_t)n * 3 * sizeof(float));
@@ -361,6 +407,10 @@ int main(int argc, char** argv) {
         return 0;
     }
 
+    const int NTAPS = 256;                                     /* correction-FIR length (<= BW_EQ_TAPS) */
+    float*    eq_taps = NULL; uint16_t* eq_lens = NULL;
+    if (eq) { eq_taps = (float*)calloc((size_t)n * BW_EQ_TAPS, sizeof(float));
+              eq_lens = (uint16_t*)calloc((size_t)n, sizeof(uint16_t)); }
     for (int i = 0; i < n; ++i) {
         if (simulate) {
             simulate_capture(i, &L, mic, sweep, cap);
@@ -373,9 +423,10 @@ int main(int argc, char** argv) {
         measure_response(cap, CAPLEN, sweep, NSWEEP, F1, F2, FS, BAND_HZ, &res[i]);
         printf("  speaker %2d: delay=%6d  level=%.4f  bands=[%.3f %.3f %.3f]\n",
                i, res[i].delay_samples, res[i].level, res[i].band[0], res[i].band[1], res[i].band[2]);
-        if (room || ir_prefix) {                               /* room report + retained IR kernels */
+        if (room || ir_prefix || eq) {                         /* room report + retained IR kernels + EQ */
             RoomResult rr; static float irbuf[IR_LEN];
-            measure_room(cap, CAPLEN, sweep, NSWEEP, F1, F2, FS, &rr, ir_prefix ? irbuf : NULL, ir_prefix ? IR_LEN : 0);
+            int want_ir = (ir_prefix || eq);
+            measure_room(cap, CAPLEN, sweep, NSWEEP, F1, F2, FS, &rr, want_ir ? irbuf : NULL, want_ir ? IR_LEN : 0);
             if (room) {
                 printf("            RT60=%.3f s  early reflections:", rr.rt60);
                 for (int e = 0; e < rr.er_count; ++e) printf(" %.1fms/%.2f", rr.er_delay[e] * 1000.0 / FS, rr.er_level[e]);
@@ -383,6 +434,13 @@ int main(int argc, char** argv) {
                 if (rr.rt60 > 0.f) { rt60_sum += rr.rt60; ++rt60_n; }
             }
             if (ir_prefix) { char p[512]; snprintf(p, sizeof p, "%s_%02d.wav", ir_prefix, i); write_wav_f32(p, irbuf, IR_LEN, (int)FS); }
+            if (eq) {     /* gate to before the first reflection -> invert the speaker's direct response */
+                int first_refl = rr.er_count ? rr.er_delay[0] : 0;
+                if (calib_eq(irbuf, IR_LEN, first_refl, FS, NTAPS, &eq_taps[(size_t)i * BW_EQ_TAPS]))
+                    eq_lens[i] = (uint16_t)NTAPS;
+                printf("            eq: %d-tap correction (gate %s)\n", eq_lens[i],
+                       first_refl ? "to first reflection" : "default 4 ms");
+            }
         }
     }
     if (room && rt60_n) printf("room: mean RT60 ~ %.3f s (the floor on renderable reverb; treat the room to lower it)\n", rt60_sum / rt60_n);
@@ -409,6 +467,13 @@ int main(int argc, char** argv) {
         fprintf(stderr, "calibrate: %s\n", err); return 1;
     }
     printf("calibrate: wrote %s\n", out_path);
+
+    if (eq) {   /* write the correction filters into the file the trims just wrote */
+        if (!calib_write_eq(out_path, out_path, eq_taps, eq_lens, n, BW_EQ_TAPS, err, sizeof err))
+            fprintf(stderr, "calibrate: eq writeback: %s\n", err);
+        else printf("calibrate: wrote per-speaker correction filters to %s\n", out_path);
+        free(eq_taps); free(eq_lens);
+    }
 
     free(gdb); free(dms); free(res); free(cap); free(sweep);
     return 0;

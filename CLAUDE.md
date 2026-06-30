@@ -184,7 +184,11 @@ sub-degree — `zylia_doa`), and with the known latency a Gauss-Newton refine ag
 wavefront gives the full position (`zylia_localize`). Distance is latency-limited (the array is too small to
 self-calibrate latency at metres). Spatial room capture reuses the same sweep windowed per early reflection →
 `zylia_doa` → which surface throws it. The 19-ch ASIO capture + the datasheet capsule geometry are the
-rig-bound shell. See docs/calibration.md.
+rig-bound shell. **Per-speaker correction filters** (`--eq`) are the "inverse EQ" upgrade to the scalar
+trims: `measure_correction` gates the IR to the direct sound (before the first reflection) and inverts that
+magnitude into a minimum-phase FIR (`calib_eq` → the layout `eq` array → applied per channel in `align.c`,
+before gain+delay), so it flattens the SPEAKER not the room (a moving listener can't be room-EQ'd from one
+point — same trap as matching RT60); unit-tested in `measure`/`dsp`/`calib`. See docs/calibration.md.
 Remaining: the by-ear headphone check; and live Motive verification of M6 (parser + lifecycle are tested off-wire). Do not bake ASIO assumptions
 outside `asio_sink.cpp`, and do not link the NatNet SDK (proprietary; reference only — GPLv3).
 The atomics in `rt.c` need `/experimental:c11atomics` on MSVC (wired in CMake); `pose.h` uses
