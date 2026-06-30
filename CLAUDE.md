@@ -150,6 +150,15 @@ phonon-free), reusing the SH→26 decode the reflection bed will need. `sound.c`
 (`bw_dsp_time`, device-anchored), the mixer holding it silent until the exact in-block offset. **Ray-tracing
 acceleration**: `BWAUDIO_EMBREE=1` runs both sims on Intel Embree, opt-in with a graceful fallback to the
 default tracer (the vendored prebuilt phonon isn't Embree-built, so it currently falls back — see docs/api.md).
+**Speaker calibration** (`bw_calibrate`, opt-in `-DBWAUDIO_BUILD_CALIBRATE=ON`; DSP in `measure.c`, solve +
+JSON writeback in `calib.c`, both unit-tested off-hardware): a full-duplex ASIO tool that sweeps each speaker,
+records an omni mic, and writes `cave_layout.json` — per-speaker delay/gain trims (`calib_solve`, arrival-align
++ sensitivity-equalize), acoustic **position self-survey** through the screens (`--localize` → `calib_trilaterate`,
+which recovers positions + the system latency jointly), and a **room report** (`--room`, Schroeder RT60 + early
+reflections — a treatment diagnostic, NOT a model to match: matching double-counts the real room). `--save-irs`
+retains the per-speaker IR kernels (one capture serves trims, the room report, and a future headphone room
+simulator). The ASIO capture compiles but is unverified on hardware; `--simulate` runs the whole pipeline
+hardware-free. See docs/calibration.md.
 Remaining: the by-ear headphone check; and live Motive verification of M6 (parser + lifecycle are tested off-wire). Do not bake ASIO assumptions
 outside `asio_sink.cpp`, and do not link the NatNet SDK (proprietary; reference only — GPLv3).
 The atomics in `rt.c` need `/experimental:c11atomics` on MSVC (wired in CMake); `pose.h` uses
@@ -178,5 +187,6 @@ builds `bw_sound_test` under ASan.
 - `docs/integration.md` — Unity binding + coordinate seam; Unreal notes.
 - `docs/build.md` — platform, dependencies, licensing, DVS/Dante config.
 - `docs/layout-schema.md` — `cave_layout.json` format: speaker geometry, per-speaker gain/delay, DBAP knobs.
+- `docs/calibration.md` — `bw_calibrate`: acoustic position survey, delay/gain trims, room report → `cave_layout.json`.
 - `docs/internal-types.md` — internal structs (`Voice`/`Sound`/`Layout`/`Listener`) + helper signatures. **Not ABI.**
 - `docs/roadmap.md` — milestone-ordered implementation plan.
