@@ -508,9 +508,12 @@ int main(int argc, char** argv) {
     const char* path = (export_only || score_only || optimize_only) ? (argc > 2 ? argv[2] : "cave_layout.json")
                                                                      : (argc > 1 ? argv[1] : "cave_layout.json");
     seed_default();
+    printf("working dir: %s\n", GetWorkingDirectory());   /* cave_layout.json + constraints.json resolve here (CWD) */
     int loaded = load_json(path);
     if (load_constraints("constraints.json"))
-        printf("constraints: bounds + %d no-go + %d obstacle box(es) from constraints.json\n", con_nnogo, con_nobst);
+        printf("constraints: bounds + %d no-go + %d obstacle box(es) from ./constraints.json\n", con_nnogo, con_nobst);
+    else
+        printf("constraints: none (no ./constraints.json here) — every placement allowed except the y>=0 floor\n");
 
     /* coverage/scoring shell: even directions on a sphere (Fibonacci) + a working-volume listener grid */
     for (int i = 0; i < NCOV; ++i) {
