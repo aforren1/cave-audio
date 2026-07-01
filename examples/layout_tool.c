@@ -629,6 +629,8 @@ int main(int argc, char** argv) {
     SetTargetFPS(60);
     Camera3D cam = { .target = { 0, 0, 0 }, .up = { 0, 1, 0 }, .fovy = 55, .projection = CAMERA_PERSPECTIVE };
     float cam_yaw = 45.0f * DEG2RAD, cam_pitch = 30.0f * DEG2RAD, cam_dist = 9.0f;
+    int   fps = 0;                                            /* first-person view from the observer's ears (H) */
+    float fps_yaw = PI, fps_pitch = 0.0f, fps_fov = 75.0f;    /* look direction + zoom; PI = facing -Z (front) */
 
     int   sel = 0, tone_on = 0, tone_kind = BW_TEST_SINE, driven = -1;
     int   editing = 0, ilen = 0;
@@ -643,6 +645,7 @@ int main(int argc, char** argv) {
     while (!WindowShouldClose()) {
         float dt = GetFrameTime();
         if (IsKeyPressed(KEY_F11)) ToggleBorderlessWindowed();   /* fullscreen (HUD/panel use GetScreenWidth, so they follow) */
+        if (IsKeyPressed(KEY_H)) fps = !fps;                     /* first-person view from the observer's ears */
 
         if (editing) {                                   /* typing exact "x y z" for the selected speaker */
             int c;
@@ -778,20 +781,38 @@ int main(int argc, char** argv) {
         if (save_flash > 0) save_flash -= dt;            /* "saved" toast fades out */
         else if (save_flash < 0) save_flash += dt;       /* "save failed" toast fades out */
 
-        /* arcball camera */
-        if (IsMouseButtonDown(MOUSE_BUTTON_RIGHT)) {
-            Vector2 md = GetMouseDelta();
-            cam_yaw   -= md.x * 0.005f;
-            cam_pitch += md.y * 0.005f;
-            if (cam_pitch >  1.5f) cam_pitch =  1.5f;
-            if (cam_pitch < -1.5f) cam_pitch = -1.5f;
+        /* camera: FIRST-PERSON from the observer's ears (H), or orbit (default). Right-drag looks/orbits. */
+        if (fps) {
+            if (IsMouseButtonDown(MOUSE_BUTTON_RIGHT)) {          /* mouse-look */
+                Vector2 md = GetMouseDelta();
+                fps_yaw   -= md.x * 0.004f;
+                fps_pitch -= md.y * 0.004f;
+                if (fps_pitch >  1.5f) fps_pitch =  1.5f;
+                if (fps_pitch < -1.5f) fps_pitch = -1.5f;
+            }
+            fps_fov -= GetMouseWheelMove() * 4.0f;               /* wheel zooms the view */
+            if (fps_fov < 25.0f) fps_fov = 25.0f; if (fps_fov > 100.0f) fps_fov = 100.0f;
+            Vector3 fwd = { cosf(fps_pitch)*sinf(fps_yaw), sinf(fps_pitch), cosf(fps_pitch)*cosf(fps_yaw) };
+            cam.position = (Vector3){ 0, obs_height, 0 };        /* AT the ears */
+            cam.target   = Vector3Add(cam.position, fwd);
+            cam.fovy     = fps_fov;
+        } else {
+            if (IsMouseButtonDown(MOUSE_BUTTON_RIGHT)) {
+                Vector2 md = GetMouseDelta();
+                cam_yaw   -= md.x * 0.005f;
+                cam_pitch += md.y * 0.005f;
+                if (cam_pitch >  1.5f) cam_pitch =  1.5f;
+                if (cam_pitch < -1.5f) cam_pitch = -1.5f;
+            }
+            cam_dist -= GetMouseWheelMove() * 0.6f;
+            if (cam_dist < 2.0f)  cam_dist = 2.0f;
+            if (cam_dist > 30.0f) cam_dist = 30.0f;
+            cam.target   = (Vector3){ 0, 0, 0 };
+            cam.fovy     = 55.0f;
+            cam.position.x = cam_dist * cosf(cam_pitch) * sinf(cam_yaw);
+            cam.position.y = cam_dist * sinf(cam_pitch);
+            cam.position.z = cam_dist * cosf(cam_pitch) * cosf(cam_yaw);
         }
-        cam_dist -= GetMouseWheelMove() * 0.6f;
-        if (cam_dist < 2.0f)  cam_dist = 2.0f;
-        if (cam_dist > 30.0f) cam_dist = 30.0f;
-        cam.position.x = cam_dist * cosf(cam_pitch) * sinf(cam_yaw);
-        cam.position.y = cam_dist * sinf(cam_pitch);
-        cam.position.z = cam_dist * cosf(cam_pitch) * cosf(cam_yaw);
 
         /* max distance for the live delay readout */
         float dmax = 0.0f;
@@ -826,7 +847,7 @@ int main(int argc, char** argv) {
         DrawLine3D((Vector3){ 0, 0, 0 }, (Vector3){ 1.2f, 0, 0 }, (Color){ 230, 90, 90, 255 });   /* +X */
         DrawLine3D((Vector3){ 0, 0, 0 }, (Vector3){ 0, 1.2f, 0 }, (Color){ 90, 230, 90, 255 });   /* +Y */
         DrawLine3D((Vector3){ 0, 0, 0 }, (Vector3){ 0, 0, 1.2f }, (Color){ 90, 150, 230, 255 });  /* +Z */
-        DrawSphere((Vector3){ 0, obs_height, 0 }, 0.09f, (Color){ 210, 210, 230, 255 });           /* listener (ear height) */
+        if (!fps) DrawSphere((Vector3){ 0, obs_height, 0 }, 0.09f, (Color){ 210, 210, 230, 255 });  /* listener (hidden in FPS: you're inside it) */
         DrawLine3D((Vector3){ 0, obs_height, 0 }, spk[sel].pos,   /* ear<->speaker sightline: green clear / red blocked */
                    los_clear(spk[sel].pos) ? (Color){ 240, 220, 120, 160 } : (Color){ 245, 90, 90, 230 });
         for (int i = 0; i < NSPK; ++i) {
@@ -894,7 +915,9 @@ int main(int argc, char** argv) {
         int panel_on = (!preview && !editing);
         int hud_w    = panel_on ? GetScreenWidth() - PANEL_W : GetScreenWidth();
         BeginScissorMode(0, 0, hud_w, GetScreenHeight());     /* clip ALL HUD text/bars out of the panel column */
+        Vector3 camfwd = Vector3Subtract(cam.target, cam.position);
         for (int i = 0; i < NSPK; ++i) {
+            if (fps && Vector3DotProduct(Vector3Subtract(spk[i].pos, cam.position), camfwd) <= 0) continue; /* behind the head */
             Vector2 s = GetWorldToScreen(spk[i].pos, cam);
             if (panel_on && s.x > (float)hud_w - 6) continue;
             ui_text(TextFormat("%d", i), (int)s.x + 6, (int)s.y - 6, i == sel ? 18 : 12,
@@ -911,8 +934,9 @@ int main(int argc, char** argv) {
                                 src_pos.x, src_pos.y, src_pos.z, pv_orbit ? "ON" : "off"),
                      10, 30, 16, (Color){ 240, 160, 120, 255 });
         } else {
-            ui_text("F11 fullscreen   drag/wheel: camera   click: pick   arrows/RF: move (SHIFT fine)",
-                     10, 8, 13, RAYWHITE);
+            ui_text(fps ? "HEAD VIEW (from the ears)   right-drag: look   wheel: zoom   [H] exit   (red = worst spots around you)"
+                        : "F11 fullscreen   [H] head view   drag/wheel: camera   click: pick   arrows/RF: move (SHIFT fine)",
+                     10, 8, 13, fps ? (Color){ 245, 220, 140, 255 } : RAYWHITE);
             ui_text(TextFormat("spk %d -> ch %d   pos (%.3f, %.3f, %.3f)   delay %.3f ms   dist %.2f m",
                                 sel, sel, spk[sel].pos.x, spk[sel].pos.y, spk[sel].pos.z, seldel, seld),
                      10, 30, 16, (Color){ 245, 220, 90, 255 });
@@ -1035,7 +1059,8 @@ int main(int argc, char** argv) {
             if (GuiButton((Rectangle){ x, y, w/2 - 3, rh }, "Snap [K]")) req_snap = 1;
             if (GuiButton((Rectangle){ x + w/2 + 3, y, w/2 - 3, rh }, "Save [S]")) req_save = 1;  y += rh + gp;
             if (GuiButton((Rectangle){ x, y, w, rh }, "Reload [L]")) req_reload = 1;  y += rh + gp + 6;
-            if (GuiButton((Rectangle){ x, y, w, rh }, "Fullscreen [F11]")) ToggleBorderlessWindowed();
+            if (GuiButton((Rectangle){ x, y, w/2 - 3, rh }, fps ? "Orbit view" : "Head view [H]")) fps = !fps;
+            if (GuiButton((Rectangle){ x + w/2 + 3, y, w/2 - 3, rh }, "Fullscreen [F11]")) ToggleBorderlessWindowed();
         }
 
         /* coverage hover: mouse over a shell cube -> read that sample's value (drawn on top) */
