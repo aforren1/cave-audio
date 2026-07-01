@@ -274,6 +274,7 @@ static Vector3     cov_lis[27];                        /* [0]=origin (fixed); [0
  * per-direction rE-localization error (cached + recomputed on a throttle, since it runs the real solve). */
 static int         cov_metric, cov_frame;
 static float       cov_err[NCOV];                      /* per-direction rE error (deg) for cov_err_panner */
+static float       cov_val[NCOV];                      /* per-cube value shown on hover (gap deg, or rE err deg) */
 static int         cov_err_valid, cov_err_stale, cov_err_panner = -1, cov_err_moving = -1, cov_err_frame;
 
 /* a ~2 s mono 16-bit pink-noise loop for the preview source (broadband -> localises well) */
@@ -723,11 +724,13 @@ int main(int argc, char** argv) {
                     acc += best;
                 }
                 float score = acc / (float)NL;            /* typical coverage of d over the roam (mean, not worst corner) */
-                float t = (score - 0.707f) / 0.259f; if (t < 0) t = 0; if (t > 1) t = 1;   /* >=45 deg gap red, <=15 green (tight band: a dense array's gaps live here) */
+                float a = score < -1 ? -1 : (score > 1 ? 1 : score);
+                float gap = acosf(a) * 57.2958f;          /* nearest-speaker angular gap (deg) for this direction */
+                cov_val[s] = gap;
+                float t = (40.0f - gap) / 35.0f; if (t < 0) t = 0; if (t > 1) t = 1;   /* green <=5 deg, full red >=40 deg */
                 DrawCubeV(Vector3Scale(d, COV_R), (Vector3){ 0.09f, 0.09f, 0.09f },
                           (Color){ (unsigned char)(230*(1-t)+50*t), (unsigned char)(60*(1-t)+225*t), 75, 205 });
                 if (score < worst) worst = score;
-                float a = score < -1 ? -1 : (score > 1 ? 1 : score);
                 macc += acosf(a);
             }
             float w = worst < -1 ? -1 : (worst > 1 ? 1 : worst);
@@ -742,6 +745,7 @@ int main(int argc, char** argv) {
             double macc = 0.0;
             for (int s = 0; s < NCOV; ++s) {
                 float err = cov_err[s];                   /* deg; 0 = exact, >=40 fully red */
+                cov_val[s] = err;
                 float t = err / 40.0f; if (t < 0) t = 0; if (t > 1) t = 1;
                 DrawCubeV(Vector3Scale(cov_dir[s], COV_R), (Vector3){ 0.09f, 0.09f, 0.09f },
                           (Color){ (unsigned char)(230*t+50*(1-t)), (unsigned char)(225*(1-t)+60*t), 75, 205 });
@@ -755,6 +759,7 @@ int main(int argc, char** argv) {
         /* 2D index labels projected from 3D (skipping any that would fall under the panel) */
         int panel_on = (!preview && !editing);
         int hud_w    = panel_on ? GetScreenWidth() - PANEL_W : GetScreenWidth();
+        BeginScissorMode(0, 0, hud_w, GetScreenHeight());     /* clip ALL HUD text/bars out of the panel column */
         for (int i = 0; i < NSPK; ++i) {
             Vector2 s = GetWorldToScreen(spk[i].pos, cam);
             if (panel_on && s.x > (float)hud_w - 6) continue;
@@ -772,9 +777,9 @@ int main(int argc, char** argv) {
                                 src_pos.x, src_pos.y, src_pos.z, pv_orbit ? "ON" : "off"),
                      10, 30, 16, (Color){ 240, 160, 120, 255 });
         } else {
-            ui_text("F11 fullscreen   drag: camera   wheel: zoom   click: pick   arrows/RF move (SHIFT)   --  controls in the panel ->",
+            ui_text("F11 fullscreen   drag/wheel: camera   click: pick   arrows/RF: move (SHIFT fine)",
                      10, 8, 13, RAYWHITE);
-            ui_text(TextFormat("speaker %d  ->  channel %d   pos (%.3f, %.3f, %.3f)   delay %.3f ms   dist %.3f m",
+            ui_text(TextFormat("spk %d -> ch %d   pos (%.3f, %.3f, %.3f)   delay %.3f ms   dist %.2f m",
                                 sel, sel, spk[sel].pos.x, spk[sel].pos.y, spk[sel].pos.z, seldel, seld),
                      10, 30, 16, (Color){ 245, 220, 90, 255 });
             if (editing)
@@ -823,6 +828,8 @@ int main(int argc, char** argv) {
                      10, ys, 15, score_stale ? (Color){ 210, 210, 130, 255 } : (Color){ 150, 200, 240, 255 });
         }
 
+        EndScissorMode();
+
         /* ---- raygui control panel (edit mode; the keyboard shortcuts all still work) ---- */
         if (!preview && !editing) {
             const float pw = PANEL_W, px = (float)GetScreenWidth() - pw;
@@ -838,7 +845,7 @@ int main(int argc, char** argv) {
               if (spk[sel].gain_db != g) layout_dirty = 1; }  y += rh + gp;
             if (GuiButton((Rectangle){ x, y, w, rh }, "Type X Y Z  [Enter]")) req_type = 1;  y += rh + gp + 6;
 
-            GuiLabel((Rectangle){ x, y, w, rh }, "PANNER (target for score / optimize)");  y += rh;
+            GuiLabel((Rectangle){ x, y, w, rh }, "PANNER  (score/opt target)");  y += rh;
             { int prev = pv_panner;
               GuiComboBox((Rectangle){ x, y, w, rh }, "DBAP;SPCAP;VBAP", &pv_panner);
               if (pv_panner != prev) { score_stale = 1; cov_err_stale = 1; } }  y += rh + gp;
@@ -870,13 +877,32 @@ int main(int argc, char** argv) {
             { bool me = cov_metric;
               GuiToggle((Rectangle){ x, y, w, rh }, cov_metric ? "Shade: rE error [G]" : "Shade: nearest gap [G]", &me);
               cov_metric = me; }  y += rh + gp;
-            if (GuiButton((Rectangle){ x, y, w, rh }, "PREVIEW - move a source [P]")) req_preview = 1;  y += rh + gp;
+            if (GuiButton((Rectangle){ x, y, w, rh }, "Preview - audition [P]")) req_preview = 1;  y += rh + gp;
 
             GuiLine((Rectangle){ x, y, w, 8 }, NULL);  y += 12;
             if (GuiButton((Rectangle){ x, y, w/2 - 3, rh }, "Snap [K]")) req_snap = 1;
             if (GuiButton((Rectangle){ x + w/2 + 3, y, w/2 - 3, rh }, "Save [S]")) req_save = 1;  y += rh + gp;
             if (GuiButton((Rectangle){ x, y, w, rh }, "Reload [L]")) req_reload = 1;  y += rh + gp + 6;
             if (GuiButton((Rectangle){ x, y, w, rh }, "Fullscreen [F11]")) ToggleBorderlessWindowed();
+        }
+
+        /* coverage hover: mouse over a shell cube -> read that sample's value (drawn on top) */
+        if (coverage_on && !preview && GetMouseX() < hud_w) {
+            Ray ray = GetMouseRay(GetMousePosition(), cam);
+            int hit = -1; float best = 1e30f;
+            for (int s = 0; s < NCOV; ++s) {
+                Vector3 c = Vector3Scale(cov_dir[s], COV_R);
+                BoundingBox bb = { { c.x-0.07f, c.y-0.07f, c.z-0.07f }, { c.x+0.07f, c.y+0.07f, c.z+0.07f } };
+                RayCollision rc = GetRayCollisionBox(ray, bb);
+                if (rc.hit && rc.distance < best) { best = rc.distance; hit = s; }
+            }
+            if (hit >= 0) {
+                Vector2 mp = GetMousePosition();
+                const char* lbl = TextFormat(cov_metric == 0 ? "gap %.0f deg" : "rE err %.0f deg", cov_val[hit]);
+                int tx = (int)mp.x + 14, ty = (int)mp.y - 6;
+                DrawRectangle(tx - 4, ty - 3, 128, 22, (Color){ 0, 0, 0, 225 });
+                ui_text(lbl, tx, ty, 15, (Color){ 245, 235, 150, 255 });
+            }
         }
         EndDrawing();
     }
