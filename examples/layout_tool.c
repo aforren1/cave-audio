@@ -72,6 +72,8 @@ static Spk spk[NSPK];
 /* dbap knobs (round-tripped through the file; defaults match layout_default) */
 static float       dbap_r = 0.5f, dist_ref = 1.0f, dist_rolloff = 1.0f, dist_min_db = -40.0f;
 static const char* dist_model = "inverse";
+static float       obs_height = 1.4f;      /* observer EAR height above the floor origin (m; ~4.6 ft) — the
+                                              listener/scoring point + the line-of-sight source sit here, not at y=0 */
 
 /* the engine's default 3x3x3-minus-centre grid — the starting point and the layout_default() order */
 static void seed_default(void) {
@@ -165,10 +167,15 @@ static int save_json(const char* path) {
     return 1;
 }
 
-/* ---- placement constraints / barriers (constraints.json: an allowed bounding box + no-go boxes for
- * screens / structure / doorways) ----  A speaker is valid if it is inside con_bounds and outside every
- * no-go box. Used to flag violations, to snap a speaker to the nearest allowed point, and (later) as the
- * optimizer's feasibility projection. */
+/* ---- placement constraints / barriers (constraints.json; see examples/constraints.json) ----
+ *   bounds      : the allowed box — speakers must be INSIDE it.
+ *   nogo[]      : keep-out boxes — speakers must be OUTSIDE them (screens, structure, doorways, the CAVE
+ *                 interior). Snappable (K) + the optimizer's feasibility projection.
+ *   obstacles[] : SOLID occluders (projectors, beams) — a speaker can't be inside one NOR in its acoustic
+ *                 shadow: a box on the segment from the speaker to the ears blocks its sound (los_clear).
+ *                 The optimizer penalises shadowed speakers; the tool flags them orange (move them clear).
+ * A box is axis-aligned; a projector's throw FRUSTUM is only crudely a box, so size the obstacle to the
+ * body + the near shadow you care about. Line-of-sight is to the single observer at (0, obs_height, 0). */
 typedef struct { Vector3 lo, hi; } Box;
 #define MAXNOGO 24
 static Box con_bounds = { { -3, -3, -3 }, { 3, 3, 3 } };
@@ -178,10 +185,42 @@ static int con_nnogo, con_loaded;
 static int box_in(Box b, Vector3 p) {
     return p.x >= b.lo.x && p.x <= b.hi.x && p.y >= b.lo.y && p.y <= b.hi.y && p.z >= b.lo.z && p.z <= b.hi.z;
 }
-static int constraint_ok(Vector3 p) {
+
+/* segment [a,b] vs an AABB (slab method): 1 if they intersect anywhere on the segment. */
+static int seg_hits_box(Vector3 a, Vector3 b, Box box) {
+    float pa[3] = { a.x, a.y, a.z }, pd[3] = { b.x-a.x, b.y-a.y, b.z-a.z };
+    float lo[3] = { box.lo.x, box.lo.y, box.lo.z }, hi[3] = { box.hi.x, box.hi.y, box.hi.z };
+    float tmin = 0.0f, tmax = 1.0f;
+    for (int i = 0; i < 3; ++i) {
+        if (fabsf(pd[i]) < 1e-9f) { if (pa[i] < lo[i] || pa[i] > hi[i]) return 0; }   /* parallel + outside the slab */
+        else {
+            float t1 = (lo[i]-pa[i])/pd[i], t2 = (hi[i]-pa[i])/pd[i];
+            if (t1 > t2) { float t = t1; t1 = t2; t2 = t; }
+            if (t1 > tmin) tmin = t1;
+            if (t2 < tmax) tmax = t2;
+            if (tmin > tmax) return 0;
+        }
+    }
+    return 1;
+}
+
+/* solid OCCLUDERS (projectors / structure): a speaker can't be inside one NOR in its acoustic shadow —
+ * a box on the line from the speaker to the ears would block its sound. Loaded from constraints.json. */
+static Box con_obst[MAXNOGO];
+static int con_nobst;
+
+/* clear line of sight from a speaker at p to the observer's ears (obstacle boxes block it). */
+static int los_clear(Vector3 p) {
+    Vector3 obs = { 0, obs_height, 0 };
+    for (int i = 0; i < con_nobst; ++i) if (seg_hits_box(p, obs, con_obst[i])) return 0;
+    return 1;
+}
+
+static int constraint_ok(Vector3 p) {                    /* physical: in bounds, out of no-go AND out of solid bodies */
     if (!con_loaded) return 1;                            /* no constraints loaded -> all positions allowed */
     if (!box_in(con_bounds, p)) return 0;
     for (int i = 0; i < con_nnogo; ++i) if (box_in(con_nogo[i], p)) return 0;
+    for (int i = 0; i < con_nobst; ++i) if (box_in(con_obst[i], p)) return 0;
     return 1;
 }
 /* move p just outside box b through the nearest face that stays inside con_bounds (so a no-go flush
@@ -206,6 +245,7 @@ static Vector3 constraint_project(Vector3 p) {           /* nearest allowed poin
         p.y = Clamp(p.y, con_bounds.lo.y, con_bounds.hi.y);
         p.z = Clamp(p.z, con_bounds.lo.z, con_bounds.hi.z);
         for (int i = 0; i < con_nnogo; ++i) if (box_in(con_nogo[i], p)) p = push_out(p, con_nogo[i]);
+        for (int i = 0; i < con_nobst; ++i) if (box_in(con_obst[i], p)) p = push_out(p, con_obst[i]);  /* off solid bodies */
     }
     p.x = Clamp(p.x, con_bounds.lo.x, con_bounds.hi.x);  /* final clamp: in-bounds even if over-constrained */
     p.y = Clamp(p.y, con_bounds.lo.y, con_bounds.hi.y);
@@ -243,6 +283,12 @@ static int load_constraints(const char* path) {
         cJSON* box;
         cJSON_ArrayForEach(box, ng) if (con_nnogo < MAXNOGO && read_box(box, &con_nogo[con_nnogo])) ++con_nnogo;
     }
+    con_nobst = 0;
+    cJSON* ob = cJSON_GetObjectItemCaseSensitive(root, "obstacles");   /* solid occluders (projectors/structure) */
+    if (cJSON_IsArray(ob)) {
+        cJSON* box;
+        cJSON_ArrayForEach(box, ob) if (con_nobst < MAXNOGO && read_box(box, &con_obst[con_nobst])) ++con_nobst;
+    }
     cJSON_Delete(root);
     con_loaded = 1;
     return 1;
@@ -262,8 +308,6 @@ static int         pv_panner;                             /* 0=DBAP 1=SPCAP 2=VB
 static const char* panner_names[] = { "DBAP (moving)", "SPCAP (fixed)", "VBAP (fixed)" };
 static float       pv_t;
 static Vector3     src_pos = { 1.5f, 0.0f, 0.0f };
-static float       obs_height = 1.4f;                     /* observer EAR height above the floor origin (m; ~4.6 ft).
-                                                           * The listener/scoring point sits here, not at y=0. */
 
 /* ---- coverage overlay: angular gap to the nearest speaker, over a shell of source directions ----
  * A geometric proxy for DBAP localization: a direction with no nearby speaker forces the pan to
@@ -428,7 +472,11 @@ static float   opt_step = 0.30f, opt_cost;
 static float   opt_leash = 3.0f;                          /* max optimizer displacement from the anchor (m); ~free at 3 m */
 static Vector3 opt_anchor[NSPK];                          /* speaker positions captured when optimization started */
 
-static float opt_cost_of(BwPanner p) { float m, w; score_panner(p, 4, &m, &w); return m + 0.5f * w; }  /* coarse */
+static float opt_cost_of(BwPanner p) {   /* coarse; + a penalty per speaker in a projector shadow so the climb clears them */
+    float m, w; score_panner(p, 4, &m, &w);
+    int occ = 0; for (int i = 0; i < NSPK; ++i) if (!los_clear(spk[i].pos)) ++occ;
+    return m + 0.5f * w + 25.0f * (float)occ;
+}
 static float frand(void) { return (float)rand() / ((float)RAND_MAX + 1.0f); }
 
 static void optimize_step(BwPanner p, int trials) {
@@ -462,7 +510,7 @@ int main(int argc, char** argv) {
     seed_default();
     int loaded = load_json(path);
     if (load_constraints("constraints.json"))
-        printf("constraints: bounds + %d no-go box(es) loaded from constraints.json\n", con_nnogo);
+        printf("constraints: bounds + %d no-go + %d obstacle box(es) from constraints.json\n", con_nnogo, con_nobst);
 
     /* coverage/scoring shell: even directions on a sphere (Fibonacci) + a working-volume listener grid */
     for (int i = 0; i < NCOV; ++i) {
@@ -690,8 +738,11 @@ int main(int argc, char** argv) {
         float seld   = Vector3Length(spk[sel].pos);
         float seldel = (dmax - seld) / SPEED_OF_SOUND * 1000.0f;
         float cov_worst = 0.0f, cov_mean = 0.0f;        /* coverage summary, filled by the overlay below */
-        int con_bad = 0;
-        if (con_loaded) for (int i = 0; i < NSPK; ++i) if (!constraint_ok(spk[i].pos)) ++con_bad;
+        int con_bad = 0, con_occ = 0;
+        if (con_loaded) for (int i = 0; i < NSPK; ++i) {
+            if (!constraint_ok(spk[i].pos)) ++con_bad;   /* out of bounds / inside a solid body (snappable) */
+            if (!los_clear(spk[i].pos))     ++con_occ;   /* line of sight to the ears blocked by an obstacle */
+        }
         ++cov_frame;
 
         BeginDrawing();
@@ -704,20 +755,29 @@ int main(int argc, char** argv) {
             for (int i = 0; i < con_nnogo; ++i)
                 DrawCubeWiresV(Vector3Scale(Vector3Add(con_nogo[i].lo, con_nogo[i].hi), 0.5f),
                                Vector3Subtract(con_nogo[i].hi, con_nogo[i].lo), (Color){ 235, 90, 90, 170 });
+            for (int i = 0; i < con_nobst; ++i) {        /* solid occluders (projectors/structure): filled orange */
+                Vector3 ctr = Vector3Scale(Vector3Add(con_obst[i].lo, con_obst[i].hi), 0.5f);
+                Vector3 sz  = Vector3Subtract(con_obst[i].hi, con_obst[i].lo);
+                DrawCubeV(ctr, sz, (Color){ 235, 150, 60, 70 });
+                DrawCubeWiresV(ctr, sz, (Color){ 245, 165, 70, 200 });
+            }
         }
         DrawLine3D((Vector3){ 0, 0, 0 }, (Vector3){ 1.2f, 0, 0 }, (Color){ 230, 90, 90, 255 });   /* +X */
         DrawLine3D((Vector3){ 0, 0, 0 }, (Vector3){ 0, 1.2f, 0 }, (Color){ 90, 230, 90, 255 });   /* +Y */
         DrawLine3D((Vector3){ 0, 0, 0 }, (Vector3){ 0, 0, 1.2f }, (Color){ 90, 150, 230, 255 });  /* +Z */
         DrawSphere((Vector3){ 0, obs_height, 0 }, 0.09f, (Color){ 210, 210, 230, 255 });           /* listener (ear height) */
-        DrawLine3D((Vector3){ 0, obs_height, 0 }, spk[sel].pos, (Color){ 240, 220, 120, 140 });
+        DrawLine3D((Vector3){ 0, obs_height, 0 }, spk[sel].pos,   /* ear<->speaker sightline: green clear / red blocked */
+                   los_clear(spk[sel].pos) ? (Color){ 240, 220, 120, 160 } : (Color){ 245, 90, 90, 230 });
         for (int i = 0; i < NSPK; ++i) {
             int is_sel = (i == sel), is_drv = (audio && tone_on && i == sel);
             Color col = is_drv ? (Color){ 120, 245, 140, 255 }
                       : is_sel ? (Color){ 245, 220, 90, 255 }
                                : (Color){ 120, 120, 150, 255 };
             DrawSphere(spk[i].pos, is_sel ? 0.15f : 0.10f, col);
-            if (!constraint_ok(spk[i].pos))              /* flag a speaker outside bounds / inside a no-go box */
+            if (!constraint_ok(spk[i].pos))              /* red: outside bounds / inside a solid body (snap fixes) */
                 DrawSphereWires(spk[i].pos, is_sel ? 0.20f : 0.16f, 6, 6, (Color){ 245, 80, 80, 255 });
+            else if (!los_clear(spk[i].pos))             /* orange: sightline to the ears is blocked (move it clear) */
+                DrawSphereWires(spk[i].pos, is_sel ? 0.20f : 0.16f, 6, 6, (Color){ 245, 165, 70, 255 });
         }
         if (preview) {                                   /* the moving DBAP source */
             DrawLine3D((Vector3){ 0, 0, 0 }, src_pos, (Color){ 90, 220, 90, 200 });
@@ -813,8 +873,9 @@ int main(int argc, char** argv) {
         }
         if (con_loaded && !preview) {                    /* placement-constraint status */
             DrawRectangle(0, 96, 320, 22, (Color){ 0, 0, 0, 175 });
-            ui_text(TextFormat("constraints: %d no-go   %d violating   [K snap to allowed]", con_nnogo, con_bad),
-                     10, 100, 14, con_bad ? (Color){ 245, 130, 130, 255 } : (Color){ 120, 220, 140, 255 });
+            ui_text(TextFormat("constraints: %d no-go  %d obstacle   %d out [K snap]  %d occluded (move clear)",
+                                con_nnogo, con_nobst, con_bad, con_occ),
+                     10, 100, 14, (con_bad || con_occ) ? (Color){ 245, 130, 130, 255 } : (Color){ 120, 220, 140, 255 });
         }
         if (!preview && opt_running) {                   /* auto-optimizer progress (the target panner lives in the panel) */
             int yo = con_loaded ? 122 : 100;

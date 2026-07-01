@@ -1,8 +1,15 @@
 {
-  "comment": "Placement constraints for bw_layout_tool (copy next to your cave_layout.json and run the tool there). Room space, metres, same frame as cave_layout.json. 'bounds' = the allowed box; 'nogo' = boxes speakers must stay out of (screens, structure, doorways). 'label' is ignored by the loader.",
-  "bounds": { "min": [-2.5, -1.6, -2.5], "max": [2.5, 1.6, 2.5] },
+  "comment": "Placement constraints for bw_layout_tool (copy next to your cave_layout.json and run the tool there). Room space, metres, origin = floor centre, +Y up (the floor is y=0; the observer's ears are ~1.4 m up). 'bounds' = the allowed box (speakers must be inside). 'nogo' = boxes speakers must stay OUT of (screens, structure, the CAVE interior). 'obstacles' = SOLID occluders (projectors, beams): a speaker can't be inside one NOR in its acoustic shadow — a box on the line from the speaker to the ears blocks its sound. 'label' is ignored by the loader.",
+
+  "bounds": { "min": [-4.0, 0.0, -4.0], "max": [4.0, 4.5, 4.0], "label": "room shell around the CAVE" },
+
   "nogo": [
-    { "min": [-1.6, -1.6, -2.6], "max": [1.6, 1.6, -2.25], "label": "front projection screen (-z wall)" },
-    { "min": [-0.45, -1.6, -2.6], "max": [0.45, -1.05, 2.6], "label": "floor cable trough" }
+    { "min": [-2.0, 0.0, -2.0], "max": [2.0, 4.0, 2.0], "label": "CAVE interior 4x4x4 cube (observer + screens; speakers go BEHIND the screens)" }
+  ],
+
+  "obstacles": [
+    { "min": [-0.35, 3.9, -0.35], "max": [0.35, 4.3, 0.35], "label": "ceiling projector (throws down the floor screen)" },
+    { "min": [2.6, 1.8, -0.4], "max": [3.2, 2.4, 0.4], "label": "+x wall projector" },
+    { "min": [-0.4, 1.8, 2.6], "max": [0.4, 2.4, 3.2], "label": "+z wall projector" }
   ]
 }

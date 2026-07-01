@@ -31,22 +31,34 @@ a layout without the GUI. To audition a saved layout in the full binaural playgr
 for a chosen panner. Press **X** (or run `--score <file>`) to print each panner's rE-localization error
 (mean + worst over a direction shell × the working-volume listener grid, via `bw_panner_gains_batch` —
 the same solve that ships, so the score reflects reality). Drop a **`constraints.json`** next to the
-layout to declare where speakers may go — an allowed `bounds` box plus a `nogo` list of boxes (screens,
-structure, doorways); the tool draws them (green bounds / red no-go), flags any speaker that violates,
-and **K** snaps all speakers to the nearest allowed point. Press **B** to pick the target panner, then
-**O** to **auto-optimize**: a constrained hill-climb that nudges positions to minimise that panner's rE
-error while staying feasible — it runs live (watch the layout converge, O again to stop, S to save).
-Headless: `--optimize <file> [dbap|spcap|vbap]` runs it to convergence in place. The **C** coverage
-overlay shades a direction shell to show where the array is weak; **G** switches its metric between the
-geometric *nearest-speaker gap* and the selected panner's *per-direction rE error* (the spatial
-breakdown of the X-score — green = accurate, red = mislocalised), and **V** toggles the observer model
-(fixed centre vs the moving working volume). The constraint file:
+layout (see `examples/constraints.json`) to declare where speakers may go:
+- **`bounds`** — the allowed box; speakers must be inside.
+- **`nogo`** — keep-out boxes (screens, structure, doorways, the CAVE interior); speakers must be outside.
+  Drawn red-wire; snappable with **K**; the optimizer stays out of them.
+- **`obstacles`** — SOLID occluders (projectors, beams). A speaker can't be inside one *nor in its
+  acoustic shadow* — a box on the segment from the speaker to the ears blocks its sound (line-of-sight to
+  the observer at ear height). Drawn filled-orange; shadowed speakers are ringed orange and the
+  optimizer *penalises* them (it can't push them out geometrically, so nudge them clear). A box only
+  crudely bounds a projector's throw frustum — size it to the body plus the near shadow you care about.
+
+The tool flags violations, and **K** snaps speakers off bounds/no-go/obstacle bodies. Press **B** to pick
+the target panner, then **O** to **auto-optimize**: a constrained hill-climb that nudges positions to
+minimise that panner's rE error while staying feasible — with a **leash** slider (max drift from where a
+speaker started) so it refines rather than relocates. It runs live (O again to stop, S to save). Headless:
+`--optimize <file> [dbap|spcap|vbap]`. Scoring/coverage target the observer at **ear height** (the `obs y`
+slider, default 1.4 m — a real head, not the floor). The **C** coverage overlay shades a direction shell
+to show where the array is weak; **G** switches its metric between the geometric *nearest-speaker gap* and
+the selected panner's *per-direction rE error* (green = accurate, red = mislocalised; hover a cube for its
+value), and **V** toggles the observer model (fixed centre vs the moving working volume). The file:
 
 ```jsonc
 {
-  "bounds": { "min": [-2.5, -1.6, -2.5], "max": [2.5, 1.6, 2.5] },   // allowed placement box (room metres)
-  "nogo": [                                                          // boxes speakers must stay out of
-    { "min": [-1.6, -1.6, -2.6], "max": [1.6, 1.6, -2.25] }          // e.g. the front projection screen
+  "bounds": { "min": [-4, 0, -4], "max": [4, 4.5, 4] },        // allowed box (room metres, floor y=0)
+  "nogo": [                                                     // keep-out: speakers must stay OUTSIDE
+    { "min": [-2, 0, -2], "max": [2, 4, 2] }                    // e.g. the CAVE 4x4x4 interior
+  ],
+  "obstacles": [                                                // solid occluders: also block line-of-sight
+    { "min": [-0.35, 3.9, -0.35], "max": [0.35, 4.3, 0.35] }    // e.g. a ceiling projector + its shadow
   ]
 }
 ```
