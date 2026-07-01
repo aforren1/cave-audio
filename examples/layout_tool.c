@@ -75,13 +75,15 @@ static const char* dist_model = "inverse";
 
 /* the engine's default 3x3x3-minus-centre grid — the starting point and the layout_default() order */
 static void seed_default(void) {
-    const float ax[3] = { -1.5f, 0.0f, 1.5f };
-    int k = 0;
-    for (int yi = 0; yi < 3; ++yi) for (int xi = 0; xi < 3; ++xi) for (int zi = 0; zi < 3; ++zi) {
-        if (ax[xi] == 0 && ax[yi] == 0 && ax[zi] == 0) continue;
-        spk[k].pos = (Vector3){ ax[xi], ax[yi], ax[zi] };
-        spk[k].gain_db = 0.0f;
-        ++k;
+    /* 26 speakers on a hemisphere DOME (y >= 0): a Fibonacci half-sphere, radius ~2.4 m — the listener
+     * sits under it. Even angular spread with no floor-crossing speakers (the CAVE floor is a screen). */
+    const float R = 2.4f, golden = 2.39996323f;   /* golden angle */
+    for (int i = 0; i < NSPK; ++i) {
+        float y  = ((float)i + 0.5f) / (float)NSPK;          /* 0..1, all >= 0 (upper hemisphere) */
+        float r  = sqrtf(1.0f - y * y);
+        float th = golden * (float)i;
+        spk[i].pos     = (Vector3){ R * r * cosf(th), R * y, R * r * sinf(th) };
+        spk[i].gain_db = 0.0f;
     }
 }
 
@@ -198,7 +200,7 @@ static Vector3 push_out(Vector3 p, Box b) {
     return cand[best];
 }
 static Vector3 constraint_project(Vector3 p) {           /* nearest allowed point: clamp to bounds, push out of no-go */
-    if (!con_loaded) return p;
+    if (!con_loaded) { p.y = fmaxf(0.0f, p.y); return p; }   /* y >= 0 is a hard global floor even with no constraints file */
     for (int pass = 0; pass < 4; ++pass) {               /* a few passes settle overlapping boxes */
         p.x = Clamp(p.x, con_bounds.lo.x, con_bounds.hi.x);
         p.y = Clamp(p.y, con_bounds.lo.y, con_bounds.hi.y);
@@ -208,6 +210,7 @@ static Vector3 constraint_project(Vector3 p) {           /* nearest allowed poin
     p.x = Clamp(p.x, con_bounds.lo.x, con_bounds.hi.x);  /* final clamp: in-bounds even if over-constrained */
     p.y = Clamp(p.y, con_bounds.lo.y, con_bounds.hi.y);
     p.z = Clamp(p.z, con_bounds.lo.z, con_bounds.hi.z);
+    p.y = fmaxf(0.0f, p.y);                              /* ... but never below the floor */
     return p;
 }
 static int read_box(cJSON* o, Box* out) {
@@ -638,6 +641,7 @@ int main(int argc, char** argv) {
             opt_cost = opt_cost_of((BwPanner)pv_panner);  /* re-baseline so a manual nudge can't wedge the climb */
             optimize_step((BwPanner)pv_panner, 6);
         }
+        for (int i = 0; i < NSPK; ++i) if (spk[i].pos.y < 0.0f) spk[i].pos.y = 0.0f;   /* y >= 0: speakers never below the floor */
 
         /* drive the selected speaker's channel when auditioning (edit mode only) */
         if (audio && !preview) {
@@ -784,16 +788,18 @@ int main(int argc, char** argv) {
                      10, 30, 16, (Color){ 245, 220, 90, 255 });
             if (editing)
                 ui_text(TextFormat("type \"x y z\" then ENTER:  %s_", ibuf), 10, 54, 16, (Color){ 120, 245, 140, 255 });
-            else if (save_flash > 0)
-                ui_text(TextFormat("saved -> %s", path), 10, 54, 15, (Color){ 120, 245, 140, 255 });
-            else if (save_flash < 0)
-                ui_text("SAVE FAILED (path not writable?)", 10, 54, 15, (Color){ 245, 120, 120, 255 });
             else
                 ui_text(TextFormat("save target: %s", path), 10, 54, 15, (Color){ 110, 200, 255, 255 });
         }
         ui_text(audio ? TextFormat("audio: %s  (tone drives the selected channel)", backend)
                        : "audio: none - editor only (needs a 26-ch ASIO/DVS device to audition)",
                  10, 76, 14, audio ? (Color){ 110, 235, 130, 255 } : (Color){ 235, 170, 110, 255 });
+        if (!preview && save_flash != 0.0f) {            /* transient save result in its OWN box (can't overlap a line) */
+            int by = GetScreenHeight() - 88;
+            const char* msg = save_flash > 0 ? TextFormat("saved -> %s", path) : "SAVE FAILED (path not writable?)";
+            DrawRectangle(6, by, 452, 24, (Color){ 12, 12, 16, 235 });
+            ui_text(msg, 14, by + 4, 15, save_flash > 0 ? (Color){ 130, 245, 150, 255 } : (Color){ 245, 130, 130, 255 });
+        }
         if (con_loaded && !preview) {                    /* placement-constraint status */
             DrawRectangle(0, 96, 320, 22, (Color){ 0, 0, 0, 175 });
             ui_text(TextFormat("constraints: %d no-go   %d violating   [K snap to allowed]", con_nnogo, con_bad),
@@ -811,18 +817,18 @@ int main(int argc, char** argv) {
             const char* obs = coverage_moving ? "moving" : "fixed";
             DrawRectangle(0, yb - 5, hud_w, 31, (Color){ 0, 0, 0, 195 });
             if (cov_metric == 0)
-                ui_text(TextFormat("nearest-speaker gap [%s]   worst %.0f deg   mean %.0f deg   green=covered red=gap   [G] -> rE error",
+                ui_text(TextFormat("nearest-speaker gap [%s]   worst %.0f deg   mean %.0f deg   [G] -> rE error",
                                     obs, cov_worst, cov_mean),
                          10, yb, 15, cov_worst > 45.0f ? (Color){ 245, 150, 110, 255 } : (Color){ 150, 225, 160, 255 });
             else
-                ui_text(TextFormat("%s rE error [%s]   worst %.0f deg   mean %.0f deg   green=accurate red=off   [G] -> gap",
+                ui_text(TextFormat("%s rE error [%s]   worst %.0f deg   mean %.0f deg   [G] -> gap",
                                     panner_names[pv_panner], obs, cov_worst, cov_mean),
                          10, yb, 15, cov_worst > 30.0f ? (Color){ 245, 150, 110, 255 } : (Color){ 150, 225, 160, 255 });
         }
         if (scored && !preview) {                        /* panner-specific rE-localization scores (X) */
             int ys = GetScreenHeight() - (coverage_on ? 52 : 26);
             DrawRectangle(0, ys - 5, hud_w, 31, (Color){ 0, 0, 0, 195 });
-            ui_text(TextFormat("panner rE-err [X]%s   DBAP %.0f/%.0f   SPCAP %.0f/%.0f   VBAP %.0f/%.0f   deg mean/worst (lower = layout suits it)",
+            ui_text(TextFormat("panner rE-err [X]%s   DBAP %.0f/%.0f   SPCAP %.0f/%.0f   VBAP %.0f/%.0f   deg mean/worst",
                                 score_stale ? " STALE" : "",
                                 score_mean[0], score_worst[0], score_mean[1], score_worst[1], score_mean[2], score_worst[2]),
                      10, ys, 15, score_stale ? (Color){ 210, 210, 130, 255 } : (Color){ 150, 200, 240, 255 });
