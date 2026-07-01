@@ -262,6 +262,8 @@ static int         pv_panner;                             /* 0=DBAP 1=SPCAP 2=VB
 static const char* panner_names[] = { "DBAP (moving)", "SPCAP (fixed)", "VBAP (fixed)" };
 static float       pv_t;
 static Vector3     src_pos = { 1.5f, 0.0f, 0.0f };
+static float       obs_height = 1.4f;                     /* observer EAR height above the floor origin (m; ~4.6 ft).
+                                                           * The listener/scoring point sits here, not at y=0. */
 
 /* ---- coverage overlay: angular gap to the nearest speaker, over a shell of source directions ----
  * A geometric proxy for DBAP localization: a direction with no nearby speaker forces the pan to
@@ -349,7 +351,8 @@ static void score_panner(BwPanner panner, int stride, float* mean_deg, float* wo
     int NL = (panner == BW_PAN_DBAP) ? 27 : 1;     /* DBAP: moving grid; SPCAP/VBAP: fixed centre */
     double sumerr = 0; float worst = 0; int cnt = 0;
     for (int l = 0; l < NL; ++l) {
-        Vector3 Lp = cov_lis[l]; float lisf[3] = { Lp.x, Lp.y, Lp.z };
+        Vector3 Lp = cov_lis[l]; Lp.y += obs_height;    /* the listener's EARS are at obs_height, not the floor */
+        float lisf[3] = { Lp.x, Lp.y, Lp.z };
         int ns = 0;
         for (int i = 0; i < NCOV; i += stride) {
             srcs[ns*3]   = Lp.x + COV_R * cov_dir[i].x;
@@ -389,7 +392,8 @@ static void compute_cov_err(BwPanner panner) {
     int NL = (panner == BW_PAN_DBAP && coverage_moving) ? 27 : 1;
     for (int i = 0; i < NCOV; ++i) cov_err[i] = 0.0f;
     for (int l = 0; l < NL; ++l) {
-        Vector3 Lp = cov_lis[l]; float lisf[3] = { Lp.x, Lp.y, Lp.z };
+        Vector3 Lp = cov_lis[l]; Lp.y += obs_height;    /* ears at obs_height */
+        float lisf[3] = { Lp.x, Lp.y, Lp.z };
         for (int i = 0; i < NCOV; ++i) {
             srcs[i*3]=Lp.x+COV_R*cov_dir[i].x; srcs[i*3+1]=Lp.y+COV_R*cov_dir[i].y; srcs[i*3+2]=Lp.z+COV_R*cov_dir[i].z;
         }
@@ -419,8 +423,10 @@ static void compute_cov_err(BwPanner panner) {
 /* ---- auto-optimizer: stochastic hill-climb over the free positions, minimising the panner cost
  * (mean + 0.5*worst rE error) subject to the constraints. Runs incrementally (a few trials per frame)
  * so the layout is seen converging and the GUI stays responsive; stop any time and save. ---- */
-static int   opt_running, opt_iter, opt_stall;
-static float opt_step = 0.30f, opt_cost;
+static int     opt_running, opt_iter, opt_stall;
+static float   opt_step = 0.30f, opt_cost;
+static float   opt_leash = 3.0f;                          /* max optimizer displacement from the anchor (m); ~free at 3 m */
+static Vector3 opt_anchor[NSPK];                          /* speaker positions captured when optimization started */
 
 static float opt_cost_of(BwPanner p) { float m, w; score_panner(p, 4, &m, &w); return m + 0.5f * w; }  /* coarse */
 static float frand(void) { return (float)rand() / ((float)RAND_MAX + 1.0f); }
@@ -430,6 +436,9 @@ static void optimize_step(BwPanner p, int trials) {
         int s = rand() % NSPK;
         Vector3 old = spk[s].pos;
         Vector3 cand = { old.x + opt_step * (2*frand()-1), old.y + opt_step * (2*frand()-1), old.z + opt_step * (2*frand()-1) };
+        Vector3 dv = Vector3Subtract(cand, opt_anchor[s]);       /* leash: never drift past opt_leash from where it started */
+        float dl = Vector3Length(dv);
+        if (dl > opt_leash) cand = Vector3Add(opt_anchor[s], Vector3Scale(dv, opt_leash / dl));
         spk[s].pos = constraint_project(cand);     /* keep the trial feasible */
         float c = opt_cost_of(p);
         if (c < opt_cost - 1e-4f) { opt_cost = c; opt_stall = 0; }              /* accept an improvement */
@@ -484,6 +493,7 @@ int main(int argc, char** argv) {
         if (argc > 3) { if (!strcmp(argv[3], "spcap")) p = BW_PAN_SPCAP; else if (!strcmp(argv[3], "vbap")) p = BW_PAN_VBAP; }
         float m0, w0; score_panner(p, 1, &m0, &w0);
         opt_cost = opt_cost_of(p); opt_step = 0.30f; opt_stall = 0; opt_iter = 0;
+        for (int i = 0; i < NSPK; ++i) opt_anchor[i] = spk[i].pos;             /* leash anchor (opt_leash defaults ~free) */
         while (opt_step > 0.02f && opt_iter < 120000) optimize_step(p, 200);   /* run to convergence (step floor) */
         float m1, w1; score_panner(p, 1, &m1, &w1);
         if (!save_json(path)) { printf("optimize: save failed: %s\n", path); return 1; }
@@ -569,7 +579,7 @@ int main(int argc, char** argv) {
                 }
                 if (audio) {
                     bw_source_set_pos(e, pv_src, src_pos.x, src_pos.y, src_pos.z);
-                    bw_set_listener_pose(e, 0, 0, 0, 0, 0, 0, 1);   /* listener at origin; walk the room to test off-center */
+                    bw_set_listener_pose(e, 0, obs_height, 0, 0, 0, 0, 1);   /* ears at obs_height; walk the room to test off-center */
                     bw_commit(e);
                 }
             }
@@ -604,7 +614,8 @@ int main(int argc, char** argv) {
             if (IsKeyPressed(KEY_B)) pv_panner = (pv_panner + 1) % 3;   /* select the target panner (score/optimize) */
             if (IsKeyPressed(KEY_O) || req_opt) { req_opt = 0;          /* toggle the auto-optimizer for that panner */
                 opt_running = !opt_running;
-                if (opt_running) { opt_cost = opt_cost_of((BwPanner)pv_panner); opt_step = 0.30f; opt_stall = 0; opt_iter = 0; }
+                if (opt_running) { opt_cost = opt_cost_of((BwPanner)pv_panner); opt_step = 0.30f; opt_stall = 0; opt_iter = 0;
+                                   for (int i = 0; i < NSPK; ++i) opt_anchor[i] = spk[i].pos; }   /* leash anchor = here */
             }
             if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT) && !IsMouseButtonDown(MOUSE_BUTTON_RIGHT)
                 && GetMouseX() < GetScreenWidth() - PANEL_W) {  /* click-pick a speaker (ignore clicks on the panel) */
@@ -697,8 +708,8 @@ int main(int argc, char** argv) {
         DrawLine3D((Vector3){ 0, 0, 0 }, (Vector3){ 1.2f, 0, 0 }, (Color){ 230, 90, 90, 255 });   /* +X */
         DrawLine3D((Vector3){ 0, 0, 0 }, (Vector3){ 0, 1.2f, 0 }, (Color){ 90, 230, 90, 255 });   /* +Y */
         DrawLine3D((Vector3){ 0, 0, 0 }, (Vector3){ 0, 0, 1.2f }, (Color){ 90, 150, 230, 255 });  /* +Z */
-        DrawSphere((Vector3){ 0, 0, 0 }, 0.08f, (Color){ 200, 200, 210, 255 });                   /* listener */
-        DrawLine3D((Vector3){ 0, 0, 0 }, spk[sel].pos, (Color){ 240, 220, 120, 140 });
+        DrawSphere((Vector3){ 0, obs_height, 0 }, 0.09f, (Color){ 210, 210, 230, 255 });           /* listener (ear height) */
+        DrawLine3D((Vector3){ 0, obs_height, 0 }, spk[sel].pos, (Color){ 240, 220, 120, 140 });
         for (int i = 0; i < NSPK; ++i) {
             int is_sel = (i == sel), is_drv = (audio && tone_on && i == sel);
             Color col = is_drv ? (Color){ 120, 245, 140, 255 }
@@ -717,7 +728,7 @@ int main(int argc, char** argv) {
             Vector3 sdir[27][26];                         /* speaker directions from each listener sample */
             for (int l = 0; l < NL; ++l)
                 for (int i = 0; i < NSPK; ++i)
-                    sdir[l][i] = Vector3Normalize(Vector3Subtract(spk[i].pos, cov_lis[l]));
+                    sdir[l][i] = Vector3Normalize(Vector3Subtract(spk[i].pos, Vector3Add(cov_lis[l], (Vector3){ 0, obs_height, 0 })));
             float worst = 1.0f; double macc = 0.0;       /* worst = min score (largest gap) */
             for (int s = 0; s < NCOV; ++s) {
                 Vector3 d = cov_dir[s];                   /* a source DIRECTION, queried from each listener */
@@ -732,7 +743,7 @@ int main(int argc, char** argv) {
                 float gap = acosf(a) * 57.2958f;          /* nearest-speaker angular gap (deg) for this direction */
                 cov_val[s] = gap;
                 float t = (40.0f - gap) / 35.0f; if (t < 0) t = 0; if (t > 1) t = 1;   /* green <=5 deg, full red >=40 deg */
-                DrawCubeV(Vector3Scale(d, COV_R), (Vector3){ 0.09f, 0.09f, 0.09f },
+                DrawCubeV(Vector3Add((Vector3){ 0, obs_height, 0 }, Vector3Scale(d, COV_R)), (Vector3){ 0.09f, 0.09f, 0.09f },
                           (Color){ (unsigned char)(230*(1-t)+50*t), (unsigned char)(60*(1-t)+225*t), 75, 205 });
                 if (score < worst) worst = score;
                 macc += acosf(a);
@@ -751,7 +762,7 @@ int main(int argc, char** argv) {
                 float err = cov_err[s];                   /* deg; 0 = exact, >=40 fully red */
                 cov_val[s] = err;
                 float t = err / 40.0f; if (t < 0) t = 0; if (t > 1) t = 1;
-                DrawCubeV(Vector3Scale(cov_dir[s], COV_R), (Vector3){ 0.09f, 0.09f, 0.09f },
+                DrawCubeV(Vector3Add((Vector3){ 0, obs_height, 0 }, Vector3Scale(cov_dir[s], COV_R)), (Vector3){ 0.09f, 0.09f, 0.09f },
                           (Color){ (unsigned char)(230*t+50*(1-t)), (unsigned char)(225*(1-t)+60*t), 75, 205 });
                 if (err > cov_worst) cov_worst = err;
                 macc += err;
@@ -858,7 +869,14 @@ int main(int argc, char** argv) {
             if (GuiButton((Rectangle){ x, y, w/2 - 3, rh }, "Score [X]")) req_score = 1;
             { bool ob = opt_running;
               GuiToggle((Rectangle){ x + w/2 + 3, y, w/2 - 3, rh }, opt_running ? "Optimizing.." : "Optimize [O]", &ob);
-              if (ob != (bool)opt_running) req_opt = 1; }  y += rh + gp + 6;
+              if (ob != (bool)opt_running) req_opt = 1; }  y += rh + gp;
+            GuiLabel((Rectangle){ x, y, 52, rh }, "obs y");   /* observer ear height -> scored listener */
+            { float v = obs_height; GuiSliderBar((Rectangle){ x+54, y, w-116, rh }, NULL, NULL, &obs_height, 0.0f, 2.0f);
+              if (obs_height != v) { score_stale = 1; cov_err_stale = 1; } }
+            GuiLabel((Rectangle){ x+w-56, y, 56, rh }, TextFormat("%.2fm", obs_height));  y += rh + gp;
+            GuiLabel((Rectangle){ x, y, 52, rh }, "leash");   /* max optimizer move from the anchor */
+            GuiSliderBar((Rectangle){ x+54, y, w-116, rh }, NULL, NULL, &opt_leash, 0.1f, 3.0f);
+            GuiLabel((Rectangle){ x+w-56, y, 56, rh }, TextFormat("%.2fm", opt_leash));  y += rh + gp + 6;
 
             GuiLabel((Rectangle){ x, y, w, rh }, "DBAP KNOBS");  y += rh;
             { float v;
@@ -897,7 +915,7 @@ int main(int argc, char** argv) {
             Ray ray = GetMouseRay(GetMousePosition(), cam);
             int hit = -1; float best = 1e30f;
             for (int s = 0; s < NCOV; ++s) {
-                Vector3 c = Vector3Scale(cov_dir[s], COV_R);
+                Vector3 c = Vector3Add((Vector3){ 0, obs_height, 0 }, Vector3Scale(cov_dir[s], COV_R));
                 BoundingBox bb = { { c.x-0.07f, c.y-0.07f, c.z-0.07f }, { c.x+0.07f, c.y+0.07f, c.z+0.07f } };
                 RayCollision rc = GetRayCollisionBox(ray, bb);
                 if (rc.hit && rc.distance < best) { best = rc.distance; hit = s; }
