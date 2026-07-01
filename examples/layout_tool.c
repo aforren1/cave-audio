@@ -496,6 +496,28 @@ static void optimize_step(BwPanner p, int trials) {
     layout_dirty = 1; score_stale = 1; cov_err_stale = 1;
 }
 
+/* green(good)->yellow->red(bad) ramp. t: 1 = green, 0.5 = yellow, 0 = red. */
+static Color heat(float t) {
+    if (t < 0) t = 0; else if (t > 1) t = 1;
+    float r, g, b;
+    if (t >= 0.5f) { float u = (t - 0.5f) * 2.0f;   /* yellow -> green */
+        r = 235 + (70  - 235) * u; g = 205; b = 60 + (95 - 60) * u; }
+    else { float u = t * 2.0f;                       /* red -> yellow */
+        r = 235; g = 70 + (205 - 70) * u; b = 68 + (60 - 68) * u; }
+    return (Color){ (unsigned char)r, (unsigned char)g, (unsigned char)b, 205 };
+}
+/* localization error (deg) -> heat, per the desired feel: <=2 great (green), 5-10 fine (a yellow
+ * plateau), 10+ bad (ramps to red by 12). */
+static Color err_heat(float e) {
+    float t;
+    if      (e <=  2.0f) t = 1.0f;                              /* great */
+    else if (e <=  5.0f) t = 1.0f - 0.5f * (e -  2.0f) / 3.0f;  /* green -> yellow */
+    else if (e <= 10.0f) t = 0.5f;                              /* fine: yellow plateau */
+    else if (e <= 12.0f) t = 0.5f - 0.5f * (e - 10.0f) / 2.0f;  /* yellow -> red */
+    else                 t = 0.0f;                              /* bad */
+    return heat(t);
+}
+
 int main(int argc, char** argv) {
     /* headless (no window/audio, scriptable):
      *   --export   [file]            write the layout (default grid, or an existing file with delay_ms recomputed)
@@ -813,9 +835,8 @@ int main(int argc, char** argv) {
                 float a = score < -1 ? -1 : (score > 1 ? 1 : score);
                 float gap = acosf(a) * 57.2958f;          /* nearest-speaker angular gap (deg) for this direction */
                 cov_val[s] = gap;
-                float t = (40.0f - gap) / 35.0f; if (t < 0) t = 0; if (t > 1) t = 1;   /* green <=5 deg, full red >=40 deg */
                 DrawCubeV(Vector3Add((Vector3){ 0, obs_height, 0 }, Vector3Scale(d, COV_R)), (Vector3){ 0.09f, 0.09f, 0.09f },
-                          (Color){ (unsigned char)(230*(1-t)+50*t), (unsigned char)(60*(1-t)+225*t), 75, 205 });
+                          heat((40.0f - gap) / 35.0f));   /* geometric gap: green <=5 deg, red >=40 deg */
                 if (score < worst) worst = score;
                 macc += acosf(a);
             }
@@ -830,11 +851,10 @@ int main(int argc, char** argv) {
                 compute_cov_err((BwPanner)pv_panner);
             double macc = 0.0;
             for (int s = 0; s < NCOV; ++s) {
-                float err = cov_err[s];                   /* deg; 0 = exact, >=40 fully red */
+                float err = cov_err[s];
                 cov_val[s] = err;
-                float t = err / 40.0f; if (t < 0) t = 0; if (t > 1) t = 1;
                 DrawCubeV(Vector3Add((Vector3){ 0, obs_height, 0 }, Vector3Scale(cov_dir[s], COV_R)), (Vector3){ 0.09f, 0.09f, 0.09f },
-                          (Color){ (unsigned char)(230*t+50*(1-t)), (unsigned char)(225*(1-t)+60*t), 75, 205 });
+                          err_heat(err));               /* 2 deg great (green), ~7 fine (yellow), 12+ bad (red) */
                 if (err > cov_worst) cov_worst = err;
                 macc += err;
             }
@@ -902,11 +922,11 @@ int main(int argc, char** argv) {
             if (cov_metric == 0)
                 ui_text(TextFormat("nearest-speaker gap [%s]   worst %.0f deg   mean %.0f deg   [G] -> rE error",
                                     obs, cov_worst, cov_mean),
-                         10, yb, 15, cov_worst > 45.0f ? (Color){ 245, 150, 110, 255 } : (Color){ 150, 225, 160, 255 });
+                         10, yb, 15, heat((40.0f - cov_mean) / 35.0f));
             else
-                ui_text(TextFormat("%s rE error [%s]   worst %.0f deg   mean %.0f deg   [G] -> gap",
+                ui_text(TextFormat("%s rE error [%s]   worst %.0f deg   mean %.0f deg   (2 great / 5-10 ok / 10+ bad)   [G] -> gap",
                                     panner_names[pv_panner], obs, cov_worst, cov_mean),
-                         10, yb, 15, cov_worst > 30.0f ? (Color){ 245, 150, 110, 255 } : (Color){ 150, 225, 160, 255 });
+                         10, yb, 15, err_heat(cov_mean));
         }
         if (scored && !preview) {                        /* per-panner rE-localization error, live (X = force refresh) */
             int ys = GetScreenHeight() - (coverage_on ? 52 : 26);
