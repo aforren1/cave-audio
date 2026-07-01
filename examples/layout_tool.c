@@ -382,7 +382,7 @@ static void build_engine(const char* layout_path) {
 
 /* ---- panner-specific layout scoring (offline, via the engine's real solve) ---- */
 static float score_mean[3], score_worst[3];      /* [DBAP, SPCAP, VBAP] rE localization error (deg) */
-static int   scored, score_stale;
+static int   scored, score_stale, last_score_frame;   /* the per-panner scoreboard auto-refreshes on a throttle */
 
 /* mean + worst rE localization error (deg) over the shell, from the panner's observer model: DBAP over
  * the moving listener grid; SPCAP/VBAP from the fixed centre. Uses bw_panner_gains_batch (the ACTUAL
@@ -589,6 +589,7 @@ int main(int argc, char** argv) {
      * the exact same action code as the keys with no duplication. */
     int   req_save = 0, req_reload = 0, req_score = 0, req_snap = 0, req_preview = 0, req_opt = 0, req_type = 0;
 
+    scored = 1; score_stale = 1;                                 /* per-panner scoreboard on from the start, live-refreshed */
     while (!WindowShouldClose()) {
         float dt = GetFrameTime();
         if (IsKeyPressed(KEY_F11)) ToggleBorderlessWindowed();   /* fullscreen (HUD/panel use GetScreenWidth, so they follow) */
@@ -704,6 +705,13 @@ int main(int argc, char** argv) {
             optimize_step((BwPanner)pv_panner, 6);
         }
         for (int i = 0; i < NSPK; ++i) if (spk[i].pos.y < 0.0f) spk[i].pos.y = 0.0f;   /* y >= 0: speakers never below the floor */
+
+        /* keep the per-panner rE-error scoreboard live: re-score (throttled, so a drag doesn't recompute
+         * every frame) whenever the layout is dirty. X forces an immediate refresh. */
+        if (scored && score_stale && !editing && (cov_frame - last_score_frame) >= 10) {
+            for (int p = 0; p < 3; ++p) score_panner((BwPanner)p, 1, &score_mean[p], &score_worst[p]);
+            score_stale = 0; last_score_frame = cov_frame;
+        }
 
         /* drive the selected speaker's channel when auditioning (edit mode only) */
         if (audio && !preview) {
@@ -900,13 +908,14 @@ int main(int argc, char** argv) {
                                     panner_names[pv_panner], obs, cov_worst, cov_mean),
                          10, yb, 15, cov_worst > 30.0f ? (Color){ 245, 150, 110, 255 } : (Color){ 150, 225, 160, 255 });
         }
-        if (scored && !preview) {                        /* panner-specific rE-localization scores (X) */
+        if (scored && !preview) {                        /* per-panner rE-localization error, live (X = force refresh) */
             int ys = GetScreenHeight() - (coverage_on ? 52 : 26);
             DrawRectangle(0, ys - 5, hud_w, 31, (Color){ 0, 0, 0, 195 });
-            ui_text(TextFormat("panner rE-err [X]%s   DBAP %.0f/%.0f   SPCAP %.0f/%.0f   VBAP %.0f/%.0f   deg mean/worst",
-                                score_stale ? " STALE" : "",
-                                score_mean[0], score_worst[0], score_mean[1], score_worst[1], score_mean[2], score_worst[2]),
-                     10, ys, 15, score_stale ? (Color){ 210, 210, 130, 255 } : (Color){ 150, 200, 240, 255 });
+            ui_text(TextFormat("rE-err deg mean/worst (live):   %sDBAP %.0f/%.0f    %sSPCAP %.0f/%.0f    %sVBAP %.0f/%.0f",
+                                pv_panner==0?">":"", score_mean[0], score_worst[0],
+                                pv_panner==1?">":"", score_mean[1], score_worst[1],
+                                pv_panner==2?">":"", score_mean[2], score_worst[2]),
+                     10, ys, 15, (Color){ 150, 200, 240, 255 });
         }
 
         EndScissorMode();
