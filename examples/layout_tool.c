@@ -74,6 +74,16 @@ static float       dbap_r = 0.5f, dist_ref = 1.0f, dist_rolloff = 1.0f, dist_min
 static const char* dist_model = "inverse";
 static float       obs_height = 1.4f;      /* observer EAR height above the floor origin (m; ~4.6 ft) — the
                                               listener/scoring point + the line-of-sight source sit here, not at y=0 */
+/* Psychophysics: human localization is anisotropic — horizontal (azimuth) acuity is far finer than
+ * vertical. The minimum audible angle is ~1 deg for a frontal azimuth displacement (Mills, JASA 1958)
+ * vs ~3-4 deg for a vertical one (Perrott & Saberi, JASA 1990); 2-D localization scatter is likewise
+ * ~2x larger in elevation than azimuth (Makous & Middlebrooks, JASA 1990), and median-plane blur is
+ * coarser still (Blauert, Spatial Hearing, 1997). So azimuth is ~3-4x more resolvable than elevation:
+ * split the localization error into azimuth + elevation and DOWN-weight elevation (elev_wt ~ 1/3.5), so
+ * the optimizer trades vertical accuracy for horizontal, matching what a listener actually notices.
+ * (elev_wt is a modelling choice from that ratio, not a value lifted from any single paper.) */
+static int         perceptual = 1;         /* weight azimuth over elevation in the rE error */
+static float       elev_wt    = 0.3f;      /* elevation-error weight vs azimuth (~1/3.5; slider 0..1) */
 
 /* the engine's default 3x3x3-minus-centre grid — the starting point and the layout_default() order */
 static void seed_default(void) {
@@ -380,6 +390,26 @@ static void build_engine(const char* layout_path) {
     bw_source_set_gain(e, pv_src, 0.0f);          /* silent until preview mode */
 }
 
+/* Perceptually-weighted localization error (deg) between intended dir `d` and the actual energy-vector
+ * dir `e` (both unit). With `perceptual`, the tangential error is split into an azimuth (horizontal) +
+ * elevation (vertical) component and elevation is scaled by elev_wt, so a vertical miss counts less than
+ * a horizontal one. Near-vertical dirs fall back to the raw angle (azimuth undefined at the poles). */
+static float loc_err_deg(Vector3 d, Vector3 e) {
+    float c = Vector3DotProduct(d, e); if (c > 1.f) c = 1.f; else if (c < -1.f) c = -1.f;
+    float raw = acosf(c) * 57.2958f;
+    if (!perceptual) return raw;
+    Vector3 azt = Vector3CrossProduct(d, (Vector3){ 0, 1, 0 });   /* azimuth tangent (horizontal) */
+    float azl = Vector3Length(azt);
+    if (azl < 0.15f) return raw;                                  /* d ~ vertical: azimuth ill-defined */
+    azt = Vector3Scale(azt, 1.0f / azl);
+    Vector3 elt = Vector3CrossProduct(azt, d);                    /* elevation tangent (vertical), unit */
+    Vector3 perp = Vector3Subtract(e, Vector3Scale(d, c));        /* e's deviation from d, in the tangent plane */
+    float ae = Vector3DotProduct(perp, azt), ee = Vector3DotProduct(perp, elt);
+    float w = sqrtf(ae*ae + elev_wt*elev_wt*ee*ee);               /* weighted deviation = sin(weighted error) */
+    if (w > 1.f) w = 1.f;
+    return asinf(w) * 57.2958f;
+}
+
 /* ---- panner-specific layout scoring (offline, via the engine's real solve) ---- */
 static float score_mean[3], score_worst[3];      /* [DBAP, SPCAP, VBAP] rE localization error (deg) */
 static int   scored, score_stale, last_score_frame;   /* the per-panner scoreboard auto-refreshes on a throttle */
@@ -416,9 +446,8 @@ static void score_panner(BwPanner panner, int stride, float* mean_deg, float* wo
             }
             float rl = sqrtf(rE[0]*rE[0] + rE[1]*rE[1] + rE[2]*rE[2]);
             if (rl < 1e-9f) continue;
-            float c = (rE[0]*cov_dir[i].x + rE[1]*cov_dir[i].y + rE[2]*cov_dir[i].z) / rl;  /* vs intended dir */
-            if (c > 1.f) c = 1.f; else if (c < -1.f) c = -1.f;
-            float err = acosf(c) * 57.2958f;
+            Vector3 e = { rE[0]/rl, rE[1]/rl, rE[2]/rl };
+            float err = loc_err_deg(cov_dir[i], e);   /* perceptually weighted (azimuth >> elevation) */
             sumerr += err; if (err > worst) worst = err; ++cnt;
         }
     }
@@ -453,9 +482,8 @@ static void compute_cov_err(BwPanner panner) {
             float rl = sqrtf(rE[0]*rE[0] + rE[1]*rE[1] + rE[2]*rE[2]);
             float err = 90.0f;                           /* no energy vector -> count as fully wrong */
             if (rl >= 1e-9f) {
-                float c = (rE[0]*cov_dir[i].x + rE[1]*cov_dir[i].y + rE[2]*cov_dir[i].z) / rl;
-                if (c > 1.f) c = 1.f; else if (c < -1.f) c = -1.f;
-                err = acosf(c) * 57.2958f;
+                Vector3 e = { rE[0]/rl, rE[1]/rl, rE[2]/rl };
+                err = loc_err_deg(cov_dir[i], e);        /* perceptually weighted (azimuth >> elevation) */
             }
             cov_err[i] += err;
         }
@@ -924,14 +952,15 @@ int main(int argc, char** argv) {
                                     obs, cov_worst, cov_mean),
                          10, yb, 15, heat((40.0f - cov_mean) / 35.0f));
             else
-                ui_text(TextFormat("%s rE error [%s]   worst %.0f deg   mean %.0f deg   (2 great / 5-10 ok / 10+ bad)   [G] -> gap",
-                                    panner_names[pv_panner], obs, cov_worst, cov_mean),
+                ui_text(TextFormat("%s rE error [%s]%s   worst %.0f  mean %.0f deg   (2 great / 5-10 ok / 10+ bad)   [G] -> gap",
+                                    panner_names[pv_panner], obs, perceptual ? " az>el" : "", cov_worst, cov_mean),
                          10, yb, 15, err_heat(cov_mean));
         }
         if (scored && !preview) {                        /* per-panner rE-localization error, live (X = force refresh) */
             int ys = GetScreenHeight() - (coverage_on ? 52 : 26);
             DrawRectangle(0, ys - 5, hud_w, 31, (Color){ 0, 0, 0, 195 });
-            ui_text(TextFormat("rE-err deg mean/worst (live):   %sDBAP %.0f/%.0f    %sSPCAP %.0f/%.0f    %sVBAP %.0f/%.0f",
+            ui_text(TextFormat("rE-err deg mean/worst (live%s):   %sDBAP %.0f/%.0f    %sSPCAP %.0f/%.0f    %sVBAP %.0f/%.0f",
+                                perceptual ? ", az>el" : "",
                                 pv_panner==0?">":"", score_mean[0], score_worst[0],
                                 pv_panner==1?">":"", score_mean[1], score_worst[1],
                                 pv_panner==2?">":"", score_mean[2], score_worst[2]),
@@ -969,7 +998,13 @@ int main(int argc, char** argv) {
             GuiLabel((Rectangle){ x+w-56, y, 56, rh }, TextFormat("%.2fm", obs_height));  y += rh + gp;
             GuiLabel((Rectangle){ x, y, 52, rh }, "leash");   /* max optimizer move from the anchor */
             GuiSliderBar((Rectangle){ x+54, y, w-116, rh }, NULL, NULL, &opt_leash, 0.1f, 3.0f);
-            GuiLabel((Rectangle){ x+w-56, y, 56, rh }, TextFormat("%.2fm", opt_leash));  y += rh + gp + 6;
+            GuiLabel((Rectangle){ x+w-56, y, 56, rh }, TextFormat("%.2fm", opt_leash));  y += rh + gp;
+            { bool pc = perceptual;                        /* weight azimuth >> elevation in the error */
+              GuiToggle((Rectangle){ x, y, w/2 - 3, rh }, "perceptual", &pc);
+              if (pc != (bool)perceptual) { perceptual = pc; score_stale = 1; cov_err_stale = 1; }
+              if (perceptual) { float v = elev_wt;
+                  GuiSliderBar((Rectangle){ x+w/2+42, y, w/2-45, rh }, "el wt", NULL, &elev_wt, 0.0f, 1.0f);
+                  if (elev_wt != v) { score_stale = 1; cov_err_stale = 1; } } }  y += rh + gp + 6;
 
             GuiLabel((Rectangle){ x, y, w, rh }, "DBAP KNOBS");  y += rh;
             { float v;
