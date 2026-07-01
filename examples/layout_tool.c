@@ -703,7 +703,11 @@ int main(int argc, char** argv) {
             if (IsKeyPressed(KEY_T)) tone_on = !tone_on;
             if (IsKeyPressed(KEY_N)) tone_kind = (tone_kind == BW_TEST_SINE) ? BW_TEST_NOISE : BW_TEST_SINE;
             if (IsKeyPressed(KEY_ENTER) || req_type) { req_type = 0; editing = 1; ilen = 0; ibuf[0] = 0; }
-            if (IsKeyPressed(KEY_S) || req_save) { req_save = 0; save_flash = save_json(path) ? 2.0f : -2.0f; }
+            if (IsKeyPressed(KEY_S) || req_save) { req_save = 0;
+                int ok = save_json(path); save_flash = ok ? 2.0f : -2.0f;
+                if (!ok) fprintf(stderr, "save failed: cannot write '%s' (working dir %s) — check the path / permissions\n",
+                                 path, GetWorkingDirectory());
+            }
             if (IsKeyPressed(KEY_L) || req_reload) { req_reload = 0; load_json(path); load_constraints("constraints.json"); layout_dirty = 1; score_stale = 1; cov_err_stale = 1; }
             if (IsKeyPressed(KEY_K) || req_snap) { req_snap = 0;       /* snap all speakers to the nearest allowed point */
                 for (int i = 0; i < NSPK; ++i) spk[i].pos = constraint_project(spk[i].pos);
@@ -738,10 +742,13 @@ int main(int argc, char** argv) {
                 if (driven >= 0 && e) { bw_test_signal(e, (uint32_t)driven, BW_TEST_OFF, 0.0f); driven = -1; }
                 tone_on = 0; pv_orbit = 0; pv_t = 0.0f;   /* each preview session starts manual, fresh orbit phase */
                 if (layout_dirty && e && audio) {     /* rebuild only when there's a device to hear it on */
-                    save_json(TEMP_LAYOUT);
-                    bw_stop(e); bw_destroy(e);
-                    build_engine(TEMP_LAYOUT);
-                    layout_dirty = 0; driven = -1;
+                    if (save_json(TEMP_LAYOUT)) {      /* ... and only if the temp layout actually wrote */
+                        bw_stop(e); bw_destroy(e);
+                        build_engine(TEMP_LAYOUT);
+                        layout_dirty = 0; driven = -1;
+                    } else {
+                        fprintf(stderr, "preview: cannot write %s (working dir not writable?) — previewing the last build\n", TEMP_LAYOUT);
+                    }
                 }
                 opt_running = 0;                          /* stop the optimizer when leaving edit for preview */
                 preview = 1;
@@ -778,8 +785,8 @@ int main(int argc, char** argv) {
             }
         }
 
-        if (save_flash > 0) save_flash -= dt;            /* "saved" toast fades out */
-        else if (save_flash < 0) save_flash += dt;       /* "save failed" toast fades out */
+        if      (save_flash > 0) { save_flash -= dt; if (save_flash < 0) save_flash = 0; }  /* fade out, then STOP at 0 */
+        else if (save_flash < 0) { save_flash += dt; if (save_flash > 0) save_flash = 0; }  /* (else it oscillated -> flicker) */
 
         /* camera: FIRST-PERSON from the observer's ears (H), or orbit (default). Right-drag looks/orbits. */
         if (fps) {
