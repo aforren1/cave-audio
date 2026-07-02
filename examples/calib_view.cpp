@@ -9,12 +9,14 @@
  *
  *   bw_calib_view [layoutA.json] [layoutB.json]     # B optional: diff mode
  *       --irs <prefix>                              # preload <prefix>_NN.wav IR kernels
- *       --selftest                                  # run the imgui_test_engine suite and exit
+ *       --tests [filter]                            # run the imgui_test_engine suite (optionally
+ *                                                   #   filtered, e.g. --tests viewer) and exit
  *
  * PILOT NOTES (vs the raylib tools): this is the imgui + implot + implot3d stack on the win32+d3d11
- * backend, chosen for imgui_test_engine — `--selftest` drives the ACTUAL GUI with fake inputs
+ * backend, chosen for imgui_test_engine — `--tests` drives the ACTUAL GUI with fake inputs
  * (type a path, click Load, click tabs), asserts on app state, captures screenshots, and exits with
  * a pass/fail code, so the GUI itself runs under ctest. That loop is what raylib can't do.
+ * Test-engine wiring + conventions follow aforren1/lsl-viewer (the house reference for imgui tools).
  *
  * Data comes straight from the engine's own loader (layout.c via bw_core) — the viewer can't drift
  * from what the engine would actually load. IR wavs decode through sound.c for the same reason.
@@ -389,6 +391,26 @@ static int write_fixture(const char* path, int variant_b) {
 static void register_tests(ImGuiTestEngine* e) {
     ImGuiTest* t;
 
+    /* pure-logic checks ride the same suite (lsl-viewer's pattern: the test engine is the app's
+     * whole harness, not just its UI driver) — no UI touched, still filterable via --tests logic. */
+    t = IM_REGISTER_TEST(e, "logic", "wav_prefix");
+    t->TestFunc = [](ImGuiTestContext*) {
+        char a[64] = "caps/irs_07.wav"; wav_to_prefix(a); IM_CHECK_STR_EQ(a, "caps/irs");
+        char b[64] = "plain.wav";       wav_to_prefix(b); IM_CHECK_STR_EQ(b, "plain");
+        char c[64] = "a_7.wav";         wav_to_prefix(c); IM_CHECK_STR_EQ(c, "a_7");   /* one digit: not _NN */
+        char d[64] = "noext";           wav_to_prefix(d); IM_CHECK_STR_EQ(d, "noext");
+    };
+
+    t = IM_REGISTER_TEST(e, "logic", "eq_magnitude");            /* unit FIR is 0 dB flat; 0.5 is -6 dB */
+    t->TestFunc = [](ImGuiTestContext*) {
+        float taps[2] = { 1.0f, 0.0f }, mag[EQ_PTS];
+        eq_magnitude(taps, 2, 48000.0f, mag);
+        for (int k = 0; k < EQ_PTS; ++k) IM_CHECK_LT(fabsf(mag[k]), 0.01f);
+        taps[0] = 0.5f;
+        eq_magnitude(taps, 2, 48000.0f, mag);
+        for (int k = 0; k < EQ_PTS; ++k) IM_CHECK_LT(fabsf(mag[k] + 6.0206f), 0.01f);
+    };
+
     t = IM_REGISTER_TEST(e, "viewer", "load_a");                 /* type a path, click Load, layout appears */
     t->TestFunc = [](ImGuiTestContext* ctx) {
         ctx->SetRef("calib view");
@@ -516,12 +538,16 @@ static LRESULT WINAPI wnd_proc(HWND h, UINT m, WPARAM w, LPARAM l) {
 
 int main(int argc, char** argv) {
     bool selftest = false;
+    char filter[64] = "";
     int  npos = 0;
     for (int i = 1; i < argc; ++i) {
-        if      (!strcmp(argv[i], "--selftest"))            selftest = true;
+        if (!strcmp(argv[i], "--tests") || !strcmp(argv[i], "--selftest")) {   /* --tests [filter], lsl-viewer style */
+            selftest = true;
+            if (i + 1 < argc && argv[i + 1][0] != '-') snprintf(filter, sizeof filter, "%s", argv[++i]);
+        }
         else if (!strcmp(argv[i], "--irs") && i + 1 < argc) snprintf(V.irprefix, sizeof V.irprefix, "%s", argv[++i]);
         else if (argv[i][0] != '-' && npos < 2)             snprintf(npos++ ? V.pathB : V.pathA, sizeof V.pathA, "%s", argv[i]);
-        else { fprintf(stderr, "usage: calib_view [layoutA.json] [layoutB.json] [--irs prefix] [--selftest]\n"); return 2; }
+        else { fprintf(stderr, "usage: calib_view [layoutA.json] [layoutB.json] [--irs prefix] [--tests [filter]]\n"); return 2; }
     }
     for (int k = 0; k < EQ_PTS; ++k) V.eqfreq[k] = 20.0f * powf(1000.0f, (float)k / (EQ_PTS - 1));
     if (selftest) {
@@ -566,7 +592,8 @@ int main(int argc, char** argv) {
     ImGuiTestEngine_Start(g_te, ImGui::GetCurrentContext());
     ImGuiTestEngine_InstallDefaultCrashHandler();
     register_tests(g_te);
-    if (selftest) ImGuiTestEngine_QueueTests(g_te, ImGuiTestGroup_Tests, NULL, ImGuiTestRunFlags_RunFromCommandLine);
+    if (selftest) ImGuiTestEngine_QueueTests(g_te, ImGuiTestGroup_Tests, filter[0] ? filter : NULL,
+                                             ImGuiTestRunFlags_RunFromCommandLine);
 
     bool done = false;
     int  frames = 0, drain = 0;
@@ -599,7 +626,7 @@ int main(int argc, char** argv) {
     if (selftest) {
         ImGuiTestEngineResultSummary sum;
         ImGuiTestEngine_GetResultSummary(g_te, &sum);
-        printf("calib_view selftest: %d/%d passed\n", sum.CountSuccess, sum.CountTested);
+        printf("[tests] %d/%d passed\n", sum.CountSuccess, sum.CountTested);
         rc = (sum.CountTested == 0 || sum.CountSuccess != sum.CountTested) ? 1 : 0;
     }
 

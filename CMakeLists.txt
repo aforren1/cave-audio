@@ -432,16 +432,19 @@ if(BWAUDIO_BUILD_CALIBVIEW)
     ${imgui_SOURCE_DIR} ${imgui_SOURCE_DIR}/backends
     ${implot_SOURCE_DIR} ${implot3d_SOURCE_DIR}
     ${imgui_te_SOURCE_DIR} ${imgui_te_SOURCE_DIR}/imgui_test_engine)
-  # The canonical test-engine integration: compile EVERY imgui/implot/te TU with the test engine's
-  # imconfig (defines IMGUI_ENABLE_TEST_ENGINE hooks + IMGUI_TEST_ENGINE_ENABLE_CAPTURE) — a plain
-  # IMGUI_ENABLE_TEST_ENGINE define is not enough, the capture path silently compiles out without it.
-  # The std::thread coroutine impl is the no-dependency option on Windows.
+  # Test-engine integration (pattern from aforren1/lsl-viewer, which worked these out): the hooks
+  # define must be seen by EVERY imgui-including TU (or the ImGuiContext layout diverges), the
+  # std::thread coroutine impl must be explicitly selected (else IO.CoroutineFuncs is null -> crash
+  # in ImGuiTestEngine_Start), and capture must be explicitly enabled (else screenshots are silently
+  # skipped). imgui_te_imconfig.h would default the latter two but is not auto-included; explicit
+  # defines are clearer than routing IMGUI_USER_CONFIG through it.
   target_compile_definitions(bw_calib_view PRIVATE
-    "IMGUI_USER_CONFIG=\"imgui_te_imconfig.h\""
-    IMGUI_TEST_ENGINE_ENABLE_COROUTINE_STDTHREAD_IMPL=1)
+    IMGUI_ENABLE_TEST_ENGINE
+    IMGUI_TEST_ENGINE_ENABLE_COROUTINE_STDTHREAD_IMPL=1
+    IMGUI_TEST_ENGINE_ENABLE_CAPTURE=1)
   target_link_libraries(bw_calib_view PRIVATE bw_core d3d11 d3dcompiler comdlg32)   # comdlg32: file picker
   if(BWAUDIO_BUILD_TESTS)
-    add_test(NAME calib_view COMMAND bw_calib_view --selftest)   # the GUI itself, driven by fake inputs
+    add_test(NAME calib_view COMMAND bw_calib_view --tests)      # the GUI itself, driven by fake inputs
   endif()
 endif()
 
