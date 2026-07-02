@@ -511,7 +511,8 @@ static float opt_cost_of(BwPanner p) {   /* coarse; + a penalty per speaker in a
 }
 static float frand(void) { return (float)rand() / ((float)RAND_MAX + 1.0f); }
 
-static void mark_edit(void) { layout_dirty = 1; score_stale = 1; cov_err_stale = 1; }
+static void mark_edit(void)  { layout_dirty = 1; score_stale = 1; cov_err_stale = 1; }
+static void mark_score(void) { score_stale = 1; cov_err_stale = 1; }   /* metric knob changed; the layout file didn't */
 
 static void optimize_step(BwPanner p, int trials) {
     for (int t = 0; t < trials; ++t) {
@@ -552,6 +553,14 @@ static Color err_heat(float e) {
     return heat(t);
 }
 static ImVec4 imcol(Color c) { return ImVec4(c.r / 255.0f, c.g / 255.0f, c.b / 255.0f, 1.0f); }
+
+/* checkbox over an int flag (this file's toggles are C ints shared with the key handlers) */
+static bool CheckboxInt(const char* label, int* v) {
+    bool b = *v != 0;
+    bool changed = ImGui::Checkbox(label, &b);
+    if (changed) *v = b;
+    return changed;
+}
 
 /* ============================== UI state + actions ============================== */
 
@@ -612,6 +621,213 @@ static void leave_preview(void) {
     if (e) { bw_source_set_gain(e, pv_src, 0.0f); bw_commit(e); }
 }
 
+/* ============================== per-frame input / camera / scene ============================== */
+
+/* preview mode: move the source (or auto-orbit), A/B the panner, feed the engine */
+static void handle_preview_input(float dt, bool kb) {
+    if (kb && IsKeyPressed(KEY_P)) { leave_preview(); return; }
+    if (kb && IsKeyPressed(KEY_SPACE)) pv_orbit = !pv_orbit;
+    if (kb && IsKeyPressed(KEY_B)) {                 /* live A/B: DBAP <-> SPCAP <-> VBAP (atomic, safe while running) */
+        pv_panner = (pv_panner + 1) % 3;
+        if (e) bw_set_panner(e, (BwPanner)pv_panner);
+    }
+    if (pv_orbit) {                                  /* hands-free orbit + near/far + high/low sweep */
+        pv_t += dt;
+        float az = 0.6f * pv_t, r = 1.6f + 1.0f * sinf(0.8f * pv_t), yy = 1.0f * sinf(1.1f * pv_t);
+        src_pos = Vector3{ r * cosf(az), yy, r * sinf(az) };
+    } else if (kb) {
+        float mv = ((IsKeyDown(KEY_LEFT_SHIFT) || IsKeyDown(KEY_RIGHT_SHIFT)) ? 0.4f : 1.5f) * dt;
+        if (IsKeyDown(KEY_W)) src_pos.z -= mv;
+        if (IsKeyDown(KEY_S)) src_pos.z += mv;
+        if (IsKeyDown(KEY_A)) src_pos.x -= mv;
+        if (IsKeyDown(KEY_D)) src_pos.x += mv;
+        if (IsKeyDown(KEY_R)) src_pos.y += mv;
+        if (IsKeyDown(KEY_F)) src_pos.y -= mv;
+    }
+    if (audio) {
+        bw_source_set_pos(e, pv_src, src_pos.x, src_pos.y, src_pos.z);
+        bw_set_listener_pose(e, 0, obs_height, 0, 0, 0, 0, 1);   /* ears at obs_height; walk the room to test off-center */
+        bw_commit(e);
+    }
+}
+
+/* edit mode: select/nudge speakers, toggle views, fire the shared actions (the panel mirrors all of it) */
+static void handle_edit_input(float dt, bool kb, bool ms, const Camera3D& cam) {
+    if (kb) {
+        if (IsKeyPressed(KEY_RIGHT_BRACKET)) sel = (sel + 1) % NSPK;
+        if (IsKeyPressed(KEY_LEFT_BRACKET))  sel = (sel + NSPK - 1) % NSPK;
+        Vector3 p0 = spk[sel].pos; float g0 = spk[sel].gain_db;
+        float d = ((IsKeyDown(KEY_LEFT_SHIFT) || IsKeyDown(KEY_RIGHT_SHIFT)) ? 0.25f : 1.0f) * dt;
+        if (IsKeyDown(KEY_LEFT))  spk[sel].pos.x -= d;
+        if (IsKeyDown(KEY_RIGHT)) spk[sel].pos.x += d;
+        if (IsKeyDown(KEY_UP))    spk[sel].pos.z -= d;
+        if (IsKeyDown(KEY_DOWN))  spk[sel].pos.z += d;
+        if (IsKeyDown(KEY_R))     spk[sel].pos.y += d;
+        if (IsKeyDown(KEY_F))     spk[sel].pos.y -= d;
+        if (IsKeyDown(KEY_PAGE_UP))   spk[sel].gain_db += 6.0f * dt;
+        if (IsKeyDown(KEY_PAGE_DOWN)) spk[sel].gain_db -= 6.0f * dt;
+        if (memcmp(&p0, &spk[sel].pos, sizeof p0) != 0 || g0 != spk[sel].gain_db) mark_edit();
+        if (IsKeyPressed(KEY_T)) tone_on = !tone_on;
+        if (IsKeyPressed(KEY_N)) tone_kind = (tone_kind == BW_TEST_SINE) ? BW_TEST_NOISE : BW_TEST_SINE;
+        if (IsKeyPressed(KEY_S)) do_save();
+        if (IsKeyPressed(KEY_L)) do_reload();
+        if (IsKeyPressed(KEY_K)) do_snap();
+        if (IsKeyPressed(KEY_C)) coverage_on = !coverage_on;
+        if (IsKeyPressed(KEY_V)) coverage_moving = !coverage_moving;
+        if (IsKeyPressed(KEY_G)) cov_metric ^= 1;   /* shade: gap <-> selected-panner rE error (cache stays valid) */
+        if (IsKeyPressed(KEY_X)) do_score();
+        if (IsKeyPressed(KEY_B)) pv_panner = (pv_panner + 1) % 3;   /* the score/optimize target panner */
+        if (IsKeyPressed(KEY_O)) set_optimizing(!opt_running);
+        if (IsKeyPressed(KEY_P)) enter_preview();
+    }
+    if (ms && IsMouseButtonPressed(MOUSE_BUTTON_LEFT) && !IsMouseButtonDown(MOUSE_BUTTON_RIGHT)) {
+        Ray ray = GetMouseRay(GetMousePosition(), cam);        /* click-pick a speaker (imgui owns its own area) */
+        float best = 1e9f; int hit = -1;
+        for (int i = 0; i < NSPK; ++i) {
+            RayCollision rc = GetRayCollisionSphere(ray, spk[i].pos, 0.16f);
+            if (rc.hit && rc.distance < best) { best = rc.distance; hit = i; }
+        }
+        if (hit >= 0) sel = hit;
+    }
+}
+
+/* drive the selected speaker's channel when auditioning (edit mode only) */
+static void drive_tone(void) {
+    if (!audio || preview) return;
+    if (tone_on) {
+        if (driven >= 0 && driven != sel) bw_test_signal(e, (uint32_t)driven, BW_TEST_OFF, 0.0f);
+        bw_test_signal(e, (uint32_t)sel, (BwTestKind)tone_kind, TEST_GAIN);
+        driven = sel;
+    } else if (driven >= 0) {
+        bw_test_signal(e, (uint32_t)driven, BW_TEST_OFF, 0.0f);
+        driven = -1;
+    }
+}
+
+/* camera: FIRST-PERSON from the observer's ears (H), or orbit (default). Right-drag looks/orbits. */
+static void update_camera(Camera3D* cam, bool ms) {
+    if (fps_view) {
+        if (ms && IsMouseButtonDown(MOUSE_BUTTON_RIGHT)) {    /* mouse-look */
+            Vector2 md = GetMouseDelta();
+            fps_yaw   -= md.x * 0.004f;
+            fps_pitch -= md.y * 0.004f;
+            if (fps_pitch >  1.5f) fps_pitch =  1.5f;
+            if (fps_pitch < -1.5f) fps_pitch = -1.5f;
+        }
+        if (ms) fps_fov -= GetMouseWheelMove() * 4.0f;        /* wheel zooms the view */
+        if (fps_fov < 25.0f) fps_fov = 25.0f; if (fps_fov > 100.0f) fps_fov = 100.0f;
+        Vector3 fwd = { cosf(fps_pitch)*sinf(fps_yaw), sinf(fps_pitch), cosf(fps_pitch)*cosf(fps_yaw) };
+        cam->position = Vector3{ 0, obs_height, 0 };          /* AT the ears */
+        cam->target   = Vector3Add(cam->position, fwd);
+        cam->fovy     = fps_fov;
+    } else {
+        if (ms && IsMouseButtonDown(MOUSE_BUTTON_RIGHT)) {
+            Vector2 md = GetMouseDelta();
+            cam_yaw   -= md.x * 0.005f;
+            cam_pitch += md.y * 0.005f;
+            if (cam_pitch >  1.5f) cam_pitch =  1.5f;
+            if (cam_pitch < -1.5f) cam_pitch = -1.5f;
+        }
+        if (ms) cam_dist -= GetMouseWheelMove() * 0.6f;
+        if (cam_dist < 2.0f)  cam_dist = 2.0f;
+        if (cam_dist > 30.0f) cam_dist = 30.0f;
+        cam->target   = Vector3{ 0, 0, 0 };
+        cam->fovy     = 55.0f;
+        cam->position.x = cam_dist * cosf(cam_pitch) * sinf(cam_yaw);
+        cam->position.y = cam_dist * sinf(cam_pitch);
+        cam->position.z = cam_dist * cosf(cam_pitch) * cosf(cam_yaw);
+    }
+}
+
+/* the raylib 3D scene: grid, constraints, speakers, preview source, coverage shell.
+ * Fills the coverage summary (worst/mean, deg) for the HUD line. */
+static void draw_scene(const Camera3D& cam, float* cov_worst_out, float* cov_mean_out) {
+    float cov_worst = 0.0f, cov_mean = 0.0f;
+    BeginMode3D(cam);
+    DrawGrid(16, 0.5f);
+    if (con_loaded) {                                /* placement constraints: allowed bounds (green) + no-go (red) */
+        DrawCubeWiresV(Vector3Scale(Vector3Add(con_bounds.lo, con_bounds.hi), 0.5f),
+                       Vector3Subtract(con_bounds.hi, con_bounds.lo), Color{ 90, 200, 120, 110 });
+        for (int i = 0; i < con_nnogo; ++i)
+            DrawCubeWiresV(Vector3Scale(Vector3Add(con_nogo[i].lo, con_nogo[i].hi), 0.5f),
+                           Vector3Subtract(con_nogo[i].hi, con_nogo[i].lo), Color{ 235, 90, 90, 170 });
+        for (int i = 0; i < con_nobst; ++i) {        /* solid occluders (projectors/structure): filled orange */
+            Vector3 ctr = Vector3Scale(Vector3Add(con_obst[i].lo, con_obst[i].hi), 0.5f);
+            Vector3 sz  = Vector3Subtract(con_obst[i].hi, con_obst[i].lo);
+            DrawCubeV(ctr, sz, Color{ 235, 150, 60, 70 });
+            DrawCubeWiresV(ctr, sz, Color{ 245, 165, 70, 200 });
+        }
+    }
+    DrawLine3D(Vector3{ 0, 0, 0 }, Vector3{ 1.2f, 0, 0 }, Color{ 230, 90, 90, 255 });   /* +X */
+    DrawLine3D(Vector3{ 0, 0, 0 }, Vector3{ 0, 1.2f, 0 }, Color{ 90, 230, 90, 255 });   /* +Y */
+    DrawLine3D(Vector3{ 0, 0, 0 }, Vector3{ 0, 0, 1.2f }, Color{ 90, 150, 230, 255 });  /* +Z */
+    if (!fps_view) DrawSphere(Vector3{ 0, obs_height, 0 }, 0.09f, Color{ 210, 210, 230, 255 });  /* listener (hidden in FPS: you're inside it) */
+    DrawLine3D(Vector3{ 0, obs_height, 0 }, spk[sel].pos,   /* ear<->speaker sightline: green clear / red blocked */
+               los_clear(spk[sel].pos) ? Color{ 240, 220, 120, 160 } : Color{ 245, 90, 90, 230 });
+    for (int i = 0; i < NSPK; ++i) {
+        int is_sel = (i == sel), is_drv = (audio && tone_on && i == sel);
+        Color col = is_drv ? Color{ 120, 245, 140, 255 }
+                  : is_sel ? Color{ 245, 220, 90, 255 }
+                           : Color{ 120, 120, 150, 255 };
+        DrawSphere(spk[i].pos, is_sel ? 0.15f : 0.10f, col);
+        if (!constraint_ok(spk[i].pos))              /* red: outside bounds / inside a solid body (snap fixes) */
+            DrawSphereWires(spk[i].pos, is_sel ? 0.20f : 0.16f, 6, 6, Color{ 245, 80, 80, 255 });
+        else if (!los_clear(spk[i].pos))             /* orange: sightline to the ears is blocked (move it clear) */
+            DrawSphereWires(spk[i].pos, is_sel ? 0.20f : 0.16f, 6, 6, Color{ 245, 165, 70, 255 });
+    }
+    if (preview) {                                   /* the moving DBAP source */
+        DrawLine3D(Vector3{ 0, 0, 0 }, src_pos, Color{ 90, 220, 90, 200 });
+        DrawSphere(src_pos, 0.16f, Color{ 240, 120, 90, 255 });
+    }
+    if (coverage_on && !preview && cov_metric == 0) {  /* shade each direction by its nearest-speaker gap */
+        int NL = coverage_moving ? 27 : 1;
+        static Vector3 sdir[27][26];                  /* speaker directions from each listener sample */
+        for (int l = 0; l < NL; ++l)
+            for (int i = 0; i < NSPK; ++i)
+                sdir[l][i] = Vector3Normalize(Vector3Subtract(spk[i].pos, Vector3Add(cov_lis[l], Vector3{ 0, obs_height, 0 })));
+        float worst = 1.0f; double macc = 0.0;       /* worst = min score (largest gap) */
+        for (int s = 0; s < NCOV; ++s) {
+            Vector3 d = cov_dir[s];                   /* a source DIRECTION, queried from each listener */
+            float acc = 0.0f;                        /* mean over listeners of (max over speakers of alignment) */
+            for (int l = 0; l < NL; ++l) {           /* from listener L, how near is the best speaker to direction d? */
+                float best = -1.0f;
+                for (int i = 0; i < NSPK; ++i) { float dp = Vector3DotProduct(d, sdir[l][i]); if (dp > best) best = dp; }
+                acc += best;
+            }
+            float score = acc / (float)NL;            /* typical coverage of d over the roam (mean, not worst corner) */
+            float a = score < -1 ? -1 : (score > 1 ? 1 : score);
+            float gap = acosf(a) * 57.2958f;          /* nearest-speaker angular gap (deg) for this direction */
+            cov_val[s] = gap;
+            DrawCubeV(Vector3Add(Vector3{ 0, obs_height, 0 }, Vector3Scale(d, COV_R)), Vector3{ 0.09f, 0.09f, 0.09f },
+                      heat((40.0f - gap) / 35.0f));   /* geometric gap: green <=5 deg, red >=40 deg */
+            if (score < worst) worst = score;
+            macc += acosf(a);
+        }
+        float w = worst < -1 ? -1 : (worst > 1 ? 1 : worst);
+        cov_worst = acosf(w) * 57.2958f;
+        cov_mean  = (float)(macc / NCOV) * 57.2958f;
+    } else if (coverage_on && !preview && cov_metric == 1) {  /* shade by the selected panner's per-dir rE error */
+        /* recompute a structural change (panner/observer/first-entry) immediately so the cubes and the
+         * HUD label never disagree; throttle only the layout-edit churn (which fires every frame mid-optimize) */
+        int structural = (!cov_err_valid || cov_err_panner != pv_panner || cov_err_moving != coverage_moving);
+        if (structural || (cov_err_stale && cov_frame - cov_err_frame >= 6))
+            compute_cov_err((BwPanner)pv_panner);
+        double macc = 0.0;
+        for (int s = 0; s < NCOV; ++s) {
+            float err = cov_err[s];
+            cov_val[s] = err;
+            DrawCubeV(Vector3Add(Vector3{ 0, obs_height, 0 }, Vector3Scale(cov_dir[s], COV_R)), Vector3{ 0.09f, 0.09f, 0.09f },
+                      err_heat(err));               /* 2 deg great (green), ~7 fine (yellow), 12+ bad (red) */
+            if (err > cov_worst) cov_worst = err;
+            macc += err;
+        }
+        cov_mean = (float)(macc / NCOV);
+    }
+    EndMode3D();
+    *cov_worst_out = cov_worst;
+    *cov_mean_out  = cov_mean;
+}
+
 /* ============================== imgui: labels / HUD / panel ============================== */
 
 /* 2D speaker-index labels projected from 3D — on the BACKGROUND drawlist, so they sit over the
@@ -630,7 +846,16 @@ static void draw_labels(const Camera3D& cam) {
 }
 
 /* top-left status overlay: pure text, never captures the mouse (scene clicks pass through it) */
-static void draw_hud(float seldel, float seld, int con_bad, int con_occ, float cov_worst, float cov_mean) {
+static void draw_hud(float cov_worst, float cov_mean) {
+    float dmax = 0.0f;                               /* live delay readout: max-distance alignment */
+    for (int i = 0; i < NSPK; ++i) { float dd = Vector3Length(spk[i].pos); if (dd > dmax) dmax = dd; }
+    float seld   = Vector3Length(spk[sel].pos);
+    float seldel = (dmax - seld) / SPEED_OF_SOUND * 1000.0f;
+    int con_bad = 0, con_occ = 0;
+    if (con_loaded) for (int i = 0; i < NSPK; ++i) {
+        if (!constraint_ok(spk[i].pos)) ++con_bad;   /* out of bounds / inside a solid body (snappable) */
+        if (!los_clear(spk[i].pos))     ++con_occ;   /* line of sight to the ears blocked by an obstacle */
+    }
     ImGui::SetNextWindowPos(ImVec2(uiScaled(8), uiScaled(8)));
     ImGui::SetNextWindowBgAlpha(0.72f);
     ImGui::Begin("hud", NULL, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_AlwaysAutoResize |
@@ -680,7 +905,9 @@ static void draw_hud(float seldel, float seld, int con_bad, int con_occ, float c
     ImGui::End();
 }
 
-/* right-side control panel — every edit control; the keyboard shortcuts all set the same state */
+/* right-side control panel, ordered by the workflow: load the file -> place + identify speakers ->
+ * tune the panning knobs -> analyze/optimize -> audition -> view. Every control mirrors a keyboard
+ * shortcut and fires the same do_* action. */
 static void draw_panel(void) {
     const float pw = uiScaled(PANEL_W);
     ImGuiViewport* vp = ImGui::GetMainViewport();
@@ -691,63 +918,68 @@ static void draw_panel(void) {
                                  ImGuiWindowFlags_NoSavedSettings);
     ImGui::PushItemWidth(-uiScaled(70));
 
-    if (preview) {
+    if (preview) {                                   /* preview swaps the whole panel for its own controls */
         ImGui::SeparatorText("Preview");
         ImGui::Text("source (%.2f, %.2f, %.2f)", src_pos.x, src_pos.y, src_pos.z);
-        { bool ob = pv_orbit != 0; if (ImGui::Checkbox("auto-orbit [SPACE]", &ob)) pv_orbit = ob; }
+        CheckboxInt("auto-orbit [SPACE]", &pv_orbit);
         if (ImGui::Combo("panner", &pv_panner, "DBAP (moving)\0SPCAP (fixed)\0VBAP (fixed)\0") && e)
-            bw_set_panner(e, (BwPanner)pv_panner);           /* live A/B (atomic, safe while running) */
+            bw_set_panner(e, (BwPanner)pv_panner);   /* live A/B (atomic, safe while running) */
         ImGui::TextDisabled("WASD/RF move the source");
         if (ImGui::Button("Back to edit [P]", ImVec2(-1, 0))) leave_preview();
-    } else {
-        ImGui::SeparatorText("Speaker");
-        if (ImGui::InputInt("##spk", &sel)) { if (sel < 0) sel = 0; if (sel >= NSPK) sel = NSPK - 1; }
-        ImGui::SameLine(); ImGui::Text("-> ch %d", sel);
-        if (ImGui::DragFloat3("pos", &spk[sel].pos.x, 0.01f, 0, 0, "%.3f")) mark_edit();
-        if (ImGui::SliderFloat("gain", &spk[sel].gain_db, -24.0f, 12.0f, "%+.1f dB")) mark_edit();
-
-        ImGui::SeparatorText("Panner (score/opt target)");
-        if (ImGui::Combo("##panner", &pv_panner, "DBAP (moving)\0SPCAP (fixed)\0VBAP (fixed)\0"))
-            { score_stale = 1; cov_err_stale = 1; }
-        if (ImGui::Button("Score [X]")) do_score();
-        ImGui::SameLine();
-        { bool ob = opt_running != 0; if (ImGui::Checkbox("Optimize [O]", &ob)) set_optimizing(ob); }
-        if (ImGui::SliderFloat("obs ear y", &obs_height, 0.0f, 2.0f, "%.2f m")) { score_stale = 1; cov_err_stale = 1; }
-        ImGui::SliderFloat("leash", &opt_leash, 0.1f, 3.0f, "%.2f m");   /* max optimizer move from the anchor */
-        { bool pc = perceptual != 0;                        /* weight azimuth >> elevation in the error */
-          if (ImGui::Checkbox("perceptual (az>el)", &pc)) { perceptual = pc; score_stale = 1; cov_err_stale = 1; }
-          if (perceptual)
-              if (ImGui::SliderFloat("elev wt", &elev_wt, 0.0f, 1.0f, "%.2f")) { score_stale = 1; cov_err_stale = 1; } }
-
-        ImGui::SeparatorText("DBAP knobs");
-        if (ImGui::SliderFloat("blur r",   &dbap_r,       0.05f, 3.0f, "%.2f m"))  mark_edit();
-        if (ImGui::SliderFloat("dist ref", &dist_ref,     0.25f, 4.0f, "%.2f m"))  mark_edit();
-        if (ImGui::SliderFloat("rolloff",  &dist_rolloff, 0.0f,  2.0f, "%.2f"))    mark_edit();
-        if (ImGui::SliderFloat("min gain", &dist_min_db, -60.0f, 0.0f, "%.0f dB")) mark_edit();
-
-        ImGui::SeparatorText("Audition / view");
-        { bool tb = tone_on != 0; if (ImGui::Checkbox("tone [T]", &tb)) tone_on = tb; }
-        ImGui::SameLine();
-        { bool nb = tone_kind == BW_TEST_NOISE;
-          if (ImGui::Checkbox("noise [N]", &nb)) tone_kind = nb ? BW_TEST_NOISE : BW_TEST_SINE; }
-        { bool cb = coverage_on != 0; if (ImGui::Checkbox("coverage [C]", &cb)) coverage_on = cb; }
-        ImGui::SameLine();
-        { bool mb = coverage_moving != 0; if (ImGui::Checkbox("moving [V]", &mb)) coverage_moving = mb; }
-        { bool gb = cov_metric != 0; if (ImGui::Checkbox("shade rE error (vs gap) [G]", &gb)) cov_metric = gb; }
-        { bool hb = fps_view != 0; if (ImGui::Checkbox("head view [H]", &hb)) fps_view = hb; }
-        if (ImGui::Button("Preview - audition [P]", ImVec2(-1, 0))) enter_preview();
-
-        ImGui::SeparatorText("File");
-        ImGui::PushItemWidth(-1);
-        ImGui::InputText("##path", g_path, sizeof g_path);
         ImGui::PopItemWidth();
-        float bw3 = (ImGui::GetContentRegionAvail().x - 2 * ImGui::GetStyle().ItemSpacing.x) / 3.0f;
-        if (ImGui::Button("Save [S]",   ImVec2(bw3, 0))) do_save();   ImGui::SameLine();
-        if (ImGui::Button("Reload [L]", ImVec2(bw3, 0))) do_reload(); ImGui::SameLine();
-        if (ImGui::Button("Snap [K]",   ImVec2(bw3, 0))) do_snap();
-        if (ImGui::Button("Fullscreen [F11]", ImVec2(-1, 0))) ToggleBorderlessWindowed();
-        ImGui::Checkbox("test engine UI", &show_te_ui);
+        ImGui::End();
+        return;
     }
+
+    ImGui::SeparatorText("File");
+    ImGui::PushItemWidth(-1);
+    ImGui::InputText("##path", g_path, sizeof g_path);
+    ImGui::PopItemWidth();
+    float half = (ImGui::GetContentRegionAvail().x - ImGui::GetStyle().ItemSpacing.x) / 2.0f;
+    if (ImGui::Button("Reload [L]", ImVec2(half, 0))) do_reload();
+    ImGui::SameLine();
+    if (ImGui::Button("Save [S]", ImVec2(half, 0))) do_save();
+
+    ImGui::SeparatorText("Speaker");                 /* the survey loop: pick an index, tone it, place it */
+    if (ImGui::InputInt("##spk", &sel)) { if (sel < 0) sel = 0; if (sel >= NSPK) sel = NSPK - 1; }
+    ImGui::SameLine(); ImGui::Text("-> ch %d", sel);
+    if (ImGui::DragFloat3("pos", &spk[sel].pos.x, 0.01f, 0, 0, "%.3f")) mark_edit();
+    if (ImGui::SliderFloat("gain", &spk[sel].gain_db, -24.0f, 12.0f, "%+.1f dB")) mark_edit();
+    CheckboxInt("tone [T]", &tone_on);
+    ImGui::SameLine();
+    { bool nb = tone_kind == BW_TEST_NOISE;
+      if (ImGui::Checkbox("noise [N]", &nb)) tone_kind = nb ? BW_TEST_NOISE : BW_TEST_SINE; }
+    if (ImGui::Button("Snap all to constraints [K]", ImVec2(-1, 0))) do_snap();
+
+    ImGui::SeparatorText("DBAP knobs");              /* panning params; round-trip through the file */
+    if (ImGui::SliderFloat("blur r",   &dbap_r,       0.05f, 3.0f, "%.2f m"))  mark_edit();
+    if (ImGui::SliderFloat("dist ref", &dist_ref,     0.25f, 4.0f, "%.2f m"))  mark_edit();
+    if (ImGui::SliderFloat("rolloff",  &dist_rolloff, 0.0f,  2.0f, "%.2f"))    mark_edit();
+    if (ImGui::SliderFloat("min gain", &dist_min_db, -60.0f, 0.0f, "%.0f dB")) mark_edit();
+
+    ImGui::SeparatorText("Analyze / optimize");      /* rE error of the target panner; O climbs it */
+    if (ImGui::Combo("panner", &pv_panner, "DBAP (moving)\0SPCAP (fixed)\0VBAP (fixed)\0")) mark_score();
+    if (ImGui::Button("Score [X]")) do_score();
+    ImGui::SameLine();
+    { bool ob = opt_running != 0; if (ImGui::Checkbox("Optimize [O]", &ob)) set_optimizing(ob); }
+    ImGui::SliderFloat("leash", &opt_leash, 0.1f, 3.0f, "%.2f m");   /* max optimizer move from the anchor */
+    if (ImGui::SliderFloat("obs ear y", &obs_height, 0.0f, 2.0f, "%.2f m")) mark_score();
+    if (CheckboxInt("perceptual (az>el)", &perceptual)) mark_score();   /* weight azimuth >> elevation */
+    if (perceptual && ImGui::SliderFloat("elev wt", &elev_wt, 0.0f, 1.0f, "%.2f")) mark_score();
+    CheckboxInt("coverage [C]", &coverage_on);
+    ImGui::SameLine();
+    CheckboxInt("moving [V]", &coverage_moving);
+    CheckboxInt("shade rE error (vs gap) [G]", &cov_metric);
+
+    ImGui::SeparatorText("Audition");
+    if (ImGui::Button("Preview - audition [P]", ImVec2(-1, 0))) enter_preview();
+
+    ImGui::SeparatorText("View");
+    CheckboxInt("head view [H]", &fps_view);
+    ImGui::SameLine();
+    if (ImGui::Button("Fullscreen [F11]")) ToggleBorderlessWindowed();
+    ImGui::Checkbox("test engine UI", &show_te_ui);
+
     ImGui::PopItemWidth();
     ImGui::End();
 }
@@ -1024,232 +1256,32 @@ int main(int argc, char** argv) {
         if (kb && IsKeyPressed(KEY_ESCAPE)) break;
         if (kb && IsKeyPressed(KEY_F11)) ToggleBorderlessWindowed();
         if (kb && IsKeyPressed(KEY_H)) fps_view = !fps_view;     /* first-person view from the observer's ears */
-
-        if (preview) {                             /* DBAP preview: move a source, hear it pan */
-            if (kb && IsKeyPressed(KEY_P)) leave_preview();
-            else {
-                if (kb && IsKeyPressed(KEY_SPACE)) pv_orbit = !pv_orbit;
-                if (kb && IsKeyPressed(KEY_B)) {   /* live A/B: DBAP <-> SPCAP <-> VBAP (atomic, safe while running) */
-                    pv_panner = (pv_panner + 1) % 3;
-                    if (e) bw_set_panner(e, (BwPanner)pv_panner);
-                }
-                float mv = ((IsKeyDown(KEY_LEFT_SHIFT) || IsKeyDown(KEY_RIGHT_SHIFT)) ? 0.4f : 1.5f) * dt;
-                if (pv_orbit) {                    /* hands-free orbit + near/far + high/low sweep */
-                    pv_t += dt;
-                    float az = 0.6f * pv_t, r = 1.6f + 1.0f * sinf(0.8f * pv_t), yy = 1.0f * sinf(1.1f * pv_t);
-                    src_pos = Vector3{ r * cosf(az), yy, r * sinf(az) };
-                } else if (kb) {
-                    if (IsKeyDown(KEY_W)) src_pos.z -= mv;
-                    if (IsKeyDown(KEY_S)) src_pos.z += mv;
-                    if (IsKeyDown(KEY_A)) src_pos.x -= mv;
-                    if (IsKeyDown(KEY_D)) src_pos.x += mv;
-                    if (IsKeyDown(KEY_R)) src_pos.y += mv;
-                    if (IsKeyDown(KEY_F)) src_pos.y -= mv;
-                }
-                if (audio) {
-                    bw_source_set_pos(e, pv_src, src_pos.x, src_pos.y, src_pos.z);
-                    bw_set_listener_pose(e, 0, obs_height, 0, 0, 0, 0, 1);   /* ears at obs_height; walk the room to test off-center */
-                    bw_commit(e);
-                }
-            }
-        } else if (kb) {
-            if (IsKeyPressed(KEY_RIGHT_BRACKET)) sel = (sel + 1) % NSPK;
-            if (IsKeyPressed(KEY_LEFT_BRACKET))  sel = (sel + NSPK - 1) % NSPK;
-            float d = ((IsKeyDown(KEY_LEFT_SHIFT) || IsKeyDown(KEY_RIGHT_SHIFT)) ? 0.25f : 1.0f) * dt;
-            if (IsKeyDown(KEY_LEFT))  spk[sel].pos.x -= d;
-            if (IsKeyDown(KEY_RIGHT)) spk[sel].pos.x += d;
-            if (IsKeyDown(KEY_UP))    spk[sel].pos.z -= d;
-            if (IsKeyDown(KEY_DOWN))  spk[sel].pos.z += d;
-            if (IsKeyDown(KEY_R))     spk[sel].pos.y += d;
-            if (IsKeyDown(KEY_F))     spk[sel].pos.y -= d;
-            if (IsKeyDown(KEY_PAGE_UP))   spk[sel].gain_db += 6.0f * dt;
-            if (IsKeyDown(KEY_PAGE_DOWN)) spk[sel].gain_db -= 6.0f * dt;
-            if (IsKeyPressed(KEY_T)) tone_on = !tone_on;
-            if (IsKeyPressed(KEY_N)) tone_kind = (tone_kind == BW_TEST_SINE) ? BW_TEST_NOISE : BW_TEST_SINE;
-            if (IsKeyPressed(KEY_S)) do_save();
-            if (IsKeyPressed(KEY_L)) do_reload();
-            if (IsKeyPressed(KEY_K)) do_snap();                    /* snap all speakers to the nearest allowed point */
-            if (IsKeyPressed(KEY_C)) coverage_on = !coverage_on;   /* coverage overlay */
-            if (IsKeyPressed(KEY_V)) coverage_moving = !coverage_moving;
-            if (IsKeyPressed(KEY_G)) cov_metric ^= 1;   /* shade: gap <-> selected-panner rE error (cache stays valid) */
-            if (IsKeyPressed(KEY_X)) do_score();        /* score the layout for each panner */
-            if (IsKeyPressed(KEY_B)) pv_panner = (pv_panner + 1) % 3;   /* select the target panner (score/optimize) */
-            if (IsKeyPressed(KEY_O)) set_optimizing(!opt_running);      /* toggle the auto-optimizer for that panner */
-            if (IsKeyDown(KEY_LEFT) || IsKeyDown(KEY_RIGHT) || IsKeyDown(KEY_UP) || IsKeyDown(KEY_DOWN) ||
-                IsKeyDown(KEY_R) || IsKeyDown(KEY_F) || IsKeyDown(KEY_PAGE_UP) || IsKeyDown(KEY_PAGE_DOWN)) mark_edit();
-            if (IsKeyPressed(KEY_P)) enter_preview();   /* enter DBAP preview — rebuild so it pans through the edited layout */
-        }
-        if (!preview && ms && IsMouseButtonPressed(MOUSE_BUTTON_LEFT) && !IsMouseButtonDown(MOUSE_BUTTON_RIGHT)) {
-            Ray ray = GetMouseRay(GetMousePosition(), cam);        /* click-pick a speaker (imgui owns its own area) */
-            float best = 1e9f; int hit = -1;
-            for (int i = 0; i < NSPK; ++i) {
-                RayCollision rc = GetRayCollisionSphere(ray, spk[i].pos, 0.16f);
-                if (rc.hit && rc.distance < best) { best = rc.distance; hit = i; }
-            }
-            if (hit >= 0) sel = hit;
-        }
+        if (preview) handle_preview_input(dt, kb);
+        else         handle_edit_input(dt, kb, ms, cam);
 
         if (opt_running && !preview) {                    /* auto-optimizer: a few hill-climb trials per frame */
             opt_cost = opt_cost_of((BwPanner)pv_panner);  /* re-baseline so a manual nudge can't wedge the climb */
             optimize_step((BwPanner)pv_panner, 6);
         }
         for (int i = 0; i < NSPK; ++i) if (spk[i].pos.y < 0.0f) spk[i].pos.y = 0.0f;   /* y >= 0: speakers never below the floor */
-
-        /* keep the per-panner rE-error scoreboard live: re-score (throttled, so a drag doesn't recompute
-         * every frame) whenever the layout is dirty. X forces an immediate refresh. */
         if (scored && score_stale && (cov_frame - last_score_frame) >= 10) {
-            for (int p = 0; p < 3; ++p) score_panner((BwPanner)p, 1, &score_mean[p], &score_worst[p]);
-            score_stale = 0; last_score_frame = cov_frame;
+            do_score();                                   /* throttled live re-score (X forces an immediate one) */
+            last_score_frame = cov_frame;
         }
-
-        /* drive the selected speaker's channel when auditioning (edit mode only) */
-        if (audio && !preview) {
-            if (tone_on) {
-                if (driven >= 0 && driven != sel) bw_test_signal(e, (uint32_t)driven, BW_TEST_OFF, 0.0f);
-                bw_test_signal(e, (uint32_t)sel, (BwTestKind)tone_kind, TEST_GAIN);
-                driven = sel;
-            } else if (driven >= 0) {
-                bw_test_signal(e, (uint32_t)driven, BW_TEST_OFF, 0.0f);
-                driven = -1;
-            }
-        }
-
+        drive_tone();
         if      (save_flash > 0) { save_flash -= dt; if (save_flash < 0) save_flash = 0; }  /* fade out, then STOP at 0 */
         else if (save_flash < 0) { save_flash += dt; if (save_flash > 0) save_flash = 0; }  /* (else it oscillated -> flicker) */
-
-        /* camera: FIRST-PERSON from the observer's ears (H), or orbit (default). Right-drag looks/orbits. */
-        if (fps_view) {
-            if (ms && IsMouseButtonDown(MOUSE_BUTTON_RIGHT)) {    /* mouse-look */
-                Vector2 md = GetMouseDelta();
-                fps_yaw   -= md.x * 0.004f;
-                fps_pitch -= md.y * 0.004f;
-                if (fps_pitch >  1.5f) fps_pitch =  1.5f;
-                if (fps_pitch < -1.5f) fps_pitch = -1.5f;
-            }
-            if (ms) fps_fov -= GetMouseWheelMove() * 4.0f;        /* wheel zooms the view */
-            if (fps_fov < 25.0f) fps_fov = 25.0f; if (fps_fov > 100.0f) fps_fov = 100.0f;
-            Vector3 fwd = { cosf(fps_pitch)*sinf(fps_yaw), sinf(fps_pitch), cosf(fps_pitch)*cosf(fps_yaw) };
-            cam.position = Vector3{ 0, obs_height, 0 };           /* AT the ears */
-            cam.target   = Vector3Add(cam.position, fwd);
-            cam.fovy     = fps_fov;
-        } else {
-            if (ms && IsMouseButtonDown(MOUSE_BUTTON_RIGHT)) {
-                Vector2 md = GetMouseDelta();
-                cam_yaw   -= md.x * 0.005f;
-                cam_pitch += md.y * 0.005f;
-                if (cam_pitch >  1.5f) cam_pitch =  1.5f;
-                if (cam_pitch < -1.5f) cam_pitch = -1.5f;
-            }
-            if (ms) cam_dist -= GetMouseWheelMove() * 0.6f;
-            if (cam_dist < 2.0f)  cam_dist = 2.0f;
-            if (cam_dist > 30.0f) cam_dist = 30.0f;
-            cam.target   = Vector3{ 0, 0, 0 };
-            cam.fovy     = 55.0f;
-            cam.position.x = cam_dist * cosf(cam_pitch) * sinf(cam_yaw);
-            cam.position.y = cam_dist * sinf(cam_pitch);
-            cam.position.z = cam_dist * cosf(cam_pitch) * cosf(cam_yaw);
-        }
-
-        /* max distance for the live delay readout */
-        float dmax = 0.0f;
-        for (int i = 0; i < NSPK; ++i) { float dd = Vector3Length(spk[i].pos); if (dd > dmax) dmax = dd; }
-        float seld   = Vector3Length(spk[sel].pos);
-        float seldel = (dmax - seld) / SPEED_OF_SOUND * 1000.0f;
-        float cov_worst = 0.0f, cov_mean = 0.0f;        /* coverage summary, filled by the overlay below */
-        int con_bad = 0, con_occ = 0;
-        if (con_loaded) for (int i = 0; i < NSPK; ++i) {
-            if (!constraint_ok(spk[i].pos)) ++con_bad;   /* out of bounds / inside a solid body (snappable) */
-            if (!los_clear(spk[i].pos))     ++con_occ;   /* line of sight to the ears blocked by an obstacle */
-        }
+        update_camera(&cam, ms);
         ++cov_frame;
 
         BeginDrawing();
-        ClearBackground(Color{ 24, 24, 27, 255 });      /* matches the theme's WindowBg */
-        BeginMode3D(cam);
-        DrawGrid(16, 0.5f);
-        if (con_loaded) {                                /* placement constraints: allowed bounds (green) + no-go (red) */
-            DrawCubeWiresV(Vector3Scale(Vector3Add(con_bounds.lo, con_bounds.hi), 0.5f),
-                           Vector3Subtract(con_bounds.hi, con_bounds.lo), Color{ 90, 200, 120, 110 });
-            for (int i = 0; i < con_nnogo; ++i)
-                DrawCubeWiresV(Vector3Scale(Vector3Add(con_nogo[i].lo, con_nogo[i].hi), 0.5f),
-                               Vector3Subtract(con_nogo[i].hi, con_nogo[i].lo), Color{ 235, 90, 90, 170 });
-            for (int i = 0; i < con_nobst; ++i) {        /* solid occluders (projectors/structure): filled orange */
-                Vector3 ctr = Vector3Scale(Vector3Add(con_obst[i].lo, con_obst[i].hi), 0.5f);
-                Vector3 sz  = Vector3Subtract(con_obst[i].hi, con_obst[i].lo);
-                DrawCubeV(ctr, sz, Color{ 235, 150, 60, 70 });
-                DrawCubeWiresV(ctr, sz, Color{ 245, 165, 70, 200 });
-            }
-        }
-        DrawLine3D(Vector3{ 0, 0, 0 }, Vector3{ 1.2f, 0, 0 }, Color{ 230, 90, 90, 255 });   /* +X */
-        DrawLine3D(Vector3{ 0, 0, 0 }, Vector3{ 0, 1.2f, 0 }, Color{ 90, 230, 90, 255 });   /* +Y */
-        DrawLine3D(Vector3{ 0, 0, 0 }, Vector3{ 0, 0, 1.2f }, Color{ 90, 150, 230, 255 });  /* +Z */
-        if (!fps_view) DrawSphere(Vector3{ 0, obs_height, 0 }, 0.09f, Color{ 210, 210, 230, 255 });  /* listener (hidden in FPS: you're inside it) */
-        DrawLine3D(Vector3{ 0, obs_height, 0 }, spk[sel].pos,   /* ear<->speaker sightline: green clear / red blocked */
-                   los_clear(spk[sel].pos) ? Color{ 240, 220, 120, 160 } : Color{ 245, 90, 90, 230 });
-        for (int i = 0; i < NSPK; ++i) {
-            int is_sel = (i == sel), is_drv = (audio && tone_on && i == sel);
-            Color col = is_drv ? Color{ 120, 245, 140, 255 }
-                      : is_sel ? Color{ 245, 220, 90, 255 }
-                               : Color{ 120, 120, 150, 255 };
-            DrawSphere(spk[i].pos, is_sel ? 0.15f : 0.10f, col);
-            if (!constraint_ok(spk[i].pos))              /* red: outside bounds / inside a solid body (snap fixes) */
-                DrawSphereWires(spk[i].pos, is_sel ? 0.20f : 0.16f, 6, 6, Color{ 245, 80, 80, 255 });
-            else if (!los_clear(spk[i].pos))             /* orange: sightline to the ears is blocked (move it clear) */
-                DrawSphereWires(spk[i].pos, is_sel ? 0.20f : 0.16f, 6, 6, Color{ 245, 165, 70, 255 });
-        }
-        if (preview) {                                   /* the moving DBAP source */
-            DrawLine3D(Vector3{ 0, 0, 0 }, src_pos, Color{ 90, 220, 90, 200 });
-            DrawSphere(src_pos, 0.16f, Color{ 240, 120, 90, 255 });
-        }
-        if (coverage_on && !preview && cov_metric == 0) {  /* shade each direction by its nearest-speaker gap */
-            int NL = coverage_moving ? 27 : 1;
-            static Vector3 sdir[27][26];                  /* speaker directions from each listener sample */
-            for (int l = 0; l < NL; ++l)
-                for (int i = 0; i < NSPK; ++i)
-                    sdir[l][i] = Vector3Normalize(Vector3Subtract(spk[i].pos, Vector3Add(cov_lis[l], Vector3{ 0, obs_height, 0 })));
-            float worst = 1.0f; double macc = 0.0;       /* worst = min score (largest gap) */
-            for (int s = 0; s < NCOV; ++s) {
-                Vector3 d = cov_dir[s];                   /* a source DIRECTION, queried from each listener */
-                float acc = 0.0f;                        /* mean over listeners of (max over speakers of alignment) */
-                for (int l = 0; l < NL; ++l) {           /* from listener L, how near is the best speaker to direction d? */
-                    float best = -1.0f;
-                    for (int i = 0; i < NSPK; ++i) { float dp = Vector3DotProduct(d, sdir[l][i]); if (dp > best) best = dp; }
-                    acc += best;
-                }
-                float score = acc / (float)NL;            /* typical coverage of d over the roam (mean, not worst corner) */
-                float a = score < -1 ? -1 : (score > 1 ? 1 : score);
-                float gap = acosf(a) * 57.2958f;          /* nearest-speaker angular gap (deg) for this direction */
-                cov_val[s] = gap;
-                DrawCubeV(Vector3Add(Vector3{ 0, obs_height, 0 }, Vector3Scale(d, COV_R)), Vector3{ 0.09f, 0.09f, 0.09f },
-                          heat((40.0f - gap) / 35.0f));   /* geometric gap: green <=5 deg, red >=40 deg */
-                if (score < worst) worst = score;
-                macc += acosf(a);
-            }
-            float w = worst < -1 ? -1 : (worst > 1 ? 1 : worst);
-            cov_worst = acosf(w) * 57.2958f;
-            cov_mean  = (float)(macc / NCOV) * 57.2958f;
-        } else if (coverage_on && !preview && cov_metric == 1) {  /* shade by the selected panner's per-dir rE error */
-            /* recompute a structural change (panner/observer/first-entry) immediately so the cubes and the
-             * HUD label never disagree; throttle only the layout-edit churn (which fires every frame mid-optimize) */
-            int structural = (!cov_err_valid || cov_err_panner != pv_panner || cov_err_moving != coverage_moving);
-            if (structural || (cov_err_stale && cov_frame - cov_err_frame >= 6))
-                compute_cov_err((BwPanner)pv_panner);
-            double macc = 0.0;
-            for (int s = 0; s < NCOV; ++s) {
-                float err = cov_err[s];
-                cov_val[s] = err;
-                DrawCubeV(Vector3Add(Vector3{ 0, obs_height, 0 }, Vector3Scale(cov_dir[s], COV_R)), Vector3{ 0.09f, 0.09f, 0.09f },
-                          err_heat(err));               /* 2 deg great (green), ~7 fine (yellow), 12+ bad (red) */
-                if (err > cov_worst) cov_worst = err;
-                macc += err;
-            }
-            cov_mean = (float)(macc / NCOV);
-        }
-        EndMode3D();
+        ClearBackground(Color{ 24, 24, 27, 255 });       /* matches the theme's WindowBg */
+        float cov_worst, cov_mean;
+        draw_scene(cam, &cov_worst, &cov_mean);
 
         rlImGuiBegin();
         draw_labels(cam);                                /* background drawlist: under the windows, over the scene */
-        draw_hud(seldel, seld, con_bad, con_occ, cov_worst, cov_mean);
+        draw_hud(cov_worst, cov_mean);
         draw_panel();
         draw_cov_tooltip(cam, ms);
         if (show_te_ui && g_te) ImGuiTestEngine_ShowTestEngineWindows(g_te, &show_te_ui);
