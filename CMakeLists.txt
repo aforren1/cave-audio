@@ -335,28 +335,70 @@ if(BWAUDIO_BUILD_TESTS)
   endif()
 endif()
 
+# ---- Shared Dear ImGui stack for the GUI tools (bw_calib_view, bw_layout_tool) ----
+# One pinned copy of imgui + imgui_test_engine, compiled INTO each tool as target sources (not a
+# library: the test-engine define below must be seen by every imgui-including TU of an executable,
+# and keeping it per-target makes that explicit). imgui and imgui_test_engine tags track each
+# other — bump together. Test engine license note: NOT MIT — free for open source (dual-licensed;
+# see its LICENSE.txt) — fine here, revisit if this repo's licensing changes.
+# Test-engine integration (pattern from aforren1/lsl-viewer, which worked these out): the hooks
+# define must be seen by EVERY imgui-including TU (or the ImGuiContext layout diverges), the
+# std::thread coroutine impl must be explicitly selected (else IO.CoroutineFuncs is null -> crash
+# in ImGuiTestEngine_Start), and capture must be explicitly enabled (else screenshots are silently
+# skipped). imgui_te_imconfig.h would default the latter two but is not auto-included; explicit
+# defines are clearer than routing IMGUI_USER_CONFIG through it.
+option(BWAUDIO_BUILD_PLAYGROUND "Build the interactive raylib playground + the layout tool (fetches raylib/imgui)" OFF)
+option(BWAUDIO_BUILD_CALIBVIEW "Build the imgui calibration report viewer (fetches imgui/implot/implot3d/test-engine)" OFF)
+if(BWAUDIO_BUILD_PLAYGROUND OR BWAUDIO_BUILD_CALIBVIEW)
+  enable_language(CXX)
+  # SOURCE_SUBDIR points at a non-existent dir: populate sources only, never their own demo builds.
+  FetchContent_Declare(imgui
+    URL https://github.com/ocornut/imgui/archive/refs/tags/v1.92.8.tar.gz
+    DOWNLOAD_EXTRACT_TIMESTAMP TRUE SOURCE_SUBDIR not_built)
+  FetchContent_Declare(imgui_te
+    URL https://github.com/ocornut/imgui_test_engine/archive/refs/tags/v1.92.8.tar.gz
+    DOWNLOAD_EXTRACT_TIMESTAMP TRUE SOURCE_SUBDIR not_built)
+  FetchContent_MakeAvailable(imgui imgui_te)
+  set(BW_IMGUI_SOURCES
+    ${imgui_SOURCE_DIR}/imgui.cpp
+    ${imgui_SOURCE_DIR}/imgui_draw.cpp
+    ${imgui_SOURCE_DIR}/imgui_tables.cpp
+    ${imgui_SOURCE_DIR}/imgui_widgets.cpp
+    ${imgui_SOURCE_DIR}/imgui_demo.cpp
+    ${imgui_te_SOURCE_DIR}/imgui_test_engine/imgui_te_engine.cpp
+    ${imgui_te_SOURCE_DIR}/imgui_test_engine/imgui_te_context.cpp
+    ${imgui_te_SOURCE_DIR}/imgui_test_engine/imgui_te_coroutine.cpp
+    ${imgui_te_SOURCE_DIR}/imgui_test_engine/imgui_te_exporters.cpp
+    ${imgui_te_SOURCE_DIR}/imgui_test_engine/imgui_te_perftool.cpp
+    ${imgui_te_SOURCE_DIR}/imgui_test_engine/imgui_te_ui.cpp
+    ${imgui_te_SOURCE_DIR}/imgui_test_engine/imgui_te_utils.cpp
+    ${imgui_te_SOURCE_DIR}/imgui_test_engine/imgui_capture_tool.cpp)
+  set(BW_IMGUI_INC
+    ${imgui_SOURCE_DIR} ${imgui_SOURCE_DIR}/backends
+    ${imgui_te_SOURCE_DIR} ${imgui_te_SOURCE_DIR}/imgui_test_engine)
+  set(BW_IMGUI_DEFS
+    IMGUI_ENABLE_TEST_ENGINE
+    IMGUI_TEST_ENGINE_ENABLE_COROUTINE_STDTHREAD_IMPL=1
+    IMGUI_TEST_ENGINE_ENABLE_CAPTURE=1)
+endif()
+
 # ---- Optional: interactive raylib playground (evaluate the binaural monitor by ear) ----
 # Opt-in so the default build stays lean: cmake -S . -B build -DBWAUDIO_BUILD_PLAYGROUND=ON
 # Drives the binaural profile live to headphones (auto-picked 2-ch ASIO driver). Links the
 # public ABI (bwaudio.h, propagated by the bwaudio target) + raylib; uses its own dr_wav copy
 # to generate the source wav.
-option(BWAUDIO_BUILD_PLAYGROUND "Build the interactive raylib playground (fetches raylib)" OFF)
 if(BWAUDIO_BUILD_PLAYGROUND)
   set(BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)        # raylib: skip its own examples/games
   FetchContent_Declare(raylib
     GIT_REPOSITORY https://github.com/raysan5/raylib.git
     GIT_TAG 5.5                                       # release tag (stable); pin to a SHA if desired
     GIT_SHALLOW TRUE)
-  FetchContent_MakeAvailable(raylib)
-
-  # raygui — single-header immediate-mode GUI (header-only). SOURCE_SUBDIR points at a non-existent dir
-  # so MakeAvailable populates the source without building raygui's own CMake examples.
-  FetchContent_Declare(raygui
-    GIT_REPOSITORY https://github.com/raysan5/raygui.git
-    GIT_TAG 4.0
-    GIT_SHALLOW TRUE
-    SOURCE_SUBDIR  not_built)
-  FetchContent_MakeAvailable(raygui)
+  # rlImGui — Dear ImGui platform/render backend on raylib (one .cpp). The Raylib_5_5 tag tracks
+  # raylib 5.5 + imgui 1.92.x (RendererHasTextures + event-based input, which the test engine needs).
+  FetchContent_Declare(rlimgui
+    URL https://github.com/raylib-extras/rlImGui/archive/refs/tags/Raylib_5_5.tar.gz
+    DOWNLOAD_EXTRACT_TIMESTAMP TRUE SOURCE_SUBDIR not_built)
+  FetchContent_MakeAvailable(raylib rlimgui)
 
   add_executable(bw_playground examples/playground.c)
   target_include_directories(bw_playground PRIVATE ${dr_libs_SOURCE_DIR})
@@ -368,14 +410,24 @@ if(BWAUDIO_BUILD_PLAYGROUND)
   endif()
 
   # Speaker-layout authoring tool: place the 26 speakers + identify each by ear (the channel test
-  # signal) + export cave_layout.json. Compiles its own cJSON copy to read existing layouts.
-  add_executable(bw_layout_tool examples/layout_tool.c ${CJSON_C})
-  target_include_directories(bw_layout_tool PRIVATE ${CJSON_INC} ${raygui_SOURCE_DIR}/src)
+  # signal) + export cave_layout.json. The 3D room view (orbit + head view, picking, coverage) is
+  # raylib; every control surface is Dear ImGui via rlImGui, themed like the station (bw_theme.h),
+  # with imgui_test_engine driving the panel under ctest (`--tests`). Compiles its own cJSON copy.
+  add_executable(bw_layout_tool examples/layout_tool.cpp ${CJSON_C}
+    ${rlimgui_SOURCE_DIR}/rlImGui.cpp ${BW_IMGUI_SOURCES})
+  target_include_directories(bw_layout_tool PRIVATE ${CJSON_INC} ${rlimgui_SOURCE_DIR} ${BW_IMGUI_INC})
+  # STB_IMAGE_WRITE_STATIC: raylib's rtextures embeds stb_image_write with external linkage, and so
+  # does the test engine's capture tool — making the latter's copy static avoids the LNK2005 clash.
+  target_compile_definitions(bw_layout_tool PRIVATE ${BW_IMGUI_DEFS} NO_FONT_AWESOME STB_IMAGE_WRITE_STATIC)
+  target_compile_features(bw_layout_tool PRIVATE cxx_std_17)      # bw_theme.h uses inline variables
   target_link_libraries(bw_layout_tool PRIVATE bwaudio raylib)
   if(WIN32)
     add_custom_command(TARGET bw_layout_tool POST_BUILD
       COMMAND ${CMAKE_COMMAND} -E copy_if_different
               $<TARGET_FILE:bwaudio> $<TARGET_FILE_DIR:bw_layout_tool>)
+  endif()
+  if(BWAUDIO_BUILD_TESTS)
+    add_test(NAME layout_tool COMMAND bw_layout_tool --tests)     # the GUI itself, driven by fake inputs
   endif()
 endif()
 
@@ -385,33 +437,18 @@ endif()
 # retained IRs, the array in 3D, and a layout DIFF (surveyed vs calibrated / before vs after
 # writeback). This is the imgui + implot + implot3d pilot (vs the raylib tools): the win32+d3d11
 # backend, and imgui_test_engine drives the GUI with FAKE INPUTS under ctest (`--selftest`) — a GUI
-# with an automated regression test. Test engine license note: NOT MIT — free for open source
-# (dual-licensed; see its LICENSE.txt) — fine here, revisit if this repo's licensing changes.
-option(BWAUDIO_BUILD_CALIBVIEW "Build the imgui calibration report viewer (fetches imgui/implot/implot3d/test-engine)" OFF)
+# with an automated regression test. imgui + test engine come from the shared stack above.
 if(BWAUDIO_BUILD_CALIBVIEW)
-  enable_language(CXX)
-  # SOURCE_SUBDIR points at a non-existent dir (raygui trick above): populate sources only, never
-  # their own example/demo builds. imgui and imgui_test_engine tags track each other — bump together.
-  FetchContent_Declare(imgui
-    URL https://github.com/ocornut/imgui/archive/refs/tags/v1.92.8.tar.gz
-    DOWNLOAD_EXTRACT_TIMESTAMP TRUE SOURCE_SUBDIR not_built)
   FetchContent_Declare(implot
     URL https://github.com/epezent/implot/archive/refs/tags/v1.0.tar.gz
     DOWNLOAD_EXTRACT_TIMESTAMP TRUE SOURCE_SUBDIR not_built)
   FetchContent_Declare(implot3d
     URL https://github.com/brenocq/implot3d/archive/refs/tags/v0.4.tar.gz
     DOWNLOAD_EXTRACT_TIMESTAMP TRUE SOURCE_SUBDIR not_built)
-  FetchContent_Declare(imgui_te
-    URL https://github.com/ocornut/imgui_test_engine/archive/refs/tags/v1.92.8.tar.gz
-    DOWNLOAD_EXTRACT_TIMESTAMP TRUE SOURCE_SUBDIR not_built)
-  FetchContent_MakeAvailable(imgui implot implot3d imgui_te)
+  FetchContent_MakeAvailable(implot implot3d)
 
   add_executable(bw_calib_view examples/calib_view.cpp
-    ${imgui_SOURCE_DIR}/imgui.cpp
-    ${imgui_SOURCE_DIR}/imgui_draw.cpp
-    ${imgui_SOURCE_DIR}/imgui_tables.cpp
-    ${imgui_SOURCE_DIR}/imgui_widgets.cpp
-    ${imgui_SOURCE_DIR}/imgui_demo.cpp
+    ${BW_IMGUI_SOURCES}
     ${imgui_SOURCE_DIR}/backends/imgui_impl_win32.cpp
     ${imgui_SOURCE_DIR}/backends/imgui_impl_dx11.cpp
     ${implot_SOURCE_DIR}/implot.cpp
@@ -419,29 +456,10 @@ if(BWAUDIO_BUILD_CALIBVIEW)
     ${implot_SOURCE_DIR}/implot_demo.cpp
     ${implot3d_SOURCE_DIR}/implot3d.cpp
     ${implot3d_SOURCE_DIR}/implot3d_items.cpp
-    ${implot3d_SOURCE_DIR}/implot3d_meshes.cpp
-    ${imgui_te_SOURCE_DIR}/imgui_test_engine/imgui_te_engine.cpp
-    ${imgui_te_SOURCE_DIR}/imgui_test_engine/imgui_te_context.cpp
-    ${imgui_te_SOURCE_DIR}/imgui_test_engine/imgui_te_coroutine.cpp
-    ${imgui_te_SOURCE_DIR}/imgui_test_engine/imgui_te_exporters.cpp
-    ${imgui_te_SOURCE_DIR}/imgui_test_engine/imgui_te_perftool.cpp
-    ${imgui_te_SOURCE_DIR}/imgui_test_engine/imgui_te_ui.cpp
-    ${imgui_te_SOURCE_DIR}/imgui_test_engine/imgui_te_utils.cpp
-    ${imgui_te_SOURCE_DIR}/imgui_test_engine/imgui_capture_tool.cpp)
+    ${implot3d_SOURCE_DIR}/implot3d_meshes.cpp)
   target_include_directories(bw_calib_view PRIVATE
-    ${imgui_SOURCE_DIR} ${imgui_SOURCE_DIR}/backends
-    ${implot_SOURCE_DIR} ${implot3d_SOURCE_DIR}
-    ${imgui_te_SOURCE_DIR} ${imgui_te_SOURCE_DIR}/imgui_test_engine)
-  # Test-engine integration (pattern from aforren1/lsl-viewer, which worked these out): the hooks
-  # define must be seen by EVERY imgui-including TU (or the ImGuiContext layout diverges), the
-  # std::thread coroutine impl must be explicitly selected (else IO.CoroutineFuncs is null -> crash
-  # in ImGuiTestEngine_Start), and capture must be explicitly enabled (else screenshots are silently
-  # skipped). imgui_te_imconfig.h would default the latter two but is not auto-included; explicit
-  # defines are clearer than routing IMGUI_USER_CONFIG through it.
-  target_compile_definitions(bw_calib_view PRIVATE
-    IMGUI_ENABLE_TEST_ENGINE
-    IMGUI_TEST_ENGINE_ENABLE_COROUTINE_STDTHREAD_IMPL=1
-    IMGUI_TEST_ENGINE_ENABLE_CAPTURE=1)
+    ${BW_IMGUI_INC} ${implot_SOURCE_DIR} ${implot3d_SOURCE_DIR})
+  target_compile_definitions(bw_calib_view PRIVATE ${BW_IMGUI_DEFS})
   target_compile_features(bw_calib_view PRIVATE cxx_std_17)      # bw_theme.h uses inline variables
   target_link_libraries(bw_calib_view PRIVATE bw_core d3d11 d3dcompiler comdlg32)   # comdlg32: file picker
   # Zylia tab (ZM-1 capture shell) + Capture tab (the calibrate sweep backends) — both live with the

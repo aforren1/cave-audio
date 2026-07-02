@@ -97,7 +97,8 @@ ctest --test-dir build -C RelWithDebInfo      # runs the full test suite (test_*
 ```
 
 **Current state (M6 + occlusion):** builds `bwaudio.dll` + the test suite (sixteen ctests with the Steam
-Audio SDK, twelve without; +`calib_view` with `BWAUDIO_BUILD_CALIBVIEW`). `rt.c` is the concurrency spine
+Audio SDK, twelve without; +`calib_view` with `BWAUDIO_BUILD_CALIBVIEW`, +`layout_tool` with
+`BWAUDIO_BUILD_PLAYGROUND`). `rt.c` is the concurrency spine
 (two SPSC rings, voice + sound tables, commit snapshot, generation handles) + retire-ack;
 the whole `bw_*` API forwards to it. `sound.c` decodes wav (dr_wav) and `mix_voice` plays
 `sound->pcm` with a gain ramp. Spatialization is real: `layout.c` loads the surveyed
@@ -221,7 +222,16 @@ assert 26 speakers / the known 100 mm fixture delta; Run calibration → wait fo
 into Diff → assert the wobble trims; enable simulate → Clap now → recovered DOA within 2° of truth),
 screenshots are captured to output/captures/, pure-logic checks ride the same suite, and it all runs
 under ctest (`calib_view`) — a GUI with an automated regression test (test-engine license: free for
-open source, NOT MIT — see its LICENSE.txt).
+open source, NOT MIT — see its LICENSE.txt). **`bw_layout_tool`** (`examples/layout_tool.cpp`, under
+`BWAUDIO_BUILD_PLAYGROUND`) is on the same imgui stack via **rlImGui** (pinned `Raylib_5_5` tag): the
+3D room view (orbit + head-view cameras, ray-picked speakers, the coverage shell) stays raylib — it's
+a *scene*, not a plot — while every control surface (panel/HUD/tooltips) is imgui with the station
+theme, and the same `--tests` harness runs it under ctest (`layout_tool`: logic round-trips, panel
+fake-input edits, save/reload, score/optimize, full-frame screenshots via a before-swap GL read).
+Raylib input handlers gate on `io.WantCapture*`. Only `bw_playground` remains raylib-only (raygui is
+gone from the repo). Test-ref gotchas the code comments document: a `**/` wildcard hashes its LAST
+segment as a literal string (use a plain window-relative path for `$$int` component refs, e.g.
+DragFloat3 = `"pos/$$0"`), and bare `CaptureScreenshot()` needs `CaptureReset()` between shots.
 **Per-speaker correction filters** (`--eq`) are the "inverse EQ" upgrade to the scalar
 trims: `measure_correction` gates the IR to the direct sound (before the first reflection) and inverts that
 magnitude into a minimum-phase FIR (`calib_eq` → the layout `eq` array → applied per channel in `align.c`,

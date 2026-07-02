@@ -9,7 +9,10 @@
 #pragma once
 
 #include "imgui.h"
+#if defined(__has_include) && __has_include("implot.h")   /* the layout tool has no plots; theme it anyway */
+#define BW_THEME_HAVE_IMPLOT 1
 #include "implot.h"
+#endif
 #include "roboto_font.h"   /* embedded Roboto-Regular (Apache-2.0) */
 
 /* User-facing UI scale. On win32 set it from ImGui_ImplWin32_GetDpiScaleForHwnd once at startup
@@ -23,8 +26,10 @@ inline float uiScaled(float px) { return px * g_uiScale; }
 
 /* Apply the light or dark theme to ImGui + ImPlot, plus shared style polish. */
 inline void applyTheme(bool light) {
-    if (light) { ImGui::StyleColorsLight(); ImPlot::StyleColorsLight(); }
-    else       { ImGui::StyleColorsDark();  ImPlot::StyleColorsDark(); }
+    if (light) ImGui::StyleColorsLight(); else ImGui::StyleColorsDark();
+#ifdef BW_THEME_HAVE_IMPLOT
+    if (light) ImPlot::StyleColorsLight(); else ImPlot::StyleColorsDark();
+#endif
     ImGuiStyle& s = ImGui::GetStyle();
 
     /* grayscale neutrals; blue + purple are the only accents (checkmark, hover, active/pressed,
