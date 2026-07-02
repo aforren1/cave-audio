@@ -447,7 +447,8 @@ end (`steam_path.c`, same with-SDK gate, opt in with `BWAUDIO_PATHING` at `bw_st
   pathing. The `path` test proves a route bends around a wall AND that the recovered shCoeffs point
   the right way (−X toward the source, +Z out the opening).
 - **Render (Stage 2).** A 10 Hz sim thread runs pathing per opted-in source and publishes each one's
-  `IPLPathEffectParams.shCoeffs` to rt.c via `rt_set_pathing` (handle-gated, double-buffered). In the
+  `IPLPathEffectParams.shCoeffs` (+ the normalized bending-loss `eqCoeffs`, see below) to rt.c via
+  `rt_set_pathing` (handle-gated, double-buffered). In the
   mixer, a pathing voice SH-encodes its UN-occluded signal (`accum[k] += s·shCoeffs[k]` — the
   indirect path goes around the occluder, so the direct-path occlusion must NOT apply to it) into a
   shared ambisonic accumulator, ramped per sample (invariant 4). After the voice loop the `path` tap
@@ -456,7 +457,17 @@ end (`steam_path.c`, same with-SDK gate, opt in with `BWAUDIO_PATHING` at `bw_st
   `rt` test verifies the encode lands exactly on `s·shCoeffs`; the decode is the same call the
   (tested) reflection bed uses.
 
-Opt sources in with `bw_source_set_pathing`. The bending-loss EQ (`eqCoeffs[3]`) is computed by the
-sim but not yet rendered — v1 carries the path level in `shCoeffs[0]`; a 3-band transmission-style
-EQ like occlusion's is the obvious follow-on. It only pays off where the space has real occluders to
-bend sound around — best heard at the rig.
+Opt sources in with `bw_source_set_pathing`. The **bending-loss EQ (`eqCoeffs[3]`) is now rendered.**
+phonon splits a path's response two ways (`path_simulator.cpp`): `shCoeffs` carry the direction *and*
+level (each path is SH-projected weighted by its distance attenuation), while `eqCoeffs` carry the
+frequency-dependent *deviation* (bending) loss. So to add the colour without disturbing the level, the
+sim normalizes `eqCoeffs` to a pure tilt — loudest band = 1, floored at phonon's `kMaxEQGain` (0.0625)
+— exactly phonon's `normalizeEQ` mode, and publishes it beside the shCoeffs (`rt_set_pathing`, same
+handle-gated double buffer). The mixer then applies that tilt as the same low-shelf/peak/high-shelf
+biquad cascade the occlusion EQ uses, to the **un-occluded** `s_raw` *before* the SH-encode — which is
+precisely phonon's own `path_effect.cpp` render order (EQ the mono signal, then scale each SH channel).
+It's ramped per sample (invariant 4) and bypassed while flat, so a path with no occluder to bend around
+costs nothing and is byte-identical to the pre-EQ render. The `rt` test asserts a non-flat tilt colours
+the encoded field (a DC source through `{0.5,1,1}` lands the accumulator at `0.5·shCoeffs`, the RBJ
+low-shelf DC gain). It only pays off where the space has real occluders to bend sound around — the
+audible payoff is best heard at the rig.

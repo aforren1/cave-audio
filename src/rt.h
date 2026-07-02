@@ -92,8 +92,10 @@ typedef void (*RtPathTap)(void* ud, float* bus, uint32_t n, const float* lp, con
 void    rt_set_path_tap(RtCore* c, RtPathTap tap, void* ud, uint32_t ambi_ch);
 void    rt_source_set_pathing(RtCore* c, uint32_t h, bool on);      /* gate this voice into the pathing render */
 /* Off-thread pathing sim publishes a voice's path field: shCoeffs[ambi_ch] (the indirect arrival
- * directions). Handle-gated + double-buffered; the audio thread ramps to it (no zipper). */
-void    rt_set_pathing(RtCore* c, uint32_t handle, const float* sh, uint32_t ambi_ch);
+ * directions) + eq[3] (the bending-loss band tilt, linear per-band gains in [0,1], normalized so the
+ * loudest band = 1 — a pure spectral shape; the level rides shCoeffs). Pass eq=NULL for flat (no
+ * bending loss). Handle-gated + double-buffered; the audio thread ramps to both (no zipper). */
+void    rt_set_pathing(RtCore* c, uint32_t handle, const float* sh, const float* eq, uint32_t ambi_ch);
 /* Debug: drive output `channel` with a built-in test signal (kind 0=off/1=sine/2=noise), injected
  * AFTER the per-speaker align stage (raw channel). Control thread; takes effect next block. */
 void    rt_test_signal(RtCore* c, uint32_t channel, uint8_t kind, float gain);

@@ -143,8 +143,12 @@ ambisonic shCoeffs to `rt.c` (`rt_set_pathing`, handle-gated double buffer); the
 voice's *un-occluded* signal into a shared ambisonic accumulator (ramped) and the `path` rt tap decodes it
 to the bus via phonon's own decoder (convention consistent encode→decode). `bw_source_set_pathing` opts in;
 the `path` test proves the route bends around a wall with the right direction, the `rt` test proves the
-encode lands on `s·shCoeffs`. The bending-loss EQ is computed but not yet rendered (v1 carries level in
-shCoeffs[0]); see docs/materials.md. **Opt-in per-source
+encode lands on `s·shCoeffs`. The **bending-loss EQ is rendered** too: the sim normalizes phonon's
+`eqCoeffs[3]` to a pure spectral tilt (level stays in `shCoeffs`, loudest band = 1) and publishes it
+alongside the shCoeffs; the mixer applies the same low-shelf/peak/high-shelf biquad cascade occlusion
+uses to the *un-occluded* `s_raw` before the SH-encode (ramped + bypassed-when-flat), matching phonon's
+own `path_effect.cpp` order (EQ the mono signal, then scale each SH channel) — the `rt` test asserts a
+non-flat tilt colours the encoded field. See docs/materials.md. **Opt-in per-source
 propagation effects** are implemented (phonon-free,
 pure `rt.c` DSP, default off): **Doppler** (`bw_source_set_doppler`) renders each voice through a
 per-voice fractional delay ring (`RtCore.dop_ring`, one power-of-two ring per voice, allocated at

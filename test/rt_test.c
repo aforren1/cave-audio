@@ -339,13 +339,24 @@ int main(void) {
         rt_set_path_tap(cp, test_path_tap, NULL, 4);
         rt_source_set_pathing(cp, vp, true);
         const float want[4] = { 0.5f, 0.25f, -0.1f, 0.3f };
-        rt_set_pathing(cp, vp, want, 4);                 /* publish a fixed indirect field for this voice */
+        rt_set_pathing(cp, vp, want, NULL, 4);           /* publish a fixed indirect field (flat EQ) for this voice */
         g_path_calls = 0; g_path_chn = 0;
         rt_commit(cp); render2(cp);                      /* block 1 ramps 0->want, block 2 holds at want */
         CHECK(g_path_calls == 2 && g_path_chn == 4, "path tap called once per block with the ambi channel count");
         int matched = 1;
         for (int k = 0; k < 4; ++k) if (fabs((double)g_path_cap[k] - want[k]) > 1e-3) matched = 0;
         CHECK(matched, "accumulator lands on s*shCoeffs (s=1) — the indirect field is encoded from the published directions");
+        /* bending-loss EQ: a non-flat band tilt colours the indirect signal BEFORE the SH-encode. The
+         * source is DC (s=1) and the RBJ low-shelf DC gain is exactly its band gain, so {0.5,1,1} scales
+         * every SH channel by 0.5 once the band-gain slew + biquads settle -> accumulator = 0.5*shCoeffs. */
+        const float eqtilt[3] = { 0.5f, 1.0f, 1.0f };
+        rt_set_pathing(cp, vp, want, eqtilt, 4);
+        for (int b = 0; b < 16; ++b) render2(cp);        /* settle the EQ_SLEW glide + biquad transient */
+        int tilted = 1;
+        for (int k = 0; k < 4; ++k) if (fabs((double)g_path_cap[k] - 0.5 * want[k]) > 5e-3) tilted = 0;
+        CHECK(tilted, "bending-loss EQ tilts the indirect field pre-encode (low-shelf DC gain applied to s_raw)");
+        rt_set_pathing(cp, vp, want, NULL, 4);           /* back to flat for the opt-out check */
+        for (int b = 0; b < 16; ++b) render2(cp);        /* let the EQ settle back to bypass */
         rt_source_set_pathing(cp, vp, false);            /* opt out -> the accumulator is silent */
         for (int k = 0; k < 4; ++k) g_path_cap[k] = 9.f;
         rt_commit(cp); render2(cp);

@@ -42,5 +42,11 @@ bindings/unity/**/obj/
 # local config / surveyed data that shouldn't be shared verbatim
 *.local.json
 
+# bw_layout_tool working files: it resolves cave_layout.json / constraints.json against the
+# CWD, so running it from the repo root drops these here. The tracked references live in
+# examples/; these root-level copies are per-user scratch (leading slash = root only).
+/cave_layout.json
+/constraints.json
+
 # playground scratch (the demo generates this at startup, removes it on clean exit)
 playground_src.wav

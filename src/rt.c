@@ -46,7 +46,7 @@
 
 typedef struct { Cmd slots[RING_CAP]; _Atomic uint32_t write, read; } CmdRing;
 typedef struct { Evt slots[EVT_CAP];  _Atomic uint32_t write, read; } EvtRing;
-typedef struct { uint32_t handle; float sh[BW_AMBI_CH]; } PathPub;   /* one double-buffer slot of a voice's path field */
+typedef struct { uint32_t handle; float sh[BW_AMBI_CH]; float eq[3]; } PathPub;   /* one double-buffer slot of a voice's path field (directions + bending-loss band tilt) */
 
 typedef struct {
     uint16_t gen;
@@ -62,6 +62,13 @@ typedef struct {
     float    xover_lp;                                        /* dual-band crossover one-pole LP state */
     int      path_on;                                         /* gated into the pathing (indirect) render */
     float    path_sh_cur[BW_AMBI_CH];                         /* ramped path shCoeffs (toward the published target) */
+    /* pathing bending-loss EQ (audio-thread-only): a 3-band tilt on the indirect signal before the
+     * SH-encode, structurally identical to the occlusion EQ above but on the un-occluded s_raw and
+     * its own filter state. Bypassed while the tilt is flat (path_eq_engaged == 0). */
+    float    path_eqg_cur[3];
+    float    path_eq_co[3][5];
+    float    path_eq_x1[3], path_eq_x2[3], path_eq_y1[3], path_eq_y2[3];
+    int      path_eq_engaged;
     /* occlusion ramp state (audio-thread-only). The published target lives in the RtCore.occ_*
      * atomic arrays (outside this memset'd struct, so the off-thread sim never races a voice
      * create). occ_cur ramps toward the gated published value, applied to the mono signal pre-pan. */
@@ -387,6 +394,8 @@ static void drain_commands(RtCore* c) {
             v->refl_gain = 1.f;                     /* full wet-send level by default (gated by refl_send) */
             v->eqg_cur[0] = v->eqg_cur[1] = v->eqg_cur[2] = 1.f;   /* flat EQ (history zeroed by memset) */
             for (int b = 0; b < 3; ++b) v->eq_co[b][0] = 1.f;     /* passthrough coeffs {1,0,0,0,0} */
+            v->path_eqg_cur[0] = v->path_eqg_cur[1] = v->path_eqg_cur[2] = 1.f;  /* flat pathing EQ */
+            for (int b = 0; b < 3; ++b) v->path_eq_co[b][0] = 1.f;
             /* drop any publish the sim left for the prior occupant of this slot (the stores are
              * atomic, so a concurrent sim publish for the old handle can't tear; either way the new
              * gen won't match it). */
@@ -415,7 +424,11 @@ static void drain_commands(RtCore* c) {
             if (v) v->refl_send = cmd->u.refl.on != 0; } break;
         case CMD_SET_PATHING: { Voice* v = voice_for(c, cmd->handle);
             if (v) { v->path_on = cmd->u.path.on != 0;
-                     if (!v->path_on) for (int k = 0; k < BW_AMBI_CH; ++k) v->path_sh_cur[k] = 0.f; } } break;
+                     if (!v->path_on) {                          /* clean restart: zero the ramp + flatten the EQ */
+                         for (int k = 0; k < BW_AMBI_CH; ++k) v->path_sh_cur[k] = 0.f;
+                         v->path_eq_engaged = 0;
+                         for (int b = 0; b < 3; ++b) { v->path_eqg_cur[b] = 1.f;
+                             v->path_eq_x1[b]=v->path_eq_x2[b]=v->path_eq_y1[b]=v->path_eq_y2[b]=0.f; } } } } break;
         case CMD_SET_REFL_SEND: { Voice* v = voice_for(c, cmd->handle);
             if (v) { float g = cmd->u.rsend.gain; v->refl_gain = g < 0.f ? 0.f : g; } } break;
         case CMD_SET_REFL_DIST: { Voice* v = voice_for(c, cmd->handle);
@@ -672,12 +685,30 @@ static void mix_voice(RtCore* c, Voice* v, uint16_t idx, float* bus, uint32_t n,
     const int path_on = v->path_on && c->path_tap && c->path_ambi_ch;
     const uint32_t pac = c->path_ambi_ch;
     float path_tgt[BW_AMBI_CH], path_step[BW_AMBI_CH];
+    float pco_tgt[3][5], pco_step[3][5];      /* pathing bending-loss EQ: block target coeffs + per-sample glide */
+    int   path_flat = 1;
     if (path_on) {
         int pf = atomic_load_explicit(&c->path_idx[idx], memory_order_acquire);
         const PathPub* pp = &c->path_pub[(size_t)idx * 2 + (size_t)pf];
         const int mine_path = (pp->handle == myh);
         for (uint32_t k = 0; k < pac; ++k) path_tgt[k] = mine_path ? pp->sh[k] : 0.f;
         for (uint32_t k = 0; k < pac; ++k) path_step[k] = (path_tgt[k] - v->path_sh_cur[k]) / (float)n;
+        /* bending-loss EQ: glide the band gains toward the published tilt (flat when not mine), then
+         * compute this block's target biquad coeffs and interpolate the live coeffs per sample — the
+         * same low-shelf/peak/high-shelf cascade the occlusion EQ uses, applied to s_raw pre-encode
+         * (phonon's own path effect: EQ the mono signal, then scale each SH channel — path_effect.cpp). */
+        float peq_tgt[3];
+        for (int b = 0; b < 3; ++b) {
+            peq_tgt[b] = mine_path ? pp->eq[b] : 1.f;
+            v->path_eqg_cur[b] += (peq_tgt[b] - v->path_eqg_cur[b]) * EQ_SLEW;
+            if (v->path_eqg_cur[b] < 1.f - EQ_FLAT_EPS || v->path_eqg_cur[b] > 1.f + EQ_FLAT_EPS) path_flat = 0;
+        }
+        if (!path_flat) v->path_eq_engaged = 1;
+        if (v->path_eq_engaged) for (int b = 0; b < 3; ++b) {
+            if (path_flat) { pco_tgt[b][0] = 1.f; pco_tgt[b][1] = pco_tgt[b][2] = pco_tgt[b][3] = pco_tgt[b][4] = 0.f; }
+            else eq_coeffs(c->eq_proto[b].type, c->eq_proto[b].cw0, c->eq_proto[b].alpha, v->path_eqg_cur[b], pco_tgt[b]);
+            for (int k = 0; k < 5; ++k) pco_step[b][k] = (pco_tgt[b][k] - v->path_eq_co[b][k]) / (float)n;
+        }
     }
 
     uint32_t cur = v->cursor;
@@ -717,9 +748,18 @@ static void mix_voice(RtCore* c, Voice* v, uint16_t idx, float* bus, uint32_t n,
         if (!streaming && !ended) ++cur;
         v->occ_cur += occ_step;
         v->dir_cur += dir_step;
-        if (path_on) for (uint32_t k = 0; k < pac; ++k) {      /* SH-encode the indirect field (decoded later by the tap) */
-            c->path_accum[(size_t)k * n + i] += s_raw * v->path_sh_cur[k];
-            v->path_sh_cur[k] += path_step[k];
+        if (path_on) {                                         /* SH-encode the indirect field (decoded later by the tap) */
+            float sp = s_raw;                                  /* the indirect path is un-occluded (it bends around) ... */
+            if (v->path_eq_engaged) for (int b = 0; b < 3; ++b) {   /* ... but takes the bending-loss tilt (3 biquads, DF-I) */
+                float* co = v->path_eq_co[b];
+                float y = co[0]*sp + co[1]*v->path_eq_x1[b] + co[2]*v->path_eq_x2[b] - co[3]*v->path_eq_y1[b] - co[4]*v->path_eq_y2[b];
+                v->path_eq_x2[b]=v->path_eq_x1[b]; v->path_eq_x1[b]=sp; v->path_eq_y2[b]=v->path_eq_y1[b]; v->path_eq_y1[b]=y; sp=y;
+                for (int k = 0; k < 5; ++k) co[k] += pco_step[b][k];   /* glide toward the block target */
+            }
+            for (uint32_t k = 0; k < pac; ++k) {
+                c->path_accum[(size_t)k * n + i] += sp * v->path_sh_cur[k];
+                v->path_sh_cur[k] += path_step[k];
+            }
         }
         if (dual) {
             float lo = v->xover_lp + xover_a * (s - v->xover_lp); v->xover_lp = lo;   /* LP @ 700 Hz */
@@ -737,6 +777,11 @@ static void mix_voice(RtCore* c, Voice* v, uint16_t idx, float* bus, uint32_t n,
     }
     v->cursor = cur;
     if (path_on) for (uint32_t k = 0; k < pac; ++k) v->path_sh_cur[k] = path_tgt[k];   /* land exactly */
+    if (path_on && v->path_eq_engaged) {                        /* land the pathing-EQ coeffs; bypass once settled flat */
+        for (int b = 0; b < 3; ++b) for (int k = 0; k < 5; ++k) v->path_eq_co[b][k] = pco_tgt[b][k];
+        if (path_flat) { v->path_eq_engaged = 0;
+            for (int b = 0; b < 3; ++b) { v->path_eq_x1[b]=v->path_eq_x2[b]=v->path_eq_y1[b]=v->path_eq_y2[b]=0.f; } }
+    }
     if (streaming) {                                            /* advance the stream position; end at a true EOF (not underrun) */
         v->stream_pos += strm_got;
         if (stream_ended(snd->stream, v->stream_pos)) ended = true;
@@ -1005,9 +1050,10 @@ void rt_set_path_tap(RtCore* c, RtPathTap tap, void* ud, uint32_t ambi_ch) {
     c->path_ambi_ch = (ambi_ch > BW_AMBI_CH) ? BW_AMBI_CH : ambi_ch;   /* set while the audio thread is stopped */
 }
 
-/* Off-thread pathing sim publishes a voice's shCoeffs: write the back buffer, flip the index (release).
- * Handle stored alongside so the audio thread drops a stale/recycled slot. */
-void rt_set_pathing(RtCore* c, uint32_t handle, const float* sh, uint32_t ambi_ch) {
+/* Off-thread pathing sim publishes a voice's path field: write the back buffer, flip the index (release).
+ * `sh` = shCoeffs (directions + level); `eq` = the 3-band bending-loss tilt (NULL = flat). Handle stored
+ * alongside so the audio thread drops a stale/recycled slot. */
+void rt_set_pathing(RtCore* c, uint32_t handle, const float* sh, const float* eq, uint32_t ambi_ch) {
     if (!c || !sh) return;
     uint32_t idx = BW_H_IDX(handle);
     if (idx >= c->voice_cap) return;
@@ -1017,6 +1063,7 @@ void rt_set_pathing(RtCore* c, uint32_t handle, const float* sh, uint32_t ambi_c
     back->handle = handle;
     for (uint32_t k = 0; k < ambi_ch; ++k)        back->sh[k] = sh[k];
     for (uint32_t k = ambi_ch; k < BW_AMBI_CH; ++k) back->sh[k] = 0.f;
+    for (int b = 0; b < 3; ++b) back->eq[b] = eq ? eq[b] : 1.f;   /* NULL eq = flat (no bending loss) */
     atomic_store_explicit(&c->path_idx[idx], 1 - cur, memory_order_release);
 }
 

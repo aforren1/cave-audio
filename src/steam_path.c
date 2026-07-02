@@ -116,6 +116,19 @@ static int find_slot(SteamPath* sp, uint32_t handle) {
     return -1;
 }
 
+/* Normalize the raw bending-loss eqCoeffs to a pure spectral tilt (loudest band = 1), mirroring
+ * phonon's EQEffect::normalizeGains / IPLPathEffectParams.normalizeEQ. The path LEVEL rides shCoeffs
+ * (calcAmbisonicsCoeffsForPaths weights each path by its distance attenuation), so eqCoeffs must carry
+ * only COLOUR here — else the deviation gain would double-count against the level in shCoeffs. Floor at
+ * phonon's kMaxEQGain so a single band can't cut more than ~-24 dB (guards over-aggressive filtering). */
+#define PATH_EQ_MIN_GAIN 0.0625f
+static void normalize_eq(float eq[3]) {
+    float mx = 0.f;
+    for (int b=0;b<3;++b) if (eq[b] > mx) mx = eq[b];
+    if (mx < 1e-8f) { eq[0]=eq[1]=eq[2]=1.f; return; }         /* no path / silence -> flat */
+    for (int b=0;b<3;++b) { float g = eq[b]/mx; eq[b] = g < PATH_EQ_MIN_GAIN ? PATH_EQ_MIN_GAIN : g; }
+}
+
 void steam_path_set_source(SteamPath* sp, uint32_t handle, const float pos[3], int on) {
     if (!sp) return;
     EnterCriticalSection(&sp->lock);
@@ -172,9 +185,10 @@ static DWORD WINAPI sim_thread(LPVOID arg) {
         float lp[3], lq[4]; rt_read_pose(sp->rt, lp, lq); (void)lq;
         EnterCriticalSection(&sp->lock); int n = sp->nsrc; LeaveCriticalSection(&sp->lock);
         for (int i = 0; i < n; ++i) {
-            if (!sp->srcs[i].on) { memset(sh, 0, sizeof(float)*sp->ambi_ch); rt_set_pathing(sp->rt, sp->srcs[i].handle, sh, sp->ambi_ch); continue; }
-            run_get(sp, lp, i, eq, sh);                          /* eq computed but not yet rendered (v1: level is in sh) */
-            rt_set_pathing(sp->rt, sp->srcs[i].handle, sh, sp->ambi_ch);
+            if (!sp->srcs[i].on) { memset(sh, 0, sizeof(float)*sp->ambi_ch); rt_set_pathing(sp->rt, sp->srcs[i].handle, sh, NULL, sp->ambi_ch); continue; }
+            run_get(sp, lp, i, eq, sh);              /* sh carries direction+level; eq is the bending-loss tilt */
+            normalize_eq(eq);                        /* -> pure colour (level already in sh); rt applies it pre-encode */
+            rt_set_pathing(sp->rt, sp->srcs[i].handle, sh, eq, sp->ambi_ch);
         }
         Sleep(1000 / PATH_HZ);
     }
