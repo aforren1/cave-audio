@@ -112,25 +112,24 @@ the code: the capsule geometry in `zylia_geometry` is a **placeholder** spread �
 datasheet/surveyed capsule directions before trusting on-hardware DOA (the math is geometry-agnostic;
 only that table must match the real array).
 
-**Bring-up probe.** Before any of that, `bw_zylia_probe` (built with `-DBWAUDIO_BUILD_CALIBRATE=ON`)
-is the "is it talking?" check you can run the moment the ZM-1 is plugged in — input-only, no rig
-needed. `bw_zylia_probe --list` enumerates the ASIO drivers + their channel counts (look for the
-Zylia driver, or ASIO4ALL over its USB-audio interface, showing `in=19`). It auto-picks a driver whose
-name contains "zylia", else `--driver` it. Two views:
+**Bring-up.** Before any of that, the "is it talking?" checks you can run the moment the ZM-1 is
+plugged in — input-only, no rig needed. Both ride the same capture shell (`zylia_capture.cpp`:
+driver open, transient trigger, snapshot publish):
 
-- `--console`: a live per-channel RMS meter — confirm all 19 capsules stream, and learn which channel
-  is which capsule by tapping each and watching its channel jump. A channel stuck at digital silence
-  is dead or unmapped.
-- **Live DOA view** (default when built with `-DBWAUDIO_BUILD_PLAYGROUND=ON` too, which supplies
-  raylib): the audio callback watches for a transient; CLAP anywhere around the array and a dot
-  appears on the capsule sphere where the clap came from (`zylia_tdoa`: onset + windowed
-  cross-correlation against the strongest capsule with sub-sample parabolic peaks → `zylia_doa`).
-  This verifies the capsule MAPPING and the GEOMETRY table in one gesture — swapped channels or a
-  wrong geometry row put the dot somewhere absurd, and you find out in seconds instead of during a
-  calibration session. `--simulate` runs the identical snapshot→tdoa→doa→draw pipeline on
-  synthesized claps from a walking direction (drawn as a truth ring the dot must land in) — the
-  hardware-free check of everything but the ASIO capture; the math itself is unit-tested in the
-  `zylia` ctest.
+- `bw_zylia_probe` (built with `-DBWAUDIO_BUILD_CALIBRATE=ON`): console meter. `--list` enumerates
+  the ASIO drivers + channel counts (look for the Zylia driver, or ASIO4ALL over its USB-audio
+  interface, showing `in=19`; it auto-picks a name containing "zylia", else `--driver` it). Tap a
+  capsule and watch its channel jump; a channel stuck at digital silence is dead or unmapped.
+- **Live DOA view** — `bw_calib_view`'s **Zylia tab** (built with `-DBWAUDIO_BUILD_CALIBVIEW=ON`;
+  live capture needs the ASIO SDK too): CLAP anywhere around the array and a dot appears on the
+  capsule sphere where the clap came from (`zylia_tdoa`: onset + windowed cross-correlation against
+  the strongest capsule with sub-sample parabolic peaks → `zylia_doa`). This verifies the capsule
+  MAPPING and the GEOMETRY table in one gesture — swapped channels or a wrong geometry row put the
+  dot somewhere absurd, and you find out in seconds instead of during a calibration session. Its
+  simulate mode runs the identical snapshot→tdoa→doa→draw pipeline on synthesized claps (truth
+  marker drawn; "Clap now" for a deterministic one) — the hardware-free check of everything but the
+  ASIO capture. The math is unit-tested in the `zylia` ctest, and the whole tab is driven by the
+  `zylia/sim_doa` UI test in `calib_view`.
 
 ## Reviewing the results (`bw_calib_view`)
 
@@ -145,9 +144,12 @@ Dear ImGui + ImPlot/ImPlot3D on win32+d3d11) loads layouts through the engine's 
   Δgain / Δdelay / eq-taps per speaker with outliers highlighted, so a swapped channel, a bad mic
   placement, or a bogus `--localize` solve is one glance, not an evening.
 
-`bw_calib_view --selftest` runs its imgui_test_engine suite (fake inputs drive the actual UI against
-generated fixture layouts, screenshots land in `output/captures/`) and is wired into ctest as
-`calib_view`.
+It is growing into the **calibration station** (one window for the rig session): the **Zylia tab**
+(live clap-DOA, see "Bring-up" above) is the first station tab beyond review; a capture front-end
+over `bw_calibrate` is the natural next one (`bw_calibrate` stays the headless CLI either way).
+`bw_calib_view --tests [filter]` runs its imgui_test_engine suite (fake inputs drive the actual UI
+against generated fixture layouts + synthesized claps, screenshots land in `output/captures/`) and
+is wired into ctest as `calib_view`.
 
 ## What feeds the engine
 

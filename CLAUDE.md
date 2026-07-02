@@ -197,22 +197,27 @@ sub-degree — `zylia_doa`), and with the known latency a Gauss-Newton refine ag
 wavefront gives the full position (`zylia_localize`). Distance is latency-limited (the array is too small to
 self-calibrate latency at metres). Spatial room capture reuses the same sweep windowed per early reflection →
 `zylia_doa` → which surface throws it. The 19-ch ASIO capture + the datasheet capsule geometry are the
-rig-bound shell; `bw_zylia_probe` (opt-in `-DBWAUDIO_BUILD_CALIBRATE=ON`) is the input-only ASIO
-bring-up tool: a live per-channel meter (`--console`), and — when the playground gate also provides
-raylib — a **live DOA view**: the audio callback watches for a transient (a clap), snapshots all 19
-channels, and `zylia_tdoa` (onset + windowed cross-correlation with sub-sample peak, unit-tested in
-the `zylia` test) feeds `zylia_doa` so a dot appears on the capsule sphere where the clap came from —
-verifying capsule mapping AND the geometry table in seconds; `--simulate` drives the same
-snapshot→tdoa→doa→draw pipeline with synthesized claps (truth ring drawn), hardware-free.
-**`bw_calib_view`** (opt-in `-DBWAUDIO_BUILD_CALIBVIEW=ON`) is the calibration REPORT viewer and the
-**Dear ImGui pilot** (imgui + implot + implot3d on win32+d3d11 — preferred over raylib/raygui for new
-panel/plot tools): it loads layouts through the engine's own `layout_load`, shows the array in 3D,
-gain/delay trims, correction-EQ magnitude curves, `--save-irs` IR kernels, and a layout DIFF (surveyed
-vs calibrated) with outlier highlighting — the "did calibration write something sane?" check before
-accepting a writeback. Its `--selftest` runs **imgui_test_engine**: fake inputs drive the real UI
-(type path → click Load → assert 26 speakers / the known 100 mm fixture delta), screenshots are
-captured to output/captures/, and it runs under ctest (`calib_view`) — a GUI with an automated
-regression test (test-engine license: free for open source, NOT MIT — see its LICENSE.txt).
+rig-bound shell, factored into `zylia_capture.cpp` (driver open, format conversion, transient trigger,
+snapshot publish via `ZpShared`) and shared by two consumers: `bw_zylia_probe` (opt-in
+`-DBWAUDIO_BUILD_CALIBRATE=ON`), the console bring-up meter (tap a capsule → its channel jumps); and
+`bw_calib_view`'s **Zylia tab**, the live DOA view — a clap is snapshotted, `zylia_tdoa` (onset +
+windowed cross-correlation with sub-sample peaks, unit-tested in the `zylia` test) feeds `zylia_doa`,
+and a dot appears on the capsule sphere where the clap came from, verifying capsule mapping AND the
+geometry table in seconds. Its simulate mode synthesizes claps from a known (walking) direction
+through the identical pipeline, and the `zylia/sim_doa` UI test asserts the recovered direction lands
+within 2° of truth.
+**`bw_calib_view`** (opt-in `-DBWAUDIO_BUILD_CALIBVIEW=ON`) is the **calibration station** (imgui +
+implot + implot3d on win32+d3d11 — the stack for new panel/plot tools; theme + embedded Roboto +
+conventions ported from aforren1/lsl-viewer, the house reference — `examples/bw_theme.h`): it loads
+layouts through the engine's own `layout_load`, shows the array in 3D, gain/delay trims,
+correction-EQ magnitude curves, `--save-irs` IR kernels, a layout DIFF (surveyed vs calibrated) with
+outlier highlighting — the "did calibration write something sane?" check before accepting a
+writeback — and the **Zylia tab** (live clap-DOA on the capsule sphere; see below). `--tests [filter]`
+runs **imgui_test_engine**: fake inputs drive the real UI (type path → click Load → assert 26
+speakers / the known 100 mm fixture delta; enable simulate → Clap now → recovered DOA within 2° of
+truth), screenshots are captured to output/captures/, pure-logic checks ride the same suite, and it
+all runs under ctest (`calib_view`) — a GUI with an automated regression test (test-engine license:
+free for open source, NOT MIT — see its LICENSE.txt).
 **Per-speaker correction filters** (`--eq`) are the "inverse EQ" upgrade to the scalar
 trims: `measure_correction` gates the IR to the direct sound (before the first reflection) and inverts that
 magnitude into a minimum-phase FIR (`calib_eq` → the layout `eq` array → applied per channel in `align.c`,

@@ -442,7 +442,19 @@ if(BWAUDIO_BUILD_CALIBVIEW)
     IMGUI_ENABLE_TEST_ENGINE
     IMGUI_TEST_ENGINE_ENABLE_COROUTINE_STDTHREAD_IMPL=1
     IMGUI_TEST_ENGINE_ENABLE_CAPTURE=1)
+  target_compile_features(bw_calib_view PRIVATE cxx_std_17)      # bw_theme.h uses inline variables
   target_link_libraries(bw_calib_view PRIVATE bw_core d3d11 d3dcompiler comdlg32)   # comdlg32: file picker
+  # Zylia tab: the ZM-1 capture shell (live with the ASIO SDK; stubs + simulate-only without it).
+  target_sources(bw_calib_view PRIVATE examples/zylia_capture.cpp)
+  if(BWAUDIO_WITH_ASIO)
+    target_sources(bw_calib_view PRIVATE
+      ${ASIO_SDK_DIR}/common/asio.cpp
+      ${ASIO_SDK_DIR}/host/asiodrivers.cpp
+      ${ASIO_SDK_DIR}/host/pc/asiolist.cpp)
+    target_include_directories(bw_calib_view PRIVATE ${ASIO_SDK_DIR}/common ${ASIO_SDK_DIR}/host ${ASIO_SDK_DIR}/host/pc)
+    target_compile_definitions(bw_calib_view PRIVATE BW_HAVE_ASIO)
+    target_link_libraries(bw_calib_view PRIVATE ole32 user32 advapi32)
+  endif()
   if(BWAUDIO_BUILD_TESTS)
     add_test(NAME calib_view COMMAND bw_calib_view --tests)      # the GUI itself, driven by fake inputs
   endif()
@@ -470,16 +482,10 @@ if(BWAUDIO_BUILD_CALIBRATE)
     message(STATUS "bwaudio: calibration tool (simulate only; no ASIO SDK)")
   endif()
 
-  # ZM-1 hardware bring-up probe: input-only ASIO meter, plus a live DOA view (clap -> direction on the
-  # capsule sphere) when the playground gate provides raylib. The GUI lives in its own C file because
-  # raylib.h and windows.h cannot share a translation unit; --simulate drives the GUI hardware-free.
-  add_executable(bw_zylia_probe examples/zylia_probe.cpp)
+  # ZM-1 hardware bring-up probe: console meter over the shared capture shell (zylia_capture.cpp).
+  # The DOA view (clap -> direction on the capsule sphere) lives in bw_calib_view's Zylia tab.
+  add_executable(bw_zylia_probe examples/zylia_probe.cpp examples/zylia_capture.cpp)
   target_link_libraries(bw_zylia_probe PRIVATE bw_core)
-  if(TARGET raylib)                                   # BWAUDIO_BUILD_PLAYGROUND=ON: add the DOA GUI.
-    target_sources(bw_zylia_probe PRIVATE examples/zylia_probe_gui.c)
-    target_compile_definitions(bw_zylia_probe PRIVATE BW_HAVE_RAYLIB)
-    target_link_libraries(bw_zylia_probe PRIVATE raylib)   # BEFORE user32: raylib defines CloseWindow too,
-  endif()                                                  # and the GUI's call must resolve against raylib
   if(BWAUDIO_WITH_ASIO)
     target_sources(bw_zylia_probe PRIVATE
       ${ASIO_SDK_DIR}/common/asio.cpp

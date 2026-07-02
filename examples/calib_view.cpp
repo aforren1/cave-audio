@@ -24,6 +24,7 @@
 #include "imgui.h"
 #include "implot.h"
 #include "implot3d.h"
+#include "bw_theme.h"      /* lsl-viewer's theme + embedded Roboto (applyTheme / loadEmbeddedFont / uiScaled) */
 #include "imgui_impl_win32.h"
 #include "imgui_impl_dx11.h"
 #include "imgui_te_engine.h"
@@ -33,6 +34,7 @@
 extern "C" {                       /* engine internals (C, no extern-C guards of their own) */
 #include "layout.h"
 #include "sound.h"
+#include "zylia_capture.h"         /* ZM-1 ASIO shell + ZpShared (pulls in zylia.h: tdoa/doa) */
 }
 
 #include <d3d11.h>
@@ -147,6 +149,7 @@ static void load_irs(void) {
 /* ============================== UI ============================== */
 
 static bool show_imgui_demo, show_implot_demo, show_te_ui;
+static bool g_light;                                             /* theme (dark default; Tools menu toggles) */
 static ImGuiTestEngine* g_te;
 static HWND g_hwnd;
 
@@ -283,6 +286,203 @@ static void tab_diff(void) {
     ImGui::EndTable();
 }
 
+/* ============ Zylia tab — ZM-1 bring-up + live clap DOA (the calibration-station seed) ============
+ * The capture shell (zylia_capture.cpp) streams the 19 capsules and publishes transient snapshots;
+ * this tab runs the SAME zylia_tdoa -> zylia_doa the speaker survey uses and draws the arrival on
+ * the capsule sphere. Simulate mode synthesizes claps from a (walking) known direction through the
+ * identical snapshot -> tdoa -> doa path — the hardware-free pipeline check, and what the test
+ * drives ("Clap now" is deterministic: it uses the current truth direction). */
+#define ZY_HIST 12
+
+struct ZyState {
+    ZpShared* live;                        /* non-NULL while the ASIO capture is open */
+    ZpShared  sim;                         /* simulate-mode block (UI thread only) */
+    bool      simulate, sim_walk;
+    float     sim_t, sim_az;
+    float     truth[3];                    /* last sim clap's true direction */
+    long      last_seq;
+    int       claps, rejects;
+    struct { float dir[3]; float age; int valid; } hist[ZY_HIST];
+    int       hist_n;
+    float     last_dir[3];                 /* newest estimate (test hook) */
+    int       last_valid;
+    char      driver[128];
+    float     dirs[ZYLIA_MICS][3]; float R;
+    bool      geom_init;
+};
+static ZyState Z;
+
+static float zy_az(const float d[3]) { return atan2f(d[0], -d[2]) * 57.29578f; }
+static float zy_el(const float d[3]) { return asinf(d[1] > 1.f ? 1.f : (d[1] < -1.f ? -1.f : d[1])) * 57.29578f; }
+
+/* a clap-like Gaussian click sampled at each capsule's exact fractional arrival time (the synthesis
+ * the zylia unit test validates), landed in the shared block exactly like the ASIO side would */
+static void zy_sim_clap(ZpShared* sh, const float dir[3]) {
+    const double C = 343.0, FS = sh->rate, SIGMA = 1.0e-4, DIST = 2.0;
+    unsigned int rng = (unsigned int)(sh->seq * 2654435761u + 12345u);
+    double src[3] = { dir[0] * DIST, dir[1] * DIST, dir[2] * DIST };
+    for (int ch = 0; ch < ZYLIA_MICS; ++ch) {
+        double mx = Z.R * Z.dirs[ch][0] - src[0], my = Z.R * Z.dirs[ch][1] - src[1], mz = Z.R * Z.dirs[ch][2] - src[2];
+        double t0 = 0.020 + sqrt(mx * mx + my * my + mz * mz) / C;
+        for (int i = 0; i < ZP_SNAP_N; ++i) {
+            double td = (double)i / FS - t0;
+            double s  = exp(-0.5 * (td / SIGMA) * (td / SIGMA));
+            rng = rng * 1664525u + 1013904223u;
+            double nz = ((double)(int)(rng >> 9) / (double)(1 << 22) - 1.0) * 1e-3;
+            sh->snap[ch][i] = (float)(0.7 * s + nz);
+        }
+        sh->rms[ch] = 0.25f;                                     /* kick the meters; drawing decays them */
+    }
+    sh->blocks++; sh->seq++;                                     /* same publish the ASIO side does */
+}
+
+static void zy_process(ZpShared* sh, float dt) {
+    if (Z.simulate && !Z.live) {
+        if (Z.sim_walk) {
+            Z.sim_t += dt;
+            if (Z.sim_t >= 1.5f) {
+                Z.sim_t = 0.0f; Z.sim_az += 0.44f;               /* ~25 deg steps; elevation sweeps too */
+                float el = 0.45f * sinf(0.8f * Z.sim_az);
+                Z.truth[0] = cosf(el) * sinf(Z.sim_az); Z.truth[1] = sinf(el); Z.truth[2] = -cosf(el) * cosf(Z.sim_az);
+                zy_sim_clap(sh, Z.truth);
+            }
+        }
+        for (int ch = 0; ch < ZYLIA_MICS; ++ch) sh->rms[ch] *= expf(-4.0f * dt);   /* meter decay */
+    }
+    long seq = sh->seq;                                          /* fresh snapshot -> TDOA -> DOA */
+    if (seq != Z.last_seq) {
+        Z.last_seq = seq;
+        static float snap[ZYLIA_MICS][ZP_SNAP_N];                /* local copy (static: 300 KB off the stack) */
+        memcpy(snap, (const void*)sh->snap, sizeof snap);
+        const float* ptr[ZYLIA_MICS];
+        for (int ch = 0; ch < ZYLIA_MICS; ++ch) ptr[ch] = snap[ch];
+        uint32_t max_lag = (uint32_t)(sh->rate * (2.0 * 0.049 / 343.0) * 2.0) + 4;   /* 2x the array's max TDOA */
+        double arr[ZYLIA_MICS]; float dir[3];
+        if (zylia_tdoa(ptr, ZP_SNAP_N, sh->rate, max_lag, arr) && zylia_doa(arr, dir)) {
+            auto* h = &Z.hist[Z.hist_n++ % ZY_HIST];
+            h->dir[0] = dir[0]; h->dir[1] = dir[1]; h->dir[2] = dir[2];
+            h->age = 0.0f; h->valid = 1;
+            memcpy(Z.last_dir, dir, sizeof Z.last_dir); Z.last_valid = 1;
+            ++Z.claps;
+            fprintf(stderr, "arrival %d: az %+.1f el %+.1f\n", Z.claps, zy_az(dir), zy_el(dir));
+        } else ++Z.rejects;                                      /* not transient enough / degenerate solve */
+    }
+    for (int i = 0; i < ZY_HIST; ++i) if (Z.hist[i].valid) Z.hist[i].age += dt;
+}
+
+static void tab_zylia(void) {
+    if (!Z.geom_init) {                                          /* lazy init: geometry + a fixed first truth */
+        zylia_geometry(Z.dirs, &Z.R);
+        Z.truth[0] = 0.62f; Z.truth[1] = 0.27f; Z.truth[2] = -0.74f;
+        float m = sqrtf(Z.truth[0]*Z.truth[0] + Z.truth[1]*Z.truth[1] + Z.truth[2]*Z.truth[2]);
+        Z.truth[0] /= m; Z.truth[1] /= m; Z.truth[2] /= m;
+        Z.sim_walk = true;
+        Z.geom_init = true;
+    }
+
+    /* -------- source controls -------- */
+    if (ImGui::Checkbox("simulate claps", &Z.simulate) && Z.simulate) {
+        memset((void*)&Z.sim, 0, sizeof Z.sim);
+        Z.sim.nch = ZYLIA_MICS; Z.sim.rate = 48000.0; Z.sim.title = "simulate";
+        Z.last_seq = 0; Z.sim_t = 1.0f;
+    }
+    if (Z.simulate && !Z.live) {
+        ImGui::SameLine(); ImGui::Checkbox("walk", &Z.sim_walk);
+        ImGui::SameLine(); if (ImGui::Button("Clap now")) zy_sim_clap(&Z.sim, Z.truth);
+    }
+#ifdef BW_HAVE_ASIO
+    ImGui::SameLine(0, uiScaled(24));
+    ImGui::SetNextItemWidth(uiScaled(160));
+    ImGui::InputTextWithHint("##zydrv", "ASIO driver (auto)", Z.driver, sizeof Z.driver);
+    ImGui::SameLine();
+    if (!Z.live) { if (ImGui::Button("Open ZM-1")) { Z.live = zylia_capture_open(Z.driver[0] ? Z.driver : NULL, 48000.0);
+                                                     if (Z.live) { Z.simulate = false; Z.last_seq = Z.live->seq; } } }
+    else if (ImGui::Button("Close ZM-1")) { zylia_capture_close(); Z.live = NULL; }
+#else
+    ImGui::SameLine(0, uiScaled(24));
+    ImGui::TextDisabled("(built without the ASIO SDK: simulate only)");
+#endif
+    ZpShared* sh = Z.live ? Z.live : (Z.simulate ? &Z.sim : NULL);
+    if (!sh) {
+        ImGui::TextDisabled("open the ZM-1 (or enable simulate) — clap anywhere around the array and a dot\n"
+                            "appears on the capsule sphere where the clap came from (mapping + geometry check)");
+        return;
+    }
+    zy_process(sh, ImGui::GetIO().DeltaTime);
+
+    if (Z.last_valid)
+        ImGui::Text("%s   %d ch @ %.0f Hz   blocks %ld   claps %d (rejected %d)   last: az %+.1f  el %+.1f",
+                    sh->title ? sh->title : "?", sh->nch, sh->rate, sh->blocks, Z.claps, Z.rejects,
+                    zy_az(Z.last_dir), zy_el(Z.last_dir));
+    else
+        ImGui::Text("%s   %d ch @ %.0f Hz   blocks %ld   waiting for a clap...",
+                    sh->title ? sh->title : "?", sh->nch, sh->rate, sh->blocks);
+
+    /* -------- capsule meters (left) + DOA sphere (right) -------- */
+    ImVec2 avail = ImGui::GetContentRegionAvail();
+    if (ImPlot::BeginPlot("##zymeters", ImVec2(uiScaled(240), avail.y))) {
+        static float db[ZYLIA_MICS];
+        for (int ch = 0; ch < ZYLIA_MICS; ++ch) {
+            float r = sh->rms[ch];
+            db[ch] = (r > 1e-6f) ? 20.0f * log10f(r) : -120.0f;
+        }
+        ImPlot::SetupAxes("capsule", "dBFS");
+        ImPlot::SetupAxesLimits(-1, ZYLIA_MICS, -80, 0, ImPlotCond_Always);
+        ImPlot::PlotBars("##rms", db, ZYLIA_MICS, 0.8);
+        ImPlot::EndPlot();
+    }
+    ImGui::SameLine();
+    if (ImPlot3D::BeginPlot("##zysphere", ImGui::GetContentRegionAvail(), ImPlot3DFlags_NoLegend)) {
+        ImPlot3D::SetupAxes("x", "z", "y up");
+        ImPlot3D::SetupAxesLimits(-1.4, 1.4, -1.4, 1.4, -1.4, 1.4, ImPlot3DCond_Once);
+        const ImU32 wire = IM_COL32(110, 110, 128, 120);
+        static float cx[33], cy[33], cz[33];
+        for (int ring = 0; ring < 3; ++ring) {                   /* wire sphere: three great circles */
+            for (int i = 0; i <= 32; ++i) {
+                float a = (float)i / 32.0f * 6.2831853f, c = cosf(a), s = sinf(a);
+                if      (ring == 0) { cx[i] = c;   cy[i] = s;   cz[i] = 0.f; }
+                else if (ring == 1) { cx[i] = c;   cy[i] = 0.f; cz[i] = s;   }
+                else                { cx[i] = 0.f; cy[i] = c;   cz[i] = s;   }
+            }
+            char id[8]; snprintf(id, sizeof id, "##w%d", ring);
+            ImPlot3D::PlotLine(id, cx, cy, cz, 33, ImPlot3DSpec(ImPlot3DProp_LineColor, wire));
+        }
+        /* capsules: room (x, z, y-up) mapping, sized + lit by their live meter */
+        static float px[ZYLIA_MICS], py[ZYLIA_MICS], pz[ZYLIA_MICS], psz[ZYLIA_MICS];
+        static ImU32 pcol[ZYLIA_MICS];
+        for (int ch = 0; ch < ZYLIA_MICS; ++ch) {
+            px[ch] = Z.dirs[ch][0]; py[ch] = Z.dirs[ch][2]; pz[ch] = Z.dirs[ch][1];
+            float r  = sh->rms[ch];
+            float t  = ((r > 1e-6f) ? (20.0f * log10f(r) + 80.0f) / 80.0f : 0.0f);
+            if (t < 0) t = 0; if (t > 1) t = 1;
+            psz[ch]  = 3.0f + 6.0f * t;
+            pcol[ch] = IM_COL32(70 + (int)(60 * t), 100 + (int)(155 * t), 130 + (int)(40 * t), 255);
+        }
+        ImPlot3D::PlotScatter("##caps", px, py, pz, ZYLIA_MICS,
+                              ImPlot3DSpec(ImPlot3DProp_MarkerSizes, psz, ImPlot3DProp_MarkerFillColors, pcol));
+        if (Z.simulate && !Z.live) {                             /* truth marker: the dot must land here */
+            float tx = 1.18f * Z.truth[0], ty = 1.18f * Z.truth[2], tz = 1.18f * Z.truth[1];
+            ImPlot3D::PlotScatter("##truth", &tx, &ty, &tz, 1,
+                                  ImPlot3DSpec(ImPlot3DProp_MarkerSize, 9.0f,
+                                               ImPlot3DProp_MarkerFillColor, IM_COL32(240, 240, 120, 90)));
+        }
+        for (int i = 0; i < ZY_HIST; ++i) {                      /* arrival dots, fading; the newest gets a ray */
+            if (!Z.hist[i].valid || Z.hist[i].age > 6.0f) continue;
+            float a = 1.0f - Z.hist[i].age / 6.0f;
+            float hx = 1.15f * Z.hist[i].dir[0], hy = 1.15f * Z.hist[i].dir[2], hz = 1.15f * Z.hist[i].dir[1];
+            char id[8]; snprintf(id, sizeof id, "##h%d", i);
+            ImPlot3D::PlotScatter(id, &hx, &hy, &hz, 1,
+                                  ImPlot3DSpec(ImPlot3DProp_MarkerSize, 4.0f + 3.0f * a,
+                                               ImPlot3DProp_MarkerFillColor, IM_COL32(245, 120, 80, 60 + (int)(195 * a))));
+            if (Z.hist[i].age < 1.5f) {
+                float lx[2] = { 0, hx }, ly[2] = { 0, hy }, lz[2] = { 0, hz };
+                ImPlot3D::PlotLine(id, lx, ly, lz, 2, ImPlot3DSpec(ImPlot3DProp_LineColor, IM_COL32(245, 140, 90, 200)));
+            }
+        }
+        ImPlot3D::EndPlot();
+    }
+}
+
 static void draw_ui(void) {
     ImGuiViewport* vp = ImGui::GetMainViewport();
     ImGui::SetNextWindowPos(vp->WorkPos);
@@ -292,6 +492,8 @@ static void draw_ui(void) {
                                      ImGuiWindowFlags_MenuBar);
     if (ImGui::BeginMenuBar()) {
         if (ImGui::BeginMenu("Tools")) {
+            if (ImGui::MenuItem("Light theme", NULL, &g_light)) applyTheme(g_light);
+            ImGui::Separator();
             ImGui::MenuItem("ImGui demo", NULL, &show_imgui_demo);
             ImGui::MenuItem("ImPlot demo", NULL, &show_implot_demo);
             ImGui::MenuItem("Test engine", NULL, &show_te_ui);
@@ -300,21 +502,21 @@ static void draw_ui(void) {
         ImGui::EndMenuBar();
     }
 
-    ImGui::BeginChild("side", ImVec2(340, 0), ImGuiChildFlags_Borders);
+    ImGui::BeginChild("side", ImVec2(uiScaled(340), 0), ImGuiChildFlags_Borders);
     const char* JSONF = "layout json (*.json)\0*.json\0all files (*.*)\0*.*\0";
     const char* WAVF  = "IR wav (*.wav)\0*.wav\0all files (*.*)\0*.*\0";
     ImGui::TextUnformatted("layout A (surveyed / before)");
-    ImGui::SetNextItemWidth(-104);
+    ImGui::SetNextItemWidth(-uiScaled(104));
     ImGui::InputText("##A", V.pathA, sizeof V.pathA);
     ImGui::SameLine(); if (ImGui::Button("...##pA") && pick_file(V.pathA, sizeof V.pathA, JSONF)) load_layout(0);
     ImGui::SameLine(); if (ImGui::Button("Load A")) load_layout(0);
     ImGui::TextUnformatted("layout B (calibrated / after)");
-    ImGui::SetNextItemWidth(-104);
+    ImGui::SetNextItemWidth(-uiScaled(104));
     ImGui::InputText("##B", V.pathB, sizeof V.pathB);
     ImGui::SameLine(); if (ImGui::Button("...##pB") && pick_file(V.pathB, sizeof V.pathB, JSONF)) load_layout(1);
     ImGui::SameLine(); if (ImGui::Button("Load B")) load_layout(1);
     ImGui::TextUnformatted("IR prefix (bw_calibrate --save-irs)");
-    ImGui::SetNextItemWidth(-104);
+    ImGui::SetNextItemWidth(-uiScaled(104));
     ImGui::InputText("##IR", V.irprefix, sizeof V.irprefix);
     ImGui::SameLine(); if (ImGui::Button("...##pI") && pick_file(V.irprefix, sizeof V.irprefix, WAVF)) {
         wav_to_prefix(V.irprefix);                               /* any one _NN.wav selects the set */
@@ -343,6 +545,7 @@ static void draw_ui(void) {
         if (ImGui::BeginTabItem("EQ"))    { tab_eq();    ImGui::EndTabItem(); }
         if (ImGui::BeginTabItem("IRs"))   { tab_irs();   ImGui::EndTabItem(); }
         if (ImGui::BeginTabItem("Diff"))  { tab_diff();  ImGui::EndTabItem(); }
+        if (ImGui::BeginTabItem("Zylia")) { tab_zylia(); ImGui::EndTabItem(); }
         ImGui::EndTabBar();
     }
     ImGui::EndChild();
@@ -439,11 +642,27 @@ static void register_tests(ImGuiTestEngine* e) {
         ctx->CaptureScreenshotWindow("//calib view");
     };
 
+    t = IM_REGISTER_TEST(e, "zylia", "sim_doa");                 /* whole live-DOA pipeline through the real UI */
+    t->TestFunc = [](ImGuiTestContext* ctx) {
+        ctx->SetRef("calib view");
+        ctx->ItemClick("**/Zylia");
+        ctx->Yield(2);
+        ctx->ItemClick("**/simulate claps");
+        ctx->ItemUncheck("**/walk");                             /* freeze truth so Clap now is deterministic */
+        ctx->ItemClick("**/Clap now");
+        ctx->Yield(4);                                           /* snapshot -> tdoa -> doa happens in-frame */
+        IM_CHECK(Z.last_valid);
+        double dot = (double)Z.last_dir[0] * Z.truth[0] + (double)Z.last_dir[1] * Z.truth[1] + (double)Z.last_dir[2] * Z.truth[2];
+        double deg = acos(dot > 1.0 ? 1.0 : (dot < -1.0 ? -1.0 : dot)) * 57.29578;
+        IM_CHECK_LT(deg, 2.0);                                   /* recovered direction lands on the truth ring */
+        ctx->CaptureScreenshotWindow("//calib view");
+    };
+
     t = IM_REGISTER_TEST(e, "viewer", "tabs");                   /* every tab renders without faulting */
     t->TestFunc = [](ImGuiTestContext* ctx) {
         ctx->SetRef("calib view");
-        const char* tabs[] = { "**/Array", "**/Trims", "**/EQ", "**/IRs", "**/Diff" };
-        for (int i = 0; i < 5; ++i) { ctx->ItemClick(tabs[i]); ctx->Yield(2); }
+        const char* tabs[] = { "**/Array", "**/Trims", "**/EQ", "**/IRs", "**/Diff", "**/Zylia" };
+        for (int i = 0; i < 6; ++i) { ctx->ItemClick(tabs[i]); ctx->Yield(2); }
         ctx->ItemClick("**/EQ");                                 /* the checkbox lives inside the EQ tab */
         ctx->Yield(2);
         ctx->ItemClick("**/overlay all speakers");
@@ -574,10 +793,9 @@ int main(int argc, char** argv) {
     ImPlot3D::CreateContext();
     ImGuiIO& io = ImGui::GetIO();
     io.IniFilename = NULL;                                        /* a viewer; don't scatter imgui.ini */
-    float scale = ImGui_ImplWin32_GetDpiScaleForHwnd(hwnd);
-    ImGui::StyleColorsDark();
-    ImGui::GetStyle().ScaleAllSizes(scale);
-    io.Fonts->AddFontFromFileTTF("C:/Windows/Fonts/consola.ttf", 15.0f * scale);   /* crisp mono, like ui_text.h */
+    g_uiScale = ImGui_ImplWin32_GetDpiScaleForHwnd(hwnd);         /* DPI rides FontScaleMain (bw_theme.h) */
+    loadEmbeddedFont(io);                                         /* embedded Roboto, crisp via the 1.92 atlas */
+    applyTheme(g_light);
     ImGui_ImplWin32_Init(hwnd);
     ImGui_ImplDX11_Init(g_dev, g_ctx);
 
@@ -611,7 +829,8 @@ int main(int argc, char** argv) {
         ImGui::NewFrame();
         draw_ui();
         ImGui::Render();
-        const float clear[4] = { 0.08f, 0.08f, 0.10f, 1.0f };
+        ImVec4 bg = ImGui::GetStyle().Colors[ImGuiCol_WindowBg];  /* clear matches the theme */
+        const float clear[4] = { bg.x, bg.y, bg.z, 1.0f };
         g_ctx->OMSetRenderTargets(1, &g_rtv, NULL);
         g_ctx->ClearRenderTargetView(g_rtv, clear);
         ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
@@ -641,5 +860,6 @@ int main(int argc, char** argv) {
     DestroyWindow(hwnd);
     UnregisterClassW(wc.lpszClassName, wc.hInstance);
     for (int i = 0; i < BW_CHANNELS; ++i) if (V.hasIR[i]) sound_unload(&V.ir[i]);
+    if (Z.live) zylia_capture_close();
     return rc;
 }
