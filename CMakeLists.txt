@@ -445,8 +445,10 @@ if(BWAUDIO_BUILD_CALIBVIEW)
   target_compile_features(bw_calib_view PRIVATE cxx_std_17)      # bw_theme.h uses inline variables
   target_link_libraries(bw_calib_view PRIVATE bw_core d3d11 d3dcompiler comdlg32)   # comdlg32: file picker
   # Zylia tab (ZM-1 capture shell) + Capture tab (the calibrate sweep backends) — both live with the
-  # ASIO SDK, simulate-only without it.
-  target_sources(bw_calib_view PRIVATE examples/zylia_capture.cpp examples/calib_capture.cpp)
+  # ASIO SDK, simulate-only without it. asio_session arbitrates the SDK's one current-driver slot
+  # between them (they'd otherwise tear each other down).
+  target_sources(bw_calib_view PRIVATE examples/zylia_capture.cpp examples/calib_capture.cpp
+                                       examples/asio_session.cpp)
   if(BWAUDIO_WITH_ASIO)
     target_sources(bw_calib_view PRIVATE
       ${ASIO_SDK_DIR}/common/asio.cpp
@@ -466,7 +468,7 @@ endif()
 option(BWAUDIO_BUILD_CALIBRATE "Build the speaker calibration tool" OFF)
 if(BWAUDIO_BUILD_CALIBRATE)
   enable_language(CXX)
-  add_executable(bw_calibrate examples/calibrate.cpp examples/calib_capture.cpp)
+  add_executable(bw_calibrate examples/calibrate.cpp examples/calib_capture.cpp examples/asio_session.cpp)
   target_link_libraries(bw_calibrate PRIVATE bw_core)
   if(BWAUDIO_WITH_ASIO)
     # the tool runs its own full-duplex ASIO host, so it compiles the SDK host sources itself (the
@@ -485,7 +487,7 @@ if(BWAUDIO_BUILD_CALIBRATE)
 
   # ZM-1 hardware bring-up probe: console meter over the shared capture shell (zylia_capture.cpp).
   # The DOA view (clap -> direction on the capsule sphere) lives in bw_calib_view's Zylia tab.
-  add_executable(bw_zylia_probe examples/zylia_probe.cpp examples/zylia_capture.cpp)
+  add_executable(bw_zylia_probe examples/zylia_probe.cpp examples/zylia_capture.cpp examples/asio_session.cpp)
   target_link_libraries(bw_zylia_probe PRIVATE bw_core)
   if(BWAUDIO_WITH_ASIO)
     target_sources(bw_zylia_probe PRIVATE

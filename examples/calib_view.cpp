@@ -72,6 +72,7 @@ struct View {
     float  dpos_mm[BW_CHANNELS];
     float  eqfreq[EQ_PTS];
     float  eqmagA[BW_CHANNELS][EQ_PTS];                          /* dB; only valid where eq_len > 0 */
+    float  eqmagB[BW_CHANNELS][EQ_PTS];                          /* B too: reviewing what calibration WROTE */
 
     SoundData ir[BW_CHANNELS];
     bool      hasIR[BW_CHANNELS];
@@ -128,7 +129,7 @@ static void load_layout(int which) {                             /* 0 = A, 1 = B
         int neq = 0; for (uint32_t i = 0; i < L->count; ++i) if (L->speakers[i].eq_len) ++neq;
         snprintf(V.status, sizeof V.status, "%c: %u speakers loaded from %s (%d with eq)",
                  which ? 'B' : 'A', L->count, path, neq);
-        if (which) derive(L, V.gainB_db, V.delayB_ms, V.bx, V.by, V.bz, NULL);
+        if (which) derive(L, V.gainB_db, V.delayB_ms, V.bx, V.by, V.bz, V.eqmagB);
         else       derive(L, V.gainA_db, V.delayA_ms, V.ax, V.ay, V.az, V.eqmagA);
         refresh_diff();
     } else snprintf(V.status, sizeof V.status, "%c: %s", which ? 'B' : 'A', err);
@@ -238,19 +239,28 @@ static void tab_eq(void) {
     ImPlot::SetupAxisScale(ImAxis_X1, ImPlotScale_Log10);
     ImPlot::SetupAxesLimits(20, 20000, -12, 12, ImPlotCond_Once);
     bool any = false;
+    char lbl[32];
     if (V.hasA) {
-        char lbl[24];
         for (uint32_t i = 0; i < V.A.count; ++i) {
             if (!V.A.speakers[i].eq_len) continue;
             if (!V.eq_all && (int)i != V.sel) continue;
             any = true;
-            snprintf(lbl, sizeof lbl, "spk %u (%u taps)", i, V.A.speakers[i].eq_len);
+            snprintf(lbl, sizeof lbl, "A %u (%u taps)", i, V.A.speakers[i].eq_len);
             ImPlot::PlotLine(lbl, V.eqfreq, V.eqmagA[i], EQ_PTS);
         }
     }
+    if (V.hasB) {                                                /* the filters calibration WROTE live in B */
+        for (uint32_t i = 0; i < V.B.count; ++i) {
+            if (!V.B.speakers[i].eq_len) continue;
+            if (!V.eq_all && (int)i != V.sel) continue;
+            any = true;
+            snprintf(lbl, sizeof lbl, "B %u (%u taps)", i, V.B.speakers[i].eq_len);
+            ImPlot::PlotLine(lbl, V.eqfreq, V.eqmagB[i], EQ_PTS);
+        }
+    }
     if (!any) ImPlot::Annotation(200, 0, ImVec4(1, 1, 1, 0.6f), ImVec2(0, 0), false,
-                                 "no correction eq %s(run bw_calibrate --eq)",
-                                 V.eq_all ? "in this layout " : "on the selected speaker ");
+                                 "no correction eq %s(run calibration with eq enabled)",
+                                 V.eq_all ? "in the loaded layout(s) " : "on the selected speaker ");
     ImPlot::EndPlot();
 }
 
@@ -301,6 +311,9 @@ static void tab_diff(void) {
  * into the Diff view (A = input layout, B = what calibration wrote): capture -> review, one window. */
 struct CapJob {
     char  layout[512], out[512], irprefix[512];      /* config (UI writes only while idle) */
+    char  ran_layout[512], ran_out[512];             /* paths snapshotted at Run: the worker + the
+                                                      * Load-into-Diff button use THESE, so edits made
+                                                      * after the run can't change what gets diffed */
     float mic[3];
     int   mic_in;
     bool  simulate, do_room, do_eq, do_irs;
@@ -309,7 +322,7 @@ struct CapJob {
     std::atomic<int>  state;                         /* 0 idle / 1 running / 2 done / 3 failed */
     std::atomic<int>  done_count;
     std::atomic<bool> cancel;
-    int      n;                                      /* speaker count (set by worker before first row) */
+    std::atomic<int>  n;                             /* speaker count (worker sets; UI reads concurrently) */
     float    arrival_ms[BW_CHANNELS], level[BW_CHANNELS], rt60[BW_CHANNELS];
     uint16_t eqlen[BW_CHANNELS];
     float    gain_db[BW_CHANNELS], trim_ms[BW_CHANNELS];   /* the solve, valid when state == 2 */
@@ -325,9 +338,9 @@ static void cap_fail(const char* m) { snprintf(J.msg, sizeof J.msg, "%s", m); J.
 static void cap_worker(void) {
     char err[256];
     Layout L;
-    if (!layout_load(J.layout, (uint32_t)CAL_FS, &L, err, sizeof err)) { cap_fail(err); return; }
+    if (!layout_load(J.ran_layout, (uint32_t)CAL_FS, &L, err, sizeof err)) { cap_fail(err); return; }
     const int n = (int)L.count;
-    J.n = n;
+    J.n.store(n);
     static float sweep[CAL_NSWEEP], cap[CAL_CAPLEN], irbuf[CAL_IRLEN];   /* one job at a time; off the stack */
     static float eq_taps[(size_t)BW_CHANNELS * BW_EQ_TAPS];
     static uint16_t eq_lens[BW_CHANNELS];
@@ -388,9 +401,9 @@ static void cap_worker(void) {
     calib_solve(res, pos, J.mic, n, CAL_FS, gdb, dms);
     memcpy(J.gain_db, gdb, sizeof gdb);
     memcpy(J.trim_ms, dms, sizeof dms);
-    if (!calib_write_layout(J.layout, J.out, gdb, dms, n, err, sizeof err)) { cap_fail(err); return; }
-    if (J.do_eq && !calib_write_eq(J.out, J.out, eq_taps, eq_lens, n, BW_EQ_TAPS, err, sizeof err)) { cap_fail(err); return; }
-    snprintf(J.msg, sizeof J.msg, "wrote %s%s", J.out, J.do_eq ? " (trims + eq)" : " (trims)");
+    if (!calib_write_layout(J.ran_layout, J.ran_out, gdb, dms, n, err, sizeof err)) { cap_fail(err); return; }
+    if (J.do_eq && !calib_write_eq(J.ran_out, J.ran_out, eq_taps, eq_lens, n, BW_EQ_TAPS, err, sizeof err)) { cap_fail(err); return; }
+    snprintf(J.msg, sizeof J.msg, "wrote %s%s", J.ran_out, J.do_eq ? " (trims + eq)" : " (trims)");
     J.state.store(2, std::memory_order_release);
 }
 
@@ -425,6 +438,7 @@ static void tab_capture(void) {
         ImGui::InputTextWithHint("##cdrv", "ASIO driver (auto)", J.driver, sizeof J.driver);
         ImGui::SameLine(); ImGui::SetNextItemWidth(uiScaled(90));
         ImGui::InputInt("mic input ch", &J.mic_in);
+        if (J.mic_in < 0) J.mic_in = 0;                          /* channelNum -1 would reach the driver */
     }
 #else
     if (!J.simulate) ImGui::TextDisabled("(built without the ASIO SDK: simulate only)");
@@ -434,7 +448,9 @@ static void tab_capture(void) {
     if (!running) {
         if (ImGui::Button("Run calibration")) {
             if (J.th_live) { J.th.join(); J.th_live = false; }   /* reap the previous run */
-            J.cancel.store(false); J.done_count.store(0); J.n = 0; J.msg[0] = 0;
+            snprintf(J.ran_layout, sizeof J.ran_layout, "%s", J.layout);   /* snapshot: this run's paths */
+            snprintf(J.ran_out,    sizeof J.ran_out,    "%s", J.out);
+            J.cancel.store(false); J.done_count.store(0); J.n.store(0); J.msg[0] = 0;
             J.state.store(1, std::memory_order_release);
             J.th = std::thread(cap_worker); J.th_live = true;
         }
@@ -443,7 +459,8 @@ static void tab_capture(void) {
     if (st == 0) { ImGui::TextDisabled("sweeps every speaker, solves the trims, writes the layout - then diff it right here"); return; }
 
     int dc = J.done_count.load(std::memory_order_acquire);
-    int n  = J.n > 0 ? J.n : BW_CHANNELS;
+    int jn = J.n.load();
+    int n  = jn > 0 ? jn : BW_CHANNELS;
     char ov[64]; snprintf(ov, sizeof ov, "%d / %d speakers", dc, n);
     ImGui::ProgressBar((float)dc / (float)n, ImVec2(-1, 0), ov);
     if (st == 3) ImGui::TextColored(ImVec4(1.0f, 0.42f, 0.42f, 1.0f), "FAILED: %s", J.msg);
@@ -451,8 +468,8 @@ static void tab_capture(void) {
         ImGui::TextColored(ImVec4(0.45f, 0.85f, 0.5f, 1.0f), "%s", J.msg);
         ImGui::SameLine(0, uiScaled(16));
         if (ImGui::Button("Load into Diff (A=input, B=result)")) {
-            snprintf(V.pathA, sizeof V.pathA, "%s", J.layout); load_layout(0);
-            snprintf(V.pathB, sizeof V.pathB, "%s", J.out);    load_layout(1);
+            snprintf(V.pathA, sizeof V.pathA, "%s", J.ran_layout); load_layout(0);   /* the RUN's paths, not the */
+            snprintf(V.pathB, sizeof V.pathB, "%s", J.ran_out);    load_layout(1);   /* possibly-edited fields  */
         }
     }
     if (ImGui::BeginTable("capt", 6, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY)) {
@@ -583,7 +600,9 @@ static void tab_zylia(void) {
     ImGui::SameLine();
     if (!Z.live) { if (ImGui::Button("Open ZM-1")) { Z.live = zylia_capture_open(Z.driver[0] ? Z.driver : NULL, 48000.0);
                                                      if (Z.live) { Z.simulate = false; Z.last_seq = Z.live->seq; } } }
-    else if (ImGui::Button("Close ZM-1")) { zylia_capture_close(); Z.live = NULL; }
+    else if (ImGui::Button("Close ZM-1")) { zylia_capture_close(); Z.live = NULL;
+                                            Z.last_seq = Z.sim.seq; }   /* re-baseline: else the sim block's older
+                                                                         * seq reprocesses a stale snapshot once */
 #else
     ImGui::SameLine(0, uiScaled(24));
     ImGui::TextDisabled("(built without the ASIO SDK: simulate only)");
@@ -838,7 +857,8 @@ static void register_tests(ImGuiTestEngine* e) {
         ctx->ItemClick("**/##co");   ctx->KeyCharsReplaceEnter("calibview_cap_out.json");
         ctx->ItemCheck("**/simulate");
         ctx->ItemClick("**/Run calibration");
-        for (int i = 0; i < 4000 && J.state.load() == 1; ++i) ctx->Yield();   /* worker: 26 sweeps + solve */
+        double t0 = ImGui::GetTime();                            /* wall-clock bound, not frames: unthrottled */
+        while (J.state.load() == 1 && ImGui::GetTime() - t0 < 60.0) ctx->Yield();   /* frames can be sub-ms  */
         IM_CHECK_EQ(J.state.load(), 2);
         IM_CHECK_EQ(J.done_count.load(), 26);
         ctx->ItemClick("**/Load into Diff (A=input, B=result)");
@@ -975,7 +995,10 @@ int main(int argc, char** argv) {
             if (i + 1 < argc && argv[i + 1][0] != '-') snprintf(filter, sizeof filter, "%s", argv[++i]);
         }
         else if (!strcmp(argv[i], "--irs") && i + 1 < argc) snprintf(V.irprefix, sizeof V.irprefix, "%s", argv[++i]);
-        else if (argv[i][0] != '-' && npos < 2)             snprintf(npos++ ? V.pathB : V.pathA, sizeof V.pathA, "%s", argv[i]);
+        else if (argv[i][0] != '-' && npos < 2) {
+            if (npos++ == 0) snprintf(V.pathA, sizeof V.pathA, "%s", argv[i]);
+            else             snprintf(V.pathB, sizeof V.pathB, "%s", argv[i]);
+        }
         else { fprintf(stderr, "usage: calib_view [layoutA.json] [layoutB.json] [--irs prefix] [--tests [filter]]\n"); return 2; }
     }
     for (int k = 0; k < EQ_PTS; ++k) V.eqfreq[k] = 20.0f * powf(1000.0f, (float)k / (EQ_PTS - 1));

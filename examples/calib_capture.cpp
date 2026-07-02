@@ -39,6 +39,8 @@ void calib_sim_capture(int ch, const Layout* L, const float mic[3], const float*
 #include "asiosys.h"
 #include "asio.h"
 #include "asiodrivers.h"
+#include "asio_convert.h"              /* shared sample-format converters (after the SDK headers) */
+#include "asio_session.h"              /* the one-driver-slot arbitration */
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <atomic>
@@ -59,30 +61,6 @@ struct Cal {
     int             play_pos, cap_pos;
 } g;
 
-int32_t to_i32(float v) { return v >= 1.f ? 2147483647 : v <= -1.f ? -2147483647-1 : (int32_t)(v*2147483647.f); }
-
-void out_block(void* dst, const float* src, long n, long type) {     /* float -> driver type, one channel */
-    switch (type) {
-    case ASIOSTFloat32LSB: memcpy(dst, src, (size_t)n*sizeof(float)); break;
-    case ASIOSTInt32LSB: { int32_t* d=(int32_t*)dst; for (long i=0;i<n;++i) d[i]=to_i32(src[i]); break; }
-    case ASIOSTInt24LSB: { uint8_t* d=(uint8_t*)dst; for (long i=0;i<n;++i){ int32_t v=to_i32(src[i])>>8;
-                           d[i*3]=v&0xFF; d[i*3+1]=(v>>8)&0xFF; d[i*3+2]=(v>>16)&0xFF; } break; }
-    case ASIOSTInt16LSB: { int16_t* d=(int16_t*)dst; for (long i=0;i<n;++i){ float v=src[i];
-                           v=v>1.f?1.f:(v<-1.f?-1.f:v); d[i]=(int16_t)(v*32767.f);} break; }
-    default: memset(dst, 0, (size_t)n*4); break;
-    }
-}
-void in_block(float* dst, const void* src, long n, long type) {      /* driver type -> float, the mic */
-    switch (type) {
-    case ASIOSTFloat32LSB: memcpy(dst, src, (size_t)n*sizeof(float)); break;
-    case ASIOSTInt32LSB: { const int32_t* s=(const int32_t*)src; for (long i=0;i<n;++i) dst[i]=s[i]/2147483648.f; break; }
-    case ASIOSTInt24LSB: { const uint8_t* s=(const uint8_t*)src; for (long i=0;i<n;++i){
-                           int32_t v=(s[i*3])|(s[i*3+1]<<8)|(s[i*3+2]<<16); if (v&0x800000) v|=~0xFFFFFF; dst[i]=v/8388608.f; } break; }
-    case ASIOSTInt16LSB: { const int16_t* s=(const int16_t*)src; for (long i=0;i<n;++i) dst[i]=s[i]/32768.f; break; }
-    default: memset(dst, 0, (size_t)n*sizeof(float)); break;
-    }
-}
-
 void buffer_switch(long index, ASIOBool) {
     int ac = g.active.load(std::memory_order_acquire);
     long n = g.bufsize;
@@ -91,7 +69,7 @@ void buffer_switch(long index, ASIOBool) {
         if (c == ac && g.play_pos < CAL_NSWEEP) {
             float blk[1024];                                 /* bufsize <= 1024 enforced at open */
             for (long i = 0; i < n; ++i) blk[i] = (g.play_pos + i < CAL_NSWEEP) ? g.sweep[g.play_pos + i] : 0.f;
-            out_block(dst, blk, n, g.ci[c].type);
+            asio_float_to_out(dst, blk, n, g.ci[c].type);
         } else {
             memset(dst, 0, (size_t)n * 4);                   /* silence (zero bytes = 0 for all LSB types) */
         }
@@ -99,7 +77,7 @@ void buffer_switch(long index, ASIOBool) {
     if (ac >= 0) {
         int rem = CAL_CAPLEN - g.cap_pos;
         long take = n < rem ? n : rem;
-        if (take > 0) in_block(g.cap + g.cap_pos, g.bi[BW_CHANNELS].buffers[index], take, g.ci[BW_CHANNELS].type);
+        if (take > 0) asio_in_to_float(g.cap + g.cap_pos, g.bi[BW_CHANNELS].buffers[index], take, g.ci[BW_CHANNELS].type);
         g.play_pos += (int)n;
         g.cap_pos  += (int)n;
         if (g.cap_pos >= CAL_CAPLEN) g.done.store(1, std::memory_order_release);
@@ -132,21 +110,23 @@ bool open_driver(const char* want, int mic_in) {
 } /* namespace */
 
 int calib_asio_open(const char* driver, int mic_in, const float* sweep, float* cap) {
+    if (mic_in < 0) { fprintf(stderr, "calib_capture: mic input channel must be >= 0 (got %d)\n", mic_in); return 1; }
+    if (!asio_session_acquire("the calibration sweep (Capture tab / bw_calibrate)")) return 1;
     memset(&g, 0, sizeof g); g.active = -1; g.sweep = sweep; g.cap = cap;
-    if (!open_driver(driver, mic_in)) { fprintf(stderr, "calib_capture: no ASIO driver with >=26 out + the mic input\n"); return 1; }
+    if (!open_driver(driver, mic_in)) { fprintf(stderr, "calib_capture: no ASIO driver with >=26 out + the mic input\n"); asio_session_release(); return 1; }
     long bmin=0,bmax=0,bpref=0,bgran=0; ASIOGetBufferSize(&bmin,&bmax,&bpref,&bgran);
     g.bufsize = bpref > 1024 ? 1024 : bpref;                  /* blk[] in buffer_switch is 1024 */
     if (g.bufsize < bmin) g.bufsize = bmin;
     if (ASIOCanSampleRate((ASIOSampleRate)CAL_FS)!=ASE_OK || ASIOSetSampleRate((ASIOSampleRate)CAL_FS)!=ASE_OK) {
-        fprintf(stderr, "calib_capture: driver cannot run at %.0f Hz\n", CAL_FS); ASIOExit(); asioDrivers->removeCurrentDriver(); return 1; }
+        fprintf(stderr, "calib_capture: driver cannot run at %.0f Hz\n", CAL_FS); ASIOExit(); asioDrivers->removeCurrentDriver(); asio_session_release(); return 1; }
     for (int c = 0; c < BW_CHANNELS; ++c) { g.bi[c].isInput=ASIOFalse; g.bi[c].channelNum=c; }
     g.bi[BW_CHANNELS].isInput=ASIOTrue;  g.bi[BW_CHANNELS].channelNum=mic_in;
     g.cb.bufferSwitch=&buffer_switch; g.cb.sampleRateDidChange=&rate_changed;
     g.cb.asioMessage=&asio_msg;       g.cb.bufferSwitchTimeInfo=&buffer_switch_ti;
     for (int c = 0; c <= BW_CHANNELS; ++c) { g.ci[c].channel=g.bi[c].channelNum; g.ci[c].isInput=g.bi[c].isInput; ASIOGetChannelInfo(&g.ci[c]); }
     if (ASIOCreateBuffers(g.bi, BW_CHANNELS+1, g.bufsize, &g.cb)!=ASE_OK) {
-        fprintf(stderr, "calib_capture: ASIOCreateBuffers failed\n"); ASIOExit(); asioDrivers->removeCurrentDriver(); return 1; }
-    if (ASIOStart()!=ASE_OK) { fprintf(stderr, "calib_capture: ASIOStart failed\n"); ASIODisposeBuffers(); ASIOExit(); asioDrivers->removeCurrentDriver(); return 1; }
+        fprintf(stderr, "calib_capture: ASIOCreateBuffers failed\n"); ASIOExit(); asioDrivers->removeCurrentDriver(); asio_session_release(); return 1; }
+    if (ASIOStart()!=ASE_OK) { fprintf(stderr, "calib_capture: ASIOStart failed\n"); ASIODisposeBuffers(); ASIOExit(); asioDrivers->removeCurrentDriver(); asio_session_release(); return 1; }
     return 0;
 }
 
@@ -163,5 +143,9 @@ int calib_asio_capture(int ch) {
     return 1;
 }
 
-void calib_asio_close(void) { ASIOStop(); ASIODisposeBuffers(); ASIOExit(); if (asioDrivers) asioDrivers->removeCurrentDriver(); }
+void calib_asio_close(void) {
+    ASIOStop(); ASIODisposeBuffers(); ASIOExit();
+    if (asioDrivers) asioDrivers->removeCurrentDriver();
+    asio_session_release();
+}
 #endif /* BW_HAVE_ASIO */

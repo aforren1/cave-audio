@@ -15,6 +15,8 @@
 #include "asiosys.h"
 #include "asio.h"
 #include "asiodrivers.h"
+#include "asio_convert.h"              /* shared sample-format converters (after the SDK headers) */
+#include "asio_session.h"              /* the one-driver-slot arbitration */
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <atomic>
@@ -22,8 +24,9 @@
 extern AsioDrivers* asioDrivers;
 extern bool loadAsioDriver(char* name);
 
-#define MAXNAMES  32
-#define ZP_RING_N 16384                /* per-capsule capture ring (power of 2); ~340 ms at 48 kHz */
+#define MAXNAMES     32
+#define ZP_RING_N    16384             /* per-capsule capture ring (power of 2); ~340 ms at 48 kHz */
+#define ZP_MAX_BLOCK 8192              /* conversion scratch bound; open() refuses larger driver blocks */
 
 namespace {
 struct Capture {
@@ -48,35 +51,20 @@ struct Capture {
     char     title[64];
 } g;
 
-/* convert one channel's block to float into the capture ring; returns the block's peak |sample|. */
-float ring_write(const void* src, long n, long type, float* ring, uint64_t wabs) {
-    const uint64_t M = ZP_RING_N - 1;
-    float pk = 0.f;
-    switch (type) {
-    case ASIOSTFloat32LSB: { const float* s = (const float*)src;
-        for (long i = 0; i < n; ++i) { float v = s[i]; ring[(wabs + i) & M] = v; float a = fabsf(v); if (a > pk) pk = a; } break; }
-    case ASIOSTInt32LSB:   { const int32_t* s = (const int32_t*)src;
-        for (long i = 0; i < n; ++i) { float v = (float)(s[i] / 2147483648.0); ring[(wabs + i) & M] = v; float a = fabsf(v); if (a > pk) pk = a; } break; }
-    case ASIOSTInt24LSB:   { const uint8_t* s = (const uint8_t*)src;
-        for (long i = 0; i < n; ++i) { int32_t w = (s[i*3]) | (s[i*3+1] << 8) | (s[i*3+2] << 16); if (w & 0x800000) w |= ~0xFFFFFF;
-                                       float v = (float)(w / 8388608.0); ring[(wabs + i) & M] = v; float a = fabsf(v); if (a > pk) pk = a; } break; }
-    case ASIOSTInt16LSB:   { const int16_t* s = (const int16_t*)src;
-        for (long i = 0; i < n; ++i) { float v = (float)(s[i] / 32768.0); ring[(wabs + i) & M] = v; float a = fabsf(v); if (a > pk) pk = a; } break; }
-    default: for (long i = 0; i < n; ++i) ring[(wabs + i) & M] = 0.f; break;
-    }
-    return pk;
-}
-
 void buffer_switch(long index, ASIOBool) {
     const long n = g.bufsize;
+    const uint64_t M = ZP_RING_N - 1;
+    static float tmp[ZP_MAX_BLOCK];                    /* audio thread only; bufsize bound enforced at open */
     float pk = 0.f;
     for (long c = 0; c < g.ncap; ++c) {
-        float p = ring_write(g.bi[c].buffers[index], n, g.ci[c].type, g.ring[c], g.wabs);
-        if (p > pk) pk = p;
-        /* meter: block RMS from the freshly-written ring slice (one pass, cache-hot) */
-        const uint64_t M = ZP_RING_N - 1;
+        asio_in_to_float(tmp, g.bi[c].buffers[index], n, g.ci[c].type);
         double acc = 0.0;
-        for (long i = 0; i < n; ++i) { float v = g.ring[c][(g.wabs + i) & M]; acc += (double)v * v; }
+        for (long i = 0; i < n; ++i) {                 /* one fused pass: ring write + peak + RMS accumulate */
+            float v = tmp[i];
+            g.ring[c][(g.wabs + i) & M] = v;
+            float a = fabsf(v); if (a > pk) pk = a;
+            acc += (double)v * v;
+        }
         float r = (float)sqrt(acc / (n > 0 ? n : 1));
         g.sm[c] = 0.8f * g.sm[c] + 0.2f * r;           /* a little smoothing so the meter doesn't flicker */
         g.sh.rms[c] = g.sm[c];
@@ -160,13 +148,14 @@ int zylia_capture_list(void) {
 
 ZpShared* zylia_capture_open(const char* driver, double rate) {
     if (g.started) { fprintf(stderr, "zylia_capture: already open\n"); return &g.sh; }
+    if (!asio_session_acquire("the ZM-1 capture (Zylia tab / zylia_probe)")) return NULL;
     memset(&g, 0, sizeof g);
     g.nfloor = 0.02f;                                  /* start the trigger floor above quiet-room noise */
 
     bool ok = false;
     if (driver && *driver) {
         ok = tryopen(driver);
-        if (!ok) { fprintf(stderr, "zylia_capture: could not open '%s' (try --list)\n", driver); return NULL; }
+        if (!ok) { fprintf(stderr, "zylia_capture: could not open '%s' (try --list)\n", driver); asio_session_release(); return NULL; }
     } else {
         char names[MAXNAMES][32]; int nd = get_driver_names(names, MAXNAMES);
         for (int i = 0; i < nd && !ok; ++i) {          /* first pass: a driver that looks like the Zylia */
@@ -174,13 +163,17 @@ ZpShared* zylia_capture_open(const char* driver, double rate) {
             if (strstr(low, "zylia")) ok = tryopen(names[i]);
         }
         for (int i = 0; i < nd && !ok; ++i) ok = tryopen(names[i]);   /* else the first input-capable one */
-        if (!ok) { fprintf(stderr, "zylia_capture: no ASIO input device opened. For the ZM-1 use its ASIO driver or ASIO4ALL.\n"); return NULL; }
+        if (!ok) { fprintf(stderr, "zylia_capture: no ASIO input device opened. For the ZM-1 use its ASIO driver or ASIO4ALL.\n"); asio_session_release(); return NULL; }
     }
 
     if (ASIOCanSampleRate((ASIOSampleRate)rate) != ASE_OK || ASIOSetSampleRate((ASIOSampleRate)rate) != ASE_OK)
         fprintf(stderr, "  note: driver would not set %.0f Hz; running at its current rate\n", rate);
     long bmin = 0, bmax = 0, bpref = 0, bgran = 0; ASIOGetBufferSize(&bmin, &bmax, &bpref, &bgran);
     g.bufsize = bpref;
+    if (g.bufsize > ZP_MAX_BLOCK) {                    /* the callback's conversion scratch is fixed-size */
+        fprintf(stderr, "zylia_capture: driver block %ld exceeds %d\n", g.bufsize, ZP_MAX_BLOCK);
+        ASIOExit(); asioDrivers->removeCurrentDriver(); asio_session_release(); return NULL;
+    }
     { ASIOSampleRate ar = rate; ASIOGetSampleRate(&ar);            /* the callback's holdoff math reads */
       g.sh.nch = (int)g.nin; g.sh.rate = (double)ar; g.sh.title = g.title; }   /* sh BEFORE the stream starts */
     for (long c = 0; c < g.ncap; ++c) { g.bi[c].isInput = ASIOTrue; g.bi[c].channelNum = c; }
@@ -190,11 +183,11 @@ ZpShared* zylia_capture_open(const char* driver, double rate) {
 
     if (ASIOCreateBuffers(g.bi, g.ncap, g.bufsize, &g.cb) != ASE_OK) {
         fprintf(stderr, "zylia_capture: ASIOCreateBuffers failed\n");
-        ASIOExit(); asioDrivers->removeCurrentDriver(); return NULL;
+        ASIOExit(); asioDrivers->removeCurrentDriver(); asio_session_release(); return NULL;
     }
     if (ASIOStart() != ASE_OK) {
         fprintf(stderr, "zylia_capture: ASIOStart failed\n");
-        ASIODisposeBuffers(); ASIOExit(); asioDrivers->removeCurrentDriver(); return NULL;
+        ASIODisposeBuffers(); ASIOExit(); asioDrivers->removeCurrentDriver(); asio_session_release(); return NULL;
     }
     g.started = true;
     printf("streaming %ld ch @ %.0f Hz, block %ld\n", g.ncap, g.sh.rate, g.bufsize);
@@ -206,6 +199,7 @@ void zylia_capture_close(void) {
     ASIOStop(); ASIODisposeBuffers(); ASIOExit();
     if (asioDrivers) asioDrivers->removeCurrentDriver();
     g.started = false;
+    asio_session_release();
 }
 
 #else /* !BW_HAVE_ASIO: stubs so consumers can link unconditionally */
