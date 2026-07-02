@@ -34,6 +34,7 @@ extern "C" {                       /* engine internals (C, no extern-C guards of
 }
 
 #include <d3d11.h>
+#include <commdlg.h>       /* GetOpenFileNameA: the native file picker (comdlg32) */
 #include <math.h>
 #include <stdio.h>
 #include <string.h>
@@ -145,6 +146,34 @@ static void load_irs(void) {
 
 static bool show_imgui_demo, show_implot_demo, show_te_ui;
 static ImGuiTestEngine* g_te;
+static HWND g_hwnd;
+
+/* Native open dialog. OFN_NOCHANGEDIR is load-bearing: this tool (like the rest of the repo's tools)
+ * resolves relative paths against the CWD, and GetOpenFileName silently changes it by default. The
+ * typed InputText stays alongside — it is the path the test engine drives (a native modal can't be). */
+static bool pick_file(char* buf, size_t cap, const char* filter) {
+    char tmp[512] = "";
+    OPENFILENAMEA ofn = { sizeof ofn };
+    ofn.hwndOwner   = g_hwnd;
+    ofn.lpstrFilter = filter;
+    ofn.lpstrFile   = tmp;
+    ofn.nMaxFile    = sizeof tmp;
+    ofn.Flags       = OFN_FILEMUSTEXIST | OFN_NOCHANGEDIR;
+    if (!GetOpenFileNameA(&ofn)) return false;
+    snprintf(buf, cap, "%s", tmp);
+    return true;
+}
+
+/* picking any one "<prefix>_NN.wav" IR selects the whole set: strip the suffix back to the prefix */
+static void wav_to_prefix(char* p) {
+    size_t n = strlen(p);
+    if (n > 4 && !_stricmp(p + n - 4, ".wav")) {
+        size_t cut = n - 4;
+        if (cut >= 3 && p[cut - 3] == '_' && p[cut - 2] >= '0' && p[cut - 2] <= '9'
+                                          && p[cut - 1] >= '0' && p[cut - 1] <= '9') cut -= 3;
+        p[cut] = 0;
+    }
+}
 
 static void tab_array(void) {
     if (!ImPlot3D::BeginPlot("##array", ImGui::GetContentRegionAvail())) return;
@@ -270,17 +299,25 @@ static void draw_ui(void) {
     }
 
     ImGui::BeginChild("side", ImVec2(340, 0), ImGuiChildFlags_Borders);
+    const char* JSONF = "layout json (*.json)\0*.json\0all files (*.*)\0*.*\0";
+    const char* WAVF  = "IR wav (*.wav)\0*.wav\0all files (*.*)\0*.*\0";
     ImGui::TextUnformatted("layout A (surveyed / before)");
-    ImGui::SetNextItemWidth(-70);
+    ImGui::SetNextItemWidth(-104);
     ImGui::InputText("##A", V.pathA, sizeof V.pathA);
+    ImGui::SameLine(); if (ImGui::Button("...##pA") && pick_file(V.pathA, sizeof V.pathA, JSONF)) load_layout(0);
     ImGui::SameLine(); if (ImGui::Button("Load A")) load_layout(0);
     ImGui::TextUnformatted("layout B (calibrated / after)");
-    ImGui::SetNextItemWidth(-70);
+    ImGui::SetNextItemWidth(-104);
     ImGui::InputText("##B", V.pathB, sizeof V.pathB);
+    ImGui::SameLine(); if (ImGui::Button("...##pB") && pick_file(V.pathB, sizeof V.pathB, JSONF)) load_layout(1);
     ImGui::SameLine(); if (ImGui::Button("Load B")) load_layout(1);
     ImGui::TextUnformatted("IR prefix (bw_calibrate --save-irs)");
-    ImGui::SetNextItemWidth(-70);
+    ImGui::SetNextItemWidth(-104);
     ImGui::InputText("##IR", V.irprefix, sizeof V.irprefix);
+    ImGui::SameLine(); if (ImGui::Button("...##pI") && pick_file(V.irprefix, sizeof V.irprefix, WAVF)) {
+        wav_to_prefix(V.irprefix);                               /* any one _NN.wav selects the set */
+        load_irs();
+    }
     ImGui::SameLine(); if (ImGui::Button("Load IRs")) load_irs();
     ImGui::Separator();
     ImGui::TextWrapped("%s", V.status[0] ? V.status : "load a cave_layout.json to begin");
@@ -501,6 +538,7 @@ int main(int argc, char** argv) {
     RegisterClassExW(&wc);
     HWND hwnd = CreateWindowW(wc.lpszClassName, L"bwaudio - calibration report viewer", WS_OVERLAPPEDWINDOW,
                               100, 100, 1280, 800, NULL, NULL, wc.hInstance, NULL);
+    g_hwnd = hwnd;                                                /* file-picker dialog owner */
     if (!create_device(hwnd)) { fprintf(stderr, "calib_view: d3d11 device creation failed\n"); return 1; }
     ShowWindow(hwnd, selftest ? SW_SHOWNOACTIVATE : SW_SHOWDEFAULT);
     UpdateWindow(hwnd);

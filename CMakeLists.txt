@@ -439,7 +439,7 @@ if(BWAUDIO_BUILD_CALIBVIEW)
   target_compile_definitions(bw_calib_view PRIVATE
     "IMGUI_USER_CONFIG=\"imgui_te_imconfig.h\""
     IMGUI_TEST_ENGINE_ENABLE_COROUTINE_STDTHREAD_IMPL=1)
-  target_link_libraries(bw_calib_view PRIVATE bw_core d3d11 d3dcompiler)
+  target_link_libraries(bw_calib_view PRIVATE bw_core d3d11 d3dcompiler comdlg32)   # comdlg32: file picker
   if(BWAUDIO_BUILD_TESTS)
     add_test(NAME calib_view COMMAND bw_calib_view --selftest)   # the GUI itself, driven by fake inputs
   endif()
