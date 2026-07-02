@@ -97,7 +97,7 @@ ctest --test-dir build -C RelWithDebInfo      # runs the full test suite (test_*
 ```
 
 **Current state (M6 + occlusion):** builds `bwaudio.dll` + the test suite (sixteen ctests with the Steam
-Audio SDK, twelve without). `rt.c` is the concurrency spine
+Audio SDK, twelve without; +`calib_view` with `BWAUDIO_BUILD_CALIBVIEW`). `rt.c` is the concurrency spine
 (two SPSC rings, voice + sound tables, commit snapshot, generation handles) + retire-ack;
 the whole `bw_*` API forwards to it. `sound.c` decodes wav (dr_wav) and `mix_voice` plays
 `sound->pcm` with a gain ramp. Spatialization is real: `layout.c` loads the surveyed
@@ -204,6 +204,15 @@ channels, and `zylia_tdoa` (onset + windowed cross-correlation with sub-sample p
 the `zylia` test) feeds `zylia_doa` so a dot appears on the capsule sphere where the clap came from —
 verifying capsule mapping AND the geometry table in seconds; `--simulate` drives the same
 snapshot→tdoa→doa→draw pipeline with synthesized claps (truth ring drawn), hardware-free.
+**`bw_calib_view`** (opt-in `-DBWAUDIO_BUILD_CALIBVIEW=ON`) is the calibration REPORT viewer and the
+**Dear ImGui pilot** (imgui + implot + implot3d on win32+d3d11 — preferred over raylib/raygui for new
+panel/plot tools): it loads layouts through the engine's own `layout_load`, shows the array in 3D,
+gain/delay trims, correction-EQ magnitude curves, `--save-irs` IR kernels, and a layout DIFF (surveyed
+vs calibrated) with outlier highlighting — the "did calibration write something sane?" check before
+accepting a writeback. Its `--selftest` runs **imgui_test_engine**: fake inputs drive the real UI
+(type path → click Load → assert 26 speakers / the known 100 mm fixture delta), screenshots are
+captured to output/captures/, and it runs under ctest (`calib_view`) — a GUI with an automated
+regression test (test-engine license: free for open source, NOT MIT — see its LICENSE.txt).
 **Per-speaker correction filters** (`--eq`) are the "inverse EQ" upgrade to the scalar
 trims: `measure_correction` gates the IR to the direct sound (before the first reflection) and inverts that
 magnitude into a minimum-phase FIR (`calib_eq` → the layout `eq` array → applied per channel in `align.c`,

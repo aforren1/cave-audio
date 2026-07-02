@@ -379,6 +379,72 @@ if(BWAUDIO_BUILD_PLAYGROUND)
   endif()
 endif()
 
+# ---- Optional: calibration report viewer (Dear ImGui pilot: win32 + d3d11) ----
+# cmake -S . -B build -DBWAUDIO_BUILD_CALIBVIEW=ON
+# Inspect what bw_calibrate wrote before trusting it: per-speaker trims, correction-EQ magnitudes,
+# retained IRs, the array in 3D, and a layout DIFF (surveyed vs calibrated / before vs after
+# writeback). This is the imgui + implot + implot3d pilot (vs the raylib tools): the win32+d3d11
+# backend, and imgui_test_engine drives the GUI with FAKE INPUTS under ctest (`--selftest`) — a GUI
+# with an automated regression test. Test engine license note: NOT MIT — free for open source
+# (dual-licensed; see its LICENSE.txt) — fine here, revisit if this repo's licensing changes.
+option(BWAUDIO_BUILD_CALIBVIEW "Build the imgui calibration report viewer (fetches imgui/implot/implot3d/test-engine)" OFF)
+if(BWAUDIO_BUILD_CALIBVIEW)
+  enable_language(CXX)
+  # SOURCE_SUBDIR points at a non-existent dir (raygui trick above): populate sources only, never
+  # their own example/demo builds. imgui and imgui_test_engine tags track each other — bump together.
+  FetchContent_Declare(imgui
+    URL https://github.com/ocornut/imgui/archive/refs/tags/v1.92.8.tar.gz
+    DOWNLOAD_EXTRACT_TIMESTAMP TRUE SOURCE_SUBDIR not_built)
+  FetchContent_Declare(implot
+    URL https://github.com/epezent/implot/archive/refs/tags/v1.0.tar.gz
+    DOWNLOAD_EXTRACT_TIMESTAMP TRUE SOURCE_SUBDIR not_built)
+  FetchContent_Declare(implot3d
+    URL https://github.com/brenocq/implot3d/archive/refs/tags/v0.4.tar.gz
+    DOWNLOAD_EXTRACT_TIMESTAMP TRUE SOURCE_SUBDIR not_built)
+  FetchContent_Declare(imgui_te
+    URL https://github.com/ocornut/imgui_test_engine/archive/refs/tags/v1.92.8.tar.gz
+    DOWNLOAD_EXTRACT_TIMESTAMP TRUE SOURCE_SUBDIR not_built)
+  FetchContent_MakeAvailable(imgui implot implot3d imgui_te)
+
+  add_executable(bw_calib_view examples/calib_view.cpp
+    ${imgui_SOURCE_DIR}/imgui.cpp
+    ${imgui_SOURCE_DIR}/imgui_draw.cpp
+    ${imgui_SOURCE_DIR}/imgui_tables.cpp
+    ${imgui_SOURCE_DIR}/imgui_widgets.cpp
+    ${imgui_SOURCE_DIR}/imgui_demo.cpp
+    ${imgui_SOURCE_DIR}/backends/imgui_impl_win32.cpp
+    ${imgui_SOURCE_DIR}/backends/imgui_impl_dx11.cpp
+    ${implot_SOURCE_DIR}/implot.cpp
+    ${implot_SOURCE_DIR}/implot_items.cpp
+    ${implot_SOURCE_DIR}/implot_demo.cpp
+    ${implot3d_SOURCE_DIR}/implot3d.cpp
+    ${implot3d_SOURCE_DIR}/implot3d_items.cpp
+    ${implot3d_SOURCE_DIR}/implot3d_meshes.cpp
+    ${imgui_te_SOURCE_DIR}/imgui_test_engine/imgui_te_engine.cpp
+    ${imgui_te_SOURCE_DIR}/imgui_test_engine/imgui_te_context.cpp
+    ${imgui_te_SOURCE_DIR}/imgui_test_engine/imgui_te_coroutine.cpp
+    ${imgui_te_SOURCE_DIR}/imgui_test_engine/imgui_te_exporters.cpp
+    ${imgui_te_SOURCE_DIR}/imgui_test_engine/imgui_te_perftool.cpp
+    ${imgui_te_SOURCE_DIR}/imgui_test_engine/imgui_te_ui.cpp
+    ${imgui_te_SOURCE_DIR}/imgui_test_engine/imgui_te_utils.cpp
+    ${imgui_te_SOURCE_DIR}/imgui_test_engine/imgui_capture_tool.cpp)
+  target_include_directories(bw_calib_view PRIVATE
+    ${imgui_SOURCE_DIR} ${imgui_SOURCE_DIR}/backends
+    ${implot_SOURCE_DIR} ${implot3d_SOURCE_DIR}
+    ${imgui_te_SOURCE_DIR} ${imgui_te_SOURCE_DIR}/imgui_test_engine)
+  # The canonical test-engine integration: compile EVERY imgui/implot/te TU with the test engine's
+  # imconfig (defines IMGUI_ENABLE_TEST_ENGINE hooks + IMGUI_TEST_ENGINE_ENABLE_CAPTURE) — a plain
+  # IMGUI_ENABLE_TEST_ENGINE define is not enough, the capture path silently compiles out without it.
+  # The std::thread coroutine impl is the no-dependency option on Windows.
+  target_compile_definitions(bw_calib_view PRIVATE
+    "IMGUI_USER_CONFIG=\"imgui_te_imconfig.h\""
+    IMGUI_TEST_ENGINE_ENABLE_COROUTINE_STDTHREAD_IMPL=1)
+  target_link_libraries(bw_calib_view PRIVATE bw_core d3d11 d3dcompiler)
+  if(BWAUDIO_BUILD_TESTS)
+    add_test(NAME calib_view COMMAND bw_calib_view --selftest)   # the GUI itself, driven by fake inputs
+  endif()
+endif()
+
 # ---- Optional: speaker calibration tool (full-duplex ASIO sweep -> per-speaker delay/gain trims) ----
 # cmake -S . -B build -DBWAUDIO_BUILD_CALIBRATE=ON ; run with --simulate (no hardware) or on the rig.
 option(BWAUDIO_BUILD_CALIBRATE "Build the speaker calibration tool" OFF)

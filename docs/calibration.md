@@ -132,6 +132,23 @@ name contains "zylia", else `--driver` it. Two views:
   hardware-free check of everything but the ASIO capture; the math itself is unit-tested in the
   `zylia` ctest.
 
+## Reviewing the results (`bw_calib_view`)
+
+Before trusting a calibration run, LOOK at it: `bw_calib_view` (opt-in `-DBWAUDIO_BUILD_CALIBVIEW=ON`;
+Dear ImGui + ImPlot/ImPlot3D on win32+d3d11) loads layouts through the engine's own loader and shows
+
+- the **array in 3D** with per-speaker index labels (the wiring sanity check),
+- **gain/delay trims** as bar charts,
+- each speaker's **correction-EQ magnitude** (`--eq` filters, 20 Hz–20 kHz),
+- the retained **IR kernels** (`--save-irs <prefix>` → `<prefix>_NN.wav`) with the direct-arrival tag,
+- and — the main event — a **layout diff**: `bw_calib_view before.json after.json` tables Δposition /
+  Δgain / Δdelay / eq-taps per speaker with outliers highlighted, so a swapped channel, a bad mic
+  placement, or a bogus `--localize` solve is one glance, not an evening.
+
+`bw_calib_view --selftest` runs its imgui_test_engine suite (fake inputs drive the actual UI against
+generated fixture layouts, screenshots land in `output/captures/`) and is wired into ctest as
+`calib_view`.
+
 ## What feeds the engine
 
 `cave_layout.json` carries per-speaker `position`, `gain_db`, `delay_ms` (consumed by `dbap.c` +
