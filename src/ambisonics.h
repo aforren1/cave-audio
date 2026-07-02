@@ -27,7 +27,7 @@ void ambi_encode_sn3d(const float dir[3], float y[BW_AMBI_CH]);
  * and its SH evaluator is math-orthonormal (= N3D / sqrt(4pi)). Factor = sqrt(2l+1)/sqrt(4pi) for a
  * channel of degree l. Confirmed against phonon's hardcoded SH constants (third_party/steam-audio
  * core/src/core/sh/spherical_harmonics.cc: Y00=0.282095=1/sqrt(4pi), Y1=0.488603=sqrt(3)/sqrt(4pi),
- * ...). Multiply ambi_encode_sn3d's output by this elementwise to feed the decode; bw_ambi_test
+ * ...). Multiply ambi_encode_sn3d's output by this elementwise to feed the decode; test_ambi
  * checks the product against those constants. */
 extern const float ambi_phonon_scale[BW_AMBI_CH];
 

@@ -71,6 +71,78 @@ int zylia_doa(const double arrival_s[ZYLIA_MICS], float dir_out[3]) {
     return 1;
 }
 
+/* Live-transient TDOA (see zylia.h). Plain time-domain cross-correlation on a short window around
+ * the onset: at n~4k, L=256, max_lag~32 that is ~19 x 65 x 256 MACs — microseconds, no FFT needed.
+ * A clap is broadband, so the correlation has ONE sharp peak (no carrier-cycle ambiguity). */
+#define TDOA_WIN 256           /* correlation window (samples): ~5 ms at 48 kHz — direct sound only;
+                                 * the first room reflection lands ms later and stays outside it */
+
+int zylia_tdoa(const float* const x[ZYLIA_MICS], uint32_t n, double fs, uint32_t max_lag,
+               double arrival_s[ZYLIA_MICS]) {
+    if (!x || !arrival_s || fs <= 0.0 || max_lag < 1 || max_lag > 4096) return 0;
+
+    /* reference = the channel with the strongest peak (closest capsule: earliest + loudest). */
+    int ref = 0; float pk = 0.f; uint32_t pki = 0;
+    for (int ch = 0; ch < ZYLIA_MICS; ++ch) {
+        if (!x[ch]) return 0;
+        for (uint32_t i = 0; i < n; ++i) {
+            float a = fabsf(x[ch][i]);
+            if (a > pk) { pk = a; ref = ch; pki = i; }
+        }
+    }
+    double sos = 0.0;                                   /* transient sanity: peak must stand off the RMS */
+    for (uint32_t i = 0; i < n; ++i) sos += (double)x[ref][i] * x[ref][i];
+    double rms = sqrt(sos / (n > 0 ? n : 1));
+    if (pk < 6.0 * rms || pk < 1e-6f) return 0;         /* steady noise / silence: no transient to time */
+
+    /* onset on the reference: first sample reaching 20% of the peak (leading edge — robust to the
+     * tail and to reflections after it). Window starts just before it. */
+    uint32_t onset = pki;
+    for (uint32_t i = 0; i < n; ++i) if (fabsf(x[ref][i]) >= 0.2f * pk) { onset = i; break; }
+    uint32_t L  = TDOA_WIN;
+    uint32_t s0 = (onset > max_lag + 8) ? onset - max_lag - 8 : 0;    /* pre-roll: capture earlier arrivals */
+    if (s0 + L + max_lag >= n) {                                       /* clamp the window into the snapshot */
+        if (n < 2 * max_lag + 64) return 0;                            /* too little context to correlate */
+        L = n - s0 - max_lag - 1;
+        if (L < 64) { s0 = 0; L = n - max_lag - 1; }
+    }
+    if (s0 < max_lag) s0 = max_lag;                                    /* need s0-lag >= 0 for negative lags */
+    if (s0 + L + max_lag >= n) L = n - s0 - max_lag - 1;
+    if (L < 32) return 0;
+
+    for (int ch = 0; ch < ZYLIA_MICS; ++ch) {
+        if (ch == ref) { arrival_s[ch] = 0.0; continue; }
+        /* r(lag) = sum_i ref[s0+i] * ch[s0+i+lag]; a channel DELAYED by d peaks at lag = +d. */
+        int    best = 0; double rbest = -1e300, rm1 = 0, rp1 = 0;
+        double r_at[3];                                     /* r at best-1 / best / best+1 for the parabola */
+        for (int lag = -(int)max_lag; lag <= (int)max_lag; ++lag) {
+            double r = 0.0;
+            const float* a = x[ref] + s0;
+            const float* b = x[ch]  + s0 + lag;
+            for (uint32_t i = 0; i < L; ++i) r += (double)a[i] * b[i];
+            if (r > rbest) { rbest = r; best = lag; }
+        }
+        double frac = 0.0;
+        if (best > -(int)max_lag && best < (int)max_lag) {  /* interior peak: parabolic sub-sample refine */
+            for (int k = -1; k <= 1; ++k) {                 /* recompute the neighbours (cheaper than storing the curve) */
+                int lag = best + k;
+                double r = 0.0;
+                const float* a = x[ref] + s0;
+                const float* b = x[ch]  + s0 + lag;
+                for (uint32_t i = 0; i < L; ++i) r += (double)a[i] * b[i];
+                r_at[k + 1] = r;
+            }
+            rm1 = r_at[0]; rp1 = r_at[2];
+            double denom = rm1 - 2.0 * r_at[1] + rp1;
+            frac = (fabs(denom) > 1e-12) ? 0.5 * (rm1 - rp1) / denom : 0.0;
+            if (frac >  0.5) frac =  0.5;                   /* the true peak is between the neighbours */
+            if (frac < -0.5) frac = -0.5;
+        }                                                   /* boundary peak: keep the integer lag as-is */
+        arrival_s[ch] = ((double)best + frac) / fs;
+    }
+    return 1;
+}
+
 int zylia_localize(const double arrival_s[ZYLIA_MICS], const float center[3],
                    double latency_s, double c, float pos_out[3], float* dist_out) {
     if (!arrival_s || !center || !pos_out || c <= 0.0) return 0;

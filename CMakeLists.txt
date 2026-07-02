@@ -208,130 +208,130 @@ if(BWAUDIO_BUILD_TESTS)
   enable_testing()
 
   # lifecycle smoke against the public ABI / DLL
-  add_executable(bw_smoke test/smoke.c)
-  target_link_libraries(bw_smoke PRIVATE bwaudio)
-  add_test(NAME smoke COMMAND bw_smoke)
+  add_executable(test_smoke test/smoke.c)
+  target_link_libraries(test_smoke PRIVATE bwaudio)
+  add_test(NAME smoke COMMAND test_smoke)
   set_tests_properties(smoke PROPERTIES ENVIRONMENT "BWAUDIO_SINK=null")   # hermetic: no real device
   if(WIN32)
-    add_custom_command(TARGET bw_smoke POST_BUILD
+    add_custom_command(TARGET test_smoke POST_BUILD
       COMMAND ${CMAKE_COMMAND} -E copy_if_different
-              $<TARGET_FILE:bwaudio> $<TARGET_FILE_DIR:bw_smoke>)           # .dll next to the .exe
+              $<TARGET_FILE:bwaudio> $<TARGET_FILE_DIR:test_smoke>)           # .dll next to the .exe
   endif()
 
   # audio-loop check: drives the null sink directly (no core needed)
-  add_executable(bw_audio_smoke test/audio_sink_test.c src/sink.c src/null_sink.c)
-  target_include_directories(bw_audio_smoke PRIVATE src)
+  add_executable(test_audio_sink test/audio_sink_test.c src/sink.c src/null_sink.c)
+  target_include_directories(test_audio_sink PRIVATE src)
   if(WIN32)
-    target_link_libraries(bw_audio_smoke PRIVATE winmm)
+    target_link_libraries(test_audio_sink PRIVATE winmm)
   endif()
-  add_test(NAME audio_sink COMMAND bw_audio_smoke)
+  add_test(NAME audio_sink COMMAND test_audio_sink)
 
   # off-RT-path checks that compile the core in (bw_core PUBLIC includes propagate)
-  add_executable(bw_rt_test    test/rt_test.c)
-  target_link_libraries(bw_rt_test PRIVATE bw_core)
-  add_test(NAME rt COMMAND bw_rt_test)
+  add_executable(test_rt    test/rt_test.c)
+  target_link_libraries(test_rt PRIVATE bw_core)
+  add_test(NAME rt COMMAND test_rt)
 
   # Doppler-quality probe (diagnostic; prints an FFT spectrum report, not a ctest)
-  add_executable(bw_doppler_fft test/doppler_fft.c)
-  target_link_libraries(bw_doppler_fft PRIVATE bw_core)
+  add_executable(test_doppler_fft test/doppler_fft.c)
+  target_link_libraries(test_doppler_fft PRIVATE bw_core)
 
-  add_executable(bw_sound_test test/sound_test.c)
-  target_link_libraries(bw_sound_test PRIVATE bw_core)
-  add_test(NAME sound COMMAND bw_sound_test)
+  add_executable(test_sound test/sound_test.c)
+  target_link_libraries(test_sound PRIVATE bw_core)
+  add_test(NAME sound COMMAND test_sound)
 
-  add_executable(bw_dsp_test   test/dsp_test.c)
-  target_link_libraries(bw_dsp_test PRIVATE bw_core)
-  add_test(NAME dsp COMMAND bw_dsp_test)
+  add_executable(test_dsp   test/dsp_test.c)
+  target_link_libraries(test_dsp PRIVATE bw_core)
+  add_test(NAME dsp COMMAND test_dsp)
 
-  add_executable(bw_monitor_test test/monitor_test.c)
-  target_link_libraries(bw_monitor_test PRIVATE bw_core)
-  add_test(NAME monitor COMMAND bw_monitor_test)
+  add_executable(test_monitor test/monitor_test.c)
+  target_link_libraries(test_monitor PRIVATE bw_core)
+  add_test(NAME monitor COMMAND test_monitor)
 
-  add_executable(bw_natnet_test test/natnet_test.c)
-  target_link_libraries(bw_natnet_test PRIVATE bw_core)
-  add_test(NAME natnet COMMAND bw_natnet_test)
+  add_executable(test_natnet test/natnet_test.c)
+  target_link_libraries(test_natnet PRIVATE bw_core)
+  add_test(NAME natnet COMMAND test_natnet)
 
-  add_executable(bw_ambi_test test/ambi_test.c)
-  target_link_libraries(bw_ambi_test PRIVATE bw_core)
-  add_test(NAME ambi COMMAND bw_ambi_test)
+  add_executable(test_ambi test/ambi_test.c)
+  target_link_libraries(test_ambi PRIVATE bw_core)
+  add_test(NAME ambi COMMAND test_ambi)
 
-  add_executable(bw_measure_test test/measure_test.c)
-  target_link_libraries(bw_measure_test PRIVATE bw_core)
-  add_test(NAME measure COMMAND bw_measure_test)
+  add_executable(test_measure test/measure_test.c)
+  target_link_libraries(test_measure PRIVATE bw_core)
+  add_test(NAME measure COMMAND test_measure)
 
-  add_executable(bw_stream_test test/stream_test.c)
-  target_link_libraries(bw_stream_test PRIVATE bw_core)
-  add_test(NAME stream COMMAND bw_stream_test)
+  add_executable(test_stream test/stream_test.c)
+  target_link_libraries(test_stream PRIVATE bw_core)
+  add_test(NAME stream COMMAND test_stream)
 
-  add_executable(bw_calib_test test/calib_test.c)
-  target_link_libraries(bw_calib_test PRIVATE bw_core)
-  add_test(NAME calib COMMAND bw_calib_test)
+  add_executable(test_calib test/calib_test.c)
+  target_link_libraries(test_calib PRIVATE bw_core)
+  add_test(NAME calib COMMAND test_calib)
 
-  add_executable(bw_zylia_test test/zylia_test.c)
-  target_link_libraries(bw_zylia_test PRIVATE bw_core)
-  add_test(NAME zylia COMMAND bw_zylia_test)
+  add_executable(test_zylia test/zylia_test.c)
+  target_link_libraries(test_zylia PRIVATE bw_core)
+  add_test(NAME zylia COMMAND test_zylia)
 
   # Directional reflection-bed check (with-SDK only): compiles the steam objects in + links phonon,
   # drives steam_reflect_tap directly, asserts the reverb is directional. Needs the alignment patch.
   if(BW_STEAMAUDIO_FOUND)
-    add_executable(bw_reflect_test test/reflect_test.c src/steam_scene.c src/steam_reflect.c)
-    target_include_directories(bw_reflect_test PRIVATE src "${STEAMAUDIO_DIR}/include")
-    target_link_libraries(bw_reflect_test PRIVATE bw_core "${STEAMAUDIO_DIR}/lib/windows-x64/phonon.lib")
-    target_compile_definitions(bw_reflect_test PRIVATE BW_HAVE_STEAMAUDIO)
+    add_executable(test_reflect test/reflect_test.c src/steam_scene.c src/steam_reflect.c)
+    target_include_directories(test_reflect PRIVATE src "${STEAMAUDIO_DIR}/include")
+    target_link_libraries(test_reflect PRIVATE bw_core "${STEAMAUDIO_DIR}/lib/windows-x64/phonon.lib")
+    target_compile_definitions(test_reflect PRIVATE BW_HAVE_STEAMAUDIO)
     if(MSVC)   # steam_reflect.c's seqlock uses C11 <stdatomic.h>
       set_source_files_properties(src/steam_reflect.c PROPERTIES COMPILE_OPTIONS /experimental:c11atomics)
     endif()
     if(WIN32)
-      add_custom_command(TARGET bw_reflect_test POST_BUILD
+      add_custom_command(TARGET test_reflect POST_BUILD
         COMMAND ${CMAKE_COMMAND} -E copy_if_different
-                "${STEAMAUDIO_DIR}/lib/windows-x64/phonon.dll" $<TARGET_FILE_DIR:bw_reflect_test>)
+                "${STEAMAUDIO_DIR}/lib/windows-x64/phonon.dll" $<TARGET_FILE_DIR:test_reflect>)
     endif()
-    add_test(NAME reflect COMMAND bw_reflect_test)
+    add_test(NAME reflect COMMAND test_reflect)
 
-    add_executable(bw_bake_test test/bake_test.c src/steam_scene.c src/steam_reflect.c)
-    target_include_directories(bw_bake_test PRIVATE src "${STEAMAUDIO_DIR}/include")
-    target_link_libraries(bw_bake_test PRIVATE bw_core "${STEAMAUDIO_DIR}/lib/windows-x64/phonon.lib")
-    target_compile_definitions(bw_bake_test PRIVATE BW_HAVE_STEAMAUDIO)
+    add_executable(test_bake test/bake_test.c src/steam_scene.c src/steam_reflect.c)
+    target_include_directories(test_bake PRIVATE src "${STEAMAUDIO_DIR}/include")
+    target_link_libraries(test_bake PRIVATE bw_core "${STEAMAUDIO_DIR}/lib/windows-x64/phonon.lib")
+    target_compile_definitions(test_bake PRIVATE BW_HAVE_STEAMAUDIO)
     if(MSVC)
       set_source_files_properties(src/steam_reflect.c PROPERTIES COMPILE_OPTIONS /experimental:c11atomics)
     endif()
     if(WIN32)
-      add_custom_command(TARGET bw_bake_test POST_BUILD
+      add_custom_command(TARGET test_bake POST_BUILD
         COMMAND ${CMAKE_COMMAND} -E copy_if_different
-                "${STEAMAUDIO_DIR}/lib/windows-x64/phonon.dll" $<TARGET_FILE_DIR:bw_bake_test>)
+                "${STEAMAUDIO_DIR}/lib/windows-x64/phonon.dll" $<TARGET_FILE_DIR:test_bake>)
     endif()
-    add_test(NAME bake COMMAND bw_bake_test)
+    add_test(NAME bake COMMAND test_bake)
 
     # Pathing: routes a source around an occluding wall (visibility bake + pathing sim).
-    add_executable(bw_path_test test/path_test.c src/steam_scene.c src/steam_path.c)
-    target_include_directories(bw_path_test PRIVATE src "${STEAMAUDIO_DIR}/include")
-    target_link_libraries(bw_path_test PRIVATE bw_core "${STEAMAUDIO_DIR}/lib/windows-x64/phonon.lib")
-    target_compile_definitions(bw_path_test PRIVATE BW_HAVE_STEAMAUDIO)
+    add_executable(test_path test/path_test.c src/steam_scene.c src/steam_path.c)
+    target_include_directories(test_path PRIVATE src "${STEAMAUDIO_DIR}/include")
+    target_link_libraries(test_path PRIVATE bw_core "${STEAMAUDIO_DIR}/lib/windows-x64/phonon.lib")
+    target_compile_definitions(test_path PRIVATE BW_HAVE_STEAMAUDIO)
     if(WIN32)
-      add_custom_command(TARGET bw_path_test POST_BUILD
+      add_custom_command(TARGET test_path POST_BUILD
         COMMAND ${CMAKE_COMMAND} -E copy_if_different
-                "${STEAMAUDIO_DIR}/lib/windows-x64/phonon.dll" $<TARGET_FILE_DIR:bw_path_test>)
+                "${STEAMAUDIO_DIR}/lib/windows-x64/phonon.dll" $<TARGET_FILE_DIR:test_path>)
     endif()
-    add_test(NAME path COMMAND bw_path_test)
+    add_test(NAME path COMMAND test_path)
 
     # HRTF decode (production monitor): the 26->stereo Steam Audio decode runs + preserves laterality.
-    add_executable(bw_steam_decode_test test/steam_decode_test.c src/steam_decode.c)
-    target_include_directories(bw_steam_decode_test PRIVATE src "${STEAMAUDIO_DIR}/include")
-    target_link_libraries(bw_steam_decode_test PRIVATE bw_core "${STEAMAUDIO_DIR}/lib/windows-x64/phonon.lib")
-    target_compile_definitions(bw_steam_decode_test PRIVATE BW_HAVE_STEAMAUDIO)
+    add_executable(test_steam_decode test/steam_decode_test.c src/steam_decode.c)
+    target_include_directories(test_steam_decode PRIVATE src "${STEAMAUDIO_DIR}/include")
+    target_link_libraries(test_steam_decode PRIVATE bw_core "${STEAMAUDIO_DIR}/lib/windows-x64/phonon.lib")
+    target_compile_definitions(test_steam_decode PRIVATE BW_HAVE_STEAMAUDIO)
     if(WIN32)
-      add_custom_command(TARGET bw_steam_decode_test POST_BUILD
+      add_custom_command(TARGET test_steam_decode POST_BUILD
         COMMAND ${CMAKE_COMMAND} -E copy_if_different
-                "${STEAMAUDIO_DIR}/lib/windows-x64/phonon.dll" $<TARGET_FILE_DIR:bw_steam_decode_test>)
+                "${STEAMAUDIO_DIR}/lib/windows-x64/phonon.dll" $<TARGET_FILE_DIR:test_steam_decode>)
     endif()
-    add_test(NAME steam_decode COMMAND bw_steam_decode_test)
+    add_test(NAME steam_decode COMMAND test_steam_decode)
   endif()
 
   # Optional: AddressSanitizer build of the sound test (M3 unload-safety / UAF check).
-  option(BWAUDIO_ASAN "Build bw_sound_test with AddressSanitizer" OFF)
+  option(BWAUDIO_ASAN "Build test_sound with AddressSanitizer" OFF)
   if(BWAUDIO_ASAN AND MSVC)
-    target_compile_options(bw_sound_test PRIVATE /fsanitize=address)
-    target_link_options(bw_sound_test PRIVATE /INCREMENTAL:NO)
+    target_compile_options(test_sound PRIVATE /fsanitize=address)
+    target_link_options(test_sound PRIVATE /INCREMENTAL:NO)
   endif()
 endif()
 
@@ -401,9 +401,16 @@ if(BWAUDIO_BUILD_CALIBRATE)
     message(STATUS "bwaudio: calibration tool (simulate only; no ASIO SDK)")
   endif()
 
-  # ZM-1 hardware bring-up probe (input-only ASIO live meter). No simulate path — it IS the hardware test.
+  # ZM-1 hardware bring-up probe: input-only ASIO meter, plus a live DOA view (clap -> direction on the
+  # capsule sphere) when the playground gate provides raylib. The GUI lives in its own C file because
+  # raylib.h and windows.h cannot share a translation unit; --simulate drives the GUI hardware-free.
   add_executable(bw_zylia_probe examples/zylia_probe.cpp)
   target_link_libraries(bw_zylia_probe PRIVATE bw_core)
+  if(TARGET raylib)                                   # BWAUDIO_BUILD_PLAYGROUND=ON: add the DOA GUI.
+    target_sources(bw_zylia_probe PRIVATE examples/zylia_probe_gui.c)
+    target_compile_definitions(bw_zylia_probe PRIVATE BW_HAVE_RAYLIB)
+    target_link_libraries(bw_zylia_probe PRIVATE raylib)   # BEFORE user32: raylib defines CloseWindow too,
+  endif()                                                  # and the GUI's call must resolve against raylib
   if(BWAUDIO_WITH_ASIO)
     target_sources(bw_zylia_probe PRIVATE
       ${ASIO_SDK_DIR}/common/asio.cpp

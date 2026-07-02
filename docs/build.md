@@ -12,7 +12,7 @@ Build system: CMake + MSVC (Visual Studio 2022 toolset). The core is C (C11 with
 `/experimental:c11atomics`; CMake scopes that flag to `src/rt.c` (the only file that uses
 them).
 
-**Race-checking the rings.** The `bw_rt_test` target drives the SPSC ring/commit logic
+**Race-checking the rings.** The `test_rt` target drives the SPSC ring/commit logic
 off the real-time path (single-threaded, deterministic) and is what runs under `ctest` on
 MSVC. The full ThreadSanitizer/Helgrind pass the roadmap calls for needs a **Clang or
 Linux** build (MSVC ships no TSan, and Helgrind is Valgrind/Linux): build `rt.c` + a

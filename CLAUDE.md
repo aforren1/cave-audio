@@ -73,7 +73,8 @@ src/
   steam_reflect.h/.c   reflection bed: IPLSimulator reflections -> ambisonic IR -> SH->26 bus tap (with-SDK). [materials]
   steam_path.h/.c      sound pathing: indirect routing -> per-voice shCoeffs -> SH-encode -> bus tap (with-SDK). [materials]
   natnet.c             OptiTrack pose ingest (off-wire, see docs/build.md). [M6]
-test/                  bw_smoke (3 profiles), bw_audio_smoke, bw_rt_test, bw_sound_test, bw_dsp_test, bw_monitor_test.
+test/                  ctest suite; targets are prefixed test_* (test_smoke, test_rt, test_dsp, ...) so
+                       the built tools (bw_*) and the tests sort apart in the bin dir.
 bindings/
   unity/               P/Invoke + BwAudio/BwEmitter (see docs/integration.md).
   unreal/              module + component.
@@ -92,10 +93,10 @@ Windows sink) — do not bake ASIO assumptions outside `asio_sink.c`.
 ```
 cmake -S . -B build -G "Visual Studio 17 2022" -A x64
 cmake --build build --config RelWithDebInfo
-ctest --test-dir build -C RelWithDebInfo      # runs the bw_smoke lifecycle check
+ctest --test-dir build -C RelWithDebInfo      # runs the full test suite (test_* targets)
 ```
 
-**Current state (M6 + occlusion):** builds `bwaudio.dll` + the test suite (fifteen ctests with the Steam
+**Current state (M6 + occlusion):** builds `bwaudio.dll` + the test suite (sixteen ctests with the Steam
 Audio SDK, twelve without). `rt.c` is the concurrency spine
 (two SPSC rings, voice + sound tables, commit snapshot, generation handles) + retire-ack;
 the whole `bw_*` API forwards to it. `sound.c` decodes wav (dr_wav) and `mix_voice` plays
@@ -110,8 +111,11 @@ any driver buffer size works); `bw_audio_backend()` reports the device actually 
 (`pose.h`); with `track_internal` the audio thread samples the freshest head pose at block
 time** (`rt_set_tracker`), configured via `BWAUDIO_NATNET_*` env (see docs/api.md). An
 interactive **raylib playground** (`examples/playground.c`, opt-in `-DBWAUDIO_BUILD_PLAYGROUND=ON`)
-auditions binaural by ear across five feature **scenes** (TAB): localization (with a SPACE auto-move
-sweep), occlusion+materials, directivity, a channel-walk speaker check, and a reverb-bed room (which
+auditions binaural by ear across six feature **scenes** (TAB): localization (with a SPACE auto-move
+sweep), occlusion+materials, directivity, a channel-walk speaker check, a **blind A/B/X** harness
+(X is secretly A or B over one live knob — dual-band, DBAP vs SPCAP/VBAP, spread, air absorption —
+answer over N trials and a one-sided binomial p-value says whether the difference is genuinely
+audible, not just "sounds different to me"), and a reverb-bed room (which
 rebuilds the engine on entry/exit, since the bed + room geometry are load-time). **`bw_test_signal(channel, kind, gain)`** drives one
 raw output channel with a 660 Hz sine/noise injected after align (`rt.c`) — a speaker-check / wiring
 tool, not a spatial path. The **production Steam Audio HRTF decode** is built + smoke-tested:
@@ -120,7 +124,7 @@ tool, not a spatial path. The **production Steam Audio HRTF decode** is built + 
 third_party/README.md), with the simple-pan monitor as the no-SDK fallback. The `steam_decode` test
 drives the 26→stereo decode and asserts gross laterality (right→right ear, left→left, 180° flips) —
 which caught a real bug: the encode's real-SH m<0 channels (ACN 1,4,5,9,10,11) had phonon's opposite
-sign, inverting left/right; `bw_ambi_test` only checked m≥0 so it was invisible until the decode ran.
+sign, inverting left/right; `test_ambi` only checked m≥0 so it was invisible until the decode ran.
 HRTF *quality* (timbre/externalization/front-back) is still the by-ear check. **Materials: occlusion +
 per-band transmission EQ + source directivity are implemented** (`steam_scene.c`, same gate): a third
 "simulation thread" owns an `IPLScene` + mesh + `IPLSimulator`, ray-traces volumetric occlusion +
@@ -193,8 +197,13 @@ sub-degree — `zylia_doa`), and with the known latency a Gauss-Newton refine ag
 wavefront gives the full position (`zylia_localize`). Distance is latency-limited (the array is too small to
 self-calibrate latency at metres). Spatial room capture reuses the same sweep windowed per early reflection →
 `zylia_doa` → which surface throws it. The 19-ch ASIO capture + the datasheet capsule geometry are the
-rig-bound shell; `bw_zylia_probe` (opt-in `-DBWAUDIO_BUILD_CALIBRATE=ON`) is an input-only ASIO live
-per-channel meter to confirm the ZM-1 streams + maps all 19 capsules the moment it's plugged in.
+rig-bound shell; `bw_zylia_probe` (opt-in `-DBWAUDIO_BUILD_CALIBRATE=ON`) is the input-only ASIO
+bring-up tool: a live per-channel meter (`--console`), and — when the playground gate also provides
+raylib — a **live DOA view**: the audio callback watches for a transient (a clap), snapshots all 19
+channels, and `zylia_tdoa` (onset + windowed cross-correlation with sub-sample peak, unit-tested in
+the `zylia` test) feeds `zylia_doa` so a dot appears on the capsule sphere where the clap came from —
+verifying capsule mapping AND the geometry table in seconds; `--simulate` drives the same
+snapshot→tdoa→doa→draw pipeline with synthesized claps (truth ring drawn), hardware-free.
 **Per-speaker correction filters** (`--eq`) are the "inverse EQ" upgrade to the scalar
 trims: `measure_correction` gates the IR to the direct sound (before the first reflection) and inverts that
 magnitude into a minimum-phase FIR (`calib_eq` → the layout `eq` array → applied per channel in `align.c`,
@@ -204,7 +213,7 @@ Remaining: the by-ear headphone check; and live Motive verification of M6 (parse
 outside `asio_sink.cpp`, and do not link the NatNet SDK (proprietary; reference only — GPLv3).
 The atomics in `rt.c` need `/experimental:c11atomics` on MSVC (wired in CMake); `pose.h` uses
 Interlocked intrinsics instead, so `natnet.c`/tests need no extra flag. `-DBWAUDIO_ASAN=ON`
-builds `bw_sound_test` under ASan.
+builds `test_sound` under ASan.
 
 ## What NOT to do
 

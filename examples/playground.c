@@ -20,7 +20,11 @@
  *   4 Channel walk      — bw_test_signal drives ONE raw output channel (speaker-check tool). Step
  *                         channels with LEFT/RIGHT (SPACE auto-walks); in binaural each channel is
  *                         HRTF'd as its virtual speaker, so the tone circles your head as you walk.
- *   5 Reverb bed        — a static shoebox room + the Steam Audio hybrid reverb bed. Move the source
+ *   5 Blind A/B/X       — double-blind self test over live engine knobs (dual-band, DBAP vs SPCAP /
+ *                         VBAP, spread, air absorption): X is secretly A or B, listen with Z/X/C,
+ *                         answer LEFT/RIGHT, and the running binomial p-value says whether the
+ *                         difference is genuinely audible (p < 0.05) or you're guessing.
+ *   6 Reverb bed        — a static shoebox room + the Steam Audio hybrid reverb bed. Move the source
  *                         and the room reverb follows; G dry/wet A-B, [ ] wet level, V distance->wet
  *                         (near dry / far wet), B A/Bs the bed
  *                         DECODER (sampling vs AllRAD — load-time, so it rebuilds the engine; differs
@@ -47,6 +51,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #define SR   48000u
 #define NSPK 26
@@ -415,7 +420,106 @@ static void chan_hud(int y) {
              12, y + 22, 15, (Color){ 200, 200, 210, 255 });
 }
 
-/* ============================= Scene 5: Reverb bed (static room) ============================= */
+/* ============================= Scene 5: Blind A/B/X ============================= */
+/* Double-blind self test: A and B are two settings of ONE engine knob, X is randomly one of them.
+ * Listen to all three freely (every switch is live + click-free: ramped gains / atomic toggles),
+ * answer with LEFT ("X is A") or RIGHT ("X is B"), and the one-sided binomial tail over your trials
+ * says whether you can ACTUALLY hear the difference (p < 0.05) or you're guessing — it turns
+ * "sounds different to me" into a measurement. These are exactly the by-ear judgments the automated
+ * tests can't make: dual-band panning, panner choice, source spread, air absorption. */
+typedef struct { const char* name; const char* a; const char* b; void (*apply)(int v); } AbxCmp;
+static void abx_ap_dual (int v) { bw_set_dual_band(e, v); }
+static void abx_ap_spcap(int v) { bw_set_panner(e, v ? BW_PAN_SPCAP : BW_PAN_DBAP); }
+static void abx_ap_vbap (int v) { bw_set_panner(e, v ? BW_PAN_VBAP  : BW_PAN_DBAP); }
+static void abx_ap_sprd (int v) { bw_source_set_spread(e, src, v ? 0.6f : 0.0f); }
+static void abx_ap_air  (int v) { bw_source_set_air_absorption(e, src, v); }
+static const AbxCmp abx_cmps[] = {
+    { "dual-band panning",     "single-band (power)", "dual-band (LF amplitude)", abx_ap_dual  },
+    { "panner: DBAP vs SPCAP", "DBAP",                "SPCAP",                    abx_ap_spcap },
+    { "panner: DBAP vs VBAP",  "DBAP",                "VBAP",                     abx_ap_vbap  },
+    { "source spread",         "point source",        "spread 60%",               abx_ap_sprd  },
+    { "air absorption",        "off",                 "on (distance LPF)",        abx_ap_air   },
+};
+enum { NABX = sizeof abx_cmps / sizeof abx_cmps[0] };
+static int   abx_cmp, abx_listen = 2, abx_x;     /* listening to 0=A 1=B 2=X; abx_x = X's hidden identity */
+static int   abx_trials, abx_correct, abx_last_x;
+static float abx_flash_t; static int abx_flash_ok;
+static int   abx_orbit; static float abx_orbit_t;
+
+static double abx_pvalue(int n, int k) {         /* one-sided binomial tail P(correct >= k | n, 1/2) */
+    double p = 0.0;
+    for (int i = k; i <= n; ++i)
+        p += exp(lgamma(n + 1.0) - lgamma(i + 1.0) - lgamma(n - i + 1.0) - n * log(2.0));
+    return p > 1.0 ? 1.0 : p;
+}
+/* every knob back to baseline, then the tested knob to whichever variant we're listening to — so
+ * switching COMPARISONS can't leave the previous knob stuck on its B setting. */
+static void abx_apply_listen(void) {
+    bw_set_dual_band(e, false);
+    bw_set_panner(e, BW_PAN_DBAP);
+    bw_source_set_spread(e, src, 0.0f);
+    bw_source_set_air_absorption(e, src, false);
+    abx_cmps[abx_cmp].apply(abx_listen == 2 ? abx_x : abx_listen);
+}
+static void abx_new_trial(void) { abx_x = GetRandomValue(0, 1); abx_listen = 2; abx_apply_listen(); }
+static void abx_reset(void)     { abx_trials = abx_correct = 0; abx_flash_t = 0.0f; abx_new_trial(); }
+static void abx_enter(void) {
+    bw_source_set_gain(e, src, SRC_GAIN);
+    abx_orbit = 1; abx_orbit_t = 0.0f;           /* default: slow orbit — motion exposes panner differences */
+    abx_new_trial();                             /* keep the tally across visits; only X is redrawn */
+}
+static void abx_update(float dt) {
+    if (IsKeyPressed(KEY_Z)) { abx_listen = 0; abx_apply_listen(); }
+    if (IsKeyPressed(KEY_X)) { abx_listen = 1; abx_apply_listen(); }
+    if (IsKeyPressed(KEY_C)) { abx_listen = 2; abx_apply_listen(); }
+    if (IsKeyPressed(KEY_LEFT) || IsKeyPressed(KEY_RIGHT)) {
+        int guess = IsKeyPressed(KEY_RIGHT) ? 1 : 0;
+        abx_last_x = abx_x;
+        abx_flash_ok = (guess == abx_x); abx_correct += abx_flash_ok; ++abx_trials; abx_flash_t = 1.6f;
+        abx_new_trial();                         /* reveal + immediately deal the next X */
+    }
+    if (IsKeyPressed(KEY_G)) { abx_cmp = (abx_cmp + 1) % NABX; abx_reset(); }   /* new knob -> fresh tally */
+    if (IsKeyPressed(KEY_V)) abx_reset();
+    if (IsKeyPressed(KEY_SPACE)) abx_orbit = !abx_orbit;
+    if (abx_orbit) {                             /* slow orbit + gentle bob; identical for A/B/X, so it never cues */
+        abx_orbit_t += dt;
+        float az = 0.45f * abx_orbit_t;
+        source_pos = (Vector3){ 2.2f * cosf(az), 0.5f * sinf(0.31f * abx_orbit_t), 2.2f * sinf(az) };
+    }
+    if (abx_flash_t > 0.0f) { abx_flash_t -= dt; if (abx_flash_t < 0.0f) abx_flash_t = 0.0f; }
+    bw_source_set_pos(e, src, source_pos.x, source_pos.y, source_pos.z);
+    bw_source_set_gain(e, src, SRC_GAIN);
+}
+static void abx_draw3d(void) {
+    DrawLine3D((Vector3){ 0, 0, 0 }, source_pos, (Color){ 90, 220, 90, 200 });
+    DrawSphere(source_pos, 0.18f, RED);
+}
+static void abx_hud(int y) {
+    const AbxCmp* cm = &abx_cmps[abx_cmp];
+    ui_text(TextFormat("[G] compare: %s   (A = %s, B = %s)   [SPACE] orbit %s",
+                        cm->name, cm->a, cm->b, abx_orbit ? "ON" : "off"),
+             12, y, 15, (Color){ 110, 200, 255, 255 });
+    ui_text(TextFormat("listen:  [Z] A %s   [X] B %s   [C] X %s      answer:  [LEFT] X is A   [RIGHT] X is B   [V] reset",
+                        abx_listen == 0 ? "<--" : "   ", abx_listen == 1 ? "<--" : "   ", abx_listen == 2 ? "<--" : "   "),
+             12, y + 22, 15, (Color){ 235, 235, 120, 255 });
+    if (abx_trials > 0) {
+        double p = abx_pvalue(abx_trials, abx_correct);
+        const char* verdict = (abx_trials < 6)  ? "keep going (need ~6+ trials)"
+                            : (p < 0.05)        ? "DISTINGUISHABLE - you can hear it"
+                                                : "not distinguishable yet (guessing?)";
+        ui_text(TextFormat("score %d/%d   p = %.3f   %s%s", abx_correct, abx_trials, p, verdict,
+                            abx_flash_t > 0.0f ? TextFormat("      last: %s (X was %s)",
+                                                            abx_flash_ok ? "CORRECT" : "wrong",
+                                                            abx_last_x ? "B" : "A") : ""),
+                 12, y + 44, 15, (abx_flash_t > 0.0f) ? (abx_flash_ok ? (Color){ 120, 235, 130, 255 } : (Color){ 245, 140, 140, 255 })
+                                                      : (Color){ 200, 200, 210, 255 });
+    } else {
+        ui_text("listen to A, B, X (switching is seamless - that's the point), then answer. 1-4 picks the signal.",
+                 12, y + 44, 15, (Color){ 200, 200, 210, 255 });
+    }
+}
+
+/* ============================= Scene 6: Reverb bed (static room) ============================= */
 /* The hybrid reverb bed needs reflections configured + the room geometry set BEFORE bw_start (the
  * scene locks once the bed runs), so this scene runs on a SEPARATE engine config — build_engine()
  * rebuilds the engine when crossing this boundary (see switch_scene). */
@@ -478,6 +582,7 @@ static const Scene scenes[] = {
     { "Occlusion & Materials",   occ_enter,  occ_update,  occ_draw3d,  occ_hud  },
     { "Directivity",             dir_enter,  dir_update,  dir_draw3d,  dir_hud  },
     { "Channel walk (speaker check)", chan_enter, chan_update, chan_draw3d, chan_hud },
+    { "Blind A/B/X (hear it, prove it)", abx_enter, abx_update, abx_draw3d, abx_hud },
     { "Reverb bed (static room)", rev_enter,  rev_update,  rev_draw3d,  rev_hud  },
 };
 enum { NSCENE = sizeof scenes / sizeof scenes[0], SCENE_REVERB = NSCENE - 1 };
@@ -537,6 +642,7 @@ static void switch_scene(int idx) {
     bw_source_set_air_absorption(e, src, false);
     bw_source_set_spread(e, src, 0.0f);
     bw_set_dual_band(e, false);
+    bw_set_panner(e, BW_PAN_DBAP);                               /* the ABX scene may leave SPCAP/VBAP selected */
     source_yaw = 0.0f;
     bw_source_set_gain(e, src, SRC_GAIN);
     cur_scene = idx;
@@ -563,6 +669,7 @@ int main(int argc, char** argv) {
 
     SetConfigFlags(FLAG_WINDOW_HIGHDPI | FLAG_MSAA_4X_HINT);   /* native pixel density + smooth 3D edges */
     InitWindow(1000, 700, "bwaudio - binaural playground");
+    SetRandomSeed((unsigned int)time(NULL));                   /* the ABX scene's X draw must not repeat run-to-run */
     ui_text_init();                                            /* crisp TTF HUD (see ui_text.h) */
     SetTargetFPS(60);
     cam = (Camera3D){ .target = { 0, 0.5f, 0 }, .up = { 0, 1, 0 }, .fovy = 55, .projection = CAMERA_PERSPECTIVE };

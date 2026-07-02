@@ -3,7 +3,7 @@
 How the 26-speaker array is surveyed, trimmed, and characterized at install time, and how those
 numbers reach the engine. The tool is `bw_calibrate` (`examples/calibrate.cpp`, opt-in
 `-DBWAUDIO_BUILD_CALIBRATE=ON`); the measurement DSP is `measure.c`, the solve + JSON writeback is
-`calib.c`. All of it is unit-tested off-hardware (`bw_measure_test`, `bw_calib_test`); the ASIO
+`calib.c`. All of it is unit-tested off-hardware (`test_measure`, `test_calib`); the ASIO
 full-duplex capture is the only part that needs the rig.
 
 ## The two layout tools
@@ -115,10 +115,22 @@ only that table must match the real array).
 **Bring-up probe.** Before any of that, `bw_zylia_probe` (built with `-DBWAUDIO_BUILD_CALIBRATE=ON`)
 is the "is it talking?" check you can run the moment the ZM-1 is plugged in — input-only, no rig
 needed. `bw_zylia_probe --list` enumerates the ASIO drivers + their channel counts (look for the
-Zylia driver, or ASIO4ALL over its USB-audio interface, showing `in=19`); `bw_zylia_probe` opens it
-and prints a live per-channel RMS meter, so you can confirm all 19 capsules stream and learn which
-channel is which capsule by tapping each and watching its channel jump. A channel stuck at digital
-silence is dead or unmapped. It auto-picks a driver whose name contains "zylia", else `--driver` it.
+Zylia driver, or ASIO4ALL over its USB-audio interface, showing `in=19`). It auto-picks a driver whose
+name contains "zylia", else `--driver` it. Two views:
+
+- `--console`: a live per-channel RMS meter — confirm all 19 capsules stream, and learn which channel
+  is which capsule by tapping each and watching its channel jump. A channel stuck at digital silence
+  is dead or unmapped.
+- **Live DOA view** (default when built with `-DBWAUDIO_BUILD_PLAYGROUND=ON` too, which supplies
+  raylib): the audio callback watches for a transient; CLAP anywhere around the array and a dot
+  appears on the capsule sphere where the clap came from (`zylia_tdoa`: onset + windowed
+  cross-correlation against the strongest capsule with sub-sample parabolic peaks → `zylia_doa`).
+  This verifies the capsule MAPPING and the GEOMETRY table in one gesture — swapped channels or a
+  wrong geometry row put the dot somewhere absurd, and you find out in seconds instead of during a
+  calibration session. `--simulate` runs the identical snapshot→tdoa→doa→draw pipeline on
+  synthesized claps from a walking direction (drawn as a truth ring the dot must land in) — the
+  hardware-free check of everything but the ASIO capture; the math itself is unit-tested in the
+  `zylia` ctest.
 
 ## What feeds the engine
 

@@ -70,6 +70,57 @@ int main(void) {
         CHECK(dot > 0.99999, "DOA unchanged by a constant latency shift");
     }
 
+    /* live-transient path: a clap-like Gaussian click, sampled at each capsule's exact (fractional)
+     * arrival time + noise -> zylia_tdoa recovers the arrival differences -> zylia_doa the direction.
+     * This is the whole live-DOA pipeline (zylia_probe GUI) minus the ASIO capture. */
+    {
+        const double FS = 48000.0, SIGMA = 1.0e-4;      /* ~100 us wide: broadband, ~5 samples at 48 kHz */
+        enum { N = 4096 };
+        static float buf[ZYLIA_MICS][N];
+        const float* ptr[ZYLIA_MICS];
+        double arr_true[ZYLIA_MICS], arr_est[ZYLIA_MICS];
+        unsigned int rng = 777u;
+
+        struct { double pos[3]; const char* name; } tcases[] = {
+            {{  2.0,  1.4,  0.5 }, "clap right"},
+            {{ -1.0,  0.2, -2.5 }, "clap front-left"},
+            {{  0.1,  3.5, -0.4 }, "clap overhead"},
+        };
+        for (int t = 0; t < 3; ++t) {
+            synth(center, tcases[t].pos, 0.0021, C, arr_true);          /* real capture has latency: DOA won't care */
+            for (int chn = 0; chn < ZYLIA_MICS; ++chn) {
+                double t0 = 0.030 + arr_true[chn];                       /* click lands ~1440 samples in */
+                for (int i = 0; i < N; ++i) {
+                    double td = (double)i / FS - t0;
+                    double s  = exp(-0.5 * (td / SIGMA) * (td / SIGMA)); /* Gaussian click at the exact fractional time */
+                    rng = rng * 1664525u + 1013904223u;
+                    double nz = ((double)(int)(rng >> 9) / (double)(1 << 22) - 1.0) * 1e-3;   /* ~-60 dB noise */
+                    buf[chn][i] = (float)(s + nz);
+                }
+                ptr[chn] = buf[chn];
+            }
+            int ok = zylia_tdoa(ptr, N, FS, 32, arr_est);
+            float doa[3];
+            int ok2 = ok && zylia_doa(arr_est, doa);
+            double tx = tcases[t].pos[0]-center[0], ty = tcases[t].pos[1]-center[1], tz = tcases[t].pos[2]-center[2];
+            double td = sqrt(tx*tx + ty*ty + tz*tz); tx/=td; ty/=td; tz/=td;
+            double dot = ok2 ? doa[0]*tx + doa[1]*ty + doa[2]*tz : -1.0;
+            double deg = acos(fmax(-1.0, fmin(1.0, dot))) * 180.0 / 3.14159265358979;
+            printf("[%-14s] tdoa->doa err=%.3f deg\n", tcases[t].name, deg);
+            CHECK(ok2 && deg < 2.0, "live-transient TDOA -> DOA within 2 deg");
+        }
+
+        /* no transient -> refuse (steady noise must not produce a phantom direction) */
+        for (int chn = 0; chn < ZYLIA_MICS; ++chn) {
+            for (int i = 0; i < N; ++i) {
+                rng = rng * 1664525u + 1013904223u;
+                buf[chn][i] = (float)(((double)(int)(rng >> 9) / (double)(1 << 22) - 1.0) * 0.1);
+            }
+            ptr[chn] = buf[chn];
+        }
+        CHECK(!zylia_tdoa(ptr, N, FS, 32, arr_est), "steady noise (no transient) is rejected");
+    }
+
     printf("%s\n", fails ? "FAIL: zylia localization" : "PASS: zylia single-position localization");
     return fails ? 1 : 0;
 }

@@ -37,6 +37,18 @@ void zylia_geometry(float dirs[ZYLIA_MICS][3], float* radius_m);
  * close range that zylia_localize's refined position removes. */
 int  zylia_doa(const double arrival_s[ZYLIA_MICS], float dir_out[3]);
 
+/* Arrival times from a LIVE 19-channel transient snapshot (a clap / hand-click), for feeding
+ * zylia_doa without a sweep: finds the onset on the strongest channel, windows every channel
+ * around it (tight, so early room reflections stay out), cross-correlates each against that
+ * reference over lags within +-max_lag samples, and refines the peak to sub-sample by parabolic
+ * interpolation. The array is ~10 cm, so the true inter-capsule lag is <= ~14 samples at 48 kHz —
+ * pass max_lag ~32 for margin. x = 19 planar channel pointers, n samples each (sample-locked,
+ * which the ZM-1's shared ADC guarantees). arrival_s comes back RELATIVE (reference channel = 0);
+ * a common offset is meaningless — zylia_doa uses differences only. Returns 1 on success, 0 if
+ * there is no usable transient (peak < 6x the channel RMS) or the window doesn't fit. */
+int  zylia_tdoa(const float* const x[ZYLIA_MICS], uint32_t n, double fs, uint32_t max_lag,
+                double arrival_s[ZYLIA_MICS]);
+
 /* Full single-position localization: Gauss-Newton refine the source position against the exact
  * spherical-wavefront model. center = the array centre in room coords (m); latency_s = the known system
  * latency (s); c = speed of sound (m/s). pos_out = source position (m); dist_out (optional) = range

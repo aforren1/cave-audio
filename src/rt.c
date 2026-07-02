@@ -659,7 +659,7 @@ static void mix_voice(RtCore* c, Voice* v, uint16_t idx, float* bus, uint32_t n,
          * delay, BW_DOPPLER_TAU each). Position is committed per video frame (~60 Hz) but we render many
          * samples per frame, so the raw target is a staircase; its fundamental (the commit rate) would
          * FM-modulate the carrier into audible sidebands (worse at HF). The cutoff (~5 Hz, BW_DOPPLER_TAU
-         * = 32 ms) was set with test/bw_doppler_fft: it keeps the commit-rate sidebands below ~ -45 dB at
+         * = 32 ms) was set with test_doppler_fft: it keeps the commit-rate sidebands below ~ -45 dB at
          * 1 kHz / -38 dB at 4 kHz. Low-passing the delay preserves the ramp's SLOPE, so steady-motion
          * pitch is exact; it only offsets the delay value by ~v*group_delay (sub-millisecond), and
          * rounds pitch transitions over the group delay (natural). A plain velocity tracker is worse

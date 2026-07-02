@@ -9,7 +9,7 @@ engines. Don't start with the engine bindings.
 - `include/bwaudio.h` compiles; stub `engine.c` returns a valid opaque handle.
 - **Done when:** library builds and links on the target Windows toolchain.
 - **Status: ✅ done** — `CMakeLists.txt` builds `bwaudio.dll` from a stub `src/engine.c`
-  and a passing `bw_smoke` lifecycle test (MSVC 19.4x / VS2022). `third_party/` is wired
+  and a passing `test_smoke` lifecycle test (MSVC 19.4x / VS2022). `third_party/` is wired
   in CMake but vendoring is deferred until M1 actually needs ASIO.
 
 ## M1 — ASIO sink, silence
@@ -22,7 +22,7 @@ engines. Don't start with the engine bindings.
   and **compiles, links, and runs** (driver load → init → channel-count check → graceful
   fallback verified on real, non-DVS hardware). A `null_sink.c` offline backend runs the
   same render loop with no hardware and **verifies the stable-callback + monotonic-
-  timestamp** criterion (`bw_audio_smoke`). The remaining piece — *26 active channels in
+  timestamp** criterion (`test_audio_sink`). The remaining piece — *26 active channels in
   DVS with no dropouts* — needs a Dante Virtual Soundcard endpoint to confirm on site.
 
 ## M2 — Concurrency spine
@@ -35,7 +35,7 @@ engines. Don't start with the engine bindings.
 - **Status: ~done.** `src/rt.c` (behind `src/rt.h`) implements the two SPSC rings,
   voice table, `drain_commands`, the staging→active commit snapshot, generation-counted
   handles + free-list, and the event ring; the full `bw_source_*` / `bw_set_listener_pose`
-  / `bw_commit` API forwards to it. `bw_rt_test` drives the consumer off the RT path and
+  / `bw_commit` API forwards to it. `test_rt` drives the consumer off the RT path and
   verifies the commit snapshot, generation stale-drop, play/stop, gain scaling, and
   position routing. The mixer is a **placeholder** — a 440 Hz test tone routed to one
   position-derived channel with a per-block gain ramp; M3 swaps in wav playback
@@ -55,7 +55,7 @@ engines. Don't start with the engine bindings.
   → audio detaches voices + acks `EVT_SOUND_RETIRED` → control frees the buffer).
   `mix_voice` reads `sound->pcm` at the cursor (loop/end), and a oneshot recycles its
   transient voice via `EVT_VOICE_ENDED`. Routing is still the M2 placeholder until M4.
-  `bw_sound_test` verifies multi-voice mixing, natural end, oneshot recycle, and
+  `test_sound` verifies multi-voice mixing, natural end, oneshot recycle, and
   unload-while-playing — and **passes clean under AddressSanitizer** (`-DBWAUDIO_ASAN=ON`),
   discharging the no-use-after-free criterion.
 
@@ -71,7 +71,7 @@ engines. Don't start with the engine bindings.
   given; `dbap.c` is the listener-relative, constant-power gain solve (see
   spatialization.md); `align.c` is the per-speaker gain trim + delay-line output stage.
   `rt.c` calls `dbap_gains` in the dirty-gated `compute_gains` and runs `align_process`
-  after the mix; the engine loads the layout at `bw_create`. `bw_dsp_test` verifies it:
+  after the mix; the engine loads the layout at `bw_create`. `test_dsp` verifies it:
   a source at each speaker localizes to that channel, the solve is constant-power, two
   speakers split, moving the listener shifts the distribution, and align applies gain+delay;
   it also round-trips the committed `examples/cave_layout.json`. The DBAP exponents/r/curve
@@ -89,19 +89,19 @@ engines. Don't start with the engine bindings.
   W/X ambisonic encode + two cardioid decoders). `engine.c` wires all three profiles:
   `cave` (26→device), `binaural` (26→memory→2-ch device via the monitor), and `both`
   (a 26-ch array sink + a 2-ch monitor sink sharing a double-buffer). The listener
-  quaternion drives the monitor; the array render ignores it. `bw_monitor_test` verifies
+  quaternion drives the monitor; the array render ignores it. `test_monitor` verifies
   L/R directionality, median balance, and a 180° head turn flipping the image;
-  `bw_smoke` runs all three profile lifecycles end-to-end (offline sink). **Production HRTF
+  `test_smoke` runs all three profile lifecycles end-to-end (offline sink). **Production HRTF
   decode — in progress, two stages:** (1) **stage 1 done** — the 26→16-ch 3rd-order ambisonic
-  **encode** (`ambisonics.c`, ACN/SN3D real SH), unit-tested (`bw_ambi_test`); it is the
+  **encode** (`ambisonics.c`, ACN/SN3D real SH), unit-tested (`test_ambi`); it is the
   SDK-independent front half of the production monitor. (2) **stage 2 BUILT + RUNNING** —
   `steam_decode.c` is the **ambisonics→binaural HRTF decode via Steam Audio**
   (`iplAmbisonicsDecodeEffect`), wired into `engine.c` for binaural + both with the simple-pan
   monitor as the fallback (`BW_HAVE_STEAMAUDIO`; CMake auto-detects `third_party/steamaudio/`).
   **phonon was built from the vendored submodule** (minimal core; see third_party/README.md) and
-  `steam_decode.c` compiles + runs: `bw_smoke` drives the real `iplContextCreate → iplHRTFCreate →
+  `steam_decode.c` compiles + runs: `test_smoke` drives the real `iplContextCreate → iplHRTFCreate →
   iplAmbisonicsDecodeEffectApply` path each block. The ambisonic CONVENTION is RESOLVED +
-  unit-tested (`bw_ambi_test` vs phonon's hardcoded SH constants): phonon decodes orthonormal/N3D
+  unit-tested (`test_ambi` vs phonon's hardcoded SH constants): phonon decodes orthonormal/N3D
   real SH, so the SN3D encode is scaled by `ambi_phonon_scale = sqrt(2l+1)/sqrt(4pi)`; axes +
   orientation match phonon as written. phonon's effect frameSize is fixed at create, so the decoder
   is built at the sink's actual block size (`bw_sink_block_size`). Remaining: the **by-ear** check
@@ -125,7 +125,7 @@ engines. Don't start with the engine bindings.
   `rt_render` samples the freshest pose at block time — overriding the committed listener and
   dirtying every voice on a move (lower latency than routing pose through the command ring). The
   consumer auto-negotiates the bitstream version via a `NAT_CONNECT` handshake (env-overridable;
-  config is via `BWAUDIO_NATNET_*`, see `api.md`). `bw_natnet_test` verifies the parser (v3 and
+  config is via `BWAUDIO_NATNET_*`, see `api.md`). `test_natnet` verifies the parser (v3 and
   v4.1, rigid-body select, the tracking-valid flag, truncation safety) and the seqlock roundtrip;
   the open→receive→join socket lifecycle is verified live (UDP socket + multicast join, clean
   thread join on close). **Remaining:** confirm against a real Motive server — actual pose

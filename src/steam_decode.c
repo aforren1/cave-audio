@@ -10,14 +10,14 @@
  *  - CONVENTION 1 (axes): room_to_ambi_dir matches phonon's net AmbiX assignment (sh.cpp
  *    convertedDirection: front=-z, left=-x, up=+y). ACN ordering matches.
  *  - CONVENTION 2 (normalization): phonon decodes orthonormal real SH (N3D/sqrt(4pi)); the SN3D
- *    encode is scaled by ambi_phonon_scale = sqrt(2l+1)/sqrt(4pi), VERIFIED in bw_ambi_test against
+ *    encode is scaled by ambi_phonon_scale = sqrt(2l+1)/sqrt(4pi), VERIFIED in test_ambi against
  *    phonon's hardcoded SH constants. (Deriving the matrix from iplAmbisonicsEncodeEffect is an
  *    equivalent alternative.)
  *  - CONVENTION 3 (orientation): phonon is right-handed x=right/y=up/-z=ahead = the room frame.
  *  - CONVENTION 2b (m<0 sign): the real-SH m<0 channels (ACN 1,4,5,9,10,11) needed NEGATING to match
- *    phonon's decode (sh_encode below). bw_ambi_test only checked m>=0 (W, front, the zonal/cosine l=2
+ *    phonon's decode (sh_encode below). test_ambi only checked m>=0 (W, front, the zonal/cosine l=2
  *    terms), so this was invisible until the HRTF decode was exercised — it inverted left/right.
- *    bw_steam_decode_test now drives the decode and confirms right->right ear, left->left, 180-flip.
+ *    test_steam_decode now drives the decode and confirms right->right ear, left->left, 180-flip.
  *  Still pending: HRTF *quality* (timbre / externalization / front-back / elevation) is unverified by
  *  ear — the smoke test covers gross laterality only.
  */
@@ -54,7 +54,7 @@ static void room_to_ambi_dir(const float r[3], float a[3]) {
 /* CONVENTION 2 — normalization. RESOLVED from the phonon source: iplAmbisonicsDecodeEffect takes no
  * ambisonics-type param and decodes orthonormal real SH (= N3D/sqrt(4pi); core/.../sh/spherical_harmonics.cc,
  * audio_buffer.h "N3D is used internally for everything"). Scale the SN3D encode per ACN channel by
- * ambi_phonon_scale = sqrt(2l+1)/sqrt(4pi); bw_ambi_test verifies the product against phonon's
+ * ambi_phonon_scale = sqrt(2l+1)/sqrt(4pi); test_ambi verifies the product against phonon's
  * hardcoded SH constants. (Deriving the matrix from iplAmbisonicsEncodeEffect is an equivalent path.) */
 /* ACN channels with m<0 (the sin / "left-right" real harmonics) for order 3: l1 m-1; l2 m-2,-1;
  * l3 m-3,-2,-1. phonon's real-SH m<0 sign is opposite to this encode's (ambi_test only ever verified
