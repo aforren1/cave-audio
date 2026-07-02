@@ -36,6 +36,12 @@ extern "C" {                       /* engine internals (C, no extern-C guards of
 #include "sound.h"
 #include "zylia_capture.h"         /* ZM-1 ASIO shell + ZpShared (pulls in zylia.h: tdoa/doa) */
 }
+#include "calib_capture.h"         /* sweep constants + the simulate/ASIO capture backends (Capture tab) */
+#include "measure.h"               /* measurement DSP (self-guarded extern "C") */
+#include "calib.h"                 /* trims solve + layout writeback (self-guarded extern "C") */
+
+#include <atomic>
+#include <thread>
 
 #include <d3d11.h>
 #include <commdlg.h>       /* GetOpenFileNameA: the native file picker (comdlg32) */
@@ -284,6 +290,186 @@ static void tab_diff(void) {
         ImGui::TableNextColumn(); ImGui::Text("%u -> %u taps", V.A.speakers[i].eq_len, V.B.speakers[i].eq_len);
     }
     ImGui::EndTable();
+}
+
+/* ============ Capture tab — run the calibration sweep (bw_calibrate's core flow, in-window) ============
+ * A worker thread runs sweep -> measure_response per speaker -> calib_solve -> writeback, using the
+ * SAME calib_capture backends and measure/calib DSP as the CLI (simulate today; the ASIO full-duplex
+ * path compiles in with the SDK and is exercised at the rig). Publication is row-at-a-time: the
+ * worker fills a speaker's result fields, THEN bumps done_count (release); the UI only reads rows
+ * below done_count (acquire) — live progress with no torn rows. On success the result loads straight
+ * into the Diff view (A = input layout, B = what calibration wrote): capture -> review, one window. */
+struct CapJob {
+    char  layout[512], out[512], irprefix[512];      /* config (UI writes only while idle) */
+    float mic[3];
+    int   mic_in;
+    bool  simulate, do_room, do_eq, do_irs;
+    char  driver[128];
+
+    std::atomic<int>  state;                         /* 0 idle / 1 running / 2 done / 3 failed */
+    std::atomic<int>  done_count;
+    std::atomic<bool> cancel;
+    int      n;                                      /* speaker count (set by worker before first row) */
+    float    arrival_ms[BW_CHANNELS], level[BW_CHANNELS], rt60[BW_CHANNELS];
+    uint16_t eqlen[BW_CHANNELS];
+    float    gain_db[BW_CHANNELS], trim_ms[BW_CHANNELS];   /* the solve, valid when state == 2 */
+    char     msg[256];
+
+    std::thread th;
+    bool     th_live;
+};
+static CapJob J;
+
+static void cap_fail(const char* m) { snprintf(J.msg, sizeof J.msg, "%s", m); J.state.store(3, std::memory_order_release); }
+
+static void cap_worker(void) {
+    char err[256];
+    Layout L;
+    if (!layout_load(J.layout, (uint32_t)CAL_FS, &L, err, sizeof err)) { cap_fail(err); return; }
+    const int n = (int)L.count;
+    J.n = n;
+    static float sweep[CAL_NSWEEP], cap[CAL_CAPLEN], irbuf[CAL_IRLEN];   /* one job at a time; off the stack */
+    static float eq_taps[(size_t)BW_CHANNELS * BW_EQ_TAPS];
+    static uint16_t eq_lens[BW_CHANNELS];
+    static MeasureResult res[BW_CHANNELS];
+    memset(eq_lens, 0, sizeof eq_lens);
+    measure_sweep(sweep, CAL_NSWEEP, CAL_F1, CAL_F2, CAL_FS);
+
+#ifdef BW_HAVE_ASIO
+    bool asio_up = false;
+    if (!J.simulate) {
+        if (calib_asio_open(J.driver[0] ? J.driver : NULL, J.mic_in, sweep, cap) != 0) { cap_fail("ASIO open failed (>=26 outs + the mic input; see console)"); return; }
+        asio_up = true;
+    }
+#else
+    if (!J.simulate) { cap_fail("built without the ASIO SDK - simulate only"); return; }
+#endif
+
+    const double band[2] = { CAL_BAND_LO, CAL_BAND_HI };
+    for (int i = 0; i < n; ++i) {
+        if (J.cancel.load(std::memory_order_relaxed)) {
+#ifdef BW_HAVE_ASIO
+            if (asio_up) calib_asio_close();
+#endif
+            cap_fail("cancelled");
+            return;
+        }
+        if (J.simulate) calib_sim_capture(i, &L, J.mic, sweep, cap);
+#ifdef BW_HAVE_ASIO
+        else if (!calib_asio_capture(i)) { calib_asio_close(); cap_fail("capture timed out (speaker not wired? see console)"); return; }
+#endif
+        measure_response(cap, CAL_CAPLEN, sweep, CAL_NSWEEP, CAL_F1, CAL_F2, CAL_FS, band, &res[i]);
+        J.arrival_ms[i] = (float)(((double)res[i].delay_samples + res[i].delay_frac) * 1000.0 / CAL_FS);
+        J.level[i]      = res[i].level;
+        J.rt60[i]       = 0.f;
+        J.eqlen[i]      = 0;
+        if (J.do_room || J.do_eq || J.do_irs) {
+            RoomResult rr;
+            int want_ir = (J.do_eq || J.do_irs);
+            measure_room(cap, CAL_CAPLEN, sweep, CAL_NSWEEP, CAL_F1, CAL_F2, CAL_FS, &rr, want_ir ? irbuf : NULL, want_ir ? CAL_IRLEN : 0);
+            J.rt60[i] = rr.rt60;
+            if (J.do_irs && J.irprefix[0]) { char p[600]; snprintf(p, sizeof p, "%s_%02d.wav", J.irprefix, i); calib_write_wav_f32(p, irbuf, CAL_IRLEN, (int)CAL_FS); }
+            if (J.do_eq) {                                       /* gate to before the first reflection, invert */
+                int first_refl = rr.er_count ? rr.er_delay[0] : 0;
+                if (calib_eq(irbuf, CAL_IRLEN, first_refl, CAL_FS, 256, &eq_taps[(size_t)i * BW_EQ_TAPS])) {
+                    eq_lens[i] = 256; J.eqlen[i] = 256;
+                }
+            }
+        }
+        J.done_count.store(i + 1, std::memory_order_release);    /* publish the completed row */
+    }
+#ifdef BW_HAVE_ASIO
+    if (asio_up) calib_asio_close();
+#endif
+
+    float gdb[BW_CHANNELS], dms[BW_CHANNELS];
+    static float pos[BW_CHANNELS][3];                            /* calib_solve wants a packed [3]-stride array */
+    for (int i = 0; i < n; ++i) { pos[i][0] = L.speakers[i].pos[0]; pos[i][1] = L.speakers[i].pos[1]; pos[i][2] = L.speakers[i].pos[2]; }
+    calib_solve(res, pos, J.mic, n, CAL_FS, gdb, dms);
+    memcpy(J.gain_db, gdb, sizeof gdb);
+    memcpy(J.trim_ms, dms, sizeof dms);
+    if (!calib_write_layout(J.layout, J.out, gdb, dms, n, err, sizeof err)) { cap_fail(err); return; }
+    if (J.do_eq && !calib_write_eq(J.out, J.out, eq_taps, eq_lens, n, BW_EQ_TAPS, err, sizeof err)) { cap_fail(err); return; }
+    snprintf(J.msg, sizeof J.msg, "wrote %s%s", J.out, J.do_eq ? " (trims + eq)" : " (trims)");
+    J.state.store(2, std::memory_order_release);
+}
+
+static void tab_capture(void) {
+    int  st      = J.state.load(std::memory_order_acquire);
+    bool running = (st == 1);
+    if (!J.layout[0] && V.hasA) snprintf(J.layout, sizeof J.layout, "%s", V.pathA);   /* sensible defaults */
+    if (!J.out[0]) snprintf(J.out, sizeof J.out, "calibrated.json");
+
+    ImGui::BeginDisabled(running);
+    ImGui::SetNextItemWidth(-uiScaled(240));
+    ImGui::InputText("##cl", J.layout, sizeof J.layout);
+    ImGui::SameLine(); if (ImGui::Button("...##cpl") && pick_file(J.layout, sizeof J.layout,
+                          "layout json (*.json)\0*.json\0all files (*.*)\0*.*\0")) {}
+    ImGui::SameLine(); ImGui::TextUnformatted("layout in");
+    ImGui::SetNextItemWidth(-uiScaled(240));
+    ImGui::InputText("##co", J.out, sizeof J.out);
+    ImGui::SameLine(); ImGui::TextUnformatted("layout out (trims written here)");
+    ImGui::SetNextItemWidth(uiScaled(220));
+    ImGui::InputFloat3("mic (m)", J.mic, "%.2f");
+    ImGui::SameLine(0, uiScaled(16)); ImGui::Checkbox("simulate", &J.simulate);
+    ImGui::SameLine(); ImGui::Checkbox("room report", &J.do_room);
+    ImGui::SameLine(); ImGui::Checkbox("eq", &J.do_eq);
+    ImGui::SameLine(); ImGui::Checkbox("save IRs", &J.do_irs);
+    if (J.do_irs) {
+        ImGui::SameLine(); ImGui::SetNextItemWidth(uiScaled(140));
+        ImGui::InputTextWithHint("##cirp", "ir prefix", J.irprefix, sizeof J.irprefix);
+    }
+#ifdef BW_HAVE_ASIO
+    if (!J.simulate) {
+        ImGui::SetNextItemWidth(uiScaled(160));
+        ImGui::InputTextWithHint("##cdrv", "ASIO driver (auto)", J.driver, sizeof J.driver);
+        ImGui::SameLine(); ImGui::SetNextItemWidth(uiScaled(90));
+        ImGui::InputInt("mic input ch", &J.mic_in);
+    }
+#else
+    if (!J.simulate) ImGui::TextDisabled("(built without the ASIO SDK: simulate only)");
+#endif
+    ImGui::EndDisabled();
+
+    if (!running) {
+        if (ImGui::Button("Run calibration")) {
+            if (J.th_live) { J.th.join(); J.th_live = false; }   /* reap the previous run */
+            J.cancel.store(false); J.done_count.store(0); J.n = 0; J.msg[0] = 0;
+            J.state.store(1, std::memory_order_release);
+            J.th = std::thread(cap_worker); J.th_live = true;
+        }
+    } else if (ImGui::Button("Cancel")) J.cancel.store(true);
+
+    if (st == 0) { ImGui::TextDisabled("sweeps every speaker, solves the trims, writes the layout - then diff it right here"); return; }
+
+    int dc = J.done_count.load(std::memory_order_acquire);
+    int n  = J.n > 0 ? J.n : BW_CHANNELS;
+    char ov[64]; snprintf(ov, sizeof ov, "%d / %d speakers", dc, n);
+    ImGui::ProgressBar((float)dc / (float)n, ImVec2(-1, 0), ov);
+    if (st == 3) ImGui::TextColored(ImVec4(1.0f, 0.42f, 0.42f, 1.0f), "FAILED: %s", J.msg);
+    if (st == 2) {
+        ImGui::TextColored(ImVec4(0.45f, 0.85f, 0.5f, 1.0f), "%s", J.msg);
+        ImGui::SameLine(0, uiScaled(16));
+        if (ImGui::Button("Load into Diff (A=input, B=result)")) {
+            snprintf(V.pathA, sizeof V.pathA, "%s", J.layout); load_layout(0);
+            snprintf(V.pathB, sizeof V.pathB, "%s", J.out);    load_layout(1);
+        }
+    }
+    if (ImGui::BeginTable("capt", 6, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY)) {
+        ImGui::TableSetupColumn("spk"); ImGui::TableSetupColumn("arrival (ms)"); ImGui::TableSetupColumn("level");
+        ImGui::TableSetupColumn("rt60 (s)"); ImGui::TableSetupColumn("gain trim (dB)"); ImGui::TableSetupColumn("delay trim (ms)");
+        ImGui::TableSetupScrollFreeze(0, 1); ImGui::TableHeadersRow();
+        for (int i = 0; i < dc; ++i) {                           /* only published rows */
+            ImGui::TableNextRow();
+            ImGui::TableNextColumn(); ImGui::Text("%2d%s", i, J.eqlen[i] ? " eq" : "");
+            ImGui::TableNextColumn(); ImGui::Text("%8.3f", J.arrival_ms[i]);
+            ImGui::TableNextColumn(); ImGui::Text("%7.4f", J.level[i]);
+            ImGui::TableNextColumn(); if (J.rt60[i] > 0.f) ImGui::Text("%5.2f", J.rt60[i]); else ImGui::TextDisabled("-");
+            ImGui::TableNextColumn(); if (st == 2) ImGui::Text("%+6.2f", J.gain_db[i]); else ImGui::TextDisabled("...");
+            ImGui::TableNextColumn(); if (st == 2) ImGui::Text("%7.3f", J.trim_ms[i]); else ImGui::TextDisabled("...");
+        }
+        ImGui::EndTable();
+    }
 }
 
 /* ============ Zylia tab — ZM-1 bring-up + live clap DOA (the calibration-station seed) ============
@@ -543,9 +729,10 @@ static void draw_ui(void) {
         if (ImGui::BeginTabItem("Array")) { tab_array(); ImGui::EndTabItem(); }
         if (ImGui::BeginTabItem("Trims")) { tab_trims(); ImGui::EndTabItem(); }
         if (ImGui::BeginTabItem("EQ"))    { tab_eq();    ImGui::EndTabItem(); }
-        if (ImGui::BeginTabItem("IRs"))   { tab_irs();   ImGui::EndTabItem(); }
-        if (ImGui::BeginTabItem("Diff"))  { tab_diff();  ImGui::EndTabItem(); }
-        if (ImGui::BeginTabItem("Zylia")) { tab_zylia(); ImGui::EndTabItem(); }
+        if (ImGui::BeginTabItem("IRs"))     { tab_irs();     ImGui::EndTabItem(); }
+        if (ImGui::BeginTabItem("Diff"))    { tab_diff();    ImGui::EndTabItem(); }
+        if (ImGui::BeginTabItem("Capture")) { tab_capture(); ImGui::EndTabItem(); }
+        if (ImGui::BeginTabItem("Zylia"))   { tab_zylia();   ImGui::EndTabItem(); }
         ImGui::EndTabBar();
     }
     ImGui::EndChild();
@@ -642,6 +829,29 @@ static void register_tests(ImGuiTestEngine* e) {
         ctx->CaptureScreenshotWindow("//calib view");
     };
 
+    t = IM_REGISTER_TEST(e, "capture", "simulate_run");          /* the whole calibration: sweep -> solve -> writeback -> diff */
+    t->TestFunc = [](ImGuiTestContext* ctx) {
+        ctx->SetRef("calib view");
+        ctx->ItemClick("**/Capture");
+        ctx->Yield(2);
+        ctx->ItemClick("**/##cl");   ctx->KeyCharsReplaceEnter(FIX_A);
+        ctx->ItemClick("**/##co");   ctx->KeyCharsReplaceEnter("calibview_cap_out.json");
+        ctx->ItemCheck("**/simulate");
+        ctx->ItemClick("**/Run calibration");
+        for (int i = 0; i < 4000 && J.state.load() == 1; ++i) ctx->Yield();   /* worker: 26 sweeps + solve */
+        IM_CHECK_EQ(J.state.load(), 2);
+        IM_CHECK_EQ(J.done_count.load(), 26);
+        ctx->ItemClick("**/Load into Diff (A=input, B=result)");
+        IM_CHECK(V.hasA);
+        IM_CHECK(V.hasB);
+        int trimmed = 0;                                          /* the sim sensitivity wobble must show up */
+        for (int i = 0; i < 26; ++i) if (fabsf(V.gainB_db[i] - V.gainA_db[i]) > 0.1f) ++trimmed;
+        IM_CHECK_GT(trimmed, 5);
+        ctx->ItemClick("**/Diff");
+        ctx->Yield(2);
+        ctx->CaptureScreenshotWindow("//calib view");
+    };
+
     t = IM_REGISTER_TEST(e, "zylia", "sim_doa");                 /* whole live-DOA pipeline through the real UI */
     t->TestFunc = [](ImGuiTestContext* ctx) {
         ctx->SetRef("calib view");
@@ -661,8 +871,8 @@ static void register_tests(ImGuiTestEngine* e) {
     t = IM_REGISTER_TEST(e, "viewer", "tabs");                   /* every tab renders without faulting */
     t->TestFunc = [](ImGuiTestContext* ctx) {
         ctx->SetRef("calib view");
-        const char* tabs[] = { "**/Array", "**/Trims", "**/EQ", "**/IRs", "**/Diff", "**/Zylia" };
-        for (int i = 0; i < 6; ++i) { ctx->ItemClick(tabs[i]); ctx->Yield(2); }
+        const char* tabs[] = { "**/Array", "**/Trims", "**/EQ", "**/IRs", "**/Diff", "**/Capture", "**/Zylia" };
+        for (int i = 0; i < 7; ++i) { ctx->ItemClick(tabs[i]); ctx->Yield(2); }
         ctx->ItemClick("**/EQ");                                 /* the checkbox lives inside the EQ tab */
         ctx->Yield(2);
         ctx->ItemClick("**/overlay all speakers");
@@ -769,6 +979,7 @@ int main(int argc, char** argv) {
         else { fprintf(stderr, "usage: calib_view [layoutA.json] [layoutB.json] [--irs prefix] [--tests [filter]]\n"); return 2; }
     }
     for (int k = 0; k < EQ_PTS; ++k) V.eqfreq[k] = 20.0f * powf(1000.0f, (float)k / (EQ_PTS - 1));
+    J.simulate = true;                                            /* hardware capture is the rig-day opt-out */
     if (selftest) {
         if (!write_fixture(FIX_A, 0) || !write_fixture(FIX_B, 1)) { fprintf(stderr, "calib_view: cannot write fixtures in cwd\n"); return 1; }
     } else {
@@ -861,5 +1072,6 @@ int main(int argc, char** argv) {
     UnregisterClassW(wc.lpszClassName, wc.hInstance);
     for (int i = 0; i < BW_CHANNELS; ++i) if (V.hasIR[i]) sound_unload(&V.ir[i]);
     if (Z.live) zylia_capture_close();
+    if (J.th_live) { J.cancel.store(true); J.th.join(); }        /* reap a still-running capture job */
     return rc;
 }

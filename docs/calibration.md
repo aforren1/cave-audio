@@ -144,9 +144,14 @@ Dear ImGui + ImPlot/ImPlot3D on win32+d3d11) loads layouts through the engine's 
   Δgain / Δdelay / eq-taps per speaker with outliers highlighted, so a swapped channel, a bad mic
   placement, or a bogus `--localize` solve is one glance, not an evening.
 
-It is growing into the **calibration station** (one window for the rig session): the **Zylia tab**
-(live clap-DOA, see "Bring-up" above) is the first station tab beyond review; a capture front-end
-over `bw_calibrate` is the natural next one (`bw_calibrate` stays the headless CLI either way).
+It is the **calibration station** (one window for the rig session): the **Capture tab** runs the
+calibration itself — sweep every speaker, solve the trims, write the layout — on a worker thread with
+live per-speaker progress, through the same capture backends (`calib_capture.cpp`) and measure/solve
+DSP as the CLI (simulate hardware-free; ASIO full-duplex at the rig, mic position + input channel +
+room/eq/IR options in-window), and one button loads the result into Diff (A = input, B = what
+calibration wrote) for review before you accept it. The **Zylia tab** (live clap-DOA, see "Bring-up"
+above) covers the ZM-1. `bw_calibrate` remains the headless CLI over the same code — scriptable, and
+the only place for the multi-placement modes (`--localize`, `--zylia`, `--check`, `--live`).
 `bw_calib_view --tests [filter]` runs its imgui_test_engine suite (fake inputs drive the actual UI
 against generated fixture layouts + synthesized claps, screenshots land in `output/captures/`) and
 is wired into ctest as `calib_view`.

@@ -212,12 +212,16 @@ conventions ported from aforren1/lsl-viewer, the house reference — `examples/b
 layouts through the engine's own `layout_load`, shows the array in 3D, gain/delay trims,
 correction-EQ magnitude curves, `--save-irs` IR kernels, a layout DIFF (surveyed vs calibrated) with
 outlier highlighting — the "did calibration write something sane?" check before accepting a
-writeback — and the **Zylia tab** (live clap-DOA on the capsule sphere; see below). `--tests [filter]`
-runs **imgui_test_engine**: fake inputs drive the real UI (type path → click Load → assert 26
-speakers / the known 100 mm fixture delta; enable simulate → Clap now → recovered DOA within 2° of
-truth), screenshots are captured to output/captures/, pure-logic checks ride the same suite, and it
-all runs under ctest (`calib_view`) — a GUI with an automated regression test (test-engine license:
-free for open source, NOT MIT — see its LICENSE.txt).
+writeback — the **Capture tab** (bw_calibrate's core flow in-window: a worker thread runs
+sweep→measure→solve→writeback through the same `calib_capture.cpp` backends the CLI uses, rows
+publish live via a done_count release/acquire, and the result loads straight into Diff: A = input,
+B = what calibration wrote) — and the **Zylia tab** (live clap-DOA on the capsule sphere; see below).
+`--tests [filter]` runs **imgui_test_engine**: fake inputs drive the real UI (type path → click Load →
+assert 26 speakers / the known 100 mm fixture delta; Run calibration → wait for the worker → Load
+into Diff → assert the wobble trims; enable simulate → Clap now → recovered DOA within 2° of truth),
+screenshots are captured to output/captures/, pure-logic checks ride the same suite, and it all runs
+under ctest (`calib_view`) — a GUI with an automated regression test (test-engine license: free for
+open source, NOT MIT — see its LICENSE.txt).
 **Per-speaker correction filters** (`--eq`) are the "inverse EQ" upgrade to the scalar
 trims: `measure_correction` gates the IR to the direct sound (before the first reflection) and inverts that
 magnitude into a minimum-phase FIR (`calib_eq` → the layout `eq` array → applied per channel in `align.c`,

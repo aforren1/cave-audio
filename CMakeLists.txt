@@ -444,8 +444,9 @@ if(BWAUDIO_BUILD_CALIBVIEW)
     IMGUI_TEST_ENGINE_ENABLE_CAPTURE=1)
   target_compile_features(bw_calib_view PRIVATE cxx_std_17)      # bw_theme.h uses inline variables
   target_link_libraries(bw_calib_view PRIVATE bw_core d3d11 d3dcompiler comdlg32)   # comdlg32: file picker
-  # Zylia tab: the ZM-1 capture shell (live with the ASIO SDK; stubs + simulate-only without it).
-  target_sources(bw_calib_view PRIVATE examples/zylia_capture.cpp)
+  # Zylia tab (ZM-1 capture shell) + Capture tab (the calibrate sweep backends) — both live with the
+  # ASIO SDK, simulate-only without it.
+  target_sources(bw_calib_view PRIVATE examples/zylia_capture.cpp examples/calib_capture.cpp)
   if(BWAUDIO_WITH_ASIO)
     target_sources(bw_calib_view PRIVATE
       ${ASIO_SDK_DIR}/common/asio.cpp
@@ -465,7 +466,7 @@ endif()
 option(BWAUDIO_BUILD_CALIBRATE "Build the speaker calibration tool" OFF)
 if(BWAUDIO_BUILD_CALIBRATE)
   enable_language(CXX)
-  add_executable(bw_calibrate examples/calibrate.cpp)
+  add_executable(bw_calibrate examples/calibrate.cpp examples/calib_capture.cpp)
   target_link_libraries(bw_calibrate PRIVATE bw_core)
   if(BWAUDIO_WITH_ASIO)
     # the tool runs its own full-duplex ASIO host, so it compiles the SDK host sources itself (the
