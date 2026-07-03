@@ -1,3 +1,4 @@
 [submodule "third_party/steam-audio"]
 	path = third_party/steam-audio
 	url = https://github.com/valvesoftware/steam-audio
+	ignore = dirty
