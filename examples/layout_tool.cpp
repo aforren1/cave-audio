@@ -922,8 +922,10 @@ static void draw_panel(void) {
         ImGui::SeparatorText("Preview");
         ImGui::Text("source (%.2f, %.2f, %.2f)", src_pos.x, src_pos.y, src_pos.z);
         CheckboxInt("auto-orbit [SPACE]", &pv_orbit);
+        bwTip("hands-free sweep: the source orbits while moving near/far and high/low");
         if (ImGui::Combo("panner", &pv_panner, "DBAP (moving)\0SPCAP (fixed)\0VBAP (fixed)\0") && e)
             bw_set_panner(e, (BwPanner)pv_panner);   /* live A/B (atomic, safe while running) */
+        bwTip("A/B by ear while it plays - the switch is atomic (no glitch)");
         ImGui::TextDisabled("WASD/RF move the source");
         if (ImGui::Button("Back to edit [P]", ImVec2(-1, 0))) leave_preview();
         ImGui::PopItemWidth();
@@ -934,51 +936,87 @@ static void draw_panel(void) {
     ImGui::SeparatorText("File");
     ImGui::PushItemWidth(-1);
     ImGui::InputText("##path", g_path, sizeof g_path);
+    bwTip("the layout file: Save writes it, Reload reads it (cave_layout.json schema)");
     ImGui::PopItemWidth();
     float half = (ImGui::GetContentRegionAvail().x - ImGui::GetStyle().ItemSpacing.x) / 2.0f;
     if (ImGui::Button("Reload [L]", ImVec2(half, 0))) do_reload();
+    bwTip("re-read the layout + constraints.json from disk - discards unsaved edits");
     ImGui::SameLine();
     if (ImGui::Button("Save [S]", ImVec2(half, 0))) do_save();
+    bwTip("write the layout; delay_ms is derived from the positions (max-distance alignment)");
 
     ImGui::SeparatorText("Speaker");                 /* the survey loop: pick an index, tone it, place it */
     if (ImGui::InputInt("##spk", &sel)) { if (sel < 0) sel = 0; if (sel >= NSPK) sel = NSPK - 1; }
+    bwTip("the speaker's index IS its output/bus channel; [ ] steps, or click a sphere");
     ImGui::SameLine(); ImGui::Text("-> ch %d", sel);
     if (ImGui::DragFloat3("pos", &spk[sel].pos.x, 0.01f, 0, 0, "%.3f")) mark_edit();
+    bwTip("room-space metres, right-handed, origin at the working-area centre (matches Motive); drag, or ctrl-click to type");
     if (ImGui::SliderFloat("gain", &spk[sel].gain_db, -24.0f, 12.0f, "%+.1f dB")) mark_edit();
+    bwTip("per-speaker level trim (gain_db in the file)");
     CheckboxInt("tone [T]", &tone_on);
+    bwTip("drive THIS channel with the test signal out the array: walk the room, hear which "
+          "physical speaker it is, place its marker (needs the 26-ch ASIO/DVS device)");
     ImGui::SameLine();
     { bool nb = tone_kind == BW_TEST_NOISE;
       if (ImGui::Checkbox("noise [N]", &nb)) tone_kind = nb ? BW_TEST_NOISE : BW_TEST_SINE; }
+    bwTip("test-signal type; noise is easier to localize by ear than a sine");
     if (ImGui::Button("Snap all to constraints [K]", ImVec2(-1, 0))) do_snap();
+    bwTip("project every speaker to its nearest allowed point: inside bounds, out of no-go and "
+          "solid boxes (constraints.json next to the layout); y >= 0 always");
 
     ImGui::SeparatorText("DBAP knobs");              /* panning params; round-trip through the file */
     if (ImGui::SliderFloat("blur r",   &dbap_r,       0.05f, 3.0f, "%.2f m"))  mark_edit();
+    bwTip("DBAP rolloff radius: larger spreads energy over more speakers - smoother pans, less pinpoint");
     if (ImGui::SliderFloat("dist ref", &dist_ref,     0.25f, 4.0f, "%.2f m"))  mark_edit();
+    bwTip("distance attenuation: reference distance (no attenuation closer than this)");
     if (ImGui::SliderFloat("rolloff",  &dist_rolloff, 0.0f,  2.0f, "%.2f"))    mark_edit();
+    bwTip("distance attenuation: exponent - 1 = inverse law (-6 dB per doubling), 0 = off");
     if (ImGui::SliderFloat("min gain", &dist_min_db, -60.0f, 0.0f, "%.0f dB")) mark_edit();
+    bwTip("distance attenuation: floor - a source never drops below this");
 
     ImGui::SeparatorText("Analyze / optimize");      /* rE error of the target panner; O climbs it */
     if (ImGui::Combo("panner", &pv_panner, "DBAP (moving)\0SPCAP (fixed)\0VBAP (fixed)\0")) mark_score();
+    bwTip("the panner Score / Optimize / the rE overlay evaluate ([B] cycles). DBAP tracks a "
+          "MOVING listener; SPCAP/VBAP assume the centre sweet spot");
     if (ImGui::Button("Score [X]")) do_score();
+    bwTip("rE localization error over a shell of directions, via the engine's real gain solve - "
+          "mean/worst per panner land in the HUD scoreboard");
     ImGui::SameLine();
     { bool ob = opt_running != 0; if (ImGui::Checkbox("Optimize [O]", &ob)) set_optimizing(ob); }
+    bwTip("stochastic hill-climb of the speaker positions, minimising the target panner's rE error "
+          "within the constraints; runs live - watch it converge, stop, then Save");
     ImGui::SliderFloat("leash", &opt_leash, 0.1f, 3.0f, "%.2f m");   /* max optimizer move from the anchor */
+    bwTip("how far the optimizer may move any speaker from where it started (3 m = essentially free)");
     if (ImGui::SliderFloat("obs ear y", &obs_height, 0.0f, 2.0f, "%.2f m")) mark_score();
+    bwTip("listener EAR height above the floor - scoring, coverage, and the sightline checks all measure from here");
     if (CheckboxInt("perceptual (az>el)", &perceptual)) mark_score();   /* weight azimuth >> elevation */
+    bwTip("weight azimuth error over elevation: human azimuth acuity is ~3.5x finer, so the "
+          "optimizer trades vertical accuracy for horizontal");
     if (perceptual && ImGui::SliderFloat("elev wt", &elev_wt, 0.0f, 1.0f, "%.2f")) mark_score();
+    bwTip("elevation-error weight vs azimuth (0.3 ~ the psychophysics ratio; 1 = isotropic)");
     CheckboxInt("coverage [C]", &coverage_on);
+    bwTip("shade a shell of source directions: green = the array localizes it well, red = a hole; "
+          "hover a cube for its value");
     ImGui::SameLine();
     CheckboxInt("moving [V]", &coverage_moving);
+    bwTip("observer model: average over a grid of listener positions across the working volume "
+          "(this installation's case) instead of the centre sweet spot");
     CheckboxInt("shade rE error (vs gap) [G]", &cov_metric);
+    bwTip("colour by the selected panner's REAL solve (rE error) instead of the geometric "
+          "nearest-speaker gap");
 
     ImGui::SeparatorText("Audition");
     if (ImGui::Button("Preview - audition [P]", ImVec2(-1, 0))) enter_preview();
+    bwTip("pan a pink-noise source through the edited layout and judge it by ear (rebuilds the "
+          "engine - the layout is load-time); at the CAVE, walk the room for off-centre coverage");
 
     ImGui::SeparatorText("View");
     CheckboxInt("head view [H]", &fps_view);
+    bwTip("first-person from the observer's ears - see the coverage shell around YOU");
     ImGui::SameLine();
     if (ImGui::Button("Fullscreen [F11]")) ToggleBorderlessWindowed();
     ImGui::Checkbox("test engine UI", &show_te_ui);
+    bwTip("imgui_test_engine windows - run the --tests suite interactively");
 
     ImGui::PopItemWidth();
     ImGui::End();
@@ -1110,6 +1148,17 @@ static void register_tests(ImGuiTestEngine* te) {
         IM_CHECK_LE(opt_cost, cost0 + 1e-3f);                    /* hill-climb never accepts a regression */
         ctx->ItemUncheck("**/Optimize [O]");
         IM_CHECK(!opt_running);
+    };
+
+    t = IM_REGISTER_TEST(te, "viewer", "tooltips");              /* the hover help actually shows */
+    t->TestFunc = [](ImGuiTestContext* ctx) {
+        ctx->SetRef("layout");
+        ctx->MouseMove("**/blur r");
+        double t0 = ImGui::GetTime();
+        while (ImGui::GetTime() - t0 < 1.2) ctx->Yield();        /* the ForTooltip delay is wall-clock */
+        ImGuiWindow* tip = ImGui::FindWindowByName("##Tooltip_00");
+        IM_CHECK(tip != NULL && tip->WasActive);
+        ctx->CaptureScreenshot();
     };
 
     t = IM_REGISTER_TEST(te, "viewer", "scene_shots");           /* coverage overlay + preview render; screenshots */

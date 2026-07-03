@@ -145,6 +145,17 @@ inline void applyTheme(bool light) {
     s.ScaleAllSizes(g_uiScale);
 }
 
+/* Hover help for the PREVIOUS item (standard tooltip delay, wrapped) — the house pattern for
+ * explaining a control without spending panel space on it. Call right after the widget. */
+inline void bwTip(const char* text) {
+    if (ImGui::IsItemHovered(ImGuiHoveredFlags_ForTooltip) && ImGui::BeginTooltip()) {
+        ImGui::PushTextWrapPos(ImGui::GetFontSize() * 24.0f);
+        ImGui::TextUnformatted(text);
+        ImGui::PopTextWrapPos();
+        ImGui::EndTooltip();
+    }
+}
+
 /* Embedded Roboto at its natural logical size; scale rides style.FontScaleMain (see applyTheme). */
 inline void loadEmbeddedFont(ImGuiIO& io) {
     ImFontConfig cfg; cfg.OversampleH = 2; cfg.OversampleV = 1;

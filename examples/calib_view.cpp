@@ -234,6 +234,7 @@ static void tab_trims(void) {
 
 static void tab_eq(void) {
     ImGui::Checkbox("overlay all speakers", &V.eq_all);
+    bwTip("draw every speaker's correction curve at once - an outlier (bad capture, dead driver) pops out");
     if (!ImPlot::BeginPlot("##eq", ImGui::GetContentRegionAvail())) return;
     ImPlot::SetupAxes("Hz", "dB");
     ImPlot::SetupAxisScale(ImAxis_X1, ImPlotScale_Log10);
@@ -416,18 +417,29 @@ static void tab_capture(void) {
     ImGui::BeginDisabled(running);
     ImGui::SetNextItemWidth(-uiScaled(240));
     ImGui::InputText("##cl", J.layout, sizeof J.layout);
+    bwTip("the surveyed layout the sweep reads speaker geometry from - becomes the A side of the diff");
     ImGui::SameLine(); if (ImGui::Button("...##cpl") && pick_file(J.layout, sizeof J.layout,
                           "layout json (*.json)\0*.json\0all files (*.*)\0*.*\0")) {}
     ImGui::SameLine(); ImGui::TextUnformatted("layout in");
     ImGui::SetNextItemWidth(-uiScaled(240));
     ImGui::InputText("##co", J.out, sizeof J.out);
+    bwTip("where the calibrated layout is written (trims + optional eq) - becomes the B side of the diff");
     ImGui::SameLine(); ImGui::TextUnformatted("layout out (trims written here)");
     ImGui::SetNextItemWidth(uiScaled(220));
     ImGui::InputFloat3("mic (m)", J.mic, "%.2f");
+    bwTip("omni mic position in room space - the solve time-aligns and level-matches arrivals at this point");
     ImGui::SameLine(0, uiScaled(16)); ImGui::Checkbox("simulate", &J.simulate);
+    bwTip("no hardware: synthesize each sweep capture (1/r + a per-speaker sensitivity wobble) and "
+          "run the identical measure->solve->writeback pipeline");
     ImGui::SameLine(); ImGui::Checkbox("room report", &J.do_room);
+    bwTip("Schroeder RT60 + early reflections per speaker - a treatment diagnostic, NOT a model to "
+          "match (matching would double-count the real room)");
     ImGui::SameLine(); ImGui::Checkbox("eq", &J.do_eq);
+    bwTip("per-speaker correction FIR inverted from the direct-sound window - flattens the SPEAKER, "
+          "not the room (a moving listener can't be room-EQ'd from one point)");
     ImGui::SameLine(); ImGui::Checkbox("save IRs", &J.do_irs);
+    bwTip("keep each speaker's impulse response as <prefix>_NN.wav - feeds the IRs tab, and one "
+          "capture then serves trims, the room report, and future analysis");
     if (J.do_irs) {
         ImGui::SameLine(); ImGui::SetNextItemWidth(uiScaled(140));
         ImGui::InputTextWithHint("##cirp", "ir prefix", J.irprefix, sizeof J.irprefix);
@@ -436,8 +448,10 @@ static void tab_capture(void) {
     if (!J.simulate) {
         ImGui::SetNextItemWidth(uiScaled(160));
         ImGui::InputTextWithHint("##cdrv", "ASIO driver (auto)", J.driver, sizeof J.driver);
+        bwTip("ASIO driver name; empty = first driver with 26 outputs + the mic input");
         ImGui::SameLine(); ImGui::SetNextItemWidth(uiScaled(90));
         ImGui::InputInt("mic input ch", &J.mic_in);
+        bwTip("the driver INPUT channel the measurement mic is plugged into (0-based)");
         if (J.mic_in < 0) J.mic_in = 0;                          /* channelNum -1 would reach the driver */
     }
 #else
@@ -454,6 +468,8 @@ static void tab_capture(void) {
             J.state.store(1, std::memory_order_release);
             J.th = std::thread(cap_worker); J.th_live = true;
         }
+        bwTip("sweep every speaker -> measure -> solve trims -> write the layout, on a worker "
+              "thread; the table fills in live as speakers finish");
     } else if (ImGui::Button("Cancel")) J.cancel.store(true);
 
     if (st == 0) { ImGui::TextDisabled("sweeps every speaker, solves the trims, writes the layout - then diff it right here"); return; }
@@ -471,6 +487,8 @@ static void tab_capture(void) {
             snprintf(V.pathA, sizeof V.pathA, "%s", J.ran_layout); load_layout(0);   /* the RUN's paths, not the */
             snprintf(V.pathB, sizeof V.pathB, "%s", J.ran_out);    load_layout(1);   /* possibly-edited fields  */
         }
+        bwTip("review what calibration wrote (Diff/Trims/EQ tabs) BEFORE trusting it - a swapped "
+              "channel or bad mic placement shows up as an absurd delta");
     }
     if (ImGui::BeginTable("capt", 6, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY)) {
         ImGui::TableSetupColumn("spk"); ImGui::TableSetupColumn("arrival (ms)"); ImGui::TableSetupColumn("level");
@@ -589,17 +607,24 @@ static void tab_zylia(void) {
         Z.sim.nch = ZYLIA_MICS; Z.sim.rate = 48000.0; Z.sim.title = "simulate";
         Z.last_seq = 0; Z.sim_t = 1.0f;
     }
+    bwTip("synthesize claps from a known direction through the IDENTICAL pipeline (snapshot -> "
+          "TDOA -> DOA); the ring marks the truth the dot should land on");
     if (Z.simulate && !Z.live) {
         ImGui::SameLine(); ImGui::Checkbox("walk", &Z.sim_walk);
+        bwTip("the truth direction walks a circle, one clap per second - off = it holds still");
         ImGui::SameLine(); if (ImGui::Button("Clap now")) zy_sim_clap(&Z.sim, Z.truth);
+        bwTip("fire one synthetic clap immediately");
     }
 #ifdef BW_HAVE_ASIO
     ImGui::SameLine(0, uiScaled(24));
     ImGui::SetNextItemWidth(uiScaled(160));
     ImGui::InputTextWithHint("##zydrv", "ASIO driver (auto)", Z.driver, sizeof Z.driver);
+    bwTip("ASIO driver name; empty = first driver exposing the ZM-1's 19 inputs");
     ImGui::SameLine();
     if (!Z.live) { if (ImGui::Button("Open ZM-1")) { Z.live = zylia_capture_open(Z.driver[0] ? Z.driver : NULL, 48000.0);
-                                                     if (Z.live) { Z.simulate = false; Z.last_seq = Z.live->seq; } } }
+                                                     if (Z.live) { Z.simulate = false; Z.last_seq = Z.live->seq; } }
+                   bwTip("open the 19-capsule capture; clap anywhere around the array and the dot "
+                         "shows where it came from - verifies capsule mapping AND the geometry table"); }
     else if (ImGui::Button("Close ZM-1")) { zylia_capture_close(); Z.live = NULL;
                                             Z.last_seq = Z.sim.seq; }   /* re-baseline: else the sim block's older
                                                                          * seq reprocesses a stale snapshot once */
@@ -728,6 +753,8 @@ static void draw_ui(void) {
         load_irs();
     }
     ImGui::SameLine(); if (ImGui::Button("Load IRs")) load_irs();
+    bwTip("decode <prefix>_00.wav .. _25.wav (bw_calibrate --save-irs) through the engine's own "
+          "sound loader; picking any one _NN.wav selects the whole set");
     ImGui::Separator();
     ImGui::TextWrapped("%s", V.status[0] ? V.status : "load a cave_layout.json to begin");
     ImGui::Separator();
