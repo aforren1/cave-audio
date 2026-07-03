@@ -95,6 +95,8 @@ void     bw_source_set_pos (BwEngine* e, BwSource s, float x, float y, float z);
 void     bw_source_set_gain(BwEngine* e, BwSource s, float linear);
 void     bw_source_play (BwEngine* e, BwSource s, BwSound snd, bool loop);
 void     bw_source_stop (BwEngine* e, BwSource s);
+void     bw_source_set_paused(BwEngine* e, BwSource s, bool paused);   // ramped; playhead freezes
+void     bw_source_seek (BwEngine* e, BwSource s, uint64_t frame);     // click-free jump (in-memory)
 bool     bw_source_is_playing(BwEngine* e, BwSource s);  // control-thread poll; see below
 void     bw_play_oneshot(BwEngine* e, BwSound snd, float x, float y, float z, float gain);
 ```
@@ -104,6 +106,14 @@ republishes each source's playing state every block, gated on the handle's gener
 `true` while a sound plays, `false` once a non-loop sound finishes, after `stop`, or for a
 stale/destroyed handle. Poll it once per frame to drive an "on finished" signal; it is best-effort
 (a sound shorter than the poll interval may never be observed as playing).
+
+`bw_source_set_paused` gates the voice with a one-block ramp (~5 ms — no click) and freezes the
+playhead once silent, so resume continues exactly where pause landed; it works for in-memory,
+streamed, and bed sounds, and a paused voice still reads as *playing* (it has not ended).
+`bw_source_seek` jumps the content position (engine-rate frames): on a running voice it ramps out,
+jumps, and ramps back in (~10 ms end to end); on a paused voice the jump is immediate and it stays
+paused. Past-the-end seeks wrap for loops and end one-shots. Streamed sounds ignore seeks (the
+stream ring cannot jump); `bw_source_play` always restarts un-paused at frame 0.
 
 Positions are in **room space, right-handed** — the engine binding converts from its
 own coordinate system at the boundary (see integration.md). `bw_play_oneshot` is the
@@ -351,6 +361,22 @@ reflection beds only, not the point-source panner. Both are load-time; see
 [`spatialization.md`](./spatialization.md). `bw_get_speakers` returns the effective layout (the default
 grid or the `layout_path` file) as `cap*3` floats in channel order + the count (26) — for visualizing
 or auditioning the geometry the engine actually pans with.
+
+## Output protection limiter (control thread; ON by default)
+
+```c
+void bw_set_limiter(BwEngine* e, bool on);                     // live
+void bw_set_limiter_ceiling(BwEngine* e, float ceiling_db);    // default -1 dBFS; clamped [-60, 0]
+```
+
+The final stage on the 26-ch output — everything (voices, beds, the reflection/pathing taps, the
+per-speaker align stage, the test signal) passes through it before the device. It is **linked**
+across channels: one gain, derived from the cross-channel peak, so engaging never shifts the
+spatial image; ~1 ms attack / ~120 ms release one-poles, then a hard clamp at the ceiling (the
+attack is not lookahead, so the first millisecond of a hot transient clips instead of overshooting).
+This is driver/speaker **protection** against digital overs and pathological content, not a
+mastering limiter — if it engages in normal use, turn the content down. In the `binaural` profile
+the same limited bus feeds the monitor, so headphones inherit the ceiling too.
 
 ## Reflection bed (control thread)
 

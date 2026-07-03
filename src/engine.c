@@ -441,11 +441,20 @@ void bw_source_play_at(BwEngine* e, BwSource s, BwSound snd, bool loop, uint64_t
 }
 uint64_t bw_dsp_time(BwEngine* e)                                     { return e ? rt_dsp_time(e->rt) : 0; }
 void bw_source_stop(BwEngine* e, BwSource s)                           { if (e) rt_source_stop(e->rt, s); }
+void bw_source_set_paused(BwEngine* e, BwSource s, bool paused)        { if (e) rt_source_set_paused(e->rt, s, paused); }
+void bw_source_seek(BwEngine* e, BwSource s, uint64_t frame)           { if (e) rt_source_seek(e->rt, s, frame); }
 bool bw_source_is_playing(BwEngine* e, BwSource s)                     { return e ? rt_source_is_playing(e->rt, s) : false; }
 void bw_test_signal(BwEngine* e, uint32_t channel, BwTestKind kind, float gain) { if (e) rt_test_signal(e->rt, channel, (uint8_t)kind, gain); }
 
 void bw_set_panner(BwEngine* e, BwPanner panner) { if (e) rt_set_panner(e->rt, (int)panner); }
 void bw_set_dual_band(BwEngine* e, bool on)       { if (e) rt_set_dual_band(e->rt, on); }
+void bw_set_limiter(BwEngine* e, bool on)         { if (e) rt_set_limiter(e->rt, on); }
+void bw_set_limiter_ceiling(BwEngine* e, float ceiling_db) {
+    if (!e) return;
+    if (ceiling_db > 0.f)   ceiling_db = 0.f;      /* the ceiling is a maximum, never a boost */
+    if (ceiling_db < -60.f) ceiling_db = -60.f;
+    rt_set_limiter_ceiling(e->rt, powf(10.f, ceiling_db / 20.f));
+}
 
 /* Offline: the chosen panner's per-speaker gains for `nsrc` source positions heard from one listener,
  * over a layout given as `n` speaker positions (3 floats each). Default DBAP/distance tuning. Shares

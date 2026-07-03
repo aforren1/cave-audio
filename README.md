@@ -34,7 +34,8 @@ in one process behind one audio callback.
 
 - **Spatialization**: per-voice listener-relative DBAP (SPCAP/VBAP selectable, a
   dual-band option), recomputed per block from the tracked head position; source
-  spread; per-speaker gain/delay/correction-EQ output stage.
+  spread; per-speaker gain/delay/correction-EQ output stage, with a linked
+  protection limiter as the final stage.
 - **Acoustics** (Steam Audio): ray-traced occlusion with per-band transmission EQ,
   source directivity, a directional reflection bed (real-time, or baked over a
   probe grid), sound pathing around occluders with bending-loss EQ.
@@ -42,8 +43,9 @@ in one process behind one audio callback.
   source, ramped.
 - **Assets**: WAV/FLAC/MP3, decoded and resampled at load; disk streaming for long
   files; AmbiX ambisonic beds decoded world-locked to the array.
-- **Voices**: fixed pool with priority stealing; sample-accurate start against a
-  device-anchored DSP clock (`bw_source_play_at` / `bw_dsp_time`).
+- **Voices**: fixed pool with priority stealing; pause and click-free seek;
+  sample-accurate start against a device-anchored DSP clock
+  (`bw_source_play_at` / `bw_dsp_time`).
 - **Tracking**: OptiTrack NatNet parsed off-wire; the audio thread samples the
   freshest head pose at block time.
 - **Monitoring**: binaural HRTF render of the same 26-channel bus (3rd-order
@@ -62,12 +64,12 @@ only, one listener, and no room EQ at the listening position by design (a moving
 listener can't be room-corrected from one point; calibration flattens the
 speakers instead).
 
-Current gaps (may change): no pause/seek on a source (play/loop/stop only), no
-user pitch control (Doppler is physics-derived), no master-bus gain or protection
-limiter, no buses/groups, mono point sources only (stereo assets downmix; the
-ambisonic bed is the only non-point path), no completion callbacks (poll
-`bw_source_is_playing`), no OGG/Opus, and reflection/room configuration is
-load-time (occlusion meshes can be replaced live).
+Current gaps (may change): no user pitch control (Doppler is physics-derived), no
+master-bus gain or buses/groups (there is an output protection limiter), mono
+point sources only (stereo assets downmix; the ambisonic bed is the only
+non-point path), no completion callbacks (poll `bw_source_is_playing`), no
+OGG/Opus, seek does not apply to streamed sounds, and reflection/room
+configuration is load-time (occlusion meshes can be replaced live).
 
 ## Read next
 

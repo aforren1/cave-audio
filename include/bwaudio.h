@@ -105,6 +105,16 @@ BW_API void     bw_source_play_at(BwEngine* e, BwSource s, BwSound snd, bool loo
  * sample position when running, an internal block counter otherwise. Monotonic. 0 before the first block. */
 BW_API uint64_t bw_dsp_time(BwEngine* e);
 BW_API void     bw_source_stop(BwEngine* e, BwSource s);
+/* Pause/resume the source's voice in place. The gate ramps over one block (~5 ms — no click) and the
+ * playhead freezes once silent, so resume continues exactly where pause landed. Works for in-memory,
+ * streamed, and bed sounds. A paused voice still reads as playing (it has not ended); bw_source_play
+ * always starts un-paused. */
+BW_API void     bw_source_set_paused(BwEngine* e, BwSource s, bool paused);
+/* Jump the voice's content position to `frame` (engine-rate frames into the sound). Click-free: the
+ * voice ramps out, jumps, ramps back in (~10 ms end to end); on a paused voice the jump is immediate
+ * (and stays paused). Past-the-end: loops wrap, one-shots end. In-memory and bed sounds only —
+ * streamed sounds ignore it (the stream ring cannot jump). */
+BW_API void     bw_source_seek(BwEngine* e, BwSource s, uint64_t frame);
 /* Is the source's voice still producing audio? Control-thread poll (latest-wins readback): true while
  * a sound plays, false once a non-loop sound finishes, after stop, or for a stale/destroyed handle.
  * Best-effort — a sound shorter than the caller's poll interval may never be observed as playing. */
@@ -252,6 +262,15 @@ BW_API void     bw_set_panner(BwEngine* e, BwPanner panner);
  * (energy-vector) normalisation — better low-frequency localisation for a near-centred listener. Wraps
  * the selected panner; live-toggleable for A/B. Sweet-spot dependent like VBAP (see docs). */
 BW_API void     bw_set_dual_band(BwEngine* e, bool on);
+
+/* ---- output protection limiter (ON by default at -1 dBFS) ----
+ * The final stage on the 26-ch output — everything (voices, beds, reflections, pathing, per-speaker
+ * trims, the test signal) passes through it before the device. LINKED across channels: one gain from
+ * the cross-channel peak, so engaging never shifts the spatial image; ~1 ms attack / ~120 ms release,
+ * then a hard clamp at the ceiling. This is driver/speaker protection against digital overs, not a
+ * mastering limiter — if it engages in normal use, turn the content down. Control thread; live. */
+BW_API void     bw_set_limiter(BwEngine* e, bool on);
+BW_API void     bw_set_limiter_ceiling(BwEngine* e, float ceiling_db);   /* e.g. -1.0f; clamped to [-60, 0] */
 
 /* Select the diffuse-bed ambisonic decoder (load-time: between bw_create and bw_start). SAMPLING is the
  * default projection decode; ALLRAD (All-Round Ambisonic Decoding) decodes to a uniform virtual layout

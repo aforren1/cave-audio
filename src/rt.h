@@ -33,7 +33,7 @@ enum {
     CMD_SRC_CREATE = 0, CMD_SRC_DESTROY, CMD_SET_POS, CMD_SET_GAIN,
     CMD_PLAY, CMD_STOP, CMD_SET_LISTENER, CMD_COMMIT, CMD_SOUND_RETIRE,
     CMD_SET_REFLECTIONS, CMD_TEST_SIGNAL, CMD_SET_DOPPLER, CMD_SET_AIR, CMD_SET_SPREAD,
-    CMD_SET_REFL_SEND, CMD_SET_REFL_DIST, CMD_SET_PATHING
+    CMD_SET_REFL_SEND, CMD_SET_REFL_DIST, CMD_SET_PATHING, CMD_SET_PAUSED, CMD_SEEK
 };
 typedef struct {
     uint8_t  type;
@@ -50,6 +50,8 @@ typedef struct {
         struct { float gain; }                         rsend; /* per-voice reverb wet-send level */
         struct { uint8_t on; }                         rdist; /* per-voice distance->wet scaling enable */
         struct { uint8_t on; }                         path;  /* per-voice pathing enable */
+        struct { uint8_t on; }                         pause; /* per-voice pause gate (ramped; playhead freezes) */
+        struct { uint64_t frame; }                     seek;  /* content position to jump to (in-memory sounds) */
         struct { uint32_t channel; uint8_t kind; float gain; } test;  /* debug channel injection */
     } u;
 } Cmd;
@@ -67,6 +69,8 @@ void    rt_set_layout(RtCore* c, const Layout* L);   /* call before bw_start / w
 void    rt_set_panner(RtCore* c, int panner);        /* 0 = DBAP, 1 = SPCAP; call before bw_start */
 void    rt_set_bed_decoder(RtCore* c, int decoder);  /* 0 = sampling (SAD), 1 = AllRAD; before bw_start */
 void    rt_set_dual_band(RtCore* c, int on);         /* dual-band panning (amplitude LF / power HF); live A/B */
+void    rt_set_limiter(RtCore* c, int on);           /* output protection limiter (final stage; default ON); live */
+void    rt_set_limiter_ceiling(RtCore* c, float ceiling_linear);   /* limit/clamp ceiling, linear (default -1 dBFS); live */
 
 /* Attach the internal tracker's pose slot (track_internal). When set, rt_render samples the
  * freshest head pose from it at block time, overriding the committed listener. NULL detaches.
@@ -129,6 +133,8 @@ void rt_source_set_gain(RtCore* c, uint32_t h, float linear);
 void rt_source_play    (RtCore* c, uint32_t h, uint32_t sound, bool loop);
 void rt_source_play_at (RtCore* c, uint32_t h, uint32_t sound, bool loop, uint64_t start_sample);  /* sample-accurate */
 void rt_source_stop    (RtCore* c, uint32_t h);
+void rt_source_set_paused(RtCore* c, uint32_t h, bool paused);   /* ramped gate; the playhead freezes once silent */
+void rt_source_seek    (RtCore* c, uint32_t h, uint64_t frame);  /* click-free jump (in-memory sounds; streams ignore) */
 void rt_source_set_doppler(RtCore* c, uint32_t h, bool on);          /* propagation: glided delay -> pitch from radial motion */
 void rt_source_set_air_absorption(RtCore* c, uint32_t h, bool on);   /* propagation: distance-driven HF low-pass */
 void rt_source_set_spread(RtCore* c, uint32_t h, float amount);      /* source angular width: 0 = point .. 1 = wide */

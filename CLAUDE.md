@@ -180,7 +180,17 @@ thread closes the stream.
 **Voice management + scheduling**: sources carry a control-side steal **priority** (`bw_source_set_priority`,
 255 = protected) — a full pool steals the lowest-priority voice instead of failing the create; and
 **`bw_source_play_at(start_sample)`** fires a voice sample-accurately off a published dsp clock
-(`bw_dsp_time`, device-anchored), the mixer holding it silent until the exact in-block offset. **Ray-tracing
+(`bw_dsp_time`, device-anchored), the mixer holding it silent until the exact in-block offset.
+**Pause/seek** (`bw_source_set_paused` / `bw_source_seek`): a per-voice gate ramps over one block
+(invariant 4) and the playhead freezes only once silent, so resume continues exactly where pause
+landed and a seek on a running voice is ramp-out → jump → ramp-in (click-free); pause covers
+memory/stream/bed voices, seek is in-memory/bed only (the stream ring can't jump), and paused
+still reads as playing. An **output protection limiter** (`bw_set_limiter` / `bw_set_limiter_ceiling`,
+ON by default at -1 dBFS) is the FINAL stage in `rt_render` (after align + the test signal —
+everything reaching the device passes through): LINKED across channels (one gain from the
+cross-channel peak, so engaging never shifts the spatial image), ~1 ms attack / ~120 ms release +
+a hard clamp at the ceiling; protection, not mastering. Both are covered in the `rt` test (freeze,
+seek landing, ceiling, linkage). **Ray-tracing
 acceleration**: `BWAUDIO_EMBREE=1` runs both sims on Intel Embree, opt-in with a graceful fallback to the
 default tracer (the vendored prebuilt phonon isn't Embree-built, so it currently falls back — see docs/api.md).
 **Speaker calibration** (`bw_calibrate`, opt-in `-DBWAUDIO_BUILD_CALIBRATE=ON`; DSP in `measure.c`, solve +

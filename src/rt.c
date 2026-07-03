@@ -95,6 +95,13 @@ typedef struct {
     float    dop_delay, dop_dtgt;            /* read delay + its smoothed target (2-pole, per-sample) */
     uint32_t dop_w;
     float    spread;                         /* source angular width 0..1 (0 = point); blends the pan gains */
+    /* pause/seek gate: pause_g ramps 1 (running) <-> 0 (silent) across one block; the playhead only
+     * freezes (and a pending seek only lands) once fully silent, so both are click-free (invariant 4).
+     * A seek on a RUNNING voice is ramp-out -> jump -> ramp-in (two blocks, ~10 ms at 256/48k). */
+    bool     paused;                         /* target state (CMD_SET_PAUSED) */
+    float    pause_g;                        /* current gate value (1 = running) */
+    uint8_t  seek_pending;
+    uint64_t seek_pos;                       /* content frame to land on (in-memory sounds only) */
 } Voice;
 
 typedef struct {
@@ -155,6 +162,15 @@ struct RtCore {
     Aligner*  aligner;
     _Atomic int panner;      /* 0 = DBAP (moving observer); 1 = SPCAP; 2 = VBAP (both fixed observer); atomic for A/B */
     _Atomic int dual_band;   /* 0 = single (power) panning; 1 = dual-band (amplitude LF / power HF); atomic for A/B */
+
+    /* output protection limiter (final stage, after align + test signal — everything passes through).
+     * LINKED across channels: one gain from the block's cross-channel peak, so engaging never shifts
+     * the spatial image. ~1 ms attack / ~120 ms release one-poles + a hard safety clamp at the ceiling
+     * (the attack is not lookahead, so brief overshoot clips — deterministic protection, not mastering). */
+    _Atomic int   lim_on;         /* default 1 */
+    _Atomic float lim_ceiling;    /* linear (default -1 dBFS) */
+    float lim_gain;               /* audio-thread envelope: current applied gain (starts at 1) */
+    float lim_att_a, lim_rel_a;   /* one-pole coefficients, rate-derived at create */
     float       xover_a;     /* one-pole LP coeff for the dual-band crossover (BW_DUALBAND_FC), rate-derived */
     uint64_t    dsp_block;   /* audio-thread: next block's dsp-sample (fallback clock when no device timestamp) */
     _Atomic uint64_t dsp_now;/* published block-start dsp-sample; control thread reads via rt_dsp_time for scheduling */
@@ -392,6 +408,7 @@ static void drain_commands(RtCore* c) {
             v->dir_cur = 1.f;                       /* on-axis/omni by default */
             v->air_a_cur = 1.f;                     /* air low-pass passthrough by default */
             v->refl_gain = 1.f;                     /* full wet-send level by default (gated by refl_send) */
+            v->pause_g = 1.f;                       /* pause gate open (running) by default */
             v->eqg_cur[0] = v->eqg_cur[1] = v->eqg_cur[2] = 1.f;   /* flat EQ (history zeroed by memset) */
             for (int b = 0; b < 3; ++b) v->eq_co[b][0] = 1.f;     /* passthrough coeffs {1,0,0,0,0} */
             v->path_eqg_cur[0] = v->path_eqg_cur[1] = v->path_eqg_cur[2] = 1.f;  /* flat pathing EQ */
@@ -417,9 +434,17 @@ static void drain_commands(RtCore* c) {
                           v->start_sample = cmd->u.play.start;  /* 0 = now; else hold output until this dsp-sample */
                           v->refl_g_cur = 0.f;                  /* fresh start: ramp the wet send up from 0, no stale burst */
                           v->xover_lp = 0.f;                    /* fresh dual-band crossover state */
+                          v->paused = false; v->pause_g = 1.f; v->seek_pending = 0;   /* play always starts running */
                           if (v->dop_on) dop_line_reset(c, v, BW_H_IDX(cmd->handle)); } } break;
         case CMD_STOP: { Voice* v = voice_for(c, cmd->handle);
             if (v) v->playing = false; } break;
+        case CMD_SET_PAUSED: { Voice* v = voice_for(c, cmd->handle);
+            if (v) v->paused = cmd->u.pause.on != 0; } break;    /* the mixer's gate does the ramp/freeze */
+        case CMD_SEEK: { Voice* v = voice_for(c, cmd->handle);
+            if (v && v->sound && !v->sound->stream) {            /* streams: the ring can't jump — ignored */
+                v->seek_pos = cmd->u.seek.frame;
+                v->seek_pending = 1;                             /* lands once the gate is silent (click-free) */
+            } } break;
         case CMD_SET_REFLECTIONS: { Voice* v = voice_for(c, cmd->handle);
             if (v) v->refl_send = cmd->u.refl.on != 0; } break;
         case CMD_SET_PATHING: { Voice* v = voice_for(c, cmd->handle);
@@ -573,8 +598,34 @@ static void compute_gains(RtCore* c, Voice* v) {
  * Routing (gtarget) is still the M2 placeholder until M4. On a non-looping end the voice
  * stops; a oneshot additionally acks EVT_VOICE_ENDED so the control thread recycles its
  * transient handle. */
+/* pause/seek gate for this block. Returns 0 when the voice is fully paused (playhead frozen, nothing
+ * to mix); else fills the block's starting gate value + per-sample step. The gate ramps across one
+ * whole block (invariant 4); a pending seek lands only once the gate is silent, so a seek on a
+ * running voice is ramp-out -> jump -> ramp-in and never clicks. */
+static int pause_gate(Voice* v, uint32_t n, float* pg, float* pg_step) {
+    float tgt = (v->paused || v->seek_pending) ? 0.f : 1.f;
+    if (v->pause_g == 0.f && tgt == 0.f) {
+        if (v->seek_pending) {                       /* land the seek while inaudible */
+            const SoundData* snd = v->sound;
+            uint64_t f = v->seek_pos;
+            if (snd->frames == 0) f = 0;
+            else if (f >= snd->frames) f = v->loop ? (f % snd->frames) : snd->frames;  /* wrap, or end naturally */
+            v->cursor = (uint32_t)f;
+            v->seek_pending = 0;
+            if (!v->paused) tgt = 1.f;               /* not paused: ramp back in this block */
+        }
+        if (tgt == 0.f) return 0;                    /* paused: skip mixing, playhead stays frozen */
+    }
+    *pg      = v->pause_g;
+    *pg_step = (tgt - v->pause_g) / (float)n;
+    v->pause_g = tgt;                                /* land exactly (the loop advances a local copy) */
+    return 1;
+}
+
 static void mix_voice(RtCore* c, Voice* v, uint16_t idx, float* bus, uint32_t n, uint32_t start, float* aux) {
     const SoundData* snd = v->sound;
+    float pg, pg_step;
+    if (!pause_gate(v, n, &pg, &pg_step)) return;
     float step[BW_CHANNELS];
     for (uint32_t ch = 0; ch < c->channels; ++ch)
         step[ch] = (v->gtarget[ch] - v->gcur[ch]) / (float)n;
@@ -720,6 +771,7 @@ static void mix_voice(RtCore* c, Voice* v, uint16_t idx, float* bus, uint32_t n,
             else         ended = true;
         }
         float s = streaming ? c->stream_scratch[i] : (ended ? 0.f : snd->pcm[cur]);
+        s *= pg;                                               /* pause/seek gate (also gates the sends below) */
         const float s_raw = s;                                 /* pre-occlusion source, for the indirect (pathing) field */
         if (v->eq_engaged) {                                    /* 3 biquads (DF-I), coeffs interpolated per sample */
             for (int b = 0; b < 3; ++b) {
@@ -746,6 +798,7 @@ static void mix_voice(RtCore* c, Voice* v, uint16_t idx, float* bus, uint32_t n,
             v->dop_delay += (v->dop_dtgt - v->dop_delay) * dop_k;   /* ... then the read delay -> continuous rate */
         }
         if (!streaming && !ended) ++cur;
+        pg += pg_step;
         v->occ_cur += occ_step;
         v->dir_cur += dir_step;
         if (path_on) {                                         /* SH-encode the indirect field (decoded later by the tap) */
@@ -815,6 +868,8 @@ static void mix_voice(RtCore* c, Voice* v, uint16_t idx, float* bus, uint32_t n,
  * gcur[0]. Looping / natural end / oneshot-ack are identical to mix_voice. */
 static void mix_bed(RtCore* c, Voice* v, uint16_t idx, float* bus, uint32_t n, uint32_t start) {
     const SoundData* snd = v->sound;
+    float pg, pg_step;
+    if (!pause_gate(v, n, &pg, &pg_step)) return;
     const int nch = (int)snd->channels;
     const float g_step = (v->gtarget[0] - v->gcur[0]) / (float)n;   /* master gain ramp (invariant 4) */
     uint32_t cur = v->cursor;
@@ -824,7 +879,7 @@ static void mix_bed(RtCore* c, Voice* v, uint16_t idx, float* bus, uint32_t n, u
         if (cur >= snd->frames) { if (v->loop) cur = 0; else ended = true; }
         if (!ended) {
             const float* sh = &snd->pcm[(size_t)cur * nch];
-            const float g = v->gcur[0];
+            const float g = v->gcur[0] * pg;   /* master gain x the pause/seek gate */
             for (uint32_t s = 0; s < c->channels; ++s) {
                 const float* D = c->bed_decode[s];
                 float acc = 0.f;
@@ -833,6 +888,7 @@ static void mix_bed(RtCore* c, Voice* v, uint16_t idx, float* bus, uint32_t n, u
             }
             ++cur;
         }
+        pg += pg_step;
         v->gcur[0] += g_step;
     }
     v->cursor = cur;
@@ -939,6 +995,33 @@ void rt_render(RtCore* c, float* bus, uint32_t nframes, const BwTimestamp* ts) {
             for (uint32_t i = 0; i < nframes; ++i) { n = n * 1664525u + 1013904223u; out[i] += g * ((float)(n >> 9) * (1.0f / 4194304.0f) - 1.0f); }
             c->test_noise = n;
         }
+    }
+
+    /* protection limiter (final stage): everything that reaches the device — voices, beds, taps,
+     * align, test signal — passes through. One gain from the cross-channel peak (linked: engaging
+     * never shifts the spatial image), attack/release one-poles, then a hard clamp at the ceiling
+     * (the attack is not lookahead, so a transient's first ~ms can clip — protection, not mastering). */
+    if (atomic_load_explicit(&c->lim_on, memory_order_acquire)) {
+        const float lim_c = atomic_load_explicit(&c->lim_ceiling, memory_order_relaxed);
+        float g = c->lim_gain;
+        for (uint32_t i = 0; i < nframes; ++i) {
+            float peak = 0.f;
+            for (uint32_t ch = 0; ch < c->channels; ++ch) {
+                float a = bus[(size_t)ch * nframes + i];
+                a = a < 0.f ? -a : a;
+                if (a > peak) peak = a;
+            }
+            float want = (peak > lim_c) ? lim_c / peak : 1.f;
+            g += (want - g) * (want < g ? c->lim_att_a : c->lim_rel_a);
+            for (uint32_t ch = 0; ch < c->channels; ++ch) {
+                float* p = &bus[(size_t)ch * nframes + i];
+                float s = *p * g;
+                if (s >  lim_c) s =  lim_c;
+                if (s < -lim_c) s = -lim_c;
+                *p = s;
+            }
+        }
+        c->lim_gain = g;
     }
     pose_write(&c->readback, c->lis.p_active, c->lis.q_active);   /* publish for control-thread readback */
     BW_ZONE_END(zr);
@@ -1128,6 +1211,18 @@ void rt_source_stop(RtCore* c, uint32_t h) {
     cmd_push(&c->cmds, &cmd);
 }
 
+void rt_source_set_paused(RtCore* c, uint32_t h, bool paused) {
+    Cmd cmd = { .type = CMD_SET_PAUSED, .handle = h };
+    cmd.u.pause.on = paused ? 1 : 0;
+    cmd_push(&c->cmds, &cmd);
+}
+
+void rt_source_seek(RtCore* c, uint32_t h, uint64_t frame) {
+    Cmd cmd = { .type = CMD_SEEK, .handle = h };
+    cmd.u.seek.frame = frame;
+    cmd_push(&c->cmds, &cmd);
+}
+
 void rt_set_listener(RtCore* c, const float p[3], const float q[4]) {
     Cmd cmd = { .type = CMD_SET_LISTENER };
     cmd.u.lis.px = p[0]; cmd.u.lis.py = p[1]; cmd.u.lis.pz = p[2];
@@ -1296,6 +1391,12 @@ RtCore* rt_create(uint32_t voice_cap, uint32_t sound_cap, uint32_t sample_rate, 
     c->lis.q_active[3]  = 1.0f;        /* default head orientation = identity (facing forward) */
     c->lis.q_pending[3] = 1.0f;
     c->readback.q[3]    = 1.0f;        /* readback identity until the first block publishes */
+    /* protection limiter: ON at -1 dBFS by default; ~1 ms attack / ~120 ms release one-poles */
+    atomic_store_explicit(&c->lim_on, 1, memory_order_relaxed);
+    atomic_store_explicit(&c->lim_ceiling, 0.891251f, memory_order_relaxed);   /* 10^(-1/20) */
+    c->lim_gain  = 1.0f;
+    c->lim_att_a = 1.0f - expf(-1.0f / (0.001f * (float)sample_rate));
+    c->lim_rel_a = 1.0f - expf(-1.0f / (0.120f * (float)sample_rate));
     c->layout  = layout_default();
     c->aligner = align_create(channels, &c->layout);
     if (!c->aligner) { rt_destroy(c); return NULL; }
@@ -1335,6 +1436,18 @@ void rt_set_panner(RtCore* c, int panner) {
 void rt_set_dual_band(RtCore* c, int on) {
     if (!c) return;
     atomic_store_explicit(&c->dual_band, on ? 1 : 0, memory_order_release);
+}
+
+void rt_set_limiter(RtCore* c, int on) {
+    if (!c) return;
+    atomic_store_explicit(&c->lim_on, on ? 1 : 0, memory_order_release);
+}
+
+void rt_set_limiter_ceiling(RtCore* c, float ceiling_linear) {
+    if (!c) return;
+    if (ceiling_linear < 0.001f) ceiling_linear = 0.001f;   /* -60 dB floor: 0 would silence everything */
+    if (ceiling_linear > 1.0f)   ceiling_linear = 1.0f;
+    atomic_store_explicit(&c->lim_ceiling, ceiling_linear, memory_order_release);
 }
 
 /* Select the diffuse-bed decoder: 0 = sampling (SAD, default), 1 = AllRAD. Rebuilds the decode matrix

@@ -663,8 +663,74 @@ int main(void) {
         }
     }
 
+    /* pause/resume + seek: the gate ramps to silence, the playhead freezes, seeks land click-free */
+    {
+        RtCore* cq = rt_create(4, 4, RATE, CH);
+        CHECK(cq != NULL, "rt_create (pause/seek)");
+        if (cq && write_const_wav("bw_rt_seek.wav", 0.8f, 5 * N)) {   /* finite, non-loop: 5 blocks of content */
+            uint32_t sq = rt_load_sound(cq, "bw_rt_seek.wav", err, sizeof err);
+            uint32_t h  = rt_source_create(cq);
+            rt_source_set_pos(cq, h, 1.f, 0.f, 1.f);
+            BwTimestamp ts = { 0, 0 };
+            rt_source_play(cq, h, sq, false);
+            rt_commit(cq);
+            rt_render(cq, bus, N, &ts);                    /* block 1 of 5 plays */
+            CHECK(total_l2() > 1e-3, "voice audible before pause");
+            rt_source_set_paused(cq, h, true);
+            rt_render(cq, bus, N, &ts);                    /* ramp-out block (consumes block 2) */
+            rt_render(cq, bus, N, &ts);
+            CHECK(total_l2() < 1e-9, "paused voice is silent");
+            CHECK(rt_source_is_playing(cq, h), "a paused voice still reads as playing");
+            for (int b = 0; b < 10; ++b) rt_render(cq, bus, N, &ts);   /* 10N frames >> the 3N remaining */
+            rt_source_set_paused(cq, h, false);
+            rt_render(cq, bus, N, &ts);                    /* ramp back in: block 3 of 5 */
+            CHECK(total_l2() > 1e-3, "resume continues from the frozen position (nothing consumed while paused)");
+            rt_source_seek(cq, h, (uint64_t)4 * N);        /* jump to the last block of content */
+            rt_render(cq, bus, N, &ts);                    /* ramp-out */
+            rt_render(cq, bus, N, &ts);                    /* seek lands: plays [4N, 5N) ramping in */
+            CHECK(total_l2() > 1e-3, "seek lands and plays the target region");
+            rt_render(cq, bus, N, &ts);                    /* past the end: the non-loop voice ends */
+            CHECK(total_l2() < 1e-9, "silence after the seeked tail");
+            CHECK(!rt_source_is_playing(cq, h), "seeking near the end ends the non-loop voice on time");
+            rt_destroy(cq);
+            remove("bw_rt_seek.wav");
+        } else if (cq) { CHECK(0, "write seek wav"); rt_destroy(cq); }
+    }
+
+    /* output protection limiter: a linked gain caps the peak without shifting inter-channel balance.
+     * The test signal is injected after align, so it hits the limiter (the final stage) directly. */
+    {
+        RtCore* cl = rt_create(4, 4, RATE, CH);
+        CHECK(cl != NULL, "rt_create (limiter)");
+        if (cl) {
+            BwTimestamp ts = { 0, 0 };
+            rt_test_signal(cl, 0, 1, 2.0f);                /* sine, peak 2.0 — over the -1 dBFS ceiling */
+            rt_test_signal(cl, 1, 1, 0.5f);                /* the same waveform at 1/4 the level */
+            for (int b = 0; b < 20; ++b) rt_render(cl, bus, N, &ts);   /* settle the envelope */
+            rt_render(cl, bus, N, &ts);
+            float p0 = 0, p1 = 0;
+            for (int i = 0; i < N; ++i) {
+                float a0 = fabsf(bus[0 * N + i]), a1 = fabsf(bus[1 * N + i]);
+                if (a0 > p0) p0 = a0;
+                if (a1 > p1) p1 = a1;
+            }
+            CHECK(p0 <= 0.8915f && p0 > 0.80f, "limiter holds the hot channel at the -1 dBFS ceiling");
+            CHECK(fabsf(p1 / p0 - 0.25f) < 0.02f, "linked limiting preserves inter-channel balance");
+            rt_set_limiter_ceiling(cl, 0.5f);
+            for (int b = 0; b < 20; ++b) rt_render(cl, bus, N, &ts);
+            rt_render(cl, bus, N, &ts);
+            p0 = 0; for (int i = 0; i < N; ++i) { float a = fabsf(bus[0 * N + i]); if (a > p0) p0 = a; }
+            CHECK(p0 <= 0.5001f, "limiter ceiling is adjustable");
+            rt_set_limiter(cl, 0);
+            rt_render(cl, bus, N, &ts); rt_render(cl, bus, N, &ts);
+            p0 = 0; for (int i = 0; i < N; ++i) { float a = fabsf(bus[0 * N + i]); if (a > p0) p0 = a; }
+            CHECK(p0 > 1.5f, "limiter off passes the raw signal");
+            rt_destroy(cl);
+        }
+    }
+
     remove(WAV);
     if (fails) { printf("rt_test: %d FAILURES\n", fails); return 1; }
-    printf("rt_test OK (DBAP, commit, gen-drop, gain, occlusion, EQ, directivity, bed, reflection-tap, channel-test, air+Doppler, spread, reverb-send, dual-band, voice-steal, scheduled-play, streaming verified)\n");
+    printf("rt_test OK (DBAP, commit, gen-drop, gain, occlusion, EQ, directivity, bed, reflection-tap, channel-test, air+Doppler, spread, reverb-send, dual-band, voice-steal, scheduled-play, streaming, pause/seek, limiter verified)\n");
     return 0;
 }
