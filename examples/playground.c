@@ -42,6 +42,7 @@
 #include "raylib.h"
 #include "raymath.h"
 #include "ui_text.h"        /* crisp HUD text; ui_text() supersedes raylib's DrawText() */
+#include "speaker_gizmo.h"  /* the "real speaker" glyph (cabinet + cone aimed at the listener) */
 
 #define DR_WAV_IMPLEMENTATION
 #include "dr_wav.h"
@@ -208,8 +209,9 @@ static void push_wall_mesh(BwMaterial mat) {
 /* ---- shared drawing ---- */
 static void draw_speakers(int hi) {
     for (int k = 0; k < NSPK; ++k)
-        DrawSphere(speakers[k], k == hi ? 0.16f : 0.10f,
-                   k == hi ? (Color){ 120, 240, 140, 255 } : (Color){ 120, 120, 140, 255 });
+        draw_speaker_gizmo(speakers[k], (Vector3){ 0, 0, 0 },   /* cones aim at the head (the origin) */
+                           k == hi ? 0.30f : 0.22f,
+                           k == hi ? (Color){ 120, 240, 140, 255 } : (Color){ 120, 120, 140, 255 });
 }
 static void draw_head(Quaternion q) {
     Vector3 right = Vector3RotateByQuaternion((Vector3){ 1, 0, 0 }, q);

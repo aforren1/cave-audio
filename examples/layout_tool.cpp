@@ -53,6 +53,7 @@
 #include "raylib.h"
 #include "raymath.h"
 #include "rlgl.h"            /* rlDrawRenderBatchActive: flush the 3D batch before a screenshot */
+#include "speaker_gizmo.h"   /* the "real speaker" glyph (cabinet + cone aimed at the listener) */
 #include "cJSON.h"
 
 #include "imgui.h"
@@ -815,11 +816,12 @@ static void draw_scene(const Camera3D& cam, float* cov_worst_out, float* cov_mea
         Color col = is_drv ? Color{ 120, 245, 140, 255 }
                   : is_sel ? Color{ 245, 220, 90, 255 }
                            : Color{ 120, 120, 150, 255 };
-        DrawSphere(spk[i].pos, is_sel ? 0.15f : 0.10f, col);
+        draw_speaker_gizmo(spk[i].pos, Vector3{ 0, obs_height, 0 },   /* cones aim at the listener's ears */
+                           is_sel ? 0.30f : 0.22f, col);
         if (!constraint_ok(spk[i].pos))              /* red: outside bounds / inside a solid body (snap fixes) */
-            DrawSphereWires(spk[i].pos, is_sel ? 0.20f : 0.16f, 6, 6, Color{ 245, 80, 80, 255 });
+            DrawSphereWires(spk[i].pos, is_sel ? 0.22f : 0.18f, 6, 6, Color{ 245, 80, 80, 255 });
         else if (!los_clear(spk[i].pos))             /* orange: sightline to the ears is blocked (move it clear) */
-            DrawSphereWires(spk[i].pos, is_sel ? 0.20f : 0.16f, 6, 6, Color{ 245, 165, 70, 255 });
+            DrawSphereWires(spk[i].pos, is_sel ? 0.22f : 0.18f, 6, 6, Color{ 245, 165, 70, 255 });
     }
     if (preview) {                                   /* the moving DBAP source */
         DrawLine3D(Vector3{ 0, 0, 0 }, src_pos, Color{ 90, 220, 90, 200 });
