@@ -115,6 +115,24 @@ on a ZM-1 capsule sphere to check capsule mapping and geometry.
 `bw_zylia_probe` is a console level meter. See
 [`docs/calibration.md`](./docs/calibration.md).
 
+**One array, several audiences.** Speaker positions are surveyed once, but trims and
+EQ are measured relative to a reference point — so one installation can keep several
+calibrated variants of the same geometry and pick one per session
+(`BwConfig.layout_path` + the panner):
+
+```
+bw_calibrate --layout survey.json --mic 0 1.2 0 --room-eq --out cave_layout.seated.json
+bw_calibrate --layout survey.json --mic 0 1.7 0 --eq      --out cave_layout.roaming.json
+```
+
+Seated: SPCAP/VBAP, fixed listener pose, trims aligned at the seat, room correction
+at the seat (`--room-eq` is only valid for a listener who stays at the measurement
+point). Roaming: DBAP + tracking, trims aligned at the working-volume center at
+standing ear height, speaker-only EQ — one point can't room-correct a roam. Diffing
+the two files in calib_view should show identical positions and only trim/EQ
+differences; unknown JSON fields survive recalibration, so a variant can carry its
+own annotation (e.g. `"intent": "seated, SPCAP"`).
+
 ### Audition — `bw_playground`
 
 ![bw_playground](docs/img/playground.png)
