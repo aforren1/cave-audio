@@ -45,7 +45,8 @@
  *           PgUp/PgDn gain_db   T tone   N sine/noise   C coverage   V observer   G shade metric
  *           X score   B panner   O optimize   K snap   S save   L reload   H head view   F11 fullscreen
  * Controls (preview, P toggles): WASD/RF move the source   SPACE auto-orbit/near-far/high-low sweep
- *           B A/B the panner DBAP<->SPCAP<->VBAP live   Common: right-drag/wheel camera   ESC quit
+ *           B A/B the panner DBAP<->SPCAP<->VBAP live   Common: right-drag/wheel camera
+ *           ESC / close quits — with a confirm (Save and quit / Quit / Cancel) if there are unsaved edits
  * Build: cmake -S . -B build -DBWAUDIO_BUILD_PLAYGROUND=ON && cmake --build build --target bw_layout_tool
  */
 #include "bwaudio.h"
@@ -511,7 +512,9 @@ static float opt_cost_of(BwPanner p) {   /* coarse; + a penalty per speaker in a
 }
 static float frand(void) { return (float)rand() / ((float)RAND_MAX + 1.0f); }
 
-static void mark_edit(void)  { layout_dirty = 1; score_stale = 1; cov_err_stale = 1; }
+static int edited_unsaved;   /* any layout edit since the last successful save/reload (the quit guard) */
+
+static void mark_edit(void)  { layout_dirty = 1; score_stale = 1; cov_err_stale = 1; edited_unsaved = 1; }
 static void mark_score(void) { score_stale = 1; cov_err_stale = 1; }   /* metric knob changed; the layout file didn't */
 
 static void optimize_step(BwPanner p, int trials) {
@@ -575,11 +578,13 @@ static bool  show_te_ui = false;
 static void do_save(void) {
     int ok = save_json(g_path);
     save_flash = ok ? 2.0f : -2.0f;
-    if (!ok) fprintf(stderr, "save failed: cannot write '%s' (working dir %s) — check the path / permissions\n",
-                     g_path, GetWorkingDirectory());
+    if (ok) edited_unsaved = 0;
+    else fprintf(stderr, "save failed: cannot write '%s' (working dir %s) — check the path / permissions\n",
+                 g_path, GetWorkingDirectory());
 }
 static void do_reload(void) {
     load_json(g_path); load_constraints("constraints.json"); mark_edit();
+    edited_unsaved = 0;                          /* state now equals the file — nothing to lose on quit */
 }
 static void do_snap(void) {
     for (int i = 0; i < NSPK; ++i) spk[i].pos = constraint_project(spk[i].pos);
@@ -619,6 +624,47 @@ static void enter_preview(void) {      /* rebuild so the preview pans through th
 static void leave_preview(void) {
     preview = 0;
     if (e) { bw_source_set_gain(e, pv_src, 0.0f); bw_commit(e); }
+}
+
+/* ---- quit guard: ESC / the close button ask before dropping unsaved edits ---- */
+static int quit_ask;     /* open the confirm modal next frame */
+static int quit_now;     /* confirmed: leave the main loop */
+
+static void request_quit(void) {
+    if (edited_unsaved) quit_ask = 1; else quit_now = 1;
+}
+
+/* the [unsaved] marker rides the window title (the Save [S] label stays stable for the tests) */
+static void update_title(void) {
+    static int shown = -1;
+    if (edited_unsaved != shown) {
+        SetWindowTitle(edited_unsaved ? "bwaudio - speaker layout tool  [unsaved]"
+                                      : "bwaudio - speaker layout tool");
+        shown = edited_unsaved;
+    }
+}
+
+/* drawn at top level every frame (a modal must outlive the panel's edit/preview branches) */
+static void draw_quit_modal(void) {
+    if (quit_ask) { ImGui::OpenPopup("Unsaved changes"); quit_ask = 0; }
+    ImGui::SetNextWindowPos(ImGui::GetMainViewport()->GetCenter(), ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
+    if (ImGui::BeginPopupModal("Unsaved changes", NULL, ImGuiWindowFlags_AlwaysAutoResize)) {
+        ImGui::Text("The layout has edits that are not on disk.");
+        ImGui::TextDisabled("save target: %s", g_path);
+        if (save_flash < 0)
+            ImGui::TextColored(ImVec4(0.96f, 0.51f, 0.51f, 1), "save failed - check the path / permissions");
+        ImGui::Separator();
+        if (ImGui::Button("Save and quit")) {
+            do_save();
+            if (!edited_unsaved) { quit_now = 1; ImGui::CloseCurrentPopup(); }
+            /* else: the save failed — stay open so the edits aren't silently lost */
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Quit without saving")) { quit_now = 1; ImGui::CloseCurrentPopup(); }
+        ImGui::SameLine();
+        if (ImGui::Button("Cancel")) ImGui::CloseCurrentPopup();
+        ImGui::EndPopup();
+    }
 }
 
 /* ============================== per-frame input / camera / scene ============================== */
@@ -1132,6 +1178,25 @@ static void register_tests(ImGuiTestEngine* te) {
         IM_CHECK_LT(fabsf(spk[5].pos.z - 2.0f), 1e-3f);
     };
 
+    t = IM_REGISTER_TEST(te, "viewer", "quit_guard");            /* unsaved edits gate ESC/close behind a confirm */
+    t->TestFunc = [](ImGuiTestContext* ctx) {
+        seed_default(); mark_edit();
+        IM_CHECK_EQ(edited_unsaved, 1);
+        request_quit();
+        IM_CHECK_EQ(quit_now, 0);                                /* guarded: no instant exit */
+        ctx->Yield(2);                                           /* the modal opens */
+        ctx->SetRef("//Unsaved changes");
+        IM_CHECK(ctx->ItemInfo("Save and quit").ID != 0);        /* both exits offered */
+        IM_CHECK(ctx->ItemInfo("Quit without saving").ID != 0);
+        ctx->CaptureScreenshot();
+        ctx->ItemClick("Cancel");
+        IM_CHECK_EQ(quit_now, 0);                                /* cancel keeps the session */
+        ctx->Yield(2);
+        do_save();                                               /* Save-and-quit relies on exactly this */
+        IM_CHECK_EQ(edited_unsaved, 0);
+        IM_CHECK_GT(save_flash, 0.0f);
+    };
+
     t = IM_REGISTER_TEST(te, "viewer", "score_optimize");        /* Score fills the board; the optimizer actually climbs */
     t->TestFunc = [](ImGuiTestContext* ctx) {
         ctx->SetRef("layout");
@@ -1296,13 +1361,13 @@ int main(int argc, char** argv) {
     cam.up = Vector3{ 0, 1, 0 }; cam.fovy = 55; cam.projection = CAMERA_PERSPECTIVE;
 
     scored = 1; score_stale = 1;                   /* per-panner scoreboard on from the start, live-refreshed */
-    bool done = false;
-    int  frames = 0, drain = 0;
-    while (!WindowShouldClose() && !done) {
+    int frames = 0, drain = 0;
+    while (!quit_now) {
         float dt = GetFrameTime();
         const bool kb = !io.WantCaptureKeyboard;   /* imgui typing must not trigger scene shortcuts */
         const bool ms = !io.WantCaptureMouse;      /* the panel/tooltips own the mouse when hovered */
-        if (kb && IsKeyPressed(KEY_ESCAPE)) break;
+        if (WindowShouldClose() || (kb && IsKeyPressed(KEY_ESCAPE)))
+            request_quit();                        /* asks first if there are unsaved edits */
         if (kb && IsKeyPressed(KEY_F11)) ToggleBorderlessWindowed();
         if (kb && IsKeyPressed(KEY_H)) fps_view = !fps_view;     /* first-person view from the observer's ears */
         if (preview) handle_preview_input(dt, kb);
@@ -1321,6 +1386,7 @@ int main(int argc, char** argv) {
         if      (save_flash > 0) { save_flash -= dt; if (save_flash < 0) save_flash = 0; }  /* fade out, then STOP at 0 */
         else if (save_flash < 0) { save_flash += dt; if (save_flash > 0) save_flash = 0; }  /* (else it oscillated -> flicker) */
         update_camera(&cam, ms);
+        update_title();                                  /* [unsaved] marker in the title bar */
         ++cov_frame;
 
         BeginDrawing();
@@ -1332,6 +1398,7 @@ int main(int argc, char** argv) {
         draw_labels(cam);                                /* background drawlist: under the windows, over the scene */
         draw_hud(cov_worst, cov_mean);
         draw_panel();
+        draw_quit_modal();                               /* the unsaved-changes confirm (top level: outlives modes) */
         draw_cov_tooltip(cam, ms);
         if (show_te_ui && g_te) ImGuiTestEngine_ShowTestEngineWindows(g_te, &show_te_ui);
         rlImGuiEnd();
@@ -1341,7 +1408,7 @@ int main(int argc, char** argv) {
         EndDrawing();
 
         ++frames;
-        if (selftest && frames > 5 && ImGuiTestEngine_IsTestQueueEmpty(g_te) && ++drain > 3) done = true;
+        if (selftest && frames > 5 && ImGuiTestEngine_IsTestQueueEmpty(g_te) && ++drain > 3) quit_now = 1;
     }
 
     int rc = 0;
