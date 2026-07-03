@@ -2,9 +2,12 @@
  * align.c — per-channel gain trim + integer-sample delay line. One power-of-two ring per
  * channel sized to max_delay+1, a single shared write index. Trivial DSP, but not optional
  * for a real array (docs/spatialization.md). In-place on the planar 26-ch bus.
+ * Optionally also applies the per-speaker correction FIR and the LF room_eq modal cuts
+ * (static-listener room correction; docs/calibration.md) before the gain+delay.
  */
 #include "align.h"
 
+#include <math.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -22,12 +25,19 @@ struct Aligner {
     float*   eq;                   /* channels * BW_EQ_TAPS, the kernels */
     uint32_t eqlen, eqmask, eqw;   /* per-channel input-history ring (power of two >= BW_EQ_TAPS) */
     float*   eqhist;               /* channels * eqlen */
+    /* LF room_eq modal cuts (optional): per-channel RBJ peaking biquads, coefficients derived from
+     * the layout's fc/gain/Q at the engine rate. Static state — fixed arrays, no allocation. */
+    int      any_rq;
+    uint8_t  rq_n[BW_CHANNELS];
+    float    rq_co[BW_CHANNELS][BW_ROOM_EQ_MAX][5];   /* b0 b1 b2 a1 a2 (a0-normalized) */
+    float    rq_x1[BW_CHANNELS][BW_ROOM_EQ_MAX], rq_x2[BW_CHANNELS][BW_ROOM_EQ_MAX];
+    float    rq_y1[BW_CHANNELS][BW_ROOM_EQ_MAX], rq_y2[BW_CHANNELS][BW_ROOM_EQ_MAX];
 };
 
 static uint32_t pow2_ge(uint32_t x) { uint32_t p = 1; while (p < x) p <<= 1; return p; }
 
-Aligner* align_create(uint32_t channels, const Layout* L) {
-    if (channels == 0 || channels > BW_CHANNELS || !L) return NULL;
+Aligner* align_create(uint32_t channels, const Layout* L, uint32_t sample_rate) {
+    if (channels == 0 || channels > BW_CHANNELS || !L || sample_rate == 0) return NULL;
     Aligner* a = (Aligner*)calloc(1, sizeof *a);
     if (!a) return NULL;
     a->channels = channels;
@@ -39,6 +49,23 @@ Aligner* align_create(uint32_t channels, const Layout* L) {
         a->delay[k]  = L->speakers[k].delay_samples;
         a->eq_len[k] = L->speakers[k].eq_len > BW_EQ_TAPS ? BW_EQ_TAPS : L->speakers[k].eq_len;
         if (a->eq_len[k]) a->any_eq = 1;
+        uint8_t nrq = L->speakers[k].room_eq_count > BW_ROOM_EQ_MAX ? BW_ROOM_EQ_MAX : L->speakers[k].room_eq_count;
+        for (uint8_t s = 0; s < nrq; ++s) {        /* RBJ peaking EQ from the rate-independent params */
+            const RoomEqSection* rq = &L->speakers[k].room_eq[s];
+            if (!(rq->fc > 0.f) || rq->fc >= 0.5f * (float)sample_rate || !(rq->q > 0.f)) continue;
+            double A     = pow(10.0, rq->gain_db / 40.0);
+            double w0    = 2.0 * 3.14159265358979323846 * rq->fc / (double)sample_rate;
+            double alpha = sin(w0) / (2.0 * rq->q);
+            double a0    = 1.0 + alpha / A;
+            uint8_t j = a->rq_n[k];
+            a->rq_co[k][j][0] = (float)((1.0 + alpha * A) / a0);
+            a->rq_co[k][j][1] = (float)((-2.0 * cos(w0)) / a0);
+            a->rq_co[k][j][2] = (float)((1.0 - alpha * A) / a0);
+            a->rq_co[k][j][3] = (float)((-2.0 * cos(w0)) / a0);
+            a->rq_co[k][j][4] = (float)((1.0 - alpha / A) / a0);
+            a->rq_n[k] = j + 1;
+        }
+        if (a->rq_n[k]) a->any_rq = 1;
     }
     a->buf = (float*)calloc((size_t)channels * a->len, sizeof(float));
     if (!a->buf) { free(a); return NULL; }
@@ -76,6 +103,23 @@ void align_process(Aligner* a, float* bus, uint32_t n) {
             }
         }
         a->eqw = (ew + n) & emask;
+    }
+    if (a->any_rq) {                               /* LF modal cuts: per-channel biquad cascade (DF-I) */
+        for (uint32_t k = 0; k < a->channels; ++k) {
+            const uint8_t S = a->rq_n[k];
+            if (!S) continue;
+            float* x = &bus[(size_t)k * n];
+            for (uint8_t s = 0; s < S; ++s) {
+                const float* co = a->rq_co[k][s];
+                float x1 = a->rq_x1[k][s], x2 = a->rq_x2[k][s], y1 = a->rq_y1[k][s], y2 = a->rq_y2[k][s];
+                for (uint32_t i = 0; i < n; ++i) {
+                    float in = x[i];
+                    float y  = co[0]*in + co[1]*x1 + co[2]*x2 - co[3]*y1 - co[4]*y2;
+                    x2 = x1; x1 = in; y2 = y1; y1 = y; x[i] = y;
+                }
+                a->rq_x1[k][s] = x1; a->rq_x2[k][s] = x2; a->rq_y1[k][s] = y1; a->rq_y2[k][s] = y2;
+            }
+        }
     }
     const uint32_t len = a->len, mask = a->mask, C = a->channels;
     const uint32_t w = a->w;

@@ -1,5 +1,6 @@
 /* calib_test.c — the calibration trim solve + layout writeback, verified without the rig. */
 #include "calib.h"
+#include "layout.h"        /* BW_ROOM_EQ_MAX (the room_eq writeback round-trip) */
 
 #include <cJSON.h>
 #include <math.h>
@@ -121,6 +122,51 @@ int main(void) {
                 free(buf);
             }
             remove(EIN); remove(EOUT);
+        }
+    }
+
+    /* calib_write_room_eq: LF modal cuts round-trip into each speaker's "room_eq" section array */
+    {
+        const char* RIN = "bw_rq_in.json", *ROUT = "bw_rq_out.json";
+        FILE* rfw = fopen(RIN, "wb");
+        CHECK(rfw != NULL, "open room_eq in.json");
+        if (rfw) {
+            fputs("{\n \"speakers\": [\n"
+                  "  { \"index\": 0, \"position\": [1,0,0] },\n"
+                  "  { \"index\": 1, \"position\": [2,0,0] }\n ]\n}\n", rfw);
+            fclose(rfw);
+            MeasureEqSection cuts[2 * BW_ROOM_EQ_MAX];
+            memset(cuts, 0, sizeof cuts);
+            cuts[0].fc = 62.5f; cuts[0].gain_db = -6.2f; cuts[0].q = 4.3f;   /* speaker 0: two cuts */
+            cuts[1].fc = 118.f; cuts[1].gain_db = -3.5f; cuts[1].q = 2.0f;
+            int counts[2] = { 2, 0 };                                        /* speaker 1: none */
+            char err[256] = {0};
+            CHECK(calib_write_room_eq(RIN, ROUT, cuts, counts, 2, BW_ROOM_EQ_MAX, err, sizeof err),
+                  err[0] ? err : "calib_write_room_eq");
+            FILE* rf = fopen(ROUT, "rb");
+            if (rf) {
+                fseek(rf, 0, SEEK_END); long len = ftell(rf); fseek(rf, 0, SEEK_SET);
+                char* buf = (char*)malloc((size_t)len + 1); size_t rd = fread(buf, 1, (size_t)len, rf); buf[rd] = 0; fclose(rf);
+                cJSON* root = cJSON_Parse(buf);
+                CHECK(root != NULL, "reparse written room_eq layout");
+                if (root) {
+                    cJSON* sps = cJSON_GetObjectItem(root, "speakers");
+                    cJSON* r0  = cJSON_GetObjectItem(cJSON_GetArrayItem(sps, 0), "room_eq");
+                    cJSON* r1  = cJSON_GetObjectItem(cJSON_GetArrayItem(sps, 1), "room_eq");
+                    CHECK(cJSON_IsArray(r0) && cJSON_GetArraySize(r0) == 2, "speaker 0 room_eq has 2 sections");
+                    if (cJSON_IsArray(r0) && cJSON_GetArraySize(r0) == 2) {
+                        cJSON* s0 = cJSON_GetArrayItem(r0, 0);
+                        CHECK(fabs(cJSON_GetObjectItem(s0, "fc")->valuedouble      - 62.5) < 0.11 &&
+                              fabs(cJSON_GetObjectItem(s0, "gain_db")->valuedouble + 6.2)  < 0.011 &&
+                              fabs(cJSON_GetObjectItem(s0, "q")->valuedouble       - 4.3)  < 0.011,
+                              "room_eq section values round-trip");
+                    }
+                    CHECK(r1 == NULL, "a speaker with no cuts gets no room_eq array");
+                    cJSON_Delete(root);
+                }
+                free(buf);
+            }
+            remove(RIN); remove(ROUT);
         }
     }
 

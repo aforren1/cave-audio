@@ -76,6 +76,27 @@ the trim automatically).
   gain+delay. With the Zylia you can gate by *direction* (keep the speaker's DOA, reject off-axis
   reflections) for a cleaner near-free-field correction than an omni gate; that's a follow-on.
 
+- **`--room-eq`** — room correction **at the mic position**, for a **static listener only** (the
+  fixed-observer SPCAP/VBAP deployments: one seat, one sweet spot — put the mic there, at ear
+  height). A roaming listener keeps plain `--eq`; the one-point objection above applies in full.
+  Two halves, split at 200 Hz so nothing is corrected twice:
+  - **200 Hz and up** — the `eq` FIR is designed from a **frequency-dependent window**
+    (`measure_correction_room`): each frequency's magnitude comes from the IR windowed to ~6 cycles,
+    clamped between the direct-sound gate and 400 ms. At HF the window shrinks to the gate (identical
+    to `--eq`, and the ~1/6-octave resolution is the broad-stroke smoothing that survives head sway);
+    toward LF it grows to include the room. Boosts are capped at **+3 dB** — a seated head still
+    sways a few cm, and interference dips move with it, so dips are never fought hard.
+  - **30–200 Hz** — discrete **modal cuts** (`measure_room_cuts` → each speaker's `room_eq` array of
+    `{fc, gain_db, q}` peaking sections, rendered as biquads in `align.c`). Below the room's Schroeder
+    frequency modes are approximately minimum-phase, so a magnitude cut also fixes the ringing, and
+    the correction stays valid over meter-scale distances. **Cut-only** by design and by schema
+    (`gain_db <= 0` — the loader rejects boosts): peaks are modal energy you can remove; dips are
+    position-dependent cancellations you cannot fill.
+
+  What no EQ fixes: **decay**. A ringing room still smears transients after its steady-state
+  coloration is flattened — that is what the `--room` report's RT60/early-reflection numbers are
+  for (treatment), and why `--room-eq` is correction at a point, not a room model to match.
+
 ## Zylia ZM-1: full 3D from one placement
 
 `--localize` needs the omni mic at ≥5 spots because one omni gives only **distance**. The ZM-1 is 19

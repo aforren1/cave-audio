@@ -12,7 +12,12 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#define BW_EQ_TAPS 512      /* max per-speaker correction-FIR length */
+#define BW_EQ_TAPS     512  /* max per-speaker correction-FIR length */
+#define BW_ROOM_EQ_MAX 8    /* max per-speaker LF modal-cut sections (static-listener room correction) */
+
+/* One parametric peaking section (RBJ), rate-independent in the file; align.c derives the biquad
+ * coefficients at the engine rate. Cut-only by schema (gain_db <= 0). */
+typedef struct { float fc, gain_db, q; } RoomEqSection;
 
 typedef struct {
     float    pos[3];        /* room space, right-handed, meters */
@@ -20,6 +25,8 @@ typedef struct {
     uint32_t delay_samples; /* per-speaker delay for arrival-time alignment */
     uint16_t eq_len;        /* per-speaker correction-FIR length (0 = none) */
     float    eq[BW_EQ_TAPS];/* minimum-phase speaker-correction taps (gated direct-sound inverse) */
+    uint8_t  room_eq_count; /* LF modal cuts — STATIC-listener room correction only (docs/calibration.md) */
+    RoomEqSection room_eq[BW_ROOM_EQ_MAX];
 } Speaker;
 
 typedef struct {

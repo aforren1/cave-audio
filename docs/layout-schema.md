@@ -108,6 +108,8 @@ value), and **V** toggles the observer model (fixed centre vs the moving working
 | `position` | `[x, y, z]` float | surveyed position in room space (meters, RH). |
 | `gain_db` | float | measured per-speaker level trim, applied in `align_speakers`. `0.0` = no trim. |
 | `delay_ms` | float | per-speaker delay to time-align arrival to the reference; converted to whole samples at `sample_rate` on load. `0.0` = the reference (farthest) speaker. |
+| `eq` | float array (optional) | minimum-phase correction-FIR taps (up to 512), written by `bw_calibrate --eq` / `--room-eq`; applied per channel in the align stage before gain+delay. |
+| `room_eq` | object array (optional) | up to 8 LF modal-cut sections `{fc, gain_db, q}` (RBJ peaking, **cuts only**: `gain_db` in `[-24, 0]`, `fc` in `[10, 1000]`, `q` in `[0.25, 24]`), written by `bw_calibrate --room-eq`. **Static-listener room correction** — see [`calibration.md`](./calibration.md); rendered as biquads at the engine rate. |
 
 ## Validation (loader contract)
 

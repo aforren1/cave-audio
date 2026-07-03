@@ -1398,7 +1398,7 @@ RtCore* rt_create(uint32_t voice_cap, uint32_t sound_cap, uint32_t sample_rate, 
     c->lim_att_a = 1.0f - expf(-1.0f / (0.001f * (float)sample_rate));
     c->lim_rel_a = 1.0f - expf(-1.0f / (0.120f * (float)sample_rate));
     c->layout  = layout_default();
-    c->aligner = align_create(channels, &c->layout);
+    c->aligner = align_create(channels, &c->layout, sample_rate);
     if (!c->aligner) { rt_destroy(c); return NULL; }
     build_bed_decode(c);                        /* ambisonic bed decode from the default layout */
     /* push indices so the first alloc hands out slot 0, then 1, ... */
@@ -1412,7 +1412,7 @@ RtCore* rt_create(uint32_t voice_cap, uint32_t sound_cap, uint32_t sample_rate, 
  * rt_render. Voices recompute their DBAP gains on the next render (created dirty). */
 void rt_set_layout(RtCore* c, const Layout* L) {
     if (!c || !L) return;
-    Aligner* a = align_create(c->channels, L);
+    Aligner* a = align_create(c->channels, L, c->sample_rate);
     if (!a) return;                         /* keep the old layout on alloc failure */
     c->layout = *L;
     align_destroy(c->aligner);

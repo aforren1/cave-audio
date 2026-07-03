@@ -55,6 +55,22 @@ int calib_eq(const float* ir, int nir, int first_refl, double fs, int ntaps, flo
 int calib_write_eq(const char* in_path, const char* out_path, const float* taps, const uint16_t* lens,
                    int n, int max_taps, char* err, size_t errcap);
 
+/* STATIC-LISTENER room correction (docs/calibration.md): only valid when the listener sits at the
+ * measurement point (the fixed-observer SPCAP/VBAP deployments). Produces BOTH halves from one IR:
+ *   taps — a correction FIR from a frequency-dependent window (direct-gated at HF == the speaker EQ
+ *          above; growing to include the room toward LF), covering 200 Hz up, boost-capped at +3 dB;
+ *   cuts — LF modal peaking CUTS (30..200 Hz), where modes are minimum-phase and correctable.
+ * The 200 Hz split means nothing is corrected twice. Returns the cut count (0 = flat), -1 on failure. */
+int calib_room_eq(const float* ir, int nir, int first_refl, double fs, int ntaps, float* taps,
+                  MeasureEqSection* cuts, int max_cuts);
+
+/* Write per-speaker LF modal cuts into the layout JSON as each speaker's "room_eq" array of
+ * { fc, gain_db, q } objects (replacing any prior; count 0 = remove). `cuts` is n * max_sections
+ * row-major with `counts[i]` used per speaker. Returns 1 / 0. */
+int calib_write_room_eq(const char* in_path, const char* out_path,
+                        const MeasureEqSection* cuts, const int* counts, int n,
+                        int max_sections, char* err, size_t errcap);
+
 /* Drift check: given measured ranges (c*delay, meters, latency included) from ONE mic at `mic` to n
  * speakers at their STORED positions `pos`, report each speaker's RADIAL deviation (meters) from where
  * it should be. The unknown common latency is removed as the MEDIAN residual (robust to a few moved

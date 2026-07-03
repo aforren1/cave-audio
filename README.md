@@ -60,9 +60,10 @@ Not middleware: no events, banks, mixer graphs, or authoring app — the ABI is
 create/play/position/commit, and game-side audio (UI, menus) stays in the game
 engine's own mixer. Fixed target: the speaker geometry is data but the channel
 count is compile-time — this is not a general 5.1/Atmos renderer. Windows + ASIO
-only, one listener, and no room EQ at the listening position by design (a moving
-listener can't be room-corrected from one point; calibration flattens the
-speakers instead).
+only, one listener. Room EQ at the listening position is opt-in and static-listener
+only (`bw_calibrate --room-eq`, for the fixed-seat SPCAP/VBAP deployments); the
+moving-listener default flattens the speakers, not the room (one point can't
+correct a roam).
 
 Current gaps (may change): no user pitch control (Doppler is physics-derived), no
 master-bus gain or buses/groups (there is an output protection limiter), mono

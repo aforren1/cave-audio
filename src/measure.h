@@ -79,6 +79,35 @@ int measure_correction(const float* ir, int nir, int direct, int gate_len,
                        double f1, double f2, double fs, double max_boost_db, double max_cut_db,
                        int ntaps, float* taps);
 
+/* ---- STATIC-LISTENER room correction (docs/calibration.md). Only valid when the listener sits at
+ * the measurement point (the fixed-observer SPCAP/VBAP deployments) — a moving listener keeps the
+ * speaker-only measure_correction above. ---- */
+
+/* Room-correction FIR via a FREQUENCY-DEPENDENT WINDOW: each frequency's magnitude is estimated from
+ * the IR windowed to `cycles`/f seconds, clamped to [gate_len .. max_win_s]. At HF the window shrinks
+ * to the direct-sound gate (== measure_correction's quasi-anechoic view, and the ~1/cycles-octave
+ * resolution is the broad-stroke smoothing that survives head sway); at LF it grows to include the
+ * room. Same inversion policy as measure_correction (regularized, boost/cut-capped, min-phase, unity
+ * outside [f1, f2]) — pass f1 at the LF split so the modal band below is left to measure_room_cuts,
+ * never corrected twice. Returns 1 / 0. Offline only. */
+int measure_correction_room(const float* ir, int nir, int direct, int gate_len,
+                            double cycles, double max_win_s,
+                            double f1, double f2, double fs, double max_boost_db, double max_cut_db,
+                            int ntaps, float* taps);
+
+/* One parametric peaking section (RBJ biquad parameters, rate-independent). */
+typedef struct { float fc, gain_db, q; } MeasureEqSection;
+
+/* LF modal CUTS from a long-window magnitude estimate: find peaks in [f_lo, f_hi] that stand above a
+ * ±octave smoothed baseline by >= ~3 dB (room modes are minimum-phase there, so a magnitude cut also
+ * fixes the ringing), fit fc/Q from the peak's half-prominence width, and emit cut-only sections
+ * (gain_db < 0, depth capped at max_cut_db). NEVER emits boosts — dips are position-dependent
+ * interference and must not be fought. Returns the section count (0 = flat / nothing to cut), or -1
+ * on failure. Offline only. */
+int measure_room_cuts(const float* ir, int nir, int direct, double fs,
+                      double f_lo, double f_hi, double max_cut_db,
+                      int max_sections, MeasureEqSection* out);
+
 #ifdef __cplusplus
 }
 #endif

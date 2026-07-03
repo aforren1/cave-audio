@@ -139,7 +139,7 @@ int main(void) {
         AL.speakers[2].gain_lin = 0.5f;
         AL.speakers[3].delay_samples = 4;
         AL.max_delay_samples = 4;
-        Aligner* a = align_create(CH, &AL);
+        Aligner* a = align_create(CH, &AL, RATE);
         CHECK(a != NULL, "align_create");
         if (a) {
             const uint32_t n = 16;
@@ -162,7 +162,7 @@ int main(void) {
         Layout EQ = layout_default();
         EQ.speakers[5].eq_len = 3;
         EQ.speakers[5].eq[0] = 0.5f; EQ.speakers[5].eq[1] = 0.25f; EQ.speakers[5].eq[2] = -0.1f;
-        Aligner* a = align_create(CH, &EQ);
+        Aligner* a = align_create(CH, &EQ, RATE);
         CHECK(a != NULL, "align_create (eq)");
         if (a) {
             const uint32_t n = 16;
@@ -175,6 +175,37 @@ int main(void) {
                   fabs(buf[5*n+1] - 0.25f) < 1e-6 &&
                   fabs(buf[5*n+2] + 0.1f)  < 1e-6, "correction FIR convolves the channel with its kernel");
             CHECK(fabs(buf[1*n+0] - 1.0f) < 1e-6, "a channel with no correction passes through");
+            align_destroy(a);
+        }
+    }
+
+    /* 7a2. room_eq modal cut: a -6 dB peaking section at 100 Hz attenuates a 100 Hz tone by ~6 dB
+     * and leaves 1 kHz (and other channels) alone. Steady-state RMS over the tail (filter settled). */
+    {
+        Layout RQ = layout_default();
+        RQ.speakers[4].room_eq_count = 1;
+        RQ.speakers[4].room_eq[0].fc = 100.f; RQ.speakers[4].room_eq[0].gain_db = -6.f; RQ.speakers[4].room_eq[0].q = 2.f;
+        Aligner* a = align_create(CH, &RQ, RATE);
+        CHECK(a != NULL, "align_create (room_eq)");
+        if (a) {
+            enum { NN = 48000 };
+            static float buf[CH * NN];
+            memset(buf, 0, sizeof buf);
+            for (int i = 0; i < NN; ++i) {
+                buf[4 * (size_t)NN + i] = sinf(2.f * 3.14159265f * 100.f  * i / (float)RATE);
+                buf[6 * (size_t)NN + i] = sinf(2.f * 3.14159265f * 100.f  * i / (float)RATE);   /* no room_eq */
+                buf[7 * (size_t)NN + i] = sinf(2.f * 3.14159265f * 1000.f * i / (float)RATE);
+            }
+            align_process(a, buf, NN);
+            double r4 = 0, r6 = 0, r7 = 0;
+            for (int i = NN / 2; i < NN; ++i) {                     /* settled tail only */
+                r4 += (double)buf[4*(size_t)NN+i] * buf[4*(size_t)NN+i];
+                r6 += (double)buf[6*(size_t)NN+i] * buf[6*(size_t)NN+i];
+                r7 += (double)buf[7*(size_t)NN+i] * buf[7*(size_t)NN+i];
+            }
+            double att_db = 10.0 * log10(r4 / r6);                  /* cut channel vs untouched at fc */
+            CHECK(att_db < -5.0 && att_db > -7.0, "room_eq section cuts ~6 dB at its centre frequency");
+            CHECK(fabs(10.0 * log10(r7 / (0.5 * (NN / 2)))) < 0.6,  "room_eq leaves off-fc content alone");
             align_destroy(a);
         }
     }

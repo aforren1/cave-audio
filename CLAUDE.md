@@ -246,7 +246,13 @@ DragFloat3 = `"pos/$$0"`), and bare `CaptureScreenshot()` needs `CaptureReset()`
 trims: `measure_correction` gates the IR to the direct sound (before the first reflection) and inverts that
 magnitude into a minimum-phase FIR (`calib_eq` → the layout `eq` array → applied per channel in `align.c`,
 before gain+delay), so it flattens the SPEAKER not the room (a moving listener can't be room-EQ'd from one
-point — same trap as matching RT60); unit-tested in `measure`/`dsp`/`calib`. See docs/calibration.md.
+point — same trap as matching RT60); unit-tested in `measure`/`dsp`/`calib`. **`--room-eq`** is the opt-in
+STATIC-listener upgrade (fixed-observer SPCAP/VBAP installs; mic at the seat): the FIR is designed from a
+frequency-dependent window (`measure_correction_room` — direct-gated at HF, growing to include the room
+toward LF, boosts capped +3 dB) covering 200 Hz up, and 30–200 Hz gets discrete modal CUTS
+(`measure_room_cuts` → the layout `room_eq` array of {fc, gain_db, q}, cut-only by schema, rendered as
+per-channel biquads in `align.c`) — the split means nothing is corrected twice, and EQ still can't fix
+decay (that stays the `--room` report's treatment problem). See docs/calibration.md.
 Remaining: the by-ear headphone check; and live Motive verification of M6 (parser + lifecycle are tested off-wire). Do not bake ASIO assumptions
 outside `asio_sink.cpp`, and do not link the NatNet SDK (proprietary; reference only — GPLv3).
 The atomics in `rt.c` need `/experimental:c11atomics` on MSVC (wired in CMake); `pose.h` uses

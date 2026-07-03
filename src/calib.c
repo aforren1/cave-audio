@@ -200,6 +200,66 @@ fail:
     #undef FAIL
 }
 
+#define BW_ROOM_EQ_SPLIT_HZ 200.0   /* the FIR corrects above this; the modal cuts own [30, split] */
+
+int calib_room_eq(const float* ir, int nir, int first_refl, double fs, int ntaps, float* taps,
+                  MeasureEqSection* cuts, int max_cuts) {
+    if (!ir || !taps || !cuts) return -1;
+    /* same HF gate policy as calib_eq: at high frequencies the FD window shrinks to the direct sound */
+    int gate = (first_refl > 8) ? first_refl - 4 : (int)(0.004 * fs);
+    if (gate > nir) gate = nir;
+    if (gate < 16) return -1;
+    /* 6 cycles/f window (~1/6-octave resolution — the broad-stroke smoothing that survives head sway),
+     * up to 400 ms of room; boosts capped at +3 dB (a seated head still sways — never fight nulls hard). */
+    if (!measure_correction_room(ir, nir, 0, gate, 6.0, 0.4,
+                                 BW_ROOM_EQ_SPLIT_HZ, 18000.0, fs, 3.0, 18.0, ntaps, taps)) return -1;
+    return measure_room_cuts(ir, nir, 0, fs, 30.0, BW_ROOM_EQ_SPLIT_HZ, 12.0, max_cuts, cuts);
+}
+
+int calib_write_room_eq(const char* in_path, const char* out_path,
+                        const MeasureEqSection* cuts, const int* counts, int n,
+                        int max_sections, char* err, size_t errcap) {
+    #define FAIL(msg) do { if (err && errcap) snprintf(err, errcap, "%s", msg); goto fail; } while (0)
+    char* text = NULL; cJSON* root = NULL; char* outtext = NULL; int ok = 0;
+    text = read_file(in_path, NULL);
+    if (!text) { if (err && errcap) snprintf(err, errcap, "calib: cannot read %s", in_path); return 0; }
+    root = cJSON_Parse(text);
+    if (!root) FAIL("calib: layout is not valid JSON");
+    cJSON* speakers = cJSON_GetObjectItemCaseSensitive(root, "speakers");
+    if (!cJSON_IsArray(speakers)) FAIL("calib: layout has no 'speakers' array");
+    if (cJSON_GetArraySize(speakers) != n) FAIL("calib: speaker count does not match the measurements");
+
+    for (int i = 0; i < n; ++i) {
+        cJSON* sp = cJSON_GetArrayItem(speakers, i);
+        cJSON_DeleteItemFromObjectCaseSensitive(sp, "room_eq");   /* replace any prior */
+        int m = counts[i]; if (m > max_sections) m = max_sections;
+        if (m > 0) {
+            cJSON* arr = cJSON_CreateArray();
+            if (!arr) FAIL("calib: room_eq array alloc");
+            for (int s = 0; s < m; ++s) {
+                const MeasureEqSection* c = &cuts[(size_t)i * max_sections + s];
+                cJSON* o = cJSON_CreateObject();
+                if (!o) FAIL("calib: room_eq section alloc");
+                cJSON_AddNumberToObject(o, "fc",      round((double)c->fc * 10.0) / 10.0);
+                cJSON_AddNumberToObject(o, "gain_db", round((double)c->gain_db * 100.0) / 100.0);
+                cJSON_AddNumberToObject(o, "q",       round((double)c->q * 100.0) / 100.0);
+                cJSON_AddItemToArray(arr, o);
+            }
+            cJSON_AddItemToObject(sp, "room_eq", arr);
+        }
+    }
+    outtext = cJSON_Print(root);
+    if (!outtext) FAIL("calib: failed to serialize layout");
+    FILE* f = fopen(out_path, "wb");
+    if (!f) FAIL("calib: cannot open output for writing");
+    fwrite(outtext, 1, strlen(outtext), f); fclose(f);
+    ok = 1;
+fail:
+    free(outtext); cJSON_Delete(root); free(text);
+    return ok;
+    #undef FAIL
+}
+
 int calib_write_positions(const char* in_path, const char* out_path, const float (*pos)[3], int n, char* err, size_t errcap) {
     #define FAIL(msg) do { if (err && errcap) snprintf(err, errcap, "%s", msg); goto fail; } while (0)
     char* text = NULL; cJSON* root = NULL; char* outtext = NULL; int ok = 0;

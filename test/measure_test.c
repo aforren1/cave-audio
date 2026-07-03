@@ -167,7 +167,50 @@ int main(void) {
         free(col); free(taps); free(cor);
     }
 
+    /* --- static-listener room correction: the FD-window FIR sees (and cuts) a room resonance the
+     *     direct gate misses, matches the gated view at HF, and the LF cut solver finds a mode. --- */
+    {
+        const int nir = 16384, gate = 192 /* 4 ms */, ntaps = 512;
+        float* rm = (float*)calloc((size_t)nir, sizeof(float));
+        rm[0] = 1.0f;                                   /* direct */
+        peak_biquad(rm, nir,   80.0,  6.0, +12.0, fs);  /* an LF room mode: rings ~24 ms, way past the gate */
+        peak_biquad(rm, nir,  500.0, 10.0, +10.0, fs);  /* a mid room resonance: rings ~6 ms, past the gate */
+
+        /* LF modal cuts: the 80 Hz mode is found, as a CUT, with a sane Q; nothing else fires */
+        MeasureEqSection cuts[8];
+        int nc = measure_room_cuts(rm, nir, 0, fs, 30.0, 200.0, 12.0, 8, cuts);
+        CHECK(nc >= 1, "room cuts: the 80 Hz mode is detected");
+        int hit80 = 0;
+        for (int s = 0; s < nc; ++s) {
+            CHECK(cuts[s].gain_db < 0.f, "room cuts are cut-only (never a boost)");
+            CHECK(cuts[s].q >= 1.f && cuts[s].q <= 12.f, "room cut Q is clamped sane");
+            if (cuts[s].fc > 70.f && cuts[s].fc < 90.f && cuts[s].gain_db < -3.f) hit80 = 1;
+        }
+        CHECK(hit80, "a cut lands on the 80 Hz mode with meaningful depth");
+
+        /* an anechoic IR yields no cuts (nothing above the smoothed baseline) */
+        float* an = (float*)calloc((size_t)nir, sizeof(float));
+        an[0] = 1.0f;
+        CHECK(measure_room_cuts(an, nir, 0, fs, 30.0, 200.0, 12.0, 8, cuts) == 0,
+              "an anechoic IR produces zero cuts");
+
+        /* FD-window FIR vs the direct-gated FIR: normalize by their HF ratio (same gate there), then
+         * the room FIR must attenuate the 500 Hz resonance noticeably more than the gated one. */
+        float *tr = (float*)calloc((size_t)ntaps, sizeof(float));
+        float *tg = (float*)calloc((size_t)ntaps, sizeof(float));
+        CHECK(measure_correction_room(rm, nir, 0, gate, 6.0, 0.4, 200.0, 18000.0, fs, 3.0, 18.0, ntaps, tr),
+              "measure_correction_room succeeds");
+        CHECK(measure_correction(rm, nir, 0, gate, 200.0, 18000.0, fs, 3.0, 18.0, ntaps, tg),
+              "gated correction succeeds (same band/caps)");
+        double hf   = mag_at(tr, ntaps, 8000.0, fs) / mag_at(tg, ntaps, 8000.0, fs);
+        double r500 = (mag_at(tr, ntaps, 500.0, fs) / mag_at(tg, ntaps, 500.0, fs)) / hf;
+        printf("room-eq: FDW/gated at 8 kHz = %.2f, at 500 Hz (HF-normalized) = %.2f\n", hf, r500);
+        CHECK(fabs(hf - 1.0) < 0.25, "FD window converges to the direct gate at HF");
+        CHECK(r500 < 0.7, "FD window sees + cuts the room resonance the gate under-corrects");
+        free(rm); free(an); free(tr); free(tg);
+    }
+
     if (fails) { printf("measure_test: %d FAILURES\n", fails); return 1; }
-    printf("measure_test OK (sweep, deconvolution, delay+gain, band tilt, RT60, early reflections, speaker EQ verified)\n");
+    printf("measure_test OK (sweep, deconvolution, delay+gain, band tilt, RT60, early reflections, speaker EQ, room EQ verified)\n");
     return 0;
 }

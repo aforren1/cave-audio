@@ -59,7 +59,7 @@ int main(int argc, char** argv) {
     const char* out_path    = NULL;
     const char* driver      = getenv("BWAUDIO_ASIO_DRIVER");
     float mic[3] = { 0.f, 0.f, 0.f };
-    int   mic_in = 0, simulate = 0, room = 0, check = 0, live_speaker = -1, eq = 0, zylia = 0;
+    int   mic_in = 0, simulate = 0, room = 0, check = 0, live_speaker = -1, eq = 0, room_eq = 0, zylia = 0;
     double known_latency = -1.0;
     const char* ir_prefix = NULL;
     const char* localize_file = NULL;
@@ -76,10 +76,15 @@ int main(int argc, char** argv) {
         else if (!strcmp(argv[i],"--live") && i+1<argc)   live_speaker= atoi(argv[++i]); /* live distance readout for one speaker */
         else if (!strcmp(argv[i],"--latency") && i+1<argc) known_latency = atof(argv[++i]); /* c*tau meters, for --live absolute distance */
         else if (!strcmp(argv[i],"--eq"))                 eq          = 1;   /* per-speaker direct-sound correction FIR */
+        else if (!strcmp(argv[i],"--room-eq"))            eq = room_eq = 1;  /* + room correction AT THE MIC POINT (static listener only) */
         else if (!strcmp(argv[i],"--zylia"))              zylia       = 1;   /* single-position localization with the ZM-1 */
         else if (!strcmp(argv[i],"--mic") && i+3<argc) { mic[0]=(float)atof(argv[++i]); mic[1]=(float)atof(argv[++i]); mic[2]=(float)atof(argv[++i]); }
-        else { fprintf(stderr, "usage: calibrate [--layout f] [--out f] [--mic x y z] [--input ch] [--driver name] [--simulate] [--room] [--eq] [--zylia] [--save-irs prefix] [--localize positions.txt] [--check] [--live N] [--latency m]\n"); return 2; }
+        else { fprintf(stderr, "usage: calibrate [--layout f] [--out f] [--mic x y z] [--input ch] [--driver name] [--simulate] [--room] [--eq | --room-eq] [--zylia] [--save-irs prefix] [--localize positions.txt] [--check] [--live N] [--latency m]\n"); return 2; }
     }
+    if (room_eq)
+        printf("calibrate: --room-eq corrects the ROOM at the mic position — valid only for a STATIC\n"
+               "           listener seated there (SPCAP/VBAP deployments); a roaming listener wants plain --eq.\n"
+               "           Place the mic at the listening position, ear height.\n");
     if (!out_path) out_path = layout_path;                    /* in-place by default */
 
     char err[256] = {0};
@@ -256,8 +261,11 @@ int main(int argc, char** argv) {
 
     const int NTAPS = 256;                                     /* correction-FIR length (<= BW_EQ_TAPS) */
     float*    eq_taps = NULL; uint16_t* eq_lens = NULL;
+    MeasureEqSection* rq_cuts = NULL; int* rq_counts = NULL;   /* --room-eq: LF modal cuts per speaker */
     if (eq) { eq_taps = (float*)calloc((size_t)n * BW_EQ_TAPS, sizeof(float));
               eq_lens = (uint16_t*)calloc((size_t)n, sizeof(uint16_t)); }
+    if (room_eq) { rq_cuts   = (MeasureEqSection*)calloc((size_t)n * BW_ROOM_EQ_MAX, sizeof(MeasureEqSection));
+                   rq_counts = (int*)calloc((size_t)n, sizeof(int)); }
     for (int i = 0; i < n; ++i) {
         if (simulate) {
             calib_sim_capture(i, &L, mic, sweep, cap);
@@ -281,7 +289,18 @@ int main(int argc, char** argv) {
                 if (rr.rt60 > 0.f) { rt60_sum += rr.rt60; ++rt60_n; }
             }
             if (ir_prefix) { char p[512]; snprintf(p, sizeof p, "%s_%02d.wav", ir_prefix, i); calib_write_wav_f32(p, irbuf, IR_LEN, (int)FS); }
-            if (eq) {     /* gate to before the first reflection -> invert the speaker's direct response */
+            if (room_eq) {   /* room correction at the mic point: FD-window FIR + LF modal cuts */
+                int first_refl = rr.er_count ? rr.er_delay[0] : 0;
+                int nc = calib_room_eq(irbuf, IR_LEN, first_refl, FS, NTAPS,
+                                       &eq_taps[(size_t)i * BW_EQ_TAPS],
+                                       &rq_cuts[(size_t)i * BW_ROOM_EQ_MAX], BW_ROOM_EQ_MAX);
+                if (nc >= 0) { eq_lens[i] = (uint16_t)NTAPS; rq_counts[i] = nc; }
+                printf("            room-eq: %d-tap FIR (200 Hz up), %d LF modal cut(s)", eq_lens[i], nc < 0 ? 0 : nc);
+                for (int s = 0; s < rq_counts[i]; ++s)
+                    printf("  [%.0f Hz %.1f dB Q%.1f]", rq_cuts[(size_t)i*BW_ROOM_EQ_MAX+s].fc,
+                           rq_cuts[(size_t)i*BW_ROOM_EQ_MAX+s].gain_db, rq_cuts[(size_t)i*BW_ROOM_EQ_MAX+s].q);
+                printf("\n");
+            } else if (eq) {   /* gate to before the first reflection -> invert the speaker's direct response */
                 int first_refl = rr.er_count ? rr.er_delay[0] : 0;
                 if (calib_eq(irbuf, IR_LEN, first_refl, FS, NTAPS, &eq_taps[(size_t)i * BW_EQ_TAPS]))
                     eq_lens[i] = (uint16_t)NTAPS;
@@ -320,6 +339,12 @@ int main(int argc, char** argv) {
             fprintf(stderr, "calibrate: eq writeback: %s\n", err);
         else printf("calibrate: wrote per-speaker correction filters to %s\n", out_path);
         free(eq_taps); free(eq_lens);
+    }
+    if (room_eq) {   /* the LF modal cuts ride the same file (align.c renders them as biquads) */
+        if (!calib_write_room_eq(out_path, out_path, rq_cuts, rq_counts, n, BW_ROOM_EQ_MAX, err, sizeof err))
+            fprintf(stderr, "calibrate: room-eq writeback: %s\n", err);
+        else printf("calibrate: wrote LF modal cuts (room_eq) to %s\n", out_path);
+        free(rq_cuts); free(rq_counts);
     }
 
     free(gdb); free(dms); free(res); free(cap); free(sweep);

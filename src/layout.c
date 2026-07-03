@@ -154,6 +154,30 @@ bool layout_load(const char* path, uint32_t sample_rate, Layout* out, char* err,
             }
             spk->eq_len = (uint16_t)m;
         }
+
+        spk->room_eq_count = 0;                     /* optional LF modal cuts (calibrate --room-eq writes them) */
+        cJSON* rqj = cJSON_GetObjectItemCaseSensitive(sp, "room_eq");
+        if (cJSON_IsArray(rqj)) {
+            int m = cJSON_GetArraySize(rqj);
+            if (m > BW_ROOM_EQ_MAX) m = BW_ROOM_EQ_MAX;
+            for (int t = 0; t < m; ++t) {
+                cJSON* o  = cJSON_GetArrayItem(rqj, t);
+                cJSON* fj = cJSON_IsObject(o) ? cJSON_GetObjectItemCaseSensitive(o, "fc")      : NULL;
+                cJSON* gj2= cJSON_IsObject(o) ? cJSON_GetObjectItemCaseSensitive(o, "gain_db") : NULL;
+                cJSON* qj = cJSON_IsObject(o) ? cJSON_GetObjectItemCaseSensitive(o, "q")       : NULL;
+                if (!cJSON_IsNumber(fj) || !cJSON_IsNumber(gj2) || !cJSON_IsNumber(qj)) {
+                    set_err(err, errcap, "layout: bad room_eq section (need numeric fc/gain_db/q)"); goto done;
+                }
+                double fc = fj->valuedouble, g = gj2->valuedouble, q = qj->valuedouble;
+                if (!(fc >= 10.0 && fc <= 1000.0)) { set_err(err, errcap, "layout: room_eq fc out of range [10, 1000]"); goto done; }
+                if (!(g >= -24.0 && g <= 0.0))     { set_err(err, errcap, "layout: room_eq gain_db out of range [-24, 0] (cuts only)"); goto done; }
+                if (!(q >= 0.25 && q <= 24.0))     { set_err(err, errcap, "layout: room_eq q out of range [0.25, 24]"); goto done; }
+                spk->room_eq[spk->room_eq_count].fc      = (float)fc;
+                spk->room_eq[spk->room_eq_count].gain_db = (float)g;
+                spk->room_eq[spk->room_eq_count].q       = (float)q;
+                ++spk->room_eq_count;
+            }
+        }
     }
     for (uint32_t i = 0; i < BW_CHANNELS; ++i)
         if (!seen[i]) { set_err(err, errcap, "layout: missing a speaker index in 0..25"); goto done; }
