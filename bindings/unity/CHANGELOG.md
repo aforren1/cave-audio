@@ -6,6 +6,12 @@ All notable changes to `com.cave.bwaudio`.
 
 Initial Unity binding (M7).
 
+- Pause/seek + the output protection limiter (engine `9d60c6e`): `BwEmitter.Pause()/UnPause()/Paused`
+  (AudioSource.Pause/UnPause equivalents; click-free, the playhead freezes, paused still reads as
+  IsPlaying) and `BwEmitter.Seek(samples)` (a timeSamples-set equivalent; in-memory clips only —
+  streamed clips ignore it); `BwAudio.SetLimiter(bool)` / `SetLimiterCeiling(dB)` over the
+  engine-default ON at -1 dBFS.
+
 - `Bw` — P/Invoke layer, 1:1 with the bwaudio C ABI (`include/bwaudio.h`): lifecycle, assets,
   sources, ambisonic beds, materials/occlusion, directivity, reflection bed, listener, commit.
   Verified against the real `bwaudio.dll` (struct layout, calling convention, string/array/bool

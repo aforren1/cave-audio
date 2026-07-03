@@ -99,11 +99,31 @@ namespace CaveAudio
         {
             if (!_created || Eng == IntPtr.Zero) return;
             uint snd = BwAudio.Instance.Load(clipOverride ?? clip);
-            if (snd != 0) Bw.bw_source_play(Eng, _src, snd, loop);
+            if (snd != 0) { Bw.bw_source_play(Eng, _src, snd, loop); _paused = false; }   // play restarts un-paused
         }
 
         /// <summary>Stop this source — AudioSource.Stop equivalent.</summary>
         public void Stop() { if (_created && Eng != IntPtr.Zero) Bw.bw_source_stop(Eng, _src); }
+
+        /// <summary>Pause in place — AudioSource.Pause equivalent. Click-free (the engine ramps out
+        /// over one block and freezes the playhead); a paused source still reads as IsPlaying.</summary>
+        public void Pause() { Paused = true; }
+
+        /// <summary>Resume from exactly where Pause landed — AudioSource.UnPause equivalent.</summary>
+        public void UnPause() { Paused = false; }
+
+        /// <summary>Paused state (set-driven; Play() always restarts un-paused).</summary>
+        public bool Paused
+        {
+            get => _paused;
+            set { _paused = value; if (_created && Eng != IntPtr.Zero) Bw.bw_source_set_paused(Eng, _src, value); }
+        }
+        bool _paused;
+
+        /// <summary>Jump to `samples` (engine-rate frames) into the clip — AudioSource.timeSamples-set
+        /// equivalent, click-free (ramp-out → jump → ramp-in). In-memory clips only; streamed clips
+        /// ignore it. Past-the-end wraps a looping clip and ends a one-shot.</summary>
+        public void Seek(ulong samples) { if (_created && Eng != IntPtr.Zero) Bw.bw_source_seek(Eng, _src, samples); }
 
         /// <summary>Linear gain — AudioSource.volume equivalent; applies immediately if live.</summary>
         public float Gain

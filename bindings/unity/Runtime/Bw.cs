@@ -76,6 +76,8 @@ namespace CaveAudio
         [DllImport(DLL, CallingConvention = CC)] public static extern void bw_source_play_at(IntPtr e, uint s, uint snd, [MarshalAs(UnmanagedType.I1)] bool loop, ulong startSample);
         [DllImport(DLL, CallingConvention = CC)] public static extern ulong bw_dsp_time(IntPtr e);
         [DllImport(DLL, CallingConvention = CC)] public static extern void bw_source_stop(IntPtr e, uint s);
+        [DllImport(DLL, CallingConvention = CC)] public static extern void bw_source_set_paused(IntPtr e, uint s, [MarshalAs(UnmanagedType.I1)] bool paused);
+        [DllImport(DLL, CallingConvention = CC)] public static extern void bw_source_seek(IntPtr e, uint s, ulong frame);   // engine-rate frames; in-memory sounds
         [DllImport(DLL, CallingConvention = CC)] [return: MarshalAs(UnmanagedType.I1)] public static extern bool bw_source_is_playing(IntPtr e, uint s);
         [DllImport(DLL, CallingConvention = CC)] public static extern void bw_play_oneshot(IntPtr e, uint snd, float x, float y, float z, float gain);
 
@@ -123,6 +125,8 @@ namespace CaveAudio
         // Panner selection (load-time): DBAP (moving observer, default) or SPCAP (fixed-observer sweet spot).
         [DllImport(DLL, CallingConvention = CC)] public static extern void bw_set_panner(IntPtr e, BwPanner panner);
         [DllImport(DLL, CallingConvention = CC)] public static extern void bw_set_dual_band(IntPtr e, [MarshalAs(UnmanagedType.I1)] bool on);
+        [DllImport(DLL, CallingConvention = CC)] public static extern void bw_set_limiter(IntPtr e, [MarshalAs(UnmanagedType.I1)] bool on);
+        [DllImport(DLL, CallingConvention = CC)] public static extern void bw_set_limiter_ceiling(IntPtr e, float ceilingDb);   // default -1 dBFS; clamped [-60, 0]
         // Diffuse-bed decoder (load-time): sampling (default) or AllRAD (robust on irregular arrays).
         [DllImport(DLL, CallingConvention = CC)] public static extern void bw_set_bed_decoder(IntPtr e, BwBedDecoder decoder);
         // Offline panner evaluation (no engine handle): out = nsrc*n gains for a layout/panner; for layout scoring.

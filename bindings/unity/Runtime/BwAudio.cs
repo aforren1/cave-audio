@@ -108,6 +108,12 @@ namespace CaveAudio
             set { reverbGain = value; if (Ready) Bw.bw_reflections_set_gain(_eng, value); }
         }
 
+        /// <summary>Output protection limiter (engine default: ON at -1 dBFS). Linked across the 26
+        /// channels — engaging never shifts the spatial image. Protection against digital overs, not
+        /// mastering: if it engages in normal use, turn the content down.</summary>
+        public void SetLimiter(bool on) { if (Ready) Bw.bw_set_limiter(_eng, on); }
+        public void SetLimiterCeiling(float ceilingDb) { if (Ready) Bw.bw_set_limiter_ceiling(_eng, ceilingDb); }
+
         // ---- acoustic scene baking (load-time) ----------------------------------------------------
         // Collect every BwAcousticGeometry (+ the optional room box) into ONE mesh and hand it to the
         // engine. The engine's scene is a single static mesh, so this is a one-time bake before start.
