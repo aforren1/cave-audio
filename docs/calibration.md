@@ -97,6 +97,10 @@ the trim automatically).
   coloration is flattened — that is what the `--room` report's RT60/early-reflection numbers are
   for (treatment), and why `--room-eq` is correction at a point, not a room model to match.
 
+  The wrong-file mistake fails loudly: **`bw_start` refuses** a layout carrying `room_eq` sections
+  when the session renders a moving listener (the DBAP panner and/or `track_internal`) — see
+  `bw_last_error`. Load the roaming variant, or run SPCAP/VBAP with a fixed pose.
+
 ## Zylia ZM-1: full 3D from one placement
 
 `--localize` needs the omni mic at ≥5 spots because one omni gives only **distance**. The ZM-1 is 19

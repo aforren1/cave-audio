@@ -131,7 +131,9 @@ point). Roaming: DBAP + tracking, trims aligned at the working-volume center at
 standing ear height, speaker-only EQ — one point can't room-correct a roam. Diffing
 the two files in calib_view should show identical positions and only trim/EQ
 differences; unknown JSON fields survive recalibration, so a variant can carry its
-own annotation (e.g. `"intent": "seated, SPCAP"`).
+own annotation (e.g. `"intent": "seated, SPCAP"`). Loading the seated file into a
+moving-listener session (DBAP or tracking) fails `bw_start` rather than quietly
+mis-correcting the array.
 
 ### Audition — `bw_playground`
 

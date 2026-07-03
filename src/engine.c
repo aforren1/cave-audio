@@ -64,6 +64,7 @@ struct BwEngine {
     const char* last_error;        /* points at errbuf or a literal; NULL when clean */
     char        errbuf[256];
     BwProfile   profile;
+    int         panner;            /* mirror of bw_set_panner (BwPanner; 0 = DBAP) for the room_eq start guard */
 
     RtCore*     rt;               /* rings + voice/sound tables + mixer (rt.c) */
     Monitor*    monitor;          /* binaural/both: 26->stereo decode */
@@ -229,6 +230,24 @@ int bw_start(BwEngine* e) {
     if (!e) return 1;                                  /* BW_ERR_CONFIG (docs/api.md) */
     if (e->started) return 0;
     e->errbuf[0] = 0; e->last_error = NULL;
+
+    /* room_eq guard: static-listener room correction (bw_calibrate --room-eq) is only valid for a
+     * listener parked at the measurement point. A moving-listener session — the DBAP panner and/or
+     * internal tracking — with a room_eq'd layout is the wrong-file mistake; fail LOUDLY rather than
+     * quietly mis-correct the whole array (docs/calibration.md). */
+    {
+        int has_rq = 0;
+        for (uint32_t i = 0; i < e->layout.count; ++i)
+            if (e->layout.speakers[i].room_eq_count) { has_rq = 1; break; }
+        if (has_rq && (e->panner == (int)BW_PAN_DBAP || e->cfg.track_internal)) {
+            set_error(e, "bw_start: the layout carries room_eq (room correction at ONE point; static "
+                         "listener only), but this session renders a MOVING listener (DBAP panner "
+                         "and/or track_internal). Load the roaming layout, or use SPCAP/VBAP with a "
+                         "fixed pose.");
+            return 1;
+        }
+    }
+
     const uint32_t sr = e->cfg.sample_rate, bs = e->cfg.block_size;
     e->cap = bs;
 
@@ -446,7 +465,7 @@ void bw_source_seek(BwEngine* e, BwSource s, uint64_t frame)           { if (e) 
 bool bw_source_is_playing(BwEngine* e, BwSource s)                     { return e ? rt_source_is_playing(e->rt, s) : false; }
 void bw_test_signal(BwEngine* e, uint32_t channel, BwTestKind kind, float gain) { if (e) rt_test_signal(e->rt, channel, (uint8_t)kind, gain); }
 
-void bw_set_panner(BwEngine* e, BwPanner panner) { if (e) rt_set_panner(e->rt, (int)panner); }
+void bw_set_panner(BwEngine* e, BwPanner panner) { if (e) { e->panner = (int)panner; rt_set_panner(e->rt, (int)panner); } }
 void bw_set_dual_band(BwEngine* e, bool on)       { if (e) rt_set_dual_band(e->rt, on); }
 void bw_set_limiter(BwEngine* e, bool on)         { if (e) rt_set_limiter(e->rt, on); }
 void bw_set_limiter_ceiling(BwEngine* e, float ceiling_db) {
