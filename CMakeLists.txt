@@ -184,10 +184,21 @@ if(WIN32)
   endif()
 endif()
 
+# Windows .exe icon: compile the tool's resource script (examples/icons/<target>.rc -> .ico) into
+# the target. The raylib tools name their icon resource GLFW_ICON so the window/taskbar pick it up;
+# the rest use ordinal 1 (calib_view loads it for its window class). Regenerate the .ico family
+# with examples/icons/gen_icons.py (the .ico files are committed; builds never need Python).
+function(bw_tool_icon target)
+  if(WIN32)
+    target_sources(${target} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/examples/icons/${target}.rc)
+  endif()
+endfunction()
+
 # ---- tests ----
 # ---- track monitor example (console; prints the live track_internal pose) ----
 add_executable(bw_track_monitor examples/track_monitor.c)
 target_link_libraries(bw_track_monitor PRIVATE bwaudio)
+bw_tool_icon(bw_track_monitor)
 if(WIN32)
   add_custom_command(TARGET bw_track_monitor POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
@@ -197,6 +208,7 @@ endif()
 # ---- headless profiling bench (representative load for Tracy; build with -DBWAUDIO_TRACY=ON) ----
 add_executable(bw_profile_bench examples/profile_bench.c)
 target_link_libraries(bw_profile_bench PRIVATE bwaudio)
+bw_tool_icon(bw_profile_bench)
 if(WIN32)
   add_custom_command(TARGET bw_profile_bench POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
@@ -403,6 +415,7 @@ if(BWAUDIO_BUILD_PLAYGROUND)
   add_executable(bw_playground examples/playground.c)
   target_include_directories(bw_playground PRIVATE ${dr_libs_SOURCE_DIR})
   target_link_libraries(bw_playground PRIVATE bwaudio raylib)
+  bw_tool_icon(bw_playground)
   if(WIN32)
     add_custom_command(TARGET bw_playground POST_BUILD
       COMMAND ${CMAKE_COMMAND} -E copy_if_different
@@ -421,6 +434,7 @@ if(BWAUDIO_BUILD_PLAYGROUND)
   target_compile_definitions(bw_layout_tool PRIVATE ${BW_IMGUI_DEFS} NO_FONT_AWESOME STB_IMAGE_WRITE_STATIC)
   target_compile_features(bw_layout_tool PRIVATE cxx_std_17)      # bw_theme.h uses inline variables
   target_link_libraries(bw_layout_tool PRIVATE bwaudio raylib)
+  bw_tool_icon(bw_layout_tool)
   if(WIN32)
     add_custom_command(TARGET bw_layout_tool POST_BUILD
       COMMAND ${CMAKE_COMMAND} -E copy_if_different
@@ -462,6 +476,7 @@ if(BWAUDIO_BUILD_CALIBVIEW)
   target_compile_definitions(bw_calib_view PRIVATE ${BW_IMGUI_DEFS})
   target_compile_features(bw_calib_view PRIVATE cxx_std_17)      # bw_theme.h uses inline variables
   target_link_libraries(bw_calib_view PRIVATE bw_core d3d11 d3dcompiler comdlg32)   # comdlg32: file picker
+  bw_tool_icon(bw_calib_view)
   # Zylia tab (ZM-1 capture shell) + Capture tab (the calibrate sweep backends) — both live with the
   # ASIO SDK, simulate-only without it. asio_session arbitrates the SDK's one current-driver slot
   # between them (they'd otherwise tear each other down).
@@ -488,6 +503,7 @@ if(BWAUDIO_BUILD_CALIBRATE)
   enable_language(CXX)
   add_executable(bw_calibrate examples/calibrate.cpp examples/calib_capture.cpp examples/asio_session.cpp)
   target_link_libraries(bw_calibrate PRIVATE bw_core)
+  bw_tool_icon(bw_calibrate)
   if(BWAUDIO_WITH_ASIO)
     # the tool runs its own full-duplex ASIO host, so it compiles the SDK host sources itself (the
     # bwaudio DLL keeps them internal) — independent of the engine's output-only asio_sink.
@@ -507,6 +523,7 @@ if(BWAUDIO_BUILD_CALIBRATE)
   # The DOA view (clap -> direction on the capsule sphere) lives in bw_calib_view's Zylia tab.
   add_executable(bw_zylia_probe examples/zylia_probe.cpp examples/zylia_capture.cpp examples/asio_session.cpp)
   target_link_libraries(bw_zylia_probe PRIVATE bw_core)
+  bw_tool_icon(bw_zylia_probe)
   if(BWAUDIO_WITH_ASIO)
     target_sources(bw_zylia_probe PRIVATE
       ${ASIO_SDK_DIR}/common/asio.cpp

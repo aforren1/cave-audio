@@ -50,3 +50,6 @@ bindings/unity/**/obj/
 
 # playground scratch (the demo generates this at startup, removes it on clean exit)
 playground_src.wav
+
+# icon preview contact sheet (gen_icons.py regenerates it; the .ico files ARE committed)
+/examples/icons/preview_sheet.png

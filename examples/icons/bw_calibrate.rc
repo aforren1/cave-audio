@@ -1,0 +1,2 @@
+// Explorer/.exe icon (console tool; no window class to attach it to).
+1 ICON "bw_calibrate.ico"

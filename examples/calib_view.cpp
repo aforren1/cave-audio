@@ -1014,6 +1014,7 @@ int main(int argc, char** argv) {
 
     ImGui_ImplWin32_EnableDpiAwareness();
     WNDCLASSEXW wc = { sizeof wc, CS_CLASSDC, wnd_proc, 0, 0, GetModuleHandleW(NULL), NULL, NULL, NULL, NULL, L"bw_calib_view", NULL };
+    wc.hIcon = wc.hIconSm = LoadIconW(wc.hInstance, MAKEINTRESOURCEW(1));   /* the .rc icon (title bar/taskbar) */
     RegisterClassExW(&wc);
     HWND hwnd = CreateWindowW(wc.lpszClassName, L"bwaudio - calibration report viewer", WS_OVERLAPPEDWINDOW,
                               100, 100, 1280, 800, NULL, NULL, wc.hInstance, NULL);
