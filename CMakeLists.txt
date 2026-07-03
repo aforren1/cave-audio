@@ -146,10 +146,10 @@ endif()
 
 # ---- optional Steam Audio backend (production binaural HRTF decode; later occlusion/reflections) ----
 # Apache-2.0 (GPLv3-compatible). Auto-enabled when the prebuilt phonon SDK is vendored at
-# third_party/steamaudio/ (third_party/README.md). Stage 1 of the production monitor (the SH encode
+# third_party/steam-audio-artifacts/ (third_party/README.md). Stage 1 of the production monitor (the SH encode
 # in src/ambisonics.c) is always built + tested; stage 2 (the ambisonics->binaural HRTF decode, gated
 # BW_HAVE_STEAMAUDIO) supersedes the first-cut pan in binaural.c and lands with the SDK, on-SDK-verified.
-set(STEAMAUDIO_DIR "${CMAKE_SOURCE_DIR}/third_party/steamaudio" CACHE PATH "Steam Audio (phonon) SDK root")
+set(STEAMAUDIO_DIR "${CMAKE_SOURCE_DIR}/third_party/steam-audio-artifacts" CACHE PATH "Steam Audio (phonon) SDK root")
 if(EXISTS "${STEAMAUDIO_DIR}/include/phonon.h")
   set(BW_STEAMAUDIO_FOUND TRUE)   # consumed by the with-SDK reflection test below
   target_sources(bwaudio PRIVATE src/steam_decode.c src/steam_scene.c src/steam_reflect.c src/steam_path.c)  # HRTF decode + occlusion + reflections + pathing (with-SDK)

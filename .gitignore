@@ -32,7 +32,7 @@ CMakeUserPresets.json
 
 # Steam Audio prebuilt SDK — Apache-2.0 (redistributable), but the binaries are large;
 # fetch the release locally per third_party/README.md. CMake auto-detects it here.
-/third_party/steamaudio/
+/third_party/steam-audio-artifacts/
 
 # Unity binding build artifacts (the .dll is copied into Assets/Plugins by build)
 bindings/unity/**/Library/

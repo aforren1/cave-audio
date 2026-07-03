@@ -80,7 +80,7 @@ bindings/
   unreal/              module + component.
 docs/                  Specs. Start here.
 examples/              cave_layout.json (see docs/layout-schema.md).
-third_party/           asiosdk/ (GPLv3 option, vendored), steamaudio/; dr_wav + cJSON are
+third_party/           asiosdk/ (GPLv3 option, vendored), steam-audio-source/ (submodule) + steam-audio-artifacts/ (built phonon SDK); dr_wav + cJSON are
                        fetched by CMake (FetchContent, pinned) — see third_party/README.md.
 ```
 
@@ -121,7 +121,7 @@ rebuilds the engine on entry/exit, since the bed + room geometry are load-time).
 raw output channel with a 660 Hz sine/noise injected after align (`rt.c`) — a speaker-check / wiring
 tool, not a spatial path. The **production Steam Audio HRTF decode** is built + smoke-tested:
 `ambisonics.c` (3rd-order encode) → `steam_decode.c` (phonon `iplAmbisonicsDecodeEffect`), gated
-`BW_HAVE_STEAMAUDIO` (phonon built from the `third_party/steam-audio` submodule; see
+`BW_HAVE_STEAMAUDIO` (phonon built from the `third_party/steam-audio-source` submodule, staged in `steam-audio-artifacts/`; see
 third_party/README.md), with the simple-pan monitor as the no-SDK fallback. The `steam_decode` test
 drives the 26→stereo decode and asserts gross laterality (right→right ear, left→left, 180° flips) —
 which caught a real bug: the encode's real-SH m<0 channels (ACN 1,4,5,9,10,11) had phonon's opposite

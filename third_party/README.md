@@ -79,7 +79,7 @@ by changing the SHA; offline builds can override `FETCHCONTENT_SOURCE_DIR_CJSON_
 Steam Audio is a *clean, redistributable* dependency: it can be linked and shipped under the repo
 `LICENSE` with no special handling.
 
-**Vendored as a source submodule** at `third_party/steam-audio`, pinned to
+**Vendored as a source submodule** at `third_party/steam-audio-source`, pinned to
 [`ValveSoftware/steam-audio`](https://github.com/ValveSoftware/steam-audio) **v4.8.1+10
 (`480dd64`)** — chosen over a prebuilt release because those extra commits include an ambisonics
 conversion fix the v4.8.1 binaries lack. Two reasons the source is the right vendor here:
@@ -101,13 +101,13 @@ early reflections instead of omni-only. This is the open upstream issue
 no root cause/fix there yet); drop the patch once a fixed release lands.
 
 **Building phonon (minimal core, Windows x64).** This recipe produces a `phonon.dll`/`phonon.lib`
-that links cleanly into `bwaudio.dll`. Run from `third_party/steam-audio/core/build`:
+that links cleanly into `bwaudio.dll`. Run from `third_party/steam-audio-source/core/build`:
 
 ```sh
-git submodule update --init third_party/steam-audio          # fetch the pinned source
+git submodule update --init third_party/steam-audio-source   # fetch the pinned source
 
 # 0. Apply our local fixes (see third_party/patches/). REQUIRED for directional reflections.
-git -C third_party/steam-audio apply ../patches/phonon-multiplyaccumulate-align.patch
+git -C third_party/steam-audio-source apply ../patches/phonon-multiplyaccumulate-align.patch
 
 # 1. Fetch ONLY the required deps, with the SHARED CRT (/MD) — see the CRT note below.
 #    flatbuffers is a build tool (flatc); zlib/pffft/mysofa are linked into phonon.
@@ -132,7 +132,7 @@ cmake --build build/windows-vs2022-x64 --config Release --target phonon
 **Stage it** where `BWAUDIO_WITH_STEAMAUDIO` auto-detects it (mirroring the ASIO block):
 
 ```
-third_party/steamaudio/
+third_party/steam-audio-artifacts/
   include/   phonon.h, phonon_version.h        # from core/src/core/ + the generated build dir
   lib/windows-x64/   phonon.lib, phonon.dll    # from build/windows-vs2022-x64/src/core/Release/
 ```

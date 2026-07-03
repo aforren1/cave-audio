@@ -29,7 +29,7 @@ never let the sanitizer harness add allocation/locks to the callback.
 | dr_wav         | wav loading (single header)                 | public domain / MIT-0                    |
 | NatNet         | OptiTrack pose ingest                        | consume off-wire; see below              |
 
-Vendor third-party under `third_party/` (`asiosdk/`, `steamaudio/`, `dr_wav.h`).
+Vendor third-party under `third_party/` (`asiosdk/`, `steam-audio-source/` + `steam-audio-artifacts/`, `dr_wav.h`).
 
 ### ASIO SDK licensing (read before distributing)
 

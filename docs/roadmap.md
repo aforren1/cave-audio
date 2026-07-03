@@ -5,7 +5,7 @@ concurrency spine first, prove silence flows, then layer spatialization, then th
 engines. Don't start with the engine bindings.
 
 ## M0 — Scaffolding
-- CMake project, `third_party/` vendored (asiosdk, steamaudio, dr_wav).
+- CMake project, `third_party/` vendored (asiosdk, steam-audio-*, dr_wav).
 - `include/bwaudio.h` compiles; stub `engine.c` returns a valid opaque handle.
 - **Done when:** library builds and links on the target Windows toolchain.
 - **Status: ✅ done** — `CMakeLists.txt` builds `bwaudio.dll` from a stub `src/engine.c`
