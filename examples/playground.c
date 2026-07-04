@@ -44,6 +44,7 @@
 #include "ui_text.h"        /* crisp HUD text; ui_text() supersedes raylib's DrawText() */
 #include "speaker_gizmo.h"  /* the "real speaker" glyph (cabinet + cone aimed at the listener) */
 #include "constraints_view.h"  /* constraints.json boxes, drawn for orientation (same view as the layout tool) */
+#include "axes_hud.h"       /* screen-corner XYZ triad, shared with the layout tool */
 
 #define DR_WAV_IMPLEMENTATION
 #include "dr_wav.h"
@@ -737,6 +738,7 @@ int main(int argc, char** argv) {
         scenes[cur_scene].draw3d();
         draw_head(q);
         EndMode3D();
+        draw_axes_hud(cam, 56.f, (float)GetScreenHeight() - 56.f, 30.f);   /* room axes, bottom-left */
 
         /* HUD: a dark backing panel + bright ASCII text (raylib's default font has no em-dash/box glyphs).
          * Scene HUDs use up to three lines from y=52 (the localization scene's propagation line is the

@@ -56,6 +56,7 @@
 #include "speaker_gizmo.h"   /* the "real speaker" glyph (cabinet + cone aimed at the listener) */
 #include "cJSON.h"
 #include "constraints_view.h"   /* constraints.json load + box drawing, shared with the playground */
+#include "axes_hud.h"        /* screen-corner XYZ triad, shared with the playground */
 
 #include "imgui.h"
 #include "rlImGui.h"
@@ -1337,6 +1338,7 @@ int main(int argc, char** argv) {
         ClearBackground(Color{ 24, 24, 27, 255 });       /* matches the theme's WindowBg */
         float cov_worst, cov_mean;
         draw_scene(cam, &cov_worst, &cov_mean);
+        draw_axes_hud(cam, uiScaled(56), (float)GetScreenHeight() - uiScaled(56), uiScaled(30));  /* room axes, bottom-left */
 
         rlImGuiBegin();
         draw_labels(cam);                                /* background drawlist: under the windows, over the scene */
