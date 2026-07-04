@@ -20,12 +20,18 @@ static inline void draw_speaker_gizmo(Vector3 pos, Vector3 aim_at, float scale, 
 
     Color grille; grille.r = 30; grille.g = 30; grille.b = 36; grille.a = 255;
     Color cone;   cone.r   = 62; cone.g   = 62; cone.b   = 72; cone.a   = 255;
+    Color wire;                                            /* brightened body -> a crisp cabinet silhouette */
+    wire.r = (unsigned char)(body.r + (255 - body.r) / 2);
+    wire.g = (unsigned char)(body.g + (255 - body.g) / 2);
+    wire.b = (unsigned char)(body.b + (255 - body.b) / 2);
+    wire.a = 220;
 
     Vector3 back   = Vector3Subtract(pos, Vector3Scale(a, 0.55f * scale));
     Vector3 front  = Vector3Add(pos, Vector3Scale(a, 0.45f * scale));
     Vector3 f_rim  = Vector3Add(front, Vector3Scale(a, 0.05f * scale));
     Vector3 f_apex = Vector3Add(front, Vector3Scale(a, 0.34f * scale));
     DrawCylinderEx(back, front, 0.50f * scale, 0.42f * scale, 10, body);    /* cabinet, tapered to the face */
+    DrawCylinderWiresEx(back, front, 0.50f * scale, 0.42f * scale, 10, wire);   /* wireframe outline */
     DrawCylinderEx(front, f_rim, 0.34f * scale, 0.32f * scale, 12, grille); /* driver surround */
     DrawCylinderEx(f_rim, f_apex, 0.27f * scale, 0.04f * scale, 12, cone);  /* the cone, at the listener */
 }
