@@ -268,7 +268,8 @@ int main(void) {
     rt_destroy(c);
 
     /* 12. ambisonic bed: a W-only field decodes equally to all speakers; a front-encoded 1st-order
-     *     field favors the front speaker (room -z) over the back one (+z). */
+     *     field favors the front speaker over the back one. Room convention (post +z-forward flip):
+     *     the listener faces +z, so AmbiX-front (ACN3 X) must decode to the room +z speaker. */
     const char* AMB_OMNI = "bw_amb_omni.wav", *AMB_FRONT = "bw_amb_front.wav";
     if (write_ambix4_wav(AMB_OMNI, 0.5f, 0.f, 0.f, 0.f, 4 * N) &&
         write_ambix4_wav(AMB_FRONT, 0.5f, 0.f, 0.f, 0.5f, 4 * N)) {     /* W,Y,Z,X — X(ACN3) = front */
@@ -287,8 +288,8 @@ int main(void) {
             int s_front = -1, s_back = -1;
             for (int s = 0; s < CH; ++s)
                 if (fabsf(LD.speakers[s].pos[0]) < 0.1f && fabsf(LD.speakers[s].pos[1]) < 0.1f) {
-                    if (LD.speakers[s].pos[2] < -1.0f) s_front = s;
-                    if (LD.speakers[s].pos[2] >  1.0f) s_back  = s;
+                    if (LD.speakers[s].pos[2] >  1.0f) s_front = s;   /* room +z: the listener faces +z */
+                    if (LD.speakers[s].pos[2] < -1.0f) s_back  = s;
                 }
             uint32_t sf = rt_load_ambix(cb, AMB_FRONT, err, sizeof err);
             CHECK(sf != 0, "load ambix front");

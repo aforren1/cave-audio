@@ -166,8 +166,11 @@ static int load_json(const char* path) {
 static int save_json(const char* path) {
     FILE* f = fopen(path, "wb");
     if (!f) return 0;
+    /* delay_ms time-aligns arrivals at the LISTENING POINT (ears at obs_height), not the floor
+     * origin — since the +z-forward/floor-origin move, distance-to-origin would skew alignment. */
+    const Vector3 ear = { 0.0f, obs_height, 0.0f };
     float dmax = 0.0f;
-    for (int i = 0; i < NSPK; ++i) { float d = Vector3Length(spk[i].pos); if (d > dmax) dmax = d; }
+    for (int i = 0; i < NSPK; ++i) { float d = Vector3Distance(spk[i].pos, ear); if (d > dmax) dmax = d; }
     fprintf(f,
         "{\n"
         "  \"schema_version\": 1,\n"
@@ -178,7 +181,7 @@ static int save_json(const char* path) {
         "  \"speakers\": [\n",
         (double)SPEED_OF_SOUND, dbap_r, dist_model, dist_ref, dist_rolloff, dist_min_db);
     for (int i = 0; i < NSPK; ++i) {
-        float d = Vector3Length(spk[i].pos);
+        float d = Vector3Distance(spk[i].pos, ear);
         float delay_ms = (dmax - d) / SPEED_OF_SOUND * 1000.0f;
         fprintf(f, "    { \"index\": %d, \"position\": [%.4f, %.4f, %.4f], \"gain_db\": %.2f, \"delay_ms\": %.3f }%s\n",
                 i, spk[i].pos.x, spk[i].pos.y, spk[i].pos.z, spk[i].gain_db, delay_ms, (i < NSPK - 1) ? "," : "");
@@ -838,9 +841,10 @@ static void draw_labels(const Camera3D& cam) {
 
 /* top-left status overlay: pure text, never captures the mouse (scene clicks pass through it) */
 static void draw_hud(float cov_worst, float cov_mean) {
-    float dmax = 0.0f;                               /* live delay readout: max-distance alignment */
-    for (int i = 0; i < NSPK; ++i) { float dd = Vector3Length(spk[i].pos); if (dd > dmax) dmax = dd; }
-    float seld   = Vector3Length(spk[sel].pos);
+    const Vector3 ear = { 0.0f, obs_height, 0.0f };  /* live delay readout: max-distance alignment at the ears */
+    float dmax = 0.0f;
+    for (int i = 0; i < NSPK; ++i) { float dd = Vector3Distance(spk[i].pos, ear); if (dd > dmax) dmax = dd; }
+    float seld   = Vector3Distance(spk[sel].pos, ear);
     float seldel = (dmax - seld) / SPEED_OF_SOUND * 1000.0f;
     int con_bad = 0, con_occ = 0;
     if (CON.loaded) for (int i = 0; i < NSPK; ++i) {

@@ -191,8 +191,11 @@ struct RtCore {
     PoseSlot readback;
 
     /* post-mix aux-send tap (the reflection bed): a phonon-free hook the audio thread calls after the
-     * voice loop. `aux` is the summed mono send (opted-in voices); set while stopped. */
-    RtBusTap bus_tap;
+     * voice loop. `aux` is the summed mono send (opted-in voices). The tap pointer is published with
+     * release AFTER its user-data (bus_tap_ud), and the audio thread acquire-loads it — so it is
+     * registered SAFELY even though bw_start opens the sink (starting the callback) before it registers
+     * the tap: a render seeing a non-NULL tap always sees a consistent ud. */
+    _Atomic RtBusTap bus_tap;
     void*    bus_tap_ud;
     float*   aux;                /* BW_RT_MAX_BLOCK mono samples; the per-block aux send scratch */
     StreamSet* streams;          /* background file-streaming thread + ring pool (control thread owns lifecycle) */
@@ -200,7 +203,7 @@ struct RtCore {
 
     /* pathing: rt_render SH-encodes pathing voices into path_accum, then path_tap decodes it to the bus.
      * Per voice the sim publishes shCoeffs via a handle-gated double buffer (path_pub[idx*2 + path_idx]). */
-    RtPathTap path_tap;
+    _Atomic RtPathTap path_tap;  /* published release-after-ud/ambi_ch; acquire-loaded (see bus_tap) */
     void*    path_tap_ud;
     uint32_t path_ambi_ch;       /* (order+1)^2 of the pathing field; 0 = no path tap */
     float*   path_accum;         /* BW_AMBI_CH * BW_RT_MAX_BLOCK; summed ambisonic indirect field */
@@ -251,14 +254,19 @@ static uint32_t alloc_handle(RtCore* c) {
     if (g == 0) g = 1;                                        /* skip 0 (invalid handle) */
     c->gen[idx] = g;
     c->inuse[idx] = 1;
+    c->priority[idx] = 128;                                   /* defined default for EVERY alloc (sources AND oneshots),
+                                                              * so a recycled slot never leaks its prior priority */
     return BW_MK_H(idx, g);
 }
 
-static void recycle_handle(RtCore* c, uint16_t idx) {
-    /* Idempotent: only a currently-allocated slot is returned to the free-list, so a
-     * double-destroy (or a destroy racing a future EVT_VOICE_ENDED) can neither double-
-     * free the index nor overflow free_count past voice_cap. */
-    if (idx < c->voice_cap && c->inuse[idx]) {
+static void recycle_handle(RtCore* c, uint32_t h) {
+    uint16_t idx = BW_H_IDX(h);
+    /* Gen-checked + idempotent: return the slot to the free-list only if THIS handle is still its
+     * current occupant. A stale handle (slot already recycled, then re-allocated at a higher gen)
+     * is dropped, so a double-destroy OR a late EVT_VOICE_ENDED for a since-stolen slot can never
+     * free a live source's slot (invariant 5). The inuse check catches a double-free before reuse;
+     * the gen check catches one after reuse. */
+    if (idx < c->voice_cap && c->inuse[idx] && c->gen[idx] == BW_H_GEN(h)) {
         c->inuse[idx] = 0;
         c->freelist[c->free_count++] = idx;
     }
@@ -299,7 +307,7 @@ static void drain_events(RtCore* c) {                          /* control thread
     for (; rd != w; ++rd) {
         const Evt* ev = &r->slots[rd & (EVT_CAP - 1)];
         switch (ev->type) {
-        case EVT_VOICE_ENDED:    recycle_handle(c, BW_H_IDX(ev->handle)); break;
+        case EVT_VOICE_ENDED:    recycle_handle(c, ev->handle); break;
         case EVT_SOUND_RETIRED: {        /* audio dropped all refs: free pcm / close the stream + recycle the slot */
             SoundSlot* s = sound_slot_ctrl(c, ev->handle);
             if (s) {
@@ -506,8 +514,10 @@ static void drain_commands(RtCore* c) {
 }
 
 /* Build the ambisonic bed decode matrix from the layout: for each speaker, sample the SH basis at
- * its direction (room -> ambisonic axes: room x=right/y=up/z=back -> ambi x=front/y=left/z=up) and
- * scale by (2l+1)/L. World-locked: directions are from the room origin, not the moving listener.
+ * its direction (room -> ambisonic axes) and scale by (2l+1)/L. Room convention (post +z-forward
+ * flip): identity listener faces +z, right ear at -x, +y up; AmbiX axes are x=front/y=left/z=up, so
+ * ambi front = room +z (where the listener faces / the main content sits), ambi left = room +x,
+ * ambi up = room +y. World-locked: directions are from the array centroid, not the moving listener.
  * This is the projection/sampling decode, which assumes a roughly UNIFORM speaker distribution; the
  * cave grid is only approximately uniform, so it is good for a diffuse bed but a pseudo-inverse
  * (mode-matching) decode would be exact — a refinement, not needed for v1's diffuse content. */
@@ -522,7 +532,7 @@ static void build_bed_decode_sad(RtCore* c) {
         float len = sqrtf(p[0]*p[0] + p[1]*p[1] + p[2]*p[2]);
         float ad[3];
         if (len < 1e-6f) { ad[0] = 1.f; ad[1] = 0.f; ad[2] = 0.f; }          /* degenerate: face front */
-        else { ad[0] = -p[2]/len; ad[1] = -p[0]/len; ad[2] = p[1]/len; }     /* (-z,-x,y) = ambisonic axes */
+        else { ad[0] = p[2]/len; ad[1] = p[0]/len; ad[2] = p[1]/len; }       /* (z,x,y): ambi front=+z, left=+x, up=+y */
         float y[BW_AMBI_CH];
         ambi_encode_sn3d(ad, y);
         for (int k = 0; k < BW_AMBI_CH; ++k) {
@@ -924,6 +934,16 @@ void rt_render(RtCore* c, float* bus, uint32_t nframes, const BwTimestamp* ts) {
     BW_ZONE_BEGIN(zr, "rt_render");
     drain_commands(c);
 
+    /* Every RT scratch buffer (aux / stream_scratch / path_accum) is sized BW_RT_MAX_BLOCK, which
+     * matches the engine's BW_MAX_BLOCK device-block ceiling. If a driver ever presents a larger
+     * block, fail safe to silence rather than overflow the scratch on the audio thread. (Commands
+     * are still drained above so the control ring never backs up.) */
+    if (nframes > BW_RT_MAX_BLOCK) {
+        memset(bus, 0, sizeof(float) * (size_t)nframes * c->channels);
+        BW_ZONE_END(zr);
+        return;
+    }
+
     /* track_internal: sample the freshest tracked head pose at block time, overriding the
      * committed listener (lower latency than routing pose through the command ring). A position
      * change dirties every voice, since DBAP gains are all listener-relative. */
@@ -938,10 +958,14 @@ void rt_render(RtCore* c, float* bus, uint32_t nframes, const BwTimestamp* ts) {
     }
 
     memset(bus, 0, sizeof(float) * (size_t)nframes * c->channels);
+    /* Acquire-load the taps once (paired with the release stores in rt_set_*_tap): a non-NULL tap
+     * guarantees its ud/ambi_ch are visible, so registration mid-run (bw_start) can't tear. */
+    const RtBusTap  bus_tap  = atomic_load_explicit(&c->bus_tap,  memory_order_acquire);
+    const RtPathTap path_tap = atomic_load_explicit(&c->path_tap, memory_order_acquire);
     /* the reflection aux send: collected this block if a tap is registered + the block fits the scratch */
-    float* aux = (c->bus_tap && nframes <= BW_RT_MAX_BLOCK) ? c->aux : NULL;
+    float* aux = (bus_tap && nframes <= BW_RT_MAX_BLOCK) ? c->aux : NULL;
     if (aux) memset(aux, 0, sizeof(float) * (size_t)nframes);
-    const int path_active = (c->path_tap && c->path_ambi_ch && nframes <= BW_RT_MAX_BLOCK);
+    const int path_active = (path_tap && c->path_ambi_ch && nframes <= BW_RT_MAX_BLOCK);
     if (path_active) memset(c->path_accum, 0, sizeof(float) * (size_t)c->path_ambi_ch * nframes);  /* pathing accumulator */
     int rt_active = 0;
     BW_ZONE_BEGIN(zmix, "mix voices");
@@ -970,12 +994,12 @@ void rt_render(RtCore* c, float* bus, uint32_t nframes, const BwTimestamp* ts) {
     }
     if (aux) {   /* reflection bed: convolve the aux send + sum onto the bus BEFORE align (so it gets trim+delay too) */
         BW_ZONE_BEGIN(zt, "reflect tap");
-        c->bus_tap(c->bus_tap_ud, bus, nframes, c->lis.p_active, c->lis.q_active, aux);
+        bus_tap(c->bus_tap_ud, bus, nframes, c->lis.p_active, c->lis.q_active, aux);
         BW_ZONE_END(zt);
     }
     if (path_active) {   /* pathing: decode the summed indirect ambisonic field onto the bus (also pre-align) */
         BW_ZONE_BEGIN(zp, "path tap");
-        c->path_tap(c->path_tap_ud, bus, nframes, c->lis.p_active, c->lis.q_active, c->path_accum, c->path_ambi_ch);
+        path_tap(c->path_tap_ud, bus, nframes, c->lis.p_active, c->lis.q_active, c->path_accum, c->path_ambi_ch);
         BW_ZONE_END(zp);
     }
     BW_ZONE_BEGIN(za, "align");
@@ -1078,11 +1102,10 @@ uint32_t rt_source_create(RtCore* c) {
         }
         if (!h) return 0;                   /* nothing to steal (or the destroy didn't enqueue): genuinely full */
     }
-    uint16_t idx = BW_H_IDX(h);
-    c->priority[idx] = 128;                 /* default mid priority until the caller sets one */
+    uint16_t idx = BW_H_IDX(h);             /* priority defaulted to 128 in alloc_handle */
     Cmd cmd = { .type = CMD_SRC_CREATE, .handle = h };
     if (!cmd_push(&c->cmds, &cmd)) {        /* ring full (should never happen): don't leak the slot */
-        recycle_handle(c, idx);
+        recycle_handle(c, h);
         return 0;
     }
     return h;
@@ -1102,7 +1125,7 @@ void rt_source_destroy(RtCore* c, uint32_t h) {
     /* Recycle only if the destroy was actually enqueued, so a dropped command can't leave
      * the voice active while the index is handed out again. recycle is idempotent, so a
      * double-destroy is harmless. */
-    if (cmd_push(&c->cmds, &cmd)) recycle_handle(c, BW_H_IDX(h));
+    if (cmd_push(&c->cmds, &cmd)) recycle_handle(c, h);
 }
 
 void rt_source_set_pos(RtCore* c, uint32_t h, float x, float y, float z) {
@@ -1133,8 +1156,9 @@ void rt_source_set_pathing(RtCore* c, uint32_t h, bool on) {
 
 void rt_set_path_tap(RtCore* c, RtPathTap tap, void* ud, uint32_t ambi_ch) {
     if (!c) return;
-    c->path_tap = tap; c->path_tap_ud = ud;
-    c->path_ambi_ch = (ambi_ch > BW_AMBI_CH) ? BW_AMBI_CH : ambi_ch;   /* set while the audio thread is stopped */
+    c->path_tap_ud  = ud;                                        /* publish ud + ambi_ch BEFORE the tap ... */
+    c->path_ambi_ch = (ambi_ch > BW_AMBI_CH) ? BW_AMBI_CH : ambi_ch;
+    atomic_store_explicit(&c->path_tap, tap, memory_order_release);  /* ... acquire-load of a non-NULL tap sees both */
 }
 
 /* Off-thread pathing sim publishes a voice's path field: write the back buffer, flip the index (release).
@@ -1477,7 +1501,9 @@ void rt_set_tracker(RtCore* c, const PoseSlot* slot) {
 }
 
 void rt_set_bus_tap(RtCore* c, RtBusTap tap, void* ud) {
-    if (c) { c->bus_tap = tap; c->bus_tap_ud = ud; }   /* audio thread reads them; set while stopped */
+    if (!c) return;
+    c->bus_tap_ud = ud;                                          /* publish ud BEFORE the tap ... */
+    atomic_store_explicit(&c->bus_tap, tap, memory_order_release);   /* ... so an acquire-load of a non-NULL tap sees it */
 }
 
 /* Publish a voice's occlusion transmittance (1 = clear, 0 = blocked). Called from the off-thread

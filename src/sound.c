@@ -55,6 +55,7 @@ static double sinc(double x) { return (x == 0.0) ? 1.0 : sin(BW_PI * x) / (BW_PI
  * cutoff dropped to the lower Nyquist on downsampling so it band-limits. Returns a new malloc'd
  * buffer (caller frees) + sets *n_out; NULL on OOM. Quality is for load-time asset prep, not the RT path. */
 static float* resample_mono(const float* in, uint64_t n_in, uint32_t fin, uint32_t fout, uint64_t* n_out) {
+    if (fin == 0 || fout == 0) return NULL;          /* guard: ratio would be inf/0 -> UB cast + overflow malloc */
     const double ratio = (double)fout / (double)fin;
     uint64_t no = (uint64_t)((double)n_in * ratio + 0.5);
     if (no == 0) no = 1;
@@ -92,6 +93,7 @@ bool sound_load(const char* path, uint32_t want_rate, SoundData* out, char* err,
     float* interleaved = decode_any(path, &channels, &rate, &frames);
     if (!interleaved)                 { set_err(err, errcap, "sound: cannot open/decode (wav/flac/mp3)"); return false; }
     if (channels == 0 || frames == 0) { free(interleaved); set_err(err, errcap, "sound: empty file"); return false; }
+    if (rate == 0)                    { free(interleaved); set_err(err, errcap, "sound: invalid sample rate (0)"); return false; }
 
     /* downmix to mono (equal weight) */
     float* mono = (float*)malloc((size_t)frames * sizeof(float));
@@ -163,6 +165,7 @@ bool sound_load_ambix(const char* path, uint32_t want_rate, SoundData* out, char
     float* inter = decode_any(path, &channels, &rate, &frames);
     if (!inter)               { set_err(err, errcap, "ambix: cannot open/decode (wav/flac/mp3)"); return false; }
     if (frames == 0)          { free(inter); set_err(err, errcap, "ambix: empty file"); return false; }
+    if (rate == 0)            { free(inter); set_err(err, errcap, "ambix: invalid sample rate (0)"); return false; }
     if (channels != 4 && channels != 9 && channels != 16) {
         free(inter); set_err(err, errcap, "ambix: channel count must be 4, 9, or 16 (1st/2nd/3rd order)"); return false;
     }

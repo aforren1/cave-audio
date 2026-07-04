@@ -21,8 +21,8 @@ static void fib_dir(int i, int M, float d[3]) {
     float r = sqrtf(fmaxf(0.f, 1.f - y * y)), th = (float)i * 2.39996323f;
     d[0] = r * cosf(th); d[1] = y; d[2] = r * sinf(th);
 }
-/* room (x=right,y=up,z=back) -> ambisonic axes (x=front,y=left,z=up): (-z,-x,y) — matches build_bed_decode */
-static void room_to_ambi(const float d[3], float a[3]) { a[0] = -d[2]; a[1] = -d[0]; a[2] = d[1]; }
+/* room (+z fwd, +y up, -x right) -> ambisonic axes (x=front,y=left,z=up): (z,x,y) — matches build_bed_decode */
+static void room_to_ambi(const float d[3], float a[3]) { a[0] = d[2]; a[1] = d[0]; a[2] = d[1]; }
 
 int allrad_build_decode(const Layout* L, float decode[BW_CHANNELS][BW_AMBI_CH]) {
     const uint32_t N = L->count;

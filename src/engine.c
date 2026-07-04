@@ -98,6 +98,9 @@ static void set_error(BwEngine* e, const char* msg) {
     if (msg && msg != e->errbuf) { strncpy(e->errbuf, msg, sizeof e->errbuf - 1); e->errbuf[sizeof e->errbuf - 1] = 0; }
     e->last_error = (msg && e->errbuf[0]) ? e->errbuf : msg;
 }
+/* Reset the error state at the start of an operation, so a SUCCESSFUL call leaves bw_last_error at
+ * NULL (not a stale pointer to a now-empty errbuf, which reads as a spurious non-NULL "" error). */
+static void clear_error(BwEngine* e) { if (e) { e->errbuf[0] = 0; e->last_error = NULL; } }
 
 /* env helpers for the track_internal (NatNet) config — keeps the NatNet wiring out of BwConfig */
 static const char* env_or(const char* name, const char* def) { const char* v = getenv(name); return (v && v[0]) ? v : def; }
@@ -375,14 +378,14 @@ const char* bw_audio_backend(BwEngine* e) {
 
 BwSound bw_load_sound(BwEngine* e, const char* path) {
     if (!e) return 0;
-    e->errbuf[0] = 0;
+    clear_error(e);
     BwSound snd = rt_load_sound(e->rt, path, e->errbuf, sizeof e->errbuf);
     if (snd == 0) set_error(e, e->errbuf[0] ? e->errbuf : "bw_load_sound: failed");
     return snd;
 }
 BwSound bw_load_sound_streaming(BwEngine* e, const char* path) {
     if (!e) return 0;
-    e->errbuf[0] = 0;
+    clear_error(e);
     BwSound snd = rt_load_sound_streaming(e->rt, path, e->errbuf, sizeof e->errbuf);
     if (snd == 0) set_error(e, e->errbuf[0] ? e->errbuf : "bw_load_sound_streaming: failed");
     return snd;
@@ -394,7 +397,7 @@ void bw_unload_sound(BwEngine* e, BwSound snd) {
 
 BwSound bw_load_ambix(BwEngine* e, const char* path) {
     if (!e) return 0;
-    e->errbuf[0] = 0;
+    clear_error(e);
     BwSound snd = rt_load_ambix(e->rt, path, e->errbuf, sizeof e->errbuf);
     if (snd == 0) set_error(e, e->errbuf[0] ? e->errbuf : "bw_load_ambix: failed");
     return snd;
@@ -505,7 +508,15 @@ uint32_t bw_panner_gains_batch(BwPanner panner, const float* positions, uint32_t
     }
     return nsrc;
 }
-void bw_set_bed_decoder(BwEngine* e, BwBedDecoder decoder) { if (e) rt_set_bed_decoder(e->rt, (int)decoder); }
+void bw_set_bed_decoder(BwEngine* e, BwBedDecoder decoder) {
+    if (!e) return;
+    if (e->started) {   /* load-time only: rt_set_bed_decoder rebuilds bed_decode[26][16] on the control
+                         * thread, which would race mix_bed reading it on the audio thread */
+        set_error(e, "bw_set_bed_decoder: load-time only (call between bw_create and bw_start)");
+        return;
+    }
+    rt_set_bed_decoder(e->rt, (int)decoder);
+}
 
 uint32_t bw_get_speakers(BwEngine* e, float* xyz, uint32_t cap) {
     if (!e) return 0;
@@ -659,6 +670,11 @@ float bw_source_get_occlusion(BwEngine* e, BwSource s) {
 
 void bw_reflections_config(BwEngine* e, const BwReflectionConfig* cfg) {
     if (!e || !cfg) return;
+    if (e->started) {   /* load-time only: the bed's IR length + order are baked at bw_start, so a
+                         * post-start config would silently do nothing until the next stop/start */
+        set_error(e, "bw_reflections_config: load-time only (call between bw_create and bw_start)");
+        return;
+    }
     e->refl_cfg = *cfg;                                         /* applied at bw_start; zero -> defaults */
     if (e->refl_cfg.ir_seconds <= 0.f) e->refl_cfg.ir_seconds = 1.0f;
     if (e->refl_cfg.order == 0)        e->refl_cfg.order       = 1;

@@ -281,7 +281,7 @@ int main(void) {
                 float p[3] = { LD.speakers[s].pos[0] - LD.ref[0], LD.speakers[s].pos[1] - LD.ref[1],
                                LD.speakers[s].pos[2] - LD.ref[2] };       /* dirs from the array centre */
                 float pl = sqrtf(p[0]*p[0] + p[1]*p[1] + p[2]*p[2]);
-                float ad2[3] = { -p[2]/pl, -p[0]/pl, p[1]/pl }, ys[BW_AMBI_CH]; ambi_encode_sn3d(ad2, ys);
+                float ad2[3] = { p[2]/pl, p[0]/pl, p[1]/pl }, ys[BW_AMBI_CH]; ambi_encode_sn3d(ad2, ys);   /* (z,x,y): matches build_bed_decode */
                 for (int k = 0; k < BW_AMBI_CH; ++k) { int l = (int)floorf(sqrtf((float)k));
                     double d = (double)(2*l+1)*ys[k]/CH; esad += d*d/(2*l+1); }
             }
@@ -291,7 +291,7 @@ int main(void) {
             for (int t = 0; t < 3; ++t) {
                 float* sd = dirs[t]; float sl = sqrtf(sd[0]*sd[0] + sd[1]*sd[1] + sd[2]*sd[2]);
                 float s3[3] = { sd[0]/sl, sd[1]/sl, sd[2]/sl };
-                float ad[3] = { -s3[2], -s3[0], s3[1] }, sh[BW_AMBI_CH]; ambi_encode_sn3d(ad, sh);
+                float ad[3] = { s3[2], s3[0], s3[1] }, sh[BW_AMBI_CH]; ambi_encode_sn3d(ad, sh);   /* (z,x,y): matches build_bed_decode */
                 float rE[3] = { 0, 0, 0 };
                 for (int s = 0; s < CH; ++s) {
                     float f = 0; for (int k = 0; k < BW_AMBI_CH; ++k) f += dec[s][k]*sh[k];
