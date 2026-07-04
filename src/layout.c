@@ -133,6 +133,9 @@ bool layout_load(const char* path, uint32_t sample_rate, Layout* out, char* err,
         for (int c = 0; c < 3; ++c) {
             cJSON* v = cJSON_GetArrayItem(posj, c);
             if (!cJSON_IsNumber(v)) { set_err(err, errcap, "layout: non-numeric position component"); goto done; }
+            if (!isfinite(v->valuedouble) || fabs(v->valuedouble) > 1000.0) {   /* NaN/inf/absurd -> NaN gains on the bus */
+                set_err(err, errcap, "layout: position component non-finite or out of range (+/-1000 m)"); goto done;
+            }
             spk->pos[c] = (float)v->valuedouble;
         }
         cJSON* gj = cJSON_GetObjectItemCaseSensitive(sp, "gain_db");
@@ -158,10 +161,15 @@ bool layout_load(const char* path, uint32_t sample_rate, Layout* out, char* err,
         cJSON* eqj = cJSON_GetObjectItemCaseSensitive(sp, "eq");
         if (cJSON_IsArray(eqj)) {
             int m = cJSON_GetArraySize(eqj);
-            if (m > BW_EQ_TAPS) m = BW_EQ_TAPS;
+            if (m > BW_EQ_TAPS) {   /* reject rather than silently truncate the kernel mid-tap (a discontinuity) */
+                set_err(err, errcap, "layout: eq FIR longer than BW_EQ_TAPS (512)"); goto done;
+            }
             for (int t = 0; t < m; ++t) {
                 cJSON* v = cJSON_GetArrayItem(eqj, t);
-                spk->eq[t] = cJSON_IsNumber(v) ? (float)v->valuedouble : 0.f;
+                if (!cJSON_IsNumber(v) || !isfinite(v->valuedouble)) {   /* a silent 0 would corrupt the response */
+                    set_err(err, errcap, "layout: non-numeric/non-finite eq tap"); goto done;
+                }
+                spk->eq[t] = (float)v->valuedouble;
             }
             spk->eq_len = (uint16_t)m;
         }
@@ -170,7 +178,7 @@ bool layout_load(const char* path, uint32_t sample_rate, Layout* out, char* err,
         cJSON* rqj = cJSON_GetObjectItemCaseSensitive(sp, "room_eq");
         if (cJSON_IsArray(rqj)) {
             int m = cJSON_GetArraySize(rqj);
-            if (m > BW_ROOM_EQ_MAX) m = BW_ROOM_EQ_MAX;
+            if (m > BW_ROOM_EQ_MAX) { set_err(err, errcap, "layout: room_eq has more than BW_ROOM_EQ_MAX (8) sections"); goto done; }
             for (int t = 0; t < m; ++t) {
                 cJSON* o  = cJSON_GetArrayItem(rqj, t);
                 cJSON* fj = cJSON_IsObject(o) ? cJSON_GetObjectItemCaseSensitive(o, "fc")      : NULL;

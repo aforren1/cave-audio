@@ -8,6 +8,7 @@
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <stdatomic.h>
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -15,6 +16,7 @@
 #define CHUNK       4096        /* frames decoded per read */
 #define RING_SIZE   65536       /* per-stream ring samples (~1.37 s @ 48k); power of two */
 #define PREBUFFER   8192        /* samples to buffer before playback may begin */
+#define EOF_NONE    UINT64_MAX  /* eof_w sentinel for "end not reached" (0 is a valid EOF position) */
 
 enum { ST_FREE = 0, ST_IDLE, ST_RESTART, ST_ACTIVE, ST_CLOSING };
 enum { DT_WAV = 0, DT_FLAC, DT_MP3 };
@@ -32,8 +34,9 @@ struct Stream {
 
     _Atomic uint64_t r;         /* consumed position (audio thread writes, streaming thread reads) */
     _Atomic uint64_t w;         /* filled position (streaming thread writes, audio thread reads) */
-    _Atomic uint64_t eof_w;     /* file-end position (non-loop; 0 = not reached / looping) */
+    _Atomic uint64_t eof_w;     /* file-end position (non-loop; EOF_NONE = not reached / looping) */
     _Atomic int      state;
+    _Atomic int      loop_req;  /* control thread sets the loop flag here; the thread adopts it on ST_RESTART */
     int      loop;              /* streaming-thread-private once active */
     uint64_t w_priv;            /* streaming-thread-private write cursor */
     int      done;              /* streaming-thread-private: reached EOF, stop filling */
@@ -116,15 +119,21 @@ static void fill(Stream* s) {
     uint64_t r = atomic_load_explicit(&s->r, memory_order_acquire);
     uint64_t w = s->w_priv;
     uint64_t target = r + s->ring_mask + 1;          /* keep the ring's worth ahead of the consumer */
+    int seek_retries = 0;                            /* consecutive loop-seeks with no data read (spin guard) */
     while (w < target && !s->done) {
         uint64_t want = target - w; if (want > CHUNK) want = CHUNK;
         uint64_t got = dec_read(s, want);
+        if (got > 0) seek_retries = 0;
         for (uint64_t k = 0; k < got; ++k) s->ring[(w + k) & s->ring_mask] = s->mono[k];
         w += got;
         atomic_store_explicit(&s->w, w, memory_order_release);   /* publish as we go, so the consumer can start */
         if (got < want) {                            /* end of file */
-            if (s->loop) dec_seek0(s);
-            else { atomic_store_explicit(&s->eof_w, w, memory_order_release); s->done = 1; }
+            if (s->loop) {
+                if (++seek_retries > 1) {            /* two seeks yielding nothing: file is unreadable, don't spin */
+                    atomic_store_explicit(&s->eof_w, w, memory_order_release); s->done = 1; break;
+                }
+                dec_seek0(s);
+            } else { atomic_store_explicit(&s->eof_w, w, memory_order_release); s->done = 1; }
         }
     }
     s->w_priv = w;
@@ -145,10 +154,15 @@ static DWORD WINAPI stream_thread(LPVOID arg) {
             int st = atomic_load_explicit(&s->state, memory_order_acquire);
             if (st == ST_CLOSING) { dec_close(s); atomic_store_explicit(&s->state, ST_FREE, memory_order_release); continue; }
             if (st == ST_RESTART) {
+                /* the streaming thread owns ALL the reset (the control thread only flips the state),
+                 * so no streaming-private field (w_priv/done/loop) is written cross-thread and fill's
+                 * trailing w_priv store can't republish a stale cursor over the reset. */
+                s->loop = atomic_load_explicit(&s->loop_req, memory_order_relaxed);
                 dec_seek0(s);
                 s->w_priv = 0; s->done = 0;
+                atomic_store_explicit(&s->r, 0, memory_order_release);       /* reset the consumer cursor too */
                 atomic_store_explicit(&s->w, 0, memory_order_release);
-                atomic_store_explicit(&s->eof_w, 0, memory_order_release);
+                atomic_store_explicit(&s->eof_w, EOF_NONE, memory_order_release);
                 atomic_store_explicit(&s->state, ST_ACTIVE, memory_order_release);
                 st = ST_ACTIVE;
             }
@@ -199,6 +213,7 @@ Stream* stream_open(StreamSet* set, const char* path, char* err, size_t errcap) 
     s->inter = (float*)malloc((size_t)CHUNK * s->channels * sizeof(float));
     s->mono  = (float*)malloc((size_t)CHUNK * sizeof(float));
     if (!s->ring || !s->inter || !s->mono) { set_err(err, errcap, "stream: ring alloc failed"); dec_close(s); free(s->ring); free(s->inter); free(s->mono); free(s); return NULL; }
+    atomic_store_explicit(&s->eof_w, EOF_NONE, memory_order_release);   /* not "reached at position 0" (calloc gave 0) */
     atomic_store_explicit(&s->state, ST_IDLE, memory_order_release);
 
     EnterCriticalSection(&set->lock);
@@ -226,19 +241,18 @@ void stream_close(StreamSet* set, Stream* s) {
 
 void stream_start(Stream* s, int loop) {
     if (!s) return;
-    s->loop = loop;
-    atomic_store_explicit(&s->r, 0, memory_order_release);
-    atomic_store_explicit(&s->w, 0, memory_order_release);
-    atomic_store_explicit(&s->eof_w, 0, memory_order_release);
-    s->w_priv = 0; s->done = 0;
-    atomic_store_explicit(&s->state, ST_RESTART, memory_order_release);   /* thread re-seeks + fills */
+    /* Control thread: publish the loop flag, then hand the WHOLE reset (seek + r/w/eof_w/w_priv/done)
+     * to the streaming thread via ST_RESTART. Writing the streaming-private fields here would race
+     * a concurrent fill(). */
+    atomic_store_explicit(&s->loop_req, loop, memory_order_relaxed);
+    atomic_store_explicit(&s->state, ST_RESTART, memory_order_release);
 }
 
 int stream_prebuffered(const Stream* s) {
     if (!s) return 0;
     uint64_t w = atomic_load_explicit(&((Stream*)s)->w, memory_order_acquire);
     uint64_t e = atomic_load_explicit(&((Stream*)s)->eof_w, memory_order_acquire);
-    return (w >= PREBUFFER) || (e != 0);   /* enough buffered, or a short file already fully read */
+    return (w >= PREBUFFER) || (e != EOF_NONE);   /* enough buffered, or a short file already fully read */
 }
 
 uint32_t stream_pull(Stream* s, uint64_t pos, float* dst, uint32_t n) {
@@ -246,11 +260,14 @@ uint32_t stream_pull(Stream* s, uint64_t pos, float* dst, uint32_t n) {
     uint64_t avail = (w > pos) ? (w - pos) : 0;
     uint32_t got = (avail < (uint64_t)n) ? (uint32_t)avail : n;
     for (uint32_t k = 0; k < got; ++k) dst[k] = s->ring[(pos + k) & s->ring_mask];
-    atomic_store_explicit(&s->r, pos + got, memory_order_release);   /* publish consumed -> the thread may reuse [old, here) */
+    /* Publish the consumed cursor ONLY when we actually read. A zero-sample pull (a still-bound voice
+     * whose stale pos is ahead of w after a restart) must NOT store r = pos, or it would poison the
+     * streaming thread's refill target with a position the ring never filled. */
+    if (got > 0) atomic_store_explicit(&s->r, pos + got, memory_order_release);
     return got;
 }
 
 int stream_ended(const Stream* s, uint64_t pos) {
     uint64_t e = atomic_load_explicit(&((Stream*)s)->eof_w, memory_order_acquire);
-    return e != 0 && pos >= e;
+    return e != EOF_NONE && pos >= e;
 }

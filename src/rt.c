@@ -439,7 +439,11 @@ static void drain_commands(RtCore* c) {
             if (v) { v->gain_user = cmd->u.gain.g; v->dirty = true; } } break;
         case CMD_PLAY: { Voice* v = voice_for(c, cmd->handle);
             const SoundData* s = sound_for(c, cmd->u.play.sound);
-            if (v && s) { v->sound = s; v->cursor = 0; v->stream_pos = 0; v->loop = cmd->u.play.loop != 0;
+            if (v && s) {
+                if (s->stream)                       /* one voice per stream: the ring is SPSC. Detach any OTHER */
+                    for (uint32_t j = 0; j < c->voice_cap; ++j)   /* voice on this stream so two consumers can't corrupt it */
+                        if (&c->voices[j] != v && c->voices[j].sound == s) { c->voices[j].playing = false; c->voices[j].sound = NULL; }
+                v->sound = s; v->cursor = 0; v->stream_pos = 0; v->loop = cmd->u.play.loop != 0;
                           v->oneshot = cmd->u.play.oneshot != 0; v->playing = true; v->dirty = true;
                           v->start_sample = cmd->u.play.start;  /* 0 = now; else hold output until this dsp-sample */
                           v->refl_g_cur = 0.f;                  /* fresh start: ramp the wet send up from 0, no stale burst */

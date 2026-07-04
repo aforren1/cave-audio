@@ -61,6 +61,8 @@ struct Cal {
     int             play_pos, cap_pos;
 } g;
 
+static const float g_zero[1024] = { 0 };                     /* type-correct silence via asio_float_to_out */
+
 void buffer_switch(long index, ASIOBool) {
     int ac = g.active.load(std::memory_order_acquire);
     long n = g.bufsize;
@@ -71,7 +73,7 @@ void buffer_switch(long index, ASIOBool) {
             for (long i = 0; i < n; ++i) blk[i] = (g.play_pos + i < CAL_NSWEEP) ? g.sweep[g.play_pos + i] : 0.f;
             asio_float_to_out(dst, blk, n, g.ci[c].type);
         } else {
-            memset(dst, 0, (size_t)n * 4);                   /* silence (zero bytes = 0 for all LSB types) */
+            asio_float_to_out(dst, g_zero, n, g.ci[c].type); /* NOT memset(n*4): a 2/3-byte buffer would overrun */
         }
     }
     if (ac >= 0) {
@@ -115,8 +117,13 @@ int calib_asio_open(const char* driver, int mic_in, const float* sweep, float* c
     memset(&g, 0, sizeof g); g.active = -1; g.sweep = sweep; g.cap = cap;
     if (!open_driver(driver, mic_in)) { fprintf(stderr, "calib_capture: no ASIO driver with >=26 out + the mic input\n"); asio_session_release(); return 1; }
     long bmin=0,bmax=0,bpref=0,bgran=0; ASIOGetBufferSize(&bmin,&bmax,&bpref,&bgran);
-    g.bufsize = bpref > 1024 ? 1024 : bpref;                  /* blk[] in buffer_switch is 1024 */
-    if (g.bufsize < bmin) g.bufsize = bmin;
+    long bs = bpref > 1024 ? 1024 : bpref;                    /* prefer <=1024 (blk[] in buffer_switch is 1024) */
+    if (bs < bmin) bs = bmin;                                 /* honor the driver minimum ... */
+    if (bs > 1024) {                                          /* ... but the stack scratch can't exceed 1024 */
+        fprintf(stderr, "calib_capture: driver minimum buffer %ld samples exceeds the 1024 limit\n", bs);
+        ASIOExit(); asioDrivers->removeCurrentDriver(); asio_session_release(); return 1;
+    }
+    g.bufsize = bs;
     if (ASIOCanSampleRate((ASIOSampleRate)CAL_FS)!=ASE_OK || ASIOSetSampleRate((ASIOSampleRate)CAL_FS)!=ASE_OK) {
         fprintf(stderr, "calib_capture: driver cannot run at %.0f Hz\n", CAL_FS); ASIOExit(); asioDrivers->removeCurrentDriver(); asio_session_release(); return 1; }
     for (int c = 0; c < BW_CHANNELS; ++c) { g.bi[c].isInput=ASIOFalse; g.bi[c].channelNum=c; }

@@ -99,15 +99,17 @@ int zylia_tdoa(const float* const x[ZYLIA_MICS], uint32_t n, double fs, uint32_t
      * tail and to reflections after it). Window starts just before it. */
     uint32_t onset = pki;
     for (uint32_t i = 0; i < n; ++i) if (fabsf(x[ref][i]) >= 0.2f * pk) { onset = i; break; }
+    /* Correlation window [s0, s0+L) with lags in [-max_lag, +max_lag]. It must satisfy both
+     * s0 >= max_lag (negative lags stay in bounds) AND s0 + L + max_lag < n (positive lags do too).
+     * Clamp L to the largest value that fits and bail if there is no room — computed underflow-safe
+     * (uint32), since a large max_lag (the localize refine) can exceed TDOA_WIN. */
     uint32_t L  = TDOA_WIN;
     uint32_t s0 = (onset > max_lag + 8) ? onset - max_lag - 8 : 0;    /* pre-roll: capture earlier arrivals */
-    if (s0 + L + max_lag >= n) {                                       /* clamp the window into the snapshot */
-        if (n < 2 * max_lag + 64) return 0;                            /* too little context to correlate */
-        L = n - s0 - max_lag - 1;
-        if (L < 64) { s0 = 0; L = n - max_lag - 1; }
-    }
-    if (s0 < max_lag) s0 = max_lag;                                    /* need s0-lag >= 0 for negative lags */
-    if (s0 + L + max_lag >= n) L = n - s0 - max_lag - 1;
+    if (n < 2 * max_lag + 64) return 0;                               /* too little context to correlate */
+    if (s0 < max_lag) s0 = max_lag;                                   /* need s0-lag >= 0 for negative lags */
+    if (s0 + max_lag + 1 >= n) return 0;                              /* no room for even a 1-sample window */
+    uint32_t Lmax = n - s0 - max_lag - 1;                             /* largest L keeping s0+L+max_lag < n */
+    if (L > Lmax) L = Lmax;
     if (L < 32) return 0;
 
     for (int ch = 0; ch < ZYLIA_MICS; ++ch) {

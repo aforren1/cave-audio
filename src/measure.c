@@ -183,6 +183,10 @@ void measure_rt60(const float* ir, int nir, int direct_idx, double fs, RoomResul
 /* Gated magnitude: |FFT(ir[direct .. direct+gate_len])| with a raised-cosine tail fade so the
  * truncation doesn't ring the spectrum. Fills mag[CORR_N/2 + 1]; re/im are CORR_N scratch. */
 static void gated_mag(const float* ir, int direct, int gate_len, double* re, double* im, double* mag) {
+    if (gate_len > CORR_N) gate_len = CORR_N;   /* the window can't exceed the FFT scratch (heap overflow) — a
+                                                 * gate this long already spans the whole analysis window anyway */
+    if (gate_len < 1) gate_len = 1;
+    if (direct < 0) direct = 0;
     memset(re, 0, (size_t)CORR_N * sizeof(double));
     memset(im, 0, (size_t)CORR_N * sizeof(double));
     int gfade = gate_len / 4; if (gfade < 1) gfade = 1;
