@@ -412,8 +412,8 @@ if(BWAUDIO_BUILD_PLAYGROUND)
     DOWNLOAD_EXTRACT_TIMESTAMP TRUE SOURCE_SUBDIR not_built)
   FetchContent_MakeAvailable(raylib rlimgui)
 
-  add_executable(bw_playground examples/playground.c)
-  target_include_directories(bw_playground PRIVATE ${dr_libs_SOURCE_DIR})
+  add_executable(bw_playground examples/playground.c ${CJSON_C})   # cJSON: constraints_view.h
+  target_include_directories(bw_playground PRIVATE ${dr_libs_SOURCE_DIR} ${CJSON_INC})
   target_link_libraries(bw_playground PRIVATE bwaudio raylib)
   bw_tool_icon(bw_playground)
   if(WIN32)

@@ -43,6 +43,7 @@
 #include "raymath.h"
 #include "ui_text.h"        /* crisp HUD text; ui_text() supersedes raylib's DrawText() */
 #include "speaker_gizmo.h"  /* the "real speaker" glyph (cabinet + cone aimed at the listener) */
+#include "constraints_view.h"  /* constraints.json boxes, drawn for orientation (same view as the layout tool) */
 
 #define DR_WAV_IMPLEMENTATION
 #include "dr_wav.h"
@@ -207,7 +208,10 @@ static void push_wall_mesh(BwMaterial mat) {
 }
 
 /* ---- shared drawing ---- */
+static CvConstraints g_con;     /* ./constraints.json, if present — drawn in every scene for orientation */
+
 static void draw_speakers(int hi) {
+    cv_draw(&g_con);            /* the room's bounds/no-go/obstacle boxes, same colors as the layout tool */
     for (int k = 0; k < NSPK; ++k)
         draw_speaker_gizmo(speakers[k], (Vector3){ 0, 0, 0 },   /* cones aim at the head (the origin) */
                            k == hi ? 0.30f : 0.22f,
@@ -668,6 +672,8 @@ int main(int argc, char** argv) {
     build_engine(0);                                          /* start in the interactive config (fills speakers[]) */
     printf("layout: %s    audio backend: %s%s\n", g_layout_path ? g_layout_path : "default grid", backend_name,
            backend_silent ? "   (SILENT — set BWAUDIO_ASIO_DRIVER to your headphone driver)" : "");
+    if (cv_load("constraints.json", &g_con))                  /* orientation only; the layout tool edits against these */
+        printf("constraints: bounds + %d no-go + %d obstacle box(es) drawn from ./constraints.json\n", g_con.nnogo, g_con.nobst);
 
     SetConfigFlags(FLAG_WINDOW_HIGHDPI | FLAG_MSAA_4X_HINT);   /* native pixel density + smooth 3D edges */
     InitWindow(1000, 700, "bwaudio - binaural playground");

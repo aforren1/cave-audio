@@ -55,6 +55,7 @@
 #include "rlgl.h"            /* rlDrawRenderBatchActive: flush the 3D batch before a screenshot */
 #include "speaker_gizmo.h"   /* the "real speaker" glyph (cabinet + cone aimed at the listener) */
 #include "cJSON.h"
+#include "constraints_view.h"   /* constraints.json load + box drawing, shared with the playground */
 
 #include "imgui.h"
 #include "rlImGui.h"
@@ -194,12 +195,11 @@ static int save_json(const char* path) {
  *                 shadow: a box on the segment from the speaker to the ears blocks its sound (los_clear).
  *                 The optimizer penalises shadowed speakers; the tool flags them orange (move them clear).
  * A box is axis-aligned; a projector's throw FRUSTUM is only crudely a box, so size the obstacle to the
- * body + the near shadow you care about. Line-of-sight is to the single observer at (0, obs_height, 0). */
-typedef struct { Vector3 lo, hi; } Box;
-#define MAXNOGO 24
-static Box con_bounds = { { -3, -3, -3 }, { 3, 3, 3 } };
-static Box con_nogo[MAXNOGO];
-static int con_nnogo, con_loaded;
+ * body + the near shadow you care about. Line-of-sight is to the single observer at (0, obs_height, 0).
+ * Loading + drawing are shared with the playground (constraints_view.h: cv_load / cv_draw); the
+ * snap/projection/line-of-sight logic below is this tool's own. */
+typedef CvBox Box;
+static CvConstraints CON;          /* CON.loaded == 0 -> every placement allowed (y >= 0 still holds) */
 
 static int box_in(Box b, Vector3 p) {
     return p.x >= b.lo.x && p.x <= b.hi.x && p.y >= b.lo.y && p.y <= b.hi.y && p.z >= b.lo.z && p.z <= b.hi.z;
@@ -223,26 +223,21 @@ static int seg_hits_box(Vector3 a, Vector3 b, Box box) {
     return 1;
 }
 
-/* solid OCCLUDERS (projectors / structure): a speaker can't be inside one NOR in its acoustic shadow —
- * a box on the line from the speaker to the ears would block its sound. Loaded from constraints.json. */
-static Box con_obst[MAXNOGO];
-static int con_nobst;
-
 /* clear line of sight from a speaker at p to the observer's ears (obstacle boxes block it). */
 static int los_clear(Vector3 p) {
     Vector3 obs = { 0, obs_height, 0 };
-    for (int i = 0; i < con_nobst; ++i) if (seg_hits_box(p, obs, con_obst[i])) return 0;
+    for (int i = 0; i < CON.nobst; ++i) if (seg_hits_box(p, obs, CON.obst[i])) return 0;
     return 1;
 }
 
 static int constraint_ok(Vector3 p) {                    /* physical: in bounds, out of no-go AND out of solid bodies */
-    if (!con_loaded) return 1;                            /* no constraints loaded -> all positions allowed */
-    if (!box_in(con_bounds, p)) return 0;
-    for (int i = 0; i < con_nnogo; ++i) if (box_in(con_nogo[i], p)) return 0;
-    for (int i = 0; i < con_nobst; ++i) if (box_in(con_obst[i], p)) return 0;
+    if (!CON.loaded) return 1;                            /* no constraints loaded -> all positions allowed */
+    if (!box_in(CON.bounds, p)) return 0;
+    for (int i = 0; i < CON.nnogo; ++i) if (box_in(CON.nogo[i], p)) return 0;
+    for (int i = 0; i < CON.nobst; ++i) if (box_in(CON.obst[i], p)) return 0;
     return 1;
 }
-/* move p just outside box b through the nearest face that stays inside con_bounds (so a no-go flush
+/* move p just outside box b through the nearest face that stays inside CON.bounds (so a no-go flush
  * against a bounds wall pushes INTO the room, not out of bounds — else the snap never converges) */
 static Vector3 push_out(Vector3 p, Box b) {
     const float eps = 1e-3f;
@@ -253,66 +248,25 @@ static Vector3 push_out(Vector3 p, Box b) {
     };
     float d[6] = { p.x - b.lo.x, b.hi.x - p.x, p.y - b.lo.y, b.hi.y - p.y, p.z - b.lo.z, b.hi.z - p.z };
     int best = -1; float bd = 1e30f;
-    for (int i = 0; i < 6; ++i) if (box_in(con_bounds, cand[i]) && d[i] < bd) { bd = d[i]; best = i; }
+    for (int i = 0; i < 6; ++i) if (box_in(CON.bounds, cand[i]) && d[i] < bd) { bd = d[i]; best = i; }
     if (best < 0) for (int i = 0; i < 6; ++i) if (d[i] < bd) { bd = d[i]; best = i; }  /* over-constrained: nearest face */
     return cand[best];
 }
 static Vector3 constraint_project(Vector3 p) {           /* nearest allowed point: clamp to bounds, push out of no-go */
-    if (!con_loaded) { p.y = fmaxf(0.0f, p.y); return p; }   /* y >= 0 is a hard global floor even with no constraints file */
+    if (!CON.loaded) { p.y = fmaxf(0.0f, p.y); return p; }   /* y >= 0 is a hard global floor even with no constraints file */
     for (int pass = 0; pass < 4; ++pass) {               /* a few passes settle overlapping boxes */
-        p.x = Clamp(p.x, con_bounds.lo.x, con_bounds.hi.x);
-        p.y = Clamp(p.y, con_bounds.lo.y, con_bounds.hi.y);
-        p.z = Clamp(p.z, con_bounds.lo.z, con_bounds.hi.z);
-        for (int i = 0; i < con_nnogo; ++i) if (box_in(con_nogo[i], p)) p = push_out(p, con_nogo[i]);
-        for (int i = 0; i < con_nobst; ++i) if (box_in(con_obst[i], p)) p = push_out(p, con_obst[i]);  /* off solid bodies */
+        p.x = Clamp(p.x, CON.bounds.lo.x, CON.bounds.hi.x);
+        p.y = Clamp(p.y, CON.bounds.lo.y, CON.bounds.hi.y);
+        p.z = Clamp(p.z, CON.bounds.lo.z, CON.bounds.hi.z);
+        for (int i = 0; i < CON.nnogo; ++i) if (box_in(CON.nogo[i], p)) p = push_out(p, CON.nogo[i]);
+        for (int i = 0; i < CON.nobst; ++i) if (box_in(CON.obst[i], p)) p = push_out(p, CON.obst[i]);  /* off solid bodies */
     }
-    p.x = Clamp(p.x, con_bounds.lo.x, con_bounds.hi.x);  /* final clamp: in-bounds even if over-constrained */
-    p.y = Clamp(p.y, con_bounds.lo.y, con_bounds.hi.y);
-    p.z = Clamp(p.z, con_bounds.lo.z, con_bounds.hi.z);
+    p.x = Clamp(p.x, CON.bounds.lo.x, CON.bounds.hi.x);  /* final clamp: in-bounds even if over-constrained */
+    p.y = Clamp(p.y, CON.bounds.lo.y, CON.bounds.hi.y);
+    p.z = Clamp(p.z, CON.bounds.lo.z, CON.bounds.hi.z);
     p.y = fmaxf(0.0f, p.y);                              /* ... but never below the floor */
     return p;
 }
-static int read_box(cJSON* o, Box* out) {
-    cJSON* mn = cJSON_GetObjectItemCaseSensitive(o, "min");
-    cJSON* mx = cJSON_GetObjectItemCaseSensitive(o, "max");
-    if (!cJSON_IsArray(mn) || cJSON_GetArraySize(mn) != 3 || !cJSON_IsArray(mx) || cJSON_GetArraySize(mx) != 3) return 0;
-    float a[3], b[3];
-    for (int k = 0; k < 3; ++k) {
-        cJSON *ak = cJSON_GetArrayItem(mn, k), *bk = cJSON_GetArrayItem(mx, k);
-        if (!cJSON_IsNumber(ak) || !cJSON_IsNumber(bk)) return 0;
-        a[k] = (float)ak->valuedouble; b[k] = (float)bk->valuedouble;
-    }
-    out->lo = Vector3{ fminf(a[0],b[0]), fminf(a[1],b[1]), fminf(a[2],b[2]) };  /* tolerate min/max swapped */
-    out->hi = Vector3{ fmaxf(a[0],b[0]), fmaxf(a[1],b[1]), fmaxf(a[2],b[2]) };
-    return 1;
-}
-static int load_constraints(const char* path) {
-    FILE* f = fopen(path, "rb"); if (!f) return 0;
-    fseek(f, 0, SEEK_END); long n = ftell(f); fseek(f, 0, SEEK_SET);
-    if (n <= 0) { fclose(f); return 0; }
-    char* buf = (char*)malloc((size_t)n + 1); if (!buf) { fclose(f); return 0; }
-    size_t rd = fread(buf, 1, (size_t)n, f); buf[rd] = 0; fclose(f);
-    cJSON* root = cJSON_Parse(buf); free(buf);
-    if (!root) return 0;
-    cJSON* b = cJSON_GetObjectItemCaseSensitive(root, "bounds");
-    if (cJSON_IsObject(b)) read_box(b, &con_bounds);
-    con_nnogo = 0;
-    cJSON* ng = cJSON_GetObjectItemCaseSensitive(root, "nogo");
-    if (cJSON_IsArray(ng)) {
-        cJSON* box;
-        cJSON_ArrayForEach(box, ng) if (con_nnogo < MAXNOGO && read_box(box, &con_nogo[con_nnogo])) ++con_nnogo;
-    }
-    con_nobst = 0;
-    cJSON* ob = cJSON_GetObjectItemCaseSensitive(root, "obstacles");   /* solid occluders (projectors/structure) */
-    if (cJSON_IsArray(ob)) {
-        cJSON* box;
-        cJSON_ArrayForEach(box, ob) if (con_nobst < MAXNOGO && read_box(box, &con_obst[con_nobst])) ++con_nobst;
-    }
-    cJSON_Delete(root);
-    con_loaded = 1;
-    return 1;
-}
-
 /* ---- engine + DBAP preview state (file scope) ---- */
 #define PREV_WAV    "._bw_layout_preview.wav"
 #define TEMP_LAYOUT "._bw_layout_preview.json"
@@ -584,7 +538,7 @@ static void do_save(void) {
                  g_path, GetWorkingDirectory());
 }
 static void do_reload(void) {
-    load_json(g_path); load_constraints("constraints.json"); mark_edit();
+    load_json(g_path); cv_load("constraints.json", &CON); mark_edit();
     edited_unsaved = 0;                          /* state now equals the file — nothing to lose on quit */
 }
 static void do_snap(void) {
@@ -792,19 +746,7 @@ static void draw_scene(const Camera3D& cam, float* cov_worst_out, float* cov_mea
     float cov_worst = 0.0f, cov_mean = 0.0f;
     BeginMode3D(cam);
     DrawGrid(16, 0.5f);
-    if (con_loaded) {                                /* placement constraints: allowed bounds (green) + no-go (red) */
-        DrawCubeWiresV(Vector3Scale(Vector3Add(con_bounds.lo, con_bounds.hi), 0.5f),
-                       Vector3Subtract(con_bounds.hi, con_bounds.lo), Color{ 90, 200, 120, 110 });
-        for (int i = 0; i < con_nnogo; ++i)
-            DrawCubeWiresV(Vector3Scale(Vector3Add(con_nogo[i].lo, con_nogo[i].hi), 0.5f),
-                           Vector3Subtract(con_nogo[i].hi, con_nogo[i].lo), Color{ 235, 90, 90, 170 });
-        for (int i = 0; i < con_nobst; ++i) {        /* solid occluders (projectors/structure): filled orange */
-            Vector3 ctr = Vector3Scale(Vector3Add(con_obst[i].lo, con_obst[i].hi), 0.5f);
-            Vector3 sz  = Vector3Subtract(con_obst[i].hi, con_obst[i].lo);
-            DrawCubeV(ctr, sz, Color{ 235, 150, 60, 70 });
-            DrawCubeWiresV(ctr, sz, Color{ 245, 165, 70, 200 });
-        }
-    }
+    cv_draw(&CON);                                   /* constraints: green bounds / red no-go / orange solids */
     DrawLine3D(Vector3{ 0, 0, 0 }, Vector3{ 1.2f, 0, 0 }, Color{ 230, 90, 90, 255 });   /* +X */
     DrawLine3D(Vector3{ 0, 0, 0 }, Vector3{ 0, 1.2f, 0 }, Color{ 90, 230, 90, 255 });   /* +Y */
     DrawLine3D(Vector3{ 0, 0, 0 }, Vector3{ 0, 0, 1.2f }, Color{ 90, 150, 230, 255 });  /* +Z */
@@ -900,7 +842,7 @@ static void draw_hud(float cov_worst, float cov_mean) {
     float seld   = Vector3Length(spk[sel].pos);
     float seldel = (dmax - seld) / SPEED_OF_SOUND * 1000.0f;
     int con_bad = 0, con_occ = 0;
-    if (con_loaded) for (int i = 0; i < NSPK; ++i) {
+    if (CON.loaded) for (int i = 0; i < NSPK; ++i) {
         if (!constraint_ok(spk[i].pos)) ++con_bad;   /* out of bounds / inside a solid body (snappable) */
         if (!los_clear(spk[i].pos))     ++con_occ;   /* line of sight to the ears blocked by an obstacle */
     }
@@ -923,10 +865,10 @@ static void draw_hud(float cov_worst, float cov_mean) {
     }
     if (audio) ImGui::TextColored(ImVec4(0.43f, 0.92f, 0.51f, 1), "audio: %s  (tone drives the selected channel)", backend);
     else       ImGui::TextColored(ImVec4(0.92f, 0.67f, 0.43f, 1), "audio: none - editor only (needs a 26-ch ASIO/DVS device to audition)");
-    if (con_loaded && !preview)
+    if (CON.loaded && !preview)
         ImGui::TextColored((con_bad || con_occ) ? ImVec4(0.96f, 0.51f, 0.51f, 1) : ImVec4(0.47f, 0.86f, 0.55f, 1),
                            "constraints: %d no-go  %d obstacle   %d out [K snap]  %d occluded (move clear)",
-                           con_nnogo, con_nobst, con_bad, con_occ);
+                           CON.nnogo, CON.nobst, con_bad, con_occ);
     if (opt_running && !preview)
         ImGui::TextColored(ImVec4(0.47f, 0.96f, 0.63f, 1), "OPTIMIZING %s   cost %.1f   iter %d   step %.2f m   [O] stop",
                            panner_names[pv_panner], opt_cost, opt_iter, opt_step);
@@ -1128,16 +1070,16 @@ static void register_tests(ImGuiTestEngine* te) {
 
     t = IM_REGISTER_TEST(te, "logic", "constraints");            /* projection escapes a no-go; obstacles block LOS */
     t->TestFunc = [](ImGuiTestContext*) {
-        Box sb = con_bounds; int sn = con_nnogo, so = con_nobst, sl = con_loaded;
-        con_loaded = 1; con_bounds = { { -3, -3, -3 }, { 3, 3, 3 } };
-        con_nnogo = 1;  con_nogo[0] = { { -1, -1, -1 }, { 1, 1, 1 } };
-        con_nobst = 1;  con_obst[0] = { { 0.9f, 0.9f, 0.9f }, { 1.4f, 2.2f, 1.4f } };
+        Box sb = CON.bounds; int sn = CON.nnogo, so = CON.nobst, sl = CON.loaded;
+        CON.loaded = 1; CON.bounds = { { -3, -3, -3 }, { 3, 3, 3 } };
+        CON.nnogo = 1;  CON.nogo[0] = { { -1, -1, -1 }, { 1, 1, 1 } };
+        CON.nobst = 1;  CON.obst[0] = { { 0.9f, 0.9f, 0.9f }, { 1.4f, 2.2f, 1.4f } };
         Vector3 p = constraint_project(Vector3{ 0.2f, 0.5f, 0.1f });
-        IM_CHECK(!box_in(con_nogo[0], p));                       /* pushed out of the keep-out box */
+        IM_CHECK(!box_in(CON.nogo[0], p));                       /* pushed out of the keep-out box */
         IM_CHECK(constraint_ok(p));
         IM_CHECK(!los_clear(Vector3{ 2, 3, 2 }));                /* the obstacle sits on the sightline to the ears */
         IM_CHECK(los_clear(Vector3{ -2, 1, -2 }));               /* opposite side: clear */
-        con_bounds = sb; con_nnogo = sn; con_nobst = so; con_loaded = sl;
+        CON.bounds = sb; CON.nnogo = sn; CON.nobst = so; CON.loaded = sl;
     };
 
     t = IM_REGISTER_TEST(te, "logic", "score");                  /* the real engine solve scores the default dome sanely */
@@ -1276,8 +1218,8 @@ int main(int argc, char** argv) {
     printf("working dir: %s\n", GetWorkingDirectory());   /* cave_layout.json + constraints.json resolve here (CWD) */
     int loaded = selftest ? 0 : load_json(g_path);
     if (!selftest) {
-        if (load_constraints("constraints.json"))
-            printf("constraints: bounds + %d no-go + %d obstacle box(es) from ./constraints.json\n", con_nnogo, con_nobst);
+        if (cv_load("constraints.json", &CON))
+            printf("constraints: bounds + %d no-go + %d obstacle box(es) from ./constraints.json\n", CON.nnogo, CON.nobst);
         else
             printf("constraints: none (no ./constraints.json here) — every placement allowed except the y>=0 floor\n");
     }
@@ -1316,7 +1258,7 @@ int main(int argc, char** argv) {
         float m1, w1; score_panner(p, 1, &m1, &w1);
         if (!save_json(g_path)) { printf("optimize: save failed: %s\n", g_path); return 1; }
         printf("optimized %s for %-5s:  rE mean %.1f -> %.1f deg   worst %.1f -> %.1f deg   (%d iters%s)\n",
-               g_path, panner_names[p], m0, m1, w0, w1, opt_iter, con_loaded ? ", within constraints" : "");
+               g_path, panner_names[p], m0, m1, w0, w1, opt_iter, CON.loaded ? ", within constraints" : "");
         return 0;
     }
     printf("layout: %s (%s, %d speakers)\n", g_path, loaded ? "loaded" : "default grid", loaded ? loaded : NSPK);

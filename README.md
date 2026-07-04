@@ -142,7 +142,9 @@ mis-correcting the array.
 Binaural monitor on headphones (auto-picked 2-ch ASIO driver; visual-only without
 one). Scenes: localization, occlusion + materials, directivity, channel walk,
 reverb bed, and a blind A/B/X comparison over single engine knobs (dual-band,
-panner choice, spread, air absorption) scored with a binomial p-value.
+panner choice, spread, air absorption) scored with a binomial p-value. A
+`constraints.json` next to the exe is drawn for orientation — the same room
+boxes the layout tool edits against.
 
 The imgui tools run their UI test suites under ctest (`--tests`); screenshots
 above are from those runs.
