@@ -12,6 +12,7 @@ electric blue + purple as the only accents. One glyph per tool:
   bw_zylia_probe   mic sphere (capsule dots on a ball)
   bw_track_monitor crosshair + tracked dot
   bw_profile_bench ascending bars
+  bw_minimal       play triangle + wavefront (the minimal client example)
 
 Drawn at 1024 px (4x supersample), downscaled to 256, saved as .ico with
 256/48/32/24/16 entries. The .ico files are committed so builds never need
@@ -110,6 +111,11 @@ def glyph_profile_bench(d):
         d.rounded_rectangle([x - 72, 812 - h, x + 72, 788], radius=40, fill=col)
 
 
+def glyph_minimal(d):
+    d.polygon([(280, 290), (280, 734), (664, 512)], fill=BLUE)               # play
+    d.arc([560, 332, 920, 692], start=-55, end=55, fill=PURPLE, width=56)    # wavefront
+
+
 TOOLS = {
     "bw_layout_tool":   glyph_layout_tool,
     "bw_calib_view":    glyph_calib_view,
@@ -118,6 +124,7 @@ TOOLS = {
     "bw_zylia_probe":   glyph_zylia_probe,
     "bw_track_monitor": glyph_track_monitor,
     "bw_profile_bench": glyph_profile_bench,
+    "bw_minimal":       glyph_minimal,
 }
 
 

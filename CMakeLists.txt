@@ -195,6 +195,17 @@ function(bw_tool_icon target)
 endfunction()
 
 # ---- tests ----
+# ---- minimal client example (the whole API lifecycle in one file; compiled every build so it
+# can't drift from the ABI) ----
+add_executable(bw_minimal examples/minimal.c)
+target_link_libraries(bw_minimal PRIVATE bwaudio)
+bw_tool_icon(bw_minimal)
+if(WIN32)
+  add_custom_command(TARGET bw_minimal POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            $<TARGET_FILE:bwaudio> $<TARGET_FILE_DIR:bw_minimal>)   # bwaudio.dll next to the exe
+endif()
+
 # ---- track monitor example (console; prints the live track_internal pose) ----
 add_executable(bw_track_monitor examples/track_monitor.c)
 target_link_libraries(bw_track_monitor PRIVATE bwaudio)

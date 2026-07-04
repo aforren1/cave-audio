@@ -75,7 +75,9 @@ configuration is load-time (occlusion meshes can be replaced live).
 ## Read next
 
 Start with [`CLAUDE.md`](./CLAUDE.md), then [`docs/architecture.md`](./docs/architecture.md).
-Full doc index is in `CLAUDE.md`.
+Full doc index is in `CLAUDE.md`. [`examples/minimal.c`](./examples/minimal.c) is the whole
+client lifecycle in one file (create → load → play → per-frame commit → teardown); it builds
+as `bw_minimal` and runs without hardware.
 
 ## Tools
 
