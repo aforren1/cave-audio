@@ -13,7 +13,9 @@
  *    encode is scaled by ambi_phonon_scale = sqrt(2l+1)/sqrt(4pi), VERIFIED in test_ambi against
  *    phonon's hardcoded SH constants. (Deriving the matrix from iplAmbisonicsEncodeEffect is an
  *    equivalent alternative.)
- *  - CONVENTION 3 (orientation): phonon is right-handed x=right/y=up/-z=ahead = the room frame.
+ *  - CONVENTION 3 (orientation): phonon is right-handed x=right/y=up/-z=ahead; its world axes are
+ *    the room frame. The room's HEAD convention is identity-faces-+z (Motive default), handled in
+ *    head_basis (ahead=q*+z, right=q*-x).
  *  - CONVENTION 2b (m<0 sign): the real-SH m<0 channels (ACN 1,4,5,9,10,11) needed NEGATING to match
  *    phonon's decode (sh_encode below). test_ambi only checked m>=0 (W, front, the zonal/cosine l=2
  *    terms), so this was invisible until the HRTF decode was exercised — it inverted left/right.
@@ -82,11 +84,13 @@ static void qrot(const float q[4], const float v[3], float o[3]) {
     o[2] = v[2] + w * tz + (x * ty - y * tx);
 }
 
-/* CONVENTION 3 — head orientation frame. CONFIRMED: phonon is right-handed x=right/y=up/-z=ahead
- * (C API docs), identical to the engine's room frame, so the head's ahead/up/right vectors pass
- * through unchanged into IPLCoordinateSpace3. */
+/* CONVENTION 3 — head orientation frame. phonon is right-handed x=right/y=up/-z=ahead (C API
+ * docs); its WORLD axes coincide with the room frame, so the head's world-space ahead/up/right
+ * vectors pass straight into IPLCoordinateSpace3. The head's LOCAL frame is the room convention:
+ * identity faces +z (Motive default), so ahead = q*(0,0,+1) and right = q*(-1,0,0) — facing +z
+ * with +y up in a right-handed frame puts the right ear at -x. */
 static void head_basis(const float q[4], IPLCoordinateSpace3* cs) {
-    const float fwd[3] = { 0, 0, -1 }, up[3] = { 0, 1, 0 }, rgt[3] = { 1, 0, 0 };
+    const float fwd[3] = { 0, 0, 1 }, up[3] = { 0, 1, 0 }, rgt[3] = { -1, 0, 0 };
     float a[3], u[3], r[3];
     qrot(q, fwd, a); qrot(q, up, u); qrot(q, rgt, r);
     cs->ahead = (IPLVector3){ a[0], a[1], a[2] };

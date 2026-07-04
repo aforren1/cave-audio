@@ -104,10 +104,11 @@ Reference one asset from many objects; it's minted once. No material = the engin
 
 ### Coordinate seam
 
-The engine is **room space, right-handed** (matching OptiTrack); Unity is left-handed. `Room` does
-the conversion in one place. Set `Room.UnityToRoom` once from your CAVE registration (the rigid
-transform mapping Unity world → the physical room origin/axes); the baseline is identity + a
-handedness flip. **Getting this wrong silently swaps front/back or left/right.**
+The engine is **room space: right-handed, +Y up, +Z forward** (Motive's default streamed frame);
+Unity is left-handed, +Y up, +Z forward. Up and forward agree, so the baseline conversion is a
+single X mirror (`Room` does it in one place — Unity identity rotation maps to room identity).
+Set `Room.UnityToRoom` once from your CAVE registration (the rigid transform mapping Unity world →
+the physical room origin/axes). **Getting this wrong silently swaps front/back or left/right.**
 
 ## Threading & lifecycle notes
 

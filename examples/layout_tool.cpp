@@ -172,7 +172,7 @@ static int save_json(const char* path) {
         "{\n"
         "  \"schema_version\": 1,\n"
         "  \"units\": { \"position\": \"meters\", \"gain\": \"decibels\", \"delay\": \"milliseconds\" },\n"
-        "  \"coordinate_space\": \"room, right-handed (matches OptiTrack/Motive); origin at working-area center\",\n"
+        "  \"coordinate_space\": \"room, right-handed, +y up, +z forward (matches OptiTrack/Motive default); origin at working-area center\",\n"
         "  \"reference\": { \"alignment\": \"max-distance\", \"speed_of_sound_mps\": %g, \"note\": \"delay_ms time-aligns each speaker arrival to the farthest speaker; gain_db is a measured per-speaker trim\" },\n"
         "  \"dbap\": { \"rolloff_r\": %g, \"distance_attenuation\": { \"model\": \"%s\", \"reference_distance_m\": %g, \"rolloff\": %g, \"min_gain_db\": %g } },\n"
         "  \"speakers\": [\n",
@@ -526,7 +526,7 @@ static bool CheckboxInt(const char* label, int* v) {
 static char  g_path[512] = "cave_layout.json";      /* save/load target (panel-editable) */
 static int   sel = 0, tone_on = 0, tone_kind = BW_TEST_SINE, driven = -1;
 static int   fps_view = 0;                          /* first-person view from the observer's ears (H) */
-static float fps_yaw = PI, fps_pitch = 0.0f, fps_fov = 75.0f;
+static float fps_yaw = 0.0f, fps_pitch = 0.0f, fps_fov = 75.0f;   /* yaw 0 = +z, the room's default facing */
 static float cam_yaw = 45.0f * DEG2RAD, cam_pitch = 30.0f * DEG2RAD, cam_dist = 9.0f;
 static float save_flash = 0.0f;
 static bool  show_te_ui = false;

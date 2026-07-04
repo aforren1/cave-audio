@@ -39,17 +39,18 @@ int main(void) {
     CHECK(m != NULL, "monitor_create");
     if (!m) return 1;
 
-    /* find a right (+x), left (-x), and median-plane (x≈0) speaker */
+    /* find a right (-x), left (+x), and median-plane (x≈0) speaker. Room convention:
+     * identity faces +z with +y up (right-handed), so the listener's right is -x. */
     int right = -1, left = -1, center = -1;
     for (int k = 0; k < CH; ++k) {
         float x = L.speakers[k].pos[0];
-        if (x >  1.0f) right  = k;
-        if (x < -1.0f) left   = k;
+        if (x < -1.0f) right  = k;
+        if (x >  1.0f) left   = k;
         if (fabsf(x) < 0.01f) center = k;
     }
     CHECK(right >= 0 && left >= 0 && center >= 0, "default layout has right/left/median speakers");
 
-    const float ident[4]   = { 0, 0, 0, 1 };       /* head facing forward */
+    const float ident[4]   = { 0, 0, 0, 1 };       /* head facing forward (+z) */
     const float yaw180[4]  = { 0, 1, 0, 0 };       /* head turned 180° about +y */
 
     /* 1. right speaker -> right ear louder; left speaker -> left ear louder */

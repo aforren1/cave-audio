@@ -31,6 +31,11 @@ static void decode_channel(SteamMonitor* m, int ch, const float q[4]) {
     const float p[3] = { 0, 0, 0 };
     memset(bus, 0, sizeof(float) * (size_t)BW_CHANNELS * N);
     for (uint32_t i = 0; i < N; ++i) bus[(size_t)ch * N + i] = 1.0f;
+    /* phonon crossfades an orientation CHANGE across one block (AmbisonicsRotateEffect keeps the
+     * previous rotation and interpolates), so the first block after a new q is a smear of old and
+     * new. Render twice and measure the settled block. (The old head convention masked this: its
+     * identity equalled phonon's initial internal rotation, so block 1 happened to be pure.) */
+    steam_monitor_process(m, bus, p, q, out, N);
     steam_monitor_process(m, bus, p, q, out, N);
 }
 
@@ -45,15 +50,15 @@ int main(void) {
     if (!m) { printf("steam_decode_test: %d FAILURES\n", fails); return 1; }
 
     int right = -1, left = -1;     /* pure-lateral speakers (y,z ~ 0) so the HRTF L/R isn't diluted by elevation */
-    for (int k = 0; k < (int)BW_CHANNELS; ++k) {
+    for (int k = 0; k < (int)BW_CHANNELS; ++k) {     /* identity faces +z, so the listener's right is -x */
         float x = L.speakers[k].pos[0], y = L.speakers[k].pos[1], z = L.speakers[k].pos[2];
         if (fabsf(y) > 0.01f || fabsf(z) > 0.01f) continue;
-        if (x >  1.0f) right = k;
-        if (x < -1.0f) left  = k;
+        if (x < -1.0f) right = k;
+        if (x >  1.0f) left  = k;
     }
-    CHECK(right >= 0 && left >= 0, "default layout has pure-lateral right (+x) and left (-x) speakers");
+    CHECK(right >= 0 && left >= 0, "default layout has pure-lateral right (-x) and left (+x) speakers");
 
-    const float ident[4]  = { 0, 0, 0, 1 };          /* head facing forward */
+    const float ident[4]  = { 0, 0, 0, 1 };          /* head facing forward (+z) */
     const float yaw180[4] = { 0, 1, 0, 0 };          /* head turned 180 about +y */
 
     /* 1. the decode runs + is finite + audible */

@@ -322,7 +322,7 @@ static void shadow_adopt(SteamScene* s, uint16_t idx, uint32_t handle) {
         s->shadow[idx].handle     = handle;
         s->shadow[idx].features   = 0;
         s->shadow[idx].dir_weight = 0.f; s->shadow[idx].dir_power = 1.f;
-        s->shadow[idx].fwd[0] = 0.f; s->shadow[idx].fwd[1] = 0.f; s->shadow[idx].fwd[2] = -1.f;  /* default ahead = -z */
+        s->shadow[idx].fwd[0] = 0.f; s->shadow[idx].fwd[1] = 0.f; s->shadow[idx].fwd[2] = 1.f;   /* default ahead = +z (room convention) */
         s->shadow[idx].pos[0] = 0.f; s->shadow[idx].pos[1] = 0.f; s->shadow[idx].pos[2] = 0.f;   /* origin until set_pos lands */
     }
 }

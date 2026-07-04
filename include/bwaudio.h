@@ -204,7 +204,7 @@ BW_API float    bw_source_get_occlusion(BwEngine* e, BwSource s);
  * Independent of occlusion (a source can be directional without being occluded). */
 typedef enum { BW_DIR_OMNI = 0, BW_DIR_CARDIOID = 1, BW_DIR_FIGURE8 = 2 } BwDirectivity;
 /* Source orientation as a quaternion (same room frame + handedness as bw_set_listener_pose); the
- * dipole axis is the source's forward (-z rotated by q). Per-frame-safe. No-op without the SDK. */
+ * dipole axis is the source's forward (+z rotated by q). Per-frame-safe. No-op without the SDK. */
 BW_API void     bw_source_set_orientation(BwEngine* e, BwSource s, float qx, float qy, float qz, float qw);
 /* Radiation pattern: weight 0=omni (off) .. 0.5=cardioid .. 1=figure-8; power>=1 sharpens the lobe.
  * Per-frame-safe. No-op without the Steam Audio backend. */
@@ -291,7 +291,10 @@ BW_API uint32_t bw_panner_gains_batch(BwPanner panner, const float* positions, u
 
 /* ---- listener (control thread; skip if track_internal) ---- */
 /* Position in room space. Quaternion is head orientation; used by the binaural
- * monitor only — the array render ignores orientation (real speakers, real ears). */
+ * monitor only — the array render ignores orientation (real speakers, real ears).
+ * ROOM FRAME: right-handed, +y up, metres, identity orientation faces +z (so the
+ * right ear is at -x). This is Motive's default streamed frame, so OptiTrack
+ * rigid-body poses pass through unchanged. */
 BW_API void bw_set_listener_pose(BwEngine* e, float px, float py, float pz,
                                               float qx, float qy, float qz, float qw);
 

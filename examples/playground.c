@@ -219,8 +219,9 @@ static void draw_speakers(int hi) {
                            k == hi ? (Color){ 120, 240, 140, 255 } : (Color){ 120, 120, 140, 255 });
 }
 static void draw_head(Quaternion q) {
-    Vector3 right = Vector3RotateByQuaternion((Vector3){ 1, 0, 0 }, q);
-    Vector3 fwd   = Vector3RotateByQuaternion((Vector3){ 0, 0, -1 }, q);
+    /* room convention: identity faces +z with +y up (Motive default), so the right ear is -x */
+    Vector3 right = Vector3RotateByQuaternion((Vector3){ -1, 0, 0 }, q);
+    Vector3 fwd   = Vector3RotateByQuaternion((Vector3){ 0, 0, 1 }, q);
     DrawSphere((Vector3){ 0, 0, 0 }, 0.16f, SKYBLUE);
     DrawSphere(Vector3Scale(right,  0.17f), 0.055f, RED);       /* right ear -> audio R */
     DrawSphere(Vector3Scale(right, -0.17f), 0.055f, RAYWHITE);  /* left ear  -> audio L */
@@ -383,7 +384,8 @@ static void dir_draw3d(void) {
         float a = (float)i / 48.0f * 2.0f * PI;                /* angle off the source forward */
         float g = fabsf((1.0f - w) + w * cosf(a));
         float r = 0.15f + 0.7f * g, wa = source_yaw + a;
-        Vector3 p = { source_pos.x - r * sinf(wa), source_pos.y, source_pos.z - r * cosf(wa) };
+        /* source forward = yaw-rotated +z (room convention) */
+        Vector3 p = { source_pos.x + r * sinf(wa), source_pos.y, source_pos.z + r * cosf(wa) };
         if (i > 0) DrawLine3D(prev, p, (Color){ 255, 180, 80, 200 });
         prev = p;
     }

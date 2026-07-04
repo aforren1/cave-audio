@@ -1388,7 +1388,7 @@ RtCore* rt_create(uint32_t voice_cap, uint32_t sound_cap, uint32_t sample_rate, 
             c->eq_proto[i].type  = ty[i];
         }
     }
-    c->lis.q_active[3]  = 1.0f;        /* default head orientation = identity (facing forward) */
+    c->lis.q_active[3]  = 1.0f;        /* default head orientation = identity (facing +z) */
     c->lis.q_pending[3] = 1.0f;
     c->readback.q[3]    = 1.0f;        /* readback identity until the first block publishes */
     /* protection limiter: ON at -1 dBFS by default; ~1 ms attack / ~120 ms release one-poles */

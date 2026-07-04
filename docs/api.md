@@ -115,8 +115,9 @@ jumps, and ramps back in (~10 ms end to end); on a paused voice the jump is imme
 paused. Past-the-end seeks wrap for loops and end one-shots. Streamed sounds ignore seeks (the
 stream ring cannot jump); `bw_source_play` always restarts un-paused at frame 0.
 
-Positions are in **room space, right-handed** — the engine binding converts from its
-own coordinate system at the boundary (see integration.md). `bw_play_oneshot` is the
+Positions are in **room space: right-handed, +Y up, +Z forward** (Motive's default frame;
+an identity orientation faces +Z) — the engine binding converts from its own coordinate
+system at the boundary (see integration.md). `bw_play_oneshot` is the
 fire-and-forget path: it allocates a transient voice internally and recycles it on
 end, so the caller holds no handle.
 

@@ -6,6 +6,10 @@ All notable changes to `com.cave.bwaudio`.
 
 Initial Unity binding (M7).
 
+- Room convention change (engine-wide): room space is now **+Z forward** (identity head faces +z,
+  matching Motive's default streamed frame). `Room`'s baseline handedness flip moved from the Z
+  axis to the X axis; since Unity is also +Z-forward, identity rotations now map to identity.
+
 - Pause/seek + the output protection limiter (engine `9d60c6e`): `BwEmitter.Pause()/UnPause()/Paused`
   (AudioSource.Pause/UnPause equivalents; click-free, the playhead freezes, paused still reads as
   IsPlaying) and `BwEmitter.Seek(samples)` (a timeSamples-set equivalent; in-memory clips only —

@@ -711,10 +711,10 @@ void bw_source_set_spread(BwEngine* e, BwSource s, float amount) {
 void bw_source_set_orientation(BwEngine* e, BwSource s, float qx, float qy, float qz, float qw) {
 #ifdef BW_HAVE_STEAMAUDIO
     if (!e || !e->scene) return;
-    /* the dipole axis is the source forward = q * (0,0,-1) * q^-1 */
-    float fx = -2.0f * (qw * qy + qx * qz);
-    float fy =  2.0f * (qw * qx - qy * qz);
-    float fz = -1.0f + 2.0f * (qx * qx + qy * qy);
+    /* the dipole axis is the source forward = q * (0,0,+1) * q^-1 (room convention: +z ahead) */
+    float fx =  2.0f * (qw * qy + qx * qz);
+    float fy = -2.0f * (qw * qx - qy * qz);
+    float fz =  1.0f - 2.0f * (qx * qx + qy * qy);
     steam_scene_set_orientation(e->scene, s, fx, fy, fz);
 #else
     (void)e; (void)s; (void)qx; (void)qy; (void)qz; (void)qw;

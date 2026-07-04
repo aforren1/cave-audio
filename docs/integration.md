@@ -6,13 +6,16 @@ calls on the main thread.
 
 ## Coordinate seam (the part that silently ruins spatial audio)
 
-The core works in **room space, right-handed**, matching OptiTrack/Motive. Engines
-do not. Convert every position and quaternion at the boundary:
+The core works in **room space: right-handed, +Y up, +Z forward, metres** — exactly
+OptiTrack/Motive's default streamed frame, so tracked rigid-body poses pass through
+unchanged (an identity head quaternion faces +Z; the listener's right ear is at −X).
+Engines do not share it. Convert every position and quaternion at the boundary:
 
-- **Unity** is left-handed (Z forward). Baseline conversion is an axis flip (negate
-  Z), then apply the CAVE registration matrix that maps Unity world → room/Motive
-  origin (Motive's ground plane is calibrated to deck center, so the real mapping
-  lives in that matrix — the bare Z-negation is only the handedness part).
+- **Unity** is left-handed, +Y up, +Z forward. Up and forward already agree, so the
+  baseline conversion is a single axis flip (negate X — Unity identity rotation maps
+  to room identity), then apply the CAVE registration matrix that maps Unity world →
+  room/Motive origin (Motive's ground plane is calibrated to deck center, so the real
+  mapping lives in that matrix — the bare X-negation is only the handedness part).
 - **Unreal** is left-handed, Z-up, centimeters. Convert to room meters and apply the
   registration matrix similarly.
 
@@ -78,11 +81,11 @@ public static class Room {
     public static Matrix4x4 UnityToRoom = Matrix4x4.identity;  // set once from CAVE registration
     public static Vector3 Pos(Vector3 v) {
         v = UnityToRoom.MultiplyPoint3x4(v);
-        return new Vector3(v.x, v.y, -v.z);                    // baseline LH->RH; real map in UnityToRoom
+        return new Vector3(-v.x, v.y, v.z);                    // baseline LH->RH; real map in UnityToRoom
     }
     public static Quaternion Rot(Quaternion q) {
         q = UnityToRoom.rotation * q;
-        return new Quaternion(-q.x, -q.y, q.z, q.w);
+        return new Quaternion(q.x, -q.y, -q.z, q.w);           // both frames face +Z: identity -> identity
     }
 }
 ```

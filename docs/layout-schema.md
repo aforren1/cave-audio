@@ -69,7 +69,7 @@ value), and **V** toggles the observer model (fixed centre vs the moving working
 {
   "schema_version": 1,
   "units":            { "position": "meters", "gain": "decibels", "delay": "milliseconds" },
-  "coordinate_space": "room, right-handed (matches OptiTrack/Motive); origin at working-area center",
+  "coordinate_space": "room, right-handed, +y up, +z forward (matches OptiTrack/Motive default); origin at working-area center",
   "reference": {
     "alignment":          "max-distance",   // how delay_ms was derived (documentation only)
     "speed_of_sound_mps": 343.0,

@@ -8,7 +8,8 @@
  *
  * Runs anywhere: the binaural profile auto-picks a 2-ch ASIO device (headphones)
  * and falls back to the silent offline sink without one -- bw_audio_backend says
- * which you got. Room frame is right-handed, y up, metres; with no layout file the
+ * which you got. Room frame is right-handed, +y up, +z forward, metres (Motive's
+ * default; an identity listener faces +z, right ear at -x); with no layout file the
  * engine pans over its default grid, a 3 m cube of 26 speakers around the origin.
  *
  *   bw_minimal [sound.wav]     (no argument: a short ping is synthesized and used)
@@ -71,7 +72,7 @@ int main(int argc, char** argv) {
 
     BwSource src = bw_source_create(e);
     bw_source_set_gain(e, src, 0.8f);
-    bw_source_set_pos(e, src, 2.f, 0.f, 0.f);  /* room space: 2 m to the listener's right */
+    bw_source_set_pos(e, src, 2.f, 0.f, 0.f);  /* room space: 2 m to the listener's left (+x) */
     bw_source_play(e, src, ping, true);        /* loop while we move it */
 
     /* ---- the game loop: push updates every frame, then ONE commit ---- */

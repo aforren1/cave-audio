@@ -157,8 +157,8 @@ namespace CaveAudio
 
         // Append a Unity mesh, transformed local -> world -> room space. Whether the winding must be
         // reversed to keep front faces depends on the SIGN of the full linear map's determinant (the
-        // Z-flip in Room.Pos, UnityToRoom, AND the object's own scale — a negative/mirrored scale flips
-        // winding by itself), not just the Z-flip. Room.ReversesWinding folds all three together.
+        // X-flip in Room.Pos, UnityToRoom, AND the object's own scale — a negative/mirrored scale flips
+        // winding by itself), not just the X-flip. Room.ReversesWinding folds all three together.
         static void AddMesh(List<float> verts, List<int> tris, List<uint> triMat, Mesh mesh, Matrix4x4 l2w, uint mat)
         {
             int baseIdx = verts.Count / 3;

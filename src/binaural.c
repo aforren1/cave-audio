@@ -32,17 +32,18 @@ Monitor* monitor_create(const Layout* L, uint32_t sample_rate) {
 
 void monitor_destroy(Monitor* m) { free(m); }
 
-/* world-space direction of the head's local +x ("right"), from quaternion q (xyzw). The
- * rotation formula assumes a unit quaternion, so normalize first; a zero/degenerate q
- * (e.g. an unset pose) falls back to identity (facing forward). */
+/* world-space direction of the head's local -x ("right"), from quaternion q (xyzw). Room
+ * convention: identity faces +z with +y up (Motive default), right-handed — so the right ear
+ * is at local -x. The rotation formula assumes a unit quaternion, so normalize first; a
+ * zero/degenerate q (e.g. an unset pose) falls back to identity (facing +z). */
 static void head_right(const float q[4], float r[3]) {
     float x = q[0], y = q[1], z = q[2], w = q[3];
     float n2 = x * x + y * y + z * z + w * w;
     if (n2 > 1e-12f) { float inv = 1.f / sqrtf(n2); x *= inv; y *= inv; z *= inv; w *= inv; }
     else { x = y = z = 0.f; w = 1.f; }
-    r[0] = 1.f - 2.f * (y * y + z * z);
-    r[1] = 2.f * (x * y + z * w);
-    r[2] = 2.f * (x * z - y * w);
+    r[0] = -(1.f - 2.f * (y * y + z * z));
+    r[1] = -(2.f * (x * y + z * w));
+    r[2] = -(2.f * (x * z - y * w));
 }
 
 static void recompute(Monitor* m, const float p[3], const float q[4]) {
