@@ -25,6 +25,7 @@
  */
 #include "steam_decode.h"
 #include "ambisonics.h"
+#include "frame.h"          /* BW_ROOM_* identity basis + frame_qrot */
 #include "sink.h"           /* BW_CHANNELS */
 
 #include <phonon.h>
@@ -73,26 +74,13 @@ static void sh_encode(const float room_dir[3], float y[BW_AMBI_CH]) {
     for (size_t i = 0; i < sizeof SH_M_NEG / sizeof *SH_M_NEG; ++i) y[SH_M_NEG[i]] = -y[SH_M_NEG[i]];
 }
 
-/* rotate vector v by quaternion q (xyzw) */
-static void qrot(const float q[4], const float v[3], float o[3]) {
-    float x = q[0], y = q[1], z = q[2], w = q[3];
-    float tx = 2.f * (y * v[2] - z * v[1]);
-    float ty = 2.f * (z * v[0] - x * v[2]);
-    float tz = 2.f * (x * v[1] - y * v[0]);
-    o[0] = v[0] + w * tx + (y * tz - z * ty);
-    o[1] = v[1] + w * ty + (z * tx - x * tz);
-    o[2] = v[2] + w * tz + (x * ty - y * tx);
-}
-
 /* CONVENTION 3 — head orientation frame. phonon is right-handed x=right/y=up/-z=ahead (C API
  * docs); its WORLD axes coincide with the room frame, so the head's world-space ahead/up/right
- * vectors pass straight into IPLCoordinateSpace3. The head's LOCAL frame is the room convention:
- * identity faces +z (Motive default), so ahead = q*(0,0,+1) and right = q*(-1,0,0) — facing +z
- * with +y up in a right-handed frame puts the right ear at -x. */
+ * vectors pass straight into IPLCoordinateSpace3. The head's LOCAL frame is the room convention
+ * (bwaudio.h BW_ROOM_*): identity faces +z (Motive default), right ear at -x. */
 static void head_basis(const float q[4], IPLCoordinateSpace3* cs) {
-    const float fwd[3] = { 0, 0, 1 }, up[3] = { 0, 1, 0 }, rgt[3] = { -1, 0, 0 };
     float a[3], u[3], r[3];
-    qrot(q, fwd, a); qrot(q, up, u); qrot(q, rgt, r);
+    frame_qrot(q, BW_ROOM_AHEAD, a); frame_qrot(q, BW_ROOM_UP, u); frame_qrot(q, BW_ROOM_RIGHT, r);
     cs->ahead = (IPLVector3){ a[0], a[1], a[2] };
     cs->up    = (IPLVector3){ u[0], u[1], u[2] };
     cs->right = (IPLVector3){ r[0], r[1], r[2] };

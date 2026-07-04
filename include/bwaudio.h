@@ -295,6 +295,12 @@ BW_API uint32_t bw_panner_gains_batch(BwPanner panner, const float* positions, u
  * ROOM FRAME: right-handed, +y up, metres, identity orientation faces +z (so the
  * right ear is at -x). This is Motive's default streamed frame, so OptiTrack
  * rigid-body poses pass through unchanged. */
+/* The identity-listener basis, as data — derive "forward"/"right" from these
+ * (the engine's own orientation seams do) rather than re-hardcoding the
+ * convention. An identity quaternion's ahead is BW_ROOM_AHEAD, etc. */
+static const float BW_ROOM_AHEAD[3] = {  0.0f, 0.0f, 1.0f };
+static const float BW_ROOM_UP[3]    = {  0.0f, 1.0f, 0.0f };
+static const float BW_ROOM_RIGHT[3] = { -1.0f, 0.0f, 0.0f };
 BW_API void bw_set_listener_pose(BwEngine* e, float px, float py, float pz,
                                               float qx, float qy, float qz, float qw);
 

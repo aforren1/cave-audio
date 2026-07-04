@@ -6,6 +6,7 @@
  * Sounds (bw_load_sound) are still stubs until M3.
  */
 #include "bwaudio.h"
+#include "frame.h"         /* BW_ROOM_* identity basis + frame_qrot */
 #include "sink.h"
 #include "rt.h"
 #include "layout.h"
@@ -711,11 +712,10 @@ void bw_source_set_spread(BwEngine* e, BwSource s, float amount) {
 void bw_source_set_orientation(BwEngine* e, BwSource s, float qx, float qy, float qz, float qw) {
 #ifdef BW_HAVE_STEAMAUDIO
     if (!e || !e->scene) return;
-    /* the dipole axis is the source forward = q * (0,0,+1) * q^-1 (room convention: +z ahead) */
-    float fx =  2.0f * (qw * qy + qx * qz);
-    float fy = -2.0f * (qw * qx - qy * qz);
-    float fz =  1.0f - 2.0f * (qx * qx + qy * qy);
-    steam_scene_set_orientation(e->scene, s, fx, fy, fz);
+    /* the dipole axis is the source forward = q rotating the room frame's identity ahead */
+    float q4[4] = { qx, qy, qz, qw }, f[3];
+    frame_qrot(q4, BW_ROOM_AHEAD, f);
+    steam_scene_set_orientation(e->scene, s, f[0], f[1], f[2]);
 #else
     (void)e; (void)s; (void)qx; (void)qy; (void)qz; (void)qw;
 #endif

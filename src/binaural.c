@@ -5,6 +5,7 @@
  * axis, so the stereo image turns with the head. (W/X ambisonic encode + two cardioids.)
  */
 #include "binaural.h"
+#include "frame.h"          /* BW_ROOM_RIGHT + frame_qrot */
 
 #include <math.h>
 #include <stdlib.h>
@@ -32,18 +33,15 @@ Monitor* monitor_create(const Layout* L, uint32_t sample_rate) {
 
 void monitor_destroy(Monitor* m) { free(m); }
 
-/* world-space direction of the head's local -x ("right"), from quaternion q (xyzw). Room
- * convention: identity faces +z with +y up (Motive default), right-handed — so the right ear
- * is at local -x. The rotation formula assumes a unit quaternion, so normalize first; a
- * zero/degenerate q (e.g. an unset pose) falls back to identity (facing +z). */
+/* world-space direction of the listener's right ear axis (BW_ROOM_RIGHT rotated by q, xyzw).
+ * frame_qrot assumes a unit quaternion, so normalize first; a zero/degenerate q (e.g. an
+ * unset pose) falls back to identity (facing BW_ROOM_AHEAD). */
 static void head_right(const float q[4], float r[3]) {
-    float x = q[0], y = q[1], z = q[2], w = q[3];
-    float n2 = x * x + y * y + z * z + w * w;
-    if (n2 > 1e-12f) { float inv = 1.f / sqrtf(n2); x *= inv; y *= inv; z *= inv; w *= inv; }
-    else { x = y = z = 0.f; w = 1.f; }
-    r[0] = -(1.f - 2.f * (y * y + z * z));
-    r[1] = -(2.f * (x * y + z * w));
-    r[2] = -(2.f * (x * z - y * w));
+    float n[4] = { q[0], q[1], q[2], q[3] };
+    float n2 = n[0] * n[0] + n[1] * n[1] + n[2] * n[2] + n[3] * n[3];
+    if (n2 > 1e-12f) { float inv = 1.f / sqrtf(n2); n[0] *= inv; n[1] *= inv; n[2] *= inv; n[3] *= inv; }
+    else { n[0] = n[1] = n[2] = 0.f; n[3] = 1.f; }
+    frame_qrot(n, BW_ROOM_RIGHT, r);
 }
 
 static void recompute(Monitor* m, const float p[3], const float q[4]) {

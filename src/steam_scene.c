@@ -7,6 +7,7 @@
  * and the audio thread only reads the published occlusion float (rt_set_occlusion).
  */
 #include "steam_scene.h"
+#include "frame.h"         /* BW_ROOM_AHEAD (default source forward) */
 #include "profile.h"
 
 #include <phonon.h>
@@ -322,7 +323,8 @@ static void shadow_adopt(SteamScene* s, uint16_t idx, uint32_t handle) {
         s->shadow[idx].handle     = handle;
         s->shadow[idx].features   = 0;
         s->shadow[idx].dir_weight = 0.f; s->shadow[idx].dir_power = 1.f;
-        s->shadow[idx].fwd[0] = 0.f; s->shadow[idx].fwd[1] = 0.f; s->shadow[idx].fwd[2] = 1.f;   /* default ahead = +z (room convention) */
+        s->shadow[idx].fwd[0] = BW_ROOM_AHEAD[0]; s->shadow[idx].fwd[1] = BW_ROOM_AHEAD[1];      /* default ahead = the room */
+        s->shadow[idx].fwd[2] = BW_ROOM_AHEAD[2];                                                /* frame's identity forward */
         s->shadow[idx].pos[0] = 0.f; s->shadow[idx].pos[1] = 0.f; s->shadow[idx].pos[2] = 0.f;   /* origin until set_pos lands */
     }
 }

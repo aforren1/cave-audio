@@ -219,9 +219,9 @@ static void draw_speakers(int hi) {
                            k == hi ? (Color){ 120, 240, 140, 255 } : (Color){ 120, 120, 140, 255 });
 }
 static void draw_head(Quaternion q) {
-    /* room convention: identity faces +z with +y up (Motive default), so the right ear is -x */
-    Vector3 right = Vector3RotateByQuaternion((Vector3){ -1, 0, 0 }, q);
-    Vector3 fwd   = Vector3RotateByQuaternion((Vector3){ 0, 0, 1 }, q);
+    /* ear/nose axes from the ABI's room-frame identity basis (bwaudio.h BW_ROOM_*) */
+    Vector3 right = Vector3RotateByQuaternion((Vector3){ BW_ROOM_RIGHT[0], BW_ROOM_RIGHT[1], BW_ROOM_RIGHT[2] }, q);
+    Vector3 fwd   = Vector3RotateByQuaternion((Vector3){ BW_ROOM_AHEAD[0], BW_ROOM_AHEAD[1], BW_ROOM_AHEAD[2] }, q);
     DrawSphere((Vector3){ 0, 0, 0 }, 0.16f, SKYBLUE);
     DrawSphere(Vector3Scale(right,  0.17f), 0.055f, RED);       /* right ear -> audio R */
     DrawSphere(Vector3Scale(right, -0.17f), 0.055f, RAYWHITE);  /* left ear  -> audio L */

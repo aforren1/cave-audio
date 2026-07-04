@@ -78,7 +78,7 @@ add_library(bw_core OBJECT
   src/stream.c
   ${CJSON_C}
 )
-target_include_directories(bw_core PUBLIC src ${dr_libs_SOURCE_DIR} ${CJSON_INC})
+target_include_directories(bw_core PUBLIC src include ${dr_libs_SOURCE_DIR} ${CJSON_INC})   # include/: frame.h consumes the BW_ROOM_* basis
 target_link_libraries(bw_core PUBLIC ws2_32)   # natnet.c uses Winsock (propagates to consumers)
 if(MSVC)
   target_compile_options(bw_core PRIVATE /W4)
