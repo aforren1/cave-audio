@@ -100,6 +100,8 @@ typedef struct {
      * A seek on a RUNNING voice is ramp-out -> jump -> ramp-in (two blocks, ~10 ms at 256/48k). */
     bool     paused;                         /* target state (CMD_SET_PAUSED) */
     float    pause_g;                        /* current gate value (1 = running) */
+    uint8_t  stopping;                       /* CMD_STOP: fade the gate to 0 over one block, THEN playing=false
+                                              * (click-free explicit stop; steal/destroy still hard-cut, see CMD_STOP) */
     uint8_t  seek_pending;
     uint64_t seek_pos;                       /* content frame to land on (in-memory sounds only) */
 } Voice;
@@ -442,10 +444,14 @@ static void drain_commands(RtCore* c) {
                           v->start_sample = cmd->u.play.start;  /* 0 = now; else hold output until this dsp-sample */
                           v->refl_g_cur = 0.f;                  /* fresh start: ramp the wet send up from 0, no stale burst */
                           v->xover_lp = 0.f;                    /* fresh dual-band crossover state */
-                          v->paused = false; v->pause_g = 1.f; v->seek_pending = 0;   /* play always starts running */
+                          v->paused = false; v->pause_g = 1.f; v->seek_pending = 0; v->stopping = 0;   /* play always starts running */
                           if (v->dop_on) dop_line_reset(c, v, BW_H_IDX(cmd->handle)); } } break;
         case CMD_STOP: { Voice* v = voice_for(c, cmd->handle);
-            if (v) v->playing = false; } break;
+            /* Fade the gate to 0 over one block, then finalize (playing=false) in pause_gate — a
+             * click-free explicit stop. (Automatic voice-steal and CMD_SRC_DESTROY still hard-cut:
+             * a stolen slot is re-allocated the same drain, so its fade would be memset away; fading
+             * it cleanly would mean delaying the new voice a block — a deliberate design trade-off.) */
+            if (v && v->playing) v->stopping = 1; } break;
         case CMD_SET_PAUSED: { Voice* v = voice_for(c, cmd->handle);
             if (v) v->paused = cmd->u.pause.on != 0; } break;    /* the mixer's gate does the ramp/freeze */
         case CMD_SEEK: { Voice* v = voice_for(c, cmd->handle);
@@ -617,8 +623,9 @@ static void compute_gains(RtCore* c, Voice* v) {
  * whole block (invariant 4); a pending seek lands only once the gate is silent, so a seek on a
  * running voice is ramp-out -> jump -> ramp-in and never clicks. */
 static int pause_gate(Voice* v, uint32_t n, float* pg, float* pg_step) {
-    float tgt = (v->paused || v->seek_pending) ? 0.f : 1.f;
+    float tgt = (v->paused || v->seek_pending || v->stopping) ? 0.f : 1.f;
     if (v->pause_g == 0.f && tgt == 0.f) {
+        if (v->stopping) { v->playing = false; v->stopping = 0; return 0; }   /* faded to silence: finalize the stop */
         if (v->seek_pending) {                       /* land the seek while inaudible */
             const SoundData* snd = v->sound;
             uint64_t f = v->seek_pos;
@@ -638,11 +645,14 @@ static int pause_gate(Voice* v, uint32_t n, float* pg, float* pg_step) {
 
 static void mix_voice(RtCore* c, Voice* v, uint16_t idx, float* bus, uint32_t n, uint32_t start, float* aux) {
     const SoundData* snd = v->sound;
+    const uint32_t nr = n - start;      /* rendered samples this block: every per-sample ramp spans the AUDIBLE
+                                         * part [start,n), so a scheduled start (start>0) lands its gains exactly
+                                         * instead of snapping the unspent start/n fraction at the block end */
     float pg, pg_step;
-    if (!pause_gate(v, n, &pg, &pg_step)) return;
+    if (!pause_gate(v, nr, &pg, &pg_step)) return;
     float step[BW_CHANNELS];
     for (uint32_t ch = 0; ch < c->channels; ++ch)
-        step[ch] = (v->gtarget[ch] - v->gcur[ch]) / (float)n;
+        step[ch] = (v->gtarget[ch] - v->gcur[ch]) / (float)nr;
     /* dual-band panning: split each sample at BW_DUALBAND_FC; the low band uses amplitude-normalised
      * gains (gcur_lo, better LF velocity vector), the high band the power gains. The complementary
      * 1st-order crossover (hi = s - lo) sums flat, so it composes with everything upstream. */
@@ -650,18 +660,18 @@ static void mix_voice(RtCore* c, Voice* v, uint16_t idx, float* bus, uint32_t n,
     const float xover_a = c->xover_a;
     float step_lo[BW_CHANNELS];
     if (dual) for (uint32_t ch = 0; ch < c->channels; ++ch)
-        step_lo[ch] = (v->gtarget_lo[ch] - v->gcur_lo[ch]) / (float)n;
+        step_lo[ch] = (v->gtarget_lo[ch] - v->gcur_lo[ch]) / (float)nr;
     /* gate the sim's publish on our own generation (we own v->gen, so this is race-free): apply the
      * published transmittance only if it was published for THIS occupant, else treat as clear. Read
      * once into a local so the ramp aims at and lands on the same value (invariant 4 — no jump). */
     const uint32_t myh = BW_MK_H(idx, v->gen);
     const bool mine = atomic_load_explicit(&c->occ_handle[idx], memory_order_acquire) == myh;
     const float occ_tgt = mine ? atomic_load_explicit(&c->occ_val[idx], memory_order_relaxed) : 1.0f;
-    const float occ_step = (occ_tgt - v->occ_cur) / (float)n;   /* occlusion ramp (invariant 4) */
+    const float occ_step = (occ_tgt - v->occ_cur) / (float)nr;   /* occlusion ramp (invariant 4) */
     /* directivity (source-radiation gain): own ramp — it tracks source/listener motion, so a raw
      * per-block jump would zipper (invariant 4). Gated on the same handle. */
     const float dir_tgt = mine ? atomic_load_explicit(&c->occ_dir[idx], memory_order_relaxed) : 1.0f;
-    const float dir_step = (dir_tgt - v->dir_cur) / (float)n;
+    const float dir_step = (dir_tgt - v->dir_cur) / (float)nr;
 
     /* per-band EQ: read the gated tilt once + glide the band gains; compute this block's TARGET
      * biquad coeffs and interpolate the live coeffs (eq_co) toward them per sample, so the spectral
@@ -680,7 +690,7 @@ static void mix_voice(RtCore* c, Voice* v, uint16_t idx, float* bus, uint32_t n,
         for (int b = 0; b < 3; ++b) {
             if (flat) { co_tgt[b][0] = 1.f; co_tgt[b][1] = co_tgt[b][2] = co_tgt[b][3] = co_tgt[b][4] = 0.f; }
             else eq_coeffs(c->eq_proto[b].type, c->eq_proto[b].cw0, c->eq_proto[b].alpha, v->eqg_cur[b], co_tgt[b]);
-            for (int k = 0; k < 5; ++k) co_step[b][k] = (co_tgt[b][k] - v->eq_co[b][k]) / (float)n;
+            for (int k = 0; k < 5; ++k) co_step[b][k] = (co_tgt[b][k] - v->eq_co[b][k]) / (float)nr;
         }
     }
 
@@ -704,7 +714,7 @@ static void mix_voice(RtCore* c, Voice* v, uint16_t idx, float* bus, uint32_t n,
             refl_tgt *= BW_REFL_NEAR_SEND + (1.f - BW_REFL_NEAR_SEND) * t;
         }
     }
-    const float refl_step = (refl_tgt - v->refl_g_cur) / (float)n;
+    const float refl_step = (refl_tgt - v->refl_g_cur) / (float)nr;
     const bool do_send = aux && (v->refl_send || v->refl_g_cur > 1e-6f);
     float air_a_tgt = 1.f, air_a_step = 0.f;
     if (v->air_on) {
@@ -712,7 +722,7 @@ static void mix_voice(RtCore* c, Voice* v, uint16_t idx, float* bus, uint32_t n,
         if (fc < BW_AIR_FC_FLOOR) fc = BW_AIR_FC_FLOOR;
         air_a_tgt = 1.f - expf(-6.28318530718f * fc / (float)c->sample_rate);
         if (air_a_tgt > 1.f) air_a_tgt = 1.f;
-        air_a_step = (air_a_tgt - v->air_a_cur) / (float)n;
+        air_a_step = (air_a_tgt - v->air_a_cur) / (float)nr;
     }
     float dop_ds = 0.f, dop_k = 0.f, *dring = NULL; uint32_t dmask = 0;
     if (v->dop_on && c->dop_ring) {
@@ -757,7 +767,7 @@ static void mix_voice(RtCore* c, Voice* v, uint16_t idx, float* bus, uint32_t n,
         const PathPub* pp = &c->path_pub[(size_t)idx * 2 + (size_t)pf];
         const int mine_path = (pp->handle == myh);
         for (uint32_t k = 0; k < pac; ++k) path_tgt[k] = mine_path ? pp->sh[k] : 0.f;
-        for (uint32_t k = 0; k < pac; ++k) path_step[k] = (path_tgt[k] - v->path_sh_cur[k]) / (float)n;
+        for (uint32_t k = 0; k < pac; ++k) path_step[k] = (path_tgt[k] - v->path_sh_cur[k]) / (float)nr;
         /* bending-loss EQ: glide the band gains toward the published tilt (flat when not mine), then
          * compute this block's target biquad coeffs and interpolate the live coeffs per sample — the
          * same low-shelf/peak/high-shelf cascade the occlusion EQ uses, applied to s_raw pre-encode
@@ -772,7 +782,7 @@ static void mix_voice(RtCore* c, Voice* v, uint16_t idx, float* bus, uint32_t n,
         if (v->path_eq_engaged) for (int b = 0; b < 3; ++b) {
             if (path_flat) { pco_tgt[b][0] = 1.f; pco_tgt[b][1] = pco_tgt[b][2] = pco_tgt[b][3] = pco_tgt[b][4] = 0.f; }
             else eq_coeffs(c->eq_proto[b].type, c->eq_proto[b].cw0, c->eq_proto[b].alpha, v->path_eqg_cur[b], pco_tgt[b]);
-            for (int k = 0; k < 5; ++k) pco_step[b][k] = (pco_tgt[b][k] - v->path_eq_co[b][k]) / (float)n;
+            for (int k = 0; k < 5; ++k) pco_step[b][k] = (pco_tgt[b][k] - v->path_eq_co[b][k]) / (float)nr;
         }
     }
 
@@ -882,10 +892,11 @@ static void mix_voice(RtCore* c, Voice* v, uint16_t idx, float* bus, uint32_t n,
  * gcur[0]. Looping / natural end / oneshot-ack are identical to mix_voice. */
 static void mix_bed(RtCore* c, Voice* v, uint16_t idx, float* bus, uint32_t n, uint32_t start) {
     const SoundData* snd = v->sound;
+    const uint32_t nr = n - start;      /* rendered samples: ramp over the audible part (see mix_voice) */
     float pg, pg_step;
-    if (!pause_gate(v, n, &pg, &pg_step)) return;
+    if (!pause_gate(v, nr, &pg, &pg_step)) return;
     const int nch = (int)snd->channels;
-    const float g_step = (v->gtarget[0] - v->gcur[0]) / (float)n;   /* master gain ramp (invariant 4) */
+    const float g_step = (v->gtarget[0] - v->gcur[0]) / (float)nr;   /* master gain ramp (invariant 4) */
     uint32_t cur = v->cursor;
     bool ended = false;
     for (uint32_t i = 0; i < n; ++i) {

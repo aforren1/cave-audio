@@ -15,9 +15,11 @@ struct Monitor {
     uint32_t channels;
     uint32_t sample_rate;
     float    spk[BW_CHANNELS][3];           /* speaker world positions */
-    float    gL[BW_CHANNELS], gR[BW_CHANNELS];
+    float    gL[BW_CHANNELS], gR[BW_CHANNELS];          /* target pan gains (recomputed on pose change) */
+    float    gL_cur[BW_CHANNELS], gR_cur[BW_CHANNELS];  /* applied gains, ramped toward the target (invariant 4) */
     float    last_p[3], last_q[4];
     int      have;
+    int      primed;                        /* gL_cur seeded from the first solve (no ramp up from 0) */
 };
 
 Monitor* monitor_create(const Layout* L, uint32_t sample_rate) {
@@ -64,13 +66,22 @@ void monitor_process(Monitor* m, const float* bus, const float p[3], const float
                      float* out, uint32_t n) {
     if (!m->have || memcmp(m->last_p, p, sizeof m->last_p) || memcmp(m->last_q, q, sizeof m->last_q))
         recompute(m, p, q);
+    if (!m->primed) {                               /* seed the applied gains from the first solve (no ramp from 0) */
+        memcpy(m->gL_cur, m->gL, sizeof m->gL_cur);
+        memcpy(m->gR_cur, m->gR, sizeof m->gR_cur);
+        m->primed = 1;
+    }
     float* L = out;
     float* R = out + (size_t)n;                     /* planar 2-ch out */
     memset(out, 0, sizeof(float) * (size_t)n * 2);
+    const float inv_n = 1.0f / (float)n;
     for (uint32_t k = 0; k < m->channels; ++k) {
         const float* src = bus + (size_t)k * n;
-        const float gl = m->gL[k], gr = m->gR[k];
-        for (uint32_t i = 0; i < n; ++i) { L[i] += gl * src[i]; R[i] += gr * src[i]; }
+        float gl = m->gL_cur[k], gr = m->gR_cur[k];              /* ramp per block toward the new pan gains: a head */
+        const float dgl = (m->gL[k] - gl) * inv_n;              /* turn moves the stereo image smoothly, no zipper */
+        const float dgr = (m->gR[k] - gr) * inv_n;
+        for (uint32_t i = 0; i < n; ++i) { L[i] += gl * src[i]; R[i] += gr * src[i]; gl += dgl; gr += dgr; }
+        m->gL_cur[k] = m->gL[k]; m->gR_cur[k] = m->gR[k];        /* land exactly */
     }
     /* Debug monitor: summing 26 virtual speakers into 2 channels is not level-calibrated
      * (the production Steam Audio decode normalizes). Clamp to keep the device in range. */

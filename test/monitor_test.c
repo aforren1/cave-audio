@@ -22,11 +22,14 @@ static float out[2 * N];
 static double e_left(void)  { double e = 0; for (int i = 0; i < N; ++i) e += fabs(out[i]);     return e; }
 static double e_right(void) { double e = 0; for (int i = 0; i < N; ++i) e += fabs(out[N + i]); return e; }
 
-/* drive a constant 1.0 on exactly one bus channel, decode, with listener at origin + pose q */
+/* drive a constant 1.0 on exactly one bus channel, decode, with listener at origin + pose q.
+ * The monitor ramps its pan gains one block toward a NEW pose (invariant 4 — no zipper as the head
+ * turns), so render twice and measure the settled block when the pose changed from the last call. */
 static void decode_channel(Monitor* m, int ch, const float q[4]) {
     const float p[3] = { 0, 1.5f, 0 };   /* the default grid's ear point (floor origin) */
     memset(bus, 0, sizeof bus);
     for (int i = 0; i < N; ++i) bus[(size_t)ch * N + i] = 1.0f;
+    monitor_process(m, bus, p, q, out, N);
     monitor_process(m, bus, p, q, out, N);
 }
 
