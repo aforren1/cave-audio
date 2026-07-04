@@ -49,6 +49,7 @@ struct AsioSink {
     ASIOChannelInfo channelInfos[64];
     ASIOCallbacks   callbacks;
     float*          bus;             /* planar channels * buffer_size; engine renders here */
+    uint64_t        fallback_pos;    /* internal block counter for when the driver's sample position is invalid */
     bool            post_output;     /* driver supports ASIOOutputReady */
     bool            running;
     char            name[64];
@@ -117,9 +118,16 @@ ASIOTime* bufferSwitchTimeInfo(ASIOTime* timeInfo, long index, ASIOBool /*proces
     if (!named) { BW_THREAD_NAME("bw-audio (ASIO)"); named = true; }   /* the driver's callback thread */
     BW_ZONE_BEGIN(zblk, "asio block");                                 /* one block; vs the period = the RT budget */
 
+    /* Trust the driver's sample position ONLY when it flags it valid; otherwise the memset-0 (or a
+     * stale value) would freeze the engine's dsp clock and break bw_source_play_at scheduling. Fall
+     * back to an internal block counter, kept in step with the device position while it IS valid. */
     BwTimestamp ts;
-    ts.sample_pos     = samples_u64(timeInfo->timeInfo.samplePosition);
-    ts.system_time_ns = timestamp_ns(timeInfo->timeInfo.systemTime);
+    if (timeInfo->timeInfo.flags & kSamplePositionValid)
+        ts.sample_pos = samples_u64(timeInfo->timeInfo.samplePosition);
+    else
+        ts.sample_pos = s->fallback_pos;
+    s->fallback_pos   = ts.sample_pos + (uint64_t)s->buffer_size;
+    ts.system_time_ns = (timeInfo->timeInfo.flags & kSystemTimeValid) ? timestamp_ns(timeInfo->timeInfo.systemTime) : 0;
 
     s->render(s->user, s->bus, (uint32_t)s->buffer_size, &ts);   /* engine fills the bus */
 
@@ -153,7 +161,12 @@ long asioMessage(long selector, long value, void* /*msg*/, double* /*opt*/) {
                 value == kAsioSupportsTimeInfo) ? 1L : 0L;
     case kAsioEngineVersion:     return 2L;
     case kAsioSupportsTimeInfo:  return 1L;
-    case kAsioResetRequest:      /* TODO(M1+): signal engine to re-open */ return 1L;
+    case kAsioResetRequest:
+        /* KNOWN GAP (rig-day): we ack the request but don't yet perform the reset. A full handler must
+         * signal the control thread to bw_stop + bw_start (the driver stops calling bufferSwitch until
+         * we re-create buffers). Until that plumbing exists, a live buffer-size/rate change in the
+         * driver control panel will stall output — change it before bw_start, not during. */
+        return 1L;
     case kAsioResyncRequest:
     case kAsioLatenciesChanged:  return 1L;
     default:                     return 0L;
@@ -179,9 +192,13 @@ void asio_stop(BwSink* base) {
 }
 void asio_close(BwSink* base) {
     AsioSink* s = (AsioSink*)base;
-    g_sink = nullptr;            /* stop dispatching to this sink before tearing it down */
-    asio_stop(base);            /* ASIOStop; then DisposeBuffers deregisters callbacks */
-    ASIODisposeBuffers();
+    /* Teardown order matters: ASIOStop then ASIODisposeBuffers, which per the ASIO spec guarantees
+     * the driver issues no further bufferSwitch. Only AFTER that do we clear g_sink and free s, so a
+     * callback can never be in flight against freed memory (clearing g_sink first would have left a
+     * window: a callback past its NULL check could still touch s while we freed it). */
+    asio_stop(base);            /* ASIOStop: driver stops issuing callbacks */
+    ASIODisposeBuffers();       /* no bufferSwitch after this returns */
+    g_sink = nullptr;
     ASIOExit();
     if (asioDrivers) asioDrivers->removeCurrentDriver();
     free(s->bus);

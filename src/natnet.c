@@ -249,12 +249,19 @@ static bool resolve_name_via_modeldef(const NatNetConfig* cfg, int major, int mi
     return found;
 }
 
+static bool valid_ipv4(const char* s) { struct in_addr a; return inet_pton(AF_INET, s, &a) == 1; }
+
 static DWORD WINAPI receiver(LPVOID arg) {
     NatNet* nn = (NatNet*)arg;
     uint8_t buf[65536];                                        /* max UDP datagram */
     while (!nn->stop) {
         int got = recvfrom(nn->sock, (char*)buf, sizeof buf, 0, NULL, NULL);
-        if (got < 4) continue;                                 /* timeout / error / runt: re-poll stop */
+        if (got == SOCKET_ERROR) {                             /* timeout is normal (200 ms, to re-poll stop); */
+            int e = WSAGetLastError();                         /* a HARD error must back off, not hot-spin a core */
+            if (e != WSAETIMEDOUT && e != WSAEWOULDBLOCK) Sleep(50);
+            continue;
+        }
+        if (got < 4) continue;                                 /* runt: re-poll stop */
         uint16_t msg, nbytes;
         memcpy(&msg, buf, 2); memcpy(&nbytes, buf + 2, 2);
         if (msg != NAT_FRAMEOFDATA) continue;
@@ -282,6 +289,16 @@ NatNet* natnet_open(const NatNetConfig* cfg, char* err, size_t errcap) {
     nn->sock = INVALID_SOCKET;
     nn->rigid_body = cfg->rigid_body;
     nn->pose.q[3] = 1.0f;                                       /* identity until the first frame */
+
+    /* inet_pton accepts only numeric IPv4 literals; a hostname or typo silently becomes 0.0.0.0,
+     * which downstream surfaces as a misleading "server didn't respond" / "rigid body not found".
+     * Reject a bad server/multicast address up front with a clear message. */
+    if (cfg->server && cfg->server[0] && !valid_ipv4(cfg->server)) {
+        nn_err(err, errcap, "natnet: BWAUDIO_NATNET_SERVER must be a numeric IPv4 address (e.g. 192.168.1.10), not a hostname"); goto fail;
+    }
+    if (cfg->multicast && cfg->multicast[0] && !valid_ipv4(cfg->multicast)) {
+        nn_err(err, errcap, "natnet: BWAUDIO_NATNET_MULTICAST must be a numeric IPv4 multicast address (e.g. 239.255.42.99)"); goto fail;
+    }
 
     /* Bitstream version. The server knows its own version, so when one is configured the
      * handshake is authoritative — it can't be desynced by a wrong BWAUDIO_NATNET_VERSION (a

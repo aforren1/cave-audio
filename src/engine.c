@@ -262,13 +262,24 @@ int bw_start(BwEngine* e) {
         if (e->scratch26)
             e->sink = bw_sink_open(sr, bs, 2, render_binaural, e, e->errbuf, sizeof e->errbuf);
     } else { /* both: a 26-ch array sink + a 2-ch monitor sink sharing a double-buffer */
-        e->mon_buf[0] = (float*)calloc((size_t)bs * 2, sizeof(float));
-        e->mon_buf[1] = (float*)calloc((size_t)bs * 2, sizeof(float));
+        /* Size the handoff for ANY device block (the ASIO driver picks its own, != cfg.block_size in
+         * general); cap is set to the ACTUAL array block below, once the sink reports it. */
+        e->mon_buf[0] = (float*)calloc((size_t)BW_MAX_BLOCK * 2, sizeof(float));
+        e->mon_buf[1] = (float*)calloc((size_t)BW_MAX_BLOCK * 2, sizeof(float));
         e->mon_idx = 0;
         if (e->mon_buf[0] && e->mon_buf[1]) {
             e->sink = bw_sink_open(sr, bs, BW_CHANNELS, render_both_array, e, e->errbuf, sizeof e->errbuf);
-            if (e->sink)
+            if (e->sink) {
+                e->cap = bw_sink_block_size(e->sink);   /* the array's real block; render_both_* gate on it */
                 e->sink_mon = bw_sink_open(sr, bs, 2, render_both_monitor, e, e->errbuf, sizeof e->errbuf);
+                /* the double-buffer handoff exchanges cap-sized blocks, so the two devices must agree.
+                 * A mismatch would leave the monitor silent — fail with a clear message instead. */
+                if (e->sink_mon && bw_sink_block_size(e->sink_mon) != e->cap) {
+                    set_error(e, "both profile: the array and monitor ASIO devices must use the same buffer size");
+                    engine_close_devices(e);
+                    return 2;
+                }
+            }
         }
     }
 
