@@ -567,6 +567,17 @@ int main(void) {
                  * coherent summation at the listener), and the panning DIRECTION is unchanged. */
                 CHECK(l2_off > 0 && l2_on < 0.85 * l2_off, "dual-band LF uses amplitude norm (lower per-channel power)");
                 CHECK(amax_on == amax_off, "dual-band preserves the localization direction");
+                /* the A/B toggle CROSSFADES (invariant 4): the first block after enabling lands BETWEEN
+                 * single and dual, not straight at dual — a hard switch would step the LF re-weight in
+                 * one sample. (dual L2 < single L2, so a gradual transition sits above the settled dual.) */
+                {
+                    BwTimestamp tsd = { 0, 0 };
+                    rt_set_dual_band(cdb, 0); rt_commit(cdb); render2(cdb);        /* settle back to single */
+                    rt_set_dual_band(cdb, 1); rt_commit(cdb);
+                    rt_render(cdb, bus, N, &tsd);  double l2_trans = total_l2();   /* one block: crossfade in progress */
+                    CHECK(l2_trans > l2_on * 1.02 && l2_trans <= l2_off * 1.02,
+                          "dual-band toggle crossfades (transition block between dual and single, not a jump)");
+                }
                 /* a HIGH tone (above the crossover) is unaffected by dual-band: it stays in the power band */
                 const char* HW = "bw_rt_hi.wav";
                 if (write_sine_wav(HW, 5000.0, 8 * N)) {

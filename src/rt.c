@@ -60,6 +60,8 @@ typedef struct {
     float    gtarget[BW_CHANNELS], gcur[BW_CHANNELS];
     float    gtarget_lo[BW_CHANNELS], gcur_lo[BW_CHANNELS];   /* dual-band low (amplitude-norm) band gains */
     float    xover_lp;                                        /* dual-band crossover one-pole LP state */
+    float    dual_mix;                                        /* 0 = single .. 1 = dual; ramps on an A/B toggle
+                                                              * so the LF re-weighting crossfades (no step) */
     int      path_on;                                         /* gated into the pathing (indirect) render */
     float    path_sh_cur[BW_AMBI_CH];                         /* ramped path shCoeffs (toward the published target) */
     /* pathing bending-loss EQ (audio-thread-only): a 3-band tilt on the indirect signal before the
@@ -453,6 +455,7 @@ static void drain_commands(RtCore* c) {
                           v->start_sample = cmd->u.play.start;  /* 0 = now; else hold output until this dsp-sample */
                           v->refl_g_cur = 0.f;                  /* fresh start: ramp the wet send up from 0, no stale burst */
                           v->xover_lp = 0.f;                    /* fresh dual-band crossover state */
+                          v->dual_mix = atomic_load_explicit(&c->dual_band, memory_order_relaxed) ? 1.f : 0.f;  /* start in the current mode */
                           v->paused = false; v->pause_g = 1.f; v->seek_pending = 0; v->stopping = 0;   /* play always starts running */
                           if (v->dop_on) dop_line_reset(c, v, BW_H_IDX(cmd->handle)); } } break;
         case CMD_STOP: { Voice* v = voice_for(c, cmd->handle);
@@ -676,11 +679,18 @@ static void mix_voice(RtCore* c, Voice* v, uint16_t idx, float* bus, uint32_t n,
         step[ch] = (v->gtarget[ch] - v->gcur[ch]) / (float)nr;
     /* dual-band panning: split each sample at BW_DUALBAND_FC; the low band uses amplitude-normalised
      * gains (gcur_lo, better LF velocity vector), the high band the power gains. The complementary
-     * 1st-order crossover (hi = s - lo) sums flat, so it composes with everything upstream. */
+     * 1st-order crossover (hi = s - lo) sums flat. dual = gcur*s + (gcur_lo-gcur)*lo, so a `dual_mix`
+     * factor ramped 0<->1 on an A/B toggle CROSSFADES the LF re-weighting instead of stepping it
+     * (invariant 4). The full path runs only while dual is on OR mid-crossfade; settled-single stays
+     * cheap and keeps xover_lp at 0 for a clean re-enable. */
     const int dual = atomic_load_explicit(&c->dual_band, memory_order_acquire);
+    const float target_mix = dual ? 1.f : 0.f;
+    const int use_dual = (v->dual_mix > 0.f) || dual;
+    float dmix = v->dual_mix;
+    const float dmix_step = (target_mix - v->dual_mix) / (float)nr;
     const float xover_a = c->xover_a;
     float step_lo[BW_CHANNELS];
-    if (dual) for (uint32_t ch = 0; ch < c->channels; ++ch)
+    if (use_dual) for (uint32_t ch = 0; ch < c->channels; ++ch)
         step_lo[ch] = (v->gtarget_lo[ch] - v->gcur_lo[ch]) / (float)nr;
     /* gate the sim's publish on our own generation (we own v->gen, so this is race-free): apply the
      * published transmittance only if it was published for THIS occupant, else treat as clear. Read
@@ -859,13 +869,13 @@ static void mix_voice(RtCore* c, Voice* v, uint16_t idx, float* bus, uint32_t n,
                 v->path_sh_cur[k] += path_step[k];
             }
         }
-        if (dual) {
+        if (use_dual) {
             float lo = v->xover_lp + xover_a * (s - v->xover_lp); v->xover_lp = lo;   /* LP @ 700 Hz */
-            float hi = s - lo;                                                        /* complementary HP */
-            for (uint32_t ch = 0; ch < c->channels; ++ch) {
-                bus[(size_t)ch * n + i] += v->gcur_lo[ch] * lo + v->gcur[ch] * hi;
+            for (uint32_t ch = 0; ch < c->channels; ++ch) {                           /* single + dmix-scaled LF re-weight */
+                bus[(size_t)ch * n + i] += v->gcur[ch] * s + dmix * (v->gcur_lo[ch] - v->gcur[ch]) * lo;
                 v->gcur_lo[ch] += step_lo[ch]; v->gcur[ch] += step[ch];
             }
+            dmix += dmix_step;
         } else {
             for (uint32_t ch = 0; ch < c->channels; ++ch) {
                 bus[(size_t)ch * n + i] += v->gcur[ch] * s;
@@ -888,7 +898,11 @@ static void mix_voice(RtCore* c, Voice* v, uint16_t idx, float* bus, uint32_t n,
     v->dir_cur = dir_tgt;
     if (v->air_on) v->air_a_cur = air_a_tgt;                     /* land the ramped propagation params */
     if (do_send)   v->refl_g_cur = refl_tgt;                     /* (the Doppler delay self-tracks per sample) */
-    if (dual) for (uint32_t ch = 0; ch < c->channels; ++ch) v->gcur_lo[ch] = v->gtarget_lo[ch];  /* land lo band */
+    if (use_dual) {
+        for (uint32_t ch = 0; ch < c->channels; ++ch) v->gcur_lo[ch] = v->gtarget_lo[ch];  /* land lo band */
+        v->dual_mix = target_mix;                                    /* land the crossfade factor */
+        if (target_mix == 0.f) v->xover_lp = 0.f;                    /* settled single next block: clean LP restart */
+    }
     if (v->eq_engaged) {
         for (int b = 0; b < 3; ++b) for (int k = 0; k < 5; ++k) v->eq_co[b][k] = co_tgt[b][k];   /* land coeffs */
         if (flat) {                                              /* settled to passthrough: bypass + reset history */
