@@ -114,11 +114,19 @@ value), and **V** toggles the observer model (fixed centre vs the moving working
 
 ## Validation (loader contract)
 
-`bw_create`/`bw_start` fails (NULL / nonzero, see [`api.md`](./api.md) error codes) if any of:
+`layout_load` rejects a malformed file (the reason is surfaced through `bw_last_error`) if any of:
 - `speakers.length != 26`;
 - `index` values are not a permutation of `0..25`;
-- a `position` is missing or not three finite numbers;
-- `schema_version` major is newer than the loader supports.
+- a `position` component is missing, non-numeric, non-finite, or beyond ±1000 m;
+- a `gain_db` / `delay_ms` / `room_eq` field is out of its documented range, or an `eq` (>512 taps)
+  or `room_eq` (>8 sections) array is over its cap, or a tap is non-finite.
+
+**A present-but-invalid `BwConfig.layout_path` is NOT fatal.** `bw_create` records the reason in
+`bw_last_error` and falls back to the **default grid** (so desk/dev runs with no survey still work);
+`bw_start` still returns success. An installation that must run on the surveyed geometry therefore
+**must check `bw_last_error` after `bw_create`** — a silently-defaulted layout pans the array with
+the wrong speaker positions. A NULL/empty `layout_path` intentionally selects the default grid with
+no error. `schema_version` is stored for forward-compat but not yet enforced.
 
 On success, the loader holds the parsed geometry in the internal `Layout` struct (see
 [`internal-types.md`](./internal-types.md)); the audio thread reads it but never reloads it.

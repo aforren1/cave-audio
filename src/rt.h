@@ -8,10 +8,10 @@
  * rt_render (drain + mix), which must not allocate/lock/block. They share state only
  * through the two rings and the staging->active snapshot.
  *
- * M2 scope: the rings/voice-table/commit/generation machinery is real and final. The
- * mixing is a placeholder — a generated test tone routed to a single position-derived
- * channel with a per-block gain ramp. M3 replaces the tone with wav playback (mix_voice
- * reading sound->pcm); M4 replaces the single-channel routing with the DBAP 26-gain solve.
+ * The mixing is the full production path: mix_voice plays sound->pcm through the
+ * listener-relative DBAP/SPCAP/VBAP 26-gain solve with per-block gain ramps, plus occlusion,
+ * directivity, Doppler, air absorption, reflection/pathing sends, dual-band panning, the
+ * ambisonic bed, streaming, pause/seek, and the output limiter. See docs/roadmap.md for history.
  */
 #ifndef BW_RT_H
 #define BW_RT_H
@@ -66,7 +66,7 @@ typedef struct RtCore RtCore;   /* opaque */
 RtCore* rt_create(uint32_t voice_cap, uint32_t sound_cap, uint32_t sample_rate, uint32_t channels);
 void    rt_destroy(RtCore* c);
 void    rt_set_layout(RtCore* c, const Layout* L);   /* call before bw_start / while stopped */
-void    rt_set_panner(RtCore* c, int panner);        /* 0 = DBAP, 1 = SPCAP; call before bw_start */
+void    rt_set_panner(RtCore* c, int panner);        /* 0 = DBAP, 1 = SPCAP, 2 = VBAP; atomic, live-switchable */
 void    rt_set_bed_decoder(RtCore* c, int decoder);  /* 0 = sampling (SAD), 1 = AllRAD; before bw_start */
 void    rt_set_dual_band(RtCore* c, int on);         /* dual-band panning (amplitude LF / power HF); live A/B */
 void    rt_set_limiter(RtCore* c, int on);           /* output protection limiter (final stage; default ON); live */

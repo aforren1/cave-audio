@@ -13,8 +13,9 @@
  * speaker from the origin gets 0, nearer ones wait for it); gain_db is your per-speaker trim. The
  * dbap knobs round-trip. Loads an existing layout (argv[1] or ./cave_layout.json) to keep iterating.
  *
- * Coordinate frame: room space, right-handed, origin at the working-area centre (matches Motive) —
- * the same numbers the JSON stores. The 3D view renders them directly; the audition (which physical
+ * Coordinate frame: room space, right-handed, +y up, +z forward, origin ON THE FLOOR at the
+ * working-area centre in x/z (Motive's default; y = height above the floor) — the same numbers the
+ * JSON stores. The 3D view renders them directly; the audition (which physical
  * speaker sounds) is the ground truth for the channel<->speaker map, the numeric readout for position.
  *
  * P / Preview: a pink-noise source moves through your in-progress layout (the tool rebuilds the
@@ -945,7 +946,7 @@ static void draw_panel(void) {
     bwTip("the speaker's index IS its output/bus channel; [ ] steps, or click a sphere");
     ImGui::SameLine(); ImGui::Text("-> ch %d", sel);
     if (ImGui::DragFloat3("pos", &spk[sel].pos.x, 0.01f, 0, 0, "%.3f")) mark_edit();
-    bwTip("room-space metres, right-handed, origin at the working-area centre (matches Motive); drag, or ctrl-click to type");
+    bwTip("room-space metres, right-handed, +y up, origin on the floor at the working-area centre (Motive); drag, or ctrl-click to type");
     if (ImGui::SliderFloat("gain", &spk[sel].gain_db, -24.0f, 12.0f, "%+.1f dB")) mark_edit();
     bwTip("per-speaker level trim (gain_db in the file)");
     CheckboxInt("tone [T]", &tone_on);

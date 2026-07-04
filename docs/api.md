@@ -61,26 +61,37 @@ The API reports failure three ways, all read on the **control thread**:
 | `BW_ERR_STATE`  | 5     | called in the wrong state (e.g. `bw_start` while already running) |
 | `BW_ERR_INTERNAL` | 6   | unexpected internal failure; `bw_last_error` carries detail |
 
-`bw_create` validates the config and allocates; **device and asset I/O that can fail at runtime
-happen in `bw_start`**, so a non-NULL engine from `bw_create` can still fail to `bw_start`. Always
-check `bw_start`'s return and read `bw_last_error` on nonzero.
+`bw_create` returns `NULL` on failure (bad config / out of memory); it does **not** return a code.
+`bw_start` currently returns only **`0`, `1` (`BW_ERR_CONFIG`: NULL engine, or a `room_eq` layout in a
+moving-listener session), and `2` (`BW_ERR_DEVICE`)**. Codes **3–6 are reserved**, not yet returned:
+a bad `layout_path` or `hrtf_path` **degrades gracefully** (the engine falls back to the default grid
+/ the simple-pan monitor and records the reason in `bw_last_error`) rather than failing `bw_start`,
+and a redundant `bw_start` is a no-op that returns `0`. So **read `bw_last_error` after `bw_create`
+and `bw_start` even on success** if you must confirm the surveyed layout / SOFA HRTF actually loaded.
 
 The per-frame `void` calls (`bw_source_set_pos`, `bw_commit`, …) never return an error: they only
 enqueue onto the command ring. If that ring is ever full (a should-never-happen control-thread
-stall — see [`concurrency.md`](./concurrency.md)), the policy is to briefly spin rather than drop a
-structural command; a persistent stall is recorded in `bw_last_error`.
+stall — see [`concurrency.md`](./concurrency.md)) the command is **dropped** (silently — no
+`bw_last_error`); the ring is sized (`RING_CAP`) for a worst-case frame burst so this does not occur
+in normal use. Position/pose are latest-wins, so a dropped update is corrected by the next frame.
 
 ## Assets (control thread, file I/O)
 
 ```c
-BwSound bw_load_sound(BwEngine* e, const char* path);   // 0 = failure
-void    bw_unload_sound(BwEngine* e, BwSound snd);       // safe; retire-acked internally
+BwSound bw_load_sound(BwEngine* e, const char* path);           // decode fully into RAM; 0 = failure
+BwSound bw_load_sound_streaming(BwEngine* e, const char* path); // stream from disk (long files); 0 = failure
+void    bw_unload_sound(BwEngine* e, BwSound snd);               // safe; retire-acked internally
 ```
 
 Load sounds once, at load time. **WAV, FLAC, and MP3** are accepted (decoded to mono
 float by dr_libs, dispatched by file extension). If the file's sample rate differs from
 the engine's, it is **resampled to the engine rate at load** (a windowed-sinc pass) — so a
 44.1 kHz MP3 plays correctly on a 48 kHz engine; only the one-time load cost is paid.
+
+`bw_load_sound_streaming` is for long assets (music, ambience) you don't want resident in RAM: a
+background thread feeds the voice from disk as it plays. It is **mono, at the engine sample rate**
+(a rate mismatch fails — pre-convert, or use `bw_load_sound` which resamples), plays on **one voice
+at a time**, and does not support `bw_source_seek` (the ring can't jump).
 
 `bw_unload_sound` is safe to call any time — the
 core detaches references on the audio thread and frees only after the retire-ack
@@ -91,15 +102,24 @@ core detaches references on the audio thread and frees only after the retire-ack
 ```c
 BwSource bw_source_create(BwEngine* e);                  // handle returned synchronously
 void     bw_source_destroy(BwEngine* e, BwSource s);
+void     bw_source_set_priority(BwEngine* e, BwSource s, int priority);  // 0 = expendable .. 255 = protected (default 128)
 void     bw_source_set_pos (BwEngine* e, BwSource s, float x, float y, float z); // ROOM space, RH
 void     bw_source_set_gain(BwEngine* e, BwSource s, float linear);
 void     bw_source_play (BwEngine* e, BwSource s, BwSound snd, bool loop);
+void     bw_source_play_at(BwEngine* e, BwSource s, BwSound snd, bool loop, uint64_t start_sample); // sample-accurate
+uint64_t bw_dsp_time(BwEngine* e);                       // current dsp-sample clock (device-anchored, monotonic)
 void     bw_source_stop (BwEngine* e, BwSource s);
 void     bw_source_set_paused(BwEngine* e, BwSource s, bool paused);   // ramped; playhead freezes
 void     bw_source_seek (BwEngine* e, BwSource s, uint64_t frame);     // click-free jump (in-memory)
 bool     bw_source_is_playing(BwEngine* e, BwSource s);  // control-thread poll; see below
 void     bw_play_oneshot(BwEngine* e, BwSound snd, float x, float y, float z, float gain);
 ```
+
+**Voice pool + scheduling.** The voice pool is fixed; when it is full, `bw_source_create` steals the
+lowest-**priority** active source (255 = protected, never stolen) rather than failing — so set music
+and critical SFX high. `bw_source_play_at` begins output exactly when the engine's dsp clock reaches
+`start_sample`; read "now" from `bw_dsp_time` (device sample position, monotonic) and add a delay,
+e.g. play 0.5 s out with `bw_dsp_time(e) + sample_rate/2`. `0` = play immediately (== `bw_source_play`).
 
 `bw_source_is_playing` is a **latest-wins readback** (like `bw_get_listener_pose`): the audio thread
 republishes each source's playing state every block, gated on the handle's generation. It reads

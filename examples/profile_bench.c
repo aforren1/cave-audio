@@ -89,9 +89,11 @@ int main(int argc, char** argv) {
         for (int i = 0; i < nv; ++i) {
             float a = ph + (float)i * (6.2831853f / (float)nv);
             float r = 2.0f + 1.5f * sinf(0.3f * ph + (float)i);
-            bw_source_set_pos(e, src[i], r * cosf(a), 0.8f * sinf(0.7f * ph + (float)i), r * sinf(a));
+            /* orbit about the array centre at ear height (1.5 m), the engine's nominal listening
+             * point under the floor-origin frame — a floor-level listener would profile skewed distances */
+            bw_source_set_pos(e, src[i], r * cosf(a), 1.5f + 0.8f * sinf(0.7f * ph + (float)i), r * sinf(a));
         }
-        if (binaural) { float yaw = 0.2f * ph; bw_set_listener_pose(e, 0, 0, 0, 0, sinf(yaw * 0.5f), 0, cosf(yaw * 0.5f)); }
+        if (binaural) { float yaw = 0.2f * ph; bw_set_listener_pose(e, 0, 1.5f, 0, 0, sinf(yaw * 0.5f), 0, cosf(yaw * 0.5f)); }
         bw_commit(e);
         Sleep(16);                            /* ~60 fps control rate */
     }

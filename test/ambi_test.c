@@ -38,6 +38,19 @@ int main(void) {
     for (int i = 0; i < BW_AMBI_CH; ++i) finite &= isfinite(y[i]);
     CHECK(finite && EQ(y[0], 1), "diagonal: finite and W=1");
 
+    /* The product / sectoral harmonics (ACN 4,5,7,8,10,11,14) are EXACTLY ZERO at every cardinal
+     * direction, so a sign flip in any of them — the m<0 SH-sign bug class that has bitten this repo
+     * — is invisible to the cardinal checks above. Pin their signs+values at an ASYMMETRIC direction
+     * (2,1,2)/3 (unit; x!=y so the m=+2 terms don't vanish either). */
+    ambi_encode_sn3d((const float[]){ 0.6666667f, 0.3333333f, 0.6666667f }, y);
+    CHECK(EQ(y[4],  0.3849002f), "asym: ACN4 (l2 m-2, x*y)");
+    CHECK(EQ(y[5],  0.3849002f), "asym: ACN5 (l2 m-1, y*z)");
+    CHECK(EQ(y[7],  0.7698004f), "asym: ACN7 (l2 m+1, x*z)");
+    CHECK(EQ(y[8],  0.2886751f), "asym: ACN8 (l2 m+2, x^2-y^2)");
+    CHECK(EQ(y[10], 0.5737753f), "asym: ACN10 (l3 m-2, x*y*z)");
+    CHECK(EQ(y[11], 0.2494813f), "asym: ACN11 (l3 m-1)");
+    CHECK(EQ(y[14], 0.4303315f), "asym: ACN14 (l3 m+2)");
+
     /* phonon interop: SN3D encode * ambi_phonon_scale must reproduce phonon's orthonormal SH
      * (third_party/steam-audio core/src/core/sh/spherical_harmonics.cc hardcoded constants). At
      * AmbiX front (x=1) = phonon Google +x: W=0.282095, ACN3(x)=0.488603, ACN6(l2,m0)=-0.315392,

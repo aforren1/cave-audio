@@ -17,7 +17,8 @@ the array origin.
 > **Fixed-observer installs are a supported mode — and some deployments want it immediately.** The
 > case above is the *moving*, tracked listener, but a simpler install that seats the audience at one
 > fixed spot is equally valid. The engine already serves it with **no extra machinery**: don't enable
-> tracking, set the listener once to the sweet spot (or leave it at the origin for a centred spot), and
+> tracking, set the listener once to the sweet spot (or leave the pose unset — the engine defaults it
+> to the array centroid, the nominal listening point, since the origin now sits on the floor), and
 > DBAP — being position-based — pans correctly for that fixed point. This is already better than an
 > origin-only ambisonic decode for an off-centre seat, because DBAP uses the *actual* listening
 > position. The layout tool's coverage overlay scores this case directly (its `V` key picks

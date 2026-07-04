@@ -134,6 +134,20 @@ int main(void) {
         CHECK(diff > 1e-3, "moving the listener changes the gain distribution");
     }
 
+    /* 6b. moving-listener localization (the headline feature): a source co-located with speaker k
+     *     localizes to channel k from ANY listener position, because DBAP is listener-relative — the
+     *     source and speaker k share a bearing from every point. A sign error in the listener-relative
+     *     direction would pull the image to the OPPOSITE speaker, which the centred test 3 can't see. */
+    {
+        float lis[3] = { -1.0f, LD.ref[1] - 0.4f, 0.6f }, g[CH];   /* off-centre AND off the ear plane */
+        int ok = 1;
+        for (int k = 0; k < CH; ++k) {
+            dbap_gains(LD.speakers[k].pos, lis, &LD, 1.0f, g);
+            if (argmax(g, CH) != k) ok = 0;
+        }
+        CHECK(ok, "DBAP localizes a source at each speaker to that channel from an off-centre listener");
+    }
+
     /* 7. align: gain trim halves a channel; delay shifts the impulse */
     {
         Layout AL = layout_default();
