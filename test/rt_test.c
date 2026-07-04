@@ -616,6 +616,32 @@ int main(void) {
         }
     }
 
+    /* voice-steal is CLICK-FREE: the stolen voice fades out over one block on its own slot (the new
+     * source starts on a reserve slot), instead of a hard cut. Pool of 1 isolates it; the stealing
+     * source is created but NOT played, so the steal block contains only the victim's fade. */
+    {
+        RtCore* cf = rt_create(1, 4, RATE, CH);
+        if (cf) {
+            BwTimestamp ts0 = { 0, 0 };
+            uint32_t sf = rt_load_sound(cf, WAV, err, sizeof err);   /* WAV = constant 1.0 */
+            uint32_t a = rt_source_create(cf);
+            rt_source_play(cf, a, sf, true);
+            rt_source_set_priority(cf, a, 10);
+            rt_commit(cf); render2(cf);
+            double e_full = total_energy();
+            CHECK(e_full > 1e-6, "steal fade: baseline voice audible");
+            uint32_t b = rt_source_create(cf);                       /* pool full (1) -> steal a; leave b unplayed */
+            CHECK(b != 0, "steal fade: create-on-full succeeds by stealing");
+            rt_commit(cf);
+            rt_render(cf, bus, N, &ts0);  double e_fade  = total_energy();   /* the steal block: a fades */
+            rt_render(cf, bus, N, &ts0);  double e_after = total_energy();   /* next block: a gone, b silent */
+            CHECK(e_fade > 0.05 * e_full, "steal fade: the stolen voice fades, not a hard cut to silence");
+            CHECK(e_fade < e_full,        "steal fade: fading DOWN, not still full");
+            CHECK(e_after < 1e-6,         "steal fade: silent the block after the fade completes");
+            rt_destroy(cf);
+        }
+    }
+
     /* sample-accurate scheduled play: a voice is held silent until its start_sample, then fires */
     {
         RtCore* cp = rt_create(4, 4, RATE, CH);

@@ -150,8 +150,11 @@ struct RtCore {
     uint16_t* gen;                          /* current generation per voice slot */
     uint8_t*  inuse;                        /* 1 while a voice slot is allocated */
     uint8_t*  priority;                     /* per-source steal priority (control-side; 0=expendable..255=protected) */
+    uint8_t*  stealing;                     /* 1 while a slot is fading out from a steal (skip it in the next scan) */
     uint32_t* freelist;
     uint32_t  free_count;
+    uint32_t  fade_reserve;                 /* physical slots beyond the user pool, kept free so a stolen voice can
+                                             * fade out on its OWN slot while the new source starts on a reserve one */
 
     /* control-thread-owned sound table + handle allocation */
     SoundSlot* sounds;
@@ -258,6 +261,8 @@ static uint32_t alloc_handle(RtCore* c) {
     c->inuse[idx] = 1;
     c->priority[idx] = 128;                                   /* defined default for EVERY alloc (sources AND oneshots),
                                                               * so a recycled slot never leaks its prior priority */
+    c->stealing[idx] = 0;                                     /* a fresh slot is not mid-steal (clears a leaked flag
+                                                              * if the app destroyed a voice while it faded) */
     return BW_MK_H(idx, g);
 }
 
@@ -309,7 +314,7 @@ static void drain_events(RtCore* c) {                          /* control thread
     for (; rd != w; ++rd) {
         const Evt* ev = &r->slots[rd & (EVT_CAP - 1)];
         switch (ev->type) {
-        case EVT_VOICE_ENDED:    recycle_handle(c, ev->handle); break;
+        case EVT_VOICE_ENDED:    recycle_handle(c, ev->handle); c->stealing[BW_H_IDX(ev->handle)] = 0; break;
         case EVT_SOUND_RETIRED: {        /* audio dropped all refs: free pcm / close the stream + recycle the slot */
             SoundSlot* s = sound_slot_ctrl(c, ev->handle);
             if (s) {
@@ -452,10 +457,14 @@ static void drain_commands(RtCore* c) {
                           if (v->dop_on) dop_line_reset(c, v, BW_H_IDX(cmd->handle)); } } break;
         case CMD_STOP: { Voice* v = voice_for(c, cmd->handle);
             /* Fade the gate to 0 over one block, then finalize (playing=false) in pause_gate — a
-             * click-free explicit stop. (Automatic voice-steal and CMD_SRC_DESTROY still hard-cut:
-             * a stolen slot is re-allocated the same drain, so its fade would be memset away; fading
-             * it cleanly would mean delaying the new voice a block — a deliberate design trade-off.) */
-            if (v && v->playing) v->stopping = 1; } break;
+             * click-free explicit stop. Don't downgrade a steal-in-progress (2), which must still free
+             * its slot. (CMD_SRC_DESTROY hard-cuts; automatic steal fades via CMD_SRC_STEAL below.) */
+            if (v && v->playing && v->stopping != 2) v->stopping = 1; } break;
+        case CMD_SRC_STEAL: { Voice* v = voice_for(c, cmd->handle);
+            /* Fade the stolen voice out on its own slot, then free it (pause_gate finalize pushes
+             * EVT_VOICE_ENDED so the control thread recycles the slot). The new source already started
+             * on a reserve slot, so the steal is click-free. */
+            if (v && v->playing) v->stopping = 2; } break;
         case CMD_SET_PAUSED: { Voice* v = voice_for(c, cmd->handle);
             if (v) v->paused = cmd->u.pause.on != 0; } break;    /* the mixer's gate does the ramp/freeze */
         case CMD_SEEK: { Voice* v = voice_for(c, cmd->handle);
@@ -626,10 +635,18 @@ static void compute_gains(RtCore* c, Voice* v) {
  * to mix); else fills the block's starting gate value + per-sample step. The gate ramps across one
  * whole block (invariant 4); a pending seek lands only once the gate is silent, so a seek on a
  * running voice is ramp-out -> jump -> ramp-in and never clicks. */
-static int pause_gate(Voice* v, uint32_t n, float* pg, float* pg_step) {
+static int pause_gate(RtCore* c, Voice* v, uint16_t idx, uint32_t n, float* pg, float* pg_step) {
     float tgt = (v->paused || v->seek_pending || v->stopping) ? 0.f : 1.f;
     if (v->pause_g == 0.f && tgt == 0.f) {
-        if (v->stopping) { v->playing = false; v->stopping = 0; return 0; }   /* faded to silence: finalize the stop */
+        if (v->stopping) {                           /* faded to silence: finalize the stop/steal */
+            uint8_t how = v->stopping; v->stopping = 0; v->playing = false;
+            if (how == 2) {                          /* steal: free the slot (control thread recycles on the ack) */
+                v->active = false;
+                Evt ev = { .type = EVT_VOICE_ENDED, .handle = BW_MK_H(idx, v->gen) };
+                evt_push(&c->events, &ev);
+            }
+            return 0;
+        }
         if (v->seek_pending) {                       /* land the seek while inaudible */
             const SoundData* snd = v->sound;
             uint64_t f = v->seek_pos;
@@ -653,7 +670,7 @@ static void mix_voice(RtCore* c, Voice* v, uint16_t idx, float* bus, uint32_t n,
                                          * part [start,n), so a scheduled start (start>0) lands its gains exactly
                                          * instead of snapping the unspent start/n fraction at the block end */
     float pg, pg_step;
-    if (!pause_gate(v, nr, &pg, &pg_step)) return;
+    if (!pause_gate(c, v, idx, nr, &pg, &pg_step)) return;
     float step[BW_CHANNELS];
     for (uint32_t ch = 0; ch < c->channels; ++ch)
         step[ch] = (v->gtarget[ch] - v->gcur[ch]) / (float)nr;
@@ -898,7 +915,7 @@ static void mix_bed(RtCore* c, Voice* v, uint16_t idx, float* bus, uint32_t n, u
     const SoundData* snd = v->sound;
     const uint32_t nr = n - start;      /* rendered samples: ramp over the audible part (see mix_voice) */
     float pg, pg_step;
-    if (!pause_gate(v, nr, &pg, &pg_step)) return;
+    if (!pause_gate(c, v, idx, nr, &pg, &pg_step)) return;
     const int nch = (int)snd->channels;
     const float g_step = (v->gtarget[0] - v->gcur[0]) / (float)nr;   /* master gain ramp (invariant 4) */
     uint32_t cur = v->cursor;
@@ -1106,14 +1123,28 @@ void rt_get_listener(RtCore* c, float p[3], float q[4]) {
 /* ---- control-thread API (enqueue) ---- */
 
 uint32_t rt_source_create(RtCore* c) {
-    uint32_t h = alloc_handle(c);
-    if (!h) {                               /* pool full: steal the lowest-priority active source for the new one */
+    /* Normal alloc draws the pool down only to the fade reserve; the reserve slots are kept free so a
+     * steal can place the new source there while the victim fades out on its own slot. */
+    uint32_t h = (c->free_count > c->fade_reserve) ? alloc_handle(c) : 0;
+    if (!h) {                               /* user pool full: steal the lowest-priority active source */
         int victim = -1, lowest = 256;
-        for (uint32_t i = 0; i < c->voice_cap; ++i)   /* 255 = protected: never stolen */
-            if (c->inuse[i] && c->priority[i] < 255 && (int)c->priority[i] < lowest) { lowest = c->priority[i]; victim = (int)i; }
+        for (uint32_t i = 0; i < c->voice_cap; ++i)   /* 255 = protected; skip a slot already fading from a steal */
+            if (c->inuse[i] && !c->stealing[i] && c->priority[i] < 255 && (int)c->priority[i] < lowest)
+                { lowest = c->priority[i]; victim = (int)i; }
         if (victim >= 0) {
-            rt_source_destroy(c, BW_MK_H((uint16_t)victim, c->gen[victim]));   /* stops it + frees the slot */
-            h = alloc_handle(c);
+            uint32_t vh = BW_MK_H((uint16_t)victim, c->gen[victim]);
+            /* Preferred: click-free steal — the new source takes a RESERVE slot and the victim fades out
+             * on its own (CMD_SRC_STEAL), freeing its slot via EVT_VOICE_ENDED once silent. */
+            uint32_t nh = alloc_handle(c);            /* a reserve slot (victim keeps its own, so nh != victim) */
+            if (nh) {
+                Cmd steal = { .type = CMD_SRC_STEAL, .handle = vh };
+                if (cmd_push(&c->cmds, &steal)) { c->stealing[victim] = 1; h = nh; }
+                else recycle_handle(c, nh);           /* ring full: undo, fall through to the hard-cut path */
+            }
+            if (!h) {                                 /* reserve exhausted (steal burst) / ring full: hard-cut + reuse */
+                rt_source_destroy(c, vh);
+                h = alloc_handle(c);
+            }
         }
         if (!h) return 0;                   /* nothing to steal (or the destroy didn't enqueue): genuinely full */
     }
@@ -1352,8 +1383,8 @@ void rt_play_oneshot(RtCore* c, uint32_t sound, float x, float y, float z, float
      * acks EVT_VOICE_ENDED -> never recycled). Reserve room for all 4 up front so a
      * ring-full case drops the whole oneshot rather than half of it. */
     if (cmd_free(&c->cmds) < 4) return;
-    uint32_t h = alloc_handle(c);
-    if (!h) return;
+    uint32_t h = (c->free_count > c->fade_reserve) ? alloc_handle(c) : 0;   /* don't spend the steal reserve */
+    if (!h) return;                          /* full pool: the fire-and-forget oneshot is simply dropped */
     Cmd create = { .type = CMD_SRC_CREATE, .handle = h };
     cmd_push(&c->cmds, &create);              /* the 4 pushes are guaranteed by cmd_free >= 4 */
     rt_source_set_pos(c, h, x, y, z);
@@ -1365,10 +1396,17 @@ void rt_play_oneshot(RtCore* c, uint32_t sound, float x, float y, float z, float
 
 /* ---- lifecycle ---- */
 
-RtCore* rt_create(uint32_t voice_cap, uint32_t sound_cap, uint32_t sample_rate, uint32_t channels) {
-    if (voice_cap == 0 || voice_cap > 0xFFFFu || sound_cap == 0 || sound_cap > 0xFFFFu ||
+/* Extra physical voice slots beyond the caller's pool. A full-pool steal fades the victim out on its
+ * own slot (one block) and places the new source on a reserve slot, so the steal is click-free; the
+ * victim's slot returns to the pool when the fade completes. Bounds how many steals per frame can be
+ * click-free (beyond it, a steal falls back to a hard cut). */
+#define BW_FADE_RESERVE 8
+
+RtCore* rt_create(uint32_t req_voice_cap, uint32_t sound_cap, uint32_t sample_rate, uint32_t channels) {
+    if (req_voice_cap == 0 || req_voice_cap > 0xFFFFu - BW_FADE_RESERVE || sound_cap == 0 || sound_cap > 0xFFFFu ||
         channels  == 0 || channels  > BW_CHANNELS || sample_rate == 0)
         return NULL;
+    const uint32_t voice_cap = req_voice_cap + BW_FADE_RESERVE;   /* physical slots (user pool + fade reserve) */
     /* Bound the event ring: between two control-thread drains the audio thread emits at
      * most one EVT_VOICE_ENDED per voice plus one EVT_SOUND_RETIRED per sound, so
      * EVT_CAP >= voice_cap + sound_cap makes the event ring un-overflowable (acks can
@@ -1377,6 +1415,7 @@ RtCore* rt_create(uint32_t voice_cap, uint32_t sound_cap, uint32_t sample_rate, 
     RtCore* c = (RtCore*)calloc(1, sizeof *c);
     if (!c) return NULL;
     c->voice_cap   = voice_cap;
+    c->fade_reserve = BW_FADE_RESERVE;
     c->sound_cap   = sound_cap;
     c->channels    = channels;
     c->sample_rate = sample_rate;
@@ -1397,6 +1436,7 @@ RtCore* rt_create(uint32_t voice_cap, uint32_t sound_cap, uint32_t sample_rate, 
     c->gen       = (uint16_t*) calloc(voice_cap, sizeof(uint16_t));
     c->inuse     = (uint8_t*)  calloc(voice_cap, sizeof(uint8_t));
     c->priority  = (uint8_t*)  calloc(voice_cap, sizeof(uint8_t));
+    c->stealing  = (uint8_t*)  calloc(voice_cap, sizeof(uint8_t));
     c->freelist  = (uint32_t*) calloc(voice_cap, sizeof(uint32_t));
     c->sounds    = (SoundSlot*)calloc(sound_cap, sizeof(SoundSlot));
     c->sfreelist = (uint32_t*) calloc(sound_cap, sizeof(uint32_t));
@@ -1408,7 +1448,7 @@ RtCore* rt_create(uint32_t voice_cap, uint32_t sound_cap, uint32_t sample_rate, 
     }
     if (!c->voices || !c->occ_handle || !c->occ_val || !c->occ_eq || !c->occ_dir || !c->play_pub || !c->aux ||
         !c->stream_scratch || !c->streams || !c->path_accum || !c->path_pub || !c->path_idx ||
-        !c->gen || !c->inuse || !c->priority || !c->freelist || !c->sounds || !c->sfreelist || !c->dop_ring) {
+        !c->gen || !c->inuse || !c->priority || !c->stealing || !c->freelist || !c->sounds || !c->sfreelist || !c->dop_ring) {
         rt_destroy(c); return NULL;
     }
     const uint64_t eq_flat = eq_pack((float[3]){ 1.f, 1.f, 1.f });
@@ -1581,6 +1621,7 @@ void rt_destroy(RtCore* c) {
     free(c->sfreelist);
     free(c->sounds);
     free(c->freelist);
+    free(c->stealing);
     free(c->priority);
     free(c->inuse);
     free(c->gen);

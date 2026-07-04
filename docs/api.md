@@ -117,7 +117,9 @@ void     bw_play_oneshot(BwEngine* e, BwSound snd, float x, float y, float z, fl
 
 **Voice pool + scheduling.** The voice pool is fixed; when it is full, `bw_source_create` steals the
 lowest-**priority** active source (255 = protected, never stolen) rather than failing — so set music
-and critical SFX high. `bw_source_play_at` begins output exactly when the engine's dsp clock reaches
+and critical SFX high. The steal is **click-free**: the stolen voice fades out over one block on its
+own slot (the new source starts immediately on a small reserve of extra slots), so a scene churning
+voices under load doesn't tick. `bw_source_play_at` begins output exactly when the engine's dsp clock reaches
 `start_sample`; read "now" from `bw_dsp_time` (device sample position, monotonic) and add a delay,
 e.g. play 0.5 s out with `bw_dsp_time(e) + sample_rate/2`. `0` = play immediately (== `bw_source_play`).
 
