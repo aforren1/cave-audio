@@ -63,7 +63,7 @@ BwMaterial m_open = bw_material_define(e, abs3, 0.5f, trn3);    // custom 3-band
 BwMaterial tri_mat[N] = { m_wall, m_wall, m_open, /* … */ };
 bw_scene_set_mesh_mat(e, verts, nverts, tris, ntris, tri_mat);
 
-// or a shoebox room: w×h×d metres centred at origin, one material per face
+// or a shoebox room: w×h×d metres, floor-based (x/z centred, y 0..h), one material per face
 BwMaterial faces[6] = { m_wall,m_wall,m_wall,m_open,m_wall,m_wall };  // -x,+x,-y,+y,-z,+z
 bw_scene_set_box(e, 6.f, 3.f, 6.f, faces);                      // triangle normals face inward
 ```

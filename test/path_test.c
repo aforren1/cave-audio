@@ -1,8 +1,9 @@
 /*
  * path_test.c — pathing routes around an occluder (with-SDK only).
  *
- * A wall at x=0 (z in [-3, 0.5]) blocks the straight line between a source at (-2,0,-1.5) and a
- * listener at (2,0,-1.5); the only way across is around the wall's end past z=0.5. If pathing finds a
+ * A wall at x=0 (z in [-3, 0.5]) blocks the straight line between a source at (-2,1.5,-1.5) and a
+ * listener at (2,1.5,-1.5) (the ear plane; the probe grid sits at mean speaker height y=1.5); the
+ * only way across is around the wall's end past z=0.5. If pathing finds a
  * route, the source's path output carries energy (shCoeffs[0] > 0) — that energy can ONLY have come
  * around the wall, since the direct line is blocked. Proves the pathing sim + visibility bake work.
  */
@@ -39,7 +40,7 @@ int main(void) {
     SteamPath* sp = steam_path_create(scene, rt, &L, SR, BLK, ORDER);
     if (!sp) { printf("FAIL: steam_path_create\n"); steam_scene_destroy(scene); rt_destroy(rt); return 1; }
 
-    float src[3] = { -2.0f, 0.0f, -1.5f }, listener[3] = { 2.0f, 0.0f, -1.5f };
+    float src[3] = { -2.0f, 1.5f, -1.5f }, listener[3] = { 2.0f, 1.5f, -1.5f };
     steam_path_set_source(sp, /*handle*/1, src, /*on*/1);
 
     float eq[3] = {0,0,0}, sh[16] = {0};

@@ -32,6 +32,11 @@ typedef struct {
 typedef struct {
     Speaker  speakers[BW_CHANNELS];
     uint32_t count;                 /* == BW_CHANNELS once validated */
+    /* nominal listening point = the array CENTROID, computed at load. The world-locked decodes
+     * (ambisonic/reflection/pathing beds, the monitor's virtual-speaker encode) take their speaker
+     * DIRECTIONS from here, and it is the engine's default listener pose — so the room origin can
+     * sit anywhere (canonically on the floor, Motive-style) without skewing a decode. */
+    float    ref[3];
     float    rolloff_r;             /* DBAP spatial blur (meters) */
     /* distance attenuation, source -> listener (inverse model):
      *   atten = clamp( (ref / max(d, ref))^rolloff , min_lin, 1 ) */
@@ -41,13 +46,17 @@ typedef struct {
     uint32_t max_delay_samples;     /* max over speakers; sizes the alignment delay lines */
 } Layout;
 
-/* A sane default: the 3x3x3 boundary grid (minus centre) at +/-1.5 m, unity trim, no
- * delay. Lets the engine run with no layout file (binaural / desk dev / tests). */
+/* A sane default: a 3 m-cube 3x3x3 boundary grid (minus centre), FLOOR-origin — x/z at
+ * +/-1.5 m around the room centre, y from 0 (floor) to 3 m, ref (ear point) at (0,1.5,0).
+ * Unity trim, no delay. Lets the engine run with no layout file (binaural / desk dev / tests). */
 Layout layout_default(void);
 
 /* Load + validate cave_layout.json. `sample_rate` converts delay_ms -> samples and the
  * gains from dB. Fails (false + message in `err`) on a missing/unparseable file, a wrong
  * speaker count, or out-of-range values. */
 bool layout_load(const char* path, uint32_t sample_rate, Layout* out, char* err, size_t errcap);
+
+/* (Re)compute `ref` from the speaker positions — for callers that build a Layout by hand. */
+void layout_compute_ref(Layout* L);
 
 #endif /* BW_LAYOUT_H */

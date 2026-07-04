@@ -90,7 +90,7 @@ static void render_capture_mono_moving(RtCore* c, uint32_t h, float d0, float d1
     BwTimestamp ts = { 0, 0 };
     for (int b = 0; b < kb; ++b) {
         float d = d0 + (d1 - d0) * ((float)b / (float)(kb - 1));
-        rt_source_set_pos(c, h, d, 0.f, 0.f); rt_commit(c);
+        rt_source_set_pos(c, h, d, LD.ref[1], 0.f); rt_commit(c);   /* on the ear plane: distance == d */
         rt_render(c, bus, N, &ts);
         for (int i = 0; i < N; ++i) { double s = 0; for (int ch = 0; ch < CH; ++ch) s += bus[(size_t)ch*N + i]; out[b*N + i] = (float)s; }
     }
@@ -148,7 +148,7 @@ static void test_path_tap(void* ud, float* bus, uint32_t n, const float* lp, con
 }
 
 int main(void) {
-    LD = layout_default();                          /* listener stays at the origin (centre) */
+    LD = layout_default();                          /* listener stays at the default (the array centre, LD.ref) */
     const char* WAV = "bw_rt_const.wav";
     if (!write_const_wav(WAV, 1.0f, 8 * N)) { printf("FAIL: write wav\n"); return 1; }
 
@@ -438,7 +438,7 @@ int main(void) {
                 uint32_t si = rt_load_sound(cp, IW, err, sizeof err);
                 float cap[4 * N];
                 uint32_t hoff = rt_source_create(cp);
-                rt_source_set_pos(cp, hoff, 3.43f, 0.f, 0.f);
+                rt_source_set_pos(cp, hoff, 3.43f, LD.ref[1], 0.f);   /* ear plane: distance == 3.43 m */
                 rt_source_play(cp, hoff, si, false);
                 rt_commit(cp);
                 render_capture_mono(cp, cap, 4);
@@ -446,7 +446,7 @@ int main(void) {
                 rt_source_destroy(cp, hoff); rt_commit(cp);
 
                 uint32_t hon = rt_source_create(cp);
-                rt_source_set_pos(cp, hon, 3.43f, 0.f, 0.f);
+                rt_source_set_pos(cp, hon, 3.43f, LD.ref[1], 0.f);
                 rt_source_set_doppler(cp, hon, true);
                 rt_source_play(cp, hon, si, false);
                 rt_commit(cp);

@@ -154,9 +154,10 @@ BW_API BwMaterial bw_material_define(BwEngine* e, const float absorption[3], flo
  * Load-time. No-op without the Steam Audio backend. */
 BW_API void     bw_scene_set_mesh_mat(BwEngine* e, const float* verts, int nverts, const int* tris, int ntris,
                                       const BwMaterial* tri_material);
-/* Convenience: a shoebox enclosure of size w x h x d metres, centred at the origin, with one
- * material per face. faces[6] = (-x,+x,-y,+y,-z,+z); each a BwMaterial token (0 = default). Triangle
- * normals face inward (the listener is inside). Load-time. No-op without the Steam Audio backend. */
+/* Convenience: a shoebox enclosure of size w x h x d metres, FLOOR-based — centred on the origin
+ * in x/z, y from 0 (the floor) up to h — with one material per face. faces[6] = (-x,+x,-y,+y,-z,+z);
+ * each a BwMaterial token (0 = default). Triangle normals face inward (the listener is inside).
+ * Load-time. No-op without the Steam Audio backend. */
 BW_API void     bw_scene_set_box(BwEngine* e, float w, float h, float d, const BwMaterial faces[6]);
 /* Enable per-source occlusion: geometry between the source and listener attenuates it (ramped).
  * Per-frame-safe. No-op without the Steam Audio backend. */
@@ -293,8 +294,12 @@ BW_API uint32_t bw_panner_gains_batch(BwPanner panner, const float* positions, u
 /* Position in room space. Quaternion is head orientation; used by the binaural
  * monitor only — the array render ignores orientation (real speakers, real ears).
  * ROOM FRAME: right-handed, +y up, metres, identity orientation faces +z (so the
- * right ear is at -x). This is Motive's default streamed frame, so OptiTrack
- * rigid-body poses pass through unchanged. */
+ * right ear is at -x). The origin sits ON THE FLOOR at the working-area centre
+ * (x/z) — Motive's ground-plane calibration — so OptiTrack rigid-body poses pass
+ * through unchanged and y is height above the floor. The engine's world-locked
+ * decodes reference the ARRAY CENTROID (the nominal listening point, also the
+ * default listener position), not the origin, so nothing breaks if a survey
+ * places the origin elsewhere. */
 /* The identity-listener basis, as data — derive "forward"/"right" from these
  * (the engine's own orientation seams do) rather than re-hardcoding the
  * convention. An identity quaternion's ahead is BW_ROOM_AHEAD, etc. */

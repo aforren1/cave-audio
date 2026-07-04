@@ -115,9 +115,11 @@ jumps, and ramps back in (~10 ms end to end); on a paused voice the jump is imme
 paused. Past-the-end seeks wrap for loops and end one-shots. Streamed sounds ignore seeks (the
 stream ring cannot jump); `bw_source_play` always restarts un-paused at frame 0.
 
-Positions are in **room space: right-handed, +Y up, +Z forward** (Motive's default frame;
-an identity orientation faces +Z) — the engine binding converts from its own coordinate
-system at the boundary (see integration.md). `bw_play_oneshot` is the
+Positions are in **room space: right-handed, +Y up, +Z forward, origin on the floor**
+(Motive's ground-plane default: y = height above the floor; an identity orientation faces
++Z) — the engine binding converts from its own coordinate system at the boundary (see
+integration.md). The engine's world-locked decodes and its default listener position use
+the **array centroid** (the nominal listening point), not the origin. `bw_play_oneshot` is the
 fire-and-forget path: it allocates a transient voice internally and recycles it on
 end, so the caller holds no handle.
 
@@ -254,8 +256,9 @@ coefficients — `"generic"` returns `0` without minting) or custom 3-band coeff
 `0` and sets `bw_last_error`. Tokens are **not** generation-checked handles — they stay valid for the
 engine's life; per-triangle indices out of range clamp to the default.
 
-Geometry is in **room space (RH metres)**, triangles CCW; `bw_scene_set_box` builds an origin-centred
-shoebox with **inward-facing** normals (the listener is inside). The same per-triangle materials feed
+Geometry is in **room space (RH metres)**, triangles CCW; `bw_scene_set_box` builds a floor-based
+shoebox (x/z centred on the origin, y from 0 — the floor — up to `h`) with **inward-facing** normals
+(the listener stands inside). The same per-triangle materials feed
 **both** occlusion (per-band transmission) and the reflection bed (absorption/scattering) — one shared
 `IPLScene`. The geometry **can change at runtime** for occlusion (the occlusion sim owns the scene and
 serializes its own commit + ray trace) — but it is **locked once the reflection bed is running** (that

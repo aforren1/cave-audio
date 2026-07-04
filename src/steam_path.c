@@ -221,8 +221,10 @@ SteamPath* steam_path_create(SteamScene* scene, RtCore* rt, const Layout* L,
 
     if (do_path_bake(sp, L) == 0) goto fail;
 
-    for (uint32_t s = 0; s < BW_CHANNELS; ++s) {       /* speaker dirs in phonon's cartesian frame (== room) */
-        const float* p = L->speakers[s].pos;
+    for (uint32_t s = 0; s < BW_CHANNELS; ++s) {       /* speaker dirs in phonon's cartesian frame (== room),
+                                                        * from the layout's nominal listening point */
+        float p[3] = { L->speakers[s].pos[0] - L->ref[0], L->speakers[s].pos[1] - L->ref[1],
+                       L->speakers[s].pos[2] - L->ref[2] };
         float m = sqrtf(p[0]*p[0] + p[1]*p[1] + p[2]*p[2]);
         sp->spk[s] = (m < 1e-6f) ? (IPLVector3){0,0,-1} : (IPLVector3){ p[0]/m, p[1]/m, p[2]/m };
     }

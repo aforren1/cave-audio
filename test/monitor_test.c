@@ -24,7 +24,7 @@ static double e_right(void) { double e = 0; for (int i = 0; i < N; ++i) e += fab
 
 /* drive a constant 1.0 on exactly one bus channel, decode, with listener at origin + pose q */
 static void decode_channel(Monitor* m, int ch, const float q[4]) {
-    const float p[3] = { 0, 0, 0 };
+    const float p[3] = { 0, 1.5f, 0 };   /* the default grid's ear point (floor origin) */
     memset(bus, 0, sizeof bus);
     for (int i = 0; i < N; ++i) bus[(size_t)ch * N + i] = 1.0f;
     monitor_process(m, bus, p, q, out, N);

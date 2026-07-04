@@ -514,7 +514,11 @@ static void drain_commands(RtCore* c) {
 static void build_bed_decode_sad(RtCore* c) {
     const float invL = 1.0f / (float)c->channels;
     for (uint32_t s = 0; s < c->channels; ++s) {
-        const float* p = c->layout.speakers[s].pos;
+        /* speaker direction from the layout's nominal listening point (the array centroid) —
+         * NOT from the origin, which canonically sits on the floor (Motive ground plane) */
+        float p[3] = { c->layout.speakers[s].pos[0] - c->layout.ref[0],
+                       c->layout.speakers[s].pos[1] - c->layout.ref[1],
+                       c->layout.speakers[s].pos[2] - c->layout.ref[2] };
         float len = sqrtf(p[0]*p[0] + p[1]*p[1] + p[2]*p[2]);
         float ad[3];
         if (len < 1e-6f) { ad[0] = 1.f; ad[1] = 0.f; ad[2] = 0.f; }          /* degenerate: face front */
@@ -1398,6 +1402,11 @@ RtCore* rt_create(uint32_t voice_cap, uint32_t sound_cap, uint32_t sample_rate, 
     c->lim_att_a = 1.0f - expf(-1.0f / (0.001f * (float)sample_rate));
     c->lim_rel_a = 1.0f - expf(-1.0f / (0.120f * (float)sample_rate));
     c->layout  = layout_default();
+    /* default listener POSITION = the layout's nominal listening point (re-set when the real
+     * layout arrives) — a pose-less client listens from the array centre, not the floor origin */
+    memcpy(c->lis.p_active,  c->layout.ref, sizeof c->lis.p_active);
+    memcpy(c->lis.p_pending, c->layout.ref, sizeof c->lis.p_pending);
+    memcpy(c->readback.p,    c->layout.ref, sizeof c->readback.p);
     c->aligner = align_create(channels, &c->layout, sample_rate);
     if (!c->aligner) { rt_destroy(c); return NULL; }
     build_bed_decode(c);                        /* ambisonic bed decode from the default layout */
@@ -1417,6 +1426,11 @@ void rt_set_layout(RtCore* c, const Layout* L) {
     c->layout = *L;
     align_destroy(c->aligner);
     c->aligner = a;
+    /* re-default the listener to the new layout's nominal listening point (load-time: poses
+     * pushed after start overwrite this every frame; a pose-less client hears from the centre) */
+    memcpy(c->lis.p_active,  c->layout.ref, sizeof c->lis.p_active);
+    memcpy(c->lis.p_pending, c->layout.ref, sizeof c->lis.p_pending);
+    memcpy(c->readback.p,    c->layout.ref, sizeof c->readback.p);
     build_bed_decode(c);                         /* re-derive the bed decode for the new geometry */
     c->layout_gen++;                             /* the SPCAP cache self-invalidates on the next gains call */
     for (uint32_t i = 0; i < c->voice_cap; ++i)

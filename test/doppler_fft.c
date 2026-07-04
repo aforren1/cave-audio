@@ -93,7 +93,7 @@ int main(int argc, char** argv) {
     BwTimestamp ts; memset(&ts, 0, sizeof ts);
     int cap = 0, blk = 0, warm = 0;
     while (cap < FFTN) {
-        if (blk % bpc == 0) { rt_source_set_pos(rt, h, dist, 0.f, 0.f); rt_commit(rt); }
+        if (blk % bpc == 0) { rt_source_set_pos(rt, h, dist, L.ref[1], 0.f); rt_commit(rt); }   /* ear plane: distance == dist */
         rt_render(rt, bus, N, &ts);
         for (uint32_t i = 0; i < N; ++i) {
             double s = 0; for (int ch = 0; ch < BW_CHANNELS; ++ch) s += bus[(size_t)ch * N + i];

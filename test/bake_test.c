@@ -24,7 +24,8 @@ int main(void) {
     Layout L = layout_default();
     rt_set_layout(rt, &L);
 
-    float p[3] = { 2.0f, 0.0f, 0.0f }, q[4] = { 0.0f, 0.0f, 0.0f, 1.0f };   /* 1 m from the +X wall */
+    float p[3] = { 2.0f, 1.5f, 0.0f }, q[4] = { 0.0f, 0.0f, 0.0f, 1.0f };   /* 1 m from the +X wall, at ear height
+                                                                              * (the probe plane = mean speaker y = 1.5) */
     float* bus = (float*)calloc((size_t)BW_CHANNELS * BLK, sizeof(float));
     BwTimestamp ts; memset(&ts, 0, sizeof ts);
     rt_set_listener(rt, p, q); rt_commit(rt); rt_render(rt, bus, BLK, &ts);

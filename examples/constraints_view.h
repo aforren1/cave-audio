@@ -44,11 +44,12 @@ static inline int cv_read_box(cJSON* o, CvBox* out) {
     return 1;
 }
 
-/* Parse constraints.json into `c` (bounds default +/-3 m if the file omits them). Returns 1 when a
+/* Parse constraints.json into `c` (bounds default +/-3 m in x/z and 0..3 m in y — floor origin —
+ * if the file omits them). Returns 1 when a
  * file was read; 0 (and c->loaded = 0) when absent/unparseable — every placement allowed. */
 static inline int cv_load(const char* path, CvConstraints* c) {
     c->loaded = 0; c->nnogo = 0; c->nobst = 0;
-    c->bounds.lo.x = c->bounds.lo.y = c->bounds.lo.z = -3.f;
+    c->bounds.lo.x = c->bounds.lo.z = -3.f; c->bounds.lo.y = 0.f;   /* the floor is y = 0 */
     c->bounds.hi.x = c->bounds.hi.y = c->bounds.hi.z =  3.f;
     FILE* f = fopen(path, "rb"); if (!f) return 0;
     fseek(f, 0, SEEK_END); long n = ftell(f); fseek(f, 0, SEEK_SET);

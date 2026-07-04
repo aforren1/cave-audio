@@ -802,7 +802,7 @@ static int write_fixture(const char* path, int variant_b) {
     if (!f) return 0;
     fprintf(f, "{\n  \"schema_version\": 1,\n"
                "  \"units\": { \"position\": \"meters\", \"gain\": \"decibels\", \"delay\": \"milliseconds\" },\n"
-               "  \"coordinate_space\": \"room, right-handed, +y up, +z forward\",\n"
+               "  \"coordinate_space\": \"room, right-handed, +y up, +z forward; origin on the floor\",\n"
                "  \"reference\": { \"alignment\": \"max-distance\", \"speed_of_sound_mps\": 343.0 },\n"
                "  \"dbap\": { \"rolloff_r\": 0.5, \"distance_attenuation\": { \"model\": \"inverse\","
                " \"reference_distance_m\": 1.0, \"rolloff\": 1.0, \"min_gain_db\": -40.0 } },\n"

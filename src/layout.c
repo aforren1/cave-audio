@@ -17,23 +17,34 @@ static void set_err(char* err, size_t cap, const char* msg) {
 
 static float db_to_lin(double db) { return (float)pow(10.0, db / 20.0); }
 
+/* ref = the array centroid: the nominal listening point the world-locked decodes reference.
+ * Computed from the positions, so it holds for any origin convention (floor or centre). */
+void layout_compute_ref(Layout* L) {
+    double s[3] = { 0, 0, 0 };
+    for (uint32_t k = 0; k < L->count; ++k)
+        for (int i = 0; i < 3; ++i) s[i] += L->speakers[k].pos[i];
+    for (int i = 0; i < 3; ++i) L->ref[i] = L->count ? (float)(s[i] / L->count) : 0.f;
+}
+
 Layout layout_default(void) {
     Layout L;
     memset(&L, 0, sizeof L);
-    const float ax[3] = { -1.5f, 0.0f, 1.5f };
+    const float ax[3] = { -1.5f, 0.0f, 1.5f };  /* x/z: centred on the room */
+    const float ay[3] = {  0.0f, 1.5f, 3.0f };  /* y: FLOOR origin, Motive-style */
     uint32_t k = 0;
     for (int yi = 0; yi < 3; ++yi)              /* 3x3x3 boundary grid minus the centre = 26 */
         for (int xi = 0; xi < 3; ++xi)
             for (int zi = 0; zi < 3; ++zi) {
-                if (ax[xi] == 0.0f && ax[yi] == 0.0f && ax[zi] == 0.0f) continue;
+                if (ax[xi] == 0.0f && ay[yi] == 1.5f && ax[zi] == 0.0f) continue;
                 L.speakers[k].pos[0] = ax[xi];
-                L.speakers[k].pos[1] = ax[yi];
+                L.speakers[k].pos[1] = ay[yi];
                 L.speakers[k].pos[2] = ax[zi];
                 L.speakers[k].gain_lin = 1.0f;
                 L.speakers[k].delay_samples = 0;
                 ++k;
             }
     L.count             = k;                    /* 26 */
+    layout_compute_ref(&L);                            /* (0, 1.5, 0) — the cube's centre */
     L.rolloff_r         = 0.5f;
     L.atten_ref_m       = 1.0f;
     L.atten_rolloff     = 1.0f;
@@ -184,6 +195,7 @@ bool layout_load(const char* path, uint32_t sample_rate, Layout* out, char* err,
 
     out->count             = BW_CHANNELS;
     out->max_delay_samples = maxdelay;
+    layout_compute_ref(out);                  /* nominal listening point = the surveyed array's centroid */
     ok = true;
 done:
     cJSON_Delete(root);

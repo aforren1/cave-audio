@@ -92,7 +92,7 @@ int main(void) {
 
     /* 3. DBAP localization (centered listener): source at speaker k -> channel k dominates */
     {
-        float lis[3] = { 0, 0, 0 }, g[CH];
+        float lis[3] = { LD.ref[0], LD.ref[1], LD.ref[2] }, g[CH];   /* the array centre (floor origin) */
         int ok = 1;
         for (int k = 0; k < CH; ++k) {
             dbap_gains(LD.speakers[k].pos, lis, &LD, 1.0f, g);
@@ -103,7 +103,8 @@ int main(void) {
 
     /* 4. constant power: ||g|| ~ user_gain (atten == 1 within the reference distance) */
     {
-        float lis[3] = { 0, 0, 0 }, src[3] = { 0.5f, 0.f, 0.5f }, g[CH];
+        float lis[3] = { LD.ref[0], LD.ref[1], LD.ref[2] };
+        float src[3] = { 0.5f, LD.ref[1], 0.5f }, g[CH];             /* ds ~ 0.7 m < ref -> atten = 1 */
         float gain = 0.8f;
         dbap_gains(src, lis, &LD, gain, g);
         double p = 0; for (int k = 0; k < CH; ++k) p += (double)g[k] * g[k];
@@ -113,7 +114,7 @@ int main(void) {
     /* 5. two-speaker split: a source midway between two speakers feeds both above average */
     {
         const int A = 7, B = 8;
-        float lis[3] = { 0, 0, 0 }, g[CH];
+        float lis[3] = { LD.ref[0], LD.ref[1], LD.ref[2] }, g[CH];
         float mid[3] = { (LD.speakers[A].pos[0] + LD.speakers[B].pos[0]) * 0.5f,
                          (LD.speakers[A].pos[1] + LD.speakers[B].pos[1]) * 0.5f,
                          (LD.speakers[A].pos[2] + LD.speakers[B].pos[2]) * 0.5f };
@@ -125,8 +126,8 @@ int main(void) {
 
     /* 6. listener move changes the distribution */
     {
-        float src[3] = { 1.5f, 0.f, 0.f }, g0[CH], g1[CH];
-        float lis0[3] = { 0, 0, 0 }, lis1[3] = { -1.0f, 0, 0 };
+        float src[3] = { 1.5f, LD.ref[1], 0.f }, g0[CH], g1[CH];
+        float lis0[3] = { 0, LD.ref[1], 0 }, lis1[3] = { -1.0f, LD.ref[1], 0 };
         dbap_gains(src, lis0, &LD, 1.0f, g0);
         dbap_gains(src, lis1, &LD, 1.0f, g1);
         double diff = 0; for (int k = 0; k < CH; ++k) diff += fabs(g0[k] - g1[k]);
@@ -243,7 +244,7 @@ int main(void) {
     /* 9. SPCAP panner: localization, constant power, multi-speaker spread, non-negative gains */
     {
         SpcapState sp; spcap_reset(&sp);
-        float lis[3] = { 0, 0, 0 }, g[CH];
+        float lis[3] = { LD.ref[0], LD.ref[1], LD.ref[2] }, g[CH];   /* sweet spot = the array centre */
         int loc_ok = 1, nonneg = 1;
         for (int k = 0; k < CH; ++k) {
             spcap_gains(&sp, LD.speakers[k].pos, lis, &LD, 1u, 1.0f, g);   /* source at speaker k's bearing */
@@ -253,7 +254,7 @@ int main(void) {
         CHECK(loc_ok, "SPCAP localizes a source at each speaker to that channel");
         CHECK(nonneg, "SPCAP gains are non-negative");
 
-        float src[3] = { 0.5f, 0.f, 0.5f }, gain = 0.8f;
+        float src[3] = { 0.5f, LD.ref[1], 0.5f }, gain = 0.8f;
         spcap_gains(&sp, src, lis, &LD, 1u, gain, g);
         double p = 0; int active = 0;
         for (int k = 0; k < CH; ++k) { p += (double)g[k] * g[k]; if (g[k] > 0.05f * gain) ++active; }
@@ -277,7 +278,9 @@ int main(void) {
              * wrong normalization target in AllRAD would fail this rather than match a shared mistake */
             double esad = 0;
             for (int s = 0; s < CH; ++s) {
-                float* p = LD.speakers[s].pos; float pl = sqrtf(p[0]*p[0] + p[1]*p[1] + p[2]*p[2]);
+                float p[3] = { LD.speakers[s].pos[0] - LD.ref[0], LD.speakers[s].pos[1] - LD.ref[1],
+                               LD.speakers[s].pos[2] - LD.ref[2] };       /* dirs from the array centre */
+                float pl = sqrtf(p[0]*p[0] + p[1]*p[1] + p[2]*p[2]);
                 float ad2[3] = { -p[2]/pl, -p[0]/pl, p[1]/pl }, ys[BW_AMBI_CH]; ambi_encode_sn3d(ad2, ys);
                 for (int k = 0; k < BW_AMBI_CH; ++k) { int l = (int)floorf(sqrtf((float)k));
                     double d = (double)(2*l+1)*ys[k]/CH; esad += d*d/(2*l+1); }
@@ -292,7 +295,9 @@ int main(void) {
                 float rE[3] = { 0, 0, 0 };
                 for (int s = 0; s < CH; ++s) {
                     float f = 0; for (int k = 0; k < BW_AMBI_CH; ++k) f += dec[s][k]*sh[k];
-                    float* p = LD.speakers[s].pos; float pl = sqrtf(p[0]*p[0] + p[1]*p[1] + p[2]*p[2]);
+                    float p[3] = { LD.speakers[s].pos[0] - LD.ref[0], LD.speakers[s].pos[1] - LD.ref[1],
+                                   LD.speakers[s].pos[2] - LD.ref[2] };
+                    float pl = sqrtf(p[0]*p[0] + p[1]*p[1] + p[2]*p[2]);
                     float w = f*f; rE[0]+=w*p[0]/pl; rE[1]+=w*p[1]/pl; rE[2]+=w*p[2]/pl;
                 }
                 float rl = sqrtf(rE[0]*rE[0] + rE[1]*rE[1] + rE[2]*rE[2]);
@@ -305,7 +310,7 @@ int main(void) {
     /* 11. VBAP panner: localization, constant power, at most 3 active speakers (the containing triangle) */
     {
         VbapState vb; vbap_reset(&vb);
-        float lis[3] = { 0, 0, 0 }, g[CH];
+        float lis[3] = { LD.ref[0], LD.ref[1], LD.ref[2] }, g[CH];   /* inside the hull (the floor is ON it) */
         int loc_ok = 1;
         for (int k = 0; k < CH; ++k) {
             vbap_gains(&vb, LD.speakers[k].pos, lis, &LD, 1u, 1.0f, g);   /* source at speaker k's bearing */
@@ -313,7 +318,7 @@ int main(void) {
         }
         CHECK(loc_ok, "VBAP localizes a source at each speaker to that channel");
 
-        float src[3] = { 0.7f, 0.2f, 0.6f }, gain = 0.8f;                  /* ds < 1 m -> atten = 1 */
+        float src[3] = { 0.7f, LD.ref[1] + 0.2f, 0.6f }, gain = 0.8f;      /* ds < 1 m -> atten = 1 */
         vbap_gains(&vb, src, lis, &LD, 1u, gain, g);
         double p = 0; int active = 0;
         for (int k = 0; k < CH; ++k) { p += (double)g[k] * g[k]; if (g[k] > 1e-4f) ++active; }

@@ -14,7 +14,8 @@ consumed by:
   the 26→ambisonics→binaural decode.
 
 A complete, valid example lives at [`../examples/cave_layout.json`](../examples/cave_layout.json)
-(a 3×3×3 boundary grid minus the center = exactly 26 speakers).
+(a 3×3×3 boundary grid minus the center = exactly 26 speakers, floor-origin: y layers at
+0 / 1.5 / 3 m, ears nominally at 1.5).
 
 You can author this file interactively with **`bw_layout_tool`** (`examples/layout_tool.cpp`, built with
 `-DBWAUDIO_BUILD_PLAYGROUND=ON`): place each speaker in 3D and **identify it by ear** — since a
@@ -69,7 +70,7 @@ value), and **V** toggles the observer model (fixed centre vs the moving working
 {
   "schema_version": 1,
   "units":            { "position": "meters", "gain": "decibels", "delay": "milliseconds" },
-  "coordinate_space": "room, right-handed, +y up, +z forward (matches OptiTrack/Motive default); origin at working-area center",
+  "coordinate_space": "room, right-handed, +y up, +z forward (matches OptiTrack/Motive default); origin ON THE FLOOR at the working-area centre (x/z); y = height above the floor",
   "reference": {
     "alignment":          "max-distance",   // how delay_ms was derived (documentation only)
     "speed_of_sound_mps": 343.0,
@@ -94,7 +95,7 @@ value), and **V** toggles the observer model (fixed centre vs the moving working
 |-------|------|---------|
 | `schema_version` | int | bump on breaking format changes; loader rejects unknown majors. |
 | `units` | object | declares the units used; the loader converts to engine-internal (meters, linear gain, samples) at load. |
-| `coordinate_space` | string | documentation of the frame. Positions MUST be in **room space, right-handed**, the same frame the engine works in (the Unity/Unreal binding converts at its boundary — see [`integration.md`](./integration.md)). |
+| `coordinate_space` | string | documentation of the frame. Positions MUST be in **room space: right-handed, +y up, +z forward, origin on the floor** (Motive's ground-plane default; y = height above the floor) — the frame the engine works in (the Unity/Unreal binding converts at its boundary — see [`integration.md`](./integration.md)). The engine derives its **nominal listening point from the array centroid** (world-locked bed/monitor decode directions + the default listener position), so the origin's exact spot is not load-bearing. |
 | `reference` | object | provenance for the alignment values; `speed_of_sound_mps` is used if delays are derived rather than measured. Informational — `delay_ms` is authoritative. |
 | `dbap.rolloff_r` | float | the **blur** knob `r` from [`spatialization.md`](./spatialization.md): larger spreads energy over more speakers. |
 | `dbap.distance_attenuation` | object | the source→listener distance-attenuation curve (the second tuning knob). `model` + its parameters; `min_gain_db` floors the attenuation. |

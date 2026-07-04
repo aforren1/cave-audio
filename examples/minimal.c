@@ -8,9 +8,10 @@
  *
  * Runs anywhere: the binaural profile auto-picks a 2-ch ASIO device (headphones)
  * and falls back to the silent offline sink without one -- bw_audio_backend says
- * which you got. Room frame is right-handed, +y up, +z forward, metres (Motive's
- * default; an identity listener faces +z, right ear at -x); with no layout file the
- * engine pans over its default grid, a 3 m cube of 26 speakers around the origin.
+ * which you got. Room frame is right-handed, +y up, +z forward, metres, origin on
+ * the FLOOR (Motive's default; an identity listener faces +z, right ear at -x, and
+ * y is height above the floor); with no layout file the engine pans over its default
+ * grid, a 3 m cube of 26 speakers with its centre (the ear point) at (0, 1.5, 0).
  *
  *   bw_minimal [sound.wav]     (no argument: a short ping is synthesized and used)
  */
@@ -72,22 +73,22 @@ int main(int argc, char** argv) {
 
     BwSource src = bw_source_create(e);
     bw_source_set_gain(e, src, 0.8f);
-    bw_source_set_pos(e, src, 2.f, 0.f, 0.f);  /* room space: 2 m to the listener's left (+x) */
+    bw_source_set_pos(e, src, 2.f, 1.5f, 0.f); /* room space: ear height, 2 m to the listener's left (+x) */
     bw_source_play(e, src, ping, true);        /* loop while we move it */
 
     /* ---- the game loop: push updates every frame, then ONE commit ---- */
     printf("orbiting a looping ping around the listener (6 s)...\n");
     for (int frame = 0; frame < 6 * 60; ++frame) {
         float a = (float)(6.283185307179586 * frame / (3.0 * 60.0));   /* one lap / 3 s */
-        bw_source_set_pos(e, src, 2.f * cosf(a), 0.f, -2.f * sinf(a));
-        bw_set_listener_pose(e, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 1.f);    /* head at room centre */
+        bw_source_set_pos(e, src, 2.f * cosf(a), 1.5f, -2.f * sinf(a));
+        bw_set_listener_pose(e, 0.f, 1.5f, 0.f, 0.f, 0.f, 0.f, 1.f);   /* standing at the array centre */
         bw_commit(e);                          /* promote this frame's updates as one snapshot */
         Sleep(16);                             /* ~60 Hz, like an engine tick */
     }
     bw_source_stop(e, src);
 
     /* fire-and-forget at a fixed point: no handle to manage, the voice recycles itself */
-    bw_play_oneshot(e, ping, -2.f, 0.f, 0.f, 1.f);
+    bw_play_oneshot(e, ping, -2.f, 1.5f, 0.f, 1.f);
 
     /* completion: there are no callbacks -- play, then poll bw_source_is_playing.
      * The readback publishes per audio block, so give the play command a moment to land

@@ -119,9 +119,12 @@ SteamMonitor* steam_monitor_create(const Layout* L, uint32_t sample_rate, uint32
         iplHRTFRelease(&m->hrtf); iplContextRelease(&m->context); free(m); return NULL;
     }
 
-    /* fixed 26→16 encode matrix: each speaker is a virtual source at its room direction */
+    /* fixed 26→16 encode matrix: each speaker is a virtual source at its direction from the
+     * layout's nominal listening point (the centroid — the origin canonically sits on the floor) */
     for (uint32_t k = 0; k < m->channels; ++k) {
-        const float* pos = L->speakers[k].pos;
+        float pos[3] = { L->speakers[k].pos[0] - L->ref[0],
+                         L->speakers[k].pos[1] - L->ref[1],
+                         L->speakers[k].pos[2] - L->ref[2] };
         float len = sqrtf(pos[0] * pos[0] + pos[1] * pos[1] + pos[2] * pos[2]);
         float dir[3] = { 0, 0, -1 };
         if (len > 1e-6f) { dir[0] = pos[0] / len; dir[1] = pos[1] / len; dir[2] = pos[2] / len; }

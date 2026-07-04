@@ -492,6 +492,7 @@ uint32_t bw_panner_gains_batch(BwPanner panner, const float* positions, uint32_t
         L.speakers[s].gain_lin = 1.0f;
         L.speakers[s].delay_samples = 0;
     }
+    layout_compute_ref(&L);          /* keep the struct coherent (the panners themselves are listener-relative) */
     SpcapState sp; VbapState vb;
     if (panner == BW_PAN_SPCAP) spcap_reset(&sp);
     else if (panner == BW_PAN_VBAP) vbap_reset(&vb);
@@ -602,14 +603,15 @@ void bw_scene_set_mesh_mat(BwEngine* e, const float* verts, int nverts, const in
 
 #ifdef BW_HAVE_STEAMAUDIO
 /* Emit triangle (i0,i1,i2) into tris[*n], flipping the last two indices if needed so the face normal
- * points toward the origin (inward — the listener is inside the box). */
-static void emit_inward(const float* v, int* tris, int* n, int i0, int i1, int i2) {
+ * points toward `ctr` (the box centre — inward; the listener is inside). Testing toward the ORIGIN
+ * would degenerate for a floor-based box, whose bottom face contains the origin. */
+static void emit_inward(const float* v, const float ctr[3], int* tris, int* n, int i0, int i1, int i2) {
     const float *p0 = &v[i0*3], *p1 = &v[i1*3], *p2 = &v[i2*3];
     float e1x = p1[0]-p0[0], e1y = p1[1]-p0[1], e1z = p1[2]-p0[2];
     float e2x = p2[0]-p0[0], e2y = p2[1]-p0[1], e2z = p2[2]-p0[2];
     float nx = e1y*e2z - e1z*e2y, ny = e1z*e2x - e1x*e2z, nz = e1x*e2y - e1y*e2x;
     float cx = (p0[0]+p1[0]+p2[0])/3.f, cy = (p0[1]+p1[1]+p2[1])/3.f, cz = (p0[2]+p1[2]+p2[2])/3.f;
-    if (nx*(-cx) + ny*(-cy) + nz*(-cz) < 0.f) { int tmp = i1; i1 = i2; i2 = tmp; }   /* normal points outward -> flip */
+    if (nx*(ctr[0]-cx) + ny*(ctr[1]-cy) + nz*(ctr[2]-cz) < 0.f) { int tmp = i1; i1 = i2; i2 = tmp; }   /* outward -> flip */
     tris[*n*3+0] = i0; tris[*n*3+1] = i1; tris[*n*3+2] = i2; (*n)++;
 }
 #endif
@@ -621,18 +623,21 @@ void bw_scene_set_box(BwEngine* e, float w, float h, float d, const BwMaterial f
         set_error(e, "bw_scene_set_box: w/h/d must be positive");
         return;
     }
-    float hw = w*0.5f, hh = h*0.5f, hd = d*0.5f;
+    /* floor-based: x/z centred on the origin, y from 0 (the floor, where the room origin
+     * canonically sits) up to h — so a listener at ear height stands inside the box */
+    float hw = w*0.5f, hd = d*0.5f;
     float verts[8*3] = {
-        -hw,-hh,-hd,   hw,-hh,-hd,   hw, hh,-hd,  -hw, hh,-hd,
-        -hw,-hh, hd,   hw,-hh, hd,   hw, hh, hd,  -hw, hh, hd };
+        -hw, 0.f,-hd,   hw, 0.f,-hd,   hw, h,-hd,  -hw, h,-hd,
+        -hw, 0.f, hd,   hw, 0.f, hd,   hw, h, hd,  -hw, h, hd };
     static const int quad[6][4] = {            /* face order: -x,+x,-y,+y,-z,+z (matches faces[6]) */
         {0,4,7,3}, {1,2,6,5}, {0,1,5,4}, {3,7,6,2}, {0,3,2,1}, {4,5,6,7} };
     int tris[12*3]; BwMaterial tri_mat[12]; int n = 0;
+    const float ctr[3] = { 0.f, h * 0.5f, 0.f };
     for (int f = 0; f < 6; ++f) {
         BwMaterial m = faces ? faces[f] : 0;
         int a = quad[f][0], b = quad[f][1], c = quad[f][2], dd = quad[f][3];
-        emit_inward(verts, tris, &n, a, b, c);  tri_mat[n-1] = m;
-        emit_inward(verts, tris, &n, a, c, dd); tri_mat[n-1] = m;
+        emit_inward(verts, ctr, tris, &n, a, b, c);  tri_mat[n-1] = m;
+        emit_inward(verts, ctr, tris, &n, a, c, dd); tri_mat[n-1] = m;
     }
     bw_scene_set_mesh_mat(e, verts, 8, tris, 12, tri_mat);
 #else

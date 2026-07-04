@@ -28,10 +28,13 @@ int allrad_build_decode(const Layout* L, float decode[BW_CHANNELS][BW_AMBI_CH]) 
     const uint32_t N = L->count;
     if (N < 4 || N > BW_CHANNELS) return 0;
 
-    /* real loudspeaker directions from the room origin (world-locked, like the sampling decode) */
+    /* real loudspeaker directions from the layout's nominal listening point (the array centroid —
+     * world-locked, like the sampling decode; the room origin canonically sits on the floor) */
     float r[BW_CHANNELS][3];
     for (uint32_t s = 0; s < N; ++s) {
-        const float* p = L->speakers[s].pos;
+        float p[3] = { L->speakers[s].pos[0] - L->ref[0],
+                       L->speakers[s].pos[1] - L->ref[1],
+                       L->speakers[s].pos[2] - L->ref[2] };
         float len = sqrtf(p[0]*p[0] + p[1]*p[1] + p[2]*p[2]);
         if (len < 1e-6f) { r[s][0] = 1.f; r[s][1] = 0.f; r[s][2] = 0.f; }
         else { float inv = 1.f/len; r[s][0] = p[0]*inv; r[s][1] = p[1]*inv; r[s][2] = p[2]*inv; }

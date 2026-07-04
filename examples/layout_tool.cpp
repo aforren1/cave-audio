@@ -172,7 +172,7 @@ static int save_json(const char* path) {
         "{\n"
         "  \"schema_version\": 1,\n"
         "  \"units\": { \"position\": \"meters\", \"gain\": \"decibels\", \"delay\": \"milliseconds\" },\n"
-        "  \"coordinate_space\": \"room, right-handed, +y up, +z forward (matches OptiTrack/Motive default); origin at working-area center\",\n"
+        "  \"coordinate_space\": \"room, right-handed, +y up, +z forward (matches OptiTrack/Motive default); origin ON THE FLOOR at the working-area centre (x/z); y = height above the floor\",\n"
         "  \"reference\": { \"alignment\": \"max-distance\", \"speed_of_sound_mps\": %g, \"note\": \"delay_ms time-aligns each speaker arrival to the farthest speaker; gain_db is a measured per-speaker trim\" },\n"
         "  \"dbap\": { \"rolloff_r\": %g, \"distance_attenuation\": { \"model\": \"%s\", \"reference_distance_m\": %g, \"rolloff\": %g, \"min_gain_db\": %g } },\n"
         "  \"speakers\": [\n",

@@ -28,9 +28,9 @@ int main(void) {
     rt_set_layout(rt, &L);
 
     /* Promote the off-centre listener pose BEFORE the reflection sim starts, so its accumulating
-     * energy field is built for (2,0,0) from the first tick (never the centred default). 1 m from
-     * the +X wall, 5 m from -X. */
-    float p[3] = { 2.0f, 0.0f, 0.0f }, q[4] = { 0.0f, 0.0f, 0.0f, 1.0f };
+     * energy field is built for (2,1.5,0) from the first tick (never the centred default). 1 m from
+     * the +X wall, 5 m from -X, on the array's ear plane (floor origin: ears at y=1.5). */
+    float p[3] = { 2.0f, 1.5f, 0.0f }, q[4] = { 0.0f, 0.0f, 0.0f, 1.0f };
     float* bus = (float*)calloc((size_t)BW_CHANNELS * BLK, sizeof(float));
     BwTimestamp ts; memset(&ts, 0, sizeof ts);
     rt_set_listener(rt, p, q);

@@ -174,29 +174,32 @@ namespace CaveAudio
             }
         }
 
-        // Append an origin-centred box (room metres), inward-facing normals (the listener is inside).
+        // Append a FLOOR-based box (room metres: x/z centred, y from 0 up to size.y — matching
+        // bw_scene_set_box), inward-facing normals (the listener is inside).
         static void AddBox(List<float> verts, List<int> tris, List<uint> triMat, Vector3 size, uint mat)
         {
-            float hw = size.x * 0.5f, hh = size.y * 0.5f, hd = size.z * 0.5f;
+            float hw = size.x * 0.5f, hd = size.z * 0.5f, h = size.y;
             var v = new[] {
-                new Vector3(-hw,-hh,-hd), new Vector3(hw,-hh,-hd), new Vector3(hw,hh,-hd), new Vector3(-hw,hh,-hd),
-                new Vector3(-hw,-hh, hd), new Vector3(hw,-hh, hd), new Vector3(hw,hh, hd), new Vector3(-hw,hh, hd) };
+                new Vector3(-hw, 0,-hd), new Vector3(hw, 0,-hd), new Vector3(hw, h,-hd), new Vector3(-hw, h,-hd),
+                new Vector3(-hw, 0, hd), new Vector3(hw, 0, hd), new Vector3(hw, h, hd), new Vector3(-hw, h, hd) };
             int baseIdx = verts.Count / 3;
             foreach (var p in v) { verts.Add(p.x); verts.Add(p.y); verts.Add(p.z); }   // already room space
             int[][] quad = { new[]{0,4,7,3}, new[]{1,2,6,5}, new[]{0,1,5,4}, new[]{3,7,6,2}, new[]{0,3,2,1}, new[]{4,5,6,7} };
+            var ctr = new Vector3(0, h * 0.5f, 0);
             foreach (var qd in quad)
             {
-                EmitInward(v, tris, baseIdx, qd[0], qd[1], qd[2]); triMat.Add(mat);
-                EmitInward(v, tris, baseIdx, qd[0], qd[2], qd[3]); triMat.Add(mat);
+                EmitInward(v, ctr, tris, baseIdx, qd[0], qd[1], qd[2]); triMat.Add(mat);
+                EmitInward(v, ctr, tris, baseIdx, qd[0], qd[2], qd[3]); triMat.Add(mat);
             }
         }
 
-        // Emit a box triangle, flipping the last two indices so its normal points toward the origin.
-        static void EmitInward(Vector3[] v, List<int> tris, int baseIdx, int i0, int i1, int i2)
+        // Emit a box triangle, flipping the last two indices so its normal points toward the box
+        // centre (toward the ORIGIN would degenerate: a floor-based box's bottom face contains it).
+        static void EmitInward(Vector3[] v, Vector3 ctr, List<int> tris, int baseIdx, int i0, int i1, int i2)
         {
             Vector3 n = Vector3.Cross(v[i1] - v[i0], v[i2] - v[i0]);
             Vector3 c = (v[i0] + v[i1] + v[i2]) / 3f;
-            if (Vector3.Dot(n, -c) < 0f) { var t = i1; i1 = i2; i2 = t; }   // normal points outward -> flip
+            if (Vector3.Dot(n, ctr - c) < 0f) { var t = i1; i1 = i2; i2 = t; }   // normal points outward -> flip
             tris.Add(baseIdx + i0); tris.Add(baseIdx + i1); tris.Add(baseIdx + i2);
         }
 

@@ -9,6 +9,10 @@ Initial Unity binding (M7).
 - Room convention change (engine-wide): room space is now **+Z forward** (identity head faces +z,
   matching Motive's default streamed frame). `Room`'s baseline handedness flip moved from the Z
   axis to the X axis; since Unity is also +Z-forward, identity rotations now map to identity.
+- Room origin is now canonically **on the floor** (Motive ground plane; y = height above the
+  floor), and the room box (`AddBox` / `bw_scene_set_box`) is floor-based: x/z centred, y from 0
+  up to the box height. The engine references the array centroid, not the origin, for its
+  world-locked decodes, so surveys with other origins keep working.
 
 - Pause/seek + the output protection limiter (engine `9d60c6e`): `BwEmitter.Pause()/UnPause()/Paused`
   (AudioSource.Pause/UnPause equivalents; click-free, the playhead freezes, paused still reads as

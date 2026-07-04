@@ -6,10 +6,13 @@ calls on the main thread.
 
 ## Coordinate seam (the part that silently ruins spatial audio)
 
-The core works in **room space: right-handed, +Y up, +Z forward, metres** — exactly
-OptiTrack/Motive's default streamed frame, so tracked rigid-body poses pass through
-unchanged (an identity head quaternion faces +Z; the listener's right ear is at −X).
-Engines do not share it. Convert every position and quaternion at the boundary:
+The core works in **room space: right-handed, +Y up, +Z forward, metres, origin on the
+floor** — exactly OptiTrack/Motive's default streamed frame (the ground-plane square
+defines the floor), so tracked rigid-body poses pass through unchanged: no rotation, no
+translation (an identity head quaternion faces +Z; the listener's right ear is at −X;
+y is height above the floor). The engine references the **array centroid** as its nominal
+listening point, so the origin's exact spot is not audio-load-bearing. Engines do not
+share this frame. Convert every position and quaternion at the boundary:
 
 - **Unity** is left-handed, +Y up, +Z forward. Up and forward already agree, so the
   baseline conversion is a single axis flip (negate X — Unity identity rotation maps

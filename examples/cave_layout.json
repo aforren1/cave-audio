@@ -5,7 +5,7 @@
     "gain": "decibels",
     "delay": "milliseconds"
   },
-  "coordinate_space": "room, right-handed, +y up, +z forward (matches OptiTrack/Motive default); origin at working-area center",
+  "coordinate_space": "room, right-handed, +y up, +z forward (matches OptiTrack/Motive default); origin ON THE FLOOR at the working-area centre (x/z); y = height above the floor",
   "reference": {
     "alignment": "max-distance",
     "speed_of_sound_mps": 343,
@@ -25,7 +25,7 @@
       "index": 0,
       "position": [
         -1.5,
-        -1.5,
+        0.0,
         -1.5
       ],
       "gain_db": 0,
@@ -35,7 +35,7 @@
       "index": 1,
       "position": [
         -1.5,
-        -1.5,
+        0.0,
         0
       ],
       "gain_db": 0,
@@ -45,7 +45,7 @@
       "index": 2,
       "position": [
         -1.5,
-        -1.5,
+        0.0,
         1.5
       ],
       "gain_db": 0,
@@ -55,7 +55,7 @@
       "index": 3,
       "position": [
         0,
-        -1.5,
+        0.0,
         -1.5
       ],
       "gain_db": 0,
@@ -65,7 +65,7 @@
       "index": 4,
       "position": [
         0,
-        -1.5,
+        0.0,
         0
       ],
       "gain_db": 0,
@@ -75,7 +75,7 @@
       "index": 5,
       "position": [
         0,
-        -1.5,
+        0.0,
         1.5
       ],
       "gain_db": 0,
@@ -85,7 +85,7 @@
       "index": 6,
       "position": [
         1.5,
-        -1.5,
+        0.0,
         -1.5
       ],
       "gain_db": 0,
@@ -95,7 +95,7 @@
       "index": 7,
       "position": [
         1.5,
-        -1.5,
+        0.0,
         0
       ],
       "gain_db": 0,
@@ -105,7 +105,7 @@
       "index": 8,
       "position": [
         1.5,
-        -1.5,
+        0.0,
         1.5
       ],
       "gain_db": 0,
@@ -115,7 +115,7 @@
       "index": 9,
       "position": [
         -1.5,
-        0,
+        1.5,
         -1.5
       ],
       "gain_db": 0,
@@ -125,7 +125,7 @@
       "index": 10,
       "position": [
         -1.5,
-        0,
+        1.5,
         0
       ],
       "gain_db": 0,
@@ -135,7 +135,7 @@
       "index": 11,
       "position": [
         -1.5,
-        0,
+        1.5,
         1.5
       ],
       "gain_db": 0,
@@ -145,7 +145,7 @@
       "index": 12,
       "position": [
         0,
-        0,
+        1.5,
         -1.5
       ],
       "gain_db": 0,
@@ -155,7 +155,7 @@
       "index": 13,
       "position": [
         0,
-        0,
+        1.5,
         1.5
       ],
       "gain_db": 0,
@@ -165,7 +165,7 @@
       "index": 14,
       "position": [
         1.5,
-        0,
+        1.5,
         -1.5
       ],
       "gain_db": 0,
@@ -175,7 +175,7 @@
       "index": 15,
       "position": [
         1.5,
-        0,
+        1.5,
         0
       ],
       "gain_db": 0,
@@ -185,7 +185,7 @@
       "index": 16,
       "position": [
         1.5,
-        0,
+        1.5,
         1.5
       ],
       "gain_db": 0,
@@ -195,7 +195,7 @@
       "index": 17,
       "position": [
         -1.5,
-        1.5,
+        3.0,
         -1.5
       ],
       "gain_db": 0,
@@ -205,7 +205,7 @@
       "index": 18,
       "position": [
         -1.5,
-        1.5,
+        3.0,
         0
       ],
       "gain_db": 0,
@@ -215,7 +215,7 @@
       "index": 19,
       "position": [
         -1.5,
-        1.5,
+        3.0,
         1.5
       ],
       "gain_db": 0,
@@ -225,7 +225,7 @@
       "index": 20,
       "position": [
         0,
-        1.5,
+        3.0,
         -1.5
       ],
       "gain_db": 0,
@@ -235,7 +235,7 @@
       "index": 21,
       "position": [
         0,
-        1.5,
+        3.0,
         0
       ],
       "gain_db": 0,
@@ -245,7 +245,7 @@
       "index": 22,
       "position": [
         0,
-        1.5,
+        3.0,
         1.5
       ],
       "gain_db": 0,
@@ -255,7 +255,7 @@
       "index": 23,
       "position": [
         1.5,
-        1.5,
+        3.0,
         -1.5
       ],
       "gain_db": 0,
@@ -265,7 +265,7 @@
       "index": 24,
       "position": [
         1.5,
-        1.5,
+        3.0,
         0
       ],
       "gain_db": 0,
@@ -275,7 +275,7 @@
       "index": 25,
       "position": [
         1.5,
-        1.5,
+        3.0,
         1.5
       ],
       "gain_db": 0,

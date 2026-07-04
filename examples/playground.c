@@ -160,13 +160,15 @@ static int         backend_silent;
 static const char* g_layout_path;          /* optional cave_layout.json; NULL = engine default grid */
 
 static Vector3 speakers[NSPK];
-static Vector3 source_pos = { 1.5f, 0.0f, 0.0f };
+static Vector3 g_head;            /* the ear point = array centroid (the engine's nominal listening point);
+                                   * room origin is on the FLOOR, so the head is NOT at the origin */
+static Vector3 source_pos = { 1.5f, 0.0f, 0.0f };   /* y re-based to ear height once the layout is known */
 static float   head_yaw, source_yaw;
 static int     cur_sig;
 static int     highlight_spk = -1;          /* a scene may highlight one speaker each frame; reset per frame */
 
 /* wall + materials (occlusion scene) */
-static Vector3       wall_c = { 0.0f, 0.6f, -2.2f };
+static Vector3       wall_c = { 0.0f, 1.2f, -2.2f };   /* standing on the floor: spans y 0..2.4, blocks the ear line */
 static const Vector3 wall_n = { 0, 0, 1 };
 static const float   wall_hw = 2.0f, wall_hh = 1.2f;
 static Vector3       wall_u, wall_v;
@@ -214,7 +216,7 @@ static CvConstraints g_con;     /* ./constraints.json, if present — drawn in e
 static void draw_speakers(int hi) {
     cv_draw(&g_con);            /* the room's bounds/no-go/obstacle boxes, same colors as the layout tool */
     for (int k = 0; k < NSPK; ++k)
-        draw_speaker_gizmo(speakers[k], (Vector3){ 0, 0, 0 },   /* cones aim at the head (the origin) */
+        draw_speaker_gizmo(speakers[k], g_head,                 /* cones aim at the head (the array centroid) */
                            k == hi ? 0.30f : 0.22f,
                            k == hi ? (Color){ 120, 240, 140, 255 } : (Color){ 120, 120, 140, 255 });
 }
@@ -222,10 +224,11 @@ static void draw_head(Quaternion q) {
     /* ear/nose axes from the ABI's room-frame identity basis (bwaudio.h BW_ROOM_*) */
     Vector3 right = Vector3RotateByQuaternion((Vector3){ BW_ROOM_RIGHT[0], BW_ROOM_RIGHT[1], BW_ROOM_RIGHT[2] }, q);
     Vector3 fwd   = Vector3RotateByQuaternion((Vector3){ BW_ROOM_AHEAD[0], BW_ROOM_AHEAD[1], BW_ROOM_AHEAD[2] }, q);
-    DrawSphere((Vector3){ 0, 0, 0 }, 0.16f, SKYBLUE);
-    DrawSphere(Vector3Scale(right,  0.17f), 0.055f, RED);       /* right ear -> audio R */
-    DrawSphere(Vector3Scale(right, -0.17f), 0.055f, RAYWHITE);  /* left ear  -> audio L */
-    DrawCylinderEx(Vector3Scale(fwd, 0.13f), Vector3Scale(fwd, 0.30f), 0.06f, 0.0f, 10, ORANGE); /* nose */
+    DrawSphere(g_head, 0.16f, SKYBLUE);
+    DrawSphere(Vector3Add(g_head, Vector3Scale(right,  0.17f)), 0.055f, RED);       /* right ear -> audio R */
+    DrawSphere(Vector3Add(g_head, Vector3Scale(right, -0.17f)), 0.055f, RAYWHITE);  /* left ear  -> audio L */
+    DrawCylinderEx(Vector3Add(g_head, Vector3Scale(fwd, 0.13f)),
+                   Vector3Add(g_head, Vector3Scale(fwd, 0.30f)), 0.06f, 0.0f, 10, ORANGE); /* nose */
 }
 
 static void build_engine(int with_reverb);   /* fwd: the reverb scene rebuilds to A/B the bed decoder */
@@ -260,13 +263,13 @@ static void loc_update(float dt) {
         loc_fly_t += dt;
         float period = 3.6f, u = fmodf(loc_fly_t, period) / period;     /* there-and-back, ~7.8 m/s */
         float x = (u < 0.5f) ? (-7.0f + 28.0f * u) : (7.0f - 28.0f * (u - 0.5f));
-        source_pos = (Vector3){ x, 0.0f, 0.8f };
+        source_pos = (Vector3){ x, g_head.y, 0.8f };
     } else if (loc_auto) {
         loc_t += dt;
         float az = 0.62f * loc_t;                         /* circle the listener   (~10 s / orbit) */
         float r  = 2.0f + 1.2f * sinf(0.90f * loc_t);     /* near <-> far  0.8..3.2 (~7 s) */
-        float y  = 1.2f  * sinf(1.14f * loc_t);           /* low  <-> high -1.2..1.2 (~5.5 s) */
-        source_pos = (Vector3){ r * cosf(az), y, r * sinf(az) };
+        float y  = 1.2f  * sinf(1.14f * loc_t);           /* low  <-> high +/-1.2 about ear height (~5.5 s) */
+        source_pos = (Vector3){ r * cosf(az), g_head.y + y, r * sinf(az) };
     }
     if (loc_auto || loc_flyby) {
         if (loc_trail_len < LOC_TRAIL) loc_trail[loc_trail_len++] = source_pos;
@@ -281,7 +284,7 @@ static void loc_draw3d(void) {
             DrawLine3D(loc_trail[i - 1], loc_trail[i], (Color){ 90, 220, 90, (unsigned char)(40 + 180 * i / loc_trail_len) });
         DrawLine3D(source_pos, (Vector3){ source_pos.x, 0, source_pos.z }, (Color){ 90, 220, 90, 60 }); /* height drop line */
     }
-    DrawLine3D((Vector3){ 0, 0, 0 }, source_pos, (Color){ 90, 220, 90, 220 });
+    DrawLine3D(g_head, source_pos, (Color){ 90, 220, 90, 220 });
     DrawSphere(source_pos, 0.18f, RED);
 }
 static void loc_hud(int y) {
@@ -315,7 +318,7 @@ static void occ_update(float dt) {
 
     /* reflection: the source mirrored across the wall is valid when source + listener are on the same
      * side and the bounce lands on the panel. occlusion: the direct path crosses the panel. */
-    const Vector3 L = { 0, 0, 0 };
+    const Vector3 L = g_head;
     occ_image = reflect_point(source_pos, wall_c, wall_n);
     int same_side = (Vector3DotProduct(Vector3Subtract(source_pos, wall_c), wall_n) > 0)
                  == (Vector3DotProduct(Vector3Subtract(L, wall_c), wall_n) > 0);
@@ -334,11 +337,11 @@ static void occ_update(float dt) {
 static void occ_draw3d(void) {
     draw_wall(wall_c, wall_u, wall_v, wall_hw, wall_hh,
               (Color){ 90, 110, 140, 90 }, (Color){ 150, 180, 220, 255 });
-    DrawLine3D((Vector3){ 0, 0, 0 }, source_pos, occ_occluded ? (Color){ 230, 70, 70, 255 } : (Color){ 90, 220, 90, 220 });
+    DrawLine3D(g_head, source_pos, occ_occluded ? (Color){ 230, 70, 70, 255 } : (Color){ 90, 220, 90, 220 });
     DrawSphere(source_pos, 0.18f, RED);
     if (occ_refl_valid) {
         DrawLine3D(source_pos, occ_refl_pt, ORANGE);
-        DrawLine3D(occ_refl_pt, (Vector3){ 0, 0, 0 }, ORANGE);
+        DrawLine3D(occ_refl_pt, g_head, ORANGE);
         DrawSphere(occ_refl_pt, 0.06f, ORANGE);
         DrawSphere(occ_image, 0.14f, (Color){ 230, 160, 60, 130 });
         DrawLine3D(occ_image, occ_refl_pt, (Color){ 230, 160, 60, 80 });
@@ -375,7 +378,7 @@ static void dir_update(float dt) {
     dir_gain = bw_source_get_directivity(e, src);              /* 1 = on-axis/omni .. 0 = null */
 }
 static void dir_draw3d(void) {
-    DrawLine3D((Vector3){ 0, 0, 0 }, source_pos, (Color){ 90, 220, 90, 180 });
+    DrawLine3D(g_head, source_pos, (Color){ 90, 220, 90, 180 });
     DrawSphere(source_pos, 0.18f, RED);
     /* illustrative horizontal lobe (weighted dipole) pointing the source's aim */
     float w = (cur_dir == 1) ? 0.5f : (cur_dir == 2) ? 1.0f : 0.0f;
@@ -417,7 +420,7 @@ static void chan_update(float dt) {
     highlight_spk = chan_active;
 }
 static void chan_draw3d(void) {
-    DrawLine3D((Vector3){ 0, 0, 0 }, speakers[chan_active], (Color){ 120, 235, 150, 200 });
+    DrawLine3D(g_head, speakers[chan_active], (Color){ 120, 235, 150, 200 });
 }
 static void chan_hud(int y) {
     ui_text(TextFormat("LEFT/RIGHT step channel   N %s   SPACE auto-walk %s",
@@ -493,14 +496,14 @@ static void abx_update(float dt) {
     if (abx_orbit) {                             /* slow orbit + gentle bob; identical for A/B/X, so it never cues */
         abx_orbit_t += dt;
         float az = 0.45f * abx_orbit_t;
-        source_pos = (Vector3){ 2.2f * cosf(az), 0.5f * sinf(0.31f * abx_orbit_t), 2.2f * sinf(az) };
+        source_pos = (Vector3){ 2.2f * cosf(az), g_head.y + 0.5f * sinf(0.31f * abx_orbit_t), 2.2f * sinf(az) };
     }
     if (abx_flash_t > 0.0f) { abx_flash_t -= dt; if (abx_flash_t < 0.0f) abx_flash_t = 0.0f; }
     bw_source_set_pos(e, src, source_pos.x, source_pos.y, source_pos.z);
     bw_source_set_gain(e, src, SRC_GAIN);
 }
 static void abx_draw3d(void) {
-    DrawLine3D((Vector3){ 0, 0, 0 }, source_pos, (Color){ 90, 220, 90, 200 });
+    DrawLine3D(g_head, source_pos, (Color){ 90, 220, 90, 200 });
     DrawSphere(source_pos, 0.18f, RED);
 }
 static void abx_hud(int y) {
@@ -559,14 +562,14 @@ static void rev_update(float dt) {
     if (IsKeyDown(KEY_RIGHT_BRACKET)) rev_wet = fminf(2.0f, rev_wet + 0.7f * dt);
     bw_reflections_set_gain(e, rev_wet);
     source_pos.x = Clamp(source_pos.x, -ROOM_W * 0.5f + 0.5f, ROOM_W * 0.5f - 0.5f); /* keep it inside the room */
-    source_pos.y = Clamp(source_pos.y, -ROOM_H * 0.5f + 0.5f, ROOM_H * 0.5f - 0.5f);
+    source_pos.y = Clamp(source_pos.y, 0.5f, ROOM_H - 0.5f);                         /* floor-based box: y 0..H */
     source_pos.z = Clamp(source_pos.z, -ROOM_D * 0.5f + 0.5f, ROOM_D * 0.5f - 0.5f);
     bw_source_set_pos(e, src, source_pos.x, source_pos.y, source_pos.z);
     bw_source_set_gain(e, src, SRC_GAIN);
 }
 static void rev_draw3d(void) {
-    DrawCubeWires((Vector3){ 0, 0, 0 }, ROOM_W, ROOM_H, ROOM_D, (Color){ 90, 110, 150, 130 });
-    DrawLine3D((Vector3){ 0, 0, 0 }, source_pos, (Color){ 90, 220, 90, 200 });
+    DrawCubeWires((Vector3){ 0, ROOM_H * 0.5f, 0 }, ROOM_W, ROOM_H, ROOM_D, (Color){ 90, 110, 150, 130 });
+    DrawLine3D(g_head, source_pos, (Color){ 90, 220, 90, 200 });
     DrawSphere(source_pos, 0.18f, RED);
 }
 static void rev_hud(int y) {
@@ -624,6 +627,9 @@ static void build_engine(int with_reverb) {
     backend_name   = bw_audio_backend(e);
     backend_silent = (strncmp(backend_name, "asio", 4) != 0);
     bw_get_speakers(e, (float*)speakers, NSPK);            /* render the geometry the engine pans with */
+    g_head = (Vector3){ 0, 0, 0 };                         /* ear point = array centroid (the engine's own ref) */
+    for (int i = 0; i < NSPK; ++i) g_head = Vector3Add(g_head, speakers[i]);
+    g_head = Vector3Scale(g_head, 1.0f / NSPK);
     for (int i = 0; i < NSIG; ++i) sounds[i] = bw_load_sound(e, sig_files[i]);
     for (int i = 0; i < NMAT; ++i) mats[i] = bw_material_preset(e, mat_names[i]);
     src  = bw_source_create(e);  bw_source_play(e, src,  sounds[cur_sig], true);
@@ -672,7 +678,8 @@ int main(int argc, char** argv) {
     free(sigbuf);
 
     wall_basis(wall_n, &wall_u, &wall_v);
-    build_engine(0);                                          /* start in the interactive config (fills speakers[]) */
+    build_engine(0);                                          /* start in the interactive config (fills speakers[], g_head) */
+    source_pos.y = g_head.y;                                  /* start the source on the ear plane */
     printf("layout: %s    audio backend: %s%s\n", g_layout_path ? g_layout_path : "default grid", backend_name,
            backend_silent ? "   (SILENT — set BWAUDIO_ASIO_DRIVER to your headphone driver)" : "");
     if (cv_load("constraints.json", &g_con))                  /* orientation only; the layout tool edits against these */
@@ -683,7 +690,7 @@ int main(int argc, char** argv) {
     SetRandomSeed((unsigned int)time(NULL));                   /* the ABX scene's X draw must not repeat run-to-run */
     ui_text_init();                                            /* crisp TTF HUD (see ui_text.h) */
     SetTargetFPS(60);
-    cam = (Camera3D){ .target = { 0, 0.5f, 0 }, .up = { 0, 1, 0 }, .fovy = 55, .projection = CAMERA_PERSPECTIVE };
+    cam = (Camera3D){ .target = { 0, g_head.y, 0 }, .up = { 0, 1, 0 }, .fovy = 55, .projection = CAMERA_PERSPECTIVE };
     switch_scene(0);
 
     while (!WindowShouldClose()) {
@@ -729,7 +736,7 @@ int main(int argc, char** argv) {
         highlight_spk = -1;
         scenes[cur_scene].update(dt);
         Quaternion q = QuaternionFromAxisAngle((Vector3){ 0, 1, 0 }, head_yaw);
-        bw_set_listener_pose(e, 0, 0, 0, q.x, q.y, q.z, q.w);
+        bw_set_listener_pose(e, g_head.x, g_head.y, g_head.z, q.x, q.y, q.z, q.w);
         bw_commit(e);
 
         BeginDrawing();

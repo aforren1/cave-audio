@@ -38,7 +38,7 @@ static int run_profile(BwProfile profile, const char* name) {
     bw_source_play(e, s, snd, /*loop*/ true);
     bw_source_set_gain(e, s, 0.8f);
     bw_source_set_pos(e, s, 1.0f, 0.0f, -0.5f);
-    bw_set_listener_pose(e, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 1.f);
+    bw_set_listener_pose(e, 0.f, 1.5f, 0.f, 0.f, 0.f, 0.f, 1.f);   /* the default grid's ear point */
     bw_commit(e);
     bw_play_oneshot(e, snd, 0.f, 1.f, 0.f, 1.0f);
 
