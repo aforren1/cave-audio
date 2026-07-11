@@ -754,6 +754,12 @@ int main(void) {
             }
             CHECK(p0 <= 0.8915f && p0 > 0.80f, "limiter holds the hot channel at the -1 dBFS ceiling");
             CHECK(fabsf(p1 / p0 - 0.25f) < 0.02f, "linked limiting preserves inter-channel balance");
+            /* the output meter publishes exactly this block's post-limiter per-channel peaks */
+            float mtr[CH] = { 0 };
+            CHECK(rt_bus_peaks(cl, mtr, CH) == CH, "bus meter reports the channel count");
+            CHECK(fabsf(mtr[0] - p0) < 1e-6f && fabsf(mtr[1] - p1) < 1e-6f,
+                  "bus meter matches the rendered block's peaks");
+            CHECK(mtr[2] == 0.f, "a silent channel meters zero");
             rt_set_limiter_ceiling(cl, 0.5f);
             for (int b = 0; b < 20; ++b) rt_render(cl, bus, N, &ts);
             rt_render(cl, bus, N, &ts);
@@ -769,6 +775,6 @@ int main(void) {
 
     remove(WAV);
     if (fails) { printf("rt_test: %d FAILURES\n", fails); return 1; }
-    printf("rt_test OK (DBAP, commit, gen-drop, gain, occlusion, EQ, directivity, bed, reflection-tap, channel-test, air+Doppler, spread, reverb-send, dual-band, voice-steal, scheduled-play, streaming, pause/seek, limiter verified)\n");
+    printf("rt_test OK (DBAP, commit, gen-drop, gain, occlusion, EQ, directivity, bed, reflection-tap, channel-test, air+Doppler, spread, reverb-send, dual-band, voice-steal, scheduled-play, streaming, pause/seek, limiter, bus-meter verified)\n");
     return 0;
 }

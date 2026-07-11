@@ -247,6 +247,13 @@ BW_API void     bw_test_signal(BwEngine* e, uint32_t channel, BwTestKind kind, f
  * auditioning the geometry the engine is actually panning with. Control thread; safe any time. */
 BW_API uint32_t bw_get_speakers(BwEngine* e, float* xyz, uint32_t cap);
 
+/* Per-channel output meter: fills `peaks` with up to `cap` channels' LAST-BLOCK peak |sample|
+ * (linear), measured at the very end of the render — after align, the test signal, and the limiter,
+ * i.e. exactly what each device channel received. Returns the count filled. Control thread,
+ * per-frame-safe (relaxed atomic reads; no locks/alloc) — drive channel meters or a speaker-activity
+ * display (the playground lights each speaker gizmo with it). Reads 0 until audio is running. */
+BW_API uint32_t bw_get_bus_levels(BwEngine* e, float* peaks, uint32_t cap);
+
 /* ---- panner selection (load-time, or live: the switch is atomic) ----
  * The per-source panner that writes the 26-ch bus. DBAP (default) is listener-relative, recomputed
  * per frame from the tracked position — for a MOVING observer roaming the array. SPCAP is a smooth,

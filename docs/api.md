@@ -347,7 +347,8 @@ panner's own power** — so widening never changes loudness, and the perceived d
 
 ```c
 typedef enum { BW_TEST_OFF = 0, BW_TEST_SINE = 1, BW_TEST_NOISE = 2 } BwTestKind;
-void bw_test_signal(BwEngine* e, uint32_t channel, BwTestKind kind, float gain);
+void     bw_test_signal(BwEngine* e, uint32_t channel, BwTestKind kind, float gain);
+uint32_t bw_get_bus_levels(BwEngine* e, float* peaks, uint32_t cap);  // last block's per-channel output peak
 ```
 
 Drive a single **output channel** with a built-in signal (660 Hz sine or white noise), injected
@@ -357,6 +358,12 @@ map, find a dead speaker, set a trim), **not** a spatial path: it bypasses the p
 it to "place" a sound. Per-frame-safe, takes effect next block, no `bw_commit` needed; any number of
 channels at once; `gain 0` / `BW_TEST_OFF` silences one. Works in every profile (cave/both: a raw tone
 on that DVS channel; binaural: that bus channel HRTF'd as its virtual speaker). Needs no SDK.
+
+`bw_get_bus_levels` is the matching **readback**: each output channel's last-block peak `|sample|`
+(linear), measured at the very end of the render — after align, the test signal, and the limiter, i.e.
+exactly what the device channel received. Fills up to `cap` floats, returns the count filled.
+Per-frame-safe (relaxed atomic reads, no locks); levels read 0 until audio is running. Drive channel
+meters or a speaker-activity display with it — the playground lights each speaker gizmo from this.
 
 ## Panner & layout query (control thread)
 

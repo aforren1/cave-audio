@@ -1,0 +1,103 @@
+# CI: build + test the core engine ("the C part"), and package bwaudio.dll for
+# limited distribution as a workflow artifact (repo access required to download).
+#
+# Scope (deliberate, see third_party/README.md):
+#   - ASIO backend: BUILT. The SDK is fetched from Steinberg's official URL (the
+#     repo's documented one-liner) and cached; it is dual-licensed GPLv3/proprietary
+#     and this project uses the GPLv3 option, consistent with the repo LICENSE — so
+#     the artifact is redistributable under GPLv3 (source = this repo at the commit).
+#   - Steam Audio: NOT built (needs the patched phonon submodule build — heavy;
+#     see third_party/README.md). Binaural falls back to the simple-pan monitor;
+#     the with-SDK tests (reflect/bake/path/steam_decode) don't run here → 12 ctests.
+#   - GUI tools (playground/calib_view/layout_tool): not built — they need a display
+#     and aren't part of the distributed library.
+#
+# Tests run with BWAUDIO_SINK=null, the documented CI mode (no audio hardware on
+# runners; forcing null keeps it deterministic rather than relying on fallback).
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        # no submodules: steam-audio-source is only needed for the phonon build (skipped here)
+
+      - name: Cache ASIO SDK
+        id: asiosdk
+        uses: actions/cache@v4
+        with:
+          path: third_party/asiosdk
+          key: asiosdk-v1   # bump manually to pick up a new Steinberg release
+
+      - name: Fetch ASIO SDK (Steinberg, GPLv3 option)
+        if: steps.asiosdk.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: |
+          curl.exe -fsSL -o asiosdk.zip https://www.steinberg.net/asiosdk
+          Expand-Archive asiosdk.zip -DestinationPath asiosdk_tmp
+          # the zip's top-level dir name varies by release — locate common/asio.h and take its parent
+          $hit = Get-ChildItem asiosdk_tmp -Recurse -Filter asio.h |
+                 Where-Object { $_.Directory.Name -eq 'common' } | Select-Object -First 1
+          if (-not $hit) { throw "asio.h not found in the Steinberg zip — layout changed?" }
+          Move-Item $hit.Directory.Parent.FullName third_party/asiosdk
+          Remove-Item asiosdk.zip, asiosdk_tmp -Recurse -Force
+
+      - name: Configure
+        shell: bash
+        run: |
+          cmake -S . -B build -G "Visual Studio 17 2022" -A x64 | tee configure.log
+          # the artifact must contain the production device path — fail loudly if it didn't wire up
+          grep -q "ASIO backend ENABLED" configure.log
+
+      - name: Build
+        run: cmake --build build --config RelWithDebInfo
+
+      - name: Test
+        env:
+          BWAUDIO_SINK: "null"   # quoted: bare null is YAML-null -> empty string, not the string "null"
+        run: ctest --test-dir build -C RelWithDebInfo --output-on-failure
+
+      - name: Stage dist
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory dist | Out-Null
+          Copy-Item build/RelWithDebInfo/bwaudio.dll,
+                    build/RelWithDebInfo/bwaudio.lib,
+                    build/RelWithDebInfo/bwaudio.pdb,
+                    build/RelWithDebInfo/bw_minimal.exe,
+                    include/bwaudio.h,
+                    examples/cave_layout.json,
+                    LICENSE dist/
+          @"
+          bwaudio win64 RelWithDebInfo — limited distribution build
+          commit   ${{ github.sha }} (${{ github.ref_name }})
+          built    $((Get-Date).ToUniversalTime().ToString('s'))Z  (GitHub Actions run ${{ github.run_id }})
+          backends ASIO=yes  SteamAudio=no (binaural monitor = simple-pan fallback;
+                   the production HRTF decode needs the phonon artifacts — third_party/README.md)
+          contents bwaudio.dll/.lib/.pdb (the C ABI, include/bwaudio.h), bw_minimal.exe
+                   (smoke check: runs the whole client lifecycle, no hardware needed),
+                   cave_layout.json (example layout)
+          license  GPLv3 (LICENSE included); complete source:
+                   https://github.com/aforren1/cave-audio/tree/${{ github.sha }}
+          "@ | Out-File -Encoding utf8 dist/DIST.txt
+          Get-Content dist/DIST.txt
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: bwaudio-win64-r${{ github.run_number }}
+          path: dist/
+          retention-days: 30
+          if-no-files-found: error

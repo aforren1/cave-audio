@@ -213,12 +213,26 @@ static void push_wall_mesh(BwMaterial mat) {
 /* ---- shared drawing ---- */
 static CvConstraints g_con;     /* ./constraints.json, if present — drawn in every scene for orientation */
 
+static float spk_lv[NSPK];      /* smoothed per-speaker activity (0..1): instant attack, ~1/3 s release */
+
 static void draw_speakers(int hi) {
     cv_draw(&g_con);            /* the room's bounds/no-go/obstacle boxes, same colors as the layout tool */
-    for (int k = 0; k < NSPK; ++k)
+    float pk[NSPK] = { 0 };
+    bw_get_bus_levels(e, pk, NSPK);                             /* last block's per-channel output peak */
+    const float rel = fminf(1.0f, 6.0f * GetFrameTime());       /* release one-pole (attack is instant) */
+    for (int k = 0; k < NSPK; ++k) {
+        /* block peak -> display level over a 60 dB window, so quiet DBAP tails still read */
+        float db = pk[k] > 1e-6f ? 20.0f * log10f(pk[k]) : -120.0f;
+        float lv = db <= -60.0f ? 0.0f : (db >= 0.0f ? 1.0f : 1.0f + db / 60.0f);
+        spk_lv[k] = lv > spk_lv[k] ? lv : spk_lv[k] + (lv - spk_lv[k]) * rel;
+        float t = spk_lv[k];
+        Color col = (k == hi) ? (Color){ 120, 240, 140, 255 }   /* a scene's explicit highlight wins */
+                              : (Color){ (unsigned char)(120 + t * 125.0f),   /* idle gray -> driven amber */
+                                         (unsigned char)(120 + t *  85.0f),
+                                         (unsigned char)(140 - t *  60.0f), 255 };
         draw_speaker_gizmo(speakers[k], g_head,                 /* cones aim at the head (the array centroid) */
-                           k == hi ? 0.30f : 0.22f,
-                           k == hi ? (Color){ 120, 240, 140, 255 } : (Color){ 120, 120, 140, 255 });
+                           (k == hi) ? 0.30f : 0.22f + 0.06f * t, col);
+    }
 }
 static void draw_head(Quaternion q) {
     /* ear/nose axes from the ABI's room-frame identity basis (bwaudio.h BW_ROOM_*) */
@@ -665,7 +679,11 @@ static void switch_scene(int idx) {
 }
 
 int main(int argc, char** argv) {
-    _putenv("BWAUDIO_SINK=asio");                             /* headphone output via a 2-ch ASIO driver */
+    /* Sink policy: engine default (try a 2-ch ASIO driver for headphones, fall back to the offline
+     * null sink). The fallback matters: without a device the engine still RENDERS in real time, so
+     * visual-only mode stays live — speaker activity, panning, occlusion — just silent. The HUD's
+     * SILENT banner + backend readout keep the no-audio state loud (we used to force
+     * BWAUDIO_SINK=asio here, which left visual-only mode with a dead engine: nothing metered). */
 
     /* optional surveyed layout: argv[1], else ./cave_layout.json if present, else the default grid */
     g_layout_path = (argc > 1) ? argv[1] : NULL;

@@ -149,6 +149,11 @@ struct RtCore {
     uint32_t test_noise;                /* shared LCG state for the noise kind */
     struct { float cw0, alpha; int type; } eq_proto[3];   /* per-band biquad prototypes, rate-derived at create */
 
+    /* per-channel output meter: each block's peak |sample| at the END of rt_render (post align/test
+     * signal/limiter = exactly what the device channel received), relaxed-published for control-thread
+     * readback (rt_bus_peaks -> bw_get_bus_levels: channel meters / speaker-activity displays). */
+    _Atomic float chan_peak[BW_CHANNELS];
+
     /* control-thread-owned voice handle allocation */
     uint16_t* gen;                          /* current generation per voice slot */
     uint8_t*  inuse;                        /* 1 while a voice slot is allocated */
@@ -1074,6 +1079,14 @@ void rt_render(RtCore* c, float* bus, uint32_t nframes, const BwTimestamp* ts) {
         }
         c->lim_gain = g;
     }
+    /* per-channel output meter: publish this block's peak |sample| — measured after align, the test
+     * signal, and the limiter, i.e. exactly what the device channel receives (rt_bus_peaks). */
+    for (uint32_t ch = 0; ch < c->channels; ++ch) {
+        const float* p = &bus[(size_t)ch * nframes];
+        float m = 0.f;
+        for (uint32_t i = 0; i < nframes; ++i) { float a = p[i] < 0.f ? -p[i] : p[i]; if (a > m) m = a; }
+        atomic_store_explicit(&c->chan_peak[ch], m, memory_order_relaxed);
+    }
     pose_write(&c->readback, c->lis.p_active, c->lis.q_active);   /* publish for control-thread readback */
     BW_ZONE_END(zr);
 }
@@ -1084,6 +1097,13 @@ void rt_read_pose(RtCore* c, float p[3], float q[4]) {
         memcpy(p, c->lis.p_active, sizeof(float) * 3);
         memcpy(q, c->lis.q_active, sizeof(float) * 4);
     }
+}
+
+uint32_t rt_bus_peaks(RtCore* c, float* out, uint32_t cap) {
+    if (!c || !out) return 0;
+    uint32_t n = c->channels < cap ? c->channels : cap;
+    for (uint32_t i = 0; i < n; ++i) out[i] = atomic_load_explicit(&c->chan_peak[i], memory_order_relaxed);
+    return n;
 }
 
 /* Control-thread readback: is the source's voice still producing audio? Reads the per-slot state the
@@ -1447,6 +1467,8 @@ RtCore* rt_create(uint32_t req_voice_cap, uint32_t sound_cap, uint32_t sample_ra
         atomic_store_explicit(&c->occ_eq[i],  eq_flat, memory_order_relaxed);
         atomic_store_explicit(&c->occ_dir[i], 1.0f,    memory_order_relaxed);
     }
+    for (uint32_t ch = 0; ch < BW_CHANNELS; ++ch)   /* output meter starts silent */
+        atomic_store_explicit(&c->chan_peak[ch], 0.f, memory_order_relaxed);
     /* precompute the 3 EQ band prototypes from the runtime sample rate (so the EQ is correct at
      * 48/96/192k). fc's: low-shelf 800, peaking at the geometric centre, high-shelf 8000. */
     {

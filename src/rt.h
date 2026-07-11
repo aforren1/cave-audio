@@ -149,5 +149,7 @@ void rt_get_listener(RtCore* c, float p[3], float q[4]);   /* audio thread: acti
 void rt_read_pose(RtCore* c, float p[3], float q[4]);      /* control thread: active pose (seqlock readback) */
 bool rt_source_is_playing(RtCore* c, uint32_t h);         /* control thread: is the source's voice still playing? */
 uint64_t rt_dsp_time(RtCore* c);                          /* control thread: current dsp-sample clock (for scheduling) */
+uint32_t rt_bus_peaks(RtCore* c, float* out, uint32_t cap); /* control thread: last block's per-channel output peak
+                                                             * (post align/test/limiter); returns the count filled */
 
 #endif /* BW_RT_H */

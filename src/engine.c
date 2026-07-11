@@ -543,6 +543,11 @@ uint32_t bw_get_speakers(BwEngine* e, float* xyz, uint32_t cap) {
     return n;
 }
 
+uint32_t bw_get_bus_levels(BwEngine* e, float* peaks, uint32_t cap) {
+    if (!e) return 0;
+    return rt_bus_peaks(e->rt, peaks, cap);
+}
+
 void bw_play_oneshot(BwEngine* e, BwSound snd, float x, float y, float z, float gain) {
     if (!e) return;
     if (rt_sound_channels(e->rt, snd) > 1) {
