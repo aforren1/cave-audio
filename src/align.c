@@ -6,6 +6,7 @@
  * (static-listener room correction; docs/calibration.md) before the gain+delay.
  */
 #include "align.h"
+#include "biquad.h"       /* shared RBJ cookbook (also used by rt.c's transmission/pathing EQ) */
 
 #include <math.h>
 #include <stdlib.h>
@@ -53,16 +54,8 @@ Aligner* align_create(uint32_t channels, const Layout* L, uint32_t sample_rate) 
         for (uint8_t s = 0; s < nrq; ++s) {        /* RBJ peaking EQ from the rate-independent params */
             const RoomEqSection* rq = &L->speakers[k].room_eq[s];
             if (!(rq->fc > 0.f) || rq->fc >= 0.5f * (float)sample_rate || !(rq->q > 0.f)) continue;
-            double A     = pow(10.0, rq->gain_db / 40.0);
-            double w0    = 2.0 * 3.14159265358979323846 * rq->fc / (double)sample_rate;
-            double alpha = sin(w0) / (2.0 * rq->q);
-            double a0    = 1.0 + alpha / A;
             uint8_t j = a->rq_n[k];
-            a->rq_co[k][j][0] = (float)((1.0 + alpha * A) / a0);
-            a->rq_co[k][j][1] = (float)((-2.0 * cos(w0)) / a0);
-            a->rq_co[k][j][2] = (float)((1.0 - alpha * A) / a0);
-            a->rq_co[k][j][3] = (float)((-2.0 * cos(w0)) / a0);
-            a->rq_co[k][j][4] = (float)((1.0 - alpha / A) / a0);
+            bw_biquad_rbj_hz(BW_BIQUAD_PEAK, rq->fc, rq->q, rq->gain_db, (double)sample_rate, a->rq_co[k][j]);
             a->rq_n[k] = j + 1;
         }
         if (a->rq_n[k]) a->any_rq = 1;

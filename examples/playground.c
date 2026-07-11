@@ -195,7 +195,7 @@ static float chan_timer;
 
 /* camera (shared) */
 static Camera3D cam;
-static float    cam_yaw = 45.0f * DEG2RAD, cam_pitch = 33.0f * DEG2RAD, cam_dist = 8.4f;
+static float    cam_yaw = 195.0f * DEG2RAD, cam_pitch = 25.0f * DEG2RAD, cam_dist = 8.4f;
 
 /* register the wall quad as occluding geometry with a material token. Safe at runtime because the
  * reverb bed isn't enabled (occlusion geometry is dynamic; it locks only while the bed runs). */
@@ -699,10 +699,10 @@ int main(int argc, char** argv) {
         float mv = 2.5f * dt, rt = 1.8f * dt;
 
         /* ---- global navigation (every scene) ---- */
-        if (IsKeyDown(KEY_W)) source_pos.z -= mv;
-        if (IsKeyDown(KEY_S)) source_pos.z += mv;
-        if (IsKeyDown(KEY_A)) source_pos.x -= mv;
-        if (IsKeyDown(KEY_D)) source_pos.x += mv;
+        if (IsKeyDown(KEY_W)) source_pos.z += mv;
+        if (IsKeyDown(KEY_S)) source_pos.z -= mv;
+        if (IsKeyDown(KEY_A)) source_pos.x += mv;
+        if (IsKeyDown(KEY_D)) source_pos.x -= mv;
         if (IsKeyDown(KEY_R)) source_pos.y += mv;
         if (IsKeyDown(KEY_F)) source_pos.y -= mv;
         if (IsKeyDown(KEY_Q)) head_yaw += rt;

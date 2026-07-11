@@ -1,5 +1,6 @@
 /* measure.c — see measure.h. Exponential sine sweep + regularized deconvolution. Pure DSP. */
 #include "measure.h"
+#include "fft.h"                                   /* shared radix-2 fft() + next_pow2() */
 
 #include <math.h>
 #include <stdlib.h>
@@ -8,34 +9,6 @@
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
 #endif
-
-/* in-place iterative radix-2 FFT; dir = +1 forward, -1 inverse (inverse divides by n). n must be 2^k. */
-static void fft(double* re, double* im, int n, int dir) {
-    for (int i = 1, j = 0; i < n; ++i) {              /* bit-reversal permutation */
-        int bit = n >> 1;
-        for (; j & bit; bit >>= 1) j ^= bit;
-        j ^= bit;
-        if (i < j) { double t = re[i]; re[i] = re[j]; re[j] = t; t = im[i]; im[i] = im[j]; im[j] = t; }
-    }
-    for (int len = 2; len <= n; len <<= 1) {
-        double ang = dir * 2.0 * M_PI / len;
-        double wr = cos(ang), wi = sin(ang);
-        for (int i = 0; i < n; i += len) {
-            double cr = 1.0, ci = 0.0;
-            for (int k = 0; k < len / 2; ++k) {
-                double ur = re[i + k],            ui = im[i + k];
-                double vr = re[i + k + len/2]*cr - im[i + k + len/2]*ci;
-                double vi = re[i + k + len/2]*ci + im[i + k + len/2]*cr;
-                re[i + k] = ur + vr;            im[i + k] = ui + vi;
-                re[i + k + len/2] = ur - vr;    im[i + k + len/2] = ui - vi;
-                double ncr = cr*wr - ci*wi;     ci = cr*wi + ci*wr; cr = ncr;
-            }
-        }
-    }
-    if (dir < 0) for (int i = 0; i < n; ++i) { re[i] /= n; im[i] /= n; }
-}
-
-static int next_pow2(int x) { int p = 1; while (p < x) p <<= 1; return p; }
 
 void measure_sweep(float* out, int n, double f1, double f2, double fs) {
     if (n <= 0) return;

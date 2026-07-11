@@ -166,9 +166,9 @@ void steam_path_tap(void* ud, float* bus, uint32_t n, const float* lp, const flo
     if (n != sp->n) return;
     if (ambi_ch > sp->ambi_ch) ambi_ch = sp->ambi_ch;
     float* ambP[BW_AMBI_CH]; for (uint32_t k=0;k<ambi_ch;++k) ambP[k] = (float*)(ambi + (size_t)k * n);
-    IPLAudioBuffer ab = { (IPLint32)ambi_ch, (IPLint32)n, ambP };
+    IPLAudioBuffer ab = { .numChannels = (IPLint32)ambi_ch, .numSamples = (IPLint32)n, .data = ambP };
     float* outP[BW_CHANNELS]; for (uint32_t s=0;s<BW_CHANNELS;++s) outP[s] = sp->out26 + (size_t)s * n;
-    IPLAudioBuffer o26 = { (IPLint32)BW_CHANNELS, (IPLint32)n, outP };
+    IPLAudioBuffer o26 = { .numChannels = (IPLint32)BW_CHANNELS, .numSamples = (IPLint32)n, .data = outP };
     IPLAmbisonicsDecodeEffectParams dp; memset(&dp,0,sizeof dp);
     dp.order = (IPLint32)sp->order; dp.hrtf = NULL; dp.binaural = IPL_FALSE;
     cs_at(&dp.orientation, (float[3]){0,0,0});

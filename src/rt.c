@@ -13,6 +13,7 @@
 #include "spcap.h"
 #include "vbap.h"
 #include "align.h"
+#include "biquad.h"       /* shared RBJ cookbook (also used by align.c's room_eq) */
 #include "ambisonics.h"   /* SH->26 decode for ambisonic beds */
 #include "allrad.h"       /* robust SH->26 decode for irregular arrays */
 #include "profile.h"      /* Tracy zones/plots (no-ops unless BWAUDIO_TRACY=ON) */
@@ -352,7 +353,7 @@ static const SoundData* sound_for(RtCore* c, uint32_t h) {
  * mono voice signal. The band *gains* are the spectral tilt of occluded sound; the broadband level
  * rides the existing occ_cur scalar. fc's are fixed, so the trig (cos w0 / alpha) is precomputed
  * per sample-rate at rt_create; only A=sqrt(g) varies per update => no transcendentals per sample. */
-enum { EQ_LOWSHELF = 0, EQ_PEAK = 1, EQ_HIGHSHELF = 2 };
+enum { EQ_LOWSHELF = BW_BIQUAD_LOWSHELF, EQ_PEAK = BW_BIQUAD_PEAK, EQ_HIGHSHELF = BW_BIQUAD_HIGHSHELF };
 #define EQ_SLEW     0.5f       /* per-block band-gain glide toward the published target */
 #define EQ_FLAT     0xFFFFFFFFFFFFull /* eq_pack({1,1,1}): the flat (passthrough) tilt, as a constant */
 #define EQ_FLAT_EPS 0.001f     /* band gains within +/-0.1% (~0.009 dB) of unity count as flat -> EQ bypassed
@@ -372,33 +373,9 @@ static inline void eq_unpack(uint64_t p, float g[3]) {
     for (int i = 0; i < 3; ++i) g[i] = (float)((p >> (16 * i)) & 0xFFFFu) * (1.f / 65535.f);
 }
 
-/* RBJ Audio-EQ-Cookbook coefficients (a0-normalized, Direct Form I). cw0/alpha are precomputed per
- * filter; g is the linear band gain (A = sqrt(g)). out = {b0,b1,b2,a1,a2}. */
+/* g is the linear band gain (A = sqrt(g)); cw0/alpha are precomputed per filter (see eq_proto). */
 static void eq_coeffs(int type, float cw0, float alpha, float g, float out[5]) {
-    float A = sqrtf(g), b0, b1, b2, a0, a1, a2;
-    if (type == EQ_PEAK) {
-        a0 = 1.f + alpha / A; a1 = -2.f * cw0;        a2 = 1.f - alpha / A;
-        b0 = 1.f + alpha * A; b1 = -2.f * cw0;        b2 = 1.f - alpha * A;
-    } else {
-        float t = 2.f * sqrtf(A) * alpha;
-        if (type == EQ_LOWSHELF) {
-            a0 =  (A + 1) + (A - 1) * cw0 + t;
-            a1 = -2.f * ((A - 1) + (A + 1) * cw0);
-            a2 =  (A + 1) + (A - 1) * cw0 - t;
-            b0 =  A * ((A + 1) - (A - 1) * cw0 + t);
-            b1 =  2.f * A * ((A - 1) - (A + 1) * cw0);
-            b2 =  A * ((A + 1) - (A - 1) * cw0 - t);
-        } else { /* EQ_HIGHSHELF */
-            a0 =  (A + 1) - (A - 1) * cw0 + t;
-            a1 =  2.f * ((A - 1) - (A + 1) * cw0);
-            a2 =  (A + 1) - (A - 1) * cw0 - t;
-            b0 =  A * ((A + 1) + (A - 1) * cw0 + t);
-            b1 = -2.f * A * ((A - 1) + (A + 1) * cw0);
-            b2 =  A * ((A + 1) + (A - 1) * cw0 - t);
-        }
-    }
-    float inv = 1.f / a0;
-    out[0] = b0 * inv; out[1] = b1 * inv; out[2] = b2 * inv; out[3] = a1 * inv; out[4] = a2 * inv;
+    bw_biquad_rbj(type, cw0, alpha, sqrt((double)g), out);
 }
 
 /* (re)start a voice's Doppler delay line clean: clear its ring slice + snap the delay next block, so a
@@ -1162,7 +1139,6 @@ uint32_t rt_source_create(RtCore* c) {
         }
         if (!h) return 0;                   /* nothing to steal (or the destroy didn't enqueue): genuinely full */
     }
-    uint16_t idx = BW_H_IDX(h);             /* priority defaulted to 128 in alloc_handle */
     Cmd cmd = { .type = CMD_SRC_CREATE, .handle = h };
     if (!cmd_push(&c->cmds, &cmd)) {        /* ring full (should never happen): don't leak the slot */
         recycle_handle(c, h);

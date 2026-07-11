@@ -129,7 +129,9 @@ if(BWAUDIO_WITH_ASIO)
     message(FATAL_ERROR "BWAUDIO_WITH_ASIO=ON but no ASIO SDK at ${ASIO_SDK_DIR} (see third_party/README.md)")
   endif()
   enable_language(CXX)
-  set(CMAKE_CXX_STANDARD 14)
+  # C++20 on the DLL: asio_sink.cpp uses designated initializers (ASIO_VT) — MSVC needs /std:c++20 for
+  # those. Target-scoped (not a global set()) so it can't leak into other targets or the vendored SDK.
+  target_compile_features(bwaudio PRIVATE cxx_std_20)
   target_sources(bwaudio PRIVATE
     src/asio_sink.cpp
     ${ASIO_SDK_DIR}/common/asio.cpp

@@ -159,16 +159,16 @@ void steam_reflect_tap(void* ud, float* bus, uint32_t n, const float* lp, const 
 
     /* convolve the mono aux send -> the full ambisonic reflection field (directional early reflections) */
     float* inP[1]  = { (float*)aux };
-    IPLAudioBuffer in  = { 1, (IPLint32)n, inP };
+    IPLAudioBuffer in  = { .numChannels = 1, .numSamples = (IPLint32)n, .data = inP };
     float* ambP[BW_AMBI_CH];
     for (uint32_t k = 0; k < r->ambi_ch; ++k) ambP[k] = r->ambi + (size_t)k * n;
-    IPLAudioBuffer amb = { (IPLint32)r->ambi_ch, (IPLint32)n, ambP };
+    IPLAudioBuffer amb = { .numChannels = (IPLint32)r->ambi_ch, .numSamples = (IPLint32)n, .data = ambP };
     iplReflectionEffectApply(r->refl, &rp, &in, &amb, NULL);   /* NULL mixer: single bed */
 
     /* decode ambisonic -> 26 speakers, world-locked (identity orientation matches the sim's world listener) */
     float* outP[BW_CHANNELS];
     for (uint32_t s = 0; s < BW_CHANNELS; ++s) outP[s] = r->out26 + (size_t)s * n;
-    IPLAudioBuffer o26 = { (IPLint32)BW_CHANNELS, (IPLint32)n, outP };
+    IPLAudioBuffer o26 = { .numChannels = (IPLint32)BW_CHANNELS, .numSamples = (IPLint32)n, .data = outP };
     IPLAmbisonicsDecodeEffectParams dp; memset(&dp, 0, sizeof dp);
     dp.order = (IPLint32)r->order; dp.hrtf = NULL; dp.binaural = IPL_FALSE;
     cs_at(&dp.orientation, (float[3]){ 0.f, 0.f, 0.f });

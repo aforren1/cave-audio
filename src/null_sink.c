@@ -108,7 +108,10 @@ static void null_close(BwSink* base) {
 static const char* null_backend(BwSink* base) { (void)base; return "null"; }
 static uint32_t null_block_size(BwSink* base) { return ((NullSink*)base)->block_size; }
 
-static const BwSinkVtbl NULL_VT = { null_start, null_stop, null_close, null_backend, null_block_size };
+static const BwSinkVtbl NULL_VT = {   /* designated: stop/close share a signature, so a positional swap would be silent */
+    .start = null_start, .stop = null_stop, .close = null_close,
+    .backend = null_backend, .block_size = null_block_size,
+};
 
 BwSink* bw_null_sink_open(uint32_t sample_rate, uint32_t block_size, uint32_t channels,
                           BwRenderFn render, void* user, char* err, size_t errcap) {

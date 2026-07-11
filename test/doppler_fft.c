@@ -14,6 +14,7 @@
  */
 #include "rt.h"
 #include "layout.h"
+#include "fft.h"
 #include "dr_wav.h"
 
 #include <math.h>
@@ -42,29 +43,6 @@ static int write_sine(const char* path, double freq, uint32_t frames) {
     drwav_uint64 w = drwav_write_pcm_frames(&wav, frames, buf);
     free(buf); drwav_uninit(&wav);
     return w == frames;
-}
-
-/* in-place iterative radix-2 FFT */
-static void fft(double* re, double* im, int n) {
-    for (int i = 1, j = 0; i < n; ++i) {
-        int bit = n >> 1;
-        for (; j & bit; bit >>= 1) j ^= bit;
-        j ^= bit;
-        if (i < j) { double t = re[i]; re[i] = re[j]; re[j] = t; t = im[i]; im[i] = im[j]; im[j] = t; }
-    }
-    for (int len = 2; len <= n; len <<= 1) {
-        double ang = -2.0 * M_PI / len, wr = cos(ang), wi = sin(ang);
-        for (int i = 0; i < n; i += len) {
-            double cr = 1.0, ci = 0.0;
-            for (int k = 0; k < len / 2; ++k) {
-                double a = i + k, b = i + k + len / 2;
-                double vr = re[(int)b] * cr - im[(int)b] * ci, vi = re[(int)b] * ci + im[(int)b] * cr;
-                re[(int)b] = re[(int)a] - vr; im[(int)b] = im[(int)a] - vi;
-                re[(int)a] += vr; im[(int)a] += vi;
-                double nr = cr * wr - ci * wi; ci = cr * wi + ci * wr; cr = nr;
-            }
-        }
-    }
 }
 
 int main(int argc, char** argv) {
@@ -106,7 +84,7 @@ int main(int argc, char** argv) {
 
     /* Hann window + FFT */
     for (int i = 0; i < FFTN; ++i) { double w = 0.5 * (1.0 - cos(2.0 * M_PI * i / (FFTN - 1))); re[i] *= w; im[i] = 0.0; }
-    fft(re, im, FFTN);
+    fft(re, im, FFTN, +1);
 
     int half = FFTN / 2;
     double binhz = (double)SR / FFTN;

@@ -161,8 +161,8 @@ void steam_monitor_process(SteamMonitor* m, const float* bus26, const float p[3]
     for (uint32_t k = 0; k < BW_AMBI_CH; ++k) ambiPtrs[k] = m->ambi + (size_t)k * n;
     IPLfloat32* outPtrs[2] = { out, out + n };
 
-    IPLAudioBuffer inBuf  = { (IPLint32)BW_AMBI_CH, (IPLint32)n, ambiPtrs };
-    IPLAudioBuffer outBuf = { 2, (IPLint32)n, outPtrs };
+    IPLAudioBuffer inBuf  = { .numChannels = (IPLint32)BW_AMBI_CH, .numSamples = (IPLint32)n, .data = ambiPtrs };
+    IPLAudioBuffer outBuf = { .numChannels = 2, .numSamples = (IPLint32)n, .data = outPtrs };
 
     IPLAmbisonicsDecodeEffectParams params = { 0 };
     params.order = BW_AMBI_ORDER;

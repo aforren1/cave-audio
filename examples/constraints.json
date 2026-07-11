@@ -1,15 +1,16 @@
 {
-  "comment": "Placement constraints for bw_layout_tool (copy next to your cave_layout.json and run the tool there). Room space, metres, origin = floor centre, +Y up (the floor is y=0; the observer's ears are ~1.4 m up). 'bounds' = the allowed box (speakers must be inside). 'nogo' = boxes speakers must stay OUT of (screens, structure, the CAVE interior). 'obstacles' = SOLID occluders (projectors, beams): a speaker can't be inside one NOR in its acoustic shadow — a box on the line from the speaker to the ears blocks its sound. 'label' is ignored by the loader.",
+  "comment": "Placement constraints for bw_layout_tool (copy next to cave_layout.json and run the tool there). Room space, metres, origin = FLOOR CENTRE, +Y up, +Z forward (toward the far / main-screen wall); observer ears ~1.4 m up. From the overhead plan (imperial callouts x 25.4 mm/in). AXIS MAP: X is the LONG axis = 163-7/16 in (4.151 m); Z = 146-7/16 in (3.720 m); Y = 97-3/4 in (2.483 m) structure height. 'bounds' = speaker truss. 'nogo' = CAVE screen cube (screens + observer; speakers go BEHIND, in the truss<->screen gap: ~0.60 m/side in X, ~0.40 m/side in Z). 'obstacles' = the four 522x494x198 mm projectors, Y CENTRED ON THE STRUCTURE TOP (2.483 m) per note, so each spans y 2.384..2.582. PROJECTOR X/Z CENTRES ARE APPROXIMATE: the plan locates a central overhead cluster but the four centres could not be uniquely resolved, so they are a plausible non-overlapping 2x2 at +/-0.65 m - nudge each in the tool (or send the four centres for an exact drop-in). Building wall is >= 28-11/16 in (0.729 m) beyond the truss, so 'bounds' is the mount line, not the wall. 'label' is ignored by the loader.",
 
-  "bounds": { "min": [-4.0, 0.0, -4.0], "max": [4.0, 4.5, 4.0], "label": "room shell around the CAVE" },
+  "bounds": { "min": [-2.076, 0.0, -1.860], "max": [2.076, 2.483, 1.860], "label": "speaker truss: 163-7/16 in (X) x 146-7/16 in (Z) x 97-3/4 in tall (Y); wall >=0.729 m beyond" },
 
   "nogo": [
-    { "min": [-2.0, 0.0, -2.0], "max": [2.0, 4.0, 2.0], "label": "CAVE interior 4x4x4 cube (observer + screens; speakers go BEHIND the screens)" }
+    { "min": [-1.480, 0.0, -1.464], "max": [1.480, 2.483, 1.464], "label": "CAVE screen cube 116-9/16 (X) x 115-5/16 in (Z) full height: screens + observer; speakers go behind" }
   ],
 
   "obstacles": [
-    { "min": [-0.35, 3.9, -0.35], "max": [0.35, 4.3, 0.35], "label": "ceiling projector (throws down the floor screen)" },
-    { "min": [2.6, 1.8, -0.4], "max": [3.2, 2.4, 0.4], "label": "+x wall projector" },
-    { "min": [-0.4, 1.8, 2.6], "max": [0.4, 2.4, 3.2], "label": "+z wall projector" }
+    { "min": [0.389, 2.384, 0.403], "max": [0.911, 2.582, 0.897], "label": "projector 1 (522x494x198 mm; Y bisected by structure top) - X/Z centre APPROX, verify" },
+    { "min": [-0.911, 2.384, 0.403], "max": [-0.389, 2.582, 0.897], "label": "projector 2 (522x494x198 mm; Y bisected by structure top) - X/Z centre APPROX, verify" },
+    { "min": [0.389, 2.384, -0.897], "max": [0.911, 2.582, -0.403], "label": "projector 3 (522x494x198 mm; Y bisected by structure top) - X/Z centre APPROX, verify" },
+    { "min": [-0.911, 2.384, -0.897], "max": [-0.389, 2.582, -0.403], "label": "projector 4 (522x494x198 mm; Y bisected by structure top) - X/Z centre APPROX, verify" }
   ]
 }
