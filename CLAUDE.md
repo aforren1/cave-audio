@@ -97,8 +97,8 @@ ctest --test-dir build -C RelWithDebInfo      # runs the full test suite (test_*
 ```
 
 **Current state (M6 + occlusion):** builds `bwaudio.dll` + the test suite (sixteen ctests with the Steam
-Audio SDK, twelve without; +`calib_view` with `BWAUDIO_BUILD_CALIBVIEW`, +`layout_tool` with
-`BWAUDIO_BUILD_PLAYGROUND`). `rt.c` is the concurrency spine
+Audio SDK, twelve without; +`calib_view` with `BWAUDIO_BUILD_CALIBVIEW`, +`layout_tool` and
++`playground` with `BWAUDIO_BUILD_PLAYGROUND`). `rt.c` is the concurrency spine
 (two SPSC rings, voice + sound tables, commit snapshot, generation handles) + retire-ack;
 the whole `bw_*` API forwards to it. `sound.c` decodes wav (dr_wav) and `mix_voice` plays
 `sound->pcm` with a gain ramp. Spatialization is real: `layout.c` loads the surveyed
@@ -111,13 +111,16 @@ any driver buffer size works); `bw_audio_backend()` reports the device actually 
 **`natnet.c` is M6: an off-wire NatNet (OptiTrack) FrameOfData parser + a seqlock pose handoff
 (`pose.h`); with `track_internal` the audio thread samples the freshest head pose at block
 time** (`rt_set_tracker`), configured via `BWAUDIO_NATNET_*` env (see docs/api.md). An
-interactive **raylib playground** (`examples/playground.c`, opt-in `-DBWAUDIO_BUILD_PLAYGROUND=ON`)
+interactive **playground** (`examples/playground.cpp`, opt-in `-DBWAUDIO_BUILD_PLAYGROUND=ON`)
 auditions binaural by ear across six feature **scenes** (TAB): localization (with a SPACE auto-move
 sweep), occlusion+materials, directivity, a channel-walk speaker check, a **blind A/B/X** harness
 (X is secretly A or B over one live knob — dual-band, DBAP vs SPCAP/VBAP, spread, air absorption —
 answer over N trials and a one-sided binomial p-value says whether the difference is genuinely
 audible, not just "sounds different to me"), and a reverb-bed room (which
-rebuilds the engine on entry/exit, since the bed + room geometry are load-time). **`bw_test_signal(channel, kind, gain)`** drives one
+rebuilds the engine on entry/exit, since the bed + room geometry are load-time). Its 3D scene shades
+each speaker gizmo by that channel's live output level (`bw_get_bus_levels`, mirrored as a meter
+strip in the panel), and with no ASIO device the engine falls back to the null sink and keeps
+rendering — visual-only mode is live, just silent. **`bw_test_signal(channel, kind, gain)`** drives one
 raw output channel with a 660 Hz sine/noise injected after align (`rt.c`) — a speaker-check / wiring
 tool, not a spatial path. The **production Steam Audio HRTF decode** is built + smoke-tested:
 `ambisonics.c` (3rd-order encode) → `steam_decode.c` (phonon `iplAmbisonicsDecodeEffect`), gated
@@ -238,10 +241,17 @@ open source, NOT MIT — see its LICENSE.txt). **`bw_layout_tool`** (`examples/l
 a *scene*, not a plot — while every control surface (panel/HUD/tooltips) is imgui with the station
 theme, and the same `--tests` harness runs it under ctest (`layout_tool`: logic round-trips, panel
 fake-input edits, save/reload, score/optimize, full-frame screenshots via a before-swap GL read).
-Raylib input handlers gate on `io.WantCapture*`. Only `bw_playground` remains raylib-only (raygui is
-gone from the repo). Test-ref gotchas the code comments document: a `**/` wildcard hashes its LAST
+Raylib input handlers gate on `io.WantCapture*`. **`bw_playground` is on the same rlImGui stack**
+(control panel + live output meters in imgui; the 3D scene stays raylib; raygui is gone from the
+repo), with its own `--tests` suite under ctest (`playground`: p-value/signal logic, panel
+fake-input edits, a scene cycle that rebuilds the engine across the reverb boundary, and
+`meters_live` — the suite forces `BWAUDIO_SINK=null` and asserts the engine STAYS LIVE with no
+audio device, pinning the null-sink fallback the tool's visual-only mode depends on). Test-ref
+gotchas the code comments document: a `**/` wildcard hashes its LAST
 segment as a literal string (use a plain window-relative path for `$$int` component refs, e.g.
-DragFloat3 = `"pos/$$0"`), and bare `CaptureScreenshot()` needs `CaptureReset()` between shots.
+DragFloat3 = `"pos/$$0"`), and bare `CaptureScreenshot()` needs `CaptureReset()` between shots;
+test-engine synthetic input drives imgui only — raylib key polls (`kp`/`kd`) never see it, so UI
+tests must go through panel widgets (or call the app's own functions directly).
 **Per-speaker correction filters** (`--eq`) are the "inverse EQ" upgrade to the scalar
 trims: `measure_correction` gates the IR to the direct sound (before the first reflection) and inverts that
 magnitude into a minimum-phase FIR (`calib_eq` → the layout `eq` array → applied per channel in `align.c`,

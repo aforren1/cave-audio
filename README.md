@@ -5,7 +5,7 @@ array over **ASIO → Dante Virtual Soundcard**, with a **binaural HRTF monitor*
 desk-side debugging. Unity and Unreal connect as thin control clients over a C ABI.
 
 > **Status:** implemented through M6 (engine, spatialization, Steam Audio
-> materials/reflections/pathing, tracking, calibration, tooling; 18 ctests).
+> materials/reflections/pathing, tracking, calibration, tooling; 19 ctests).
 > Remaining: hardware verification at the rig. `include/bwaudio.h` is the
 > authoritative contract.
 
@@ -141,14 +141,17 @@ mis-correcting the array.
 
 ![bw_playground](docs/img/playground.png)
 
-Binaural monitor on headphones (auto-picked 2-ch ASIO driver; visual-only without
-one). Scenes: localization, occlusion + materials, directivity, channel walk,
+Binaural monitor on headphones (auto-picked 2-ch ASIO driver; without one the
+engine falls back to the null sink and keeps rendering — visual-only, live, just
+silent). Scenes: localization, occlusion + materials, directivity, channel walk,
 reverb bed, and a blind A/B/X comparison over single engine knobs (dual-band,
-panner choice, spread, air absorption) scored with a binomial p-value. A
+panner choice, spread, air absorption) scored with a binomial p-value. The 3D
+speakers shade by their live output level (mirrored as a meter strip in the
+panel), so you can watch the panner drive the array even with no audio device. A
 `constraints.json` next to the exe is drawn for orientation — the same room
 boxes the layout tool edits against.
 
-The imgui tools run their UI test suites under ctest (`--tests`); screenshots
+All three GUI tools run their UI test suites under ctest (`--tests`); screenshots
 above are from those runs.
 
 ## Platform & licensing

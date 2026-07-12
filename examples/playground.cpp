@@ -1,9 +1,17 @@
 /*
- * playground.c — interactive raylib harness for bwaudio's binaural monitor, split into SCENES,
+ * playground.cpp — interactive harness for bwaudio's binaural monitor, split into SCENES,
  * each auditioning one feature by ear on headphones (the binaural profile, output through a 2-ch
- * ASIO driver the engine auto-picks — ASIO4ALL / FlexASIO / the Steinberg built-in). This is the
+ * ASIO driver the engine auto-picks — ASIO4ALL / FlexASIO / the Steinberg built-in; without one the
+ * engine falls back to the offline null sink and everything still renders, just silent). This is the
  * by-ear evaluation the automated tests can't do. Public C ABI only (bwaudio.h); raylib's raymath
  * provides the vector/quaternion math.
+ *
+ * UI stack: the 3D scene (speakers with live level shading, source, head, room) stays raylib; every
+ * control surface is Dear ImGui via rlImGui, themed like the station (bw_theme.h) — the same split
+ * as bw_layout_tool. imgui_test_engine drives the ACTUAL panel with fake inputs under ctest
+ * (`--tests [filter]`, forced onto the null sink for determinism), captures screenshots to
+ * output/captures/, and exits pass/fail. Keyboard shortcuts act only when imgui doesn't want the
+ * keyboard; the camera only drags when the cursor isn't over the UI (io.WantCapture*).
  *
  * Scenes (cycle with TAB):
  *   1 Localization      — pure listener-relative DBAP. Move a source, turn your head, switch the
@@ -41,14 +49,22 @@
 #include "bwaudio.h"
 #include "raylib.h"
 #include "raymath.h"
-#include "ui_text.h"        /* crisp HUD text; ui_text() supersedes raylib's DrawText() */
+#include "rlgl.h"           /* rlDrawRenderBatchActive: flush the 3D batch before a screenshot */
 #include "speaker_gizmo.h"  /* the "real speaker" glyph (cabinet + cone aimed at the listener) */
 #include "constraints_view.h"  /* constraints.json boxes, drawn for orientation (same view as the layout tool) */
 #include "axes_hud.h"       /* screen-corner XYZ triad, shared with the layout tool */
 
+#include "imgui.h"
+#include "rlImGui.h"
+#include "bw_theme.h"       /* station theme + embedded Roboto (applyTheme / loadEmbeddedFont / uiScaled) */
+#include "imgui_te_engine.h"
+#include "imgui_te_context.h"
+#include "imgui_te_ui.h"
+
 #define DR_WAV_IMPLEMENTATION
 #include "dr_wav.h"
 
+#include <float.h>
 #include <math.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -133,7 +149,7 @@ static int seg_plane(Vector3 a, Vector3 b, Vector3 c, Vector3 n, float* t, Vecto
     return 1;
 }
 static void wall_basis(Vector3 n, Vector3* u, Vector3* v) {
-    Vector3 up = (fabsf(n.y) > 0.9f) ? (Vector3){ 1, 0, 0 } : (Vector3){ 0, 1, 0 };
+    Vector3 up = (fabsf(n.y) > 0.9f) ? Vector3{ 1, 0, 0 } : Vector3{ 0, 1, 0 };
     *u = Vector3Normalize(Vector3CrossProduct(up, n));
     *v = Vector3CrossProduct(n, *u);
 }
@@ -167,6 +183,12 @@ static float   head_yaw, source_yaw;
 static int     cur_sig;
 static int     highlight_spk = -1;          /* a scene may highlight one speaker each frame; reset per frame */
 
+/* keyboard/mouse gating: scene shortcuts act only when imgui doesn't want the device (set per frame
+ * from io.WantCapture*; kp/kd wrap raylib so every scene handler is gated without touching them). */
+static bool g_kb = true, g_ms = true;
+static bool kp(int k) { return g_kb && IsKeyPressed(k); }
+static bool kd(int k) { return g_kb && IsKeyDown(k); }
+
 /* wall + materials (occlusion scene) */
 static Vector3       wall_c = { 0.0f, 1.2f, -2.2f };   /* standing on the floor: spans y 0..2.4, blocks the ear line */
 static const Vector3 wall_n = { 0, 0, 1 };
@@ -189,8 +211,11 @@ static const char* dir_names[] = { "omni", "cardioid", "figure-8" };
 static int         cur_dir = 1;                  /* default cardioid so the effect is audible on entry */
 static float       dir_gain = 1.0f;
 
-/* channel-walk scene */
+/* channel-walk scene. chan_active/chan_kind are the REQUESTED state (keys or panel write them);
+ * chan_update applies any change once per frame (old channel off, new on), so both input paths share
+ * the same off/on switch. chan_applied = -1 marks "nothing driven yet" (scene entry re-applies). */
 static int   chan_active, chan_kind = BW_TEST_SINE, chan_auto;
+static int   chan_applied = -1, chan_kind_applied = BW_TEST_SINE;
 static float chan_timer;
 
 /* camera (shared) */
@@ -226,8 +251,8 @@ static void draw_speakers(int hi) {
         float lv = db <= -60.0f ? 0.0f : (db >= 0.0f ? 1.0f : 1.0f + db / 60.0f);
         spk_lv[k] = lv > spk_lv[k] ? lv : spk_lv[k] + (lv - spk_lv[k]) * rel;
         float t = spk_lv[k];
-        Color col = (k == hi) ? (Color){ 120, 240, 140, 255 }   /* a scene's explicit highlight wins */
-                              : (Color){ (unsigned char)(120 + t * 125.0f),   /* idle gray -> driven amber */
+        Color col = (k == hi) ? Color{ 120, 240, 140, 255 }   /* a scene's explicit highlight wins */
+                              : Color{ (unsigned char)(120 + t * 125.0f),   /* idle gray -> driven amber */
                                          (unsigned char)(120 + t *  85.0f),
                                          (unsigned char)(140 - t *  60.0f), 255 };
         draw_speaker_gizmo(speakers[k], g_head,                 /* cones aim at the head (the array centroid) */
@@ -236,8 +261,8 @@ static void draw_speakers(int hi) {
 }
 static void draw_head(Quaternion q) {
     /* ear/nose axes from the ABI's room-frame identity basis (bwaudio.h BW_ROOM_*) */
-    Vector3 right = Vector3RotateByQuaternion((Vector3){ BW_ROOM_RIGHT[0], BW_ROOM_RIGHT[1], BW_ROOM_RIGHT[2] }, q);
-    Vector3 fwd   = Vector3RotateByQuaternion((Vector3){ BW_ROOM_AHEAD[0], BW_ROOM_AHEAD[1], BW_ROOM_AHEAD[2] }, q);
+    Vector3 right = Vector3RotateByQuaternion(Vector3{ BW_ROOM_RIGHT[0], BW_ROOM_RIGHT[1], BW_ROOM_RIGHT[2] }, q);
+    Vector3 fwd   = Vector3RotateByQuaternion(Vector3{ BW_ROOM_AHEAD[0], BW_ROOM_AHEAD[1], BW_ROOM_AHEAD[2] }, q);
     DrawSphere(g_head, 0.16f, SKYBLUE);
     DrawSphere(Vector3Add(g_head, Vector3Scale(right,  0.17f)), 0.055f, RED);       /* right ear -> audio R */
     DrawSphere(Vector3Add(g_head, Vector3Scale(right, -0.17f)), 0.055f, RAYWHITE);  /* left ear  -> audio L */
@@ -264,26 +289,26 @@ static void loc_enter(void)  {
     bw_set_dual_band(e, loc_dual);
 }
 static void loc_update(float dt) {
-    if (IsKeyPressed(KEY_SPACE)) { loc_auto = !loc_auto; if (loc_auto) { loc_flyby = 0; loc_t = 0.0f; loc_trail_len = 0; } }
-    if (IsKeyPressed(KEY_X))     { loc_flyby = !loc_flyby; if (loc_flyby) { loc_auto = 0; loc_fly_t = 0.0f; loc_trail_len = 0; } }
-    if (IsKeyPressed(KEY_V)) { loc_dop = !loc_dop; bw_source_set_doppler(e, src, loc_dop); }
-    if (IsKeyPressed(KEY_B)) { loc_air = !loc_air; bw_source_set_air_absorption(e, src, loc_air); }
-    if (IsKeyPressed(KEY_C)) {                            /* cycle source size: point -> .4 -> .7 -> wide -> point */
+    if (kp(KEY_SPACE)) { loc_auto = !loc_auto; if (loc_auto) { loc_flyby = 0; loc_t = 0.0f; loc_trail_len = 0; } }
+    if (kp(KEY_X))     { loc_flyby = !loc_flyby; if (loc_flyby) { loc_auto = 0; loc_fly_t = 0.0f; loc_trail_len = 0; } }
+    if (kp(KEY_V)) { loc_dop = !loc_dop; bw_source_set_doppler(e, src, loc_dop); }
+    if (kp(KEY_B)) { loc_air = !loc_air; bw_source_set_air_absorption(e, src, loc_air); }
+    if (kp(KEY_C)) {                            /* cycle source size: point -> .4 -> .7 -> wide -> point */
         loc_spread = (loc_spread < 0.05f) ? 0.4f : (loc_spread < 0.5f) ? 0.7f : (loc_spread < 0.85f) ? 1.0f : 0.0f;
         bw_source_set_spread(e, src, loc_spread);
     }
-    if (IsKeyPressed(KEY_M)) { loc_dual = !loc_dual; bw_set_dual_band(e, loc_dual); }   /* dual-band A/B */
+    if (kp(KEY_M)) { loc_dual = !loc_dual; bw_set_dual_band(e, loc_dual); }   /* dual-band A/B */
     if (loc_flyby) {                                      /* fast straight pass 0.8 m in front: the Doppler demo */
         loc_fly_t += dt;
         float period = 3.6f, u = fmodf(loc_fly_t, period) / period;     /* there-and-back, ~7.8 m/s */
         float x = (u < 0.5f) ? (-7.0f + 28.0f * u) : (7.0f - 28.0f * (u - 0.5f));
-        source_pos = (Vector3){ x, g_head.y, 0.8f };
+        source_pos = Vector3{ x, g_head.y, 0.8f };
     } else if (loc_auto) {
         loc_t += dt;
         float az = 0.62f * loc_t;                         /* circle the listener   (~10 s / orbit) */
         float r  = 2.0f + 1.2f * sinf(0.90f * loc_t);     /* near <-> far  0.8..3.2 (~7 s) */
         float y  = 1.2f  * sinf(1.14f * loc_t);           /* low  <-> high +/-1.2 about ear height (~5.5 s) */
-        source_pos = (Vector3){ r * cosf(az), g_head.y + y, r * sinf(az) };
+        source_pos = Vector3{ r * cosf(az), g_head.y + y, r * sinf(az) };
     }
     if (loc_auto || loc_flyby) {
         if (loc_trail_len < LOC_TRAIL) loc_trail[loc_trail_len++] = source_pos;
@@ -295,25 +320,12 @@ static void loc_update(float dt) {
 static void loc_draw3d(void) {
     if (loc_auto) {
         for (int i = 1; i < loc_trail_len; ++i)           /* fading trail of the swept path */
-            DrawLine3D(loc_trail[i - 1], loc_trail[i], (Color){ 90, 220, 90, (unsigned char)(40 + 180 * i / loc_trail_len) });
-        DrawLine3D(source_pos, (Vector3){ source_pos.x, 0, source_pos.z }, (Color){ 90, 220, 90, 60 }); /* height drop line */
+            DrawLine3D(loc_trail[i - 1], loc_trail[i], Color{ 90, 220, 90, (unsigned char)(40 + 180 * i / loc_trail_len) });
+        DrawLine3D(source_pos, Vector3{ source_pos.x, 0, source_pos.z }, Color{ 90, 220, 90, 60 }); /* height drop line */
     }
-    DrawLine3D(g_head, source_pos, (Color){ 90, 220, 90, 220 });
+    DrawLine3D(g_head, source_pos, Color{ 90, 220, 90, 220 });
     DrawSphere(source_pos, 0.18f, RED);
 }
-static void loc_hud(int y) {
-    ui_text(TextFormat("[SPACE] auto-move %s   signal [1-4]: %s   (broadband + sharp onsets localise best)",
-                        loc_auto ? "ON - orbit + near/far + high/low" : "off", SIG_NAMES[cur_sig]),
-             12, y, 15, (Color){ 110, 200, 255, 255 });
-    ui_text(TextFormat("source (%.2f, %.2f, %.2f)   head %.0f deg%s",
-                        source_pos.x, source_pos.y, source_pos.z, head_yaw * 57.2958f,
-                        (loc_auto || loc_flyby) ? "   (WASD paused while auto-move runs)" : ""),
-             12, y + 22, 15, (Color){ 200, 200, 210, 255 });
-    ui_text(TextFormat("propagation:  [V] Doppler %s   [B] air absorption %s   [X] fast flyby %s   [C] size %.0f%%   [M] dual-band %s",
-                        loc_dop ? "ON" : "off", loc_air ? "ON" : "off", loc_flyby ? "ON" : "off", loc_spread * 100.0f, loc_dual ? "ON (LF amp)" : "off"),
-             12, y + 44, 15, (Color){ 150, 225, 150, 255 });
-}
-
 /* ====================== Scene 2: Occlusion & Materials (real Steam Audio) ====================== */
 static void occ_enter(void) {
     bw_source_set_gain(e, src, SRC_GAIN);
@@ -322,13 +334,13 @@ static void occ_enter(void) {
 }
 static void occ_update(float dt) {
     float mv = 2.5f * dt;
-    if (IsKeyDown(KEY_LEFT_BRACKET) || IsKeyDown(KEY_RIGHT_BRACKET)) {
-        wall_c = Vector3Add(wall_c, Vector3Scale(wall_n, IsKeyDown(KEY_LEFT_BRACKET) ? -mv : mv));
+    if (kd(KEY_LEFT_BRACKET) || kd(KEY_RIGHT_BRACKET)) {
+        wall_c = Vector3Add(wall_c, Vector3Scale(wall_n, kd(KEY_LEFT_BRACKET) ? -mv : mv));
         push_wall_mesh(mats[cur_mat]);
     }
-    if (IsKeyPressed(KEY_M)) { cur_mat = (cur_mat + 1) % NMAT; push_wall_mesh(mats[cur_mat]); }
-    if (IsKeyPressed(KEY_T)) refl_audible = !refl_audible;
-    if (IsKeyPressed(KEY_G)) { occ_audible = !occ_audible; bw_source_set_occlusion(e, src, occ_audible); }
+    if (kp(KEY_M)) { cur_mat = (cur_mat + 1) % NMAT; push_wall_mesh(mats[cur_mat]); }
+    if (kp(KEY_T)) refl_audible = !refl_audible;
+    if (kp(KEY_G)) { occ_audible = !occ_audible; bw_source_set_occlusion(e, src, occ_audible); }
 
     /* reflection: the source mirrored across the wall is valid when source + listener are on the same
      * side and the bounce lands on the panel. occlusion: the direct path crosses the panel. */
@@ -350,31 +362,17 @@ static void occ_update(float dt) {
 }
 static void occ_draw3d(void) {
     draw_wall(wall_c, wall_u, wall_v, wall_hw, wall_hh,
-              (Color){ 90, 110, 140, 90 }, (Color){ 150, 180, 220, 255 });
-    DrawLine3D(g_head, source_pos, occ_occluded ? (Color){ 230, 70, 70, 255 } : (Color){ 90, 220, 90, 220 });
+              Color{ 90, 110, 140, 90 }, Color{ 150, 180, 220, 255 });
+    DrawLine3D(g_head, source_pos, occ_occluded ? Color{ 230, 70, 70, 255 } : Color{ 90, 220, 90, 220 });
     DrawSphere(source_pos, 0.18f, RED);
     if (occ_refl_valid) {
         DrawLine3D(source_pos, occ_refl_pt, ORANGE);
         DrawLine3D(occ_refl_pt, g_head, ORANGE);
         DrawSphere(occ_refl_pt, 0.06f, ORANGE);
-        DrawSphere(occ_image, 0.14f, (Color){ 230, 160, 60, 130 });
-        DrawLine3D(occ_image, occ_refl_pt, (Color){ 230, 160, 60, 80 });
+        DrawSphere(occ_image, 0.14f, Color{ 230, 160, 60, 130 });
+        DrawLine3D(occ_image, occ_refl_pt, Color{ 230, 160, 60, 80 });
     }
 }
-static void occ_hud(int y) {
-    ui_text(TextFormat("[ ] slide wall   M material: %s (refl %.0f%%)   T reflection %s   G occlusion %s",
-                        mat_names[cur_mat], mat_refl[cur_mat] * 100.0f,
-                        refl_audible ? "ON" : "off", occ_audible ? "ON" : "off"),
-             12, y, 15, (Color){ 110, 200, 255, 255 });
-    ui_text(TextFormat("%s   (occlusion %.0f%% audible)",
-                        occ_refl_valid ? "in FRONT: REFLECTING - audible image source" :
-                        (occ_occluded ? "BEHIND: OCCLUDED - Steam Audio attenuates + tilts by material"
-                                      : "wall: clear line of sight"),
-                        occ_factor * 100.0f),
-             12, y + 22, 15, occ_refl_valid ? ORANGE
-                           : (occ_occluded ? (Color){ 245, 140, 140, 255 } : (Color){ 200, 200, 210, 255 }));
-}
-
 /* ============================= Scene 3: Directivity (weighted dipole) ============================= */
 static void dir_enter(void) {
     bw_source_set_gain(e, src, SRC_GAIN);
@@ -382,17 +380,17 @@ static void dir_enter(void) {
 }
 static void dir_update(float dt) {
     float rt = 1.8f * dt;
-    if (IsKeyPressed(KEY_Z)) { cur_dir = (cur_dir + 1) % 3; bw_source_set_directivity_preset(e, src, (BwDirectivity)cur_dir); }
-    if (IsKeyDown(KEY_COMMA))  source_yaw += rt;
-    if (IsKeyDown(KEY_PERIOD)) source_yaw -= rt;
-    Quaternion sq = QuaternionFromAxisAngle((Vector3){ 0, 1, 0 }, source_yaw);
+    if (kp(KEY_Z)) { cur_dir = (cur_dir + 1) % 3; bw_source_set_directivity_preset(e, src, (BwDirectivity)cur_dir); }
+    if (kd(KEY_COMMA))  source_yaw += rt;
+    if (kd(KEY_PERIOD)) source_yaw -= rt;
+    Quaternion sq = QuaternionFromAxisAngle(Vector3{ 0, 1, 0 }, source_yaw);
     bw_source_set_pos(e, src, source_pos.x, source_pos.y, source_pos.z);
     bw_source_set_gain(e, src, SRC_GAIN);
     bw_source_set_orientation(e, src, sq.x, sq.y, sq.z, sq.w);
     dir_gain = bw_source_get_directivity(e, src);              /* 1 = on-axis/omni .. 0 = null */
 }
 static void dir_draw3d(void) {
-    DrawLine3D(g_head, source_pos, (Color){ 90, 220, 90, 180 });
+    DrawLine3D(g_head, source_pos, Color{ 90, 220, 90, 180 });
     DrawSphere(source_pos, 0.18f, RED);
     /* illustrative horizontal lobe (weighted dipole) pointing the source's aim */
     float w = (cur_dir == 1) ? 0.5f : (cur_dir == 2) ? 1.0f : 0.0f;
@@ -403,17 +401,10 @@ static void dir_draw3d(void) {
         float r = 0.15f + 0.7f * g, wa = source_yaw + a;
         /* source forward = yaw-rotated +z (room convention) */
         Vector3 p = { source_pos.x + r * sinf(wa), source_pos.y, source_pos.z + r * cosf(wa) };
-        if (i > 0) DrawLine3D(prev, p, (Color){ 255, 180, 80, 200 });
+        if (i > 0) DrawLine3D(prev, p, Color{ 255, 180, 80, 200 });
         prev = p;
     }
 }
-static void dir_hud(int y) {
-    ui_text(TextFormat("directivity [Z]: %s   aim with , / .   (%.0f%% on-axis at the listener)",
-                        dir_names[cur_dir], dir_gain * 100.0f), 12, y, 15, (Color){ 110, 200, 255, 255 });
-    ui_text("move/aim the source so its forward points AWAY from the head and hear it drop",
-             12, y + 22, 15, (Color){ 200, 200, 210, 255 });
-}
-
 /* ============================= Scene 4: Channel walk (bw_test_signal) ============================= */
 static void chan_set(int ch) { bw_test_signal(e, (uint32_t)ch, (BwTestKind)chan_kind, TEST_GAIN); }
 static void chan_enter(void) {
@@ -422,30 +413,24 @@ static void chan_enter(void) {
     chan_timer = 0.0f;
     chan_auto  = 0;                             /* start manual each visit (don't resume a prior auto-walk) */
     chan_set(chan_active);
+    chan_applied = chan_active; chan_kind_applied = chan_kind;
 }
 static void chan_update(float dt) {
-    int prev = chan_active;
-    if (IsKeyPressed(KEY_RIGHT)) chan_active = (chan_active + 1) % NSPK;
-    if (IsKeyPressed(KEY_LEFT))  chan_active = (chan_active + NSPK - 1) % NSPK;
-    if (IsKeyPressed(KEY_N))     { chan_kind = (chan_kind == BW_TEST_SINE) ? BW_TEST_NOISE : BW_TEST_SINE; chan_set(chan_active); }
-    if (IsKeyPressed(KEY_SPACE)) chan_auto = !chan_auto;
+    if (kp(KEY_RIGHT)) chan_active = (chan_active + 1) % NSPK;
+    if (kp(KEY_LEFT))  chan_active = (chan_active + NSPK - 1) % NSPK;
+    if (kp(KEY_N))     chan_kind = (chan_kind == BW_TEST_SINE) ? BW_TEST_NOISE : BW_TEST_SINE;
+    if (kp(KEY_SPACE)) chan_auto = !chan_auto;
     if (chan_auto && (chan_timer += dt) >= 0.7f) { chan_timer = 0.0f; chan_active = (chan_active + 1) % NSPK; }
-    if (chan_active != prev) { bw_test_signal(e, (uint32_t)prev, BW_TEST_OFF, 0.0f); chan_set(chan_active); }
+    if (chan_active != chan_applied || chan_kind != chan_kind_applied) {   /* keys OR the panel moved it */
+        if (chan_applied >= 0) bw_test_signal(e, (uint32_t)chan_applied, BW_TEST_OFF, 0.0f);
+        chan_set(chan_active);
+        chan_applied = chan_active; chan_kind_applied = chan_kind;
+    }
     highlight_spk = chan_active;
 }
 static void chan_draw3d(void) {
-    DrawLine3D(g_head, speakers[chan_active], (Color){ 120, 235, 150, 200 });
+    DrawLine3D(g_head, speakers[chan_active], Color{ 120, 235, 150, 200 });
 }
-static void chan_hud(int y) {
-    ui_text(TextFormat("LEFT/RIGHT step channel   N %s   SPACE auto-walk %s",
-                        chan_kind == BW_TEST_SINE ? "sine" : "noise", chan_auto ? "ON" : "off"),
-             12, y, 15, (Color){ 110, 200, 255, 255 });
-    Vector3 p = speakers[chan_active];
-    ui_text(TextFormat("channel %d / %d   %s   speaker (%.2f, %.2f, %.2f)   (binaural: heard from that direction)",
-                        chan_active, NSPK, chan_kind == BW_TEST_SINE ? "660 Hz sine" : "white noise", p.x, p.y, p.z),
-             12, y + 22, 15, (Color){ 200, 200, 210, 255 });
-}
-
 /* ============================= Scene 5: Blind A/B/X ============================= */
 /* Double-blind self test: A and B are two settings of ONE engine knob, X is randomly one of them.
  * Listen to all three freely (every switch is live + click-free: ramped gains / atomic toggles),
@@ -489,62 +474,39 @@ static void abx_apply_listen(void) {
 }
 static void abx_new_trial(void) { abx_x = GetRandomValue(0, 1); abx_listen = 2; abx_apply_listen(); }
 static void abx_reset(void)     { abx_trials = abx_correct = 0; abx_flash_t = 0.0f; abx_new_trial(); }
+/* shared by the key handlers AND the panel buttons, so both paths score identically */
+static void abx_set_listen(int which) { abx_listen = which; abx_apply_listen(); }
+static void abx_answer(int guess) {
+    abx_last_x   = abx_x;
+    abx_flash_ok = (guess == abx_x); abx_correct += abx_flash_ok; ++abx_trials; abx_flash_t = 1.6f;
+    abx_new_trial();                             /* reveal + immediately deal the next X */
+}
 static void abx_enter(void) {
     bw_source_set_gain(e, src, SRC_GAIN);
     abx_orbit = 1; abx_orbit_t = 0.0f;           /* default: slow orbit — motion exposes panner differences */
     abx_new_trial();                             /* keep the tally across visits; only X is redrawn */
 }
 static void abx_update(float dt) {
-    if (IsKeyPressed(KEY_Z)) { abx_listen = 0; abx_apply_listen(); }
-    if (IsKeyPressed(KEY_X)) { abx_listen = 1; abx_apply_listen(); }
-    if (IsKeyPressed(KEY_C)) { abx_listen = 2; abx_apply_listen(); }
-    if (IsKeyPressed(KEY_LEFT) || IsKeyPressed(KEY_RIGHT)) {
-        int guess = IsKeyPressed(KEY_RIGHT) ? 1 : 0;
-        abx_last_x = abx_x;
-        abx_flash_ok = (guess == abx_x); abx_correct += abx_flash_ok; ++abx_trials; abx_flash_t = 1.6f;
-        abx_new_trial();                         /* reveal + immediately deal the next X */
-    }
-    if (IsKeyPressed(KEY_G)) { abx_cmp = (abx_cmp + 1) % NABX; abx_reset(); }   /* new knob -> fresh tally */
-    if (IsKeyPressed(KEY_V)) abx_reset();
-    if (IsKeyPressed(KEY_SPACE)) abx_orbit = !abx_orbit;
+    if (kp(KEY_Z)) abx_set_listen(0);
+    if (kp(KEY_X)) abx_set_listen(1);
+    if (kp(KEY_C)) abx_set_listen(2);
+    if (kp(KEY_LEFT) || kp(KEY_RIGHT)) abx_answer(kp(KEY_RIGHT) ? 1 : 0);
+    if (kp(KEY_G)) { abx_cmp = (abx_cmp + 1) % NABX; abx_reset(); }   /* new knob -> fresh tally */
+    if (kp(KEY_V)) abx_reset();
+    if (kp(KEY_SPACE)) abx_orbit = !abx_orbit;
     if (abx_orbit) {                             /* slow orbit + gentle bob; identical for A/B/X, so it never cues */
         abx_orbit_t += dt;
         float az = 0.45f * abx_orbit_t;
-        source_pos = (Vector3){ 2.2f * cosf(az), g_head.y + 0.5f * sinf(0.31f * abx_orbit_t), 2.2f * sinf(az) };
+        source_pos = Vector3{ 2.2f * cosf(az), g_head.y + 0.5f * sinf(0.31f * abx_orbit_t), 2.2f * sinf(az) };
     }
     if (abx_flash_t > 0.0f) { abx_flash_t -= dt; if (abx_flash_t < 0.0f) abx_flash_t = 0.0f; }
     bw_source_set_pos(e, src, source_pos.x, source_pos.y, source_pos.z);
     bw_source_set_gain(e, src, SRC_GAIN);
 }
 static void abx_draw3d(void) {
-    DrawLine3D(g_head, source_pos, (Color){ 90, 220, 90, 200 });
+    DrawLine3D(g_head, source_pos, Color{ 90, 220, 90, 200 });
     DrawSphere(source_pos, 0.18f, RED);
 }
-static void abx_hud(int y) {
-    const AbxCmp* cm = &abx_cmps[abx_cmp];
-    ui_text(TextFormat("[G] compare: %s   (A = %s, B = %s)   [SPACE] orbit %s",
-                        cm->name, cm->a, cm->b, abx_orbit ? "ON" : "off"),
-             12, y, 15, (Color){ 110, 200, 255, 255 });
-    ui_text(TextFormat("listen:  [Z] A %s   [X] B %s   [C] X %s      answer:  [LEFT] X is A   [RIGHT] X is B   [V] reset",
-                        abx_listen == 0 ? "<--" : "   ", abx_listen == 1 ? "<--" : "   ", abx_listen == 2 ? "<--" : "   "),
-             12, y + 22, 15, (Color){ 235, 235, 120, 255 });
-    if (abx_trials > 0) {
-        double p = abx_pvalue(abx_trials, abx_correct);
-        const char* verdict = (abx_trials < 6)  ? "keep going (need ~6+ trials)"
-                            : (p < 0.05)        ? "DISTINGUISHABLE - you can hear it"
-                                                : "not distinguishable yet (guessing?)";
-        ui_text(TextFormat("score %d/%d   p = %.3f   %s%s", abx_correct, abx_trials, p, verdict,
-                            abx_flash_t > 0.0f ? TextFormat("      last: %s (X was %s)",
-                                                            abx_flash_ok ? "CORRECT" : "wrong",
-                                                            abx_last_x ? "B" : "A") : ""),
-                 12, y + 44, 15, (abx_flash_t > 0.0f) ? (abx_flash_ok ? (Color){ 120, 235, 130, 255 } : (Color){ 245, 140, 140, 255 })
-                                                      : (Color){ 200, 200, 210, 255 });
-    } else {
-        ui_text("listen to A, B, X (switching is seamless - that's the point), then answer. 1-4 picks the signal.",
-                 12, y + 44, 15, (Color){ 200, 200, 210, 255 });
-    }
-}
-
 /* ============================= Scene 6: Reverb bed (static room) ============================= */
 /* The hybrid reverb bed needs reflections configured + the room geometry set BEFORE bw_start (the
  * scene locks once the bed runs), so this scene runs on a SEPARATE engine config — build_engine()
@@ -564,16 +526,16 @@ static void rev_enter(void) {
     bw_reflections_set_gain(e, rev_wet);
 }
 static void rev_update(float dt) {
-    if (IsKeyPressed(KEY_B)) {                     /* A/B the bed decoder: load-time, so rebuild the engine */
+    if (kp(KEY_B)) {                     /* A/B the bed decoder: load-time, so rebuild the engine */
         rev_decoder ^= 1;
         if (e) { bw_stop(e); bw_destroy(e); e = NULL; }
         build_engine(1);
         rev_enter();                               /* re-apply source gain + reflections + wet on the new engine */
     }
-    if (IsKeyPressed(KEY_G)) { rev_on = !rev_on; bw_source_set_reflections(e, src, rev_on); }
-    if (IsKeyPressed(KEY_V)) { rev_dist = !rev_dist; bw_source_set_reflection_distance(e, src, rev_dist); }
-    if (IsKeyDown(KEY_LEFT_BRACKET))  rev_wet = fmaxf(0.0f, rev_wet - 0.7f * dt);
-    if (IsKeyDown(KEY_RIGHT_BRACKET)) rev_wet = fminf(2.0f, rev_wet + 0.7f * dt);
+    if (kp(KEY_G)) { rev_on = !rev_on; bw_source_set_reflections(e, src, rev_on); }
+    if (kp(KEY_V)) { rev_dist = !rev_dist; bw_source_set_reflection_distance(e, src, rev_dist); }
+    if (kd(KEY_LEFT_BRACKET))  rev_wet = fmaxf(0.0f, rev_wet - 0.7f * dt);
+    if (kd(KEY_RIGHT_BRACKET)) rev_wet = fminf(2.0f, rev_wet + 0.7f * dt);
     bw_reflections_set_gain(e, rev_wet);
     source_pos.x = Clamp(source_pos.x, -ROOM_W * 0.5f + 0.5f, ROOM_W * 0.5f - 0.5f); /* keep it inside the room */
     source_pos.y = Clamp(source_pos.y, 0.5f, ROOM_H - 0.5f);                         /* floor-based box: y 0..H */
@@ -582,34 +544,24 @@ static void rev_update(float dt) {
     bw_source_set_gain(e, src, SRC_GAIN);
 }
 static void rev_draw3d(void) {
-    DrawCubeWires((Vector3){ 0, ROOM_H * 0.5f, 0 }, ROOM_W, ROOM_H, ROOM_D, (Color){ 90, 110, 150, 130 });
-    DrawLine3D(g_head, source_pos, (Color){ 90, 220, 90, 200 });
+    DrawCubeWires(Vector3{ 0, ROOM_H * 0.5f, 0 }, ROOM_W, ROOM_H, ROOM_D, Color{ 90, 110, 150, 130 });
+    DrawLine3D(g_head, source_pos, Color{ 90, 220, 90, 200 });
     DrawSphere(source_pos, 0.18f, RED);
 }
-static void rev_hud(int y) {
-    ui_text(TextFormat("[G] reverb %s   [ ] wet %.2f   [B] bed decoder: %s   [V] distance->wet %s   move the source",
-                        rev_on ? "ON (wet)" : "off (dry)", rev_wet, rev_decoder ? "AllRAD" : "sampling",
-                        rev_dist ? "ON (near dry / far wet)" : "off"),
-             12, y, 15, (Color){ 110, 200, 255, 255 });
-    ui_text("8x4x8 m plaster room (Steam Audio bed); clicks [3]/bursts [2] show the tail. SAD vs AllRAD differ most on an IRREGULAR layout",
-             12, y + 22, 15, (Color){ 200, 200, 210, 255 });
-}
-
-/* ---- scene table ---- */
+/* ---- scene table (per-scene panel sections live in draw_panel) ---- */
 typedef struct {
     const char* name;
     void (*enter)(void);
     void (*update)(float dt);
     void (*draw3d)(void);
-    void (*hud)(int y);
 } Scene;
 static const Scene scenes[] = {
-    { "Localization (DBAP)",     loc_enter,  loc_update,  loc_draw3d,  loc_hud  },
-    { "Occlusion & Materials",   occ_enter,  occ_update,  occ_draw3d,  occ_hud  },
-    { "Directivity",             dir_enter,  dir_update,  dir_draw3d,  dir_hud  },
-    { "Channel walk (speaker check)", chan_enter, chan_update, chan_draw3d, chan_hud },
-    { "Blind A/B/X (hear it, prove it)", abx_enter, abx_update, abx_draw3d, abx_hud },
-    { "Reverb bed (static room)", rev_enter,  rev_update,  rev_draw3d,  rev_hud  },
+    { "Localization (DBAP)",     loc_enter,  loc_update,  loc_draw3d  },
+    { "Occlusion & Materials",   occ_enter,  occ_update,  occ_draw3d  },
+    { "Directivity",             dir_enter,  dir_update,  dir_draw3d  },
+    { "Channel walk (speaker check)", chan_enter, chan_update, chan_draw3d },
+    { "Blind A/B/X (hear it, prove it)", abx_enter, abx_update, abx_draw3d },
+    { "Reverb bed (static room)", rev_enter,  rev_update,  rev_draw3d  },
 };
 enum { NSCENE = sizeof scenes / sizeof scenes[0], SCENE_REVERB = NSCENE - 1 };
 static int cur_scene;
@@ -641,7 +593,7 @@ static void build_engine(int with_reverb) {
     backend_name   = bw_audio_backend(e);
     backend_silent = (strncmp(backend_name, "asio", 4) != 0);
     bw_get_speakers(e, (float*)speakers, NSPK);            /* render the geometry the engine pans with */
-    g_head = (Vector3){ 0, 0, 0 };                         /* ear point = array centroid (the engine's own ref) */
+    g_head = Vector3{ 0, 0, 0 };                         /* ear point = array centroid (the engine's own ref) */
     for (int i = 0; i < NSPK; ++i) g_head = Vector3Add(g_head, speakers[i]);
     g_head = Vector3Scale(g_head, 1.0f / NSPK);
     for (int i = 0; i < NSIG; ++i) sounds[i] = bw_load_sound(e, sig_files[i]);
@@ -678,16 +630,306 @@ static void switch_scene(int idx) {
     scenes[idx].enter();
 }
 
+/* ============================== imgui control panel ============================== */
+
+#define PANEL_W 330.0f            /* control panel width (right side), in unscaled UI px */
+static bool show_te_ui = false;   /* imgui_test_engine windows — run the --tests suite interactively */
+
+/* checkbox over an int flag; returns true when toggled (the caller applies the engine side effect) */
+static bool chk(const char* label, int* v) {
+    bool b = *v != 0;
+    if (!ImGui::Checkbox(label, &b)) return false;
+    *v = b ? 1 : 0;
+    return true;
+}
+
+static void draw_panel(void) {
+    const float W = uiScaled(PANEL_W);
+    ImGui::SetNextWindowPos(ImVec2((float)GetScreenWidth() - W - uiScaled(8.0f), uiScaled(8.0f)), ImGuiCond_Always);
+    ImGui::SetNextWindowSize(ImVec2(W, (float)GetScreenHeight() - uiScaled(16.0f)), ImGuiCond_Always);
+    if (!ImGui::Begin("playground", NULL, ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoCollapse)) {
+        ImGui::End(); return;
+    }
+
+    /* scene selector (TAB cycles too; crossing the reverb boundary rebuilds the engine) */
+    ImGui::SetNextItemWidth(-FLT_MIN);
+    if (ImGui::BeginCombo("##scene", scenes[cur_scene].name)) {
+        for (int i = 0; i < NSCENE; ++i)
+            if (ImGui::Selectable(scenes[i].name, i == cur_scene) && i != cur_scene) switch_scene(i);
+        ImGui::EndCombo();
+    }
+    ImGui::TextDisabled("TAB scene  WASD/RF source  Q/E head  F11  ESC");
+
+    /* audio status + live output meters (bw_get_bus_levels -> spk_lv, the same data shading the 3D gizmos) */
+    ImGui::SeparatorText("output");
+    if (backend_silent) ImGui::TextColored(ImVec4(1.00f, 0.45f, 0.45f, 1.0f), "audio: %s - NO SOUND", backend_name);
+    else                ImGui::TextColored(ImVec4(0.45f, 0.92f, 0.55f, 1.0f), "audio: %s", backend_name);
+    if (backend_silent && ImGui::IsItemHovered(ImGuiHoveredFlags_ForTooltip))
+        ImGui::SetTooltip("no ASIO device opened - the offline null sink renders silently\n"
+                          "(set BWAUDIO_ASIO_DRIVER to your headphone driver)");
+    ImGui::PlotHistogram("##meters", spk_lv, NSPK, 0, "speakers 0-25 (60 dB window)", 0.0f, 1.0f,
+                         ImVec2(-FLT_MIN, uiScaled(46.0f)));
+
+    /* the localization signal is global (the 1-4 keys work in every scene) */
+    ImGui::SeparatorText("signal [1-4]");
+    for (int i = 0; i < NSIG; ++i) {
+        if (ImGui::RadioButton(SIG_NAMES[i], cur_sig == i) && cur_sig != i) {
+            cur_sig = i;
+            bw_source_play(e, src,  sounds[i], true);
+            bw_source_play(e, refl, sounds[i], true);
+        }
+    }
+
+    ImGui::SeparatorText(scenes[cur_scene].name);
+    if (cur_scene == 0) {                                 /* Localization */
+        if (chk("auto-move [SPACE]", &loc_auto) && loc_auto) { loc_flyby = 0; loc_t = 0.0f; loc_trail_len = 0; }
+        if (chk("fast flyby [X]", &loc_flyby) && loc_flyby) { loc_auto = 0; loc_fly_t = 0.0f; loc_trail_len = 0; }
+        if (chk("Doppler [V]", &loc_dop))            bw_source_set_doppler(e, src, loc_dop);
+        if (chk("air absorption [B]", &loc_air))     bw_source_set_air_absorption(e, src, loc_air);
+        if (chk("dual-band panning [M]", &loc_dual)) bw_set_dual_band(e, loc_dual);
+        ImGui::SetNextItemWidth(-FLT_MIN);
+        if (ImGui::SliderFloat("##spread", &loc_spread, 0.0f, 1.0f, "size %.2f [C]"))
+            bw_source_set_spread(e, src, loc_spread);
+        ImGui::TextDisabled("source (%.2f, %.2f, %.2f)  head %.0f deg",
+                            source_pos.x, source_pos.y, source_pos.z, head_yaw * 57.2958f);
+        ImGui::TextWrapped("broadband + sharp onsets localise best");
+    } else if (cur_scene == 1) {                          /* Occlusion & Materials */
+        ImGui::SetNextItemWidth(-FLT_MIN);
+        int m = cur_mat;
+        if (ImGui::Combo("##mat", &m, mat_names, NMAT) && m != cur_mat) { cur_mat = m; push_wall_mesh(mats[cur_mat]); }
+        chk("audible reflection [T]", &refl_audible);
+        if (chk("occlusion [G]", &occ_audible)) bw_source_set_occlusion(e, src, occ_audible);
+        ImGui::TextDisabled("[ ] keys slide the wall");
+        if (occ_refl_valid)    ImGui::TextColored(ImVec4(1.00f, 0.70f, 0.30f, 1.0f), "in FRONT: REFLECTING (image source)");
+        else if (occ_occluded) ImGui::TextColored(ImVec4(0.96f, 0.55f, 0.55f, 1.0f), "BEHIND: OCCLUDED (material tilt)");
+        else                   ImGui::TextUnformatted("wall: clear line of sight");
+        ImGui::Text("occlusion %.0f%% audible   material refl %.0f%%", occ_factor * 100.0f, mat_refl[cur_mat] * 100.0f);
+    } else if (cur_scene == 2) {                          /* Directivity */
+        ImGui::SetNextItemWidth(-FLT_MIN);
+        int d = cur_dir;
+        if (ImGui::Combo("##dir", &d, dir_names, 3) && d != cur_dir) {
+            cur_dir = d;
+            bw_source_set_directivity_preset(e, src, (BwDirectivity)cur_dir);
+        }
+        ImGui::SetNextItemWidth(-FLT_MIN);
+        ImGui::SliderAngle("##aim", &source_yaw, -180.0f, 180.0f, "aim %.0f deg [,/.]");
+        ImGui::Text("%.0f%% on-axis at the listener", dir_gain * 100.0f);
+        ImGui::TextWrapped("aim the lobe away from the head and hear it drop");
+    } else if (cur_scene == 3) {                          /* Channel walk */
+        ImGui::SetNextItemWidth(-FLT_MIN);
+        ImGui::SliderInt("##chan", &chan_active, 0, NSPK - 1, "channel %d [LEFT/RIGHT]");
+        if (ImGui::RadioButton("660 Hz sine [N]", chan_kind == BW_TEST_SINE)) chan_kind = BW_TEST_SINE;
+        ImGui::SameLine();
+        if (ImGui::RadioButton("noise", chan_kind == BW_TEST_NOISE)) chan_kind = BW_TEST_NOISE;
+        chk("auto-walk [SPACE]", &chan_auto);
+        Vector3 p = speakers[chan_active];
+        ImGui::TextDisabled("speaker (%.2f, %.2f, %.2f)", p.x, p.y, p.z);
+        ImGui::TextWrapped("binaural: each channel is HRTF'd as its virtual speaker");
+    } else if (cur_scene == 4) {                          /* Blind A/B/X */
+        ImGui::SetNextItemWidth(-FLT_MIN);
+        if (ImGui::BeginCombo("##cmp", abx_cmps[abx_cmp].name)) {   /* names contain '/' — keep them out of test paths */
+            for (int i = 0; i < (int)NABX; ++i)
+                if (ImGui::Selectable(abx_cmps[i].name, i == abx_cmp) && i != abx_cmp) { abx_cmp = i; abx_reset(); }
+            ImGui::EndCombo();
+        }
+        ImGui::TextDisabled("A = %s\nB = %s", abx_cmps[abx_cmp].a, abx_cmps[abx_cmp].b);
+        if (ImGui::RadioButton("A [Z]", abx_listen == 0)) abx_set_listen(0);
+        ImGui::SameLine();
+        if (ImGui::RadioButton("B [X]", abx_listen == 1)) abx_set_listen(1);
+        ImGui::SameLine();
+        if (ImGui::RadioButton("X [C]", abx_listen == 2)) abx_set_listen(2);
+        if (ImGui::Button("X is A [LEFT]"))  abx_answer(0);
+        ImGui::SameLine();
+        if (ImGui::Button("X is B [RIGHT]")) abx_answer(1);
+        if (ImGui::Button("reset tally [V]")) abx_reset();
+        chk("orbit the source [SPACE]", &abx_orbit);
+        if (abx_trials > 0) {
+            double p = abx_pvalue(abx_trials, abx_correct);
+            const char* verdict = (abx_trials < 6) ? "keep going (need ~6+ trials)"
+                                : (p < 0.05)       ? "DISTINGUISHABLE - you can hear it"
+                                                   : "not distinguishable yet (guessing?)";
+            ImGui::Text("score %d/%d   p = %.3f", abx_correct, abx_trials, p);
+            ImGui::TextWrapped("%s", verdict);
+            if (abx_flash_t > 0.0f)
+                ImGui::TextColored(abx_flash_ok ? ImVec4(0.50f, 0.92f, 0.55f, 1.0f) : ImVec4(0.96f, 0.55f, 0.55f, 1.0f),
+                                   "last: %s (X was %s)", abx_flash_ok ? "CORRECT" : "wrong", abx_last_x ? "B" : "A");
+        } else {
+            ImGui::TextWrapped("listen to A, B, X (switching is seamless - that's the point), then answer.");
+        }
+    } else {                                              /* Reverb bed */
+        if (chk("reverb send [G]", &rev_on)) bw_source_set_reflections(e, src, rev_on);
+        ImGui::SetNextItemWidth(-FLT_MIN);
+        ImGui::SliderFloat("##wet", &rev_wet, 0.0f, 2.0f, "wet %.2f  [ ] keys");   /* applied per frame in rev_update */
+        if (chk("distance->wet [V]", &rev_dist)) bw_source_set_reflection_distance(e, src, rev_dist);
+        ImGui::SetNextItemWidth(-FLT_MIN);
+        int dec = rev_decoder;
+        const char* dec_names[2] = { "bed decoder: sampling (SAD)", "bed decoder: AllRAD" };
+        if (ImGui::Combo("##dec", &dec, dec_names, 2) && dec != rev_decoder) {   /* load-time: rebuild the engine */
+            rev_decoder = dec;
+            if (e) { bw_stop(e); bw_destroy(e); e = NULL; }
+            build_engine(1);
+            rev_enter();
+        }
+        ImGui::TextWrapped("8x4x8 m plaster room; clicks/bursts show the tail. SAD vs AllRAD differ most on an irregular layout.");
+    }
+
+    ImGui::Separator();
+    ImGui::Checkbox("test engine", &show_te_ui);
+    ImGui::End();
+}
+
+/* ============================== --tests harness (imgui_test_engine) ============================== */
+
+static ImGuiTestEngine* g_te;
+
+/* test-engine screenshot hook — identical to layout_tool's: read GL_BACK via raylib from PostSwap
+ * (called BEFORE EndDrawing's buffer swap, after flushing the rlgl batch). */
+static bool screen_capture(ImGuiID viewport_id, int x, int y, int w, int h, unsigned int* pixels, void* user) {
+    (void)viewport_id; (void)user;
+    Image img = LoadImageFromScreen();
+    if (!img.data || img.format != PIXELFORMAT_UNCOMPRESSED_R8G8B8A8) { UnloadImage(img); return false; }
+    const unsigned int* srcpx = (const unsigned int*)img.data;
+    for (int row = 0; row < h; ++row)
+        for (int c = 0; c < w; ++c) {
+            int sx = x + c, sy = y + row;
+            unsigned int v = (sx >= 0 && sx < img.width && sy >= 0 && sy < img.height)
+                           ? srcpx[(size_t)sy * img.width + sx] : 0;
+            pixels[(size_t)row * w + c] = v | 0xFF000000u;
+        }
+    UnloadImage(img);
+    return true;
+}
+
+/* engine-liveness helper for the tests: current max output-channel peak (0 while dead or silent) */
+static float meters_max(uint32_t* count_out) {
+    float pk[NSPK] = { 0 };
+    uint32_t n = bw_get_bus_levels(e, pk, NSPK);
+    if (count_out) *count_out = n;
+    float m = 0.0f;
+    for (uint32_t i = 0; i < n; ++i) if (pk[i] > m) m = pk[i];
+    return m;
+}
+
+static void register_tests(ImGuiTestEngine* te) {
+    ImGuiTest* t;
+
+    /* pure-logic checks ride the same suite (the station's pattern) — filterable via --tests logic */
+    t = IM_REGISTER_TEST(te, "logic", "abx_pvalue");
+    t->TestFunc = [](ImGuiTestContext*) {
+        IM_CHECK_LT(fabs(abx_pvalue(6, 6) - 1.0 / 64.0), 1e-9);    /* 6/6 = (1/2)^6 */
+        IM_CHECK_GT(abx_pvalue(6, 3), 0.5);                        /* chance level: not significant */
+        IM_CHECK_LT(abx_pvalue(10, 9), 0.05);                      /* 9/10 clearly is */
+        IM_CHECK_LT(fabs(abx_pvalue(1, 0) - 1.0), 1e-9);           /* >= 0 correct is certain */
+    };
+
+    t = IM_REGISTER_TEST(te, "logic", "signals");
+    t->TestFunc = [](ImGuiTestContext*) {
+        static float buf[SR];                       /* 1 s is plenty for these checks */
+        for (int w = 0; w < NSIG; ++w) {
+            gen_signal(w, buf, SR);
+            float peak = 0, sum = 0;
+            for (uint32_t i = 0; i < SR; ++i) { float a = fabsf(buf[i]); if (a > peak) peak = a; sum += a; }
+            IM_CHECK_GT(peak, 0.05f);               /* every signal produces output */
+            IM_CHECK_LE(peak, 1.0f);                /* and stays in range */
+            if (w == 2) IM_CHECK_LT(sum / SR, 0.05f);   /* the click train is mostly silence */
+        }
+    };
+
+    /* THE regression this harness exists to pin: with no ASIO device (the suite forces
+     * BWAUDIO_SINK=null) the engine must still be LIVE — null-sink fallback rendering in real
+     * time, output meters flowing. A dead engine here once shipped as "visual-only mode". */
+    t = IM_REGISTER_TEST(te, "viewer", "meters_live");
+    t->TestFunc = [](ImGuiTestContext* ctx) {
+        IM_CHECK_STR_EQ(backend_name, "null");      /* fallback engaged; NOT "none" (dead engine) */
+        uint32_t n = 0;
+        float m = 0.0f;
+        for (int tries = 0; tries < 60 && m <= 1e-6f; ++tries) { ctx->Yield(4); m = meters_max(&n); }
+        IM_CHECK_EQ(n, (uint32_t)NSPK);
+        IM_CHECK_GT(m, 1e-4f);                      /* pink noise through DBAP reaches the output bus */
+    };
+
+    t = IM_REGISTER_TEST(te, "viewer", "panel_controls");   /* fake inputs drive the real panel */
+    t->TestFunc = [](ImGuiTestContext* ctx) {
+        ctx->SetRef("playground");
+        ctx->ItemClick("**/pink bursts");
+        IM_CHECK_EQ(cur_sig, 1);
+        ctx->ItemCheck("**/auto-move [SPACE]");
+        IM_CHECK_EQ(loc_auto, 1);
+        ctx->Yield(8);                              /* the orbit moves the source */
+        ctx->CaptureScreenshot();
+        ctx->ItemUncheck("**/auto-move [SPACE]");
+        IM_CHECK_EQ(loc_auto, 0);
+        ctx->ItemClick("**/pink noise");
+        IM_CHECK_EQ(cur_sig, 0);
+    };
+
+    /* every scene enters cleanly; the reverb boundary rebuilds the engine BOTH ways and it stays
+     * live. (switch_scene is called directly: the keyboard path polls raylib, which the test
+     * engine's synthetic input can't reach — the panel path is covered by panel_controls.) */
+    t = IM_REGISTER_TEST(te, "viewer", "scene_cycle");
+    t->TestFunc = [](ImGuiTestContext* ctx) {
+        for (int i = 1; i <= (int)NSCENE; ++i) {
+            int idx = i % NSCENE;
+            switch_scene(idx);
+            IM_CHECK_EQ(cur_scene, idx);
+            ctx->Yield(6);
+            uint32_t n = 0;
+            meters_max(&n);
+            IM_CHECK_EQ(n, (uint32_t)NSPK);         /* engine alive after every switch (incl. rebuilds) */
+        }
+    };
+
+    t = IM_REGISTER_TEST(te, "viewer", "abx_flow");  /* the blind test scores through the panel buttons */
+    t->TestFunc = [](ImGuiTestContext* ctx) {
+        switch_scene(4);
+        ctx->Yield(2);
+        ctx->SetRef("playground");
+        ctx->ItemClick("**/A [Z]");
+        IM_CHECK_EQ(abx_listen, 0);
+        ctx->ItemClick("**/X [C]");
+        IM_CHECK_EQ(abx_listen, 2);
+        int t0 = abx_trials;
+        ctx->ItemClick("**/X is A [LEFT]");
+        ctx->ItemClick("**/X is B [RIGHT]");
+        IM_CHECK_EQ(abx_trials, t0 + 2);
+        double p = abx_pvalue(abx_trials, abx_correct);
+        IM_CHECK(p >= 0.0 && p <= 1.0);
+        ctx->CaptureReset();                        /* else this shot would reuse the previous filename */
+        ctx->CaptureScreenshot();
+        ctx->ItemClick("**/reset tally [V]");
+        IM_CHECK_EQ(abx_trials, 0);
+        switch_scene(0);
+    };
+}
+
+/* ============================== main ============================== */
+
 int main(int argc, char** argv) {
-    /* Sink policy: engine default (try a 2-ch ASIO driver for headphones, fall back to the offline
-     * null sink). The fallback matters: without a device the engine still RENDERS in real time, so
-     * visual-only mode stays live — speaker activity, panning, occlusion — just silent. The HUD's
-     * SILENT banner + backend readout keep the no-audio state loud (we used to force
+    /* --tests [filter]: run the imgui_test_engine suite (logic + the real panel) and exit pass/fail.
+     * The suite forces the offline null sink: deterministic on any machine (no audio device needed),
+     * and it PINS the no-device fallback path — see the meters_live test. */
+    bool selftest = false;
+    char filter[64] = "";
+    for (int i = 1; i < argc; ++i)
+        if (!strcmp(argv[i], "--tests") || !strcmp(argv[i], "--selftest")) {
+            selftest = true;
+            if (i + 1 < argc && argv[i + 1][0] != '-') snprintf(filter, sizeof filter, "%s", argv[i + 1]);
+        }
+    if (selftest) _putenv((char*)"BWAUDIO_SINK=null");
+
+    /* Sink policy (interactive): engine default — try a 2-ch ASIO driver for headphones, fall back
+     * to the offline null sink. The fallback matters: without a device the engine still RENDERS in
+     * real time, so visual-only mode stays live — speaker activity, panning, occlusion — just
+     * silent. The panel's audio line + meters keep the no-audio state loud (we used to force
      * BWAUDIO_SINK=asio here, which left visual-only mode with a dead engine: nothing metered). */
 
-    /* optional surveyed layout: argv[1], else ./cave_layout.json if present, else the default grid */
-    g_layout_path = (argc > 1) ? argv[1] : NULL;
-    if (!g_layout_path) { FILE* lf = fopen("cave_layout.json", "rb"); if (lf) { fclose(lf); g_layout_path = "cave_layout.json"; } }
+    /* optional surveyed layout: argv[1], else ./cave_layout.json if present, else the default grid.
+     * selftest always uses the default grid — the suite must not depend on a machine-local file. */
+    g_layout_path = (!selftest && argc > 1) ? argv[1] : NULL;
+    if (!selftest && !g_layout_path) {
+        FILE* lf = fopen("cave_layout.json", "rb");
+        if (lf) { fclose(lf); g_layout_path = "cave_layout.json"; }
+    }
 
     /* synthesise the localization test signals to wav (the engine loads sounds from file) */
     float* sigbuf = (float*)malloc((size_t)SIGLEN * sizeof(float));
@@ -703,47 +945,83 @@ int main(int argc, char** argv) {
     if (cv_load("constraints.json", &g_con))                  /* orientation only; the layout tool edits against these */
         printf("constraints: bounds + %d no-go + %d obstacle box(es) drawn from ./constraints.json\n", g_con.nnogo, g_con.nobst);
 
-    SetConfigFlags(FLAG_WINDOW_HIGHDPI | FLAG_MSAA_4X_HINT);   /* native pixel density + smooth 3D edges */
-    InitWindow(1000, 700, "bwaudio - binaural playground");
-    SetRandomSeed((unsigned int)time(NULL));                   /* the ABX scene's X draw must not repeat run-to-run */
-    ui_text_init();                                            /* crisp TTF HUD (see ui_text.h) */
-    SetTargetFPS(60);
-    cam = (Camera3D){ .target = { 0, g_head.y, 0 }, .up = { 0, 1, 0 }, .fovy = 55, .projection = CAMERA_PERSPECTIVE };
+    /* No FLAG_WINDOW_HIGHDPI: framebuffer == window pixels keeps rlImGui's scale at 1 so the test
+     * engine's screenshots/scissors stay 1:1; DPI rides the theme's FontScaleMain (layout_tool's pattern). */
+    SetConfigFlags(FLAG_MSAA_4X_HINT | (selftest ? FLAG_WINDOW_UNFOCUSED : 0));
+    InitWindow(1280, 800, "bwaudio - binaural playground");
+    SetExitKey(KEY_NULL);                                     /* ESC handled below (must not quit while typing) */
+    SetRandomSeed(selftest ? 42u : (unsigned int)time(NULL)); /* ABX X-draws: deterministic only under test */
+    SetTargetFPS(selftest ? 0 : 60);                          /* selftest: run the suite unthrottled */
+    g_uiScale = GetWindowScaleDPI().y;
+    if (g_uiScale > 1.01f) SetWindowSize((int)uiScaled(1280), (int)uiScaled(800));
+
+    rlImGuiBeginInitImGui();                                  /* split init: our Roboto must be the default font */
+    ImGuiIO& io = ImGui::GetIO();
+    io.IniFilename = NULL;                                    /* fixed layout; don't scatter imgui.ini */
+    loadEmbeddedFont(io);
+    applyTheme(false);                                        /* the station theme (dark) */
+    rlImGuiEndInitImGui();
+
+    g_te = ImGuiTestEngine_CreateContext();
+    {
+        ImGuiTestEngineIO& teio = ImGuiTestEngine_GetIO(g_te);
+        teio.ConfigVerboseLevel        = ImGuiTestVerboseLevel_Warning;
+        teio.ConfigVerboseLevelOnError = ImGuiTestVerboseLevel_Debug;
+        teio.ConfigLogToTTY            = selftest;            /* ctest: name each test + why it failed */
+        teio.ConfigCaptureEnabled      = true;                /* actually write screenshots (output/captures/) */
+        teio.ConfigRunSpeed            = selftest ? ImGuiTestRunSpeed_Fast : ImGuiTestRunSpeed_Normal;
+        teio.ScreenCaptureFunc         = screen_capture;
+    }
+    ImGuiTestEngine_Start(g_te, ImGui::GetCurrentContext());
+    ImGuiTestEngine_InstallDefaultCrashHandler();
+    register_tests(g_te);
+    if (selftest) ImGuiTestEngine_QueueTests(g_te, ImGuiTestGroup_Tests, filter[0] ? filter : NULL,
+                                             ImGuiTestRunFlags_RunFromCommandLine);
+
+    cam = Camera3D{};
+    cam.target = Vector3{ 0, g_head.y, 0 };
+    cam.up = Vector3{ 0, 1, 0 };
+    cam.fovy = 55;
+    cam.projection = CAMERA_PERSPECTIVE;
     switch_scene(0);
 
-    while (!WindowShouldClose()) {
+    int quit_now = 0, frames = 0, drain = 0;
+    while (!quit_now) {
         float dt = GetFrameTime();
-        if (IsKeyPressed(KEY_F11)) ToggleBorderlessWindowed();   /* fullscreen */
+        g_kb = !io.WantCaptureKeyboard;             /* imgui typing must not trigger scene shortcuts */
+        g_ms = !io.WantCaptureMouse;                /* the panel owns the mouse when hovered */
+        if (WindowShouldClose() || kp(KEY_ESCAPE)) quit_now = 1;
+        if (kp(KEY_F11)) ToggleBorderlessWindowed();
         float mv = 2.5f * dt, rt = 1.8f * dt;
 
         /* ---- global navigation (every scene) ---- */
-        if (IsKeyDown(KEY_W)) source_pos.z += mv;
-        if (IsKeyDown(KEY_S)) source_pos.z -= mv;
-        if (IsKeyDown(KEY_A)) source_pos.x += mv;
-        if (IsKeyDown(KEY_D)) source_pos.x -= mv;
-        if (IsKeyDown(KEY_R)) source_pos.y += mv;
-        if (IsKeyDown(KEY_F)) source_pos.y -= mv;
-        if (IsKeyDown(KEY_Q)) head_yaw += rt;
-        if (IsKeyDown(KEY_E)) head_yaw -= rt;
-        for (int i = 0; i < NSIG; ++i)                        /* 1-4: switch the test signal everywhere */
-            if (IsKeyPressed(KEY_ONE + i)) {
+        if (kd(KEY_W)) source_pos.z += mv;
+        if (kd(KEY_S)) source_pos.z -= mv;
+        if (kd(KEY_A)) source_pos.x += mv;
+        if (kd(KEY_D)) source_pos.x -= mv;
+        if (kd(KEY_R)) source_pos.y += mv;
+        if (kd(KEY_F)) source_pos.y -= mv;
+        if (kd(KEY_Q)) head_yaw += rt;
+        if (kd(KEY_E)) head_yaw -= rt;
+        for (int i = 0; i < NSIG; ++i)              /* 1-4: switch the test signal everywhere */
+            if (kp(KEY_ONE + i)) {
                 cur_sig = i;
                 bw_source_play(e, src,  sounds[i], true);
                 bw_source_play(e, refl, sounds[i], true);
             }
         /* TAB last in this block ON PURPOSE: a reverb-boundary switch REBUILDS the engine (destroys e,
          * src, refl), so all per-source calls above must run against the still-valid engine first. */
-        if (IsKeyPressed(KEY_TAB)) switch_scene((cur_scene + 1) % NSCENE);
+        if (kp(KEY_TAB)) switch_scene((cur_scene + 1) % NSCENE);
 
-        /* arcball camera: right-drag orbits, the wheel zooms */
-        if (IsMouseButtonDown(MOUSE_BUTTON_RIGHT)) {
+        /* arcball camera: right-drag orbits, the wheel zooms — only when imgui doesn't own the mouse */
+        if (g_ms && IsMouseButtonDown(MOUSE_BUTTON_RIGHT)) {
             Vector2 md = GetMouseDelta();
             cam_yaw   -= md.x * 0.005f;
             cam_pitch += md.y * 0.005f;
             if (cam_pitch >  1.5f) cam_pitch =  1.5f;
             if (cam_pitch < -1.5f) cam_pitch = -1.5f;
         }
-        cam_dist -= GetMouseWheelMove() * 0.6f;
+        if (g_ms) cam_dist -= GetMouseWheelMove() * 0.6f;
         if (cam_dist < 1.5f)  cam_dist = 1.5f;
         if (cam_dist > 25.0f) cam_dist = 25.0f;
         cam.position.x = cam.target.x + cam_dist * cosf(cam_pitch) * sinf(cam_yaw);
@@ -753,38 +1031,47 @@ int main(int argc, char** argv) {
         /* ---- per-scene update, then publish the frame ---- */
         highlight_spk = -1;
         scenes[cur_scene].update(dt);
-        Quaternion q = QuaternionFromAxisAngle((Vector3){ 0, 1, 0 }, head_yaw);
+        Quaternion q = QuaternionFromAxisAngle(Vector3{ 0, 1, 0 }, head_yaw);
         bw_set_listener_pose(e, g_head.x, g_head.y, g_head.z, q.x, q.y, q.z, q.w);
         bw_commit(e);
 
         BeginDrawing();
-        ClearBackground((Color){ 25, 25, 30, 255 });
+        ClearBackground(Color{ 24, 24, 27, 255 });  /* matches the theme's WindowBg */
         BeginMode3D(cam);
         DrawGrid(12, 0.5f);
         draw_speakers(highlight_spk);
         scenes[cur_scene].draw3d();
         draw_head(q);
         EndMode3D();
-        draw_axes_hud(cam, 56.f, (float)GetScreenHeight() - 56.f, 30.f);   /* room axes, bottom-left */
+        draw_axes_hud(cam, uiScaled(56.0f), (float)GetScreenHeight() - uiScaled(56.0f), uiScaled(30.0f));
 
-        /* HUD: a dark backing panel + bright ASCII text (raylib's default font has no em-dash/box glyphs).
-         * Scene HUDs use up to three lines from y=52 (the localization scene's propagation line is the
-         * tallest), so the audio-backend line sits below them at y=120 to avoid overlapping. */
-        DrawRectangle(0, 0, GetScreenWidth(), 144, (Color){ 0, 0, 0, 195 });
-        ui_text("[TAB] scene   WASD/RF move source   Q/E head   1-4 signal   right-drag/wheel camera   F11 fullscreen   ESC",
-                 12, 8, 14, RAYWHITE);
-        ui_text(TextFormat("scene %d/%d:  %s", cur_scene + 1, NSCENE, scenes[cur_scene].name),
-                 12, 28, 16, (Color){ 235, 235, 120, 255 });
-        scenes[cur_scene].hud(52);
-        if (backend_silent)
-            ui_text("audio: NULL sink - NO SOUND (set BWAUDIO_ASIO_DRIVER; see console)", 12, 120, 15, (Color){ 255, 110, 110, 255 });
-        else
-            ui_text(TextFormat("audio: %s", backend_name), 12, 120, 15, (Color){ 110, 235, 130, 255 });
+        rlImGuiBegin();
+        draw_panel();
+        if (show_te_ui && g_te) ImGuiTestEngine_ShowTestEngineWindows(g_te, &show_te_ui);
+        rlImGuiEnd();
+
+        rlDrawRenderBatchActive();                  /* flush rlgl so a capture sees the whole frame */
+        ImGuiTestEngine_PostSwap(g_te);             /* BEFORE the swap: GL_BACK still holds this frame */
         EndDrawing();
+
+        ++frames;
+        if (selftest && frames > 5 && ImGuiTestEngine_IsTestQueueEmpty(g_te) && ++drain > 3) quit_now = 1;
     }
 
+    int rc = 0;
+    if (selftest) {
+        ImGuiTestEngineResultSummary sum;
+        ImGuiTestEngine_GetResultSummary(g_te, &sum);
+        printf("[tests] %d/%d passed\n", sum.CountSuccess, sum.CountTested);
+        rc = (sum.CountTested == 0 || sum.CountSuccess != sum.CountTested) ? 1 : 0;
+    }
+
+    ImGuiTestEngine_Stop(g_te);
+    rlImGuiShutdown();                              /* destroys the imgui context */
+    ImGuiTestEngine_DestroyContext(g_te);           /* after DestroyContext, per the te docs */
     CloseWindow();
     if (e) { bw_stop(e); bw_destroy(e); }
     for (int i = 0; i < NSIG; ++i) remove(sig_files[i]);
-    return 0;
+    return rc;
 }
+

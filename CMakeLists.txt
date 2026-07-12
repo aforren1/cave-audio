@@ -407,11 +407,11 @@ if(BWAUDIO_BUILD_PLAYGROUND OR BWAUDIO_BUILD_CALIBVIEW)
     IMGUI_TEST_ENGINE_ENABLE_CAPTURE=1)
 endif()
 
-# ---- Optional: interactive raylib playground (evaluate the binaural monitor by ear) ----
+# ---- Optional: interactive playground (evaluate the binaural monitor by ear) ----
 # Opt-in so the default build stays lean: cmake -S . -B build -DBWAUDIO_BUILD_PLAYGROUND=ON
-# Drives the binaural profile live to headphones (auto-picked 2-ch ASIO driver). Links the
-# public ABI (bwaudio.h, propagated by the bwaudio target) + raylib; uses its own dr_wav copy
-# to generate the source wav.
+# Drives the binaural profile live to headphones (auto-picked 2-ch ASIO driver; null-sink
+# fallback keeps it rendering visual-only without one). Links the public ABI (bwaudio.h,
+# propagated by the bwaudio target) + raylib; uses its own dr_wav copy to generate the wavs.
 if(BWAUDIO_BUILD_PLAYGROUND)
   set(BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)        # raylib: skip its own examples/games
   FetchContent_Declare(raylib
@@ -425,14 +425,24 @@ if(BWAUDIO_BUILD_PLAYGROUND)
     DOWNLOAD_EXTRACT_TIMESTAMP TRUE SOURCE_SUBDIR not_built)
   FetchContent_MakeAvailable(raylib rlimgui)
 
-  add_executable(bw_playground examples/playground.c ${CJSON_C})   # cJSON: constraints_view.h
-  target_include_directories(bw_playground PRIVATE ${dr_libs_SOURCE_DIR} ${CJSON_INC})
+  # Same UI stack as the layout tool: raylib 3D scene + Dear ImGui control panel via rlImGui, themed
+  # like the station (bw_theme.h), with imgui_test_engine driving the panel under ctest (`--tests` —
+  # forced onto the null sink, so the suite also pins the no-device fallback staying LIVE).
+  add_executable(bw_playground examples/playground.cpp ${CJSON_C}   # cJSON: constraints_view.h
+    ${rlimgui_SOURCE_DIR}/rlImGui.cpp ${BW_IMGUI_SOURCES})
+  target_include_directories(bw_playground PRIVATE ${dr_libs_SOURCE_DIR} ${CJSON_INC}
+    ${rlimgui_SOURCE_DIR} ${BW_IMGUI_INC})
+  target_compile_definitions(bw_playground PRIVATE ${BW_IMGUI_DEFS} NO_FONT_AWESOME STB_IMAGE_WRITE_STATIC)
+  target_compile_features(bw_playground PRIVATE cxx_std_20)      # C++20: the C-style designated inits stay
   target_link_libraries(bw_playground PRIVATE bwaudio raylib)
   bw_tool_icon(bw_playground)
   if(WIN32)
     add_custom_command(TARGET bw_playground POST_BUILD
       COMMAND ${CMAKE_COMMAND} -E copy_if_different
               $<TARGET_FILE:bwaudio> $<TARGET_FILE_DIR:bw_playground>)   # bwaudio.dll next to the exe
+  endif()
+  if(BWAUDIO_BUILD_TESTS)
+    add_test(NAME playground COMMAND bw_playground --tests)       # the GUI itself, driven by fake inputs
   endif()
 
   # Speaker-layout authoring tool: place the 26 speakers + identify each by ear (the channel test
