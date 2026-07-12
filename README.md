@@ -6,8 +6,7 @@ desk-side debugging. Unity and Unreal connect as thin control clients over a C A
 
 > **Status:** implemented through M6 (engine, spatialization, Steam Audio
 > materials/reflections/pathing, tracking, calibration, tooling; 19 ctests).
-> Remaining: hardware verification at the rig. `include/bwaudio.h` is the
-> authoritative contract.
+> Remaining: hardware verification at the rig.
 
 ## Why self-hosted
 
@@ -56,28 +55,68 @@ in one process behind one audio callback.
 
 ## Non-goals & current limitations
 
-Not middleware: no events, banks, mixer graphs, or authoring app — the ABI is
-create/play/position/commit, and game-side audio (UI, menus) stays in the game
-engine's own mixer. Fixed target: the speaker geometry is data but the channel
-count is compile-time — this is not a general 5.1/Atmos renderer. Windows + ASIO
-only, one listener. Room EQ at the listening position is opt-in and static-listener
-only (`bw_calibrate --room-eq`, for the fixed-seat SPCAP/VBAP deployments); the
-moving-listener default flattens the speakers, not the room (one point can't
-correct a roam).
+bwaudio is not middleware. There are no events, banks, mixer graphs, or authoring
+app — the ABI is create/play/position/commit. Game-side audio (UI, menus) stays in
+the game engine's own mixer.
 
-Current gaps (may change): no user pitch control (Doppler is physics-derived), no
-master-bus gain or buses/groups (there is an output protection limiter), mono
-point sources only (stereo assets downmix; the ambisonic bed is the only
-non-point path), no completion callbacks (poll `bw_source_is_playing`), no
-OGG/Opus, seek does not apply to streamed sounds, and reflection/room
-configuration is load-time (occlusion meshes can be replaced live).
+- **Fixed target.** The speaker geometry is data, but the channel count is
+  compile-time. This is not a general 5.1/Atmos renderer.
+- **Windows + ASIO only. One listener.**
+- **Room EQ is opt-in and static-listener only** (`bw_calibrate --room-eq`, for the
+  fixed-seat SPCAP/VBAP deployments). The moving-listener default flattens the
+  speakers, not the room — one measurement point can't correct a roam.
 
-## Read next
+Current gaps (may change):
 
-Start with [`CLAUDE.md`](./CLAUDE.md), then [`docs/architecture.md`](./docs/architecture.md).
-Full doc index is in `CLAUDE.md`. [`examples/minimal.c`](./examples/minimal.c) is the whole
-client lifecycle in one file (create → load → play → per-frame commit → teardown); it builds
-as `bw_minimal` and runs without hardware.
+- No user pitch control — Doppler is physics-derived.
+- No master-bus gain or buses/groups (there is an output protection limiter).
+- Mono point sources only. Stereo assets downmix; the ambisonic bed is the only
+  non-point path.
+- No completion callbacks — poll `bw_source_is_playing`.
+- No OGG/Opus, and seek does not apply to streamed sounds.
+- Reflection/room configuration is load-time (occlusion meshes can be replaced live).
+
+## Getting started
+
+Usage docs live in [`docs/api.md`](./docs/api.md): quickstart, profiles, the
+threading contract, coordinates, error handling, environment variables, then a
+per-call reference. [`examples/minimal.c`](./examples/minimal.c) runs the whole
+client lifecycle (create → load → play → per-frame commit → teardown); it builds
+as `bw_minimal` and needs no hardware.
+
+```c
+BwConfig cfg = { .profile = BW_PROFILE_BINAURAL, .sample_rate = 48000, .block_size = 256 };
+BwEngine* e = bw_create(&cfg);
+bw_start(e);                                    // no ASIO device? silent sink, keeps running
+
+BwSound ping = bw_load_sound(e, "ping.wav");    // WAV/FLAC/MP3, resampled at load
+BwSource s   = bw_source_create(e);
+bw_source_play(e, s, ping, /*loop*/ true);
+
+// per frame, from one thread:
+bw_set_listener_pose(e, px,py,pz, qx,qy,qz,qw);
+bw_source_set_pos(e, s, x, y, z);
+bw_commit(e);
+```
+
+## Documentation
+
+| doc | covers |
+|-----|--------|
+| [`docs/api.md`](./docs/api.md) | usage guide + per-call reference |
+| [`include/bwaudio.h`](./include/bwaudio.h) | the C ABI; every declaration commented |
+| [`docs/architecture.md`](./docs/architecture.md) | system overview, the bus seam, locked decisions |
+| [`docs/concurrency.md`](./docs/concurrency.md) | threading model, rings, commit snapshot, lifetimes |
+| [`docs/spatialization.md`](./docs/spatialization.md) | DBAP/SPCAP/VBAP, dual-band, binaural decode, alignment |
+| [`docs/materials.md`](./docs/materials.md) | occlusion, reflections, sound pathing |
+| [`docs/integration.md`](./docs/integration.md) | Unity/Unreal bindings, coordinate seam |
+| [`docs/layout-schema.md`](./docs/layout-schema.md) | `cave_layout.json` format |
+| [`docs/calibration.md`](./docs/calibration.md) | trims, EQ, acoustic survey, room report |
+| [`docs/build.md`](./docs/build.md) | platform, dependencies, licensing, DVS/Dante config |
+
+Contributor-facing notes live in [`docs/internal-types.md`](./docs/internal-types.md),
+[`docs/roadmap.md`](./docs/roadmap.md), [`docs/profiling.md`](./docs/profiling.md), and
+`CLAUDE.md` (agent working notes, not user documentation).
 
 ## Tools
 
@@ -92,24 +131,30 @@ cmake --build build --config RelWithDebInfo
 
 ![bw_layout_tool](docs/img/layout_tool.png)
 
-Authors `cave_layout.json`. Place the 26 speakers (a speaker's index is its output
-channel, so the built-in test tone identifies which physical speaker is which);
-load placement constraints from `constraints.json`; shade a coverage shell by
-nearest-speaker gap or by the selected panner's rE-localization error (the
-engine's own gain solve); optionally hill-climb the positions against that error;
-preview a moving pink-noise source through the edited layout. Headless:
-`--export`, `--score`, `--optimize`.
+Authors `cave_layout.json`:
+
+- Place the 26 speakers. A speaker's index is its output channel, so the built-in
+  test tone tells you which physical speaker is which.
+- Load placement constraints from `constraints.json`.
+- Shade a coverage shell by nearest-speaker gap, or by the selected panner's
+  rE-localization error — computed with the engine's own gain solve.
+- Optionally hill-climb the positions against that error.
+- Preview a moving pink-noise source through the edited layout.
+
+Headless: `--export`, `--score`, `--optimize`.
 
 ### Calibrate — `bw_calib_view`
 
 ![bw_calib_view: layout diff](docs/img/calib_view_diff.png)
 
-The Capture tab runs sweep → measure → solve → writeback (simulated, or
-full-duplex ASIO with a measurement mic) and loads the result into a layout diff —
-A the input, B what was written — so a swapped channel or bad mic placement is
-caught before the file is trusted. Other tabs: the array in 3D, gain/delay trims,
-correction-EQ curves, retained IRs. The Zylia tab shows clap direction-of-arrival
-on a ZM-1 capsule sphere to check capsule mapping and geometry.
+The Capture tab runs sweep → measure → solve → writeback (simulated, or full-duplex
+ASIO with a measurement mic), then loads the result into a layout diff — A the
+input, B what was written. A swapped channel or a bad mic placement is caught
+before the file is trusted.
+
+Other tabs: the array in 3D, gain/delay trims, correction-EQ curves, retained IRs.
+The Zylia tab shows clap direction-of-arrival on a ZM-1 capsule sphere — a
+seconds-fast check of capsule mapping and geometry.
 
 ![bw_calib_view: Zylia tab](docs/img/calib_view_zylia.png)
 
@@ -127,14 +172,16 @@ bw_calibrate --layout survey.json --mic 0 1.2 0 --room-eq --out cave_layout.seat
 bw_calibrate --layout survey.json --mic 0 1.7 0 --eq      --out cave_layout.roaming.json
 ```
 
-Seated: SPCAP/VBAP, fixed listener pose, trims aligned at the seat, room correction
-at the seat (`--room-eq` is only valid for a listener who stays at the measurement
-point). Roaming: DBAP + tracking, trims aligned at the working-volume center at
-standing ear height, speaker-only EQ — one point can't room-correct a roam. Diffing
-the two files in calib_view should show identical positions and only trim/EQ
-differences; unknown JSON fields survive recalibration, so a variant can carry its
-own annotation (e.g. `"intent": "seated, SPCAP"`). Loading the seated file into a
-moving-listener session (DBAP or tracking) fails `bw_start` rather than quietly
+- **Seated** (SPCAP/VBAP, fixed listener pose): trims aligned at the seat, room
+  correction at the seat. `--room-eq` is only valid for a listener who stays at the
+  measurement point.
+- **Roaming** (DBAP + tracking): trims aligned at the working-volume centre at
+  standing ear height, speaker-only EQ — one point can't room-correct a roam.
+
+Diffing the two files in calib_view should show identical positions and only trim/EQ
+differences. Unknown JSON fields survive recalibration, so a variant can carry its
+own annotation (e.g. `"intent": "seated, SPCAP"`). And loading the seated file into
+a moving-listener session (DBAP or tracking) fails `bw_start` rather than quietly
 mis-correcting the array.
 
 ### Audition — `bw_playground`

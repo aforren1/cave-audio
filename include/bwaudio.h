@@ -3,7 +3,12 @@
  *
  * Self-hosted native audio engine driving a 26-speaker CAVE array via ASIO/Dante,
  * with a binaural (HRTF) debug monitor. Engines (Unity/Unreal) are thin control
- * clients; no audio buffers cross this boundary.
+ * clients; no audio buffers cross this boundary — only control (sound triggers,
+ * source positions, the listener pose).
+ *
+ * Usage docs: docs/api.md — quickstart, profiles, the threading contract,
+ * coordinates, error handling, environment variables, and the per-call
+ * reference. examples/minimal.c runs the whole client lifecycle.
  *
  * Name "bw" is a placeholder prefix — rename freely, but keep it consistent
  * across the header, the lib symbols, and the engine bindings.
@@ -14,7 +19,7 @@
  *     ring that the audio thread drains. It does NOT touch DSP state.
  *   - Only create/start/load/source_create may allocate or do I/O. Do these at
  *     load time, never mid-frame in a hot loop.
- *   - Position/pose are latest-wins; push them every frame.
+ *   - Position/pose are latest-wins; push them every frame, then bw_commit once.
  *
  * LICENSING NOTE: links the Steinberg ASIO SDK (GPLv3 option, see docs/build.md)
  * and Steam Audio. Distribution implications are copyleft — read docs/build.md.

@@ -1,8 +1,9 @@
 # CLAUDE.md
 
 Guidance for working in this repository. Read this first, then the file under
-`docs/` relevant to the task. The design is settled; this is a planning/spec repo
-with no implementation yet — your job will mostly be scaffolding against these specs.
+`docs/` relevant to the task. The design is settled and implemented through M6
+plus the calibration/tooling work (see "Current state" below) — most work now
+extends the engine or verifies it on hardware, against these specs.
 
 ## What this is
 
@@ -91,7 +92,7 @@ A future cross-platform move means abstracting the device layer (ASIO is just th
 Windows sink) — do not bake ASIO assumptions outside `asio_sink.c`.
 
 ```
-cmake -S . -B build -G "Visual Studio 17 2022" -A x64
+cmake -S . -B build -A x64      # default generator = newest installed Visual Studio
 cmake --build build --config RelWithDebInfo
 ctest --test-dir build -C RelWithDebInfo      # runs the full test suite (test_* targets)
 ```

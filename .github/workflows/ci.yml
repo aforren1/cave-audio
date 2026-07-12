@@ -57,7 +57,9 @@ jobs:
       - name: Configure
         shell: bash
         run: |
-          cmake -S . -B build -G "Visual Studio 17 2022" -A x64 | tee configure.log
+          # No -G pin: CMake defaults to the newest Visual Studio on the runner. Pinning
+          # "Visual Studio 17 2022" broke when the windows-latest image dropped VS 2022.
+          cmake -S . -B build -A x64 | tee configure.log
           # the artifact must contain the production device path — fail loudly if it didn't wire up
           grep -q "ASIO backend ENABLED" configure.log
 

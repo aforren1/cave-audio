@@ -1,11 +1,82 @@
-# C ABI reference
+# bwaudio — usage guide & C ABI reference
 
-Authoritative header: [`include/bwaudio.h`](../include/bwaudio.h). This document
-gives semantics and the threading contract per call. From a consumer's side it is a
-**control-only** API: no audio buffers, no device, no queue, no threads — an opaque
-handle, sounds, positioned sources, and per-frame updates.
+From a consumer's side this is a **control-only** API: no audio buffers, no
+device, no queue, no threads — an opaque engine handle, sounds, positioned
+sources, and per-frame updates. Declarations in
+[`include/bwaudio.h`](../include/bwaudio.h) carry their contracts as comments;
+[`examples/minimal.c`](../examples/minimal.c) runs the whole client lifecycle.
 
-## Contract
+## Feature overview
+
+- Listener-relative spatialization over the 26-speaker array, recomputed per
+  audio block from the tracked head position: DBAP for a moving listener (the
+  default), SPCAP/VBAP for a fixed one, an optional dual-band mode, per-source
+  angular spread.
+- Per-speaker gain/delay/correction-EQ output stage driven by a measured layout
+  file, with a linked protection limiter as the final stage.
+- Acoustics (Steam Audio builds only): ray-traced occlusion with per-band
+  transmission EQ, source directivity, a directional reflection bed (real-time
+  or baked), sound pathing around occluders. Without the SDK those calls are
+  documented no-ops, and the binaural profile uses a simple-pan monitor instead
+  of the HRTF decode.
+- Propagation (any build): Doppler and air absorption, opt-in per source.
+- Assets: WAV/FLAC/MP3 decoded (and resampled) at load, disk streaming for long
+  files, AmbiX ambisonic beds decoded world-locked to the array.
+- Voices: fixed pool with priority stealing, pause and click-free seek,
+  sample-accurate scheduled starts against a device-anchored DSP clock.
+- Tracking: OptiTrack/NatNet ingested in-process; the audio thread samples the
+  freshest head pose at block time.
+- Diagnostics: per-channel test tone, output-level and listener-pose readbacks,
+  offline panner evaluation for layout tools.
+
+## Quickstart
+
+```c
+BwConfig cfg = { .profile = BW_PROFILE_BINAURAL, .sample_rate = 48000,
+                 .block_size = 256, .track_internal = false };
+BwEngine* eng = bw_create(&cfg);
+if (!eng || bw_start(eng) != 0) { /* see bw_last_error(eng) */ }
+
+BwSound steps = bw_load_sound(eng, "footsteps.wav");     // once, at load time
+BwSource s    = bw_source_create(eng);
+bw_source_play(eng, s, steps, /*loop*/ true);
+
+// per frame, from the control thread:
+bw_set_listener_pose(eng, hx,hy,hz, qx,qy,qz,qw);        // skip if track_internal
+bw_source_set_pos(eng, s, sx,sy,sz);
+bw_commit(eng);                                          // ONE commit, last
+
+// teardown:
+bw_source_destroy(eng, s);
+bw_unload_sound(eng, steps);   // safe while playing: retire is acked internally
+bw_stop(eng); bw_destroy(eng);
+```
+
+- **Production** uses `BW_PROFILE_CAVE`, with `cfg.layout_path` pointing at the
+  surveyed `cave_layout.json`.
+- **`bw_start` never demands hardware**: with no usable ASIO device the engine
+  keeps rendering into a silent offline sink. `bw_audio_backend` reports which
+  backend you actually got (see [Errors](#errors--return-codes)).
+- **Completion is polled, not called back**: `bw_source_is_playing` publishes
+  once per audio block, so give a play command a moment to land before trusting
+  a `false` answer.
+
+## Profiles and the master bus
+
+Every voice is panned into an in-memory **26-channel master bus**; the profile
+selects who consumes it:
+
+| profile               | consumers |
+|-----------------------|-----------|
+| `BW_PROFILE_CAVE`     | bus → ASIO → Dante (production). Listener **position** only — real speakers, real ears. |
+| `BW_PROFILE_BINAURAL` | bus → HRTF monitor → any 2-ch ASIO device (desk debugging). Each bus channel is a virtual speaker at its surveyed room position; full **pose** — head orientation turns the virtual array around you. |
+| `BW_PROFILE_BOTH`     | both at once: array to Dante + a monitor tap. |
+
+The binaural monitor hears the **same 26-channel mix** production plays, panner
+and all — headphone debugging exercises the array render, not a parallel stereo
+path. See [architecture.md](./architecture.md).
+
+## The threading contract
 
 - **One control thread.** All `bw_*` calls come from a single thread. For Unity/
   Unreal that is naturally the main thread (`LateUpdate`/`Tick`), so single-producer
@@ -16,6 +87,25 @@ handle, sounds, positioned sources, and per-frame updates.
   or backs up. Push them every frame.
 - **Allocation only at load time.** `create`/`start`/`load_sound`/`source_create`
   may allocate or do I/O. The per-frame loop is pure enqueue.
+- **`bw_commit` defines frame coherence.** Position/pose updates land in *pending*
+  fields; commit promotes them all to *active* as one snapshot, so the mixer never
+  renders a moved listener against a not-yet-moved source. Once per frame, last
+  (see [Frame boundary](#frame-boundary)).
+
+The full model (rings, snapshot, lifetimes) is [concurrency.md](./concurrency.md).
+
+## Coordinates and units
+
+Room space is **right-handed, metres, +y up, +z forward**, and the origin sits
+**on the floor** at the working-area centre (Motive's ground-plane calibration) —
+OptiTrack rigid-body poses pass through unchanged and y is height above the
+floor. An identity orientation faces +z with the right ear at −x; derive basis
+vectors from `BW_ROOM_AHEAD` / `BW_ROOM_UP` / `BW_ROOM_RIGHT` in the header
+rather than re-hardcoding the convention. The engine's world-locked decodes and
+its default listener position use the **array centroid** (the nominal listening
+point), not the origin. Gains are linear (1 = unity); sound offsets are
+engine-rate sample frames. The engine bindings convert from Unity/Unreal
+coordinates at the boundary ([integration.md](./integration.md)).
 
 ## Lifecycle
 
@@ -42,14 +132,14 @@ const char* bw_last_error(BwEngine* e);
 
 The API reports failure three ways, all read on the **control thread**:
 
-- **Pointer/handle returns** — `bw_create` returns `NULL`, `bw_load_sound`/`bw_source_create`
-  return `0`, on failure.
-- **`int` returns** — `bw_start`/`bw_stop` return `0` (`BW_OK`) on success, a nonzero `BwError`
-  otherwise. (These codes live in api.md today; mirror them as an enum in
-  [`include/bwaudio.h`](../include/bwaudio.h) when the lifecycle is implemented.)
-- **`bw_last_error`** — a human-readable string for the most recent failure on that engine, or
-  `NULL` if none. Engine-scoped; valid until the next `bw_*` call on the same engine. Call it right
-  after a failing call.
+- **Pointer/handle returns.** `bw_create` returns `NULL` on failure; `bw_load_sound` /
+  `bw_source_create` return `0`.
+- **`int` returns.** `bw_start`/`bw_stop` return `0` (`BW_OK`) on success, a nonzero code
+  otherwise. The codes are listed below; there is no matching enum in
+  [`include/bwaudio.h`](../include/bwaudio.h) yet.
+- **`bw_last_error`.** A human-readable string for the most recent failure on that engine, or
+  `NULL` if none. It stays valid until the next `bw_*` call on the same engine, so read it
+  right after the failing call.
 
 | code            | value | cause |
 |-----------------|-------|-------|
@@ -61,19 +151,49 @@ The API reports failure three ways, all read on the **control thread**:
 | `BW_ERR_STATE`  | 5     | called in the wrong state (e.g. `bw_start` while already running) |
 | `BW_ERR_INTERNAL` | 6   | unexpected internal failure; `bw_last_error` carries detail |
 
-`bw_create` returns `NULL` on failure (bad config / out of memory); it does **not** return a code.
-`bw_start` currently returns only **`0`, `1` (`BW_ERR_CONFIG`: NULL engine, or a `room_eq` layout in a
-moving-listener session), and `2` (`BW_ERR_DEVICE`)**. Codes **3–6 are reserved**, not yet returned:
-a bad `layout_path` or `hrtf_path` **degrades gracefully** (the engine falls back to the default grid
-/ the simple-pan monitor and records the reason in `bw_last_error`) rather than failing `bw_start`,
-and a redundant `bw_start` is a no-op that returns `0`. So **read `bw_last_error` after `bw_create`
-and `bw_start` even on success** if you must confirm the surveyed layout / SOFA HRTF actually loaded.
+What actually comes back today:
 
-The per-frame `void` calls (`bw_source_set_pos`, `bw_commit`, …) never return an error: they only
-enqueue onto the command ring. If that ring is ever full (a should-never-happen control-thread
-stall — see [`concurrency.md`](./concurrency.md)) the command is **dropped** (silently — no
-`bw_last_error`); the ring is sized (`RING_CAP`) for a worst-case frame burst so this does not occur
-in normal use. Position/pose are latest-wins, so a dropped update is corrected by the next frame.
+- `bw_create` returns `NULL` (bad config / out of memory). No code.
+- `bw_start` returns `0`, `1` (`BW_ERR_CONFIG`: NULL engine, or a `room_eq` layout in a
+  moving-listener session), or `2` (`BW_ERR_DEVICE`). Codes **3–6 are reserved**, not yet
+  returned. A redundant `bw_start` is a no-op that returns `0`.
+- A bad `layout_path` or `hrtf_path` does **not** fail `bw_start`. The engine degrades —
+  default speaker grid, simple-pan monitor — and records why in `bw_last_error`.
+
+The consequence of that last point: if your session depends on the surveyed layout or a SOFA
+HRTF, read `bw_last_error` after a *successful* `bw_create`/`bw_start` to confirm they
+actually loaded.
+
+Per-frame `void` calls (`bw_source_set_pos`, `bw_commit`, …) never report errors — they only
+enqueue onto the command ring. A full ring drops the command silently, but the ring is sized
+(`RING_CAP`) for a worst-case frame burst, and only a stalled control thread could fill it
+(see [`concurrency.md`](./concurrency.md)). Position and pose are latest-wins, so a dropped
+update is corrected one frame later.
+
+## Environment variables
+
+Deployment knobs, kept out of `BwConfig` so the ABI stays stable:
+
+| variable | meaning |
+|----------|---------|
+| `BWAUDIO_SINK` | `null` forces the silent offline sink (CI, desk debugging with no hardware); `asio` demands a real device — an open failure then fails `bw_start` instead of hiding behind the silent fallback. Default: try ASIO, fall back to the null sink. |
+| `BWAUDIO_ASIO_DRIVER` | ASIO driver name to open. Default: auto-pick the first registered driver with enough output channels for the profile (so binaural finds a 2-ch headphone driver, cave a ≥26-ch one, without configuration). |
+| `BWAUDIO_EMBREE` | non-`0`: ray-trace the acoustics sims on Intel Embree (see below). |
+| `BWAUDIO_PATHING` | non-`0`: enable the sound-pathing sim at `bw_start` (needs scene geometry + the Steam Audio build); sources opt in via `bw_source_set_pathing`. |
+| `BWAUDIO_BAKE` | non-`0`: precompute (bake) the reflection reverb over a probe grid at `bw_start`, so the reflections sim looks it up instead of ray-tracing live. |
+| `BWAUDIO_NATNET_*` | `track_internal` configuration — multicast group, ports, server IP, rigid body, bitstream version, interface. Full table under [Internal tracking](#internal-tracking-track_internal-m6). |
+
+### Ray-tracing acceleration (`BWAUDIO_EMBREE`)
+
+The occlusion and reflection sims ray-trace on the Steam Audio scene. Set **`BWAUDIO_EMBREE=1`**
+(any non-empty, non-`0` value) to run them on **Intel Embree** instead of Steam Audio's built-in
+ray tracer — faster, and the lever to pull if you raise scene complexity, ray counts, or bake at
+high probe density. It is **opt-in and safe**: if the linked `phonon` was not built with Embree
+(or the Embree/TBB runtime is missing), the engine logs that Embree is unavailable and falls back
+to the default tracer — no failure. The scene is created once and both sims share it, so the flag
+applies to occlusion and reflections together. **Note:** the vendored prebuilt `phonon.dll` is not
+Embree-enabled (the flag currently falls back); to activate it, drop in a `phonon` built with
+Embree (the SDK's `STEAMAUDIO_ENABLE_EMBREE` path) and ship `embree4.dll` + `tbb*.dll` alongside.
 
 ## Assets (control thread, file I/O)
 
@@ -93,9 +213,9 @@ background thread feeds the voice from disk as it plays. It is **mono, at the en
 (a rate mismatch fails — pre-convert, or use `bw_load_sound` which resamples), plays on **one voice
 at a time**, and does not support `bw_source_seek` (the ring can't jump).
 
-`bw_unload_sound` is safe to call any time — the
-core detaches references on the audio thread and frees only after the retire-ack
-(see concurrency.md), so it will not pull a buffer out from under a playing voice.
+`bw_unload_sound` is safe to call at any time. The core detaches references on the audio thread
+and frees only after the retire-ack (see [concurrency.md](./concurrency.md)) — it will never pull
+a buffer out from under a playing voice.
 
 ## Sources (control thread, non-blocking)
 
@@ -115,35 +235,39 @@ bool     bw_source_is_playing(BwEngine* e, BwSource s);  // control-thread poll;
 void     bw_play_oneshot(BwEngine* e, BwSound snd, float x, float y, float z, float gain);
 ```
 
-**Voice pool + scheduling.** The voice pool is fixed; when it is full, `bw_source_create` steals the
-lowest-**priority** active source (255 = protected, never stolen) rather than failing — so set music
-and critical SFX high. The steal is **click-free**: the stolen voice fades out over one block on its
-own slot (the new source starts immediately on a small reserve of extra slots), so a scene churning
-voices under load doesn't tick. `bw_source_play_at` begins output exactly when the engine's dsp clock reaches
-`start_sample`; read "now" from `bw_dsp_time` (device sample position, monotonic) and add a delay,
-e.g. play 0.5 s out with `bw_dsp_time(e) + sample_rate/2`. `0` = play immediately (== `bw_source_play`).
+**The voice pool steals, it doesn't fail.** The pool is fixed-size. When it's full,
+`bw_source_create` stops the lowest-**priority** active source to make room (255 = protected, never
+stolen) — an overloaded scene drops its least important sound instead of refusing the new one. Set
+music and critical SFX high. The steal is click-free: the stolen voice fades out over one block on
+its own slot while the new source starts immediately on a small reserve of spare slots.
 
-`bw_source_is_playing` is a **latest-wins readback** (like `bw_get_listener_pose`): the audio thread
-republishes each source's playing state every block, gated on the handle's generation. It reads
-`true` while a sound plays, `false` once a non-loop sound finishes, after `stop`, or for a
-stale/destroyed handle. Poll it once per frame to drive an "on finished" signal; it is best-effort
-(a sound shorter than the poll interval may never be observed as playing).
+**Scheduled starts are sample-accurate.** `bw_source_play_at` begins output exactly when the
+engine's dsp clock reaches `start_sample` — silent until then, then starting at the precise in-block
+sample. Read "now" from `bw_dsp_time` (device sample position, monotonic) and add a delay:
+`bw_dsp_time(e) + sample_rate/2` plays half a second out. `0` means play immediately (same as
+`bw_source_play`); a start already in the past plays immediately, best-effort.
 
-`bw_source_set_paused` gates the voice with a one-block ramp (~5 ms — no click) and freezes the
-playhead once silent, so resume continues exactly where pause landed; it works for in-memory,
-streamed, and bed sounds, and a paused voice still reads as *playing* (it has not ended).
-`bw_source_seek` jumps the content position (engine-rate frames): on a running voice it ramps out,
-jumps, and ramps back in (~10 ms end to end); on a paused voice the jump is immediate and it stays
-paused. Past-the-end seeks wrap for loops and end one-shots. Streamed sounds ignore seeks (the
-stream ring cannot jump); `bw_source_play` always restarts un-paused at frame 0.
+**Completion is a poll.** `bw_source_is_playing` is a latest-wins readback (like
+`bw_get_listener_pose`): the audio thread republishes each source's playing state every block, gated
+on the handle's generation. It reads `true` while a sound plays; `false` once a non-loop sound
+finishes, after `stop`, or for a stale/destroyed handle. Poll it once per frame to drive an
+"on finished" signal. It's best-effort — a sound shorter than your poll interval may never be
+observed as playing.
 
-Positions are in **room space: right-handed, +Y up, +Z forward, origin on the floor**
-(Motive's ground-plane default: y = height above the floor; an identity orientation faces
-+Z) — the engine binding converts from its own coordinate system at the boundary (see
-integration.md). The engine's world-locked decodes and its default listener position use
-the **array centroid** (the nominal listening point), not the origin. `bw_play_oneshot` is the
-fire-and-forget path: it allocates a transient voice internally and recycles it on
-end, so the caller holds no handle.
+**Pause and seek are click-free.**
+
+- `bw_source_set_paused` gates the voice with a one-block ramp (~5 ms) and freezes the playhead
+  once silent, so resume continues exactly where pause landed. Works for in-memory, streamed, and
+  bed sounds. A paused voice still reads as *playing* — it hasn't ended.
+- `bw_source_seek` jumps the content position (engine-rate frames). On a running voice: ramp out,
+  jump, ramp back in (~10 ms end to end). On a paused voice the jump is immediate and it stays
+  paused. Past-the-end seeks wrap for loops and end one-shots.
+- Streamed sounds ignore seeks — the stream ring can't jump. `bw_source_play` always restarts
+  un-paused at frame 0.
+
+Positions are in **room space** (see [Coordinates and units](#coordinates-and-units)).
+`bw_play_oneshot` is the fire-and-forget path: it allocates a transient voice internally
+and recycles it on end, so the caller holds no handle.
 
 ## Ambisonic beds (control thread)
 
@@ -156,15 +280,20 @@ void    bw_bed_stop    (BwEngine* e, BwBed b);
 void    bw_bed_destroy (BwEngine* e, BwBed b);
 ```
 
-A **bed** is a pre-encoded **AmbiX** (ACN ordering, SN3D normalization) soundfield decoded
-**straight to the 26 speakers** — *not* DBAP-panned — for diffuse/ambient content. It is
-**world-locked** (the soundfield is fixed to the room; the physical speakers are world-fixed,
-so the listener moving through it is handled by the real acoustics, and the binaural monitor's
-head-tracking applies downstream). Load with `bw_load_ambix` (a multichannel asset; mono and other
-channel counts are rejected), then drive with the `bw_bed_*` family — no position, just a master
-gain. Internally a bed is a voice playing a multichannel asset, so handles/lifetime match
-`bw_source_*`. The decode is a static SN3D sampling decode `(2l+1)·Y_k(dir_s)/L`, rebuilt from the
-layout. FLAC is the natural container for lossless multichannel beds; MP3 cannot carry ambisonics.
+A **bed** is a pre-encoded **AmbiX** soundfield (ACN ordering, SN3D normalization) decoded
+**straight to the 26 speakers**. It is not panned and has no position — use it for diffuse,
+ambient content.
+
+Beds are **world-locked**: the soundfield is fixed to the room. The physical speakers are
+world-fixed too, so a listener walking through the field is handled by the real acoustics,
+and the binaural monitor's head-tracking applies downstream.
+
+Load with `bw_load_ambix` (a multichannel asset; mono and other channel counts are rejected),
+then drive with the `bw_bed_*` family — no position, just a master gain. Internally a bed is a
+voice playing a multichannel asset, so handles and lifetime match `bw_source_*`. The decode is
+a static SN3D sampling decode `(2l+1)·Y_k(dir_s)/L`, rebuilt from the layout.
+
+NOTE: FLAC is the natural container for lossless multichannel beds. MP3 can't carry ambisonics.
 
 ## Listener (control thread; skip if `track_internal`)
 
@@ -200,18 +329,6 @@ needs `BWAUDIO_NATNET_SERVER` and NatNet ≥ 4; a name that doesn't resolve fail
 engine then runs untracked, with the reason in `bw_last_error`). A NatNet open failure is
 non-fatal: the engine runs on the committed/default listener until tracking data arrives.
 
-### Ray-tracing acceleration (`BWAUDIO_EMBREE`)
-
-The occlusion and reflection sims ray-trace on the Steam Audio scene. Set **`BWAUDIO_EMBREE=1`**
-(any non-empty, non-`0` value) to run them on **Intel Embree** instead of Steam Audio's built-in
-ray tracer — faster, and the lever to pull if you raise scene complexity, ray counts, or bake at
-high probe density. It is **opt-in and safe**: if the linked `phonon` was not built with Embree
-(or the Embree/TBB runtime is missing), the engine logs that Embree is unavailable and falls back
-to the default tracer — no failure. The scene is created once and both sims share it, so the flag
-applies to occlusion and reflections together. **Note:** the vendored prebuilt `phonon.dll` is not
-Embree-enabled (the flag currently falls back); to activate it, drop in a `phonon` built with
-Embree (the SDK's `STEAMAUDIO_ENABLE_EMBREE` path) and ship `embree4.dll` + `tbb*.dll` alongside.
-
 ### Reading back the pose
 
 ```c
@@ -235,29 +352,6 @@ moved listener against a not-yet-moved source) and drains the event ring. For
 independent point sources the tearing avoided by commit is often inaudible, but for
 the moving-observer case — where listener and sources update together — it matters.
 
-## Canonical call sequence
-
-```c
-BwConfig cfg = { .profile = BW_PROFILE_BINAURAL, .sample_rate = 48000,
-                 .block_size = 256, .track_internal = false };
-BwEngine* eng = bw_create(&cfg);
-bw_start(eng);
-
-BwSound steps = bw_load_sound(eng, "footsteps.wav");     // once, at load
-BwSource s    = bw_source_create(eng);
-bw_source_play(eng, s, steps, /*loop*/ true);
-
-// per frame, from the control thread:
-bw_set_listener_pose(eng, hx,hy,hz, qx,qy,qz,qw);
-bw_source_set_pos(eng, s, sx,sy,sz);
-bw_commit(eng);
-
-// teardown:
-bw_source_destroy(eng, s);
-bw_unload_sound(eng, steps);
-bw_stop(eng); bw_destroy(eng);
-```
-
 ## Materials & scene geometry (control thread; load-time)
 
 ```c
@@ -271,22 +365,28 @@ void bw_scene_set_mesh_mat(BwEngine* e, const float* verts, int nverts, const in
 void bw_scene_set_box     (BwEngine* e, float w, float h, float d, const BwMaterial faces[6]); // -x,+x,-y,+y,-z,+z
 ```
 
-A `BwMaterial` is an **opaque, engine-scoped token** (a small index; `0` is always the built-in
-`generic` default). Mint with a preset name (11 presets, case-insensitive, Steam Audio's published
-coefficients — `"generic"` returns `0` without minting) or custom 3-band coefficients (clamped to
-`[0,1]`, NaN-sanitized). The table is fixed (64 entries); on overflow / unknown name the mint returns
-`0` and sets `bw_last_error`. Tokens are **not** generation-checked handles — they stay valid for the
-engine's life; per-triangle indices out of range clamp to the default.
+A `BwMaterial` is an **opaque, engine-scoped token** — a small index, where `0` is always the
+built-in `generic` default. Mint one from a preset name (11 presets, case-insensitive, Steam
+Audio's published coefficients; `"generic"` returns `0` without minting) or from custom 3-band
+coefficients (clamped to `[0,1]`, NaN-sanitized). The table is fixed at 64 entries; on overflow or
+an unknown name the mint returns `0` and sets `bw_last_error`. Tokens are **not**
+generation-checked handles — they stay valid for the engine's life, and per-triangle indices out
+of range clamp to the default.
 
-Geometry is in **room space (RH metres)**, triangles CCW; `bw_scene_set_box` builds a floor-based
-shoebox (x/z centred on the origin, y from 0 — the floor — up to `h`) with **inward-facing** normals
-(the listener stands inside). The same per-triangle materials feed
-**both** occlusion (per-band transmission) and the reflection bed (absorption/scattering) — one shared
-`IPLScene`. The geometry **can change at runtime** for occlusion (the occlusion sim owns the scene and
-serializes its own commit + ray trace) — but it is **locked once the reflection bed is running** (that
-sim shares the scene and an `iplSceneCommit` can't race its ray tracing; the reflection IR assumes a
-static scene). A locked call is rejected (sets `bw_last_error`). All of the above are **no-ops without
-the `BW_HAVE_STEAMAUDIO` build** (token minting still works — it is plain table state).
+Geometry rules:
+
+- **Room space, RH metres, CCW triangles.** `bw_scene_set_box` builds a floor-based shoebox
+  (x/z centred on the origin, y from 0 — the floor — up to `h`) with inward-facing normals;
+  the listener stands inside.
+- **One scene, two consumers.** The same per-triangle materials feed both occlusion (per-band
+  transmission) and the reflection bed (absorption/scattering) — one shared `IPLScene`.
+- **Runtime swaps: occlusion yes, reflections no.** Geometry can change at runtime while only
+  occlusion runs — that sim owns the scene and serializes its own commit + ray trace. Once the
+  reflection bed is running the scene is locked: the reflection IR assumes a static scene, and
+  an `iplSceneCommit` can't race its ray tracing. A locked call is rejected and sets
+  `bw_last_error`.
+- **No SDK, no-op.** Everything here is a documented no-op without the `BW_HAVE_STEAMAUDIO`
+  build — except token minting, which is plain table state and still works.
 
 ## Occlusion & directivity (control thread; per-frame except where noted)
 
@@ -336,12 +436,15 @@ reflections keep their own propagation. They do not affect ambisonic beds (world
 void bw_source_set_spread(BwEngine* e, BwSource s, float amount);   // 0 = point (default) .. 1 = wide
 ```
 
-Angular **width** of a source. A waterfall, a crowd, an engine room, or ambience shouldn't collapse to
-a single point; raise `spread` and the source's energy fans out across the speakers around its
-direction. Implemented in the per-block gain solve (not the sample loop): the panner's point gains are
-blended toward a width-controlled lobe centred on the source direction, then **renormalised to the
-panner's own power** — so widening never changes loudness, and the perceived direction stays put. It's
-**panner-agnostic** (works over DBAP/SPCAP/VBAP) and the change ramps click-free like any gain change.
+Angular **width** of a source. A waterfall, a crowd, an engine room, or ambience shouldn't
+collapse to a single point — raise `spread` and the source's energy fans out across the speakers
+around its direction.
+
+It's implemented in the per-block gain solve, not the sample loop: the panner's point gains are
+blended toward a width-controlled lobe centred on the source direction, then **renormalised to
+the panner's own power**. Widening never changes loudness, and the perceived direction stays put.
+It's **panner-agnostic** (works over DBAP/SPCAP/VBAP), and the change ramps click-free like any
+gain change.
 
 ## Channel test / diagnostics (control thread)
 
@@ -351,49 +454,67 @@ void     bw_test_signal(BwEngine* e, uint32_t channel, BwTestKind kind, float ga
 uint32_t bw_get_bus_levels(BwEngine* e, float* peaks, uint32_t cap);  // last block's per-channel output peak
 ```
 
-Drive a single **output channel** with a built-in signal (660 Hz sine or white noise), injected
-**after** the per-speaker align stage — a raw value straight on the channel. This is a **speaker-check
-/ wiring-verification / calibration** tool (walk a tone across all 26 to confirm the channel→speaker
-map, find a dead speaker, set a trim), **not** a spatial path: it bypasses the panner, so don't use
-it to "place" a sound. Per-frame-safe, takes effect next block, no `bw_commit` needed; any number of
-channels at once; `gain 0` / `BW_TEST_OFF` silences one. Works in every profile (cave/both: a raw tone
-on that DVS channel; binaural: that bus channel HRTF'd as its virtual speaker). Needs no SDK.
+`bw_test_signal` drives a single **output channel** with a built-in signal (660 Hz sine or white
+noise), injected **after** the per-speaker align stage — a raw value straight on the channel.
+
+This is a speaker-check / wiring / calibration tool: walk a tone across all 26 channels to confirm
+the channel→speaker map, find a dead speaker, set a trim. It is **not** a spatial path — it
+bypasses the panner, so don't use it to "place" a sound. Per-frame-safe, takes effect next block,
+no `bw_commit` needed. Any number of channels at once; `gain 0` / `BW_TEST_OFF` silences one.
+Works in every profile (cave/both: a raw tone on that DVS channel; binaural: that bus channel
+HRTF'd as its virtual speaker). Needs no SDK.
 
 `bw_get_bus_levels` is the matching **readback**: each output channel's last-block peak `|sample|`
-(linear), measured at the very end of the render — after align, the test signal, and the limiter, i.e.
-exactly what the device channel received. Fills up to `cap` floats, returns the count filled.
-Per-frame-safe (relaxed atomic reads, no locks); levels read 0 until audio is running. Drive channel
-meters or a speaker-activity display with it — the playground lights each speaker gizmo from this.
+(linear), measured at the very end of the render — after align, the test signal, and the limiter.
+That is exactly what the device channel received. It fills up to `cap` floats and returns the
+count filled. Per-frame-safe (relaxed atomic reads, no locks); levels read 0 until audio is
+running. Drive channel meters or a speaker-activity display with it — the playground lights each
+speaker gizmo from this.
 
 ## Panner & layout query (control thread)
 
 ```c
 typedef enum { BW_PAN_DBAP = 0, BW_PAN_SPCAP = 1, BW_PAN_VBAP = 2 } BwPanner;
 typedef enum { BW_DECODE_SAMPLING = 0, BW_DECODE_ALLRAD = 1 } BwBedDecoder;
-void     bw_set_panner(BwEngine* e, BwPanner panner);            // load-time (between create and start)
+void     bw_set_panner(BwEngine* e, BwPanner panner);            // load-time or live (atomic switch)
 void     bw_set_dual_band(BwEngine* e, bool on);                // live A/B; wraps the selected panner
 void     bw_set_bed_decoder(BwEngine* e, BwBedDecoder decoder);  // load-time
 uint32_t bw_get_speakers(BwEngine* e, float* xyz, uint32_t cap); // read back the layout; NULL xyz = count only
 ```
 
-`bw_set_panner` chooses the per-source panner behind the 26-ch bus. **DBAP** (default) is
-listener-relative, recomputed per frame from the tracked pose — for a **moving** observer roaming the
-array. **SPCAP** is a smooth, all-speaker, placement-correcting sweet-spot panner for a **fixed**
-observer (a static listener: don't track, set the sweet spot once); it conserves loudspeaker power
-across an uneven array. **VBAP** is the sharpest (2-3 nearest speakers), also fixed-observer, best on a
-cleanly-triangulable array (falls back to DBAP otherwise). The switch is atomic (safe live, e.g. the
-layout tool's `B` A/B). `bw_set_dual_band` (off by default, live-toggleable) **wraps** the selected
-panner: it splits each source at ~700 Hz and pans the low band with **amplitude** (pressure /
-velocity-vector) normalisation, the high band with the panner's usual **power** (energy-vector)
-normalisation — sharper low-frequency localisation for a near-centred listener (SPAT's "VBP
-Dual-Band"). The panning *direction* is unchanged; only the low band's level/coherence differs. It is
-sweet-spot dependent like VBAP, so it's a by-ear/measurement call for a roaming listener. `bw_set_bed_decoder` chooses the **diffuse-bed** SH→26 decoder:
-**sampling** (default projection decode) or **AllRAD** (decode to a uniform virtual layout + VBAP onto
-the real array — robust on an irregular array, heavier load-time build). It affects the ambisonic +
-reflection beds only, not the point-source panner. Both are load-time; see
-[`spatialization.md`](./spatialization.md). `bw_get_speakers` returns the effective layout (the default
-grid or the `layout_path` file) as `cap*3` floats in channel order + the count (26) — for visualizing
-or auditioning the geometry the engine actually pans with.
+`bw_set_panner` chooses the per-source panner behind the 26-ch bus:
+
+- **DBAP** (default) is listener-relative and recomputed per block from the tracked pose.
+  This is the panner for a **moving** observer roaming the array.
+- **SPCAP** is a smooth, all-speaker, placement-correcting sweet-spot panner for a **fixed**
+  observer: don't track, set the sweet spot once. It conserves loudspeaker power across an
+  uneven array.
+- **VBAP** is the sharpest — the 2-3 speakers of the containing triangle carry a source. Also
+  fixed-observer, best on a cleanly-triangulable array; it falls back to DBAP otherwise.
+
+The switch is atomic, so flipping it live is safe — the layout tool's `B` key A/Bs panners
+exactly this way.
+
+`bw_set_dual_band` (off by default, live-toggleable) **wraps** the selected panner. It splits
+each source at ~700 Hz, then pans the low band with **amplitude** (pressure / velocity-vector)
+normalisation and the high band with the panner's usual **power** (energy-vector) normalisation —
+SPAT's "VBP Dual-Band". You get sharper low-frequency localisation for a near-centred listener.
+The panning *direction* is unchanged; only the low band's level/coherence differs. It is
+sweet-spot dependent like VBAP, so for a roaming listener it's a by-ear / measurement call.
+
+`bw_set_bed_decoder` chooses the **diffuse-bed** SH→26 decoder. It affects the ambisonic and
+reflection beds only, never the point-source panner:
+
+- **sampling** (default): the straightforward projection decode.
+- **AllRAD**: decode to a uniform virtual layout, then VBAP onto the real array. Robust on an
+  irregular array, at the cost of a heavier load-time build.
+
+The decoder is load-time (between `bw_create` and `bw_start`); see
+[`spatialization.md`](./spatialization.md) for the theory.
+
+`bw_get_speakers` returns the effective layout (the default grid, or the `layout_path` file) as
+`cap*3` floats in channel order, plus the count (26). Use it to visualize or audition the
+geometry the engine is actually panning with.
 
 ## Output protection limiter (control thread; ON by default)
 
@@ -402,13 +523,16 @@ void bw_set_limiter(BwEngine* e, bool on);                     // live
 void bw_set_limiter_ceiling(BwEngine* e, float ceiling_db);    // default -1 dBFS; clamped [-60, 0]
 ```
 
-The final stage on the 26-ch output — everything (voices, beds, the reflection/pathing taps, the
-per-speaker align stage, the test signal) passes through it before the device. It is **linked**
-across channels: one gain, derived from the cross-channel peak, so engaging never shifts the
-spatial image; ~1 ms attack / ~120 ms release one-poles, then a hard clamp at the ceiling (the
-attack is not lookahead, so the first millisecond of a hot transient clips instead of overshooting).
+The final stage on the 26-ch output. Everything — voices, beds, the reflection/pathing taps, the
+per-speaker align stage, the test signal — passes through it before the device.
+
+It is **linked** across channels: one gain, derived from the cross-channel peak, so engaging never
+shifts the spatial image. ~1 ms attack / ~120 ms release one-poles, then a hard clamp at the
+ceiling. The attack is not lookahead, so the first millisecond of a hot transient clips instead of
+overshooting.
+
 This is driver/speaker **protection** against digital overs and pathological content, not a
-mastering limiter — if it engages in normal use, turn the content down. In the `binaural` profile
+mastering limiter. If it engages in normal use, turn the content down. In the `binaural` profile
 the same limited bus feeds the monitor, so headphones inherit the ceiling too.
 
 ## Reflection bed (control thread)
@@ -422,27 +546,36 @@ void bw_source_set_reflection_send(BwEngine* e, BwSource s, float gain);    // p
 void bw_source_set_reflection_distance(BwEngine* e, BwSource s, bool on);   // far = wetter
 ```
 
-A single shared **listener-centric reverb bed** decoded straight to the 26 channels and summed onto
-the bus. `bw_reflections_config` is **load-time** (the IR length + ambisonic order are baked at
-`bw_start`); zero fields take defaults (`ir_seconds` 1.0, `order` 1, `num_rays` 4096, `num_bounces`
-16, `wet_gain` 1.0), `enabled = 0` means no bed is created and the engine behaves exactly as without
-it. `bw_reflections_set_gain` adjusts the wet level live (a single atomic the audio-thread tap reads).
-`bw_source_set_reflections` is the per-frame, non-blocking opt-in of a source into the bed's wet send
-(with the bed disabled or no SDK, it gates a send that goes nowhere). Per source, the send level is
-`bw_source_set_reflection_send` (default 1.0 — drive it for a manual dry/wet), and
-`bw_source_set_reflection_distance` enables an automatic **distance→wet** scaling (near = drier, far =
-wetter, on top of the level). The effective send is computed + **ramped on the audio thread** (in
-`rt.c`, from the source↔listener distance), so motion and on/off don't zipper the send. The bed runs Steam Audio's
-**HYBRID** reverb — **directional** early-reflection convolution (full ambisonic, order = `order`) +
-parametric (FDN) tail, decoded across the 26 speakers (requires the vendored phonon's alignment patch;
-see [materials.md](.\materials.md)). No-op without the Steam Audio build.
+A single shared **listener-centric reverb bed**, decoded straight to the 26 channels and summed
+onto the bus. It runs Steam Audio's **HYBRID** reverb: directional early-reflection convolution
+(full ambisonic, order = `order`) plus a parametric (FDN) tail, decoded across the 26 speakers.
+(This needs the vendored phonon's alignment patch — see [materials.md](./materials.md).) No-op
+without the Steam Audio build.
+
+Configuration is load-time; the sends are live:
+
+- **`bw_reflections_config`** must land before `bw_start` — the IR length and ambisonic order are
+  baked there. Zero fields take defaults (`ir_seconds` 1.0, `order` 1, `num_rays` 4096,
+  `num_bounces` 16, `wet_gain` 1.0). `enabled = 0` creates no bed; the engine behaves exactly as
+  without one.
+- **`bw_reflections_set_gain`** adjusts the wet level live — a single atomic the audio-thread tap
+  reads.
+- **`bw_source_set_reflections`** opts a source into the bed's wet send. Per-frame, non-blocking;
+  with the bed disabled (or no SDK) it gates a send that goes nowhere.
+- **`bw_source_set_reflection_send`** sets that source's send level (default 1.0). Drive it
+  yourself for a manual dry/wet.
+- **`bw_source_set_reflection_distance`** adds automatic **distance→wet** scaling on top:
+  near = drier, far = wetter.
+
+The effective send is computed and **ramped on the audio thread** (in `rt.c`, from the
+source↔listener distance), so motion and on/off toggles never zipper the send.
 
 ## Handle scheme
 
-`BwSound` and `BwSource` are opaque `uint32_t` = `(index | generation<<16)`. A stale
-handle (slot destroyed, then reused) fails the generation check on the audio side and
-is silently dropped rather than crashing. `0` is always invalid. Callers should treat
-handles as tokens — never do arithmetic on them.
+`BwSound`, `BwSource`, and `BwBed` are opaque `uint32_t` = `(index | generation<<16)`. A stale
+handle (slot destroyed, then reused) fails the generation check on the audio side and is
+silently dropped rather than crashing. `0` is always invalid. Treat handles as tokens — never
+do arithmetic on them.
 
 ## Planned extension point
 

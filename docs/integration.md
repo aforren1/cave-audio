@@ -1,37 +1,56 @@
 # Engine integration
 
-The engine difference is entirely in how transforms and tracking are read and
-converted; the audio code is identical. No audio crosses the boundary — only control
-calls on the main thread.
+Unity and Unreal differ only in how transforms and tracking are read and
+converted at the boundary. The audio code is identical. No audio crosses the
+boundary — only control calls on the main thread.
 
 ## Coordinate seam (the part that silently ruins spatial audio)
 
-The core works in **room space: right-handed, +Y up, +Z forward, metres, origin on the
-floor** — exactly OptiTrack/Motive's default streamed frame (the ground-plane square
-defines the floor), so tracked rigid-body poses pass through unchanged: no rotation, no
-translation (an identity head quaternion faces +Z; the listener's right ear is at −X;
-y is height above the floor). The engine references the **array centroid** as its nominal
-listening point, so the origin's exact spot is not audio-load-bearing. Engines do not
-share this frame. Convert every position and quaternion at the boundary:
+The core works in **room space: right-handed, +Y up, +Z forward, metres, origin on
+the floor**. This is exactly OptiTrack/Motive's default streamed frame (the
+ground-plane square defines the floor), so tracked rigid-body poses pass through
+unchanged: no rotation, no translation. An identity head quaternion faces +Z, the
+listener's right ear is at −X, and y is height above the floor.
+
+The engine references the **array centroid** as its nominal listening point, so the
+origin's exact spot is not audio-load-bearing.
+
+Game engines do not share this frame. Convert every position and quaternion at the
+boundary:
 
 - **Unity** is left-handed, +Y up, +Z forward. Up and forward already agree, so the
-  baseline conversion is a single axis flip (negate X — Unity identity rotation maps
-  to room identity), then apply the CAVE registration matrix that maps Unity world →
-  room/Motive origin (Motive's ground plane is calibrated to deck center, so the real
-  mapping lives in that matrix — the bare X-negation is only the handedness part).
+  baseline conversion is a single axis flip: negate X (Unity identity rotation maps
+  to room identity). Then apply the CAVE registration matrix that maps Unity world →
+  room/Motive origin. Motive's ground plane is calibrated to deck center, so the
+  real mapping lives in that matrix — the bare X-negation is only the handedness part.
 - **Unreal** is left-handed, Z-up, centimeters. Convert to room meters and apply the
-  registration matrix similarly.
+  registration matrix the same way.
 
-Get this wrong and sources end up mirrored or rotated 90° — budget time to verify it
-with a known-position test source before trusting anything else.
+Get this wrong and sources end up mirrored or rotated 90°. Budget time to verify the
+conversion with a known-position test source before trusting anything else.
 
 ## Unity
 
 **Implemented as a UPM package — [`bindings/unity/`](../bindings/unity/) (`com.cave.bwaudio`).**
-See its [README](../bindings/unity/README.md) for install + plugin staging. Four pieces:
-`Bw` (the P/Invoke layer, verified 1:1 against the ABI), `Room` (the coordinate seam), `BwAudio`
-(the singleton manager + centralized per-frame push), and `BwEmitter` (the per-source component).
-The snippets below are the design rationale; the package is the source of truth.
+See its [README](../bindings/unity/README.md) for install + plugin staging.
+
+Four core pieces:
+
+- **`Bw`** — the P/Invoke layer, verified 1:1 against the ABI.
+- **`Room`** — the coordinate seam.
+- **`BwAudio`** — the singleton manager + centralized per-frame push.
+- **`BwEmitter`** — the per-source component.
+
+The rest of the Runtime folder: `BwAmbisonicBed` (a world-locked AmbiX soundfield
+component over `bw_bed_*`), `BwAcousticGeometry` (marks a mesh as
+occluding/reflecting geometry with a material; `BwAudio` bakes them all into one
+engine mesh at load), `BwMaterialAsset` (an acoustic material as a Project asset —
+engine preset name or custom 3-band coefficients), and `BwClipAttribute` (marks a
+string field as a StreamingAssets audio path). Editor-side: `BwAudioProjectCheck`
+(warns when Unity's built-in audio is still enabled, with one-click disable) and
+`BwClipDrawer` (the `[BwClip]` file picker).
+
+The snippets below explain the design; read the package for the current code.
 
 ### Binding
 
@@ -76,6 +95,31 @@ internal static class Bw {
 }
 ```
 
+The snippet shows the core calls. The shipped `Bw.cs` also binds the rest of the
+ABI surface:
+
+- **Voice management + scheduling**: `bw_source_set_priority`;
+  `bw_source_play_at` + `bw_dsp_time` (sample-accurate start).
+- **Transport**: `bw_source_set_paused`, `bw_source_seek`,
+  `bw_source_is_playing` — `BwEmitter` polls the playing state each frame to
+  fire its `onFinished` UnityEvent.
+- **Propagation effects**: `bw_source_set_doppler`, `bw_source_set_air_absorption`,
+  `bw_source_set_spread`.
+- **Occlusion + directivity**: `bw_source_set_occlusion` /
+  `bw_source_get_occlusion`, `bw_source_set_directivity` (+ preset),
+  `bw_source_set_orientation`.
+- **Reflections + pathing**: `bw_reflections_config`, `bw_reflections_set_gain`,
+  `bw_source_set_reflections` / `_reflection_send` / `_reflection_distance`,
+  `bw_source_set_pathing`.
+- **Ambisonic beds**: `bw_bed_create` / `bw_bed_play` / `bw_bed_set_gain` /
+  `bw_bed_stop` / `bw_bed_destroy`.
+- **Materials / scene geometry**: `bw_scene_set_mesh`, `bw_material_preset`,
+  `bw_material_define`, `bw_scene_set_mesh_mat`, `bw_scene_set_box`.
+- **Output stage + diagnostics**: `bw_set_panner`, `bw_set_dual_band`,
+  `bw_set_limiter` / `bw_set_limiter_ceiling`, `bw_set_bed_decoder`,
+  `bw_get_bus_levels`, `bw_test_signal`, `bw_get_speakers`.
+- **Assets**: `bw_load_sound_streaming`, `bw_load_ambix`.
+
 ### Coordinate helper
 
 ```csharp
@@ -95,12 +139,12 @@ public static class Room {
 
 ### Bootstrap (centralized per-frame push)
 
-Centralize the push in the manager rather than letting each emitter push in its own
-`LateUpdate` — Unity does not guarantee `LateUpdate` order across components, so
-per-emitter pushes risk committing a frame where the listener moved but some sources
-hadn't. The manager pushes all sources, then the listener, then commits, so every
-block the audio thread sees is internally consistent. That is what makes the
-moving-observer case correct.
+Centralize the push in the manager. Do not let each emitter push in its own
+`LateUpdate`: Unity does not guarantee `LateUpdate` order across components, so
+per-emitter pushes risk committing a frame where the listener moved but some
+sources hadn't. The manager pushes all sources, then the listener, then commits.
+Every block the audio thread sees is internally consistent — that is what makes
+the moving-observer case correct.
 
 ```csharp
 [DefaultExecutionOrder(-100)]
@@ -185,17 +229,20 @@ public sealed class BwEmitter : MonoBehaviour {
 ### Unity-specific traps
 
 - **Native plugins don't unload between Editor play sessions.** The DLL and its
-  globals persist. `bw_create` must not assume zeroed global state; `bw_destroy` must
-  fully tidy up — otherwise "fine on first Play, crashes on second." If Domain Reload
-  is disabled for fast enter-play, C# statics persist too; guard `Instance` re-init.
-- **Bypass `AudioClip`.** The core loads wav itself; hand it `StreamingAssets` paths
-  (real files on desktop builds) and keep audio assets out of Unity's import pipeline.
+  globals persist. `bw_create` must not assume zeroed global state, and `bw_destroy`
+  must fully tidy up — otherwise you get "fine on first Play, crashes on second."
+  If Domain Reload is disabled for fast enter-play, C# statics persist too; guard
+  the `Instance` re-init.
+- **Bypass `AudioClip`.** The core loads wav itself. Hand it `StreamingAssets`
+  paths (real files on desktop builds) and keep audio assets out of Unity's
+  import pipeline.
 
 ## Unreal (notes — not yet implemented)
 
 Same library, same C ABI, linked as a module. The per-engine work mirrors Unity:
+
 - A subsystem (e.g. a `UGameInstanceSubsystem`) owns `bw_create`/`start`/`stop`/
-  `destroy` and runs the centralized per-frame push from a single tick, for the same
+  `destroy` and runs the centralized per-frame push from a single tick — the same
   ordering reason as Unity's manager.
 - A scene component reads `GetActorLocation` (and head pose via a NatNet bridge or
   LiveLink) each tick, converts UE LH/Z-up/cm → room RH/m via the registration
@@ -204,7 +251,8 @@ Same library, same C ABI, linked as a module. The per-engine work mirrors Unity:
 
 ## Profile = desk-vs-CAVE, from the engine's view
 
-At the desk: `binaural` + `feedListener = true`, `listener` pointed at the XR camera,
-driving the same emitters and calls. In the CAVE: `cave` (or `both`) +
-`feedListener = false`, the core taking head pose straight from OptiTrack. Same build,
-same components, same control path — only the profile changes.
+At the desk: run `binaural` with `feedListener = true` and `listener` pointed at
+the XR camera, driving the same emitters and calls. In the CAVE: run `cave` (or
+`both`) with `feedListener = false`; the core takes head pose straight from
+OptiTrack. Same build, same components, same control path — only the profile
+changes.
