@@ -1,6 +1,91 @@
 # Changelog
 
-All notable changes to `com.cave.bwaudio`.
+All notable changes to `com.brainworks.bwaudio`.
+
+## [0.2.0]
+
+First **published** release: the package now ships as an installable UPM tarball with the native engine
+inside it (`bwaudio.dll` + `phonon.dll`, import settings pre-configured), so a Unity project consumes it
+without building any C++.
+
+- **Renamed to `com.brainworks.bwaudio`** (was `com.cave.bwaudio`). Done before anything shipped, so
+  there is nothing to migrate: the scope you add to `manifest.json` is now `com.brainworks`. The C#
+  namespace stays `CaveAudio` — this is the package identity, not the code.
+- **Distribution** — `tools/upm/pack.ps1` packs `com.brainworks.bwaudio-<version>.tgz` (uses `tar`, no
+  Node anywhere; CI packs on *every* run, so a broken package fails the build rather than the release).
+  A `v*` tag cuts a GitHub Release with that tarball attached, and **the Release is the publish**:
+  OpenUPM's `githubRelease` tracking mode serves that exact file — no registry push, no token. Install
+  with `openupm add com.brainworks.bwaudio`, or download the `.tgz` and use *Install package from
+  tarball…* if you'd rather not add a registry at all. See the README.
+- **`.meta` files are now committed** (`tools/upm/gen-meta.ps1`). A package installed from a registry is
+  immutable, so assets arriving without a `.meta` get a fresh random GUID in every project: a scene
+  referencing `BwEmitter` on one machine would deserialize as *"Missing (Mono Script)"* on another. The
+  native plugins' import settings (Windows x64, Editor enabled) ship the same way — in an immutable
+  package the user cannot fix them in the Inspector.
+- **Version/tag guard** — the pack fails if the git tag and `package.json` disagree, so a tarball can't
+  claim a version it isn't.
+
+### Usability pass
+
+The theme: the binding had several settings that failed *silently* — the engine survives them, logs
+something, and carries on sounding subtly wrong. Those are now impossible to express, or caught in the
+inspector where you can still see them.
+
+- **Materials are a dropdown, not a string.** `BwMaterialPreset` (mirrors the engine's table) replaces
+  the free-text preset name on `BwAudio.roomMaterial` and `BwMaterialAsset.preset`. An unrecognised name
+  was never an error — `bw_material_preset` quietly returns material 0 (generic) and leaves the reason in
+  `bw_last_error` — so a typo'd `"concreet"` wall just *sounded* wrong. **Breaking:** `BwMaterialAsset`
+  assets whose preset wasn't `concrete` will reset to Concrete; re-pick it from the dropdown.
+- **The layout file says where it goes.** `layoutFile` uses the `[BwClip(".json")]` picker (the same one
+  audio clips use), so it lists the JSON files actually present under `StreamingAssets`, flags a missing
+  one in red, and tooltips that the path is *relative to `Assets/StreamingAssets/`*. The inspector also
+  shows the **absolute path the engine will look in** when the file isn't there — paired with the
+  runtime error, both ends of that trap are now closed.
+- **Inspector sliders work in Play mode.** `BwEmitter` gained the `OnValidate` re-push that `BwAudio` and
+  `BwAmbisonicBed` already had. Dragging Gain/Pitch/Spread during Play used to change the field and
+  nothing else (the value is only read at source creation), which reads as a broken slider.
+- **Custom inspectors** for `BwAudio`, `BwEmitter` and `BwMaterialAsset`: settings that don't apply are
+  hidden (FDN decay with the FDN off, pose prediction when Unity feeds the pose, custom coefficients
+  under a preset material…), and the mistakes the engine merely *warns* about are surfaced as inspector
+  warnings — a missing layout, both reverb beds fighting over the one tap, reflections with no geometry
+  to reflect off. In Play mode `BwAudio` shows the live backend (flagging a **silent** fallback to the
+  null sink), channel count, active voices and per-channel output meters; `BwEmitter` shows its
+  ray-traced occlusion, which is otherwise invisible.
+- **The room box is visible.** It draws as a wireframe gizmo (`Room.RoomToUnityMatrix` — the inverse of
+  the coordinate seam, so a wrong `Room.UnityToRoom` makes the box land visibly in the wrong place).
+- **The speaker array is visible.** `BwAudio` draws each speaker as a gizmo, labelled with its channel
+  index. Stopped, the positions come from the layout **file**; in Play mode they come from the **engine**
+  (`bw_get_speakers`) and each one lights up with that channel's live output level, the same way the
+  playground's gizmos do — so a dead or mis-wired speaker is visible at a glance. The Play-mode source
+  matters: it's the geometry the engine is *actually* panning over, which means a failed layout load
+  shows up as the built-in 26-grid sitting where your room isn't.
+- **`BwSpeakerView` — live speaker activity you can see from inside the CAVE.** The gizmos above are an
+  *editor* feature and don't render in a build, so this is the runtime counterpart: one unlit marker per
+  channel, placed at the real speaker's position, brightening (and growing) with that channel's output.
+  Unlit on purpose — a CAVE is dark, so the colour computed is the colour seen, with no lights to set up.
+  Instant attack + slow release, because the engine reports a per-*block* peak that strobes too fast to
+  read raw. Uses the same `bw_get_speakers` + `bw_get_bus_levels` readbacks as everything else, writes no
+  audio state, and picks its shader across URP / HDRP / built-in. Optional: delete it and nothing changes
+  audibly.
+- **`BwRoomConstraints` — the physical room, in the scene view.** Reads the surveyed `constraints.json`
+  (from StreamingAssets) and draws it: green = the speaker truss, red = the CAVE screen cube / observer
+  keep-out, orange = the projectors. It's the **same file** `bw_layout_tool` and `bw_playground` read,
+  so the room has one source of truth and doesn't get re-authored as Unity geometry that can drift from
+  the survey. Purely a scene-view aid — no engine needed (it parses the JSON directly, so it works with
+  the editor stopped) and nothing audible depends on it.
+- **Minimum Unity is now 6000.0 (Unity 6)**, up from 2021.3. Nothing had ever been tested below it, and
+  the old floor was already forcing compatibility shims.
+- **No deprecation warnings.** The scene bake used `FindObjectsOfType`, deprecated in favour of
+  `FindObjectsByType`, which forces you to say whether you need the results sorted. We don't — every
+  geometry is baked into one mesh — so it passes `FindObjectsSortMode.None` and skips a pointless
+  InstanceID sort.
+- **Packing no longer dies on a locked DLL.** An open Unity Editor holds `bwaudio.dll` loaded out of
+  `Runtime/Plugins/x86_64/`, so it can't be overwritten — `pack.ps1` now hashes first and skips the copy
+  when the binary is already identical, and explains itself instead of throwing a raw IOException when
+  it genuinely has to write. (A CMake rebuild hits the same lock; close the editor first.)
+- **A tracked listener with nothing to track now warns** — `feedListener` on with no `listener` Transform
+  silently left the listener parked at the array centroid, panning every source for a head that never
+  moves.
 
 ## [0.1.0] — unreleased
 

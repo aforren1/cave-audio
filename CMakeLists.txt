@@ -72,6 +72,7 @@ add_library(bw_core OBJECT
   src/ambisonics.c
   src/allrad.c
   src/fdn.c
+  src/ism.c
   src/natnet.c
   src/measure.c
   src/calib.c
@@ -306,6 +307,11 @@ if(BWAUDIO_BUILD_TESTS)
   add_executable(test_fdn test/fdn_test.c)
   target_link_libraries(test_fdn PRIVATE bw_core)
   add_test(NAME fdn COMMAND test_fdn)
+
+  # Image-source early reflections: the shoebox mirror geometry (the rt test drives the render).
+  add_executable(test_ism test/ism_test.c)
+  target_link_libraries(test_ism PRIVATE bw_core)
+  add_test(NAME ism COMMAND test_ism)
 
   add_executable(test_zylia test/zylia_test.c)
   target_link_libraries(test_zylia PRIVATE bw_core)

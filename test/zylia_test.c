@@ -9,6 +9,7 @@
 
 #include <math.h>
 #include <stdio.h>
+#include <stdlib.h>
 
 static int fails = 0;
 #define CHECK(cond, msg) do { if (!(cond)) { printf("FAIL: %s\n", msg); ++fails; } } while (0)
@@ -23,9 +24,263 @@ static void synth(const float center[3], const double src[3], double latency, do
     }
 }
 
+/* ---- the capsule table is a vertex-up dodecahedron minus its nadir vertex ----
+ *
+ * Worth being clear about what this can and cannot do. Every OTHER test in this file synthesizes its
+ * arrivals from zylia_geometry and then recovers them through zylia_geometry, so a wrong table cancels
+ * exactly and they all pass regardless — they pin the algebra, not the array. These checks pin the
+ * TABLE, by asserting the structure that makes it a dodecahedron rather than 19 arbitrary points.
+ *
+ * What still escapes: a PERMUTATION of the table (channel order) and a global ROTATION (which capsule
+ * faces the device front) both preserve every property below. Neither is knowable off-hardware — they
+ * get pinned at the rig, or measured by the capsule self-survey. See zylia.c.
+ */
+static void test_geometry(void) {
+    float dirs[ZYLIA_MICS][3]; float R;
+    zylia_geometry(dirs, &R);
+
+    CHECK(R > 0.03f && R < 0.07f, "radius is a ~100 mm sphere");
+
+    int unit = 1;
+    for (int i = 0; i < ZYLIA_MICS; ++i) {
+        double m = sqrt((double)dirs[i][0]*dirs[i][0] + (double)dirs[i][1]*dirs[i][1] + (double)dirs[i][2]*dirs[i][2]);
+        if (fabs(m - 1.0) > 1e-5) unit = 0;
+    }
+    CHECK(unit, "all 19 capsule directions are unit vectors");
+
+    /* elevation rings: 1 @ +90, 3 @ +48.19, 6 @ +19.47, 6 @ -19.47, 3 @ -48.19 (the absent 20th
+     * dodecahedral vertex is the 1 @ -90). Any other split is not this solid. */
+    const double EL_A = asin(sqrt(5.0) / 3.0) * 180.0 / 3.14159265358979;   /* 48.1897 */
+    const double EL_B = asin(1.0 / 3.0)       * 180.0 / 3.14159265358979;   /* 19.4712 */
+    const double ring[5] = { 90.0, EL_A, EL_B, -EL_B, -EL_A };
+    const int    want[5] = {    1,    3,    6,     6,     3 };
+    int got[5] = {0}, stray = 0;
+    for (int i = 0; i < ZYLIA_MICS; ++i) {
+        double el = asin(dirs[i][1] > 1.0 ? 1.0 : (dirs[i][1] < -1.0 ? -1.0 : dirs[i][1])) * 180.0 / 3.14159265358979;
+        int hit = 0;
+        for (int r = 0; r < 5; ++r) if (fabs(el - ring[r]) < 0.05) { ++got[r]; hit = 1; break; }
+        if (!hit) ++stray;
+    }
+    CHECK(!stray, "every capsule lands on a dodecahedral elevation ring");
+    int rings_ok = 1;
+    for (int r = 0; r < 5; ++r) if (got[r] != want[r]) rings_ok = 0;
+    CHECK(rings_ok, "ring populations are 1 / 3 / 6 / 6 / 3");
+    printf("[geometry    ] R=%.3f m  rings %d/%d/%d/%d/%d @ el %+.2f %+.2f %+.2f %+.2f %+.2f\n",
+           R, got[0], got[1], got[2], got[3], got[4], ring[0], ring[1], ring[2], ring[3], ring[4]);
+
+    /* A dodecahedron's vertices are antipodally symmetric. Drop the nadir and EVERY capsule still has
+     * its opposite in the table except the zenith, which is left unpaired. Two consequences, and the
+     * second is the sharp one: the 18 paired vectors cancel, so the whole table sums to the zenith. */
+    int unpaired = 0;
+    for (int i = 0; i < ZYLIA_MICS; ++i) {
+        int found = 0;
+        for (int j = 0; j < ZYLIA_MICS; ++j) {
+            double dot = (double)dirs[i][0]*dirs[j][0] + (double)dirs[i][1]*dirs[j][1] + (double)dirs[i][2]*dirs[j][2];
+            if (dot < -0.9999) { found = 1; break; }
+        }
+        if (!found) ++unpaired;
+    }
+    CHECK(unpaired == 1, "exactly one capsule (the zenith) has no antipode — the nadir is the missing vertex");
+
+    double sx = 0, sy = 0, sz = 0;
+    for (int i = 0; i < ZYLIA_MICS; ++i) { sx += dirs[i][0]; sy += dirs[i][1]; sz += dirs[i][2]; }
+    CHECK(fabs(sx) < 1e-4 && fabs(sy - 1.0) < 1e-4 && fabs(sz) < 1e-4,
+          "the table sums to the zenith (0,1,0): the other 18 cancel in antipodal pairs");
+
+    /* adjacent dodecahedral vertices subtend arccos(sqrt5/3) = 41.81 deg; nothing may be closer
+     * (a duplicated or collapsed capsule would show up here and nowhere else). */
+    double closest = 180.0;
+    for (int i = 0; i < ZYLIA_MICS; ++i)
+        for (int j = i + 1; j < ZYLIA_MICS; ++j) {
+            double dot = (double)dirs[i][0]*dirs[j][0] + (double)dirs[i][1]*dirs[j][1] + (double)dirs[i][2]*dirs[j][2];
+            double deg = acos(fmax(-1.0, fmin(1.0, dot))) * 180.0 / 3.14159265358979;
+            if (deg < closest) closest = deg;
+        }
+    printf("[geometry    ] closest capsule pair %.3f deg (dodecahedral edge = 41.810)\n", closest);
+    CHECK(fabs(closest - 41.8103) < 0.01, "closest pair is the dodecahedral edge angle, 41.81 deg");
+}
+
+/* ---- capsule self-survey ----
+ *
+ * This is the test the others can't be. Build a "real" array that differs from the built-in table in
+ * exactly the ways a real ZM-1 on a real stand does — its channels PERMUTED (node i is not ASIO input
+ * i), the whole thing ROTATED (nobody knows which capsule faces front, and nobody aimed the stand),
+ * and each capsule nudged half a millimetre — then synthesize claps off the EXACT spherical wavefront
+ * and check the survey recovers it. Both of those corruptions preserve every structural invariant
+ * test_geometry() checks, and both are invisible to every other test in this file, because they all
+ * synthesize and recover through the same table. Here they are the thing under test.
+ *
+ * The last check is the one that matters: the same arrivals, decoded against the BUILT-IN table, must
+ * come out badly wrong. If they didn't, the survey wouldn't be buying anything.
+ */
+static void test_survey(void) {
+    const double C = 343.0;
+    enum { NOBS = 14 };
+
+    /* the "real" array: table -> permute channels -> rotate -> perturb */
+    float truth[ZYLIA_MICS][3];
+    {
+        float dirs[ZYLIA_MICS][3], R;
+        zylia_set_capsules(NULL);                       /* build truth off the pristine table */
+        zylia_geometry(dirs, &R);
+        const double yaw = 0.7, pit = 0.3;              /* an arbitrary, un-aimed stand */
+        const double cy = cos(yaw), sy = sin(yaw), cp = cos(pit), sp = sin(pit);
+        unsigned rng = 4242u;
+        for (int ch = 0; ch < ZYLIA_MICS; ++ch) {
+            int node = (ch * 7 + 3) % ZYLIA_MICS;       /* gcd(7,19)=1 -> a genuine permutation */
+            double x = R * dirs[node][0], y = R * dirs[node][1], z = R * dirs[node][2];
+            double x1 =  cy * x + sy * z, z1 = -sy * x + cy * z;              /* yaw   */
+            double y2 =  cp * y - sp * z1, z2 = sp * y + cp * z1;             /* pitch */
+            double v[3] = { x1, y2, z2 };
+            for (int a = 0; a < 3; ++a) {               /* +-0.5 mm of build tolerance */
+                rng = rng * 1664525u + 1013904223u;
+                v[a] += ((double)(int)(rng >> 9) / (double)(1 << 22) - 1.0) * 0.0005;
+                truth[ch][a] = (float)v[a];
+            }
+        }
+    }
+
+    /* claps from NOBS spread positions (Fibonacci sphere at 2.5 m — deliberately including high and
+     * low, which is what the solve needs and what a careless operator clapping in a ring would not
+     * give it) */
+    float src_m[NOBS][3];
+    double arr[NOBS][ZYLIA_MICS];
+    const double golden = 2.399963229728653, DIST = 2.5;
+    for (int k = 0; k < NOBS; ++k) {
+        double yy = 1.0 - 2.0 * ((double)k + 0.5) / (double)NOBS;
+        double rr = sqrt(fmax(0.0, 1.0 - yy * yy)), th = golden * (double)k;
+        src_m[k][0] = (float)(DIST * rr * cos(th));
+        src_m[k][1] = (float)(DIST * yy);
+        src_m[k][2] = (float)(DIST * rr * sin(th));
+
+        /* EXACT spherical wavefront (the survey's linear seed assumes a plane one, and iterates the
+         * difference away) + a per-clap offset standing in for latency / onset / tdoa's reference
+         * channel. Both must wash out. */
+        double t0 = 0.001 * (double)k + 0.0033;
+        for (int i = 0; i < ZYLIA_MICS; ++i) {
+            double dx = truth[i][0]-src_m[k][0], dy = truth[i][1]-src_m[k][1], dz = truth[i][2]-src_m[k][2];
+            arr[k][i] = sqrt(dx*dx + dy*dy + dz*dz) / C + t0;
+        }
+    }
+
+    float caps[ZYLIA_MICS][3], resid_us = 0, radius = 0, spread = 0;
+    int ok = zylia_survey(src_m, arr, NOBS, C, caps, &resid_us, &radius, &spread);
+    CHECK(ok, "survey solves from 14 spread claps");
+
+    double worst = 0.0;
+    for (int i = 0; i < ZYLIA_MICS; ++i) {
+        double e = sqrt((double)(caps[i][0]-truth[i][0])*(caps[i][0]-truth[i][0]) +
+                        (double)(caps[i][1]-truth[i][1])*(caps[i][1]-truth[i][1]) +
+                        (double)(caps[i][2]-truth[i][2])*(caps[i][2]-truth[i][2]));
+        if (e > worst) worst = e;
+    }
+    printf("[survey      ] worst capsule err %.3f mm  resid %.3f us  R=%.1f mm  spread %.2f\n",
+           worst * 1000.0, resid_us, radius * 1000.0, spread);
+    /* The residual is the real proof: 5 ns says the recovered geometry explains the arrivals to well
+     * under a thousandth of a sample, i.e. the cloud's SHAPE is exact. The absolute positions carry a
+     * little more error than that, and necessarily so: a translation of the whole cloud is invisible to
+     * arrival times (see zylia.c), so the origin is pinned by assuming the capsules lie on a sphere —
+     * and this truth array deliberately does NOT, having been perturbed by +-0.5 mm of build tolerance.
+     * That non-sphericity is the entire budget for the sub-0.2 mm centre error below. It costs nothing
+     * where it counts: DOA is translation-invariant, which is why it comes out exact. */
+    CHECK(resid_us < 0.02f, "residual ~5 ns: the recovered shape explains the arrivals exactly");
+    CHECK(worst < 3e-4, "every capsule within 0.3 mm — through a permutation, a rotation, and 0.5 mm of slop");
+    CHECK(radius > 0.045f && radius < 0.053f, "recovered radius lands on the ~49 mm shell");
+    CHECK(spread > 0.5f, "Fibonacci clap directions are well spread");
+
+    /* the recovered array is the real one -> DOA works. The built-in table is NOT -> DOA is garbage.
+     * Same arrivals both times; the only difference is which geometry decodes them. */
+    const double D = 3.0;
+    float probe[3] = { 0.48f, 0.60f, -0.64f };
+    double m = sqrt((double)probe[0]*probe[0] + (double)probe[1]*probe[1] + (double)probe[2]*probe[2]);
+    probe[0] /= (float)m; probe[1] /= (float)m; probe[2] /= (float)m;
+    double src[3] = { D*probe[0], D*probe[1], D*probe[2] }, a2[ZYLIA_MICS];
+    for (int i = 0; i < ZYLIA_MICS; ++i) {
+        double dx = truth[i][0]-src[0], dy = truth[i][1]-src[1], dz = truth[i][2]-src[2];
+        a2[i] = sqrt(dx*dx + dy*dy + dz*dz) / C + 0.0071;
+    }
+    float d_surv[3], d_table[3];
+    zylia_set_capsules(caps);  CHECK(zylia_doa(a2, d_surv),  "DOA against the surveyed array");
+    zylia_set_capsules(NULL);  CHECK(zylia_doa(a2, d_table), "DOA against the built-in table");
+
+    double dot_s = d_surv[0]*probe[0]  + d_surv[1]*probe[1]  + d_surv[2]*probe[2];
+    double dot_t = d_table[0]*probe[0] + d_table[1]*probe[1] + d_table[2]*probe[2];
+    double deg_s = acos(fmax(-1.0, fmin(1.0, dot_s))) * 180.0 / 3.14159265358979;
+    double deg_t = acos(fmax(-1.0, fmin(1.0, dot_t))) * 180.0 / 3.14159265358979;
+    printf("[survey      ] DOA err: surveyed %.2f deg   built-in table %.1f deg\n", deg_s, deg_t);
+    CHECK(deg_s < 1.0,  "surveyed geometry decodes the clap correctly");
+    CHECK(deg_t > 10.0, "the built-in table does NOT — the permutation/rotation is what the survey buys");
+
+    /* a per-observation constant is unknowable and must be irrelevant (it is why no sample-sync, no
+     * known latency, and tdoa's arbitrary reference channel are all fine) */
+    {
+        double shifted[NOBS][ZYLIA_MICS];
+        for (int k = 0; k < NOBS; ++k)
+            for (int i = 0; i < ZYLIA_MICS; ++i) shifted[k][i] = arr[k][i] + 0.017 * (k + 1) - 0.004;
+        float c2[ZYLIA_MICS][3];
+        CHECK(zylia_survey(src_m, shifted, NOBS, C, c2, NULL, NULL, NULL), "survey solves on shifted arrivals");
+        double w = 0.0;
+        for (int i = 0; i < ZYLIA_MICS; ++i)
+            for (int a = 0; a < 3; ++a) w = fmax(w, fabs((double)c2[i][a] - caps[i][a]));
+        CHECK(w < 1e-9, "per-observation offsets (latency / onset / reference channel) cancel exactly");
+    }
+
+    /* the operator trap: claps in a horizontal ring are coplanar, the capsules' heights are then
+     * unconstrained, and a solve that "succeeded" would be a flattened array. Refuse, don't guess. */
+    {
+        float flat[8][3]; double fa[8][ZYLIA_MICS]; float c3[ZYLIA_MICS][3]; float sp = -1.0f;
+        for (int k = 0; k < 8; ++k) {
+            double th = 6.2831853 * k / 8.0;
+            flat[k][0] = (float)(2.5 * cos(th)); flat[k][1] = 0.0f; flat[k][2] = (float)(2.5 * sin(th));
+            for (int i = 0; i < ZYLIA_MICS; ++i) fa[k][i] = arr[0][i];   /* contents irrelevant: it must refuse */
+        }
+        CHECK(!zylia_survey(flat, fa, 8, C, c3, NULL, NULL, &sp), "coplanar clap directions are refused");
+        CHECK(sp >= 0.0f && sp < 0.05f, "...and the spread metric says why");
+    }
+
+    /* persistence: a survey is worthless if it doesn't survive a restart. Round-trip it and check the
+     * SOLVE follows — reading the file back must install the geometry, not merely parse it. */
+    {
+        const char* path = "zylia_survey_test.json";
+        char e[128] = {0};
+        CHECK(zylia_survey_save(path, caps, resid_us, radius, spread, NOBS, e, sizeof e), "survey saves");
+
+        zylia_set_capsules(NULL);                        /* wipe it, so a no-op load would be caught */
+        CHECK(zylia_survey_load(path, e, sizeof e), "survey loads");
+
+        float back[ZYLIA_MICS][3];
+        zylia_capsules(back);
+        double w = 0.0;
+        for (int i = 0; i < ZYLIA_MICS; ++i)
+            for (int a = 0; a < 3; ++a) w = fmax(w, fabs((double)back[i][a] - caps[i][a]));
+        CHECK(w < 1e-6, "round-tripped capsules match to float precision");
+
+        float d3[3];
+        CHECK(zylia_doa(a2, d3), "DOA after load");
+        double dot = d3[0]*probe[0] + d3[1]*probe[1] + d3[2]*probe[2];
+        CHECK(acos(fmax(-1.0, fmin(1.0, dot))) * 180.0 / 3.14159265358979 < 1.0,
+              "the LOADED survey drives the solve — persistence reaches zylia_doa, not just the parser");
+
+        /* a mm-vs-m slip would put capsules 49 metres out and quietly destroy every direction */
+        {
+            float bad[ZYLIA_MICS][3];
+            for (int i = 0; i < ZYLIA_MICS; ++i)
+                for (int a = 0; a < 3; ++a) bad[i][a] = caps[i][a] * 1000.0f;
+            CHECK(zylia_survey_save(path, bad, 0, 49, 1, NOBS, e, sizeof e), "save (bad units)");
+            CHECK(!zylia_survey_load(path, e, sizeof e), "a mm-vs-m unit slip is rejected on load");
+        }
+        remove(path);
+    }
+
+    zylia_set_capsules(NULL);                            /* leave the global default installed */
+}
+
 int main(void) {
     const double C = 343.0, LAT = 0.0047;       /* arbitrary nonzero system latency */
     const float center[3] = { 0.1f, 1.2f, -0.3f };   /* array placed off-origin in the room */
+
+    test_geometry();
+    test_survey();
 
     struct { double pos[3]; const char* name; } cases[] = {
         {{  2.0,  1.2, -0.3 }, "right  (+X)"},

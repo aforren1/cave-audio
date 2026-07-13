@@ -1,4 +1,4 @@
-# BwAudio — Unity package (`com.cave.bwaudio`)
+# BwAudio — Unity package (`com.brainworks.bwaudio`)
 
 Unity **control client** for the bwaudio spatial-audio engine. Unity is a *thin* client: it sends
 control (source positions, triggers, listener pose) over the engine's C ABI — **no audio crosses the
@@ -38,37 +38,155 @@ engine owns decoding (and avoids Unity's 8-channel output cap entirely).
 
 ## Install
 
-Add to your project's `Packages/manifest.json` (local path or git URL):
+**Windows x64 only** (ASIO is Windows-only). A released package **ships the native engine** —
+`bwaudio.dll` + `phonon.dll` are inside it, with import settings already configured. Nothing to build.
+
+### From OpenUPM (recommended)
+
+```
+openupm add com.brainworks.bwaudio
+```
+
+…or, without the CLI, add the registry by hand in `Packages/manifest.json`. The package then appears
+under **Package Manager → My Registries**, and upgrades are a click.
 
 ```json
-"com.cave.bwaudio": "file:../../cave-audio/bindings/unity"
+{
+  "scopedRegistries": [
+    {
+      "name": "package.openupm.com",
+      "url": "https://package.openupm.com",
+      "scopes": ["com.brainworks"]
+    }
+  ],
+  "dependencies": {
+    "com.brainworks.bwaudio": "0.2.0"
+  }
+}
 ```
 
-…or copy this folder into `Packages/com.cave.bwaudio/`.
+(Unity's "scope" is a package-name *prefix*, not an npm `@scope` — which is why this works on OpenUPM
+or npmjs but *cannot* work on GitHub Packages, whose npm registry only accepts `@owner/name`.)
 
-## Native plugins (required)
+### From a release tarball (no registry)
 
-The package calls into two native DLLs that the **engine build produces** (they are gitignored, not
-shipped in source):
+Grab `com.brainworks.bwaudio-<version>.tgz` from the
+[Releases](https://github.com/aforren1/cave-audio/releases) page, then **Package Manager → `+` →
+Install package from tarball…**. It is byte-for-byte the *same* artifact OpenUPM serves — just pinned
+by hand instead of resolved, so it won't offer upgrades.
+
+### From source (developing the engine itself)
+
+Point the manifest at your working tree, and the CMake build's POST_BUILD copy keeps the plugins fresh:
+
+```json
+"com.brainworks.bwaudio": "file:../../cave-audio/bindings/unity"
+```
+
+The DLLs are gitignored build output, so a **git-URL install of this repo will not work** — you'd get
+the C# with no engine behind it (`DllNotFoundException` on the first call). Use the registry or a
+tarball, both of which carry the binaries.
+
+> **License:** the engine is **GPLv3** (`bwaudio.dll` links the ASIO SDK under its GPLv3 option).
+> Internal use never triggers copyleft — it's a *distribution* condition. But shipping a Unity app
+> containing this DLL to third parties would place that app under GPLv3; see
+> [`docs/build.md`](../../docs/build.md) for the proprietary-ASIO alternative.
+
+## Releasing (maintainers)
+
+**The GitHub Release *is* the publish.** OpenUPM runs in `githubRelease` tracking mode: it discovers
+the git tag, finds the Release whose tag matches, and serves the attached `.tgz` unchanged. So there is
+no registry push, **no token, and no secret to rotate** — and the same file is the manual-tarball
+download.
+
+To cut a release: bump `version` in `package.json` (+ the CHANGELOG), then push a matching tag
+(`v0.2.0`). CI packs on *every* run — so a broken package fails the build rather than the release — and
+on a tag it creates the Release with the tarball attached. **The pack fails if the tag and the manifest
+disagree**, so a tarball can't claim a version it isn't.
+
+Locally:
 
 ```
-Runtime/Plugins/x86_64/
-  bwaudio.dll      # the engine
-  phonon.dll       # Steam Audio (occlusion/reflections/HRTF) — must include the alignment patch
+cmake --build build --config RelWithDebInfo         # produces the DLLs
+powershell -File tools/upm/pack.ps1                 # -> dist/com.brainworks.bwaudio-<version>.tgz
 ```
 
-The engine's CMake build stages them here automatically (a POST_BUILD copy). For a manual/release
-install, copy them from `build/<config>/` into `Runtime/Plugins/x86_64/`. The `x86_64` folder name
-makes Unity auto-import them for **Standalone Windows x64** (ASIO is Windows-only). Confirm in the
-plugin importer that the platform is set to *Windows x86_64* and **Editor** is enabled (so it works
-in Play mode).
+Two things that will bite if forgotten:
+
+- **New file in the package? Run `tools/upm/gen-meta.ps1`.** Every asset must ship a committed `.meta`,
+  or its GUID is regenerated per-project and scenes lose their script references. `pack.ps1` refuses to
+  build a tarball with one missing.
+- **Attaching a second `.tgz` to a Release breaks OpenUPM** — it expects exactly one publishable
+  tarball. If that ever changes, set `githubReleaseAssetName` in the OpenUPM package config to the
+  stable prefix `com.brainworks.bwaudio-`.
+
+One-time setup (already done, recorded here for the next person): the package was submitted to
+[OpenUPM](https://openupm.com/packages/add/) with `trackingMode: githubRelease`, which is what makes it
+serve our pre-built tarball instead of trying to `npm pack` a git clone — the default mode would ship
+the C# with **no DLLs**, since those are gitignored build output.
 
 ## Assets under StreamingAssets
 
-The engine loads files itself — **do not** use Unity `AudioClip`. Put under `Assets/StreamingAssets/`:
+The engine loads files itself — **do not** use Unity `AudioClip`. Everything it reads lives in
+`Assets/StreamingAssets/`, and every file field on a component is a path **relative to that folder**
+(the `[BwClip]` picker only lists what's actually there, so you don't type paths by hand):
 
-- `cave_layout.json` — surveyed speaker geometry (`cave`/`both` profiles).
-- your audio (`.wav` / `.flac` / `.mp3`; resampled to the engine rate at load).
+```
+Assets/
+  StreamingAssets/          <- create this folder; Unity does not by default
+    cave_layout.json        <- surveyed speaker geometry
+    sfx/footsteps.wav       <- your audio (.wav / .flac / .mp3)
+```
+
+- `cave_layout.json` — the surveyed speaker geometry. **Watch this one:** if it's missing or fails to
+  parse, the engine does *not* stop — it falls back to its built-in 26-speaker grid and only records why
+  in `bw_last_error`. On a rig that isn't 26 speakers that silently changes the channel count too, so
+  every source gets panned over geometry that isn't the one in your room. `BwAudio` logs an error at
+  startup if this happens, and the inspector warns (showing the exact absolute path it will look in)
+  before you ever hit Play.
+- `constraints.json` *(optional)* — the surveyed **room**: the speaker truss, the CAVE screen cube, the
+  projectors. Add a **`BwRoomConstraints`** component and it draws them in the scene view (green truss,
+  red keep-out, orange obstacles) so you can place content against the real room instead of guessing.
+  It's the same file `bw_layout_tool` and `bw_playground` read — one source of truth; don't re-author
+  those boxes as Unity geometry. It affects nothing audible.
+
+### Seeing the room
+
+`BwAudio` draws the **speaker array** in the scene view, each speaker labelled with its channel index —
+so, with `BwRoomConstraints`, the whole CAVE (truss, screens, projectors, speakers) is visible while you
+work, in real metres.
+
+Two details worth knowing. Stopped, the speaker positions come from the layout **file**; in Play mode
+they come from the **engine**, and each speaker lights up with that channel's live output level (a dead
+or mis-wired speaker is then obvious, and it's the same trick `bw_playground` uses). And because Play
+mode draws what the engine is *actually* panning over, **a failed layout load looks like the wrong
+array** — the built-in 26-grid, sitting where your room isn't.
+
+Everything is drawn through `Room.RoomToUnityMatrix()`, the inverse of the coordinate seam. So if the
+array and the room land somewhere unexpected in the scene, your `Room.UnityToRoom` registration is
+wrong — which is the cheapest possible check on the one setting that silently ruins spatial audio.
+
+### Watching the array from inside the CAVE
+
+Gizmos are an editor feature — they don't render in a build. For live speaker activity **while you're
+standing in the room**, add **`BwSpeakerView`**: it spawns one unlit marker per channel at the real
+speaker's position, and each one brightens and grows with that channel's output. Look toward a speaker
+and you see it light up.
+
+It's a viewer, not a control: it only reads `bw_get_speakers` / `bw_get_bus_levels`, never writes audio
+state, and deleting it changes nothing you can hear. The markers are **unlit** deliberately (a CAVE is
+dark, so the colour computed is the colour seen — no lighting rig to set up), and the meter has an
+instant attack with a slow release, because the engine reports a per-*block* peak that strobes too fast
+to read raw.
+
+Pair it with `BwAudio.TestSignal(channel, kind, gain)` for wiring checks: drive one raw output channel
+and confirm the speaker that lights up is the one that makes noise.
+- Your audio — decoded and resampled to the engine rate at load.
+
+> **While the Unity Editor is open it holds `bwaudio.dll` loaded**, so the file is locked. A CMake
+> rebuild will fail its POST_BUILD copy into `Runtime/Plugins/x86_64/`, and so will `pack.ps1`. Close
+> the editor before rebuilding the engine. (Packing an *unchanged* DLL is fine — the script hashes it
+> and skips the copy.)
 
 ## Disable Unity's built-in audio (do this once)
 

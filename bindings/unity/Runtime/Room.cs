@@ -31,6 +31,16 @@ namespace CaveAudio
             return new Vector3(-v.x, v.y, v.z);          // baseline LH->RH; the real map lives in UnityToRoom
         }
 
+        /// <summary>Room space -> Unity world, the inverse of Pos(). For DRAWING what the engine reports
+        /// back in room coordinates (the acoustic room box, speaker positions from bw_get_speakers): set
+        /// it as Gizmos.matrix and then draw in plain room metres. Handy side effect — a wrong
+        /// UnityToRoom makes the gizmo land visibly in the wrong place.</summary>
+        public static Matrix4x4 RoomToUnityMatrix()
+            => UnityToRoom.inverse * Matrix4x4.Scale(new Vector3(-1f, 1f, 1f));   // the X mirror is its own inverse
+
+        /// <summary>Room-space position -> Unity world (the inverse of Pos()).</summary>
+        public static Vector3 FromRoom(Vector3 roomPos) => RoomToUnityMatrix().MultiplyPoint3x4(roomPos);
+
         /// <summary>Unity world DIRECTION -> room space (RH). Pos() without the translation — for axes and
         /// normals (the FDN's decay direction), which a registration OFFSET must not move. Not normalized.</summary>
         public static Vector3 Dir(Vector3 v)

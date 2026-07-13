@@ -142,7 +142,7 @@ engines. Don't start with the engine bindings.
 - Verify the coordinate seam with a known-position test source.
 - **Done when:** a Unity scene drives the engine end-to-end in `binaural` at the desk
   and `cave`/`both` on the hardware, same build.
-- **Status: ✅ done.** `bindings/unity` is a UPM package (`com.cave.bwaudio`).
+- **Status: ✅ done.** `bindings/unity` is a UPM package (`com.brainworks.bwaudio`).
   Runtime: `Bw.cs` (the P/Invoke layer), `BwAudio.cs` (bootstrap/scene manager),
   `BwEmitter.cs` (positional emitter), `Room.cs` (the coordinate seam), plus
   `BwAcousticGeometry.cs`, `BwMaterialAsset.cs`, `BwAmbisonicBed.cs`, and

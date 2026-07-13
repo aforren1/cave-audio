@@ -1,0 +1,62 @@
+// BwEmitterEditor.cs — custom inspector for a source. Hides the settings that only matter once their
+// feature is switched on, and shows what the engine is doing to this source while it runs (occlusion is
+// ray-traced off-thread, so the number is the only way to see whether the wall you built is working).
+using UnityEditor;
+using UnityEngine;
+
+namespace CaveAudio.EditorTools
+{
+    [CustomEditor(typeof(BwEmitter))]
+    [CanEditMultipleObjects]
+    public sealed class BwEmitterEditor : Editor
+    {
+        public override bool RequiresConstantRepaint() => Application.isPlaying;
+
+        public override void OnInspectorGUI()
+        {
+            var e = (BwEmitter)target;
+            serializedObject.Update();
+
+            var it = serializedObject.GetIterator();
+            for (bool enter = true; it.NextVisible(enter); enter = false)
+            {
+                if (it.propertyPath == "m_Script")
+                {
+                    using (new EditorGUI.DisabledScope(true)) EditorGUILayout.PropertyField(it);
+                    continue;
+                }
+                if (IsHidden(it.propertyPath, e)) continue;
+                EditorGUILayout.PropertyField(it, true);
+            }
+
+            serializedObject.ApplyModifiedProperties();   // fires BwEmitter.OnValidate -> live re-push
+
+            if (e.spread > 0f && e.sizeMetres > 0f)
+                EditorGUILayout.HelpBox(
+                    "Spread and Size both set. They don't add up — the engine takes the WIDER of the two, " +
+                    "and Size (a physical radius) usually wins as the listener gets close. Pick one.",
+                    MessageType.Info);
+
+            if (Application.isPlaying && e.isActiveAndEnabled)
+            {
+                EditorGUILayout.Space();
+                EditorGUILayout.LabelField("Live", EditorStyles.boldLabel);
+                EditorGUILayout.LabelField("playing", e.IsPlaying ? "yes" : "no");
+                var r = EditorGUILayout.GetControlRect();
+                // 1 = clear, 0 = fully blocked. Shown as "openness" so a full bar means an unobstructed path.
+                EditorGUI.ProgressBar(r, e.Occlusion, $"unoccluded  {e.Occlusion:0.00}");
+            }
+        }
+
+        static bool IsHidden(string p, BwEmitter e)
+        {
+            switch (p)
+            {
+                case "directivityPower":    return e.directivity == BwDirectivity.Omni;
+                case "reflectionSend":
+                case "reflectionDistance":  return !e.reflections;
+                default:                    return false;
+            }
+        }
+    }
+}

@@ -19,6 +19,7 @@
 #include "sink.h"          /* BwTimestamp, BW_CHANNELS */
 #include "layout.h"        /* Layout (for rt_set_layout) */
 #include "pose.h"          /* PoseSlot (for rt_set_tracker) */
+#include "ism.h"           /* IsmRoom (for rt_set_ism_room) */
 
 #include <stdbool.h>
 #include <stdint.h>
@@ -46,7 +47,8 @@ enum {
     CMD_GROUP_GAIN, /* mix-group gain (re-dirties the group's voices) */
     CMD_GROUP_PAUSED,   /* mix-group pause gate */
     CMD_SET_PITCH,  /* per-voice playback rate (in-memory sounds) */
-    CMD_BED_YAW     /* per-bed soundfield rotation about the room's vertical axis */
+    CMD_BED_YAW,    /* per-bed soundfield rotation about the room's vertical axis */
+    CMD_SET_ISM     /* per-voice image-source early reflections */
 };
 typedef struct {
     uint8_t  type;
@@ -75,6 +77,7 @@ typedef struct {
         struct { uint8_t id, on; }                     gpause;/* mix-group pause */
         struct { float rate; }                         pitch; /* playback rate (1 = native) */
         struct { float yaw; }                          byaw;  /* bed soundfield yaw (radians) */
+        struct { uint8_t on; }                         ism;   /* per-voice early reflections */
     } u;
 } Cmd;
 
@@ -99,6 +102,10 @@ void    rt_set_pose_prediction(RtCore* c, float lead_s);  /* tracked-pose lead (
 void    rt_set_near_spread(RtCore* c, float radius_m);    /* near-listener widening radius (0 = off); live */
 void    rt_set_extra_listeners(RtCore* c, const float* xyz, uint32_t n);   /* compromise panning; commit-gated */
 void    rt_set_master_gain(RtCore* c, float linear);      /* one ramped scalar over the whole mix; live */
+/* Image-source early reflections: the shoebox room (NULL/invalid = no reflections; set while stopped)
+ * and the live reflection level. Voices opt in with rt_source_set_ism. */
+void    rt_set_ism_room(RtCore* c, const IsmRoom* room);
+void    rt_set_ism_gain(RtCore* c, float linear);
 void    rt_set_all_paused(RtCore* c, int paused);         /* global pause gate (rides pause_gate); live */
 void    rt_group_set_gain(RtCore* c, uint32_t group, float linear);   /* mix-group gain (enqueue) */
 void    rt_group_set_paused(RtCore* c, uint32_t group, bool paused);  /* mix-group pause (enqueue) */
@@ -178,6 +185,7 @@ void rt_source_fade_to   (RtCore* c, uint32_t h, float gain, float seconds, bool
 void rt_source_set_group (RtCore* c, uint32_t h, uint32_t group);    /* mix-group assignment (0 = default) */
 void rt_source_set_pitch (RtCore* c, uint32_t h, float rate);        /* playback rate [0.25, 4]; glided */
 void rt_bed_set_rotation (RtCore* c, uint32_t h, float yaw_rad);     /* bed soundfield yaw; glided */
+void rt_source_set_ism   (RtCore* c, uint32_t h, bool on);           /* image-source early reflections */
 void rt_play_oneshot   (RtCore* c, uint32_t sound, float x, float y, float z, float gain);
 void rt_set_listener   (RtCore* c, const float p[3], const float q[4]);
 void rt_commit         (RtCore* c);                   /* enqueue CMD_COMMIT + drain events */

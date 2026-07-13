@@ -538,6 +538,7 @@ struct ZyState {
     float     truth[3];                    /* last sim clap's true direction */
     long      last_seq;
     int       claps, rejects;
+    int       short_ch;                    /* device exposes < 19 inputs: DOA refused (see zy_process) */
     struct { float dir[3]; float age; int valid; } hist[ZY_HIST];
     int       hist_n;
     float     last_dir[3];                 /* newest estimate (test hook) */
@@ -545,16 +546,35 @@ struct ZyState {
     char      driver[128];
     float     dirs[ZYLIA_MICS][3]; float R;
     bool      geom_init;
+
+    /* ---- capsule survey (see zylia.h) ----
+     * Each accepted clap contributes one observation: WHERE it happened (relative to the array centre)
+     * and the 19 arrival times it produced. Solve over >= 6 well-spread ones and the capsule geometry —
+     * channel order and mounted orientation included — falls out. */
+    bool      surv_on;
+    float     surv_center[3];                        /* array centre, room coords (tape-measured) */
+    float     surv_clap[3];                          /* where the NEXT clap will happen, room coords */
+    int       surv_spk;                              /* -1 = manual, else autofill from layout A */
+    int       surv_n;
+    float     surv_src[ZYLIA_SURVEY_MAX][3];         /* clap positions RELATIVE to the centre */
+    double    surv_arr[ZYLIA_SURVEY_MAX][ZYLIA_MICS];
+    bool      surv_solved, surv_installed;
+    float     surv_caps[ZYLIA_MICS][3];
+    float     surv_resid, surv_radius, surv_spread;
+    char      surv_msg[192];
+    char      surv_path[512];
 };
 static ZyState Z;
 
 static float zy_az(const float d[3]) { return atan2f(d[0], -d[2]) * 57.29578f; }
 static float zy_el(const float d[3]) { return asinf(d[1] > 1.f ? 1.f : (d[1] < -1.f ? -1.f : d[1])) * 57.29578f; }
 
+#define ZY_SIM_DIST 2.0      /* how far a synthetic clap happens from the array centre (m) */
+
 /* a clap-like Gaussian click sampled at each capsule's exact fractional arrival time (the synthesis
  * the zylia unit test validates), landed in the shared block exactly like the ASIO side would */
 static void zy_sim_clap(ZpShared* sh, const float dir[3]) {
-    const double C = 343.0, FS = sh->rate, SIGMA = 1.0e-4, DIST = 2.0;
+    const double C = 343.0, FS = sh->rate, SIGMA = 1.0e-4, DIST = ZY_SIM_DIST;
     unsigned int rng = (unsigned int)(sh->seq * 2654435761u + 12345u);
     double src[3] = { dir[0] * DIST, dir[1] * DIST, dir[2] * DIST };
     for (int ch = 0; ch < ZYLIA_MICS; ++ch) {
@@ -585,8 +605,15 @@ static void zy_process(ZpShared* sh, float dt) {
         }
         for (int ch = 0; ch < ZYLIA_MICS; ++ch) sh->rms[ch] *= expf(-4.0f * dt);   /* meter decay */
     }
+    /* The capture tolerates a device with fewer than 19 inputs (the probe still meters what it has), but
+     * the DOA cannot: zylia_tdoa/zylia_doa want all 19, and the capsules the device never filled are
+     * still ZEROED snapshot channels. They would sail through the transient check on the reference
+     * channel and enter the least-squares fit as perfectly valid arrivals — yielding a direction that is
+     * confident, stable, and wrong, with nothing on screen to say so. Refuse instead of guessing. */
+    Z.short_ch = (sh->nch < ZYLIA_MICS);
+
     long seq = sh->seq;                                          /* fresh snapshot -> TDOA -> DOA */
-    if (seq != Z.last_seq) {
+    if (seq != Z.last_seq && !Z.short_ch) {
         Z.last_seq = seq;
         static float snap[ZYLIA_MICS][ZP_SNAP_N];                /* local copy (static: 300 KB off the stack) */
         memcpy(snap, (const void*)sh->snap, sizeof snap);
@@ -601,9 +628,66 @@ static void zy_process(ZpShared* sh, float dt) {
             memcpy(Z.last_dir, dir, sizeof Z.last_dir); Z.last_valid = 1;
             ++Z.claps;
             fprintf(stderr, "arrival %d: az %+.1f el %+.1f\n", Z.claps, zy_az(dir), zy_el(dir));
+
+            /* the same clap, banked as a survey observation. The arrivals are already in hand — the
+             * only extra thing a survey needs is WHERE it came from, which the operator has told us. */
+            if (Z.surv_on && Z.surv_n < ZYLIA_SURVEY_MAX) {
+                int k = Z.surv_n++;
+                for (int a = 0; a < 3; ++a) Z.surv_src[k][a] = Z.surv_clap[a] - Z.surv_center[a];
+                memcpy(Z.surv_arr[k], arr, sizeof arr);
+                Z.surv_solved = false;                           /* new data: the old solve is stale */
+            }
         } else ++Z.rejects;                                      /* not transient enough / degenerate solve */
     }
     for (int i = 0; i < ZY_HIST; ++i) if (Z.hist[i].valid) Z.hist[i].age += dt;
+}
+
+static void zy_solve(void) {
+    if (Z.surv_n < 6) {
+        snprintf(Z.surv_msg, sizeof Z.surv_msg, "need at least 6 claps (have %d)", Z.surv_n);
+        Z.surv_solved = false; return;
+    }
+    if (zylia_survey(Z.surv_src, Z.surv_arr, Z.surv_n, 343.0, Z.surv_caps,
+                     &Z.surv_resid, &Z.surv_radius, &Z.surv_spread)) {
+        Z.surv_solved = true;
+        snprintf(Z.surv_msg, sizeof Z.surv_msg,
+                 "solved from %d claps: residual %.2f us, radius %.1f mm, spread %.2f",
+                 Z.surv_n, Z.surv_resid, Z.surv_radius * 1000.0f, Z.surv_spread);
+    } else {
+        Z.surv_solved = false;
+        snprintf(Z.surv_msg, sizeof Z.surv_msg,
+                 "refused (spread %.2f): the claps are too coplanar or clustered — the capsules' HEIGHTS "
+                 "are unconstrained. Clap from above and below, not just a ring.", Z.surv_spread);
+    }
+}
+
+static void zy_install(void) {
+    zylia_set_capsules(Z.surv_caps);
+    zylia_geometry(Z.dirs, &Z.R);                                /* follows the override: the sphere now
+                                                                  * draws the array we actually measured */
+    Z.surv_installed = true;
+}
+
+/* Drive a whole survey off synthetic claps, end to end through the real path (sim clap -> snapshot ->
+ * tdoa -> observation). Hardware-free proof the flow is wired, and what the UI test drives. */
+static void zy_sim_survey(void) {
+    const int N = 14;
+    Z.sim_walk = false;
+    Z.surv_on  = true;
+    Z.surv_n   = 0;
+    Z.surv_solved = Z.surv_installed = false;
+    zylia_set_capsules(NULL);                                    /* recover from a clean slate */
+    zylia_geometry(Z.dirs, &Z.R);
+    Z.surv_center[0] = Z.surv_center[1] = Z.surv_center[2] = 0.0f;   /* zy_sim_clap centres on the origin */
+    for (int k = 0; k < N; ++k) {
+        double yy = 1.0 - 2.0 * ((double)k + 0.5) / (double)N;   /* Fibonacci: spread, and crucially not
+                                                                  * coplanar — it includes high and low */
+        double rr = sqrt(fmax(0.0, 1.0 - yy * yy)), th = 2.399963229728653 * (double)k;
+        Z.truth[0] = (float)(rr * cos(th)); Z.truth[1] = (float)yy; Z.truth[2] = (float)(rr * sin(th));
+        for (int a = 0; a < 3; ++a) Z.surv_clap[a] = (float)ZY_SIM_DIST * Z.truth[a];
+        zy_sim_clap(&Z.sim, Z.truth);
+        zy_process(&Z.sim, 0.0f);                                /* consume immediately: 1 clap = 1 observation */
+    }
 }
 
 static void tab_zylia(void) {
@@ -613,6 +697,8 @@ static void tab_zylia(void) {
         float m = sqrtf(Z.truth[0]*Z.truth[0] + Z.truth[1]*Z.truth[1] + Z.truth[2]*Z.truth[2]);
         Z.truth[0] /= m; Z.truth[1] /= m; Z.truth[2] /= m;
         Z.sim_walk = true;
+        Z.surv_spk = -1;
+        snprintf(Z.surv_path, sizeof Z.surv_path, "zylia_capsules.json");
         Z.geom_init = true;
     }
 
@@ -655,13 +741,133 @@ static void tab_zylia(void) {
     }
     zy_process(sh, ImGui::GetIO().DeltaTime);
 
-    if (Z.last_valid)
+    if (Z.short_ch)
+        ImGui::TextColored(ImVec4(0.95f, 0.45f, 0.35f, 1.0f),
+                           "%s exposes %d inputs — the ZM-1 needs %d. DOA disabled: the missing capsules "
+                           "would enter the fit as silent arrivals and point somewhere confidently wrong.\n"
+                           "Meters below are live, so this is still usable to check what IS arriving.",
+                           sh->title ? sh->title : "?", sh->nch, ZYLIA_MICS);
+    else if (Z.last_valid)
         ImGui::Text("%s   %d ch @ %.0f Hz   blocks %ld   claps %d (rejected %d)   last: az %+.1f  el %+.1f",
                     sh->title ? sh->title : "?", sh->nch, sh->rate, sh->blocks, Z.claps, Z.rejects,
                     zy_az(Z.last_dir), zy_el(Z.last_dir));
     else
         ImGui::Text("%s   %d ch @ %.0f Hz   blocks %ld   waiting for a clap...",
                     sh->title ? sh->title : "?", sh->nch, sh->rate, sh->blocks);
+
+    /* Trigger tuning, live (the defaults are guesses — see ZpShared). The readout is the point: the
+     * floor is what the room is actually giving you, the threshold is where a clap has to reach, and
+     * you want the second comfortably above the first without sitting so high that a clap misses it. */
+    if (Z.live) {
+        float floor_db = (sh->nfloor > 1e-6f) ? 20.0f * log10f(sh->nfloor) : -120.0f;
+        float trip     = sh->trig_ratio * sh->nfloor;
+        if (trip < sh->trig_min) trip = sh->trig_min;
+        float trip_db  = (trip > 1e-6f) ? 20.0f * log10f(trip) : -120.0f;
+        ImGui::Text("noise floor %+.1f dBFS   ->   trips at %+.1f dBFS", floor_db, trip_db);
+        bwTip("clap and watch: if nothing registers, lower the ratio; if the room self-triggers, raise it");
+        ImGui::SetNextItemWidth(uiScaled(150));
+        ImGui::SliderFloat("x floor", (float*)&sh->trig_ratio, 2.0f, 40.0f, "%.1f");
+        bwTip("a block's peak must exceed this MULTIPLE of the noise floor to trip the snapshot");
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(uiScaled(150));
+        ImGui::SliderFloat("min peak", (float*)&sh->trig_min, 0.0005f, 0.2f, "%.4f", ImGuiSliderFlags_Logarithmic);
+        bwTip("...AND exceed this absolute level, so a dead-quiet room can't trigger on its own hiss");
+    }
+
+    /* ---- capsule survey ---- */
+    if (ImGui::CollapsingHeader("Capsule survey")) {
+        ImGui::TextWrapped(
+            "The built-in table knows the ZM-1's shape but NOT which ASIO channel feeds which capsule, "
+            "nor how the array is turned on its stand. Both give a confident, wrong direction. Clap from "
+            "6+ known spots — high and low, not just a ring — and the geometry, the channel order and the "
+            "orientation all fall out together. No sweep, no second audio device.");
+        ImGui::Spacing();
+
+        ImGui::SetNextItemWidth(uiScaled(220));
+        ImGui::DragFloat3("array centre", Z.surv_center, 0.01f, -20.0f, 20.0f, "%.3f");
+        bwTip("where the ZM-1 sits, room coords (m). A tape measure is plenty: at 2.5 m a 5 cm error "
+              "tilts a clap direction by ~1 deg, which is already at the timing noise floor");
+
+        if (V.hasA) {                                            /* clap AT a surveyed speaker: it is a
+                                                                  * known position you don't have to measure */
+            ImGui::SetNextItemWidth(uiScaled(220));
+            char prev[48];
+            snprintf(prev, sizeof prev, Z.surv_spk < 0 ? "manual" : "speaker %d", Z.surv_spk);
+            if (ImGui::BeginCombo("clap at", prev)) {
+                if (ImGui::Selectable("manual", Z.surv_spk < 0)) Z.surv_spk = -1;
+                for (uint32_t i = 0; i < V.A.count; ++i) {
+                    char lbl[32]; snprintf(lbl, sizeof lbl, "speaker %u", i);
+                    if (ImGui::Selectable(lbl, Z.surv_spk == (int)i)) {
+                        Z.surv_spk = (int)i;
+                        for (int a = 0; a < 3; ++a) Z.surv_clap[a] = V.A.speakers[i].pos[a];
+                    }
+                }
+                ImGui::EndCombo();
+            }
+            bwTip("stand at a speaker and clap - layout A already knows exactly where it is");
+            ImGui::SameLine();
+        }
+        ImGui::SetNextItemWidth(uiScaled(220));
+        if (ImGui::DragFloat3("clap position", Z.surv_clap, 0.01f, -20.0f, 20.0f, "%.3f")) Z.surv_spk = -1;
+        bwTip("where the NEXT clap will happen, room coords (m) - set this BEFORE you clap");
+
+        ImGui::Checkbox("record claps", &Z.surv_on);
+        bwTip("every accepted clap is banked as an observation at the position above");
+        ImGui::SameLine(); ImGui::Text("|  %d clap%s banked", Z.surv_n, Z.surv_n == 1 ? "" : "s");
+        ImGui::SameLine();
+        if (ImGui::Button("Clear")) { Z.surv_n = 0; Z.surv_solved = false; Z.surv_msg[0] = 0; }
+
+        if (Z.simulate && !Z.live) {
+            ImGui::SameLine(0, uiScaled(16));
+            if (ImGui::Button("simulate a full survey")) zy_sim_survey();
+            bwTip("fire 14 spread synthetic claps through the identical clap->snapshot->TDOA->observation "
+                  "path, so you can see what a good survey looks like before doing it for real");
+        }
+
+        ImGui::Spacing();
+        if (ImGui::Button("Solve")) zy_solve();
+        bwTip("recover the 19 capsule positions from the banked claps");
+        ImGui::SameLine();
+        if (!Z.surv_solved) ImGui::BeginDisabled();
+        if (ImGui::Button(Z.surv_installed ? "Installed" : "Install")) zy_install();
+        bwTip("use the surveyed geometry for every DOA from now on (the sphere below redraws to match)");
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(uiScaled(220));
+        ImGui::InputTextWithHint("##zsp", "zylia_capsules.json", Z.surv_path, sizeof Z.surv_path);
+        ImGui::SameLine();
+        if (ImGui::Button("Save")) {
+            char e[128] = {0};
+            const char* p = Z.surv_path[0] ? Z.surv_path : "zylia_capsules.json";
+            if (zylia_survey_save(p, Z.surv_caps, Z.surv_resid, Z.surv_radius, Z.surv_spread, Z.surv_n,
+                                  e, sizeof e))
+                snprintf(Z.surv_msg, sizeof Z.surv_msg, "saved to %s", p);
+            else
+                snprintf(Z.surv_msg, sizeof Z.surv_msg, "%s", e);
+        }
+        bwTip("write the survey to JSON - it encodes the geometry, the channel order AND the mounted "
+              "orientation, so it is specific to this ZM-1 on this stand");
+        if (!Z.surv_solved) ImGui::EndDisabled();
+        ImGui::SameLine();
+        if (ImGui::Button("Load")) {
+            char e[128] = {0};
+            const char* p = Z.surv_path[0] ? Z.surv_path : "zylia_capsules.json";
+            if (zylia_survey_load(p, e, sizeof e)) {
+                zylia_geometry(Z.dirs, &Z.R);
+                Z.surv_installed = true;
+                snprintf(Z.surv_msg, sizeof Z.surv_msg, "loaded %s — it is driving the DOA now", p);
+            } else snprintf(Z.surv_msg, sizeof Z.surv_msg, "%s", e);
+        }
+        bwTip("load a previous survey and install it");
+
+        if (Z.surv_msg[0]) {
+            /* residual is the "should I believe this?" number: it is what the recovered geometry FAILS
+             * to explain, in microseconds. Sub-microsecond is a clean survey; tens of us means bad
+             * claps, a wrong array centre, or a clap position that was not where you said it was. */
+            bool bad = !Z.surv_solved || Z.surv_resid > 20.0f;
+            ImGui::TextColored(bad ? ImVec4(0.95f, 0.45f, 0.35f, 1.0f) : ImVec4(0.45f, 0.85f, 0.55f, 1.0f),
+                               "%s", Z.surv_msg);
+        }
+    }
 
     /* -------- capsule meters (left) + DOA sphere (right) -------- */
     ImVec2 avail = ImGui::GetContentRegionAvail();
@@ -928,6 +1134,44 @@ static void register_tests(ImGuiTestEngine* e) {
         double deg = acos(dot > 1.0 ? 1.0 : (dot < -1.0 ? -1.0 : dot)) * 57.29578;
         IM_CHECK_LT(deg, 2.0);                                   /* recovered direction lands on the truth ring */
         ctx->CaptureScreenshotWindow("//calib view");
+    };
+
+    /* the capsule-survey flow, end to end through the real UI. The synthetic claps are generated FROM
+     * the built-in table, so a correctly-wired panel must recover exactly that table back — which only
+     * happens if it fed the solver the right clap positions, the right arrivals, and the right channel
+     * order. Get any of those wrong and the recovered geometry is visibly not the ZM-1. */
+    t = IM_REGISTER_TEST(e, "zylia", "sim_survey");
+    t->TestFunc = [](ImGuiTestContext* ctx) {
+        ctx->SetRef("calib view");
+        ctx->ItemClick("**/Zylia");
+        ctx->Yield(2);
+        ctx->ItemCheck("**/simulate claps");                     /* Check, not Click: earlier tests share Z */
+        ctx->ItemOpen("**/Capsule survey");
+        ctx->Yield(2);
+        ctx->ItemClick("**/simulate a full survey");
+        ctx->Yield(2);
+        IM_CHECK_EQ(Z.surv_n, 14);                               /* 14 claps in -> 14 observations banked */
+
+        ctx->ItemClick("**/Solve");
+        ctx->Yield(2);
+        IM_CHECK(Z.surv_solved);
+        IM_CHECK_LT(Z.surv_resid, 1.0f);                         /* sub-us: the fit explains the claps */
+        IM_CHECK_GT(Z.surv_radius, 0.045f);
+        IM_CHECK_LT(Z.surv_radius, 0.053f);
+        IM_CHECK_GT(Z.surv_spread, 0.5f);
+
+        float ref[ZYLIA_MICS][3], R;
+        zylia_set_capsules(NULL);
+        zylia_geometry(ref, &R);
+        for (int i = 0; i < ZYLIA_MICS; ++i)
+            for (int a = 0; a < 3; ++a)
+                IM_CHECK_LT(fabsf(Z.surv_caps[i][a] - R * ref[i][a]), 0.0005f);
+
+        ctx->ItemClick("**/Install");
+        ctx->Yield(2);
+        IM_CHECK(Z.surv_installed);
+        ctx->CaptureScreenshotWindow("//calib view");
+        zylia_set_capsules(NULL);                                /* don't leak the override into other tests */
     };
 
     t = IM_REGISTER_TEST(e, "viewer", "tabs");                   /* every tab renders without faulting */

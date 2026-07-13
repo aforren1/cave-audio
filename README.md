@@ -37,9 +37,11 @@ in one process behind one audio callback.
   output stage, master gain, and a linked protection limiter as the final stage.
 - **Acoustics**: ray-traced occlusion with per-band transmission EQ, source
   directivity, a directional reflection bed (real-time, or baked over a probe
-  grid), and sound pathing with bending-loss EQ via Steam Audio — plus a
-  **phonon-free directional FDN reverb** (anisotropic decay) and **manual
-  occlusion** driven from game logic, so no-SDK builds keep reverb and muffling.
+  grid), and sound pathing with bending-loss EQ via Steam Audio — **plus a
+  complete SDK-free path**: geometric **image-source early reflections** (each
+  wall bounce panned as a point source, so it has parallax as you walk) into a
+  **directional FDN reverb** (anisotropic decay), with **manual occlusion** driven
+  from game logic.
 - **Propagation**: distance attenuation, Doppler, air absorption, equal-loudness
   compensation, playback **pitch** — opt-in per source, ramped/glided.
 - **Assets**: WAV/FLAC/MP3, decoded and resampled at load; disk streaming for long
@@ -136,8 +138,17 @@ the game engine's own mixer.
   mid/HF stays speaker-only correction, because one room can't be flattened for
   every position at once.
 
+**Steam Audio is optional.** A no-SDK build is fully viable for the array — the whole
+spatializer plus geometric early reflections, FDN reverb, and manual occlusion. The
+SDK adds ray-traced (automatic) occlusion, sound pathing, and the real HRTF monitor;
+that last one is a *developer-workstation* dependency, since the production array
+render never uses HRTF. Which reverb/reflection path to run is a genuine choice —
+[`docs/materials.md`](./docs/materials.md) has the comparison and the recommendation.
+
 Current gaps (may change):
 
+- Early reflections model a **shoebox** (the image-source path); arbitrary virtual
+  geometry needs the Steam scene.
 - Mono point sources only. Stereo assets downmix; the ambisonic bed is the only
   non-point path.
 - No completion callbacks — poll `bw_source_is_playing`.

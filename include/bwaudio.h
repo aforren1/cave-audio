@@ -239,6 +239,21 @@ BW_API void     bw_reflections_set_gain(BwEngine* e, float linear);
 BW_API void     bw_reverb_fdn(BwEngine* e, bool on);
 BW_API void     bw_fdn_set_decay(BwEngine* e, float rt60_low_s, float rt60_high_s, float xover_hz);
 BW_API void     bw_fdn_set_decay_direction(BwEngine* e, const float dir[3], float factor);
+
+/* ---- image-source EARLY reflections (per source; no SDK needed) ----
+ * The other half of a phonon-free acoustics path: the FDN above renders the late diffuse tail, this
+ * renders the six FIRST-ORDER specular reflections — the wall bounces that actually carry room size
+ * and source distance. Needs the room: call bw_scene_set_box (which now captures the shoebox even in
+ * a no-SDK build). Each reflection is rendered as a real POINT SOURCE at its mirrored position,
+ * panned through the engine's own LISTENER-RELATIVE panner — so reflections have correct direction
+ * AND parallax as the listener walks, which no shared reverb bed (Steam's or the FDN's) can give.
+ * Path delay, distance attenuation, and per-band wall absorption (walls eat treble, so a reflection
+ * is duller than the direct sound) all fall out of the geometry. Delays glide and gains ramp, so a
+ * moving source bends its reflections instead of stepping them. Order 1 only by design: higher
+ * orders blend into the diffuse field within tens of ms — that is the FDN's job, and it renders
+ * them for free. A source outside the room renders dry. Per-frame-safe; the gain is live. */
+BW_API void     bw_source_set_early_reflections(BwEngine* e, BwSource s, bool on);
+BW_API void     bw_early_reflections_set_gain(BwEngine* e, float linear);   /* default 1 */
 /* Opt a source into the shared bed's wet send (per-frame-safe, enqueue-only). With the bed disabled
  * or no SDK, this just gates a send that goes nowhere. */
 BW_API void     bw_source_set_reflections(BwEngine* e, BwSource s, bool on);

@@ -1,5 +1,8 @@
-# Native plugins are staged here by the engine build (gitignored artifacts).
+# The DLLs are BUILD OUTPUT (staged here by the engine build, and by CI when it packs the UPM
+# tarball) — never committed. Their .meta files ARE committed: a package installed from a registry
+# is immutable, so the plugin's import settings (Windows x64, Editor on) cannot be fixed in the
+# Inspector afterwards — they have to ship. See tools/upm/gen-meta.ps1.
 *.dll
-*.dll.meta
 *.pdb
 !.gitkeep
+!*.dll.meta

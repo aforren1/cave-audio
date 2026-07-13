@@ -16,11 +16,17 @@ namespace CaveAudio
 
         [Header("Engine")]
         public BwProfile profile = BwProfile.Binaural;   // inspector dropdown; maps 1:1 to the C enum
-        public string layoutFile = "cave_layout.json";   // under StreamingAssets (cave/both)
+        [Tooltip("The surveyed speaker geometry, as a path RELATIVE TO Assets/StreamingAssets/ " +
+                 "(create that folder and put cave_layout.json in it). Used by the cave/both profiles. " +
+                 "If it fails to load the engine falls back to its default 26-speaker grid and logs an " +
+                 "error — it does NOT stop, so a smaller rig would silently pan over the wrong geometry.")]
+        [BwClip(".json")] public string layoutFile = "cave_layout.json";
         public uint sampleRate = 48000;
         public uint blockSize = 256;
 
         [Header("Listener")]
+        [Tooltip("The tracked head: your OptiTrack rigid body, or the XR camera at a desk. Required " +
+                 "when Feed Listener is on — without it the listener never moves from the array centroid.")]
         public Transform listener;          // OptiTrack head rigid body, or the XR camera at a desk
         public bool feedListener = true;    // false => the core reads NatNet itself (cave/both)
         [Tooltip("Other occupants (up to 3). Panning becomes the per-speaker energy MEAN of everyone's " +
@@ -91,10 +97,24 @@ namespace CaveAudio
         public Vector3 fdnDecayDirection = Vector3.zero;
         [Range(0.1f, 2f)] public float fdnDecayFactor = 1f;
 
+        [Header("Scene view")]
+        [Tooltip("Draw the speaker array. Stopped, these come from the layout FILE. In Play mode they " +
+                 "come from the ENGINE (bw_get_speakers) and light up with each channel's live output " +
+                 "level — so you see the geometry actually being panned over, which is how a failed " +
+                 "layout load looks: the default 26-grid, not your room.")]
+        public bool showSpeakers = true;
+        [Range(0.02f, 0.5f)] public float speakerGizmoRadius = 0.12f;
+        public bool showSpeakerIndices = true;
+
         [Header("Room box (load-time; optional acoustic geometry)")]
+        [Tooltip("A shoebox enclosure for occlusion/reflections, drawn as a yellow wireframe in the " +
+                 "scene view. FLOOR-BASED: centred on the origin in x/z, running from y=0 up to its " +
+                 "height. For anything more detailed, use BwAcousticGeometry instead.")]
         public bool enableRoomBox = false;
         public Vector3 roomSizeMetres = new Vector3(3f, 3f, 3f);
-        public string roomMaterial = "concrete";   // a bw_material_preset name
+        [Tooltip("Material for all six faces. For per-face or custom materials, build the room out of " +
+                 "BwAcousticGeometry objects instead.")]
+        public BwMaterialPreset roomMaterial = BwMaterialPreset.Concrete;
 
         IntPtr _eng;
         public IntPtr Handle => _eng;
@@ -139,6 +159,13 @@ namespace CaveAudio
             // Only claim the singleton once we have a live engine, so a failed init leaves Instance free.
             Instance = this; DontDestroyOnLoad(gameObject);
             Debug.Log($"[BwAudio] started, backend={Bw.Backend(_eng)}, channels={_channels}");
+
+            // Feeding the pose from Unity with nothing to feed it FROM is a silent no-op: the listener
+            // just stays at the array centroid and every source is panned for a head that never moves.
+            if (feedListener && !listener)
+                Debug.LogWarning("[BwAudio] 'Feed Listener' is on but no listener Transform is assigned — " +
+                                 "the listener will never move from the array centroid. Assign the tracked " +
+                                 "head (or turn Feed Listener off to let the engine read NatNet itself).");
         }
 
         // Everything the engine wants set BEFORE bw_start (the reverb bed, the bed decoder), plus the live
@@ -195,6 +222,7 @@ namespace CaveAudio
         // by ear). Load-time fields (the reverb beds, the bed decoder, the room box) need a scene restart.
         void OnValidate()
         {
+            _layoutXyzFrom = null;                                       // re-read the layout for the gizmos
             if (Application.isPlaying && Ready) ApplyLiveSettings();
         }
 
@@ -219,8 +247,10 @@ namespace CaveAudio
             _sounds[key] = s; return s;
         }
 
-        /// <summary>Mint a material from a named preset (load-time). 0 = the built-in default.</summary>
-        public uint MaterialPreset(string name) => Ready ? Bw.bw_material_preset(_eng, name) : 0;
+        /// <summary>Mint one of the engine's built-in materials (load-time). Typed, because the raw call
+        /// treats an unknown name as "use the generic default" rather than as an error — for a name the
+        /// enum doesn't cover, drop to Bw.bw_material_preset and check Bw.LastError yourself.</summary>
+        public uint MaterialPreset(BwMaterialPreset preset) => Ready ? Bw.MaterialPreset(_eng, preset) : 0;
 
         /// <summary>Reverb wet level (linear), adjustable live — the reverb-send equivalent.</summary>
         public float ReverbGain
@@ -289,14 +319,20 @@ namespace CaveAudio
         float[] _levels;
 
         /// <summary>Speaker positions in ROOM space (3 floats each, in channel order) — the geometry the
-        /// engine is actually panning with (the loaded layout, or the default grid).</summary>
+        /// engine is actually panning with (the loaded layout, or the default grid it fell back to). The
+        /// layout is fixed for the engine's lifetime, so this is read once and cached; the array is
+        /// reused, so don't mutate it.</summary>
         public float[] SpeakerPositions()
         {
             if (!Ready) return Array.Empty<float>();
-            var xyz = new float[_channels * 3];
-            Bw.bw_get_speakers(_eng, xyz, _channels);
-            return xyz;
+            if (_speakers == null || _speakers.Length != _channels * 3)
+            {
+                _speakers = new float[_channels * 3];
+                Bw.bw_get_speakers(_eng, _speakers, _channels);
+            }
+            return _speakers;
         }
+        float[] _speakers;
 
         /// <summary>Voices playing in the last block — a voice-pool gauge for a HUD.</summary>
         public uint ActiveVoices => Ready ? Bw.bw_get_active_voices(_eng) : 0;
@@ -314,14 +350,17 @@ namespace CaveAudio
         // engine. The engine's scene is a single static mesh, so this is a one-time bake before start.
         void SetupScene()
         {
-            var geos = FindObjectsOfType<BwAcousticGeometry>();
+            // Sort mode None: we don't care about order (every geometry is baked into one mesh), and the
+            // default InstanceID sort is pure overhead. FindObjectsOfType, which sorted unconditionally,
+            // is deprecated.
+            var geos = FindObjectsByType<BwAcousticGeometry>(FindObjectsSortMode.None);
             bool haveGeo = geos != null && geos.Length > 0;
             if (!haveGeo && !enableRoomBox) return;
 
             // simple path: just a box, nothing else -> the engine's own box helper (inward normals)
             if (!haveGeo && enableRoomBox)
             {
-                uint mb = Bw.bw_material_preset(_eng, roomMaterial);
+                uint mb = Bw.MaterialPreset(_eng, roomMaterial);
                 var faces = new[] { mb, mb, mb, mb, mb, mb };
                 Bw.bw_scene_set_box(_eng, roomSizeMetres.x, roomSizeMetres.y, roomSizeMetres.z, faces);
                 return;
@@ -338,7 +377,7 @@ namespace CaveAudio
             }
 
             if (enableRoomBox)
-                AddBox(verts, tris, triMat, roomSizeMetres, Bw.bw_material_preset(_eng, roomMaterial));
+                AddBox(verts, tris, triMat, roomSizeMetres, Bw.MaterialPreset(_eng, roomMaterial));
             foreach (var g in geos)
             {
                 var mesh = g.ResolveMesh();
@@ -442,6 +481,99 @@ namespace CaveAudio
             if (n == 0 && _extraPushed == 0) return;               // the common case: nobody else in the room
             Bw.bw_set_extra_listeners(_eng, _extraBuf, (uint)n);
             _extraPushed = n;
+        }
+
+        // ---- scene view ------------------------------------------------------------------------------
+        // Everything here is drawn in ROOM metres through the inverse of the coordinate seam, so a wrong
+        // Room.UnityToRoom puts the array and the box visibly in the wrong place — which is the cheapest
+        // possible check on the one setting that silently ruins spatial audio.
+        void OnDrawGizmos()
+        {
+            var prev = Gizmos.matrix;
+            Gizmos.matrix = Room.RoomToUnityMatrix();
+
+            if (enableRoomBox)
+            {
+                Gizmos.color = new Color(1f, 0.9f, 0.3f, 0.9f);
+                var size = new Vector3(roomSizeMetres.x, roomSizeMetres.y, roomSizeMetres.z);
+                Gizmos.DrawWireCube(new Vector3(0f, size.y * 0.5f, 0f), size);   // floor-based: y from 0 up
+            }
+            if (showSpeakers) DrawSpeakers();
+
+            Gizmos.matrix = prev;
+        }
+
+        // Stopped: the layout FILE (the geometry you authored). Running: the ENGINE's own readback, which
+        // is the geometry it is actually panning over — including the default 26-grid it silently falls
+        // back to when the layout fails to load. Seeing the wrong array is a better bug report than
+        // reading about it.
+        void DrawSpeakers()
+        {
+            float[] xyz; float[] peaks = null;
+            if (Application.isPlaying && Ready) { xyz = SpeakerPositions(); peaks = BusLevels(); }
+            else                                { xyz = LayoutFileSpeakers(); }
+            if (xyz == null) return;
+
+            int n = xyz.Length / 3;
+            for (int i = 0; i < n; i++)
+            {
+                var p = new Vector3(xyz[i * 3], xyz[i * 3 + 1], xyz[i * 3 + 2]);
+
+                // Live level lights the speaker up, exactly like the playground's gizmos: a silent
+                // channel stays dim, so a dead or mis-wired speaker is visible at a glance.
+                float lvl = (peaks != null && i < peaks.Length) ? Mathf.Clamp01(peaks[i]) : 0f;
+                Gizmos.color = Application.isPlaying
+                    ? new Color(0.25f + 0.75f * lvl, 0.35f + 0.35f * lvl, 0.45f - 0.25f * lvl, 1f)
+                    : new Color(0.35f, 0.75f, 0.95f, 0.9f);
+                Gizmos.DrawSphere(p, speakerGizmoRadius);
+                Gizmos.color = new Color(0.1f, 0.15f, 0.2f, 0.5f);
+                Gizmos.DrawWireSphere(p, speakerGizmoRadius);
+
+#if UNITY_EDITOR
+                if (showSpeakerIndices)
+                {
+                    var above = new Vector3(p.x, p.y + speakerGizmoRadius * 1.6f, p.z);
+                    UnityEditor.Handles.Label(Room.FromRoom(above), i.ToString());   // = the channel index
+                }
+#endif
+            }
+        }
+
+        // The layout as authored, for the stopped editor (the engine isn't up to ask). Only the speaker
+        // POSITIONS — the trims/DBAP knobs are the engine's business.
+        [Serializable] class LayoutSpeaker { public int index; public float[] position; }
+        [Serializable] class LayoutFile    { public LayoutSpeaker[] speakers; }
+        float[] _layoutXyz;
+        string _layoutXyzFrom;
+
+        float[] LayoutFileSpeakers()
+        {
+            if (_layoutXyzFrom == layoutFile) return _layoutXyz;
+            _layoutXyzFrom = layoutFile;
+            _layoutXyz = null;
+            if (string.IsNullOrEmpty(layoutFile)) return null;
+            try
+            {
+                string path = Path.Combine(Application.streamingAssetsPath, layoutFile);
+                if (!File.Exists(path)) return null;
+                var f = JsonUtility.FromJson<LayoutFile>(File.ReadAllText(path));
+                if (f?.speakers == null) return null;
+
+                // Speakers are stored BY INDEX (the channel), not by array order — the loader requires a
+                // complete 0..N-1 permutation, so index is what the engine pans onto and what to label.
+                var xyz = new float[f.speakers.Length * 3];
+                foreach (var s in f.speakers)
+                {
+                    if (s?.position == null || s.position.Length < 3) continue;
+                    if (s.index < 0 || s.index >= f.speakers.Length) continue;
+                    xyz[s.index * 3]     = s.position[0];
+                    xyz[s.index * 3 + 1] = s.position[1];
+                    xyz[s.index * 3 + 2] = s.position[2];
+                }
+                _layoutXyz = xyz;
+            }
+            catch (Exception) { _layoutXyz = null; }   // a malformed layout just draws nothing
+            return _layoutXyz;
         }
 
         void OnDestroy()

@@ -268,6 +268,36 @@ namespace CaveAudio
         /// <summary>Current occlusion factor (1 = clear .. 0 = fully blocked) for a HUD/debug readout.</summary>
         public float Occlusion => (_created && Eng != IntPtr.Zero) ? Bw.bw_source_get_occlusion(Eng, _src) : 1f;
 
+        // Inspector edits take effect live in Play mode. Without this, dragging Gain or Pitch during Play
+        // changes the FIELD and nothing else — the value is only read once, at source creation — which
+        // reads as "the slider is broken". Everything here is per-frame-safe and ramped engine-side.
+        // (Position/orientation are pushed every frame anyway; the load-time-ish opt-ins are re-pushed
+        // too, so ticking `doppler` mid-play does what you'd expect.)
+        void OnValidate()
+        {
+            if (!Application.isPlaying || !_created || Eng == IntPtr.Zero) return;
+            Bw.bw_source_set_gain(Eng, _src, gain);
+            Bw.bw_source_set_pitch(Eng, _src, pitch);
+            Bw.bw_source_set_priority(Eng, _src, priority);
+            Bw.bw_source_set_group(Eng, _src, (uint)group);
+            Bw.bw_source_set_spread(Eng, _src, spread);
+            Bw.bw_source_set_size(Eng, _src, sizeMetres);
+            Bw.bw_source_set_occlusion(Eng, _src, occlusion);
+            Bw.bw_source_set_reflections(Eng, _src, reflections);
+            Bw.bw_source_set_reflection_send(Eng, _src, reflectionSend);
+            Bw.bw_source_set_reflection_distance(Eng, _src, reflectionDistance);
+            Bw.bw_source_set_pathing(Eng, _src, pathing);
+            Bw.bw_source_set_doppler(Eng, _src, doppler);
+            Bw.bw_source_set_air_absorption(Eng, _src, airAbsorption);
+            Bw.bw_source_set_loudness_comp(Eng, _src, loudnessComp);
+            Bw.bw_source_set_directivity_preset(Eng, _src, directivity);
+            if (directivity != BwDirectivity.Omni)
+            {
+                float w = directivity == BwDirectivity.Cardioid ? 0.5f : 1.0f;
+                Bw.bw_source_set_directivity(Eng, _src, w, directivityPower);
+            }
+        }
+
         void OnDisable()
         {
             _wasPlaying = false;                 // never carry a stale play edge into a re-enable

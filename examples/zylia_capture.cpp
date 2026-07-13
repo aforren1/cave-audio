@@ -75,7 +75,7 @@ void buffer_switch(long index, ASIOBool) {
      * inflates it. */
     switch (g.tstate) {
     case 0:
-        if (g.wabs > ZP_RING_N && pk > 8.f * g.nfloor && pk > 0.005f) {
+        if (g.wabs > ZP_RING_N && pk > g.sh.trig_ratio * g.nfloor && pk > g.sh.trig_min) {
             g.trig_abs = g.wabs - (uint64_t)n;         /* block start; ZP_SNAP_PRE covers the in-block offset */
             g.tstate = 1;
         } else g.nfloor = 0.98f * g.nfloor + 0.02f * pk;
@@ -94,6 +94,7 @@ void buffer_switch(long index, ASIOBool) {
         if (--g.holdoff <= 0) g.tstate = 0;
         break;
     }
+    g.sh.nfloor = g.nfloor;                            /* publish for the tuning readout */
 
     long b = g.blocks.fetch_add(1, std::memory_order_relaxed) + 1;
     g.sh.blocks = b;
@@ -174,8 +175,9 @@ ZpShared* zylia_capture_open(const char* driver, double rate) {
         fprintf(stderr, "zylia_capture: driver block %ld exceeds %d\n", g.bufsize, ZP_MAX_BLOCK);
         ASIOExit(); asioDrivers->removeCurrentDriver(); asio_session_release(); return NULL;
     }
-    { ASIOSampleRate ar = rate; ASIOGetSampleRate(&ar);            /* the callback's holdoff math reads */
-      g.sh.nch = (int)g.nin; g.sh.rate = (double)ar; g.sh.title = g.title; }   /* sh BEFORE the stream starts */
+    { ASIOSampleRate ar = rate; ASIOGetSampleRate(&ar);            /* the callback's holdoff math + trigger */
+      g.sh.nch = (int)g.nin; g.sh.rate = (double)ar; g.sh.title = g.title;     /* read sh, so fill it BEFORE  */
+      g.sh.trig_ratio = 8.0f; g.sh.trig_min = 0.005f; g.sh.nfloor = g.nfloor; } /* the stream starts          */
     for (long c = 0; c < g.ncap; ++c) { g.bi[c].isInput = ASIOTrue; g.bi[c].channelNum = c; }
     g.cb.bufferSwitch = &buffer_switch; g.cb.sampleRateDidChange = &rate_changed;
     g.cb.asioMessage  = &asio_msg;      g.cb.bufferSwitchTimeInfo = &buffer_switch_ti;

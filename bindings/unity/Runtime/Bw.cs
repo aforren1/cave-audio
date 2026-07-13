@@ -25,6 +25,15 @@ namespace CaveAudio
     public enum BwSpreadMode : int { Lobe = 0, Mdap = 1 }
     public enum BwBedRenderer : int { Matrix = 0, Parametric = 1 }
 
+    /// <summary>The engine's built-in acoustic materials (BW_PRESETS in engine.c, same order). This is
+    /// an ENUM rather than the raw string bw_material_preset takes, because an unrecognised name is not
+    /// an error there — it quietly returns material 0 (the generic default) and leaves the reason in
+    /// bw_last_error, so a typo'd "concreet" wall just sounds wrong instead of failing.</summary>
+    public enum BwMaterialPreset : int
+    {
+        Generic = 0, Brick, Concrete, Ceramic, Gravel, Carpet, Glass, Plaster, Wood, Metal, Rock
+    }
+
     [StructLayout(LayoutKind.Sequential)]
     public struct BwConfig
     {
@@ -221,6 +230,15 @@ namespace CaveAudio
         [DllImport(DLL, CallingConvention = CC)] public static extern void bw_commit(IntPtr e);
 
         // ---- convenience ----
+        /// <summary>Mint a built-in material by preset. The typed form of bw_material_preset — the enum
+        /// name IS the engine's name (lowercased), so a preset can't be misspelled into silently becoming
+        /// the generic default.</summary>
+        public static uint MaterialPreset(IntPtr e, BwMaterialPreset preset)
+            => bw_material_preset(e, PresetName(preset));
+
+        /// <summary>The engine-side name for a preset ("concrete", ...). Case-insensitive engine-side.</summary>
+        public static string PresetName(BwMaterialPreset preset) => preset.ToString().ToLowerInvariant();
+
         /// <summary>Human-readable last error (null if clean). Does not take ownership of the pointer.</summary>
         public static string LastError(IntPtr e)
         {

@@ -67,6 +67,7 @@ src/
   zylia.h / zylia.c    Zylia ZM-1 single-position speaker localization (DOA + GN position). [calib]
   dbap.h / dbap.c      listener-relative, constant-power DBAP gain solve. [M4]
   fdn.h / fdn.c        directional FDN reverb bed (phonon-free; takes the reflection bus tap). [innovations]
+  ism.h / ism.c        image-source EARLY reflections: shoebox mirrors, panned as point sources. [innovations]
   align.h / align.c    per-speaker gain trim + delay-line output stage. [M4]
   binaural.h/binaural.c  head-oriented 26->stereo monitor (Steam Audio HRTF is the upgrade). [M5]
   ambisonics.h/.c      3rd-order ACN/SN3D encode (+ phonon N3D scale) for the Steam decode. [M5]
@@ -102,8 +103,8 @@ cmake --build build --config RelWithDebInfo
 ctest --test-dir build -C RelWithDebInfo      # runs the full test suite (test_* targets)
 ```
 
-**Current state (M6 + occlusion):** builds `bwaudio.dll` + the test suite (eighteen ctests with the Steam
-Audio SDK, fourteen without; +`calib_view` with `BWAUDIO_BUILD_CALIBVIEW`, +`layout_tool` and
+**Current state (M6 + occlusion):** builds `bwaudio.dll` + the test suite (nineteen ctests with the Steam
+Audio SDK, fifteen without; +`calib_view` with `BWAUDIO_BUILD_CALIBVIEW`, +`layout_tool` and
 +`playground` with `BWAUDIO_BUILD_PLAYGROUND`). `rt.c` is the concurrency spine
 (two SPSC rings, voice + sound tables, commit snapshot, generation handles) + retire-ack;
 the whole `bw_*` API forwards to it. `sound.c` decodes wav (dr_wav) and `mix_voice` plays
@@ -213,6 +214,16 @@ localization, diffuse spread, power match both ways, and the round-trip. **Direc
 it takes the reflection BUS TAP instead of the Steam bed (mutually exclusive; same aux send + send
 levels, `bw_reflections_set_gain` applies), so reverb now works in no-SDK builds. The `fdn` test
 pins RT60 landing (0.8 s configured → 0.800 measured), the 2-band split, anisotropy, and stability.
+**Image-source EARLY reflections** (`bw_source_set_early_reflections` + `bw_early_reflections_set_gain`,
+per-source opt-in, phonon-free, `ism.c`): the FDN's other half — the six first-order shoebox mirrors,
+each rendered as a POINT SOURCE at its mirrored position through the LISTENER-RELATIVE panner, so
+reflections have direction AND parallax as the listener walks (a shared listener-centric bed cannot).
+`bw_scene_set_box` now captures the room with or without the SDK, so one call feeds both the
+ray-traced scene and the ISM. Per image: gliding fractional delay (path/c, per-voice `ism_ring`),
+one-pole HF damping from the material's high-vs-mid absorption, ramped panner gains; enable wipes the
+ring (recycled slot) and snaps delays, disable ramps out over one block. Order 1 ONLY by design —
+higher orders are the FDN's job. The `ism` test pins the mirror geometry; the `rt` test pins arrival
+times against the geometric prediction (floor+ceiling pair at 546 samples), direction, and opt-out.
 **Tier-2 rendering polish** (all rt-tested): **pose prediction** (`bw_set_pose_prediction`, off by
 default) — `pose.h` slots carry the writer's clock (`pose_write_t`; natnet stamps QPC at arrival),
 and `rt_render` leads the tracked position by a fixed user lead along a ~100 ms-smoothed,
@@ -305,17 +316,42 @@ test) is the one-placement complement to the multi-position omni survey: the 19-
 arrive at 19 times, so the arrival-time DIFFERENCES give a speaker's DIRECTION from ONE spot (latency-free,
 sub-degree — `zylia_doa`), and with the known latency a Gauss-Newton refine against the exact spherical
 wavefront gives the full position (`zylia_localize`). Distance is latency-limited (the array is too small to
-self-calibrate latency at metres). Spatial room capture reuses the same sweep windowed per early reflection →
-`zylia_doa` → which surface throws it. The 19-ch ASIO capture + the datasheet capsule geometry are the
-rig-bound shell, factored into `zylia_capture.cpp` (driver open, format conversion, transient trigger,
-snapshot publish via `ZpShared`) and shared by two consumers: `bw_zylia_probe` (opt-in
-`-DBWAUDIO_BUILD_CALIBRATE=ON`), the console bring-up meter (tap a capsule → its channel jumps); and
-`bw_calib_view`'s **Zylia tab**, the live DOA view — a clap is snapshotted, `zylia_tdoa` (onset +
-windowed cross-correlation with sub-sample peaks, unit-tested in the `zylia` test) feeds `zylia_doa`,
-and a dot appears on the capsule sphere where the clap came from, verifying capsule mapping AND the
-geometry table in seconds. Its simulate mode synthesizes claps from a known (walking) direction
-through the identical pipeline, and the `zylia/sim_doa` UI test asserts the recovered direction lands
-within 2° of truth.
+self-calibrate latency at metres). Spatial room capture (early-reflection DOA) is still DESIGN ONLY — nothing
+consumes `er_delay` directionally yet. The capsule geometry is REAL: the ZM-1's 19 capsules are a vertex-up
+**dodecahedron minus the nadir vertex** (Zylia's published node table; built from closed forms —
+`asin(√5/3)`, `asin(1/3)`, `atan(√(3/5))` — so nothing is rounded), and the `zylia` test pins the structure
+(ring populations 1/3/6/6/3, the unpaired zenith, the sum-to-zenith identity, the 41.81° dodecahedral edge).
+What the table CANNOT give you is the **channel order** (node i ≠ ASIO input i) or the **azimuth reference**
+(which capsule faces front) — both survive every structural check, both yield a confident WRONG direction,
+and no off-hardware test can catch either. Hence the **capsule self-survey** (`zylia_survey`, `zylia_set_capsules`,
+`zylia_survey_save/load`): claps from ≥6 known positions recover the capsule positions INDEXED BY ASIO CHANNEL
+in ROOM axes, so the result *is* the channel order and *is* the orientation. `τ[k][i] = t0_k − (1/c)·m_i·d_k`,
+the unknowable per-observation constant `t0_k` dies under a mean-subtraction across the 19 capsules, and what's
+left separates into nineteen independent 3-unknown solves sharing one 3×3 normal matrix — **so it needs no
+sweep, no sample-sync and no second audio device**. Two subtleties the code documents: a clap at 2.5 m is a
+SPHERE (curvature across the array is a systematic ~1.4 µs ≈ 2–3 mm), so the solver takes source POSITIONS and
+iterates an exact-minus-plane-wave correction; and translation is a GAUGE (unobservable), where the default
+choice is wrong — the capsule set is centroid-UNbalanced (missing nadir), its centroid sitting R/19 = 2.6 mm
+off the sphere centre, so the solve re-centres on the best-fit SPHERE each iteration. Coplanar claps (a
+horizontal ring) leave the capsules' HEIGHTS unconstrained; `spread` measures this and below 0.05 it refuses
+rather than return a flattened array. The 19-ch ASIO capture is the rig-bound shell, factored into
+`zylia_capture.cpp` (driver open, format conversion, transient trigger, snapshot publish via `ZpShared`;
+trigger thresholds + the live noise floor are exposed in `ZpShared` for tuning at the rig) and shared by two
+consumers: `bw_zylia_probe` (opt-in `-DBWAUDIO_BUILD_CALIBRATE=ON`), the console bring-up meter (tap a capsule
+→ its channel jumps — this is what resolves the channel order by hand); and `bw_calib_view`'s **Zylia tab**,
+the live DOA view — a clap is snapshotted, `zylia_tdoa` (onset + windowed cross-correlation with sub-sample
+peaks) feeds `zylia_doa`, and a dot appears on the capsule sphere where the clap came from. The tab also hosts
+the **Capsule survey** panel (bank claps → Solve → Install → Save). A device exposing FEWER than 19 inputs is
+REFUSED for DOA (the unfilled snapshot channels would enter the fit as silent arrivals and point somewhere
+confidently wrong). Simulate mode synthesizes claps through the identical pipeline; `zylia/sim_doa` asserts the
+recovered direction lands within 2° of truth and `zylia/sim_survey` drives the whole survey flow, asserting it
+recovers the built-in table back (which only holds if the UI fed it the right positions, arrivals AND channel
+order). **Dante is the unlock for the sweep path**: the ZM-1 can join the Dante network via Dante Via, so DVS
+presents its 19 capsules as INPUTS ON THE SAME ASIO DEVICE as the 26 outputs — one driver, one clock domain,
+which dissolves the two-device problem that blocks `--zylia` on hardware (and makes latency measurable, so
+DISTANCE becomes real). `zylia_survey` is capture-agnostic: it takes (source position, 19 arrival times) and
+does not care whether they came from a clap's cross-correlation or a sweep's deconvolved IR peak. See
+docs/calibration.md.
 **`bw_calib_view`** (opt-in `-DBWAUDIO_BUILD_CALIBVIEW=ON`) is the **calibration station** (imgui +
 implot + implot3d on win32+d3d11 — the stack for new panel/plot tools; theme + embedded Roboto +
 conventions ported from aforren1/lsl-viewer, the house reference — `examples/bw_theme.h`): it loads
@@ -375,7 +411,31 @@ builds `test_sound` under ASan.
   tracked position. See `docs/spatialization.md`.
 - Do not assume Steam Audio's Unity/FMOD *integration* limits apply to its C API.
   The C API supports custom speaker layouts; the integrations do not expose them.
+- Do not run the Steam reflection bed AND the ISM early reflections together — the
+  bed already contains early reflections, so they render twice (engine.c warns once).
+- Do not model the CAVE room itself with the ISM. Its shoebox is the *virtual*
+  environment; the physical room supplies its own reflections, and modelling it
+  double-counts (same trap as matching the measured RT60 — docs/calibration.md).
 - Do not let any `bw_*` per-frame call block or allocate.
+
+## Which acoustics path (the recommendation)
+
+Three implementations now overlap here; they are complementary, not rivals (the full
+comparison + rationale is `docs/materials.md` → "Choosing an acoustics path"):
+
+- **Steam scene** (`steam_scene.c`) for occlusion + directivity + pathing — ray tracing
+  earns its keep; the manual path needs the game to already know the answer.
+- **ISM** (`ism.c`) for early reflections — the Steam bed is listener-CENTRIC (one field
+  around one point, 30 Hz) so its reflections have no parallax; the ISM pans each bounce
+  as a point source through the listener-relative panner, per block. That is the engine's
+  own thesis applied to reflections. Cost: O(N) in sources vs the bed's O(1) — opt in on
+  the few that matter.
+- **FDN** (`fdn.c`) for the late tail — deterministic, infinite, designable.
+
+That configuration never creates the Steam reflection bed. A **no-SDK build is fully
+viable** (ISM + FDN + manual occlusion); what it loses is automatic occlusion, pathing,
+and the real HRTF monitor — the last being a *developer-workstation* dependency, since
+the production array render never uses HRTF.
 
 ## Doc index
 

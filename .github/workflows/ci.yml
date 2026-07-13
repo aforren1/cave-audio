@@ -25,12 +25,16 @@ name: ci
 on:
   push:
     branches: [main]
+    tags: ['v*']        # a tag additionally RELEASES the Unity package (see the release steps)
   pull_request:
   workflow_dispatch:
 
 concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
+
+permissions:
+  contents: write       # the release step attaches the .tgz; everything else is read-only
 
 jobs:
   windows:
@@ -207,6 +211,20 @@ jobs:
           "@ | Out-File -Encoding utf8 dist/DIST.txt
           Get-Content dist/DIST.txt
 
+      # The Unity package. Packed on EVERY run (not just tags) so a broken package - a missing .meta,
+      # a version/tag mismatch, a tarball that somehow lost its DLLs - fails the build rather than the
+      # release. The .tgz lands in dist/, so it rides along in the workflow artifact below too.
+      - name: Pack UPM package
+        shell: pwsh
+        env:
+          TAG: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || '' }}
+        run: |
+          # -PluginsFrom pins RelWithDebInfo: the Debug build above ALSO POST_BUILD-stages into the
+          # package folder (last config wins), so packing without it would ship the Debug engine.
+          $a = @('-PluginsFrom', 'build/RelWithDebInfo', '-OutDir', 'dist')
+          if ($env:TAG) { $a += @('-Version', $env:TAG) }   # tag must match package.json, or this fails
+          ./tools/upm/pack.ps1 @a
+
       - name: Upload artifact
         uses: actions/upload-artifact@v6
         with:
@@ -214,3 +232,52 @@ jobs:
           path: dist/
           retention-days: 30
           if-no-files-found: error
+
+      # ---- release (tags only) -------------------------------------------------------------------
+      # ONE artifact, two ways to consume it. The Release IS the publish: OpenUPM's `githubRelease`
+      # tracking mode discovers the tag, finds the Release whose tag matches, and serves the attached
+      # .tgz UNCHANGED - so there is no registry push here, no token, and nothing to rotate. The same
+      # file is also the manual "Install package from tarball..." download for anyone who would rather
+      # not add a registry at all.
+      #
+      # Two rules OpenUPM imposes, both already satisfied: the git tag must match package.json (the
+      # pack step above FAILS otherwise), and the Release must carry exactly ONE publishable .tgz. If
+      # a second tarball is ever attached here, set githubReleaseAssetName in the OpenUPM package
+      # config to the stable prefix `com.brainworks.bwaudio-`.
+      #
+      # (For the record: GitHub Packages could never host this - its npm registry accepts only SCOPED
+      # names (@owner/name), and Unity package names may not contain '@' or '/'.)
+      - name: Release the Unity package (OpenUPM picks this up)
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tgz = (Get-Item dist/*.tgz).FullName
+          $notes = @"
+          Unity package ``com.brainworks.bwaudio`` $($env:GITHUB_REF_NAME). Windows x64 only.
+
+          **Install (recommended)**
+          ``````
+          openupm add com.brainworks.bwaudio
+          ``````
+          ...or add the registry by hand in ``Packages/manifest.json``, then pick the package up under
+          Package Manager > My Registries:
+          ``````json
+          "scopedRegistries": [
+            { "name": "package.openupm.com", "url": "https://package.openupm.com", "scopes": ["com.brainworks"] }
+          ]
+          ``````
+
+          **Install (no registry)** - download the ``.tgz`` below, then
+          Package Manager > ``+`` > *Install package from tarball...*
+
+          Ships the native engine (``bwaudio.dll`` + ``phonon.dll``), import settings already set. Turn
+          OFF Unity's built-in audio (*Project Settings > Audio > Disable Unity Audio*): the engine owns
+          the device.
+
+          **License: GPLv3.** ``bwaudio.dll`` links the ASIO SDK under its GPLv3 option. Internal use
+          never triggers copyleft, but SHIPPING a Unity app that includes this DLL to third parties
+          would put that app under GPLv3 - see ``docs/build.md`` for the proprietary-ASIO alternative.
+          "@
+          gh release create $env:GITHUB_REF_NAME $tgz --title "bwaudio $env:GITHUB_REF_NAME" --notes $notes

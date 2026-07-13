@@ -8,6 +8,7 @@
 #include "rt.h"
 #include "layout.h"
 #include "ambisonics.h"   /* BW_AMBI_CH for the pathing accumulator capture */
+#include "ism.h"          /* IsmRoom for the early-reflection section */
 #include "dr_wav.h"
 
 #include <math.h>
@@ -72,6 +73,19 @@ static int write_impulse_wav(const char* path, uint32_t frames) {
     float* buf = (float*)calloc((size_t)frames, sizeof(float));
     if (!buf) { drwav_uninit(&wav); return 0; }
     buf[0] = 1.0f;                                   /* unit impulse at frame 0, silence after */
+    drwav_uint64 wrote = drwav_write_pcm_frames(&wav, frames, buf);
+    free(buf); drwav_uninit(&wav);
+    return wrote == frames;
+}
+/* an impulse at frame `at`, so the voice's gain ramp-in (one block from 0) is long settled when it
+ * fires — otherwise the ramp would swallow an impulse sitting at frame 0. */
+static int write_impulse_at_wav(const char* path, uint32_t at, uint32_t frames) {
+    drwav_data_format fmt = { drwav_container_riff, DR_WAVE_FORMAT_IEEE_FLOAT, 1, RATE, 32 };
+    drwav wav;
+    if (!drwav_init_file_write(&wav, path, &fmt, NULL)) return 0;
+    float* buf = (float*)calloc((size_t)frames, sizeof(float));
+    if (!buf) { drwav_uninit(&wav); return 0; }
+    if (at < frames) buf[at] = 1.0f;
     drwav_uint64 wrote = drwav_write_pcm_frames(&wav, frames, buf);
     free(buf); drwav_uninit(&wav);
     return wrote == frames;
@@ -992,6 +1006,104 @@ int main(void) {
             CHECK(canary_ok, "24-ch: nothing writes beyond the active channel count");
             rt_source_destroy(c24, h24); rt_commit(c24);
             rt_destroy(c24);
+        }
+    }
+
+    /* image-source early reflections (bw_source_set_early_reflections): a source hard against the +x
+     * wall of a shoebox. Its +x image sits just BEYOND that wall, so the reflection must (a) appear
+     * only when enabled, (b) arrive AFTER the direct sound, and (c) come from the +x side — a real
+     * point source panned at the mirrored position, not a diffuse bed. */
+    {
+        RtCore* ci = rt_create(8, 4, RATE, CH);
+        CHECK(ci != NULL, "rt_create (early reflections)");
+        if (ci) {
+            IsmRoom room; memset(&room, 0, sizeof room);
+            room.w = 6.f; room.h = 3.f; room.d = 6.f; room.valid = 1;
+            for (int f = 0; f < ISM_FACES; ++f)                  /* lively walls: strong first-order returns */
+                for (int b = 0; b < 3; ++b) room.absorb[f][b] = 0.1f;
+            rt_set_ism_room(ci, &room);
+            const float qi[4] = { 0, 0, 0, 1 };
+            rt_set_listener(ci, (const float[3]){ 0.f, 1.5f, 0.f }, qi);   /* centre of the room */
+
+            const char* IW = "bw_rt_imp.wav";
+            enum { IMP_AT = 300 };                               /* fires after the voice's one-block gain ramp-in */
+            if (write_impulse_at_wav(IW, IMP_AT, 8 * N)) {
+                enum { KB = 6 };                                 /* 1536 samples: past every reflection path */
+                static double env[KB * N], envp[KB * N], envn[KB * N];   /* |sum| all / +x side / -x side */
+                uint32_t si = rt_load_sound(ci, IW, err, sizeof err);
+                uint32_t hi = rt_source_create(ci);
+                /* fire the impulse and capture KB blocks: the per-sample envelope over the whole
+                 * capture, split into the +x and -x speaker halves (the reflection's direction). */
+                #define ISM_CAPTURE() do {                                                        \
+                    rt_source_play(ci, hi, si, false);                                            \
+                    rt_source_set_pos(ci, hi, 2.5f, 1.5f, 0.f);   /* 0.5 m from the +x wall */    \
+                    rt_commit(ci);                                                                \
+                    BwTimestamp ts_ = { 0, 0 };                                                   \
+                    for (int b_ = 0; b_ < KB; ++b_) {                                             \
+                        rt_render(ci, bus, N, &ts_);                                              \
+                        for (int i_ = 0; i_ < (int)N; ++i_) {                                     \
+                            double a_ = 0, p_ = 0, n_ = 0;                                        \
+                            for (int ch_ = 0; ch_ < CH; ++ch_) {                                  \
+                                double v_ = fabs(bus[(size_t)ch_ * N + i_]);                      \
+                                a_ += v_;                                                         \
+                                if (LD.speakers[ch_].pos[0] >  1.f) p_ += v_;                     \
+                                if (LD.speakers[ch_].pos[0] < -1.f) n_ += v_;                     \
+                            }                                                                     \
+                            env[b_ * (int)N + i_] = a_; envp[b_ * (int)N + i_] = p_;              \
+                            envn[b_ * (int)N + i_] = n_;                                          \
+                        }                                                                         \
+                    }                                                                             \
+                } while (0)
+                #define ISM_SUM(A, B, OUT, SRC) do {                                              \
+                    double s_ = 0; for (int i_ = (A); i_ < (B); ++i_) s_ += (SRC)[i_]; (OUT) = s_; \
+                } while (0)
+
+                ISM_CAPTURE();                                   /* dry (ISM off): the direct sound only */
+                double dry_direct, dry_late;
+                ISM_SUM(IMP_AT - 10, IMP_AT + 50, dry_direct, env);
+                ISM_SUM(IMP_AT + 120, KB * (int)N, dry_late, env);   /* the reflection window: silent when dry */
+                CHECK(dry_direct > 1e-3, "the direct impulse renders");
+                CHECK(dry_late < dry_direct * 0.02, "no reflections without the opt-in");
+
+                rt_source_set_ism(ci, hi, true);
+                rt_commit(ci);
+                ISM_CAPTURE();                                   /* wet: direct + the six wall images */
+                double wet_direct, wet_late, wet_px, wet_nx;
+                ISM_SUM(IMP_AT - 10, IMP_AT + 50, wet_direct, env);
+                ISM_SUM(IMP_AT + 120, KB * (int)N, wet_late, env);
+                CHECK(fabs(wet_direct - dry_direct) / dry_direct < 0.05, "the direct sound is unchanged");
+                CHECK(wet_late > dry_direct * 0.05, "reflections arrive AFTER the direct sound");
+                /* Every arrival is pinned by geometry (source (2.5,1.5,0), listener (0,1.5,0), room
+                 * 6x3x6 -> x,z in +-3, y in [0,3]):
+                 *   +x wall  image (3.5, 1.5, 0)     -> 3.50 m -> 490 samples
+                 *   floor    image (2.5,-1.5, 0)     -> 3.91 m -> 546  (coincident with the ceiling,
+                 *   ceiling  image (2.5, 4.5, 0)     -> 3.91 m -> 546   so this PAIR is the largest peak)
+                 *   +-z wall images (2.5, 1.5, +-6)  -> 6.50 m -> 909
+                 * The peak past the direct sound is therefore the floor/ceiling pair at ~546. */
+                int pk = IMP_AT + 120; double pkv = 0;          /* search PAST the direct arrival */
+                for (int i = IMP_AT + 120; i < KB * (int)N; ++i) if (env[i] > pkv) { pkv = env[i]; pk = i; }
+                printf("ism: strongest reflection %d samples after the direct (floor+ceiling pair: 546)\n", pk - IMP_AT);
+                CHECK(pk - IMP_AT > 500 && pk - IMP_AT < 590, "reflections land at their geometric path delays");
+                /* the near +x wall's own reflection (~490) must come from the +x side: it is a point
+                 * source at the mirrored position, not a diffuse bed */
+                ISM_SUM(IMP_AT + 460, IMP_AT + 520, wet_px, envp);
+                ISM_SUM(IMP_AT + 460, IMP_AT + 520, wet_nx, envn);
+                CHECK(wet_px > wet_nx * 1.2, "the +x wall's reflection arrives from the +x side");
+
+                rt_source_set_ism(ci, hi, false);                /* opt out: the reflections ramp away */
+                rt_commit(ci);
+                ISM_CAPTURE();
+                double off_direct, off_late;
+                ISM_SUM(IMP_AT - 10, IMP_AT + 50, off_direct, env);
+                ISM_SUM(IMP_AT + 120, KB * (int)N, off_late, env);
+                CHECK(fabs(off_direct - dry_direct) / dry_direct < 0.05, "direct sound survives the opt-out");
+                CHECK(off_late < dry_direct * 0.02, "opting out silences the reflections");
+                #undef ISM_SUM
+                #undef ISM_CAPTURE
+                rt_source_destroy(ci, hi); rt_commit(ci);
+                remove(IW);
+            } else CHECK(0, "write impulse wav (ism)");
+            rt_destroy(ci);
         }
     }
 

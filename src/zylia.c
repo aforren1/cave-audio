@@ -4,24 +4,96 @@
 #include "zylia.h"
 
 #include <math.h>
+#include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
-#define ZYLIA_RADIUS_M 0.049f   /* ZM-1 is ~98 mm diameter */
+#include "cJSON.h"
+
+#define ZYLIA_RADIUS_M 0.049f   /* ZM-1 shell is ~100 mm across. Only zylia_localize's near-field solve
+                                 * reads this — zylia_doa normalizes the fitted gradient, so the radius
+                                 * cancels out of the DIRECTION entirely (49 vs 50 mm changes nothing). */
+
+/* An installed capsule survey (zylia_set_capsules). Overrides the built-in table everywhere. These
+ * tools are single-threaded; the survey is set once at load and read by the solves. */
+static float g_caps[ZYLIA_MICS][3];
+static int   g_have_survey = 0;
 
 void zylia_geometry(float dirs[ZYLIA_MICS][3], float* radius_m) {
-    /* PLACEHOLDER: 19-point Fibonacci-sphere spread (well-distributed, deterministic). REPLACE this
-     * loop's output with the ZM-1 datasheet/surveyed capsule directions before on-hardware use — the
-     * localization math is geometry-agnostic, but the DOA is only correct if these match the real array. */
-    const double golden = 2.399963229728653;   /* pi*(3 - sqrt 5) */
+    /* The ZM-1's 19 capsules are the 20 vertices of a regular DODECAHEDRON, vertex-up, minus the nadir
+     * vertex. That is the whole geometry, and it self-checks: the rings come out 1 / 3 / 6 / 6 / 3 by
+     * elevation (the missing 20th would be the 1 at -90), each ring's azimuths are exactly its opposite
+     * ring's rotated 180 deg, and the elevations are the dodecahedral values below. It reproduces the
+     * node table published in Zylia's documentation (see docs/calibration.md for the source) to that
+     * table's 1-degree rounding — but we build it from the closed forms, so there is no rounding here.
+     *
+     * Frame: the engine's room convention (+X right, +Y up, -Z front); azimuth measured from -Z toward
+     * +X, elevation = asin(y). That is exactly what calib_view's zy_az/zy_el invert.
+     *
+     * TWO THINGS THIS TABLE CANNOT TELL YOU, both of which must be pinned on the rig:
+     *   - CHANNEL ORDER: node i here is not necessarily ASIO input i. A permutation still yields a
+     *     confident direction, just the wrong one. bw_zylia_probe resolves it (tap a capsule, see
+     *     which channel jumps).
+     *   - AZIMUTH REFERENCE: nothing published says which capsule faces the device's front, so an
+     *     unknown yaw offset rotates every DOA by a constant. Clap from a known direction in
+     *     calib_view's Zylia tab; the discrepancy IS the offset.
+     * Both fall out for free if you run the capsule self-survey instead (docs/calibration.md).
+     */
+    const double D2R = 3.14159265358979323846 / 180.0;
+    const double A = asin(sqrt(5.0) / 3.0) / D2R;    /* 48.1897 deg — the +-48 rings                 */
+    const double B = asin(1.0 / 3.0)       / D2R;    /* 19.4712 deg — the +-19 rings                 */
+    const double Q = atan(sqrt(3.0 / 5.0)) / D2R;    /* 37.7612 deg — generates every ring's azimuth */
+
+    /* {azimuth, elevation} in degrees, in the published node order. */
+    const double node[ZYLIA_MICS][2] = {
+        {       0.0,  90.0 },                                                  /* 0     zenith   */
+        {       0.0,     A }, {     120.0,     A }, {    -120.0,     A },       /* 1-3   +48 ring */
+        { -(120.0-Q),    B }, {        -Q,     B }, {         Q,     B },       /* 4-9   +19 ring */
+        {   120.0-Q,     B }, {   120.0+Q,     B }, { -(120.0+Q),    B },
+        { -(180.0-Q),   -B }, { -(60.0+Q),    -B }, { -(60.0-Q),    -B },       /* 10-15 -19 ring */
+        {    60.0-Q,    -B }, {   60.0+Q,     -B }, {   180.0-Q,    -B },
+        {     180.0,    -A }, {     -60.0,    -A }, {      60.0,    -A },       /* 16-18 -48 ring */
+    };
+
     for (int i = 0; i < ZYLIA_MICS; ++i) {
-        double y  = 1.0 - 2.0 * ((double)i + 0.5) / (double)ZYLIA_MICS;   /* 1 .. -1 */
-        double r  = sqrt(fmax(0.0, 1.0 - y * y));
-        double th = golden * (double)i;
-        dirs[i][0] = (float)(r * cos(th));
-        dirs[i][1] = (float)y;
-        dirs[i][2] = (float)(r * sin(th));
+        double az = node[i][0] * D2R, el = node[i][1] * D2R, ce = cos(el);
+        dirs[i][0] = (float)( ce * sin(az));
+        dirs[i][1] = (float)( sin(el));
+        dirs[i][2] = (float)(-ce * cos(az));
     }
     if (radius_m) *radius_m = ZYLIA_RADIUS_M;
+
+    if (g_have_survey) {                       /* a survey overrides the table: hand back its directions */
+        double rsum = 0.0;
+        for (int i = 0; i < ZYLIA_MICS; ++i) {
+            double m = sqrt((double)g_caps[i][0]*g_caps[i][0] + (double)g_caps[i][1]*g_caps[i][1] +
+                            (double)g_caps[i][2]*g_caps[i][2]);
+            rsum += m;
+            if (m < 1e-9) m = 1e-9;
+            dirs[i][0] = (float)(g_caps[i][0] / m);
+            dirs[i][1] = (float)(g_caps[i][1] / m);
+            dirs[i][2] = (float)(g_caps[i][2] / m);
+        }
+        if (radius_m) *radius_m = (float)(rsum / ZYLIA_MICS);
+    }
+}
+
+void zylia_set_capsules(const float caps_m[ZYLIA_MICS][3]) {
+    if (!caps_m) { g_have_survey = 0; return; }
+    memcpy(g_caps, caps_m, sizeof g_caps);
+    g_have_survey = 1;
+}
+
+void zylia_capsules(float caps_m[ZYLIA_MICS][3]) {
+    if (!caps_m) return;
+    if (g_have_survey) { memcpy(caps_m, g_caps, sizeof g_caps); return; }
+    float dirs[ZYLIA_MICS][3], R;
+    zylia_geometry(dirs, &R);                  /* no survey installed, so this is the built-in table */
+    for (int i = 0; i < ZYLIA_MICS; ++i) {
+        caps_m[i][0] = R * dirs[i][0];
+        caps_m[i][1] = R * dirs[i][1];
+        caps_m[i][2] = R * dirs[i][2];
+    }
 }
 
 /* Gaussian elimination with partial pivoting on a row-major n x n system A*x = b (n <= 4). 0 if singular. */
@@ -50,12 +122,15 @@ static int solve_lin(int n, double* A, double* b, double* x) {
 
 int zylia_doa(const double arrival_s[ZYLIA_MICS], float dir_out[3]) {
     if (!arrival_s || !dir_out) return 0;
-    float dirs[ZYLIA_MICS][3]; float R; zylia_geometry(dirs, &R);
-    /* Far field: tau_i = A - (R/c)(dir_i . d). Fit tau_i = A + b.dir_i (4 unknowns) by least squares;
-     * b = -(R/c) d points AWAY from the source, so d = -normalize(b). Latency folds into A and cancels. */
+    float caps[ZYLIA_MICS][3]; zylia_capsules(caps);
+    /* Far field: tau_i = A - (1/c)(m_i . d), m_i = capsule position relative to the centre. Fit
+     * tau_i = A + b.m_i (4 unknowns) by least squares; b = -d/c points AWAY from the source, so
+     * d = -normalize(b). Latency folds into A and cancels. Fitting against POSITIONS rather than
+     * (radius x unit direction) is what lets a SURVEYED array — capsules not exactly on the nominal
+     * sphere — be handled exactly, and it makes the radius irrelevant to the direction. */
     double M[16] = {0}, rhs[4] = {0};
     for (int i = 0; i < ZYLIA_MICS; ++i) {
-        double row[4] = { 1.0, dirs[i][0], dirs[i][1], dirs[i][2] };
+        double row[4] = { 1.0, caps[i][0], caps[i][1], caps[i][2] };
         for (int a = 0; a < 4; ++a) {
             for (int cc = 0; cc < 4; ++cc) M[a*4+cc] += row[a] * row[cc];
             rhs[a] += row[a] * arrival_s[i];
@@ -145,16 +220,237 @@ int zylia_tdoa(const float* const x[ZYLIA_MICS], uint32_t n, double fs, uint32_t
     return 1;
 }
 
+int zylia_survey(const float src_m[][3], const double (*arrival_s)[ZYLIA_MICS], int nobs, double c,
+                 float caps_out[ZYLIA_MICS][3], float* resid_us, float* radius_out, float* spread_out) {
+    if (!src_m || !arrival_s || !caps_out || nobs < 4 || c <= 0.0) return 0;
+
+    double d[ZYLIA_SURVEY_MAX][3], D[ZYLIA_SURVEY_MAX];      /* unit direction + range, per observation */
+    if (nobs > ZYLIA_SURVEY_MAX) nobs = ZYLIA_SURVEY_MAX;
+    for (int k = 0; k < nobs; ++k) {
+        D[k] = sqrt((double)src_m[k][0]*src_m[k][0] + (double)src_m[k][1]*src_m[k][1] +
+                    (double)src_m[k][2]*src_m[k][2]);
+        if (D[k] < 0.2) return 0;                            /* inside/at the array: the model is nonsense */
+        d[k][0] = src_m[k][0] / D[k]; d[k][1] = src_m[k][1] / D[k]; d[k][2] = src_m[k][2] / D[k];
+    }
+
+    /* A = sum_k d_k d_k^T is the normal matrix, and it is the SAME for all 19 capsules — the model
+     * separates, so this is one 3x3 shared by nineteen 3-unknown solves. Its determinant is also the
+     * degeneracy test: the d_k are unit, so trace(A) = nobs, and 27*det(A/nobs) is 1 for perfectly
+     * isotropic directions and 0 when they are coplanar. Coplanar is the realistic failure — clapping
+     * in a horizontal ring around the array leaves the capsules' HEIGHTS unconstrained, and the solve
+     * would happily return a flattened array rather than admit it. Refuse instead. */
+    double A[9] = {0};
+    for (int k = 0; k < nobs; ++k)
+        for (int a = 0; a < 3; ++a)
+            for (int b = 0; b < 3; ++b) A[a*3+b] += d[k][a] * d[k][b];
+    double s = 1.0 / (double)nobs;
+    double det = A[0]*s * (A[4]*s*A[8]*s - A[5]*s*A[7]*s)
+               - A[1]*s * (A[3]*s*A[8]*s - A[5]*s*A[6]*s)
+               + A[2]*s * (A[3]*s*A[7]*s - A[4]*s*A[6]*s);
+    double spread = 27.0 * det;
+    if (spread < 0.0) spread = 0.0;
+    if (spread_out) *spread_out = (float)spread;
+    if (spread < 0.05) return 0;               /* coplanar / clustered: the vertical is unrecoverable */
+
+    /* The linear model is a PLANE wave, but a clap 2.5 m away is a sphere, and across a 49 mm array
+     * that curvature is a systematic ~1.4 us — worth 2-3 mm of capsule error if ignored. We know the
+     * clap's RANGE (it is the same known spot that gave us the direction), so we can just subtract the
+     * curvature off: seed with the plane-wave solve, then iterate
+     *     corr[k][i] = ( |src_k - m_i| - (D_k - m_i . d_k) ) / c        (exact minus plane-wave)
+     * re-solving the linear system on tau - corr each round. corr depends only weakly on m, so this is
+     * a contraction and settles in a few passes. Pass a far-away source and corr -> 0, recovering the
+     * pure plane-wave solve. */
+    double m[ZYLIA_MICS][3];
+    memset(m, 0, sizeof m);
+    for (int iter = 0; iter < 8; ++iter) {
+        /* Per observation, subtract the mean over the 19 capsules. That mean is exactly the per-k
+         * constant (t0_k + D_k/c) under the centering gauge sum_i m_i = 0, so this removes the system
+         * latency, the clap's onset, and zylia_tdoa's arbitrary reference channel in one stroke —
+         * without ever estimating one of them. The gauge then holds automatically in the solution:
+         * summing the 19 normal equations gives A * (sum_i m_i) = 0, and A is non-singular above. */
+        double rhs[ZYLIA_MICS][3];
+        memset(rhs, 0, sizeof rhs);
+        for (int k = 0; k < nobs; ++k) {
+            double y[ZYLIA_MICS], mean = 0.0;
+            for (int i = 0; i < ZYLIA_MICS; ++i) {
+                double ex = (double)src_m[k][0] - m[i][0], ey = (double)src_m[k][1] - m[i][1],
+                       ez = (double)src_m[k][2] - m[i][2];
+                double exact = sqrt(ex*ex + ey*ey + ez*ez);
+                double plane = D[k] - (m[i][0]*d[k][0] + m[i][1]*d[k][1] + m[i][2]*d[k][2]);
+                y[i] = arrival_s[k][i] - (exact - plane) / c;      /* iter 0: m = 0, so corr = 0 */
+                mean += y[i];
+            }
+            mean /= (double)ZYLIA_MICS;
+            /* y[i] - mean = -(1/c) m_i . d_k   ->   normal equations  A m_i = -c * sum_k (y-mean) d_k */
+            for (int i = 0; i < ZYLIA_MICS; ++i)
+                for (int a = 0; a < 3; ++a) rhs[i][a] += -c * (y[i] - mean) * d[k][a];
+        }
+        for (int i = 0; i < ZYLIA_MICS; ++i) {
+            double Ai[9], bi[3];
+            memcpy(Ai, A, sizeof Ai);
+            bi[0] = rhs[i][0]; bi[1] = rhs[i][1]; bi[2] = rhs[i][2];
+            if (!solve_lin(3, Ai, bi, m[i])) return 0;
+        }
+
+        /* WHERE IS THE ORIGIN? Arrival times fix the capsule cloud's SHAPE but not its position:
+         * translating every m_i by w shifts each arrival by -(1/c) w . d_k, one constant per
+         * observation — and those are exactly what we fitted out. The translation is a gauge, so we
+         * must CHOOSE it, and the one the linear solve lands on (sum_i m_i = 0, the centroid) is the
+         * wrong choice. The ZM-1's capsules are not centroid-balanced: a dodecahedron MISSING its nadir
+         * vertex sums to the zenith, so the centroid sits R/19 = 2.6 mm ABOVE the sphere centre. Nobody
+         * tape-measures to the centroid. Fit the sphere the capsules actually lie on — algebraically,
+         * |p-q|^2 = r^2  ->  2 p_i . q - k = |p_i|^2 with k = |q|^2 - r^2, linear in four unknowns —
+         * and re-centre on q, giving the physical centre of the shell: the point the operator measured
+         * the clap positions from, and what zylia_localize's `center` argument means.
+         *
+         * This happens INSIDE the loop, not after it: the near-field correction above needs m in the
+         * same frame src_m is measured in. Re-centring only at the end would leave the correction
+         * computed 2.6 mm off, and it shows up as a residual that will not go away. */
+        double S[16] = {0}, sb[4] = {0}, q[4];
+        for (int i = 0; i < ZYLIA_MICS; ++i) {
+            double row[4] = { 2.0*m[i][0], 2.0*m[i][1], 2.0*m[i][2], -1.0 };
+            double rv    = m[i][0]*m[i][0] + m[i][1]*m[i][1] + m[i][2]*m[i][2];
+            for (int a = 0; a < 4; ++a) {
+                for (int b = 0; b < 4; ++b) S[a*4+b] += row[a] * row[b];
+                sb[a] += row[a] * rv;
+            }
+        }
+        if (!solve_lin(4, S, sb, q)) return 0;
+        for (int i = 0; i < ZYLIA_MICS; ++i) { m[i][0] -= q[0]; m[i][1] -= q[1]; m[i][2] -= q[2]; }
+    }
+
+    double rsum = 0.0;
+    for (int i = 0; i < ZYLIA_MICS; ++i) {
+        caps_out[i][0] = (float)m[i][0];
+        caps_out[i][1] = (float)m[i][1];
+        caps_out[i][2] = (float)m[i][2];
+        rsum += sqrt(m[i][0]*m[i][0] + m[i][1]*m[i][1] + m[i][2]*m[i][2]);
+    }
+    if (radius_out) *radius_out = (float)(rsum / ZYLIA_MICS);   /* ~49 mm; a wild value means bad data */
+
+    if (resid_us) {                            /* RMS of what the fitted geometry fails to explain, on the
+                                                * EXACT model — this is the number that says "trust it" */
+        double sse = 0.0; int cnt = 0;
+        for (int k = 0; k < nobs; ++k) {
+            double pred[ZYLIA_MICS], mean = 0.0;
+            for (int i = 0; i < ZYLIA_MICS; ++i) {
+                double ex = (double)src_m[k][0] - m[i][0], ey = (double)src_m[k][1] - m[i][1],
+                       ez = (double)src_m[k][2] - m[i][2];
+                pred[i] = sqrt(ex*ex + ey*ey + ez*ez) / c - arrival_s[k][i];
+                mean += pred[i];
+            }
+            mean /= (double)ZYLIA_MICS;        /* the unknowable per-k constant, fitted out */
+            for (int i = 0; i < ZYLIA_MICS; ++i) { double e = pred[i] - mean; sse += e * e; ++cnt; }
+        }
+        *resid_us = (float)(sqrt(sse / (cnt ? cnt : 1)) * 1e6);
+    }
+    return 1;
+}
+
+static void zy_err(char* err, int cap, const char* msg) {
+    if (err && cap > 0) { snprintf(err, (size_t)cap, "%s", msg); }
+}
+
+int zylia_survey_save(const char* path, const float caps_m[ZYLIA_MICS][3],
+                      float resid_us, float radius_m, float spread, int nobs, char* err, int errcap) {
+    if (!path || !caps_m) { zy_err(err, errcap, "zylia_survey_save: null argument"); return 0; }
+    cJSON* root = cJSON_CreateObject();
+    if (!root) { zy_err(err, errcap, "zylia_survey_save: out of memory"); return 0; }
+
+    cJSON_AddStringToObject(root, "_comment",
+        "ZM-1 capsule survey. Positions are metres, relative to the array centre, in ROOM axes "
+        "(+X right, +Y up, -Z front), indexed BY ASIO INPUT CHANNEL. This file therefore encodes the "
+        "channel order and the array's mounted orientation as well as the geometry. It is specific to "
+        "one physical ZM-1 on one mount: re-survey if either changes.");
+    cJSON_AddNumberToObject(root, "residual_us", resid_us);
+    cJSON_AddNumberToObject(root, "radius_m",    radius_m);
+    cJSON_AddNumberToObject(root, "spread",      spread);
+    cJSON_AddNumberToObject(root, "observations", nobs);
+
+    cJSON* arr = cJSON_AddArrayToObject(root, "capsules");
+    if (!arr) { cJSON_Delete(root); zy_err(err, errcap, "zylia_survey_save: out of memory"); return 0; }
+    for (int i = 0; i < ZYLIA_MICS; ++i) {
+        cJSON* p = cJSON_CreateArray();
+        for (int a = 0; a < 3; ++a) cJSON_AddItemToArray(p, cJSON_CreateNumber(caps_m[i][a]));
+        cJSON_AddItemToArray(arr, p);
+    }
+
+    char* text = cJSON_Print(root);
+    cJSON_Delete(root);
+    if (!text) { zy_err(err, errcap, "zylia_survey_save: serialize failed"); return 0; }
+
+    FILE* f = fopen(path, "wb");
+    if (!f) { free(text); zy_err(err, errcap, "zylia_survey_save: cannot open file for writing"); return 0; }
+    size_t n = strlen(text);
+    size_t w = fwrite(text, 1, n, f);
+    fclose(f);
+    free(text);
+    if (w != n) { zy_err(err, errcap, "zylia_survey_save: short write"); return 0; }
+    return 1;
+}
+
+int zylia_survey_load(const char* path, char* err, int errcap) {
+    if (!path) { zy_err(err, errcap, "zylia_survey_load: null path"); return 0; }
+    FILE* f = fopen(path, "rb");
+    if (!f) { zy_err(err, errcap, "zylia_survey_load: cannot open file"); return 0; }
+    fseek(f, 0, SEEK_END);
+    long len = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    if (len <= 0 || len > (1 << 20)) { fclose(f); zy_err(err, errcap, "zylia_survey_load: bad file size"); return 0; }
+    char* text = (char*)malloc((size_t)len + 1);
+    if (!text) { fclose(f); zy_err(err, errcap, "zylia_survey_load: out of memory"); return 0; }
+    size_t got = fread(text, 1, (size_t)len, f);
+    fclose(f);
+    text[got] = 0;
+
+    int ok = 0;
+    float caps[ZYLIA_MICS][3];
+    cJSON* root = cJSON_Parse(text);
+    free(text);
+    if (!root) { zy_err(err, errcap, "zylia_survey_load: JSON parse error"); return 0; }
+
+    cJSON* arr = cJSON_GetObjectItemCaseSensitive(root, "capsules");
+    if (!cJSON_IsArray(arr) || cJSON_GetArraySize(arr) != ZYLIA_MICS) {
+        zy_err(err, errcap, "zylia_survey_load: 'capsules' must be an array of 19");
+        goto done;
+    }
+    for (int i = 0; i < ZYLIA_MICS; ++i) {
+        cJSON* p = cJSON_GetArrayItem(arr, i);
+        if (!cJSON_IsArray(p) || cJSON_GetArraySize(p) != 3) {
+            zy_err(err, errcap, "zylia_survey_load: each capsule must be [x, y, z]");
+            goto done;
+        }
+        for (int a = 0; a < 3; ++a) {
+            cJSON* v = cJSON_GetArrayItem(p, a);
+            if (!cJSON_IsNumber(v)) { zy_err(err, errcap, "zylia_survey_load: non-numeric capsule component"); goto done; }
+            caps[i][a] = (float)v->valuedouble;
+        }
+        /* A capsule metres from the array centre means a unit slip (mm vs m) or a corrupt file, and it
+         * would silently wreck every DOA. Cheap to check, so check. */
+        double m = sqrt((double)caps[i][0]*caps[i][0] + (double)caps[i][1]*caps[i][1] +
+                        (double)caps[i][2]*caps[i][2]);
+        if (m < 0.005 || m > 0.5) {
+            zy_err(err, errcap, "zylia_survey_load: capsule is not on a ~50 mm shell (units wrong?)");
+            goto done;
+        }
+    }
+    zylia_set_capsules(caps);
+    ok = 1;
+done:
+    cJSON_Delete(root);
+    return ok;
+}
+
 int zylia_localize(const double arrival_s[ZYLIA_MICS], const float center[3],
                    double latency_s, double c, float pos_out[3], float* dist_out) {
     if (!arrival_s || !center || !pos_out || c <= 0.0) return 0;
-    float dirs[ZYLIA_MICS][3]; float R; zylia_geometry(dirs, &R);
+    float caps[ZYLIA_MICS][3]; zylia_capsules(caps);
 
     double mic[ZYLIA_MICS][3], range[ZYLIA_MICS];
     for (int i = 0; i < ZYLIA_MICS; ++i) {
-        mic[i][0] = center[0] + R * dirs[i][0];
-        mic[i][1] = center[1] + R * dirs[i][1];
-        mic[i][2] = center[2] + R * dirs[i][2];
+        mic[i][0] = center[0] + caps[i][0];
+        mic[i][1] = center[1] + caps[i][1];
+        mic[i][2] = center[2] + caps[i][2];
         range[i]  = c * (arrival_s[i] - latency_s);    /* known-latency absolute range to each capsule */
     }
 

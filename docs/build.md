@@ -41,6 +41,25 @@ Everything beyond the DLL + test suite is opt-in; the default build stays lean.
 Steam Audio has no option: CMake auto-enables it when the built phonon SDK sits at
 `third_party/steam-audio-artifacts/` (see `third_party/README.md`).
 
+### Building without Steam Audio
+
+**A no-SDK build is fully viable for the array** — it is not a degraded mode. You keep the whole
+spatializer, plus a complete geometric acoustics path: **image-source early reflections**
+(`bw_source_set_early_reflections`, real parallax as the listener walks), the **directional FDN
+reverb** (`bw_reverb_fdn`), and **manual occlusion** (`bw_source_set_occlusion_manual`, driven by
+your own game logic). That is what a collaborator site should start from: clone, `cmake`, run.
+
+What the SDK adds, and what you lose without it:
+
+- **Ray-traced occlusion + transmission** against arbitrary geometry — automatic, where the manual
+  path needs the game to know the answer. The main reason to build it.
+- **Sound pathing** (routing around occluders). No equivalent.
+- **A real HRTF binaural monitor.** Without it the `binaural` profile falls back to a lateral pan:
+  fine for routing checks, useless for timbre or front/back. This is a *developer-workstation*
+  dependency — the production CAVE render is the 26-speaker array, which never uses HRTF.
+- The Steam **reflection bed**, which the recommended configuration does not use anyway (see
+  [materials.md](./materials.md) → "Choosing an acoustics path").
+
 ## Dependencies
 
 | dep            | role                                        | license / notes                          |
@@ -179,6 +198,31 @@ distribution channel:
   same directory — keep the pair together. The CMake post-build step and the Unity
   plugin staging both copy it for you. Only a no-SDK build is self-contained (with
   the simple-pan binaural fallback and acoustics calls as no-ops).
+- **The Unity package is packed every run, and released on a tag.**
+  `tools/upm/pack.ps1` produces `com.brainworks.bwaudio-<version>.tgz` — the C#
+  binding with both DLLs inside it — so a broken package (a missing `.meta`, a lost
+  plugin) fails the *build*, not a release. A `v*` tag then cuts a GitHub Release with
+  that tarball attached, and **the Release is the publish**: OpenUPM tracks the repo in
+  `githubRelease` mode, matches the tag, and serves the attached `.tgz` unchanged — so
+  there is no registry push, **no token, no secret**. Users run
+  `openupm add com.brainworks.bwaudio`, or download the tarball and use "Install
+  package from tarball". Same artifact either way, under the same GPLv3 terms as the
+  engine artifact: a Unity app that ships this DLL to third parties inherits GPLv3
+  (see the ASIO section). The tag must match `bindings/unity/package.json`, or the
+  pack fails.
+
+  Three constraints worth knowing before changing any of this:
+
+  1. **OpenUPM's *default* mode would ship a broken package.** It clones the repo at
+     the tag and runs `npm pack` — and the DLLs are gitignored build output, so the
+     result would be C# with no engine behind it. `trackingMode: githubRelease` is what
+     makes it serve our pre-built tarball instead. It also wants exactly ONE publishable
+     `.tgz` on the Release (or a `githubReleaseAssetName` prefix).
+  2. **GitHub Packages could never host it**: its npm registry accepts only *scoped*
+     names (`@owner/name`), and Unity package names may not contain `@` or `/`.
+  3. **The package's `.meta` files are committed on purpose**
+     (`tools/upm/gen-meta.ps1`) — an installed package is immutable, so assets without a
+     `.meta` get a fresh GUID per project and scenes lose their script references.
 
 ## DVS / Dante configuration
 

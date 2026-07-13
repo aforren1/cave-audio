@@ -14,12 +14,16 @@ sources, and per-frame updates. Declarations in
   an optional dual-band mode, per-source angular spread.
 - Per-speaker gain/delay/correction-EQ output stage driven by a measured layout
   file, with a linked protection limiter as the final stage.
-- Acoustics (Steam Audio builds only): ray-traced occlusion with per-band
-  transmission EQ, source directivity, a directional reflection bed (real-time
-  or baked), sound pathing around occluders. Without the SDK those calls are
-  documented no-ops, and the binaural profile uses a simple-pan monitor instead
-  of the HRTF decode.
-- Propagation (any build): Doppler and air absorption, opt-in per source.
+- Acoustics, **any build**: image-source early reflections (each wall bounce panned
+  as a point source, so it has parallax as the listener walks), a directional FDN
+  reverb tail, manual occlusion with per-band transmission EQ.
+- Acoustics, **Steam Audio builds**: ray-traced occlusion, source directivity, a
+  reflection bed (real-time or baked), sound pathing around occluders, and the HRTF
+  binaural monitor (without the SDK the binaural profile falls back to a simple pan).
+  Which reverb/reflection path to run is a real choice — see
+  [materials.md](./materials.md) → "Choosing an acoustics path".
+- Propagation (any build): Doppler, air absorption, equal-loudness compensation,
+  pitch — opt-in per source.
 - Assets: WAV/FLAC/MP3 decoded (and resampled) at load, disk streaming for long
   files, AmbiX ambisonic beds decoded world-locked to the array.
 - Voices: fixed pool with priority stealing, pause and click-free seek,
@@ -766,6 +770,16 @@ array.
 (This needs the vendored phonon's alignment patch — see [materials.md](./materials.md).) No-op
 without the Steam Audio build.
 
+> **Which reverb should you use?** There are three reflection/reverb implementations now, and they
+> are complementary rather than rival. This bed is *listener-centric* — one ambisonic field decoded
+> around one point — so its reflections have **no parallax** as the listener walks. The recommended
+> configuration is the Steam **scene** (occlusion / directivity / pathing) + **ISM** early
+> reflections (below — real parallax, per block) + the **FDN** late tail (below — infinite,
+> designable), which never creates this bed at all. The trade is cost: this bed is O(1) in sources,
+> the ISM costs per source. See [materials.md](./materials.md) → "Choosing an acoustics path".
+> Do **not** run this bed and the ISM together: you would hear early reflections twice (the engine
+> warns once through `bw_last_error`).
+
 Configuration is load-time; the sends are live:
 
 - **`bw_reflections_config`** must land before `bw_start` — the IR length and ambisonic order are
@@ -807,6 +821,35 @@ treated wall); do **not** match the real room's RT60 (see [calibration.md](./cal
 
 Deterministic CPU (no rays, no IRs, infinite tail), works in no-SDK builds — the reverb path no
 longer requires the Steam Audio SDK.
+
+### Image-source early reflections (no SDK needed)
+
+```c
+void bw_scene_set_box(BwEngine* e, float w, float h, float d, const BwMaterial faces[6]);  // the room
+void bw_source_set_early_reflections(BwEngine* e, BwSource s, bool on);   // per source; per-frame-safe
+void bw_early_reflections_set_gain(BwEngine* e, float linear);            // live; default 1
+```
+
+The other half of the phonon-free acoustics path. The FDN renders the late diffuse tail; this
+renders the **six first-order specular reflections** — the wall bounces that actually carry room
+size and source distance. `bw_scene_set_box` now captures the shoebox **whether or not** the Steam
+build is present, so one call configures the ray-traced scene (with SDK) *and* the geometric early
+reflections (always).
+
+Each reflection is rendered as a **real point source at its mirrored position**, panned through the
+engine's own **listener-relative panner**. That is the payoff: reflections get correct direction
+*and parallax as the listener walks* — something no shared listener-centric reverb bed (Steam's or
+the FDN's) can give. Path delay, distance attenuation, and per-band wall absorption all fall out of
+the geometry (walls eat treble, so a reflection is duller than the direct sound — a one-pole derived
+from the material's high-vs-mid absorption). Delays **glide** and gains **ramp**, so a moving source
+bends its reflections instead of stepping them.
+
+**Order 1 only, by design.** Higher orders blend into the diffuse field within tens of milliseconds
+— which is exactly what the FDN already renders, for free and with a proper decay. Spending
+per-voice DSP to reproduce it would be double work. A source outside the room renders dry.
+
+Cost: six panner solves per opted-in voice per block, plus six delay taps per sample. Opt in on the
+sources that matter (a few), not on everything.
 
 ## Handle scheme
 

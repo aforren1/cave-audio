@@ -1,9 +1,57 @@
 # Materials & reflections
 
 How surface **materials** shape simulated **occlusion**, **reflections/reverb**, and **sound
-pathing**, and how that audio reaches the speaker array (26 in the CAVE) and the binaural monitor. All of it is
-implemented (`src/steam_scene.c`, `src/steam_reflect.c`, `src/steam_path.c`, gated on the
-Steam Audio build); "Implementation status" below says what is tested where.
+pathing**, and how that audio reaches the speaker array (26 in the CAVE) and the binaural monitor.
+Two implementations now exist behind these features — Steam Audio's ray tracer
+(`src/steam_scene.c`, `src/steam_reflect.c`, `src/steam_path.c`, gated on the SDK build) and a
+phonon-free geometric path (`src/ism.c` early reflections + `src/fdn.c` late reverb + manual
+occlusion). **Read "Choosing an acoustics path" first** — they are complementary, not rivals, and
+the recommended configuration mixes them. "Implementation status" below says what is tested where.
+
+## Choosing an acoustics path
+
+The array render no longer needs Steam Audio at all. What the SDK still buys is *automatic*
+occlusion, pathing, and a real HRTF monitor. Feature by feature:
+
+| | Steam Audio | Homegrown | Take |
+|---|---|---|---|
+| **Occlusion / transmission** | ray-traced against any mesh, automatic | `bw_source_set_occlusion_manual` — the game supplies the answer | **Steam**, clearly |
+| **Sound pathing** (around occluders) | yes (probe-baked visibility) | none | **Steam** |
+| **Early reflections** | ray-traced, any geometry, but a **listener-centric bed** (one field around one point, 30 Hz) | image-source, shoebox only, **panned as point sources** (direction + parallax, per block) | **Homegrown** — see below |
+| **Late reverb** | convolved IR (finite length) | FDN: infinite tail, designable, anisotropic decay | **Homegrown** |
+| **Binaural HRTF monitor** | real HRTF (SOFA) | lateral pan, no HRTF | **Steam** |
+| **Arbitrary scene geometry** | any mesh | shoebox only (ISM) | **Steam** |
+| **Cost in sources** | O(1) — one shared bed, N sends | ISM is **O(N)** — six solves + six taps per wet voice | **Steam** at scale |
+| **Determinism** | ray count drives CPU; sim lags at 30 Hz | fixed cost, updates every block (~5 ms) | **Homegrown** |
+| **Dependency** | submodule + built artifacts + an alignment patch + a shipped DLL | ~200 lines each, no deps | **Homegrown** |
+
+**Reflections are where the homegrown path wins the argument that matters here.** Steam's reflection
+bed is listener-*centric*: one ambisonic field decoded around one point. It cannot give parallax —
+walk toward a wall and the reflection does not change direction, structurally. The ISM renders each
+bounce as a point source through the listener-relative panner, updated every block. For a tracked
+listener roaming a 3×3 m area — the engine's whole premise — that is the correct model. The price is
+that it costs per *source*, where Steam's bed costs per *scene*.
+
+**Recommended configuration** (and the code allows it — the ISM is independent of the reverb bus tap,
+which the FDN takes):
+
+- **Steam scene** for occlusion + directivity + pathing (the ray tracer earns its keep here),
+- **ISM** for early reflections (`bw_source_set_early_reflections`, on the handful of sources that
+  matter),
+- **FDN** for the late tail (`bw_reverb_fdn` — deterministic, infinite, designable).
+
+That config never calls `steam_reflect` at all. **Do not run the Steam reflection bed and the ISM at
+the same time**: Steam's bed already contains early reflections, so you would hear them twice
+(`bw_source_set_early_reflections` warns once via `bw_last_error` if the bed owns the tap).
+
+**No-SDK builds are now fully viable** for the array: ISM + FDN + manual occlusion. What you lose is
+automatic occlusion, pathing, and — the practical one for a developer working off-site — the real
+HRTF monitor (the fallback is a lateral pan: fine for routing checks, useless for timbre or
+front/back).
+
+**One doctrine reminder.** The ISM's shoebox is the **virtual** environment (a hall, a corridor), not
+the CAVE room you are standing in — the physical room supplies its own reflections, and modelling it
+double-counts. Same trap as matching the measured RT60 ([calibration.md](./calibration.md)).
 
 > The one rule that governs everything here: **materials never become a third consumer of the bus.**
 > They parameterize Steam Audio's scene; the *output* (occluded direct sound, an ambisonic

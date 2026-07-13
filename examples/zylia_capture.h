@@ -26,6 +26,16 @@ typedef struct {
     int            nch;                  /* input channels the device exposes (capture uses <= 19) */
     double         rate;                 /* sample rate the device opened at */
     const char*    title;                /* driver name for display */
+
+    /* Trigger tuning — written by the UI thread, read by the audio thread each block. A torn float is
+     * harmless here (worst case: one block trips at a stale threshold), and these NEED to be live: the
+     * defaults below have never met a real room's noise floor or a real clap, so the first thing you do
+     * at the rig is watch nfloor and drag the threshold to sit above it. Recompiling to find that out
+     * would be a miserable way to spend an afternoon. */
+    volatile float trig_ratio;           /* trip when a block's peak exceeds this x the noise floor (8) */
+    volatile float trig_min;             /* ...and this absolute level, so a silent room can't trip (0.005) */
+    volatile float nfloor;               /* the capture's live noise-floor estimate — tune against it */
+
     float          snap[ZYLIA_MICS][ZP_SNAP_N];
 } ZpShared;
 

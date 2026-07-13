@@ -21,6 +21,7 @@
 #include "steam_reflect.h"
 #include "steam_path.h"
 #include "fdn.h"
+#include "ism.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -85,6 +86,9 @@ struct BwEngine {
     SteamScene*   scene;          /* materials occlusion sim (off-thread); NULL without the SDK */
     SteamReflect* reflect;        /* reflection bed (created at bw_start if configured); NULL otherwise */
     BwReflectionConfig refl_cfg;  /* set via bw_reflections_config before bw_start */
+    IsmRoom       ism_room;       /* the shoebox for the image-source early reflections (bw_scene_set_box;
+                                   * captured with or without the Steam build — ism.c is phonon-free) */
+    int           ism_warned;     /* the "ISM + Steam bed = double early reflections" warning, once */
     Fdn*          fdn;            /* directional FDN reverb bed (bw_reverb_fdn; created at bw_start) */
     int           fdn_enabled;    /* staged pre-start; when on, the FDN takes the bus tap (not the Steam bed) */
     float         fdn_rt[3];      /* staged decay: rt60 low / rt60 high / crossover Hz */
@@ -703,12 +707,24 @@ static void emit_inward(const float* v, const float ctr[3], int* tris, int* n, i
 #endif
 
 void bw_scene_set_box(BwEngine* e, float w, float h, float d, const BwMaterial faces[6]) {
-#ifdef BW_HAVE_STEAMAUDIO
-    if (scene_locked(e)) return;
+    if (!e) return;
     if (!(w > 0.f) || !(h > 0.f) || !(d > 0.f)) {   /* reject zero/negative/NaN dims (degenerate triangles) */
         set_error(e, "bw_scene_set_box: w/h/d must be positive");
         return;
     }
+    /* The box is captured for the IMAGE-SOURCE reflections (ism.c) whether or not the Steam Audio
+     * build is present — the same call configures the ray-traced scene (with SDK) and the geometric
+     * early reflections (always), so a no-SDK build still knows the room it is in. */
+    e->ism_room.w = w; e->ism_room.h = h; e->ism_room.d = d;
+    for (int f = 0; f < 6; ++f) {
+        uint32_t m = faces ? faces[f] : 0;
+        if (m >= e->num_materials) m = 0;
+        for (int b = 0; b < 3; ++b) e->ism_room.absorb[f][b] = e->materials[m].absorption[b];
+    }
+    e->ism_room.valid = 1;
+    rt_set_ism_room(e->rt, &e->ism_room);          /* audio thread is stopped (scene setup is load-time) */
+#ifdef BW_HAVE_STEAMAUDIO
+    if (scene_locked(e)) return;
     /* floor-based: x/z centred on the origin, y from 0 (the floor, where the room origin
      * canonically sits) up to h — so a listener at ear height stands inside the box */
     float hw = w*0.5f, hd = d*0.5f;
@@ -726,10 +742,31 @@ void bw_scene_set_box(BwEngine* e, float w, float h, float d, const BwMaterial f
         emit_inward(verts, ctr, tris, &n, a, c, dd); tri_mat[n-1] = m;
     }
     bw_scene_set_mesh_mat(e, verts, 8, tris, 12, tri_mat);
-#else
-    (void)e; (void)w; (void)h; (void)d; (void)faces;
 #endif
 }
+
+/* ---- image-source early reflections (phonon-free; see ism.h) ---- */
+void bw_source_set_early_reflections(BwEngine* e, BwSource s, bool on) {
+    if (!e) return;
+    if (on && !e->ism_room.valid) {
+        set_error(e, "bw_source_set_early_reflections: no room — call bw_scene_set_box first");
+        return;
+    }
+#ifdef BW_HAVE_STEAMAUDIO
+    /* the Steam reflection bed ALREADY contains early reflections — running both renders them twice.
+     * Warn once (this is a per-frame call; don't spam), and let it through: the caller may be
+     * deliberately A/B-ing the two. The recommended pairing is Steam scene + ISM + FDN, which never
+     * creates the Steam bed at all (docs/materials.md). */
+    if (on && e->reflect && !e->ism_warned) {
+        e->ism_warned = 1;
+        set_error(e, "bw_source_set_early_reflections: the Steam reflection bed is running and already "
+                     "renders early reflections — you will hear them twice. Use bw_reverb_fdn (which "
+                     "takes the reverb tap instead) for the late tail, or drop the ISM.");
+    }
+#endif
+    rt_source_set_ism(e->rt, s, on);
+}
+void bw_early_reflections_set_gain(BwEngine* e, float linear) { if (e) rt_set_ism_gain(e->rt, linear); }
 
 void bw_source_set_occlusion(BwEngine* e, BwSource s, bool on) {
 #ifdef BW_HAVE_STEAMAUDIO

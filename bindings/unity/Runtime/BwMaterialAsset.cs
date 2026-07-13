@@ -12,9 +12,8 @@ namespace CaveAudio
         public enum Source { Preset, Custom }
         public Source source = Source.Preset;
 
-        [Tooltip("Engine preset name (case-insensitive): generic, brick, concrete, ceramic, gravel, " +
-                 "carpet, glass, plaster, wood, metal, rock.")]
-        public string preset = "concrete";
+        [Tooltip("One of the engine's built-in materials.")]
+        public BwMaterialPreset preset = BwMaterialPreset.Concrete;
 
         [Header("Custom coefficients (x=low, y=mid, z=high band; 0..1)")]
         [Tooltip("Fraction absorbed on reflection (1 = dead, 0 = perfect mirror), per band.")]
@@ -28,7 +27,7 @@ namespace CaveAudio
         public uint Resolve(IntPtr engine)
         {
             if (source == Source.Preset)
-                return Bw.bw_material_preset(engine, preset);
+                return Bw.MaterialPreset(engine, preset);
             return Bw.bw_material_define(engine,
                 new[] { absorption.x, absorption.y, absorption.z }, scattering,
                 new[] { transmission.x, transmission.y, transmission.z });

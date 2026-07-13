@@ -13,6 +13,7 @@
 #include "spcap.h"
 #include "vbap.h"
 #include "align.h"
+#include "ism.h"          /* image-source early reflections (shoebox geometry; phonon-free) */
 #include "biquad.h"       /* shared RBJ cookbook (also used by align.c's room_eq) */
 #include "ambisonics.h"   /* SH->26 decode for ambisonic beds */
 #include "allrad.h"       /* robust SH->26 decode for irregular arrays */
@@ -56,6 +57,11 @@
 #define BW_PARA_TAU   0.060f          /* intensity/energy smoothing time (s) */
 static const float BW_PARA_XOVER[3] = { 200.f, 800.f, 3200.f };
 #define BW_BED_YAW_RATE 6.2831853f    /* bed-rotation glide (rad/s): one full turn per second */
+/* image-source early reflections (bw_source_set_early_reflections; ism.c): each of the room's six
+ * first-order images is rendered as a POINT SOURCE through the listener-relative panner — correct
+ * direction AND parallax as the listener walks. The late tail is the FDN's job (fdn.c). */
+#define BW_ISM_MAX_M    60.0f         /* longest reflection path the per-voice ring holds (bounds the delay) */
+#define BW_ISM_TAU      0.020f        /* per-image delay glide (s): a moving source bends, never steps */
 
 typedef struct { Cmd slots[RING_CAP]; _Atomic uint32_t write, read; } CmdRing;
 typedef struct { Evt slots[EVT_CAP];  _Atomic uint32_t write, read; } EvtRing;
@@ -142,6 +148,15 @@ typedef struct {
     /* bed yaw (CMD_BED_YAW): rotate a bed's soundfield about the room's vertical axis. yaw_cur glides
      * toward yaw at BW_BED_YAW_RATE; mix_bed rotates the ±m SH pairs with a per-sample phasor. */
     float    yaw, yaw_cur;
+    /* image-source early reflections (CMD_SET_ISM). Per image: a gliding fractional read into this
+     * voice's ism_ring slice, a one-pole HF damping state (walls absorb HF harder), and a ramped
+     * 26-gain vector from the panner solved AT THE IMAGE POSITION (so reflections are directional
+     * and walk-correct). All audio-thread-owned; ism_w is the shared ring write index. */
+    bool     ism_on, ism_init, ism_tail;   /* enabled / snap the delays this block / ramping out */
+    uint32_t ism_w;
+    float    ism_delay[ISM_IMAGES];                  /* current fractional read delay (samples) */
+    float    ism_lp[ISM_IMAGES];                     /* HF-damping one-pole state */
+    float    ism_g[ISM_IMAGES][BW_CHANNELS];         /* ramped per-image speaker gains */
 } Voice;
 
 typedef struct {
@@ -336,6 +351,14 @@ struct RtCore {
     float*   path_accum;         /* BW_AMBI_CH * BW_RT_MAX_BLOCK; summed ambisonic indirect field */
     PathPub* path_pub;           /* voice_cap * 2 (double-buffered per voice) */
     _Atomic int* path_idx;       /* voice_cap: front-buffer index the sim flips after writing the back */
+
+    /* image-source early reflections (ism.c): the room + a live gain, plus one delay ring per voice
+     * (the reflected copies are the direct signal, delayed by their longer paths). The room is set
+     * while stopped (bw_scene_set_box); the gain and the per-voice enables are live. */
+    IsmRoom  ism_room;
+    _Atomic float ism_gain;
+    float*   ism_ring;           /* voice_cap contiguous power-of-two rings of ism_ringlen floats */
+    uint32_t ism_ringlen;
 
     /* per-voice Doppler delay rings: voice_cap contiguous power-of-two rings of dop_ringlen floats each
      * (slice idx = dop_ring + idx*dop_ringlen), sized to BW_DOPPLER_MAX_DIST at the engine rate.
@@ -575,6 +598,22 @@ static void drain_commands(RtCore* c) {
                      v->pitch = r2 < 0.25f ? 0.25f : (r2 > 4.f ? 4.f : r2); } } break;   /* mixer glides */
         case CMD_BED_YAW: { Voice* v = voice_for(c, cmd->handle);
             if (v) v->yaw = cmd->u.byaw.yaw; } break;                     /* mix_bed glides toward it */
+        case CMD_SET_ISM: { Voice* v = voice_for(c, cmd->handle);
+            if (v) {
+                const bool on = cmd->u.ism.on != 0;
+                if (on && !v->ism_on && c->ism_ring) {   /* fresh enable: a clean ring (a recycled slot must
+                                                          * never replay the previous occupant), zeroed filter
+                                                          * state, gains from 0 (the reflections fade in), and
+                                                          * delays snapped on the first render (ism_init) */
+                    memset(c->ism_ring + (size_t)BW_H_IDX(cmd->handle) * c->ism_ringlen, 0,
+                           sizeof(float) * c->ism_ringlen);
+                    memset(v->ism_g, 0, sizeof v->ism_g);
+                    memset(v->ism_lp, 0, sizeof v->ism_lp);
+                    v->ism_w = 0; v->ism_init = true;
+                }
+                if (!on && v->ism_on) v->ism_tail = 1;   /* ramp the reflections out over one block */
+                v->ism_on = on;
+            } } break;
         case CMD_PLAY: { Voice* v = voice_for(c, cmd->handle);
             const SoundData* s = sound_for(c, cmd->u.play.sound);
             if (v && s) {
@@ -1095,6 +1134,59 @@ static void mix_voice(RtCore* c, Voice* v, uint16_t idx, float* bus, uint32_t n,
     float pit = v->pitch_cur;
     const float pit_step = use_pitch ? (v->pitch - v->pitch_cur) / (float)nr : 0.f;
 
+    /* image-source early reflections: solve this block's six images (positions from the room + the
+     * source; ism.c), then per image derive the target delay (path/c), the per-band reflection
+     * coefficient, and the speaker gains from the panner AT THE IMAGE POSITION — so each reflection
+     * is a real point source, with the panner's own distance attenuation and the listener-relative
+     * direction (a walked reflection changes direction, as it must). Delays glide (BW_ISM_TAU) and
+     * gains ramp per sample: motion bends the reflections, never steps them. */
+    const int ism_want = v->ism_on && c->ism_room.valid && c->ism_ring;
+    const int ism_on   = ism_want || v->ism_tail;      /* a just-disabled voice ramps its reflections out */
+    int   ism_n = 0;
+    float ism_gtgt[ISM_IMAGES][BW_CHANNELS], ism_gstep[ISM_IMAGES][BW_CHANNELS];
+    float ism_dtgt[ISM_IMAGES], ism_a[ISM_IMAGES];
+    float ism_k = 0.f;
+    float *iring = NULL; uint32_t imask = 0;
+    if (ism_on) {
+        IsmImage img[ISM_IMAGES];
+        const int nimg = ism_want ? ism_images(&c->ism_room, v->pos_active, img) : 0;   /* 0 = outside the room */
+        const float scale = atomic_load_explicit(&c->ism_gain, memory_order_relaxed);
+        ism_n = ISM_IMAGES;                                      /* every slot ramps: a dropped image fades out */
+        ism_k = 1.f / (BW_ISM_TAU * (float)c->sample_rate);      /* per-sample delay glide */
+        if (ism_k > 0.5f) ism_k = 0.5f;
+        const int p = atomic_load_explicit(&c->panner, memory_order_acquire);
+        const float maxd = (float)(c->ism_ringlen - 2);          /* keep both interpolation taps in-ring */
+        for (int m = 0; m < ISM_IMAGES; ++m) {
+            if (m >= nimg) {                                     /* disabled / outside the room: fade this slot */
+                ism_dtgt[m] = v->ism_delay[m]; ism_a[m] = 1.f;
+                for (uint32_t k = 0; k < c->channels; ++k) {
+                    ism_gtgt[m][k]  = 0.f;
+                    ism_gstep[m][k] = -v->ism_g[m][k] / (float)nr;
+                }
+                continue;
+            }
+            float dx = img[m].pos[0]-c->lis.p_active[0], dy = img[m].pos[1]-c->lis.p_active[1],
+                  dz = img[m].pos[2]-c->lis.p_active[2];
+            float path = sqrtf(dx*dx + dy*dy + dz*dz);       /* the reflection's path length to the ears */
+            float dtg = path / BW_SPEED_OF_SOUND * (float)c->sample_rate;
+            ism_dtgt[m] = dtg > maxd ? maxd : dtg;
+            if (v->ism_init) v->ism_delay[m] = ism_dtgt[m];      /* fresh enable: snap (a glide from 0 would sweep) */
+            /* the panner gives direction + its own distance attenuation; the mid-band coefficient is
+             * the broadband level, and the high-vs-mid ratio becomes a one-pole HF damping (a wall
+             * absorbs treble harder — why a reflection sounds duller than the direct sound) */
+            panner_gains(c, p, img[m].pos, v->gain_user * c->group_gain[v->group] * img[m].refl[1] * scale,
+                         ism_gtgt[m]);
+            float hf = img[m].refl[1] > 1e-6f ? img[m].refl[2] / img[m].refl[1] : 1.f;
+            if (hf > 1.f) hf = 1.f; else if (hf < 0.02f) hf = 0.02f;
+            ism_a[m] = hf;                                       /* 1 = no damping .. 0 = fully dull */
+            for (uint32_t k = 0; k < c->channels; ++k)
+                ism_gstep[m][k] = (ism_gtgt[m][k] - v->ism_g[m][k]) / (float)nr;
+        }
+        v->ism_init = false;
+        iring = c->ism_ring + (size_t)idx * c->ism_ringlen;
+        imask = c->ism_ringlen - 1;
+    }
+
     /* streaming sounds: pull this block's mono samples from the background ring (no I/O on the audio
      * thread). want covers [start, n); a short pull (underrun or EOF) leaves the tail silent. */
     const int streaming = streaming_pre;
@@ -1165,6 +1257,27 @@ static void mix_voice(RtCore* c, Voice* v, uint16_t idx, float* bus, uint32_t n,
         }
         s *= v->occ_cur * v->dir_cur;                           /* occlusion level + directivity, pre-pan */
         if (do_send) { aux[i] += s * v->refl_g_cur; v->refl_g_cur += refl_step; }  /* reverb send: pre-propagation, distance/level-scaled */
+        if (ism_on) {                                           /* early reflections: each image is a delayed,
+                                                                 * damped, PANNED copy of the source (the
+                                                                 * reflections carry their own propagation, so
+                                                                 * they tap s BEFORE Doppler/air, like the send) */
+            iring[v->ism_w & imask] = s;
+            for (int m = 0; m < ism_n; ++m) {
+                uint32_t di = (uint32_t)v->ism_delay[m];        /* integer part; the read index stays integer */
+                float    df = v->ism_delay[m] - (float)di;
+                float newer = iring[(v->ism_w - di)     & imask];
+                float older = iring[(v->ism_w - di - 1) & imask];
+                float r = newer * (1.f - df) + older * df;      /* fractional read: no zipper as the path glides */
+                v->ism_lp[m] += ism_a[m] * (r - v->ism_lp[m]);  /* wall HF damping (one-pole) */
+                r = v->ism_lp[m];
+                for (uint32_t ch = 0; ch < c->channels; ++ch) {
+                    bus[(size_t)ch * n + i] += v->ism_g[m][ch] * r;
+                    v->ism_g[m][ch] += ism_gstep[m][ch];
+                }
+                v->ism_delay[m] += (ism_dtgt[m] - v->ism_delay[m]) * ism_k;   /* glide toward the new path */
+            }
+            v->ism_w++;
+        }
         if (v->air_on) {                                        /* air absorption: distance one-pole LPF (direct path) */
             v->air_y1 += v->air_a_cur * (s - v->air_y1); s = v->air_y1; v->air_a_cur += air_a_step;
         }
@@ -1229,6 +1342,12 @@ static void mix_voice(RtCore* c, Voice* v, uint16_t idx, float* bus, uint32_t n,
         }
     }
     v->cursor = cur;
+    if (ism_on) {                                               /* land the image gains exactly (invariant 4) */
+        for (int m = 0; m < ism_n; ++m)
+            for (uint32_t ch = 0; ch < c->channels; ++ch) v->ism_g[m][ch] = ism_gtgt[m][ch];
+        v->ism_tail = 0;                                        /* the targets above were 0 when !ism_want, so
+                                                                 * one block of ramp-out finishes the fade */
+    }
     if (use_pitch) v->pitch_cur = v->pitch;                     /* land the rate glide exactly */
     if (path_on) for (uint32_t k = 0; k < pac; ++k) v->path_sh_cur[k] = path_tgt[k];   /* land exactly */
     if (path_on && v->path_eq_engaged) {                        /* land the pathing-EQ coeffs; bypass once settled flat */
@@ -1957,6 +2076,27 @@ void rt_source_set_pitch(RtCore* c, uint32_t h, float rate) {
     cmd_push(&c->cmds, &cmd);
 }
 
+void rt_source_set_ism(RtCore* c, uint32_t h, bool on) {
+    if (!c) return;
+    Cmd cmd = { .type = CMD_SET_ISM, .handle = h };
+    cmd.u.ism.on = on ? 1 : 0;
+    cmd_push(&c->cmds, &cmd);
+}
+
+/* The shoebox for the image-source reflections. Set while the audio thread is stopped (bw_start
+ * reads it); NULL or an invalid room disables early reflections engine-wide. */
+void rt_set_ism_room(RtCore* c, const IsmRoom* room) {
+    if (!c) return;
+    if (room) c->ism_room = *room;
+    else      memset(&c->ism_room, 0, sizeof c->ism_room);
+}
+
+void rt_set_ism_gain(RtCore* c, float linear) {
+    if (!c) return;
+    if (linear < 0.f) linear = 0.f;
+    atomic_store_explicit(&c->ism_gain, linear, memory_order_relaxed);   /* the solve re-reads it per block */
+}
+
 void rt_bed_set_rotation(RtCore* c, uint32_t h, float yaw_rad) {
     if (!c) return;
     Cmd cmd = { .type = CMD_BED_YAW, .handle = h };
@@ -2184,6 +2324,15 @@ RtCore* rt_create(uint32_t req_voice_cap, uint32_t sound_cap, uint32_t sample_ra
         c->dop_ringlen = rl;
         c->dop_ring = (float*)calloc((size_t)voice_cap * rl, sizeof(float));
     }
+    {   /* image-source reflection rings: one power-of-two ring per voice, sized to the longest
+         * reflection path the renderer supports (BW_ISM_MAX_M). Allocated with the voice pool — a
+         * reflection is the direct signal delayed by its own path, so each voice needs its own. */
+        uint32_t need = (uint32_t)(BW_ISM_MAX_M / BW_SPEED_OF_SOUND * (float)sample_rate) + 2;
+        uint32_t rl = 1; while (rl < need) rl <<= 1;
+        c->ism_ringlen = rl;
+        c->ism_ring = (float*)calloc((size_t)voice_cap * rl, sizeof(float));
+        atomic_store_explicit(&c->ism_gain, 1.f, memory_order_relaxed);
+    }
     {   /* per-channel velvet-noise decorrelators (bw_set_decorrelation): BW_DECOR_TAPS taps on a
          * jittered grid over BW_DECOR_MS, exponential decay envelope, random signs, normalized to
          * unit ENERGY (decorrelated copies must carry the power the coherent copy gave up). A
@@ -2222,7 +2371,7 @@ RtCore* rt_create(uint32_t req_voice_cap, uint32_t sound_cap, uint32_t sample_ra
     if (!c->voices || !c->occ_handle || !c->occ_val || !c->occ_eq || !c->occ_dir || !c->play_pub || !c->aux ||
         !c->stream_scratch || !c->streams || !c->path_accum || !c->path_pub || !c->path_idx ||
         !c->gen || !c->inuse || !c->priority || !c->stealing || !c->freelist || !c->sounds || !c->sfreelist ||
-        !c->dop_ring || !c->dc_bus || !c->dc_hist || !c->para) {
+        !c->dop_ring || !c->dc_bus || !c->dc_hist || !c->para || !c->ism_ring) {
         rt_destroy(c); return NULL;
     }
     const uint64_t eq_flat = eq_pack((float[3]){ 1.f, 1.f, 1.f });
@@ -2492,6 +2641,7 @@ void rt_destroy(RtCore* c) {
     free(c->inuse);
     free(c->gen);
     free(c->dop_ring);
+    free(c->ism_ring);
     free(c->dc_bus);
     free(c->dc_hist);
     free(c->para);

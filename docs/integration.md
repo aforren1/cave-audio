@@ -43,7 +43,7 @@ install that silently changes the channel count too. Check `bw_last_error` right
 
 ## Unity
 
-**Implemented as a UPM package — [`bindings/unity/`](../bindings/unity/) (`com.cave.bwaudio`).**
+**Implemented as a UPM package — [`bindings/unity/`](../bindings/unity/) (`com.brainworks.bwaudio`).**
 See its [README](../bindings/unity/README.md) for install + plugin staging.
 
 Four core pieces:
@@ -57,10 +57,24 @@ The rest of the Runtime folder: `BwAmbisonicBed` (a world-locked AmbiX soundfiel
 component over `bw_bed_*`), `BwAcousticGeometry` (marks a mesh as
 occluding/reflecting geometry with a material; `BwAudio` bakes them all into one
 engine mesh at load), `BwMaterialAsset` (an acoustic material as a Project asset —
-engine preset name or custom 3-band coefficients), and `BwClipAttribute` (marks a
-string field as a StreamingAssets audio path). Editor-side: `BwAudioProjectCheck`
-(warns when Unity's built-in audio is still enabled, with one-click disable) and
-`BwClipDrawer` (the `[BwClip]` file picker).
+an engine preset or custom 3-band coefficients), `BwRoomConstraints` (draws the
+surveyed room — truss, screen cube, projectors — in the scene view, from the same
+`constraints.json` the C++ tools read; scene-view only, no audio), and
+`BwClipAttribute` (marks a string field as a StreamingAssets path). Editor-side:
+`BwAudioProjectCheck` (warns when Unity's built-in audio is still enabled, with
+one-click disable), `BwClipDrawer` (the `[BwClip]` file picker), and custom
+inspectors for `BwAudio` / `BwEmitter` / `BwMaterialAsset` that hide settings which
+don't apply and surface the engine's *survivable* mistakes — a layout file that
+isn't where the engine will look, both reverb beds contending for the one tap, a
+tracked listener with nothing to track — plus live backend / meters / voice count
+while playing.
+
+**The settings that fail quietly are the ones to watch.** An unknown material name is
+not an error to the engine (`bw_material_preset` returns the generic default and
+notes it in `bw_last_error`), and a failed layout load is not fatal (it falls back to
+the 26-speaker grid). Both merely *sound wrong*. The binding therefore makes them
+unrepresentable where it can — materials are a `BwMaterialPreset` enum, file paths go
+through a picker that lists what actually exists — and loud where it cannot.
 
 The snippets below explain the design; read the package for the current code.
 

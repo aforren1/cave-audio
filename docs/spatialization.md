@@ -371,6 +371,30 @@ parametric comparison is a clean live A/B. Analysis is first-order (HO-DirAC
 sectors are the upgrade path if band-level parameters prove too coarse); beds with
 fewer than 4 channels stay on the matrix.
 
+## Early reflections: image sources, panned like point sources (`ism.c`)
+
+The FDN below renders the late tail; `ism.c` renders the **first-order specular
+reflections** — the six wall bounces that carry room size and source distance.
+Together they are the classic early+late hybrid, and neither needs phonon: the
+engine has a complete acoustics path with no SDK at all.
+
+The geometry is trivial for a shoebox (the room `bw_scene_set_box` already
+describes): mirroring the source across a face flips the one coordinate normal to
+it. Each of the six images is then rendered as **a point source at its mirrored
+position, through the engine's own listener-relative panner** — so a reflection has
+the right *direction*, the panner's own distance attenuation over its longer path,
+and, crucially, **parallax**: walk toward the wall and its reflection changes
+direction and level as it physically must. A shared listener-centric bed (Steam's,
+or the FDN's) cannot do that — it decodes one field around one point. This is the
+engine's central thesis (re-solve per listener position) applied to reflections.
+
+Per image: a gliding fractional delay (path/c — a moving source *bends* its
+reflections), a one-pole HF damping derived from the material's high-vs-mid
+absorption (walls eat treble, which is why a reflection sounds duller than the
+direct sound), and a ramped gain vector from the panner. Order 1 only — higher
+orders blend into the diffuse field within tens of ms, which is precisely what the
+FDN renders for free. A source outside the room renders dry.
+
 ## Directional FDN reverb (`bw_reverb_fdn`)
 
 The reflection bed no longer *requires* phonon: a 16-line **feedback delay
