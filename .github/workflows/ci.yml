@@ -104,8 +104,14 @@ jobs:
             python get_dependencies.py --dependency $d --sharedcrt -p windows -a x64 -t vs2022
           done
           python build.py -p windows -a x64 -t vs2022 -c release --minimal -o generate
-          cmake -DSTEAMAUDIO_STATIC_RUNTIME=OFF build/windows-vs2022-x64
-          cmake --build build/windows-vs2022-x64 --config Release --target phonon
+
+          # build.py makes its tree in the CWD (os.makedirs("windows-vs2022-x64")), so from
+          # core/build that is ./windows-vs2022-x64. Don't guess — locate the CMakeCache.
+          TREE=$(dirname "$(find . -maxdepth 3 -name CMakeCache.txt | head -1)")
+          test -n "$TREE" && test -d "$TREE" || { echo "generated tree not found:"; ls; exit 1; }
+          echo "phonon build tree: $TREE"
+          cmake -DSTEAMAUDIO_STATIC_RUNTIME=OFF "$TREE"
+          cmake --build "$TREE" --config Release --target phonon
           cd ../../../..
 
           # Stage where BWAUDIO_WITH_STEAMAUDIO auto-detects it. find: the build-tree
