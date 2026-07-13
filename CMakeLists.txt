@@ -31,8 +31,8 @@ include(FetchContent)
 # commit lives in exactly ONE place. The gzipped tarball (~220 KB) is smaller than the raw headers,
 # and CMake strips the single top-level dir, so ${dr_libs_SOURCE_DIR} holds the headers directly.
 FetchContent_Declare(dr_libs
-  URL https://github.com/mackron/dr_libs/archive/fa931f3285ced10ace628f7f1ac951e1951e7ea6.tar.gz
-  DOWNLOAD_EXTRACT_TIMESTAMP TRUE)                            # wav-0.14.5 / flac-0.13.3 / mp3-0.7.3, PD or MIT-0
+  URL https://github.com/mackron/dr_libs/archive/c629ca6f5ad6e013980b7db31043d5b4d1b63787.tar.gz
+  DOWNLOAD_EXTRACT_TIMESTAMP TRUE)                            # wav-0.14.6 / flac-0.13.4 / mp3-0.7.4, PD or MIT-0
 FetchContent_Declare(cjson_src
   URL https://raw.githubusercontent.com/DaveGamble/cJSON/c859b25da02955fef659d658b8f324b5cde87be3/cJSON.c
   DOWNLOAD_NO_EXTRACT TRUE)                                   # v1.7.19

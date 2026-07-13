@@ -53,16 +53,24 @@ distribution, so the engine parses the documented FrameOfData wire protocol itse
 and `include/NatNetTypes.h` has the message IDs / default ports / multicast group. Nothing
 in `third_party/NatNetSDK/` is required to build; M6 needs no vendored dependency.
 
-## dr_wav (wav loading, M3)
+## dr_libs — dr_wav / dr_flac / dr_mp3 (sound loading + streaming, M3)
 
-**Not vendored here.** CMake fetches it via `FetchContent`, pinned to the **wav-0.14.5**
-release commit (`fa931f3285ced10ace628f7f1ac951e1951e7ea6`) — see the `dr_wav` block in
-`CMakeLists.txt`. dr_wav is public domain / MIT-0 and a single header; pinning to a commit
-keeps builds reproducible even though upstream `master` moves often. To bump the version,
-change the SHA. For an offline build, point CMake at a local copy:
+**Not vendored here.** CMake fetches the whole header-only repo as one pinned tarball
+(`c629ca6f5ad6e013980b7db31043d5b4d1b63787` — **dr_wav 0.14.6 / dr_flac 0.13.4 / dr_mp3 0.7.4**),
+so the commit lives in exactly one place; see the `dr_libs` block in `CMakeLists.txt`. dr_libs is
+public domain / MIT-0 and header-only; pinning to a commit keeps builds reproducible even though
+upstream `master` moves often. To bump, change the SHA.
+
+The pin is a **master snapshot, not a release commit** — upstream tags a version only when it cuts
+one, and the fixes we want (malformed `fmt`/`fact`/`bext`/`smpl` chunk handling, ADPCM + W64
+underflows, FLAC picture-metadata and MP3 Xing/Info overflows) all landed after the 0.14.5 tag with
+the version lines still reading "TBD". Prefer a tagged commit whenever one is available.
+
+For an offline build, point CMake at a local copy (the variable is named after the
+`FetchContent_Declare` name, `dr_libs` — not the header):
 
 ```sh
-cmake -S . -B build -DFETCHCONTENT_SOURCE_DIR_DR_WAV=/path/to/dir-containing-dr_wav.h ...
+cmake -S . -B build -DFETCHCONTENT_SOURCE_DIR_DR_LIBS=/path/to/dir-containing-dr_wav.h ...
 ```
 
 ## cJSON (layout parsing, M4)
