@@ -13,11 +13,10 @@ without building any C++.
   namespace stays `CaveAudio` — this is the package identity, not the code.
 - **Distribution** — `tools/upm/pack.ps1` packs `com.brainworks.bwaudio-<version>.tgz` (uses `tar`, no
   Node anywhere; CI packs on *every* run, so a broken package fails the build rather than the release).
-  A `v*` tag cuts a GitHub Release with that tarball attached, and **the Release is the publish**:
-  OpenUPM's `githubRelease` tracking mode serves that exact file — no registry push, no token. Install
-  with `openupm add com.brainworks.bwaudio`, or download the `.tgz` and use *Install package from
-  tarball…* if you'd rather not add a registry at all. See the README.
-- **`.meta` files are now committed** (`tools/upm/gen-meta.ps1`). A package installed from a registry is
+  A `v*` tag cuts a GitHub Release with that tarball attached, and **the Release is the distribution** —
+  no registry, no token, nothing to keep in sync. Install it with Package Manager → `+` → *Install
+  package from tarball…*. See the README.
+- **`.meta` files are now committed** (`tools/upm/gen-meta.ps1`). An installed package is
   immutable, so assets arriving without a `.meta` get a fresh random GUID in every project: a scene
   referencing `BwEmitter` on one machine would deserialize as *"Missing (Mono Script)"* on another. The
   native plugins' import settings (Windows x64, Editor enabled) ship the same way — in an immutable

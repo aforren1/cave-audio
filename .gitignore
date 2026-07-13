@@ -4,8 +4,8 @@
 /out/
 # CI staging + the packed UPM tarball (tools/upm/pack.ps1)
 /dist/
-# nothing in this repo publishes to a registry (OpenUPM pulls the tarball off the GitHub Release),
-# but keep this ignored so a stray `npm login` can never commit an auth token
+# nothing here publishes to a registry, but keep this ignored so a stray `npm login`
+# can never commit an auth token
 .npmrc
 *.obj
 *.lib

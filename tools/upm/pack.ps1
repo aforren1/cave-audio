@@ -3,9 +3,8 @@
 # ASCII ONLY, deliberately: Windows PowerShell 5.1 reads a BOM-less .ps1 as ANSI, so a stray em-dash
 # or arrow becomes mojibake and breaks the PARSER. CI runs pwsh, developers run 5.1. Keep it plain.
 #
-# This tarball IS the release. CI attaches it to a GitHub Release on a v* tag; OpenUPM's githubRelease
-# tracking mode then serves that exact file (no registry push, no token), and the same file is the
-# manual "Install package from tarball..." download. One artifact, both routes.
+# This tarball IS the distribution. CI attaches it to a GitHub Release on a v* tag, and Unity installs
+# it directly: Package Manager > "+" > "Install package from tarball...". No registry involved.
 #
 # It stages into a CLEAN directory before packing, which is not fussiness:
 #   npm falls back to .gitignore when a package has no .npmignore - and bwaudio.dll / phonon.dll ARE
@@ -131,9 +130,9 @@ if ($missing.Count) {
 
 # ---- pack ----------------------------------------------------------------------------------------
 # UPM (like npm) requires every entry to sit under a single "package/" root - which is exactly what
-# the staging directory is named, so we tar it by name from its parent. That is the same layout
-# `npm pack` emits, so the file stays valid for any npm-protocol registry if this ever moves off
-# OpenUPM (nothing here depends on npm being installed).
+# the staging directory is named, so we tar it by name from its parent. That is also the layout
+# `npm pack` emits, so the file would stay valid if this is ever served from a UPM registry (they all
+# speak the npm protocol) - but nothing here depends on npm being installed.
 New-Item -ItemType Directory $OutDir -Force | Out-Null
 $tgz = Join-Path $OutDir ("{0}-{1}.tgz" -f $manifest.name, $pkgVersion)
 if (Test-Path $tgz) { Remove-Item $tgz -Force }

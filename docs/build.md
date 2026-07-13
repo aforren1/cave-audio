@@ -205,11 +205,10 @@ distribution channel:
   `tools/upm/pack.ps1` produces `com.brainworks.bwaudio-<version>.tgz` — the C#
   binding with both DLLs inside it — so a broken package (a missing `.meta`, a lost
   plugin) fails the *build*, not a release. A `v*` tag then cuts a GitHub Release, and
-  **the Release is the publish**: OpenUPM tracks the repo in `githubRelease` mode,
-  matches the tag, and serves the attached `.tgz` unchanged — so there is no registry
-  push, **no token, no secret**. Users run `openupm add com.brainworks.bwaudio`, or
-  download the tarball and use "Install package from tarball". The tag must match
-  `bindings/unity/package.json`, or the pack fails.
+  **the Release is the distribution**: there is no registry, no token, nothing to keep
+  in sync. Unity installs the tarball directly (Package Manager → `+` → *Install
+  package from tarball…*). The tag must match `bindings/unity/package.json`, or the
+  pack fails — so a tarball can never claim a version it isn't.
 - **A release carries TWO assets**, because workflow artifacts expire (30 days) and a
   release doesn't:
   - `com.brainworks.bwaudio-<ver>.tgz` — the Unity package.
@@ -217,25 +216,24 @@ distribution channel:
     `phonon.dll`, `bwaudio.h`, and the tools. This is the durable download for a C/C++
     consumer or the CAVE machine.
 
-  The engine bundle **must stay a `.zip`**. OpenUPM expects exactly *one* publishable
-  `.tgz`/`.tar.gz` on the release and takes it unconditionally, so a second tarball
-  would make it ambiguous which one is the package. Both assets ship under GPLv3 (the
-  `.zip` carries `LICENSE`, `THIRD_PARTY-NOTICES.md` and `DIST.txt`, which names the
-  commit and links the complete source; the `.tgz` carries the same inside it): an app
-  that ships this DLL to third parties inherits GPLv3 — see the ASIO section.
+  Both ship under GPLv3 (the `.zip` carries `LICENSE`, `THIRD_PARTY-NOTICES.md` and
+  `DIST.txt`, which names the commit and links the complete source; the `.tgz` carries
+  the same inside it): an app that ships this DLL to third parties inherits GPLv3 —
+  see the ASIO section.
 
-  Three constraints worth knowing before changing any of this:
+  Two constraints worth knowing before changing any of this:
 
-  1. **OpenUPM's *default* mode would ship a broken package.** It clones the repo at
-     the tag and runs `npm pack` — and the DLLs are gitignored build output, so the
-     result would be C# with no engine behind it. `trackingMode: githubRelease` is what
-     makes it serve our pre-built tarball instead. It also wants exactly ONE publishable
-     `.tgz` on the Release (or a `githubReleaseAssetName` prefix).
-  2. **GitHub Packages could never host it**: its npm registry accepts only *scoped*
-     names (`@owner/name`), and Unity package names may not contain `@` or `/`.
-  3. **The package's `.meta` files are committed on purpose**
+  1. **The package's `.meta` files are committed on purpose**
      (`tools/upm/gen-meta.ps1`) — an installed package is immutable, so assets without a
-     `.meta` get a fresh GUID per project and scenes lose their script references.
+     `.meta` get a fresh GUID per project and scenes lose their script references. The
+     native plugins' import settings (Windows x64, Editor on) ship the same way; they
+     cannot be fixed in the Inspector afterwards.
+  2. **Keep the engine bundle a `.zip`, and the package the only `.tgz` on a release.**
+     A UPM registry (they all speak the npm protocol) keys on a single publishable
+     tarball. Nothing is listed on one today — the audience already has the repo, and a
+     public listing would invite installs into projects the GPLv3 would surprise — but
+     the tarball IS what a registry would serve, so listing it later stays a config
+     change rather than a rebuild. Preserving that costs nothing.
 
 ## DVS / Dante configuration
 

@@ -38,42 +38,18 @@ engine owns decoding (and avoids Unity's 8-channel output cap entirely).
 
 ## Install
 
-**Windows x64 only** (ASIO is Windows-only). A released package **ships the native engine** —
+**Windows x64 only** (ASIO is Windows-only). The released package **ships the native engine** —
 `bwaudio.dll` + `phonon.dll` are inside it, with import settings already configured. Nothing to build.
 
-### From OpenUPM (recommended)
-
-```
-openupm add com.brainworks.bwaudio
-```
-
-…or, without the CLI, add the registry by hand in `Packages/manifest.json`. The package then appears
-under **Package Manager → My Registries**, and upgrades are a click.
-
-```json
-{
-  "scopedRegistries": [
-    {
-      "name": "package.openupm.com",
-      "url": "https://package.openupm.com",
-      "scopes": ["com.brainworks"]
-    }
-  ],
-  "dependencies": {
-    "com.brainworks.bwaudio": "0.2.0"
-  }
-}
-```
-
-(Unity's "scope" is a package-name *prefix*, not an npm `@scope` — which is why this works on OpenUPM
-or npmjs but *cannot* work on GitHub Packages, whose npm registry only accepts `@owner/name`.)
-
-### From a release tarball (no registry)
+### From a release tarball
 
 Grab `com.brainworks.bwaudio-<version>.tgz` from the
 [Releases](https://github.com/aforren1/cave-audio/releases) page, then **Package Manager → `+` →
-Install package from tarball…**. It is byte-for-byte the *same* artifact OpenUPM serves — just pinned
-by hand instead of resolved, so it won't offer upgrades.
+Install package from tarball…**. That's the whole install.
+
+It pins by hand rather than resolving, so it won't notify you of upgrades — grab the newer `.tgz` and
+install it again. (This package isn't on a registry: it exists to drive one specific 26-speaker CAVE,
+and the audience is people who already have the repo.)
 
 ### From source (developing the engine itself)
 
@@ -84,8 +60,8 @@ Point the manifest at your working tree, and the CMake build's POST_BUILD copy k
 ```
 
 The DLLs are gitignored build output, so a **git-URL install of this repo will not work** — you'd get
-the C# with no engine behind it (`DllNotFoundException` on the first call). Use the registry or a
-tarball, both of which carry the binaries.
+the C# with no engine behind it (`DllNotFoundException` on the first call). Use a release tarball, which
+carries the binaries, or a local path against a built tree.
 
 > **License:** the engine is **GPLv3** (`bwaudio.dll` links the ASIO SDK under its GPLv3 option).
 > Internal use never triggers copyleft — it's a *distribution* condition. But shipping a Unity app
@@ -94,10 +70,7 @@ tarball, both of which carry the binaries.
 
 ## Releasing (maintainers)
 
-**The GitHub Release *is* the publish.** OpenUPM runs in `githubRelease` tracking mode: it discovers
-the git tag, finds the Release whose tag matches, and serves the attached `.tgz` unchanged. So there is
-no registry push, **no token, and no secret to rotate** — and the same file is the manual-tarball
-download.
+**The GitHub Release is the distribution** — there's no registry, no token, and nothing to keep in sync.
 
 To cut a release: bump `version` in `package.json` (+ the CHANGELOG), then push a matching tag
 (`v0.2.0`). CI packs on *every* run — so a broken package fails the build rather than the release — and
@@ -106,8 +79,6 @@ can't claim a version it isn't.
 
 A release carries **two** assets: this package (`com.brainworks.bwaudio-<ver>.tgz`) and the engine on
 its own (`bwaudio-win64-<tag>.zip` — dll/lib/header/tools, for C/C++ consumers and the CAVE machine).
-The engine one **must stay a `.zip`**: OpenUPM takes the single publishable `.tgz` on the release
-unconditionally, so a second tarball would make it ambiguous which is the package.
 
 Locally:
 
@@ -121,14 +92,13 @@ Two things that will bite if forgotten:
 - **New file in the package? Run `tools/upm/gen-meta.ps1`.** Every asset must ship a committed `.meta`,
   or its GUID is regenerated per-project and scenes lose their script references. `pack.ps1` refuses to
   build a tarball with one missing.
-- **Attaching a second `.tgz` to a Release breaks OpenUPM** — it expects exactly one publishable
-  tarball. If that ever changes, set `githubReleaseAssetName` in the OpenUPM package config to the
-  stable prefix `com.brainworks.bwaudio-`.
+- **Keep the engine bundle a `.zip`, and the package the only `.tgz` on a release.** Every UPM registry
+  that could ever serve this (they all speak the npm protocol) keys on a single publishable tarball, so
+  one `.tgz` per release keeps that door open at zero cost.
 
-One-time setup (already done, recorded here for the next person): the package was submitted to
-[OpenUPM](https://openupm.com/packages/add/) with `trackingMode: githubRelease`, which is what makes it
-serve our pre-built tarball instead of trying to `npm pack` a git clone — the default mode would ship
-the C# with **no DLLs**, since those are gitignored build output.
+Not on a registry, and deliberately so: this drives one specific 26-speaker CAVE, so the audience is
+people who already have the repo, and a tarball costs them one click. The tarball *is* the artifact a
+registry would serve, so listing it later is a config change, not a rebuild.
 
 ## Assets under StreamingAssets
 
