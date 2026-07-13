@@ -29,6 +29,18 @@ boundary:
 Get this wrong and sources end up mirrored or rotated 90°. Budget time to verify the
 conversion with a known-position test source before trusting anything else.
 
+## Channel count
+
+The engine's channel count is **the layout's speaker count** (4..26), not a constant.
+The CAVE array is 26; a smaller rig loads its own file. Read it back with
+`bw_channel_count` (or `bw_get_speakers`, which returns the same number) and size any
+meter / speaker-gizmo / channel-test array from it. Never hard-code 26 in a binding.
+
+The trap: **a failed layout load is not fatal** — `bw_create` falls back to the
+26-speaker default grid and only records the reason in `bw_last_error`. On a smaller
+install that silently changes the channel count too. Check `bw_last_error` right after
+`bw_create` and fail loudly if the surveyed layout didn't load.
+
 ## Unity
 
 **Implemented as a UPM package — [`bindings/unity/`](../bindings/unity/) (`com.cave.bwaudio`).**
@@ -117,7 +129,8 @@ ABI surface:
   `bw_material_define`, `bw_scene_set_mesh_mat`, `bw_scene_set_box`.
 - **Output stage + diagnostics**: `bw_set_panner`, `bw_set_dual_band`,
   `bw_set_limiter` / `bw_set_limiter_ceiling`, `bw_set_bed_decoder`,
-  `bw_get_bus_levels`, `bw_test_signal`, `bw_get_speakers`.
+  `bw_get_bus_levels`, `bw_test_signal`, `bw_get_speakers` (returns the layout's
+  speaker count — see "Channel count" below; size meter/speaker arrays with it).
 - **Assets**: `bw_load_sound_streaming`, `bw_load_ambix`.
 
 ### Coordinate helper

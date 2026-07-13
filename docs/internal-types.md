@@ -54,7 +54,14 @@ typedef struct {
 } Voice;
 ```
 
-`BW_CHANNELS` is defined in [`src/sink.h`](../src/sink.h).
+`BW_CHANNELS` (26) is defined in [`src/sink.h`](../src/sink.h) and is the
+**capacity**, not the count. Every `[BW_CHANNELS]` array in these structs — gain
+vectors, the bed decode matrix, the meters — is sized to that capacity, but only
+the first `RtCore.channels` entries are used. `channels` is the loaded layout's
+speaker count (`Layout.count`, 4..26; 26 for the default grid), resolved in
+`bw_create` *before* `rt_create` and fixed for the engine's lifetime. It is what
+`bw_channel_count` reports. Loops over the bus must use `channels`, never
+`BW_CHANNELS` — the tail entries belong to no speaker.
 
 The rest of the struct is per-subsystem DSP state, one group per feature. All of
 it is audio-thread-only (ramp state, filter histories), which is why it lives
@@ -131,8 +138,11 @@ Notes:
 ## Layout (loaded once from `cave_layout.json`; read-only on the audio thread)
 
 See [`layout-schema.md`](./layout-schema.md) for the file format. Replaceable
-while the audio thread is stopped (`rt_set_layout`). From
-[`src/layout.h`](../src/layout.h):
+while the audio thread is stopped (`rt_set_layout`). Its `count` is the engine's
+channel count — the loader accepts 4..`BW_CHANNELS` speakers whose indices form a
+complete `0..count-1` permutation, and a layout with fewer than `BW_CHANNELS`
+leaves the tail `speakers[]` entries at the default grid's values (harmless:
+`count` gates every consumer). From [`src/layout.h`](../src/layout.h):
 
 ```c
 typedef struct { float fc, gain_db, q; } RoomEqSection;   /* cut-only by schema */
@@ -148,8 +158,8 @@ typedef struct {
 } Speaker;
 
 typedef struct {
-    Speaker  speakers[BW_CHANNELS];
-    uint32_t count;                /* == BW_CHANNELS once validated */
+    Speaker  speakers[BW_CHANNELS];   /* capacity; only `count` are real */
+    uint32_t count;                /* 4..BW_CHANNELS — and it IS the engine's channel count */
     float    ref[3];               /* nominal listening point = the array centroid */
     float    rolloff_r;            /* DBAP spatial blur (meters) */
     /* distance attenuation: atten = clamp((ref/max(d,ref))^rolloff, min_lin, 1) */
@@ -174,9 +184,9 @@ struct BwEngine {                /* abridged; see engine.c */
     BwConfig    cfg;
     BwProfile   profile;
     RtCore*     rt;              /* rings + voice/sound tables + mixer */
-    Monitor*    monitor;         /* binaural/both: 26 -> stereo decode */
-    Layout      layout;          /* effective geometry (for the Steam decoder at start) */
-    BwSink*     sink;            /* primary device (cave 26ch / binaural 2ch) */
+    Monitor*    monitor;         /* binaural/both: speaker bus -> stereo decode */
+    Layout      layout;          /* effective geometry; layout.count IS the channel count */
+    BwSink*     sink;            /* primary device (cave: layout.count ch / binaural: 2 ch) */
     BwSink*     sink_mon;        /* both: the monitor (2-ch) device */
     float*      scratch26;       /* binaural: array render before the monitor decode */
     float*      mon_buf[2];      /* both: stereo double-buffer, array -> monitor thread */
@@ -189,7 +199,8 @@ struct BwEngine {                /* abridged; see engine.c */
 
 There is no bus field in either struct. The bus is a `float* bus` **argument**
 to `rt_render`, supplied per block by whichever sink render callback is running
-— the device's own buffer for `cave`, `scratch26` for `binaural`.
+— the device's own buffer for `cave`, `scratch26` for `binaural`. (`scratch26` is
+allocated at the `BW_CHANNELS` capacity; `rt_render` fills only `channels` of it.)
 
 ### Also lives in RtCore
 
@@ -198,8 +209,10 @@ reference):
 
 - **panner caches** — `SpcapState` / `VbapState`, self-invalidated via
   `layout_gen`; the `panner` / `dual_band` atomics.
-- **bed decode** — the `bed_decode[BW_CHANNELS][BW_AMBI_CH]` matrix +
-  `bed_decoder` selector (SAD / AllRAD).
+- **channel count** — `channels` (the layout's speaker count; set at `rt_create`),
+  the width every bus loop, decode matrix, and meter array actually runs to.
+- **bed decode** — the `bed_decode[BW_CHANNELS][BW_AMBI_CH]` matrix (built for the
+  first `channels` rows) + `bed_decoder` selector (SAD / AllRAD).
 - **limiter** — `lim_on` / `lim_ceiling` atomics, the `lim_gain` envelope,
   rate-derived attack/release coefficients.
 - **pathing publish** — the `PathPub` double buffer + `path_idx` flip atomics,

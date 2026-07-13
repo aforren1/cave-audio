@@ -11,7 +11,12 @@ thread. Three consumers read the result:
 - **the align stage** (`align_process`) — per-speaker `gain_db` trim and `delay_ms`
   align the unequal speaker distances to a common reference (output stage, after the mix).
 - **the binaural monitor** — the same positions become the virtual-speaker directions
-  for the 26→ambisonics→binaural decode.
+  for the bus→ambisonics→binaural decode.
+
+**The speaker count in this file IS the engine's channel count.** Any N in **4..26** works
+(26 = `BW_CHANNELS`, the compile-time capacity), fixed for the engine's lifetime and readable
+back with `bw_channel_count` / `bw_get_speakers`. The CAVE array is 26; a smaller collaborator
+rig loads its own N-speaker file into the same binary.
 
 A complete, valid example lives at [`../examples/cave_layout.json`](../examples/cave_layout.json):
 a 3×3×3 boundary grid minus the center = exactly 26 speakers, floor-origin, y layers at
@@ -100,7 +105,7 @@ model (fixed centre vs the moving working volume). The file:
       "min_gain_db":         -40.0
     }
   },
-  "speakers": [ /* exactly 26 entries, see below */ ]
+  "speakers": [ /* 4..26 entries — the count IS the engine's channel count; see below */ ]
 }
 ```
 
@@ -120,7 +125,7 @@ model (fixed centre vs the moving working volume). The file:
 
 | field | type | meaning |
 |-------|------|---------|
-| `index` | int `0..25` | bus/output channel for this speaker. Must be unique and cover `0..25` with no gaps. |
+| `index` | int `0..N-1` | bus/output channel for this speaker (N = the number of `speakers[]` records). Must be unique and cover `0..N-1` with no gaps — a complete permutation. |
 | `position` | `[x, y, z]` float | surveyed position in room space (meters, RH). Each component must be finite and within ±1000 m. |
 | `gain_db` | float | measured per-speaker level trim, applied in the align stage (`align_process`). `0.0` = no trim. Must be in **[-100, 24]**; anything outside rejects the file. |
 | `delay_ms` | float | per-speaker delay to time-align arrival to the reference; converted to whole samples at `sample_rate` on load. `0.0` = the reference (farthest) speaker. A negative value clamps to `0`; anything **over 1000 ms rejects the file**. |
@@ -137,10 +142,10 @@ align biquads toward them (`bw_set_tracked_room_eq` is the live kill switch).
 ```jsonc
 "room_eq_grid": [
   { "position": [-0.5, 1.2, 0.0],          // mic position, room meters
-    "speakers": [                           // exactly 26 entries, channel order
+    "speakers": [                           // one entry per speaker (N), channel order
       [ {"fc": 44.6, "gain_db": -7.9, "q": 6.1} ],   // speaker 0's sections AT THIS POSITION
       [],                                            // speaker 1: no cuts
-      // ... 24 more
+      // ... one array per remaining speaker
     ] },
   { "position": [0.5, 1.2, 0.0], "speakers": [ /* same ladder, this position's depths */ ] }
 ]
@@ -166,19 +171,20 @@ if any of:
 - a `room_eq` section is out of its documented range, or an `eq` (>512 taps) or
   `room_eq` (>8 sections) array is over its cap, or a tap is non-finite;
 - a `room_eq_grid` is malformed: 0 or >16 positions, an entry without
-  `position[3]` + `speakers[26]`, a section out of range, positions disagreeing on
-  a speaker's `fc`/`q` ladder, or the file carrying both `room_eq` and
-  `room_eq_grid`.
+  `position[3]` + one `speakers` array per speaker (N), a section out of range,
+  positions disagreeing on a speaker's `fc`/`q` ladder, or the file carrying both
+  `room_eq` and `room_eq_grid`.
 
 `schema_version` is not checked — the loader never reads it.
 
 **A present-but-invalid `BwConfig.layout_path` is NOT fatal.** `bw_create` records the
-reason in `bw_last_error` and falls back to the **default grid**, so desk/dev runs
-with no survey still work; `bw_start` still returns success. An installation that must
-run on the surveyed geometry therefore **must check `bw_last_error` after
+reason in `bw_last_error` and falls back to the **26-speaker default grid**, so desk/dev
+runs with no survey still work; `bw_start` still returns success. An installation that
+must run on the surveyed geometry therefore **must check `bw_last_error` after
 `bw_create`** — a silently-defaulted layout pans the array with the wrong speaker
-positions. A NULL/empty `layout_path` intentionally selects the default grid with no
-error.
+positions, and (since the count follows the layout) a **different channel count**: a
+20-speaker install whose file fails to load comes up as a 26-channel engine. A NULL/empty
+`layout_path` intentionally selects the default grid with no error.
 
 On success, the loader holds the parsed geometry in the internal `Layout` struct (see
 [`internal-types.md`](./internal-types.md)); the audio thread reads it but never

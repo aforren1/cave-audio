@@ -82,7 +82,8 @@ a 16-voice load with all propagation effects + the reflection bed measures ~458 
 ## Memory budget
 
 The engine's heap is **static**: everything is allocated at `bw_create` (the voice table, the per-voice
-Doppler rings, the 26-ch bus + scratch, sound PCM at load) and **nothing allocates on the audio thread**
+Doppler rings, the speaker bus + scratch — sized to the `BW_CHANNELS` capacity, though only the layout's
+channel count is rendered — sound PCM at load) and **nothing allocates on the audio thread**
 (hard invariant — see `docs/concurrency.md`). So the "memory budget" is just the create-time footprint;
 there is no real-time growth to chase. If you want allocation-level detail (footprint / leaks) in Tracy's
 memory view, wrap the big allocations with the `BW_ALLOC` / `BW_FREE` hooks already in `profile.h`.

@@ -8,10 +8,10 @@ sources, and per-frame updates. Declarations in
 
 ## Feature overview
 
-- Listener-relative spatialization over the 26-speaker array, recomputed per
-  audio block from the tracked head position: DBAP for a moving listener (the
-  default), SPCAP/VBAP for a fixed one, an optional dual-band mode, per-source
-  angular spread.
+- Listener-relative spatialization over the speaker array (26 speakers on the
+  CAVE; any 4..26 layout works), recomputed per audio block from the tracked head
+  position: DBAP for a moving listener (the default), SPCAP/VBAP for a fixed one,
+  an optional dual-band mode, per-source angular spread.
 - Per-speaker gain/delay/correction-EQ output stage driven by a measured layout
   file, with a linked protection limiter as the final stage.
 - Acoustics (Steam Audio builds only): ray-traced occlusion with per-band
@@ -63,8 +63,9 @@ bw_stop(eng); bw_destroy(eng);
 
 ## Profiles and the master bus
 
-Every voice is panned into an in-memory **26-channel master bus**; the profile
-selects who consumes it:
+Every voice is panned into an in-memory **master bus**, one channel per speaker
+(26 on the CAVE array; see [Channel count](#channel-count)). The profile selects
+who consumes it:
 
 | profile               | consumers |
 |-----------------------|-----------|
@@ -72,9 +73,9 @@ selects who consumes it:
 | `BW_PROFILE_BINAURAL` | bus → HRTF monitor → any 2-ch ASIO device (desk debugging). Each bus channel is a virtual speaker at its surveyed room position; full **pose** — head orientation turns the virtual array around you. |
 | `BW_PROFILE_BOTH`     | both at once: array to Dante + a monitor tap. |
 
-The binaural monitor hears the **same 26-channel mix** production plays, panner
-and all — headphone debugging exercises the array render, not a parallel stereo
-path. See [architecture.md](./architecture.md).
+The binaural monitor hears the **same mix** production plays, panner and all —
+headphone debugging exercises the array render, not a parallel stereo path. See
+[architecture.md](./architecture.md).
 
 ## The threading contract
 
@@ -145,7 +146,7 @@ The API reports failure three ways, all read on the **control thread**:
 |-----------------|-------|-------|
 | `BW_OK`         | 0     | success |
 | `BW_ERR_CONFIG` | 1     | invalid `BwConfig` (bad profile, sample_rate, block_size) |
-| `BW_ERR_DEVICE` | 2     | ASIO/output device could not be opened, lacked ≥26 channels, or failed to start |
+| `BW_ERR_DEVICE` | 2     | ASIO/output device could not be opened, lacked enough output channels for the layout, or failed to start |
 | `BW_ERR_LAYOUT` | 3     | `layout_path` missing/unparseable/failed validation (see [`layout-schema.md`](./layout-schema.md)) |
 | `BW_ERR_HRTF`   | 4     | `hrtf_path` (SOFA) could not be loaded |
 | `BW_ERR_STATE`  | 5     | called in the wrong state (e.g. `bw_start` while already running) |
@@ -163,6 +164,11 @@ What actually comes back today:
 So if your session depends on the surveyed layout or a SOFA HRTF, read `bw_last_error` after a
 *successful* `bw_create`/`bw_start` to confirm they actually loaded.
 
+That fallback also **changes the channel count**: the default grid is 26 speakers, so a failed
+load on a 12- or 24-speaker install silently renders 26 channels. If your layout isn't 26, check
+`bw_last_error` (or `bw_channel_count`) right after `bw_create` — see
+[Channel count](#channel-count).
+
 Per-frame `void` calls (`bw_source_set_pos`, `bw_commit`, …) never report errors — they only
 enqueue onto the command ring. A full ring drops the command silently, but the ring is sized
 (`RING_CAP`) for a worst-case frame burst, and only a stalled control thread could fill it
@@ -176,7 +182,7 @@ Deployment knobs, kept out of `BwConfig` so the ABI stays stable:
 | variable | meaning |
 |----------|---------|
 | `BWAUDIO_SINK` | `null` forces the silent offline sink (CI, desk debugging with no hardware); `asio` demands a real device — an open failure then fails `bw_start` instead of hiding behind the silent fallback. Default: try ASIO, fall back to the null sink. |
-| `BWAUDIO_ASIO_DRIVER` | ASIO driver name to open. Default: auto-pick the first registered driver with enough output channels for the profile (so binaural finds a 2-ch headphone driver, cave a ≥26-ch one, without configuration). |
+| `BWAUDIO_ASIO_DRIVER` | ASIO driver name to open. Default: auto-pick the first registered driver with enough output channels for the profile (so binaural finds a 2-ch headphone driver, cave one with at least the layout's speaker count — 26 for the CAVE array — without configuration). |
 | `BWAUDIO_EMBREE` | non-`0`: ray-trace the acoustics sims on Intel Embree (see below). |
 | `BWAUDIO_PATHING` | non-`0`: enable the sound-pathing sim at `bw_start` (needs scene geometry + the Steam Audio build); sources opt in via `bw_source_set_pathing`. |
 | `BWAUDIO_BAKE` | non-`0`: precompute (bake) the reflection reverb over a probe grid at `bw_start`, so the reflections sim looks it up instead of ray-tracing live. |
@@ -325,7 +331,7 @@ turn per second (click-free, live-safe), and it applies before *either* bed rend
 decode and the parametric analysis see the same turned field.
 
 A **bed** is a pre-encoded **AmbiX** soundfield (ACN ordering, SN3D normalization) decoded
-**straight to the 26 speakers**. It is not panned and has no position — use it for diffuse,
+**straight to the speakers**. It is not panned and has no position — use it for diffuse,
 ambient content.
 
 Beds are **world-locked**: the soundfield is fixed to the room. The physical speakers are
@@ -344,16 +350,18 @@ void bw_set_bed_renderer(BwEngine* e, BwBedRenderer renderer);   // live A/B (ea
 
 Two renderers sit behind the same bed API:
 
-- **matrix** (default) — the static SH→26 decode above (sampling or AllRAD per
-  `bw_set_bed_decoder`). Cheap and robust, but a 26-speaker array is sparse for a matrix decode
-  (directional content blurs) and the decode is world-locked around the array centre.
+- **matrix** (default) — the static SH→speaker decode above (sampling or AllRAD per
+  `bw_set_bed_decoder`). Cheap and robust, but an array this size (26 speakers on the CAVE) is
+  sparse for a matrix decode (directional content blurs) and the decode is world-locked around
+  the array centre.
 - **parametric** (`BW_BED_PARAMETRIC`) — first-order **DirAC-style** rendering: the bed's FOA
   channels are analyzed per frequency band (4 time-domain bands) into a **direction +
   diffuseness** from the smoothed intensity vector. The **non-diffuse stream is re-panned through
   the engine's own listener-relative panner** at a virtual source on the array shell — a recorded
   soundfield becomes **walkable**: an off-centre listener hears correct directions and parallax,
   which no matrix decode can provide. The **diffuse stream** decodes through the matrix into
-  per-speaker **decorrelators** (incoherent envelopment instead of 26 correlated copies). Both
+  per-speaker **decorrelators** (incoherent envelopment instead of a correlated copy per
+  speaker). Both
   streams are loudness-matched to the matrix decode; beds with fewer than 4 channels stay on the
   matrix. The switch crossfades per bed, so flipping it live is a clean A/B.
 
@@ -619,8 +627,9 @@ HUDs or health monitoring; it reads 0 until audio runs.
 
 `bw_test_signal` drives a single **output channel** with a built-in signal (660 Hz sine or white
 noise), injected **after** the per-speaker align stage — a raw value straight on the channel.
+`channel` is in `[0, bw_channel_count())`; anything else is ignored.
 
-This is a speaker-check / wiring / calibration tool: walk a tone across all 26 channels to confirm
+This is a speaker-check / wiring / calibration tool: walk a tone across every channel to confirm
 the channel→speaker map, find a dead speaker, set a trim. It is **not** a spatial path — it
 bypasses the panner, so don't use it to "place" a sound. Per-frame-safe, takes effect next block,
 no `bw_commit` needed. Any number of channels at once; `gain 0` / `BW_TEST_OFF` silences one.
@@ -630,7 +639,8 @@ HRTF'd as its virtual speaker). Needs no SDK.
 `bw_get_bus_levels` is the matching **readback**: each output channel's last-block peak `|sample|`
 (linear), measured at the very end of the render — after align, the test signal, and the limiter.
 That is exactly what the device channel received. It fills up to `cap` floats and returns the
-count filled. Per-frame-safe (relaxed atomic reads, no locks); levels read 0 until audio is
+count filled (`bw_channel_count()` when `cap` allows). Per-frame-safe (relaxed atomic reads, no
+locks); levels read 0 until audio is
 running. Drive channel meters or a speaker-activity display with it — the playground lights each
 speaker gizmo from this.
 
@@ -645,7 +655,7 @@ void     bw_set_bed_decoder(BwEngine* e, BwBedDecoder decoder);  // load-time
 uint32_t bw_get_speakers(BwEngine* e, float* xyz, uint32_t cap); // read back the layout; NULL xyz = count only
 ```
 
-`bw_set_panner` chooses the per-source panner behind the 26-ch bus:
+`bw_set_panner` chooses the per-source panner behind the master bus:
 
 - **DBAP** (default) is listener-relative and recomputed per block from the tracked pose.
   This is the panner for a **moving** observer roaming the array.
@@ -665,7 +675,7 @@ SPAT's "VBP Dual-Band". You get sharper low-frequency localisation for a near-ce
 The panning *direction* is unchanged; only the low band's level/coherence differs. It is
 sweet-spot dependent like VBAP, so for a roaming listener it's a by-ear / measurement call.
 
-`bw_set_bed_decoder` chooses the **diffuse-bed** SH→26 decoder. It affects the ambisonic and
+`bw_set_bed_decoder` chooses the **diffuse-bed** SH→speaker decoder. It affects the ambisonic and
 reflection beds only, never the point-source panner:
 
 - **sampling** (default): the straightforward projection decode.
@@ -679,8 +689,8 @@ The decoder is load-time (between `bw_create` and `bw_start`); see
 [`spatialization.md`](./spatialization.md) for the theory.
 
 `bw_get_speakers` returns the effective layout (the default grid, or the `layout_path` file) as
-`cap*3` floats in channel order, plus the count. Use it to visualize or audition the geometry the
-engine is actually panning with.
+`cap*3` floats in channel order, plus the count — the same count `bw_channel_count()` reports.
+Use it to visualize or audition the geometry the engine is actually panning with.
 
 ### Channel count
 
@@ -726,7 +736,7 @@ void bw_set_limiter(BwEngine* e, bool on);                     // live
 void bw_set_limiter_ceiling(BwEngine* e, float ceiling_db);    // default -1 dBFS; clamped [-60, 0]
 ```
 
-The final stage on the 26-ch output. Everything — voices, beds, the reflection/pathing taps, the
+The final stage on the speaker output. Everything — voices, beds, the reflection/pathing taps, the
 per-speaker align stage, the test signal — passes through it before the device.
 
 It is **linked** across channels: one gain, derived from the cross-channel peak, so engaging never
@@ -749,9 +759,10 @@ void bw_source_set_reflection_send(BwEngine* e, BwSource s, float gain);    // p
 void bw_source_set_reflection_distance(BwEngine* e, BwSource s, bool on);   // far = wetter
 ```
 
-A single shared **listener-centric reverb bed**, decoded straight to the 26 channels and summed
-onto the bus. It runs Steam Audio's **HYBRID** reverb: directional early-reflection convolution
-(full ambisonic, order = `order`) plus a parametric (FDN) tail, decoded across the 26 speakers.
+A single shared **listener-centric reverb bed**, decoded straight to the speaker channels and
+summed onto the bus. It runs Steam Audio's **HYBRID** reverb: directional early-reflection
+convolution (full ambisonic, order = `order`) plus a parametric (FDN) tail, decoded across the
+array.
 (This needs the vendored phonon's alignment patch — see [materials.md](./materials.md).) No-op
 without the Steam Audio build.
 
@@ -788,7 +799,7 @@ mono aux send, so `bw_source_set_reflections` and the per-source send levels app
 
 Inside: a 16-line **feedback delay network** (Householder feedback — lossless prototype, the decay
 filters are the only loss), each line assigned a direction on the sphere and rendered as a plane
-wave through the layout's SH→26 bed decode. `bw_fdn_set_decay` sets a two-band decay (defaults
+wave through the layout's SH→speaker bed decode. `bw_fdn_set_decay` sets a two-band decay (defaults
 1.2 s low / 0.7 s high @ 2 kHz). `bw_fdn_set_decay_direction` makes the decay **anisotropic** — the
 field dies faster (factor < 1) or slower toward a direction, the diagonal special case of the
 Directional FDN (Alary/Politis/Schlecht, JAES 2019). Use it to *design* a space (an open side, a

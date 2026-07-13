@@ -120,7 +120,10 @@ namespace CaveAudio
 
         // ---- channel test / diagnostics (drives a raw output channel; speaker-check tool) ----
         [DllImport(DLL, CallingConvention = CC)] public static extern void bw_test_signal(IntPtr e, uint channel, BwTestKind kind, float gain);
-        // Read back the effective speaker layout (xyz = cap*3 floats, x,y,z per speaker); returns the count (26).
+        // The engine's active channel count = the layout's speaker count (4..26). Size meter/speaker
+        // arrays with this; never hard-code 26 (that is only the compile-time capacity).
+        [DllImport(DLL, CallingConvention = CC)] public static extern uint bw_channel_count(IntPtr e);
+        // Read back the effective speaker layout (xyz = cap*3 floats, x,y,z per speaker); returns the count.
         [DllImport(DLL, CallingConvention = CC)] public static extern uint bw_get_speakers(IntPtr e, [Out] float[] xyz, uint cap);
         // Per-channel output meter: last-block peak |sample| per channel (linear), as sent to the device; returns the count filled.
         [DllImport(DLL, CallingConvention = CC)] public static extern uint bw_get_bus_levels(IntPtr e, [Out] float[] peaks, uint cap);

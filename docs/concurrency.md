@@ -15,8 +15,14 @@ Two threads carry the core:
   memory. Does all file decode, malloc/free, file I/O, logging.
 - **Audio thread** — the ASIO driver's `bufferSwitch` callback (or the null
   sink's pacing thread) *is* this thread. It calls `rt_render`, which owns all
-  DSP state: the voice table, the 26-ch bus, per-voice gains, the listener
+  DSP state: the voice table, the speaker bus, per-voice gains, the listener
   active fields. It never allocates, locks, blocks, or does I/O.
+
+The bus is **N channels wide, where N is the loaded layout's speaker count**
+(`RtCore.channels`, 4..26; 26 for the CAVE array and for the default grid). It is
+fixed for the engine's lifetime — resolved at `bw_create`, before `rt_create`.
+`BW_CHANNELS` (26, [`src/sink.h`](../src/sink.h)) is only the compile-time
+*capacity* that sizes the fixed arrays.
 
 These two communicate through two SPSC rings:
 
@@ -309,7 +315,7 @@ source's slot.
 the whole audio-thread entry point (rt.c). The sink's render callback calls it
 with the device's planar buffer (`cave` profile) or a scratch buffer
 (`binaural`/`both` — see below). The bus is planar, channel-major:
-`bus[ch * nframes + i]`. Stages, in order:
+`bus[ch * nframes + i]`, `channels * nframes` floats. Stages, in order:
 
 1. **Clock.** Take the block-start dsp-sample from the device timestamp
    (`ts->sample_pos`), falling back to an internal block counter when no

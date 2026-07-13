@@ -1,15 +1,19 @@
 # Materials & reflections
 
 How surface **materials** shape simulated **occlusion**, **reflections/reverb**, and **sound
-pathing**, and how that audio reaches the 26-speaker array and the binaural monitor. All of it is
+pathing**, and how that audio reaches the speaker array (26 in the CAVE) and the binaural monitor. All of it is
 implemented (`src/steam_scene.c`, `src/steam_reflect.c`, `src/steam_path.c`, gated on the
 Steam Audio build); "Implementation status" below says what is tested where.
 
 > The one rule that governs everything here: **materials never become a third consumer of the bus.**
 > They parameterize Steam Audio's scene; the *output* (occluded direct sound, an ambisonic
-> reflection bed decoded to the 26 channels) lands on the same in-memory **26-channel master bus**
-> as everything else, so the ASIO array and the binaural monitor both get reflections for free.
+> reflection bed decoded to the speakers) lands on the same in-memory **speaker master bus** as
+> everything else, so the ASIO array and the binaural monitor both get reflections for free.
 > Protect that property — see [architecture.md](./architecture.md) "the bus seam."
+
+The bus is as wide as the loaded layout has speakers (4..26; 26 in the CAVE — see
+[layout-schema.md](./layout-schema.md)). Everything below decodes to that count, not to a
+hard-wired 26.
 
 ## Where this fits the existing signal flow
 
@@ -21,14 +25,14 @@ layer:
 
 ```
                    ┌─ direct:  occlusion (scalar gain + 3-band EQ) on the mono voice → per-source DBAP ─┐
-   source ─────────┤                                                                                     ├─► 26-ch bus ─► { ASIO array;  binaural monitor (26→ambi→stereo) }
+   source ─────────┤                                                                                     ├─► speaker bus ─► { ASIO array;  binaural monitor (bus→ambi→stereo) }
                    └─ reflections: IPLSimulator (off-thread ray trace) → ambisonic IR →                  ─┘
-                      IPLReflectionEffect convolution → IPLAmbisonicsDecodeEffect (panning, custom 26-dir layout)
+                      IPLReflectionEffect convolution → IPLAmbisonicsDecodeEffect (panning, custom speaker layout)
 ```
 
 Two paths, one bus. Materials feed both. (Sound pathing — the indirect route around occluders —
 is a third feed onto the same bus; see "Pathing" below.) The reflection ambisonic field is decoded
-to the **same 26 bus channels**. The binaural monitor then re-encodes those 26 channels back to
+to the **same bus channels**. The binaural monitor then re-encodes those bus channels back to
 ambisonics for its stereo decode, like any other bus content — see "The monitor and reflections."
 
 ## The acoustic material model
@@ -86,7 +90,7 @@ scene. A locked call sets `bw_last_error` (`scene_locked` in `src/engine.c`).
 
 The reflection bed runs Steam Audio's **HYBRID** reverb: an early-reflection **convolution** plus a
 **parametric (FDN)** late tail, rendered as a **full ambisonic field** (order `order`, decoded
-across the 26 speakers). The early reflections are **directional** — they arrive from the
+across the layout's speakers). The early reflections are **directional** — they arrive from the
 directions the geometry actually reflects them. A symmetric scene with a centred listener
 correctly collapses to a near-omni field (the directional ambisonic channels cancel); asymmetric
 geometry lights them up (verified: an offset source puts ~half the omni energy into a directional
@@ -150,8 +154,8 @@ smoothly, not as a binary shadow).
 
 Occlusion applies to the **mono voice signal, upstream of panning**: a scalar occlusion gain plus
 a 3-band transmission EQ on the pre-DBAP signal. It does **not** enter `dbap_gains` and does
-**not** set the per-voice `dirty` flag — the 26-gain DBAP vector stays position/listener-driven
-and constant-power, and the solve stays dirty-gated on geometry only.
+**not** set the per-voice `dirty` flag — the per-speaker DBAP gain vector stays
+position/listener-driven and constant-power, and the solve stays dirty-gated on geometry only.
 
 What the sim publishes, per source at 30 Hz: it folds occlusion and transmission per band —
 `raw[b] = occlusion + (1 − occlusion) · transmission[b]` — then splits that into a broadband
@@ -189,13 +193,13 @@ A dedicated sim thread (12 Hz) runs Steam Audio's **`IPLSimulator`** reflections
 + materials for a single listener-centric bed source and produces a **single mixed ambisonic IR**
 (early reflections *and* late reverb together — the public C API does **not** expose discrete
 image sources). The audio thread runs the **`IPLReflectionEffect`** convolution against that IR,
-yielding an ambisonic reflection signal, then **decodes it to the 26 channels with an
+yielding an ambisonic reflection signal, then **decodes it to the bus channels with an
 `IPLAmbisonicsDecodeEffect` in panning mode** (`binaural = false`) whose `speakerLayout` is the
-**same `IPL_SPEAKERLAYOUTTYPE_CUSTOM` 26-direction layout** the binaural monitor builds from the
-surveyed geometry — and sums it onto the bus.
+**same `IPL_SPEAKERLAYOUTTYPE_CUSTOM` layout** the binaural monitor builds from the surveyed
+geometry — one direction per layout speaker — and sums it onto the bus.
 
-Decoding an ambisonic field onto the **irregular** 26-speaker grid (a 3×3×3 boundary minus centre,
-*not* a uniform sphere) is the hard, non-unique direction: a naïve sampling/transpose or raw
+Decoding an ambisonic field onto an **irregular** speaker grid (the CAVE's 3×3×3 boundary minus
+centre, *not* a uniform sphere) is the hard, non-unique direction: a naïve sampling/transpose or raw
 pseudo-inverse gives uneven loudness and direction errors. Steam Audio's decoder handles the custom
 layout with a sane decode law and the right SH channel-order/normalization convention. A literal
 precomputed matrix is only an *optimization* of the same effect (skipping per-block effect
@@ -292,10 +296,10 @@ updated per publish, and the library cross-fades in place.
 
 ## The monitor and reflections
 
-To keep the bus seam, reflections go **ambisonic → 26-ch decode → bus**, and the binaural monitor
-then re-encodes those 26 channels back to ambisonics for its stereo decode, like any other bus
-content. That is a deliberate double ambisonic round-trip (low-order reflection ambi → irregular
-26-ch → 3rd-order monitor ambi → stereo); its cost and directionality loss buy the "both consumers
+To keep the bus seam, reflections go **ambisonic → speaker decode → bus**, and the binaural monitor
+then re-encodes those bus channels back to ambisonics for its stereo decode, like any other bus
+content. That is a deliberate double ambisonic round-trip (low-order reflection ambi → the
+irregular speaker bus → 3rd-order monitor ambi → stereo); its cost and directionality loss buy the "both consumers
 audition the identical bus" guarantee. Short-circuiting the monitor by feeding it the pre-decode
 reflection ambisonics directly is **prohibited** — it would create a second, bus-bypassing binaural
 consumer and desync the array vs monitor reflection content.
@@ -448,7 +452,7 @@ Still not built:
 zone (`steam_reflect.c` `do_bake`, gated `BW_HAVE_STEAMAUDIO`); the reflection sim thread then *looks
 up* the reverb at the listener each tick instead of ray-tracing it. The ray-trace runs once, offline,
 at `bw_start`, and can afford more rays/bounces than real time. The reverb still renders through the
-same hybrid effect + 26-decode, so it stays **directional** — the `bake` test confirms the +X-near
+same hybrid effect + speaker decode, so it stays **directional** — the `bake` test confirms the +X-near
 listener gets +X-biased reverb out of baked data (ratio ≈ 1.4, vs ~1.0 for an omni bed).
 
 Two things must be right:
@@ -487,7 +491,7 @@ end (`steam_path.c`, same with-SDK gate, opt in with `BWAUDIO_PATHING` at `bw_st
   `rt_set_pathing` (handle-gated, double-buffered). In the mixer, a pathing voice SH-encodes its
   UN-occluded signal (`accum[k] += s·shCoeffs[k]` — the indirect path goes around the occluder, so
   the direct-path occlusion must NOT apply to it) into a shared ambisonic accumulator, ramped per
-  sample (invariant 4). After the voice loop the `path` tap decodes that accumulator to the 26-ch
+  sample (invariant 4). After the voice loop the `path` tap decodes that accumulator to the speaker
   bus through phonon's own `iplAmbisonicsDecodeEffect` — so phonon's ACN/N3D convention is
   consistent encode-to-decode, no hand-rolled normalization. The `rt` test verifies the encode
   lands exactly on `s·shCoeffs`; the decode is the same call the (tested) reflection bed uses.

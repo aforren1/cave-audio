@@ -17,7 +17,7 @@ in one process behind one audio callback.
  engine (Unity/Unreal) ──control──┐
  OptiTrack (NatNet) ─────pose─────┤
                                   ▼
-                     ┌─ voice playback ─ DBAP pan ─► 26-ch master bus ─┐
+                     ┌─ voice playback ─ DBAP pan ─► speaker bus ──────┐
                      │  (one audio callback)                           │
                      └─────────────────────────────────────────────────┘
                                   │                         │
@@ -54,7 +54,7 @@ in one process behind one audio callback.
   freshest head pose at block time, with optional **pose prediction** to hide
   motion-to-ears latency; **tracked room EQ** interpolates measured LF room
   correction at the live listener position.
-- **Monitoring**: binaural HRTF render of the same 26-channel bus (3rd-order
+- **Monitoring**: binaural HRTF render of the same speaker bus (3rd-order
   ambisonic encode → Steam Audio decode) to any 2-ch ASIO device; per-channel
   test signal, output meters, voice gauge.
 - **Real-time discipline**: no allocation, locks, or I/O on the audio thread;
@@ -76,8 +76,8 @@ The calibration commands behind the last row are under
 | | **tracked roamer** (the CAVE) | **fixed seat** (one chair) | **audience** (several people) | **desk** (headphones) |
 |---|---|---|---|---|
 | profile | `cave` | `cave` | `cave` | `binaural` |
-| panner | **DBAP** (default) | **VBAP**, else SPCAP | **DBAP**, untracked | any (DBAP) |
-| tracking | `track_internal = true` | none — listener sits at the seat | none — listener at the array centroid | push head pose, or track |
+| panner | **DBAP** (default) | **VBAP**, else SPCAP | **DBAP** | any (DBAP) |
+| tracking | `track_internal = true` | none — listener sits at the seat | track the main occupant + `bw_set_extra_listeners` for the rest | push head pose, or track |
 | dual-band | off | **on** | off | your call (A/B it) |
 | calibration | `--eq` + `--room-eq-grid` | `--eq` + `--room-eq` at the seat | `--eq` only | `--eq` |
 | bed decoder | AllRAD if the array is irregular | sampling | AllRAD | either |
@@ -97,17 +97,18 @@ or you want a smoother, all-speaker image. Turn **dual-band on** for tighter bas
 localisation, and calibrate with `--room-eq` **with the mic at the seat**. Don't track;
 set the listener pose once.
 
-**Audience.** The hard case, and the one the engine does *not* solve: there is **one
-listener**, so several sets of ears mean several wrong poses. Play it safe rather than
-sharp — everything sweet-spot-dependent is a liability. Stay on DBAP with the listener
-parked at the array centroid, dual-band off, and no room EQ beyond `--eq` (which
-flattens the *speakers*, not the room, so it helps every seat equally). Raise
-`bw_source_set_spread` on ambience: wide sources survive off-centre listening far better
-than points do. If one person in the group matters most (a demo driver, the participant),
-track *them* and accept that everyone else is an eavesdropper.
+**Audience.** Panning is exact for one head and wrong for everyone else, so this is a
+compromise by construction. Track the person who matters (the participant, the demo
+driver) and hand the *other* occupants' positions to **`bw_set_extra_listeners`** (up to
+3): every source's gains become the per-speaker energy mean of the per-listener solves,
+so each occupant gets an image biased toward their own seat instead of one exact and N
+wrong. Otherwise play it safe rather than sharp — DBAP, dual-band off, and no room EQ
+beyond `--eq` (which flattens the *speakers*, not the room, so it helps every seat).
+Raise `bw_source_set_spread` on ambience: wide sources survive off-centre listening far
+better than points do.
 
 **Desk.** The `binaural` profile needs no layout, no Dante, and no hardware beyond
-headphones — the monitor renders the *same* 26-channel mix, so what you hear is the array
+headphones — the monitor renders the *same* speaker mix, so what you hear is the array
 render. Use it to develop; don't use it to judge timbre for the room.
 
 **Everywhere:** the output limiter is on at −1 dBFS (leave it — it's speaker protection, not

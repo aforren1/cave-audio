@@ -1,10 +1,16 @@
 # Speaker calibration & room characterization
 
-How the 26-speaker array is surveyed, trimmed, and characterized at install time, and how those
-numbers reach the engine. The tool is `bw_calibrate` (`examples/calibrate.cpp`, opt-in
+How the speaker array (26 in the CAVE) is surveyed, trimmed, and characterized at install time, and
+how those numbers reach the engine. The tool is `bw_calibrate` (`examples/calibrate.cpp`, opt-in
 `-DBWAUDIO_BUILD_CALIBRATE=ON`). The measurement DSP is `measure.c`; the solve + JSON writeback is
 `calib.c`. All of it is unit-tested off-hardware (`test_measure`, `test_calib`); the ASIO
 full-duplex capture is the only part that needs the rig.
+
+**Everything here follows the layout's speaker count** (`n`, 4..26 — see
+[`layout-schema.md`](./layout-schema.md)), not a hard-wired 26: the capture opens `n` ASIO outputs
+plus the mic input (which rides buffer slot `n`), sweeps those `n` speakers, and writes `n` records
+back. `bw_calib_view` likewise sizes its plots from each loaded layout, and refuses to Diff two
+layouts with different speaker counts rather than mis-compare them.
 
 ## The two layout tools
 

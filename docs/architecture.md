@@ -26,20 +26,20 @@ Why:
 
 The cost: you own voice management, wav playback, and the ASIO host glue.
 
-## The central seam: a 26-channel in-memory master bus
+## The central seam: an in-memory master bus
 
-The panner does not write "to the device". It writes to an in-memory **26-channel
-master bus**. *Consumers* read that bus:
+The panner does not write "to the device". It writes to an in-memory **master bus**,
+one channel per speaker. *Consumers* read that bus:
 
-- **ASIO device sink (production):** writes the 26-ch bus straight to DVS.
-- **Binaural monitor (debug):** treats each of the 26 channels as a virtual speaker
-  at that speaker's surveyed room position, HRTFs them to stereo, and writes to an
-  ordinary output device (a headphone DAC). It sits *after* the panner, so it
-  auditions the real array render — DBAP behavior and all — not an idealized version.
+- **ASIO device sink (production):** writes the bus straight to DVS.
+- **Binaural monitor (debug):** treats each bus channel as a virtual speaker at that
+  speaker's surveyed room position, HRTFs them to stereo, and writes to an ordinary
+  output device (a headphone DAC). It sits *after* the panner, so it auditions the
+  real array render — DBAP behavior and all — not an idealized version.
 
 The binaural monitor is just a second consumer of the bus. Keep it that way. The
 abstraction set is: a **render target** (the bus), one or more **device sinks**
-consuming buses, and the binaural monitor as a **bus→bus transform** (26→2) feeding a
+consuming buses, and the binaural monitor as a **bus→bus transform** (N→2) feeding a
 stereo sink.
 
 ```
@@ -47,15 +47,28 @@ stereo sink.
               │  per-voice, listener-relative DBAP (recomputed on move)
               ▼
       ┌───────────────────┐
-      │ 26-ch master bus  │  (in memory, owned by audio thread)
+      │  N-ch master bus  │  (in memory, owned by audio thread)
       └───────────────────┘
         │                  │
-   per-ch gain/delay   26→ambisonics→HRTF
+   per-ch gain/delay   bus→ambisonics→HRTF
    align               (single binaural decode)
         │                  │
      ASIO ► DVS         stereo device
      (cave)             (binaural debug)
 ```
+
+### How wide is the bus?
+
+**The layout's speaker count.** `BW_CHANNELS` (26, `src/sink.h`) is the compile-time
+*capacity*; the **active** count is whatever the loaded `cave_layout.json` declares —
+any N in **4..26**, resolved at `bw_create` and fixed for the engine's lifetime. With
+no `layout_path` you get the built-in 26-speaker default grid. `bw_channel_count()`
+is the readback, and everything downstream (panners, bed decodes, reverb, the
+monitor, the device sink, calibration) is driven from it.
+
+The CAVE installation is 26 speakers — that is the target deployment, not an engine
+limit. A collaborator's 12- or 24-speaker rig loads its own layout into the same
+binary and the device opens that many channels.
 
 ## Profiles
 
@@ -90,7 +103,8 @@ orientation component.
 ## Locked decisions
 
 - **Transport: ASIO, not WDM.** DVS's WDM driver caps at 16 channels; ASIO carries
-  up to 64. 26 channels makes ASIO mandatory.
+  up to 64. The CAVE's 26 channels make ASIO mandatory. The device must expose enough
+  outputs for your layout — 26 for the CAVE array.
 - **ASIO SDK used directly** under its GPLv3 option (dual-licensed GPLv3/proprietary
   as of Oct 2025), for direct access to the timing hooks. See `docs/build.md` for
   copyleft notes.

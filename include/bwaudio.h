@@ -53,8 +53,8 @@ typedef uint32_t BwSource;
 typedef uint32_t BwBed;       /* an ambisonic-bed voice (world-locked soundfield); see bw_bed_* */
 
 typedef enum {
-    BW_PROFILE_CAVE     = 0,  /* 26-ch bus -> ASIO/DVS. Listener POSITION only. */
-    BW_PROFILE_BINAURAL = 1,  /* 26-ch bus -> binaural monitor -> stereo device. Full POSE. */
+    BW_PROFILE_CAVE     = 0,  /* speaker bus -> ASIO/DVS. Listener POSITION only. */
+    BW_PROFILE_BINAURAL = 1,  /* speaker bus -> binaural monitor -> stereo device. Full POSE. */
     BW_PROFILE_BOTH     = 2,  /* array to DVS + binaural tap to a stereo device. Full POSE. */
 } BwProfile;
 
@@ -87,7 +87,7 @@ BW_API BwSound bw_load_sound(BwEngine* e, const char* path); /* mono point-sourc
 BW_API BwSound bw_load_sound_streaming(BwEngine* e, const char* path);
 BW_API void    bw_unload_sound(BwEngine* e, BwSound snd);    /* safe: retire-acked internally */
 /* Load a pre-encoded AmbiX (ACN/SN3D) soundfield, KEEPING its channels (4/9/16 -> order 1/2/3). Plays
- * via bw_bed_* as a world-locked diffuse bed decoded to the 26 speakers; resampled to the engine rate
+ * via bw_bed_* as a world-locked diffuse bed decoded to the speakers; resampled to the engine rate
  * at load if needed. 0 = failure (bad channel count / decode error). */
 BW_API BwSound bw_load_ambix(BwEngine* e, const char* path);
 
@@ -148,7 +148,7 @@ BW_API void     bw_source_seek(BwEngine* e, BwSource s, uint64_t frame);
 BW_API bool     bw_source_is_playing(BwEngine* e, BwSource s);
 BW_API void     bw_play_oneshot(BwEngine* e, BwSound snd, float x, float y, float z, float gain);
 
-/* ---- ambisonic beds (control thread; a world-locked soundfield decoded straight to the 26 speakers,
+/* ---- ambisonic beds (control thread; a world-locked soundfield decoded straight to the speakers,
  * not DBAP-panned — for diffuse/ambient content). Play a bw_load_ambix asset; no position. Occlusion
  * and directivity do NOT apply to a bed (it is world-locked diffuse). bw_bed_play requires a
  * multichannel asset and bw_source_play a mono one — a mismatch is rejected (see bw_last_error). ---- */
@@ -206,7 +206,7 @@ BW_API void     bw_source_set_occlusion_manual(BwEngine* e, BwSource s, float le
 
 /* ---- reflection bed (materials; needs the Steam Audio build) ----
  * A single shared listener-centric reverb bed (Steam Audio hybrid reverb), decoded straight to the
- * 26 speakers and summed onto the bus. Configure at LOAD time (the IR length + order are baked at
+ * speakers and summed onto the bus. Configure at LOAD time (the IR length + order are baked at
  * bw_start), then opt sources into its wet send. v1 assumes a static scene (set geometry before
  * bw_start). No-op without the Steam Audio backend. */
 typedef struct {
@@ -227,7 +227,7 @@ BW_API void     bw_reflections_set_gain(BwEngine* e, float linear);
 
 /* ---- directional FDN reverb bed (load-time; no SDK needed) ----
  * A phonon-free late-reverb alternative to the Steam reflection bed: a 16-line feedback delay
- * network whose lines are rendered as plane waves through the layout's SH->26 bed decode, fed by
+ * network whose lines are rendered as plane waves through the layout's SH->speaker bed decode, fed by
  * the SAME mono aux send (bw_source_set_reflections + the per-source send levels apply unchanged).
  * The decay is a DESIGN parameter: set what the content wants. Don't copy the room's measured RT60 —
  * the real room adds its own decay on top (docs/calibration.md). Decay can be ANISOTROPIC: scale the decay time toward a
@@ -305,7 +305,7 @@ BW_API void     bw_source_set_size(BwEngine* e, BwSource s, float radius_m);
  * Drive a single OUTPUT channel with a built-in test signal, injected AFTER the per-speaker align
  * stage (a raw value straight on the channel) — a speaker-check / wiring-verification / calibration
  * tool, NOT a spatial path (it bypasses the panner; don't use it to "place" audio). `channel` is in
- * [0, 26). Per-frame-safe, takes effect next block, no bw_commit needed; multiple channels at once.
+ * [0, bw_channel_count()). Per-frame-safe, next block, no bw_commit needed; multiple channels at once.
  * gain 0 or BW_TEST_OFF silences a channel. Composes with the profiles: cave/both -> a raw tone on
  * that DVS channel/speaker; binaural -> that bus channel HRTF'd as its virtual speaker. */
 typedef enum { BW_TEST_OFF = 0, BW_TEST_SINE = 1, BW_TEST_NOISE = 2 } BwTestKind;
@@ -313,7 +313,7 @@ BW_API void     bw_test_signal(BwEngine* e, uint32_t channel, BwTestKind kind, f
 
 /* Read back the effective speaker layout (the default grid, or the file from BwConfig.layout_path):
  * fills `xyz` with up to `cap` speakers' positions (3 floats each: x,y,z room space, in channel/index
- * order) and returns the total count (26). Pass xyz=NULL to just query the count. For visualizing or
+ * order) and returns the total count (== bw_channel_count()). Pass xyz=NULL to just query the count. For visualizing or
  * auditioning the geometry the engine is actually panning with. Control thread; safe any time. */
 BW_API uint32_t bw_get_speakers(BwEngine* e, float* xyz, uint32_t cap);
 
@@ -328,7 +328,7 @@ BW_API uint32_t bw_get_bus_levels(BwEngine* e, float* peaks, uint32_t cap);
 BW_API uint32_t bw_get_active_voices(BwEngine* e);
 
 /* ---- panner selection (load-time, or live: the switch is atomic) ----
- * The per-source panner that writes the 26-ch bus. DBAP (default) is listener-relative, recomputed
+ * The per-source panner that writes the speaker bus. DBAP (default) is listener-relative, recomputed
  * per frame from the tracked position — for a MOVING observer roaming the array. SPCAP is a smooth,
  * all-speaker, placement-correcting sweet-spot panner for a FIXED observer (a static listener: don't
  * track, set the sweet spot once); it conserves loudspeaker power across an uneven array. VBAP is the
@@ -372,7 +372,7 @@ BW_API void     bw_set_decorrelation(BwEngine* e, bool on);
 BW_API void     bw_set_near_spread(BwEngine* e, float radius_m);
 
 /* ---- output protection limiter (ON by default at -1 dBFS) ----
- * The final stage on the 26-ch output — everything (voices, beds, reflections, pathing, per-speaker
+ * The final stage on the speaker output — everything (voices, beds, reflections, pathing, per-speaker
  * trims, the test signal) passes through it before the device. LINKED across channels: one gain from
  * the cross-channel peak, so engaging never shifts the spatial image; ~1 ms attack / ~120 ms release,
  * then a hard clamp at the ceiling. This is driver/speaker protection against digital overs, not a
@@ -395,7 +395,7 @@ typedef enum { BW_DECODE_SAMPLING = 0, BW_DECODE_ALLRAD = 1 } BwBedDecoder;
 BW_API void     bw_set_bed_decoder(BwEngine* e, BwBedDecoder decoder);
 
 /* Select how ambisonic BEDS render (live: each bed crossfades to the selection — a click-free A/B).
- * MATRIX (default) is the static SH->26 decode (sampling or AllRAD per bw_set_bed_decoder) — cheap,
+ * MATRIX (default) is the static SH->speaker decode (sampling or AllRAD per bw_set_bed_decoder) — cheap,
  * world-locked, sweet-spot-ish. PARAMETRIC analyzes the bed's first-order channels per frequency
  * band into a direction + diffuseness (DirAC-style intensity analysis): the non-diffuse stream is
  * RE-PANNED through the engine's listener-relative panner at the array shell — a recorded soundfield

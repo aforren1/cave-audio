@@ -59,15 +59,16 @@ that layer is specified in [materials.md](./materials.md).
 
 ## The gain solve (`dbap_gains`)
 
-Per voice, per frame *if dirty*: produce a 26-element gain vector `gtarget` from the
-source position, the listener position, and the speaker layout.
+Per voice, per frame *if dirty*: produce a gain vector `gtarget`, one entry per
+speaker, from the source position, the listener position, and the speaker layout.
+The vector is as long as the **layout's** speaker count (`bw_channel_count()`, 4..26
+— 26 on the CAVE array), never a hard-coded 26.
 
 Inputs:
 - `src` — source position (room space).
 - `lis` — listener position (room space). Orientation is **not** used by the array
   render.
-- `layout` — the 26 surveyed speaker positions (room space), loaded from
-  `layout_path`.
+- `layout` — the surveyed speaker positions (room space), loaded from `layout_path`.
 
 The solve (listener-relative DBAP):
 1. For each speaker `k`, compute the distance from the source as heard from the
@@ -78,7 +79,7 @@ The solve (listener-relative DBAP):
    controls how many speakers share energy), then normalize for constant perceived
    power.
 3. Apply per-source user gain and distance attenuation (source→listener).
-4. Write `gtarget[0..25]`.
+4. Write `gtarget[0..count-1]`.
 
 `r` (blur) and the distance-attenuation curve are the two tuning knobs. Expose them
 in the layout/config so they can be dialed against the real array.
@@ -148,7 +149,7 @@ point solve per listener per dirty voice.
 
 `dbap_gains` writes `gtarget`. The mixer holds `gcur` and interpolates
 `gcur → gtarget` across the block (per-sample, or a short per-block fade). Never
-apply a new 26-gain vector discontinuously — a position jump otherwise produces
+apply a new gain vector discontinuously — a position jump otherwise produces
 audible zipper noise. This is a hard invariant.
 
 ## Per-speaker alignment
@@ -254,7 +255,7 @@ constant-power) is unchanged.
 
 ## Binaural debug path
 
-The binaural monitor is a **bus→stereo** transform. It consumes the same 26-ch bus
+The binaural monitor is a **bus→stereo** transform. It consumes the same speaker bus
 the array render does, so it auditions the actual render.
 
 Two implementations sit behind the same seam:
@@ -266,11 +267,12 @@ Two implementations sit behind the same seam:
   constant-power panned to L/R (`gL² + gR² = 1`). No HRTF. It verifies routing and
   gross laterality, not timbre or externalization.
 
-The production decode is efficient — do **not** run 26 separate HRTF convolutions:
-1. Treat each of the 26 bus channels as a virtual speaker at its surveyed room
-   **direction** relative to the listener. This is where head **orientation**
-   enters — rotate the speaker directions with the head.
-2. Encode those 26 feeds into ambisonics — a fixed gain matrix from the speaker
+The production decode is efficient — do **not** run one HRTF convolution per bus
+channel (26 of them on the CAVE array):
+1. Treat each bus channel as a virtual speaker at its surveyed room **direction**
+   relative to the listener. This is where head **orientation** enters — rotate the
+   speaker directions with the head.
+2. Encode those feeds into ambisonics — a fixed gain matrix from the speaker
    directions. Cheap.
 3. Do a single **ambisonics → binaural** decode (Steam Audio's ambisonics-binaural
    effect with the configured HRTF).
@@ -303,9 +305,9 @@ virtual-speaker tap is the default; the direct mode is a diagnostic.
 
 ## Diffuse-bed decode (sampling vs AllRAD)
 
-The diffuse layer (ambisonic beds, the reflection bed) is rendered by a fixed SH→26
-**decode matrix** applied per block (`build_bed_decode` / `mix_bed` in `rt.c`),
-built from the speaker geometry at load time. Two decoders are selectable with
+The diffuse layer (ambisonic beds, the reflection bed) is rendered by a fixed
+SH→speaker **decode matrix** applied per block (`build_bed_decode` / `mix_bed` in
+`rt.c`), built from the speaker geometry at load time. Two decoders are selectable with
 `bw_set_panner`'s sibling **`bw_set_bed_decoder`** (load-time):
 
 - **Sampling (`BW_DECODE_SAMPLING`, default)** — the projection decode
@@ -342,10 +344,11 @@ sources. Its convex-hull + VBAP solve is factored into `hull.c`, shared with the
 
 ## Parametric bed rendering (`bw_set_bed_renderer`, live A/B)
 
-Any matrix decode — sampling or AllRAD — has two limits on this rig: 26 speakers
-are sparse for 3rd-order content (directional material blurs), and the decode is
-locked to the array centre (walking off-centre skews a recorded field in exactly
-the way the engine's listener-relative panning was built to avoid).
+Any matrix decode — sampling or AllRAD — has two limits on this rig: the array is
+sparse for 3rd-order content (26 speakers on the CAVE, so directional material
+blurs), and the decode is locked to the array centre (walking off-centre skews a
+recorded field in exactly the way the engine's listener-relative panning was built
+to avoid).
 
 `BW_BED_PARAMETRIC` renders beds the DirAC way (Pulkki's directional audio coding,
 first-order, in 4 coarse time-domain bands instead of an STFT — `mix_bed` in
@@ -358,8 +361,8 @@ isotropic). Two streams render per band:
   (`ref + R·doa`). The direct stream re-pans *per listener position*, so a recorded
   soundfield becomes **walkable** — correct directions and parallax off-centre.
 - **diffuse** (`√ψ`): the FOA band decoded through the bed matrix into the
-  **velvet-noise decorrelators** — envelopment from incoherent speaker feeds, not
-  26 correlated copies.
+  **velvet-noise decorrelators** — envelopment from incoherent speaker feeds, not a
+  correlated copy on every speaker.
 
 Both streams are loudness-matched to the matrix decode (a direction-averaged
 plane-wave power reference computed with the decode), parameters ramp per block
@@ -373,7 +376,7 @@ fewer than 4 channels stay on the matrix.
 The reflection bed no longer *requires* phonon: a 16-line **feedback delay
 network** (`fdn.c`, Householder feedback, two-band decay filters per line) can
 take the reverb bus tap instead. Each line is assigned a Fibonacci-sphere
-direction and rendered as a plane wave through the same SH→26 bed decode, and the
+direction and rendered as a plane wave through the same SH→speaker bed decode, and the
 per-line decay time scales with direction (`bw_fdn_set_decay_direction`) —
 **anisotropic decay**, the diagonal direction-domain case of the Directional FDN
 (Alary/Politis/Schlecht, JAES 2019). Deterministic CPU, infinite tail, no rays or
@@ -388,7 +391,7 @@ Via the **C API**, not the Unity/FMOD integration. Relevant pieces:
   speaker directions. The integrations don't expose custom layouts; the C API does.
 - Ambisonics encode + ambisonics→binaural decode for the monitor path.
 - The Direct Effect (occlusion + transmission) on the per-source path, and
-  reflections/reverb as a diffuse ambisonic bed decoded to the 26 array — see
+  reflections/reverb as a diffuse ambisonic bed decoded to the speakers — see
   [materials.md](./materials.md).
 
 Steam Audio's own custom-layout **panning** is a simpler projection law than

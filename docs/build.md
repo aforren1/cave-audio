@@ -182,8 +182,10 @@ distribution channel:
 
 ## DVS / Dante configuration
 
-- **Driver: ASIO.** Do not use the WDM driver — it caps at 16 channels; 26 needs ASIO
-  (up to 64).
+- **Driver: ASIO.** The device must expose **enough output channels for your layout** —
+  26 for the CAVE array; fewer for a smaller install (the engine's channel count is the
+  layout's speaker count, 4..26). Do not use the WDM driver — it caps at 16 channels;
+  26 needs ASIO (up to 64).
 - **Format:** 48 kHz, 24-bit. Match the bit depth end-to-end; DVS truncates on
   mismatch. Read the driver's reported sample type via `ASIOGetChannelInfo` and
   convert (DVS is typically Int32 or packed Int24).
@@ -201,13 +203,14 @@ distribution channel:
 
 1. COM-load the driver (the SDK's `AsioDrivers`/`asiolist` helpers handle registry
    enumeration; DVS registers an ASIO driver). `CoInitialize` on the thread.
-2. `ASIOInit` → `ASIOGetChannels` (expect ≥26 out) → `ASIOGetBufferSize`.
+2. `ASIOInit` → `ASIOGetChannels` (expect ≥ the layout's speaker count out — 26 for the
+   CAVE) → `ASIOGetBufferSize`.
 3. `ASIOGetChannelInfo` per output channel to learn the sample type.
 4. `ASIOCreateBuffers` with the `bufferSwitch` / `bufferSwitchTimeInfo` callbacks →
    `ASIOStart`.
 5. In `bufferSwitchTimeInfo`, capture `ASIOTime.timeInfo.systemTime` (ns) and
    `samplePosition` for the timestamping path, then run the block (see
-   concurrency.md), convert the 26-ch float bus to the driver's sample type, and
+   concurrency.md), convert the float speaker bus to the driver's sample type, and
    write into the driver buffers for `index`.
 
 Keep the callback allocation-free and lock-free per the invariants in `CLAUDE.md`.
@@ -221,7 +224,7 @@ auto-detects `third_party/asiosdk/` and prints `ASIO backend ENABLED`. Without i
 offline `null_sink.c` backend builds instead: the library always builds and the audio
 loop is testable with no hardware. Pick a backend at runtime with `BWAUDIO_SINK`
 (`null` | `asio`; default is ASIO with null fallback). The ASIO backend rejects any
-driver exposing fewer than 26 output channels.
+driver exposing fewer output channels than the layout needs (26 for the CAVE array).
 
 ## Verify before shipping
 
