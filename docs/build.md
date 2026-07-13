@@ -2,10 +2,10 @@
 
 ## Platform
 
-**Windows only.** ASIO is Windows-only; DVS is Windows/macOS. On other platforms the
-device backend would be ALSA/JACK (Linux) or CoreAudio (macOS), and you would *not*
-use ASIO there. A future cross-platform move means abstracting the device layer —
-ASIO is just the Windows sink. Keep ASIO assumptions confined to `asio_sink.cpp`.
+**Windows only.** ASIO is Windows-only; DVS is Windows/macOS. A cross-platform move
+means abstracting the device layer — ASIO is just the Windows sink, and the backend
+elsewhere would be ALSA/JACK (Linux) or CoreAudio (macOS). Keep ASIO assumptions
+confined to `asio_sink.cpp`.
 
 Build system: CMake + MSVC (Visual Studio 2022 toolset). The core is C (C11 with
 `stdatomic.h`); Steam Audio and ASIO glue are C/C++.
@@ -115,9 +115,7 @@ The catch is copyleft — pick the case that matches how you ship:
 - **Shipping closed** → take the proprietary ASIO license (the other half of the dual).
 
 This is the shape of the issue, not legal advice. Confirm against the current SDK
-license text. The same copyleft reasoning is why a permissive library (e.g. miniaudio)
-still won't bundle ASIO upstream: a permissive core can't absorb GPLv3. A "miniaudio
-ASIO backend" would be one *you* write under the GPLv3 (or proprietary) option.
+license text.
 
 ### imgui_test_engine licensing
 
@@ -135,10 +133,10 @@ the notice in `THIRD_PARTY-NOTICES.md`. Revisit if this repo's licensing changes
 ### NatNet without the proprietary SDK
 
 NaturalPoint's NatNet SDK is proprietary, which would conflict with GPLv3 under
-distribution. The NatNet protocol is documented, so `natnet.c` consumes the
-multicast/unicast stream directly rather than linking the SDK. A copy of the SDK sits
-at `third_party/NatNetSDK/` as a protocol reference for that implementation — no
-target compiles or links it, and it stays out of anything distributed. This also lets the core
+distribution. The protocol is documented, so `natnet.c` consumes the
+multicast/unicast stream directly rather than linking the SDK. The SDK copy at
+`third_party/NatNetSDK/` is a protocol reference for that implementation — no target
+compiles or links it, and it stays out of anything distributed. It also lets the core
 read pose itself (`track_internal = true`) and sample the freshest head pose at
 audio-callback time — lower-latency than marshaling pose through the engine each frame.
 

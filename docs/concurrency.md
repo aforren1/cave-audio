@@ -3,12 +3,12 @@
 The spine of the engine is two SPSC rings and a voice table, with a hard split
 between the control thread and the audio thread. That spine lives in
 [`src/rt.c`](../src/rt.c) / [`src/rt.h`](../src/rt.h).
-The `Voice`, `SoundData`, `Layout`, `Listener`, and `RtCore` structs are mapped in
+The `Voice`, `SoundData`, `Layout`, `Listener`, and `RtCore` structs are documented in
 [`internal-types.md`](./internal-types.md).
 
 ## Threads
 
-The two-thread core is unchanged:
+Two threads carry the core:
 
 - **Control thread** — whatever calls the `bw_*` API (the engine main thread).
   Owns handle allocation, the slot free-lists, generation tables, and asset
@@ -26,10 +26,9 @@ These two communicate through two SPSC rings:
 Both are single-producer/single-consumer, so the indices need only
 acquire/release — no CAS.
 
-That is the backbone, but it is no longer the whole picture. The engine has
-grown auxiliary producer threads, each with its own channel into the audio
-thread. Every channel is wait-free on the audio side — the audio thread never
-blocks on any of them:
+Around that backbone sit auxiliary producer threads, each with its own channel
+into the audio thread. Every channel is wait-free on the audio side — the audio
+thread never blocks on any of them:
 
 - **NatNet receiver thread** (`track_internal`): publishes the tracked head pose
   through a single-slot seqlock (`PoseSlot`, [`src/pose.h`](../src/pose.h)).
@@ -74,26 +73,25 @@ everything sampled is ramped in, never slammed.
 
 ## Command type and ring
 
-Fixed-size POD slots — no framing. The enum has grown from the original nine to
-twenty (current list: [`rt.h`](../src/rt.h)):
+Fixed-size POD slots — no framing. Twenty types (current list:
+[`rt.h`](../src/rt.h)):
 
 ```c
 enum {
-    /* the original core: */
+    /* core: */
     CMD_SRC_CREATE = 0, CMD_SRC_DESTROY, CMD_SET_POS, CMD_SET_GAIN,
     CMD_PLAY, CMD_STOP, CMD_SET_LISTENER, CMD_COMMIT, CMD_SOUND_RETIRE,
-    /* per-voice features + scheduling, added since: */
+    /* per-voice features + scheduling: */
     CMD_SET_REFLECTIONS, CMD_TEST_SIGNAL, CMD_SET_DOPPLER, CMD_SET_AIR, CMD_SET_SPREAD,
     CMD_SET_REFL_SEND, CMD_SET_REFL_DIST, CMD_SET_PATHING, CMD_SET_PAUSED, CMD_SEEK,
     CMD_SRC_STEAL
 };
 ```
 
-`Cmd` is `type` + `handle` + a union of 14 small payload arms (rt.h:39-58). The
-additions are all the same shape as the originals: a handle plus a bool or a
-float. The one worth calling out is `play`, which now carries
+`Cmd` is `type` + `handle` + a union of 14 small payload arms (rt.h:39-58).
+Most arms are a handle plus a bool or a float. `play` carries
 `{ uint64_t start; uint32_t sound; uint8_t loop, oneshot; }` — `start` is the
-dsp-sample to begin at (0 = now). Sample-accurate scheduling is just a wider
+dsp-sample to begin at (0 = now), so sample-accurate scheduling is a wider
 command, not a new mechanism.
 
 ```c
@@ -138,7 +136,7 @@ static bool evt_push(EvtRing* r, const Evt* e) {
 (`cmd_push` is the same function modulo `RING_CAP`, with the control thread as
 producer.)
 
-Three facts about the event path as implemented:
+Three facts about the event path:
 
 - **`EVT_VOICE_ENDED` does not fire for every ended voice.** A regular
   non-looping voice just flips `playing` off at end-of-buffer; its handle still
@@ -156,8 +154,8 @@ Three facts about the event path as implemented:
 
 ## Producer side (control thread)
 
-Per-frame calls are pure encode-and-push; they never touch voice state. Real
-code from rt.c:
+Per-frame calls are pure encode-and-push; they never touch voice state. From
+rt.c:
 
 ```c
 void rt_source_set_pos(RtCore* c, uint32_t h, float x, float y, float z) {
@@ -350,7 +348,7 @@ with the device's planar buffer (`cave` profile) or a scratch buffer
 8. **`align_process`** ([`src/align.c`](../src/align.c)): the per-speaker
    output stage — correction FIR, room-EQ modal cuts, gain trim, delay line.
 9. **Test signal.** `bw_test_signal` injects its sine/noise onto a raw channel
-   *after* align — a wiring check, deliberately outside the spatial path.
+   *after* align — a wiring check, outside the spatial path.
 10. **Limiter** (final stage; on by default at -1 dBFS). One gain computed
     from the cross-channel peak — linked, so engaging never shifts the spatial
     image — with ~1 ms attack / ~120 ms release one-poles and a hard clamp at
@@ -359,13 +357,12 @@ with the device's planar buffer (`cave` profile) or a scratch buffer
     `bw_get_bus_levels`) and the active pose (the `readback` seqlock →
     `rt_read_pose`).
 
-Two functions from the original spec do not exist. There is no `binaural_tap`:
-the binaural monitor is not a bus tap but a *sink render callback* in
+The binaural monitor is not a bus tap: it is a *sink render callback* in
 [`src/engine.c`](../src/engine.c) (`render_binaural`: `rt_render` into
 `scratch26`, then `monitor_process` / `steam_monitor_process` decodes to the
-2-ch device). And there is no `asio_convert_write`: device output goes through
-the `BwSink` abstraction ([`src/sink.h`](../src/sink.h)); the render callback
-fills the device's planar buffers directly.
+2-ch device). Device output likewise goes through the `BwSink` abstraction
+([`src/sink.h`](../src/sink.h)); the render callback fills the device's planar
+buffers directly.
 
 `mix_voice` interpolates `gcur → gtarget` across the block, never slams the new
 vector in at block start — invariant 4 in `CLAUDE.md`. The `dirty` flag means a
@@ -375,10 +372,9 @@ non-looping voice flips `playing` off; only oneshots (and steal fades) push
 
 ## Newer machinery, same rules
 
-Everything below arrived after the original spec. None of it adds a new kind of
-synchronization — each piece is the existing invariants applied again:
-allocation on the control thread, ramps for every audible change,
-generation-gated handles, acks over the event ring.
+None of the machinery below adds a new kind of synchronization — each piece is
+the existing invariants applied again: allocation on the control thread, ramps
+for every audible change, generation-gated handles, acks over the event ring.
 
 ### Voice steal (fade reserve + priority)
 
@@ -422,7 +418,7 @@ allocation — one power-of-two slice per voice, sized at `rt_create` for
 sample and reads at a delay gliding toward `distance/c`; the glide *is* the
 pitch shift. The write index stays integer (masked ring) with the fraction as a
 separate small float, so a long-lived voice never loses sample precision.
-Allocation at create time, DSP on the audio thread — invariant 1 as usual.
+Allocation at create time, DSP on the audio thread — invariant 1.
 
 ### Dual-band gains and the bed decode
 
@@ -440,8 +436,8 @@ on the control thread only while the audio thread is stopped (`rt_set_layout` /
 - File decode and malloc/free live on the control thread (or the streaming and
   sim threads — which are also not the audio thread).
 - The command ring is sized so a worst-case frame's burst can't fill it between
-  two drains (~one audio block apart). On the should-never-happen full case the
-  code does not spin — it makes the drop safe: `rt_source_destroy` recycles the
+  two drains (~one audio block apart). If it fills anyway, the code does not
+  spin — it makes the drop safe: `rt_source_destroy` recycles the
   handle only if the destroy actually enqueued, `rt_source_create` undoes its
   allocation, `rt_unload_sound` reverts the `retiring` flag so it can be
   retried, and a oneshot reserves its 4 commands up front (`cmd_free`) so it

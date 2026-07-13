@@ -3,11 +3,10 @@
 These types are **internal** to `src/` — they are *not* part of the public ABI
 and must **not** go in [`include/bwaudio.h`](../include/bwaudio.h).
 
-This file is a map, not a mirror. It pins down the protocol fields that
-[`concurrency.md`](./concurrency.md) reasons about, and summarizes the
-per-subsystem field groups that grew around them. The real structs in [`src/rt.c`](../src/rt.c) are 2–4× the size of the sketches here,
-and this doc tracks their *shape*, not every field. When a detail matters, read
-the struct.
+This file pins the protocol fields that [`concurrency.md`](./concurrency.md)
+reasons about and summarizes the per-subsystem field groups around them. It
+tracks the *shape* of the structs, not every field; the full definitions live in
+[`src/rt.c`](../src/rt.c). When a detail matters, read the struct.
 
 The thread-ownership rules from [`concurrency.md`](./concurrency.md) apply: the
 **audio thread** owns the DSP state (`Voice`, the bus, `Listener.*_active`);
@@ -19,18 +18,17 @@ tables, and asset (`SoundSlot`) memory.
 `BwSource` / `BwSound` are `uint32_t = (index | generation<<16)` — the
 `BW_H_IDX` / `BW_H_GEN` / `BW_MK_H` macros in [`src/rt.h`](../src/rt.h). Index
 and generation are each 16-bit, so the voice and sound tables are each ≤ 65536
-slots and generations wrap at 2¹⁶. That wrap is acceptable: a stale handle only
-has to differ from the *current* occupant, and 65536 reuses of one slot between
-two references in the same frame is not reachable.
+slots and generations wrap at 2¹⁶. The wrap is safe: a stale handle only has to
+differ from the *current* occupant of the slot.
 
-One implementation detail: `rt_create` adds `BW_FADE_RESERVE` (8) physical
-voice slots beyond the requested pool, kept free so a stolen voice can fade out
-on its own slot (see concurrency.md).
+`rt_create` adds `BW_FADE_RESERVE` (8) physical voice slots beyond the requested
+pool, kept free so a stolen voice can fade out on its own slot (see
+concurrency.md).
 
 ## DSP state (audio thread owns)
 
-The real `Voice` (rt.c) has grown to ~50 fields. The protocol core — the fields
-the concurrency doc's snapshot logic manipulates — is unchanged:
+`Voice` (rt.c) is ~50 fields. The protocol core — the fields the concurrency
+doc's snapshot logic manipulates:
 
 ```c
 typedef struct {
@@ -56,14 +54,11 @@ typedef struct {
 } Voice;
 ```
 
-Two renames against the original sketch: `const Sound*` is now
-`const SoundData*` (see "Sound" below), and the gain arrays are
-`[BW_CHANNELS]`, not a literal `[26]` (`BW_CHANNELS` is defined in
-[`src/sink.h`](../src/sink.h)).
+`BW_CHANNELS` is defined in [`src/sink.h`](../src/sink.h).
 
-The rest of the struct is per-subsystem DSP state, one group per feature. All
-of it is audio-thread-only (ramp state, filter histories), which is exactly why
-it lives *inside* `Voice`:
+The rest of the struct is per-subsystem DSP state, one group per feature. All of
+it is audio-thread-only (ramp state, filter histories), which is why it lives
+*inside* `Voice`:
 
 - **scheduling / streaming** — `oneshot` (self-recycling voice),
   `stream_pos` (absolute position into a stream's ring),
@@ -87,8 +82,6 @@ it lives *inside* `Voice`:
 
 ## Listener (audio thread owns active; control writes via ring)
 
-Unchanged:
-
 ```c
 typedef struct {
     float p_pending[3], q_pending[4];   /* written by CMD_SET_LISTENER */
@@ -102,9 +95,8 @@ is also handed to the reflection/pathing taps. Under `track_internal`,
 
 ## Sound (control thread owns; audio thread only reads via const*)
 
-The original single `Sound` struct split in two: the **payload**
-([`src/sound.h`](../src/sound.h)) and the **lifecycle wrapper** (rt.c — the
-sound table is a `SoundSlot[]`):
+A sound is two structs: the **payload** ([`src/sound.h`](../src/sound.h)) and
+the **lifecycle wrapper** (rt.c — the sound table is a `SoundSlot[]`):
 
 ```c
 /* sound.h — the payload */
@@ -131,8 +123,8 @@ Notes:
 - `channels` does double duty: 1 is a mono point source, 4/9/16 is an AmbiX
   ambisonic bed (played by `mix_bed`, not the panner).
 - Loads **resample to the engine rate at load time** (windowed-sinc in
-  sound.c). The old "sample rate must match, no resampling" rule survives only
-  for streams, which are rejected at open on a rate mismatch.
+  sound.c). Streams do not: a stream whose rate differs from the engine rate is
+  rejected at open.
 - The audio thread resolves a handle to `const SoundData*` via `sound_for`; the
   control thread resolves to the `SoundSlot` via `sound_slot_ctrl`.
 
@@ -166,20 +158,14 @@ typedef struct {
 } Layout;
 ```
 
-Against the original sketch: `Speaker` gained the correction-EQ and room-EQ
-fields, `Layout` gained `count` and `ref[3]`, and `atten_min_gain_lin` was
-**renamed** `atten_min_lin`.
-
 ## Engine (the opaque `BwEngine`)
 
-The original sketch put everything in one `BwEngine`. The implementation split
-it in two levels:
+The engine state sits at two levels.
 
-**`RtCore`** (rt.c, opaque behind [`src/rt.h`](../src/rt.h)) holds everything
-the old sketch listed — the two rings, the voice table + `Listener`, the
-`Layout` + `Aligner`, and the control-side allocation state (`gen` / `inuse` /
-`priority` / `stealing` / free-lists, plus the `SoundSlot` table). The whole
-`bw_*` API forwards to it.
+**`RtCore`** (rt.c, opaque behind [`src/rt.h`](../src/rt.h)) is the real-time
+core: the two rings, the voice table + `Listener`, the `Layout` + `Aligner`, and
+the control-side allocation state (`gen` / `inuse` / `priority` / `stealing` /
+free-lists, plus the `SoundSlot` table). The whole `bw_*` API forwards to it.
 
 **`BwEngine`** (engine.c) is the ABI-facing shell around it:
 
@@ -207,7 +193,7 @@ to `rt_render`, supplied per block by whichever sink render callback is running
 
 ### Also lives in RtCore
 
-The subsystem state parked in `RtCore` (the struct definition in rt.c is the
+Subsystem state parked in `RtCore` (the struct definition in rt.c is the
 reference):
 
 - **panner caches** — `SpcapState` / `VbapState`, self-invalidated via
@@ -223,7 +209,8 @@ reference):
 - **streaming** — the `StreamSet` (background thread + ring pool) and the
   per-block `stream_scratch`.
 - **occlusion publish** — the `occ_handle` / `occ_val` / `occ_eq` / `occ_dir`
-  atomic arrays (parallel to `voices`, deliberately outside `Voice`).
+  atomic arrays (parallel to `voices`, outside `Voice` so a voice-create memset
+  can't race a publish).
 - **readback / meters** — `play_pub` (per-slot playing state), `chan_peak`
   (per-channel output peaks), `dsp_now` (the published dsp clock).
 - **misc DSP** — the reflection `aux` scratch, the `dop_ring` Doppler pool,
@@ -255,18 +242,16 @@ void mix_bed  (RtCore* c, Voice* v, uint16_t idx, float* bus,
 void align_process(Aligner* a, float* bus, uint32_t nframes);  /* align.h; in place, planar */
 ```
 
-Renames against the original sketch: `ring_push` → `cmd_push`,
-`ring_push_evt` → `evt_push`, `align_speakers` → `align_process` (it takes the
-`Aligner`, not the engine), and every `BwEngine*` parameter became `RtCore*`.
-`dbap_gains` kept its shape; `mix_voice` grew the core pointer, the slot index
-(for the handle-gated publishes), the scheduled-start offset, and the aux-send
-buffer.
+In `mix_voice`, `idx` is the voice's slot index (for the handle-gated
+publishes), `start` the scheduled-start offset within the block, and `aux` the
+reflection aux-send buffer. `align_process` takes the `Aligner`, not the engine.
 
-Two sketched helpers were never built. `binaural_tap` does not exist: the
-binaural decode is a *sink render callback* in engine.c (`render_binaural` →
-`monitor_process` / `steam_monitor_process`), not a bus tap. And
-`asio_convert_write` does not exist: device output goes through the `BwSink`
-abstraction ([`src/sink.h`](../src/sink.h)), whose render callback fills the
-device's planar buffers directly. The original caution about Steam Audio's
-real-time safety is settled the intended way: the phonon objects are created at
-`bw_start`, and the decode runs inside the sink callback.
+Two things that are *not* helpers here:
+
+- **The binaural decode** is a sink render callback in engine.c
+  (`render_binaural` → `monitor_process` / `steam_monitor_process`), not a bus
+  tap. Steam Audio's phonon objects are created at `bw_start`, and the decode
+  runs inside the sink callback.
+- **Device output** goes through the `BwSink` abstraction
+  ([`src/sink.h`](../src/sink.h)), whose render callback fills the device's
+  planar buffers directly.

@@ -971,10 +971,10 @@ int main(int argc, char** argv) {
     if (selftest) _putenv((char*)"BWAUDIO_SINK=null");
 
     /* Sink policy (interactive): engine default — try a 2-ch ASIO driver for headphones, fall back
-     * to the offline null sink. The fallback matters: without a device the engine still RENDERS in
-     * real time, so visual-only mode stays live — speaker activity, panning, occlusion — just
-     * silent. The panel's audio line + meters keep the no-audio state loud (we used to force
-     * BWAUDIO_SINK=asio here, which left visual-only mode with a dead engine: nothing metered). */
+     * to the offline null sink. Do NOT force BWAUDIO_SINK=asio: the fallback is what keeps
+     * visual-only mode live (no device -> the engine still renders in real time, so speaker
+     * activity, panning and occlusion still animate, just silent). The panel's audio line +
+     * meters keep the no-audio state visible. */
 
     /* optional surveyed layout: argv[1], else ./cave_layout.json if present, else the default grid.
      * selftest always uses the default grid — the suite must not depend on a machine-local file. */

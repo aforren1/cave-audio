@@ -447,8 +447,8 @@ static void tab_capture(void) {
     bwTip("no hardware: synthesize each sweep capture (1/r + a per-speaker sensitivity wobble) and "
           "run the identical measure->solve->writeback pipeline");
     ImGui::SameLine(); ImGui::Checkbox("room report", &J.do_room);
-    bwTip("Schroeder RT60 + early reflections per speaker - a treatment diagnostic, NOT a model to "
-          "match (matching would double-count the real room)");
+    bwTip("Schroeder RT60 + early reflections per speaker - tells you how live the room is. "
+          "Treat the room if it's too live; don't copy the RT60 into your engine reverb");
     ImGui::SameLine(); ImGui::Checkbox("eq", &J.do_eq);
     bwTip("per-speaker correction FIR inverted from the direct-sound window - flattens the SPEAKER, "
           "not the room (a moving listener can't be room-EQ'd from one point)");

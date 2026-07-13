@@ -5,8 +5,7 @@
 Render spatialized audio for a CAVE: a tracked observer moving within a ~3×3 m area
 inside a **26-speaker array**, fed from a game engine (Unity and/or Unreal). Output
 goes to a **Dante Virtual Soundcard (DVS)** over **ASIO**. Latency and timing
-precision are first-class requirements. Jitter from middleware or cross-process
-control is not acceptable.
+precision are first-class requirements.
 
 ## Top-level decision: self-hosted core, engines as control clients
 
@@ -20,15 +19,12 @@ Why:
   `bufferSwitchTimeInfo` delivers an `ASIOTime` with sample position and a
   nanosecond `systemTime`, plus `ASIOGetSamplePosition` on demand. Middleware hides
   these.
-- **Engine-agnostic.** One core, two thin clients. The library is portable across
-  Unity and Unreal by construction. The only per-engine code reads transforms and
-  tracking.
+- **Engine-agnostic.** One core, two thin clients. The only per-engine code reads
+  transforms and tracking.
 - **No middleware jitter.** Control is in-process over a lock-free ring, not OSC/UDP
-  to a separate process with its own clock. (An OSC/Max renderer was considered and
-  rejected on jitter/complexity grounds.)
+  to a separate process with its own clock.
 
-The cost: you own voice management, wav playback, and the ASIO host glue. For bounded
-research stimuli this is modest and squarely in scope.
+The cost: you own voice management, wav playback, and the ASIO host glue.
 
 ## The central seam: a 26-channel in-memory master bus
 
@@ -41,10 +37,10 @@ master bus**. *Consumers* read that bus:
   ordinary output device (a headphone DAC). It sits *after* the panner, so it
   auditions the real array render — DBAP behavior and all — not an idealized version.
 
-This seam is why the binaural path was a clean addition rather than a complication:
-it is just a second consumer. Keep it that way. The abstraction set is: a **render
-target** (the bus), one or more **device sinks** consuming buses, and the binaural
-monitor as a **bus→bus transform** (26→2) feeding a stereo sink.
+The binaural monitor is just a second consumer of the bus. Keep it that way. The
+abstraction set is: a **render target** (the bus), one or more **device sinks**
+consuming buses, and the binaural monitor as a **bus→bus transform** (26→2) feeding a
+stereo sink.
 
 ```
             sources
@@ -76,8 +72,8 @@ identical across all three:
 device, so it needs no Dante hardware. This is the desk-development profile.
 
 `both` gives you a live headphone monitor of the CAVE render while standing at the
-rack. The two device clocks are independent and that is fine: the monitor isn't
-sample-locked to the array, it just reads the same bus.
+rack. The two device clocks are independent: the monitor isn't sample-locked to the
+array, it just reads the same bus.
 
 ## Tracking asymmetry (a correctness point)
 
@@ -96,20 +92,18 @@ orientation component.
 - **Transport: ASIO, not WDM.** DVS's WDM driver caps at 16 channels; ASIO carries
   up to 64. 26 channels makes ASIO mandatory.
 - **ASIO SDK used directly** under its GPLv3 option (dual-licensed GPLv3/proprietary
-  as of Oct 2025). This is a Windows-only tool, so PortAudio's portability buys
-  nothing, and direct access to the timing hooks is preferred. See `docs/build.md`
-  for copyleft notes.
+  as of Oct 2025), for direct access to the timing hooks. See `docs/build.md` for
+  copyleft notes.
 - **Steam Audio via its C API** (not the Unity/FMOD integration). The C API supports
   custom speaker layouts (`IPLSpeakerLayout` with `IPL_SPEAKERLAYOUTTYPE_CUSTOM`,
   unit-direction speakers); the integrations do not expose this. The same dependency
-  now carries the whole acoustics stack: the binaural HRTF decode
-  (`src/steam_decode.c`), occlusion + per-band transmission EQ + directivity
-  (`src/steam_scene.c`), the reflection bed with an optional baked mode
-  (`src/steam_reflect.c`), and sound pathing (`src/steam_path.c`) — all wired up in
-  `src/engine.c` at `bw_start`.
+  carries the whole acoustics stack: the binaural HRTF decode (`src/steam_decode.c`),
+  occlusion + per-band transmission EQ + directivity (`src/steam_scene.c`), the
+  reflection bed with an optional baked mode (`src/steam_reflect.c`), and sound
+  pathing (`src/steam_path.c`) — all wired up in `src/engine.c` at `bw_start`.
 - **Spatialization: listener-relative DBAP**, recomputed per frame from tracked
-  position. Pure ambisonics is rejected for localized point sources because a single
-  sweet spot fails across a 3×3 m roam. DBAP remains the default; SPCAP and VBAP are
+  position. Pure ambisonics fails for localized point sources here: its single sweet
+  spot does not survive a 3×3 m roam. DBAP is the default; SPCAP and VBAP are
   selectable for fixed-listener installs (`bw_set_panner`), and `bw_set_dual_band`
   adds an optional dual-band mode on top of whichever panner is active. See
   `docs/spatialization.md`.
@@ -120,7 +114,7 @@ orientation component.
 
 ## Dependencies (minimal by design)
 
-The engine core links four external pieces, each there for a reason:
+The engine core links four external pieces:
 
 - **ASIO SDK** (GPLv3 option, vendored) — the device backend.
 - **Steam Audio (phonon)** — HRTF decode, occlusion, reflections, pathing. Optional:

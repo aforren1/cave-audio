@@ -13,11 +13,11 @@ Steam Audio build); "Implementation status" below says what is tested where.
 
 ## Where this fits the existing signal flow
 
-The direct path is DBAP (M4). Materials leave it unchanged except for occlusion. The architecture
-reserved the **diffuse layer** (ambient beds, reflections, reverb) for ambisonics: that energy is
-not sweet-spot-sensitive, so a fixed decode is robust across the moving observer
-([spatialization.md](./spatialization.md) "Why DBAP, not ambisonics"). Materials are the build-out
-of that reserved layer:
+The direct path is DBAP (M4). Materials leave it unchanged except for occlusion. The **diffuse
+layer** (ambient beds, reflections, reverb) is ambisonic: that energy is not
+sweet-spot-sensitive, so a fixed decode is robust across the moving observer
+([spatialization.md](./spatialization.md) "Why DBAP, not ambisonics"). Materials build out that
+layer:
 
 ```
                    ┌─ direct:  occlusion (scalar gain + 3-band EQ) on the mono voice → per-source DBAP ─┐
@@ -92,21 +92,20 @@ correctly collapses to a near-omni field (the directional ambisonic channels can
 geometry lights them up (verified: an offset source puts ~half the omni energy into a directional
 channel).
 
-Getting there required fixing a real **Steam Audio 4.8.1 bug**, found via a single-threaded phonon
-repro plus a debugger trace. The complex `ArrayMath::multiplyAccumulate` reads its accumulator
-with an *aligned* SSE load on its *unaligned* code path, which access-violates on the odd
-ambisonic channels (the per-channel FFT stride is `8 mod 16` bytes, because `numSpectrumSamples`
-is always odd). That crashed any `numChannels > 1` reflection effect at channel 1. The one-line
-fix (`load`→`loadu`) is a local patch on the vendored phonon — see
-[third_party/patches/](../third_party/patches/) and [third_party/README.md](../third_party/README.md);
-report it upstream and drop it once it lands.
+The vendored phonon carries a local patch for a **Steam Audio 4.8.1 bug**: the complex
+`ArrayMath::multiplyAccumulate` reads its accumulator with an *aligned* SSE load on its *unaligned*
+code path, which access-violates on the odd ambisonic channels (the per-channel FFT stride is
+`8 mod 16` bytes, because `numSpectrumSamples` is always odd) — so any `numChannels > 1` reflection
+effect crashes at channel 1. The fix is one line (`load`→`loadu`); see
+[third_party/patches/](../third_party/patches/) and [third_party/README.md](../third_party/README.md).
+Report it upstream and drop the patch once it lands.
 
 The same per-triangle materials drive **both** occlusion (per-band transmission) and the
 reflection bed (absorption/scattering), because both simulators share one committed `IPLScene`. A
 per-triangle smoke test confirms a source behind a `concrete` triangle is occluded to ~0.015 while
 one behind a high-transmission triangle passes at ~0.6.
 
-Note the occlusion *amount* is separate from the material. Steam Audio's `IPLDirectEffectParams`
+The occlusion *amount* is separate from the material. Steam Audio's `IPLDirectEffectParams`
 carries a **scalar `occlusion`** (how much of the direct path is blocked, a geometry/ray result)
 *and* the **3-band `transmission`** (the material's spectral tilt of what leaks through). The
 material supplies `transmission`; the ray query supplies `occlusion`.
@@ -150,10 +149,9 @@ the instant you toggle occlusion on. Occlusion is **volumetric** (partial cover 
 smoothly, not as a binary shadow).
 
 Occlusion applies to the **mono voice signal, upstream of panning**: a scalar occlusion gain plus
-a 3-band transmission EQ on the pre-DBAP signal. It deliberately does **not** enter `dbap_gains`
-and does **not** set the per-voice `dirty` flag. The 26-gain DBAP vector stays position/listener-
-driven and constant-power; the solve stays dirty-gated on geometry only. Occlusion's low-rate
-updates are decoupled from DBAP recompute.
+a 3-band transmission EQ on the pre-DBAP signal. It does **not** enter `dbap_gains` and does
+**not** set the per-voice `dirty` flag — the 26-gain DBAP vector stays position/listener-driven
+and constant-power, and the solve stays dirty-gated on geometry only.
 
 What the sim publishes, per source at 30 Hz: it folds occlusion and transmission per band —
 `raw[b] = occlusion + (1 − occlusion) · transmission[b]` — then splits that into a broadband
@@ -170,8 +168,8 @@ attenuate.
 
 ### Source directivity (cheap, per source)
 
-A source facing away from you is a strong perceptual cue, and it is nearly free. The shipped model
-is a **weighted dipole** (phonon's `IPLDirectivity`):
+A source facing away from you is a strong perceptual cue. The shipped model is a **weighted
+dipole** (phonon's `IPLDirectivity`):
 
 - **`bw_source_set_directivity(e, s, weight, power)`** — `weight` 0 = omni (off), 0.5 = cardioid,
   1 = figure-8; `power >= 1` sharpens the lobe.
@@ -196,40 +194,29 @@ yielding an ambisonic reflection signal, then **decodes it to the 26 channels wi
 **same `IPL_SPEAKERLAYOUTTYPE_CUSTOM` 26-direction layout** the binaural monitor builds from the
 surveyed geometry — and sums it onto the bus.
 
-Using Steam Audio's decode effect here is deliberate. Decoding an ambisonic field onto the
-**irregular** 26-speaker grid (a 3×3×3 boundary minus centre, *not* a uniform sphere) is the hard,
-non-unique direction — a naïve sampling/transpose or raw pseudo-inverse gives uneven loudness and
-direction errors. Steam Audio's decoder handles a custom layout with a sane decode law and the
-correct SH channel-order/normalization convention; **re-deriving the matrix ourselves risks
-getting that convention wrong** (rotated/scaled bed). A literal precomputed matrix is only an
-*optimization* of the same effect (to skip per-block effect overhead). If you take it, it must
-reproduce Steam Audio's SH convention and a proper irregular-layout decode (e.g. AllRAD /
-energy-preserving max-rE) — it is not a substitute for thinking the decode through.
+Decoding an ambisonic field onto the **irregular** 26-speaker grid (a 3×3×3 boundary minus centre,
+*not* a uniform sphere) is the hard, non-unique direction: a naïve sampling/transpose or raw
+pseudo-inverse gives uneven loudness and direction errors. Steam Audio's decoder handles the custom
+layout with a sane decode law and the right SH channel-order/normalization convention. A literal
+precomputed matrix is only an *optimization* of the same effect (skipping per-block effect
+overhead); if you take it, it must reproduce phonon's SH convention **and** a proper
+irregular-layout decode (e.g. AllRAD / energy-preserving max-rE), or you get a rotated/scaled bed.
 
-Why ambisonic-and-fixed-decode rather than per-image-source DBAP:
-- It is Steam Audio's native reflection output — no re-derivation of image sources.
-- Reflections carry **spaciousness and distance**, not primary localization. The sweet-spot
-  argument that *mandates* DBAP for the direct sound is much weaker for the diffuse field, so a
-  fixed decode across the 3×3 m roam is acceptable (the explicit split in
-  [spatialization.md](./spatialization.md)).
-- A **lower ambisonic order suffices** for a diffuse bed (`order` is 1 or 2, default 1; the direct
-  binaural monitor uses 3rd), keeping the reflection channel count and convolution cheap.
+Reflections carry **spaciousness and distance**, not primary localization, so the sweet-spot
+argument that mandates DBAP for the direct sound is weak for the diffuse field: a fixed decode
+across the 3×3 m roam is fine (the split in [spatialization.md](./spatialization.md)). A **lower
+ambisonic order suffices** for a diffuse bed (`order` is 1 or 2, default 1; the direct binaural
+monitor uses 3rd), keeping the reflection channel count and convolution cheap.
 
 **Bounding the convolution cost — hybrid reverb.** Convolving a full IR (early + a long diffuse
 tail) every block is the feature's CPU cost centre (below). Steam Audio's **hybrid reverb** splits
-it the way IRCAM Spat and most production reverbs do: a **short ray-traced early-reflection IR** —
-the part that carries spatial cues — convolved as above, plus a **parametric / FDN late tail**
-synthesised from the simulator's estimated per-band decay (RT60; `reverb_estimator` /
-`hybrid_reverb_estimator` in the SDK). The convolution then runs against a *short* IR and the long
-tail is a cheap recursive reverb sharing the same ambisonic→bus decode — far less CPU for the same
-perceived space. The bed runs hybrid unconditionally (`REFL_TYPE` in `steam_reflect.c` is a
-compile-time constant); full-length-IR convolution would be a code change, not a config option.
-
-> **Out of scope — sharp early reflections.** Strong, directional first-order reflections localize
-> more than diffuse reverb and could be rendered as image-source DBAP "voices." But those image
-> sources **cannot be extracted** from Steam Audio's mixed ambisonic IR — it would require a
-> *separate* first-party image-source/ray pass running alongside the ambisonic bed, not a re-tap of
-> the simulator output. Future refinement.
+it: a **short ray-traced early-reflection IR** — the part that carries spatial cues — convolved as
+above, plus a **parametric / FDN late tail** synthesised from the simulator's estimated per-band
+decay (RT60; `reverb_estimator` / `hybrid_reverb_estimator` in the SDK). The convolution then runs
+against a *short* IR and the long tail is a cheap recursive reverb sharing the same ambisonic→bus
+decode — far less CPU for the same perceived space. The bed runs hybrid unconditionally
+(`REFL_TYPE` in `steam_reflect.c` is a compile-time constant); full-length-IR convolution would be
+a code change, not a config option.
 
 ## Threading & RT-safety
 
@@ -294,11 +281,10 @@ thread has joined — no use-after-free window.
 **Per-source results are generation-keyed.** Occlusion/directivity publishes are keyed by the full
 generation-counted `BwSource` handle and **dropped on a generation mismatch** at consume time
 (just as `voice_for` drops stale commands) — a slot destroyed and recycled between simulation and
-consumption can't apply stale values to a different sound. This path is **intentionally decoupled
-from `CMD_COMMIT` frame coherence**: occlusion/reflection energy is diffuse and low-rate, and the
-ramps hide the sub-frame skew, so it does not need the listener/source atomicity the direct DBAP
-pan requires (where a torn snapshot *is* audible). That decoupling is acceptable *here* precisely
-because the diffuse field tolerates it — unlike the direct path.
+consumption can't apply stale values to a different sound. This path is **decoupled from
+`CMD_COMMIT` frame coherence**: occlusion/reflection energy is diffuse and low-rate, and the ramps
+hide the sub-frame skew, so it does not need the listener/source atomicity the direct DBAP pan
+requires (where a torn snapshot *is* audible).
 
 **No clicks on low-rate updates.** Occlusion gain + filter coefficients ramp per block (above).
 The IR transition is phonon's own: one persistent `IPLReflectionEffect`, with only `params->ir`
@@ -308,35 +294,31 @@ updated per publish, and the library cross-fades in place.
 
 To keep the bus seam, reflections go **ambisonic → 26-ch decode → bus**, and the binaural monitor
 then re-encodes those 26 channels back to ambisonics for its stereo decode, like any other bus
-content. This is a deliberate double ambisonic round-trip (low-order reflection ambi → irregular
-26-ch → 3rd-order monitor ambi → stereo). The cost and the directionality loss are **accepted to
-protect the "both consumers audition the identical bus" guarantee**. Short-circuiting the monitor
-by feeding it the pre-decode reflection ambisonics directly is **prohibited** — that would create
-exactly the second, bus-bypassing binaural consumer this design forbids, and desync the array vs
-monitor reflection content. If reflection quality on headphones ever demands it, the only
-sanctioned exception must be documented explicitly and reconciled with the single-seam rule.
+content. That is a deliberate double ambisonic round-trip (low-order reflection ambi → irregular
+26-ch → 3rd-order monitor ambi → stereo); its cost and directionality loss buy the "both consumers
+audition the identical bus" guarantee. Short-circuiting the monitor by feeding it the pre-decode
+reflection ambisonics directly is **prohibited** — it would create a second, bus-bypassing binaural
+consumer and desync the array vs monitor reflection content.
 
 ## Geometric default, perceptual option
 
 Everything above is the **geometric** path — materials + scene → ray-traced reflections — and it
-is the **default**, because the CAVE mostly simulates physical situations. But geometry isn't
-always wanted (abstract or musical content, or scenes with no usable mesh). The *perceptual*
-school (IRCAM Spat) is the alternative: drive a parametric reverb from a handful of
-listener-tested knobs — **presence** (direct vs reverb), **warmth** / **brillance** (LF/HF
-balance), **room presence**, **reverberance** (decay time), **envelopment** — instead of geometry.
+is the **default**. For content with no usable mesh (abstract or musical), the *perceptual* school
+(IRCAM Spat) drives a parametric reverb from listener-tested knobs instead of geometry:
+**presence** (direct vs reverb), **warmth** / **brillance** (LF/HF balance), **room presence**,
+**reverberance** (decay time), **envelopment**.
 
-It is cheap to tack on *because the hybrid reverb already provides the engine*: the FDN late tail
-(above) exposes exactly the parameters a thin perceptual mapping targets (per-band RT60,
-early/late balance, band EQ). A perceptual layer is a control mapping, **no new DSP**, landing on
-the same bus. So the design supports both — **geometric by default**, with an optional
-**perceptual mode** that bypasses the scene and drives the late-reverb parameters directly. The
-two are mutually exclusive *per source*: a source is either physically simulated or perceptually
-placed. This mode is designed but **not implemented** (see "Implementation status").
+The hybrid reverb's FDN late tail already exposes what such a mapping targets (per-band RT60,
+early/late balance, band EQ), so a perceptual mode is a control mapping — **no new DSP**, same bus.
+It bypasses the scene and drives the late-reverb parameters directly, and is mutually exclusive
+with geometry *per source*: a source is either physically simulated or perceptually placed. **Not
+implemented** (see "Implementation status").
 
 ## Data surface / API (additive; load-time setup, per-frame-safe toggles)
 
 Signatures live in [include/bwaudio.h](../include/bwaudio.h); per-call threading
-semantics are in [api.md](./api.md). An engine with no scene behaves exactly as today. The shipped surface:
+semantics are in [api.md](./api.md). An engine with no scene renders as if materials didn't exist.
+The shipped surface:
 
 ```c
 /* materials — engine-scoped tokens; 0 = the built-in generic default */
@@ -372,12 +354,12 @@ float bw_source_get_directivity(BwEngine* e, BwSource s);       /* 1 = on-axis/o
 
 `BwReflectionConfig` (bwaudio.h) is: `ir_seconds` (0 → default 1.0, range ~0.5..2.0), `order`
 (1 or 2; 0 → default 1), `num_rays` (0 → default 4096), `num_bounces` (0 → default 16), `enabled`
-(0 = no bed created — the engine behaves exactly as today), `wet_gain` (0 → default 1.0), and
+(0 = no bed created), `wet_gain` (0 → default 1.0), and
 `reserved[3]` (zero; room to grow without an ABI break). There is no "update Hz" field (the sim
 rates are compile-time constants) and no shared-vs-per-source field (the bed is always the single
 shared instance).
 
-The per-source wet send deserves a note:
+The per-source wet send:
 
 - **`bw_source_set_reflection_send`** sets the source's wet-send **level** (default 1.0; 0 =
   none). Drive it yourself for a manual dry/wet.
@@ -421,21 +403,12 @@ it to one convolution regardless of source count.
 Materials simulate the *virtual* scene. The physical CAVE also reflects sound off its real walls,
 and those reflections are not under engine control. For the simulated acoustics to read correctly,
 **the physical room should be acoustically treated (absorptive)** so the rendered virtual
-reflections dominate. A deployment requirement — noted here so it is designed for, not discovered
-on site.
+reflections dominate. That is a deployment requirement.
 
 ## Scope & sequencing
 
-The build-out followed the designed order, cheapest first, and has landed:
-
-- **Occlusion first** (rode the M5 Steam Audio link): the direct-sim ray query, the per-voice
-  gain + EQ glide — small state, immediate payoff. **Directivity** rides the same pre-pan stage
-  for nearly free.
-- **Then the reflection bed**: the sim thread, the seqlock params handoff, the hybrid
-  `IPLReflectionEffect` convolution, and the `IPLAmbisonicsDecodeEffect` to the 26-ch bus — a
-  single shared listener-centric bed over a static scene.
-- **Then the probe machinery**: baked reflections (`BWAUDIO_BAKE`) and sound pathing
-  (`BWAUDIO_PATHING`), both below.
+Built: occlusion + transmission EQ + directivity, the reflection bed, and the probe machinery on
+top of it (baked reflections `BWAUDIO_BAKE`, sound pathing `BWAUDIO_PATHING`) — all below.
 
 Still not built:
 
@@ -447,27 +420,20 @@ Still not built:
   **full-length-IR convolution**, **GPU (TrueAudio Next) convolution**, and **runtime
   order/IR-length changes** (phonon fixes effect sizes at create).
 
-One item from the original out-of-scope list shipped elsewhere: **Doppler** is implemented as
-phonon-free per-voice DSP in `rt.c` (`bw_source_set_doppler` — see [api.md](./api.md)), not part
-of the materials path.
+**Doppler** is phonon-free per-voice DSP in `rt.c` (`bw_source_set_doppler` — see
+[api.md](./api.md)), not part of the materials path.
 
 ## Implementation status
 
 - **Occlusion + per-band transmission EQ + directivity — implemented** (`src/steam_scene.c`, gated on
   the Steam Audio build; `bw_scene_set_mesh` / `bw_scene_set_mesh_mat` / `bw_scene_set_box` +
   `bw_source_set_occlusion` / `bw_source_set_directivity` / `bw_source_set_orientation` +
-  `bw_source_get_occlusion` / `bw_source_get_directivity`). The simulation thread is real: it owns
-  an `IPLScene` + `IPLStaticMesh` (**per-triangle materials**) + an `IPLSimulator`, ray-traces
-  **volumetric** occlusion + transmission + directivity at 30 Hz, and publishes per source a
-  (level, 3-band tilt, directivity-gain) set. The control thread feeds geometry + per-source
-  enable/position/orientation through a locked shadow; the audio thread reads the published values
-  lock-free and **ramps** them (invariant 4) — a 3-biquad transmission EQ (so a wall *muffles*,
-  not just attenuates — rate-derived, runs at 96 kHz too), a directivity dipole gain, and the
-  level. The sim → audio handoff is a set of per-voice atomics
-  (`occ_handle`/`occ_val`/`occ_eq`/`occ_dir`) the audio thread gates on its own generation — the
-  sim never touches audio-owned voice state, so there is no data race and a recycled slot can't
-  inherit stale state. The published level/EQ/directivity ramp is asserted in `test/rt_test.c`;
-  the playground wall is a real scene mesh.
+  `bw_source_get_occlusion` / `bw_source_get_directivity`). The sim thread owns an `IPLScene` +
+  `IPLStaticMesh` (**per-triangle materials**) + an `IPLSimulator` and ray-traces **volumetric**
+  occlusion + transmission + directivity at 30 Hz; the audio thread ramps the published values
+  (mechanism under "Direct sound" and "Threading & RT-safety" above). The published
+  level/EQ/directivity ramp is asserted in `test/rt_test.c`; the playground wall is a real scene
+  mesh.
 - **Reflection bed — implemented** (`src/steam_reflect.c`; the sections above, plus the per-source
   send controls in "Data surface / API"). The `reflect` test proves it is directional;
   `BWAUDIO_BAKE` precomputes it and the `bake` test proves the baked path stays directional.
@@ -485,25 +451,23 @@ at `bw_start`, and can afford more rays/bounces than real time. The reverb still
 same hybrid effect + 26-decode, so it stays **directional** — the `bake` test confirms the +X-near
 listener gets +X-biased reverb out of baked data (ratio ≈ 1.4, vs ~1.0 for an omni bed).
 
-Two non-obvious things had to be right, both learned by reading the SDK source:
+Two things must be right:
 
-- **Probe placement.** `UNIFORMFLOOR` generation is sensitive to floor-mesh winding (it found no floor
-  in a box whose floor faces down). Placing probes manually with one `CENTROID` call per grid point is
-  robust — but phonon's `generateCentroidProbe` reads the probe **centre from the transform's
-  translation column** and the influence **radius from the basis-column lengths (min/2)** (it treats
-  the matrix as an OBB centre+basis, NOT the documented unit-cube→box mapping). So the translation must
-  be the grid point itself (not a corner), and a box edge of `2*spacing` gives `radius == spacing`, so
-  the probes' influence spheres overlap. Get the translation wrong and the probes land outside their
-  own influence radius of the listener.
-- **Why that matters.** `SimulationManager::lookupBakedReflections` only fills the reverb for sources
-  whose listener has **influencing probes** (`getInfluencingProbes` → `validSimulationData`). Probes
-  off by half a box → no influencing probe → the lookup is silently skipped and the reverb stays zero.
-  (That zero, not a phonon-build fault, was the whole mystery — the Unity integration's identical
-  call sequence is what pointed back at the probe transform.)
+- **Probe placement.** `UNIFORMFLOOR` generation is sensitive to floor-mesh winding (it finds no floor
+  in a box whose floor faces down). Place probes manually with one `CENTROID` call per grid point —
+  but phonon's `generateCentroidProbe` reads the probe **centre from the transform's translation
+  column** and the influence **radius from the basis-column lengths (min/2)** (it treats the matrix
+  as an OBB centre+basis, NOT the documented unit-cube→box mapping). So the translation must be the
+  grid point itself (not a corner), and a box edge of `2*spacing` gives `radius == spacing`, so the
+  probes' influence spheres overlap.
+- **Influencing probes.** `SimulationManager::lookupBakedReflections` only fills the reverb for sources
+  whose listener has **influencing probes** (`getInfluencingProbes` → `validSimulationData`). Get the
+  transform wrong and the probes land outside their own influence radius of the listener: no
+  influencing probe → the lookup is silently skipped and the reverb stays zero.
 
-Marginal CPU win for *this* installation (the real-time ray-trace already runs off the audio thread
-with Tracy headroom), but it enables much higher bake-time quality and is the right default for a
-static room.
+The CPU win for *this* installation is marginal (the real-time ray-trace already runs off the audio
+thread with Tracy headroom), but baking enables much higher bake-time quality and is the right
+default for a static room.
 
 ## Pathing — wired (`BWAUDIO_PATHING`)
 
@@ -514,10 +478,10 @@ end (`steam_path.c`, same with-SDK gate, opt in with `BWAUDIO_PATHING` at `bw_st
 - **Bake (Stage 1, `steam_path_create`).** A probe grid spans the layout (+margin) at mean speaker
   height, using the SAME OBB-transform convention learned for reflections (centre in the translation
   column, radius from the basis lengths — see above). `iplPathBakerBake` writes the probe-to-probe
-  visibility graph. The pathing sim's `IPLSimulationSettings.maxOrder` MUST be set to the path order
-  or the path field is silently capped to order-0 (omni, no direction) — the one gotcha unique to
-  pathing. The `path` test proves a route bends around a wall AND that the recovered shCoeffs point
-  the right way (−X toward the source, +Z out the opening).
+  visibility graph. Set the pathing sim's `IPLSimulationSettings.maxOrder` to the path order: if you
+  don't, the path field is silently capped to order-0 (omni, no direction). The `path` test proves a
+  route bends around a wall AND that the recovered shCoeffs point the right way (−X toward the
+  source, +Z out the opening).
 - **Render (Stage 2).** A 10 Hz sim thread runs pathing per opted-in source and publishes each one's
   `IPLPathEffectParams.shCoeffs` (+ the normalized bending-loss `eqCoeffs`, below) to rt.c via
   `rt_set_pathing` (handle-gated, double-buffered). In the mixer, a pathing voice SH-encodes its
@@ -540,5 +504,5 @@ same low-shelf/peak/high-shelf biquad cascade the occlusion EQ uses, to the **un
 then scale each SH channel). It's ramped per sample (invariant 4) and bypassed while flat, so a
 path with no occluder to bend around costs nothing and is byte-identical to the pre-EQ render. The
 `rt` test asserts a non-flat tilt colours the encoded field (a DC source through `{0.5,1,1}` lands
-the accumulator at `0.5·shCoeffs`, the RBJ low-shelf DC gain). It only pays off where the space has
-real occluders to bend sound around — the audible payoff is best heard at the rig.
+the accumulator at `0.5·shCoeffs`, the RBJ low-shelf DC gain). Pathing only does anything where the
+scene has real occluders to bend sound around; judge it by ear at the rig.

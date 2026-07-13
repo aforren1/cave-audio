@@ -229,8 +229,8 @@ BW_API void     bw_reflections_set_gain(BwEngine* e, float linear);
  * A phonon-free late-reverb alternative to the Steam reflection bed: a 16-line feedback delay
  * network whose lines are rendered as plane waves through the layout's SH->26 bed decode, fed by
  * the SAME mono aux send (bw_source_set_reflections + the per-source send levels apply unchanged).
- * The decay is a DESIGN parameter — set what the content wants, don't match the real room (that
- * double-counts; docs/calibration.md). Decay can be ANISOTROPIC: scale the decay time toward a
+ * The decay is a DESIGN parameter: set what the content wants. Don't copy the room's measured RT60 —
+ * the real room adds its own decay on top (docs/calibration.md). Decay can be ANISOTROPIC: scale the decay time toward a
  * direction (factor < 1 = the field dies faster that way — an open or treated side), the diagonal
  * special case of the Directional FDN (Alary/Politis/Schlecht, JAES 2019). Enabling it takes the
  * reverb tap INSTEAD of the Steam bed (one reverb bed at a time); works in no-SDK builds — the

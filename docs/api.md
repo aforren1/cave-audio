@@ -160,9 +160,8 @@ What actually comes back today:
 - A bad `layout_path` or `hrtf_path` does **not** fail `bw_start`. The engine degrades —
   default speaker grid, simple-pan monitor — and records why in `bw_last_error`.
 
-The consequence of that last point: if your session depends on the surveyed layout or a SOFA
-HRTF, read `bw_last_error` after a *successful* `bw_create`/`bw_start` to confirm they
-actually loaded.
+So if your session depends on the surveyed layout or a SOFA HRTF, read `bw_last_error` after a
+*successful* `bw_create`/`bw_start` to confirm they actually loaded.
 
 Per-frame `void` calls (`bw_source_set_pos`, `bw_commit`, …) never report errors — they only
 enqueue onto the command ring. A full ring drops the command silently, but the ring is sized
@@ -191,8 +190,8 @@ ray tracer — faster, and the lever to pull if you raise scene complexity, ray 
 high probe density. It is **opt-in and safe**: if the linked `phonon` was not built with Embree
 (or the Embree/TBB runtime is missing), the engine logs that Embree is unavailable and falls back
 to the default tracer — no failure. The scene is created once and both sims share it, so the flag
-applies to occlusion and reflections together. **Note:** the vendored prebuilt `phonon.dll` is not
-Embree-enabled (the flag currently falls back); to activate it, drop in a `phonon` built with
+applies to occlusion and reflections together. The vendored prebuilt `phonon.dll` is **not**
+Embree-enabled, so the flag currently falls back; to activate it, drop in a `phonon` built with
 Embree (the SDK's `STEAMAUDIO_ENABLE_EMBREE` path) and ship `embree4.dll` + `tbb*.dll` alongside.
 
 ## Assets (control thread, file I/O)
@@ -299,10 +298,10 @@ void bw_set_master_gain(BwEngine* e, float linear);   // one ramped scalar over 
 void bw_set_paused(BwEngine* e, bool paused);         // pause EVERYTHING (ramped, playheads freeze); live
 ```
 
-`bw_set_master_gain` is the volume knob / scene-fade the API previously lacked: it scales
-everything mixed — voices, beds, the reverb/pathing taps — **before** the per-speaker align stage
-(so trims and the raw channel-test signal stay calibrated) and before the limiter (which still
-guards the sum). Ramped per block; dragging a slider never zippers. `bw_set_paused` is app-focus /
+`bw_set_master_gain` is the volume knob / scene fade: it scales everything mixed — voices, beds,
+the reverb/pathing taps — **before** the per-speaker align stage (so trims and the raw channel-test
+signal stay calibrated) and before the limiter (which still guards the sum). Ramped per block;
+dragging a slider never zippers. `bw_set_paused` is app-focus /
 menu pause: every voice gates out with the per-voice pause machinery (memory, streamed, and bed
 alike), playheads freeze, resume continues exactly, and paused voices still read as *playing*.
 
@@ -376,7 +375,7 @@ do not call this — the core samples the freshest OptiTrack pose at block time.
 With `track_internal = true` the core ingests OptiTrack/NatNet pose itself and samples the
 freshest head pose on the **audio thread at block time** — lower latency than pushing pose
 through the command ring — overriding any `bw_set_listener_pose`. The NatNet specifics are
-configured by environment variable (kept out of `BwConfig` so the ABI stays stable):
+configured by environment variable:
 
 | Variable                      | Default         | Meaning                                       |
 |-------------------------------|-----------------|-----------------------------------------------|
@@ -445,9 +444,7 @@ void bw_commit(BwEngine* e);
 
 Call once per frame after pushing all source and listener updates. It promotes this
 frame's position/pose to a coherent snapshot (so the audio thread never mixes a
-moved listener against a not-yet-moved source) and drains the event ring. For
-independent point sources the tearing avoided by commit is often inaudible, but for
-the moving-observer case — where listener and sources update together — it matters.
+moved listener against a not-yet-moved source) and drains the event ring.
 
 ## Materials & scene geometry (control thread; load-time)
 
@@ -716,9 +713,8 @@ construction, fast enough to track a walking listener.
 This is the moving-listener answer to the static `room_eq`, which `bw_start` rejects for moving
 sessions. It works because the room's mode *frequencies* don't move with the listener — only how
 strongly each mode reads at a position — so one per-speaker fc/Q ladder plus per-position depths
-interpolate safely. Mid/HF room correction deliberately stays out of the tracked path: it's
-position-sensitive at the centimetre scale, the same trap as room-EQing a roaming listener from
-one mic point ([`calibration.md`](./calibration.md)).
+interpolate safely. Mid/HF room correction stays out of the tracked path: it is position-sensitive
+at the centimetre scale ([`calibration.md`](./calibration.md)).
 
 The switch is the live kill switch (off glides every cut to flat — a clean A/B). It's a no-op for
 layouts without a grid.
@@ -796,8 +792,7 @@ wave through the layout's SH→26 bed decode. `bw_fdn_set_decay` sets a two-band
 1.2 s low / 0.7 s high @ 2 kHz). `bw_fdn_set_decay_direction` makes the decay **anisotropic** — the
 field dies faster (factor < 1) or slower toward a direction, the diagonal special case of the
 Directional FDN (Alary/Politis/Schlecht, JAES 2019). Use it to *design* a space (an open side, a
-treated wall); do **not** match the real room's RT60 — the real room adds its own decay on top
-([calibration.md](./calibration.md)).
+treated wall); do **not** match the real room's RT60 (see [calibration.md](./calibration.md)).
 
 Deterministic CPU (no rays, no IRs, infinite tail), works in no-SDK builds — the reverb path no
 longer requires the Steam Audio SDK.

@@ -1,9 +1,8 @@
 # Profiling (Tracy) & real-time scheduling
 
-The engine is instrumented for [Tracy](https://github.com/wolfpld/tracy) (pinned **v0.13.1**). It's
-opt-in, so the default build carries zero overhead. The instrumentation answers two questions: **are
-you inside the per-block time budget**, and **is anything (especially the ray-tracing sim threads)
-stealing time from audio**.
+The engine is instrumented for [Tracy](https://github.com/wolfpld/tracy) (pinned **v0.13.1**), opt-in.
+The instrumentation answers two questions: **are you inside the per-block time budget**, and **is
+anything (especially the ray-tracing sim threads) stealing time from audio**.
 
 ## Build
 

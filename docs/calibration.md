@@ -42,14 +42,13 @@ automatically.
   (arrival-align every speaker to the farthest) and `gain_db` (equalize sensitivity, with the
   speaker→mic distance divided out so it corrects the *speaker*, not distance; cut-only so nothing
   clips).
-- **`--room`** — RT60 (Schroeder) + early reflections from the captured IRs. **A treatment
-  diagnostic, not a model to match.** Matching the engine's reverb to the room would *double-count*:
-  the engine renders the virtual room AND the real room adds its own. What it tells you: how live
-  the room is — the **floor** on what you can render, since you can't reproduce a space deader than
-  your room — and which nearby surfaces throw early reflections that smear localization (treat
-  those). You cannot DSP the room away for a moving listener (reverb is non-invertible,
-  position-dependent), so the lever is physical treatment. The binaural monitor (headphones,
-  room-free) is the clean reference; comparing array-vs-monitor measures how much the room is adding.
+- **`--room`** — RT60 (Schroeder) + early reflections from the captured IRs. It measures **how live
+  your room is**. **Do not copy the measured RT60 into the engine's reverb settings.** The room's
+  own decay is a **floor**: you cannot render a space deader than the room you're in, and nearby
+  surfaces that throw early reflections smear localization. If the room is too live, **treat it
+  physically** — you cannot DSP reverb away for a moving listener (it is non-invertible and
+  position-dependent). The binaural monitor (headphones, room-free) is the clean reference;
+  comparing array-vs-monitor measures how much the room is adding.
 - **`--check`** — drift detector. One fast pass from the mic position; `calib_check_drift` compares
   each speaker's measured distance to its stored position (removing the common latency as the median
   residual, so it's robust to a few moved speakers) and flags anything beyond ~20 mm. Catches a
@@ -71,11 +70,11 @@ automatically.
   inverts that magnitude into a minimum-phase FIR (`measure_correction` → `calib_eq`). The filter
   flattens the **speaker's own** response.
 
-  It deliberately does NOT correct the room. Room response is position-dependent across the ~3×3 m
-  listening area, so a single-point room EQ over-fits one spot and makes the others worse — the same
-  double-counting trap as matching RT60. The inversion is regularized (deep nulls aren't fought) and
-  centred on the in-band geometric mean (the scalar `gain_db` trim still owns overall level). The
-  engine applies it as a per-speaker FIR stage in `align.c`, before the gain+delay.
+  It does NOT correct the room. Room response is position-dependent across the ~3×3 m listening
+  area, so a single-point room EQ over-fits one spot and makes the others worse. The inversion is
+  regularized (deep nulls aren't fought) and centred on the in-band geometric mean (the scalar
+  `gain_db` trim still owns overall level). The engine applies it as a per-speaker FIR stage in
+  `align.c`, before the gain+delay.
 
   With the Zylia you can gate by *direction* (keep the speaker's DOA, reject off-axis reflections)
   for a cleaner near-free-field correction than an omni gate; that's a follow-on.
@@ -97,9 +96,8 @@ automatically.
     (`gain_db <= 0` — the loader rejects boosts): peaks are modal energy you can remove; dips are
     position-dependent cancellations you cannot fill.
 
-  What no EQ fixes: **decay**. A ringing room still smears transients after its steady-state
-  coloration is flattened. That is what the `--room` report's RT60/early-reflection numbers are
-  for (treatment), and why `--room-eq` is correction at a point, not a room model to match.
+  What no EQ fixes: **decay**. A ringing room still smears transients once its steady-state
+  coloration is flattened. That stays a treatment problem — see `--room` above.
 
   The wrong-file mistake fails loudly: **`bw_start` refuses** a layout carrying `room_eq` sections
   when the session renders a moving listener (the DBAP panner and/or `track_internal`) — see
@@ -108,9 +106,9 @@ automatically.
 
 - **`--room-eq-grid`** — **tracked room EQ**: the moving-listener answer to `--room-eq`'s modal
   half (Lindfors/Liski/Välimäki, JAES 2022, adapted to the tracked CAVE). One point can't room-EQ a
-  roaming listener — but a **grid of points can**, because below ~200 Hz the room's mode
-  *frequencies* are fixed properties of the room; only how strongly each mode reads varies with
-  position, and that varies smoothly on the half-metre scale of LF wavelengths.
+  roaming listener; a **grid of points can**. Below ~200 Hz the room's mode *frequencies* are fixed
+  properties of the room — only how strongly each mode reads varies with position, and that varies
+  smoothly on the half-metre scale of LF wavelengths.
 
   Workflow: run once per mic placement — `--mic x y z` **is the grid key** (a rerun within 5 cm
   replaces that entry; up to 16 positions, `BW_RQ_GRID_MAX`). Cover the working area at ear height,
@@ -127,13 +125,11 @@ automatically.
   the live kill switch (off glides to flat) for A/B on the rig. Works with every panner; `bw_start`
   has no objection to a grid in a moving session — that's the point.
 
-  Deliberately **only** the 30–200 Hz modal band is tracked. The mid/HF room response
-  decorrelates over centimetres, so interpolating it between half-metre grid points would
-  manufacture corrections that are wrong almost everywhere — the `eq` FIR above stays the
-  direct-sound speaker correction for moving installs. And EQ still can't fix decay: the `--room`
-  report stays the treatment diagnostic. `room_eq` and `room_eq_grid` are mutually exclusive in
-  one layout file (the loader rejects both together; the grid writeback removes a stale static
-  `room_eq` for you).
+  **Only** the 30–200 Hz modal band is tracked: the mid/HF room response decorrelates over
+  centimetres, far too fast to interpolate between half-metre grid points. The `eq` FIR above stays
+  the direct-sound speaker correction for moving installs. `room_eq` and `room_eq_grid` are mutually
+  exclusive in one layout file (the loader rejects both together; the grid writeback removes a stale
+  static `room_eq` for you).
 
 ## Zylia ZM-1: full 3D from one placement
 
@@ -141,15 +137,15 @@ automatically.
 capsules on a rigid ~10 cm sphere, so a single placement already records each sweep arriving at 19
 slightly-different times — and the arrival-time **differences** across the sphere are a
 **direction**. A speaker's full position falls out of ONE Zylia placement: direction × distance +
-the array centre. This is the `--live` note's "for live 3D you'd need ≥4 fixed mics", delivered.
+the array centre.
 
 The solve (`zylia.c`, `zylia_doa` / `zylia_localize`, unit-tested off-hardware in the `zylia` test by
 synthesizing the 19 arrivals from a known position and recovering it to machine precision):
 
 - **Direction** — least-squares fit of the 19 arrivals to the far-field model `τ_i = A − (R/c)(dir_i·d)`,
   then a Gauss-Newton refine against the exact spherical wavefront. Latency-independent (uses the
-  differences), so it's precise — sub-degree given measure.c's sub-sample IR peak. This is the
-  headline: *where is every speaker, from one spot*, including the screen-hidden ones.
+  differences), so it's precise — sub-degree given measure.c's sub-sample IR peak, and it finds the
+  screen-hidden speakers too.
 - **Distance** — `c·(arrival − latency)`. The array is too small for the wavefront curvature across
   it to self-calibrate the latency at metres (sub-mm of differential delay), so feed a
   loopback-measured or `--localize`-recovered latency; then the distance is as good as that latency
@@ -169,8 +165,8 @@ arrivals to `zylia_localize`, and writes `cave_layout.json`. `--zylia --simulate
 arrivals from the layout and recovers every speaker position exactly, so the math + writeback are
 validated off-hardware; the two-device ASIO capture is the only unbuilt piece.
 
-One caveat baked into the code: the capsule geometry in `zylia_geometry` is a **placeholder** spread.
-Drop in the ZM-1 datasheet/surveyed capsule directions before trusting on-hardware DOA — the math is
+The capsule geometry in `zylia_geometry` is a **placeholder** spread. Drop in the ZM-1
+datasheet/surveyed capsule directions before trusting on-hardware DOA — the math is
 geometry-agnostic; only that table must match the real array.
 
 **Bring-up.** Before any of that, run the "is it talking?" checks the moment the ZM-1 is plugged in —
@@ -186,11 +182,10 @@ transient trigger, snapshot publish):
   capsule sphere where the clap came from (`zylia_tdoa`: onset + windowed cross-correlation against
   the strongest capsule with sub-sample parabolic peaks → `zylia_doa`). This verifies the capsule
   MAPPING and the GEOMETRY table in one gesture — swapped channels or a wrong geometry row put the
-  dot somewhere absurd, and you find out in seconds instead of during a calibration session. Its
-  simulate mode runs the identical snapshot→tdoa→doa→draw pipeline on synthesized claps (truth
-  marker drawn; "Clap now" for a deterministic one) — the hardware-free check of everything but the
-  ASIO capture. The math is unit-tested in the `zylia` ctest, and the whole tab is driven by the
-  `zylia/sim_doa` UI test in `calib_view`.
+  dot somewhere absurd. Its simulate mode runs the identical snapshot→tdoa→doa→draw pipeline on
+  synthesized claps (truth marker drawn; "Clap now" for a deterministic one) — the hardware-free
+  check of everything but the ASIO capture. The math is unit-tested in the `zylia` ctest, and the
+  whole tab is driven by the `zylia/sim_doa` UI test in `calib_view`.
 
 ## Reviewing the results (`bw_calib_view`)
 

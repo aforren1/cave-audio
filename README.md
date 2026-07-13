@@ -67,11 +67,11 @@ in one process behind one audio callback.
 
 ## Recommended settings per setup
 
-The defaults target the CAVE: **one tracked listener roaming the array.** Change setup
-and the right settings change with it — mostly because a *sweet spot* either exists or
-doesn't. These are starting points, not laws; the playground's blind A/B/X harness is
-there so you can check by ear instead of taking our word. The calibration commands
-behind the last row are under [One array, several audiences](#calibrate--bw_calib_view).
+The defaults target the CAVE: **one tracked listener roaming the array.** Change the
+setup and the right settings change with it — mostly because a *sweet spot* either
+exists or it doesn't. These are starting points; A/B them by ear in the playground.
+The calibration commands behind the last row are under
+[One array, several audiences](#calibrate--bw_calib_view).
 
 | | **tracked roamer** (the CAVE) | **fixed seat** (one chair) | **audience** (several people) | **desk** (headphones) |
 |---|---|---|---|---|
@@ -82,9 +82,9 @@ behind the last row are under [One array, several audiences](#calibrate--bw_cali
 | calibration | `--eq` + `--room-eq-grid` | `--eq` + `--room-eq` at the seat | `--eq` only | `--eq` |
 | bed decoder | AllRAD if the array is irregular | sampling | AllRAD | either |
 
-**Tracked roamer.** DBAP is listener-relative and re-solves every block, so it degrades
-gracefully as you walk — that is the whole point of it. Leave dual-band and VBAP off:
-both sharpen the image *at a sweet spot* and there isn't one. For room correction use the
+**Tracked roamer.** DBAP is listener-relative and re-solves every block, so the image
+follows you instead of degrading away from a centre. Leave dual-band and VBAP off:
+both sharpen the image *at a sweet spot*, and there isn't one. For room correction use the
 grid (`bw_calibrate --room-eq-grid`, one run per mic position); the engine interpolates
 the LF cuts at your live position and glides the biquads. `bw_set_pose_prediction` (start
 ~20–40 ms, your measured motion-to-ears latency) hides the panning lag; `bw_set_decorrelation`

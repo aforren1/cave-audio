@@ -21,8 +21,8 @@ boundary:
 - **Unity** is left-handed, +Y up, +Z forward. Up and forward already agree, so the
   baseline conversion is a single axis flip: negate X (Unity identity rotation maps
   to room identity). Then apply the CAVE registration matrix that maps Unity world →
-  room/Motive origin. Motive's ground plane is calibrated to deck center, so the
-  real mapping lives in that matrix — the bare X-negation is only the handedness part.
+  room/Motive origin. Motive's ground plane is calibrated to deck center, so the real
+  mapping lives in that matrix — the bare X-negation is only the handedness part.
 - **Unreal** is left-handed, Z-up, centimeters. Convert to room meters and apply the
   registration matrix the same way.
 
@@ -142,9 +142,8 @@ public static class Room {
 Centralize the push in the manager. Do not let each emitter push in its own
 `LateUpdate`: Unity does not guarantee `LateUpdate` order across components, so
 per-emitter pushes risk committing a frame where the listener moved but some
-sources hadn't. The manager pushes all sources, then the listener, then commits.
-Every block the audio thread sees is internally consistent — that is what makes
-the moving-observer case correct.
+sources hadn't. The manager pushes all sources, then the listener, then commits,
+so every block the audio thread sees is internally consistent.
 
 ```csharp
 [DefaultExecutionOrder(-100)]

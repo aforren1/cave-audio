@@ -37,8 +37,7 @@ binaural playground: `bw_playground cave_layout.json`.
 **Scoring, constraints, and auto-optimization.** The tool can also *evaluate* and
 *improve* a layout for a chosen panner. Press **X** (or run `--score <file>`) to print
 each panner's rE-localization error — mean + worst over a direction shell × the
-working-volume listener grid, via `bw_panner_gains_batch`. That is the same solve that
-ships, so the score reflects reality.
+working-volume listener grid, via `bw_panner_gains_batch` (the same solve that ships).
 
 Drop a **`constraints.json`** next to the layout (see `examples/constraints.json`) to
 declare where speakers may go:
@@ -197,8 +196,3 @@ Everything else in the file survives: unknown fields, per-speaker annotations, t
 `reference` block, `note` strings. You can annotate a layout freely and recalibrate
 without losing it. JSON has no comments, so keep annotations as extra string fields
 (like `note`) — those round-trip.
-
-> The `26` is currently fixed by the array. If the array size ever becomes configurable,
-> it moves from a hard constant to a value derived from `speakers.length` — but that is out
-> of scope for the current build (see the channel-count decision in
-> [`architecture.md`](./architecture.md)).

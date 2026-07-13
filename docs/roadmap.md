@@ -9,22 +9,20 @@ engines. Don't start with the engine bindings.
 - `include/bwaudio.h` compiles; stub `engine.c` returns a valid opaque handle.
 - **Done when:** library builds and links on the target Windows toolchain.
 - **Status: ✅ done.** `CMakeLists.txt` builds `bwaudio.dll` from a stub `src/engine.c`
-  with a passing `test_smoke` lifecycle test (MSVC 19.4x / VS2022). `third_party/` was
-  wired in CMake up front; vendoring waited until M1 actually needed ASIO.
+  with a passing `test_smoke` lifecycle test (MSVC 19.4x / VS2022).
 
 ## M1 — ASIO sink, silence
 - `asio_sink.cpp`: driver load → `ASIOCreateBuffers` → `ASIOStart`, writing 26 channels
   of silence to DVS. Capture the sample-position/`systemTime` timestamp.
 - **Done when:** DVS shows 26 active output channels and a stable callback with no
   dropouts; timestamp advances monotonically.
-- **Status: ~done, pending DVS hardware.** The code is done; the Dante endpoint isn't
-  verified. A device-sink seam (`src/sink.h`) keeps ASIO isolated. `asio_sink.cpp`
-  implements the full bring-up against the vendored ASIO SDK and compiles, links, and
-  runs: driver load → init → channel-count check → graceful fallback, verified on real
-  (non-DVS) hardware. A `null_sink.c` offline backend runs the same render loop with no
-  hardware and discharges the stable-callback + monotonic-timestamp criterion
-  (`test_audio_sink`). The remaining piece — *26 active channels in DVS with no
-  dropouts* — needs a Dante Virtual Soundcard endpoint on site.
+- **Status: ~done, pending DVS hardware.** A device-sink seam (`src/sink.h`) keeps ASIO
+  isolated. `asio_sink.cpp` implements the full bring-up against the vendored ASIO SDK
+  and compiles, links, and runs: driver load → init → channel-count check → graceful
+  fallback, verified on real (non-DVS) hardware. A `null_sink.c` offline backend runs the
+  same render loop with no hardware and discharges the stable-callback +
+  monotonic-timestamp criterion (`test_audio_sink`). **Remaining:** *26 active channels
+  in DVS with no dropouts* — needs a Dante Virtual Soundcard endpoint on site.
 
 ## M2 — Concurrency spine
 - Two SPSC rings, the voice table, `drain_commands`, the commit snapshot, generation
@@ -38,12 +36,9 @@ engines. Don't start with the engine bindings.
   handles + free-list, and the event ring. The full `bw_source_*` /
   `bw_set_listener_pose` / `bw_commit` API forwards to it. `test_rt` drives the consumer
   off the RT path and verifies the commit snapshot, generation stale-drop, play/stop,
-  gain scaling, and position routing. The mixer here was a placeholder — a 440 Hz tone
-  routed to one position-derived channel with a per-block gain ramp; M3 swapped in wav
-  playback (`mix_voice` reading `sound->pcm`) and M4 the DBAP 26-gain solve. Remaining:
-  the ThreadSanitizer/Helgrind pass needs a Clang/Linux build (MSVC has no TSan) — see
-  `docs/build.md`. The `bw_play_oneshot` / `EVT_VOICE_ENDED` natural-end recycle path
-  landed with M3.
+  gain scaling, and position routing. **Remaining:** the ThreadSanitizer/Helgrind pass
+  needs a Clang/Linux build (MSVC has no TSan) — see `docs/build.md`. The
+  `bw_play_oneshot` / `EVT_VOICE_ENDED` natural-end recycle path landed with M3.
 
 ## M3 — wav + voice mixing
 - `sound.c` (dr_wav load, buffer lifetime, retire-ack), `mix_voice` with gain ramp.
@@ -55,10 +50,10 @@ engines. Don't start with the engine bindings.
   sound handles, and the full retire-ack handshake (`bw_unload_sound` →
   `CMD_SOUND_RETIRE` → audio detaches voices + acks `EVT_SOUND_RETIRED` → control frees
   the buffer). `mix_voice` reads `sound->pcm` at the cursor (loop/end), and a oneshot
-  recycles its transient voice via `EVT_VOICE_ENDED`. Routing stayed the M2 placeholder
-  until M4. `test_sound` verifies multi-voice mixing, natural end, oneshot recycle, and
-  unload-while-playing — and passes clean under AddressSanitizer (`-DBWAUDIO_ASAN=ON`),
-  discharging the no-use-after-free criterion.
+  recycles its transient voice via `EVT_VOICE_ENDED`. `test_sound` verifies multi-voice
+  mixing, natural end, oneshot recycle, and unload-while-playing — and passes clean
+  under AddressSanitizer (`-DBWAUDIO_ASAN=ON`), discharging the no-use-after-free
+  criterion.
 
 ## M4 — DBAP + layout + alignment
 - `layout.c` (load surveyed geometry; per-speaker gain/delay), `dbap.c`
@@ -106,16 +101,16 @@ engines. Don't start with the engine bindings.
     `iplContextCreate → iplHRTFCreate → iplAmbisonicsDecodeEffectApply` path each
     block, and the `steam_decode` ctest asserts gross laterality (right→right ear,
     left→left, 180° flips).
-  - **Convention resolved + unit-tested** (`test_ambi` vs phonon's hardcoded SH
-    constants): phonon decodes orthonormal/N3D real SH, so the SN3D encode is scaled
-    by `ambi_phonon_scale = sqrt(2l+1)/sqrt(4pi)`; axes + orientation match phonon as
+  - **Convention** (`test_ambi` vs phonon's hardcoded SH constants): phonon decodes
+    orthonormal/N3D real SH, so the SN3D encode is scaled by
+    `ambi_phonon_scale = sqrt(2l+1)/sqrt(4pi)`; axes + orientation match phonon as
     written. phonon's effect frameSize is fixed at create, so the decoder is built at
     the sink's actual block size (`bw_sink_block_size`).
   - **Remaining:** the by-ear check on headphones (any free 2-ch ASIO driver). The
     playground (`bw_playground`) is the by-ear bench.
-  - **Optional:** a dedicated WASAPI stereo backend. Live headphone output already
-    works through any 2-ch ASIO driver (ASIO4ALL / FlexASIO / the Steinberg built-in),
-    so this is a convenience, not a blocker.
+  - **Optional:** a dedicated WASAPI stereo backend — a convenience, not a blocker.
+    Live headphone output already works through any 2-ch ASIO driver (ASIO4ALL /
+    FlexASIO / the Steinberg built-in).
 
 ## M6 — OptiTrack ingest
 - `natnet.c`: off-wire NatNet consumer; `track_internal` path samples freshest pose

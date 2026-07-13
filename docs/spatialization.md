@@ -14,17 +14,15 @@ reason: it works directly from speaker and source **positions**. It degrades
 gracefully when the listener is off-center instead of assuming a listener fixed at
 the array origin.
 
-> **Fixed-observer installs are a supported mode — and some deployments want it
-> immediately.** The case above is the *moving*, tracked listener. A simpler install
-> that seats the audience at one fixed spot is equally valid, and the engine already
-> serves it with no extra machinery:
+> **Fixed-observer installs are a supported mode.** The case above is the *moving*,
+> tracked listener. An install that seats the audience at one fixed spot needs no
+> extra machinery:
 >
 > - **Don't enable tracking.** Set the listener once to the sweet spot, or leave the
 >   pose unset — the engine defaults it to the array centroid, the nominal listening
 >   point (the origin sits on the floor).
-> - **DBAP is position-based**, so it pans correctly for that fixed point. This
->   already beats an origin-only ambisonic decode for an off-centre seat, because
->   DBAP uses the *actual* listening position.
+> - **DBAP is position-based**, so it pans correctly for that fixed point — using the
+>   *actual* listening position, unlike an origin-only ambisonic decode.
 > - **The layout tool's coverage overlay scores this case directly** (its `V` key
 >   picks fixed-centre vs moving-volume), so you can optimize a layout for the
 >   observer model your install uses.
@@ -50,11 +48,9 @@ the array origin.
 > back to DBAP for a non-triangulable array. SPCAP stays the recommended
 > fixed-observer default (smoother, robust on the irregular surveyed array); pick
 > VBAP when pinpoint localization at the sweet spot is the priority. It shares the
-> convex-hull + VBAP solve (`hull.c`) with AllRAD's decode. VBAP is also the
-> theoretically-optimal *sparse* panner: with non-negative gains, the ℓ1-optimal
-> speaker-gain solution is exactly VBAP over a Delaunay triangulation (Franck,
-> Wang & Fazi 2017, IEEE TASLP) — there is no sparser panner to upgrade to, only
-> different trade-offs.
+> convex-hull + VBAP solve (`hull.c`) with AllRAD's decode. VBAP is the optimal
+> *sparse* panner: with non-negative gains, the ℓ1-optimal speaker-gain solution is
+> exactly VBAP over a Delaunay triangulation (Franck, Wang & Fazi 2017, IEEE TASLP).
 
 Ambisonics is still the right tool for the **diffuse layer** (ambient beds,
 reflections/reverb). Diffuse energy isn't sweet-spot-sensitive, so a fixed decode is
@@ -73,7 +69,7 @@ Inputs:
 - `layout` — the 26 surveyed speaker positions (room space), loaded from
   `layout_path`.
 
-Sketch (listener-relative DBAP):
+The solve (listener-relative DBAP):
 1. For each speaker `k`, compute the distance from the source as heard from the
    listener. The listener-aware form weights the source→speaker geometry referenced
    to the listener position, so off-center listeners get a correct distribution
@@ -105,8 +101,7 @@ For each speaker `k` (positions in room space):
 The result: a source *at* a speaker localizes to that speaker (smallest `d_k`,
 `dir_k ≈ 1`), two speakers split a source between them, the total power is
 `user_gain·atten` regardless of position, and the distribution shifts as the
-listener moves. The exponents, `r`, and the curve are tuning knobs to dial against
-the real array. This is a first cut, not a final psychoacoustic model.
+listener moves.
 
 > Implementation note: keep the math in `dbap.c` pure and listener-position-driven.
 > A listener move dirties every voice (concurrency.md), so this runs for all active
@@ -148,10 +143,6 @@ hears an image biased toward their own solve instead of one exact and the rest
 wrong. Spread direction, Doppler, air absorption, the reverb-send distance, and the
 binaural monitor stay primary-relative. Panner-agnostic, block-rate, one extra
 point solve per listener per dirty voice.
-
-The layout tool's coverage scoring is the design-time complement: it can already
-score a layout for a fixed centre vs a moving volume; the compromise mode is the
-runtime answer when several tracked-or-known heads share the room.
 
 ## Gain ramping
 
@@ -234,8 +225,7 @@ modes sit behind `bw_set_spread_mode` (an atomic live A/B, like the panner switc
 
 Either mode still feeds every speaker the **same signal** — coherent copies, which
 collapse to phantom images and comb-filter *position-dependently* as the tracked
-listener walks (the artifact a CAVE occupant actually notices).
-**`bw_set_decorrelation`** (off by default, live A/B) splits a spread source's
+listener walks. **`bw_set_decorrelation`** (off by default, live A/B) splits a spread source's
 energy: the coherent share takes the normal path, the rest routes through a
 per-speaker **sparse velvet-noise filter bank** (`rt.c`, ~30 signed taps jittered
 over 30 ms with an exponential envelope, unit energy — Välimäki et al.'s
@@ -253,10 +243,9 @@ the selected spread mode and the decorrelators. Sources flying through the room 
 the common CAVE case this exists for.
 
 **Metric source size** (`bw_source_set_size`, radius in meters, 0 = point) is the
-physical parametrization of the same machinery (the extent-primitive idea from
-Embody's volumetric-panning writeup, grafted onto the engine's listener-relative
-solve): the spread is floored at the angle the radius subtends from the tracked
-listener, `asin(r/d)/(π/2)`, capped at 1 when the listener is inside the source. A
+physical parametrization of the same machinery: the spread is floored at the angle
+the radius subtends from the tracked listener, `asin(r/d)/(π/2)`, capped at 1 when
+the listener is inside the source. A
 2 m waterfall therefore *stays* 2 m wide as the listener walks — an angular spread
 would change physical size with distance — and a sized source subsumes the
 near-listener policy (engulfment = the `d < r` case). The larger of spread and the
@@ -294,10 +283,9 @@ Two convention details in the implemented encode matrix:
   `ambisonics.c`).
 - **m<0 sign.** phonon's real-SH m<0 channels have the opposite sign to the
   engine's encode, so ACN channels 1, 4, 5, 9, 10, 11 are negated (`SH_M_NEG`,
-  `steam_decode.c`). Getting this wrong inverted left/right in the decoded
-  stereo. `test_ambi` only checked the m≥0 channels against phonon's constants, so
-  it couldn't see it; the `steam_decode` laterality test (right source → right ear,
-  180° flips) caught it. If you touch either convention, run that test.
+  `steam_decode.c`). The sign must match or left/right invert. If you touch either
+  convention, run the `steam_decode` laterality test (right source → right ear, 180°
+  flips) — `test_ambi` only checks m≥0 and will not catch it.
 
 **Ambisonic order:** default to **3rd order (16 channels, 3D)** for the
 encode/decode. This is the sweet spot for a 26-speaker array: order `N` uses
@@ -307,8 +295,7 @@ purpose; 1st–2nd order (4–9 ch) noticeably blurs the directionality the arra
 there to reproduce. Expose the order as a config/build knob (alongside `r` and the
 distance curve) so it can be traded against CPU on the monitor path, but 3rd order
 is the baseline. The decode cost is fixed by the order, **independent of the source
-count** — that is the whole point of going through ambisonics rather than
-per-source HRTF.
+count** — the reason the monitor goes through ambisonics rather than per-source HRTF.
 
 A second optional mode binauralizes the **sources directly**, bypassing the panner.
 Use it to isolate whether a problem is in tracking/positioning or in the decode. The
@@ -368,9 +355,8 @@ isotropic). Two streams render per band:
 
 - **direct** (`√(1−ψ)`): the W signal, panned through the engine's own
   **listener-relative panner** at a virtual source on the array shell
-  (`ref + R·doa`). This is the payoff and the twist no stock DirAC gives: the
-  direct stream re-pans *per listener position*, so a recorded soundfield becomes
-  **walkable** — correct directions and parallax off-centre.
+  (`ref + R·doa`). The direct stream re-pans *per listener position*, so a recorded
+  soundfield becomes **walkable** — correct directions and parallax off-centre.
 - **diffuse** (`√ψ`): the FOA band decoded through the bed matrix into the
   **velvet-noise decorrelators** — envelopment from incoherent speaker feeds, not
   26 correlated copies.
@@ -391,9 +377,9 @@ direction and rendered as a plane wave through the same SH→26 bed decode, and 
 per-line decay time scales with direction (`bw_fdn_set_decay_direction`) —
 **anisotropic decay**, the diagonal direction-domain case of the Directional FDN
 (Alary/Politis/Schlecht, JAES 2019). Deterministic CPU, infinite tail, no rays or
-IRs; the decay is a *design* parameter (never match the measured room — that
-double-counts, see calibration.md). The `fdn` test pins RT60 landing, the two-band
-split, anisotropy, and stability.
+IRs. The decay is a *design* parameter: don't set it from the room's measured RT60 —
+the real room adds its own reverb on top ([calibration.md](./calibration.md)). The
+`fdn` test pins RT60 landing, the two-band split, anisotropy, and stability.
 
 ## Steam Audio usage
 
@@ -401,11 +387,11 @@ Via the **C API**, not the Unity/FMOD integration. Relevant pieces:
 - `IPLSpeakerLayout` with `IPL_SPEAKERLAYOUTTYPE_CUSTOM` — the array as unit-length
   speaker directions. The integrations don't expose custom layouts; the C API does.
 - Ambisonics encode + ambisonics→binaural decode for the monitor path.
-- Later, optionally: the Direct Effect (occlusion, distance attenuation, air
-  absorption) feeding the per-source path, and reflections/reverb as a diffuse
-  ambisonic bed decoded to the 26 array. These reuse the already-linked dependency.
+- The Direct Effect (occlusion + transmission) on the per-source path, and
+  reflections/reverb as a diffuse ambisonic bed decoded to the 26 array — see
+  [materials.md](./materials.md).
 
 Steam Audio's own custom-layout **panning** is a simpler projection law than
-VBAP/DBAP and is angular/center-listener. It is fine for the binaural
-virtual-speaker encode but is *not* the array panner. The array panner is our own
-listener-relative DBAP, for the moving-observer reasons above.
+VBAP/DBAP and is angular/center-listener. Use it for the binaural virtual-speaker
+encode; it is *not* the array panner. The array panner is the engine's own
+listener-relative DBAP.
