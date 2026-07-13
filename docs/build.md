@@ -198,18 +198,31 @@ distribution channel:
   same directory — keep the pair together. The CMake post-build step and the Unity
   plugin staging both copy it for you. Only a no-SDK build is self-contained (with
   the simple-pan binaural fallback and acoustics calls as no-ops).
+- **Two audiences, two artifacts.** Every run uploads them separately — the engine
+  (`bwaudio-win64-r<N>`: dll/lib/pdb + phonon + tools + header) and the Unity package
+  (`unity-package-r<N>`: one `.tgz`) — so downloading one no longer drags in the other.
 - **The Unity package is packed every run, and released on a tag.**
   `tools/upm/pack.ps1` produces `com.brainworks.bwaudio-<version>.tgz` — the C#
   binding with both DLLs inside it — so a broken package (a missing `.meta`, a lost
-  plugin) fails the *build*, not a release. A `v*` tag then cuts a GitHub Release with
-  that tarball attached, and **the Release is the publish**: OpenUPM tracks the repo in
-  `githubRelease` mode, matches the tag, and serves the attached `.tgz` unchanged — so
-  there is no registry push, **no token, no secret**. Users run
-  `openupm add com.brainworks.bwaudio`, or download the tarball and use "Install
-  package from tarball". Same artifact either way, under the same GPLv3 terms as the
-  engine artifact: a Unity app that ships this DLL to third parties inherits GPLv3
-  (see the ASIO section). The tag must match `bindings/unity/package.json`, or the
-  pack fails.
+  plugin) fails the *build*, not a release. A `v*` tag then cuts a GitHub Release, and
+  **the Release is the publish**: OpenUPM tracks the repo in `githubRelease` mode,
+  matches the tag, and serves the attached `.tgz` unchanged — so there is no registry
+  push, **no token, no secret**. Users run `openupm add com.brainworks.bwaudio`, or
+  download the tarball and use "Install package from tarball". The tag must match
+  `bindings/unity/package.json`, or the pack fails.
+- **A release carries TWO assets**, because workflow artifacts expire (30 days) and a
+  release doesn't:
+  - `com.brainworks.bwaudio-<ver>.tgz` — the Unity package.
+  - `bwaudio-win64-<tag>.zip` — the engine itself: `bwaudio.dll`/`.lib`/`.pdb` +
+    `phonon.dll`, `bwaudio.h`, and the tools. This is the durable download for a C/C++
+    consumer or the CAVE machine.
+
+  The engine bundle **must stay a `.zip`**. OpenUPM expects exactly *one* publishable
+  `.tgz`/`.tar.gz` on the release and takes it unconditionally, so a second tarball
+  would make it ambiguous which one is the package. Both assets ship under GPLv3 (the
+  `.zip` carries `LICENSE`, `THIRD_PARTY-NOTICES.md` and `DIST.txt`, which names the
+  commit and links the complete source; the `.tgz` carries the same inside it): an app
+  that ships this DLL to third parties inherits GPLv3 — see the ASIO section.
 
   Three constraints worth knowing before changing any of this:
 

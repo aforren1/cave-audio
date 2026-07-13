@@ -101,8 +101,13 @@ download.
 
 To cut a release: bump `version` in `package.json` (+ the CHANGELOG), then push a matching tag
 (`v0.2.0`). CI packs on *every* run — so a broken package fails the build rather than the release — and
-on a tag it creates the Release with the tarball attached. **The pack fails if the tag and the manifest
-disagree**, so a tarball can't claim a version it isn't.
+on a tag it creates the Release. **The pack fails if the tag and the manifest disagree**, so a tarball
+can't claim a version it isn't.
+
+A release carries **two** assets: this package (`com.brainworks.bwaudio-<ver>.tgz`) and the engine on
+its own (`bwaudio-win64-<tag>.zip` — dll/lib/header/tools, for C/C++ consumers and the CAVE machine).
+The engine one **must stay a `.zip`**: OpenUPM takes the single publishable `.tgz` on the release
+unconditionally, so a second tarball would make it ambiguous which is the package.
 
 Locally:
 

@@ -213,7 +213,8 @@ jobs:
 
       # The Unity package. Packed on EVERY run (not just tags) so a broken package - a missing .meta,
       # a version/tag mismatch, a tarball that somehow lost its DLLs - fails the build rather than the
-      # release. The .tgz lands in dist/, so it rides along in the workflow artifact below too.
+      # release. It goes in its OWN folder (dist/unity), because engine consumers and Unity consumers
+      # want different things and the release below ships them as separate assets.
       - name: Pack UPM package
         shell: pwsh
         env:
@@ -223,43 +224,73 @@ jobs:
           # package folder (last config wins), so packing without it would ship the Debug engine.
           # NB: splat a HASHTABLE, not an array. Array splatting binds POSITIONALLY, so '-PluginsFrom'
           # would land in $Version and the trailing value would have no parameter left to bind to.
-          $a = @{ PluginsFrom = 'build/RelWithDebInfo'; OutDir = 'dist' }
+          $a = @{ PluginsFrom = 'build/RelWithDebInfo'; OutDir = 'dist/unity' }
           if ($env:TAG) { $a.Version = $env:TAG }           # tag must match package.json, or this fails
           ./tools/upm/pack.ps1 @a
 
-      - name: Upload artifact
+      # Two artifacts, not one bag: the engine (native consumers - the C ABI, the tools, the CAVE
+      # machine) and the Unity package (a single .tgz). Downloading one no longer drags in the other.
+      - name: Upload artifact (engine + tools)
         uses: actions/upload-artifact@v6
         with:
           name: bwaudio-win64-r${{ github.run_number }}
-          path: dist/
+          path: |
+            dist/
+            !dist/unity/**
+          retention-days: 30
+          if-no-files-found: error
+
+      - name: Upload artifact (Unity package)
+        uses: actions/upload-artifact@v6
+        with:
+          name: unity-package-r${{ github.run_number }}
+          path: dist/unity/
           retention-days: 30
           if-no-files-found: error
 
       # ---- release (tags only) -------------------------------------------------------------------
-      # ONE artifact, two ways to consume it. The Release IS the publish: OpenUPM's `githubRelease`
-      # tracking mode discovers the tag, finds the Release whose tag matches, and serves the attached
-      # .tgz UNCHANGED - so there is no registry push here, no token, and nothing to rotate. The same
-      # file is also the manual "Install package from tarball..." download for anyone who would rather
-      # not add a registry at all.
+      # TWO assets, because there are two audiences and they want different bytes:
       #
-      # Two rules OpenUPM imposes, both already satisfied: the git tag must match package.json (the
-      # pack step above FAILS otherwise), and the Release must carry exactly ONE publishable .tgz. If
-      # a second tarball is ever attached here, set githubReleaseAssetName in the OpenUPM package
-      # config to the stable prefix `com.brainworks.bwaudio-`.
+      #   com.brainworks.bwaudio-<ver>.tgz   the Unity package (C# + the two DLLs, import settings set)
+      #   bwaudio-win64-<tag>.zip            the engine itself: dll/lib/pdb + bwaudio.h + the tools
+      #
+      # The Release IS the publish for Unity: OpenUPM's `githubRelease` tracking mode discovers the tag,
+      # finds the Release whose tag matches, and serves the attached .tgz UNCHANGED - no registry push,
+      # no token, nothing to rotate. The zip is the durable home for the native side (workflow artifacts
+      # expire; a release does not), and it is what a C/C++ consumer or the CAVE machine actually wants.
+      #
+      # The engine bundle MUST be a .zip, not a tarball. OpenUPM expects exactly ONE publishable
+      # .tgz/.tar.gz on the release and takes it unconditionally - a second tarball here would make it
+      # ambiguous which one is the package. (If that ever becomes necessary, set githubReleaseAssetName
+      # in the OpenUPM package config to the stable prefix `com.brainworks.bwaudio-`.)
+      #
+      # The other OpenUPM rule - the git tag must match package.json - is enforced by the pack step above.
       #
       # (For the record: GitHub Packages could never host this - its npm registry accepts only SCOPED
       # names (@owner/name), and Unity package names may not contain '@' or '/'.)
-      - name: Release the Unity package (OpenUPM picks this up)
+      - name: Release (engine zip + Unity package; OpenUPM picks up the .tgz)
         if: startsWith(github.ref, 'refs/tags/')
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          $tgz = (Get-Item dist/*.tgz).FullName
-          $notes = @"
-          Unity package ``com.brainworks.bwaudio`` $($env:GITHUB_REF_NAME). Windows x64 only.
+          $tag = $env:GITHUB_REF_NAME
+          $tgz = (Get-Item dist/unity/*.tgz).FullName
 
-          **Install (recommended)**
+          # The engine bundle: everything staged in dist/ EXCEPT the Unity package (which ships on its
+          # own). GPLv3 travels with it - LICENSE, THIRD_PARTY-NOTICES.md and DIST.txt (which names the
+          # commit and links the complete source) are already staged there.
+          $zip = "dist/bwaudio-win64-$tag.zip"
+          Compress-Archive -Path dist/RelWithDebInfo, dist/Debug, dist/bwaudio.h, dist/LICENSE,
+                                 dist/THIRD_PARTY-NOTICES.md, dist/DIST.txt `
+                           -DestinationPath $zip -Force
+          $zip = (Get-Item $zip).FullName
+
+          $notes = @"
+          Windows x64. Two downloads: the **Unity package**, and the **engine** itself.
+
+          ## Unity
+
           ``````
           openupm add com.brainworks.bwaudio
           ``````
@@ -270,16 +301,26 @@ jobs:
             { "name": "package.openupm.com", "url": "https://package.openupm.com", "scopes": ["com.brainworks"] }
           ]
           ``````
-
-          **Install (no registry)** - download the ``.tgz`` below, then
+          No registry? Download ``com.brainworks.bwaudio-*.tgz`` below, then
           Package Manager > ``+`` > *Install package from tarball...*
 
-          Ships the native engine (``bwaudio.dll`` + ``phonon.dll``), import settings already set. Turn
-          OFF Unity's built-in audio (*Project Settings > Audio > Disable Unity Audio*): the engine owns
-          the device.
+          The package ships the native engine (``bwaudio.dll`` + ``phonon.dll``) with its import settings
+          already set. Turn OFF Unity's built-in audio (*Project Settings > Audio > Disable Unity Audio*):
+          the engine owns the device.
 
-          **License: GPLv3.** ``bwaudio.dll`` links the ASIO SDK under its GPLv3 option. Internal use
-          never triggers copyleft, but SHIPPING a Unity app that includes this DLL to third parties
-          would put that app under GPLv3 - see ``docs/build.md`` for the proprietary-ASIO alternative.
+          ## Engine (C ABI, tools)
+
+          ``bwaudio-win64-$tag.zip`` - ``bwaudio.dll`` / ``.lib`` / ``.pdb`` + ``phonon.dll`` (**keep the
+          pair together**, the dll will not load without it), ``bwaudio.h``, and the tools:
+          ``bw_playground``, ``bw_layout_tool``, ``bw_calib_view``, ``bw_calibrate``, ``bw_zylia_probe``.
+          Needs the MSVC x64 runtime. See ``DIST.txt`` inside for the exact commit.
+
+          ## License
+
+          **GPLv3.** ``bwaudio.dll`` links the ASIO SDK under its GPLv3 option. Internal use never
+          triggers copyleft - it is a *distribution* condition - but SHIPPING an app that includes this
+          DLL to third parties would put that app under GPLv3. See ``docs/build.md`` for the
+          proprietary-ASIO alternative.
           "@
-          gh release create $env:GITHUB_REF_NAME $tgz --title "bwaudio $env:GITHUB_REF_NAME" --notes $notes
+          # Exactly one .tgz among the assets - that is what OpenUPM keys on. The other is a .zip.
+          gh release create $tag $tgz $zip --title "bwaudio $tag" --notes $notes
