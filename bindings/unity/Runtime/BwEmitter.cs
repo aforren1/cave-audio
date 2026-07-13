@@ -15,12 +15,47 @@ namespace CaveAudio
         public bool loop = true;
         public bool playOnEnable = true;
         [Range(0f, 1f)] public float gain = 1f;
+        [Tooltip("Playback rate (1 = native). In-memory clips only — streamed clips ignore it.")]
+        [Range(0.25f, 4f)] public float pitch = 1f;
+
+        [Header("Mixing")]
+        [Tooltip("Voice-steal priority: when the voice pool is full, the LOWEST-priority source is stolen " +
+                 "to make room. 255 = protected (music/critical SFX).")]
+        [Range(0, 255)] public int priority = 128;
+        [Tooltip("Mix group (0..7). BwAudio.SetGroupGain/SetGroupPaused duck or pause the whole group.")]
+        [Range(0, 7)] public int group = 0;
 
         [Header("Spatial")]
         public bool occlusion = false;                       // geometry between source + listener attenuates it
         public bool reflections = false;                     // contribute to the shared reverb bed
+        [Tooltip("Wet-send level into the shared reverb bed (needs Reflections).")]
+        [Range(0f, 2f)] public float reflectionSend = 1f;
+        [Tooltip("Scale the reverb send by distance to the listener: near = drier, far = wetter.")]
+        public bool reflectionDistance = false;
+        [Tooltip("When the direct line is blocked, route the sound around occluders / through openings. " +
+                 "Needs scene geometry + BWAUDIO_PATHING at start.")]
+        public bool pathing = false;
         public BwDirectivity directivity = BwDirectivity.Omni;
         [Range(1f, 8f)] public float directivityPower = 1f;  // sharpness of the lobe (cardioid/figure-8)
+
+        [Header("Width")]
+        [Tooltip("Angular width: 0 = a point, 1 = wide. For a crowd/waterfall/ambience that shouldn't " +
+                 "collapse to one speaker.")]
+        [Range(0f, 1f)] public float spread = 0f;
+        [Tooltip("Physical radius in METRES (0 = point). The width becomes the angle the radius subtends " +
+                 "from the listener, so the source stays the same PHYSICAL size as the listener walks. " +
+                 "Floors `spread` — the larger of the two wins.")]
+        public float sizeMetres = 0f;
+
+        [Header("Propagation (opt-in; derived from source↔listener distance)")]
+        [Tooltip("Render through the propagation delay (distance/c): pitch up approaching, down receding. " +
+                 "Best for fast movers; adds the real propagation latency.")]
+        public bool doppler = false;
+        [Tooltip("Distance-driven HF low-pass — far sources sound duller.")]
+        public bool airAbsorption = false;
+        [Tooltip("LF shelf that tracks the distance attenuation, so a far source reads far, not THIN. " +
+                 "A perceptual stylization — leave off for strict realism.")]
+        public bool loudnessComp = false;
 
         [Header("Events")]
         [Tooltip("Fires when the source stops producing audio — a non-looping clip finished, or Stop().")]
@@ -55,9 +90,27 @@ namespace CaveAudio
             _src = Bw.bw_source_create(Eng);
             _created = true;
             _wasPlaying = false;
+            _paused = false;
             Bw.bw_source_set_gain(Eng, _src, gain);
+            Bw.bw_source_set_priority(Eng, _src, priority);
+            if (group != 0) Bw.bw_source_set_group(Eng, _src, (uint)group);
+            if (pitch != 1f) Bw.bw_source_set_pitch(Eng, _src, pitch);
+
+            // The engine defaults every opt-in below to OFF/point/unity, so only push what differs — a
+            // fresh source already IS the default (this runs again on every re-enable).
             if (occlusion)   Bw.bw_source_set_occlusion(Eng, _src, true);
-            if (reflections) Bw.bw_source_set_reflections(Eng, _src, true);
+            if (reflections)
+            {
+                Bw.bw_source_set_reflections(Eng, _src, true);
+                if (reflectionSend != 1f)  Bw.bw_source_set_reflection_send(Eng, _src, reflectionSend);
+                if (reflectionDistance)    Bw.bw_source_set_reflection_distance(Eng, _src, true);
+            }
+            if (pathing)       Bw.bw_source_set_pathing(Eng, _src, true);
+            if (spread > 0f)   Bw.bw_source_set_spread(Eng, _src, spread);
+            if (sizeMetres > 0f) Bw.bw_source_set_size(Eng, _src, sizeMetres);
+            if (doppler)       Bw.bw_source_set_doppler(Eng, _src, true);
+            if (airAbsorption) Bw.bw_source_set_air_absorption(Eng, _src, true);
+            if (loudnessComp)  Bw.bw_source_set_loudness_comp(Eng, _src, true);
             if (directivity != BwDirectivity.Omni)
             {
                 Bw.bw_source_set_directivity_preset(Eng, _src, directivity);
@@ -125,11 +178,81 @@ namespace CaveAudio
         /// ignore it. Past-the-end wraps a looping clip and ends a one-shot.</summary>
         public void Seek(ulong samples) { if (_created && Eng != IntPtr.Zero) Bw.bw_source_seek(Eng, _src, samples); }
 
-        /// <summary>Linear gain — AudioSource.volume equivalent; applies immediately if live.</summary>
+        /// <summary>Linear gain — AudioSource.volume equivalent; applies immediately if live. Cancels a
+        /// running FadeTo/FadeOut (an explicit gain wins over a fade).</summary>
         public float Gain
         {
             get => gain;
             set { gain = value; if (_created && Eng != IntPtr.Zero) Bw.bw_source_set_gain(Eng, _src, value); }
+        }
+
+        /// <summary>Glide the gain to `target` over `seconds`, on the audio thread — no per-frame
+        /// scripting, no coroutine. A later Gain-set or fade replaces it.</summary>
+        public void FadeTo(float target, float seconds)
+        {
+            gain = target;   // keep the inspector field truthful about where the fade lands
+            if (_created && Eng != IntPtr.Zero) Bw.bw_source_fade_to(Eng, _src, target, seconds);
+        }
+
+        /// <summary>Fade to silence over `seconds`, then STOP the voice (the click-free stop path) — the
+        /// one-call "fade this out and clean it up". Fires onFinished when the voice ends.</summary>
+        public void FadeOut(float seconds) { if (_created && Eng != IntPtr.Zero) Bw.bw_source_fade_out(Eng, _src, seconds); }
+
+        /// <summary>Playback rate (1 = native, clamped [0.25, 4]); the rate GLIDES, so a change bends the
+        /// pitch rather than stepping it. In-memory clips only — streamed clips ignore it.</summary>
+        public float Pitch
+        {
+            get => pitch;
+            set { pitch = value; if (_created && Eng != IntPtr.Zero) Bw.bw_source_set_pitch(Eng, _src, value); }
+        }
+
+        /// <summary>Angular width (0 = point .. 1 = wide). Floored by SizeMetres when that is set.</summary>
+        public float Spread
+        {
+            get => spread;
+            set { spread = value; if (_created && Eng != IntPtr.Zero) Bw.bw_source_set_spread(Eng, _src, value); }
+        }
+
+        /// <summary>Physical radius in metres (0 = point): the source holds its real-world size as the
+        /// listener walks, where a fixed Spread would not.</summary>
+        public float SizeMetres
+        {
+            get => sizeMetres;
+            set { sizeMetres = value; if (_created && Eng != IntPtr.Zero) Bw.bw_source_set_size(Eng, _src, value); }
+        }
+
+        /// <summary>Voice-steal priority (0 = expendable .. 255 = protected). A full voice pool steals the
+        /// lowest-priority source rather than failing the new one.</summary>
+        public int Priority
+        {
+            get => priority;
+            set { priority = value; if (_created && Eng != IntPtr.Zero) Bw.bw_source_set_priority(Eng, _src, value); }
+        }
+
+        /// <summary>Mix group (0..7) — drive the whole group with BwAudio.SetGroupGain/SetGroupPaused.</summary>
+        public int Group
+        {
+            get => group;
+            set { group = value; if (_created && Eng != IntPtr.Zero) Bw.bw_source_set_group(Eng, _src, (uint)value); }
+        }
+
+        /// <summary>Wet-send level into the shared reverb bed (needs `reflections`).</summary>
+        public float ReflectionSend
+        {
+            get => reflectionSend;
+            set { reflectionSend = value; if (_created && Eng != IntPtr.Zero) Bw.bw_source_set_reflection_send(Eng, _src, value); }
+        }
+
+        /// <summary>Drive occlusion from GAME LOGIC instead of the ray-traced sim — a door the gameplay
+        /// knows about, underwater, muffled-by-menu. Works WITHOUT the Steam Audio build. `level` is
+        /// broadband transmittance (1 = clear .. 0 = blocked); `bands` is an optional low/mid/high tilt in
+        /// [0,1] rendered as the same transmission EQ (so it MUFFLES, not just attenuates) — pass null for
+        /// broadband only. Everything ramps. Do NOT also tick `occlusion`: the sim republishes every tick
+        /// and would overwrite this.</summary>
+        public void SetOcclusionManual(float level, float[] bands = null)
+        {
+            if (occlusion) { Debug.LogWarning("[BwEmitter] SetOcclusionManual on a source with `occlusion` ticked — the sim overwrites it: " + name); return; }
+            if (_created && Eng != IntPtr.Zero) Bw.bw_source_set_occlusion_manual(Eng, _src, level, bands);
         }
 
         /// <summary>Fire a one-shot at this transform (transient voice; no handle held).</summary>

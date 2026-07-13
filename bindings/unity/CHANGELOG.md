@@ -46,6 +46,50 @@ Initial Unity binding (M7).
 - `BwEmitter.IsPlaying` + an `onFinished` UnityEvent, backed by a new engine ABI call
   `bw_source_is_playing` (latest-wins per-source playback readback).
 
+### Caught up to the engine ABI
+
+The engine had grown 23 `BW_API` calls the binding never got. `Bw` is **1:1 with `bwaudio.h`** again
+(verified by diffing the exported symbols), and the components expose the ones a scene actually
+authors:
+
+- **Mixing** — `BwEmitter.FadeTo()` / `FadeOut()` (the engine runs the fade on the audio thread; no
+  coroutine, and `FadeOut` lands on the click-free stop path), `BwEmitter.Pitch` (glides — a change
+  bends the pitch rather than stepping it), `BwEmitter.Priority` (voice-steal), mix groups
+  (`BwEmitter.group` + `BwAudio.SetGroupGain` / `SetGroupPaused` — duck the SFX, keep the dialog),
+  `BwAudio.MasterGain`, and `BwAudio.Paused` (global freeze; resume continues exactly).
+- **Width** — `BwEmitter.spread` was bound but had no inspector field; `sizeMetres` (a physical
+  radius: the source keeps its real-world size as the listener walks, where a fixed angular spread
+  would not) is new, as are the engine-wide `spreadMode` (LOBE / MDAP), `decorrelation` (wide sources
+  stop collapsing to phantom images as you walk), and `nearSpreadRadius`.
+- **Propagation** — `BwEmitter.loudnessComp` (an LF shelf tracking the distance attenuation: far, not
+  thin) joins `doppler` and `airAbsorption`.
+- **Reverb without the SDK** — `BwAudio.enableFdnReverb` + the decay controls: a directional FDN bed
+  that takes the reverb tap **instead of** the Steam bed (the manager warns if both are ticked) and is
+  fed by the same per-emitter sends, so reverb works in a build with no phonon. Likewise
+  `BwEmitter.SetOcclusionManual()` — game-driven occlusion (a door the gameplay knows about,
+  underwater) through the sim's own ramped, band-tilted publish path, no SDK required.
+- **Beds** — `BwAmbisonicBed.YawDegrees` (turn a recorded soundfield to line up with the scene) and
+  `BwAudio.bedRenderer`: MATRIX, or **PARAMETRIC**, which re-pans the directional part of the field
+  through the listener-relative panner — a recorded soundfield becomes *walkable*.
+- **Listener** — `BwAudio.extraListeners` (up to 3 other occupants; panning becomes the energy mean of
+  everyone's solve, instead of exact for one head and wrong for the rest), pushed in the same frame
+  block as the primary pose since it is commit-gated the same way; and `posePredictionMs`, which leads
+  the *tracked* pose by your measured motion-to-ears latency.
+- **Diagnostics** — `BwAudio.ChannelCount` / `BusLevels()` / `SpeakerPositions()` / `ActiveVoices` /
+  `TestSignal()` / `DspTime`.
+- **Live A/B by ear** — `BwAudio.OnValidate` re-pushes every knob the engine makes atomic or
+  crossfaded (panner, dual-band, spread mode, decorrelation, near-spread, bed renderer, tracked room
+  EQ, master gain, limiter), so inspector tweaks are audible in Play mode instead of needing a restart.
+
+Two coordinate seams the new calls exposed, both now in `Room` so nothing re-derives them:
+`Room.YawRad` (the X mirror **reverses the sense of rotation** — a Unity euler angle passed straight
+to `bw_bed_set_rotation` spins the soundfield the wrong way) and `Room.Dir` (a *direction*, e.g. the
+FDN's decay axis, must not pick up the registration transform's translation the way `Room.Pos` does).
+
+`BwAudio` now also **reports a failed layout load** (`bw_last_error` right after `bw_create`): it is
+non-fatal — the engine falls back to its 26-speaker default grid — which on a smaller rig silently
+changes the channel count and pans every source over geometry that isn't the one in the room.
+
 ### Hardened (adversarial review)
 
 - `BwAudio` claims the `Instance` singleton only after a successful `bw_start` (a failed init no longer

@@ -17,6 +17,10 @@ namespace CaveAudio
         public bool loop = true;
         public bool playOnEnable = true;
         [Range(0f, 1f)] public float gain = 1f;
+        [Tooltip("Turn the soundfield about the vertical axis (degrees, Unity's sense) — line a recording " +
+                 "up with the scene, or spin it slowly for effect. Glides to the target (~1 turn/s), so it " +
+                 "is click-free live.")]
+        [Range(-180f, 180f)] public float yawDegrees = 0f;
 
         uint _bed;
         bool _created;
@@ -28,6 +32,7 @@ namespace CaveAudio
             _bed = Bw.bw_bed_create(Eng);
             _created = true;
             Bw.bw_bed_set_gain(Eng, _bed, gain);
+            if (yawDegrees != 0f) Bw.bw_bed_set_rotation(Eng, _bed, Room.YawRad(yawDegrees));
             if (playOnEnable) Play();
         }
 
@@ -46,6 +51,25 @@ namespace CaveAudio
         {
             get => gain;
             set { gain = value; if (_created && Eng != IntPtr.Zero) Bw.bw_bed_set_gain(Eng, _bed, value); }
+        }
+
+        /// <summary>Yaw of the soundfield in DEGREES, Unity's sense (positive = turn it to the right).
+        /// Room.YawRad converts to the engine's frame — the X mirror reverses the sense of rotation, so a
+        /// Unity angle handed straight to the engine would spin the field the wrong way.</summary>
+        public float YawDegrees
+        {
+            get => yawDegrees;
+            set { yawDegrees = value; if (_created && Eng != IntPtr.Zero) Bw.bw_bed_set_rotation(Eng, _bed, Room.YawRad(value)); }
+        }
+
+        // Inspector edits are audible in Play mode (the engine glides to the new yaw).
+        void OnValidate()
+        {
+            if (Application.isPlaying && _created && Eng != IntPtr.Zero)
+            {
+                Bw.bw_bed_set_gain(Eng, _bed, gain);
+                Bw.bw_bed_set_rotation(Eng, _bed, Room.YawRad(yawDegrees));
+            }
         }
 
         void OnDisable()

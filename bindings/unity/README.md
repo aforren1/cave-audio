@@ -18,12 +18,19 @@ You **turn Unity's built-in audio off** (see below) and use these instead. It ma
 | `AudioClip` (imported asset) | a **StreamingAssets file path** — pick it with the `[BwClip]` field; the engine decodes `.wav`/`.flac`/`.mp3` itself and resamples at load |
 | `AudioSource.Play()` / `Stop()` | `BwEmitter.Play()` / `Stop()` |
 | `AudioSource.PlayOneShot()` | `BwEmitter.PlayOneShot()` |
-| `AudioSource.volume` | `BwEmitter.Gain` |
+| `AudioSource.volume` | `BwEmitter.Gain` (and `FadeTo` / `FadeOut` — the engine runs the fade, no coroutine) |
+| `AudioSource.pitch` | `BwEmitter.Pitch` (glides; in-memory clips only) |
+| `AudioSource.priority` | `BwEmitter.Priority` (a full voice pool steals the LOWEST-priority source) |
 | `AudioSource.isPlaying` | `BwEmitter.IsPlaying` (+ an `onFinished` UnityEvent) |
-| `spatialBlend = 1` (3D) | always 3D — listener-relative DBAP across the 26 speakers |
-| ambient / 2D music | `BwAmbisonicBed` — a world-locked AmbiX soundfield decoded to all 26 speakers |
-| Audio Reverb Zone | the shared **reflection bed** (`BwAudio` reflections + acoustic geometry) |
-| occlusion (3rd-party) | `BwEmitter.occlusion`, ray-traced against the acoustic geometry |
+| `AudioListener.volume` | `BwAudio.MasterGain` |
+| `AudioListener.pause` | `BwAudio.Paused` (every voice freezes; resume continues exactly) |
+| `AudioMixerGroup` (ducking) | mix groups: `BwEmitter.group` + `BwAudio.SetGroupGain` / `SetGroupPaused` |
+| `spatialBlend = 1` (3D) | always 3D — listener-relative DBAP across the speakers |
+| `AudioSource.spread` | `BwEmitter.spread` (angular) or `sizeMetres` (a physical radius — holds its real size as the listener walks) |
+| ambient / 2D music | `BwAmbisonicBed` — a world-locked AmbiX soundfield decoded to every speaker |
+| Audio Reverb Zone | the shared reverb bed: **Steam Audio reflections**, or the **FDN reverb** (no SDK needed) |
+| occlusion (3rd-party) | `BwEmitter.occlusion`, ray-traced against the acoustic geometry — or `SetOcclusionManual` from game logic (no SDK needed) |
+| Doppler / rolloff curves | `BwEmitter.doppler`, `airAbsorption`, `loudnessComp` (all physically derived from distance) |
 | output device / AudioMixer | the engine (ASIO/Dante 26-ch + binaural monitor); Unity's audio output is disabled |
 
 The big difference: **audio files are raw files in `StreamingAssets`, not imported `AudioClip`s** — the
@@ -121,6 +128,23 @@ the physical room origin/axes). **Getting this wrong silently swaps front/back o
 
 ## API surface
 
-`Bw` mirrors `include/bwaudio.h` 1:1 (lifecycle, sources, ambisonic beds, materials/occlusion,
-directivity, reflection bed, listener, commit). The MonoBehaviours cover the common path; for
-anything else, call `Bw.*` directly with `BwAudio.Instance.Handle`.
+`Bw` mirrors `include/bwaudio.h` **1:1** — every `BW_API` function has an entry point. The
+MonoBehaviours cover the common path; for anything else, call `Bw.*` directly with
+`BwAudio.Instance.Handle`.
+
+**Tune it by ear in Play mode.** The engine makes its rendering choices switchable *live* (atomic or
+crossfaded), so `BwAudio` re-pushes them whenever you touch the inspector: the panner (DBAP /
+SPCAP / VBAP), dual-band panning, the spread mode (LOBE / MDAP), decorrelation, near-listener
+widening, the bed renderer (MATRIX / **PARAMETRIC** — a recorded soundfield you can walk through),
+tracked room EQ, master gain, and the limiter. That is an A/B you can *hear*, not a restart.
+
+Load-time settings (a scene restart to change): the profile, the reverb bed (Steam **or** FDN — they
+share one reverb tap, so pick one), the bed *decoder* (sampling / AllRAD), the room box, and all
+acoustic geometry.
+
+Everything the CAVE needs but a desktop engine doesn't is on `BwAudio`: `ChannelCount` (the layout's
+speaker count — **size meter arrays with it, never hard-code 26**), `BusLevels()` (per-channel output
+peaks), `SpeakerPositions()`, `ActiveVoices`, `TestSignal()` (a raw tone on one speaker, for wiring
+checks), `DspTime` (schedule a sample-accurate start), and `extraListeners` — the *other* occupants,
+so panning becomes a compromise across everyone in the room instead of exact for one head and wrong
+for the rest.

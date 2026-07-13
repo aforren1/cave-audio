@@ -31,12 +31,31 @@ namespace CaveAudio
             return new Vector3(-v.x, v.y, v.z);          // baseline LH->RH; the real map lives in UnityToRoom
         }
 
+        /// <summary>Unity world DIRECTION -> room space (RH). Pos() without the translation — for axes and
+        /// normals (the FDN's decay direction), which a registration OFFSET must not move. Not normalized.</summary>
+        public static Vector3 Dir(Vector3 v)
+        {
+            v = UnityToRoom.MultiplyVector(v);
+            return new Vector3(-v.x, v.y, v.z);
+        }
+
         /// <summary>Unity world rotation -> room space (RH). Used for the listener head + source orientation.
         /// Unity identity faces +Z and so does the room's, so identity maps to identity.</summary>
         public static Quaternion Rot(Quaternion q)
         {
             q = UnityToRoom.rotation * q;
             return new Quaternion(q.x, -q.y, -q.z, q.w); // negate y,z to match the position handedness flip
+        }
+
+        /// <summary>Unity yaw (degrees about +Y) -> room yaw (radians about +Y, RH: positive turns the field
+        /// from room +Z toward room +X) — the angle <c>bw_bed_set_rotation</c> wants. The X mirror REVERSES
+        /// the sense of rotation (turning a bed to Unity's right turns it toward room -X, a NEGATIVE room
+        /// yaw), so a Unity euler angle passed straight to the engine spins the soundfield the wrong way.
+        /// Routed through Rot() so any yaw baked into UnityToRoom is included, not just the mirror.</summary>
+        public static float YawRad(float unityYawDegrees)
+        {
+            Vector3 ahead = Rot(Quaternion.Euler(0f, unityYawDegrees, 0f)) * Vector3.forward;  // room-space heading
+            return Mathf.Atan2(ahead.x, ahead.z);                                              // RH yaw about +Y
         }
     }
 }

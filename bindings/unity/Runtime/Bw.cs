@@ -22,6 +22,8 @@ namespace CaveAudio
     public enum BwTestKind : int { Off = 0, Sine = 1, Noise = 2 }
     public enum BwPanner : int { Dbap = 0, Spcap = 1, Vbap = 2 }
     public enum BwBedDecoder : int { Sampling = 0, Allrad = 1 }
+    public enum BwSpreadMode : int { Lobe = 0, Mdap = 1 }
+    public enum BwBedRenderer : int { Matrix = 0, Parametric = 1 }
 
     [StructLayout(LayoutKind.Sequential)]
     public struct BwConfig
@@ -72,11 +74,24 @@ namespace CaveAudio
         [DllImport(DLL, CallingConvention = CC)] public static extern void bw_source_destroy(IntPtr e, uint s);
         [DllImport(DLL, CallingConvention = CC)] public static extern void bw_source_set_pos(IntPtr e, uint s, float x, float y, float z);
         [DllImport(DLL, CallingConvention = CC)] public static extern void bw_source_set_gain(IntPtr e, uint s, float linear);
+        // Engine-side timed fades (no per-frame scripting). fade_out lands on the click-free stop path.
+        // A later set_gain or fade replaces a running one.
+        [DllImport(DLL, CallingConvention = CC)] public static extern void bw_source_fade_to(IntPtr e, uint s, float gain, float seconds);
+        [DllImport(DLL, CallingConvention = CC)] public static extern void bw_source_fade_out(IntPtr e, uint s, float seconds);
+        // Mix groups (0..7; sources start in group 0): a group gain folds into every member's gain solve
+        // and a paused group freezes its members exactly like per-voice pause.
+        [DllImport(DLL, CallingConvention = CC)] public static extern void bw_source_set_group(IntPtr e, uint s, uint group);
+        [DllImport(DLL, CallingConvention = CC)] public static extern void bw_group_set_gain(IntPtr e, uint group, float linear);
+        [DllImport(DLL, CallingConvention = CC)] public static extern void bw_group_set_paused(IntPtr e, uint group, [MarshalAs(UnmanagedType.I1)] bool paused);
+        // Playback rate, clamped [0.25, 4] (glides across a block). In-memory sounds only — streams ignore it.
+        [DllImport(DLL, CallingConvention = CC)] public static extern void bw_source_set_pitch(IntPtr e, uint s, float rate);
         [DllImport(DLL, CallingConvention = CC)] public static extern void bw_source_play(IntPtr e, uint s, uint snd, [MarshalAs(UnmanagedType.I1)] bool loop);
         [DllImport(DLL, CallingConvention = CC)] public static extern void bw_source_play_at(IntPtr e, uint s, uint snd, [MarshalAs(UnmanagedType.I1)] bool loop, ulong startSample);
         [DllImport(DLL, CallingConvention = CC)] public static extern ulong bw_dsp_time(IntPtr e);
         [DllImport(DLL, CallingConvention = CC)] public static extern void bw_source_stop(IntPtr e, uint s);
         [DllImport(DLL, CallingConvention = CC)] public static extern void bw_source_set_paused(IntPtr e, uint s, [MarshalAs(UnmanagedType.I1)] bool paused);
+        // Global pause: EVERY voice (memory, streamed, bed) ramps out and freezes; resume continues exactly.
+        [DllImport(DLL, CallingConvention = CC)] public static extern void bw_set_paused(IntPtr e, [MarshalAs(UnmanagedType.I1)] bool paused);
         [DllImport(DLL, CallingConvention = CC)] public static extern void bw_source_seek(IntPtr e, uint s, ulong frame);   // engine-rate frames; in-memory sounds
         [DllImport(DLL, CallingConvention = CC)] [return: MarshalAs(UnmanagedType.I1)] public static extern bool bw_source_is_playing(IntPtr e, uint s);
         [DllImport(DLL, CallingConvention = CC)] public static extern void bw_play_oneshot(IntPtr e, uint snd, float x, float y, float z, float gain);
@@ -85,6 +100,10 @@ namespace CaveAudio
         [DllImport(DLL, CallingConvention = CC)] public static extern uint bw_bed_create(IntPtr e);
         [DllImport(DLL, CallingConvention = CC)] public static extern void bw_bed_play(IntPtr e, uint b, uint snd, [MarshalAs(UnmanagedType.I1)] bool loop);
         [DllImport(DLL, CallingConvention = CC)] public static extern void bw_bed_set_gain(IntPtr e, uint b, float linear);
+        // Yaw the soundfield about the room's vertical axis, in RADIANS, in the ROOM frame (positive turns
+        // the field from room +z toward room +x). Unity's yaw is the opposite sense — convert with
+        // Room.YawRad, do not pass a Unity euler angle straight in. Glides (~1 turn/s), click-free.
+        [DllImport(DLL, CallingConvention = CC)] public static extern void bw_bed_set_rotation(IntPtr e, uint b, float yawRad);
         [DllImport(DLL, CallingConvention = CC)] public static extern void bw_bed_stop(IntPtr e, uint b);
         [DllImport(DLL, CallingConvention = CC)] public static extern void bw_bed_destroy(IntPtr e, uint b);
 
@@ -97,6 +116,12 @@ namespace CaveAudio
 
         // ---- occlusion (per-frame setters; readback any time) ----
         [DllImport(DLL, CallingConvention = CC)] public static extern void  bw_source_set_occlusion(IntPtr e, uint s, [MarshalAs(UnmanagedType.I1)] bool on);
+        // MANUAL occlusion (no SDK needed): drive the sim's own publish path from game logic. `level` is
+        // broadband transmittance (1 = clear .. 0 = blocked); `bands` is an optional low/mid/high tilt in
+        // [0,1] rendered as the same 3-biquad transmission EQ (so a wall MUFFLES, not just attenuates) —
+        // pass null (marshals to NULL) for broadband only. Do NOT also enable bw_source_set_occlusion on
+        // the same source: the sim republishes every tick and wins.
+        [DllImport(DLL, CallingConvention = CC)] public static extern void  bw_source_set_occlusion_manual(IntPtr e, uint s, float level, float[] bands);
         [DllImport(DLL, CallingConvention = CC)] public static extern float bw_source_get_occlusion(IntPtr e, uint s);
 
         // ---- reflection bed ----
@@ -107,10 +132,28 @@ namespace CaveAudio
         [DllImport(DLL, CallingConvention = CC)] public static extern void bw_source_set_reflection_distance(IntPtr e, uint s, [MarshalAs(UnmanagedType.I1)] bool on);
         [DllImport(DLL, CallingConvention = CC)] public static extern void bw_source_set_pathing(IntPtr e, uint s, [MarshalAs(UnmanagedType.I1)] bool on);
 
+        // ---- directional FDN reverb bed (load-time; works WITHOUT the Steam Audio build) ----
+        // Takes the reverb tap INSTEAD of the Steam reflection bed (one bed at a time), fed by the same
+        // per-source send (bw_source_set_reflections + send levels apply unchanged). All three are
+        // load-time (between bw_create and bw_start). Decay is a DESIGN parameter — do not copy the room's
+        // measured RT60; the real room adds its own on top.
+        [DllImport(DLL, CallingConvention = CC)] public static extern void bw_reverb_fdn(IntPtr e, [MarshalAs(UnmanagedType.I1)] bool on);
+        [DllImport(DLL, CallingConvention = CC)] public static extern void bw_fdn_set_decay(IntPtr e, float rt60LowS, float rt60HighS, float xoverHz);
+        // Anisotropic decay: scale the decay time toward `dir` (3 floats, room space) by `factor`
+        // (< 1 = the field dies faster that way — an open or treated side).
+        [DllImport(DLL, CallingConvention = CC)] public static extern void bw_fdn_set_decay_direction(IntPtr e, float[] dir, float factor);
+
         // ---- propagation effects (no SDK needed; opt-in per source, default off) ----
         [DllImport(DLL, CallingConvention = CC)] public static extern void  bw_source_set_doppler(IntPtr e, uint s, [MarshalAs(UnmanagedType.I1)] bool on);
         [DllImport(DLL, CallingConvention = CC)] public static extern void  bw_source_set_air_absorption(IntPtr e, uint s, [MarshalAs(UnmanagedType.I1)] bool on);
+        // Equal-loudness distance compensation: an LF shelf tracking the panner's attenuation ("far, not
+        // tinny"). A perceptual stylization, not physics — leave off for strict realism.
+        [DllImport(DLL, CallingConvention = CC)] public static extern void  bw_source_set_loudness_comp(IntPtr e, uint s, [MarshalAs(UnmanagedType.I1)] bool on);
         [DllImport(DLL, CallingConvention = CC)] public static extern void  bw_source_set_spread(IntPtr e, uint s, float amount);
+        // Source size in METRES (radius; 0 = point). The physical alternative to the angular spread above:
+        // the width is the angle the radius subtends from the listener, so a 2 m source STAYS 2 m wide as
+        // the listener walks. Floors spread (the larger of the two wins).
+        [DllImport(DLL, CallingConvention = CC)] public static extern void  bw_source_set_size(IntPtr e, uint s, float radiusM);
 
         // ---- directivity ----
         [DllImport(DLL, CallingConvention = CC)] public static extern void  bw_source_set_orientation(IntPtr e, uint s, float qx, float qy, float qz, float qw);
@@ -127,13 +170,36 @@ namespace CaveAudio
         [DllImport(DLL, CallingConvention = CC)] public static extern uint bw_get_speakers(IntPtr e, [Out] float[] xyz, uint cap);
         // Per-channel output meter: last-block peak |sample| per channel (linear), as sent to the device; returns the count filled.
         [DllImport(DLL, CallingConvention = CC)] public static extern uint bw_get_bus_levels(IntPtr e, [Out] float[] peaks, uint cap);
-        // Panner selection (load-time): DBAP (moving observer, default) or SPCAP (fixed-observer sweet spot).
+        // Last block's ACTIVE voice count (a voice-pool gauge for a HUD next to the meters); 0 until audio runs.
+        [DllImport(DLL, CallingConvention = CC)] public static extern uint bw_get_active_voices(IntPtr e);
+        // Panner selection (load-time, or live — the switch is atomic): DBAP (moving observer, default),
+        // SPCAP or VBAP (both fixed-observer sweet-spot panners).
         [DllImport(DLL, CallingConvention = CC)] public static extern void bw_set_panner(IntPtr e, BwPanner panner);
         [DllImport(DLL, CallingConvention = CC)] public static extern void bw_set_dual_band(IntPtr e, [MarshalAs(UnmanagedType.I1)] bool on);
+        // How bw_source_set_spread renders width (live A/B): LOBE (default, one reshaped solve) or MDAP
+        // (a ring of virtual sources panned with the selected panner — panner-true, ~13x the solve cost).
+        [DllImport(DLL, CallingConvention = CC)] public static extern void bw_set_spread_mode(IntPtr e, BwSpreadMode mode);
+        // Decorrelate the WIDE part of spread sources (live A/B): per-speaker velvet-noise filters make the
+        // copies mutually incoherent — real extent, no phantom collapse or comb-filtering as the listener
+        // walks. Point sources (spread 0) are untouched.
+        [DllImport(DLL, CallingConvention = CC)] public static extern void bw_set_decorrelation(IntPtr e, [MarshalAs(UnmanagedType.I1)] bool on);
+        // Near-listener widening (0 = off): floor every source's spread at 1 - dist/radius, so a source
+        // flying at the head widens instead of snapping across the nearest speaker. ~1.0 m is a good start.
+        [DllImport(DLL, CallingConvention = CC)] public static extern void bw_set_near_spread(IntPtr e, float radiusM);
         [DllImport(DLL, CallingConvention = CC)] public static extern void bw_set_limiter(IntPtr e, [MarshalAs(UnmanagedType.I1)] bool on);
         [DllImport(DLL, CallingConvention = CC)] public static extern void bw_set_limiter_ceiling(IntPtr e, float ceilingDb);   // default -1 dBFS; clamped [-60, 0]
+        // One ramped scalar over the whole mix, applied BEFORE the per-speaker align stage (trims + the raw
+        // channel-test signal stay calibrated) and before the limiter. The volume knob / scene fade. Live.
+        [DllImport(DLL, CallingConvention = CC)] public static extern void bw_set_master_gain(IntPtr e, float linear);
         // Diffuse-bed decoder (load-time): sampling (default) or AllRAD (robust on irregular arrays).
         [DllImport(DLL, CallingConvention = CC)] public static extern void bw_set_bed_decoder(IntPtr e, BwBedDecoder decoder);
+        // How ambisonic BEDS render (live; each bed crossfades — a click-free A/B): MATRIX (default, the
+        // static SH->speaker decode) or PARAMETRIC (DirAC: the directional stream is re-panned through the
+        // listener-relative panner, so a recorded soundfield becomes WALKABLE — parallax off-centre).
+        [DllImport(DLL, CallingConvention = CC)] public static extern void bw_set_bed_renderer(IntPtr e, BwBedRenderer renderer);
+        // Tracked room EQ (layouts carrying a room_eq_grid): the LF modal cuts follow the live listener
+        // position. ON by default when a grid is present; this is the live kill switch. No-op without a grid.
+        [DllImport(DLL, CallingConvention = CC)] public static extern void bw_set_tracked_room_eq(IntPtr e, [MarshalAs(UnmanagedType.I1)] bool on);
         // Offline panner evaluation (no engine handle): out = nsrc*n gains for a layout/panner; for layout scoring.
         [DllImport(DLL, CallingConvention = CC)] public static extern uint bw_panner_gains_batch(BwPanner panner, float[] positions, uint n, float[] lis, float[] srcs, uint nsrc, [Out] float[] outGains);
 
@@ -142,6 +208,16 @@ namespace CaveAudio
         // The engine writes p[0..2] and q[0..3] UNCONDITIONALLY — p must be length>=3, q length>=4, both
         // non-null, or the native write corrupts memory. Prefer the GetListenerPose helper below.
         [DllImport(DLL, CallingConvention = CC)] public static extern void bw_get_listener_pose(IntPtr e, [Out] float[] p, [Out] float[] q);
+        // Pose prediction (track_internal only; 0 = off): lead the TRACKED position by `leadMs` along the
+        // tracker's own velocity, hiding the motion-to-ears latency. Set it to your MEASURED latency —
+        // too much lead overshoots on direction changes (clamped at 200 ms). No effect when Unity feeds
+        // the pose (bw_set_listener_pose): predict on your side instead.
+        [DllImport(DLL, CallingConvention = CC)] public static extern void bw_set_pose_prediction(IntPtr e, float leadMs);
+        // Extra listeners (multi-occupant compromise panning; up to 3, count 0 = off/single-listener). `xyz`
+        // is count*3 floats in ROOM space — the OTHER occupants; the primary stays bw_set_listener_pose /
+        // tracking. Every source's gains become the per-speaker energy mean of the per-listener solves.
+        // Commit-gated like the pose (push it in the same frame block, before bw_commit).
+        [DllImport(DLL, CallingConvention = CC)] public static extern void bw_set_extra_listeners(IntPtr e, float[] xyz, uint count);
         [DllImport(DLL, CallingConvention = CC)] public static extern void bw_commit(IntPtr e);
 
         // ---- convenience ----

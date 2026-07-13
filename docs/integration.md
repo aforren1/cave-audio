@@ -107,31 +107,53 @@ internal static class Bw {
 }
 ```
 
-The snippet shows the core calls. The shipped `Bw.cs` also binds the rest of the
-ABI surface:
+The snippet shows the core calls. The shipped `Bw.cs` binds the ABI **1:1** — every
+`BW_API` function in `bwaudio.h` has an entry point. Beyond the core:
 
 - **Voice management + scheduling**: `bw_source_set_priority`;
-  `bw_source_play_at` + `bw_dsp_time` (sample-accurate start).
-- **Transport**: `bw_source_set_paused`, `bw_source_seek`,
-  `bw_source_is_playing` — `BwEmitter` polls the playing state each frame to
-  fire its `onFinished` UnityEvent.
+  `bw_source_play_at` + `bw_dsp_time` (sample-accurate start);
+  `bw_get_active_voices`.
+- **Transport**: `bw_source_set_paused`, `bw_set_paused` (global),
+  `bw_source_seek`, `bw_source_is_playing` — `BwEmitter` polls the playing state
+  each frame to fire its `onFinished` UnityEvent.
+- **Mixing**: `bw_source_fade_to` / `bw_source_fade_out` (engine-side timed
+  fades — no coroutines), `bw_source_set_pitch`, `bw_set_master_gain`, and mix
+  groups (`bw_source_set_group` + `bw_group_set_gain` / `bw_group_set_paused`).
 - **Propagation effects**: `bw_source_set_doppler`, `bw_source_set_air_absorption`,
-  `bw_source_set_spread`.
+  `bw_source_set_loudness_comp`, `bw_source_set_spread`, `bw_source_set_size`
+  (metric radius).
 - **Occlusion + directivity**: `bw_source_set_occlusion` /
-  `bw_source_get_occlusion`, `bw_source_set_directivity` (+ preset),
-  `bw_source_set_orientation`.
+  `bw_source_get_occlusion`, `bw_source_set_occlusion_manual` (game-driven
+  occlusion; **works without the Steam Audio build**),
+  `bw_source_set_directivity` (+ preset), `bw_source_set_orientation`.
 - **Reflections + pathing**: `bw_reflections_config`, `bw_reflections_set_gain`,
   `bw_source_set_reflections` / `_reflection_send` / `_reflection_distance`,
-  `bw_source_set_pathing`.
+  `bw_source_set_pathing`; the phonon-free **FDN reverb** (`bw_reverb_fdn`,
+  `bw_fdn_set_decay`, `bw_fdn_set_decay_direction`).
 - **Ambisonic beds**: `bw_bed_create` / `bw_bed_play` / `bw_bed_set_gain` /
-  `bw_bed_stop` / `bw_bed_destroy`.
+  `bw_bed_set_rotation` / `bw_bed_stop` / `bw_bed_destroy`.
 - **Materials / scene geometry**: `bw_scene_set_mesh`, `bw_material_preset`,
   `bw_material_define`, `bw_scene_set_mesh_mat`, `bw_scene_set_box`.
-- **Output stage + diagnostics**: `bw_set_panner`, `bw_set_dual_band`,
-  `bw_set_limiter` / `bw_set_limiter_ceiling`, `bw_set_bed_decoder`,
-  `bw_get_bus_levels`, `bw_test_signal`, `bw_get_speakers` (returns the layout's
-  speaker count — see "Channel count" below; size meter/speaker arrays with it).
+- **Rendering A/B (live)**: `bw_set_panner`, `bw_set_dual_band`,
+  `bw_set_spread_mode`, `bw_set_decorrelation`, `bw_set_near_spread`,
+  `bw_set_bed_renderer`, `bw_set_tracked_room_eq` (`bw_set_bed_decoder` is
+  load-time). `BwAudio` re-pushes these from `OnValidate`, so the inspector
+  A/Bs them by ear in Play mode — which is what the engine makes them atomic for.
+- **Listener**: `bw_set_pose_prediction` (internal tracking only) and
+  `bw_set_extra_listeners` — the other occupants, pushed by `BwAudio` in the same
+  frame block as the primary pose (they are commit-gated the same way).
+- **Output stage + diagnostics**: `bw_set_limiter` / `bw_set_limiter_ceiling`,
+  `bw_get_bus_levels`, `bw_test_signal`, `bw_get_speakers` / `bw_channel_count`
+  (the layout's speaker count — see "Channel count" above; size meter/speaker
+  arrays with it, never a hard-coded 26).
 - **Assets**: `bw_load_sound_streaming`, `bw_load_ambix`.
+
+Two seams a binding must not get wrong, both handled in `Room` (see below):
+`bw_bed_set_rotation` takes a **room-frame** yaw, and the X mirror **reverses the
+sense of rotation** — pass a Unity euler angle straight in and the soundfield
+spins the wrong way (`Room.YawRad` converts). The FDN's decay direction is a
+**direction**, so it goes through `Room.Dir` (no registration translation), not
+`Room.Pos`.
 
 ### Coordinate helper
 
@@ -143,9 +165,17 @@ public static class Room {
         v = UnityToRoom.MultiplyPoint3x4(v);
         return new Vector3(-v.x, v.y, v.z);                    // baseline LH->RH; real map in UnityToRoom
     }
+    public static Vector3 Dir(Vector3 v) {                     // Pos() without the translation: axes/normals
+        v = UnityToRoom.MultiplyVector(v);
+        return new Vector3(-v.x, v.y, v.z);
+    }
     public static Quaternion Rot(Quaternion q) {
         q = UnityToRoom.rotation * q;
         return new Quaternion(q.x, -q.y, -q.z, q.w);           // both frames face +Z: identity -> identity
+    }
+    public static float YawRad(float unityYawDegrees) {        // for bw_bed_set_rotation
+        Vector3 ahead = Rot(Quaternion.Euler(0f, unityYawDegrees, 0f)) * Vector3.forward;
+        return Mathf.Atan2(ahead.x, ahead.z);                  // RH yaw about +Y — the mirror flips the sense
     }
 }
 ```
