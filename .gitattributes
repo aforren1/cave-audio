@@ -1,0 +1,4 @@
+# Patch files must check out byte-exact: git apply rejects a patch whose blank
+# context lines were CRLF-converted ("corrupt patch") — exactly what happens on
+# checkouts with core.autocrlf=true (GitHub's Windows runners, some dev boxes).
+*.patch -text
