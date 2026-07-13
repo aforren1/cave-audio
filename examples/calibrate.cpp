@@ -59,7 +59,7 @@ int main(int argc, char** argv) {
     const char* out_path    = NULL;
     const char* driver      = getenv("BWAUDIO_ASIO_DRIVER");
     float mic[3] = { 0.f, 0.f, 0.f };
-    int   mic_in = 0, simulate = 0, room = 0, check = 0, live_speaker = -1, eq = 0, room_eq = 0, zylia = 0;
+    int   mic_in = 0, simulate = 0, room = 0, check = 0, live_speaker = -1, eq = 0, room_eq = 0, rq_grid = 0, zylia = 0;
     double known_latency = -1.0;
     const char* ir_prefix = NULL;
     const char* localize_file = NULL;
@@ -77,14 +77,21 @@ int main(int argc, char** argv) {
         else if (!strcmp(argv[i],"--latency") && i+1<argc) known_latency = atof(argv[++i]); /* c*tau meters, for --live absolute distance */
         else if (!strcmp(argv[i],"--eq"))                 eq          = 1;   /* per-speaker direct-sound correction FIR */
         else if (!strcmp(argv[i],"--room-eq"))            eq = room_eq = 1;  /* + room correction AT THE MIC POINT (static listener only) */
+        else if (!strcmp(argv[i],"--room-eq-grid"))       rq_grid     = 1;   /* accumulate LF modal cuts at THIS mic position into room_eq_grid (tracked room EQ) */
         else if (!strcmp(argv[i],"--zylia"))              zylia       = 1;   /* single-position localization with the ZM-1 */
         else if (!strcmp(argv[i],"--mic") && i+3<argc) { mic[0]=(float)atof(argv[++i]); mic[1]=(float)atof(argv[++i]); mic[2]=(float)atof(argv[++i]); }
-        else { fprintf(stderr, "usage: calibrate [--layout f] [--out f] [--mic x y z] [--input ch] [--driver name] [--simulate] [--room] [--eq | --room-eq] [--zylia] [--save-irs prefix] [--localize positions.txt] [--check] [--live N] [--latency m]\n"); return 2; }
+        else { fprintf(stderr, "usage: calibrate [--layout f] [--out f] [--mic x y z] [--input ch] [--driver name] [--simulate] [--room] [--eq | --room-eq | --room-eq-grid] [--zylia] [--save-irs prefix] [--localize positions.txt] [--check] [--live N] [--latency m]\n"); return 2; }
     }
+    if (room_eq && rq_grid) { fprintf(stderr, "calibrate: --room-eq and --room-eq-grid are mutually exclusive (one scheme per layout)\n"); return 2; }
     if (room_eq)
         printf("calibrate: --room-eq corrects the ROOM at the mic position — valid only for a STATIC\n"
                "           listener seated there (SPCAP/VBAP deployments); a roaming listener wants plain --eq.\n"
                "           Place the mic at the listening position, ear height.\n");
+    if (rq_grid)
+        printf("calibrate: --room-eq-grid measures this mic position's LF modal cuts and merges them into\n"
+               "           the layout's room_eq_grid — one run per mic placement, --mic x y z IS the grid\n"
+               "           key (a rerun within 5 cm replaces that entry). Cover the working area (ear\n"
+               "           height, ~0.5-1 m spacing); the engine interpolates between positions live.\n");
     if (!out_path) out_path = layout_path;                    /* in-place by default */
 
     char err[256] = {0};
@@ -264,8 +271,8 @@ int main(int argc, char** argv) {
     MeasureEqSection* rq_cuts = NULL; int* rq_counts = NULL;   /* --room-eq: LF modal cuts per speaker */
     if (eq) { eq_taps = (float*)calloc((size_t)n * BW_EQ_TAPS, sizeof(float));
               eq_lens = (uint16_t*)calloc((size_t)n, sizeof(uint16_t)); }
-    if (room_eq) { rq_cuts   = (MeasureEqSection*)calloc((size_t)n * BW_ROOM_EQ_MAX, sizeof(MeasureEqSection));
-                   rq_counts = (int*)calloc((size_t)n, sizeof(int)); }
+    if (room_eq || rq_grid) { rq_cuts   = (MeasureEqSection*)calloc((size_t)n * BW_ROOM_EQ_MAX, sizeof(MeasureEqSection));
+                              rq_counts = (int*)calloc((size_t)n, sizeof(int)); }
     for (int i = 0; i < n; ++i) {
         if (simulate) {
             calib_sim_capture(i, &L, mic, sweep, cap);
@@ -278,9 +285,9 @@ int main(int argc, char** argv) {
         measure_response(cap, CAPLEN, sweep, NSWEEP, F1, F2, FS, BAND_HZ, &res[i]);
         printf("  speaker %2d: delay=%6d  level=%.4f  bands=[%.3f %.3f %.3f]\n",
                i, res[i].delay_samples, res[i].level, res[i].band[0], res[i].band[1], res[i].band[2]);
-        if (room || ir_prefix || eq) {                         /* room report + retained IR kernels + EQ */
+        if (room || ir_prefix || eq || rq_grid) {              /* room report + retained IR kernels + EQ */
             RoomResult rr; static float irbuf[IR_LEN];
-            int want_ir = (ir_prefix || eq);
+            int want_ir = (ir_prefix || eq || rq_grid);
             measure_room(cap, CAPLEN, sweep, NSWEEP, F1, F2, FS, &rr, want_ir ? irbuf : NULL, want_ir ? IR_LEN : 0);
             if (room) {
                 printf("            RT60=%.3f s  early reflections:", rr.rt60);
@@ -306,6 +313,18 @@ int main(int argc, char** argv) {
                     eq_lens[i] = (uint16_t)NTAPS;
                 printf("            eq: %d-tap correction (gate %s)\n", eq_lens[i],
                        first_refl ? "to first reflection" : "default 4 ms");
+            }
+            if (rq_grid) {     /* tracked room EQ: this position's LF modal cuts (same 30-200 Hz band +
+                                * 12 dB depth cap as --room-eq's cut half; the merge across positions
+                                * happens in the writeback) */
+                int nc = measure_room_cuts(irbuf, IR_LEN, 0, FS, 30.0, 200.0, 12.0,
+                                           BW_ROOM_EQ_MAX, &rq_cuts[(size_t)i * BW_ROOM_EQ_MAX]);
+                rq_counts[i] = nc < 0 ? 0 : nc;
+                printf("            room-eq-grid: %d LF modal cut(s) at this position", rq_counts[i]);
+                for (int s = 0; s < rq_counts[i]; ++s)
+                    printf("  [%.0f Hz %.1f dB Q%.1f]", rq_cuts[(size_t)i*BW_ROOM_EQ_MAX+s].fc,
+                           rq_cuts[(size_t)i*BW_ROOM_EQ_MAX+s].gain_db, rq_cuts[(size_t)i*BW_ROOM_EQ_MAX+s].q);
+                printf("\n");
             }
         }
     }
@@ -344,8 +363,14 @@ int main(int argc, char** argv) {
         if (!calib_write_room_eq(out_path, out_path, rq_cuts, rq_counts, n, BW_ROOM_EQ_MAX, err, sizeof err))
             fprintf(stderr, "calibrate: room-eq writeback: %s\n", err);
         else printf("calibrate: wrote LF modal cuts (room_eq) to %s\n", out_path);
-        free(rq_cuts); free(rq_counts);
     }
+    if (rq_grid) {   /* merge this mic position into room_eq_grid (replace-within-5cm or append) */
+        if (!calib_write_room_eq_grid(out_path, out_path, mic, rq_cuts, rq_counts, n, BW_ROOM_EQ_MAX, err, sizeof err))
+            fprintf(stderr, "calibrate: room-eq-grid writeback: %s\n", err);
+        else printf("calibrate: merged position (%.2f %.2f %.2f) into room_eq_grid in %s\n",
+                    mic[0], mic[1], mic[2], out_path);
+    }
+    if (room_eq || rq_grid) { free(rq_cuts); free(rq_counts); }
 
     free(gdb); free(dms); free(res); free(cap); free(sweep);
     return 0;

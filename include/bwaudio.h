@@ -185,8 +185,24 @@ typedef struct {
 /* Set the reflection config. Load-time only (between bw_create and bw_start); copies the struct,
  * zero fields take defaults. No-op without the Steam Audio backend. */
 BW_API void     bw_reflections_config(BwEngine* e, const BwReflectionConfig* cfg);
-/* Set the reverb wet level (linear; 1 = unity) live. Per-frame-safe. No-op if the bed isn't running. */
+/* Set the reverb wet level (linear; 1 = unity) live. Per-frame-safe. No-op if no bed is running.
+ * Applies to whichever reverb bed owns the tap — the Steam bed or the FDN below. */
 BW_API void     bw_reflections_set_gain(BwEngine* e, float linear);
+
+/* ---- directional FDN reverb bed (load-time; no SDK needed) ----
+ * A phonon-free late-reverb alternative to the Steam reflection bed: a 16-line feedback delay
+ * network whose lines are rendered as plane waves through the layout's SH->26 bed decode, fed by
+ * the SAME mono aux send (bw_source_set_reflections + the per-source send levels apply unchanged).
+ * The decay is a DESIGN parameter — set what the content wants, don't match the real room (that
+ * double-counts; docs/calibration.md). Decay can be ANISOTROPIC: scale the decay time toward a
+ * direction (factor < 1 = the field dies faster that way — an open or treated side), the diagonal
+ * special case of the Directional FDN (Alary/Politis/Schlecht, JAES 2019). Enabling it takes the
+ * reverb tap INSTEAD of the Steam bed (one reverb bed at a time); works in no-SDK builds — the
+ * playground's reverb scene runs without phonon. All three calls are load-time (between bw_create
+ * and bw_start); defaults: 1.2 s low / 0.7 s high @ 2 kHz crossover, uniform, unity return. */
+BW_API void     bw_reverb_fdn(BwEngine* e, bool on);
+BW_API void     bw_fdn_set_decay(BwEngine* e, float rt60_low_s, float rt60_high_s, float xover_hz);
+BW_API void     bw_fdn_set_decay_direction(BwEngine* e, const float dir[3], float factor);
 /* Opt a source into the shared bed's wet send (per-frame-safe, enqueue-only). With the bed disabled
  * or no SDK, this just gates a send that goes nowhere. */
 BW_API void     bw_source_set_reflections(BwEngine* e, BwSource s, bool on);
@@ -231,6 +247,12 @@ BW_API void     bw_source_set_doppler(BwEngine* e, BwSource s, bool on);
 /* Air absorption: a distance-driven high-frequency low-pass (far sources sound duller). Subtle at a
  * few metres, pronounced for sources placed at large virtual distances. */
 BW_API void     bw_source_set_air_absorption(BwEngine* e, BwSource s, bool on);
+/* Equal-loudness distance compensation: as distance attenuation takes level away, the ear also loses
+ * LF sensitivity (ISO 226 contours), so an attenuated source reads THIN as well as far. This restores
+ * part of the body with an LF shelf that tracks the attenuation (+0.4 dB per dB taken, capped +8 dB) —
+ * "far, not tinny". A perceptual stylization, not physics; leave it off for strict realism. Direct
+ * path only (like air/Doppler); ramped; per-frame-safe. */
+BW_API void     bw_source_set_loudness_comp(BwEngine* e, BwSource s, bool on);
 /* Source spread / size: angular width of the source, 0 = a point (default) .. 1 = wide. Spreads the
  * source's energy across the speakers around its direction (a waterfall/crowd/ambience that shouldn't
  * collapse to one point), centred on its direction and constant-power. Works with any panner. */
@@ -275,6 +297,27 @@ BW_API void     bw_set_panner(BwEngine* e, BwPanner panner);
  * (energy-vector) normalisation — better low-frequency localisation for a near-centred listener. Wraps
  * the selected panner; live-toggleable for A/B. Sweet-spot dependent like VBAP (see docs). */
 BW_API void     bw_set_dual_band(BwEngine* e, bool on);
+/* How bw_source_set_spread renders a source's width (live A/B; sources with spread 0 are unaffected).
+ * LOBE (default) reshapes the point gains toward a width-controlled lobe — one solve, smooth,
+ * approximate. MDAP (Pulkki's multiple-direction amplitude panning) pans a ring of virtual sources
+ * around the source direction with the selected panner and sums — the extent is made of real panner
+ * solves (panner-true: VBAP stays sparse, SPCAP stays placement-corrected), at ~13x the gain-solve
+ * cost (block-rate + dirty-gated, still cheap). Both are constant-power. See docs/spatialization.md. */
+typedef enum { BW_SPREAD_LOBE = 0, BW_SPREAD_MDAP = 1 } BwSpreadMode;
+BW_API void     bw_set_spread_mode(BwEngine* e, BwSpreadMode mode);
+/* Decorrelate the WIDE part of spread sources (off by default; live A/B). Amplitude panning feeds
+ * every speaker the SAME signal, so a wide source still collapses to phantom images and comb-filters
+ * as the tracked listener walks. With this on, a spread source's energy splits: the coherent share
+ * stays on the normal path, the rest passes through per-speaker sparse velvet-noise filters
+ * (~30 taps, time-domain, no latency) so the copies are mutually incoherent — real extent, stable
+ * timbre while moving. Constant-power (incoherent energy adds); the split follows spread (0 = all
+ * coherent). Point sources (spread 0) are untouched. */
+BW_API void     bw_set_decorrelation(BwEngine* e, bool on);
+/* Near-listener widening (0 = off, the default): floor every source's spread at 1 - dist/radius, so
+ * a source flying at the head WIDENS (it subtends a growing angle) instead of collapsing into the
+ * nearest speaker and snapping across it. radius_m ~ 1.0 is a good start; the widened part follows
+ * the selected spread mode and (when enabled) decorrelates. Engine-wide policy; live-safe. */
+BW_API void     bw_set_near_spread(BwEngine* e, float radius_m);
 
 /* ---- output protection limiter (ON by default at -1 dBFS) ----
  * The final stage on the 26-ch output — everything (voices, beds, reflections, pathing, per-speaker
@@ -292,6 +335,26 @@ BW_API void     bw_set_limiter_ceiling(BwEngine* e, float ceiling_db);   /* e.g.
  * ambisonic + reflection BEDS only, not the point-source panner. See docs/spatialization.md. */
 typedef enum { BW_DECODE_SAMPLING = 0, BW_DECODE_ALLRAD = 1 } BwBedDecoder;
 BW_API void     bw_set_bed_decoder(BwEngine* e, BwBedDecoder decoder);
+
+/* Select how ambisonic BEDS render (live: each bed crossfades to the selection — a click-free A/B).
+ * MATRIX (default) is the static SH->26 decode (sampling or AllRAD per bw_set_bed_decoder) — cheap,
+ * world-locked, sweet-spot-ish. PARAMETRIC analyzes the bed's first-order channels per frequency
+ * band into a direction + diffuseness (DirAC-style intensity analysis): the non-diffuse stream is
+ * RE-PANNED through the engine's listener-relative panner at the array shell — a recorded soundfield
+ * becomes WALKABLE (off-centre listeners get correct directions + parallax, which no matrix decode
+ * can give) — and the diffuse stream decodes through the matrix into per-speaker decorrelators
+ * (incoherent envelopment). Loudness-matched to the matrix decode; beds with < 4 channels stay on
+ * the matrix. See docs/spatialization.md. */
+typedef enum { BW_BED_MATRIX = 0, BW_BED_PARAMETRIC = 1 } BwBedRenderer;
+BW_API void     bw_set_bed_renderer(BwEngine* e, BwBedRenderer renderer);
+
+/* Tracked room EQ (layouts carrying a room_eq_grid, written by bw_calibrate --room-eq-grid): the LF
+ * modal cuts are re-interpolated at the LIVE listener position each block and the per-speaker biquads
+ * glide toward them — room correction that survives a moving/tracked listener, unlike the static
+ * per-speaker room_eq (which bw_start rejects for moving sessions). ON by default when a grid is
+ * present; this is the live kill switch (off glides every cut to flat — a click-free A/B). A no-op
+ * for layouts without a grid. Control thread, per-frame-safe. See docs/calibration.md. */
+BW_API void     bw_set_tracked_room_eq(BwEngine* e, bool on);
 
 /* ---- offline panner evaluation (no engine handle; for layout scoring/optimization in tools) ----
  * The per-speaker gains the given `panner` produces for `nsrc` source positions heard from one
@@ -325,6 +388,24 @@ BW_API void bw_set_listener_pose(BwEngine* e, float px, float py, float pz,
  * under track_internal, the freshest tracked pose. For visuals/logging/debugging tracking; safe
  * to poll from the control thread. Fills p[3] (position) and q[4] (orientation xyzw). */
 BW_API void bw_get_listener_pose(BwEngine* e, float p[3], float q[4]);
+
+/* Pose prediction (track_internal only; 0 = off, the default): extrapolate the tracked POSITION by
+ * `lead_ms` along a velocity estimated from the tracker's own frame timestamps (smoothed ~100 ms,
+ * speed-capped, reset across drop-outs). The tracking chain — Motive solve, network, the audio
+ * block, the DAC — puts the rendered pose 20-40 ms behind the head; at walking speed that is a few
+ * cm of panning lag this hides. Set lead_ms to your measured motion-to-ears latency; too much lead
+ * OVERSHOOTS on direction changes (clamped at 200 ms). Live-safe. */
+BW_API void bw_set_pose_prediction(BwEngine* e, float lead_ms);
+
+/* Extra listeners (multi-occupant compromise panning; 0 = off, the default). A CAVE usually holds
+ * more than one person, and single-listener panning is exact for the tracked head and wrong for
+ * everyone else. Give the OTHER occupants' positions here (up to 3, `xyz` = count*3 floats, room
+ * space; the primary listener stays bw_set_listener_pose / tracking): every source's gains become
+ * the per-speaker ENERGY MEAN of the per-listener solves — each occupant hears the image biased
+ * toward their own solve instead of one exact + N wrong. Constant-power; works with every panner
+ * (each extra gets its own SPCAP/VBAP cache). Spread/Doppler/air and the monitor stay primary-
+ * relative. Per-frame-safe, commit-gated like the pose; count 0 restores single-listener panning. */
+BW_API void bw_set_extra_listeners(BwEngine* e, const float* xyz, uint32_t count);
 
 /* ---- frame boundary ----
  * Promotes this frame's position/pose updates as one coherent snapshot and drains

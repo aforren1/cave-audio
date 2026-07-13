@@ -128,6 +128,32 @@ model (fixed centre vs the moving working volume). The file:
 | `eq` | float array (optional) | minimum-phase correction-FIR taps (up to 512), written by `bw_calibrate --eq` / `--room-eq`; applied per channel in the align stage before gain+delay. |
 | `room_eq` | object array (optional) | up to 8 LF modal-cut sections `{fc, gain_db, q}` (RBJ peaking, **cuts only**: `gain_db` in `[-24, 0]`, `fc` in `[10, 1000]`, `q` in `[0.25, 24]`), written by `bw_calibrate --room-eq`. **Static-listener room correction** — see [`calibration.md`](./calibration.md); rendered as biquads at the engine rate. |
 
+### Tracked room EQ: top-level `room_eq_grid` (optional)
+
+The moving-listener form of `room_eq`, written by `bw_calibrate --room-eq-grid` (one
+run per mic placement — see [`calibration.md`](./calibration.md)). The engine
+interpolates the cut depths at the live listener position each block and glides the
+align biquads toward them (`bw_set_tracked_room_eq` is the live kill switch).
+
+```jsonc
+"room_eq_grid": [
+  { "position": [-0.5, 1.2, 0.0],          // mic position, room meters
+    "speakers": [                           // exactly 26 entries, channel order
+      [ {"fc": 44.6, "gain_db": -7.9, "q": 6.1} ],   // speaker 0's sections AT THIS POSITION
+      [],                                            // speaker 1: no cuts
+      // ... 24 more
+    ] },
+  { "position": [0.5, 1.2, 0.0], "speakers": [ /* same ladder, this position's depths */ ] }
+]
+```
+
+1–16 positions. Section ranges match `room_eq` (cuts only, `fc` `[10, 1000]`, `q`
+`[0.25, 24]`; `gain_db 0` = this position doesn't need the cut). **Every position
+must carry the same per-speaker `fc`/`q` ladder** — only the depths vary — because
+the runtime interpolates depths by ladder index; the loader rejects a mismatch.
+`room_eq` and `room_eq_grid` in one file are rejected too (one correction scheme at
+a time). The calibration writeback maintains both invariants for you.
+
 ## Validation (loader contract)
 
 `layout_load` rejects a malformed file (the reason surfaces through `bw_last_error`)
@@ -139,7 +165,11 @@ if any of:
 - `gain_db` is outside `[-100, 24]`, or `delay_ms` exceeds 1000 ms (a negative
   `delay_ms` is not an error — it clamps to 0);
 - a `room_eq` section is out of its documented range, or an `eq` (>512 taps) or
-  `room_eq` (>8 sections) array is over its cap, or a tap is non-finite.
+  `room_eq` (>8 sections) array is over its cap, or a tap is non-finite;
+- a `room_eq_grid` is malformed: 0 or >16 positions, an entry without
+  `position[3]` + `speakers[26]`, a section out of range, positions disagreeing on
+  a speaker's `fc`/`q` ladder, or the file carrying both `room_eq` and
+  `room_eq_grid`.
 
 `schema_version` is not checked — the loader never reads it.
 
@@ -160,7 +190,8 @@ reloads it.
 `bw_calibrate` writes its results back into this file, and it does so
 non-destructively. Every `calib_write_*` function (`src/calib.c`) re-parses the
 original JSON, mutates only its target fields — `gain_db`/`delay_ms` for the trims,
-`eq`, `room_eq`, `position` for the survey — and re-serializes the whole root.
+`eq`, `room_eq`, `room_eq_grid`, `position` for the survey — and re-serializes the
+whole root.
 
 Everything else in the file survives: unknown fields, per-speaker annotations, the
 `reference` block, `note` strings. You can annotate a layout freely and recalibrate

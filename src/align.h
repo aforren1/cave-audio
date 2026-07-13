@@ -17,4 +17,10 @@ Aligner* align_create(uint32_t channels, const Layout* L, uint32_t sample_rate);
 void     align_destroy(Aligner* a);
 void     align_process(Aligner* a, float* bus, uint32_t nframes);  /* in place; planar bus */
 
+/* Tracked room EQ (layouts with a room_eq_grid): set the section-gain targets (dB, <= 0) the next
+ * align_process blocks slew toward — rt.c interpolates them from the grid at the live listener
+ * position. gain_db is [channel][section] over the grid's fc/q ladder. AUDIO thread (the same thread
+ * as align_process — plain stores, no atomics needed); no-op for a gridless layout. */
+void     align_room_eq_targets(Aligner* a, const float (*gain_db)[BW_ROOM_EQ_MAX]);
+
 #endif /* BW_ALIGN_H */

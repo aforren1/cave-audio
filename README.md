@@ -4,10 +4,6 @@ Self-hosted spatial audio engine for a 26-speaker CAVE installation. Drives the
 array over **ASIO → Dante Virtual Soundcard**, with a **binaural HRTF monitor** for
 desk-side debugging. Unity and Unreal connect as thin control clients over a C ABI.
 
-> **Status:** implemented through M6 (engine, spatialization, Steam Audio
-> materials/reflections/pathing, tracking, calibration, tooling; 19 ctests).
-> Remaining: hardware verification at the rig.
-
 ## Why self-hosted
 
 Going direct (no FMOD/Wwise) gives sample-accurate access to ASIO timing hooks and
@@ -78,6 +74,15 @@ Current gaps (may change):
 
 ## Getting started
 
+Build — no vendored dependencies required (without the ASIO SDK you get the
+silent offline sink; [`docs/build.md`](./docs/build.md) has the device/SDK setup):
+
+```
+cmake -S . -B build -A x64
+cmake --build build --config RelWithDebInfo
+ctest --test-dir build -C RelWithDebInfo
+```
+
 Usage docs live in [`docs/api.md`](./docs/api.md): quickstart, profiles, the
 threading contract, coordinates, error handling, environment variables, then a
 per-call reference. [`examples/minimal.c`](./examples/minimal.c) runs the whole
@@ -104,7 +109,7 @@ bw_commit(e);
 | doc | covers |
 |-----|--------|
 | [`docs/api.md`](./docs/api.md) | usage guide + per-call reference |
-| [`include/bwaudio.h`](./include/bwaudio.h) | the C ABI; every declaration commented |
+| [`include/bwaudio.h`](./include/bwaudio.h) | the C ABI |
 | [`docs/architecture.md`](./docs/architecture.md) | system overview, the bus seam, locked decisions |
 | [`docs/concurrency.md`](./docs/concurrency.md) | threading model, rings, commit snapshot, lifetimes |
 | [`docs/spatialization.md`](./docs/spatialization.md) | DBAP/SPCAP/VBAP, dual-band, binaural decode, alignment |

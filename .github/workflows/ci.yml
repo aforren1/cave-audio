@@ -6,11 +6,17 @@
 #     repo's documented one-liner) and cached; it is dual-licensed GPLv3/proprietary
 #     and this project uses the GPLv3 option, consistent with the repo LICENSE — so
 #     the artifact is redistributable under GPLv3 (source = this repo at the commit).
-#   - Steam Audio: NOT built (needs the patched phonon submodule build — heavy;
-#     see third_party/README.md). Binaural falls back to the simple-pan monitor;
-#     the with-SDK tests (reflect/bake/path/steam_decode) don't run here → 12 ctests.
-#   - GUI tools (playground/calib_view/layout_tool): not built — they need a display
-#     and aren't part of the distributed library.
+#   - Steam Audio: BUILT (the patched phonon core, recipe = third_party/README.md),
+#     cached on the submodule sha + patch hash — the first run pays the phonon
+#     build, later runs restore it. The with-SDK tests (reflect/bake/path/
+#     steam_decode) run, binaural is the real HRTF decode, and the artifact ships
+#     phonon.dll next to bwaudio.dll (the dll does not load without it).
+#   - Tools (playground/layout_tool/calib_view + calibrate/zylia_probe): BUILT and
+#     shipped in the artifact. Their imgui-test-engine UI suites need a display +
+#     OpenGL, which runners don't have — ctest excludes those three suites here
+#     (they run locally / at the rig).
+#   - Configs: x64 only. RelWithDebInfo is the full build (tested + tools);
+#     Debug builds the engine + bw_minimal for downstream debugging (smoke-run).
 #
 # Tests run with BWAUDIO_SINK=null, the documented CI mode (no audio hardware on
 # runners; forcing null keeps it deterministic rather than relying on fallback).
@@ -29,10 +35,10 @@ concurrency:
 jobs:
   windows:
     runs-on: windows-latest
-    timeout-minutes: 30
+    timeout-minutes: 75   # the uncached phonon build is the long pole; cached runs are far under
     steps:
       - uses: actions/checkout@v4
-        # no submodules: steam-audio-source is only needed for the phonon build (skipped here)
+        # no submodules by default: steam-audio-source is fetched only on a phonon cache miss
 
       - name: Cache ASIO SDK
         id: asiosdk
@@ -54,44 +60,138 @@ jobs:
           Move-Item $hit.Directory.Parent.FullName third_party/asiosdk
           Remove-Item asiosdk.zip, asiosdk_tmp -Recurse -Force
 
+      - name: Phonon cache key (submodule sha, no checkout needed)
+        id: phonon-key
+        shell: bash
+        run: echo "sha=$(git rev-parse HEAD:third_party/steam-audio-source)" >> "$GITHUB_OUTPUT"
+
+      - name: Cache phonon (built Steam Audio core)
+        id: phonon
+        uses: actions/cache@v4
+        with:
+          path: third_party/steam-audio-artifacts
+          key: phonon-v1-${{ steps.phonon-key.outputs.sha }}-${{ hashFiles('third_party/patches/**') }}
+
+      - name: Build phonon (cache miss only; recipe = third_party/README.md)
+        if: steps.phonon.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          git submodule update --init --depth 1 third_party/steam-audio-source \
+            || git submodule update --init third_party/steam-audio-source
+          # REQUIRED for directional reflections (upstream steam-audio#546):
+          git -C third_party/steam-audio-source apply ../patches/phonon-multiplyaccumulate-align.patch
+
+          # The pinned build scripts hard-code "Visual Studio 17 2022"; rewrite that to
+          # CMake's default generator (= the VS this runner actually has, and the same
+          # generator our own Configure step will use).
+          GEN="$(cmake --help | sed -n 's/^\* \(Visual Studio [0-9]* [0-9]*\).*/\1/p' | head -1)"
+          test -n "$GEN"
+          echo "using generator: $GEN"
+          sed -i "s/Visual Studio 17 2022/$GEN/g" \
+              third_party/steam-audio-source/core/build/build.py \
+              third_party/steam-audio-source/core/build/get_dependencies.py
+
+          # Everything /MD (the CRT gotcha in third_party/README.md); --minimal drops
+          # Embree/IPP/GPU/sample apps; skip phonon_test (CRT-fragile exe).
+          cd third_party/steam-audio-source/core/build
+          python get_dependencies.py --dependency flatbuffers -p windows -a x64 -t vs2022
+          for d in zlib pffft mysofa; do
+            python get_dependencies.py --dependency $d --sharedcrt -p windows -a x64 -t vs2022
+          done
+          python build.py -p windows -a x64 -t vs2022 -c release --minimal -o generate
+          cmake -DSTEAMAUDIO_STATIC_RUNTIME=OFF build/windows-vs2022-x64
+          cmake --build build/windows-vs2022-x64 --config Release --target phonon
+          cd ../../../..
+
+          # Stage where BWAUDIO_WITH_STEAMAUDIO auto-detects it. find: the build-tree
+          # layout is phonon's business; only the staged layout is ours.
+          ART=third_party/steam-audio-artifacts
+          mkdir -p "$ART/include" "$ART/lib/windows-x64"
+          CORE=third_party/steam-audio-source/core
+          cp "$CORE/src/core/phonon.h"                              "$ART/include/"
+          cp "$(find $CORE/build -name phonon_version.h | head -1)" "$ART/include/"
+          cp "$(find $CORE/build -name phonon.dll | head -1)"       "$ART/lib/windows-x64/"
+          cp "$(find $CORE/build -name phonon.lib | head -1)"       "$ART/lib/windows-x64/"
+          test -f "$ART/lib/windows-x64/phonon.dll" && test -f "$ART/include/phonon_version.h"
+
       - name: Configure
         shell: bash
         run: |
           # No -G pin: CMake defaults to the newest Visual Studio on the runner. Pinning
           # "Visual Studio 17 2022" broke when the windows-latest image dropped VS 2022.
-          cmake -S . -B build -A x64 | tee configure.log
-          # the artifact must contain the production device path — fail loudly if it didn't wire up
+          cmake -S . -B build -A x64 \
+                -DBWAUDIO_BUILD_PLAYGROUND=ON \
+                -DBWAUDIO_BUILD_CALIBVIEW=ON \
+                -DBWAUDIO_BUILD_CALIBRATE=ON | tee configure.log
+          # the artifact must contain the production device path AND the HRTF decode —
+          # fail loudly if either didn't wire up
           grep -q "ASIO backend ENABLED" configure.log
+          grep -q "Steam Audio ENABLED" configure.log
 
-      - name: Build
+      - name: Build (RelWithDebInfo — everything)
         run: cmake --build build --config RelWithDebInfo
+
+      - name: Build (Debug — engine + smoke only)
+        run: cmake --build build --config Debug --target bwaudio bw_minimal
 
       - name: Test
         env:
           BWAUDIO_SINK: "null"   # quoted: bare null is YAML-null -> empty string, not the string "null"
-        run: ctest --test-dir build -C RelWithDebInfo --output-on-failure
+        # -E: the GUI UI suites need a display + OpenGL; everything else runs
+        run: ctest --test-dir build -C RelWithDebInfo --output-on-failure -E '^(playground|layout_tool|calib_view)$'
+
+      - name: Smoke (Debug)
+        env:
+          BWAUDIO_SINK: "null"
+        # the Debug dll ships too — prove it loads (incl. phonon.dll) and runs a lifecycle
+        run: build/Debug/bw_minimal.exe
 
       - name: Stage dist
         shell: pwsh
         run: |
-          New-Item -ItemType Directory dist | Out-Null
+          New-Item -ItemType Directory dist, dist/RelWithDebInfo, dist/Debug | Out-Null
+          Copy-Item include/bwaudio.h,
+                    LICENSE,
+                    THIRD_PARTY-NOTICES.md dist/
+          # the JSONs live NEXT TO the tools: playground/layout_tool resolve
+          # ./cave_layout.json + ./constraints.json relative to their working dir
+          Copy-Item examples/cave_layout.json,
+                    examples/constraints.json dist/RelWithDebInfo/
           Copy-Item build/RelWithDebInfo/bwaudio.dll,
                     build/RelWithDebInfo/bwaudio.lib,
                     build/RelWithDebInfo/bwaudio.pdb,
+                    build/RelWithDebInfo/phonon.dll,
                     build/RelWithDebInfo/bw_minimal.exe,
-                    include/bwaudio.h,
-                    examples/cave_layout.json,
-                    LICENSE dist/
+                    build/RelWithDebInfo/bw_playground.exe,
+                    build/RelWithDebInfo/bw_layout_tool.exe,
+                    build/RelWithDebInfo/bw_calib_view.exe,
+                    build/RelWithDebInfo/bw_calibrate.exe,
+                    build/RelWithDebInfo/bw_zylia_probe.exe dist/RelWithDebInfo/
+          Copy-Item build/Debug/bwaudio.dll,
+                    build/Debug/bwaudio.lib,
+                    build/Debug/bwaudio.pdb,
+                    build/Debug/phonon.dll,
+                    build/Debug/bw_minimal.exe dist/Debug/
           @"
-          bwaudio win64 RelWithDebInfo — limited distribution build
+          bwaudio win64 — limited distribution build
           commit   ${{ github.sha }} (${{ github.ref_name }})
           built    $((Get-Date).ToUniversalTime().ToString('s'))Z  (GitHub Actions run ${{ github.run_id }})
-          backends ASIO=yes  SteamAudio=no (binaural monitor = simple-pan fallback;
-                   the production HRTF decode needs the phonon artifacts — third_party/README.md)
-          contents bwaudio.dll/.lib/.pdb (the C ABI, include/bwaudio.h), bw_minimal.exe
-                   (smoke check: runs the whole client lifecycle, no hardware needed),
-                   cave_layout.json (example layout)
-          license  GPLv3 (LICENSE included); complete source:
+          try      RelWithDebInfo\bw_playground.exe — needs no audio device (renders
+                   silently, the 3D view + meters stay live); bw_playground --help for keys
+          needs    the Microsoft VC++ x64 runtime (vcruntime140*.dll). Any machine with
+                   Visual Studio has it; otherwise https://aka.ms/vs/17/release/vc_redist.x64.exe
+          backends ASIO=yes  SteamAudio=yes (patched phonon 4.8.1+10: HRTF decode,
+                   occlusion, reflections, pathing — third_party/README.md)
+          contents RelWithDebInfo/ — bwaudio.dll/.lib/.pdb + phonon.dll (KEEP THEM
+                   TOGETHER: bwaudio.dll does not load without phonon.dll beside it),
+                   bw_minimal.exe (smoke check: runs the whole client lifecycle, no
+                   hardware needed), tools: bw_playground / bw_layout_tool /
+                   bw_calib_view (GUI — need a display), bw_calibrate + bw_zylia_probe
+                   (console), cave_layout.json + constraints.json (example layout +
+                   room, read by the tools from their own directory). Debug/ — engine
+                   dll/.lib/.pdb + phonon.dll + bw_minimal. Root — include/bwaudio.h.
+                   x64 only.
+          license  GPLv3 (LICENSE) + THIRD_PARTY-NOTICES.md; complete source:
                    https://github.com/aforren1/cave-audio/tree/${{ github.sha }}
           "@ | Out-File -Encoding utf8 dist/DIST.txt
           Get-Content dist/DIST.txt

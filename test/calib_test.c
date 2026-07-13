@@ -170,6 +170,100 @@ int main(void) {
         }
     }
 
+    /* calib_room_grid_merge: the same mode read from two positions clusters into ONE ladder section
+     * (fcs within tolerance), keeping each position's own depth; a mode only one position saw gets a
+     * 0 dB filler at the other (congruence). */
+    {
+        MeasureEqSection cuts[2 * BW_ROOM_EQ_MAX];
+        memset(cuts, 0, sizeof cuts);
+        cuts[0].fc = 44.8f; cuts[0].gain_db = -8.f; cuts[0].q = 6.f;   /* position 0: the 45 Hz mode + 120 Hz */
+        cuts[1].fc = 118.f; cuts[1].gain_db = -5.f; cuts[1].q = 4.f;
+        cuts[BW_ROOM_EQ_MAX + 0].fc = 45.9f;                            /* position 1: the same 45 Hz mode, 2% off */
+        cuts[BW_ROOM_EQ_MAX + 0].gain_db = -4.f;
+        cuts[BW_ROOM_EQ_MAX + 0].q = 8.f;
+        int counts[2] = { 2, 1 };
+        float fc[BW_ROOM_EQ_MAX], q[BW_ROOM_EQ_MAX], g[2 * BW_ROOM_EQ_MAX];
+        int lad = calib_room_grid_merge(cuts, counts, 2, BW_ROOM_EQ_MAX, 0.08, BW_ROOM_EQ_MAX, fc, q, g);
+        CHECK(lad == 2, "two positions merge into a 2-section ladder (shared mode clustered)");
+        if (lad == 2) {
+            CHECK(fc[0] > 44.f && fc[0] < 46.f && fabs(q[0] - 7.f) < 0.01, "cluster takes the member-median fc/q");
+            CHECK(fabs(g[0*BW_ROOM_EQ_MAX + 0] + 8.f) < 1e-4 && fabs(g[1*BW_ROOM_EQ_MAX + 0] + 4.f) < 1e-4,
+                  "each position keeps its own depth for the shared mode");
+            CHECK(fabs(fc[1] - 118.f) < 1e-3 && fabs(g[0*BW_ROOM_EQ_MAX + 1] + 5.f) < 1e-4,
+                  "the position-0-only mode survives");
+            CHECK(g[1*BW_ROOM_EQ_MAX + 1] == 0.f, "the position that missed a mode gets a 0 dB filler");
+        }
+    }
+
+    /* calib_write_room_eq_grid: one run per mic placement ACCUMULATES the grid — the second position
+     * appends, a rerun within 5 cm replaces, and the static room_eq is removed (mutually exclusive). */
+    {
+        const char* GIN = "bw_grid_in.json";
+        FILE* gf = fopen(GIN, "wb");
+        CHECK(gf != NULL, "open grid in.json");
+        if (gf) {
+            fputs("{\n \"speakers\": [\n"
+                  "  { \"index\": 0, \"position\": [1,0,0], \"room_eq\": [{\"fc\":80,\"gain_db\":-6,\"q\":4}] },\n"
+                  "  { \"index\": 1, \"position\": [2,0,0] }\n ]\n}\n", gf);
+            fclose(gf);
+            MeasureEqSection cuts[2 * BW_ROOM_EQ_MAX];
+            int counts[2];
+            char err[256] = {0};
+            memset(cuts, 0, sizeof cuts);                              /* run 1: mic A sees 45 Hz on speaker 0 */
+            cuts[0].fc = 45.f; cuts[0].gain_db = -8.f; cuts[0].q = 6.f;
+            counts[0] = 1; counts[1] = 0;
+            float micA[3] = { -0.5f, 1.5f, 0.f }, micB[3] = { 0.5f, 1.5f, 0.f };
+            CHECK(calib_write_room_eq_grid(GIN, GIN, micA, cuts, counts, 2, BW_ROOM_EQ_MAX, err, sizeof err),
+                  err[0] ? err : "grid writeback run 1");
+            memset(cuts, 0, sizeof cuts);                              /* run 2: mic B reads the mode shallower */
+            cuts[0].fc = 45.5f; cuts[0].gain_db = -3.f; cuts[0].q = 6.f;
+            counts[0] = 1; counts[1] = 0;
+            CHECK(calib_write_room_eq_grid(GIN, GIN, micB, cuts, counts, 2, BW_ROOM_EQ_MAX, err, sizeof err),
+                  err[0] ? err : "grid writeback run 2");
+            memset(cuts, 0, sizeof cuts);                              /* run 3: B re-measured (2 cm off: replaces) */
+            cuts[0].fc = 45.5f; cuts[0].gain_db = -4.f; cuts[0].q = 6.f;
+            counts[0] = 1; counts[1] = 0;
+            float micB2[3] = { 0.52f, 1.5f, 0.f };
+            CHECK(calib_write_room_eq_grid(GIN, GIN, micB2, cuts, counts, 2, BW_ROOM_EQ_MAX, err, sizeof err),
+                  err[0] ? err : "grid writeback run 3");
+            FILE* rf = fopen(GIN, "rb");
+            if (rf) {
+                fseek(rf, 0, SEEK_END); long len = ftell(rf); fseek(rf, 0, SEEK_SET);
+                char* buf = (char*)malloc((size_t)len + 1); size_t rd = fread(buf, 1, (size_t)len, rf); buf[rd] = 0; fclose(rf);
+                cJSON* root = cJSON_Parse(buf);
+                CHECK(root != NULL, "reparse written grid layout");
+                if (root) {
+                    cJSON* sps = cJSON_GetObjectItem(root, "speakers");
+                    CHECK(cJSON_GetObjectItem(cJSON_GetArrayItem(sps, 0), "room_eq") == NULL,
+                          "static room_eq removed by the grid writeback");
+                    cJSON* grid = cJSON_GetObjectItem(root, "room_eq_grid");
+                    CHECK(cJSON_IsArray(grid) && cJSON_GetArraySize(grid) == 2,
+                          "three runs at two spots leave two grid positions (rerun replaced)");
+                    if (cJSON_IsArray(grid) && cJSON_GetArraySize(grid) == 2) {
+                        cJSON* eA = cJSON_GetArrayItem(grid, 0);
+                        cJSON* eB = cJSON_GetArrayItem(grid, 1);
+                        cJSON* sA = cJSON_GetArrayItem(cJSON_GetObjectItem(eA, "speakers"), 0);
+                        cJSON* sB = cJSON_GetArrayItem(cJSON_GetObjectItem(eB, "speakers"), 0);
+                        CHECK(cJSON_GetArraySize(sA) == 1 && cJSON_GetArraySize(sB) == 1,
+                              "both positions carry the merged 1-section ladder");
+                        double gA = cJSON_GetObjectItem(cJSON_GetArrayItem(sA, 0), "gain_db")->valuedouble;
+                        double gB = cJSON_GetObjectItem(cJSON_GetArrayItem(sB, 0), "gain_db")->valuedouble;
+                        CHECK(fabs(gA + 8.0) < 0.011, "position A keeps its depth through the re-merge");
+                        CHECK(fabs(gB + 4.0) < 0.011, "the rerun's depth replaced the stale entry");
+                        double fB = cJSON_GetObjectItem(cJSON_GetArrayItem(sB, 0), "fc")->valuedouble;
+                        double fA = cJSON_GetObjectItem(cJSON_GetArrayItem(sA, 0), "fc")->valuedouble;
+                        CHECK(fabs(fA - fB) < 1e-6, "positions share one fc ladder (congruent for the loader)");
+                        cJSON* s1A = cJSON_GetArrayItem(cJSON_GetObjectItem(eA, "speakers"), 1);
+                        CHECK(cJSON_GetArraySize(s1A) == 0, "a speaker with no modes gets an empty ladder");
+                    }
+                    cJSON_Delete(root);
+                }
+                free(buf);
+            }
+            remove(GIN);
+        }
+    }
+
     /* self-localization: recover a speaker position + the system latency from ranges (c*delay,
      * latency included) to 6 non-coplanar mic positions. */
     {

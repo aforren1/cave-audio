@@ -73,6 +73,36 @@ static int write_layout_with(const char* path, double rolloff_r, double g0_db, d
     return k == 26;
 }
 
+/* a grid layout carrying a room_eq_grid: two positions, one 45 Hz section on speaker 0.
+ * mode 0 = valid; 1 = the second position's fc disagrees (ladder mismatch); 2 = plus a static
+ * room_eq on speaker 0 (the schemes are mutually exclusive). */
+static int write_layout_grid(const char* path, int mode) {
+    FILE* f = fopen(path, "wb");
+    if (!f) return 0;
+    const float ax[3] = { -1.5f, 0.f, 1.5f };
+    fprintf(f, "{ \"speakers\": [\n");
+    int k = 0;
+    for (int yi = 0; yi < 3; ++yi) for (int xi = 0; xi < 3; ++xi) for (int zi = 0; zi < 3; ++zi) {
+        if (ax[xi] == 0 && ax[yi] == 0 && ax[zi] == 0) continue;
+        fprintf(f, "  {\"index\":%d,\"position\":[%g,%g,%g]%s}%s\n", k, ax[xi], ax[yi], ax[zi],
+                (mode == 2 && k == 0) ? ",\"room_eq\":[{\"fc\":80,\"gain_db\":-6,\"q\":4}]" : "",
+                (k == 25) ? "" : ",");
+        ++k;
+    }
+    fprintf(f, "],\n\"room_eq_grid\": [\n");
+    for (int p = 0; p < 2; ++p) {
+        double fc = (p == 1 && mode == 1) ? 60.0 : 45.0;      /* mode 1: ladder mismatch */
+        double g  = (p == 0) ? -8.0 : -4.0;
+        fprintf(f, " {\"position\":[%g,1.5,0],\"speakers\":[\n  [{\"fc\":%g,\"gain_db\":%g,\"q\":6}]",
+                p ? 1.0 : -1.0, fc, g);
+        for (int s = 1; s < 26; ++s) fprintf(f, ",[]");
+        fprintf(f, "\n ]}%s\n", p ? "" : ",");
+    }
+    fprintf(f, "]}\n");
+    fclose(f);
+    return k == 26;
+}
+
 int main(void) {
     /* 1. default layout */
     Layout LD = layout_default();
@@ -225,6 +255,50 @@ int main(void) {
         }
     }
 
+    /* 7a3. tracked room EQ (room_eq_grid ladder): align SLEWS each section toward the targets set by
+     * align_room_eq_targets (24 dB/s) — a -12 dB target glides in (the first 0.25 s window sits
+     * mid-slew, not already cut), lands at depth, and releases back to flat. Windowed RMS of a 100 Hz
+     * tone on the cut channel, block-sized processing like the audio thread. */
+    {
+        Layout G = layout_default();
+        G.rq_grid.npos = 1;              /* align only reads the ladder — rt.c owns the interpolation */
+        G.rq_grid.nsec[4]  = 1;
+        G.rq_grid.fc[4][0] = 100.f; G.rq_grid.q[4][0] = 2.f;
+        Aligner* a = align_create(CH, &G, RATE);
+        CHECK(a != NULL, "align_create (room_eq_grid)");
+        if (a) {
+            enum { BL = 256, WIN = 47 };                      /* 47 blocks ~ 0.25 s per window */
+            static float blk[CH * BL];
+            float tgt[BW_CHANNELS][BW_ROOM_EQ_MAX];
+            memset(tgt, 0, sizeof tgt);
+            int ph = 0;
+            #define GRID_WIN_DB(out) do {                                                        \
+                double r_ = 0;                                                                   \
+                for (int b_ = 0; b_ < WIN; ++b_) {                                               \
+                    memset(blk, 0, sizeof blk);                                                  \
+                    for (int i_ = 0; i_ < BL; ++i_, ++ph)                                        \
+                        blk[4*(size_t)BL + i_] = sinf(2.f*3.14159265f*100.f*(float)ph/(float)RATE); \
+                    align_process(a, blk, BL);                                                   \
+                    for (int i_ = 0; i_ < BL; ++i_) r_ += (double)blk[4*(size_t)BL+i_]*blk[4*(size_t)BL+i_]; \
+                }                                                                                \
+                (out) = 10.0 * log10(r_ / (0.5 * WIN * BL));                                     \
+            } while (0)
+            tgt[4][0] = -12.f;
+            align_room_eq_targets(a, tgt);
+            double w0, wlast;
+            GRID_WIN_DB(w0);                                  /* mid-glide: ~ -3 dB average */
+            for (int wn = 0; wn < 7; ++wn) GRID_WIN_DB(wlast); /* by 2 s: fully landed */
+            CHECK(w0 > -9.0,                     "tracked cut glides in (first window is mid-slew, not a step)");
+            CHECK(wlast > -13.0 && wlast < -11.0, "tracked cut lands at its target depth");
+            memset(tgt, 0, sizeof tgt);
+            align_room_eq_targets(a, tgt);                    /* release */
+            for (int wn = 0; wn < 4; ++wn) GRID_WIN_DB(wlast);
+            CHECK(fabs(wlast) < 1.0,             "tracked cut releases back to flat");
+            #undef GRID_WIN_DB
+            align_destroy(a);
+        }
+    }
+
     /* 7b. layout_load rejects out-of-range values (so bad JSON can't reach the audio thread) */
     {
         const char* BJ = "bw_bad_layout.json";
@@ -234,6 +308,27 @@ int main(void) {
         write_layout_with(BJ, 0.7, 0.0, 1.0e7);   CHECK(!layout_load(BJ, RATE, &B, err, sizeof err), "huge delay_ms is rejected");
         write_layout_with(BJ, 0.7, 0.0, 0.0);     CHECK( layout_load(BJ, RATE, &B, err, sizeof err), "valid layout still loads");
         remove(BJ);
+    }
+
+    /* 7b2. room_eq_grid schema: parses into the shared ladder + per-position depths; positions must
+     * agree on the ladder (depths interpolate by index); static room_eq + grid don't mix. */
+    {
+        const char* GJ = "bw_grid_layout.json";
+        Layout B;
+        write_layout_grid(GJ, 0);
+        CHECK(layout_load(GJ, RATE, &B, err, sizeof err), err[0] ? err : "room_eq_grid layout loads");
+        CHECK(B.rq_grid.npos == 2, "room_eq_grid has both positions");
+        CHECK(B.rq_grid.nsec[0] == 1 && B.rq_grid.nsec[1] == 0, "ladder sizes parsed per speaker");
+        CHECK(fabs(B.rq_grid.fc[0][0] - 45.f) < 1e-3 && fabs(B.rq_grid.q[0][0] - 6.f) < 1e-3,
+              "ladder fc/q parsed");
+        CHECK(fabs(B.rq_grid.gain_db[0][0][0] + 8.f) < 1e-3 && fabs(B.rq_grid.gain_db[1][0][0] + 4.f) < 1e-3,
+              "per-position depths parsed");
+        CHECK(fabs(B.rq_grid.pos[1][0] - 1.f) < 1e-3, "grid positions parsed");
+        write_layout_grid(GJ, 1);
+        CHECK(!layout_load(GJ, RATE, &B, err, sizeof err), "a ladder mismatch across positions is rejected");
+        write_layout_grid(GJ, 2);
+        CHECK(!layout_load(GJ, RATE, &B, err, sizeof err), "room_eq + room_eq_grid together are rejected");
+        remove(GJ);
     }
 
     /* 8. the committed example layout parses with this loader (schema-vs-parser integration) */
@@ -318,6 +413,45 @@ int main(void) {
                 if (rl <= 0 || (rE[0]*s3[0] + rE[1]*s3[1] + rE[2]*s3[2])/rl < 0.9f) loc_ok = 0;  /* within ~25 deg */
             }
             CHECK(loc_ok, "AllRAD localizes plane waves toward their direction");
+        }
+
+        /* imaginary pole speaker: a FLOOR-LESS array (the default grid minus its y=0 level) leaves a
+         * > 60° hole at the nadir. The imaginary nadir speaker closes the hull there and its share is
+         * discarded, so a straight-down plane wave decodes to (near) nothing instead of smearing full
+         * power onto the bottom ring. The cube grid (nadir gap ~55°) takes the unfixed path above. */
+        {
+            Layout LH;
+            memset(&LH, 0, sizeof LH);
+            uint32_t nh = 0;
+            for (uint32_t s = 0; s < LD.count; ++s) {
+                if (LD.speakers[s].pos[1] < 0.1f) continue;    /* drop the floor level */
+                LH.speakers[nh].pos[0] = LD.speakers[s].pos[0];
+                LH.speakers[nh].pos[1] = LD.speakers[s].pos[1];
+                LH.speakers[nh].pos[2] = LD.speakers[s].pos[2];
+                LH.speakers[nh].gain_lin = 1.0f;
+                ++nh;
+            }
+            LH.count = nh;                                     /* 17: the 1.5 m ring (8) + the ceiling (9) */
+            layout_compute_ref(&LH);
+            float dech[BW_CHANNELS][BW_AMBI_CH];
+            int okh = allrad_build_decode(&LH, dech);
+            CHECK(okh, "allrad_build_decode succeeds on a floor-less array");
+            if (okh) {
+                /* decoded energy of a plane wave from direction d (room axes) */
+                double e_down = 0, e_side = 0;
+                float dirs2[2][3] = { { 0, -1, 0 }, { 1, 0, 0 } };
+                double* acc[2] = { &e_down, &e_side };
+                for (int t = 0; t < 2; ++t) {
+                    float ad[3] = { dirs2[t][2], dirs2[t][0], dirs2[t][1] }, sh[BW_AMBI_CH];
+                    ambi_encode_sn3d(ad, sh);                  /* (z,x,y): matches build_bed_decode */
+                    for (uint32_t s = 0; s < nh; ++s) {
+                        float f = 0; for (int k = 0; k < BW_AMBI_CH; ++k) f += dech[s][k]*sh[k];
+                        *acc[t] += (double)f * f;
+                    }
+                }
+                CHECK(e_side > 0 && e_down < 0.25 * e_side,
+                      "imaginary nadir speaker discards straight-down diffuse energy (no bottom-ring smear)");
+            }
         }
     }
 

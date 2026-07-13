@@ -20,6 +20,7 @@
 #include "steam_scene.h"
 #include "steam_reflect.h"
 #include "steam_path.h"
+#include "fdn.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -84,6 +85,12 @@ struct BwEngine {
     SteamScene*   scene;          /* materials occlusion sim (off-thread); NULL without the SDK */
     SteamReflect* reflect;        /* reflection bed (created at bw_start if configured); NULL otherwise */
     BwReflectionConfig refl_cfg;  /* set via bw_reflections_config before bw_start */
+    Fdn*          fdn;            /* directional FDN reverb bed (bw_reverb_fdn; created at bw_start) */
+    int           fdn_enabled;    /* staged pre-start; when on, the FDN takes the bus tap (not the Steam bed) */
+    float         fdn_rt[3];      /* staged decay: rt60 low / rt60 high / crossover Hz */
+    float         fdn_dir[3], fdn_dirfactor;   /* staged anisotropy */
+    int           fdn_rt_set, fdn_dir_set;     /* explicit "was staged" flags — a 0 VALUE must still
+                                                * reach fdn_set_* (which clamps), not silently drop */
     SteamPath*    path;           /* pathing (BWAUDIO_PATHING); NULL otherwise */
     float         src_pos[BW_VOICE_CAP][3];  /* control-side per-source positions, so set_pathing has the pos */
 
@@ -224,6 +231,7 @@ static void engine_close_devices(BwEngine* e) {
     if (e->path)     { rt_set_path_tap(e->rt, NULL, NULL, 0); steam_path_destroy(e->path); e->path = NULL; }
     if (e->steam)    { steam_monitor_destroy(e->steam); e->steam = NULL; }   /* after the audio thread joins */
 #endif
+    if (e->fdn)      { rt_set_bus_tap(e->rt, NULL, NULL); fdn_destroy(e->fdn); e->fdn = NULL; }   /* after the audio thread joins */
     if (e->tracker)  { rt_set_tracker(e->rt, NULL); natnet_close(e->tracker); e->tracker = NULL; }  /* after audio stops */
     free(e->scratch26);  e->scratch26  = NULL;
     free(e->mon_buf[0]); e->mon_buf[0] = NULL;
@@ -246,8 +254,8 @@ int bw_start(BwEngine* e) {
         if (has_rq && (e->panner == (int)BW_PAN_DBAP || e->cfg.track_internal)) {
             set_error(e, "bw_start: the layout carries room_eq (room correction at ONE point; static "
                          "listener only), but this session renders a MOVING listener (DBAP panner "
-                         "and/or track_internal). Load the roaming layout, or use SPCAP/VBAP with a "
-                         "fixed pose.");
+                         "and/or track_internal). Load the roaming layout, recalibrate with "
+                         "--room-eq-grid (tracked room EQ), or use SPCAP/VBAP with a fixed pose.");
             return 1;
         }
     }
@@ -301,7 +309,7 @@ int bw_start(BwEngine* e) {
     /* reflection bed: a separate reflections sim + the audio-thread convolution registered as the rt
      * bus tap. Same frameSize-fixed-at-create reason as the monitor — build it now. Non-fatal: if it
      * fails, no tap is registered and the engine runs dry. Needs the occlusion scene (shared geometry). */
-    if (e->scene && e->refl_cfg.enabled) {
+    if (e->scene && e->refl_cfg.enabled && !e->fdn_enabled) {
         const char* bake_env = getenv("BWAUDIO_BAKE");
         int bake = (bake_env && bake_env[0] && bake_env[0] != '0');   /* opt-in: precompute the reverb at probes */
         e->reflect = steam_reflect_create(e->scene, e->rt, &e->layout, e->cfg.sample_rate,
@@ -320,6 +328,19 @@ int bw_start(BwEngine* e) {
         }
     }
 #endif
+
+    /* directional FDN reverb bed (bw_reverb_fdn; phonon-free): takes the bus tap the Steam bed would
+     * otherwise use (mutually exclusive — one reverb bed at a time; the Steam block above is skipped
+     * when the FDN is enabled). Consumes the same mono aux send + per-voice send levels. Non-fatal on
+     * allocation failure: no tap, the engine runs dry, the reason surfaces via bw_last_error. */
+    if (e->fdn_enabled) {
+        e->fdn = fdn_create(&e->layout, e->cfg.sample_rate, BW_CHANNELS);
+        if (e->fdn) {
+            if (e->fdn_rt_set)  fdn_set_decay(e->fdn, e->fdn_rt[0], e->fdn_rt[1], e->fdn_rt[2]);
+            if (e->fdn_dir_set) fdn_set_decay_direction(e->fdn, e->fdn_dir, e->fdn_dirfactor);
+            rt_set_bus_tap(e->rt, fdn_tap, e->fdn);
+        } else set_error(e, "bw_start: FDN reverb allocation failed (running dry)");
+    }
 
     /* track_internal: ingest OptiTrack pose ourselves and sample it on the audio thread.
      * Configured via env (no NatNet specifics in BwConfig). Non-fatal: a failure leaves the
@@ -482,6 +503,14 @@ void bw_test_signal(BwEngine* e, uint32_t channel, BwTestKind kind, float gain) 
 
 void bw_set_panner(BwEngine* e, BwPanner panner) { if (e) { e->panner = (int)panner; rt_set_panner(e->rt, (int)panner); } }
 void bw_set_dual_band(BwEngine* e, bool on)       { if (e) rt_set_dual_band(e->rt, on); }
+void bw_set_spread_mode(BwEngine* e, BwSpreadMode mode) { if (e) rt_set_spread_mode(e->rt, (int)mode); }
+void bw_set_tracked_room_eq(BwEngine* e, bool on)  { if (e) rt_set_room_eq_dyn(e->rt, on); }
+void bw_set_decorrelation(BwEngine* e, bool on)    { if (e) rt_set_decorrelation(e->rt, on); }
+void bw_set_bed_renderer(BwEngine* e, BwBedRenderer r) { if (e) rt_set_bed_renderer(e->rt, (int)r); }
+void bw_set_pose_prediction(BwEngine* e, float lead_ms) { if (e) rt_set_pose_prediction(e->rt, lead_ms * 1e-3f); }
+void bw_set_near_spread(BwEngine* e, float radius_m)    { if (e) rt_set_near_spread(e->rt, radius_m); }
+void bw_set_extra_listeners(BwEngine* e, const float* xyz, uint32_t count) { if (e) rt_set_extra_listeners(e->rt, xyz, count); }
+void bw_source_set_loudness_comp(BwEngine* e, BwSource s, bool on) { if (e) rt_source_set_loudness_comp(e->rt, s, on); }
 void bw_set_limiter(BwEngine* e, bool on)         { if (e) rt_set_limiter(e->rt, on); }
 void bw_set_limiter_ceiling(BwEngine* e, float ceiling_db) {
     if (!e) return;
@@ -703,9 +732,28 @@ void bw_reflections_config(BwEngine* e, const BwReflectionConfig* cfg) {
 void bw_reflections_set_gain(BwEngine* e, float linear) {
 #ifdef BW_HAVE_STEAMAUDIO
     if (e && e->reflect) steam_reflect_set_gain(e->reflect, linear);
-#else
-    (void)e; (void)linear;
 #endif
+    if (e && e->fdn) fdn_set_gain(e->fdn, linear);   /* the FDN is "the reflection bed" when enabled */
+}
+
+/* ---- directional FDN reverb bed (phonon-free; see fdn.h) ---- */
+void bw_reverb_fdn(BwEngine* e, bool on) {
+    if (!e) return;
+    if (e->started) { set_error(e, "bw_reverb_fdn: load-time only (call between bw_create and bw_start)"); return; }
+    e->fdn_enabled = on ? 1 : 0;
+}
+void bw_fdn_set_decay(BwEngine* e, float rt60_low_s, float rt60_high_s, float xover_hz) {
+    if (!e) return;
+    if (e->started) { set_error(e, "bw_fdn_set_decay: load-time only"); return; }
+    e->fdn_rt[0] = rt60_low_s; e->fdn_rt[1] = rt60_high_s; e->fdn_rt[2] = xover_hz;
+    e->fdn_rt_set = 1;                       /* out-of-range values reach fdn_set_decay's clamps */
+}
+void bw_fdn_set_decay_direction(BwEngine* e, const float dir[3], float factor) {
+    if (!e || !dir) return;
+    if (e->started) { set_error(e, "bw_fdn_set_decay_direction: load-time only"); return; }
+    memcpy(e->fdn_dir, dir, sizeof e->fdn_dir);
+    e->fdn_dirfactor = factor;
+    e->fdn_dir_set = 1;
 }
 
 void bw_source_set_reflections(BwEngine* e, BwSource s, bool on) {

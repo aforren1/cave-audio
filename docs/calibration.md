@@ -103,7 +103,37 @@ automatically.
 
   The wrong-file mistake fails loudly: **`bw_start` refuses** a layout carrying `room_eq` sections
   when the session renders a moving listener (the DBAP panner and/or `track_internal`) — see
-  `bw_last_error`. Load the roaming variant, or run SPCAP/VBAP with a fixed pose.
+  `bw_last_error`. Load the roaming variant, recalibrate with `--room-eq-grid`, or run SPCAP/VBAP
+  with a fixed pose.
+
+- **`--room-eq-grid`** — **tracked room EQ**: the moving-listener answer to `--room-eq`'s modal
+  half (Lindfors/Liski/Välimäki, JAES 2022, adapted to the tracked CAVE). One point can't room-EQ a
+  roaming listener — but a **grid of points can**, because below ~200 Hz the room's mode
+  *frequencies* are fixed properties of the room; only how strongly each mode reads varies with
+  position, and that varies smoothly on the half-metre scale of LF wavelengths.
+
+  Workflow: run once per mic placement — `--mic x y z` **is the grid key** (a rerun within 5 cm
+  replaces that entry; up to 16 positions, `BW_RQ_GRID_MAX`). Cover the working area at ear height,
+  ~0.5–1 m spacing. Each run measures this position's modal cuts (`measure_room_cuts`, same
+  30–200 Hz band and 12 dB depth cap as `--room-eq`) and **merges** them into the layout's
+  top-level `room_eq_grid` (`calib_room_grid_merge` → `calib_write_room_eq_grid`): per-position fcs
+  within ~8% are the same mode, so each speaker gets ONE shared `fc`/`q` ladder with per-position
+  depths (0 dB where a position didn't see the mode). See
+  [`layout-schema.md`](./layout-schema.md) for the format.
+
+  At runtime the engine interpolates the depths at the **live listener position** every block
+  (inverse-distance weights over the grid points) and the align biquads glide toward them at
+  24 dB/s — click-free by construction, fast enough to track a walk. `bw_set_tracked_room_eq` is
+  the live kill switch (off glides to flat) for A/B on the rig. Works with every panner; `bw_start`
+  has no objection to a grid in a moving session — that's the point.
+
+  Deliberately **only** the 30–200 Hz modal band is tracked. The mid/HF room response
+  decorrelates over centimetres, so interpolating it between half-metre grid points would
+  manufacture corrections that are wrong almost everywhere — the `eq` FIR above stays the
+  direct-sound speaker correction for moving installs. And EQ still can't fix decay: the `--room`
+  report stays the treatment diagnostic. `room_eq` and `room_eq_grid` are mutually exclusive in
+  one layout file (the loader rejects both together; the grid writeback removes a stale static
+  `room_eq` for you).
 
 ## Zylia ZM-1: full 3D from one placement
 

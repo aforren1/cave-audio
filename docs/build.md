@@ -89,9 +89,9 @@ Everything above, sorted by what it actually ends up in:
   additionally compile in imgui, implot, implot3d (**MIT**), raylib, rlImGui
   (**zlib/libpng**), the Roboto face (**Apache-2.0**), imgui_test_engine (**its own
   dual license** — free tier, see below), and optionally Tracy (**BSD-3-Clause**).
-  The tools are not part of the CI artifact and are not otherwise distributed; if
-  you start shipping them, add the MIT/zlib/Apache notices to a
-  `THIRD_PARTY-NOTICES` file and re-check the test-engine terms.
+  The tools ship in the CI artifact; the notices ride along in
+  [`THIRD_PARTY-NOTICES.md`](../THIRD_PARTY-NOTICES.md) (repo root, copied into the
+  artifact). Keep that file in sync when a pin bumps.
 - **Never linked**: the NatNet SDK. `third_party/NatNetSDK/` sits in the tree as a
   **protocol reference only** (it is proprietary — OptiTrack's plugin license); no
   target compiles or links it, and it must never be distributed with this repo.
@@ -127,10 +127,10 @@ person, an open-source project, an educational/research institution, or a small
 business under the license's revenue threshold — a paid license otherwise. Read
 `imgui_test_engine/LICENSE.txt` in the fetched tree for the exact criteria.
 
-That's fine here: this repo is GPLv3 open source, the test engine compiles only into
-the opt-in GUI tools (`bw_playground`, `bw_layout_tool`, `bw_calib_view`) — never into
-`bwaudio.dll` — and the CI artifact doesn't contain the tools. Revisit if this repo's
-licensing changes or the tools start shipping.
+That's fine here: this repo is GPLv3 open source, so the free tier applies, and the
+test engine compiles only into the GUI tools (`bw_playground`, `bw_layout_tool`,
+`bw_calib_view`) — never into `bwaudio.dll`. The tools ship in the CI artifact with
+the notice in `THIRD_PARTY-NOTICES.md`. Revisit if this repo's licensing changes.
 
 ### NatNet without the proprietary SDK
 
@@ -150,17 +150,37 @@ distribution channel:
 - **ASIO is built.** The workflow fetches the SDK from Steinberg's official URL
   (cached between runs), and the configure step fails loudly unless the log says
   `ASIO backend ENABLED` — the artifact must contain the production device path.
+- **Steam Audio is built, and cached.** CI runs the phonon recipe from
+  [`third_party/README.md`](../third_party/README.md) (patched submodule, minimal
+  core, `/MD`) and caches `third_party/steam-audio-artifacts/` keyed on the
+  submodule sha + the patch hash — the first run pays the phonon build, every later
+  run restores it. The four with-SDK tests (`reflect`/`bake`/`path`/`steam_decode`)
+  run, and binaural is the real HRTF decode. One CI-only tweak: the pinned phonon
+  build scripts hard-code the VS 2022 generator, so the workflow rewrites that to
+  whatever Visual Studio the runner image has (via `vswhere`).
 - **Tests run with `BWAUDIO_SINK=null`.** Runners have no audio hardware; forcing the
-  null sink keeps runs deterministic instead of relying on fallback. That's 12 ctests:
-  Steam Audio is *not* built in CI (the patched phonon build is heavy), so the four
-  with-SDK tests (`reflect`/`bake`/`path`/`steam_decode`) don't run there and binaural
-  falls back to the simple-pan monitor.
-- **The artifact is a GPLv3 distribution.** Each run uploads `bwaudio.dll`/`.lib`/`.pdb`,
-  `bwaudio.h`, `bw_minimal.exe`, the example layout, the `LICENSE`, and a `DIST.txt`
-  naming the commit and linking the complete source (this repo at that commit).
-  Downloading requires repo access; the artifact carries the GPLv3 terms with it.
-- **GUI tools aren't built in CI.** They need a display and aren't part of the
-  distributed library.
+  null sink keeps runs deterministic instead of relying on fallback. The three GUI
+  UI suites (`playground`/`layout_tool`/`calib_view`) are built but excluded from
+  the CI ctest run — they need a display and OpenGL, which runners don't have; run
+  them locally.
+- **Two configs, x64 only.** RelWithDebInfo is the full build: tested, tools and
+  all. Debug builds the engine (`bwaudio` + `bw_minimal`) and smoke-runs it, for
+  downstream debugging against a debug CRT.
+- **The tools are built and shipped.** CI configures with `BWAUDIO_BUILD_PLAYGROUND`,
+  `BWAUDIO_BUILD_CALIBVIEW`, and `BWAUDIO_BUILD_CALIBRATE`, so the artifact carries
+  `bw_playground`, `bw_layout_tool`, `bw_calib_view` (GUI — they need a display),
+  plus `bw_calibrate` and `bw_zylia_probe` (console).
+- **The artifact is a GPLv3 distribution.** Each run uploads `RelWithDebInfo/`
+  (engine + phonon + tools) and `Debug/` (engine + phonon) folders plus `bwaudio.h`,
+  the example layout + `constraints.json`, the `LICENSE`, `THIRD_PARTY-NOTICES.md`,
+  and a `DIST.txt` naming the commit and linking the complete source (this repo at
+  that commit). Downloading requires repo access; the artifact carries the GPLv3
+  terms with it.
+- **`bwaudio.dll` needs `phonon.dll` beside it.** With-SDK builds (including the CI
+  artifact) link `phonon.lib`, so the DLL won't load without `phonon.dll` in the
+  same directory — keep the pair together. The CMake post-build step and the Unity
+  plugin staging both copy it for you. Only a no-SDK build is self-contained (with
+  the simple-pan binaural fallback and acoustics calls as no-ops).
 
 ## DVS / Dante configuration
 
@@ -220,8 +240,8 @@ relying on it:
   linked version, and that the 3rd-order encode/decode path (see `spatialization.md`)
   is supported.
 - [ ] **Other dependency licenses** unchanged in the versions you ship. The pinned
-  versions are verified in the "License inventory" above — re-check on any pin bump,
-  and add a `THIRD_PARTY-NOTICES` file if the GUI tools ever ship.
+  versions are verified in the "License inventory" above — re-check on any pin bump
+  and keep `THIRD_PARTY-NOTICES.md` in sync.
 - [ ] **Dante clock.** A hardware leader clock is present on the network — a
   pure-software DVS instance cannot be the standalone leader.
 - [ ] **This repo's own license** is GPLv3 (see `LICENSE`), matching the ASIO GPLv3

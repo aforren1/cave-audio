@@ -29,12 +29,16 @@
 #define BW_MK_H(i, g) ((uint32_t)(i) | ((uint32_t)(g) << 16))
 
 /* Command ring payload (control -> audio). Fixed-size POD, no framing. */
+#define BW_EXTRA_LIS 3   /* extra (compromise) listener positions beyond the primary */
+
 enum {
     CMD_SRC_CREATE = 0, CMD_SRC_DESTROY, CMD_SET_POS, CMD_SET_GAIN,
     CMD_PLAY, CMD_STOP, CMD_SET_LISTENER, CMD_COMMIT, CMD_SOUND_RETIRE,
     CMD_SET_REFLECTIONS, CMD_TEST_SIGNAL, CMD_SET_DOPPLER, CMD_SET_AIR, CMD_SET_SPREAD,
     CMD_SET_REFL_SEND, CMD_SET_REFL_DIST, CMD_SET_PATHING, CMD_SET_PAUSED, CMD_SEEK,
-    CMD_SRC_STEAL   /* fade a stolen voice out on its own slot, then free it (click-free voice-steal) */
+    CMD_SRC_STEAL,  /* fade a stolen voice out on its own slot, then free it (click-free voice-steal) */
+    CMD_SET_LDC,    /* per-voice equal-loudness distance compensation enable */
+    CMD_SET_EXTRA_LIS   /* extra listener positions for multi-listener compromise panning */
 };
 typedef struct {
     uint8_t  type;
@@ -54,6 +58,8 @@ typedef struct {
         struct { uint8_t on; }                         pause; /* per-voice pause gate (ramped; playhead freezes) */
         struct { uint64_t frame; }                     seek;  /* content position to jump to (in-memory sounds) */
         struct { uint32_t channel; uint8_t kind; float gain; } test;  /* debug channel injection */
+        struct { uint8_t on; }                         ldc;   /* per-voice loudness-compensated attenuation */
+        struct { float p[BW_EXTRA_LIS][3]; uint8_t n; } exlis; /* extra listeners (compromise panning) */
     } u;
 } Cmd;
 
@@ -70,6 +76,13 @@ void    rt_set_layout(RtCore* c, const Layout* L);   /* call before bw_start / w
 void    rt_set_panner(RtCore* c, int panner);        /* 0 = DBAP, 1 = SPCAP, 2 = VBAP; atomic, live-switchable */
 void    rt_set_bed_decoder(RtCore* c, int decoder);  /* 0 = sampling (SAD), 1 = AllRAD; before bw_start */
 void    rt_set_dual_band(RtCore* c, int on);         /* dual-band panning (amplitude LF / power HF); live A/B */
+void    rt_set_spread_mode(RtCore* c, int mode);     /* spread render: 0 = lobe reshape, 1 = MDAP ring; live A/B */
+void    rt_set_room_eq_dyn(RtCore* c, int on);       /* tracked room EQ (room_eq_grid layouts): default on; live A/B */
+void    rt_set_decorrelation(RtCore* c, int on);     /* velvet-noise wide-part decorrelation; live A/B */
+void    rt_set_bed_renderer(RtCore* c, int parametric);   /* bed: 0 = matrix decode, 1 = parametric (DirAC); live A/B */
+void    rt_set_pose_prediction(RtCore* c, float lead_s);  /* tracked-pose lead (0 = off); live */
+void    rt_set_near_spread(RtCore* c, float radius_m);    /* near-listener widening radius (0 = off); live */
+void    rt_set_extra_listeners(RtCore* c, const float* xyz, uint32_t n);   /* compromise panning; commit-gated */
 void    rt_set_limiter(RtCore* c, int on);           /* output protection limiter (final stage; default ON); live */
 void    rt_set_limiter_ceiling(RtCore* c, float ceiling_linear);   /* limit/clamp ceiling, linear (default -1 dBFS); live */
 
@@ -138,6 +151,7 @@ void rt_source_set_paused(RtCore* c, uint32_t h, bool paused);   /* ramped gate;
 void rt_source_seek    (RtCore* c, uint32_t h, uint64_t frame);  /* click-free jump (in-memory sounds; streams ignore) */
 void rt_source_set_doppler(RtCore* c, uint32_t h, bool on);          /* propagation: glided delay -> pitch from radial motion */
 void rt_source_set_air_absorption(RtCore* c, uint32_t h, bool on);   /* propagation: distance-driven HF low-pass */
+void rt_source_set_loudness_comp(RtCore* c, uint32_t h, bool on);    /* equal-loudness LF shelf vs attenuation */
 void rt_source_set_spread(RtCore* c, uint32_t h, float amount);      /* source angular width: 0 = point .. 1 = wide */
 void rt_play_oneshot   (RtCore* c, uint32_t sound, float x, float y, float z, float gain);
 void rt_set_listener   (RtCore* c, const float p[3], const float q[4]);

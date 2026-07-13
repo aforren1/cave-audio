@@ -14,6 +14,7 @@
 
 #define BW_EQ_TAPS     512  /* max per-speaker correction-FIR length */
 #define BW_ROOM_EQ_MAX 8    /* max per-speaker LF modal-cut sections (static-listener room correction) */
+#define BW_RQ_GRID_MAX 16   /* max tracked-room-EQ measurement positions (room_eq_grid) */
 
 /* One parametric peaking section (RBJ), rate-independent in the file; align.c derives the biquad
  * coefficients at the engine rate. Cut-only by schema (gain_db <= 0). */
@@ -28,6 +29,21 @@ typedef struct {
     uint8_t  room_eq_count; /* LF modal cuts — STATIC-listener room correction only (docs/calibration.md) */
     RoomEqSection room_eq[BW_ROOM_EQ_MAX];
 } Speaker;
+
+/* Tracked room EQ (docs/calibration.md): the same LF modal cuts as room_eq, but measured at a GRID
+ * of listener positions (bw_calibrate --room-eq-grid) so they survive a MOVING listener. The room's
+ * mode frequencies don't move with the listener — only how strongly each mode reads at a position —
+ * so per speaker there is ONE shared fc/q ladder, and per grid position that ladder's cut depths.
+ * rt.c interpolates the depths at the live listener position each block (inverse-distance weights)
+ * and align.c slews its biquads toward them. Mutually exclusive with per-speaker room_eq. */
+typedef struct {
+    uint8_t  npos;                                     /* measurement positions (0 = no grid) */
+    float    pos[BW_RQ_GRID_MAX][3];                   /* mic positions, room meters */
+    uint8_t  nsec[BW_CHANNELS];                        /* ladder size per speaker */
+    float    fc[BW_CHANNELS][BW_ROOM_EQ_MAX];          /* ladder: mode centre frequencies (Hz) */
+    float    q [BW_CHANNELS][BW_ROOM_EQ_MAX];          /* ladder: mode Qs */
+    float    gain_db[BW_RQ_GRID_MAX][BW_CHANNELS][BW_ROOM_EQ_MAX];  /* per-position cut depths (<= 0) */
+} RoomEqGrid;
 
 typedef struct {
     Speaker  speakers[BW_CHANNELS];
@@ -44,6 +60,7 @@ typedef struct {
     float    atten_rolloff;
     float    atten_min_lin;
     uint32_t max_delay_samples;     /* max over speakers; sizes the alignment delay lines */
+    RoomEqGrid rq_grid;             /* tracked room EQ grid (npos = 0 when the layout has none) */
 } Layout;
 
 /* A sane default: a 3 m-cube 3x3x3 boundary grid (minus centre), FLOOR-origin — x/z at

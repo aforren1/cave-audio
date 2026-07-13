@@ -50,7 +50,11 @@ the array origin.
 > back to DBAP for a non-triangulable array. SPCAP stays the recommended
 > fixed-observer default (smoother, robust on the irregular surveyed array); pick
 > VBAP when pinpoint localization at the sweet spot is the priority. It shares the
-> convex-hull + VBAP solve (`hull.c`) with AllRAD's decode.
+> convex-hull + VBAP solve (`hull.c`) with AllRAD's decode. VBAP is also the
+> theoretically-optimal *sparse* panner: with non-negative gains, the ℓ1-optimal
+> speaker-gain solution is exactly VBAP over a Delaunay triangulation (Franck,
+> Wang & Fazi 2017, IEEE TASLP) — there is no sparser panner to upgrade to, only
+> different trade-offs.
 
 Ambisonics is still the right tool for the **diffuse layer** (ambient beds,
 reflections/reverb). Diffuse energy isn't sweet-spot-sensitive, so a fixed decode is
@@ -131,6 +135,24 @@ atomic is on, so it A/Bs live.
 Dual-band is sweet-spot dependent (like VBAP). The dense array + small working area
 is favourable, but whether it helps a *roaming* listener is a by-ear/rig call.
 
+## Multi-listener compromise (`bw_set_extra_listeners`)
+
+Single-listener panning is exact for the tracked head and wrong for every other
+occupant — and CAVEs usually hold a group. With extra listener positions supplied
+(up to 3, commit-gated like the pose), `compute_gains` solves the same source once
+per listener — each extra keeps its **own** SPCAP/VBAP cache, since those caches are
+listener-keyed — and takes the per-speaker **energy mean**:
+`g[k] = sqrt(mean_i g_i[k]²)`, the L2 barycentre of the individual renderings.
+Constant power is preserved (the mean of the solves' powers), and every occupant
+hears an image biased toward their own solve instead of one exact and the rest
+wrong. Spread direction, Doppler, air absorption, the reverb-send distance, and the
+binaural monitor stay primary-relative. Panner-agnostic, block-rate, one extra
+point solve per listener per dirty voice.
+
+The layout tool's coverage scoring is the design-time complement: it can already
+score a layout for a fixed centre vs a moving volume; the compromise mode is the
+runtime answer when several tracked-or-known heads share the room.
+
 ## Gain ramping
 
 `dbap_gains` writes `gtarget`. The mixer holds `gcur` and interpolates
@@ -180,17 +202,55 @@ never loses sample precision.
 frequencies roll off with distance (cutoff ≈ 18 kHz near, −650 Hz/m, ≥1.2 kHz).
 Subtle in-room, pronounced for far virtual sources.
 
+**Loudness compensation** (`bw_source_set_loudness_comp`, opt-in) is the perceptual
+counterpart: attenuation lowers level, and at lower levels the ear loses LF
+sensitivity (the ISO 226 equal-loudness contours), so an attenuated source reads
+*thin* as well as far. A one-pole LF shelf (~250 Hz) boosts by 0.4 dB per dB of
+attenuation the panner applied (capped +8 dB) — "far, not tinny". A stylization,
+not physics; strict realism leaves it off.
+
 Both ramp per sample (no zipper) and tap the reflection send *before* themselves.
 
 **Source spread/size** gives a source angular width — a waterfall or a crowd
 shouldn't collapse to a point. It runs in the per-block gain solve, not the sample
-loop: the panner's point gains are blended toward a width-controlled lobe
-`(½(1+cosθ))^q` centred on the source direction (`q` shrinks as spread→1, widening
-the lobe), then renormalised to *the panner's own power*. Widening redistributes
-energy without re-levelling and keeps the centroid on the source direction. It is
-panner-agnostic, and the new gains ramp like any other gain change. A future
-refinement is true multi-direction panning (MDAP), if the lobe blend proves too
-coarse on the real array.
+loop, renormalised to *the panner's own power*: widening redistributes energy
+without re-levelling and keeps the centroid on the source direction. It is
+panner-agnostic, and the new gains ramp like any other gain change. Two render
+modes sit behind `bw_set_spread_mode` (an atomic live A/B, like the panner switch):
+
+- **Lobe** (default): the panner's point gains are blended toward a
+  width-controlled lobe `(½(1+cosθ))^q` centred on the source direction (`q`
+  shrinks as spread→1, widening the lobe). One solve — smooth and cheap, but the
+  extent is a reshaping of gains solved for a *point*.
+- **MDAP** (Pulkki 1999, multiple-direction amplitude panning): a ring of virtual
+  sources around the source direction — 8 at the full cone angle (`spread`·90°)
+  plus 4 offset at half, at the source's own distance — each panned with the
+  *selected panner*, summed, and renormalised to the point solve's power. The
+  extent is built from real panner solves, so it inherits the panner's character
+  (VBAP stays sparse per direction, SPCAP stays placement-corrected) and sharpens
+  the extent's edge. ~13× the gain-solve cost, block-rate + dirty-gated — still
+  cheap. At spread→0 the ring collapses onto the point solve, so the two modes
+  meet continuously.
+
+Either mode still feeds every speaker the **same signal** — coherent copies, which
+collapse to phantom images and comb-filter *position-dependently* as the tracked
+listener walks (the artifact a CAVE occupant actually notices).
+**`bw_set_decorrelation`** (off by default, live A/B) splits a spread source's
+energy: the coherent share takes the normal path, the rest routes through a
+per-speaker **sparse velvet-noise filter bank** (`rt.c`, ~30 signed taps jittered
+over 30 ms with an exponential envelope, unit energy — Välimäki et al.'s
+velvet-noise decorrelator, DAFx-17/18; time-domain, no FFT, no onset latency). The
+split amplitude is `sqrt(spread)` and ramps per sample; power is conserved because
+incoherent energy adds. The same filter bank renders the parametric bed's diffuse
+stream (below).
+
+**Near-listener widening** (`bw_set_near_spread`, off by default): a source
+approaching the head subtends a growing solid angle, but a point panner collapses
+it into the nearest speaker and snaps it across the head as it passes through. With
+a radius `R` set, every source's spread is floored at `1 − dist/R` in the gain
+solve — untouched beyond `R`, fully wide at the head — and the widened part rides
+the selected spread mode and the decorrelators. Sources flying through the room are
+the common CAVE case this exists for.
 
 ## Binaural debug path
 
@@ -264,6 +324,14 @@ built from the speaker geometry at load time. Two decoders are selectable with
   of a heavier load-time build — a brute-force hull + VBAP over ~240 virtual
   directions. The audio thread still just applies the matrix.
 
+  A pole with no real speaker within ~60° gets an **imaginary loudspeaker** (IEM
+  AllRADecoder practice): it closes the triangulation at the hole and its decode
+  share is *discarded*. Without it, a floor-less array's hull spans the nadir
+  with triangles of bottom-ring speakers, and downward diffuse energy smears onto
+  them — with it, energy aimed where no speaker exists is dropped. The cube grid's
+  ~55° nadir gap stays under the threshold, so genuinely-covered poles are
+  untouched.
+
 Validated against the cube grid + a deliberately clustered array (per-direction
 energy CV / rE error): on the near-uniform cube AllRAD matches sampling (≈7% CV, a
 few degrees); on the **clustered** array it cuts the loudness-vs-direction variance
@@ -273,6 +341,48 @@ AllRAD doesn't touch the point-source panner (DBAP/SPCAP/VBAP). It is the
 diffuse-layer counterpart to the placement correction those make for localized
 sources. Its convex-hull + VBAP solve is factored into `hull.c`, shared with the
 `BW_PAN_VBAP` point panner.
+
+## Parametric bed rendering (`bw_set_bed_renderer`, live A/B)
+
+Any matrix decode — sampling or AllRAD — has two limits on this rig: 26 speakers
+are sparse for 3rd-order content (directional material blurs), and the decode is
+locked to the array centre (walking off-centre skews a recorded field in exactly
+the way the engine's listener-relative panning was built to avoid).
+
+`BW_BED_PARAMETRIC` renders beds the DirAC way (Pulkki's directional audio coding,
+first-order, in 4 coarse time-domain bands instead of an STFT — `mix_bed` in
+`rt.c`). Per band, the smoothed **intensity vector** of the bed's FOA channels
+gives a direction and a **diffuseness** `ψ = 1 − |I|/E` (0 = a plane wave, 1 =
+isotropic). Two streams render per band:
+
+- **direct** (`√(1−ψ)`): the W signal, panned through the engine's own
+  **listener-relative panner** at a virtual source on the array shell
+  (`ref + R·doa`). This is the payoff and the twist no stock DirAC gives: the
+  direct stream re-pans *per listener position*, so a recorded soundfield becomes
+  **walkable** — correct directions and parallax off-centre.
+- **diffuse** (`√ψ`): the FOA band decoded through the bed matrix into the
+  **velvet-noise decorrelators** — envelopment from incoherent speaker feeds, not
+  26 correlated copies.
+
+Both streams are loudness-matched to the matrix decode (a direction-averaged
+plane-wave power reference computed with the decode), parameters ramp per block
+(invariant 4), and the renderer crossfades per bed on the toggle, so the matrix vs
+parametric comparison is a clean live A/B. Analysis is first-order (HO-DirAC
+sectors are the upgrade path if band-level parameters prove too coarse); beds with
+fewer than 4 channels stay on the matrix.
+
+## Directional FDN reverb (`bw_reverb_fdn`)
+
+The reflection bed no longer *requires* phonon: a 16-line **feedback delay
+network** (`fdn.c`, Householder feedback, two-band decay filters per line) can
+take the reverb bus tap instead. Each line is assigned a Fibonacci-sphere
+direction and rendered as a plane wave through the same SH→26 bed decode, and the
+per-line decay time scales with direction (`bw_fdn_set_decay_direction`) —
+**anisotropic decay**, the diagonal direction-domain case of the Directional FDN
+(Alary/Politis/Schlecht, JAES 2019). Deterministic CPU, infinite tail, no rays or
+IRs; the decay is a *design* parameter (never match the measured room — that
+double-counts, see calibration.md). The `fdn` test pins RT60 landing, the two-band
+split, anisotropy, and stability.
 
 ## Steam Audio usage
 

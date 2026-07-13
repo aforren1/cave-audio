@@ -201,6 +201,69 @@ bool layout_load(const char* path, uint32_t sample_rate, Layout* out, char* err,
     for (uint32_t i = 0; i < BW_CHANNELS; ++i)
         if (!seen[i]) { set_err(err, errcap, "layout: missing a speaker index in 0..25"); goto done; }
 
+    /* optional tracked-room-EQ grid (bw_calibrate --room-eq-grid writes it; see layout.h). Every
+     * position must carry the SAME per-speaker fc/q ladder — only the depths vary — because the
+     * runtime interpolates depths by ladder index; a mismatched ladder would blend unrelated modes. */
+    cJSON* grid = cJSON_GetObjectItemCaseSensitive(root, "room_eq_grid");
+    if (cJSON_IsArray(grid)) {
+        int np = cJSON_GetArraySize(grid);
+        if (np < 1 || np > (int)BW_RQ_GRID_MAX) {
+            set_err(err, errcap, "layout: room_eq_grid must have 1..16 positions"); goto done;
+        }
+        for (int p = 0; p < np; ++p) {
+            cJSON* ent  = cJSON_GetArrayItem(grid, p);
+            cJSON* posj = cJSON_IsObject(ent) ? cJSON_GetObjectItemCaseSensitive(ent, "position") : NULL;
+            cJSON* spks = cJSON_IsObject(ent) ? cJSON_GetObjectItemCaseSensitive(ent, "speakers") : NULL;
+            if (!cJSON_IsArray(posj) || cJSON_GetArraySize(posj) != 3 ||
+                !cJSON_IsArray(spks) || cJSON_GetArraySize(spks) != (int)BW_CHANNELS) {
+                set_err(err, errcap, "layout: room_eq_grid entry needs position[3] + speakers[26]"); goto done;
+            }
+            for (int c = 0; c < 3; ++c) {
+                cJSON* v = cJSON_GetArrayItem(posj, c);
+                if (!cJSON_IsNumber(v) || !isfinite(v->valuedouble) || fabs(v->valuedouble) > 1000.0) {
+                    set_err(err, errcap, "layout: room_eq_grid position component non-finite or out of range"); goto done;
+                }
+                out->rq_grid.pos[p][c] = (float)v->valuedouble;
+            }
+            for (int s = 0; s < (int)BW_CHANNELS; ++s) {
+                cJSON* secs = cJSON_GetArrayItem(spks, s);
+                if (!cJSON_IsArray(secs)) { set_err(err, errcap, "layout: room_eq_grid speaker entry is not an array"); goto done; }
+                int m = cJSON_GetArraySize(secs);
+                if (m > BW_ROOM_EQ_MAX) { set_err(err, errcap, "layout: room_eq_grid has more than 8 sections for a speaker"); goto done; }
+                if (p == 0) out->rq_grid.nsec[s] = (uint8_t)m;
+                else if (m != (int)out->rq_grid.nsec[s]) {
+                    set_err(err, errcap, "layout: room_eq_grid positions disagree on a speaker's section count"); goto done;
+                }
+                for (int t = 0; t < m; ++t) {
+                    cJSON* o  = cJSON_GetArrayItem(secs, t);
+                    cJSON* fj = cJSON_IsObject(o) ? cJSON_GetObjectItemCaseSensitive(o, "fc")      : NULL;
+                    cJSON* gj2= cJSON_IsObject(o) ? cJSON_GetObjectItemCaseSensitive(o, "gain_db") : NULL;
+                    cJSON* qj = cJSON_IsObject(o) ? cJSON_GetObjectItemCaseSensitive(o, "q")       : NULL;
+                    if (!cJSON_IsNumber(fj) || !cJSON_IsNumber(gj2) || !cJSON_IsNumber(qj)) {
+                        set_err(err, errcap, "layout: bad room_eq_grid section (need numeric fc/gain_db/q)"); goto done;
+                    }
+                    double fc = fj->valuedouble, g = gj2->valuedouble, q = qj->valuedouble;
+                    if (!(fc >= 10.0 && fc <= 1000.0)) { set_err(err, errcap, "layout: room_eq_grid fc out of range [10, 1000]"); goto done; }
+                    if (!(g >= -24.0 && g <= 0.0))     { set_err(err, errcap, "layout: room_eq_grid gain_db out of range [-24, 0] (cuts only)"); goto done; }
+                    if (!(q >= 0.25 && q <= 24.0))     { set_err(err, errcap, "layout: room_eq_grid q out of range [0.25, 24]"); goto done; }
+                    if (p == 0) {
+                        out->rq_grid.fc[s][t] = (float)fc;
+                        out->rq_grid.q [s][t] = (float)q;
+                    } else if (fabs(fc - out->rq_grid.fc[s][t]) > 0.005 * out->rq_grid.fc[s][t] ||
+                               fabs(q  - out->rq_grid.q [s][t]) > 0.005 * out->rq_grid.q [s][t]) {
+                        set_err(err, errcap, "layout: room_eq_grid positions disagree on the fc/q ladder"); goto done;
+                    }
+                    out->rq_grid.gain_db[p][s][t] = (float)g;
+                }
+            }
+        }
+        out->rq_grid.npos = (uint8_t)np;
+        for (uint32_t s = 0; s < BW_CHANNELS; ++s)   /* one room-correction scheme at a time */
+            if (out->speakers[s].room_eq_count) {
+                set_err(err, errcap, "layout: carries both room_eq (static) and room_eq_grid (tracked) — pick one"); goto done;
+            }
+    }
+
     out->count             = BW_CHANNELS;
     out->max_delay_samples = maxdelay;
     layout_compute_ref(out);                  /* nominal listening point = the surveyed array's centroid */

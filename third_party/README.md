@@ -73,7 +73,7 @@ files, compiled straight into `bw_core`. `layout.c` uses it to parse `cave_layou
 by changing the SHA; offline builds can override `FETCHCONTENT_SOURCE_DIR_CJSON_SRC` /
 `..._CJSON_HDR`.
 
-## Steam Audio (binaural decode, M5 upgrade; occlusion/reflections later)
+## Steam Audio (binaural decode + occlusion/reflections/pathing)
 
 **Apache-2.0**, which is one-way compatible with GPLv3 — so, unlike the ASIO and NatNet SDKs,
 Steam Audio is a *clean, redistributable* dependency: it can be linked and shipped under the repo
@@ -139,3 +139,6 @@ third_party/steam-audio-artifacts/
 
 A prebuilt **release** zip is the lighter alternative if the ambisonics fix isn't needed. Apache-2.0
 permits redistribution, so the built binaries are kept out of git (gitignored) for size only.
+
+CI runs this same recipe (`.github/workflows/ci.yml`, "Build phonon" step) and caches the staged
+artifacts on the submodule sha + patch hash. If you change the recipe here, change it there too.

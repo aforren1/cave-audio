@@ -71,6 +71,27 @@ int calib_write_room_eq(const char* in_path, const char* out_path,
                         const MeasureEqSection* cuts, const int* counts, int n,
                         int max_sections, char* err, size_t errcap);
 
+/* TRACKED room EQ (docs/calibration.md): merge ONE speaker's modal cuts measured at `npos` mic
+ * positions into the congruent ladder the layout's room_eq_grid needs. Room modes don't move with
+ * the mic — only their measured depth does — so per-position fcs within `tol_rel` (e.g. 0.08) are
+ * the SAME mode: one output section per cluster, fc/q = the member medians, and per position that
+ * position's measured depth (0 dB where it didn't see the mode). Keeps the deepest `max_out`
+ * clusters. `cuts` is npos * max_in row-major with counts[p] used; writes fc/q (max_out) +
+ * gain_db (npos * max_out row-major, <= 0). Returns the ladder size (0 = flat everywhere). */
+int calib_room_grid_merge(const MeasureEqSection* cuts, const int* counts, int npos, int max_in,
+                          double tol_rel, int max_out, float* fc, float* q, float* gain_db);
+
+/* Merge THIS mic position's per-speaker modal cuts into the layout JSON's "room_eq_grid": existing
+ * grid entries are read back (their sections re-treated as that position's cuts), an entry within
+ * 5 cm of `mic` is replaced (else appended, up to BW_RQ_GRID_MAX), every speaker's ladder is
+ * re-merged across all positions (calib_room_grid_merge), and the congruent grid is rewritten —
+ * so one bw_calibrate run per mic placement accumulates the grid. Removes any static per-speaker
+ * "room_eq" (the schemes are mutually exclusive). `cuts` is n * max_sections row-major with
+ * counts[i] used per speaker. Returns 1 / 0. */
+int calib_write_room_eq_grid(const char* in_path, const char* out_path, const float mic[3],
+                             const MeasureEqSection* cuts, const int* counts, int n,
+                             int max_sections, char* err, size_t errcap);
+
 /* Drift check: given measured ranges (c*delay, meters, latency included) from ONE mic at `mic` to n
  * speakers at their STORED positions `pos`, report each speaker's RADIAL deviation (meters) from where
  * it should be. The unknown common latency is removed as the MEDIAN residual (robust to a few moved

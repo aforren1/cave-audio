@@ -1,5 +1,6 @@
 /* calib.c — see calib.h. Trim solve + cave_layout.json writeback. Pure + file I/O (no audio thread). */
 #include "calib.h"
+#include "layout.h"        /* BW_RQ_GRID_MAX / BW_ROOM_EQ_MAX (the room_eq_grid schema caps) */
 
 #include <cJSON.h>
 
@@ -257,6 +258,235 @@ int calib_write_room_eq(const char* in_path, const char* out_path,
 fail:
     free(outtext); cJSON_Delete(root); free(text);
     return ok;
+    #undef FAIL
+}
+
+static int fcmp(const void* a, const void* b) {
+    float x = *(const float*)a, y = *(const float*)b; return x < y ? -1 : x > y ? 1 : 0;
+}
+static float fmedian(float* v, int n) {   /* sorts v in place */
+    qsort(v, (size_t)n, sizeof(float), fcmp);
+    return (n & 1) ? v[n/2] : 0.5f * (v[n/2 - 1] + v[n/2]);
+}
+
+int calib_room_grid_merge(const MeasureEqSection* cuts, const int* counts, int npos, int max_in,
+                          double tol_rel, int max_out, float* fc, float* q, float* gain_db) {
+    if (!cuts || !counts || !fc || !q || !gain_db || npos <= 0 || max_in <= 0 || max_out <= 0) return 0;
+    if (npos > (int)BW_RQ_GRID_MAX || max_in > BW_ROOM_EQ_MAX) return 0;   /* schema caps bound the stack arrays */
+    memset(gain_db, 0, (size_t)npos * (size_t)max_out * sizeof(float));
+
+    /* flatten every real cut (a 0 dB section is congruence filler, not a measured mode) */
+    int cap = npos * max_in, m = 0;
+    float* ifc = (float*)malloc((size_t)cap * 3 * sizeof(float));
+    int*   ip  = (int*)  malloc((size_t)cap * sizeof(int));
+    if (!ifc || !ip) { free(ifc); free(ip); return 0; }
+    float* iq = ifc + cap, *ig = ifc + 2 * cap;
+    for (int p = 0; p < npos; ++p) {
+        int cnum = counts[p] > max_in ? max_in : counts[p];
+        for (int s = 0; s < cnum; ++s) {
+            const MeasureEqSection* c = &cuts[(size_t)p * max_in + s];
+            if (!(c->fc > 0.f) || !(c->q > 0.f) || c->gain_db > -0.05f) continue;
+            ifc[m] = c->fc; iq[m] = c->q; ig[m] = c->gain_db; ip[m] = p; ++m;
+        }
+    }
+    if (!m) { free(ifc); free(ip); return 0; }
+
+    for (int i = 1; i < m; ++i) {                            /* insertion sort by fc (m <= npos*max_in, tiny) */
+        float tf = ifc[i], tq = iq[i], tg = ig[i]; int tp = ip[i]; int j = i - 1;
+        while (j >= 0 && ifc[j] > tf) { ifc[j+1]=ifc[j]; iq[j+1]=iq[j]; ig[j+1]=ig[j]; ip[j+1]=ip[j]; --j; }
+        ifc[j+1] = tf; iq[j+1] = tq; ig[j+1] = tg; ip[j+1] = tp;
+    }
+
+    /* greedy clusters over the sorted list: a run belongs together while fc stays within tol_rel of
+     * the run's lowest member (the same room mode read from different mic spots) */
+    enum { CLU_CAP = BW_RQ_GRID_MAX * BW_ROOM_EQ_MAX };
+    int cstart[CLU_CAP], clen[CLU_CAP], nclu = 0;
+    for (int i = 0; i < m; ) {
+        int j = i + 1;
+        while (j < m && ifc[j] <= ifc[i] * (float)(1.0 + tol_rel)) ++j;
+        cstart[nclu] = i; clen[nclu] = j - i; ++nclu;
+        i = j;
+    }
+
+    float cfc[CLU_CAP], cq[CLU_CAP], cdepth[CLU_CAP]; int keep[CLU_CAP];
+    for (int cI = 0; cI < nclu; ++cI) {                      /* per cluster: median fc/q, deepest member */
+        float tmp[CLU_CAP];
+        int s0 = cstart[cI], L = clen[cI];
+        memcpy(tmp, &ifc[s0], (size_t)L * sizeof(float)); cfc[cI] = fmedian(tmp, L);
+        memcpy(tmp, &iq[s0],  (size_t)L * sizeof(float)); cq[cI]  = fmedian(tmp, L);
+        float d = 0.f;
+        for (int i = s0; i < s0 + L; ++i) if (ig[i] < d) d = ig[i];
+        cdepth[cI] = d;
+        keep[cI] = 1;
+    }
+    int nsel = nclu;
+    while (nsel > max_out) {                                 /* over the ladder cap: drop the shallowest */
+        int worst = -1; float wd = -1e9f;
+        for (int cI = 0; cI < nclu; ++cI)
+            if (keep[cI] && cdepth[cI] > wd) { wd = cdepth[cI]; worst = cI; }
+        keep[worst] = 0; --nsel;
+    }
+
+    int j = 0;
+    for (int cI = 0; cI < nclu; ++cI) {                      /* emit in fc order (the list is fc-sorted) */
+        if (!keep[cI]) continue;
+        fc[j] = cfc[cI]; q[j] = cq[cI];
+        for (int i = cstart[cI]; i < cstart[cI] + clen[cI]; ++i) {
+            float* g = &gain_db[(size_t)ip[i] * max_out + j];
+            if (ig[i] < *g) *g = ig[i];                      /* a position's deepest read of this mode */
+        }
+        ++j;
+    }
+    free(ifc); free(ip);
+    return j;
+}
+
+int calib_write_room_eq_grid(const char* in_path, const char* out_path, const float mic[3],
+                             const MeasureEqSection* cuts, const int* counts, int n,
+                             int max_sections, char* err, size_t errcap) {
+    #define FAIL(msg) do { if (err && errcap) snprintf(err, errcap, "%s", msg); goto fail; } while (0)
+    char* text = NULL; cJSON* root = NULL; char* outtext = NULL; int ok = 0;
+    cJSON* narr = NULL;             /* the rebuilt grid; owned here until attached to root */
+    MeasureEqSection* all = NULL;   /* [pos][speaker][BW_ROOM_EQ_MAX] — every position's cuts */
+    int* acount = NULL;             /* [pos][speaker] used sections */
+    float gpos[BW_RQ_GRID_MAX][3]; int npos = 0;
+
+    text = read_file(in_path, NULL);
+    if (!text) { if (err && errcap) snprintf(err, errcap, "calib: cannot read %s", in_path); return 0; }
+    root = cJSON_Parse(text);
+    if (!root) FAIL("calib: layout is not valid JSON");
+    cJSON* speakers = cJSON_GetObjectItemCaseSensitive(root, "speakers");
+    if (!cJSON_IsArray(speakers)) FAIL("calib: layout has no 'speakers' array");
+    if (cJSON_GetArraySize(speakers) != n) FAIL("calib: speaker count does not match the measurements");
+
+    all    = (MeasureEqSection*)calloc((size_t)BW_RQ_GRID_MAX * n * BW_ROOM_EQ_MAX, sizeof *all);
+    acount = (int*)calloc((size_t)BW_RQ_GRID_MAX * n, sizeof *acount);
+    if (!all || !acount) FAIL("calib: out of memory");
+    #define ALL(p, s)    (&all[((size_t)(p) * n + (s)) * BW_ROOM_EQ_MAX])
+    #define ACOUNT(p, s) (acount[(size_t)(p) * n + (s)])
+
+    /* read back the existing grid: each entry's sections become that position's cuts for the
+     * re-merge (its 0 dB congruence fillers are skipped by calib_room_grid_merge) */
+    cJSON* grid = cJSON_GetObjectItemCaseSensitive(root, "room_eq_grid");
+    if (cJSON_IsArray(grid)) {
+        int np = cJSON_GetArraySize(grid);
+        if (np > (int)BW_RQ_GRID_MAX) np = BW_RQ_GRID_MAX;
+        for (int p = 0; p < np; ++p) {
+            cJSON* ent  = cJSON_GetArrayItem(grid, p);
+            cJSON* posj = cJSON_IsObject(ent) ? cJSON_GetObjectItemCaseSensitive(ent, "position") : NULL;
+            cJSON* spks = cJSON_IsObject(ent) ? cJSON_GetObjectItemCaseSensitive(ent, "speakers") : NULL;
+            if (!cJSON_IsArray(posj) || cJSON_GetArraySize(posj) != 3 ||
+                !cJSON_IsArray(spks) || cJSON_GetArraySize(spks) != n)
+                FAIL("calib: existing room_eq_grid entry is malformed");
+            for (int c = 0; c < 3; ++c) gpos[npos][c] = (float)cJSON_GetArrayItem(posj, c)->valuedouble;
+            for (int s = 0; s < n; ++s) {
+                cJSON* secs = cJSON_GetArrayItem(spks, s);
+                int m = cJSON_IsArray(secs) ? cJSON_GetArraySize(secs) : 0;
+                if (m > BW_ROOM_EQ_MAX) m = BW_ROOM_EQ_MAX;
+                for (int t = 0; t < m; ++t) {
+                    cJSON* o = cJSON_GetArrayItem(secs, t);
+                    MeasureEqSection* dst = &ALL(npos, s)[t];
+                    cJSON* fj = cJSON_GetObjectItemCaseSensitive(o, "fc");
+                    cJSON* gj = cJSON_GetObjectItemCaseSensitive(o, "gain_db");
+                    cJSON* qj = cJSON_GetObjectItemCaseSensitive(o, "q");
+                    if (!cJSON_IsNumber(fj) || !cJSON_IsNumber(gj) || !cJSON_IsNumber(qj))
+                        FAIL("calib: existing room_eq_grid section is malformed");
+                    dst->fc = (float)fj->valuedouble; dst->gain_db = (float)gj->valuedouble; dst->q = (float)qj->valuedouble;
+                }
+                ACOUNT(npos, s) = m;
+            }
+            ++npos;
+        }
+    }
+
+    /* replace the entry at (or append) this mic position */
+    {
+        int slot = -1;
+        for (int p = 0; p < npos; ++p) {
+            float dx = gpos[p][0]-mic[0], dy = gpos[p][1]-mic[1], dz = gpos[p][2]-mic[2];
+            if (dx*dx + dy*dy + dz*dz < 0.05f * 0.05f) { slot = p; break; }
+        }
+        if (slot < 0) {
+            if (npos >= (int)BW_RQ_GRID_MAX) FAIL("calib: room_eq_grid is full (16 positions)");
+            slot = npos++;
+        }
+        memcpy(gpos[slot], mic, sizeof(float) * 3);
+        for (int s = 0; s < n; ++s) {
+            int m = counts[s] > BW_ROOM_EQ_MAX ? BW_ROOM_EQ_MAX : counts[s];
+            if (m > max_sections) m = max_sections;
+            for (int t = 0; t < m; ++t) ALL(slot, s)[t] = cuts[(size_t)s * max_sections + t];
+            ACOUNT(slot, s) = m;
+        }
+    }
+
+    /* re-merge every speaker across all positions and rewrite the congruent grid */
+    {
+        narr = cJSON_CreateArray();
+        if (!narr) FAIL("calib: room_eq_grid array alloc");
+        cJSON* entries[BW_RQ_GRID_MAX];
+        for (int p = 0; p < npos; ++p) {
+            cJSON* ent = cJSON_CreateObject();
+            cJSON* posj = cJSON_CreateArray();
+            cJSON* spks = cJSON_CreateArray();
+            if (!ent || !posj || !spks) FAIL("calib: room_eq_grid entry alloc");
+            for (int c = 0; c < 3; ++c)
+                cJSON_AddItemToArray(posj, cJSON_CreateNumber(round((double)gpos[p][c] * 1000.0) / 1000.0));
+            cJSON_AddItemToObject(ent, "position", posj);
+            cJSON_AddItemToObject(ent, "speakers", spks);
+            cJSON_AddItemToArray(narr, ent);
+            entries[p] = spks;
+        }
+        MeasureEqSection percut[BW_RQ_GRID_MAX * BW_ROOM_EQ_MAX];
+        int   percnt[BW_RQ_GRID_MAX];
+        float lfc[BW_ROOM_EQ_MAX], lq[BW_ROOM_EQ_MAX], lg[BW_RQ_GRID_MAX * BW_ROOM_EQ_MAX];
+        for (int s = 0; s < n; ++s) {
+            for (int p = 0; p < npos; ++p) {
+                memcpy(&percut[(size_t)p * BW_ROOM_EQ_MAX], ALL(p, s), sizeof(MeasureEqSection) * BW_ROOM_EQ_MAX);
+                percnt[p] = ACOUNT(p, s);
+            }
+            int lad = calib_room_grid_merge(percut, percnt, npos, BW_ROOM_EQ_MAX,
+                                            0.08, BW_ROOM_EQ_MAX, lfc, lq, lg);
+            for (int p = 0; p < npos; ++p) {
+                cJSON* secs = cJSON_CreateArray();
+                if (!secs) FAIL("calib: room_eq_grid sections alloc");
+                for (int j = 0; j < lad; ++j) {              /* the FULL ladder at every position (congruent) */
+                    cJSON* o = cJSON_CreateObject();
+                    if (!o) FAIL("calib: room_eq_grid section alloc");
+                    /* clamp into the loader's schema ranges so the writeback always round-trips */
+                    double wfc = round((double)lfc[j] * 10.0) / 10.0;
+                    double wg  = round((double)lg[(size_t)p * BW_ROOM_EQ_MAX + j] * 100.0) / 100.0;
+                    double wq  = round((double)lq[j] * 100.0) / 100.0;
+                    if (wfc < 10.0)  wfc = 10.0;  else if (wfc > 1000.0) wfc = 1000.0;
+                    if (wg  < -24.0) wg  = -24.0; else if (wg  > 0.0)    wg  = 0.0;
+                    if (wq  < 0.25)  wq  = 0.25;  else if (wq  > 24.0)   wq  = 24.0;
+                    cJSON_AddNumberToObject(o, "fc",      wfc);
+                    cJSON_AddNumberToObject(o, "gain_db", wg);
+                    cJSON_AddNumberToObject(o, "q",       wq);
+                    cJSON_AddItemToArray(secs, o);
+                }
+                cJSON_AddItemToArray(entries[p], secs);
+            }
+            cJSON* sp = cJSON_GetArrayItem(speakers, s);     /* the schemes are mutually exclusive */
+            cJSON_DeleteItemFromObjectCaseSensitive(sp, "room_eq");
+        }
+        cJSON_DeleteItemFromObjectCaseSensitive(root, "room_eq_grid");
+        cJSON_AddItemToObject(root, "room_eq_grid", narr);
+        narr = NULL;                                     /* root owns it now (fail must not double-free) */
+    }
+
+    outtext = cJSON_Print(root);
+    if (!outtext) FAIL("calib: failed to serialize layout");
+    FILE* f = fopen(out_path, "wb");
+    if (!f) FAIL("calib: cannot open output for writing");
+    fwrite(outtext, 1, strlen(outtext), f); fclose(f);
+    ok = 1;
+fail:
+    cJSON_Delete(narr);                                  /* non-NULL only if a FAIL fired pre-attach */
+    free(all); free(acount);
+    free(outtext); cJSON_Delete(root); free(text);
+    return ok;
+    #undef ACOUNT
+    #undef ALL
     #undef FAIL
 }
 

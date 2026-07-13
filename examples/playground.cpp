@@ -683,13 +683,22 @@ static void draw_panel(void) {
     ImGui::SeparatorText(scenes[cur_scene].name);
     if (cur_scene == 0) {                                 /* Localization */
         if (chk("auto-move [SPACE]", &loc_auto) && loc_auto) { loc_flyby = 0; loc_t = 0.0f; loc_trail_len = 0; }
+        bwTip("orbit the source around the head - listen for smooth motion, no zipper");
         if (chk("fast flyby [X]", &loc_flyby) && loc_flyby) { loc_auto = 0; loc_fly_t = 0.0f; loc_trail_len = 0; }
+        bwTip("a fast close pass - the speed Doppler needs to be obvious");
         if (chk("Doppler [V]", &loc_dop))            bw_source_set_doppler(e, src, loc_dop);
+        bwTip("renders the true propagation delay: pitch up approaching, down receding "
+              "(subtle at orbit speed - pair it with fast flyby)");
         if (chk("air absorption [B]", &loc_air))     bw_source_set_air_absorption(e, src, loc_air);
+        bwTip("distance-driven high-frequency roll-off: far sources sound duller");
         if (chk("dual-band panning [M]", &loc_dual)) bw_set_dual_band(e, loc_dual);
+        bwTip("below ~700 Hz pans amplitude-normalised - sharper bass localisation "
+              "near the sweet spot; toggle it live and compare");
         ImGui::SetNextItemWidth(-FLT_MIN);
         if (ImGui::SliderFloat("##spread", &loc_spread, 0.0f, 1.0f, "size %.2f [C]"))
             bw_source_set_spread(e, src, loc_spread);
+        bwTip("angular width: 0 = point source, 1 = wide - a crowd or waterfall "
+              "that shouldn't collapse to a point");
         ImGui::TextDisabled("source (%.2f, %.2f, %.2f)  head %.0f deg",
                             source_pos.x, source_pos.y, source_pos.z, head_yaw * 57.2958f);
         ImGui::TextWrapped("broadband + sharp onsets localise best");
@@ -697,8 +706,13 @@ static void draw_panel(void) {
         ImGui::SetNextItemWidth(-FLT_MIN);
         int m = cur_mat;
         if (ImGui::Combo("##mat", &m, mat_names, NMAT) && m != cur_mat) { cur_mat = m; push_wall_mesh(mats[cur_mat]); }
+        bwTip("wall material: each has its own per-band transmission (how muffled "
+              "the occluded sound gets) and reflectivity");
         chk("audible reflection [T]", &refl_audible);
+        bwTip("the wall throws an image-source reflection when the source is in front of it");
         if (chk("occlusion [G]", &occ_audible)) bw_source_set_occlusion(e, src, occ_audible);
+        bwTip("ray-traced: the wall between source and listener attenuates AND muffles "
+              "it (per-band transmission EQ), ramped - not a hard mute");
         ImGui::TextDisabled("[ ] keys slide the wall");
         if (occ_refl_valid)    ImGui::TextColored(ImVec4(1.00f, 0.70f, 0.30f, 1.0f), "in FRONT: REFLECTING (image source)");
         else if (occ_occluded) ImGui::TextColored(ImVec4(0.96f, 0.55f, 0.55f, 1.0f), "BEHIND: OCCLUDED (material tilt)");
@@ -711,6 +725,8 @@ static void draw_panel(void) {
             cur_dir = d;
             bw_source_set_directivity_preset(e, src, (BwDirectivity)cur_dir);
         }
+        bwTip("radiation pattern: omni (no directivity), cardioid (one-sided), "
+              "figure-8 (dipole with a null at 90 degrees)");
         ImGui::SetNextItemWidth(-FLT_MIN);
         ImGui::SliderAngle("##aim", &source_yaw, -180.0f, 180.0f, "aim %.0f deg [,/.]");
         ImGui::Text("%.0f%% on-axis at the listener", dir_gain * 100.0f);
@@ -732,6 +748,9 @@ static void draw_panel(void) {
                 if (ImGui::Selectable(abx_cmps[i].name, i == abx_cmp) && i != abx_cmp) { abx_cmp = i; abx_reset(); }
             ImGui::EndCombo();
         }
+        bwTip("one engine knob differs between A and B; X is secretly one of them. "
+              "Listen to all three, answer, repeat - the p-value says whether the "
+              "difference is genuinely audible, not just 'sounds different to me'");
         ImGui::TextDisabled("A = %s\nB = %s", abx_cmps[abx_cmp].a, abx_cmps[abx_cmp].b);
         if (ImGui::RadioButton("A [Z]", abx_listen == 0)) abx_set_listen(0);
         ImGui::SameLine();
@@ -758,9 +777,13 @@ static void draw_panel(void) {
         }
     } else {                                              /* Reverb bed */
         if (chk("reverb send [G]", &rev_on)) bw_source_set_reflections(e, src, rev_on);
+        bwTip("opt the source into the shared reverb bed's wet send");
         ImGui::SetNextItemWidth(-FLT_MIN);
         ImGui::SliderFloat("##wet", &rev_wet, 0.0f, 2.0f, "wet %.2f  [ ] keys");   /* applied per frame in rev_update */
+        bwTip("live wet level of the whole bed (bw_reflections_set_gain)");
         if (chk("distance->wet [V]", &rev_dist)) bw_source_set_reflection_distance(e, src, rev_dist);
+        bwTip("near = drier, far = wetter - walk the source away (WASD) and hear "
+              "the room take over");
         ImGui::SetNextItemWidth(-FLT_MIN);
         int dec = rev_decoder;
         const char* dec_names[2] = { "bed decoder: sampling (SAD)", "bed decoder: AllRAD" };
@@ -770,6 +793,8 @@ static void draw_panel(void) {
             build_engine(1);
             rev_enter();
         }
+        bwTip("diffuse-bed decoder. Load-time, so switching REBUILDS the engine - "
+              "expect a brief pause; audio and playhead restart");
         ImGui::TextWrapped("8x4x8 m plaster room; clicks/bursts show the tail. SAD vs AllRAD differ most on an irregular layout.");
     }
 
@@ -863,6 +888,17 @@ static void register_tests(ImGuiTestEngine* te) {
         IM_CHECK_EQ(cur_sig, 0);
     };
 
+    t = IM_REGISTER_TEST(te, "viewer", "tooltips");              /* the hover help actually shows */
+    t->TestFunc = [](ImGuiTestContext* ctx) {
+        ctx->SetRef("playground");
+        ctx->MouseMove("**/dual-band panning [M]");
+        double t0 = ImGui::GetTime();
+        while (ImGui::GetTime() - t0 < 1.2) ctx->Yield();        /* the ForTooltip delay is wall-clock */
+        ImGuiWindow* tip = ImGui::FindWindowByName("##Tooltip_00");
+        IM_CHECK(tip != NULL && tip->WasActive);
+        ctx->CaptureScreenshot();
+    };
+
     /* every scene enters cleanly; the reverb boundary rebuilds the engine BOTH ways and it stays
      * live. (switch_scene is called directly: the keyboard path polls raylib, which the test
      * engine's synthetic input can't reach — the panel path is covered by panel_controls.) */
@@ -910,6 +946,18 @@ int main(int argc, char** argv) {
      * and it PINS the no-device fallback path — see the meters_live test. */
     bool selftest = false;
     char filter[64] = "";
+    for (int i = 1; i < argc; ++i)
+        if (!strcmp(argv[i], "--help") || !strcmp(argv[i], "-h")) {
+            printf("usage: bw_playground [cave_layout.json] [--tests [filter]]\n"
+                   "  audition the engine by ear on the binaural monitor (auto-picked 2-ch ASIO\n"
+                   "  driver; with no device it renders silently -- visual-only mode stays live)\n"
+                   "  cave_layout.json   optional surveyed layout (default: ./cave_layout.json if\n"
+                   "                     present, else the built-in grid); ./constraints.json is\n"
+                   "                     drawn for orientation if present\n"
+                   "  --tests [filter]   run the UI test suite (offline) and exit pass/fail\n"
+                   "  keys: TAB scene | WASD/RF source | Q/E head | 1-4 signal | SPACE auto-move | F11\n");
+            return 0;
+        }
     for (int i = 1; i < argc; ++i)
         if (!strcmp(argv[i], "--tests") || !strcmp(argv[i], "--selftest")) {
             selftest = true;

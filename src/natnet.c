@@ -272,7 +272,11 @@ static DWORD WINAPI receiver(LPVOID arg) {
         if (natnet_parse_frame(buf + 4, plen, nn->major, nn->minor, nn->rigid_body, sp, sq, &tv) && tv) {
             float p[3], q[4];
             to_room(sp, sq, p, q);
-            pose_write(&nn->pose, p, q);
+            /* stamp with QPC ns at ARRIVAL: rt.c differences successive stamps for the pose-prediction
+             * velocity estimate (same clock, same writer — never compared to another clock) */
+            LARGE_INTEGER qc, qf;
+            QueryPerformanceCounter(&qc); QueryPerformanceFrequency(&qf);
+            pose_write_t(&nn->pose, p, q, (unsigned __int64)((double)qc.QuadPart * 1e9 / (double)qf.QuadPart));
         }
     }
     return 0;

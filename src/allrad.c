@@ -15,6 +15,13 @@
 
 #define ALLRAD_M       240     /* virtual loudspeakers (Fibonacci sphere) */
 #define ALLRAD_MAXTRI  1024    /* hull-triangle cap; overflow (extreme coplanarity) -> fall back to SAD */
+/* Imaginary-loudspeaker gap threshold (IEM AllRADecoder practice): if no real speaker lies within
+ * this angle of a pole (nadir/zenith), the hull spans the hole with triangles of DISTANT speakers
+ * and diffuse energy aimed into the hole smears onto them (a floor-less CAVE array over-energises
+ * its bottom ring). Adding an imaginary speaker at the pole closes the triangulation there, and its
+ * decode row is DISCARDED — energy pointed where no speaker exists is dropped, not mis-panned. 60°
+ * leaves genuinely-covered poles alone (the cube grid's nadir gap is ~55°: unchanged). */
+#define ALLRAD_IMAG_COS 0.5f   /* cos(60°) */
 
 static void fib_dir(int i, int M, float d[3]) {
     float y = 1.f - 2.f * ((float)i + 0.5f) / (float)M;
@@ -30,7 +37,7 @@ int allrad_build_decode(const Layout* L, float decode[BW_CHANNELS][BW_AMBI_CH]) 
 
     /* real loudspeaker directions from the layout's nominal listening point (the array centroid —
      * world-locked, like the sampling decode; the room origin canonically sits on the floor) */
-    float r[BW_CHANNELS][3];
+    float r[BW_CHANNELS + 2][3];   /* + up to 2 imaginary pole speakers */
     for (uint32_t s = 0; s < N; ++s) {
         float p[3] = { L->speakers[s].pos[0] - L->ref[0],
                        L->speakers[s].pos[1] - L->ref[1],
@@ -40,9 +47,20 @@ int allrad_build_decode(const Layout* L, float decode[BW_CHANNELS][BW_AMBI_CH]) 
         else { float inv = 1.f/len; r[s][0] = p[0]*inv; r[s][1] = p[1]*inv; r[s][2] = p[2]*inv; }
     }
 
+    /* imaginary pole speakers (see ALLRAD_IMAG_COS): probe nadir then zenith (room +y = up) */
+    uint32_t nall = N;
+    for (int pole = -1; pole <= 1; pole += 2) {
+        float best = -1.f;                                     /* max dot = the nearest real speaker */
+        for (uint32_t s = 0; s < N; ++s) if ((float)pole * r[s][1] > best) best = (float)pole * r[s][1];
+        if (best < ALLRAD_IMAG_COS) {
+            r[nall][0] = 0.f; r[nall][1] = (float)pole; r[nall][2] = 0.f;
+            ++nall;
+        }
+    }
+
     /* convex-hull triangulation of the unit speaker directions around the origin */
     int tri[ALLRAD_MAXTRI][3]; float tdet[ALLRAD_MAXTRI];
-    int ntri = hull_triangulate(r, N, tri, tdet, ALLRAD_MAXTRI);
+    int ntri = hull_triangulate(r, nall, tri, tdet, ALLRAD_MAXTRI);
     if (ntri == 0) return 0;                                   /* degenerate / overflow -> caller keeps SAD */
 
     memset(decode, 0, sizeof(float) * BW_CHANNELS * BW_AMBI_CH);
@@ -61,8 +79,10 @@ int allrad_build_decode(const Layout* L, float decode[BW_CHANNELS][BW_AMBI_CH]) 
             int l = (int)floorf(sqrtf((float)kk));
             row[kk] = (float)(2*l + 1) * y[kk] / (float)ALLRAD_M;   /* D_virt row */
         }
-        for (int q = 0; q < 3; ++q)
+        for (int q = 0; q < 3; ++q) {
+            if ((uint32_t)spk[q] >= N) continue;   /* imaginary pole speaker: its share is discarded */
             for (int kk = 0; kk < BW_AMBI_CH; ++kk) decode[spk[q]][kk] += bg[q] * row[kk];
+        }
     }
 
     /* energy-normalise to the sampling decode's diffuse level (so swapping decoders keeps the bed

@@ -33,7 +33,23 @@ struct Aligner {
     float    rq_co[BW_CHANNELS][BW_ROOM_EQ_MAX][5];   /* b0 b1 b2 a1 a2 (a0-normalized) */
     float    rq_x1[BW_CHANNELS][BW_ROOM_EQ_MAX], rq_x2[BW_CHANNELS][BW_ROOM_EQ_MAX];
     float    rq_y1[BW_CHANNELS][BW_ROOM_EQ_MAX], rq_y2[BW_CHANNELS][BW_ROOM_EQ_MAX];
+    /* Tracked room EQ (layouts with a room_eq_grid): the SAME rq cascade, but the section gains are
+     * live — rt.c interpolates targets from the grid at the listener position (align_room_eq_targets)
+     * and process slews each section's gain toward its target (RQ_SLEW_DB_S), rebuilding that section's
+     * coefficients from the precomputed cw0/alpha (fixed fc/Q ladder — only the depth moves, so the
+     * trig stays out of the audio thread; same trick as rt.c's transmission EQ). Sections settled at
+     * 0 dB are skipped (a cold restart of a near-identity biquad is inaudible). */
+    int      rq_dyn;
+    float    rq_cw0[BW_CHANNELS][BW_ROOM_EQ_MAX];     /* cos(w0) per ladder section */
+    float    rq_alpha[BW_CHANNELS][BW_ROOM_EQ_MAX];   /* sin(w0)/(2Q) per ladder section */
+    float    rq_gcur[BW_CHANNELS][BW_ROOM_EQ_MAX];    /* current section gain (dB, slewed) */
+    float    rq_gtgt[BW_CHANNELS][BW_ROOM_EQ_MAX];    /* target section gain (dB) */
+    float    rq_slew;                                 /* max dB change per sample (RQ_SLEW_DB_S / rate) */
 };
+
+#define RQ_SLEW_DB_S 24.0f   /* tracked-room-EQ gain slew: a full 12 dB cut lands in ~0.5 s — fast
+                              * enough to track a walking listener, far too slow to zipper (the cuts
+                              * live below 200 Hz, where a 0.13 dB/block step at 256/48k is inaudible) */
 
 static uint32_t pow2_ge(uint32_t x) { uint32_t p = 1; while (p < x) p <<= 1; return p; }
 
@@ -60,6 +76,22 @@ Aligner* align_create(uint32_t channels, const Layout* L, uint32_t sample_rate) 
         }
         if (a->rq_n[k]) a->any_rq = 1;
     }
+    if (L->rq_grid.npos) {                         /* tracked room EQ: seed the ladder, gains start flat
+                                                    * (0 dB) and slew toward rt.c's interpolated targets
+                                                    * (mutually exclusive with room_eq — layout.c enforces) */
+        a->rq_dyn  = 1;
+        a->any_rq  = 1;
+        a->rq_slew = RQ_SLEW_DB_S / (float)sample_rate;
+        for (uint32_t k = 0; k < channels; ++k) {
+            uint8_t m = L->rq_grid.nsec[k] > BW_ROOM_EQ_MAX ? BW_ROOM_EQ_MAX : L->rq_grid.nsec[k];
+            for (uint8_t s = 0; s < m; ++s) {
+                double w0 = 2.0 * M_PI * (double)L->rq_grid.fc[k][s] / (double)sample_rate;
+                a->rq_cw0[k][s]   = (float)cos(w0);
+                a->rq_alpha[k][s] = (float)(sin(w0) / (2.0 * (double)L->rq_grid.q[k][s]));
+            }
+            a->rq_n[k] = m;
+        }
+    }
     a->buf = (float*)calloc((size_t)channels * a->len, sizeof(float));
     if (!a->buf) { free(a); return NULL; }
     if (a->any_eq) {                               /* only pay the memory + DSP if a filter exists */
@@ -77,6 +109,17 @@ Aligner* align_create(uint32_t channels, const Layout* L, uint32_t sample_rate) 
 
 void align_destroy(Aligner* a) {
     if (a) { free(a->buf); free(a->eq); free(a->eqhist); free(a); }
+}
+
+void align_room_eq_targets(Aligner* a, const float (*gain_db)[BW_ROOM_EQ_MAX]) {
+    if (!a || !a->rq_dyn || !gain_db) return;
+    for (uint32_t k = 0; k < a->channels; ++k)
+        for (uint8_t s = 0; s < a->rq_n[k]; ++s) {
+            float g = gain_db[k][s];
+            if (g > 0.f)   g = 0.f;                /* the grid is cut-only by schema; clamp defensively */
+            if (g < -24.f) g = -24.f;
+            a->rq_gtgt[k][s] = g;
+        }
 }
 
 void align_process(Aligner* a, float* bus, uint32_t n) {
@@ -97,12 +140,32 @@ void align_process(Aligner* a, float* bus, uint32_t n) {
         }
         a->eqw = (ew + n) & emask;
     }
+    if (a->rq_dyn) {                               /* tracked room EQ: slew each section's gain toward its
+                                                    * target, rebuilding its coefficients when it moved. The
+                                                    * step is bounded per BLOCK (slew * n), so the spectral
+                                                    * envelope glides — the biquad state rides through a
+                                                    * coefficient nudge without a step (invariant 4). */
+        const float step = a->rq_slew * (float)n;
+        for (uint32_t k = 0; k < a->channels; ++k)
+            for (uint8_t s = 0; s < a->rq_n[k]; ++s) {
+                float g = a->rq_gcur[k][s], t = a->rq_gtgt[k][s];
+                if (g == t) continue;
+                if      (g < t - step) g += step;
+                else if (g > t + step) g -= step;
+                else                   g  = t;
+                a->rq_gcur[k][s] = g;
+                bw_biquad_rbj(BW_BIQUAD_PEAK, (double)a->rq_cw0[k][s], (double)a->rq_alpha[k][s],
+                              pow(10.0, (double)g / 40.0), a->rq_co[k][s]);
+            }
+    }
     if (a->any_rq) {                               /* LF modal cuts: per-channel biquad cascade (DF-I) */
         for (uint32_t k = 0; k < a->channels; ++k) {
             const uint8_t S = a->rq_n[k];
             if (!S) continue;
             float* x = &bus[(size_t)k * n];
             for (uint8_t s = 0; s < S; ++s) {
+                if (a->rq_dyn && a->rq_gcur[k][s] == 0.f && a->rq_gtgt[k][s] == 0.f)
+                    continue;                      /* settled flat: identity — skip (cold restart is fine) */
                 const float* co = a->rq_co[k][s];
                 float x1 = a->rq_x1[k][s], x2 = a->rq_x2[k][s], y1 = a->rq_y1[k][s], y2 = a->rq_y2[k][s];
                 for (uint32_t i = 0; i < n; ++i) {

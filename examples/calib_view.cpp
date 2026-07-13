@@ -1022,6 +1022,12 @@ int main(int argc, char** argv) {
             if (i + 1 < argc && argv[i + 1][0] != '-') snprintf(filter, sizeof filter, "%s", argv[++i]);
         }
         else if (!strcmp(argv[i], "--irs") && i + 1 < argc) snprintf(V.irprefix, sizeof V.irprefix, "%s", argv[++i]);
+        else if (!strcmp(argv[i], "--help") || !strcmp(argv[i], "-h")) {
+            printf("usage: calib_view [layoutA.json] [layoutB.json] [--irs prefix] [--tests [filter]]\n"
+                   "  calibration station: array 3D view, trims, EQ curves, IRs, a layout diff (A vs\n"
+                   "  B), the Capture tab (sweep->measure->solve->writeback), and the Zylia DOA tab.\n");
+            return 0;
+        }
         else if (argv[i][0] != '-' && npos < 2) {
             if (npos++ == 0) snprintf(V.pathA, sizeof V.pathA, "%s", argv[i]);
             else             snprintf(V.pathB, sizeof V.pathB, "%s", argv[i]);

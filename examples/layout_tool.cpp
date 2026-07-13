@@ -1205,6 +1205,17 @@ int main(int argc, char** argv) {
     bool selftest = false;
     char filter[64] = "";
     for (int i = 1; i < argc; ++i)
+        if (!strcmp(argv[i], "--help") || !strcmp(argv[i], "-h")) {
+            printf("usage: bw_layout_tool [cave_layout.json | mode]\n"
+                   "  edit a speaker layout in 3D (default file: ./cave_layout.json;\n"
+                   "  ./constraints.json bounds the placement if present)\n"
+                   "  --export   [file]                    write the layout headless\n"
+                   "  --score    [file]                    print each panner's rE-localization error\n"
+                   "  --optimize [file] [dbap|spcap|vbap]  hill-climb within constraints, save in place\n"
+                   "  --tests    [filter]                  run the UI test suite and exit pass/fail\n");
+            return 0;
+        }
+    for (int i = 1; i < argc; ++i)
         if (!strcmp(argv[i], "--tests") || !strcmp(argv[i], "--selftest")) {
             selftest = true;
             if (i + 1 < argc && argv[i + 1][0] != '-') snprintf(filter, sizeof filter, "%s", argv[i + 1]);

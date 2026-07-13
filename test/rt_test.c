@@ -76,6 +76,40 @@ static int write_impulse_wav(const char* path, uint32_t frames) {
     free(buf); drwav_uninit(&wav);
     return wrote == frames;
 }
+static float lcg_noise_next(uint32_t* s) {           /* rt.c's LCG, [-1, 1) */
+    *s = *s * 1664525u + 1013904223u;
+    return (float)(*s >> 9) * (1.0f / 4194304.0f) - 1.0f;
+}
+static int write_noise_wav(const char* path, uint32_t frames) {
+    drwav_data_format fmt = { drwav_container_riff, DR_WAVE_FORMAT_IEEE_FLOAT, 1, RATE, 32 };
+    drwav wav;
+    if (!drwav_init_file_write(&wav, path, &fmt, NULL)) return 0;
+    float* buf = (float*)malloc((size_t)frames * sizeof(float));
+    if (!buf) { drwav_uninit(&wav); return 0; }
+    uint32_t s = 1;
+    for (uint32_t i = 0; i < frames; ++i) buf[i] = 0.5f * lcg_noise_next(&s);
+    drwav_uint64 wrote = drwav_write_pcm_frames(&wav, frames, buf);
+    free(buf); drwav_uninit(&wav);
+    return wrote == frames;
+}
+/* 4-ch (1st-order AmbiX) wav: ONE noise signal scaled per channel (ACN order W/Y/Z/X, SN3D) —
+ * (1,0,0,1) with x = the W amp encodes a plane wave from ambi +x (room +z); (1,0,0,0) is W-only
+ * (zero intensity: reads as fully diffuse to the parametric analysis). */
+static int write_ambix4_noise_wav(const char* path, float w, float y, float z, float x, uint32_t frames) {
+    drwav_data_format fmt = { drwav_container_riff, DR_WAVE_FORMAT_IEEE_FLOAT, 4, RATE, 32 };
+    drwav wav;
+    if (!drwav_init_file_write(&wav, path, &fmt, NULL)) return 0;
+    float* buf = (float*)malloc((size_t)frames * 4 * sizeof(float));
+    if (!buf) { drwav_uninit(&wav); return 0; }
+    uint32_t s = 7;
+    for (uint32_t i = 0; i < frames; ++i) {
+        float v = 0.5f * lcg_noise_next(&s);
+        buf[i*4+0] = w*v; buf[i*4+1] = y*v; buf[i*4+2] = z*v; buf[i*4+3] = x*v;
+    }
+    drwav_uint64 wrote = drwav_write_pcm_frames(&wav, frames, buf);
+    free(buf); drwav_uninit(&wav);
+    return wrote == frames;
+}
 /* render `kb` blocks, summing all 26 channels to mono per sample into out[kb*N]; the per-channel pan
  * gains are all >= 0 for one source, so the mono sum is a scaled copy of the (propagated) source. */
 static void render_capture_mono(RtCore* c, float* out, int kb) {
@@ -404,8 +438,352 @@ int main(void) {
             CHECK(act_spread > act_point + 2, "spread widens the source across more speakers");
             CHECK(share_sp < share_pt, "spread lowers the dominant channel's share");
             CHECK(l2_point > 0 && fabs(l2_spread - l2_point) / l2_point < 0.02, "spread preserves total power (constant-power)");
+
+            /* MDAP mode: the same widening contract from a different construction (a ring of virtual
+             * panner solves). Live A/B atomic like the panner: switch, re-dirty via commit, render. */
+            rt_set_spread_mode(cs, 1);
+            rt_source_set_pos(cs, hsp, 0.f, 0.f, 0.f); rt_commit(cs); render2(cs);   /* nudge -> re-solve */
+            set_pos_spk(cs, hsp, 7); rt_commit(cs); render2(cs);
+            int    act_mdap = active_channels(0.03);
+            double l2_mdap  = total_l2();
+            double share_md = chan_energy(argmax_channel()) / total_energy();
+            CHECK(act_mdap > act_point + 2, "MDAP spread widens the source across more speakers");
+            CHECK(share_md < share_pt, "MDAP spread lowers the dominant channel's share");
+            CHECK(l2_point > 0 && fabs(l2_mdap - l2_point) / l2_point < 0.02, "MDAP spread preserves total power");
+            /* spread 0 under MDAP mode = the plain point solve (the ring collapses onto the source) */
+            rt_source_set_spread(cs, hsp, 0.0f); rt_commit(cs); render2(cs);
+            int    act_md0 = active_channels(0.03);
+            double l2_md0  = total_l2();
+            CHECK(act_md0 == act_point && fabs(l2_md0 - l2_point) / l2_point < 0.02,
+                  "MDAP at spread 0 is the point solve");
+            rt_set_spread_mode(cs, 0);
             rt_source_destroy(cs, hsp); rt_commit(cs);
             rt_destroy(cs);
+        }
+    }
+
+    /* tracked room EQ (room_eq_grid): the align biquads re-aim as the committed listener moves — a
+     * 100 Hz voice equidistant from two grid positions (flat at A, -12 dB at B on EVERY channel)
+     * drops by ~the IDW-interpolated depth when the listener walks A -> B, and the live kill switch
+     * glides it back to flat. Total L2 isolates the EQ: the move also redistributes the panning, but
+     * constant power keeps ||bus|| fixed, and the same cut on every channel scales it uniformly. */
+    {
+        RtCore* cg = rt_create(8, 4, RATE, CH);
+        CHECK(cg != NULL, "rt_create (tracked room eq)");
+        if (cg) {
+            Layout G = layout_default();
+            G.rq_grid.npos = 2;
+            G.rq_grid.pos[0][0] = -0.5f; G.rq_grid.pos[0][1] = 1.5f; G.rq_grid.pos[0][2] = 0.f;
+            G.rq_grid.pos[1][0] =  0.5f; G.rq_grid.pos[1][1] = 1.5f; G.rq_grid.pos[1][2] = 0.f;
+            for (int k = 0; k < CH; ++k) {
+                G.rq_grid.nsec[k]  = 1;
+                G.rq_grid.fc[k][0] = 100.f; G.rq_grid.q[k][0] = 2.f;
+                G.rq_grid.gain_db[0][k][0] = 0.f;
+                G.rq_grid.gain_db[1][k][0] = -12.f;
+            }
+            rt_set_layout(cg, &G);
+            const char* SW = "bw_rt_sine100.wav";
+            if (write_sine_wav(SW, 100.0, 4800)) {               /* exactly 10 cycles: seamless loop */
+                uint32_t sg = rt_load_sound(cg, SW, err, sizeof err);
+                uint32_t hg = rt_source_create(cg);
+                rt_source_play(cg, hg, sg, true);
+                rt_source_set_pos(cg, hg, 0.f, 1.5f, 0.f);       /* equidistant from A and B (same atten) */
+                const float qid[4] = { 0, 0, 0, 1 };
+                const float pa[3] = { -0.5f, 1.5f, 0.f }, pb[3] = { 0.5f, 1.5f, 0.f };
+                rt_set_listener(cg, pa, qid); rt_commit(cg);
+                double l2_a = 0, l2_b = 0, l2_off = 0;
+                for (int b = 0; b < 100; ++b) render2(cg);       /* settle at A */
+                for (int b = 0; b <   8; ++b) { render2(cg); l2_a += total_l2(); }
+                rt_set_listener(cg, pb, qid); rt_commit(cg);
+                for (int b = 0; b < 200; ++b) render2(cg);       /* walk + settle (12 dB at 24 dB/s = 0.5 s) */
+                for (int b = 0; b <   8; ++b) { render2(cg); l2_b += total_l2(); }
+                double drop_db = 20.0 * log10(l2_a / l2_b);      /* IDW at B: ~ -11.7 dB (A still pulls a little) */
+                CHECK(drop_db > 9.0 && drop_db < 14.0, "tracked room EQ follows the listener (A flat -> B cut)");
+                rt_set_room_eq_dyn(cg, 0);                       /* kill switch: glide every section to flat */
+                for (int b = 0; b < 200; ++b) render2(cg);
+                for (int b = 0; b <   8; ++b) { render2(cg); l2_off += total_l2(); }
+                CHECK(fabs(20.0 * log10(l2_a / l2_off)) < 1.5, "tracked room EQ off glides back to flat");
+                rt_source_destroy(cg, hg); rt_commit(cg);
+            } else CHECK(0, "write 100 Hz sine");
+            rt_destroy(cg);
+            remove("bw_rt_sine100.wav");
+        }
+    }
+
+    /* decorrelation (bw_set_decorrelation): a fully-spread noise source's speaker feeds are IDENTICAL
+     * scaled copies with decor off (zero-lag correlation ~ +1) and mutually incoherent with it on
+     * (each channel passes its own velvet filter), at the same total power; toggling back restores
+     * coherence (the split amplitude ramps out and the velvet tail flushes). */
+    {
+        RtCore* cd = rt_create(8, 4, RATE, CH);
+        CHECK(cd != NULL, "rt_create (decorrelation)");
+        if (cd) {
+            const char* NW = "bw_rt_noise.wav";
+            if (write_noise_wav(NW, 8 * N)) {
+                uint32_t nd = rt_load_sound(cd, NW, err, sizeof err);
+                uint32_t hd = rt_source_create(cd);
+                rt_source_play(cd, hd, nd, true);
+                rt_source_set_pos(cd, hd, 0.7f, 1.5f, 0.4f);
+                rt_source_set_spread(cd, hd, 1.0f);              /* wide: many active channels */
+                rt_commit(cd);
+                for (int b = 0; b < 8; ++b) render2(cd);
+                /* pick the two strongest channels while coherent (stable across the toggle) */
+                int ca = argmax_channel(); double ea = chan_energy(ca);
+                int cb2 = -1; double eb = -1;
+                for (int ch = 0; ch < CH; ++ch) if (ch != ca && chan_energy(ch) > eb) { eb = chan_energy(ch); cb2 = ch; }
+                double l2_coh = total_l2();
+                #define XCORR(A, B, OUT) do {                                                   \
+                    double sab_ = 0, saa_ = 0, sbb_ = 0;                                        \
+                    for (int i_ = 0; i_ < (int)N; ++i_) {                                       \
+                        double xa_ = bus[(size_t)(A)*N + i_], xb_ = bus[(size_t)(B)*N + i_];    \
+                        sab_ += xa_*xb_; saa_ += xa_*xa_; sbb_ += xb_*xb_;                      \
+                    }                                                                           \
+                    (OUT) = (saa_ > 0 && sbb_ > 0) ? sab_ / sqrt(saa_*sbb_) : 0.0;              \
+                } while (0)
+                double r_off; XCORR(ca, cb2, r_off);
+                CHECK(r_off > 0.95, "decor off: spread feeds are coherent copies (corr ~ +1)");
+                rt_set_decorrelation(cd, 1);
+                for (int b = 0; b < 20; ++b) render2(cd);        /* ramp in + fill the velvet history */
+                double r_on; XCORR(ca, cb2, r_on);
+                double l2_dc = total_l2();
+                CHECK(fabs(r_on) < 0.4, "decor on: the same feeds are mutually incoherent");
+                CHECK(l2_coh > 0 && fabs(20.0 * log10(l2_dc / l2_coh)) < 1.5,
+                      "decorrelation preserves total power (~unit-energy filters)");
+                rt_set_decorrelation(cd, 0);
+                for (int b = 0; b < 20; ++b) render2(cd);        /* ramp out + flush the tail */
+                double r_back; XCORR(ca, cb2, r_back);
+                CHECK(r_back > 0.95, "decor off again: coherence restored (click-free A/B round trip)");
+                #undef XCORR
+                rt_source_destroy(cd, hd); rt_commit(cd);
+            } else CHECK(0, "write noise wav");
+            rt_destroy(cd);
+            remove("bw_rt_noise.wav");
+        }
+    }
+
+    /* parametric bed renderer (bw_set_bed_renderer): a noise PLANE-WAVE bed (W=X: from room +z)
+     * localizes SHARPER than the matrix decode and stays loudness-matched; a W-only bed (zero
+     * intensity -> fully diffuse) spreads across many channels through the decorrelators at matched
+     * power. The switch crossfades live. */
+    {
+        RtCore* cb = rt_create(8, 4, RATE, CH);
+        CHECK(cb != NULL, "rt_create (parametric bed)");
+        if (cb) {
+            const char* PW = "bw_rt_bed_pw.wav", *DW = "bw_rt_bed_w.wav";
+            if (write_ambix4_noise_wav(PW, 1.f, 0.f, 0.f, 1.f, 8 * N) &&
+                write_ambix4_noise_wav(DW, 1.f, 0.f, 0.f, 0.f, 8 * N)) {
+                uint32_t sp = rt_load_ambix(cb, PW, err, sizeof err);
+                CHECK(sp != 0, err[0] ? err : "load plane-wave bed");
+                uint32_t hp = rt_source_create(cb);
+                rt_source_play(cb, hp, sp, true);
+                rt_commit(cb);
+                for (int b = 0; b < 8; ++b) render2(cb);
+                double l2_m    = total_l2();
+                double share_m = chan_energy(argmax_channel()) / total_energy();
+                rt_set_bed_renderer(cb, 1);
+                for (int b = 0; b < 60; ++b) render2(cb);        /* crossfade + analysis smoothing settle */
+                double l2_p    = total_l2();
+                double share_p = chan_energy(argmax_channel()) / total_energy();
+                int    amax    = argmax_channel();
+                CHECK(LD.speakers[amax].pos[2] > 1.0f, "parametric: plane wave from room +z lands on the +z wall");
+                CHECK(share_p > share_m * 1.3, "parametric: the direct stream localizes sharper than the matrix decode");
+                CHECK(l2_m > 0 && fabs(20.0 * log10(l2_p / l2_m)) < 2.5,
+                      "parametric: plane-wave loudness matches the matrix decode (bed_pref)");
+                rt_set_bed_renderer(cb, 0);
+                for (int b = 0; b < 60; ++b) render2(cb);
+                double l2_back = total_l2();
+                CHECK(fabs(20.0 * log10(l2_back / l2_m)) < 0.5, "parametric -> matrix round trip restores the decode");
+                rt_source_destroy(cb, hp); rt_commit(cb);
+
+                uint32_t sd = rt_load_ambix(cb, DW, err, sizeof err);   /* W-only: fully diffuse */
+                uint32_t hd2 = rt_source_create(cb);
+                rt_source_play(cb, hd2, sd, true);
+                rt_commit(cb);
+                for (int b = 0; b < 8; ++b) render2(cb);
+                double l2_dm = total_l2();
+                rt_set_bed_renderer(cb, 1);
+                for (int b = 0; b < 60; ++b) render2(cb);
+                double l2_dp = total_l2();
+                CHECK(active_channels(0.02) >= 10, "parametric: a diffuse bed stays spread over many speakers");
+                CHECK(l2_dm > 0 && fabs(20.0 * log10(l2_dp / l2_dm)) < 2.0,
+                      "parametric: diffuse loudness matches the matrix decode (decorrelated, unit energy)");
+                rt_source_destroy(cb, hd2); rt_commit(cb);
+            } else CHECK(0, "write ambix noise beds");
+            rt_destroy(cb);
+            remove(PW); remove(DW);
+        }
+    }
+
+    /* pose prediction (rt_set_pose_prediction): with a tracked listener walking at a constant
+     * velocity, the rendered pose LEADS the freshest tracker sample by lead x velocity — the
+     * velocity estimated purely from the tracker's own timestamps. Lead 0 = passthrough. */
+    {
+        RtCore* cp = rt_create(8, 4, RATE, CH);
+        CHECK(cp != NULL, "rt_create (pose prediction)");
+        if (cp) {
+            static PoseSlot slot;                            /* single writer (this thread) */
+            memset(&slot, 0, sizeof slot);
+            rt_set_tracker(cp, &slot);
+            const float q[4] = { 0, 0, 0, 1 };
+            BwTimestamp ts = { 0, 0 };
+            float px = 0.f;
+            rt_set_pose_prediction(cp, 0.f);                 /* off: readback == written */
+            for (int k = 0; k < 20; ++k) {
+                px = 0.5f * (float)k * 0.01f;                /* 0.5 m/s, one write per 10 ms */
+                float p[3] = { px, 1.5f, 0.f };
+                pose_write_t(&slot, p, q, (uint64_t)(k + 1) * 10000000ull);
+                rt_render(cp, bus, N, &ts);
+            }
+            float rp[3], rq[4];
+            rt_read_pose(cp, rp, rq);
+            CHECK(fabsf(rp[0] - px) < 1e-6f, "prediction off: rendered pose == tracked pose");
+            rt_set_pose_prediction(cp, 0.05f);               /* 50 ms lead */
+            int k0 = 20;
+            for (int k = k0; k < k0 + 60; ++k) {             /* 0.6 s: the velocity estimate settles */
+                px = 0.5f * (float)k * 0.01f;
+                float p[3] = { px, 1.5f, 0.f };
+                pose_write_t(&slot, p, q, (uint64_t)(k + 1) * 10000000ull);
+                rt_render(cp, bus, N, &ts);
+            }
+            rt_read_pose(cp, rp, rq);
+            float lead_m = rp[0] - px;                       /* want 0.5 m/s * 0.05 s = 25 mm */
+            printf("posepred: lead = %.1f mm (want 25)\n", lead_m * 1000.f);
+            CHECK(lead_m > 0.018f && lead_m < 0.030f, "predicted pose leads by ~velocity x lead");
+            CHECK(fabsf(rp[1] - 1.5f) < 1e-4f, "no lead on the static axes");
+            rt_set_tracker(cp, NULL);
+            rt_destroy(cp);
+        }
+    }
+
+    /* near-listener widening (rt_set_near_spread): a point source close to the listener widens
+     * (spread floored by 1 - dist/radius) instead of collapsing into the nearest speaker; a source
+     * beyond the radius is untouched. */
+    {
+        RtCore* cn = rt_create(8, 4, RATE, CH);
+        CHECK(cn != NULL, "rt_create (near spread)");
+        if (cn) {
+            uint32_t ns = rt_load_sound(cn, WAV, err, sizeof err);
+            uint32_t hn = rt_source_create(cn);
+            rt_source_play(cn, hn, ns, true);
+            /* stand the listener 0.3 m from speaker 7, source AT the speaker: without the policy the
+             * point solve concentrates there (the collapse the feature exists to prevent) */
+            const float* sp7 = LD.speakers[7].pos;
+            const float qn[4] = { 0, 0, 0, 1 };
+            const float lp7[3] = { sp7[0] - 0.3f, sp7[1], sp7[2] };
+            rt_set_listener(cn, lp7, qn);
+            set_pos_spk(cn, hn, 7);
+            rt_commit(cn); render2(cn);
+            int act_close = active_channels(0.03);
+            rt_set_near_spread(cn, 1.0f);
+            rt_source_set_pos(cn, hn, sp7[0], sp7[1] + 0.001f, sp7[2]);   /* nudge: re-solve with the policy */
+            rt_commit(cn); render2(cn);
+            int act_near = active_channels(0.03);
+            CHECK(act_near > act_close + 2, "a source inside the radius widens (spread floor engages)");
+            rt_source_set_pos(cn, hn, lp7[0] - 2.5f, sp7[1], sp7[2]);     /* beyond the radius: point behavior */
+            rt_commit(cn); render2(cn); render2(cn);
+            int act_far = active_channels(0.03);
+            rt_set_near_spread(cn, 0.f);
+            rt_source_set_pos(cn, hn, lp7[0] - 2.501f, sp7[1], sp7[2]);
+            rt_commit(cn); render2(cn); render2(cn);
+            int act_far_off = active_channels(0.03);
+            CHECK(abs(act_far - act_far_off) <= 1, "a source beyond the radius is untouched");
+            rt_source_destroy(cn, hn); rt_commit(cn);
+            rt_destroy(cn);
+        }
+    }
+
+    /* equal-loudness distance compensation (bw_source_set_loudness_comp): at -12 dB of distance
+     * attenuation a 100 Hz tone gains ~ +4.5 dB of shelf (0.4 dB/dB, below the 250 Hz corner);
+     * a 5 kHz tone is untouched; opt-out ramps back to flat. */
+    {
+        RtCore* cl = rt_create(8, 4, RATE, CH);
+        CHECK(cl != NULL, "rt_create (loudness comp)");
+        if (cl) {
+            const char* LW = "bw_rt_ldc100.wav";
+            if (write_sine_wav(LW, 100.0, 4800)) {
+                uint32_t sl = rt_load_sound(cl, LW, err, sizeof err);
+                uint32_t hl = rt_source_create(cl);
+                rt_source_play(cl, hl, sl, true);
+                rt_source_set_pos(cl, hl, 4.0f, 1.5f, 0.f);  /* 4 m: atten = 1/4 = -12 dB (ref 1 m, rolloff 1) */
+                rt_commit(cl);
+                for (int b = 0; b < 4; ++b) render2(cl);
+                double l2_off = 0; for (int b = 0; b < 4; ++b) { render2(cl); l2_off += total_l2(); }
+                rt_source_set_loudness_comp(cl, hl, true);
+                for (int b = 0; b < 8; ++b) render2(cl);     /* ramp + shelf settle */
+                double l2_on = 0; for (int b = 0; b < 4; ++b) { render2(cl); l2_on += total_l2(); }
+                double boost_db = 20.0 * log10(l2_on / l2_off);
+                printf("ldc: 100 Hz boost at -12 dB atten = %.2f dB (want ~4.5)\n", boost_db);
+                CHECK(boost_db > 3.2 && boost_db < 5.6, "LF shelf tracks the attenuation (~0.4 dB/dB)");
+                rt_source_set_loudness_comp(cl, hl, false);
+                for (int b = 0; b < 8; ++b) render2(cl);
+                double l2_back = 0; for (int b = 0; b < 4; ++b) { render2(cl); l2_back += total_l2(); }
+                CHECK(fabs(20.0 * log10(l2_back / l2_off)) < 0.3, "opt-out ramps back to flat");
+                rt_source_destroy(cl, hl); rt_commit(cl);
+
+                const char* HW2 = "bw_rt_ldc5k.wav";         /* HF: the shelf must not touch it */
+                if (write_sine_wav(HW2, 5000.0, 4800)) {
+                    uint32_t sh = rt_load_sound(cl, HW2, err, sizeof err);
+                    uint32_t hh = rt_source_create(cl);
+                    rt_source_play(cl, hh, sh, true);
+                    rt_source_set_pos(cl, hh, 4.0f, 1.5f, 0.f);
+                    rt_commit(cl);
+                    for (int b = 0; b < 4; ++b) render2(cl);
+                    double h_off = 0; for (int b = 0; b < 4; ++b) { render2(cl); h_off += total_l2(); }
+                    rt_source_set_loudness_comp(cl, hh, true);
+                    for (int b = 0; b < 8; ++b) render2(cl);
+                    double h_on = 0; for (int b = 0; b < 4; ++b) { render2(cl); h_on += total_l2(); }
+                    CHECK(fabs(20.0 * log10(h_on / h_off)) < 0.8, "the shelf leaves HF content alone");
+                    rt_source_destroy(cl, hh); rt_commit(cl);
+                    remove(HW2);
+                } else CHECK(0, "write 5 kHz sine (ldc)");
+                remove(LW);
+            } else CHECK(0, "write 100 Hz sine (ldc)");
+            rt_destroy(cl);
+        }
+    }
+
+    /* multi-listener compromise (rt_set_extra_listeners): one listener west of a centred source
+     * biases the render east (DBAP weights the source's bearing); adding a mirrored second listener
+     * makes the compromise SYMMETRIC at unchanged total power; clearing restores the bias. */
+    {
+        RtCore* cm = rt_create(8, 4, RATE, CH);
+        CHECK(cm != NULL, "rt_create (multi-listener)");
+        if (cm) {
+            uint32_t sm = rt_load_sound(cm, WAV, err, sizeof err);
+            uint32_t hm = rt_source_create(cm);
+            rt_source_play(cm, hm, sm, true);
+            rt_source_set_pos(cm, hm, 0.f, 1.5f, 0.f);       /* the array centre */
+            const float qid2[4] = { 0, 0, 0, 1 };
+            rt_set_listener(cm, (const float[3]){ -1.f, 1.5f, 0.f }, qid2);
+            rt_commit(cm); render2(cm);
+            #define SIDE_E(SGN, OUT) do {                                                  \
+                double e_ = 0;                                                             \
+                for (int ch_ = 0; ch_ < CH; ++ch_)                                         \
+                    if ((SGN) * LD.speakers[ch_].pos[0] > 1.f) e_ += chan_energy(ch_);     \
+                (OUT) = e_;                                                                \
+            } while (0)
+            double epx, enx;
+            SIDE_E(+1, epx); SIDE_E(-1, enx);
+            double l2_single = total_l2();
+            CHECK(epx > enx * 1.15, "single listener west of the source biases the render east");
+            const float exl[3] = { 1.f, 1.5f, 0.f };         /* the mirrored second occupant */
+            rt_set_extra_listeners(cm, exl, 1);
+            rt_commit(cm); render2(cm); render2(cm);
+            double epx2, enx2;
+            SIDE_E(+1, epx2); SIDE_E(-1, enx2);
+            double l2_multi = total_l2();
+            CHECK(fabs(epx2 - enx2) / (epx2 + enx2) < 0.08,
+                  "mirrored second listener makes the compromise symmetric (energy mean)");
+            CHECK(fabs(20.0 * log10(l2_multi / l2_single)) < 1.0,
+                  "compromise panning preserves total power");
+            rt_set_extra_listeners(cm, NULL, 0);             /* back to single-listener panning */
+            rt_commit(cm); render2(cm); render2(cm);
+            double epx3, enx3;
+            SIDE_E(+1, epx3); SIDE_E(-1, enx3);
+            CHECK(epx3 > enx3 * 1.15, "clearing the extras restores single-listener panning");
+            #undef SIDE_E
+            rt_source_destroy(cm, hm); rt_commit(cm);
+            rt_destroy(cm);
         }
     }
 
@@ -775,6 +1153,6 @@ int main(void) {
 
     remove(WAV);
     if (fails) { printf("rt_test: %d FAILURES\n", fails); return 1; }
-    printf("rt_test OK (DBAP, commit, gen-drop, gain, occlusion, EQ, directivity, bed, reflection-tap, channel-test, air+Doppler, spread, reverb-send, dual-band, voice-steal, scheduled-play, streaming, pause/seek, limiter, bus-meter verified)\n");
+    printf("rt_test OK (DBAP, commit, gen-drop, gain, occlusion, EQ, directivity, bed, reflection-tap, channel-test, air+Doppler, spread+MDAP, tracked-room-EQ, decorrelation, parametric-bed, pose-pred, near-spread, loudness-comp, multi-listener, reverb-send, dual-band, voice-steal, scheduled-play, streaming, pause/seek, limiter, bus-meter verified)\n");
     return 0;
 }

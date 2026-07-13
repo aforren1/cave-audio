@@ -5,7 +5,10 @@
  * (a Fibonacci sphere), then VBAP each virtual loudspeaker onto the real array (convex-hull
  * triangulation), then energy-normalise to the sampling decode. On a clustered/lopsided array this
  * keeps the diffuse field even (no loud directions) and improves localization, where the plain
- * sampling decode over-energises dense regions. See docs/spatialization.md.
+ * sampling decode over-energises dense regions. A pole with no real speaker within ~60° (a
+ * floor-less array's nadir) gets an IMAGINARY speaker whose decode share is discarded, so diffuse
+ * energy aimed into the hole is dropped rather than smeared onto the bottom ring (IEM AllRADecoder
+ * practice). See docs/spatialization.md.
  *
  * Heavy (convex hull + VBAP over a few hundred virtual directions) — a LOAD-TIME control-thread build;
  * the audio thread still just applies the resulting matrix (mix_bed), unchanged.
