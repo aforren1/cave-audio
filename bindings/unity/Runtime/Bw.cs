@@ -152,6 +152,15 @@ namespace CaveAudio
         // (< 1 = the field dies faster that way — an open or treated side).
         [DllImport(DLL, CallingConvention = CC)] public static extern void bw_fdn_set_decay_direction(IntPtr e, float[] dir, float factor);
 
+        // ---- image-source EARLY reflections (per source; no SDK needed) ----
+        // The other half of the phonon-free acoustics path: the FDN renders the late diffuse tail, this
+        // renders the six first-order wall bounces — the ones that carry room size and source distance.
+        // Each is a real POINT SOURCE at its mirrored position, panned through the engine's own
+        // listener-relative panner, so reflections keep correct direction AND parallax as the listener
+        // walks — which no shared reverb bed can do. Needs the room: call bw_scene_set_box first.
+        [DllImport(DLL, CallingConvention = CC)] public static extern void bw_source_set_early_reflections(IntPtr e, uint s, [MarshalAs(UnmanagedType.I1)] bool on);
+        [DllImport(DLL, CallingConvention = CC)] public static extern void bw_early_reflections_set_gain(IntPtr e, float linear);   // default 1; live
+
         // ---- propagation effects (no SDK needed; opt-in per source, default off) ----
         [DllImport(DLL, CallingConvention = CC)] public static extern void  bw_source_set_doppler(IntPtr e, uint s, [MarshalAs(UnmanagedType.I1)] bool on);
         [DllImport(DLL, CallingConvention = CC)] public static extern void  bw_source_set_air_absorption(IntPtr e, uint s, [MarshalAs(UnmanagedType.I1)] bool on);

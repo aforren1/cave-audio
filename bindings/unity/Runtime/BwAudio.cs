@@ -77,6 +77,12 @@ namespace CaveAudio
                  "(correct directions + parallax off-centre). Live: beds crossfade, so it A/Bs.")]
         public BwBedRenderer bedRenderer = BwBedRenderer.Matrix;
 
+        [Header("Early reflections (image-source; no SDK needed)")]
+        [Tooltip("Level of the per-source wall bounces (opt a source in with BwEmitter.earlyReflections). " +
+                 "Needs the Room Box below — that's the geometry they mirror off. These carry room size " +
+                 "and source distance with real parallax; the reverb beds below carry the late tail.")]
+        [Range(0f, 2f)] public float earlyReflectionGain = 1f;
+
         [Header("Reflections — Steam Audio bed (load-time; needs the SDK)")]
         public bool enableReflections = false;
         [Range(0.1f, 3f)] public float reverbSeconds = 1.0f;
@@ -212,6 +218,7 @@ namespace CaveAudio
             Bw.bw_set_bed_renderer(_eng, bedRenderer);
             Bw.bw_set_tracked_room_eq(_eng, trackedRoomEq);
             Bw.bw_set_master_gain(_eng, masterGain);
+            Bw.bw_early_reflections_set_gain(_eng, earlyReflectionGain);
             Bw.bw_set_limiter(_eng, limiter);
             Bw.bw_set_limiter_ceiling(_eng, limiterCeilingDb);
             Bw.bw_set_pose_prediction(_eng, feedListener ? 0f : posePredictionMs);   // internal tracking only
@@ -257,6 +264,15 @@ namespace CaveAudio
         {
             get => reverbGain;
             set { reverbGain = value; if (Ready) Bw.bw_reflections_set_gain(_eng, value); }
+        }
+
+        /// <summary>Level of the image-source EARLY reflections (the per-source wall bounces, opted into
+        /// with BwEmitter.earlyReflections). Independent of the late reverb bed's wet level above: early
+        /// reflections carry room size and distance, the bed carries the tail. Live.</summary>
+        public float EarlyReflectionGain
+        {
+            get => earlyReflectionGain;
+            set { earlyReflectionGain = value; if (Ready) Bw.bw_early_reflections_set_gain(_eng, value); }
         }
 
         /// <summary>Output protection limiter (engine default: ON at -1 dBFS). Linked across the channels —

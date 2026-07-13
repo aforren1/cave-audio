@@ -27,6 +27,12 @@ namespace CaveAudio
 
         [Header("Spatial")]
         public bool occlusion = false;                       // geometry between source + listener attenuates it
+        [Tooltip("Image-source EARLY reflections: the six first-order wall bounces, each rendered as a " +
+                 "real point source at its mirrored position and panned like any other — so they keep " +
+                 "correct direction AND parallax as the listener walks, which a shared reverb bed can't " +
+                 "do. Needs a room box (BwAudio). No Steam Audio needed. Pairs with the FDN reverb, " +
+                 "which renders the late tail.")]
+        public bool earlyReflections = false;
         public bool reflections = false;                     // contribute to the shared reverb bed
         [Tooltip("Wet-send level into the shared reverb bed (needs Reflections).")]
         [Range(0f, 2f)] public float reflectionSend = 1f;
@@ -98,7 +104,8 @@ namespace CaveAudio
 
             // The engine defaults every opt-in below to OFF/point/unity, so only push what differs — a
             // fresh source already IS the default (this runs again on every re-enable).
-            if (occlusion)   Bw.bw_source_set_occlusion(Eng, _src, true);
+            if (occlusion)        Bw.bw_source_set_occlusion(Eng, _src, true);
+            if (earlyReflections) Bw.bw_source_set_early_reflections(Eng, _src, true);
             if (reflections)
             {
                 Bw.bw_source_set_reflections(Eng, _src, true);
@@ -283,6 +290,7 @@ namespace CaveAudio
             Bw.bw_source_set_spread(Eng, _src, spread);
             Bw.bw_source_set_size(Eng, _src, sizeMetres);
             Bw.bw_source_set_occlusion(Eng, _src, occlusion);
+            Bw.bw_source_set_early_reflections(Eng, _src, earlyReflections);
             Bw.bw_source_set_reflections(Eng, _src, reflections);
             Bw.bw_source_set_reflection_send(Eng, _src, reflectionSend);
             Bw.bw_source_set_reflection_distance(Eng, _src, reflectionDistance);
