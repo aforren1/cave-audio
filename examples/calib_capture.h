@@ -1,10 +1,11 @@
 /*
  * calib_capture.h — the speaker-sweep capture backends, shared by bw_calibrate (CLI) and
  * bw_calib_view's Capture tab (the calibration-station front-end). Two backends behind one shape:
- * ASIO full-duplex (26 outputs + one mic input, sample-aligned; rig bring-up code, gated on
- * BW_HAVE_ASIO) and simulate (delay/attenuate the sweep per the layout's speaker->mic distances +
- * a deterministic sensitivity wobble, so the whole measure -> solve -> writeback path runs without
- * the rig). The measurement/solve DSP these feed lives in measure.c / calib.c (unit-tested).
+ * ASIO full-duplex (one output per speaker + one mic input, sample-aligned; rig bring-up code,
+ * gated on BW_HAVE_ASIO) and simulate (delay/attenuate the sweep per the layout's speaker->mic
+ * distances + a deterministic sensitivity wobble, so the whole measure -> solve -> writeback path
+ * runs without the rig). The speaker count is the LAYOUT's (Layout.count, 4..BW_CHANNELS) — never
+ * assume 26. The measurement/solve DSP these feed lives in measure.c / calib.c (unit-tested).
  */
 #ifndef BW_CALIB_CAPTURE_H
 #define BW_CALIB_CAPTURE_H
@@ -36,11 +37,12 @@ void calib_sim_capture(int ch, const Layout* L, const float mic[3], const float*
 void calib_write_wav_f32(const char* path, const float* x, int n, int fs);
 
 #ifdef BW_HAVE_ASIO
-/* ASIO full-duplex: open `driver` (NULL = first with >= 26 outs + the mic input), start streaming.
- * calib_asio_capture(ch) plays the sweep out channel `ch` and records CAL_CAPLEN mic samples into
- * the `cap` given at open (blocking, ~10 s watchdog; returns 0 on timeout). Single instance.
+/* ASIO full-duplex: open `driver` (NULL = first with >= `nspk` outs + the mic input), start
+ * streaming. `nspk` is the layout's speaker count (4..BW_CHANNELS). calib_asio_capture(ch) plays
+ * the sweep out channel `ch` and records CAL_CAPLEN mic samples into the `cap` given at open
+ * (blocking, ~10 s watchdog; returns 0 on timeout). Single instance.
  * NOT verified on hardware here — rig bring-up code (mirrors asio_sink.cpp's host sequence). */
-int  calib_asio_open(const char* driver, int mic_in, const float* sweep, float* cap);
+int  calib_asio_open(const char* driver, int mic_in, int nspk, const float* sweep, float* cap);
 int  calib_asio_capture(int ch);
 void calib_asio_close(void);
 #endif

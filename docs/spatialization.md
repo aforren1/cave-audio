@@ -252,6 +252,17 @@ solve — untouched beyond `R`, fully wide at the head — and the widened part 
 the selected spread mode and the decorrelators. Sources flying through the room are
 the common CAVE case this exists for.
 
+**Metric source size** (`bw_source_set_size`, radius in meters, 0 = point) is the
+physical parametrization of the same machinery (the extent-primitive idea from
+Embody's volumetric-panning writeup, grafted onto the engine's listener-relative
+solve): the spread is floored at the angle the radius subtends from the tracked
+listener, `asin(r/d)/(π/2)`, capped at 1 when the listener is inside the source. A
+2 m waterfall therefore *stays* 2 m wide as the listener walks — an angular spread
+would change physical size with distance — and a sized source subsumes the
+near-listener policy (engulfment = the `d < r` case). The larger of spread and the
+size-derived floor wins; everything downstream (lobe/MDAP, decorrelation,
+constant-power) is unchanged.
+
 ## Binaural debug path
 
 The binaural monitor is a **bus→stereo** transform. It consumes the same 26-ch bus

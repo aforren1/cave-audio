@@ -73,7 +73,7 @@
 #include <time.h>
 
 #define SR   48000u
-#define NSPK 26
+#define NSPK 26                 /* array CAPACITY; g_nspk is the engine's ACTIVE count (the layout's) */
 
 #define SRC_GAIN  0.8f
 #define REFL_GAIN 0.5f    /* base image-source level (scaled further by the wall material reflectivity) */
@@ -176,6 +176,7 @@ static int         backend_silent;
 static const char* g_layout_path;          /* optional cave_layout.json; NULL = engine default grid */
 
 static Vector3 speakers[NSPK];
+static int     g_nspk = NSPK;     /* the engine's ACTIVE channel count (bw_get_speakers); the layout's */
 static Vector3 g_head;            /* the ear point = array centroid (the engine's nominal listening point);
                                    * room origin is on the FLOOR, so the head is NOT at the origin */
 static Vector3 source_pos = { 1.5f, 0.0f, 0.0f };   /* y re-based to ear height once the layout is known */
@@ -245,7 +246,7 @@ static void draw_speakers(int hi) {
     float pk[NSPK] = { 0 };
     bw_get_bus_levels(e, pk, NSPK);                             /* last block's per-channel output peak */
     const float rel = fminf(1.0f, 6.0f * GetFrameTime());       /* release one-pole (attack is instant) */
-    for (int k = 0; k < NSPK; ++k) {
+    for (int k = 0; k < g_nspk; ++k) {
         /* block peak -> display level over a 60 dB window, so quiet DBAP tails still read */
         float db = pk[k] > 1e-6f ? 20.0f * log10f(pk[k]) : -120.0f;
         float lv = db <= -60.0f ? 0.0f : (db >= 0.0f ? 1.0f : 1.0f + db / 60.0f);
@@ -416,11 +417,11 @@ static void chan_enter(void) {
     chan_applied = chan_active; chan_kind_applied = chan_kind;
 }
 static void chan_update(float dt) {
-    if (kp(KEY_RIGHT)) chan_active = (chan_active + 1) % NSPK;
-    if (kp(KEY_LEFT))  chan_active = (chan_active + NSPK - 1) % NSPK;
+    if (kp(KEY_RIGHT)) chan_active = (chan_active + 1) % g_nspk;
+    if (kp(KEY_LEFT))  chan_active = (chan_active + g_nspk - 1) % g_nspk;
     if (kp(KEY_N))     chan_kind = (chan_kind == BW_TEST_SINE) ? BW_TEST_NOISE : BW_TEST_SINE;
     if (kp(KEY_SPACE)) chan_auto = !chan_auto;
-    if (chan_auto && (chan_timer += dt) >= 0.7f) { chan_timer = 0.0f; chan_active = (chan_active + 1) % NSPK; }
+    if (chan_auto && (chan_timer += dt) >= 0.7f) { chan_timer = 0.0f; chan_active = (chan_active + 1) % g_nspk; }
     if (chan_active != chan_applied || chan_kind != chan_kind_applied) {   /* keys OR the panel moved it */
         if (chan_applied >= 0) bw_test_signal(e, (uint32_t)chan_applied, BW_TEST_OFF, 0.0f);
         chan_set(chan_active);
@@ -592,10 +593,12 @@ static void build_engine(int with_reverb) {
     }
     backend_name   = bw_audio_backend(e);
     backend_silent = (strncmp(backend_name, "asio", 4) != 0);
-    bw_get_speakers(e, (float*)speakers, NSPK);            /* render the geometry the engine pans with */
+    g_nspk = (int)bw_get_speakers(e, (float*)speakers, NSPK);   /* the geometry AND count the engine pans with */
+    if (g_nspk < 1) g_nspk = 1;                          /* (a layout always has >= 4; keep the divides safe) */
+    if (chan_active >= g_nspk) chan_active = 0;          /* a smaller array may have retired the walked channel */
     g_head = Vector3{ 0, 0, 0 };                         /* ear point = array centroid (the engine's own ref) */
-    for (int i = 0; i < NSPK; ++i) g_head = Vector3Add(g_head, speakers[i]);
-    g_head = Vector3Scale(g_head, 1.0f / NSPK);
+    for (int i = 0; i < g_nspk; ++i) g_head = Vector3Add(g_head, speakers[i]);
+    g_head = Vector3Scale(g_head, 1.0f / (float)g_nspk);
     for (int i = 0; i < NSIG; ++i) sounds[i] = bw_load_sound(e, sig_files[i]);
     for (int i = 0; i < NMAT; ++i) mats[i] = bw_material_preset(e, mat_names[i]);
     src  = bw_source_create(e);  bw_source_play(e, src,  sounds[cur_sig], true);
@@ -614,7 +617,7 @@ static void switch_scene(int idx) {
         if (e) { bw_stop(e); bw_destroy(e); e = NULL; }
         build_engine(want_reverb);
     }
-    for (uint32_t ch = 0; ch < NSPK; ++ch) bw_test_signal(e, ch, BW_TEST_OFF, 0.0f);  /* clear channel walk */
+    for (uint32_t ch = 0; ch < (uint32_t)g_nspk; ++ch) bw_test_signal(e, ch, BW_TEST_OFF, 0.0f);  /* clear channel walk */
     bw_source_set_gain(e, refl, 0.0f);
     bw_source_set_occlusion(e, src, false);
     bw_source_set_directivity_preset(e, src, BW_DIR_OMNI);
@@ -667,7 +670,9 @@ static void draw_panel(void) {
     if (backend_silent && ImGui::IsItemHovered(ImGuiHoveredFlags_ForTooltip))
         ImGui::SetTooltip("no ASIO device opened - the offline null sink renders silently\n"
                           "(set BWAUDIO_ASIO_DRIVER to your headphone driver)");
-    ImGui::PlotHistogram("##meters", spk_lv, NSPK, 0, "speakers 0-25 (60 dB window)", 0.0f, 1.0f,
+    char mlabel[48];
+    snprintf(mlabel, sizeof mlabel, "speakers 0-%d (60 dB window)", g_nspk - 1);
+    ImGui::PlotHistogram("##meters", spk_lv, g_nspk, 0, mlabel, 0.0f, 1.0f,
                          ImVec2(-FLT_MIN, uiScaled(46.0f)));
 
     /* the localization signal is global (the 1-4 keys work in every scene) */
@@ -733,7 +738,7 @@ static void draw_panel(void) {
         ImGui::TextWrapped("aim the lobe away from the head and hear it drop");
     } else if (cur_scene == 3) {                          /* Channel walk */
         ImGui::SetNextItemWidth(-FLT_MIN);
-        ImGui::SliderInt("##chan", &chan_active, 0, NSPK - 1, "channel %d [LEFT/RIGHT]");
+        ImGui::SliderInt("##chan", &chan_active, 0, g_nspk - 1, "channel %d [LEFT/RIGHT]");
         if (ImGui::RadioButton("660 Hz sine [N]", chan_kind == BW_TEST_SINE)) chan_kind = BW_TEST_SINE;
         ImGui::SameLine();
         if (ImGui::RadioButton("noise", chan_kind == BW_TEST_NOISE)) chan_kind = BW_TEST_NOISE;
@@ -869,7 +874,7 @@ static void register_tests(ImGuiTestEngine* te) {
         uint32_t n = 0;
         float m = 0.0f;
         for (int tries = 0; tries < 60 && m <= 1e-6f; ++tries) { ctx->Yield(4); m = meters_max(&n); }
-        IM_CHECK_EQ(n, (uint32_t)NSPK);
+        IM_CHECK_EQ(n, (uint32_t)g_nspk);           /* the engine's channel count == the layout's */
         IM_CHECK_GT(m, 1e-4f);                      /* pink noise through DBAP reaches the output bus */
     };
 
@@ -911,7 +916,7 @@ static void register_tests(ImGuiTestEngine* te) {
             ctx->Yield(6);
             uint32_t n = 0;
             meters_max(&n);
-            IM_CHECK_EQ(n, (uint32_t)NSPK);         /* engine alive after every switch (incl. rebuilds) */
+            IM_CHECK_EQ(n, (uint32_t)g_nspk);       /* engine alive after every switch (incl. rebuilds) */
         }
     };
 

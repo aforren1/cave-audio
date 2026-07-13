@@ -692,6 +692,41 @@ int main(void) {
         }
     }
 
+    /* metric source size (bw_source_set_size): the rendered width is the angle the radius subtends
+     * from the listener — a source that engulfs the listener is fully wide, the SAME physical size
+     * narrows with distance, and size 0 restores the point solve. */
+    {
+        RtCore* cz = rt_create(8, 4, RATE, CH);
+        CHECK(cz != NULL, "rt_create (source size)");
+        if (cz) {
+            uint32_t zs = rt_load_sound(cz, WAV, err, sizeof err);
+            uint32_t hz = rt_source_create(cz);
+            rt_source_play(cz, hz, zs, true);
+            const float* sp7 = LD.speakers[7].pos;
+            const float qz[4] = { 0, 0, 0, 1 };
+            const float lz[3] = { sp7[0] - 0.5f, sp7[1], sp7[2] };
+            rt_set_listener(cz, lz, qz);                 /* 0.5 m from speaker 7 */
+            set_pos_spk(cz, hz, 7);                      /* source at the speaker: concentrated point */
+            rt_commit(cz); render2(cz);
+            int act_point = active_channels(0.03);
+            rt_source_set_size(cz, hz, 1.0f);            /* radius 1 m > dist 0.5 m: engulfed */
+            rt_commit(cz); render2(cz);
+            int act_engulfed = active_channels(0.03);
+            CHECK(act_engulfed > act_point + 2, "a source that engulfs the listener goes fully wide");
+            rt_source_set_pos(cz, hz, lz[0] + 4.0f, sp7[1], sp7[2]);   /* same 1 m radius, 4 m away */
+            rt_commit(cz); render2(cz); render2(cz);
+            int act_far = active_channels(0.03);
+            CHECK(act_far < act_engulfed, "the same physical size subtends less at distance (narrows)");
+            rt_source_set_size(cz, hz, 0.f);             /* back to a point */
+            set_pos_spk(cz, hz, 7);
+            rt_commit(cz); render2(cz); render2(cz);
+            int act_back = active_channels(0.03);
+            CHECK(abs(act_back - act_point) <= 1, "size 0 restores the point solve");
+            rt_source_destroy(cz, hz); rt_commit(cz);
+            rt_destroy(cz);
+        }
+    }
+
     /* equal-loudness distance compensation (bw_source_set_loudness_comp): at -12 dB of distance
      * attenuation a 100 Hz tone gains ~ +4.5 dB of shelf (0.4 dB/dB, below the 250 Hz corner);
      * a 5 kHz tone is untouched; opt-out ramps back to flat. */
@@ -784,6 +819,179 @@ int main(void) {
             #undef SIDE_E
             rt_source_destroy(cm, hm); rt_commit(cm);
             rt_destroy(cm);
+        }
+    }
+
+    /* QoL batch: master gain, mix groups (gain + pause), global pause, timed fades, voice gauge.
+     * Two voices in different groups at different speakers, so per-group effects read per-channel. */
+    {
+        RtCore* cq = rt_create(8, 4, RATE, CH);
+        CHECK(cq != NULL, "rt_create (qol)");
+        if (cq) {
+            uint32_t sq = rt_load_sound(cq, WAV, err, sizeof err);
+            uint32_t h1 = rt_source_create(cq), h2 = rt_source_create(cq);
+            rt_source_play(cq, h1, sq, true); set_pos_spk(cq, h1, 3);  rt_source_set_group(cq, h1, 1);
+            rt_source_play(cq, h2, sq, true); set_pos_spk(cq, h2, 20); rt_source_set_group(cq, h2, 2);
+            rt_commit(cq); render2(cq);
+            CHECK(rt_active_voices(cq) == 2, "active-voice gauge reads 2");
+            double e3 = chan_energy(3), e20 = chan_energy(20), l2_base = total_l2();
+            CHECK(e3 > 0.1 && e20 > 0.1, "both group voices render");
+
+            rt_set_master_gain(cq, 0.5f);                      /* master: -6 dB over everything */
+            render2(cq); render2(cq);
+            CHECK(fabs(20.0*log10(total_l2()/l2_base) + 6.02) < 0.3, "master gain scales the whole mix");
+            rt_set_master_gain(cq, 1.f); render2(cq); render2(cq);
+
+            rt_group_set_gain(cq, 1, 0.25f);                   /* group 1: -12 dB; group 2 untouched */
+            render2(cq); render2(cq);
+            CHECK(fabs(20.0*log10(chan_energy(3)/e3) + 12.04) < 0.8, "group gain scales its members");
+            CHECK(fabs(20.0*log10(chan_energy(20)/e20)) < 0.3,       "other groups untouched");
+            rt_group_set_gain(cq, 1, 1.f); render2(cq); render2(cq);
+
+            rt_group_set_paused(cq, 2, true);                  /* group pause: silent, frozen, still 'playing' */
+            render2(cq); render2(cq);
+            CHECK(chan_energy(20) < e20 * 0.02, "paused group is silent (only voice-1's DBAP leakage remains)");
+            CHECK(chan_energy(3) > 0.1, "unpaused group keeps playing");
+            CHECK(rt_source_is_playing(cq, h2), "a group-paused voice still reads as playing");
+            rt_group_set_paused(cq, 2, false); render2(cq);
+            CHECK(chan_energy(20) > 0.05, "group resume");
+
+            rt_set_all_paused(cq, 1);                          /* global pause: everything out, everything back */
+            render2(cq); render2(cq);
+            CHECK(total_energy() < 1e-6, "global pause silences the mix");
+            rt_set_all_paused(cq, 0); render2(cq);
+            CHECK(total_energy() > 0.1, "global resume");
+
+            rt_source_fade_to(cq, h1, 0.25f, 0.1f, false);     /* timed fade: glide to -12 dB over 0.1 s */
+            for (int b = 0; b < 5; ++b) render2(cq);           /* ~0.053 s: mid-fade */
+            double e_mid = chan_energy(3);
+            for (int b = 0; b < 10; ++b) render2(cq);          /* well past the landing */
+            double e_end = chan_energy(3);
+            CHECK(e_mid < e3 * 0.95 && e_mid > e_end * 1.1, "fade glides through intermediate levels");
+            CHECK(fabs(20.0*log10(e_end/e3) + 12.04) < 0.8,   "fade lands on its target");
+
+            rt_source_fade_to(cq, h2, 0.f, 0.05f, true);       /* fade-out-and-stop */
+            for (int b = 0; b < 15; ++b) render2(cq);
+            CHECK(!rt_source_is_playing(cq, h2), "fade_out stops the voice once landed");
+            CHECK(chan_energy(20) < e20 * 0.02, "faded-out voice is silent (only leakage remains)");
+            CHECK(rt_active_voices(cq) == 1, "the gauge tracks the stop");
+
+            rt_source_destroy(cq, h1); rt_source_destroy(cq, h2); rt_commit(cq);
+            rt_destroy(cq);
+        }
+    }
+
+    /* pitch (bw_source_set_pitch): a looping 1 kHz sine at rate 2 doubles its zero-crossing count,
+     * at rate 0.5 halves it; rate 1 is the untouched integer path. */
+    {
+        RtCore* cz = rt_create(8, 4, RATE, CH);
+        CHECK(cz != NULL, "rt_create (pitch)");
+        if (cz) {
+            const char* PW2 = "bw_rt_pitch1k.wav";
+            if (write_sine_wav(PW2, 1000.0, 4800)) {           /* integer cycles: seamless loop */
+                enum { KB = 8 };
+                static float mono[KB * N];
+                uint32_t sp2 = rt_load_sound(cz, PW2, err, sizeof err);
+                uint32_t hp2 = rt_source_create(cz);
+                rt_source_play(cz, hp2, sp2, true);
+                rt_source_set_pos(cz, hp2, 0.f, 1.5f, 0.f);
+                rt_commit(cz); render2(cz);
+                render_capture_mono(cz, mono, KB);
+                int zc1 = count_zc(mono, KB * N);
+                rt_source_set_pitch(cz, hp2, 2.0f);
+                render2(cz); render2(cz);                      /* glide lands within a block; settle */
+                render_capture_mono(cz, mono, KB);
+                int zc2 = count_zc(mono, KB * N);
+                rt_source_set_pitch(cz, hp2, 0.5f);
+                render2(cz); render2(cz);
+                render_capture_mono(cz, mono, KB);
+                int zch = count_zc(mono, KB * N);
+                printf("pitch: zc x1=%d x2=%d x0.5=%d\n", zc1, zc2, zch);
+                CHECK(zc1 > 60, "baseline tone renders");
+                CHECK(fabs((double)zc2 / zc1 - 2.0) < 0.12, "pitch 2.0 doubles the frequency");
+                CHECK(fabs((double)zch / zc1 - 0.5) < 0.06, "pitch 0.5 halves the frequency");
+                rt_source_destroy(cz, hp2); rt_commit(cz);
+                remove(PW2);
+            } else CHECK(0, "write 1 kHz sine (pitch)");
+            rt_destroy(cz);
+        }
+    }
+
+    /* bed rotation (bw_bed_set_rotation): a plane-wave bed from room +z, yawed +pi/2, re-localizes
+     * on the +x wall at conserved level — the closed-form yaw SH rotation, glided. */
+    {
+        RtCore* cr = rt_create(8, 4, RATE, CH);
+        CHECK(cr != NULL, "rt_create (bed rotation)");
+        if (cr) {
+            const char* BW2 = "bw_rt_bed_rot.wav";
+            if (write_ambix4_noise_wav(BW2, 1.f, 0.f, 0.f, 1.f, 8 * N)) {
+                uint32_t sb = rt_load_ambix(cr, BW2, err, sizeof err);
+                uint32_t hb = rt_source_create(cr);
+                rt_source_play(cr, hb, sb, true);
+                rt_commit(cr);
+                for (int b = 0; b < 8; ++b) render2(cr);
+                int    a0  = argmax_channel();
+                double l0  = total_l2();
+                CHECK(LD.speakers[a0].pos[2] > 1.0f, "unrotated plane wave lands on the +z wall");
+                rt_bed_set_rotation(cr, hb, 1.5707963f);       /* +90°: field turns toward room +x */
+                for (int b = 0; b < 80; ++b) render2(cr);      /* glide (0.25 s at 1 turn/s) + settle */
+                int    a1 = argmax_channel();
+                double l1 = total_l2();
+                CHECK(LD.speakers[a1].pos[0] > 1.0f && fabsf(LD.speakers[a1].pos[2]) < 1.0f,
+                      "rotated +90 deg: the field re-localizes on the +x wall");
+                CHECK(fabs(20.0 * log10(l1 / l0)) < 1.5, "rotation conserves level (orthogonal transform)");
+                rt_source_destroy(cr, hb); rt_commit(cr);
+                remove(BW2);
+            } else CHECK(0, "write rotation bed");
+            rt_destroy(cr);
+        }
+    }
+
+    /* runtime channel count: a 24-speaker layout drives a 24-channel core end to end — point panning,
+     * a bed decode, meters — and a canary proves NOTHING writes beyond the active channel count into
+     * a capacity-sized buffer (the exact overrun class the BW_CHANNELS->count migration must prevent). */
+    {
+        RtCore* c24 = rt_create(8, 4, RATE, 24);
+        CHECK(c24 != NULL, "rt_create (24 ch)");
+        if (c24) {
+            Layout L24 = layout_default();
+            L24.count = 24;                              /* the first 24 grid speakers, indices 0..23 */
+            layout_compute_ref(&L24);
+            rt_set_layout(c24, &L24);
+            uint32_t s24 = rt_load_sound(c24, WAV, err, sizeof err);
+            uint32_t h24 = rt_source_create(c24);
+            rt_source_play(c24, h24, s24, true);
+            rt_source_set_pos(c24, h24, L24.speakers[5].pos[0], L24.speakers[5].pos[1], L24.speakers[5].pos[2]);
+            rt_commit(c24);
+            static float b24[CH * N];
+            for (int i = 24 * (int)N; i < CH * (int)N; ++i) b24[i] = 123.f;   /* canary beyond channel 24 */
+            BwTimestamp t24 = { 0, 0 };
+            rt_render(c24, b24, N, &t24); rt_render(c24, b24, N, &t24);
+            int best = 0; double bm = -1;
+            for (int ch = 0; ch < 24; ++ch) {            /* 24-wide PLANAR indexing */
+                double e = 0; for (int i = 0; i < (int)N; ++i) e += fabs(b24[(size_t)ch * N + i]);
+                if (e > bm) { bm = e; best = ch; }
+            }
+            CHECK(best == 5, "24-ch: a source at speaker 5 localizes to channel 5");
+            float pk[CH];
+            CHECK(rt_bus_peaks(c24, pk, CH) == 24, "24-ch: the meter readback reports 24 channels");
+            const char* B24 = "bw_rt_bed24.wav";         /* a bed too: SH->24 decode, same canary */
+            if (write_ambix4_noise_wav(B24, 1.f, 0.f, 0.f, 1.f, 4 * N)) {
+                uint32_t sb5 = rt_load_ambix(c24, B24, err, sizeof err);
+                uint32_t hb5 = rt_source_create(c24);
+                rt_source_play(c24, hb5, sb5, true);
+                rt_commit(c24);
+                rt_render(c24, b24, N, &t24); rt_render(c24, b24, N, &t24);
+                double etot = 0; for (int i = 0; i < 24 * (int)N; ++i) etot += fabs(b24[i]);
+                CHECK(etot > 0.1, "24-ch: the bed decodes onto the 24 active channels");
+                rt_source_destroy(c24, hb5); rt_commit(c24);
+                remove(B24);
+            } else CHECK(0, "write 24-ch bed");
+            int canary_ok = 1;
+            for (int i = 24 * (int)N; i < CH * (int)N; ++i) if (b24[i] != 123.f) canary_ok = 0;
+            CHECK(canary_ok, "24-ch: nothing writes beyond the active channel count");
+            rt_source_destroy(c24, h24); rt_commit(c24);
+            rt_destroy(c24);
         }
     }
 
@@ -1153,6 +1361,6 @@ int main(void) {
 
     remove(WAV);
     if (fails) { printf("rt_test: %d FAILURES\n", fails); return 1; }
-    printf("rt_test OK (DBAP, commit, gen-drop, gain, occlusion, EQ, directivity, bed, reflection-tap, channel-test, air+Doppler, spread+MDAP, tracked-room-EQ, decorrelation, parametric-bed, pose-pred, near-spread, loudness-comp, multi-listener, reverb-send, dual-band, voice-steal, scheduled-play, streaming, pause/seek, limiter, bus-meter verified)\n");
+    printf("rt_test OK (DBAP, commit, gen-drop, gain, occlusion, EQ, directivity, bed, reflection-tap, channel-test, air+Doppler, spread+MDAP+size, tracked-room-EQ, decorrelation, parametric-bed, pose-pred, near-spread, loudness-comp, multi-listener, master+groups+fades+global-pause, pitch, bed-rotation, reverb-send, dual-band, voice-steal, scheduled-play, streaming, pause/seek, limiter, bus-meter verified)\n");
     return 0;
 }

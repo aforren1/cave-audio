@@ -112,7 +112,7 @@ int main(int argc, char** argv) {
 
 #ifdef BW_HAVE_ASIO
     int asio_up = 0;
-    if (!simulate) { if (calib_asio_open(driver, mic_in, sweep, cap) != 0) return 1; asio_up = 1; }
+    if (!simulate) { if (calib_asio_open(driver, mic_in, n, sweep, cap) != 0) return 1; asio_up = 1; }
 #else
     if (!simulate) { fprintf(stderr, "calibrate: built without ASIO; re-run with --simulate or build the ASIO backend\n"); return 1; }
 #endif

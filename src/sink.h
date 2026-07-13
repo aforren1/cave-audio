@@ -22,8 +22,10 @@
 #include <stddef.h>
 #include <stdint.h>
 
-/* The CAVE array width — the single source of truth shared by the engine, the sinks'
- * callers, and the tests (see docs/architecture.md). */
+/* The array-width CAPACITY — sizes every fixed array (gain vectors, decode matrices, meters). The
+ * ACTIVE channel count is the loaded layout's speaker count (4..BW_CHANNELS, Layout.count; the
+ * default grid is exactly BW_CHANNELS), fixed per engine instance — a collaborator's 24-speaker
+ * array loads into the same binary. Raising the cap is a recompile. */
 #define BW_CHANNELS 26
 
 /* Hardware-anchored timestamp captured at the top of each block. Mirrors what ASIO

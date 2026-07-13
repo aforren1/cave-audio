@@ -81,6 +81,8 @@ struct View {
 
     int    sel;                                                  /* selected speaker */
     bool   eq_all;                                               /* overlay every eq curve */
+    bool   diffable;                                             /* A and B have the SAME speaker count —
+                                                                  * comparing different arrays is meaningless */
 };
 static View V;
 
@@ -110,7 +112,8 @@ static void derive(Layout* L, float* gdb, float* dms, float* x, float* y, float*
 }
 
 static void refresh_diff(void) {
-    if (!V.hasA || !V.hasB) return;
+    V.diffable = V.hasA && V.hasB && V.A.count == V.B.count;     /* per-speaker deltas need one array */
+    if (!V.diffable) return;
     for (uint32_t i = 0; i < V.A.count; ++i) {
         float dx = V.A.speakers[i].pos[0] - V.B.speakers[i].pos[0];
         float dy = V.A.speakers[i].pos[1] - V.B.speakers[i].pos[1];
@@ -203,7 +206,8 @@ static void tab_array(void) {
     }
     if (V.hasB) {
         ImPlot3D::PlotScatter("B", V.bx, V.by, V.bz, (int)V.B.count);
-        static float seg[3][2 * BW_CHANNELS];                    /* A->B delta segments */
+        static float seg[3][2 * BW_CHANNELS];                    /* A->B delta segments (same array only) */
+        if (V.diffable) {
         for (uint32_t i = 0; i < V.B.count; ++i) {
             seg[0][2*i] = V.ax[i]; seg[0][2*i+1] = V.bx[i];
             seg[1][2*i] = V.ay[i]; seg[1][2*i+1] = V.by[i];
@@ -211,6 +215,7 @@ static void tab_array(void) {
         }
         ImPlot3D::PlotLine("A->B", seg[0], seg[1], seg[2], (int)(2 * V.B.count),
                            ImPlot3DSpec(ImPlot3DProp_Flags, ImPlot3DLineFlags_Segments));
+        }
     }
     ImPlot3D::EndPlot();
 }
@@ -286,6 +291,13 @@ static void tab_irs(void) {
 
 static void tab_diff(void) {
     if (!V.hasA || !V.hasB) { ImGui::TextDisabled("load a second layout as B to diff (e.g. the file bw_calibrate wrote)"); return; }
+    if (!V.diffable) {                                           /* different arrays: a per-speaker diff is meaningless */
+        ImGui::TextColored(ImVec4(1.0f, 0.42f, 0.42f, 1.0f),
+                           "A has %u speakers, B has %u - these are different arrays, not a before/after.",
+                           V.A.count, V.B.count);
+        ImGui::TextDisabled("load two layouts of the same array (calibration never changes the speaker count)");
+        return;
+    }
     if (!ImGui::BeginTable("difft", 5, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY)) return;
     ImGui::TableSetupColumn("spk"); ImGui::TableSetupColumn("dpos (mm)"); ImGui::TableSetupColumn("dgain (dB)");
     ImGui::TableSetupColumn("ddelay (ms)"); ImGui::TableSetupColumn("eq A -> B");
@@ -352,7 +364,10 @@ static void cap_worker(void) {
 #ifdef BW_HAVE_ASIO
     bool asio_up = false;
     if (!J.simulate) {
-        if (calib_asio_open(J.driver[0] ? J.driver : NULL, J.mic_in, sweep, cap) != 0) { cap_fail("ASIO open failed (>=26 outs + the mic input; see console)"); return; }
+        if (calib_asio_open(J.driver[0] ? J.driver : NULL, J.mic_in, n, sweep, cap) != 0) {
+            char m[96]; snprintf(m, sizeof m, "ASIO open failed (>=%d outs + the mic input; see console)", n);
+            cap_fail(m); return;
+        }
         asio_up = true;
     }
 #else
@@ -448,7 +463,7 @@ static void tab_capture(void) {
     if (!J.simulate) {
         ImGui::SetNextItemWidth(uiScaled(160));
         ImGui::InputTextWithHint("##cdrv", "ASIO driver (auto)", J.driver, sizeof J.driver);
-        bwTip("ASIO driver name; empty = first driver with 26 outputs + the mic input");
+        bwTip("ASIO driver name; empty = first driver with an output per speaker + the mic input");
         ImGui::SameLine(); ImGui::SetNextItemWidth(uiScaled(90));
         ImGui::InputInt("mic input ch", &J.mic_in);
         bwTip("the driver INPUT channel the measurement mic is plugged into (0-based)");
@@ -753,8 +768,8 @@ static void draw_ui(void) {
         load_irs();
     }
     ImGui::SameLine(); if (ImGui::Button("Load IRs")) load_irs();
-    bwTip("decode <prefix>_00.wav .. _25.wav (bw_calibrate --save-irs) through the engine's own "
-          "sound loader; picking any one _NN.wav selects the whole set");
+    bwTip("decode <prefix>_00.wav .. one per speaker (bw_calibrate --save-irs) through the engine's "
+          "own sound loader; picking any one _NN.wav selects the whole set");
     ImGui::Separator();
     ImGui::TextWrapped("%s", V.status[0] ? V.status : "load a cave_layout.json to begin");
     ImGui::Separator();

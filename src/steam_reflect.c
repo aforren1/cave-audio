@@ -54,6 +54,7 @@ struct SteamReflect {
     IPLSceneType  scene_type;         /* DEFAULT/EMBREE, for the bake + sim */
     int           baked;              /* 1 = look up baked reverb instead of ray-tracing each sim tick */
 
+    uint32_t channels;          /* the layout's speaker count (<= BW_CHANNELS capacity) */
     uint32_t order, ambi_ch, n;
     IPLint32 ir_size;
     float    duration; uint32_t rays, bounces;
@@ -165,17 +166,17 @@ void steam_reflect_tap(void* ud, float* bus, uint32_t n, const float* lp, const 
     IPLAudioBuffer amb = { .numChannels = (IPLint32)r->ambi_ch, .numSamples = (IPLint32)n, .data = ambP };
     iplReflectionEffectApply(r->refl, &rp, &in, &amb, NULL);   /* NULL mixer: single bed */
 
-    /* decode ambisonic -> 26 speakers, world-locked (identity orientation matches the sim's world listener) */
+    /* decode ambisonic -> the array, world-locked (identity orientation matches the sim's world listener) */
     float* outP[BW_CHANNELS];
-    for (uint32_t s = 0; s < BW_CHANNELS; ++s) outP[s] = r->out26 + (size_t)s * n;
-    IPLAudioBuffer o26 = { .numChannels = (IPLint32)BW_CHANNELS, .numSamples = (IPLint32)n, .data = outP };
+    for (uint32_t s = 0; s < r->channels; ++s) outP[s] = r->out26 + (size_t)s * n;
+    IPLAudioBuffer o26 = { .numChannels = (IPLint32)r->channels, .numSamples = (IPLint32)n, .data = outP };
     IPLAmbisonicsDecodeEffectParams dp; memset(&dp, 0, sizeof dp);
     dp.order = (IPLint32)r->order; dp.hrtf = NULL; dp.binaural = IPL_FALSE;
     cs_at(&dp.orientation, (float[3]){ 0.f, 0.f, 0.f });
     iplAmbisonicsDecodeEffectApply(r->dec, &dp, &amb, &o26);
 
     const float g = atomic_load_explicit(&r->wet_gain, memory_order_relaxed);   /* live wet level */
-    for (uint32_t s = 0; s < BW_CHANNELS; ++s)          /* sum the wet reverb onto the bus (composes with the dry voices) */
+    for (uint32_t s = 0; s < r->channels; ++s)          /* sum the wet reverb onto the bus (composes with the dry voices) */
         for (uint32_t i = 0; i < n; ++i) bus[(size_t)s * n + i] += g * r->out26[(size_t)s * n + i];
 }
 
@@ -192,13 +193,13 @@ void steam_reflect_set_gain(SteamReflect* r, float linear) {
  * which is what getInfluencingProbes needs to match the listener to a probe. */
 static int do_bake(SteamReflect* r, const Layout* L) {
     float xmin = 1e30f, xmax = -1e30f, zmin = 1e30f, zmax = -1e30f, ysum = 0.f;
-    for (uint32_t s = 0; s < BW_CHANNELS; ++s) {
+    for (uint32_t s = 0; s < L->count; ++s) {
         const float* p = L->speakers[s].pos;
         if (p[0] < xmin) xmin = p[0]; if (p[0] > xmax) xmax = p[0];
         if (p[2] < zmin) zmin = p[2]; if (p[2] > zmax) zmax = p[2];
         ysum += p[1];
     }
-    const float head = ysum / (float)BW_CHANNELS;     /* listening-plane height = mean speaker height */
+    const float head = ysum / (float)L->count;        /* listening-plane height = mean speaker height */
     xmin -= BW_BAKE_MARGIN; xmax += BW_BAKE_MARGIN; zmin -= BW_BAKE_MARGIN; zmax += BW_BAKE_MARGIN;
 
     if (iplProbeBatchCreate(r->ctx, &r->probes) != IPL_STATUS_SUCCESS) return 0;
@@ -252,6 +253,7 @@ SteamReflect* steam_reflect_create(SteamScene* scene, RtCore* rt, const Layout* 
     if (!r->ctx || !r->scene_ipl) { free(r); return NULL; }
     r->scene_type = (IPLSceneType)steam_scene_ipl_scenetype(scene);
     r->rt = rt; r->n = block; r->order = order; r->ambi_ch = (order + 1) * (order + 1);
+    r->channels = L->count;                         /* the layout's speaker count (<= BW_CHANNELS cap) */
     r->ir_size = (IPLint32)ceilf(ir_seconds * (float)sample_rate);
     r->duration = ir_seconds; r->rays = num_rays; r->bounces = num_bounces;
 
@@ -289,7 +291,7 @@ SteamReflect* steam_reflect_create(SteamScene* scene, RtCore* rt, const Layout* 
     rs.type = REFL_TYPE; rs.irSize = r->ir_size; rs.numChannels = (IPLint32)r->ambi_ch;   /* full directional ambisonic */
     if (iplReflectionEffectCreate(r->ctx, &as, &rs, &r->refl) != IPL_STATUS_SUCCESS) goto fail;
 
-    for (uint32_t s = 0; s < BW_CHANNELS; ++s) {        /* speaker dirs in phonon's cartesian frame (== room),
+    for (uint32_t s = 0; s < r->channels; ++s) {        /* speaker dirs in phonon's cartesian frame (== room),
                                                          * from the layout's nominal listening point */
         float p[3] = { L->speakers[s].pos[0] - L->ref[0], L->speakers[s].pos[1] - L->ref[1],
                        L->speakers[s].pos[2] - L->ref[2] };
@@ -298,13 +300,13 @@ SteamReflect* steam_reflect_create(SteamScene* scene, RtCore* rt, const Layout* 
     }
     IPLAmbisonicsDecodeEffectSettings ds; memset(&ds, 0, sizeof ds);
     ds.speakerLayout.type = IPL_SPEAKERLAYOUTTYPE_CUSTOM;
-    ds.speakerLayout.numSpeakers = (IPLint32)BW_CHANNELS;
+    ds.speakerLayout.numSpeakers = (IPLint32)r->channels;
     ds.speakerLayout.speakers = r->spk;
     ds.hrtf = NULL; ds.maxOrder = (IPLint32)order;
     if (iplAmbisonicsDecodeEffectCreate(r->ctx, &as, &ds, &r->dec) != IPL_STATUS_SUCCESS) goto fail;
 
     r->ambi  = (float*)calloc((size_t)r->ambi_ch * block, sizeof(float));
-    r->out26 = (float*)calloc((size_t)BW_CHANNELS * block, sizeof(float));
+    r->out26 = (float*)calloc((size_t)r->channels * block, sizeof(float));
     if (!r->ambi || !r->out26) goto fail;
 
     r->thread = CreateThread(NULL, 0, sim_thread, r, 0, NULL);

@@ -103,6 +103,23 @@ static int write_layout_grid(const char* path, int mode) {
     return k == 26;
 }
 
+/* an N-speaker layout: the first N positions of the default grid, indices 0..N-1 (bad_index >= 0
+ * replaces speaker 0's index — a gap/out-of-range case for the loader to reject) */
+static int write_layout_n(const char* path, int n, int bad_index) {
+    FILE* f = fopen(path, "wb");
+    if (!f) return 0;
+    Layout g = layout_default();
+    fprintf(f, "{ \"speakers\": [\n");
+    for (int k = 0; k < n; ++k) {
+        int idx = (k == 0 && bad_index >= 0) ? bad_index : k;
+        fprintf(f, "  {\"index\":%d,\"position\":[%g,%g,%g]}%s\n", idx,
+                g.speakers[k].pos[0], g.speakers[k].pos[1], g.speakers[k].pos[2], (k == n - 1) ? "" : ",");
+    }
+    fprintf(f, "] }\n");
+    fclose(f);
+    return 1;
+}
+
 int main(void) {
     /* 1. default layout */
     Layout LD = layout_default();
@@ -329,6 +346,21 @@ int main(void) {
         write_layout_grid(GJ, 2);
         CHECK(!layout_load(GJ, RATE, &B, err, sizeof err), "room_eq + room_eq_grid together are rejected");
         remove(GJ);
+    }
+
+    /* 7b3. runtime channel count: the loader accepts 4..26 speakers whose indices form a complete
+     * 0..N-1 permutation — the engine's channel count follows the file (BW_CHANNELS is the cap). */
+    {
+        const char* NJ = "bw_n_layout.json";
+        Layout B;
+        write_layout_n(NJ, 24, -1);
+        CHECK(layout_load(NJ, RATE, &B, err, sizeof err), err[0] ? err : "a 24-speaker layout loads");
+        CHECK(B.count == 24, "count follows the file");
+        write_layout_n(NJ, 3, -1);
+        CHECK(!layout_load(NJ, RATE, &B, err, sizeof err), "fewer than 4 speakers is rejected");
+        write_layout_n(NJ, 24, 24);                       /* index 24 in a 24-speaker file: gap at 0 */
+        CHECK(!layout_load(NJ, RATE, &B, err, sizeof err), "an index outside 0..N-1 is rejected");
+        remove(NJ);
     }
 
     /* 8. the committed example layout parses with this loader (schema-vs-parser integration) */

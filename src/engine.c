@@ -179,8 +179,22 @@ BwEngine* bw_create(const BwConfig* cfg) {
     if (e->cfg.sample_rate == 0) e->cfg.sample_rate = 48000;   /* sane defaults */
     if (e->cfg.block_size  == 0) e->cfg.block_size  = 256;
     e->profile = e->cfg.profile;
-    e->rt = rt_create(BW_VOICE_CAP, BW_SOUND_CAP, e->cfg.sample_rate, BW_CHANNELS);
+
+    /* Resolve the speaker geometry FIRST: the engine's CHANNEL COUNT is the layout's speaker count
+     * (a file with 4..BW_CHANNELS speakers, or the built-in 26-grid default with no path — the
+     * default IS a layout, so tests/desk-dev still need no file). A load failure is non-fatal
+     * (default grid) but surfaces via bw_last_error — note it now also means the channel count
+     * falls back to 26, so a 24-speaker install MUST check bw_last_error after bw_create. */
+    Layout L = layout_default();
+    if (e->cfg.layout_path && e->cfg.layout_path[0]) {
+        if (!layout_load(e->cfg.layout_path, e->cfg.sample_rate, &L, e->errbuf, sizeof e->errbuf))
+            set_error(e, e->errbuf[0] ? e->errbuf : "bw_create: layout load failed");
+    }
+    e->layout = L;                                  /* kept for the Steam decoder, built at bw_start */
+
+    e->rt = rt_create(BW_VOICE_CAP, BW_SOUND_CAP, e->cfg.sample_rate, L.count);
     if (!e->rt) { free(e); return NULL; }
+    rt_set_layout(e->rt, &L);
 
     /* material table: token 0 is always the built-in "generic" default (BW_PRESETS[0]). */
     for (int b = 0; b < 3; ++b) {
@@ -190,20 +204,8 @@ BwEngine* bw_create(const BwConfig* cfg) {
     e->materials[0].scattering = BW_PRESETS[0].scattering;
     e->num_materials = 1;
 
-    /* Load the surveyed speaker geometry if given; otherwise keep the default grid. A load
-     * failure is non-fatal (usable with the default layout) but surfaces via bw_last_error.
-     * Done here, before bw_start, so the audio thread isn't running. L is the effective
-     * layout (default or loaded) — the binaural monitor needs the same geometry. */
-    Layout L = layout_default();
-    if (e->cfg.layout_path && e->cfg.layout_path[0]) {
-        if (layout_load(e->cfg.layout_path, e->cfg.sample_rate, &L, e->errbuf, sizeof e->errbuf))
-            rt_set_layout(e->rt, &L);
-        else
-            set_error(e, e->errbuf[0] ? e->errbuf : "bw_create: layout load failed");
-    }
-    e->layout = L;                                  /* kept for the Steam decoder, built at bw_start */
     if (e->profile == BW_PROFILE_BINAURAL || e->profile == BW_PROFILE_BOTH) {
-        e->monitor = monitor_create(&L, e->cfg.sample_rate);
+        e->monitor = monitor_create(&e->layout, e->cfg.sample_rate);   /* count-driven virtual speakers */
         if (!e->monitor) { rt_destroy(e->rt); free(e); return NULL; }
     }
 #ifdef BW_HAVE_STEAMAUDIO
@@ -264,7 +266,7 @@ int bw_start(BwEngine* e) {
     e->cap = bs;
 
     if (e->profile == BW_PROFILE_CAVE) {
-        e->sink = bw_sink_open(sr, bs, BW_CHANNELS, render_cave, e, e->errbuf, sizeof e->errbuf);
+        e->sink = bw_sink_open(sr, bs, e->layout.count, render_cave, e, e->errbuf, sizeof e->errbuf);
     } else if (e->profile == BW_PROFILE_BINAURAL) {
         e->scratch26 = (float*)calloc((size_t)BW_MAX_BLOCK * BW_CHANNELS, sizeof(float));
         if (e->scratch26)
@@ -276,7 +278,7 @@ int bw_start(BwEngine* e) {
         e->mon_buf[1] = (float*)calloc((size_t)BW_MAX_BLOCK * 2, sizeof(float));
         e->mon_idx = 0;
         if (e->mon_buf[0] && e->mon_buf[1]) {
-            e->sink = bw_sink_open(sr, bs, BW_CHANNELS, render_both_array, e, e->errbuf, sizeof e->errbuf);
+            e->sink = bw_sink_open(sr, bs, e->layout.count, render_both_array, e, e->errbuf, sizeof e->errbuf);
             if (e->sink) {
                 e->cap = bw_sink_block_size(e->sink);   /* the array's real block; render_both_* gate on it */
                 e->sink_mon = bw_sink_open(sr, bs, 2, render_both_monitor, e, e->errbuf, sizeof e->errbuf);
@@ -334,7 +336,7 @@ int bw_start(BwEngine* e) {
      * when the FDN is enabled). Consumes the same mono aux send + per-voice send levels. Non-fatal on
      * allocation failure: no tap, the engine runs dry, the reason surfaces via bw_last_error. */
     if (e->fdn_enabled) {
-        e->fdn = fdn_create(&e->layout, e->cfg.sample_rate, BW_CHANNELS);
+        e->fdn = fdn_create(&e->layout, e->cfg.sample_rate, e->layout.count);
         if (e->fdn) {
             if (e->fdn_rt_set)  fdn_set_decay(e->fdn, e->fdn_rt[0], e->fdn_rt[1], e->fdn_rt[2]);
             if (e->fdn_dir_set) fdn_set_decay_direction(e->fdn, e->fdn_dir, e->fdn_dirfactor);
@@ -511,6 +513,34 @@ void bw_set_pose_prediction(BwEngine* e, float lead_ms) { if (e) rt_set_pose_pre
 void bw_set_near_spread(BwEngine* e, float radius_m)    { if (e) rt_set_near_spread(e->rt, radius_m); }
 void bw_set_extra_listeners(BwEngine* e, const float* xyz, uint32_t count) { if (e) rt_set_extra_listeners(e->rt, xyz, count); }
 void bw_source_set_loudness_comp(BwEngine* e, BwSource s, bool on) { if (e) rt_source_set_loudness_comp(e->rt, s, on); }
+void bw_source_set_size(BwEngine* e, BwSource s, float radius_m) { if (e) rt_source_set_size(e->rt, s, radius_m); }
+
+void     bw_set_master_gain(BwEngine* e, float linear)  { if (e) rt_set_master_gain(e->rt, linear); }
+void     bw_set_paused(BwEngine* e, bool paused)        { if (e) rt_set_all_paused(e->rt, paused); }
+uint32_t bw_get_active_voices(BwEngine* e)              { return e ? rt_active_voices(e->rt) : 0; }
+uint32_t bw_channel_count(BwEngine* e)                  { return e ? e->layout.count : 0; }
+void bw_source_fade_to (BwEngine* e, BwSource s, float gain, float seconds) { if (e) rt_source_fade_to(e->rt, s, gain, seconds, false); }
+void bw_source_fade_out(BwEngine* e, BwSource s, float seconds)             { if (e) rt_source_fade_to(e->rt, s, 0.f, seconds, true); }
+void bw_source_set_group(BwEngine* e, BwSource s, uint32_t group)  { if (e) rt_source_set_group(e->rt, s, group); }
+void bw_group_set_gain  (BwEngine* e, uint32_t group, float linear){ if (e) rt_group_set_gain(e->rt, group, linear); }
+void bw_group_set_paused(BwEngine* e, uint32_t group, bool paused) { if (e) rt_group_set_paused(e->rt, group, paused); }
+void bw_source_set_pitch(BwEngine* e, BwSource s, float rate)      { if (e) rt_source_set_pitch(e->rt, s, rate); }
+void bw_bed_set_rotation(BwEngine* e, BwBed b, float yaw_rad)      { if (e) rt_bed_set_rotation(e->rt, b, yaw_rad); }
+
+/* Manual occlusion: the same handle-gated, audio-thread-ramped publish path the Steam sim uses
+ * (rt_set_occlusion / rt_set_occlusion_eq), driven from the control thread. Do not drive a source
+ * from BOTH this and the sim (bw_source_set_occlusion) — the sim republishes every tick and wins. */
+void bw_source_set_occlusion_manual(BwEngine* e, BwSource s, float level, const float bands[3]) {
+    if (!e) return;
+    if (level < 0.f) level = 0.f; else if (level > 1.f) level = 1.f;
+    if (bands) {
+        float b[3];
+        for (int i = 0; i < 3; ++i) b[i] = bands[i] < 0.f ? 0.f : (bands[i] > 1.f ? 1.f : bands[i]);
+        rt_set_occlusion_eq(e->rt, s, level, b);
+    } else {
+        rt_set_occlusion(e->rt, s, level);
+    }
+}
 void bw_set_limiter(BwEngine* e, bool on)         { if (e) rt_set_limiter(e->rt, on); }
 void bw_set_limiter_ceiling(BwEngine* e, float ceiling_db) {
     if (!e) return;

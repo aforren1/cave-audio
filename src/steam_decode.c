@@ -92,7 +92,7 @@ SteamMonitor* steam_monitor_create(const Layout* L, uint32_t sample_rate, uint32
     if (!L || block_size == 0) return NULL;
     SteamMonitor* m = (SteamMonitor*)calloc(1, sizeof *m);
     if (!m) return NULL;
-    m->channels = BW_CHANNELS;
+    m->channels = L->count;                   /* the layout's speaker count (<= BW_CHANNELS capacity) */
     m->frame_size = block_size;
 
     IPLContextSettings cs = { 0 };

@@ -115,7 +115,7 @@ model (fixed centre vs the moving working volume). The file:
 | `reference` | object | provenance for the alignment values; `speed_of_sound_mps` is used if delays are derived rather than measured. Informational — the engine applies `delay_ms` as written. |
 | `dbap.rolloff_r` | float | the **blur** knob `r` from [`spatialization.md`](./spatialization.md): larger spreads energy over more speakers. Must be > 0. |
 | `dbap.distance_attenuation` | object | the source→listener distance-attenuation curve (the second tuning knob). The loader reads only `reference_distance_m` (> 0), `rolloff` (> 0), and `min_gain_db` (≤ 0; floors the attenuation). `model` is ignored — the inverse curve is the only one implemented. |
-| `speakers[]` | array | **exactly 26** speaker records. Order is not significant for DBAP, but `index` is the channel the speaker maps to on the 26-ch bus / ASIO output. |
+| `speakers[]` | array | **4..26** speaker records (26 = the compile-time `BW_CHANNELS` capacity). **The speaker count IS the engine's channel count** — a 24-speaker install loads a 24-entry file into the same binary. Order is not significant for DBAP, but `index` is the channel the speaker maps to on the bus / ASIO output, and the indices must form a complete `0..N-1` permutation. |
 
 ### Per-speaker record
 
@@ -159,8 +159,8 @@ a time). The calibration writeback maintains both invariants for you.
 `layout_load` rejects a malformed file (the reason surfaces through `bw_last_error`)
 if any of:
 
-- `speakers.length != 26`;
-- `index` values are not a permutation of `0..25`;
+- `speakers.length` is outside `4..26`;
+- `index` values are not a permutation of `0..N-1`;
 - a `position` component is missing, non-numeric, non-finite, or beyond ±1000 m;
 - `gain_db` is outside `[-100, 24]`, or `delay_ms` exceeds 1000 ms (a negative
   `delay_ms` is not an error — it clamps to 0);

@@ -30,6 +30,7 @@
 
 /* Command ring payload (control -> audio). Fixed-size POD, no framing. */
 #define BW_EXTRA_LIS 3   /* extra (compromise) listener positions beyond the primary */
+#define BW_GROUPS    8   /* mix groups (per-voice group id 0..7; group 0 is the default) */
 
 enum {
     CMD_SRC_CREATE = 0, CMD_SRC_DESTROY, CMD_SET_POS, CMD_SET_GAIN,
@@ -38,7 +39,14 @@ enum {
     CMD_SET_REFL_SEND, CMD_SET_REFL_DIST, CMD_SET_PATHING, CMD_SET_PAUSED, CMD_SEEK,
     CMD_SRC_STEAL,  /* fade a stolen voice out on its own slot, then free it (click-free voice-steal) */
     CMD_SET_LDC,    /* per-voice equal-loudness distance compensation enable */
-    CMD_SET_EXTRA_LIS   /* extra listener positions for multi-listener compromise panning */
+    CMD_SET_EXTRA_LIS,  /* extra listener positions for multi-listener compromise panning */
+    CMD_SET_SIZE,   /* per-voice metric source size (radius, meters) */
+    CMD_FADE,       /* per-voice timed gain fade (optionally stop at the end) */
+    CMD_SET_GROUP,  /* per-voice mix-group assignment */
+    CMD_GROUP_GAIN, /* mix-group gain (re-dirties the group's voices) */
+    CMD_GROUP_PAUSED,   /* mix-group pause gate */
+    CMD_SET_PITCH,  /* per-voice playback rate (in-memory sounds) */
+    CMD_BED_YAW     /* per-bed soundfield rotation about the room's vertical axis */
 };
 typedef struct {
     uint8_t  type;
@@ -60,6 +68,13 @@ typedef struct {
         struct { uint32_t channel; uint8_t kind; float gain; } test;  /* debug channel injection */
         struct { uint8_t on; }                         ldc;   /* per-voice loudness-compensated attenuation */
         struct { float p[BW_EXTRA_LIS][3]; uint8_t n; } exlis; /* extra listeners (compromise panning) */
+        struct { float radius; }                       size;  /* per-voice source radius (meters; 0 = point) */
+        struct { float target, seconds; uint8_t stop; } fade; /* timed gain fade (stop = stop when landed) */
+        struct { uint8_t id; }                         group; /* mix-group assignment */
+        struct { uint8_t id; float gain; }             ggain; /* mix-group gain */
+        struct { uint8_t id, on; }                     gpause;/* mix-group pause */
+        struct { float rate; }                         pitch; /* playback rate (1 = native) */
+        struct { float yaw; }                          byaw;  /* bed soundfield yaw (radians) */
     } u;
 } Cmd;
 
@@ -83,6 +98,11 @@ void    rt_set_bed_renderer(RtCore* c, int parametric);   /* bed: 0 = matrix dec
 void    rt_set_pose_prediction(RtCore* c, float lead_s);  /* tracked-pose lead (0 = off); live */
 void    rt_set_near_spread(RtCore* c, float radius_m);    /* near-listener widening radius (0 = off); live */
 void    rt_set_extra_listeners(RtCore* c, const float* xyz, uint32_t n);   /* compromise panning; commit-gated */
+void    rt_set_master_gain(RtCore* c, float linear);      /* one ramped scalar over the whole mix; live */
+void    rt_set_all_paused(RtCore* c, int paused);         /* global pause gate (rides pause_gate); live */
+void    rt_group_set_gain(RtCore* c, uint32_t group, float linear);   /* mix-group gain (enqueue) */
+void    rt_group_set_paused(RtCore* c, uint32_t group, bool paused);  /* mix-group pause (enqueue) */
+uint32_t rt_active_voices(RtCore* c);                     /* control thread: last block's active voice count */
 void    rt_set_limiter(RtCore* c, int on);           /* output protection limiter (final stage; default ON); live */
 void    rt_set_limiter_ceiling(RtCore* c, float ceiling_linear);   /* limit/clamp ceiling, linear (default -1 dBFS); live */
 
@@ -153,6 +173,11 @@ void rt_source_set_doppler(RtCore* c, uint32_t h, bool on);          /* propagat
 void rt_source_set_air_absorption(RtCore* c, uint32_t h, bool on);   /* propagation: distance-driven HF low-pass */
 void rt_source_set_loudness_comp(RtCore* c, uint32_t h, bool on);    /* equal-loudness LF shelf vs attenuation */
 void rt_source_set_spread(RtCore* c, uint32_t h, float amount);      /* source angular width: 0 = point .. 1 = wide */
+void rt_source_set_size  (RtCore* c, uint32_t h, float radius_m);    /* source METRIC size: spread from subtended angle */
+void rt_source_fade_to   (RtCore* c, uint32_t h, float gain, float seconds, bool stop_at_end);  /* timed fade */
+void rt_source_set_group (RtCore* c, uint32_t h, uint32_t group);    /* mix-group assignment (0 = default) */
+void rt_source_set_pitch (RtCore* c, uint32_t h, float rate);        /* playback rate [0.25, 4]; glided */
+void rt_bed_set_rotation (RtCore* c, uint32_t h, float yaw_rad);     /* bed soundfield yaw; glided */
 void rt_play_oneshot   (RtCore* c, uint32_t sound, float x, float y, float z, float gain);
 void rt_set_listener   (RtCore* c, const float p[3], const float q[4]);
 void rt_commit         (RtCore* c);                   /* enqueue CMD_COMMIT + drain events */

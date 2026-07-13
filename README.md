@@ -29,25 +29,93 @@ in one process behind one audio callback.
 
 - **Spatialization**: per-voice listener-relative DBAP (SPCAP/VBAP selectable, a
   dual-band option), recomputed per block from the tracked head position; source
-  spread; per-speaker gain/delay/correction-EQ output stage, with a linked
-  protection limiter as the final stage.
-- **Acoustics** (Steam Audio): ray-traced occlusion with per-band transmission EQ,
-  source directivity, a directional reflection bed (real-time, or baked over a
-  probe grid), sound pathing around occluders with bending-loss EQ.
-- **Propagation**: distance attenuation, Doppler, air absorption — opt-in per
-  source, ramped.
+  extent as an angular spread (lobe or MDAP virtual-source ring) or a **metric
+  size in meters** that holds constant as the listener walks, with optional
+  velvet-noise **decorrelation** so wide sources don't collapse to phantom images;
+  near-listener widening for fly-throughs; a **multi-listener compromise** mode
+  (energy-mean over up to 4 occupants); per-speaker gain/delay/correction-EQ
+  output stage, master gain, and a linked protection limiter as the final stage.
+- **Acoustics**: ray-traced occlusion with per-band transmission EQ, source
+  directivity, a directional reflection bed (real-time, or baked over a probe
+  grid), and sound pathing with bending-loss EQ via Steam Audio — plus a
+  **phonon-free directional FDN reverb** (anisotropic decay) and **manual
+  occlusion** driven from game logic, so no-SDK builds keep reverb and muffling.
+- **Propagation**: distance attenuation, Doppler, air absorption, equal-loudness
+  compensation, playback **pitch** — opt-in per source, ramped/glided.
 - **Assets**: WAV/FLAC/MP3, decoded and resampled at load; disk streaming for long
-  files; AmbiX ambisonic beds decoded world-locked to the array.
-- **Voices**: fixed pool with priority stealing; pause and click-free seek;
-  sample-accurate start against a device-anchored DSP clock
-  (`bw_source_play_at` / `bw_dsp_time`).
+  files; AmbiX ambisonic beds — matrix decode (sampling or AllRAD) or a
+  **parametric DirAC-style renderer** whose direct stream re-pans listener-relative
+  (a walkable soundfield), with yaw rotation to line a capture up with the scene.
+- **Voices**: fixed pool with priority stealing; pause (per-voice, per-group, and
+  global) and click-free seek; engine-side timed fades; **mix groups** for
+  category gain/ducking; sample-accurate start against a device-anchored DSP
+  clock (`bw_source_play_at` / `bw_dsp_time`).
 - **Tracking**: OptiTrack NatNet parsed off-wire; the audio thread samples the
-  freshest head pose at block time.
+  freshest head pose at block time, with optional **pose prediction** to hide
+  motion-to-ears latency; **tracked room EQ** interpolates measured LF room
+  correction at the live listener position.
 - **Monitoring**: binaural HRTF render of the same 26-channel bus (3rd-order
   ambisonic encode → Steam Audio decode) to any 2-ch ASIO device; per-channel
-  test signal.
+  test signal, output meters, voice gauge.
 - **Real-time discipline**: no allocation, locks, or I/O on the audio thread;
-  lock-free SPSC command/event rings; `bw_commit` gives frame-coherent updates.
+  lock-free SPSC command/event rings; `bw_commit` gives frame-coherent updates;
+  every parameter change ramps — nothing steps.
+- **Validation**: the core math (SH encode, VBAP, AllRAD, biquads, EQ rendering)
+  is cross-checked against independent implementations (scipy/qhull/linear-
+  programming goldens) in CI, alongside the DSP/concurrency test suite and
+  UI-driven tests for all three tools.
+
+## Recommended settings per setup
+
+The defaults target the CAVE: **one tracked listener roaming the array.** Change setup
+and the right settings change with it — mostly because a *sweet spot* either exists or
+doesn't. These are starting points, not laws; the playground's blind A/B/X harness is
+there so you can check by ear instead of taking our word. The calibration commands
+behind the last row are under [One array, several audiences](#calibrate--bw_calib_view).
+
+| | **tracked roamer** (the CAVE) | **fixed seat** (one chair) | **audience** (several people) | **desk** (headphones) |
+|---|---|---|---|---|
+| profile | `cave` | `cave` | `cave` | `binaural` |
+| panner | **DBAP** (default) | **VBAP**, else SPCAP | **DBAP**, untracked | any (DBAP) |
+| tracking | `track_internal = true` | none — listener sits at the seat | none — listener at the array centroid | push head pose, or track |
+| dual-band | off | **on** | off | your call (A/B it) |
+| calibration | `--eq` + `--room-eq-grid` | `--eq` + `--room-eq` at the seat | `--eq` only | `--eq` |
+| bed decoder | AllRAD if the array is irregular | sampling | AllRAD | either |
+
+**Tracked roamer.** DBAP is listener-relative and re-solves every block, so it degrades
+gracefully as you walk — that is the whole point of it. Leave dual-band and VBAP off:
+both sharpen the image *at a sweet spot* and there isn't one. For room correction use the
+grid (`bw_calibrate --room-eq-grid`, one run per mic position); the engine interpolates
+the LF cuts at your live position and glides the biquads. `bw_set_pose_prediction` (start
+~20–40 ms, your measured motion-to-ears latency) hides the panning lag; `bw_set_decorrelation`
+keeps wide sources from comb-filtering as you move. Loading a static `room_eq` layout into
+a moving session **fails `bw_start`** on purpose — one measurement point cannot correct a roam.
+
+**Fixed seat.** Now a sweet spot exists, so spend it: VBAP for the sharpest image (it needs
+a cleanly triangulable array — it falls back to DBAP if not), SPCAP if the array is uneven
+or you want a smoother, all-speaker image. Turn **dual-band on** for tighter bass
+localisation, and calibrate with `--room-eq` **with the mic at the seat**. Don't track;
+set the listener pose once.
+
+**Audience.** The hard case, and the one the engine does *not* solve: there is **one
+listener**, so several sets of ears mean several wrong poses. Play it safe rather than
+sharp — everything sweet-spot-dependent is a liability. Stay on DBAP with the listener
+parked at the array centroid, dual-band off, and no room EQ beyond `--eq` (which
+flattens the *speakers*, not the room, so it helps every seat equally). Raise
+`bw_source_set_spread` on ambience: wide sources survive off-centre listening far better
+than points do. If one person in the group matters most (a demo driver, the participant),
+track *them* and accept that everyone else is an eavesdropper.
+
+**Desk.** The `binaural` profile needs no layout, no Dante, and no hardware beyond
+headphones — the monitor renders the *same* 26-channel mix, so what you hear is the array
+render. Use it to develop; don't use it to judge timbre for the room.
+
+**Everywhere:** the output limiter is on at −1 dBFS (leave it — it's speaker protection, not
+mastering), and reflections are opt-in per source. Pick one reverb bed: Steam Audio's
+(needs the SDK, ray-traced from your geometry) *or* the phonon-free FDN (`bw_reverb_fdn`,
+a designed decay — cheaper, works in no-SDK builds). Details in
+[`docs/spatialization.md`](./docs/spatialization.md) and
+[`docs/calibration.md`](./docs/calibration.md).
 
 ## Non-goals & current limitations
 
@@ -55,21 +123,24 @@ bwaudio is not middleware. There are no events, banks, mixer graphs, or authorin
 app — the ABI is create/play/position/commit. Game-side audio (UI, menus) stays in
 the game engine's own mixer.
 
-- **Fixed target.** The speaker geometry is data, but the channel count is
-  compile-time. This is not a general 5.1/Atmos renderer.
-- **Windows + ASIO only. One listener.**
-- **Room EQ is opt-in and static-listener only** (`bw_calibrate --room-eq`, for the
-  fixed-seat SPCAP/VBAP deployments). The moving-listener default flattens the
-  speakers, not the room — one measurement point can't correct a roam.
+- **Fixed target.** The speaker geometry — including the channel count — is data:
+  a layout file carries 4..26 speakers and the engine's channel count follows it
+  (26 is the compile-time capacity; collaborator arrays with fewer speakers load
+  into the same binary). Still not a general 5.1/Atmos renderer.
+- **Windows + ASIO only.** One *tracked* listener — the multi-listener mode is a
+  panning compromise for extra occupants, not per-head rendering.
+- **Room EQ is opt-in.** Static-listener correction at one point
+  (`bw_calibrate --room-eq`, fixed-seat installs), or **tracked room EQ** from a
+  measured grid (`--room-eq-grid`) for a roaming listener — LF modal cuts only;
+  mid/HF stays speaker-only correction, because one room can't be flattened for
+  every position at once.
 
 Current gaps (may change):
 
-- No user pitch control — Doppler is physics-derived.
-- No master-bus gain or buses/groups (there is an output protection limiter).
 - Mono point sources only. Stereo assets downmix; the ambisonic bed is the only
   non-point path.
 - No completion callbacks — poll `bw_source_is_playing`.
-- No OGG/Opus, and seek does not apply to streamed sounds.
+- No OGG/Opus; seek and pitch do not apply to streamed sounds.
 - Reflection/room configuration is load-time (occlusion meshes can be replaced live).
 
 ## Getting started
@@ -138,8 +209,9 @@ cmake --build build --config RelWithDebInfo
 
 Authors `cave_layout.json`:
 
-- Place the 26 speakers. A speaker's index is its output channel, so the built-in
-  test tone tells you which physical speaker is which.
+- Place the speakers (4–26; the count control sets the array size, and the file's
+  count *is* the engine's channel count). A speaker's index is its output channel,
+  so the built-in test tone tells you which physical speaker is which.
 - Load placement constraints from `constraints.json`.
 - Shade a coverage shell by nearest-speaker gap, or by the selected panner's
   rE-localization error — computed with the engine's own gain solve.
@@ -173,8 +245,9 @@ calibrated variants of the same geometry and pick one per session
 (`BwConfig.layout_path` + the panner):
 
 ```
-bw_calibrate --layout survey.json --mic 0 1.2 0 --room-eq --out cave_layout.seated.json
-bw_calibrate --layout survey.json --mic 0 1.7 0 --eq      --out cave_layout.roaming.json
+bw_calibrate --layout survey.json --mic 0 1.2 0 --room-eq      --out cave_layout.seated.json
+bw_calibrate --layout survey.json --mic 0 1.7 0 --eq           --out cave_layout.roaming.json
+bw_calibrate --layout cave_layout.roaming.json --mic -1 1.7 0 --room-eq-grid   # then rerun per mic spot
 ```
 
 - **Seated** (SPCAP/VBAP, fixed listener pose): trims aligned at the seat, room
@@ -182,6 +255,10 @@ bw_calibrate --layout survey.json --mic 0 1.7 0 --eq      --out cave_layout.roam
   measurement point.
 - **Roaming** (DBAP + tracking): trims aligned at the working-volume centre at
   standing ear height, speaker-only EQ — one point can't room-correct a roam.
+- **Roaming + tracked room EQ**: `--room-eq-grid` accumulates LF modal cuts one mic
+  placement at a time (the `--mic` position is the grid key); the engine then
+  interpolates the cuts at the live tracked position — grid-based room correction
+  that survives a walk.
 
 Diffing the two files in calib_view should show identical positions and only trim/EQ
 differences. Unknown JSON fields survive recalibration, so a variant can carry its

@@ -100,6 +100,24 @@ BW_API void     bw_source_destroy(BwEngine* e, BwSource s);
 BW_API void     bw_source_set_priority(BwEngine* e, BwSource s, int priority);
 BW_API void     bw_source_set_pos(BwEngine* e, BwSource s, float x, float y, float z); /* ROOM space, right-handed */
 BW_API void     bw_source_set_gain(BwEngine* e, BwSource s, float linear);
+/* Timed gain fade: glide the source's gain to `gain` over `seconds` (engine-side, so no per-frame
+ * scripting; seconds <= 0 sets it immediately). A later bw_source_set_gain or fade replaces it.
+ * bw_source_fade_out fades to silence and then STOPS the voice (the click-free stop path) — the
+ * one-call answer to "fade this out and clean it up". Per-frame-safe. */
+BW_API void     bw_source_fade_to (BwEngine* e, BwSource s, float gain, float seconds);
+BW_API void     bw_source_fade_out(BwEngine* e, BwSource s, float seconds);
+/* Mix groups (0..7; sources start in group 0): group gain multiplies into every member's gain solve
+ * (ramped), and a paused group ramps out + freezes its members' playheads exactly like per-voice
+ * pause — "duck the SFX, keep the dialog", scene-wide category control without touching each source.
+ * All per-frame-safe. */
+BW_API void     bw_source_set_group(BwEngine* e, BwSource s, uint32_t group);
+BW_API void     bw_group_set_gain  (BwEngine* e, uint32_t group, float linear);
+BW_API void     bw_group_set_paused(BwEngine* e, uint32_t group, bool paused);
+/* Playback rate (1 = native; clamped to [0.25, 4]): a fractional-cursor linear-interp resample of
+ * IN-MEMORY sounds — variation on repeated one-shots, slow-mo, engines. Rate changes GLIDE across a
+ * block (a change bends the pitch, never steps it) and compose with Doppler. Streamed sounds ignore
+ * it (the stream ring is sequential); beds are unaffected. Per-frame-safe. */
+BW_API void     bw_source_set_pitch(BwEngine* e, BwSource s, float rate);
 BW_API void     bw_source_play(BwEngine* e, BwSource s, BwSound snd, bool loop);
 /* Sample-accurate scheduled play: begin output exactly when the engine's dsp clock reaches
  * `start_sample` (the voice is silent until then, then starts at the precise in-block sample).
@@ -115,6 +133,10 @@ BW_API void     bw_source_stop(BwEngine* e, BwSource s);
  * streamed, and bed sounds. A paused voice still reads as playing (it has not ended); bw_source_play
  * always starts un-paused. */
 BW_API void     bw_source_set_paused(BwEngine* e, BwSource s, bool paused);
+/* Global pause (app focus loss, menu pause): EVERY voice ramps out and freezes — memory, streamed,
+ * and bed alike — and resume continues exactly. Same semantics as per-voice pause (paused voices
+ * still read as playing). Live, per-frame-safe. */
+BW_API void     bw_set_paused(BwEngine* e, bool paused);
 /* Jump the voice's content position to `frame` (engine-rate frames into the sound). Click-free: the
  * voice ramps out, jumps, ramps back in (~10 ms end to end); on a paused voice the jump is immediate
  * (and stays paused). Past-the-end: loops wrap, one-shots end. In-memory and bed sounds only —
@@ -133,6 +155,12 @@ BW_API void     bw_play_oneshot(BwEngine* e, BwSound snd, float x, float y, floa
 BW_API BwBed bw_bed_create(BwEngine* e);
 BW_API void  bw_bed_play(BwEngine* e, BwBed b, BwSound snd, bool loop);
 BW_API void  bw_bed_set_gain(BwEngine* e, BwBed b, float linear);   /* master gain, ramped */
+/* Yaw the bed's soundfield about the room's vertical axis (radians; positive turns the field from
+ * room +z/front toward room +x): line a capture up with the scene, or rotate it slowly for effect.
+ * Closed-form yaw SH rotation (each degree's +-m pair rotates by m*yaw — exact, all orders), glides
+ * to the target at ~one turn/s (click-free, live), applied before EITHER bed renderer (matrix and
+ * parametric see the same turned field). Per-frame-safe. */
+BW_API void  bw_bed_set_rotation(BwEngine* e, BwBed b, float yaw_rad);
 BW_API void  bw_bed_stop(BwEngine* e, BwBed b);
 BW_API void  bw_bed_destroy(BwEngine* e, BwBed b);
 
@@ -167,6 +195,14 @@ BW_API void     bw_scene_set_box(BwEngine* e, float w, float h, float d, const B
 /* Enable per-source occlusion: geometry between the source and listener attenuates it (ramped).
  * Per-frame-safe. No-op without the Steam Audio backend. */
 BW_API void     bw_source_set_occlusion(BwEngine* e, BwSource s, bool on);
+/* MANUAL occlusion (no SDK needed): drive the same handle-gated, audio-thread-ramped path the sim
+ * publishes through, from your own game logic — "behind a door the gameplay knows about",
+ * underwater, muffled-by-menu. `level` is broadband transmittance (1 = clear .. 0 = blocked);
+ * `bands` (optional, NULL = broadband only) is a low/mid/high tilt in [0,1] rendered as the same
+ * 3-biquad transmission EQ the sim uses (so a wall MUFFLES, not just attenuates). Everything ramps.
+ * Do not drive a source from both this and the sim (bw_source_set_occlusion) — the sim republishes
+ * every tick and wins. Per-frame-safe. */
+BW_API void     bw_source_set_occlusion_manual(BwEngine* e, BwSource s, float level, const float bands[3]);
 
 /* ---- reflection bed (materials; needs the Steam Audio build) ----
  * A single shared listener-centric reverb bed (Steam Audio hybrid reverb), decoded straight to the
@@ -257,6 +293,13 @@ BW_API void     bw_source_set_loudness_comp(BwEngine* e, BwSource s, bool on);
  * source's energy across the speakers around its direction (a waterfall/crowd/ambience that shouldn't
  * collapse to one point), centred on its direction and constant-power. Works with any panner. */
 BW_API void     bw_source_set_spread(BwEngine* e, BwSource s, float amount);
+/* Source size in METERS (radius; 0 = point, the default) — the physical alternative to the angular
+ * spread above. The rendered width is the angle the radius subtends from the tracked listener, so a
+ * 2 m waterfall STAYS 2 m wide as the listener walks (an angular spread changes physical size with
+ * distance), and a source that engulfs the listener (dist < radius) goes fully wide. Floors spread
+ * (the larger of the two wins), rides the selected spread mode + decorrelation, and subsumes
+ * bw_set_near_spread for sized sources. Per-frame-safe. */
+BW_API void     bw_source_set_size(BwEngine* e, BwSource s, float radius_m);
 
 /* ---- channel test / diagnostics (control thread; no SDK needed) ----
  * Drive a single OUTPUT channel with a built-in test signal, injected AFTER the per-speaker align
@@ -280,6 +323,9 @@ BW_API uint32_t bw_get_speakers(BwEngine* e, float* xyz, uint32_t cap);
  * per-frame-safe (relaxed atomic reads; no locks/alloc) — drive channel meters or a speaker-activity
  * display (the playground lights each speaker gizmo with it). Reads 0 until audio is running. */
 BW_API uint32_t bw_get_bus_levels(BwEngine* e, float* peaks, uint32_t cap);
+/* Last block's ACTIVE voice count (playing, sound bound) — a voice-pool gauge for HUDs/health
+ * monitoring next to the meters. Control thread, per-frame-safe; 0 until audio runs. */
+BW_API uint32_t bw_get_active_voices(BwEngine* e);
 
 /* ---- panner selection (load-time, or live: the switch is atomic) ----
  * The per-source panner that writes the 26-ch bus. DBAP (default) is listener-relative, recomputed
@@ -292,6 +338,12 @@ BW_API uint32_t bw_get_bus_levels(BwEngine* e, float* peaks, uint32_t cap);
  * for a moving observer). Does not affect the diffuse bed / ambisonic paths. See docs/spatialization.md. */
 typedef enum { BW_PAN_DBAP = 0, BW_PAN_SPCAP = 1, BW_PAN_VBAP = 2 } BwPanner;
 BW_API void     bw_set_panner(BwEngine* e, BwPanner panner);
+/* The engine's ACTIVE channel count = the layout's speaker count (4..26; the 26-grid default with no
+ * layout_path). Fixed for the engine's lifetime — size meter/speaker arrays with it. BW_CHANNELS(26)
+ * is only the compile-time CAPACITY; a collaborator's 24-speaker layout loads into the same binary.
+ * NOTE: a failed layout load falls back to the 26 default (non-fatal, see bw_last_error) — which now
+ * also means a different channel count, so smaller installs must check bw_last_error at create. */
+BW_API uint32_t bw_channel_count(BwEngine* e);
 /* Dual-band panning (off by default): split each source at ~700 Hz and pan the low band with
  * amplitude (pressure / velocity-vector) normalisation, the high band with the panner's usual power
  * (energy-vector) normalisation — better low-frequency localisation for a near-centred listener. Wraps
@@ -327,6 +379,12 @@ BW_API void     bw_set_near_spread(BwEngine* e, float radius_m);
  * mastering limiter — if it engages in normal use, turn the content down. Control thread; live. */
 BW_API void     bw_set_limiter(BwEngine* e, bool on);
 BW_API void     bw_set_limiter_ceiling(BwEngine* e, float ceiling_db);   /* e.g. -1.0f; clamped to [-60, 0] */
+
+/* Master gain: one ramped scalar over the whole mix — voices, beds, reverb/pathing — applied BEFORE
+ * the per-speaker align stage (trims and the raw channel-test signal stay calibrated) and before the
+ * limiter (which still guards the sum). The volume knob / scene-fade control the API previously
+ * lacked. Live, per-frame-safe; ramps across a block, so slider drags never zipper. */
+BW_API void     bw_set_master_gain(BwEngine* e, float linear);
 
 /* Select the diffuse-bed ambisonic decoder (load-time: between bw_create and bw_start). SAMPLING is the
  * default projection decode; ALLRAD (All-Round Ambisonic Decoding) decodes to a uniform virtual layout

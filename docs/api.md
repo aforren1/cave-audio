@@ -225,6 +225,12 @@ void     bw_source_destroy(BwEngine* e, BwSource s);
 void     bw_source_set_priority(BwEngine* e, BwSource s, int priority);  // 0 = expendable .. 255 = protected (default 128)
 void     bw_source_set_pos (BwEngine* e, BwSource s, float x, float y, float z); // ROOM space, RH
 void     bw_source_set_gain(BwEngine* e, BwSource s, float linear);
+void     bw_source_fade_to (BwEngine* e, BwSource s, float gain, float seconds); // engine-side timed fade
+void     bw_source_fade_out(BwEngine* e, BwSource s, float seconds);             // fade to 0, then stop
+void     bw_source_set_group(BwEngine* e, BwSource s, uint32_t group);           // mix group 0..7 (default 0)
+void     bw_group_set_gain  (BwEngine* e, uint32_t group, float linear);         // scales every member (ramped)
+void     bw_group_set_paused(BwEngine* e, uint32_t group, bool paused);          // pause a whole category
+void     bw_source_set_pitch(BwEngine* e, BwSource s, float rate);               // playback rate [0.25, 4]; glided
 void     bw_source_play (BwEngine* e, BwSource s, BwSound snd, bool loop);
 void     bw_source_play_at(BwEngine* e, BwSource s, BwSound snd, bool loop, uint64_t start_sample); // sample-accurate
 uint64_t bw_dsp_time(BwEngine* e);                       // current dsp-sample clock (device-anchored, monotonic)
@@ -265,9 +271,40 @@ observed as playing.
 - Streamed sounds ignore seeks — the stream ring can't jump. `bw_source_play` always restarts
   un-paused at frame 0.
 
+**Fades are engine-side.** `bw_source_fade_to` glides the gain over `seconds` on the audio thread
+(no per-frame scripting; `seconds <= 0` sets immediately). A later `set_gain` or fade replaces the
+fade in flight. `bw_source_fade_out` is the one-call "fade to silence, then stop" — it lands on the
+same click-free stop path `bw_source_stop` uses.
+
+**Mix groups (0..7)** are category-level control: a group's gain multiplies into every member's
+gain solve (ramped like any solve), and pausing a group ramps its members out and freezes their
+playheads exactly like per-voice pause — duck the SFX and keep the dialog, silence the ambience
+category for a cutscene. Sources start in group 0; group state persists across `play`.
+
+**Pitch** (`bw_source_set_pitch`, 1 = native, clamped `[0.25, 4]`) resamples **in-memory** sounds
+with a fractional playback cursor (linear interpolation; the cursor stays integer + fraction, so a
+voice running for hours never loses precision). Rate changes **glide** across a block — a change
+bends the pitch rather than stepping it — and compose with Doppler (which resamples via propagation
+delay on top). Streamed sounds ignore it (the stream ring is sequential); beds are unaffected. Use
+it for one-shot variation, slow-mo, engines.
+
 Positions are in **room space** (see [Coordinates and units](#coordinates-and-units)).
 `bw_play_oneshot` is the fire-and-forget path: it allocates a transient voice internally
 and recycles it on end, so the caller holds no handle.
+
+### Master gain & global pause
+
+```c
+void bw_set_master_gain(BwEngine* e, float linear);   // one ramped scalar over the whole mix; live
+void bw_set_paused(BwEngine* e, bool paused);         // pause EVERYTHING (ramped, playheads freeze); live
+```
+
+`bw_set_master_gain` is the volume knob / scene-fade the API previously lacked: it scales
+everything mixed — voices, beds, the reverb/pathing taps — **before** the per-speaker align stage
+(so trims and the raw channel-test signal stay calibrated) and before the limiter (which still
+guards the sum). Ramped per block; dragging a slider never zippers. `bw_set_paused` is app-focus /
+menu pause: every voice gates out with the per-voice pause machinery (memory, streamed, and bed
+alike), playheads freeze, resume continues exactly, and paused voices still read as *playing*.
 
 ## Ambisonic beds (control thread)
 
@@ -275,10 +312,18 @@ and recycles it on end, so the caller holds no handle.
 BwSound bw_load_ambix(BwEngine* e, const char* path);   // AmbiX (ACN/SN3D); 4/9/16 ch -> order 1/2/3
 BwBed   bw_bed_create  (BwEngine* e);
 void    bw_bed_play    (BwEngine* e, BwBed b, BwSound snd, bool loop);
-void    bw_bed_set_gain(BwEngine* e, BwBed b, float linear);   // master gain, ramped
+void    bw_bed_set_gain(BwEngine* e, BwBed b, float linear);       // master gain, ramped
+void    bw_bed_set_rotation(BwEngine* e, BwBed b, float yaw_rad);  // yaw the soundfield; glided
 void    bw_bed_stop    (BwEngine* e, BwBed b);
 void    bw_bed_destroy (BwEngine* e, BwBed b);
 ```
+
+`bw_bed_set_rotation` yaws the recorded field about the room's vertical axis — line a capture up
+with the scene, or rotate it slowly for effect. Positive yaw turns the field from room **+z**
+(front) toward room **+x**. It's the closed-form yaw SH rotation (each degree's ±m channel pair
+rotates by m·yaw — exact at every order, no Wigner matrices), it **glides** to the target at ~one
+turn per second (click-free, live-safe), and it applies before *either* bed renderer, so the matrix
+decode and the parametric analysis see the same turned field.
 
 A **bed** is a pre-encoded **AmbiX** soundfield (ACN ordering, SN3D normalization) decoded
 **straight to the 26 speakers**. It is not panned and has no position — use it for diffuse,
@@ -457,6 +502,20 @@ at a low rate and publishes a per-source scalar (+ a 3-band transmission tilt fo
 directional without being occluded). The `_get_` reads return the latest published scalar for
 HUD/diagnostics and are safe to poll. No-ops without the Steam Audio build.
 
+### Manual occlusion (no SDK needed)
+
+```c
+void bw_source_set_occlusion_manual(BwEngine* e, BwSource s, float level, const float bands[3]);
+```
+
+Drives the **same** handle-gated, audio-thread-ramped publish path the ray-tracing sim uses — from
+your own game logic. `level` is broadband transmittance (1 = clear .. 0 = blocked); `bands`
+(optional; NULL = broadband only) is a low/mid/high tilt in `[0,1]` rendered as the same 3-biquad
+transmission EQ, so a wall *muffles* rather than just attenuating. This is how a no-SDK build gets
+gameplay-driven occlusion ("behind a door the game knows about", underwater, muffled-behind-a-menu)
+with identical click-free rendering. Don't drive one source from both this and the sim
+(`bw_source_set_occlusion`) — the sim republishes every tick and wins.
+
 ## Propagation effects (control thread; per-frame)
 
 ```c
@@ -492,6 +551,7 @@ own propagation. They do not affect ambisonic beds (world-locked, no position).
 
 ```c
 void bw_source_set_spread(BwEngine* e, BwSource s, float amount);   // 0 = point (default) .. 1 = wide
+void bw_source_set_size  (BwEngine* e, BwSource s, float radius_m); // metric alternative: radius in m
 typedef enum { BW_SPREAD_LOBE = 0, BW_SPREAD_MDAP = 1 } BwSpreadMode;
 void bw_set_spread_mode(BwEngine* e, BwSpreadMode mode);            // engine-wide; live A/B
 ```
@@ -499,6 +559,12 @@ void bw_set_spread_mode(BwEngine* e, BwSpreadMode mode);            // engine-wi
 Angular **width** of a source. A waterfall, a crowd, an engine room, or ambience shouldn't
 collapse to a single point — raise `spread` and the source's energy fans out across the speakers
 around its direction.
+
+Prefer **`bw_source_set_size`** when the content has a physical size: it floors the spread at the
+angle the radius subtends from the tracked listener (`asin(r/d)`, fully wide once the listener is
+inside the source), so a 2 m waterfall *stays* 2 m wide as the listener walks — an angular spread
+changes physical size with distance. The larger of the two knobs wins, and a sized source subsumes
+`bw_set_near_spread` (engulfment is just the `d < r` case). Both are per-frame-safe.
 
 It's implemented in the per-block gain solve, not the sample loop, and **renormalised to the
 panner's own power** — widening never changes loudness, and the perceived direction stays put.
@@ -547,7 +613,12 @@ solve. Engine-wide policy; it takes effect with each gain re-solve (continuous u
 typedef enum { BW_TEST_OFF = 0, BW_TEST_SINE = 1, BW_TEST_NOISE = 2 } BwTestKind;
 void     bw_test_signal(BwEngine* e, uint32_t channel, BwTestKind kind, float gain);
 uint32_t bw_get_bus_levels(BwEngine* e, float* peaks, uint32_t cap);  // last block's per-channel output peak
+uint32_t bw_get_active_voices(BwEngine* e);                           // last block's active voice count
 ```
+
+`bw_get_active_voices` is the voice-pool gauge next to the meters: the audio thread publishes each
+block's active count (playing, sound bound — paused voices count, they haven't ended). Poll it for
+HUDs or health monitoring; it reads 0 until audio runs.
 
 `bw_test_signal` drives a single **output channel** with a built-in signal (660 Hz sine or white
 noise), injected **after** the per-speaker align stage — a raw value straight on the channel.
@@ -611,8 +682,24 @@ The decoder is load-time (between `bw_create` and `bw_start`); see
 [`spatialization.md`](./spatialization.md) for the theory.
 
 `bw_get_speakers` returns the effective layout (the default grid, or the `layout_path` file) as
-`cap*3` floats in channel order, plus the count (26). Use it to visualize or audition the
-geometry the engine is actually panning with.
+`cap*3` floats in channel order, plus the count. Use it to visualize or audition the geometry the
+engine is actually panning with.
+
+### Channel count
+
+```c
+uint32_t bw_channel_count(BwEngine* e);   // the ACTIVE channel count (4..26), fixed at create
+```
+
+The engine's channel count **is the layout's speaker count**: a `layout_path` file with 4..26
+speakers, or 26 (the default grid) with no path. `BW_CHANNELS` (26) is only the compile-time
+*capacity* — a collaborator's 24-speaker array loads a 24-entry layout into the same binary, the
+device opens 24 channels, and every consumer (panners, beds, reverb, monitor, calibration) follows.
+Size meter/speaker arrays from this getter, not the constant.
+
+One sharp edge: a **failed** layout load still falls back to the 26-grid default (non-fatal, reason
+in `bw_last_error`) — which for a smaller install also means the *wrong channel count*. A
+24-speaker deployment must check `bw_last_error` (or `bw_channel_count`) after `bw_create`.
 
 ## Tracked room EQ (control thread; live)
 

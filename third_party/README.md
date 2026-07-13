@@ -109,6 +109,10 @@ git submodule update --init third_party/steam-audio-source   # fetch the pinned 
 # 0. Apply our local fixes (see third_party/patches/). REQUIRED for directional reflections.
 git -C third_party/steam-audio-source apply ../patches/phonon-multiplyaccumulate-align.patch
 
+# 0.5. CMake >= 4 only: the pinned deps (flatbuffers 1.12, zlib, ...) declare pre-3.5
+#      cmake_minimum_required, which CMake 4 refuses. This env var is the escape hatch.
+export CMAKE_POLICY_VERSION_MINIMUM=3.5
+
 # 1. Fetch ONLY the required deps, with the SHARED CRT (/MD) — see the CRT note below.
 #    flatbuffers is a build tool (flatc); zlib/pffft/mysofa are linked into phonon.
 python get_dependencies.py --dependency flatbuffers -p windows -a x64 -t vs2022
@@ -117,11 +121,14 @@ for d in zlib pffft mysofa; do
 done
 
 # 2. Generate the phonon project (--minimal drops Embree / IPP / GPU / sample apps).
+#    build.py creates its build tree in the CURRENT directory, so this lands in
+#    core/build/windows-vs2022-x64 (the dir name comes from -t/-a, not the generator).
 python build.py -p windows -a x64 -t vs2022 -c release --minimal -o generate
 
 # 3. Build JUST the phonon target with the DYNAMIC CRT, and skip phonon_test (a CRT-fragile exe).
-cmake -DSTEAMAUDIO_STATIC_RUNTIME=OFF build/windows-vs2022-x64
-cmake --build build/windows-vs2022-x64 --config Release --target phonon
+#    Paths are relative to core/build — where you already are.
+cmake -DSTEAMAUDIO_STATIC_RUNTIME=OFF windows-vs2022-x64
+cmake --build windows-vs2022-x64 --config Release --target phonon
 ```
 
 > **CRT gotcha (the build's one trap).** phonon defaults to `STEAMAUDIO_STATIC_RUNTIME=ON` (`/MT`),

@@ -51,7 +51,8 @@ extern bool loadAsioDriver(char* name);
 namespace {
 struct Cal {
     long            bufsize;
-    ASIOBufferInfo  bi[BW_CHANNELS + 1];      /* 26 outputs + 1 mic input (last) */
+    int             nspk;                     /* the layout's speaker count; the mic rides slot [nspk] */
+    ASIOBufferInfo  bi[BW_CHANNELS + 1];      /* nspk outputs + 1 mic input (last) */
     ASIOChannelInfo ci[BW_CHANNELS + 1];
     ASIOCallbacks   cb;
     const float*    sweep;
@@ -66,7 +67,7 @@ static const float g_zero[1024] = { 0 };                     /* type-correct sil
 void buffer_switch(long index, ASIOBool) {
     int ac = g.active.load(std::memory_order_acquire);
     long n = g.bufsize;
-    for (int c = 0; c < BW_CHANNELS; ++c) {
+    for (int c = 0; c < g.nspk; ++c) {
         void* dst = g.bi[c].buffers[index];
         if (c == ac && g.play_pos < CAL_NSWEEP) {
             float blk[1024];                                 /* bufsize <= 1024 enforced at open */
@@ -79,7 +80,7 @@ void buffer_switch(long index, ASIOBool) {
     if (ac >= 0) {
         int rem = CAL_CAPLEN - g.cap_pos;
         long take = n < rem ? n : rem;
-        if (take > 0) asio_in_to_float(g.cap + g.cap_pos, g.bi[BW_CHANNELS].buffers[index], take, g.ci[BW_CHANNELS].type);
+        if (take > 0) asio_in_to_float(g.cap + g.cap_pos, g.bi[g.nspk].buffers[index], take, g.ci[g.nspk].type);
         g.play_pos += (int)n;
         g.cap_pos  += (int)n;
         if (g.cap_pos >= CAL_CAPLEN) g.done.store(1, std::memory_order_release);
@@ -93,14 +94,14 @@ long asio_msg(long s, long v, void*, double*) {
     if (s == kAsioEngineVersion) return 2; if (s == kAsioSupportsTimeInfo) return 1; return 0;
 }
 
-bool open_driver(const char* want, int mic_in) {
+bool open_driver(const char* want, int mic_in, int nspk) {
     char names[16][32], *ptr[16]; for (int i=0;i<16;++i) ptr[i]=names[i];
     auto tryone = [&](const char* nm)->bool {
         if (!loadAsioDriver((char*)nm)) return false;
         ASIODriverInfo di; memset(&di,0,sizeof di); di.asioVersion=2; di.sysRef=GetDesktopWindow();
         if (ASIOInit(&di) != ASE_OK) { asioDrivers->removeCurrentDriver(); return false; }
         long nin=0, nout=0;
-        if (ASIOGetChannels(&nin,&nout)!=ASE_OK || nout<BW_CHANNELS || nin<=mic_in) {
+        if (ASIOGetChannels(&nin,&nout)!=ASE_OK || nout<nspk || nin<=mic_in) {
             ASIOExit(); asioDrivers->removeCurrentDriver(); return false; }
         return true;
     };
@@ -111,11 +112,12 @@ bool open_driver(const char* want, int mic_in) {
 }
 } /* namespace */
 
-int calib_asio_open(const char* driver, int mic_in, const float* sweep, float* cap) {
+int calib_asio_open(const char* driver, int mic_in, int nspk, const float* sweep, float* cap) {
     if (mic_in < 0) { fprintf(stderr, "calib_capture: mic input channel must be >= 0 (got %d)\n", mic_in); return 1; }
+    if (nspk < 1 || nspk > BW_CHANNELS) { fprintf(stderr, "calib_capture: speaker count %d out of range\n", nspk); return 1; }
     if (!asio_session_acquire("the calibration sweep (Capture tab / bw_calibrate)")) return 1;
-    memset(&g, 0, sizeof g); g.active = -1; g.sweep = sweep; g.cap = cap;
-    if (!open_driver(driver, mic_in)) { fprintf(stderr, "calib_capture: no ASIO driver with >=26 out + the mic input\n"); asio_session_release(); return 1; }
+    memset(&g, 0, sizeof g); g.active = -1; g.sweep = sweep; g.cap = cap; g.nspk = nspk;
+    if (!open_driver(driver, mic_in, nspk)) { fprintf(stderr, "calib_capture: no ASIO driver with >=%d out + the mic input\n", nspk); asio_session_release(); return 1; }
     long bmin=0,bmax=0,bpref=0,bgran=0; ASIOGetBufferSize(&bmin,&bmax,&bpref,&bgran);
     long bs = bpref > 1024 ? 1024 : bpref;                    /* prefer <=1024 (blk[] in buffer_switch is 1024) */
     if (bs < bmin) bs = bmin;                                 /* honor the driver minimum ... */
@@ -126,12 +128,12 @@ int calib_asio_open(const char* driver, int mic_in, const float* sweep, float* c
     g.bufsize = bs;
     if (ASIOCanSampleRate((ASIOSampleRate)CAL_FS)!=ASE_OK || ASIOSetSampleRate((ASIOSampleRate)CAL_FS)!=ASE_OK) {
         fprintf(stderr, "calib_capture: driver cannot run at %.0f Hz\n", CAL_FS); ASIOExit(); asioDrivers->removeCurrentDriver(); asio_session_release(); return 1; }
-    for (int c = 0; c < BW_CHANNELS; ++c) { g.bi[c].isInput=ASIOFalse; g.bi[c].channelNum=c; }
-    g.bi[BW_CHANNELS].isInput=ASIOTrue;  g.bi[BW_CHANNELS].channelNum=mic_in;
+    for (int c = 0; c < nspk; ++c) { g.bi[c].isInput=ASIOFalse; g.bi[c].channelNum=c; }
+    g.bi[nspk].isInput=ASIOTrue;  g.bi[nspk].channelNum=mic_in;
     g.cb.bufferSwitch=&buffer_switch; g.cb.sampleRateDidChange=&rate_changed;
     g.cb.asioMessage=&asio_msg;       g.cb.bufferSwitchTimeInfo=&buffer_switch_ti;
-    for (int c = 0; c <= BW_CHANNELS; ++c) { g.ci[c].channel=g.bi[c].channelNum; g.ci[c].isInput=g.bi[c].isInput; ASIOGetChannelInfo(&g.ci[c]); }
-    if (ASIOCreateBuffers(g.bi, BW_CHANNELS+1, g.bufsize, &g.cb)!=ASE_OK) {
+    for (int c = 0; c <= nspk; ++c) { g.ci[c].channel=g.bi[c].channelNum; g.ci[c].isInput=g.bi[c].isInput; ASIOGetChannelInfo(&g.ci[c]); }
+    if (ASIOCreateBuffers(g.bi, nspk+1, g.bufsize, &g.cb)!=ASE_OK) {
         fprintf(stderr, "calib_capture: ASIOCreateBuffers failed\n"); ASIOExit(); asioDrivers->removeCurrentDriver(); asio_session_release(); return 1; }
     if (ASIOStart()!=ASE_OK) { fprintf(stderr, "calib_capture: ASIOStart failed\n"); ASIODisposeBuffers(); ASIOExit(); asioDrivers->removeCurrentDriver(); asio_session_release(); return 1; }
     return 0;

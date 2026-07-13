@@ -55,6 +55,7 @@
 #define BW_PARA_BANDS 4
 #define BW_PARA_TAU   0.060f          /* intensity/energy smoothing time (s) */
 static const float BW_PARA_XOVER[3] = { 200.f, 800.f, 3200.f };
+#define BW_BED_YAW_RATE 6.2831853f    /* bed-rotation glide (rad/s): one full turn per second */
 
 typedef struct { Cmd slots[RING_CAP]; _Atomic uint32_t write, read; } CmdRing;
 typedef struct { Evt slots[EVT_CAP];  _Atomic uint32_t write, read; } EvtRing;
@@ -109,8 +110,11 @@ typedef struct {
     float    dop_delay, dop_dtgt;            /* read delay + its smoothed target (2-pole, per-sample) */
     uint32_t dop_w;
     float    spread;                         /* source angular width 0..1 (0 = point); blends the pan gains */
-    float    spread_eff;                     /* last solve's EFFECTIVE spread (user, floored by near-listener
-                                              * widening) — the decor split follows it (audio-thread-owned) */
+    float    size_m;                         /* source METRIC radius (m; 0 = point): floors the spread at the
+                                              * angle the radius subtends from the listener, so physical size
+                                              * stays constant as the listener walks */
+    float    spread_eff;                     /* last solve's EFFECTIVE spread (user, floored by size + near-
+                                              * listener widening) — the decor split follows it (audio-thread) */
     float    dc_amp;                         /* decorrelated-split amplitude sqrt(spread*toggle), ramped (audio-thread) */
     /* equal-loudness distance compensation (opt-in): a one-pole LF shelf whose boost tracks the
      * distance attenuation, so an attenuated source keeps its body (ISO-226-motivated; audio-thread). */
@@ -126,6 +130,18 @@ typedef struct {
                                               * (click-free explicit stop; steal/destroy still hard-cut, see CMD_STOP) */
     uint8_t  seek_pending;
     uint64_t seek_pos;                       /* content frame to land on (in-memory sounds only) */
+    /* timed fade (CMD_FADE): gain_user glides toward fade_target at fade_rate per sample, re-dirtying
+     * the solve each block; on landing, optionally take the click-free stop path (audio-thread). */
+    float    fade_target, fade_rate;
+    uint8_t  fade_stop;
+    uint8_t  group;                          /* mix-group id (0 = default); scales the solve by group_gain */
+    /* pitch (CMD_SET_PITCH; in-memory sounds): fractional playback cursor. pitch is the target rate,
+     * pitch_cur glides per sample (a change BENDS, never steps); cur_frac is the read position's
+     * fractional part (cursor stays integer + frac — a long-lived voice never loses precision). */
+    float    pitch, pitch_cur, cur_frac;
+    /* bed yaw (CMD_BED_YAW): rotate a bed's soundfield about the room's vertical axis. yaw_cur glides
+     * toward yaw at BW_BED_YAW_RATE; mix_bed rotates the ±m SH pairs with a per-sample phasor. */
+    float    yaw, yaw_cur;
 } Voice;
 
 typedef struct {
@@ -236,6 +252,18 @@ struct RtCore {
     int      dc_on_blk, bed_param_blk;   /* this block's decor_on/bed_param, loaded ONCE in rt_render so
                                           * the zero/convolve gate and the mixers can never see a toggle
                                           * land mid-block and drop a block of the incoherent share */
+
+    /* master gain: one ramped scalar over the whole mix, applied pre-align (per-speaker trims and the
+     * raw channel-test signal stay calibrated; the limiter still guards the sum). */
+    _Atomic float master_gain;           /* target (control thread; default 1) */
+    float    master_g_cur;               /* per-block ramp state (audio-thread) */
+    /* global + per-group pause gates: ride pause_gate's existing ramp/freeze machinery. all_paused is
+     * an atomic loaded once per block; the group arrays are audio-thread-owned (set via commands). */
+    _Atomic int all_paused;
+    int      all_paused_blk;
+    float    group_gain[BW_GROUPS];      /* mix-group gain multipliers (default 1; CMD_GROUP_GAIN) */
+    uint8_t  group_paused[BW_GROUPS];    /* mix-group pause gates (CMD_GROUP_PAUSED) */
+    _Atomic uint32_t active_pub;         /* last block's active voice count (rt_active_voices readback) */
 
     /* output protection limiter (final stage, after align + test signal — everything passes through).
      * LINKED across channels: one gain from the block's cross-channel peak, so engaging never shifts
@@ -493,6 +521,7 @@ static void drain_commands(RtCore* c) {
             v->dir_cur = 1.f;                       /* on-axis/omni by default */
             v->air_a_cur = 1.f;                     /* air low-pass passthrough by default */
             v->ldc_g_cur = 1.f;                     /* loudness-comp shelf flat by default */
+            v->pitch = v->pitch_cur = 1.f;          /* native playback rate by default */
             v->refl_gain = 1.f;                     /* full wet-send level by default (gated by refl_send) */
             v->pause_g = 1.f;                       /* pause gate open (running) by default */
             v->eqg_cur[0] = v->eqg_cur[1] = v->eqg_cur[2] = 1.f;   /* flat EQ (history zeroed by memset) */
@@ -513,14 +542,46 @@ static void drain_commands(RtCore* c) {
         case CMD_SET_POS: { Voice* v = voice_for(c, cmd->handle);
             if (v) memcpy(v->pos_pending, &cmd->u.pos, sizeof v->pos_pending); } break;
         case CMD_SET_GAIN: { Voice* v = voice_for(c, cmd->handle);
-            if (v) { v->gain_user = cmd->u.gain.g; v->dirty = true; } } break;
+            if (v) { v->gain_user = cmd->u.gain.g; v->dirty = true;
+                     v->fade_rate = 0.f; v->fade_stop = 0; } } break;   /* an explicit set cancels a fade */
+        case CMD_FADE: { Voice* v = voice_for(c, cmd->handle);
+            if (v) {
+                float tgt = cmd->u.fade.target < 0.f ? 0.f : cmd->u.fade.target;
+                if (cmd->u.fade.seconds <= 0.f || tgt == v->gain_user) {   /* instant (or already there) */
+                    v->gain_user = tgt; v->dirty = true;
+                    v->fade_rate = 0.f; v->fade_stop = 0;
+                    if (cmd->u.fade.stop && v->playing && v->stopping != 2) v->stopping = 1;
+                } else {
+                    v->fade_target = tgt;
+                    v->fade_rate   = (tgt - v->gain_user) / (cmd->u.fade.seconds * (float)c->sample_rate);
+                    v->fade_stop   = cmd->u.fade.stop;
+                }
+            } } break;
+        case CMD_SET_GROUP: { Voice* v = voice_for(c, cmd->handle);
+            if (v) { v->group = cmd->u.group.id < BW_GROUPS ? cmd->u.group.id : 0; v->dirty = true; } } break;
+        case CMD_GROUP_GAIN: {
+            uint8_t id = cmd->u.ggain.id;
+            if (id < BW_GROUPS) {
+                c->group_gain[id] = cmd->u.ggain.gain < 0.f ? 0.f : cmd->u.ggain.gain;
+                for (uint32_t i = 0; i < c->voice_cap; ++i)          /* the group's voices re-solve (ramped) */
+                    if (c->voices[i].active && c->voices[i].group == id) c->voices[i].dirty = true;
+            } } break;
+        case CMD_GROUP_PAUSED: {
+            uint8_t id = cmd->u.gpause.id;
+            if (id < BW_GROUPS) c->group_paused[id] = cmd->u.gpause.on;   /* pause_gate ramps/freezes */
+            } break;
+        case CMD_SET_PITCH: { Voice* v = voice_for(c, cmd->handle);
+            if (v) { float r2 = cmd->u.pitch.rate;
+                     v->pitch = r2 < 0.25f ? 0.25f : (r2 > 4.f ? 4.f : r2); } } break;   /* mixer glides */
+        case CMD_BED_YAW: { Voice* v = voice_for(c, cmd->handle);
+            if (v) v->yaw = cmd->u.byaw.yaw; } break;                     /* mix_bed glides toward it */
         case CMD_PLAY: { Voice* v = voice_for(c, cmd->handle);
             const SoundData* s = sound_for(c, cmd->u.play.sound);
             if (v && s) {
                 if (s->stream)                       /* one voice per stream: the ring is SPSC. Detach any OTHER */
                     for (uint32_t j = 0; j < c->voice_cap; ++j)   /* voice on this stream so two consumers can't corrupt it */
                         if (&c->voices[j] != v && c->voices[j].sound == s) { c->voices[j].playing = false; c->voices[j].sound = NULL; }
-                v->sound = s; v->cursor = 0; v->stream_pos = 0; v->loop = cmd->u.play.loop != 0;
+                v->sound = s; v->cursor = 0; v->cur_frac = 0.f; v->stream_pos = 0; v->loop = cmd->u.play.loop != 0;
                           v->oneshot = cmd->u.play.oneshot != 0; v->playing = true; v->dirty = true;
                           v->start_sample = cmd->u.play.start;  /* 0 = now; else hold output until this dsp-sample */
                           v->refl_g_cur = 0.f;                  /* fresh start: ramp the wet send up from 0, no stale burst */
@@ -573,6 +634,8 @@ static void drain_commands(RtCore* c) {
             break;
         case CMD_SET_SPREAD: { Voice* v = voice_for(c, cmd->handle);
             if (v) { float a = cmd->u.spread.amount; v->spread = a < 0.f ? 0.f : (a > 1.f ? 1.f : a); v->dirty = true; } } break;
+        case CMD_SET_SIZE: { Voice* v = voice_for(c, cmd->handle);
+            if (v) { float rad = cmd->u.size.radius; v->size_m = rad < 0.f ? 0.f : rad; v->dirty = true; } } break;
         case CMD_TEST_SIGNAL: {
             uint32_t ch = cmd->u.test.channel;
             if (ch < c->channels) { c->test_kind[ch] = cmd->u.test.kind; c->test_gain[ch] = cmd->u.test.gain; }
@@ -731,7 +794,7 @@ static void panner_gains(RtCore* c, int p, const float src[3], float user_gain, 
  * attenuation is untouched; the sum is renormalised to the point solve's power P (widening never
  * re-levels). At spread->0 the ring collapses onto the source direction and the result IS the point
  * solve, so the two spread modes meet continuously. 12 extra panner solves, per-block + dirty-gated. */
-static void mdap_gains(RtCore* c, int p, const Voice* v, float spread, float* g) {
+static void mdap_gains(RtCore* c, int p, const Voice* v, float spread, float user_gain, float* g) {
     float d[3] = { v->pos_active[0]-c->lis.p_active[0], v->pos_active[1]-c->lis.p_active[1], v->pos_active[2]-c->lis.p_active[2] };
     float dl = sqrtf(d[0]*d[0] + d[1]*d[1] + d[2]*d[2]);
     if (dl < 1e-6f) return;                              /* source on the listener: no direction to spread around */
@@ -761,7 +824,7 @@ static void mdap_gains(RtCore* c, int p, const Voice* v, float spread, float* g)
             float pos[3];
             for (int k = 0; k < 3; ++k)
                 pos[k] = c->lis.p_active[k] + dl * (ca * d[k] + sa * (cp * u[k] + sp * w[k]));
-            panner_gains(c, p, pos, v->gain_user, gd);
+            panner_gains(c, p, pos, user_gain, gd);
             for (uint32_t k = 0; k < c->channels; ++k) acc[k] += gd[k];
         }
     }
@@ -775,9 +838,10 @@ static void mdap_gains(RtCore* c, int p, const Voice* v, float spread, float* g)
  * position change and dirties all voices on a listener move (gains are listener-relative). A bed
  * voice (multi-channel asset) has no DBAP position — its master gain rides gtarget[0]. */
 static void compute_gains(RtCore* c, Voice* v) {
-    if (v->sound && v->sound->channels > 1) { v->gtarget[0] = v->gain_user; return; }
+    const float ug = v->gain_user * c->group_gain[v->group];   /* mix-group gain folds into the solve */
+    if (v->sound && v->sound->channels > 1) { v->gtarget[0] = ug; return; }
     int p = atomic_load_explicit(&c->panner, memory_order_acquire);
-    panner_gains(c, p, v->pos_active, v->gain_user, v->gtarget);
+    panner_gains(c, p, v->pos_active, ug, v->gtarget);
 
     /* multi-listener compromise (rt_set_extra_listeners): solve the same point for each extra
      * listener (each with its own SPCAP/VBAP cache) and take the per-speaker ENERGY MEAN — the L2
@@ -791,29 +855,38 @@ static void compute_gains(RtCore* c, Voice* v) {
         float gx[BW_CHANNELS];
         for (uint8_t j = 0; j < nex; ++j) {
             panner_gains_at(c, p, c->lis.ex_active[j], &c->spcap_x[j], &c->vbap_x[j],
-                            v->pos_active, v->gain_user, gx);
+                            v->pos_active, ug, gx);
             for (uint32_t k = 0; k < c->channels; ++k) acc[k] += (double)gx[k] * gx[k];
         }
         const double inv = 1.0 / (double)(nex + 1);
         for (uint32_t k = 0; k < c->channels; ++k) v->gtarget[k] = (float)sqrt(acc[k] * inv);
     }
 
-    /* effective spread: the user's width, floored by NEAR-LISTENER widening (rt_set_near_spread) —
-     * an approaching source subtends a growing angle, so it widens instead of collapsing into the
-     * nearest speaker and snapping across the head as it passes through. The decor split follows
-     * spread_eff, so the widened part decorrelates too when enabled. */
+    /* effective spread: the user's angular width, floored by the source's METRIC size (the angle its
+     * radius subtends from the listener — physical size stays constant as the listener walks, and a
+     * source that engulfs the listener goes fully wide) and by the engine-wide NEAR-LISTENER widening
+     * policy (rt_set_near_spread; a per-source size subsumes it for sized sources). The decor split
+     * follows spread_eff, so the widened part decorrelates too when enabled. */
     float s_eff = v->spread; if (s_eff > 1.f) s_eff = 1.f; else if (s_eff < 0.f) s_eff = 0.f;
     const float nearR = atomic_load_explicit(&c->near_spread, memory_order_relaxed);
-    if (nearR > 0.f) {
+    if (v->size_m > 0.f || nearR > 0.f) {
         float dx = v->pos_active[0]-c->lis.p_active[0], dy = v->pos_active[1]-c->lis.p_active[1],
               dz = v->pos_active[2]-c->lis.p_active[2];
-        float s_near = 1.f - sqrtf(dx*dx + dy*dy + dz*dz) / nearR;
-        if (s_near > s_eff) s_eff = s_near > 1.f ? 1.f : s_near;
+        float dist = sqrtf(dx*dx + dy*dy + dz*dz);
+        if (v->size_m > 0.f) {
+            float ratio  = dist > 1e-6f ? v->size_m / dist : 2.f;
+            float s_size = ratio >= 1.f ? 1.f : asinf(ratio) * 0.636619772f;   /* subtended half-angle / (pi/2) */
+            if (s_size > s_eff) s_eff = s_size;
+        }
+        if (nearR > 0.f) {
+            float s_near = 1.f - dist / nearR;
+            if (s_near > s_eff) s_eff = s_near > 1.f ? 1.f : s_near;
+        }
     }
     v->spread_eff = s_eff;
     if (s_eff > 1e-3f) {                                     /* widen the image if this source has size */
         if (atomic_load_explicit(&c->spread_mode, memory_order_acquire) == 1)
-            mdap_gains(c, p, v, s_eff, v->gtarget);
+            mdap_gains(c, p, v, s_eff, ug, v->gtarget);
         else
             spread_gains(c, v, s_eff, v->gtarget);
     }
@@ -840,7 +913,8 @@ static void compute_gains(RtCore* c, Voice* v) {
  * whole block (invariant 4); a pending seek lands only once the gate is silent, so a seek on a
  * running voice is ramp-out -> jump -> ramp-in and never clicks. */
 static int pause_gate(RtCore* c, Voice* v, uint16_t idx, uint32_t n, float* pg, float* pg_step) {
-    float tgt = (v->paused || v->seek_pending || v->stopping) ? 0.f : 1.f;
+    float tgt = (v->paused || c->all_paused_blk || c->group_paused[v->group] ||
+                 v->seek_pending || v->stopping) ? 0.f : 1.f;
     if (v->pause_g == 0.f && tgt == 0.f) {
         if (v->stopping) {                           /* faded to silence: finalize the stop/steal */
             uint8_t how = v->stopping; v->stopping = 0; v->playing = false;
@@ -857,6 +931,7 @@ static int pause_gate(RtCore* c, Voice* v, uint16_t idx, uint32_t n, float* pg, 
             if (snd->frames == 0) f = 0;
             else if (f >= snd->frames) f = v->loop ? (f % snd->frames) : snd->frames;  /* wrap, or end naturally */
             v->cursor = (uint32_t)f;
+            v->cur_frac = 0.f;                       /* the fractional cursor lands with it */
             v->seek_pending = 0;
             if (!v->paused) tgt = 1.f;               /* not paused: ramp back in this block */
         }
@@ -1012,9 +1087,17 @@ static void mix_voice(RtCore* c, Voice* v, uint16_t idx, float* bus, uint32_t n,
         if (use_dc) c->dc_wrote = 1;
     }
 
+    /* pitch (in-memory sounds only): fractional-cursor linear-interp resample. The rate glides per
+     * sample so a change BENDS the pitch rather than stepping it; settled at exactly 1 the integer
+     * path runs untouched. Streams can't resample (the ring is sequential) — pitch is ignored there. */
+    const int streaming_pre = (snd->stream != NULL);
+    const int use_pitch = !streaming_pre && (v->pitch != 1.f || v->pitch_cur != 1.f);
+    float pit = v->pitch_cur;
+    const float pit_step = use_pitch ? (v->pitch - v->pitch_cur) / (float)nr : 0.f;
+
     /* streaming sounds: pull this block's mono samples from the background ring (no I/O on the audio
      * thread). want covers [start, n); a short pull (underrun or EOF) leaves the tail silent. */
-    const int streaming = (snd->stream != NULL);
+    const int streaming = streaming_pre;
     uint32_t strm_got = 0;
     if (streaming) {
         uint32_t want = (start < n) ? (n - start) : 0;
@@ -1059,10 +1142,17 @@ static void mix_voice(RtCore* c, Voice* v, uint16_t idx, float* bus, uint32_t n,
     for (uint32_t i = 0; i < n; ++i) {
         if (i < start) continue;               /* scheduled start: this voice stays silent (and frozen) until the in-block offset */
         if (!streaming && cur >= snd->frames) {
-            if (v->loop) cur = 0;
+            if (v->loop) do { cur -= snd->frames; } while (cur >= snd->frames);   /* pitch can overshoot the seam */
             else         ended = true;
         }
-        float s = streaming ? c->stream_scratch[i] : (ended ? 0.f : snd->pcm[cur]);
+        float s;
+        if (streaming)      s = c->stream_scratch[i];
+        else if (ended)     s = 0.f;
+        else if (use_pitch) {                  /* linear interp between cur and its successor */
+            uint32_t i2 = cur + 1;
+            if (i2 >= snd->frames) i2 = v->loop ? 0 : snd->frames - 1;
+            s = snd->pcm[cur] + v->cur_frac * (snd->pcm[i2] - snd->pcm[cur]);
+        } else s = snd->pcm[cur];
         s *= pg;                                               /* pause/seek gate (also gates the sends below) */
         const float s_raw = s;                                 /* pre-occlusion source, for the indirect (pathing) field */
         if (v->eq_engaged) {                                    /* 3 biquads (DF-I), coeffs interpolated per sample */
@@ -1094,7 +1184,12 @@ static void mix_voice(RtCore* c, Voice* v, uint16_t idx, float* bus, uint32_t n,
             v->dop_dtgt  += (dop_ds      - v->dop_dtgt)  * dop_k;   /* 2-pole, per sample: smooth the target ... */
             v->dop_delay += (v->dop_dtgt - v->dop_delay) * dop_k;   /* ... then the read delay -> continuous rate */
         }
-        if (!streaming && !ended) ++cur;
+        if (!streaming && !ended) {
+            if (use_pitch) {
+                v->cur_frac += pit; pit += pit_step;
+                while (v->cur_frac >= 1.f) { v->cur_frac -= 1.f; ++cur; }
+            } else ++cur;
+        }
         pg += pg_step;
         v->occ_cur += occ_step;
         v->dir_cur += dir_step;
@@ -1134,6 +1229,7 @@ static void mix_voice(RtCore* c, Voice* v, uint16_t idx, float* bus, uint32_t n,
         }
     }
     v->cursor = cur;
+    if (use_pitch) v->pitch_cur = v->pitch;                     /* land the rate glide exactly */
     if (path_on) for (uint32_t k = 0; k < pac; ++k) v->path_sh_cur[k] = path_tgt[k];   /* land exactly */
     if (path_on && v->path_eq_engaged) {                        /* land the pathing-EQ coeffs; bypass once settled flat */
         for (int b = 0; b < 3; ++b) for (int k = 0; k < 5; ++k) v->path_eq_co[b][k] = pco_tgt[b][k];
@@ -1174,6 +1270,23 @@ static void mix_voice(RtCore* c, Voice* v, uint16_t idx, float* bus, uint32_t n,
     }
 }
 
+/* Rotate real ACN/SN3D SH coefficients about the vertical (ambi z / room +y) axis: each degree's
+ * ±m pair rotates as a 2D vector by m*yaw (the closed form yaw-only rotation — no Wigner matrices).
+ * cm/sm are cos/sin of {yaw, 2yaw, 3yaw}; positive yaw turns the FIELD from room +z (front) toward
+ * room +x. Zonal (m = 0) channels are untouched. */
+static void bed_rotate_z(const float* sh, int nch, const float cm[3], const float sm[3], float* out) {
+    for (int k = 0; k < nch; ++k) out[k] = sh[k];
+    const int maxl = nch >= 16 ? 3 : (nch >= 9 ? 2 : 1);
+    for (int l = 1; l <= maxl; ++l)
+        for (int m = 1; m <= l; ++m) {
+            const int kp = l*l + l + m, kn = l*l + l - m;   /* cos(m·az) / sin(m·az) components */
+            const float cp = sh[kp], cn = sh[kn];
+            /* a source at azimuth a moves to a + yaw: cos(m(a+yaw)) / sin(m(a+yaw)) expansions */
+            out[kp] = cm[m-1] * cp - sm[m-1] * cn;
+            out[kn] = sm[m-1] * cp + cm[m-1] * cn;
+        }
+}
+
 /* Mix an ambisonic BED voice: decode its SH channels straight onto the 26-ch bus through the static
  * decode matrix (world-locked — no DBAP, occlusion, or directivity), with a master-gain ramp on
  * gcur[0]. Looping / natural end / oneshot-ack are identical to mix_voice.
@@ -1196,6 +1309,21 @@ static void mix_bed(RtCore* c, Voice* v, uint16_t idx, float* bus, uint32_t n, u
     ParaBed* pb = &c->para[idx];
     const int want_p  = nch >= 4 && c->bed_param_blk;     /* the block's single load (rt_render) */
     const int use_p   = want_p || pb->mix > 0.f;
+    /* bed yaw (rt_bed_set_rotation): glide toward the target at BW_BED_YAW_RATE and rotate the field
+     * with a per-sample phasor recurrence (no per-sample trig; m = 2,3 by angle addition). Rotation
+     * happens BEFORE either renderer, so the matrix decode and the parametric analysis see the same
+     * turned field. Settled at 0 -> fully bypassed. */
+    const int use_rot = v->yaw != 0.f || v->yaw_cur != 0.f;
+    float rc1 = 1.f, rs1 = 0.f, rdc = 1.f, rds = 0.f;
+    if (use_rot) {
+        const float dmax = BW_BED_YAW_RATE * (float)nr / (float)c->sample_rate;
+        float dtot = v->yaw - v->yaw_cur;
+        if (dtot > dmax) dtot = dmax; else if (dtot < -dmax) dtot = -dmax;
+        const float dphi = dtot / (float)nr;
+        rc1 = cosf(v->yaw_cur); rs1 = sinf(v->yaw_cur);
+        rdc = cosf(dphi); rds = sinf(dphi);
+        v->yaw_cur += dtot;                               /* land this block's glide */
+    }
     uint32_t cur = v->cursor;
     bool ended = false;
 
@@ -1205,6 +1333,14 @@ static void mix_bed(RtCore* c, Voice* v, uint16_t idx, float* bus, uint32_t n, u
             if (cur >= snd->frames) { if (v->loop) cur = 0; else ended = true; }
             if (!ended) {
                 const float* sh = &snd->pcm[(size_t)cur * nch];
+                float shr[BW_AMBI_CH];
+                if (use_rot) {                     /* turn the field, then advance the yaw phasor */
+                    const float cm[3] = { rc1, rc1*rc1 - rs1*rs1, rc1*(rc1*rc1 - rs1*rs1) - rs1*(2.f*rc1*rs1) };
+                    const float sm[3] = { rs1, 2.f*rc1*rs1,       rs1*(rc1*rc1 - rs1*rs1) + rc1*(2.f*rc1*rs1) };
+                    bed_rotate_z(sh, nch, cm, sm, shr);
+                    sh = shr;
+                    const float t = rc1*rdc - rs1*rds; rs1 = rs1*rdc + rc1*rds; rc1 = t;
+                }
                 const float g = v->gcur[0] * pg;   /* master gain x the pause/seek gate */
                 for (uint32_t s = 0; s < c->channels; ++s) {
                     const float* D = c->bed_decode[s];
@@ -1263,6 +1399,14 @@ static void mix_bed(RtCore* c, Voice* v, uint16_t idx, float* bus, uint32_t n, u
             if (cur >= snd->frames) { if (v->loop) cur = 0; else ended = true; }
             if (!ended) {
                 const float* sh = &snd->pcm[(size_t)cur * nch];
+                float shr[BW_AMBI_CH];
+                if (use_rot) {                         /* turn the field before EITHER renderer sees it */
+                    const float cm[3] = { rc1, rc1*rc1 - rs1*rs1, rc1*(rc1*rc1 - rs1*rs1) - rs1*(2.f*rc1*rs1) };
+                    const float sm[3] = { rs1, 2.f*rc1*rs1,       rs1*(rc1*rc1 - rs1*rs1) + rc1*(2.f*rc1*rs1) };
+                    bed_rotate_z(sh, nch, cm, sm, shr);
+                    sh = shr;
+                    const float t = rc1*rdc - rs1*rds; rs1 = rs1*rdc + rc1*rds; rc1 = t;
+                }
                 const float g = v->gcur[0] * pg;
                 if (run_matrix) {                      /* matrix share of the crossfade */
                     const float gm = g * (1.f - pmix);
@@ -1466,6 +1610,8 @@ void rt_render(RtCore* c, float* bus, uint32_t nframes, const BwTimestamp* ts) {
      * incoherent share into a bus that never gets convolved. */
     c->dc_on_blk     = atomic_load_explicit(&c->decor_on,  memory_order_acquire);
     c->bed_param_blk = atomic_load_explicit(&c->bed_param, memory_order_acquire);
+    c->all_paused_blk = atomic_load_explicit(&c->all_paused, memory_order_acquire);   /* one load: every
+                                                                                       * gate agrees this block */
     const int dc_live = c->dc_on_blk || c->bed_param_blk || c->dc_tail > 0;
     if (dc_live) memset(c->dc_bus, 0, sizeof(float) * (size_t)c->channels * nframes);
     c->dc_wrote = 0;
@@ -1483,12 +1629,25 @@ void rt_render(RtCore* c, float* bus, uint32_t nframes, const BwTimestamp* ts) {
             if (d >= nframes) continue;                /* starts in a later block: nothing to mix yet */
             off = (uint32_t)d;
         }
+        if (v->fade_rate != 0.f) {                     /* timed fade: glide gain_user, re-solve each block
+                                                        * (the per-channel gcur ramp keeps it click-free) */
+            v->gain_user += v->fade_rate * (float)nframes;
+            if ((v->fade_rate > 0.f && v->gain_user >= v->fade_target) ||
+                (v->fade_rate < 0.f && v->gain_user <= v->fade_target)) {
+                v->gain_user = v->fade_target;         /* land exactly */
+                v->fade_rate = 0.f;
+                if (v->fade_stop) { v->fade_stop = 0;
+                    if (v->playing && v->stopping != 2) v->stopping = 1; }   /* click-free stop path */
+            }
+            v->dirty = true;
+        }
         if (v->dirty) { compute_gains(c, v); v->dirty = false; }
         if (v->sound->channels > 1) mix_bed  (c, v, (uint16_t)i, bus, nframes, off);        /* ambisonic bed */
         else                        mix_voice(c, v, (uint16_t)i, bus, nframes, off, aux);   /* mono point source */
     }
     BW_ZONE_END(zmix);
     BW_PLOT("rt voices", rt_active);
+    atomic_store_explicit(&c->active_pub, (uint32_t)rt_active, memory_order_relaxed);   /* rt_active_voices */
     /* decorrelation: convolve the decor bus through each channel's sparse velvet filter into the main
      * bus. Runs while anything wrote this block, plus one filter-length of flush so the tail rings
      * out; on going idle the history is wiped, so a later re-engage can never replay stale samples. */
@@ -1529,6 +1688,21 @@ void rt_render(RtCore* c, float* bus, uint32_t nframes, const BwTimestamp* ts) {
         BW_ZONE_BEGIN(zp, "path tap");
         path_tap(c->path_tap_ud, bus, nframes, c->lis.p_active, c->lis.q_active, c->path_accum, c->path_ambi_ch);
         BW_ZONE_END(zp);
+    }
+    /* master gain: one ramped scalar over everything mixed so far (voices, beds, reverb/path taps),
+     * applied PRE-align so the per-speaker trims and the raw channel-test signal stay calibrated.
+     * Skipped entirely while settled at unity. */
+    {
+        const float mg_tgt = atomic_load_explicit(&c->master_gain, memory_order_relaxed);
+        if (mg_tgt != 1.f || c->master_g_cur != 1.f) {
+            const float step = (mg_tgt - c->master_g_cur) / (float)nframes;
+            for (uint32_t ch = 0; ch < c->channels; ++ch) {
+                float g = c->master_g_cur;
+                float* p = &bus[(size_t)ch * nframes];
+                for (uint32_t i = 0; i < nframes; ++i) { p[i] *= g; g += step; }
+            }
+            c->master_g_cur = mg_tgt;                  /* land exactly */
+        }
     }
     room_eq_track(c);                          /* tracked room EQ: re-aim the align biquads at the pose */
     BW_ZONE_BEGIN(za, "align");
@@ -1757,6 +1931,59 @@ void rt_source_set_doppler(RtCore* c, uint32_t h, bool on) {
 void rt_source_set_air_absorption(RtCore* c, uint32_t h, bool on) {
     Cmd cmd = { .type = CMD_SET_AIR, .handle = h };
     cmd.u.air.on = on ? 1u : 0u;
+    cmd_push(&c->cmds, &cmd);
+}
+
+void rt_source_set_size(RtCore* c, uint32_t h, float radius_m) {
+    if (!c) return;
+    Cmd cmd = { .type = CMD_SET_SIZE, .handle = h };
+    cmd.u.size.radius = radius_m;
+    cmd_push(&c->cmds, &cmd);
+}
+
+void rt_source_fade_to(RtCore* c, uint32_t h, float gain, float seconds, bool stop_at_end) {
+    if (!c) return;
+    Cmd cmd = { .type = CMD_FADE, .handle = h };
+    cmd.u.fade.target  = gain;
+    cmd.u.fade.seconds = seconds;
+    cmd.u.fade.stop    = stop_at_end ? 1 : 0;
+    cmd_push(&c->cmds, &cmd);
+}
+
+void rt_source_set_pitch(RtCore* c, uint32_t h, float rate) {
+    if (!c) return;
+    Cmd cmd = { .type = CMD_SET_PITCH, .handle = h };
+    cmd.u.pitch.rate = rate;
+    cmd_push(&c->cmds, &cmd);
+}
+
+void rt_bed_set_rotation(RtCore* c, uint32_t h, float yaw_rad) {
+    if (!c) return;
+    Cmd cmd = { .type = CMD_BED_YAW, .handle = h };
+    cmd.u.byaw.yaw = yaw_rad;
+    cmd_push(&c->cmds, &cmd);
+}
+
+void rt_source_set_group(RtCore* c, uint32_t h, uint32_t group) {
+    if (!c) return;
+    Cmd cmd = { .type = CMD_SET_GROUP, .handle = h };
+    cmd.u.group.id = group < BW_GROUPS ? (uint8_t)group : 0;
+    cmd_push(&c->cmds, &cmd);
+}
+
+void rt_group_set_gain(RtCore* c, uint32_t group, float linear) {
+    if (!c || group >= BW_GROUPS) return;
+    Cmd cmd = { .type = CMD_GROUP_GAIN, .handle = 0 };
+    cmd.u.ggain.id = (uint8_t)group;
+    cmd.u.ggain.gain = linear;
+    cmd_push(&c->cmds, &cmd);
+}
+
+void rt_group_set_paused(RtCore* c, uint32_t group, bool paused) {
+    if (!c || group >= BW_GROUPS) return;
+    Cmd cmd = { .type = CMD_GROUP_PAUSED, .handle = 0 };
+    cmd.u.gpause.id = (uint8_t)group;
+    cmd.u.gpause.on = paused ? 1 : 0;
     cmd_push(&c->cmds, &cmd);
 }
 
@@ -2024,6 +2251,9 @@ RtCore* rt_create(uint32_t req_voice_cap, uint32_t sound_cap, uint32_t sample_ra
     c->lis.q_pending[3] = 1.0f;
     c->readback.q[3]    = 1.0f;        /* readback identity until the first block publishes */
     atomic_store_explicit(&c->room_eq_dyn, 1, memory_order_relaxed);   /* tracked room EQ: on when a grid is present */
+    atomic_store_explicit(&c->master_gain, 1.f, memory_order_relaxed);
+    c->master_g_cur = 1.f;
+    for (int j = 0; j < BW_GROUPS; ++j) c->group_gain[j] = 1.f;        /* mix groups start at unity, unpaused */
     /* protection limiter: ON at -1 dBFS by default; ~1 ms attack / ~120 ms release one-poles */
     atomic_store_explicit(&c->lim_on, 1, memory_order_relaxed);
     atomic_store_explicit(&c->lim_ceiling, 0.891251f, memory_order_relaxed);   /* 10^(-1/20) */
@@ -2118,6 +2348,25 @@ void rt_set_pose_prediction(RtCore* c, float lead_s) {
     if (!c) return;
     if (lead_s < 0.f) lead_s = 0.f; else if (lead_s > 0.2f) lead_s = 0.2f;   /* a lead past ~200 ms is overshoot, not latency hiding */
     atomic_store_explicit(&c->pred_lead, lead_s, memory_order_relaxed);
+}
+
+/* Master gain: one ramped scalar over the whole mix (pre-align). Live-safe atomic; the render ramps
+ * toward it across the block, so a slider drag never zippers. */
+void rt_set_master_gain(RtCore* c, float linear) {
+    if (!c) return;
+    if (linear < 0.f) linear = 0.f;
+    atomic_store_explicit(&c->master_gain, linear, memory_order_relaxed);
+}
+
+/* Global pause: every voice's pause_gate ramps out and freezes its playhead (memory/stream/bed alike);
+ * resume continues exactly. Paused voices still read as playing, like per-voice pause. Live. */
+void rt_set_all_paused(RtCore* c, int paused) {
+    if (!c) return;
+    atomic_store_explicit(&c->all_paused, paused ? 1 : 0, memory_order_release);
+}
+
+uint32_t rt_active_voices(RtCore* c) {
+    return c ? atomic_load_explicit(&c->active_pub, memory_order_relaxed) : 0;
 }
 
 /* Near-listener widening: floor every source's spread at 1 - dist/radius. 0 disables (default).

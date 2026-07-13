@@ -31,7 +31,8 @@ struct SteamPath {
     IPLProbeBatch probes;        /* OWNED: probes carrying the baked visibility graph */
     IPLAmbisonicsDecodeEffect dec;  /* OWNED: ambisonic path field -> 26 speakers (custom layout, panning) */
     IPLVector3   spk[BW_CHANNELS];
-    float*       out26;          /* BW_CHANNELS * n decode scratch */
+    float*       out26;          /* channels * n decode scratch */
+    uint32_t     channels;       /* the layout's speaker count (<= BW_CHANNELS capacity) */
     uint32_t     order, ambi_ch, n, sample_rate;
 
     CRITICAL_SECTION lock;
@@ -51,9 +52,9 @@ static void cs_at(IPLCoordinateSpace3* cs, const float o[3]) {
  * reflection bake: translation column = the probe CENTRE, basis lengths = the box (radius = min/2). */
 static int do_path_bake(SteamPath* sp, const Layout* L) {
     float xmin=1e30f,xmax=-1e30f,zmin=1e30f,zmax=-1e30f,ysum=0.f;
-    for (uint32_t s=0;s<BW_CHANNELS;++s){ const float* p=L->speakers[s].pos;
+    for (uint32_t s=0;s<L->count;++s){ const float* p=L->speakers[s].pos;
         if(p[0]<xmin)xmin=p[0]; if(p[0]>xmax)xmax=p[0]; if(p[2]<zmin)zmin=p[2]; if(p[2]>zmax)zmax=p[2]; ysum+=p[1]; }
-    const float head = ysum/(float)BW_CHANNELS;
+    const float head = ysum/(float)L->count;
     xmin-=PATH_MARGIN; xmax+=PATH_MARGIN; zmin-=PATH_MARGIN; zmax+=PATH_MARGIN;
 
     if (iplProbeBatchCreate(sp->ctx, &sp->probes) != IPL_STATUS_SUCCESS) return 0;
@@ -167,13 +168,13 @@ void steam_path_tap(void* ud, float* bus, uint32_t n, const float* lp, const flo
     if (ambi_ch > sp->ambi_ch) ambi_ch = sp->ambi_ch;
     float* ambP[BW_AMBI_CH]; for (uint32_t k=0;k<ambi_ch;++k) ambP[k] = (float*)(ambi + (size_t)k * n);
     IPLAudioBuffer ab = { .numChannels = (IPLint32)ambi_ch, .numSamples = (IPLint32)n, .data = ambP };
-    float* outP[BW_CHANNELS]; for (uint32_t s=0;s<BW_CHANNELS;++s) outP[s] = sp->out26 + (size_t)s * n;
-    IPLAudioBuffer o26 = { .numChannels = (IPLint32)BW_CHANNELS, .numSamples = (IPLint32)n, .data = outP };
+    float* outP[BW_CHANNELS]; for (uint32_t s=0;s<sp->channels;++s) outP[s] = sp->out26 + (size_t)s * n;
+    IPLAudioBuffer o26 = { .numChannels = (IPLint32)sp->channels, .numSamples = (IPLint32)n, .data = outP };
     IPLAmbisonicsDecodeEffectParams dp; memset(&dp,0,sizeof dp);
     dp.order = (IPLint32)sp->order; dp.hrtf = NULL; dp.binaural = IPL_FALSE;
     cs_at(&dp.orientation, (float[3]){0,0,0});
     iplAmbisonicsDecodeEffectApply(sp->dec, &dp, &ab, &o26);
-    for (uint32_t s=0;s<BW_CHANNELS;++s) for (uint32_t i=0;i<n;++i) bus[(size_t)s*n+i] += sp->out26[(size_t)s*n+i];
+    for (uint32_t s=0;s<sp->channels;++s) for (uint32_t i=0;i<n;++i) bus[(size_t)s*n+i] += sp->out26[(size_t)s*n+i];
 }
 
 static DWORD WINAPI sim_thread(LPVOID arg) {
@@ -221,7 +222,8 @@ SteamPath* steam_path_create(SteamScene* scene, RtCore* rt, const Layout* L,
 
     if (do_path_bake(sp, L) == 0) goto fail;
 
-    for (uint32_t s = 0; s < BW_CHANNELS; ++s) {       /* speaker dirs in phonon's cartesian frame (== room),
+    sp->channels = L->count;                           /* the layout's speaker count (<= BW_CHANNELS cap) */
+    for (uint32_t s = 0; s < sp->channels; ++s) {      /* speaker dirs in phonon's cartesian frame (== room),
                                                         * from the layout's nominal listening point */
         float p[3] = { L->speakers[s].pos[0] - L->ref[0], L->speakers[s].pos[1] - L->ref[1],
                        L->speakers[s].pos[2] - L->ref[2] };
@@ -231,11 +233,11 @@ SteamPath* steam_path_create(SteamScene* scene, RtCore* rt, const Layout* L,
     IPLAudioSettings as; memset(&as,0,sizeof as); as.samplingRate=(IPLint32)sample_rate; as.frameSize=(IPLint32)block;
     IPLAmbisonicsDecodeEffectSettings ds; memset(&ds,0,sizeof ds);
     ds.speakerLayout.type = IPL_SPEAKERLAYOUTTYPE_CUSTOM;
-    ds.speakerLayout.numSpeakers = (IPLint32)BW_CHANNELS;
+    ds.speakerLayout.numSpeakers = (IPLint32)sp->channels;
     ds.speakerLayout.speakers = sp->spk;
     ds.hrtf = NULL; ds.maxOrder = (IPLint32)order;
     if (iplAmbisonicsDecodeEffectCreate(sp->ctx, &as, &ds, &sp->dec) != IPL_STATUS_SUCCESS) goto fail;
-    sp->out26 = (float*)calloc((size_t)BW_CHANNELS * block, sizeof(float));
+    sp->out26 = (float*)calloc((size_t)sp->channels * block, sizeof(float));
     if (!sp->out26) goto fail;
     return sp;
 fail:

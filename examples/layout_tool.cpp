@@ -72,7 +72,8 @@
 #include <stdlib.h>
 #include <string.h>
 
-#define NSPK           26
+#define NSPK           26         /* array CAPACITY (== BW_CHANNELS); g_nspk is the layout's ACTUAL count */
+#define NSPK_MIN       4          /* the engine's layout loader accepts 4..NSPK speakers */
 #define SR             48000u
 #define SPEED_OF_SOUND 343.0f
 #define TEST_GAIN      0.4f
@@ -80,6 +81,7 @@
 
 typedef struct { Vector3 pos; float gain_db; } Spk;
 static Spk spk[NSPK];
+static int g_nspk = NSPK;         /* speakers in the edited layout (4..NSPK) — the engine's channel count */
 
 /* dbap knobs (round-tripped through the file; defaults match layout_default) */
 static float       dbap_r = 0.5f, dist_ref = 1.0f, dist_rolloff = 1.0f, dist_min_db = -40.0f;
@@ -97,21 +99,22 @@ static float       obs_height = 1.4f;      /* observer EAR height above the floo
 static int         perceptual = 1;         /* weight azimuth over elevation in the rE error */
 static float       elev_wt    = 0.3f;      /* elevation-error weight vs azimuth (~1/3.5; slider 0..1) */
 
-/* the engine's default 3x3x3-minus-centre grid — the starting point and the layout_default() order */
-static void seed_default(void) {
-    /* 26 speakers on a hemisphere DOME (y >= 0): a Fibonacci half-sphere, radius ~2.4 m — the listener
-     * sits under it. Even angular spread with no floor-crossing speakers (the CAVE floor is a screen). */
+/* speaker `i` of `n` on a hemisphere DOME (y >= 0): a Fibonacci half-sphere, radius ~2.4 m — the
+ * listener sits under it. Even angular spread with no floor-crossing speakers (the CAVE floor is a
+ * screen). The starting layout, and where a speaker added by the count control lands. */
+static Vector3 dome_pos(int i, int n) {
     const float R = 2.4f, golden = 2.39996323f;   /* golden angle */
-    for (int i = 0; i < NSPK; ++i) {
-        float y  = ((float)i + 0.5f) / (float)NSPK;          /* 0..1, all >= 0 (upper hemisphere) */
-        float r  = sqrtf(1.0f - y * y);
-        float th = golden * (float)i;
-        spk[i].pos     = Vector3{ R * r * cosf(th), R * y, R * r * sinf(th) };
-        spk[i].gain_db = 0.0f;
-    }
+    float y  = ((float)i + 0.5f) / (float)n;      /* 0..1, all >= 0 (upper hemisphere) */
+    float r  = sqrtf(1.0f - y * y);
+    float th = golden * (float)i;
+    return Vector3{ R * r * cosf(th), R * y, R * r * sinf(th) };
+}
+static void seed_default(void) {
+    for (int i = 0; i < g_nspk; ++i) { spk[i].pos = dome_pos(i, g_nspk); spk[i].gain_db = 0.0f; }
 }
 
-/* load positions/gain + dbap knobs from an existing cave_layout.json; returns #speakers read (0 = none) */
+/* load positions/gain + dbap knobs from an existing cave_layout.json; returns #speakers read (0 = none).
+ * The file's speaker COUNT becomes the edited layout's count (4..NSPK — the engine loader's range). */
 static int load_json(const char* path) {
     FILE* f = fopen(path, "rb");
     if (!f) return 0;
@@ -126,13 +129,16 @@ static int load_json(const char* path) {
     int loaded = 0;
     cJSON* spks = cJSON_GetObjectItemCaseSensitive(root, "speakers");
     if (cJSON_IsArray(spks)) {
+        int n = cJSON_GetArraySize(spks);
+        if (n < NSPK_MIN || n > NSPK) { cJSON_Delete(root); return 0; }   /* the engine would reject it too */
+        g_nspk = n;
         cJSON* sp;
         cJSON_ArrayForEach(sp, spks) {
             cJSON* idxj = cJSON_GetObjectItemCaseSensitive(sp, "index");
             cJSON* posj = cJSON_GetObjectItemCaseSensitive(sp, "position");
             if (!cJSON_IsNumber(idxj) || !cJSON_IsArray(posj) || cJSON_GetArraySize(posj) != 3) continue;
             int idx = idxj->valueint;
-            if (idx < 0 || idx >= NSPK) continue;
+            if (idx < 0 || idx >= g_nspk) continue;   /* indices are a 0..count-1 permutation */
             cJSON* px = cJSON_GetArrayItem(posj, 0);
             cJSON* py = cJSON_GetArrayItem(posj, 1);
             cJSON* pz = cJSON_GetArrayItem(posj, 2);
@@ -171,7 +177,7 @@ static int save_json(const char* path) {
      * origin — since the +z-forward/floor-origin move, distance-to-origin would skew alignment. */
     const Vector3 ear = { 0.0f, obs_height, 0.0f };
     float dmax = 0.0f;
-    for (int i = 0; i < NSPK; ++i) { float d = Vector3Distance(spk[i].pos, ear); if (d > dmax) dmax = d; }
+    for (int i = 0; i < g_nspk; ++i) { float d = Vector3Distance(spk[i].pos, ear); if (d > dmax) dmax = d; }
     fprintf(f,
         "{\n"
         "  \"schema_version\": 1,\n"
@@ -181,11 +187,11 @@ static int save_json(const char* path) {
         "  \"dbap\": { \"rolloff_r\": %g, \"distance_attenuation\": { \"model\": \"%s\", \"reference_distance_m\": %g, \"rolloff\": %g, \"min_gain_db\": %g } },\n"
         "  \"speakers\": [\n",
         (double)SPEED_OF_SOUND, dbap_r, dist_model, dist_ref, dist_rolloff, dist_min_db);
-    for (int i = 0; i < NSPK; ++i) {
+    for (int i = 0; i < g_nspk; ++i) {
         float d = Vector3Distance(spk[i].pos, ear);
         float delay_ms = (dmax - d) / SPEED_OF_SOUND * 1000.0f;
         fprintf(f, "    { \"index\": %d, \"position\": [%.4f, %.4f, %.4f], \"gain_db\": %.2f, \"delay_ms\": %.3f }%s\n",
-                i, spk[i].pos.x, spk[i].pos.y, spk[i].pos.z, spk[i].gain_db, delay_ms, (i < NSPK - 1) ? "," : "");
+                i, spk[i].pos.x, spk[i].pos.y, spk[i].pos.z, spk[i].gain_db, delay_ms, (i < g_nspk - 1) ? "," : "");
     }
     fprintf(f, "  ]\n}\n");
     fclose(f);
@@ -344,8 +350,8 @@ static void build_engine(const char* layout_path) {
     if (!e) return;
     if (bw_start(e) != 0) {
         const char* err = bw_last_error(e);
-        printf("bw_start: %s — no audition (need a 26-ch ASIO device / DVS); the editor still runs.\n",
-               err ? err : "?");
+        printf("bw_start: %s — no audition (needs an ASIO device / DVS with an output per speaker); "
+               "the editor still runs.\n", err ? err : "?");
     }
     backend = bw_audio_backend(e);
     audio = (strncmp(backend, "asio", 4) == 0);
@@ -385,7 +391,7 @@ static int   scored, score_stale, last_score_frame;   /* the per-panner scoreboa
 static void score_panner(BwPanner panner, int stride, float* mean_deg, float* worst_deg) {
     static float gains[NCOV * NSPK], srcs[NCOV * 3];
     float pos[NSPK * 3];
-    for (int i = 0; i < NSPK; ++i) { pos[i*3] = spk[i].pos.x; pos[i*3+1] = spk[i].pos.y; pos[i*3+2] = spk[i].pos.z; }
+    for (int i = 0; i < g_nspk; ++i) { pos[i*3] = spk[i].pos.x; pos[i*3+1] = spk[i].pos.y; pos[i*3+2] = spk[i].pos.z; }
     if (stride < 1) stride = 1;                     /* >1 subsamples the direction shell (coarse, for the optimizer) */
     int NL = (panner == BW_PAN_DBAP) ? 27 : 1;     /* DBAP: moving grid; SPCAP/VBAP: fixed centre */
     double sumerr = 0; float worst = 0; int cnt = 0;
@@ -399,12 +405,12 @@ static void score_panner(BwPanner panner, int stride, float* mean_deg, float* wo
             srcs[ns*3+2] = Lp.z + COV_R * cov_dir[i].z;
             ++ns;
         }
-        bw_panner_gains_batch(panner, pos, NSPK, lisf, srcs, ns, gains);
+        bw_panner_gains_batch(panner, pos, (uint32_t)g_nspk, lisf, srcs, ns, gains);
         for (int j = 0; j < ns; ++j) {
             int i = j * stride;                     /* the cov_dir index this sample came from */
-            float* g = &gains[j * NSPK];
+            float* g = &gains[j * g_nspk];
             float rE[3] = { 0, 0, 0 };
-            for (int s = 0; s < NSPK; ++s) {        /* energy-weighted speaker-direction vector (rE) */
+            for (int s = 0; s < g_nspk; ++s) {      /* energy-weighted speaker-direction vector (rE) */
                 float w = g[s] * g[s];
                 Vector3 sd = Vector3Normalize(Vector3Subtract(spk[s].pos, Lp));
                 rE[0] += w * sd.x; rE[1] += w * sd.y; rE[2] += w * sd.z;
@@ -426,7 +432,7 @@ static void score_panner(BwPanner panner, int stride, float* mean_deg, float* wo
 static void compute_cov_err(BwPanner panner) {
     static float gains[NCOV * NSPK], srcs[NCOV * 3];
     float pos[NSPK * 3];
-    for (int i = 0; i < NSPK; ++i) { pos[i*3]=spk[i].pos.x; pos[i*3+1]=spk[i].pos.y; pos[i*3+2]=spk[i].pos.z; }
+    for (int i = 0; i < g_nspk; ++i) { pos[i*3]=spk[i].pos.x; pos[i*3+1]=spk[i].pos.y; pos[i*3+2]=spk[i].pos.z; }
     int NL = (panner == BW_PAN_DBAP && coverage_moving) ? 27 : 1;
     for (int i = 0; i < NCOV; ++i) cov_err[i] = 0.0f;
     for (int l = 0; l < NL; ++l) {
@@ -435,11 +441,11 @@ static void compute_cov_err(BwPanner panner) {
         for (int i = 0; i < NCOV; ++i) {
             srcs[i*3]=Lp.x+COV_R*cov_dir[i].x; srcs[i*3+1]=Lp.y+COV_R*cov_dir[i].y; srcs[i*3+2]=Lp.z+COV_R*cov_dir[i].z;
         }
-        bw_panner_gains_batch(panner, pos, NSPK, lisf, srcs, NCOV, gains);
+        bw_panner_gains_batch(panner, pos, (uint32_t)g_nspk, lisf, srcs, NCOV, gains);
         for (int i = 0; i < NCOV; ++i) {
-            float* g = &gains[i * NSPK];
+            float* g = &gains[i * g_nspk];
             float rE[3] = { 0, 0, 0 };
-            for (int s = 0; s < NSPK; ++s) {
+            for (int s = 0; s < g_nspk; ++s) {
                 float w = g[s] * g[s];
                 Vector3 sd = Vector3Normalize(Vector3Subtract(spk[s].pos, Lp));
                 rE[0] += w*sd.x; rE[1] += w*sd.y; rE[2] += w*sd.z;
@@ -467,7 +473,7 @@ static Vector3 opt_anchor[NSPK];                          /* speaker positions c
 
 static float opt_cost_of(BwPanner p) {   /* coarse; + a penalty per speaker in a projector shadow so the climb clears them */
     float m, w; score_panner(p, 4, &m, &w);
-    int occ = 0; for (int i = 0; i < NSPK; ++i) if (!los_clear(spk[i].pos)) ++occ;
+    int occ = 0; for (int i = 0; i < g_nspk; ++i) if (!los_clear(spk[i].pos)) ++occ;
     return m + 0.5f * w + 25.0f * (float)occ;
 }
 static float frand(void) { return (float)rand() / ((float)RAND_MAX + 1.0f); }
@@ -479,7 +485,7 @@ static void mark_score(void) { score_stale = 1; cov_err_stale = 1; }   /* metric
 
 static void optimize_step(BwPanner p, int trials) {
     for (int t = 0; t < trials; ++t) {
-        int s = rand() % NSPK;
+        int s = rand() % g_nspk;
         Vector3 old = spk[s].pos;
         Vector3 cand = { old.x + opt_step * (2*frand()-1), old.y + opt_step * (2*frand()-1), old.z + opt_step * (2*frand()-1) };
         Vector3 dv = Vector3Subtract(cand, opt_anchor[s]);       /* leash: never drift past opt_leash from where it started */
@@ -488,7 +494,7 @@ static void optimize_step(BwPanner p, int trials) {
         spk[s].pos = constraint_project(cand);     /* keep the trial feasible */
         float c = opt_cost_of(p);
         if (c < opt_cost - 1e-4f) { opt_cost = c; opt_stall = 0; }              /* accept an improvement */
-        else { spk[s].pos = old; if (++opt_stall > 6*NSPK) { opt_step *= 0.7f; opt_stall = 0; } }  /* revert; shrink when stuck */
+        else { spk[s].pos = old; if (++opt_stall > 6*g_nspk) { opt_step *= 0.7f; opt_stall = 0; } }  /* revert; shrink when stuck */
         ++opt_iter;
     }
     mark_edit();
@@ -547,7 +553,7 @@ static void do_reload(void) {
     edited_unsaved = 0;                          /* state now equals the file — nothing to lose on quit */
 }
 static void do_snap(void) {
-    for (int i = 0; i < NSPK; ++i) spk[i].pos = constraint_project(spk[i].pos);
+    for (int i = 0; i < g_nspk; ++i) spk[i].pos = constraint_project(spk[i].pos);
     mark_edit();
 }
 static void do_score(void) {
@@ -557,7 +563,7 @@ static void do_score(void) {
 static void set_optimizing(int on) {
     if (on && !opt_running) {
         opt_cost = opt_cost_of((BwPanner)pv_panner); opt_step = 0.30f; opt_stall = 0; opt_iter = 0;
-        for (int i = 0; i < NSPK; ++i) opt_anchor[i] = spk[i].pos;   /* leash anchor = here */
+        for (int i = 0; i < g_nspk; ++i) opt_anchor[i] = spk[i].pos;   /* leash anchor = here */
     }
     opt_running = on;
 }
@@ -660,8 +666,8 @@ static void handle_preview_input(float dt, bool kb) {
 /* edit mode: select/nudge speakers, toggle views, fire the shared actions (the panel mirrors all of it) */
 static void handle_edit_input(float dt, bool kb, bool ms, const Camera3D& cam) {
     if (kb) {
-        if (IsKeyPressed(KEY_RIGHT_BRACKET)) sel = (sel + 1) % NSPK;
-        if (IsKeyPressed(KEY_LEFT_BRACKET))  sel = (sel + NSPK - 1) % NSPK;
+        if (IsKeyPressed(KEY_RIGHT_BRACKET)) sel = (sel + 1) % g_nspk;
+        if (IsKeyPressed(KEY_LEFT_BRACKET))  sel = (sel + g_nspk - 1) % g_nspk;
         Vector3 p0 = spk[sel].pos; float g0 = spk[sel].gain_db;
         float d = ((IsKeyDown(KEY_LEFT_SHIFT) || IsKeyDown(KEY_RIGHT_SHIFT)) ? 0.25f : 1.0f) * dt;
         if (IsKeyDown(KEY_LEFT))  spk[sel].pos.x -= d;
@@ -689,7 +695,7 @@ static void handle_edit_input(float dt, bool kb, bool ms, const Camera3D& cam) {
     if (ms && IsMouseButtonPressed(MOUSE_BUTTON_LEFT) && !IsMouseButtonDown(MOUSE_BUTTON_RIGHT)) {
         Ray ray = GetMouseRay(GetMousePosition(), cam);        /* click-pick a speaker (imgui owns its own area) */
         float best = 1e9f; int hit = -1;
-        for (int i = 0; i < NSPK; ++i) {
+        for (int i = 0; i < g_nspk; ++i) {
             RayCollision rc = GetRayCollisionSphere(ray, spk[i].pos, 0.16f);
             if (rc.hit && rc.distance < best) { best = rc.distance; hit = i; }
         }
@@ -758,7 +764,7 @@ static void draw_scene(const Camera3D& cam, float* cov_worst_out, float* cov_mea
     if (!fps_view) DrawSphere(Vector3{ 0, obs_height, 0 }, 0.09f, Color{ 210, 210, 230, 255 });  /* listener (hidden in FPS: you're inside it) */
     DrawLine3D(Vector3{ 0, obs_height, 0 }, spk[sel].pos,   /* ear<->speaker sightline: green clear / red blocked */
                los_clear(spk[sel].pos) ? Color{ 240, 220, 120, 160 } : Color{ 245, 90, 90, 230 });
-    for (int i = 0; i < NSPK; ++i) {
+    for (int i = 0; i < g_nspk; ++i) {
         int is_sel = (i == sel), is_drv = (audio && tone_on && i == sel);
         Color col = is_drv ? Color{ 120, 245, 140, 255 }
                   : is_sel ? Color{ 245, 220, 90, 255 }
@@ -776,9 +782,9 @@ static void draw_scene(const Camera3D& cam, float* cov_worst_out, float* cov_mea
     }
     if (coverage_on && !preview && cov_metric == 0) {  /* shade each direction by its nearest-speaker gap */
         int NL = coverage_moving ? 27 : 1;
-        static Vector3 sdir[27][26];                  /* speaker directions from each listener sample */
+        static Vector3 sdir[27][NSPK];                /* speaker directions from each listener sample */
         for (int l = 0; l < NL; ++l)
-            for (int i = 0; i < NSPK; ++i)
+            for (int i = 0; i < g_nspk; ++i)
                 sdir[l][i] = Vector3Normalize(Vector3Subtract(spk[i].pos, Vector3Add(cov_lis[l], Vector3{ 0, obs_height, 0 })));
         float worst = 1.0f; double macc = 0.0;       /* worst = min score (largest gap) */
         for (int s = 0; s < NCOV; ++s) {
@@ -786,7 +792,7 @@ static void draw_scene(const Camera3D& cam, float* cov_worst_out, float* cov_mea
             float acc = 0.0f;                        /* mean over listeners of (max over speakers of alignment) */
             for (int l = 0; l < NL; ++l) {           /* from listener L, how near is the best speaker to direction d? */
                 float best = -1.0f;
-                for (int i = 0; i < NSPK; ++i) { float dp = Vector3DotProduct(d, sdir[l][i]); if (dp > best) best = dp; }
+                for (int i = 0; i < g_nspk; ++i) { float dp = Vector3DotProduct(d, sdir[l][i]); if (dp > best) best = dp; }
                 acc += best;
             }
             float score = acc / (float)NL;            /* typical coverage of d over the roam (mean, not worst corner) */
@@ -830,7 +836,7 @@ static void draw_scene(const Camera3D& cam, float* cov_worst_out, float* cov_mea
 static void draw_labels(const Camera3D& cam) {
     ImDrawList* dl = ImGui::GetBackgroundDrawList();
     Vector3 camfwd = Vector3Subtract(cam.target, cam.position);
-    for (int i = 0; i < NSPK; ++i) {
+    for (int i = 0; i < g_nspk; ++i) {
         if (fps_view && Vector3DotProduct(Vector3Subtract(spk[i].pos, cam.position), camfwd) <= 0) continue; /* behind the head */
         Vector2 s = GetWorldToScreen(spk[i].pos, cam);
         char buf[8]; snprintf(buf, sizeof buf, "%d", i);
@@ -844,11 +850,11 @@ static void draw_labels(const Camera3D& cam) {
 static void draw_hud(float cov_worst, float cov_mean) {
     const Vector3 ear = { 0.0f, obs_height, 0.0f };  /* live delay readout: max-distance alignment at the ears */
     float dmax = 0.0f;
-    for (int i = 0; i < NSPK; ++i) { float dd = Vector3Distance(spk[i].pos, ear); if (dd > dmax) dmax = dd; }
+    for (int i = 0; i < g_nspk; ++i) { float dd = Vector3Distance(spk[i].pos, ear); if (dd > dmax) dmax = dd; }
     float seld   = Vector3Distance(spk[sel].pos, ear);
     float seldel = (dmax - seld) / SPEED_OF_SOUND * 1000.0f;
     int con_bad = 0, con_occ = 0;
-    if (CON.loaded) for (int i = 0; i < NSPK; ++i) {
+    if (CON.loaded) for (int i = 0; i < g_nspk; ++i) {
         if (!constraint_ok(spk[i].pos)) ++con_bad;   /* out of bounds / inside a solid body (snappable) */
         if (!los_clear(spk[i].pos))     ++con_occ;   /* line of sight to the ears blocked by an obstacle */
     }
@@ -870,7 +876,7 @@ static void draw_hud(float cov_worst, float cov_mean) {
                            sel, sel, spk[sel].pos.x, spk[sel].pos.y, spk[sel].pos.z, seldel, seld);
     }
     if (audio) ImGui::TextColored(ImVec4(0.43f, 0.92f, 0.51f, 1), "audio: %s  (tone drives the selected channel)", backend);
-    else       ImGui::TextColored(ImVec4(0.92f, 0.67f, 0.43f, 1), "audio: none - editor only (needs a 26-ch ASIO/DVS device to audition)");
+    else       ImGui::TextColored(ImVec4(0.92f, 0.67f, 0.43f, 1), "audio: none - editor only (needs an ASIO/DVS device to audition)");
     if (CON.loaded && !preview)
         ImGui::TextColored((con_bad || con_occ) ? ImVec4(0.96f, 0.51f, 0.51f, 1) : ImVec4(0.47f, 0.86f, 0.55f, 1),
                            "constraints: %d no-go  %d obstacle   %d out [K snap]  %d occluded (move clear)",
@@ -942,7 +948,26 @@ static void draw_panel(void) {
     bwTip("write the layout; delay_ms is derived from the positions (max-distance alignment)");
 
     ImGui::SeparatorText("Speaker");                 /* the survey loop: pick an index, tone it, place it */
-    if (ImGui::InputInt("##spk", &sel)) { if (sel < 0) sel = 0; if (sel >= NSPK) sel = NSPK - 1; }
+    { int n = g_nspk;                                /* the array's SIZE = the engine's channel count */
+      if (ImGui::InputInt("count", &n)) {
+          if (n < NSPK_MIN) n = NSPK_MIN; if (n > NSPK) n = NSPK;
+          for (int i = g_nspk; i < n; ++i) { spk[i].pos = dome_pos(i, n); spk[i].gain_db = 0.0f; }  /* grow: on the dome */
+          if (n != g_nspk) {                         /* shrink drops the tail; grow keeps what is already placed */
+              g_nspk = n; if (sel >= g_nspk) sel = g_nspk - 1;
+              mark_edit();
+              /* the engine's channel count IS the layout's, so a count change must rebuild it —
+               * otherwise the test tone on a newly-added channel goes nowhere */
+              if (e && audio && save_json(TEMP_LAYOUT)) {
+                  if (driven >= 0) { bw_test_signal(e, (uint32_t)driven, BW_TEST_OFF, 0.0f); driven = -1; }
+                  bw_stop(e); bw_destroy(e);
+                  build_engine(TEMP_LAYOUT);
+                  layout_dirty = 0;
+              }
+          }
+      } }
+    bwTip("speakers in this layout (4-26) - the file's count IS the engine's channel count, so a "
+          "24-speaker array is a 24-entry file; growing adds one on the dome, shrinking drops the last");
+    if (ImGui::InputInt("##spk", &sel)) { if (sel < 0) sel = 0; if (sel >= g_nspk) sel = g_nspk - 1; }
     bwTip("the speaker's index IS its output/bus channel; [ ] steps, or click a sphere");
     ImGui::SameLine(); ImGui::Text("-> ch %d", sel);
     if (ImGui::DragFloat3("pos", &spk[sel].pos.x, 0.01f, 0, 0, "%.3f")) mark_edit();
@@ -951,7 +976,7 @@ static void draw_panel(void) {
     bwTip("per-speaker level trim (gain_db in the file)");
     CheckboxInt("tone [T]", &tone_on);
     bwTip("drive THIS channel with the test signal out the array: walk the room, hear which "
-          "physical speaker it is, place its marker (needs the 26-ch ASIO/DVS device)");
+          "physical speaker it is, place its marker (needs the ASIO/DVS device)");
     ImGui::SameLine();
     { bool nb = tone_kind == BW_TEST_NOISE;
       if (ImGui::Checkbox("noise [N]", &nb)) tone_kind = nb ? BW_TEST_NOISE : BW_TEST_SINE; }
@@ -1074,6 +1099,35 @@ static void register_tests(ImGuiTestEngine* te) {
         dbap_r = 0.5f; seed_default(); layout_dirty = 1;
     };
 
+    /* a SMALLER array (a collaborator's 24 speakers): the count round-trips through the file, the
+     * engine's own loader accepts what we wrote, and scoring runs on the reduced array. */
+    t = IM_REGISTER_TEST(te, "logic", "save_load_24");
+    t->TestFunc = [](ImGuiTestContext*) {
+        const int keep = g_nspk;
+        g_nspk = 24; seed_default();
+        spk[23].pos = Vector3{ -0.5f, 1.8f, 1.1f };
+        IM_CHECK(save_json(TEST_OUT));
+        g_nspk = NSPK; seed_default();                           /* clobber, then read the count back */
+        IM_CHECK_EQ(load_json(TEST_OUT), 24);
+        IM_CHECK_EQ(g_nspk, 24);
+        IM_CHECK_LT(fabsf(spk[23].pos.z - 1.1f), 1e-3f);
+        /* the ENGINE must accept what we wrote, at OUR count (bw_create only loads — no device) */
+        BwConfig cfg; memset(&cfg, 0, sizeof cfg);
+        cfg.profile = BW_PROFILE_CAVE; cfg.sample_rate = SR; cfg.block_size = 256;
+        cfg.layout_path = TEST_OUT;
+        BwEngine* te2 = bw_create(&cfg);
+        IM_CHECK(te2 != NULL);
+        if (te2) {
+            IM_CHECK(bw_last_error(te2) == NULL);                /* not silently defaulted to the 26 grid */
+            IM_CHECK_EQ(bw_channel_count(te2), 24u);
+            bw_destroy(te2);
+        }
+        float m = 0, w = 0;                                      /* the real panner solve, on 24 speakers */
+        score_panner(BW_PAN_DBAP, 4, &m, &w);
+        IM_CHECK_GT(w, 0.0f);
+        g_nspk = keep; seed_default(); layout_dirty = 1;
+    };
+
     t = IM_REGISTER_TEST(te, "logic", "constraints");            /* projection escapes a no-go; obstacles block LOS */
     t->TestFunc = [](ImGuiTestContext*) {
         Box sb = CON.bounds; int sn = CON.nnogo, so = CON.nobst, sl = CON.loaded;
@@ -1112,6 +1166,25 @@ static void register_tests(ImGuiTestEngine* te) {
         IM_CHECK_EQ(layout_dirty, 1);
         ctx->ItemInputValue("**/gain", -3.5f);
         IM_CHECK_LT(fabsf(spk[7].gain_db + 3.5f), 1e-2f);
+    };
+
+    /* the speaker-count control: shrinking retires the tail (and the selection follows), growing
+     * places the new speaker on the dome — the array size IS the engine's channel count. */
+    t = IM_REGISTER_TEST(te, "viewer", "panel_count");
+    t->TestFunc = [](ImGuiTestContext* ctx) {
+        const int keep = g_nspk;
+        ctx->SetRef("layout");
+        ctx->ItemInputValue("**/##spk", 25);
+        IM_CHECK_EQ(sel, 25);
+        ctx->ItemInputValue("**/count", 24);
+        IM_CHECK_EQ(g_nspk, 24);
+        IM_CHECK_EQ(sel, 23);                                    /* the retired selection moved in-range */
+        ctx->ItemInputValue("**/count", 26);
+        IM_CHECK_EQ(g_nspk, 26);
+        IM_CHECK_GT(Vector3Length(spk[25].pos), 0.1f);           /* the re-added speaker landed on the dome */
+        ctx->ItemInputValue("**/count", 2);                      /* below the engine's minimum: clamped */
+        IM_CHECK_EQ(g_nspk, NSPK_MIN);
+        g_nspk = keep; seed_default(); sel = 0; layout_dirty = 1;
     };
 
     t = IM_REGISTER_TEST(te, "viewer", "save_reload");           /* Save writes the file; Reload restores from it */
@@ -1270,7 +1343,7 @@ int main(int argc, char** argv) {
         if (argc > 3) { if (!strcmp(argv[3], "spcap")) p = BW_PAN_SPCAP; else if (!strcmp(argv[3], "vbap")) p = BW_PAN_VBAP; }
         float m0, w0; score_panner(p, 1, &m0, &w0);
         opt_cost = opt_cost_of(p); opt_step = 0.30f; opt_stall = 0; opt_iter = 0;
-        for (int i = 0; i < NSPK; ++i) opt_anchor[i] = spk[i].pos;             /* leash anchor (opt_leash defaults ~free) */
+        for (int i = 0; i < g_nspk; ++i) opt_anchor[i] = spk[i].pos;           /* leash anchor (opt_leash defaults ~free) */
         while (opt_step > 0.02f && opt_iter < 120000) optimize_step(p, 200);   /* run to convergence (step floor) */
         float m1, w1; score_panner(p, 1, &m1, &w1);
         if (!save_json(g_path)) { printf("optimize: save failed: %s\n", g_path); return 1; }
@@ -1278,10 +1351,10 @@ int main(int argc, char** argv) {
                g_path, panner_names[p], m0, m1, w0, w1, opt_iter, CON.loaded ? ", within constraints" : "");
         return 0;
     }
-    printf("layout: %s (%s, %d speakers)\n", g_path, loaded ? "loaded" : "default grid", loaded ? loaded : NSPK);
+    printf("layout: %s (%s, %d speakers)\n", g_path, loaded ? "loaded" : "default dome", g_nspk);
 
-    /* cave profile so the test signal / DBAP preview goes out the 26-ch DVS to the real speakers;
-     * falls back to no audio (editor still works) if no 26-ch ASIO device is present (off-site). */
+    /* cave profile so the test signal / DBAP preview goes out the DVS to the real speakers;
+     * falls back to no audio (editor still works) if no such ASIO device is present (off-site). */
     _putenv((char*)"BWAUDIO_SINK=asio");
     gen_pink_wav(PREV_WAV);                        /* the moving DBAP-preview source signal */
     build_engine(NULL);                            /* edit-mode engine (the test signal is layout-independent) */
@@ -1338,7 +1411,7 @@ int main(int argc, char** argv) {
             opt_cost = opt_cost_of((BwPanner)pv_panner);  /* re-baseline so a manual nudge can't wedge the climb */
             optimize_step((BwPanner)pv_panner, 6);
         }
-        for (int i = 0; i < NSPK; ++i) if (spk[i].pos.y < 0.0f) spk[i].pos.y = 0.0f;   /* y >= 0: speakers never below the floor */
+        for (int i = 0; i < g_nspk; ++i) if (spk[i].pos.y < 0.0f) spk[i].pos.y = 0.0f;   /* y >= 0: speakers never below the floor */
         if (scored && score_stale && (cov_frame - last_score_frame) >= 10) {
             do_score();                                   /* throttled live re-score (X forces an immediate one) */
             last_score_frame = cov_frame;
