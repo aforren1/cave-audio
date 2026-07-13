@@ -37,12 +37,12 @@ jobs:
     runs-on: windows-latest
     timeout-minutes: 75   # the uncached phonon build is the long pole; cached runs are far under
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         # no submodules by default: steam-audio-source is fetched only on a phonon cache miss
 
       - name: Cache ASIO SDK
         id: asiosdk
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: third_party/asiosdk
           key: asiosdk-v1   # bump manually to pick up a new Steinberg release
@@ -67,7 +67,7 @@ jobs:
 
       - name: Cache phonon (built Steam Audio core)
         id: phonon
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: third_party/steam-audio-artifacts
           key: phonon-v1-${{ steps.phonon-key.outputs.sha }}-${{ hashFiles('third_party/patches/**') }}
@@ -75,6 +75,11 @@ jobs:
       - name: Build phonon (cache miss only; recipe = third_party/README.md)
         if: steps.phonon.outputs.cache-hit != 'true'
         shell: bash
+        env:
+          # The pinned deps (flatbuffers 1.12, zlib, pffft, mysofa) declare pre-3.5
+          # cmake_minimum_required, which CMake 4 refuses outright. This env var
+          # (honored by CMake >= 3.31.7 / 4.0) is the official escape hatch.
+          CMAKE_POLICY_VERSION_MINIMUM: "3.5"
         run: |
           git submodule update --init --depth 1 third_party/steam-audio-source \
             || git submodule update --init third_party/steam-audio-source
@@ -197,7 +202,7 @@ jobs:
           Get-Content dist/DIST.txt
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: bwaudio-win64-r${{ github.run_number }}
           path: dist/
