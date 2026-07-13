@@ -221,8 +221,10 @@ jobs:
         run: |
           # -PluginsFrom pins RelWithDebInfo: the Debug build above ALSO POST_BUILD-stages into the
           # package folder (last config wins), so packing without it would ship the Debug engine.
-          $a = @('-PluginsFrom', 'build/RelWithDebInfo', '-OutDir', 'dist')
-          if ($env:TAG) { $a += @('-Version', $env:TAG) }   # tag must match package.json, or this fails
+          # NB: splat a HASHTABLE, not an array. Array splatting binds POSITIONALLY, so '-PluginsFrom'
+          # would land in $Version and the trailing value would have no parameter left to bind to.
+          $a = @{ PluginsFrom = 'build/RelWithDebInfo'; OutDir = 'dist' }
+          if ($env:TAG) { $a.Version = $env:TAG }           # tag must match package.json, or this fails
           ./tools/upm/pack.ps1 @a
 
       - name: Upload artifact
