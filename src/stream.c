@@ -7,6 +7,7 @@
 
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#include <math.h>
 #include <stdatomic.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -24,6 +25,7 @@ enum { DT_WAV = 0, DT_FLAC, DT_MP3 };
 struct Stream {
     void*    dec;               /* drwav* / drflac* / drmp3*, owned by the streaming thread after start */
     int      dtype;
+    int      push;              /* 1 = push stream: no decoder, the CONTROL thread is the producer */
     uint32_t channels, file_rate;
     uint64_t total_frames;
 
@@ -139,6 +141,18 @@ static void fill(Stream* s) {
     s->w_priv = w;
 }
 
+/* Tear a closed stream down: decoder, slot registration, memory. Runs on the STREAMING thread while
+ * the set is live — its pass snapshot may still hold the pointer, so only it may free — and on the
+ * control thread solely from stream_set_destroy, after the thread has been joined. The slot is
+ * cleared under the lock BEFORE the free, so no later snapshot can capture a dangling pointer. */
+static void stream_reap(StreamSet* set, Stream* s) {
+    dec_close(s);
+    EnterCriticalSection(&set->lock);
+    for (int i = 0; i < set->nslots; ++i) if (set->slots[i] == s) set->slots[i] = NULL;
+    LeaveCriticalSection(&set->lock);
+    free(s->ring); free(s->inter); free(s->mono); free(s);
+}
+
 static DWORD WINAPI stream_thread(LPVOID arg) {
     StreamSet* set = (StreamSet*)arg;
     while (!set->stop) {
@@ -152,7 +166,9 @@ static DWORD WINAPI stream_thread(LPVOID arg) {
             Stream* s = snap[i];
             if (!s) continue;
             int st = atomic_load_explicit(&s->state, memory_order_acquire);
-            if (st == ST_CLOSING) { dec_close(s); atomic_store_explicit(&s->state, ST_FREE, memory_order_release); continue; }
+            if (st == ST_CLOSING) { stream_reap(set, s); continue; }
+            if (s->push) continue;   /* caller-fed: nothing to fill, and touching w_priv here would
+                                      * race the control-thread producer (close is handled above) */
             if (st == ST_RESTART) {
                 /* the streaming thread owns ALL the reset (the control thread only flips the state),
                  * so no streaming-private field (w_priv/done/loop) is written cross-thread and fill's
@@ -188,17 +204,26 @@ StreamSet* stream_set_create(uint32_t engine_rate) {
 void stream_set_destroy(StreamSet* set) {
     if (!set) return;
     if (set->thread) { InterlockedExchange(&set->stop, 1); WaitForSingleObject(set->thread, INFINITE); CloseHandle(set->thread); }
-    for (int i = 0; i < set->nslots; ++i) {              /* thread is gone: release any survivors directly */
+    for (int i = 0; i < set->nslots; ++i) {              /* thread is gone: reap any survivors directly
+                                                          * (including closes the thread hadn't reached) */
         Stream* s = set->slots[i];
-        if (!s) continue;
-        dec_close(s);
-        free(s->ring); free(s->inter); free(s->mono); free(s);
+        if (s) stream_reap(set, s);
     }
     DeleteCriticalSection(&set->lock);
     free(set);
 }
 
 static void set_err(char* err, size_t cap, const char* msg) { if (err && cap) { strncpy(err, msg, cap - 1); err[cap - 1] = 0; } }
+
+/* register a stream in the set's slot array; 0 = no slot free */
+static int reg_slot(StreamSet* set, Stream* s) {
+    EnterCriticalSection(&set->lock);
+    int slot = -1;
+    for (int i = 0; i < MAX_STREAMS; ++i) if (!set->slots[i]) { slot = i; break; }
+    if (slot >= 0) { set->slots[slot] = s; if (slot + 1 > set->nslots) set->nslots = slot + 1; }
+    LeaveCriticalSection(&set->lock);
+    return slot >= 0;
+}
 
 Stream* stream_open(StreamSet* set, const char* path, char* err, size_t errcap) {
     if (!set || !path) { set_err(err, errcap, "stream: bad arguments"); return NULL; }
@@ -216,31 +241,68 @@ Stream* stream_open(StreamSet* set, const char* path, char* err, size_t errcap) 
     atomic_store_explicit(&s->eof_w, EOF_NONE, memory_order_release);   /* not "reached at position 0" (calloc gave 0) */
     atomic_store_explicit(&s->state, ST_IDLE, memory_order_release);
 
-    EnterCriticalSection(&set->lock);
-    int slot = -1;
-    for (int i = 0; i < MAX_STREAMS; ++i) if (!set->slots[i]) { slot = i; break; }
-    if (slot >= 0) { set->slots[slot] = s; if (slot + 1 > set->nslots) set->nslots = slot + 1; }
-    LeaveCriticalSection(&set->lock);
-    if (slot < 0) { set_err(err, errcap, "stream: too many open streams"); dec_close(s); free(s->ring); free(s->inter); free(s->mono); free(s); return NULL; }
+    if (!reg_slot(set, s)) { set_err(err, errcap, "stream: too many open streams"); dec_close(s); free(s->ring); free(s->inter); free(s->mono); free(s); return NULL; }
     return s;
+}
+
+/* A push stream: no decoder — the caller produces. Born ST_ACTIVE (the audio thread may pull as soon
+ * as a voice binds it; an empty ring is an underrun, which renders silence, never an end). */
+Stream* stream_open_push(StreamSet* set, char* err, size_t errcap) {
+    if (!set) { set_err(err, errcap, "stream: bad arguments"); return NULL; }
+    Stream* s = (Stream*)calloc(1, sizeof *s);
+    if (!s) { set_err(err, errcap, "stream: out of memory"); return NULL; }
+    s->push = 1; s->channels = 1; s->file_rate = set->rate;
+    s->ring_mask = RING_SIZE - 1;
+    s->ring = (float*)malloc((size_t)RING_SIZE * sizeof(float));   /* no inter/mono: nothing decodes */
+    if (!s->ring) { set_err(err, errcap, "stream: ring alloc failed"); free(s); return NULL; }
+    atomic_store_explicit(&s->eof_w, EOF_NONE, memory_order_release);
+    atomic_store_explicit(&s->state, ST_ACTIVE, memory_order_release);
+    if (!reg_slot(set, s)) { set_err(err, errcap, "stream: too many open streams"); free(s->ring); free(s); return NULL; }
+    return s;
+}
+
+uint32_t stream_push_space(Stream* s) {
+    if (!s || !s->push) return 0;
+    if (atomic_load_explicit(&s->eof_w, memory_order_relaxed) != EOF_NONE) return 0;   /* ended: refuse */
+    uint64_t r = atomic_load_explicit(&s->r, memory_order_acquire);
+    return (uint32_t)((uint64_t)s->ring_mask + 1u - (s->w_priv - r));
+}
+
+uint32_t stream_push(Stream* s, const float* src, uint32_t n) {
+    if (!s || !src) return 0;
+    uint32_t space = stream_push_space(s);           /* the ONE ring-occupancy formula (+ push/ended gates) */
+    uint32_t put = n < space ? n : space;
+    if (!put) return 0;
+    uint64_t w = s->w_priv;                          /* producer-private cursor (control thread here) */
+    for (uint32_t k = 0; k < put; ++k) {
+        float x = src[k];
+        s->ring[(w + k) & s->ring_mask] = isfinite(x) ? x : 0.f;   /* nothing may hand NaN to the audio thread */
+    }
+    s->w_priv = w + put;
+    atomic_store_explicit(&s->w, s->w_priv, memory_order_release);
+    return put;
+}
+
+void stream_push_end(Stream* s) {
+    if (!s || !s->push) return;
+    if (atomic_load_explicit(&s->eof_w, memory_order_relaxed) != EOF_NONE) return;   /* idempotent */
+    atomic_store_explicit(&s->eof_w, s->w_priv, memory_order_release);
 }
 
 void stream_close(StreamSet* set, Stream* s) {
     if (!set || !s) return;
-    /* hand the decoder release to the streaming thread, then reclaim the slot + memory */
+    /* NON-BLOCKING by design: this runs inside drain_events, on the per-frame bwa_commit path, and
+     * must never wait on the streaming thread's ~3 ms cadence (or its in-progress disk reads). The
+     * whole teardown is handed to the streaming thread (stream_reap on its next pass) — it may still
+     * hold this pointer in its current slot snapshot, so it is also the only thread that may free it
+     * (the old spin-until-freed close both blocked AND raced that snapshot). Do not touch the
+     * pointer after this call; the slot stays occupied until the reap (~ms). */
+    (void)set;
     atomic_store_explicit(&s->state, ST_CLOSING, memory_order_release);
-    for (int spins = 0; atomic_load_explicit(&s->state, memory_order_acquire) != ST_FREE; ++spins) {
-        Sleep(1);
-        if (spins > 2000) { dec_close(s); break; }   /* thread wedged: release here as a last resort */
-    }
-    EnterCriticalSection(&set->lock);
-    for (int i = 0; i < set->nslots; ++i) if (set->slots[i] == s) set->slots[i] = NULL;
-    LeaveCriticalSection(&set->lock);
-    free(s->ring); free(s->inter); free(s->mono); free(s);
 }
 
 void stream_start(Stream* s, int loop) {
-    if (!s) return;
+    if (!s || s->push) return;   /* push streams are born active and cannot restart (no decoder to seek) */
     /* Control thread: publish the loop flag, then hand the WHOLE reset (seek + r/w/eof_w/w_priv/done)
      * to the streaming thread via ST_RESTART. Writing the streaming-private fields here would race
      * a concurrent fill(). */

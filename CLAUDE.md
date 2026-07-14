@@ -10,8 +10,10 @@ extends the engine or verifies it on hardware, against these specs.
 A self-hosted native (C/C++) spatial audio engine for a CAVE installation. It
 drives a **26-speaker array** over **ASIO** into a **Dante Virtual Soundcard
 (DVS)**, with a **binaural (HRTF) debug monitor** as a second output. Unity and
-Unreal are *thin control clients* over a C ABI — no audio crosses that boundary,
-only control (sound triggers, source positions, listener pose).
+Unreal are *thin control clients* over a C ABI — no rendered audio crosses that
+boundary, only control (sound triggers, source positions, listener pose). The one
+inbound exception is the opt-in push-source feed (caller PCM *into* the engine,
+control thread) — a source feed, not a render path.
 
 The engine is deliberately *not* built on FMOD/Wwise/middleware. Self-hosting buys
 direct access to ASIO timing hooks (`ASIOTime.systemTime`, `ASIOGetSamplePosition`)
@@ -287,7 +289,19 @@ phonon-free), reusing the SH→26 decode the reflection bed will need. `sound.c`
 thread decodes chunks (WAV/FLAC/MP3, downmixed to mono, engine rate required) into a per-stream **SPSC ring**;
 the audio thread `stream_pull`s from the ring in `mix_voice` (no I/O/alloc/locks), distinguishing a true EOF
 from a transient underrun. One voice per stream; the retire handshake detaches voices before the control
-thread closes the stream.
+thread closes the stream. **Push (procedural) sources** (`bwa_source_create_stream` +
+`bwa_source_push`/`_push_space`/`_push_end`) ride the same ring in push mode (`stream_open_push`: the CONTROL
+thread is the producer, the streaming thread never touches the slot), so `mix_voice` is unchanged — the source
+consumes from create (underrun renders silence without losing the caller's place; the data-driven clock slips,
+never drops), `push_end` ends the voice once the ring drains (one-way; not restartable — stop/fade_out end
+it the same way, refusing further pushes; pause is the temporary silence), the internal sound slot retires
+with the source handle (destroy AND steal paths — a steal of an already-DRAINED victim finalizes + acks
+immediately instead of waiting on a fade that never comes; a retire that hits a full command ring parks and
+retries at drain_events), and `bwa_source_play` on a push source is refused (every play entry point,
+bwa_bed_play included, reports the error). `bwa_source_is_playing` counts a still-queued play as playing,
+so create→push→push_end→poll→destroy can't drop a clip in the first-block window. The `rt` test drives the
+mix path + lifetime cycles (incl. steal-of-drained and the parked retire); the `stream` test pins the ring
+mechanics (exact-capacity fill, wrap, NaN scrub, underrun-vs-end).
 **Voice management + scheduling**: sources carry a control-side steal **priority** (`bwa_source_set_priority`,
 255 = protected) — a full pool steals the lowest-priority voice instead of failing the create; and
 **`bwa_source_play_at(start_sample)`** fires a voice sample-accurately off a published dsp clock

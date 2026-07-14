@@ -113,6 +113,24 @@ static void set_error(bwa_engine* e, const char* msg) {
  * NULL (not a stale pointer to a now-empty errbuf, which reads as a spurious non-NULL "" error). */
 static void clear_error(bwa_engine* e) { if (e) { e->errbuf[0] = 0; e->last_error = NULL; } }
 
+/* EVERY play-shaped entry point (bwa_source_play / _play_at / bwa_bed_play) must refuse a push
+ * source WITH an error: the rt-level guard (rt_source_play_at) drops the play silently and relies
+ * on the engine layer to report. Returns true when the play must be refused. */
+static bool refuse_push_play(bwa_engine* e, bwa_source s, const char* msg) {
+    if (!rt_source_is_push(e->rt, s)) return false;
+    set_error(e, msg);
+    return true;
+}
+
+/* push-API guard: true = s is a live push source (proceed). A live NON-push handle is REPORTED —
+ * a bare 0/no-op reads exactly like ring backpressure and the pacing loop would spin forever —
+ * while a stale handle keeps the documented silent-no-op contract every bwa_* call shares. */
+static bool push_guard(bwa_engine* e, bwa_source s, const char* msg) {
+    if (rt_source_is_push(e->rt, s)) return true;
+    if (rt_source_live(e->rt, s)) set_error(e, msg);
+    return false;
+}
+
 /* cave: the 26-ch array goes straight to the device. */
 static void render_cave(void* user, float* dev, uint32_t n, const bwa_timestamp* ts) {
     rt_render(((bwa_engine*)user)->rt, dev, n, ts);
@@ -473,6 +491,8 @@ void  bwa_bed_play(bwa_engine* e, bwa_bed b, bwa_sound snd, bool loop) {
         set_error(e, "bwa_bed_play: asset is mono — load it with bwa_load_ambix (a 4/9/16-ch AmbiX file)");
         return;
     }
+    if (refuse_push_play(e, b, "bwa_bed_play: push source (bwa_source_create_stream) — feed it with bwa_source_push"))
+        return;
     rt_source_play(e->rt, b, snd, loop);            /* direct: bypass bwa_source_play's mono-only guard */
 }
 void  bwa_bed_set_gain(bwa_engine* e, bwa_bed b, float linear)       { bwa_source_set_gain(e, b, linear); }
@@ -491,6 +511,26 @@ bool  bwa_bed_is_playing(bwa_engine* e, bwa_bed b)                   { return bw
 
 bwa_source bwa_source_create(bwa_engine* e) {
     return e ? rt_source_create(e->rt) : 0;
+}
+/* procedural (push) sources: the voice plays caller-pushed PCM (see bw_audio.h) */
+bwa_source bwa_source_create_stream(bwa_engine* e) {
+    if (!e) return 0;
+    clear_error(e);
+    bwa_source s = rt_source_create_stream(e->rt, e->errbuf, sizeof e->errbuf);
+    if (s == 0) set_error(e, e->errbuf[0] ? e->errbuf : "bwa_source_create_stream: failed");
+    return s;
+}
+uint32_t bwa_source_push(bwa_engine* e, bwa_source s, const float* frames, uint32_t n) {
+    if (!e || !push_guard(e, s, "bwa_source_push: not a push source (create it with bwa_source_create_stream)")) return 0;
+    return rt_source_push(e->rt, s, frames, n);
+}
+uint32_t bwa_source_push_space(bwa_engine* e, bwa_source s) {
+    if (!e || !push_guard(e, s, "bwa_source_push_space: not a push source (create it with bwa_source_create_stream)")) return 0;
+    return rt_source_push_space(e->rt, s);
+}
+void bwa_source_push_end(bwa_engine* e, bwa_source s) {
+    if (e && push_guard(e, s, "bwa_source_push_end: not a push source (create it with bwa_source_create_stream)"))
+        rt_source_push_end(e->rt, s);
 }
 void bwa_source_set_priority(bwa_engine* e, bwa_source s, int priority) {
     if (e) rt_source_set_priority(e->rt, s, priority);
@@ -522,6 +562,8 @@ void bwa_source_play(bwa_engine* e, bwa_source s, bwa_sound snd, bool loop) {
         set_error(e, "bwa_source_play: asset is multichannel — use bwa_bed_play (or bwa_load_sound for a point source)");
         return;
     }
+    if (refuse_push_play(e, s, "bwa_source_play: push source (bwa_source_create_stream) — feed it with bwa_source_push"))
+        return;
     rt_source_play(e->rt, s, snd, loop);
 }
 void bwa_source_play_at(bwa_engine* e, bwa_source s, bwa_sound snd, bool loop, uint64_t start_sample) {
@@ -530,6 +572,8 @@ void bwa_source_play_at(bwa_engine* e, bwa_source s, bwa_sound snd, bool loop, u
         set_error(e, "bwa_source_play_at: asset is multichannel — use a point source");
         return;
     }
+    if (refuse_push_play(e, s, "bwa_source_play_at: push source (bwa_source_create_stream) — feed it with bwa_source_push"))
+        return;
     rt_source_play_at(e->rt, s, snd, loop, start_sample);
 }
 uint64_t bwa_get_dsp_time(bwa_engine* e)                                     { return e ? rt_dsp_time(e->rt) : 0; }

@@ -187,6 +187,27 @@ BWA_API void     bwa_source_seek(bwa_engine* e, bwa_source s, uint64_t frame);
 BWA_API bool     bwa_source_is_playing(bwa_engine* e, bwa_source s);
 BWA_API void     bwa_play_oneshot(bwa_engine* e, bwa_sound snd, float x, float y, float z, float gain);
 
+/* ---- procedural (push) sources: engine-generated audio, no file ----
+ * bwa_source_create_stream returns a source whose voice plays PCM you PUSH — mono float frames at
+ * the engine sample rate, through a per-source ring (~1.3 s deep at 48 kHz). The full spatial path
+ * applies: position, gain, spread, occlusion, Doppler, groups, fades — every bwa_source_* control
+ * except play/seek/pitch (a push source plays what you push; those are rejected/ignored). It starts
+ * consuming at create: silence until the first push, and if you fall behind (underrun) it renders
+ * silence WITHOUT losing your place — output resumes at the next pushed sample (the stream clock is
+ * data-driven: it slips, it never drops). Push from the ONE control thread, like every bwa_* call,
+ * at least a frame's worth ahead. bwa_source_push returns the count accepted (< n when the ring is
+ * full — pace with bwa_source_push_space). Non-finite samples are written as 0. bwa_source_push_end
+ * marks end-of-data: the voice ends (is_playing -> false) once the ring drains and further pushes
+ * are refused — a push source is not restartable, create a new one. bwa_source_stop / fade_out end
+ * it the same one-way way (the unconsumed remainder is dropped, pushes refused); set_paused is the
+ * temporary silence. A full pool can steal a push
+ * source like any voice (its pushed audio is dropped); protect an important one with priority 255.
+ * bwa_source_destroy releases the ring (safe while playing). */
+BWA_API bwa_source bwa_source_create_stream(bwa_engine* e);            /* 0 = failure (see bwa_last_error) */
+BWA_API uint32_t   bwa_source_push(bwa_engine* e, bwa_source s, const float* frames, uint32_t n);
+BWA_API uint32_t   bwa_source_push_space(bwa_engine* e, bwa_source s);
+BWA_API void       bwa_source_push_end(bwa_engine* e, bwa_source s);
+
 /* ---- ambisonic beds (control thread; a world-locked soundfield decoded straight to the speakers,
  * not DBAP-panned — for diffuse/ambient content). Play a bwa_load_ambix asset; no position. Occlusion
  * and directivity do NOT apply to a bed (it is world-locked diffuse). bwa_bed_play requires a

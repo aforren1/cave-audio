@@ -163,10 +163,27 @@ uint32_t rt_load_sound  (RtCore* c, const char* path, char* err, size_t errcap);
 uint32_t rt_load_sound_streaming(RtCore* c, const char* path, char* err, size_t errcap); /* mono, engine rate, streamed */
 uint32_t rt_load_ambix  (RtCore* c, const char* path, char* err, size_t errcap); /* multichannel bed asset */
 uint16_t rt_sound_channels(RtCore* c, uint32_t sound);   /* 1 = mono, 4/9/16 = bed, 0 = invalid */
-void     rt_unload_sound(RtCore* c, uint32_t sound);  /* safe any time; retire-acked internally */
+bool     rt_unload_sound(RtCore* c, uint32_t sound);  /* safe any time; retire-acked internally.
+                                                       * false = command ring full, nothing enqueued:
+                                                       * retry later (internal sounds park in rt.c) */
 
 /* ---- control thread: handle allocation is synchronous, the rest enqueue ---- */
 uint32_t rt_source_create(RtCore* c);                 /* steals the lowest-priority source if the table is full */
+/* PUSH source (procedural audio): a source whose voice plays caller-pushed PCM through a per-source
+ * ring instead of a loaded sound — same voice, same spatial path, second feeding path. Consuming
+ * starts at create (an empty ring renders silence, it never ends the voice); rt_source_push feeds it
+ * (returns frames accepted; pace with rt_source_push_space), rt_source_push_end marks end-of-data
+ * (the voice ends once the ring drains; not restartable). rt_source_stop / a stop_at_end fade also
+ * END it (one-way, like push_end — pushes are refused after; pause is the temporary silence). The
+ * internal sound slot retires with the source handle. Push from the control thread — the ring is SPSC. */
+uint32_t rt_source_create_stream(RtCore* c, char* err, size_t errcap);   /* 0 + err on failure */
+uint32_t rt_source_push(RtCore* c, uint32_t h, const float* frames, uint32_t n);
+uint32_t rt_source_push_space(RtCore* c, uint32_t h);
+void     rt_source_push_end(RtCore* c, uint32_t h);
+bool     rt_source_is_push(RtCore* c, uint32_t h);    /* control thread: is this a live push source? */
+bool     rt_source_live(RtCore* c, uint32_t h);       /* control thread: live source handle of ANY kind
+                                                       * (distinguishes wrong-kind misuse from a stale
+                                                       * handle's documented silent no-op) */
 void rt_source_destroy (RtCore* c, uint32_t h);
 void rt_source_set_priority(RtCore* c, uint32_t h, int priority);   /* 0 = expendable .. 255 = protected (default 128) */
 void rt_source_set_pos (RtCore* c, uint32_t h, float x, float y, float z);

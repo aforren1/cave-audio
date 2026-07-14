@@ -224,6 +224,17 @@ struct RtCore {
     uint8_t*  inuse;                        /* 1 while a voice slot is allocated */
     uint8_t*  priority;                     /* per-source steal priority (control-side; 0=expendable..255=protected) */
     uint8_t*  stealing;                     /* 1 while a slot is fading out from a steal (skip it in the next scan) */
+    uint32_t* push_sound;                   /* per voice slot: the PUSH source's internal sound handle (0 = not
+                                             * push-fed; control-side — the sound retires with the source handle) */
+    uint32_t* retire_park;                  /* internal-sound retires whose CMD_SOUND_RETIRE hit a full command
+                                             * ring: parked here and re-tried at every drain_events. The handle is
+                                             * internal (the user never saw it), so nobody else can retry — dropping
+                                             * it would leak the slot + a push stream's ring for the engine's life. */
+    uint32_t  retire_parked;
+    uint8_t*  play_opt;                     /* control-side pending-play flag, set when a CMD_PLAY enqueues for this
+                                             * slot's current gen: rt_source_is_playing reads it until the audio
+                                             * thread first PUBLISHES that gen, so a fresh play/create_stream never
+                                             * reads not-playing in the one-block window before the next render. */
     uint32_t* freelist;
     uint32_t  free_count;
     uint32_t  fade_reserve;                 /* physical slots beyond the user pool, kept free so a stolen voice can
@@ -410,19 +421,27 @@ static uint32_t alloc_handle(RtCore* c) {
                                                               * so a recycled slot never leaks its prior priority */
     c->stealing[idx] = 0;                                     /* a fresh slot is not mid-steal (clears a leaked flag
                                                               * if the app destroyed a voice while it faded) */
+    c->push_sound[idx] = 0;                                   /* a fresh slot is not push-fed */
+    c->play_opt[idx] = 0;                                     /* no pending play for the new gen yet */
     return BWA_MK_H(idx, g);
 }
 
-static void recycle_handle(RtCore* c, uint32_t h) {
+/* Control-thread liveness: is h the CURRENT occupant of its voice slot? This is the invariant-5
+ * gen guard — every control-side act on a voice handle goes through it, so a stale handle (slot
+ * recycled, then re-allocated at a higher gen) can never touch the slot's next occupant. */
+static bool voice_live_ctrl(const RtCore* c, uint32_t h) {
     uint16_t idx = BWA_H_IDX(h);
+    return idx < c->voice_cap && c->inuse[idx] && c->gen[idx] == BWA_H_GEN(h);
+}
+
+static void recycle_handle(RtCore* c, uint32_t h) {
     /* Gen-checked + idempotent: return the slot to the free-list only if THIS handle is still its
-     * current occupant. A stale handle (slot already recycled, then re-allocated at a higher gen)
-     * is dropped, so a double-destroy OR a late EVT_VOICE_ENDED for a since-stolen slot can never
-     * free a live source's slot (invariant 5). The inuse check catches a double-free before reuse;
-     * the gen check catches one after reuse. */
-    if (idx < c->voice_cap && c->inuse[idx] && c->gen[idx] == BWA_H_GEN(h)) {
-        c->inuse[idx] = 0;
-        c->freelist[c->free_count++] = idx;
+     * current occupant, so a double-destroy OR a late EVT_VOICE_ENDED for a since-stolen slot can
+     * never free a live source's slot (invariant 5). The inuse check catches a double-free before
+     * reuse; the gen check catches one after reuse. */
+    if (voice_live_ctrl(c, h)) {
+        c->inuse[BWA_H_IDX(h)] = 0;
+        c->freelist[c->free_count++] = BWA_H_IDX(h);
     }
 }
 
@@ -454,14 +473,42 @@ static SoundSlot* sound_slot_ctrl(RtCore* c, uint32_t h) {
     return (s->inuse && s->gen == BWA_H_GEN(h)) ? s : NULL;
 }
 
+static void set_err(char* err, size_t cap, const char* msg) { if (err && cap) { strncpy(err, msg, cap - 1); err[cap - 1] = 0; } }
+
+/* Retire an INTERNAL sound (a handle the user never saw, so nobody else can retry it): if the
+ * command ring is full right now the retire is parked and re-tried at every drain_events —
+ * rt_unload_sound's revert-and-retry contract needs SOMEONE holding the handle, and here that
+ * someone has to be us. */
+static void retire_internal_sound(RtCore* c, uint32_t snd) {
+    if (!rt_unload_sound(c, snd) && c->retire_parked < c->sound_cap)   /* bound is structural: each
+                                             * parked handle pins a distinct sound slot */
+        c->retire_park[c->retire_parked++] = snd;
+}
+
+/* A push source's handle is dying (destroy, or a steal completed): retire its internal sound
+ * so the ring closes once the audio thread has let go. Gen-guarded, so a stale handle can never
+ * touch the slot's next occupant. Call BEFORE recycle_handle (recycle clears inuse). */
+static void push_sound_release(RtCore* c, uint32_t h) {
+    uint16_t idx = BWA_H_IDX(h);
+    if (voice_live_ctrl(c, h) && c->push_sound[idx]) {
+        retire_internal_sound(c, c->push_sound[idx]);
+        c->push_sound[idx] = 0;
+    }
+}
+
 static void drain_events(RtCore* c) {                          /* control thread */
+    for (uint32_t i = 0; i < c->retire_parked; )               /* re-try parked internal retires (the
+                                                                * command ring was full when they died) */
+        if (rt_unload_sound(c, c->retire_park[i])) c->retire_park[i] = c->retire_park[--c->retire_parked];
+        else ++i;
     EvtRing* r = &c->events;
     uint32_t rd = atomic_load_explicit(&r->read,  memory_order_relaxed);
     uint32_t w  = atomic_load_explicit(&r->write, memory_order_acquire);
     for (; rd != w; ++rd) {
         const Evt* ev = &r->slots[rd & (EVT_CAP - 1)];
         switch (ev->type) {
-        case EVT_VOICE_ENDED:    recycle_handle(c, ev->handle); c->stealing[BWA_H_IDX(ev->handle)] = 0; break;
+        case EVT_VOICE_ENDED:    push_sound_release(c, ev->handle);   /* a stolen push source dies here */
+                                 recycle_handle(c, ev->handle); c->stealing[BWA_H_IDX(ev->handle)] = 0; break;
         case EVT_SOUND_RETIRED: {        /* audio dropped all refs: free pcm / close the stream + recycle the slot */
             SoundSlot* s = sound_slot_ctrl(c, ev->handle);
             if (s) {
@@ -639,7 +686,16 @@ static void drain_commands(RtCore* c) {
             /* Fade the stolen voice out on its own slot, then free it (pause_gate finalize pushes
              * EVT_VOICE_ENDED so the control thread recycles the slot). The new source already started
              * on a reserve slot, so the steal is click-free. */
-            if (v && v->playing) v->stopping = 2; } break;
+            if (v && v->playing) v->stopping = 2;
+            else if (v) {                /* already silent (ended, stopped, or a drained push source —
+                                          * its normal terminal state): nothing to fade, so finalize and
+                                          * ack NOW. Without this the control side waits forever on an
+                                          * event that never comes: stealing[] sticks, the slot never
+                                          * recycles, and a push victim's internal sound never retires. */
+                v->stopping = 0; v->playing = false; v->active = false; v->sound = NULL;
+                Evt ev = { .type = EVT_VOICE_ENDED, .handle = cmd->handle };
+                evt_push(&c->events, &ev);
+            } } break;
         case CMD_SET_PAUSED: { Voice* v = voice_for(c, cmd->handle);
             if (v) v->paused = cmd->u.pause.on != 0; } break;    /* the mixer's gate does the ramp/freeze */
         case CMD_SEEK: { Voice* v = voice_for(c, cmd->handle);
@@ -1906,14 +1962,18 @@ uint32_t rt_bus_peaks(RtCore* c, float* out, uint32_t cap) {
 
 /* Control-thread readback: is the source's voice still producing audio? Reads the per-slot state the
  * audio thread republishes each block, gated on the handle's generation (a stale/recycled handle, or
- * a finished non-loop voice, reads as not-playing). Best-effort: a sound shorter than a poll interval
- * may never be observed playing. */
+ * a finished non-loop voice, reads as not-playing). Until the audio thread has published this
+ * generation once (the window between a play — or bwa_source_create_stream's internal one — and the
+ * next rendered block), the control-side pending-play flag answers instead, so a fresh voice never
+ * reads not-playing and a poll-then-destroy can't drop it. Best-effort: a sound shorter than a poll
+ * interval may never be observed playing. */
 bool rt_source_is_playing(RtCore* c, uint32_t h) {
     if (!c || h == 0) return false;
     uint32_t idx = BWA_H_IDX(h);
     if (idx >= c->voice_cap) return false;
     uint32_t st = atomic_load_explicit(&c->play_pub[idx], memory_order_acquire);
-    return ((st >> 1) == BWA_H_GEN(h)) && (st & 1u) != 0u;
+    if ((st >> 1) == BWA_H_GEN(h)) return (st & 1u) != 0u;   /* published this gen: authoritative */
+    return c->inuse[idx] && c->gen[idx] == BWA_H_GEN(h) && c->play_opt[idx] != 0;   /* play still queued */
 }
 
 /* Control thread: the engine's current dsp-sample clock (the most recently rendered block's first
@@ -1965,13 +2025,107 @@ uint32_t rt_source_create(RtCore* c) {
     return h;
 }
 
+/* The unguarded bind: enqueue CMD_PLAY + flag the pending play. rt_source_play_at wraps this in
+ * the public guards (retiring sound, push source); rt_source_create_stream calls it directly for
+ * its internal bind — an internal caller skips the guards by construction, not by write ordering. */
+static void source_bind(RtCore* c, uint32_t h, uint32_t sound, bool loop, uint64_t start_sample) {
+    Cmd cmd = { .type = CMD_PLAY, .handle = h };
+    cmd.u.play.sound = sound; cmd.u.play.loop = loop ? 1u : 0u; cmd.u.play.oneshot = 0u;
+    cmd.u.play.start = start_sample;
+    if (cmd_push(&c->cmds, &cmd) && voice_live_ctrl(c, h))
+        c->play_opt[BWA_H_IDX(h)] = 1;     /* pending play: is_playing reads true from NOW, not from
+                                            * the first rendered block */
+}
+
+/* Bind an open stream to a fresh sound slot (shared by file streaming and push sources); on a
+ * full table the stream is closed and 0 returned with `full_msg` in err. */
+static uint32_t bind_stream_sound(RtCore* c, Stream* st, const char* full_msg, char* err, size_t errcap) {
+    uint32_t snd = salloc_sound(c);
+    if (!snd) {
+        stream_close(c->streams, st);
+        set_err(err, errcap, full_msg);
+        return 0;
+    }
+    SoundData d; memset(&d, 0, sizeof d);
+    d.stream = st; d.channels = 1; d.sample_rate = c->sample_rate;   /* pcm NULL, frames 0: the ring is
+                                                                      * the content, the stream tracks EOF */
+    c->sounds[BWA_H_IDX(snd)].data = d;
+    return snd;
+}
+
+/* PUSH source: a source whose voice plays caller-pushed PCM through a per-source ring
+ * (stream_open_push) instead of a loaded sound — the "second feeding path" (docs/api.md). The
+ * internal sound slot never leaves rt.c: it binds here and retires when the source handle dies
+ * (rt_source_destroy / a steal's EVT_VOICE_ENDED — push_sound_release). */
+uint32_t rt_source_create_stream(RtCore* c, char* err, size_t errcap) {
+    if (!c) return 0;
+    /* create + play must BOTH land (a bound-but-never-fed voice is fine; a created-but-never-bound
+     * push source would sit silent forever looking alive). The worst case is EXACTLY 4, no slack:
+     * a full pool whose fade reserve is exhausted hard-cuts a victim that is itself a push source —
+     * CMD_SRC_DESTROY + CMD_SOUND_RETIRE (the victim's internal sound) + CMD_SRC_CREATE + CMD_PLAY.
+     * The click-free steal path needs 3 (CMD_SRC_STEAL + create + play). */
+    if (cmd_free(&c->cmds) < 4) {
+        set_err(err, errcap, "push: command ring full");
+        return 0;
+    }
+    Stream* st = stream_open_push(c->streams, err, errcap);
+    if (!st) return 0;
+    uint32_t snd = bind_stream_sound(c, st, "push: sound table full", err, errcap);
+    if (!snd) return 0;
+    uint32_t h = rt_source_create(c);
+    if (!h) {
+        retire_internal_sound(c, snd);      /* nothing ever bound: the retire-ack closes the ring */
+        set_err(err, errcap, "push: voice pool full");
+        return 0;
+    }
+    /* Bind + start consuming NOW: an empty ring is an underrun (renders silence, never ends the
+     * voice), so the source is live from the first pushed sample. source_bind skips the public
+     * play guards, so the push mapping can be installed first. */
+    c->push_sound[BWA_H_IDX(h)] = snd;
+    source_bind(c, h, snd, false, 0);
+    return h;
+}
+
+/* control-thread resolve: the push source's ring iff h is its live handle */
+static Stream* push_stream_ctrl(RtCore* c, uint32_t h) {
+    if (!rt_source_is_push(c, h)) return NULL;
+    SoundSlot* s = sound_slot_ctrl(c, c->push_sound[BWA_H_IDX(h)]);
+    return s ? s->data.stream : NULL;
+}
+
+/* Feed a push source (control thread — the ring's single producer). Returns frames accepted:
+ * short/0 when the ring is full (~1.3 s at 48 kHz), after rt_source_push_end, or on a stale handle. */
+uint32_t rt_source_push(RtCore* c, uint32_t h, const float* frames, uint32_t n) {
+    Stream* st = push_stream_ctrl(c, h);
+    return st ? stream_push(st, frames, n) : 0;
+}
+
+uint32_t rt_source_push_space(RtCore* c, uint32_t h) {
+    Stream* st = push_stream_ctrl(c, h);
+    return st ? stream_push_space(st) : 0;
+}
+
+void rt_source_push_end(RtCore* c, uint32_t h) {
+    Stream* st = push_stream_ctrl(c, h);
+    if (st) stream_push_end(st);
+}
+
+bool rt_source_is_push(RtCore* c, uint32_t h) {
+    return c && h != 0 && voice_live_ctrl(c, h) && c->push_sound[BWA_H_IDX(h)] != 0;
+}
+
+/* Control thread: is h a live source handle at all (any kind)? Lets the engine tell a WRONG-KIND
+ * call on a live handle (report an error) from a stale handle (the documented silent no-op). */
+bool rt_source_live(RtCore* c, uint32_t h) {
+    return c && h != 0 && voice_live_ctrl(c, h);
+}
+
 /* Steal priority (control-side only — the audio thread never reads it): 0 = first to be stolen when
  * the pool is full .. 255 = protected. Take effect immediately; safe any time. */
 void rt_source_set_priority(RtCore* c, uint32_t h, int priority) {
     if (!c) return;
-    uint16_t idx = BWA_H_IDX(h);
-    if (idx < c->voice_cap && c->inuse[idx] && c->gen[idx] == BWA_H_GEN(h))
-        c->priority[idx] = (uint8_t)(priority < 0 ? 0 : priority > 255 ? 255 : priority);
+    if (voice_live_ctrl(c, h))
+        c->priority[BWA_H_IDX(h)] = (uint8_t)(priority < 0 ? 0 : priority > 255 ? 255 : priority);
 }
 
 void rt_source_destroy(RtCore* c, uint32_t h) {
@@ -1979,7 +2133,10 @@ void rt_source_destroy(RtCore* c, uint32_t h) {
     /* Recycle only if the destroy was actually enqueued, so a dropped command can't leave
      * the voice active while the index is handed out again. recycle is idempotent, so a
      * double-destroy is harmless. */
-    if (cmd_push(&c->cmds, &cmd)) recycle_handle(c, h);
+    if (cmd_push(&c->cmds, &cmd)) {
+        push_sound_release(c, h);        /* a push source owns its internal sound: retire it too */
+        recycle_handle(c, h);
+    }
 }
 
 void rt_source_set_pos(RtCore* c, uint32_t h, float x, float y, float z) {
@@ -2066,6 +2223,10 @@ void rt_source_set_size(RtCore* c, uint32_t h, float radius_m) {
 
 void rt_source_fade_to(RtCore* c, uint32_t h, float gain, float seconds, bool stop_at_end) {
     if (!c) return;
+    if (stop_at_end) {                 /* fade-out: one-way for a push source, same as stop above */
+        Stream* st = push_stream_ctrl(c, h);
+        if (st) stream_push_end(st);
+    }
     Cmd cmd = { .type = CMD_FADE, .handle = h };
     cmd.u.fade.target  = gain;
     cmd.u.fade.seconds = seconds;
@@ -2153,16 +2314,19 @@ void rt_source_play_at(RtCore* c, uint32_t h, uint32_t sound, bool loop, uint64_
     SoundSlot* s = sound_slot_ctrl(c, sound);
     if (!s || s->retiring) return;          /* invalid or being unloaded: drop the play so the
                                              * audio thread can never bind a retiring sound */
+    if (rt_source_is_push(c, h)) return;    /* a PUSH source plays what is pushed; rebinding it to an
+                                             * asset would orphan its ring (engine.c reports the error) */
     /* streamed sound: kick the background decode (re-seek + fill) now, off the audio thread. The
      * voice reads its ring from sample 0; the first blocks may be silent until the ring fills (~ms). */
     if (s->data.stream) stream_start(s->data.stream, loop ? 1 : 0);
-    Cmd cmd = { .type = CMD_PLAY, .handle = h };
-    cmd.u.play.sound = sound; cmd.u.play.loop = loop ? 1u : 0u; cmd.u.play.oneshot = 0u;
-    cmd.u.play.start = start_sample;
-    cmd_push(&c->cmds, &cmd);
+    source_bind(c, h, sound, loop, start_sample);
 }
 
 void rt_source_stop(RtCore* c, uint32_t h) {
+    Stream* st = push_stream_ctrl(c, h);
+    if (st) stream_push_end(st);       /* a push source cannot re-arm (play is refused), so stop ENDS it
+                                        * like push_end: further pushes are refused instead of silently
+                                        * feeding a ring nothing will ever drain again */
     Cmd cmd = { .type = CMD_STOP, .handle = h };
     cmd_push(&c->cmds, &cmd);
 }
@@ -2200,7 +2364,7 @@ uint32_t rt_load_sound(RtCore* c, const char* path, char* err, size_t errcap) {
     uint32_t h = salloc_sound(c);
     if (!h) {
         sound_unload(&d);
-        if (err && errcap) { strncpy(err, "sound: table full", errcap - 1); err[errcap - 1] = 0; }
+        set_err(err, errcap, "sound: table full");
         return 0;
     }
     c->sounds[BWA_H_IDX(h)].data = d;     /* published to the audio thread when a CMD_PLAY references it */
@@ -2213,16 +2377,7 @@ uint32_t rt_load_sound_streaming(RtCore* c, const char* path, char* err, size_t 
     if (!c) return 0;
     Stream* st = stream_open(c->streams, path, err, errcap);
     if (!st) return 0;
-    uint32_t h = salloc_sound(c);
-    if (!h) {
-        stream_close(c->streams, st);
-        if (err && errcap) { strncpy(err, "stream: sound table full", errcap - 1); err[errcap - 1] = 0; }
-        return 0;
-    }
-    SoundData d; memset(&d, 0, sizeof d);
-    d.stream = st; d.channels = 1; d.sample_rate = c->sample_rate;   /* pcm NULL, frames 0: the stream tracks EOF */
-    c->sounds[BWA_H_IDX(h)].data = d;
-    return h;
+    return bind_stream_sound(c, st, "stream: sound table full", err, errcap);
 }
 
 /* Load a multichannel AmbiX asset into the sound table (plays as an ambisonic bed via mix_bed). */
@@ -2232,7 +2387,7 @@ uint32_t rt_load_ambix(RtCore* c, const char* path, char* err, size_t errcap) {
     uint32_t h = salloc_sound(c);
     if (!h) {
         sound_unload(&d);
-        if (err && errcap) { strncpy(err, "ambix: sound table full", errcap - 1); err[errcap - 1] = 0; }
+        set_err(err, errcap, "ambix: sound table full");
         return 0;
     }
     c->sounds[BWA_H_IDX(h)].data = d;
@@ -2246,12 +2401,17 @@ uint16_t rt_sound_channels(RtCore* c, uint32_t sound) {
     return s ? s->data.channels : 0;
 }
 
-void rt_unload_sound(RtCore* c, uint32_t sound) {
+bool rt_unload_sound(RtCore* c, uint32_t sound) {
     SoundSlot* s = sound_slot_ctrl(c, sound);
-    if (!s || s->retiring) return;       /* invalid or already retiring: idempotent no-op */
+    if (!s || s->retiring) return true;  /* invalid or already retiring: idempotent no-op (nothing to retry) */
     s->retiring = 1;                     /* refuse new binds (rt_source_play checks this) */
     Cmd cmd = { .type = CMD_SOUND_RETIRE, .handle = sound };
-    if (!cmd_push(&c->cmds, &cmd)) s->retiring = 0;   /* ring full: revert so it can be retried */
+    if (!cmd_push(&c->cmds, &cmd)) {     /* ring full: revert so the caller can retry (internal
+                                          * handles park in retire_park — see retire_internal_sound) */
+        s->retiring = 0;
+        return false;
+    }
+    return true;
 }
 
 /* Fire-and-forget: a transient voice that recycles itself on EVT_VOICE_ENDED. Its position
@@ -2319,6 +2479,9 @@ RtCore* rt_create(uint32_t req_voice_cap, uint32_t sound_cap, uint32_t sample_ra
     c->inuse     = (uint8_t*)  calloc(voice_cap, sizeof(uint8_t));
     c->priority  = (uint8_t*)  calloc(voice_cap, sizeof(uint8_t));
     c->stealing  = (uint8_t*)  calloc(voice_cap, sizeof(uint8_t));
+    c->push_sound = (uint32_t*)calloc(voice_cap, sizeof(uint32_t));
+    c->retire_park = (uint32_t*)calloc(sound_cap, sizeof(uint32_t));
+    c->play_opt  = (uint8_t*)  calloc(voice_cap, sizeof(uint8_t));
     c->freelist  = (uint32_t*) calloc(voice_cap, sizeof(uint32_t));
     c->sounds    = (SoundSlot*)calloc(sound_cap, sizeof(SoundSlot));
     c->sfreelist = (uint32_t*) calloc(sound_cap, sizeof(uint32_t));
@@ -2374,7 +2537,8 @@ RtCore* rt_create(uint32_t req_voice_cap, uint32_t sound_cap, uint32_t sample_ra
     c->ldc_a = 1.f - expf(-6.2831853f * 250.f / (float)sample_rate);   /* loudness-comp shelf corner */
     if (!c->voices || !c->occ_handle || !c->occ_val || !c->occ_eq || !c->occ_dir || !c->play_pub || !c->aux ||
         !c->stream_scratch || !c->streams || !c->path_accum || !c->path_pub || !c->path_idx ||
-        !c->gen || !c->inuse || !c->priority || !c->stealing || !c->freelist || !c->sounds || !c->sfreelist ||
+        !c->gen || !c->inuse || !c->priority || !c->stealing || !c->push_sound || !c->retire_park ||
+        !c->play_opt || !c->freelist || !c->sounds || !c->sfreelist ||
         !c->dop_ring || !c->dc_bus || !c->dc_hist || !c->para || !c->ism_ring) {
         rt_destroy(c); return NULL;
     }
@@ -2645,6 +2809,9 @@ void rt_destroy(RtCore* c) {
     free(c->freelist);
     free(c->stealing);
     free(c->priority);
+    free(c->push_sound);
+    free(c->retire_park);
+    free(c->play_opt);
     free(c->inuse);
     free(c->gen);
     free(c->dop_ring);

@@ -9,7 +9,9 @@ desk-side debugging. Unity and Unreal connect as thin control clients over a C A
 Going direct (no FMOD/Wwise) gives sample-accurate access to ASIO timing hooks and
 keeps the core engine-agnostic, so the same library serves both engines with only a
 thin per-engine glue layer. The spatializer, mixer, output, and tracking all live
-in one process behind one audio callback.
+in one process behind one audio callback — the experiment deploys as one system on
+the machine running DVS, with no external renderer to author, synchronize, and
+maintain alongside it.
 
 ## Shape
 

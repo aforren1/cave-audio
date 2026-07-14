@@ -150,6 +150,21 @@ namespace BwAudio
         [DllImport(DLL, CallingConvention = CC)] public static extern void bwa_source_seek(IntPtr e, uint s, ulong frame);   // engine-rate frames; in-memory sounds
         [DllImport(DLL, CallingConvention = CC)] [return: MarshalAs(UnmanagedType.I1)] public static extern bool bwa_source_is_playing(IntPtr e, uint s);
         [DllImport(DLL, CallingConvention = CC)] public static extern void bwa_play_oneshot(IntPtr e, uint snd, float x, float y, float z, float gain);
+        // Procedural (push) sources: the voice plays PCM you push — mono float frames at the engine
+        // rate, ~1.3 s ring. Underrun renders silence without losing your place; push returns the
+        // count accepted (pace with push_space); push_end ends the voice once the ring drains (not
+        // restartable; stop/fade_out also end it). Push from the one control thread, like every bwa_* call.
+        [DllImport(DLL, CallingConvention = CC)] public static extern uint bwa_source_create_stream(IntPtr e);
+        [DllImport(DLL, EntryPoint = "bwa_source_push", CallingConvention = CC)] private static extern uint bwa_source_push_native(IntPtr e, uint s, float[] frames, uint n);
+        // n is clamped to frames.Length: push_space can report up to the full ring (65536), and passing
+        // it with a shorter buffer must never let native code read past the pinned array.
+        public static uint bwa_source_push(IntPtr e, uint s, float[] frames, uint n) {
+            if (frames == null) return 0;
+            if (n > (uint)frames.Length) n = (uint)frames.Length;
+            return bwa_source_push_native(e, s, frames, n);
+        }
+        [DllImport(DLL, CallingConvention = CC)] public static extern uint bwa_source_push_space(IntPtr e, uint s);
+        [DllImport(DLL, CallingConvention = CC)] public static extern void bwa_source_push_end(IntPtr e, uint s);
 
         // ---- ambisonic beds (world-locked diffuse soundfields) ----
         [DllImport(DLL, CallingConvention = CC)] public static extern uint bwa_bed_create(IntPtr e);

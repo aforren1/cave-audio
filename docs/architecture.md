@@ -11,7 +11,10 @@ precision are first-class requirements.
 
 The spatializer, mixer, device output, and tracking ingest all live in one native
 process behind a single audio callback. Unity/Unreal call a C ABI to trigger sounds
-and push positions. **No audio buffers cross the boundary**, only control.
+and push positions. **No rendered audio crosses the boundary** — the mix never
+routes through the game engine, only control. (The opt-in push-source API feeds
+caller-generated PCM *into* the engine over the same control thread; that is a
+source feed, not a render path.)
 
 Why:
 
@@ -21,6 +24,12 @@ Why:
   these.
 - **Engine-agnostic.** One core, two thin clients. The only per-engine code reads
   transforms and tracking.
+- **One system to run and author.** The experiment deploys as a single process on
+  the machine running DVS. The alternative — an external renderer (Spat, SSR, Max)
+  driven over OSC — means a second implementation in a second system: authored
+  separately, versioned separately, synchronized at runtime, and maintained by
+  whoever still knows that system. In-process control leaves nothing to keep in
+  sync.
 - **No middleware jitter.** Control is in-process over a lock-free ring, not OSC/UDP
   to a separate process with its own clock.
 

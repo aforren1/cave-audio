@@ -1399,6 +1399,191 @@ int main(void) {
         }
     }
 
+    /* push (procedural) source: caller-pushed PCM plays through the full mix path; an underrun
+     * renders silence WITHOUT ending the voice or losing the caller's place; push_end drains then
+     * ends; the internal sound slot retires with the source handle (cycles don't exhaust tables). */
+    {
+        RtCore* cps = rt_create(4, 4, RATE, CH);
+        CHECK(cps != NULL, "rt_create (push)");
+        if (cps) {
+            char perr[256] = {0};
+            uint32_t h = rt_source_create_stream(cps, perr, sizeof perr);
+            CHECK(h != 0, perr[0] ? perr : "rt_source_create_stream");
+            CHECK(rt_source_is_push(cps, h), "push source reads as push");
+            /* the play is still queued (no render yet) — a pending play must READ as playing, or the
+             * documented create->push->push_end->poll->destroy flow drops the clip in the first-block
+             * window (the poll sees false, the caller destroys early) */
+            CHECK(rt_source_is_playing(cps, h), "push: pending play reads as playing before the first block");
+            rt_source_set_pos(cps, h, 1.f, 0.f, 1.f);
+            rt_commit(cps);
+            render2(cps);                                       /* binds + consumes an EMPTY ring */
+            CHECK(total_l2() < 1e-9, "push: silent before any data (underrun, not garbage)");
+            CHECK(rt_source_is_playing(cps, h), "push: an empty ring does not end the voice");
+
+            float pblk[2 * N];
+            for (int i = 0; i < 2 * N; ++i) pblk[i] = 0.5f;
+            uint32_t space = rt_source_push_space(cps, h);
+            CHECK(space >= 2 * N, "push: space available");
+            CHECK(rt_source_push(cps, h, pblk, 2 * N) == 2 * N, "push accepts two blocks");
+            CHECK(rt_source_push_space(cps, h) == space - 2 * N, "push: space accounts for the pushed frames");
+            render2(cps);                                       /* consumes both pushed blocks */
+            CHECK(total_l2() > 1e-3, "pushed audio reaches the bus");
+            bwa_timestamp pts = { 0, 0 };
+            rt_render(cps, bus, N, &pts);
+            CHECK(total_l2() < 1e-9, "underrun after the pushed data: silence again");
+            CHECK(rt_source_is_playing(cps, h), "underrun does not end the voice");
+
+            /* data-driven clock: audio pushed after an underrun still plays (nothing was skipped) */
+            CHECK(rt_source_push(cps, h, pblk, N) == N, "push after an underrun");
+            rt_source_push_end(cps, h);
+            CHECK(rt_source_push(cps, h, pblk, N) == 0, "push after push_end is refused");
+            CHECK(rt_source_push_space(cps, h) == 0, "space is 0 after push_end");
+            rt_render(cps, bus, N, &pts);                       /* the tail drains this block */
+            CHECK(total_l2() > 1e-3, "the tail pushed after the underrun still plays");
+            rt_render(cps, bus, N, &pts);
+            CHECK(!rt_source_is_playing(cps, h), "voice ends once the pushed data drains");
+
+            /* rebinding a push source to a loaded asset is refused (the ring is the content) */
+            uint32_t sq = rt_load_sound(cps, WAV, err, sizeof err);
+            CHECK(sq != 0, "push: load asset for the rebind-refusal check");   /* sq==0 would pass vacuously */
+            rt_source_play(cps, h, sq, true);
+            render2(cps);
+            CHECK(total_l2() < 1e-9, "rt_source_play on a push source is refused");
+
+            /* handle death retires the internal sound: 8 create/destroy cycles through a 4-slot
+             * sound table only pass if each destroy recycles its slot (retire-ack per cycle) */
+            rt_source_destroy(cps, h);
+            CHECK(rt_source_push(cps, h, pblk, N) == 0, "push on a destroyed handle is dropped");
+            CHECK(!rt_source_is_playing(cps, h), "destroyed push handle reads not playing");
+            render2(cps); rt_commit(cps);                       /* retire lands; the ack drains on commit */
+            for (int k = 0; k < 8; ++k) {
+                uint32_t hk = rt_source_create_stream(cps, perr, sizeof perr);
+                CHECK(hk != 0, "push sound slots recycle across create/destroy cycles");
+                if (!hk) break;
+                rt_source_destroy(cps, hk);
+                render2(cps); rt_commit(cps);
+            }
+
+            /* stop ENDS a push source one-way (like push_end): a stopped push voice cannot re-arm
+             * (play is refused), so pushes must be refused too — not silently swallowed forever */
+            uint32_t hst = rt_source_create_stream(cps, perr, sizeof perr);
+            CHECK(hst != 0, "push: create for the stop test");
+            if (hst) {
+                CHECK(rt_source_push(cps, hst, pblk, N) == N, "push: feed before stop");
+                rt_source_stop(cps, hst);
+                CHECK(rt_source_push(cps, hst, pblk, N) == 0, "push after stop is refused (stop ends the stream)");
+                CHECK(rt_source_push_space(cps, hst) == 0, "push: no space after stop");
+                render2(cps);
+                CHECK(!rt_source_is_playing(cps, hst), "stop finalizes the push voice");
+                rt_source_destroy(cps, hst);
+                render2(cps); rt_commit(cps);
+            }
+            rt_destroy(cps);
+        }
+    }
+
+    /* steal reaps a DRAINED push source (playing=false after push_end, handle still held — every push
+     * source's normal terminal state): the steal must finalize + ack immediately (there is no fade to
+     * wait for), recycling the voice slot AND retiring the internal sound. Without that the control
+     * side waits forever (stealing[] sticks) and the sound/stream slots leak. */
+    {
+        RtCore* cs = rt_create(4, 4, RATE, CH);
+        CHECK(cs != NULL, "rt_create (steal-push)");
+        if (cs) {
+            char perr[256] = {0};
+            float blk[N]; for (int i = 0; i < N; ++i) blk[i] = 0.25f;
+            uint32_t hs[4] = {0};
+            for (int i = 0; i < 4; ++i) {
+                hs[i] = rt_source_create_stream(cs, perr, sizeof perr);
+                CHECK(hs[i] != 0, "steal-push: fill the pool");
+                if (!hs[i]) break;
+                rt_source_push(cs, hs[i], blk, N);
+                rt_source_push_end(cs, hs[i]);
+            }
+            render2(cs); render2(cs);                       /* bind, play the block, drain, end */
+            for (int i = 0; i < 4; ++i) CHECK(!rt_source_is_playing(cs, hs[i]), "steal-push: victim drained");
+            /* the user pool (4) is full of drained-but-held push sources: this create must steal one */
+            uint32_t hn = rt_source_create(cs);
+            CHECK(hn != 0, "steal-push: create steals a drained victim");
+            render2(cs);                                    /* CMD_SRC_STEAL -> immediate EVT (victim silent) */
+            rt_commit(cs);                                  /* ack: victim recycles, its internal sound retires */
+            render2(cs); rt_commit(cs);                     /* retire-ack: the ring closes, the slot frees */
+            int live = 0; for (int i = 0; i < 4; ++i) live += rt_source_is_push(cs, hs[i]) ? 1 : 0;
+            CHECK(live == 3, "steal-push: exactly one drained victim recycled");
+            /* the victim's sound slot must be free again: a new push source fits the 4-slot table
+             * (it steals another drained victim for the VOICE and needs the freed SOUND slot) */
+            uint32_t hp2 = rt_source_create_stream(cs, perr, sizeof perr);
+            CHECK(hp2 != 0, "steal-push: the steal retired the internal sound (slot reusable)");
+            rt_destroy(cs);
+        }
+    }
+
+    /* steal of a PLAYING push source rides the fade path: stopping=2 -> fade -> EVT_VOICE_ENDED ->
+     * push_sound_release. Same contract as the drained case, different audio-side route. */
+    {
+        RtCore* cp = rt_create(4, 4, RATE, CH);
+        CHECK(cp != NULL, "rt_create (steal-playing-push)");
+        if (cp) {
+            char perr[256] = {0};
+            float blk[N]; for (int i = 0; i < N; ++i) blk[i] = 0.25f;
+            uint32_t hs[4] = {0};
+            for (int i = 0; i < 4; ++i) {
+                hs[i] = rt_source_create_stream(cp, perr, sizeof perr);
+                CHECK(hs[i] != 0, "steal-playing: fill the pool");
+                if (!hs[i]) break;
+                for (int k = 0; k < 16; ++k) rt_source_push(cp, hs[i], blk, N);   /* deep buffer: stays playing */
+            }
+            render2(cp);                                    /* bind + consume; everything still playing */
+            for (int i = 0; i < 4; ++i) CHECK(rt_source_is_playing(cp, hs[i]), "steal-playing: victims live");
+            uint32_t hn = rt_source_create(cp);             /* full pool: steals a PLAYING push source */
+            CHECK(hn != 0, "steal-playing: create steals");
+            render2(cp);                                    /* block 1 fades the victim, block 2 finalizes + EVT */
+            rt_commit(cp);                                  /* ack: recycle + internal sound retires */
+            render2(cp); rt_commit(cp);                     /* retire-ack: ring closes, slot frees */
+            int live = 0; for (int i = 0; i < 4; ++i) live += rt_source_is_push(cp, hs[i]) ? 1 : 0;
+            CHECK(live == 3, "steal-playing: exactly one victim recycled through the fade");
+            uint32_t hp3 = rt_source_create_stream(cp, perr, sizeof perr);
+            CHECK(hp3 != 0, "steal-playing: the faded steal retired the internal sound");
+            rt_destroy(cp);
+        }
+    }
+
+    /* a push-source death whose internal CMD_SOUND_RETIRE hits a FULL command ring must park the
+     * retire and re-try at drain_events — not drop it (the handle is internal; nobody else can retry,
+     * so a drop leaks the sound slot + stream ring for the engine's lifetime). The pad sweep walks the
+     * ring fill across the boundary (RING_CAP = 4096 in rt.c; create_stream = 2 cmds, destroy = 1, the
+     * retire is the +1 that lands on the full ring at one pad in the sweep). */
+    {
+        RtCore* cf = rt_create(4, 4, RATE, CH);
+        CHECK(cf != NULL, "rt_create (parked retire)");
+        if (cf) {
+            char perr[256] = {0};
+            for (int pad = 4090; pad <= 4098; ++pad) {
+                uint32_t hp = rt_source_create_stream(cf, perr, sizeof perr);
+                CHECK(hp != 0, "parked retire: create_stream");
+                if (!hp) break;
+                for (int i = 0; i < pad; ++i) rt_source_set_pos(cf, hp, 0.f, 0.f, 1.f);
+                rt_source_destroy(cf, hp);                  /* one pad lands the retire on a full ring */
+                render2(cf); rt_commit(cf);                 /* drain; a parked retire re-enqueues here */
+                render2(cf); rt_commit(cf);                 /* retire-ack: ring closes, sound slot frees */
+                if (rt_source_is_push(cf, hp)) {            /* ring was dead-full: the DESTROY itself was
+                                                             * dropped (documented no-op) — retry it */
+                    rt_source_destroy(cf, hp);
+                    render2(cf); rt_commit(cf); render2(cf); rt_commit(cf);
+                }
+            }
+            /* nothing leaked across the sweep: all 4 sound slots must be allocatable AT ONCE */
+            uint32_t hk[4] = {0};
+            for (int k = 0; k < 4; ++k) {
+                hk[k] = rt_source_create_stream(cf, perr, sizeof perr);
+                CHECK(hk[k] != 0, "parked retire: no sound/stream slot leaked across the sweep");
+            }
+            for (int k = 0; k < 4; ++k) if (hk[k]) rt_source_destroy(cf, hk[k]);
+            render2(cf); rt_commit(cf); render2(cf); rt_commit(cf);
+            rt_destroy(cf);
+        }
+    }
+
     /* pause/resume + seek: the gate ramps to silence, the playhead freezes, seeks land click-free */
     {
         RtCore* cq = rt_create(4, 4, RATE, CH);

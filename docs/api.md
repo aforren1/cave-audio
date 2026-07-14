@@ -62,8 +62,9 @@ bwa_stop(eng); bwa_destroy(eng);
   keeps rendering into a silent offline sink. `bwa_get_audio_backend` reports which
   backend you actually got (see [Errors](#errors--return-codes)).
 - **Completion is polled, not called back**: `bwa_source_is_playing` publishes
-  once per audio block, so give a play command a moment to land before trusting
-  a `false` answer.
+  once per audio block. A play that hasn't reached the audio thread yet already
+  reads as playing (the pending play counts), so `false` from a live handle means
+  the voice really ended — poll-then-destroy is safe from the moment you play.
 
 ## Profiles and the master bus
 
@@ -302,6 +303,44 @@ it for one-shot variation, slow-mo, engines.
 Positions are in **room space** (see [Coordinates and units](#coordinates-and-units)).
 `bwa_play_oneshot` is the fire-and-forget path: it allocates a transient voice internally
 and recycles it on end, so the caller holds no handle.
+
+### Procedural (push) sources
+
+```c
+bwa_source bwa_source_create_stream(bwa_engine* e);            // 0 = failure (see bwa_last_error)
+uint32_t   bwa_source_push(bwa_engine* e, bwa_source s, const float* frames, uint32_t n); // frames accepted
+uint32_t   bwa_source_push_space(bwa_engine* e, bwa_source s); // frames a push would accept right now
+void       bwa_source_push_end(bwa_engine* e, bwa_source s);   // end-of-data: ends once drained
+```
+
+Engine-generated audio without a file: `bwa_source_create_stream` returns a source whose voice plays
+PCM **you push** — mono float frames at the engine sample rate, through a per-source ring (~1.3 s
+deep at 48 kHz). It is a normal source in every other way: position, gain, spread, occlusion,
+Doppler, groups, fades, pause — the full spatial path applies. Use it for synthesis, network audio,
+or bridging another engine's output.
+
+Three rules cover the model:
+
+- **The stream clock is data-driven.** The voice starts consuming at create: silence until your
+  first push, and if you fall behind (**underrun**) it renders silence *without losing your place* —
+  output resumes at the next pushed sample. It slips, it never drops. Stay a frame's worth ahead;
+  `bwa_source_push` returns the count accepted (short when the ring is full — pace with
+  `bwa_source_push_space`).
+- **Push from the one control thread**, like every `bwa_*` call — the ring is single-producer/
+  single-consumer. Non-finite samples are written as 0 (nothing hands NaN to the audio thread).
+- **Ending is one-way.** `bwa_source_push_end` marks end-of-data: the voice ends
+  (`bwa_source_is_playing` → false) once the ring drains, and further pushes are refused. A push
+  source is not restartable — create a new one. `bwa_source_stop` and `bwa_source_fade_out` end it
+  the same way (stop now / fade first; the unconsumed remainder is dropped, pushes are refused) —
+  use `bwa_source_set_paused` to silence one temporarily. `bwa_source_destroy` releases the ring
+  (safe while playing; retire-acked like any sound).
+
+`bwa_source_play` / `seek` / `pitch` don't apply — a push source plays what you push (`play` is
+rejected with an error; streams ignore seek/pitch as always). The reverse mix-up is reported too:
+`bwa_source_push` / `push_space` / `push_end` on a live **non-push** source return 0 / do nothing
+**with an error** (`bwa_last_error`), so a wrong handle never masquerades as ring backpressure (a
+stale handle stays the usual silent no-op). A full pool can **steal** a push
+source like any voice, dropping its pushed audio — protect an important one with priority 255.
 
 ### Master gain & global pause
 
@@ -896,7 +935,7 @@ do arithmetic on them.
 
 ## Planned extension point
 
-If engine-generated or procedural audio is later needed (not just wav files), add a
-`bwa_source_create_stream` returning a handle the caller pushes PCM into via a
-per-source ring — same control model, second feeding path. The source abstraction
-should therefore not assume "backed by a file," so this slots in without churn.
+This section used to sketch a `bwa_source_create_stream` for engine-generated audio. It exists now —
+see [Procedural (push) sources](#procedural-push-sources). It landed exactly as sketched: a handle
+the caller pushes PCM into via a per-source ring, same control model, second feeding path — the
+source abstraction never assumed "backed by a file," so it slotted in without churn.

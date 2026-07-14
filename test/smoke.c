@@ -123,11 +123,47 @@ done:
     return rc;
 }
 
+/* the push-API kind guards, at the ABI: pushing to a live NON-push source must accept nothing AND
+ * report (a bare 0 reads exactly like ring backpressure), a real push must work, and a pending play
+ * must read as playing before the first rendered block (the poll-then-destroy window). */
+static int run_push_guard(void) {
+    bwa_desc cfg = {
+        .profile     = BWA_PROFILE_CAVE,
+        .sample_rate = 48000,
+        .block_size  = 256,
+        .sink        = BWA_SINK_NULL,          /* hermetic: no real device */
+    };
+    int rc = 1;
+    float blk[64] = {0};
+    bwa_engine* e = bwa_create(&cfg);
+    if (!e) { fprintf(stderr, "FAIL[push]: bwa_create returned NULL\n"); return 1; }
+    if (bwa_start(e) != 0) { fprintf(stderr, "FAIL[push]: bwa_start: %s\n", bwa_last_error(e)); goto done; }
+    {
+        bwa_source plain = bwa_source_create(e);
+        bwa_source push  = bwa_source_create_stream(e);
+        if (!plain || !push) { fprintf(stderr, "FAIL[push]: source create\n"); goto done; }
+        if (!bwa_source_is_playing(e, push)) { fprintf(stderr, "FAIL[push]: pending play must read as playing\n"); goto done; }
+        if (bwa_source_push(e, plain, blk, 64) != 0 || !bwa_last_error(e)) {
+            fprintf(stderr, "FAIL[push]: push on a non-push source must accept nothing AND set bwa_last_error\n"); goto done;
+        }
+        if (bwa_source_push_space(e, plain) != 0) { fprintf(stderr, "FAIL[push]: push_space on a non-push source\n"); goto done; }
+        if (bwa_source_push(e, push, blk, 64) != 64) { fprintf(stderr, "FAIL[push]: push source refused frames\n"); goto done; }
+        bwa_source_destroy(e, push);
+        bwa_source_destroy(e, plain);
+    }
+    bwa_stop(e);
+    rc = 0;
+done:
+    bwa_destroy(e);
+    return rc;
+}
+
 int main(void) {
     if (run_profile(BWA_PROFILE_CAVE,     "cave"))     return 1;
     if (run_profile(BWA_PROFILE_BINAURAL, "binaural")) return 1;
     if (run_profile(BWA_PROFILE_BOTH,     "both"))     return 1;
     if (run_room_eq_guard())                          return 1;
-    printf("smoke OK (cave, binaural, both lifecycles; room_eq start guard)\n");
+    if (run_push_guard())                             return 1;
+    printf("smoke OK (cave, binaural, both lifecycles; room_eq start guard; push kind guards)\n");
     return 0;
 }

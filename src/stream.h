@@ -28,8 +28,10 @@ void       stream_set_destroy(StreamSet* set);
  * Returns a registered (inactive) Stream, or NULL with a message in `err`. Control thread (does I/O). */
 Stream*    stream_open(StreamSet* set, const char* path, char* err, size_t errcap);
 
-/* Stop + free a stream (control thread). Safe after the voice using it has stopped; blocks briefly to
- * ensure the streaming thread has released the decoder before the slot is reused. */
+/* Stop + free a stream (control thread). Safe after the voice using it has stopped. NON-BLOCKING:
+ * the streaming thread performs the whole teardown (decoder, slot, memory) on its next pass — this
+ * runs on the per-frame commit path and never waits on it. The pointer is dead after this call;
+ * the slot stays occupied until the reap (~ms). */
 void       stream_close(StreamSet* set, Stream* s);
 
 /* (Re)start playback from the beginning; `loop` != 0 wraps at EOF. The streaming thread re-seeks and
@@ -47,5 +49,25 @@ uint32_t   stream_pull(Stream* s, uint64_t pos, float* dst, uint32_t n);
 /* Audio thread: for a non-looping stream, has playback reached the end of the file at `pos`?
  * (Distinguishes a real EOF from a transient underrun, so the voice ends only at true EOF.) */
 int        stream_ended(const Stream* s, uint64_t pos);
+
+/* ---- push streams (procedural audio: the CALLER is the producer) ----
+ * A push stream has no file or decoder: the control thread writes PCM into the ring (stream_push)
+ * and the audio thread consumes it with the same stream_pull/stream_ended calls a file stream uses.
+ * The streaming thread never touches a push stream (there is nothing to fill), so the ring stays
+ * strictly SPSC: control produces, audio consumes. Born active — an empty ring is an underrun
+ * (renders silence), never an end. stream_start does not apply (a push stream can't restart). */
+Stream*    stream_open_push(StreamSet* set, char* err, size_t errcap);
+
+/* Append up to `n` mono engine-rate samples; returns the count accepted (short/0 when the ring is
+ * full or the stream was ended). Non-finite samples are written as 0 — nothing may hand NaN to the
+ * audio thread. Control thread (the single producer). */
+uint32_t   stream_push(Stream* s, const float* src, uint32_t n);
+
+/* Samples stream_push would accept right now (ring free space; 0 after stream_push_end). */
+uint32_t   stream_push_space(Stream* s);
+
+/* Mark end-of-data: stream_ended() turns true once everything pushed has been consumed, and
+ * further pushes are refused. Idempotent. Control thread. */
+void       stream_push_end(Stream* s);
 
 #endif /* BWA_STREAM_H */

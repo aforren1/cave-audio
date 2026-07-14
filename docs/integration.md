@@ -1,8 +1,11 @@
 # Engine integration
 
 Unity and Unreal differ only in how transforms and tracking are read and
-converted at the boundary. The audio code is identical. No audio crosses the
-boundary — only control calls on the main thread.
+converted at the boundary. The audio code is identical. No *rendered* audio
+crosses the boundary — the mix never routes through the game engine, only
+control calls on the main thread. The one inbound exception is the opt-in
+push-source feed (`bwa_source_push`): caller-generated PCM *into* the engine,
+on the same control thread — a source feed, not a render path.
 
 ## Coordinate seam (the part that silently ruins spatial audio)
 
@@ -163,6 +166,9 @@ The snippet shows the core calls. The shipped `Bwa.cs` binds the ABI **1:1** —
   (the layout's speaker count — see "Channel count" above; size meter/speaker
   arrays with it, never a hard-coded 26).
 - **Assets**: `bwa_load_sound_streaming`, `bwa_load_ambix`.
+- **Procedural (push) sources**: `bwa_source_create_stream`, `bwa_source_push`,
+  `bwa_source_push_space`, `bwa_source_push_end` — push mono engine-rate floats
+  from the main thread (the binding's control thread); see api.md.
 
 Two seams a binding must not get wrong, both handled in `Room` (see below):
 `bwa_bed_set_rotation` takes a **room-frame** yaw, and the X mirror **reverses the

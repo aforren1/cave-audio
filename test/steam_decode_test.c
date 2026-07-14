@@ -10,6 +10,7 @@
  */
 #include "steam_decode.h"
 #include "layout.h"
+#include "rt.h"            /* the live-composition probe drives the real DBAP bus + pose plumbing */
 #include "sink.h"          /* BWA_CHANNELS */
 
 #include <math.h>
@@ -78,6 +79,52 @@ int main(void) {
     decode_channel(m, right, yaw180);
     printf("right + 180:   L=%.4g R=%.4g\n", e_left(), e_right());
     CHECK(e_left() > e_right() * 1.1, "head turned 180: the right speaker now favors the left ear");
+
+    /* 4. the LIVE composition (render_binaural minus the device): a source rendered through the real
+     * rt core — DBAP gains, commit snapshot, pose plumbing — into the 26-ch bus, then this decode.
+     * Checks 1-3 drive single bus channels directly, so the rt×monitor seam (bus channel order vs
+     * layout positions, committed pose vs decode orientation) was unpinned — exactly where a live
+     * mirror could hide while every direct-drive check stays green. Source at room +x = the identity
+     * listener's LEFT (the room frame is RH, +y up, +z ahead: right ear at -x, bw_audio.h). */
+    {
+        RtCore* c = rt_create(4, 4, 48000, BWA_CHANNELS);
+        CHECK(c != NULL, "live: rt_create");
+        if (c) {
+            rt_set_layout(c, &L);
+            char perr[256] = {0};
+            uint32_t h = rt_source_create_stream(c, perr, sizeof perr);
+            CHECK(h != 0, "live: push source");
+            float* blk = (float*)malloc(sizeof(float) * 4 * N);
+            for (uint32_t i = 0; i < 4 * N; ++i) blk[i] = 0.5f;
+            rt_source_push(c, h, blk, 4 * N);
+            rt_source_set_pos(c, h, 1.5f, 1.5f, 0.f);        /* the playground's spawn side: room +x */
+            const float pl[3] = { 0.f, 1.5f, 0.f };          /* listener at the ear point */
+            const float qi[4] = { 0, 0, 0, 1 };
+            rt_set_listener(c, pl, qi);
+            rt_commit(c);
+            bwa_timestamp ts = { 0, 0 };
+            float pg[3], qg[4];                              /* the decode gets its pose the way
+                                                              * render_binaural does: rt_get_listener */
+            rt_render(c, bus, N, &ts);                       /* block 1: gains ramp in */
+            rt_render(c, bus, N, &ts);                       /* settled */
+            rt_get_listener(c, pg, qg);
+            steam_monitor_process(m, bus, pg, qg, out, N);   /* twice: phonon smears an orientation */
+            steam_monitor_process(m, bus, pg, qg, out, N);   /* change across its first block */
+            printf("live +x, ident: L=%.4g R=%.4g\n", e_left(), e_right());
+            CHECK(e_left() > e_right() * 1.1, "live: +x source (listener's LEFT) favors the left ear");
+            const float q180[4] = { 0, 1, 0, 0 };
+            rt_set_listener(c, pl, q180);                    /* array gains ignore orientation; the decode doesn't */
+            rt_commit(c);
+            rt_render(c, bus, N, &ts);
+            rt_get_listener(c, pg, qg);
+            steam_monitor_process(m, bus, pg, qg, out, N);
+            steam_monitor_process(m, bus, pg, qg, out, N);
+            printf("live +x, yaw180: L=%.4g R=%.4g\n", e_left(), e_right());
+            CHECK(e_right() > e_left() * 1.1, "live: head turned 180 - the +x source now favors the right ear");
+            free(blk);
+            rt_destroy(c);
+        }
+    }
 
     steam_monitor_destroy(m);
     free(bus); free(out);
