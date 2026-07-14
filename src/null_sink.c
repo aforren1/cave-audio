@@ -18,9 +18,9 @@
 #include <timeapi.h>        /* timeBeginPeriod/timeEndPeriod (link winmm) */
 
 typedef struct {
-    BwSink       base;
+    bwa_sink       base;
     uint32_t     sample_rate, block_size, channels;
-    BwRenderFn   render;
+    bwa_render_fn   render;
     void*        user;
     float*       bus;            /* planar channels * block_size */
     HANDLE       thread;
@@ -43,7 +43,7 @@ static void null_set_err(char* err, size_t cap, const char* msg) {
 
 static DWORD WINAPI null_thread(LPVOID arg) {
     NullSink* s = (NullSink*)arg;
-    BW_THREAD_NAME("bw-audio (null)");       /* same render() the ASIO callback drives — profile w/o hardware */
+    BWA_THREAD_NAME("bw-audio (null)");       /* same render() the ASIO callback drives — profile w/o hardware */
     LARGE_INTEGER lf; QueryPerformanceFrequency(&lf);
     const uint64_t freq = (uint64_t)lf.QuadPart;
     timeBeginPeriod(1);                      /* ~1ms Sleep granularity */
@@ -53,15 +53,15 @@ static DWORD WINAPI null_thread(LPVOID arg) {
     uint64_t sample_pos = 0, block_index = 0;
 
     while (!s->stop_flag) {
-        BwTimestamp ts = {
+        bwa_timestamp ts = {
             .sample_pos     = sample_pos,
             .system_time_ns = ticks_to_ns(qpc_now() - base, freq),
         };
-        BW_ZONE_BEGIN(zb, "null block");
+        BWA_ZONE_BEGIN(zb, "null block");
         s->render(s->user, s->bus, s->block_size, &ts);   /* engine produces a block */
         /* null sink: the rendered bus is intentionally discarded. */
-        BW_ZONE_END(zb);
-        BW_FRAME_MARK();
+        BWA_ZONE_END(zb);
+        BWA_FRAME_MARK();
 
         sample_pos  += s->block_size;
         block_index += 1;
@@ -81,7 +81,7 @@ static DWORD WINAPI null_thread(LPVOID arg) {
     return 0;
 }
 
-static int null_start(BwSink* base) {
+static int null_start(bwa_sink* base) {
     NullSink* s = (NullSink*)base;
     if (s->thread) return 0;                 /* already running */
     InterlockedExchange(&s->stop_flag, 0);
@@ -89,7 +89,7 @@ static int null_start(BwSink* base) {
     return s->thread ? 0 : 1;
 }
 
-static void null_stop(BwSink* base) {
+static void null_stop(bwa_sink* base) {
     NullSink* s = (NullSink*)base;
     if (!s->thread) return;
     InterlockedExchange(&s->stop_flag, 1);
@@ -98,23 +98,23 @@ static void null_stop(BwSink* base) {
     s->thread = NULL;
 }
 
-static void null_close(BwSink* base) {
+static void null_close(bwa_sink* base) {
     NullSink* s = (NullSink*)base;
     null_stop(base);
     free(s->bus);
     free(s);
 }
 
-static const char* null_backend(BwSink* base) { (void)base; return "null"; }
-static uint32_t null_block_size(BwSink* base) { return ((NullSink*)base)->block_size; }
+static const char* null_backend(bwa_sink* base) { (void)base; return "null"; }
+static uint32_t null_block_size(bwa_sink* base) { return ((NullSink*)base)->block_size; }
 
-static const BwSinkVtbl NULL_VT = {   /* designated: stop/close share a signature, so a positional swap would be silent */
+static const bwa_sink_vtbl NULL_VT = {   /* designated: stop/close share a signature, so a positional swap would be silent */
     .start = null_start, .stop = null_stop, .close = null_close,
     .backend = null_backend, .block_size = null_block_size,
 };
 
-BwSink* bw_null_sink_open(uint32_t sample_rate, uint32_t block_size, uint32_t channels,
-                          BwRenderFn render, void* user, char* err, size_t errcap) {
+bwa_sink* bwa_null_sink_open(uint32_t sample_rate, uint32_t block_size, uint32_t channels,
+                          bwa_render_fn render, void* user, char* err, size_t errcap) {
     if (!render || channels == 0 || block_size == 0 || sample_rate == 0) {
         null_set_err(err, errcap, "null_sink: bad arguments");
         return NULL;

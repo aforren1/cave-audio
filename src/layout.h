@@ -3,18 +3,18 @@
  * cave_layout.json (see docs/layout-schema.md). Control thread / load time only; the
  * audio thread reads a const Layout owned by rt.c. Not part of the public ABI.
  */
-#ifndef BW_LAYOUT_H
-#define BW_LAYOUT_H
+#ifndef BWA_LAYOUT_H
+#define BWA_LAYOUT_H
 
-#include "sink.h"          /* BW_CHANNELS */
+#include "sink.h"          /* BWA_CHANNELS */
 
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 
-#define BW_EQ_TAPS     512  /* max per-speaker correction-FIR length */
-#define BW_ROOM_EQ_MAX 8    /* max per-speaker LF modal-cut sections (static-listener room correction) */
-#define BW_RQ_GRID_MAX 16   /* max tracked-room-EQ measurement positions (room_eq_grid) */
+#define BWA_EQ_TAPS     512  /* max per-speaker correction-FIR length */
+#define BWA_ROOM_EQ_MAX 8    /* max per-speaker LF modal-cut sections (static-listener room correction) */
+#define BWA_RQ_GRID_MAX 16   /* max tracked-room-EQ measurement positions (room_eq_grid) */
 
 /* One parametric peaking section (RBJ), rate-independent in the file; align.c derives the biquad
  * coefficients at the engine rate. Cut-only by schema (gain_db <= 0). */
@@ -25,29 +25,29 @@ typedef struct {
     float    gain_lin;      /* per-speaker level trim (linear) */
     uint32_t delay_samples; /* per-speaker delay for arrival-time alignment */
     uint16_t eq_len;        /* per-speaker correction-FIR length (0 = none) */
-    float    eq[BW_EQ_TAPS];/* minimum-phase speaker-correction taps (gated direct-sound inverse) */
+    float    eq[BWA_EQ_TAPS];/* minimum-phase speaker-correction taps (gated direct-sound inverse) */
     uint8_t  room_eq_count; /* LF modal cuts — STATIC-listener room correction only (docs/calibration.md) */
-    RoomEqSection room_eq[BW_ROOM_EQ_MAX];
+    RoomEqSection room_eq[BWA_ROOM_EQ_MAX];
 } Speaker;
 
 /* Tracked room EQ (docs/calibration.md): the same LF modal cuts as room_eq, but measured at a GRID
- * of listener positions (bw_calibrate --room-eq-grid) so they survive a MOVING listener. The room's
+ * of listener positions (bwa_calibrate --room-eq-grid) so they survive a MOVING listener. The room's
  * mode frequencies don't move with the listener — only how strongly each mode reads at a position —
  * so per speaker there is ONE shared fc/q ladder, and per grid position that ladder's cut depths.
  * rt.c interpolates the depths at the live listener position each block (inverse-distance weights)
  * and align.c slews its biquads toward them. Mutually exclusive with per-speaker room_eq. */
 typedef struct {
     uint8_t  npos;                                     /* measurement positions (0 = no grid) */
-    float    pos[BW_RQ_GRID_MAX][3];                   /* mic positions, room meters */
-    uint8_t  nsec[BW_CHANNELS];                        /* ladder size per speaker */
-    float    fc[BW_CHANNELS][BW_ROOM_EQ_MAX];          /* ladder: mode centre frequencies (Hz) */
-    float    q [BW_CHANNELS][BW_ROOM_EQ_MAX];          /* ladder: mode Qs */
-    float    gain_db[BW_RQ_GRID_MAX][BW_CHANNELS][BW_ROOM_EQ_MAX];  /* per-position cut depths (<= 0) */
+    float    pos[BWA_RQ_GRID_MAX][3];                   /* mic positions, room meters */
+    uint8_t  nsec[BWA_CHANNELS];                        /* ladder size per speaker */
+    float    fc[BWA_CHANNELS][BWA_ROOM_EQ_MAX];          /* ladder: mode centre frequencies (Hz) */
+    float    q [BWA_CHANNELS][BWA_ROOM_EQ_MAX];          /* ladder: mode Qs */
+    float    gain_db[BWA_RQ_GRID_MAX][BWA_CHANNELS][BWA_ROOM_EQ_MAX];  /* per-position cut depths (<= 0) */
 } RoomEqGrid;
 
 typedef struct {
-    Speaker  speakers[BW_CHANNELS];
-    uint32_t count;                 /* == BW_CHANNELS once validated */
+    Speaker  speakers[BWA_CHANNELS];
+    uint32_t count;                 /* == BWA_CHANNELS once validated */
     /* nominal listening point = the array CENTROID, computed at load. The world-locked decodes
      * (ambisonic/reflection/pathing beds, the monitor's virtual-speaker encode) take their speaker
      * DIRECTIONS from here, and it is the engine's default listener pose — so the room origin can
@@ -76,4 +76,4 @@ bool layout_load(const char* path, uint32_t sample_rate, Layout* out, char* err,
 /* (Re)compute `ref` from the speaker positions — for callers that build a Layout by hand. */
 void layout_compute_ref(Layout* L);
 
-#endif /* BW_LAYOUT_H */
+#endif /* BWA_LAYOUT_H */

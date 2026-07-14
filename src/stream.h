@@ -11,8 +11,8 @@
  * rejected at open — pre-convert, or load in memory which resamples). One stream plays one voice at a
  * time (restarting re-seeks). WAV / FLAC / MP3 via dr_libs, decoded incrementally.
  */
-#ifndef BW_STREAM_H
-#define BW_STREAM_H
+#ifndef BWA_STREAM_H
+#define BWA_STREAM_H
 
 #include <stdint.h>
 #include <stddef.h>
@@ -48,4 +48,4 @@ uint32_t   stream_pull(Stream* s, uint64_t pos, float* dst, uint32_t n);
  * (Distinguishes a real EOF from a transient underrun, so the voice ends only at true EOF.) */
 int        stream_ended(const Stream* s, uint64_t pos);
 
-#endif /* BW_STREAM_H */
+#endif /* BWA_STREAM_H */

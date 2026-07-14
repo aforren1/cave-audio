@@ -16,8 +16,8 @@
  * against a synthetic capture with a known delay + gain + low-pass — the ASIO capture is the only part
  * that needs the rig.
  */
-#ifndef BW_MEASURE_H
-#define BW_MEASURE_H
+#ifndef BWA_MEASURE_H
+#define BWA_MEASURE_H
 
 #include <stdint.h>
 
@@ -112,4 +112,4 @@ int measure_room_cuts(const float* ir, int nir, int direct, double fs,
 }
 #endif
 
-#endif /* BW_MEASURE_H */
+#endif /* BWA_MEASURE_H */

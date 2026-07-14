@@ -6,8 +6,8 @@
  * NOT for the audio thread. Runtime frequency-domain work (convolution reflections, HRTF) goes through
  * phonon's own SIMD FFT; this is the calibration/analysis workhorse where correctness, not speed, rules.
  */
-#ifndef BW_FFT_H
-#define BW_FFT_H
+#ifndef BWA_FFT_H
+#define BWA_FFT_H
 
 #include <math.h>
 
@@ -44,4 +44,4 @@ static inline void fft(double* re, double* im, int n, int dir) {
 /* smallest power of two >= x (for zero-padding a real signal up to a radix-2 length). */
 static inline int next_pow2(int x) { int p = 1; while (p < x) p <<= 1; return p; }
 
-#endif /* BW_FFT_H */
+#endif /* BWA_FFT_H */

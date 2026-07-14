@@ -22,7 +22,7 @@
 #pragma warning(pop)
 #endif
 
-#define BW_PI 3.14159265358979323846
+#define BWA_PI 3.14159265358979323846
 
 static void set_err(char* err, size_t cap, const char* msg) {
     if (err && cap) { strncpy(err, msg, cap - 1); err[cap - 1] = 0; }
@@ -49,7 +49,7 @@ static float* decode_any(const char* path, unsigned int* ch, unsigned int* rate,
     *frames = (uint64_t)f; return p;
 }
 
-static double sinc(double x) { return (x == 0.0) ? 1.0 : sin(BW_PI * x) / (BW_PI * x); }
+static double sinc(double x) { return (x == 0.0) ? 1.0 : sin(BWA_PI * x) / (BWA_PI * x); }
 
 /* Resample mono `in` (n_in frames at fin) to fout. Windowed-sinc (Blackman), normalized, with the
  * cutoff dropped to the lower Nyquist on downsampling so it band-limits. Returns a new malloc'd
@@ -74,7 +74,7 @@ static float* resample_mono(const float* in, uint64_t n_in, uint32_t fin, uint32
         for (int64_t j = lo; j <= hi; ++j) {
             const double x = t - (double)j;            /* distance in input samples */
             const double wn = (x + half) / (2.0 * half);                 /* window position in [0,1] */
-            const double w  = 0.42 - 0.5 * cos(2.0 * BW_PI * wn) + 0.08 * cos(4.0 * BW_PI * wn); /* Blackman */
+            const double w  = 0.42 - 0.5 * cos(2.0 * BWA_PI * wn) + 0.08 * cos(4.0 * BWA_PI * wn); /* Blackman */
             const double h  = fc * sinc(fc * x) * w;
             acc += (double)in[j] * h; wsum += h;
         }

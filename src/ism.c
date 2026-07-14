@@ -1,6 +1,6 @@
 /*
  * ism.c — see ism.h. Mirroring a point across an axis-aligned plane is a one-line reflection:
- * the coordinate normal to the face becomes 2*plane - x. The room is floor-based (bw_scene_set_box):
+ * the coordinate normal to the face becomes 2*plane - x. The room is floor-based (bwa_scene_set_box):
  * x in [-w/2, w/2], y in [0, h], z in [-d/2, d/2].
  */
 #include "ism.h"

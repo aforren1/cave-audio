@@ -82,11 +82,11 @@ bool layout_load(const char* path, uint32_t sample_rate, Layout* out, char* err,
     bool ok = false;
     cJSON* speakers = cJSON_GetObjectItemCaseSensitive(root, "speakers");
     if (!cJSON_IsArray(speakers)) { set_err(err, errcap, "layout: missing 'speakers' array"); goto done; }
-    /* the layout's speaker count IS the engine's channel count: 4..BW_CHANNELS (the compile-time
+    /* the layout's speaker count IS the engine's channel count: 4..BWA_CHANNELS (the compile-time
      * CAPACITY — collaborator arrays with fewer speakers load into the same binary) */
     const int nspk = cJSON_GetArraySize(speakers);
-    if (nspk < 4 || nspk > (int)BW_CHANNELS) {
-        set_err(err, errcap, "layout: 'speakers' must have 4..26 entries (26 = BW_CHANNELS cap)"); goto done;
+    if (nspk < 4 || nspk > (int)BWA_CHANNELS) {
+        set_err(err, errcap, "layout: 'speakers' must have 4..26 entries (26 = BWA_CHANNELS cap)"); goto done;
     }
 
     cJSON* dbap = cJSON_GetObjectItemCaseSensitive(root, "dbap");
@@ -116,7 +116,7 @@ bool layout_load(const char* path, uint32_t sample_rate, Layout* out, char* err,
         }
     }
 
-    bool seen[BW_CHANNELS];
+    bool seen[BWA_CHANNELS];
     memset(seen, 0, sizeof seen);
     uint32_t maxdelay = 0;
     for (int i = 0; i < nspk; ++i) {
@@ -164,8 +164,8 @@ bool layout_load(const char* path, uint32_t sample_rate, Layout* out, char* err,
         cJSON* eqj = cJSON_GetObjectItemCaseSensitive(sp, "eq");
         if (cJSON_IsArray(eqj)) {
             int m = cJSON_GetArraySize(eqj);
-            if (m > BW_EQ_TAPS) {   /* reject rather than silently truncate the kernel mid-tap (a discontinuity) */
-                set_err(err, errcap, "layout: eq FIR longer than BW_EQ_TAPS (512)"); goto done;
+            if (m > BWA_EQ_TAPS) {   /* reject rather than silently truncate the kernel mid-tap (a discontinuity) */
+                set_err(err, errcap, "layout: eq FIR longer than BWA_EQ_TAPS (512)"); goto done;
             }
             for (int t = 0; t < m; ++t) {
                 cJSON* v = cJSON_GetArrayItem(eqj, t);
@@ -181,7 +181,7 @@ bool layout_load(const char* path, uint32_t sample_rate, Layout* out, char* err,
         cJSON* rqj = cJSON_GetObjectItemCaseSensitive(sp, "room_eq");
         if (cJSON_IsArray(rqj)) {
             int m = cJSON_GetArraySize(rqj);
-            if (m > BW_ROOM_EQ_MAX) { set_err(err, errcap, "layout: room_eq has more than BW_ROOM_EQ_MAX (8) sections"); goto done; }
+            if (m > BWA_ROOM_EQ_MAX) { set_err(err, errcap, "layout: room_eq has more than BWA_ROOM_EQ_MAX (8) sections"); goto done; }
             for (int t = 0; t < m; ++t) {
                 cJSON* o  = cJSON_GetArrayItem(rqj, t);
                 cJSON* fj = cJSON_IsObject(o) ? cJSON_GetObjectItemCaseSensitive(o, "fc")      : NULL;
@@ -204,13 +204,13 @@ bool layout_load(const char* path, uint32_t sample_rate, Layout* out, char* err,
     for (int i = 0; i < nspk; ++i)
         if (!seen[i]) { set_err(err, errcap, "layout: missing a speaker index in 0..count-1"); goto done; }
 
-    /* optional tracked-room-EQ grid (bw_calibrate --room-eq-grid writes it; see layout.h). Every
+    /* optional tracked-room-EQ grid (bwa_calibrate --room-eq-grid writes it; see layout.h). Every
      * position must carry the SAME per-speaker fc/q ladder — only the depths vary — because the
      * runtime interpolates depths by ladder index; a mismatched ladder would blend unrelated modes. */
     cJSON* grid = cJSON_GetObjectItemCaseSensitive(root, "room_eq_grid");
     if (cJSON_IsArray(grid)) {
         int np = cJSON_GetArraySize(grid);
-        if (np < 1 || np > (int)BW_RQ_GRID_MAX) {
+        if (np < 1 || np > (int)BWA_RQ_GRID_MAX) {
             set_err(err, errcap, "layout: room_eq_grid must have 1..16 positions"); goto done;
         }
         for (int p = 0; p < np; ++p) {
@@ -232,7 +232,7 @@ bool layout_load(const char* path, uint32_t sample_rate, Layout* out, char* err,
                 cJSON* secs = cJSON_GetArrayItem(spks, s);
                 if (!cJSON_IsArray(secs)) { set_err(err, errcap, "layout: room_eq_grid speaker entry is not an array"); goto done; }
                 int m = cJSON_GetArraySize(secs);
-                if (m > BW_ROOM_EQ_MAX) { set_err(err, errcap, "layout: room_eq_grid has more than 8 sections for a speaker"); goto done; }
+                if (m > BWA_ROOM_EQ_MAX) { set_err(err, errcap, "layout: room_eq_grid has more than 8 sections for a speaker"); goto done; }
                 if (p == 0) out->rq_grid.nsec[s] = (uint8_t)m;
                 else if (m != (int)out->rq_grid.nsec[s]) {
                     set_err(err, errcap, "layout: room_eq_grid positions disagree on a speaker's section count"); goto done;
@@ -267,7 +267,7 @@ bool layout_load(const char* path, uint32_t sample_rate, Layout* out, char* err,
             }
     }
 
-    /* a loaded layout with fewer than BW_CHANNELS speakers leaves the tail entries at the default
+    /* a loaded layout with fewer than BWA_CHANNELS speakers leaves the tail entries at the default
      * grid's values — harmless: count gates every consumer, and the engine's channel count follows it */
     out->count             = (uint32_t)nspk;
     out->max_delay_samples = maxdelay;

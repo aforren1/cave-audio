@@ -1,7 +1,7 @@
 # Internal types & helper contracts
 
 These types are **internal** to `src/` — they are *not* part of the public ABI
-and must **not** go in [`include/bwaudio.h`](../include/bwaudio.h).
+and must **not** go in [`include/bw_audio.h`](../include/bw_audio.h).
 
 This file pins the protocol fields that [`concurrency.md`](./concurrency.md)
 reasons about and summarizes the per-subsystem field groups around them. It
@@ -15,13 +15,13 @@ tables, and asset (`SoundSlot`) memory.
 
 ## Handles
 
-`BwSource` / `BwSound` are `uint32_t = (index | generation<<16)` — the
-`BW_H_IDX` / `BW_H_GEN` / `BW_MK_H` macros in [`src/rt.h`](../src/rt.h). Index
+`bwa_source` / `bwa_sound` are `uint32_t = (index | generation<<16)` — the
+`BWA_H_IDX` / `BWA_H_GEN` / `BWA_MK_H` macros in [`src/rt.h`](../src/rt.h). Index
 and generation are each 16-bit, so the voice and sound tables are each ≤ 65536
 slots and generations wrap at 2¹⁶. The wrap is safe: a stale handle only has to
 differ from the *current* occupant of the slot.
 
-`rt_create` adds `BW_FADE_RESERVE` (8) physical voice slots beyond the requested
+`rt_create` adds `BWA_FADE_RESERVE` (8) physical voice slots beyond the requested
 pool, kept free so a stolen voice can fade out on its own slot (see
 concurrency.md).
 
@@ -47,21 +47,21 @@ typedef struct {
     float    pos_pending[3];       /* room space; written by CMD_SET_POS */
     float    pos_active[3];        /* promoted on CMD_COMMIT; the mixer reads only this */
     float    gain_user;            /* linear, from CMD_SET_GAIN (default 1.0) */
-    float    gtarget[BW_CHANNELS]; /* panner solve output (per-speaker target gains) */
-    float    gcur[BW_CHANNELS];    /* ramp state; mix_voice interpolates gcur -> gtarget */
+    float    gtarget[BWA_CHANNELS]; /* panner solve output (per-speaker target gains) */
+    float    gcur[BWA_CHANNELS];    /* ramp state; mix_voice interpolates gcur -> gtarget */
 
     /* ... ~35 more fields; groups below ... */
 } Voice;
 ```
 
-`BW_CHANNELS` (26) is defined in [`src/sink.h`](../src/sink.h) and is the
-**capacity**, not the count. Every `[BW_CHANNELS]` array in these structs — gain
+`BWA_CHANNELS` (26) is defined in [`src/sink.h`](../src/sink.h) and is the
+**capacity**, not the count. Every `[BWA_CHANNELS]` array in these structs — gain
 vectors, the bed decode matrix, the meters — is sized to that capacity, but only
 the first `RtCore.channels` entries are used. `channels` is the loaded layout's
 speaker count (`Layout.count`, 4..26; 26 for the default grid), resolved in
-`bw_create` *before* `rt_create` and fixed for the engine's lifetime. It is what
-`bw_channel_count` reports. Loops over the bus must use `channels`, never
-`BW_CHANNELS` — the tail entries belong to no speaker.
+`bwa_create` *before* `rt_create` and fixed for the engine's lifetime. It is what
+`bwa_get_channel_count` reports. Loops over the bus must use `channels`, never
+`BWA_CHANNELS` — the tail entries belong to no speaker.
 
 The rest of the struct is per-subsystem DSP state, one group per feature. All of
 it is audio-thread-only (ramp state, filter histories), which is why it lives
@@ -69,7 +69,7 @@ it is audio-thread-only (ramp state, filter histories), which is why it lives
 
 - **scheduling / streaming** — `oneshot` (self-recycling voice),
   `stream_pos` (absolute position into a stream's ring),
-  `start_sample` (dsp-sample for a scheduled `bw_source_play_at`).
+  `start_sample` (dsp-sample for a scheduled `bwa_source_play_at`).
 - **dual-band panning** — `gtarget_lo` / `gcur_lo` (amplitude-normalised LF
   gain set), `xover_lp` (crossover one-pole state), `dual_mix` (0↔1 A/B
   crossfade factor).
@@ -97,7 +97,7 @@ typedef struct {
 ```
 
 The position drives the panners; the quaternion drives the binaural monitor and
-is also handed to the reflection/pathing taps. Under `track_internal`,
+is also handed to the reflection/pathing taps. With a tracker connected,
 `rt_render` overwrites the active fields from the tracker's seqlock each block.
 
 ## Sound (control thread owns; audio thread only reads via const*)
@@ -139,8 +139,8 @@ Notes:
 
 See [`layout-schema.md`](./layout-schema.md) for the file format. Replaceable
 while the audio thread is stopped (`rt_set_layout`). Its `count` is the engine's
-channel count — the loader accepts 4..`BW_CHANNELS` speakers whose indices form a
-complete `0..count-1` permutation, and a layout with fewer than `BW_CHANNELS`
+channel count — the loader accepts 4..`BWA_CHANNELS` speakers whose indices form a
+complete `0..count-1` permutation, and a layout with fewer than `BWA_CHANNELS`
 leaves the tail `speakers[]` entries at the default grid's values (harmless:
 `count` gates every consumer). From [`src/layout.h`](../src/layout.h):
 
@@ -152,14 +152,14 @@ typedef struct {
     float    gain_lin;             /* per-speaker level trim (linear) */
     uint32_t delay_samples;        /* per-speaker arrival-time alignment */
     uint16_t eq_len;               /* correction-FIR length (0 = none) */
-    float    eq[BW_EQ_TAPS];       /* 512 taps max; minimum-phase speaker correction */
+    float    eq[BWA_EQ_TAPS];       /* 512 taps max; minimum-phase speaker correction */
     uint8_t  room_eq_count;        /* LF modal cuts (static-listener installs only) */
-    RoomEqSection room_eq[BW_ROOM_EQ_MAX];   /* 8 sections max */
+    RoomEqSection room_eq[BWA_ROOM_EQ_MAX];   /* 8 sections max */
 } Speaker;
 
 typedef struct {
-    Speaker  speakers[BW_CHANNELS];   /* capacity; only `count` are real */
-    uint32_t count;                /* 4..BW_CHANNELS — and it IS the engine's channel count */
+    Speaker  speakers[BWA_CHANNELS];   /* capacity; only `count` are real */
+    uint32_t count;                /* 4..BWA_CHANNELS — and it IS the engine's channel count */
     float    ref[3];               /* nominal listening point = the array centroid */
     float    rolloff_r;            /* DBAP spatial blur (meters) */
     /* distance attenuation: atten = clamp((ref/max(d,ref))^rolloff, min_lin, 1) */
@@ -168,29 +168,29 @@ typedef struct {
 } Layout;
 ```
 
-## Engine (the opaque `BwEngine`)
+## Engine (the opaque `bwa_engine`)
 
 The engine state sits at two levels.
 
 **`RtCore`** (rt.c, opaque behind [`src/rt.h`](../src/rt.h)) is the real-time
 core: the two rings, the voice table + `Listener`, the `Layout` + `Aligner`, and
 the control-side allocation state (`gen` / `inuse` / `priority` / `stealing` /
-free-lists, plus the `SoundSlot` table). The whole `bw_*` API forwards to it.
+free-lists, plus the `SoundSlot` table). The whole `bwa_*` API forwards to it.
 
-**`BwEngine`** (engine.c) is the ABI-facing shell around it:
+**`bwa_engine`** (engine.c) is the ABI-facing shell around it:
 
 ```c
-struct BwEngine {                /* abridged; see engine.c */
-    BwConfig    cfg;
-    BwProfile   profile;
+struct bwa_engine {                /* abridged; see engine.c */
+    bwa_desc    cfg;
+    bwa_profile   profile;
     RtCore*     rt;              /* rings + voice/sound tables + mixer */
     Monitor*    monitor;         /* binaural/both: speaker bus -> stereo decode */
     Layout      layout;          /* effective geometry; layout.count IS the channel count */
-    BwSink*     sink;            /* primary device (cave: layout.count ch / binaural: 2 ch) */
-    BwSink*     sink_mon;        /* both: the monitor (2-ch) device */
+    bwa_sink*     sink;            /* primary device (cave: layout.count ch / binaural: 2 ch) */
+    bwa_sink*     sink_mon;        /* both: the monitor (2-ch) device */
     float*      scratch26;       /* binaural: array render before the monitor decode */
     float*      mon_buf[2];      /* both: stereo double-buffer, array -> monitor thread */
-    NatNet*     tracker;         /* track_internal pose ingest (NULL otherwise) */
+    NatNet*     tracker;         /* internal tracking (bwa_tracker_connect); NULL otherwise */
     SteamMonitor* steam;         /* production HRTF decode; NULL = simple-pan fallback */
     SteamScene* scene;  SteamReflect* reflect;  SteamPath* path;
     /* + material table, per-source position mirror, error buffer */
@@ -200,7 +200,7 @@ struct BwEngine {                /* abridged; see engine.c */
 There is no bus field in either struct. The bus is a `float* bus` **argument**
 to `rt_render`, supplied per block by whichever sink render callback is running
 — the device's own buffer for `cave`, `scratch26` for `binaural`. (`scratch26` is
-allocated at the `BW_CHANNELS` capacity; `rt_render` fills only `channels` of it.)
+allocated at the `BWA_CHANNELS` capacity; `rt_render` fills only `channels` of it.)
 
 ### Also lives in RtCore
 
@@ -211,7 +211,7 @@ reference):
   `layout_gen`; the `panner` / `dual_band` atomics.
 - **channel count** — `channels` (the layout's speaker count; set at `rt_create`),
   the width every bus loop, decode matrix, and meter array actually runs to.
-- **bed decode** — the `bed_decode[BW_CHANNELS][BW_AMBI_CH]` matrix (built for the
+- **bed decode** — the `bed_decode[BWA_CHANNELS][BWA_AMBI_CH]` matrix (built for the
   first `channels` rows) + `bed_decoder` selector (SAD / AllRAD).
 - **limiter** — `lim_on` / `lim_ceiling` atomics, the `lim_gain` envelope,
   rate-derived attack/release coefficients.
@@ -263,8 +263,8 @@ Two things that are *not* helpers here:
 
 - **The binaural decode** is a sink render callback in engine.c
   (`render_binaural` → `monitor_process` / `steam_monitor_process`), not a bus
-  tap. Steam Audio's phonon objects are created at `bw_start`, and the decode
+  tap. Steam Audio's phonon objects are created at `bwa_start`, and the decode
   runs inside the sink callback.
-- **Device output** goes through the `BwSink` abstraction
+- **Device output** goes through the `bwa_sink` abstraction
   ([`src/sink.h`](../src/sink.h)), whose render callback fills the device's
   planar buffers directly.

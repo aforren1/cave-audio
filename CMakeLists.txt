@@ -1,4 +1,4 @@
-# bwaudio — self-hosted spatial audio engine for a 26-speaker CAVE array.
+# bw_audio — self-hosted spatial audio engine for a 26-speaker CAVE array.
 # See docs/ for the design; CLAUDE.md for invariants.
 #
 # Milestones realized so far (docs/roadmap.md):
@@ -9,13 +9,13 @@
 #   M3 — wav playback (sound.c + dr_wav via FetchContent) + the retire-ack handshake.
 #   M4 — DBAP spatialization: layout.c (cave_layout.json via cJSON) + dbap.c + align.c.
 cmake_minimum_required(VERSION 3.20)
-project(bwaudio LANGUAGES C VERSION 0.0.1)
+project(bw_audio LANGUAGES C VERSION 0.0.1)
 
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 
 if(NOT WIN32)
-  message(WARNING "bwaudio targets Windows (ASIO + Win32 audio thread). Non-Windows is unsupported for now.")
+  message(WARNING "bw_audio targets Windows (ASIO + Win32 audio thread). Non-Windows is unsupported for now.")
 endif()
 
 # The codebase uses standard C string functions (strncpy etc.); silence MSVC's
@@ -44,10 +44,10 @@ set(CJSON_C   "${cjson_src_SOURCE_DIR}/cJSON.c")
 set(CJSON_INC "${cjson_hdr_SOURCE_DIR}")
 
 # ---- optional Tracy profiler instrumentation (opt-in; default build stays lean) ----
-# cmake -S . -B build -DBWAUDIO_TRACY=ON, then connect the standalone Tracy profiler to the running
+# cmake -S . -B build -DBWA_TRACY=ON, then connect the standalone Tracy profiler to the running
 # engine. ON_DEMAND => the client only collects while a profiler is attached (near-zero idle cost).
-option(BWAUDIO_TRACY "Instrument with the Tracy profiler (fetches Tracy)" OFF)
-if(BWAUDIO_TRACY)
+option(BWA_TRACY "Instrument with the Tracy profiler (fetches Tracy)" OFF)
+if(BWA_TRACY)
   set(TRACY_ENABLE    ON CACHE BOOL "" FORCE)
   set(TRACY_ON_DEMAND ON CACHE BOOL "" FORCE)
   FetchContent_Declare(tracy
@@ -59,7 +59,7 @@ endif()
 # ---- shared core (everything except the public ABI shim and the device sinks) ----
 # An OBJECT library so the off-RT-path tests can compile the core in directly and reach
 # its internals, without re-listing sources per target.
-add_library(bw_core OBJECT
+add_library(bwa_core OBJECT
   src/rt.c
   src/sound.c
   src/layout.c
@@ -80,10 +80,10 @@ add_library(bw_core OBJECT
   src/stream.c
   ${CJSON_C}
 )
-target_include_directories(bw_core PUBLIC src include ${dr_libs_SOURCE_DIR} ${CJSON_INC})   # include/: frame.h consumes the BW_ROOM_* basis
-target_link_libraries(bw_core PUBLIC ws2_32)   # natnet.c uses Winsock (propagates to consumers)
+target_include_directories(bwa_core PUBLIC src include ${dr_libs_SOURCE_DIR} ${CJSON_INC})   # include/: frame.h consumes the BWA_ROOM_* basis
+target_link_libraries(bwa_core PUBLIC ws2_32)   # natnet.c uses Winsock (propagates to consumers)
 if(MSVC)
-  target_compile_options(bw_core PRIVATE /W4)
+  target_compile_options(bwa_core PRIVATE /W4)
   # rt.c uses C11 <stdatomic.h>, gated behind /experimental:c11atomics (directory-scoped,
   # so it applies wherever rt.c is compiled). cJSON is third-party: silence its warnings.
   set_source_files_properties(src/rt.c PROPERTIES COMPILE_OPTIONS /experimental:c11atomics)
@@ -92,99 +92,99 @@ if(MSVC)
   set_source_files_properties(${CJSON_C} PROPERTIES COMPILE_OPTIONS /W0)
 endif()
 
-# ---- core library (public C ABI in include/bwaudio.h) ----
-add_library(bwaudio SHARED
+# ---- core library (public C ABI in include/bw_audio.h) ----
+add_library(bw_audio SHARED
   src/engine.c
   src/sink.c
   src/null_sink.c
-  $<TARGET_OBJECTS:bw_core>
+  $<TARGET_OBJECTS:bwa_core>
 )
-target_include_directories(bwaudio PUBLIC include PRIVATE src ${dr_libs_SOURCE_DIR} ${CJSON_INC})
-target_compile_definitions(bwaudio PRIVATE BW_BUILD_DLL)
+target_include_directories(bw_audio PUBLIC include PRIVATE src ${dr_libs_SOURCE_DIR} ${CJSON_INC})
+target_compile_definitions(bw_audio PRIVATE BWA_BUILD_DLL)
 if(MSVC)
-  target_compile_options(bwaudio PRIVATE /W4)
+  target_compile_options(bw_audio PRIVATE /W4)
 endif()
 if(WIN32)
-  target_link_libraries(bwaudio PRIVATE winmm ws2_32)   # winmm: timeBeginPeriod (null_sink); ws2_32: natnet
+  target_link_libraries(bw_audio PRIVATE winmm ws2_32)   # winmm: timeBeginPeriod (null_sink); ws2_32: natnet
 endif()
 
-if(BWAUDIO_TRACY)
-  # bw_core is an OBJECT lib: linking TracyClient gives rt.c Tracy's headers (no link step here); the
-  # DLL links the actual client. BW_TRACY flips profile.h's macros on for both compile groups.
-  target_link_libraries(bw_core PRIVATE TracyClient)
-  target_compile_definitions(bw_core PRIVATE BW_TRACY)
-  target_link_libraries(bwaudio PRIVATE TracyClient)
-  target_compile_definitions(bwaudio PRIVATE BW_TRACY)
-  message(STATUS "bwaudio: Tracy profiling ENABLED")
+if(BWA_TRACY)
+  # bwa_core is an OBJECT lib: linking TracyClient gives rt.c Tracy's headers (no link step here); the
+  # DLL links the actual client. BWA_TRACY flips profile.h's macros on for both compile groups.
+  target_link_libraries(bwa_core PRIVATE TracyClient)
+  target_compile_definitions(bwa_core PRIVATE BWA_TRACY)
+  target_link_libraries(bw_audio PRIVATE TracyClient)
+  target_compile_definitions(bw_audio PRIVATE BWA_TRACY)
+  message(STATUS "bw_audio: Tracy profiling ENABLED")
 endif()
 
 # ---- optional ASIO backend (production: 26ch -> DVS -> Dante) ----
 # Auto-enabled when the SDK is present; the SDK is GPLv3/proprietary dual-licensed
 # and is NOT committed to this repo (third_party/README.md explains how to fetch it).
 set(ASIO_SDK_DIR "${CMAKE_SOURCE_DIR}/third_party/asiosdk" CACHE PATH "Steinberg ASIO SDK root")
-option(BWAUDIO_WITH_ASIO "Build the ASIO backend (needs the Steinberg ASIO SDK)" OFF)
+option(BWA_WITH_ASIO "Build the ASIO backend (needs the Steinberg ASIO SDK)" OFF)
 if(EXISTS "${ASIO_SDK_DIR}/common/asio.h")
-  set(BWAUDIO_WITH_ASIO ON)
+  set(BWA_WITH_ASIO ON)
 endif()
 
-if(BWAUDIO_WITH_ASIO)
+if(BWA_WITH_ASIO)
   if(NOT EXISTS "${ASIO_SDK_DIR}/common/asio.h")
-    message(FATAL_ERROR "BWAUDIO_WITH_ASIO=ON but no ASIO SDK at ${ASIO_SDK_DIR} (see third_party/README.md)")
+    message(FATAL_ERROR "BWA_WITH_ASIO=ON but no ASIO SDK at ${ASIO_SDK_DIR} (see third_party/README.md)")
   endif()
   enable_language(CXX)
   # C++20 on the DLL: asio_sink.cpp uses designated initializers (ASIO_VT) — MSVC needs /std:c++20 for
   # those. Target-scoped (not a global set()) so it can't leak into other targets or the vendored SDK.
-  target_compile_features(bwaudio PRIVATE cxx_std_20)
-  target_sources(bwaudio PRIVATE
+  target_compile_features(bw_audio PRIVATE cxx_std_20)
+  target_sources(bw_audio PRIVATE
     src/asio_sink.cpp
     ${ASIO_SDK_DIR}/common/asio.cpp
     ${ASIO_SDK_DIR}/host/asiodrivers.cpp
     ${ASIO_SDK_DIR}/host/pc/asiolist.cpp)
-  target_include_directories(bwaudio PRIVATE
+  target_include_directories(bw_audio PRIVATE
     ${ASIO_SDK_DIR}/common ${ASIO_SDK_DIR}/host ${ASIO_SDK_DIR}/host/pc)
-  target_compile_definitions(bwaudio PRIVATE BW_HAVE_ASIO _CRT_SECURE_NO_WARNINGS)
-  target_link_libraries(bwaudio PRIVATE ole32 user32 advapi32)
-  message(STATUS "bwaudio: ASIO backend ENABLED (${ASIO_SDK_DIR})")
+  target_compile_definitions(bw_audio PRIVATE BWA_HAVE_ASIO _CRT_SECURE_NO_WARNINGS)
+  target_link_libraries(bw_audio PRIVATE ole32 user32 advapi32)
+  message(STATUS "bw_audio: ASIO backend ENABLED (${ASIO_SDK_DIR})")
 else()
-  message(STATUS "bwaudio: ASIO backend disabled (no SDK at ${ASIO_SDK_DIR}); null sink only")
+  message(STATUS "bw_audio: ASIO backend disabled (no SDK at ${ASIO_SDK_DIR}); null sink only")
 endif()
 
 # ---- optional Steam Audio backend (production binaural HRTF decode; later occlusion/reflections) ----
 # Apache-2.0 (GPLv3-compatible). Auto-enabled when the prebuilt phonon SDK is vendored at
 # third_party/steam-audio-artifacts/ (third_party/README.md). Stage 1 of the production monitor (the SH encode
 # in src/ambisonics.c) is always built + tested; stage 2 (the ambisonics->binaural HRTF decode, gated
-# BW_HAVE_STEAMAUDIO) supersedes the first-cut pan in binaural.c and lands with the SDK, on-SDK-verified.
+# BWA_HAVE_STEAMAUDIO) supersedes the first-cut pan in binaural.c and lands with the SDK, on-SDK-verified.
 set(STEAMAUDIO_DIR "${CMAKE_SOURCE_DIR}/third_party/steam-audio-artifacts" CACHE PATH "Steam Audio (phonon) SDK root")
 if(EXISTS "${STEAMAUDIO_DIR}/include/phonon.h")
-  set(BW_STEAMAUDIO_FOUND TRUE)   # consumed by the with-SDK reflection test below
-  target_sources(bwaudio PRIVATE src/steam_decode.c src/steam_scene.c src/steam_reflect.c src/steam_path.c)  # HRTF decode + occlusion + reflections + pathing (with-SDK)
+  set(BWA_STEAMAUDIO_FOUND TRUE)   # consumed by the with-SDK reflection test below
+  target_sources(bw_audio PRIVATE src/steam_decode.c src/steam_scene.c src/steam_reflect.c src/steam_path.c)  # HRTF decode + occlusion + reflections + pathing (with-SDK)
   if(MSVC)   # steam_reflect.c uses C11 <stdatomic.h> (the IR-publish seqlock), like rt.c
     set_source_files_properties(src/steam_reflect.c PROPERTIES COMPILE_OPTIONS /experimental:c11atomics)
   endif()
-  target_include_directories(bwaudio PRIVATE "${STEAMAUDIO_DIR}/include")
-  target_link_libraries(bwaudio PRIVATE "${STEAMAUDIO_DIR}/lib/windows-x64/phonon.lib")
-  target_compile_definitions(bwaudio PRIVATE BW_HAVE_STEAMAUDIO)
+  target_include_directories(bw_audio PRIVATE "${STEAMAUDIO_DIR}/include")
+  target_link_libraries(bw_audio PRIVATE "${STEAMAUDIO_DIR}/lib/windows-x64/phonon.lib")
+  target_compile_definitions(bw_audio PRIVATE BWA_HAVE_STEAMAUDIO)
   if(WIN32)
-    add_custom_command(TARGET bwaudio POST_BUILD
+    add_custom_command(TARGET bw_audio POST_BUILD
       COMMAND ${CMAKE_COMMAND} -E copy_if_different
-              "${STEAMAUDIO_DIR}/lib/windows-x64/phonon.dll" $<TARGET_FILE_DIR:bwaudio>)   # runtime dep
+              "${STEAMAUDIO_DIR}/lib/windows-x64/phonon.dll" $<TARGET_FILE_DIR:bw_audio>)   # runtime dep
   endif()
-  message(STATUS "bwaudio: Steam Audio ENABLED (${STEAMAUDIO_DIR}); binaural uses the HRTF decode")
+  message(STATUS "bw_audio: Steam Audio ENABLED (${STEAMAUDIO_DIR}); binaural uses the HRTF decode")
 else()
-  message(STATUS "bwaudio: Steam Audio disabled (no SDK at ${STEAMAUDIO_DIR}); binaural uses the first-cut pan")
+  message(STATUS "bw_audio: Steam Audio disabled (no SDK at ${STEAMAUDIO_DIR}); binaural uses the first-cut pan")
 endif()
 
 # ---- stage runtime DLLs into the Unity package (bindings/unity/Runtime/Plugins/x86_64) ----
 # Gitignored build artifacts; the UPM package picks them up so it "just works" after a build.
 if(WIN32)
-  set(BW_UNITY_PLUGINS "${CMAKE_SOURCE_DIR}/bindings/unity/Runtime/Plugins/x86_64")
-  if(EXISTS "${BW_UNITY_PLUGINS}")
-    add_custom_command(TARGET bwaudio POST_BUILD
-      COMMAND ${CMAKE_COMMAND} -E copy_if_different $<TARGET_FILE:bwaudio> "${BW_UNITY_PLUGINS}")
-    if(BW_STEAMAUDIO_FOUND)
-      add_custom_command(TARGET bwaudio POST_BUILD
+  set(BWA_UNITY_PLUGINS "${CMAKE_SOURCE_DIR}/bindings/unity/Runtime/Plugins/x86_64")
+  if(EXISTS "${BWA_UNITY_PLUGINS}")
+    add_custom_command(TARGET bw_audio POST_BUILD
+      COMMAND ${CMAKE_COMMAND} -E copy_if_different $<TARGET_FILE:bw_audio> "${BWA_UNITY_PLUGINS}")
+    if(BWA_STEAMAUDIO_FOUND)
+      add_custom_command(TARGET bw_audio POST_BUILD
         COMMAND ${CMAKE_COMMAND} -E copy_if_different
-                "${STEAMAUDIO_DIR}/lib/windows-x64/phonon.dll" "${BW_UNITY_PLUGINS}")
+                "${STEAMAUDIO_DIR}/lib/windows-x64/phonon.dll" "${BWA_UNITY_PLUGINS}")
     endif()
   endif()
 endif()
@@ -193,7 +193,7 @@ endif()
 # the target. The raylib tools name their icon resource GLFW_ICON so the window/taskbar pick it up;
 # the rest use ordinal 1 (calib_view loads it for its window class). Regenerate the .ico family
 # with examples/icons/gen_icons.py (the .ico files are committed; builds never need Python).
-function(bw_tool_icon target)
+function(bwa_tool_icon target)
   if(WIN32)
     target_sources(${target} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/examples/icons/${target}.rc)
   endif()
@@ -202,48 +202,47 @@ endfunction()
 # ---- tests ----
 # ---- minimal client example (the whole API lifecycle in one file; compiled every build so it
 # can't drift from the ABI) ----
-add_executable(bw_minimal examples/minimal.c)
-target_link_libraries(bw_minimal PRIVATE bwaudio)
-bw_tool_icon(bw_minimal)
+add_executable(bwa_minimal examples/minimal.c)
+target_link_libraries(bwa_minimal PRIVATE bw_audio)
+bwa_tool_icon(bwa_minimal)
 if(WIN32)
-  add_custom_command(TARGET bw_minimal POST_BUILD
+  add_custom_command(TARGET bwa_minimal POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
-            $<TARGET_FILE:bwaudio> $<TARGET_FILE_DIR:bw_minimal>)   # bwaudio.dll next to the exe
+            $<TARGET_FILE:bw_audio> $<TARGET_FILE_DIR:bwa_minimal>)   # bw_audio.dll next to the exe
 endif()
 
-# ---- track monitor example (console; prints the live track_internal pose) ----
-add_executable(bw_track_monitor examples/track_monitor.c)
-target_link_libraries(bw_track_monitor PRIVATE bwaudio)
-bw_tool_icon(bw_track_monitor)
+# ---- track monitor example (console; prints the live tracked pose) ----
+add_executable(bwa_track_monitor examples/track_monitor.c)
+target_link_libraries(bwa_track_monitor PRIVATE bw_audio)
+bwa_tool_icon(bwa_track_monitor)
 if(WIN32)
-  add_custom_command(TARGET bw_track_monitor POST_BUILD
+  add_custom_command(TARGET bwa_track_monitor POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
-            $<TARGET_FILE:bwaudio> $<TARGET_FILE_DIR:bw_track_monitor>)   # bwaudio.dll next to the exe
+            $<TARGET_FILE:bw_audio> $<TARGET_FILE_DIR:bwa_track_monitor>)   # bw_audio.dll next to the exe
 endif()
 
-# ---- headless profiling bench (representative load for Tracy; build with -DBWAUDIO_TRACY=ON) ----
-add_executable(bw_profile_bench examples/profile_bench.c)
-target_link_libraries(bw_profile_bench PRIVATE bwaudio)
-bw_tool_icon(bw_profile_bench)
+# ---- headless profiling bench (representative load for Tracy; build with -DBWA_TRACY=ON) ----
+add_executable(bwa_profile_bench examples/profile_bench.c)
+target_link_libraries(bwa_profile_bench PRIVATE bw_audio)
+bwa_tool_icon(bwa_profile_bench)
 if(WIN32)
-  add_custom_command(TARGET bw_profile_bench POST_BUILD
+  add_custom_command(TARGET bwa_profile_bench POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
-            $<TARGET_FILE:bwaudio> $<TARGET_FILE_DIR:bw_profile_bench>)
+            $<TARGET_FILE:bw_audio> $<TARGET_FILE_DIR:bwa_profile_bench>)
 endif()
 
-option(BWAUDIO_BUILD_TESTS "Build the bwaudio tests" ON)
-if(BWAUDIO_BUILD_TESTS)
+option(BWA_BUILD_TESTS "Build the bw_audio tests" ON)
+if(BWA_BUILD_TESTS)
   enable_testing()
 
   # lifecycle smoke against the public ABI / DLL
   add_executable(test_smoke test/smoke.c)
-  target_link_libraries(test_smoke PRIVATE bwaudio)
+  target_link_libraries(test_smoke PRIVATE bw_audio)
   add_test(NAME smoke COMMAND test_smoke)
-  set_tests_properties(smoke PROPERTIES ENVIRONMENT "BWAUDIO_SINK=null")   # hermetic: no real device
   if(WIN32)
     add_custom_command(TARGET test_smoke POST_BUILD
       COMMAND ${CMAKE_COMMAND} -E copy_if_different
-              $<TARGET_FILE:bwaudio> $<TARGET_FILE_DIR:test_smoke>)           # .dll next to the .exe
+              $<TARGET_FILE:bw_audio> $<TARGET_FILE_DIR:test_smoke>)           # .dll next to the .exe
   endif()
 
   # audio-loop check: drives the null sink directly (no core needed)
@@ -254,76 +253,76 @@ if(BWAUDIO_BUILD_TESTS)
   endif()
   add_test(NAME audio_sink COMMAND test_audio_sink)
 
-  # off-RT-path checks that compile the core in (bw_core PUBLIC includes propagate)
+  # off-RT-path checks that compile the core in (bwa_core PUBLIC includes propagate)
   add_executable(test_rt    test/rt_test.c)
-  target_link_libraries(test_rt PRIVATE bw_core)
+  target_link_libraries(test_rt PRIVATE bwa_core)
   add_test(NAME rt COMMAND test_rt)
 
   # Doppler-quality probe (diagnostic; prints an FFT spectrum report, not a ctest)
   add_executable(test_doppler_fft test/doppler_fft.c)
-  target_link_libraries(test_doppler_fft PRIVATE bw_core)
+  target_link_libraries(test_doppler_fft PRIVATE bwa_core)
 
   add_executable(test_sound test/sound_test.c)
-  target_link_libraries(test_sound PRIVATE bw_core)
+  target_link_libraries(test_sound PRIVATE bwa_core)
   add_test(NAME sound COMMAND test_sound)
 
   add_executable(test_dsp   test/dsp_test.c)
-  target_link_libraries(test_dsp PRIVATE bw_core)
+  target_link_libraries(test_dsp PRIVATE bwa_core)
   add_test(NAME dsp COMMAND test_dsp)
 
   add_executable(test_monitor test/monitor_test.c)
-  target_link_libraries(test_monitor PRIVATE bw_core)
+  target_link_libraries(test_monitor PRIVATE bwa_core)
   add_test(NAME monitor COMMAND test_monitor)
 
   add_executable(test_natnet test/natnet_test.c)
-  target_link_libraries(test_natnet PRIVATE bw_core)
+  target_link_libraries(test_natnet PRIVATE bwa_core)
   add_test(NAME natnet COMMAND test_natnet)
 
   add_executable(test_ambi test/ambi_test.c)
-  target_link_libraries(test_ambi PRIVATE bw_core)
+  target_link_libraries(test_ambi PRIVATE bwa_core)
   add_test(NAME ambi COMMAND test_ambi)
 
   add_executable(test_measure test/measure_test.c)
-  target_link_libraries(test_measure PRIVATE bw_core)
+  target_link_libraries(test_measure PRIVATE bwa_core)
   add_test(NAME measure COMMAND test_measure)
 
   add_executable(test_stream test/stream_test.c)
-  target_link_libraries(test_stream PRIVATE bw_core)
+  target_link_libraries(test_stream PRIVATE bwa_core)
   add_test(NAME stream COMMAND test_stream)
 
   add_executable(test_calib test/calib_test.c)
-  target_link_libraries(test_calib PRIVATE bw_core)
+  target_link_libraries(test_calib PRIVATE bwa_core)
   add_test(NAME calib COMMAND test_calib)
 
   # Cross-validation against independent implementations (scipy SH / l1-LP VBAP / qhull
   # AllRAD / bilinear RBJ / lfilter goldens in test/xval_data.h, regenerated by
   # tools/xval/gen_reference.py — the test itself is hermetic, no Python needed).
   add_executable(test_xval test/xval_test.c)
-  target_link_libraries(test_xval PRIVATE bw_core)
+  target_link_libraries(test_xval PRIVATE bwa_core)
   add_test(NAME xval COMMAND test_xval)
 
   # Directional FDN reverb bed: drives fdn_tap directly (like the reflect test does the Steam bed) —
   # decay lands on target, anisotropy is real, output is directional, long runs stay finite.
   add_executable(test_fdn test/fdn_test.c)
-  target_link_libraries(test_fdn PRIVATE bw_core)
+  target_link_libraries(test_fdn PRIVATE bwa_core)
   add_test(NAME fdn COMMAND test_fdn)
 
   # Image-source early reflections: the shoebox mirror geometry (the rt test drives the render).
   add_executable(test_ism test/ism_test.c)
-  target_link_libraries(test_ism PRIVATE bw_core)
+  target_link_libraries(test_ism PRIVATE bwa_core)
   add_test(NAME ism COMMAND test_ism)
 
   add_executable(test_zylia test/zylia_test.c)
-  target_link_libraries(test_zylia PRIVATE bw_core)
+  target_link_libraries(test_zylia PRIVATE bwa_core)
   add_test(NAME zylia COMMAND test_zylia)
 
   # Directional reflection-bed check (with-SDK only): compiles the steam objects in + links phonon,
   # drives steam_reflect_tap directly, asserts the reverb is directional. Needs the alignment patch.
-  if(BW_STEAMAUDIO_FOUND)
+  if(BWA_STEAMAUDIO_FOUND)
     add_executable(test_reflect test/reflect_test.c src/steam_scene.c src/steam_reflect.c)
     target_include_directories(test_reflect PRIVATE src "${STEAMAUDIO_DIR}/include")
-    target_link_libraries(test_reflect PRIVATE bw_core "${STEAMAUDIO_DIR}/lib/windows-x64/phonon.lib")
-    target_compile_definitions(test_reflect PRIVATE BW_HAVE_STEAMAUDIO)
+    target_link_libraries(test_reflect PRIVATE bwa_core "${STEAMAUDIO_DIR}/lib/windows-x64/phonon.lib")
+    target_compile_definitions(test_reflect PRIVATE BWA_HAVE_STEAMAUDIO)
     if(MSVC)   # steam_reflect.c's seqlock uses C11 <stdatomic.h>
       set_source_files_properties(src/steam_reflect.c PROPERTIES COMPILE_OPTIONS /experimental:c11atomics)
     endif()
@@ -336,8 +335,8 @@ if(BWAUDIO_BUILD_TESTS)
 
     add_executable(test_bake test/bake_test.c src/steam_scene.c src/steam_reflect.c)
     target_include_directories(test_bake PRIVATE src "${STEAMAUDIO_DIR}/include")
-    target_link_libraries(test_bake PRIVATE bw_core "${STEAMAUDIO_DIR}/lib/windows-x64/phonon.lib")
-    target_compile_definitions(test_bake PRIVATE BW_HAVE_STEAMAUDIO)
+    target_link_libraries(test_bake PRIVATE bwa_core "${STEAMAUDIO_DIR}/lib/windows-x64/phonon.lib")
+    target_compile_definitions(test_bake PRIVATE BWA_HAVE_STEAMAUDIO)
     if(MSVC)
       set_source_files_properties(src/steam_reflect.c PROPERTIES COMPILE_OPTIONS /experimental:c11atomics)
     endif()
@@ -351,8 +350,8 @@ if(BWAUDIO_BUILD_TESTS)
     # Pathing: routes a source around an occluding wall (visibility bake + pathing sim).
     add_executable(test_path test/path_test.c src/steam_scene.c src/steam_path.c)
     target_include_directories(test_path PRIVATE src "${STEAMAUDIO_DIR}/include")
-    target_link_libraries(test_path PRIVATE bw_core "${STEAMAUDIO_DIR}/lib/windows-x64/phonon.lib")
-    target_compile_definitions(test_path PRIVATE BW_HAVE_STEAMAUDIO)
+    target_link_libraries(test_path PRIVATE bwa_core "${STEAMAUDIO_DIR}/lib/windows-x64/phonon.lib")
+    target_compile_definitions(test_path PRIVATE BWA_HAVE_STEAMAUDIO)
     if(WIN32)
       add_custom_command(TARGET test_path POST_BUILD
         COMMAND ${CMAKE_COMMAND} -E copy_if_different
@@ -363,8 +362,8 @@ if(BWAUDIO_BUILD_TESTS)
     # HRTF decode (production monitor): the 26->stereo Steam Audio decode runs + preserves laterality.
     add_executable(test_steam_decode test/steam_decode_test.c src/steam_decode.c)
     target_include_directories(test_steam_decode PRIVATE src "${STEAMAUDIO_DIR}/include")
-    target_link_libraries(test_steam_decode PRIVATE bw_core "${STEAMAUDIO_DIR}/lib/windows-x64/phonon.lib")
-    target_compile_definitions(test_steam_decode PRIVATE BW_HAVE_STEAMAUDIO)
+    target_link_libraries(test_steam_decode PRIVATE bwa_core "${STEAMAUDIO_DIR}/lib/windows-x64/phonon.lib")
+    target_compile_definitions(test_steam_decode PRIVATE BWA_HAVE_STEAMAUDIO)
     if(WIN32)
       add_custom_command(TARGET test_steam_decode POST_BUILD
         COMMAND ${CMAKE_COMMAND} -E copy_if_different
@@ -374,14 +373,14 @@ if(BWAUDIO_BUILD_TESTS)
   endif()
 
   # Optional: AddressSanitizer build of the sound test (M3 unload-safety / UAF check).
-  option(BWAUDIO_ASAN "Build test_sound with AddressSanitizer" OFF)
-  if(BWAUDIO_ASAN AND MSVC)
+  option(BWA_ASAN "Build test_sound with AddressSanitizer" OFF)
+  if(BWA_ASAN AND MSVC)
     target_compile_options(test_sound PRIVATE /fsanitize=address)
     target_link_options(test_sound PRIVATE /INCREMENTAL:NO)
   endif()
 endif()
 
-# ---- Shared Dear ImGui stack for the GUI tools (bw_calib_view, bw_layout_tool) ----
+# ---- Shared Dear ImGui stack for the GUI tools (bwa_calib_view, bwa_layout_tool) ----
 # One pinned copy of imgui + imgui_test_engine, compiled INTO each tool as target sources (not a
 # library: the test-engine define below must be seen by every imgui-including TU of an executable,
 # and keeping it per-target makes that explicit). imgui and imgui_test_engine tags track each
@@ -393,9 +392,9 @@ endif()
 # in ImGuiTestEngine_Start), and capture must be explicitly enabled (else screenshots are silently
 # skipped). imgui_te_imconfig.h would default the latter two but is not auto-included; explicit
 # defines are clearer than routing IMGUI_USER_CONFIG through it.
-option(BWAUDIO_BUILD_PLAYGROUND "Build the interactive raylib playground + the layout tool (fetches raylib/imgui)" OFF)
-option(BWAUDIO_BUILD_CALIBVIEW "Build the imgui calibration report viewer (fetches imgui/implot/implot3d/test-engine)" OFF)
-if(BWAUDIO_BUILD_PLAYGROUND OR BWAUDIO_BUILD_CALIBVIEW)
+option(BWA_BUILD_PLAYGROUND "Build the interactive raylib playground + the layout tool (fetches raylib/imgui)" OFF)
+option(BWA_BUILD_CALIBVIEW "Build the imgui calibration report viewer (fetches imgui/implot/implot3d/test-engine)" OFF)
+if(BWA_BUILD_PLAYGROUND OR BWA_BUILD_CALIBVIEW)
   enable_language(CXX)
   # SOURCE_SUBDIR points at a non-existent dir: populate sources only, never their own demo builds.
   FetchContent_Declare(imgui
@@ -405,7 +404,7 @@ if(BWAUDIO_BUILD_PLAYGROUND OR BWAUDIO_BUILD_CALIBVIEW)
     URL https://github.com/ocornut/imgui_test_engine/archive/refs/tags/v1.92.8.tar.gz
     DOWNLOAD_EXTRACT_TIMESTAMP TRUE SOURCE_SUBDIR not_built)
   FetchContent_MakeAvailable(imgui imgui_te)
-  set(BW_IMGUI_SOURCES
+  set(BWA_IMGUI_SOURCES
     ${imgui_SOURCE_DIR}/imgui.cpp
     ${imgui_SOURCE_DIR}/imgui_draw.cpp
     ${imgui_SOURCE_DIR}/imgui_tables.cpp
@@ -419,21 +418,21 @@ if(BWAUDIO_BUILD_PLAYGROUND OR BWAUDIO_BUILD_CALIBVIEW)
     ${imgui_te_SOURCE_DIR}/imgui_test_engine/imgui_te_ui.cpp
     ${imgui_te_SOURCE_DIR}/imgui_test_engine/imgui_te_utils.cpp
     ${imgui_te_SOURCE_DIR}/imgui_test_engine/imgui_capture_tool.cpp)
-  set(BW_IMGUI_INC
+  set(BWA_IMGUI_INC
     ${imgui_SOURCE_DIR} ${imgui_SOURCE_DIR}/backends
     ${imgui_te_SOURCE_DIR} ${imgui_te_SOURCE_DIR}/imgui_test_engine)
-  set(BW_IMGUI_DEFS
+  set(BWA_IMGUI_DEFS
     IMGUI_ENABLE_TEST_ENGINE
     IMGUI_TEST_ENGINE_ENABLE_COROUTINE_STDTHREAD_IMPL=1
     IMGUI_TEST_ENGINE_ENABLE_CAPTURE=1)
 endif()
 
 # ---- Optional: interactive playground (evaluate the binaural monitor by ear) ----
-# Opt-in so the default build stays lean: cmake -S . -B build -DBWAUDIO_BUILD_PLAYGROUND=ON
+# Opt-in so the default build stays lean: cmake -S . -B build -DBWA_BUILD_PLAYGROUND=ON
 # Drives the binaural profile live to headphones (auto-picked 2-ch ASIO driver; null-sink
-# fallback keeps it rendering visual-only without one). Links the public ABI (bwaudio.h,
-# propagated by the bwaudio target) + raylib; uses its own dr_wav copy to generate the wavs.
-if(BWAUDIO_BUILD_PLAYGROUND)
+# fallback keeps it rendering visual-only without one). Links the public ABI (bw_audio.h,
+# propagated by the bw_audio target) + raylib; uses its own dr_wav copy to generate the wavs.
+if(BWA_BUILD_PLAYGROUND)
   set(BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)        # raylib: skip its own examples/games
   FetchContent_Declare(raylib
     GIT_REPOSITORY https://github.com/raysan5/raylib.git
@@ -447,56 +446,56 @@ if(BWAUDIO_BUILD_PLAYGROUND)
   FetchContent_MakeAvailable(raylib rlimgui)
 
   # Same UI stack as the layout tool: raylib 3D scene + Dear ImGui control panel via rlImGui, themed
-  # like the station (bw_theme.h), with imgui_test_engine driving the panel under ctest (`--tests` —
+  # like the station (bwa_theme.h), with imgui_test_engine driving the panel under ctest (`--tests` —
   # forced onto the null sink, so the suite also pins the no-device fallback staying LIVE).
-  add_executable(bw_playground examples/playground.cpp ${CJSON_C}   # cJSON: constraints_view.h
-    ${rlimgui_SOURCE_DIR}/rlImGui.cpp ${BW_IMGUI_SOURCES})
-  target_include_directories(bw_playground PRIVATE ${dr_libs_SOURCE_DIR} ${CJSON_INC}
-    ${rlimgui_SOURCE_DIR} ${BW_IMGUI_INC})
-  target_compile_definitions(bw_playground PRIVATE ${BW_IMGUI_DEFS} NO_FONT_AWESOME STB_IMAGE_WRITE_STATIC)
-  target_compile_features(bw_playground PRIVATE cxx_std_20)      # C++20: the C-style designated inits stay
-  target_link_libraries(bw_playground PRIVATE bwaudio raylib)
-  bw_tool_icon(bw_playground)
+  add_executable(bwa_playground examples/playground.cpp ${CJSON_C}   # cJSON: constraints_view.h
+    ${rlimgui_SOURCE_DIR}/rlImGui.cpp ${BWA_IMGUI_SOURCES})
+  target_include_directories(bwa_playground PRIVATE ${dr_libs_SOURCE_DIR} ${CJSON_INC}
+    ${rlimgui_SOURCE_DIR} ${BWA_IMGUI_INC})
+  target_compile_definitions(bwa_playground PRIVATE ${BWA_IMGUI_DEFS} NO_FONT_AWESOME STB_IMAGE_WRITE_STATIC)
+  target_compile_features(bwa_playground PRIVATE cxx_std_20)      # C++20: the C-style designated inits stay
+  target_link_libraries(bwa_playground PRIVATE bw_audio raylib)
+  bwa_tool_icon(bwa_playground)
   if(WIN32)
-    add_custom_command(TARGET bw_playground POST_BUILD
+    add_custom_command(TARGET bwa_playground POST_BUILD
       COMMAND ${CMAKE_COMMAND} -E copy_if_different
-              $<TARGET_FILE:bwaudio> $<TARGET_FILE_DIR:bw_playground>)   # bwaudio.dll next to the exe
+              $<TARGET_FILE:bw_audio> $<TARGET_FILE_DIR:bwa_playground>)   # bw_audio.dll next to the exe
   endif()
-  if(BWAUDIO_BUILD_TESTS)
-    add_test(NAME playground COMMAND bw_playground --tests)       # the GUI itself, driven by fake inputs
+  if(BWA_BUILD_TESTS)
+    add_test(NAME playground COMMAND bwa_playground --tests)       # the GUI itself, driven by fake inputs
   endif()
 
   # Speaker-layout authoring tool: place the 26 speakers + identify each by ear (the channel test
   # signal) + export cave_layout.json. The 3D room view (orbit + head view, picking, coverage) is
-  # raylib; every control surface is Dear ImGui via rlImGui, themed like the station (bw_theme.h),
+  # raylib; every control surface is Dear ImGui via rlImGui, themed like the station (bwa_theme.h),
   # with imgui_test_engine driving the panel under ctest (`--tests`). Compiles its own cJSON copy.
-  add_executable(bw_layout_tool examples/layout_tool.cpp ${CJSON_C}
-    ${rlimgui_SOURCE_DIR}/rlImGui.cpp ${BW_IMGUI_SOURCES})
-  target_include_directories(bw_layout_tool PRIVATE ${CJSON_INC} ${rlimgui_SOURCE_DIR} ${BW_IMGUI_INC})
+  add_executable(bwa_layout_tool examples/layout_tool.cpp ${CJSON_C}
+    ${rlimgui_SOURCE_DIR}/rlImGui.cpp ${BWA_IMGUI_SOURCES})
+  target_include_directories(bwa_layout_tool PRIVATE ${CJSON_INC} ${rlimgui_SOURCE_DIR} ${BWA_IMGUI_INC})
   # STB_IMAGE_WRITE_STATIC: raylib's rtextures embeds stb_image_write with external linkage, and so
   # does the test engine's capture tool — making the latter's copy static avoids the LNK2005 clash.
-  target_compile_definitions(bw_layout_tool PRIVATE ${BW_IMGUI_DEFS} NO_FONT_AWESOME STB_IMAGE_WRITE_STATIC)
-  target_compile_features(bw_layout_tool PRIVATE cxx_std_17)      # bw_theme.h uses inline variables
-  target_link_libraries(bw_layout_tool PRIVATE bwaudio raylib)
-  bw_tool_icon(bw_layout_tool)
+  target_compile_definitions(bwa_layout_tool PRIVATE ${BWA_IMGUI_DEFS} NO_FONT_AWESOME STB_IMAGE_WRITE_STATIC)
+  target_compile_features(bwa_layout_tool PRIVATE cxx_std_17)      # bwa_theme.h uses inline variables
+  target_link_libraries(bwa_layout_tool PRIVATE bw_audio raylib)
+  bwa_tool_icon(bwa_layout_tool)
   if(WIN32)
-    add_custom_command(TARGET bw_layout_tool POST_BUILD
+    add_custom_command(TARGET bwa_layout_tool POST_BUILD
       COMMAND ${CMAKE_COMMAND} -E copy_if_different
-              $<TARGET_FILE:bwaudio> $<TARGET_FILE_DIR:bw_layout_tool>)
+              $<TARGET_FILE:bw_audio> $<TARGET_FILE_DIR:bwa_layout_tool>)
   endif()
-  if(BWAUDIO_BUILD_TESTS)
-    add_test(NAME layout_tool COMMAND bw_layout_tool --tests)     # the GUI itself, driven by fake inputs
+  if(BWA_BUILD_TESTS)
+    add_test(NAME layout_tool COMMAND bwa_layout_tool --tests)     # the GUI itself, driven by fake inputs
   endif()
 endif()
 
 # ---- Optional: calibration report viewer (Dear ImGui pilot: win32 + d3d11) ----
-# cmake -S . -B build -DBWAUDIO_BUILD_CALIBVIEW=ON
-# Inspect what bw_calibrate wrote before trusting it: per-speaker trims, correction-EQ magnitudes,
+# cmake -S . -B build -DBWA_BUILD_CALIBVIEW=ON
+# Inspect what bwa_calibrate wrote before trusting it: per-speaker trims, correction-EQ magnitudes,
 # retained IRs, the array in 3D, and a layout DIFF (surveyed vs calibrated / before vs after
 # writeback). This is the imgui + implot + implot3d pilot (vs the raylib tools): the win32+d3d11
 # backend, and imgui_test_engine drives the GUI with FAKE INPUTS under ctest (`--selftest`) — a GUI
 # with an automated regression test. imgui + test engine come from the shared stack above.
-if(BWAUDIO_BUILD_CALIBVIEW)
+if(BWA_BUILD_CALIBVIEW)
   FetchContent_Declare(implot
     URL https://github.com/epezent/implot/archive/refs/tags/v1.0.tar.gz
     DOWNLOAD_EXTRACT_TIMESTAMP TRUE SOURCE_SUBDIR not_built)
@@ -505,8 +504,8 @@ if(BWAUDIO_BUILD_CALIBVIEW)
     DOWNLOAD_EXTRACT_TIMESTAMP TRUE SOURCE_SUBDIR not_built)
   FetchContent_MakeAvailable(implot implot3d)
 
-  add_executable(bw_calib_view examples/calib_view.cpp
-    ${BW_IMGUI_SOURCES}
+  add_executable(bwa_calib_view examples/calib_view.cpp
+    ${BWA_IMGUI_SOURCES}
     ${imgui_SOURCE_DIR}/backends/imgui_impl_win32.cpp
     ${imgui_SOURCE_DIR}/backends/imgui_impl_dx11.cpp
     ${implot_SOURCE_DIR}/implot.cpp
@@ -515,66 +514,66 @@ if(BWAUDIO_BUILD_CALIBVIEW)
     ${implot3d_SOURCE_DIR}/implot3d.cpp
     ${implot3d_SOURCE_DIR}/implot3d_items.cpp
     ${implot3d_SOURCE_DIR}/implot3d_meshes.cpp)
-  target_include_directories(bw_calib_view PRIVATE
-    ${BW_IMGUI_INC} ${implot_SOURCE_DIR} ${implot3d_SOURCE_DIR})
-  target_compile_definitions(bw_calib_view PRIVATE ${BW_IMGUI_DEFS})
-  target_compile_features(bw_calib_view PRIVATE cxx_std_17)      # bw_theme.h uses inline variables
-  target_link_libraries(bw_calib_view PRIVATE bw_core d3d11 d3dcompiler comdlg32)   # comdlg32: file picker
-  bw_tool_icon(bw_calib_view)
+  target_include_directories(bwa_calib_view PRIVATE
+    ${BWA_IMGUI_INC} ${implot_SOURCE_DIR} ${implot3d_SOURCE_DIR})
+  target_compile_definitions(bwa_calib_view PRIVATE ${BWA_IMGUI_DEFS})
+  target_compile_features(bwa_calib_view PRIVATE cxx_std_17)      # bwa_theme.h uses inline variables
+  target_link_libraries(bwa_calib_view PRIVATE bwa_core d3d11 d3dcompiler comdlg32)   # comdlg32: file picker
+  bwa_tool_icon(bwa_calib_view)
   # Zylia tab (ZM-1 capture shell) + Capture tab (the calibrate sweep backends) — both live with the
   # ASIO SDK, simulate-only without it. asio_session arbitrates the SDK's one current-driver slot
   # between them (they'd otherwise tear each other down).
-  target_sources(bw_calib_view PRIVATE examples/zylia_capture.cpp examples/calib_capture.cpp
+  target_sources(bwa_calib_view PRIVATE examples/zylia_capture.cpp examples/calib_capture.cpp
                                        examples/asio_session.cpp)
-  if(BWAUDIO_WITH_ASIO)
-    target_sources(bw_calib_view PRIVATE
+  if(BWA_WITH_ASIO)
+    target_sources(bwa_calib_view PRIVATE
       ${ASIO_SDK_DIR}/common/asio.cpp
       ${ASIO_SDK_DIR}/host/asiodrivers.cpp
       ${ASIO_SDK_DIR}/host/pc/asiolist.cpp)
-    target_include_directories(bw_calib_view PRIVATE ${ASIO_SDK_DIR}/common ${ASIO_SDK_DIR}/host ${ASIO_SDK_DIR}/host/pc)
-    target_compile_definitions(bw_calib_view PRIVATE BW_HAVE_ASIO)
-    target_link_libraries(bw_calib_view PRIVATE ole32 user32 advapi32)
+    target_include_directories(bwa_calib_view PRIVATE ${ASIO_SDK_DIR}/common ${ASIO_SDK_DIR}/host ${ASIO_SDK_DIR}/host/pc)
+    target_compile_definitions(bwa_calib_view PRIVATE BWA_HAVE_ASIO)
+    target_link_libraries(bwa_calib_view PRIVATE ole32 user32 advapi32)
   endif()
-  if(BWAUDIO_BUILD_TESTS)
-    add_test(NAME calib_view COMMAND bw_calib_view --tests)      # the GUI itself, driven by fake inputs
+  if(BWA_BUILD_TESTS)
+    add_test(NAME calib_view COMMAND bwa_calib_view --tests)      # the GUI itself, driven by fake inputs
   endif()
 endif()
 
 # ---- Optional: speaker calibration tool (full-duplex ASIO sweep -> per-speaker delay/gain trims) ----
-# cmake -S . -B build -DBWAUDIO_BUILD_CALIBRATE=ON ; run with --simulate (no hardware) or on the rig.
-option(BWAUDIO_BUILD_CALIBRATE "Build the speaker calibration tool" OFF)
-if(BWAUDIO_BUILD_CALIBRATE)
+# cmake -S . -B build -DBWA_BUILD_CALIBRATE=ON ; run with --simulate (no hardware) or on the rig.
+option(BWA_BUILD_CALIBRATE "Build the speaker calibration tool" OFF)
+if(BWA_BUILD_CALIBRATE)
   enable_language(CXX)
-  add_executable(bw_calibrate examples/calibrate.cpp examples/calib_capture.cpp examples/asio_session.cpp)
-  target_link_libraries(bw_calibrate PRIVATE bw_core)
-  bw_tool_icon(bw_calibrate)
-  if(BWAUDIO_WITH_ASIO)
+  add_executable(bwa_calibrate examples/calibrate.cpp examples/calib_capture.cpp examples/asio_session.cpp)
+  target_link_libraries(bwa_calibrate PRIVATE bwa_core)
+  bwa_tool_icon(bwa_calibrate)
+  if(BWA_WITH_ASIO)
     # the tool runs its own full-duplex ASIO host, so it compiles the SDK host sources itself (the
-    # bwaudio DLL keeps them internal) — independent of the engine's output-only asio_sink.
-    target_sources(bw_calibrate PRIVATE
+    # bw_audio DLL keeps them internal) — independent of the engine's output-only asio_sink.
+    target_sources(bwa_calibrate PRIVATE
       ${ASIO_SDK_DIR}/common/asio.cpp
       ${ASIO_SDK_DIR}/host/asiodrivers.cpp
       ${ASIO_SDK_DIR}/host/pc/asiolist.cpp)
-    target_include_directories(bw_calibrate PRIVATE ${ASIO_SDK_DIR}/common ${ASIO_SDK_DIR}/host ${ASIO_SDK_DIR}/host/pc)
-    target_compile_definitions(bw_calibrate PRIVATE BW_HAVE_ASIO _CRT_SECURE_NO_WARNINGS)
-    target_link_libraries(bw_calibrate PRIVATE ole32 user32 advapi32)
-    message(STATUS "bwaudio: calibration tool with ASIO capture")
+    target_include_directories(bwa_calibrate PRIVATE ${ASIO_SDK_DIR}/common ${ASIO_SDK_DIR}/host ${ASIO_SDK_DIR}/host/pc)
+    target_compile_definitions(bwa_calibrate PRIVATE BWA_HAVE_ASIO _CRT_SECURE_NO_WARNINGS)
+    target_link_libraries(bwa_calibrate PRIVATE ole32 user32 advapi32)
+    message(STATUS "bw_audio: calibration tool with ASIO capture")
   else()
-    message(STATUS "bwaudio: calibration tool (simulate only; no ASIO SDK)")
+    message(STATUS "bw_audio: calibration tool (simulate only; no ASIO SDK)")
   endif()
 
   # ZM-1 hardware bring-up probe: console meter over the shared capture shell (zylia_capture.cpp).
-  # The DOA view (clap -> direction on the capsule sphere) lives in bw_calib_view's Zylia tab.
-  add_executable(bw_zylia_probe examples/zylia_probe.cpp examples/zylia_capture.cpp examples/asio_session.cpp)
-  target_link_libraries(bw_zylia_probe PRIVATE bw_core)
-  bw_tool_icon(bw_zylia_probe)
-  if(BWAUDIO_WITH_ASIO)
-    target_sources(bw_zylia_probe PRIVATE
+  # The DOA view (clap -> direction on the capsule sphere) lives in bwa_calib_view's Zylia tab.
+  add_executable(bwa_zylia_probe examples/zylia_probe.cpp examples/zylia_capture.cpp examples/asio_session.cpp)
+  target_link_libraries(bwa_zylia_probe PRIVATE bwa_core)
+  bwa_tool_icon(bwa_zylia_probe)
+  if(BWA_WITH_ASIO)
+    target_sources(bwa_zylia_probe PRIVATE
       ${ASIO_SDK_DIR}/common/asio.cpp
       ${ASIO_SDK_DIR}/host/asiodrivers.cpp
       ${ASIO_SDK_DIR}/host/pc/asiolist.cpp)
-    target_include_directories(bw_zylia_probe PRIVATE ${ASIO_SDK_DIR}/common ${ASIO_SDK_DIR}/host ${ASIO_SDK_DIR}/host/pc)
-    target_compile_definitions(bw_zylia_probe PRIVATE BW_HAVE_ASIO _CRT_SECURE_NO_WARNINGS)
-    target_link_libraries(bw_zylia_probe PRIVATE ole32 user32 advapi32)
+    target_include_directories(bwa_zylia_probe PRIVATE ${ASIO_SDK_DIR}/common ${ASIO_SDK_DIR}/host ${ASIO_SDK_DIR}/host/pc)
+    target_compile_definitions(bwa_zylia_probe PRIVATE BWA_HAVE_ASIO _CRT_SECURE_NO_WARNINGS)
+    target_link_libraries(bwa_zylia_probe PRIVATE ole32 user32 advapi32)
   endif()
 endif()

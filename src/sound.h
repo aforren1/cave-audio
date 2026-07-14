@@ -3,8 +3,8 @@
  * handle lifetime, and the retire-ack handshake live in rt.c — this file just turns a
  * file into mono float PCM. Not part of the public ABI.
  */
-#ifndef BW_SOUND_H
-#define BW_SOUND_H
+#ifndef BWA_SOUND_H
+#define BWA_SOUND_H
 
 #include <stdbool.h>
 #include <stddef.h>
@@ -35,4 +35,4 @@ bool sound_load_ambix(const char* path, uint32_t want_rate, SoundData* out, char
 
 void sound_unload(SoundData* s);   /* frees pcm; safe on a zeroed/empty SoundData */
 
-#endif /* BW_SOUND_H */
+#endif /* BWA_SOUND_H */

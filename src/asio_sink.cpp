@@ -1,7 +1,7 @@
 /*
  * asio_sink.cpp — ASIO host backend (production path: 26 channels -> DVS -> Dante).
  *
- * Compiled ONLY when the Steinberg ASIO SDK is vendored (BW_HAVE_ASIO; see
+ * Compiled ONLY when the Steinberg ASIO SDK is vendored (BWA_HAVE_ASIO; see
  * third_party/README.md). C++ because the SDK's driver-loading host helpers
  * (AsioDrivers, loadAsioDriver) are C++. Everything ASIO-specific stays inside this
  * file — the rest of the engine sees only the device-agnostic sink.h interface.
@@ -39,11 +39,11 @@ extern bool loadAsioDriver(char* name);
 namespace {
 
 struct AsioSink {
-    BwSink          base;
+    bwa_sink          base;
     uint32_t        sample_rate;
     uint32_t        channels;        /* requested (26) */
     long            buffer_size;     /* frames per block, chosen from ASIOGetBufferSize */
-    BwRenderFn      render;
+    bwa_render_fn      render;
     void*           user;
     ASIOBufferInfo  bufferInfos[64];
     ASIOChannelInfo channelInfos[64];
@@ -115,13 +115,13 @@ ASIOTime* bufferSwitchTimeInfo(ASIOTime* timeInfo, long index, ASIOBool /*proces
     AsioSink* s = g_sink;
     if (!s) return timeInfo;
     static bool named = false;
-    if (!named) { BW_THREAD_NAME("bw-audio (ASIO)"); named = true; }   /* the driver's callback thread */
-    BW_ZONE_BEGIN(zblk, "asio block");                                 /* one block; vs the period = the RT budget */
+    if (!named) { BWA_THREAD_NAME("bw-audio (ASIO)"); named = true; }   /* the driver's callback thread */
+    BWA_ZONE_BEGIN(zblk, "asio block");                                 /* one block; vs the period = the RT budget */
 
     /* Trust the driver's sample position ONLY when it flags it valid; otherwise the memset-0 (or a
-     * stale value) would freeze the engine's dsp clock and break bw_source_play_at scheduling. Fall
+     * stale value) would freeze the engine's dsp clock and break bwa_source_play_at scheduling. Fall
      * back to an internal block counter, kept in step with the device position while it IS valid. */
-    BwTimestamp ts;
+    bwa_timestamp ts;
     if (timeInfo->timeInfo.flags & kSamplePositionValid)
         ts.sample_pos = samples_u64(timeInfo->timeInfo.samplePosition);
     else
@@ -131,16 +131,16 @@ ASIOTime* bufferSwitchTimeInfo(ASIOTime* timeInfo, long index, ASIOBool /*proces
 
     s->render(s->user, s->bus, (uint32_t)s->buffer_size, &ts);   /* engine fills the bus */
 
-    BW_ZONE_BEGIN(zcv, "convert_out");
+    BWA_ZONE_BEGIN(zcv, "convert_out");
     for (uint32_t c = 0; c < s->channels; ++c) {
         void*        dst = s->bufferInfos[c].buffers[index];
         const float* src = s->bus + (size_t)c * s->buffer_size;
         convert_out(dst, src, s->buffer_size, s->channelInfos[c].type);
     }
-    BW_ZONE_END(zcv);
+    BWA_ZONE_END(zcv);
     if (s->post_output) ASIOOutputReady();
-    BW_ZONE_END(zblk);
-    BW_FRAME_MARK();
+    BWA_ZONE_END(zblk);
+    BWA_FRAME_MARK();
     return timeInfo;
 }
 
@@ -163,9 +163,9 @@ long asioMessage(long selector, long value, void* /*msg*/, double* /*opt*/) {
     case kAsioSupportsTimeInfo:  return 1L;
     case kAsioResetRequest:
         /* KNOWN GAP (rig-day): we ack the request but don't yet perform the reset. A full handler must
-         * signal the control thread to bw_stop + bw_start (the driver stops calling bufferSwitch until
+         * signal the control thread to bwa_stop + bwa_start (the driver stops calling bufferSwitch until
          * we re-create buffers). Until that plumbing exists, a live buffer-size/rate change in the
-         * driver control panel will stall output — change it before bw_start, not during. */
+         * driver control panel will stall output — change it before bwa_start, not during. */
         return 1L;
     case kAsioResyncRequest:
     case kAsioLatenciesChanged:  return 1L;
@@ -179,18 +179,18 @@ void set_err(char* err, size_t cap, const char* msg) {
 
 /* vtable ------------------------------------------------------------------ */
 
-int asio_start(BwSink* base) {
+int asio_start(bwa_sink* base) {
     AsioSink* s = (AsioSink*)base;
     if (s->running) return 0;
     if (ASIOStart() != ASE_OK) return 1;
     s->running = true;
     return 0;
 }
-void asio_stop(BwSink* base) {
+void asio_stop(bwa_sink* base) {
     AsioSink* s = (AsioSink*)base;
     if (s->running) { ASIOStop(); s->running = false; }
 }
-void asio_close(BwSink* base) {
+void asio_close(bwa_sink* base) {
     AsioSink* s = (AsioSink*)base;
     /* Teardown order matters: ASIOStop then ASIODisposeBuffers, which per the ASIO spec guarantees
      * the driver issues no further bufferSwitch. Only AFTER that do we clear g_sink and free s, so a
@@ -204,10 +204,10 @@ void asio_close(BwSink* base) {
     free(s->bus);
     free(s);
 }
-const char* asio_backend(BwSink* base) { return ((AsioSink*)base)->name; }
-uint32_t asio_block_size(BwSink* base) { return (uint32_t)((AsioSink*)base)->buffer_size; }
+const char* asio_backend(bwa_sink* base) { return ((AsioSink*)base)->name; }
+uint32_t asio_block_size(bwa_sink* base) { return (uint32_t)((AsioSink*)base)->buffer_size; }
 
-const BwSinkVtbl ASIO_VT = {   /* designated: stop/close share a signature, so a positional swap would be silent */
+const bwa_sink_vtbl ASIO_VT = {   /* designated: stop/close share a signature, so a positional swap would be silent */
     .start = asio_start, .stop = asio_stop, .close = asio_close,
     .backend = asio_backend, .block_size = asio_block_size,
 };
@@ -231,20 +231,20 @@ static bool try_driver(const char* name, uint32_t channels) {
     return true;
 }
 
-extern "C" BwSink* bw_asio_sink_open(uint32_t sample_rate, uint32_t block_size,
-                                     uint32_t channels, BwRenderFn render, void* user,
+extern "C" bwa_sink* bwa_asio_sink_open(uint32_t sample_rate, uint32_t block_size,
+                                     uint32_t channels, const char* driver,
+                                     bwa_render_fn render, void* user,
                                      char* err, size_t errcap) {
     if (g_sink)                 { set_err(err, errcap, "asio: a driver is already open"); return nullptr; }
     if (!render || channels == 0 || channels > 64) { set_err(err, errcap, "asio: bad arguments"); return nullptr; }
 
-    /* Auto-pick: BWAUDIO_ASIO_DRIVER if set, else the first registered driver that opens with
+    /* Auto-pick: bwa_desc.asio_driver if set, else the first registered driver that opens with
      * enough output channels (so binaural finds a 2-ch headphone driver — ASIO4ALL / FlexASIO /
      * the Steinberg built-in — and cave finds a >=26-ch one, without configuration). */
     char drv[64] = {0};
     bool opened = false;
-    const char* env = getenv("BWAUDIO_ASIO_DRIVER");
-    if (env && *env) {
-        strncpy(drv, env, sizeof drv - 1);
+    if (driver && *driver) {
+        strncpy(drv, driver, sizeof drv - 1);
         opened = try_driver(drv, channels);
     } else if (asioDrivers) {
         char names[16][32];
@@ -259,7 +259,7 @@ extern "C" BwSink* bw_asio_sink_open(uint32_t sample_rate, uint32_t block_size,
         return nullptr;
     }
 
-    /* The driver dictates the true block size; BwConfig.block_size is only a hint, and
+    /* The driver dictates the true block size; bwa_desc.block_size is only a hint, and
      * the nframes passed to the render callback (== bufsize, the bus is sized to it) is
      * authoritative. Clamp the hint into range and honour the driver's granularity so
      * ASIOCreateBuffers never gets an invalid size. */
@@ -278,7 +278,7 @@ extern "C" BwSink* bw_asio_sink_open(uint32_t sample_rate, uint32_t block_size,
      * fixed-rate (set in Dante Controller), and the engine is already built at cfg.sample_rate, so a
      * mismatch must fail loudly with the device's actual rate rather than run the whole engine at
      * the wrong rate. Query first (ASIOCanSampleRate), set, then re-query — some drivers report OK
-     * but ignore the set. (BWAUDIO_ASIO_DRIVER pins the driver if the auto-pick chose a wrong one.) */
+     * but ignore the set. (bwa_desc.asio_driver pins the driver if the auto-pick chose a wrong one.) */
     if (ASIOCanSampleRate((ASIOSampleRate)sample_rate) != ASE_OK) {
         ASIOSampleRate cur = 0; ASIOGetSampleRate(&cur);
         char m[176];

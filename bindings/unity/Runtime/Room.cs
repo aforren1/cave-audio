@@ -6,7 +6,7 @@
 // See docs/integration.md.
 using UnityEngine;
 
-namespace CaveAudio
+namespace BwAudio
 {
     public static class Room
     {
@@ -32,7 +32,7 @@ namespace CaveAudio
         }
 
         /// <summary>Room space -> Unity world, the inverse of Pos(). For DRAWING what the engine reports
-        /// back in room coordinates (the acoustic room box, speaker positions from bw_get_speakers): set
+        /// back in room coordinates (the acoustic room box, speaker positions from bwa_get_speakers): set
         /// it as Gizmos.matrix and then draw in plain room metres. Handy side effect — a wrong
         /// UnityToRoom makes the gizmo land visibly in the wrong place.</summary>
         public static Matrix4x4 RoomToUnityMatrix()
@@ -58,7 +58,7 @@ namespace CaveAudio
         }
 
         /// <summary>Unity yaw (degrees about +Y) -> room yaw (radians about +Y, RH: positive turns the field
-        /// from room +Z toward room +X) — the angle <c>bw_bed_set_rotation</c> wants. The X mirror REVERSES
+        /// from room +Z toward room +X) — the angle <c>bwa_bed_set_rotation</c> wants. The X mirror REVERSES
         /// the sense of rotation (turning a bed to Unity's right turns it toward room -X, a NEGATIVE room
         /// yaw), so a Unity euler angle passed straight to the engine spins the soundfield the wrong way.
         /// Routed through Rot() so any yaw baked into UnityToRoom is included, not just the mirror.</summary>

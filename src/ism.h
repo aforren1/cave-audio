@@ -15,19 +15,19 @@
  * panner: the reflections then have correct direction AND parallax as the listener walks — the
  * property a shared listener-centric reverb bed (Steam's, or the FDN's) cannot give.
  */
-#ifndef BW_ISM_H
-#define BW_ISM_H
+#ifndef BWA_ISM_H
+#define BWA_ISM_H
 
-#define ISM_FACES  6      /* -x, +x, -y, +y, -z, +z (the bw_scene_set_box face order) */
+#define ISM_FACES  6      /* -x, +x, -y, +y, -z, +z (the bwa_scene_set_box face order) */
 #define ISM_IMAGES 6      /* one first-order image per face */
 
-/* The shoebox, in room space. Floor-based like bw_scene_set_box: x/z centred on the origin, y from
+/* The shoebox, in room space. Floor-based like bwa_scene_set_box: x/z centred on the origin, y from
  * 0 (the floor) to `h`. absorb[f][b] is face f's energy absorption in band b (low/mid/high, 0..1);
  * the pressure reflection coefficient is sqrt(1 - absorb). */
 typedef struct {
     float w, h, d;
     float absorb[ISM_FACES][3];
-    int   valid;                    /* 0 until a room is set (bw_scene_set_box) */
+    int   valid;                    /* 0 until a room is set (bwa_scene_set_box) */
 } IsmRoom;
 
 /* One first-order image: the mirrored source position + that face's per-band reflection coefficient
@@ -43,4 +43,4 @@ typedef struct {
  * geometry, so the caller renders it dry). Pure: no allocation, safe on the audio thread. */
 int ism_images(const IsmRoom* r, const float src[3], IsmImage* out);
 
-#endif /* BW_ISM_H */
+#endif /* BWA_ISM_H */

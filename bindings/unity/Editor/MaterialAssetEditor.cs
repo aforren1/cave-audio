@@ -1,17 +1,17 @@
-// BwMaterialAssetEditor.cs — show either the preset dropdown or the custom coefficients, never both.
+// MaterialAssetEditor.cs — show either the preset dropdown or the custom coefficients, never both.
 // A material is one or the other, and leaving the unused half on screen makes it look like the numbers
 // under a preset are what you'd get (they aren't — the engine's own table is).
 using UnityEditor;
 using UnityEngine;
 
-namespace CaveAudio.EditorTools
+namespace BwAudio.EditorTools
 {
-    [CustomEditor(typeof(BwMaterialAsset))]
-    public sealed class BwMaterialAssetEditor : Editor
+    [CustomEditor(typeof(MaterialAsset))]
+    public sealed class MaterialAssetEditor : Editor
     {
         public override void OnInspectorGUI()
         {
-            var m = (BwMaterialAsset)target;
+            var m = (MaterialAsset)target;
             serializedObject.Update();
 
             var it = serializedObject.GetIterator();
@@ -22,7 +22,7 @@ namespace CaveAudio.EditorTools
                     using (new EditorGUI.DisabledScope(true)) EditorGUILayout.PropertyField(it);
                     continue;
                 }
-                bool custom = m.source == BwMaterialAsset.Source.Custom;
+                bool custom = m.source == MaterialAsset.Source.Custom;
                 switch (it.propertyPath)
                 {
                     case "preset":       if (custom)  continue; break;
@@ -36,7 +36,7 @@ namespace CaveAudio.EditorTools
             serializedObject.ApplyModifiedProperties();
 
             EditorGUILayout.HelpBox(
-                m.source == BwMaterialAsset.Source.Preset
+                m.source == MaterialAsset.Source.Preset
                     ? "Uses the engine's built-in coefficients for this material."
                     : "Bands are low / mid / high. Absorption = what a reflection loses. Transmission = " +
                       "what passes THROUGH (the spectral tilt of occluded sound — this is what makes a " +

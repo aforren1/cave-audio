@@ -67,7 +67,7 @@ int main(void) {
     const float below[3] = { 0.f, -0.1f, 0.f };
     CHECK(ism_images(&r, below, img) == 0, "a source below the floor produces no images");
 
-    /* an unset/degenerate room produces nothing (the engine renders dry until bw_scene_set_box) */
+    /* an unset/degenerate room produces nothing (the engine renders dry until bwa_scene_set_box) */
     IsmRoom bad; memset(&bad, 0, sizeof bad);
     CHECK(ism_images(&bad, src, img) == 0, "an unset room produces no images");
     bad.valid = 1; bad.w = 0.f; bad.h = 3.f; bad.d = 3.f;

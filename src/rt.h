@@ -1,7 +1,7 @@
 /*
  * rt.h — the real-time core: the two SPSC rings, the voice table, the commit
  * snapshot, and generation-counted handles (docs/concurrency.md, docs/internal-types.md).
- * NOT part of the public ABI. engine.c owns one RtCore and forwards the bw_* API to it.
+ * NOT part of the public ABI. engine.c owns one RtCore and forwards the bwa_* API to it.
  *
  * Thread split (docs/CLAUDE.md): the CONTROL thread calls the rt_source_* / rt_set_listener
  * / rt_commit functions (enqueue only, plus handle allocation); the AUDIO thread calls
@@ -13,10 +13,10 @@
  * directivity, Doppler, air absorption, reflection/pathing sends, dual-band panning, the
  * ambisonic bed, streaming, pause/seek, and the output limiter. See docs/roadmap.md for history.
  */
-#ifndef BW_RT_H
-#define BW_RT_H
+#ifndef BWA_RT_H
+#define BWA_RT_H
 
-#include "sink.h"          /* BwTimestamp, BW_CHANNELS */
+#include "sink.h"          /* bwa_timestamp, BWA_CHANNELS */
 #include "layout.h"        /* Layout (for rt_set_layout) */
 #include "pose.h"          /* PoseSlot (for rt_set_tracker) */
 #include "ism.h"           /* IsmRoom (for rt_set_ism_room) */
@@ -24,14 +24,14 @@
 #include <stdbool.h>
 #include <stdint.h>
 
-/* Handles are (index | generation<<16); 0 is invalid (see include/bwaudio.h). */
-#define BW_H_IDX(h)   ((uint16_t)((h) & 0xFFFFu))
-#define BW_H_GEN(h)   ((uint16_t)((h) >> 16))
-#define BW_MK_H(i, g) ((uint32_t)(i) | ((uint32_t)(g) << 16))
+/* Handles are (index | generation<<16); 0 is invalid (see include/bw_audio.h). */
+#define BWA_H_IDX(h)   ((uint16_t)((h) & 0xFFFFu))
+#define BWA_H_GEN(h)   ((uint16_t)((h) >> 16))
+#define BWA_MK_H(i, g) ((uint32_t)(i) | ((uint32_t)(g) << 16))
 
 /* Command ring payload (control -> audio). Fixed-size POD, no framing. */
-#define BW_EXTRA_LIS 3   /* extra (compromise) listener positions beyond the primary */
-#define BW_GROUPS    8   /* mix groups (per-voice group id 0..7; group 0 is the default) */
+#define BWA_EXTRA_LIS 3   /* extra (compromise) listener positions beyond the primary */
+#define BWA_GROUPS    8   /* mix groups (per-voice group id 0..7; group 0 is the default) */
 
 enum {
     CMD_SRC_CREATE = 0, CMD_SRC_DESTROY, CMD_SET_POS, CMD_SET_GAIN,
@@ -69,7 +69,7 @@ typedef struct {
         struct { uint64_t frame; }                     seek;  /* content position to jump to (in-memory sounds) */
         struct { uint32_t channel; uint8_t kind; float gain; } test;  /* debug channel injection */
         struct { uint8_t on; }                         ldc;   /* per-voice loudness-compensated attenuation */
-        struct { float p[BW_EXTRA_LIS][3]; uint8_t n; } exlis; /* extra listeners (compromise panning) */
+        struct { float p[BWA_EXTRA_LIS][3]; uint8_t n; } exlis; /* extra listeners (compromise panning) */
         struct { float radius; }                       size;  /* per-voice source radius (meters; 0 = point) */
         struct { float target, seconds; uint8_t stop; } fade; /* timed gain fade (stop = stop when landed) */
         struct { uint8_t id; }                         group; /* mix-group assignment */
@@ -90,9 +90,9 @@ typedef struct RtCore RtCore;   /* opaque */
 /* ---- lifecycle (control thread; allocates) ---- */
 RtCore* rt_create(uint32_t voice_cap, uint32_t sound_cap, uint32_t sample_rate, uint32_t channels);
 void    rt_destroy(RtCore* c);
-void    rt_set_layout(RtCore* c, const Layout* L);   /* call before bw_start / while stopped */
+void    rt_set_layout(RtCore* c, const Layout* L);   /* call before bwa_start / while stopped */
 void    rt_set_panner(RtCore* c, int panner);        /* 0 = DBAP, 1 = SPCAP, 2 = VBAP; atomic, live-switchable */
-void    rt_set_bed_decoder(RtCore* c, int decoder);  /* 0 = sampling (SAD), 1 = AllRAD; before bw_start */
+void    rt_set_bed_decoder(RtCore* c, int decoder);  /* 0 = sampling (SAD), 1 = AllRAD; before bwa_start */
 void    rt_set_dual_band(RtCore* c, int on);         /* dual-band panning (amplitude LF / power HF); live A/B */
 void    rt_set_spread_mode(RtCore* c, int mode);     /* spread render: 0 = lobe reshape, 1 = MDAP ring; live A/B */
 void    rt_set_room_eq_dyn(RtCore* c, int on);       /* tracked room EQ (room_eq_grid layouts): default on; live A/B */
@@ -113,7 +113,7 @@ uint32_t rt_active_voices(RtCore* c);                     /* control thread: las
 void    rt_set_limiter(RtCore* c, int on);           /* output protection limiter (final stage; default ON); live */
 void    rt_set_limiter_ceiling(RtCore* c, float ceiling_linear);   /* limit/clamp ceiling, linear (default -1 dBFS); live */
 
-/* Attach the internal tracker's pose slot (track_internal). When set, rt_render samples the
+/* Attach the internal tracker's pose slot (bwa_tracker_connect). When set, rt_render samples the
  * freshest head pose from it at block time, overriding the committed listener. NULL detaches.
  * Set before the audio thread starts / after it stops (the audio thread reads the pointer). */
 void    rt_set_tracker(RtCore* c, const PoseSlot* slot);
@@ -191,7 +191,7 @@ void rt_set_listener   (RtCore* c, const float p[3], const float q[4]);
 void rt_commit         (RtCore* c);                   /* enqueue CMD_COMMIT + drain events */
 
 /* ---- audio thread: drain the command ring, then mix one block into `bus` ---- */
-void rt_render(RtCore* c, float* bus, uint32_t nframes, const BwTimestamp* ts);
+void rt_render(RtCore* c, float* bus, uint32_t nframes, const bwa_timestamp* ts);
 void rt_get_listener(RtCore* c, float p[3], float q[4]);   /* audio thread: active pose */
 void rt_read_pose(RtCore* c, float p[3], float q[4]);      /* control thread: active pose (seqlock readback) */
 bool rt_source_is_playing(RtCore* c, uint32_t h);         /* control thread: is the source's voice still playing? */
@@ -199,4 +199,4 @@ uint64_t rt_dsp_time(RtCore* c);                          /* control thread: cur
 uint32_t rt_bus_peaks(RtCore* c, float* out, uint32_t cap); /* control thread: last block's per-channel output peak
                                                              * (post align/test/limiter); returns the count filled */
 
-#endif /* BW_RT_H */
+#endif /* BWA_RT_H */

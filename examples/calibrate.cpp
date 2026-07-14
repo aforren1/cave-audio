@@ -9,22 +9,22 @@
  *   calibrate --layout examples/cave_layout.json --out tuned.json --mic 0 0 0 --input 0
  *   calibrate --simulate                     # no hardware: synthesize captures from the layout geometry
  *
- * Two capture backends (extracted to calib_capture.cpp, shared with bw_calib_view's Capture tab):
- *   - ASIO full-duplex (gated on BW_HAVE_ASIO): 26 outputs + one mic input, sample-aligned. Built when
+ * Two capture backends (extracted to calib_capture.cpp, shared with bwa_calib_view's Capture tab):
+ *   - ASIO full-duplex (gated on BWA_HAVE_ASIO): 26 outputs + one mic input, sample-aligned. Built when
  *     the ASIO SDK is vendored. NOT verified on hardware here — treat as rig bring-up code (it mirrors
  *     asio_sink.cpp's host: load -> ASIOInit -> ASIOGetChannels -> create in+out buffers -> Start).
  *   - simulate: delays/attenuates the sweep per the layout's speaker->mic distances (+ a deterministic
  *     sensitivity wobble) so the whole measure -> solve -> writeback path runs without the rig.
  *
  * Compiled as C++ only because the ASIO host helpers are C++; the engine pieces it calls are C. Built
- * opt-in: cmake -DBWAUDIO_BUILD_CALIBRATE=ON.
+ * opt-in: cmake -DBWA_BUILD_CALIBRATE=ON.
  */
 extern "C" {
 #include "measure.h"
 #include "calib.h"
 #include "layout.h"
 #include "zylia.h"
-#include "sink.h"          /* BW_CHANNELS */
+#include "sink.h"          /* BWA_CHANNELS */
 }
 #include "calib_capture.h" /* sweep constants + the simulate/ASIO capture backends */
 
@@ -32,7 +32,7 @@ extern "C" {
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#ifdef BW_HAVE_ASIO
+#ifdef BWA_HAVE_ASIO
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>       /* Sleep */
 #include <conio.h>         /* _kbhit/_getch for --live */
@@ -57,7 +57,7 @@ static int read_positions(const char* path, float (*out)[3], int maxK) {
 int main(int argc, char** argv) {
     const char* layout_path = "examples/cave_layout.json";
     const char* out_path    = NULL;
-    const char* driver      = getenv("BWAUDIO_ASIO_DRIVER");
+    const char* driver      = NULL;                       /* --driver; NULL = auto-pick */
     float mic[3] = { 0.f, 0.f, 0.f };
     int   mic_in = 0, simulate = 0, room = 0, check = 0, live_speaker = -1, eq = 0, room_eq = 0, rq_grid = 0, zylia = 0;
     double known_latency = -1.0;
@@ -110,7 +110,7 @@ int main(int argc, char** argv) {
     measure_sweep(sweep, NSWEEP, F1, F2, FS);
     double rt60_sum = 0.0; int rt60_n = 0;                     /* room-report aggregate */
 
-#ifdef BW_HAVE_ASIO
+#ifdef BWA_HAVE_ASIO
     int asio_up = 0;
     if (!simulate) { if (calib_asio_open(driver, mic_in, n, sweep, cap) != 0) return 1; asio_up = 1; }
 #else
@@ -123,7 +123,7 @@ int main(int argc, char** argv) {
         int K = read_positions(localize_file, micpos, 64);
         if (K < 5) {
             fprintf(stderr, "calibrate: --localize needs >= 5 non-coplanar mic positions in %s (got %d)\n", localize_file, K);
-#ifdef BW_HAVE_ASIO
+#ifdef BWA_HAVE_ASIO
             if (asio_up) calib_asio_close();
 #endif
             return 1;
@@ -134,14 +134,14 @@ int main(int argc, char** argv) {
             if (!simulate) { printf("  -> place the mic at (%.2f %.2f %.2f) and press Enter...", micpos[k][0], micpos[k][1], micpos[k][2]); fflush(stdout); getchar(); }
             for (int s = 0; s < n; ++s) {
                 if (simulate) calib_sim_capture(s, &L, micpos[k], sweep, cap);
-#ifdef BW_HAVE_ASIO
+#ifdef BWA_HAVE_ASIO
                 else if (!calib_asio_capture(s)) { fprintf(stderr, "calibrate: capture timed out (spk %d, pos %d)\n", s, k); calib_asio_close(); return 1; }
 #endif
                 MeasureResult r; measure_response(cap, CAPLEN, sweep, NSWEEP, F1, F2, FS, BAND_HZ, &r);
                 range[(size_t)s * K + k] = ((double)r.delay_samples + r.delay_frac) * 343.0 / FS; /* c*delay, meters (sub-sample) */
             }
         }
-#ifdef BW_HAVE_ASIO
+#ifdef BWA_HAVE_ASIO
         if (asio_up) calib_asio_close();
 #endif
         float (*pos)[3] = (float(*)[3])malloc((size_t)n * 3 * sizeof(float));
@@ -184,7 +184,7 @@ int main(int argc, char** argv) {
                  * cross-device clock — but running two ASIO drivers at once is the unbuilt rig piece. */
                 fprintf(stderr, "calibrate: --zylia hardware capture is not wired in this build; use --simulate\n"
                                 "  (the ZM-1 is a second 19-ch input device — see docs/calibration.md)\n");
-#ifdef BW_HAVE_ASIO
+#ifdef BWA_HAVE_ASIO
                 if (asio_up) calib_asio_close();
 #endif
                 free(pos); free(res); free(cap); free(sweep);
@@ -211,13 +211,13 @@ int main(int argc, char** argv) {
         double* range = (double*)malloc((size_t)n * sizeof(double));
         for (int s = 0; s < n; ++s) {
             if (simulate) calib_sim_capture(s, &L, mic, sweep, cap);
-#ifdef BW_HAVE_ASIO
+#ifdef BWA_HAVE_ASIO
             else if (!calib_asio_capture(s)) { fprintf(stderr, "calibrate: capture timed out (spk %d)\n", s); calib_asio_close(); return 1; }
 #endif
             MeasureResult r; measure_response(cap, CAPLEN, sweep, NSWEEP, F1, F2, FS, BAND_HZ, &r);
             range[s] = ((double)r.delay_samples + r.delay_frac) * 343.0 / FS;
         }
-#ifdef BW_HAVE_ASIO
+#ifdef BWA_HAVE_ASIO
         if (asio_up) calib_asio_close();
 #endif
         float* dev = (float*)malloc((size_t)n * sizeof(float));
@@ -244,7 +244,7 @@ int main(int argc, char** argv) {
         int iters = simulate ? 4 : (1 << 30);
         for (int t = 0; t < iters; ++t) {
             if (simulate) calib_sim_capture(live_speaker, &L, mic, sweep, cap);
-#ifdef BW_HAVE_ASIO
+#ifdef BWA_HAVE_ASIO
             else {
                 if (!calib_asio_capture(live_speaker)) { fprintf(stderr, "\ncalibrate: capture timed out\n"); calib_asio_close(); return 1; }
                 if (_kbhit()) { _getch(); break; }
@@ -259,25 +259,25 @@ int main(int argc, char** argv) {
             fflush(stdout);
         }
         printf("\n");
-#ifdef BW_HAVE_ASIO
+#ifdef BWA_HAVE_ASIO
         if (asio_up) calib_asio_close();
 #endif
         free(res); free(cap); free(sweep);
         return 0;
     }
 
-    const int NTAPS = 256;                                     /* correction-FIR length (<= BW_EQ_TAPS) */
+    const int NTAPS = 256;                                     /* correction-FIR length (<= BWA_EQ_TAPS) */
     float*    eq_taps = NULL; uint16_t* eq_lens = NULL;
     MeasureEqSection* rq_cuts = NULL; int* rq_counts = NULL;   /* --room-eq: LF modal cuts per speaker */
-    if (eq) { eq_taps = (float*)calloc((size_t)n * BW_EQ_TAPS, sizeof(float));
+    if (eq) { eq_taps = (float*)calloc((size_t)n * BWA_EQ_TAPS, sizeof(float));
               eq_lens = (uint16_t*)calloc((size_t)n, sizeof(uint16_t)); }
-    if (room_eq || rq_grid) { rq_cuts   = (MeasureEqSection*)calloc((size_t)n * BW_ROOM_EQ_MAX, sizeof(MeasureEqSection));
+    if (room_eq || rq_grid) { rq_cuts   = (MeasureEqSection*)calloc((size_t)n * BWA_ROOM_EQ_MAX, sizeof(MeasureEqSection));
                               rq_counts = (int*)calloc((size_t)n, sizeof(int)); }
     for (int i = 0; i < n; ++i) {
         if (simulate) {
             calib_sim_capture(i, &L, mic, sweep, cap);
         } else {
-#ifdef BW_HAVE_ASIO
+#ifdef BWA_HAVE_ASIO
             printf("  speaker %2d: playing sweep...\n", i); fflush(stdout);
             if (!calib_asio_capture(i)) { fprintf(stderr, "calibrate: capture timed out on speaker %d\n", i); calib_asio_close(); return 1; }
 #endif
@@ -299,17 +299,17 @@ int main(int argc, char** argv) {
             if (room_eq) {   /* room correction at the mic point: FD-window FIR + LF modal cuts */
                 int first_refl = rr.er_count ? rr.er_delay[0] : 0;
                 int nc = calib_room_eq(irbuf, IR_LEN, first_refl, FS, NTAPS,
-                                       &eq_taps[(size_t)i * BW_EQ_TAPS],
-                                       &rq_cuts[(size_t)i * BW_ROOM_EQ_MAX], BW_ROOM_EQ_MAX);
+                                       &eq_taps[(size_t)i * BWA_EQ_TAPS],
+                                       &rq_cuts[(size_t)i * BWA_ROOM_EQ_MAX], BWA_ROOM_EQ_MAX);
                 if (nc >= 0) { eq_lens[i] = (uint16_t)NTAPS; rq_counts[i] = nc; }
                 printf("            room-eq: %d-tap FIR (200 Hz up), %d LF modal cut(s)", eq_lens[i], nc < 0 ? 0 : nc);
                 for (int s = 0; s < rq_counts[i]; ++s)
-                    printf("  [%.0f Hz %.1f dB Q%.1f]", rq_cuts[(size_t)i*BW_ROOM_EQ_MAX+s].fc,
-                           rq_cuts[(size_t)i*BW_ROOM_EQ_MAX+s].gain_db, rq_cuts[(size_t)i*BW_ROOM_EQ_MAX+s].q);
+                    printf("  [%.0f Hz %.1f dB Q%.1f]", rq_cuts[(size_t)i*BWA_ROOM_EQ_MAX+s].fc,
+                           rq_cuts[(size_t)i*BWA_ROOM_EQ_MAX+s].gain_db, rq_cuts[(size_t)i*BWA_ROOM_EQ_MAX+s].q);
                 printf("\n");
             } else if (eq) {   /* gate to before the first reflection -> invert the speaker's direct response */
                 int first_refl = rr.er_count ? rr.er_delay[0] : 0;
-                if (calib_eq(irbuf, IR_LEN, first_refl, FS, NTAPS, &eq_taps[(size_t)i * BW_EQ_TAPS]))
+                if (calib_eq(irbuf, IR_LEN, first_refl, FS, NTAPS, &eq_taps[(size_t)i * BWA_EQ_TAPS]))
                     eq_lens[i] = (uint16_t)NTAPS;
                 printf("            eq: %d-tap correction (gate %s)\n", eq_lens[i],
                        first_refl ? "to first reflection" : "default 4 ms");
@@ -318,18 +318,18 @@ int main(int argc, char** argv) {
                                 * 12 dB depth cap as --room-eq's cut half; the merge across positions
                                 * happens in the writeback) */
                 int nc = measure_room_cuts(irbuf, IR_LEN, 0, FS, 30.0, 200.0, 12.0,
-                                           BW_ROOM_EQ_MAX, &rq_cuts[(size_t)i * BW_ROOM_EQ_MAX]);
+                                           BWA_ROOM_EQ_MAX, &rq_cuts[(size_t)i * BWA_ROOM_EQ_MAX]);
                 rq_counts[i] = nc < 0 ? 0 : nc;
                 printf("            room-eq-grid: %d LF modal cut(s) at this position", rq_counts[i]);
                 for (int s = 0; s < rq_counts[i]; ++s)
-                    printf("  [%.0f Hz %.1f dB Q%.1f]", rq_cuts[(size_t)i*BW_ROOM_EQ_MAX+s].fc,
-                           rq_cuts[(size_t)i*BW_ROOM_EQ_MAX+s].gain_db, rq_cuts[(size_t)i*BW_ROOM_EQ_MAX+s].q);
+                    printf("  [%.0f Hz %.1f dB Q%.1f]", rq_cuts[(size_t)i*BWA_ROOM_EQ_MAX+s].fc,
+                           rq_cuts[(size_t)i*BWA_ROOM_EQ_MAX+s].gain_db, rq_cuts[(size_t)i*BWA_ROOM_EQ_MAX+s].q);
                 printf("\n");
             }
         }
     }
     if (room && rt60_n) printf("room: mean RT60 ~ %.3f s (the floor on renderable reverb; treat the room to lower it)\n", rt60_sum / rt60_n);
-#ifdef BW_HAVE_ASIO
+#ifdef BWA_HAVE_ASIO
     if (asio_up) calib_asio_close();
 #endif
 
@@ -354,18 +354,18 @@ int main(int argc, char** argv) {
     printf("calibrate: wrote %s\n", out_path);
 
     if (eq) {   /* write the correction filters into the file the trims just wrote */
-        if (!calib_write_eq(out_path, out_path, eq_taps, eq_lens, n, BW_EQ_TAPS, err, sizeof err))
+        if (!calib_write_eq(out_path, out_path, eq_taps, eq_lens, n, BWA_EQ_TAPS, err, sizeof err))
             fprintf(stderr, "calibrate: eq writeback: %s\n", err);
         else printf("calibrate: wrote per-speaker correction filters to %s\n", out_path);
         free(eq_taps); free(eq_lens);
     }
     if (room_eq) {   /* the LF modal cuts ride the same file (align.c renders them as biquads) */
-        if (!calib_write_room_eq(out_path, out_path, rq_cuts, rq_counts, n, BW_ROOM_EQ_MAX, err, sizeof err))
+        if (!calib_write_room_eq(out_path, out_path, rq_cuts, rq_counts, n, BWA_ROOM_EQ_MAX, err, sizeof err))
             fprintf(stderr, "calibrate: room-eq writeback: %s\n", err);
         else printf("calibrate: wrote LF modal cuts (room_eq) to %s\n", out_path);
     }
     if (rq_grid) {   /* merge this mic position into room_eq_grid (replace-within-5cm or append) */
-        if (!calib_write_room_eq_grid(out_path, out_path, mic, rq_cuts, rq_counts, n, BW_ROOM_EQ_MAX, err, sizeof err))
+        if (!calib_write_room_eq_grid(out_path, out_path, mic, rq_cuts, rq_counts, n, BWA_ROOM_EQ_MAX, err, sizeof err))
             fprintf(stderr, "calibrate: room-eq-grid writeback: %s\n", err);
         else printf("calibrate: merged position (%.2f %.2f %.2f) into room_eq_grid in %s\n",
                     mic[0], mic[1], mic[2], out_path);

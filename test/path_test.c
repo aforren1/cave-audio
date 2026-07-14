@@ -21,20 +21,20 @@
 
 int main(void) {
     const uint32_t SR = 48000, BLK = 256, ORDER = 1;
-    RtCore* rt = rt_create(64, 64, SR, BW_CHANNELS);
+    RtCore* rt = rt_create(64, 64, SR, BWA_CHANNELS);
     if (!rt) { printf("FAIL: rt_create\n"); return 1; }
     Layout L = layout_default();
     rt_set_layout(rt, &L);
 
-    SteamScene* scene = steam_scene_create(rt, SR, BLK, 64);
+    SteamScene* scene = steam_scene_create(rt, SR, BLK, 64, 0);
     if (!scene) { printf("FAIL: steam_scene_create\n"); rt_destroy(rt); return 1; }
 
     /* a wall quad at x=0, spanning y in [-2,2], z in [-3, 0.5] — blocks the direct line at z=-1.5,
      * leaving only the opening past z=0.5. (Two triangles, both windings, so it occludes either way.) */
     float verts[] = { 0,-2,-3,  0,2,-3,  0,2,0.5f,  0,-2,0.5f };
     int   tris[]  = { 0,1,2, 0,2,3,  0,2,1, 0,3,2 };
-    float absorption[3] = { 0.2f, 0.2f, 0.2f }, transmission[3] = { 0.0f, 0.0f, 0.0f };
-    steam_scene_set_mesh(scene, verts, 4, tris, 4, absorption, 0.5f, transmission);
+    float absorption[3] = { 0.2f, 0.2f, 0.2f }, scattering[1] = { 0.5f }, transmission[3] = { 0.0f, 0.0f, 0.0f };
+    steam_scene_set_mesh_mat(scene, verts, 4, tris, 4, 1, absorption, scattering, transmission, NULL);
 
     printf("baking pathing visibility...\n"); fflush(stdout);
     SteamPath* sp = steam_path_create(scene, rt, &L, SR, BLK, ORDER);

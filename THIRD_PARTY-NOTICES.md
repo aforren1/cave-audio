@@ -1,10 +1,10 @@
 # Third-party notices
 
-Notice text accompanying bwaudio binary distributions. `docs/build.md` has the
+Notice text accompanying bw_audio binary distributions. `docs/build.md` has the
 full dependency and licensing discussion; this file is what ships next to the
 binaries.
 
-## In `bwaudio.dll`
+## In `bw_audio.dll`
 
 - **Steinberg ASIO SDK** — used under its GPLv3 option. This repository and the
   distributed DLL are GPLv3 (see `LICENSE`). (c) Steinberg Media Technologies GmbH.
@@ -13,11 +13,11 @@ binaries.
 - **cJSON** — MIT (text below). Copyright (c) 2009-2017 Dave Gamble and cJSON
   contributors.
 - **Steam Audio (`phonon.dll`)** — Apache License 2.0, Copyright Valve
-  Corporation. Ships alongside `bwaudio.dll` in with-SDK builds, including the
+  Corporation. Ships alongside `bw_audio.dll` in with-SDK builds, including the
   CI artifact; keep the two DLLs together.
   License: https://github.com/ValveSoftware/steam-audio/blob/master/LICENSE.md
 
-## In the tools (`bw_playground`, `bw_layout_tool`, `bw_calib_view`)
+## In the tools (`bwa_playground`, `bwa_layout_tool`, `bwa_calib_view`)
 
 - **Dear ImGui** — MIT (text below). Copyright (c) 2014-2026 Omar Cornut.
 - **ImPlot** — MIT (text below). Copyright (c) 2020 Evan Pezent.
@@ -33,10 +33,10 @@ binaries.
 - **Roboto** (embedded font) — Apache License 2.0, Copyright Google.
   https://www.apache.org/licenses/LICENSE-2.0
 - **Tracy Profiler** — BSD-3-Clause, Copyright (c) Bartosz Taudul. Only in
-  builds made with `BWAUDIO_TRACY=ON` (not in CI artifacts).
+  builds made with `BWA_TRACY=ON` (not in CI artifacts).
 
-`bw_calibrate` and `bw_zylia_probe` are console tools; they add nothing beyond
-the `bwaudio.dll` list.
+`bwa_calibrate` and `bwa_zylia_probe` are console tools; they add nothing beyond
+the `bw_audio.dll` list.
 
 ## MIT License (Dear ImGui, ImPlot, ImPlot3D, cJSON)
 

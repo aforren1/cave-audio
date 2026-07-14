@@ -1,4 +1,4 @@
-# pack.ps1 - build the installable UPM tarball (com.brainworks.bwaudio-<version>.tgz).
+# pack.ps1 - build the installable UPM tarball (com.brainworks.bw_audio-<version>.tgz).
 #
 # ASCII ONLY, deliberately: Windows PowerShell 5.1 reads a BOM-less .ps1 as ANSI, so a stray em-dash
 # or arrow becomes mojibake and breaks the PARSER. CI runs pwsh, developers run 5.1. Keep it plain.
@@ -7,7 +7,7 @@
 # it directly: Package Manager > "+" > "Install package from tarball...". No registry involved.
 #
 # It stages into a CLEAN directory before packing, which is not fussiness:
-#   npm falls back to .gitignore when a package has no .npmignore - and bwaudio.dll / phonon.dll ARE
+#   npm falls back to .gitignore when a package has no .npmignore - and bw_audio.dll / phonon.dll ARE
 #   gitignored (they are build output). Packing bindings/unity in place therefore yields a tarball with
 #   no native plugin: it installs fine, then throws DllNotFoundException on the first engine call.
 #   Staging first means npm only ever sees what we put there.
@@ -24,7 +24,7 @@
 param(
     [string] $Version,                 # optional: assert package.json matches (e.g. from a v0.2.0 tag)
     [string] $OutDir,                  # default: <repo>/dist
-    [string] $PluginsFrom              # optional: build dir to take bwaudio.dll + phonon.dll FROM
+    [string] $PluginsFrom              # optional: build dir to take bw_audio.dll + phonon.dll FROM
 )
 $ErrorActionPreference = 'Stop'
 $here = if ($PSScriptRoot) { $PSScriptRoot } else { Split-Path -Parent $MyInvocation.MyCommand.Path }
@@ -55,7 +55,7 @@ $plugins = Join-Path $pkg 'Runtime/Plugins/x86_64'
 if ($PluginsFrom) {
     $src = (Resolve-Path $PluginsFrom).Path
     Write-Host "taking the native plugins from $src"
-    foreach ($dll in 'bwaudio.dll', 'phonon.dll') {
+    foreach ($dll in 'bw_audio.dll', 'phonon.dll') {
         $from = Join-Path $src $dll
         $to   = Join-Path $plugins $dll
         if (-not (Test-Path $from)) { throw "$dll not found in $src" }
@@ -74,7 +74,7 @@ if ($PluginsFrom) {
         }
     }
 }
-foreach ($dll in 'bwaudio.dll', 'phonon.dll') {
+foreach ($dll in 'bw_audio.dll', 'phonon.dll') {
     if (-not (Test-Path (Join-Path $plugins $dll))) {
         throw "$dll is missing from Runtime/Plugins/x86_64. Build the engine first: cmake --build build --config RelWithDebInfo (CMake stages both DLLs there), or pass -PluginsFrom build/RelWithDebInfo. A tarball without them installs, then fails at runtime."
     }
@@ -142,7 +142,7 @@ if (-not (Test-Path $tgz)) { throw "tar did not produce $tgz" }
 
 # Prove the plugins actually made it in. This is the whole point of staging (see the header).
 $listing = & tar -tzf $tgz
-foreach ($need in 'package/Runtime/Plugins/x86_64/bwaudio.dll', 'package/Runtime/Plugins/x86_64/phonon.dll') {
+foreach ($need in 'package/Runtime/Plugins/x86_64/bw_audio.dll', 'package/Runtime/Plugins/x86_64/phonon.dll') {
     if ($listing -notcontains $need) {
         throw "$need is MISSING from the tarball. It would install and then fail at runtime."
     }

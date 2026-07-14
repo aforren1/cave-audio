@@ -7,23 +7,23 @@
 #include <stdlib.h>
 #include <string.h>
 
-BwSink* bw_sink_open(uint32_t sample_rate, uint32_t block_size, uint32_t channels,
-                     BwRenderFn render, void* user, char* err, size_t errcap) {
-    /* Override: BWAUDIO_SINK=null forces the offline sink (CI, desk debugging without
-     * touching audio hardware); BWAUDIO_SINK=asio asks for ASIO explicitly. Default is
+bwa_sink* bwa_sink_open(uint32_t sample_rate, uint32_t block_size, uint32_t channels,
+                     int sink_type, const char* asio_driver,
+                     bwa_render_fn render, void* user, char* err, size_t errcap) {
+    /* bwa_desc.sink: BWA_SINK_NULL forces the offline sink (CI, desk debugging without
+     * touching audio hardware); BWA_SINK_ASIO asks for ASIO explicitly. Default is
      * auto: try the real device, fall back to offline. */
-    const char* want = getenv("BWAUDIO_SINK");
-    const int force_null = (want && strcmp(want, "null") == 0);
-    const int force_asio = (want && strcmp(want, "asio") == 0);
+    const int force_null = (sink_type == 2);   /* BWA_SINK_NULL */
+    const int force_asio = (sink_type == 1);   /* BWA_SINK_ASIO */
 
     char asio_err[256] = {0};
-#ifdef BW_HAVE_ASIO
+#ifdef BWA_HAVE_ASIO
     if (!force_null) {
         /* Production path: try the real device first. */
-        BwSink* a = bw_asio_sink_open(sample_rate, block_size, channels, render, user,
-                                      asio_err, sizeof asio_err);
+        bwa_sink* a = bwa_asio_sink_open(sample_rate, block_size, channels, asio_driver,
+                                      render, user, asio_err, sizeof asio_err);
         if (a) return a;
-        /* BWAUDIO_SINK=asio is an explicit request: surface the failure instead of hiding
+        /* BWA_SINK_ASIO is an explicit request: surface the failure instead of hiding
          * it behind the silent null sink (otherwise the caller "starts" but hears nothing). */
         if (force_asio) {
             if (err && errcap) {
@@ -42,7 +42,7 @@ BwSink* bw_sink_open(uint32_t sample_rate, uint32_t block_size, uint32_t channel
 #endif
 
     char null_err[256] = {0};
-    BwSink* n = bw_null_sink_open(sample_rate, block_size, channels, render, user,
+    bwa_sink* n = bwa_null_sink_open(sample_rate, block_size, channels, render, user,
                                   null_err, sizeof null_err);
     if (n) return n;
 
@@ -56,8 +56,8 @@ BwSink* bw_sink_open(uint32_t sample_rate, uint32_t block_size, uint32_t channel
     return NULL;
 }
 
-int         bw_sink_start(BwSink* s)   { return s ? s->vt->start(s) : 1; }
-void        bw_sink_stop(BwSink* s)    { if (s) s->vt->stop(s); }
-void        bw_sink_close(BwSink* s)   { if (s) s->vt->close(s); }
-const char* bw_sink_backend(BwSink* s) { return s ? s->vt->backend(s) : "none"; }
-uint32_t    bw_sink_block_size(BwSink* s) { return s ? s->vt->block_size(s) : 0; }
+int         bwa_sink_start(bwa_sink* s)   { return s ? s->vt->start(s) : 1; }
+void        bwa_sink_stop(bwa_sink* s)    { if (s) s->vt->stop(s); }
+void        bwa_sink_close(bwa_sink* s)   { if (s) s->vt->close(s); }
+const char* bwa_sink_backend(bwa_sink* s) { return s ? s->vt->backend(s) : "none"; }
+uint32_t    bwa_sink_block_size(bwa_sink* s) { return s ? s->vt->block_size(s) : 0; }

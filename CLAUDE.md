@@ -36,7 +36,7 @@ that are painful to debug, so they are non-negotiable:
 1. **No allocation, locks, syscalls, or file I/O on the audio thread.** The audio
    thread is the ASIO `bufferSwitch` callback. wav decode, malloc/free, and logging
    all live on the control thread.
-2. **One control thread.** All `bw_*` calls come from a single thread. The command
+2. **One control thread.** All `bwa_*` calls come from a single thread. The command
    ring is single-producer/single-consumer; a second producer breaks it.
 3. **Audio thread owns DSP state** (voice table, bus, panner gains, listener
    active fields). The control thread owns handle allocation and asset memory.
@@ -54,7 +54,7 @@ See `docs/concurrency.md` for the full model and reference code.
 ## Repo layout (intended)
 
 ```
-include/bwaudio.h      Public C ABI (authoritative contract).
+include/bw_audio.h      Public C ABI (authoritative contract).
 src/
   engine.c             public ABI: lifecycle + sink + forwards per-frame calls to rt. [M0/M1/M2]
   rt.h / rt.c          rings, voice table, commit snapshot, generation handles, mixer. [M2]
@@ -63,7 +63,7 @@ src/
   asio_sink.cpp        ASIO host: driver load, bufferSwitch, sample-pos timestamp. [M1]
   sound.h / sound.c    wav decode to mono float via dr_wav (Sound table lives in rt.c). [M3]
   layout.h / layout.c  speaker geometry load (cave_layout.json via cJSON) + default grid. [M4]
-  measure.c/calib.c    bw_calibrate DSP: sweep+deconvolution, trims, trilateration, room report. [calib]
+  measure.c/calib.c    bwa_calibrate DSP: sweep+deconvolution, trims, trilateration, room report. [calib]
   zylia.h / zylia.c    Zylia ZM-1 single-position speaker localization (DOA + GN position). [calib]
   dbap.h / dbap.c      listener-relative, constant-power DBAP gain solve. [M4]
   fdn.h / fdn.c        directional FDN reverb bed (phonon-free; takes the reflection bus tap). [innovations]
@@ -77,13 +77,13 @@ src/
   steam_path.h/.c      sound pathing: indirect routing -> per-voice shCoeffs -> SH-encode -> bus tap (with-SDK). [materials]
   natnet.c             OptiTrack pose ingest (off-wire, see docs/build.md). [M6]
 test/                  ctest suite; targets are prefixed test_* (test_smoke, test_rt, test_dsp, ...) so
-                       the built tools (bw_*) and the tests sort apart in the bin dir. xval_data.h is
+                       the built tools (bwa_*) and the tests sort apart in the bin dir. xval_data.h is
                        GENERATED (tools/xval) — don't hand-edit.
 tools/xval/            gen_reference.py: cross-validation golden generator (scipy SH / l1-LP VBAP /
                        qhull AllRAD / bilinear RBJ / lfilter) -> test/xval_data.h for the xval ctest.
                        Needs numpy+scipy; ctest itself does not (the header is committed).
 bindings/
-  unity/               P/Invoke + BwAudio/BwEmitter (see docs/integration.md).
+  unity/               P/Invoke + Engine/Emitter (see docs/integration.md).
   unreal/              module + component.
 docs/                  Specs. Start here.
 examples/              cave_layout.json (see docs/layout-schema.md).
@@ -103,35 +103,36 @@ cmake --build build --config RelWithDebInfo
 ctest --test-dir build -C RelWithDebInfo      # runs the full test suite (test_* targets)
 ```
 
-**Current state (M6 + occlusion):** builds `bwaudio.dll` + the test suite (nineteen ctests with the Steam
-Audio SDK, fifteen without; +`calib_view` with `BWAUDIO_BUILD_CALIBVIEW`, +`layout_tool` and
-+`playground` with `BWAUDIO_BUILD_PLAYGROUND`). `rt.c` is the concurrency spine
+**Current state (M6 + occlusion):** builds `bw_audio.dll` + the test suite (nineteen ctests with the Steam
+Audio SDK, fifteen without; +`calib_view` with `BWA_BUILD_CALIBVIEW`, +`layout_tool` and
++`playground` with `BWA_BUILD_PLAYGROUND`). `rt.c` is the concurrency spine
 (two SPSC rings, voice + sound tables, commit snapshot, generation handles) + retire-ack;
-the whole `bw_*` API forwards to it. `sound.c` decodes wav (dr_wav) and `mix_voice` plays
+the whole `bwa_*` API forwards to it. `sound.c` decodes wav (dr_wav) and `mix_voice` plays
 `sound->pcm` with a gain ramp. Spatialization is real: `layout.c` loads the surveyed
 geometry, `dbap.c` is the listener-relative constant-power gain solve, `align.c` applies
 the per-speaker gain trim + delay. `binaural.c` is the head-oriented 26→stereo monitor, and
 `engine.c` wires all three profiles (`cave` 26→device, `binaural` 26→2ch via the monitor,
 `both` array+monitor on two sinks via a double-buffer). Binaural/both reach headphones live
 through an auto-picked 2-ch **ASIO** driver (sizes its render scratch to the device block, so
-any driver buffer size works); `bw_audio_backend()` reports the device actually opened.
+any driver buffer size works); `bwa_get_audio_backend()` reports the device actually opened.
 **`natnet.c` is M6: an off-wire NatNet (OptiTrack) FrameOfData parser + a seqlock pose handoff
-(`pose.h`); with `track_internal` the audio thread samples the freshest head pose at block
-time** (`rt_set_tracker`), configured via `BWAUDIO_NATNET_*` env (see docs/api.md). An
-interactive **playground** (`examples/playground.cpp`, opt-in `-DBWAUDIO_BUILD_PLAYGROUND=ON`)
+(`pose.h`); with a tracker connected the audio thread samples the freshest head pose at block
+time** (`rt_set_tracker`), configured at runtime via `bwa_tracker_connect`/`bwa_tracker_desc`
+(see docs/api.md). An
+interactive **playground** (`examples/playground.cpp`, opt-in `-DBWA_BUILD_PLAYGROUND=ON`)
 auditions binaural by ear across six feature **scenes** (TAB): localization (with a SPACE auto-move
 sweep), occlusion+materials, directivity, a channel-walk speaker check, a **blind A/B/X** harness
 (X is secretly A or B over one live knob — dual-band, DBAP vs SPCAP/VBAP, spread, air absorption —
 answer over N trials and a one-sided binomial p-value says whether the difference is genuinely
 audible, not just "sounds different to me"), and a reverb-bed room (which
 rebuilds the engine on entry/exit, since the bed + room geometry are load-time). Its 3D scene shades
-each speaker gizmo by that channel's live output level (`bw_get_bus_levels`, mirrored as a meter
+each speaker gizmo by that channel's live output level (`bwa_get_bus_levels`, mirrored as a meter
 strip in the panel), and with no ASIO device the engine falls back to the null sink and keeps
-rendering — visual-only mode is live, just silent. **`bw_test_signal(channel, kind, gain)`** drives one
+rendering — visual-only mode is live, just silent. **`bwa_set_test_signal(channel, kind, gain)`** drives one
 raw output channel with a 660 Hz sine/noise injected after align (`rt.c`) — a speaker-check / wiring
 tool, not a spatial path. The **production Steam Audio HRTF decode** is built + smoke-tested:
 `ambisonics.c` (3rd-order encode) → `steam_decode.c` (phonon `iplAmbisonicsDecodeEffect`), gated
-`BW_HAVE_STEAMAUDIO` (phonon built from the `third_party/steam-audio-source` submodule, staged in `steam-audio-artifacts/`; see
+`BWA_HAVE_STEAMAUDIO` (phonon built from the `third_party/steam-audio-source` submodule, staged in `steam-audio-artifacts/`; see
 third_party/README.md), with the simple-pan monitor as the no-SDK fallback. The `steam_decode` test
 drives the 26→stereo decode and asserts gross laterality (right→right ear, left→left, 180° flips) —
 which caught a real bug: the encode's real-SH m<0 channels (ACN 1,4,5,9,10,11) had phonon's opposite
@@ -143,20 +144,20 @@ transmission + directivity at 30 Hz, and publishes per source a (level, 3-band t
 set via per-voice atomics (`rt`'s `occ_handle`/`occ_val`/`occ_eq`/`occ_dir`) gated on the audio
 thread's own generation; the audio thread applies a 3-biquad transmission EQ (so a wall *muffles*, not
 just attenuates — rate-derived, runs at 96 kHz too), a directivity dipole gain, and the level — all
-ramped per sample. `bw_scene_set_mesh` / `bw_source_set_occlusion` / `bw_source_set_directivity` /
-`bw_source_set_orientation` drive it; the playground wall is a real occluder. The **reflection bed** is
+ramped per sample. `bwa_scene_set_mesh_mat` / `bwa_source_set_occlusion` / `bwa_source_set_directivity` /
+`bwa_source_set_orientation` drive it; the playground wall is a real occluder. The **reflection bed** is
 implemented (`steam_reflect.c`, same gate): an `IPLSimulator` reflections sim → ambisonic IR → the
-SH→26 decode → bus, registered as the rt bus tap at `bw_start`; the `reflect` test proves it's
-*directional*. Sources opt in via `bw_source_set_reflections`, with a per-source wet-send level
-(`bw_source_set_reflection_send`) and an optional **distance→wet** scaling (`bw_source_set_reflection_distance`,
+SH→26 decode → bus, registered as the rt bus tap at `bwa_start`; the `reflect` test proves it's
+*directional*. Sources opt in via `bwa_source_set_reflections`, with a per-source wet-send level
+(`bwa_source_set_reflection_send`) and an optional **distance→wet** scaling (`bwa_source_set_reflection_distance`,
 near = drier / far = wetter; the send gain is distance-derived in `rt.c` and ramped). **Baked reflections**
-(`BWAUDIO_BAKE=1`, same gate) precompute the reverb at a probe grid at `bw_start` so the sim thread looks it
+(`bwa_reflections_desc.bake`, same gate) precompute the reverb at a probe grid at `bwa_start` so the sim thread looks it
 up instead of ray-tracing; the `bake` test confirms it stays directional. **Sound pathing** is wired end to
-end too (`steam_path.c`, same gate, opt in with `BWAUDIO_PATHING`): a 10 Hz sim thread rides the same probe
+end too (`steam_path.c`, same gate, opt in with `bwa_desc.enable_pathing`): a 10 Hz sim thread rides the same probe
 machinery to route a blocked source around occluders / through openings and publishes each opted-in voice's
 ambisonic shCoeffs to `rt.c` (`rt_set_pathing`, handle-gated double buffer); the mixer SH-encodes that
 voice's *un-occluded* signal into a shared ambisonic accumulator (ramped) and the `path` rt tap decodes it
-to the bus via phonon's own decoder (convention consistent encode→decode). `bw_source_set_pathing` opts in;
+to the bus via phonon's own decoder (convention consistent encode→decode). `bwa_source_set_pathing` opts in;
 the `path` test proves the route bends around a wall with the right direction, the `rt` test proves the
 encode lands on `s·shCoeffs`. The **bending-loss EQ is rendered** too: the sim normalizes phonon's
 `eqCoeffs[3]` to a pure spectral tilt (level stays in `shCoeffs`, loudest band = 1) and publishes it
@@ -165,19 +166,19 @@ uses to the *un-occluded* `s_raw` before the SH-encode (ramped + bypassed-when-f
 own `path_effect.cpp` order (EQ the mono signal, then scale each SH channel) — the `rt` test asserts a
 non-flat tilt colours the encoded field. See docs/materials.md. **Opt-in per-source
 propagation effects** are implemented (phonon-free,
-pure `rt.c` DSP, default off): **Doppler** (`bw_source_set_doppler`) renders each voice through a
+pure `rt.c` DSP, default off): **Doppler** (`bwa_source_set_doppler`) renders each voice through a
 per-voice fractional delay ring (`RtCore.dop_ring`, one power-of-two ring per voice, allocated at
 create) whose delay glides toward `distance/c` — the glide rate is the pitch shift, saturating past
-~8 m; and **air absorption** (`bw_source_set_air_absorption`) a distance-driven one-pole HF low-pass.
+~8 m; and **air absorption** (`bwa_source_set_air_absorption`) a distance-driven one-pole HF low-pass.
 Both compute the source↔listener distance per block, ramp per sample (invariant 4), and tap the
 reflection send *before* themselves (direct path only); indices stay integer so a long-lived voice
-never loses sample precision. **Source spread/size** (`bw_source_set_spread`, 0=point..1=wide) is also
-in, with two render modes behind **`bw_set_spread_mode`** (atomic live A/B): LOBE (default) blends the
+never loses sample precision. **Source spread/size** (`bwa_source_set_spread`, 0=point..1=wide) is also
+in, with two render modes behind **`bwa_set_spread_mode`** (atomic live A/B): LOBE (default) blends the
 panner's point gains toward a width-controlled lobe centred on the source direction, renormalised to the
 panner's own power (widening never re-levels) — panner-agnostic; MDAP (Pulkki) pans a 12-direction
 virtual-source ring with the SELECTED panner and sums, so the extent inherits the panner's character
 (collapses to the point solve at spread 0; the `rt` test pins both).
-**Dual-band panning** (`bw_set_dual_band`, off by default, live A/B) wraps the selected panner: a 700 Hz
+**Dual-band panning** (`bwa_set_dual_band`, off by default, live A/B) wraps the selected panner: a 700 Hz
 complementary crossover splits each voice, the low band panned amplitude-normalised (`Σg = gain`,
 velocity-vector) and the high band power-normalised (the panners' usual `Σg² = gain²`) — SPAT's "VBP
 Dual-Band", for sharper LF localisation near the sweet spot; `compute_gains` derives `gtarget_lo` every
@@ -185,22 +186,22 @@ solve so it A/Bs live, and the mixer reads it only when on. **AllRAD adds imagin
 pole no real speaker covers within 60° (a floor-less array's nadir) closes the hull with an imaginary
 speaker whose decode share is discarded, so downward diffuse energy is dropped instead of smeared onto
 the bottom ring (`allrad.c`; the `dsp` test pins it on a floor-less grid). **Tracked room EQ**
-(`room_eq_grid` in the layout, written by `bw_calibrate --room-eq-grid` one run per mic placement) is
+(`room_eq_grid` in the layout, written by `bwa_calibrate --room-eq-grid` one run per mic placement) is
 the moving-listener form of `--room-eq`'s modal half: room mode FREQUENCIES don't move with the
 listener, so each speaker gets one fc/Q ladder + per-position cut depths; each block `rt_render`
 IDW-interpolates the depths at the live listener position (`room_eq_track`) and `align.c` slews its
 biquads toward them at 24 dB/s (fixed-fc coefficients rebuilt from precomputed cw0/alpha — no trig
-beyond a `powf` on the audio thread). `bw_set_tracked_room_eq` is the live kill switch (glides to
+beyond a `powf` on the audio thread). `bwa_set_tracked_room_eq` is the live kill switch (glides to
 flat); static `room_eq` and the grid are mutually exclusive (loader-enforced; the grid writeback
 re-merges all positions via `calib_room_grid_merge` fc-clustering and strips a stale `room_eq`).
 Covered in the `dsp` (loader + align slew), `rt` (listener-follow + kill switch), and `calib`
-(merge + accumulating writeback) tests. **Decorrelation** (`bw_set_decorrelation`, off by default,
+(merge + accumulating writeback) tests. **Decorrelation** (`bwa_set_decorrelation`, off by default,
 live A/B): a spread source's wide part splits off through per-speaker sparse VELVET-NOISE filters
 (`rt.c` `dc_*`: ~30 taps/30 ms, unit energy, per-channel seeds; a shared decor bus convolved after
 the voice loop with a tail-flush + idle history wipe) so wide sources are made of mutually
 INCOHERENT speaker feeds — no phantom collapse or walk-dependent comb filtering; constant power
 (incoherent energy adds), split = sqrt(spread), ramped per sample. The `rt` test pins coherent→
-incoherent→coherent round-trip + power. **Parametric bed renderer** (`bw_set_bed_renderer`, live
+incoherent→coherent round-trip + power. **Parametric bed renderer** (`bwa_set_bed_renderer`, live
 crossfade per bed): first-order DirAC in 4 time-domain bands (`mix_bed`) — per band the smoothed
 FOA intensity vector gives direction + diffuseness ψ; the direct stream (√(1−ψ)·W) re-pans through
 the LISTENER-RELATIVE panner at the array shell (`ref + bed_radius·doa` — a walkable bed: parallax
@@ -208,67 +209,67 @@ off-centre, which no matrix decode gives), the diffuse stream (√ψ·FOA) decod
 into the decorrelators; loudness-matched to the matrix decode via a direction-averaged plane-wave
 reference (`bed_pref`, derived in build_bed_decode). The `rt` test pins sharper-than-matrix
 localization, diffuse spread, power match both ways, and the round-trip. **Directional FDN reverb**
-(`bw_reverb_fdn` + `bw_fdn_set_decay`/`bw_fdn_set_decay_direction`, load-time, phonon-free,
+(`bwa_fdn_config`, load-time, phonon-free,
 `fdn.c`): a 16-line Householder FDN whose lines render as plane waves through the SH→26 bed decode,
 2-band decay + per-direction decay scaling (diagonal Directional-FDN, Alary/Politis/Schlecht 2019);
 it takes the reflection BUS TAP instead of the Steam bed (mutually exclusive; same aux send + send
-levels, `bw_reflections_set_gain` applies), so reverb now works in no-SDK builds. The `fdn` test
+levels, `bwa_reflections_set_gain` applies), so reverb now works in no-SDK builds. The `fdn` test
 pins RT60 landing (0.8 s configured → 0.800 measured), the 2-band split, anisotropy, and stability.
-**Image-source EARLY reflections** (`bw_source_set_early_reflections` + `bw_early_reflections_set_gain`,
+**Image-source EARLY reflections** (`bwa_source_set_early_reflections` + `bwa_early_reflections_set_gain`,
 per-source opt-in, phonon-free, `ism.c`): the FDN's other half — the six first-order shoebox mirrors,
 each rendered as a POINT SOURCE at its mirrored position through the LISTENER-RELATIVE panner, so
 reflections have direction AND parallax as the listener walks (a shared listener-centric bed cannot).
-`bw_scene_set_box` now captures the room with or without the SDK, so one call feeds both the
+`bwa_scene_set_box` now captures the room with or without the SDK, so one call feeds both the
 ray-traced scene and the ISM. Per image: gliding fractional delay (path/c, per-voice `ism_ring`),
 one-pole HF damping from the material's high-vs-mid absorption, ramped panner gains; enable wipes the
 ring (recycled slot) and snaps delays, disable ramps out over one block. Order 1 ONLY by design —
 higher orders are the FDN's job. The `ism` test pins the mirror geometry; the `rt` test pins arrival
 times against the geometric prediction (floor+ceiling pair at 546 samples), direction, and opt-out.
-**Tier-2 rendering polish** (all rt-tested): **pose prediction** (`bw_set_pose_prediction`, off by
+**Tier-2 rendering polish** (all rt-tested): **pose prediction** (`bwa_set_pose_prediction`, off by
 default) — `pose.h` slots carry the writer's clock (`pose_write_t`; natnet stamps QPC at arrival),
 and `rt_render` leads the tracked position by a fixed user lead along a ~100 ms-smoothed,
 speed-capped, dropout-reset velocity from those stamps ONLY (never cross-clock vs the device time);
-**near-listener widening** (`bw_set_near_spread`, off) — `compute_gains` floors every source's
+**near-listener widening** (`bwa_set_near_spread`, off) — `compute_gains` floors every source's
 spread at `1 − dist/radius` so a fly-by widens instead of snapping across the head; the decor split
-follows the solved `spread_eff`; **metric source size** (`bw_source_set_size`, radius m, 0 = point)
+follows the solved `spread_eff`; **metric source size** (`bwa_source_set_size`, radius m, 0 = point)
 — spread floored at the subtended angle `asin(r/d)/(π/2)` (capped 1 when the listener is inside), so
 physical size holds constant as the listener walks and a sized source subsumes near-spread; **equal-loudness distance compensation**
-(`bw_source_set_loudness_comp`, per-source opt-in) — a ~250 Hz one-pole LF shelf boosting 0.4 dB per
+(`bwa_source_set_loudness_comp`, per-source opt-in) — a ~250 Hz one-pole LF shelf boosting 0.4 dB per
 dB of the panner's own attenuation (cap +8 dB), ramped, direct-path-only like air/Doppler;
-**multi-listener compromise panning** (`bw_set_extra_listeners`, up to `BW_EXTRA_LIS` = 3, commit-
+**multi-listener compromise panning** (`bwa_set_extra_listeners`, up to `BWA_EXTRA_LIS` = 3, commit-
 gated) — per-listener point solves (each extra has its OWN SPCAP/VBAP cache: they're listener-keyed)
 energy-meaned per speaker (`panner_gains_at` is the any-listener solve `panner_gains` now wraps);
 spread/Doppler/air/monitor stay primary-relative. **QoL surface** (all rt-tested in one batch):
-`bw_set_master_gain` (one ramped scalar over the whole mix, pre-align so trims/test-signal stay
-calibrated), `bw_source_fade_to`/`bw_source_fade_out` (audio-thread timed fades; fade-out lands on
-the click-free stop path; an explicit set_gain cancels a fade), `bw_set_paused` (global pause riding
-`pause_gate` — one atomic loaded once per block), **mix groups** (`bw_source_set_group` 0..7 +
-`bw_group_set_gain`/`bw_group_set_paused`: group gain folds into the solve via `compute_gains`' `ug`,
-group pause rides `pause_gate`; a group-gain change re-dirties its members), `bw_get_active_voices`
-(rt_render's active count, atomic-published), and `bw_source_set_occlusion_manual` (control-thread
+`bwa_set_master_gain` (one ramped scalar over the whole mix, pre-align so trims/test-signal stay
+calibrated), `bwa_source_fade_to`/`bwa_source_fade_out` (audio-thread timed fades; fade-out lands on
+the click-free stop path; an explicit set_gain cancels a fade), `bwa_set_paused` (global pause riding
+`pause_gate` — one atomic loaded once per block), **mix groups** (`bwa_source_set_group` 0..7 +
+`bwa_group_set_gain`/`bwa_group_set_paused`: group gain folds into the solve via `compute_gains`' `ug`,
+group pause rides `pause_gate`; a group-gain change re-dirties its members), `bwa_get_active_voices`
+(rt_render's active count, atomic-published), and `bwa_source_set_occlusion_manual` (control-thread
 access to the sim's handle-gated occlusion/transmission-EQ publish path — no-SDK gameplay occlusion;
-don't drive one source from both). **Pitch** (`bw_source_set_pitch`, [0.25, 4]): fractional-cursor
+don't drive one source from both). **Pitch** (`bwa_source_set_pitch`, [0.25, 4]): fractional-cursor
 linear-interp resample of in-memory sounds in `mix_voice` (integer cursor + frac — no precision
 loss; the rate GLIDES per sample; the loop seam handles multi-sample overshoot; streams/beds
-unaffected; composes with Doppler). **Bed rotation** (`bw_bed_set_rotation`, radians): closed-form
+unaffected; composes with Doppler). **Bed rotation** (`bwa_bed_set_rotation`, radians): closed-form
 yaw SH rotation in `mix_bed` (`bed_rotate_z`: each degree's ±m pair rotates by m·yaw; per-sample
 phasor recurrence, no per-sample trig), glided at ~1 turn/s, applied before BOTH bed renderers;
 positive yaw turns the field from room +z toward +x (the `rt` test pins the convention + level
-conservation). **Runtime channel count**: `BW_CHANNELS` (26, sink.h) is now the CAPACITY only — the
+conservation). **Runtime channel count**: `BWA_CHANNELS` (26, sink.h) is now the CAPACITY only — the
 ACTIVE count is the layout's speaker count (4..26; loader accepts N speakers whose indices form a
-complete 0..N-1 permutation), fixed per engine instance. `bw_create` resolves the layout BEFORE
+complete 0..N-1 permutation), fixed per engine instance. `bwa_create` resolves the layout BEFORE
 `rt_create` and passes `layout.count` to the rt core, sinks, monitor, FDN; `steam_decode`/
-`steam_reflect`/`steam_path` are count-driven too (they previously hard-looped BW_CHANNELS over the
-bus — an overrun at N<26). `bw_channel_count()` is the readback; a FAILED layout load still falls
+`steam_reflect`/`steam_path` are count-driven too (they previously hard-looped BWA_CHANNELS over the
+bus — an overrun at N<26). `bwa_get_channel_count()` is the readback; a FAILED layout load still falls
 back to the 26 default (non-fatal) which then also means a different channel count — smaller
-installs must check bw_last_error at create. The `dsp` test pins the loader rules; the `rt` test
+installs must check bwa_last_error at create. The `dsp` test pins the loader rules; the `rt` test
 runs a 24-channel core end to end with a canary proving nothing writes past the active count. The
-GUI tools follow the count too: `playground` takes it from `bw_get_speakers` (gizmos/meters/channel
+GUI tools follow the count too: `playground` takes it from `bwa_get_speakers` (gizmos/meters/channel
 walk), `layout_tool` carries `g_nspk` (load sets it from the file, save writes N records, a panel
 count control grows onto the dome / drops the tail and REBUILDS the engine — its channel count is
 the layout's), `calib_view` uses each loaded `Layout.count` (a Diff of two different-sized arrays
 is refused, not silently mis-compared), and `calib_capture` takes the speaker count (ASIO opens
-`n` outs + the mic at slot `n`). NSPK/BW_CHANNELS remain array capacity in all four.
+`n` outs + the mic at slot `n`). NSPK/BWA_CHANNELS remain array capacity in all four.
 **Cross-validation** (`test_xval`, goldens generated by
 `tools/xval/gen_reference.py`): the SH encode, hull/VBAP solve, AllRAD build (both grids, incl. the
 imaginary speaker), RBJ biquads, and align's room_eq rendering are pinned against INDEPENDENT
@@ -278,32 +279,32 @@ linprog/HiGHS validates `hull.c`'s geometric walk — they agree to ~1e-7), a qh
 rebuild, bilinear-transformed RBJ analog prototypes, and a scipy `lfilter` golden. The header is
 committed, so ctest stays hermetic; regenerating needs numpy+scipy. DBAP/SPCAP and the MDAP ring
 parametrization are house designs with no external reference — their contracts stay in the
-`dsp`/`rt` property tests, and their shared cores (hull/VBAP, SH, biquads) are what xval pins. An **ambisonic bed** is implemented too (`bw_load_ambix` + `bw_bed_*`):
+`dsp`/`rt` property tests, and their shared cores (hull/VBAP, SH, biquads) are what xval pins. An **ambisonic bed** is implemented too (`bwa_load_ambix` + `bwa_bed_*`):
 a file-fed AmbiX soundfield decoded world-locked to the 26-ch bus (`rt.c` `build_bed_decode`/`mix_bed`,
 phonon-free), reusing the SH→26 decode the reflection bed will need. `sound.c` now decodes **WAV/FLAC/MP3**
 (dr_libs, one pinned repo fetch) and **resamples to the engine rate at load** (windowed-sinc). **Streaming**
-(`bw_load_sound_streaming`, `stream.c`) plays long files without decoding them into RAM: a background
+(`bwa_load_sound_streaming`, `stream.c`) plays long files without decoding them into RAM: a background
 thread decodes chunks (WAV/FLAC/MP3, downmixed to mono, engine rate required) into a per-stream **SPSC ring**;
 the audio thread `stream_pull`s from the ring in `mix_voice` (no I/O/alloc/locks), distinguishing a true EOF
 from a transient underrun. One voice per stream; the retire handshake detaches voices before the control
 thread closes the stream.
-**Voice management + scheduling**: sources carry a control-side steal **priority** (`bw_source_set_priority`,
+**Voice management + scheduling**: sources carry a control-side steal **priority** (`bwa_source_set_priority`,
 255 = protected) — a full pool steals the lowest-priority voice instead of failing the create; and
-**`bw_source_play_at(start_sample)`** fires a voice sample-accurately off a published dsp clock
-(`bw_dsp_time`, device-anchored), the mixer holding it silent until the exact in-block offset.
-**Pause/seek** (`bw_source_set_paused` / `bw_source_seek`): a per-voice gate ramps over one block
+**`bwa_source_play_at(start_sample)`** fires a voice sample-accurately off a published dsp clock
+(`bwa_get_dsp_time`, device-anchored), the mixer holding it silent until the exact in-block offset.
+**Pause/seek** (`bwa_source_set_paused` / `bwa_source_seek`): a per-voice gate ramps over one block
 (invariant 4) and the playhead freezes only once silent, so resume continues exactly where pause
 landed and a seek on a running voice is ramp-out → jump → ramp-in (click-free); pause covers
 memory/stream/bed voices, seek is in-memory/bed only (the stream ring can't jump), and paused
-still reads as playing. An **output protection limiter** (`bw_set_limiter` / `bw_set_limiter_ceiling`,
+still reads as playing. An **output protection limiter** (`bwa_set_limiter` / `bwa_set_limiter_ceiling`,
 ON by default at -1 dBFS) is the FINAL stage in `rt_render` (after align + the test signal —
 everything reaching the device passes through): LINKED across channels (one gain from the
 cross-channel peak, so engaging never shifts the spatial image), ~1 ms attack / ~120 ms release +
 a hard clamp at the ceiling; protection, not mastering. Both are covered in the `rt` test (freeze,
 seek landing, ceiling, linkage). **Ray-tracing
-acceleration**: `BWAUDIO_EMBREE=1` runs both sims on Intel Embree, opt-in with a graceful fallback to the
+acceleration**: `bwa_desc.embree` runs both sims on Intel Embree, opt-in with a graceful fallback to the
 default tracer (the vendored prebuilt phonon isn't Embree-built, so it currently falls back — see docs/api.md).
-**Speaker calibration** (`bw_calibrate`, opt-in `-DBWAUDIO_BUILD_CALIBRATE=ON`; DSP in `measure.c`, solve +
+**Speaker calibration** (`bwa_calibrate`, opt-in `-DBWA_BUILD_CALIBRATE=ON`; DSP in `measure.c`, solve +
 JSON writeback in `calib.c`, both unit-tested off-hardware): a full-duplex ASIO tool that sweeps each speaker,
 records an omni mic, and writes `cave_layout.json` — per-speaker delay/gain trims (`calib_solve`, arrival-align
 + sensitivity-equalize), acoustic **position self-survey** through the screens (`--localize` → `calib_trilaterate`,
@@ -337,8 +338,8 @@ horizontal ring) leave the capsules' HEIGHTS unconstrained; `spread` measures th
 rather than return a flattened array. The 19-ch ASIO capture is the rig-bound shell, factored into
 `zylia_capture.cpp` (driver open, format conversion, transient trigger, snapshot publish via `ZpShared`;
 trigger thresholds + the live noise floor are exposed in `ZpShared` for tuning at the rig) and shared by two
-consumers: `bw_zylia_probe` (opt-in `-DBWAUDIO_BUILD_CALIBRATE=ON`), the console bring-up meter (tap a capsule
-→ its channel jumps — this is what resolves the channel order by hand); and `bw_calib_view`'s **Zylia tab**,
+consumers: `bwa_zylia_probe` (opt-in `-DBWA_BUILD_CALIBRATE=ON`), the console bring-up meter (tap a capsule
+→ its channel jumps — this is what resolves the channel order by hand); and `bwa_calib_view`'s **Zylia tab**,
 the live DOA view — a clap is snapshotted, `zylia_tdoa` (onset + windowed cross-correlation with sub-sample
 peaks) feeds `zylia_doa`, and a dot appears on the capsule sphere where the clap came from. The tab also hosts
 the **Capsule survey** panel (bank claps → Solve → Install → Save). A device exposing FEWER than 19 inputs is
@@ -352,13 +353,13 @@ which dissolves the two-device problem that blocks `--zylia` on hardware (and ma
 DISTANCE becomes real). `zylia_survey` is capture-agnostic: it takes (source position, 19 arrival times) and
 does not care whether they came from a clap's cross-correlation or a sweep's deconvolved IR peak. See
 docs/calibration.md.
-**`bw_calib_view`** (opt-in `-DBWAUDIO_BUILD_CALIBVIEW=ON`) is the **calibration station** (imgui +
+**`bwa_calib_view`** (opt-in `-DBWA_BUILD_CALIBVIEW=ON`) is the **calibration station** (imgui +
 implot + implot3d on win32+d3d11 — the stack for new panel/plot tools; theme + embedded Roboto +
-conventions ported from aforren1/lsl-viewer, the house reference — `examples/bw_theme.h`): it loads
+conventions ported from aforren1/lsl-viewer, the house reference — `examples/bwa_theme.h`): it loads
 layouts through the engine's own `layout_load`, shows the array in 3D, gain/delay trims,
 correction-EQ magnitude curves, `--save-irs` IR kernels, a layout DIFF (surveyed vs calibrated) with
 outlier highlighting — the "did calibration write something sane?" check before accepting a
-writeback — the **Capture tab** (bw_calibrate's core flow in-window: a worker thread runs
+writeback — the **Capture tab** (bwa_calibrate's core flow in-window: a worker thread runs
 sweep→measure→solve→writeback through the same `calib_capture.cpp` backends the CLI uses, rows
 publish live via a done_count release/acquire, and the result loads straight into Diff: A = input,
 B = what calibration wrote) — and the **Zylia tab** (live clap-DOA on the capsule sphere; see below).
@@ -367,17 +368,17 @@ assert 26 speakers / the known 100 mm fixture delta; Run calibration → wait fo
 into Diff → assert the wobble trims; enable simulate → Clap now → recovered DOA within 2° of truth),
 screenshots are captured to output/captures/, pure-logic checks ride the same suite, and it all runs
 under ctest (`calib_view`) — a GUI with an automated regression test (test-engine license: free for
-open source, NOT MIT — see its LICENSE.txt). **`bw_layout_tool`** (`examples/layout_tool.cpp`, under
-`BWAUDIO_BUILD_PLAYGROUND`) is on the same imgui stack via **rlImGui** (pinned `Raylib_5_5` tag): the
+open source, NOT MIT — see its LICENSE.txt). **`bwa_layout_tool`** (`examples/layout_tool.cpp`, under
+`BWA_BUILD_PLAYGROUND`) is on the same imgui stack via **rlImGui** (pinned `Raylib_5_5` tag): the
 3D room view (orbit + head-view cameras, ray-picked speakers, the coverage shell) stays raylib — it's
 a *scene*, not a plot — while every control surface (panel/HUD/tooltips) is imgui with the station
 theme, and the same `--tests` harness runs it under ctest (`layout_tool`: logic round-trips, panel
 fake-input edits, save/reload, score/optimize, full-frame screenshots via a before-swap GL read).
-Raylib input handlers gate on `io.WantCapture*`. **`bw_playground` is on the same rlImGui stack**
+Raylib input handlers gate on `io.WantCapture*`. **`bwa_playground` is on the same rlImGui stack**
 (control panel + live output meters in imgui; the 3D scene stays raylib; raygui is gone from the
 repo), with its own `--tests` suite under ctest (`playground`: p-value/signal logic, panel
 fake-input edits, a scene cycle that rebuilds the engine across the reverb boundary, and
-`meters_live` — the suite forces `BWAUDIO_SINK=null` and asserts the engine STAYS LIVE with no
+`meters_live` — the suite forces `BWA_SINK_NULL` and asserts the engine STAYS LIVE with no
 audio device, pinning the null-sink fallback the tool's visual-only mode depends on). Test-ref
 gotchas the code comments document: a `**/` wildcard hashes its LAST
 segment as a literal string (use a plain window-relative path for `$$int` component refs, e.g.
@@ -398,7 +399,7 @@ decay (that stays the `--room` report's treatment problem). See docs/calibration
 Remaining: the by-ear headphone check; and live Motive verification of M6 (parser + lifecycle are tested off-wire). Do not bake ASIO assumptions
 outside `asio_sink.cpp`, and do not link the NatNet SDK (proprietary; reference only — GPLv3).
 The atomics in `rt.c` need `/experimental:c11atomics` on MSVC (wired in CMake); `pose.h` uses
-Interlocked intrinsics instead, so `natnet.c`/tests need no extra flag. `-DBWAUDIO_ASAN=ON`
+Interlocked intrinsics instead, so `natnet.c`/tests need no extra flag. `-DBWA_ASAN=ON`
 builds `test_sound` under ASan.
 
 ## What NOT to do
@@ -416,7 +417,7 @@ builds `test_sound` under ASan.
 - Do not model the CAVE room itself with the ISM. Its shoebox is the *virtual*
   environment; the physical room supplies its own reflections, and modelling it
   double-counts (same trap as matching the measured RT60 — docs/calibration.md).
-- Do not let any `bw_*` per-frame call block or allocate.
+- Do not let any `bwa_*` per-frame call block or allocate.
 
 ## Which acoustics path (the recommendation)
 
@@ -447,6 +448,6 @@ the production array render never uses HRTF.
 - `docs/integration.md` — Unity binding + coordinate seam; Unreal notes.
 - `docs/build.md` — platform, dependencies, licensing, DVS/Dante config.
 - `docs/layout-schema.md` — `cave_layout.json` format: speaker geometry, per-speaker gain/delay, DBAP knobs.
-- `docs/calibration.md` — `bw_calibrate`: acoustic position survey, delay/gain trims, room report → `cave_layout.json`.
+- `docs/calibration.md` — `bwa_calibrate`: acoustic position survey, delay/gain trims, room report → `cave_layout.json`.
 - `docs/internal-types.md` — internal structs (`Voice`/`Sound`/`Layout`/`Listener`) + helper signatures. **Not ABI.**
 - `docs/roadmap.md` — milestone-ordered implementation plan.

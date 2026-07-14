@@ -3,7 +3,7 @@
 # WHY these are committed, and not left to Unity:
 #   A package installed from a registry/tarball is IMMUTABLE - Unity imports it read-only into
 #   Library/PackageCache. Any file arriving without a .meta gets a FRESH RANDOM GUID in each project,
-#   so a scene that references BwEmitter on machine A points at a GUID machine B never generated:
+#   so a scene that references Emitter on machine A points at a GUID machine B never generated:
 #   the component deserializes as "Missing (Mono Script)". Shipping the .meta pins the GUID for
 #   everyone. The same applies to the native plugins' import settings (which platforms, Editor on/off):
 #   in an immutable package the user CANNOT fix them in the Inspector, so they must ship correct.
@@ -94,7 +94,7 @@ PluginImporter:
 $assets = @(
     'package.json', 'README.md', 'CHANGELOG.md',
     'Runtime', 'Runtime/Plugins', 'Runtime/Plugins/x86_64', 'Editor',
-    'Runtime/Plugins/x86_64/bwaudio.dll', 'Runtime/Plugins/x86_64/phonon.dll'
+    'Runtime/Plugins/x86_64/bw_audio.dll', 'Runtime/Plugins/x86_64/phonon.dll'
 )
 foreach ($dir in 'Runtime', 'Editor') {
     Get-ChildItem (Join-Path $PackageDir $dir) -File |

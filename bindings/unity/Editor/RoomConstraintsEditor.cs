@@ -1,19 +1,19 @@
-// BwRoomConstraintsEditor.cs — show what actually got loaded. A constraints file that is missing, or
+// RoomConstraintsEditor.cs — show what actually got loaded. A constraints file that is missing, or
 // that parsed to nothing, otherwise just draws no gizmos, which looks identical to "the component is
 // working and the room is empty".
 using UnityEditor;
 using UnityEngine;
 
-namespace CaveAudio.EditorTools
+namespace BwAudio.EditorTools
 {
-    [CustomEditor(typeof(BwRoomConstraints))]
-    public sealed class BwRoomConstraintsEditor : Editor
+    [CustomEditor(typeof(RoomConstraints))]
+    public sealed class RoomConstraintsEditor : Editor
     {
         public override void OnInspectorGUI()
         {
             DrawDefaultInspector();
 
-            var c = (BwRoomConstraints)target;
+            var c = (RoomConstraints)target;
             if (GUILayout.Button("Reload")) { c.Load(force: true); SceneView.RepaintAll(); }
 
             var data = c.Constraints;
@@ -21,7 +21,7 @@ namespace CaveAudio.EditorTools
             {
                 EditorGUILayout.HelpBox(
                     c.LoadError + "\n\nThis is the surveyed room (truss / screen cube / projectors), the " +
-                    "same constraints.json bw_layout_tool and bw_playground read. Copy it into " +
+                    "same constraints.json bwa_layout_tool and bwa_playground read. Copy it into " +
                     "Assets/StreamingAssets/.", MessageType.Warning);
                 return;
             }

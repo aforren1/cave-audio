@@ -7,7 +7,7 @@
  * the asio_sink.c boundary — everything here is device-agnostic.
  *
  * Backends:
- *   - asio_sink.c  (BW_HAVE_ASIO): drives a real ASIO driver (DVS in production).
+ *   - asio_sink.c  (BWA_HAVE_ASIO): drives a real ASIO driver (DVS in production).
  *   - null_sink.c  (always built): a threaded *offline* sink that paces blocks from
  *                  a high-resolution clock and discards the audio. Lets the engine
  *                  run with no hardware (desk dev, CI, the `binaural` array path).
@@ -16,17 +16,17 @@
  * channel `c` sample `i` lives at bus[c * nframes + i]. This matches the per-channel
  * work in align_speakers and the ASIO planar driver buffers (one buffer per channel).
  */
-#ifndef BW_SINK_H
-#define BW_SINK_H
+#ifndef BWA_SINK_H
+#define BWA_SINK_H
 
 #include <stddef.h>
 #include <stdint.h>
 
 /* The array-width CAPACITY — sizes every fixed array (gain vectors, decode matrices, meters). The
- * ACTIVE channel count is the loaded layout's speaker count (4..BW_CHANNELS, Layout.count; the
- * default grid is exactly BW_CHANNELS), fixed per engine instance — a collaborator's 24-speaker
+ * ACTIVE channel count is the loaded layout's speaker count (4..BWA_CHANNELS, Layout.count; the
+ * default grid is exactly BWA_CHANNELS), fixed per engine instance — a collaborator's 24-speaker
  * array loads into the same binary. Raising the cap is a recompile. */
-#define BW_CHANNELS 26
+#define BWA_CHANNELS 26
 
 /* Hardware-anchored timestamp captured at the top of each block. Mirrors what ASIO
  * delivers via ASIOTime (sample position + nanosecond systemTime); the null sink
@@ -34,46 +34,50 @@
 typedef struct {
     uint64_t sample_pos;       /* running output sample-frame position             */
     uint64_t system_time_ns;   /* monotonic host time at block start, nanoseconds   */
-} BwTimestamp;
+} bwa_timestamp;
 
 /* The engine's per-block render. Called on the audio thread, once per buffer.
  * MUST fill `bus` (planar, channels * nframes floats) and obey the audio-thread
  * invariants (no alloc/lock/syscall/I/O — see CLAUDE.md). `user` is the engine. */
-typedef void (*BwRenderFn)(void* user, float* bus, uint32_t nframes, const BwTimestamp* ts);
+typedef void (*bwa_render_fn)(void* user, float* bus, uint32_t nframes, const bwa_timestamp* ts);
 
-typedef struct BwSink BwSink;
+typedef struct bwa_sink bwa_sink;
 
-/* Backend dispatch. Each concrete sink embeds `struct BwSink` as its FIRST member and
- * fills `vt`; the generic bw_sink_* calls (in sink.c) dispatch through it. */
+/* Backend dispatch. Each concrete sink embeds `struct bwa_sink` as its FIRST member and
+ * fills `vt`; the generic bwa_sink_* calls (in sink.c) dispatch through it. */
 typedef struct {
-    int         (*start)(BwSink*);
-    void        (*stop)(BwSink*);
-    void        (*close)(BwSink*);
-    const char* (*backend)(BwSink*);
-    uint32_t    (*block_size)(BwSink*);   /* actual frames per callback (driver dictates for ASIO) */
-} BwSinkVtbl;
+    int         (*start)(bwa_sink*);
+    void        (*stop)(bwa_sink*);
+    void        (*close)(bwa_sink*);
+    const char* (*backend)(bwa_sink*);
+    uint32_t    (*block_size)(bwa_sink*);   /* actual frames per callback (driver dictates for ASIO) */
+} bwa_sink_vtbl;
 
-struct BwSink { const BwSinkVtbl* vt; };
+struct bwa_sink { const bwa_sink_vtbl* vt; };
 
-/* Open the best available sink for this format: ASIO if compiled in and a driver
- * opens, otherwise the null sink. On failure returns NULL and writes a message to
- * `err` (if err/errcap given). Does NOT start the audio thread yet. */
-BwSink* bw_sink_open(uint32_t sample_rate, uint32_t block_size, uint32_t channels,
-                     BwRenderFn render, void* user, char* err, size_t errcap);
+/* Open a sink for this format per `sink_type` (bwa_sink_type: 0 = auto — ASIO if compiled in and
+ * a driver opens, else the null sink; 1 = demand ASIO, failure returns NULL; 2 = force null).
+ * `asio_driver` names the ASIO driver to open (NULL = auto-pick by channel count). On failure
+ * returns NULL and writes a message to `err` (if err/errcap given). Does NOT start the audio
+ * thread yet. */
+bwa_sink* bwa_sink_open(uint32_t sample_rate, uint32_t block_size, uint32_t channels,
+                     int sink_type, const char* asio_driver,
+                     bwa_render_fn render, void* user, char* err, size_t errcap);
 
-int          bw_sink_start(BwSink* s);   /* begin the callback loop; 0 = ok        */
-void         bw_sink_stop(BwSink* s);    /* stop the loop; safe if already stopped */
-void         bw_sink_close(BwSink* s);   /* stop (if needed) + release             */
-const char*  bw_sink_backend(BwSink* s); /* e.g. "asio:DVS" or "null"              */
-uint32_t     bw_sink_block_size(BwSink* s); /* actual frames per block; 0 if none  */
+int          bwa_sink_start(bwa_sink* s);   /* begin the callback loop; 0 = ok        */
+void         bwa_sink_stop(bwa_sink* s);    /* stop the loop; safe if already stopped */
+void         bwa_sink_close(bwa_sink* s);   /* stop (if needed) + release             */
+const char*  bwa_sink_backend(bwa_sink* s); /* e.g. "asio:DVS" or "null"              */
+uint32_t     bwa_sink_block_size(bwa_sink* s); /* actual frames per block; 0 if none  */
 
-/* Backend constructors used by bw_sink_open. null is always present; asio only when
- * BW_HAVE_ASIO is defined (third_party/asiosdk vendored — see third_party/README.md). */
-BwSink* bw_null_sink_open(uint32_t sample_rate, uint32_t block_size, uint32_t channels,
-                          BwRenderFn render, void* user, char* err, size_t errcap);
-#ifdef BW_HAVE_ASIO
-BwSink* bw_asio_sink_open(uint32_t sample_rate, uint32_t block_size, uint32_t channels,
-                          BwRenderFn render, void* user, char* err, size_t errcap);
+/* Backend constructors used by bwa_sink_open. null is always present; asio only when
+ * BWA_HAVE_ASIO is defined (third_party/asiosdk vendored — see third_party/README.md). */
+bwa_sink* bwa_null_sink_open(uint32_t sample_rate, uint32_t block_size, uint32_t channels,
+                          bwa_render_fn render, void* user, char* err, size_t errcap);
+#ifdef BWA_HAVE_ASIO
+bwa_sink* bwa_asio_sink_open(uint32_t sample_rate, uint32_t block_size, uint32_t channels,
+                          const char* driver /* NULL = auto-pick */,
+                          bwa_render_fn render, void* user, char* err, size_t errcap);
 #endif
 
-#endif /* BW_SINK_H */
+#endif /* BWA_SINK_H */

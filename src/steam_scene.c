@@ -1,13 +1,13 @@
 /*
  * steam_scene.c — materials occlusion, off-thread half. See steam_scene.h.
  *
- * Build-only-with-SDK (BWAUDIO_WITH_STEAMAUDIO). phonon's room/coord convention equals ours
+ * Build-only-with-SDK (BWA_WITH_STEAMAUDIO). phonon's room/coord convention equals ours
  * (x=right, y=up, -z=ahead), so positions pass through unchanged. A dedicated sim thread owns all
  * phonon objects; the control thread only writes a locked shadow (mesh + per-source enable/pos),
  * and the audio thread only reads the published occlusion float (rt_set_occlusion).
  */
 #include "steam_scene.h"
-#include "frame.h"         /* BW_ROOM_AHEAD (default source forward) */
+#include "frame.h"         /* BWA_ROOM_AHEAD (default source forward) */
 #include "profile.h"
 
 #include <phonon.h>
@@ -112,7 +112,7 @@ static DWORD WINAPI sim_thread(LPVOID arg) {
     if (!snap_h || !snap_p || !snap_feat || !snap_dw || !snap_dp || !snap_fwd) {
         free(snap_h); free(snap_p); free(snap_feat); free(snap_dw); free(snap_dp); free(snap_fwd); return 0;
     }
-    BW_THREAD_NAME("bw-sim (occlusion)");
+    BWA_THREAD_NAME("bw-sim (occlusion)");
     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);  /* never preempt the audio callback */
 
     while (!s->stop) {
@@ -189,7 +189,7 @@ static DWORD WINAPI sim_thread(LPVOID arg) {
          * (floored) is the EQ. Each output is read only for the features that asked for it. */
         int any_src = 0;
         for (uint32_t i = 0; i < cap; ++i) if (s->srcs[i]) { any_src = 1; break; }
-        if (any_src) { BW_ZONE_BEGIN(zs, "occlusion ray-trace"); iplSimulatorRunDirect(s->simulator); BW_ZONE_END(zs); }
+        if (any_src) { BWA_ZONE_BEGIN(zs, "occlusion ray-trace"); iplSimulatorRunDirect(s->simulator); BWA_ZONE_END(zs); }
         for (uint32_t i = 0; i < cap; ++i) {
             if (!s->srcs[i]) continue;
             IPLSimulationOutputs out; memset(&out, 0, sizeof out);
@@ -215,7 +215,8 @@ static DWORD WINAPI sim_thread(LPVOID arg) {
     return 0;
 }
 
-SteamScene* steam_scene_create(RtCore* rt, uint32_t sample_rate, uint32_t frame_size, uint32_t voice_cap) {
+SteamScene* steam_scene_create(RtCore* rt, uint32_t sample_rate, uint32_t frame_size, uint32_t voice_cap,
+                               int use_embree) {
     if (!rt || voice_cap == 0) return NULL;
     SteamScene* s = (SteamScene*)calloc(1, sizeof *s);
     if (!s) return NULL;
@@ -229,17 +230,16 @@ SteamScene* steam_scene_create(RtCore* rt, uint32_t sample_rate, uint32_t frame_
     if (iplContextCreate(&cs, &s->context) != IPL_STATUS_SUCCESS) goto fail;
 
     /* Ray tracer: default to Steam Audio's built-in, opt into Embree (faster CPU ray tracing) via
-     * BWAUDIO_EMBREE. If the device can't be created (phonon built without Embree, or no runtime), fall
-     * back to default so the flag is always safe. The reflection sim borrows this scene, so it must use
-     * the same scene type — exposed via steam_scene_ipl_scenetype. */
+     * bwa_desc.embree. If the device can't be created (phonon built without Embree, or no runtime),
+     * fall back to default so the flag is always safe. The reflection sim borrows this scene, so it
+     * must use the same scene type — exposed via steam_scene_ipl_scenetype. */
     s->scene_type = IPL_SCENETYPE_DEFAULT;
-    const char* want_embree = getenv("BWAUDIO_EMBREE");
-    if (want_embree && want_embree[0] && want_embree[0] != '0') {
+    if (use_embree) {
         if (iplEmbreeDeviceCreate(s->context, NULL, &s->embree) == IPL_STATUS_SUCCESS) {
             s->scene_type = IPL_SCENETYPE_EMBREE;
-            fprintf(stderr, "bwaudio: Steam Audio ray tracing on Embree (BWAUDIO_EMBREE)\n");
+            fprintf(stderr, "bw_audio: Steam Audio ray tracing on Embree (bwa_desc.embree)\n");
         } else {
-            fprintf(stderr, "bwaudio: BWAUDIO_EMBREE set but Embree unavailable; using the default ray tracer\n");
+            fprintf(stderr, "bw_audio: embree requested but unavailable; using the default ray tracer\n");
         }
     }
 
@@ -303,11 +303,6 @@ static void set_mesh_internal(SteamScene* s, const float* verts, int nverts, con
     LeaveCriticalSection(&s->lock);
 }
 
-void steam_scene_set_mesh(SteamScene* s, const float* verts, int nverts, const int* tris, int ntris,
-                          const float absorption[3], float scattering, const float transmission[3]) {
-    set_mesh_internal(s, verts, nverts, tris, ntris, 1, absorption, &scattering, transmission, NULL);
-}
-
 void steam_scene_set_mesh_mat(SteamScene* s, const float* verts, int nverts, const int* tris, int ntris,
                               int nmat, const float* absorption, const float* scattering,
                               const float* transmission, const int* tri_material) {
@@ -323,15 +318,15 @@ static void shadow_adopt(SteamScene* s, uint16_t idx, uint32_t handle) {
         s->shadow[idx].handle     = handle;
         s->shadow[idx].features   = 0;
         s->shadow[idx].dir_weight = 0.f; s->shadow[idx].dir_power = 1.f;
-        s->shadow[idx].fwd[0] = BW_ROOM_AHEAD[0]; s->shadow[idx].fwd[1] = BW_ROOM_AHEAD[1];      /* default ahead = the room */
-        s->shadow[idx].fwd[2] = BW_ROOM_AHEAD[2];                                                /* frame's identity forward */
+        s->shadow[idx].fwd[0] = BWA_ROOM_AHEAD[0]; s->shadow[idx].fwd[1] = BWA_ROOM_AHEAD[1];      /* default ahead = the room */
+        s->shadow[idx].fwd[2] = BWA_ROOM_AHEAD[2];                                                /* frame's identity forward */
         s->shadow[idx].pos[0] = 0.f; s->shadow[idx].pos[1] = 0.f; s->shadow[idx].pos[2] = 0.f;   /* origin until set_pos lands */
     }
 }
 
 void steam_scene_set_occlusion(SteamScene* s, uint32_t handle, int on) {
     if (!s) return;
-    uint16_t idx = BW_H_IDX(handle);
+    uint16_t idx = BWA_H_IDX(handle);
     if (idx >= s->voice_cap) return;
     EnterCriticalSection(&s->lock);
     shadow_adopt(s, idx, handle);
@@ -342,7 +337,7 @@ void steam_scene_set_occlusion(SteamScene* s, uint32_t handle, int on) {
 /* weight 0 = omni (no directivity); 0.5 = cardioid; 1 = figure-8. power >= 1 sharpens the lobe. */
 void steam_scene_set_directivity(SteamScene* s, uint32_t handle, float weight, float power) {
     if (!s) return;
-    uint16_t idx = BW_H_IDX(handle);
+    uint16_t idx = BWA_H_IDX(handle);
     if (idx >= s->voice_cap) return;
     if (weight < 0.f) weight = 0.f; if (weight > 1.f) weight = 1.f;
     if (power  < 1.f) power  = 1.f;
@@ -355,7 +350,7 @@ void steam_scene_set_directivity(SteamScene* s, uint32_t handle, float weight, f
 
 void steam_scene_set_orientation(SteamScene* s, uint32_t handle, float fx, float fy, float fz) {
     if (!s) return;
-    uint16_t idx = BW_H_IDX(handle);
+    uint16_t idx = BWA_H_IDX(handle);
     if (idx >= s->voice_cap) return;
     EnterCriticalSection(&s->lock);
     shadow_adopt(s, idx, handle);
@@ -365,7 +360,7 @@ void steam_scene_set_orientation(SteamScene* s, uint32_t handle, float fx, float
 
 void steam_scene_set_pos(SteamScene* s, uint32_t handle, float x, float y, float z) {
     if (!s) return;
-    uint16_t idx = BW_H_IDX(handle);
+    uint16_t idx = BWA_H_IDX(handle);
     if (idx >= s->voice_cap) return;
     EnterCriticalSection(&s->lock);
     shadow_adopt(s, idx, handle);
@@ -373,11 +368,11 @@ void steam_scene_set_pos(SteamScene* s, uint32_t handle, float x, float y, float
     LeaveCriticalSection(&s->lock);
 }
 
-/* On bw_source_destroy: clear ALL features so the sim tears the IPLSource down and stops simulating
+/* On bwa_source_destroy: clear ALL features so the sim tears the IPLSource down and stops simulating
  * the slot (else a recycled slot inherits stale state). */
 void steam_scene_source_gone(SteamScene* s, uint32_t handle) {
     if (!s) return;
-    uint16_t idx = BW_H_IDX(handle);
+    uint16_t idx = BWA_H_IDX(handle);
     if (idx >= s->voice_cap) return;
     EnterCriticalSection(&s->lock);
     if (s->shadow[idx].handle == handle) s->shadow[idx].features = 0;

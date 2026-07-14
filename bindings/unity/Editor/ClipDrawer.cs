@@ -1,8 +1,8 @@
-// BwClipDrawer.cs — editor picker for [BwClip] string fields. Lists the files actually present under
+// ClipDrawer.cs — editor picker for [Clip] string fields. Lists the files actually present under
 // StreamingAssets (so you don't type paths by hand), flags a missing file in red, and offers a browse
 // button scoped to StreamingAssets. The stored value stays a StreamingAssets-relative path.
 //
-// The extension set comes from the attribute ([BwClip] = audio, [BwClip(".json")] = the speaker
+// The extension set comes from the attribute ([Clip] = audio, [Clip(".json")] = the speaker
 // layout), so the file lists are cached per extension set rather than globally.
 using System;
 using System.Collections.Generic;
@@ -11,10 +11,10 @@ using System.Linq;
 using UnityEditor;
 using UnityEngine;
 
-namespace CaveAudio.EditorTools
+namespace BwAudio.EditorTools
 {
-    [CustomPropertyDrawer(typeof(BwClipAttribute))]
-    public sealed class BwClipDrawer : PropertyDrawer
+    [CustomPropertyDrawer(typeof(ClipAttribute))]
+    public sealed class ClipDrawer : PropertyDrawer
     {
         class Cache { public string[] Files = Array.Empty<string>(); public double NextScan; }
         static readonly Dictionary<string, Cache> _caches = new Dictionary<string, Cache>();
@@ -22,7 +22,7 @@ namespace CaveAudio.EditorTools
         public override void OnGUI(Rect pos, SerializedProperty prop, GUIContent label)
         {
             if (prop.propertyType != SerializedPropertyType.String) { EditorGUI.PropertyField(pos, prop, label); return; }
-            var exts = ((BwClipAttribute)attribute).Extensions;
+            var exts = ((ClipAttribute)attribute).Extensions;
             var files = Scan(exts);
 
             string cur = prop.stringValue ?? "";

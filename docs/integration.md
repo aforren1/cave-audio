@@ -33,47 +33,47 @@ conversion with a known-position test source before trusting anything else.
 
 The engine's channel count is **the layout's speaker count** (4..26), not a constant.
 The CAVE array is 26; a smaller rig loads its own file. Read it back with
-`bw_channel_count` (or `bw_get_speakers`, which returns the same number) and size any
+`bwa_get_channel_count` (or `bwa_get_speakers`, which returns the same number) and size any
 meter / speaker-gizmo / channel-test array from it. Never hard-code 26 in a binding.
 
-The trap: **a failed layout load is not fatal** — `bw_create` falls back to the
-26-speaker default grid and only records the reason in `bw_last_error`. On a smaller
-install that silently changes the channel count too. Check `bw_last_error` right after
-`bw_create` and fail loudly if the surveyed layout didn't load.
+The trap: **a failed layout load is not fatal** — `bwa_create` falls back to the
+26-speaker default grid and only records the reason in `bwa_last_error`. On a smaller
+install that silently changes the channel count too. Check `bwa_last_error` right after
+`bwa_create` and fail loudly if the surveyed layout didn't load.
 
 ## Unity
 
-**Implemented as a UPM package — [`bindings/unity/`](../bindings/unity/) (`com.brainworks.bwaudio`).**
+**Implemented as a UPM package — [`bindings/unity/`](../bindings/unity/) (`com.brainworks.bw_audio`).**
 See its [README](../bindings/unity/README.md) for install + plugin staging.
 
 Four core pieces:
 
-- **`Bw`** — the P/Invoke layer, verified 1:1 against the ABI.
+- **`Bwa`** — the P/Invoke layer, verified 1:1 against the ABI.
 - **`Room`** — the coordinate seam.
-- **`BwAudio`** — the singleton manager + centralized per-frame push.
-- **`BwEmitter`** — the per-source component.
+- **`Engine`** — the singleton manager + centralized per-frame push.
+- **`Emitter`** — the per-source component.
 
-The rest of the Runtime folder: `BwAmbisonicBed` (a world-locked AmbiX soundfield
-component over `bw_bed_*`), `BwAcousticGeometry` (marks a mesh as
-occluding/reflecting geometry with a material; `BwAudio` bakes them all into one
-engine mesh at load), `BwMaterialAsset` (an acoustic material as a Project asset —
-an engine preset or custom 3-band coefficients), `BwRoomConstraints` (draws the
+The rest of the Runtime folder: `AmbisonicBed` (a world-locked AmbiX soundfield
+component over `bwa_bed_*`), `AcousticGeometry` (marks a mesh as
+occluding/reflecting geometry with a material; `Engine` bakes them all into one
+engine mesh at load), `MaterialAsset` (an acoustic material as a Project asset —
+an engine preset or custom 3-band coefficients), `RoomConstraints` (draws the
 surveyed room — truss, screen cube, projectors — in the scene view, from the same
 `constraints.json` the C++ tools read; scene-view only, no audio), and
-`BwClipAttribute` (marks a string field as a StreamingAssets path). Editor-side:
-`BwAudioProjectCheck` (warns when Unity's built-in audio is still enabled, with
-one-click disable), `BwClipDrawer` (the `[BwClip]` file picker), and custom
-inspectors for `BwAudio` / `BwEmitter` / `BwMaterialAsset` that hide settings which
+`ClipAttribute` (marks a string field as a StreamingAssets path). Editor-side:
+`ProjectCheck` (warns when Unity's built-in audio is still enabled, with
+one-click disable), `ClipDrawer` (the `[Clip]` file picker), and custom
+inspectors for `Engine` / `Emitter` / `MaterialAsset` that hide settings which
 don't apply and surface the engine's *survivable* mistakes — a layout file that
 isn't where the engine will look, both reverb beds contending for the one tap, a
 tracked listener with nothing to track — plus live backend / meters / voice count
 while playing.
 
 **The settings that fail quietly are the ones to watch.** An unknown material name is
-not an error to the engine (`bw_material_preset` returns the generic default and
-notes it in `bw_last_error`), and a failed layout load is not fatal (it falls back to
+not an error to the engine (`bwa_material_preset` returns the generic default and
+notes it in `bwa_last_error`), and a failed layout load is not fatal (it falls back to
 the 26-speaker grid). Both merely *sound wrong*. The binding therefore makes them
-unrepresentable where it can — materials are a `BwMaterialPreset` enum, file paths go
+unrepresentable where it can — materials are a `BwaMaterialPreset` enum, file paths go
 through a picker that lists what actually exists — and loud where it cannot.
 
 The snippets below explain the design; read the package for the current code.
@@ -84,86 +84,88 @@ The snippets below explain the design; read the package for the current code.
 using System;
 using System.Runtime.InteropServices;
 
-internal static class Bw {
-    const string DLL = "bwaudio";
+internal static class Bwa {
+    const string DLL = "bw_audio";
     const CallingConvention CC = CallingConvention.Cdecl;
 
-    // Mirrors BwProfile in bwaudio.h. MUST be a 4-byte int enum, NOT a string — the
-    // C ABI's BwConfig.profile is an enum, so marshalling it as a string would push a
+    // Mirrors bwa_profile in bw_audio.h. MUST be a 4-byte int enum, NOT a string — the
+    // C ABI's bwa_desc.profile is an enum, so marshalling it as a string would push a
     // pointer where the core expects 0/1/2 (undefined behaviour / crash).
-    public enum BwProfile : int { Cave = 0, Binaural = 1, Both = 2 }
+    public enum bwa_profile : int { Cave = 0, Binaural = 1, Both = 2 }
 
     [StructLayout(LayoutKind.Sequential)]
     public struct Config {
-        public BwProfile profile;                                      // matches BwProfile (int) in the header
+        public bwa_profile profile;                                      // matches bwa_profile (int) in the header
         [MarshalAs(UnmanagedType.LPUTF8Str)] public string layoutPath; // const char* — string marshalling is correct here
         [MarshalAs(UnmanagedType.LPUTF8Str)] public string hrtfPath;   // const char* or null
         public uint sampleRate, blockSize;
-        [MarshalAs(UnmanagedType.I1)] public bool trackInternal;
     }
 
-    [DllImport(DLL, CallingConvention=CC)] public static extern IntPtr bw_create(in Config c);
-    [DllImport(DLL, CallingConvention=CC)] public static extern int  bw_start(IntPtr e);
-    [DllImport(DLL, CallingConvention=CC)] public static extern int  bw_stop(IntPtr e);
-    [DllImport(DLL, CallingConvention=CC)] public static extern void bw_destroy(IntPtr e);
-    [DllImport(DLL, CallingConvention=CC)] public static extern IntPtr bw_last_error(IntPtr e); // Marshal.PtrToStringUTF8(...) to read; null => no error
-    [DllImport(DLL, CallingConvention=CC)] public static extern uint bw_load_sound(IntPtr e,[MarshalAs(UnmanagedType.LPUTF8Str)] string p);
-    [DllImport(DLL, CallingConvention=CC)] public static extern void bw_unload_sound(IntPtr e, uint snd);
-    [DllImport(DLL, CallingConvention=CC)] public static extern uint bw_source_create(IntPtr e);
-    [DllImport(DLL, CallingConvention=CC)] public static extern void bw_source_destroy(IntPtr e, uint s);
-    [DllImport(DLL, CallingConvention=CC)] public static extern void bw_source_set_pos(IntPtr e, uint s, float x, float y, float z);
-    [DllImport(DLL, CallingConvention=CC)] public static extern void bw_source_set_gain(IntPtr e, uint s, float g);
-    [DllImport(DLL, CallingConvention=CC)] public static extern void bw_source_play(IntPtr e, uint s, uint snd,[MarshalAs(UnmanagedType.I1)] bool loop);
-    [DllImport(DLL, CallingConvention=CC)] public static extern void bw_source_stop(IntPtr e, uint s);
-    [DllImport(DLL, CallingConvention=CC)] public static extern void bw_play_oneshot(IntPtr e, uint snd, float x, float y, float z, float gain);
-    [DllImport(DLL, CallingConvention=CC)] public static extern void bw_set_listener_pose(IntPtr e, float px,float py,float pz, float qx,float qy,float qz,float qw);
-    [DllImport(DLL, CallingConvention=CC)] public static extern void bw_commit(IntPtr e);
+    [DllImport(DLL, CallingConvention=CC)] public static extern IntPtr bwa_create(in Config c);
+    [DllImport(DLL, CallingConvention=CC)] public static extern int  bwa_start(IntPtr e);
+    [DllImport(DLL, CallingConvention=CC)] public static extern int  bwa_stop(IntPtr e);
+    [DllImport(DLL, CallingConvention=CC)] public static extern void bwa_destroy(IntPtr e);
+    [DllImport(DLL, CallingConvention=CC)] public static extern IntPtr bwa_last_error(IntPtr e); // Marshal.PtrToStringUTF8(...) to read; null => no error
+    [DllImport(DLL, CallingConvention=CC)] public static extern uint bwa_load_sound(IntPtr e,[MarshalAs(UnmanagedType.LPUTF8Str)] string p);
+    [DllImport(DLL, CallingConvention=CC)] public static extern void bwa_unload_sound(IntPtr e, uint snd);
+    [DllImport(DLL, CallingConvention=CC)] public static extern uint bwa_source_create(IntPtr e);
+    [DllImport(DLL, CallingConvention=CC)] public static extern void bwa_source_destroy(IntPtr e, uint s);
+    [DllImport(DLL, CallingConvention=CC)] public static extern void bwa_source_set_pos(IntPtr e, uint s, float x, float y, float z);
+    [DllImport(DLL, CallingConvention=CC)] public static extern void bwa_source_set_gain(IntPtr e, uint s, float g);
+    [DllImport(DLL, CallingConvention=CC)] public static extern void bwa_source_play(IntPtr e, uint s, uint snd,[MarshalAs(UnmanagedType.I1)] bool loop);
+    [DllImport(DLL, CallingConvention=CC)] public static extern void bwa_source_stop(IntPtr e, uint s);
+    [DllImport(DLL, CallingConvention=CC)] public static extern void bwa_play_oneshot(IntPtr e, uint snd, float x, float y, float z, float gain);
+    [DllImport(DLL, CallingConvention=CC)] public static extern void bwa_set_listener_pose(IntPtr e, float px,float py,float pz, float qx,float qy,float qz,float qw);
+    [DllImport(DLL, CallingConvention=CC)] public static extern void bwa_commit(IntPtr e);
 }
 ```
 
-The snippet shows the core calls. The shipped `Bw.cs` binds the ABI **1:1** — every
-`BW_API` function in `bwaudio.h` has an entry point. Beyond the core:
+The snippet shows the core calls. The shipped `Bwa.cs` binds the ABI **1:1** — every
+`BWA_API` function in `bw_audio.h` has an entry point. Beyond the core:
 
-- **Voice management + scheduling**: `bw_source_set_priority`;
-  `bw_source_play_at` + `bw_dsp_time` (sample-accurate start);
-  `bw_get_active_voices`.
-- **Transport**: `bw_source_set_paused`, `bw_set_paused` (global),
-  `bw_source_seek`, `bw_source_is_playing` — `BwEmitter` polls the playing state
+- **Voice management + scheduling**: `bwa_source_set_priority`;
+  `bwa_source_play_at` + `bwa_get_dsp_time` (sample-accurate start);
+  `bwa_get_active_voices`.
+- **Transport**: `bwa_source_set_paused`, `bwa_set_paused` (global),
+  `bwa_source_seek`, `bwa_source_is_playing` — `Emitter` polls the playing state
   each frame to fire its `onFinished` UnityEvent.
-- **Mixing**: `bw_source_fade_to` / `bw_source_fade_out` (engine-side timed
-  fades — no coroutines), `bw_source_set_pitch`, `bw_set_master_gain`, and mix
-  groups (`bw_source_set_group` + `bw_group_set_gain` / `bw_group_set_paused`).
-- **Propagation effects**: `bw_source_set_doppler`, `bw_source_set_air_absorption`,
-  `bw_source_set_loudness_comp`, `bw_source_set_spread`, `bw_source_set_size`
+- **Mixing**: `bwa_source_fade_to` / `bwa_source_fade_out` (engine-side timed
+  fades — no coroutines), `bwa_source_set_pitch`, `bwa_set_master_gain`, and mix
+  groups (`bwa_source_set_group` + `bwa_group_set_gain` / `bwa_group_set_paused`).
+- **Propagation effects**: `bwa_source_set_doppler`, `bwa_source_set_air_absorption`,
+  `bwa_source_set_loudness_comp`, `bwa_source_set_spread`, `bwa_source_set_size`
   (metric radius).
-- **Occlusion + directivity**: `bw_source_set_occlusion` /
-  `bw_source_get_occlusion`, `bw_source_set_occlusion_manual` (game-driven
+- **Occlusion + directivity**: `bwa_source_set_occlusion` /
+  `bwa_source_get_occlusion`, `bwa_source_set_occlusion_manual` (game-driven
   occlusion; **works without the Steam Audio build**),
-  `bw_source_set_directivity` (+ preset), `bw_source_set_orientation`.
-- **Reflections + pathing**: `bw_reflections_config`, `bw_reflections_set_gain`,
-  `bw_source_set_reflections` / `_reflection_send` / `_reflection_distance`,
-  `bw_source_set_pathing`; the phonon-free **FDN reverb** (`bw_reverb_fdn`,
-  `bw_fdn_set_decay`, `bw_fdn_set_decay_direction`).
-- **Ambisonic beds**: `bw_bed_create` / `bw_bed_play` / `bw_bed_set_gain` /
-  `bw_bed_set_rotation` / `bw_bed_stop` / `bw_bed_destroy`.
-- **Materials / scene geometry**: `bw_scene_set_mesh`, `bw_material_preset`,
-  `bw_material_define`, `bw_scene_set_mesh_mat`, `bw_scene_set_box`.
-- **Rendering A/B (live)**: `bw_set_panner`, `bw_set_dual_band`,
-  `bw_set_spread_mode`, `bw_set_decorrelation`, `bw_set_near_spread`,
-  `bw_set_bed_renderer`, `bw_set_tracked_room_eq` (`bw_set_bed_decoder` is
-  load-time). `BwAudio` re-pushes these from `OnValidate`, so the inspector
-  A/Bs them by ear in Play mode — which is what the engine makes them atomic for.
-- **Listener**: `bw_set_pose_prediction` (internal tracking only) and
-  `bw_set_extra_listeners` — the other occupants, pushed by `BwAudio` in the same
+  `bwa_source_set_directivity` (+ preset), `bwa_source_set_orientation`.
+- **Reflections + pathing**: `bwa_reflections_config`, `bwa_reflections_set_gain`,
+  `bwa_source_set_reflections` / `_reflection_send` / `_reflection_distance`,
+  `bwa_source_set_pathing` (engine-level enable rides `bwa_desc.enable_pathing`);
+  the phonon-free **FDN reverb** (`bwa_fdn_config`).
+- **Ambisonic beds**: the full `bwa_bed_*` facade — `create` / `play` / `set_gain` /
+  `set_rotation` / `stop` / `destroy`, plus the bed-named forms of the per-voice
+  calls (`fade_to` / `fade_out` / `set_paused` / `seek` / `set_priority` /
+  `set_group` / `is_playing`).
+- **Materials / scene geometry**: `bwa_material_preset`, `bwa_material_define`,
+  `bwa_scene_set_mesh_mat`, `bwa_scene_set_box`.
+- **Rendering A/B (live)**: `bwa_set_panner`, `bwa_set_dual_band`,
+  `bwa_set_spread_mode`, `bwa_set_decorrelation`, `bwa_set_near_spread`,
+  `bwa_set_bed_renderer`, `bwa_set_tracked_room_eq` (the bed *decoder* is
+  create-time: `bwa_desc.bed_decoder`). `Engine` re-pushes these from
+  `OnValidate`, so the inspector A/Bs them by ear in Play mode — which is what
+  the engine makes them atomic for.
+- **Listener**: `bwa_set_pose_prediction` (internal tracking only) and
+  `bwa_set_extra_listeners` — the other occupants, pushed by `Engine` in the same
   frame block as the primary pose (they are commit-gated the same way).
-- **Output stage + diagnostics**: `bw_set_limiter` / `bw_set_limiter_ceiling`,
-  `bw_get_bus_levels`, `bw_test_signal`, `bw_get_speakers` / `bw_channel_count`
+- **Output stage + diagnostics**: `bwa_set_limiter` / `bwa_set_limiter_ceiling`,
+  `bwa_get_bus_levels`, `bwa_set_test_signal`, `bwa_get_speakers` / `bwa_get_channel_count`
   (the layout's speaker count — see "Channel count" above; size meter/speaker
   arrays with it, never a hard-coded 26).
-- **Assets**: `bw_load_sound_streaming`, `bw_load_ambix`.
+- **Assets**: `bwa_load_sound_streaming`, `bwa_load_ambix`.
 
 Two seams a binding must not get wrong, both handled in `Room` (see below):
-`bw_bed_set_rotation` takes a **room-frame** yaw, and the X mirror **reverses the
+`bwa_bed_set_rotation` takes a **room-frame** yaw, and the X mirror **reverses the
 sense of rotation** — pass a Unity euler angle straight in and the soundfield
 spins the wrong way (`Room.YawRad` converts). The FDN's decay direction is a
 **direction**, so it goes through `Room.Dir` (no registration translation), not
@@ -187,7 +189,7 @@ public static class Room {
         q = UnityToRoom.rotation * q;
         return new Quaternion(q.x, -q.y, -q.z, q.w);           // both frames face +Z: identity -> identity
     }
-    public static float YawRad(float unityYawDegrees) {        // for bw_bed_set_rotation
+    public static float YawRad(float unityYawDegrees) {        // for bwa_bed_set_rotation
         Vector3 ahead = Rot(Quaternion.Euler(0f, unityYawDegrees, 0f)) * Vector3.forward;
         return Mathf.Atan2(ahead.x, ahead.z);                  // RH yaw about +Y — the mirror flips the sense
     }
@@ -204,48 +206,54 @@ so every block the audio thread sees is internally consistent.
 
 ```csharp
 [DefaultExecutionOrder(-100)]
-public sealed class BwAudio : MonoBehaviour {
-    public static BwAudio Instance { get; private set; }
-    public Bw.BwProfile profile = Bw.BwProfile.Binaural;   // inspector dropdown; maps 1:1 to the C enum
+public sealed class Engine : MonoBehaviour {
+    public static Engine Instance { get; private set; }
+    public BwaProfile profile = BwaProfile.Binaural;   // inspector dropdown; maps 1:1 to the C enum
     public Transform listener;          // OptiTrack head rigid body, or XR camera at desk
     public bool feedListener = true;    // false => core reads NatNet (cave/both)
 
     IntPtr _eng; public IntPtr Handle => _eng;
-    readonly System.Collections.Generic.List<BwEmitter> _emitters = new();
+    readonly System.Collections.Generic.List<Emitter> _emitters = new();
     readonly System.Collections.Generic.Dictionary<string,uint> _sounds = new();
 
     void Awake() {
         if (Instance != null) { Destroy(gameObject); return; }
         Instance = this; DontDestroyOnLoad(gameObject);
-        var cfg = new Bw.Config {
+        var cfg = new BwaDesc {
             profile = profile,
             layoutPath = System.IO.Path.Combine(Application.streamingAssetsPath, "cave_layout.json"),
             hrtfPath = null, sampleRate = 48000, blockSize = 256,
-            trackInternal = !feedListener,
         };
-        _eng = Bw.bw_create(in cfg);
-        if (_eng == IntPtr.Zero || Bw.bw_start(_eng) != 0) Debug.LogError("bw init failed");
+        _eng = Bwa.bwa_create(in cfg);
+        if (_eng == IntPtr.Zero || Bwa.bwa_start(_eng) != BwaResult.Ok) Debug.LogError("bw init failed");
+        // internal tracking (Feed Listener off): connect the engine to the NatNet stream itself —
+        // a runtime call, like any NatNet client (reconnect/disconnect any time)
+        if (!feedListener) {
+            var td = new BwaTrackerDesc { server = natnetServer, rigidBodyName = natnetRigidBody };
+            if (Bwa.bwa_tracker_connect(_eng, in td) != BwaResult.Ok)
+                Debug.LogError("tracker: " + Bwa.LastError(_eng));
+        }
     }
     public uint Load(string p) {
         if (_sounds.TryGetValue(p, out var s)) return s;
-        s = Bw.bw_load_sound(_eng, System.IO.Path.Combine(Application.streamingAssetsPath, p));
+        s = Bwa.bwa_load_sound(_eng, System.IO.Path.Combine(Application.streamingAssetsPath, p));
         _sounds[p] = s; return s;
     }
-    public void Register(BwEmitter e)   => _emitters.Add(e);
-    public void Unregister(BwEmitter e) => _emitters.Remove(e);
+    public void Register(Emitter e)   => _emitters.Add(e);
+    public void Unregister(Emitter e) => _emitters.Remove(e);
 
     void LateUpdate() {
         if (_eng == IntPtr.Zero) return;
         foreach (var e in _emitters) e.Push();            // all sources first
         if (feedListener && listener) {
             var p = Room.Pos(listener.position); var q = Room.Rot(listener.rotation);
-            Bw.bw_set_listener_pose(_eng, p.x,p.y,p.z, q.x,q.y,q.z,q.w);
+            Bwa.bwa_set_listener_pose(_eng, p.x,p.y,p.z, q.x,q.y,q.z,q.w);
         }
-        Bw.bw_commit(_eng);                               // one atomic snapshot
+        Bwa.bwa_commit(_eng);                               // one atomic snapshot
     }
     void OnDestroy() {
         if (_eng == IntPtr.Zero) return;
-        Bw.bw_stop(_eng); Bw.bw_destroy(_eng); _eng = IntPtr.Zero;
+        Bwa.bwa_stop(_eng); Bwa.bwa_destroy(_eng); _eng = IntPtr.Zero;
         if (Instance == this) Instance = null;
     }
 }
@@ -255,29 +263,29 @@ public sealed class BwAudio : MonoBehaviour {
 
 ```csharp
 using System; using UnityEngine;
-public sealed class BwEmitter : MonoBehaviour {
+public sealed class Emitter : MonoBehaviour {
     public string clip = "sfx/footsteps.wav";   // under StreamingAssets
     public bool loop = true, playOnEnable = true;
     [Range(0,1)] public float gain = 1f;
     uint _src;
-    IntPtr Eng => BwAudio.Instance ? BwAudio.Instance.Handle : IntPtr.Zero;
+    IntPtr Eng => Engine.Instance ? Engine.Instance.Handle : IntPtr.Zero;
 
     void OnEnable() {
         if (Eng == IntPtr.Zero) { enabled = false; return; }
-        _src = Bw.bw_source_create(Eng);
-        Bw.bw_source_set_gain(Eng, _src, gain);
+        _src = Bwa.bwa_source_create(Eng);
+        Bwa.bwa_source_set_gain(Eng, _src, gain);
         Push();
-        if (playOnEnable) Bw.bw_source_play(Eng, _src, BwAudio.Instance.Load(clip), loop);
-        BwAudio.Instance.Register(this);
+        if (playOnEnable) Bwa.bwa_source_play(Eng, _src, Engine.Instance.Load(clip), loop);
+        Engine.Instance.Register(this);
     }
     public void Push() {
         var p = Room.Pos(transform.position);
-        Bw.bw_source_set_pos(Eng, _src, p.x, p.y, p.z);
+        Bwa.bwa_source_set_pos(Eng, _src, p.x, p.y, p.z);
     }
     void OnDisable() {
         if (Eng == IntPtr.Zero) return;
-        BwAudio.Instance.Unregister(this);
-        Bw.bw_source_destroy(Eng, _src);
+        Engine.Instance.Unregister(this);
+        Bwa.bwa_source_destroy(Eng, _src);
     }
 }
 ```
@@ -285,7 +293,7 @@ public sealed class BwEmitter : MonoBehaviour {
 ### Unity-specific traps
 
 - **Native plugins don't unload between Editor play sessions.** The DLL and its
-  globals persist. `bw_create` must not assume zeroed global state, and `bw_destroy`
+  globals persist. `bwa_create` must not assume zeroed global state, and `bwa_destroy`
   must fully tidy up — otherwise you get "fine on first Play, crashes on second."
   If Domain Reload is disabled for fast enter-play, C# statics persist too; guard
   the `Instance` re-init.
@@ -297,7 +305,7 @@ public sealed class BwEmitter : MonoBehaviour {
 
 Same library, same C ABI, linked as a module. The per-engine work mirrors Unity:
 
-- A subsystem (e.g. a `UGameInstanceSubsystem`) owns `bw_create`/`start`/`stop`/
+- A subsystem (e.g. a `UGameInstanceSubsystem`) owns `bwa_create`/`start`/`stop`/
   `destroy` and runs the centralized per-frame push from a single tick — the same
   ordering reason as Unity's manager.
 - A scene component reads `GetActorLocation` (and head pose via a NatNet bridge or

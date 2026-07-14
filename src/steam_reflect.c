@@ -13,7 +13,7 @@
  * has joined.
  */
 #include "steam_reflect.h"
-#include "ambisonics.h"   /* BW_AMBI_CH (max ambisonic channel count for scratch sizing) */
+#include "ambisonics.h"   /* BWA_AMBI_CH (max ambisonic channel count for scratch sizing) */
 #include "profile.h"
 
 #include <phonon.h>
@@ -38,8 +38,8 @@
  * is odd, so the per-channel FFT stride is 8 mod 16. Fixed load->loadu in the vendored build; see
  * third_party/README.md. A symmetric scene still yields a near-omni field, which is physically right.) */
 #define REFL_TYPE        IPL_REFLECTIONEFFECTTYPE_HYBRID
-#define BW_BAKE_SPACING  1.5f    /* spacing (m) of the manual reverb-probe grid (BWAUDIO_BAKE) */
-#define BW_BAKE_MARGIN   1.5f    /* expand the speaker XZ bounds by this so the grid covers the whole room */
+#define BWA_BAKE_SPACING  1.5f    /* spacing (m) of the manual reverb-probe grid (bwa_reflections_desc.bake) */
+#define BWA_BAKE_MARGIN   1.5f    /* expand the speaker XZ bounds by this so the grid covers the whole room */
 
 struct SteamReflect {
     IPLContext   ctx;            /* BORROWED from scene */
@@ -49,18 +49,18 @@ struct SteamReflect {
     IPLSource    bed;            /* OWNED + IMMORTAL: listener-centric bed source */
     IPLReflectionEffect       refl;   /* OWNED */
     IPLAmbisonicsDecodeEffect dec;    /* OWNED: custom 26-dir layout, panning */
-    IPLVector3   spk[BW_CHANNELS];
+    IPLVector3   spk[BWA_CHANNELS];
     IPLProbeBatch probes;             /* OWNED (baked mode): probes carrying the baked reverb, NULL = real-time */
     IPLSceneType  scene_type;         /* DEFAULT/EMBREE, for the bake + sim */
     int           baked;              /* 1 = look up baked reverb instead of ray-tracing each sim tick */
 
-    uint32_t channels;          /* the layout's speaker count (<= BW_CHANNELS capacity) */
+    uint32_t channels;          /* the layout's speaker count (<= BWA_CHANNELS capacity) */
     uint32_t order, ambi_ch, n;
     IPLint32 ir_size;
     float    duration; uint32_t rays, bounces;
     _Atomic float wet_gain;     /* control thread sets, audio-thread tap reads (linear; 1 = unity) */
     float*   ambi;              /* ambi_ch * n */
-    float*   out26;             /* BW_CHANNELS * n */
+    float*   out26;             /* BWA_CHANNELS * n */
 
     /* seqlock-published reflection params (sim thread writes, audio thread reads) */
     _Atomic uint32_t seq;
@@ -104,7 +104,7 @@ static int refl_read(SteamReflect* r, IPLReflectionEffectParams* out) {
 
 static DWORD WINAPI sim_thread(LPVOID arg) {
     SteamReflect* r = (SteamReflect*)arg;
-    BW_THREAD_NAME("bw-sim (reflections)");
+    BWA_THREAD_NAME("bw-sim (reflections)");
     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);  /* never preempt the audio callback */
     while (!r->stop) {
         float lp[3], lq[4]; rt_read_pose(r->rt, lp, lq); (void)lq;
@@ -133,9 +133,9 @@ static DWORD WINAPI sim_thread(LPVOID arg) {
         sh.irradianceMinDistance = 1.0f;
         iplSimulatorSetSharedInputs(r->sim, IPL_SIMULATIONFLAGS_REFLECTIONS, &sh);
 
-        BW_ZONE_BEGIN(zr, "reflection ray-trace");
+        BWA_ZONE_BEGIN(zr, "reflection ray-trace");
         iplSimulatorRunReflections(r->sim);
-        BW_ZONE_END(zr);
+        BWA_ZONE_END(zr);
 
         IPLSimulationOutputs out; memset(&out, 0, sizeof out);
         iplSourceGetOutputs(r->bed, IPL_SIMULATIONFLAGS_REFLECTIONS, &out);
@@ -161,13 +161,13 @@ void steam_reflect_tap(void* ud, float* bus, uint32_t n, const float* lp, const 
     /* convolve the mono aux send -> the full ambisonic reflection field (directional early reflections) */
     float* inP[1]  = { (float*)aux };
     IPLAudioBuffer in  = { .numChannels = 1, .numSamples = (IPLint32)n, .data = inP };
-    float* ambP[BW_AMBI_CH];
+    float* ambP[BWA_AMBI_CH];
     for (uint32_t k = 0; k < r->ambi_ch; ++k) ambP[k] = r->ambi + (size_t)k * n;
     IPLAudioBuffer amb = { .numChannels = (IPLint32)r->ambi_ch, .numSamples = (IPLint32)n, .data = ambP };
     iplReflectionEffectApply(r->refl, &rp, &in, &amb, NULL);   /* NULL mixer: single bed */
 
     /* decode ambisonic -> the array, world-locked (identity orientation matches the sim's world listener) */
-    float* outP[BW_CHANNELS];
+    float* outP[BWA_CHANNELS];
     for (uint32_t s = 0; s < r->channels; ++s) outP[s] = r->out26 + (size_t)s * n;
     IPLAudioBuffer o26 = { .numChannels = (IPLint32)r->channels, .numSamples = (IPLint32)n, .data = outP };
     IPLAmbisonicsDecodeEffectParams dp; memset(&dp, 0, sizeof dp);
@@ -200,13 +200,13 @@ static int do_bake(SteamReflect* r, const Layout* L) {
         ysum += p[1];
     }
     const float head = ysum / (float)L->count;        /* listening-plane height = mean speaker height */
-    xmin -= BW_BAKE_MARGIN; xmax += BW_BAKE_MARGIN; zmin -= BW_BAKE_MARGIN; zmax += BW_BAKE_MARGIN;
+    xmin -= BWA_BAKE_MARGIN; xmax += BWA_BAKE_MARGIN; zmin -= BWA_BAKE_MARGIN; zmax += BWA_BAKE_MARGIN;
 
     if (iplProbeBatchCreate(r->ctx, &r->probes) != IPL_STATUS_SUCCESS) return 0;
     int np = 0;
-    const float bs = 2.0f * BW_BAKE_SPACING;          /* box edge; radius = bs/2 = spacing => probes overlap */
-    for (float x = xmin; x <= xmax + 1e-3f; x += BW_BAKE_SPACING)
-    for (float z = zmin; z <= zmax + 1e-3f; z += BW_BAKE_SPACING) {
+    const float bs = 2.0f * BWA_BAKE_SPACING;          /* box edge; radius = bs/2 = spacing => probes overlap */
+    for (float x = xmin; x <= xmax + 1e-3f; x += BWA_BAKE_SPACING)
+    for (float z = zmin; z <= zmax + 1e-3f; z += BWA_BAKE_SPACING) {
         IPLProbeArray pa = NULL;
         if (iplProbeArrayCreate(r->ctx, &pa) != IPL_STATUS_SUCCESS) continue;
         IPLProbeGenerationParams gp; memset(&gp, 0, sizeof gp);
@@ -221,7 +221,7 @@ static int do_bake(SteamReflect* r, const Layout* L) {
     }
     if (np == 0) { iplProbeBatchRelease(&r->probes); r->probes = NULL; return 0; }
     iplProbeBatchCommit(r->probes);
-    fprintf(stderr, "bwaudio: baking reverb at %d probes\n", np);
+    fprintf(stderr, "bw_audio: baking reverb at %d probes\n", np);
 
     IPLReflectionsBakeParams bp; memset(&bp, 0, sizeof bp);
     bp.scene = r->scene_ipl; bp.probeBatch = r->probes; bp.sceneType = r->scene_type;
@@ -253,7 +253,7 @@ SteamReflect* steam_reflect_create(SteamScene* scene, RtCore* rt, const Layout* 
     if (!r->ctx || !r->scene_ipl) { free(r); return NULL; }
     r->scene_type = (IPLSceneType)steam_scene_ipl_scenetype(scene);
     r->rt = rt; r->n = block; r->order = order; r->ambi_ch = (order + 1) * (order + 1);
-    r->channels = L->count;                         /* the layout's speaker count (<= BW_CHANNELS cap) */
+    r->channels = L->count;                         /* the layout's speaker count (<= BWA_CHANNELS cap) */
     r->ir_size = (IPLint32)ceilf(ir_seconds * (float)sample_rate);
     r->duration = ir_seconds; r->rays = num_rays; r->bounces = num_bounces;
 
@@ -284,7 +284,7 @@ SteamReflect* steam_reflect_create(SteamScene* scene, RtCore* rt, const Layout* 
 
     if (bake) {                                         /* precompute the reverb now; sim thread then looks it up */
         r->baked = (do_bake(r, L) > 0);
-        if (!r->baked) fprintf(stderr, "bwaudio: BWAUDIO_BAKE set but baking produced no probes; using real-time reflections\n");
+        if (!r->baked) fprintf(stderr, "bw_audio: reflection bake requested but produced no probes; using real-time reflections\n");
     }
 
     IPLReflectionEffectSettings rs; memset(&rs, 0, sizeof rs);

@@ -7,7 +7,7 @@
  *   - a oneshot recycles its transient voice (a small table doesn't leak);
  *   - unloading a playing sound is safe (detach + free-after-ack; clean under ASan).
  *
- * Compiles the core in (bw_core); dr_wav's impl comes from sound.c, included here only for
+ * Compiles the core in (bwa_core); dr_wav's impl comes from sound.c, included here only for
  * the write API used to synthesize test files.
  */
 #include "rt.h"
@@ -21,7 +21,7 @@
 #include <string.h>
 
 #define N    256
-#define CH   BW_CHANNELS
+#define CH   BWA_CHANNELS
 #define RATE 48000u
 
 static float  bus[CH * N];
@@ -33,7 +33,7 @@ static double chan_energy(int ch) {
 static double total_energy(void) {
     double e = 0; for (int i = 0; i < CH * N; ++i) e += fabs(bus[i]); return e;
 }
-static void render1(RtCore* c) { BwTimestamp ts = { 0, 0 }; rt_render(c, bus, N, &ts); }
+static void render1(RtCore* c) { bwa_timestamp ts = { 0, 0 }; rt_render(c, bus, N, &ts); }
 static void render2(RtCore* c) { render1(c); render1(c); }
 static void set_pos_spk(RtCore* c, uint32_t h, int k) {
     rt_source_set_pos(c, h, LD.speakers[k].pos[0], LD.speakers[k].pos[1], LD.speakers[k].pos[2]);
@@ -68,8 +68,8 @@ static int fails = 0;
 
 int main(void) {
     LD = layout_default();
-    const char* WAV_LONG  = "bw_snd_long.wav";
-    const char* WAV_SHORT = "bw_snd_short.wav";
+    const char* WAV_LONG  = "bwa_snd_long.wav";
+    const char* WAV_SHORT = "bwa_snd_short.wav";
     if (!write_const_wav(WAV_LONG, 0.5f, 4 * N) || !write_const_wav(WAV_SHORT, 1.0f, 100)) {
         printf("FAIL: could not write test wavs\n"); return 1;
     }
@@ -139,7 +139,7 @@ int main(void) {
     }
 
     /* 5. a 44.1 kHz file resamples to the engine rate on load (frames scale, DC preserved) */
-    const char* WAV_44K = "bw_snd_44k.wav";
+    const char* WAV_44K = "bwa_snd_44k.wav";
     if (write_const_wav_rate(WAV_44K, 0.5f, 4410, 44100)) {
         SoundData sd;
         bool ok = sound_load(WAV_44K, RATE, &sd, err, sizeof err);

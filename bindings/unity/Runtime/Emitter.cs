@@ -1,17 +1,17 @@
-// BwEmitter.cs — a positional sound source. Attach to any GameObject; its transform drives the
-// source position (and orientation, for directional sources) every frame via BwAudio's centralized
+// Emitter.cs — a positional sound source. Attach to any GameObject; its transform drives the
+// source position (and orientation, for directional sources) every frame via Engine's centralized
 // push. Audio files live under StreamingAssets and are decoded by the engine (not Unity's AudioClip).
 using System;
 using System.Collections;
 using UnityEngine;
 using UnityEngine.Events;
 
-namespace CaveAudio
+namespace BwAudio
 {
-    public sealed class BwEmitter : MonoBehaviour
+    public sealed class Emitter : MonoBehaviour
     {
         [Header("Clip (under StreamingAssets)")]
-        [BwClip] public string clip = "sfx/footsteps.wav";
+        [Clip] public string clip = "sfx/footsteps.wav";
         public bool loop = true;
         public bool playOnEnable = true;
         [Range(0f, 1f)] public float gain = 1f;
@@ -22,7 +22,7 @@ namespace CaveAudio
         [Tooltip("Voice-steal priority: when the voice pool is full, the LOWEST-priority source is stolen " +
                  "to make room. 255 = protected (music/critical SFX).")]
         [Range(0, 255)] public int priority = 128;
-        [Tooltip("Mix group (0..7). BwAudio.SetGroupGain/SetGroupPaused duck or pause the whole group.")]
+        [Tooltip("Mix group (0..7). Engine.SetGroupGain/SetGroupPaused duck or pause the whole group.")]
         [Range(0, 7)] public int group = 0;
 
         [Header("Spatial")]
@@ -30,7 +30,7 @@ namespace CaveAudio
         [Tooltip("Image-source EARLY reflections: the six first-order wall bounces, each rendered as a " +
                  "real point source at its mirrored position and panned like any other — so they keep " +
                  "correct direction AND parallax as the listener walks, which a shared reverb bed can't " +
-                 "do. Needs a room box (BwAudio). No Steam Audio needed. Pairs with the FDN reverb, " +
+                 "do. Needs a room box (Engine). No Steam Audio needed. Pairs with the FDN reverb, " +
                  "which renders the late tail.")]
         public bool earlyReflections = false;
         public bool reflections = false;                     // contribute to the shared reverb bed
@@ -39,9 +39,9 @@ namespace CaveAudio
         [Tooltip("Scale the reverb send by distance to the listener: near = drier, far = wetter.")]
         public bool reflectionDistance = false;
         [Tooltip("When the direct line is blocked, route the sound around occluders / through openings. " +
-                 "Needs scene geometry + BWAUDIO_PATHING at start.")]
+                 "Needs scene geometry + Engine's 'Enable Pathing'.")]
         public bool pathing = false;
-        public BwDirectivity directivity = BwDirectivity.Omni;
+        public BwaDirectivity directivity = BwaDirectivity.Omni;
         [Range(1f, 8f)] public float directivityPower = 1f;  // sharpness of the lobe (cardioid/figure-8)
 
         [Header("Width")]
@@ -70,86 +70,86 @@ namespace CaveAudio
         uint _src;
         bool _created;
         bool _wasPlaying;     // for the play->stop edge that drives onFinished
-        IntPtr Eng => BwAudio.Instance ? BwAudio.Instance.Handle : IntPtr.Zero;
+        IntPtr Eng => Engine.Instance ? Engine.Instance.Handle : IntPtr.Zero;
 
         /// <summary>Is this source still producing audio? (AudioSource.isPlaying equivalent.)</summary>
-        public bool IsPlaying => _created && Eng != IntPtr.Zero && Bw.bw_source_is_playing(Eng, _src);
+        public bool IsPlaying => _created && Eng != IntPtr.Zero && Bwa.bwa_source_is_playing(Eng, _src);
 
         void OnEnable()
         {
-            if (!TryInit()) StartCoroutine(InitWhenReady());   // create now, or retry until BwAudio is ready
+            if (!TryInit()) StartCoroutine(InitWhenReady());   // create now, or retry until Engine is ready
         }
 
-        // Wait out an init-order race (this emitter enabled before BwAudio finished starting) instead of
+        // Wait out an init-order race (this emitter enabled before Engine finished starting) instead of
         // permanently disabling. Unity stops the coroutine automatically when the component is disabled.
         IEnumerator InitWhenReady()
         {
             while (!_created) { yield return null; TryInit(); }
         }
 
-        // Create the engine source + apply settings. Returns false (leaving _created false) if BwAudio
+        // Create the engine source + apply settings. Returns false (leaving _created false) if Engine
         // isn't ready yet. Resets _wasPlaying so a recycled component never inherits a stale play edge.
         bool TryInit()
         {
             if (_created) return true;
-            if (Eng == IntPtr.Zero) return false;          // BwAudio not ready -> caller retries
-            _src = Bw.bw_source_create(Eng);
+            if (Eng == IntPtr.Zero) return false;          // Engine not ready -> caller retries
+            _src = Bwa.bwa_source_create(Eng);
             _created = true;
             _wasPlaying = false;
             _paused = false;
-            Bw.bw_source_set_gain(Eng, _src, gain);
-            Bw.bw_source_set_priority(Eng, _src, priority);
-            if (group != 0) Bw.bw_source_set_group(Eng, _src, (uint)group);
-            if (pitch != 1f) Bw.bw_source_set_pitch(Eng, _src, pitch);
+            Bwa.bwa_source_set_gain(Eng, _src, gain);
+            Bwa.bwa_source_set_priority(Eng, _src, priority);
+            if (group != 0) Bwa.bwa_source_set_group(Eng, _src, (uint)group);
+            if (pitch != 1f) Bwa.bwa_source_set_pitch(Eng, _src, pitch);
 
             // The engine defaults every opt-in below to OFF/point/unity, so only push what differs — a
             // fresh source already IS the default (this runs again on every re-enable).
-            if (occlusion)        Bw.bw_source_set_occlusion(Eng, _src, true);
-            if (earlyReflections) Bw.bw_source_set_early_reflections(Eng, _src, true);
+            if (occlusion)        Bwa.bwa_source_set_occlusion(Eng, _src, true);
+            if (earlyReflections) Bwa.bwa_source_set_early_reflections(Eng, _src, true);
             if (reflections)
             {
-                Bw.bw_source_set_reflections(Eng, _src, true);
-                if (reflectionSend != 1f)  Bw.bw_source_set_reflection_send(Eng, _src, reflectionSend);
-                if (reflectionDistance)    Bw.bw_source_set_reflection_distance(Eng, _src, true);
+                Bwa.bwa_source_set_reflections(Eng, _src, true);
+                if (reflectionSend != 1f)  Bwa.bwa_source_set_reflection_send(Eng, _src, reflectionSend);
+                if (reflectionDistance)    Bwa.bwa_source_set_reflection_distance(Eng, _src, true);
             }
-            if (pathing)       Bw.bw_source_set_pathing(Eng, _src, true);
-            if (spread > 0f)   Bw.bw_source_set_spread(Eng, _src, spread);
-            if (sizeMetres > 0f) Bw.bw_source_set_size(Eng, _src, sizeMetres);
-            if (doppler)       Bw.bw_source_set_doppler(Eng, _src, true);
-            if (airAbsorption) Bw.bw_source_set_air_absorption(Eng, _src, true);
-            if (loudnessComp)  Bw.bw_source_set_loudness_comp(Eng, _src, true);
-            if (directivity != BwDirectivity.Omni)
+            if (pathing)       Bwa.bwa_source_set_pathing(Eng, _src, true);
+            if (spread > 0f)   Bwa.bwa_source_set_spread(Eng, _src, spread);
+            if (sizeMetres > 0f) Bwa.bwa_source_set_size(Eng, _src, sizeMetres);
+            if (doppler)       Bwa.bwa_source_set_doppler(Eng, _src, true);
+            if (airAbsorption) Bwa.bwa_source_set_air_absorption(Eng, _src, true);
+            if (loudnessComp)  Bwa.bwa_source_set_loudness_comp(Eng, _src, true);
+            if (directivity != BwaDirectivity.Omni)
             {
-                Bw.bw_source_set_directivity_preset(Eng, _src, directivity);
+                Bwa.bwa_source_set_directivity_preset(Eng, _src, directivity);
                 if (directivityPower != 1f)
                 {
                     // preset sets weight; re-issue with the chosen power (weight from the preset table)
-                    float w = directivity == BwDirectivity.Cardioid ? 0.5f : 1.0f;
-                    Bw.bw_source_set_directivity(Eng, _src, w, directivityPower);
+                    float w = directivity == BwaDirectivity.Cardioid ? 0.5f : 1.0f;
+                    Bwa.bwa_source_set_directivity(Eng, _src, w, directivityPower);
                 }
             }
             Push();
             if (playOnEnable) Play();
-            BwAudio.Instance.Register(this);
+            Engine.Instance.Register(this);
             return true;
         }
 
-        /// <summary>Called once per frame by BwAudio (before the listener + commit).</summary>
+        /// <summary>Called once per frame by Engine (before the listener + commit).</summary>
         public void Push()
         {
             if (!_created || Eng == IntPtr.Zero) return;
             var p = Room.Pos(transform.position);
-            Bw.bw_source_set_pos(Eng, _src, p.x, p.y, p.z);
-            if (directivity != BwDirectivity.Omni)
+            Bwa.bwa_source_set_pos(Eng, _src, p.x, p.y, p.z);
+            if (directivity != BwaDirectivity.Omni)
             {
                 var q = Room.Rot(transform.rotation);            // the source's forward axis drives the lobe
-                Bw.bw_source_set_orientation(Eng, _src, q.x, q.y, q.z, q.w);
+                Bwa.bwa_source_set_orientation(Eng, _src, q.x, q.y, q.z, q.w);
             }
 
             // playback edge -> onFinished (poll the engine's per-source playing state). Best-effort: the
             // play is observed a frame or two after Play() (it's a queued command), and a clip shorter
             // than the frame interval may never read as playing, so onFinished can be missed for it.
-            bool now = Bw.bw_source_is_playing(Eng, _src);
+            bool now = Bwa.bwa_source_is_playing(Eng, _src);
             if (now) _wasPlaying = true;
             else if (_wasPlaying) { _wasPlaying = false; onFinished.Invoke(); }
         }
@@ -158,12 +158,12 @@ namespace CaveAudio
         public void Play(string clipOverride = null)
         {
             if (!_created || Eng == IntPtr.Zero) return;
-            uint snd = BwAudio.Instance.Load(clipOverride ?? clip);
-            if (snd != 0) { Bw.bw_source_play(Eng, _src, snd, loop); _paused = false; }   // play restarts un-paused
+            uint snd = Engine.Instance.Load(clipOverride ?? clip);
+            if (snd != 0) { Bwa.bwa_source_play(Eng, _src, snd, loop); _paused = false; }   // play restarts un-paused
         }
 
         /// <summary>Stop this source — AudioSource.Stop equivalent.</summary>
-        public void Stop() { if (_created && Eng != IntPtr.Zero) Bw.bw_source_stop(Eng, _src); }
+        public void Stop() { if (_created && Eng != IntPtr.Zero) Bwa.bwa_source_stop(Eng, _src); }
 
         /// <summary>Pause in place — AudioSource.Pause equivalent. Click-free (the engine ramps out
         /// over one block and freezes the playhead); a paused source still reads as IsPlaying.</summary>
@@ -176,21 +176,21 @@ namespace CaveAudio
         public bool Paused
         {
             get => _paused;
-            set { _paused = value; if (_created && Eng != IntPtr.Zero) Bw.bw_source_set_paused(Eng, _src, value); }
+            set { _paused = value; if (_created && Eng != IntPtr.Zero) Bwa.bwa_source_set_paused(Eng, _src, value); }
         }
         bool _paused;
 
         /// <summary>Jump to `samples` (engine-rate frames) into the clip — AudioSource.timeSamples-set
         /// equivalent, click-free (ramp-out → jump → ramp-in). In-memory clips only; streamed clips
         /// ignore it. Past-the-end wraps a looping clip and ends a one-shot.</summary>
-        public void Seek(ulong samples) { if (_created && Eng != IntPtr.Zero) Bw.bw_source_seek(Eng, _src, samples); }
+        public void Seek(ulong samples) { if (_created && Eng != IntPtr.Zero) Bwa.bwa_source_seek(Eng, _src, samples); }
 
         /// <summary>Linear gain — AudioSource.volume equivalent; applies immediately if live. Cancels a
         /// running FadeTo/FadeOut (an explicit gain wins over a fade).</summary>
         public float Gain
         {
             get => gain;
-            set { gain = value; if (_created && Eng != IntPtr.Zero) Bw.bw_source_set_gain(Eng, _src, value); }
+            set { gain = value; if (_created && Eng != IntPtr.Zero) Bwa.bwa_source_set_gain(Eng, _src, value); }
         }
 
         /// <summary>Glide the gain to `target` over `seconds`, on the audio thread — no per-frame
@@ -198,26 +198,26 @@ namespace CaveAudio
         public void FadeTo(float target, float seconds)
         {
             gain = target;   // keep the inspector field truthful about where the fade lands
-            if (_created && Eng != IntPtr.Zero) Bw.bw_source_fade_to(Eng, _src, target, seconds);
+            if (_created && Eng != IntPtr.Zero) Bwa.bwa_source_fade_to(Eng, _src, target, seconds);
         }
 
         /// <summary>Fade to silence over `seconds`, then STOP the voice (the click-free stop path) — the
         /// one-call "fade this out and clean it up". Fires onFinished when the voice ends.</summary>
-        public void FadeOut(float seconds) { if (_created && Eng != IntPtr.Zero) Bw.bw_source_fade_out(Eng, _src, seconds); }
+        public void FadeOut(float seconds) { if (_created && Eng != IntPtr.Zero) Bwa.bwa_source_fade_out(Eng, _src, seconds); }
 
         /// <summary>Playback rate (1 = native, clamped [0.25, 4]); the rate GLIDES, so a change bends the
         /// pitch rather than stepping it. In-memory clips only — streamed clips ignore it.</summary>
         public float Pitch
         {
             get => pitch;
-            set { pitch = value; if (_created && Eng != IntPtr.Zero) Bw.bw_source_set_pitch(Eng, _src, value); }
+            set { pitch = value; if (_created && Eng != IntPtr.Zero) Bwa.bwa_source_set_pitch(Eng, _src, value); }
         }
 
         /// <summary>Angular width (0 = point .. 1 = wide). Floored by SizeMetres when that is set.</summary>
         public float Spread
         {
             get => spread;
-            set { spread = value; if (_created && Eng != IntPtr.Zero) Bw.bw_source_set_spread(Eng, _src, value); }
+            set { spread = value; if (_created && Eng != IntPtr.Zero) Bwa.bwa_source_set_spread(Eng, _src, value); }
         }
 
         /// <summary>Physical radius in metres (0 = point): the source holds its real-world size as the
@@ -225,7 +225,7 @@ namespace CaveAudio
         public float SizeMetres
         {
             get => sizeMetres;
-            set { sizeMetres = value; if (_created && Eng != IntPtr.Zero) Bw.bw_source_set_size(Eng, _src, value); }
+            set { sizeMetres = value; if (_created && Eng != IntPtr.Zero) Bwa.bwa_source_set_size(Eng, _src, value); }
         }
 
         /// <summary>Voice-steal priority (0 = expendable .. 255 = protected). A full voice pool steals the
@@ -233,21 +233,21 @@ namespace CaveAudio
         public int Priority
         {
             get => priority;
-            set { priority = value; if (_created && Eng != IntPtr.Zero) Bw.bw_source_set_priority(Eng, _src, value); }
+            set { priority = value; if (_created && Eng != IntPtr.Zero) Bwa.bwa_source_set_priority(Eng, _src, value); }
         }
 
-        /// <summary>Mix group (0..7) — drive the whole group with BwAudio.SetGroupGain/SetGroupPaused.</summary>
+        /// <summary>Mix group (0..7) — drive the whole group with Engine.SetGroupGain/SetGroupPaused.</summary>
         public int Group
         {
             get => group;
-            set { group = value; if (_created && Eng != IntPtr.Zero) Bw.bw_source_set_group(Eng, _src, (uint)value); }
+            set { group = value; if (_created && Eng != IntPtr.Zero) Bwa.bwa_source_set_group(Eng, _src, (uint)value); }
         }
 
         /// <summary>Wet-send level into the shared reverb bed (needs `reflections`).</summary>
         public float ReflectionSend
         {
             get => reflectionSend;
-            set { reflectionSend = value; if (_created && Eng != IntPtr.Zero) Bw.bw_source_set_reflection_send(Eng, _src, value); }
+            set { reflectionSend = value; if (_created && Eng != IntPtr.Zero) Bwa.bwa_source_set_reflection_send(Eng, _src, value); }
         }
 
         /// <summary>Drive occlusion from GAME LOGIC instead of the ray-traced sim — a door the gameplay
@@ -258,22 +258,22 @@ namespace CaveAudio
         /// and would overwrite this.</summary>
         public void SetOcclusionManual(float level, float[] bands = null)
         {
-            if (occlusion) { Debug.LogWarning("[BwEmitter] SetOcclusionManual on a source with `occlusion` ticked — the sim overwrites it: " + name); return; }
-            if (_created && Eng != IntPtr.Zero) Bw.bw_source_set_occlusion_manual(Eng, _src, level, bands);
+            if (occlusion) { Debug.LogWarning("[Emitter] SetOcclusionManual on a source with `occlusion` ticked — the sim overwrites it: " + name); return; }
+            if (_created && Eng != IntPtr.Zero) Bwa.bwa_source_set_occlusion_manual(Eng, _src, level, bands);
         }
 
         /// <summary>Fire a one-shot at this transform (transient voice; no handle held).</summary>
         public void PlayOneShot(string oneShotClip = null)
         {
             if (Eng == IntPtr.Zero) return;
-            uint snd = BwAudio.Instance.Load(oneShotClip ?? clip);
+            uint snd = Engine.Instance.Load(oneShotClip ?? clip);
             if (snd == 0) return;
             var p = Room.Pos(transform.position);
-            Bw.bw_play_oneshot(Eng, snd, p.x, p.y, p.z, gain);
+            Bwa.bwa_play_oneshot(Eng, snd, p.x, p.y, p.z, gain);
         }
 
         /// <summary>Current occlusion factor (1 = clear .. 0 = fully blocked) for a HUD/debug readout.</summary>
-        public float Occlusion => (_created && Eng != IntPtr.Zero) ? Bw.bw_source_get_occlusion(Eng, _src) : 1f;
+        public float Occlusion => (_created && Eng != IntPtr.Zero) ? Bwa.bwa_source_get_occlusion(Eng, _src) : 1f;
 
         // Inspector edits take effect live in Play mode. Without this, dragging Gain or Pitch during Play
         // changes the FIELD and nothing else — the value is only read once, at source creation — which
@@ -283,26 +283,26 @@ namespace CaveAudio
         void OnValidate()
         {
             if (!Application.isPlaying || !_created || Eng == IntPtr.Zero) return;
-            Bw.bw_source_set_gain(Eng, _src, gain);
-            Bw.bw_source_set_pitch(Eng, _src, pitch);
-            Bw.bw_source_set_priority(Eng, _src, priority);
-            Bw.bw_source_set_group(Eng, _src, (uint)group);
-            Bw.bw_source_set_spread(Eng, _src, spread);
-            Bw.bw_source_set_size(Eng, _src, sizeMetres);
-            Bw.bw_source_set_occlusion(Eng, _src, occlusion);
-            Bw.bw_source_set_early_reflections(Eng, _src, earlyReflections);
-            Bw.bw_source_set_reflections(Eng, _src, reflections);
-            Bw.bw_source_set_reflection_send(Eng, _src, reflectionSend);
-            Bw.bw_source_set_reflection_distance(Eng, _src, reflectionDistance);
-            Bw.bw_source_set_pathing(Eng, _src, pathing);
-            Bw.bw_source_set_doppler(Eng, _src, doppler);
-            Bw.bw_source_set_air_absorption(Eng, _src, airAbsorption);
-            Bw.bw_source_set_loudness_comp(Eng, _src, loudnessComp);
-            Bw.bw_source_set_directivity_preset(Eng, _src, directivity);
-            if (directivity != BwDirectivity.Omni)
+            Bwa.bwa_source_set_gain(Eng, _src, gain);
+            Bwa.bwa_source_set_pitch(Eng, _src, pitch);
+            Bwa.bwa_source_set_priority(Eng, _src, priority);
+            Bwa.bwa_source_set_group(Eng, _src, (uint)group);
+            Bwa.bwa_source_set_spread(Eng, _src, spread);
+            Bwa.bwa_source_set_size(Eng, _src, sizeMetres);
+            Bwa.bwa_source_set_occlusion(Eng, _src, occlusion);
+            Bwa.bwa_source_set_early_reflections(Eng, _src, earlyReflections);
+            Bwa.bwa_source_set_reflections(Eng, _src, reflections);
+            Bwa.bwa_source_set_reflection_send(Eng, _src, reflectionSend);
+            Bwa.bwa_source_set_reflection_distance(Eng, _src, reflectionDistance);
+            Bwa.bwa_source_set_pathing(Eng, _src, pathing);
+            Bwa.bwa_source_set_doppler(Eng, _src, doppler);
+            Bwa.bwa_source_set_air_absorption(Eng, _src, airAbsorption);
+            Bwa.bwa_source_set_loudness_comp(Eng, _src, loudnessComp);
+            Bwa.bwa_source_set_directivity_preset(Eng, _src, directivity);
+            if (directivity != BwaDirectivity.Omni)
             {
-                float w = directivity == BwDirectivity.Cardioid ? 0.5f : 1.0f;
-                Bw.bw_source_set_directivity(Eng, _src, w, directivityPower);
+                float w = directivity == BwaDirectivity.Cardioid ? 0.5f : 1.0f;
+                Bwa.bwa_source_set_directivity(Eng, _src, w, directivityPower);
             }
         }
 
@@ -312,8 +312,8 @@ namespace CaveAudio
             StopAllCoroutines();                 // cancel a pending InitWhenReady
             if (_created && Eng != IntPtr.Zero)
             {
-                if (BwAudio.Instance) BwAudio.Instance.Unregister(this);
-                Bw.bw_source_destroy(Eng, _src);
+                if (Engine.Instance) Engine.Instance.Unregister(this);
+                Bwa.bwa_source_destroy(Eng, _src);
             }
             _created = false;
         }

@@ -298,14 +298,14 @@ NatNet* natnet_open(const NatNetConfig* cfg, char* err, size_t errcap) {
      * which downstream surfaces as a misleading "server didn't respond" / "rigid body not found".
      * Reject a bad server/multicast address up front with a clear message. */
     if (cfg->server && cfg->server[0] && !valid_ipv4(cfg->server)) {
-        nn_err(err, errcap, "natnet: BWAUDIO_NATNET_SERVER must be a numeric IPv4 address (e.g. 192.168.1.10), not a hostname"); goto fail;
+        nn_err(err, errcap, "natnet: tracker server must be a numeric IPv4 address (e.g. 192.168.1.10), not a hostname"); goto fail;
     }
     if (cfg->multicast && cfg->multicast[0] && !valid_ipv4(cfg->multicast)) {
-        nn_err(err, errcap, "natnet: BWAUDIO_NATNET_MULTICAST must be a numeric IPv4 multicast address (e.g. 239.255.42.99)"); goto fail;
+        nn_err(err, errcap, "natnet: tracker multicast must be a numeric IPv4 multicast address (e.g. 239.255.42.99)"); goto fail;
     }
 
     /* Bitstream version. The server knows its own version, so when one is configured the
-     * handshake is authoritative — it can't be desynced by a wrong BWAUDIO_NATNET_VERSION (a
+     * handshake is authoritative — it can't be desynced by a wrong version override (a
      * 4.0-vs-4.1 mistake silently mis-parses the size-prefixed sections). The env value is only
      * a fallback for a pure multicast listen with no command channel; 3.1 is the last resort. */
     nn->major = 0; nn->minor = 0;
@@ -317,7 +317,7 @@ NatNet* natnet_open(const NatNetConfig* cfg, char* err, size_t errcap) {
      * miss is fatal here — the caller asked for a specific body, so don't silently track another. */
     if (cfg->rigid_body_name && cfg->rigid_body_name[0]) {
         if (!cfg->server || !cfg->server[0]) {
-            nn_err(err, errcap, "natnet: tracking by name needs BWAUDIO_NATNET_SERVER"); goto fail;
+            nn_err(err, errcap, "natnet: tracking by name needs the server address"); goto fail;
         }
         int32_t id;
         if (!resolve_name_via_modeldef(cfg, nn->major, nn->minor, cfg->rigid_body_name, &id)) {

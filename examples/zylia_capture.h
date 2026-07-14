@@ -1,13 +1,13 @@
 /*
  * zylia_capture.h — the ZM-1 ASIO input shell, shared by zylia_probe (console meter) and
- * bw_calib_view's Zylia tab (the live DOA view). Owns the driver, streams the first 19 input
+ * bwa_calib_view's Zylia tab (the live DOA view). Owns the driver, streams the first 19 input
  * channels into per-capsule rings, watches for a transient (a clap), and publishes snapshots +
  * live meters through ZpShared. The DOA math it feeds (zylia_tdoa -> zylia_doa) lives in zylia.c,
  * unit-tested off-hardware; this is the rig-bound part. Compiled only when the ASIO SDK is present
- * (BW_HAVE_ASIO) — consumers guard their calls the same way.
+ * (BWA_HAVE_ASIO) — consumers guard their calls the same way.
  */
-#ifndef BW_ZYLIA_CAPTURE_H
-#define BW_ZYLIA_CAPTURE_H
+#ifndef BWA_ZYLIA_CAPTURE_H
+#define BWA_ZYLIA_CAPTURE_H
 
 #include "zylia.h"
 
@@ -56,4 +56,4 @@ void      zylia_capture_close(void);
 }
 #endif
 
-#endif /* BW_ZYLIA_CAPTURE_H */
+#endif /* BWA_ZYLIA_CAPTURE_H */

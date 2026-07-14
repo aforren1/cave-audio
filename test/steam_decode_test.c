@@ -10,7 +10,7 @@
  */
 #include "steam_decode.h"
 #include "layout.h"
-#include "sink.h"          /* BW_CHANNELS */
+#include "sink.h"          /* BWA_CHANNELS */
 
 #include <math.h>
 #include <stdio.h>
@@ -19,7 +19,7 @@
 
 #define N 1024u            /* device block == phonon frameSize */
 
-static float* bus;         /* BW_CHANNELS * N */
+static float* bus;         /* BWA_CHANNELS * N */
 static float* out;         /* 2 * N (L at [0,N), R at [N,2N)) */
 static int    fails = 0;
 #define CHECK(cond, msg) do { if (!(cond)) { printf("FAIL: %s\n", (msg)); ++fails; } } while (0)
@@ -29,7 +29,7 @@ static double e_right(void) { double e = 0; for (uint32_t i = 0; i < N; ++i) e +
 
 static void decode_channel(SteamMonitor* m, int ch, const float q[4]) {
     const float p[3] = { 0, 1.5f, 0 };   /* the default grid's ear point (floor origin) */
-    memset(bus, 0, sizeof(float) * (size_t)BW_CHANNELS * N);
+    memset(bus, 0, sizeof(float) * (size_t)BWA_CHANNELS * N);
     for (uint32_t i = 0; i < N; ++i) bus[(size_t)ch * N + i] = 1.0f;
     /* phonon crossfades an orientation CHANGE across one block (AmbisonicsRotateEffect keeps the
      * previous rotation and interpolates), so the first block after a new q is a smear of old and
@@ -41,7 +41,7 @@ static void decode_channel(SteamMonitor* m, int ch, const float q[4]) {
 
 int main(void) {
     Layout L = layout_default();
-    bus = (float*)calloc((size_t)BW_CHANNELS * N, sizeof(float));
+    bus = (float*)calloc((size_t)BWA_CHANNELS * N, sizeof(float));
     out = (float*)calloc((size_t)2 * N, sizeof(float));
     if (!bus || !out) { printf("FAIL: alloc\n"); return 1; }
 
@@ -50,7 +50,7 @@ int main(void) {
     if (!m) { printf("steam_decode_test: %d FAILURES\n", fails); return 1; }
 
     int right = -1, left = -1;     /* pure-lateral speakers (y,z ~ 0) so the HRTF L/R isn't diluted by elevation */
-    for (int k = 0; k < (int)BW_CHANNELS; ++k) {     /* identity faces +z, so the listener's right is -x */
+    for (int k = 0; k < (int)BWA_CHANNELS; ++k) {     /* identity faces +z, so the listener's right is -x */
         float x = L.speakers[k].pos[0], y = L.speakers[k].pos[1], z = L.speakers[k].pos[2];
         if (fabsf(y - 1.5f) > 0.01f || fabsf(z) > 0.01f) continue;   /* lateral = at ear height */
         if (x < -1.0f) right = k;

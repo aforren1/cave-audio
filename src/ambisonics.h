@@ -5,7 +5,7 @@
  * the 26 bus channels as a virtual speaker at its room direction from the listener, encode the
  * 26 feeds into a 16-channel 3rd-order ambisonic bus with these gains (a fixed matrix), then do
  * a single ambisonics→binaural HRTF decode via Steam Audio. This module is the SDK-independent,
- * unit-tested encode; the HRTF decode (stage 2) links Steam Audio (BWAUDIO_WITH_STEAMAUDIO) and
+ * unit-tested encode; the HRTF decode (stage 2) links Steam Audio (BWA_WITH_STEAMAUDIO) and
  * supersedes the first-cut per-channel pan in binaural.c.
  *
  * Convention: ACN channel order n = l(l+1)+m, SN3D normalization (the AmbiX standard). Ambisonic
@@ -13,14 +13,14 @@
  * integration this must match the linked phonon build's convention: if it uses N3D, scale ACN n
  * of degree l by sqrt(2l+1); if its axes differ, permute/sign the direction before encoding.
  */
-#ifndef BW_AMBISONICS_H
-#define BW_AMBISONICS_H
+#ifndef BWA_AMBISONICS_H
+#define BWA_AMBISONICS_H
 
-#define BW_AMBI_ORDER 3
-#define BW_AMBI_CH    16    /* (order + 1)^2 */
+#define BWA_AMBI_ORDER 3
+#define BWA_AMBI_CH    16    /* (order + 1)^2 */
 
 /* Real SH gains for a unit direction `dir` (ambisonic axes), written to y[16] (ACN/SN3D). */
-void ambi_encode_sn3d(const float dir[3], float y[BW_AMBI_CH]);
+void ambi_encode_sn3d(const float dir[3], float y[BWA_AMBI_CH]);
 
 /* Per-ACN-channel gain converting the SN3D encode above into the orthonormal real-SH basis Steam
  * Audio (phonon) consumes internally: its iplAmbisonicsDecodeEffect takes no normalization param,
@@ -29,6 +29,6 @@ void ambi_encode_sn3d(const float dir[3], float y[BW_AMBI_CH]);
  * core/src/core/sh/spherical_harmonics.cc: Y00=0.282095=1/sqrt(4pi), Y1=0.488603=sqrt(3)/sqrt(4pi),
  * ...). Multiply ambi_encode_sn3d's output by this elementwise to feed the decode; test_ambi
  * checks the product against those constants. */
-extern const float ambi_phonon_scale[BW_AMBI_CH];
+extern const float ambi_phonon_scale[BWA_AMBI_CH];
 
-#endif /* BW_AMBISONICS_H */
+#endif /* BWA_AMBISONICS_H */

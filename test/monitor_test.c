@@ -12,7 +12,7 @@
 #include <stdio.h>
 #include <string.h>
 
-#define CH   BW_CHANNELS
+#define CH   BWA_CHANNELS
 #define N    64
 #define RATE 48000u
 

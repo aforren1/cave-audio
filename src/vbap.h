@@ -6,15 +6,15 @@
  * change, so the per-voice solve is alloc/lock-free. Falls back to DBAP for a non-triangulable array
  * or a source at the listener. See docs/spatialization.md.
  */
-#ifndef BW_VBAP_H
-#define BW_VBAP_H
+#ifndef BWA_VBAP_H
+#define BWA_VBAP_H
 
 #include "layout.h"
 
 #define VBAP_MAXTRI 256    /* hull-triangle cap (a generic 26-speaker hull is ~48; overflow -> DBAP fallback) */
 
 typedef struct {
-    float    sdir[BW_CHANNELS][3];    /* listener-relative unit speaker directions */
+    float    sdir[BWA_CHANNELS][3];    /* listener-relative unit speaker directions */
     int      tri[VBAP_MAXTRI][3];     /* hull triangles of sdir */
     float    det[VBAP_MAXTRI];
     int      ntri;                    /* 0 if the array can't be triangulated within the cap -> DBAP fallback */
@@ -33,4 +33,4 @@ void vbap_reset(VbapState* s);
 void vbap_gains(VbapState* s, const float src[3], const float lis[3], const Layout* L,
                 uint32_t gen, float user_gain, float* out);
 
-#endif /* BW_VBAP_H */
+#endif /* BWA_VBAP_H */

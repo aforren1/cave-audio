@@ -1,4 +1,4 @@
-// BwAudio.cs — the manager. ONE per scene (singleton). Owns the engine handle, loads assets, and
+// Engine.cs — the manager. ONE per scene (singleton). Owns the engine handle, loads assets, and
 // runs the CENTRALIZED per-frame push: all sources, then the listener, then one commit — so every
 // block the audio thread sees is internally consistent (Unity does not order LateUpdate across
 // components, so per-emitter pushes could commit a half-moved frame). See docs/integration.md.
@@ -7,28 +7,43 @@ using System.Collections.Generic;
 using System.IO;
 using UnityEngine;
 
-namespace CaveAudio
+namespace BwAudio
 {
     [DefaultExecutionOrder(-100)]
-    public sealed class BwAudio : MonoBehaviour
+    public sealed class Engine : MonoBehaviour
     {
-        public static BwAudio Instance { get; private set; }
+        public static Engine Instance { get; private set; }
 
         [Header("Engine")]
-        public BwProfile profile = BwProfile.Binaural;   // inspector dropdown; maps 1:1 to the C enum
+        public BwaProfile profile = BwaProfile.Binaural;   // inspector dropdown; maps 1:1 to the C enum
         [Tooltip("The surveyed speaker geometry, as a path RELATIVE TO Assets/StreamingAssets/ " +
                  "(create that folder and put cave_layout.json in it). Used by the cave/both profiles. " +
                  "If it fails to load the engine falls back to its default 26-speaker grid and logs an " +
                  "error — it does NOT stop, so a smaller rig would silently pan over the wrong geometry.")]
-        [BwClip(".json")] public string layoutFile = "cave_layout.json";
+        [Clip(".json")] public string layoutFile = "cave_layout.json";
         public uint sampleRate = 48000;
         public uint blockSize = 256;
+        [Tooltip("Output-device policy. Auto: try ASIO, fall back to the SILENT offline sink (the " +
+                 "engine keeps rendering — the inspector flags the silent fallback). Asio: demand a " +
+                 "real device, so a missing driver fails startup loudly. Null: force the offline sink.")]
+        public BwaSinkType sink = BwaSinkType.Auto;
+        [Tooltip("ASIO driver name to open. Empty = auto-pick the first registered driver with " +
+                 "enough output channels for the profile.")]
+        public string asioDriver = "";
 
         [Header("Listener")]
         [Tooltip("The tracked head: your OptiTrack rigid body, or the XR camera at a desk. Required " +
                  "when Feed Listener is on — without it the listener never moves from the array centroid.")]
         public Transform listener;          // OptiTrack head rigid body, or the XR camera at a desk
         public bool feedListener = true;    // false => the core reads NatNet itself (cave/both)
+        [Tooltip("Internal tracking only (Feed Listener off): the Motive host IP, for the command " +
+                 "handshake and rigid-body names. Empty = multicast-only (no handshake).")]
+        public string natnetServer = "";
+        [Tooltip("Internal tracking only: the rigid body to follow — a numeric streaming ID, or a " +
+                 "name (names need the server above). Empty = the first rigid body in the frame. " +
+                 "Ports/multicast/interface use NatNet defaults; call Bwa.bwa_tracker_connect " +
+                 "yourself for a non-default rig.")]
+        public string natnetRigidBody = "";
         [Tooltip("Other occupants (up to 3). Panning becomes the per-speaker energy MEAN of everyone's " +
                  "solve — each person hears the image biased toward their own spot, instead of one exact " +
                  "listener and N wrong ones. Pushed every frame, like the primary listener.")]
@@ -51,13 +66,13 @@ namespace CaveAudio
         [Header("Panning")]
         [Tooltip("DBAP: listener-relative, for a MOVING observer (the CAVE case). SPCAP/VBAP assume a " +
                  "FIXED listener — sharper, but only at the sweet spot.")]
-        public BwPanner panner = BwPanner.Dbap;
+        public BwaPanner panner = BwaPanner.Dbap;
         [Tooltip("Split at ~700 Hz and pan the low band with amplitude normalisation: sharper LF " +
                  "localisation for a near-centred listener. Sweet-spot dependent.")]
         public bool dualBand = false;
         [Tooltip("How a source's spread renders. LOBE: one reshaped solve (cheap, smooth). MDAP: a ring of " +
                  "virtual sources panned with the selected panner (panner-true, ~13x the solve cost).")]
-        public BwSpreadMode spreadMode = BwSpreadMode.Lobe;
+        public BwaSpreadMode spreadMode = BwaSpreadMode.Lobe;
         [Tooltip("Feed a wide source's speakers mutually INCOHERENT signals (velvet-noise filters), so it " +
                  "doesn't collapse to phantom images or comb-filter as the listener walks. Point sources " +
                  "are untouched.")]
@@ -65,20 +80,20 @@ namespace CaveAudio
         [Tooltip("Widen sources that come close to the head, instead of letting them snap across the " +
                  "nearest speaker. ~1 m is a good start; 0 = off.")]
         public float nearSpreadRadius = 0f;
-        [Tooltip("For layouts carrying a room_eq_grid (bw_calibrate --room-eq-grid): re-interpolate the LF " +
+        [Tooltip("For layouts carrying a room_eq_grid (bwa_calibrate --room-eq-grid): re-interpolate the LF " +
                  "modal cuts at the live listener position. No-op without a grid; this is the kill switch.")]
         public bool trackedRoomEq = true;
 
-        [Header("Diffuse beds (BwAmbisonicBed / reverb)")]
+        [Header("Diffuse beds (AmbisonicBed / reverb)")]
         [Tooltip("Load-time. AllRAD is more robust on an irregular/lopsided array, at a heavier load-time build.")]
-        public BwBedDecoder bedDecoder = BwBedDecoder.Sampling;
+        public BwaBedDecoder bedDecoder = BwaBedDecoder.Sampling;
         [Tooltip("MATRIX: the static SH->speaker decode. PARAMETRIC: DirAC analysis re-pans the directional " +
                  "part through the listener-relative panner — a recorded soundfield becomes WALKABLE " +
                  "(correct directions + parallax off-centre). Live: beds crossfade, so it A/Bs.")]
-        public BwBedRenderer bedRenderer = BwBedRenderer.Matrix;
+        public BwaBedRenderer bedRenderer = BwaBedRenderer.Matrix;
 
         [Header("Early reflections (image-source; no SDK needed)")]
-        [Tooltip("Level of the per-source wall bounces (opt a source in with BwEmitter.earlyReflections). " +
+        [Tooltip("Level of the per-source wall bounces (opt a source in with Emitter.earlyReflections). " +
                  "Needs the Room Box below — that's the geometry they mirror off. These carry room size " +
                  "and source distance with real parallax; the reverb beds below carry the late tail.")]
         [Range(0f, 2f)] public float earlyReflectionGain = 1f;
@@ -87,6 +102,9 @@ namespace CaveAudio
         public bool enableReflections = false;
         [Range(0.1f, 3f)] public float reverbSeconds = 1.0f;
         [Range(1, 2)]     public int   reflectionOrder = 1;
+        [Tooltip("Precompute (bake) the reverb over a probe grid at start, so the sim thread looks it " +
+                 "up instead of ray-tracing live. Static scenes only (which the bed requires anyway).")]
+        public bool bakeReflections = false;
         [Range(0f, 2f)]   public float reverbGain = 1.0f;   // wet level; adjustable live via ReverbGain
 
         [Header("Reflections — FDN reverb (load-time; NO SDK needed)")]
@@ -103,9 +121,15 @@ namespace CaveAudio
         public Vector3 fdnDecayDirection = Vector3.zero;
         [Range(0.1f, 2f)] public float fdnDecayFactor = 1f;
 
+        [Header("Sound pathing (load-time; needs the SDK + scene geometry)")]
+        [Tooltip("Run the sound-pathing sim: a blocked emitter's sound is routed around occluders / " +
+                 "through openings and rendered from the indirect arrival directions. Emitters opt in " +
+                 "with Emitter.pathing.")]
+        public bool enablePathing = false;
+
         [Header("Scene view")]
         [Tooltip("Draw the speaker array. Stopped, these come from the layout FILE. In Play mode they " +
-                 "come from the ENGINE (bw_get_speakers) and light up with each channel's live output " +
+                 "come from the ENGINE (bwa_get_speakers) and light up with each channel's live output " +
                  "level — so you see the geometry actually being panned over, which is how a failed " +
                  "layout load looks: the default 26-grid, not your room.")]
         public bool showSpeakers = true;
@@ -115,94 +139,116 @@ namespace CaveAudio
         [Header("Room box (load-time; optional acoustic geometry)")]
         [Tooltip("A shoebox enclosure for occlusion/reflections, drawn as a yellow wireframe in the " +
                  "scene view. FLOOR-BASED: centred on the origin in x/z, running from y=0 up to its " +
-                 "height. For anything more detailed, use BwAcousticGeometry instead.")]
+                 "height. For anything more detailed, use AcousticGeometry instead.")]
         public bool enableRoomBox = false;
         public Vector3 roomSizeMetres = new Vector3(3f, 3f, 3f);
         [Tooltip("Material for all six faces. For per-face or custom materials, build the room out of " +
-                 "BwAcousticGeometry objects instead.")]
-        public BwMaterialPreset roomMaterial = BwMaterialPreset.Concrete;
+                 "AcousticGeometry objects instead.")]
+        public BwaMaterialPreset roomMaterial = BwaMaterialPreset.Concrete;
 
         IntPtr _eng;
         public IntPtr Handle => _eng;
         public bool Ready => _eng != IntPtr.Zero;
 
-        readonly List<BwEmitter> _emitters = new();
+        readonly List<Emitter> _emitters = new();
         readonly Dictionary<string, uint> _sounds = new();
 
         void Awake()
         {
             if (Instance != null) { Destroy(gameObject); return; }   // a working manager already owns the engine
 
-            var cfg = new BwConfig {
+            var cfg = new BwaDesc {
                 profile = profile,
                 layoutPath = Path.Combine(Application.streamingAssetsPath, layoutFile),
                 hrtfPath = null, sampleRate = sampleRate, blockSize = blockSize,
-                trackInternal = !feedListener,
+                sink = sink,
+                asioDriver = asioDriver.Length > 0 ? asioDriver : null,
+                enablePathing = enablePathing,
+                bedDecoder = bedDecoder,
             };
-            _eng = Bw.bw_create(in cfg);
-            if (_eng == IntPtr.Zero) { Debug.LogError("[BwAudio] bw_create failed"); return; }   // Instance NOT claimed
+            _eng = Bwa.bwa_create(in cfg);
+            if (_eng == IntPtr.Zero) { Debug.LogError("[bw_audio] bwa_create failed"); return; }   // Instance NOT claimed
 
-            // The layout resolves inside bw_create, so the channel count is known before start — and it is
+            // The layout resolves inside bwa_create, so the channel count is known before start — and it is
             // the LAYOUT's speaker count, not a constant. A FAILED load is NOT fatal: the engine falls back
-            // to the built-in 26-speaker grid and only records why in bw_last_error (which bw_create sets
+            // to the built-in 26-speaker grid and only records why in bwa_last_error (which bwa_create sets
             // for nothing else). On a smaller rig that silently changes the count too, so every source would
             // be panned over geometry that isn't the one in the room. Say so, loudly.
-            _channels = Bw.bw_channel_count(_eng);
-            var loadErr = Bw.LastError(_eng);
+            _channels = Bwa.bwa_get_channel_count(_eng);
+            var loadErr = Bwa.LastError(_eng);
             if (loadErr != null)
-                Debug.LogError($"[BwAudio] layout '{cfg.layoutPath}' did not load — the engine fell back to " +
+                Debug.LogError($"[bw_audio] layout '{cfg.layoutPath}' did not load — the engine fell back to " +
                                $"its default {_channels}-speaker grid: {loadErr}");
 
             ApplyLoadTimeSettings();
             SetupScene();   // acoustic geometry + optional room box -> the engine's scene (load-time)
 
-            if (Bw.bw_start(_eng) != 0)
+            if (Bwa.bwa_start(_eng) != BwaResult.Ok)
             {
-                Debug.LogError("[BwAudio] bw_start failed: " + Bw.LastError(_eng));
-                Bw.bw_destroy(_eng); _eng = IntPtr.Zero; return;     // Instance NOT claimed -> another manager can try
+                Debug.LogError("[bw_audio] bwa_start failed: " + Bwa.LastError(_eng));
+                Bwa.bwa_destroy(_eng); _eng = IntPtr.Zero; return;     // Instance NOT claimed -> another manager can try
+            }
+
+            // Internal tracking: connect the engine to the NatNet stream itself (runtime call — no env
+            // vars). Non-fatal: the engine keeps rendering from the committed/default pose, loudly.
+            if (!feedListener)
+            {
+                var td = new BwaTrackerDesc { server = natnetServer.Length > 0 ? natnetServer : null };
+                if (natnetRigidBody.Length > 0)
+                {
+                    if (int.TryParse(natnetRigidBody, out var id)) td.rigidBodyId = id;
+                    else td.rigidBodyName = natnetRigidBody;
+                }
+                if (Bwa.bwa_tracker_connect(_eng, in td) != BwaResult.Ok)
+                    Debug.LogError("[bw_audio] tracker connect failed (listener stays at the committed " +
+                                   "pose): " + Bwa.LastError(_eng));
             }
 
             // Only claim the singleton once we have a live engine, so a failed init leaves Instance free.
             Instance = this; DontDestroyOnLoad(gameObject);
-            Debug.Log($"[BwAudio] started, backend={Bw.Backend(_eng)}, channels={_channels}");
+            Debug.Log($"[bw_audio] started, backend={Bwa.Backend(_eng)}, channels={_channels}");
 
             // Feeding the pose from Unity with nothing to feed it FROM is a silent no-op: the listener
             // just stays at the array centroid and every source is panned for a head that never moves.
             if (feedListener && !listener)
-                Debug.LogWarning("[BwAudio] 'Feed Listener' is on but no listener Transform is assigned — " +
+                Debug.LogWarning("[bw_audio] 'Feed Listener' is on but no listener Transform is assigned — " +
                                  "the listener will never move from the array centroid. Assign the tracked " +
                                  "head (or turn Feed Listener off to let the engine read NatNet itself).");
         }
 
-        // Everything the engine wants set BEFORE bw_start (the reverb bed, the bed decoder), plus the live
-        // knobs — pushed here too so the scene STARTS in the state the inspector shows, not at the engine's
-        // defaults. ApplyLiveSettings is the same set minus the load-time-only ones.
+        // Everything the engine wants set BEFORE bwa_start (the reverb beds — the bed decoder and pathing
+        // ride BwaDesc into bwa_create), plus the live knobs — pushed here too so the scene STARTS in the
+        // state the inspector shows, not at the engine's defaults. ApplyLiveSettings is the same set minus
+        // the load-time-only ones.
         void ApplyLoadTimeSettings()
         {
             if (enableReflections && enableFdnReverb)
-                Debug.LogWarning("[BwAudio] both reverb beds enabled — they share ONE reverb tap. Using the " +
+                Debug.LogWarning("[bw_audio] both reverb beds enabled — they share ONE reverb tap. Using the " +
                                  "FDN (it takes the tap) and ignoring the Steam bed; tick only one.");
 
             if (enableFdnReverb)
             {
-                Bw.bw_reverb_fdn(_eng, true);
-                Bw.bw_fdn_set_decay(_eng, fdnRt60LowSeconds, fdnRt60HighSeconds, fdnCrossoverHz);
-                if (fdnDecayDirection != Vector3.zero)
-                {
-                    var d = Room.Dir(fdnDecayDirection.normalized);   // a direction: no registration offset
-                    Bw.bw_fdn_set_decay_direction(_eng, new[] { d.x, d.y, d.z }, fdnDecayFactor);
-                }
+                var d = fdnDecayDirection == Vector3.zero
+                    ? Vector3.zero                                    // all-zero => uniform decay
+                    : Room.Dir(fdnDecayDirection.normalized);         // a direction: no registration offset
+                var fc = new BwaFdnDesc {
+                    enabled = 1,
+                    rt60LowSeconds = fdnRt60LowSeconds, rt60HighSeconds = fdnRt60HighSeconds,
+                    crossoverHz = fdnCrossoverHz,
+                    decayDirX = d.x, decayDirY = d.y, decayDirZ = d.z,
+                    decayFactor = fdnDecayFactor,
+                };
+                Bwa.bwa_fdn_config(_eng, in fc);
             }
             else if (enableReflections)
             {
-                var rc = new BwReflectionConfig {
+                var rc = new BwaReflectionsDesc {
                     irSeconds = reverbSeconds, order = (uint)reflectionOrder,
-                    numRays = 0, numBounces = 0, enabled = 1, wetGain = reverbGain,
+                    numRays = 0, numBounces = 0, enabled = 1, bake = bakeReflections ? 1 : 0,
                 };
-                Bw.bw_reflections_config(_eng, in rc);
+                Bwa.bwa_reflections_config(_eng, in rc);
             }
 
-            Bw.bw_set_bed_decoder(_eng, bedDecoder);   // load-time only
             ApplyLiveSettings();
         }
 
@@ -210,18 +256,19 @@ namespace CaveAudio
         // Called once before start, and again from OnValidate so inspector tweaks are audible in Play mode.
         void ApplyLiveSettings()
         {
-            Bw.bw_set_panner(_eng, panner);
-            Bw.bw_set_dual_band(_eng, dualBand);
-            Bw.bw_set_spread_mode(_eng, spreadMode);
-            Bw.bw_set_decorrelation(_eng, decorrelation);
-            Bw.bw_set_near_spread(_eng, nearSpreadRadius);
-            Bw.bw_set_bed_renderer(_eng, bedRenderer);
-            Bw.bw_set_tracked_room_eq(_eng, trackedRoomEq);
-            Bw.bw_set_master_gain(_eng, masterGain);
-            Bw.bw_early_reflections_set_gain(_eng, earlyReflectionGain);
-            Bw.bw_set_limiter(_eng, limiter);
-            Bw.bw_set_limiter_ceiling(_eng, limiterCeilingDb);
-            Bw.bw_set_pose_prediction(_eng, feedListener ? 0f : posePredictionMs);   // internal tracking only
+            Bwa.bwa_set_panner(_eng, panner);
+            Bwa.bwa_set_dual_band(_eng, dualBand);
+            Bwa.bwa_set_spread_mode(_eng, spreadMode);
+            Bwa.bwa_set_decorrelation(_eng, decorrelation);
+            Bwa.bwa_set_near_spread(_eng, nearSpreadRadius);
+            Bwa.bwa_set_bed_renderer(_eng, bedRenderer);
+            Bwa.bwa_set_tracked_room_eq(_eng, trackedRoomEq);
+            Bwa.bwa_set_master_gain(_eng, masterGain);
+            Bwa.bwa_reflections_set_gain(_eng, reverbGain);   // valid pre-start: seeds whichever reverb bed bwa_start creates
+            Bwa.bwa_early_reflections_set_gain(_eng, earlyReflectionGain);
+            Bwa.bwa_set_limiter(_eng, limiter);
+            Bwa.bwa_set_limiter_ceiling(_eng, limiterCeilingDb);
+            Bwa.bwa_set_pose_prediction(_eng, feedListener ? 0f : posePredictionMs);   // internal tracking only
         }
 
         // Inspector edits take effect live in Play mode — that IS the workflow for these (the engine makes
@@ -238,8 +285,8 @@ namespace CaveAudio
         {
             if (!Ready) return 0;
             if (_sounds.TryGetValue(clip, out var s)) return s;
-            s = Bw.bw_load_sound(_eng, Path.Combine(Application.streamingAssetsPath, clip));
-            if (s == 0) Debug.LogWarning("[BwAudio] load failed: " + clip + " (" + Bw.LastError(_eng) + ")");
+            s = Bwa.bwa_load_sound(_eng, Path.Combine(Application.streamingAssetsPath, clip));
+            if (s == 0) Debug.LogWarning("[bw_audio] load failed: " + clip + " (" + Bwa.LastError(_eng) + ")");
             _sounds[clip] = s; return s;
         }
 
@@ -249,43 +296,42 @@ namespace CaveAudio
             if (!Ready) return 0;
             var key = "ambix:" + clip;
             if (_sounds.TryGetValue(key, out var s)) return s;
-            s = Bw.bw_load_ambix(_eng, Path.Combine(Application.streamingAssetsPath, clip));
-            if (s == 0) Debug.LogWarning("[BwAudio] ambix load failed: " + clip + " (" + Bw.LastError(_eng) + ")");
+            s = Bwa.bwa_load_ambix(_eng, Path.Combine(Application.streamingAssetsPath, clip));
+            if (s == 0) Debug.LogWarning("[bw_audio] ambix load failed: " + clip + " (" + Bwa.LastError(_eng) + ")");
             _sounds[key] = s; return s;
         }
 
-        /// <summary>Mint one of the engine's built-in materials (load-time). Typed, because the raw call
-        /// treats an unknown name as "use the generic default" rather than as an error — for a name the
-        /// enum doesn't cover, drop to Bw.bw_material_preset and check Bw.LastError yourself.</summary>
-        public uint MaterialPreset(BwMaterialPreset preset) => Ready ? Bw.MaterialPreset(_eng, preset) : 0;
+        /// <summary>Mint one of the engine's built-in materials (load-time). The native call takes the
+        /// same enum (bwa_material_type) — this wrapper is just null-engine-safe.</summary>
+        public uint MaterialPreset(BwaMaterialPreset preset) => Ready ? Bwa.MaterialPreset(_eng, preset) : 0;
 
         /// <summary>Reverb wet level (linear), adjustable live — the reverb-send equivalent.</summary>
         public float ReverbGain
         {
             get => reverbGain;
-            set { reverbGain = value; if (Ready) Bw.bw_reflections_set_gain(_eng, value); }
+            set { reverbGain = value; if (Ready) Bwa.bwa_reflections_set_gain(_eng, value); }
         }
 
         /// <summary>Level of the image-source EARLY reflections (the per-source wall bounces, opted into
-        /// with BwEmitter.earlyReflections). Independent of the late reverb bed's wet level above: early
+        /// with Emitter.earlyReflections). Independent of the late reverb bed's wet level above: early
         /// reflections carry room size and distance, the bed carries the tail. Live.</summary>
         public float EarlyReflectionGain
         {
             get => earlyReflectionGain;
-            set { earlyReflectionGain = value; if (Ready) Bw.bw_early_reflections_set_gain(_eng, value); }
+            set { earlyReflectionGain = value; if (Ready) Bwa.bwa_early_reflections_set_gain(_eng, value); }
         }
 
         /// <summary>Output protection limiter (engine default: ON at -1 dBFS). Linked across the channels —
         /// engaging never shifts the spatial image. Protection against digital overs, not mastering: if it
         /// engages in normal use, turn the content down.</summary>
-        public void SetLimiter(bool on) { limiter = on; if (Ready) Bw.bw_set_limiter(_eng, on); }
-        public void SetLimiterCeiling(float ceilingDb) { limiterCeilingDb = ceilingDb; if (Ready) Bw.bw_set_limiter_ceiling(_eng, ceilingDb); }
+        public void SetLimiter(bool on) { limiter = on; if (Ready) Bwa.bwa_set_limiter(_eng, on); }
+        public void SetLimiterCeiling(float ceilingDb) { limiterCeilingDb = ceilingDb; if (Ready) Bwa.bwa_set_limiter_ceiling(_eng, ceilingDb); }
 
         /// <summary>Master gain over the whole mix (ramped — slider drags never zipper). The volume knob.</summary>
         public float MasterGain
         {
             get => masterGain;
-            set { masterGain = value; if (Ready) Bw.bw_set_master_gain(_eng, value); }
+            set { masterGain = value; if (Ready) Bwa.bwa_set_master_gain(_eng, value); }
         }
 
         /// <summary>Global pause (focus loss, menu): EVERY voice — sources, streams, beds — ramps out and
@@ -293,28 +339,28 @@ namespace CaveAudio
         public bool Paused
         {
             get => _paused;
-            set { _paused = value; if (Ready) Bw.bw_set_paused(_eng, value); }
+            set { _paused = value; if (Ready) Bwa.bwa_set_paused(_eng, value); }
         }
         bool _paused;
 
         /// <summary>Mix-group gain (group 0..7): ducks every emitter in the group — "quiet the SFX, keep the
         /// dialog" without touching each source. Ramped.</summary>
-        public void SetGroupGain(uint group, float linear) { if (Ready) Bw.bw_group_set_gain(_eng, group, linear); }
+        public void SetGroupGain(uint group, float linear) { if (Ready) Bwa.bwa_group_set_gain(_eng, group, linear); }
 
         /// <summary>Pause a whole mix group (0..7) — same click-free freeze as per-source pause.</summary>
-        public void SetGroupPaused(uint group, bool paused) { if (Ready) Bw.bw_group_set_paused(_eng, group, paused); }
+        public void SetGroupPaused(uint group, bool paused) { if (Ready) Bwa.bwa_group_set_paused(_eng, group, paused); }
 
         // ---- live rendering A/B (each of these is atomic / crossfaded engine-side) --------------------
-        public void SetPanner(BwPanner p)        { panner = p;        if (Ready) Bw.bw_set_panner(_eng, p); }
-        public void SetDualBand(bool on)         { dualBand = on;     if (Ready) Bw.bw_set_dual_band(_eng, on); }
-        public void SetSpreadMode(BwSpreadMode m){ spreadMode = m;    if (Ready) Bw.bw_set_spread_mode(_eng, m); }
-        public void SetDecorrelation(bool on)    { decorrelation = on; if (Ready) Bw.bw_set_decorrelation(_eng, on); }
-        public void SetNearSpread(float radiusM) { nearSpreadRadius = radiusM; if (Ready) Bw.bw_set_near_spread(_eng, radiusM); }
-        public void SetBedRenderer(BwBedRenderer r) { bedRenderer = r; if (Ready) Bw.bw_set_bed_renderer(_eng, r); }
-        public void SetTrackedRoomEq(bool on)    { trackedRoomEq = on; if (Ready) Bw.bw_set_tracked_room_eq(_eng, on); }
+        public void SetPanner(BwaPanner p)        { panner = p;        if (Ready) Bwa.bwa_set_panner(_eng, p); }
+        public void SetDualBand(bool on)         { dualBand = on;     if (Ready) Bwa.bwa_set_dual_band(_eng, on); }
+        public void SetSpreadMode(BwaSpreadMode m){ spreadMode = m;    if (Ready) Bwa.bwa_set_spread_mode(_eng, m); }
+        public void SetDecorrelation(bool on)    { decorrelation = on; if (Ready) Bwa.bwa_set_decorrelation(_eng, on); }
+        public void SetNearSpread(float radiusM) { nearSpreadRadius = radiusM; if (Ready) Bwa.bwa_set_near_spread(_eng, radiusM); }
+        public void SetBedRenderer(BwaBedRenderer r) { bedRenderer = r; if (Ready) Bwa.bwa_set_bed_renderer(_eng, r); }
+        public void SetTrackedRoomEq(bool on)    { trackedRoomEq = on; if (Ready) Bwa.bwa_set_tracked_room_eq(_eng, on); }
         /// <summary>Lead the TRACKED pose by `ms` to hide motion-to-ears latency. Internal tracking only
         /// (Feed Listener off) — when Unity feeds the pose, predict on the Unity side instead.</summary>
-        public void SetPosePrediction(float ms)  { posePredictionMs = ms; if (Ready && !feedListener) Bw.bw_set_pose_prediction(_eng, ms); }
+        public void SetPosePrediction(float ms)  { posePredictionMs = ms; if (Ready && !feedListener) Bwa.bwa_set_pose_prediction(_eng, ms); }
 
         // ---- readback (per-frame-safe: no locks, no allocation in the engine) -------------------------
         /// <summary>The engine's ACTIVE channel count — the layout's speaker count (4..26), NOT a constant.
@@ -329,7 +375,7 @@ namespace CaveAudio
         {
             if (!Ready) return Array.Empty<float>();
             if (_levels == null || _levels.Length != _channels) _levels = new float[_channels];
-            Bw.bw_get_bus_levels(_eng, _levels, (uint)_levels.Length);
+            Bwa.bwa_get_bus_levels(_eng, _levels, (uint)_levels.Length);
             return _levels;
         }
         float[] _levels;
@@ -344,48 +390,48 @@ namespace CaveAudio
             if (_speakers == null || _speakers.Length != _channels * 3)
             {
                 _speakers = new float[_channels * 3];
-                Bw.bw_get_speakers(_eng, _speakers, _channels);
+                Bwa.bwa_get_speakers(_eng, _speakers, _channels);
             }
             return _speakers;
         }
         float[] _speakers;
 
         /// <summary>Voices playing in the last block — a voice-pool gauge for a HUD.</summary>
-        public uint ActiveVoices => Ready ? Bw.bw_get_active_voices(_eng) : 0;
+        public uint ActiveVoices => Ready ? Bwa.bwa_get_active_voices(_eng) : 0;
 
         /// <summary>The engine's dsp-sample clock (device-anchored, monotonic). Add to it to schedule a
         /// sample-accurate start: <c>DspTime + sampleRate/2</c> plays half a second out.</summary>
-        public ulong DspTime => Ready ? Bw.bw_dsp_time(_eng) : 0;
+        public ulong DspTime => Ready ? Bwa.bwa_get_dsp_time(_eng) : 0;
 
         /// <summary>Drive ONE raw output channel with a test tone — a speaker-check / wiring tool, injected
         /// after the per-speaker trims. NOT a spatial path (it bypasses the panner). gain 0 or Off silences.</summary>
-        public void TestSignal(uint channel, BwTestKind kind, float gain) { if (Ready) Bw.bw_test_signal(_eng, channel, kind, gain); }
+        public void TestSignal(uint channel, BwaTestKind kind, float gain) { if (Ready) Bwa.bwa_set_test_signal(_eng, channel, kind, gain); }
 
         // ---- acoustic scene baking (load-time) ----------------------------------------------------
-        // Collect every BwAcousticGeometry (+ the optional room box) into ONE mesh and hand it to the
+        // Collect every AcousticGeometry (+ the optional room box) into ONE mesh and hand it to the
         // engine. The engine's scene is a single static mesh, so this is a one-time bake before start.
         void SetupScene()
         {
             // Sort mode None: we don't care about order (every geometry is baked into one mesh), and the
             // default InstanceID sort is pure overhead. FindObjectsOfType, which sorted unconditionally,
             // is deprecated.
-            var geos = FindObjectsByType<BwAcousticGeometry>(FindObjectsSortMode.None);
+            var geos = FindObjectsByType<AcousticGeometry>(FindObjectsSortMode.None);
             bool haveGeo = geos != null && geos.Length > 0;
             if (!haveGeo && !enableRoomBox) return;
 
             // simple path: just a box, nothing else -> the engine's own box helper (inward normals)
             if (!haveGeo && enableRoomBox)
             {
-                uint mb = Bw.MaterialPreset(_eng, roomMaterial);
+                uint mb = Bwa.MaterialPreset(_eng, roomMaterial);
                 var faces = new[] { mb, mb, mb, mb, mb, mb };
-                Bw.bw_scene_set_box(_eng, roomSizeMetres.x, roomSizeMetres.y, roomSizeMetres.z, faces);
+                Bwa.bwa_scene_set_box(_eng, roomSizeMetres.x, roomSizeMetres.y, roomSizeMetres.z, faces);
                 return;
             }
 
             // combined path: geometry (+ optional box), all baked into one mesh
             var verts = new List<float>(); var tris = new List<int>(); var triMat = new List<uint>();
-            var cache = new Dictionary<BwMaterialAsset, uint>();
-            uint Resolve(BwMaterialAsset a)
+            var cache = new Dictionary<MaterialAsset, uint>();
+            uint Resolve(MaterialAsset a)
             {
                 if (a == null) return 0;                       // default material
                 if (cache.TryGetValue(a, out var t)) return t; // mint each asset once
@@ -393,16 +439,16 @@ namespace CaveAudio
             }
 
             if (enableRoomBox)
-                AddBox(verts, tris, triMat, roomSizeMetres, Bw.MaterialPreset(_eng, roomMaterial));
+                AddBox(verts, tris, triMat, roomSizeMetres, Bwa.MaterialPreset(_eng, roomMaterial));
             foreach (var g in geos)
             {
                 var mesh = g.ResolveMesh();
-                if (mesh == null) { Debug.LogWarning("[BwAudio] BwAcousticGeometry with no mesh: " + g.name); continue; }
+                if (mesh == null) { Debug.LogWarning("[bw_audio] AcousticGeometry with no mesh: " + g.name); continue; }
                 AddMesh(verts, tris, triMat, mesh, g.transform.localToWorldMatrix, Resolve(g.material));
             }
             if (tris.Count == 0) return;
-            Bw.bw_scene_set_mesh_mat(_eng, verts.ToArray(), verts.Count / 3, tris.ToArray(), tris.Count / 3, triMat.ToArray());
-            Debug.Log($"[BwAudio] acoustic scene: {verts.Count / 3} verts, {tris.Count / 3} tris, {cache.Count} material(s)");
+            Bwa.bwa_scene_set_mesh_mat(_eng, verts.ToArray(), verts.Count / 3, tris.ToArray(), tris.Count / 3, triMat.ToArray());
+            Debug.Log($"[bw_audio] acoustic scene: {verts.Count / 3} verts, {tris.Count / 3} tris, {cache.Count} material(s)");
         }
 
         // Append a Unity mesh, transformed local -> world -> room space. Whether the winding must be
@@ -425,7 +471,7 @@ namespace CaveAudio
         }
 
         // Append a FLOOR-based box (room metres: x/z centred, y from 0 up to size.y — matching
-        // bw_scene_set_box), inward-facing normals (the listener is inside).
+        // bwa_scene_set_box), inward-facing normals (the listener is inside).
         static void AddBox(List<float> verts, List<int> tris, List<uint> triMat, Vector3 size, uint mat)
         {
             float hw = size.x * 0.5f, hd = size.z * 0.5f, h = size.y;
@@ -453,10 +499,10 @@ namespace CaveAudio
             tris.Add(baseIdx + i0); tris.Add(baseIdx + i1); tris.Add(baseIdx + i2);
         }
 
-        readonly List<BwEmitter> _pushBuf = new();   // reusable snapshot (Push may unregister mid-loop)
+        readonly List<Emitter> _pushBuf = new();   // reusable snapshot (Push may unregister mid-loop)
 
-        public void Register(BwEmitter e)   { if (!_emitters.Contains(e)) _emitters.Add(e); }
-        public void Unregister(BwEmitter e) => _emitters.Remove(e);
+        public void Register(Emitter e)   { if (!_emitters.Contains(e)) _emitters.Add(e); }
+        public void Unregister(Emitter e) => _emitters.Remove(e);
 
         void LateUpdate()
         {
@@ -471,14 +517,14 @@ namespace CaveAudio
             {
                 var p = Room.Pos(listener.position);
                 var q = Room.Rot(listener.rotation);
-                Bw.bw_set_listener_pose(_eng, p.x, p.y, p.z, q.x, q.y, q.z, q.w);
+                Bwa.bwa_set_listener_pose(_eng, p.x, p.y, p.z, q.x, q.y, q.z, q.w);
             }
             PushExtraListeners();                                  // ...the other occupants (commit-gated too)...
-            Bw.bw_commit(_eng);                                    // ...then one atomic snapshot
+            Bwa.bwa_commit(_eng);                                    // ...then one atomic snapshot
         }
 
         // The other occupants, for compromise panning. Commit-gated like the primary pose, so it belongs in
-        // the same frame block. The engine takes at most BW_EXTRA_LIS (3); the buffer is reused (no per-frame
+        // the same frame block. The engine takes at most BWA_EXTRA_LIS (3); the buffer is reused (no per-frame
         // allocation), and count 0 restores single-listener panning — so clearing the array turns it off.
         static readonly float[] _extraBuf = new float[3 * 3];
         int _extraPushed;   // remember the last count, so dropping the last occupant still sends the 0
@@ -495,7 +541,7 @@ namespace CaveAudio
                     n++;
                 }
             if (n == 0 && _extraPushed == 0) return;               // the common case: nobody else in the room
-            Bw.bw_set_extra_listeners(_eng, _extraBuf, (uint)n);
+            Bwa.bwa_set_extra_listeners(_eng, _extraBuf, (uint)n);
             _extraPushed = n;
         }
 
@@ -595,7 +641,7 @@ namespace CaveAudio
         void OnDestroy()
         {
             if (!Ready) return;
-            Bw.bw_stop(_eng); Bw.bw_destroy(_eng); _eng = IntPtr.Zero;
+            Bwa.bwa_stop(_eng); Bwa.bwa_destroy(_eng); _eng = IntPtr.Zero;
             if (Instance == this) Instance = null;
         }
     }

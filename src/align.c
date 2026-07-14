@@ -17,22 +17,22 @@ struct Aligner {
     uint32_t len;                  /* ring length, power of two >= max_delay + 1 */
     uint32_t mask;                 /* len - 1 */
     uint32_t w;                    /* write index */
-    float    gain[BW_CHANNELS];
-    uint32_t delay[BW_CHANNELS];
+    float    gain[BWA_CHANNELS];
+    uint32_t delay[BWA_CHANNELS];
     float*   buf;                  /* channels * len */
     /* per-speaker correction FIR (optional). Applied to each channel BEFORE the gain+delay. */
     int      any_eq;               /* any channel has a correction filter */
-    uint16_t eq_len[BW_CHANNELS];  /* taps per channel (0 = bypass) */
-    float*   eq;                   /* channels * BW_EQ_TAPS, the kernels */
-    uint32_t eqlen, eqmask, eqw;   /* per-channel input-history ring (power of two >= BW_EQ_TAPS) */
+    uint16_t eq_len[BWA_CHANNELS];  /* taps per channel (0 = bypass) */
+    float*   eq;                   /* channels * BWA_EQ_TAPS, the kernels */
+    uint32_t eqlen, eqmask, eqw;   /* per-channel input-history ring (power of two >= BWA_EQ_TAPS) */
     float*   eqhist;               /* channels * eqlen */
     /* LF room_eq modal cuts (optional): per-channel RBJ peaking biquads, coefficients derived from
      * the layout's fc/gain/Q at the engine rate. Static state — fixed arrays, no allocation. */
     int      any_rq;
-    uint8_t  rq_n[BW_CHANNELS];
-    float    rq_co[BW_CHANNELS][BW_ROOM_EQ_MAX][5];   /* b0 b1 b2 a1 a2 (a0-normalized) */
-    float    rq_x1[BW_CHANNELS][BW_ROOM_EQ_MAX], rq_x2[BW_CHANNELS][BW_ROOM_EQ_MAX];
-    float    rq_y1[BW_CHANNELS][BW_ROOM_EQ_MAX], rq_y2[BW_CHANNELS][BW_ROOM_EQ_MAX];
+    uint8_t  rq_n[BWA_CHANNELS];
+    float    rq_co[BWA_CHANNELS][BWA_ROOM_EQ_MAX][5];   /* b0 b1 b2 a1 a2 (a0-normalized) */
+    float    rq_x1[BWA_CHANNELS][BWA_ROOM_EQ_MAX], rq_x2[BWA_CHANNELS][BWA_ROOM_EQ_MAX];
+    float    rq_y1[BWA_CHANNELS][BWA_ROOM_EQ_MAX], rq_y2[BWA_CHANNELS][BWA_ROOM_EQ_MAX];
     /* Tracked room EQ (layouts with a room_eq_grid): the SAME rq cascade, but the section gains are
      * live — rt.c interpolates targets from the grid at the listener position (align_room_eq_targets)
      * and process slews each section's gain toward its target (RQ_SLEW_DB_S), rebuilding that section's
@@ -40,10 +40,10 @@ struct Aligner {
      * trig stays out of the audio thread; same trick as rt.c's transmission EQ). Sections settled at
      * 0 dB are skipped (a cold restart of a near-identity biquad is inaudible). */
     int      rq_dyn;
-    float    rq_cw0[BW_CHANNELS][BW_ROOM_EQ_MAX];     /* cos(w0) per ladder section */
-    float    rq_alpha[BW_CHANNELS][BW_ROOM_EQ_MAX];   /* sin(w0)/(2Q) per ladder section */
-    float    rq_gcur[BW_CHANNELS][BW_ROOM_EQ_MAX];    /* current section gain (dB, slewed) */
-    float    rq_gtgt[BW_CHANNELS][BW_ROOM_EQ_MAX];    /* target section gain (dB) */
+    float    rq_cw0[BWA_CHANNELS][BWA_ROOM_EQ_MAX];     /* cos(w0) per ladder section */
+    float    rq_alpha[BWA_CHANNELS][BWA_ROOM_EQ_MAX];   /* sin(w0)/(2Q) per ladder section */
+    float    rq_gcur[BWA_CHANNELS][BWA_ROOM_EQ_MAX];    /* current section gain (dB, slewed) */
+    float    rq_gtgt[BWA_CHANNELS][BWA_ROOM_EQ_MAX];    /* target section gain (dB) */
     float    rq_slew;                                 /* max dB change per sample (RQ_SLEW_DB_S / rate) */
 };
 
@@ -54,7 +54,7 @@ struct Aligner {
 static uint32_t pow2_ge(uint32_t x) { uint32_t p = 1; while (p < x) p <<= 1; return p; }
 
 Aligner* align_create(uint32_t channels, const Layout* L, uint32_t sample_rate) {
-    if (channels == 0 || channels > BW_CHANNELS || !L || sample_rate == 0) return NULL;
+    if (channels == 0 || channels > BWA_CHANNELS || !L || sample_rate == 0) return NULL;
     Aligner* a = (Aligner*)calloc(1, sizeof *a);
     if (!a) return NULL;
     a->channels = channels;
@@ -64,14 +64,14 @@ Aligner* align_create(uint32_t channels, const Layout* L, uint32_t sample_rate) 
     for (uint32_t k = 0; k < channels; ++k) {
         a->gain[k]   = L->speakers[k].gain_lin;
         a->delay[k]  = L->speakers[k].delay_samples;
-        a->eq_len[k] = L->speakers[k].eq_len > BW_EQ_TAPS ? BW_EQ_TAPS : L->speakers[k].eq_len;
+        a->eq_len[k] = L->speakers[k].eq_len > BWA_EQ_TAPS ? BWA_EQ_TAPS : L->speakers[k].eq_len;
         if (a->eq_len[k]) a->any_eq = 1;
-        uint8_t nrq = L->speakers[k].room_eq_count > BW_ROOM_EQ_MAX ? BW_ROOM_EQ_MAX : L->speakers[k].room_eq_count;
+        uint8_t nrq = L->speakers[k].room_eq_count > BWA_ROOM_EQ_MAX ? BWA_ROOM_EQ_MAX : L->speakers[k].room_eq_count;
         for (uint8_t s = 0; s < nrq; ++s) {        /* RBJ peaking EQ from the rate-independent params */
             const RoomEqSection* rq = &L->speakers[k].room_eq[s];
             if (!(rq->fc > 0.f) || rq->fc >= 0.5f * (float)sample_rate || !(rq->q > 0.f)) continue;
             uint8_t j = a->rq_n[k];
-            bw_biquad_rbj_hz(BW_BIQUAD_PEAK, rq->fc, rq->q, rq->gain_db, (double)sample_rate, a->rq_co[k][j]);
+            bwa_biquad_rbj_hz(BWA_BIQUAD_PEAK, rq->fc, rq->q, rq->gain_db, (double)sample_rate, a->rq_co[k][j]);
             a->rq_n[k] = j + 1;
         }
         if (a->rq_n[k]) a->any_rq = 1;
@@ -83,7 +83,7 @@ Aligner* align_create(uint32_t channels, const Layout* L, uint32_t sample_rate) 
         a->any_rq  = 1;
         a->rq_slew = RQ_SLEW_DB_S / (float)sample_rate;
         for (uint32_t k = 0; k < channels; ++k) {
-            uint8_t m = L->rq_grid.nsec[k] > BW_ROOM_EQ_MAX ? BW_ROOM_EQ_MAX : L->rq_grid.nsec[k];
+            uint8_t m = L->rq_grid.nsec[k] > BWA_ROOM_EQ_MAX ? BWA_ROOM_EQ_MAX : L->rq_grid.nsec[k];
             for (uint8_t s = 0; s < m; ++s) {
                 double w0 = 2.0 * M_PI * (double)L->rq_grid.fc[k][s] / (double)sample_rate;
                 a->rq_cw0[k][s]   = (float)cos(w0);
@@ -95,14 +95,14 @@ Aligner* align_create(uint32_t channels, const Layout* L, uint32_t sample_rate) 
     a->buf = (float*)calloc((size_t)channels * a->len, sizeof(float));
     if (!a->buf) { free(a); return NULL; }
     if (a->any_eq) {                               /* only pay the memory + DSP if a filter exists */
-        a->eqlen  = pow2_ge(BW_EQ_TAPS);
+        a->eqlen  = pow2_ge(BWA_EQ_TAPS);
         a->eqmask = a->eqlen - 1;
-        a->eq     = (float*)calloc((size_t)channels * BW_EQ_TAPS, sizeof(float));
+        a->eq     = (float*)calloc((size_t)channels * BWA_EQ_TAPS, sizeof(float));
         a->eqhist = (float*)calloc((size_t)channels * a->eqlen, sizeof(float));
         if (!a->eq || !a->eqhist) { free(a->buf); free(a->eq); free(a->eqhist); free(a); return NULL; }
         for (uint32_t k = 0; k < channels; ++k)
             for (uint32_t t = 0; t < a->eq_len[k]; ++t)
-                a->eq[(size_t)k * BW_EQ_TAPS + t] = L->speakers[k].eq[t];
+                a->eq[(size_t)k * BWA_EQ_TAPS + t] = L->speakers[k].eq[t];
     }
     return a;
 }
@@ -111,7 +111,7 @@ void align_destroy(Aligner* a) {
     if (a) { free(a->buf); free(a->eq); free(a->eqhist); free(a); }
 }
 
-void align_room_eq_targets(Aligner* a, const float (*gain_db)[BW_ROOM_EQ_MAX]) {
+void align_room_eq_targets(Aligner* a, const float (*gain_db)[BWA_ROOM_EQ_MAX]) {
     if (!a || !a->rq_dyn || !gain_db) return;
     for (uint32_t k = 0; k < a->channels; ++k)
         for (uint8_t s = 0; s < a->rq_n[k]; ++s) {
@@ -131,7 +131,7 @@ void align_process(Aligner* a, float* bus, uint32_t n) {
             for (uint32_t k = 0; k < C; ++k) {
                 const uint16_t T = a->eq_len[k];
                 if (!T) continue;
-                const float* kn = &a->eq[(size_t)k * BW_EQ_TAPS];
+                const float* kn = &a->eq[(size_t)k * BWA_EQ_TAPS];
                 const float* hh = &a->eqhist[(size_t)k * elen];
                 float y = 0.f;
                 for (uint16_t t = 0; t < T; ++t) y += kn[t] * hh[(wi - t) & emask];
@@ -154,7 +154,7 @@ void align_process(Aligner* a, float* bus, uint32_t n) {
                 else if (g > t + step) g -= step;
                 else                   g  = t;
                 a->rq_gcur[k][s] = g;
-                bw_biquad_rbj(BW_BIQUAD_PEAK, (double)a->rq_cw0[k][s], (double)a->rq_alpha[k][s],
+                bwa_biquad_rbj(BWA_BIQUAD_PEAK, (double)a->rq_cw0[k][s], (double)a->rq_alpha[k][s],
                               pow(10.0, (double)g / 40.0), a->rq_co[k][s]);
             }
     }

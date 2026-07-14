@@ -1,14 +1,14 @@
 /*
- * playground.cpp — interactive harness for bwaudio's binaural monitor, split into SCENES,
+ * playground.cpp — interactive harness for bw_audio's binaural monitor, split into SCENES,
  * each auditioning one feature by ear on headphones (the binaural profile, output through a 2-ch
  * ASIO driver the engine auto-picks — ASIO4ALL / FlexASIO / the Steinberg built-in; without one the
  * engine falls back to the offline null sink and everything still renders, just silent). This is the
- * by-ear evaluation the automated tests can't do. Public C ABI only (bwaudio.h); raylib's raymath
+ * by-ear evaluation the automated tests can't do. Public C ABI only (bw_audio.h); raylib's raymath
  * provides the vector/quaternion math.
  *
  * UI stack: the 3D scene (speakers with live level shading, source, head, room) stays raylib; every
- * control surface is Dear ImGui via rlImGui, themed like the station (bw_theme.h) — the same split
- * as bw_layout_tool. imgui_test_engine drives the ACTUAL panel with fake inputs under ctest
+ * control surface is Dear ImGui via rlImGui, themed like the station (bwa_theme.h) — the same split
+ * as bwa_layout_tool. imgui_test_engine drives the ACTUAL panel with fake inputs under ctest
  * (`--tests [filter]`, forced onto the null sink for determinism), captures screenshots to
  * output/captures/, and exits pass/fail. Keyboard shortcuts act only when imgui doesn't want the
  * keyboard; the camera only drags when the cursor isn't over the UI (io.WantCapture*).
@@ -25,7 +25,7 @@
  *                         is an audible specular reflection scaled by that material's reflectivity.
  *   3 Directivity       — a weighted-dipole radiation pattern (Z omni/cardioid/figure-8), aim it
  *                         with , / . ; the listener hears it attenuate off-axis (HUD shows the lobe).
- *   4 Channel walk      — bw_test_signal drives ONE raw output channel (speaker-check tool). Step
+ *   4 Channel walk      — bwa_set_test_signal drives ONE raw output channel (speaker-check tool). Step
  *                         channels with LEFT/RIGHT (SPACE auto-walks); in binaural each channel is
  *                         HRTF'd as its virtual speaker, so the tone circles your head as you walk.
  *   5 Blind A/B/X       — double-blind self test over live engine knobs (dual-band, DBAP vs SPCAP /
@@ -42,11 +42,11 @@
  *
  * Global keys: WASD/RF move source, Q/E turn head, 1-4 signal, TAB scene, right-drag/wheel camera, ESC.
  * Needs the Steam Audio build for occlusion/materials/directivity/reverb; without it those are no-ops.
- * Usage: bw_playground [cave_layout.json] — audition with your surveyed layout (renders + pans with the
+ * Usage: bwa_playground [cave_layout.json] — audition with your surveyed layout (renders + pans with the
  *        engine's actual speaker positions); with no arg it auto-loads ./cave_layout.json or the default grid.
- * Build: cmake -S . -B build -DBWAUDIO_BUILD_PLAYGROUND=ON && cmake --build build
+ * Build: cmake -S . -B build -DBWA_BUILD_PLAYGROUND=ON && cmake --build build
  */
-#include "bwaudio.h"
+#include "bw_audio.h"
 #include "raylib.h"
 #include "raymath.h"
 #include "rlgl.h"           /* rlDrawRenderBatchActive: flush the 3D batch before a screenshot */
@@ -56,7 +56,7 @@
 
 #include "imgui.h"
 #include "rlImGui.h"
-#include "bw_theme.h"       /* station theme + embedded Roboto (applyTheme / loadEmbeddedFont / uiScaled) */
+#include "bwa_theme.h"       /* station theme + embedded Roboto (applyTheme / loadEmbeddedFont / uiScaled) */
 #include "imgui_te_engine.h"
 #include "imgui_te_context.h"
 #include "imgui_te_ui.h"
@@ -168,15 +168,15 @@ static void draw_wall(Vector3 c, Vector3 u, Vector3 v, float hw, float hh, Color
 }
 
 /* ======================= shared playground state (file scope for the scene callbacks) ======================= */
-static BwEngine*   e;
-static BwSource    src, refl;
-static BwSound     sounds[NSIG];
+static bwa_engine*   e;
+static bwa_source    src, refl;
+static bwa_sound     sounds[NSIG];
 static const char* backend_name;
 static int         backend_silent;
 static const char* g_layout_path;          /* optional cave_layout.json; NULL = engine default grid */
 
 static Vector3 speakers[NSPK];
-static int     g_nspk = NSPK;     /* the engine's ACTIVE channel count (bw_get_speakers); the layout's */
+static int     g_nspk = NSPK;     /* the engine's ACTIVE channel count (bwa_get_speakers); the layout's */
 static Vector3 g_head;            /* the ear point = array centroid (the engine's nominal listening point);
                                    * room origin is on the FLOOR, so the head is NOT at the origin */
 static Vector3 source_pos = { 1.5f, 0.0f, 0.0f };   /* y re-based to ear height once the layout is known */
@@ -195,13 +195,14 @@ static Vector3       wall_c = { 0.0f, 1.2f, -2.2f };   /* standing on the floor:
 static const Vector3 wall_n = { 0, 0, 1 };
 static const float   wall_hw = 2.0f, wall_hh = 1.2f;
 static Vector3       wall_u, wall_v;
-static const char*   mat_names[] = { "concrete", "glass", "carpet", "wood", "metal" };
+static const char*   mat_names[] = { "concrete", "glass", "carpet", "wood", "metal" };   /* UI labels */
+static const bwa_material_type mat_types[] = { BWA_MAT_CONCRETE, BWA_MAT_GLASS, BWA_MAT_CARPET, BWA_MAT_WOOD, BWA_MAT_METAL };
 /* broadband reflectivity (~1 - mean absorption of the same presets): scales the image-source level so
  * the wall MATERIAL drives reflectivity too — carpet reflects far less than metal/concrete. Broadband
  * only (one DBAP voice has no per-source EQ); the full per-band material reflection is the reverb bed's job. */
 static const float   mat_refl[] = { 0.93f, 0.96f, 0.45f, 0.92f, 0.89f };
 enum { NMAT = 5 };
-static BwMaterial    mats[NMAT];
+static bwa_material    mats[NMAT];
 static int           cur_mat, refl_audible = 1, occ_audible = 1;
 static Vector3       occ_image, occ_refl_pt;     /* computed in occ_update, drawn in occ_draw3d */
 static int           occ_refl_valid, occ_occluded;
@@ -215,8 +216,8 @@ static float       dir_gain = 1.0f;
 /* channel-walk scene. chan_active/chan_kind are the REQUESTED state (keys or panel write them);
  * chan_update applies any change once per frame (old channel off, new on), so both input paths share
  * the same off/on switch. chan_applied = -1 marks "nothing driven yet" (scene entry re-applies). */
-static int   chan_active, chan_kind = BW_TEST_SINE, chan_auto;
-static int   chan_applied = -1, chan_kind_applied = BW_TEST_SINE;
+static int   chan_active, chan_kind = BWA_TEST_SINE, chan_auto;
+static int   chan_applied = -1, chan_kind_applied = BWA_TEST_SINE;
 static float chan_timer;
 
 /* camera (shared) */
@@ -225,15 +226,15 @@ static float    cam_yaw = 195.0f * DEG2RAD, cam_pitch = 25.0f * DEG2RAD, cam_dis
 
 /* register the wall quad as occluding geometry with a material token. Safe at runtime because the
  * reverb bed isn't enabled (occlusion geometry is dynamic; it locks only while the bed runs). */
-static void push_wall_mesh(BwMaterial mat) {
+static void push_wall_mesh(bwa_material mat) {
     Vector3 a  = Vector3Add(Vector3Add(wall_c, Vector3Scale(wall_u, -wall_hw)), Vector3Scale(wall_v, -wall_hh));
     Vector3 b  = Vector3Add(Vector3Add(wall_c, Vector3Scale(wall_u,  wall_hw)), Vector3Scale(wall_v, -wall_hh));
     Vector3 d  = Vector3Add(Vector3Add(wall_c, Vector3Scale(wall_u,  wall_hw)), Vector3Scale(wall_v,  wall_hh));
     Vector3 ee = Vector3Add(Vector3Add(wall_c, Vector3Scale(wall_u, -wall_hw)), Vector3Scale(wall_v,  wall_hh));
     float verts[12] = { a.x, a.y, a.z,  b.x, b.y, b.z,  d.x, d.y, d.z,  ee.x, ee.y, ee.z };
     int   tris[6]   = { 0, 1, 2,  0, 2, 3 };
-    BwMaterial tri_mat[2] = { mat, mat };
-    bw_scene_set_mesh_mat(e, verts, 4, tris, 2, tri_mat);
+    bwa_material tri_mat[2] = { mat, mat };
+    bwa_scene_set_mesh_mat(e, verts, 4, tris, 2, tri_mat);
 }
 
 /* ---- shared drawing ---- */
@@ -244,7 +245,7 @@ static float spk_lv[NSPK];      /* smoothed per-speaker activity (0..1): instant
 static void draw_speakers(int hi) {
     cv_draw(&g_con);            /* the room's bounds/no-go/obstacle boxes, same colors as the layout tool */
     float pk[NSPK] = { 0 };
-    bw_get_bus_levels(e, pk, NSPK);                             /* last block's per-channel output peak */
+    bwa_get_bus_levels(e, pk, NSPK);                             /* last block's per-channel output peak */
     const float rel = fminf(1.0f, 6.0f * GetFrameTime());       /* release one-pole (attack is instant) */
     for (int k = 0; k < g_nspk; ++k) {
         /* block peak -> display level over a 60 dB window, so quiet DBAP tails still read */
@@ -261,9 +262,9 @@ static void draw_speakers(int hi) {
     }
 }
 static void draw_head(Quaternion q) {
-    /* ear/nose axes from the ABI's room-frame identity basis (bwaudio.h BW_ROOM_*) */
-    Vector3 right = Vector3RotateByQuaternion(Vector3{ BW_ROOM_RIGHT[0], BW_ROOM_RIGHT[1], BW_ROOM_RIGHT[2] }, q);
-    Vector3 fwd   = Vector3RotateByQuaternion(Vector3{ BW_ROOM_AHEAD[0], BW_ROOM_AHEAD[1], BW_ROOM_AHEAD[2] }, q);
+    /* ear/nose axes from the ABI's room-frame identity basis (bw_audio.h BWA_ROOM_*) */
+    Vector3 right = Vector3RotateByQuaternion(Vector3{ BWA_ROOM_RIGHT[0], BWA_ROOM_RIGHT[1], BWA_ROOM_RIGHT[2] }, q);
+    Vector3 fwd   = Vector3RotateByQuaternion(Vector3{ BWA_ROOM_AHEAD[0], BWA_ROOM_AHEAD[1], BWA_ROOM_AHEAD[2] }, q);
     DrawSphere(g_head, 0.16f, SKYBLUE);
     DrawSphere(Vector3Add(g_head, Vector3Scale(right,  0.17f)), 0.055f, RED);       /* right ear -> audio R */
     DrawSphere(Vector3Add(g_head, Vector3Scale(right, -0.17f)), 0.055f, RAYWHITE);  /* left ear  -> audio L */
@@ -283,22 +284,22 @@ static Vector3 loc_trail[LOC_TRAIL];
 static int     loc_trail_len;
 
 static void loc_enter(void)  {
-    bw_source_set_gain(e, src, SRC_GAIN); loc_auto = 0; loc_flyby = 0; loc_trail_len = 0;
-    bw_source_set_doppler(e, src, loc_dop);            /* re-apply (switch_scene cleared them) */
-    bw_source_set_air_absorption(e, src, loc_air);
-    bw_source_set_spread(e, src, loc_spread);
-    bw_set_dual_band(e, loc_dual);
+    bwa_source_set_gain(e, src, SRC_GAIN); loc_auto = 0; loc_flyby = 0; loc_trail_len = 0;
+    bwa_source_set_doppler(e, src, loc_dop);            /* re-apply (switch_scene cleared them) */
+    bwa_source_set_air_absorption(e, src, loc_air);
+    bwa_source_set_spread(e, src, loc_spread);
+    bwa_set_dual_band(e, loc_dual);
 }
 static void loc_update(float dt) {
     if (kp(KEY_SPACE)) { loc_auto = !loc_auto; if (loc_auto) { loc_flyby = 0; loc_t = 0.0f; loc_trail_len = 0; } }
     if (kp(KEY_X))     { loc_flyby = !loc_flyby; if (loc_flyby) { loc_auto = 0; loc_fly_t = 0.0f; loc_trail_len = 0; } }
-    if (kp(KEY_V)) { loc_dop = !loc_dop; bw_source_set_doppler(e, src, loc_dop); }
-    if (kp(KEY_B)) { loc_air = !loc_air; bw_source_set_air_absorption(e, src, loc_air); }
+    if (kp(KEY_V)) { loc_dop = !loc_dop; bwa_source_set_doppler(e, src, loc_dop); }
+    if (kp(KEY_B)) { loc_air = !loc_air; bwa_source_set_air_absorption(e, src, loc_air); }
     if (kp(KEY_C)) {                            /* cycle source size: point -> .4 -> .7 -> wide -> point */
         loc_spread = (loc_spread < 0.05f) ? 0.4f : (loc_spread < 0.5f) ? 0.7f : (loc_spread < 0.85f) ? 1.0f : 0.0f;
-        bw_source_set_spread(e, src, loc_spread);
+        bwa_source_set_spread(e, src, loc_spread);
     }
-    if (kp(KEY_M)) { loc_dual = !loc_dual; bw_set_dual_band(e, loc_dual); }   /* dual-band A/B */
+    if (kp(KEY_M)) { loc_dual = !loc_dual; bwa_set_dual_band(e, loc_dual); }   /* dual-band A/B */
     if (loc_flyby) {                                      /* fast straight pass 0.8 m in front: the Doppler demo */
         loc_fly_t += dt;
         float period = 3.6f, u = fmodf(loc_fly_t, period) / period;     /* there-and-back, ~7.8 m/s */
@@ -315,8 +316,8 @@ static void loc_update(float dt) {
         if (loc_trail_len < LOC_TRAIL) loc_trail[loc_trail_len++] = source_pos;
         else { memmove(loc_trail, loc_trail + 1, (LOC_TRAIL - 1) * sizeof(Vector3)); loc_trail[LOC_TRAIL - 1] = source_pos; }
     }
-    bw_source_set_pos(e, src, source_pos.x, source_pos.y, source_pos.z);
-    bw_source_set_gain(e, src, SRC_GAIN);
+    bwa_source_set_pos(e, src, source_pos.x, source_pos.y, source_pos.z);
+    bwa_source_set_gain(e, src, SRC_GAIN);
 }
 static void loc_draw3d(void) {
     if (loc_auto) {
@@ -329,8 +330,8 @@ static void loc_draw3d(void) {
 }
 /* ====================== Scene 2: Occlusion & Materials (real Steam Audio) ====================== */
 static void occ_enter(void) {
-    bw_source_set_gain(e, src, SRC_GAIN);
-    bw_source_set_occlusion(e, src, occ_audible);
+    bwa_source_set_gain(e, src, SRC_GAIN);
+    bwa_source_set_occlusion(e, src, occ_audible);
     push_wall_mesh(mats[cur_mat]);
 }
 static void occ_update(float dt) {
@@ -341,7 +342,7 @@ static void occ_update(float dt) {
     }
     if (kp(KEY_M)) { cur_mat = (cur_mat + 1) % NMAT; push_wall_mesh(mats[cur_mat]); }
     if (kp(KEY_T)) refl_audible = !refl_audible;
-    if (kp(KEY_G)) { occ_audible = !occ_audible; bw_source_set_occlusion(e, src, occ_audible); }
+    if (kp(KEY_G)) { occ_audible = !occ_audible; bwa_source_set_occlusion(e, src, occ_audible); }
 
     /* reflection: the source mirrored across the wall is valid when source + listener are on the same
      * side and the bounce lands on the panel. occlusion: the direct path crosses the panel. */
@@ -353,12 +354,12 @@ static void occ_update(float dt) {
     if (same_side && seg_plane(L, occ_image, wall_c, wall_n, &t, &hit) && t > 0 && t < 1 &&
         in_panel(hit, wall_c, wall_u, wall_v, wall_hw, wall_hh)) { occ_refl_valid = 1; occ_refl_pt = hit; }
 
-    bw_source_set_pos(e, src, source_pos.x, source_pos.y, source_pos.z);
-    bw_source_set_gain(e, src, SRC_GAIN);                       /* occlusion is applied by the engine */
-    bw_source_set_pos(e, refl, occ_image.x, occ_image.y, occ_image.z);
-    bw_source_set_gain(e, refl, (refl_audible && occ_refl_valid) ? SRC_GAIN * REFL_GAIN * mat_refl[cur_mat] : 0.0f);
+    bwa_source_set_pos(e, src, source_pos.x, source_pos.y, source_pos.z);
+    bwa_source_set_gain(e, src, SRC_GAIN);                       /* occlusion is applied by the engine */
+    bwa_source_set_pos(e, refl, occ_image.x, occ_image.y, occ_image.z);
+    bwa_source_set_gain(e, refl, (refl_audible && occ_refl_valid) ? SRC_GAIN * REFL_GAIN * mat_refl[cur_mat] : 0.0f);
 
-    occ_factor   = bw_source_get_occlusion(e, src);             /* real Steam Audio occlusion (1 = clear) */
+    occ_factor   = bwa_source_get_occlusion(e, src);             /* real Steam Audio occlusion (1 = clear) */
     occ_occluded = occ_factor < 0.85f;
 }
 static void occ_draw3d(void) {
@@ -376,19 +377,19 @@ static void occ_draw3d(void) {
 }
 /* ============================= Scene 3: Directivity (weighted dipole) ============================= */
 static void dir_enter(void) {
-    bw_source_set_gain(e, src, SRC_GAIN);
-    bw_source_set_directivity_preset(e, src, (BwDirectivity)cur_dir);
+    bwa_source_set_gain(e, src, SRC_GAIN);
+    bwa_source_set_directivity_preset(e, src, (bwa_directivity)cur_dir);
 }
 static void dir_update(float dt) {
     float rt = 1.8f * dt;
-    if (kp(KEY_Z)) { cur_dir = (cur_dir + 1) % 3; bw_source_set_directivity_preset(e, src, (BwDirectivity)cur_dir); }
+    if (kp(KEY_Z)) { cur_dir = (cur_dir + 1) % 3; bwa_source_set_directivity_preset(e, src, (bwa_directivity)cur_dir); }
     if (kd(KEY_COMMA))  source_yaw += rt;
     if (kd(KEY_PERIOD)) source_yaw -= rt;
     Quaternion sq = QuaternionFromAxisAngle(Vector3{ 0, 1, 0 }, source_yaw);
-    bw_source_set_pos(e, src, source_pos.x, source_pos.y, source_pos.z);
-    bw_source_set_gain(e, src, SRC_GAIN);
-    bw_source_set_orientation(e, src, sq.x, sq.y, sq.z, sq.w);
-    dir_gain = bw_source_get_directivity(e, src);              /* 1 = on-axis/omni .. 0 = null */
+    bwa_source_set_pos(e, src, source_pos.x, source_pos.y, source_pos.z);
+    bwa_source_set_gain(e, src, SRC_GAIN);
+    bwa_source_set_orientation(e, src, sq.x, sq.y, sq.z, sq.w);
+    dir_gain = bwa_source_get_directivity(e, src);              /* 1 = on-axis/omni .. 0 = null */
 }
 static void dir_draw3d(void) {
     DrawLine3D(g_head, source_pos, Color{ 90, 220, 90, 180 });
@@ -406,11 +407,11 @@ static void dir_draw3d(void) {
         prev = p;
     }
 }
-/* ============================= Scene 4: Channel walk (bw_test_signal) ============================= */
-static void chan_set(int ch) { bw_test_signal(e, (uint32_t)ch, (BwTestKind)chan_kind, TEST_GAIN); }
+/* ============================= Scene 4: Channel walk (bwa_set_test_signal) ============================= */
+static void chan_set(int ch) { bwa_set_test_signal(e, (uint32_t)ch, (bwa_test_kind)chan_kind, TEST_GAIN); }
 static void chan_enter(void) {
-    bw_source_set_gain(e, src,  0.0f);          /* silence the spatial voices; only the test tone sounds */
-    bw_source_set_gain(e, refl, 0.0f);
+    bwa_source_set_gain(e, src,  0.0f);          /* silence the spatial voices; only the test tone sounds */
+    bwa_source_set_gain(e, refl, 0.0f);
     chan_timer = 0.0f;
     chan_auto  = 0;                             /* start manual each visit (don't resume a prior auto-walk) */
     chan_set(chan_active);
@@ -419,11 +420,11 @@ static void chan_enter(void) {
 static void chan_update(float dt) {
     if (kp(KEY_RIGHT)) chan_active = (chan_active + 1) % g_nspk;
     if (kp(KEY_LEFT))  chan_active = (chan_active + g_nspk - 1) % g_nspk;
-    if (kp(KEY_N))     chan_kind = (chan_kind == BW_TEST_SINE) ? BW_TEST_NOISE : BW_TEST_SINE;
+    if (kp(KEY_N))     chan_kind = (chan_kind == BWA_TEST_SINE) ? BWA_TEST_NOISE : BWA_TEST_SINE;
     if (kp(KEY_SPACE)) chan_auto = !chan_auto;
     if (chan_auto && (chan_timer += dt) >= 0.7f) { chan_timer = 0.0f; chan_active = (chan_active + 1) % g_nspk; }
     if (chan_active != chan_applied || chan_kind != chan_kind_applied) {   /* keys OR the panel moved it */
-        if (chan_applied >= 0) bw_test_signal(e, (uint32_t)chan_applied, BW_TEST_OFF, 0.0f);
+        if (chan_applied >= 0) bwa_set_test_signal(e, (uint32_t)chan_applied, BWA_TEST_OFF, 0.0f);
         chan_set(chan_active);
         chan_applied = chan_active; chan_kind_applied = chan_kind;
     }
@@ -440,11 +441,11 @@ static void chan_draw3d(void) {
  * "sounds different to me" into a measurement. These are exactly the by-ear judgments the automated
  * tests can't make: dual-band panning, panner choice, source spread, air absorption. */
 typedef struct { const char* name; const char* a; const char* b; void (*apply)(int v); } AbxCmp;
-static void abx_ap_dual (int v) { bw_set_dual_band(e, v); }
-static void abx_ap_spcap(int v) { bw_set_panner(e, v ? BW_PAN_SPCAP : BW_PAN_DBAP); }
-static void abx_ap_vbap (int v) { bw_set_panner(e, v ? BW_PAN_VBAP  : BW_PAN_DBAP); }
-static void abx_ap_sprd (int v) { bw_source_set_spread(e, src, v ? 0.6f : 0.0f); }
-static void abx_ap_air  (int v) { bw_source_set_air_absorption(e, src, v); }
+static void abx_ap_dual (int v) { bwa_set_dual_band(e, v); }
+static void abx_ap_spcap(int v) { bwa_set_panner(e, v ? BWA_PAN_SPCAP : BWA_PAN_DBAP); }
+static void abx_ap_vbap (int v) { bwa_set_panner(e, v ? BWA_PAN_VBAP  : BWA_PAN_DBAP); }
+static void abx_ap_sprd (int v) { bwa_source_set_spread(e, src, v ? 0.6f : 0.0f); }
+static void abx_ap_air  (int v) { bwa_source_set_air_absorption(e, src, v); }
 static const AbxCmp abx_cmps[] = {
     { "dual-band panning",     "single-band (power)", "dual-band (LF amplitude)", abx_ap_dual  },
     { "panner: DBAP vs SPCAP", "DBAP",                "SPCAP",                    abx_ap_spcap },
@@ -467,10 +468,10 @@ static double abx_pvalue(int n, int k) {         /* one-sided binomial tail P(co
 /* every knob back to baseline, then the tested knob to whichever variant we're listening to — so
  * switching COMPARISONS can't leave the previous knob stuck on its B setting. */
 static void abx_apply_listen(void) {
-    bw_set_dual_band(e, false);
-    bw_set_panner(e, BW_PAN_DBAP);
-    bw_source_set_spread(e, src, 0.0f);
-    bw_source_set_air_absorption(e, src, false);
+    bwa_set_dual_band(e, false);
+    bwa_set_panner(e, BWA_PAN_DBAP);
+    bwa_source_set_spread(e, src, 0.0f);
+    bwa_source_set_air_absorption(e, src, false);
     abx_cmps[abx_cmp].apply(abx_listen == 2 ? abx_x : abx_listen);
 }
 static void abx_new_trial(void) { abx_x = GetRandomValue(0, 1); abx_listen = 2; abx_apply_listen(); }
@@ -483,7 +484,7 @@ static void abx_answer(int guess) {
     abx_new_trial();                             /* reveal + immediately deal the next X */
 }
 static void abx_enter(void) {
-    bw_source_set_gain(e, src, SRC_GAIN);
+    bwa_source_set_gain(e, src, SRC_GAIN);
     abx_orbit = 1; abx_orbit_t = 0.0f;           /* default: slow orbit — motion exposes panner differences */
     abx_new_trial();                             /* keep the tally across visits; only X is redrawn */
 }
@@ -501,15 +502,15 @@ static void abx_update(float dt) {
         source_pos = Vector3{ 2.2f * cosf(az), g_head.y + 0.5f * sinf(0.31f * abx_orbit_t), 2.2f * sinf(az) };
     }
     if (abx_flash_t > 0.0f) { abx_flash_t -= dt; if (abx_flash_t < 0.0f) abx_flash_t = 0.0f; }
-    bw_source_set_pos(e, src, source_pos.x, source_pos.y, source_pos.z);
-    bw_source_set_gain(e, src, SRC_GAIN);
+    bwa_source_set_pos(e, src, source_pos.x, source_pos.y, source_pos.z);
+    bwa_source_set_gain(e, src, SRC_GAIN);
 }
 static void abx_draw3d(void) {
     DrawLine3D(g_head, source_pos, Color{ 90, 220, 90, 200 });
     DrawSphere(source_pos, 0.18f, RED);
 }
 /* ============================= Scene 6: Reverb bed (static room) ============================= */
-/* The hybrid reverb bed needs reflections configured + the room geometry set BEFORE bw_start (the
+/* The hybrid reverb bed needs reflections configured + the room geometry set BEFORE bwa_start (the
  * scene locks once the bed runs), so this scene runs on a SEPARATE engine config — build_engine()
  * rebuilds the engine when crossing this boundary (see switch_scene). */
 #define ROOM_W 8.0f
@@ -521,28 +522,28 @@ static int   rev_decoder;                          /* bed decoder: 0 = sampling 
 static int   rev_dist;                             /* distance->wet send (V): near = drier, far = wetter */
 
 static void rev_enter(void) {
-    bw_source_set_gain(e, src, SRC_GAIN);
-    bw_source_set_reflections(e, src, rev_on);    /* feed the source into the shared reverb bed */
-    bw_source_set_reflection_distance(e, src, rev_dist);
-    bw_reflections_set_gain(e, rev_wet);
+    bwa_source_set_gain(e, src, SRC_GAIN);
+    bwa_source_set_reflections(e, src, rev_on);    /* feed the source into the shared reverb bed */
+    bwa_source_set_reflection_distance(e, src, rev_dist);
+    bwa_reflections_set_gain(e, rev_wet);
 }
 static void rev_update(float dt) {
     if (kp(KEY_B)) {                     /* A/B the bed decoder: load-time, so rebuild the engine */
         rev_decoder ^= 1;
-        if (e) { bw_stop(e); bw_destroy(e); e = NULL; }
+        if (e) { bwa_stop(e); bwa_destroy(e); e = NULL; }
         build_engine(1);
         rev_enter();                               /* re-apply source gain + reflections + wet on the new engine */
     }
-    if (kp(KEY_G)) { rev_on = !rev_on; bw_source_set_reflections(e, src, rev_on); }
-    if (kp(KEY_V)) { rev_dist = !rev_dist; bw_source_set_reflection_distance(e, src, rev_dist); }
+    if (kp(KEY_G)) { rev_on = !rev_on; bwa_source_set_reflections(e, src, rev_on); }
+    if (kp(KEY_V)) { rev_dist = !rev_dist; bwa_source_set_reflection_distance(e, src, rev_dist); }
     if (kd(KEY_LEFT_BRACKET))  rev_wet = fmaxf(0.0f, rev_wet - 0.7f * dt);
     if (kd(KEY_RIGHT_BRACKET)) rev_wet = fminf(2.0f, rev_wet + 0.7f * dt);
-    bw_reflections_set_gain(e, rev_wet);
+    bwa_reflections_set_gain(e, rev_wet);
     source_pos.x = Clamp(source_pos.x, -ROOM_W * 0.5f + 0.5f, ROOM_W * 0.5f - 0.5f); /* keep it inside the room */
     source_pos.y = Clamp(source_pos.y, 0.5f, ROOM_H - 0.5f);                         /* floor-based box: y 0..H */
     source_pos.z = Clamp(source_pos.z, -ROOM_D * 0.5f + 0.5f, ROOM_D * 0.5f - 0.5f);
-    bw_source_set_pos(e, src, source_pos.x, source_pos.y, source_pos.z);
-    bw_source_set_gain(e, src, SRC_GAIN);
+    bwa_source_set_pos(e, src, source_pos.x, source_pos.y, source_pos.z);
+    bwa_source_set_gain(e, src, SRC_GAIN);
 }
 static void rev_draw3d(void) {
     DrawCubeWires(Vector3{ 0, ROOM_H * 0.5f, 0 }, ROOM_W, ROOM_H, ROOM_D, Color{ 90, 110, 150, 130 });
@@ -570,41 +571,45 @@ static int engine_has_reverb;       /* which config the live engine was built in
 
 /* (re)build the engine in the interactive (no-bed, dynamic geometry) or reverb (bed + static room)
  * config, reloading assets + recreating sources. Used at startup and on each reverb-boundary switch. */
+static bwa_sink_type g_sink_mode = BWA_SINK_AUTO;   /* --tests forces BWA_SINK_NULL (hermetic) */
+static const char*   g_asio_driver = NULL;          /* --driver <name>; NULL = auto-pick */
+
 static void build_engine(int with_reverb) {
-    BwConfig cfg = {
-        .profile = BW_PROFILE_BINAURAL, .layout_path = g_layout_path, .hrtf_path = NULL,
-        .sample_rate = SR, .block_size = 256, .track_internal = false,
+    bwa_desc cfg = {
+        .profile = BWA_PROFILE_BINAURAL, .layout_path = g_layout_path, .hrtf_path = NULL,
+        .sample_rate = SR, .block_size = 256, .sink = g_sink_mode, .asio_driver = g_asio_driver,
+        /* create-time: only the reverb scene cares, but it's harmless for the others */
+        .bed_decoder = rev_decoder ? BWA_DECODE_ALLRAD : BWA_DECODE_SAMPLING,
     };
-    e = bw_create(&cfg);
-    if (!e) { printf("bw_create failed\n"); exit(1); }
+    e = bwa_create(&cfg);
+    if (!e) { printf("bwa_create failed\n"); exit(1); }
     if (with_reverb) {
-        BwReflectionConfig rc = { .ir_seconds = 1.0f, .order = 1, .num_rays = 4096,
-                                  .num_bounces = 16, .enabled = 1, .wet_gain = 1.0f };
-        bw_reflections_config(e, &rc);
-        BwMaterial rm = bw_material_preset(e, "plaster");
-        BwMaterial faces[6] = { rm, rm, rm, rm, rm, rm };
-        bw_scene_set_box(e, ROOM_W, ROOM_H, ROOM_D, faces);     /* static room, BEFORE bw_start */
-        bw_set_bed_decoder(e, rev_decoder ? BW_DECODE_ALLRAD : BW_DECODE_SAMPLING);  /* load-time */
+        bwa_reflections_desc rc = { .ir_seconds = 1.0f, .order = 1, .num_rays = 4096,
+                                  .num_bounces = 16, .enabled = 1 };
+        bwa_reflections_config(e, &rc);
+        bwa_material rm = bwa_material_preset(e, BWA_MAT_PLASTER);
+        bwa_material faces[6] = { rm, rm, rm, rm, rm, rm };
+        bwa_scene_set_box(e, ROOM_W, ROOM_H, ROOM_D, faces);     /* static room, BEFORE bwa_start */
     }
-    if (bw_start(e) != 0) {
-        const char* err = bw_last_error(e);
-        printf("bw_start: %s — no audio (install/select an ASIO driver, e.g. ASIO4ALL); the scene still runs.\n",
+    if (bwa_start(e) != 0) {
+        const char* err = bwa_last_error(e);
+        printf("bwa_start: %s — no audio (install/select an ASIO driver, e.g. ASIO4ALL); the scene still runs.\n",
                err ? err : "?");
     }
-    backend_name   = bw_audio_backend(e);
+    backend_name   = bwa_get_audio_backend(e);
     backend_silent = (strncmp(backend_name, "asio", 4) != 0);
-    g_nspk = (int)bw_get_speakers(e, (float*)speakers, NSPK);   /* the geometry AND count the engine pans with */
+    g_nspk = (int)bwa_get_speakers(e, (float*)speakers, NSPK);   /* the geometry AND count the engine pans with */
     if (g_nspk < 1) g_nspk = 1;                          /* (a layout always has >= 4; keep the divides safe) */
     if (chan_active >= g_nspk) chan_active = 0;          /* a smaller array may have retired the walked channel */
     g_head = Vector3{ 0, 0, 0 };                         /* ear point = array centroid (the engine's own ref) */
     for (int i = 0; i < g_nspk; ++i) g_head = Vector3Add(g_head, speakers[i]);
     g_head = Vector3Scale(g_head, 1.0f / (float)g_nspk);
-    for (int i = 0; i < NSIG; ++i) sounds[i] = bw_load_sound(e, sig_files[i]);
-    for (int i = 0; i < NMAT; ++i) mats[i] = bw_material_preset(e, mat_names[i]);
-    src  = bw_source_create(e);  bw_source_play(e, src,  sounds[cur_sig], true);
-    refl = bw_source_create(e);  bw_source_play(e, refl, sounds[cur_sig], true);
-    bw_source_set_gain(e, refl, 0.0f);
-    if (with_reverb) bw_source_set_reflections(e, src, rev_on);
+    for (int i = 0; i < NSIG; ++i) sounds[i] = bwa_load_sound(e, sig_files[i]);
+    for (int i = 0; i < NMAT; ++i) mats[i] = bwa_material_preset(e, mat_types[i]);
+    src  = bwa_source_create(e);  bwa_source_play(e, src,  sounds[cur_sig], true);
+    refl = bwa_source_create(e);  bwa_source_play(e, refl, sounds[cur_sig], true);
+    bwa_source_set_gain(e, refl, 0.0f);
+    if (with_reverb) bwa_source_set_reflections(e, src, rev_on);
     engine_has_reverb = with_reverb;
 }
 
@@ -614,21 +619,21 @@ static void switch_scene(int idx) {
     int want_reverb = (idx == SCENE_REVERB);
     if (want_reverb != engine_has_reverb) {
         printf("rebuilding engine: %s\n", want_reverb ? "reverb (bed + static room)" : "interactive");
-        if (e) { bw_stop(e); bw_destroy(e); e = NULL; }
+        if (e) { bwa_stop(e); bwa_destroy(e); e = NULL; }
         build_engine(want_reverb);
     }
-    for (uint32_t ch = 0; ch < (uint32_t)g_nspk; ++ch) bw_test_signal(e, ch, BW_TEST_OFF, 0.0f);  /* clear channel walk */
-    bw_source_set_gain(e, refl, 0.0f);
-    bw_source_set_occlusion(e, src, false);
-    bw_source_set_directivity_preset(e, src, BW_DIR_OMNI);
-    bw_source_set_orientation(e, src, 0.0f, 0.0f, 0.0f, 1.0f);   /* clear any aim left by the directivity scene */
-    bw_source_set_doppler(e, src, false);                        /* propagation/size effects are localization-scene only */
-    bw_source_set_air_absorption(e, src, false);
-    bw_source_set_spread(e, src, 0.0f);
-    bw_set_dual_band(e, false);
-    bw_set_panner(e, BW_PAN_DBAP);                               /* the ABX scene may leave SPCAP/VBAP selected */
+    for (uint32_t ch = 0; ch < (uint32_t)g_nspk; ++ch) bwa_set_test_signal(e, ch, BWA_TEST_OFF, 0.0f);  /* clear channel walk */
+    bwa_source_set_gain(e, refl, 0.0f);
+    bwa_source_set_occlusion(e, src, false);
+    bwa_source_set_directivity_preset(e, src, BWA_DIR_OMNI);
+    bwa_source_set_orientation(e, src, 0.0f, 0.0f, 0.0f, 1.0f);   /* clear any aim left by the directivity scene */
+    bwa_source_set_doppler(e, src, false);                        /* propagation/size effects are localization-scene only */
+    bwa_source_set_air_absorption(e, src, false);
+    bwa_source_set_spread(e, src, 0.0f);
+    bwa_set_dual_band(e, false);
+    bwa_set_panner(e, BWA_PAN_DBAP);                               /* the ABX scene may leave SPCAP/VBAP selected */
     source_yaw = 0.0f;
-    bw_source_set_gain(e, src, SRC_GAIN);
+    bwa_source_set_gain(e, src, SRC_GAIN);
     cur_scene = idx;
     scenes[idx].enter();
 }
@@ -663,13 +668,13 @@ static void draw_panel(void) {
     }
     ImGui::TextDisabled("TAB scene  WASD/RF source  Q/E head  F11  ESC");
 
-    /* audio status + live output meters (bw_get_bus_levels -> spk_lv, the same data shading the 3D gizmos) */
+    /* audio status + live output meters (bwa_get_bus_levels -> spk_lv, the same data shading the 3D gizmos) */
     ImGui::SeparatorText("output");
     if (backend_silent) ImGui::TextColored(ImVec4(1.00f, 0.45f, 0.45f, 1.0f), "audio: %s - NO SOUND", backend_name);
     else                ImGui::TextColored(ImVec4(0.45f, 0.92f, 0.55f, 1.0f), "audio: %s", backend_name);
     if (backend_silent && ImGui::IsItemHovered(ImGuiHoveredFlags_ForTooltip))
         ImGui::SetTooltip("no ASIO device opened - the offline null sink renders silently\n"
-                          "(set BWAUDIO_ASIO_DRIVER to your headphone driver)");
+                          "(run with --driver <your headphone driver>)");
     char mlabel[48];
     snprintf(mlabel, sizeof mlabel, "speakers 0-%d (60 dB window)", g_nspk - 1);
     ImGui::PlotHistogram("##meters", spk_lv, g_nspk, 0, mlabel, 0.0f, 1.0f,
@@ -680,8 +685,8 @@ static void draw_panel(void) {
     for (int i = 0; i < NSIG; ++i) {
         if (ImGui::RadioButton(SIG_NAMES[i], cur_sig == i) && cur_sig != i) {
             cur_sig = i;
-            bw_source_play(e, src,  sounds[i], true);
-            bw_source_play(e, refl, sounds[i], true);
+            bwa_source_play(e, src,  sounds[i], true);
+            bwa_source_play(e, refl, sounds[i], true);
         }
     }
 
@@ -691,17 +696,17 @@ static void draw_panel(void) {
         bwTip("orbit the source around the head - listen for smooth motion, no zipper");
         if (chk("fast flyby [X]", &loc_flyby) && loc_flyby) { loc_auto = 0; loc_fly_t = 0.0f; loc_trail_len = 0; }
         bwTip("a fast close pass - the speed Doppler needs to be obvious");
-        if (chk("Doppler [V]", &loc_dop))            bw_source_set_doppler(e, src, loc_dop);
+        if (chk("Doppler [V]", &loc_dop))            bwa_source_set_doppler(e, src, loc_dop);
         bwTip("renders the true propagation delay: pitch up approaching, down receding "
               "(subtle at orbit speed - pair it with fast flyby)");
-        if (chk("air absorption [B]", &loc_air))     bw_source_set_air_absorption(e, src, loc_air);
+        if (chk("air absorption [B]", &loc_air))     bwa_source_set_air_absorption(e, src, loc_air);
         bwTip("distance-driven high-frequency roll-off: far sources sound duller");
-        if (chk("dual-band panning [M]", &loc_dual)) bw_set_dual_band(e, loc_dual);
+        if (chk("dual-band panning [M]", &loc_dual)) bwa_set_dual_band(e, loc_dual);
         bwTip("below ~700 Hz pans amplitude-normalised - sharper bass localisation "
               "near the sweet spot; toggle it live and compare");
         ImGui::SetNextItemWidth(-FLT_MIN);
         if (ImGui::SliderFloat("##spread", &loc_spread, 0.0f, 1.0f, "size %.2f [C]"))
-            bw_source_set_spread(e, src, loc_spread);
+            bwa_source_set_spread(e, src, loc_spread);
         bwTip("angular width: 0 = point source, 1 = wide - a crowd or waterfall "
               "that shouldn't collapse to a point");
         ImGui::TextDisabled("source (%.2f, %.2f, %.2f)  head %.0f deg",
@@ -715,7 +720,7 @@ static void draw_panel(void) {
               "the occluded sound gets) and reflectivity");
         chk("audible reflection [T]", &refl_audible);
         bwTip("the wall throws an image-source reflection when the source is in front of it");
-        if (chk("occlusion [G]", &occ_audible)) bw_source_set_occlusion(e, src, occ_audible);
+        if (chk("occlusion [G]", &occ_audible)) bwa_source_set_occlusion(e, src, occ_audible);
         bwTip("ray-traced: the wall between source and listener attenuates AND muffles "
               "it (per-band transmission EQ), ramped - not a hard mute");
         ImGui::TextDisabled("[ ] keys slide the wall");
@@ -728,7 +733,7 @@ static void draw_panel(void) {
         int d = cur_dir;
         if (ImGui::Combo("##dir", &d, dir_names, 3) && d != cur_dir) {
             cur_dir = d;
-            bw_source_set_directivity_preset(e, src, (BwDirectivity)cur_dir);
+            bwa_source_set_directivity_preset(e, src, (bwa_directivity)cur_dir);
         }
         bwTip("radiation pattern: omni (no directivity), cardioid (one-sided), "
               "figure-8 (dipole with a null at 90 degrees)");
@@ -739,9 +744,9 @@ static void draw_panel(void) {
     } else if (cur_scene == 3) {                          /* Channel walk */
         ImGui::SetNextItemWidth(-FLT_MIN);
         ImGui::SliderInt("##chan", &chan_active, 0, g_nspk - 1, "channel %d [LEFT/RIGHT]");
-        if (ImGui::RadioButton("660 Hz sine [N]", chan_kind == BW_TEST_SINE)) chan_kind = BW_TEST_SINE;
+        if (ImGui::RadioButton("660 Hz sine [N]", chan_kind == BWA_TEST_SINE)) chan_kind = BWA_TEST_SINE;
         ImGui::SameLine();
-        if (ImGui::RadioButton("noise", chan_kind == BW_TEST_NOISE)) chan_kind = BW_TEST_NOISE;
+        if (ImGui::RadioButton("noise", chan_kind == BWA_TEST_NOISE)) chan_kind = BWA_TEST_NOISE;
         chk("auto-walk [SPACE]", &chan_auto);
         Vector3 p = speakers[chan_active];
         ImGui::TextDisabled("speaker (%.2f, %.2f, %.2f)", p.x, p.y, p.z);
@@ -781,12 +786,12 @@ static void draw_panel(void) {
             ImGui::TextWrapped("listen to A, B, X (switching is seamless - that's the point), then answer.");
         }
     } else {                                              /* Reverb bed */
-        if (chk("reverb send [G]", &rev_on)) bw_source_set_reflections(e, src, rev_on);
+        if (chk("reverb send [G]", &rev_on)) bwa_source_set_reflections(e, src, rev_on);
         bwTip("opt the source into the shared reverb bed's wet send");
         ImGui::SetNextItemWidth(-FLT_MIN);
         ImGui::SliderFloat("##wet", &rev_wet, 0.0f, 2.0f, "wet %.2f  [ ] keys");   /* applied per frame in rev_update */
-        bwTip("live wet level of the whole bed (bw_reflections_set_gain)");
-        if (chk("distance->wet [V]", &rev_dist)) bw_source_set_reflection_distance(e, src, rev_dist);
+        bwTip("live wet level of the whole bed (bwa_reflections_set_gain)");
+        if (chk("distance->wet [V]", &rev_dist)) bwa_source_set_reflection_distance(e, src, rev_dist);
         bwTip("near = drier, far = wetter - walk the source away (WASD) and hear "
               "the room take over");
         ImGui::SetNextItemWidth(-FLT_MIN);
@@ -794,7 +799,7 @@ static void draw_panel(void) {
         const char* dec_names[2] = { "bed decoder: sampling (SAD)", "bed decoder: AllRAD" };
         if (ImGui::Combo("##dec", &dec, dec_names, 2) && dec != rev_decoder) {   /* load-time: rebuild the engine */
             rev_decoder = dec;
-            if (e) { bw_stop(e); bw_destroy(e); e = NULL; }
+            if (e) { bwa_stop(e); bwa_destroy(e); e = NULL; }
             build_engine(1);
             rev_enter();
         }
@@ -833,7 +838,7 @@ static bool screen_capture(ImGuiID viewport_id, int x, int y, int w, int h, unsi
 /* engine-liveness helper for the tests: current max output-channel peak (0 while dead or silent) */
 static float meters_max(uint32_t* count_out) {
     float pk[NSPK] = { 0 };
-    uint32_t n = bw_get_bus_levels(e, pk, NSPK);
+    uint32_t n = bwa_get_bus_levels(e, pk, NSPK);
     if (count_out) *count_out = n;
     float m = 0.0f;
     for (uint32_t i = 0; i < n; ++i) if (pk[i] > m) m = pk[i];
@@ -866,7 +871,7 @@ static void register_tests(ImGuiTestEngine* te) {
     };
 
     /* THE regression this harness exists to pin: with no ASIO device (the suite forces
-     * BWAUDIO_SINK=null) the engine must still be LIVE — null-sink fallback rendering in real
+     * BWA_SINK_NULL) the engine must still be LIVE — null-sink fallback rendering in real
      * time, output meters flowing. A dead engine here once shipped as "visual-only mode". */
     t = IM_REGISTER_TEST(te, "viewer", "meters_live");
     t->TestFunc = [](ImGuiTestContext* ctx) {
@@ -953,12 +958,13 @@ int main(int argc, char** argv) {
     char filter[64] = "";
     for (int i = 1; i < argc; ++i)
         if (!strcmp(argv[i], "--help") || !strcmp(argv[i], "-h")) {
-            printf("usage: bw_playground [cave_layout.json] [--tests [filter]]\n"
+            printf("usage: bwa_playground [cave_layout.json] [--driver <asio driver>] [--tests [filter]]\n"
                    "  audition the engine by ear on the binaural monitor (auto-picked 2-ch ASIO\n"
                    "  driver; with no device it renders silently -- visual-only mode stays live)\n"
                    "  cave_layout.json   optional surveyed layout (default: ./cave_layout.json if\n"
                    "                     present, else the built-in grid); ./constraints.json is\n"
                    "                     drawn for orientation if present\n"
+                   "  --driver <name>    ASIO driver to open (default: auto-pick a 2-ch one)\n"
                    "  --tests [filter]   run the UI test suite (offline) and exit pass/fail\n"
                    "  keys: TAB scene | WASD/RF source | Q/E head | 1-4 signal | SPACE auto-move | F11\n");
             return 0;
@@ -967,18 +973,20 @@ int main(int argc, char** argv) {
         if (!strcmp(argv[i], "--tests") || !strcmp(argv[i], "--selftest")) {
             selftest = true;
             if (i + 1 < argc && argv[i + 1][0] != '-') snprintf(filter, sizeof filter, "%s", argv[i + 1]);
+        } else if (!strcmp(argv[i], "--driver") && i + 1 < argc) {
+            g_asio_driver = argv[++i];                        /* pin the headphone driver (bwa_desc.asio_driver) */
         }
-    if (selftest) _putenv((char*)"BWAUDIO_SINK=null");
+    if (selftest) g_sink_mode = BWA_SINK_NULL;
 
-    /* Sink policy (interactive): engine default — try a 2-ch ASIO driver for headphones, fall back
-     * to the offline null sink. Do NOT force BWAUDIO_SINK=asio: the fallback is what keeps
+    /* Sink policy (interactive): engine default (AUTO) — try a 2-ch ASIO driver for headphones, fall
+     * back to the offline null sink. Do NOT demand BWA_SINK_ASIO: the fallback is what keeps
      * visual-only mode live (no device -> the engine still renders in real time, so speaker
      * activity, panning and occlusion still animate, just silent). The panel's audio line +
      * meters keep the no-audio state visible. */
 
     /* optional surveyed layout: argv[1], else ./cave_layout.json if present, else the default grid.
      * selftest always uses the default grid — the suite must not depend on a machine-local file. */
-    g_layout_path = (!selftest && argc > 1) ? argv[1] : NULL;
+    g_layout_path = (!selftest && argc > 1 && argv[1][0] != '-') ? argv[1] : NULL;
     if (!selftest && !g_layout_path) {
         FILE* lf = fopen("cave_layout.json", "rb");
         if (lf) { fclose(lf); g_layout_path = "cave_layout.json"; }
@@ -994,14 +1002,14 @@ int main(int argc, char** argv) {
     build_engine(0);                                          /* start in the interactive config (fills speakers[], g_head) */
     source_pos.y = g_head.y;                                  /* start the source on the ear plane */
     printf("layout: %s    audio backend: %s%s\n", g_layout_path ? g_layout_path : "default grid", backend_name,
-           backend_silent ? "   (SILENT — set BWAUDIO_ASIO_DRIVER to your headphone driver)" : "");
+           backend_silent ? "   (SILENT — run with --driver <your headphone driver>)" : "");
     if (cv_load("constraints.json", &g_con))                  /* orientation only; the layout tool edits against these */
         printf("constraints: bounds + %d no-go + %d obstacle box(es) drawn from ./constraints.json\n", g_con.nnogo, g_con.nobst);
 
     /* No FLAG_WINDOW_HIGHDPI: framebuffer == window pixels keeps rlImGui's scale at 1 so the test
      * engine's screenshots/scissors stay 1:1; DPI rides the theme's FontScaleMain (layout_tool's pattern). */
     SetConfigFlags(FLAG_MSAA_4X_HINT | (selftest ? FLAG_WINDOW_UNFOCUSED : 0));
-    InitWindow(1280, 800, "bwaudio - binaural playground");
+    InitWindow(1280, 800, "bw_audio - binaural playground");
     SetExitKey(KEY_NULL);                                     /* ESC handled below (must not quit while typing) */
     SetRandomSeed(selftest ? 42u : (unsigned int)time(NULL)); /* ABX X-draws: deterministic only under test */
     SetTargetFPS(selftest ? 0 : 60);                          /* selftest: run the suite unthrottled */
@@ -1059,8 +1067,8 @@ int main(int argc, char** argv) {
         for (int i = 0; i < NSIG; ++i)              /* 1-4: switch the test signal everywhere */
             if (kp(KEY_ONE + i)) {
                 cur_sig = i;
-                bw_source_play(e, src,  sounds[i], true);
-                bw_source_play(e, refl, sounds[i], true);
+                bwa_source_play(e, src,  sounds[i], true);
+                bwa_source_play(e, refl, sounds[i], true);
             }
         /* TAB last in this block ON PURPOSE: a reverb-boundary switch REBUILDS the engine (destroys e,
          * src, refl), so all per-source calls above must run against the still-valid engine first. */
@@ -1085,8 +1093,8 @@ int main(int argc, char** argv) {
         highlight_spk = -1;
         scenes[cur_scene].update(dt);
         Quaternion q = QuaternionFromAxisAngle(Vector3{ 0, 1, 0 }, head_yaw);
-        bw_set_listener_pose(e, g_head.x, g_head.y, g_head.z, q.x, q.y, q.z, q.w);
-        bw_commit(e);
+        bwa_set_listener_pose(e, g_head.x, g_head.y, g_head.z, q.x, q.y, q.z, q.w);
+        bwa_commit(e);
 
         BeginDrawing();
         ClearBackground(Color{ 24, 24, 27, 255 });  /* matches the theme's WindowBg */
@@ -1123,7 +1131,7 @@ int main(int argc, char** argv) {
     rlImGuiShutdown();                              /* destroys the imgui context */
     ImGuiTestEngine_DestroyContext(g_te);           /* after DestroyContext, per the te docs */
     CloseWindow();
-    if (e) { bw_stop(e); bw_destroy(e); }
+    if (e) { bwa_stop(e); bwa_destroy(e); }
     for (int i = 0; i < NSIG; ++i) remove(sig_files[i]);
     return rc;
 }

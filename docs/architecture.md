@@ -59,10 +59,10 @@ stereo sink.
 
 ### How wide is the bus?
 
-**The layout's speaker count.** `BW_CHANNELS` (26, `src/sink.h`) is the compile-time
+**The layout's speaker count.** `BWA_CHANNELS` (26, `src/sink.h`) is the compile-time
 *capacity*; the **active** count is whatever the loaded `cave_layout.json` declares —
-any N in **4..26**, resolved at `bw_create` and fixed for the engine's lifetime. With
-no `layout_path` you get the built-in 26-speaker default grid. `bw_channel_count()`
+any N in **4..26**, resolved at `bwa_create` and fixed for the engine's lifetime. With
+no `layout_path` you get the built-in 26-speaker default grid. `bwa_get_channel_count()`
 is the readback, and everything downstream (panners, bed decodes, reverb, the
 monitor, the device sink, calibration) is driven from it.
 
@@ -72,7 +72,7 @@ binary and the device opens that many channels.
 
 ## Profiles
 
-You select a profile at startup (`BwConfig.profile`); usage from the engine is
+You select a profile at startup (`bwa_desc.profile`); usage from the engine is
 identical across all three:
 
 | profile    | bus consumers                         | tracking needed | Dante HW |
@@ -114,11 +114,11 @@ orientation component.
   carries the whole acoustics stack: the binaural HRTF decode (`src/steam_decode.c`),
   occlusion + per-band transmission EQ + directivity (`src/steam_scene.c`), the
   reflection bed with an optional baked mode (`src/steam_reflect.c`), and sound
-  pathing (`src/steam_path.c`) — all wired up in `src/engine.c` at `bw_start`.
+  pathing (`src/steam_path.c`) — all wired up in `src/engine.c` at `bwa_start`.
 - **Spatialization: listener-relative DBAP**, recomputed per frame from tracked
   position. Pure ambisonics fails for localized point sources here: its single sweet
   spot does not survive a 3×3 m roam. DBAP is the default; SPCAP and VBAP are
-  selectable for fixed-listener installs (`bw_set_panner`), and `bw_set_dual_band`
+  selectable for fixed-listener installs (`bwa_set_panner`), and `bwa_set_dual_band`
   adds an optional dual-band mode on top of whichever panner is active. See
   `docs/spatialization.md`.
 - **Concurrency: two SPSC rings** (commands down, events up), a voice table owned by
@@ -132,7 +132,7 @@ The engine core links four external pieces:
 
 - **ASIO SDK** (GPLv3 option, vendored) — the device backend.
 - **Steam Audio (phonon)** — HRTF decode, occlusion, reflections, pathing. Optional:
-  auto-detected at `third_party/steam-audio-artifacts/` (`BW_HAVE_STEAMAUDIO`);
+  auto-detected at `third_party/steam-audio-artifacts/` (`BWA_HAVE_STEAMAUDIO`);
   without it the simple-pan monitor is the fallback.
 - **dr_libs** (dr_wav/dr_flac/dr_mp3) — WAV/FLAC/MP3 decode in `src/sound.c`.
 - **cJSON** — `cave_layout.json` parsing in `src/layout.c`.
@@ -143,8 +143,8 @@ proprietary SDK is a wire-format reference only, never linked.
 
 The opt-in tools carry their own stack, and the engine links none of it:
 **imgui / implot / implot3d / imgui_test_engine** plus **raylib / rlImGui** for
-`bw_playground`, `bw_layout_tool`, and `bw_calib_view`. **Intel Embree** is an
-optional runtime acceleration for the ray-traced sims (`BWAUDIO_EMBREE=1`, with a
+`bwa_playground`, `bwa_layout_tool`, and `bwa_calib_view`. **Intel Embree** is an
+optional acceleration for the ray-traced sims (`bwa_desc.embree`, with a
 graceful fallback to the default tracer).
 
 Everything else is first-party. See `docs/build.md`.

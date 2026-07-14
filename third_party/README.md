@@ -27,21 +27,21 @@ third_party/asiosdk/
 ```
 
 **Build wiring:** with the SDK present, `cmake` prints
-`bwaudio: ASIO backend ENABLED` and compiles `src/asio_sink.cpp` plus the SDK host
+`bw_audio: ASIO backend ENABLED` and compiles `src/asio_sink.cpp` plus the SDK host
 sources (`common/asio.cpp`, `host/asiodrivers.cpp`, `host/pc/asiolist.cpp`) with
-`BW_HAVE_ASIO`. Without it, only the offline null sink is built (`bwaudio: ASIO
+`BWA_HAVE_ASIO`. Without it, only the offline null sink is built (`bw_audio: ASIO
 backend disabled`) and the library still builds and links.
 
-**Sink selection at runtime** (see `src/sink.c`):
-- default — try ASIO, fall back to the null (offline) sink if no usable device;
-- `BWAUDIO_SINK=null` — force the offline sink (CI, desk debugging, no hardware);
-- `BWAUDIO_SINK=asio` — require ASIO; if no driver opens it **fails** (no silent
+**Sink selection** (`bwa_desc.sink`; see `src/sink.c`):
+- `BWA_SINK_AUTO` (default) — try ASIO, fall back to the null (offline) sink if no usable device;
+- `BWA_SINK_NULL` — force the offline sink (CI, desk debugging, no hardware);
+- `BWA_SINK_ASIO` — require ASIO; if no driver opens it **fails** (no silent
   null fallback), so a missing device surfaces instead of playing silence.
 
 The `cave`/`both` array path needs a driver exposing **≥26 output channels** (Dante
 Virtual Soundcard in production); `binaural` needs only 2. The auto-pick tries the
-registered drivers and uses the first that opens with enough outputs (override with
-`BWAUDIO_ASIO_DRIVER`); `bw_audio_backend()` reports which one opened.
+registered drivers and uses the first that opens with enough outputs (pin one with
+`bwa_desc.asio_driver`); `bwa_get_audio_backend()` reports which one opened.
 
 ## NatNet SDK (OptiTrack pose, M6) — reference only, NOT linked
 
@@ -77,7 +77,7 @@ cmake -S . -B build -DFETCHCONTENT_SOURCE_DIR_DR_LIBS=/path/to/dir-containing-dr
 
 **Not vendored here.** CMake fetches `cJSON.c` + `cJSON.h` via `FetchContent`, pinned to the
 **v1.7.19** release commit (`c859b25da02955fef659d658b8f324b5cde87be3`); cJSON is MIT and two
-files, compiled straight into `bw_core`. `layout.c` uses it to parse `cave_layout.json`. Bump
+files, compiled straight into `bwa_core`. `layout.c` uses it to parse `cave_layout.json`. Bump
 by changing the SHA; offline builds can override `FETCHCONTENT_SOURCE_DIR_CJSON_SRC` /
 `..._CJSON_HDR`.
 
@@ -109,7 +109,7 @@ early reflections instead of omni-only. This is the open upstream issue
 no root cause/fix there yet); drop the patch once a fixed release lands.
 
 **Building phonon (minimal core, Windows x64).** This recipe produces a `phonon.dll`/`phonon.lib`
-that links cleanly into `bwaudio.dll`. Run from `third_party/steam-audio-source/core/build`:
+that links cleanly into `bw_audio.dll`. Run from `third_party/steam-audio-source/core/build`:
 
 ```sh
 git submodule update --init third_party/steam-audio-source   # fetch the pinned source
@@ -142,9 +142,9 @@ cmake --build windows-vs2022-x64 --config Release --target phonon
 > **CRT gotcha (the build's one trap).** phonon defaults to `STEAMAUDIO_STATIC_RUNTIME=ON` (`/MT`),
 > but its deps' CMake (mysofa especially) ignore the runtime flag and build `/MD`. Mixing them gives
 > `unresolved external __imp_fgetc / __stdio_common_vsscanf`. Make **everything `/MD`**: `--sharedcrt`
-> on the deps **and** `-DSTEAMAUDIO_STATIC_RUNTIME=OFF` on phonon. `/MD` also matches our `bwaudio.dll`.
+> on the deps **and** `-DSTEAMAUDIO_STATIC_RUNTIME=OFF` on phonon. `/MD` also matches our `bw_audio.dll`.
 
-**Stage it** where `BWAUDIO_WITH_STEAMAUDIO` auto-detects it (mirroring the ASIO block):
+**Stage it** where `BWA_WITH_STEAMAUDIO` auto-detects it (mirroring the ASIO block):
 
 ```
 third_party/steam-audio-artifacts/

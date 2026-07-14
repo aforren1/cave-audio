@@ -31,7 +31,7 @@
 #define FFTN   32768          /* power of two; ~0.68 s window, ~1.46 Hz/bin */
 #define WARMUP 8192           /* discard while the 2-pole delay settles */
 
-static float bus[BW_CHANNELS * N];
+static float bus[BWA_CHANNELS * N];
 
 static int write_sine(const char* path, double freq, uint32_t frames) {
     drwav_data_format fmt = { drwav_container_riff, DR_WAVE_FORMAT_IEEE_FLOAT, 1, SR, 32 };
@@ -52,10 +52,10 @@ int main(int argc, char** argv) {
     if (bpc < 1) bpc = 1;
 
     Layout L = layout_default();
-    RtCore* rt = rt_create(8, 4, SR, BW_CHANNELS);
+    RtCore* rt = rt_create(8, 4, SR, BWA_CHANNELS);
     if (!rt) { printf("FAIL rt_create\n"); return 1; }
     rt_set_layout(rt, &L);
-    const char* WAV = "bw_dop_sine.wav";
+    const char* WAV = "bwa_dop_sine.wav";
     if (!write_sine(WAV, f_in, SR * 4)) { printf("FAIL write sine\n"); rt_destroy(rt); return 1; }
     char err[256] = {0};
     uint32_t snd = rt_load_sound(rt, WAV, err, sizeof err);
@@ -68,13 +68,13 @@ int main(int argc, char** argv) {
     double* im = (double*)calloc(FFTN, sizeof(double));
     float dist = 7.5f;                                   /* start far; stays inside the 8 m Doppler range */
     const double dt = (double)N / SR;
-    BwTimestamp ts; memset(&ts, 0, sizeof ts);
+    bwa_timestamp ts; memset(&ts, 0, sizeof ts);
     int cap = 0, blk = 0, warm = 0;
     while (cap < FFTN) {
         if (blk % bpc == 0) { rt_source_set_pos(rt, h, dist, L.ref[1], 0.f); rt_commit(rt); }   /* ear plane: distance == dist */
         rt_render(rt, bus, N, &ts);
         for (uint32_t i = 0; i < N; ++i) {
-            double s = 0; for (int ch = 0; ch < BW_CHANNELS; ++ch) s += bus[(size_t)ch * N + i];
+            double s = 0; for (int ch = 0; ch < BWA_CHANNELS; ++ch) s += bus[(size_t)ch * N + i];
             if (warm < WARMUP) { ++warm; continue; }
             if (cap < FFTN) re[cap++] = s;               /* mono sum = source * sum(gains) */
         }

@@ -18,14 +18,14 @@
  * zylia_geometry is the real array: a vertex-up dodecahedron minus its nadir vertex (see zylia.c). What
  * it does NOT fix is the CHANNEL ORDER (node i vs ASIO input i) or the AZIMUTH REFERENCE (which capsule
  * faces the device front) — a permutation or a yaw offset still produces a confident direction, just the
- * wrong one, and no off-hardware test can catch either. Pin them on the rig (bw_zylia_probe / a clap from
+ * wrong one, and no off-hardware test can catch either. Pin them on the rig (bwa_zylia_probe / a clap from
  * a known direction), or measure the geometry outright with the capsule self-survey. docs/calibration.md.
  *
  * The DOA/localize solve is unit-tested off-hardware (synthesize the 19 arrivals from a known position,
  * recover it) and the table's dodecahedral structure is pinned separately — see zylia_test.c.
  */
-#ifndef BW_ZYLIA_H
-#define BW_ZYLIA_H
+#ifndef BWA_ZYLIA_H
+#define BWA_ZYLIA_H
 
 #include <stdint.h>
 
@@ -126,4 +126,4 @@ int  zylia_survey_load(const char* path, char* err, int errcap);
 int  zylia_localize(const double arrival_s[ZYLIA_MICS], const float center[3],
                     double latency_s, double c, float pos_out[3], float* dist_out);
 
-#endif /* BW_ZYLIA_H */
+#endif /* BWA_ZYLIA_H */

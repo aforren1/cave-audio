@@ -4,8 +4,8 @@
  * panner's per-listener triangulation cache). For N speakers around the origin the convex hull of
  * their unit directions IS the spherical triangulation the panner needs.
  */
-#ifndef BW_HULL_H
-#define BW_HULL_H
+#ifndef BWA_HULL_H
+#define BWA_HULL_H
 
 #include <stdint.h>
 
@@ -22,4 +22,4 @@ int hull_triangulate(float (*dirs)[3], uint32_t n, int (*tri)[3], float* det, in
 int hull_vbap(const float dir[3], float (*dirs)[3], int (*tri)[3], const float* det,
               int ntri, int spk[3], float gain[3]);
 
-#endif /* BW_HULL_H */
+#endif /* BWA_HULL_H */

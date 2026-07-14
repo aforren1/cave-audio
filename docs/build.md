@@ -30,13 +30,13 @@ Everything beyond the DLL + test suite is opt-in; the default build stays lean.
 
 | option | default | what it does |
 |--------|---------|--------------|
-| `BWAUDIO_BUILD_TESTS` | ON | the ctest suite (`test_*` targets) |
-| `BWAUDIO_WITH_ASIO` | OFF* | the ASIO backend. *Auto-flips ON when the SDK sits at `third_party/asiosdk/` |
-| `BWAUDIO_BUILD_PLAYGROUND` | OFF | `bw_playground` + `bw_layout_tool` (fetches raylib/rlImGui/imgui/test-engine) |
-| `BWAUDIO_BUILD_CALIBVIEW` | OFF | `bw_calib_view` (fetches imgui/test-engine/implot/implot3d) |
-| `BWAUDIO_BUILD_CALIBRATE` | OFF | `bw_calibrate` + `bw_zylia_probe` |
-| `BWAUDIO_ASAN` | OFF | builds `test_sound` with AddressSanitizer (MSVC; needs tests ON) |
-| `BWAUDIO_TRACY` | OFF | Tracy profiler instrumentation (fetches Tracy; collects only while a profiler is attached) |
+| `BWA_BUILD_TESTS` | ON | the ctest suite (`test_*` targets) |
+| `BWA_WITH_ASIO` | OFF* | the ASIO backend. *Auto-flips ON when the SDK sits at `third_party/asiosdk/` |
+| `BWA_BUILD_PLAYGROUND` | OFF | `bwa_playground` + `bwa_layout_tool` (fetches raylib/rlImGui/imgui/test-engine) |
+| `BWA_BUILD_CALIBVIEW` | OFF | `bwa_calib_view` (fetches imgui/test-engine/implot/implot3d) |
+| `BWA_BUILD_CALIBRATE` | OFF | `bwa_calibrate` + `bwa_zylia_probe` |
+| `BWA_ASAN` | OFF | builds `test_sound` with AddressSanitizer (MSVC; needs tests ON) |
+| `BWA_TRACY` | OFF | Tracy profiler instrumentation (fetches Tracy; collects only while a profiler is attached) |
 
 Steam Audio has no option: CMake auto-enables it when the built phonon SDK sits at
 `third_party/steam-audio-artifacts/` (see `third_party/README.md`).
@@ -45,8 +45,8 @@ Steam Audio has no option: CMake auto-enables it when the built phonon SDK sits 
 
 **A no-SDK build is fully viable for the array** — it is not a degraded mode. You keep the whole
 spatializer, plus a complete geometric acoustics path: **image-source early reflections**
-(`bw_source_set_early_reflections`, real parallax as the listener walks), the **directional FDN
-reverb** (`bw_reverb_fdn`), and **manual occlusion** (`bw_source_set_occlusion_manual`, driven by
+(`bwa_source_set_early_reflections`, real parallax as the listener walks), the **directional FDN
+reverb** (`bwa_fdn_config`), and **manual occlusion** (`bwa_source_set_occlusion_manual`, driven by
 your own game logic). That is what a collaborator site should start from: clone, `cmake`, run.
 
 What the SDK adds, and what you lose without it:
@@ -80,7 +80,7 @@ to exact commits. Offline builds override with `-DFETCHCONTENT_SOURCE_DIR_<NAME>
 ### Tool dependencies (opt-in builds only)
 
 The GUI tools and the profiler pull their own pinned deps. None of these touch the
-default build or `bwaudio.dll`:
+default build or `bw_audio.dll`:
 
 | dep | pin | pulled in by | license |
 |-----|-----|--------------|---------|
@@ -90,7 +90,7 @@ default build or `bwaudio.dll`:
 | implot3d | v0.4 | CALIBVIEW | MIT |
 | raylib | 5.5 | PLAYGROUND | zlib/libpng |
 | rlImGui | `Raylib_5_5` tag | PLAYGROUND | zlib/libpng |
-| Tracy | v0.13.1 | `BWAUDIO_TRACY` | BSD-3-Clause |
+| Tracy | v0.13.1 | `BWA_TRACY` | BSD-3-Clause |
 | Roboto-Regular | embedded (`examples/roboto_font.h`) | all GUI tools | Apache-2.0 (Google) |
 
 The imgui and imgui_test_engine tags track each other. Bump them together.
@@ -99,12 +99,12 @@ The imgui and imgui_test_engine tags track each other. Bump them together.
 
 Everything above, sorted by what it actually ends up in:
 
-- **`bwaudio.dll`** (the artifact CI distributes, under this repo's GPLv3) links four
+- **`bw_audio.dll`** (the artifact CI distributes, under this repo's GPLv3) links four
   third-party components: the ASIO SDK under its **GPLv3** option, Steam Audio's
   `phonon.dll` (**Apache-2.0**, a separate DLL loaded at runtime), dr_libs (**public
   domain / MIT-0**, your choice), and cJSON (**MIT**). All four are GPLv3-compatible,
   so distributing the DLL under GPLv3 is consistent.
-- **The GUI tools** (`bw_playground`, `bw_layout_tool`, `bw_calib_view`, opt-in builds)
+- **The GUI tools** (`bwa_playground`, `bwa_layout_tool`, `bwa_calib_view`, opt-in builds)
   additionally compile in imgui, implot, implot3d (**MIT**), raylib, rlImGui
   (**zlib/libpng**), the Roboto face (**Apache-2.0**), imgui_test_engine (**its own
   dual license** — free tier, see below), and optionally Tracy (**BSD-3-Clause**).
@@ -116,7 +116,7 @@ Everything above, sorted by what it actually ends up in:
   target compiles or links it, and it must never be distributed with this repo.
   `natnet.c` speaks the documented wire protocol instead — see below.
 - **Optional, user-supplied**: Intel Embree + TBB (**Apache-2.0** both) if you drop in
-  an Embree-enabled `phonon` for `BWAUDIO_EMBREE` (see `docs/api.md`). This repo
+  an Embree-enabled `phonon` for `bwa_desc.embree` (see `docs/api.md`). This repo
   ships neither.
 
 ### ASIO SDK licensing (read before distributing)
@@ -125,7 +125,7 @@ As of October 2025 the ASIO SDK is **dual-licensed GPLv3 / proprietary** (previo
 proprietary-only). You can use it under the GPLv3 option without signing an agreement.
 The catch is copyleft — pick the case that matches how you ship:
 
-- **Distributed under GPLv3** → what this repo does. CI publishes `bwaudio.dll` as a
+- **Distributed under GPLv3** → what this repo does. CI publishes `bw_audio.dll` as a
   workflow artifact under the repo's GPLv3 `LICENSE`, with the complete source
   available as this repo at the built commit. That meets the GPLv3 terms — see the
   CI section below.
@@ -145,8 +145,8 @@ business under the license's revenue threshold — a paid license otherwise. Rea
 `imgui_test_engine/LICENSE.txt` in the fetched tree for the exact criteria.
 
 That's fine here: this repo is GPLv3 open source, so the free tier applies, and the
-test engine compiles only into the GUI tools (`bw_playground`, `bw_layout_tool`,
-`bw_calib_view`) — never into `bwaudio.dll`. The tools ship in the CI artifact with
+test engine compiles only into the GUI tools (`bwa_playground`, `bwa_layout_tool`,
+`bwa_calib_view`) — never into `bw_audio.dll`. The tools ship in the CI artifact with
 the notice in `THIRD_PARTY-NOTICES.md`. Revisit if this repo's licensing changes.
 
 ### NatNet without the proprietary SDK
@@ -156,7 +156,7 @@ distribution. The protocol is documented, so `natnet.c` consumes the
 multicast/unicast stream directly rather than linking the SDK. The SDK copy at
 `third_party/NatNetSDK/` is a protocol reference for that implementation — no target
 compiles or links it, and it stays out of anything distributed. It also lets the core
-read pose itself (`track_internal = true`) and sample the freshest head pose at
+read pose itself (`bwa_tracker_connect`) and sample the freshest head pose at
 audio-callback time — lower-latency than marshaling pose through the engine each frame.
 
 ## Continuous integration
@@ -175,34 +175,34 @@ distribution channel:
   run, and binaural is the real HRTF decode. One CI-only tweak: the pinned phonon
   build scripts hard-code the VS 2022 generator, so the workflow rewrites that to
   whatever Visual Studio the runner image has (via `vswhere`).
-- **Tests run with `BWAUDIO_SINK=null`.** Runners have no audio hardware; forcing the
+- **Tests force the null sink (`bwa_desc.sink = BWA_SINK_NULL`).** Runners have no audio hardware; forcing the
   null sink keeps runs deterministic instead of relying on fallback. The three GUI
   UI suites (`playground`/`layout_tool`/`calib_view`) are built but excluded from
   the CI ctest run — they need a display and OpenGL, which runners don't have; run
   them locally.
 - **Two configs, x64 only.** RelWithDebInfo is the full build: tested, tools and
-  all. Debug builds the engine (`bwaudio` + `bw_minimal`) and smoke-runs it, for
+  all. Debug builds the engine (`bw_audio` + `bwa_minimal`) and smoke-runs it, for
   downstream debugging against a debug CRT.
-- **The tools are built and shipped.** CI configures with `BWAUDIO_BUILD_PLAYGROUND`,
-  `BWAUDIO_BUILD_CALIBVIEW`, and `BWAUDIO_BUILD_CALIBRATE`, so the artifact carries
-  `bw_playground`, `bw_layout_tool`, `bw_calib_view` (GUI — they need a display),
-  plus `bw_calibrate` and `bw_zylia_probe` (console).
+- **The tools are built and shipped.** CI configures with `BWA_BUILD_PLAYGROUND`,
+  `BWA_BUILD_CALIBVIEW`, and `BWA_BUILD_CALIBRATE`, so the artifact carries
+  `bwa_playground`, `bwa_layout_tool`, `bwa_calib_view` (GUI — they need a display),
+  plus `bwa_calibrate` and `bwa_zylia_probe` (console).
 - **The artifact is a GPLv3 distribution.** Each run uploads `RelWithDebInfo/`
-  (engine + phonon + tools) and `Debug/` (engine + phonon) folders plus `bwaudio.h`,
+  (engine + phonon + tools) and `Debug/` (engine + phonon) folders plus `bw_audio.h`,
   the example layout + `constraints.json`, the `LICENSE`, `THIRD_PARTY-NOTICES.md`,
   and a `DIST.txt` naming the commit and linking the complete source (this repo at
   that commit). Downloading requires repo access; the artifact carries the GPLv3
   terms with it.
-- **`bwaudio.dll` needs `phonon.dll` beside it.** With-SDK builds (including the CI
+- **`bw_audio.dll` needs `phonon.dll` beside it.** With-SDK builds (including the CI
   artifact) link `phonon.lib`, so the DLL won't load without `phonon.dll` in the
   same directory — keep the pair together. The CMake post-build step and the Unity
   plugin staging both copy it for you. Only a no-SDK build is self-contained (with
   the simple-pan binaural fallback and acoustics calls as no-ops).
 - **Two audiences, two artifacts.** Every run uploads them separately — the engine
-  (`bwaudio-win64-r<N>`: dll/lib/pdb + phonon + tools + header) and the Unity package
+  (`bw_audio-win64-r<N>`: dll/lib/pdb + phonon + tools + header) and the Unity package
   (`unity-package-r<N>`: one `.tgz`) — so downloading one no longer drags in the other.
 - **The Unity package is packed every run, and released on a tag.**
-  `tools/upm/pack.ps1` produces `com.brainworks.bwaudio-<version>.tgz` — the C#
+  `tools/upm/pack.ps1` produces `com.brainworks.bw_audio-<version>.tgz` — the C#
   binding with both DLLs inside it — so a broken package (a missing `.meta`, a lost
   plugin) fails the *build*, not a release. A `v*` tag then cuts a GitHub Release, and
   **the Release is the distribution**: there is no registry, no token, nothing to keep
@@ -211,9 +211,9 @@ distribution channel:
   pack fails — so a tarball can never claim a version it isn't.
 - **A release carries TWO assets**, because workflow artifacts expire (30 days) and a
   release doesn't:
-  - `com.brainworks.bwaudio-<ver>.tgz` — the Unity package.
-  - `bwaudio-win64-<tag>.zip` — the engine itself: `bwaudio.dll`/`.lib`/`.pdb` +
-    `phonon.dll`, `bwaudio.h`, and the tools. This is the durable download for a C/C++
+  - `com.brainworks.bw_audio-<ver>.tgz` — the Unity package.
+  - `bw_audio-win64-<tag>.zip` — the engine itself: `bw_audio.dll`/`.lib`/`.pdb` +
+    `phonon.dll`, `bw_audio.h`, and the tools. This is the durable download for a C/C++
     consumer or the CAVE machine.
 
   Both ship under GPLv3 (the `.zip` carries `LICENSE`, `THIRD_PARTY-NOTICES.md` and
@@ -277,7 +277,7 @@ seam, so ASIO types never leak into the engine. It compiles only when the ASIO S
 vendored — fetch it per [`../third_party/README.md`](../third_party/README.md); CMake
 auto-detects `third_party/asiosdk/` and prints `ASIO backend ENABLED`. Without it, the
 offline `null_sink.c` backend builds instead: the library always builds and the audio
-loop is testable with no hardware. Pick a backend at runtime with `BWAUDIO_SINK`
+loop is testable with no hardware. Pick a backend with `bwa_desc.sink`
 (`null` | `asio`; default is ASIO with null fallback). The ASIO backend rejects any
 driver exposing fewer output channels than the layout needs (26 for the CAVE array).
 

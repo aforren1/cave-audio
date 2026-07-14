@@ -4,7 +4,7 @@
 /* SN3D-normalized real spherical harmonics in Cartesian form (unit dir; x=front, y=left, z=up).
  * Constants: sqrt(3)=1.7320508, sqrt(3)/2=0.8660254, sqrt(15)=3.8729833, sqrt(15)/2=1.9364917,
  *            sqrt(5/8)=0.7905694, sqrt(3/8)=0.6123724. */
-void ambi_encode_sn3d(const float dir[3], float y[BW_AMBI_CH]) {
+void ambi_encode_sn3d(const float dir[3], float y[BWA_AMBI_CH]) {
     const float x = dir[0], yy = dir[1], z = dir[2];
 
     y[0]  = 1.0f;                                            /* l=0          */
@@ -30,7 +30,7 @@ void ambi_encode_sn3d(const float dir[3], float y[BW_AMBI_CH]) {
 
 /* sqrt(2l+1)/sqrt(4pi) per ACN channel — SN3D (AmbiX) -> phonon's orthonormal real SH (see header).
  * 1/sqrt(4pi)=0.2820948, sqrt(3)/sqrt(4pi)=0.4886025, sqrt(5)/sqrt(4pi)=0.6307832, sqrt(7)/..=0.7463527. */
-const float ambi_phonon_scale[BW_AMBI_CH] = {
+const float ambi_phonon_scale[BWA_AMBI_CH] = {
     0.2820948f,                                                                     /* l=0 */
     0.4886025f, 0.4886025f, 0.4886025f,                                             /* l=1 */
     0.6307832f, 0.6307832f, 0.6307832f, 0.6307832f, 0.6307832f,                     /* l=2 */

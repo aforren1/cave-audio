@@ -5,7 +5,7 @@
  * axis, so the stereo image turns with the head. (W/X ambisonic encode + two cardioids.)
  */
 #include "binaural.h"
-#include "frame.h"          /* BW_ROOM_RIGHT + frame_qrot */
+#include "frame.h"          /* BWA_ROOM_RIGHT + frame_qrot */
 
 #include <math.h>
 #include <stdlib.h>
@@ -14,16 +14,16 @@
 struct Monitor {
     uint32_t channels;
     uint32_t sample_rate;
-    float    spk[BW_CHANNELS][3];           /* speaker world positions */
-    float    gL[BW_CHANNELS], gR[BW_CHANNELS];          /* target pan gains (recomputed on pose change) */
-    float    gL_cur[BW_CHANNELS], gR_cur[BW_CHANNELS];  /* applied gains, ramped toward the target (invariant 4) */
+    float    spk[BWA_CHANNELS][3];           /* speaker world positions */
+    float    gL[BWA_CHANNELS], gR[BWA_CHANNELS];          /* target pan gains (recomputed on pose change) */
+    float    gL_cur[BWA_CHANNELS], gR_cur[BWA_CHANNELS];  /* applied gains, ramped toward the target (invariant 4) */
     float    last_p[3], last_q[4];
     int      have;
     int      primed;                        /* gL_cur seeded from the first solve (no ramp up from 0) */
 };
 
 Monitor* monitor_create(const Layout* L, uint32_t sample_rate) {
-    if (!L || L->count == 0 || L->count > BW_CHANNELS) return NULL;
+    if (!L || L->count == 0 || L->count > BWA_CHANNELS) return NULL;
     Monitor* m = (Monitor*)calloc(1, sizeof *m);
     if (!m) return NULL;
     m->channels    = L->count;
@@ -35,15 +35,15 @@ Monitor* monitor_create(const Layout* L, uint32_t sample_rate) {
 
 void monitor_destroy(Monitor* m) { free(m); }
 
-/* world-space direction of the listener's right ear axis (BW_ROOM_RIGHT rotated by q, xyzw).
+/* world-space direction of the listener's right ear axis (BWA_ROOM_RIGHT rotated by q, xyzw).
  * frame_qrot assumes a unit quaternion, so normalize first; a zero/degenerate q (e.g. an
- * unset pose) falls back to identity (facing BW_ROOM_AHEAD). */
+ * unset pose) falls back to identity (facing BWA_ROOM_AHEAD). */
 static void head_right(const float q[4], float r[3]) {
     float n[4] = { q[0], q[1], q[2], q[3] };
     float n2 = n[0] * n[0] + n[1] * n[1] + n[2] * n[2] + n[3] * n[3];
     if (n2 > 1e-12f) { float inv = 1.f / sqrtf(n2); n[0] *= inv; n[1] *= inv; n[2] *= inv; n[3] *= inv; }
     else { n[0] = n[1] = n[2] = 0.f; n[3] = 1.f; }
-    frame_qrot(n, BW_ROOM_RIGHT, r);
+    frame_qrot(n, BWA_ROOM_RIGHT, r);
 }
 
 static void recompute(Monitor* m, const float p[3], const float q[4]) {

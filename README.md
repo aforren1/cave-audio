@@ -1,4 +1,4 @@
-# bwaudio
+# bw_audio
 
 Self-hosted spatial audio engine for a 26-speaker CAVE installation. Drives the
 array over **ASIO → Dante Virtual Soundcard**, with a **binaural HRTF monitor** for
@@ -51,7 +51,7 @@ in one process behind one audio callback.
 - **Voices**: fixed pool with priority stealing; pause (per-voice, per-group, and
   global) and click-free seek; engine-side timed fades; **mix groups** for
   category gain/ducking; sample-accurate start against a device-anchored DSP
-  clock (`bw_source_play_at` / `bw_dsp_time`).
+  clock (`bwa_source_play_at` / `bwa_get_dsp_time`).
 - **Tracking**: OptiTrack NatNet parsed off-wire; the audio thread samples the
   freshest head pose at block time, with optional **pose prediction** to hide
   motion-to-ears latency; **tracked room EQ** interpolates measured LF room
@@ -60,7 +60,7 @@ in one process behind one audio callback.
   ambisonic encode → Steam Audio decode) to any 2-ch ASIO device; per-channel
   test signal, output meters, voice gauge.
 - **Real-time discipline**: no allocation, locks, or I/O on the audio thread;
-  lock-free SPSC command/event rings; `bw_commit` gives frame-coherent updates;
+  lock-free SPSC command/event rings; `bwa_commit` gives frame-coherent updates;
   every parameter change ramps — nothing steps.
 - **Validation**: the core math (SH encode, VBAP, AllRAD, biquads, EQ rendering)
   is cross-checked against independent implementations (scipy/qhull/linear-
@@ -73,13 +73,13 @@ The defaults target the CAVE: **one tracked listener roaming the array.** Change
 setup and the right settings change with it — mostly because a *sweet spot* either
 exists or it doesn't. These are starting points; A/B them by ear in the playground.
 The calibration commands behind the last row are under
-[One array, several audiences](#calibrate--bw_calib_view).
+[One array, several audiences](#calibrate--bwa_calib_view).
 
 | | **tracked roamer** (the CAVE) | **fixed seat** (one chair) | **audience** (several people) | **desk** (headphones) |
 |---|---|---|---|---|
 | profile | `cave` | `cave` | `cave` | `binaural` |
 | panner | **DBAP** (default) | **VBAP**, else SPCAP | **DBAP** | any (DBAP) |
-| tracking | `track_internal = true` | none — listener sits at the seat | track the main occupant + `bw_set_extra_listeners` for the rest | push head pose, or track |
+| tracking | `bwa_tracker_connect` | none — listener sits at the seat | track the main occupant + `bwa_set_extra_listeners` for the rest | push head pose, or track |
 | dual-band | off | **on** | off | your call (A/B it) |
 | calibration | `--eq` + `--room-eq-grid` | `--eq` + `--room-eq` at the seat | `--eq` only | `--eq` |
 | bed decoder | AllRAD if the array is irregular | sampling | AllRAD | either |
@@ -87,11 +87,11 @@ The calibration commands behind the last row are under
 **Tracked roamer.** DBAP is listener-relative and re-solves every block, so the image
 follows you instead of degrading away from a centre. Leave dual-band and VBAP off:
 both sharpen the image *at a sweet spot*, and there isn't one. For room correction use the
-grid (`bw_calibrate --room-eq-grid`, one run per mic position); the engine interpolates
-the LF cuts at your live position and glides the biquads. `bw_set_pose_prediction` (start
-~20–40 ms, your measured motion-to-ears latency) hides the panning lag; `bw_set_decorrelation`
+grid (`bwa_calibrate --room-eq-grid`, one run per mic position); the engine interpolates
+the LF cuts at your live position and glides the biquads. `bwa_set_pose_prediction` (start
+~20–40 ms, your measured motion-to-ears latency) hides the panning lag; `bwa_set_decorrelation`
 keeps wide sources from comb-filtering as you move. Loading a static `room_eq` layout into
-a moving session **fails `bw_start`** on purpose — one measurement point cannot correct a roam.
+a moving session **fails `bwa_start`** on purpose — one measurement point cannot correct a roam.
 
 **Fixed seat.** Now a sweet spot exists, so spend it: VBAP for the sharpest image (it needs
 a cleanly triangulable array — it falls back to DBAP if not), SPCAP if the array is uneven
@@ -101,12 +101,12 @@ set the listener pose once.
 
 **Audience.** Panning is exact for one head and wrong for everyone else, so this is a
 compromise by construction. Track the person who matters (the participant, the demo
-driver) and hand the *other* occupants' positions to **`bw_set_extra_listeners`** (up to
+driver) and hand the *other* occupants' positions to **`bwa_set_extra_listeners`** (up to
 3): every source's gains become the per-speaker energy mean of the per-listener solves,
 so each occupant gets an image biased toward their own seat instead of one exact and N
 wrong. Otherwise play it safe rather than sharp — DBAP, dual-band off, and no room EQ
 beyond `--eq` (which flattens the *speakers*, not the room, so it helps every seat).
-Raise `bw_source_set_spread` on ambience: wide sources survive off-centre listening far
+Raise `bwa_source_set_spread` on ambience: wide sources survive off-centre listening far
 better than points do.
 
 **Desk.** The `binaural` profile needs no layout, no Dante, and no hardware beyond
@@ -115,14 +115,14 @@ render. Use it to develop; don't use it to judge timbre for the room.
 
 **Everywhere:** the output limiter is on at −1 dBFS (leave it — it's speaker protection, not
 mastering), and reflections are opt-in per source. Pick one reverb bed: Steam Audio's
-(needs the SDK, ray-traced from your geometry) *or* the phonon-free FDN (`bw_reverb_fdn`,
+(needs the SDK, ray-traced from your geometry) *or* the phonon-free FDN (`bwa_fdn_config`,
 a designed decay — cheaper, works in no-SDK builds). Details in
 [`docs/spatialization.md`](./docs/spatialization.md) and
 [`docs/calibration.md`](./docs/calibration.md).
 
 ## Non-goals & current limitations
 
-bwaudio is not middleware. There are no events, banks, mixer graphs, or authoring
+bw_audio is not middleware. There are no events, banks, mixer graphs, or authoring
 app — the ABI is create/play/position/commit. Game-side audio (UI, menus) stays in
 the game engine's own mixer.
 
@@ -133,7 +133,7 @@ the game engine's own mixer.
 - **Windows + ASIO only.** One *tracked* listener — the multi-listener mode is a
   panning compromise for extra occupants, not per-head rendering.
 - **Room EQ is opt-in.** Static-listener correction at one point
-  (`bw_calibrate --room-eq`, fixed-seat installs), or **tracked room EQ** from a
+  (`bwa_calibrate --room-eq`, fixed-seat installs), or **tracked room EQ** from a
   measured grid (`--room-eq-grid`) for a roaming listener — LF modal cuts only;
   mid/HF stays speaker-only correction, because one room can't be flattened for
   every position at once.
@@ -151,7 +151,7 @@ Current gaps (may change):
   geometry needs the Steam scene.
 - Mono point sources only. Stereo assets downmix; the ambisonic bed is the only
   non-point path.
-- No completion callbacks — poll `bw_source_is_playing`.
+- No completion callbacks — poll `bwa_source_is_playing`.
 - No OGG/Opus; seek and pitch do not apply to streamed sounds.
 - Reflection/room configuration is load-time (occlusion meshes can be replaced live).
 
@@ -170,21 +170,21 @@ Usage docs live in [`docs/api.md`](./docs/api.md): quickstart, profiles, the
 threading contract, coordinates, error handling, environment variables, then a
 per-call reference. [`examples/minimal.c`](./examples/minimal.c) runs the whole
 client lifecycle (create → load → play → per-frame commit → teardown); it builds
-as `bw_minimal` and needs no hardware.
+as `bwa_minimal` and needs no hardware.
 
 ```c
-BwConfig cfg = { .profile = BW_PROFILE_BINAURAL, .sample_rate = 48000, .block_size = 256 };
-BwEngine* e = bw_create(&cfg);
-bw_start(e);                                    // no ASIO device? silent sink, keeps running
+bwa_desc cfg = { .profile = BWA_PROFILE_BINAURAL, .sample_rate = 48000, .block_size = 256 };
+bwa_engine* e = bwa_create(&cfg);
+bwa_start(e);                                    // no ASIO device? silent sink, keeps running
 
-BwSound ping = bw_load_sound(e, "ping.wav");    // WAV/FLAC/MP3, resampled at load
-BwSource s   = bw_source_create(e);
-bw_source_play(e, s, ping, /*loop*/ true);
+bwa_sound ping = bwa_load_sound(e, "ping.wav");    // WAV/FLAC/MP3, resampled at load
+bwa_source s   = bwa_source_create(e);
+bwa_source_play(e, s, ping, /*loop*/ true);
 
 // per frame, from one thread:
-bw_set_listener_pose(e, px,py,pz, qx,qy,qz,qw);
-bw_source_set_pos(e, s, x, y, z);
-bw_commit(e);
+bwa_set_listener_pose(e, px,py,pz, qx,qy,qz,qw);
+bwa_source_set_pos(e, s, x, y, z);
+bwa_commit(e);
 ```
 
 ## Documentation
@@ -192,7 +192,7 @@ bw_commit(e);
 | doc | covers |
 |-----|--------|
 | [`docs/api.md`](./docs/api.md) | usage guide + per-call reference |
-| [`include/bwaudio.h`](./include/bwaudio.h) | the C ABI |
+| [`include/bw_audio.h`](./include/bw_audio.h) | the C ABI |
 | [`docs/architecture.md`](./docs/architecture.md) | system overview, the bus seam, locked decisions |
 | [`docs/concurrency.md`](./docs/concurrency.md) | threading model, rings, commit snapshot, lifetimes |
 | [`docs/spatialization.md`](./docs/spatialization.md) | DBAP/SPCAP/VBAP, dual-band, binaural decode, alignment |
@@ -211,13 +211,13 @@ Contributor-facing notes live in [`docs/internal-types.md`](./docs/internal-type
 Opt-in, in workflow order (design → calibrate → audition):
 
 ```
-cmake -S . -B build -DBWAUDIO_BUILD_PLAYGROUND=ON -DBWAUDIO_BUILD_CALIBVIEW=ON -DBWAUDIO_BUILD_CALIBRATE=ON
+cmake -S . -B build -DBWA_BUILD_PLAYGROUND=ON -DBWA_BUILD_CALIBVIEW=ON -DBWA_BUILD_CALIBRATE=ON
 cmake --build build --config RelWithDebInfo
 ```
 
-### Design — `bw_layout_tool`
+### Design — `bwa_layout_tool`
 
-![bw_layout_tool](docs/img/layout_tool.png)
+![bwa_layout_tool](docs/img/layout_tool.png)
 
 Authors `cave_layout.json`:
 
@@ -232,9 +232,9 @@ Authors `cave_layout.json`:
 
 Headless: `--export`, `--score`, `--optimize`.
 
-### Calibrate — `bw_calib_view`
+### Calibrate — `bwa_calib_view`
 
-![bw_calib_view: layout diff](docs/img/calib_view_diff.png)
+![bwa_calib_view: layout diff](docs/img/calib_view_diff.png)
 
 The Capture tab runs sweep → measure → solve → writeback (simulated, or full-duplex
 ASIO with a measurement mic), then loads the result into a layout diff — A the
@@ -245,21 +245,21 @@ Other tabs: the array in 3D, gain/delay trims, correction-EQ curves, retained IR
 The Zylia tab shows clap direction-of-arrival on a ZM-1 capsule sphere — a
 seconds-fast check of capsule mapping and geometry.
 
-![bw_calib_view: Zylia tab](docs/img/calib_view_zylia.png)
+![bwa_calib_view: Zylia tab](docs/img/calib_view_zylia.png)
 
-`bw_calibrate` is the same pipeline headless (`--simulate`, `--localize`);
-`bw_zylia_probe` is a console level meter. See
+`bwa_calibrate` is the same pipeline headless (`--simulate`, `--localize`);
+`bwa_zylia_probe` is a console level meter. See
 [`docs/calibration.md`](./docs/calibration.md).
 
 **One array, several audiences.** Speaker positions are surveyed once, but trims and
 EQ are measured relative to a reference point — so one installation can keep several
 calibrated variants of the same geometry and pick one per session
-(`BwConfig.layout_path` + the panner):
+(`bwa_desc.layout_path` + the panner):
 
 ```
-bw_calibrate --layout survey.json --mic 0 1.2 0 --room-eq      --out cave_layout.seated.json
-bw_calibrate --layout survey.json --mic 0 1.7 0 --eq           --out cave_layout.roaming.json
-bw_calibrate --layout cave_layout.roaming.json --mic -1 1.7 0 --room-eq-grid   # then rerun per mic spot
+bwa_calibrate --layout survey.json --mic 0 1.2 0 --room-eq      --out cave_layout.seated.json
+bwa_calibrate --layout survey.json --mic 0 1.7 0 --eq           --out cave_layout.roaming.json
+bwa_calibrate --layout cave_layout.roaming.json --mic -1 1.7 0 --room-eq-grid   # then rerun per mic spot
 ```
 
 - **Seated** (SPCAP/VBAP, fixed listener pose): trims aligned at the seat, room
@@ -275,12 +275,12 @@ bw_calibrate --layout cave_layout.roaming.json --mic -1 1.7 0 --room-eq-grid   #
 Diffing the two files in calib_view should show identical positions and only trim/EQ
 differences. Unknown JSON fields survive recalibration, so a variant can carry its
 own annotation (e.g. `"intent": "seated, SPCAP"`). And loading the seated file into
-a moving-listener session (DBAP or tracking) fails `bw_start` rather than quietly
+a moving-listener session (DBAP or tracking) fails `bwa_start` rather than quietly
 mis-correcting the array.
 
-### Audition — `bw_playground`
+### Audition — `bwa_playground`
 
-![bw_playground](docs/img/playground.png)
+![bwa_playground](docs/img/playground.png)
 
 Binaural monitor on headphones (auto-picked 2-ch ASIO driver; without one the
 engine falls back to the null sink and keeps rendering — visual-only, live, just

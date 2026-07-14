@@ -1,7 +1,7 @@
 /*
  * fdn.h — directional FDN reverb bed: a phonon-free late-reverb renderer that registers at the SAME
  * rt bus-tap seam as the Steam Audio reflection bed (input = the mono reflection aux send; voices
- * opt in via bw_source_set_reflections, with the same per-voice send levels). A 16-line feedback
+ * opt in via bwa_source_set_reflections, with the same per-voice send levels). A 16-line feedback
  * delay network (Householder feedback — a lossless prototype) with per-line 2-band decay filters;
  * every line is assigned a direction on the sphere and rendered as a plane wave through the
  * layout's SH→26 bed decode, and the per-line decay can be SCALED by direction — anisotropic decay,
@@ -9,11 +9,11 @@
  * JAES 2019). The decay is a DESIGN parameter, not a model of the real room (matching would
  * double-count — docs/calibration.md).
  *
- * fdn_create/fdn_set_* run on the control thread BEFORE the audio thread starts (bw_start stages
+ * fdn_create/fdn_set_* run on the control thread BEFORE the audio thread starts (bwa_start stages
  * them); fdn_tap runs on the audio thread and never allocates or locks.
  */
-#ifndef BW_FDN_H
-#define BW_FDN_H
+#ifndef BWA_FDN_H
+#define BWA_FDN_H
 
 #include "layout.h"
 
@@ -42,4 +42,4 @@ void fdn_set_gain(Fdn* f, float gain);
  * (pre-align, like the Steam bed). `ud` is the Fdn. Audio thread. */
 void fdn_tap(void* ud, float* bus, uint32_t n, const float* lp, const float* lq, const float* aux);
 
-#endif /* BW_FDN_H */
+#endif /* BWA_FDN_H */

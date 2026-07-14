@@ -1,7 +1,7 @@
-// BwRoomConstraints.cs — draw the PHYSICAL room in the scene view: the speaker truss you must stay
+// RoomConstraints.cs — draw the PHYSICAL room in the scene view: the speaker truss you must stay
 // inside, the CAVE screen cube you must stay out of, and the projectors hanging in the way.
 //
-// It reads the SAME constraints.json the C++ tools do (bw_layout_tool, bw_playground — see
+// It reads the SAME constraints.json the C++ tools do (bwa_layout_tool, bwa_playground — see
 // examples/constraints_view.h), so the room has one source of truth. Do not re-author these boxes as
 // Unity geometry: the file comes from the survey, and a second copy of it is a second thing to be wrong.
 //
@@ -14,16 +14,16 @@ using System;
 using System.IO;
 using UnityEngine;
 
-namespace CaveAudio
+namespace BwAudio
 {
     [DisallowMultipleComponent]
-    public sealed class BwRoomConstraints : MonoBehaviour
+    public sealed class RoomConstraints : MonoBehaviour
     {
         [Header("Constraints file (under StreamingAssets)")]
         [Tooltip("The surveyed room: 'bounds' = the speaker truss (speakers must be INSIDE), 'nogo' = " +
                  "keep-out volumes (the screen cube + observer), 'obstacles' = solid objects (projectors). " +
-                 "Room metres, floor-based origin. The same file bw_layout_tool and bw_playground read.")]
-        [BwClip(".json")] public string constraintsFile = "constraints.json";
+                 "Room metres, floor-based origin. The same file bwa_layout_tool and bwa_playground read.")]
+        [Clip(".json")] public string constraintsFile = "constraints.json";
 
         [Header("Draw")]
         public bool showBounds    = true;    // green wire  — the truss

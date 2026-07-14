@@ -1,6 +1,6 @@
 /*
  * zylia_capture.cpp — see zylia_capture.h. Extracted from zylia_probe so the console meter and
- * bw_calib_view's Zylia tab share ONE copy of the ASIO shell (driver open, format conversion,
+ * bwa_calib_view's Zylia tab share ONE copy of the ASIO shell (driver open, format conversion,
  * transient trigger, snapshot publish). Build-only-with-ASIO.
  */
 #include "zylia_capture.h"
@@ -10,7 +10,7 @@
 #include <string.h>
 #include <math.h>
 
-#ifdef BW_HAVE_ASIO
+#ifdef BWA_HAVE_ASIO
 
 #include "asiosys.h"
 #include "asio.h"
@@ -204,10 +204,10 @@ void zylia_capture_close(void) {
     asio_session_release();
 }
 
-#else /* !BW_HAVE_ASIO: stubs so consumers can link unconditionally */
+#else /* !BWA_HAVE_ASIO: stubs so consumers can link unconditionally */
 
 int       zylia_capture_list(void)                    { fprintf(stderr, "zylia_capture: built without ASIO\n"); return 1; }
 ZpShared* zylia_capture_open(const char*, double)     { fprintf(stderr, "zylia_capture: built without ASIO (vendor the SDK; see third_party/README.md)\n"); return NULL; }
 void      zylia_capture_close(void)                   {}
 
-#endif /* BW_HAVE_ASIO */
+#endif /* BWA_HAVE_ASIO */

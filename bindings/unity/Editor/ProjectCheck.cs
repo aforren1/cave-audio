@@ -1,6 +1,6 @@
-// BwAudioProjectCheck.cs — editor-only guardrail.
+// ProjectCheck.cs — editor-only guardrail.
 //
-// The bwaudio engine OWNS the audio device (ASIO/Dante + the binaural monitor). Unity's built-in
+// The bw_audio engine OWNS the audio device (ASIO/Dante + the binaural monitor). Unity's built-in
 // audio pipeline must therefore be OFF — left enabled it opens its own output device (wasted CPU,
 // possible contention for the monitor's headphones) and any stray AudioSource plays the WRONG path
 // instead of the 26-speaker array. The switch is Project Settings > Audio > "Disable Unity Audio"
@@ -10,23 +10,23 @@
 using UnityEditor;
 using UnityEngine;
 
-namespace CaveAudio.EditorTools
+namespace BwAudio.EditorTools
 {
     [InitializeOnLoad]
-    public static class BwAudioProjectCheck
+    public static class ProjectCheck
     {
         const string AudioManagerPath = "ProjectSettings/AudioManager.asset";
 
-        static BwAudioProjectCheck() => EditorApplication.delayCall += WarnIfEnabled;
+        static ProjectCheck() => EditorApplication.delayCall += WarnIfEnabled;
 
         static void WarnIfEnabled()
         {
             if (!IsUnityAudioDisabled())
                 Debug.LogWarning(
-                    "[BwAudio] Unity's built-in audio is ENABLED. The bwaudio engine owns the audio " +
+                    "[bw_audio] Unity's built-in audio is ENABLED. The bw_audio engine owns the audio " +
                     "device, so leaving Unity audio on wastes CPU, can contend for the monitor's output " +
                     "device, and plays stray AudioSources the wrong way (not through the CAVE array). " +
-                    "Run Tools → BwAudio → Disable Unity Audio, or tick Project Settings → " +
+                    "Run Tools → Engine → Disable Unity Audio, or tick Project Settings → " +
                     "Audio → “Disable Unity Audio”.");
         }
 
@@ -34,7 +34,7 @@ namespace CaveAudio.EditorTools
         static void DisableUnityAudio()
         {
             if (SetDisableAudio(true))
-                Debug.Log("[BwAudio] Unity built-in audio disabled. Re-enter Play mode to apply.");
+                Debug.Log("[bw_audio] Unity built-in audio disabled. Re-enter Play mode to apply.");
         }
 
         // grey out the menu item once it's already disabled
@@ -57,7 +57,7 @@ namespace CaveAudio.EditorTools
         {
             var so = LoadAudioManager();
             var p = so?.FindProperty("m_DisableAudio");
-            if (p == null) { Debug.LogError("[BwAudio] could not access AudioManager.m_DisableAudio."); return false; }
+            if (p == null) { Debug.LogError("[bw_audio] could not access AudioManager.m_DisableAudio."); return false; }
             p.boolValue = value;
             so.ApplyModifiedProperties();
             AssetDatabase.SaveAssets();

@@ -6,8 +6,8 @@
  * same everywhere. One copy of the JSON parsing, so a schema change lands everywhere at once.
  * C and C++ (no compound literals). cJSON + raylib.
  */
-#ifndef BW_CONSTRAINTS_VIEW_H
-#define BW_CONSTRAINTS_VIEW_H
+#ifndef BWA_CONSTRAINTS_VIEW_H
+#define BWA_CONSTRAINTS_VIEW_H
 
 #include "raylib.h"
 #include "raymath.h"
@@ -95,4 +95,4 @@ static inline void cv_draw(const CvConstraints* c) {
     }
 }
 
-#endif /* BW_CONSTRAINTS_VIEW_H */
+#endif /* BWA_CONSTRAINTS_VIEW_H */

@@ -12,8 +12,8 @@
  * Windows/x86 only (the whole engine is): the InterlockedExchange/CompareExchange on the
  * sequence are full barriers, which order the data stores/loads between them on this target.
  */
-#ifndef BW_POSE_H
-#define BW_POSE_H
+#ifndef BWA_POSE_H
+#define BWA_POSE_H
 
 #include <intrin.h>
 #include <stdbool.h>
@@ -60,4 +60,4 @@ static inline bool pose_read(const PoseSlot* s, float p[3], float q[4]) {
     return pose_read_t(s, p, q, 0);
 }
 
-#endif /* BW_POSE_H */
+#endif /* BWA_POSE_H */

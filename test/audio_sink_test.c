@@ -24,10 +24,10 @@ typedef struct {
     uint64_t      prev_pos;
 } Probe;
 
-static void on_render(void* user, float* bus, uint32_t nframes, const BwTimestamp* ts) {
+static void on_render(void* user, float* bus, uint32_t nframes, const bwa_timestamp* ts) {
     Probe* p = (Probe*)user;
     /* prove the bus is writable for the full block (the engine would mix here) */
-    memset(bus, 0, sizeof(float) * (size_t)nframes * BW_CHANNELS);
+    memset(bus, 0, sizeof(float) * (size_t)nframes * BWA_CHANNELS);
 
     if (!p->first) {
         if (ts->system_time_ns < p->prev_ns)  p->time_monotonic = 0;
@@ -47,16 +47,16 @@ int main(void) {
     memset(&p, 0, sizeof p);
     p.first = 1; p.time_monotonic = 1; p.pos_monotonic = 1;
 
-    const uint32_t SR = 48000, BS = 256, CH = BW_CHANNELS;
+    const uint32_t SR = 48000, BS = 256, CH = BWA_CHANNELS;
     char err[256] = {0};
-    BwSink* s = bw_null_sink_open(SR, BS, CH, on_render, &p, err, sizeof err);
+    bwa_sink* s = bwa_null_sink_open(SR, BS, CH, on_render, &p, err, sizeof err);
     if (!s) { fprintf(stderr, "FAIL: open: %s\n", err[0] ? err : "(no message)"); return 1; }
 
-    const char* backend = bw_sink_backend(s);
-    if (bw_sink_start(s) != 0) { fprintf(stderr, "FAIL: start\n"); bw_sink_close(s); return 1; }
+    const char* backend = bwa_sink_backend(s);
+    if (bwa_sink_start(s) != 0) { fprintf(stderr, "FAIL: start\n"); bwa_sink_close(s); return 1; }
 
     Sleep(200);                                  /* ~37 blocks at 256/48000 = 5.33 ms */
-    bw_sink_stop(s);                             /* joins the audio thread */
+    bwa_sink_stop(s);                             /* joins the audio thread */
 
     /* thread is joined; reading the probe is race-free now */
     const unsigned long blocks = p.blocks;
@@ -70,7 +70,7 @@ int main(void) {
         ok = 0;
     }
 
-    bw_sink_close(s);
+    bwa_sink_close(s);
     if (!ok) return 1;
 
     printf("audio sink OK: backend=%s blocks=%lu last_sample_pos=%llu last_ns=%llu\n",

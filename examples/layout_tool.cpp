@@ -2,9 +2,9 @@
  * layout_tool.cpp — interactive speaker-layout authoring for the CAVE array.
  *
  * Define where the 26 speakers physically are and export a valid cave_layout.json (the file the
- * engine loads via BwConfig.layout_path; see docs/layout-schema.md). The killer feature is identify-
+ * engine loads via bwa_desc.layout_path; see docs/layout-schema.md). The killer feature is identify-
  * by-ear: each speaker's INDEX is its bus/output channel, so selecting speaker N and enabling the
- * tone drives that exact channel with the built-in test signal (bw_test_signal) out the cave profile
+ * tone drives that exact channel with the built-in test signal (bwa_set_test_signal) out the cave profile
  * -> DVS -> the physical speaker. So the survey loop is: pick an index, enable the tone, walk to
  * whichever speaker sounds, read its position, and place marker N there (nudge, or type exact coords
  * into the panel's position field).
@@ -36,9 +36,9 @@
  *
  * UI stack: the 3D room view (orbit + head-view cameras, ray-picked speakers, the coverage shell)
  * stays raylib — it is a *scene*, not a plot — and every control surface (panel, HUD, tooltips) is
- * Dear ImGui rendered on top via rlImGui, themed like the calibration station (bw_theme.h).
+ * Dear ImGui rendered on top via rlImGui, themed like the calibration station (bwa_theme.h).
  * imgui_test_engine drives the ACTUAL panel with fake inputs under ctest (`--tests [filter]`),
- * captures screenshots to output/captures/, and exits pass/fail — same harness as bw_calib_view.
+ * captures screenshots to output/captures/, and exits pass/fail — same harness as bwa_calib_view.
  * Keyboard shortcuts act only when imgui doesn't want the keyboard; mouse picking/camera only when
  * the cursor isn't over the UI (io.WantCapture*).
  *
@@ -48,9 +48,9 @@
  * Controls (preview, P toggles): WASD/RF move the source   SPACE auto-orbit/near-far/high-low sweep
  *           B A/B the panner DBAP<->SPCAP<->VBAP live   Common: right-drag/wheel camera
  *           ESC / close quits — with a confirm (Save and quit / Quit / Cancel) if there are unsaved edits
- * Build: cmake -S . -B build -DBWAUDIO_BUILD_PLAYGROUND=ON && cmake --build build --target bw_layout_tool
+ * Build: cmake -S . -B build -DBWA_BUILD_PLAYGROUND=ON && cmake --build build --target bwa_layout_tool
  */
-#include "bwaudio.h"
+#include "bw_audio.h"
 #include "raylib.h"
 #include "raymath.h"
 #include "rlgl.h"            /* rlDrawRenderBatchActive: flush the 3D batch before a screenshot */
@@ -61,7 +61,7 @@
 
 #include "imgui.h"
 #include "rlImGui.h"
-#include "bw_theme.h"        /* station theme + embedded Roboto (applyTheme / loadEmbeddedFont / uiScaled) */
+#include "bwa_theme.h"        /* station theme + embedded Roboto (applyTheme / loadEmbeddedFont / uiScaled) */
 #include "imgui_te_engine.h"
 #include "imgui_te_context.h"
 #include "imgui_te_ui.h"
@@ -72,7 +72,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-#define NSPK           26         /* array CAPACITY (== BW_CHANNELS); g_nspk is the layout's ACTUAL count */
+#define NSPK           26         /* array CAPACITY (== BWA_CHANNELS); g_nspk is the layout's ACTUAL count */
 #define NSPK_MIN       4          /* the engine's layout loader accepts 4..NSPK speakers */
 #define SR             48000u
 #define SPEED_OF_SOUND 343.0f
@@ -282,13 +282,13 @@ static Vector3 constraint_project(Vector3 p) {           /* nearest allowed poin
 #define PREV_WAV    "._bw_layout_preview.wav"
 #define TEMP_LAYOUT "._bw_layout_preview.json"
 #define SRC_GAIN    0.7f
-static BwEngine*   e;
+static bwa_engine*   e;
 static int         audio;
 static const char* backend = "none";
-static BwSound     pv_sound;
-static BwSource    pv_src;
+static bwa_sound     pv_sound;
+static bwa_source    pv_src;
 static int         preview, pv_orbit, layout_dirty = 1;   /* dirty=1 forces the first preview to rebuild from spk[] */
-static int         pv_panner;                             /* 0=DBAP 1=SPCAP 2=VBAP (= BwPanner; live A/B, B key) */
+static int         pv_panner;                             /* 0=DBAP 1=SPCAP 2=VBAP (= bwa_panner; live A/B, B key) */
 static const char* panner_names[] = { "DBAP (moving)", "SPCAP (fixed)", "VBAP (fixed)" };
 static float       pv_t;
 static Vector3     src_pos = { 1.5f, 0.0f, 0.0f };
@@ -344,21 +344,26 @@ static void gen_pink_wav(const char* p) {
 /* (re)create the cave-profile engine + the (muted) preview source. layout_path NULL = default grid;
  * the preview rebuilds with a temp file written from spk[] so DBAP pans through the edited positions. */
 static void build_engine(const char* layout_path) {
-    BwConfig cfg = { BW_PROFILE_CAVE, layout_path, NULL, SR, 256, false };
-    e = bw_create(&cfg);
+    /* demand a real device (BWA_SINK_ASIO): the audition drives REAL speakers — silence must fail
+     * loudly, not hide behind the null sink. A failed start leaves the editor running (below). */
+    bwa_desc cfg = { };
+    cfg.profile = BWA_PROFILE_CAVE; cfg.layout_path = layout_path;
+    cfg.sample_rate = SR; cfg.block_size = 256;
+    cfg.sink = BWA_SINK_ASIO;
+    e = bwa_create(&cfg);
     backend = "none"; audio = 0; pv_sound = 0; pv_src = 0;
     if (!e) return;
-    if (bw_start(e) != 0) {
-        const char* err = bw_last_error(e);
-        printf("bw_start: %s — no audition (needs an ASIO device / DVS with an output per speaker); "
+    if (bwa_start(e) != 0) {
+        const char* err = bwa_last_error(e);
+        printf("bwa_start: %s — no audition (needs an ASIO device / DVS with an output per speaker); "
                "the editor still runs.\n", err ? err : "?");
     }
-    backend = bw_audio_backend(e);
+    backend = bwa_get_audio_backend(e);
     audio = (strncmp(backend, "asio", 4) == 0);
-    pv_sound = bw_load_sound(e, PREV_WAV);
-    pv_src   = bw_source_create(e);
-    bw_source_play(e, pv_src, pv_sound, true);
-    bw_source_set_gain(e, pv_src, 0.0f);          /* silent until preview mode */
+    pv_sound = bwa_load_sound(e, PREV_WAV);
+    pv_src   = bwa_source_create(e);
+    bwa_source_play(e, pv_src, pv_sound, true);
+    bwa_source_set_gain(e, pv_src, 0.0f);          /* silent until preview mode */
 }
 
 /* Perceptually-weighted localization error (deg) between intended dir `d` and the actual energy-vector
@@ -386,14 +391,14 @@ static float score_mean[3], score_worst[3];      /* [DBAP, SPCAP, VBAP] rE local
 static int   scored, score_stale, last_score_frame;   /* the per-panner scoreboard auto-refreshes on a throttle */
 
 /* mean + worst rE localization error (deg) over the shell, from the panner's observer model: DBAP over
- * the moving listener grid; SPCAP/VBAP from the fixed centre. Uses bw_panner_gains_batch (the ACTUAL
+ * the moving listener grid; SPCAP/VBAP from the fixed centre. Uses bwa_panner_gains_batch (the ACTUAL
  * engine solve), so the score reflects what will ship — not a re-implementation. */
-static void score_panner(BwPanner panner, int stride, float* mean_deg, float* worst_deg) {
+static void score_panner(bwa_panner panner, int stride, float* mean_deg, float* worst_deg) {
     static float gains[NCOV * NSPK], srcs[NCOV * 3];
     float pos[NSPK * 3];
     for (int i = 0; i < g_nspk; ++i) { pos[i*3] = spk[i].pos.x; pos[i*3+1] = spk[i].pos.y; pos[i*3+2] = spk[i].pos.z; }
     if (stride < 1) stride = 1;                     /* >1 subsamples the direction shell (coarse, for the optimizer) */
-    int NL = (panner == BW_PAN_DBAP) ? 27 : 1;     /* DBAP: moving grid; SPCAP/VBAP: fixed centre */
+    int NL = (panner == BWA_PAN_DBAP) ? 27 : 1;     /* DBAP: moving grid; SPCAP/VBAP: fixed centre */
     double sumerr = 0; float worst = 0; int cnt = 0;
     for (int l = 0; l < NL; ++l) {
         Vector3 Lp = cov_lis[l]; Lp.y += obs_height;    /* the listener's EARS are at obs_height, not the floor */
@@ -405,7 +410,7 @@ static void score_panner(BwPanner panner, int stride, float* mean_deg, float* wo
             srcs[ns*3+2] = Lp.z + COV_R * cov_dir[i].z;
             ++ns;
         }
-        bw_panner_gains_batch(panner, pos, (uint32_t)g_nspk, lisf, srcs, ns, gains);
+        bwa_panner_gains_batch(panner, pos, (uint32_t)g_nspk, lisf, srcs, ns, gains);
         for (int j = 0; j < ns; ++j) {
             int i = j * stride;                     /* the cov_dir index this sample came from */
             float* g = &gains[j * g_nspk];
@@ -429,11 +434,11 @@ static void score_panner(BwPanner panner, int stride, float* mean_deg, float* wo
 /* fill cov_err[] with the selected panner's per-direction rE error (deg), averaged over the observer
  * model score_panner uses (DBAP: the moving grid when coverage_moving; SPCAP/VBAP: the fixed centre).
  * Same real solve as the X-score — this is its per-direction breakdown, for the overlay. */
-static void compute_cov_err(BwPanner panner) {
+static void compute_cov_err(bwa_panner panner) {
     static float gains[NCOV * NSPK], srcs[NCOV * 3];
     float pos[NSPK * 3];
     for (int i = 0; i < g_nspk; ++i) { pos[i*3]=spk[i].pos.x; pos[i*3+1]=spk[i].pos.y; pos[i*3+2]=spk[i].pos.z; }
-    int NL = (panner == BW_PAN_DBAP && coverage_moving) ? 27 : 1;
+    int NL = (panner == BWA_PAN_DBAP && coverage_moving) ? 27 : 1;
     for (int i = 0; i < NCOV; ++i) cov_err[i] = 0.0f;
     for (int l = 0; l < NL; ++l) {
         Vector3 Lp = cov_lis[l]; Lp.y += obs_height;    /* ears at obs_height */
@@ -441,7 +446,7 @@ static void compute_cov_err(BwPanner panner) {
         for (int i = 0; i < NCOV; ++i) {
             srcs[i*3]=Lp.x+COV_R*cov_dir[i].x; srcs[i*3+1]=Lp.y+COV_R*cov_dir[i].y; srcs[i*3+2]=Lp.z+COV_R*cov_dir[i].z;
         }
-        bw_panner_gains_batch(panner, pos, (uint32_t)g_nspk, lisf, srcs, NCOV, gains);
+        bwa_panner_gains_batch(panner, pos, (uint32_t)g_nspk, lisf, srcs, NCOV, gains);
         for (int i = 0; i < NCOV; ++i) {
             float* g = &gains[i * g_nspk];
             float rE[3] = { 0, 0, 0 };
@@ -471,7 +476,7 @@ static float   opt_step = 0.30f, opt_cost;
 static float   opt_leash = 3.0f;                          /* max optimizer displacement from the anchor (m); ~free at 3 m */
 static Vector3 opt_anchor[NSPK];                          /* speaker positions captured when optimization started */
 
-static float opt_cost_of(BwPanner p) {   /* coarse; + a penalty per speaker in a projector shadow so the climb clears them */
+static float opt_cost_of(bwa_panner p) {   /* coarse; + a penalty per speaker in a projector shadow so the climb clears them */
     float m, w; score_panner(p, 4, &m, &w);
     int occ = 0; for (int i = 0; i < g_nspk; ++i) if (!los_clear(spk[i].pos)) ++occ;
     return m + 0.5f * w + 25.0f * (float)occ;
@@ -483,7 +488,7 @@ static int edited_unsaved;   /* any layout edit since the last successful save/r
 static void mark_edit(void)  { layout_dirty = 1; score_stale = 1; cov_err_stale = 1; edited_unsaved = 1; }
 static void mark_score(void) { score_stale = 1; cov_err_stale = 1; }   /* metric knob changed; the layout file didn't */
 
-static void optimize_step(BwPanner p, int trials) {
+static void optimize_step(bwa_panner p, int trials) {
     for (int t = 0; t < trials; ++t) {
         int s = rand() % g_nspk;
         Vector3 old = spk[s].pos;
@@ -534,7 +539,7 @@ static bool CheckboxInt(const char* label, int* v) {
 /* ============================== UI state + actions ============================== */
 
 static char  g_path[512] = "cave_layout.json";      /* save/load target (panel-editable) */
-static int   sel = 0, tone_on = 0, tone_kind = BW_TEST_SINE, driven = -1;
+static int   sel = 0, tone_on = 0, tone_kind = BWA_TEST_SINE, driven = -1;
 static int   fps_view = 0;                          /* first-person view from the observer's ears (H) */
 static float fps_yaw = 0.0f, fps_pitch = 0.0f, fps_fov = 75.0f;   /* yaw 0 = +z, the room's default facing */
 static float cam_yaw = 45.0f * DEG2RAD, cam_pitch = 30.0f * DEG2RAD, cam_dist = 9.0f;
@@ -557,22 +562,22 @@ static void do_snap(void) {
     mark_edit();
 }
 static void do_score(void) {
-    for (int p = 0; p < 3; ++p) score_panner((BwPanner)p, 1, &score_mean[p], &score_worst[p]);
+    for (int p = 0; p < 3; ++p) score_panner((bwa_panner)p, 1, &score_mean[p], &score_worst[p]);
     scored = 1; score_stale = 0;
 }
 static void set_optimizing(int on) {
     if (on && !opt_running) {
-        opt_cost = opt_cost_of((BwPanner)pv_panner); opt_step = 0.30f; opt_stall = 0; opt_iter = 0;
+        opt_cost = opt_cost_of((bwa_panner)pv_panner); opt_step = 0.30f; opt_stall = 0; opt_iter = 0;
         for (int i = 0; i < g_nspk; ++i) opt_anchor[i] = spk[i].pos;   /* leash anchor = here */
     }
     opt_running = on;
 }
 static void enter_preview(void) {      /* rebuild so the preview pans through the edited layout */
-    if (driven >= 0 && e) { bw_test_signal(e, (uint32_t)driven, BW_TEST_OFF, 0.0f); driven = -1; }
+    if (driven >= 0 && e) { bwa_set_test_signal(e, (uint32_t)driven, BWA_TEST_OFF, 0.0f); driven = -1; }
     tone_on = 0; pv_orbit = 0; pv_t = 0.0f;      /* each preview session starts manual, fresh orbit phase */
     if (layout_dirty && e && audio) {            /* rebuild only when there's a device to hear it on */
         if (save_json(TEMP_LAYOUT)) {            /* ... and only if the temp layout actually wrote */
-            bw_stop(e); bw_destroy(e);
+            bwa_stop(e); bwa_destroy(e);
             build_engine(TEMP_LAYOUT);
             layout_dirty = 0; driven = -1;
         } else {
@@ -582,14 +587,14 @@ static void enter_preview(void) {      /* rebuild so the preview pans through th
     opt_running = 0;                             /* stop the optimizer when leaving edit for preview */
     preview = 1;
     if (e) {
-        bw_set_panner(e, (BwPanner)pv_panner);   /* rebuilt engine defaults to DBAP */
-        bw_source_set_gain(e, pv_src, SRC_GAIN);
-        bw_commit(e);
+        bwa_set_panner(e, (bwa_panner)pv_panner);   /* rebuilt engine defaults to DBAP */
+        bwa_source_set_gain(e, pv_src, SRC_GAIN);
+        bwa_commit(e);
     }
 }
 static void leave_preview(void) {
     preview = 0;
-    if (e) { bw_source_set_gain(e, pv_src, 0.0f); bw_commit(e); }
+    if (e) { bwa_source_set_gain(e, pv_src, 0.0f); bwa_commit(e); }
 }
 
 /* ---- quit guard: ESC / the close button ask before dropping unsaved edits ---- */
@@ -604,8 +609,8 @@ static void request_quit(void) {
 static void update_title(void) {
     static int shown = -1;
     if (edited_unsaved != shown) {
-        SetWindowTitle(edited_unsaved ? "bwaudio - speaker layout tool  [unsaved]"
-                                      : "bwaudio - speaker layout tool");
+        SetWindowTitle(edited_unsaved ? "bw_audio - speaker layout tool  [unsaved]"
+                                      : "bw_audio - speaker layout tool");
         shown = edited_unsaved;
     }
 }
@@ -641,7 +646,7 @@ static void handle_preview_input(float dt, bool kb) {
     if (kb && IsKeyPressed(KEY_SPACE)) pv_orbit = !pv_orbit;
     if (kb && IsKeyPressed(KEY_B)) {                 /* live A/B: DBAP <-> SPCAP <-> VBAP (atomic, safe while running) */
         pv_panner = (pv_panner + 1) % 3;
-        if (e) bw_set_panner(e, (BwPanner)pv_panner);
+        if (e) bwa_set_panner(e, (bwa_panner)pv_panner);
     }
     if (pv_orbit) {                                  /* hands-free orbit + near/far + high/low sweep */
         pv_t += dt;
@@ -657,9 +662,9 @@ static void handle_preview_input(float dt, bool kb) {
         if (IsKeyDown(KEY_F)) src_pos.y -= mv;
     }
     if (audio) {
-        bw_source_set_pos(e, pv_src, src_pos.x, src_pos.y, src_pos.z);
-        bw_set_listener_pose(e, 0, obs_height, 0, 0, 0, 0, 1);   /* ears at obs_height; walk the room to test off-center */
-        bw_commit(e);
+        bwa_source_set_pos(e, pv_src, src_pos.x, src_pos.y, src_pos.z);
+        bwa_set_listener_pose(e, 0, obs_height, 0, 0, 0, 0, 1);   /* ears at obs_height; walk the room to test off-center */
+        bwa_commit(e);
     }
 }
 
@@ -680,7 +685,7 @@ static void handle_edit_input(float dt, bool kb, bool ms, const Camera3D& cam) {
         if (IsKeyDown(KEY_PAGE_DOWN)) spk[sel].gain_db -= 6.0f * dt;
         if (memcmp(&p0, &spk[sel].pos, sizeof p0) != 0 || g0 != spk[sel].gain_db) mark_edit();
         if (IsKeyPressed(KEY_T)) tone_on = !tone_on;
-        if (IsKeyPressed(KEY_N)) tone_kind = (tone_kind == BW_TEST_SINE) ? BW_TEST_NOISE : BW_TEST_SINE;
+        if (IsKeyPressed(KEY_N)) tone_kind = (tone_kind == BWA_TEST_SINE) ? BWA_TEST_NOISE : BWA_TEST_SINE;
         if (IsKeyPressed(KEY_S)) do_save();
         if (IsKeyPressed(KEY_L)) do_reload();
         if (IsKeyPressed(KEY_K)) do_snap();
@@ -707,11 +712,11 @@ static void handle_edit_input(float dt, bool kb, bool ms, const Camera3D& cam) {
 static void drive_tone(void) {
     if (!audio || preview) return;
     if (tone_on) {
-        if (driven >= 0 && driven != sel) bw_test_signal(e, (uint32_t)driven, BW_TEST_OFF, 0.0f);
-        bw_test_signal(e, (uint32_t)sel, (BwTestKind)tone_kind, TEST_GAIN);
+        if (driven >= 0 && driven != sel) bwa_set_test_signal(e, (uint32_t)driven, BWA_TEST_OFF, 0.0f);
+        bwa_set_test_signal(e, (uint32_t)sel, (bwa_test_kind)tone_kind, TEST_GAIN);
         driven = sel;
     } else if (driven >= 0) {
-        bw_test_signal(e, (uint32_t)driven, BW_TEST_OFF, 0.0f);
+        bwa_set_test_signal(e, (uint32_t)driven, BWA_TEST_OFF, 0.0f);
         driven = -1;
     }
 }
@@ -812,7 +817,7 @@ static void draw_scene(const Camera3D& cam, float* cov_worst_out, float* cov_mea
          * HUD label never disagree; throttle only the layout-edit churn (which fires every frame mid-optimize) */
         int structural = (!cov_err_valid || cov_err_panner != pv_panner || cov_err_moving != coverage_moving);
         if (structural || (cov_err_stale && cov_frame - cov_err_frame >= 6))
-            compute_cov_err((BwPanner)pv_panner);
+            compute_cov_err((bwa_panner)pv_panner);
         double macc = 0.0;
         for (int s = 0; s < NCOV; ++s) {
             float err = cov_err[s];
@@ -926,7 +931,7 @@ static void draw_panel(void) {
         CheckboxInt("auto-orbit [SPACE]", &pv_orbit);
         bwTip("hands-free sweep: the source orbits while moving near/far and high/low");
         if (ImGui::Combo("panner", &pv_panner, "DBAP (moving)\0SPCAP (fixed)\0VBAP (fixed)\0") && e)
-            bw_set_panner(e, (BwPanner)pv_panner);   /* live A/B (atomic, safe while running) */
+            bwa_set_panner(e, (bwa_panner)pv_panner);   /* live A/B (atomic, safe while running) */
         bwTip("A/B by ear while it plays - the switch is atomic (no glitch)");
         ImGui::TextDisabled("WASD/RF move the source");
         if (ImGui::Button("Back to edit [P]", ImVec2(-1, 0))) leave_preview();
@@ -958,8 +963,8 @@ static void draw_panel(void) {
               /* the engine's channel count IS the layout's, so a count change must rebuild it —
                * otherwise the test tone on a newly-added channel goes nowhere */
               if (e && audio && save_json(TEMP_LAYOUT)) {
-                  if (driven >= 0) { bw_test_signal(e, (uint32_t)driven, BW_TEST_OFF, 0.0f); driven = -1; }
-                  bw_stop(e); bw_destroy(e);
+                  if (driven >= 0) { bwa_set_test_signal(e, (uint32_t)driven, BWA_TEST_OFF, 0.0f); driven = -1; }
+                  bwa_stop(e); bwa_destroy(e);
                   build_engine(TEMP_LAYOUT);
                   layout_dirty = 0;
               }
@@ -978,8 +983,8 @@ static void draw_panel(void) {
     bwTip("drive THIS channel with the test signal out the array: walk the room, hear which "
           "physical speaker it is, place its marker (needs the ASIO/DVS device)");
     ImGui::SameLine();
-    { bool nb = tone_kind == BW_TEST_NOISE;
-      if (ImGui::Checkbox("noise [N]", &nb)) tone_kind = nb ? BW_TEST_NOISE : BW_TEST_SINE; }
+    { bool nb = tone_kind == BWA_TEST_NOISE;
+      if (ImGui::Checkbox("noise [N]", &nb)) tone_kind = nb ? BWA_TEST_NOISE : BWA_TEST_SINE; }
     bwTip("test-signal type; noise is easier to localize by ear than a sine");
     if (ImGui::Button("Snap all to constraints [K]", ImVec2(-1, 0))) do_snap();
     bwTip("project every speaker to its nearest allowed point: inside bounds, out of no-go and "
@@ -1111,19 +1116,19 @@ static void register_tests(ImGuiTestEngine* te) {
         IM_CHECK_EQ(load_json(TEST_OUT), 24);
         IM_CHECK_EQ(g_nspk, 24);
         IM_CHECK_LT(fabsf(spk[23].pos.z - 1.1f), 1e-3f);
-        /* the ENGINE must accept what we wrote, at OUR count (bw_create only loads — no device) */
-        BwConfig cfg; memset(&cfg, 0, sizeof cfg);
-        cfg.profile = BW_PROFILE_CAVE; cfg.sample_rate = SR; cfg.block_size = 256;
+        /* the ENGINE must accept what we wrote, at OUR count (bwa_create only loads — no device) */
+        bwa_desc cfg; memset(&cfg, 0, sizeof cfg);
+        cfg.profile = BWA_PROFILE_CAVE; cfg.sample_rate = SR; cfg.block_size = 256;
         cfg.layout_path = TEST_OUT;
-        BwEngine* te2 = bw_create(&cfg);
+        bwa_engine* te2 = bwa_create(&cfg);
         IM_CHECK(te2 != NULL);
         if (te2) {
-            IM_CHECK(bw_last_error(te2) == NULL);                /* not silently defaulted to the 26 grid */
-            IM_CHECK_EQ(bw_channel_count(te2), 24u);
-            bw_destroy(te2);
+            IM_CHECK(bwa_last_error(te2) == NULL);                /* not silently defaulted to the 26 grid */
+            IM_CHECK_EQ(bwa_get_channel_count(te2), 24u);
+            bwa_destroy(te2);
         }
         float m = 0, w = 0;                                      /* the real panner solve, on 24 speakers */
-        score_panner(BW_PAN_DBAP, 4, &m, &w);
+        score_panner(BWA_PAN_DBAP, 4, &m, &w);
         IM_CHECK_GT(w, 0.0f);
         g_nspk = keep; seed_default(); layout_dirty = 1;
     };
@@ -1146,7 +1151,7 @@ static void register_tests(ImGuiTestEngine* te) {
     t->TestFunc = [](ImGuiTestContext*) {
         seed_default(); layout_dirty = 1;
         float m = -1, w = -1;
-        score_panner(BW_PAN_DBAP, 2, &m, &w);
+        score_panner(BWA_PAN_DBAP, 2, &m, &w);
         IM_CHECK_GT(m, 0.0f);
         IM_CHECK_LT(m, 90.0f);
         IM_CHECK_GE(w, m);
@@ -1279,7 +1284,7 @@ int main(int argc, char** argv) {
     char filter[64] = "";
     for (int i = 1; i < argc; ++i)
         if (!strcmp(argv[i], "--help") || !strcmp(argv[i], "-h")) {
-            printf("usage: bw_layout_tool [cave_layout.json | mode]\n"
+            printf("usage: bwa_layout_tool [cave_layout.json | mode]\n"
                    "  edit a speaker layout in 3D (default file: ./cave_layout.json;\n"
                    "  ./constraints.json bounds the placement if present)\n"
                    "  --export   [file]                    write the layout headless\n"
@@ -1333,14 +1338,14 @@ int main(int argc, char** argv) {
     if (score_only) {                              /* headless: score the layout for each panner + exit */
         printf("layout: %s (%s)\n", g_path, loaded ? "loaded" : "default grid");
         for (int p = 0; p < 3; ++p) {
-            float m, w; score_panner((BwPanner)p, 1, &m, &w);
+            float m, w; score_panner((bwa_panner)p, 1, &m, &w);
             printf("  %-14s rE-localize error:  mean %4.1f deg   worst %4.1f deg\n", panner_names[p], m, w);
         }
         return 0;
     }
     if (optimize_only) {                           /* headless: optimize in place for one panner + save */
-        BwPanner p = BW_PAN_DBAP;
-        if (argc > 3) { if (!strcmp(argv[3], "spcap")) p = BW_PAN_SPCAP; else if (!strcmp(argv[3], "vbap")) p = BW_PAN_VBAP; }
+        bwa_panner p = BWA_PAN_DBAP;
+        if (argc > 3) { if (!strcmp(argv[3], "spcap")) p = BWA_PAN_SPCAP; else if (!strcmp(argv[3], "vbap")) p = BWA_PAN_VBAP; }
         float m0, w0; score_panner(p, 1, &m0, &w0);
         opt_cost = opt_cost_of(p); opt_step = 0.30f; opt_stall = 0; opt_iter = 0;
         for (int i = 0; i < g_nspk; ++i) opt_anchor[i] = spk[i].pos;           /* leash anchor (opt_leash defaults ~free) */
@@ -1354,8 +1359,7 @@ int main(int argc, char** argv) {
     printf("layout: %s (%s, %d speakers)\n", g_path, loaded ? "loaded" : "default dome", g_nspk);
 
     /* cave profile so the test signal / DBAP preview goes out the DVS to the real speakers;
-     * falls back to no audio (editor still works) if no such ASIO device is present (off-site). */
-    _putenv((char*)"BWAUDIO_SINK=asio");
+     * no audio (the editor still works) if no such ASIO device is present (off-site). */
     gen_pink_wav(PREV_WAV);                        /* the moving DBAP-preview source signal */
     build_engine(NULL);                            /* edit-mode engine (the test signal is layout-independent) */
 
@@ -1364,7 +1368,7 @@ int main(int argc, char** argv) {
      * DPI rides the theme's FontScaleMain instead (the same pattern as calib_view — and as rlImGui's
      * own default-font path). */
     SetConfigFlags(FLAG_MSAA_4X_HINT | (selftest ? FLAG_WINDOW_UNFOCUSED : 0));
-    InitWindow(1280, 800, "bwaudio - speaker layout tool");
+    InitWindow(1280, 800, "bw_audio - speaker layout tool");
     SetExitKey(KEY_NULL);                          /* ESC is handled below (it must not quit while typing) */
     SetTargetFPS(selftest ? 0 : 60);               /* selftest: run the suite unthrottled */
     g_uiScale = GetWindowScaleDPI().y;
@@ -1408,8 +1412,8 @@ int main(int argc, char** argv) {
         else         handle_edit_input(dt, kb, ms, cam);
 
         if (opt_running && !preview) {                    /* auto-optimizer: a few hill-climb trials per frame */
-            opt_cost = opt_cost_of((BwPanner)pv_panner);  /* re-baseline so a manual nudge can't wedge the climb */
-            optimize_step((BwPanner)pv_panner, 6);
+            opt_cost = opt_cost_of((bwa_panner)pv_panner);  /* re-baseline so a manual nudge can't wedge the climb */
+            optimize_step((bwa_panner)pv_panner, 6);
         }
         for (int i = 0; i < g_nspk; ++i) if (spk[i].pos.y < 0.0f) spk[i].pos.y = 0.0f;   /* y >= 0: speakers never below the floor */
         if (scored && score_stale && (cov_frame - last_score_frame) >= 10) {
@@ -1458,7 +1462,7 @@ int main(int argc, char** argv) {
     rlImGuiShutdown();                                   /* destroys the imgui context */
     ImGuiTestEngine_DestroyContext(g_te);                /* after DestroyContext, per the te docs */
     CloseWindow();
-    if (e) { bw_stop(e); bw_destroy(e); }
+    if (e) { bwa_stop(e); bwa_destroy(e); }
     remove(PREV_WAV); remove(TEMP_LAYOUT);
     return rc;
 }

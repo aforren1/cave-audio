@@ -12,8 +12,8 @@
  * Per-source like occlusion; the probe-transform convention (centre in the translation column, radius
  * from the basis lengths) is the one learned wiring baked reflections.
  */
-#ifndef BW_STEAM_PATH_H
-#define BW_STEAM_PATH_H
+#ifndef BWA_STEAM_PATH_H
+#define BWA_STEAM_PATH_H
 
 #include "steam_scene.h"
 #include "layout.h"
@@ -23,7 +23,7 @@ typedef struct SteamPath SteamPath;
 
 /* Create the pathing sim over `scene`'s geometry: generate a probe grid spanning the layout (+margin),
  * bake the visibility graph, and start a sim thread. `order` is the pathing ambisonic order (1..3).
- * NULL on failure. Call at bw_start, off the audio thread. */
+ * NULL on failure. Call at bwa_start, off the audio thread. */
 SteamPath* steam_path_create(SteamScene* scene, RtCore* rt, const Layout* L,
                              uint32_t sample_rate, uint32_t block, uint32_t order);
 void       steam_path_start(SteamPath* sp);    /* start the publishing sim thread (engine wires the tap first) */
@@ -44,4 +44,4 @@ void       steam_path_set_pos(SteamPath* sp, uint32_t handle, float x, float y, 
  * carries energy (sh[0] > 0), else 0. ---- */
 int        steam_path_debug_run_get(SteamPath* sp, const float listener[3], uint32_t handle, float eq[3], float* sh);
 
-#endif /* BW_STEAM_PATH_H */
+#endif /* BWA_STEAM_PATH_H */

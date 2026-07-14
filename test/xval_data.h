@@ -3,8 +3,8 @@
  * lpmv spherical harmonics, linprog/HiGHS l1-panning, qhull AllRAD, bilinear
  * RBJ prototypes, lfilter). See the generator header for what validates what.
  * Regenerate: python tools/xval/gen_reference.py  (deterministic). */
-#ifndef BW_XVAL_DATA_H
-#define BW_XVAL_DATA_H
+#ifndef BWA_XVAL_DATA_H
+#define BWA_XVAL_DATA_H
 
 #define XVAL_SH_N 64
 static const float xval_sh_dir[192] = {
@@ -1156,4 +1156,4 @@ static const float xval_lf_out[4096] = {
     0.943102956f, 0.167917654f, 0.279804021f, 0.104323491f, -0.373637885f, -0.329682946f, -0.698002517f, 0.0443073213f,
 };
 
-#endif /* BW_XVAL_DATA_H */
+#endif /* BWA_XVAL_DATA_H */

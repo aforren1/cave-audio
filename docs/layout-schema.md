@@ -1,8 +1,8 @@
 # Speaker layout file schema (`cave_layout.json`)
 
 The layout file is the surveyed description of the physical array. You pass it as
-`BwConfig.layout_path` (see [`api.md`](./api.md)). `layout.c` loads it once at
-`bw_create`/`bw_start` time, on the control thread — file I/O never touches the audio
+`bwa_desc.layout_path` (see [`api.md`](./api.md)). `layout.c` loads it once at
+`bwa_create`/`bwa_start` time, on the control thread — file I/O never touches the audio
 thread. Three consumers read the result:
 
 - **`dbap.c`** — speaker **positions** drive the listener-relative DBAP gain solve.
@@ -14,20 +14,20 @@ thread. Three consumers read the result:
   for the bus→ambisonics→binaural decode.
 
 **The speaker count in this file IS the engine's channel count.** Any N in **4..26** works
-(26 = `BW_CHANNELS`, the compile-time capacity), fixed for the engine's lifetime and readable
-back with `bw_channel_count` / `bw_get_speakers`. The CAVE array is 26; a smaller collaborator
+(26 = `BWA_CHANNELS`, the compile-time capacity), fixed for the engine's lifetime and readable
+back with `bwa_get_channel_count` / `bwa_get_speakers`. The CAVE array is 26; a smaller collaborator
 rig loads its own N-speaker file into the same binary.
 
 A complete, valid example lives at [`../examples/cave_layout.json`](../examples/cave_layout.json):
 a 3×3×3 boundary grid minus the center = exactly 26 speakers, floor-origin, y layers at
 0 / 1.5 / 3 m, ears nominally at 1.5.
 
-## Authoring with `bw_layout_tool`
+## Authoring with `bwa_layout_tool`
 
-You can author this file interactively with **`bw_layout_tool`**
-(`examples/layout_tool.cpp`, built with `-DBWAUDIO_BUILD_PLAYGROUND=ON`). Place each
+You can author this file interactively with **`bwa_layout_tool`**
+(`examples/layout_tool.cpp`, built with `-DBWA_BUILD_PLAYGROUND=ON`). Place each
 speaker in 3D and **identify it by ear**: a speaker's `index` is its output channel,
-so the tool drives that channel with the test signal (`bw_test_signal`) out the cave
+so the tool drives that channel with the test signal (`bwa_set_test_signal`) out the cave
 profile — you hear which physical speaker you're positioning.
 
 Press **P** for a **DBAP preview**: a source pans through your in-progress layout, so
@@ -35,14 +35,14 @@ you can hear gaps/smoothness and walk the room to judge off-center coverage. The
 rebuilds the engine with the edited positions, since the layout is load-time.
 
 The tool exports this schema with `delay_ms` auto-derived from the positions
-(max-distance alignment). A headless `bw_layout_tool --export <file>`
+(max-distance alignment). A headless `bwa_layout_tool --export <file>`
 writes/normalizes a layout without the GUI. To audition a saved layout in the full
-binaural playground: `bw_playground cave_layout.json`.
+binaural playground: `bwa_playground cave_layout.json`.
 
 **Scoring, constraints, and auto-optimization.** The tool can also *evaluate* and
 *improve* a layout for a chosen panner. Press **X** (or run `--score <file>`) to print
 each panner's rE-localization error — mean + worst over a direction shell × the
-working-volume listener grid, via `bw_panner_gains_batch` (the same solve that ships).
+working-volume listener grid, via `bwa_panner_gains_batch` (the same solve that ships).
 
 Drop a **`constraints.json`** next to the layout (see `examples/constraints.json`) to
 declare where speakers may go:
@@ -119,7 +119,7 @@ model (fixed centre vs the moving working volume). The file:
 | `reference` | object | provenance for the alignment values; `speed_of_sound_mps` is used if delays are derived rather than measured. Informational — the engine applies `delay_ms` as written. |
 | `dbap.rolloff_r` | float | the **blur** knob `r` from [`spatialization.md`](./spatialization.md): larger spreads energy over more speakers. Must be > 0. |
 | `dbap.distance_attenuation` | object | the source→listener distance-attenuation curve (the second tuning knob). The loader reads only `reference_distance_m` (> 0), `rolloff` (> 0), and `min_gain_db` (≤ 0; floors the attenuation). `model` is ignored — the inverse curve is the only one implemented. |
-| `speakers[]` | array | **4..26** speaker records (26 = the compile-time `BW_CHANNELS` capacity). **The speaker count IS the engine's channel count** — a 24-speaker install loads a 24-entry file into the same binary. Order is not significant for DBAP, but `index` is the channel the speaker maps to on the bus / ASIO output, and the indices must form a complete `0..N-1` permutation. |
+| `speakers[]` | array | **4..26** speaker records (26 = the compile-time `BWA_CHANNELS` capacity). **The speaker count IS the engine's channel count** — a 24-speaker install loads a 24-entry file into the same binary. Order is not significant for DBAP, but `index` is the channel the speaker maps to on the bus / ASIO output, and the indices must form a complete `0..N-1` permutation. |
 
 ### Per-speaker record
 
@@ -129,15 +129,15 @@ model (fixed centre vs the moving working volume). The file:
 | `position` | `[x, y, z]` float | surveyed position in room space (meters, RH). Each component must be finite and within ±1000 m. |
 | `gain_db` | float | measured per-speaker level trim, applied in the align stage (`align_process`). `0.0` = no trim. Must be in **[-100, 24]**; anything outside rejects the file. |
 | `delay_ms` | float | per-speaker delay to time-align arrival to the reference; converted to whole samples at `sample_rate` on load. `0.0` = the reference (farthest) speaker. A negative value clamps to `0`; anything **over 1000 ms rejects the file**. |
-| `eq` | float array (optional) | minimum-phase correction-FIR taps (up to 512), written by `bw_calibrate --eq` / `--room-eq`; applied per channel in the align stage before gain+delay. |
-| `room_eq` | object array (optional) | up to 8 LF modal-cut sections `{fc, gain_db, q}` (RBJ peaking, **cuts only**: `gain_db` in `[-24, 0]`, `fc` in `[10, 1000]`, `q` in `[0.25, 24]`), written by `bw_calibrate --room-eq`. **Static-listener room correction** — see [`calibration.md`](./calibration.md); rendered as biquads at the engine rate. |
+| `eq` | float array (optional) | minimum-phase correction-FIR taps (up to 512), written by `bwa_calibrate --eq` / `--room-eq`; applied per channel in the align stage before gain+delay. |
+| `room_eq` | object array (optional) | up to 8 LF modal-cut sections `{fc, gain_db, q}` (RBJ peaking, **cuts only**: `gain_db` in `[-24, 0]`, `fc` in `[10, 1000]`, `q` in `[0.25, 24]`), written by `bwa_calibrate --room-eq`. **Static-listener room correction** — see [`calibration.md`](./calibration.md); rendered as biquads at the engine rate. |
 
 ### Tracked room EQ: top-level `room_eq_grid` (optional)
 
-The moving-listener form of `room_eq`, written by `bw_calibrate --room-eq-grid` (one
+The moving-listener form of `room_eq`, written by `bwa_calibrate --room-eq-grid` (one
 run per mic placement — see [`calibration.md`](./calibration.md)). The engine
 interpolates the cut depths at the live listener position each block and glides the
-align biquads toward them (`bw_set_tracked_room_eq` is the live kill switch).
+align biquads toward them (`bwa_set_tracked_room_eq` is the live kill switch).
 
 ```jsonc
 "room_eq_grid": [
@@ -160,7 +160,7 @@ a time). The calibration writeback maintains both invariants for you.
 
 ## Validation (loader contract)
 
-`layout_load` rejects a malformed file (the reason surfaces through `bw_last_error`)
+`layout_load` rejects a malformed file (the reason surfaces through `bwa_last_error`)
 if any of:
 
 - `speakers.length` is outside `4..26`;
@@ -177,11 +177,11 @@ if any of:
 
 `schema_version` is not checked — the loader never reads it.
 
-**A present-but-invalid `BwConfig.layout_path` is NOT fatal.** `bw_create` records the
-reason in `bw_last_error` and falls back to the **26-speaker default grid**, so desk/dev
-runs with no survey still work; `bw_start` still returns success. An installation that
-must run on the surveyed geometry therefore **must check `bw_last_error` after
-`bw_create`** — a silently-defaulted layout pans the array with the wrong speaker
+**A present-but-invalid `bwa_desc.layout_path` is NOT fatal.** `bwa_create` records the
+reason in `bwa_last_error` and falls back to the **26-speaker default grid**, so desk/dev
+runs with no survey still work; `bwa_start` still returns success. An installation that
+must run on the surveyed geometry therefore **must check `bwa_last_error` after
+`bwa_create`** — a silently-defaulted layout pans the array with the wrong speaker
 positions, and (since the count follows the layout) a **different channel count**: a
 20-speaker install whose file fails to load comes up as a 26-channel engine. A NULL/empty
 `layout_path` intentionally selects the default grid with no error.
@@ -192,7 +192,7 @@ reloads it.
 
 ## Calibration writeback (unknown fields survive)
 
-`bw_calibrate` writes its results back into this file, and it does so
+`bwa_calibrate` writes its results back into this file, and it does so
 non-destructively. Every `calib_write_*` function (`src/calib.c`) re-parses the
 original JSON, mutates only its target fields — `gain_db`/`delay_ms` for the trims,
 `eq`, `room_eq`, `room_eq_grid`, `position` for the survey — and re-serializes the

@@ -1,15 +1,15 @@
 /*
  * frame.h — the room frame's identity basis, consumed from one place. The convention itself
  * (right-handed, +y up, +z forward = Motive's default; right ear at -x) is public ABI contract,
- * so the base vectors live in bwaudio.h (BW_ROOM_AHEAD/UP/RIGHT); this header adds the helper
- * the engine's orientation seams share. Flipping the convention = editing the bwaudio.h
+ * so the base vectors live in bw_audio.h (BWA_ROOM_AHEAD/UP/RIGHT); this header adds the helper
+ * the engine's orientation seams share. Flipping the convention = editing the bw_audio.h
  * constants, plus the mirrors a C constant cannot reach: the Unity binding's handedness flip
  * (bindings/unity Room.cs), the laterality tests' left/right speaker picks, and the docs.
  */
-#ifndef BW_FRAME_H
-#define BW_FRAME_H
+#ifndef BWA_FRAME_H
+#define BWA_FRAME_H
 
-#include "bwaudio.h"
+#include "bw_audio.h"
 
 /* rotate vector v by UNIT quaternion q (xyzw) — callers normalize degenerate input first */
 static inline void frame_qrot(const float q[4], const float v[3], float o[3]) {
@@ -22,4 +22,4 @@ static inline void frame_qrot(const float q[4], const float v[3], float o[3]) {
     o[2] = v[2] + w * tz + (x * ty - y * tx);
 }
 
-#endif /* BW_FRAME_H */
+#endif /* BWA_FRAME_H */

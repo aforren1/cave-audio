@@ -1,19 +1,19 @@
-// BwAcousticGeometry.cs — marks a GameObject's mesh as occluding/reflecting geometry for the engine's
-// acoustic scene, with a material. BwAudio collects every one of these at load time and bakes them
-// (world -> room space) into a single mesh via bw_scene_set_mesh_mat.
+// AcousticGeometry.cs — marks a GameObject's mesh as occluding/reflecting geometry for the engine's
+// acoustic scene, with a material. Engine collects every one of these at load time and bakes them
+// (world -> room space) into a single mesh via bwa_scene_set_mesh_mat.
 //
 // IMPORTANT: keep acoustic meshes SIMPLE (tens–hundreds of triangles). The engine ray-traces them at
 // runtime; render meshes (thousands of tris) are far too heavy. Use a low-poly proxy via `meshOverride`
 // (or a simple MeshFilter on a dedicated, renderer-less object). Geometry is STATIC (set before start).
 using UnityEngine;
 
-namespace CaveAudio
+namespace BwAudio
 {
     [DisallowMultipleComponent]
-    public sealed class BwAcousticGeometry : MonoBehaviour
+    public sealed class AcousticGeometry : MonoBehaviour
     {
         [Tooltip("Material for every triangle of this object. None = the engine's default material.")]
-        public BwMaterialAsset material;
+        public MaterialAsset material;
 
         [Tooltip("Low-poly acoustic mesh. If empty, the sibling MeshFilter's sharedMesh is used.")]
         public Mesh meshOverride;

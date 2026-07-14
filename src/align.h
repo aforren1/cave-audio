@@ -3,8 +3,8 @@
  * arrival times from unequally-distant CAVE speakers (docs/spatialization.md). align_create
  * allocates on the control thread; align_process runs on the audio thread (no alloc/lock).
  */
-#ifndef BW_ALIGN_H
-#define BW_ALIGN_H
+#ifndef BWA_ALIGN_H
+#define BWA_ALIGN_H
 
 #include "layout.h"
 
@@ -21,6 +21,6 @@ void     align_process(Aligner* a, float* bus, uint32_t nframes);  /* in place; 
  * align_process blocks slew toward — rt.c interpolates them from the grid at the live listener
  * position. gain_db is [channel][section] over the grid's fc/q ladder. AUDIO thread (the same thread
  * as align_process — plain stores, no atomics needed); no-op for a gridless layout. */
-void     align_room_eq_targets(Aligner* a, const float (*gain_db)[BW_ROOM_EQ_MAX]);
+void     align_room_eq_targets(Aligner* a, const float (*gain_db)[BWA_ROOM_EQ_MAX]);
 
-#endif /* BW_ALIGN_H */
+#endif /* BWA_ALIGN_H */

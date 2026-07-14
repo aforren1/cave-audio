@@ -29,7 +29,7 @@ the array origin.
 >
 > For best-in-class fixed-observer quality, **SPCAP** (speaker-placement correction
 > amplitude panning) is implemented as a selectable panner:
-> `bw_set_panner(e, BW_PAN_SPCAP)` at load time (`spcap.c`, next to `dbap.c` behind
+> `bwa_set_panner(e, BWA_PAN_SPCAP)` at load time (`spcap.c`, next to `dbap.c` behind
 > the bus seam — it touches neither the seam nor its consumers). It weights every
 > speaker by a smooth lobe `((1+cos)/2)^focus` toward the source's bearing from the
 > listener, scales by a per-speaker **placement correction** `1/local-density` so a
@@ -41,7 +41,7 @@ the array origin.
 > **Pick DBAP for a moving observer, SPCAP for a fixed one.** The layout tool's `V`
 > key scores a layout for either model; its preview `B` key A/Bs the panners live.
 >
-> **VBAP** (`BW_PAN_VBAP`, `vbap.c`) is also selectable: the 2-3 nearest speakers of
+> **VBAP** (`BWA_PAN_VBAP`, `vbap.c`) is also selectable: the 2-3 nearest speakers of
 > the hull triangle containing the source carry it. It is the **sharpest** of the
 > three, also fixed-observer. It needs a clean triangulation, so it suits a
 > *regular* array; it has VBAP's direction-dependent source-width artifact and falls
@@ -61,7 +61,7 @@ that layer is specified in [materials.md](./materials.md).
 
 Per voice, per frame *if dirty*: produce a gain vector `gtarget`, one entry per
 speaker, from the source position, the listener position, and the speaker layout.
-The vector is as long as the **layout's** speaker count (`bw_channel_count()`, 4..26
+The vector is as long as the **layout's** speaker count (`bwa_get_channel_count()`, 4..26
 — 26 on the CAVE array), never a hard-coded 26.
 
 Inputs:
@@ -108,7 +108,7 @@ listener moves.
 > A listener move dirties every voice (concurrency.md), so this runs for all active
 > voices on move frames. Keep it allocation-free and tight.
 
-## Dual-band panning (`bw_set_dual_band`, off by default)
+## Dual-band panning (`bwa_set_dual_band`, off by default)
 
 The panners normalise gains to constant **power** (`Σg² = gain²`, an energy-vector /
 `rE` pan) across the whole band. That is right for high frequencies, where the ear
@@ -131,7 +131,7 @@ atomic is on, so it A/Bs live.
 Dual-band is sweet-spot dependent (like VBAP). The dense array + small working area
 is favourable, but whether it helps a *roaming* listener is a by-ear/rig call.
 
-## Multi-listener compromise (`bw_set_extra_listeners`)
+## Multi-listener compromise (`bwa_set_extra_listeners`)
 
 Single-listener panning is exact for the tracked head and wrong for every other
 occupant — and CAVEs usually hold a group. With extra listener positions supplied
@@ -160,9 +160,9 @@ spec's `align_speakers`, implemented as `align_process` in `align.c`, driven by
 per-speaker values in the layout file (schema parsed in `layout.c`). Per channel,
 in order:
 
-- **Correction FIR** (`eq`, up to `BW_EQ_TAPS` = 512 taps) — the speaker-flattening
-  inverse EQ written by `bw_calibrate --eq`. Applied before the gain+delay.
-- **LF room-EQ cuts** (`room_eq`, up to `BW_ROOM_EQ_MAX` = 8 sections) — RBJ peaking
+- **Correction FIR** (`eq`, up to `BWA_EQ_TAPS` = 512 taps) — the speaker-flattening
+  inverse EQ written by `bwa_calibrate --eq`. Applied before the gain+delay.
+- **LF room-EQ cuts** (`room_eq`, up to `BWA_ROOM_EQ_MAX` = 8 sections) — RBJ peaking
   cuts for room modes, written by `--room-eq`. Static-listener installs only. Also
   before the gain+delay.
 - **Gain trim** — per-speaker level equalisation.
@@ -171,7 +171,7 @@ in order:
 
 The gain trim + delay are not optional for a real array, but they are trivial DSP.
 The two EQ stages are optional and bypass when absent. See
-[calibration.md](./calibration.md) for how `bw_calibrate` measures and writes all
+[calibration.md](./calibration.md) for how `bwa_calibrate` measures and writes all
 four.
 
 ## Propagation effects (opt-in, per source)
@@ -194,7 +194,7 @@ never loses sample precision.
 frequencies roll off with distance (cutoff ≈ 18 kHz near, −650 Hz/m, ≥1.2 kHz).
 Subtle in-room, pronounced for far virtual sources.
 
-**Loudness compensation** (`bw_source_set_loudness_comp`, opt-in) is the perceptual
+**Loudness compensation** (`bwa_source_set_loudness_comp`, opt-in) is the perceptual
 counterpart: attenuation lowers level, and at lower levels the ear loses LF
 sensitivity (the ISO 226 equal-loudness contours), so an attenuated source reads
 *thin* as well as far. A one-pole LF shelf (~250 Hz) boosts by 0.4 dB per dB of
@@ -208,7 +208,7 @@ shouldn't collapse to a point. It runs in the per-block gain solve, not the samp
 loop, renormalised to *the panner's own power*: widening redistributes energy
 without re-levelling and keeps the centroid on the source direction. It is
 panner-agnostic, and the new gains ramp like any other gain change. Two render
-modes sit behind `bw_set_spread_mode` (an atomic live A/B, like the panner switch):
+modes sit behind `bwa_set_spread_mode` (an atomic live A/B, like the panner switch):
 
 - **Lobe** (default): the panner's point gains are blended toward a
   width-controlled lobe `(½(1+cosθ))^q` centred on the source direction (`q`
@@ -226,7 +226,7 @@ modes sit behind `bw_set_spread_mode` (an atomic live A/B, like the panner switc
 
 Either mode still feeds every speaker the **same signal** — coherent copies, which
 collapse to phantom images and comb-filter *position-dependently* as the tracked
-listener walks. **`bw_set_decorrelation`** (off by default, live A/B) splits a spread source's
+listener walks. **`bwa_set_decorrelation`** (off by default, live A/B) splits a spread source's
 energy: the coherent share takes the normal path, the rest routes through a
 per-speaker **sparse velvet-noise filter bank** (`rt.c`, ~30 signed taps jittered
 over 30 ms with an exponential envelope, unit energy — Välimäki et al.'s
@@ -235,7 +235,7 @@ split amplitude is `sqrt(spread)` and ramps per sample; power is conserved becau
 incoherent energy adds. The same filter bank renders the parametric bed's diffuse
 stream (below).
 
-**Near-listener widening** (`bw_set_near_spread`, off by default): a source
+**Near-listener widening** (`bwa_set_near_spread`, off by default): a source
 approaching the head subtends a growing solid angle, but a point panner collapses
 it into the nearest speaker and snaps it across the head as it passes through. With
 a radius `R` set, every source's spread is floored at `1 − dist/R` in the gain
@@ -243,7 +243,7 @@ solve — untouched beyond `R`, fully wide at the head — and the widened part 
 the selected spread mode and the decorrelators. Sources flying through the room are
 the common CAVE case this exists for.
 
-**Metric source size** (`bw_source_set_size`, radius in meters, 0 = point) is the
+**Metric source size** (`bwa_source_set_size`, radius in meters, 0 = point) is the
 physical parametrization of the same machinery: the spread is floored at the angle
 the radius subtends from the tracked listener, `asin(r/d)/(π/2)`, capped at 1 when
 the listener is inside the source. A
@@ -260,7 +260,7 @@ the array render does, so it auditions the actual render.
 
 Two implementations sit behind the same seam:
 
-- **Production (`steam_decode.c`, gated `BW_HAVE_STEAMAUDIO`)** — ambisonic encode →
+- **Production (`steam_decode.c`, gated `BWA_HAVE_STEAMAUDIO`)** — ambisonic encode →
   Steam Audio HRTF decode, described below.
 - **Fallback (`binaural.c`, no SDK)** — a simple lateral-projection pan: each bus
   channel's bearing from the listener is projected onto the head's right axis and
@@ -308,14 +308,14 @@ virtual-speaker tap is the default; the direct mode is a diagnostic.
 The diffuse layer (ambisonic beds, the reflection bed) is rendered by a fixed
 SH→speaker **decode matrix** applied per block (`build_bed_decode` / `mix_bed` in
 `rt.c`), built from the speaker geometry at load time. Two decoders are selectable with
-`bw_set_panner`'s sibling **`bw_set_bed_decoder`** (load-time):
+**`bwa_desc.bed_decoder`** (create-time):
 
-- **Sampling (`BW_DECODE_SAMPLING`, default)** — the projection decode
+- **Sampling (`BWA_DECODE_SAMPLING`, default)** — the projection decode
   `decode[s][k] = (2l+1)·Y_k^SN3D(dir_s)/N` (`build_bed_decode_sad`). Cheap and
   exact for a *uniform* array. On an irregular one it over-energises dense regions:
   every speaker radiates a fixed diffuse energy regardless of position, so a
   cluster of speakers makes the diffuse field loud from that direction.
-- **AllRAD (`BW_DECODE_ALLRAD`, `allrad.c`)** — All-Round Ambisonic Decoding
+- **AllRAD (`BWA_DECODE_ALLRAD`, `allrad.c`)** — All-Round Ambisonic Decoding
   (Zotter & Frank 2012). Sampling-decode to a dense **uniform virtual layout** (a
   Fibonacci sphere), then **VBAP** each virtual loudspeaker onto the real array
   (its convex-hull triangulation), then energy-normalise to the sampling decode.
@@ -340,9 +340,9 @@ from **91%→29%** and the localization error from **34°→18°**.
 AllRAD doesn't touch the point-source panner (DBAP/SPCAP/VBAP). It is the
 diffuse-layer counterpart to the placement correction those make for localized
 sources. Its convex-hull + VBAP solve is factored into `hull.c`, shared with the
-`BW_PAN_VBAP` point panner.
+`BWA_PAN_VBAP` point panner.
 
-## Parametric bed rendering (`bw_set_bed_renderer`, live A/B)
+## Parametric bed rendering (`bwa_set_bed_renderer`, live A/B)
 
 Any matrix decode — sampling or AllRAD — has two limits on this rig: the array is
 sparse for 3rd-order content (26 speakers on the CAVE, so directional material
@@ -350,7 +350,7 @@ blurs), and the decode is locked to the array centre (walking off-centre skews a
 recorded field in exactly the way the engine's listener-relative panning was built
 to avoid).
 
-`BW_BED_PARAMETRIC` renders beds the DirAC way (Pulkki's directional audio coding,
+`BWA_BED_PARAMETRIC` renders beds the DirAC way (Pulkki's directional audio coding,
 first-order, in 4 coarse time-domain bands instead of an STFT — `mix_bed` in
 `rt.c`). Per band, the smoothed **intensity vector** of the bed's FOA channels
 gives a direction and a **diffuseness** `ψ = 1 − |I|/E` (0 = a plane wave, 1 =
@@ -378,7 +378,7 @@ reflections** — the six wall bounces that carry room size and source distance.
 Together they are the classic early+late hybrid, and neither needs phonon: the
 engine has a complete acoustics path with no SDK at all.
 
-The geometry is trivial for a shoebox (the room `bw_scene_set_box` already
+The geometry is trivial for a shoebox (the room `bwa_scene_set_box` already
 describes): mirroring the source across a face flips the one coordinate normal to
 it. Each of the six images is then rendered as **a point source at its mirrored
 position, through the engine's own listener-relative panner** — so a reflection has
@@ -395,13 +395,13 @@ direct sound), and a ramped gain vector from the panner. Order 1 only — higher
 orders blend into the diffuse field within tens of ms, which is precisely what the
 FDN renders for free. A source outside the room renders dry.
 
-## Directional FDN reverb (`bw_reverb_fdn`)
+## Directional FDN reverb (`bwa_fdn_config`)
 
 The reflection bed no longer *requires* phonon: a 16-line **feedback delay
 network** (`fdn.c`, Householder feedback, two-band decay filters per line) can
 take the reverb bus tap instead. Each line is assigned a Fibonacci-sphere
 direction and rendered as a plane wave through the same SH→speaker bed decode, and the
-per-line decay time scales with direction (`bw_fdn_set_decay_direction`) —
+per-line decay time scales with direction (`bwa_fdn_desc.decay_dir`/`decay_factor`) —
 **anisotropic decay**, the diagonal direction-domain case of the Directional FDN
 (Alary/Politis/Schlecht, JAES 2019). Deterministic CPU, infinite tail, no rays or
 IRs. The decay is a *design* parameter: don't set it from the room's measured RT60 —

@@ -1,5 +1,5 @@
 /*
- * bw_theme.h — UI theme + embedded font for the bwaudio imgui tools (calib_view, future station
+ * bwa_theme.h — UI theme + embedded font for the bw_audio imgui tools (calib_view, future station
  * tabs). Ported from aforren1/lsl-viewer's theme.hpp (the house reference for imgui tooling):
  * mostly-grayscale chrome with electric-blue + purple as the ONLY accents, light + dark variants,
  * and embedded Roboto-Regular (Apache-2.0) so text is identical everywhere with no asset files.
@@ -10,7 +10,7 @@
 
 #include "imgui.h"
 #if defined(__has_include) && __has_include("implot.h")   /* the layout tool has no plots; theme it anyway */
-#define BW_THEME_HAVE_IMPLOT 1
+#define BWA_THEME_HAVE_IMPLOT 1
 #include "implot.h"
 #endif
 #include "roboto_font.h"   /* embedded Roboto-Regular (Apache-2.0) */
@@ -27,7 +27,7 @@ inline float uiScaled(float px) { return px * g_uiScale; }
 /* Apply the light or dark theme to ImGui + ImPlot, plus shared style polish. */
 inline void applyTheme(bool light) {
     if (light) ImGui::StyleColorsLight(); else ImGui::StyleColorsDark();
-#ifdef BW_THEME_HAVE_IMPLOT
+#ifdef BWA_THEME_HAVE_IMPLOT
     if (light) ImPlot::StyleColorsLight(); else ImPlot::StyleColorsDark();
 #endif
     ImGuiStyle& s = ImGui::GetStyle();

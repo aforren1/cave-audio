@@ -1,6 +1,6 @@
 /* calib_test.c — the calibration trim solve + layout writeback, verified without the rig. */
 #include "calib.h"
-#include "layout.h"        /* BW_ROOM_EQ_MAX (the room_eq writeback round-trip) */
+#include "layout.h"        /* BWA_ROOM_EQ_MAX (the room_eq writeback round-trip) */
 
 #include <cJSON.h>
 #include <math.h>
@@ -51,7 +51,7 @@ int main(void) {
     CHECK(gdb[0] < -1.f, "live louder speaker still cut (dead one didn't poison the reference)");
 
     /* writeback round-trip: write a layout, apply trims, reload, confirm fields updated + dbap kept */
-    const char* IN = "bw_calib_in.json", *OUT = "bw_calib_out.json";
+    const char* IN = "bwa_calib_in.json", *OUT = "bwa_calib_out.json";
     FILE* f = fopen(IN, "wb");
     CHECK(f != NULL, "open calib in.json");
     if (f) {
@@ -88,7 +88,7 @@ int main(void) {
 
     /* calib_write_eq: per-speaker correction taps round-trip into each speaker's "eq" array */
     {
-        const char* EIN = "bw_eq_in.json", *EOUT = "bw_eq_out.json";
+        const char* EIN = "bwa_eq_in.json", *EOUT = "bwa_eq_out.json";
         FILE* ef = fopen(EIN, "wb");
         CHECK(ef != NULL, "open eq in.json");
         if (ef) {
@@ -127,7 +127,7 @@ int main(void) {
 
     /* calib_write_room_eq: LF modal cuts round-trip into each speaker's "room_eq" section array */
     {
-        const char* RIN = "bw_rq_in.json", *ROUT = "bw_rq_out.json";
+        const char* RIN = "bwa_rq_in.json", *ROUT = "bwa_rq_out.json";
         FILE* rfw = fopen(RIN, "wb");
         CHECK(rfw != NULL, "open room_eq in.json");
         if (rfw) {
@@ -135,13 +135,13 @@ int main(void) {
                   "  { \"index\": 0, \"position\": [1,0,0] },\n"
                   "  { \"index\": 1, \"position\": [2,0,0] }\n ]\n}\n", rfw);
             fclose(rfw);
-            MeasureEqSection cuts[2 * BW_ROOM_EQ_MAX];
+            MeasureEqSection cuts[2 * BWA_ROOM_EQ_MAX];
             memset(cuts, 0, sizeof cuts);
             cuts[0].fc = 62.5f; cuts[0].gain_db = -6.2f; cuts[0].q = 4.3f;   /* speaker 0: two cuts */
             cuts[1].fc = 118.f; cuts[1].gain_db = -3.5f; cuts[1].q = 2.0f;
             int counts[2] = { 2, 0 };                                        /* speaker 1: none */
             char err[256] = {0};
-            CHECK(calib_write_room_eq(RIN, ROUT, cuts, counts, 2, BW_ROOM_EQ_MAX, err, sizeof err),
+            CHECK(calib_write_room_eq(RIN, ROUT, cuts, counts, 2, BWA_ROOM_EQ_MAX, err, sizeof err),
                   err[0] ? err : "calib_write_room_eq");
             FILE* rf = fopen(ROUT, "rb");
             if (rf) {
@@ -174,31 +174,31 @@ int main(void) {
      * (fcs within tolerance), keeping each position's own depth; a mode only one position saw gets a
      * 0 dB filler at the other (congruence). */
     {
-        MeasureEqSection cuts[2 * BW_ROOM_EQ_MAX];
+        MeasureEqSection cuts[2 * BWA_ROOM_EQ_MAX];
         memset(cuts, 0, sizeof cuts);
         cuts[0].fc = 44.8f; cuts[0].gain_db = -8.f; cuts[0].q = 6.f;   /* position 0: the 45 Hz mode + 120 Hz */
         cuts[1].fc = 118.f; cuts[1].gain_db = -5.f; cuts[1].q = 4.f;
-        cuts[BW_ROOM_EQ_MAX + 0].fc = 45.9f;                            /* position 1: the same 45 Hz mode, 2% off */
-        cuts[BW_ROOM_EQ_MAX + 0].gain_db = -4.f;
-        cuts[BW_ROOM_EQ_MAX + 0].q = 8.f;
+        cuts[BWA_ROOM_EQ_MAX + 0].fc = 45.9f;                            /* position 1: the same 45 Hz mode, 2% off */
+        cuts[BWA_ROOM_EQ_MAX + 0].gain_db = -4.f;
+        cuts[BWA_ROOM_EQ_MAX + 0].q = 8.f;
         int counts[2] = { 2, 1 };
-        float fc[BW_ROOM_EQ_MAX], q[BW_ROOM_EQ_MAX], g[2 * BW_ROOM_EQ_MAX];
-        int lad = calib_room_grid_merge(cuts, counts, 2, BW_ROOM_EQ_MAX, 0.08, BW_ROOM_EQ_MAX, fc, q, g);
+        float fc[BWA_ROOM_EQ_MAX], q[BWA_ROOM_EQ_MAX], g[2 * BWA_ROOM_EQ_MAX];
+        int lad = calib_room_grid_merge(cuts, counts, 2, BWA_ROOM_EQ_MAX, 0.08, BWA_ROOM_EQ_MAX, fc, q, g);
         CHECK(lad == 2, "two positions merge into a 2-section ladder (shared mode clustered)");
         if (lad == 2) {
             CHECK(fc[0] > 44.f && fc[0] < 46.f && fabs(q[0] - 7.f) < 0.01, "cluster takes the member-median fc/q");
-            CHECK(fabs(g[0*BW_ROOM_EQ_MAX + 0] + 8.f) < 1e-4 && fabs(g[1*BW_ROOM_EQ_MAX + 0] + 4.f) < 1e-4,
+            CHECK(fabs(g[0*BWA_ROOM_EQ_MAX + 0] + 8.f) < 1e-4 && fabs(g[1*BWA_ROOM_EQ_MAX + 0] + 4.f) < 1e-4,
                   "each position keeps its own depth for the shared mode");
-            CHECK(fabs(fc[1] - 118.f) < 1e-3 && fabs(g[0*BW_ROOM_EQ_MAX + 1] + 5.f) < 1e-4,
+            CHECK(fabs(fc[1] - 118.f) < 1e-3 && fabs(g[0*BWA_ROOM_EQ_MAX + 1] + 5.f) < 1e-4,
                   "the position-0-only mode survives");
-            CHECK(g[1*BW_ROOM_EQ_MAX + 1] == 0.f, "the position that missed a mode gets a 0 dB filler");
+            CHECK(g[1*BWA_ROOM_EQ_MAX + 1] == 0.f, "the position that missed a mode gets a 0 dB filler");
         }
     }
 
     /* calib_write_room_eq_grid: one run per mic placement ACCUMULATES the grid — the second position
      * appends, a rerun within 5 cm replaces, and the static room_eq is removed (mutually exclusive). */
     {
-        const char* GIN = "bw_grid_in.json";
+        const char* GIN = "bwa_grid_in.json";
         FILE* gf = fopen(GIN, "wb");
         CHECK(gf != NULL, "open grid in.json");
         if (gf) {
@@ -206,25 +206,25 @@ int main(void) {
                   "  { \"index\": 0, \"position\": [1,0,0], \"room_eq\": [{\"fc\":80,\"gain_db\":-6,\"q\":4}] },\n"
                   "  { \"index\": 1, \"position\": [2,0,0] }\n ]\n}\n", gf);
             fclose(gf);
-            MeasureEqSection cuts[2 * BW_ROOM_EQ_MAX];
+            MeasureEqSection cuts[2 * BWA_ROOM_EQ_MAX];
             int counts[2];
             char err[256] = {0};
             memset(cuts, 0, sizeof cuts);                              /* run 1: mic A sees 45 Hz on speaker 0 */
             cuts[0].fc = 45.f; cuts[0].gain_db = -8.f; cuts[0].q = 6.f;
             counts[0] = 1; counts[1] = 0;
             float micA[3] = { -0.5f, 1.5f, 0.f }, micB[3] = { 0.5f, 1.5f, 0.f };
-            CHECK(calib_write_room_eq_grid(GIN, GIN, micA, cuts, counts, 2, BW_ROOM_EQ_MAX, err, sizeof err),
+            CHECK(calib_write_room_eq_grid(GIN, GIN, micA, cuts, counts, 2, BWA_ROOM_EQ_MAX, err, sizeof err),
                   err[0] ? err : "grid writeback run 1");
             memset(cuts, 0, sizeof cuts);                              /* run 2: mic B reads the mode shallower */
             cuts[0].fc = 45.5f; cuts[0].gain_db = -3.f; cuts[0].q = 6.f;
             counts[0] = 1; counts[1] = 0;
-            CHECK(calib_write_room_eq_grid(GIN, GIN, micB, cuts, counts, 2, BW_ROOM_EQ_MAX, err, sizeof err),
+            CHECK(calib_write_room_eq_grid(GIN, GIN, micB, cuts, counts, 2, BWA_ROOM_EQ_MAX, err, sizeof err),
                   err[0] ? err : "grid writeback run 2");
             memset(cuts, 0, sizeof cuts);                              /* run 3: B re-measured (2 cm off: replaces) */
             cuts[0].fc = 45.5f; cuts[0].gain_db = -4.f; cuts[0].q = 6.f;
             counts[0] = 1; counts[1] = 0;
             float micB2[3] = { 0.52f, 1.5f, 0.f };
-            CHECK(calib_write_room_eq_grid(GIN, GIN, micB2, cuts, counts, 2, BW_ROOM_EQ_MAX, err, sizeof err),
+            CHECK(calib_write_room_eq_grid(GIN, GIN, micB2, cuts, counts, 2, BWA_ROOM_EQ_MAX, err, sizeof err),
                   err[0] ? err : "grid writeback run 3");
             FILE* rf = fopen(GIN, "rb");
             if (rf) {
@@ -285,7 +285,7 @@ int main(void) {
 
     /* position writeback round-trip */
     {
-        const char* IN = "bw_pos_in.json", *OUT = "bw_pos_out.json";
+        const char* IN = "bwa_pos_in.json", *OUT = "bwa_pos_out.json";
         FILE* f = fopen(IN, "wb");
         CHECK(f != NULL, "open pos in.json");
         if (f) {

@@ -1,6 +1,6 @@
 /* calib.c — see calib.h. Trim solve + cave_layout.json writeback. Pure + file I/O (no audio thread). */
 #include "calib.h"
-#include "layout.h"        /* BW_RQ_GRID_MAX / BW_ROOM_EQ_MAX (the room_eq_grid schema caps) */
+#include "layout.h"        /* BWA_RQ_GRID_MAX / BWA_ROOM_EQ_MAX (the room_eq_grid schema caps) */
 
 #include <cJSON.h>
 
@@ -201,7 +201,7 @@ fail:
     #undef FAIL
 }
 
-#define BW_ROOM_EQ_SPLIT_HZ 200.0   /* the FIR corrects above this; the modal cuts own [30, split] */
+#define BWA_ROOM_EQ_SPLIT_HZ 200.0   /* the FIR corrects above this; the modal cuts own [30, split] */
 
 int calib_room_eq(const float* ir, int nir, int first_refl, double fs, int ntaps, float* taps,
                   MeasureEqSection* cuts, int max_cuts) {
@@ -213,8 +213,8 @@ int calib_room_eq(const float* ir, int nir, int first_refl, double fs, int ntaps
     /* 6 cycles/f window (~1/6-octave resolution — the broad-stroke smoothing that survives head sway),
      * up to 400 ms of room; boosts capped at +3 dB (a seated head still sways — never fight nulls hard). */
     if (!measure_correction_room(ir, nir, 0, gate, 6.0, 0.4,
-                                 BW_ROOM_EQ_SPLIT_HZ, 18000.0, fs, 3.0, 18.0, ntaps, taps)) return -1;
-    return measure_room_cuts(ir, nir, 0, fs, 30.0, BW_ROOM_EQ_SPLIT_HZ, 12.0, max_cuts, cuts);
+                                 BWA_ROOM_EQ_SPLIT_HZ, 18000.0, fs, 3.0, 18.0, ntaps, taps)) return -1;
+    return measure_room_cuts(ir, nir, 0, fs, 30.0, BWA_ROOM_EQ_SPLIT_HZ, 12.0, max_cuts, cuts);
 }
 
 int calib_write_room_eq(const char* in_path, const char* out_path,
@@ -272,7 +272,7 @@ static float fmedian(float* v, int n) {   /* sorts v in place */
 int calib_room_grid_merge(const MeasureEqSection* cuts, const int* counts, int npos, int max_in,
                           double tol_rel, int max_out, float* fc, float* q, float* gain_db) {
     if (!cuts || !counts || !fc || !q || !gain_db || npos <= 0 || max_in <= 0 || max_out <= 0) return 0;
-    if (npos > (int)BW_RQ_GRID_MAX || max_in > BW_ROOM_EQ_MAX) return 0;   /* schema caps bound the stack arrays */
+    if (npos > (int)BWA_RQ_GRID_MAX || max_in > BWA_ROOM_EQ_MAX) return 0;   /* schema caps bound the stack arrays */
     memset(gain_db, 0, (size_t)npos * (size_t)max_out * sizeof(float));
 
     /* flatten every real cut (a 0 dB section is congruence filler, not a measured mode) */
@@ -299,7 +299,7 @@ int calib_room_grid_merge(const MeasureEqSection* cuts, const int* counts, int n
 
     /* greedy clusters over the sorted list: a run belongs together while fc stays within tol_rel of
      * the run's lowest member (the same room mode read from different mic spots) */
-    enum { CLU_CAP = BW_RQ_GRID_MAX * BW_ROOM_EQ_MAX };
+    enum { CLU_CAP = BWA_RQ_GRID_MAX * BWA_ROOM_EQ_MAX };
     int cstart[CLU_CAP], clen[CLU_CAP], nclu = 0;
     for (int i = 0; i < m; ) {
         int j = i + 1;
@@ -347,9 +347,9 @@ int calib_write_room_eq_grid(const char* in_path, const char* out_path, const fl
     #define FAIL(msg) do { if (err && errcap) snprintf(err, errcap, "%s", msg); goto fail; } while (0)
     char* text = NULL; cJSON* root = NULL; char* outtext = NULL; int ok = 0;
     cJSON* narr = NULL;             /* the rebuilt grid; owned here until attached to root */
-    MeasureEqSection* all = NULL;   /* [pos][speaker][BW_ROOM_EQ_MAX] — every position's cuts */
+    MeasureEqSection* all = NULL;   /* [pos][speaker][BWA_ROOM_EQ_MAX] — every position's cuts */
     int* acount = NULL;             /* [pos][speaker] used sections */
-    float gpos[BW_RQ_GRID_MAX][3]; int npos = 0;
+    float gpos[BWA_RQ_GRID_MAX][3]; int npos = 0;
 
     text = read_file(in_path, NULL);
     if (!text) { if (err && errcap) snprintf(err, errcap, "calib: cannot read %s", in_path); return 0; }
@@ -359,10 +359,10 @@ int calib_write_room_eq_grid(const char* in_path, const char* out_path, const fl
     if (!cJSON_IsArray(speakers)) FAIL("calib: layout has no 'speakers' array");
     if (cJSON_GetArraySize(speakers) != n) FAIL("calib: speaker count does not match the measurements");
 
-    all    = (MeasureEqSection*)calloc((size_t)BW_RQ_GRID_MAX * n * BW_ROOM_EQ_MAX, sizeof *all);
-    acount = (int*)calloc((size_t)BW_RQ_GRID_MAX * n, sizeof *acount);
+    all    = (MeasureEqSection*)calloc((size_t)BWA_RQ_GRID_MAX * n * BWA_ROOM_EQ_MAX, sizeof *all);
+    acount = (int*)calloc((size_t)BWA_RQ_GRID_MAX * n, sizeof *acount);
     if (!all || !acount) FAIL("calib: out of memory");
-    #define ALL(p, s)    (&all[((size_t)(p) * n + (s)) * BW_ROOM_EQ_MAX])
+    #define ALL(p, s)    (&all[((size_t)(p) * n + (s)) * BWA_ROOM_EQ_MAX])
     #define ACOUNT(p, s) (acount[(size_t)(p) * n + (s)])
 
     /* read back the existing grid: each entry's sections become that position's cuts for the
@@ -370,7 +370,7 @@ int calib_write_room_eq_grid(const char* in_path, const char* out_path, const fl
     cJSON* grid = cJSON_GetObjectItemCaseSensitive(root, "room_eq_grid");
     if (cJSON_IsArray(grid)) {
         int np = cJSON_GetArraySize(grid);
-        if (np > (int)BW_RQ_GRID_MAX) np = BW_RQ_GRID_MAX;
+        if (np > (int)BWA_RQ_GRID_MAX) np = BWA_RQ_GRID_MAX;
         for (int p = 0; p < np; ++p) {
             cJSON* ent  = cJSON_GetArrayItem(grid, p);
             cJSON* posj = cJSON_IsObject(ent) ? cJSON_GetObjectItemCaseSensitive(ent, "position") : NULL;
@@ -382,7 +382,7 @@ int calib_write_room_eq_grid(const char* in_path, const char* out_path, const fl
             for (int s = 0; s < n; ++s) {
                 cJSON* secs = cJSON_GetArrayItem(spks, s);
                 int m = cJSON_IsArray(secs) ? cJSON_GetArraySize(secs) : 0;
-                if (m > BW_ROOM_EQ_MAX) m = BW_ROOM_EQ_MAX;
+                if (m > BWA_ROOM_EQ_MAX) m = BWA_ROOM_EQ_MAX;
                 for (int t = 0; t < m; ++t) {
                     cJSON* o = cJSON_GetArrayItem(secs, t);
                     MeasureEqSection* dst = &ALL(npos, s)[t];
@@ -407,12 +407,12 @@ int calib_write_room_eq_grid(const char* in_path, const char* out_path, const fl
             if (dx*dx + dy*dy + dz*dz < 0.05f * 0.05f) { slot = p; break; }
         }
         if (slot < 0) {
-            if (npos >= (int)BW_RQ_GRID_MAX) FAIL("calib: room_eq_grid is full (16 positions)");
+            if (npos >= (int)BWA_RQ_GRID_MAX) FAIL("calib: room_eq_grid is full (16 positions)");
             slot = npos++;
         }
         memcpy(gpos[slot], mic, sizeof(float) * 3);
         for (int s = 0; s < n; ++s) {
-            int m = counts[s] > BW_ROOM_EQ_MAX ? BW_ROOM_EQ_MAX : counts[s];
+            int m = counts[s] > BWA_ROOM_EQ_MAX ? BWA_ROOM_EQ_MAX : counts[s];
             if (m > max_sections) m = max_sections;
             for (int t = 0; t < m; ++t) ALL(slot, s)[t] = cuts[(size_t)s * max_sections + t];
             ACOUNT(slot, s) = m;
@@ -423,7 +423,7 @@ int calib_write_room_eq_grid(const char* in_path, const char* out_path, const fl
     {
         narr = cJSON_CreateArray();
         if (!narr) FAIL("calib: room_eq_grid array alloc");
-        cJSON* entries[BW_RQ_GRID_MAX];
+        cJSON* entries[BWA_RQ_GRID_MAX];
         for (int p = 0; p < npos; ++p) {
             cJSON* ent = cJSON_CreateObject();
             cJSON* posj = cJSON_CreateArray();
@@ -436,16 +436,16 @@ int calib_write_room_eq_grid(const char* in_path, const char* out_path, const fl
             cJSON_AddItemToArray(narr, ent);
             entries[p] = spks;
         }
-        MeasureEqSection percut[BW_RQ_GRID_MAX * BW_ROOM_EQ_MAX];
-        int   percnt[BW_RQ_GRID_MAX];
-        float lfc[BW_ROOM_EQ_MAX], lq[BW_ROOM_EQ_MAX], lg[BW_RQ_GRID_MAX * BW_ROOM_EQ_MAX];
+        MeasureEqSection percut[BWA_RQ_GRID_MAX * BWA_ROOM_EQ_MAX];
+        int   percnt[BWA_RQ_GRID_MAX];
+        float lfc[BWA_ROOM_EQ_MAX], lq[BWA_ROOM_EQ_MAX], lg[BWA_RQ_GRID_MAX * BWA_ROOM_EQ_MAX];
         for (int s = 0; s < n; ++s) {
             for (int p = 0; p < npos; ++p) {
-                memcpy(&percut[(size_t)p * BW_ROOM_EQ_MAX], ALL(p, s), sizeof(MeasureEqSection) * BW_ROOM_EQ_MAX);
+                memcpy(&percut[(size_t)p * BWA_ROOM_EQ_MAX], ALL(p, s), sizeof(MeasureEqSection) * BWA_ROOM_EQ_MAX);
                 percnt[p] = ACOUNT(p, s);
             }
-            int lad = calib_room_grid_merge(percut, percnt, npos, BW_ROOM_EQ_MAX,
-                                            0.08, BW_ROOM_EQ_MAX, lfc, lq, lg);
+            int lad = calib_room_grid_merge(percut, percnt, npos, BWA_ROOM_EQ_MAX,
+                                            0.08, BWA_ROOM_EQ_MAX, lfc, lq, lg);
             for (int p = 0; p < npos; ++p) {
                 cJSON* secs = cJSON_CreateArray();
                 if (!secs) FAIL("calib: room_eq_grid sections alloc");
@@ -454,7 +454,7 @@ int calib_write_room_eq_grid(const char* in_path, const char* out_path, const fl
                     if (!o) FAIL("calib: room_eq_grid section alloc");
                     /* clamp into the loader's schema ranges so the writeback always round-trips */
                     double wfc = round((double)lfc[j] * 10.0) / 10.0;
-                    double wg  = round((double)lg[(size_t)p * BW_ROOM_EQ_MAX + j] * 100.0) / 100.0;
+                    double wg  = round((double)lg[(size_t)p * BWA_ROOM_EQ_MAX + j] * 100.0) / 100.0;
                     double wq  = round((double)lq[j] * 100.0) / 100.0;
                     if (wfc < 10.0)  wfc = 10.0;  else if (wfc > 1000.0) wfc = 1000.0;
                     if (wg  < -24.0) wg  = -24.0; else if (wg  > 0.0)    wg  = 0.0;

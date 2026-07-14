@@ -32,7 +32,7 @@ void zylia_geometry(float dirs[ZYLIA_MICS][3], float* radius_m) {
      *
      * TWO THINGS THIS TABLE CANNOT TELL YOU, both of which must be pinned on the rig:
      *   - CHANNEL ORDER: node i here is not necessarily ASIO input i. A permutation still yields a
-     *     confident direction, just the wrong one. bw_zylia_probe resolves it (tap a capsule, see
+     *     confident direction, just the wrong one. bwa_zylia_probe resolves it (tap a capsule, see
      *     which channel jumps).
      *   - AZIMUTH REFERENCE: nothing published says which capsule faces the device's front, so an
      *     unknown yaw offset rotates every DOA by a constant. Clap from a known direction in

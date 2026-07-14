@@ -1,4 +1,4 @@
-# CI: build + test the core engine ("the C part"), and package bwaudio.dll for
+# CI: build + test the core engine ("the C part"), and package bw_audio.dll for
 # limited distribution as a workflow artifact (repo access required to download).
 #
 # Scope (deliberate, see third_party/README.md):
@@ -10,16 +10,16 @@
 #     cached on the submodule sha + patch hash — the first run pays the phonon
 #     build, later runs restore it. The with-SDK tests (reflect/bake/path/
 #     steam_decode) run, binaural is the real HRTF decode, and the artifact ships
-#     phonon.dll next to bwaudio.dll (the dll does not load without it).
+#     phonon.dll next to bw_audio.dll (the dll does not load without it).
 #   - Tools (playground/layout_tool/calib_view + calibrate/zylia_probe): BUILT and
 #     shipped in the artifact. Their imgui-test-engine UI suites need a display +
 #     OpenGL, which runners don't have — ctest excludes those three suites here
 #     (they run locally / at the rig).
 #   - Configs: x64 only. RelWithDebInfo is the full build (tested + tools);
-#     Debug builds the engine + bw_minimal for downstream debugging (smoke-run).
+#     Debug builds the engine + bwa_minimal for downstream debugging (smoke-run).
 #
-# Tests run with BWAUDIO_SINK=null, the documented CI mode (no audio hardware on
-# runners; forcing null keeps it deterministic rather than relying on fallback).
+# No audio hardware on runners: the test descs force the null sink (bwa_desc.sink
+# = BWA_SINK_NULL) and everything else auto-falls-back to it, by design.
 name: ci
 
 on:
@@ -118,7 +118,7 @@ jobs:
           cmake --build "$TREE" --config Release --target phonon
           cd ../../../..
 
-          # Stage where BWAUDIO_WITH_STEAMAUDIO auto-detects it. find: the build-tree
+          # Stage where BWA_WITH_STEAMAUDIO auto-detects it. find: the build-tree
           # layout is phonon's business; only the staged layout is ours.
           ART=third_party/steam-audio-artifacts
           mkdir -p "$ART/include" "$ART/lib/windows-x64"
@@ -135,9 +135,9 @@ jobs:
           # No -G pin: CMake defaults to the newest Visual Studio on the runner. Pinning
           # "Visual Studio 17 2022" broke when the windows-latest image dropped VS 2022.
           cmake -S . -B build -A x64 \
-                -DBWAUDIO_BUILD_PLAYGROUND=ON \
-                -DBWAUDIO_BUILD_CALIBVIEW=ON \
-                -DBWAUDIO_BUILD_CALIBRATE=ON | tee configure.log
+                -DBWA_BUILD_PLAYGROUND=ON \
+                -DBWA_BUILD_CALIBVIEW=ON \
+                -DBWA_BUILD_CALIBRATE=ON | tee configure.log
           # the artifact must contain the production device path AND the HRTF decode —
           # fail loudly if either didn't wire up
           grep -q "ASIO backend ENABLED" configure.log
@@ -147,64 +147,61 @@ jobs:
         run: cmake --build build --config RelWithDebInfo
 
       - name: Build (Debug — engine + smoke only)
-        run: cmake --build build --config Debug --target bwaudio bw_minimal
+        run: cmake --build build --config Debug --target bw_audio bwa_minimal
 
       - name: Test
-        env:
-          BWAUDIO_SINK: "null"   # quoted: bare null is YAML-null -> empty string, not the string "null"
         # -E: the GUI UI suites need a display + OpenGL; everything else runs
         run: ctest --test-dir build -C RelWithDebInfo --output-on-failure -E '^(playground|layout_tool|calib_view)$'
 
       - name: Smoke (Debug)
-        env:
-          BWAUDIO_SINK: "null"
         # the Debug dll ships too — prove it loads (incl. phonon.dll) and runs a lifecycle
-        run: build/Debug/bw_minimal.exe
+        # (no device on the runner: the AUTO sink policy falls back to the silent null sink)
+        run: build/Debug/bwa_minimal.exe
 
       - name: Stage dist
         shell: pwsh
         run: |
           New-Item -ItemType Directory dist, dist/RelWithDebInfo, dist/Debug | Out-Null
-          Copy-Item include/bwaudio.h,
+          Copy-Item include/bw_audio.h,
                     LICENSE,
                     THIRD_PARTY-NOTICES.md dist/
           # the JSONs live NEXT TO the tools: playground/layout_tool resolve
           # ./cave_layout.json + ./constraints.json relative to their working dir
           Copy-Item examples/cave_layout.json,
                     examples/constraints.json dist/RelWithDebInfo/
-          Copy-Item build/RelWithDebInfo/bwaudio.dll,
-                    build/RelWithDebInfo/bwaudio.lib,
-                    build/RelWithDebInfo/bwaudio.pdb,
+          Copy-Item build/RelWithDebInfo/bw_audio.dll,
+                    build/RelWithDebInfo/bw_audio.lib,
+                    build/RelWithDebInfo/bw_audio.pdb,
                     build/RelWithDebInfo/phonon.dll,
-                    build/RelWithDebInfo/bw_minimal.exe,
-                    build/RelWithDebInfo/bw_playground.exe,
-                    build/RelWithDebInfo/bw_layout_tool.exe,
-                    build/RelWithDebInfo/bw_calib_view.exe,
-                    build/RelWithDebInfo/bw_calibrate.exe,
-                    build/RelWithDebInfo/bw_zylia_probe.exe dist/RelWithDebInfo/
-          Copy-Item build/Debug/bwaudio.dll,
-                    build/Debug/bwaudio.lib,
-                    build/Debug/bwaudio.pdb,
+                    build/RelWithDebInfo/bwa_minimal.exe,
+                    build/RelWithDebInfo/bwa_playground.exe,
+                    build/RelWithDebInfo/bwa_layout_tool.exe,
+                    build/RelWithDebInfo/bwa_calib_view.exe,
+                    build/RelWithDebInfo/bwa_calibrate.exe,
+                    build/RelWithDebInfo/bwa_zylia_probe.exe dist/RelWithDebInfo/
+          Copy-Item build/Debug/bw_audio.dll,
+                    build/Debug/bw_audio.lib,
+                    build/Debug/bw_audio.pdb,
                     build/Debug/phonon.dll,
-                    build/Debug/bw_minimal.exe dist/Debug/
+                    build/Debug/bwa_minimal.exe dist/Debug/
           @"
-          bwaudio win64 — limited distribution build
+          bw_audio win64 — limited distribution build
           commit   ${{ github.sha }} (${{ github.ref_name }})
           built    $((Get-Date).ToUniversalTime().ToString('s'))Z  (GitHub Actions run ${{ github.run_id }})
-          try      RelWithDebInfo\bw_playground.exe — needs no audio device (renders
-                   silently, the 3D view + meters stay live); bw_playground --help for keys
+          try      RelWithDebInfo\bwa_playground.exe — needs no audio device (renders
+                   silently, the 3D view + meters stay live); bwa_playground --help for keys
           needs    the Microsoft VC++ x64 runtime (vcruntime140*.dll). Any machine with
                    Visual Studio has it; otherwise https://aka.ms/vs/17/release/vc_redist.x64.exe
           backends ASIO=yes  SteamAudio=yes (patched phonon 4.8.1+10: HRTF decode,
                    occlusion, reflections, pathing — third_party/README.md)
-          contents RelWithDebInfo/ — bwaudio.dll/.lib/.pdb + phonon.dll (KEEP THEM
-                   TOGETHER: bwaudio.dll does not load without phonon.dll beside it),
-                   bw_minimal.exe (smoke check: runs the whole client lifecycle, no
-                   hardware needed), tools: bw_playground / bw_layout_tool /
-                   bw_calib_view (GUI — need a display), bw_calibrate + bw_zylia_probe
+          contents RelWithDebInfo/ — bw_audio.dll/.lib/.pdb + phonon.dll (KEEP THEM
+                   TOGETHER: bw_audio.dll does not load without phonon.dll beside it),
+                   bwa_minimal.exe (smoke check: runs the whole client lifecycle, no
+                   hardware needed), tools: bwa_playground / bwa_layout_tool /
+                   bwa_calib_view (GUI — need a display), bwa_calibrate + bwa_zylia_probe
                    (console), cave_layout.json + constraints.json (example layout +
                    room, read by the tools from their own directory). Debug/ — engine
-                   dll/.lib/.pdb + phonon.dll + bw_minimal. Root — include/bwaudio.h.
+                   dll/.lib/.pdb + phonon.dll + bwa_minimal. Root — include/bw_audio.h.
                    x64 only.
           license  GPLv3 (LICENSE) + THIRD_PARTY-NOTICES.md; complete source:
                    https://github.com/aforren1/cave-audio/tree/${{ github.sha }}
@@ -233,7 +230,7 @@ jobs:
       - name: Upload artifact (engine + tools)
         uses: actions/upload-artifact@v6
         with:
-          name: bwaudio-win64-r${{ github.run_number }}
+          name: bw_audio-win64-r${{ github.run_number }}
           path: |
             dist/
             !dist/unity/**
@@ -252,9 +249,9 @@ jobs:
       # The Release IS the distribution - there is no registry. TWO assets, because there are two
       # audiences and they want different bytes:
       #
-      #   com.brainworks.bwaudio-<ver>.tgz   the Unity package (C# + the two DLLs, import settings set).
+      #   com.brainworks.bw_audio-<ver>.tgz   the Unity package (C# + the two DLLs, import settings set).
       #                                      Installs via Package Manager > "+" > "from tarball".
-      #   bwaudio-win64-<tag>.zip            the engine itself: dll/lib/pdb + bwaudio.h + the tools.
+      #   bw_audio-win64-<tag>.zip            the engine itself: dll/lib/pdb + bw_audio.h + the tools.
       #                                      The durable home for the native side - workflow artifacts
       #                                      expire, a release does not.
       #
@@ -273,8 +270,8 @@ jobs:
           # The engine bundle: everything staged in dist/ EXCEPT the Unity package (which ships on its
           # own). GPLv3 travels with it - LICENSE, THIRD_PARTY-NOTICES.md and DIST.txt (which names the
           # commit and links the complete source) are already staged there.
-          $zip = "dist/bwaudio-win64-$tag.zip"
-          Compress-Archive -Path dist/RelWithDebInfo, dist/Debug, dist/bwaudio.h, dist/LICENSE,
+          $zip = "dist/bw_audio-win64-$tag.zip"
+          Compress-Archive -Path dist/RelWithDebInfo, dist/Debug, dist/bw_audio.h, dist/LICENSE,
                                  dist/THIRD_PARTY-NOTICES.md, dist/DIST.txt `
                            -DestinationPath $zip -Force
           $zip = (Get-Item $zip).FullName
@@ -284,26 +281,26 @@ jobs:
 
           ## Unity
 
-          Download ``com.brainworks.bwaudio-*.tgz`` below, then in Unity:
+          Download ``com.brainworks.bw_audio-*.tgz`` below, then in Unity:
           **Package Manager > ``+`` > *Install package from tarball...*** That is the whole install.
 
-          The package ships the native engine (``bwaudio.dll`` + ``phonon.dll``) with its import settings
+          The package ships the native engine (``bw_audio.dll`` + ``phonon.dll``) with its import settings
           already set - nothing to build. Requires **Unity 6**. Turn OFF Unity's built-in audio
           (*Project Settings > Audio > Disable Unity Audio*): the engine owns the device.
 
           ## Engine (C ABI, tools)
 
-          ``bwaudio-win64-$tag.zip`` - ``bwaudio.dll`` / ``.lib`` / ``.pdb`` + ``phonon.dll`` (**keep the
-          pair together**, the dll will not load without it), ``bwaudio.h``, and the tools:
-          ``bw_playground``, ``bw_layout_tool``, ``bw_calib_view``, ``bw_calibrate``, ``bw_zylia_probe``.
+          ``bw_audio-win64-$tag.zip`` - ``bw_audio.dll`` / ``.lib`` / ``.pdb`` + ``phonon.dll`` (**keep the
+          pair together**, the dll will not load without it), ``bw_audio.h``, and the tools:
+          ``bwa_playground``, ``bwa_layout_tool``, ``bwa_calib_view``, ``bwa_calibrate``, ``bwa_zylia_probe``.
           Needs the MSVC x64 runtime. See ``DIST.txt`` inside for the exact commit.
 
           ## License
 
-          **GPLv3.** ``bwaudio.dll`` links the ASIO SDK under its GPLv3 option. Internal use never
+          **GPLv3.** ``bw_audio.dll`` links the ASIO SDK under its GPLv3 option. Internal use never
           triggers copyleft - it is a *distribution* condition - but SHIPPING an app that includes this
           DLL to third parties would put that app under GPLv3. See ``docs/build.md`` for the
           proprietary-ASIO alternative.
           "@
           # One .tgz (the package) + one .zip (the engine). Keep it that way - see the note above.
-          gh release create $tag $tgz $zip --title "bwaudio $tag" --notes $notes
+          gh release create $tag $tgz $zip --title "bw_audio $tag" --notes $notes

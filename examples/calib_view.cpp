@@ -1,13 +1,13 @@
 /*
  * calib_view.cpp — calibration report viewer (the Dear ImGui pilot: win32 + d3d11).
  *
- * bw_calibrate writes trims/positions/EQ into cave_layout.json and (--save-irs) per-speaker IR wavs;
+ * bwa_calibrate writes trims/positions/EQ into cave_layout.json and (--save-irs) per-speaker IR wavs;
  * this views all of it BEFORE you trust it: the array in 3D, gain/delay trims as bars, correction-EQ
  * magnitude curves, the retained IRs, and — the workhorse — a layout DIFF (load the pre-calibration
  * layout as A and the written-back one as B) so a swapped channel, a bad mic placement, or a bogus
  * localize solve shows up as an absurd delta instead of an evening of confusion at the rig.
  *
- *   bw_calib_view [layoutA.json] [layoutB.json]     # B optional: diff mode
+ *   bwa_calib_view [layoutA.json] [layoutB.json]     # B optional: diff mode
  *       --irs <prefix>                              # preload <prefix>_NN.wav IR kernels
  *       --tests [filter]                            # run the imgui_test_engine suite (optionally
  *                                                   #   filtered, e.g. --tests viewer) and exit
@@ -18,13 +18,13 @@
  * a pass/fail code, so the GUI itself runs under ctest. That loop is what raylib can't do.
  * Test-engine wiring + conventions follow aforren1/lsl-viewer (the house reference for imgui tools).
  *
- * Data comes straight from the engine's own loader (layout.c via bw_core) — the viewer can't drift
+ * Data comes straight from the engine's own loader (layout.c via bwa_core) — the viewer can't drift
  * from what the engine would actually load. IR wavs decode through sound.c for the same reason.
  */
 #include "imgui.h"
 #include "implot.h"
 #include "implot3d.h"
-#include "bw_theme.h"      /* lsl-viewer's theme + embedded Roboto (applyTheme / loadEmbeddedFont / uiScaled) */
+#include "bwa_theme.h"      /* lsl-viewer's theme + embedded Roboto (applyTheme / loadEmbeddedFont / uiScaled) */
 #include "imgui_impl_win32.h"
 #include "imgui_impl_dx11.h"
 #include "imgui_te_engine.h"
@@ -56,7 +56,7 @@ extern "C" {                       /* engine internals (C, no extern-C guards of
 /* ============================== data model ============================== */
 
 #define EQ_PTS 240                 /* magnitude-curve resolution (log 20 Hz .. 20 kHz) */
-#define IR_FS  48000u              /* bw_calibrate writes IRs at the engine rate */
+#define IR_FS  48000u              /* bwa_calibrate writes IRs at the engine rate */
 
 struct View {
     char   pathA[512], pathB[512], irprefix[512];
@@ -65,18 +65,18 @@ struct View {
     char   status[512];
 
     /* derived, refreshed on load (not per frame) */
-    float  gainA_db[BW_CHANNELS], delayA_ms[BW_CHANNELS];
-    float  gainB_db[BW_CHANNELS], delayB_ms[BW_CHANNELS];
-    float  ax[BW_CHANNELS], ay[BW_CHANNELS], az[BW_CHANNELS];    /* 3D plot coords (room x, z, y-up) */
-    float  bx[BW_CHANNELS], by[BW_CHANNELS], bz[BW_CHANNELS];
-    float  dpos_mm[BW_CHANNELS];
+    float  gainA_db[BWA_CHANNELS], delayA_ms[BWA_CHANNELS];
+    float  gainB_db[BWA_CHANNELS], delayB_ms[BWA_CHANNELS];
+    float  ax[BWA_CHANNELS], ay[BWA_CHANNELS], az[BWA_CHANNELS];    /* 3D plot coords (room x, z, y-up) */
+    float  bx[BWA_CHANNELS], by[BWA_CHANNELS], bz[BWA_CHANNELS];
+    float  dpos_mm[BWA_CHANNELS];
     float  eqfreq[EQ_PTS];
-    float  eqmagA[BW_CHANNELS][EQ_PTS];                          /* dB; only valid where eq_len > 0 */
-    float  eqmagB[BW_CHANNELS][EQ_PTS];                          /* B too: reviewing what calibration WROTE */
+    float  eqmagA[BWA_CHANNELS][EQ_PTS];                          /* dB; only valid where eq_len > 0 */
+    float  eqmagB[BWA_CHANNELS][EQ_PTS];                          /* B too: reviewing what calibration WROTE */
 
-    SoundData ir[BW_CHANNELS];
-    bool      hasIR[BW_CHANNELS];
-    float     ir_ms[BW_CHANNELS];                                /* peak time of each loaded IR */
+    SoundData ir[BWA_CHANNELS];
+    bool      hasIR[BWA_CHANNELS];
+    float     ir_ms[BWA_CHANNELS];                                /* peak time of each loaded IR */
     int       ir_n;
 
     int    sel;                                                  /* selected speaker */
@@ -141,7 +141,7 @@ static void load_layout(int which) {                             /* 0 = A, 1 = B
 static void load_irs(void) {
     char err[256], p[600];
     V.ir_n = 0;
-    uint32_t n = V.hasA ? V.A.count : BW_CHANNELS;
+    uint32_t n = V.hasA ? V.A.count : BWA_CHANNELS;
     for (uint32_t i = 0; i < n; ++i) {
         if (V.hasIR[i]) { sound_unload(&V.ir[i]); V.hasIR[i] = false; }
         snprintf(p, sizeof p, "%s_%02u.wav", V.irprefix, i);
@@ -206,7 +206,7 @@ static void tab_array(void) {
     }
     if (V.hasB) {
         ImPlot3D::PlotScatter("B", V.bx, V.by, V.bz, (int)V.B.count);
-        static float seg[3][2 * BW_CHANNELS];                    /* A->B delta segments (same array only) */
+        static float seg[3][2 * BWA_CHANNELS];                    /* A->B delta segments (same array only) */
         if (V.diffable) {
         for (uint32_t i = 0; i < V.B.count; ++i) {
             seg[0][2*i] = V.ax[i]; seg[0][2*i+1] = V.bx[i];
@@ -273,7 +273,7 @@ static void tab_eq(void) {
 static void tab_irs(void) {
     if (!V.hasIR[V.sel]) {
         ImGui::TextDisabled("no IR loaded for speaker %d - set the --save-irs prefix and Load IRs "
-                            "(bw_calibrate --save-irs <prefix> writes <prefix>_NN.wav)", V.sel);
+                            "(bwa_calibrate --save-irs <prefix> writes <prefix>_NN.wav)", V.sel);
         return;
     }
     static float xs[120000]; static uint32_t xs_n;               /* shared ms axis, built lazily */
@@ -290,7 +290,7 @@ static void tab_irs(void) {
 }
 
 static void tab_diff(void) {
-    if (!V.hasA || !V.hasB) { ImGui::TextDisabled("load a second layout as B to diff (e.g. the file bw_calibrate wrote)"); return; }
+    if (!V.hasA || !V.hasB) { ImGui::TextDisabled("load a second layout as B to diff (e.g. the file bwa_calibrate wrote)"); return; }
     if (!V.diffable) {                                           /* different arrays: a per-speaker diff is meaningless */
         ImGui::TextColored(ImVec4(1.0f, 0.42f, 0.42f, 1.0f),
                            "A has %u speakers, B has %u - these are different arrays, not a before/after.",
@@ -315,7 +315,7 @@ static void tab_diff(void) {
     ImGui::EndTable();
 }
 
-/* ============ Capture tab — run the calibration sweep (bw_calibrate's core flow, in-window) ============
+/* ============ Capture tab — run the calibration sweep (bwa_calibrate's core flow, in-window) ============
  * A worker thread runs sweep -> measure_response per speaker -> calib_solve -> writeback, using the
  * SAME calib_capture backends and measure/calib DSP as the CLI (simulate today; the ASIO full-duplex
  * path compiles in with the SDK and is exercised at the rig). Publication is row-at-a-time: the
@@ -336,9 +336,9 @@ struct CapJob {
     std::atomic<int>  done_count;
     std::atomic<bool> cancel;
     std::atomic<int>  n;                             /* speaker count (worker sets; UI reads concurrently) */
-    float    arrival_ms[BW_CHANNELS], level[BW_CHANNELS], rt60[BW_CHANNELS];
-    uint16_t eqlen[BW_CHANNELS];
-    float    gain_db[BW_CHANNELS], trim_ms[BW_CHANNELS];   /* the solve, valid when state == 2 */
+    float    arrival_ms[BWA_CHANNELS], level[BWA_CHANNELS], rt60[BWA_CHANNELS];
+    uint16_t eqlen[BWA_CHANNELS];
+    float    gain_db[BWA_CHANNELS], trim_ms[BWA_CHANNELS];   /* the solve, valid when state == 2 */
     char     msg[256];
 
     std::thread th;
@@ -355,13 +355,13 @@ static void cap_worker(void) {
     const int n = (int)L.count;
     J.n.store(n);
     static float sweep[CAL_NSWEEP], cap[CAL_CAPLEN], irbuf[CAL_IRLEN];   /* one job at a time; off the stack */
-    static float eq_taps[(size_t)BW_CHANNELS * BW_EQ_TAPS];
-    static uint16_t eq_lens[BW_CHANNELS];
-    static MeasureResult res[BW_CHANNELS];
+    static float eq_taps[(size_t)BWA_CHANNELS * BWA_EQ_TAPS];
+    static uint16_t eq_lens[BWA_CHANNELS];
+    static MeasureResult res[BWA_CHANNELS];
     memset(eq_lens, 0, sizeof eq_lens);
     measure_sweep(sweep, CAL_NSWEEP, CAL_F1, CAL_F2, CAL_FS);
 
-#ifdef BW_HAVE_ASIO
+#ifdef BWA_HAVE_ASIO
     bool asio_up = false;
     if (!J.simulate) {
         if (calib_asio_open(J.driver[0] ? J.driver : NULL, J.mic_in, n, sweep, cap) != 0) {
@@ -377,14 +377,14 @@ static void cap_worker(void) {
     const double band[2] = { CAL_BAND_LO, CAL_BAND_HI };
     for (int i = 0; i < n; ++i) {
         if (J.cancel.load(std::memory_order_relaxed)) {
-#ifdef BW_HAVE_ASIO
+#ifdef BWA_HAVE_ASIO
             if (asio_up) calib_asio_close();
 #endif
             cap_fail("cancelled");
             return;
         }
         if (J.simulate) calib_sim_capture(i, &L, J.mic, sweep, cap);
-#ifdef BW_HAVE_ASIO
+#ifdef BWA_HAVE_ASIO
         else if (!calib_asio_capture(i)) { calib_asio_close(); cap_fail("capture timed out (speaker not wired? see console)"); return; }
 #endif
         measure_response(cap, CAL_CAPLEN, sweep, CAL_NSWEEP, CAL_F1, CAL_F2, CAL_FS, band, &res[i]);
@@ -400,25 +400,25 @@ static void cap_worker(void) {
             if (J.do_irs && J.irprefix[0]) { char p[600]; snprintf(p, sizeof p, "%s_%02d.wav", J.irprefix, i); calib_write_wav_f32(p, irbuf, CAL_IRLEN, (int)CAL_FS); }
             if (J.do_eq) {                                       /* gate to before the first reflection, invert */
                 int first_refl = rr.er_count ? rr.er_delay[0] : 0;
-                if (calib_eq(irbuf, CAL_IRLEN, first_refl, CAL_FS, 256, &eq_taps[(size_t)i * BW_EQ_TAPS])) {
+                if (calib_eq(irbuf, CAL_IRLEN, first_refl, CAL_FS, 256, &eq_taps[(size_t)i * BWA_EQ_TAPS])) {
                     eq_lens[i] = 256; J.eqlen[i] = 256;
                 }
             }
         }
         J.done_count.store(i + 1, std::memory_order_release);    /* publish the completed row */
     }
-#ifdef BW_HAVE_ASIO
+#ifdef BWA_HAVE_ASIO
     if (asio_up) calib_asio_close();
 #endif
 
-    float gdb[BW_CHANNELS], dms[BW_CHANNELS];
-    static float pos[BW_CHANNELS][3];                            /* calib_solve wants a packed [3]-stride array */
+    float gdb[BWA_CHANNELS], dms[BWA_CHANNELS];
+    static float pos[BWA_CHANNELS][3];                            /* calib_solve wants a packed [3]-stride array */
     for (int i = 0; i < n; ++i) { pos[i][0] = L.speakers[i].pos[0]; pos[i][1] = L.speakers[i].pos[1]; pos[i][2] = L.speakers[i].pos[2]; }
     calib_solve(res, pos, J.mic, n, CAL_FS, gdb, dms);
     memcpy(J.gain_db, gdb, sizeof gdb);
     memcpy(J.trim_ms, dms, sizeof dms);
     if (!calib_write_layout(J.ran_layout, J.ran_out, gdb, dms, n, err, sizeof err)) { cap_fail(err); return; }
-    if (J.do_eq && !calib_write_eq(J.ran_out, J.ran_out, eq_taps, eq_lens, n, BW_EQ_TAPS, err, sizeof err)) { cap_fail(err); return; }
+    if (J.do_eq && !calib_write_eq(J.ran_out, J.ran_out, eq_taps, eq_lens, n, BWA_EQ_TAPS, err, sizeof err)) { cap_fail(err); return; }
     snprintf(J.msg, sizeof J.msg, "wrote %s%s", J.ran_out, J.do_eq ? " (trims + eq)" : " (trims)");
     J.state.store(2, std::memory_order_release);
 }
@@ -459,7 +459,7 @@ static void tab_capture(void) {
         ImGui::SameLine(); ImGui::SetNextItemWidth(uiScaled(140));
         ImGui::InputTextWithHint("##cirp", "ir prefix", J.irprefix, sizeof J.irprefix);
     }
-#ifdef BW_HAVE_ASIO
+#ifdef BWA_HAVE_ASIO
     if (!J.simulate) {
         ImGui::SetNextItemWidth(uiScaled(160));
         ImGui::InputTextWithHint("##cdrv", "ASIO driver (auto)", J.driver, sizeof J.driver);
@@ -491,7 +491,7 @@ static void tab_capture(void) {
 
     int dc = J.done_count.load(std::memory_order_acquire);
     int jn = J.n.load();
-    int n  = jn > 0 ? jn : BW_CHANNELS;
+    int n  = jn > 0 ? jn : BWA_CHANNELS;
     char ov[64]; snprintf(ov, sizeof ov, "%d / %d speakers", dc, n);
     ImGui::ProgressBar((float)dc / (float)n, ImVec2(-1, 0), ov);
     if (st == 3) ImGui::TextColored(ImVec4(1.0f, 0.42f, 0.42f, 1.0f), "FAILED: %s", J.msg);
@@ -716,7 +716,7 @@ static void tab_zylia(void) {
         ImGui::SameLine(); if (ImGui::Button("Clap now")) zy_sim_clap(&Z.sim, Z.truth);
         bwTip("fire one synthetic clap immediately");
     }
-#ifdef BW_HAVE_ASIO
+#ifdef BWA_HAVE_ASIO
     ImGui::SameLine(0, uiScaled(24));
     ImGui::SetNextItemWidth(uiScaled(160));
     ImGui::InputTextWithHint("##zydrv", "ASIO driver (auto)", Z.driver, sizeof Z.driver);
@@ -966,7 +966,7 @@ static void draw_ui(void) {
     ImGui::InputText("##B", V.pathB, sizeof V.pathB);
     ImGui::SameLine(); if (ImGui::Button("...##pB") && pick_file(V.pathB, sizeof V.pathB, JSONF)) load_layout(1);
     ImGui::SameLine(); if (ImGui::Button("Load B")) load_layout(1);
-    ImGui::TextUnformatted("IR prefix (bw_calibrate --save-irs)");
+    ImGui::TextUnformatted("IR prefix (bwa_calibrate --save-irs)");
     ImGui::SetNextItemWidth(-uiScaled(104));
     ImGui::InputText("##IR", V.irprefix, sizeof V.irprefix);
     ImGui::SameLine(); if (ImGui::Button("...##pI") && pick_file(V.irprefix, sizeof V.irprefix, WAVF)) {
@@ -974,7 +974,7 @@ static void draw_ui(void) {
         load_irs();
     }
     ImGui::SameLine(); if (ImGui::Button("Load IRs")) load_irs();
-    bwTip("decode <prefix>_00.wav .. one per speaker (bw_calibrate --save-irs) through the engine's "
+    bwTip("decode <prefix>_00.wav .. one per speaker (bwa_calibrate --save-irs) through the engine's "
           "own sound loader; picking any one _NN.wav selects the whole set");
     ImGui::Separator();
     ImGui::TextWrapped("%s", V.status[0] ? V.status : "load a cave_layout.json to begin");
@@ -1305,10 +1305,10 @@ int main(int argc, char** argv) {
     }
 
     ImGui_ImplWin32_EnableDpiAwareness();
-    WNDCLASSEXW wc = { sizeof wc, CS_CLASSDC, wnd_proc, 0, 0, GetModuleHandleW(NULL), NULL, NULL, NULL, NULL, L"bw_calib_view", NULL };
+    WNDCLASSEXW wc = { sizeof wc, CS_CLASSDC, wnd_proc, 0, 0, GetModuleHandleW(NULL), NULL, NULL, NULL, NULL, L"bwa_calib_view", NULL };
     wc.hIcon = wc.hIconSm = LoadIconW(wc.hInstance, MAKEINTRESOURCEW(1));   /* the .rc icon (title bar/taskbar) */
     RegisterClassExW(&wc);
-    HWND hwnd = CreateWindowW(wc.lpszClassName, L"bwaudio - calibration report viewer", WS_OVERLAPPEDWINDOW,
+    HWND hwnd = CreateWindowW(wc.lpszClassName, L"bw_audio - calibration report viewer", WS_OVERLAPPEDWINDOW,
                               100, 100, 1280, 800, NULL, NULL, wc.hInstance, NULL);
     g_hwnd = hwnd;                                                /* file-picker dialog owner */
     if (!create_device(hwnd)) { fprintf(stderr, "calib_view: d3d11 device creation failed\n"); return 1; }
@@ -1320,7 +1320,7 @@ int main(int argc, char** argv) {
     ImPlot3D::CreateContext();
     ImGuiIO& io = ImGui::GetIO();
     io.IniFilename = NULL;                                        /* a viewer; don't scatter imgui.ini */
-    g_uiScale = ImGui_ImplWin32_GetDpiScaleForHwnd(hwnd);         /* DPI rides FontScaleMain (bw_theme.h) */
+    g_uiScale = ImGui_ImplWin32_GetDpiScaleForHwnd(hwnd);         /* DPI rides FontScaleMain (bwa_theme.h) */
     loadEmbeddedFont(io);                                         /* embedded Roboto, crisp via the 1.92 atlas */
     applyTheme(g_light);
     ImGui_ImplWin32_Init(hwnd);
@@ -1386,7 +1386,7 @@ int main(int argc, char** argv) {
     destroy_device();
     DestroyWindow(hwnd);
     UnregisterClassW(wc.lpszClassName, wc.hInstance);
-    for (int i = 0; i < BW_CHANNELS; ++i) if (V.hasIR[i]) sound_unload(&V.ir[i]);
+    for (int i = 0; i < BWA_CHANNELS; ++i) if (V.hasIR[i]) sound_unload(&V.ir[i]);
     if (Z.live) zylia_capture_close();
     if (J.th_live) { J.cancel.store(true); J.th.join(); }        /* reap a still-running capture job */
     return rc;

@@ -33,7 +33,7 @@
 #include <stdio.h>
 #include <string.h>
 
-#define CH BW_CHANNELS
+#define CH BWA_CHANNELS
 
 static int fails = 0;
 #define CHECK(c, msg) do { if (!(c)) { printf("FAIL: %s\n", msg); ++fails; } } while (0)
@@ -45,10 +45,10 @@ int main(void) {
     {
         float maxerr = 0.f;
         for (int i = 0; i < XVAL_SH_N; ++i) {
-            float y[BW_AMBI_CH];
+            float y[BWA_AMBI_CH];
             ambi_encode_sn3d(&xval_sh_dir[i * 3], y);
-            for (int k = 0; k < BW_AMBI_CH; ++k) {
-                float e = fabsf(y[k] - xval_sh_val[i * BW_AMBI_CH + k]);
+            for (int k = 0; k < BWA_AMBI_CH; ++k) {
+                float e = fabsf(y[k] - xval_sh_val[i * BWA_AMBI_CH + k]);
                 if (e > maxerr) maxerr = e;
             }
         }
@@ -92,12 +92,12 @@ int main(void) {
     /* 3. allrad.c vs the qhull + linprog + scipy rebuild — full matrices, both grids */
     {
         Layout L = layout_default();
-        float dec[BW_CHANNELS][BW_AMBI_CH];
+        float dec[BWA_CHANNELS][BWA_AMBI_CH];
         CHECK(allrad_build_decode(&L, dec), "allrad builds (grid26)");
         double fro2 = 0, ref2 = 0; float maxerr = 0.f;
         for (int s = 0; s < CH; ++s)
-            for (int k = 0; k < BW_AMBI_CH; ++k) {
-                float ref = xval_allrad_grid26[s * BW_AMBI_CH + k];
+            for (int k = 0; k < BWA_AMBI_CH; ++k) {
+                float ref = xval_allrad_grid26[s * BWA_AMBI_CH + k];
                 float e = fabsf(dec[s][k] - ref);
                 if (e > maxerr) maxerr = e;
                 fro2 += (double)e * e; ref2 += (double)ref * ref;
@@ -120,8 +120,8 @@ int main(void) {
         CHECK(nh == 17 && allrad_build_decode(&LH, dec), "allrad builds (floorless17)");
         fro2 = ref2 = 0; maxerr = 0.f;
         for (uint32_t s = 0; s < nh; ++s)
-            for (int k = 0; k < BW_AMBI_CH; ++k) {
-                float ref = xval_allrad_floorless17[s * BW_AMBI_CH + k];
+            for (int k = 0; k < BWA_AMBI_CH; ++k) {
+                float ref = xval_allrad_floorless17[s * BWA_AMBI_CH + k];
                 float e = fabsf(dec[s][k] - ref);
                 if (e > maxerr) maxerr = e;
                 fro2 += (double)e * e; ref2 += (double)ref * ref;
@@ -138,7 +138,7 @@ int main(void) {
         for (int i = 0; i < XVAL_BQ_N; ++i) {
             const float* c = &xval_bq_case[i * 5];
             float co[5];
-            bw_biquad_rbj_hz((int)c[0], (double)c[1], (double)c[2], (double)c[3], (double)c[4], co);
+            bwa_biquad_rbj_hz((int)c[0], (double)c[1], (double)c[2], (double)c[3], (double)c[4], co);
             for (int k = 0; k < 5; ++k) {
                 float e = fabsf(co[k] - xval_bq_coef[i * 5 + k]);
                 if (e > maxerr) maxerr = e;

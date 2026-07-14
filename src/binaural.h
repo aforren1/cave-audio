@@ -10,10 +10,10 @@
  * single ambisonics->binaural HRTF decode via Steam Audio (one decode, not 26 convolutions);
  * that slots in here behind the same interface when the SDK is vendored (see roadmap M5).
  */
-#ifndef BW_BINAURAL_H
-#define BW_BINAURAL_H
+#ifndef BWA_BINAURAL_H
+#define BWA_BINAURAL_H
 
-#include "layout.h"        /* Layout, BW_CHANNELS */
+#include "layout.h"        /* Layout, BWA_CHANNELS */
 
 #include <stdint.h>
 
@@ -28,4 +28,4 @@ void     monitor_destroy(Monitor* m);
 void monitor_process(Monitor* m, const float* bus, const float p[3], const float q[4],
                      float* out_stereo, uint32_t nframes);
 
-#endif /* BW_BINAURAL_H */
+#endif /* BWA_BINAURAL_H */

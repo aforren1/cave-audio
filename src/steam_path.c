@@ -1,7 +1,7 @@
 /* steam_path.c — see steam_path.h. PATHING simulator + path bake over a probe grid. Build-only-with-SDK. */
 #include "steam_path.h"
 #include "rt.h"
-#include "ambisonics.h"   /* BW_AMBI_CH */
+#include "ambisonics.h"   /* BWA_AMBI_CH */
 #include "profile.h"
 
 #include <phonon.h>
@@ -30,9 +30,9 @@ struct SteamPath {
     IPLSimulator sim;            /* OWNED: pathing-only simulator */
     IPLProbeBatch probes;        /* OWNED: probes carrying the baked visibility graph */
     IPLAmbisonicsDecodeEffect dec;  /* OWNED: ambisonic path field -> 26 speakers (custom layout, panning) */
-    IPLVector3   spk[BW_CHANNELS];
+    IPLVector3   spk[BWA_CHANNELS];
     float*       out26;          /* channels * n decode scratch */
-    uint32_t     channels;       /* the layout's speaker count (<= BW_CHANNELS capacity) */
+    uint32_t     channels;       /* the layout's speaker count (<= BWA_CHANNELS capacity) */
     uint32_t     order, ambi_ch, n, sample_rate;
 
     CRITICAL_SECTION lock;
@@ -83,7 +83,7 @@ static int do_path_bake(SteamPath* sp, const Layout* L) {
 
     iplSimulatorAddProbeBatch(sp->sim, sp->probes);
     iplSimulatorCommit(sp->sim);
-    fprintf(stderr, "bwaudio: baked pathing visibility at %d probes\n", np);
+    fprintf(stderr, "bw_audio: baked pathing visibility at %d probes\n", np);
     return np;
 }
 
@@ -166,9 +166,9 @@ void steam_path_tap(void* ud, float* bus, uint32_t n, const float* lp, const flo
     SteamPath* sp = (SteamPath*)ud; (void)lp; (void)lq;
     if (n != sp->n) return;
     if (ambi_ch > sp->ambi_ch) ambi_ch = sp->ambi_ch;
-    float* ambP[BW_AMBI_CH]; for (uint32_t k=0;k<ambi_ch;++k) ambP[k] = (float*)(ambi + (size_t)k * n);
+    float* ambP[BWA_AMBI_CH]; for (uint32_t k=0;k<ambi_ch;++k) ambP[k] = (float*)(ambi + (size_t)k * n);
     IPLAudioBuffer ab = { .numChannels = (IPLint32)ambi_ch, .numSamples = (IPLint32)n, .data = ambP };
-    float* outP[BW_CHANNELS]; for (uint32_t s=0;s<sp->channels;++s) outP[s] = sp->out26 + (size_t)s * n;
+    float* outP[BWA_CHANNELS]; for (uint32_t s=0;s<sp->channels;++s) outP[s] = sp->out26 + (size_t)s * n;
     IPLAudioBuffer o26 = { .numChannels = (IPLint32)sp->channels, .numSamples = (IPLint32)n, .data = outP };
     IPLAmbisonicsDecodeEffectParams dp; memset(&dp,0,sizeof dp);
     dp.order = (IPLint32)sp->order; dp.hrtf = NULL; dp.binaural = IPL_FALSE;
@@ -179,9 +179,9 @@ void steam_path_tap(void* ud, float* bus, uint32_t n, const float* lp, const flo
 
 static DWORD WINAPI sim_thread(LPVOID arg) {
     SteamPath* sp = (SteamPath*)arg;
-    BW_THREAD_NAME("bw-sim (pathing)");
+    BWA_THREAD_NAME("bw-sim (pathing)");
     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);   /* never preempt the audio callback */
-    float eq[3], sh[BW_AMBI_CH];
+    float eq[3], sh[BWA_AMBI_CH];
     while (!sp->stop) {
         float lp[3], lq[4]; rt_read_pose(sp->rt, lp, lq); (void)lq;
         EnterCriticalSection(&sp->lock); int n = sp->nsrc; LeaveCriticalSection(&sp->lock);
@@ -222,7 +222,7 @@ SteamPath* steam_path_create(SteamScene* scene, RtCore* rt, const Layout* L,
 
     if (do_path_bake(sp, L) == 0) goto fail;
 
-    sp->channels = L->count;                           /* the layout's speaker count (<= BW_CHANNELS cap) */
+    sp->channels = L->count;                           /* the layout's speaker count (<= BWA_CHANNELS cap) */
     for (uint32_t s = 0; s < sp->channels; ++s) {      /* speaker dirs in phonon's cartesian frame (== room),
                                                         * from the layout's nominal listening point */
         float p[3] = { L->speakers[s].pos[0] - L->ref[0], L->speakers[s].pos[1] - L->ref[1],

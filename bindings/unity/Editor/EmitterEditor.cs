@@ -1,20 +1,20 @@
-// BwEmitterEditor.cs — custom inspector for a source. Hides the settings that only matter once their
+// EmitterEditor.cs — custom inspector for a source. Hides the settings that only matter once their
 // feature is switched on, and shows what the engine is doing to this source while it runs (occlusion is
 // ray-traced off-thread, so the number is the only way to see whether the wall you built is working).
 using UnityEditor;
 using UnityEngine;
 
-namespace CaveAudio.EditorTools
+namespace BwAudio.EditorTools
 {
-    [CustomEditor(typeof(BwEmitter))]
+    [CustomEditor(typeof(Emitter))]
     [CanEditMultipleObjects]
-    public sealed class BwEmitterEditor : Editor
+    public sealed class EmitterEditor : Editor
     {
         public override bool RequiresConstantRepaint() => Application.isPlaying;
 
         public override void OnInspectorGUI()
         {
-            var e = (BwEmitter)target;
+            var e = (Emitter)target;
             serializedObject.Update();
 
             var it = serializedObject.GetIterator();
@@ -29,7 +29,7 @@ namespace CaveAudio.EditorTools
                 EditorGUILayout.PropertyField(it, true);
             }
 
-            serializedObject.ApplyModifiedProperties();   // fires BwEmitter.OnValidate -> live re-push
+            serializedObject.ApplyModifiedProperties();   // fires Emitter.OnValidate -> live re-push
 
             if (e.spread > 0f && e.sizeMetres > 0f)
                 EditorGUILayout.HelpBox(
@@ -48,11 +48,11 @@ namespace CaveAudio.EditorTools
             }
         }
 
-        static bool IsHidden(string p, BwEmitter e)
+        static bool IsHidden(string p, Emitter e)
         {
             switch (p)
             {
-                case "directivityPower":    return e.directivity == BwDirectivity.Omni;
+                case "directivityPower":    return e.directivity == BwaDirectivity.Omni;
                 case "reflectionSend":
                 case "reflectionDistance":  return !e.reflections;
                 default:                    return false;

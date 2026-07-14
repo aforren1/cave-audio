@@ -5,8 +5,8 @@
  * orbiting or in head view. Room frame is right-handed, y up. Draw in the 2D pass
  * (after EndMode3D). Pure raylib primitives, stateless, C and C++ (no compound literals).
  */
-#ifndef BW_AXES_HUD_H
-#define BW_AXES_HUD_H
+#ifndef BWA_AXES_HUD_H
+#define BWA_AXES_HUD_H
 
 #include "raylib.h"
 #include "raymath.h"
@@ -49,4 +49,4 @@ static inline void draw_axes_hud(Camera3D cam, float cx, float cy, float len) {
     DrawCircle((int)cx, (int)cy, 2.5f, hub);
 }
 
-#endif /* BW_AXES_HUD_H */
+#endif /* BWA_AXES_HUD_H */

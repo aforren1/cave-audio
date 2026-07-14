@@ -39,7 +39,7 @@ from scipy.signal import bilinear, lfilter
 
 OUT = os.path.join(os.path.dirname(__file__), "..", "..", "test", "xval_data.h")
 AMBI_CH = 16          # 3rd order, (N+1)^2
-CH = 26               # BW_CHANNELS
+CH = 26               # BWA_CHANNELS
 RNG = np.random.default_rng(20260712)
 
 # ---------------------------------------------------------------- real SN3D/ACN SH (AmbiX)
@@ -295,7 +295,7 @@ def main():
                 " * lpmv spherical harmonics, linprog/HiGHS l1-panning, qhull AllRAD, bilinear\n"
                 " * RBJ prototypes, lfilter). See the generator header for what validates what.\n"
                 " * Regenerate: python tools/xval/gen_reference.py  (deterministic). */\n"
-                "#ifndef BW_XVAL_DATA_H\n#define BW_XVAL_DATA_H\n\n")
+                "#ifndef BWA_XVAL_DATA_H\n#define BWA_XVAL_DATA_H\n\n")
         f.write(f"#define XVAL_SH_N {len(sh_dirs)}\n")
         f.write(farr("xval_sh_dir", sh_dirs))
         f.write(farr("xval_sh_val", sh_vals))
@@ -314,7 +314,7 @@ def main():
         f.write("/* align room_eq golden: rt.c's LCG noise (seed 1) through the two sections\n"
                 " * {45 Hz -8 dB Q6, 120 Hz -5 dB Q2} at 48 kHz, rendered with scipy lfilter */\n")
         f.write(farr("xval_lf_out", lf_out))
-        f.write("\n#endif /* BW_XVAL_DATA_H */\n")
+        f.write("\n#endif /* BWA_XVAL_DATA_H */\n")
     print(f"wrote {os.path.normpath(OUT)}: {len(sh_dirs)} SH dirs, {len(vb_dirs)} VBAP dirs, "
           f"2 AllRAD matrices, {len(bq_cases)} biquads, {LF_N} lfilter samples")
 

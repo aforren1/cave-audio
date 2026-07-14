@@ -1,22 +1,22 @@
 # Speaker calibration & room characterization
 
 How the speaker array (26 in the CAVE) is surveyed, trimmed, and characterized at install time, and
-how those numbers reach the engine. The tool is `bw_calibrate` (`examples/calibrate.cpp`, opt-in
-`-DBWAUDIO_BUILD_CALIBRATE=ON`). The measurement DSP is `measure.c`; the solve + JSON writeback is
+how those numbers reach the engine. The tool is `bwa_calibrate` (`examples/calibrate.cpp`, opt-in
+`-DBWA_BUILD_CALIBRATE=ON`). The measurement DSP is `measure.c`; the solve + JSON writeback is
 `calib.c`. All of it is unit-tested off-hardware (`test_measure`, `test_calib`); the ASIO
 full-duplex capture is the only part that needs the rig.
 
 **Everything here follows the layout's speaker count** (`n`, 4..26 — see
 [`layout-schema.md`](./layout-schema.md)), not a hard-wired 26: the capture opens `n` ASIO outputs
 plus the mic input (which rides buffer slot `n`), sweeps those `n` speakers, and writes `n` records
-back. `bw_calib_view` likewise sizes its plots from each loaded layout, and refuses to Diff two
+back. `bwa_calib_view` likewise sizes its plots from each loaded layout, and refuses to Diff two
 layouts with different speaker counts rather than mis-compare them.
 
 ## The two layout tools
 
-- **`bw_layout_tool`** — *authoring*: place the speakers + identify which channel drives which
+- **`bwa_layout_tool`** — *authoring*: place the speakers + identify which channel drives which
   physical box (by ear, via the channel test signal) → writes positions + the channel map.
-- **`bw_calibrate`** — *survey + tuning*: measures positions acoustically, and the per-speaker
+- **`bwa_calibrate`** — *survey + tuning*: measures positions acoustically, and the per-speaker
   delay/gain trims, into the same `cave_layout.json`.
 
 Bring-up order: `layout_tool` (channel map) → `calibrate --localize` (positions) →
@@ -105,9 +105,9 @@ automatically.
   What no EQ fixes: **decay**. A ringing room still smears transients once its steady-state
   coloration is flattened. That stays a treatment problem — see `--room` above.
 
-  The wrong-file mistake fails loudly: **`bw_start` refuses** a layout carrying `room_eq` sections
-  when the session renders a moving listener (the DBAP panner and/or `track_internal`) — see
-  `bw_last_error`. Load the roaming variant, recalibrate with `--room-eq-grid`, or run SPCAP/VBAP
+  The wrong-file mistake fails loudly: **`bwa_start` refuses** a layout carrying `room_eq` sections
+  when the session renders a moving listener (the DBAP panner and/or a connected tracker) — see
+  `bwa_last_error`. Load the roaming variant, recalibrate with `--room-eq-grid`, or run SPCAP/VBAP
   with a fixed pose.
 
 - **`--room-eq-grid`** — **tracked room EQ**: the moving-listener answer to `--room-eq`'s modal
@@ -117,7 +117,7 @@ automatically.
   smoothly on the half-metre scale of LF wavelengths.
 
   Workflow: run once per mic placement — `--mic x y z` **is the grid key** (a rerun within 5 cm
-  replaces that entry; up to 16 positions, `BW_RQ_GRID_MAX`). Cover the working area at ear height,
+  replaces that entry; up to 16 positions, `BWA_RQ_GRID_MAX`). Cover the working area at ear height,
   ~0.5–1 m spacing. Each run measures this position's modal cuts (`measure_room_cuts`, same
   30–200 Hz band and 12 dB depth cap as `--room-eq`) and **merges** them into the layout's
   top-level `room_eq_grid` (`calib_room_grid_merge` → `calib_write_room_eq_grid`): per-position fcs
@@ -127,8 +127,8 @@ automatically.
 
   At runtime the engine interpolates the depths at the **live listener position** every block
   (inverse-distance weights over the grid points) and the align biquads glide toward them at
-  24 dB/s — click-free by construction, fast enough to track a walk. `bw_set_tracked_room_eq` is
-  the live kill switch (off glides to flat) for A/B on the rig. Works with every panner; `bw_start`
+  24 dB/s — click-free by construction, fast enough to track a walk. `bwa_set_tracked_room_eq` is
+  the live kill switch (off glides to flat) for A/B on the rig. Works with every panner; `bwa_start`
   has no objection to a grid in a moving session — that's the point.
 
   **Only** the 30–200 Hz modal band is tracked: the mid/HF room response decorrelates over
@@ -228,7 +228,7 @@ gradient, so the radius **cancels out of the direction entirely** — 49 vs 50 m
 survive every structural check above:
 
 - **Channel order** — node *i* here is not necessarily ASIO input *i*. A permutation still yields a
-  confident direction, just the wrong one. `bw_zylia_probe` resolves it: tap a capsule, see which
+  confident direction, just the wrong one. `bwa_zylia_probe` resolves it: tap a capsule, see which
   channel jumps.
 - **Azimuth reference** — nothing published says which capsule faces the device's front, so an unknown
   yaw offset rotates every DOA by a constant. Clap from a known direction in the Zylia tab; the
@@ -288,11 +288,11 @@ re-survey if either changes.
 input-only, no rig needed. Both ride the same capture shell (`zylia_capture.cpp`: driver open,
 transient trigger, snapshot publish):
 
-- `bw_zylia_probe` (built with `-DBWAUDIO_BUILD_CALIBRATE=ON`): console meter. `--list` enumerates
+- `bwa_zylia_probe` (built with `-DBWA_BUILD_CALIBRATE=ON`): console meter. `--list` enumerates
   the ASIO drivers + channel counts (look for the Zylia driver, or ASIO4ALL over its USB-audio
   interface, showing `in=19`; it auto-picks a name containing "zylia", else `--driver` it). Tap a
   capsule and watch its channel jump; a channel stuck at digital silence is dead or unmapped.
-- **Live DOA view** — `bw_calib_view`'s **Zylia tab** (built with `-DBWAUDIO_BUILD_CALIBVIEW=ON`;
+- **Live DOA view** — `bwa_calib_view`'s **Zylia tab** (built with `-DBWA_BUILD_CALIBVIEW=ON`;
   live capture needs the ASIO SDK too): CLAP anywhere around the array and a dot appears on the
   capsule sphere where the clap came from (`zylia_tdoa`: onset + windowed cross-correlation against
   the strongest capsule with sub-sample parabolic peaks → `zylia_doa`). This verifies the capsule
@@ -302,16 +302,16 @@ transient trigger, snapshot publish):
   check of everything but the ASIO capture. The math is unit-tested in the `zylia` ctest, and the
   whole tab is driven by the `zylia/sim_doa` UI test in `calib_view`.
 
-## Reviewing the results (`bw_calib_view`)
+## Reviewing the results (`bwa_calib_view`)
 
-Before trusting a calibration run, LOOK at it. `bw_calib_view` (opt-in `-DBWAUDIO_BUILD_CALIBVIEW=ON`;
+Before trusting a calibration run, LOOK at it. `bwa_calib_view` (opt-in `-DBWA_BUILD_CALIBVIEW=ON`;
 Dear ImGui + ImPlot/ImPlot3D on win32+d3d11) loads layouts through the engine's own loader and shows
 
 - the **array in 3D** with per-speaker index labels (the wiring sanity check),
 - **gain/delay trims** as bar charts,
 - each speaker's **correction-EQ magnitude** (`--eq` filters, 20 Hz–20 kHz),
 - the retained **IR kernels** (`--save-irs <prefix>` → `<prefix>_NN.wav`) with the direct-arrival tag,
-- and — the main event — a **layout diff**: `bw_calib_view before.json after.json` tables Δposition /
+- and — the main event — a **layout diff**: `bwa_calib_view before.json after.json` tables Δposition /
   Δgain / Δdelay / eq-taps per speaker with outliers highlighted, so a swapped channel, a bad mic
   placement, or a bogus `--localize` solve is one glance, not an evening.
 
@@ -323,9 +323,9 @@ room/eq/IR options in-window). One button loads the result into Diff (A = input,
 wrote) for review before you accept it. The **Zylia tab** (live clap-DOA, see "Bring-up" above)
 covers the ZM-1.
 
-`bw_calibrate` remains the headless CLI over the same code — scriptable, and the only place for the
+`bwa_calibrate` remains the headless CLI over the same code — scriptable, and the only place for the
 multi-placement modes (`--localize`, `--zylia`, `--check`, `--live`).
-`bw_calib_view --tests [filter]` runs its imgui_test_engine suite (fake inputs drive the actual UI
+`bwa_calib_view --tests [filter]` runs its imgui_test_engine suite (fake inputs drive the actual UI
 against generated fixture layouts + synthesized claps, screenshots land in `output/captures/`) and
 is wired into ctest as `calib_view`.
 

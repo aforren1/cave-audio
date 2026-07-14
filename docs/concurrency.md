@@ -10,7 +10,7 @@ The `Voice`, `SoundData`, `Layout`, `Listener`, and `RtCore` structs are documen
 
 Two threads carry the core:
 
-- **Control thread** — whatever calls the `bw_*` API (the engine main thread).
+- **Control thread** — whatever calls the `bwa_*` API (the engine main thread).
   Owns handle allocation, the slot free-lists, generation tables, and asset
   memory. Does all file decode, malloc/free, file I/O, logging.
 - **Audio thread** — the ASIO driver's `bufferSwitch` callback (or the null
@@ -20,8 +20,8 @@ Two threads carry the core:
 
 The bus is **N channels wide, where N is the loaded layout's speaker count**
 (`RtCore.channels`, 4..26; 26 for the CAVE array and for the default grid). It is
-fixed for the engine's lifetime — resolved at `bw_create`, before `rt_create`.
-`BW_CHANNELS` (26, [`src/sink.h`](../src/sink.h)) is only the compile-time
+fixed for the engine's lifetime — resolved at `bwa_create`, before `rt_create`.
+`BWA_CHANNELS` (26, [`src/sink.h`](../src/sink.h)) is only the compile-time
 *capacity* that sizes the fixed arrays.
 
 These two communicate through two SPSC rings:
@@ -36,7 +36,7 @@ Around that backbone sit auxiliary producer threads, each with its own channel
 into the audio thread. Every channel is wait-free on the audio side — the audio
 thread never blocks on any of them:
 
-- **NatNet receiver thread** (`track_internal`): publishes the tracked head pose
+- **NatNet receiver thread** (`bwa_tracker_connect`): publishes the tracked head pose
   through a single-slot seqlock (`PoseSlot`, [`src/pose.h`](../src/pose.h)).
   `rt_render` samples the freshest pose once per block; if the position moved,
   it dirties every voice. If the reader loses the seqlock race it keeps the
@@ -108,16 +108,16 @@ typedef struct { Cmd slots[RING_CAP]; _Atomic uint32_t write, read; } CmdRing;
 Handles are `(index | generation << 16)`; the macros live in rt.h:
 
 ```c
-#define BW_H_IDX(h)   ((uint16_t)((h) & 0xFFFFu))
-#define BW_H_GEN(h)   ((uint16_t)((h) >> 16))
-#define BW_MK_H(i, g) ((uint32_t)(i) | ((uint32_t)(g) << 16))
+#define BWA_H_IDX(h)   ((uint16_t)((h) & 0xFFFFu))
+#define BWA_H_GEN(h)   ((uint16_t)((h) >> 16))
+#define BWA_MK_H(i, g) ((uint32_t)(i) | ((uint32_t)(g) << 16))
 ```
 
 ## Event type and ring
 
 The return path is symmetric and likewise SPSC, roles reversed: the **audio
 thread is the sole producer**, the **control thread the sole consumer**
-(`drain_events`, called from `rt_commit` / `bw_commit`). There is no second
+(`drain_events`, called from `rt_commit` / `bwa_commit`). There is no second
 producer — keep it that way, or the relaxed/acquire/release scheme stops being
 sufficient.
 
@@ -146,7 +146,7 @@ Three facts about the event path:
 
 - **`EVT_VOICE_ENDED` does not fire for every ended voice.** A regular
   non-looping voice just flips `playing` off at end-of-buffer; its handle still
-  belongs to the app until `bw_source_destroy`. The event fires only where the
+  belongs to the app until `bwa_source_destroy`. The event fires only where the
   *audio thread* ends a slot's lifetime: a oneshot reaching end-of-buffer, and
   a stolen voice finishing its fade-out. The control side recycles the slot and
   clears its `stealing` flag.
@@ -180,7 +180,7 @@ void rt_commit(RtCore* c) {
 
 `rt_source_create` is the one call that does **not** round-trip. The control
 thread owns the free-list and generation table, so it allocates an index, bumps
-the generation, returns `BW_MK_H(idx, gen)` synchronously, and enqueues
+the generation, returns `BWA_MK_H(idx, gen)` synchronously, and enqueues
 `CMD_SRC_CREATE`. Synchronous handle, async activation. When the pool is full it
 steals a voice instead of failing — see "Voice steal" below.
 
@@ -196,10 +196,10 @@ the ring.
 
 ```c
 static Voice* voice_for(RtCore* c, uint32_t h) {
-    uint16_t i = BW_H_IDX(h);
+    uint16_t i = BWA_H_IDX(h);
     if (i >= c->voice_cap) return NULL;
     Voice* v = &c->voices[i];
-    return (v->active && v->gen == BW_H_GEN(h)) ? v : NULL;    /* stale gen => dropped */
+    return (v->active && v->gen == BWA_H_GEN(h)) ? v : NULL;    /* stale gen => dropped */
 }
 ```
 
@@ -252,7 +252,7 @@ static void drain_commands(RtCore* c) {
 - **A listener move dirties every voice**, since the panner gains are all
   listener-relative. That is the moving-observer case paying its cost:
   recompute the whole field on frames the head moves, nothing on frames it
-  doesn't. The tracker override (`track_internal`) applies the same rule when
+  doesn't. The tracker override (a connected tracker) applies the same rule when
   the sampled pose moves.
 - **Generation counts make slot reuse safe without an ack.** A late
   `CMD_SET_POS` aimed at a destroyed-then-recycled slot fails the `gen` check
@@ -288,13 +288,13 @@ static void drain_events(RtCore* c) {
         const Evt* ev = &r->slots[rd & (EVT_CAP - 1)];
         switch (ev->type) {
         case EVT_VOICE_ENDED:    recycle_handle(c, ev->handle);
-                                 c->stealing[BW_H_IDX(ev->handle)] = 0; break;
+                                 c->stealing[BWA_H_IDX(ev->handle)] = 0; break;
         case EVT_SOUND_RETIRED: {        /* audio dropped all refs: free pcm / close the stream */
             SoundSlot* s = sound_slot_ctrl(c, ev->handle);
             if (s) {
                 if (s->data.stream) { stream_close(c->streams, s->data.stream); s->data.stream = NULL; }
                 sound_unload(&s->data);
-                srecycle_sound(c, BW_H_IDX(ev->handle));
+                srecycle_sound(c, BWA_H_IDX(ev->handle));
             }
         } break;
         }
@@ -311,7 +311,7 @@ source's slot.
 
 ## Block structure
 
-`rt_render(RtCore*, float* bus, uint32_t nframes, const BwTimestamp* ts)` is
+`rt_render(RtCore*, float* bus, uint32_t nframes, const bwa_timestamp* ts)` is
 the whole audio-thread entry point (rt.c). The sink's render callback calls it
 with the device's planar buffer (`cave` profile) or a scratch buffer
 (`binaural`/`both` — see below). The bus is planar, channel-major:
@@ -324,10 +324,10 @@ with the device's planar buffer (`cave` profile) or a scratch buffer
    zero (FTZ/DAZ) — gain ramps toward 0 otherwise produce subnormals that
    stall the FP pipeline.
 2. **Drain commands** (the snapshot above). A block larger than
-   `BW_RT_MAX_BLOCK` then renders silence instead of overflowing the RT
+   `BWA_RT_MAX_BLOCK` then renders silence instead of overflowing the RT
    scratch buffers — but commands were already drained, so the ring never
    backs up.
-3. **Sample the tracker pose.** Under `track_internal`, read the seqlock slot
+3. **Sample the tracker pose.** With a tracker connected, read the seqlock slot
    and overwrite the active listener; a moved position dirties every voice.
    This bypasses the commit path — lower latency than routing pose through the
    command ring.
@@ -353,20 +353,20 @@ with the device's planar buffer (`cave` profile) or a scratch buffer
    output gets the per-speaker trims too.
 8. **`align_process`** ([`src/align.c`](../src/align.c)): the per-speaker
    output stage — correction FIR, room-EQ modal cuts, gain trim, delay line.
-9. **Test signal.** `bw_test_signal` injects its sine/noise onto a raw channel
+9. **Test signal.** `bwa_set_test_signal` injects its sine/noise onto a raw channel
    *after* align — a wiring check, outside the spatial path.
 10. **Limiter** (final stage; on by default at -1 dBFS). One gain computed
     from the cross-channel peak — linked, so engaging never shifts the spatial
     image — with ~1 ms attack / ~120 ms release one-poles and a hard clamp at
     the ceiling. Protection, not mastering.
 11. **Meters + readback.** Publish per-channel output peaks (`chan_peak` →
-    `bw_get_bus_levels`) and the active pose (the `readback` seqlock →
+    `bwa_get_bus_levels`) and the active pose (the `readback` seqlock →
     `rt_read_pose`).
 
 The binaural monitor is not a bus tap: it is a *sink render callback* in
 [`src/engine.c`](../src/engine.c) (`render_binaural`: `rt_render` into
 `scratch26`, then `monitor_process` / `steam_monitor_process` decodes to the
-2-ch device). Device output likewise goes through the `BwSink` abstraction
+2-ch device). Device output likewise goes through the `bwa_sink` abstraction
 ([`src/sink.h`](../src/sink.h)); the render callback fills the device's planar
 buffers directly.
 
@@ -384,10 +384,10 @@ for every audible change, generation-gated handles, acks over the event ring.
 
 ### Voice steal (fade reserve + priority)
 
-`rt_create` allocates `BW_FADE_RESERVE` (8) physical slots beyond the user pool;
+`rt_create` allocates `BWA_FADE_RESERVE` (8) physical slots beyond the user pool;
 normal allocation never draws them down. When the user pool is full,
 `rt_source_create` scans for the lowest-priority active source
-(`bw_source_set_priority`; control-side bytes, 255 = protected, slots already
+(`bwa_source_set_priority`; control-side bytes, 255 = protected, slots already
 mid-steal are skipped), gives the *new* source a reserve slot, and enqueues
 `CMD_SRC_STEAL` for the victim. The audio thread fades the victim's gate to
 zero over one block, then finalizes in `pause_gate`: `active = false` plus
@@ -420,7 +420,7 @@ still reads as playing.
 
 Per-voice fractional-delay rings live in one contiguous `RtCore.dop_ring`
 allocation — one power-of-two slice per voice, sized at `rt_create` for
-`BW_DOPPLER_MAX_DIST` (8 m) at the engine rate. The audio thread writes each
+`BWA_DOPPLER_MAX_DIST` (8 m) at the engine rate. The audio thread writes each
 sample and reads at a delay gliding toward `distance/c`; the glide *is* the
 pitch shift. The write index stays integer (masked ring) with the fraction as a
 separate small float, so a long-lived voice never loses sample precision.
@@ -430,7 +430,7 @@ Allocation at create time, DSP on the audio thread — invariant 1.
 
 Both are plain audio-thread state, not new channels. `compute_gains` derives
 the amplitude-normalised LF gain set (`gtarget_lo`) on every solve, so
-`bw_set_dual_band` A/Bs live: an atomic flag the mixer reads, crossfaded per
+`bwa_set_dual_band` A/Bs live: an atomic flag the mixer reads, crossfaded per
 voice via `dual_mix`. The ambisonic-bed decode matrix (`bed_decode`) is rebuilt
 on the control thread only while the audio thread is stopped (`rt_set_layout` /
 `rt_set_bed_decoder`), like the aligner and the taps.

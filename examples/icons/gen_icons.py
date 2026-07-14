@@ -1,18 +1,18 @@
 #!/usr/bin/env python3
 """
-gen_icons.py -- generate the bw_* tool icons (examples/icons/*.ico).
+gen_icons.py -- generate the bwa_* tool icons (examples/icons/*.ico).
 
-One family, the station theme (bw_theme.h): dark rounded square, grayscale chrome,
+One family, the station theme (bwa_theme.h): dark rounded square, grayscale chrome,
 electric blue + purple as the only accents. One glyph per tool:
 
-  bw_layout_tool   ring of speaker dots, one highlighted (placing a speaker)
-  bw_calib_view    magnitude curve over a baseline (the calibration report)
-  bw_playground    headphones (binaural audition)
-  bw_calibrate     sine sweep chirp
-  bw_zylia_probe   mic sphere (capsule dots on a ball)
-  bw_track_monitor crosshair + tracked dot
-  bw_profile_bench ascending bars
-  bw_minimal       play triangle + wavefront (the minimal client example)
+  bwa_layout_tool   ring of speaker dots, one highlighted (placing a speaker)
+  bwa_calib_view    magnitude curve over a baseline (the calibration report)
+  bwa_playground    headphones (binaural audition)
+  bwa_calibrate     sine sweep chirp
+  bwa_zylia_probe   mic sphere (capsule dots on a ball)
+  bwa_track_monitor crosshair + tracked dot
+  bwa_profile_bench ascending bars
+  bwa_minimal       play triangle + wavefront (the minimal client example)
 
 Drawn at 1024 px (4x supersample), downscaled to 256, saved as .ico with
 256/48/32/24/16 entries. The .ico files are committed so builds never need
@@ -117,14 +117,14 @@ def glyph_minimal(d):
 
 
 TOOLS = {
-    "bw_layout_tool":   glyph_layout_tool,
-    "bw_calib_view":    glyph_calib_view,
-    "bw_playground":    glyph_playground,
-    "bw_calibrate":     glyph_calibrate,
-    "bw_zylia_probe":   glyph_zylia_probe,
-    "bw_track_monitor": glyph_track_monitor,
-    "bw_profile_bench": glyph_profile_bench,
-    "bw_minimal":       glyph_minimal,
+    "bwa_layout_tool":   glyph_layout_tool,
+    "bwa_calib_view":    glyph_calib_view,
+    "bwa_playground":    glyph_playground,
+    "bwa_calibrate":     glyph_calibrate,
+    "bwa_zylia_probe":   glyph_zylia_probe,
+    "bwa_track_monitor": glyph_track_monitor,
+    "bwa_profile_bench": glyph_profile_bench,
+    "bwa_minimal":       glyph_minimal,
 }
 
 

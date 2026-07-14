@@ -1,3 +1,3 @@
 // GLFW_ICON: raylib/GLFW loads this named resource as the window/taskbar icon;
 // Explorer shows it as the .exe icon too (named entries sort first).
-GLFW_ICON ICON "bw_playground.ico"
+GLFW_ICON ICON "bwa_playground.ico"

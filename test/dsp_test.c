@@ -19,7 +19,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-#define CH   BW_CHANNELS
+#define CH   BWA_CHANNELS
 #define RATE 48000u
 
 static int fails = 0;
@@ -126,7 +126,7 @@ int main(void) {
     CHECK(LD.count == CH, "default layout has 26 speakers");
 
     /* 2. layout_load parse */
-    const char* LJ = "bw_layout.json";
+    const char* LJ = "bwa_layout.json";
     CHECK(write_layout_json(LJ), "write layout json");
     char err[256] = {0};
     Layout L;
@@ -286,7 +286,7 @@ int main(void) {
         if (a) {
             enum { BL = 256, WIN = 47 };                      /* 47 blocks ~ 0.25 s per window */
             static float blk[CH * BL];
-            float tgt[BW_CHANNELS][BW_ROOM_EQ_MAX];
+            float tgt[BWA_CHANNELS][BWA_ROOM_EQ_MAX];
             memset(tgt, 0, sizeof tgt);
             int ph = 0;
             #define GRID_WIN_DB(out) do {                                                        \
@@ -318,7 +318,7 @@ int main(void) {
 
     /* 7b. layout_load rejects out-of-range values (so bad JSON can't reach the audio thread) */
     {
-        const char* BJ = "bw_bad_layout.json";
+        const char* BJ = "bwa_bad_layout.json";
         Layout B;
         write_layout_with(BJ, 0.0, 0.0, 0.0);     CHECK(!layout_load(BJ, RATE, &B, err, sizeof err), "rolloff_r=0 is rejected");
         write_layout_with(BJ, 0.7, 1000.0, 0.0);  CHECK(!layout_load(BJ, RATE, &B, err, sizeof err), "gain_db=1000 is rejected");
@@ -330,7 +330,7 @@ int main(void) {
     /* 7b2. room_eq_grid schema: parses into the shared ladder + per-position depths; positions must
      * agree on the ladder (depths interpolate by index); static room_eq + grid don't mix. */
     {
-        const char* GJ = "bw_grid_layout.json";
+        const char* GJ = "bwa_grid_layout.json";
         Layout B;
         write_layout_grid(GJ, 0);
         CHECK(layout_load(GJ, RATE, &B, err, sizeof err), err[0] ? err : "room_eq_grid layout loads");
@@ -349,9 +349,9 @@ int main(void) {
     }
 
     /* 7b3. runtime channel count: the loader accepts 4..26 speakers whose indices form a complete
-     * 0..N-1 permutation — the engine's channel count follows the file (BW_CHANNELS is the cap). */
+     * 0..N-1 permutation — the engine's channel count follows the file (BWA_CHANNELS is the cap). */
     {
-        const char* NJ = "bw_n_layout.json";
+        const char* NJ = "bwa_n_layout.json";
         Layout B;
         write_layout_n(NJ, 24, -1);
         CHECK(layout_load(NJ, RATE, &B, err, sizeof err), err[0] ? err : "a 24-speaker layout loads");
@@ -405,12 +405,12 @@ int main(void) {
 
     /* 10. AllRAD bed decoder: builds, finite, energy ~ the sampling decode, localizes plane waves */
     {
-        float dec[BW_CHANNELS][BW_AMBI_CH];
+        float dec[BWA_CHANNELS][BWA_AMBI_CH];
         int ok = allrad_build_decode(&LD, dec);
         CHECK(ok, "allrad_build_decode succeeds on the default grid");
         if (ok) {
             int finite = 1; double ediff = 0;
-            for (int s = 0; s < CH; ++s) for (int k = 0; k < BW_AMBI_CH; ++k) {
+            for (int s = 0; s < CH; ++s) for (int k = 0; k < BWA_AMBI_CH; ++k) {
                 if (!isfinite(dec[s][k])) finite = 0;
                 int l = (int)floorf(sqrtf((float)k)); ediff += (double)dec[s][k]*dec[s][k]/(2*l+1);
             }
@@ -422,8 +422,8 @@ int main(void) {
                 float p[3] = { LD.speakers[s].pos[0] - LD.ref[0], LD.speakers[s].pos[1] - LD.ref[1],
                                LD.speakers[s].pos[2] - LD.ref[2] };       /* dirs from the array centre */
                 float pl = sqrtf(p[0]*p[0] + p[1]*p[1] + p[2]*p[2]);
-                float ad2[3] = { p[2]/pl, p[0]/pl, p[1]/pl }, ys[BW_AMBI_CH]; ambi_encode_sn3d(ad2, ys);   /* (z,x,y): matches build_bed_decode */
-                for (int k = 0; k < BW_AMBI_CH; ++k) { int l = (int)floorf(sqrtf((float)k));
+                float ad2[3] = { p[2]/pl, p[0]/pl, p[1]/pl }, ys[BWA_AMBI_CH]; ambi_encode_sn3d(ad2, ys);   /* (z,x,y): matches build_bed_decode */
+                for (int k = 0; k < BWA_AMBI_CH; ++k) { int l = (int)floorf(sqrtf((float)k));
                     double d = (double)(2*l+1)*ys[k]/CH; esad += d*d/(2*l+1); }
             }
             CHECK(fabs(ediff - esad)/esad < 0.05, "AllRAD diffuse energy matches the sampling decode");
@@ -432,10 +432,10 @@ int main(void) {
             for (int t = 0; t < 3; ++t) {
                 float* sd = dirs[t]; float sl = sqrtf(sd[0]*sd[0] + sd[1]*sd[1] + sd[2]*sd[2]);
                 float s3[3] = { sd[0]/sl, sd[1]/sl, sd[2]/sl };
-                float ad[3] = { s3[2], s3[0], s3[1] }, sh[BW_AMBI_CH]; ambi_encode_sn3d(ad, sh);   /* (z,x,y): matches build_bed_decode */
+                float ad[3] = { s3[2], s3[0], s3[1] }, sh[BWA_AMBI_CH]; ambi_encode_sn3d(ad, sh);   /* (z,x,y): matches build_bed_decode */
                 float rE[3] = { 0, 0, 0 };
                 for (int s = 0; s < CH; ++s) {
-                    float f = 0; for (int k = 0; k < BW_AMBI_CH; ++k) f += dec[s][k]*sh[k];
+                    float f = 0; for (int k = 0; k < BWA_AMBI_CH; ++k) f += dec[s][k]*sh[k];
                     float p[3] = { LD.speakers[s].pos[0] - LD.ref[0], LD.speakers[s].pos[1] - LD.ref[1],
                                    LD.speakers[s].pos[2] - LD.ref[2] };
                     float pl = sqrtf(p[0]*p[0] + p[1]*p[1] + p[2]*p[2]);
@@ -465,7 +465,7 @@ int main(void) {
             }
             LH.count = nh;                                     /* 17: the 1.5 m ring (8) + the ceiling (9) */
             layout_compute_ref(&LH);
-            float dech[BW_CHANNELS][BW_AMBI_CH];
+            float dech[BWA_CHANNELS][BWA_AMBI_CH];
             int okh = allrad_build_decode(&LH, dech);
             CHECK(okh, "allrad_build_decode succeeds on a floor-less array");
             if (okh) {
@@ -474,10 +474,10 @@ int main(void) {
                 float dirs2[2][3] = { { 0, -1, 0 }, { 1, 0, 0 } };
                 double* acc[2] = { &e_down, &e_side };
                 for (int t = 0; t < 2; ++t) {
-                    float ad[3] = { dirs2[t][2], dirs2[t][0], dirs2[t][1] }, sh[BW_AMBI_CH];
+                    float ad[3] = { dirs2[t][2], dirs2[t][0], dirs2[t][1] }, sh[BWA_AMBI_CH];
                     ambi_encode_sn3d(ad, sh);                  /* (z,x,y): matches build_bed_decode */
                     for (uint32_t s = 0; s < nh; ++s) {
-                        float f = 0; for (int k = 0; k < BW_AMBI_CH; ++k) f += dech[s][k]*sh[k];
+                        float f = 0; for (int k = 0; k < BWA_AMBI_CH; ++k) f += dech[s][k]*sh[k];
                         *acc[t] += (double)f * f;
                     }
                 }

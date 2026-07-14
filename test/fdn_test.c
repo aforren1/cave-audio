@@ -17,7 +17,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-#define CH   BW_CHANNELS
+#define CH   BWA_CHANNELS
 #define RATE 48000u
 #define N    256u
 

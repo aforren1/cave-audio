@@ -5,8 +5,8 @@
  * orientation at a glance (and makes a mis-surveyed position read wrong immediately).
  * Pure raylib primitives, stateless, C and C++ (no compound literals).
  */
-#ifndef BW_SPEAKER_GIZMO_H
-#define BW_SPEAKER_GIZMO_H
+#ifndef BWA_SPEAKER_GIZMO_H
+#define BWA_SPEAKER_GIZMO_H
 
 #include "raylib.h"
 #include "raymath.h"
@@ -36,4 +36,4 @@ static inline void draw_speaker_gizmo(Vector3 pos, Vector3 aim_at, float scale, 
     DrawCylinderEx(f_rim, f_apex, 0.27f * scale, 0.04f * scale, 12, cone);  /* the cone, at the listener */
 }
 
-#endif /* BW_SPEAKER_GIZMO_H */
+#endif /* BWA_SPEAKER_GIZMO_H */

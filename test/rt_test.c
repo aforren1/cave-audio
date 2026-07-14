@@ -7,7 +7,7 @@
  */
 #include "rt.h"
 #include "layout.h"
-#include "ambisonics.h"   /* BW_AMBI_CH for the pathing accumulator capture */
+#include "ambisonics.h"   /* BWA_AMBI_CH for the pathing accumulator capture */
 #include "ism.h"          /* IsmRoom for the early-reflection section */
 #include "dr_wav.h"
 
@@ -19,7 +19,7 @@
 #include <windows.h>          /* Sleep, for the streaming-fill wait */
 
 #define N    256
-#define CH   BW_CHANNELS
+#define CH   BWA_CHANNELS
 #define RATE 48000u
 
 static float  bus[CH * N];
@@ -36,7 +36,7 @@ static int argmax_channel(void) {
     for (int ch = 0; ch < CH; ++ch) { double e = chan_energy(ch); if (e > bm) { bm = e; best = ch; } }
     return best;
 }
-static void render2(RtCore* c) { BwTimestamp ts = { 0, 0 }; rt_render(c, bus, N, &ts); rt_render(c, bus, N, &ts); }
+static void render2(RtCore* c) { bwa_timestamp ts = { 0, 0 }; rt_render(c, bus, N, &ts); rt_render(c, bus, N, &ts); }
 
 /* place a voice at speaker k's surveyed position (so DBAP localizes it to channel k) */
 static void set_pos_spk(RtCore* c, uint32_t h, int k) {
@@ -127,7 +127,7 @@ static int write_ambix4_noise_wav(const char* path, float w, float y, float z, f
 /* render `kb` blocks, summing all 26 channels to mono per sample into out[kb*N]; the per-channel pan
  * gains are all >= 0 for one source, so the mono sum is a scaled copy of the (propagated) source. */
 static void render_capture_mono(RtCore* c, float* out, int kb) {
-    BwTimestamp ts = { 0, 0 };
+    bwa_timestamp ts = { 0, 0 };
     for (int b = 0; b < kb; ++b) {
         rt_render(c, bus, N, &ts);
         for (int i = 0; i < N; ++i) { double s = 0; for (int ch = 0; ch < CH; ++ch) s += bus[(size_t)ch*N + i]; out[b*N + i] = (float)s; }
@@ -135,7 +135,7 @@ static void render_capture_mono(RtCore* c, float* out, int kb) {
 }
 /* same, but move the source on +x from d0 to d1 (one step per block) so the Doppler delay glides */
 static void render_capture_mono_moving(RtCore* c, uint32_t h, float d0, float d1, float* out, int kb) {
-    BwTimestamp ts = { 0, 0 };
+    bwa_timestamp ts = { 0, 0 };
     for (int b = 0; b < kb; ++b) {
         float d = d0 + (d1 - d0) * ((float)b / (float)(kb - 1));
         rt_source_set_pos(c, h, d, LD.ref[1], 0.f); rt_commit(c);   /* on the ear plane: distance == d */
@@ -188,16 +188,16 @@ static void test_tap(void* ud, float* bus, uint32_t n, const float* lp, const fl
 
 static int      g_path_calls;
 static uint32_t g_path_chn;
-static float    g_path_cap[BW_AMBI_CH];   /* last-sample value of each accumulator channel */
+static float    g_path_cap[BWA_AMBI_CH];   /* last-sample value of each accumulator channel */
 static void test_path_tap(void* ud, float* bus, uint32_t n, const float* lp, const float* lq, const float* ambi, uint32_t ambi_ch) {
     (void)ud; (void)lp; (void)lq; (void)bus;
     ++g_path_calls; g_path_chn = ambi_ch;
-    for (uint32_t k = 0; k < ambi_ch && k < BW_AMBI_CH; ++k) g_path_cap[k] = ambi[(size_t)k * n + (n - 1)];
+    for (uint32_t k = 0; k < ambi_ch && k < BWA_AMBI_CH; ++k) g_path_cap[k] = ambi[(size_t)k * n + (n - 1)];
 }
 
 int main(void) {
     LD = layout_default();                          /* listener stays at the default (the array centre, LD.ref) */
-    const char* WAV = "bw_rt_const.wav";
+    const char* WAV = "bwa_rt_const.wav";
     if (!write_const_wav(WAV, 1.0f, 8 * N)) { printf("FAIL: write wav\n"); return 1; }
 
     CHECK(rt_create(1000, 1000, RATE, CH) == NULL, "rt_create rejects caps that could overflow the event ring");
@@ -244,8 +244,8 @@ int main(void) {
     render2(c);
     CHECK(total_energy() == 0.0, "destroyed voice is silent");
     uint32_t h2 = rt_source_create(c);
-    CHECK(BW_H_IDX(h2) == BW_H_IDX(old), "destroyed slot is reused");
-    CHECK(BW_H_GEN(h2) != BW_H_GEN(old), "generation is bumped on reuse");
+    CHECK(BWA_H_IDX(h2) == BWA_H_IDX(old), "destroyed slot is reused");
+    CHECK(BWA_H_GEN(h2) != BWA_H_GEN(old), "generation is bumped on reuse");
     set_pos_spk(c, old, 2);                          /* STALE handle -> must be dropped */
     rt_source_play(c, h2, snd, true);
     set_pos_spk(c, h2, 9);                           /* valid */
@@ -279,7 +279,7 @@ int main(void) {
     CHECK(total_energy() < e_clear * 0.02, "occlusion 0 ~ silent");
     rt_set_occlusion(c, h3, 1.0f); render2(c);
     CHECK(fabs(total_energy() / e_clear - 1.0) < 0.02, "occlusion restored to 1 ~ full");
-    uint32_t stale_occ = BW_MK_H(BW_H_IDX(h3), (uint16_t)(BW_H_GEN(h3) + 7));
+    uint32_t stale_occ = BWA_MK_H(BWA_H_IDX(h3), (uint16_t)(BWA_H_GEN(h3) + 7));
     rt_set_occlusion(c, stale_occ, 0.0f); render2(c);
     CHECK(total_energy() > e_clear * 0.5, "occlusion on a stale handle is dropped");
 
@@ -289,7 +289,7 @@ int main(void) {
     CHECK(total_energy() < e_clear * 0.02, "h3 fully occluded before recycling");
     rt_source_destroy(c, h3); render2(c);
     uint32_t h4 = rt_source_create(c);
-    CHECK(BW_H_IDX(h4) == BW_H_IDX(h3) && h4 != h3, "occlusion: slot reused with a bumped generation");
+    CHECK(BWA_H_IDX(h4) == BWA_H_IDX(h3) && h4 != h3, "occlusion: slot reused with a bumped generation");
     rt_source_play(c, h4, snd, true); set_pos_spk(c, h4, 4); rt_commit(c); render2(c);
     CHECK(total_energy() > e_clear * 0.5, "recycled voice is clear despite the prior occupant's occlusion");
 
@@ -318,7 +318,7 @@ int main(void) {
     /* 12. ambisonic bed: a W-only field decodes equally to all speakers; a front-encoded 1st-order
      *     field favors the front speaker over the back one. Room convention (post +z-forward flip):
      *     the listener faces +z, so AmbiX-front (ACN3 X) must decode to the room +z speaker. */
-    const char* AMB_OMNI = "bw_amb_omni.wav", *AMB_FRONT = "bw_amb_front.wav";
+    const char* AMB_OMNI = "bwa_amb_omni.wav", *AMB_FRONT = "bwa_amb_front.wav";
     if (write_ambix4_wav(AMB_OMNI, 0.5f, 0.f, 0.f, 0.f, 4 * N) &&
         write_ambix4_wav(AMB_FRONT, 0.5f, 0.f, 0.f, 0.5f, 4 * N)) {     /* W,Y,Z,X — X(ACN3) = front */
         RtCore* cb = rt_create(8, 4, RATE, CH);
@@ -419,7 +419,7 @@ int main(void) {
         RtCore* cs = rt_create(8, 4, RATE, CH);
         CHECK(cs != NULL, "rt_create (test signal)");
         if (cs) {
-            BwTimestamp ts = { 0, 0 };
+            bwa_timestamp ts = { 0, 0 };
             rt_test_signal(cs, 5, 1, 0.5f);      /* sine on channel 5 (drained + injected in one render) */
             rt_render(cs, bus, N, &ts);
             double e5 = chan_energy(5);
@@ -496,7 +496,7 @@ int main(void) {
                 G.rq_grid.gain_db[1][k][0] = -12.f;
             }
             rt_set_layout(cg, &G);
-            const char* SW = "bw_rt_sine100.wav";
+            const char* SW = "bwa_rt_sine100.wav";
             if (write_sine_wav(SW, 100.0, 4800)) {               /* exactly 10 cycles: seamless loop */
                 uint32_t sg = rt_load_sound(cg, SW, err, sizeof err);
                 uint32_t hg = rt_source_create(cg);
@@ -520,11 +520,11 @@ int main(void) {
                 rt_source_destroy(cg, hg); rt_commit(cg);
             } else CHECK(0, "write 100 Hz sine");
             rt_destroy(cg);
-            remove("bw_rt_sine100.wav");
+            remove("bwa_rt_sine100.wav");
         }
     }
 
-    /* decorrelation (bw_set_decorrelation): a fully-spread noise source's speaker feeds are IDENTICAL
+    /* decorrelation (bwa_set_decorrelation): a fully-spread noise source's speaker feeds are IDENTICAL
      * scaled copies with decor off (zero-lag correlation ~ +1) and mutually incoherent with it on
      * (each channel passes its own velvet filter), at the same total power; toggling back restores
      * coherence (the split amplitude ramps out and the velvet tail flushes). */
@@ -532,7 +532,7 @@ int main(void) {
         RtCore* cd = rt_create(8, 4, RATE, CH);
         CHECK(cd != NULL, "rt_create (decorrelation)");
         if (cd) {
-            const char* NW = "bw_rt_noise.wav";
+            const char* NW = "bwa_rt_noise.wav";
             if (write_noise_wav(NW, 8 * N)) {
                 uint32_t nd = rt_load_sound(cd, NW, err, sizeof err);
                 uint32_t hd = rt_source_create(cd);
@@ -571,11 +571,11 @@ int main(void) {
                 rt_source_destroy(cd, hd); rt_commit(cd);
             } else CHECK(0, "write noise wav");
             rt_destroy(cd);
-            remove("bw_rt_noise.wav");
+            remove("bwa_rt_noise.wav");
         }
     }
 
-    /* parametric bed renderer (bw_set_bed_renderer): a noise PLANE-WAVE bed (W=X: from room +z)
+    /* parametric bed renderer (bwa_set_bed_renderer): a noise PLANE-WAVE bed (W=X: from room +z)
      * localizes SHARPER than the matrix decode and stays loudness-matched; a W-only bed (zero
      * intensity -> fully diffuse) spreads across many channels through the decorrelators at matched
      * power. The switch crossfades live. */
@@ -583,7 +583,7 @@ int main(void) {
         RtCore* cb = rt_create(8, 4, RATE, CH);
         CHECK(cb != NULL, "rt_create (parametric bed)");
         if (cb) {
-            const char* PW = "bw_rt_bed_pw.wav", *DW = "bw_rt_bed_w.wav";
+            const char* PW = "bwa_rt_bed_pw.wav", *DW = "bwa_rt_bed_w.wav";
             if (write_ambix4_noise_wav(PW, 1.f, 0.f, 0.f, 1.f, 8 * N) &&
                 write_ambix4_noise_wav(DW, 1.f, 0.f, 0.f, 0.f, 8 * N)) {
                 uint32_t sp = rt_load_ambix(cb, PW, err, sizeof err);
@@ -639,7 +639,7 @@ int main(void) {
             memset(&slot, 0, sizeof slot);
             rt_set_tracker(cp, &slot);
             const float q[4] = { 0, 0, 0, 1 };
-            BwTimestamp ts = { 0, 0 };
+            bwa_timestamp ts = { 0, 0 };
             float px = 0.f;
             rt_set_pose_prediction(cp, 0.f);                 /* off: readback == written */
             for (int k = 0; k < 20; ++k) {
@@ -706,7 +706,7 @@ int main(void) {
         }
     }
 
-    /* metric source size (bw_source_set_size): the rendered width is the angle the radius subtends
+    /* metric source size (bwa_source_set_size): the rendered width is the angle the radius subtends
      * from the listener — a source that engulfs the listener is fully wide, the SAME physical size
      * narrows with distance, and size 0 restores the point solve. */
     {
@@ -741,14 +741,14 @@ int main(void) {
         }
     }
 
-    /* equal-loudness distance compensation (bw_source_set_loudness_comp): at -12 dB of distance
+    /* equal-loudness distance compensation (bwa_source_set_loudness_comp): at -12 dB of distance
      * attenuation a 100 Hz tone gains ~ +4.5 dB of shelf (0.4 dB/dB, below the 250 Hz corner);
      * a 5 kHz tone is untouched; opt-out ramps back to flat. */
     {
         RtCore* cl = rt_create(8, 4, RATE, CH);
         CHECK(cl != NULL, "rt_create (loudness comp)");
         if (cl) {
-            const char* LW = "bw_rt_ldc100.wav";
+            const char* LW = "bwa_rt_ldc100.wav";
             if (write_sine_wav(LW, 100.0, 4800)) {
                 uint32_t sl = rt_load_sound(cl, LW, err, sizeof err);
                 uint32_t hl = rt_source_create(cl);
@@ -769,7 +769,7 @@ int main(void) {
                 CHECK(fabs(20.0 * log10(l2_back / l2_off)) < 0.3, "opt-out ramps back to flat");
                 rt_source_destroy(cl, hl); rt_commit(cl);
 
-                const char* HW2 = "bw_rt_ldc5k.wav";         /* HF: the shelf must not touch it */
+                const char* HW2 = "bwa_rt_ldc5k.wav";         /* HF: the shelf must not touch it */
                 if (write_sine_wav(HW2, 5000.0, 4800)) {
                     uint32_t sh = rt_load_sound(cl, HW2, err, sizeof err);
                     uint32_t hh = rt_source_create(cl);
@@ -895,13 +895,13 @@ int main(void) {
         }
     }
 
-    /* pitch (bw_source_set_pitch): a looping 1 kHz sine at rate 2 doubles its zero-crossing count,
+    /* pitch (bwa_source_set_pitch): a looping 1 kHz sine at rate 2 doubles its zero-crossing count,
      * at rate 0.5 halves it; rate 1 is the untouched integer path. */
     {
         RtCore* cz = rt_create(8, 4, RATE, CH);
         CHECK(cz != NULL, "rt_create (pitch)");
         if (cz) {
-            const char* PW2 = "bw_rt_pitch1k.wav";
+            const char* PW2 = "bwa_rt_pitch1k.wav";
             if (write_sine_wav(PW2, 1000.0, 4800)) {           /* integer cycles: seamless loop */
                 enum { KB = 8 };
                 static float mono[KB * N];
@@ -931,13 +931,13 @@ int main(void) {
         }
     }
 
-    /* bed rotation (bw_bed_set_rotation): a plane-wave bed from room +z, yawed +pi/2, re-localizes
+    /* bed rotation (bwa_bed_set_rotation): a plane-wave bed from room +z, yawed +pi/2, re-localizes
      * on the +x wall at conserved level — the closed-form yaw SH rotation, glided. */
     {
         RtCore* cr = rt_create(8, 4, RATE, CH);
         CHECK(cr != NULL, "rt_create (bed rotation)");
         if (cr) {
-            const char* BW2 = "bw_rt_bed_rot.wav";
+            const char* BW2 = "bwa_rt_bed_rot.wav";
             if (write_ambix4_noise_wav(BW2, 1.f, 0.f, 0.f, 1.f, 8 * N)) {
                 uint32_t sb = rt_load_ambix(cr, BW2, err, sizeof err);
                 uint32_t hb = rt_source_create(cr);
@@ -963,7 +963,7 @@ int main(void) {
 
     /* runtime channel count: a 24-speaker layout drives a 24-channel core end to end — point panning,
      * a bed decode, meters — and a canary proves NOTHING writes beyond the active channel count into
-     * a capacity-sized buffer (the exact overrun class the BW_CHANNELS->count migration must prevent). */
+     * a capacity-sized buffer (the exact overrun class the BWA_CHANNELS->count migration must prevent). */
     {
         RtCore* c24 = rt_create(8, 4, RATE, 24);
         CHECK(c24 != NULL, "rt_create (24 ch)");
@@ -979,7 +979,7 @@ int main(void) {
             rt_commit(c24);
             static float b24[CH * N];
             for (int i = 24 * (int)N; i < CH * (int)N; ++i) b24[i] = 123.f;   /* canary beyond channel 24 */
-            BwTimestamp t24 = { 0, 0 };
+            bwa_timestamp t24 = { 0, 0 };
             rt_render(c24, b24, N, &t24); rt_render(c24, b24, N, &t24);
             int best = 0; double bm = -1;
             for (int ch = 0; ch < 24; ++ch) {            /* 24-wide PLANAR indexing */
@@ -989,7 +989,7 @@ int main(void) {
             CHECK(best == 5, "24-ch: a source at speaker 5 localizes to channel 5");
             float pk[CH];
             CHECK(rt_bus_peaks(c24, pk, CH) == 24, "24-ch: the meter readback reports 24 channels");
-            const char* B24 = "bw_rt_bed24.wav";         /* a bed too: SH->24 decode, same canary */
+            const char* B24 = "bwa_rt_bed24.wav";         /* a bed too: SH->24 decode, same canary */
             if (write_ambix4_noise_wav(B24, 1.f, 0.f, 0.f, 1.f, 4 * N)) {
                 uint32_t sb5 = rt_load_ambix(c24, B24, err, sizeof err);
                 uint32_t hb5 = rt_source_create(c24);
@@ -1009,7 +1009,7 @@ int main(void) {
         }
     }
 
-    /* image-source early reflections (bw_source_set_early_reflections): a source hard against the +x
+    /* image-source early reflections (bwa_source_set_early_reflections): a source hard against the +x
      * wall of a shoebox. Its +x image sits just BEYOND that wall, so the reflection must (a) appear
      * only when enabled, (b) arrive AFTER the direct sound, and (c) come from the +x side — a real
      * point source panned at the mirrored position, not a diffuse bed. */
@@ -1025,7 +1025,7 @@ int main(void) {
             const float qi[4] = { 0, 0, 0, 1 };
             rt_set_listener(ci, (const float[3]){ 0.f, 1.5f, 0.f }, qi);   /* centre of the room */
 
-            const char* IW = "bw_rt_imp.wav";
+            const char* IW = "bwa_rt_imp.wav";
             enum { IMP_AT = 300 };                               /* fires after the voice's one-block gain ramp-in */
             if (write_impulse_at_wav(IW, IMP_AT, 8 * N)) {
                 enum { KB = 6 };                                 /* 1536 samples: past every reflection path */
@@ -1038,7 +1038,7 @@ int main(void) {
                     rt_source_play(ci, hi, si, false);                                            \
                     rt_source_set_pos(ci, hi, 2.5f, 1.5f, 0.f);   /* 0.5 m from the +x wall */    \
                     rt_commit(ci);                                                                \
-                    BwTimestamp ts_ = { 0, 0 };                                                   \
+                    bwa_timestamp ts_ = { 0, 0 };                                                   \
                     for (int b_ = 0; b_ < KB; ++b_) {                                             \
                         rt_render(ci, bus, N, &ts_);                                              \
                         for (int i_ = 0; i_ < (int)N; ++i_) {                                     \
@@ -1114,7 +1114,7 @@ int main(void) {
         if (cp) {
             /* air absorption: at a far distance, enabling it dulls an 8 kHz tone (same position, so
              * the panning + distance attenuation are identical — the energy drop is purely the LPF). */
-            const char* SW8 = "bw_rt_sine8k.wav";
+            const char* SW8 = "bwa_rt_sine8k.wav";
             if (write_sine_wav(SW8, 8000.0, 8 * N)) {
                 uint32_t s8 = rt_load_sound(cp, SW8, err, sizeof err);
                 uint32_t hv = rt_source_create(cp);
@@ -1132,7 +1132,7 @@ int main(void) {
 
             /* Doppler delay: a static source's signal arrives delayed by distance/c. At 3.43 m that's
              * 480 samples (343 m/s, 48 kHz); an impulse peaks there with Doppler on, at ~0 with it off. */
-            const char* IW = "bw_rt_impulse.wav";
+            const char* IW = "bwa_rt_impulse.wav";
             if (write_impulse_wav(IW, 16 * N)) {
                 uint32_t si = rt_load_sound(cp, IW, err, sizeof err);
                 float cap[4 * N];
@@ -1160,14 +1160,14 @@ int main(void) {
             /* Doppler pitch: an approaching source is pitched up vs a static one (more zero crossings).
              * Both start at 4 m with Doppler on (same initial propagation fill); the moving one glides
              * in to 0.5 m, so its read pointer outruns its write -> the 1 kHz tone resamples higher. */
-            const char* SW1 = "bw_rt_sine1k.wav";
+            const char* SW1 = "bwa_rt_sine1k.wav";
             if (write_sine_wav(SW1, 1000.0, 128 * N)) {
                 /* The delay smoother is heavy (low cutoff, for a clean spectrum), so warm up past its
                  * group delay + the ring fill, then measure the STEADY-STATE pitch over the tail. */
                 enum { WARM = 16, KB = 24, TOT = WARM + KB };
                 uint32_t s1 = rt_load_sound(cp, SW1, err, sizeof err);
                 float cap[KB * N];
-                BwTimestamp ts = { 0, 0 };
+                bwa_timestamp ts = { 0, 0 };
 
                 uint32_t hst = rt_source_create(cp);                  /* static reference at 4 m */
                 rt_source_set_pos(cp, hst, 4.f, 0.f, 0.f);
@@ -1239,7 +1239,7 @@ int main(void) {
             rt_commit(cr);
             rt_source_play(cr, hr, rsnd, true);                  /* replay -> refl_g_cur reset to 0 */
             g_aux_energy = -1.0; rt_commit(cr);
-            { BwTimestamp ts = { 0, 0 }; rt_render(cr, bus, N, &ts); }   /* first block after replay */
+            { bwa_timestamp ts = { 0, 0 }; rt_render(cr, bus, N, &ts); }   /* first block after replay */
             CHECK(g_aux_energy == 0.0, "replay after disabling reflections sends no stale burst");
             rt_source_destroy(cr, hr); rt_commit(cr);
             rt_destroy(cr);
@@ -1251,7 +1251,7 @@ int main(void) {
         RtCore* cdb = rt_create(8, 4, RATE, CH);
         CHECK(cdb != NULL, "rt_create (dual-band)");
         if (cdb) {
-            const char* LW = "bw_rt_lo.wav";
+            const char* LW = "bwa_rt_lo.wav";
             if (write_sine_wav(LW, 200.0, 8 * N)) {              /* a tone below the 700 Hz crossover */
                 uint32_t sl = rt_load_sound(cdb, LW, err, sizeof err);
                 uint32_t hd = rt_source_create(cdb);
@@ -1269,7 +1269,7 @@ int main(void) {
                  * single and dual, not straight at dual — a hard switch would step the LF re-weight in
                  * one sample. (dual L2 < single L2, so a gradual transition sits above the settled dual.) */
                 {
-                    BwTimestamp tsd = { 0, 0 };
+                    bwa_timestamp tsd = { 0, 0 };
                     rt_set_dual_band(cdb, 0); rt_commit(cdb); render2(cdb);        /* settle back to single */
                     rt_set_dual_band(cdb, 1); rt_commit(cdb);
                     rt_render(cdb, bus, N, &tsd);  double l2_trans = total_l2();   /* one block: crossfade in progress */
@@ -1277,7 +1277,7 @@ int main(void) {
                           "dual-band toggle crossfades (transition block between dual and single, not a jump)");
                 }
                 /* a HIGH tone (above the crossover) is unaffected by dual-band: it stays in the power band */
-                const char* HW = "bw_rt_hi.wav";
+                const char* HW = "bwa_rt_hi.wav";
                 if (write_sine_wav(HW, 5000.0, 8 * N)) {
                     uint32_t sh = rt_load_sound(cdb, HW, err, sizeof err);
                     uint32_t hh = rt_source_create(cdb);
@@ -1331,7 +1331,7 @@ int main(void) {
     {
         RtCore* cf = rt_create(1, 4, RATE, CH);
         if (cf) {
-            BwTimestamp ts0 = { 0, 0 };
+            bwa_timestamp ts0 = { 0, 0 };
             uint32_t sf = rt_load_sound(cf, WAV, err, sizeof err);   /* WAV = constant 1.0 */
             uint32_t a = rt_source_create(cf);
             rt_source_play(cf, a, sf, true);
@@ -1363,13 +1363,13 @@ int main(void) {
             rt_commit(cp);
             double pre = 0; uint64_t pos = 0;
             for (int blk = 0; blk < 3; ++blk) {                    /* blocks spanning [0, 3N): held silent */
-                BwTimestamp ts = { pos, 0 };
+                bwa_timestamp ts = { pos, 0 };
                 rt_render(cp, bus, N, &ts);
                 pre += total_l2();
                 pos += N;
             }
             CHECK(pre < 1e-6, "scheduled voice is silent before its start_sample");
-            BwTimestamp ts3 = { pos, 0 };                          /* pos == 3N: the voice fires here */
+            bwa_timestamp ts3 = { pos, 0 };                          /* pos == 3N: the voice fires here */
             rt_render(cp, bus, N, &ts3);
             CHECK(total_l2() > 1e-3, "scheduled voice fires at its start_sample");
             CHECK(rt_dsp_time(cp) == (uint64_t)3 * N, "rt_dsp_time tracks the device sample clock");
@@ -1403,11 +1403,11 @@ int main(void) {
     {
         RtCore* cq = rt_create(4, 4, RATE, CH);
         CHECK(cq != NULL, "rt_create (pause/seek)");
-        if (cq && write_const_wav("bw_rt_seek.wav", 0.8f, 5 * N)) {   /* finite, non-loop: 5 blocks of content */
-            uint32_t sq = rt_load_sound(cq, "bw_rt_seek.wav", err, sizeof err);
+        if (cq && write_const_wav("bwa_rt_seek.wav", 0.8f, 5 * N)) {   /* finite, non-loop: 5 blocks of content */
+            uint32_t sq = rt_load_sound(cq, "bwa_rt_seek.wav", err, sizeof err);
             uint32_t h  = rt_source_create(cq);
             rt_source_set_pos(cq, h, 1.f, 0.f, 1.f);
-            BwTimestamp ts = { 0, 0 };
+            bwa_timestamp ts = { 0, 0 };
             rt_source_play(cq, h, sq, false);
             rt_commit(cq);
             rt_render(cq, bus, N, &ts);                    /* block 1 of 5 plays */
@@ -1429,7 +1429,7 @@ int main(void) {
             CHECK(total_l2() < 1e-9, "silence after the seeked tail");
             CHECK(!rt_source_is_playing(cq, h), "seeking near the end ends the non-loop voice on time");
             rt_destroy(cq);
-            remove("bw_rt_seek.wav");
+            remove("bwa_rt_seek.wav");
         } else if (cq) { CHECK(0, "write seek wav"); rt_destroy(cq); }
     }
 
@@ -1439,7 +1439,7 @@ int main(void) {
         RtCore* cl = rt_create(4, 4, RATE, CH);
         CHECK(cl != NULL, "rt_create (limiter)");
         if (cl) {
-            BwTimestamp ts = { 0, 0 };
+            bwa_timestamp ts = { 0, 0 };
             rt_test_signal(cl, 0, 1, 2.0f);                /* sine, peak 2.0 — over the -1 dBFS ceiling */
             rt_test_signal(cl, 1, 1, 0.5f);                /* the same waveform at 1/4 the level */
             for (int b = 0; b < 20; ++b) rt_render(cl, bus, N, &ts);   /* settle the envelope */

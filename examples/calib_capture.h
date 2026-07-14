@@ -1,14 +1,14 @@
 /*
- * calib_capture.h — the speaker-sweep capture backends, shared by bw_calibrate (CLI) and
- * bw_calib_view's Capture tab (the calibration-station front-end). Two backends behind one shape:
+ * calib_capture.h — the speaker-sweep capture backends, shared by bwa_calibrate (CLI) and
+ * bwa_calib_view's Capture tab (the calibration-station front-end). Two backends behind one shape:
  * ASIO full-duplex (one output per speaker + one mic input, sample-aligned; rig bring-up code,
- * gated on BW_HAVE_ASIO) and simulate (delay/attenuate the sweep per the layout's speaker->mic
+ * gated on BWA_HAVE_ASIO) and simulate (delay/attenuate the sweep per the layout's speaker->mic
  * distances + a deterministic sensitivity wobble, so the whole measure -> solve -> writeback path
- * runs without the rig). The speaker count is the LAYOUT's (Layout.count, 4..BW_CHANNELS) — never
+ * runs without the rig). The speaker count is the LAYOUT's (Layout.count, 4..BWA_CHANNELS) — never
  * assume 26. The measurement/solve DSP these feed lives in measure.c / calib.c (unit-tested).
  */
-#ifndef BW_CALIB_CAPTURE_H
-#define BW_CALIB_CAPTURE_H
+#ifndef BWA_CALIB_CAPTURE_H
+#define BWA_CALIB_CAPTURE_H
 
 #ifdef __cplusplus
 extern "C" {
@@ -36,9 +36,9 @@ void calib_sim_capture(int ch, const Layout* L, const float mic[3], const float*
 /* minimal mono IEEE-float WAV writer (retained per-speaker impulse responses) */
 void calib_write_wav_f32(const char* path, const float* x, int n, int fs);
 
-#ifdef BW_HAVE_ASIO
+#ifdef BWA_HAVE_ASIO
 /* ASIO full-duplex: open `driver` (NULL = first with >= `nspk` outs + the mic input), start
- * streaming. `nspk` is the layout's speaker count (4..BW_CHANNELS). calib_asio_capture(ch) plays
+ * streaming. `nspk` is the layout's speaker count (4..BWA_CHANNELS). calib_asio_capture(ch) plays
  * the sweep out channel `ch` and records CAL_CAPLEN mic samples into the `cap` given at open
  * (blocking, ~10 s watchdog; returns 0 on timeout). Single instance.
  * NOT verified on hardware here — rig bring-up code (mirrors asio_sink.cpp's host sequence). */
@@ -47,4 +47,4 @@ int  calib_asio_capture(int ch);
 void calib_asio_close(void);
 #endif
 
-#endif /* BW_CALIB_CAPTURE_H */
+#endif /* BWA_CALIB_CAPTURE_H */

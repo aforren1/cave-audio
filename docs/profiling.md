@@ -7,12 +7,12 @@ anything (especially the ray-tracing sim threads) stealing time from audio**.
 ## Build
 
 ```
-cmake -S . -B build -DBWAUDIO_TRACY=ON
+cmake -S . -B build -DBWA_TRACY=ON
 cmake --build build --config RelWithDebInfo
 ```
 
-This fetches Tracy and links its client into `bwaudio.dll`. The client is built **on-demand**, so it
-costs almost nothing until a profiler actually connects. Without `-DBWAUDIO_TRACY=ON`, the macros in
+This fetches Tracy and links its client into `bw_audio.dll`. The client is built **on-demand**, so it
+costs almost nothing until a profiler actually connects. Without `-DBWA_TRACY=ON`, the macros in
 [`src/profile.h`](../src/profile.h) compile to nothing — no dependency, no overhead.
 
 ## What's instrumented
@@ -35,7 +35,7 @@ with Doppler / air / reverb-send / spread fanned across them) through the **null
 hardware:
 
 ```
-bw_profile_bench [seconds=20] [voices=16] [cave|binaural]
+bwa_profile_bench [seconds=20] [voices=16] [cave|binaural]
 ```
 
 It prints the block budget and renders the load on the engine's render thread exactly as the ASIO
@@ -55,7 +55,7 @@ The Tracy CLI tools (in the [release](https://github.com/wolfpld/tracy/releases)
 `csvexport/` and `capture/` in the Tracy source) give a scriptable per-zone budget report:
 
 ```
-bw_profile_bench 20 16 cave            # 1) start the load
+bwa_profile_bench 20 16 cave            # 1) start the load
 tracy-capture -o bench.tracy -s 20     # 2) connect + record 20 s to a file
 tracy-csvexport bench.tracy            # 3) per-zone CSV to stdout
 ```
@@ -81,9 +81,9 @@ a 16-voice load with all propagation effects + the reflection bed measures ~458 
 
 ## Memory budget
 
-The engine's heap is **static**: everything is allocated at `bw_create` (the voice table, the per-voice
-Doppler rings, the speaker bus + scratch — sized to the `BW_CHANNELS` capacity, though only the layout's
+The engine's heap is **static**: everything is allocated at `bwa_create` (the voice table, the per-voice
+Doppler rings, the speaker bus + scratch — sized to the `BWA_CHANNELS` capacity, though only the layout's
 channel count is rendered — sound PCM at load) and **nothing allocates on the audio thread**
 (hard invariant — see `docs/concurrency.md`). So the "memory budget" is just the create-time footprint;
 there is no real-time growth to chase. If you want allocation-level detail (footprint / leaks) in Tracy's
-memory view, wrap the big allocations with the `BW_ALLOC` / `BW_FREE` hooks already in `profile.h`.
+memory view, wrap the big allocations with the `BWA_ALLOC` / `BWA_FREE` hooks already in `profile.h`.

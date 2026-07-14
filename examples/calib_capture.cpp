@@ -1,6 +1,6 @@
 /*
  * calib_capture.cpp — see calib_capture.h. Moved verbatim out of calibrate.cpp so the CLI and
- * bw_calib_view's Capture tab share ONE copy of the sweep-capture backends.
+ * bwa_calib_view's Capture tab share ONE copy of the sweep-capture backends.
  */
 #include "calib_capture.h"
 
@@ -33,7 +33,7 @@ void calib_sim_capture(int ch, const Layout* L, const float mic[3], const float*
     }
 }
 
-#ifdef BW_HAVE_ASIO
+#ifdef BWA_HAVE_ASIO
 /* ===== ASIO full-duplex capture (rig only; not run in this environment) ===== */
 /* NOT wrapped in extern "C": the SDK builds these with C++ linkage (matches asio_sink.cpp). */
 #include "asiosys.h"
@@ -52,8 +52,8 @@ namespace {
 struct Cal {
     long            bufsize;
     int             nspk;                     /* the layout's speaker count; the mic rides slot [nspk] */
-    ASIOBufferInfo  bi[BW_CHANNELS + 1];      /* nspk outputs + 1 mic input (last) */
-    ASIOChannelInfo ci[BW_CHANNELS + 1];
+    ASIOBufferInfo  bi[BWA_CHANNELS + 1];      /* nspk outputs + 1 mic input (last) */
+    ASIOChannelInfo ci[BWA_CHANNELS + 1];
     ASIOCallbacks   cb;
     const float*    sweep;
     float*          cap;
@@ -114,8 +114,8 @@ bool open_driver(const char* want, int mic_in, int nspk) {
 
 int calib_asio_open(const char* driver, int mic_in, int nspk, const float* sweep, float* cap) {
     if (mic_in < 0) { fprintf(stderr, "calib_capture: mic input channel must be >= 0 (got %d)\n", mic_in); return 1; }
-    if (nspk < 1 || nspk > BW_CHANNELS) { fprintf(stderr, "calib_capture: speaker count %d out of range\n", nspk); return 1; }
-    if (!asio_session_acquire("the calibration sweep (Capture tab / bw_calibrate)")) return 1;
+    if (nspk < 1 || nspk > BWA_CHANNELS) { fprintf(stderr, "calib_capture: speaker count %d out of range\n", nspk); return 1; }
+    if (!asio_session_acquire("the calibration sweep (Capture tab / bwa_calibrate)")) return 1;
     memset(&g, 0, sizeof g); g.active = -1; g.sweep = sweep; g.cap = cap; g.nspk = nspk;
     if (!open_driver(driver, mic_in, nspk)) { fprintf(stderr, "calib_capture: no ASIO driver with >=%d out + the mic input\n", nspk); asio_session_release(); return 1; }
     long bmin=0,bmax=0,bpref=0,bgran=0; ASIOGetBufferSize(&bmin,&bmax,&bpref,&bgran);
@@ -157,4 +157,4 @@ void calib_asio_close(void) {
     if (asioDrivers) asioDrivers->removeCurrentDriver();
     asio_session_release();
 }
-#endif /* BW_HAVE_ASIO */
+#endif /* BWA_HAVE_ASIO */

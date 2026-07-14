@@ -2,15 +2,15 @@
  * steam_decode.h — production binaural monitor, stage 2: ambisonics → binaural HRTF decode
  * via Steam Audio. Phonon-free interface, so engine.c includes it unconditionally; the
  * implementation (steam_decode.c) is compiled ONLY when the SDK is vendored
- * (BWAUDIO_WITH_STEAMAUDIO), so the steam_monitor_* symbols exist only in that build — callers
- * gate the actual calls on BW_HAVE_STEAMAUDIO.
+ * (BWA_WITH_STEAMAUDIO), so the steam_monitor_* symbols exist only in that build — callers
+ * gate the actual calls on BWA_HAVE_STEAMAUDIO.
  *
  * Pipeline: the 26-ch bus is encoded to 3rd-order ambisonics (ambisonics.c, fixed matrix from
  * the speaker directions) and decoded to stereo through Steam Audio's HRTF, with the head
  * orientation applied at the decode. Supersedes the first-cut per-channel pan in binaural.c.
  */
-#ifndef BW_STEAM_DECODE_H
-#define BW_STEAM_DECODE_H
+#ifndef BWA_STEAM_DECODE_H
+#define BWA_STEAM_DECODE_H
 
 #include "layout.h"
 #include <stdint.h>
@@ -30,4 +30,4 @@ void steam_monitor_process(SteamMonitor* m, const float* bus26, const float p[3]
 
 void steam_monitor_destroy(SteamMonitor* m);
 
-#endif /* BW_STEAM_DECODE_H */
+#endif /* BWA_STEAM_DECODE_H */

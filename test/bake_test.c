@@ -19,24 +19,24 @@
 
 int main(void) {
     const uint32_t SR = 48000, BLK = 256;
-    RtCore* rt = rt_create(64, 64, SR, BW_CHANNELS);
+    RtCore* rt = rt_create(64, 64, SR, BWA_CHANNELS);
     if (!rt) { printf("FAIL: rt_create\n"); return 1; }
     Layout L = layout_default();
     rt_set_layout(rt, &L);
 
     float p[3] = { 2.0f, 1.5f, 0.0f }, q[4] = { 0.0f, 0.0f, 0.0f, 1.0f };   /* 1 m from the +X wall, at ear height
                                                                               * (the probe plane = mean speaker y = 1.5) */
-    float* bus = (float*)calloc((size_t)BW_CHANNELS * BLK, sizeof(float));
-    BwTimestamp ts; memset(&ts, 0, sizeof ts);
+    float* bus = (float*)calloc((size_t)BWA_CHANNELS * BLK, sizeof(float));
+    bwa_timestamp ts; memset(&ts, 0, sizeof ts);
     rt_set_listener(rt, p, q); rt_commit(rt); rt_render(rt, bus, BLK, &ts);
 
-    SteamScene* scene = steam_scene_create(rt, SR, BLK, 64);
+    SteamScene* scene = steam_scene_create(rt, SR, BLK, 64, 0);
     if (!scene) { printf("FAIL: steam_scene_create\n"); free(bus); rt_destroy(rt); return 1; }
 
     float verts[] = { -3,-2,-3,  3,-2,-3,  3,2,-3,  -3,2,-3,  -3,-2,3,  3,-2,3,  3,2,3,  -3,2,3 };
     int   tris[]  = { 0,1,2, 0,2,3,  4,6,5, 4,7,6,  0,4,7, 0,7,3,  1,2,6, 1,6,5,  3,2,6, 3,6,7,  0,1,5, 0,5,4 };
-    float absorption[3] = { 0.1f, 0.1f, 0.1f }, transmission[3] = { 0.05f, 0.05f, 0.05f };
-    steam_scene_set_mesh(scene, verts, 8, tris, 12, absorption, 0.5f, transmission);
+    float absorption[3] = { 0.1f, 0.1f, 0.1f }, scattering[1] = { 0.5f }, transmission[3] = { 0.05f, 0.05f, 0.05f };
+    steam_scene_set_mesh_mat(scene, verts, 8, tris, 12, 1, absorption, scattering, transmission, NULL);
 
     printf("baking reverb at a probe grid (ray-traces every probe once)...\n"); fflush(stdout);
     SteamReflect* refl = steam_reflect_create(scene, rt, &L, SR, BLK, /*order*/1, /*ir*/0.4f, /*rays*/2048, /*bounces*/8, /*wet*/1.0f, /*bake*/1);
@@ -44,18 +44,18 @@ int main(void) {
 
     Sleep(600);                       /* let the sim thread look up + publish the baked reverb */
 
-    double e[BW_CHANNELS]; for (int s = 0; s < BW_CHANNELS; ++s) e[s] = 0.0;
+    double e[BWA_CHANNELS]; for (int s = 0; s < BWA_CHANNELS; ++s) e[s] = 0.0;
     float aux[256];
     for (int blk = 0; blk < 80; ++blk) {
         for (uint32_t i = 0; i < BLK; ++i) aux[i] = (i == 0) ? 1.0f : 0.0f;
-        memset(bus, 0, (size_t)BW_CHANNELS * BLK * sizeof(float));
+        memset(bus, 0, (size_t)BWA_CHANNELS * BLK * sizeof(float));
         steam_reflect_tap(refl, bus, BLK, p, q, aux);
-        for (int s = 0; s < BW_CHANNELS; ++s)
+        for (int s = 0; s < BWA_CHANNELS; ++s)
             for (uint32_t i = 0; i < BLK; ++i) { float v = bus[(size_t)s * BLK + i]; e[s] += (double)v * v; }
     }
 
     double ePlusX = 0.0, eMinusX = 0.0; int nPlus = 0, nMinus = 0;
-    for (int s = 0; s < BW_CHANNELS; ++s) {
+    for (int s = 0; s < BWA_CHANNELS; ++s) {
         if (L.speakers[s].pos[0] >  0.5f) { ePlusX  += e[s]; ++nPlus;  }
         else if (L.speakers[s].pos[0] < -0.5f) { eMinusX += e[s]; ++nMinus; }
     }

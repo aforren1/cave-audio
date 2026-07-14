@@ -4,8 +4,8 @@
  * is the calibration tool (examples/calibrate.c). This part is pure + file I/O only (no audio thread,
  * no ASIO), so it is unit-tested (test/calib_test.c).
  */
-#ifndef BW_CALIB_H
-#define BW_CALIB_H
+#ifndef BWA_CALIB_H
+#define BWA_CALIB_H
 
 #include "measure.h"
 #include <stddef.h>
@@ -83,9 +83,9 @@ int calib_room_grid_merge(const MeasureEqSection* cuts, const int* counts, int n
 
 /* Merge THIS mic position's per-speaker modal cuts into the layout JSON's "room_eq_grid": existing
  * grid entries are read back (their sections re-treated as that position's cuts), an entry within
- * 5 cm of `mic` is replaced (else appended, up to BW_RQ_GRID_MAX), every speaker's ladder is
+ * 5 cm of `mic` is replaced (else appended, up to BWA_RQ_GRID_MAX), every speaker's ladder is
  * re-merged across all positions (calib_room_grid_merge), and the congruent grid is rewritten —
- * so one bw_calibrate run per mic placement accumulates the grid. Removes any static per-speaker
+ * so one bwa_calibrate run per mic placement accumulates the grid. Removes any static per-speaker
  * "room_eq" (the schemes are mutually exclusive). `cuts` is n * max_sections row-major with
  * counts[i] used per speaker. Returns 1 / 0. */
 int calib_write_room_eq_grid(const char* in_path, const char* out_path, const float mic[3],
@@ -104,4 +104,4 @@ void calib_check_drift(const double* range, const float (*pos)[3], const float m
 }
 #endif
 
-#endif /* BW_CALIB_H */
+#endif /* BWA_CALIB_H */

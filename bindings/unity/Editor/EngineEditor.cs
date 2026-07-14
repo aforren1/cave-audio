@@ -1,28 +1,28 @@
-// BwAudioEditor.cs — custom inspector for the manager.
+// EngineEditor.cs — custom inspector for the manager.
 //
-// BwAudio carries the whole engine's configuration, which is a lot of fields, and most of them are
+// Engine carries the whole engine's configuration, which is a lot of fields, and most of them are
 // irrelevant most of the time (the FDN decay controls mean nothing with the FDN off). So: hide what
 // doesn't apply, and surface the things the component can only otherwise tell you by failing at run
 // time — a layout file that isn't where the engine will look for it, both reverb beds fighting over
 // one tap, a tracked-listener setup with nothing to track.
 //
 // Fields are drawn by ITERATING the serialized object rather than listing them by name, so a new field
-// on BwAudio shows up here automatically; only the ones with a rule get hidden.
+// on Engine shows up here automatically; only the ones with a rule get hidden.
 using System.IO;
 using UnityEditor;
 using UnityEngine;
 
-namespace CaveAudio.EditorTools
+namespace BwAudio.EditorTools
 {
-    [CustomEditor(typeof(BwAudio))]
-    public sealed class BwAudioEditor : Editor
+    [CustomEditor(typeof(Engine))]
+    public sealed class EngineEditor : Editor
     {
         // Play-mode readouts (backend, meters, voice count) are live values, not serialized state.
         public override bool RequiresConstantRepaint() => Application.isPlaying;
 
         public override void OnInspectorGUI()
         {
-            var a = (BwAudio)target;
+            var a = (Engine)target;
             serializedObject.Update();
 
             var it = serializedObject.GetIterator();
@@ -37,18 +37,20 @@ namespace CaveAudio.EditorTools
                 EditorGUILayout.PropertyField(it, true);
             }
 
-            serializedObject.ApplyModifiedProperties();   // fires BwAudio.OnValidate -> live re-push
+            serializedObject.ApplyModifiedProperties();   // fires Engine.OnValidate -> live re-push
             DrawProblems(a);
             DrawLiveStatus(a);
         }
 
         // The engine ignores these in the given state, so showing them just invites you to tune a knob
         // that does nothing.
-        static bool IsHidden(string p, BwAudio a)
+        static bool IsHidden(string p, Engine a)
         {
             switch (p)
             {
                 case "listener":          return !a.feedListener;      // the engine tracks itself
+                case "natnetServer":                                   // NatNet connection: tracking-only
+                case "natnetRigidBody":
                 case "posePredictionMs":  return a.feedListener;       // prediction is tracking-only
                 case "limiterCeilingDb":  return !a.limiter;
                 case "reverbSeconds":
@@ -69,7 +71,7 @@ namespace CaveAudio.EditorTools
 
         // Everything here is a mistake the engine survives — it logs and carries on — which is exactly
         // why it is worth catching in the inspector, where you can still see it.
-        static void DrawProblems(BwAudio a)
+        static void DrawProblems(Engine a)
         {
             if (!string.IsNullOrEmpty(a.layoutFile))
             {
@@ -95,24 +97,24 @@ namespace CaveAudio.EditorTools
                     "moves. Assign the tracked head, or turn Feed Listener off to let the engine read " +
                     "NatNet itself.", MessageType.Warning);
 
-            if (a.profile != BwProfile.Cave && a.enableRoomBox == false && a.enableReflections)
+            if (a.profile != BwaProfile.Cave && a.enableRoomBox == false && a.enableReflections)
                 EditorGUILayout.HelpBox(
                     "Reflections are on but there is no acoustic geometry: add a Room Box, or one or more " +
-                    "BwAcousticGeometry objects. With nothing to reflect off, the bed stays silent.",
+                    "AcousticGeometry objects. With nothing to reflect off, the bed stays silent.",
                     MessageType.Info);
         }
 
         // The questions you actually ask while the scene is running: did I get a real audio device, or
         // did it silently fall back to the null sink? How many voices am I burning? Is anything coming
         // out of the speakers at all?
-        static void DrawLiveStatus(BwAudio a)
+        static void DrawLiveStatus(Engine a)
         {
             if (!Application.isPlaying || !a.Ready) return;
 
             EditorGUILayout.Space();
             EditorGUILayout.LabelField("Live", EditorStyles.boldLabel);
 
-            string backend = Bw.Backend(a.Handle) ?? "?";
+            string backend = Bwa.Backend(a.Handle) ?? "?";
             var kind = backend.StartsWith("asio:") ? MessageType.Info : MessageType.Warning;
             EditorGUILayout.HelpBox(
                 $"backend: {backend}{(backend == "null" ? "  (SILENT — no audio device)" : "")}\n" +

@@ -1,9 +1,9 @@
-// BwSpeakerView.cs — a LIVE, in-build view of speaker activity: one glowing marker per channel, sitting
+// SpeakerView.cs — a LIVE, in-build view of speaker activity: one glowing marker per channel, sitting
 // at the real speaker's position, brightening with that channel's output.
 //
-// This is the runtime counterpart to BwAudio's scene-view gizmos. Gizmos are an editor feature — they do
+// This is the runtime counterpart to Engine's scene-view gizmos. Gizmos are an editor feature — they do
 // not render in a build — so seeing the array light up while you are STANDING IN THE CAVE needs actual
-// renderers, which is what this makes. Same data behind both (bw_get_speakers + bw_get_bus_levels).
+// renderers, which is what this makes. Same data behind both (bwa_get_speakers + bwa_get_bus_levels).
 //
 // The markers are UNLIT on purpose: a CAVE is dark, and a lit material would need lights and would read
 // as geometry. Unlit means the colour you compute IS the colour you see, so a hot channel glows.
@@ -13,10 +13,10 @@ using System;
 using System.Collections;
 using UnityEngine;
 
-namespace CaveAudio
+namespace BwAudio
 {
     [DisallowMultipleComponent]
-    public sealed class BwSpeakerView : MonoBehaviour
+    public sealed class SpeakerView : MonoBehaviour
     {
         [Header("Markers")]
         [Tooltip("Marker radius in metres.")]
@@ -47,14 +47,14 @@ namespace CaveAudio
 
         IEnumerator BuildWhenReady()
         {
-            while (BwAudio.Instance == null || !BwAudio.Instance.Ready) yield return null;   // wait out init order
+            while (Engine.Instance == null || !Engine.Instance.Ready) yield return null;   // wait out init order
             Build();
         }
 
         void Build()
         {
             Teardown();
-            var eng = BwAudio.Instance;
+            var eng = Engine.Instance;
             float[] xyz = eng.SpeakerPositions();          // ROOM space, channel order — the engine's own truth
             int n = xyz.Length / 3;
             if (n == 0) return;
@@ -62,7 +62,7 @@ namespace CaveAudio
             _material = MakeUnlitMaterial();
             if (_material == null)
             {
-                Debug.LogWarning("[BwSpeakerView] no unlit shader found for this render pipeline — no markers drawn.");
+                Debug.LogWarning("[SpeakerView] no unlit shader found for this render pipeline — no markers drawn.");
                 return;
             }
             _mpb = new MaterialPropertyBlock();
@@ -92,7 +92,7 @@ namespace CaveAudio
         void Update()
         {
             if (_renderers == null) return;
-            var eng = BwAudio.Instance;
+            var eng = Engine.Instance;
             if (eng == null || !eng.Ready) return;
 
             float[] peaks = eng.BusLevels();

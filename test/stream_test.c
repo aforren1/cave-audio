@@ -34,7 +34,7 @@ static int wait_prebuffer(Stream* s) { for (int t = 0; t < 2000; ++t) { if (stre
 
 int main(void) {
     const uint32_t RATE = 48000; const int N = 200000;   /* ~4 s, well past the 65536-sample ring */
-    const char* WAV = "bw_stream_test.wav";
+    const char* WAV = "bwa_stream_test.wav";
     char err[256] = {0};
     write_wav_f32_mono(WAV, N, (int)RATE);
 
@@ -43,10 +43,10 @@ int main(void) {
     if (!set) { remove(WAV); return 1; }
 
     /* a wrong-rate file is rejected */
-    write_wav_f32_mono("bw_stream_44k.wav", 1000, 44100);
-    Stream* bad = stream_open(set, "bw_stream_44k.wav", err, sizeof err);
+    write_wav_f32_mono("bwa_stream_44k.wav", 1000, 44100);
+    Stream* bad = stream_open(set, "bwa_stream_44k.wav", err, sizeof err);
     CHECK(bad == NULL, "rejects a sample-rate mismatch");
-    remove("bw_stream_44k.wav");
+    remove("bwa_stream_44k.wav");
 
     /* --- stream the whole file, sample-exact --- */
     Stream* s = stream_open(set, WAV, err, sizeof err);

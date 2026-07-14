@@ -1,7 +1,7 @@
 {
-    "name": "CaveAudio.Editor",
-    "rootNamespace": "CaveAudio.EditorTools",
-    "references": [ "CaveAudio" ],
+    "name": "BwAudio.Editor",
+    "rootNamespace": "BwAudio.EditorTools",
+    "references": [ "BwAudio" ],
     "includePlatforms": [ "Editor" ],
     "excludePlatforms": [],
     "allowUnsafeCode": false,
@@ -10,5 +10,5 @@
     "autoReferenced": true,
     "defineConstraints": [],
     "versionDefines": [],
-    "noEngineReferences": false
+    "noBwAudioReferences": false
 }

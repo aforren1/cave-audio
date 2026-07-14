@@ -12,7 +12,7 @@ static int fails = 0;
 #define EQ(a, b)    (fabsf((a) - (b)) < 1e-5f)
 
 int main(void) {
-    float y[BW_AMBI_CH];
+    float y[BWA_AMBI_CH];
     const float SQ3_2 = 0.8660254f, S58 = 0.7905694f, S38 = 0.6123724f;
 
     /* +x (front): l=1 picks out x; zonal/sectoral l2,l3 take known values */
@@ -35,7 +35,7 @@ int main(void) {
     /* W is always unity; all harmonics finite for an arbitrary direction */
     ambi_encode_sn3d((const float[]){ 0.5773503f, 0.5773503f, 0.5773503f }, y);
     int finite = 1;
-    for (int i = 0; i < BW_AMBI_CH; ++i) finite &= isfinite(y[i]);
+    for (int i = 0; i < BWA_AMBI_CH; ++i) finite &= isfinite(y[i]);
     CHECK(finite && EQ(y[0], 1), "diagonal: finite and W=1");
 
     /* The product / sectoral harmonics (ACN 4,5,7,8,10,11,14) are EXACTLY ZERO at every cardinal

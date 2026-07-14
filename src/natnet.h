@@ -4,14 +4,14 @@
  * Parses the NatNet FrameOfData multicast/unicast stream directly — the NatNet SDK is
  * proprietary and would conflict with GPLv3 under distribution, so we consume the documented
  * wire protocol ourselves (see docs/build.md). A receiver thread decodes the selected rigid
- * body's pose and publishes it into a seqlock; with track_internal the audio thread samples
+ * body's pose and publishes it into a seqlock; with a tracker connected (bwa_tracker_connect) the audio thread samples
  * that slot at block time (lower latency than routing pose through the command ring).
  *
  * The socket/thread path is Windows-only and on-hardware-pending (needs a live Motive server);
  * the parser (natnet_parse_frame) is pure and unit-tested against synthetic packets.
  */
-#ifndef BW_NATNET_H
-#define BW_NATNET_H
+#ifndef BWA_NATNET_H
+#define BWA_NATNET_H
 
 #include "pose.h"
 #include <stdbool.h>
@@ -56,4 +56,4 @@ bool natnet_parse_frame(const uint8_t* payload, size_t len, int major, int minor
 bool natnet_resolve_name(const uint8_t* payload, size_t len, int major, int minor,
                          const char* want_name, int32_t* out_id);
 
-#endif /* BW_NATNET_H */
+#endif /* BWA_NATNET_H */

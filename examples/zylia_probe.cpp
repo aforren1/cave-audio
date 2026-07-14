@@ -9,13 +9,13 @@
  * output without hurting the DOA (see docs/calibration.md).
  *
  * The LIVE DOA view (clap -> a dot on the capsule sphere, verifying mapping + geometry in one gesture)
- * lives in bw_calib_view's Zylia tab now — same capture shell (zylia_capture.cpp), richer display,
+ * lives in bwa_calib_view's Zylia tab now — same capture shell (zylia_capture.cpp), richer display,
  * and a --tests-able UI. This tool stays a dependency-free console check.
  *
  *   zylia_probe --list                            # enumerate ASIO drivers + their channel counts
  *   zylia_probe [--driver name] [--rate 48000]    # open + live meter (auto-picks a Zylia/ASIO4ALL driver)
  *
- * Build: -DBWAUDIO_BUILD_CALIBRATE=ON with the ASIO SDK (same gate as calibrate).
+ * Build: -DBWA_BUILD_CALIBRATE=ON with the ASIO SDK (same gate as calibrate).
  */
 #include "zylia.h"
 #include "zylia_capture.h"
@@ -25,10 +25,10 @@
 #include <string.h>
 #include <math.h>
 
-#ifndef BW_HAVE_ASIO
+#ifndef BWA_HAVE_ASIO
 int main(void) {
-    fprintf(stderr, "zylia_probe: built without ASIO. Reconfigure with the ASIO SDK (BWAUDIO_WITH_ASIO).\n"
-                    "(the hardware-free DOA demo lives in bw_calib_view's Zylia tab, simulate mode.)\n");
+    fprintf(stderr, "zylia_probe: built without ASIO. Reconfigure with the ASIO SDK (BWA_WITH_ASIO).\n"
+                    "(the hardware-free DOA demo lives in bwa_calib_view's Zylia tab, simulate mode.)\n");
     return 1;
 }
 #else
@@ -37,7 +37,7 @@ int main(void) {
 #include <conio.h>
 
 int main(int argc, char** argv) {
-    const char* driver = getenv("BWAUDIO_ASIO_DRIVER");
+    const char* driver = NULL;                            /* --driver; NULL = auto-pick */
     double rate = 48000.0;
     int    do_list = 0;
     for (int i = 1; i < argc; ++i) {
@@ -46,7 +46,7 @@ int main(int argc, char** argv) {
         else if (!strcmp(argv[i], "--rate")   && i+1 < argc)  rate    = atof(argv[++i]);
         else if (!strcmp(argv[i], "--console"))               ;   /* legacy no-op: console is all there is now */
         else if (!strcmp(argv[i], "--simulate")) {
-            fprintf(stderr, "zylia_probe: the DOA view (and its simulate mode) moved to bw_calib_view (Zylia tab).\n");
+            fprintf(stderr, "zylia_probe: the DOA view (and its simulate mode) moved to bwa_calib_view (Zylia tab).\n");
             return 2;
         }
         else { fprintf(stderr, "usage: zylia_probe [--list] [--driver name] [--rate hz]\n"); return 2; }
@@ -89,4 +89,4 @@ int main(int argc, char** argv) {
     printf("\nzylia_probe: stopped.\n");
     return 0;
 }
-#endif /* BW_HAVE_ASIO */
+#endif /* BWA_HAVE_ASIO */

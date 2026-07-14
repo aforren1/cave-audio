@@ -6,8 +6,8 @@
  *
  * Include AFTER the ASIO SDK headers (asiosys.h / asio.h): the ASIOST* constants come from there.
  */
-#ifndef BW_ASIO_CONVERT_H
-#define BW_ASIO_CONVERT_H
+#ifndef BWA_ASIO_CONVERT_H
+#define BWA_ASIO_CONVERT_H
 
 #include <stdint.h>
 #include <string.h>
@@ -41,4 +41,4 @@ static inline void asio_float_to_out(void* dst, const float* src, long n, long t
     }
 }
 
-#endif /* BW_ASIO_CONVERT_H */
+#endif /* BWA_ASIO_CONVERT_H */
