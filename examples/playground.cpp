@@ -23,6 +23,10 @@
  *                         off-thread sim attenuates + spectrally tilts it by the wall MATERIAL (M to
  *                         cycle concrete/glass/carpet/wood/metal); in FRONT, a mirror-image source
  *                         is an audible specular reflection scaled by that material's reflectivity.
+ *                         [ ] slide the wall, SPACE auto-sweeps it through the ear line, and Y A/Bs
+ *                         the STATIC mesh (bwa_scene_set_mesh_mat, full rebuild) against the DYNAMIC
+ *                         instanced mesh (bwa_scene_add_dynamic_mesh + transform) — same occluder,
+ *                         should sound identical; the dynamic path is the cheap per-frame one.
  *   3 Directivity       — a weighted-dipole radiation pattern (Z omni/cardioid/figure-8), aim it
  *                         with , / . ; the listener hears it attenuate off-axis (HUD shows the lobe).
  *   4 Channel walk      — bwa_set_test_signal drives ONE raw output channel (speaker-check tool). Step
@@ -40,13 +44,15 @@
  *                         home for the bed knobs.
  *   7 Reverb bed        — a static shoebox room + the Steam Audio hybrid reverb bed. Move the source
  *                         and the room reverb follows; G dry/wet A-B, [ ] wet level, V distance->wet
- *                         (near dry / far wet), B A/Bs the bed
- *                         DECODER (sampling vs AllRAD — load-time, so it rebuilds the engine; differs
- *                         most on an irregular layout). The bed + room geometry are LOAD-time (the room
- *                         locks once the bed runs), so entering/leaving this scene REBUILDS the engine
- *                         (a brief audio gap). Transient signals (clicks/bursts) show the tail best.
+ *                         (near dry / far wet), B A/Bs the bed DECODER (sampling vs AllRAD — load-time,
+ *                         so it rebuilds the engine; differs most on an irregular layout). N drops a
+ *                         MOVABLE concrete wall between source and listener and SPACE auto-sweeps it —
+ *                         occlusion mutes the direct sound AND the reverb re-traces off the moving wall,
+ *                         the by-ear check that geometry can change while the bed runs. The bed + room
+ *                         geometry are LOAD-time, so entering/leaving this scene REBUILDS the engine (a
+ *                         brief audio gap). Transient signals (clicks/bursts) show the tail best.
  *
- * Global keys: WASD/RF move source, Q/E turn head, 1-4 signal, TAB scene, right-drag/wheel camera, ESC.
+ * Global keys: WASD/RF move source, Q/E head, 1-4 signal, TAB scene, F9 record output to WAV, ESC.
  * Needs the Steam Audio build for occlusion/materials/directivity/reverb; without it those are no-ops.
  * Usage: bwa_playground [cave_layout.json] — audition with your surveyed layout (renders + pans with the
  *        engine's actual speaker positions); with no arg it auto-loads ./cave_layout.json or the default grid.
@@ -69,6 +75,8 @@
 
 #define DR_WAV_IMPLEMENTATION
 #include "dr_wav.h"
+
+#include <atomic>
 
 #include <float.h>
 #include <math.h>
@@ -139,6 +147,60 @@ static int write_wav(const char* path, const float* buf, uint32_t n) {
     drwav_write_pcm_frames(&wav, n, buf);
     drwav_uninit(&wav);
     return 1;
+}
+/* interleaved multichannel float WAV (the recorder's writer; frames = per-channel sample count) */
+static int write_wav_n(const char* path, const float* interleaved, uint32_t frames, uint32_t ch) {
+    drwav_data_format fmt = { drwav_container_riff, DR_WAVE_FORMAT_IEEE_FLOAT, ch, SR, 32 };
+    drwav wav;
+    if (!drwav_init_file_write(&wav, path, &fmt, NULL)) return 0;
+    drwav_write_pcm_frames(&wav, frames, interleaved);
+    drwav_uninit(&wav);
+    return 1;
+}
+
+/* ---- output recording (bwa_set_output_capture -> WAV): grab a clip of what you're hearing, e.g. to
+ * A/B static vs dynamic geometry sample-for-sample, or as a golden-audio sanity check. The capture
+ * callback runs on the AUDIO thread, so it only interleaves the planar block into a PREALLOCATED
+ * buffer (no alloc/lock); the UI thread writes the WAV on stop. ---- */
+#define REC_SECONDS 60
+static float*  g_rec = NULL;                      /* interleaved capture buffer (REC_SECONDS * SR * 2 floats) */
+static size_t  g_rec_cap = 0;
+static std::atomic<size_t> g_rec_widx{ 0 };       /* write cursor (floats) */
+static std::atomic<int>    g_recording{ 0 };
+static std::atomic<int>    g_rec_busy{ 0 };        /* 1 while capture_cb is executing — the stop handshake */
+static uint32_t g_rec_ch = 2;                     /* channels captured (binaural monitor = 2) */
+static int      g_rec_index = 0;                  /* output filename counter */
+static char     g_rec_last[80] = "";              /* last saved path, for the panel */
+
+static void capture_cb(void* user, const float* planar, uint32_t ch, uint32_t n) {
+    (void)user;
+    g_rec_busy.store(1);                                              /* set BEFORE the recording check: the stop
+                                                                      * handshake waits on this, so a write in flight
+                                                                      * when g_recording clears is never truncated */
+    if (!g_recording.load() || !g_rec) { g_rec_busy.store(0); return; }
+    g_rec_ch = ch;
+    size_t w = g_rec_widx.load(std::memory_order_relaxed), need = (size_t)n * ch;
+    if (w + need > g_rec_cap) { g_recording.store(0); g_rec_busy.store(0); return; }   /* buffer full -> stop */
+    for (uint32_t i = 0; i < n; ++i)                                  /* planar (c*n+i) -> interleaved (i*ch+c) */
+        for (uint32_t c = 0; c < ch; ++c) g_rec[w + (size_t)i * ch + c] = planar[(size_t)c * n + i];
+    g_rec_widx.store(w + need, std::memory_order_release);
+    g_rec_busy.store(0);
+}
+static void toggle_record(void) {
+    if (g_recording.load()) {
+        g_recording.store(0);
+        for (int i = 0; i < 100 && g_rec_busy.load(); ++i) WaitTime(0.001);   /* drain the in-flight callback (bounded) */
+        uint32_t frames = (uint32_t)(g_rec_widx.load() / g_rec_ch);
+        if (frames == 0) { snprintf(g_rec_last, sizeof g_rec_last, "(no audio - silent backend?)"); printf("recording: no audio captured\n"); return; }
+        char path[64]; snprintf(path, sizeof path, "bwa_capture_%d.wav", ++g_rec_index);
+        if (write_wav_n(path, g_rec, frames, g_rec_ch)) {
+            snprintf(g_rec_last, sizeof g_rec_last, "%s  (%.1fs, %uch)", path, (double)frames / SR, g_rec_ch);
+            printf("recorded %.2f s (%u ch) -> %s\n", (double)frames / SR, g_rec_ch, path);
+        }
+    } else if (g_rec) {
+        g_rec_widx.store(0); g_recording.store(1);
+        printf("recording... F9 again to stop (max %d s)\n", REC_SECONDS);
+    }
 }
 
 /* ---- ambisonic bed content (the bed scene): a 3rd-order AmbiX field synthesized at startup ----
@@ -299,6 +361,44 @@ static void push_wall_mesh(bwa_material mat) {
     bwa_scene_set_mesh_mat(e, verts, 4, tris, 2, tri_mat);
 }
 
+/* ---- the SAME wall as a DYNAMIC instanced mesh (Path B) — the A/B against push_wall_mesh above ---- */
+static int   occ_wall = -1;       /* dynamic-mesh handle (-1 = none) */
+static int   occ_dynamic = 1;     /* Y: 1 = one instanced mesh moved by transform, 0 = static full rebuild */
+static int   occ_sweep = 0;       /* SPACE: auto-slide the wall in/out through the ear line */
+static float occ_anim_t = 0.0f;
+
+/* push the wall's live pose (pure translation to wall_c; identity rotation keeps the quad's normal at
+ * wall_n). Cheap — an instance-transform update, not a geometry rebuild. */
+static void update_dyn_wall_xform(void) {
+    if (occ_wall >= 0) bwa_scene_set_dynamic_transform(e, occ_wall, wall_c.x, wall_c.y, wall_c.z, 0, 0, 0, 1);
+}
+/* (re)create the dynamic wall. Its LOCAL geometry is the quad's corners as offsets from centre
+ * (wall_u*±hw + wall_v*±hh), so a pure translation reproduces push_wall_mesh's exact world triangles —
+ * the occluder is geometrically identical to the static one, which is what makes the A/B meaningful. */
+static void make_dyn_wall(bwa_material mat) {
+    if (occ_wall >= 0) { bwa_scene_remove_dynamic_mesh(e, occ_wall); occ_wall = -1; }
+    Vector3 u = Vector3Scale(wall_u, wall_hw), v = Vector3Scale(wall_v, wall_hh);
+    Vector3 c0 = Vector3Negate(Vector3Add(u, v)), c1 = Vector3Subtract(u, v);
+    Vector3 c2 = Vector3Add(u, v),                c3 = Vector3Subtract(v, u);
+    float verts[12] = { c0.x,c0.y,c0.z,  c1.x,c1.y,c1.z,  c2.x,c2.y,c2.z,  c3.x,c3.y,c3.z };
+    int   tris[6]   = { 0, 1, 2,  0, 2, 3 };
+    occ_wall = bwa_scene_add_dynamic_mesh(e, verts, 4, tris, 2, mat);
+    update_dyn_wall_xform();
+}
+/* the "no static occluder" state: bwa_scene_set_mesh_mat won't accept an empty mesh, so park a tiny
+ * degenerate triangle far outside the room to replace any prior static wall (harmless — no ray reaches it). */
+static void clear_static_wall(void) {
+    float v[9] = { 100.f,100.f,100.f,  100.02f,100.f,100.f,  100.f,100.02f,100.f };
+    int   t[3] = { 0, 1, 2 };
+    bwa_material tm[1] = { mats[cur_mat] };
+    bwa_scene_set_mesh_mat(e, v, 3, t, 1, tm);
+}
+/* install the wall in the CURRENT mode; exactly one representation is live at a time (else two walls). */
+static void apply_wall(void) {
+    if (occ_dynamic) { clear_static_wall(); make_dyn_wall(mats[cur_mat]); }
+    else { if (occ_wall >= 0) { bwa_scene_remove_dynamic_mesh(e, occ_wall); occ_wall = -1; } push_wall_mesh(mats[cur_mat]); }
+}
+
 /* ---- shared drawing ---- */
 static CvConstraints g_con;     /* ./constraints.json, if present — drawn in every scene for orientation */
 
@@ -394,17 +494,25 @@ static void loc_draw3d(void) {
 static void occ_enter(void) {
     bwa_source_set_gain(e, src, SRC_GAIN);
     bwa_source_set_occlusion(e, src, occ_audible);
-    push_wall_mesh(mats[cur_mat]);
+    occ_wall = -1;                      /* any handle from a prior engine build is stale; apply_wall re-adds */
+    apply_wall();
 }
 static void occ_update(float dt) {
     float mv = 2.5f * dt;
+    int   moved = 0;
     if (kd(KEY_LEFT_BRACKET) || kd(KEY_RIGHT_BRACKET)) {
         wall_c = Vector3Add(wall_c, Vector3Scale(wall_n, kd(KEY_LEFT_BRACKET) ? -mv : mv));
-        push_wall_mesh(mats[cur_mat]);
+        moved = 1;
     }
-    if (kp(KEY_M)) { cur_mat = (cur_mat + 1) % NMAT; push_wall_mesh(mats[cur_mat]); }
+    if (kp(KEY_SPACE)) occ_sweep = !occ_sweep;
+    if (kp(KEY_Y))     { occ_dynamic = !occ_dynamic; apply_wall(); }   /* A/B: static full-rebuild vs dynamic instance */
+    if (occ_sweep) { occ_anim_t += dt; wall_c.z = -2.2f + 1.6f * sinf(occ_anim_t * 1.1f); moved = 1; }
+    if (kp(KEY_M)) { cur_mat = (cur_mat + 1) % NMAT; apply_wall(); }
     if (kp(KEY_T)) refl_audible = !refl_audible;
     if (kp(KEY_G)) { occ_audible = !occ_audible; bwa_source_set_occlusion(e, src, occ_audible); }
+    /* the whole point of the A/B: sliding is a cheap instance-transform in dynamic mode, a full scene
+     * rebuild in static mode — and they must sound identical. */
+    if (moved) { if (occ_dynamic) update_dyn_wall_xform(); else push_wall_mesh(mats[cur_mat]); }
 
     /* reflection: the source mirrored across the wall is valid when source + listener are on the same
      * side and the bounce lands on the panel. occlusion: the direct path crosses the panel. */
@@ -636,12 +744,36 @@ static int   rev_on  = 1;
 static float rev_wet = 1.0f;
 static int   rev_decoder;                          /* bed decoder: 0 = sampling (SAD), 1 = AllRAD (B to A/B) */
 static int   rev_dist;                             /* distance->wet send (V): near = drier, far = wetter */
+/* a MOVABLE occluder inside the running reverb scene — the by-ear check that geometry can change while
+ * the reflection bed runs (blocker 1). Sliding it changes BOTH the direct occlusion AND the reverb the
+ * bed traces off it, live. Its material is reflective (concrete). */
+static int   rev_wall = -1;                        /* dynamic-mesh handle */
+static int   rev_wall_on = 0;                      /* N: add/remove the movable occluder */
+static int   rev_wall_sweep = 0;                   /* SPACE: auto-slide it through the source->listener line */
+static float rev_wall_z = -1.6f, rev_wall_t = 0.0f;
 
+static void rev_place_wall(void) {                 /* push the wall's live pose (pure translation) */
+    if (rev_wall >= 0) bwa_scene_set_dynamic_transform(e, rev_wall, 0.0f, 1.5f, rev_wall_z, 0, 0, 0, 1);
+}
+static void rev_apply_wall(void) {                 /* add/remove the wall + toggle occlusion to match rev_wall_on */
+    if (rev_wall >= 0) { bwa_scene_remove_dynamic_mesh(e, rev_wall); rev_wall = -1; }
+    if (!rev_wall_on) { bwa_source_set_occlusion(e, src, false); return; }
+    const float hw = 1.5f, hh = 1.5f;              /* a 3x3 vertical panel, normal +Z (local XY quad) */
+    float verts[12] = { -hw,-hh,0,  hw,-hh,0,  hw,hh,0,  -hw,hh,0 };
+    int   tris[6]   = { 0, 1, 2,  0, 2, 3 };
+    rev_wall = bwa_scene_add_dynamic_mesh(e, verts, 4, tris, 2, mats[0]);   /* pre-minted concrete (mat_types[0]);
+                                                                            * don't mint per toggle — it leaks the table */
+    bwa_source_set_occlusion(e, src, true);
+    rev_place_wall();
+}
 static void rev_enter(void) {
     bwa_source_set_gain(e, src, SRC_GAIN);
     bwa_source_set_reflections(e, src, rev_on);    /* feed the source into the shared reverb bed */
     bwa_source_set_reflection_distance(e, src, rev_dist);
     bwa_reflections_set_gain(e, rev_wet);
+    source_pos = Vector3{ 0.0f, g_head.y, -3.0f }; /* behind where the wall sweeps, so the demo occludes out of the box */
+    rev_wall = -1;                                 /* fresh engine build; re-add if enabled */
+    rev_apply_wall();
 }
 static void rev_update(float dt) {
     if (kp(KEY_B)) {                     /* A/B the bed decoder: load-time, so rebuild the engine */
@@ -652,6 +784,11 @@ static void rev_update(float dt) {
     }
     if (kp(KEY_G)) { rev_on = !rev_on; bwa_source_set_reflections(e, src, rev_on); }
     if (kp(KEY_V)) { rev_dist = !rev_dist; bwa_source_set_reflection_distance(e, src, rev_dist); }
+    if (kp(KEY_N)) { rev_wall_on = !rev_wall_on; rev_apply_wall(); }       /* movable occluder in/out */
+    if (kp(KEY_SPACE)) rev_wall_sweep = !rev_wall_sweep;
+    if (rev_wall_on && rev_wall_sweep) {           /* slide the wall through the ear line: occlusion + reverb both shift */
+        rev_wall_t += dt; rev_wall_z = -1.6f + 1.3f * sinf(rev_wall_t * 0.6f); rev_place_wall();
+    }
     if (kd(KEY_LEFT_BRACKET))  rev_wet = fmaxf(0.0f, rev_wet - 0.7f * dt);
     if (kd(KEY_RIGHT_BRACKET)) rev_wet = fminf(2.0f, rev_wet + 0.7f * dt);
     bwa_reflections_set_gain(e, rev_wet);
@@ -665,6 +802,9 @@ static void rev_draw3d(void) {
     DrawCubeWires(Vector3{ 0, ROOM_H * 0.5f, 0 }, ROOM_W, ROOM_H, ROOM_D, Color{ 90, 110, 150, 130 });
     DrawLine3D(g_head, source_pos, Color{ 90, 220, 90, 200 });
     DrawSphere(source_pos, 0.18f, RED);
+    if (rev_wall_on)                               /* the movable occluder (matches the dynamic mesh's pose) */
+        draw_wall(Vector3{ 0, 1.5f, rev_wall_z }, Vector3{ 1, 0, 0 }, Vector3{ 0, 1, 0 }, 1.5f, 1.5f,
+                  Color{ 140, 110, 90, 90 }, Color{ 220, 180, 150, 255 });
 }
 /* ---- scene table (per-scene panel sections live in draw_panel) ---- */
 typedef struct {
@@ -713,6 +853,7 @@ static void build_engine(int with_reverb) {
         printf("bwa_start: %s — no audio (install/select an ASIO driver, e.g. ASIO4ALL); the scene still runs.\n",
                err ? err : "?");
     }
+    bwa_set_output_capture(e, capture_cb, NULL);             /* F9 records the binaural output to WAV */
     backend_name   = bwa_get_audio_backend(e);
     backend_silent = (strncmp(backend_name, "asio", 4) != 0);
     g_nspk = (int)bwa_get_speakers(e, (float*)speakers, NSPK);   /* the geometry AND count the engine pans with */
@@ -736,6 +877,10 @@ static void build_engine(int with_reverb) {
  * are crossing the reverb boundary, since the bed + room geometry are load-time) */
 static void switch_scene(int idx) {
     int want_reverb = (idx == SCENE_REVERB);
+    if (e) {                                     /* drop any movable walls before a possible engine rebuild */
+        if (occ_wall >= 0) { bwa_scene_remove_dynamic_mesh(e, occ_wall); occ_wall = -1; }
+        if (rev_wall >= 0) { bwa_scene_remove_dynamic_mesh(e, rev_wall); rev_wall = -1; }
+    }
     if (want_reverb != engine_has_reverb) {
         printf("rebuilding engine: %s\n", want_reverb ? "reverb (bed + static room)" : "interactive");
         if (e) { bwa_stop(e); bwa_destroy(e); e = NULL; }
@@ -790,7 +935,7 @@ static void draw_panel(void) {
             if (ImGui::Selectable(scenes[i].name, i == cur_scene) && i != cur_scene) switch_scene(i);
         ImGui::EndCombo();
     }
-    ImGui::TextDisabled("TAB scene  WASD/RF source  Q/E head  F11  ESC");
+    ImGui::TextDisabled("TAB scene  WASD/RF source  Q/E head  F9 rec  F11  ESC");
 
     /* audio status + live output meters (bwa_get_bus_levels -> spk_lv, the same data shading the 3D gizmos) */
     ImGui::SeparatorText("output");
@@ -803,6 +948,21 @@ static void draw_panel(void) {
     snprintf(mlabel, sizeof mlabel, "speakers 0-%d (60 dB window)", g_nspk - 1);
     ImGui::PlotHistogram("##meters", spk_lv, g_nspk, 0, mlabel, 0.0f, 1.0f,
                          ImVec2(-FLT_MIN, uiScaled(46.0f)));
+
+    /* record the binaural output to WAV (bwa_set_output_capture): grab a clip for A/B or a golden check */
+    bool rec = g_recording.load() != 0;
+    if (rec) {
+        double secs = (double)(g_rec_widx.load() / (g_rec_ch ? g_rec_ch : 2)) / SR;
+        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.65f, 0.15f, 0.15f, 1.0f));
+        if (ImGui::Button("STOP recording [F9]", ImVec2(-FLT_MIN, 0))) toggle_record();
+        ImGui::PopStyleColor();
+        ImGui::TextColored(ImVec4(1.0f, 0.5f, 0.5f, 1.0f), "\xe2\x97\x8f REC  %.1fs / %ds", secs, REC_SECONDS);
+    } else {
+        if (ImGui::Button("record output [F9]", ImVec2(-FLT_MIN, 0))) toggle_record();
+        if (g_rec_last[0]) ImGui::TextDisabled("saved: %s", g_rec_last);
+    }
+    bwTip("write the binaural headphone output to bwa_capture_N.wav in the working directory - "
+          "A/B static vs dynamic geometry sample-for-sample, or keep a golden clip");
 
     /* the localization signal is global (the 1-4 keys work in every scene) */
     ImGui::SeparatorText("signal [1-4]");
@@ -839,15 +999,21 @@ static void draw_panel(void) {
     } else if (cur_scene == 1) {                          /* Occlusion & Materials */
         ImGui::SetNextItemWidth(-FLT_MIN);
         int m = cur_mat;
-        if (ImGui::Combo("##mat", &m, mat_names, NMAT) && m != cur_mat) { cur_mat = m; push_wall_mesh(mats[cur_mat]); }
+        if (ImGui::Combo("##mat", &m, mat_names, NMAT) && m != cur_mat) { cur_mat = m; apply_wall(); }
         bwTip("wall material: each has its own per-band transmission (how muffled "
               "the occluded sound gets) and reflectivity");
+        if (chk("dynamic instanced mesh [Y]", &occ_dynamic)) apply_wall();
+        bwTip("A/B the movable-geometry path: ON = one instanced mesh moved by a transform (a cheap "
+              "BVH refit); OFF = bwa_scene_set_mesh_mat rebuilds the whole scene on every move. Same "
+              "occluder either way — it should sound IDENTICAL.");
+        chk("auto-sweep the wall [SPACE]", &occ_sweep);
+        bwTip("slide the wall in and out through the ear line, hands-free, so occlusion pumps");
         chk("audible reflection [T]", &refl_audible);
         bwTip("the wall throws an image-source reflection when the source is in front of it");
         if (chk("occlusion [G]", &occ_audible)) bwa_source_set_occlusion(e, src, occ_audible);
         bwTip("ray-traced: the wall between source and listener attenuates AND muffles "
               "it (per-band transmission EQ), ramped - not a hard mute");
-        ImGui::TextDisabled("[ ] keys slide the wall");
+        ImGui::TextDisabled("[ ] slide  ·  now: %s", occ_dynamic ? "dynamic (instanced)" : "static (rebuild)");
         if (occ_refl_valid)    ImGui::TextColored(ImVec4(1.00f, 0.70f, 0.30f, 1.0f), "in FRONT: REFLECTING (image source)");
         else if (occ_occluded) ImGui::TextColored(ImVec4(0.96f, 0.55f, 0.55f, 1.0f), "BEHIND: OCCLUDED (material tilt)");
         else                   ImGui::TextUnformatted("wall: clear line of sight");
@@ -947,6 +1113,15 @@ static void draw_panel(void) {
         bwTip("diffuse-bed decoder. Load-time, so switching REBUILDS the engine - "
               "expect a brief pause; audio and playhead restart");
         ImGui::TextWrapped("8x4x8 m plaster room; clicks/bursts show the tail. SAD vs AllRAD differ most on an irregular layout.");
+
+        ImGui::SeparatorText("movable occluder");
+        if (chk("dynamic wall [N]", &rev_wall_on)) rev_apply_wall();
+        bwTip("add a concrete wall (a dynamic instanced mesh) between source and listener WHILE the "
+              "bed runs - occlusion mutes the direct sound and the reverb re-traces off it. This is the "
+              "runtime-geometry-with-reflections path (blocker 1): moving geometry no longer locks the scene.");
+        chk("auto-sweep [SPACE]", &rev_wall_sweep);
+        bwTip("slide the wall through the source->listener line; hear occlusion AND the reverb shift together");
+        if (rev_wall_on) ImGui::TextDisabled("wall at z = %.2f", rev_wall_z); else ImGui::TextDisabled("no wall");
     }
 
     ImGui::Separator();
@@ -1024,6 +1199,25 @@ static void register_tests(ImGuiTestEngine* te) {
         for (int tries = 0; tries < 60 && m <= 1e-6f; ++tries) { ctx->Yield(4); m = meters_max(&n); }
         IM_CHECK_EQ(n, (uint32_t)g_nspk);           /* the engine's channel count == the layout's */
         IM_CHECK_GT(m, 1e-4f);                      /* pink noise through DBAP reaches the output bus */
+    };
+
+    /* recording: the record button drives bwa_set_output_capture -> capture_cb -> write_wav_n end to
+     * end (on the null sink, which still renders). Asserts blocks were captured and a real WAV landed. */
+    t = IM_REGISTER_TEST(te, "viewer", "record");
+    t->TestFunc = [](ImGuiTestContext* ctx) {
+        ctx->SetRef("playground");
+        int idx0 = g_rec_index;
+        ctx->ItemClick("**/record output [F9]");
+        IM_CHECK_EQ(g_recording.load(), 1);
+        for (int tries = 0; tries < 120 && g_rec_widx.load() < 4096; ++tries) ctx->Yield(4);  /* let the sink render blocks */
+        IM_CHECK_GT((int)g_rec_widx.load(), 0);
+        ctx->ItemClick("**/STOP recording [F9]");
+        IM_CHECK_EQ(g_recording.load(), 0);
+        IM_CHECK_EQ(g_rec_index, idx0 + 1);                 /* a file was written */
+        char path[64]; snprintf(path, sizeof path, "bwa_capture_%d.wav", g_rec_index);
+        FILE* f = fopen(path, "rb");
+        IM_CHECK(f != NULL);
+        if (f) { fseek(f, 0, SEEK_END); long sz = ftell(f); fclose(f); IM_CHECK_GT(sz, 1000); remove(path); }
     };
 
     t = IM_REGISTER_TEST(te, "viewer", "panel_controls");   /* fake inputs drive the real panel */
@@ -1119,6 +1313,23 @@ static void register_tests(ImGuiTestEngine* te) {
         IM_CHECK_EQ(abx_trials, 0);
         switch_scene(0);
     };
+
+    /* Scene 7's movable occluder: toggling it adds/removes a dynamic mesh IN the running reverb engine
+     * (bed + occlusion sims both reading the shared scene) — the by-ear blocker-1 path, exercised. */
+    t = IM_REGISTER_TEST(te, "viewer", "reverb_wall");
+    t->TestFunc = [](ImGuiTestContext* ctx) {
+        switch_scene(SCENE_REVERB);                     /* rebuilds the engine into the reverb config */
+        ctx->Yield(2);
+        ctx->SetRef("playground");
+        ctx->ItemCheck("**/dynamic wall [N]");
+        IM_CHECK_EQ(rev_wall_on, 1);
+        IM_CHECK_GE(rev_wall, 0);                        /* a dynamic mesh was allocated in the reverb scene */
+        ctx->ItemCheck("**/auto-sweep [SPACE]");
+        ctx->Yield(8);                                   /* the wall slides; the sims re-trace against it */
+        ctx->ItemUncheck("**/dynamic wall [N]");
+        IM_CHECK_EQ(rev_wall, -1);                       /* removing it releases the instance */
+        switch_scene(0);                                 /* back to interactive (rebuilds the engine again) */
+    };
 }
 
 /* ============================== main ============================== */
@@ -1176,6 +1387,9 @@ int main(int argc, char** argv) {
     gen_bed(bedbuf, SIGLEN);
     write_wav16(BED_FILE, bedbuf, SIGLEN);
     free(bedbuf);
+
+    g_rec_cap = (size_t)REC_SECONDS * SR * 2;                /* preallocate the record buffer (stereo monitor) */
+    g_rec = (float*)malloc(g_rec_cap * sizeof(float));       /* NULL is fine: capture_cb/toggle_record no-op */
 
     wall_basis(wall_n, &wall_u, &wall_v);
     build_engine(0);                                          /* start in the interactive config (fills speakers[], g_head) */
@@ -1249,6 +1463,7 @@ int main(int argc, char** argv) {
                 bwa_source_play(e, src,  sounds[i], true);
                 bwa_source_play(e, refl, sounds[i], true);
             }
+        if (kp(KEY_F9)) toggle_record();                    /* record the binaural output to WAV (any scene) */
         /* TAB last in this block ON PURPOSE: a reverb-boundary switch REBUILDS the engine (destroys e,
          * src, refl), so all per-source calls above must run against the still-valid engine first. */
         if (kp(KEY_TAB)) switch_scene((cur_scene + 1) % NSCENE);

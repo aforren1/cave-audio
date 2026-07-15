@@ -4,6 +4,21 @@ All notable changes to `com.brainworks.bw_audio`.
 
 ## [Unreleased]
 
+### Added — dynamic (movable) acoustic geometry
+
+- **`DynamicAcousticGeometry`** component + **`Engine.AddDynamicMesh` / `SetDynamicTransform` /
+  `RemoveDynamicMesh`** → `bwa_scene_add_dynamic_mesh` & co.: mark a MOVING object (door, lift,
+  rotating panel) as an occluder/reflector. It registers a low-poly acoustic mesh as a rigid
+  instance (Steam Audio `IPLInstancedMesh`) and pushes its pose each frame (throttled by
+  `positionEpsilon`/`angleEpsilon`), so occlusion and REAL-TIME reflections track it — moving it is a
+  cheap scene-BVH refit, not a geometry rebuild. Same "keep it simple / use `meshOverride`" rules as
+  `AcousticGeometry`; scale is captured at registration (rigid-body). Coordinate seam handled: the
+  mesh bakes into room handedness once (X-flip + scale, winding reversed) and the per-frame pose goes
+  through `Room.Pos`/`Room.Rot`. Baked reflections/pathing do NOT track movement (real-time does).
+  Needs the Steam Audio backend (a no-op otherwise). Static geometry stays on `AcousticGeometry`,
+  which is now also safe to re-push at runtime (a full scene rebuild — prefer dynamic meshes for
+  movers).
+
 ### Added — parity with the engine's A/B round (max-rE · spectral spread · FuMa · bed orientation)
 
 - **`Engine.maxRe` / `SetMaxRe`** → `bwa_set_max_re`: max-rE weighting on the bed decode and the

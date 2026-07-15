@@ -128,11 +128,18 @@ bwa_scene_set_box(e, 6.f, 3.f, 6.f, faces);                      // triangle nor
 - **Custom coefficients are clamped to `[0,1]`** and NaN/Inf-sanitized before they reach phonon.
 - **A single-material mesh** is just `bwa_scene_set_mesh_mat` with every triangle on one token.
 
-**Scene lifecycle.** You may call the geometry setters at runtime while only occlusion is running:
-the occlusion sim owns the `IPLScene` and serializes its own commit + ray trace, so a mesh swap
-there is safe. Once the reflection bed is running they are **rejected** — the bed shares the same
-scene, an `iplSceneCommit` cannot race its ray tracing, and the reflection IR assumes a static
-scene. A locked call sets `bwa_last_error` (`scene_locked` in `src/engine.c`).
+**Scene lifecycle.** The geometry setters are safe to call at runtime, reflection bed or not. The
+occlusion sim owns the `IPLScene` and is the sole thread that commits it; the borrowing reflection
+and pathing sims take that scene's lock **shared** around their ray traces (`steam_scene_ray_lock`,
+an `SRWLOCK`), so an `iplSceneCommit` can no longer race a `RunReflections`/`RunPathing`. What moves
+each frame is a **dynamic mesh** (`bwa_scene_add_dynamic_mesh` → an `IPLInstancedMesh` you reposition
+with `bwa_scene_set_dynamic_transform`) — a cheap top-level BVH refit, not a geometry rebuild — the
+acoustic analogue of a physics collider with a transform. Replacing the whole *static* mesh at runtime
+also works but rebuilds the entire BVH, so it's for occasional swaps, not per-frame motion. The one
+thing runtime geometry does **not** move is a **baked** reverb/pathing result: the bake froze the
+geometry at `bwa_start`, so a mover changes nothing there — use real-time reflections (the default) if
+the scene animates. `scene_locked` in `src/engine.c` now only means "no scene" (no SDK / failed
+create).
 
 ### Reflection bed: hybrid reverb (directional early reflections + parametric tail)
 

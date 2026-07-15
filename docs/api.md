@@ -135,7 +135,7 @@ const char* bwa_last_error(bwa_engine* e);
 | `hrtf_path`      | HRTF (SOFA) or NULL for built-in; binaural/both                     |
 | `sample_rate`    | 48000                                                               |
 | `block_size`     | ASIO buffer hint (256/512)                                          |
-| `sink`           | output-device policy: `BWA_SINK_AUTO` (0, default — try ASIO, fall back to the silent null sink), `BWA_SINK_ASIO` (demand a device: an open failure fails `bwa_start` loudly), `BWA_SINK_NULL` (force the offline sink — CI, profiling, tracking-only) |
+| `sink`           | output-device policy: `BWA_SINK_AUTO` (0, default — try ASIO, fall back to the silent null sink), `BWA_SINK_ASIO` (demand a device: an open failure fails `bwa_start` loudly), `BWA_SINK_NULL` (force the offline sink — CI, profiling, tracking-only), `BWA_SINK_MANUAL` (no device/thread — pump blocks yourself with `bwa_render_block`; deterministic, for golden tests) |
 | `asio_driver`    | ASIO driver name to open; NULL = auto-pick the first registered driver with enough output channels for the profile (binaural finds a 2-ch headphone driver, cave a ≥layout-count one) |
 | `embree`         | ray-trace the acoustics sims on Intel Embree; silently falls back to the default tracer if the phonon build lacks it — see [Ray-tracing acceleration](#ray-tracing-acceleration-bwa_descembree) |
 | `enable_pathing` | run the sound-pathing sim from `bwa_start` (needs scene geometry + the Steam Audio build); sources opt in via `bwa_source_set_pathing` |
@@ -557,7 +557,7 @@ Call once per frame after pushing all source and listener updates. It promotes t
 frame's position/pose to a coherent snapshot (so the audio thread never mixes a
 moved listener against a not-yet-moved source) and drains the event ring.
 
-## Materials & scene geometry (control thread; load-time)
+## Materials & scene geometry (control thread; static at load, dynamic per-frame)
 
 ```c
 typedef enum { BWA_MAT_GENERIC = 0, BWA_MAT_BRICK, BWA_MAT_CONCRETE, BWA_MAT_CERAMIC,
@@ -567,8 +567,14 @@ bwa_material bwa_material_preset(bwa_engine* e, bwa_material_type preset);   // 
 bwa_material bwa_material_define(bwa_engine* e, const float absorption[3], float scattering,
                                            const float transmission[3]);
 void bwa_scene_set_mesh_mat(bwa_engine* e, const float* verts, int nverts, const int* tris, int ntris,
-                           const bwa_material* tri_material);     // one token per triangle
+                           const bwa_material* tri_material);     // one token per triangle (STATIC world)
 void bwa_scene_set_box     (bwa_engine* e, float w, float h, float d, const bwa_material faces[6]); // -x,+x,-y,+y,-z,+z
+// Dynamic (movable) occluders/reflectors — one instanced sub-scene per mover, placed by a rigid transform.
+int  bwa_scene_add_dynamic_mesh(bwa_engine* e, const float* verts, int nverts, const int* tris, int ntris,
+                               bwa_material material);            // -> handle >= 0, or -1
+void bwa_scene_set_dynamic_transform(bwa_engine* e, int handle, float x, float y, float z,
+                                    float qx, float qy, float qz, float qw);   // room-space pos + quat
+void bwa_scene_remove_dynamic_mesh(bwa_engine* e, int handle);
 ```
 
 A `bwa_material` is an **opaque, engine-scoped token** — a small index, where `0` is always the
@@ -587,13 +593,21 @@ Geometry rules:
   the listener stands inside.
 - **One scene, two consumers.** The same per-triangle materials feed both occlusion (per-band
   transmission) and the reflection bed (absorption/scattering) — one shared `IPLScene`.
-- **Runtime swaps: occlusion yes, reflections no.** Geometry can change at runtime while only
-  occlusion runs — that sim owns the scene and serializes its own commit + ray trace. Once the
-  reflection bed is running the scene is locked: the reflection IR assumes a static scene, and
-  an `iplSceneCommit` can't race its ray tracing. A locked call is rejected and sets
-  `bwa_last_error`.
+- **Static vs dynamic.** `bwa_scene_set_mesh_mat`/`_set_box` set the STATIC world — committed once,
+  BVH built once. For things that MOVE, `bwa_scene_add_dynamic_mesh` registers a rigid **instance**
+  (its own sub-scene) that you reposition with `bwa_scene_set_dynamic_transform` (room-space position
+  + orientation quaternion) — a cheap top-level BVH refit, not a geometry rebuild, so it's the
+  per-frame path. Geometry is in the mover's LOCAL space; one material token covers all its triangles;
+  the movable table holds 32 instances. `add` returns a handle (or `-1`: no SDK / bad geometry / full).
+- **Runtime-safe.** Both the static swap and dynamic-mesh moves are safe to call at any time — the
+  occlusion sim owns the scene and serializes `iplSceneCommit`, and the borrowing reflection/pathing
+  sims take the scene lock **shared** around their ray traces, so a commit can no longer race a trace.
+  Caveat: **baked** reflections/pathing don't track a runtime change (the bake froze the geometry —
+  see [materials.md](./materials.md)); real-time reflections and occlusion do. Replacing the whole
+  static mesh at runtime works but rebuilds the entire BVH — prefer dynamic meshes for movers.
 - **No SDK, no-op.** Everything here is a documented no-op without the `BWA_HAVE_STEAMAUDIO`
-  build — except token minting, which is plain table state and still works.
+  build — except token minting, which is plain table state and still works. `bwa_scene_add_dynamic_mesh`
+  returns `-1` without the backend.
 
 ## Occlusion & directivity (control thread; per-frame except where noted)
 
@@ -760,6 +774,48 @@ count filled (`bwa_get_channel_count()` when `cap` allows). Per-frame-safe (rela
 locks); levels read 0 until audio is
 running. Drive channel meters or a speaker-activity display with it — the playground lights each
 speaker gizmo from this.
+
+### Output capture (recording / golden checks)
+
+```c
+typedef void (*bwa_output_fn)(void* user, const float* planar, uint32_t channels, uint32_t nframes);
+void bwa_set_output_capture(bwa_engine* e, bwa_output_fn cb, void* user);
+```
+
+`bwa_set_output_capture` taps the **final device-bound output** — post-limiter, exactly what reaches
+the device. The callback runs on the **audio thread**, once per block, with **planar** channel-major
+data (`planar[c*nframes + i]`). `channels` is the primary device's channel count: the array count
+(`bwa_get_channel_count`) for `cave`/`both`, `2` for `binaural`. Same audio-thread contract as any
+callback here — **copy out only, no alloc/lock/syscall/file I/O**; write to a ring your own thread
+drains to a file or comparison buffer. Pass `cb = NULL` to stop, and keep `user` alive until after
+the NULL set plus one block.
+
+Two uses: **recording** (grab what you're hearing — the playground's `F9` writes the binaural output
+to a WAV this way) and **offline sanity / golden-audio tests**. For recording, any sink works. For
+golden tests, use the **manual sink** below — it's deterministic, where the null sink is only
+*paced* (a real thread, a wall clock, a run-varying block count).
+
+### Offline / deterministic render — `bwa_render_block`
+
+```c
+const float* bwa_render_block(bwa_engine* e, uint32_t* channels, uint32_t* nframes);
+```
+
+Set `bwa_desc.sink = BWA_SINK_MANUAL` and no device or audio thread is created — **you** pump one block
+at a time on your own thread. Each call renders exactly one block (`bwa_desc.block_size` frames) of the
+profile's primary output — `binaural`: 2 ch; `cave`/`both`: `bwa_get_channel_count()` ch — into
+engine-owned memory and returns a pointer (**planar**, `channels * nframes` floats, valid until the
+next call or `bwa_stop`). Fills `*channels`/`*nframes` (either may be `NULL`). Returns `NULL` if the
+engine isn't started or the sink isn't `MANUAL`.
+
+The timestamp is a pure sample counter (no wall clock), so a **fixed input + fixed call sequence
+renders bit-identically every run** — that reproducibility is what makes a committed golden meaningful
+(see `test/golden_test.c`: push a tone at a fixed position → render N blocks → compare per-channel
+energy against a reference). Same caveat as capture: only the **synchronous DSP** is reproducible. The
+async sim layers — Steam occlusion, reflection, pathing — run on their own wall-clock-timed threads
+(30 / 12 / 10 Hz), so keep golden renders off them, or drive the deterministic entry points
+(`bwa_source_set_occlusion_manual` instead of the ray-traced sim). You can still register a capture
+callback on a manual sink, but reading `bwa_render_block`'s return value directly is simpler.
 
 ## Panner & layout query (control thread)
 

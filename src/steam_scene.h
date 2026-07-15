@@ -42,13 +42,39 @@ void steam_scene_set_orientation(SteamScene* s, uint32_t handle, float fx, float
 void steam_scene_set_pos        (SteamScene* s, uint32_t handle, float x, float y, float z);
 void steam_scene_source_gone    (SteamScene* s, uint32_t handle);
 
+/* Dynamic (movable) occluders/reflectors. The static mesh above is committed once and its BVH built
+ * once; a dynamic mesh is a rigid INSTANCE of its own sub-scene, so moving it is a cheap top-level BVH
+ * refit, not a geometry rebuild (Steam Audio's IPLInstancedMesh — the acoustic analogue of a physics
+ * collider with a transform). Both the occlusion sim and the borrowing reflection/pathing sims see the
+ * change on their next tick. Geometry is in the mover's LOCAL space (metres); place it with the rigid
+ * transform. add returns a handle >= 0 (a slot index), or -1 on bad geometry / a full table.
+ *
+ * The mover carries a single material (absorption[3] / scattering / transmission[3], each 0..1). All
+ * three calls are control-thread, per-frame-safe (the sim thread owns every phonon object; the control
+ * thread only writes a locked shadow). BAKED reflections/pathing do NOT track these — the bake froze
+ * the geometry (docs/materials.md); real-time reflections and occlusion do. */
+int  steam_scene_add_dynamic_mesh(SteamScene* s, const float* verts, int nverts, const int* tris, int ntris,
+                                  const float absorption[3], float scattering, const float transmission[3]);
+/* Move/rotate/scale a dynamic mesh. m16 is a row-major 4x4 local-to-room affine (phonon IPLMatrix4x4
+ * order); the engine builds it from a rigid pos+quat. No-op for an unknown/removed handle. */
+void steam_scene_set_dynamic_transform(SteamScene* s, int handle, const float m16[16]);
+/* Remove a dynamic mesh (the sim tears down its instance + sub-scene). */
+void steam_scene_remove_dynamic_mesh(SteamScene* s, int handle);
+
 /* Borrow the underlying phonon objects (void* = opaque IPLContext / IPLScene) so the reflection bed
  * can build a reflections simulator on the SAME committed geometry. Valid for the scene's lifetime;
- * the reflection bed must be destroyed before the scene. (v1 assumes a static scene during playback —
- * set the mesh before bwa_start; concurrent commits + reflection reads are not synchronized.) */
+ * the reflection bed must be destroyed before the scene. Concurrent commits (this scene's sim thread)
+ * and reflection/pathing ray-traces are serialized by the scene lock below — take it SHARED around a
+ * borrowing sim's RunReflections/RunPathing (the commit side takes it exclusive internally). */
 void* steam_scene_ipl_context(SteamScene* s);
 void* steam_scene_ipl_scene(SteamScene* s);
 int   steam_scene_ipl_scenetype(SteamScene* s);   /* IPLSceneType of the shared scene (DEFAULT/EMBREE); reflect sim must match */
+
+/* Reader lock over the committed scene, for the borrowing sims (steam_reflect / steam_path). A ray
+ * trace that reads the shared scene's BVH must hold this SHARED while it runs, so it can't race an
+ * iplSceneCommit (a dynamic-mesh move or a mesh swap) on the scene's own sim thread. NULL-safe. */
+void steam_scene_ray_lock(SteamScene* s);
+void steam_scene_ray_unlock(SteamScene* s);
 
 void steam_scene_destroy(SteamScene* s);   /* stops the sim thread, releases phonon objects */
 

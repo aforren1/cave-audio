@@ -171,6 +171,14 @@ static void stereo_tap(const float* bus, unsigned channels, unsigned n) {
     if (channels != 2) return;
     for (unsigned i = 0; i < n; ++i) { tap_sum[0] += fabs(bus[i]); tap_sum[1] += fabs(bus[n + i]); }
 }
+/* the PUBLIC capture path (bwa_set_output_capture) — fires per block in render_binaural with the same
+ * final device-bound stereo, planar. Same accumulation as the tap; asserted to carry the laterality. */
+static double cap_sum[2];
+static void capture_probe(void* user, const float* planar, uint32_t channels, uint32_t n) {
+    (void)user;
+    if (channels != 2) return;
+    for (uint32_t i = 0; i < n; ++i) { cap_sum[0] += fabs(planar[i]); cap_sum[1] += fabs(planar[n + i]); }
+}
 static int run_binaural_laterality(void) {
     bwa_desc cfg = {
         .profile     = BWA_PROFILE_BINAURAL,
@@ -196,7 +204,9 @@ static int run_binaural_laterality(void) {
         bwa_set_listener_pose(e, 0.f, 1.5f, 0.f, 0.f, 0.f, 0.f, 1.f);
         bwa_commit(e);
         bwa_null_sink_tap = stereo_tap;
+        bwa_set_output_capture(e, capture_probe, NULL);     /* the public capture path, alongside the test tap */
         tap_sum[0] = tap_sum[1] = 0.0;
+        cap_sum[0] = cap_sum[1] = 0.0;
         if (bwa_start(e) != 0) { fprintf(stderr, "FAIL[lat]: bwa_start: %s\n", bwa_last_error(e)); goto done; }
         char backend[96];
         snprintf(backend, sizeof backend, "%s", bwa_get_audio_backend(e));   /* read while the sink is open */
@@ -205,6 +215,10 @@ static int run_binaural_laterality(void) {
         printf("smoke[lat] %s: -x ident L=%.3g R=%.3g\n", backend, tap_sum[0], tap_sum[1]);
         if (!(tap_sum[1] > tap_sum[0] * 1.1)) {
             fprintf(stderr, "FAIL[lat]: a -x source must reach the RIGHT device channel at identity\n"); goto done;
+        }
+        printf("smoke[cap] bwa_set_output_capture: L=%.3g R=%.3g\n", cap_sum[0], cap_sum[1]);
+        if (!(cap_sum[0] > 0.0) || !(cap_sum[1] > cap_sum[0] * 1.1)) {   /* fired + carried the final stereo */
+            fprintf(stderr, "FAIL[cap]: bwa_set_output_capture must deliver the final binaural output (right-biased for a -x source)\n"); goto done;
         }
         bwa_set_listener_pose(e, 0.f, 1.5f, 0.f, 0.f, 1.f, 0.f, 0.f);   /* yaw 180: -x is now the LEFT */
         bwa_commit(e);

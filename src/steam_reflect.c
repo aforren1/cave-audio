@@ -44,6 +44,7 @@
 struct SteamReflect {
     IPLContext   ctx;            /* BORROWED from scene */
     IPLScene     scene_ipl;      /* BORROWED from scene */
+    SteamScene*  scene;          /* BORROWED: for the shared scene lock around RunReflections */
     RtCore*      rt;             /* for the listener pose */
     IPLSimulator sim;            /* OWNED: reflections-only simulator */
     IPLSource    bed;            /* OWNED + IMMORTAL: listener-centric bed source */
@@ -134,7 +135,9 @@ static DWORD WINAPI sim_thread(LPVOID arg) {
         iplSimulatorSetSharedInputs(r->sim, IPL_SIMULATIONFLAGS_REFLECTIONS, &sh);
 
         BWA_ZONE_BEGIN(zr, "reflection ray-trace");
+        steam_scene_ray_lock(r->scene);          /* shared: can't race an iplSceneCommit (a mover moved) */
         iplSimulatorRunReflections(r->sim);
+        steam_scene_ray_unlock(r->scene);
         BWA_ZONE_END(zr);
 
         IPLSimulationOutputs out; memset(&out, 0, sizeof out);
@@ -250,6 +253,7 @@ SteamReflect* steam_reflect_create(SteamScene* scene, RtCore* rt, const Layout* 
     atomic_store_explicit(&r->wet_gain, wet_gain, memory_order_relaxed);
     r->ctx       = (IPLContext)steam_scene_ipl_context(scene);
     r->scene_ipl = (IPLScene)steam_scene_ipl_scene(scene);
+    r->scene     = scene;                        /* for the shared scene lock on the sim thread */
     if (!r->ctx || !r->scene_ipl) { free(r); return NULL; }
     r->scene_type = (IPLSceneType)steam_scene_ipl_scenetype(scene);
     r->rt = rt; r->n = block; r->order = order; r->ambi_ch = (order + 1) * (order + 1);

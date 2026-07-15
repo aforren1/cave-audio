@@ -77,7 +77,8 @@ typedef enum { BWA_DECODE_SAMPLING = 0, BWA_DECODE_ALLRAD = 1 } bwa_bed_decoder;
  * tracking-only tools). bwa_get_audio_backend reports what actually opened; in binaural/both it
  * also names the monitor in use — "(steam HRTF monitor)" or "(simple-pan monitor)" — because the
  * HRTF decode falls back to the simple pan silently and a by-ear report needs to know which ran. */
-typedef enum { BWA_SINK_AUTO = 0, BWA_SINK_ASIO = 1, BWA_SINK_NULL = 2 } bwa_sink_type;
+typedef enum { BWA_SINK_AUTO = 0, BWA_SINK_ASIO = 1, BWA_SINK_NULL = 2,
+               BWA_SINK_MANUAL = 3 /* no device/thread — pump blocks yourself with bwa_render_block */ } bwa_sink_type;
 
 /* Engine configuration. Zero-init and set what you need — every field's zero is its default. */
 typedef struct {
@@ -271,9 +272,11 @@ BWA_API bwa_material bwa_material_preset(bwa_engine* e, bwa_material_type preset
 /* Mint a custom material: 3-band absorption + 3-band transmission (low/mid/high, each 0..1) and a
  * scattering coefficient (0..1). Returns the new token, or 0 if the material table is full. */
 BWA_API bwa_material bwa_material_define(bwa_engine* e, const float absorption[3], float scattering, const float transmission[3]);
-/* Set the occluding geometry (room space, RH metres; tris are CCW vertex-index triples) with
+/* Set the STATIC occluding geometry (room space, RH metres; tris are CCW vertex-index triples) with
  * PER-TRIANGLE materials: tri_material is ntris bwa_material tokens (one per triangle; out-of-range
- * clamps to the default). Load-time. No-op without the Steam Audio backend. */
+ * clamps to the default). Replaces any prior static mesh. Safe to call at runtime, but it rebuilds the
+ * whole scene BVH — for things that MOVE, use the dynamic-mesh API below (a cheap instance transform).
+ * No-op without the Steam Audio backend. */
 BWA_API void     bwa_scene_set_mesh_mat(bwa_engine* e, const float* verts, int nverts, const int* tris, int ntris,
                                       const bwa_material* tri_material);
 /* Convenience: a shoebox enclosure of size w x h x d metres, FLOOR-based — centred on the origin
@@ -281,6 +284,25 @@ BWA_API void     bwa_scene_set_mesh_mat(bwa_engine* e, const float* verts, int n
  * each a bwa_material token (0 = default). Triangle normals face inward (the listener is inside).
  * Load-time. No-op without the Steam Audio backend. */
 BWA_API void     bwa_scene_set_box(bwa_engine* e, float w, float h, float d, const bwa_material faces[6]);
+
+/* Dynamic (movable) occluders/reflectors — the acoustic analogue of a physics collider with a
+ * transform. The static mesh above is committed once (BVH built once); a dynamic mesh is a rigid
+ * INSTANCE of its own sub-scene, so moving it is a cheap top-level BVH refit, not a geometry rebuild.
+ * Occlusion and REAL-TIME reflections/pathing pick up the motion on their next sim tick (~10-30 Hz);
+ * BAKED reflections/pathing do NOT (the bake froze the geometry — see docs/materials.md).
+ *
+ * add: geometry is in the mover's LOCAL space (metres, CCW), placed by set_dynamic_transform; one
+ * `material` token covers every triangle. Returns a handle >= 0, or -1 (no SDK / bad geometry / the
+ * movable table is full — bwa_last_error distinguishes). Runtime- and load-time-safe. */
+BWA_API int      bwa_scene_add_dynamic_mesh(bwa_engine* e, const float* verts, int nverts, const int* tris, int ntris,
+                                          bwa_material material);
+/* Move/rotate a dynamic mesh (rigid: room-space position + orientation quaternion). Per-frame-safe;
+ * unknown/removed handles are ignored. No-op without the Steam Audio backend. */
+BWA_API void     bwa_scene_set_dynamic_transform(bwa_engine* e, int handle, float x, float y, float z,
+                                               float qx, float qy, float qz, float qw);
+/* Remove a dynamic mesh (frees its sub-scene). No-op without the Steam Audio backend. */
+BWA_API void     bwa_scene_remove_dynamic_mesh(bwa_engine* e, int handle);
+
 /* Enable per-source occlusion: geometry between the source and listener attenuates it (ramped).
  * Per-frame-safe. No-op without the Steam Audio backend. */
 BWA_API void     bwa_source_set_occlusion(bwa_engine* e, bwa_source s, bool on);
@@ -440,6 +462,32 @@ BWA_API uint32_t bwa_get_bus_levels(bwa_engine* e, float* peaks, uint32_t cap);
 /* Last block's ACTIVE voice count (playing, sound bound) — a voice-pool gauge for HUDs/health
  * monitoring next to the meters. Control thread, per-frame-safe; 0 until audio runs. */
 BWA_API uint32_t bwa_get_active_voices(bwa_engine* e);
+
+/* ---- output capture (recording / offline sanity + golden checks) ----
+ * Tap the FINAL device-bound output — post-limiter, exactly what reaches the device. The callback runs
+ * on the AUDIO thread, once per block, with PLANAR channel-major data: `planar[c*nframes + i]` is
+ * channel c, sample i. `channels` is the PRIMARY device's channel count — the array count
+ * (bwa_get_channel_count) for the 'cave' and 'both' profiles, 2 for 'binaural'. Obey the audio-thread
+ * rules: copy out only, no alloc/lock/syscall/file I/O (write to a ring your OWN thread drains to a
+ * file/buffer). Pass cb = NULL to stop; keep `user` alive until after the NULL set plus one block.
+ * Run the engine on the offline null sink (bwa_desc.sink = BWA_SINK_NULL) for a hardware-free,
+ * deterministically-paced render — the basis for golden-audio tests. Note: the async sim layers
+ * (Steam occlusion/reflection/pathing) are wall-clock-timed and NOT bit-reproducible, so golden
+ * comparisons want the synchronous DSP (or the manual occlusion path) — see docs/api.md. */
+typedef void (*bwa_output_fn)(void* user, const float* planar, uint32_t channels, uint32_t nframes);
+BWA_API void bwa_set_output_capture(bwa_engine* e, bwa_output_fn cb, void* user);
+
+/* ---- offline / deterministic render (bwa_desc.sink = BWA_SINK_MANUAL) ----
+ * With a MANUAL sink, no device or audio thread is created; YOU pump one block at a time on your own
+ * thread. Each call renders exactly one block (bwa_desc.block_size frames) of the profile's primary
+ * output — binaural: 2 ch; cave/both: bwa_get_channel_count() ch — into engine-owned memory and returns
+ * a pointer to it (PLANAR, `channels * nframes` floats, `p[c*nframes + i]`), valid until the next call
+ * or bwa_stop. Fills *channels / *nframes (either may be NULL). Returns NULL if the engine isn't started
+ * or the sink isn't MANUAL. The timestamp is a pure sample counter (no wall clock), so a fixed input +
+ * fixed call sequence renders bit-identically every run — the basis for golden-audio tests. Same caveat
+ * as bwa_set_output_capture: the async Steam sims aren't reproducible; keep golden renders on the
+ * synchronous DSP (or the manual occlusion path). Control thread. */
+BWA_API const float* bwa_render_block(bwa_engine* e, uint32_t* channels, uint32_t* nframes);
 
 /* ---- panner selection (load-time, or live: the switch is atomic) ----
  * The per-source panner that writes the speaker bus. DBAP (default) is listener-relative, recomputed

@@ -97,6 +97,7 @@ add_library(bw_audio SHARED
   src/engine.c
   src/sink.c
   src/null_sink.c
+  src/manual_sink.c
   $<TARGET_OBJECTS:bwa_core>
 )
 target_include_directories(bw_audio PUBLIC include PRIVATE src ${dr_libs_SOURCE_DIR} ${CJSON_INC})
@@ -261,8 +262,18 @@ if(BWA_BUILD_TESTS)
               $<TARGET_FILE:bw_audio> $<TARGET_FILE_DIR:test_smoke>)           # .dll next to the .exe
   endif()
 
+  # Deterministic end-to-end golden through the manual sink (bwa_render_block): links the real dll.
+  add_executable(test_golden test/golden_test.c)
+  target_link_libraries(test_golden PRIVATE bw_audio)
+  add_test(NAME golden COMMAND test_golden)
+  if(WIN32)
+    add_custom_command(TARGET test_golden POST_BUILD
+      COMMAND ${CMAKE_COMMAND} -E copy_if_different
+              $<TARGET_FILE:bw_audio> $<TARGET_FILE_DIR:test_golden>)
+  endif()
+
   # audio-loop check: drives the null sink directly (no core needed)
-  add_executable(test_audio_sink test/audio_sink_test.c src/sink.c src/null_sink.c)
+  add_executable(test_audio_sink test/audio_sink_test.c src/sink.c src/null_sink.c src/manual_sink.c)
   target_include_directories(test_audio_sink PRIVATE src)
   if(WIN32)
     target_link_libraries(test_audio_sink PRIVATE winmm)
@@ -374,6 +385,23 @@ if(BWA_BUILD_TESTS)
                 "${STEAMAUDIO_DIR}/lib/windows-x64/phonon.dll" $<TARGET_FILE_DIR:test_path>)
     endif()
     add_test(NAME path COMMAND test_path)
+
+    # Dynamic (instanced) occluder + shared-scene-lock: a movable wall added at runtime blocks the
+    # source when slid between it and the listener, clears when moved away/removed — while a reflect
+    # bed reads the same scene concurrently (pins Path B + blocker 1).
+    add_executable(test_dynmesh test/dynmesh_test.c src/steam_scene.c src/steam_reflect.c)
+    target_include_directories(test_dynmesh PRIVATE src "${STEAMAUDIO_DIR}/include")
+    target_link_libraries(test_dynmesh PRIVATE bwa_core "${STEAMAUDIO_DIR}/lib/windows-x64/phonon.lib")
+    target_compile_definitions(test_dynmesh PRIVATE BWA_HAVE_STEAMAUDIO)
+    if(MSVC)   # steam_reflect.c's seqlock uses C11 <stdatomic.h>
+      set_source_files_properties(src/steam_reflect.c PROPERTIES COMPILE_OPTIONS /experimental:c11atomics)
+    endif()
+    if(WIN32)
+      add_custom_command(TARGET test_dynmesh POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                "${STEAMAUDIO_DIR}/lib/windows-x64/phonon.dll" $<TARGET_FILE_DIR:test_dynmesh>)
+    endif()
+    add_test(NAME dynmesh COMMAND test_dynmesh)
 
     # HRTF decode (production monitor): the 26->stereo Steam Audio decode runs + preserves laterality.
     add_executable(test_steam_decode test/steam_decode_test.c src/steam_decode.c)

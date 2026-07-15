@@ -61,6 +61,10 @@ typedef struct {
     void        (*close)(bwa_sink*);
     const char* (*backend)(bwa_sink*);
     uint32_t    (*block_size)(bwa_sink*);   /* actual frames per callback (driver dictates for ASIO) */
+    /* MANUAL sink only (NULL on threaded backends): render ONE block synchronously on the CALLER's
+     * thread into the sink's own bus, returning a pointer to it (planar, *channels * *nframes floats)
+     * valid until the next call. This is the offline/deterministic render path (bwa_render_block). */
+    const float* (*render_block)(bwa_sink*, uint32_t* channels, uint32_t* nframes);
 } bwa_sink_vtbl;
 
 struct bwa_sink { const bwa_sink_vtbl* vt; };
@@ -79,10 +83,17 @@ void         bwa_sink_stop(bwa_sink* s);    /* stop the loop; safe if already st
 void         bwa_sink_close(bwa_sink* s);   /* stop (if needed) + release             */
 const char*  bwa_sink_backend(bwa_sink* s); /* e.g. "asio:DVS" or "null"              */
 uint32_t     bwa_sink_block_size(bwa_sink* s); /* actual frames per block; 0 if none  */
+/* Manual/offline: render one block synchronously (bwa_render_block). NULL unless this is a manual
+ * sink — threaded backends don't support caller-driven pumping. */
+const float* bwa_sink_render_block(bwa_sink* s, uint32_t* channels, uint32_t* nframes);
 
 /* Backend constructors used by bwa_sink_open. null is always present; asio only when
  * BWA_HAVE_ASIO is defined (third_party/asiosdk vendored — see third_party/README.md). */
 bwa_sink* bwa_null_sink_open(uint32_t sample_rate, uint32_t block_size, uint32_t channels,
+                          bwa_render_fn render, void* user, char* err, size_t errcap);
+/* Manual/offline sink: no thread — bwa_sink_render_block pumps blocks on the caller's thread with a
+ * DETERMINISTIC clock (sample_pos + nominal block time, no wall clock), so a render is reproducible. */
+bwa_sink* bwa_manual_sink_open(uint32_t sample_rate, uint32_t block_size, uint32_t channels,
                           bwa_render_fn render, void* user, char* err, size_t errcap);
 #ifdef BWA_HAVE_ASIO
 bwa_sink* bwa_asio_sink_open(uint32_t sample_rate, uint32_t block_size, uint32_t channels,

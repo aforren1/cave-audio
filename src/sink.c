@@ -16,6 +16,11 @@ bwa_sink* bwa_sink_open(uint32_t sample_rate, uint32_t block_size, uint32_t chan
     const int force_null = (sink_type == 2);   /* BWA_SINK_NULL */
     const int force_asio = (sink_type == 1);   /* BWA_SINK_ASIO */
 
+    /* BWA_SINK_MANUAL: no device, no thread — the caller pumps blocks (bwa_render_block). Bypasses all
+     * device probing; this is the offline/deterministic render path. */
+    if (sink_type == 3)
+        return bwa_manual_sink_open(sample_rate, block_size, channels, render, user, err, errcap);
+
     char asio_err[256] = {0};
 #ifdef BWA_HAVE_ASIO
     if (!force_null) {
@@ -61,3 +66,6 @@ void        bwa_sink_stop(bwa_sink* s)    { if (s) s->vt->stop(s); }
 void        bwa_sink_close(bwa_sink* s)   { if (s) s->vt->close(s); }
 const char* bwa_sink_backend(bwa_sink* s) { return s ? s->vt->backend(s) : "none"; }
 uint32_t    bwa_sink_block_size(bwa_sink* s) { return s ? s->vt->block_size(s) : 0; }
+const float* bwa_sink_render_block(bwa_sink* s, uint32_t* channels, uint32_t* nframes) {
+    return (s && s->vt->render_block) ? s->vt->render_block(s, channels, nframes) : NULL;
+}

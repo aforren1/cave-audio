@@ -25,6 +25,7 @@
 struct SteamPath {
     IPLContext   ctx;            /* BORROWED */
     IPLScene     scene_ipl;      /* BORROWED */
+    SteamScene*  scene;          /* BORROWED: for the shared scene lock around RunPathing */
     IPLSceneType scene_type;
     RtCore*      rt;
     IPLSimulator sim;            /* OWNED: pathing-only simulator */
@@ -102,7 +103,10 @@ static int run_get(SteamPath* sp, const float listener[3], int slot, float eq[3]
     cs_at(&sh_in.listener, listener);
     iplSimulatorSetSharedInputs(sp->sim, IPL_SIMULATIONFLAGS_PATHING, &sh_in);
 
+    steam_scene_ray_lock(sp->scene);             /* shared: RunPathing reads the scene BVH (direct-path
+                                                  * visibility) — can't race a dynamic-mesh iplSceneCommit */
     iplSimulatorRunPathing(sp->sim);
+    steam_scene_ray_unlock(sp->scene);
 
     IPLSimulationOutputs out; memset(&out,0,sizeof out);
     iplSourceGetOutputs(sp->srcs[slot].src, IPL_SIMULATIONFLAGS_PATHING, &out);
@@ -205,6 +209,7 @@ SteamPath* steam_path_create(SteamScene* scene, RtCore* rt, const Layout* L,
     if (!sp) return NULL;
     sp->ctx = (IPLContext)steam_scene_ipl_context(scene);
     sp->scene_ipl = (IPLScene)steam_scene_ipl_scene(scene);
+    sp->scene = scene;                           /* for the shared scene lock on the sim thread */
     sp->scene_type = (IPLSceneType)steam_scene_ipl_scenetype(scene);
     if (!sp->ctx || !sp->scene_ipl) { free(sp); return NULL; }
     sp->rt = rt; sp->n = block; sp->order = order; sp->ambi_ch = (order+1)*(order+1); sp->sample_rate = sample_rate;

@@ -428,6 +428,61 @@ namespace BwAudio
         /// after the per-speaker trims. NOT a spatial path (it bypasses the panner). gain 0 or Off silences.</summary>
         public void TestSignal(uint channel, BwaTestKind kind, float gain) { if (Ready) Bwa.bwa_set_test_signal(_eng, channel, kind, gain); }
 
+        // ---- dynamic (movable) acoustic geometry --------------------------------------------------
+        // Register a movable occluder/reflector from a LOW-POLY mesh (the acoustic analogue of a physics
+        // collider with a transform). The mesh is baked ONCE into room-handed local space — the object's
+        // SCALE plus the baseline X-flip, winding reversed to keep front faces; the registration ROTATION
+        // rides the per-frame quaternion (Room.Rot), so it is NOT baked here (see Room.cs). Position and
+        // rotation are pushed live via SetDynamicTransform, which only moves the instance transform (a
+        // cheap BVH refit), so occlusion + real-time reflections track it. Scale is captured here
+        // (rigid-body assumption); to rescale, remove and re-add. Returns a handle >= 0, or -1 (no SDK /
+        // bad mesh / table full). Call after the engine is Ready. Usually driven by DynamicAcousticGeometry.
+        public int AddDynamicMesh(Mesh mesh, Transform t, MaterialAsset material)
+        {
+            if (!Ready || mesh == null || t == null) return -1;
+            var ls = t.lossyScale;
+            var mv = mesh.vertices;
+            var verts = new float[mv.Length * 3];
+            for (int i = 0; i < mv.Length; i++)
+            {
+                verts[i * 3 + 0] = -(mv[i].x * ls.x);        // X-flip the scaled local vertex -> room handedness
+                verts[i * 3 + 1] =   mv[i].y * ls.y;
+                verts[i * 3 + 2] =   mv[i].z * ls.z;
+            }
+            // Winding flips iff the baked linear map (X-flip * scale) has negative determinant. Room's own
+            // helper computes exactly that sign (the object's rotation/translation don't change it).
+            bool reverse = Room.ReversesWinding(t.localToWorldMatrix);
+            var mt = mesh.triangles;
+            var tris = new int[mt.Length];
+            for (int i = 0; i < mt.Length; i += 3)
+            {
+                tris[i] = mt[i];
+                if (reverse) { tris[i + 1] = mt[i + 2]; tris[i + 2] = mt[i + 1]; }
+                else         { tris[i + 1] = mt[i + 1]; tris[i + 2] = mt[i + 2]; }
+            }
+            uint mat = material != null ? material.Resolve(_eng) : 0;
+            int h = Bwa.bwa_scene_add_dynamic_mesh(_eng, verts, mv.Length, tris, mt.Length / 3, mat);
+            if (h >= 0) SetDynamicTransform(h, t);           // place it at its current pose immediately
+            else Debug.LogWarning("[bw_audio] AddDynamicMesh failed: " + Bwa.LastError(_eng));
+            return h;
+        }
+
+        /// <summary>Push a dynamic mesh's live room-space pose (position + rotation). Per-frame-safe.</summary>
+        public void SetDynamicTransform(int handle, Transform t)
+        {
+            if (!Ready || handle < 0 || t == null) return;
+            var p = Room.Pos(t.position);
+            var q = Room.Rot(t.rotation);
+            Bwa.bwa_scene_set_dynamic_transform(_eng, handle, p.x, p.y, p.z, q.x, q.y, q.z, q.w);
+        }
+
+        /// <summary>Remove a dynamic mesh registered with AddDynamicMesh.</summary>
+        public void RemoveDynamicMesh(int handle)
+        {
+            if (!Ready || handle < 0) return;
+            Bwa.bwa_scene_remove_dynamic_mesh(_eng, handle);
+        }
+
         // ---- acoustic scene baking (load-time) ----------------------------------------------------
         // Collect every AcousticGeometry (+ the optional room box) into ONE mesh and hand it to the
         // engine. The engine's scene is a single static mesh, so this is a one-time bake before start.

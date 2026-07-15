@@ -199,6 +199,12 @@ namespace BwAudio
         [DllImport(DLL, CallingConvention = CC)] public static extern uint bwa_material_define(IntPtr e, float[] absorption, float scattering, float[] transmission);
         [DllImport(DLL, CallingConvention = CC)] public static extern void bwa_scene_set_mesh_mat(IntPtr e, float[] verts, int nverts, int[] tris, int ntris, uint[] triMaterial);
         [DllImport(DLL, CallingConvention = CC)] public static extern void bwa_scene_set_box(IntPtr e, float w, float h, float d, uint[] faces);
+        // Dynamic (movable) occluders/reflectors — an instanced sub-scene placed by a rigid transform, so
+        // moving it is a cheap BVH refit (physics-collider-with-a-transform). add returns a handle >= 0 or
+        // -1; geometry is in the mover's LOCAL space (room handedness), placed with set_dynamic_transform.
+        [DllImport(DLL, CallingConvention = CC)] public static extern int  bwa_scene_add_dynamic_mesh(IntPtr e, float[] verts, int nverts, int[] tris, int ntris, uint material);
+        [DllImport(DLL, CallingConvention = CC)] public static extern void bwa_scene_set_dynamic_transform(IntPtr e, int handle, float x, float y, float z, float qx, float qy, float qz, float qw);
+        [DllImport(DLL, CallingConvention = CC)] public static extern void bwa_scene_remove_dynamic_mesh(IntPtr e, int handle);
 
         // ---- occlusion (per-frame setters; readback any time) ----
         [DllImport(DLL, CallingConvention = CC)] public static extern void  bwa_source_set_occlusion(IntPtr e, uint s, [MarshalAs(UnmanagedType.I1)] bool on);

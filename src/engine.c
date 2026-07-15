@@ -105,7 +105,18 @@ struct bwa_engine {
      * resolved to per-triangle materials when a mesh is set. */
     struct { float absorption[3], scattering, transmission[3]; } materials[BWA_MAX_MATERIALS];
     uint32_t      num_materials;
+
+    /* output capture (bwa_set_output_capture): the audio thread reads these once per block. volatile +
+     * write-user-before-cb ordering (x64 store order) so a non-NULL cb is always seen with its user. */
+    bwa_output_fn volatile capture_cb;
+    void*         volatile capture_user;
 };
+
+/* audio thread: hand the final device-bound block to the capture callback, if one is set. */
+static inline void engine_capture(bwa_engine* e, const float* planar, uint32_t channels, uint32_t n) {
+    bwa_output_fn cb = e->capture_cb;
+    if (cb) cb(e->capture_user, planar, channels, n);
+}
 
 static void set_error(bwa_engine* e, const char* msg) {
     if (!e) return;
@@ -136,7 +147,9 @@ static bool push_guard(bwa_engine* e, bwa_source s, const char* msg) {
 
 /* cave: the 26-ch array goes straight to the device. */
 static void render_cave(void* user, float* dev, uint32_t n, const bwa_timestamp* ts) {
-    rt_render(((bwa_engine*)user)->rt, dev, n, ts);
+    bwa_engine* e = (bwa_engine*)user;
+    rt_render(e->rt, dev, n, ts);
+    engine_capture(e, dev, e->layout.count, n);          /* final array output (post-limiter) */
 }
 
 /* binaural: render the 26-ch array to scratch, then decode to the 2-ch device. The scratch is
@@ -156,6 +169,7 @@ static void render_binaural(void* user, float* dev2, uint32_t n, const bwa_times
     monitor_process(e->monitor, e->scratch26, p, q, dev2, n);
     if (bwa_null_sink_tap) bwa_null_sink_tap(dev2, 2, n);   /* test hook: observe the device-bound
                                                              * stereo on ANY sink (see null_sink.c) */
+    engine_capture(e, dev2, 2, n);                          /* public capture: the binaural headphone output */
     BWA_ZONE_END(zbin);
 }
 
@@ -164,6 +178,7 @@ static void render_binaural(void* user, float* dev2, uint32_t n, const bwa_times
 static void render_both_array(void* user, float* dev26, uint32_t n, const bwa_timestamp* ts) {
     bwa_engine* e = (bwa_engine*)user;
     rt_render(e->rt, dev26, n, ts);
+    engine_capture(e, dev26, e->layout.count, n);       /* primary output = the 26-ch array (post-limiter) */
     if (n != e->cap) return;                            /* off-spec block: skip the fixed-size monitor publish */
     LONG cur = e->mon_idx;                              /* producer is the sole writer of mon_idx */
     float p[3], q[4];
@@ -628,6 +643,18 @@ void     bwa_set_master_gain(bwa_engine* e, float linear)  { if (e) rt_set_maste
 void     bwa_set_paused(bwa_engine* e, bool paused)        { if (e) rt_set_all_paused(e->rt, paused); }
 uint32_t bwa_get_active_voices(bwa_engine* e)              { return e ? rt_active_voices(e->rt) : 0; }
 uint32_t bwa_get_channel_count(bwa_engine* e)                  { return e ? e->layout.count : 0; }
+void bwa_set_output_capture(bwa_engine* e, bwa_output_fn cb, void* user) {
+    if (!e) return;
+    e->capture_user = user;      /* publish user BEFORE cb: the audio thread gates on cb (x64 store order + */
+    e->capture_cb   = cb;        /* volatile), so a non-NULL cb is never seen with a stale/mismatched user */
+}
+const float* bwa_render_block(bwa_engine* e, uint32_t* channels, uint32_t* nframes) {
+    if (!e) return NULL;
+    if (!e->started) { set_error(e, "bwa_render_block: engine not started"); return NULL; }
+    const float* out = bwa_sink_render_block(e->sink, channels, nframes);   /* NULL unless a MANUAL sink */
+    if (!out) set_error(e, "bwa_render_block: requires bwa_desc.sink = BWA_SINK_MANUAL");
+    return out;
+}
 void bwa_source_fade_to (bwa_engine* e, bwa_source s, float gain, float seconds) { if (e) rt_source_fade_to(e->rt, s, gain, seconds, false); }
 void bwa_source_fade_out(bwa_engine* e, bwa_source s, float seconds)             { if (e) rt_source_fade_to(e->rt, s, 0.f, seconds, true); }
 void bwa_source_set_group(bwa_engine* e, bwa_source s, uint32_t group)  { if (e) rt_source_set_group(e->rt, s, group); }
@@ -721,15 +748,14 @@ void bwa_play_oneshot(bwa_engine* e, bwa_sound snd, float x, float y, float z, f
 /* ---- materials / occlusion (no-ops without the Steam Audio backend) ---- */
 
 #ifdef BWA_HAVE_STEAMAUDIO
-/* Geometry CAN change at runtime for occlusion: the occlusion sim owns the IPLScene and serializes
- * its commit + ray trace on its own single thread, so a mesh swap there is safe (the control thread
- * only hands it a pending buffer under a lock). It is locked only once the REFLECTION bed is running:
- * that sim shares the same IPLScene, and an iplSceneCommit cannot race its RunReflections (v1 has no
- * scene-swap handshake — the reflection IR assumes a static scene). */
+/* Geometry can change at runtime. The occlusion sim owns the IPLScene and serializes commits on its
+ * own thread; the borrowing reflection/pathing sims take the scene lock SHARED around their ray traces
+ * (steam_scene_ray_lock), so an iplSceneCommit can no longer race a RunReflections/RunPathing. The one
+ * caveat is BAKED reflections/pathing: the bake froze the geometry, so a runtime change won't move the
+ * baked reverb/paths (real-time reflections + occlusion track it fine). "Locked" now means only "no
+ * scene" (no SDK, or a failed create). */
 static int scene_locked(bwa_engine* e) {
-    if (!e || !e->scene) return 1;
-    if (e->reflect) { set_error(e, "scene geometry is locked while the reflection bed is running"); return 1; }
-    return 0;
+    return (!e || !e->scene);
 }
 #endif
 
@@ -830,6 +856,51 @@ void bwa_scene_set_box(bwa_engine* e, float w, float h, float d, const bwa_mater
         emit_inward(verts, ctr, tris, &n, a, c, dd); tri_mat[n-1] = m;
     }
     bwa_scene_set_mesh_mat(e, verts, 8, tris, 12, tri_mat);
+#endif
+}
+
+/* ---- dynamic (movable) occluders/reflectors (instanced meshes; SDK-gated no-ops otherwise) ---- */
+
+int bwa_scene_add_dynamic_mesh(bwa_engine* e, const float* verts, int nverts, const int* tris, int ntris,
+                               bwa_material material) {
+#ifdef BWA_HAVE_STEAMAUDIO
+    if (!e) return -1;
+    if (!e->scene) { set_error(e, "bwa_scene_add_dynamic_mesh: no scene (needs the Steam Audio backend)"); return -1; }
+    uint32_t m = material; if (m >= e->num_materials) m = 0;      /* out-of-range token -> default */
+    int h = steam_scene_add_dynamic_mesh(e->scene, verts, nverts, tris, ntris,
+                                         e->materials[m].absorption, e->materials[m].scattering, e->materials[m].transmission);
+    if (h < 0) set_error(e, "bwa_scene_add_dynamic_mesh: invalid geometry or the movable-mesh table is full");
+    return h;
+#else
+    (void)e; (void)verts; (void)nverts; (void)tris; (void)ntris; (void)material; return -1;
+#endif
+}
+
+void bwa_scene_set_dynamic_transform(bwa_engine* e, int handle, float x, float y, float z,
+                                     float qx, float qy, float qz, float qw) {
+#ifdef BWA_HAVE_STEAMAUDIO
+    if (!e || !e->scene) return;
+    /* rigid local-to-room affine: rotation from the (normalized) quaternion + translation, row-major
+     * to match phonon's IPLMatrix4x4. The Unity binding delivers room-space pos/quat (Room.Pos/Rot). */
+    float n = qx*qx + qy*qy + qz*qz + qw*qw, s = (n > 1e-12f) ? 2.0f / n : 0.0f;
+    float xs = qx*s, ys = qy*s, zs = qz*s;
+    float wx = qw*xs, wy = qw*ys, wz = qw*zs, xx = qx*xs, xy = qx*ys, xz = qx*zs, yy = qy*ys, yz = qy*zs, zz = qz*zs;
+    float m16[16] = {
+        1.f-(yy+zz), xy-wz,       xz+wy,       x,
+        xy+wz,       1.f-(xx+zz), yz-wx,       y,
+        xz-wy,       yz+wx,       1.f-(xx+yy), z,
+        0.f,         0.f,         0.f,         1.f };
+    steam_scene_set_dynamic_transform(e->scene, handle, m16);
+#else
+    (void)e; (void)handle; (void)x; (void)y; (void)z; (void)qx; (void)qy; (void)qz; (void)qw;
+#endif
+}
+
+void bwa_scene_remove_dynamic_mesh(bwa_engine* e, int handle) {
+#ifdef BWA_HAVE_STEAMAUDIO
+    if (e && e->scene) steam_scene_remove_dynamic_mesh(e->scene, handle);
+#else
+    (void)e; (void)handle;
 #endif
 }
 
