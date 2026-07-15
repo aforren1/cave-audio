@@ -22,7 +22,7 @@ namespace BwAudio
     public enum BwaTestKind : int { Off = 0, Sine = 1, Noise = 2 }
     public enum BwaPanner : int { Dbap = 0, Spcap = 1, Vbap = 2 }
     public enum BwaBedDecoder : int { Sampling = 0, Allrad = 1 }
-    public enum BwaSpreadMode : int { Lobe = 0, Mdap = 1 }
+    public enum BwaSpreadMode : int { Lobe = 0, Mdap = 1, Spectral = 2 }
     public enum BwaBedRenderer : int { Matrix = 0, Parametric = 1 }
 
     /// <summary>Mirrors bwa_material_type: the engine's built-in acoustic materials, in ABI order
@@ -122,6 +122,9 @@ namespace BwAudio
         [DllImport(DLL, CallingConvention = CC)] public static extern uint bwa_load_sound_streaming(IntPtr e, [MarshalAs(UnmanagedType.LPUTF8Str)] string path);
         [DllImport(DLL, CallingConvention = CC)] public static extern void bwa_unload_sound(IntPtr e, uint snd);
         [DllImport(DLL, CallingConvention = CC)] public static extern uint bwa_load_ambix(IntPtr e, [MarshalAs(UnmanagedType.LPUTF8Str)] string path);
+        // Legacy FuMa B-format (.amb and friends: WXYZ order, MaxN + the W -3 dB) — converted to AmbiX
+        // at load, so the returned asset is indistinguishable from bwa_load_ambix of the same field.
+        [DllImport(DLL, CallingConvention = CC)] public static extern uint bwa_load_fuma(IntPtr e, [MarshalAs(UnmanagedType.LPUTF8Str)] string path);
 
         // ---- sources (per-frame; non-blocking) ----
         [DllImport(DLL, CallingConvention = CC)] public static extern uint bwa_source_create(IntPtr e);
@@ -174,6 +177,12 @@ namespace BwAudio
         // the field from room +z toward room +x). Unity's yaw is the opposite sense — convert with
         // Room.YawRad, do not pass a Unity euler angle straight in. Glides (~1 turn/s), click-free.
         [DllImport(DLL, CallingConvention = CC)] public static extern void bwa_bed_set_rotation(IntPtr e, uint b, float yawRad);
+        // Full 3-axis orientation, RADIANS, ROOM frame (level or tilt a capture; supersedes set_rotation,
+        // which is the yaw shorthand and resets pitch/roll). Room senses: positive pitch tilts the field's
+        // front upward, positive roll tilts its top toward room -x (the room's right). Across the seam:
+        // yaw needs Room.YawRad (the X mirror reverses it); pitch and roll pass through with the SAME
+        // sense (front-up doesn't touch the mirrored axis, and Unity-right maps to room-right). Glided.
+        [DllImport(DLL, CallingConvention = CC)] public static extern void bwa_bed_set_orientation(IntPtr e, uint b, float yawRad, float pitchRad, float rollRad);
         [DllImport(DLL, CallingConvention = CC)] public static extern void bwa_bed_stop(IntPtr e, uint b);
         [DllImport(DLL, CallingConvention = CC)] public static extern void bwa_bed_destroy(IntPtr e, uint b);
         // same voice machinery as the bwa_source_* calls of the same name, bed-named (a bed IS a voice)
@@ -258,9 +267,15 @@ namespace BwAudio
         // SPCAP or VBAP (both fixed-observer sweet-spot panners).
         [DllImport(DLL, CallingConvention = CC)] public static extern void bwa_set_panner(IntPtr e, BwaPanner panner);
         [DllImport(DLL, CallingConvention = CC)] public static extern void bwa_set_dual_band(IntPtr e, [MarshalAs(UnmanagedType.I1)] bool on);
-        // How bwa_source_set_spread renders width (live A/B): LOBE (default, one reshaped solve) or MDAP
-        // (a ring of virtual sources panned with the selected panner — panner-true, ~13x the solve cost).
+        // How bwa_source_set_spread renders width (live A/B): LOBE (default, one reshaped solve), MDAP
+        // (a ring of virtual sources panned with the selected panner — panner-true, ~13x the solve cost),
+        // or SPECTRAL (frequency-dependent panning: 6 bands, each to its own direction in the cone — width
+        // with no coherent copies to collapse or comb-filter; the decorrelation alternative).
         [DllImport(DLL, CallingConvention = CC)] public static extern void bwa_set_spread_mode(IntPtr e, BwaSpreadMode mode);
+        // max-rE weighting for the SH->speaker BED decode (live A/B, crossfaded): tapers the high orders —
+        // fewer decode sidelobes, better localization away from the sweet spot. Reaches the bed matrix
+        // renderer and the FDN's line render; point-source panners and phonon's decodes are untouched.
+        [DllImport(DLL, CallingConvention = CC)] public static extern void bwa_set_max_re(IntPtr e, [MarshalAs(UnmanagedType.I1)] bool on);
         // Decorrelate the WIDE part of spread sources (live A/B): per-speaker velvet-noise filters make the
         // copies mutually incoherent — real extent, no phantom collapse or comb-filtering as the listener
         // walks. Point sources (spread 0) are untouched.

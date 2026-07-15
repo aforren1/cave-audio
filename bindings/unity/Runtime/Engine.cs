@@ -71,7 +71,9 @@ namespace BwAudio
                  "localisation for a near-centred listener. Sweet-spot dependent.")]
         public bool dualBand = false;
         [Tooltip("How a source's spread renders. LOBE: one reshaped solve (cheap, smooth). MDAP: a ring of " +
-                 "virtual sources panned with the selected panner (panner-true, ~13x the solve cost).")]
+                 "virtual sources panned with the selected panner (panner-true, ~13x the solve cost). " +
+                 "SPECTRAL: frequency-dependent panning — 6 bands, each from its own direction in the " +
+                 "cone; width with nothing to collapse or comb-filter (the decorrelation alternative).")]
         public BwaSpreadMode spreadMode = BwaSpreadMode.Lobe;
         [Tooltip("Feed a wide source's speakers mutually INCOHERENT signals (velvet-noise filters), so it " +
                  "doesn't collapse to phantom images or comb-filter as the listener walks. Point sources " +
@@ -91,6 +93,10 @@ namespace BwAudio
                  "part through the listener-relative panner — a recorded soundfield becomes WALKABLE " +
                  "(correct directions + parallax off-centre). Live: beds crossfade, so it A/Bs.")]
         public BwaBedRenderer bedRenderer = BwaBedRenderer.Matrix;
+        [Tooltip("max-rE weighting on the bed decode (and the FDN's render): tapers the high ambisonic " +
+                 "orders — fewer decode sidelobes, better localization AWAY from the sweet spot (the " +
+                 "walking-listener case), slightly wider main lobe. Live A/B, level-fair.")]
+        public bool maxRe = false;
 
         [Header("Early reflections (image-source; no SDK needed)")]
         [Tooltip("Level of the per-source wall bounces (opt a source in with Emitter.earlyReflections). " +
@@ -262,6 +268,7 @@ namespace BwAudio
             Bwa.bwa_set_decorrelation(_eng, decorrelation);
             Bwa.bwa_set_near_spread(_eng, nearSpreadRadius);
             Bwa.bwa_set_bed_renderer(_eng, bedRenderer);
+            Bwa.bwa_set_max_re(_eng, maxRe);
             Bwa.bwa_set_tracked_room_eq(_eng, trackedRoomEq);
             Bwa.bwa_set_master_gain(_eng, masterGain);
             Bwa.bwa_reflections_set_gain(_eng, reverbGain);   // valid pre-start: seeds whichever reverb bed bwa_start creates
@@ -298,6 +305,19 @@ namespace BwAudio
             if (_sounds.TryGetValue(key, out var s)) return s;
             s = Bwa.bwa_load_ambix(_eng, Path.Combine(Application.streamingAssetsPath, clip));
             if (s == 0) Debug.LogWarning("[bw_audio] ambix load failed: " + clip + " (" + Bwa.LastError(_eng) + ")");
+            _sounds[key] = s; return s;
+        }
+
+        /// <summary>Load a legacy FuMa B-format soundfield (.amb-style: WXYZ order, MaxN, W -3 dB) for a
+        /// world-locked bed (cached). Converted to AmbiX at load — past this call it IS an AmbiX asset.
+        /// Full 3D sets only (4/9/16 channels). Returns 0 on failure.</summary>
+        public uint LoadFuma(string clip)
+        {
+            if (!Ready) return 0;
+            var key = "fuma:" + clip;
+            if (_sounds.TryGetValue(key, out var s)) return s;
+            s = Bwa.bwa_load_fuma(_eng, Path.Combine(Application.streamingAssetsPath, clip));
+            if (s == 0) Debug.LogWarning("[bw_audio] fuma load failed: " + clip + " (" + Bwa.LastError(_eng) + ")");
             _sounds[key] = s; return s;
         }
 
@@ -357,6 +377,7 @@ namespace BwAudio
         public void SetDecorrelation(bool on)    { decorrelation = on; if (Ready) Bwa.bwa_set_decorrelation(_eng, on); }
         public void SetNearSpread(float radiusM) { nearSpreadRadius = radiusM; if (Ready) Bwa.bwa_set_near_spread(_eng, radiusM); }
         public void SetBedRenderer(BwaBedRenderer r) { bedRenderer = r; if (Ready) Bwa.bwa_set_bed_renderer(_eng, r); }
+        public void SetMaxRe(bool on)            { maxRe = on;        if (Ready) Bwa.bwa_set_max_re(_eng, on); }
         public void SetTrackedRoomEq(bool on)    { trackedRoomEq = on; if (Ready) Bwa.bwa_set_tracked_room_eq(_eng, on); }
         /// <summary>Lead the TRACKED pose by `ms` to hide motion-to-ears latency. Internal tracking only
         /// (Feed Listener off) — when Unity feeds the pose, predict on the Unity side instead.</summary>

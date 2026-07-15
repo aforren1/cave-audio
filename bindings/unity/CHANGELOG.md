@@ -4,6 +4,25 @@ All notable changes to `com.brainworks.bw_audio`.
 
 ## [Unreleased]
 
+### Added — parity with the engine's A/B round (max-rE · spectral spread · FuMa · bed orientation)
+
+- **`Engine.maxRe` / `SetMaxRe`** → `bwa_set_max_re`: max-rE weighting on the bed decode and the
+  FDN's render (live A/B, crossfaded, level-fair) — fewer decode sidelobes, better localization
+  away from the sweet spot. Sits under the *Diffuse beds* header; off by default like the engine.
+- **`BwaSpreadMode.Spectral`**: the third spread render — frequency-dependent panning (6 bands,
+  each from its own direction inside the cone; width with no coherent copies to collapse or
+  comb-filter — the decorrelation alternative). The existing `spreadMode` field/`SetSpreadMode`
+  pass it through unchanged.
+- **`Engine.LoadFuma`** + **`AmbisonicBed.fumaClip`** → `bwa_load_fuma`: legacy FuMa B-format
+  clips (WXYZ order, MaxN, the W −3 dB) convert to AmbiX at load — downstream they are AmbiX
+  assets, cached under a separate `fuma:` key so the same path can be loaded both ways.
+- **`AmbisonicBed.pitchDegrees` / `rollDegrees`** (+ `PitchDegrees`/`RollDegrees` properties) →
+  `bwa_bed_set_orientation`: level or tilt a capture, glided and click-free like yaw. Coordinate
+  seam: yaw still converts through `Room.YawRad` (the X mirror reverses its sense), while pitch
+  and roll pass through with the **same** sense — "front tilts up" never touches the mirrored
+  axis, and Unity-right maps to room-right. All orientation paths (inspector, properties,
+  enable) now go through one `ApplyOrientation()`.
+
 **Breaking** — the native ABI was reshaped for consistency (nothing had shipped against it, so no
 migration window): load-time configuration lives in config structs, live control lives in setters,
 one door per knob.
