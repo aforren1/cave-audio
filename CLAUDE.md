@@ -486,6 +486,7 @@ the production array render never uses HRTF.
 
 - `docs/architecture.md` — system overview, the bus seam, the full signal-flow diagram
   (every signal kind, source → device, with tap-order rationale), locked decisions + rationale.
+  `docs/signal-flow.md` is the same diagram as a rendered Mermaid graph (ASCII is canonical).
 - `docs/concurrency.md` — threading model, SPSC rings, commit snapshot, lifetimes. **Most load-bearing.**
 - `docs/api.md` — C ABI reference and per-call threading semantics.
 - `docs/spatialization.md` — DBAP, moving observer, binaural decode (3rd-order), speaker alignment.

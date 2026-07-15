@@ -71,7 +71,9 @@ stereo sink.
 The seam diagram above is the shape; this is the whole plumbing — every signal kind, in
 processing order. Side taps (`└→`) leave the chain at that point and land on one of the
 named buses; the main chain continues downward. Everything between the two rules runs on
-the audio thread inside one `rt_render` block.
+the audio thread inside one `rt_render` block. (The same diagram as a rendered Mermaid
+graph, with each stage annotated with the functions that implement and configure it:
+[`signal-flow.md`](signal-flow.md) — this ASCII version is canonical for structure.)
 
 ```
  control thread (bwa_*)                                off-thread producers
