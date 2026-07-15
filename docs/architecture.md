@@ -66,6 +66,97 @@ stereo sink.
      (cave)             (binaural debug)
 ```
 
+### The full render path
+
+The seam diagram above is the shape; this is the whole plumbing — every signal kind, in
+processing order. Side taps (`└→`) leave the chain at that point and land on one of the
+named buses; the main chain continues downward. Everything between the two rules runs on
+the audio thread inside one `rt_render` block.
+
+```
+ control thread (bwa_*)                                off-thread producers
+ ──────────────────────                                ────────────────────
+ wav/flac/mp3 → decode + resample → mono asset         NatNet → pose seqlock
+ AmbiX file ─────────────→ bed asset (4/9/16 ch)       scene sim (30 Hz, phonon):
+ FuMa file → reorder + rescale → the same bed asset      occlusion · transmission tilt ·
+ disk file → streaming thread → per-stream ring          directivity  (atomic publishes,
+ caller PCM → push API (caller is the ring producer)     handle-gated)
+                                                       path sim (10 Hz, phonon):
+ every bwa_* call → command ring (SPSC)                  per-voice shCoeffs + bending tilt
+ bwa_commit promotes pending → active (one snapshot)
+
+═ audio thread — rt_render, one block ═══════════════════════════════════════════════
+
+ drain commands · sample the tracked pose (+ prediction lead) — a move dirties every solve
+
+ MONO VOICE (mix_voice) — per sample                 gain solve — block rate, dirty-gated
+ ───────────────────────────────────                 ─────────────────────────────────────
+ read: pcm cursor · pitch resample · stream pull     panner DBAP/SPCAP/VBAP at the tracked
+ × pause/seek gate                                   listener, energy-meaned over extra
+ │ └→ s_raw → bending-loss EQ → × shCoeffs           listeners → spread render (LOBE ·
+ │            → PATH ACCUM (ambisonic)               MDAP ring · SPECTRAL 6-band targets;
+ transmission EQ (3 biquads — occlusion's tilt)      near-spread + metric-size floors) →
+ × occlusion level × directivity                     dual-band low derivation; × user gain
+ │ ├→ × wet send (× distance) → AUX (mono)           × group gain × timed fades
+ │ └→ ISM: per-voice ring → 6 shoebox mirror
+ │       images (frac delay · HF damp · per-
+ │       image panner gains) ──────────→ BUS
+ air-absorption LP → loudness shelf → Doppler ring
+ │ └→ decor split (× √spread) ─────────→ DECOR
+ pan: single gains · dual-band (700 Hz) ·
+      spectral (6 bands × 6 gain sets) ─→ BUS
+
+ BED VOICE (mix_bed) — per sample
+ ────────────────────────────────
+ SH frames → rotate (yaw phasor · full 3-axis Ivanic-Ruedenberg matrix; glided)
+ ├→ matrix render: × max-rE taper (crossfaded) → bed decode (SAD · AllRAD) ─→ BUS
+ └→ parametric render (crossfaded): FOA band split → DirAC direction + diffuseness ψ
+      direct  √(1−ψ)·W → listener-relative panner at the array shell ───────→ BUS
+      diffuse √ψ·FOA  → bed decode (raw) ───────────────────────────────────→ DECOR
+
+ after the voice loop
+ ────────────────────
+ DECOR → per-channel sparse velvet-noise filters (mutually incoherent copies) → BUS
+ AUX ──→ the ONE reverb tap → BUS:   Steam bed (convolve → ambisonic IR → phonon
+         decode)  ·or·  FDN (16 lines · Householder · 2-band decay · direction-
+         scaled · lines rendered as plane waves through the bed decode + max-rE pair)
+ PATH ACCUM → path tap: phonon's own ambisonics decode ───────────────────────→ BUS
+
+ output stage — everything that reaches a device passes through, in this order
+ ─────────────────────────────────────────────────────────────────────────────
+ × master gain (ramped)
+ align: per-speaker correction FIR · room-EQ biquads (re-aimed at the tracked pose) ·
+        gain trim · delay
+ + test signal (bwa_set_test_signal — a raw channel, deliberately post-align)
+ linked limiter (default −1 dBFS) → per-channel peak meters
+      │
+      ├ cave      26-ch ASIO ► DVS ► the array
+      ├ binaural  each bus channel = a virtual speaker at its room position →
+      │           3rd-order SH encode → phonon HRTF decode (simple-pan fallback) → 2 ch
+      ├ both      the array sink + the monitor on a second device (double-buffered)
+      └ null      no device: keeps rendering in real time, silent (tools' visual mode)
+```
+
+The tap ordering is deliberate, not incidental:
+
+- The **reverb send and the ISM images branch off before air absorption, loudness comp,
+  and Doppler** — those three model the *direct* path's propagation, and a reflection
+  travels its own path (the ISM applies its own delay/damping per image; the reverb bed
+  models the room's).
+- **Pathing taps `s_raw` before the occlusion EQ** — the indirect route goes *around* the
+  occluder, so it must not inherit the direct path's muffling; it takes its own
+  bending-loss tilt instead.
+- The **decorrelation split leaves right before panning** so the incoherent share carries
+  the full per-voice processing, and the velvet filters run once per *channel* (after the
+  voice loop), not per voice.
+- **max-rE weighting** lives where the engine's own SH→speaker decode renders bed signal
+  (the matrix renderer, the FDN's line render). The parametric analysis and its re-panned
+  direct stream see the raw field, and phonon's decodes (reflection bed, pathing, the
+  HRTF monitor) are its own.
+- **Master gain sits before align** so per-speaker trims stay calibrated; the **test
+  signal enters after align** so a wiring check is a raw channel, untouched by trims or
+  delays; the **limiter is last** so nothing — test signal included — can clip a driver.
+
 ### How wide is the bus?
 
 **The layout's speaker count.** `BWA_CHANNELS` (26, `src/sink.h`) is the compile-time
