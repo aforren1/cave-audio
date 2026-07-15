@@ -566,6 +566,7 @@ typedef enum { BWA_MAT_GENERIC = 0, BWA_MAT_BRICK, BWA_MAT_CONCRETE, BWA_MAT_CER
 bwa_material bwa_material_preset(bwa_engine* e, bwa_material_type preset);   // GENERIC = token 0
 bwa_material bwa_material_define(bwa_engine* e, const float absorption[3], float scattering,
                                            const float transmission[3]);
+void         bwa_material_release(bwa_engine* e, bwa_material token);        // free the slot for reuse
 void bwa_scene_set_mesh_mat(bwa_engine* e, const float* verts, int nverts, const int* tris, int ntris,
                            const bwa_material* tri_material);     // one token per triangle (STATIC world)
 void bwa_scene_set_box     (bwa_engine* e, float w, float h, float d, const bwa_material faces[6]); // -x,+x,-y,+y,-z,+z
@@ -583,8 +584,16 @@ published coefficients; `BWA_MAT_GENERIC` returns `0` without minting) or from c
 coefficients (clamped to `[0,1]`, NaN-sanitized). **Both paths return the same kind of token** —
 the enum only names the preset; custom materials are handles from the same table. The table is
 fixed at 64 entries; on overflow (or an out-of-range enum value) the mint returns `0` and sets
-`bwa_last_error`. Tokens are **not** generation-checked handles — they stay valid for the
-engine's life, and per-triangle indices out of range clamp to the default.
+`bwa_last_error`. Tokens are **not** generation-checked handles — they stay valid until you release
+them, and per-triangle indices out of range clamp to the default.
+
+Most apps **mint once and never release** — the table is a palette, not a per-object allocation. For a
+long-running app that churns many *distinct* materials over its lifetime, `bwa_material_release(token)`
+frees a slot so the next `bwa_material_define` reuses it (defines fill released slots before growing).
+It's **caller-managed, like `free()`**: only release a token no live mesh or source still references.
+Already-set meshes copied their material coefficients at set time, so they're unaffected; but a *future*
+`bwa_scene_set_mesh_mat` with a released token gets whatever the slot was reused for. Token `0` (the
+default) can't be released.
 
 Geometry rules:
 

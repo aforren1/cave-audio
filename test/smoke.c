@@ -238,6 +238,37 @@ done:
     return rc;
 }
 
+/* the material table's fill / release / reuse contract: define fills the 64-slot table, release frees a
+ * slot, and the NEXT define reuses that exact slot instead of overflowing — the churn escape hatch. */
+static int run_material_release(void) {
+    bwa_desc cfg; memset(&cfg, 0, sizeof cfg);
+    cfg.profile = BWA_PROFILE_CAVE; cfg.sample_rate = 48000; cfg.block_size = 256; cfg.sink = BWA_SINK_NULL;
+    bwa_engine* e = bwa_create(&cfg);
+    if (!e) { fprintf(stderr, "FAIL[mat]: bwa_create\n"); return 1; }
+    int rc = 1;
+    const float a[3] = { 0.1f, 0.1f, 0.1f }, t[3] = { 0.05f, 0.05f, 0.05f };
+
+    bwa_material tok[128]; int n = 0;
+    for (int i = 0; i < 128; ++i) { bwa_material m = bwa_material_define(e, a, 0.5f, t); if (m == 0) break; tok[n++] = m; }
+    /* slot 0 is the reserved default, so a 64-slot table mints 63 custom tokens, then it's full */
+    if (n != 63)                                  { fprintf(stderr, "FAIL[mat]: expected 63 tokens, got %d\n", n); goto done; }
+    if (bwa_material_define(e, a, 0.5f, t) != 0)  { fprintf(stderr, "FAIL[mat]: full table should return 0\n"); goto done; }
+
+    bwa_material freed = tok[20];
+    bwa_material_release(e, freed);
+    bwa_material reused = bwa_material_define(e, a, 0.5f, t);   /* must reuse the freed slot, not overflow */
+    if (reused != freed)                          { fprintf(stderr, "FAIL[mat]: reuse gave %u, expected the freed %u\n", reused, freed); goto done; }
+
+    bwa_material_release(e, 0);                    /* refused: token 0 is the default */
+    if (bwa_last_error(e) == NULL)                { fprintf(stderr, "FAIL[mat]: releasing token 0 must set an error\n"); goto done; }
+
+    printf("smoke[mat] 63 tokens, release+reuse hit slot %u, token-0 release refused\n", freed);
+    rc = 0;
+done:
+    bwa_destroy(e);
+    return rc;
+}
+
 int main(void) {
     if (run_profile(BWA_PROFILE_CAVE,     "cave"))     return 1;
     if (run_profile(BWA_PROFILE_BINAURAL, "binaural")) return 1;
@@ -245,6 +276,7 @@ int main(void) {
     if (run_room_eq_guard())                          return 1;
     if (run_push_guard())                             return 1;
     if (run_binaural_laterality())                    return 1;
-    printf("smoke OK (cave, binaural, both lifecycles; room_eq start guard; push kind guards; binaural laterality)\n");
+    if (run_material_release())                       return 1;
+    printf("smoke OK (cave, binaural, both lifecycles; room_eq start guard; push kind guards; binaural laterality; material release/reuse)\n");
     return 0;
 }

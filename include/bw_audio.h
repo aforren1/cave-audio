@@ -270,8 +270,16 @@ typedef enum {
  * is the same kind of handle bwa_material_define returns; the enum only names the preset. */
 BWA_API bwa_material bwa_material_preset(bwa_engine* e, bwa_material_type preset);
 /* Mint a custom material: 3-band absorption + 3-band transmission (low/mid/high, each 0..1) and a
- * scattering coefficient (0..1). Returns the new token, or 0 if the material table is full. */
+ * scattering coefficient (0..1). Returns the new token, reusing a released slot before growing the
+ * table; 0 if the (64-slot) table is full. */
 BWA_API bwa_material bwa_material_define(bwa_engine* e, const float absorption[3], float scattering, const float transmission[3]);
+/* Release a token so bwa_material_define can reuse its slot — the churn escape hatch for the fixed
+ * table (long-running apps that mint many distinct materials over their lifetime). CALLER-MANAGED,
+ * like free(): only release a token no live mesh or source still references. Meshes copy the material
+ * at set time, so already-set geometry is unaffected; a FUTURE bwa_scene_set_mesh_mat with a released
+ * token gets whatever the slot is reused for. Token 0 (the default) and out-of-range tokens are
+ * refused (bwa_last_error says which). Most apps mint once and never release — this is opt-in. */
+BWA_API void         bwa_material_release(bwa_engine* e, bwa_material token);
 /* Set the STATIC occluding geometry (room space, RH metres; tris are CCW vertex-index triples) with
  * PER-TRIANGLE materials: tri_material is ntris bwa_material tokens (one per triangle; out-of-range
  * clamps to the default). Replaces any prior static mesh. Safe to call at runtime, but it rebuilds the

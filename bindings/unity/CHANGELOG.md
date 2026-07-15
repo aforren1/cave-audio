@@ -4,6 +4,27 @@ All notable changes to `com.brainworks.bw_audio`.
 
 ## [Unreleased]
 
+### Added — multi-scene support
+
+- The `Engine` (a `DontDestroyOnLoad` singleton = the physical CAVE, not a level) now **follows Unity's
+  loaded scenes**: it subscribes to `SceneManager.sceneLoaded`/`sceneUnloaded` and re-bakes the static
+  `AcousticGeometry` whenever scenes change (deferred one frame so additive loads coalesce into a single
+  BVH rebuild; `sceneUnloaded` fires after teardown, so an unloaded scene's geometry drops naturally).
+  Made possible by the runtime-safe geometry work — no engine rebuild, no audio gap. Additive scenes
+  compose (a re-bake spans all loaded scenes); emitters were already per-scene via `OnEnable`/`OnDisable`.
+- **Persistent material cache** (`Engine.ResolveMaterial`): material tokens are minted into a fixed
+  64-slot engine table, so each `MaterialAsset`/preset is now minted **once** and reused across every
+  scene load. Re-minting per load (the old per-`SetupScene` cache, and `AddDynamicMesh`) would exhaust
+  the table in a multi-scene game — both now route through the shared cache.
+- **`Engine.ReleaseMaterial`** → `bwa_material_release`: frees a material's table slot for reuse and
+  evicts it from the cache (a later `ResolveMaterial` re-mints). Caller-managed — only release a
+  material no live mesh/occluder references. The mint-once cache covers the common case; this is the
+  escape hatch for apps that churn many *distinct* materials over a long session.
+- Recommended pattern: put the `Engine` in a **persistent bootstrap scene**, load levels on top
+  (single or additive). Sources, dynamic occluders, and static geometry all track the loaded scenes;
+  the reflection-bed *config* (IR/order, room box) and the speaker layout stay engine-level (rebuild
+  the engine only if those must change — rare for a fixed install).
+
 ### Added — dynamic (movable) acoustic geometry
 
 - **`DynamicAcousticGeometry`** component + **`Engine.AddDynamicMesh` / `SetDynamicTransform` /

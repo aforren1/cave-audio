@@ -197,6 +197,7 @@ namespace BwAudio
         // ---- materials / scene geometry (load time; needs the Steam Audio build) ----
         [DllImport(DLL, CallingConvention = CC)] public static extern uint bwa_material_preset(IntPtr e, BwaMaterialPreset preset);
         [DllImport(DLL, CallingConvention = CC)] public static extern uint bwa_material_define(IntPtr e, float[] absorption, float scattering, float[] transmission);
+        [DllImport(DLL, CallingConvention = CC)] public static extern void bwa_material_release(IntPtr e, uint token);
         [DllImport(DLL, CallingConvention = CC)] public static extern void bwa_scene_set_mesh_mat(IntPtr e, float[] verts, int nverts, int[] tris, int ntris, uint[] triMaterial);
         [DllImport(DLL, CallingConvention = CC)] public static extern void bwa_scene_set_box(IntPtr e, float w, float h, float d, uint[] faces);
         // Dynamic (movable) occluders/reflectors — an instanced sub-scene placed by a rigid transform, so

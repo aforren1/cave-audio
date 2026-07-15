@@ -102,8 +102,10 @@ struct bwa_engine {
     float         src_pos[BWA_VOICE_CAP][3];  /* control-side per-source positions, so set_pathing has the pos */
 
     /* material table (control-thread): token == index; [0] is the built-in default. Coefficients are
-     * resolved to per-triangle materials when a mesh is set. */
+     * resolved to per-triangle materials when a mesh is set. mat_free marks released slots (reusable by
+     * a later bwa_material_define); num_materials is the high-water mark of ever-allocated slots. */
     struct { float absorption[3], scattering, transmission[3]; } materials[BWA_MAX_MATERIALS];
+    uint8_t       mat_free[BWA_MAX_MATERIALS];   /* calloc'd 0 = in use; 1 = released, available for reuse */
     uint32_t      num_materials;
 
     /* output capture (bwa_set_output_capture): the audio thread reads these once per block. volatile +
@@ -768,11 +770,29 @@ static float clamp01(float x) { if (!(x >= 0.f)) return 0.f; return (x > 1.f) ? 
 bwa_material bwa_material_define(bwa_engine* e, const float absorption[3], float scattering, const float transmission[3]) {
     if (!e) return 0;
     if (!absorption || !transmission) { set_error(e, "bwa_material_define: NULL coefficients"); return 0; }
-    if (e->num_materials >= BWA_MAX_MATERIALS) { set_error(e, "bwa_material_define: material table full"); return 0; }
-    uint32_t i = e->num_materials++;
+    uint32_t i = 0; int found = 0;
+    for (uint32_t k = 1; k < e->num_materials; ++k)          /* reuse a released slot before growing (skip 0 = default) */
+        if (e->mat_free[k]) { i = k; found = 1; break; }
+    if (!found) {
+        if (e->num_materials >= BWA_MAX_MATERIALS) { set_error(e, "bwa_material_define: material table full"); return 0; }
+        i = e->num_materials++;
+    }
+    e->mat_free[i] = 0;
     for (int b = 0; b < 3; ++b) { e->materials[i].absorption[b] = clamp01(absorption[b]); e->materials[i].transmission[b] = clamp01(transmission[b]); }
     e->materials[i].scattering = clamp01(scattering);
     return (bwa_material)i;
+}
+
+/* Release a token so its slot can be reused. Caller-managed lifetime (like free()): only release a
+ * token no live mesh/source still references — already-set meshes copied the coefficients at set time,
+ * so they're unaffected, but a FUTURE mesh set with a released token gets whatever the slot is reused
+ * for. Token 0 (the built-in default) and out-of-range tokens are refused. */
+void bwa_material_release(bwa_engine* e, bwa_material token) {
+    if (!e) return;
+    uint32_t t = (uint32_t)token;
+    if (t == 0)                 { set_error(e, "bwa_material_release: token 0 is the built-in default (can't release)"); return; }
+    if (t >= e->num_materials)  { set_error(e, "bwa_material_release: token out of range"); return; }
+    e->mat_free[t] = 1;
 }
 
 bwa_material bwa_material_preset(bwa_engine* e, bwa_material_type preset) {

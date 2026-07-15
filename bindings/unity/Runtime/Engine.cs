@@ -6,6 +6,7 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 using UnityEngine;
+using UnityEngine.SceneManagement;
 
 namespace BwAudio
 {
@@ -158,6 +159,14 @@ namespace BwAudio
 
         readonly List<Emitter> _emitters = new();
         readonly Dictionary<string, uint> _sounds = new();
+        // Material tokens are minted into a FIXED 64-slot engine table and never freed, so mint each
+        // MaterialAsset / preset ONCE and reuse it across every scene load — re-minting per load leaks
+        // the table (multi-scene games hit this fast). The cache is engine-lifetime (assets are Project
+        // objects that survive scene unloads), unlike the old per-SetupScene-call cache.
+        readonly Dictionary<MaterialAsset, uint> _matCache = new();
+        readonly Dictionary<BwaMaterialPreset, uint> _presetCache = new();
+        bool _rebakeStatic;      // a scene loaded/unloaded: re-collect static AcousticGeometry next LateUpdate
+        bool _hasStaticMesh;     // whether a non-empty static mesh is currently pushed (so we know to clear it)
 
         void Awake()
         {
@@ -212,6 +221,10 @@ namespace BwAudio
 
             // Only claim the singleton once we have a live engine, so a failed init leaves Instance free.
             Instance = this; DontDestroyOnLoad(gameObject);
+            // Follow Unity's loaded scenes: re-bake the static acoustic geometry when one loads/unloads, so
+            // the persistent engine's scene tracks the (possibly additive) game scenes on top of it.
+            SceneManager.sceneLoaded   += OnSceneChanged;
+            SceneManager.sceneUnloaded += OnSceneChanged;
             Debug.Log($"[bw_audio] started, backend={Bwa.Backend(_eng)}, channels={_channels}");
 
             // Feeding the pose from Unity with nothing to feed it FROM is a silent no-op: the listener
@@ -321,9 +334,9 @@ namespace BwAudio
             _sounds[key] = s; return s;
         }
 
-        /// <summary>Mint one of the engine's built-in materials (load-time). The native call takes the
-        /// same enum (bwa_material_type) — this wrapper is just null-engine-safe.</summary>
-        public uint MaterialPreset(BwaMaterialPreset preset) => Ready ? Bwa.MaterialPreset(_eng, preset) : 0;
+        /// <summary>Mint one of the engine's built-in materials. Cached (minted once per preset), so
+        /// calling it per scene load is safe — null-engine-safe too.</summary>
+        public uint MaterialPreset(BwaMaterialPreset preset) => Ready ? ResolvePreset(preset) : 0;
 
         /// <summary>Reverb wet level (linear), adjustable live — the reverb-send equivalent.</summary>
         public float ReverbGain
@@ -460,7 +473,7 @@ namespace BwAudio
                 if (reverse) { tris[i + 1] = mt[i + 2]; tris[i + 2] = mt[i + 1]; }
                 else         { tris[i + 1] = mt[i + 1]; tris[i + 2] = mt[i + 2]; }
             }
-            uint mat = material != null ? material.Resolve(_eng) : 0;
+            uint mat = ResolveMaterial(material);          // cached: re-adding across scene loads won't leak the table
             int h = Bwa.bwa_scene_add_dynamic_mesh(_eng, verts, mv.Length, tris, mt.Length / 3, mat);
             if (h >= 0) SetDynamicTransform(h, t);           // place it at its current pose immediately
             else Debug.LogWarning("[bw_audio] AddDynamicMesh failed: " + Bwa.LastError(_eng));
@@ -483,49 +496,92 @@ namespace BwAudio
             Bwa.bwa_scene_remove_dynamic_mesh(_eng, handle);
         }
 
-        // ---- acoustic scene baking (load-time) ----------------------------------------------------
-        // Collect every AcousticGeometry (+ the optional room box) into ONE mesh and hand it to the
-        // engine. The engine's scene is a single static mesh, so this is a one-time bake before start.
+        // ---- acoustic scene baking (load-time bake + per-scene re-bake) ---------------------------
+        // Collect every AcousticGeometry (+ the optional room box) into ONE static mesh and hand it to
+        // the engine. Done once at start and again whenever a Unity scene loads/unloads (below), since
+        // bwa_scene_set_mesh_mat is now runtime-safe.
+        /// <summary>Mint a MaterialAsset once and reuse it for the engine's lifetime (across scene loads).
+        /// null -> the default material (token 0). Use this everywhere instead of MaterialAsset.Resolve so
+        /// repeated scene loads never exhaust the 64-slot material table.</summary>
+        public uint ResolveMaterial(MaterialAsset a)
+        {
+            if (a == null) return 0;
+            if (_matCache.TryGetValue(a, out var t)) return t;
+            t = a.Resolve(_eng); _matCache[a] = t; return t;
+        }
+        uint ResolvePreset(BwaMaterialPreset p)
+        {
+            if (_presetCache.TryGetValue(p, out var t)) return t;
+            t = Bwa.MaterialPreset(_eng, p); _presetCache[p] = t; return t;
+        }
+        /// <summary>Release a material minted via ResolveMaterial so the engine can reuse its table slot
+        /// (evicts the cache; a later ResolveMaterial re-mints). Caller-managed lifetime — only release a
+        /// material no live mesh or dynamic occluder still references. The mint-once cache handles the
+        /// common case; this is for apps that churn many distinct materials over a long session.</summary>
+        public void ReleaseMaterial(MaterialAsset a)
+        {
+            if (!Ready || a == null) return;
+            if (_matCache.TryGetValue(a, out var t)) { Bwa.bwa_material_release(_eng, t); _matCache.Remove(a); }
+        }
+
+        // Load-time (Awake) scene bake. The box-ONLY case uses the engine's own box helper, which also
+        // seeds the ISM early-reflection room — valid only before start, so it stays on this path. Any
+        // acoustic geometry goes through RebuildSceneMesh, which is runtime-safe and shared with the
+        // per-scene re-bake below.
         void SetupScene()
         {
-            // Sort mode None: we don't care about order (every geometry is baked into one mesh), and the
-            // default InstanceID sort is pure overhead. FindObjectsOfType, which sorted unconditionally,
-            // is deprecated.
             var geos = FindObjectsByType<AcousticGeometry>(FindObjectsSortMode.None);
             bool haveGeo = geos != null && geos.Length > 0;
-            if (!haveGeo && !enableRoomBox) return;
-
-            // simple path: just a box, nothing else -> the engine's own box helper (inward normals)
             if (!haveGeo && enableRoomBox)
             {
-                uint mb = Bwa.MaterialPreset(_eng, roomMaterial);
+                uint mb = ResolvePreset(roomMaterial);
                 var faces = new[] { mb, mb, mb, mb, mb, mb };
                 Bwa.bwa_scene_set_box(_eng, roomSizeMetres.x, roomSizeMetres.y, roomSizeMetres.z, faces);
+                _hasStaticMesh = true;
                 return;
             }
-
-            // combined path: geometry (+ optional box), all baked into one mesh
-            var verts = new List<float>(); var tris = new List<int>(); var triMat = new List<uint>();
-            var cache = new Dictionary<MaterialAsset, uint>();
-            uint Resolve(MaterialAsset a)
-            {
-                if (a == null) return 0;                       // default material
-                if (cache.TryGetValue(a, out var t)) return t; // mint each asset once
-                t = a.Resolve(_eng); cache[a] = t; return t;
-            }
-
-            if (enableRoomBox)
-                AddBox(verts, tris, triMat, roomSizeMetres, Bwa.MaterialPreset(_eng, roomMaterial));
-            foreach (var g in geos)
-            {
-                var mesh = g.ResolveMesh();
-                if (mesh == null) { Debug.LogWarning("[bw_audio] AcousticGeometry with no mesh: " + g.name); continue; }
-                AddMesh(verts, tris, triMat, mesh, g.transform.localToWorldMatrix, Resolve(g.material));
-            }
-            if (tris.Count == 0) return;
-            Bwa.bwa_scene_set_mesh_mat(_eng, verts.ToArray(), verts.Count / 3, tris.ToArray(), tris.Count / 3, triMat.ToArray());
-            Debug.Log($"[bw_audio] acoustic scene: {verts.Count / 3} verts, {tris.Count / 3} tris, {cache.Count} material(s)");
+            RebuildSceneMesh(geos);
         }
+
+        // Collect all currently-loaded AcousticGeometry (+ the optional box, baked as geometry) into ONE
+        // mesh and push it. Uses bwa_scene_set_mesh_mat only — runtime-safe (a BVH rebuild, fine on a
+        // scene transition), and it never touches bwa_scene_set_box's ISM path. Called at load time and
+        // on every scene load/unload so the acoustic scene follows Unity's loaded scenes (additive
+        // included: FindObjectsByType spans them all).
+        void RebuildSceneMesh(AcousticGeometry[] geos)
+        {
+            var verts = new List<float>(); var tris = new List<int>(); var triMat = new List<uint>();
+            if (enableRoomBox)
+                AddBox(verts, tris, triMat, roomSizeMetres, ResolvePreset(roomMaterial));
+            if (geos != null)
+                foreach (var g in geos)
+                {
+                    var mesh = g.ResolveMesh();
+                    if (mesh == null) { Debug.LogWarning("[bw_audio] AcousticGeometry with no mesh: " + g.name); continue; }
+                    AddMesh(verts, tris, triMat, mesh, g.transform.localToWorldMatrix, ResolveMaterial(g.material));
+                }
+            if (tris.Count == 0) { ClearStaticMesh(); return; }
+            Bwa.bwa_scene_set_mesh_mat(_eng, verts.ToArray(), verts.Count / 3, tris.ToArray(), tris.Count / 3, triMat.ToArray());
+            _hasStaticMesh = true;
+            Debug.Log($"[bw_audio] acoustic scene: {verts.Count / 3} verts, {tris.Count / 3} tris");
+        }
+
+        // Drop the prior scene's static geometry when nothing is loaded. bwa_scene_set_mesh_mat rejects
+        // an empty mesh, so replace it with a tiny degenerate triangle far outside the room (no ray
+        // reaches it). Only when a mesh is actually up, so an empty install pushes nothing.
+        void ClearStaticMesh()
+        {
+            if (!_hasStaticMesh) return;
+            var v = new[] { 1000f, 1000f, 1000f,  1000.02f, 1000f, 1000f,  1000f, 1000.02f, 1000f };
+            Bwa.bwa_scene_set_mesh_mat(_eng, v, 3, new[] { 0, 1, 2 }, 1, new uint[] { 0 });
+            _hasStaticMesh = false;
+        }
+
+        // A scene loaded/unloaded (sceneUnloaded fires AFTER its objects are destroyed, so a re-collect
+        // naturally drops them). Defer to LateUpdate so several additive loads in one frame coalesce into
+        // a single BVH rebuild.
+        void OnSceneChanged(Scene s, LoadSceneMode m) => _rebakeStatic = true;
+        void OnSceneChanged(Scene s)                  => _rebakeStatic = true;
 
         // Append a Unity mesh, transformed local -> world -> room space. Whether the winding must be
         // reversed to keep front faces depends on the SIGN of the full linear map's determinant (the
@@ -583,6 +639,11 @@ namespace BwAudio
         void LateUpdate()
         {
             if (!Ready) return;
+            if (_rebakeStatic)   // a scene loaded/unloaded since last frame -> re-collect static geometry once
+            {
+                _rebakeStatic = false;
+                RebuildSceneMesh(FindObjectsByType<AcousticGeometry>(FindObjectsSortMode.None));
+            }
             // Iterate a snapshot: an emitter's onFinished handler may disable it, which runs OnDisable ->
             // Unregister -> _emitters.Remove mid-loop. Mutating the list under a foreach would throw and
             // skip the commit. _pushBuf is cleared+refilled (no per-frame allocation after warmup).
@@ -716,6 +777,11 @@ namespace BwAudio
 
         void OnDestroy()
         {
+            if (Instance == this)   // only the live engine subscribed (after claiming Instance)
+            {
+                SceneManager.sceneLoaded   -= OnSceneChanged;
+                SceneManager.sceneUnloaded -= OnSceneChanged;
+            }
             if (!Ready) return;
             Bwa.bwa_stop(_eng); Bwa.bwa_destroy(_eng); _eng = IntPtr.Zero;
             if (Instance == this) Instance = null;
