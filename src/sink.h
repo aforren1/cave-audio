@@ -28,6 +28,16 @@
  * array loads into the same binary. Raising the cap is a recompile. */
 #define BWA_CHANNELS 26
 
+/* TEST HOOK (defined in null_sink.c, exported from the dll; deliberately not in bw_audio.h):
+ * when set, observers of the device-bound audio call it — the null sink hands it every block it
+ * would discard, and render_binaural hands it the monitor's stereo on ANY sink. It is the seam
+ * that lets a test (or a rig-side probe) see what actually goes to the device. Read your
+ * accumulators only once rendering has stopped; the hook runs on the sink's render thread. */
+#ifdef BWA_BUILD_DLL
+__declspec(dllexport)
+#endif
+extern void (*bwa_null_sink_tap)(const float* bus, uint32_t channels, uint32_t block_size);
+
 /* Hardware-anchored timestamp captured at the top of each block. Mirrors what ASIO
  * delivers via ASIOTime (sample position + nanosecond systemTime); the null sink
  * synthesizes it from QueryPerformanceCounter. */

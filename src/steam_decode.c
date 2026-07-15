@@ -16,10 +16,13 @@
  *  - CONVENTION 3 (orientation): phonon is right-handed x=right/y=up/-z=ahead; its world axes are
  *    the room frame. The room's HEAD convention is identity-faces-+z (Motive default), handled in
  *    head_basis (ahead=q*+z, right=q*-x).
- *  - CONVENTION 2b (m<0 sign): the real-SH m<0 channels (ACN 1,4,5,9,10,11) needed NEGATING to match
- *    phonon's decode (sh_encode below). test_ambi only checked m>=0 (W, front, the zonal/cosine l=2
- *    terms), so this was invisible until the HRTF decode was exercised — it inverted left/right.
- *    test_steam_decode now drives the decode and confirms right->right ear, left->left, 180-flip.
+ *  - CONVENTION 2b (m<0 sign): NO fix-up — phonon's real-SH m<0 convention MATCHES this encode
+ *    (the xval golden pins ambi_encode_sn3d against phonon's own SH table, sin harmonics included).
+ *    A negation of ACN 1,4,5,9,10,11 lived here briefly, added to satisfy a laterality test that
+ *    drove the decode with DC: the default HRTF's per-ear DC gains are laterally OPPOSITE its
+ *    audible ILD, so the DC assertion passed exactly when the field was mirrored — it inverted
+ *    left/right for all real audio and was caught by ear at the rig. THE LESSON: a laterality
+ *    check must drive a tone in the hearing band, never DC (test_steam_decode uses 660 Hz).
  *  Still pending: HRTF *quality* (timbre / externalization / front-back / elevation) is unverified by
  *  ear — the smoke test covers gross laterality only.
  */
@@ -59,19 +62,14 @@ static void room_to_ambi_dir(const float r[3], float a[3]) {
  * audio_buffer.h "N3D is used internally for everything"). Scale the SN3D encode per ACN channel by
  * ambi_phonon_scale = sqrt(2l+1)/sqrt(4pi); test_ambi verifies the product against phonon's
  * hardcoded SH constants. (Deriving the matrix from iplAmbisonicsEncodeEffect is an equivalent path.) */
-/* ACN channels with m<0 (the sin / "left-right" real harmonics) for order 3: l1 m-1; l2 m-2,-1;
- * l3 m-3,-2,-1. phonon's real-SH m<0 sign is opposite to this encode's (ambi_test only ever verified
- * the m>=0 channels against phonon — W, front, the zonal/cosine l2 terms — so the m<0 mismatch was
- * invisible until the HRTF decode was exercised: it inverted L/R and skewed the inter-channel energy).
- * Negating these brings the engine's encode into phonon's decode convention. */
-static const int SH_M_NEG[] = { 1, 4, 5, 9, 10, 11 };
-
+/* No m<0 sign fix-up: phonon's real-SH convention matches ambi_encode_sn3d for ALL channels (the
+ * xval golden pins the encode against phonon's own SH table, sin harmonics included). See the
+ * CONVENTION 2b note above for the history — a DC-driven test once argued otherwise, wrongly. */
 static void sh_encode(const float room_dir[3], float y[BWA_AMBI_CH]) {
     float a[3];
     room_to_ambi_dir(room_dir, a);
     ambi_encode_sn3d(a, y);                                          /* SN3D, AmbiX axes */
     for (int k = 0; k < BWA_AMBI_CH; ++k) y[k] *= ambi_phonon_scale[k];  /* -> phonon orthonormal SH */
-    for (size_t i = 0; i < sizeof SH_M_NEG / sizeof *SH_M_NEG; ++i) y[SH_M_NEG[i]] = -y[SH_M_NEG[i]];
 }
 
 /* CONVENTION 3 — head orientation frame. phonon is right-handed x=right/y=up/-z=ahead (C API

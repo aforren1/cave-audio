@@ -7,6 +7,7 @@
  */
 #include "bw_audio.h"
 
+#include <math.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -158,12 +159,78 @@ done:
     return rc;
 }
 
+/* binaural laterality through the REAL dll, end to end: bwa_create's own construction (layout,
+ * monitor at the sink block size), render_binaural on the sink thread, whichever monitor the build
+ * carries (steam HRTF or simple-pan — same convention either way). The null sink's test tap
+ * observes the device-bound stereo the sink otherwise discards. The room frame is RH, +y up,
+ * +z ahead: the identity listener's RIGHT ear is at -x (bw_audio.h BWA_ROOM_RIGHT), so a source
+ * at (-1.5, 1.5, 0) must reach device channel 1 (R) — and channel 0 (L) after a 180-degree turn. */
+__declspec(dllimport) extern void (*bwa_null_sink_tap)(const float* bus, unsigned channels, unsigned block_size);
+static double tap_sum[2];
+static void stereo_tap(const float* bus, unsigned channels, unsigned n) {
+    if (channels != 2) return;
+    for (unsigned i = 0; i < n; ++i) { tap_sum[0] += fabs(bus[i]); tap_sum[1] += fabs(bus[n + i]); }
+}
+static int run_binaural_laterality(void) {
+    bwa_desc cfg = {
+        .profile     = BWA_PROFILE_BINAURAL,
+        .sample_rate = 48000,
+        .block_size  = 256,
+        .sink        = BWA_SINK_NULL,
+    };
+    int rc = 1;
+    bwa_engine* e = bwa_create(&cfg);
+    if (!e) { fprintf(stderr, "FAIL[lat]: bwa_create returned NULL\n"); return 1; }
+    {
+        bwa_source s = bwa_source_create_stream(e);
+        if (!s) { fprintf(stderr, "FAIL[lat]: create_stream: %s\n", bwa_last_error(e)); goto done; }
+        /* a TONE, never DC: the HRTF's per-ear DC gains are laterally opposite its audible ILD, so a
+         * DC-driven laterality check passes exactly when the image is MIRRORED (steam_decode.c 2b) */
+        float blk[4096];
+        for (int k = 0; k < 16; ++k) {
+            for (int i = 0; i < 4096; ++i)
+                blk[i] = 0.25f * sinf(6.2831853f * 660.0f * (float)(k * 4096 + i) / 48000.0f);
+            bwa_source_push(e, s, blk, 4096);                            /* ~1.4 s of signal */
+        }
+        bwa_source_set_pos(e, s, -1.5f, 1.5f, 0.0f);        /* the identity listener's RIGHT (-x) */
+        bwa_set_listener_pose(e, 0.f, 1.5f, 0.f, 0.f, 0.f, 0.f, 1.f);
+        bwa_commit(e);
+        bwa_null_sink_tap = stereo_tap;
+        tap_sum[0] = tap_sum[1] = 0.0;
+        if (bwa_start(e) != 0) { fprintf(stderr, "FAIL[lat]: bwa_start: %s\n", bwa_last_error(e)); goto done; }
+        char backend[96];
+        snprintf(backend, sizeof backend, "%s", bwa_get_audio_backend(e));   /* read while the sink is open */
+        Sleep(400);
+        bwa_stop(e);                                        /* sink thread joined: tap_sum is safe to read */
+        printf("smoke[lat] %s: -x ident L=%.3g R=%.3g\n", backend, tap_sum[0], tap_sum[1]);
+        if (!(tap_sum[1] > tap_sum[0] * 1.1)) {
+            fprintf(stderr, "FAIL[lat]: a -x source must reach the RIGHT device channel at identity\n"); goto done;
+        }
+        bwa_set_listener_pose(e, 0.f, 1.5f, 0.f, 0.f, 1.f, 0.f, 0.f);   /* yaw 180: -x is now the LEFT */
+        bwa_commit(e);
+        tap_sum[0] = tap_sum[1] = 0.0;
+        if (bwa_start(e) != 0) { fprintf(stderr, "FAIL[lat]: restart: %s\n", bwa_last_error(e)); goto done; }
+        Sleep(400);
+        bwa_stop(e);
+        printf("smoke[lat] yaw180: L=%.3g R=%.3g\n", tap_sum[0], tap_sum[1]);
+        if (!(tap_sum[0] > tap_sum[1] * 1.1)) {
+            fprintf(stderr, "FAIL[lat]: after a 180-degree turn the -x source must reach the LEFT channel\n"); goto done;
+        }
+    }
+    rc = 0;
+done:
+    bwa_null_sink_tap = NULL;
+    bwa_destroy(e);
+    return rc;
+}
+
 int main(void) {
     if (run_profile(BWA_PROFILE_CAVE,     "cave"))     return 1;
     if (run_profile(BWA_PROFILE_BINAURAL, "binaural")) return 1;
     if (run_profile(BWA_PROFILE_BOTH,     "both"))     return 1;
     if (run_room_eq_guard())                          return 1;
     if (run_push_guard())                             return 1;
-    printf("smoke OK (cave, binaural, both lifecycles; room_eq start guard; push kind guards)\n");
+    if (run_binaural_laterality())                    return 1;
+    printf("smoke OK (cave, binaural, both lifecycles; room_eq start guard; push kind guards; binaural laterality)\n");
     return 0;
 }

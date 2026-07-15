@@ -23,6 +23,7 @@
 #include "fdn.h"
 #include "ism.h"
 
+#include <stdio.h>          /* snprintf (the backend readback string) */
 #include <stdlib.h>
 #include <string.h>
 
@@ -67,6 +68,7 @@ struct bwa_engine {
     int         started;
     const char* last_error;        /* points at errbuf or a literal; NULL when clean */
     char        errbuf[256];
+    char        backend_buf[96];   /* bwa_get_audio_backend readback (device + which monitor is live) */
     bwa_profile   profile;
     int         panner;            /* mirror of bwa_set_panner (bwa_panner; 0 = DBAP) for the room_eq start guard */
 
@@ -147,9 +149,12 @@ static void render_binaural(void* user, float* dev2, uint32_t n, const bwa_times
     rt_get_listener(e->rt, p, q);
     BWA_ZONE_BEGIN(zbin, "binaural decode");                /* 26 virtual speakers -> HRTF -> 2 ch */
 #ifdef BWA_HAVE_STEAMAUDIO
-    if (e->steam) { steam_monitor_process(e->steam, e->scratch26, p, q, dev2, n); BWA_ZONE_END(zbin); return; }
+    if (e->steam) { steam_monitor_process(e->steam, e->scratch26, p, q, dev2, n); }
+    else
 #endif
     monitor_process(e->monitor, e->scratch26, p, q, dev2, n);
+    if (bwa_null_sink_tap) bwa_null_sink_tap(dev2, 2, n);   /* test hook: observe the device-bound
+                                                             * stereo on ANY sink (see null_sink.c) */
     BWA_ZONE_END(zbin);
 }
 
@@ -451,7 +456,15 @@ const char* bwa_last_error(bwa_engine* e) {
 
 const char* bwa_get_audio_backend(bwa_engine* e) {
     if (!e || !e->sink) return "none";
-    return bwa_sink_backend(e->sink);   /* binaural/both: the primary (headphone/array) device */
+    if (e->profile == BWA_PROFILE_BINAURAL || e->profile == BWA_PROFILE_BOTH) {
+        /* name the monitor too: the HRTF decode falls back to the simple-pan monitor SILENTLY
+         * (steam_monitor_create is non-fatal), and a by-ear report is meaningless without knowing
+         * which of the two actually rendered it */
+        snprintf(e->backend_buf, sizeof e->backend_buf, "%s (%s monitor)", bwa_sink_backend(e->sink),
+                 e->steam ? "steam HRTF" : "simple-pan");
+        return e->backend_buf;
+    }
+    return bwa_sink_backend(e->sink);   /* cave: the array device */
 }
 
 /* ---- assets ---- */

@@ -111,7 +111,7 @@ namespace BwAudio
         [DllImport(DLL, CallingConvention = CC)] public static extern BwaResult bwa_stop(IntPtr e);
         [DllImport(DLL, CallingConvention = CC)] public static extern void   bwa_destroy(IntPtr e);
         [DllImport(DLL, CallingConvention = CC)] public static extern IntPtr bwa_last_error(IntPtr e);     // PtrToStringUTF8; null = none
-        [DllImport(DLL, CallingConvention = CC)] public static extern IntPtr bwa_get_audio_backend(IntPtr e);  // "asio:<drv>" / "null" / "none"
+        [DllImport(DLL, CallingConvention = CC)] public static extern IntPtr bwa_get_audio_backend(IntPtr e);  // "asio:<drv>" / "null" / "none"; binaural/both append "(steam HRTF|simple-pan monitor)"
 
         // ---- internal tracking (OptiTrack/NatNet; may block — lifecycle-class, not per-frame) ----
         [DllImport(DLL, CallingConvention = CC)] public static extern BwaResult bwa_tracker_connect(IntPtr e, in BwaTrackerDesc desc);

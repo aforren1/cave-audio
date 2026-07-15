@@ -72,7 +72,9 @@ typedef enum { BWA_DECODE_SAMPLING = 0, BWA_DECODE_ALLRAD = 1 } bwa_bed_decoder;
  * — the engine keeps rendering with no device (the tools' visual-only mode). ASIO is an explicit
  * demand: an open failure fails bwa_start loudly instead of hiding behind silence (production, or
  * a speaker audition that must reach real speakers). NULL forces the offline sink (CI, profiling,
- * tracking-only tools). bwa_get_audio_backend reports what actually opened. */
+ * tracking-only tools). bwa_get_audio_backend reports what actually opened; in binaural/both it
+ * also names the monitor in use — "(steam HRTF monitor)" or "(simple-pan monitor)" — because the
+ * HRTF decode falls back to the simple pan silently and a by-ear report needs to know which ran. */
 typedef enum { BWA_SINK_AUTO = 0, BWA_SINK_ASIO = 1, BWA_SINK_NULL = 2 } bwa_sink_type;
 
 /* Engine configuration. Zero-init and set what you need — every field's zero is its default. */

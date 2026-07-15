@@ -27,6 +27,11 @@ typedef struct {
     volatile LONG stop_flag;
 } NullSink;
 
+/* TEST HOOK — declared in sink.h (exported from the dll there), deliberately not in bw_audio.h:
+ * lets a test observe the blocks this sink otherwise discards, i.e. see a profile's device-bound
+ * output off-hardware (the smoke test uses it to pin binaural laterality through the REAL dll). */
+void (*bwa_null_sink_tap)(const float* bus, uint32_t channels, uint32_t block_size) = NULL;
+
 static uint64_t qpc_now(void) {
     LARGE_INTEGER c; QueryPerformanceCounter(&c);
     return (uint64_t)c.QuadPart;
@@ -59,6 +64,7 @@ static DWORD WINAPI null_thread(LPVOID arg) {
         };
         BWA_ZONE_BEGIN(zb, "null block");
         s->render(s->user, s->bus, s->block_size, &ts);   /* engine produces a block */
+        if (bwa_null_sink_tap) bwa_null_sink_tap(s->bus, s->channels, s->block_size);
         /* null sink: the rendered bus is intentionally discarded. */
         BWA_ZONE_END(zb);
         BWA_FRAME_MARK();

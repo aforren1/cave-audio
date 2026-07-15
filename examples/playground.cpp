@@ -875,7 +875,9 @@ static void register_tests(ImGuiTestEngine* te) {
      * time, output meters flowing. A dead engine here once shipped as "visual-only mode". */
     t = IM_REGISTER_TEST(te, "viewer", "meters_live");
     t->TestFunc = [](ImGuiTestContext* ctx) {
-        IM_CHECK_STR_EQ(backend_name, "null");      /* fallback engaged; NOT "none" (dead engine) */
+        /* fallback engaged; NOT "none" (dead engine). Prefix match: binaural appends the live
+         * monitor kind — "null (steam HRTF monitor)" / "null (simple-pan monitor)". */
+        IM_CHECK(strncmp(backend_name, "null", 4) == 0);
         uint32_t n = 0;
         float m = 0.0f;
         for (int tries = 0; tries < 60 && m <= 1e-6f; ++tries) { ctx->Yield(4); m = meters_max(&n); }

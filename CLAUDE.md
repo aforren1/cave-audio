@@ -136,9 +136,13 @@ tool, not a spatial path. The **production Steam Audio HRTF decode** is built + 
 `ambisonics.c` (3rd-order encode) → `steam_decode.c` (phonon `iplAmbisonicsDecodeEffect`), gated
 `BWA_HAVE_STEAMAUDIO` (phonon built from the `third_party/steam-audio-source` submodule, staged in `steam-audio-artifacts/`; see
 third_party/README.md), with the simple-pan monitor as the no-SDK fallback. The `steam_decode` test
-drives the 26→stereo decode and asserts gross laterality (right→right ear, left→left, 180° flips) —
-which caught a real bug: the encode's real-SH m<0 channels (ACN 1,4,5,9,10,11) had phonon's opposite
-sign, inverting left/right; `test_ambi` only checked m≥0 so it was invisible until the decode ran.
+drives the 26→stereo decode with a **660 Hz tone** and asserts gross laterality (right→right ear,
+left→left, 180° flips) — the tone matters: an earlier DC-driven version of this assertion had
+INVERTED polarity (the default HRTF's per-ear DC gains are laterally opposite its audible ILD), which
+mis-diagnosed a correct encode and shipped an m<0 sign "fix" that mirrored left/right for all real
+audio; only a by-ear report caught it. Laterality checks must never drive DC. The full-dll laterality
+check in `smoke` (null-sink tap, `sink.h`) pins the same thing end-to-end, and `xval` pins the SH
+encode against phonon's own table (m<0 rows included — trust it over any single-path test).
 HRTF *quality* (timbre/externalization/front-back) is still the by-ear check. **Materials: occlusion +
 per-band transmission EQ + source directivity are implemented** (`steam_scene.c`, same gate): a third
 "simulation thread" owns an `IPLScene` + mesh + `IPLSimulator`, ray-traces volumetric occlusion +

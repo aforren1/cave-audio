@@ -31,7 +31,11 @@ static double e_right(void) { double e = 0; for (uint32_t i = 0; i < N; ++i) e +
 static void decode_channel(SteamMonitor* m, int ch, const float q[4]) {
     const float p[3] = { 0, 1.5f, 0 };   /* the default grid's ear point (floor origin) */
     memset(bus, 0, sizeof(float) * (size_t)BWA_CHANNELS * N);
-    for (uint32_t i = 0; i < N; ++i) bus[(size_t)ch * N + i] = 1.0f;
+    /* Drive a TONE in the hearing band, never DC: the default HRTF's per-ear DC gains are laterally
+     * OPPOSITE its audible ILD, so a DC-driven laterality assertion passes exactly when the field is
+     * mirrored (that trap shipped a mirrored decode once — see steam_decode.c CONVENTION 2b). */
+    for (uint32_t i = 0; i < N; ++i)
+        bus[(size_t)ch * N + i] = sinf(6.2831853f * 660.0f * (float)i / 48000.0f);
     /* phonon crossfades an orientation CHANGE across one block (AmbisonicsRotateEffect keeps the
      * previous rotation and interpolates), so the first block after a new q is a smear of old and
      * new. Render twice and measure the settled block. (The old head convention masked this: its
@@ -95,7 +99,8 @@ int main(void) {
             uint32_t h = rt_source_create_stream(c, perr, sizeof perr);
             CHECK(h != 0, "live: push source");
             float* blk = (float*)malloc(sizeof(float) * 4 * N);
-            for (uint32_t i = 0; i < 4 * N; ++i) blk[i] = 0.5f;
+            for (uint32_t i = 0; i < 4 * N; ++i)   /* a tone, not DC (see decode_channel) */
+                blk[i] = 0.5f * sinf(6.2831853f * 660.0f * (float)i / 48000.0f);
             rt_source_push(c, h, blk, 4 * N);
             rt_source_set_pos(c, h, 1.5f, 1.5f, 0.f);        /* the playground's spawn side: room +x */
             const float pl[3] = { 0.f, 1.5f, 0.f };          /* listener at the ear point */
