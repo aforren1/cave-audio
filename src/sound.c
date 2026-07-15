@@ -156,7 +156,21 @@ static float* resample_interleaved(const float* in, uint64_t n_in, unsigned int 
     return outbuf;
 }
 
-bool sound_load_ambix(const char* path, uint32_t want_rate, SoundData* out, char* err, size_t errcap) {
+/* FuMa (Furse-Malham) -> AmbiX: channel order WXYZ|RSTUV|KLMNOPQ -> ACN, MaxN (+ the W -3 dB) ->
+ * SN3D. Indexed by FUMA channel; the factors are the published standard set (Chapman; also phonon's
+ * audio_buffer.cpp — note FuMa's 3rd order is NOT plain MaxN, hence the L..Q factors). */
+static const int fuma_acn[16] = { 0, 3, 1, 2,  6, 7, 5, 8, 4,  12, 13, 11, 14, 10, 15, 9 };
+static float fuma_sn3d(int i) {
+    if (i == 0)  return 1.41421356f;                       /* W: sqrt(2) (FuMa W carries -3 dB) */
+    if (i <= 4)  return 1.f;                               /* X Y Z R */
+    if (i <= 8)  return 0.86602540f;                       /* S T U V: sqrt(3)/2 */
+    if (i == 9)  return 1.f;                               /* K */
+    if (i <= 11) return 0.84327404f;                       /* L M: sqrt(32/45) */
+    if (i <= 13) return 0.74535599f;                       /* N O: sqrt(5)/3 */
+    return 0.79056942f;                                    /* P Q: sqrt(5/8) */
+}
+
+static bool load_bed(const char* path, uint32_t want_rate, SoundData* out, char* err, size_t errcap, int fuma) {
     memset(out, 0, sizeof *out);
     if (!path) { set_err(err, errcap, "ambix: null path"); return false; }
 
@@ -167,9 +181,20 @@ bool sound_load_ambix(const char* path, uint32_t want_rate, SoundData* out, char
     if (frames == 0)          { free(inter); set_err(err, errcap, "ambix: empty file"); return false; }
     if (rate == 0)            { free(inter); set_err(err, errcap, "ambix: invalid sample rate (0)"); return false; }
     if (channels != 4 && channels != 9 && channels != 16) {
-        free(inter); set_err(err, errcap, "ambix: channel count must be 4, 9, or 16 (1st/2nd/3rd order)"); return false;
+        free(inter); set_err(err, errcap, fuma ? "fuma: channel count must be 4, 9, or 16 (full 3D 1st/2nd/3rd order)"
+                                               : "ambix: channel count must be 4, 9, or 16 (1st/2nd/3rd order)");
+        return false;
     }
     uint16_t order = (channels == 4) ? 1 : (channels == 9) ? 2 : 3;
+
+    if (fuma) {                                            /* reorder + rescale each frame in place */
+        float tmp[16];
+        for (uint64_t i = 0; i < frames; ++i) {
+            float* f = inter + i * channels;
+            for (unsigned int k = 0; k < channels; ++k) tmp[fuma_acn[k]] = f[k] * fuma_sn3d((int)k);
+            memcpy(f, tmp, channels * sizeof(float));
+        }
+    }
 
     if (rate != want_rate) {                          /* resample each SH channel to the engine rate */
         uint64_t nout = 0;
@@ -186,6 +211,14 @@ bool sound_load_ambix(const char* path, uint32_t want_rate, SoundData* out, char
     out->channels = (uint16_t)channels;
     out->order = order;
     return true;
+}
+
+bool sound_load_ambix(const char* path, uint32_t want_rate, SoundData* out, char* err, size_t errcap) {
+    return load_bed(path, want_rate, out, err, errcap, 0);
+}
+
+bool sound_load_fuma(const char* path, uint32_t want_rate, SoundData* out, char* err, size_t errcap) {
+    return load_bed(path, want_rate, out, err, errcap, 1);
 }
 
 void sound_unload(SoundData* s) {

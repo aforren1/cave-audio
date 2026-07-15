@@ -476,6 +476,87 @@ int main(void) {
         }
     }
 
+    /* spectral spread (BWA_SPREAD_SPECTRAL = mode 2): the widening contract again (more speakers,
+     * lower dominant share, ~constant power — power to within the crossover overlap), PLUS the
+     * mode's signature no other spread mode has: a LOW tone and a HIGH tone leave the same spread
+     * source from DIFFERENT directions (frequency-dependent panning), while at spread 0 they pan
+     * identically. Finally the retire handoff: leaving mode 2 lands back on the lobe rendering. */
+    {
+        RtCore* cf = rt_create(8, 4, RATE, CH);
+        CHECK(cf != NULL, "rt_create (spectral spread)");
+        if (cf) {
+            const char* NW2 = "bwa_rt_fsnoise.wav";
+            bwa_timestamp ts0 = { 0, 0 };
+            /* 8 blocks = exactly one noise-loop pass, so the summed power is loop-phase-independent */
+            #define L2_LOOP(C, OUT) do { double acc_ = 0; \
+                for (int b_ = 0; b_ < 8; ++b_) { rt_render((C), bus, N, &ts0); acc_ += total_l2(); } \
+                (OUT) = acc_; } while (0)
+            if (write_noise_wav(NW2, 8 * N)) {
+                uint32_t nf = rt_load_sound(cf, NW2, err, sizeof err);
+                uint32_t hf = rt_source_create(cf);
+                rt_source_play(cf, hf, nf, true);
+                set_pos_spk(cf, hf, 7);
+                rt_commit(cf); render2(cf);
+                int    act_pt = active_channels(0.03);
+                double share_pt = chan_energy(argmax_channel()) / total_energy();
+                double l2_pt; L2_LOOP(cf, l2_pt);
+                rt_set_spread_mode(cf, 2);
+                rt_source_set_spread(cf, hf, 1.0f); rt_commit(cf);   /* re-dirties: the mode lands */
+                for (int b = 0; b < 4; ++b) render2(cf);             /* engage + splitter settle */
+                int    act_fs = active_channels(0.03);
+                double share_fs = chan_energy(argmax_channel()) / total_energy();
+                double l2_fs; L2_LOOP(cf, l2_fs);
+                CHECK(act_fs > act_pt + 2, "spectral spread widens the source across more speakers");
+                CHECK(share_fs < share_pt, "spectral spread lowers the dominant channel's share");
+                printf("spectral: power delta %.2f dB\n", 20.0 * log10(l2_fs / l2_pt));
+                CHECK(l2_pt > 0 && fabs(20.0 * log10(l2_fs / l2_pt)) < 0.5,
+                      "spectral spread is constant-power (overlap-compensated)");
+                /* retire handoff: back to LOBE — the rendering matches lobe's own, not a stuck band path */
+                rt_set_spread_mode(cf, 0);
+                rt_source_set_pos(cf, hf, 0.f, 0.f, 0.f); rt_commit(cf); render2(cf);   /* nudge -> re-solve */
+                set_pos_spk(cf, hf, 7); rt_commit(cf);
+                for (int b = 0; b < 4; ++b) render2(cf);
+                int    act_lb = active_channels(0.03);
+                double l2_lb; L2_LOOP(cf, l2_lb);
+                CHECK(act_lb > act_pt + 2 && fabs(20.0 * log10(l2_lb / l2_pt)) < 0.5,
+                      "leaving spectral mode hands back to the lobe rendering (constant power)");
+                rt_source_destroy(cf, hf); rt_commit(cf);
+            } else CHECK(0, "write noise wav (spectral)");
+            #undef L2_LOOP
+            /* the signature: frequency splits direction. 200 Hz sits in the LF band (kept on the
+             * source direction), 6 kHz in a scattered band — their dominant speakers must differ at
+             * spread 1 and agree at spread 0. Integer cycles per file: both loop seamlessly. */
+            const char* SL = "bwa_rt_fs_lo.wav", *SH2 = "bwa_rt_fs_hi.wav";
+            if (write_sine_wav(SL, 200.0, 4800) && write_sine_wav(SH2, 6000.0, 4800)) {
+                uint32_t slo = rt_load_sound(cf, SL, err, sizeof err);
+                uint32_t shi = rt_load_sound(cf, SH2, err, sizeof err);
+                uint32_t hv  = rt_source_create(cf);
+                rt_set_spread_mode(cf, 2);
+                int a_lo0, a_hi0, a_lo1, a_hi1;
+                rt_source_play(cf, hv, slo, true); set_pos_spk(cf, hv, 7);
+                rt_commit(cf); for (int b = 0; b < 4; ++b) render2(cf);
+                a_lo0 = argmax_channel();                            /* spread 0: the point solve */
+                rt_source_play(cf, hv, shi, true);
+                rt_commit(cf); for (int b = 0; b < 4; ++b) render2(cf);
+                a_hi0 = argmax_channel();
+                CHECK(a_lo0 == a_hi0, "spread 0: low and high tones pan identically (mode 2 inactive)");
+                rt_source_set_spread(cf, hv, 1.0f);
+                rt_commit(cf); for (int b = 0; b < 6; ++b) render2(cf);
+                a_hi1 = argmax_channel();
+                rt_source_play(cf, hv, slo, true);
+                rt_commit(cf); for (int b = 0; b < 6; ++b) render2(cf);
+                a_lo1 = argmax_channel();
+                CHECK(a_lo1 == a_lo0, "spread 1: the LF band stays on the source direction");
+                CHECK(a_hi1 != a_lo1, "spread 1: the HF band leaves from its own direction (frequency-dependent panning)");
+                rt_set_spread_mode(cf, 0);
+                rt_source_destroy(cf, hv); rt_commit(cf);
+                remove(SL); remove(SH2);
+            } else CHECK(0, "write tone wavs (spectral)");
+            rt_destroy(cf);
+            remove(NW2);
+        }
+    }
+
     /* tracked room EQ (room_eq_grid): the align biquads re-aim as the committed listener moves — a
      * 100 Hz voice equidistant from two grid positions (flat at A, -12 dB at B on EVERY channel)
      * drops by ~the IDW-interpolated depth when the listener walks A -> B, and the live kill switch
@@ -958,6 +1039,81 @@ int main(void) {
                 remove(BW2);
             } else CHECK(0, "write rotation bed");
             rt_destroy(cr);
+        }
+    }
+
+    /* bed orientation (bwa_bed_set_orientation): pitch +90 deg tilts a front plane wave to the
+     * CEILING at conserved level (the full Ivanic-Ruedenberg matrix path), and steering back to a
+     * yaw-only pose re-localizes on the +x wall — the matrix -> phasor handoff is seamless. */
+    {
+        RtCore* co = rt_create(8, 4, RATE, CH);
+        CHECK(co != NULL, "rt_create (bed orientation)");
+        if (co) {
+            const char* BW3 = "bwa_rt_bed_ori.wav";
+            if (write_ambix4_noise_wav(BW3, 1.f, 0.f, 0.f, 1.f, 8 * N)) {
+                uint32_t sb = rt_load_ambix(co, BW3, err, sizeof err);
+                uint32_t hb = rt_source_create(co);
+                rt_source_play(co, hb, sb, true);
+                rt_commit(co);
+                for (int b = 0; b < 8; ++b) render2(co);
+                double l0 = total_l2();
+                rt_bed_set_orientation(co, hb, 0.f, 1.5707963f, 0.f);   /* front tilts up */
+                for (int b = 0; b < 80; ++b) render2(co);               /* glide (0.25 s) + settle */
+                int    a1 = argmax_channel();
+                double l1 = total_l2();
+                CHECK(LD.speakers[a1].pos[1] > 2.0f && fabsf(LD.speakers[a1].pos[0]) < 1.0f &&
+                      fabsf(LD.speakers[a1].pos[2]) < 1.0f,
+                      "pitch +90 deg: the field re-localizes on the ceiling");
+                CHECK(fabs(20.0 * log10(l1 / l0)) < 1.5, "full rotation conserves level (orthogonal blocks)");
+                rt_bed_set_orientation(co, hb, 1.5707963f, 0.f, 0.f);   /* back to yaw-only: phasor handoff */
+                for (int b = 0; b < 120; ++b) render2(co);
+                int    a2 = argmax_channel();
+                double l2 = total_l2();
+                CHECK(LD.speakers[a2].pos[0] > 1.0f && fabsf(LD.speakers[a2].pos[2]) < 1.0f,
+                      "settling to yaw-only lands on the +x wall (matrix -> phasor handoff)");
+                CHECK(fabs(20.0 * log10(l2 / l0)) < 1.5, "level still conserved after the handoff");
+                rt_source_destroy(co, hb); rt_commit(co);
+                remove(BW3);
+            } else CHECK(0, "write orientation bed");
+            rt_destroy(co);
+        }
+    }
+
+    /* max-rE bed weighting (bwa_set_max_re): for a plane-wave FOA bed the matrix decode's REAR
+     * hemisphere is pure sidelobe — the taper must shrink its share of the energy at ~unchanged
+     * total level (diffuse-normalized weights), and toggling back restores the raw decode. */
+    {
+        RtCore* cm = rt_create(8, 4, RATE, CH);
+        CHECK(cm != NULL, "rt_create (max-rE)");
+        if (cm) {
+            const char* BW4 = "bwa_rt_bed_re.wav";
+            if (write_ambix4_noise_wav(BW4, 1.f, 0.f, 0.f, 1.f, 8 * N)) {   /* plane wave from room +z */
+                uint32_t sb = rt_load_ambix(cm, BW4, err, sizeof err);
+                uint32_t hb = rt_source_create(cm);
+                rt_source_play(cm, hb, sb, true);
+                rt_commit(cm);
+                for (int b = 0; b < 8; ++b) render2(cm);
+                #define REAR_SHARE(OUT) do { double r_ = 0, t_ = 0;                     \
+                    for (int ch_ = 0; ch_ < CH; ++ch_) { double e_ = chan_energy(ch_);  \
+                        t_ += e_; if (LD.speakers[ch_].pos[2] < LD.ref[2] - 0.5f) r_ += e_; } \
+                    (OUT) = t_ > 0 ? r_ / t_ : 1.0; } while (0)
+                double share_off, share_on, share_back, l_off, l_on;
+                REAR_SHARE(share_off); l_off = total_l2();
+                rt_set_max_re(cm, 1);
+                for (int b = 0; b < 8; ++b) render2(cm);     /* re_mix crossfades within a block */
+                REAR_SHARE(share_on); l_on = total_l2();
+                printf("max-rE: rear share %.3f -> %.3f\n", share_off, share_on);
+                CHECK(share_on < 0.6 * share_off, "max-rE shrinks the rear-hemisphere sidelobes");
+                CHECK(fabs(20.0 * log10(l_on / l_off)) < 2.0, "max-rE keeps the level (energy-normalized weights)");
+                rt_set_max_re(cm, 0);
+                for (int b = 0; b < 8; ++b) render2(cm);
+                REAR_SHARE(share_back);
+                CHECK(fabs(share_back - share_off) < 0.05, "max-rE off restores the raw decode (A/B round trip)");
+                #undef REAR_SHARE
+                rt_source_destroy(cm, hb); rt_commit(cm);
+                remove(BW4);
+            } else CHECK(0, "write max-rE bed");
+            rt_destroy(cm);
         }
     }
 
@@ -1658,6 +1814,6 @@ int main(void) {
 
     remove(WAV);
     if (fails) { printf("rt_test: %d FAILURES\n", fails); return 1; }
-    printf("rt_test OK (DBAP, commit, gen-drop, gain, occlusion, EQ, directivity, bed, reflection-tap, channel-test, air+Doppler, spread+MDAP+size, tracked-room-EQ, decorrelation, parametric-bed, pose-pred, near-spread, loudness-comp, multi-listener, master+groups+fades+global-pause, pitch, bed-rotation, reverb-send, dual-band, voice-steal, scheduled-play, streaming, pause/seek, limiter, bus-meter verified)\n");
+    printf("rt_test OK (DBAP, commit, gen-drop, gain, occlusion, EQ, directivity, bed, reflection-tap, channel-test, air+Doppler, spread+MDAP+spectral+size, tracked-room-EQ, decorrelation, parametric-bed, pose-pred, near-spread, loudness-comp, multi-listener, master+groups+fades+global-pause, pitch, bed-rotation+orientation, max-rE, reverb-send, dual-band, voice-steal, scheduled-play, streaming, pause/seek, limiter, bus-meter verified)\n");
     return 0;
 }

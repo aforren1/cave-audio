@@ -47,7 +47,7 @@ enum {
     CMD_GROUP_GAIN, /* mix-group gain (re-dirties the group's voices) */
     CMD_GROUP_PAUSED,   /* mix-group pause gate */
     CMD_SET_PITCH,  /* per-voice playback rate (in-memory sounds) */
-    CMD_BED_YAW,    /* per-bed soundfield rotation about the room's vertical axis */
+    CMD_BED_ROT,    /* per-bed soundfield orientation (yaw about up; + pitch/roll for the full rotation) */
     CMD_SET_ISM     /* per-voice image-source early reflections */
 };
 typedef struct {
@@ -76,7 +76,7 @@ typedef struct {
         struct { uint8_t id; float gain; }             ggain; /* mix-group gain */
         struct { uint8_t id, on; }                     gpause;/* mix-group pause */
         struct { float rate; }                         pitch; /* playback rate (1 = native) */
-        struct { float yaw; }                          byaw;  /* bed soundfield yaw (radians) */
+        struct { float yaw, pitch, roll; }             brot;  /* bed soundfield orientation (radians) */
         struct { uint8_t on; }                         ism;   /* per-voice early reflections */
     } u;
 } Cmd;
@@ -94,7 +94,8 @@ void    rt_set_layout(RtCore* c, const Layout* L);   /* call before bwa_start / 
 void    rt_set_panner(RtCore* c, int panner);        /* 0 = DBAP, 1 = SPCAP, 2 = VBAP; atomic, live-switchable */
 void    rt_set_bed_decoder(RtCore* c, int decoder);  /* 0 = sampling (SAD), 1 = AllRAD; before bwa_start */
 void    rt_set_dual_band(RtCore* c, int on);         /* dual-band panning (amplitude LF / power HF); live A/B */
-void    rt_set_spread_mode(RtCore* c, int mode);     /* spread render: 0 = lobe reshape, 1 = MDAP ring; live A/B */
+void    rt_set_spread_mode(RtCore* c, int mode);     /* spread render: 0 = lobe, 1 = MDAP ring, 2 = spectral; live A/B */
+void    rt_set_max_re(RtCore* c, int on);            /* max-rE bed-decode weighting (matrix paths + FDN); live A/B */
 void    rt_set_room_eq_dyn(RtCore* c, int on);       /* tracked room EQ (room_eq_grid layouts): default on; live A/B */
 void    rt_set_decorrelation(RtCore* c, int on);     /* velvet-noise wide-part decorrelation; live A/B */
 void    rt_set_bed_renderer(RtCore* c, int parametric);   /* bed: 0 = matrix decode, 1 = parametric (DirAC); live A/B */
@@ -162,6 +163,7 @@ float   rt_get_directivity(RtCore* c, uint32_t handle); /* control thread: publi
 uint32_t rt_load_sound  (RtCore* c, const char* path, char* err, size_t errcap); /* 0 on failure */
 uint32_t rt_load_sound_streaming(RtCore* c, const char* path, char* err, size_t errcap); /* mono, engine rate, streamed */
 uint32_t rt_load_ambix  (RtCore* c, const char* path, char* err, size_t errcap); /* multichannel bed asset */
+uint32_t rt_load_fuma   (RtCore* c, const char* path, char* err, size_t errcap); /* FuMa bed, converted to AmbiX at load */
 uint16_t rt_sound_channels(RtCore* c, uint32_t sound);   /* 1 = mono, 4/9/16 = bed, 0 = invalid */
 bool     rt_unload_sound(RtCore* c, uint32_t sound);  /* safe any time; retire-acked internally.
                                                        * false = command ring full, nothing enqueued:
@@ -201,7 +203,8 @@ void rt_source_set_size  (RtCore* c, uint32_t h, float radius_m);    /* source M
 void rt_source_fade_to   (RtCore* c, uint32_t h, float gain, float seconds, bool stop_at_end);  /* timed fade */
 void rt_source_set_group (RtCore* c, uint32_t h, uint32_t group);    /* mix-group assignment (0 = default) */
 void rt_source_set_pitch (RtCore* c, uint32_t h, float rate);        /* playback rate [0.25, 4]; glided */
-void rt_bed_set_rotation (RtCore* c, uint32_t h, float yaw_rad);     /* bed soundfield yaw; glided */
+void rt_bed_set_rotation (RtCore* c, uint32_t h, float yaw_rad);     /* bed soundfield yaw (= orientation yaw,0,0) */
+void rt_bed_set_orientation(RtCore* c, uint32_t h, float yaw, float pitch, float roll);  /* full 3-axis; glided */
 void rt_source_set_ism   (RtCore* c, uint32_t h, bool on);           /* image-source early reflections */
 void rt_play_oneshot   (RtCore* c, uint32_t sound, float x, float y, float z, float gain);
 void rt_set_listener   (RtCore* c, const float p[3], const float q[4]);

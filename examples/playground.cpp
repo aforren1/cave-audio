@@ -29,10 +29,16 @@
  *                         channels with LEFT/RIGHT (SPACE auto-walks); in binaural each channel is
  *                         HRTF'd as its virtual speaker, so the tone circles your head as you walk.
  *   5 Blind A/B/X       — double-blind self test over live engine knobs (dual-band, DBAP vs SPCAP /
- *                         VBAP, spread, air absorption): X is secretly A or B, listen with Z/X/C,
+ *                         VBAP, spread, spread RENDER (LOBE vs MDAP / LOBE vs SPECTRAL),
+ *                         decorrelation, air absorption): X is secretly A or B, listen with Z/X/C,
  *                         answer LEFT/RIGHT, and the running binomial p-value says whether the
  *                         difference is genuinely audible (p < 0.05) or you're guessing.
- *   6 Reverb bed        — a static shoebox room + the Steam Audio hybrid reverb bed. Move the source
+ *   6 Ambisonic bed     — a synthesized 3rd-order AmbiX field (bursts FRONT, clicks LEFT-UP, a
+ *                         diffuse floor) played world-locked through the bed decode. SPACE spins the
+ *                         field (bwa_bed_set_orientation glides), the tilt slider pitches it, G A/Bs
+ *                         matrix vs PARAMETRIC rendering, B A/Bs max-rE decode weighting — the by-ear
+ *                         home for the bed knobs.
+ *   7 Reverb bed        — a static shoebox room + the Steam Audio hybrid reverb bed. Move the source
  *                         and the room reverb follows; G dry/wet A-B, [ ] wet level, V distance->wet
  *                         (near dry / far wet), B A/Bs the bed
  *                         DECODER (sampling vs AllRAD — load-time, so it rebuilds the engine; differs
@@ -135,6 +141,60 @@ static int write_wav(const char* path, const float* buf, uint32_t n) {
     return 1;
 }
 
+/* ---- ambisonic bed content (the bed scene): a 3rd-order AmbiX field synthesized at startup ----
+ * SN3D real SH to order 3 for a ROOM direction (ambi axes x=front,y=left,z=up = room z,x,y) — a
+ * local copy of the encode so the playground stays a pure ABI client (mirrors examples/ambisonic.c). */
+#define BED_FILE "pg_bed.wav"
+static void sh16_room(float rx, float ry, float rz, float* y) {
+    const float len = sqrtf(rx*rx + ry*ry + rz*rz);
+    const float x = rz / len, yy = rx / len, z = ry / len;
+    y[0]  = 1.0f;
+    y[1]  = yy;             y[2]  = z;              y[3]  = x;
+    y[4]  = 1.7320508f * x * yy;
+    y[5]  = 1.7320508f * yy * z;
+    y[6]  = 0.5f * (3.0f * z * z - 1.0f);
+    y[7]  = 1.7320508f * x * z;
+    y[8]  = 0.8660254f * (x * x - yy * yy);
+    y[9]  = 0.7905694f * yy * (3.0f * x * x - yy * yy);
+    y[10] = 3.8729833f * x * yy * z;
+    y[11] = 0.6123724f * yy * (5.0f * z * z - 1.0f);
+    y[12] = 0.5f * z * (5.0f * z * z - 3.0f);
+    y[13] = 0.6123724f * x * (5.0f * z * z - 1.0f);
+    y[14] = 1.9364917f * z * (x * x - yy * yy);
+    y[15] = 0.7905694f * x * (x * x - 3.0f * yy * yy);
+}
+/* the bed scene's marker bearings (room space): bursts from the FRONT, clicks from LEFT-UP */
+static const Vector3 bed_dirs[2] = { { 0.0f, 0.0f, 1.0f }, { 0.87f, 0.5f, 0.0f } };
+static void gen_bed(float* buf /* n x 16 */, uint32_t n) {
+    float yf[16], yl[16];
+    sh16_room(bed_dirs[0].x, bed_dirs[0].y, bed_dirs[0].z, yf);
+    sh16_room(bed_dirs[1].x, bed_dirs[1].y, bed_dirs[1].z, yl);
+    unsigned int s1 = 33333u, s2 = 44444u, s3 = 55555u;
+    float pb1[7] = { 0 }, pb3[7] = { 0 };
+    const uint32_t period = SR / 2, on = period / 2, ramp = SR / 100, clicklen = SR / 333;
+    for (uint32_t i = 0; i < n; ++i) {                    /* period divides SIGLEN: seamless loop */
+        uint32_t ph = i % period;
+        float env = (ph < ramp) ? (float)ph / ramp
+                  : (ph < on - ramp) ? 1.0f
+                  : (ph < on) ? (float)(on - ph) / ramp : 0.0f;
+        float burst = pink(white(&s1), pb1) * 0.5f * env;
+        uint32_t pc = (i + period / 2) % period;          /* clicks in the bursts' gaps */
+        float click = (pc < clicklen) ? white(&s2) * expf(-6.0f * (float)pc / clicklen) * 0.7f : 0.0f;
+        float dif   = pink(white(&s3), pb3) * 0.08f;      /* W-only: reads as diffuse */
+        float* f = buf + (size_t)i * 16;
+        for (int k = 0; k < 16; ++k) f[k] = burst * yf[k] + click * yl[k];
+        f[0] += dif;
+    }
+}
+static int write_wav16(const char* path, const float* buf, uint32_t n) {
+    drwav_data_format fmt = { drwav_container_riff, DR_WAVE_FORMAT_IEEE_FLOAT, 16, SR, 32 };
+    drwav wav;
+    if (!drwav_init_file_write(&wav, path, &fmt, NULL)) return 0;
+    drwav_write_pcm_frames(&wav, n, buf);
+    drwav_uninit(&wav);
+    return 1;
+}
+
 /* ---- wall geometry helpers (occlusion + reflection scene) ---- */
 static Vector3 reflect_point(Vector3 p, Vector3 c, Vector3 n) {      /* mirror p across plane (c,n) */
     float d = Vector3DotProduct(Vector3Subtract(p, c), n);
@@ -171,6 +231,8 @@ static void draw_wall(Vector3 c, Vector3 u, Vector3 v, float hw, float hh, Color
 static bwa_engine*   e;
 static bwa_source    src, refl;
 static bwa_sound     sounds[NSIG];
+static bwa_sound     g_bed_snd;    /* the synthesized AmbiX field (BED_FILE), loaded per engine build */
+static bwa_bed       g_bed;        /* the bed voice (created per build; only the bed scene plays it) */
 static const char* backend_name;
 static int         backend_silent;
 static const char* g_layout_path;          /* optional cave_layout.json; NULL = engine default grid */
@@ -446,11 +508,20 @@ static void abx_ap_spcap(int v) { bwa_set_panner(e, v ? BWA_PAN_SPCAP : BWA_PAN_
 static void abx_ap_vbap (int v) { bwa_set_panner(e, v ? BWA_PAN_VBAP  : BWA_PAN_DBAP); }
 static void abx_ap_sprd (int v) { bwa_source_set_spread(e, src, v ? 0.6f : 0.0f); }
 static void abx_ap_air  (int v) { bwa_source_set_air_absorption(e, src, v); }
+/* the spread-RENDER comparisons need a wide source to have anything to render */
+static void abx_ap_mdap (int v) { bwa_source_set_spread(e, src, 0.6f);
+                                  bwa_set_spread_mode(e, v ? BWA_SPREAD_MDAP : BWA_SPREAD_LOBE); }
+static void abx_ap_spec (int v) { bwa_source_set_spread(e, src, 0.6f);
+                                  bwa_set_spread_mode(e, v ? BWA_SPREAD_SPECTRAL : BWA_SPREAD_LOBE); }
+static void abx_ap_decor(int v) { bwa_source_set_spread(e, src, 0.6f); bwa_set_decorrelation(e, v); }
 static const AbxCmp abx_cmps[] = {
     { "dual-band panning",     "single-band (power)", "dual-band (LF amplitude)", abx_ap_dual  },
     { "panner: DBAP vs SPCAP", "DBAP",                "SPCAP",                    abx_ap_spcap },
     { "panner: DBAP vs VBAP",  "DBAP",                "VBAP",                     abx_ap_vbap  },
     { "source spread",         "point source",        "spread 60%",               abx_ap_sprd  },
+    { "spread render: MDAP",   "LOBE (reshape)",      "MDAP (virtual ring)",      abx_ap_mdap  },
+    { "spread render: SPECTRAL", "LOBE (reshape)",    "SPECTRAL (freq-dep pan)",  abx_ap_spec  },
+    { "decorrelation (wide src)", "coherent copies",  "velvet-noise decorrelated", abx_ap_decor },
     { "air absorption",        "off",                 "on (distance LPF)",        abx_ap_air   },
 };
 enum { NABX = sizeof abx_cmps / sizeof abx_cmps[0] };
@@ -471,6 +542,8 @@ static void abx_apply_listen(void) {
     bwa_set_dual_band(e, false);
     bwa_set_panner(e, BWA_PAN_DBAP);
     bwa_source_set_spread(e, src, 0.0f);
+    bwa_set_spread_mode(e, BWA_SPREAD_LOBE);
+    bwa_set_decorrelation(e, false);
     bwa_source_set_air_absorption(e, src, false);
     abx_cmps[abx_cmp].apply(abx_listen == 2 ? abx_x : abx_listen);
 }
@@ -509,7 +582,50 @@ static void abx_draw3d(void) {
     DrawLine3D(g_head, source_pos, Color{ 90, 220, 90, 200 });
     DrawSphere(source_pos, 0.18f, RED);
 }
-/* ============================= Scene 6: Reverb bed (static room) ============================= */
+/* ============================= Scene 6: Ambisonic bed ============================= */
+/* A pre-encoded 3rd-order AmbiX field (synthesized at startup — see gen_bed) played WORLD-LOCKED
+ * through the bed decode: the by-ear home for the bed knobs. SPACE spins the field
+ * (bwa_bed_set_orientation glides, click-free), the tilt slider pitches it (the full 3-axis
+ * rotation), G A/Bs matrix vs parametric rendering, B A/Bs max-rE decode weighting. */
+static int   bed_spin, bed_param, bed_re;
+static float bed_yaw, bed_pitch;
+
+static void bed_apply(void) {
+    bwa_set_bed_renderer(e, bed_param ? BWA_BED_PARAMETRIC : BWA_BED_MATRIX);
+    bwa_set_max_re(e, bed_re != 0);
+    bwa_bed_set_orientation(e, g_bed, bed_yaw, bed_pitch, 0.0f);
+}
+static void bed_enter(void) {
+    bwa_source_set_gain(e, src,  0.0f);            /* the bed IS the content here */
+    bwa_source_set_gain(e, refl, 0.0f);
+    bed_apply();
+    bwa_bed_set_gain(e, g_bed, 0.9f);
+    bwa_bed_play(e, g_bed, g_bed_snd, true);
+}
+static void bed_update(float dt) {
+    if (kp(KEY_SPACE)) bed_spin = !bed_spin;
+    if (kp(KEY_G)) bed_param = !bed_param;
+    if (kp(KEY_B)) bed_re = !bed_re;
+    /* yaw ACCUMULATES while spinning (no wrap: a target wrapped by 2pi would glide the long way
+     * back at the engine's ~1 turn/s rate); float precision is fine for hours of spin */
+    if (bed_spin) bed_yaw += 0.45f * dt;
+    bed_apply();
+}
+static void bed_draw3d(void) {
+    /* markers where the field's content sits NOW: the encode bearings through the live orientation
+     * (pitch about room right, then yaw about room up — the engine's own convention) */
+    static const Color cols[2] = { { 235, 120, 120, 255 }, { 120, 200, 235, 255 } };   /* front / left-up */
+    const float cy = cosf(bed_yaw), sy = sinf(bed_yaw), cp = cosf(bed_pitch), sp = sinf(bed_pitch);
+    for (int i = 0; i < 2; ++i) {
+        Vector3 d = Vector3Normalize(bed_dirs[i]);
+        Vector3 t = { d.x, cp * d.y + sp * d.z, cp * d.z - sp * d.y };
+        Vector3 r = { cy * t.x + sy * t.z, t.y, cy * t.z - sy * t.x };
+        Vector3 p = Vector3Add(g_head, Vector3Scale(r, 2.2f));
+        DrawSphere(p, 0.15f, cols[i]);
+        DrawLine3D(g_head, p, Color{ cols[i].r, cols[i].g, cols[i].b, 160 });
+    }
+}
+/* ============================= Scene 7: Reverb bed (static room) ============================= */
 /* The hybrid reverb bed needs reflections configured + the room geometry set BEFORE bwa_start (the
  * scene locks once the bed runs), so this scene runs on a SEPARATE engine config — build_engine()
  * rebuilds the engine when crossing this boundary (see switch_scene). */
@@ -563,6 +679,7 @@ static const Scene scenes[] = {
     { "Directivity",             dir_enter,  dir_update,  dir_draw3d  },
     { "Channel walk (speaker check)", chan_enter, chan_update, chan_draw3d },
     { "Blind A/B/X (hear it, prove it)", abx_enter, abx_update, abx_draw3d },
+    { "Ambisonic bed (world-locked)", bed_enter, bed_update, bed_draw3d },
     { "Reverb bed (static room)", rev_enter,  rev_update,  rev_draw3d  },
 };
 enum { NSCENE = sizeof scenes / sizeof scenes[0], SCENE_REVERB = NSCENE - 1 };
@@ -605,9 +722,11 @@ static void build_engine(int with_reverb) {
     for (int i = 0; i < g_nspk; ++i) g_head = Vector3Add(g_head, speakers[i]);
     g_head = Vector3Scale(g_head, 1.0f / (float)g_nspk);
     for (int i = 0; i < NSIG; ++i) sounds[i] = bwa_load_sound(e, sig_files[i]);
+    g_bed_snd = bwa_load_ambix(e, BED_FILE);             /* the bed scene's field (silent until played) */
     for (int i = 0; i < NMAT; ++i) mats[i] = bwa_material_preset(e, mat_types[i]);
     src  = bwa_source_create(e);  bwa_source_play(e, src,  sounds[cur_sig], true);
     refl = bwa_source_create(e);  bwa_source_play(e, refl, sounds[cur_sig], true);
+    g_bed = bwa_bed_create(e);
     bwa_source_set_gain(e, refl, 0.0f);
     if (with_reverb) bwa_source_set_reflections(e, src, rev_on);
     engine_has_reverb = with_reverb;
@@ -632,6 +751,11 @@ static void switch_scene(int idx) {
     bwa_source_set_spread(e, src, 0.0f);
     bwa_set_dual_band(e, false);
     bwa_set_panner(e, BWA_PAN_DBAP);                               /* the ABX scene may leave SPCAP/VBAP selected */
+    bwa_set_spread_mode(e, BWA_SPREAD_LOBE);                       /* ...or a spread render / decorrelation */
+    bwa_set_decorrelation(e, false);
+    bwa_bed_stop(e, g_bed);                                        /* the bed scene's field + its knobs */
+    bwa_set_bed_renderer(e, BWA_BED_MATRIX);
+    bwa_set_max_re(e, false);
     source_yaw = 0.0f;
     bwa_source_set_gain(e, src, SRC_GAIN);
     cur_scene = idx;
@@ -785,6 +909,23 @@ static void draw_panel(void) {
         } else {
             ImGui::TextWrapped("listen to A, B, X (switching is seamless - that's the point), then answer.");
         }
+    } else if (cur_scene == 5) {                          /* Ambisonic bed */
+        chk("spin the field [SPACE]", &bed_spin);
+        bwTip("accumulating yaw through bwa_bed_set_orientation - the engine glides at "
+              "~1 turn/s, so every move is click-free");
+        ImGui::SetNextItemWidth(-FLT_MIN);
+        ImGui::SliderAngle("##tilt", &bed_pitch, -90.0f, 90.0f, "tilt (pitch) %.0f deg");
+        bwTip("the full 3-axis orientation: positive pitch tilts the field's front upward - "
+              "watch the red (front) marker climb toward the ceiling and follow it by ear");
+        chk("parametric renderer [G]", &bed_param);
+        bwTip("matrix decode vs DirAC-style parametric (direction + diffuseness per band, the "
+              "direct stream re-panned listener-relative - a walkable bed). Live crossfade");
+        chk("max-rE decode [B]", &bed_re);
+        bwTip("max-rE weighting tapers the high SH orders: fewer decode sidelobes, a longer "
+              "energy vector - better localization off-centre, slightly wider main lobe. Live A/B");
+        ImGui::TextDisabled("yaw %.0f deg", fmodf(bed_yaw * 57.2958f, 360.0f));
+        ImGui::TextWrapped("bursts = front (red), clicks = left-up (blue), plus a diffuse floor. "
+                           "World-locked: the field is glued to the room, not the head.");
     } else {                                              /* Reverb bed */
         if (chk("reverb send [G]", &rev_on)) bwa_source_set_reflections(e, src, rev_on);
         bwTip("opt the source into the shared reverb bed's wet send");
@@ -927,6 +1068,36 @@ static void register_tests(ImGuiTestEngine* te) {
         }
     };
 
+    t = IM_REGISTER_TEST(te, "viewer", "bed_scene");     /* the ambisonic bed plays + its live A/Bs stay live */
+    t->TestFunc = [](ImGuiTestContext* ctx) {
+        switch_scene(5);
+        int playing = 0;                                 /* is_playing publishes per AUDIO block; UI
+                                                          * frames outpace it — poll, don't race */
+        for (int tries = 0; tries < 60 && !playing; ++tries) { ctx->Yield(4); playing = bwa_bed_is_playing(e, g_bed); }
+        IM_CHECK(playing);
+        uint32_t n = 0;
+        float m = 0.0f;
+        for (int tries = 0; tries < 60 && m <= 1e-6f; ++tries) { ctx->Yield(4); m = meters_max(&n); }
+        IM_CHECK_GT(m, 1e-4f);                           /* the field reaches the bus through the decode */
+        ctx->SetRef("playground");
+        ctx->ItemCheck("**/max-rE decode [B]");
+        IM_CHECK_EQ(bed_re, 1);
+        ctx->ItemCheck("**/parametric renderer [G]");
+        IM_CHECK_EQ(bed_param, 1);
+        ctx->Yield(10);                                  /* both A/Bs crossfade in */
+        m = meters_max(&n);
+        IM_CHECK_GT(m, 1e-4f);                           /* still live through both live A/Bs */
+        ctx->CaptureReset();
+        ctx->CaptureScreenshot();
+        ctx->ItemUncheck("**/parametric renderer [G]");
+        ctx->ItemUncheck("**/max-rE decode [B]");
+        switch_scene(0);
+        int stopped = 0;                                 /* the stop is click-free: it needs an audio
+                                                          * block to ramp out + publish — poll, don't race */
+        for (int tries = 0; tries < 60 && !stopped; ++tries) { ctx->Yield(4); stopped = !bwa_bed_is_playing(e, g_bed); }
+        IM_CHECK(stopped);                               /* leaving the scene stops the bed */
+    };
+
     t = IM_REGISTER_TEST(te, "viewer", "abx_flow");  /* the blind test scores through the panel buttons */
     t->TestFunc = [](ImGuiTestContext* ctx) {
         switch_scene(4);
@@ -999,6 +1170,12 @@ int main(int argc, char** argv) {
     if (!sigbuf) { printf("out of memory\n"); return 1; }
     for (int i = 0; i < NSIG; ++i) { gen_signal(i, sigbuf, SIGLEN); write_wav(sig_files[i], sigbuf, SIGLEN); }
     free(sigbuf);
+    /* ...and the ambisonic-bed field (16-ch AmbiX; the bed scene plays it) */
+    float* bedbuf = (float*)malloc((size_t)SIGLEN * 16 * sizeof(float));
+    if (!bedbuf) { printf("out of memory\n"); return 1; }
+    gen_bed(bedbuf, SIGLEN);
+    write_wav16(BED_FILE, bedbuf, SIGLEN);
+    free(bedbuf);
 
     wall_basis(wall_n, &wall_u, &wall_v);
     build_engine(0);                                          /* start in the interactive config (fills speakers[], g_head) */
@@ -1135,6 +1312,7 @@ int main(int argc, char** argv) {
     CloseWindow();
     if (e) { bwa_stop(e); bwa_destroy(e); }
     for (int i = 0; i < NSIG; ++i) remove(sig_files[i]);
+    remove(BED_FILE);
     return rc;
 }
 

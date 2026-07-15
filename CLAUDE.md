@@ -88,7 +88,9 @@ bindings/
   unity/               P/Invoke + Engine/Emitter (see docs/integration.md).
   unreal/              module + component.
 docs/                  Specs. Start here.
-examples/              cave_layout.json (see docs/layout-schema.md).
+examples/              cave_layout.json (see docs/layout-schema.md); minimal.c (the client lifecycle),
+                       ambisonic.c (beds: AmbiX/FuMa load, rotate/tilt, renderer + max-rE A/B),
+                       streaming.c (disk streaming + push sources) — console walkthroughs, built every build.
 third_party/           asiosdk/ (GPLv3 option, vendored), steam-audio-source/ (submodule) + steam-audio-artifacts/ (built phonon SDK); dr_wav + cJSON are
                        fetched by CMake (FetchContent, pinned) — see third_party/README.md.
 ```
@@ -122,9 +124,12 @@ any driver buffer size works); `bwa_get_audio_backend()` reports the device actu
 time** (`rt_set_tracker`), configured at runtime via `bwa_tracker_connect`/`bwa_tracker_desc`
 (see docs/api.md). An
 interactive **playground** (`examples/playground.cpp`, opt-in `-DBWA_BUILD_PLAYGROUND=ON`)
-auditions binaural by ear across six feature **scenes** (TAB): localization (with a SPACE auto-move
-sweep), occlusion+materials, directivity, a channel-walk speaker check, a **blind A/B/X** harness
-(X is secretly A or B over one live knob — dual-band, DBAP vs SPCAP/VBAP, spread, air absorption —
+auditions binaural by ear across seven feature **scenes** (TAB): localization (with a SPACE auto-move
+sweep), occlusion+materials, directivity, a channel-walk speaker check, an **ambisonic bed** room (a
+synthesized 3rd-order field, world-locked: spin/tilt via bwa_bed_set_orientation, matrix vs
+parametric renderer, max-rE decode weighting — the by-ear home for the bed knobs), a **blind A/B/X** harness
+(X is secretly A or B over one live knob — dual-band, DBAP vs SPCAP/VBAP, spread, spread RENDER
+(LOBE vs MDAP / LOBE vs SPECTRAL), decorrelation, air absorption —
 answer over N trials and a one-sided binomial p-value says whether the difference is genuinely
 audible, not just "sounds different to me"), and a reverb-bed room (which
 rebuilds the engine on entry/exit, since the bed + room geometry are load-time). Its 3D scene shades
@@ -179,11 +184,17 @@ create) whose delay glides toward `distance/c` — the glide rate is the pitch s
 Both compute the source↔listener distance per block, ramp per sample (invariant 4), and tap the
 reflection send *before* themselves (direct path only); indices stay integer so a long-lived voice
 never loses sample precision. **Source spread/size** (`bwa_source_set_spread`, 0=point..1=wide) is also
-in, with two render modes behind **`bwa_set_spread_mode`** (atomic live A/B): LOBE (default) blends the
+in, with three render modes behind **`bwa_set_spread_mode`** (atomic live A/B): LOBE (default) blends the
 panner's point gains toward a width-controlled lobe centred on the source direction, renormalised to the
 panner's own power (widening never re-levels) — panner-agnostic; MDAP (Pulkki) pans a 12-direction
 virtual-source ring with the SELECTED panner and sums, so the extent inherits the panner's character
-(collapses to the point solve at spread 0; the `rt` test pins both).
+(collapses to the point solve at spread 0); SPECTRAL (Zotter/Frank frequency-dependent panning, the
+ambix_widening idea per source) splits the voice into 6 one-pole bands and pans EACH BAND to its own
+direction inside the cone (LF stays on the source direction; band gains are real panner solves;
+constant power via a precomputed band-overlap compensation, `fs_w`) — width with no coherent copies
+to collapse or comb, the decorrelation alternative; engage/retire hand off exactly through the
+single-path gains (`fs_on` 0/1/2 in `rt.c`; the `rt` test pins all three modes + the LF-stays/HF-moves
+signature).
 **Dual-band panning** (`bwa_set_dual_band`, off by default, live A/B) wraps the selected panner: a 700 Hz
 complementary crossover splits each voice, the low band panned amplitude-normalised (`Σg = gain`,
 velocity-vector) and the high band power-normalised (the panners' usual `Σg² = gain²`) — SPAT's "VBP
@@ -261,7 +272,22 @@ unaffected; composes with Doppler). **Bed rotation** (`bwa_bed_set_rotation`, ra
 yaw SH rotation in `mix_bed` (`bed_rotate_z`: each degree's ±m pair rotates by m·yaw; per-sample
 phasor recurrence, no per-sample trig), glided at ~1 turn/s, applied before BOTH bed renderers;
 positive yaw turns the field from room +z toward +x (the `rt` test pins the convention + level
-conservation). **Runtime channel count**: `BWA_CHANNELS` (26, sink.h) is now the CAPACITY only — the
+conservation). **Full 3-axis bed orientation** (`bwa_bed_set_orientation`, yaw/pitch/roll — level a
+capture that wasn't upright): any pitch/roll engages the Ivanic-Ruedenberg SH rotation
+(`ambi_rot_matrix`, `ambisonics.c`) — the live matrix rebuilds per block from the glided angles and
+interpolates per sample; yaw-only stays on the exact phasor path and the two hand off seamlessly at
+pitch=roll=0 (the `ambi` test pins M(R)·encode(d) == encode(R·d) for random rotations + block
+orthogonality; the `rt` test pins the pitch-to-ceiling convention + the handoff). **max-rE decode
+weighting** (`bwa_set_max_re`, off by default, live A/B): Zotter/Frank per-order tapers
+(`ambi_max_re_weights`, diffuse-energy-normalized per content order so A/B stays level-fair) applied
+where the engine's own SH→speaker decode renders a bed's signal — `mix_bed`'s matrix paths (per-voice
+`re_mix` crossfade) and the FDN's line render (`dcomb`/`dcomb_re` pair) — suppressing decode sidelobes
+and lengthening the energy vector (better off-centre localization, THE walking-listener case);
+point-source panners and phonon's own decodes untouched (the `ambi`/`dsp`/`rt`/`fdn` tests pin the
+weights, the rE lengthening through AllRAD, the rear-sidelobe shrink + level fairness, and the FDN
+pair). **FuMa loading** (`bwa_load_fuma`): legacy B-format (WXYZ order, MaxN + W −3 dB) reordered +
+rescaled to AmbiX at load (`sound.c`, phonon-matching published factors; the `sound` test pins the
+conversion against the SN3D encode), so downstream a FuMa bed IS an AmbiX bed. **Runtime channel count**: `BWA_CHANNELS` (26, sink.h) is now the CAPACITY only — the
 ACTIVE count is the layout's speaker count (4..26; loader accepts N speakers whose indices form a
 complete 0..N-1 permutation), fixed per engine instance. `bwa_create` resolves the layout BEFORE
 `rt_create` and passes `layout.count` to the rt core, sinks, monitor, FDN; `steam_decode`/

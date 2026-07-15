@@ -38,6 +38,11 @@ void fdn_set_decay_direction(Fdn* f, const float dir[3], float factor);
 /* Reverb return level (linear, default 1). Safe live: the tap ramps toward it per block. */
 void fdn_set_gain(Fdn* f, float gain);
 
+/* max-rE weighting for the line->speaker render (bwa_set_max_re; ambisonics.h): the FDN keeps BOTH
+ * render matrices and the tap crossfades between them per sample, so this is a click-free live A/B
+ * (mirrors rt.c's bed_decode taper — the FDN renders through its own copy of that decode). */
+void fdn_set_max_re(Fdn* f, int on);
+
 /* RtBusTap: process the aux send through the FDN and add the decoded 26-ch reverb onto the bus
  * (pre-align, like the Steam bed). `ud` is the Fdn. Audio thread. */
 void fdn_tap(void* ud, float* bus, uint32_t n, const float* lp, const float* lq, const float* aux);

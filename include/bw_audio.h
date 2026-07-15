@@ -8,7 +8,9 @@
  *
  * Usage docs: docs/api.md — quickstart, profiles, the threading contract,
  * coordinates, error handling, environment variables, and the per-call
- * reference. examples/minimal.c runs the whole client lifecycle.
+ * reference. examples/minimal.c runs the whole client lifecycle; examples/ambisonic.c
+ * walks the bed API (AmbiX/FuMa, rotation, renderer/max-rE A/Bs); examples/streaming.c
+ * walks disk streaming + push sources.
  *
  * Naming follows the sokol / miniaudio conventions: the symbol prefix is `bwa_`
  * ("bw" is the family namespace, "a" is audio — other bw_* libraries can sit
@@ -131,6 +133,10 @@ BWA_API void    bwa_unload_sound(bwa_engine* e, bwa_sound snd);    /* safe: reti
  * via bwa_bed_* as a world-locked diffuse bed decoded to the speakers; resampled to the engine rate
  * at load if needed. 0 = failure (bad channel count / decode error). */
 BWA_API bwa_sound bwa_load_ambix(bwa_engine* e, const char* path);
+/* Like bwa_load_ambix for legacy FuMa B-format recordings (.amb and friends: WXYZ|RSTUV|KLMNOPQ
+ * channel order, MaxN + the W -3 dB): converted to AmbiX at load, so past this call the asset is
+ * indistinguishable from an AmbiX load of the same field. Full 3D sets only (4/9/16 channels). */
+BWA_API bwa_sound bwa_load_fuma(bwa_engine* e, const char* path);
 
 /* ---- sources (control thread; non-blocking, enqueue only) ---- */
 BWA_API bwa_source bwa_source_create(bwa_engine* e);              /* handle returned synchronously */
@@ -223,6 +229,13 @@ BWA_API void  bwa_bed_set_gain(bwa_engine* e, bwa_bed b, float linear);   /* mas
  * to the target at ~one turn/s (click-free, live), applied before EITHER bed renderer (matrix and
  * parametric see the same turned field). Per-frame-safe. */
 BWA_API void  bwa_bed_set_rotation(bwa_engine* e, bwa_bed b, float yaw_rad);
+/* Full 3-axis orientation (radians; supersedes bwa_bed_set_rotation, which is the yaw-only shorthand
+ * and resets pitch/roll to 0): LEVEL or reorient a recorded soundfield whose capture wasn't upright.
+ * Yaw as above; positive pitch tilts the field's front (+z) upward; positive roll tilts its top
+ * toward the room's right (-x). Applied roll -> pitch -> yaw. Yaw-only stays on the closed-form
+ * phasor path; any pitch/roll runs a full SH rotation matrix (Ivanic-Ruedenberg), rebuilt per block
+ * from angles that glide at ~one turn/s — click-free and live, same as yaw. Per-frame-safe. */
+BWA_API void  bwa_bed_set_orientation(bwa_engine* e, bwa_bed b, float yaw_rad, float pitch_rad, float roll_rad);
 BWA_API void  bwa_bed_stop(bwa_engine* e, bwa_bed b);
 BWA_API void  bwa_bed_destroy(bwa_engine* e, bwa_bed b);
 /* The rest of a bed's control surface matches the bwa_source_* call of the same name (a bed IS a
@@ -450,13 +463,26 @@ BWA_API uint32_t bwa_get_channel_count(bwa_engine* e);
  * (energy-vector) normalisation — better low-frequency localisation for a near-centred listener. Wraps
  * the selected panner; live-toggleable for A/B. Sweet-spot dependent like VBAP (see docs). */
 BWA_API void     bwa_set_dual_band(bwa_engine* e, bool on);
+/* max-rE weighting for the SH->speaker BED decode (off by default; live A/B, crossfaded): tapers the
+ * higher ambisonic orders (Zotter & Frank's psychoacoustic decoder weights, diffuse-energy-matched so
+ * A and B stay level-fair), which suppresses decode sidelobes and lengthens the energy vector —
+ * better localization AWAY from the sweet spot, exactly the walking-listener case, at a slightly
+ * wider main lobe. Reaches every consumer of the engine's own decode: ambisonic beds (matrix
+ * renderer), the FDN reverb's line render. Point-source panning (DBAP/SPCAP/VBAP) and phonon's own
+ * decodes are untouched. Bake the winner after the hardware bake-off. */
+BWA_API void     bwa_set_max_re(bwa_engine* e, bool on);
 /* How bwa_source_set_spread renders a source's width (live A/B; sources with spread 0 are unaffected).
  * LOBE (default) reshapes the point gains toward a width-controlled lobe — one solve, smooth,
  * approximate. MDAP (Pulkki's multiple-direction amplitude panning) pans a ring of virtual sources
  * around the source direction with the selected panner and sums — the extent is made of real panner
  * solves (panner-true: VBAP stays sparse, SPCAP stays placement-corrected), at ~13x the gain-solve
- * cost (block-rate + dirty-gated, still cheap). Both are constant-power. See docs/spatialization.md. */
-typedef enum { BWA_SPREAD_LOBE = 0, BWA_SPREAD_MDAP = 1 } bwa_spread_mode;
+ * cost (block-rate + dirty-gated, still cheap). SPECTRAL is frequency-dependent panning (Zotter &
+ * Frank's phantom-source widening): the source splits into 6 bands and each band is panned to its
+ * own direction inside the spread cone (LF stays on the source direction) — the ear integrates the
+ * scattered spectrum into width, with no decorrelation noise and no phantom collapse as the tracked
+ * listener walks; costs ~6 band filters + gain sets per wide voice. All are constant-power (SPECTRAL
+ * to within its crossover overlap, < ~1 dB). See docs/spatialization.md. */
+typedef enum { BWA_SPREAD_LOBE = 0, BWA_SPREAD_MDAP = 1, BWA_SPREAD_SPECTRAL = 2 } bwa_spread_mode;
 BWA_API void     bwa_set_spread_mode(bwa_engine* e, bwa_spread_mode mode);
 /* Decorrelate the WIDE part of spread sources (off by default; live A/B). Amplitude panning feeds
  * every speaker the SAME signal, so a wide source still collapses to phantom images and comb-filters

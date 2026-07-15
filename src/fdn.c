@@ -37,6 +37,9 @@ struct Fdn {
     uint32_t w;                   /* shared sample counter (each ring indexes it modulo its own pow2) */
     float    dir[FDN_N][3];       /* line directions, room axes (Fibonacci sphere) */
     float    dcomb[BWA_CHANNELS][FDN_N];   /* line -> speaker render (bed decode of each line's plane wave) */
+    float    dcomb_re[BWA_CHANNELS][FDN_N];/* the same render with max-rE tapered encodes (fdn_set_max_re) */
+    _Atomic int max_re;           /* live A/B target; the tap crossfades re_cur toward it */
+    float    re_cur;              /* audio-thread crossfade state (0 = dcomb .. 1 = dcomb_re) */
     float    in_g[FDN_N];         /* aux injection gains (alternating sign, 1/sqrt(N)) */
     /* per-line decay filter: y = g_hf*x + (g_lf - g_hf)*lp, lp += a*(x - lp) */
     float    g_lf[FDN_N], g_hf[FDN_N], lp[FDN_N], xa;
@@ -100,14 +103,17 @@ Fdn* fdn_create(const Layout* L, uint32_t sample_rate, uint32_t channels) {
             }
         }
     }
+    float rw[BWA_AMBI_CH];
+    ambi_max_re_weights(BWA_AMBI_ORDER, rw);                    /* the lines encode at full order */
     for (int l = 0; l < FDN_N; ++l) {
         fib16(l, f->dir[l]);
         float ad[3] = { f->dir[l][2], f->dir[l][0], f->dir[l][1] };   /* room -> ambi (z,x,y) */
         float y[BWA_AMBI_CH]; ambi_encode_sn3d(ad, y);
         for (uint32_t s = 0; s < channels; ++s) {
-            float acc = 0.f;
-            for (int k = 0; k < BWA_AMBI_CH; ++k) acc += dec[s][k] * y[k];
-            f->dcomb[s][l] = acc;
+            float acc = 0.f, acr = 0.f;
+            for (int k = 0; k < BWA_AMBI_CH; ++k) { acc += dec[s][k] * y[k]; acr += dec[s][k] * y[k] * rw[k]; }
+            f->dcomb[s][l]    = acc;
+            f->dcomb_re[s][l] = acr;                            /* the max-rE render of the same line */
         }
         f->in_g[l] = ((l & 1) ? 1.f : -1.f) * 0.25f;            /* 1/sqrt(N), alternating sign */
     }
@@ -145,6 +151,10 @@ void fdn_set_gain(Fdn* f, float gain) {
     if (f) atomic_store_explicit(&f->gain, gain < 0.f ? 0.f : gain, memory_order_relaxed);
 }
 
+void fdn_set_max_re(Fdn* f, int on) {
+    if (f) atomic_store_explicit(&f->max_re, on ? 1 : 0, memory_order_relaxed);
+}
+
 void fdn_tap(void* ud, float* bus, uint32_t n, const float* lp_, const float* lq, const float* aux) {
     (void)lp_; (void)lq;
     Fdn* f = (Fdn*)ud;
@@ -154,6 +164,13 @@ void fdn_tap(void* ud, float* bus, uint32_t n, const float* lp_, const float* lq
     const float g_tgt  = atomic_load_explicit(&f->gain, memory_order_relaxed);
     const float g_step = (g_tgt - f->gain_cur) / (float)n;
     float g = f->gain_cur;
+    /* max-rE render pair: settled picks ONE matrix; mid-crossfade renders both and lerps per sample
+     * (the same aim-and-land single read as the gain — invariant 4). */
+    const float re_tgt  = atomic_load_explicit(&f->max_re, memory_order_relaxed) ? 1.f : 0.f;
+    const float re_step = (re_tgt - f->re_cur) / (float)n;
+    float re = f->re_cur;
+    const int   re_fade = (re_tgt != f->re_cur);
+    float (*dc_set)[FDN_N] = (f->re_cur >= 1.f) ? f->dcomb_re : f->dcomb;   /* settled matrix */
     uint32_t w = f->w;
     for (uint32_t i = 0; i < n; ++i) {
         float y[FDN_N], sum = 0.f;
@@ -168,15 +185,27 @@ void fdn_tap(void* ud, float* bus, uint32_t n, const float* lp_, const float* lq
         const float h = sum * (2.f / (float)FDN_N);
         for (int l = 0; l < FDN_N; ++l)                         /* Householder feedback + input */
             f->ring[l][w & f->rmask[l]] = y[l] - h + f->in_g[l] * in;
-        for (uint32_t s = 0; s < f->channels; ++s) {            /* render each line as its plane wave */
-            const float* dc = f->dcomb[s];
-            float acc = 0.f;
-            for (int l = 0; l < FDN_N; ++l) acc += dc[l] * y[l];
-            bus[(size_t)s * n + i] += g * acc;
+        if (!re_fade) {
+            for (uint32_t s = 0; s < f->channels; ++s) {        /* render each line as its plane wave */
+                const float* dc = dc_set[s];
+                float acc = 0.f;
+                for (int l = 0; l < FDN_N; ++l) acc += dc[l] * y[l];
+                bus[(size_t)s * n + i] += g * acc;
+            }
+        } else {
+            for (uint32_t s = 0; s < f->channels; ++s) {        /* A/B crossfade: both renders, lerped */
+                const float* d0 = f->dcomb[s];
+                const float* d1 = f->dcomb_re[s];
+                float a0 = 0.f, a1 = 0.f;
+                for (int l = 0; l < FDN_N; ++l) { a0 += d0[l] * y[l]; a1 += d1[l] * y[l]; }
+                bus[(size_t)s * n + i] += g * (a0 + re * (a1 - a0));
+            }
+            re += re_step;
         }
         g += g_step;
         ++w;
     }
     f->gain_cur = g_tgt;                                        /* land exactly (same local) */
+    f->re_cur   = re_tgt;
     f->w = w;
 }

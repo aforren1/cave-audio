@@ -22,6 +22,24 @@
 /* Real SH gains for a unit direction `dir` (ambisonic axes), written to y[16] (ACN/SN3D). */
 void ambi_encode_sn3d(const float dir[3], float y[BWA_AMBI_CH]);
 
+/* max-rE decode weights (Zotter & Frank 2012) for content of `order` (1..3): per-ACN-channel gains
+ * w[k] = gamma * P_l(r), where r is the largest zero of P_{order+1} and gamma renormalizes so a
+ * DIFFUSE field keeps its energy (gamma^2 * sum (2l+1) P_l(r)^2 = sum (2l+1)). Scaling the SH signal
+ * by these before a decode D is the max-rE decode D*diag(w): it tapers the high orders, which
+ * suppresses the decode's sidelobes and lengthens the energy vector — better localization AWAY from
+ * the sweet spot, at a slightly wider main lobe. Channels beyond the order are written as 1. */
+void ambi_max_re_weights(int order, float w[BWA_AMBI_CH]);
+
+/* Full 3-axis SH rotation (Ivanic & Ruedenberg 1996, the standard real-SH recursion): build the
+ * packed block-diagonal matrix M (l = 1..3 blocks: 3x3 + 5x5 + 7x7 = 83 floats, row-major, centered
+ * indices; l = 0 is always identity) for the 3x3 direction rotation R (ambi axes, field convention:
+ * applying M to an encoded plane wave from d yields the encode of R*d). Normalization-agnostic:
+ * rotation mixes only within one degree l, and SN3D/N3D differ by a per-l scale. */
+#define BWA_SH_ROT_N 83
+void ambi_rot_matrix(const float R[3][3], float M[BWA_SH_ROT_N]);
+/* Apply M to an ACN SH vector of nch channels (4/9/16; blocks past nch untouched). out != sh. */
+void ambi_rot_apply(const float M[BWA_SH_ROT_N], const float* sh, int nch, float* out);
+
 /* Per-ACN-channel gain converting the SN3D encode above into the orthonormal real-SH basis Steam
  * Audio (phonon) consumes internally: its iplAmbisonicsDecodeEffect takes no normalization param,
  * and its SH evaluator is math-orthonormal (= N3D / sqrt(4pi)). Factor = sqrt(2l+1)/sqrt(4pi) for a

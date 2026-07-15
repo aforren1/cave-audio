@@ -33,6 +33,11 @@ bool sound_load(const char* path, uint32_t want_rate, SoundData* out, char* err,
  * channel to want_rate if needed. Rejects other channel counts. Same ownership as sound_load. */
 bool sound_load_ambix(const char* path, uint32_t want_rate, SoundData* out, char* err, size_t errcap);
 
+/* Like sound_load_ambix, but the file is FuMa B-format (WXYZ | RSTUV | KLMNOPQ, MaxN + the W
+ * -3 dB): channels are reordered to ACN and rescaled to SN3D at load, so the stored asset is
+ * identical to an AmbiX load of the same field. Full 3D sets only (4/9/16 channels). */
+bool sound_load_fuma(const char* path, uint32_t want_rate, SoundData* out, char* err, size_t errcap);
+
 void sound_unload(SoundData* s);   /* frees pcm; safe on a zeroed/empty SoundData */
 
 #endif /* BWA_SOUND_H */

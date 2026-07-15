@@ -1,5 +1,7 @@
-/* ambisonics.c — 3rd-order real SH encode (ACN/SN3D). See ambisonics.h. */
+/* ambisonics.c — 3rd-order real SH encode (ACN/SN3D), max-rE weights, SH rotation. See ambisonics.h. */
 #include "ambisonics.h"
+
+#include <math.h>
 
 /* SN3D-normalized real spherical harmonics in Cartesian form (unit dir; x=front, y=left, z=up).
  * Constants: sqrt(3)=1.7320508, sqrt(3)/2=0.8660254, sqrt(15)=3.8729833, sqrt(15)/2=1.9364917,
@@ -26,6 +28,100 @@ void ambi_encode_sn3d(const float dir[3], float y[BWA_AMBI_CH]) {
     y[13] = 0.6123724f * x * (5.0f * z * z - 1.0f);          /*      m=+1    */
     y[14] = 1.9364917f * z * (x * x - yy * yy);              /*      m=+2    */
     y[15] = 0.7905694f * x * (x * x - 3.0f * yy * yy);       /*      m=+3    */
+}
+
+/* max-rE weights: w_l = P_l(r) with r the largest zero of P_{order+1}, energy-renormalized (header).
+ * The roots are exact: P_2 -> 1/sqrt(3), P_3 -> sqrt(3/5), P_4 -> sqrt((15 + 2*sqrt(30))/35). */
+void ambi_max_re_weights(int order, float w[BWA_AMBI_CH]) {
+    if (order < 1) order = 1; else if (order > 3) order = 3;
+    static const double rr[3] = { 0.5773502691896258, 0.7745966692414834, 0.8611363115940526 };
+    const double r = rr[order - 1];
+    const double pl[4] = { 1.0, r, 0.5 * (3.0*r*r - 1.0), 0.5 * (5.0*r*r*r - 3.0*r) };
+    double e = 0.0, n = 0.0;
+    for (int l = 0; l <= order; ++l) { e += (2*l + 1) * pl[l] * pl[l]; n += 2*l + 1; }
+    const double g = sqrt(n / e);                       /* diffuse-energy match: fair A/B levels */
+    for (int k = 0; k < BWA_AMBI_CH; ++k) {
+        const int l = (int)floorf(sqrtf((float)k));
+        w[k] = (l <= order) ? (float)(g * pl[l]) : 1.0f;
+    }
+}
+
+/* ---- SH rotation (Ivanic & Ruedenberg 1996, with the published errata) ----
+ * Block l is built from block l-1 and the l=1 matrix via the P/U/V/W recursion. Centered indices
+ * throughout: block l is (2l+1)x(2l+1), entry (m', m) at [(m'+l)*(2l+1) + (m+l)]. */
+
+/* r1 is the l=1 block (SH order m = -1,0,+1); prev is block l-1. P(i, a, b) of the recursion. */
+static float rot_P(const float r1[9], const float* prev, int l, int i, int a, int b) {
+    const int d = 2*l - 1;                              /* prev block dimension */
+    const float* pr = prev + (a + l - 1) * d;           /* prev row a (centered) */
+    if (b ==  l) return r1[(i+1)*3 + 2] * pr[d - 1] - r1[(i+1)*3 + 0] * pr[0];
+    if (b == -l) return r1[(i+1)*3 + 2] * pr[0]     + r1[(i+1)*3 + 0] * pr[d - 1];
+    return r1[(i+1)*3 + 1] * pr[b + l - 1];
+}
+
+void ambi_rot_matrix(const float R[3][3], float M[BWA_SH_ROT_N]) {
+    /* l=1: the SH dipoles are (y, z, x), so the block is R with rows/cols permuted. This seed makes
+     * M the FIELD rotation: M * encode(d) == encode(R * d) (ambi_test pins it for random rotations). */
+    static const int c3[3] = { 1, 2, 0 };               /* SH index -> cartesian component */
+    float* m1 = M;
+    for (int i = 0; i < 3; ++i)
+        for (int j = 0; j < 3; ++j)
+            m1[i*3 + j] = R[c3[i]][c3[j]];
+
+    const float* prev = m1;
+    int off = 9;
+    for (int l = 2; l <= 3; ++l) {
+        float* out = M + off;
+        const int dim = 2*l + 1;
+        for (int a = -l; a <= l; ++a) {
+            for (int b = -l; b <= l; ++b) {
+                const int aa = a < 0 ? -a : a;
+                const float den = (b == l || b == -l) ? (float)((2*l) * (2*l - 1))
+                                                      : (float)((l + b) * (l - b));
+                float acc = 0.f;
+                const float u = sqrtf((float)((l + a) * (l - a)) / den);
+                if (u != 0.f) acc += u * rot_P(m1, prev, l, 0, a, b);
+                {   /* v * V: v = 0.5*sqrt((1+d(a,0))(l+|a|-1)(l+|a|)/den) * (1 - 2*d(a,0)) */
+                    const float v = 0.5f * sqrtf((float)((1 + (a == 0)) * (l + aa - 1) * (l + aa)) / den)
+                                  * (a == 0 ? -1.f : 1.f);
+                    float V;
+                    if      (a == 0)  V = rot_P(m1, prev, l, 1, 1, b) + rot_P(m1, prev, l, -1, -1, b);
+                    else if (a == 1)  V = 1.41421356f * rot_P(m1, prev, l, 1, 0, b);
+                    else if (a >  1)  V = rot_P(m1, prev, l, 1, a - 1, b) - rot_P(m1, prev, l, -1, -a + 1, b);
+                    else if (a == -1) V = 1.41421356f * rot_P(m1, prev, l, -1, 0, b);
+                    else              V = rot_P(m1, prev, l, 1, a + 1, b) + rot_P(m1, prev, l, -1, -a - 1, b);
+                    acc += v * V;
+                }
+                if (a != 0) {   /* w * W: w = -0.5*sqrt((l-|a|-1)(l-|a|)/den); zero at |a| >= l-1 */
+                    const float w = -0.5f * sqrtf((float)((l - aa - 1) * (l - aa)) / den);
+                    if (w != 0.f) {
+                        const float W = (a > 0)
+                            ? rot_P(m1, prev, l, 1, a + 1, b) + rot_P(m1, prev, l, -1, -a - 1, b)
+                            : rot_P(m1, prev, l, 1, a - 1, b) - rot_P(m1, prev, l, -1, -a + 1, b);
+                        acc += w * W;
+                    }
+                }
+                out[(a + l) * dim + (b + l)] = acc;
+            }
+        }
+        prev = out;
+        off += dim * dim;
+    }
+}
+
+void ambi_rot_apply(const float M[BWA_SH_ROT_N], const float* sh, int nch, float* out) {
+    static const int off[3] = { 0, 9, 34 };
+    out[0] = sh[0];
+    const int maxl = nch >= 16 ? 3 : (nch >= 9 ? 2 : 1);
+    for (int l = 1; l <= maxl; ++l) {
+        const int dim = 2*l + 1, base = l*l;
+        const float* m = M + off[l - 1];
+        for (int i = 0; i < dim; ++i) {
+            float acc = 0.f;
+            for (int j = 0; j < dim; ++j) acc += m[i*dim + j] * sh[base + j];
+            out[base + i] = acc;
+        }
+    }
 }
 
 /* sqrt(2l+1)/sqrt(4pi) per ACN channel — SN3D (AmbiX) -> phonon's orthonormal real SH (see header).

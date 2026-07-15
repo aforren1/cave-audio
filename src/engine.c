@@ -97,6 +97,7 @@ struct bwa_engine {
                                    * when enabled, the FDN takes the bus tap (not the Steam bed) */
     float         refl_wet;       /* reverb wet level (bwa_reflections_set_gain, the one control);
                                    * seeds whichever bed bwa_start creates, live thereafter */
+    int           max_re;         /* mirror of bwa_set_max_re, so a pre-start toggle seeds the FDN */
     SteamPath*    path;           /* pathing (bwa_desc.enable_pathing); NULL otherwise */
     float         src_pos[BWA_VOICE_CAP][3];  /* control-side per-source positions, so set_pathing has the pos */
 
@@ -369,6 +370,7 @@ bwa_result bwa_start(bwa_engine* e) {
                 e->fdn_cfg.decay_factor > 0.f && e->fdn_cfg.decay_factor != 1.f)
                 fdn_set_decay_direction(e->fdn, d, e->fdn_cfg.decay_factor);
             fdn_set_gain(e->fdn, e->refl_wet);
+            fdn_set_max_re(e->fdn, e->max_re);      /* a pre-start bwa_set_max_re reaches the FDN too */
             rt_set_bus_tap(e->rt, fdn_tap, e->fdn);
         } else set_error(e, "bwa_start: FDN reverb allocation failed (running dry)");
     }
@@ -496,6 +498,14 @@ bwa_sound bwa_load_ambix(bwa_engine* e, const char* path) {
     return snd;
 }
 
+bwa_sound bwa_load_fuma(bwa_engine* e, const char* path) {
+    if (!e) return 0;
+    clear_error(e);
+    bwa_sound snd = rt_load_fuma(e->rt, path, e->errbuf, sizeof e->errbuf);
+    if (snd == 0) set_error(e, e->errbuf[0] ? e->errbuf : "bwa_load_fuma: failed");
+    return snd;
+}
+
 /* ---- ambisonic beds: a bed is a voice that plays a multichannel asset; mix_bed decodes it ---- */
 bwa_bed bwa_bed_create(bwa_engine* e)                                { return bwa_source_create(e); }
 void  bwa_bed_play(bwa_engine* e, bwa_bed b, bwa_sound snd, bool loop) {
@@ -598,6 +608,12 @@ void bwa_set_test_signal(bwa_engine* e, uint32_t channel, bwa_test_kind kind, fl
 
 void bwa_set_panner(bwa_engine* e, bwa_panner panner) { if (e) { e->panner = (int)panner; rt_set_panner(e->rt, (int)panner); } }
 void bwa_set_dual_band(bwa_engine* e, bool on)       { if (e) rt_set_dual_band(e->rt, on); }
+void bwa_set_max_re(bwa_engine* e, bool on) {
+    if (!e) return;
+    e->max_re = on ? 1 : 0;                          /* staged for the FDN bwa_start may still create */
+    rt_set_max_re(e->rt, e->max_re);
+    if (e->fdn) fdn_set_max_re(e->fdn, e->max_re);   /* live: the FDN crossfades its render pair */
+}
 void bwa_set_spread_mode(bwa_engine* e, bwa_spread_mode mode) { if (e) rt_set_spread_mode(e->rt, (int)mode); }
 void bwa_set_tracked_room_eq(bwa_engine* e, bool on)  { if (e) rt_set_room_eq_dyn(e->rt, on); }
 void bwa_set_decorrelation(bwa_engine* e, bool on)    { if (e) rt_set_decorrelation(e->rt, on); }
@@ -619,6 +635,9 @@ void bwa_group_set_gain  (bwa_engine* e, uint32_t group, float linear){ if (e) r
 void bwa_group_set_paused(bwa_engine* e, uint32_t group, bool paused) { if (e) rt_group_set_paused(e->rt, group, paused); }
 void bwa_source_set_pitch(bwa_engine* e, bwa_source s, float rate)      { if (e) rt_source_set_pitch(e->rt, s, rate); }
 void bwa_bed_set_rotation(bwa_engine* e, bwa_bed b, float yaw_rad)      { if (e) rt_bed_set_rotation(e->rt, b, yaw_rad); }
+void bwa_bed_set_orientation(bwa_engine* e, bwa_bed b, float yaw_rad, float pitch_rad, float roll_rad) {
+    if (e) rt_bed_set_orientation(e->rt, b, yaw_rad, pitch_rad, roll_rad);
+}
 
 /* Manual occlusion: the same handle-gated, audio-thread-ramped publish path the Steam sim uses
  * (rt_set_occlusion / rt_set_occlusion_eq), driven from the control thread. Do not drive a source

@@ -445,6 +445,37 @@ int main(void) {
                 if (rl <= 0 || (rE[0]*s3[0] + rE[1]*s3[1] + rE[2]*s3[2])/rl < 0.9f) loc_ok = 0;  /* within ~25 deg */
             }
             CHECK(loc_ok, "AllRAD localizes plane waves toward their direction");
+
+            /* max-rE weights (ambi_max_re_weights) lengthen the ENERGY VECTOR through the real
+             * decode: |rE|/E with the tapered encode beats the raw encode for every test plane wave
+             * — the acoustic claim behind bwa_set_max_re (sharper energy concentration = better
+             * localization away from the sweet spot). */
+            {
+                float rw[BWA_AMBI_CH];
+                ambi_max_re_weights(3, rw);
+                int re_ok = 1;
+                for (int t2 = 0; t2 < 3; ++t2) {
+                    float* sd = dirs[t2]; float sl = sqrtf(sd[0]*sd[0] + sd[1]*sd[1] + sd[2]*sd[2]);
+                    float s3[3] = { sd[0]/sl, sd[1]/sl, sd[2]/sl };
+                    float ad[3] = { s3[2], s3[0], s3[1] }, sh[BWA_AMBI_CH]; ambi_encode_sn3d(ad, sh);
+                    double rlen[2];
+                    for (int m = 0; m < 2; ++m) {
+                        double rE[3] = { 0, 0, 0 }, E = 0;
+                        for (int s = 0; s < CH; ++s) {
+                            float f = 0;
+                            for (int k = 0; k < BWA_AMBI_CH; ++k) f += dec[s][k] * sh[k] * (m ? rw[k] : 1.f);
+                            float p[3] = { LD.speakers[s].pos[0] - LD.ref[0], LD.speakers[s].pos[1] - LD.ref[1],
+                                           LD.speakers[s].pos[2] - LD.ref[2] };
+                            float pl = sqrtf(p[0]*p[0] + p[1]*p[1] + p[2]*p[2]);
+                            double w = (double)f * f;
+                            E += w; rE[0] += w*p[0]/pl; rE[1] += w*p[1]/pl; rE[2] += w*p[2]/pl;
+                        }
+                        rlen[m] = E > 0 ? sqrt(rE[0]*rE[0] + rE[1]*rE[1] + rE[2]*rE[2]) / E : 0;
+                    }
+                    if (!(rlen[1] > rlen[0] + 0.01)) re_ok = 0;
+                }
+                CHECK(re_ok, "max-rE weights lengthen the energy vector through the AllRAD decode");
+            }
         }
 
         /* imaginary pole speaker: a FLOOR-LESS array (the default grid minus its y=0 level) leaves a
@@ -508,6 +539,6 @@ int main(void) {
 
     remove(LJ);
     if (fails) { printf("dsp_test: %d FAILURES\n", fails); return 1; }
-    printf("dsp_test OK (layout parse, DBAP + SPCAP + VBAP, AllRAD bed decode, align gain+delay)\n");
+    printf("dsp_test OK (layout parse, DBAP + SPCAP + VBAP, AllRAD bed decode + max-rE, align gain+delay)\n");
     return 0;
 }

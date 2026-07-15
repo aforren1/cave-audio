@@ -1,0 +1,3 @@
+// Explorer/.exe icon (console example; reuses the minimal-client glyph — run
+// gen_icons.py to mint a distinct one).
+1 ICON "bwa_minimal.ico"

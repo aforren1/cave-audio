@@ -140,7 +140,47 @@ int main(void) {
         }
     }
 
+    /* 5. max-rE render pair (fdn_set_max_re): the taper only swaps the line->speaker render — the
+     * decay loop is untouched, so the RT60 must stay put, the level must stay ~fair (energy-
+     * normalized weights), and a mid-run toggle (the per-sample crossfade) must stay finite. */
+    {
+        Fdn* f = fdn_create(&L, RATE, CH);
+        if (f) {
+            fdn_set_decay(f, 0.8f, 0.8f, 2000.f);
+            fdn_set_max_re(f, 1);
+            run_fdn(f, &L, NULL, BLOCKS, e);
+            double rt = rt60_fit(e, 40, 150);
+            printf("fdn: max-rE rt60 = %.3f s (want 0.8)\n", rt);
+            CHECK(rt > 0.6 && rt < 1.0, "max-rE render keeps the configured RT60");
+            int finite = 1;
+            for (int b = 0; b < BLOCKS; ++b) if (!isfinite(e[b])) finite = 0;
+            CHECK(finite, "max-rE render stays finite");
+            fdn_destroy(f);
+        }
+        Fdn* f0 = fdn_create(&L, RATE, CH);
+        Fdn* f1 = fdn_create(&L, RATE, CH);
+        if (f0 && f1) {
+            static double e0[BLOCKS], e1[BLOCKS];
+            fdn_set_decay(f0, 0.8f, 0.8f, 2000.f);
+            fdn_set_decay(f1, 0.8f, 0.8f, 2000.f);
+            fdn_set_max_re(f1, 1);
+            run_fdn(f0, &L, NULL, 100, e0);
+            run_fdn(f1, &L, NULL, 100, e1);
+            double s0 = 0, s1 = 0;
+            for (int b = 5; b < 100; ++b) { s0 += e0[b]; s1 += e1[b]; }
+            printf("fdn: max-rE level delta %.2f dB\n", 10.0 * log10(s1 / s0));
+            CHECK(s0 > 0 && fabs(10.0 * log10(s1 / s0)) < 2.0, "max-rE render keeps the reverb level");
+            fdn_set_max_re(f0, 1);                   /* toggle a warm instance: the crossfade path */
+            static double e2[BLOCKS];
+            run_fdn(f0, &L, NULL, 50, e2);
+            int finite = 1;
+            for (int b = 0; b < 50; ++b) if (!isfinite(e2[b])) finite = 0;
+            CHECK(finite, "mid-run max-rE toggle stays finite");
+            fdn_destroy(f0); fdn_destroy(f1);
+        }
+    }
+
     if (fails) { printf("fdn_test: %d FAILURES\n", fails); return 1; }
-    printf("fdn_test OK (tail, RT60 landing, 2-band decay, anisotropic decay, stability)\n");
+    printf("fdn_test OK (tail, RT60 landing, 2-band decay, anisotropic decay, max-rE pair, stability)\n");
     return 0;
 }

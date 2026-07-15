@@ -13,6 +13,7 @@
 #include "rt.h"
 #include "layout.h"
 #include "sound.h"
+#include "ambisonics.h"   /* the SN3D encode, for the FuMa conversion check */
 #include "dr_wav.h"
 
 #include <math.h>
@@ -154,9 +155,58 @@ int main(void) {
         remove(WAV_44K);
     }
 
+    /* 6. FuMa -> AmbiX at load: write a 16-ch FuMa file encoding a known plane wave (each channel =
+     * the SN3D value / the FuMa->SN3D factor, in FuMa channel order) and load it with
+     * sound_load_fuma — the stored asset must equal the plain SN3D encode in ACN order, i.e. be
+     * indistinguishable from an AmbiX load of the same field. */
+    {
+        const char* WAV_FUMA = "bwa_snd_fuma.wav";
+        /* the SN3D encode of ambi direction (2,1,2)/3 (the asymmetric direction ambi_test pins) */
+        const float dir[3] = { 0.6666667f, 0.3333333f, 0.6666667f };
+        float sn3d[16];
+        ambi_encode_sn3d(dir, sn3d);
+        /* FuMa channel i carries ACN acn[i], scaled by the SN3D->FuMa factor (the inverse of the
+         * loader's table — an independent restatement of the published constants) */
+        static const int   acn[16] = { 0, 3, 1, 2, 6, 7, 5, 8, 4, 12, 13, 11, 14, 10, 15, 9 };
+        const float        s2f[16] = { 0.70710678f, 1.f, 1.f, 1.f,                    /* W X Y Z */
+                                       1.f, 1.15470054f, 1.15470054f, 1.15470054f, 1.15470054f,   /* R S T U V */
+                                       1.f, 1.18585412f, 1.18585412f,                 /* K L M: sqrt(45/32) */
+                                       1.34164079f, 1.34164079f,                      /* N O: 3/sqrt(5) */
+                                       1.26491106f, 1.26491106f };                    /* P Q: sqrt(8/5) */
+        float frame[16];
+        for (int i = 0; i < 16; ++i) frame[i] = sn3d[acn[i]] * s2f[i];
+        drwav_data_format fmt = { drwav_container_riff, DR_WAVE_FORMAT_IEEE_FLOAT, 16, RATE, 32 };
+        drwav wav;
+        int wrote = 0;
+        if (drwav_init_file_write(&wav, WAV_FUMA, &fmt, NULL)) {
+            float buf[16 * 8];
+            for (int i = 0; i < 8; ++i) memcpy(buf + i * 16, frame, sizeof frame);
+            wrote = drwav_write_pcm_frames(&wav, 8, buf) == 8;
+            drwav_uninit(&wav);
+        }
+        CHECK(wrote, "write FuMa test wav");
+        if (wrote) {
+            SoundData sd;
+            bool ok = sound_load_fuma(WAV_FUMA, RATE, &sd, err, sizeof err);
+            CHECK(ok, ok ? "fuma load" : err);
+            if (ok) {
+                CHECK(sd.channels == 16 && sd.order == 3, "fuma bed keeps its channel count + order");
+                int match = 1;
+                for (int k = 0; k < 16; ++k)
+                    if (fabsf(sd.pcm[16 + k] - sn3d[k]) > 1e-4f) match = 0;   /* frame 1, ACN order */
+                CHECK(match, "FuMa load equals the SN3D encode in ACN order (reorder + rescale)");
+                sound_unload(&sd);
+            }
+            SoundData sbad;
+            CHECK(!sound_load_fuma("bwa_snd_long.wav", RATE, &sbad, err, sizeof err),
+                  "fuma load rejects a mono file");
+        }
+        remove(WAV_FUMA);
+    }
+
     remove(WAV_LONG);
     remove(WAV_SHORT);
     if (fails) { printf("sound_test: %d FAILURES\n", fails); return 1; }
-    printf("sound_test OK (wav/flac/mp3 decode, resample, oneshot recycle, unload-safety verified)\n");
+    printf("sound_test OK (wav/flac/mp3 decode, resample, FuMa->AmbiX, oneshot recycle, unload-safety verified)\n");
     return 0;
 }

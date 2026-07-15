@@ -45,6 +45,14 @@
 #define BWA_REFL_FAR_DIST   6.0f
 #define BWA_REFL_NEAR_SEND  0.25f
 #define BWA_DUALBAND_FC     700.0f     /* dual-band panning crossover (Hz): amplitude below, power above */
+/* spectral widening (BWA_SPREAD_SPECTRAL): split a spread voice into BWA_FS_BANDS complementary
+ * one-pole bands and pan EACH BAND to its own direction inside the spread cone — frequency-dependent
+ * panning (Zotter & Frank's phantom-source widening, ambix_widening's idea, applied per source): the
+ * ear integrates the spectrally scattered directions into WIDTH with no decorrelation noise and no
+ * phantom collapse, and every band gain is a real panner solve, so the extent is panner-true. */
+#define BWA_FS_BANDS  6
+#define BWA_FS_XOVERS 5
+static const float BWA_FS_XOVER[BWA_FS_XOVERS] = { 250.f, 700.f, 1800.f, 4500.f, 10000.f };
 /* decorrelation (bwa_set_decorrelation): per-channel velvet-noise filters over BWA_DECOR_MS with
  * BWA_DECOR_TAPS sparse taps — ~30 MACs/sample/channel, time-domain, no FFT, no onset latency
  * (Valimaki/Schlecht et al., Velvet-Noise Decorrelator, DAFx-17/18). */
@@ -115,6 +123,14 @@ typedef struct {
     float    air_a_cur, air_y1;
     float    dop_delay, dop_dtgt;            /* read delay + its smoothed target (2-pole, per-sample) */
     uint32_t dop_w;
+    /* spectral widening (spread mode 2, audio-thread-only): per-band pan gains replace the single-
+     * path output stage while engaged. fs_on: 0 = off, 1 = active, 2 = retiring (every band aims at
+     * the single-path target; the mixer hands back once they land). Engage seeds fs_g from gcur and
+     * retire lands on gtarget, so both handoffs are exact (no crossfade machinery needed). */
+    uint8_t  fs_on;
+    float    fs_lp[BWA_FS_XOVERS];                            /* band-splitter one-pole states */
+    float    fs_g[BWA_FS_BANDS][BWA_CHANNELS];                 /* live per-band gains (ramped) */
+    float    fs_t[BWA_FS_BANDS][BWA_CHANNELS];                 /* per-band targets (compute_gains) */
     float    spread;                         /* source angular width 0..1 (0 = point); blends the pan gains */
     float    size_m;                         /* source METRIC radius (m; 0 = point): floors the spread at the
                                               * angle the radius subtends from the listener, so physical size
@@ -145,9 +161,17 @@ typedef struct {
      * pitch_cur glides per sample (a change BENDS, never steps); cur_frac is the read position's
      * fractional part (cursor stays integer + frac — a long-lived voice never loses precision). */
     float    pitch, pitch_cur, cur_frac;
-    /* bed yaw (CMD_BED_YAW): rotate a bed's soundfield about the room's vertical axis. yaw_cur glides
-     * toward yaw at BWA_BED_YAW_RATE; mix_bed rotates the ±m SH pairs with a per-sample phasor. */
+    /* bed orientation (CMD_BED_ROT): rotate a bed's soundfield. Yaw-only runs the exact per-sample
+     * phasor path (yaw_cur glides toward yaw at BWA_BED_YAW_RATE); any pitch/roll engages the full
+     * Ivanic-Ruedenberg matrix path (rot_full): rot_m is the LIVE packed SH rotation, rebuilt per
+     * block from the glided angles and interpolated per sample toward the block target (invariant 4).
+     * Settling back to pitch = roll = 0 hands off to the phasor (the two agree exactly there). */
     float    yaw, yaw_cur;
+    float    bpitch, bpitch_cur, broll, broll_cur;
+    uint8_t  rot_full;
+    float    rot_m[BWA_SH_ROT_N];
+    /* max-rE bed-decode weighting (rt_set_max_re): ramps 0<->1 so the A/B crossfades (like dual_mix). */
+    float    re_mix;
     /* image-source early reflections (CMD_SET_ISM). Per image: a gliding fractional read into this
      * voice's ism_ring slice, a one-pole HF damping state (walls absorb HF harder), and a ramped
      * 26-gain vector from the panner solved AT THE IMAGE POSITION (so reflections are directional
@@ -322,8 +346,22 @@ struct RtCore {
      * direct stream's virtual sources on the array shell around ref; bed_pref matches its loudness
      * to the matrix decode's plane-wave rendering (both derived in build_bed_decode). */
     _Atomic int bed_param;   /* 0 = matrix decode (default); 1 = parametric; atomic for A/B */
+    /* max-rE decode weighting (rt_set_max_re, live A/B): per-content-order SH channel tapers
+     * (gamma * P_l(r), diffuse-energy-normalized — ambisonics.h), applied wherever bed_decode
+     * matrix-decodes a bed's signal (decode(w*sh) == the max-rE decode). The parametric ANALYSIS and
+     * its re-panned direct stream see the raw field (max-rE is a decode-side taper, not a field
+     * property). The FDN carries its own weighted render pair (fdn.c); phonon's decodes are its own. */
+    _Atomic int max_re;
+    float     re_w[3][BWA_AMBI_CH];   /* [content order - 1][ACN] */
     ParaBed*  para;          /* voice_cap entries */
     float     para_xa[3];    /* band-splitter one-pole coeffs (BWA_PARA_XOVER at the engine rate) */
+    float     fs_xa[BWA_FS_XOVERS];   /* spectral-widening splitter one-poles (BWA_FS_XOVER) */
+    /* spectral-widening band-overlap correlations W[a][b] = white-noise E[b_a * b_b] (the digital
+     * splitter's responses, integrated at rt_create; rows sum to the band's share, sum(W) == 1).
+     * The one-pole bands overlap heavily, so panning them APART loses the correlated cross terms;
+     * fs_solve rescales the whole band set by 1/sqrt(sum W_ab * (g_a.g_b)/P^2) — white-noise-exact
+     * constant power, content-typical otherwise (all-parallel bands -> exactly 1). */
+    float     fs_w[BWA_FS_BANDS][BWA_FS_BANDS];
     float     bed_radius;    /* mean speaker distance from ref (virtual-source shell) */
     float     bed_pref;      /* plane-wave loudness reference: sqrt(mean rendered power of the FOA matrix decode) */
 
@@ -645,8 +683,9 @@ static void drain_commands(RtCore* c) {
         case CMD_SET_PITCH: { Voice* v = voice_for(c, cmd->handle);
             if (v) { float r2 = cmd->u.pitch.rate;
                      v->pitch = r2 < 0.25f ? 0.25f : (r2 > 4.f ? 4.f : r2); } } break;   /* mixer glides */
-        case CMD_BED_YAW: { Voice* v = voice_for(c, cmd->handle);
-            if (v) v->yaw = cmd->u.byaw.yaw; } break;                     /* mix_bed glides toward it */
+        case CMD_BED_ROT: { Voice* v = voice_for(c, cmd->handle);
+            if (v) { v->yaw = cmd->u.brot.yaw; v->bpitch = cmd->u.brot.pitch;
+                     v->broll = cmd->u.brot.roll; } } break;              /* mix_bed glides toward them */
         case CMD_SET_ISM: { Voice* v = voice_for(c, cmd->handle);
             if (v) {
                 const bool on = cmd->u.ism.on != 0;
@@ -675,6 +714,7 @@ static void drain_commands(RtCore* c) {
                           v->refl_g_cur = 0.f;                  /* fresh start: ramp the wet send up from 0, no stale burst */
                           v->xover_lp = 0.f;                    /* fresh dual-band crossover state */
                           v->dual_mix = atomic_load_explicit(&c->dual_band, memory_order_relaxed) ? 1.f : 0.f;  /* start in the current mode */
+                          v->re_mix   = atomic_load_explicit(&c->max_re,    memory_order_relaxed) ? 1.f : 0.f;  /* (beds) likewise */
                           v->paused = false; v->pause_g = 1.f; v->seek_pending = 0; v->stopping = 0;   /* play always starts running */
                           if (v->dop_on) dop_line_reset(c, v, BWA_H_IDX(cmd->handle)); } } break;
         case CMD_STOP: { Voice* v = voice_for(c, cmd->handle);
@@ -931,6 +971,85 @@ static void mdap_gains(RtCore* c, int p, const Voice* v, float spread, float use
     for (uint32_t k = 0; k < c->channels; ++k) g[k] = acc[k] * norm;
 }
 
+/* Source spread, SPECTRAL mode (frequency-dependent panning — see BWA_FS_BANDS above): one real
+ * panner solve per band at a direction inside the spread cone. Band 0 (LF) stays on the source
+ * direction (LF localization is what dual-band fights for; scattering it buys nothing), the upper
+ * bands scatter around the cone ring golden-angle style at alternating radii, and each band is
+ * renormalised to the point solve's power P — complementary bands partition the signal, so the sum
+ * stays constant-power to within the crossover overlap (< ~1 dB). gtarget KEEPS the point solve:
+ * the band path replaces the output stage while engaged, seeding from gcur on engage and handing
+ * back onto gtarget on retire, so both transitions are exact (no crossfade machinery). With
+ * dual-band on, the sub-crossover bands (0..1, < 700 Hz) take the amplitude norm instead — the two
+ * A/Bs compose (folded in at the solve, so a dual toggle lands on the next re-solve). */
+static void fs_solve(RtCore* c, Voice* v, int p, float spread, float ug) {
+    float d[3] = { v->pos_active[0]-c->lis.p_active[0], v->pos_active[1]-c->lis.p_active[1], v->pos_active[2]-c->lis.p_active[2] };
+    float dl = sqrtf(d[0]*d[0] + d[1]*d[1] + d[2]*d[2]);
+    if (dl < 1e-6f) return;                              /* source on the listener: keep the last solve */
+    d[0]/=dl; d[1]/=dl; d[2]/=dl;
+    double p0 = 0.0; for (uint32_t k = 0; k < c->channels; ++k) p0 += (double)v->gtarget[k]*v->gtarget[k];
+    const float P = (float)sqrt(p0);                     /* the point solve's power (never re-level) */
+    if (P < 1e-9f) return;
+    float up[3] = { 0.f, 1.f, 0.f };                     /* orthonormal frame (u, w) around d, as MDAP */
+    if (d[1] > 0.9f || d[1] < -0.9f) { up[0] = 1.f; up[1] = 0.f; }
+    float u[3] = { up[1]*d[2]-up[2]*d[1], up[2]*d[0]-up[0]*d[2], up[0]*d[1]-up[1]*d[0] };
+    float ul = sqrtf(u[0]*u[0] + u[1]*u[1] + u[2]*u[2]);
+    u[0]/=ul; u[1]/=ul; u[2]/=ul;
+    float w[3] = { d[1]*u[2]-d[2]*u[1], d[2]*u[0]-d[0]*u[2], d[0]*u[1]-d[1]*u[0] };
+    if (!v->fs_on) {                                     /* engage seamlessly: bands start at the live
+                                                          * gains; the splitter (and the idled dual-band
+                                                          * crossover) restart clean */
+        for (int b = 0; b < BWA_FS_BANDS; ++b)
+            for (uint32_t k = 0; k < c->channels; ++k) v->fs_g[b][k] = v->gcur[k];
+        memset(v->fs_lp, 0, sizeof v->fs_lp);
+        v->xover_lp = 0.f;
+    }
+    v->fs_on = 1;
+    static const float fs_ca[BWA_FS_BANDS] = { 0.f, 1.f, 0.55f, 1.f, 0.55f, 1.f };   /* cone-angle scale */
+    static const float fs_az[BWA_FS_BANDS] = { 0.f, 0.f, 2.4f, 4.8f, 0.917f, 3.317f };  /* golden-ish ring */
+    for (int b = 0; b < BWA_FS_BANDS; ++b) {
+        float* t = v->fs_t[b];
+        if (b == 0) {
+            for (uint32_t k = 0; k < c->channels; ++k) t[k] = v->gtarget[k];
+        } else {
+            const float a = spread * 1.5707963f * fs_ca[b];              /* cone half-angle: spread 1 = 90 deg */
+            const float ca = cosf(a), sa = sinf(a), cp = cosf(fs_az[b]), sp = sinf(fs_az[b]);
+            float pos[3];
+            for (int k = 0; k < 3; ++k)
+                pos[k] = c->lis.p_active[k] + dl * (ca * d[k] + sa * (cp * u[k] + sp * w[k]));
+            panner_gains(c, p, pos, ug, t);
+            double bn = 0.0; for (uint32_t k = 0; k < c->channels; ++k) bn += (double)t[k]*t[k];
+            if (bn > 1e-12) { const float sc = (float)(P / sqrt(bn));
+                for (uint32_t k = 0; k < c->channels; ++k) t[k] *= sc; }
+        }
+    }
+    {   /* overlap compensation (see fs_w): predicted white-noise power = P^2 * sum W_ab (g_a.g_b)/P^2;
+         * scattering the correlated one-pole bands apart loses the cross terms, so rescale the whole
+         * set to put it back — exact for white input, 1 when the bands are parallel (spread -> 0). */
+        double q = 0.0;
+        for (int a = 0; a < BWA_FS_BANDS; ++a)
+            for (int b = a; b < BWA_FS_BANDS; ++b) {
+                double dot = 0.0;
+                for (uint32_t k = 0; k < c->channels; ++k) dot += (double)v->fs_t[a][k] * v->fs_t[b][k];
+                q += (a == b ? 1.0 : 2.0) * c->fs_w[a][b] * dot;
+            }
+        q /= (double)P * P;
+        if (q > 1e-6) {
+            const float comp = (float)(1.0 / sqrt(q));
+            for (int b = 0; b < BWA_FS_BANDS; ++b)
+                for (uint32_t k = 0; k < c->channels; ++k) v->fs_t[b][k] *= comp;
+        }
+    }
+    if (atomic_load_explicit(&c->dual_band, memory_order_acquire)) {
+        for (int b = 0; b <= 1; ++b) {                   /* < 700 Hz: amplitude (pressure) norm, as gtarget_lo */
+            float* t = v->fs_t[b];
+            double gs = 0.0, gp = 0.0;
+            for (uint32_t k = 0; k < c->channels; ++k) { gs += t[k]; gp += (double)t[k]*t[k]; }
+            if (gs > 1e-9) { const float sc = (float)(sqrt(gp) / gs);
+                for (uint32_t k = 0; k < c->channels; ++k) t[k] *= sc; }
+        }
+    }
+}
+
 /* DBAP gain solve (M4): listener-relative, dirty-gated. CMD_COMMIT re-dirties a voice on a
  * position change and dirties all voices on a listener move (gains are listener-relative). A bed
  * voice (multi-channel asset) has no DBAP position — its master gain rides gtarget[0]. */
@@ -981,11 +1100,17 @@ static void compute_gains(RtCore* c, Voice* v) {
         }
     }
     v->spread_eff = s_eff;
-    if (s_eff > 1e-3f) {                                     /* widen the image if this source has size */
-        if (atomic_load_explicit(&c->spread_mode, memory_order_acquire) == 1)
-            mdap_gains(c, p, v, s_eff, ug, v->gtarget);
-        else
-            spread_gains(c, v, s_eff, v->gtarget);
+    const int smode = (s_eff > 1e-3f)                        /* widen the image if this source has size */
+                    ? atomic_load_explicit(&c->spread_mode, memory_order_acquire) : -1;
+    if      (smode == 2) fs_solve(c, v, p, s_eff, ug);       /* spectral: per-band targets; gtarget stays the point */
+    else if (smode == 1) mdap_gains(c, p, v, s_eff, ug, v->gtarget);
+    else if (smode == 0) spread_gains(c, v, s_eff, v->gtarget);
+    if (v->fs_on && smode != 2) {
+        /* the mode or the spread left spectral: aim every band at the (possibly widened) single-path
+         * target and let the mixer hand back once they land (fs_on 2 -> 0, one block). */
+        for (int b = 0; b < BWA_FS_BANDS; ++b)
+            for (uint32_t k = 0; k < c->channels; ++k) v->fs_t[b][k] = v->gtarget[k];
+        v->fs_on = 2;
     }
 
     /* dual-band low band: the SAME gain directions, renormalised to amplitude (pressure) sum instead of
@@ -1065,6 +1190,14 @@ static void mix_voice(RtCore* c, Voice* v, uint16_t idx, float* bus, uint32_t n,
     float step_lo[BWA_CHANNELS];
     if (use_dual) for (uint32_t ch = 0; ch < c->channels; ++ch)
         step_lo[ch] = (v->gtarget_lo[ch] - v->gcur_lo[ch]) / (float)nr;
+    /* spectral widening (spread mode 2): while engaged the per-band gains REPLACE the single-path
+     * output stage (dual-band included — its < 700 Hz share is folded into the band targets by
+     * fs_solve). Bands ramp per sample like gcur (invariant 4); engage/retire hand off exactly. */
+    const int fs = v->fs_on;
+    float fs_step[BWA_FS_BANDS][BWA_CHANNELS];
+    if (fs) for (int b = 0; b < BWA_FS_BANDS; ++b)
+        for (uint32_t ch = 0; ch < c->channels; ++ch)
+            fs_step[b][ch] = (v->fs_t[b][ch] - v->fs_g[b][ch]) / (float)nr;
     /* gate the sim's publish on our own generation (we own v->gen, so this is race-free): apply the
      * published transmittance only if it was published for THIS occupant, else treat as clear. Read
      * once into a local so the ramp aims at and lands on the same value (invariant 4 — no jump). */
@@ -1381,11 +1514,29 @@ static void mix_voice(RtCore* c, Voice* v, uint16_t idx, float* bus, uint32_t n,
             const float sd = s * dc_a;
             const float cs = 1.f - dc_a * dc_a;                /* ... coherent share stays on the main path */
             s *= cs > 0.f ? sqrtf(cs) : 0.f;                   /* (ramp float error can graze cs < 0) */
+            const float* dcg = fs ? v->fs_g[0] : v->gcur;      /* spectral mode: band 0 IS the source direction */
             for (uint32_t ch = 0; ch < c->channels; ++ch)
-                c->dc_bus[(size_t)ch * n + i] += v->gcur[ch] * sd;
+                c->dc_bus[(size_t)ch * n + i] += dcg[ch] * sd;
             dc_a += dc_step;
         }
-        if (use_dual) {
+        if (fs) {                                              /* spectral widening: band-split, each band on its
+                                                                * own gain vector (complementary one-poles sum to
+                                                                * s, so equal band gains == the single path) */
+            float bnd[BWA_FS_BANDS], prev = 0.f;
+            for (int x = 0; x < BWA_FS_XOVERS; ++x) {
+                v->fs_lp[x] += c->fs_xa[x] * (s - v->fs_lp[x]);
+                bnd[x] = v->fs_lp[x] - prev; prev = v->fs_lp[x];
+            }
+            bnd[BWA_FS_XOVERS] = s - prev;
+            for (uint32_t ch = 0; ch < c->channels; ++ch) {
+                float acc = 0.f;
+                for (int b = 0; b < BWA_FS_BANDS; ++b) {
+                    acc += v->fs_g[b][ch] * bnd[b];
+                    v->fs_g[b][ch] += fs_step[b][ch];
+                }
+                bus[(size_t)ch * n + i] += acc;
+            }
+        } else if (use_dual) {
             float lo = v->xover_lp + xover_a * (s - v->xover_lp); v->xover_lp = lo;   /* LP @ 700 Hz */
             for (uint32_t ch = 0; ch < c->channels; ++ch) {                           /* single + dmix-scaled LF re-weight */
                 bus[(size_t)ch * n + i] += v->gcur[ch] * s + dmix * (v->gcur_lo[ch] - v->gcur[ch]) * lo;
@@ -1428,6 +1579,12 @@ static void mix_voice(RtCore* c, Voice* v, uint16_t idx, float* bus, uint32_t n,
         v->dual_mix = target_mix;                                    /* land the crossfade factor */
         if (target_mix == 0.f) v->xover_lp = 0.f;                    /* settled single next block: clean LP restart */
     }
+    if (fs) {
+        for (int b = 0; b < BWA_FS_BANDS; ++b)                       /* land the band gains exactly */
+            for (uint32_t ch = 0; ch < c->channels; ++ch) v->fs_g[b][ch] = v->fs_t[b][ch];
+        if (v->fs_on == 2) v->fs_on = 0;   /* retiring: every band landed on the single-path target, and
+                                            * gcur lands on the same gtarget below — exact handoff */
+    }
     if (v->eq_engaged) {
         for (int b = 0; b < 3; ++b) for (int k = 0; k < 5; ++k) v->eq_co[b][k] = co_tgt[b][k];   /* land coeffs */
         if (flat) {                                              /* settled to passthrough: bypass + reset history */
@@ -1464,6 +1621,39 @@ static void bed_rotate_z(const float* sh, int nch, const float cm[3], const floa
         }
 }
 
+/* Room-frame bed orientation -> the ambi-axes FIELD rotation matrix (rt_bed_set_orientation). Yaw
+ * about room up (+y; positive turns the field from +z toward +x — the bwa_bed_set_rotation
+ * convention), pitch about the room's right axis (positive tilts the field's front upward), roll
+ * about room forward (+z; positive tilts the field's top toward room -x = the room's right).
+ * Applied roll-first, yaw-last (aircraft order), then conjugated into ambi axes (x=front=room z,
+ * y=left=room x, z=up=room y) — for a pure permutation that is an index remap. */
+static void bed_rot_ambi(float yaw, float pitch, float roll, float R[3][3]) {
+    const float cy = cosf(yaw),  sy = sinf(yaw);
+    const float cp = cosf(pitch), sp = sinf(pitch);
+    const float cr = cosf(roll),  sr = sinf(roll);
+    const float rx[3][3] = { { 1, 0, 0 }, { 0, cp, sp }, { 0, -sp, cp } };   /* Rx(-pitch): +z -> +y */
+    const float rz[3][3] = { { cr, -sr, 0 }, { sr, cr, 0 }, { 0, 0, 1 } };   /* Rz(roll):   +y -> -x */
+    const float ry[3][3] = { { cy, 0, sy }, { 0, 1, 0 }, { -sy, 0, cy } };   /* Ry(yaw):    +z -> +x */
+    float t[3][3], rm[3][3];
+    for (int i = 0; i < 3; ++i) for (int j = 0; j < 3; ++j) {
+        float a = 0.f; for (int k = 0; k < 3; ++k) a += rx[i][k] * rz[k][j];
+        t[i][j] = a;
+    }
+    for (int i = 0; i < 3; ++i) for (int j = 0; j < 3; ++j) {
+        float a = 0.f; for (int k = 0; k < 3; ++k) a += ry[i][k] * t[k][j];
+        rm[i][j] = a;
+    }
+    static const int cr3[3] = { 2, 0, 1 };               /* ambi component -> room component */
+    for (int i = 0; i < 3; ++i) for (int j = 0; j < 3; ++j) R[i][j] = rm[cr3[i]][cr3[j]];
+}
+
+/* clamp-glide toward a target by at most dmax this block (lands exactly once within reach) */
+static float rot_glide(float cur, float tgt, float dmax) {
+    float d = tgt - cur;
+    if (d > dmax) d = dmax; else if (d < -dmax) d = -dmax;
+    return cur + d;
+}
+
 /* Mix an ambisonic BED voice: decode its SH channels straight onto the 26-ch bus through the static
  * decode matrix (world-locked — no DBAP, occlusion, or directivity), with a master-gain ramp on
  * gcur[0]. Looping / natural end / oneshot-ack are identical to mix_voice.
@@ -1486,13 +1676,36 @@ static void mix_bed(RtCore* c, Voice* v, uint16_t idx, float* bus, uint32_t n, u
     ParaBed* pb = &c->para[idx];
     const int want_p  = nch >= 4 && c->bed_param_blk;     /* the block's single load (rt_render) */
     const int use_p   = want_p || pb->mix > 0.f;
-    /* bed yaw (rt_bed_set_rotation): glide toward the target at BWA_BED_YAW_RATE and rotate the field
-     * with a per-sample phasor recurrence (no per-sample trig; m = 2,3 by angle addition). Rotation
+    /* bed orientation (rt_bed_set_orientation): angles glide at BWA_BED_YAW_RATE, and rotation
      * happens BEFORE either renderer, so the matrix decode and the parametric analysis see the same
-     * turned field. Settled at 0 -> fully bypassed. */
-    const int use_rot = v->yaw != 0.f || v->yaw_cur != 0.f;
+     * turned field. Yaw-only runs the exact per-sample phasor recurrence (mode 1 — no per-sample
+     * trig; m = 2,3 by angle addition); any pitch/roll engages the full Ivanic-Ruedenberg matrix
+     * (mode 2): the live matrix rot_m is rebuilt per block from the glided angles and interpolated
+     * per sample toward the block target (invariant 4). Settling back to pitch = roll = 0 hands off
+     * to the phasor exactly (the matrix IS the yaw rotation there). Settled at 0/0/0 -> bypassed. */
+    const int rot_needs_full = v->bpitch != 0.f || v->bpitch_cur != 0.f || v->broll != 0.f || v->broll_cur != 0.f;
+    int rot_mode = 0, rot_n = 0;
     float rc1 = 1.f, rs1 = 0.f, rdc = 1.f, rds = 0.f;
-    if (use_rot) {
+    float rot_end[BWA_SH_ROT_N], rot_step[BWA_SH_ROT_N];
+    if (rot_needs_full && !v->rot_full) {                 /* engage: seed the live matrix at the current angles */
+        float R[3][3]; bed_rot_ambi(v->yaw_cur, v->bpitch_cur, v->broll_cur, R);
+        ambi_rot_matrix(R, v->rot_m);
+        v->rot_full = 1;
+    }
+    if (v->rot_full) {
+        rot_mode = 2;
+        const float dmax = BWA_BED_YAW_RATE * (float)nr / (float)c->sample_rate;
+        v->yaw_cur    = rot_glide(v->yaw_cur,    v->yaw,    dmax);
+        v->bpitch_cur = rot_glide(v->bpitch_cur, v->bpitch, dmax);
+        v->broll_cur  = rot_glide(v->broll_cur,  v->broll,  dmax);
+        float R[3][3]; bed_rot_ambi(v->yaw_cur, v->bpitch_cur, v->broll_cur, R);
+        ambi_rot_matrix(R, rot_end);
+        rot_n = nch >= 16 ? BWA_SH_ROT_N : (nch >= 9 ? 34 : 9);   /* only the blocks the bed uses */
+        for (int j = 0; j < rot_n; ++j) rot_step[j] = (rot_end[j] - v->rot_m[j]) / (float)nr;
+        if (v->bpitch == 0.f && v->broll == 0.f && v->bpitch_cur == 0.f && v->broll_cur == 0.f)
+            v->rot_full = 0;                              /* landed flat: the phasor takes over next block */
+    } else if (v->yaw != 0.f || v->yaw_cur != 0.f) {
+        rot_mode = 1;
         const float dmax = BWA_BED_YAW_RATE * (float)nr / (float)c->sample_rate;
         float dtot = v->yaw - v->yaw_cur;
         if (dtot > dmax) dtot = dmax; else if (dtot < -dmax) dtot = -dmax;
@@ -1501,6 +1714,16 @@ static void mix_bed(RtCore* c, Voice* v, uint16_t idx, float* bus, uint32_t n, u
         rdc = cosf(dphi); rds = sinf(dphi);
         v->yaw_cur += dtot;                               /* land this block's glide */
     }
+    /* max-rE decode weighting (rt_set_max_re): taper the SH signal per order before the MATRIX
+     * decode (decode(w*sh) == the max-rE decode); re_mix ramps 0<->1 per sample so the A/B
+     * crossfades. The parametric analysis, its re-panned direct stream, and the decorrelated
+     * diffuse stream see the raw field (see RtCore.max_re). */
+    const int   re_on    = atomic_load_explicit(&c->max_re, memory_order_acquire);
+    const float re_tgt   = re_on ? 1.f : 0.f;
+    const int   use_re   = re_on || v->re_mix > 0.f;
+    float       rem      = v->re_mix;
+    const float rem_step = (re_tgt - rem) / (float)nr;
+    const float* rw = c->re_w[(snd->order >= 1 && snd->order <= 3) ? snd->order - 1 : 2];
     uint32_t cur = v->cursor;
     bool ended = false;
 
@@ -1511,12 +1734,21 @@ static void mix_bed(RtCore* c, Voice* v, uint16_t idx, float* bus, uint32_t n, u
             if (!ended) {
                 const float* sh = &snd->pcm[(size_t)cur * nch];
                 float shr[BWA_AMBI_CH];
-                if (use_rot) {                     /* turn the field, then advance the yaw phasor */
+                if (rot_mode == 1) {               /* turn the field, then advance the yaw phasor */
                     const float cm[3] = { rc1, rc1*rc1 - rs1*rs1, rc1*(rc1*rc1 - rs1*rs1) - rs1*(2.f*rc1*rs1) };
                     const float sm[3] = { rs1, 2.f*rc1*rs1,       rs1*(rc1*rc1 - rs1*rs1) + rc1*(2.f*rc1*rs1) };
                     bed_rotate_z(sh, nch, cm, sm, shr);
                     sh = shr;
                     const float t = rc1*rdc - rs1*rds; rs1 = rs1*rdc + rc1*rds; rc1 = t;
+                } else if (rot_mode == 2) {        /* full 3-axis: live matrix, glided toward the block target */
+                    ambi_rot_apply(v->rot_m, sh, nch, shr);
+                    sh = shr;
+                    for (int j = 0; j < rot_n; ++j) v->rot_m[j] += rot_step[j];
+                }
+                float shw[BWA_AMBI_CH];
+                if (use_re) {                      /* max-rE taper, crossfaded by rem */
+                    for (int k = 0; k < nch; ++k) shw[k] = sh[k] * (1.f + rem * (rw[k] - 1.f));
+                    sh = shw;
                 }
                 const float g = v->gcur[0] * pg;   /* master gain x the pause/seek gate */
                 for (uint32_t s = 0; s < c->channels; ++s) {
@@ -1529,6 +1761,7 @@ static void mix_bed(RtCore* c, Voice* v, uint16_t idx, float* bus, uint32_t n, u
             }
             pg += pg_step;
             v->gcur[0] += g_step;
+            rem += rem_step;
         }
     } else {
         /* block-rate parameter update from the SMOOTHED analysis state (last blocks' field): per band
@@ -1577,20 +1810,30 @@ static void mix_bed(RtCore* c, Voice* v, uint16_t idx, float* bus, uint32_t n, u
             if (!ended) {
                 const float* sh = &snd->pcm[(size_t)cur * nch];
                 float shr[BWA_AMBI_CH];
-                if (use_rot) {                         /* turn the field before EITHER renderer sees it */
+                if (rot_mode == 1) {                   /* turn the field before EITHER renderer sees it */
                     const float cm[3] = { rc1, rc1*rc1 - rs1*rs1, rc1*(rc1*rc1 - rs1*rs1) - rs1*(2.f*rc1*rs1) };
                     const float sm[3] = { rs1, 2.f*rc1*rs1,       rs1*(rc1*rc1 - rs1*rs1) + rc1*(2.f*rc1*rs1) };
                     bed_rotate_z(sh, nch, cm, sm, shr);
                     sh = shr;
                     const float t = rc1*rdc - rs1*rds; rs1 = rs1*rdc + rc1*rds; rc1 = t;
+                } else if (rot_mode == 2) {            /* full 3-axis: live matrix, glided per sample */
+                    ambi_rot_apply(v->rot_m, sh, nch, shr);
+                    sh = shr;
+                    for (int j = 0; j < rot_n; ++j) v->rot_m[j] += rot_step[j];
                 }
                 const float g = v->gcur[0] * pg;
                 if (run_matrix) {                      /* matrix share of the crossfade */
                     const float gm = g * (1.f - pmix);
+                    float shw[BWA_AMBI_CH];
+                    const float* shd = sh;
+                    if (use_re) {                      /* max-rE taper on the MATRIX share only */
+                        for (int k = 0; k < nch; ++k) shw[k] = sh[k] * (1.f + rem * (rw[k] - 1.f));
+                        shd = shw;
+                    }
                     for (uint32_t s = 0; s < c->channels; ++s) {
                         const float* D = c->bed_decode[s];
                         float acc = 0.f;
-                        for (int k = 0; k < nch; ++k) acc += sh[k] * D[k];
+                        for (int k = 0; k < nch; ++k) acc += shd[k] * D[k];
                         bus[(size_t)s * n + i] += gm * acc;
                     }
                 }
@@ -1629,6 +1872,7 @@ static void mix_bed(RtCore* c, Voice* v, uint16_t idx, float* bus, uint32_t n, u
             pg += pg_step;
             v->gcur[0] += g_step;
             pmix += pm_step;
+            rem += rem_step;
         }
         /* land the ramps exactly + fold this block's analysis into the smoothed field */
         pb->mix = pm_tgt;
@@ -1646,6 +1890,8 @@ static void mix_bed(RtCore* c, Voice* v, uint16_t idx, float* bus, uint32_t n, u
 
     v->cursor = cur;
     v->gcur[0] = v->gtarget[0];
+    v->re_mix = re_tgt;                                            /* land the max-rE crossfade */
+    if (rot_mode == 2) memcpy(v->rot_m, rot_end, sizeof(float) * rot_n);   /* land the live matrix */
     if (ended) {
         v->playing = false;
         if (v->oneshot) {
@@ -2263,9 +2509,14 @@ void rt_set_ism_gain(RtCore* c, float linear) {
 }
 
 void rt_bed_set_rotation(RtCore* c, uint32_t h, float yaw_rad) {
+    rt_bed_set_orientation(c, h, yaw_rad, 0.f, 0.f);   /* the yaw shorthand resets pitch/roll */
+}
+
+void rt_bed_set_orientation(RtCore* c, uint32_t h, float yaw, float pitch, float roll) {
     if (!c) return;
-    Cmd cmd = { .type = CMD_BED_YAW, .handle = h };
-    cmd.u.byaw.yaw = yaw_rad;
+    if (!(isfinite(yaw) && isfinite(pitch) && isfinite(roll))) return;
+    Cmd cmd = { .type = CMD_BED_ROT, .handle = h };
+    cmd.u.brot.yaw = yaw; cmd.u.brot.pitch = pitch; cmd.u.brot.roll = roll;
     cmd_push(&c->cmds, &cmd);
 }
 
@@ -2381,9 +2632,10 @@ uint32_t rt_load_sound_streaming(RtCore* c, const char* path, char* err, size_t 
 }
 
 /* Load a multichannel AmbiX asset into the sound table (plays as an ambisonic bed via mix_bed). */
-uint32_t rt_load_ambix(RtCore* c, const char* path, char* err, size_t errcap) {
+static uint32_t load_bed_asset(RtCore* c, const char* path, char* err, size_t errcap, int fuma) {
     SoundData d;
-    if (!sound_load_ambix(path, c->sample_rate, &d, err, errcap)) return 0;
+    if (!(fuma ? sound_load_fuma(path, c->sample_rate, &d, err, errcap)
+               : sound_load_ambix(path, c->sample_rate, &d, err, errcap))) return 0;
     uint32_t h = salloc_sound(c);
     if (!h) {
         sound_unload(&d);
@@ -2392,6 +2644,12 @@ uint32_t rt_load_ambix(RtCore* c, const char* path, char* err, size_t errcap) {
     }
     c->sounds[BWA_H_IDX(h)].data = d;
     return h;
+}
+uint32_t rt_load_ambix(RtCore* c, const char* path, char* err, size_t errcap) {
+    return load_bed_asset(c, path, err, errcap, 0);
+}
+uint32_t rt_load_fuma(RtCore* c, const char* path, char* err, size_t errcap) {
+    return load_bed_asset(c, path, err, errcap, 1);   /* converted at load: past here a FuMa bed IS an AmbiX bed */
 }
 
 /* Channel count of a loaded asset (control thread): 1 = mono point source, 4/9/16 = ambisonic bed.
@@ -2534,6 +2792,35 @@ RtCore* rt_create(uint32_t req_voice_cap, uint32_t sound_cap, uint32_t sample_ra
     c->para = (ParaBed*)calloc(voice_cap, sizeof(ParaBed));   /* parametric-bed state (parallel to voices) */
     for (int x = 0; x < 3; ++x)                               /* band-splitter crossovers at the engine rate */
         c->para_xa[x] = 1.f - expf(-6.2831853f * BWA_PARA_XOVER[x] / (float)sample_rate);
+    for (int x = 0; x < BWA_FS_XOVERS; ++x)                   /* spectral-widening splitter crossovers */
+        c->fs_xa[x] = 1.f - expf(-6.2831853f * BWA_FS_XOVER[x] / (float)sample_rate);
+    {   /* fs_w: integrate the DIGITAL splitter bands' cross-spectra over white noise (see fs_w decl).
+         * B_k(w) from the actual one-poles, bands as the mixer forms them; 512 linear points span the
+         * band. Runs once at create — plain double math, no DSP-path cost. */
+        enum { FSW_M = 512 };
+        double W[BWA_FS_BANDS][BWA_FS_BANDS] = { { 0 } };
+        for (int m = 0; m < FSW_M; ++m) {
+            const double wq = 3.14159265358979 * ((double)m + 0.5) / (double)FSW_M;   /* 0..pi (Nyquist) */
+            double br[BWA_FS_BANDS], bi[BWA_FS_BANDS], pr = 0.0, pi_ = 0.0;
+            for (int x = 0; x < BWA_FS_XOVERS; ++x) {
+                const double a = c->fs_xa[x], b1 = 1.0 - a;
+                const double dr = 1.0 - b1 * cos(wq), di = b1 * sin(wq);   /* 1 - (1-a) e^-jw */
+                const double dn = dr * dr + di * di;
+                const double lr = a * dr / dn, li = -a * di / dn;          /* LP_x(w) */
+                br[x] = lr - pr; bi[x] = li - pi_;
+                pr = lr; pi_ = li;
+            }
+            br[BWA_FS_XOVERS] = 1.0 - pr; bi[BWA_FS_XOVERS] = -pi_;
+            for (int a2 = 0; a2 < BWA_FS_BANDS; ++a2)
+                for (int b2 = 0; b2 < BWA_FS_BANDS; ++b2)
+                    W[a2][b2] += br[a2] * br[b2] + bi[a2] * bi[b2];
+        }
+        for (int a2 = 0; a2 < BWA_FS_BANDS; ++a2)
+            for (int b2 = 0; b2 < BWA_FS_BANDS; ++b2)
+                c->fs_w[a2][b2] = (float)(W[a2][b2] / (double)FSW_M);
+    }
+    for (int o = 1; o <= 3; ++o)                              /* max-rE tapers per content order */
+        ambi_max_re_weights(o, c->re_w[o - 1]);
     c->ldc_a = 1.f - expf(-6.2831853f * 250.f / (float)sample_rate);   /* loudness-comp shelf corner */
     if (!c->voices || !c->occ_handle || !c->occ_val || !c->occ_eq || !c->occ_dir || !c->play_pub || !c->aux ||
         !c->stream_scratch || !c->streams || !c->path_accum || !c->path_pub || !c->path_idx ||
@@ -2629,11 +2916,20 @@ void rt_set_dual_band(RtCore* c, int on) {
     atomic_store_explicit(&c->dual_band, on ? 1 : 0, memory_order_release);
 }
 
-/* Spread rendering: 0 = lobe reshape (default), 1 = MDAP virtual-source ring. Read per gain solve,
- * so it is a live A/B atomic like the panner; voices with spread 0 are unaffected either way. */
+/* Spread rendering: 0 = lobe reshape (default), 1 = MDAP virtual-source ring, 2 = spectral
+ * (frequency-dependent panning). Read per gain solve, so it is a live A/B atomic like the panner;
+ * voices with spread 0 are unaffected either way. */
 void rt_set_spread_mode(RtCore* c, int mode) {
     if (!c) return;
-    atomic_store_explicit(&c->spread_mode, mode == 1 ? 1 : 0, memory_order_release);
+    atomic_store_explicit(&c->spread_mode, (mode >= 0 && mode <= 2) ? mode : 0, memory_order_release);
+}
+
+/* max-rE bed-decode weighting: crossfaded per bed voice (re_mix) and in the FDN's render pair, so
+ * this is a click-free live A/B like dual-band. Off by default (the unweighted decode is the
+ * incumbent); bake the winner after the hardware bake-off. */
+void rt_set_max_re(RtCore* c, int on) {
+    if (!c) return;
+    atomic_store_explicit(&c->max_re, on ? 1 : 0, memory_order_release);
 }
 
 /* Tracked room EQ (layouts with a room_eq_grid): default ON; off slews every section to flat, so

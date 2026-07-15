@@ -4,7 +4,10 @@ From a consumer's side this is a **control-only** API: no audio buffers, no
 device, no queue, no threads — an opaque engine handle, sounds, positioned
 sources, and per-frame updates. Declarations in
 [`include/bw_audio.h`](../include/bw_audio.h) carry their contracts as comments;
-[`examples/minimal.c`](../examples/minimal.c) runs the whole client lifecycle.
+[`examples/minimal.c`](../examples/minimal.c) runs the whole client lifecycle;
+[`examples/ambisonic.c`](../examples/ambisonic.c) walks the bed API (AmbiX/FuMa loading,
+rotation/tilt, the renderer and max-rE A/Bs) and [`examples/streaming.c`](../examples/streaming.c)
+walks disk streaming + push sources — all three are console programs built every build.
 
 ## Feature overview
 
@@ -360,10 +363,13 @@ alike), playheads freeze, resume continues exactly, and paused voices still read
 
 ```c
 bwa_sound bwa_load_ambix(bwa_engine* e, const char* path);   // AmbiX (ACN/SN3D); 4/9/16 ch -> order 1/2/3
+bwa_sound bwa_load_fuma (bwa_engine* e, const char* path);   // legacy FuMa B-format; converted at load
 bwa_bed   bwa_bed_create  (bwa_engine* e);
 void    bwa_bed_play    (bwa_engine* e, bwa_bed b, bwa_sound snd, bool loop);
 void    bwa_bed_set_gain(bwa_engine* e, bwa_bed b, float linear);       // master gain, ramped
 void    bwa_bed_set_rotation(bwa_engine* e, bwa_bed b, float yaw_rad);  // yaw the soundfield; glided
+void    bwa_bed_set_orientation(bwa_engine* e, bwa_bed b,               // full 3-axis (yaw/pitch/roll);
+                              float yaw_rad, float pitch_rad, float roll_rad);   //   glided, live
 void    bwa_bed_stop    (bwa_engine* e, bwa_bed b);
 void    bwa_bed_destroy (bwa_engine* e, bwa_bed b);
 
@@ -385,6 +391,14 @@ rotates by m·yaw — exact at every order, no Wigner matrices), it **glides** t
 turn per second (click-free, live-safe), and it applies before *either* bed renderer, so the matrix
 decode and the parametric analysis see the same turned field.
 
+`bwa_bed_set_orientation` is the full 3-axis version — for **levelling** a capture whose "front"
+wasn't upright, or tilting a field for effect. Positive **pitch** tilts the field's front (+z)
+upward; positive **roll** tilts its top toward the room's right (−x); applied roll → pitch → yaw.
+Yaw-only stays on the closed-form phasor path; any pitch/roll runs a full SH rotation matrix
+(the Ivanic-Ruedenberg recursion), rebuilt per block from the glided angles and interpolated per
+sample — same click-free, live semantics as yaw. `bwa_bed_set_rotation(yaw)` is the shorthand for
+`bwa_bed_set_orientation(yaw, 0, 0)` (it resets pitch/roll).
+
 A **bed** is a pre-encoded **AmbiX** soundfield (ACN ordering, SN3D normalization) decoded
 **straight to the speakers**. It is not panned and has no position — use it for diffuse,
 ambient content.
@@ -394,13 +408,31 @@ world-fixed too, so a listener walking through the field is handled by the real 
 and the binaural monitor's head-tracking applies downstream.
 
 Load with `bwa_load_ambix` (a multichannel asset; mono and other channel counts are rejected),
-then drive with the `bwa_bed_*` family — no position, just a master gain. Internally a bed is a
+then drive with the `bwa_bed_*` family — no position, just a master gain. Legacy **FuMa** B-format
+recordings (`.amb` and friends: WXYZ channel order, MaxN normalization, the W −3 dB) load with
+`bwa_load_fuma` instead — the conversion happens at load, so past that call the asset is
+indistinguishable from an AmbiX load of the same field. Full 3D sets only (4/9/16 channels).
+Internally a bed is a
 voice playing a multichannel asset, so handles and lifetime match `bwa_source_*` — which is why
 fades, pause/seek, priority, and groups work on beds: they are the same per-voice machinery,
 re-exported under the bed prefix. Note the priority default (128) means a bed **can be stolen**
 by a full-pool `bwa_source_create` like any other voice — set 255 on a bed that must survive an
 SFX overload. The decode is a static SN3D sampling decode `(2l+1)·Y_k(dir_s)/L`, rebuilt from
 the layout.
+
+```c
+void bwa_set_max_re(bwa_engine* e, bool on);   // off by default; live A/B (crossfaded)
+```
+
+`bwa_set_max_re` puts **max-rE weighting** (Zotter & Frank's psychoacoustic decoder weights) on the
+engine's SH→speaker decode: the higher ambisonic orders are tapered, which suppresses the decode's
+sidelobes and lengthens the energy vector — **better localization away from the sweet spot**,
+exactly the walking-listener case, at a slightly wider main lobe. The weights are
+diffuse-energy-normalized per content order, so A and B stay level-fair. It reaches every consumer
+of the engine's own decode — bed matrix rendering (sampling *and* AllRAD) and the FDN reverb's line
+render — but not the point-source panners (DBAP/SPCAP/VBAP pan, they don't decode) and not phonon's
+own decodes (reflection bed, pathing, the HRTF monitor). Off by default: the unweighted decode is
+the incumbent; bake the winner after the hardware bake-off.
 
 ```c
 typedef enum { BWA_BED_MATRIX = 0, BWA_BED_PARAMETRIC = 1 } bwa_bed_renderer;
@@ -630,7 +662,7 @@ own propagation. They do not affect ambisonic beds (world-locked, no position).
 ```c
 void bwa_source_set_spread(bwa_engine* e, bwa_source s, float amount);   // 0 = point (default) .. 1 = wide
 void bwa_source_set_size  (bwa_engine* e, bwa_source s, float radius_m); // metric alternative: radius in m
-typedef enum { BWA_SPREAD_LOBE = 0, BWA_SPREAD_MDAP = 1 } bwa_spread_mode;
+typedef enum { BWA_SPREAD_LOBE = 0, BWA_SPREAD_MDAP = 1, BWA_SPREAD_SPECTRAL = 2 } bwa_spread_mode;
 void bwa_set_spread_mode(bwa_engine* e, bwa_spread_mode mode);            // engine-wide; live A/B
 ```
 
@@ -647,7 +679,7 @@ changes physical size with distance. The larger of the two knobs wins, and a siz
 It's implemented in the per-block gain solve, not the sample loop, and **renormalised to the
 panner's own power** — widening never changes loudness, and the perceived direction stays put.
 It's **panner-agnostic** (works over DBAP/SPCAP/VBAP), and the change ramps click-free like any
-gain change. Two render modes sit behind the knob (`bwa_set_spread_mode`, an atomic live A/B like
+gain change. Three render modes sit behind the knob (`bwa_set_spread_mode`, an atomic live A/B like
 the panner switch; sources with spread 0 are unaffected either way):
 
 - **LOBE** (default): the panner's point gains are blended toward a width-controlled lobe
@@ -659,6 +691,18 @@ the panner switch; sources with spread 0 are unaffected either way):
   VBAP stays sparse per direction, SPCAP stays placement-corrected — at ~13× the gain-solve cost
   (block-rate and dirty-gated, so still cheap). At spread→0 the ring collapses onto the point
   solve, so the modes meet continuously.
+- **SPECTRAL** (frequency-dependent panning — Zotter & Frank's phantom-source widening): the
+  source splits into **6 bands** and each band is panned to its **own direction** inside the
+  spread cone — the LF band stays on the source direction, the upper bands scatter around the
+  cone ring, each a real panner solve. The ear integrates the scattered spectrum into *width*,
+  and because different frequencies come from different speakers, there are **no coherent copies
+  to collapse or comb-filter** as the tracked listener walks — extent without decorrelation
+  noise. Constant-power exactly (the band-overlap correlation is compensated at the solve).
+  Costs ~6 band filters + 6 gain sets per *wide* voice; point sources pay nothing. With
+  dual-band panning on, the sub-700 Hz bands take the amplitude norm, so the two A/Bs compose.
+
+LOBE/MDAP + decorrelation and SPECTRAL are two different answers to the same phantom-collapse
+problem — A/B/X them (the playground's blind harness has rows for both) and keep the winner.
 
 ```c
 void bwa_set_decorrelation(bwa_engine* e, bool on);   // off by default; live A/B

@@ -211,6 +211,22 @@ if(WIN32)
             $<TARGET_FILE:bw_audio> $<TARGET_FILE_DIR:bwa_minimal>)   # bw_audio.dll next to the exe
 endif()
 
+# ---- feature examples (console, like bwa_minimal): the ambisonic-bed walkthrough (load AmbiX/FuMa,
+# rotate/tilt, renderer + max-rE A/B) and the streaming walkthrough (disk streaming + push sources) ----
+add_executable(bwa_ambisonic examples/ambisonic.c)
+target_link_libraries(bwa_ambisonic PRIVATE bw_audio)
+bwa_tool_icon(bwa_ambisonic)
+add_executable(bwa_streaming examples/streaming.c)
+target_link_libraries(bwa_streaming PRIVATE bw_audio)
+bwa_tool_icon(bwa_streaming)
+if(WIN32)
+  foreach(tgt bwa_ambisonic bwa_streaming)
+    add_custom_command(TARGET ${tgt} POST_BUILD
+      COMMAND ${CMAKE_COMMAND} -E copy_if_different
+              $<TARGET_FILE:bw_audio> $<TARGET_FILE_DIR:${tgt}>)   # bw_audio.dll next to the exe
+  endforeach()
+endif()
+
 # ---- track monitor example (console; prints the live tracked pose) ----
 add_executable(bwa_track_monitor examples/track_monitor.c)
 target_link_libraries(bwa_track_monitor PRIVATE bw_audio)
