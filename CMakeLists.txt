@@ -98,6 +98,7 @@ add_library(bw_audio SHARED
   src/sink.c
   src/null_sink.c
   src/manual_sink.c
+  src/profile_self.c            # bwa_prof_reset/report exported unconditionally; accumulation gated by BWA_PROFILE_SELF
   $<TARGET_OBJECTS:bwa_core>
 )
 target_include_directories(bw_audio PUBLIC include PRIVATE src ${dr_libs_SOURCE_DIR} ${CJSON_INC})
@@ -117,6 +118,15 @@ if(BWA_TRACY)
   target_link_libraries(bw_audio PRIVATE TracyClient)
   target_compile_definitions(bw_audio PRIVATE BWA_TRACY)
   message(STATUS "bw_audio: Tracy profiling ENABLED")
+endif()
+
+# In-process zone profiler (mutually exclusive with Tracy): headless per-zone numbers with no server
+# tooling. Routes profile.h's zone macros into src/profile_self.c on both compile groups.
+option(BWA_PROFILE_SELF "Instrument with the built-in in-process zone profiler (bwa_prof_report)" OFF)
+if(BWA_PROFILE_SELF AND NOT BWA_TRACY)
+  target_compile_definitions(bwa_core PRIVATE BWA_PROFILE_SELF)
+  target_compile_definitions(bw_audio PRIVATE BWA_PROFILE_SELF)
+  message(STATUS "bw_audio: in-process zone profiler ENABLED")
 endif()
 
 # ---- optional ASIO backend (production: 26ch -> DVS -> Dante) ----
@@ -246,6 +256,16 @@ if(WIN32)
   add_custom_command(TARGET bwa_profile_bench POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
             $<TARGET_FILE:bw_audio> $<TARGET_FILE_DIR:bwa_profile_bench>)
+endif()
+
+# ---- per-situation bench: times each configuration synchronously via the manual sink and prints a
+# table (audio-thread cost vs the block budget). Deterministic, no device; -DBWA_TRACY=ON adds zones. ----
+add_executable(bwa_bench_situations examples/bench_situations.c)
+target_link_libraries(bwa_bench_situations PRIVATE bw_audio)
+if(WIN32)
+  add_custom_command(TARGET bwa_bench_situations POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            $<TARGET_FILE:bw_audio> $<TARGET_FILE_DIR:bwa_bench_situations>)
 endif()
 
 option(BWA_BUILD_TESTS "Build the bw_audio tests" ON)

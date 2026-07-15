@@ -11,6 +11,7 @@
  * manual occlusion path) — see docs/api.md.
  */
 #include "sink.h"
+#include "profile.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -40,7 +41,10 @@ static const float* manual_render_block(bwa_sink* b, uint32_t* channels, uint32_
         .system_time_ns = (s->sample_pos / s->sample_rate) * 1000000000ull
                         + (s->sample_pos % s->sample_rate) * 1000000000ull / s->sample_rate,
     };
+    BWA_ZONE_BEGIN(zb, "manual block");                /* same render() the ASIO/null callbacks drive */
     s->render(s->user, s->bus, s->block_size, &ts);   /* the engine fully writes the bus (rt_render zero-inits) */
+    BWA_ZONE_END(zb);
+    BWA_FRAME_MARK();                                  /* one Tracy frame = one block, like the null sink */
     s->sample_pos += s->block_size;
     if (channels) *channels = s->channels;
     if (nframes)  *nframes  = s->block_size;

@@ -24,6 +24,17 @@
   #define BWA_ALLOC(ptr, size)      TracyCAlloc((ptr), (size))
   #define BWA_FREE(ptr)             TracyCFree((ptr))
   #define BWA_MSG(txt)              TracyCMessageL(txt)
+#elif defined(BWA_PROFILE_SELF)
+  /* in-process zone accumulator (headless per-zone numbers, no Tracy server tools) — see profile_self.h */
+  #include "profile_self.h"
+  #define BWA_ZONE_BEGIN(ctx, name) bwa_prof_zone ctx = bwa_prof__begin(name)
+  #define BWA_ZONE_END(ctx)         bwa_prof__end(&(ctx))
+  #define BWA_FRAME_MARK()          bwa_prof__frame()
+  #define BWA_PLOT(name, val)       ((void)(val))
+  #define BWA_THREAD_NAME(name)     ((void)0)
+  #define BWA_ALLOC(ptr, size)      ((void)(ptr), (void)(size))
+  #define BWA_FREE(ptr)             ((void)(ptr))
+  #define BWA_MSG(txt)              ((void)0)
 #else
   #define BWA_ZONE_BEGIN(ctx, name) ((void)0)
   #define BWA_ZONE_END(ctx)         ((void)0)
