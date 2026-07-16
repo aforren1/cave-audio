@@ -57,6 +57,10 @@
  * wav/flac/mp3 — mono joins the signal picker and plays on the point source in every scene; an
  * AmbiX (4/9/16 ch) or FuMa .amb file replaces the bed scene's synthesized field, all bed knobs
  * apply. Auto-detect: .amb -> FuMa, soundfield channel counts -> AmbiX, anything else -> mono.
+ * Custom MATERIAL: the occlusion scene's material combo has a "custom" entry with coefficient
+ * sliders (3-band absorption + transmission, scattering — bwa_material_define, re-minted and
+ * re-applied live on every edit), and the reverb scene's room combo can build the shoebox out of
+ * it (load-time: applying rebuilds the engine).
  * Needs the Steam Audio build for occlusion/materials/directivity/reverb; without it those are no-ops.
  * Usage: bwa_playground [cave_layout.json] — audition with your surveyed layout (renders + pans with the
  *        engine's actual speaker positions); with no arg it auto-loads ./cave_layout.json or the default grid.
@@ -339,7 +343,8 @@ static Vector3       wall_c = { 0.0f, 1.2f, -2.2f };   /* standing on the floor:
 static const Vector3 wall_n = { 0, 0, 1 };
 static const float   wall_hw = 2.0f, wall_hh = 1.2f;
 static Vector3       wall_u, wall_v;
-static const char*   mat_names[] = { "concrete", "glass", "carpet", "wood", "metal" };   /* UI labels */
+static const char*   mat_names[] = { "concrete", "glass", "carpet", "wood", "metal", "custom" };   /* UI labels
+                                      * (index NMAT = the custom material below, not a preset) */
 static const bwa_material_type mat_types[] = { BWA_MAT_CONCRETE, BWA_MAT_GLASS, BWA_MAT_CARPET, BWA_MAT_WOOD, BWA_MAT_METAL };
 /* broadband reflectivity (~1 - mean absorption of the same presets): scales the image-source level so
  * the wall MATERIAL drives reflectivity too — carpet reflects far less than metal/concrete. Broadband
@@ -348,6 +353,31 @@ static const float   mat_refl[] = { 0.93f, 0.96f, 0.45f, 0.92f, 0.89f };
 enum { NMAT = 5 };
 static bwa_material    mats[NMAT];
 static int           cur_mat, refl_audible = 1, occ_audible = 1;
+
+/* custom material ("custom" in the wall-material combo, and selectable as the reverb ROOM's
+ * surface): 3-band absorption + scattering + 3-band transmission, minted via bwa_material_define
+ * and RE-minted on any slider edit — the wall re-applies, so the occlusion sim re-traces with the
+ * new coefficients live. The token dies with the engine (build_engine clears it; the next use
+ * re-mints). Defaults ~ a heavy curtain: audibly unlike every preset (lots through, little back). */
+static float g_cmat_abs[3] = { 0.30f, 0.50f, 0.70f };   /* absorption L/M/H: what a reflection LOSES */
+static float g_cmat_trn[3] = { 0.50f, 0.35f, 0.20f };   /* transmission L/M/H: what passes THROUGH */
+static float g_cmat_scat   = 0.30f;
+static bwa_material g_cmat;
+static bwa_material cmat_token(void) {
+    if (!g_cmat) g_cmat = bwa_material_define(e, g_cmat_abs, g_cmat_scat, g_cmat_trn);
+    return g_cmat;                          /* 0 (the generic default) only if the 64-slot table is full */
+}
+static void cmat_remint(void) {
+    bwa_material old = g_cmat;
+    g_cmat = bwa_material_define(e, g_cmat_abs, g_cmat_scat, g_cmat_trn);
+    if (!g_cmat) g_cmat = old;              /* table full: keep the previous coefficients */
+    else if (old) bwa_material_release(e, old);   /* set geometry copied it; future sets take the new one */
+}
+static bwa_material mat_cur(void) { return cur_mat < NMAT ? mats[cur_mat] : cmat_token(); }
+static float mat_refl_cur(void) {           /* the ISM reflectivity scalar, from the custom's own absorption */
+    return cur_mat < NMAT ? mat_refl[cur_mat]
+                          : 1.0f - (g_cmat_abs[0] + g_cmat_abs[1] + g_cmat_abs[2]) / 3.0f;
+}
 static Vector3       occ_image, occ_refl_pt;     /* computed in occ_update, drawn in occ_draw3d */
 static int           occ_refl_valid, occ_occluded;
 static float         occ_factor = 1.0f;
@@ -410,13 +440,13 @@ static void make_dyn_wall(bwa_material mat) {
 static void clear_static_wall(void) {
     float v[9] = { 100.f,100.f,100.f,  100.02f,100.f,100.f,  100.f,100.02f,100.f };
     int   t[3] = { 0, 1, 2 };
-    bwa_material tm[1] = { mats[cur_mat] };
+    bwa_material tm[1] = { mat_cur() };
     bwa_scene_set_mesh_mat(e, v, 3, t, 1, tm);
 }
 /* install the wall in the CURRENT mode; exactly one representation is live at a time (else two walls). */
 static void apply_wall(void) {
-    if (occ_dynamic) { clear_static_wall(); make_dyn_wall(mats[cur_mat]); }
-    else { if (occ_wall >= 0) { bwa_scene_remove_dynamic_mesh(e, occ_wall); occ_wall = -1; } push_wall_mesh(mats[cur_mat]); }
+    if (occ_dynamic) { clear_static_wall(); make_dyn_wall(mat_cur()); }
+    else { if (occ_wall >= 0) { bwa_scene_remove_dynamic_mesh(e, occ_wall); occ_wall = -1; } push_wall_mesh(mat_cur()); }
 }
 
 /* ---- shared drawing ---- */
@@ -527,12 +557,12 @@ static void occ_update(float dt) {
     if (kp(KEY_SPACE)) occ_sweep = !occ_sweep;
     if (kp(KEY_Y))     { occ_dynamic = !occ_dynamic; apply_wall(); }   /* A/B: static full-rebuild vs dynamic instance */
     if (occ_sweep) { occ_anim_t += dt; wall_c.z = -2.2f + 1.6f * sinf(occ_anim_t * 1.1f); moved = 1; }
-    if (kp(KEY_M)) { cur_mat = (cur_mat + 1) % NMAT; apply_wall(); }
+    if (kp(KEY_M)) { cur_mat = (cur_mat + 1) % (NMAT + 1); apply_wall(); }   /* incl. the custom slot */
     if (kp(KEY_T)) refl_audible = !refl_audible;
     if (kp(KEY_G)) { occ_audible = !occ_audible; bwa_source_set_occlusion(e, src, occ_audible); }
     /* the whole point of the A/B: sliding is a cheap instance-transform in dynamic mode, a full scene
      * rebuild in static mode — and they must sound identical. */
-    if (moved) { if (occ_dynamic) update_dyn_wall_xform(); else push_wall_mesh(mats[cur_mat]); }
+    if (moved) { if (occ_dynamic) update_dyn_wall_xform(); else push_wall_mesh(mat_cur()); }
 
     /* reflection: the source mirrored across the wall is valid when source + listener are on the same
      * side and the bounce lands on the panel. occlusion: the direct path crosses the panel. */
@@ -547,7 +577,7 @@ static void occ_update(float dt) {
     bwa_source_set_pos(e, src, source_pos.x, source_pos.y, source_pos.z);
     bwa_source_set_gain(e, src, SRC_GAIN);                       /* occlusion is applied by the engine */
     bwa_source_set_pos(e, refl, occ_image.x, occ_image.y, occ_image.z);
-    bwa_source_set_gain(e, refl, (refl_audible && occ_refl_valid) ? SRC_GAIN * REFL_GAIN * mat_refl[cur_mat] : 0.0f);
+    bwa_source_set_gain(e, refl, (refl_audible && occ_refl_valid) ? SRC_GAIN * REFL_GAIN * mat_refl_cur() : 0.0f);
 
     occ_factor   = bwa_source_get_occlusion(e, src);             /* real Steam Audio occlusion (1 = clear) */
     occ_occluded = occ_factor < 0.85f;
@@ -766,6 +796,11 @@ static void bed_draw3d(void) {
 static int   rev_on  = 1;
 static float rev_wet = 1.0f;
 static int   rev_decoder;                          /* bed decoder: 0 = sampling (SAD), 1 = AllRAD (B to A/B) */
+static int   rev_room_mat;                         /* room surface: 0 = plaster (default), 1..NMAT = the wall
+                                                    * presets, NMAT+1 = the custom material. LOAD-time (the box
+                                                    * is set before bwa_start), so a change rebuilds the engine
+                                                    * — same policy as the decoder combo. */
+static int   rev_cmat_dirty;                       /* custom coefficients edited since the room last rebuilt */
 static int   rev_dist;                             /* distance->wet send (V): near = drier, far = wetter */
 /* a MOVABLE occluder inside the running reverb scene — the by-ear check that geometry can change while
  * the reflection bed runs (blocker 1). Sliding it changes BOTH the direct occlusion AND the reverb the
@@ -863,11 +898,15 @@ static void build_engine(int with_reverb) {
     };
     e = bwa_create(&cfg);
     if (!e) { printf("bwa_create failed\n"); exit(1); }
+    g_cmat = 0;                                              /* custom-material token died with the old engine */
     if (with_reverb) {
         bwa_reflections_desc rc = { .ir_seconds = 1.0f, .order = 1, .num_rays = 4096,
                                   .num_bounces = 16, .enabled = 1 };
         bwa_reflections_config(e, &rc);
-        bwa_material rm = bwa_material_preset(e, BWA_MAT_PLASTER);
+        bwa_material rm;                                     /* room surface: plaster / a preset / the custom */
+        if      (rev_room_mat == 0)     rm = bwa_material_preset(e, BWA_MAT_PLASTER);
+        else if (rev_room_mat <= NMAT)  rm = bwa_material_preset(e, mat_types[rev_room_mat - 1]);
+        else                            rm = cmat_token();
         bwa_material faces[6] = { rm, rm, rm, rm, rm, rm };
         bwa_scene_set_box(e, ROOM_W, ROOM_H, ROOM_D, faces);     /* static room, BEFORE bwa_start */
     }
@@ -1012,6 +1051,28 @@ static bool chk(const char* label, int* v) {
     return true;
 }
 
+/* the custom material's coefficient sliders (shared by the occlusion scene's combo and the reverb
+ * scene's room selector). An edit RE-MINTS the token immediately (release + define — the coefficients
+ * are copied at define time, so a stale token would keep the old sound); the caller decides what to
+ * re-apply: the occlusion wall re-sets live, the reverb room needs its rebuild button. */
+static bool cmat_sliders(void) {
+    bool ed = false;
+    ImGui::SetNextItemWidth(-FLT_MIN);
+    ed |= ImGui::SliderFloat3("##cabs", g_cmat_abs, 0.0f, 1.0f, "abs %.2f");
+    bwTip("absorption low/mid/high: what a REFLECTION loses - drives the reverb bed's damping and "
+          "the image-source reflection level (1 - mean = the refl scalar)");
+    ImGui::SetNextItemWidth(-FLT_MIN);
+    ed |= ImGui::SliderFloat3("##ctrn", g_cmat_trn, 0.0f, 1.0f, "trans %.2f");
+    bwTip("transmission low/mid/high: what passes THROUGH the occluder - sets the occlusion level "
+          "and the muffling EQ tilt; high = a curtain, near zero = a bunker wall");
+    ImGui::SetNextItemWidth(-FLT_MIN);
+    ed |= ImGui::SliderFloat("##cscat", &g_cmat_scat, 0.0f, 1.0f, "scatter %.2f");
+    bwTip("reflection diffuseness (0 = specular mirror .. 1 = fully diffuse) - the ray-traced "
+          "reverb bed uses it");
+    if (ed) cmat_remint();
+    return ed;
+}
+
 static void draw_panel(void) {
     const float W = uiScaled(PANEL_W);
     ImGui::SetNextWindowPos(ImVec2((float)GetScreenWidth() - W - uiScaled(8.0f), uiScaled(8.0f)), ImGuiCond_Always);
@@ -1126,9 +1187,10 @@ static void draw_panel(void) {
     } else if (cur_scene == 1) {                          /* Occlusion & Materials */
         ImGui::SetNextItemWidth(-FLT_MIN);
         int m = cur_mat;
-        if (ImGui::Combo("##mat", &m, mat_names, NMAT) && m != cur_mat) { cur_mat = m; apply_wall(); }
+        if (ImGui::Combo("##mat", &m, mat_names, NMAT + 1) && m != cur_mat) { cur_mat = m; apply_wall(); }
         bwTip("wall material: each has its own per-band transmission (how muffled "
-              "the occluded sound gets) and reflectivity");
+              "the occluded sound gets) and reflectivity; CUSTOM opens coefficient sliders");
+        if (cur_mat == NMAT && cmat_sliders()) apply_wall();   /* edits re-trace the wall live */
         if (chk("dynamic instanced mesh [Y]", &occ_dynamic)) apply_wall();
         bwTip("A/B the movable-geometry path: ON = one instanced mesh moved by a transform (a cheap "
               "BVH refit); OFF = bwa_scene_set_mesh_mat rebuilds the whole scene on every move. Same "
@@ -1144,7 +1206,7 @@ static void draw_panel(void) {
         if (occ_refl_valid)    ImGui::TextColored(ImVec4(1.00f, 0.70f, 0.30f, 1.0f), "in FRONT: REFLECTING (image source)");
         else if (occ_occluded) ImGui::TextColored(ImVec4(0.96f, 0.55f, 0.55f, 1.0f), "BEHIND: OCCLUDED (material tilt)");
         else                   ImGui::TextUnformatted("wall: clear line of sight");
-        ImGui::Text("occlusion %.0f%% audible   material refl %.0f%%", occ_factor * 100.0f, mat_refl[cur_mat] * 100.0f);
+        ImGui::Text("occlusion %.0f%% audible   material refl %.0f%%", occ_factor * 100.0f, mat_refl_cur() * 100.0f);
     } else if (cur_scene == 2) {                          /* Directivity */
         ImGui::SetNextItemWidth(-FLT_MIN);
         int d = cur_dir;
@@ -1240,6 +1302,27 @@ static void draw_panel(void) {
             if (e) { bwa_stop(e); bwa_destroy(e); e = NULL; }
             build_engine(1);
             rev_enter();
+        }
+        ImGui::SetNextItemWidth(-FLT_MIN);
+        int rmt = rev_room_mat;
+        const char* room_names[NMAT + 2] = { "room: plaster (default)", "room: concrete", "room: glass",
+                                             "room: carpet", "room: wood", "room: metal", "room: custom" };
+        if (ImGui::Combo("##roommat", &rmt, room_names, NMAT + 2) && rmt != rev_room_mat) {
+            rev_room_mat = rmt; rev_cmat_dirty = 0;      /* load-time (the box is pre-start): rebuild */
+            if (e) { bwa_stop(e); bwa_destroy(e); e = NULL; }
+            build_engine(1);
+            rev_enter();
+        }
+        bwTip("all six room surfaces: absorption drives the bed's decay and coloration (carpet kills "
+              "the tail, metal rings). Load-time - changing it rebuilds the engine (brief gap)");
+        if (rev_room_mat == NMAT + 1) {                  /* the custom material's coefficients + apply */
+            if (cmat_sliders()) rev_cmat_dirty = 1;
+            if (rev_cmat_dirty && ImGui::Button("apply room material (rebuilds)", ImVec2(-FLT_MIN, 0))) {
+                rev_cmat_dirty = 0;
+                if (e) { bwa_stop(e); bwa_destroy(e); e = NULL; }
+                build_engine(1);
+                rev_enter();
+            }
         }
         bwTip("diffuse-bed decoder. Load-time, so switching REBUILDS the engine - "
               "expect a brief pause; audio and playhead restart");
@@ -1472,6 +1555,28 @@ static void register_tests(ImGuiTestEngine* te) {
         bwa_unload_sound(e, g_cust_bed);  g_cust_bed  = 0; g_cust_bed_path[0]  = 0;
         g_cust_status[0] = 0;
         remove(CM); remove(CB);
+    };
+
+    t = IM_REGISTER_TEST(te, "viewer", "custom_material");   /* the custom material mints, edits live, and
+                                                              * survives as the reverb room's surface */
+    t->TestFunc = [](ImGuiTestContext* ctx) {
+        switch_scene(1);                                 /* Occlusion & Materials */
+        ctx->SetRef("playground");
+        cur_mat = NMAT; apply_wall();                    /* select "custom" (what the combo entry does) */
+        ctx->Yield(2);                                   /* the panel draws the coefficient sliders */
+        IM_CHECK_NE(g_cmat, 0u);                         /* minted through bwa_material_define */
+        float want = 1.0f - (g_cmat_abs[0] + g_cmat_abs[1] + g_cmat_abs[2]) / 3.0f;
+        IM_CHECK_LT(fabsf(mat_refl_cur() - want), 1e-5f);
+        ctx->ItemInputValue("**/##cscat", 0.85f);        /* a panel edit re-mints the token live */
+        IM_CHECK_LT(fabsf(g_cmat_scat - 0.85f), 1e-3f);
+        IM_CHECK_NE(g_cmat, 0u);
+        rev_room_mat = NMAT + 1;                         /* the custom material as the reverb ROOM surface */
+        switch_scene(SCENE_REVERB);                      /* load-time: the rebuild mints it for the new engine */
+        IM_CHECK(e != NULL);
+        IM_CHECK_NE(g_cmat, 0u);
+        switch_scene(0);
+        rev_room_mat = 0; cur_mat = 0;
+        g_cmat_scat = 0.30f;                             /* restore the default coefficients */
     };
 
     t = IM_REGISTER_TEST(te, "viewer", "abx_flow");  /* the blind test scores through the panel buttons */
