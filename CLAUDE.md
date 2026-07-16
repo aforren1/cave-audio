@@ -546,5 +546,6 @@ the production array render never uses HRTF.
 - `docs/build.md` — platform, dependencies, licensing, DVS/Dante config.
 - `docs/layout-schema.md` — `cave_layout.json` format: speaker geometry, per-speaker gain/delay, DBAP knobs.
 - `docs/calibration.md` — `bwa_calibrate`: acoustic position survey, delay/gain trims, room report → `cave_layout.json`.
+- `docs/hardware-validation.md` — the rig-day runbook: staged on-hardware checks (device → wiring → calibration → Motive → end-to-end → by-ear) with pass criteria.
 - `docs/internal-types.md` — internal structs (`Voice`/`Sound`/`Layout`/`Listener`) + helper signatures. **Not ABI.**
 - `docs/roadmap.md` — milestone-ordered implementation plan.
