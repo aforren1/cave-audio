@@ -694,13 +694,15 @@ static void abx_draw3d(void) {
 /* A pre-encoded 3rd-order AmbiX field (synthesized at startup — see gen_bed) played WORLD-LOCKED
  * through the bed decode: the by-ear home for the bed knobs. SPACE spins the field
  * (bwa_bed_set_orientation glides, click-free), the tilt slider pitches it (the full 3-axis
- * rotation), G A/Bs matrix vs parametric rendering, B A/Bs max-rE decode weighting. */
-static int   bed_spin, bed_param, bed_re;
+ * rotation), G A/Bs matrix vs parametric rendering, B A/Bs max-rE decode weighting, N A/Bs the
+ * band-split (taper only > 700 Hz) against the broadband taper. */
+static int   bed_spin, bed_param, bed_re, bed_re_split;
 static float bed_yaw, bed_pitch;
 
 static void bed_apply(void) {
     bwa_set_bed_renderer(e, bed_param ? BWA_BED_PARAMETRIC : BWA_BED_MATRIX);
     bwa_set_max_re(e, bed_re != 0);
+    bwa_set_max_re_split(e, bed_re_split != 0);
     bwa_bed_set_orientation(e, g_bed, bed_yaw, bed_pitch, 0.0f);
 }
 static void bed_enter(void) {
@@ -714,6 +716,7 @@ static void bed_update(float dt) {
     if (kp(KEY_SPACE)) bed_spin = !bed_spin;
     if (kp(KEY_G)) bed_param = !bed_param;
     if (kp(KEY_B)) bed_re = !bed_re;
+    if (kp(KEY_N)) bed_re_split = !bed_re_split;
     /* yaw ACCUMULATES while spinning (no wrap: a target wrapped by 2pi would glide the long way
      * back at the engine's ~1 turn/s rate); float precision is fine for hours of spin */
     if (bed_spin) bed_yaw += 0.45f * dt;
@@ -901,6 +904,7 @@ static void switch_scene(int idx) {
     bwa_bed_stop(e, g_bed);                                        /* the bed scene's field + its knobs */
     bwa_set_bed_renderer(e, BWA_BED_MATRIX);
     bwa_set_max_re(e, false);
+    bwa_set_max_re_split(e, false);
     source_yaw = 0.0f;
     bwa_source_set_gain(e, src, SRC_GAIN);
     cur_scene = idx;
@@ -1089,6 +1093,10 @@ static void draw_panel(void) {
         chk("max-rE decode [B]", &bed_re);
         bwTip("max-rE weighting tapers the high SH orders: fewer decode sidelobes, a longer "
               "energy vector - better localization off-centre, slightly wider main lobe. Live A/B");
+        chk("band-split max-rE [N]", &bed_re_split);
+        bwTip("Gerzon split: the taper acts only above ~700 Hz, the unweighted (rV-optimal) decode "
+              "keeps the low band - the ear localizes LF by pressure, HF by energy. Needs max-rE "
+              "on to be audible; broadband vs split is the by-ear call. Live A/B");
         ImGui::TextDisabled("yaw %.0f deg", fmodf(bed_yaw * 57.2958f, 360.0f));
         ImGui::TextWrapped("bursts = front (red), clicks = left-up (blue), plus a diffuse floor. "
                            "World-locked: the field is glued to the room, not the head.");
@@ -1276,14 +1284,17 @@ static void register_tests(ImGuiTestEngine* te) {
         ctx->SetRef("playground");
         ctx->ItemCheck("**/max-rE decode [B]");
         IM_CHECK_EQ(bed_re, 1);
+        ctx->ItemCheck("**/band-split max-rE [N]");
+        IM_CHECK_EQ(bed_re_split, 1);
         ctx->ItemCheck("**/parametric renderer [G]");
         IM_CHECK_EQ(bed_param, 1);
-        ctx->Yield(10);                                  /* both A/Bs crossfade in */
+        ctx->Yield(10);                                  /* all three A/Bs crossfade in */
         m = meters_max(&n);
-        IM_CHECK_GT(m, 1e-4f);                           /* still live through both live A/Bs */
+        IM_CHECK_GT(m, 1e-4f);                           /* still live through the live A/Bs */
         ctx->CaptureReset();
         ctx->CaptureScreenshot();
         ctx->ItemUncheck("**/parametric renderer [G]");
+        ctx->ItemUncheck("**/band-split max-rE [N]");
         ctx->ItemUncheck("**/max-rE decode [B]");
         switch_scene(0);
         int stopped = 0;                                 /* the stop is click-free: it needs an audio
