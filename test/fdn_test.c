@@ -1,5 +1,5 @@
-/*
- * fdn_test.c — the directional FDN reverb bed (fdn.c), driven off-engine through its RtBusTap
+﻿/*
+ * fdn_test.c â€” the directional FDN reverb bed (fdn.c), driven off-engine through its RtBusTap
  * interface (the way reflect_test drives the Steam bed). Feeds an impulse down the aux send and
  * checks the rendered 26-ch reverb:
  *   - a tail exists and decays (not silence, not runaway);
@@ -70,7 +70,7 @@ int main(void) {
 
     /* 1. decay lands near the configured RT60 (uniform, single-band: low == high) */
     {
-        Fdn* f = fdn_create(&L, RATE, CH);
+        Fdn* f = fdn_create(&L, RATE, CH, 0);
         CHECK(f != NULL, "fdn_create");
         if (f) {
             fdn_set_decay(f, 0.8f, 0.8f, 2000.f);
@@ -85,10 +85,28 @@ int main(void) {
         }
     }
 
-    /* 2. two-band decay: with rt60_high << rt60_low the late tail is LF-dominated — compare the
+    /* 1b. EPAD line render (bed_decoder = 2): the knob reaches the FDN — it builds, produces a
+     * tail, and the decay is untouched (the decode only changes WHERE the lines land on the
+     * array, never the feedback loop). Any other decoder value keeps the house AllRAD. */
+    {
+        Fdn* f = fdn_create(&L, RATE, CH, 2);
+        CHECK(f != NULL, "fdn_create (EPAD render)");
+        if (f) {
+            fdn_set_decay(f, 0.8f, 0.8f, 2000.f);
+            run_fdn(f, &L, NULL, BLOCKS, e);
+            double tail = 0; for (int b = 20; b < BLOCKS; ++b) tail += e[b];
+            CHECK(tail > 1e-12, "EPAD-rendered FDN produces a reverb tail");
+            double rt = rt60_fit(e, 40, 150);
+            printf("fdn: epad-render rt60 = %.3f s (want 0.8)\n", rt);
+            CHECK(rt > 0.6 && rt < 1.0, "EPAD-rendered FDN decays at the configured RT60");
+            fdn_destroy(f);
+        }
+    }
+
+    /* 2. two-band decay: with rt60_high << rt60_low the late tail is LF-dominated â€” compare the
      * decay measured early (both bands alive) vs late (HF dead): the late slope must be slower. */
     {
-        Fdn* f = fdn_create(&L, RATE, CH);
+        Fdn* f = fdn_create(&L, RATE, CH, 0);
         if (f) {
             fdn_set_decay(f, 1.2f, 0.3f, 1000.f);
             run_fdn(f, &L, NULL, BLOCKS, e);
@@ -103,14 +121,14 @@ int main(void) {
     /* 3. anisotropic decay: decay scaled 0.4x toward +x -> the +x wall's late energy dies faster
      * than the -x wall's. Compare per-side late/early energy ratios (level-independent). */
     {
-        Fdn* f = fdn_create(&L, RATE, CH);
+        Fdn* f = fdn_create(&L, RATE, CH, 0);
         if (f) {
             fdn_set_decay(f, 1.0f, 1.0f, 2000.f);
             fdn_set_decay_direction(f, (const float[3]){ 1, 0, 0 }, 0.4f);
             static double epx[BLOCKS], enx[BLOCKS];
             run_fdn(f, &L, keep_px, BLOCKS, epx);
             fdn_destroy(f);
-            f = fdn_create(&L, RATE, CH);        /* fresh state, same excitation, other side */
+            f = fdn_create(&L, RATE, CH, 0);        /* fresh state, same excitation, other side */
             fdn_set_decay(f, 1.0f, 1.0f, 2000.f);
             fdn_set_decay_direction(f, (const float[3]){ 1, 0, 0 }, 0.4f);
             run_fdn(f, &L, keep_nx, BLOCKS, enx);
@@ -127,7 +145,7 @@ int main(void) {
 
     /* 4. stability: after the impulse fully decays, a long silent run stays finite and near-zero */
     {
-        Fdn* f = fdn_create(&L, RATE, CH);
+        Fdn* f = fdn_create(&L, RATE, CH, 0);
         if (f) {
             fdn_set_decay(f, 0.3f, 0.3f, 2000.f);
             static double es[BLOCKS];
@@ -140,11 +158,11 @@ int main(void) {
         }
     }
 
-    /* 5. max-rE render pair (fdn_set_max_re): the taper only swaps the line->speaker render — the
+    /* 5. max-rE render pair (fdn_set_max_re): the taper only swaps the line->speaker render â€” the
      * decay loop is untouched, so the RT60 must stay put, the level must stay ~fair (energy-
      * normalized weights), and a mid-run toggle (the per-sample crossfade) must stay finite. */
     {
-        Fdn* f = fdn_create(&L, RATE, CH);
+        Fdn* f = fdn_create(&L, RATE, CH, 0);
         if (f) {
             fdn_set_decay(f, 0.8f, 0.8f, 2000.f);
             fdn_set_max_re(f, 1);
@@ -157,8 +175,8 @@ int main(void) {
             CHECK(finite, "max-rE render stays finite");
             fdn_destroy(f);
         }
-        Fdn* f0 = fdn_create(&L, RATE, CH);
-        Fdn* f1 = fdn_create(&L, RATE, CH);
+        Fdn* f0 = fdn_create(&L, RATE, CH, 0);
+        Fdn* f1 = fdn_create(&L, RATE, CH, 0);
         if (f0 && f1) {
             static double e0[BLOCKS], e1[BLOCKS];
             fdn_set_decay(f0, 0.8f, 0.8f, 2000.f);

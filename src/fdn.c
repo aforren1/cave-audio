@@ -14,6 +14,7 @@
  */
 #include "fdn.h"
 #include "allrad.h"
+#include "epad.h"
 #include "ambisonics.h"
 
 #include <math.h>
@@ -69,7 +70,7 @@ static void fdn_gains(Fdn* f) {
     f->xa = 1.f - expf(-6.2831853f * f->xover_hz / (float)f->sample_rate);
 }
 
-Fdn* fdn_create(const Layout* L, uint32_t sample_rate, uint32_t channels) {
+Fdn* fdn_create(const Layout* L, uint32_t sample_rate, uint32_t channels, int bed_decoder) {
     if (!L || sample_rate == 0 || channels == 0 || channels > BWA_CHANNELS) return NULL;
     Fdn* f = (Fdn*)calloc(1, sizeof *f);
     if (!f) return NULL;
@@ -88,9 +89,17 @@ Fdn* fdn_create(const Layout* L, uint32_t sample_rate, uint32_t channels) {
     for (int l = 0; l < FDN_N; ++l) { f->ring[l] = f->mem + at; at += f->rlen[l]; }
 
     /* line -> speaker render: each line is a plane wave from its direction, decoded through the
-     * layout's bed decode (AllRAD; sampling-decode fallback mirrors rt.c's build_bed_decode_sad). */
+     * layout's bed decode. Follows bwa_desc.bed_decoder where it states a real preference — EPAD
+     * renders the lines through the same energy-preserving decode the beds use — but AllRAD stays
+     * the house default otherwise, INCLUDING when the knob reads SAMPLING: the FDN predates the
+     * knob reaching it, its diffuse tail wants the robust decode, and the sampling matrix was
+     * never its behavior (the sampling form below is only the non-triangulable fallback, mirroring
+     * rt.c's build_bed_decode_sad). */
     float dec[BWA_CHANNELS][BWA_AMBI_CH];
-    if (!allrad_build_decode(L, dec)) {
+    int built = 0;
+    if (bed_decoder == 2) built = epad_build_decode(L, dec);
+    if (!built)           built = allrad_build_decode(L, dec);
+    if (!built) {
         for (uint32_t s = 0; s < L->count; ++s) {               /* sampling decode: (2l+1)*Y/N per row */
             float p[3] = { L->speakers[s].pos[0] - L->ref[0], L->speakers[s].pos[1] - L->ref[1],
                            L->speakers[s].pos[2] - L->ref[2] };

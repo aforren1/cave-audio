@@ -207,7 +207,8 @@ decoder** (`bwa_desc.bed_decoder = BWA_DECODE_EPAD`, `epad.c`): the polar-factor
 `D = c·Yᵀ(YYᵀ)^(-1/2)` (Zotter/Pomberger/Noisternig 2012) makes a panned plane wave's decoded energy
 constant over direction by construction (the `dsp` test measures CV 0.09 vs sampling's 0.95 on a
 clustered array; a 16×16 Jacobi eigensolve at load, degenerate arrays fall back to sampling; `xval`
-pins it against numpy's SVD polar factor). **The MDAP/spectral spread ring frame is
+pins it against numpy's SVD polar factor; the FDN's line render follows EPAD too — any other
+bed_decoder value keeps the FDN's house AllRAD, the `fdn` test pins the EPAD build). **The MDAP/spectral spread ring frame is
 parallel-transported per voice** (`spread_frame`, `rt.c`): the old fixed-up-vector frame flipped ~180°
 in one solve when a moving source left the |d·y| > 0.9 pole zone, teleporting the spectral bands'
 directions — the `rt` test sweeps a wide source over the zenith and pins step continuity (0.0057 vs

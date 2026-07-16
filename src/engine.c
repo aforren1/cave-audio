@@ -379,7 +379,7 @@ bwa_result bwa_start(bwa_engine* e) {
      * when the FDN is enabled). Consumes the same mono aux send + per-voice send levels. Non-fatal on
      * allocation failure: no tap, the engine runs dry, the reason surfaces via bwa_last_error. */
     if (e->fdn_cfg.enabled) {
-        e->fdn = fdn_create(&e->layout, e->cfg.sample_rate, e->layout.count);
+        e->fdn = fdn_create(&e->layout, e->cfg.sample_rate, e->layout.count, (int)e->cfg.bed_decoder);
         if (e->fdn) {
             fdn_set_decay(e->fdn, e->fdn_cfg.rt60_low_s, e->fdn_cfg.rt60_high_s, e->fdn_cfg.xover_hz);
             const float* d = e->fdn_cfg.decay_dir;

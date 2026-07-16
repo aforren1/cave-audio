@@ -22,9 +22,11 @@
 typedef struct Fdn Fdn;
 
 /* Build the FDN for this layout + rate: line delays, decay filters at the defaults (1.2 s low /
- * 0.7 s high @ 2 kHz), and the line→26 render matrix (AllRAD bed decode over the real array; the
- * sampling decode as fallback for a non-triangulable one). NULL on allocation failure. */
-Fdn* fdn_create(const Layout* L, uint32_t sample_rate, uint32_t channels);
+ * 0.7 s high @ 2 kHz), and the line→26 render matrix. `bed_decoder` is bwa_desc.bed_decoder:
+ * EPAD (2) renders the lines through the same energy-preserving decode the beds use; anything
+ * else keeps the FDN's house AllRAD (the sampling decode only as the non-triangulable fallback).
+ * NULL on allocation failure. */
+Fdn* fdn_create(const Layout* L, uint32_t sample_rate, uint32_t channels, int bed_decoder);
 void fdn_destroy(Fdn* f);
 
 /* Decay time (s) below/above `xover_hz`. Values clamp to [0.05, 30]. Before the audio thread runs. */

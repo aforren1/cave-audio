@@ -869,7 +869,9 @@ and reflection beds only, never the point-source panner:
   a panned plane wave's decoded energy is constant over direction *by construction*, the
   flattest loudness-vs-direction of the three on an irregular array. Degenerate arrays fall
   back to sampling. AllRAD vs EPAD on the real array is a by-ear call: EPAD is smoother,
-  AllRAD a touch sharper.
+  AllRAD a touch sharper. The **FDN's line render follows EPAD too** (with any other value the
+  FDN keeps its house AllRAD — its diffuse tail wants the robust decode regardless of the bed
+  setting).
 
 The decoder is create-time configuration (the decode matrix is built at `bwa_create`); see
 [`spatialization.md`](./spatialization.md) for the theory.
