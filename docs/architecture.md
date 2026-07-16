@@ -97,8 +97,8 @@ graph, with each stage annotated with the functions that implement and configure
  × pause/seek gate                                   listener, energy-meaned over extra
  │ └→ s_raw → bending-loss EQ → × shCoeffs           listeners → spread render (LOBE ·
  │            → PATH ACCUM (ambisonic)               MDAP ring · SPECTRAL 6-band targets;
- transmission EQ (3 biquads — occlusion's tilt)      near-spread + metric-size floors) →
- × occlusion level × directivity                     dual-band low derivation; × user gain
+ transmission EQ (3 biquads — occlusion's tilt)      w×h extent · near-spread + size floors)
+ × occlusion level × directivity                     → dual-band low derivation; × user gain
  │ ├→ × wet send (× distance) → AUX (mono)           × group gain × timed fades
  │ └→ ISM: per-voice ring → 6 shoebox mirror
  │       images (frac delay · HF damp · per-
@@ -111,7 +111,8 @@ graph, with each stage annotated with the functions that implement and configure
  BED VOICE (mix_bed) — per sample
  ────────────────────────────────
  SH frames → rotate (yaw phasor · full 3-axis Ivanic-Ruedenberg matrix; glided)
- ├→ matrix render: × max-rE taper (crossfaded) → bed decode (SAD · AllRAD) ─→ BUS
+ ├→ matrix render: × max-rE taper (crossfaded; opt. band-split — taper > 700 Hz
+ │       only, rV decode below) → bed decode (AllRAD · EPAD) ────────────────→ BUS
  └→ parametric render (crossfaded): FOA band split → DirAC direction + diffuseness ψ
       direct  √(1−ψ)·W → listener-relative panner at the array shell ───────→ BUS
       diffuse √ψ·FOA  → bed decode (raw) ───────────────────────────────────→ DECOR
@@ -152,9 +153,10 @@ The tap ordering is deliberate, not incidental:
   the full per-voice processing, and the velvet filters run once per *channel* (after the
   voice loop), not per voice.
 - **max-rE weighting** lives where the engine's own SH→speaker decode renders bed signal
-  (the matrix renderer, the FDN's line render). The parametric analysis and its re-panned
-  direct stream see the raw field, and phonon's decodes (reflection bed, pathing, the
-  HRTF monitor) are its own.
+  (the matrix renderer, the FDN's line render) — broadband, or band-split (the taper only
+  above 700 Hz; the rV-optimal plain decode keeps the low band; bed matrix paths only, the
+  FDN stays broadband). The parametric analysis and its re-panned direct stream see the
+  raw field, and phonon's decodes (reflection bed, pathing, the HRTF monitor) are its own.
 - **Master gain sits before align** so per-speaker trims stay calibrated; the **test
   signal enters after align** so a wiring check is a raw channel, untouched by trims or
   delays; the **limiter is last** so nothing — test signal included — can clip a driver.

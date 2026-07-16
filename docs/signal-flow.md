@@ -24,7 +24,7 @@ flowchart TD
     PATHS["path sim 10 Hz: per-voice shCoeffs + bending tilt<br/>steam_path.c → rt_set_pathing<br/><i>bwa_desc.enable_pathing · bwa_source_set_pathing</i>"]
   end
 
-  SOLVE["gain solve — compute_gains (block rate, dirty-gated)<br/>panner_gains → dbap_gains / spcap_gains / vbap_gains<br/>spread: spread_gains (LOBE) / mdap_gains / fs_solve (SPECTRAL)<br/><i>bwa_set_panner · _dual_band · _spread_mode · _near_spread ·<br/>_extra_listeners · bwa_source_set_spread / _size / _gain ·<br/>bwa_group_set_gain · bwa_source_fade_to</i>"]
+  SOLVE["gain solve — compute_gains (block rate, dirty-gated)<br/>panner_gains → dbap_gains / spcap_gains / vbap_gains<br/>spread: spread_gains (LOBE) / mdap_gains / fs_solve (SPECTRAL);<br/>anisotropic w×h extent (up-anchored frame + affine squash)<br/><i>bwa_set_panner · _dual_band · _spread_mode · _near_spread ·<br/>_extra_listeners · bwa_source_set_spread / _extent / _size / _gain ·<br/>bwa_group_set_gain · bwa_source_fade_to</i>"]
 
   subgraph VOICE["mono voice — mix_voice, per sample (inside rt_render)"]
     READ["read: pcm cursor · pitch resample · stream_pull<br/><i>bwa_source_play / _play_at · bwa_source_set_pitch</i>"]
@@ -59,7 +59,7 @@ flowchart TD
   subgraph BEDV["bed voice — mix_bed, per sample (inside rt_render)"]
     SH["SH frames (world-locked soundfield)<br/><i>bwa_bed_play · bwa_bed_set_gain</i>"]
     ROT["rotate: yaw phasor (bed_rotate_z) ·<br/>full 3-axis ambi_rot_matrix / ambi_rot_apply (glided)<br/><i>bwa_bed_set_rotation · bwa_bed_set_orientation</i>"]
-    MTX["matrix render: × max-rE taper (ambi_max_re_weights,<br/>crossfaded) → bed decode — build_bed_decode /<br/>allrad_build_decode<br/><i>bwa_set_max_re · bwa_desc.bed_decoder</i>"]
+    MTX["matrix render: × max-rE taper (ambi_max_re_weights,<br/>crossfaded; opt. band-split: taper > 700 Hz only) →<br/>bed decode — build_bed_decode: allrad_build_decode /<br/>epad_build_decode (SAD = internal fallback)<br/><i>bwa_set_max_re · _max_re_split · bwa_desc.bed_decoder</i>"]
     PARA["parametric render (crossfaded): FOA bands →<br/>DirAC direction + diffuseness ψ<br/><i>bwa_set_bed_renderer</i>"]
     SH --> ROT
     ROT --> MTX
