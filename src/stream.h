@@ -50,6 +50,10 @@ uint32_t   stream_pull(Stream* s, uint64_t pos, float* dst, uint32_t n);
  * (Distinguishes a real EOF from a transient underrun, so the voice ends only at true EOF.) */
 int        stream_ended(const Stream* s, uint64_t pos);
 
+/* File length in frames (engine rate — streams require it). Fixed at stream_open, so any thread
+ * may read it. 0 for a push stream (open-ended: the producer decides when it ends). */
+uint64_t   stream_total_frames(const Stream* s);
+
 /* ---- push streams (procedural audio: the CALLER is the producer) ----
  * A push stream has no file or decoder: the control thread writes PCM into the ring (stream_push)
  * and the audio thread consumes it with the same stream_pull/stream_ended calls a file stream uses.

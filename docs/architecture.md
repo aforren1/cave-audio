@@ -95,12 +95,12 @@ graph, with each stage annotated with the functions that implement and configure
  ───────────────────────────────────                 ─────────────────────────────────────
  read: pcm cursor · pitch resample · stream pull     panner DBAP/SPCAP/VBAP at the tracked
  × pause/seek gate                                   listener, energy-meaned over extra
- │ └→ s_raw → bending-loss EQ → × shCoeffs           listeners → spread render (LOBE ·
- │            → PATH ACCUM (ambisonic)               MDAP ring · SPECTRAL 6-band targets;
- transmission EQ (3 biquads — occlusion's tilt)      w×h extent · near-spread + size floors)
- × occlusion level × directivity                     → dual-band low derivation; × user gain
- │ ├→ × wet send (× distance) → AUX (mono)           × group gain × timed fades
- │ └→ ISM: per-voice ring → 6 shoebox mirror
+ │ └→ s_raw → bending-loss EQ → × shCoeffs           listeners → per-source atten override
+ │            → PATH ACCUM (ambisonic)               (by ratio) → spread render (LOBE ·
+ transmission EQ (3 biquads — occlusion's tilt)      MDAP ring · SPECTRAL 6-band targets;
+ × occlusion level × directivity                     w×h extent · near-spread + size floors)
+ │ ├→ × wet send (× distance) → AUX (mono)           → dual-band low derivation; × user gain
+ │ └→ ISM: per-voice ring → 6 shoebox mirror         × group gain × timed fades
  │       images (frac delay · HF damp · per-
  │       image panner gains) ──────────→ BUS
  air-absorption LP → loudness shelf → Doppler ring

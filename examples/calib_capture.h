@@ -36,6 +36,12 @@ void calib_sim_capture(int ch, const Layout* L, const float mic[3], const float*
 /* minimal mono IEEE-float WAV writer (retained per-speaker impulse responses) */
 void calib_write_wav_f32(const char* path, const float* x, int n, int fs);
 
+/* Registered-driver enumeration (ungated: without the ASIO SDK the count is 0 and list says so).
+ * A fresh registry read each call; loads nothing, needs no session slot — safe while a capture
+ * or the engine has a driver open. Feeds the CLI's --list-drivers and the station's pickers. */
+int calib_asio_driver_names(char (*names)[32], int max);   /* fill up to max (<= 32); returns the count */
+int calib_asio_list(void);                                  /* print them to stdout; 0 (2 = no-SDK build) */
+
 #ifdef BWA_HAVE_ASIO
 /* ASIO full-duplex: open `driver` (NULL = first with >= `nspk` outs + the mic input), start
  * streaming. `nspk` is the layout's speaker count (4..BWA_CHANNELS). calib_asio_capture(ch) plays

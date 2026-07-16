@@ -67,6 +67,7 @@ int main(int argc, char** argv) {
         if      (!strcmp(argv[i],"--layout") && i+1<argc) layout_path = argv[++i];
         else if (!strcmp(argv[i],"--out")    && i+1<argc) out_path    = argv[++i];
         else if (!strcmp(argv[i],"--driver") && i+1<argc) driver      = argv[++i];
+        else if (!strcmp(argv[i],"--list-drivers"))       return calib_asio_list();   /* names for --driver */
         else if (!strcmp(argv[i],"--input")  && i+1<argc) mic_in      = atoi(argv[++i]);
         else if (!strcmp(argv[i],"--simulate"))           simulate    = 1;
         else if (!strcmp(argv[i],"--room"))               room        = 1;   /* RT60 + early reflections report */
@@ -80,7 +81,7 @@ int main(int argc, char** argv) {
         else if (!strcmp(argv[i],"--room-eq-grid"))       rq_grid     = 1;   /* accumulate LF modal cuts at THIS mic position into room_eq_grid (tracked room EQ) */
         else if (!strcmp(argv[i],"--zylia"))              zylia       = 1;   /* single-position localization with the ZM-1 */
         else if (!strcmp(argv[i],"--mic") && i+3<argc) { mic[0]=(float)atof(argv[++i]); mic[1]=(float)atof(argv[++i]); mic[2]=(float)atof(argv[++i]); }
-        else { fprintf(stderr, "usage: calibrate [--layout f] [--out f] [--mic x y z] [--input ch] [--driver name] [--simulate] [--room] [--eq | --room-eq | --room-eq-grid] [--zylia] [--save-irs prefix] [--localize positions.txt] [--check] [--live N] [--latency m]\n"); return 2; }
+        else { fprintf(stderr, "usage: calibrate [--layout f] [--out f] [--mic x y z] [--input ch] [--driver name] [--list-drivers] [--simulate] [--room] [--eq | --room-eq | --room-eq-grid] [--zylia] [--save-irs prefix] [--localize positions.txt] [--check] [--live N] [--latency m]\n"); return 2; }
     }
     if (room_eq && rq_grid) { fprintf(stderr, "calibrate: --room-eq and --room-eq-grid are mutually exclusive (one scheme per layout)\n"); return 2; }
     if (room_eq)

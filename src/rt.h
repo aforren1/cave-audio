@@ -48,7 +48,8 @@ enum {
     CMD_GROUP_PAUSED,   /* mix-group pause gate */
     CMD_SET_PITCH,  /* per-voice playback rate (in-memory sounds) */
     CMD_BED_ROT,    /* per-bed soundfield orientation (yaw about up; + pitch/roll for the full rotation) */
-    CMD_SET_ISM     /* per-voice image-source early reflections */
+    CMD_SET_ISM,    /* per-voice image-source early reflections */
+    CMD_SET_ATTEN   /* per-voice distance-attenuation override (replaces the layout curve for one source) */
 };
 typedef struct {
     uint8_t  type;
@@ -80,6 +81,7 @@ typedef struct {
         struct { float rate; }                         pitch; /* playback rate (1 = native) */
         struct { float yaw, pitch, roll; }             brot;  /* bed soundfield orientation (radians) */
         struct { uint8_t on; }                         ism;   /* per-voice early reflections */
+        struct { float ref, rolloff, min_lin; }        atten; /* per-voice curve; ref <= 0 clears the override */
     } u;
 } Cmd;
 
@@ -169,6 +171,8 @@ uint32_t rt_load_sound_streaming(RtCore* c, const char* path, char* err, size_t 
 uint32_t rt_load_ambix  (RtCore* c, const char* path, char* err, size_t errcap); /* multichannel bed asset */
 uint32_t rt_load_fuma   (RtCore* c, const char* path, char* err, size_t errcap); /* FuMa bed, converted to AmbiX at load */
 uint16_t rt_sound_channels(RtCore* c, uint32_t sound);   /* 1 = mono, 4/9/16 = bed, 0 = invalid */
+uint64_t rt_sound_frames  (RtCore* c, uint32_t sound);   /* length in frames at the engine rate;
+                                                          * 0 = invalid, or unknown (push streams) */
 bool     rt_unload_sound(RtCore* c, uint32_t sound);  /* safe any time; retire-acked internally.
                                                        * false = command ring full, nothing enqueued:
                                                        * retry later (internal sounds park in rt.c) */
@@ -204,6 +208,8 @@ void rt_source_set_air_absorption(RtCore* c, uint32_t h, bool on);   /* propagat
 void rt_source_set_loudness_comp(RtCore* c, uint32_t h, bool on);    /* equal-loudness LF shelf vs attenuation */
 void rt_source_set_spread(RtCore* c, uint32_t h, float amount);      /* source angular width: 0 = point .. 1 = wide */
 void rt_source_set_extent(RtCore* c, uint32_t h, float w, float hgt);/* anisotropic width/height extent (room-referenced) */
+void rt_source_set_attenuation(RtCore* c, uint32_t h, float ref_m, float rolloff, float min_lin);  /* per-source curve;
+                                                                      * ref <= 0 = back to the layout's; rolloff 0 = constant */
 void rt_source_set_size  (RtCore* c, uint32_t h, float radius_m);    /* source METRIC size: spread from subtended angle */
 void rt_source_fade_to   (RtCore* c, uint32_t h, float gain, float seconds, bool stop_at_end);  /* timed fade */
 void rt_source_set_group (RtCore* c, uint32_t h, uint32_t group);    /* mix-group assignment (0 = default) */

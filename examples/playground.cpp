@@ -980,6 +980,17 @@ static void switch_scene(int idx) {
     scenes[idx].enter();
 }
 
+/* ---- driver picker (bwa_get_asio_driver_count/_name): choose the headphone driver from the
+ * panel instead of restarting with --driver. bwa_desc.asio_driver is create-time, so a pick
+ * REBUILDS the engine (the reverb scene's decoder-combo policy) and re-enters the current scene
+ * (every scene's enter() is already rebuild-safe — switch_scene relies on that). ---- */
+static char g_drv_pick[64];                  /* the picked name g_asio_driver points at */
+static void rebuild_for_driver(void) {
+    if (e) { bwa_stop(e); bwa_destroy(e); e = NULL; }
+    build_engine(engine_has_reverb);
+    scenes[cur_scene].enter();
+}
+
 /* ---- custom sound loading (the panel's "custom sound" section + files dropped on the window):
  * a mono file joins the signal picker and plays on the point source in every scene; an ambisonic
  * one (AmbiX 4/9/16 ch, or FuMa .amb) replaces the bed scene's synthesized field — all the bed
@@ -1098,7 +1109,33 @@ static void draw_panel(void) {
     else                ImGui::TextColored(ImVec4(0.45f, 0.92f, 0.55f, 1.0f), "audio: %s", backend_name);
     if (backend_silent && ImGui::IsItemHovered(ImGuiHoveredFlags_ForTooltip))
         ImGui::SetTooltip("no ASIO device opened - the offline null sink renders silently\n"
-                          "(run with --driver <your headphone driver>)");
+                          "(pick a driver below, or run with --driver <name>)");
+    {   /* registered-driver picker: the list is read only while the combo is open (a fresh
+         * registry scan per bwa_get_asio_driver_count call); picking rebuilds the engine */
+        ImGui::SetNextItemWidth(-FLT_MIN);
+        if (ImGui::BeginCombo("##drv", g_asio_driver ? g_asio_driver : "driver: (auto-pick)")) {
+            if (ImGui::Selectable("(auto-pick)", g_asio_driver == NULL) && g_asio_driver) {
+                g_asio_driver = NULL;
+                rebuild_for_driver();
+            }
+            char nm[64];
+            uint32_t nd = bwa_get_asio_driver_count();
+            for (uint32_t i = 0; i < nd; ++i) {
+                if (!bwa_get_asio_driver_name(i, nm, sizeof nm)) continue;
+                bool sel = g_asio_driver && strcmp(g_asio_driver, nm) == 0;
+                if (ImGui::Selectable(nm, sel) && !sel) {
+                    snprintf(g_drv_pick, sizeof g_drv_pick, "%s", nm);
+                    g_asio_driver = g_drv_pick;
+                    rebuild_for_driver();
+                }
+            }
+            ImGui::EndCombo();
+        }
+        bwTip("ASIO driver for the output (bwa_desc.asio_driver). Create-time, so picking REBUILDS "
+              "the engine (brief gap). (auto-pick) = the first registered driver with enough "
+              "outputs. A registered driver can still fail to open (unplugged/busy) - the engine "
+              "falls back to the silent null sink; the audio line above is the truth.");
+    }
     char mlabel[48];
     snprintf(mlabel, sizeof mlabel, "speakers 0-%d (60 dB window)", g_nspk - 1);
     ImGui::PlotHistogram("##meters", spk_lv, g_nspk, 0, mlabel, 0.0f, 1.0f,
@@ -1381,6 +1418,19 @@ static void register_tests(ImGuiTestEngine* te) {
     ImGuiTest* t;
 
     /* pure-logic checks ride the same suite (the station's pattern) — filterable via --tests logic */
+    t = IM_REGISTER_TEST(te, "logic", "driver_rebuild");   /* the panel picker's enumeration + rebuild path */
+    t->TestFunc = [](ImGuiTestContext*) {
+        char nm[64];
+        uint32_t nd = bwa_get_asio_driver_count();
+        for (uint32_t i = 0; i < nd && i < 4; ++i)         /* every listed index is readable */
+            IM_CHECK(bwa_get_asio_driver_name(i, nm, sizeof nm) && nm[0]);
+        IM_CHECK(!bwa_get_asio_driver_name(nd, nm, sizeof nm));   /* count itself = out of range */
+        g_asio_driver = NULL;                              /* "(auto-pick)" — the suite runs the null sink */
+        rebuild_for_driver();                              /* exactly what a combo pick runs */
+        IM_CHECK(e != NULL);
+        IM_CHECK_GE(bwa_get_channel_count(e), 4u);         /* the rebuilt engine is live */
+    };
+
     t = IM_REGISTER_TEST(te, "logic", "abx_pvalue");
     t->TestFunc = [](ImGuiTestContext*) {
         IM_CHECK_LT(fabs(abx_pvalue(6, 6) - 1.0 / 64.0), 1e-9);    /* 6/6 = (1/2)^6 */
@@ -1631,13 +1681,15 @@ int main(int argc, char** argv) {
     char filter[64] = "";
     for (int i = 1; i < argc; ++i)
         if (!strcmp(argv[i], "--help") || !strcmp(argv[i], "-h")) {
-            printf("usage: bwa_playground [cave_layout.json] [--driver <asio driver>] [--tests [filter]]\n"
+            printf("usage: bwa_playground [cave_layout.json] [--driver <asio driver>] [--list-drivers] [--tests [filter]]\n"
                    "  audition the engine by ear on the binaural monitor (auto-picked 2-ch ASIO\n"
                    "  driver; with no device it renders silently -- visual-only mode stays live)\n"
                    "  cave_layout.json   optional surveyed layout (default: ./cave_layout.json if\n"
                    "                     present, else the built-in grid); ./constraints.json is\n"
                    "                     drawn for orientation if present\n"
-                   "  --driver <name>    ASIO driver to open (default: auto-pick a 2-ch one)\n"
+                   "  --driver <name>    ASIO driver to open (default: auto-pick a 2-ch one; the\n"
+                   "                     panel's driver combo switches live)\n"
+                   "  --list-drivers     print the registered ASIO drivers and exit\n"
                    "  --tests [filter]   run the UI test suite (offline) and exit pass/fail\n"
                    "  keys: TAB scene | WASD/RF source | Q/E head | 1-4 signal | SPACE auto-move | F11\n");
             return 0;
@@ -1648,6 +1700,13 @@ int main(int argc, char** argv) {
             if (i + 1 < argc && argv[i + 1][0] != '-') snprintf(filter, sizeof filter, "%s", argv[i + 1]);
         } else if (!strcmp(argv[i], "--driver") && i + 1 < argc) {
             g_asio_driver = argv[++i];                        /* pin the headphone driver (bwa_desc.asio_driver) */
+        } else if (!strcmp(argv[i], "--list-drivers")) {      /* names for --driver / the panel combo */
+            char nm[64];
+            uint32_t nd = bwa_get_asio_driver_count();
+            printf("registered ASIO drivers (%u):\n", nd);
+            for (uint32_t k = 0; k < nd; ++k)
+                if (bwa_get_asio_driver_name(k, nm, sizeof nm)) printf("  %2u. %s\n", k, nm);
+            return 0;
         }
     if (selftest) g_sink_mode = BWA_SINK_NULL;
 

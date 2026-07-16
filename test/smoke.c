@@ -36,9 +36,36 @@ static int run_profile(bwa_profile profile, const char* name) {
     bwa_source s   = bwa_source_create(e);
     if (s == 0) { fprintf(stderr, "FAIL[%s]: bwa_source_create returned 0\n", name); bwa_destroy(e); return 1; }
 
+    /* asset metadata: an invalid handle reads 0/0; a real load reports mono + a nonzero length
+     * (the exact values are pinned rt-side — this is the ABI surface) */
+    if (bwa_sound_get_frames(e, 0) != 0 || bwa_sound_get_channels(e, 0) != 0) {
+        fprintf(stderr, "FAIL[%s]: metadata of an invalid handle is not 0\n", name); bwa_destroy(e); return 1;
+    }
+    if (snd && (bwa_sound_get_frames(e, snd) == 0 || bwa_sound_get_channels(e, snd) != 1)) {
+        fprintf(stderr, "FAIL[%s]: loaded-sound metadata\n", name); bwa_destroy(e); return 1;
+    }
+
+    /* ASIO enumeration: engine-free and load-nothing, so it must be consistent on ANY machine —
+     * every index below the count yields a non-empty name, the count itself is out of range, and
+     * a zero-cap buffer is refused (0 drivers on a machine with none installed is fine) */
+    {
+        char nm[64];
+        uint32_t nd = bwa_get_asio_driver_count();
+        for (uint32_t i = 0; i < nd && i < 4; ++i)
+            if (!bwa_get_asio_driver_name(i, nm, sizeof nm) || !nm[0]) {
+                fprintf(stderr, "FAIL[%s]: driver %u unreadable\n", name, i); bwa_destroy(e); return 1;
+            }
+        if (bwa_get_asio_driver_name(nd, nm, sizeof nm) ||
+            bwa_get_asio_driver_name(0, nm, 0)) {
+            fprintf(stderr, "FAIL[%s]: driver enumeration bounds\n", name); bwa_destroy(e); return 1;
+        }
+    }
+
     bwa_source_play(e, s, snd, /*loop*/ true);
     bwa_source_set_gain(e, s, 0.8f);
     bwa_source_set_pos(e, s, 1.0f, 0.0f, -0.5f);
+    bwa_source_set_attenuation_override(e, s, 1.0f, 0.0f, 0.0f);   /* exercise the export (rt pins behavior) */
+    bwa_source_set_attenuation_override(e, s, 0.0f, 0.0f, 0.0f);
     bwa_set_listener_pose(e, 0.f, 1.5f, 0.f, 0.f, 0.f, 0.f, 1.f);   /* the default grid's ear point */
     bwa_commit(e);
     bwa_play_oneshot(e, snd, 0.f, 1.f, 0.f, 1.0f);

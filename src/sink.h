@@ -19,6 +19,7 @@
 #ifndef BWA_SINK_H
 #define BWA_SINK_H
 
+#include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 
@@ -99,6 +100,11 @@ bwa_sink* bwa_manual_sink_open(uint32_t sample_rate, uint32_t block_size, uint32
 bwa_sink* bwa_asio_sink_open(uint32_t sample_rate, uint32_t block_size, uint32_t channels,
                           const char* driver /* NULL = auto-pick */,
                           bwa_render_fn render, void* user, char* err, size_t errcap);
+/* Registered-driver enumeration (bwa_get_asio_driver_count/_name): control thread, needs no
+ * engine or device — reads the OS's driver registry, loads nothing. asio_sink.cpp implements
+ * it (the one place ASIO lives). */
+uint32_t sink_asio_driver_count(void);
+bool     sink_asio_driver_name(uint32_t index, char* buf, uint32_t cap);
 #endif
 
 #endif /* BWA_SINK_H */

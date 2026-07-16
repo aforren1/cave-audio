@@ -148,6 +148,11 @@ typedef struct {
     float    spread_eff;                     /* last solve's EFFECTIVE spread (user, floored by size + near-
                                               * listener widening) — the decor split follows it (audio-thread) */
     float    dc_amp;                         /* decorrelated-split amplitude sqrt(spread*toggle), ramped (audio-thread) */
+    /* per-source distance-attenuation override (CMD_SET_ATTEN): swap the LAYOUT's curve for this
+     * voice's own — the solve rescales its gains by the RATIO of the two curves at the solved
+     * distance (exact through any clamping, panner-agnostic; primary-listener distance, like every
+     * distance effect). att_ref <= 0 = no override; rolloff 0 = constant level at any distance. */
+    float    att_ref, att_rolloff, att_min;
     /* equal-loudness distance compensation (opt-in): a one-pole LF shelf whose boost tracks the
      * distance attenuation, so an attenuated source keeps its body (ISO-226-motivated; audio-thread). */
     bool     ldc_on;
@@ -788,6 +793,18 @@ static void drain_commands(RtCore* c) {
             if (v) v->air_on = cmd->u.air.on != 0; } break;
         case CMD_SET_LDC: { Voice* v = voice_for(c, cmd->handle);
             if (v) v->ldc_on = cmd->u.ldc.on != 0; } break;      /* the mixer ramps the shelf in/out */
+        case CMD_SET_ATTEN: { Voice* v = voice_for(c, cmd->handle);
+            if (v) {
+                float ref = cmd->u.atten.ref;
+                if (ref <= 0.f) v->att_ref = 0.f;                /* clear: back to the layout curve */
+                else {
+                    v->att_ref     = ref;
+                    v->att_rolloff = cmd->u.atten.rolloff < 0.f ? 0.f : cmd->u.atten.rolloff;
+                    float m = cmd->u.atten.min_lin;
+                    v->att_min     = m < 0.f ? 0.f : (m > 1.f ? 1.f : m);
+                }
+                v->dirty = true;                                 /* re-solve with the new curve */
+            } } break;
         case CMD_SET_EXTRA_LIS:
             c->lis.nex_pending = cmd->u.exlis.n > BWA_EXTRA_LIS ? BWA_EXTRA_LIS : cmd->u.exlis.n;
             memcpy(c->lis.ex_pending, cmd->u.exlis.p, sizeof c->lis.ex_pending);
@@ -995,6 +1012,17 @@ static void panner_gains(RtCore* c, int p, const float src[3], float user_gain, 
     panner_gains_at(c, p, c->lis.p_active, &c->spcap, &c->vbap, src, user_gain, out);
 }
 
+/* The distance-attenuation formula with arbitrary parameters — the layout curve, the per-source
+ * override, and loudness comp's tracker all share it: clamp((ref/max(d,ref))^rolloff, min, 1).
+ * ref <= 0 = attenuation off (1 everywhere); rolloff 0 = constant 1 (the formula's own limit). */
+static float atten_curve(float d, float ref, float rolloff, float min_lin) {
+    if (ref <= 0.f) return 1.f;
+    float dd = d > ref ? d : ref;
+    float a = powf(ref / dd, rolloff);
+    if (a < min_lin) a = min_lin;
+    return a > 1.f ? 1.f : a;
+}
+
 /* Orthonormal ring frame (u, w) around the source direction d, PARALLEL-TRANSPORTED per voice:
  * project the stored base off the new d rather than deriving u from a fixed up-vector, whose
  * branch flip at |d.y| = 0.9 turns the frame ~180° in one solve when a moving source leaves the
@@ -1185,6 +1213,25 @@ static void compute_gains(RtCore* c, Voice* v) {
         }
         const double inv = 1.0 / (double)(nex + 1);
         for (uint32_t k = 0; k < c->channels; ++k) v->gtarget[k] = (float)sqrt(acc[k] * inv);
+    }
+
+    /* per-source attenuation override (rt_source_set_attenuation): the panner baked the LAYOUT
+     * curve into the solve (gains ∝ user_gain · atten · a unit-power distribution), so swap it by
+     * RATIO — exact through any clamping, panner-agnostic, primary-listener distance like every
+     * other distance effect. Everything downstream follows automatically: the spread modes
+     * renormalise to this solve's power, the dual-band low band derives from it, the decor split
+     * rides the gains, and loudness comp tracks the override's own curve (mix_voice). rolloff 0
+     * gives a constant-level source (a direction-only cue that never fades). */
+    if (v->att_ref > 0.f) {
+        float dx = v->pos_active[0]-c->lis.p_active[0], dy = v->pos_active[1]-c->lis.p_active[1],
+              dz = v->pos_active[2]-c->lis.p_active[2];
+        float ds = sqrtf(dx*dx + dy*dy + dz*dz);
+        float a_lay = atten_curve(ds, c->layout.atten_ref_m, c->layout.atten_rolloff, c->layout.atten_min_lin);
+        float a_ovr = atten_curve(ds, v->att_ref, v->att_rolloff, v->att_min);
+        if (a_lay > 1e-9f && a_ovr != a_lay) {
+            const float r = a_ovr / a_lay;
+            for (uint32_t k = 0; k < c->channels; ++k) v->gtarget[k] *= r;
+        }
     }
 
     /* effective spread: the user's angular width, floored by the source's METRIC size (the angle its
@@ -1389,9 +1436,11 @@ static void mix_voice(RtCore* c, Voice* v, uint16_t idx, float* bus, uint32_t n,
     float ldc_tgt = 1.f, ldc_step = 0.f;
     if (v->ldc_on) {
         const Layout* L = &c->layout;
-        float dref = dist > L->atten_ref_m ? dist : L->atten_ref_m;
-        float att = powf(L->atten_ref_m / dref, L->atten_rolloff);
-        if (att < L->atten_min_lin) att = L->atten_min_lin;
+        /* track the curve the solve actually applied: the per-source override when set (so the
+         * two compose — a constant-level source gets no compensation), else the layout's */
+        float att = (v->att_ref > 0.f)
+                  ? atten_curve(dist, v->att_ref, v->att_rolloff, v->att_min)
+                  : atten_curve(dist, L->atten_ref_m, L->atten_rolloff, L->atten_min_lin);
         float sh_db = -20.f * log10f(att) * 0.4f;
         if (sh_db > 8.f) sh_db = 8.f; else if (sh_db < 0.f) sh_db = 0.f;
         ldc_tgt = powf(10.f, sh_db / 20.f);
@@ -2692,6 +2741,16 @@ void rt_source_set_spread(RtCore* c, uint32_t h, float amount) {
     cmd_push(&c->cmds, &cmd);
 }
 
+/* Per-source distance-attenuation override: same formula as the layout's curve with this source's
+ * own parameters; ref_m <= 0 clears it (back to the layout curve), rolloff 0 = constant level.
+ * Applied by ratio in the gain solve (see compute_gains) — panner-agnostic, ramps like any gain. */
+void rt_source_set_attenuation(RtCore* c, uint32_t h, float ref_m, float rolloff, float min_lin) {
+    if (!c || !isfinite(ref_m) || !isfinite(rolloff) || !isfinite(min_lin)) return;
+    Cmd cmd = { .type = CMD_SET_ATTEN, .handle = h };
+    cmd.u.atten.ref = ref_m; cmd.u.atten.rolloff = rolloff; cmd.u.atten.min_lin = min_lin;
+    cmd_push(&c->cmds, &cmd);
+}
+
 /* Anisotropic extent (BS.2127-style width/height): the horizontal and vertical angular extents,
  * each 0..1. Equal values behave as the isotropic spread; the room's up axis anchors which way is
  * "width", so straight overhead the split is inherently ill-defined (BS.2127's polar extent carries
@@ -2811,6 +2870,16 @@ uint32_t rt_load_fuma(RtCore* c, const char* path, char* err, size_t errcap) {
 uint16_t rt_sound_channels(RtCore* c, uint32_t sound) {
     SoundSlot* s = sound_slot_ctrl(c, sound);
     return s ? s->data.channels : 0;
+}
+
+/* Length of a loaded asset in frames at the engine rate (control thread): in-memory = the decoded
+ * length; streamed = the length the decoder reported at open (fixed there, so reading it here
+ * doesn't race the streaming thread; 0 for push sources — open-ended). 0 also = invalid handle. */
+uint64_t rt_sound_frames(RtCore* c, uint32_t sound) {
+    SoundSlot* s = sound_slot_ctrl(c, sound);
+    if (!s) return 0;
+    if (s->data.stream) return stream_total_frames(s->data.stream);
+    return s->data.frames;
 }
 
 bool rt_unload_sound(RtCore* c, uint32_t sound) {

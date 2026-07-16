@@ -333,3 +333,7 @@ int stream_ended(const Stream* s, uint64_t pos) {
     uint64_t e = atomic_load_explicit(&((Stream*)s)->eof_w, memory_order_acquire);
     return e != EOF_NONE && pos >= e;
 }
+
+uint64_t stream_total_frames(const Stream* s) {
+    return s ? s->total_frames : 0;      /* fixed at open (0 for push streams); safe from any thread */
+}

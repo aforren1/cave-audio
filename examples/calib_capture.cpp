@@ -157,4 +157,30 @@ void calib_asio_close(void) {
     if (asioDrivers) asioDrivers->removeCurrentDriver();
     asio_session_release();
 }
+
+/* Registered-driver enumeration for the tools' pickers/--list-drivers: a LOCAL AsioDrivers reads
+ * the registry fresh each call and loads nothing, so it needs no session slot and is safe while
+ * a capture (or the engine) has a driver open — the zylia shell's pattern. */
+int calib_asio_driver_names(char (*names)[32], int max) {
+    AsioDrivers list;
+    char* ptrs[32];
+    if (max > 32) max = 32;
+    for (int i = 0; i < max; ++i) ptrs[i] = names[i];
+    long n = list.getDriverNames(ptrs, max);
+    return n < 0 ? 0 : (int)n;
+}
+
+int calib_asio_list(void) {
+    char names[32][32];
+    int nd = calib_asio_driver_names(names, 32);
+    printf("registered ASIO drivers (%d):\n", nd);
+    for (int i = 0; i < nd; ++i) printf("  %2d. %s\n", i, names[i]);
+    return 0;
+}
+#else
+int calib_asio_driver_names(char (*names)[32], int max) { (void)names; (void)max; return 0; }
+int calib_asio_list(void) {
+    printf("built without the ASIO SDK - no drivers to list (simulate mode only)\n");
+    return 2;
+}
 #endif /* BWA_HAVE_ASIO */

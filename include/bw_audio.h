@@ -126,6 +126,15 @@ BWA_API const char* bwa_last_error(bwa_engine* e); /* human-readable; NULL if no
  * "none" (not started). Lets a client confirm it got a real device, not a silent fallback. */
 BWA_API const char* bwa_get_audio_backend(bwa_engine* e);
 
+/* ---- ASIO device query (control thread; needs NO engine — call before bwa_create to populate a
+ * driver picker for bwa_desc.asio_driver). Reads the OS's registered-driver list fresh each call
+ * (a newly installed driver appears immediately); nothing is loaded, initialized, or opened, so
+ * it is safe alongside a running engine too. ---- */
+BWA_API uint32_t bwa_get_asio_driver_count(void);
+/* Copy driver `index`'s registered name into buf (always NUL-terminated, truncated to cap-1) —
+ * the exact string bwa_desc.asio_driver expects. False = index out of range or no buffer. */
+BWA_API bool     bwa_get_asio_driver_name(uint32_t index, char* buf, uint32_t cap);
+
 /* ---- assets (control thread; file I/O; do at load time) ---- */
 BWA_API bwa_sound bwa_load_sound(bwa_engine* e, const char* path); /* mono point-source asset; 0 = failure */
 /* Like bwa_load_sound but STREAMED from disk for long files (music/ambience) — the file is not decoded
@@ -142,6 +151,13 @@ BWA_API bwa_sound bwa_load_ambix(bwa_engine* e, const char* path);
  * channel order, MaxN + the W -3 dB): converted to AmbiX at load, so past this call the asset is
  * indistinguishable from an AmbiX load of the same field. Full 3D sets only (4/9/16 channels). */
 BWA_API bwa_sound bwa_load_fuma(bwa_engine* e, const char* path);
+/* Asset metadata (control thread; any time after a successful load). Frames are at the ENGINE
+ * rate (in-memory assets were resampled at load; streams must already match), so
+ * seconds = frames / bwa_desc.sample_rate. get_frames returns 0 for an invalid handle or a
+ * stream whose length is unknown (push sources); get_channels returns 1 for a mono point-source
+ * asset, 4/9/16 for an ambisonic bed (order 1/2/3), 0 for an invalid handle. */
+BWA_API uint64_t bwa_sound_get_frames(bwa_engine* e, bwa_sound snd);
+BWA_API uint32_t bwa_sound_get_channels(bwa_engine* e, bwa_sound snd);
 
 /* ---- sources (control thread; non-blocking, enqueue only) ---- */
 BWA_API bwa_source bwa_source_create(bwa_engine* e);              /* handle returned synchronously */
@@ -437,6 +453,15 @@ BWA_API void     bwa_source_set_air_absorption(bwa_engine* e, bwa_source s, bool
  * "far, not tinny". A perceptual stylization, not physics; leave it off for strict realism. Direct
  * path only (like air/Doppler); ramped; per-frame-safe. */
 BWA_API void     bwa_source_set_loudness_comp(bwa_engine* e, bwa_source s, bool on);
+/* Override the LAYOUT's distance-attenuation curve for one source (mono point sources; a bed has
+ * no distance). Same formula as the layout knob: atten = clamp((ref/max(d,ref))^rolloff, min, 1),
+ * with d the source→primary-listener distance. rolloff 0 = constant level at any distance (a
+ * direction-only cue that never fades); ref_dist <= 0 CLEARS the override (back to the layout
+ * curve). Applied by ratio in the gain solve, so it is panner-agnostic and composes with spread,
+ * dual-band, decorrelation, and loudness compensation (which tracks the override's own curve);
+ * the reflection distance→wet send keeps its own mapping. Per-frame-safe; ramps like any gain. */
+BWA_API void     bwa_source_set_attenuation_override(bwa_engine* e, bwa_source s,
+                                                     float ref_dist, float rolloff, float min_gain);
 /* Source spread / size: angular width of the source, 0 = a point (default) .. 1 = wide. Spreads the
  * source's energy across the speakers around its direction (a waterfall/crowd/ambience that shouldn't
  * collapse to one point), centred on its direction and constant-power. Works with any panner. */

@@ -214,6 +214,35 @@ const bwa_sink_vtbl ASIO_VT = {   /* designated: stop/close share a signature, s
 
 } /* namespace */
 
+/* Registered-driver enumeration (bwa_get_asio_driver_count/_name forward here): pre-lifecycle and
+ * engine-free, so a host can populate a device picker before bwa_create. A LOCAL AsioDrivers reads
+ * the registry fresh on construction — so each call sees drivers installed since the last one, and
+ * nothing touches the SDK's loaded-driver global (the calib/zylia capture shells use the same
+ * pattern). Enumeration only READS the list: nothing is loaded, initialized, or opened, so it is
+ * safe alongside a live sink. Control thread only, like all lifecycle calls. */
+enum { ASIO_ENUM_MAX = 32 };
+static long asio_driver_names(char names[ASIO_ENUM_MAX][32]) {
+    AsioDrivers list;
+    char* ptrs[ASIO_ENUM_MAX];
+    for (int i = 0; i < ASIO_ENUM_MAX; ++i) ptrs[i] = names[i];
+    return list.getDriverNames(ptrs, ASIO_ENUM_MAX);
+}
+extern "C" uint32_t sink_asio_driver_count(void) {
+    char names[ASIO_ENUM_MAX][32];
+    long n = asio_driver_names(names);
+    return n < 0 ? 0u : (uint32_t)n;
+}
+extern "C" bool sink_asio_driver_name(uint32_t index, char* buf, uint32_t cap) {
+    if (!buf || cap == 0) return false;
+    buf[0] = 0;
+    char names[ASIO_ENUM_MAX][32];
+    long n = asio_driver_names(names);
+    if ((long)index >= (n < 0 ? 0 : n)) return false;
+    strncpy(buf, names[index], cap - 1);
+    buf[cap - 1] = 0;
+    return true;
+}
+
 /* Load + init driver `name` and confirm it has >= `channels` outputs. On success the driver
  * stays loaded+inited; on failure it is fully cleaned up. (ASIO callbacks have no user ptr,
  * so only one driver is ever live.) */
@@ -246,7 +275,11 @@ extern "C" bwa_sink* bwa_asio_sink_open(uint32_t sample_rate, uint32_t block_siz
     if (driver && *driver) {
         strncpy(drv, driver, sizeof drv - 1);
         opened = try_driver(drv, channels);
-    } else if (asioDrivers) {
+    } else {
+        /* the SDK's global is created lazily by loadAsioDriver — on the PROCESS'S FIRST open it
+         * doesn't exist yet, and gating on it would silently skip the auto-pick. Create it here
+         * (the same object loadAsioDriver would make). */
+        if (!asioDrivers) asioDrivers = new AsioDrivers();
         char names[16][32];
         char* ptrs[16];
         for (int i = 0; i < 16; ++i) ptrs[i] = names[i];

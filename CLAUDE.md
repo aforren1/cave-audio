@@ -287,7 +287,14 @@ the click-free stop path; an explicit set_gain cancels a fade), `bwa_set_paused`
 group pause rides `pause_gate`; a group-gain change re-dirties its members), `bwa_get_active_voices`
 (rt_render's active count, atomic-published), and `bwa_source_set_occlusion_manual` (control-thread
 access to the sim's handle-gated occlusion/transmission-EQ publish path — no-SDK gameplay occlusion;
-don't drive one source from both). **Pitch** (`bwa_source_set_pitch`, [0.25, 4]): fractional-cursor
+don't drive one source from both). **Integration QoL** (rt/smoke-tested): `bwa_get_asio_driver_count`/
+`_name` (engine-free registry enumeration for device pickers, `asio_sink.cpp`; the auto-pick's
+lazy-global gap on a process's first open is fixed alongside), `bwa_sound_get_frames`/`_channels`
+(asset metadata at the engine rate; streams report the decoder's file length, push = 0 unknown), and
+`bwa_source_set_attenuation_override` (per-source distance curve — same formula as the layout knob,
+applied by RATIO in the solve so it's panner-agnostic and composes with spread/dual-band/decor;
+loudness comp tracks the override's own curve; rolloff 0 = a constant-level direction-only source;
+ref <= 0 clears). **Pitch** (`bwa_source_set_pitch`, [0.25, 4]): fractional-cursor
 linear-interp resample of in-memory sounds in `mix_voice` (integer cursor + frac — no precision
 loss; the rate GLIDES per sample; the loop seam handles multi-sample overshoot; streams/beds
 unaffected; composes with Doppler). **Bed rotation** (`bwa_bed_set_rotation`, radians): closed-form

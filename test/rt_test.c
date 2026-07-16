@@ -1312,6 +1312,56 @@ int main(void) {
         }
     }
 
+    /* asset metadata (rt_sound_frames / rt_sound_channels) + the per-source attenuation override
+     * (rt_source_set_attenuation): metadata reports what load stored — streamed assets report the
+     * decoder's file length; the override swaps the LAYOUT distance curve for the source's own,
+     * applied by ratio in the solve — rolloff 0 pins a constant-level source, a steeper curve
+     * attenuates harder, and clearing (ref <= 0) restores the layout behavior exactly. */
+    {
+        RtCore* ca = rt_create(8, 8, RATE, CH);
+        CHECK(ca != NULL, "rt_create (atten/meta)");
+        if (ca) {
+            uint32_t sm = rt_load_sound(ca, WAV, err, sizeof err);
+            CHECK(rt_sound_frames(ca, sm) == 8 * N && rt_sound_channels(ca, sm) == 1,
+                  "in-memory metadata: frames + channels as loaded");
+            uint32_t st = rt_load_sound_streaming(ca, WAV, err, sizeof err);
+            CHECK(st != 0 && rt_sound_frames(ca, st) == 8 * N,
+                  "streamed metadata: the decoder's file length");
+            CHECK(rt_sound_frames(ca, 0) == 0 && rt_sound_channels(ca, 0) == 0, "invalid handle reads 0");
+            const char* B4 = "bwa_rt_meta4.wav";
+            if (write_ambix4_noise_wav(B4, 1.f, 0.f, 0.f, 1.f, 8 * N)) {
+                uint32_t sb = rt_load_ambix(ca, B4, err, sizeof err);
+                CHECK(rt_sound_channels(ca, sb) == 4 && rt_sound_frames(ca, sb) == 8 * N,
+                      "bed metadata: channel count + frames");
+                remove(B4);
+            } else CHECK(0, "write meta bed wav");
+
+            uint32_t h = rt_source_create(ca);
+            rt_source_play(ca, h, sm, true);                 /* WAV = constant 1.0: a clean level probe */
+            bwa_timestamp tsa = { 0, 0 };
+            #define LVL(OUT) do { double a_ = 0;                                                  \
+                rt_commit(ca);                                                                    \
+                for (int b_ = 0; b_ < 2; ++b_) rt_render(ca, bus, N, &tsa);   /* ramps land */    \
+                for (int b_ = 0; b_ < 8; ++b_) { rt_render(ca, bus, N, &tsa); a_ += total_l2(); } \
+                (OUT) = a_; } while (0)
+            double l_near, l_far, l_flat, l_steep, l_back;
+            rt_source_set_pos(ca, h, 0.5f, LD.ref[1], 0.f);  LVL(l_near);   /* inside ref: atten = 1 */
+            rt_source_set_pos(ca, h, 4.0f, LD.ref[1], 0.f);  LVL(l_far);    /* layout rolloff 1: 1/4 */
+            printf("atten: near/far %.2f (want ~4)  ", l_near / l_far);
+            CHECK(fabs(l_near / l_far - 4.0) < 0.5, "layout curve attenuates 1/d (rolloff 1)");
+            rt_source_set_attenuation(ca, h, 1.0f, 0.0f, 0.0f); LVL(l_flat);
+            CHECK(fabs(l_flat / l_near - 1.0) < 0.05, "override rolloff 0 = constant level at any distance");
+            rt_source_set_attenuation(ca, h, 1.0f, 2.0f, 0.0f); LVL(l_steep);
+            printf("near/steep %.2f (want ~16)\n", l_near / l_steep);
+            CHECK(fabs(l_near / l_steep - 16.0) < 2.0, "override rolloff 2 attenuates 1/d^2");
+            rt_source_set_attenuation(ca, h, 0.0f, 0.0f, 0.0f); LVL(l_back);
+            CHECK(fabs(l_back / l_far - 1.0) < 0.05, "clearing the override restores the layout curve");
+            #undef LVL
+            rt_source_destroy(ca, h); rt_commit(ca);
+            rt_destroy(ca);
+        }
+    }
+
     /* runtime channel count: a 24-speaker layout drives a 24-channel core end to end — point panning,
      * a bed decode, meters — and a canary proves NOTHING writes beyond the active channel count into
      * a capacity-sized buffer (the exact overrun class the BWA_CHANNELS->count migration must prevent). */

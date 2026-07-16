@@ -511,6 +511,34 @@ void bwa_unload_sound(bwa_engine* e, bwa_sound snd) {
     if (e) rt_unload_sound(e->rt, snd);   /* safe any time; retire-acked internally */
 }
 
+uint64_t bwa_sound_get_frames(bwa_engine* e, bwa_sound snd) {
+    return e ? rt_sound_frames(e->rt, snd) : 0;
+}
+
+uint32_t bwa_sound_get_channels(bwa_engine* e, bwa_sound snd) {
+    return e ? (uint32_t)rt_sound_channels(e->rt, snd) : 0;
+}
+
+/* Engine-free device query: forwards to asio_sink.cpp's registry enumeration (a no-ASIO build
+ * reports zero drivers — the null/offline sink is the only backend there anyway). */
+uint32_t bwa_get_asio_driver_count(void) {
+#ifdef BWA_HAVE_ASIO
+    return sink_asio_driver_count();
+#else
+    return 0;
+#endif
+}
+
+bool bwa_get_asio_driver_name(uint32_t index, char* buf, uint32_t cap) {
+#ifdef BWA_HAVE_ASIO
+    return sink_asio_driver_name(index, buf, cap);
+#else
+    if (buf && cap) buf[0] = 0;
+    (void)index;
+    return false;
+#endif
+}
+
 bwa_sound bwa_load_ambix(bwa_engine* e, const char* path) {
     if (!e) return 0;
     clear_error(e);
@@ -1044,6 +1072,11 @@ void bwa_source_set_spread(bwa_engine* e, bwa_source s, float amount) {
 
 void bwa_source_set_extent(bwa_engine* e, bwa_source s, float width, float height) {
     if (e) rt_source_set_extent(e->rt, s, width, height);
+}
+
+void bwa_source_set_attenuation_override(bwa_engine* e, bwa_source s,
+                                         float ref_dist, float rolloff, float min_gain) {
+    if (e) rt_source_set_attenuation(e->rt, s, ref_dist, rolloff, min_gain);
 }
 
 void bwa_source_set_orientation(bwa_engine* e, bwa_source s, float qx, float qy, float qz, float qw) {

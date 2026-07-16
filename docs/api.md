@@ -210,12 +210,30 @@ applies to occlusion and reflections together. The vendored prebuilt `phonon.dll
 Embree-enabled, so the flag currently falls back; to activate it, drop in a `phonon` built with
 Embree (the SDK's `STEAMAUDIO_ENABLE_EMBREE` path) and ship `embree4.dll` + `tbb*.dll` alongside.
 
+## ASIO device query (control thread, no engine needed)
+
+```c
+uint32_t bwa_get_asio_driver_count(void);
+bool     bwa_get_asio_driver_name(uint32_t index, char* buf, uint32_t cap);  // NUL-terminated; false = out of range
+```
+
+Enumerate the OS's **registered** ASIO drivers — call before `bwa_create` to populate a device
+picker, then pass the chosen name as `bwa_desc.asio_driver`. Nothing is loaded, initialized, or
+opened (it reads the driver registry, fresh on every call — a newly installed driver appears
+immediately), so it's also safe alongside a running engine. A registered driver isn't necessarily
+*openable* (hardware unplugged, exclusive-mode busy) — the truth test is still `bwa_start` +
+`bwa_get_audio_backend`. A no-ASIO build reports zero drivers. The tools ride the same registry:
+`bwa_playground --list-drivers` / a live picker in its panel, `bwa_calibrate --list-drivers`,
+picker dropdowns in `bwa_calib_view`'s Capture + Zylia tabs, `bwa_zylia_probe --list`.
+
 ## Assets (control thread, file I/O)
 
 ```c
 bwa_sound bwa_load_sound(bwa_engine* e, const char* path);           // decode fully into RAM; 0 = failure
 bwa_sound bwa_load_sound_streaming(bwa_engine* e, const char* path); // stream from disk (long files); 0 = failure
 void    bwa_unload_sound(bwa_engine* e, bwa_sound snd);               // safe; retire-acked internally
+uint64_t bwa_sound_get_frames  (bwa_engine* e, bwa_sound snd);        // length in frames at the ENGINE rate
+uint32_t bwa_sound_get_channels(bwa_engine* e, bwa_sound snd);        // 1 = mono; 4/9/16 = ambisonic bed
 ```
 
 Load sounds once, at load time. **WAV, FLAC, and MP3** are accepted (decoded to mono
@@ -231,6 +249,12 @@ at a time**, and does not support `bwa_source_seek` (the ring can't jump).
 `bwa_unload_sound` is safe to call at any time. The core detaches references on the audio thread
 and frees only after the retire-ack (see [concurrency.md](./concurrency.md)) — it will never pull
 a buffer out from under a playing voice.
+
+The metadata getters answer "what did I just load" (progress bars, validation, mono-vs-bed
+dispatch). Frames are at the **engine** rate — in-memory assets were resampled at load, streams
+must already match — so `seconds = frames / cfg.sample_rate`. `get_frames` returns 0 for an
+invalid handle or a stream whose length is unknown (push sources); `get_channels` returns 0 for
+an invalid handle. Control thread, any time after the load.
 
 ## Sources (control thread, non-blocking)
 
@@ -417,8 +441,8 @@ voice playing a multichannel asset, so handles and lifetime match `bwa_source_*`
 fades, pause/seek, priority, and groups work on beds: they are the same per-voice machinery,
 re-exported under the bed prefix. Note the priority default (128) means a bed **can be stolen**
 by a full-pool `bwa_source_create` like any other voice — set 255 on a bed that must survive an
-SFX overload. The decode is a static SN3D sampling decode `(2l+1)·Y_k(dir_s)/L`, rebuilt from
-the layout.
+SFX overload. The decode is a static SN3D SH→speaker matrix (AllRAD or EPAD per
+`bwa_desc.bed_decoder` — see below), rebuilt from the layout.
 
 ```c
 void bwa_set_max_re(bwa_engine* e, bool on);         // off by default; live A/B (crossfaded)
@@ -688,6 +712,22 @@ All are **non-blocking, enqueue-only**, ramp on the audio thread (coefficients a
 the block — no zipper), and are independent of each other and of the panner / profile. They apply to
 the **direct path only** — the reflection wet send is tapped *before* them, so reflections keep their
 own propagation. They do not affect ambisonic beds (world-locked, no position).
+
+```c
+void bwa_source_set_attenuation_override(bwa_engine* e, bwa_source s,
+                                         float ref_dist, float rolloff, float min_gain);
+```
+
+Override the **layout's distance-attenuation curve** for one source — the same formula with this
+source's own parameters: `atten = clamp((ref/max(d,ref))^rolloff, min_gain, 1)`, `d` the
+source→primary-listener distance. The two useful shapes: **`rolloff 0` = constant level at any
+distance** (a direction-only cue — narration, UI, a beacon — which the layout-global curve can't
+express), and a steeper/shallower curve than the room default for content that should die faster
+or carry farther. `ref_dist <= 0` **clears** the override (back to the layout curve). It's applied
+by *ratio* in the gain solve, so it's panner-agnostic and composes with spread, dual-band,
+decorrelation, and loudness compensation (which tracks the override's curve — a constant-level
+source gets no LF compensation); the reflection distance→wet send keeps its own mapping. Ramps
+like any gain change; per-frame-safe; beds unaffected (no distance).
 
 ## Source spread / size (control thread; per-frame)
 

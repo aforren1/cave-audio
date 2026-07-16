@@ -346,6 +346,23 @@ struct CapJob {
 };
 static CapJob J;
 
+/* registered-driver picker: a no-preview dropdown beside a driver text field, filled from
+ * calib_capture's registry enumeration (a fresh scan while the combo is open; loads nothing and
+ * needs no session slot, so it is safe while a capture streams). Shared by the Capture and Zylia
+ * tabs; without the ASIO SDK the enumeration returns 0 and the combo says so. */
+static void driver_pick(const char* id, char* buf, size_t cap) {
+    ImGui::SameLine();
+    if (ImGui::BeginCombo(id, "", ImGuiComboFlags_NoPreview)) {
+        char names[32][32];
+        int nd = calib_asio_driver_names(names, 32);
+        if (nd == 0) ImGui::TextDisabled("(no registered drivers)");
+        for (int i = 0; i < nd; ++i)
+            if (ImGui::Selectable(names[i], false)) snprintf(buf, cap, "%s", names[i]);
+        ImGui::EndCombo();
+    }
+    bwTip("pick a registered ASIO driver (fills the field; clear the field for auto-pick)");
+}
+
 static void cap_fail(const char* m) { snprintf(J.msg, sizeof J.msg, "%s", m); J.state.store(3, std::memory_order_release); }
 
 static void cap_worker(void) {
@@ -464,6 +481,7 @@ static void tab_capture(void) {
         ImGui::SetNextItemWidth(uiScaled(160));
         ImGui::InputTextWithHint("##cdrv", "ASIO driver (auto)", J.driver, sizeof J.driver);
         bwTip("ASIO driver name; empty = first driver with an output per speaker + the mic input");
+        driver_pick("##cdrvpick", J.driver, sizeof J.driver);
         ImGui::SameLine(); ImGui::SetNextItemWidth(uiScaled(90));
         ImGui::InputInt("mic input ch", &J.mic_in);
         bwTip("the driver INPUT channel the measurement mic is plugged into (0-based)");
@@ -721,6 +739,7 @@ static void tab_zylia(void) {
     ImGui::SetNextItemWidth(uiScaled(160));
     ImGui::InputTextWithHint("##zydrv", "ASIO driver (auto)", Z.driver, sizeof Z.driver);
     bwTip("ASIO driver name; empty = first driver exposing the ZM-1's 19 inputs");
+    driver_pick("##zydrvpick", Z.driver, sizeof Z.driver);
     ImGui::SameLine();
     if (!Z.live) { if (ImGui::Button("Open ZM-1")) { Z.live = zylia_capture_open(Z.driver[0] ? Z.driver : NULL, 48000.0);
                                                      if (Z.live) { Z.simulate = false; Z.last_seq = Z.live->seq; } }
