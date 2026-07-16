@@ -22,10 +22,10 @@
 typedef struct Fdn Fdn;
 
 /* Build the FDN for this layout + rate: line delays, decay filters at the defaults (1.2 s low /
- * 0.7 s high @ 2 kHz), and the line→26 render matrix. `bed_decoder` is bwa_desc.bed_decoder:
- * EPAD (2) renders the lines through the same energy-preserving decode the beds use; anything
- * else keeps the FDN's house AllRAD (the sampling decode only as the non-triangulable fallback).
- * NULL on allocation failure. */
+ * 0.7 s high @ 2 kHz), and the line→26 render matrix. `bed_decoder` is the rt-internal decoder id
+ * (engine.c maps the public enum): EPAD (2) renders the lines through the same energy-preserving
+ * decode the beds use; anything else keeps the FDN's house AllRAD (the sampling decode only as the
+ * non-triangulable fallback). NULL on allocation failure. */
 Fdn* fdn_create(const Layout* L, uint32_t sample_rate, uint32_t channels, int bed_decoder);
 void fdn_destroy(Fdn* f);
 

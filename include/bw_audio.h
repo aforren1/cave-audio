@@ -63,16 +63,16 @@ typedef enum {
 } bwa_profile;
 
 /* Diffuse-bed ambisonic decoder (fixed for the engine's lifetime — the decode matrix is built
- * before start). SAMPLING is the default projection decode; ALLRAD (All-Round Ambisonic Decoding)
- * decodes to a uniform virtual layout then VBAPs onto the real array — robust on an IRREGULAR/
- * lopsided array (keeps a diffuse field even with no loud directions, and localizes better), at
- * the cost of a heavier load-time build. EPAD (Energy-Preserving Ambisonic Decoding, Zotter/
- * Pomberger/Noisternig 2012) makes a panned plane wave's decoded ENERGY constant over direction
- * — the smoothest loudness-vs-direction of the three on an irregular array; sharpness sits
- * between sampling and AllRAD. A degenerate array falls back to SAMPLING (check by ear or
- * bwa_get_bus_levels). Affects the ambisonic + reflection BEDS only, not the point-source
- * panner. See docs/spatialization.md. */
-typedef enum { BWA_DECODE_SAMPLING = 0, BWA_DECODE_ALLRAD = 1, BWA_DECODE_EPAD = 2 } bwa_bed_decoder;
+ * before start). ALLRAD (All-Round Ambisonic Decoding, the default) decodes to a uniform virtual
+ * layout then VBAPs onto the real array — robust on an IRREGULAR/lopsided array, localizes a
+ * touch sharper. EPAD (Energy-Preserving Ambisonic Decoding, Zotter/Pomberger/Noisternig 2012)
+ * makes a panned plane wave's decoded ENERGY constant over direction by construction — the
+ * flattest loudness-vs-direction of the two. Which sounds better on a real array is a by-ear
+ * call. The plain sampling (projection) decode is NOT selectable: on an irregular array it
+ * over-energises dense speaker regions (dominated by both options above) — it survives only as
+ * the engine's automatic fallback when a degenerate layout defeats the chosen build. Affects the
+ * ambisonic + reflection BEDS only, not the point-source panner. See docs/spatialization.md. */
+typedef enum { BWA_DECODE_ALLRAD = 0, BWA_DECODE_EPAD = 1 } bwa_bed_decoder;
 
 /* Output-device policy. AUTO (the default) tries ASIO and falls back to the silent offline sink
  * — the engine keeps rendering with no device (the tools' visual-only mode). ASIO is an explicit
@@ -99,7 +99,7 @@ typedef struct {
                                  * tracer (one stderr notice) otherwise. No-op without the SDK. */
     bool         enable_pathing;/* run the sound-pathing sim from bwa_start (needs scene geometry +
                                  * the Steam Audio build; sources opt in via bwa_source_set_pathing). */
-    bwa_bed_decoder bed_decoder;   /* diffuse-bed SH->speaker decoder; 0 = sampling. */
+    bwa_bed_decoder bed_decoder;   /* diffuse-bed SH->speaker decoder; 0 = AllRAD (the default). */
     uint32_t     reserved[4];   /* zero; reserved so the struct can grow without an ABI break */
 } bwa_desc;
 
@@ -588,7 +588,7 @@ BWA_API void     bwa_set_limiter_ceiling(bwa_engine* e, float ceiling_db);   /* 
 BWA_API void     bwa_set_master_gain(bwa_engine* e, float linear);
 
 /* Select how ambisonic BEDS render (live: each bed crossfades to the selection — a click-free A/B).
- * MATRIX (default) is the static SH->speaker decode (sampling or AllRAD per bwa_desc.bed_decoder) — cheap,
+ * MATRIX (default) is the static SH->speaker decode (AllRAD or EPAD per bwa_desc.bed_decoder) — cheap,
  * world-locked, sweet-spot-ish. PARAMETRIC analyzes the bed's first-order channels per frequency
  * band into a direction + diffuseness (DirAC-style intensity analysis): the non-diffuse stream is
  * RE-PANNED through the engine's listener-relative panner at the array shell — a recorded soundfield

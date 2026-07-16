@@ -233,7 +233,10 @@ bwa_engine* bwa_create(const bwa_desc* cfg) {
     rt_set_layout(e->rt, &L);
     /* diffuse-bed decoder is create-time config: the SH->speaker decode matrix is (re)built here on
      * the control thread — it must not race mix_bed once the audio thread runs. */
-    rt_set_bed_decoder(e->rt, (int)e->cfg.bed_decoder);
+    /* public decoder -> the rt/fdn-internal id (1 = AllRAD, 2 = EPAD). Internal 0 is the sampling
+     * decode, which is NOT selectable from the API any more — it survives only as the automatic
+     * fallback inside the builds when a degenerate layout defeats AllRAD/EPAD. */
+    rt_set_bed_decoder(e->rt, e->cfg.bed_decoder == BWA_DECODE_EPAD ? 2 : 1);
     e->refl_wet = 1.0f;                             /* reverb wet default; bwa_reflections_set_gain */
 
     /* material table: token 0 is always the built-in "generic" default (BWA_PRESETS[0]). */
@@ -379,7 +382,8 @@ bwa_result bwa_start(bwa_engine* e) {
      * when the FDN is enabled). Consumes the same mono aux send + per-voice send levels. Non-fatal on
      * allocation failure: no tap, the engine runs dry, the reason surfaces via bwa_last_error. */
     if (e->fdn_cfg.enabled) {
-        e->fdn = fdn_create(&e->layout, e->cfg.sample_rate, e->layout.count, (int)e->cfg.bed_decoder);
+        e->fdn = fdn_create(&e->layout, e->cfg.sample_rate, e->layout.count,
+                            e->cfg.bed_decoder == BWA_DECODE_EPAD ? 2 : 1);   /* same internal mapping as rt */
         if (e->fdn) {
             fdn_set_decay(e->fdn, e->fdn_cfg.rt60_low_s, e->fdn_cfg.rt60_high_s, e->fdn_cfg.xover_hz);
             const float* d = e->fdn_cfg.decay_dir;

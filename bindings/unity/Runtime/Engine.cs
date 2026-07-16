@@ -88,8 +88,9 @@ namespace BwAudio
         public bool trackedRoomEq = true;
 
         [Header("Diffuse beds (AmbisonicBed / reverb)")]
-        [Tooltip("Load-time. AllRAD is more robust on an irregular/lopsided array, at a heavier load-time build.")]
-        public BwaBedDecoder bedDecoder = BwaBedDecoder.Sampling;
+        [Tooltip("Load-time. AllRAD (default) localizes a touch sharper; EPAD keeps a panned wave's loudness " +
+                 "constant over direction by construction (flattest on an irregular array). A by-ear call.")]
+        public BwaBedDecoder bedDecoder = BwaBedDecoder.Allrad;
         [Tooltip("MATRIX: the static SH->speaker decode. PARAMETRIC: DirAC analysis re-pans the directional " +
                  "part through the listener-relative panner — a recorded soundfield becomes WALKABLE " +
                  "(correct directions + parallax off-centre). Live: beds crossfade, so it A/Bs.")]

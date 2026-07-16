@@ -351,8 +351,10 @@ struct RtCore {
                                  * spread is floored by 1 - dist/radius (it subtends a growing angle
                                  * instead of collapsing into the nearest speaker). */
     float      ldc_a;        /* loudness-comp shelf one-pole coeff (~250 Hz), rate-derived at create */
-    int        bed_decoder;  /* 0 = sampling decode (SAD); 1 = AllRAD (robust on irregular arrays);
-                              * 2 = EPAD (energy-preserving, epad.c) */
+    int        bed_decoder;  /* 1 = AllRAD (robust on irregular arrays); 2 = EPAD (energy-preserving,
+                              * epad.c); 0 = the sampling decode (SAD) — internal-only: the engine
+                              * never selects it, it is the fallback when a build fails (and what a
+                              * bare rt core without rt_set_bed_decoder uses, which the rt tests do) */
     /* ambisonic bed decode: [speaker][ACN] = (2l+1)*Y_k^SN3D(speaker_dir)/L (sampling decode, SN3D),
      * rebuilt from the layout whenever it changes. A bed voice decodes its SH channels through this. */
     float    bed_decode[BWA_CHANNELS][BWA_AMBI_CH];

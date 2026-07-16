@@ -89,12 +89,10 @@ Fdn* fdn_create(const Layout* L, uint32_t sample_rate, uint32_t channels, int be
     for (int l = 0; l < FDN_N; ++l) { f->ring[l] = f->mem + at; at += f->rlen[l]; }
 
     /* line -> speaker render: each line is a plane wave from its direction, decoded through the
-     * layout's bed decode. Follows bwa_desc.bed_decoder where it states a real preference — EPAD
-     * renders the lines through the same energy-preserving decode the beds use — but AllRAD stays
-     * the house default otherwise, INCLUDING when the knob reads SAMPLING: the FDN predates the
-     * knob reaching it, its diffuse tail wants the robust decode, and the sampling matrix was
-     * never its behavior (the sampling form below is only the non-triangulable fallback, mirroring
-     * rt.c's build_bed_decode_sad). */
+     * layout's bed decode. `bed_decoder` is the rt-internal id engine.c maps from the public enum:
+     * 2 = EPAD renders the lines through the same energy-preserving decode the beds use; anything
+     * else keeps the FDN's house AllRAD (the sampling form below is only the non-triangulable
+     * fallback, mirroring rt.c's build_bed_decode_sad — not selectable). */
     float dec[BWA_CHANNELS][BWA_AMBI_CH];
     int built = 0;
     if (bed_decoder == 2) built = epad_build_decode(L, dec);

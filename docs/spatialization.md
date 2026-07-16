@@ -336,19 +336,20 @@ A second optional mode binauralizes the **sources directly**, bypassing the pann
 Use it to isolate whether a problem is in tracking/positioning or in the decode. The
 virtual-speaker tap is the default; the direct mode is a diagnostic.
 
-## Diffuse-bed decode (sampling vs AllRAD vs EPAD)
+## Diffuse-bed decode (AllRAD vs EPAD)
 
 The diffuse layer (ambisonic beds, the reflection bed) is rendered by a fixed
 SH→speaker **decode matrix** applied per block (`build_bed_decode` / `mix_bed` in
-`rt.c`), built from the speaker geometry at load time. Three decoders are selectable with
-**`bwa_desc.bed_decoder`** (create-time):
+`rt.c`), built from the speaker geometry at load time. Two decoders are selectable with
+**`bwa_desc.bed_decoder`** (create-time); the plain **sampling (projection) decode**
+`decode[s][k] = (2l+1)·Y_k^SN3D(dir_s)/N` (`build_bed_decode_sad`) is **not** one of
+them — exact on a perfectly uniform array, it over-energises dense regions on an
+irregular one (every speaker radiates a fixed diffuse energy regardless of position),
+which both selectable decoders dominate. It survives only as the automatic fallback
+when a degenerate layout defeats the chosen build, and as the FDN's
+non-triangulable fallback.
 
-- **Sampling (`BWA_DECODE_SAMPLING`, default)** — the projection decode
-  `decode[s][k] = (2l+1)·Y_k^SN3D(dir_s)/N` (`build_bed_decode_sad`). Cheap and
-  exact for a *uniform* array. On an irregular one it over-energises dense regions:
-  every speaker radiates a fixed diffuse energy regardless of position, so a
-  cluster of speakers makes the diffuse field loud from that direction.
-- **AllRAD (`BWA_DECODE_ALLRAD`, `allrad.c`)** — All-Round Ambisonic Decoding
+- **AllRAD (`BWA_DECODE_ALLRAD`, default, `allrad.c`)** — All-Round Ambisonic Decoding
   (Zotter & Frank 2012). Sampling-decode to a dense **uniform virtual layout** (a
   Fibonacci sphere), then **VBAP** each virtual loudspeaker onto the real array
   (its convex-hull triangulation), then energy-normalise to the sampling decode.

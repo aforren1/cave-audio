@@ -139,7 +139,7 @@ const char* bwa_last_error(bwa_engine* e);
 | `asio_driver`    | ASIO driver name to open; NULL = auto-pick the first registered driver with enough output channels for the profile (binaural finds a 2-ch headphone driver, cave a ≥layout-count one) |
 | `embree`         | ray-trace the acoustics sims on Intel Embree; silently falls back to the default tracer if the phonon build lacks it — see [Ray-tracing acceleration](#ray-tracing-acceleration-bwa_descembree) |
 | `enable_pathing` | run the sound-pathing sim from `bwa_start` (needs scene geometry + the Steam Audio build); sources opt in via `bwa_source_set_pathing` |
-| `bed_decoder`    | diffuse-bed SH→speaker decoder: sampling (0, default), AllRAD (1), or EPAD (2) — see [Panner & layout query](#panner--layout-query-control-thread) |
+| `bed_decoder`    | diffuse-bed SH→speaker decoder: AllRAD (0, default) or EPAD (1) — see [Panner & layout query](#panner--layout-query-control-thread) |
 | `reserved[4]`    | zero; room to grow without an ABI break                             |
 
 ## Errors & return codes
@@ -450,7 +450,7 @@ void bwa_set_bed_renderer(bwa_engine* e, bwa_bed_renderer renderer);   // live A
 
 Two renderers sit behind the same bed API:
 
-- **matrix** (default) — the static SH→speaker decode above (sampling or AllRAD per
+- **matrix** (default) — the static SH→speaker decode above (AllRAD or EPAD per
   `bwa_desc.bed_decoder`). Cheap and robust, but an array this size (26 speakers on the CAVE) is
   sparse for a matrix decode (directional content blurs) and the decode is world-locked around
   the array centre.
@@ -851,7 +851,7 @@ callback on a manual sink, but reading `bwa_render_block`'s return value directl
 
 ```c
 typedef enum { BWA_PAN_DBAP = 0, BWA_PAN_SPCAP = 1, BWA_PAN_VBAP = 2 } bwa_panner;
-typedef enum { BWA_DECODE_SAMPLING = 0, BWA_DECODE_ALLRAD = 1, BWA_DECODE_EPAD = 2 } bwa_bed_decoder;   // bwa_desc.bed_decoder
+typedef enum { BWA_DECODE_ALLRAD = 0, BWA_DECODE_EPAD = 1 } bwa_bed_decoder;   // bwa_desc.bed_decoder
 void     bwa_set_panner(bwa_engine* e, bwa_panner panner);            // load-time or live (atomic switch)
 void     bwa_set_dual_band(bwa_engine* e, bool on);                // live A/B; wraps the selected panner
 uint32_t bwa_get_speakers(bwa_engine* e, float* xyz, uint32_t cap); // read back the layout; NULL xyz = count only
@@ -880,19 +880,21 @@ sweet-spot dependent like VBAP, so for a roaming listener it's a by-ear / measur
 `bwa_desc.bed_decoder` chooses the **diffuse-bed** SH→speaker decoder. It affects the ambisonic
 and reflection beds only, never the point-source panner:
 
-- **sampling** (default): the straightforward projection decode.
-- **AllRAD**: decode to a uniform virtual layout, then VBAP onto the real array. Robust on an
-  irregular array, at the cost of a heavier load-time build. A pole with no real speaker within
-  ~60° (a floor-less array's nadir) gets an **imaginary speaker** whose decode share is
-  discarded — diffuse energy aimed into the hole is dropped rather than smeared onto the
-  nearest ring.
+- **AllRAD** (`BWA_DECODE_ALLRAD`, the default): decode to a uniform virtual layout, then VBAP
+  onto the real array. Robust on an irregular array, localizes a touch sharper. A pole with no
+  real speaker within ~60° (a floor-less array's nadir) gets an **imaginary speaker** whose
+  decode share is discarded — diffuse energy aimed into the hole is dropped rather than smeared
+  onto the nearest ring.
 - **EPAD** (`BWA_DECODE_EPAD`): energy-preserving decode (Zotter/Pomberger/Noisternig 2012) —
   a panned plane wave's decoded energy is constant over direction *by construction*, the
-  flattest loudness-vs-direction of the three on an irregular array. Degenerate arrays fall
-  back to sampling. AllRAD vs EPAD on the real array is a by-ear call: EPAD is smoother,
-  AllRAD a touch sharper. The **FDN's line render follows EPAD too** (with any other value the
-  FDN keeps its house AllRAD — its diffuse tail wants the robust decode regardless of the bed
-  setting).
+  flattest loudness-vs-direction of the two. AllRAD vs EPAD on the real array is a by-ear call.
+  The **FDN's line render follows EPAD too** (with AllRAD selected the FDN keeps its house
+  AllRAD render).
+
+The plain sampling (projection) decode is **not selectable**: on an irregular array it
+over-energises dense speaker regions — dominated by both options above — so it survives only as
+the engine's automatic fallback when a *degenerate* layout defeats the chosen build (a failed
+fallback is silent by design; a degenerate survey should be fixed, not decoded around).
 
 The decoder is create-time configuration (the decode matrix is built at `bwa_create`); see
 [`spatialization.md`](./spatialization.md) for the theory.

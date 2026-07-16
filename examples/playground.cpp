@@ -44,7 +44,7 @@
  *                         home for the bed knobs.
  *   7 Reverb bed        — a static shoebox room + the Steam Audio hybrid reverb bed. Move the source
  *                         and the room reverb follows; G dry/wet A-B, [ ] wet level, V distance->wet
- *                         (near dry / far wet), B A/Bs the bed DECODER (sampling vs AllRAD — load-time,
+ *                         (near dry / far wet), B A/Bs the bed DECODER (AllRAD vs EPAD — load-time,
  *                         so it rebuilds the engine; differs most on an irregular layout). N drops a
  *                         MOVABLE concrete wall between source and listener and SPACE auto-sweeps it —
  *                         occlusion mutes the direct sound AND the reverb re-traces off the moving wall,
@@ -795,7 +795,9 @@ static void bed_draw3d(void) {
 #define ROOM_D 8.0f
 static int   rev_on  = 1;
 static float rev_wet = 1.0f;
-static int   rev_decoder;                          /* bed decoder: 0 = sampling (SAD), 1 = AllRAD (B to A/B) */
+static int   rev_decoder;                          /* bed decoder: 0 = AllRAD (default), 1 = EPAD (B to A/B —
+                                                    * THE bed-decode bake-off pair; sampling is no longer a
+                                                    * public choice, it's only the degenerate-array fallback) */
 static int   rev_room_mat;                         /* room surface: 0 = plaster (default), 1..NMAT = the wall
                                                     * presets, NMAT+1 = the custom material. LOAD-time (the box
                                                     * is set before bwa_start), so a change rebuilds the engine
@@ -894,7 +896,7 @@ static void build_engine(int with_reverb) {
         .profile = BWA_PROFILE_BINAURAL, .layout_path = g_layout_path, .hrtf_path = NULL,
         .sample_rate = SR, .block_size = 256, .sink = g_sink_mode, .asio_driver = g_asio_driver,
         /* create-time: only the reverb scene cares, but it's harmless for the others */
-        .bed_decoder = rev_decoder ? BWA_DECODE_ALLRAD : BWA_DECODE_SAMPLING,
+        .bed_decoder = rev_decoder ? BWA_DECODE_EPAD : BWA_DECODE_ALLRAD,
     };
     e = bwa_create(&cfg);
     if (!e) { printf("bwa_create failed\n"); exit(1); }
@@ -1296,7 +1298,7 @@ static void draw_panel(void) {
               "the room take over");
         ImGui::SetNextItemWidth(-FLT_MIN);
         int dec = rev_decoder;
-        const char* dec_names[2] = { "bed decoder: sampling (SAD)", "bed decoder: AllRAD" };
+        const char* dec_names[2] = { "bed decoder: AllRAD", "bed decoder: EPAD" };
         if (ImGui::Combo("##dec", &dec, dec_names, 2) && dec != rev_decoder) {   /* load-time: rebuild the engine */
             rev_decoder = dec;
             if (e) { bwa_stop(e); bwa_destroy(e); e = NULL; }

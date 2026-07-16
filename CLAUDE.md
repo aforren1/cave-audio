@@ -202,13 +202,18 @@ Dual-Band", for sharper LF localisation near the sweet spot; `compute_gains` der
 solve so it A/Bs live, and the mixer reads it only when on. **AllRAD adds imaginary pole speakers**: a
 pole no real speaker covers within 60° (a floor-less array's nadir) closes the hull with an imaginary
 speaker whose decode share is discarded, so downward diffuse energy is dropped instead of smeared onto
-the bottom ring (`allrad.c`; the `dsp` test pins it on a floor-less grid). **EPAD is the third bed
+the bottom ring (`allrad.c`; the `dsp` test pins it on a floor-less grid). **EPAD is the second bed
 decoder** (`bwa_desc.bed_decoder = BWA_DECODE_EPAD`, `epad.c`): the polar-factor decode
 `D = c·Yᵀ(YYᵀ)^(-1/2)` (Zotter/Pomberger/Noisternig 2012) makes a panned plane wave's decoded energy
 constant over direction by construction (the `dsp` test measures CV 0.09 vs sampling's 0.95 on a
-clustered array; a 16×16 Jacobi eigensolve at load, degenerate arrays fall back to sampling; `xval`
-pins it against numpy's SVD polar factor; the FDN's line render follows EPAD too — any other
-bed_decoder value keeps the FDN's house AllRAD, the `fdn` test pins the EPAD build). **The MDAP/spectral spread ring frame is
+clustered array; a 16×16 Jacobi eigensolve at load; `xval`
+pins it against numpy's SVD polar factor; the FDN's line render follows EPAD too — AllRAD selected
+keeps the FDN's house AllRAD, the `fdn` test pins the EPAD build). **The sampling (projection)
+decode is no longer selectable** — the public enum is `BWA_DECODE_ALLRAD` (0, the default) /
+`BWA_DECODE_EPAD` (1); the lit review was unanimous that SAD is dominated on irregular arrays, so it
+survives only as the internal degenerate-array fallback (rt-internal decoder id 0; engine.c maps the
+public enum to internal 1/2, and a bare rt core without rt_set_bed_decoder still defaults to SAD —
+which the rt tests rely on). **The MDAP/spectral spread ring frame is
 parallel-transported per voice** (`spread_frame`, `rt.c`): the old fixed-up-vector frame flipped ~180°
 in one solve when a moving source left the |d·y| > 0.9 pole zone, teleporting the spectral bands'
 directions — the `rt` test sweeps a wide source over the zenith and pins step continuity (0.0057 vs

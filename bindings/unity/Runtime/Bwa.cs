@@ -21,7 +21,7 @@ namespace BwAudio
     public enum BwaDirectivity : int { Omni = 0, Cardioid = 1, Figure8 = 2 }
     public enum BwaTestKind : int { Off = 0, Sine = 1, Noise = 2 }
     public enum BwaPanner : int { Dbap = 0, Spcap = 1, Vbap = 2 }
-    public enum BwaBedDecoder : int { Sampling = 0, Allrad = 1 }
+    public enum BwaBedDecoder : int { Allrad = 0, Epad = 1 }   // sampling is no longer selectable (internal fallback)
     public enum BwaSpreadMode : int { Lobe = 0, Mdap = 1, Spectral = 2 }
     public enum BwaBedRenderer : int { Matrix = 0, Parametric = 1 }
 
@@ -55,7 +55,7 @@ namespace BwAudio
         [MarshalAs(UnmanagedType.LPUTF8Str)] public string asioDriver;  // ASIO driver name; null = auto-pick
         [MarshalAs(UnmanagedType.I1)] public bool embree;               // Embree ray tracing (falls back if absent)
         [MarshalAs(UnmanagedType.I1)] public bool enablePathing;        // sound-pathing sim at bwa_start (needs SDK + scene)
-        public BwaBedDecoder bedDecoder;                                 // diffuse-bed decoder; 0 = sampling (default)
+        public BwaBedDecoder bedDecoder;                                 // diffuse-bed decoder; 0 = AllRAD (default)
         public uint reserved0, reserved1, reserved2, reserved3;         // matches reserved[4]; keep zero
     }
 

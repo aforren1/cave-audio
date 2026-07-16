@@ -94,7 +94,8 @@ RtCore* rt_create(uint32_t voice_cap, uint32_t sound_cap, uint32_t sample_rate, 
 void    rt_destroy(RtCore* c);
 void    rt_set_layout(RtCore* c, const Layout* L);   /* call before bwa_start / while stopped */
 void    rt_set_panner(RtCore* c, int panner);        /* 0 = DBAP, 1 = SPCAP, 2 = VBAP; atomic, live-switchable */
-void    rt_set_bed_decoder(RtCore* c, int decoder);  /* 0 = sampling (SAD), 1 = AllRAD, 2 = EPAD; before bwa_start */
+void    rt_set_bed_decoder(RtCore* c, int decoder);  /* 1 = AllRAD, 2 = EPAD (0 = the SAD fallback — internal only,
+                                                      * no longer reachable from the public enum); before bwa_start */
 void    rt_set_dual_band(RtCore* c, int on);         /* dual-band panning (amplitude LF / power HF); live A/B */
 void    rt_set_spread_mode(RtCore* c, int mode);     /* spread render: 0 = lobe, 1 = MDAP ring, 2 = spectral; live A/B */
 void    rt_set_max_re(RtCore* c, int on);            /* max-rE bed-decode weighting (matrix paths + FDN); live A/B */
