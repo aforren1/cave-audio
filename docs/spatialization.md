@@ -14,6 +14,17 @@ reason: it works directly from speaker and source **positions**. It degrades
 gracefully when the listener is off-center instead of assuming a listener fixed at
 the array origin.
 
+The formulation below is a house design, but its two load-bearing departures from
+the original Lossius DBAP have published support: Sundstrom (I3DA 2021,
+arXiv:2109.08704) documents how the original's convex-hull projection fails for
+sources *outside* the array — projections landing on a hull vertex make distinct
+positions produce identical gains, and total power "undulates wildly" across the
+boundary — and lands on the same shape as the fix (hull-free, with a
+reference-distance rolloff). The engine's solve never touches a hull, so both
+failures are impossible by construction; the `dsp` test sweeps a source from the
+centre out through a corner speaker to 10 m and pins gain continuity, monotone
+level, and exterior injectivity.
+
 > **Fixed-observer installs are a supported mode.** The case above is the *moving*,
 > tracked listener. An install that seats the audience at one fixed spot needs no
 > extra machinery:
@@ -82,7 +93,10 @@ The solve (listener-relative DBAP):
 4. Write `gtarget[0..count-1]`.
 
 `r` (blur) and the distance-attenuation curve are the two tuning knobs. Expose them
-in the layout/config so they can be dialed against the real array.
+in the layout/config so they can be dialed against the real array. If the layout
+file omits `rolloff_r`, the loader derives it from the geometry: `0.25 ×` the mean
+centroid→speaker distance (Sundstrom 2021's recommended 0.2–0.5 band) — a defensible
+starting point, not a substitute for dialing it by ear.
 
 ### Implemented formulation (M4 first cut, `dbap.c`)
 
@@ -224,6 +238,14 @@ modes sit behind `bwa_set_spread_mode` (an atomic live A/B, like the panner swit
   cheap. At spread→0 the ring collapses onto the point solve, so the two modes
   meet continuously.
 
+Both MDAP's ring and the spectral mode's band directions hang off an orthonormal
+frame around the source direction. That frame is **parallel-transported** per voice
+(project the previous frame off the new direction) rather than derived from a fixed
+up-vector — the fixed-up branch flips the frame ~180° in one solve when a moving
+source leaves the pole zone, teleporting the ring/band directions (Pulkki's
+reference `vbap` external carries the same state for the same reason). The `rt`
+test sweeps a wide source over the zenith and pins step-to-step continuity.
+
 Either mode still feeds every speaker the **same signal** — coherent copies, which
 collapse to phantom images and comb-filter *position-dependently* as the tracked
 listener walks. **`bwa_set_decorrelation`** (off by default, live A/B) splits a spread source's
@@ -303,11 +325,11 @@ A second optional mode binauralizes the **sources directly**, bypassing the pann
 Use it to isolate whether a problem is in tracking/positioning or in the decode. The
 virtual-speaker tap is the default; the direct mode is a diagnostic.
 
-## Diffuse-bed decode (sampling vs AllRAD)
+## Diffuse-bed decode (sampling vs AllRAD vs EPAD)
 
 The diffuse layer (ambisonic beds, the reflection bed) is rendered by a fixed
 SH→speaker **decode matrix** applied per block (`build_bed_decode` / `mix_bed` in
-`rt.c`), built from the speaker geometry at load time. Two decoders are selectable with
+`rt.c`), built from the speaker geometry at load time. Three decoders are selectable with
 **`bwa_desc.bed_decoder`** (create-time):
 
 - **Sampling (`BWA_DECODE_SAMPLING`, default)** — the projection decode
@@ -332,6 +354,19 @@ SH→speaker **decode matrix** applied per block (`build_bed_decode` / `mix_bed`
   ~55° nadir gap stays under the threshold, so genuinely-covered poles are
   untouched.
 
+- **EPAD (`BWA_DECODE_EPAD`, `epad.c`)** — Energy-Preserving Ambisonic Decoding
+  (Zotter, Pomberger & Noisternig 2012). The decode is the **polar factor** of the
+  transposed encode matrix, `D = c·Yᵀ(YYᵀ)^(-1/2)`: the constant-singular-value
+  member of the pseudo-inverse family, which makes a panned plane wave's decoded
+  **energy constant over direction** — by construction, not by approximation.
+  Envelop-scale HOA venues reach the same goal through AllRAD; EPAD attacks it
+  directly. Rank-deficient field components (a degenerate survey) truncate out of
+  the inverse square root instead of amplifying. A 16×16 Jacobi eigensolve at load
+  time (`xval` pins it against numpy's SVD polar factor); a degenerate array falls
+  back to sampling. Loudness-vs-direction is EPAD's win (the `dsp` test measures
+  CV ≈ 0.09 vs sampling's 0.95 on a clustered array); AllRAD tends to localize a
+  touch sharper. Which sounds better on the real 26 is a by-ear A/B.
+
 Validated against the cube grid + a deliberately clustered array (per-direction
 energy CV / rE error): on the near-uniform cube AllRAD matches sampling (≈7% CV, a
 few degrees); on the **clustered** array it cuts the loudness-vs-direction variance
@@ -341,6 +376,26 @@ AllRAD doesn't touch the point-source panner (DBAP/SPCAP/VBAP). It is the
 diffuse-layer counterpart to the placement correction those make for localized
 sources. Its convex-hull + VBAP solve is factored into `hull.c`, shared with the
 `BWA_PAN_VBAP` point panner.
+
+### Near-field compensation: deliberately omitted
+
+The SH→speaker decodes are plane-wave: no NFC-HOA distance-coding filters
+(Daniel 2003, AES 23rd Int. Conf.). This is a decision, not an oversight, and the
+error is quantified: at 3rd order on a ~2 m-radius array, skipping the compensation
+costs **exactly 0 dB at the array centre** (only order 0 contributes there at LF)
+and **±2–6 dB below ~150–250 Hz off-centre**; above ~250 Hz it vanishes. Three
+things eat what's left: max-rE weighting tapers the higher orders where the error
+lives; the room's Schroeder frequency (~200–300 Hz for a 3×3 m space) sits *above*
+the entire effect band, so down there the physical room's modal field dominates
+whatever the array synthesises — the tracked room EQ's territory, and the same
+"don't fight the room" logic as [calibration.md](./calibration.md); and NFC's real
+payoff (finite-distance *sources*) is the job the listener-relative point panner
+already does. The parametric bed renderer sidesteps the wavefront question
+entirely — it re-pans direction at the array shell on purpose. No mainstream
+≤3rd-order decoder (IEM AllRADecoder, Resonance, Steam Audio) applies playback NFC
+either. Revisit only if hardware calibration ever measures an off-centre LF boost;
+the fix is three fixed per-order IIR sections on the bed SH channels
+(`sfs.td.nfchoa`'s matched-z realisation is the reference).
 
 ## Parametric bed rendering (`bwa_set_bed_renderer`, live A/B)
 

@@ -66,9 +66,13 @@ typedef enum {
  * before start). SAMPLING is the default projection decode; ALLRAD (All-Round Ambisonic Decoding)
  * decodes to a uniform virtual layout then VBAPs onto the real array — robust on an IRREGULAR/
  * lopsided array (keeps a diffuse field even with no loud directions, and localizes better), at
- * the cost of a heavier load-time build. Affects the ambisonic + reflection BEDS only, not the
- * point-source panner. See docs/spatialization.md. */
-typedef enum { BWA_DECODE_SAMPLING = 0, BWA_DECODE_ALLRAD = 1 } bwa_bed_decoder;
+ * the cost of a heavier load-time build. EPAD (Energy-Preserving Ambisonic Decoding, Zotter/
+ * Pomberger/Noisternig 2012) makes a panned plane wave's decoded ENERGY constant over direction
+ * — the smoothest loudness-vs-direction of the three on an irregular array; sharpness sits
+ * between sampling and AllRAD. A degenerate array falls back to SAMPLING (check by ear or
+ * bwa_get_bus_levels). Affects the ambisonic + reflection BEDS only, not the point-source
+ * panner. See docs/spatialization.md. */
+typedef enum { BWA_DECODE_SAMPLING = 0, BWA_DECODE_ALLRAD = 1, BWA_DECODE_EPAD = 2 } bwa_bed_decoder;
 
 /* Output-device policy. AUTO (the default) tries ASIO and falls back to the silent offline sink
  * — the engine keeps rendering with no device (the tools' visual-only mode). ASIO is an explicit

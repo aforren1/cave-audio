@@ -13,6 +13,7 @@
 #include "align.h"
 #include "ambisonics.h"
 #include "allrad.h"
+#include "epad.h"
 
 #include <math.h>
 #include <stdio.h>
@@ -195,6 +196,52 @@ int main(void) {
         CHECK(ok, "DBAP localizes a source at each speaker to that channel from an off-centre listener");
     }
 
+    /* 6c. boundary-crossing continuity + injectivity: hull-projection DBAP has two documented
+     *     failure modes outside the array (Sundstrom 2021, I3DA): gains become non-unique when the
+     *     projection lands on a hull vertex, and total power "undulates wildly" across the boundary.
+     *     The engine's formulation is hull-free, so a source swept from the centre out through a
+     *     corner speaker and beyond must give (a) per-speaker gains continuous in position, (b) a
+     *     total level monotone non-increasing past the reference distance, and (c) distinct gain
+     *     vectors for distinct positions (no exterior collapse). The ray passes THROUGH the corner
+     *     speaker — the hull-vertex case — and runs to ~4x the array radius. */
+    {
+        const float* corner = LD.speakers[0].pos;                    /* a corner of the grid */
+        float lis[3] = { LD.ref[0], LD.ref[1], LD.ref[2] };
+        float dir[3] = { corner[0] - lis[0], corner[1] - lis[1], corner[2] - lis[2] };
+        float dl = sqrtf(dir[0]*dir[0] + dir[1]*dir[1] + dir[2]*dir[2]);
+        for (int c = 0; c < 3; ++c) dir[c] /= dl;
+        const float step = 0.01f;                                    /* 1 cm */
+        float gprev[CH], g[CH];
+        double pprev = -1.0;
+        int cont_ok = 1, mono_ok = 1, inj_ok = 1;
+        /* start at i=1: at src == lis the bearing is undefined and the solve goes omnidirectional
+         * (documented in spatialization.md) — a genuine discontinuity AT the listener, excluded
+         * here; near-listener widening is the feature that covers fly-throughs. */
+        for (int i = 1; i <= 1000; ++i) {                            /* 1 cm .. 10 m along the ray */
+            float t = step * (float)i;
+            float src[3] = { lis[0] + dir[0]*t, lis[1] + dir[1]*t, lis[2] + dir[2]*t };
+            dbap_gains(src, lis, &LD, 1.0f, g);
+            double p = 0; for (int k = 0; k < CH; ++k) p += (double)g[k] * g[k];
+            p = sqrt(p);
+            if (i > 1) {
+                double dmax = 0, dsum = 0;
+                for (int k = 0; k < CH; ++k) {
+                    double d = fabs((double)g[k] - gprev[k]);
+                    if (d > dmax) dmax = d;
+                    dsum += d;
+                }
+                if (dmax > 0.02) cont_ok = 0;                        /* no per-cm gain jump */
+                if (t > LD.atten_ref_m + step && p > pprev + 1e-6) mono_ok = 0;
+                if (t < 4.0f && dsum < 1e-7) inj_ok = 0;             /* interior+near field: still injective */
+            }
+            memcpy(gprev, g, sizeof gprev);
+            pprev = p;
+        }
+        CHECK(cont_ok, "DBAP gains are continuous across the array boundary (no undulation)");
+        CHECK(mono_ok, "DBAP total level is monotone non-increasing past the reference distance");
+        CHECK(inj_ok,  "DBAP gain vectors stay distinct as an exterior source recedes");
+    }
+
     /* 7. align: gain trim halves a channel; delay shifts the impulse */
     {
         Layout AL = layout_default();
@@ -356,6 +403,17 @@ int main(void) {
         write_layout_n(NJ, 24, -1);
         CHECK(layout_load(NJ, RATE, &B, err, sizeof err), err[0] ? err : "a 24-speaker layout loads");
         CHECK(B.count == 24, "count follows the file");
+        {   /* no dbap block in the file -> the blur derives from the geometry:
+             * r = 0.25 x the mean centroid->speaker distance (Sundstrom 2021) */
+            double s = 0;
+            for (uint32_t k = 0; k < B.count; ++k) {
+                double dx = B.speakers[k].pos[0] - B.ref[0], dy = B.speakers[k].pos[1] - B.ref[1],
+                       dz = B.speakers[k].pos[2] - B.ref[2];
+                s += sqrt(dx * dx + dy * dy + dz * dz);
+            }
+            CHECK(fabs(B.rolloff_r - 0.25 * s / B.count) < 1e-5,
+                  "omitted rolloff_r derives from the mean centroid->speaker distance");
+        }
         write_layout_n(NJ, 3, -1);
         CHECK(!layout_load(NJ, RATE, &B, err, sizeof err), "fewer than 4 speakers is rejected");
         write_layout_n(NJ, 24, 24);                       /* index 24 in a 24-speaker file: gap at 0 */
@@ -518,6 +576,119 @@ int main(void) {
         }
     }
 
+    /* 10b. EPAD bed decoder (epad.c): builds, finite, diffuse energy matched to the sampling
+     *      decode (level-fair swap), localizes plane waves — and delivers THE property it exists
+     *      for: a panned plane wave's decoded ENERGY is ~constant over direction on an irregular
+     *      array, where the sampling decode over-energises dense speaker regions. Pinned as the
+     *      loudness-vs-direction spread (CV) on a deliberately clustered array: EPAD's must come
+     *      in far under the sampling decode's. */
+    {
+        float dep[BWA_CHANNELS][BWA_AMBI_CH];
+        int ok = epad_build_decode(&LD, dep);
+        CHECK(ok, "epad_build_decode succeeds on the default grid");
+        if (ok) {
+            int finite = 1; double ediff = 0;
+            for (int s = 0; s < CH; ++s) for (int k = 0; k < BWA_AMBI_CH; ++k) {
+                if (!isfinite(dep[s][k])) finite = 0;
+                int l = (int)floorf(sqrtf((float)k)); ediff += (double)dep[s][k]*dep[s][k]/(2*l+1);
+            }
+            CHECK(finite, "EPAD matrix is finite");
+            double esad = 0;
+            for (int s = 0; s < CH; ++s) {
+                float p[3] = { LD.speakers[s].pos[0] - LD.ref[0], LD.speakers[s].pos[1] - LD.ref[1],
+                               LD.speakers[s].pos[2] - LD.ref[2] };
+                float pl = sqrtf(p[0]*p[0] + p[1]*p[1] + p[2]*p[2]);
+                float ad2[3] = { p[2]/pl, p[0]/pl, p[1]/pl }, ys[BWA_AMBI_CH]; ambi_encode_sn3d(ad2, ys);
+                for (int k = 0; k < BWA_AMBI_CH; ++k) { int l = (int)floorf(sqrtf((float)k));
+                    double d = (double)(2*l+1)*ys[k]/CH; esad += d*d/(2*l+1); }
+            }
+            CHECK(fabs(ediff - esad)/esad < 0.05, "EPAD diffuse energy matches the sampling decode");
+            int loc_ok = 1;
+            float dirs[3][3] = { { 1, 0, 0 }, { 0, 1, 0.3f }, { -0.5f, 0.2f, -1 } };
+            for (int t = 0; t < 3; ++t) {
+                float* sd = dirs[t]; float sl = sqrtf(sd[0]*sd[0] + sd[1]*sd[1] + sd[2]*sd[2]);
+                float s3[3] = { sd[0]/sl, sd[1]/sl, sd[2]/sl };
+                float ad[3] = { s3[2], s3[0], s3[1] }, sh[BWA_AMBI_CH]; ambi_encode_sn3d(ad, sh);
+                float rE[3] = { 0, 0, 0 };
+                for (int s = 0; s < CH; ++s) {
+                    float f = 0; for (int k = 0; k < BWA_AMBI_CH; ++k) f += dep[s][k]*sh[k];
+                    float p[3] = { LD.speakers[s].pos[0] - LD.ref[0], LD.speakers[s].pos[1] - LD.ref[1],
+                                   LD.speakers[s].pos[2] - LD.ref[2] };
+                    float pl = sqrtf(p[0]*p[0] + p[1]*p[1] + p[2]*p[2]);
+                    float w = f*f; rE[0]+=w*p[0]/pl; rE[1]+=w*p[1]/pl; rE[2]+=w*p[2]/pl;
+                }
+                float rl = sqrtf(rE[0]*rE[0] + rE[1]*rE[1] + rE[2]*rE[2]);
+                if (rl <= 0 || (rE[0]*s3[0] + rE[1]*s3[1] + rE[2]*s3[2])/rl < 0.9f) loc_ok = 0;
+            }
+            CHECK(loc_ok, "EPAD localizes plane waves toward their direction");
+        }
+
+        /* the energy-preserving claim, on a lopsided array: 10 speakers bunched into a ~45° cone
+         * toward +x plus 6 covering the rest. E(d) = the decoded energy of a plane wave, swept
+         * over a Fibonacci sphere; CV = std/mean of E over the sweep. */
+        {
+            Layout LC;
+            memset(&LC, 0, sizeof LC);
+            uint32_t nc = 0;
+            for (int i = 0; i < 10; ++i) {                       /* the cluster: a cap around +x */
+                float yy = -0.45f + 0.9f * ((float)i + 0.5f) / 10.f;
+                float rr = sqrtf(1.f - yy * yy), th = (float)i * 2.39996323f;
+                float d[3] = { 1.6f, yy, rr * sinf(th) * 0.45f };
+                float dl = sqrtf(d[0]*d[0] + d[1]*d[1] + d[2]*d[2]);
+                LC.speakers[nc].pos[0] = 2.f * d[0] / dl;
+                LC.speakers[nc].pos[1] = 1.5f + 2.f * d[1] / dl;
+                LC.speakers[nc].pos[2] = 2.f * d[2] / dl;
+                LC.speakers[nc].gain_lin = 1.f; ++nc;
+            }
+            const float rest[6][3] = { { -1,0,0 }, { 0,1,0 }, { 0,-1,0 }, { 0,0,1 }, { 0,0,-1 }, { -0.7f,0.7f,0 } };
+            for (int i = 0; i < 6; ++i) {
+                float dl = sqrtf(rest[i][0]*rest[i][0] + rest[i][1]*rest[i][1] + rest[i][2]*rest[i][2]);
+                LC.speakers[nc].pos[0] = 2.f * rest[i][0] / dl;
+                LC.speakers[nc].pos[1] = 1.5f + 2.f * rest[i][1] / dl;
+                LC.speakers[nc].pos[2] = 2.f * rest[i][2] / dl;
+                LC.speakers[nc].gain_lin = 1.f; ++nc;
+            }
+            LC.count = nc;                                       /* 16 */
+            layout_compute_ref(&LC);
+            float dep2[BWA_CHANNELS][BWA_AMBI_CH], dsad[BWA_CHANNELS][BWA_AMBI_CH];
+            int okc = epad_build_decode(&LC, dep2);
+            CHECK(okc, "epad_build_decode succeeds on the clustered array");
+            for (uint32_t s = 0; s < LC.count; ++s) {            /* the sampling decode, from its formula */
+                float p[3] = { LC.speakers[s].pos[0] - LC.ref[0], LC.speakers[s].pos[1] - LC.ref[1],
+                               LC.speakers[s].pos[2] - LC.ref[2] };
+                float pl = sqrtf(p[0]*p[0] + p[1]*p[1] + p[2]*p[2]);
+                float ad2[3] = { p[2]/pl, p[0]/pl, p[1]/pl }, ys[BWA_AMBI_CH]; ambi_encode_sn3d(ad2, ys);
+                for (int k = 0; k < BWA_AMBI_CH; ++k) { int l = (int)floorf(sqrtf((float)k));
+                    dsad[s][k] = (float)(2*l+1) * ys[k] / (float)LC.count; }
+            }
+            if (okc) {
+                double cv[2];
+                float (*mats[2])[BWA_AMBI_CH] = { dep2, dsad };
+                for (int m = 0; m < 2; ++m) {
+                    enum { SWEEP = 128 };
+                    double sum = 0, sum2 = 0;
+                    for (int i = 0; i < SWEEP; ++i) {            /* Fibonacci sweep of plane waves */
+                        float yy = 1.f - 2.f * ((float)i + 0.5f) / (float)SWEEP;
+                        float rr = sqrtf(fmaxf(0.f, 1.f - yy * yy)), th = (float)i * 2.39996323f;
+                        float d[3] = { rr * cosf(th), yy, rr * sinf(th) };
+                        float ad[3] = { d[2], d[0], d[1] }, sh[BWA_AMBI_CH]; ambi_encode_sn3d(ad, sh);
+                        double E = 0;
+                        for (uint32_t s = 0; s < LC.count; ++s) {
+                            float f = 0; for (int k = 0; k < BWA_AMBI_CH; ++k) f += mats[m][s][k]*sh[k];
+                            E += (double)f * f;
+                        }
+                        sum += E; sum2 += E * E;
+                    }
+                    double mean = sum / 128.0, var = sum2 / 128.0 - mean * mean;
+                    cv[m] = mean > 0 ? sqrt(var > 0 ? var : 0) / mean : 1e9;
+                }
+                printf("epad: clustered-array energy CV %.3f (EPAD) vs %.3f (sampling)\n", cv[0], cv[1]);
+                CHECK(cv[0] < 0.5 * cv[1],
+                      "EPAD flattens loudness-vs-direction on a clustered array (energy-preserving)");
+            }
+        }
+    }
+
     /* 11. VBAP panner: localization, constant power, at most 3 active speakers (the containing triangle) */
     {
         VbapState vb; vbap_reset(&vb);
@@ -539,6 +710,6 @@ int main(void) {
 
     remove(LJ);
     if (fails) { printf("dsp_test: %d FAILURES\n", fails); return 1; }
-    printf("dsp_test OK (layout parse, DBAP + SPCAP + VBAP, AllRAD bed decode + max-rE, align gain+delay)\n");
+    printf("dsp_test OK (layout parse, DBAP + SPCAP + VBAP, AllRAD + EPAD bed decodes + max-rE, align gain+delay)\n");
     return 0;
 }

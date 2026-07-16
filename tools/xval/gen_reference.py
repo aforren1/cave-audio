@@ -18,6 +18,15 @@ bug is implausible:
                (scipy.signal.bilinear) vs biquad.h's cookbook difference-equation forms.
   align EQ   — scipy.signal.lfilter (float64) cascade golden vs align.c's DF-I float32
                room_eq rendering.
+  EPAD       — the polar-factor decode D = c*Y^T(YY^T)^(-1/2) built with numpy.linalg.svd
+               (Zotter/Pomberger/Noisternig 2012: D = c*VU^T) vs epad.c's Jacobi eigensolve
+               of YY^T — two different factorizations of the same unique polar factor.
+  SH rotation — the Ivanic-Ruedenberg recursion (ambisonics.c) vs a matrix RECOVERED from
+               the defining property alone: encode(R*d) = M*encode(d) least-squares-solved
+               over the scipy harmonics (numpy.linalg.lstsq) — no recursion in the loop, so
+               a self-consistent sign/index slip in the recursion cannot hide (the engine's
+               own ambi property test uses the engine's encode on both sides; this one
+               never touches engine code).
 
 No reference exists for DBAP/SPCAP (house designs: listener-relative direction weighting,
 placement correction) or the MDAP ring parametrization (ring layout is an implementation
@@ -191,6 +200,66 @@ def allrad_decode(pos):
     decode *= math.sqrt((AMBI_CH / N) / e_all)   # energy-normalise to the sampling decode
     return decode, len(dirs_all) - N
 
+# ---------------------------------------------------------------- EPAD via numpy SVD
+def epad_decode(pos):
+    """epad.c rebuilt on numpy.linalg.svd: D = c*V.U^T over the kept singular values (the SVD
+    form of the polar factor Y^T(YY^T)^(-1/2); epad.c reaches it through a Jacobi eigensolve of
+    YY^T instead). N3D design basis, SN3D input rescale, sampling-decode diffuse normalization."""
+    dirs, _ = unit_dirs(pos)
+    N = len(dirs)
+    l_of = np.array([int(math.floor(math.sqrt(k))) for k in range(AMBI_CH)])
+    n3d = np.sqrt(2 * l_of + 1)
+    Y = np.array([sh_sn3d(room_to_ambi(d)) for d in dirs]).T * n3d[:, None]   # (16, N), N3D
+    U, S, Vh = np.linalg.svd(Y, full_matrices=False)                          # Y = U S Vh
+    keep = S * S > 1e-6 * (S * S).max()          # epad.c's eigenvalue truncation, in sigma^2
+    D = Vh[keep].T @ U[:, keep].T                # (N, 16): the polar factor on the kept subspace
+    D = D * n3d[None, :]                         # accept SN3D signals
+    e = np.sum(D**2 / (2 * l_of + 1))
+    D *= math.sqrt((AMBI_CH / N) / e)            # energy-normalise to the sampling decode
+    return D
+
+# ---------------------------------------------------------------- SH rotation via lstsq
+def rodrigues(axis, angle):
+    a = np.asarray(axis, dtype=np.float64)
+    a = a / np.linalg.norm(a)
+    K = np.array([[0, -a[2], a[1]], [a[2], 0, -a[0]], [-a[1], a[0], 0]])
+    return np.eye(3) + math.sin(angle) * K + (1.0 - math.cos(angle)) * (K @ K)
+
+def rot_golden(R, dirs):
+    """Recover the real-SH rotation matrix from its DEFINING property: encode(R*d) = M*encode(d)
+    for all d, least-squares over well-spread directions — algorithm-independent of the
+    Ivanic-Ruedenberg recursion. Returns ambisonics.c's 83-float packing (l=1..3 blocks,
+    row-major); asserts block-diagonality and an exact fit before packing."""
+    Y = np.array([sh_sn3d(d) for d in dirs])           # (n, 16)
+    Yr = np.array([sh_sn3d(R @ d) for d in dirs])      # (n, 16)
+    Mt, res, rank, _ = np.linalg.lstsq(Y, Yr, rcond=None)
+    assert rank == AMBI_CH, "direction set does not span the SH space"
+    M = Mt.T                                           # Yr[j] = M @ Y[j]
+    assert np.max(np.abs(Y @ M.T - Yr)) < 1e-9, "rotation fit is not exact"
+    for l in (0, 1, 2, 3):                             # rotation mixes only within one degree
+        b, w = l * l, 2 * l + 1
+        off = M[b:b + w].copy(); off[:, b:b + w] = 0.0
+        assert np.max(np.abs(off)) < 1e-9, "rotation matrix is not block-diagonal"
+    assert abs(M[0, 0] - 1.0) < 1e-9
+    out = []
+    for l in (1, 2, 3):
+        b, w = l * l, 2 * l + 1
+        out.extend(M[b + i, b + j] for i in range(w) for j in range(w))
+    return np.array(out)                               # 9 + 25 + 49 = 83
+
+def gen_rotations(dirs):
+    """Deterministic rotation cases: identity, the two pure-axis conventions the engine's bed
+    orientation exposes (yaw about ambi z = room up, tilt about ambi y), and 5 random axis-angle
+    rotations. RNG draws happen AFTER every other consumer so the older goldens stay byte-stable."""
+    cases = [np.eye(3), rodrigues((0, 0, 1), math.pi / 2), rodrigues((0, 1, 0), 0.4)]
+    for _ in range(5):
+        ax = RNG.standard_normal(3)
+        ang = RNG.uniform(0.1, math.pi)
+        cases.append(rodrigues(ax, ang))
+    Rs = np.array([c.ravel() for c in cases])          # row-major 3x3, ambi axes
+    Ms = np.array([rot_golden(c, dirs) for c in cases])
+    return Rs, Ms
+
 # ---------------------------------------------------------------- RBJ biquads via bilinear
 def rbj_bilinear(kind, fc, q, gain_db, fs):
     """The cookbook's analog prototypes, bilinear-transformed with pre-warping so fc maps
@@ -286,6 +355,14 @@ def main():
     dec17, nimag17 = allrad_decode(pos17)
     assert nimag17 == 1, "floor-less grid should add exactly the nadir imaginary speaker"
 
+    # EPAD: same two grids as AllRAD (no RNG)
+    epad26 = epad_decode(pos26)
+    epad17 = epad_decode(pos17)
+
+    # SH rotations: recovered from the defining property (RNG draws AFTER gen_vbap's,
+    # so every older golden stays byte-identical)
+    rot_R, rot_M = gen_rotations(sh_dirs)
+
     bq_cases, bq_coefs = gen_biquads()
     lf_out = gen_lfilter()
 
@@ -305,6 +382,14 @@ def main():
         f.write("\n/* AllRAD decode matrices, [speaker][ACN] row-major (SN3D) */\n")
         f.write(farr("xval_allrad_grid26", dec26))
         f.write(farr("xval_allrad_floorless17", dec17))
+        f.write("\n/* EPAD decode matrices, [speaker][ACN] row-major (SN3D) — numpy SVD polar factor */\n")
+        f.write(farr("xval_epad_grid26", epad26))
+        f.write(farr("xval_epad_floorless17", epad17))
+        f.write(f"\n#define XVAL_ROT_N {len(rot_R)}\n")
+        f.write("/* SH rotations: R row-major 3x3 (ambi axes) + ambisonics.c's 83-float packed M\n"
+                " * (l = 1..3 blocks, row-major), recovered from encode(R*d) = M*encode(d) by lstsq */\n")
+        f.write(farr("xval_rot_R", rot_R))
+        f.write(farr("xval_rot_M", rot_M))
         f.write(f"\n#define XVAL_BQ_N {len(bq_cases)}\n")
         f.write("/* per case: type(0 lowshelf/1 peak/2 highshelf), fc, Q, gain_db, fs */\n")
         f.write(farr("xval_bq_case", bq_cases))
@@ -316,7 +401,8 @@ def main():
         f.write(farr("xval_lf_out", lf_out))
         f.write("\n#endif /* BWA_XVAL_DATA_H */\n")
     print(f"wrote {os.path.normpath(OUT)}: {len(sh_dirs)} SH dirs, {len(vb_dirs)} VBAP dirs, "
-          f"2 AllRAD matrices, {len(bq_cases)} biquads, {LF_N} lfilter samples")
+          f"2 AllRAD + 2 EPAD matrices, {len(rot_R)} SH rotations, {len(bq_cases)} biquads, "
+          f"{LF_N} lfilter samples")
 
 if __name__ == "__main__":
     main()

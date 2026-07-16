@@ -139,7 +139,7 @@ const char* bwa_last_error(bwa_engine* e);
 | `asio_driver`    | ASIO driver name to open; NULL = auto-pick the first registered driver with enough output channels for the profile (binaural finds a 2-ch headphone driver, cave a ≥layout-count one) |
 | `embree`         | ray-trace the acoustics sims on Intel Embree; silently falls back to the default tracer if the phonon build lacks it — see [Ray-tracing acceleration](#ray-tracing-acceleration-bwa_descembree) |
 | `enable_pathing` | run the sound-pathing sim from `bwa_start` (needs scene geometry + the Steam Audio build); sources opt in via `bwa_source_set_pathing` |
-| `bed_decoder`    | diffuse-bed SH→speaker decoder: sampling (0, default) or AllRAD — see [Panner & layout query](#panner--layout-query-control-thread) |
+| `bed_decoder`    | diffuse-bed SH→speaker decoder: sampling (0, default), AllRAD (1), or EPAD (2) — see [Panner & layout query](#panner--layout-query-control-thread) |
 | `reserved[4]`    | zero; room to grow without an ABI break                             |
 
 ## Errors & return codes
@@ -830,7 +830,7 @@ callback on a manual sink, but reading `bwa_render_block`'s return value directl
 
 ```c
 typedef enum { BWA_PAN_DBAP = 0, BWA_PAN_SPCAP = 1, BWA_PAN_VBAP = 2 } bwa_panner;
-typedef enum { BWA_DECODE_SAMPLING = 0, BWA_DECODE_ALLRAD = 1 } bwa_bed_decoder;   // bwa_desc.bed_decoder
+typedef enum { BWA_DECODE_SAMPLING = 0, BWA_DECODE_ALLRAD = 1, BWA_DECODE_EPAD = 2 } bwa_bed_decoder;   // bwa_desc.bed_decoder
 void     bwa_set_panner(bwa_engine* e, bwa_panner panner);            // load-time or live (atomic switch)
 void     bwa_set_dual_band(bwa_engine* e, bool on);                // live A/B; wraps the selected panner
 uint32_t bwa_get_speakers(bwa_engine* e, float* xyz, uint32_t cap); // read back the layout; NULL xyz = count only
@@ -865,6 +865,11 @@ and reflection beds only, never the point-source panner:
   ~60° (a floor-less array's nadir) gets an **imaginary speaker** whose decode share is
   discarded — diffuse energy aimed into the hole is dropped rather than smeared onto the
   nearest ring.
+- **EPAD** (`BWA_DECODE_EPAD`): energy-preserving decode (Zotter/Pomberger/Noisternig 2012) —
+  a panned plane wave's decoded energy is constant over direction *by construction*, the
+  flattest loudness-vs-direction of the three on an irregular array. Degenerate arrays fall
+  back to sampling. AllRAD vs EPAD on the real array is a by-ear call: EPAD is smoother,
+  AllRAD a touch sharper.
 
 The decoder is create-time configuration (the decode matrix is built at `bwa_create`); see
 [`spatialization.md`](./spatialization.md) for the theory.

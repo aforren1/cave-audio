@@ -71,6 +71,7 @@ add_library(bwa_core OBJECT
   src/binaural.c
   src/ambisonics.c
   src/allrad.c
+  src/epad.c
   src/fdn.c
   src/ism.c
   src/natnet.c

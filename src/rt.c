@@ -17,6 +17,7 @@
 #include "biquad.h"       /* shared RBJ cookbook (also used by align.c's room_eq) */
 #include "ambisonics.h"   /* SH->26 decode for ambisonic beds */
 #include "allrad.h"       /* robust SH->26 decode for irregular arrays */
+#include "epad.h"         /* energy-preserving SH->26 decode (bed_decoder = 2) */
 #include "profile.h"      /* Tracy zones/plots (no-ops unless BWA_TRACY=ON) */
 
 #include <math.h>
@@ -131,6 +132,11 @@ typedef struct {
     float    fs_lp[BWA_FS_XOVERS];                            /* band-splitter one-pole states */
     float    fs_g[BWA_FS_BANDS][BWA_CHANNELS];                 /* live per-band gains (ramped) */
     float    fs_t[BWA_FS_BANDS][BWA_CHANNELS];                 /* per-band targets (compute_gains) */
+    float    sp_base[3];                     /* spread ring-frame base, parallel-transported along the source
+                                              * trajectory (audio-thread; zero = unset). Projecting the previous
+                                              * base off the new direction keeps the ring orientation continuous —
+                                              * a fixed-up frame flips ~180° in one solve at the |d.y| = 0.9
+                                              * branch, teleporting the spectral bands' directions. */
     float    spread;                         /* source angular width 0..1 (0 = point); blends the pan gains */
     float    size_m;                         /* source METRIC radius (m; 0 = point): floors the spread at the
                                               * angle the radius subtends from the listener, so physical size
@@ -336,7 +342,8 @@ struct RtCore {
                                  * spread is floored by 1 - dist/radius (it subtends a growing angle
                                  * instead of collapsing into the nearest speaker). */
     float      ldc_a;        /* loudness-comp shelf one-pole coeff (~250 Hz), rate-derived at create */
-    int        bed_decoder;  /* 0 = sampling decode (SAD); 1 = AllRAD (robust on irregular arrays) */
+    int        bed_decoder;  /* 0 = sampling decode (SAD); 1 = AllRAD (robust on irregular arrays);
+                              * 2 = EPAD (energy-preserving, epad.c) */
     /* ambisonic bed decode: [speaker][ACN] = (2l+1)*Y_k^SN3D(speaker_dir)/L (sampling decode, SN3D),
      * rebuilt from the layout whenever it changes. A bed voice decodes its SH channels through this. */
     float    bed_decode[BWA_CHANNELS][BWA_AMBI_CH];
@@ -850,7 +857,10 @@ static void build_bed_decode_sad(RtCore* c) {
  * either bed renderer: the mean power the FOA matrix decode produces, averaged over the speaker
  * directions as direction samples). */
 static void build_bed_decode(RtCore* c) {
-    if (!(c->bed_decoder == 1 && allrad_build_decode(&c->layout, c->bed_decode)))
+    int built = 0;
+    if      (c->bed_decoder == 1) built = allrad_build_decode(&c->layout, c->bed_decode);
+    else if (c->bed_decoder == 2) built = epad_build_decode(&c->layout, c->bed_decode);
+    if (!built)
         build_bed_decode_sad(c);
     double rsum = 0.0, psum = 0.0;
     for (uint32_t s = 0; s < c->channels; ++s) {
@@ -923,6 +933,29 @@ static void panner_gains(RtCore* c, int p, const float src[3], float user_gain, 
     panner_gains_at(c, p, c->lis.p_active, &c->spcap, &c->vbap, src, user_gain, out);
 }
 
+/* Orthonormal ring frame (u, w) around the source direction d, PARALLEL-TRANSPORTED per voice:
+ * project the stored base off the new d rather than deriving u from a fixed up-vector, whose
+ * branch flip at |d.y| = 0.9 turns the frame ~180° in one solve when a moving source leaves the
+ * pole zone — the ramps mask the level step, but every spectral band's direction (and the MDAP
+ * ring's sampling) teleports (Pulkki's reference vbap external transports the same state through
+ * its spread ring). First solve — or a degenerate base after a >90° direction jump — reseeds from
+ * the old fixed-up heuristic; MDAP and spectral share the base, so an A/B stays continuous. */
+static void spread_frame(Voice* v, const float d[3], float u[3], float w[3]) {
+    const float* b = v->sp_base;
+    float dot = b[0]*d[0] + b[1]*d[1] + b[2]*d[2];
+    u[0] = b[0] - dot*d[0]; u[1] = b[1] - dot*d[1]; u[2] = b[2] - dot*d[2];
+    float ul = sqrtf(u[0]*u[0] + u[1]*u[1] + u[2]*u[2]);
+    if (ul < 1e-4f) {                                    /* unset (zero) or parallel to d: (re)seed */
+        float up[3] = { 0.f, 1.f, 0.f };
+        if (d[1] > 0.9f || d[1] < -0.9f) { up[0] = 1.f; up[1] = 0.f; }
+        u[0] = up[1]*d[2]-up[2]*d[1]; u[1] = up[2]*d[0]-up[0]*d[2]; u[2] = up[0]*d[1]-up[1]*d[0];
+        ul = sqrtf(u[0]*u[0] + u[1]*u[1] + u[2]*u[2]);
+    }
+    u[0]/=ul; u[1]/=ul; u[2]/=ul;
+    v->sp_base[0] = u[0]; v->sp_base[1] = u[1]; v->sp_base[2] = u[2];
+    w[0] = d[1]*u[2]-d[2]*u[1]; w[1] = d[2]*u[0]-d[0]*u[2]; w[2] = d[0]*u[1]-d[1]*u[0];
+}
+
 /* Source spread/size, MDAP mode (Pulkki 1999: multiple-direction amplitude panning): pan a ring of
  * VIRTUAL SOURCES around the source direction with the selected panner and sum, instead of reshaping
  * the point gains (spread_gains above). The extent is made of real panner solves, so it inherits the
@@ -931,7 +964,7 @@ static void panner_gains(RtCore* c, int p, const float src[3], float user_gain, 
  * attenuation is untouched; the sum is renormalised to the point solve's power P (widening never
  * re-levels). At spread->0 the ring collapses onto the source direction and the result IS the point
  * solve, so the two spread modes meet continuously. 12 extra panner solves, per-block + dirty-gated. */
-static void mdap_gains(RtCore* c, int p, const Voice* v, float spread, float user_gain, float* g) {
+static void mdap_gains(RtCore* c, int p, Voice* v, float spread, float user_gain, float* g) {
     float d[3] = { v->pos_active[0]-c->lis.p_active[0], v->pos_active[1]-c->lis.p_active[1], v->pos_active[2]-c->lis.p_active[2] };
     float dl = sqrtf(d[0]*d[0] + d[1]*d[1] + d[2]*d[2]);
     if (dl < 1e-6f) return;                              /* source on the listener: no direction to spread around */
@@ -939,12 +972,8 @@ static void mdap_gains(RtCore* c, int p, const Voice* v, float spread, float use
     double p0 = 0.0; for (uint32_t k = 0; k < c->channels; ++k) p0 += (double)g[k]*g[k];
     float P = (float)sqrt(p0);                           /* preserve the panner's own power (never re-level) */
     if (P < 1e-9f) return;
-    float up[3] = { 0.f, 1.f, 0.f };                     /* orthonormal frame (u, w) around d */
-    if (d[1] > 0.9f || d[1] < -0.9f) { up[0] = 1.f; up[1] = 0.f; }
-    float u[3] = { up[1]*d[2]-up[2]*d[1], up[2]*d[0]-up[0]*d[2], up[0]*d[1]-up[1]*d[0] };
-    float ul = sqrtf(u[0]*u[0] + u[1]*u[1] + u[2]*u[2]);
-    u[0]/=ul; u[1]/=ul; u[2]/=ul;
-    float w[3] = { d[1]*u[2]-d[2]*u[1], d[2]*u[0]-d[0]*u[2], d[0]*u[1]-d[1]*u[0] };
+    float u[3], w[3];
+    spread_frame(v, d, u, w);                            /* transported frame: no pole snap */
     float s = spread; if (s > 1.f) s = 1.f;
     float acc[BWA_CHANNELS], gd[BWA_CHANNELS];
     for (uint32_t k = 0; k < c->channels; ++k) acc[k] = g[k];   /* the point solve is the ring centre */
@@ -989,12 +1018,8 @@ static void fs_solve(RtCore* c, Voice* v, int p, float spread, float ug) {
     double p0 = 0.0; for (uint32_t k = 0; k < c->channels; ++k) p0 += (double)v->gtarget[k]*v->gtarget[k];
     const float P = (float)sqrt(p0);                     /* the point solve's power (never re-level) */
     if (P < 1e-9f) return;
-    float up[3] = { 0.f, 1.f, 0.f };                     /* orthonormal frame (u, w) around d, as MDAP */
-    if (d[1] > 0.9f || d[1] < -0.9f) { up[0] = 1.f; up[1] = 0.f; }
-    float u[3] = { up[1]*d[2]-up[2]*d[1], up[2]*d[0]-up[0]*d[2], up[0]*d[1]-up[1]*d[0] };
-    float ul = sqrtf(u[0]*u[0] + u[1]*u[1] + u[2]*u[2]);
-    u[0]/=ul; u[1]/=ul; u[2]/=ul;
-    float w[3] = { d[1]*u[2]-d[2]*u[1], d[2]*u[0]-d[0]*u[2], d[0]*u[1]-d[1]*u[0] };
+    float u[3], w[3];
+    spread_frame(v, d, u, w);                            /* transported frame, shared with MDAP */
     if (!v->fs_on) {                                     /* engage seamlessly: bands start at the live
                                                           * gains; the splitter (and the idled dual-band
                                                           * crossover) restart clean */
@@ -3026,7 +3051,7 @@ void rt_set_limiter_ceiling(RtCore* c, float ceiling_linear) {
  * the audio thread reads, so call BEFORE bwa_start (or while stopped), like rt_set_layout. */
 void rt_set_bed_decoder(RtCore* c, int decoder) {
     if (!c) return;
-    c->bed_decoder = (decoder == 1) ? 1 : 0;
+    c->bed_decoder = (decoder == 1 || decoder == 2) ? decoder : 0;
     build_bed_decode(c);
 }
 

@@ -89,12 +89,14 @@ bool layout_load(const char* path, uint32_t sample_rate, Layout* out, char* err,
         set_err(err, errcap, "layout: 'speakers' must have 4..26 entries (26 = BWA_CHANNELS cap)"); goto done;
     }
 
+    bool have_rolloff = false;
     cJSON* dbap = cJSON_GetObjectItemCaseSensitive(root, "dbap");
     if (cJSON_IsObject(dbap)) {
         cJSON* rr = cJSON_GetObjectItemCaseSensitive(dbap, "rolloff_r");
         if (cJSON_IsNumber(rr)) {
             if (!(rr->valuedouble > 0.0)) { set_err(err, errcap, "layout: dbap.rolloff_r must be > 0"); goto done; }
             out->rolloff_r = (float)rr->valuedouble;
+            have_rolloff = true;
         }
         cJSON* da = cJSON_GetObjectItemCaseSensitive(dbap, "distance_attenuation");
         if (cJSON_IsObject(da)) {
@@ -272,6 +274,20 @@ bool layout_load(const char* path, uint32_t sample_rate, Layout* out, char* err,
     out->count             = (uint32_t)nspk;
     out->max_delay_samples = maxdelay;
     layout_compute_ref(out);                  /* nominal listening point = the surveyed array's centroid */
+    if (!have_rolloff) {
+        /* file omits the blur: derive it from the geometry, r = 0.25 x the mean centroid->speaker
+         * distance (Sundstrom 2021 recommends 0.2-0.5 of it; docs/spatialization.md). An explicit
+         * value in the file always wins; layout_default's constant only covers the no-file grid. */
+        double s = 0.0;
+        for (int i = 0; i < nspk; ++i) {
+            double dx = out->speakers[i].pos[0] - out->ref[0];
+            double dy = out->speakers[i].pos[1] - out->ref[1];
+            double dz = out->speakers[i].pos[2] - out->ref[2];
+            s += sqrt(dx * dx + dy * dy + dz * dz);
+        }
+        out->rolloff_r = (float)(0.25 * s / nspk);
+        if (out->rolloff_r < 0.05f) out->rolloff_r = 0.05f;   /* keep the >0 invariant on a degenerate survey */
+    }
     ok = true;
 done:
     cJSON_Delete(root);

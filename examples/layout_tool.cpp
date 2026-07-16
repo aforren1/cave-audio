@@ -27,8 +27,10 @@
  * selected panner's per-direction rE-localization error (its real solve, cached + throttled). V
  * switches the observer model — FIXED (a single audience sweet spot) or MOVING (the default: mean
  * coverage over a grid of listener positions across the working volume; see docs/spatialization.md).
- * X scores the layout for each panner; O runs the auto-optimizer (a hill-climb that minimises the
- * selected panner's rE error subject to the constraints; runs live, O again to stop, then save).
+ * X scores the layout for each panner (mean/worst rE error + the Frank-spread FOCUS metric); O runs
+ * the auto-optimizer — a hill-climb over a multi-objective scalarization of the selected panner's
+ * scores ("worst wt" blends mean vs worst-case, 1 = pure maximin; "focus wt" adds image spread),
+ * subject to the constraints; runs live, O again to stop, then save.
  * K snaps all speakers to the nearest allowed point. Drop a `constraints.json` next to the layout
  * (an allowed `bounds` box + `nogo` boxes for screens/structure + solid `obstacles`) and the tool
  * draws them (green bounds / red no-go / orange solid), flags violating speakers, and K projects
@@ -388,18 +390,22 @@ static float loc_err_deg(Vector3 d, Vector3 e) {
 
 /* ---- panner-specific layout scoring (offline, via the engine's real solve) ---- */
 static float score_mean[3], score_worst[3];      /* [DBAP, SPCAP, VBAP] rE localization error (deg) */
+static float score_spread[3];                    /* mean perceived spread (deg): Frank 2013's 186.4·(1−|rE|)+10.7 */
 static int   scored, score_stale, last_score_frame;   /* the per-panner scoreboard auto-refreshes on a throttle */
 
 /* mean + worst rE localization error (deg) over the shell, from the panner's observer model: DBAP over
  * the moving listener grid; SPCAP/VBAP from the fixed centre. Uses bwa_panner_gains_batch (the ACTUAL
- * engine solve), so the score reflects what will ship — not a re-implementation. */
-static void score_panner(bwa_panner panner, int stride, float* mean_deg, float* worst_deg) {
+ * engine solve), so the score reflects what will ship — not a re-implementation. spread_deg (optional)
+ * is the mean perceived source width from the energy-vector MAGNITUDE (Frank 2013: ≈186.4°·(1−|rE|)
+ * + 10.7°) — the image-focus axis direction error alone can't see: a defocused-but-centred image
+ * scores 0° error. */
+static void score_panner(bwa_panner panner, int stride, float* mean_deg, float* worst_deg, float* spread_deg) {
     static float gains[NCOV * NSPK], srcs[NCOV * 3];
     float pos[NSPK * 3];
     for (int i = 0; i < g_nspk; ++i) { pos[i*3] = spk[i].pos.x; pos[i*3+1] = spk[i].pos.y; pos[i*3+2] = spk[i].pos.z; }
     if (stride < 1) stride = 1;                     /* >1 subsamples the direction shell (coarse, for the optimizer) */
     int NL = (panner == BWA_PAN_DBAP) ? 27 : 1;     /* DBAP: moving grid; SPCAP/VBAP: fixed centre */
-    double sumerr = 0; float worst = 0; int cnt = 0;
+    double sumerr = 0, sumspread = 0; float worst = 0; int cnt = 0;
     for (int l = 0; l < NL; ++l) {
         Vector3 Lp = cov_lis[l]; Lp.y += obs_height;    /* the listener's EARS are at obs_height, not the floor */
         float lisf[3] = { Lp.x, Lp.y, Lp.z };
@@ -414,21 +420,26 @@ static void score_panner(bwa_panner panner, int stride, float* mean_deg, float* 
         for (int j = 0; j < ns; ++j) {
             int i = j * stride;                     /* the cov_dir index this sample came from */
             float* g = &gains[j * g_nspk];
-            float rE[3] = { 0, 0, 0 };
+            float rE[3] = { 0, 0, 0 }, esum = 0;
             for (int s = 0; s < g_nspk; ++s) {      /* energy-weighted speaker-direction vector (rE) */
                 float w = g[s] * g[s];
                 Vector3 sd = Vector3Normalize(Vector3Subtract(spk[s].pos, Lp));
                 rE[0] += w * sd.x; rE[1] += w * sd.y; rE[2] += w * sd.z;
+                esum  += w;
             }
             float rl = sqrtf(rE[0]*rE[0] + rE[1]*rE[1] + rE[2]*rE[2]);
-            if (rl < 1e-9f) continue;
+            if (rl < 1e-9f || esum < 1e-12f) continue;
             Vector3 ev = { rE[0]/rl, rE[1]/rl, rE[2]/rl };
             float err = loc_err_deg(cov_dir[i], ev);   /* perceptually weighted (azimuth >> elevation) */
+            float re_mag = rl / esum;                  /* |rE| in [0,1]: 1 = a single speaker carries it */
+            if (re_mag > 1.f) re_mag = 1.f;
+            sumspread += 186.4 * (1.0 - re_mag) + 10.7;   /* Frank 2013 perceived-spread model */
             sumerr += err; if (err > worst) worst = err; ++cnt;
         }
     }
     *mean_deg = cnt ? (float)(sumerr / cnt) : 0.f;
     *worst_deg = worst;
+    if (spread_deg) *spread_deg = cnt ? (float)(sumspread / cnt) : 0.f;
 }
 
 /* fill cov_err[] with the selected panner's per-direction rE error (deg), averaged over the observer
@@ -468,18 +479,25 @@ static void compute_cov_err(bwa_panner panner) {
     cov_err_valid = 1; cov_err_stale = 0; cov_err_panner = panner; cov_err_moving = coverage_moving; cov_err_frame = cov_frame;
 }
 
-/* ---- auto-optimizer: stochastic hill-climb over the free positions, minimising the panner cost
- * (mean + 0.5*worst rE error) subject to the constraints. Runs incrementally (a few trials per frame)
- * so the layout is seen converging and the GUI stays responsive; stop any time and save. ---- */
+/* ---- auto-optimizer: stochastic hill-climb over the free positions, minimising a MULTI-OBJECTIVE
+ * scalarization subject to the constraints: (1−w)·mean + w·worst rE error blends the average
+ * experience against the worst direction/observer position (w = 1 is pure MAXIMIN — nothing is
+ * sacrificed for the average, the right target when every occupant matters; cf. Yang et al. 2025,
+ * Acoustics 7(4), who formalize that both can't be optimal at once for off-centre listeners), plus
+ * an optional image-FOCUS term (mean Frank spread) direction error alone can't see. Each weight
+ * setting climbs to a different point on the accuracy/robustness Pareto front. Runs incrementally
+ * (a few trials per frame) so the layout is seen converging; stop any time and save. ---- */
 static int     opt_running, opt_iter, opt_stall;
 static float   opt_step = 0.30f, opt_cost;
 static float   opt_leash = 3.0f;                          /* max optimizer displacement from the anchor (m); ~free at 3 m */
+static float   opt_worst_wt = 0.333f;                     /* mean<->worst blend (1/3 = the historical mean + 0.5*worst) */
+static float   opt_focus_wt = 0.0f;                       /* deg-of-spread per deg-of-error trade; 0 = direction only */
 static Vector3 opt_anchor[NSPK];                          /* speaker positions captured when optimization started */
 
 static float opt_cost_of(bwa_panner p) {   /* coarse; + a penalty per speaker in a projector shadow so the climb clears them */
-    float m, w; score_panner(p, 4, &m, &w);
+    float m, w, sp; score_panner(p, 4, &m, &w, &sp);
     int occ = 0; for (int i = 0; i < g_nspk; ++i) if (!los_clear(spk[i].pos)) ++occ;
-    return m + 0.5f * w + 25.0f * (float)occ;
+    return 2.0f * ((1.0f - opt_worst_wt) * m + opt_worst_wt * w) + opt_focus_wt * sp + 25.0f * (float)occ;
 }
 static float frand(void) { return (float)rand() / ((float)RAND_MAX + 1.0f); }
 
@@ -562,7 +580,7 @@ static void do_snap(void) {
     mark_edit();
 }
 static void do_score(void) {
-    for (int p = 0; p < 3; ++p) score_panner((bwa_panner)p, 1, &score_mean[p], &score_worst[p]);
+    for (int p = 0; p < 3; ++p) score_panner((bwa_panner)p, 1, &score_mean[p], &score_worst[p], &score_spread[p]);
     scored = 1; score_stale = 0;
 }
 static void set_optimizing(int on) {
@@ -889,13 +907,17 @@ static void draw_hud(float cov_worst, float cov_mean) {
     if (opt_running && !preview)
         ImGui::TextColored(ImVec4(0.47f, 0.96f, 0.63f, 1), "OPTIMIZING %s   cost %.1f   iter %d   step %.2f m   [O] stop",
                            panner_names[pv_panner], opt_cost, opt_iter, opt_step);
-    if (scored && !preview)
+    if (scored && !preview) {
         ImGui::TextColored(ImVec4(0.59f, 0.78f, 0.94f, 1),
                            "rE-err deg mean/worst (live%s):   %sDBAP %.0f/%.0f    %sSPCAP %.0f/%.0f    %sVBAP %.0f/%.0f",
                            perceptual ? ", az>el" : "",
                            pv_panner==0?">":"", score_mean[0], score_worst[0],
                            pv_panner==1?">":"", score_mean[1], score_worst[1],
                            pv_panner==2?">":"", score_mean[2], score_worst[2]);
+        ImGui::TextColored(ImVec4(0.59f, 0.78f, 0.94f, 1),
+                           "focus - Frank spread deg (lower = sharper):   DBAP %.0f    SPCAP %.0f    VBAP %.0f",
+                           score_spread[0], score_spread[1], score_spread[2]);
+    }
     if (coverage_on && !preview) {
         const char* obs = coverage_moving ? "moving" : "fixed";
         if (cov_metric == 0)
@@ -1013,6 +1035,17 @@ static void draw_panel(void) {
           "within the constraints; runs live - watch it converge, stop, then Save");
     ImGui::SliderFloat("leash", &opt_leash, 0.1f, 3.0f, "%.2f m");   /* max optimizer move from the anchor */
     bwTip("how far the optimizer may move any speaker from where it started (3 m = essentially free)");
+    if (ImGui::SliderFloat("worst wt", &opt_worst_wt, 0.0f, 1.0f, "%.2f") && opt_running)
+        opt_cost = opt_cost_of((bwa_panner)pv_panner);   /* re-baseline: the cached cost is on the old blend */
+    bwTip("mean<->worst-case blend the optimizer climbs: 0 optimizes the AVERAGE direction/observer "
+          "position, 1 is pure MAXIMIN - no direction or seat is sacrificed for the average (they "
+          "can't all be exact at once, so this slider picks the compromise); each setting lands a "
+          "different point on the accuracy/robustness Pareto front");
+    if (ImGui::SliderFloat("focus wt", &opt_focus_wt, 0.0f, 2.0f, "%.2f") && opt_running)
+        opt_cost = opt_cost_of((bwa_panner)pv_panner);
+    bwTip("adds the mean perceived source width (Frank 2013: ~186\xC2\xB0\xC2\xB7(1-|rE|)+11\xC2\xB0) to the cost - "
+          "an accurate but DEFOCUSED image scores 0\xC2\xB0 direction error, this is the axis that sees it; "
+          "0 = direction only, 1 = a degree of spread costs a degree of error");
     if (ImGui::SliderFloat("obs ear y", &obs_height, 0.0f, 2.0f, "%.2f m")) mark_score();
     bwTip("listener EAR height above the floor - scoring, coverage, and the sightline checks all measure from here");
     if (CheckboxInt("perceptual (az>el)", &perceptual)) mark_score();   /* weight azimuth >> elevation */
@@ -1128,7 +1161,7 @@ static void register_tests(ImGuiTestEngine* te) {
             bwa_destroy(te2);
         }
         float m = 0, w = 0;                                      /* the real panner solve, on 24 speakers */
-        score_panner(BWA_PAN_DBAP, 4, &m, &w);
+        score_panner(BWA_PAN_DBAP, 4, &m, &w, NULL);
         IM_CHECK_GT(w, 0.0f);
         g_nspk = keep; seed_default(); layout_dirty = 1;
     };
@@ -1150,12 +1183,30 @@ static void register_tests(ImGuiTestEngine* te) {
     t = IM_REGISTER_TEST(te, "logic", "score");                  /* the real engine solve scores the default dome sanely */
     t->TestFunc = [](ImGuiTestContext*) {
         seed_default(); layout_dirty = 1;
-        float m = -1, w = -1;
-        score_panner(BWA_PAN_DBAP, 2, &m, &w);
+        float m = -1, w = -1, sp = -1;
+        score_panner(BWA_PAN_DBAP, 2, &m, &w, &sp);
         IM_CHECK_GT(m, 0.0f);
         IM_CHECK_LT(m, 90.0f);
         IM_CHECK_GE(w, m);
         IM_CHECK_LT(w, 181.0f);
+        IM_CHECK_GT(sp, 10.0f);                                  /* Frank spread: 10.7° floor .. 197° ceiling */
+        IM_CHECK_LT(sp, 197.2f);
+    };
+
+    t = IM_REGISTER_TEST(te, "logic", "maximin");                /* the objective blend is wired: the weights select
+                                                                  * which score the optimizer actually climbs */
+    t->TestFunc = [](ImGuiTestContext*) {
+        seed_default(); layout_dirty = 1;
+        float m, w, sp;
+        score_panner(BWA_PAN_DBAP, 4, &m, &w, &sp);              /* stride 4 = opt_cost_of's own sampling */
+        const float saveW = opt_worst_wt, saveF = opt_focus_wt;
+        opt_worst_wt = 1.0f; opt_focus_wt = 0.0f;                /* pure maximin: cost = 2*worst (no occluders) */
+        IM_CHECK_LT(fabsf(opt_cost_of(BWA_PAN_DBAP) - 2.0f * w), 0.5f);
+        opt_worst_wt = 0.0f;                                     /* pure mean */
+        IM_CHECK_LT(fabsf(opt_cost_of(BWA_PAN_DBAP) - 2.0f * m), 0.5f);
+        opt_worst_wt = 0.0f; opt_focus_wt = 1.0f;                /* the focus axis lands in the cost too */
+        IM_CHECK_LT(fabsf(opt_cost_of(BWA_PAN_DBAP) - (2.0f * m + sp)), 0.75f);
+        opt_worst_wt = saveW; opt_focus_wt = saveF;
     };
 
     t = IM_REGISTER_TEST(te, "viewer", "panel_edit");            /* fake inputs drive the panel; state follows */
@@ -1338,19 +1389,20 @@ int main(int argc, char** argv) {
     if (score_only) {                              /* headless: score the layout for each panner + exit */
         printf("layout: %s (%s)\n", g_path, loaded ? "loaded" : "default grid");
         for (int p = 0; p < 3; ++p) {
-            float m, w; score_panner((bwa_panner)p, 1, &m, &w);
-            printf("  %-14s rE-localize error:  mean %4.1f deg   worst %4.1f deg\n", panner_names[p], m, w);
+            float m, w, sp; score_panner((bwa_panner)p, 1, &m, &w, &sp);
+            printf("  %-14s rE-localize error:  mean %4.1f deg   worst %4.1f deg   focus (Frank spread) %4.1f deg\n",
+                   panner_names[p], m, w, sp);
         }
         return 0;
     }
     if (optimize_only) {                           /* headless: optimize in place for one panner + save */
         bwa_panner p = BWA_PAN_DBAP;
         if (argc > 3) { if (!strcmp(argv[3], "spcap")) p = BWA_PAN_SPCAP; else if (!strcmp(argv[3], "vbap")) p = BWA_PAN_VBAP; }
-        float m0, w0; score_panner(p, 1, &m0, &w0);
+        float m0, w0; score_panner(p, 1, &m0, &w0, NULL);
         opt_cost = opt_cost_of(p); opt_step = 0.30f; opt_stall = 0; opt_iter = 0;
         for (int i = 0; i < g_nspk; ++i) opt_anchor[i] = spk[i].pos;           /* leash anchor (opt_leash defaults ~free) */
         while (opt_step > 0.02f && opt_iter < 120000) optimize_step(p, 200);   /* run to convergence (step floor) */
-        float m1, w1; score_panner(p, 1, &m1, &w1);
+        float m1, w1; score_panner(p, 1, &m1, &w1, NULL);
         if (!save_json(g_path)) { printf("optimize: save failed: %s\n", g_path); return 1; }
         printf("optimized %s for %-5s:  rE mean %.1f -> %.1f deg   worst %.1f -> %.1f deg   (%d iters%s)\n",
                g_path, panner_names[p], m0, m1, w0, w1, opt_iter, CON.loaded ? ", within constraints" : "");

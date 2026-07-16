@@ -557,6 +557,60 @@ int main(void) {
         }
     }
 
+    /* spread-frame continuity over the pole: the ring/band frame (u, w) around the source direction
+     * is PARALLEL-TRANSPORTED per voice (spread_frame in rt.c) rather than derived from a fixed
+     * up-vector. The fixed-up construction flips the frame ~180° in ONE solve when a moving source
+     * leaves the |d.y| > 0.9 zone — under spectral spread every scattered band's direction teleports
+     * and the speaker distribution steps (Pulkki's reference vbap external transports the same state
+     * for the same reason). Sweep a wide spectral noise source along a 2°-step arc over the zenith
+     * and pin the worst step-to-step change of the normalized per-channel energy distribution to the
+     * same order as the geometric drift of a 2° move. */
+    {
+        RtCore* cw = rt_create(8, 4, RATE, CH);
+        CHECK(cw != NULL, "rt_create (spread frame)");
+        if (cw) {
+            const char* NW3 = "bwa_rt_pole.wav";
+            if (write_noise_wav(NW3, 8 * N)) {
+                uint32_t nf = rt_load_sound(cw, NW3, err, sizeof err);
+                uint32_t hf = rt_source_create(cw);
+                rt_source_play(cw, hf, nf, true);
+                rt_set_spread_mode(cw, 2);
+                rt_source_set_spread(cw, hf, 0.8f);
+                bwa_timestamp tsw = { 0, 0 };
+                double prev[CH], worst = 0.0;
+                int first = 1;
+                for (int s = -20; s <= 20; ++s) {            /* -40°..+40° across the zenith */
+                    float th = (float)s * 0.0349066f;        /* 2° per step */
+                    rt_source_set_pos(cw, hf, LD.ref[0] + 1.5f * sinf(th),
+                                              LD.ref[1] + 1.5f * cosf(th), LD.ref[2]);
+                    rt_commit(cw);
+                    for (int b = 0; b < 6; ++b) rt_render(cw, bus, N, &tsw);   /* ramps + splitter land */
+                    double e[CH], tot = 0.0;
+                    for (int k = 0; k < CH; ++k) e[k] = 0.0;
+                    for (int b = 0; b < 8; ++b) {            /* one full noise loop: phase-independent */
+                        rt_render(cw, bus, N, &tsw);
+                        for (int k = 0; k < CH; ++k) e[k] += chan_energy(k);
+                    }
+                    for (int k = 0; k < CH; ++k) tot += e[k];
+                    for (int k = 0; k < CH; ++k) e[k] /= tot;
+                    if (!first) {
+                        double dmax = 0.0;
+                        for (int k = 0; k < CH; ++k) { double d = fabs(e[k] - prev[k]); if (d > dmax) dmax = d; }
+                        if (dmax > worst) worst = dmax;
+                    }
+                    memcpy(prev, e, sizeof prev);
+                    first = 0;
+                }
+                printf("spread frame: worst pole-crossing step %.4f\n", worst);
+                CHECK(worst < 0.02, "the spread frame is continuous over the pole (no ring snap)");
+                rt_set_spread_mode(cw, 0);
+                rt_source_destroy(cw, hf); rt_commit(cw);
+                remove(NW3);
+            } else CHECK(0, "write noise wav (spread frame)");
+            rt_destroy(cw);
+        }
+    }
+
     /* tracked room EQ (room_eq_grid): the align biquads re-aim as the committed listener moves — a
      * 100 Hz voice equidistant from two grid positions (flat at A, -12 dB at B on EVERY channel)
      * drops by ~the IDW-interpolated depth when the listener walks A -> B, and the live kill switch

@@ -97,7 +97,7 @@ model (fixed centre vs the moving working volume). The file:
     "note":               "..."
   },
   "dbap": {
-    "rolloff_r": 0.5,                        // DBAP spatial-blur 'r' (how many speakers share energy)
+    "rolloff_r": 0.5,                        // DBAP spatial-blur 'r' (how many speakers share energy); omitted -> derived from the geometry
     "distance_attenuation": {
       "model":               "inverse",      // documentation only — the loader ignores this field
       "reference_distance_m": 1.0,
@@ -117,7 +117,7 @@ model (fixed centre vs the moving working volume). The file:
 | `units` | object | documentation only. The loader always converts dB → linear gain and ms → samples at the engine rate (positions are read as meters); changing this field has no effect. |
 | `coordinate_space` | string | documentation of the frame. Positions MUST be in **room space: right-handed, +y up, +z forward, origin on the floor** (Motive's ground-plane default; y = height above the floor) — the frame the engine works in (the Unity/Unreal binding converts at its boundary — see [`integration.md`](./integration.md)). The engine derives its **nominal listening point from the array centroid** (world-locked bed/monitor decode directions + the default listener position), so the origin's exact spot is not load-bearing. |
 | `reference` | object | provenance for the alignment values; `speed_of_sound_mps` is used if delays are derived rather than measured. Informational — the engine applies `delay_ms` as written. |
-| `dbap.rolloff_r` | float | the **blur** knob `r` from [`spatialization.md`](./spatialization.md): larger spreads energy over more speakers. Must be > 0. |
+| `dbap.rolloff_r` | float | the **blur** knob `r` from [`spatialization.md`](./spatialization.md): larger spreads energy over more speakers. Must be > 0. **Omit it and the loader derives it from the geometry**: `0.25 ×` the mean centroid→speaker distance (Sundstrom 2021 recommends 0.2–0.5 of it) — ~0.53 m on the default grid. An explicit value always wins; treat the derived one as the starting point to dial against the real array. |
 | `dbap.distance_attenuation` | object | the source→listener distance-attenuation curve (the second tuning knob). The loader reads only `reference_distance_m` (> 0), `rolloff` (> 0), and `min_gain_db` (≤ 0; floors the attenuation). `model` is ignored — the inverse curve is the only one implemented. |
 | `speakers[]` | array | **4..26** speaker records (26 = the compile-time `BWA_CHANNELS` capacity). **The speaker count IS the engine's channel count** — a 24-speaker install loads a 24-entry file into the same binary. Order is not significant for DBAP, but `index` is the channel the speaker maps to on the bus / ASIO output, and the indices must form a complete `0..N-1` permutation. |
 

@@ -11,6 +11,11 @@
  *                 generator agrees with before pinning either;
  *   allrad.c      vs a full decode rebuild on qhull + numpy solves + scipy SH, including
  *                 the imaginary-pole-speaker rule (both the covered and floor-less grids);
+ *   epad.c        vs the numpy SVD form of the same (unique) polar-factor decode —
+ *                 a Jacobi eigensolve validated by a different factorization;
+ *   ambisonics.c  rotation: the Ivanic-Ruedenberg recursion vs matrices recovered from the
+ *                 defining property encode(R*d) = M*encode(d) by lstsq over scipy harmonics
+ *                 (no recursion in the reference path);
  *   biquad.h      vs the RBJ analog prototypes bilinear-transformed with pre-warping
  *                 (scipy.signal.bilinear) — an independent derivation of the cookbook;
  *   align.c       vs a scipy.signal.lfilter float64 rendering of the room_eq cascade.
@@ -23,6 +28,7 @@
 #include "layout.h"
 #include "hull.h"
 #include "allrad.h"
+#include "epad.h"
 #include "ambisonics.h"
 #include "biquad.h"
 #include "align.h"
@@ -179,7 +185,72 @@ int main(void) {
         }
     }
 
+    /* 6. epad.c vs the numpy SVD rebuild: the polar-factor decode is unique, so the Jacobi
+     * eigensolve of YY^T and numpy's SVD must land on the same matrix — both grids */
+    {
+        Layout L = layout_default();
+        float dec[BWA_CHANNELS][BWA_AMBI_CH];
+        CHECK(epad_build_decode(&L, dec), "epad builds (grid26)");
+        double fro2 = 0, ref2 = 0; float maxerr = 0.f;
+        for (int s = 0; s < CH; ++s)
+            for (int k = 0; k < BWA_AMBI_CH; ++k) {
+                float ref = xval_epad_grid26[s * BWA_AMBI_CH + k];
+                float e = fabsf(dec[s][k] - ref);
+                if (e > maxerr) maxerr = e;
+                fro2 += (double)e * e; ref2 += (double)ref * ref;
+            }
+        printf("xval epad26: max |err| = %.3g  rel frob = %.3g\n", maxerr, sqrt(fro2 / ref2));
+        CHECK(maxerr < 1e-4f && fro2 / ref2 < 1e-4 * 1e-4,
+              "EPAD decode matrix matches the numpy SVD polar factor (covered grid)");
+
+        Layout LH; memset(&LH, 0, sizeof LH);
+        uint32_t nh = 0;
+        for (uint32_t s = 0; s < L.count; ++s) {
+            if (L.speakers[s].pos[1] < 0.1f) continue;
+            memcpy(LH.speakers[nh].pos, L.speakers[s].pos, sizeof LH.speakers[nh].pos);
+            LH.speakers[nh].gain_lin = 1.f;
+            ++nh;
+        }
+        LH.count = nh;
+        layout_compute_ref(&LH);
+        CHECK(nh == 17 && epad_build_decode(&LH, dec), "epad builds (floorless17)");
+        fro2 = ref2 = 0; maxerr = 0.f;
+        for (uint32_t s = 0; s < nh; ++s)
+            for (int k = 0; k < BWA_AMBI_CH; ++k) {
+                float ref = xval_epad_floorless17[s * BWA_AMBI_CH + k];
+                float e = fabsf(dec[s][k] - ref);
+                if (e > maxerr) maxerr = e;
+                fro2 += (double)e * e; ref2 += (double)ref * ref;
+            }
+        printf("xval epad17: max |err| = %.3g  rel frob = %.3g\n", maxerr, sqrt(fro2 / ref2));
+        CHECK(maxerr < 1e-4f && fro2 / ref2 < 1e-4 * 1e-4,
+              "EPAD decode matrix matches the numpy SVD polar factor (floor-less grid)");
+    }
+
+    /* 7. ambi_rot_matrix (Ivanic-Ruedenberg recursion) vs matrices RECOVERED from the defining
+     * property encode(R*d) = M*encode(d) by least squares over the scipy harmonics — the
+     * recursion never appears in the reference, so a self-consistent slip in it cannot hide
+     * (the engine's own ambi property test uses the engine's encode on both sides) */
+    {
+        float maxerr = 0.f;
+        for (int i = 0; i < XVAL_ROT_N; ++i) {
+            float R[3][3];
+            for (int r = 0; r < 3; ++r)
+                for (int c2 = 0; c2 < 3; ++c2) R[r][c2] = xval_rot_R[i * 9 + r * 3 + c2];
+            float M[BWA_SH_ROT_N];
+            ambi_rot_matrix(R, M);
+            for (int k = 0; k < BWA_SH_ROT_N; ++k) {
+                float e = fabsf(M[k] - xval_rot_M[i * BWA_SH_ROT_N + k]);
+                if (e > maxerr) maxerr = e;
+            }
+        }
+        printf("xval rot: max |err| = %.3g\n", maxerr);
+        CHECK(maxerr < 1e-5f,
+              "Ivanic-Ruedenberg rotation matrices match the lstsq-recovered golden (8 rotations)");
+    }
+
     if (fails) { printf("xval_test: %d FAILURES\n", fails); return 1; }
-    printf("xval_test OK (SH vs scipy, VBAP vs l1-LP, AllRAD vs qhull rebuild, RBJ vs bilinear, align vs lfilter)\n");
+    printf("xval_test OK (SH vs scipy, VBAP vs l1-LP, AllRAD vs qhull rebuild, EPAD vs SVD polar factor, "
+           "SH rotation vs lstsq recovery, RBJ vs bilinear, align vs lfilter)\n");
     return 0;
 }
