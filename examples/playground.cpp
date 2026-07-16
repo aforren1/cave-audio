@@ -53,6 +53,10 @@
  *                         brief audio gap). Transient signals (clicks/bursts) show the tail best.
  *
  * Global keys: WASD/RF move source, Q/E head, 1-4 signal, TAB scene, F9 record output to WAV, ESC.
+ * Custom content: the panel's "custom sound" section (or DROP a file on the window) loads YOUR
+ * wav/flac/mp3 — mono joins the signal picker and plays on the point source in every scene; an
+ * AmbiX (4/9/16 ch) or FuMa .amb file replaces the bed scene's synthesized field, all bed knobs
+ * apply. Auto-detect: .amb -> FuMa, soundfield channel counts -> AmbiX, anything else -> mono.
  * Needs the Steam Audio build for occlusion/materials/directivity/reverb; without it those are no-ops.
  * Usage: bwa_playground [cave_layout.json] — audition with your surveyed layout (renders + pans with the
  *        engine's actual speaker positions); with no arg it auto-loads ./cave_layout.json or the default grid.
@@ -295,6 +299,16 @@ static bwa_source    src, refl;
 static bwa_sound     sounds[NSIG];
 static bwa_sound     g_bed_snd;    /* the synthesized AmbiX field (BED_FILE), loaded per engine build */
 static bwa_bed       g_bed;        /* the bed voice (created per build; only the bed scene plays it) */
+/* custom content (the "custom sound" panel section + drag-and-drop): audition YOUR files through
+ * the engine — a mono asset joins the signal picker (cur_sig == NSIG), an ambisonic one replaces
+ * the bed scene's synthesized field. Full PATHS are kept because a reverb-boundary engine rebuild
+ * kills the handles: build_engine reloads them. */
+static bwa_sound g_cust_mono, g_cust_bed;
+static char      g_cust_mono_path[512], g_cust_bed_path[512];
+static int       g_cust_bed_fuma;              /* the bed file went through the FuMa loader */
+static char      g_cust_path[512];             /* the panel's path field */
+static char      g_cust_status[192];           /* last load result line */
+static int       g_cust_ok;
 static const char* backend_name;
 static int         backend_silent;
 static const char* g_layout_path;          /* optional cave_layout.json; NULL = engine default grid */
@@ -307,6 +321,12 @@ static Vector3 source_pos = { 1.5f, 0.0f, 0.0f };   /* y re-based to ear height 
 static float   head_yaw, source_yaw;
 static int     cur_sig;
 static int     highlight_spk = -1;          /* a scene may highlight one speaker each frame; reset per frame */
+
+/* the signal picker's current asset: NSIG = the custom mono slot (falls back to signal 0 if the
+ * custom sound failed to survive an engine rebuild) */
+static bwa_sound sig_snd(void) {
+    return (cur_sig == NSIG && g_cust_mono) ? g_cust_mono : sounds[cur_sig < NSIG ? cur_sig : 0];
+}
 
 /* keyboard/mouse gating: scene shortcuts act only when imgui doesn't want the device (set per frame
  * from io.WantCapture*; kp/kd wrap raylib so every scene handler is gated without touching them). */
@@ -710,7 +730,7 @@ static void bed_enter(void) {
     bwa_source_set_gain(e, refl, 0.0f);
     bed_apply();
     bwa_bed_set_gain(e, g_bed, 0.9f);
-    bwa_bed_play(e, g_bed, g_bed_snd, true);
+    bwa_bed_play(e, g_bed, g_cust_bed ? g_cust_bed : g_bed_snd, true);   /* a loaded field replaces the synth */
 }
 static void bed_update(float dt) {
     if (kp(KEY_SPACE)) bed_spin = !bed_spin;
@@ -825,7 +845,7 @@ static const Scene scenes[] = {
     { "Ambisonic bed (world-locked)", bed_enter, bed_update, bed_draw3d },
     { "Reverb bed (static room)", rev_enter,  rev_update,  rev_draw3d  },
 };
-enum { NSCENE = sizeof scenes / sizeof scenes[0], SCENE_REVERB = NSCENE - 1 };
+enum { NSCENE = sizeof scenes / sizeof scenes[0], SCENE_REVERB = NSCENE - 1, SCENE_BED = NSCENE - 2 };
 static int cur_scene;
 static int engine_has_reverb;       /* which config the live engine was built in */
 
@@ -867,9 +887,17 @@ static void build_engine(int with_reverb) {
     g_head = Vector3Scale(g_head, 1.0f / (float)g_nspk);
     for (int i = 0; i < NSIG; ++i) sounds[i] = bwa_load_sound(e, sig_files[i]);
     g_bed_snd = bwa_load_ambix(e, BED_FILE);             /* the bed scene's field (silent until played) */
+    if (g_cust_mono_path[0]) {                           /* custom assets died with the old engine: reload */
+        g_cust_mono = bwa_load_sound(e, g_cust_mono_path);
+        if (!g_cust_mono) { g_cust_mono_path[0] = 0; if (cur_sig == NSIG) cur_sig = 0; }
+    } else g_cust_mono = 0;
+    if (g_cust_bed_path[0]) {
+        g_cust_bed = g_cust_bed_fuma ? bwa_load_fuma(e, g_cust_bed_path) : bwa_load_ambix(e, g_cust_bed_path);
+        if (!g_cust_bed) g_cust_bed_path[0] = 0;
+    } else g_cust_bed = 0;
     for (int i = 0; i < NMAT; ++i) mats[i] = bwa_material_preset(e, mat_types[i]);
-    src  = bwa_source_create(e);  bwa_source_play(e, src,  sounds[cur_sig], true);
-    refl = bwa_source_create(e);  bwa_source_play(e, refl, sounds[cur_sig], true);
+    src  = bwa_source_create(e);  bwa_source_play(e, src,  sig_snd(), true);
+    refl = bwa_source_create(e);  bwa_source_play(e, refl, sig_snd(), true);
     g_bed = bwa_bed_create(e);
     bwa_source_set_gain(e, refl, 0.0f);
     if (with_reverb) bwa_source_set_reflections(e, src, rev_on);
@@ -909,6 +937,66 @@ static void switch_scene(int idx) {
     bwa_source_set_gain(e, src, SRC_GAIN);
     cur_scene = idx;
     scenes[idx].enter();
+}
+
+/* ---- custom sound loading (the panel's "custom sound" section + files dropped on the window):
+ * a mono file joins the signal picker and plays on the point source in every scene; an ambisonic
+ * one (AmbiX 4/9/16 ch, or FuMa .amb) replaces the bed scene's synthesized field — all the bed
+ * knobs (orientation, parametric, max-rE/split) apply to it. ---- */
+static const char* path_base(const char* p) {
+    const char* b = p;
+    for (const char* q = p; *q; ++q) if (*q == '/' || *q == '\\') b = q + 1;
+    return b;
+}
+static void load_custom_mono(const char* path) {
+    bwa_sound s = bwa_load_sound(e, path);
+    if (!s) {
+        const char* er = bwa_last_error(e);
+        snprintf(g_cust_status, sizeof g_cust_status, "mono load failed: %s", er ? er : path_base(path));
+        g_cust_ok = 0;
+        return;
+    }
+    if (g_cust_mono) bwa_unload_sound(e, g_cust_mono);   /* safe: retire-acked internally */
+    g_cust_mono = s;
+    snprintf(g_cust_mono_path, sizeof g_cust_mono_path, "%s", path);
+    cur_sig = NSIG;                                      /* select it and play it, like the picker does */
+    bwa_source_play(e, src,  s, true);
+    bwa_source_play(e, refl, s, true);
+    snprintf(g_cust_status, sizeof g_cust_status, "mono: %s", path_base(path));
+    g_cust_ok = 1;
+}
+static void load_custom_bed(const char* path, int fuma) {
+    bwa_sound s = fuma ? bwa_load_fuma(e, path) : bwa_load_ambix(e, path);
+    if (!s) {
+        const char* er = bwa_last_error(e);
+        snprintf(g_cust_status, sizeof g_cust_status, "%s load failed: %s",
+                 fuma ? "FuMa" : "AmbiX", er ? er : path_base(path));
+        g_cust_ok = 0;
+        return;
+    }
+    if (g_cust_bed) bwa_unload_sound(e, g_cust_bed);
+    g_cust_bed = s; g_cust_bed_fuma = fuma;
+    snprintf(g_cust_bed_path, sizeof g_cust_bed_path, "%s", path);
+    if (cur_scene == SCENE_BED) bwa_bed_play(e, g_bed, s, true);   /* swap the playing field live */
+    snprintf(g_cust_status, sizeof g_cust_status, "bed (%s): %s%s", fuma ? "FuMa" : "AmbiX",
+             path_base(path), cur_scene == SCENE_BED ? "" : " - hear it in the Ambisonic bed scene");
+    g_cust_ok = 1;
+}
+static void load_custom_auto(const char* path) {
+    const char* dot = strrchr(path, '.');
+    if (dot && _stricmp(dot, ".amb") == 0) { load_custom_bed(path, 1); return; }   /* .amb = FuMa by convention */
+    bwa_sound s = bwa_load_ambix(e, path);               /* 4/9/16 channels -> it's a soundfield */
+    if (s) {
+        if (g_cust_bed) bwa_unload_sound(e, g_cust_bed);
+        g_cust_bed = s; g_cust_bed_fuma = 0;
+        snprintf(g_cust_bed_path, sizeof g_cust_bed_path, "%s", path);
+        if (cur_scene == SCENE_BED) bwa_bed_play(e, g_bed, s, true);
+        snprintf(g_cust_status, sizeof g_cust_status, "bed (AmbiX): %s%s", path_base(path),
+                 cur_scene == SCENE_BED ? "" : " - hear it in the Ambisonic bed scene");
+        g_cust_ok = 1;
+        return;
+    }
+    load_custom_mono(path);                              /* any other channel count: mono downmix */
 }
 
 /* ============================== imgui control panel ============================== */
@@ -977,6 +1065,41 @@ static void draw_panel(void) {
             bwa_source_play(e, refl, sounds[i], true);
         }
     }
+    if (g_cust_mono) {                                    /* the loaded mono file is a 5th signal */
+        char lbl[96];
+        snprintf(lbl, sizeof lbl, "custom: %s", path_base(g_cust_mono_path));
+        if (ImGui::RadioButton(lbl, cur_sig == NSIG) && cur_sig != NSIG) {
+            cur_sig = NSIG;
+            bwa_source_play(e, src,  g_cust_mono, true);
+            bwa_source_play(e, refl, g_cust_mono, true);
+        }
+    }
+
+    ImGui::SeparatorText("custom sound");
+    ImGui::SetNextItemWidth(-FLT_MIN);
+    ImGui::InputTextWithHint("##custpath", "path (wav/flac/mp3/amb) or drop a file here",
+                             g_cust_path, sizeof g_cust_path);
+    bwTip("load YOUR content: mono plays on the point source (all scenes), an ambisonic file "
+          "replaces the bed scene's synthesized field. Dropping a file anywhere on the window "
+          "auto-detects.");
+    if (ImGui::Button("auto"))  load_custom_auto(g_cust_path);
+    bwTip(".amb loads as FuMa; 4/9/16-channel files load as AmbiX beds; anything else is a mono "
+          "downmix - the same rule a dropped file takes");
+    ImGui::SameLine();
+    if (ImGui::Button("mono"))  load_custom_mono(g_cust_path);
+    bwTip("bwa_load_sound: decode to mono at the engine rate (multichannel downmixes), loop on "
+          "the point source, join the signal picker above");
+    ImGui::SameLine();
+    if (ImGui::Button("AmbiX")) load_custom_bed(g_cust_path, 0);
+    bwTip("bwa_load_ambix: a 4/9/16-channel ACN/SN3D soundfield - world-locked through the bed "
+          "decode; orientation/parametric/max-rE all apply");
+    ImGui::SameLine();
+    if (ImGui::Button("FuMa"))  load_custom_bed(g_cust_path, 1);
+    bwTip("bwa_load_fuma: legacy B-format (WXYZ channel order, MaxN + W -3 dB) converted to "
+          "AmbiX at load");
+    if (g_cust_status[0])
+        ImGui::TextColored(g_cust_ok ? ImVec4(0.47f, 0.86f, 0.55f, 1) : ImVec4(0.96f, 0.51f, 0.51f, 1),
+                           "%s", g_cust_status);
 
     ImGui::SeparatorText(scenes[cur_scene].name);
     if (cur_scene == 0) {                                 /* Localization */
@@ -1303,6 +1426,54 @@ static void register_tests(ImGuiTestEngine* te) {
         IM_CHECK(stopped);                               /* leaving the scene stops the bed */
     };
 
+    t = IM_REGISTER_TEST(te, "viewer", "custom_load");   /* custom mono + AmbiX files load through the panel */
+    t->TestFunc = [](ImGuiTestContext* ctx) {
+        const char* CM = "pg_cust_mono.wav", *CB = "pg_cust_bed.wav";
+        {                                                /* synthesize the fixtures with the app's own gens */
+            static float mbuf[SR];
+            gen_signal(0, mbuf, SR);
+            IM_CHECK(write_wav(CM, mbuf, SR));
+            static float bbuf[(size_t)SR * 16];
+            gen_bed(bbuf, SR);
+            IM_CHECK(write_wav16(CB, bbuf, SR));
+        }
+        switch_scene(0);
+        ctx->SetRef("playground");
+        ctx->ItemClick("**/##custpath");                 /* a bad path fails loudly, state untouched */
+        ctx->KeyCharsReplaceEnter("pg_does_not_exist.wav");
+        ctx->ItemClick("**/mono");
+        IM_CHECK_EQ(g_cust_ok, 0);
+        IM_CHECK_EQ(g_cust_mono, 0u);
+        ctx->ItemClick("**/##custpath");                 /* mono: loads, joins + selects in the picker */
+        ctx->KeyCharsReplaceEnter(CM);
+        ctx->ItemClick("**/mono");
+        IM_CHECK_EQ(g_cust_ok, 1);
+        IM_CHECK_NE(g_cust_mono, 0u);
+        IM_CHECK_EQ(cur_sig, NSIG);
+        uint32_t n = 0; float m = 0.0f;                  /* the custom clip reaches the bus */
+        for (int tries = 0; tries < 60 && m <= 1e-6f; ++tries) { ctx->Yield(4); m = meters_max(&n); }
+        IM_CHECK_GT(m, 1e-4f);
+        ctx->ItemClick("**/pink noise");                 /* the picker swaps back to a builtin */
+        IM_CHECK_EQ(cur_sig, 0);
+        ctx->ItemClick("**/##custpath");                 /* ambisonic: replaces the bed scene's field */
+        ctx->KeyCharsReplaceEnter(CB);
+        ctx->ItemClick("**/AmbiX");
+        IM_CHECK_EQ(g_cust_ok, 1);
+        IM_CHECK_NE(g_cust_bed, 0u);
+        switch_scene(SCENE_BED);
+        int playing = 0;
+        for (int tries = 0; tries < 60 && !playing; ++tries) { ctx->Yield(4); playing = bwa_bed_is_playing(e, g_bed); }
+        IM_CHECK(playing);
+        m = 0.0f;
+        for (int tries = 0; tries < 60 && m <= 1e-6f; ++tries) { ctx->Yield(4); m = meters_max(&n); }
+        IM_CHECK_GT(m, 1e-4f);                           /* the LOADED field reaches the bus */
+        switch_scene(0);
+        bwa_unload_sound(e, g_cust_mono); g_cust_mono = 0; g_cust_mono_path[0] = 0;   /* leave no trace */
+        bwa_unload_sound(e, g_cust_bed);  g_cust_bed  = 0; g_cust_bed_path[0]  = 0;
+        g_cust_status[0] = 0;
+        remove(CM); remove(CB);
+    };
+
     t = IM_REGISTER_TEST(te, "viewer", "abx_flow");  /* the blind test scores through the panel buttons */
     t->TestFunc = [](ImGuiTestContext* ctx) {
         switch_scene(4);
@@ -1457,6 +1628,14 @@ int main(int argc, char** argv) {
         g_ms = !io.WantCaptureMouse;                /* the panel owns the mouse when hovered */
         if (WindowShouldClose() || kp(KEY_ESCAPE)) quit_now = 1;
         if (kp(KEY_F11)) ToggleBorderlessWindowed();
+        if (IsFileDropped()) {                    /* audition a dropped wav/flac/mp3/amb (load_custom_auto) */
+            FilePathList drops = LoadDroppedFiles();
+            if (drops.count > 0) {
+                snprintf(g_cust_path, sizeof g_cust_path, "%s", drops.paths[0]);
+                load_custom_auto(drops.paths[0]);
+            }
+            UnloadDroppedFiles(drops);
+        }
         float mv = 2.5f * dt, rt = 1.8f * dt;
 
         /* ---- global navigation (every scene) ---- */
