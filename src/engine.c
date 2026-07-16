@@ -631,6 +631,7 @@ void bwa_set_max_re(bwa_engine* e, bool on) {
     rt_set_max_re(e->rt, e->max_re);
     if (e->fdn) fdn_set_max_re(e->fdn, e->max_re);   /* live: the FDN crossfades its render pair */
 }
+void bwa_set_max_re_split(bwa_engine* e, bool on)     { if (e) rt_set_max_re_split(e->rt, on); }
 void bwa_set_spread_mode(bwa_engine* e, bwa_spread_mode mode) { if (e) rt_set_spread_mode(e->rt, (int)mode); }
 void bwa_set_tracked_room_eq(bwa_engine* e, bool on)  { if (e) rt_set_room_eq_dyn(e->rt, on); }
 void bwa_set_decorrelation(bwa_engine* e, bool on)    { if (e) rt_set_decorrelation(e->rt, on); }
@@ -1035,6 +1036,10 @@ void bwa_source_set_air_absorption(bwa_engine* e, bwa_source s, bool on) {
 
 void bwa_source_set_spread(bwa_engine* e, bwa_source s, float amount) {
     if (e) rt_source_set_spread(e->rt, s, amount);
+}
+
+void bwa_source_set_extent(bwa_engine* e, bwa_source s, float width, float height) {
+    if (e) rt_source_set_extent(e->rt, s, width, height);
 }
 
 void bwa_source_set_orientation(bwa_engine* e, bwa_source s, float qx, float qy, float qz, float qw) {

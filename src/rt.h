@@ -61,7 +61,9 @@ typedef struct {
         struct { uint8_t on; }                         refl;
         struct { uint8_t on; }                         dop;   /* per-voice Doppler enable */
         struct { uint8_t on; }                         air;   /* per-voice air absorption enable */
-        struct { float amount; }                       spread;/* per-voice source angular width 0..1 */
+        struct { float amount, height; }               spread;/* per-voice source angular width 0..1; height
+                                                                * < 0 = isotropic, else the vertical extent
+                                                                * (rt_source_set_extent, BS.2127-style w/h) */
         struct { float gain; }                         rsend; /* per-voice reverb wet-send level */
         struct { uint8_t on; }                         rdist; /* per-voice distance->wet scaling enable */
         struct { uint8_t on; }                         path;  /* per-voice pathing enable */
@@ -96,6 +98,7 @@ void    rt_set_bed_decoder(RtCore* c, int decoder);  /* 0 = sampling (SAD), 1 = 
 void    rt_set_dual_band(RtCore* c, int on);         /* dual-band panning (amplitude LF / power HF); live A/B */
 void    rt_set_spread_mode(RtCore* c, int mode);     /* spread render: 0 = lobe, 1 = MDAP ring, 2 = spectral; live A/B */
 void    rt_set_max_re(RtCore* c, int on);            /* max-rE bed-decode weighting (matrix paths + FDN); live A/B */
+void    rt_set_max_re_split(RtCore* c, int on);      /* band-split max-rE: taper only > ~700 Hz (rV decode below); live A/B */
 void    rt_set_room_eq_dyn(RtCore* c, int on);       /* tracked room EQ (room_eq_grid layouts): default on; live A/B */
 void    rt_set_decorrelation(RtCore* c, int on);     /* velvet-noise wide-part decorrelation; live A/B */
 void    rt_set_bed_renderer(RtCore* c, int parametric);   /* bed: 0 = matrix decode, 1 = parametric (DirAC); live A/B */
@@ -199,6 +202,7 @@ void rt_source_set_doppler(RtCore* c, uint32_t h, bool on);          /* propagat
 void rt_source_set_air_absorption(RtCore* c, uint32_t h, bool on);   /* propagation: distance-driven HF low-pass */
 void rt_source_set_loudness_comp(RtCore* c, uint32_t h, bool on);    /* equal-loudness LF shelf vs attenuation */
 void rt_source_set_spread(RtCore* c, uint32_t h, float amount);      /* source angular width: 0 = point .. 1 = wide */
+void rt_source_set_extent(RtCore* c, uint32_t h, float w, float hgt);/* anisotropic width/height extent (room-referenced) */
 void rt_source_set_size  (RtCore* c, uint32_t h, float radius_m);    /* source METRIC size: spread from subtended angle */
 void rt_source_fade_to   (RtCore* c, uint32_t h, float gain, float seconds, bool stop_at_end);  /* timed fade */
 void rt_source_set_group (RtCore* c, uint32_t h, uint32_t group);    /* mix-group assignment (0 = default) */

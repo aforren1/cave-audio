@@ -138,6 +138,10 @@ typedef struct {
                                               * a fixed-up frame flips ~180° in one solve at the |d.y| = 0.9
                                               * branch, teleporting the spectral bands' directions. */
     float    spread;                         /* source angular width 0..1 (0 = point); blends the pan gains */
+    float    spread_h;                       /* vertical extent (rt_source_set_extent): < 0 = isotropic (follow
+                                              * spread); else the height 0..1 — BS.2127-style anisotropic w/h */
+    float    ext_u, ext_w;                   /* this solve's horizontal/vertical extent RATIOS (max of the two
+                                              * is exactly 1; both 1 = isotropic). Audio-thread, set per solve. */
     float    size_m;                         /* source METRIC radius (m; 0 = point): floors the spread at the
                                               * angle the radius subtends from the listener, so physical size
                                               * stays constant as the listener walks */
@@ -178,6 +182,11 @@ typedef struct {
     float    rot_m[BWA_SH_ROT_N];
     /* max-rE bed-decode weighting (rt_set_max_re): ramps 0<->1 so the A/B crossfades (like dual_mix). */
     float    re_mix;
+    /* band-split max-rE (rt_set_max_re_split): re_sm ramps the split share 0<->1 (broadband <-> taper
+     * only above the 700 Hz crossover — the rV-optimal plain decode keeps the low band); re_lp is the
+     * split's per-SH-channel one-pole LP state (xover_a). Both wiped while the taper is disengaged. */
+    float    re_sm;
+    float    re_lp[BWA_AMBI_CH];
     /* image-source early reflections (CMD_SET_ISM). Per image: a gliding fractional read into this
      * voice's ism_ring slice, a one-pole HF damping state (walls absorb HF harder), and a ramped
      * 26-gain vector from the panner solved AT THE IMAGE POSITION (so reflections are directional
@@ -359,6 +368,10 @@ struct RtCore {
      * its re-panned direct stream see the raw field (max-rE is a decode-side taper, not a field
      * property). The FDN carries its own weighted render pair (fdn.c); phonon's decodes are its own. */
     _Atomic int max_re;
+    _Atomic int max_re_split;/* band-split max-rE (rt_set_max_re_split): taper only above ~700 Hz (the
+                              * dual-band crossover), the rV-optimal unweighted decode below — the
+                              * literature-standard Gerzon split. Only meaningful with max_re on; the
+                              * FDN stays broadband (a diffuse tail has no LF image to sharpen). */
     float     re_w[3][BWA_AMBI_CH];   /* [content order - 1][ACN] */
     ParaBed*  para;          /* voice_cap entries */
     float     para_xa[3];    /* band-splitter one-pole coeffs (BWA_PARA_XOVER at the engine rate) */
@@ -635,6 +648,7 @@ static void drain_commands(RtCore* c) {
             v->gen = BWA_H_GEN(cmd->handle);
             v->active = true; v->gain_user = 1.f; v->dirty = true;
             v->occ_cur = 1.f;                       /* clear (un-occluded) by default */
+            v->spread_h = -1.f;                     /* isotropic until rt_source_set_extent */
             v->dir_cur = 1.f;                       /* on-axis/omni by default */
             v->air_a_cur = 1.f;                     /* air low-pass passthrough by default */
             v->ldc_g_cur = 1.f;                     /* loudness-comp shelf flat by default */
@@ -777,7 +791,10 @@ static void drain_commands(RtCore* c) {
             memcpy(c->lis.ex_pending, cmd->u.exlis.p, sizeof c->lis.ex_pending);
             break;
         case CMD_SET_SPREAD: { Voice* v = voice_for(c, cmd->handle);
-            if (v) { float a = cmd->u.spread.amount; v->spread = a < 0.f ? 0.f : (a > 1.f ? 1.f : a); v->dirty = true; } } break;
+            if (v) { float a = cmd->u.spread.amount, hh = cmd->u.spread.height;
+                     v->spread   = a < 0.f ? 0.f : (a > 1.f ? 1.f : a);
+                     v->spread_h = hh < 0.f ? -1.f : (hh > 1.f ? 1.f : hh);   /* < 0 = isotropic */
+                     v->dirty = true; } } break;
         case CMD_SET_SIZE: { Voice* v = voice_for(c, cmd->handle);
             if (v) { float rad = cmd->u.size.radius; v->size_m = rad < 0.f ? 0.f : rad; v->dirty = true; } } break;
         case CMD_TEST_SIGNAL: {
@@ -882,6 +899,34 @@ static void build_bed_decode(RtCore* c) {
     c->bed_pref = (float)sqrt(psum / (c->channels ? c->channels : 1));
 }
 
+/* Up-anchored tangent frame for ANISOTROPIC extent: u = the horizontal tangent, w = the
+ * vertical-ish one. Width/height are room-referenced, so the orientation-free transported frame
+ * (spread_frame below) cannot carry them — this keeps the pole branch the transported frame exists
+ * to avoid, because an anisotropic extent straight overhead is inherently ill-defined (BS.2127's
+ * polar extent has the same singularity); the snap is accepted for anisotropic sources there. */
+static void up_frame(const float d[3], float u[3], float w[3]) {
+    float up[3] = { 0.f, 1.f, 0.f };
+    if (d[1] > 0.9f || d[1] < -0.9f) { up[0] = 1.f; up[1] = 0.f; }
+    u[0] = up[1]*d[2]-up[2]*d[1]; u[1] = up[2]*d[0]-up[0]*d[2]; u[2] = up[0]*d[1]-up[1]*d[0];
+    float ul = sqrtf(u[0]*u[0] + u[1]*u[1] + u[2]*u[2]);
+    u[0]/=ul; u[1]/=ul; u[2]/=ul;
+    w[0] = d[1]*u[2]-d[2]*u[1]; w[1] = d[2]*u[0]-d[0]*u[2]; w[2] = d[0]*u[1]-d[1]*u[0];
+}
+
+/* Polar radius of the extent ellipse at tangent azimuth (cp toward u, sp toward w): r(0°) = eu
+ * (the width ratio), r(90°) = ew (the height ratio) — used by the LOBE mode to stretch a speaker's
+ * angle from the source direction. The ratios come from compute_gains (max of the two is exactly
+ * 1); flooring them keeps a zero extent well-defined (the raw polar form's numerator eu·ew would
+ * kill the on-axis limit too — a 1×0 extent must keep its width, not collapse to a point). The
+ * ring modes use the affine tangent squash instead (see mdap_gains). */
+static float ext_scale(float eu, float ew, float cp, float sp) {
+    if (eu < 1e-3f) eu = 1e-3f;
+    if (ew < 1e-3f) ew = 1e-3f;
+    float a = ew * cp, b = eu * sp;
+    float dn = sqrtf(a * a + b * b);
+    return dn > 1e-9f ? eu * ew / dn : 1.f;
+}
+
 /* Source spread/size: blend the panner's point gains toward a width-controlled lobe centred on the
  * source direction (from the listener), then renormalise constant-power. spread 0 = the point gains;
  * 1 = a wide lobe. Panner-agnostic; runs only in the per-block gain solve (not the sample loop). */
@@ -895,12 +940,27 @@ static void spread_gains(RtCore* c, const Voice* v, float spread, float* g) {
     if (P < 1e-9f) return;
     float s = spread; if (s > 1.f) s = 1.f;
     float q = 1.5f + (1.f - s) * 6.f;                    /* lobe exponent: wide at s=1, tight as s->0 */
+    const int aniso = v->ext_u != 1.f || v->ext_w != 1.f;
+    float au[3], aw[3];
+    if (aniso) up_frame(d, au, aw);                      /* room-referenced width/height (see up_frame) */
     float lobe[BWA_CHANNELS]; double ln = 0.0;
     for (uint32_t k = 0; k < c->channels; ++k) {
         const float* sp = c->layout.speakers[k].pos;
         float sd[3] = { sp[0]-c->lis.p_active[0], sp[1]-c->lis.p_active[1], sp[2]-c->lis.p_active[2] };
         float sl = sqrtf(sd[0]*sd[0] + sd[1]*sd[1] + sd[2]*sd[2]);
         float dot = sl > 1e-6f ? (sd[0]*d[0] + sd[1]*d[1] + sd[2]*d[2]) / sl : 0.f;
+        if (aniso && sl > 1e-6f && dot < 0.99999f) {
+            /* elliptical lobe: stretch the angle to the speaker by the extent ellipse's inverse
+             * polar radius at its tangent azimuth — narrower along the smaller extent */
+            float su  = (sd[0]*au[0] + sd[1]*au[1] + sd[2]*au[2]) / sl;
+            float sw2 = (sd[0]*aw[0] + sd[1]*aw[1] + sd[2]*aw[2]) / sl;
+            float t = sqrtf(su*su + sw2*sw2);
+            if (t > 1e-6f) {
+                float cl = dot < -1.f ? -1.f : dot;
+                float th = acosf(cl) / ext_scale(v->ext_u, v->ext_w, su / t, sw2 / t);
+                dot = (th >= 3.14159265f) ? -1.f : cosf(th);
+            }
+        }
         float w = 0.5f * (1.f + dot); if (w < 0.f) w = 0.f;   /* [0,1], 1 toward the source */
         lobe[k] = powf(w, q);
         ln += (double)lobe[k] * lobe[k];
@@ -972,8 +1032,10 @@ static void mdap_gains(RtCore* c, int p, Voice* v, float spread, float user_gain
     double p0 = 0.0; for (uint32_t k = 0; k < c->channels; ++k) p0 += (double)g[k]*g[k];
     float P = (float)sqrt(p0);                           /* preserve the panner's own power (never re-level) */
     if (P < 1e-9f) return;
+    const int aniso = v->ext_u != 1.f || v->ext_w != 1.f;
     float u[3], w[3];
-    spread_frame(v, d, u, w);                            /* transported frame: no pole snap */
+    if (aniso) up_frame(d, u, w);                        /* room-referenced width/height (see up_frame) */
+    else       spread_frame(v, d, u, w);                 /* transported frame: no pole snap */
     float s = spread; if (s > 1.f) s = 1.f;
     float acc[BWA_CHANNELS], gd[BWA_CHANNELS];
     for (uint32_t k = 0; k < c->channels; ++k) acc[k] = g[k];   /* the point solve is the ring centre */
@@ -982,14 +1044,24 @@ static void mdap_gains(RtCore* c, int p, Voice* v, float spread, float user_gain
     static const float ring_a[2]   = { 1.f, 0.5f };
     static const float ring_off[2] = { 0.f, 0.7853982f };      /* half-ring offset: pi/4 */
     for (int r = 0; r < 2; ++r) {
-        float a = s * 1.5707963f * ring_a[r];                  /* cone half-angle: spread 1 = 90° */
-        float ca = cosf(a), sa = sinf(a);
+        const float a = s * 1.5707963f * ring_a[r];            /* cone half-angle: spread 1 = 90° */
+        const float ca = cosf(a), sa = sinf(a);
         for (int i = 0; i < ring_n[r]; ++i) {
             float phi = ring_off[r] + 6.2831853f * (float)i / (float)ring_n[r];
             float cp = cosf(phi), sp = sinf(phi);
             float pos[3];
-            for (int k = 0; k < 3; ++k)
-                pos[k] = c->lis.p_active[k] + dl * (ca * d[k] + sa * (cp * u[k] + sp * w[k]));
+            if (aniso) {
+                /* affine tangent squash: scale the ring offset per axis and renormalise — a 1×0
+                 * extent becomes a sampled horizontal ARC (the polar-ellipse form would collapse
+                 * every off-axis point to the centre), matching BS.2127's squashed-cap weighting */
+                const float ou = sa * cp * v->ext_u, ow = sa * sp * v->ext_w;
+                const float inv = 1.f / sqrtf(ca * ca + ou * ou + ow * ow);
+                for (int k = 0; k < 3; ++k)
+                    pos[k] = c->lis.p_active[k] + dl * ((ca * d[k] + ou * u[k] + ow * w[k]) * inv);
+            } else {
+                for (int k = 0; k < 3; ++k)
+                    pos[k] = c->lis.p_active[k] + dl * (ca * d[k] + sa * (cp * u[k] + sp * w[k]));
+            }
             panner_gains(c, p, pos, user_gain, gd);
             for (uint32_t k = 0; k < c->channels; ++k) acc[k] += gd[k];
         }
@@ -1018,8 +1090,10 @@ static void fs_solve(RtCore* c, Voice* v, int p, float spread, float ug) {
     double p0 = 0.0; for (uint32_t k = 0; k < c->channels; ++k) p0 += (double)v->gtarget[k]*v->gtarget[k];
     const float P = (float)sqrt(p0);                     /* the point solve's power (never re-level) */
     if (P < 1e-9f) return;
+    const int aniso = v->ext_u != 1.f || v->ext_w != 1.f;
     float u[3], w[3];
-    spread_frame(v, d, u, w);                            /* transported frame, shared with MDAP */
+    if (aniso) up_frame(d, u, w);                        /* room-referenced width/height (see up_frame) */
+    else       spread_frame(v, d, u, w);                 /* transported frame, shared with MDAP */
     if (!v->fs_on) {                                     /* engage seamlessly: bands start at the live
                                                           * gains; the splitter (and the idled dual-band
                                                           * crossover) restart clean */
@@ -1036,11 +1110,19 @@ static void fs_solve(RtCore* c, Voice* v, int p, float spread, float ug) {
         if (b == 0) {
             for (uint32_t k = 0; k < c->channels; ++k) t[k] = v->gtarget[k];
         } else {
+            const float cp = cosf(fs_az[b]), sp = sinf(fs_az[b]);
             const float a = spread * 1.5707963f * fs_ca[b];              /* cone half-angle: spread 1 = 90 deg */
-            const float ca = cosf(a), sa = sinf(a), cp = cosf(fs_az[b]), sp = sinf(fs_az[b]);
+            const float ca = cosf(a), sa = sinf(a);
             float pos[3];
-            for (int k = 0; k < 3; ++k)
-                pos[k] = c->lis.p_active[k] + dl * (ca * d[k] + sa * (cp * u[k] + sp * w[k]));
+            if (aniso) {                                                 /* affine band scatter (as mdap_gains) */
+                const float ou = sa * cp * v->ext_u, ow = sa * sp * v->ext_w;
+                const float inv = 1.f / sqrtf(ca * ca + ou * ou + ow * ow);
+                for (int k = 0; k < 3; ++k)
+                    pos[k] = c->lis.p_active[k] + dl * ((ca * d[k] + ou * u[k] + ow * w[k]) * inv);
+            } else {
+                for (int k = 0; k < 3; ++k)
+                    pos[k] = c->lis.p_active[k] + dl * (ca * d[k] + sa * (cp * u[k] + sp * w[k]));
+            }
             panner_gains(c, p, pos, ug, t);
             double bn = 0.0; for (uint32_t k = 0; k < c->channels; ++k) bn += (double)t[k]*t[k];
             if (bn > 1e-12) { const float sc = (float)(P / sqrt(bn));
@@ -1107,24 +1189,35 @@ static void compute_gains(RtCore* c, Voice* v) {
      * radius subtends from the listener — physical size stays constant as the listener walks, and a
      * source that engulfs the listener goes fully wide) and by the engine-wide NEAR-LISTENER widening
      * policy (rt_set_near_spread; a per-source size subsumes it for sized sources). The decor split
-     * follows spread_eff, so the widened part decorrelates too when enabled. */
-    float s_eff = v->spread; if (s_eff > 1.f) s_eff = 1.f; else if (s_eff < 0.f) s_eff = 0.f;
+     * follows spread_eff, so the widened part decorrelates too when enabled. An anisotropic extent
+     * (rt_source_set_extent) carries a separate height: the physical floors apply to BOTH axes
+     * (size/near-widening are isotropic), the LARGER axis drives the mode gate + decor split, and
+     * the ratios reach the ring/lobe solves as v->ext_u/ext_w. */
+    float s_w = v->spread; if (s_w > 1.f) s_w = 1.f; else if (s_w < 0.f) s_w = 0.f;
+    float s_h = v->spread_h; if (s_h > 1.f) s_h = 1.f;      /* < 0 = isotropic (follow the width) */
     const float nearR = atomic_load_explicit(&c->near_spread, memory_order_relaxed);
     if (v->size_m > 0.f || nearR > 0.f) {
         float dx = v->pos_active[0]-c->lis.p_active[0], dy = v->pos_active[1]-c->lis.p_active[1],
               dz = v->pos_active[2]-c->lis.p_active[2];
         float dist = sqrtf(dx*dx + dy*dy + dz*dz);
+        float s_floor = 0.f;
         if (v->size_m > 0.f) {
             float ratio  = dist > 1e-6f ? v->size_m / dist : 2.f;
             float s_size = ratio >= 1.f ? 1.f : asinf(ratio) * 0.636619772f;   /* subtended half-angle / (pi/2) */
-            if (s_size > s_eff) s_eff = s_size;
+            if (s_size > s_floor) s_floor = s_size;
         }
         if (nearR > 0.f) {
             float s_near = 1.f - dist / nearR;
-            if (s_near > s_eff) s_eff = s_near > 1.f ? 1.f : s_near;
+            if (s_near > 1.f) s_near = 1.f;
+            if (s_near > s_floor) s_floor = s_near;
         }
+        if (s_floor > s_w) s_w = s_floor;
+        if (s_h >= 0.f && s_floor > s_h) s_h = s_floor;
     }
+    float s_eff = (s_h > s_w) ? s_h : s_w;
     v->spread_eff = s_eff;
+    v->ext_u = (s_eff > 1e-6f) ? s_w / s_eff : 1.f;         /* == 1 exactly when isotropic (s_w == s_eff) */
+    v->ext_w = (s_eff > 1e-6f && s_h >= 0.f) ? s_h / s_eff : v->ext_u;
     const int smode = (s_eff > 1e-3f)                        /* widen the image if this source has size */
                     ? atomic_load_explicit(&c->spread_mode, memory_order_acquire) : -1;
     if      (smode == 2) fs_solve(c, v, p, s_eff, ug);       /* spectral: per-band targets; gtarget stays the point */
@@ -1748,6 +1841,18 @@ static void mix_bed(RtCore* c, Voice* v, uint16_t idx, float* bus, uint32_t n, u
     const int   use_re   = re_on || v->re_mix > 0.f;
     float       rem      = v->re_mix;
     const float rem_step = (re_tgt - rem) / (float)nr;
+    /* band-split share (rt_set_max_re_split): 1 = taper only the band ABOVE the 700 Hz crossover
+     * (sh - sm*lo), 0 = broadband (the current incumbent). Ramps like re_mix so the toggle is
+     * click-free; the splitter state wipes while the taper is disengaged (re-engage is clean, and
+     * the rem ramp from 0 masks the one-pole's ~1.4 ms settle anyway). */
+    const float sm_tgt   = (re_on && atomic_load_explicit(&c->max_re_split, memory_order_acquire)) ? 1.f : 0.f;
+    float       resm     = v->re_sm;
+    const float sm_step  = (sm_tgt - resm) / (float)nr;
+    const float re_xa    = c->xover_a;
+    if (!use_re) {
+        v->re_sm = 0.f;
+        memset(v->re_lp, 0, sizeof v->re_lp);
+    }
     const float* rw = c->re_w[(snd->order >= 1 && snd->order <= 3) ? snd->order - 1 : 2];
     uint32_t cur = v->cursor;
     bool ended = false;
@@ -1771,8 +1876,11 @@ static void mix_bed(RtCore* c, Voice* v, uint16_t idx, float* bus, uint32_t n, u
                     for (int j = 0; j < rot_n; ++j) v->rot_m[j] += rot_step[j];
                 }
                 float shw[BWA_AMBI_CH];
-                if (use_re) {                      /* max-rE taper, crossfaded by rem */
-                    for (int k = 0; k < nch; ++k) shw[k] = sh[k] * (1.f + rem * (rw[k] - 1.f));
+                if (use_re) {                      /* max-rE taper, crossfaded by rem; resm splits the band */
+                    for (int k = 0; k < nch; ++k) {
+                        const float lo = (v->re_lp[k] += re_xa * (sh[k] - v->re_lp[k]));
+                        shw[k] = sh[k] + rem * (rw[k] - 1.f) * (sh[k] - resm * lo);
+                    }
                     sh = shw;
                 }
                 const float g = v->gcur[0] * pg;   /* master gain x the pause/seek gate */
@@ -1787,6 +1895,7 @@ static void mix_bed(RtCore* c, Voice* v, uint16_t idx, float* bus, uint32_t n, u
             pg += pg_step;
             v->gcur[0] += g_step;
             rem += rem_step;
+            resm += sm_step;
         }
     } else {
         /* block-rate parameter update from the SMOOTHED analysis state (last blocks' field): per band
@@ -1852,7 +1961,10 @@ static void mix_bed(RtCore* c, Voice* v, uint16_t idx, float* bus, uint32_t n, u
                     float shw[BWA_AMBI_CH];
                     const float* shd = sh;
                     if (use_re) {                      /* max-rE taper on the MATRIX share only */
-                        for (int k = 0; k < nch; ++k) shw[k] = sh[k] * (1.f + rem * (rw[k] - 1.f));
+                        for (int k = 0; k < nch; ++k) {
+                            const float lo = (v->re_lp[k] += re_xa * (sh[k] - v->re_lp[k]));
+                            shw[k] = sh[k] + rem * (rw[k] - 1.f) * (sh[k] - resm * lo);
+                        }
                         shd = shw;
                     }
                     for (uint32_t s = 0; s < c->channels; ++s) {
@@ -1898,6 +2010,7 @@ static void mix_bed(RtCore* c, Voice* v, uint16_t idx, float* bus, uint32_t n, u
             v->gcur[0] += g_step;
             pmix += pm_step;
             rem += rem_step;
+            resm += sm_step;
         }
         /* land the ramps exactly + fold this block's analysis into the smoothed field */
         pb->mix = pm_tgt;
@@ -1916,6 +2029,7 @@ static void mix_bed(RtCore* c, Voice* v, uint16_t idx, float* bus, uint32_t n, u
     v->cursor = cur;
     v->gcur[0] = v->gtarget[0];
     v->re_mix = re_tgt;                                            /* land the max-rE crossfade */
+    if (use_re) v->re_sm = sm_tgt;                                 /* land the split share too */
     if (rot_mode == 2) memcpy(v->rot_m, rot_end, sizeof(float) * rot_n);   /* land the live matrix */
     if (ended) {
         v->playing = false;
@@ -2572,6 +2686,19 @@ void rt_source_set_spread(RtCore* c, uint32_t h, float amount) {
     if (!isfinite(amount)) return;
     Cmd cmd = { .type = CMD_SET_SPREAD, .handle = h };
     cmd.u.spread.amount = amount;
+    cmd.u.spread.height = -1.f;                       /* scalar spread = isotropic (resets any extent) */
+    cmd_push(&c->cmds, &cmd);
+}
+
+/* Anisotropic extent (BS.2127-style width/height): the horizontal and vertical angular extents,
+ * each 0..1. Equal values behave as the isotropic spread; the room's up axis anchors which way is
+ * "width", so straight overhead the split is inherently ill-defined (BS.2127's polar extent carries
+ * the same singularity). rt_source_set_spread resets a voice to isotropic. */
+void rt_source_set_extent(RtCore* c, uint32_t h, float w, float hgt) {
+    if (!isfinite(w) || !isfinite(hgt)) return;
+    Cmd cmd = { .type = CMD_SET_SPREAD, .handle = h };
+    cmd.u.spread.amount = w;
+    cmd.u.spread.height = hgt < 0.f ? 0.f : hgt;      /* an explicit extent is never "unset" */
     cmd_push(&c->cmds, &cmd);
 }
 
@@ -2955,6 +3082,15 @@ void rt_set_spread_mode(RtCore* c, int mode) {
 void rt_set_max_re(RtCore* c, int on) {
     if (!c) return;
     atomic_store_explicit(&c->max_re, on ? 1 : 0, memory_order_release);
+}
+
+/* Band-split max-rE: with max_re on, taper only above the 700 Hz crossover and keep the rV-optimal
+ * unweighted decode below (the literature-standard Gerzon basic-LF/max-rE-HF split; the broadband
+ * taper is the incumbent A/B side). The split share ramps per bed voice (re_sm), so the toggle is
+ * click-free. No effect while max_re is off; the FDN's render stays broadband either way. */
+void rt_set_max_re_split(RtCore* c, int on) {
+    if (!c) return;
+    atomic_store_explicit(&c->max_re_split, on ? 1 : 0, memory_order_release);
 }
 
 /* Tracked room EQ (layouts with a room_eq_grid): default ON; off slews every section to flat, so

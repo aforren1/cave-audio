@@ -302,7 +302,20 @@ where the engine's own SH→speaker decode renders a bed's signal — `mix_bed`'
 and lengthening the energy vector (better off-centre localization, THE walking-listener case);
 point-source panners and phonon's own decodes untouched (the `ambi`/`dsp`/`rt`/`fdn` tests pin the
 weights, the rE lengthening through AllRAD, the rear-sidelobe shrink + level fairness, and the FDN
-pair). **FuMa loading** (`bwa_load_fuma`): legacy B-format (WXYZ order, MaxN + W −3 dB) reordered +
+pair). **Band-split max-rE** (`bwa_set_max_re_split`, off by default, live A/B, needs max_re on): the
+taper acts only above the 700 Hz crossover — the unweighted rV-optimal decode keeps the low band (the
+literature-standard Gerzon basic-LF/max-rE-HF split; per-bed one-pole splitter `re_lp` + ramped split
+share `re_sm` in `mix_bed`, so both toggles crossfade); bed matrix decodes only, the FDN stays
+broadband (a diffuse tail has no LF image to sharpen); the `rt` test pins LF-stays-raw/HF-matches-
+broadband with tones either side of the crossover. **Anisotropic source extent**
+(`bwa_source_set_extent`, BS.2127-style width/height 0..1 each): the ring modes squash their
+virtual-source cap per axis (affine tangent scaling — a 1×0 extent renders as a horizontal ARC of
+panner solves, never a collapse), the lobe stretches its falloff on the extent ellipse (`ext_scale`,
+ratios floored so zero extents stay well-defined); room-referenced, so anisotropic sources use the
+up-anchored frame (accepting its pole ambiguity — BS.2127's own singularity) instead of the
+transported one; equal extents are bit-exactly the isotropic spread (`bwa_source_set_spread` resets
+to isotropic; the size/near floors apply to both axes); the `rt` test pins vertical-spill contrast
+in lobe + MDAP modes and the iso-equality. **FuMa loading** (`bwa_load_fuma`): legacy B-format (WXYZ order, MaxN + W −3 dB) reordered +
 rescaled to AmbiX at load (`sound.c`, phonon-matching published factors; the `sound` test pins the
 conversion against the SN3D encode), so downstream a FuMa bed IS an AmbiX bed. **Runtime channel count**: `BWA_CHANNELS` (26, sink.h) is now the CAPACITY only — the
 ACTIVE count is the layout's speaker count (4..26; loader accepts N speakers whose indices form a

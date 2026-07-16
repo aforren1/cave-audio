@@ -441,6 +441,13 @@ BWA_API void     bwa_source_set_loudness_comp(bwa_engine* e, bwa_source s, bool 
  * source's energy across the speakers around its direction (a waterfall/crowd/ambience that shouldn't
  * collapse to one point), centred on its direction and constant-power. Works with any panner. */
 BWA_API void     bwa_source_set_spread(bwa_engine* e, bwa_source s, float amount);
+/* Anisotropic extent (BS.2127-style width/height): separate HORIZONTAL and VERTICAL angular extents,
+ * each 0..1 — a shoreline is wide but not tall, rain is tall but not wide. Equal values behave as the
+ * isotropic spread; bwa_source_set_spread resets to isotropic (last call wins). Width/height are
+ * room-referenced (anchored to the room's up axis), so straight overhead the split is inherently
+ * ill-defined — BS.2127's polar extent shares the singularity. Rides the selected spread mode, the
+ * size/near-widening floors (they floor BOTH axes), and decorrelation; constant-power like spread. */
+BWA_API void     bwa_source_set_extent(bwa_engine* e, bwa_source s, float width, float height);
 /* Source size in METERS (radius; 0 = point, the default) — the physical alternative to the angular
  * spread above. The rendered width is the angle the radius subtends from the tracked listener, so a
  * 2 m waterfall STAYS 2 m wide as the listener walks (an angular spread changes physical size with
@@ -531,6 +538,13 @@ BWA_API void     bwa_set_dual_band(bwa_engine* e, bool on);
  * renderer), the FDN reverb's line render. Point-source panning (DBAP/SPCAP/VBAP) and phonon's own
  * decodes are untouched. Bake the winner after the hardware bake-off. */
 BWA_API void     bwa_set_max_re(bwa_engine* e, bool on);
+/* Band-split max-rE (off by default; live A/B, crossfaded; only meaningful with bwa_set_max_re on):
+ * apply the taper only ABOVE the ~700 Hz crossover and keep the unweighted (rV-optimal) decode below —
+ * the ear localizes LF by summed pressure, where the plain decode maximizes |rV|, and HF by energy,
+ * where max-rE wins. The literature-standard Gerzon basic-LF/max-rE-HF split (the broadband taper is
+ * the incumbent A/B side). Bed matrix decodes only; the FDN's render stays broadband (a diffuse tail
+ * has no LF image to sharpen). */
+BWA_API void     bwa_set_max_re_split(bwa_engine* e, bool on);
 /* How bwa_source_set_spread renders a source's width (live A/B; sources with spread 0 are unaffected).
  * LOBE (default) reshapes the point gains toward a width-controlled lobe — one solve, smooth,
  * approximate. MDAP (Pulkki's multiple-direction amplitude panning) pans a ring of virtual sources

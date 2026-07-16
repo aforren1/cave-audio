@@ -275,6 +275,17 @@ near-listener policy (engulfment = the `d < r` case). The larger of spread and t
 size-derived floor wins; everything downstream (lobe/MDAP, decorrelation,
 constant-power) is unchanged.
 
+**Anisotropic extent** (`bwa_source_set_extent`, width + height each 0..1) is the
+BS.2127-style refinement: a shoreline is wide but not tall, rain is tall but not
+wide. The ring modes squash their virtual-source cap per axis (affine tangent
+scaling — a 1×0 extent is a horizontal *arc* of real panner solves, never a
+collapse), the lobe stretches its falloff on the extent ellipse. Width/height are
+room-referenced, so anisotropic sources use the up-anchored frame (with its pole
+ambiguity — "width" straight overhead is undefined, same as BS.2127) instead of the
+transported one; equal extents are exactly the isotropic spread, same solve path.
+The size/near floors apply to both axes. Pinned in the `rt` test (vertical-spill
+contrast + iso-equality).
+
 ## Binaural debug path
 
 The binaural monitor is a **bus→stereo** transform. It consumes the same speaker bus

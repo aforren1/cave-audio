@@ -124,6 +124,23 @@ static int write_ambix4_noise_wav(const char* path, float w, float y, float z, f
     free(buf); drwav_uninit(&wav);
     return wrote == frames;
 }
+/* same 4-ch AmbiX plane-wave encode, but a SINE — for the band-split max-rE test, which needs
+ * content isolated to one side of the 700 Hz crossover (integer cycles per file: loops seamlessly) */
+static int write_ambix4_sine_wav(const char* path, float w, float y, float z, float x,
+                                 double freq, uint32_t frames) {
+    drwav_data_format fmt = { drwav_container_riff, DR_WAVE_FORMAT_IEEE_FLOAT, 4, RATE, 32 };
+    drwav wav;
+    if (!drwav_init_file_write(&wav, path, &fmt, NULL)) return 0;
+    float* buf = (float*)malloc((size_t)frames * 4 * sizeof(float));
+    if (!buf) { drwav_uninit(&wav); return 0; }
+    for (uint32_t i = 0; i < frames; ++i) {
+        float v = 0.5f * (float)sin(2.0 * 3.14159265358979 * freq * i / RATE);
+        buf[i*4+0] = w*v; buf[i*4+1] = y*v; buf[i*4+2] = z*v; buf[i*4+3] = x*v;
+    }
+    drwav_uint64 wrote = drwav_write_pcm_frames(&wav, frames, buf);
+    free(buf); drwav_uninit(&wav);
+    return wrote == frames;
+}
 /* render `kb` blocks, summing all 26 channels to mono per sample into out[kb*N]; the per-channel pan
  * gains are all >= 0 for one source, so the mono sum is a scaled copy of the (propagated) source. */
 static void render_capture_mono(RtCore* c, float* out, int kb) {
@@ -1171,6 +1188,130 @@ int main(void) {
         }
     }
 
+    /* band-split max-rE (bwa_set_max_re_split): with the split on, the taper acts only ABOVE the
+     * 700 Hz crossover — a LOW tone's speaker distribution stays (nearly) the raw decode's while a
+     * HIGH tone's matches the broadband taper's. Tones at 187.5 Hz / 6 kHz (integer cycles per
+     * 8-block loop; the one-pole crossover leaks ~7% LF energy into the high band, so "nearly" =
+     * much closer to raw than the broadband taper is, ratio-asserted). */
+    {
+        RtCore* cs = rt_create(8, 4, RATE, CH);
+        CHECK(cs != NULL, "rt_create (max-rE split)");
+        if (cs) {
+            const char* BLO = "bwa_rt_bed_relo.wav", *BHI = "bwa_rt_bed_rehi.wav";
+            if (write_ambix4_sine_wav(BLO, 1.f, 0.f, 0.f, 1.f, 187.5, 8 * N) &&
+                write_ambix4_sine_wav(BHI, 1.f, 0.f, 0.f, 1.f, 6000.0, 8 * N)) {
+                uint32_t slo = rt_load_ambix(cs, BLO, err, sizeof err);
+                uint32_t shi = rt_load_ambix(cs, BHI, err, sizeof err);
+                uint32_t hb  = rt_source_create(cs);
+                bwa_timestamp tsb = { 0, 0 };
+                double D[3][CH];                     /* [config][ch]: normalized loop-energy distribution */
+                #define BED_DIST(OUT) do { double t_ = 0;                                   \
+                    for (int b_ = 0; b_ < 6; ++b_) rt_render(cs, bus, N, &tsb);   /* settle */ \
+                    for (int ch_ = 0; ch_ < CH; ++ch_) (OUT)[ch_] = 0.0;                    \
+                    for (int b_ = 0; b_ < 8; ++b_) {                            /* one loop */ \
+                        rt_render(cs, bus, N, &tsb);                                        \
+                        for (int ch_ = 0; ch_ < CH; ++ch_) (OUT)[ch_] += chan_energy(ch_);  \
+                    }                                                                       \
+                    for (int ch_ = 0; ch_ < CH; ++ch_) t_ += (OUT)[ch_];                    \
+                    for (int ch_ = 0; ch_ < CH; ++ch_) (OUT)[ch_] /= (t_ > 0 ? t_ : 1.0);   \
+                } while (0)
+                #define DIST_LINF(A, B, OUT) do { double m_ = 0;                            \
+                    for (int ch_ = 0; ch_ < CH; ++ch_) { double d_ = fabs((A)[ch_] - (B)[ch_]); \
+                        if (d_ > m_) m_ = d_; } (OUT) = m_; } while (0)
+                for (int tone = 0; tone < 2; ++tone) {
+                    rt_set_max_re(cs, 0); rt_set_max_re_split(cs, 0);
+                    rt_source_play(cs, hb, tone ? shi : slo, true);
+                    rt_commit(cs);
+                    BED_DIST(D[0]);                                  /* raw decode */
+                    rt_set_max_re(cs, 1);
+                    BED_DIST(D[1]);                                  /* broadband taper */
+                    rt_set_max_re_split(cs, 1);
+                    BED_DIST(D[2]);                                  /* band-split taper */
+                    double d_bb, d_sp;
+                    DIST_LINF(D[1], D[0], d_bb);                     /* broadband vs raw */
+                    DIST_LINF(D[2], tone ? D[1] : D[0], d_sp);       /* split vs its own reference */
+                    printf("re-split %s: broadband-vs-raw %.4f  split-vs-%s %.4f\n",
+                           tone ? "hi" : "lo", d_bb, tone ? "broadband" : "raw", d_sp);
+                    if (tone) CHECK(d_sp < 0.25 * d_bb, "high tone: the split taper matches the broadband taper");
+                    else      CHECK(d_bb > 0.01 && d_sp < 0.4 * d_bb,
+                                    "low tone: the split leaves the raw (rV-optimal) decode in place");
+                }
+                #undef BED_DIST
+                #undef DIST_LINF
+                rt_set_max_re(cs, 0); rt_set_max_re_split(cs, 0);
+                rt_source_destroy(cs, hb); rt_commit(cs);
+                remove(BLO); remove(BHI);
+            } else CHECK(0, "write split-re beds");
+            rt_destroy(cs);
+        }
+    }
+
+    /* anisotropic extent (bwa_source_set_extent): a WIDE-FLAT source (width 1, height 0) keeps its
+     * energy in the horizontal band around the source — its vertical spill is well under the
+     * isotropic spread's — and a TALL-THIN one (0, 1) reverses that; equal extents ARE the isotropic
+     * spread (identical solve path). MDAP + lobe modes (spectral shares the same ellipse). */
+    {
+        RtCore* ce = rt_create(8, 4, RATE, CH);
+        CHECK(ce != NULL, "rt_create (extent)");
+        if (ce) {
+            const char* NW4 = "bwa_rt_extnoise.wav";
+            if (write_noise_wav(NW4, 8 * N)) {
+                uint32_t nf = rt_load_sound(ce, NW4, err, sizeof err);
+                uint32_t hx = rt_source_create(ce);
+                rt_source_play(ce, hx, nf, true);
+                rt_source_set_pos(ce, hx, 1.5f, 1.5f, 0.f);          /* the +x wall's centre speaker */
+                bwa_timestamp tse = { 0, 0 };
+                /* vertical spill: energy on speakers OFF the source's horizontal plane (y != 1.5) */
+                #define VSPILL(OUT) do { double v_ = 0, t_ = 0;                                \
+                    for (int b_ = 0; b_ < 4; ++b_) rt_render(ce, bus, N, &tse);   /* settle */  \
+                    for (int b_ = 0; b_ < 8; ++b_) {                              /* one loop */ \
+                        rt_render(ce, bus, N, &tse);                                           \
+                        for (int ch_ = 0; ch_ < CH; ++ch_) { double e_ = chan_energy(ch_);     \
+                            t_ += e_; if (fabs(LD.speakers[ch_].pos[1] - 1.5f) > 0.1f) v_ += e_; } \
+                    }                                                                          \
+                    (OUT) = t_ > 0 ? v_ / t_ : 0.0; } while (0)
+                for (int mode = 0; mode <= 1; ++mode) {              /* lobe, MDAP */
+                    rt_set_spread_mode(ce, mode);
+                    double sp_iso, sp_flat, sp_tall;
+                    rt_source_set_spread(ce, hx, 1.f);   rt_commit(ce); VSPILL(sp_iso);
+                    rt_source_set_extent(ce, hx, 1.f, 0.f); rt_commit(ce); VSPILL(sp_flat);
+                    rt_source_set_extent(ce, hx, 0.f, 1.f); rt_commit(ce); VSPILL(sp_tall);
+                    printf("extent mode %d: vspill iso %.3f flat %.3f tall %.3f\n",
+                           mode, sp_iso, sp_flat, sp_tall);
+                    CHECK(sp_flat < 0.6 * sp_iso, "wide-flat extent keeps energy near the horizontal plane");
+                    CHECK(sp_tall > sp_iso * 0.9, "tall-thin extent keeps (or grows) the vertical share");
+                }
+                /* equal extents = the isotropic spread, same solve path (bit-exact distributions) */
+                {
+                    rt_set_spread_mode(ce, 1);
+                    double da[CH], db[CH];
+                    rt_source_set_spread(ce, hx, 0.7f); rt_commit(ce);
+                    { double t_ = 0; for (int b_ = 0; b_ < 4; ++b_) rt_render(ce, bus, N, &tse);
+                      for (int ch_ = 0; ch_ < CH; ++ch_) da[ch_] = 0.0;
+                      for (int b_ = 0; b_ < 8; ++b_) { rt_render(ce, bus, N, &tse);
+                          for (int ch_ = 0; ch_ < CH; ++ch_) da[ch_] += chan_energy(ch_); }
+                      for (int ch_ = 0; ch_ < CH; ++ch_) t_ += da[ch_];
+                      for (int ch_ = 0; ch_ < CH; ++ch_) da[ch_] /= (t_ > 0 ? t_ : 1.0); }
+                    rt_source_set_extent(ce, hx, 0.7f, 0.7f); rt_commit(ce);
+                    { double t_ = 0; for (int b_ = 0; b_ < 4; ++b_) rt_render(ce, bus, N, &tse);
+                      for (int ch_ = 0; ch_ < CH; ++ch_) db[ch_] = 0.0;
+                      for (int b_ = 0; b_ < 8; ++b_) { rt_render(ce, bus, N, &tse);
+                          for (int ch_ = 0; ch_ < CH; ++ch_) db[ch_] += chan_energy(ch_); }
+                      for (int ch_ = 0; ch_ < CH; ++ch_) t_ += db[ch_];
+                      for (int ch_ = 0; ch_ < CH; ++ch_) db[ch_] /= (t_ > 0 ? t_ : 1.0); }
+                    double dmax = 0;
+                    for (int ch_ = 0; ch_ < CH; ++ch_) { double d_ = fabs(da[ch_] - db[ch_]); if (d_ > dmax) dmax = d_; }
+                    CHECK(dmax < 1e-6, "equal extents render exactly as the isotropic spread");
+                }
+                #undef VSPILL
+                rt_set_spread_mode(ce, 0);
+                rt_source_destroy(ce, hx); rt_commit(ce);
+                remove(NW4);
+            } else CHECK(0, "write extent noise wav");
+            rt_destroy(ce);
+        }
+    }
+
     /* runtime channel count: a 24-speaker layout drives a 24-channel core end to end — point panning,
      * a bed decode, meters — and a canary proves NOTHING writes beyond the active channel count into
      * a capacity-sized buffer (the exact overrun class the BWA_CHANNELS->count migration must prevent). */
@@ -1868,6 +2009,6 @@ int main(void) {
 
     remove(WAV);
     if (fails) { printf("rt_test: %d FAILURES\n", fails); return 1; }
-    printf("rt_test OK (DBAP, commit, gen-drop, gain, occlusion, EQ, directivity, bed, reflection-tap, channel-test, air+Doppler, spread+MDAP+spectral+size, tracked-room-EQ, decorrelation, parametric-bed, pose-pred, near-spread, loudness-comp, multi-listener, master+groups+fades+global-pause, pitch, bed-rotation+orientation, max-rE, reverb-send, dual-band, voice-steal, scheduled-play, streaming, pause/seek, limiter, bus-meter verified)\n");
+    printf("rt_test OK (DBAP, commit, gen-drop, gain, occlusion, EQ, directivity, bed, reflection-tap, channel-test, air+Doppler, spread+MDAP+spectral+size+extent, tracked-room-EQ, decorrelation, parametric-bed, pose-pred, near-spread, loudness-comp, multi-listener, master+groups+fades+global-pause, pitch, bed-rotation+orientation, max-rE+split, reverb-send, dual-band, voice-steal, scheduled-play, streaming, pause/seek, limiter, bus-meter verified)\n");
     return 0;
 }

@@ -421,7 +421,8 @@ SFX overload. The decode is a static SN3D sampling decode `(2l+1)·Y_k(dir_s)/L`
 the layout.
 
 ```c
-void bwa_set_max_re(bwa_engine* e, bool on);   // off by default; live A/B (crossfaded)
+void bwa_set_max_re(bwa_engine* e, bool on);         // off by default; live A/B (crossfaded)
+void bwa_set_max_re_split(bwa_engine* e, bool on);   // off by default; live A/B; needs max_re on
 ```
 
 `bwa_set_max_re` puts **max-rE weighting** (Zotter & Frank's psychoacoustic decoder weights) on the
@@ -429,10 +430,18 @@ engine's SH→speaker decode: the higher ambisonic orders are tapered, which sup
 sidelobes and lengthens the energy vector — **better localization away from the sweet spot**,
 exactly the walking-listener case, at a slightly wider main lobe. The weights are
 diffuse-energy-normalized per content order, so A and B stay level-fair. It reaches every consumer
-of the engine's own decode — bed matrix rendering (sampling *and* AllRAD) and the FDN reverb's line
-render — but not the point-source panners (DBAP/SPCAP/VBAP pan, they don't decode) and not phonon's
-own decodes (reflection bed, pathing, the HRTF monitor). Off by default: the unweighted decode is
-the incumbent; bake the winner after the hardware bake-off.
+of the engine's own decode — bed matrix rendering (sampling / AllRAD / EPAD) and the FDN reverb's
+line render — but not the point-source panners (DBAP/SPCAP/VBAP pan, they don't decode) and not
+phonon's own decodes (reflection bed, pathing, the HRTF monitor). Off by default: the unweighted
+decode is the incumbent; bake the winner after the hardware bake-off.
+
+`bwa_set_max_re_split` is the **band-split** refinement (the literature-standard Gerzon
+basic-LF/max-rE-HF decode): with it on, the taper acts only **above a ~700 Hz crossover** — below,
+the unweighted decode stays, because the ear localizes LF by summed pressure (the velocity vector,
+which the plain decode maximizes) and HF by energy. Same 700 Hz boundary as dual-band panning; a
+per-bed one-pole splitter, crossfaded like the taper itself, so both toggles are click-free live
+A/Bs. Bed matrix decodes only — the FDN's line render stays broadband either way (a diffuse tail
+has no LF image to sharpen). Broadband vs split is a by-ear call for the rig.
 
 ```c
 typedef enum { BWA_BED_MATRIX = 0, BWA_BED_PARAMETRIC = 1 } bwa_bed_renderer;
@@ -684,6 +693,7 @@ own propagation. They do not affect ambisonic beds (world-locked, no position).
 
 ```c
 void bwa_source_set_spread(bwa_engine* e, bwa_source s, float amount);   // 0 = point (default) .. 1 = wide
+void bwa_source_set_extent(bwa_engine* e, bwa_source s, float width, float height); // anisotropic w/h
 void bwa_source_set_size  (bwa_engine* e, bwa_source s, float radius_m); // metric alternative: radius in m
 typedef enum { BWA_SPREAD_LOBE = 0, BWA_SPREAD_MDAP = 1, BWA_SPREAD_SPECTRAL = 2 } bwa_spread_mode;
 void bwa_set_spread_mode(bwa_engine* e, bwa_spread_mode mode);            // engine-wide; live A/B
@@ -693,11 +703,22 @@ Angular **width** of a source. A waterfall, a crowd, an engine room, or ambience
 collapse to a single point — raise `spread` and the source's energy fans out across the speakers
 around its direction.
 
+**`bwa_source_set_extent`** is the anisotropic form (BS.2127-style width/height): a shoreline is
+wide but not tall, rain is tall but not wide. Separate horizontal and vertical extents, each 0..1;
+equal values behave exactly as the isotropic spread, and a later `bwa_source_set_spread` resets to
+isotropic (last call wins). The ring modes squash their virtual-source cap per axis (a 1×0 extent
+renders as a horizontal *arc* of panner solves), the lobe stretches its angular falloff on the
+extent ellipse. Width/height are **room-referenced** (anchored to the room's up axis) — so straight
+overhead the split is inherently ill-defined; BS.2127's polar extent shares that singularity, and
+anisotropic sources give up the transported ring frame's pole-crossing continuity for exactly that
+reason. Rides everything spread rides: the size/near floors (they floor *both* axes, the larger
+axis drives decorrelation), constant power, per-frame-safe.
+
 Prefer **`bwa_source_set_size`** when the content has a physical size: it floors the spread at the
 angle the radius subtends from the tracked listener (`asin(r/d)`, fully wide once the listener is
 inside the source), so a 2 m waterfall *stays* 2 m wide as the listener walks — an angular spread
 changes physical size with distance. The larger of the two knobs wins, and a sized source subsumes
-`bwa_set_near_spread` (engulfment is just the `d < r` case). Both are per-frame-safe.
+`bwa_set_near_spread` (engulfment is just the `d < r` case). All three are per-frame-safe.
 
 It's implemented in the per-block gain solve, not the sample loop, and **renormalised to the
 panner's own power** — widening never changes loudness, and the perceived direction stays put.
