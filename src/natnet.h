@@ -24,7 +24,14 @@
 typedef struct NatNet NatNet;
 
 typedef struct {
-    const char* multicast;     /* group address, e.g. "239.255.42.99"; NULL/"" => unicast */
+    const char* multicast;     /* group address, e.g. "239.255.42.99". NULL/"" => a PASSIVE unicast
+                                * listen: bind the data port and take what arrives. That is NOT a
+                                * working Motive unicast client — unicast streaming requires the
+                                * NAT_CONNECT subscription + periodic NAT_KEEPALIVE pings on the
+                                * command port (see PacketClient's CommandListenThread), which this
+                                * consumer deliberately doesn't implement. Useful only for replay /
+                                * synthetic feeds; multicast is the supported transport, and
+                                * bwa_tracker_connect always passes a group (engine.c defaults it). */
     const char* server;        /* server IP, for the version handshake; NULL => skip handshake */
     const char* local_iface;   /* local NIC IP to bind/join on; NULL => INADDR_ANY */
     uint16_t    data_port;     /* NatNet data port (default 1511) */
