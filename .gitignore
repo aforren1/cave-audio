@@ -32,8 +32,11 @@ CMakeUserPresets.json
 /third_party/asiosdk/
 
 # NatNet SDK — proprietary (NaturalPoint). Used only as a wire-format reference; the
-# engine parses the stream off-wire and does NOT link it (GPLv3). Not redistributed here.
-/third_party/NatNetSDK/
+# engine parses the stream off-wire and does NOT link it. The EULA forbids redistribution
+# outright AND forbids incorporating it with GPL-licensed source (this repo is GPLv3), so
+# no drop of it may ever be committed. The glob covers every versioned copy
+# (NatNetSDK/, NatNet-4.5/, future NatNet-x.y/).
+/third_party/NatNet*/
 
 # Steam Audio prebuilt SDK — Apache-2.0 (redistributable), but the binaries are large;
 # fetch the release locally per third_party/README.md. CMake auto-detects it here.

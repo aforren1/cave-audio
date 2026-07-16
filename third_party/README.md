@@ -47,11 +47,15 @@ registered drivers and uses the first that opens with enough outputs (pin one wi
 
 NaturalPoint's NatNet SDK is **proprietary** and would conflict with GPLv3 under
 distribution, so the engine parses the documented FrameOfData wire protocol itself in
-`src/natnet.c` and **does not link the SDK**. A local copy at `third_party/NatNetSDK/`
-(gitignored, not redistributed) is useful only as a wire-format reference — the sample
+`src/natnet.c` and **does not link the SDK**. A local copy (gitignored, not redistributed)
+is useful only as a wire-format reference — the sample
 `Samples/PacketClient/PacketClient.cpp` `Unpack*` functions are the authoritative layout,
-and `include/NatNetTypes.h` has the message IDs / default ports / multicast group. Nothing
-in `third_party/NatNetSDK/` is required to build; M6 needs no vendored dependency.
+and `include/NatNetTypes.h` has the message IDs / default ports / multicast group.
+`third_party/NatNet-4.5/NatNetSDK/` is the current reference (it certifies the 4.1–4.5
+frame-suffix hop `natnet.c` uses for the server-clock pose stamps — `stamps_supported` is
+pinned to what this copy documents, so bump both together — and the 4.5 IMU/GPIO sections);
+an older copy may sit at `third_party/NatNetSDK/`. Nothing in either is required to build;
+M6 needs no vendored dependency.
 
 ## dr_libs — dr_wav / dr_flac / dr_mp3 (sound loading + streaming, M3)
 

@@ -265,7 +265,11 @@ ring (recycled slot) and snaps delays, disable ramps out over one block. Order 1
 higher orders are the FDN's job. The `ism` test pins the mirror geometry; the `rt` test pins arrival
 times against the geometric prediction (floor+ceiling pair at 546 samples), direction, and opt-out.
 **Tier-2 rendering polish** (all rt-tested): **pose prediction** (`bwa_set_pose_prediction`, off by
-default) — `pose.h` slots carry the writer's clock (`pose_write_t`; natnet stamps QPC at arrival),
+default) — `pose.h` slots carry the writer's clock (`pose_write_t`; on NatNet 4.1–4.5 natnet stamps the
+SERVER's clock from the frame suffix — mid-exposure ticks when the handshake gave the tick rate,
+fTimestamp otherwise — so the velocity dt sees no delivery jitter and survives a mid-session
+camera-rate change; outside that range — older, or NEWER than the vendored reference certifies
+(`stamps_supported`, natnet.c) — stamps QPC at arrival; one clock per connection, fixed at open),
 and `rt_render` leads the tracked position by a fixed user lead along a ~100 ms-smoothed,
 speed-capped, dropout-reset velocity from those stamps ONLY (never cross-clock vs the device time);
 **near-listener widening** (`bwa_set_near_spread`, off) — `compute_gains` floors every source's

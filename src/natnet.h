@@ -5,7 +5,10 @@
  * proprietary and would conflict with GPLv3 under distribution, so we consume the documented
  * wire protocol ourselves (see docs/build.md). A receiver thread decodes the selected rigid
  * body's pose and publishes it into a seqlock; with a tracker connected (bwa_tracker_connect) the audio thread samples
- * that slot at block time (lower latency than routing pose through the command ring).
+ * that slot at block time (lower latency than routing pose through the command ring). On
+ * NatNet 4.1+ the pose is stamped with the SERVER's clock from the frame suffix (capture-grid
+ * time — pose prediction's velocity estimate sees none of the delivery jitter); pre-4.1 falls
+ * back to QPC at arrival. One clock per connection, chosen at open (pose.h contract).
  *
  * The socket/thread path is Windows-only and on-hardware-pending (needs a live Motive server);
  * the parser (natnet_parse_frame) is pure and unit-tested against synthetic packets.
@@ -42,13 +45,26 @@ const PoseSlot* natnet_pose(const NatNet* nn);
 /* Stop the receiver thread and release the socket. Call after the audio thread is stopped. */
 void            natnet_close(NatNet* nn);
 
+/* Frame-suffix stamps, server-side clocks. NatNet 4.1..4.5 only: 4.1+ is where the size-prefixed
+ * sections make the suffix reachable without decoding skeletons/force plates/devices, and 4.5 is
+ * the newest layout the vendored reference certifies — an unknown newer bitstream refuses the
+ * hop rather than risk misreading it (see stamps_supported in natnet.c). */
+typedef struct {
+    double   timestamp;     /* fTimestamp: seconds since the server software started; < 0 = not recovered */
+    uint64_t mid_exposure;  /* CameraMidExposureTimestamp: the capture instant in server high-res
+                             * clock ticks (ServerInfo's HighResClockFrequency); 0 = not recovered */
+} NatNetStamps;
+
 /* Pure parser (no socket): extract the selected rigid body's pose from a NAT_FRAMEOFDATA
  * payload (the bytes after the 4-byte packet header). Returns true and fills pos/quat (xyzw)
  * and *tracking_valid when the rigid body is found. want_id <= 0 selects the first rigid body.
  * Fully bounds-checked against len — a malformed/truncated packet returns false, never
- * over-reads. Requires NatNet major >= 3 (earlier versions embed per-RB marker data). */
+ * over-reads. Requires NatNet major >= 3 (earlier versions embed per-RB marker data).
+ * stamps (NULL ok): filled from the frame suffix on NatNet 4.1..4.5; left "not recovered" on
+ * older/newer streams or a truncated tail — a bad tail never fails an already-good pose. */
 bool natnet_parse_frame(const uint8_t* payload, size_t len, int major, int minor,
-                        int32_t want_id, float pos[3], float quat[4], bool* tracking_valid);
+                        int32_t want_id, float pos[3], float quat[4], bool* tracking_valid,
+                        NatNetStamps* stamps);
 
 /* Pure parser (no socket): scan a NAT_MODELDEF (descriptions) payload for the rigid body named
  * want_name and return its streaming ID via *out_id. Uses the per-description size prefix to skip

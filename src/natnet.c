@@ -7,8 +7,8 @@
  *   2. the consumer — a UDP (multicast or unicast) data socket + a receiver thread that decodes
  *      each frame and publishes the pose into a seqlock. Windows/Winsock; on-hardware-pending.
  *
- * Wire format (from the documented protocol; cross-checked against the SDK's PacketClient
- * sample, which we reference but do not link):
+ * Wire format (from the documented protocol; cross-checked against the NatNet 4.5 SDK's
+ * PacketClient sample — third_party/NatNet-4.5, referenced but never linked):
  *   packet header : uint16 messageID, uint16 nDataBytes
  *   FrameOfData   : int32 frameNumber
  *                   int32 nMarkerSets    [4.1+: int32 sectionBytes] then per set: name\0, int32 nMarkers, nMarkers*3 float
@@ -16,6 +16,17 @@
  *                   int32 nRigidBodies   [4.1+: int32 sectionBytes] then per body:
  *                       int32 ID, float x,y,z, float qx,qy,qz,qw, float meanError, int16 params (bit0 = tracking valid)
  *   (markersets/other-markers are skipped; rigid bodies follow.)
+ *   After the rigid bodies, 4.1+ makes the FRAME SUFFIX reachable: every intervening section —
+ *   skeletons, assets (4.1+), labeled markers, force plates, devices, + IMU and GPIO in 4.5+ —
+ *   is `int32 count, int32 sectionBytes, data`, so the parser hops them and reads
+ *     uint32 timecode, uint32 timecodeSub,
+ *     double fTimestamp (seconds, "software timestamp"),
+ *     uint64 cameraMidExposureTimestamp (capture instant, server high-res clock ticks),
+ *     [uint64 dataReceived, uint64 transmit, 2x uint32 precision (4.1+), int16 params, int32 eod]
+ *   The stamps feed pose prediction's velocity estimate (rt.c): server-clock stamps carry none
+ *   of the network/scheduling jitter an arrival-time stamp does, and stay correct across a
+ *   mid-session camera-rate change in Motive. Pre-4.1 the sections are not hoppable (skeletons
+ *   would need full decoding), so the receiver falls back to stamping QPC at arrival.
  */
 #include "natnet.h"
 
@@ -43,6 +54,14 @@ static bool rd_f32(const uint8_t* b, size_t len, size_t* off, float* out) {
     if (*off + 4 > len) return false;
     memcpy(out, b + *off, 4); *off += 4; return true;
 }
+static bool rd_f64(const uint8_t* b, size_t len, size_t* off, double* out) {
+    if (*off + 8 > len) return false;
+    memcpy(out, b + *off, 8); *off += 8; return true;
+}
+static bool rd_u64(const uint8_t* b, size_t len, size_t* off, uint64_t* out) {
+    if (*off + 8 > len) return false;
+    memcpy(out, b + *off, 8); *off += 8; return true;
+}
 static bool rd_skip(size_t len, size_t* off, size_t n) {
     if (*off + n > len || *off + n < *off) return false;   /* second test guards overflow */
     *off += n; return true;
@@ -54,6 +73,19 @@ static bool rd_cstr(const uint8_t* b, size_t len, size_t* off) {   /* skip a nul
 
 static bool has_size_prefix(int major, int minor) {
     return ((major == 4) && (minor > 0)) || (major > 4);          /* per-section byte count, NatNet 4.1+ */
+}
+
+/* The suffix-stamp hop is certified against the vendored reference (third_party/NatNet-4.5):
+ * the section list between the rigid bodies and the frame suffix is exactly known for
+ * 4.1..4.5. A NEWER bitstream may insert a section the hop doesn't know about, landing it one
+ * section short — where 8 garbage bytes could pass the structural check and become a garbage
+ * timestamp. So unknown-future versions refuse the hop, and natnet_open falls back to
+ * arrival-time stamps (pose prediction stays alive, just on the jittery clock) instead of
+ * silently publishing t_ns = 0 forever. Bump when a newer SDK drop certifies the layout.
+ * (The escape hatch for a too-new server without touching this code: connect UNICAST and pin
+ * the syntax with the "Bitstream,4.5.0" command — unicast-only, Motive >= 3; see PacketClient.) */
+static bool stamps_supported(int major, int minor) {
+    return major == 4 && minor >= 1 && minor <= 5;
 }
 
 /* skip a count-prefixed section: either jump the 4.1+ byte count, or skip `each` bytes per item */
@@ -69,7 +101,9 @@ static bool skip_section_fixed(const uint8_t* b, size_t len, size_t* off,
 }
 
 bool natnet_parse_frame(const uint8_t* p, size_t len, int major, int minor,
-                        int32_t want_id, float pos[3], float quat[4], bool* tracking_valid) {
+                        int32_t want_id, float pos[3], float quat[4], bool* tracking_valid,
+                        NatNetStamps* stamps) {
+    if (stamps) { stamps->timestamp = -1.0; stamps->mid_exposure = 0; }
     if (major < 3) return false;                 /* pre-3 embeds per-RB marker data: unsupported */
     size_t off = 0;
     int32_t n, sect;
@@ -96,11 +130,15 @@ bool natnet_parse_frame(const uint8_t* p, size_t len, int major, int minor,
 
     /* rigid bodies */
     if (!rd_i32(p, len, &off, &n) || n < 0) return false;
+    size_t rb_end = 0;                           /* 4.1+: end of the rigid-body section — the suffix hop's start */
     if (has_size_prefix(major, minor)) {
-        if (!rd_i32(p, len, &off, &sect)) return false;                /* section byte count (unused: we read the bodies) */
+        if (!rd_i32(p, len, &off, &sect)) return false;                /* section byte count */
+        if (sect >= 0 && off + (size_t)sect <= len && off + (size_t)sect >= off)
+            rb_end = off + (size_t)sect;                               /* a lying count: no suffix hop */
     }
     const bool have_params = ((major == 2 && minor >= 6) || major > 2);   /* always true for major >= 3 */
-    for (int32_t i = 0; i < n; ++i) {
+    bool found = false;
+    for (int32_t i = 0; i < n && !found; ++i) {
         int32_t id;
         float x, y, z, qx, qy, qz, qw, meanErr;
         if (!rd_i32(p, len, &off, &id)) return false;
@@ -118,10 +156,35 @@ bool natnet_parse_frame(const uint8_t* p, size_t len, int major, int minor,
             pos[0] = x; pos[1] = y; pos[2] = z;
             quat[0] = qx; quat[1] = qy; quat[2] = qz; quat[3] = qw;
             if (tracking_valid) *tracking_valid = tv;
-            return true;
+            found = true;
         }
     }
-    return false;
+    if (!found) return false;
+
+    /* Frame-suffix stamps (4.1+ only; see the header comment for the layout). Every early-out
+     * below returns TRUE: the pose above is already good, and a truncated/odd tail must degrade
+     * to "no stamp" (the consumer publishes t_ns = 0), never to a lost pose. */
+    if (stamps && rb_end && stamps_supported(major, minor)) {
+        size_t toff = rb_end;
+        int hops = 5;                                          /* skeletons, assets, labeled markers, force plates, devices */
+        if (minor >= 5) hops += 2;                             /* 4.5: IMU, GPIO */
+        for (int i = 0; i < hops; ++i) {
+            int32_t cnt, bytes;
+            if (!rd_i32(p, len, &toff, &cnt) || !rd_i32(p, len, &toff, &bytes) ||
+                bytes < 0 || !rd_skip(len, &toff, (size_t)bytes)) return true;
+        }
+        double   ts;
+        uint64_t me;
+        if (!rd_skip(len, &toff, 8)) return true;              /* timecode + subframe */
+        if (!rd_f64(p, len, &toff, &ts) || !rd_u64(p, len, &toff, &me)) return true;
+        /* structural check that the hop landed on the suffix: what remains must hold the rest of
+         * it — dataReceived + transmit (16) + precision stamps (8, 4.1+) + params (2) + eod (4).
+         * `>=` tolerates fields a future version appends before params. */
+        if (len - toff < 30) return true;
+        stamps->timestamp    = ts;
+        stamps->mid_exposure = me;
+    }
+    return true;
 }
 
 bool natnet_resolve_name(const uint8_t* p, size_t len, int major, int minor,
@@ -164,11 +227,26 @@ bool natnet_resolve_name(const uint8_t* p, size_t len, int major, int minor,
 #include <ws2tcpip.h>
 #include <windows.h>
 
+/* How the receiver derives pose_write_t's t_ns. Chosen ONCE at open and fixed for the
+ * connection's lifetime — pose.h's contract is one writer, ONE clock, differences only, and a
+ * per-frame fallback would splice two clocks into one velocity difference. */
+enum {
+    NN_STAMP_ARRIVAL = 0,   /* QPC at packet arrival (pre-4.1: the frame suffix is unreachable) */
+    NN_STAMP_MIDEXPO,       /* CameraMidExposureTimestamp ticks -> ns (needs the handshake's clock
+                             * frequency): the hardware capture instant — no network/scheduling
+                             * jitter, immune to a mid-session camera-rate change in Motive */
+    NN_STAMP_FTS            /* fTimestamp seconds -> ns (4.1+ forced by env, no command channel):
+                             * software-stamped on the server — can carry sub-ms solve jitter, but
+                             * still beats arrival time and stays rate-change immune */
+};
+
 struct NatNet {
     SOCKET    sock;
     HANDLE    thread;
     volatile LONG stop;
     int       major, minor;
+    int       stamp_mode;    /* NN_STAMP_* */
+    double    ticks_to_ns;   /* NN_STAMP_MIDEXPO: 1e9 / server HighResClockFrequency */
     int32_t   rigid_body;
     PoseSlot  pose;
 };
@@ -187,8 +265,10 @@ static void to_room(const float src_p[3], const float src_q[4], float p[3], floa
 }
 
 /* Best-effort version handshake: ask the server (command port) for its NatNet version.
- * Returns true and sets major/minor on success. */
-static bool handshake_version(const NatNetConfig* cfg, int* major, int* minor) {
+ * Returns true and sets major/minor on success. NatNet 3.0+ servers append their high-res
+ * clock frequency (ticks/s) right after the version block (sSender_Server, NatNetTypes.h) —
+ * it converts the frame suffix's CameraMidExposureTimestamp ticks to time; left 0 if absent. */
+static bool handshake_version(const NatNetConfig* cfg, int* major, int* minor, uint64_t* freq) {
     if (!cfg->server || !cfg->server[0]) return false;
     SOCKET s = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
     if (s == INVALID_SOCKET) return false;
@@ -210,10 +290,12 @@ static bool handshake_version(const NatNetConfig* cfg, int* major, int* minor) {
     if (got < 4) return false;
     uint16_t msg; memcpy(&msg, buf, 2);
     if (msg != NAT_SERVERINFO) return false;
-    /* payload = sSender { char szName[256]; uint8 Version[4]; uint8 NatNetVersion[4]; } */
+    /* payload = sSender { char szName[256]; uint8 Version[4]; uint8 NatNetVersion[4]; }
+     * then (3.0+, sSender_Server) uint64 HighResClockFrequency — 264 is 8-aligned, no padding */
     const int nnv = 4 + 256 + 4;                               /* header + szName + Version */
     if (got < nnv + 2) return false;
     *major = buf[nnv]; *minor = buf[nnv + 1];
+    if (freq && got >= nnv + 4 + 8) memcpy(freq, buf + nnv + 4, 8);
     return (*major > 0);
 }
 
@@ -269,14 +351,33 @@ static DWORD WINAPI receiver(LPVOID arg) {
         if (nbytes <= plen) plen = nbytes;                     /* trust the smaller of header/recv */
         float sp[3], sq[4];
         bool tv = true;
-        if (natnet_parse_frame(buf + 4, plen, nn->major, nn->minor, nn->rigid_body, sp, sq, &tv) && tv) {
+        NatNetStamps st;
+        if (natnet_parse_frame(buf + 4, plen, nn->major, nn->minor, nn->rigid_body, sp, sq, &tv, &st) && tv) {
             float p[3], q[4];
             to_room(sp, sq, p, q);
-            /* stamp with QPC ns at ARRIVAL: rt.c differences successive stamps for the pose-prediction
-             * velocity estimate (same clock, same writer — never compared to another clock) */
-            LARGE_INTEGER qc, qf;
-            QueryPerformanceCounter(&qc); QueryPerformanceFrequency(&qf);
-            pose_write_t(&nn->pose, p, q, (unsigned __int64)((double)qc.QuadPart * 1e9 / (double)qf.QuadPart));
+            /* stamp with the connection's clock (stamp_mode, fixed at open): rt.c differences
+             * successive stamps for the pose-prediction velocity estimate — same clock, same
+             * writer, never compared to another clock. Server-clock stamps are preferred: the
+             * positions were SAMPLED on the camera grid, so pairing them with arrival time
+             * mis-measures dt by the network + scheduling jitter (worst when a held-up thread
+             * drains several frames back to back). A frame whose suffix didn't parse publishes
+             * t_ns = 0 ("untimestamped") — prediction resets rather than mixing clocks. */
+            unsigned __int64 t_ns = 0;
+            switch (nn->stamp_mode) {
+            case NN_STAMP_MIDEXPO:
+                if (st.mid_exposure) t_ns = (unsigned __int64)((double)st.mid_exposure * nn->ticks_to_ns);
+                break;
+            case NN_STAMP_FTS:
+                if (st.timestamp > 0.0) t_ns = (unsigned __int64)(st.timestamp * 1e9);
+                break;
+            default: {
+                LARGE_INTEGER qc, qf;
+                QueryPerformanceCounter(&qc); QueryPerformanceFrequency(&qf);
+                t_ns = (unsigned __int64)((double)qc.QuadPart * 1e9 / (double)qf.QuadPart);
+                break;
+            }
+            }
+            pose_write_t(&nn->pose, p, q, t_ns);
         }
     }
     return 0;
@@ -309,9 +410,22 @@ NatNet* natnet_open(const NatNetConfig* cfg, char* err, size_t errcap) {
      * 4.0-vs-4.1 mistake silently mis-parses the size-prefixed sections). The env value is only
      * a fallback for a pure multicast listen with no command channel; 3.1 is the last resort. */
     nn->major = 0; nn->minor = 0;
-    if (cfg->server && cfg->server[0]) handshake_version(cfg, &nn->major, &nn->minor);
-    if (nn->major <= 0) { nn->major = cfg->major; nn->minor = cfg->minor; }
+    uint64_t clock_freq = 0;
+    if (cfg->server && cfg->server[0]) handshake_version(cfg, &nn->major, &nn->minor, &clock_freq);
+    if (nn->major <= 0) { nn->major = cfg->major; nn->minor = cfg->minor; clock_freq = 0; }
     if (nn->major <= 0) { nn->major = 3; nn->minor = 1; }
+
+    /* Pose stamp policy, fixed for the connection (see the NN_STAMP_* enum): the frame suffix's
+     * server-clock stamps on 4.1..4.5 (mid-exposure ticks when the handshake gave the tick rate,
+     * fTimestamp seconds when the version was forced without a command channel), QPC at arrival
+     * otherwise — including bitstreams NEWER than the certified hop (stamps_supported), which
+     * must degrade to a working arrival-clock prediction, not a dead one. rt.c only ever
+     * differences the stamps, so which clock they're on is free to choose — but it must be ONE
+     * clock (pose.h). */
+    if (stamps_supported(nn->major, nn->minor)) {
+        if (clock_freq) { nn->stamp_mode = NN_STAMP_MIDEXPO; nn->ticks_to_ns = 1e9 / (double)clock_freq; }
+        else            nn->stamp_mode = NN_STAMP_FTS;
+    } else nn->stamp_mode = NN_STAMP_ARRIVAL;
 
     /* Track by name: resolve to a streaming ID via the model definitions (needs a server). A
      * miss is fatal here — the caller asked for a specific body, so don't silently track another. */

@@ -547,8 +547,15 @@ The tracking chain — Motive's solve, the network hop, the audio block, the DAC
 pose **20–40 ms behind the head**; at walking speed that is 3–6 cm of panning lag. With a lead set,
 the tracked **position** is extrapolated `lead_ms` along a velocity estimated from the tracker's
 own frame timestamps (smoothed over ~100 ms so Motive's frame-to-frame jitter doesn't shake the
-image, speed-capped, and reset across drop-outs so a stale velocity never extrapolates). Set
-`lead_ms` to your measured motion-to-ears latency; too much lead **overshoots on direction
+image, speed-capped, and reset across drop-outs so a stale velocity never extrapolates). On
+NatNet 4.1–4.5 those timestamps come off the wire — the **server's camera clock** (mid-exposure when
+the command channel is available, the frame's software timestamp when the version is env-forced
+over pure multicast) — so bursty packet delivery doesn't shake the estimate and a camera-rate
+change in Motive doesn't mis-scale it. Older streams — and streams **newer** than the parser's
+certified suffix layout — fall back to stamping at packet arrival, so prediction keeps working
+either way. (If a future Motive outruns the parser, the unicast-only `Bitstream` command can pin
+the server to a known syntax; see `src/natnet.c`.)
+Set `lead_ms` to your measured motion-to-ears latency; too much lead **overshoots on direction
 changes**, so start at the measured value, not above it (clamped at 200 ms). Orientation is not
 predicted (it only feeds the monitor). Internal tracking only (needs a connected tracker).
 
