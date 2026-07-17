@@ -42,6 +42,17 @@ bwa_calibrate --list-drivers        (or bwa_playground --list-drivers)
 - [ ] `bwa_minimal` runs and prints `backend: asio`, not the null fallback. The null sink
       keeps everything rendering silently, so a wrong driver *looks* alive — always check
       `bwa_get_audio_backend`.
+- [ ] `bwa_minimal`'s **device clock** line reads within ~±100 ppm of 48000 Hz *on DVS*,
+      and repeat runs agree. It measures the device's true rate from two `bwa_get_clock`
+      stamps across the 6 s run; what it exists to catch is GROSS clocking faults — a
+      wrong nominal rate reads as *thousands* of ppm (44.1 k vs 48 k is 8%), an unlocked
+      Dante domain as a rate that wanders between runs. Fix clocking before calibrating:
+      every sweep delay and every scheduled sample rides this clock. Interpretation notes:
+      when the driver supplies no `systemTime` the stamps are QPC-synthesized at callback
+      entry, which puts tens of ppm of run-to-run scatter on a window this short — that
+      scatter is measurement noise, not drift; and a consumer bridge like FlexASIO
+      legitimately reads ~1000+ ppm off (its callback pacing is synthesized over WASAPI
+      and bursts). Deviations at that scale on DVS are a real problem.
 
 Minimal opens a 2-ch device (binaural profile), so this only proves the ASIO plumbing.
 The full 26-out DVS open is proven in Stage 1: `layout_tool` demands a real device and
@@ -83,6 +94,11 @@ Then the real sequence:
 - [ ] **Positions** — `bwa_calibrate --localize positions.txt`: capture at ≥ 5 known,
       non-coplanar mic positions (put an OptiTrack marker on the mic and let Motive hand
       you the positions). Cross-check the recovered positions against the drawings.
+- [ ] **Latency residual sane** — the localize run prints the solved system latency next
+      to the driver's own digital loop (`ASIOGetLatencies`, logged at capture open). The
+      residual (DAC/ADC + analog) must be a *small positive* number: negative is
+      physically impossible (wrong device / rate mismatch), tens of ms means an unexpected
+      buffer (check the DVS latency setting). The solved value stays authoritative.
 - [ ] **Trims** — a default run writes `delay_ms`/`gain_db`. Optionally `--eq` (per-speaker
       correction FIRs), `--save-irs prefix` (keep the kernels), `--room` (RT60 report — a
       treatment diagnostic, never numbers to copy into the reverb).

@@ -226,7 +226,10 @@ void rt_render(RtCore* c, float* bus, uint32_t nframes, const bwa_timestamp* ts)
 void rt_get_listener(RtCore* c, float p[3], float q[4]);   /* audio thread: active pose */
 void rt_read_pose(RtCore* c, float p[3], float q[4]);      /* control thread: active pose (seqlock readback) */
 bool rt_source_is_playing(RtCore* c, uint32_t h);         /* control thread: is the source's voice still playing? */
+uint64_t rt_source_get_position(RtCore* c, uint32_t h);   /* control thread: content playhead (engine-rate frames) */
 uint64_t rt_dsp_time(RtCore* c);                          /* control thread: current dsp-sample clock (for scheduling) */
+bool rt_get_clock(RtCore* c, uint64_t* sample, uint64_t* time_ns); /* control thread: device (sample, host-ns) pair;
+                                                                    * false until a host-stamped block renders */
 uint32_t rt_bus_peaks(RtCore* c, float* out, uint32_t cap); /* control thread: last block's per-channel output peak
                                                              * (post align/test/limiter); returns the count filled */
 

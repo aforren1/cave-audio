@@ -195,6 +195,28 @@ BWA_API void     bwa_source_play_at(bwa_engine* e, bwa_source s, bwa_sound snd, 
 /* The engine's current dsp-sample clock (most recently rendered block's first sample): the device
  * sample position when running, an internal block counter otherwise. Monotonic. 0 before the first block. */
 BWA_API uint64_t bwa_get_dsp_time(bwa_engine* e);
+/* The device's clock correspondence: the (output sample position, host time) pair the audio stack
+ * stamped at the top of the most recently rendered block (ASIO's ASIOGetSamplePosition pair; when
+ * a driver omits systemTime — FlexASIO does — the sink synthesizes the stamp from
+ * QueryPerformanceCounter at callback entry, as the offline null sink always does). This is the jitter-free bridge
+ * between the dsp clock and wall time that graphics<->audio sync needs: pairing bwa_get_dsp_time
+ * with your own clock read carries up to a block of slack, but this pair is captured inside the
+ * audio callback itself, so  dsp_at(T) = dsp_sample + (T_ns - host_time_ns) * sample_rate / 1e9
+ * is exact — then schedule the onset with bwa_source_play_at. host_time_ns is monotonic
+ * nanoseconds on a BACKEND-DEFINED epoch (ASIO drivers differ; the null sink counts from stream
+ * start): anchor it against your own monotonic clock and track the constant offset, refreshing
+ * per frame (the device and OS clocks drift ~ppm — seconds per day). Returns false with the
+ * outputs untouched until a host-stamped block has rendered — before bwa_start, on the MANUAL
+ * sink (whose clock is deliberately wall-free so renders reproduce), or under a driver that
+ * reports no systemTime. Control thread; lock-free (a torn read retries internally). */
+BWA_API bool     bwa_get_clock(bwa_engine* e, uint64_t* dsp_sample, uint64_t* host_time_ns);
+/* The primary output device's self-reported render->DAC latency, in FRAMES at the engine rate
+ * (seconds = frames / sample_rate): how long after a block renders its samples actually leave the
+ * device (ASIOGetLatencies — DVS includes its Dante network buffering). Add it to a dsp-clock
+ * deadline to know when audio is HEARD: the audio half of AV-latency alignment (the video half —
+ * projector/display delay — you measure once; see docs/api.md). 0 = unknown or no physical output
+ * (null sink, or before bwa_start). Constant while the device is open. Control thread. */
+BWA_API uint32_t bwa_get_output_latency(bwa_engine* e);
 BWA_API void     bwa_source_stop(bwa_engine* e, bwa_source s);
 /* Pause/resume the source's voice in place. The gate ramps over one block (~5 ms — no click) and the
  * playhead freezes once silent, so resume continues exactly where pause landed. Works for in-memory,
@@ -214,6 +236,16 @@ BWA_API void     bwa_source_seek(bwa_engine* e, bwa_source s, uint64_t frame);
  * a sound plays, false once a non-loop sound finishes, after stop, or for a stale/destroyed handle.
  * Best-effort — a sound shorter than the caller's poll interval may never be observed as playing. */
 BWA_API bool     bwa_source_is_playing(bwa_engine* e, bwa_source s);
+/* The voice's content playhead in engine-rate frames (seconds = position / sample_rate), as of the
+ * last rendered block — the engine-owned truth for sync/UI, correct where deriving it from
+ * bwa_get_dsp_time breaks: it FREEZES under pause, lands where a seek lands, tracks a pitch != 1
+ * voice at its actual rate, wraps with a loop, and for stream/push sources counts frames actually
+ * consumed (an underrun slips it, exactly like the audible clock). A finished non-loop voice keeps
+ * reporting its final position; an idle voice, a scheduled bwa_source_play_at still held silent, or
+ * a stale/destroyed handle reads 0. Latest-wins readback like bwa_source_is_playing, at block
+ * granularity (~5 ms): a just-issued play/seek is reflected one block later — for tighter-than-a-
+ * block scheduling, keep using bwa_get_dsp_time arithmetic. */
+BWA_API uint64_t bwa_source_get_position(bwa_engine* e, bwa_source s);
 BWA_API void     bwa_play_oneshot(bwa_engine* e, bwa_sound snd, float x, float y, float z, float gain);
 
 /* ---- procedural (push) sources: engine-generated audio, no file ----
@@ -263,8 +295,8 @@ BWA_API void  bwa_bed_destroy(bwa_engine* e, bwa_bed b);
  * voice — same pool, same semantics; these exist so bed code never mixes prefixes): timed fades
  * (fade_out = the click-free stop), pause/seek (resume/jump lands exactly), steal priority (a bed
  * competes for voices like any source — protect a music bed with 255), mix groups, and the
- * is-playing readback. Position/spatial calls (pos, spread, occlusion, ...) do not apply — a bed
- * is world-locked; and pitch is a no-op on beds (see bwa_source_set_pitch). */
+ * is-playing/playhead readbacks. Position/spatial calls (pos, spread, occlusion, ...) do not apply —
+ * a bed is world-locked; and pitch is a no-op on beds (see bwa_source_set_pitch). */
 BWA_API void  bwa_bed_fade_to (bwa_engine* e, bwa_bed b, float gain, float seconds);
 BWA_API void  bwa_bed_fade_out(bwa_engine* e, bwa_bed b, float seconds);
 BWA_API void  bwa_bed_set_paused(bwa_engine* e, bwa_bed b, bool paused);
@@ -272,6 +304,7 @@ BWA_API void  bwa_bed_seek(bwa_engine* e, bwa_bed b, uint64_t frame);
 BWA_API void  bwa_bed_set_priority(bwa_engine* e, bwa_bed b, int priority);
 BWA_API void  bwa_bed_set_group(bwa_engine* e, bwa_bed b, uint32_t group);
 BWA_API bool  bwa_bed_is_playing(bwa_engine* e, bwa_bed b);
+BWA_API uint64_t bwa_bed_get_position(bwa_engine* e, bwa_bed b);
 
 /* ---- materials / occlusion (control thread; needs the Steam Audio build) ---- */
 

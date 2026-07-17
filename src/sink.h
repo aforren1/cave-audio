@@ -62,6 +62,10 @@ typedef struct {
     void        (*close)(bwa_sink*);
     const char* (*backend)(bwa_sink*);
     uint32_t    (*block_size)(bwa_sink*);   /* actual frames per callback (driver dictates for ASIO) */
+    /* Device-reported render->DAC output latency in FRAMES (ASIOGetLatencies for the ASIO sink —
+     * DVS includes its network buffering there). NULL entry or 0 = unknown / no physical output
+     * (the null and manual sinks have no DAC). */
+    uint32_t    (*output_latency)(bwa_sink*);
     /* MANUAL sink only (NULL on threaded backends): render ONE block synchronously on the CALLER's
      * thread into the sink's own bus, returning a pointer to it (planar, *channels * *nframes floats)
      * valid until the next call. This is the offline/deterministic render path (bwa_render_block). */
@@ -84,6 +88,7 @@ void         bwa_sink_stop(bwa_sink* s);    /* stop the loop; safe if already st
 void         bwa_sink_close(bwa_sink* s);   /* stop (if needed) + release             */
 const char*  bwa_sink_backend(bwa_sink* s); /* e.g. "asio:DVS" or "null"              */
 uint32_t     bwa_sink_block_size(bwa_sink* s); /* actual frames per block; 0 if none  */
+uint32_t     bwa_sink_output_latency(bwa_sink* s); /* device render->DAC latency, frames; 0 = unknown */
 /* Manual/offline: render one block synchronously (bwa_render_block). NULL unless this is a manual
  * sink — threaded backends don't support caller-driven pumping. */
 const float* bwa_sink_render_block(bwa_sink* s, uint32_t* channels, uint32_t* nframes);

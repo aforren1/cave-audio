@@ -273,10 +273,13 @@ void     bwa_source_set_pitch(bwa_engine* e, bwa_source s, float rate);         
 void     bwa_source_play (bwa_engine* e, bwa_source s, bwa_sound snd, bool loop);
 void     bwa_source_play_at(bwa_engine* e, bwa_source s, bwa_sound snd, bool loop, uint64_t start_sample); // sample-accurate
 uint64_t bwa_get_dsp_time(bwa_engine* e);                       // current dsp-sample clock (device-anchored, monotonic)
+bool     bwa_get_clock(bwa_engine* e, uint64_t* dsp_sample, uint64_t* host_time_ns); // device (sample, host-time) pair
+uint32_t bwa_get_output_latency(bwa_engine* e);                 // device render->DAC latency, frames (0 = unknown)
 void     bwa_source_stop (bwa_engine* e, bwa_source s);
 void     bwa_source_set_paused(bwa_engine* e, bwa_source s, bool paused);   // ramped; playhead freezes
 void     bwa_source_seek (bwa_engine* e, bwa_source s, uint64_t frame);     // click-free jump (in-memory)
 bool     bwa_source_is_playing(bwa_engine* e, bwa_source s);  // control-thread poll; see below
+uint64_t bwa_source_get_position(bwa_engine* e, bwa_source s); // content playhead, engine-rate frames
 void     bwa_play_oneshot(bwa_engine* e, bwa_sound snd, float x, float y, float z, float gain);
 ```
 
@@ -292,12 +295,40 @@ sample. Read "now" from `bwa_get_dsp_time` (device sample position, monotonic) a
 `bwa_get_dsp_time(e) + sample_rate/2` plays half a second out. `0` means play immediately (same as
 `bwa_source_play`); a start already in the past plays immediately, best-effort.
 
+**Syncing with graphics.** Two cases. Events that live on the **audio timeline** (a cue in a track
+you scheduled) never need wall time: keep the `start_sample` you passed to `play_at` and fire the
+visual when `bwa_get_dsp_time` crosses `start + cue` (or poll `bwa_source_get_position`). Events
+that originate on the **graphics side** (the sound must land on an animation frame) need the
+wall→dsp mapping, and that is `bwa_get_clock`: the (output sample position, host time) pair the
+audio stack stamps inside each block callback — ASIO's `ASIOGetSamplePosition` pair, synthesized
+from QPC on the null sink. Because the pair is captured *in* the callback, the mapping
+`dsp_at(T) = sample + (T_ns − host_time_ns) · rate / 1e9` carries none of the block-plus-scheduling
+jitter that pairing `bwa_get_dsp_time` with your own clock read does. `host_time_ns` sits on a
+backend-defined epoch — anchor it against your clock once and re-sample per frame (device and OS
+clocks drift ~ppm; the Unity binding's `Engine.DspTimeAt`/`RealtimeAt` do this for you with a
+decaying-max offset estimator). It returns false until a host-stamped block has rendered — and
+always on the **manual** sink, whose clock is deliberately wall-free so renders reproduce. Finally,
+the dsp clock stamps when a block is *rendered*, not heard: `bwa_get_output_latency` is the
+device's own render→DAC delay in frames (`ASIOGetLatencies`; DVS includes its Dante buffering), so
+sound scheduled for dsp time T reaches the room at `T + latency` — subtract your measured display
+delay from it and one constant aligns the whole AV chain.
+
 **Completion is a poll.** `bwa_source_is_playing` is a latest-wins readback (like
 `bwa_get_listener_pose`): the audio thread republishes each source's playing state every block, gated
 on the handle's generation. It reads `true` while a sound plays; `false` once a non-loop sound
 finishes, after `stop`, or for a stale/destroyed handle. Poll it once per frame to drive an
 "on finished" signal. It's best-effort — a sound shorter than your poll interval may never be
 observed as playing.
+
+**The playhead is a poll too.** `bwa_source_get_position` rides the same per-block republish: the
+voice's **content** position in engine-rate frames (`seconds = position / sample_rate`). This is the
+engine-owned truth for driving synced visuals or a progress UI — correct exactly where deriving a
+playhead from `bwa_get_dsp_time` breaks: it freezes under pause, lands where a seek lands, follows a
+pitched voice at its actual rate, wraps with a loop, and for stream/push sources counts frames
+actually **consumed** (an underrun slips it, exactly like what you hear). A finished non-loop voice
+keeps reporting its final position; an idle voice, a scheduled `bwa_source_play_at` still held
+silent, or a stale handle reads 0. Block-granular and one block behind a just-issued play/seek — for
+tighter-than-a-block scheduling, stay on `bwa_get_dsp_time` arithmetic.
 
 **Pause and seek are click-free.**
 
@@ -406,6 +437,7 @@ void    bwa_bed_seek        (bwa_engine* e, bwa_bed b, uint64_t frame);
 void    bwa_bed_set_priority(bwa_engine* e, bwa_bed b, int priority);    // beds share the voice pool —
 void    bwa_bed_set_group   (bwa_engine* e, bwa_bed b, uint32_t group);  //   protect a music bed with 255
 bool    bwa_bed_is_playing  (bwa_engine* e, bwa_bed b);
+uint64_t bwa_bed_get_position(bwa_engine* e, bwa_bed b);   // content playhead, engine-rate frames
 ```
 
 `bwa_bed_set_rotation` yaws the recorded field about the room's vertical axis — line a capture up

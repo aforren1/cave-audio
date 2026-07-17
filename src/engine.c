@@ -578,6 +578,7 @@ void  bwa_bed_seek(bwa_engine* e, bwa_bed b, uint64_t frame)         { bwa_sourc
 void  bwa_bed_set_priority(bwa_engine* e, bwa_bed b, int priority)   { bwa_source_set_priority(e, b, priority); }
 void  bwa_bed_set_group(bwa_engine* e, bwa_bed b, uint32_t group)    { bwa_source_set_group(e, b, group); }
 bool  bwa_bed_is_playing(bwa_engine* e, bwa_bed b)                   { return bwa_source_is_playing(e, b); }
+uint64_t bwa_bed_get_position(bwa_engine* e, bwa_bed b)              { return bwa_source_get_position(e, b); }
 
 /* ---- sources (forward to the rt core) ---- */
 
@@ -649,10 +650,13 @@ void bwa_source_play_at(bwa_engine* e, bwa_source s, bwa_sound snd, bool loop, u
     rt_source_play_at(e->rt, s, snd, loop, start_sample);
 }
 uint64_t bwa_get_dsp_time(bwa_engine* e)                                     { return e ? rt_dsp_time(e->rt) : 0; }
+bool bwa_get_clock(bwa_engine* e, uint64_t* dsp_sample, uint64_t* host_time_ns) { return e ? rt_get_clock(e->rt, dsp_sample, host_time_ns) : false; }
+uint32_t bwa_get_output_latency(bwa_engine* e)                               { return e ? bwa_sink_output_latency(e->sink) : 0; }
 void bwa_source_stop(bwa_engine* e, bwa_source s)                           { if (e) rt_source_stop(e->rt, s); }
 void bwa_source_set_paused(bwa_engine* e, bwa_source s, bool paused)        { if (e) rt_source_set_paused(e->rt, s, paused); }
 void bwa_source_seek(bwa_engine* e, bwa_source s, uint64_t frame)           { if (e) rt_source_seek(e->rt, s, frame); }
 bool bwa_source_is_playing(bwa_engine* e, bwa_source s)                     { return e ? rt_source_is_playing(e->rt, s) : false; }
+uint64_t bwa_source_get_position(bwa_engine* e, bwa_source s)               { return e ? rt_source_get_position(e->rt, s) : 0; }
 void bwa_set_test_signal(bwa_engine* e, uint32_t channel, bwa_test_kind kind, float gain) { if (e) rt_test_signal(e->rt, channel, (uint8_t)kind, gain); }
 
 void bwa_set_panner(bwa_engine* e, bwa_panner panner) { if (e) { e->panner = (int)panner; rt_set_panner(e->rt, (int)panner); } }

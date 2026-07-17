@@ -90,6 +90,31 @@ static int run_profile(bwa_profile profile, const char* name) {
 
     Sleep(30);                          /* let the audio thread(s) run several blocks */
 
+    /* device clock pair + output latency through the full dll: the null sink stamps every block
+     * from QPC, so a (sample, host-time) pair must exist, sit at/behind the dsp clock, and advance
+     * with it; the null sink has no DAC, so its reported output latency must be 0. */
+    {
+        uint64_t cs = 0, ct = 0;
+        if (!bwa_get_clock(e, &cs, &ct) || ct == 0) {
+            fprintf(stderr, "FAIL[%s]: bwa_get_clock has no pair after 30 ms of blocks\n", name);
+            bwa_destroy(e); return 1;
+        }
+        if (cs > bwa_get_dsp_time(e)) {   /* the pair is a rendered block's start — never ahead of the clock */
+            fprintf(stderr, "FAIL[%s]: clock-pair sample runs ahead of the dsp clock\n", name);
+            bwa_destroy(e); return 1;
+        }
+        Sleep(15);                        /* > 2 blocks at 256/48k: the pair must move */
+        uint64_t cs2 = 0, ct2 = 0;
+        if (!bwa_get_clock(e, &cs2, &ct2) || cs2 <= cs || ct2 <= ct) {
+            fprintf(stderr, "FAIL[%s]: clock pair does not advance with rendered blocks\n", name);
+            bwa_destroy(e); return 1;
+        }
+        if (bwa_get_output_latency(e) != 0) {
+            fprintf(stderr, "FAIL[%s]: null sink reports a nonzero output latency\n", name);
+            bwa_destroy(e); return 1;
+        }
+    }
+
     bwa_source_stop(e, s);
     bwa_source_destroy(e, s);
     bwa_unload_sound(e, snd);

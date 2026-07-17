@@ -43,6 +43,8 @@ struct AsioSink {
     uint32_t        sample_rate;
     uint32_t        channels;        /* requested (26) */
     long            buffer_size;     /* frames per block, chosen from ASIOGetBufferSize */
+    long            output_latency;  /* driver-reported render->DAC frames (ASIOGetLatencies); 0 = unknown */
+    uint64_t        qpc_freq;        /* QueryPerformanceFrequency, for the synthesized host stamp */
     bwa_render_fn      render;
     void*           user;
     ASIOBufferInfo  bufferInfos[64];
@@ -127,7 +129,18 @@ ASIOTime* bufferSwitchTimeInfo(ASIOTime* timeInfo, long index, ASIOBool /*proces
     else
         ts.sample_pos = s->fallback_pos;
     s->fallback_pos   = ts.sample_pos + (uint64_t)s->buffer_size;
-    ts.system_time_ns = (timeInfo->timeInfo.flags & kSystemTimeValid) ? timestamp_ns(timeInfo->timeInfo.systemTime) : 0;
+    if (timeInfo->timeInfo.flags & kSystemTimeValid)
+        ts.system_time_ns = timestamp_ns(timeInfo->timeInfo.systemTime);
+    else {
+        /* No driver stamp (FlexASIO omits systemTime on the TimeInfo path; DVS unknown until rig
+         * day): synthesize one from QPC at callback entry so bwa_get_clock still has a live pair —
+         * a hair noisier than a driver stamp (it includes callback-dispatch jitter, tens of µs)
+         * but a true correspondence. QPC is a userspace counter read (no kernel transition) — the
+         * same clock the null sink paces with; the split scale avoids overflow (see null_sink.c). */
+        LARGE_INTEGER qc; QueryPerformanceCounter(&qc);
+        const uint64_t t = (uint64_t)qc.QuadPart, f = s->qpc_freq;
+        ts.system_time_ns = f ? (t / f) * 1000000000ull + (t % f) * 1000000000ull / f : 0;
+    }
 
     s->render(s->user, s->bus, (uint32_t)s->buffer_size, &ts);   /* engine fills the bus */
 
@@ -206,10 +219,12 @@ void asio_close(bwa_sink* base) {
 }
 const char* asio_backend(bwa_sink* base) { return ((AsioSink*)base)->name; }
 uint32_t asio_block_size(bwa_sink* base) { return (uint32_t)((AsioSink*)base)->buffer_size; }
+uint32_t asio_output_latency(bwa_sink* base) { return (uint32_t)((AsioSink*)base)->output_latency; }
 
 const bwa_sink_vtbl ASIO_VT = {   /* designated: stop/close share a signature, so a positional swap would be silent */
     .start = asio_start, .stop = asio_stop, .close = asio_close,
     .backend = asio_backend, .block_size = asio_block_size,
+    .output_latency = asio_output_latency,
 };
 
 } /* namespace */
@@ -385,5 +400,12 @@ extern "C" bwa_sink* bwa_asio_sink_open(uint32_t sample_rate, uint32_t block_siz
     }
 
     s->post_output = (ASIOOutputReady() == ASE_OK);
+
+    /* Latencies are only final once the buffers exist (they depend on the negotiated size). The
+     * driver's outputLatency is the render->DAC delay in frames — for DVS that includes its Dante
+     * network buffering — surfaced as bwa_get_output_latency for AV-latency alignment. */
+    long ilat = 0, olat = 0;
+    s->output_latency = (ASIOGetLatencies(&ilat, &olat) == ASE_OK && olat > 0) ? olat : 0;
+    { LARGE_INTEGER qf; s->qpc_freq = QueryPerformanceFrequency(&qf) ? (uint64_t)qf.QuadPart : 0; }
     return &s->base;
 }

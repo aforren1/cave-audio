@@ -438,6 +438,73 @@ namespace BwAudio
         /// sample-accurate start: <c>DspTime + sampleRate/2</c> plays half a second out.</summary>
         public ulong DspTime => Ready ? Bwa.bwa_get_dsp_time(_eng) : 0;
 
+        /// <summary>The device's own (dsp sample ↔ host time) correspondence for the last rendered
+        /// block — the raw pair behind DspTimeAt/RealtimeAt, for callers who want to run their own
+        /// clock model. hostTimeNs is monotonic nanoseconds on a backend-defined epoch. False until
+        /// audio is running with a host-stamped backend.</summary>
+        public bool GetClock(out ulong dspSample, out ulong hostTimeNs)
+        {
+            dspSample = 0; hostTimeNs = 0;
+            return Ready && Bwa.bwa_get_clock(_eng, out dspSample, out hostTimeNs);
+        }
+
+        /// <summary>Device-reported render→DAC output latency, frames at the engine rate (DVS includes
+        /// its Dante network buffering). A sound scheduled for dsp time T is HEARD at T + OutputLatency —
+        /// fold it into AV alignment together with your measured display delay. 0 = unknown / no
+        /// physical output (the silent null-sink fallback).</summary>
+        public uint OutputLatency => Ready ? Bwa.bwa_get_output_latency(_eng) : 0;
+
+        /// <summary>Map a Time.realtimeSinceStartupAsDouble moment to the dsp-sample clock — THE way
+        /// to land a sound on a visual event: <c>emitter.PlayAt(engine.DspTimeAt(tEvent))</c> (schedule
+        /// with margin; a start in the past plays immediately). Built on the device's own block stamps
+        /// (GetClock) with a continuously refreshed epoch offset, so it self-corrects device↔OS clock
+        /// drift; typically accurate to well under a millisecond, falling back to block-granular
+        /// DspTime pairing (~one block) when no device stamp exists. For events that live on the AUDIO
+        /// timeline (cues in a scheduled track), skip wall time entirely — use t0 + cue×rate.</summary>
+        public ulong DspTimeAt(double realtime)
+        {
+            RefreshClock();
+            double fs = sampleRate;
+            if (!_clkValid)
+            {
+                double f = (double)DspTime + (realtime - Time.realtimeSinceStartupAsDouble) * fs;
+                return f > 0 ? (ulong)f : 0;
+            }
+            double dsp = _clkSampleD + (realtime + _clkOffset - _clkHostSec) * fs;
+            return dsp > 0 ? (ulong)dsp : 0;
+        }
+
+        /// <summary>Inverse of DspTimeAt: the Time.realtimeSinceStartupAsDouble moment at which a dsp
+        /// sample is RENDERED (add OutputLatency/sampleRate for when it is heard) — for firing visuals
+        /// off an audio-timeline event.</summary>
+        public double RealtimeAt(ulong dspSample)
+        {
+            RefreshClock();
+            double fs = sampleRate;
+            if (!_clkValid)
+                return Time.realtimeSinceStartupAsDouble + ((double)dspSample - (double)DspTime) / fs;
+            return _clkHostSec + ((double)dspSample - _clkSampleD) / fs - _clkOffset;
+        }
+
+        // The wall↔dsp correspondence: the driver-stamped pair is exact, so the only thing to
+        // estimate is the constant epoch offset between the driver's host clock and Unity's realtime
+        // clock. Each refresh observes (offset − pair age), the age being up to a block plus
+        // scheduling noise — so a decaying MAX converges on the true offset (refreshes landing just
+        // after a bufferSwitch have ~zero age) while the small decay lets it track ppm-scale clock
+        // drift. Guards reset the model across an engine restart or an epoch change.
+        void RefreshClock()
+        {
+            if (!Ready || !Bwa.bwa_get_clock(_eng, out ulong cs, out ulong ct)) { _clkValid = false; return; }
+            double hostSec = ct * 1e-9;
+            double cand = hostSec - Time.realtimeSinceStartupAsDouble;
+            if (!_clkValid || cs < _clkSample || Math.Abs(cand - _clkOffset) > 0.5)
+                _clkOffset = cand;                                   // first pair / restart / epoch change
+            else
+                _clkOffset = Math.Max(cand, _clkOffset - 2e-6);      // decaying max (covers clock drift)
+            _clkSample = cs; _clkSampleD = cs; _clkHostSec = hostSec; _clkValid = true;
+        }
+        bool _clkValid; ulong _clkSample; double _clkSampleD, _clkHostSec, _clkOffset;
+
         /// <summary>Drive ONE raw output channel with a test tone — a speaker-check / wiring tool, injected
         /// after the per-speaker trims. NOT a spatial path (it bypasses the panner). gain 0 or Off silences.</summary>
         public void TestSignal(uint channel, BwaTestKind kind, float gain) { if (Ready) Bwa.bwa_set_test_signal(_eng, channel, kind, gain); }
@@ -640,6 +707,7 @@ namespace BwAudio
         void LateUpdate()
         {
             if (!Ready) return;
+            RefreshClock();   // keep the wall↔dsp offset estimator warm even when no helper ran this frame
             if (_rebakeStatic)   // a scene loaded/unloaded since last frame -> re-collect static geometry once
             {
                 _rebakeStatic = false;

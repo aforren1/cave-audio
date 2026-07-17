@@ -249,6 +249,12 @@ struct RtCore {
      * (gen<<1 | playing-bit), republished by the audio thread each block. The gen guards a stale
      * or recycled handle (a mismatched gen reads as not-playing). */
     _Atomic uint32_t* play_pub;
+    /* per-slot playhead for control-thread readback (rt_source_get_position): packed
+     * (gen<<48 | frames<<0, 48-bit position), republished alongside play_pub. One word, so the gen
+     * gate and the position can never tear apart. The position is the voice's CONTENT playhead —
+     * cursor for in-memory/bed voices, stream_pos (frames actually consumed) for stream/push — so
+     * it freezes under pause, lands where seek lands, and slips with a stream underrun. */
+    _Atomic uint64_t* pos_pub;
 
     /* debug channel test signal (bwa_set_test_signal): audio-thread DSP state, set by CMD_TEST_SIGNAL,
      * generated + summed onto each channel AFTER align (raw channel). 0 kind = off. */
@@ -346,6 +352,13 @@ struct RtCore {
     float       xover_a;     /* one-pole LP coeff for the dual-band crossover (BWA_DUALBAND_FC), rate-derived */
     uint64_t    dsp_block;   /* audio-thread: next block's dsp-sample (fallback clock when no device timestamp) */
     _Atomic uint64_t dsp_now;/* published block-start dsp-sample; control thread reads via rt_dsp_time for scheduling */
+    /* device clock pair for rt_get_clock: the sink's (sample_pos, systemTime) stamp for the last
+     * rendered block, published seqlock-style (odd seq = write in progress) so the control thread
+     * always reads a CONSISTENT pair — the driver's own statement of "this output sample
+     * corresponds to this host time", the jitter-free wall->dsp bridge AV sync needs. Only blocks
+     * carrying a valid host stamp publish (ts NULL / time 0 keeps the last good pair). */
+    _Atomic uint32_t clk_seq;
+    _Atomic uint64_t clk_sample, clk_time;
     uint32_t   layout_gen;   /* bumped on rt_set_layout; the SPCAP/VBAP caches compare it to self-invalidate */
     SpcapState spcap;        /* SPCAP cache (audio-thread-owned; rebuilt on listener/layout change) */
     VbapState  vbap;         /* VBAP cache (same) */
@@ -2142,6 +2155,14 @@ void rt_render(RtCore* c, float* bus, uint32_t nframes, const bwa_timestamp* ts)
     uint64_t block_start = ts ? ts->sample_pos : c->dsp_block;
     c->dsp_block = block_start + nframes;
     atomic_store_explicit(&c->dsp_now, block_start, memory_order_relaxed);
+    if (ts && ts->system_time_ns) {   /* publish the device clock pair (seqlock; this thread is the only writer) */
+        uint32_t cs = atomic_load_explicit(&c->clk_seq, memory_order_relaxed);
+        atomic_store_explicit(&c->clk_seq, cs + 1, memory_order_relaxed);       /* odd: write window opens */
+        atomic_thread_fence(memory_order_release);                              /* the odd seq lands before the data */
+        atomic_store_explicit(&c->clk_sample, block_start, memory_order_relaxed);
+        atomic_store_explicit(&c->clk_time, ts->system_time_ns, memory_order_relaxed);
+        atomic_store_explicit(&c->clk_seq, cs + 2, memory_order_release);       /* even: pair consistent */
+    }
 #if defined(_MSC_VER)
     /* Flush denormals to zero on the audio thread: gain ramps toward 0 (e.g. a voice
      * moving off a channel) otherwise produce subnormals that stall the FP pipeline. */
@@ -2293,6 +2314,9 @@ void rt_render(RtCore* c, float* bus, uint32_t nframes, const bwa_timestamp* ts)
         const Voice* v = &c->voices[i];
         uint32_t st = ((uint32_t)v->gen << 1) | ((v->active && v->playing && v->sound) ? 1u : 0u);
         atomic_store_explicit(&c->play_pub[i], st, memory_order_release);
+        uint64_t pos = v->sound ? (v->sound->stream ? v->stream_pos : (uint64_t)v->cursor) : 0;
+        atomic_store_explicit(&c->pos_pub[i], ((uint64_t)v->gen << 48) | (pos & 0xFFFFFFFFFFFFULL),
+                              memory_order_release);
     }
     if (aux) {   /* reflection bed: convolve the aux send + sum onto the bus BEFORE align (so it gets trim+delay too) */
         BWA_ZONE_BEGIN(zt, "reflect tap");
@@ -2412,10 +2436,51 @@ bool rt_source_is_playing(RtCore* c, uint32_t h) {
     return c->inuse[idx] && c->gen[idx] == BWA_H_GEN(h) && c->play_opt[idx] != 0;   /* play still queued */
 }
 
+/* Control-thread readback: the voice's content playhead in engine-rate frames, as of the last
+ * rendered block. In-memory/bed voices report the sample cursor (frozen under pause, landed after a
+ * seek, wrapped by a loop); stream/push voices report frames actually CONSUMED — the data-driven
+ * clock, which an underrun slips rather than drops, so this is the truth the caller cannot derive
+ * from the dsp clock. A finished non-loop voice keeps reporting its final position until the next
+ * play; a stale/recycled handle, an idle voice, or a scheduled play still held silent reads 0.
+ * Latest-wins at block granularity: a just-issued play/seek is reflected one block later. */
+uint64_t rt_source_get_position(RtCore* c, uint32_t h) {
+    if (!c || h == 0) return 0;
+    uint32_t idx = BWA_H_IDX(h);
+    if (idx >= c->voice_cap) return 0;
+    uint64_t st = atomic_load_explicit(&c->pos_pub[idx], memory_order_acquire);
+    if ((uint32_t)(st >> 48) != BWA_H_GEN(h)) return 0;   /* stale/recycled, or not yet published */
+    return st & 0xFFFFFFFFFFFFULL;
+}
+
 /* Control thread: the engine's current dsp-sample clock (the most recently rendered block's first
  * sample). Schedule a sample-accurate play with rt_source_play_at(.., rt_dsp_time(c) + delay_samples). */
 uint64_t rt_dsp_time(RtCore* c) {
     return c ? atomic_load_explicit(&c->dsp_now, memory_order_relaxed) : 0;
+}
+
+/* Control-thread readback: the device's (output sample position, host time) correspondence stamped
+ * at the top of the last rendered block — ASIO's ASIOGetSamplePosition pair; the null sink's QPC
+ * synthesis. Unlike pairing rt_dsp_time with a caller-side clock read (jittered by up to a block
+ * plus scheduling), this pair is stamped inside the audio stack itself, so the wall->dsp mapping
+ * dsp(T) = sample + (T - time_ns) * rate / 1e9 is exact. The epoch of time_ns is backend-defined —
+ * anchor it against your own monotonic clock and track the constant offset. False (outputs
+ * untouched) until a host-stamped block has rendered: before start, on the manual sink (whose clock
+ * is deliberately wall-free for reproducibility), or under a driver that reports no systemTime. */
+bool rt_get_clock(RtCore* c, uint64_t* sample, uint64_t* time_ns) {
+    if (!c) return false;
+    for (int tries = 0; tries < 16; ++tries) {          /* seqlock read: retry a torn snapshot */
+        uint32_t s1 = atomic_load_explicit(&c->clk_seq, memory_order_acquire);
+        if (s1 & 1u) continue;                          /* write in progress */
+        uint64_t sm = atomic_load_explicit(&c->clk_sample, memory_order_relaxed);
+        uint64_t tm = atomic_load_explicit(&c->clk_time, memory_order_relaxed);
+        atomic_thread_fence(memory_order_acquire);      /* the data loads land before the re-check */
+        if (atomic_load_explicit(&c->clk_seq, memory_order_relaxed) != s1) continue;
+        if (tm == 0) return false;                      /* nothing published yet */
+        if (sample)  *sample  = sm;
+        if (time_ns) *time_ns = tm;
+        return true;
+    }
+    return false;   /* persistently torn — cannot happen at block cadence (one write per ~5 ms) */
 }
 
 /* Active listener pose, for the binaural monitor. Audio thread only (same thread as
@@ -2950,6 +3015,7 @@ RtCore* rt_create(uint32_t req_voice_cap, uint32_t sound_cap, uint32_t sample_ra
     c->occ_eq     = (_Atomic uint64_t*)calloc(voice_cap, sizeof(_Atomic uint64_t));
     c->occ_dir    = (_Atomic float*)   calloc(voice_cap, sizeof(_Atomic float));
     c->play_pub   = (_Atomic uint32_t*)calloc(voice_cap, sizeof(_Atomic uint32_t));
+    c->pos_pub    = (_Atomic uint64_t*)calloc(voice_cap, sizeof(_Atomic uint64_t));
     c->aux        = (float*)   calloc(BWA_RT_MAX_BLOCK, sizeof(float));   /* reflection aux-send scratch */
     c->stream_scratch = (float*)calloc(BWA_RT_MAX_BLOCK, sizeof(float));  /* per-block streaming pull scratch */
     c->path_accum = (float*)calloc((size_t)BWA_AMBI_CH * BWA_RT_MAX_BLOCK, sizeof(float));  /* pathing ambisonic accumulator */
@@ -3045,7 +3111,7 @@ RtCore* rt_create(uint32_t req_voice_cap, uint32_t sound_cap, uint32_t sample_ra
     for (int o = 1; o <= 3; ++o)                              /* max-rE tapers per content order */
         ambi_max_re_weights(o, c->re_w[o - 1]);
     c->ldc_a = 1.f - expf(-6.2831853f * 250.f / (float)sample_rate);   /* loudness-comp shelf corner */
-    if (!c->voices || !c->occ_handle || !c->occ_val || !c->occ_eq || !c->occ_dir || !c->play_pub || !c->aux ||
+    if (!c->voices || !c->occ_handle || !c->occ_val || !c->occ_eq || !c->occ_dir || !c->play_pub || !c->pos_pub || !c->aux ||
         !c->stream_scratch || !c->streams || !c->path_accum || !c->path_pub || !c->path_idx ||
         !c->gen || !c->inuse || !c->priority || !c->stealing || !c->push_sound || !c->retire_park ||
         !c->play_opt || !c->freelist || !c->sounds || !c->sfreelist ||
@@ -3354,6 +3420,7 @@ void rt_destroy(RtCore* c) {
     free((void*)c->path_idx);
     free(c->aux);
     free((void*)c->occ_dir);            /* cast drops the _Atomic qualifier for free() */
+    free((void*)c->pos_pub);
     free((void*)c->play_pub);
     free((void*)c->occ_eq);
     free((void*)c->occ_val);

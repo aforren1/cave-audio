@@ -112,6 +112,11 @@ bool open_driver(const char* want, int mic_in, int nspk) {
 }
 } /* namespace */
 
+/* driver latencies from the last open (calib_asio_latencies); -1 = unknown. Deliberately NOT part
+ * of `g` (which is memset per open) so the values survive calib_asio_close — the localize solve
+ * cross-checks them after the device is already torn down. */
+static long s_lat_in = -1, s_lat_out = -1;
+
 int calib_asio_open(const char* driver, int mic_in, int nspk, const float* sweep, float* cap) {
     if (mic_in < 0) { fprintf(stderr, "calib_capture: mic input channel must be >= 0 (got %d)\n", mic_in); return 1; }
     if (nspk < 1 || nspk > BWA_CHANNELS) { fprintf(stderr, "calib_capture: speaker count %d out of range\n", nspk); return 1; }
@@ -135,8 +140,28 @@ int calib_asio_open(const char* driver, int mic_in, int nspk, const float* sweep
     for (int c = 0; c <= nspk; ++c) { g.ci[c].channel=g.bi[c].channelNum; g.ci[c].isInput=g.bi[c].isInput; ASIOGetChannelInfo(&g.ci[c]); }
     if (ASIOCreateBuffers(g.bi, nspk+1, g.bufsize, &g.cb)!=ASE_OK) {
         fprintf(stderr, "calib_capture: ASIOCreateBuffers failed\n"); ASIOExit(); asioDrivers->removeCurrentDriver(); asio_session_release(); return 1; }
+    /* Log the driver's own latencies (final only after CreateBuffers — they depend on the
+     * negotiated buffer). out + in is the DIGITAL half of the sweep's round trip; every measured
+     * delay contains it, plus DAC/ADC + analog. A rig-day diagnostic: if a solved system latency
+     * ever lands BELOW this sum, the measurement chain is misconfigured, and if it lands tens of
+     * ms above, look at the DVS latency setting. */
+    s_lat_in = s_lat_out = -1;
+    { long il = 0, ol = 0;
+      if (ASIOGetLatencies(&il, &ol) == ASE_OK && il >= 0 && ol >= 0) {
+          s_lat_in = il; s_lat_out = ol;
+          printf("calib_capture: driver latency out %ld + in %ld frames (%.2f + %.2f ms) — digital loop %.2f ms = %.3f m at c\n",
+                 ol, il, 1e3 * (double)ol / CAL_FS, 1e3 * (double)il / CAL_FS,
+                 1e3 * (double)(ol + il) / CAL_FS, 343.0 * (double)(ol + il) / CAL_FS);
+      } else printf("calib_capture: driver did not report latencies (ASIOGetLatencies)\n"); }
     if (ASIOStart()!=ASE_OK) { fprintf(stderr, "calib_capture: ASIOStart failed\n"); ASIODisposeBuffers(); ASIOExit(); asioDrivers->removeCurrentDriver(); asio_session_release(); return 1; }
     return 0;
+}
+
+int calib_asio_latencies(long* in_frames, long* out_frames) {
+    if (s_lat_in < 0 || s_lat_out < 0) return 0;
+    if (in_frames)  *in_frames  = s_lat_in;
+    if (out_frames) *out_frames = s_lat_out;
+    return 1;
 }
 
 /* Capture one speaker: drive the sweep on output `ch`, record CAL_CAPLEN samples of the mic. */

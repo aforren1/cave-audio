@@ -51,6 +51,13 @@ int calib_asio_list(void);                                  /* print them to std
 int  calib_asio_open(const char* driver, int mic_in, int nspk, const float* sweep, float* cap);
 int  calib_asio_capture(int ch);
 void calib_asio_close(void);
+/* Driver-reported latencies from the LAST calib_asio_open (valid until the next open — they
+ * survive close, so a solve that runs after teardown can still cross-check): output = render->DAC,
+ * input = ADC->delivered, in frames at CAL_FS. Their SUM is the DIGITAL half of the sweep's round
+ * trip — a hard lower bound for any measured/solved system latency, which adds DAC/ADC conversion
+ * and analog on top. Logged at open; returns 1 when known, 0 when no device has been opened (or
+ * the driver refused ASIOGetLatencies). */
+int  calib_asio_latencies(long* in_frames, long* out_frames);
 #endif
 
 #endif /* BWA_CALIB_CAPTURE_H */

@@ -66,6 +66,7 @@ void        bwa_sink_stop(bwa_sink* s)    { if (s) s->vt->stop(s); }
 void        bwa_sink_close(bwa_sink* s)   { if (s) s->vt->close(s); }
 const char* bwa_sink_backend(bwa_sink* s) { return s ? s->vt->backend(s) : "none"; }
 uint32_t    bwa_sink_block_size(bwa_sink* s) { return s ? s->vt->block_size(s) : 0; }
+uint32_t    bwa_sink_output_latency(bwa_sink* s) { return (s && s->vt->output_latency) ? s->vt->output_latency(s) : 0; }
 const float* bwa_sink_render_block(bwa_sink* s, uint32_t* channels, uint32_t* nframes) {
     return (s && s->vt->render_block) ? s->vt->render_block(s, channels, nframes) : NULL;
 }

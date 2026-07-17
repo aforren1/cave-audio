@@ -1770,10 +1770,29 @@ int main(void) {
                 pos += N;
             }
             CHECK(pre < 1e-6, "scheduled voice is silent before its start_sample");
+            CHECK(rt_source_get_position(cp, h) == 0, "position reads 0 while the scheduled start holds");
             bwa_timestamp ts3 = { pos, 0 };                          /* pos == 3N: the voice fires here */
             rt_render(cp, bus, N, &ts3);
             CHECK(total_l2() > 1e-3, "scheduled voice fires at its start_sample");
+            CHECK(rt_source_get_position(cp, h) == (uint64_t)N, "position starts counting at the scheduled start");
             CHECK(rt_dsp_time(cp) == (uint64_t)3 * N, "rt_dsp_time tracks the device sample clock");
+            /* device clock pair (rt_get_clock): every render above carried system_time_ns == 0
+             * (no host stamp), so no pair exists yet; a stamped block publishes exactly its
+             * (sample, time); an unstamped one KEEPS the last valid pair rather than clobbering it */
+            uint64_t cs = 1, ct = 1;
+            CHECK(!rt_get_clock(cp, &cs, &ct), "no clock pair before a host-stamped block renders");
+            bwa_timestamp tsc = { (uint64_t)4 * N, 123456789ull };
+            rt_render(cp, bus, N, &tsc);
+            CHECK(rt_get_clock(cp, &cs, &ct) && cs == (uint64_t)4 * N && ct == 123456789ull,
+                  "the clock pair publishes the sink's (sample, host-time) stamp");
+            bwa_timestamp tsc2 = { (uint64_t)5 * N, 0 };            /* driver dropped kSystemTimeValid */
+            rt_render(cp, bus, N, &tsc2);
+            CHECK(rt_get_clock(cp, &cs, &ct) && cs == (uint64_t)4 * N && ct == 123456789ull,
+                  "an unstamped block keeps the last valid pair");
+            bwa_timestamp tsc3 = { (uint64_t)6 * N, 223456789ull };
+            rt_render(cp, bus, N, &tsc3);
+            CHECK(rt_get_clock(cp, &cs, &ct) && cs == (uint64_t)6 * N && ct == 223456789ull,
+                  "the pair tracks each stamped block");
             rt_destroy(cp);
         }
     }
@@ -1820,6 +1839,7 @@ int main(void) {
             render2(cps);                                       /* binds + consumes an EMPTY ring */
             CHECK(total_l2() < 1e-9, "push: silent before any data (underrun, not garbage)");
             CHECK(rt_source_is_playing(cps, h), "push: an empty ring does not end the voice");
+            CHECK(rt_source_get_position(cps, h) == 0, "push: position 0 before any data arrives");
 
             float pblk[2 * N];
             for (int i = 0; i < 2 * N; ++i) pblk[i] = 0.5f;
@@ -1833,6 +1853,8 @@ int main(void) {
             rt_render(cps, bus, N, &pts);
             CHECK(total_l2() < 1e-9, "underrun after the pushed data: silence again");
             CHECK(rt_source_is_playing(cps, h), "underrun does not end the voice");
+            CHECK(rt_source_get_position(cps, h) == (uint64_t)2 * N,
+                  "push: position counts frames CONSUMED — an underrun slips it, never advances it");
 
             /* data-driven clock: audio pushed after an underrun still plays (nothing was skipped) */
             CHECK(rt_source_push(cps, h, pblk, N) == N, "push after an underrun");
@@ -1998,22 +2020,38 @@ int main(void) {
             rt_commit(cq);
             rt_render(cq, bus, N, &ts);                    /* block 1 of 5 plays */
             CHECK(total_l2() > 1e-3, "voice audible before pause");
+            CHECK(rt_source_get_position(cq, h) == (uint64_t)N, "position tracks the playhead");
             rt_source_set_paused(cq, h, true);
             rt_render(cq, bus, N, &ts);                    /* ramp-out block (consumes block 2) */
             rt_render(cq, bus, N, &ts);
             CHECK(total_l2() < 1e-9, "paused voice is silent");
             CHECK(rt_source_is_playing(cq, h), "a paused voice still reads as playing");
+            CHECK(rt_source_get_position(cq, h) == (uint64_t)2 * N, "position freezes where the pause ramp landed");
             for (int b = 0; b < 10; ++b) rt_render(cq, bus, N, &ts);   /* 10N frames >> the 3N remaining */
+            CHECK(rt_source_get_position(cq, h) == (uint64_t)2 * N, "position stays frozen across paused blocks");
             rt_source_set_paused(cq, h, false);
             rt_render(cq, bus, N, &ts);                    /* ramp back in: block 3 of 5 */
             CHECK(total_l2() > 1e-3, "resume continues from the frozen position (nothing consumed while paused)");
+            CHECK(rt_source_get_position(cq, h) == (uint64_t)3 * N, "position resumes from the frozen point");
             rt_source_seek(cq, h, (uint64_t)4 * N);        /* jump to the last block of content */
             rt_render(cq, bus, N, &ts);                    /* ramp-out */
             rt_render(cq, bus, N, &ts);                    /* seek lands: plays [4N, 5N) ramping in */
             CHECK(total_l2() > 1e-3, "seek lands and plays the target region");
+            CHECK(rt_source_get_position(cq, h) == (uint64_t)5 * N, "position followed the seek through the target region");
             rt_render(cq, bus, N, &ts);                    /* past the end: the non-loop voice ends */
             CHECK(total_l2() < 1e-9, "silence after the seeked tail");
             CHECK(!rt_source_is_playing(cq, h), "seeking near the end ends the non-loop voice on time");
+            CHECK(rt_source_get_position(cq, h) == (uint64_t)5 * N, "a finished voice keeps its final position");
+            /* loop wrap + stale handle: 6N frames through a 5N looped sound lands one block past the seam */
+            uint32_t h2 = rt_source_create(cq);
+            rt_source_set_pos(cq, h2, 1.f, 0.f, 1.f);
+            rt_source_play(cq, h2, sq, true);
+            rt_commit(cq);
+            for (int b = 0; b < 6; ++b) rt_render(cq, bus, N, &ts);
+            CHECK(rt_source_get_position(cq, h2) == (uint64_t)N, "a looped position wraps at the sound length");
+            rt_source_destroy(cq, h2);
+            rt_render(cq, bus, N, &ts);
+            CHECK(rt_source_get_position(cq, h2) == 0, "a destroyed handle's position reads 0");
             rt_destroy(cq);
             remove("bwa_rt_seek.wav");
         } else if (cq) { CHECK(0, "write seek wav"); rt_destroy(cq); }
@@ -2059,6 +2097,6 @@ int main(void) {
 
     remove(WAV);
     if (fails) { printf("rt_test: %d FAILURES\n", fails); return 1; }
-    printf("rt_test OK (DBAP, commit, gen-drop, gain, occlusion, EQ, directivity, bed, reflection-tap, channel-test, air+Doppler, spread+MDAP+spectral+size+extent, tracked-room-EQ, decorrelation, parametric-bed, pose-pred, near-spread, loudness-comp, multi-listener, master+groups+fades+global-pause, pitch, bed-rotation+orientation, max-rE+split, reverb-send, dual-band, voice-steal, scheduled-play, streaming, pause/seek, limiter, bus-meter verified)\n");
+    printf("rt_test OK (DBAP, commit, gen-drop, gain, occlusion, EQ, directivity, bed, reflection-tap, channel-test, air+Doppler, spread+MDAP+spectral+size+extent, tracked-room-EQ, decorrelation, parametric-bed, pose-pred, near-spread, loudness-comp, multi-listener, master+groups+fades+global-pause, pitch, bed-rotation+orientation, max-rE+split, reverb-send, dual-band, voice-steal, scheduled-play, clock-pair, streaming, pause/seek, position-readback, limiter, bus-meter verified)\n");
     return 0;
 }

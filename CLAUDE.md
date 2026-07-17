@@ -298,7 +298,25 @@ lazy-global gap on a process's first open is fixed alongside), `bwa_sound_get_fr
 `bwa_source_set_attenuation_override` (per-source distance curve — same formula as the layout knob,
 applied by RATIO in the solve so it's panner-agnostic and composes with spread/dual-band/decor;
 loudness comp tracks the override's own curve; rolloff 0 = a constant-level direction-only source;
-ref <= 0 clears). **Pitch** (`bwa_source_set_pitch`, [0.25, 4]): fractional-cursor
+ref <= 0 clears). **`bwa_source_get_position`/`bwa_bed_get_position`** (rt-tested) is the per-voice
+content-playhead readback (engine-rate frames) riding the same per-block republish as `is_playing`
+(`pos_pub` packs gen<<48|pos48 in ONE atomic so the gen gate can't tear): cursor for memory/bed
+voices, consumed frames for stream/push (an underrun slips it), frozen under pause, 0 while a
+scheduled play holds — the AV-sync readback a client-side DspTime derivation can't get right
+(Unity: `Emitter.Position`/`PositionSeconds`, `AmbisonicBed.Position`, and `Emitter.PlayAt` now
+surfaces the long-bound `bwa_source_play_at`). **`bwa_get_clock`** (rt+smoke-tested) publishes the
+device's (sample position, host-time-ns) pair from each block callback — the ASIOTime stamp the
+sink always captured but rt_render used to discard — via a C11 seqlock (`clk_seq/clk_sample/
+clk_time`, odd = write open; an unstamped block KEEPS the last valid pair), giving clients a
+jitter-free wall↔dsp mapping for AV sync (epoch is backend-defined: drivers vary, the null sink
+counts from stream start, the MANUAL sink never stamps — reproducibility; the ASIO sink synthesizes
+a QPC stamp at callback entry when the driver omits systemTime — FlexASIO does, DVS unknown); **`bwa_get_output_latency`**
+surfaces `ASIOGetLatencies` through a new sink-vtbl entry (`output_latency`, queried after
+CreateBuffers; DVS reports its Dante buffering there; null/manual = 0) — when a scheduled sample is
+HEARD, not just rendered. Unity: `Engine.GetClock`/`OutputLatency`/`DspTimeAt`/`RealtimeAt` (the
+last two keep a decaying-max epoch-offset estimator refreshed each LateUpdate — converges through
+minimal-age refreshes, tracks ppm drift, falls back to block-granular DspTime pairing stampless).
+**Pitch** (`bwa_source_set_pitch`, [0.25, 4]): fractional-cursor
 linear-interp resample of in-memory sounds in `mix_voice` (integer cursor + frac — no precision
 loss; the rate GLIDES per sample; the loop seam handles multi-sample overshoot; streams/beds
 unaffected; composes with Doppler). **Bed rotation** (`bwa_bed_set_rotation`, radians): closed-form
@@ -407,7 +425,12 @@ which recovers positions + the system latency jointly), and a **room report** (`
 reflections — a treatment diagnostic, NOT a model to match: matching double-counts the real room). `--save-irs`
 retains the per-speaker IR kernels (one capture serves trims, the room report, and a future headphone room
 simulator). The ASIO capture compiles but is unverified on hardware; `--simulate` runs the whole pipeline
-hardware-free. **Zylia ZM-1 single-position localization** (`zylia.c`, unit-tested off-hardware via the `zylia`
+hardware-free. The capture shell logs the driver's OWN latencies at open (`ASIOGetLatencies`; the
+`calib_asio_latencies` accessor survives close) and `--localize` cross-checks the solved system latency
+against that digital loop — residual = DAC/ADC + analog, so negative is impossible (device/clocking
+mix-up) and tens of ms flags the DVS latency setting; `--live` without `--latency` prints the loop as
+the lower-bound starting value. `bwa_minimal` prints a measured device rate from two `bwa_get_clock`
+stamps (the Stage-0 Dante clock-lock check in docs/hardware-validation.md). **Zylia ZM-1 single-position localization** (`zylia.c`, unit-tested off-hardware via the `zylia`
 test) is the one-placement complement to the multi-position omni survey: the 19-capsule sphere sees each sweep
 arrive at 19 times, so the arrival-time DIFFERENCES give a speaker's DIRECTION from ONE spot (latency-free,
 sub-degree — `zylia_doa`), and with the known latency a Gauss-Newton refine against the exact spherical

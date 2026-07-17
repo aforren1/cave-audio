@@ -146,16 +146,47 @@ int main(int argc, char** argv) {
         if (asio_up) calib_asio_close();
 #endif
         float (*pos)[3] = (float(*)[3])malloc((size_t)n * 3 * sizeof(float));
+        double* latv = (double*)malloc((size_t)n * sizeof(double));
         int failed = 0;
         for (int s = 0; s < n; ++s) {
             double lat = 0;
+            latv[s] = -1.0;
             if (!calib_trilaterate(&range[(size_t)s * K], micpos, K, pos[s], &lat)) {
                 fprintf(stderr, "  spk %2d: trilateration failed (degenerate mic positions?)\n", s);
                 pos[s][0] = pos[s][1] = pos[s][2] = 0.f; ++failed;
             } else {
                 printf("  spk %2d: pos=(%+.3f %+.3f %+.3f)  [system latency %.3f m]\n", s, pos[s][0], pos[s][1], pos[s][2], lat);
+                latv[s] = lat;
             }
         }
+#ifdef BWA_HAVE_ASIO
+        /* Cross-check the solved latency against the driver's own numbers: the solve recovers the
+         * FULL loop (digital buffers + DAC/ADC + analog), the driver reports the digital half, so
+         * solved-minus-driver must be a small positive residual. Negative is physically impossible
+         * (device mix-up, clocking); tens of ms points at an unexpected buffer (the DVS latency
+         * setting). Median over speakers — per-speaker latency should agree, it is one system. */
+        { long il = 0, ol = 0;
+          if (!simulate && calib_asio_latencies(&il, &ol)) {
+              double lats[BWA_CHANNELS]; int nl = 0;
+              for (int s = 0; s < n; ++s) if (latv[s] >= 0.0) lats[nl++] = latv[s];
+              if (nl > 0) {
+                  for (int a = 1; a < nl; ++a) { double v = lats[a]; int b = a;   /* tiny insertion sort */
+                      while (b > 0 && lats[b-1] > v) { lats[b] = lats[b-1]; --b; } lats[b] = v; }
+                  double med_m = (nl & 1) ? lats[nl/2] : 0.5 * (lats[nl/2 - 1] + lats[nl/2]);
+                  double drv_m = 343.0 * (double)(il + ol) / FS;
+                  double resid_ms = (med_m - drv_m) / 343.0 * 1e3;
+                  printf("localize: solved system latency %.3f m (%.2f ms) vs driver digital loop %.3f m (%.2f ms) -> residual %+.2f ms\n",
+                         med_m, med_m / 343.0 * 1e3, drv_m, drv_m / 343.0 * 1e3, resid_ms);
+                  if (resid_ms < -0.5)
+                      printf("  WARNING: solved latency is BELOW the driver's own digital loop — physically impossible;\n"
+                             "           check the device/clocking (wrong driver? sample-rate mismatch?)\n");
+                  else if (resid_ms > 20.0)
+                      printf("  WARNING: residual is unexpectedly large for DAC/ADC + analog — check the DVS latency\n"
+                             "           setting / an extra buffer in the loop\n");
+              }
+          } }
+#endif
+        free(latv);
         if (!calib_write_positions(layout_path, out_path, pos, n, err, sizeof err)) { fprintf(stderr, "calibrate: %s\n", err); return 1; }
         printf("localize: wrote %d positions to %s%s\n", n, out_path, failed ? "  (some failed, set to 0)" : "");
         free(range); free(pos); free(res); free(cap); free(sweep);
@@ -242,6 +273,15 @@ int main(int argc, char** argv) {
         double target = sqrt(dx*dx + dy*dy + dz*dz);
         printf("live: speaker %d, target %.3f m from the mic (%.2f %.2f %.2f). Move it; press a key to stop.\n",
                live_speaker, target, mic[0], mic[1], mic[2]);
+#ifdef BWA_HAVE_ASIO
+        /* no --latency given: the driver's digital loop is a hard LOWER bound for it — a useful
+         * starting value (the true system latency adds DAC/ADC + analog on top; --localize solves
+         * it exactly, and prints this same comparison). */
+        { long il = 0, ol = 0;
+          if (known_latency < 0.0 && !simulate && calib_asio_latencies(&il, &ol))
+              printf("  (driver digital loop = %.3f m of the range below — a lower bound for --latency)\n",
+                     343.0 * (double)(il + ol) / FS); }
+#endif
         int iters = simulate ? 4 : (1 << 30);
         for (int t = 0; t < iters; ++t) {
             if (simulate) calib_sim_capture(live_speaker, &L, mic, sweep, cap);

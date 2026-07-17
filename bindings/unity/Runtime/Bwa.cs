@@ -146,12 +146,23 @@ namespace BwAudio
         [DllImport(DLL, CallingConvention = CC)] public static extern void bwa_source_play(IntPtr e, uint s, uint snd, [MarshalAs(UnmanagedType.I1)] bool loop);
         [DllImport(DLL, CallingConvention = CC)] public static extern void bwa_source_play_at(IntPtr e, uint s, uint snd, [MarshalAs(UnmanagedType.I1)] bool loop, ulong startSample);
         [DllImport(DLL, CallingConvention = CC)] public static extern ulong bwa_get_dsp_time(IntPtr e);
+        // The device-stamped (output sample, host time ns) pair for the last rendered block — the
+        // jitter-free wall<->dsp bridge (see Engine.DspTimeAt). hostTimeNs is monotonic on a
+        // backend-defined epoch. False (outputs zeroed) until a host-stamped block has rendered.
+        [DllImport(DLL, CallingConvention = CC)] [return: MarshalAs(UnmanagedType.I1)] public static extern bool bwa_get_clock(IntPtr e, out ulong dspSample, out ulong hostTimeNs);
+        // Device-reported render->DAC latency in frames (ASIOGetLatencies; DVS includes its Dante
+        // buffering). 0 = unknown / no physical output (null sink).
+        [DllImport(DLL, CallingConvention = CC)] public static extern uint bwa_get_output_latency(IntPtr e);
         [DllImport(DLL, CallingConvention = CC)] public static extern void bwa_source_stop(IntPtr e, uint s);
         [DllImport(DLL, CallingConvention = CC)] public static extern void bwa_source_set_paused(IntPtr e, uint s, [MarshalAs(UnmanagedType.I1)] bool paused);
         // Global pause: EVERY voice (memory, streamed, bed) ramps out and freezes; resume continues exactly.
         [DllImport(DLL, CallingConvention = CC)] public static extern void bwa_set_paused(IntPtr e, [MarshalAs(UnmanagedType.I1)] bool paused);
         [DllImport(DLL, CallingConvention = CC)] public static extern void bwa_source_seek(IntPtr e, uint s, ulong frame);   // engine-rate frames; in-memory sounds
         [DllImport(DLL, CallingConvention = CC)] [return: MarshalAs(UnmanagedType.I1)] public static extern bool bwa_source_is_playing(IntPtr e, uint s);
+        // Content playhead in engine-rate frames (latest-wins readback, ~one block of lag): freezes under
+        // pause, lands where seek lands, follows pitch at the actual rate; streamed sounds report frames
+        // actually CONSUMED (an underrun slips it). 0 = idle, stale handle, or a scheduled play not started.
+        [DllImport(DLL, CallingConvention = CC)] public static extern ulong bwa_source_get_position(IntPtr e, uint s);
         [DllImport(DLL, CallingConvention = CC)] public static extern void bwa_play_oneshot(IntPtr e, uint snd, float x, float y, float z, float gain);
         // Procedural (push) sources: the voice plays PCM you push — mono float frames at the engine
         // rate, ~1.3 s ring. Underrun renders silence without losing your place; push returns the
@@ -193,6 +204,7 @@ namespace BwAudio
         [DllImport(DLL, CallingConvention = CC)] public static extern void bwa_bed_set_priority(IntPtr e, uint b, int priority);
         [DllImport(DLL, CallingConvention = CC)] public static extern void bwa_bed_set_group(IntPtr e, uint b, uint group);
         [DllImport(DLL, CallingConvention = CC)] [return: MarshalAs(UnmanagedType.I1)] public static extern bool bwa_bed_is_playing(IntPtr e, uint b);
+        [DllImport(DLL, CallingConvention = CC)] public static extern ulong bwa_bed_get_position(IntPtr e, uint b);
 
         // ---- materials / scene geometry (load time; needs the Steam Audio build) ----
         [DllImport(DLL, CallingConvention = CC)] public static extern uint bwa_material_preset(IntPtr e, BwaMaterialPreset preset);

@@ -4,6 +4,33 @@ All notable changes to `com.brainworks.bw_audio`.
 
 ## [Unreleased]
 
+### Added — AV sync surface (scheduled play + playhead readback)
+
+- **`Emitter.PlayAt(startSample)`** → the already-bound `bwa_source_play_at`: sample-accurate
+  scheduled play on the engine's dsp clock (`Engine.DspTime`) — the `AudioSource.PlayScheduled`
+  equivalent, previously reachable only through the raw `Bwa` layer. Keep the startSample you
+  passed: `DspTime - startSample` is the sync clock for beat-cued visuals.
+- **`Emitter.Position` / `PositionSeconds`** and **`AmbisonicBed.Position`** → new engine ABI
+  `bwa_source_get_position` / `bwa_bed_get_position` (latest-wins per-voice playhead readback,
+  like `is_playing`): the content playhead in engine-rate frames, correct where client-side
+  `DspTime` arithmetic breaks — it freezes under pause, lands where a seek lands, follows pitch
+  at the actual rate, and for streamed clips counts frames actually consumed (an underrun slips
+  it, exactly like the audible clock). ~One audio block of lag; for tighter-than-a-block
+  scheduling keep using `DspTime` arithmetic.
+- **`Engine.DspTimeAt(realtime)` / `RealtimeAt(dspSample)`** → new engine ABI `bwa_get_clock`:
+  the wall↔dsp bridge. The engine now publishes the device's own (sample position, host time)
+  stamp from each audio callback — `ASIOTime`'s pair, previously captured at the sink and
+  discarded — so mapping a `Time.realtimeSinceStartupAsDouble` moment to a dsp sample no longer
+  carries a block of jitter: `emitter.PlayAt(engine.DspTimeAt(tEvent))` lands a sound on a visual
+  event to well under a millisecond. The helpers maintain the epoch offset between the driver's
+  clock and Unity's (decaying-max estimator, refreshed per frame from `LateUpdate`), self-correct
+  ppm clock drift, and fall back to block-granular `DspTime` pairing when the backend has no host
+  stamp. `Engine.GetClock` exposes the raw pair.
+- **`Engine.OutputLatency`** → new engine ABI `bwa_get_output_latency`: the device's self-reported
+  render→DAC latency in frames (`ASIOGetLatencies` — DVS includes its Dante network buffering;
+  0 on the null-sink fallback). A sound scheduled for dsp time T is *heard* at T + OutputLatency:
+  the audio half of AV-latency alignment, so only the display delay is left to measure by hand.
+
 ### Added — multi-scene support
 
 - The `Engine` (a `DontDestroyOnLoad` singleton = the physical CAVE, not a level) now **follows Unity's

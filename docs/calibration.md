@@ -44,6 +44,14 @@ automatically.
   marker on the *mic* (open line-of-sight) so OptiTrack hands you the known mic positions, and let
   acoustics locate the screen-hidden speakers. Spread the mic positions out and make them
   non-coplanar (GDOP) — clustered points amplify error. Cross-check against the install drawings.
+
+  The solved latency gets a free sanity check: at open, the capture shell logs the driver's own
+  `ASIOGetLatencies` numbers (out + in = the **digital** half of the loop; DVS reports its Dante
+  buffering there), and after the solve the CLI prints solved-vs-driver with the residual. The
+  residual is what the driver *can't* see — DAC/ADC conversion + analog — so it must be a small
+  positive number. **Negative is physically impossible** (wrong device, sample-rate mismatch);
+  tens of ms means an unexpected buffer (check the DVS latency setting). The solved value stays
+  authoritative — the driver's numbers are nominal, the sweep measured reality.
 - **default** — trims. `calib_solve` turns the per-speaker measurements into `delay_ms`
   (arrival-align every speaker to the farthest) and `gain_db` (equalize sensitivity, with the
   speaker→mic distance divided out so it corrects the *speaker*, not distance; cut-only so nothing
@@ -62,7 +70,8 @@ automatically.
   so re-run `--localize` for a full re-survey. Exit code 3 if anything is flagged (scriptable).
 - **`--live N`** — positioning aid: repeatedly measures speaker N's distance from the mic while you
   move it (`--latency m`, from a prior `--localize`, turns the reading into absolute distance + delta
-  from the layout target; press a key to stop). One omni mic gives **distance**, not full 3D — for
+  from the layout target; press a key to stop). With no `--latency` it prints the driver's digital
+  loop as a starting value — a hard **lower bound** (the true latency adds DAC/ADC + analog). One omni mic gives **distance**, not full 3D — for
   live 3D you'd need ≥4 fixed mics. Sub-sample peak interpolation puts the reading at well under 1 mm.
 - **`--save-irs prefix`** — dump the per-speaker impulse responses (the deconvolved kernels). One
   capture session therefore serves trims, the room report, AND a future **headphone room simulator**:

@@ -162,6 +162,19 @@ namespace BwAudio
             if (snd != 0) { Bwa.bwa_source_play(Eng, _src, snd, loop); _paused = false; }   // play restarts un-paused
         }
 
+        /// <summary>Sample-accurate scheduled play — AudioSource.PlayScheduled equivalent, on the
+        /// engine's dsp clock instead of AudioSettings.dspTime: output begins exactly when
+        /// Engine.DspTime reaches `startSample`. Schedule with margin (at least a block; e.g.
+        /// <c>PlayAt(engine.DspTime + engine.sampleRate / 2)</c> starts half a second out); a start
+        /// already in the past plays immediately. Keep the startSample you passed —
+        /// <c>DspTime - startSample</c> is the sync clock for driving visuals (or poll Position).</summary>
+        public void PlayAt(ulong startSample, string clipOverride = null)
+        {
+            if (!_created || Eng == IntPtr.Zero) return;
+            uint snd = Engine.Instance.Load(clipOverride ?? clip);
+            if (snd != 0) { Bwa.bwa_source_play_at(Eng, _src, snd, loop, startSample); _paused = false; }
+        }
+
         /// <summary>Stop this source — AudioSource.Stop equivalent.</summary>
         public void Stop() { if (_created && Eng != IntPtr.Zero) Bwa.bwa_source_stop(Eng, _src); }
 
@@ -184,6 +197,17 @@ namespace BwAudio
         /// equivalent, click-free (ramp-out → jump → ramp-in). In-memory clips only; streamed clips
         /// ignore it. Past-the-end wraps a looping clip and ends a one-shot.</summary>
         public void Seek(ulong samples) { if (_created && Eng != IntPtr.Zero) Bwa.bwa_source_seek(Eng, _src, samples); }
+
+        /// <summary>Current playhead in engine-rate frames — AudioSource.timeSamples-get equivalent
+        /// (latest-wins readback, ~one audio block of lag). Engine-owned truth where deriving it from
+        /// DspTime breaks: it freezes while Paused, lands where Seek lands, follows Pitch at the
+        /// actual rate, and counts frames actually consumed for streamed clips. 0 while idle or
+        /// before a scheduled PlayAt starts; a finished one-shot keeps its final position.</summary>
+        public ulong Position => _created && Eng != IntPtr.Zero ? Bwa.bwa_source_get_position(Eng, _src) : 0;
+
+        /// <summary>Playhead in seconds — AudioSource.time-get equivalent (Position over the engine
+        /// sample rate).</summary>
+        public double PositionSeconds => Engine.Instance ? Position / (double)Engine.Instance.sampleRate : 0.0;
 
         /// <summary>Linear gain — AudioSource.volume equivalent; applies immediately if live. Cancels a
         /// running FadeTo/FadeOut (an explicit gain wins over a fade).</summary>

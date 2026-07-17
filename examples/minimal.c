@@ -13,7 +13,10 @@
  * y is height above the floor); with no layout file the engine pans over its default
  * grid, a 3 m cube of 26 speakers with its centre (the ear point) at (0, 1.5, 0).
  *
- *   bwa_minimal [sound.wav]     (no argument: a short ping is synthesized and used)
+ *   bwa_minimal [sound.wav] [--driver name]
+ *     (no wav: a short ping is synthesized and used; no --driver: auto-pick the first
+ *      ASIO driver with enough channels — name one to test a specific device, e.g.
+ *      "Dante Virtual Soundcard" on the rig. bwa_calibrate --list-drivers enumerates.)
  */
 #include "bw_audio.h"
 
@@ -27,8 +30,8 @@
 static void put_u32(FILE* f, uint32_t v) { fwrite(&v, 4, 1, f); }  /* x64 Windows: little-endian */
 static void put_u16(FILE* f, uint16_t v) { fwrite(&v, 2, 1, f); }
 
-static const char* ensure_ping(int argc, char** argv) {
-    if (argc > 1) return argv[1];
+static const char* ensure_ping(const char* wav_arg) {
+    if (wav_arg) return wav_arg;
     static const char* path = "bwa_minimal_ping.wav";
     enum { RATE = 48000, N = RATE / 2 };
     static int16_t pcm[N];
@@ -47,13 +50,19 @@ static const char* ensure_ping(int argc, char** argv) {
 }
 
 int main(int argc, char** argv) {
-    const char* wav = ensure_ping(argc, argv);
+    const char* wav_arg = NULL, * driver = NULL;
+    for (int i = 1; i < argc; ++i) {
+        if (!strcmp(argv[i], "--driver") && i + 1 < argc) driver = argv[++i];
+        else wav_arg = argv[i];
+    }
+    const char* wav = ensure_ping(wav_arg);
 
     /* ---- load time: these may block, allocate, and touch disk ---- */
     bwa_desc cfg = { 0 };
     cfg.profile        = BWA_PROFILE_BINAURAL;  /* desk profile: 26-ch bus -> HRTF -> stereo */
     cfg.sample_rate    = 48000;
     cfg.block_size     = 256;
+    cfg.asio_driver    = driver;                /* NULL = auto-pick by channel count */
     /* no tracker connected: this "game" pushes the listener pose itself */
 
     bwa_engine* e = bwa_create(&cfg);
@@ -77,8 +86,15 @@ int main(int argc, char** argv) {
     bwa_source_play(e, src, ping, true);        /* loop while we move it */
 
     /* ---- the game loop: push updates every frame, then ONE commit ---- */
+    uint64_t cs0 = 0, ct0 = 0;                 /* baseline device clock pair (rate check below) */
+    bool have_clk = false;
     printf("orbiting a looping ping around the listener (6 s)...\n");
     for (int frame = 0; frame < 6 * 60; ++frame) {
+        if (frame == 30 && !have_clk)          /* baseline ~0.5 s in: skip the start-of-stream
+                                                * prefill burst (drivers fill their ring with a few
+                                                * back-to-back callbacks at start, which would read
+                                                * as a fake rate error) */
+            have_clk = bwa_get_clock(e, &cs0, &ct0);
         float a = (float)(6.283185307179586 * frame / (3.0 * 60.0));   /* one lap / 3 s */
         bwa_source_set_pos(e, src, 2.f * cosf(a), 1.5f, -2.f * sinf(a));
         bwa_set_listener_pose(e, 0.f, 1.5f, 0.f, 0.f, 0.f, 0.f, 1.f);   /* standing at the array centre */
@@ -86,9 +102,29 @@ int main(int argc, char** argv) {
         Sleep(16);                             /* ~60 Hz, like an engine tick */
     }
     bwa_source_stop(e, src);
+    Sleep(400);                                 /* breathe: the looping ping restarts every 0.5 s, so
+                                                 * whichever iteration is in flight gets cut by the
+                                                 * (one-block, click-free) stop — without a gap its
+                                                 * truncated attack lands right under the oneshot
+                                                 * below and reads as a doubled beep */
+
+    /* device clock sanity: the audio stack stamps a (sample position, host time) pair per block
+     * (bwa_get_clock — the wall<->dsp bridge for AV sync), so two pairs a few seconds apart measure
+     * the device's TRUE sample rate. On a rig, a Dante clocking problem — wrong nominal rate,
+     * unlocked clock domain — shows up here as far more than a few ppm of deviation. */
+    uint64_t cs1 = 0, ct1 = 0;
+    if (have_clk && bwa_get_clock(e, &cs1, &ct1) && ct1 > ct0) {
+        double rate = (double)(cs1 - cs0) * 1e9 / (double)(ct1 - ct0);
+        printf("device clock: %.2f Hz measured over the run (nominal %u, %+.1f ppm)\n",
+               rate, cfg.sample_rate, (rate / (double)cfg.sample_rate - 1.0) * 1e6);
+    }
 
     /* fire-and-forget at a fixed point: no handle to manage, the voice recycles itself */
     bwa_play_oneshot(e, ping, -2.f, 1.5f, 0.f, 1.f);
+    Sleep(600);                                 /* let the 0.5 s ping ring out — a oneshot has no
+                                                 * handle to poll, and without the wait the play
+                                                 * below starts on top of it (two overlapping dings,
+                                                 * which by ear reads as a bug) */
 
     /* completion: there are no callbacks -- play, then poll bwa_source_is_playing.
      * The readback publishes per audio block, so give the play command a moment to land

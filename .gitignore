@@ -59,6 +59,9 @@ bindings/unity/**/obj/
 # playground scratch (the demo generates this at startup, removes it on clean exit)
 playground_src.wav
 
+# bwa_minimal scratch (synthesized ping, regenerated every argument-less run)
+bwa_minimal_ping.wav
+
 # icon preview contact sheet (gen_icons.py regenerates it; the .ico files ARE committed)
 /examples/icons/preview_sheet.png
 
