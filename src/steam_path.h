@@ -33,7 +33,8 @@ void       steam_path_destroy(SteamPath* sp);
  * Decodes the summed ambisonic indirect field to the 26-ch bus. */
 void       steam_path_tap(void* ud, float* bus, uint32_t n, const float* lp, const float* lq, const float* ambi, uint32_t ambi_ch);
 
-/* Register / move / enable a source for pathing (control thread, under the scene lock). `on`=0 mutes
+/* Register / move / enable a source for pathing (control thread; shadow-only and non-blocking — the
+ * sim thread creates the IPLSource and commits, so these can never race RunPathing). `on`=0 mutes
  * it (publishes a zero path). The handle is the rt source handle, so rt.c can gate the published
  * params on its own generation. */
 void       steam_path_set_source(SteamPath* sp, uint32_t handle, const float pos[3], int on);

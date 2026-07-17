@@ -32,6 +32,13 @@ void steam_scene_set_mesh_mat(SteamScene* s, const float* verts, int nverts, con
                               int nmat, const float* absorption, const float* scattering,
                               const float* transmission, const int* tri_material);
 
+/* Drive any STAGED static mesh through to a COMMITTED scene before returning (set_mesh_mat only
+ * stages; the sim thread commits within ~one 33 ms tick). Call before create-time ray tracing —
+ * probe generation, the reflection/path bakes — so they trace the room that was just set instead
+ * of racing the deferred commit (or tracing an empty scene). Control thread; may block ~one sim
+ * tick; safe alongside the running sim thread. Dynamic (instanced) movers are not flushed. */
+void steam_scene_flush(SteamScene* s);
+
 /* Per-source controls (by bw source handle). Occlusion + directivity are independent features (a
  * source can be directional without being occluded). directivity: weight 0=omni / .5=cardioid /
  * 1=fig-8, power>=1 sharpens; the dipole axis is the source forward (fwd). source_gone clears all

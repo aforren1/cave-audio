@@ -72,6 +72,11 @@ struct SteamReflect {
     volatile LONG stop;
 };
 
+/* phonon's identity basis (ahead = -z), not the room's (+z ahead) — harmless AND load-bearing to
+ * keep consistent: the sim's ambisonic IR is oriented by this listener frame, and the decode side
+ * (steam_reflect_tap) passes the SAME basis as the decode orientation, so the two cancel and the
+ * field stays world-locked with the custom speaker directions given in room coordinates. Change
+ * one only with the other. See steam_scene.c's identity_cs note. */
 static void cs_at(IPLCoordinateSpace3* cs, const float origin[3]) {
     cs->right = (IPLVector3){ 1, 0, 0 }; cs->up = (IPLVector3){ 0, 1, 0 };
     cs->ahead = (IPLVector3){ 0, 0, -1 }; cs->origin = (IPLVector3){ origin[0], origin[1], origin[2] };
@@ -218,7 +223,9 @@ static int do_bake(SteamReflect* r, const Layout* L) {
         gp.transform.elements[1][1] = bs; gp.transform.elements[1][3] = head;
         gp.transform.elements[2][2] = bs; gp.transform.elements[2][3] = z;
         gp.transform.elements[3][3] = 1.f;
+        steam_scene_ray_lock(r->scene);                 /* shared: reads the scene — no concurrent commit */
         iplProbeArrayGenerateProbes(pa, r->scene_ipl, &gp);
+        steam_scene_ray_unlock(r->scene);
         if (iplProbeArrayGetNumProbes(pa) > 0) { iplProbeBatchAddProbeArray(r->probes, pa); ++np; }
         iplProbeArrayRelease(&pa);
     }
@@ -236,7 +243,11 @@ static int do_bake(SteamReflect* r, const Layout* L) {
     bp.simulatedDuration = 2.0f;                        /* long IR so the parametric RT60 estimates well... */
     bp.savedDuration = r->duration;                     /* ...but only save the early (directional) part */
     bp.order = (IPLint32)r->order; bp.numThreads = 2; bp.irradianceMinDistance = 1.f;
+    steam_scene_ray_lock(r->scene);                     /* shared, for the whole bake: it ray-traces the scene
+                                                         * and must not race a commit from the occlusion sim
+                                                         * thread (geometry can't change mid-bake anyway) */
     iplReflectionsBakerBake(r->ctx, &bp, NULL, NULL);   /* BLOCKS: ray-traces every probe once */
+    steam_scene_ray_unlock(r->scene);
 
     iplSimulatorAddProbeBatch(r->sim, r->probes);
     iplSimulatorCommit(r->sim);
@@ -279,6 +290,10 @@ SteamReflect* steam_reflect_create(SteamScene* scene, RtCore* rt, const Layout* 
     if (iplSimulatorCreate(r->ctx, &ss, &r->sim) != IPL_STATUS_SUCCESS) goto fail;
     iplSimulatorSetScene(r->sim, r->scene_ipl);
     iplSimulatorCommit(r->sim);
+
+    steam_scene_flush(scene);      /* a just-staged room (set_box -> start inside one scene-sim tick)
+                                    * must be COMMITTED before the bake below ray-traces — and before
+                                    * the real-time sim's first tick, for a deterministic start */
 
     IPLSourceSettings src; memset(&src, 0, sizeof src);
     src.flags = IPL_SIMULATIONFLAGS_REFLECTIONS;

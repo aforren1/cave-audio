@@ -1,10 +1,13 @@
 /*
  * steam_scene.c — materials occlusion, off-thread half. See steam_scene.h.
  *
- * Build-only-with-SDK (BWA_WITH_STEAMAUDIO). phonon's room/coord convention equals ours
- * (x=right, y=up, -z=ahead), so positions pass through unchanged. A dedicated sim thread owns all
- * phonon objects; the control thread only writes a locked shadow (mesh + per-source enable/pos),
- * and the audio thread only reads the published occlusion float (rt_set_occlusion).
+ * Build-only-with-SDK (BWA_WITH_STEAMAUDIO). phonon has no world-axis convention of its own — it is
+ * right-handed like the room and takes explicit basis vectors (IPLCoordinateSpace3) wherever
+ * orientation matters — so room-space positions pass through unchanged. (The ROOM's identity
+ * listener faces +z; identity_cs below uses phonon's identity basis, ahead = -z — see its note for
+ * why that difference is harmless here.) A dedicated sim thread owns all phonon objects; the
+ * control thread only writes a locked shadow (mesh + per-source enable/pos), and the audio thread
+ * only reads the published occlusion float (rt_set_occlusion).
  */
 #include "steam_scene.h"
 #include "frame.h"         /* BWA_ROOM_AHEAD (default source forward) */
@@ -56,6 +59,10 @@ struct SteamScene {
     struct { uint32_t handle; float pos[3]; uint8_t features;
              float dir_weight, dir_power, fwd[3]; } *shadow;          /* [voice_cap] by voice slot */
     int           mesh_dirty;
+    uint32_t      mesh_gen;         /* bumped per staged mesh (under `lock`) ... */
+    uint32_t      mesh_gen_applied; /* ... and raised to the taken gen once that mesh is COMMITTED —
+                                     * steam_scene_flush waits on this, so "flushed" really means
+                                     * "committed", even when the sim thread claimed the mesh first */
     IPLVector3*   pend_verts; int pend_nverts;     /* pending mesh (control thread) */
     IPLTriangle*  pend_tris;  int pend_ntris;
     IPLMaterial*  pend_mats;   int pend_nmat;       /* pending materials + per-triangle index */
@@ -92,6 +99,11 @@ enum { FEAT_OCC = 1, FEAT_DIR = 2 };
                                  * attenuation rides the level scalar, so the EQ tilt never fully silences a band */
 
 static IPLVector3 vec3(const float p[3]) { IPLVector3 v = { p[0], p[1], p[2] }; return v; }
+/* phonon's identity basis (ahead = -z) at `origin` — NOT the room's listener identity (+z ahead).
+ * Deliberate and harmless: every DIRECT-sim output consumed here (occlusion, transmission,
+ * directivity) depends on positions and the SOURCE frame only, never on which way the listener
+ * faces. If an orientation-sensitive output is ever consumed, pass the real head basis instead
+ * (steam_decode.c's head_basis is the reference). */
 static void identity_cs(IPLCoordinateSpace3* cs, const float origin[3]) {
     cs->right = (IPLVector3){ 1, 0, 0 }; cs->up = (IPLVector3){ 0, 1, 0 };
     cs->ahead = (IPLVector3){ 0, 0, -1 }; cs->origin = vec3(origin);
@@ -129,8 +141,14 @@ static void scene_w_unlock(SteamScene* s) { ReleaseSRWLockExclusive(&s->scene_sr
  * mesh's lifetime (freed on the next apply_mesh / destroy) to stay robust to phonon referencing
  * rather than copying. The whole remove/create/add/commit runs under the exclusive scene lock (a rare
  * event — a full static-mesh swap — so holding the lock across the BVH build is fine). */
+static void mesh_mark_applied(SteamScene* s, uint32_t gen) {
+    EnterCriticalSection(&s->lock);
+    if ((int32_t)(gen - s->mesh_gen_applied) > 0) s->mesh_gen_applied = gen;
+    LeaveCriticalSection(&s->lock);
+}
+
 static void apply_mesh(SteamScene* s, IPLVector3* verts, int nverts, IPLTriangle* tris, int ntris,
-                       IPLMaterial* mats, int nmat, IPLint32* tri_mat) {
+                       IPLMaterial* mats, int nmat, IPLint32* tri_mat, uint32_t gen) {
     scene_w_lock(s);
     if (s->mesh) { iplStaticMeshRemove(s->mesh, s->scene); iplStaticMeshRelease(&s->mesh); s->mesh = NULL; }
     free(s->mesh_verts); free(s->mesh_tris); free(s->mesh_mi); free(s->mesh_mats);
@@ -144,6 +162,7 @@ static void apply_mesh(SteamScene* s, IPLVector3* verts, int nverts, IPLTriangle
         iplSceneCommit(s->scene);
     }
     scene_w_unlock(s);
+    mesh_mark_applied(s, gen);     /* after the commit: flush's wait means COMMITTED */
 }
 
 /* (sim thread) Build slot d's sub-scene + mesh + instance and ADD the instance to the main scene
@@ -278,10 +297,11 @@ static DWORD WINAPI sim_thread(LPVOID arg) {
     while (!s->stop) {
         /* 1. snapshot the shadow + take the pending mesh */
         IPLVector3* verts = NULL; IPLTriangle* tris = NULL; int nverts = 0, ntris = 0;
-        IPLMaterial* mats = NULL; int nmat = 0; IPLint32* tri_mat = NULL;
+        IPLMaterial* mats = NULL; int nmat = 0; IPLint32* tri_mat = NULL; uint32_t mgen = 0;
         EnterCriticalSection(&s->lock);
         if (s->mesh_dirty) {
             s->mesh_dirty = 0;
+            mgen = s->mesh_gen;                            /* the taken buffers ARE this staged gen */
             verts = s->pend_verts; tris = s->pend_tris; nverts = s->pend_nverts; ntris = s->pend_ntris;
             mats = s->pend_mats; nmat = s->pend_nmat; tri_mat = s->pend_tri_mat;
             s->pend_verts = NULL; s->pend_tris = NULL;     /* ownership moves to the sim thread */
@@ -299,8 +319,9 @@ static DWORD WINAPI sim_thread(LPVOID arg) {
 
         /* 2. apply geometry change: the static mesh, then reconcile the instanced movers. Both mutate +
          * commit the main scene under the exclusive scene lock (scene_w_lock/unlock). */
-        if (verts && tris && mats && tri_mat) apply_mesh(s, verts, nverts, tris, ntris, mats, nmat, tri_mat);
-        else { free(verts); free(tris); free(mats); free(tri_mat); }   /* partial set: drop it intact */
+        if (verts && tris && mats && tri_mat) apply_mesh(s, verts, nverts, tris, ntris, mats, nmat, tri_mat, mgen);
+        else { free(verts); free(tris); free(mats); free(tri_mat);     /* partial set: drop it intact... */
+               if (mgen) mesh_mark_applied(s, mgen); }                 /* ...but never leave flush waiting */
         reconcile_dynamic(s);
 
         /* 3. reconcile IPLSources against the snapshot: a source exists iff it has any feature. */
@@ -351,7 +372,16 @@ static DWORD WINAPI sim_thread(LPVOID arg) {
          * (floored) is the EQ. Each output is read only for the features that asked for it. */
         int any_src = 0;
         for (uint32_t i = 0; i < cap; ++i) if (s->srcs[i]) { any_src = 1; break; }
-        if (any_src) { BWA_ZONE_BEGIN(zs, "occlusion ray-trace"); iplSimulatorRunDirect(s->simulator); BWA_ZONE_END(zs); }
+        if (any_src) {
+            BWA_ZONE_BEGIN(zs, "occlusion ray-trace");
+            /* shared scene lock: RunDirect ray-traces the committed scene, and commits no longer
+             * come only from this thread (steam_scene_flush commits from the control thread) —
+             * every trace holds the lock shared, every commit holds it exclusive. */
+            AcquireSRWLockShared(&s->scene_srw);
+            iplSimulatorRunDirect(s->simulator);
+            ReleaseSRWLockShared(&s->scene_srw);
+            BWA_ZONE_END(zs);
+        }
         for (uint32_t i = 0; i < cap; ++i) {
             if (!s->srcs[i]) continue;
             IPLSimulationOutputs out; memset(&out, 0, sizeof out);
@@ -467,7 +497,46 @@ static void set_mesh_internal(SteamScene* s, const float* verts, int nverts, con
     s->pend_tris = t;  s->pend_ntris = ntris;
     s->pend_mats = m;  s->pend_nmat = nmat;
     s->pend_tri_mat = mi; s->mesh_dirty = 1;
+    s->mesh_gen++;                                 /* steam_scene_flush waits for THIS gen to commit */
     LeaveCriticalSection(&s->lock);
+}
+
+/* Synchronously drive any STAGED static mesh through to a committed scene, from the CALLING thread.
+ * For create-time consumers that ray-trace the scene immediately (probe generation, the reflection/
+ * path bakes): without this they'd race the sim thread's deferred commit — or trace the room before
+ * it exists (a set_box -> bwa_start gap smaller than one 33 ms sim tick). Safe alongside the running
+ * sim thread: the pending buffers are claimed under the shadow lock (each staged mesh is applied
+ * exactly once, by whichever thread takes it first) and the commit runs under the exclusive scene
+ * lock like every other commit. If the sim thread claimed the mesh first, this WAITS until that
+ * commit lands (bounded by ~one sim tick), so on return the latest staged mesh is committed either
+ * way. Dynamic (instanced) movers stay sim-thread-owned and are not flushed — bakes don't track
+ * them anyway (docs/materials.md). Control thread; may block briefly (load-time use). */
+void steam_scene_flush(SteamScene* s) {
+    if (!s) return;
+    IPLVector3* verts = NULL; IPLTriangle* tris = NULL; int nverts = 0, ntris = 0;
+    IPLMaterial* mats = NULL; int nmat = 0; IPLint32* tri_mat = NULL;
+    uint32_t target, mgen = 0;
+    EnterCriticalSection(&s->lock);
+    target = s->mesh_gen;
+    if (s->mesh_dirty) {
+        s->mesh_dirty = 0;
+        mgen = s->mesh_gen;
+        verts = s->pend_verts; tris = s->pend_tris; nverts = s->pend_nverts; ntris = s->pend_ntris;
+        mats = s->pend_mats; nmat = s->pend_nmat; tri_mat = s->pend_tri_mat;
+        s->pend_verts = NULL; s->pend_tris = NULL; s->pend_mats = NULL; s->pend_tri_mat = NULL;
+    }
+    LeaveCriticalSection(&s->lock);
+    if (verts && tris && mats && tri_mat) apply_mesh(s, verts, nverts, tris, ntris, mats, nmat, tri_mat, mgen);
+    else {
+        free(verts); free(tris); free(mats); free(tri_mat);
+        for (;;) {                                 /* sim thread claimed it: wait for its commit */
+            EnterCriticalSection(&s->lock);
+            int done = (int32_t)(s->mesh_gen_applied - target) >= 0;
+            LeaveCriticalSection(&s->lock);
+            if (done) break;
+            Sleep(1);
+        }
+    }
 }
 
 void steam_scene_set_mesh_mat(SteamScene* s, const float* verts, int nverts, const int* tris, int ntris,

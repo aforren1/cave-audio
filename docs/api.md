@@ -711,8 +711,12 @@ Geometry rules:
   per-frame path. Geometry is in the mover's LOCAL space; one material token covers all its triangles;
   the movable table holds 32 instances. `add` returns a handle (or `-1`: no SDK / bad geometry / full).
 - **Runtime-safe.** Both the static swap and dynamic-mesh moves are safe to call at any time — the
-  occlusion sim owns the scene and serializes `iplSceneCommit`, and the borrowing reflection/pathing
-  sims take the scene lock **shared** around their ray traces, so a commit can no longer race a trace.
+  scene commit (`iplSceneCommit`) always runs under an **exclusive** scene lock, and *every* ray
+  trace against the scene — the occlusion sim's direct pass, the reflection/pathing sims, and the
+  create-time probe generation and bakes — holds the same lock **shared**, so a commit can never
+  race a trace (phonon documents exactly this constraint). Staged geometry is also **flushed
+  synchronously** when the reflection bed or pathing is created, so `bwa_scene_set_box` followed
+  immediately by `bwa_start` bakes the room you just set, never an empty scene.
   Caveat: **baked** reflections/pathing don't track a runtime change (the bake froze the geometry —
   see [materials.md](./materials.md)); real-time reflections and occlusion do. Replacing the whole
   static mesh at runtime works but rebuilds the entire BVH — prefer dynamic meshes for movers.

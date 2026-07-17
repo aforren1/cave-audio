@@ -36,14 +36,23 @@ struct SteamPath {
     uint32_t     channels;       /* the layout's speaker count (<= BWA_CHANNELS capacity) */
     uint32_t     order, ambi_ch, n, sample_rate;
 
+    /* Per-source state, steam_scene-style split: handle/pos/want are the CONTROL thread's shadow
+     * (written under `lock`); `src` is the phonon object, created/committed ONLY by the sim thread
+     * (reconcile_sources) — iplSimulatorCommit must never race iplSimulatorRunPathing, and both now
+     * live on one thread. (The debug seam reconciles inline; it documents "no sim thread running".)
+     * Slots are claim-once: a muted source keeps its slot + IPLSource until destroy. */
     CRITICAL_SECTION lock;
-    struct { uint32_t handle; float pos[3]; uint8_t on; IPLSource src; } srcs[PATH_MAX_SRC];
+    struct { uint32_t handle; float pos[3]; uint8_t want; IPLSource src; } srcs[PATH_MAX_SRC];
     int          nsrc;
 
     HANDLE        thread;
     volatile LONG stop;
 };
 
+/* phonon's identity basis (ahead = -z), not the room's (+z ahead) — harmless here: pathing outputs
+ * (eqCoeffs + world-space shCoeffs) depend on positions and the probe graph, not on which way this
+ * fictitious listener faces, and the decode side (steam_path_tap) uses the SAME basis, so the
+ * frames cancel. See steam_scene.c's identity_cs note. */
 static void cs_at(IPLCoordinateSpace3* cs, const float o[3]) {
     cs->right = (IPLVector3){1,0,0}; cs->up = (IPLVector3){0,1,0};
     cs->ahead = (IPLVector3){0,0,-1}; cs->origin = (IPLVector3){o[0],o[1],o[2]};
@@ -68,7 +77,9 @@ static int do_path_bake(SteamPath* sp, const Layout* L) {
         gp.transform.elements[1][1]=bs; gp.transform.elements[1][3]=head;
         gp.transform.elements[2][2]=bs; gp.transform.elements[2][3]=z;
         gp.transform.elements[3][3]=1.f;
+        steam_scene_ray_lock(sp->scene);                 /* shared: reads the scene — no concurrent commit */
         iplProbeArrayGenerateProbes(pa, sp->scene_ipl, &gp);
+        steam_scene_ray_unlock(sp->scene);
         if (iplProbeArrayGetNumProbes(pa)>0){ iplProbeBatchAddProbeArray(sp->probes,pa); ++np; }
         iplProbeArrayRelease(&pa);
     }
@@ -80,7 +91,11 @@ static int do_path_bake(SteamPath* sp, const Layout* L) {
     bp.identifier.type=IPL_BAKEDDATATYPE_PATHING; bp.identifier.variation=IPL_BAKEDDATAVARIATION_DYNAMIC;
     bp.numSamples=1; bp.radius=PATH_VIS_RADIUS; bp.threshold=PATH_VIS_THRESH;
     bp.visRange=PATH_VIS_RANGE; bp.pathRange=PATH_RANGE; bp.numThreads=2;
+    steam_scene_ray_lock(sp->scene);                     /* shared, for the whole bake: probe-pair visibility
+                                                          * ray-traces the scene and must not race a commit
+                                                          * from the occlusion sim thread */
     iplPathBakerBake(sp->ctx, &bp, NULL, NULL);          /* BLOCKS: probe-pair visibility graph */
+    steam_scene_ray_unlock(sp->scene);
 
     iplSimulatorAddProbeBatch(sp->sim, sp->probes);
     iplSimulatorCommit(sp->sim);
@@ -88,16 +103,39 @@ static int do_path_bake(SteamPath* sp, const Layout* L) {
     return np;
 }
 
-/* set per-source pathing inputs + run + read outputs into eq/sh. Caller holds nothing; the sim is
- * single-consumer (sim thread, or the test). Returns 1 if a path carries energy. */
-static int run_get(SteamPath* sp, const float listener[3], int slot, float eq[3], float* sh) {
+/* (sim thread — or the debug seam with no sim thread running) create + add IPLSources for wanted
+ * slots that lack one, then ONE iplSimulatorCommit. Runs on the same thread as RunPathing, which is
+ * the point: phonon forbids committing while a simulation runs, so creation must not stay on the
+ * control thread. Phonon calls happen outside `lock` (only the shadow snapshot is under it). */
+static void reconcile_sources(SteamPath* sp) {
+    int changed = 0;
+    for (int i = 0; i < PATH_MAX_SRC; ++i) {
+        EnterCriticalSection(&sp->lock);
+        int need = (i < sp->nsrc) && sp->srcs[i].want && !sp->srcs[i].src;
+        LeaveCriticalSection(&sp->lock);
+        if (!need) continue;
+        IPLSourceSettings ss; memset(&ss,0,sizeof ss); ss.flags = IPL_SIMULATIONFLAGS_PATHING;
+        IPLSource src = NULL;
+        if (iplSourceCreate(sp->sim, &ss, &src) == IPL_STATUS_SUCCESS) {
+            iplSourceAdd(src, sp->sim);
+            sp->srcs[i].src = src;      /* sim-thread-owned; the control thread never reads it */
+            changed = 1;
+        }
+    }
+    if (changed) iplSimulatorCommit(sp->sim);
+}
+
+/* set per-source pathing inputs + run + read outputs into eq/sh. `src` + `pos` are the caller's
+ * snapshot (the sim is single-consumer: sim thread, or the test seam). 1 = a path carries energy. */
+static int run_get(SteamPath* sp, const float listener[3], IPLSource src, const float pos[3],
+                   float eq[3], float* sh) {
     IPLSimulationInputs in; memset(&in,0,sizeof in);
     in.flags = IPL_SIMULATIONFLAGS_PATHING;
-    cs_at(&in.source, sp->srcs[slot].pos);
+    cs_at(&in.source, pos);
     in.pathingProbes = sp->probes;
     in.visRadius = PATH_VIS_RADIUS; in.visThreshold = PATH_VIS_THRESH; in.visRange = PATH_VIS_RANGE;
     in.pathingOrder = (IPLint32)sp->order;
-    iplSourceSetInputs(sp->srcs[slot].src, IPL_SIMULATIONFLAGS_PATHING, &in);
+    iplSourceSetInputs(src, IPL_SIMULATIONFLAGS_PATHING, &in);
 
     IPLSimulationSharedInputs sh_in; memset(&sh_in,0,sizeof sh_in);
     cs_at(&sh_in.listener, listener);
@@ -109,7 +147,7 @@ static int run_get(SteamPath* sp, const float listener[3], int slot, float eq[3]
     steam_scene_ray_unlock(sp->scene);
 
     IPLSimulationOutputs out; memset(&out,0,sizeof out);
-    iplSourceGetOutputs(sp->srcs[slot].src, IPL_SIMULATIONFLAGS_PATHING, &out);
+    iplSourceGetOutputs(src, IPL_SIMULATIONFLAGS_PATHING, &out);
     for (int b=0;b<3;++b) eq[b] = out.pathing.eqCoeffs[b];
     if (out.pathing.shCoeffs) for (uint32_t k=0;k<sp->ambi_ch;++k) sh[k] = out.pathing.shCoeffs[k];
     else                      for (uint32_t k=0;k<sp->ambi_ch;++k) sh[k] = 0.f;
@@ -134,19 +172,19 @@ static void normalize_eq(float eq[3]) {
     for (int b=0;b<3;++b) { float g = eq[b]/mx; eq[b] = g < PATH_EQ_MIN_GAIN ? PATH_EQ_MIN_GAIN : g; }
 }
 
+/* CONTROL thread: shadow-only (claim a slot, set pos/want under the lock) — no phonon calls, so it
+ * is genuinely non-blocking and cannot race the sim thread's RunPathing. The IPLSource itself is
+ * created by reconcile_sources on the sim thread (first tick after the claim; the sim publishes a
+ * zero path until then, which is also what a just-enabled blocked source would render). */
 void steam_path_set_source(SteamPath* sp, uint32_t handle, const float pos[3], int on) {
     if (!sp) return;
     EnterCriticalSection(&sp->lock);
     int slot = find_slot(sp, handle);
     if (slot < 0 && on && sp->nsrc < PATH_MAX_SRC) {
-        slot = sp->nsrc;
-        IPLSourceSettings ss; memset(&ss,0,sizeof ss); ss.flags = IPL_SIMULATIONFLAGS_PATHING;
-        if (iplSourceCreate(sp->sim, &ss, &sp->srcs[slot].src) == IPL_STATUS_SUCCESS) {
-            iplSourceAdd(sp->srcs[slot].src, sp->sim); iplSimulatorCommit(sp->sim);
-            sp->srcs[slot].handle = handle; ++sp->nsrc;
-        } else slot = -1;
+        slot = sp->nsrc++;
+        sp->srcs[slot].handle = handle;            /* src stays NULL: the sim thread creates it */
     }
-    if (slot >= 0) { sp->srcs[slot].pos[0]=pos[0]; sp->srcs[slot].pos[1]=pos[1]; sp->srcs[slot].pos[2]=pos[2]; sp->srcs[slot].on=(uint8_t)(on!=0); }
+    if (slot >= 0) { sp->srcs[slot].pos[0]=pos[0]; sp->srcs[slot].pos[1]=pos[1]; sp->srcs[slot].pos[2]=pos[2]; sp->srcs[slot].want=(uint8_t)(on!=0); }
     LeaveCriticalSection(&sp->lock);
 }
 
@@ -158,11 +196,19 @@ void steam_path_set_pos(SteamPath* sp, uint32_t handle, float x, float y, float 
     LeaveCriticalSection(&sp->lock);
 }
 
+/* Test seam: ONLY valid with the sim thread not running (steam_path_start not called) — it
+ * reconciles + runs the simulator inline, which would race a live sim thread. */
 int steam_path_debug_run_get(SteamPath* sp, const float listener[3], uint32_t handle, float eq[3], float* sh) {
     if (!sp) return 0;
+    reconcile_sources(sp);                       /* single-threaded here: create the claimed sources now */
+    EnterCriticalSection(&sp->lock);
     int slot = find_slot(sp, handle);
-    if (slot < 0) return 0;
-    return run_get(sp, listener, slot, eq, sh);
+    IPLSource src = (slot >= 0) ? sp->srcs[slot].src : NULL;
+    float pos[3] = { 0, 0, 0 };
+    if (slot >= 0) { pos[0]=sp->srcs[slot].pos[0]; pos[1]=sp->srcs[slot].pos[1]; pos[2]=sp->srcs[slot].pos[2]; }
+    LeaveCriticalSection(&sp->lock);
+    if (!src) return 0;
+    return run_get(sp, listener, src, pos, eq, sh);
 }
 
 /* AUDIO thread (rt path tap): decode the summed indirect ambisonic field to the 26 speakers + sum. */
@@ -188,12 +234,18 @@ static DWORD WINAPI sim_thread(LPVOID arg) {
     float eq[3], sh[BWA_AMBI_CH];
     while (!sp->stop) {
         float lp[3], lq[4]; rt_read_pose(sp->rt, lp, lq); (void)lq;
+        reconcile_sources(sp);                       /* create + commit here, NEVER on the control thread */
         EnterCriticalSection(&sp->lock); int n = sp->nsrc; LeaveCriticalSection(&sp->lock);
         for (int i = 0; i < n; ++i) {
-            if (!sp->srcs[i].on) { memset(sh, 0, sizeof(float)*sp->ambi_ch); rt_set_pathing(sp->rt, sp->srcs[i].handle, sh, NULL, sp->ambi_ch); continue; }
-            run_get(sp, lp, i, eq, sh);              /* sh carries direction+level; eq is the bending-loss tilt */
+            EnterCriticalSection(&sp->lock);         /* snapshot the slot's shadow (no torn pos reads) */
+            uint32_t handle = sp->srcs[i].handle; uint8_t want = sp->srcs[i].want;
+            float pos[3] = { sp->srcs[i].pos[0], sp->srcs[i].pos[1], sp->srcs[i].pos[2] };
+            LeaveCriticalSection(&sp->lock);
+            IPLSource src = sp->srcs[i].src;         /* sim-thread-owned */
+            if (!want || !src) { memset(sh, 0, sizeof(float)*sp->ambi_ch); rt_set_pathing(sp->rt, handle, sh, NULL, sp->ambi_ch); continue; }
+            run_get(sp, lp, src, pos, eq, sh);       /* sh carries direction+level; eq is the bending-loss tilt */
             normalize_eq(eq);                        /* -> pure colour (level already in sh); rt applies it pre-encode */
-            rt_set_pathing(sp->rt, sp->srcs[i].handle, sh, eq, sp->ambi_ch);
+            rt_set_pathing(sp->rt, handle, sh, eq, sp->ambi_ch);
         }
         Sleep(1000 / PATH_HZ);
     }
@@ -225,6 +277,8 @@ SteamPath* steam_path_create(SteamScene* scene, RtCore* rt, const Layout* L,
     iplSimulatorSetScene(sp->sim, sp->scene_ipl);
     iplSimulatorCommit(sp->sim);
 
+    steam_scene_flush(scene);      /* the bake ray-traces NOW: commit any just-staged room first
+                                    * (set_box -> start can beat the scene sim thread's next tick) */
     if (do_path_bake(sp, L) == 0) goto fail;
 
     sp->channels = L->count;                           /* the layout's speaker count (<= BWA_CHANNELS cap) */
