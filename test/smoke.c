@@ -32,6 +32,33 @@ static int run_profile(bwa_profile profile, const char* name) {
         return 1;
     }
 
+    /* version + resolved-config readbacks: the DLL's version must match the header we compiled
+     * against; the desc above was explicit, so the getters must echo it; and on the null sink the
+     * resolved sink type is NULL (machine-readable side of bwa_get_audio_backend). */
+    if (bwa_get_version() != BWA_VERSION) {
+        fprintf(stderr, "FAIL[%s]: bwa_get_version %x != header %x\n", name, bwa_get_version(), BWA_VERSION);
+        bwa_destroy(e); return 1;
+    }
+    if (bwa_get_sample_rate(e) != 48000 || bwa_get_block_size(e) != 256) {
+        fprintf(stderr, "FAIL[%s]: resolved sample_rate/block_size readback\n", name); bwa_destroy(e); return 1;
+    }
+    if (bwa_get_sink_type(e) != BWA_SINK_NULL) {
+        fprintf(stderr, "FAIL[%s]: bwa_get_sink_type is not NULL on the null sink\n", name); bwa_destroy(e); return 1;
+    }
+
+    /* bwa_get_speakers conventions: xyz=NULL -> the total (== channel count); with a buffer it
+     * returns the count FILLED (min(cap, count) — the bwa_get_bus_levels convention). */
+    {
+        float xyz3[3 * 3];
+        if (bwa_get_speakers(e, NULL, 0) != bwa_get_channel_count(e)) {
+            fprintf(stderr, "FAIL[%s]: get_speakers(NULL) != channel count\n", name); bwa_destroy(e); return 1;
+        }
+        if (bwa_get_speakers(e, xyz3, 3) != 3) {
+            fprintf(stderr, "FAIL[%s]: get_speakers must return the FILLED count under a small cap\n", name);
+            bwa_destroy(e); return 1;
+        }
+    }
+
     bwa_sound  snd = bwa_load_sound(e, "footsteps.wav"); /* may be 0 if absent — fine here */
     bwa_source s   = bwa_source_create(e);
     if (s == 0) { fprintf(stderr, "FAIL[%s]: bwa_source_create returned 0\n", name); bwa_destroy(e); return 1; }
@@ -179,6 +206,40 @@ done:
 /* the push-API kind guards, at the ABI: pushing to a live NON-push source must accept nothing AND
  * report (a bare 0 reads exactly like ring backpressure), a real push must work, and a pending play
  * must read as playing before the first rendered block (the poll-then-destroy window). */
+/* the strict-layout guard: an EXPLICIT layout_path that fails to load must leave bwa_create
+ * usable (fallback grid, reason in bwa_last_error, readable immediately) but refuse bwa_start
+ * with BWA_ERR_LAYOUT — a named layout must never silently run as the 26-grid default. Also
+ * covers the zero-default resolution (sample_rate/block_size 0 -> 48000/256). */
+static int run_layout_strict(void) {
+    bwa_desc cfg = {
+        .profile     = BWA_PROFILE_CAVE,
+        .layout_path = "bwa_smoke_no_such_layout.json",   /* deliberately nonexistent */
+        .sink        = BWA_SINK_NULL,                     /* rate/block 0: resolve to defaults */
+    };
+    bwa_engine* e = bwa_create(&cfg);
+    if (!e) { fprintf(stderr, "FAIL[layout]: create must survive a failed layout load\n"); return 1; }
+    if (!bwa_last_error(e)) {
+        fprintf(stderr, "FAIL[layout]: failed layout load must be readable after create\n");
+        bwa_destroy(e); return 1;
+    }
+    if (bwa_get_sample_rate(e) != 48000 || bwa_get_block_size(e) != 256) {
+        fprintf(stderr, "FAIL[layout]: zero desc fields must resolve to 48000/256\n");
+        bwa_destroy(e); return 1;
+    }
+    if (bwa_get_channel_count(e) != 26) {   /* the engine sits on the fallback grid... */
+        fprintf(stderr, "FAIL[layout]: fallback channel count is not 26\n");
+        bwa_destroy(e); return 1;
+    }
+    for (int i = 0; i < 2; ++i) {           /* ...but must refuse to start, repeatably */
+        if (bwa_start(e) != BWA_ERR_LAYOUT || !bwa_last_error(e)) {
+            fprintf(stderr, "FAIL[layout]: start #%d must fail BWA_ERR_LAYOUT with a reason\n", i + 1);
+            bwa_destroy(e); return 1;
+        }
+    }
+    bwa_destroy(e);
+    return 0;
+}
+
 static int run_push_guard(void) {
     bwa_desc cfg = {
         .profile     = BWA_PROFILE_CAVE,
@@ -193,7 +254,7 @@ static int run_push_guard(void) {
     if (bwa_start(e) != 0) { fprintf(stderr, "FAIL[push]: bwa_start: %s\n", bwa_last_error(e)); goto done; }
     {
         bwa_source plain = bwa_source_create(e);
-        bwa_source push  = bwa_source_create_stream(e);
+        bwa_source push  = bwa_source_create_push(e);
         if (!plain || !push) { fprintf(stderr, "FAIL[push]: source create\n"); goto done; }
         if (!bwa_source_is_playing(e, push)) { fprintf(stderr, "FAIL[push]: pending play must read as playing\n"); goto done; }
         if (bwa_source_push(e, plain, blk, 64) != 0 || !bwa_last_error(e)) {
@@ -242,7 +303,7 @@ static int run_binaural_laterality(void) {
     bwa_engine* e = bwa_create(&cfg);
     if (!e) { fprintf(stderr, "FAIL[lat]: bwa_create returned NULL\n"); return 1; }
     {
-        bwa_source s = bwa_source_create_stream(e);
+        bwa_source s = bwa_source_create_push(e);
         if (!s) { fprintf(stderr, "FAIL[lat]: create_stream: %s\n", bwa_last_error(e)); goto done; }
         /* a TONE, never DC: the HRTF's per-ear DC gains are laterally opposite its audible ILD, so a
          * DC-driven laterality check passes exactly when the image is MIRRORED (steam_decode.c 2b) */
@@ -326,6 +387,7 @@ int main(void) {
     if (run_profile(BWA_PROFILE_BINAURAL, "binaural")) return 1;
     if (run_profile(BWA_PROFILE_BOTH,     "both"))     return 1;
     if (run_room_eq_guard())                          return 1;
+    if (run_layout_strict())                          return 1;
     if (run_push_guard())                             return 1;
     if (run_binaural_laterality())                    return 1;
     if (run_material_release())                       return 1;

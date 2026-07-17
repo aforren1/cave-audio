@@ -40,8 +40,9 @@ namespace BwAudio
 
     /// <summary>Mirrors bwa_sink_type: the output-device policy. Auto tries ASIO and falls back to
     /// the silent offline sink (the engine keeps rendering — visual-only); Asio demands a real
-    /// device (an open failure fails bwa_start loudly); Null forces the offline sink.</summary>
-    public enum BwaSinkType : int { Auto = 0, Asio = 1, Null = 2 }
+    /// device (an open failure fails bwa_start loudly); Null forces the offline sink; Manual is
+    /// the deterministic caller-pumped sink (bwa_render_block — offline/golden tests, not Unity).</summary>
+    public enum BwaSinkType : int { Auto = 0, Asio = 1, Null = 2, Manual = 3 }
 
     [StructLayout(LayoutKind.Sequential)]
     public struct BwaDesc
@@ -162,13 +163,13 @@ namespace BwAudio
         // Content playhead in engine-rate frames (latest-wins readback, ~one block of lag): freezes under
         // pause, lands where seek lands, follows pitch at the actual rate; streamed sounds report frames
         // actually CONSUMED (an underrun slips it). 0 = idle, stale handle, or a scheduled play not started.
-        [DllImport(DLL, CallingConvention = CC)] public static extern ulong bwa_source_get_position(IntPtr e, uint s);
+        [DllImport(DLL, CallingConvention = CC)] public static extern ulong bwa_source_get_playhead(IntPtr e, uint s);
         [DllImport(DLL, CallingConvention = CC)] public static extern void bwa_play_oneshot(IntPtr e, uint snd, float x, float y, float z, float gain);
         // Procedural (push) sources: the voice plays PCM you push — mono float frames at the engine
         // rate, ~1.3 s ring. Underrun renders silence without losing your place; push returns the
         // count accepted (pace with push_space); push_end ends the voice once the ring drains (not
         // restartable; stop/fade_out also end it). Push from the one control thread, like every bwa_* call.
-        [DllImport(DLL, CallingConvention = CC)] public static extern uint bwa_source_create_stream(IntPtr e);
+        [DllImport(DLL, CallingConvention = CC)] public static extern uint bwa_source_create_push(IntPtr e);
         [DllImport(DLL, EntryPoint = "bwa_source_push", CallingConvention = CC)] private static extern uint bwa_source_push_native(IntPtr e, uint s, float[] frames, uint n);
         // n is clamped to frames.Length: push_space can report up to the full ring (65536), and passing
         // it with a shorter buffer must never let native code read past the pinned array.
@@ -204,7 +205,7 @@ namespace BwAudio
         [DllImport(DLL, CallingConvention = CC)] public static extern void bwa_bed_set_priority(IntPtr e, uint b, int priority);
         [DllImport(DLL, CallingConvention = CC)] public static extern void bwa_bed_set_group(IntPtr e, uint b, uint group);
         [DllImport(DLL, CallingConvention = CC)] [return: MarshalAs(UnmanagedType.I1)] public static extern bool bwa_bed_is_playing(IntPtr e, uint b);
-        [DllImport(DLL, CallingConvention = CC)] public static extern ulong bwa_bed_get_position(IntPtr e, uint b);
+        [DllImport(DLL, CallingConvention = CC)] public static extern ulong bwa_bed_get_playhead(IntPtr e, uint b);
 
         // ---- materials / scene geometry (load time; needs the Steam Audio build) ----
         [DllImport(DLL, CallingConvention = CC)] public static extern uint bwa_material_preset(IntPtr e, BwaMaterialPreset preset);
@@ -231,15 +232,15 @@ namespace BwAudio
 
         // ---- reflection bed ----
         [DllImport(DLL, CallingConvention = CC)] public static extern void bwa_reflections_config(IntPtr e, in BwaReflectionsDesc cfg);
-        [DllImport(DLL, CallingConvention = CC)] public static extern void bwa_reflections_set_gain(IntPtr e, float linear);
-        [DllImport(DLL, CallingConvention = CC)] public static extern void bwa_source_set_reflections(IntPtr e, uint s, [MarshalAs(UnmanagedType.I1)] bool on);
-        [DllImport(DLL, CallingConvention = CC)] public static extern void bwa_source_set_reflection_send(IntPtr e, uint s, float gain);
-        [DllImport(DLL, CallingConvention = CC)] public static extern void bwa_source_set_reflection_distance(IntPtr e, uint s, [MarshalAs(UnmanagedType.I1)] bool on);
+        [DllImport(DLL, CallingConvention = CC)] public static extern void bwa_reverb_set_gain(IntPtr e, float linear);
+        [DllImport(DLL, CallingConvention = CC)] public static extern void bwa_source_set_reverb(IntPtr e, uint s, [MarshalAs(UnmanagedType.I1)] bool on);
+        [DllImport(DLL, CallingConvention = CC)] public static extern void bwa_source_set_reverb_send(IntPtr e, uint s, float gain);
+        [DllImport(DLL, CallingConvention = CC)] public static extern void bwa_source_set_reverb_distance(IntPtr e, uint s, [MarshalAs(UnmanagedType.I1)] bool on);
         [DllImport(DLL, CallingConvention = CC)] public static extern void bwa_source_set_pathing(IntPtr e, uint s, [MarshalAs(UnmanagedType.I1)] bool on);
 
         // ---- directional FDN reverb bed (load-time; works WITHOUT the Steam Audio build) ----
         // Takes the reverb tap INSTEAD of the Steam reflection bed (one bed at a time), fed by the same
-        // per-source send (bwa_source_set_reflections + send levels apply unchanged). Load-time (between
+        // per-source send (bwa_source_set_reverb + send levels apply unchanged). Load-time (between
         // bwa_create and bwa_start). Decay is a DESIGN parameter — do not copy the room's measured RT60;
         // the real room adds its own on top.
         [DllImport(DLL, CallingConvention = CC)] public static extern void bwa_fdn_config(IntPtr e, in BwaFdnDesc cfg);
@@ -276,7 +277,15 @@ namespace BwAudio
         // The engine's active channel count = the layout's speaker count (4..26). Size meter/speaker
         // arrays with this; never hard-code 26 (that is only the compile-time capacity).
         [DllImport(DLL, CallingConvention = CC)] public static extern uint bwa_get_channel_count(IntPtr e);
-        // Read back the effective speaker layout (xyz = cap*3 floats, x,y,z per speaker); returns the count.
+        // The DLL's packed BWA_VERSION (major<<16 | minor<<8 | patch) — verify against the bound header rev.
+        [DllImport(DLL, CallingConvention = CC)] public static extern uint bwa_get_version();
+        // Resolved engine config (zero-defaulted desc fields resolved at create) — derive seconds from these.
+        [DllImport(DLL, CallingConvention = CC)] public static extern uint bwa_get_sample_rate(IntPtr e);
+        [DllImport(DLL, CallingConvention = CC)] public static extern uint bwa_get_block_size(IntPtr e);
+        // The sink actually running (Auto resolved to Asio/Null once started) — the enum side of bwa_get_audio_backend.
+        [DllImport(DLL, CallingConvention = CC)] public static extern BwaSinkType bwa_get_sink_type(IntPtr e);
+        // Read back the effective speaker layout (xyz = cap*3 floats, x,y,z per speaker); returns the count
+        // FILLED (min(cap, count) — the bwa_get_bus_levels convention); xyz = null returns the total count.
         [DllImport(DLL, CallingConvention = CC)] public static extern uint bwa_get_speakers(IntPtr e, [Out] float[] xyz, uint cap);
         // Per-channel output meter: last-block peak |sample| per channel (linear), as sent to the device; returns the count filled.
         [DllImport(DLL, CallingConvention = CC)] public static extern uint bwa_get_bus_levels(IntPtr e, [Out] float[] peaks, uint cap);

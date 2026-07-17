@@ -4,6 +4,27 @@ All notable changes to `com.brainworks.bw_audio`.
 
 ## [Unreleased]
 
+### Changed — engine ABI clarity renames (native 0.9.0)
+
+The engine renamed seven symbols for clarity; the binding follows. C#-visible changes:
+
+- **`Emitter.Position`/`PositionSeconds` → `Playhead`/`PlayheadSeconds`**, **`AmbisonicBed.Position`
+  → `Playhead`** — "Position" collided with the spatial transform; the readback is the CONTENT
+  playhead. The old properties remain as `[Obsolete]` forwarders for now.
+- Raw `Bwa` layer follows the C renames: `bwa_source_get_playhead` / `bwa_bed_get_playhead`
+  (was `_get_position`), `bwa_source_create_push` (was `_create_stream`), and the reverb-send
+  family `bwa_reverb_set_gain` / `bwa_source_set_reverb` / `bwa_source_set_reverb_send` /
+  `bwa_source_set_reverb_distance` (was `bwa_reflections_set_gain` / `bwa_source_set_reflections`
+  / `..._reflection_send` / `..._reflection_distance`) — "reflections" now always means the Steam
+  reflection-bed config or the image-source earlies, "reverb" the shared send/tap.
+- New imports: `bwa_get_version` (the DLL's packed version — check it against the header rev at
+  startup), `bwa_get_sample_rate` / `bwa_get_block_size` (resolved config — divide frames by THIS,
+  not by what you put in the desc), `bwa_get_sink_type` (enum-typed backend readback; `BwaSinkType`
+  gains `Manual`).
+- A failed **explicit** `layoutPath` now fails `bwa_start` with `BwaResult.ErrLayout` instead of
+  silently running the 26-grid default at the wrong channel count (`layoutPath = null` still
+  means the default grid deliberately).
+
 ### Added — AV sync surface (scheduled play + playhead readback)
 
 - **`Emitter.PlayAt(startSample)`** → the already-bound `bwa_source_play_at`: sample-accurate

@@ -159,8 +159,8 @@ ramped per sample. `bwa_scene_set_mesh_mat` / `bwa_source_set_occlusion` / `bwa_
 `bwa_source_set_orientation` drive it; the playground wall is a real occluder. The **reflection bed** is
 implemented (`steam_reflect.c`, same gate): an `IPLSimulator` reflections sim → ambisonic IR → the
 SH→26 decode → bus, registered as the rt bus tap at `bwa_start`; the `reflect` test proves it's
-*directional*. Sources opt in via `bwa_source_set_reflections`, with a per-source wet-send level
-(`bwa_source_set_reflection_send`) and an optional **distance→wet** scaling (`bwa_source_set_reflection_distance`,
+*directional*. Sources opt in via `bwa_source_set_reverb`, with a per-source wet-send level
+(`bwa_source_set_reverb_send`) and an optional **distance→wet** scaling (`bwa_source_set_reverb_distance`,
 near = drier / far = wetter; the send gain is distance-derived in `rt.c` and ramped). **Baked reflections**
 (`bwa_reflections_desc.bake`, same gate) precompute the reverb at a probe grid at `bwa_start` so the sim thread looks it
 up instead of ray-tracing; the `bake` test confirms it stays directional. **Sound pathing** is wired end to
@@ -252,7 +252,7 @@ localization, diffuse spread, power match both ways, and the round-trip. **Direc
 `fdn.c`): a 16-line Householder FDN whose lines render as plane waves through the SH→26 bed decode,
 2-band decay + per-direction decay scaling (diagonal Directional-FDN, Alary/Politis/Schlecht 2019);
 it takes the reflection BUS TAP instead of the Steam bed (mutually exclusive; same aux send + send
-levels, `bwa_reflections_set_gain` applies), so reverb now works in no-SDK builds. The `fdn` test
+levels, `bwa_reverb_set_gain` applies), so reverb now works in no-SDK builds. The `fdn` test
 pins RT60 landing (0.8 s configured → 0.800 measured), the 2-band split, anisotropy, and stability.
 **Image-source EARLY reflections** (`bwa_source_set_early_reflections` + `bwa_early_reflections_set_gain`,
 per-source opt-in, phonon-free, `ism.c`): the FDN's other half — the six first-order shoebox mirrors,
@@ -298,12 +298,12 @@ lazy-global gap on a process's first open is fixed alongside), `bwa_sound_get_fr
 `bwa_source_set_attenuation_override` (per-source distance curve — same formula as the layout knob,
 applied by RATIO in the solve so it's panner-agnostic and composes with spread/dual-band/decor;
 loudness comp tracks the override's own curve; rolloff 0 = a constant-level direction-only source;
-ref <= 0 clears). **`bwa_source_get_position`/`bwa_bed_get_position`** (rt-tested) is the per-voice
+ref <= 0 clears). **`bwa_source_get_playhead`/`bwa_bed_get_playhead`** (rt-tested) is the per-voice
 content-playhead readback (engine-rate frames) riding the same per-block republish as `is_playing`
 (`pos_pub` packs gen<<48|pos48 in ONE atomic so the gen gate can't tear): cursor for memory/bed
 voices, consumed frames for stream/push (an underrun slips it), frozen under pause, 0 while a
 scheduled play holds — the AV-sync readback a client-side DspTime derivation can't get right
-(Unity: `Emitter.Position`/`PositionSeconds`, `AmbisonicBed.Position`, and `Emitter.PlayAt` now
+(Unity: `Emitter.Playhead`/`PlayheadSeconds`, `AmbisonicBed.Playhead`, and `Emitter.PlayAt` now
 surfaces the long-bound `bwa_source_play_at`). **`bwa_get_clock`** (rt+smoke-tested) publishes the
 device's (sample position, host-time-ns) pair from each block callback — the ASIOTime stamp the
 sink always captured but rt_render used to discard — via a C11 seqlock (`clk_seq/clk_sample/
@@ -356,9 +356,9 @@ ACTIVE count is the layout's speaker count (4..26; loader accepts N speakers who
 complete 0..N-1 permutation), fixed per engine instance. `bwa_create` resolves the layout BEFORE
 `rt_create` and passes `layout.count` to the rt core, sinks, monitor, FDN; `steam_decode`/
 `steam_reflect`/`steam_path` are count-driven too (they previously hard-looped BWA_CHANNELS over the
-bus — an overrun at N<26). `bwa_get_channel_count()` is the readback; a FAILED layout load still falls
-back to the 26 default (non-fatal) which then also means a different channel count — smaller
-installs must check bwa_last_error at create. The `dsp` test pins the loader rules; the `rt` test
+bus — an overrun at N<26). `bwa_get_channel_count()` is the readback; a FAILED explicit layout load still leaves create
+usable on the 26-grid fallback (reason via bwa_last_error) but bwa_start now REFUSES it with
+BWA_ERR_LAYOUT (smoke-pinned) — only layout_path = NULL runs the default grid. The `dsp` test pins the loader rules; the `rt` test
 runs a 24-channel core end to end with a canary proving nothing writes past the active count. The
 GUI tools follow the count too: `playground` takes it from `bwa_get_speakers` (gizmos/meters/channel
 walk), `layout_tool` carries `g_nspk` (load sets it from the file, save writes N records, a panel
@@ -388,7 +388,7 @@ phonon-free), reusing the SH→26 decode the reflection bed will need. `sound.c`
 thread decodes chunks (WAV/FLAC/MP3, downmixed to mono, engine rate required) into a per-stream **SPSC ring**;
 the audio thread `stream_pull`s from the ring in `mix_voice` (no I/O/alloc/locks), distinguishing a true EOF
 from a transient underrun. One voice per stream; the retire handshake detaches voices before the control
-thread closes the stream. **Push (procedural) sources** (`bwa_source_create_stream` +
+thread closes the stream. **Push (procedural) sources** (`bwa_source_create_push` +
 `bwa_source_push`/`_push_space`/`_push_end`) ride the same ring in push mode (`stream_open_push`: the CONTROL
 thread is the producer, the streaming thread never touches the slot), so `mix_voice` is unchanged — the source
 consumes from create (underrun renders silence without losing the caller's place; the data-driven clock slips,

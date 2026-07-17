@@ -1,7 +1,7 @@
 /*
  * fdn.h — directional FDN reverb bed: a phonon-free late-reverb renderer that registers at the SAME
  * rt bus-tap seam as the Steam Audio reflection bed (input = the mono reflection aux send; voices
- * opt in via bwa_source_set_reflections, with the same per-voice send levels). A 16-line feedback
+ * opt in via bwa_source_set_reverb, with the same per-voice send levels). A 16-line feedback
  * delay network (Householder feedback — a lossless prototype) with per-line 2-band decay filters;
  * every line is assigned a direction on the sphere and rendered as a plane wave through the
  * layout's SH→26 bed decode, and the per-line decay can be SCALED by direction — anisotropic decay,

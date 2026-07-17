@@ -60,7 +60,9 @@ bwa_stop(eng); bwa_destroy(eng);
 ```
 
 - **Production** uses `BWA_PROFILE_CAVE`, with `cfg.layout_path` pointing at the
-  surveyed `cave_layout.json`.
+  surveyed `cave_layout.json`. A named layout that fails to load fails `bwa_start` with
+  `BWA_ERR_LAYOUT` (a wrong-channel-count session can't start silently); `NULL` opts into
+  the default 26-grid deliberately.
 - **`bwa_start` never demands hardware**: with no usable ASIO device the engine
   keeps rendering into a silent offline sink. `bwa_get_audio_backend` reports which
   backend you actually got (see [Errors](#errors--return-codes)).
@@ -124,17 +126,32 @@ bwa_result  bwa_start(bwa_engine* e);   // opens device(s), starts audio thread;
 bwa_result  bwa_stop(bwa_engine* e);
 void        bwa_destroy(bwa_engine* e);
 const char* bwa_last_error(bwa_engine* e);
+uint32_t    bwa_get_version(void);            // the DLL's packed BWA_VERSION (major<<16|minor<<8|patch)
+uint32_t    bwa_get_sample_rate(bwa_engine* e);  // resolved config, valid from create on —
+uint32_t    bwa_get_block_size (bwa_engine* e);  //   derive seconds from THESE, not from your desc
+bwa_sink_type bwa_get_sink_type(bwa_engine* e);  // the sink actually running (AUTO resolved at start)
 ```
+
+`bwa_get_version` lets a client verify the DLL matches the header it compiled against (the desc
+structs grow via reserved fields, but enum values and struct layouts are only guaranteed within a
+major.minor). The resolved-config getters exist because every zero desc field means "default":
+`seconds = frames / bwa_get_sample_rate(e)` is always right, even when the desc said 0.
+`bwa_get_sink_type` is the machine-readable side of `bwa_get_audio_backend` — after `bwa_start`,
+`BWA_SINK_AUTO` has resolved to `ASIO` or `NULL`.
+
+Every pointer argument across the API is **consumed before the call returns** — no call retains
+caller memory (`bwa_create` copies its path strings; descs, geometry, and position arrays are
+copied at call time).
 
 `bwa_desc` — zero-init and set what you need; every field's zero is its default:
 
 | field            | meaning                                                              |
 |------------------|---------------------------------------------------------------------|
 | `profile`        | `cave` / `binaural` / `both` (see architecture.md)                   |
-| `layout_path`    | surveyed speaker geometry (JSON); cave/both                         |
+| `layout_path`    | surveyed speaker geometry (JSON); cave/both. NULL = the default 26-grid deliberately; a named file that fails to load fails `bwa_start` (`BWA_ERR_LAYOUT`) |
 | `hrtf_path`      | HRTF (SOFA) or NULL for built-in; binaural/both                     |
-| `sample_rate`    | 48000                                                               |
-| `block_size`     | ASIO buffer hint (256/512)                                          |
+| `sample_rate`    | Hz; 0 = 48000, the **validated** rate. The DSP is rate-derived and 96 kHz renders correctly in software, but rates above 48 k are unverified against the real DVS/hardware chain — treat 48 kHz as supported until the rig confirms more |
+| `block_size`     | render quantum, frames; 0 = 256. Also the ASIO buffer-size *hint* — a driver may run its own size (the sinks adapt); `bwa_get_block_size` reads back the resolved quantum |
 | `sink`           | output-device policy: `BWA_SINK_AUTO` (0, default — try ASIO, fall back to the silent null sink), `BWA_SINK_ASIO` (demand a device: an open failure fails `bwa_start` loudly), `BWA_SINK_NULL` (force the offline sink — CI, profiling, tracking-only), `BWA_SINK_MANUAL` (no device/thread — pump blocks yourself with `bwa_render_block`; deterministic, for golden tests) |
 | `asio_driver`    | ASIO driver name to open; NULL = auto-pick the first registered driver with enough output channels for the profile (binaural finds a 2-ch headphone driver, cave a ≥layout-count one) |
 | `embree`         | ray-trace the acoustics sims on Intel Embree; silently falls back to the default tracer if the phonon build lacks it — see [Ray-tracing acceleration](#ray-tracing-acceleration-bwa_descembree) |
@@ -152,15 +169,18 @@ The API reports failure three ways, all read on the **control thread**:
   `bwa_tracker_connect` return `BWA_OK` (0) on success, a nonzero code otherwise — the
   `bwa_result` enum in [`include/bw_audio.h`](../include/bw_audio.h), listed below.
 - **`bwa_last_error`.** A human-readable string for the most recent failure on that engine, or
-  `NULL` if none. It stays valid until the next `bwa_*` call on the same engine, so read it
-  right after the failing call.
+  `NULL` if none. Lifetime: it is cleared at **entry** to the lifecycle/load-class calls (create,
+  start, the loads, the source creates, tracker_connect) — so a successful one leaves it `NULL` —
+  and never touched by per-frame calls. Read it right after the call you are checking; a later
+  successful lifecycle call wipes it. The string itself stays valid until the next `bwa_*` call
+  on the same engine.
 
 | code            | value | cause |
 |-----------------|-------|-------|
 | `BWA_OK`         | 0     | success |
 | `BWA_ERR_CONFIG` | 1     | invalid `bwa_desc` (bad profile, sample_rate, block_size) |
 | `BWA_ERR_DEVICE` | 2     | ASIO/output device could not be opened, lacked enough output channels for the layout, or failed to start |
-| `BWA_ERR_LAYOUT` | 3     | `layout_path` missing/unparseable/failed validation (see [`layout-schema.md`](./layout-schema.md)) |
+| `BWA_ERR_LAYOUT` | 3     | `bwa_start`: an explicitly-passed `layout_path` failed to load at create (missing/unparseable/failed validation — see [`layout-schema.md`](./layout-schema.md)) |
 | `BWA_ERR_HRTF`   | 4     | `hrtf_path` (SOFA) could not be loaded |
 | `BWA_ERR_STATE`  | 5     | called in the wrong state (e.g. `bwa_start` while already running) |
 | `BWA_ERR_INTERNAL` | 6   | unexpected internal failure; `bwa_last_error` carries detail |
@@ -170,20 +190,17 @@ What actually comes back today:
 
 - `bwa_create` returns `NULL` (bad config / out of memory). No code.
 - `bwa_start` returns `BWA_OK`, `BWA_ERR_CONFIG` (NULL engine, or a `room_eq` layout in a
-  moving-listener session), or `BWA_ERR_DEVICE`. Codes **3–6 are reserved**, not yet
-  returned. A redundant `bwa_start` is a no-op that returns `BWA_OK`.
+  moving-listener session), `BWA_ERR_LAYOUT` (below), or `BWA_ERR_DEVICE`. Codes **4–6 are
+  reserved**, not yet returned. A redundant `bwa_start` is a no-op that returns `BWA_OK`.
 - `bwa_tracker_connect` returns `BWA_OK`, `BWA_ERR_CONFIG` (NULL args / a static-`room_eq`
   layout), or `BWA_ERR_TRACKER`.
-- A bad `layout_path` or `hrtf_path` does **not** fail `bwa_start`. The engine degrades —
-  default speaker grid, simple-pan monitor — and records why in `bwa_last_error`.
-
-So if your session depends on the surveyed layout or a SOFA HRTF, read `bwa_last_error` after a
-*successful* `bwa_create`/`bwa_start` to confirm they actually loaded.
-
-That fallback also **changes the channel count**: the default grid is 26 speakers, so a failed
-load on a 12- or 24-speaker install silently renders 26 channels. If your layout isn't 26, check
-`bwa_last_error` (or `bwa_get_channel_count`) right after `bwa_create` — see
-[Channel count](#channel-count).
+- A failed **explicit** `layout_path` leaves `bwa_create` usable (the engine sits on the default
+  26-grid; the reason is in `bwa_last_error`, readable right after create) but **fails
+  `bwa_start` with `BWA_ERR_LAYOUT`** — a session that named a layout never silently runs 26
+  channels of the wrong geometry. `layout_path = NULL` means the default grid deliberately.
+- A bad `hrtf_path` does **not** fail `bwa_start`. The monitor degrades to the simple pan and
+  records why in `bwa_last_error` — so if your session depends on a SOFA HRTF, read
+  `bwa_last_error` after a *successful* `bwa_start` to confirm it loaded.
 
 Per-frame `void` calls (`bwa_source_set_pos`, `bwa_commit`, …) never report errors — they only
 enqueue onto the command ring. A full ring drops the command silently, but the ring is sized
@@ -252,7 +269,7 @@ a buffer out from under a playing voice.
 
 The metadata getters answer "what did I just load" (progress bars, validation, mono-vs-bed
 dispatch). Frames are at the **engine** rate — in-memory assets were resampled at load, streams
-must already match — so `seconds = frames / cfg.sample_rate`. `get_frames` returns 0 for an
+must already match — so `seconds = frames / bwa_get_sample_rate(e)`. `get_frames` returns 0 for an
 invalid handle or a stream whose length is unknown (push sources); `get_channels` returns 0 for
 an invalid handle. Control thread, any time after the load.
 
@@ -272,16 +289,18 @@ void     bwa_group_set_paused(bwa_engine* e, uint32_t group, bool paused);      
 void     bwa_source_set_pitch(bwa_engine* e, bwa_source s, float rate);               // playback rate [0.25, 4]; glided
 void     bwa_source_play (bwa_engine* e, bwa_source s, bwa_sound snd, bool loop);
 void     bwa_source_play_at(bwa_engine* e, bwa_source s, bwa_sound snd, bool loop, uint64_t start_sample); // sample-accurate
-uint64_t bwa_get_dsp_time(bwa_engine* e);                       // current dsp-sample clock (device-anchored, monotonic)
-bool     bwa_get_clock(bwa_engine* e, uint64_t* dsp_sample, uint64_t* host_time_ns); // device (sample, host-time) pair
-uint32_t bwa_get_output_latency(bwa_engine* e);                 // device render->DAC latency, frames (0 = unknown)
 void     bwa_source_stop (bwa_engine* e, bwa_source s);
 void     bwa_source_set_paused(bwa_engine* e, bwa_source s, bool paused);   // ramped; playhead freezes
 void     bwa_source_seek (bwa_engine* e, bwa_source s, uint64_t frame);     // click-free jump (in-memory)
 bool     bwa_source_is_playing(bwa_engine* e, bwa_source s);  // control-thread poll; see below
-uint64_t bwa_source_get_position(bwa_engine* e, bwa_source s); // content playhead, engine-rate frames
+uint64_t bwa_source_get_playhead(bwa_engine* e, bwa_source s); // CONTENT playhead, engine-rate frames
 void     bwa_play_oneshot(bwa_engine* e, bwa_sound snd, float x, float y, float z, float gain);
 ```
+
+**The model: a source drives at most one voice.** Play on an already-playing source restarts it
+(a new sound replaces the old, un-paused at frame 0); the same `bwa_sound` can play on any number
+of sources at once. And mind the near-namesakes: `bwa_source_set_pos` is the **spatial** position,
+`bwa_source_get_playhead` the **content** position — unrelated readouts.
 
 **The voice pool steals, it doesn't fail.** The pool is fixed-size. When it's full,
 `bwa_source_create` stops the lowest-**priority** active source to make room (255 = protected, never
@@ -295,9 +314,16 @@ sample. Read "now" from `bwa_get_dsp_time` (device sample position, monotonic) a
 `bwa_get_dsp_time(e) + sample_rate/2` plays half a second out. `0` means play immediately (same as
 `bwa_source_play`); a start already in the past plays immediately, best-effort.
 
+```c
+// clock / scheduling — the time base for bwa_source_play_at:
+uint64_t bwa_get_dsp_time(bwa_engine* e);                       // current dsp-sample clock (device-anchored, monotonic)
+bool     bwa_get_clock(bwa_engine* e, uint64_t* dsp_sample, uint64_t* host_time_ns); // device (sample, host-time) pair
+uint32_t bwa_get_output_latency(bwa_engine* e);                 // device render->DAC latency, frames (0 = unknown)
+```
+
 **Syncing with graphics.** Two cases. Events that live on the **audio timeline** (a cue in a track
 you scheduled) never need wall time: keep the `start_sample` you passed to `play_at` and fire the
-visual when `bwa_get_dsp_time` crosses `start + cue` (or poll `bwa_source_get_position`). Events
+visual when `bwa_get_dsp_time` crosses `start + cue` (or poll `bwa_source_get_playhead`). Events
 that originate on the **graphics side** (the sound must land on an animation frame) need the
 wall→dsp mapping, and that is `bwa_get_clock`: the (output sample position, host time) pair the
 audio stack stamps inside each block callback — ASIO's `ASIOGetSamplePosition` pair, synthesized
@@ -320,7 +346,7 @@ finishes, after `stop`, or for a stale/destroyed handle. Poll it once per frame 
 "on finished" signal. It's best-effort — a sound shorter than your poll interval may never be
 observed as playing.
 
-**The playhead is a poll too.** `bwa_source_get_position` rides the same per-block republish: the
+**The playhead is a poll too.** `bwa_source_get_playhead` rides the same per-block republish: the
 voice's **content** position in engine-rate frames (`seconds = position / sample_rate`). This is the
 engine-owned truth for driving synced visuals or a progress UI — correct exactly where deriving a
 playhead from `bwa_get_dsp_time` breaks: it freezes under pause, lands where a seek lands, follows a
@@ -346,10 +372,12 @@ tighter-than-a-block scheduling, stay on `bwa_get_dsp_time` arithmetic.
 fade in flight. `bwa_source_fade_out` is the one-call "fade to silence, then stop" — it lands on the
 same click-free stop path `bwa_source_stop` uses.
 
-**Mix groups (0..7)** are category-level control: a group's gain multiplies into every member's
-gain solve (ramped like any solve), and pausing a group ramps its members out and freezes their
-playheads exactly like per-voice pause — duck the SFX and keep the dialog, silence the ambience
-category for a cutscene. Sources start in group 0; group state persists across `play`.
+**Mix groups (ids 0..`BWA_GROUPS`-1, i.e. 0..7)** are category-level control: a group's gain
+multiplies into every member's gain solve (ramped like any solve), and pausing a group ramps its
+members out and freezes their playheads exactly like per-voice pause — duck the SFX and keep the
+dialog, silence the ambience category for a cutscene. Sources start in group 0; group state
+persists across `play`. Out of range: `set_group` falls back to group 0, group gain/pause calls
+are ignored.
 
 **Pitch** (`bwa_source_set_pitch`, 1 = native, clamped `[0.25, 4]`) resamples **in-memory** sounds
 with a fractional playback cursor (linear interpolation; the cursor stays integer + fraction, so a
@@ -360,20 +388,22 @@ it for one-shot variation, slow-mo, engines.
 
 Positions are in **room space** (see [Coordinates and units](#coordinates-and-units)).
 `bwa_play_oneshot` is the fire-and-forget path: it allocates a transient voice internally
-and recycles it on end, so the caller holds no handle.
+and recycles it on end, so the caller holds no handle. Unlike `bwa_source_create` it never
+**steals** — with the voice pool (or the command ring) momentarily full the oneshot is silently
+dropped, so oneshot spam can't evict your named sources.
 
 ### Procedural (push) sources
 
 ```c
-bwa_source bwa_source_create_stream(bwa_engine* e);            // 0 = failure (see bwa_last_error)
+bwa_source bwa_source_create_push(bwa_engine* e);            // 0 = failure (see bwa_last_error)
 uint32_t   bwa_source_push(bwa_engine* e, bwa_source s, const float* frames, uint32_t n); // frames accepted
 uint32_t   bwa_source_push_space(bwa_engine* e, bwa_source s); // frames a push would accept right now
 void       bwa_source_push_end(bwa_engine* e, bwa_source s);   // end-of-data: ends once drained
 ```
 
-Engine-generated audio without a file: `bwa_source_create_stream` returns a source whose voice plays
-PCM **you push** — mono float frames at the engine sample rate, through a per-source ring (~1.3 s
-deep at 48 kHz). It is a normal source in every other way: position, gain, spread, occlusion,
+Engine-generated audio without a file: `bwa_source_create_push` returns a source whose voice plays
+PCM **you push** — mono float frames at the engine sample rate, through a per-source ring (65536
+frames — ~1.37 s at 48 kHz). It is a normal source in every other way: position, gain, spread, occlusion,
 Doppler, groups, fades, pause — the full spatial path applies. Use it for synthesis, network audio,
 or bridging another engine's output.
 
@@ -437,7 +467,7 @@ void    bwa_bed_seek        (bwa_engine* e, bwa_bed b, uint64_t frame);
 void    bwa_bed_set_priority(bwa_engine* e, bwa_bed b, int priority);    // beds share the voice pool —
 void    bwa_bed_set_group   (bwa_engine* e, bwa_bed b, uint32_t group);  //   protect a music bed with 255
 bool    bwa_bed_is_playing  (bwa_engine* e, bwa_bed b);
-uint64_t bwa_bed_get_position(bwa_engine* e, bwa_bed b);   // content playhead, engine-rate frames
+uint64_t bwa_bed_get_playhead(bwa_engine* e, bwa_bed b);   // content playhead, engine-rate frames
 ```
 
 `bwa_bed_set_rotation` yaws the recorded field about the room's vertical axis — line a capture up
@@ -687,8 +717,12 @@ Geometry rules:
   see [materials.md](./materials.md)); real-time reflections and occlusion do. Replacing the whole
   static mesh at runtime works but rebuilds the entire BVH — prefer dynamic meshes for movers.
 - **No SDK, no-op.** Everything here is a documented no-op without the `BWA_HAVE_STEAMAUDIO`
-  build — except token minting, which is plain table state and still works. `bwa_scene_add_dynamic_mesh`
-  returns `-1` without the backend.
+  build — except token minting (plain table state) and `bwa_scene_set_box`, which ALWAYS captures
+  the shoebox for the image-source early reflections. `bwa_scene_add_dynamic_mesh` returns `-1`
+  without the backend.
+- **`bwa_scene_set_box` is load-time only.** Unlike the static-mesh swap (which the sim thread
+  serializes), the box's ISM handoff assumes the audio thread is not yet running. Set it between
+  `bwa_create` and `bwa_start`.
 
 ## Occlusion & directivity (control thread; per-frame except where noted)
 
@@ -979,8 +1013,10 @@ The decoder is create-time configuration (the decode matrix is built at `bwa_cre
 [`spatialization.md`](./spatialization.md) for the theory.
 
 `bwa_get_speakers` returns the effective layout (the default grid, or the `layout_path` file) as
-`cap*3` floats in channel order, plus the count — the same count `bwa_get_channel_count()` reports.
-Use it to visualize or audition the geometry the engine is actually panning with.
+`cap*3` floats in channel order, and returns the count **filled** — `min(cap, count)`, the same
+convention as `bwa_get_bus_levels`. Pass `xyz = NULL` to query the total count (the same count
+`bwa_get_channel_count()` reports). Use it to visualize or audition the geometry the engine is
+actually panning with.
 
 ### Channel count
 
@@ -994,9 +1030,10 @@ speakers, or 26 (the default grid) with no path. `BWA_CHANNELS` (26) is only the
 device opens 24 channels, and every consumer (panners, beds, reverb, monitor, calibration) follows.
 Size meter/speaker arrays from this getter, not the constant.
 
-One sharp edge: a **failed** layout load still falls back to the 26-grid default (non-fatal, reason
-in `bwa_last_error`) — which for a smaller install also means the *wrong channel count*. A
-24-speaker deployment must check `bwa_last_error` (or `bwa_get_channel_count`) after `bwa_create`.
+The old sharp edge here is now fenced: a **failed** explicit layout load still leaves the engine
+on the 26-grid default (reason in `bwa_last_error`, readable after `bwa_create`) — but
+`bwa_start` refuses it with `BWA_ERR_LAYOUT`, so a 24-speaker deployment can no longer silently
+render 26 channels. Only `layout_path = NULL` runs the default grid.
 
 ## Tracked room EQ (control thread; live)
 
@@ -1043,10 +1080,10 @@ the same limited bus feeds the monitor, so headphones inherit the ceiling too.
 ```c
 typedef struct { float ir_seconds; uint32_t order, num_rays, num_bounces; int enabled, bake; uint32_t reserved[3]; } bwa_reflections_desc;
 void bwa_reflections_config   (bwa_engine* e, const bwa_reflections_desc* cfg);  // LOAD-TIME (before bwa_start)
-void bwa_reflections_set_gain (bwa_engine* e, float linear);                   // the wet level: live, default 1
-void bwa_source_set_reflections(bwa_engine* e, bwa_source s, bool on);           // per-frame; gates the wet send
-void bwa_source_set_reflection_send(bwa_engine* e, bwa_source s, float gain);    // per-source wet-send level (default 1)
-void bwa_source_set_reflection_distance(bwa_engine* e, bwa_source s, bool on);   // far = wetter
+void bwa_reverb_set_gain (bwa_engine* e, float linear);                   // the wet level: live, default 1
+void bwa_source_set_reverb(bwa_engine* e, bwa_source s, bool on);           // per-frame; gates the wet send
+void bwa_source_set_reverb_send(bwa_engine* e, bwa_source s, float gain);    // per-source wet-send level (default 1)
+void bwa_source_set_reverb_distance(bwa_engine* e, bwa_source s, bool on);   // far = wetter
 ```
 
 A single shared **listener-centric reverb bed**, decoded straight to the speaker channels and
@@ -1073,14 +1110,14 @@ Configuration is load-time; the sends are live:
   `num_bounces` 16). `enabled = 0` creates no bed; the engine behaves exactly as without one.
   `bake` non-zero precomputes the reverb over a probe grid at `bwa_start`, so the sim thread looks
   it up instead of ray-tracing live (static scenes only — which the bed requires anyway).
-- **`bwa_reflections_set_gain`** is the wet level — the one control, live (a single atomic the
+- **`bwa_reverb_set_gain`** is the wet level — the one control, live (a single atomic the
   audio-thread tap reads), default 1. A value set before `bwa_start` seeds whichever reverb bed it
   creates (this bed or the FDN).
-- **`bwa_source_set_reflections`** opts a source into the bed's wet send. Per-frame, non-blocking;
+- **`bwa_source_set_reverb`** opts a source into the bed's wet send. Per-frame, non-blocking;
   with the bed disabled (or no SDK) it gates a send that goes nowhere.
-- **`bwa_source_set_reflection_send`** sets that source's send level (default 1.0). Drive it
+- **`bwa_source_set_reverb_send`** sets that source's send level (default 1.0). Drive it
   yourself for a manual dry/wet.
-- **`bwa_source_set_reflection_distance`** adds automatic **distance→wet** scaling on top:
+- **`bwa_source_set_reverb_distance`** adds automatic **distance→wet** scaling on top:
   near = drier, far = wetter.
 
 The effective send is computed and **ramped on the audio thread** (in `rt.c`, from the
@@ -1100,8 +1137,8 @@ void bwa_fdn_config(bwa_engine* e, const bwa_fdn_desc* cfg);                    
 
 A **phonon-free** late-reverb alternative that takes the reverb tap *instead of* the Steam bed
 (one reverb bed at a time; with the FDN enabled the Steam bed is skipped). It consumes the same
-mono aux send, so `bwa_source_set_reflections` and the per-source send levels apply unchanged, and
-`bwa_reflections_set_gain` sets its return level live.
+mono aux send, so `bwa_source_set_reverb` and the per-source send levels apply unchanged, and
+`bwa_reverb_set_gain` sets its return level live.
 
 Inside: a 16-line **feedback delay network** (Householder feedback — lossless prototype, the decay
 filters are the only loss), each line assigned a direction on the sphere and rendered as a plane
@@ -1149,11 +1186,6 @@ sources that matter (a few), not on everything.
 `bwa_sound`, `bwa_source`, and `bwa_bed` are opaque `uint32_t` = `(index | generation<<16)`. A stale
 handle (slot destroyed, then reused) fails the generation check on the audio side and is
 silently dropped rather than crashing. `0` is always invalid. Treat handles as tokens — never
-do arithmetic on them.
-
-## Planned extension point
-
-This section used to sketch a `bwa_source_create_stream` for engine-generated audio. It exists now —
-see [Procedural (push) sources](#procedural-push-sources). It landed exactly as sketched: a handle
-the caller pushes PCM into via a per-source ring, same control model, second feeding path — the
-source abstraction never assumed "backed by a file," so it slotted in without churn.
+do arithmetic on them. The one deliberate deviation: `bwa_scene_add_dynamic_mesh` returns a plain
+small `int` index (`-1` = failure) — movers are few and app-managed, so they skip the
+generation machinery.

@@ -75,6 +75,9 @@ struct bwa_engine {
     RtCore*     rt;               /* rings + voice/sound tables + mixer (rt.c) */
     Monitor*    monitor;          /* binaural/both: 26->stereo decode */
     Layout      layout;           /* effective speaker geometry (for the Steam decoder at start) */
+    int         layout_failed;    /* an EXPLICIT layout_path failed to load at create — engine is on
+                                   * the 26-grid fallback and bwa_start refuses with BWA_ERR_LAYOUT */
+    char        layout_errbuf[256]; /* the load failure reason, preserved across start's error clear */
     uint32_t    cap;              /* scratch capacity in frames (== cfg.block_size) */
 
     bwa_sink*     sink;             /* primary: cave 26ch / binaural 2ch / both array 26ch */
@@ -95,7 +98,7 @@ struct bwa_engine {
     Fdn*          fdn;            /* directional FDN reverb bed (bwa_fdn_config; created at bwa_start) */
     bwa_fdn_desc   fdn_cfg;        /* staged pre-start (zeros normalized to defaults in bwa_fdn_config);
                                    * when enabled, the FDN takes the bus tap (not the Steam bed) */
-    float         refl_wet;       /* reverb wet level (bwa_reflections_set_gain, the one control);
+    float         refl_wet;       /* reverb wet level (bwa_reverb_set_gain, the one control);
                                    * seeds whichever bed bwa_start creates, live thereafter */
     int           max_re;         /* mirror of bwa_set_max_re, so a pre-start toggle seeds the FDN */
     SteamPath*    path;           /* pathing (bwa_desc.enable_pathing); NULL otherwise */
@@ -218,13 +221,18 @@ bwa_engine* bwa_create(const bwa_desc* cfg) {
 
     /* Resolve the speaker geometry FIRST: the engine's CHANNEL COUNT is the layout's speaker count
      * (a file with 4..BWA_CHANNELS speakers, or the built-in 26-grid default with no path — the
-     * default IS a layout, so tests/desk-dev still need no file). A load failure is non-fatal
-     * (default grid) but surfaces via bwa_last_error — note it now also means the channel count
-     * falls back to 26, so a 24-speaker install MUST check bwa_last_error after bwa_create. */
+     * default IS a layout, so tests/desk-dev still need no file). A failed EXPLICIT load falls
+     * back to the default grid so create still succeeds (bwa_last_error has the reason, readable
+     * NOW), but it is recorded and bwa_start refuses with BWA_ERR_LAYOUT — a session that named a
+     * layout must not silently run 26 channels of the wrong geometry. NULL path = the default
+     * grid deliberately. */
     Layout L = layout_default();
     if (e->cfg.layout_path && e->cfg.layout_path[0]) {
-        if (!layout_load(e->cfg.layout_path, e->cfg.sample_rate, &L, e->errbuf, sizeof e->errbuf))
+        if (!layout_load(e->cfg.layout_path, e->cfg.sample_rate, &L, e->errbuf, sizeof e->errbuf)) {
             set_error(e, e->errbuf[0] ? e->errbuf : "bwa_create: layout load failed");
+            e->layout_failed = 1;
+            snprintf(e->layout_errbuf, sizeof e->layout_errbuf, "%s", e->errbuf);
+        }
     }
     e->layout = L;                                  /* kept for the Steam decoder, built at bwa_start */
 
@@ -237,7 +245,7 @@ bwa_engine* bwa_create(const bwa_desc* cfg) {
      * decode, which is NOT selectable from the API any more — it survives only as the automatic
      * fallback inside the builds when a degenerate layout defeats AllRAD/EPAD. */
     rt_set_bed_decoder(e->rt, e->cfg.bed_decoder == BWA_DECODE_EPAD ? 2 : 1);
-    e->refl_wet = 1.0f;                             /* reverb wet default; bwa_reflections_set_gain */
+    e->refl_wet = 1.0f;                             /* reverb wet default; bwa_reverb_set_gain */
 
     /* material table: token 0 is always the built-in "generic" default (BWA_PRESETS[0]). */
     for (int b = 0; b < 3; ++b) {
@@ -298,6 +306,14 @@ bwa_result bwa_start(bwa_engine* e) {
     if (!e) return BWA_ERR_CONFIG;
     if (e->started) return BWA_OK;
     e->errbuf[0] = 0; e->last_error = NULL;
+
+    /* An explicitly-requested layout that failed to load at create must not start: the engine sits
+     * on the 26-grid fallback, i.e. very likely the WRONG channel count for the install. The reason
+     * was preserved from create (start's error clear above would have eaten it). */
+    if (e->layout_failed) {
+        set_error(e, e->layout_errbuf[0] ? e->layout_errbuf : "bwa_start: layout_path failed to load at bwa_create");
+        return BWA_ERR_LAYOUT;
+    }
 
     /* room_eq guard: a moving-listener session — the DBAP panner and/or a connected tracker — with
      * a room_eq'd layout is the wrong-file mistake; fail LOUDLY rather than quietly mis-correct the
@@ -490,6 +506,25 @@ const char* bwa_get_audio_backend(bwa_engine* e) {
     return bwa_sink_backend(e->sink);   /* cave: the array device */
 }
 
+uint32_t bwa_get_version(void) { return BWA_VERSION; }
+
+/* resolved at bwa_create (zero-defaulted desc fields resolved there) — valid from create on */
+uint32_t bwa_get_sample_rate(bwa_engine* e) { return e ? e->cfg.sample_rate : 0; }
+uint32_t bwa_get_block_size (bwa_engine* e) { return e ? e->cfg.block_size  : 0; }
+
+/* The machine-readable side of bwa_get_audio_backend: once a sink is open, AUTO has resolved to
+ * what actually opened (derived from the sink's own backend id); otherwise the configured policy. */
+bwa_sink_type bwa_get_sink_type(bwa_engine* e) {
+    if (!e) return BWA_SINK_NULL;
+    if (e->sink) {
+        const char* b = bwa_sink_backend(e->sink);
+        if (strncmp(b, "asio", 4) == 0) return BWA_SINK_ASIO;
+        if (strcmp(b, "manual") == 0)   return BWA_SINK_MANUAL;
+        return BWA_SINK_NULL;
+    }
+    return e->cfg.sink;
+}
+
 /* ---- assets ---- */
 
 bwa_sound bwa_load_sound(bwa_engine* e, const char* path) {
@@ -563,7 +598,7 @@ void  bwa_bed_play(bwa_engine* e, bwa_bed b, bwa_sound snd, bool loop) {
         set_error(e, "bwa_bed_play: asset is mono — load it with bwa_load_ambix (a 4/9/16-ch AmbiX file)");
         return;
     }
-    if (refuse_push_play(e, b, "bwa_bed_play: push source (bwa_source_create_stream) — feed it with bwa_source_push"))
+    if (refuse_push_play(e, b, "bwa_bed_play: push source (bwa_source_create_push) — feed it with bwa_source_push"))
         return;
     rt_source_play(e->rt, b, snd, loop);            /* direct: bypass bwa_source_play's mono-only guard */
 }
@@ -578,7 +613,7 @@ void  bwa_bed_seek(bwa_engine* e, bwa_bed b, uint64_t frame)         { bwa_sourc
 void  bwa_bed_set_priority(bwa_engine* e, bwa_bed b, int priority)   { bwa_source_set_priority(e, b, priority); }
 void  bwa_bed_set_group(bwa_engine* e, bwa_bed b, uint32_t group)    { bwa_source_set_group(e, b, group); }
 bool  bwa_bed_is_playing(bwa_engine* e, bwa_bed b)                   { return bwa_source_is_playing(e, b); }
-uint64_t bwa_bed_get_position(bwa_engine* e, bwa_bed b)              { return bwa_source_get_position(e, b); }
+uint64_t bwa_bed_get_playhead(bwa_engine* e, bwa_bed b)              { return bwa_source_get_playhead(e, b); }
 
 /* ---- sources (forward to the rt core) ---- */
 
@@ -586,23 +621,23 @@ bwa_source bwa_source_create(bwa_engine* e) {
     return e ? rt_source_create(e->rt) : 0;
 }
 /* procedural (push) sources: the voice plays caller-pushed PCM (see bw_audio.h) */
-bwa_source bwa_source_create_stream(bwa_engine* e) {
+bwa_source bwa_source_create_push(bwa_engine* e) {
     if (!e) return 0;
     clear_error(e);
     bwa_source s = rt_source_create_stream(e->rt, e->errbuf, sizeof e->errbuf);
-    if (s == 0) set_error(e, e->errbuf[0] ? e->errbuf : "bwa_source_create_stream: failed");
+    if (s == 0) set_error(e, e->errbuf[0] ? e->errbuf : "bwa_source_create_push: failed");
     return s;
 }
 uint32_t bwa_source_push(bwa_engine* e, bwa_source s, const float* frames, uint32_t n) {
-    if (!e || !push_guard(e, s, "bwa_source_push: not a push source (create it with bwa_source_create_stream)")) return 0;
+    if (!e || !push_guard(e, s, "bwa_source_push: not a push source (create it with bwa_source_create_push)")) return 0;
     return rt_source_push(e->rt, s, frames, n);
 }
 uint32_t bwa_source_push_space(bwa_engine* e, bwa_source s) {
-    if (!e || !push_guard(e, s, "bwa_source_push_space: not a push source (create it with bwa_source_create_stream)")) return 0;
+    if (!e || !push_guard(e, s, "bwa_source_push_space: not a push source (create it with bwa_source_create_push)")) return 0;
     return rt_source_push_space(e->rt, s);
 }
 void bwa_source_push_end(bwa_engine* e, bwa_source s) {
-    if (e && push_guard(e, s, "bwa_source_push_end: not a push source (create it with bwa_source_create_stream)"))
+    if (e && push_guard(e, s, "bwa_source_push_end: not a push source (create it with bwa_source_create_push)"))
         rt_source_push_end(e->rt, s);
 }
 void bwa_source_set_priority(bwa_engine* e, bwa_source s, int priority) {
@@ -635,7 +670,7 @@ void bwa_source_play(bwa_engine* e, bwa_source s, bwa_sound snd, bool loop) {
         set_error(e, "bwa_source_play: asset is multichannel — use bwa_bed_play (or bwa_load_sound for a point source)");
         return;
     }
-    if (refuse_push_play(e, s, "bwa_source_play: push source (bwa_source_create_stream) — feed it with bwa_source_push"))
+    if (refuse_push_play(e, s, "bwa_source_play: push source (bwa_source_create_push) — feed it with bwa_source_push"))
         return;
     rt_source_play(e->rt, s, snd, loop);
 }
@@ -645,7 +680,7 @@ void bwa_source_play_at(bwa_engine* e, bwa_source s, bwa_sound snd, bool loop, u
         set_error(e, "bwa_source_play_at: asset is multichannel — use a point source");
         return;
     }
-    if (refuse_push_play(e, s, "bwa_source_play_at: push source (bwa_source_create_stream) — feed it with bwa_source_push"))
+    if (refuse_push_play(e, s, "bwa_source_play_at: push source (bwa_source_create_push) — feed it with bwa_source_push"))
         return;
     rt_source_play_at(e->rt, s, snd, loop, start_sample);
 }
@@ -656,7 +691,7 @@ void bwa_source_stop(bwa_engine* e, bwa_source s)                           { if
 void bwa_source_set_paused(bwa_engine* e, bwa_source s, bool paused)        { if (e) rt_source_set_paused(e->rt, s, paused); }
 void bwa_source_seek(bwa_engine* e, bwa_source s, uint64_t frame)           { if (e) rt_source_seek(e->rt, s, frame); }
 bool bwa_source_is_playing(bwa_engine* e, bwa_source s)                     { return e ? rt_source_is_playing(e->rt, s) : false; }
-uint64_t bwa_source_get_position(bwa_engine* e, bwa_source s)               { return e ? rt_source_get_position(e->rt, s) : 0; }
+uint64_t bwa_source_get_playhead(bwa_engine* e, bwa_source s)               { return e ? rt_source_get_position(e->rt, s) : 0; }
 void bwa_set_test_signal(bwa_engine* e, uint32_t channel, bwa_test_kind kind, float gain) { if (e) rt_test_signal(e->rt, channel, (uint8_t)kind, gain); }
 
 void bwa_set_panner(bwa_engine* e, bwa_panner panner) { if (e) { e->panner = (int)panner; rt_set_panner(e->rt, (int)panner); } }
@@ -759,15 +794,14 @@ uint32_t bwa_panner_gains_batch(bwa_panner panner, const float* positions, uint3
 uint32_t bwa_get_speakers(bwa_engine* e, float* xyz, uint32_t cap) {
     if (!e) return 0;
     uint32_t n = e->layout.count;
-    if (xyz) {
-        uint32_t m = (n < cap) ? n : cap;
-        for (uint32_t i = 0; i < m; ++i) {
-            xyz[i * 3 + 0] = e->layout.speakers[i].pos[0];
-            xyz[i * 3 + 1] = e->layout.speakers[i].pos[1];
-            xyz[i * 3 + 2] = e->layout.speakers[i].pos[2];
-        }
+    if (!xyz) return n;                      /* count-only query: the total (== bwa_get_channel_count) */
+    uint32_t m = (n < cap) ? n : cap;
+    for (uint32_t i = 0; i < m; ++i) {
+        xyz[i * 3 + 0] = e->layout.speakers[i].pos[0];
+        xyz[i * 3 + 1] = e->layout.speakers[i].pos[1];
+        xyz[i * 3 + 2] = e->layout.speakers[i].pos[2];
     }
-    return n;
+    return m;                                /* the count FILLED — same convention as bwa_get_bus_levels */
 }
 
 uint32_t bwa_get_bus_levels(bwa_engine* e, float* peaks, uint32_t cap) {
@@ -1013,7 +1047,7 @@ void bwa_reflections_config(bwa_engine* e, const bwa_reflections_desc* cfg) {
 
 /* The ONE reverb wet control: stored on the engine (so a pre-start value seeds whichever bed
  * bwa_start creates) and forwarded live to whichever bed owns the tap. */
-void bwa_reflections_set_gain(bwa_engine* e, float linear) {
+void bwa_reverb_set_gain(bwa_engine* e, float linear) {
     if (!e) return;
     e->refl_wet = (linear < 0.f) ? 0.f : linear;
 #ifdef BWA_HAVE_STEAMAUDIO
@@ -1036,7 +1070,7 @@ void bwa_fdn_config(bwa_engine* e, const bwa_fdn_desc* cfg) {
     /* out-of-range decay/direction values reach fdn_set_decay(_direction)'s own clamps at start */
 }
 
-void bwa_source_set_reflections(bwa_engine* e, bwa_source s, bool on) {
+void bwa_source_set_reverb(bwa_engine* e, bwa_source s, bool on) {
     if (e) rt_source_set_reflections(e->rt, s, on);             /* phonon-free; the tap consumes the send */
 }
 
@@ -1054,11 +1088,11 @@ void bwa_source_set_pathing(bwa_engine* e, bwa_source s, bool on) {
 #endif
 }
 
-void bwa_source_set_reflection_send(bwa_engine* e, bwa_source s, float gain) {
+void bwa_source_set_reverb_send(bwa_engine* e, bwa_source s, float gain) {
     if (e) rt_source_set_reflection_send(e->rt, s, gain);
 }
 
-void bwa_source_set_reflection_distance(bwa_engine* e, bwa_source s, bool on) {
+void bwa_source_set_reverb_distance(bwa_engine* e, bwa_source s, bool on) {
     if (e) rt_source_set_reflection_distance(e->rt, s, on);
 }
 

@@ -108,9 +108,9 @@ namespace BwAudio
             if (earlyReflections) Bwa.bwa_source_set_early_reflections(Eng, _src, true);
             if (reflections)
             {
-                Bwa.bwa_source_set_reflections(Eng, _src, true);
-                if (reflectionSend != 1f)  Bwa.bwa_source_set_reflection_send(Eng, _src, reflectionSend);
-                if (reflectionDistance)    Bwa.bwa_source_set_reflection_distance(Eng, _src, true);
+                Bwa.bwa_source_set_reverb(Eng, _src, true);
+                if (reflectionSend != 1f)  Bwa.bwa_source_set_reverb_send(Eng, _src, reflectionSend);
+                if (reflectionDistance)    Bwa.bwa_source_set_reverb_distance(Eng, _src, true);
             }
             if (pathing)       Bwa.bwa_source_set_pathing(Eng, _src, true);
             if (spread > 0f)   Bwa.bwa_source_set_spread(Eng, _src, spread);
@@ -167,7 +167,7 @@ namespace BwAudio
         /// Engine.DspTime reaches `startSample`. Schedule with margin (at least a block; e.g.
         /// <c>PlayAt(engine.DspTime + engine.sampleRate / 2)</c> starts half a second out); a start
         /// already in the past plays immediately. Keep the startSample you passed —
-        /// <c>DspTime - startSample</c> is the sync clock for driving visuals (or poll Position).</summary>
+        /// <c>DspTime - startSample</c> is the sync clock for driving visuals (or poll Playhead).</summary>
         public void PlayAt(ulong startSample, string clipOverride = null)
         {
             if (!_created || Eng == IntPtr.Zero) return;
@@ -202,12 +202,18 @@ namespace BwAudio
         /// (latest-wins readback, ~one audio block of lag). Engine-owned truth where deriving it from
         /// DspTime breaks: it freezes while Paused, lands where Seek lands, follows Pitch at the
         /// actual rate, and counts frames actually consumed for streamed clips. 0 while idle or
-        /// before a scheduled PlayAt starts; a finished one-shot keeps its final position.</summary>
-        public ulong Position => _created && Eng != IntPtr.Zero ? Bwa.bwa_source_get_position(Eng, _src) : 0;
+        /// before a scheduled PlayAt starts; a finished one-shot keeps its final position.
+        /// (The CONTENT position — unrelated to the emitter's spatial transform.)</summary>
+        public ulong Playhead => _created && Eng != IntPtr.Zero ? Bwa.bwa_source_get_playhead(Eng, _src) : 0;
 
-        /// <summary>Playhead in seconds — AudioSource.time-get equivalent (Position over the engine
+        /// <summary>Playhead in seconds — AudioSource.time-get equivalent (Playhead over the engine
         /// sample rate).</summary>
-        public double PositionSeconds => Engine.Instance ? Position / (double)Engine.Instance.sampleRate : 0.0;
+        public double PlayheadSeconds => Engine.Instance ? Playhead / (double)Engine.Instance.sampleRate : 0.0;
+
+        [System.Obsolete("Renamed: the content playhead is Playhead (Position collided with the spatial transform).")]
+        public ulong Position => Playhead;
+        [System.Obsolete("Renamed to PlayheadSeconds.")]
+        public double PositionSeconds => PlayheadSeconds;
 
         /// <summary>Linear gain — AudioSource.volume equivalent; applies immediately if live. Cancels a
         /// running FadeTo/FadeOut (an explicit gain wins over a fade).</summary>
@@ -271,7 +277,7 @@ namespace BwAudio
         public float ReflectionSend
         {
             get => reflectionSend;
-            set { reflectionSend = value; if (_created && Eng != IntPtr.Zero) Bwa.bwa_source_set_reflection_send(Eng, _src, value); }
+            set { reflectionSend = value; if (_created && Eng != IntPtr.Zero) Bwa.bwa_source_set_reverb_send(Eng, _src, value); }
         }
 
         /// <summary>Drive occlusion from GAME LOGIC instead of the ray-traced sim — a door the gameplay
@@ -315,9 +321,9 @@ namespace BwAudio
             Bwa.bwa_source_set_size(Eng, _src, sizeMetres);
             Bwa.bwa_source_set_occlusion(Eng, _src, occlusion);
             Bwa.bwa_source_set_early_reflections(Eng, _src, earlyReflections);
-            Bwa.bwa_source_set_reflections(Eng, _src, reflections);
-            Bwa.bwa_source_set_reflection_send(Eng, _src, reflectionSend);
-            Bwa.bwa_source_set_reflection_distance(Eng, _src, reflectionDistance);
+            Bwa.bwa_source_set_reverb(Eng, _src, reflections);
+            Bwa.bwa_source_set_reverb_send(Eng, _src, reflectionSend);
+            Bwa.bwa_source_set_reverb_distance(Eng, _src, reflectionDistance);
             Bwa.bwa_source_set_pathing(Eng, _src, pathing);
             Bwa.bwa_source_set_doppler(Eng, _src, doppler);
             Bwa.bwa_source_set_air_absorption(Eng, _src, airAbsorption);

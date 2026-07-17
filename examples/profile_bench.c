@@ -75,7 +75,7 @@ int main(int argc, char** argv) {
         bwa_source_set_gain(e, src[i], 0.15f);
         if (i % 2 == 0) bwa_source_set_doppler(e, src[i], true);
         if (i % 3 == 0) bwa_source_set_air_absorption(e, src[i], true);
-        if (i % 4 == 0) { bwa_source_set_reflections(e, src[i], true); bwa_source_set_reflection_distance(e, src[i], true); }
+        if (i % 4 == 0) { bwa_source_set_reverb(e, src[i], true); bwa_source_set_reverb_distance(e, src[i], true); }
         if (i % 5 == 0) bwa_source_set_spread(e, src[i], 0.5f);
     }
     bwa_commit(e);

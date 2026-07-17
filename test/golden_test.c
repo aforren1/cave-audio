@@ -47,7 +47,7 @@ static int render_scenario(double* total, double* negX, double* posX, float* hea
     float spk[MAXCH * 3];
     bwa_get_speakers(e, spk, MAXCH);
 
-    bwa_source s = bwa_source_create_stream(e);
+    bwa_source s = bwa_source_create_push(e);
     if (!s) { fprintf(stderr, "golden: create_stream: %s\n", bwa_last_error(e)); bwa_destroy(e); return -1; }
     bwa_source_set_pos(e, s, -1.5f, 1.5f, 0.0f);                  /* room -x = the listener's RIGHT */
     bwa_set_listener_pose(e, 0.0f, 1.5f, 0.0f, 0.0f, 0.0f, 0.0f, 1.0f);

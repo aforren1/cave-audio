@@ -4,7 +4,7 @@
  *   bwa_load_sound_streaming   long files (music/ambience): a background thread decodes chunks
  *                              into a per-stream ring, the voice reads the ring. RAM stays flat
  *                              no matter how long the file is.
- *   bwa_source_create_stream   PUSH (procedural) sources: YOU generate PCM on the control thread
+ *   bwa_source_create_push   PUSH (procedural) sources: YOU generate PCM on the control thread
  *                              and push it into the same kind of ring — synthesis, VoIP, a
  *                              game-engine submix, anything without a file.
  *
@@ -100,7 +100,7 @@ int main(void) {
     /* ---- part 2: a push (procedural) source ---- */
     printf("\n[2] push source: generating an FM sweep on the control thread and pushing it\n"
            "    into the voice's ring (~1.3 s deep). 6 s, then push_end + drain...\n");
-    bwa_source s2 = bwa_source_create_stream(e);
+    bwa_source s2 = bwa_source_create_push(e);
     if (!s2) { fprintf(stderr, "create_stream: %s\n", bwa_last_error(e)); bwa_stop(e); bwa_destroy(e); return 1; }
     bwa_source_set_gain(e, s2, 0.7f);
     bwa_source_set_pos(e, s2, -2.0f, 1.5f, 1.0f);

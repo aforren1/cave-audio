@@ -177,7 +177,7 @@ engines. Don't start with the engine bindings.
   `build_bed_decode`/`mix_bed`). The reflection bed reuses the same SH→26 decode.
 - Audio file formats — **WAV/FLAC/MP3 + resample-on-load implemented**
   (`src/sound.c`, dr_libs).
-- `bwa_source_create_stream` for procedural/engine-generated audio — **implemented**:
+- `bwa_source_create_push` for procedural/engine-generated audio — **implemented**:
   a push-fed source (caller pushes mono PCM into a per-source ring; `bwa_source_push` /
   `bwa_source_push_space` / `bwa_source_push_end`), reusing the file-streaming ring
   machinery (`src/stream.c` push mode) so the mixer path is identical. See

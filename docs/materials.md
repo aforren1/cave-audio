@@ -322,7 +322,7 @@ cleared it.
 effect's** (a mismatch is a hard crash). So **IR length, ambisonic order, and the ray/bounce
 budget are load-time configuration** — `bwa_reflections_config` is callable only between
 `bwa_create` and `bwa_start`, and changing any of them means `bwa_stop`/`bwa_start`. The one live
-control is the wet gain: `bwa_reflections_set_gain` (an atomic the audio-thread tap reads). Per
+control is the wet gain: `bwa_reverb_set_gain` (an atomic the audio-thread tap reads). Per
 block, only `IPLReflectionEffectParams.numChannels` may be *reduced* (≤ created) to shed CPU;
 nothing is resized.
 
@@ -392,13 +392,13 @@ void bwa_scene_set_box     (bwa_engine* e, float w, float h, float d, const bwa_
 
 /* reflection bed — config is load-time only (sizes are baked at bwa_start); wet gain is live */
 void bwa_reflections_config (bwa_engine* e, const bwa_reflections_desc* cfg);
-void bwa_reflections_set_gain(bwa_engine* e, float linear);        /* LIVE, per-frame-safe */
+void bwa_reverb_set_gain(bwa_engine* e, float linear);        /* LIVE, per-frame-safe */
 
 /* per-source toggles (per-frame-safe: enqueue only) */
 void bwa_source_set_occlusion          (bwa_engine* e, bwa_source s, bool on);
-void bwa_source_set_reflections        (bwa_engine* e, bwa_source s, bool on);
-void bwa_source_set_reflection_send    (bwa_engine* e, bwa_source s, float gain);
-void bwa_source_set_reflection_distance(bwa_engine* e, bwa_source s, bool on);
+void bwa_source_set_reverb        (bwa_engine* e, bwa_source s, bool on);
+void bwa_source_set_reverb_send    (bwa_engine* e, bwa_source s, float gain);
+void bwa_source_set_reverb_distance(bwa_engine* e, bwa_source s, bool on);
 void bwa_source_set_pathing            (bwa_engine* e, bwa_source s, bool on);
 void bwa_source_set_orientation        (bwa_engine* e, bwa_source s, float qx, float qy, float qz, float qw);
 void bwa_source_set_directivity        (bwa_engine* e, bwa_source s, float weight, float power);
@@ -413,15 +413,15 @@ float bwa_source_get_directivity(bwa_engine* e, bwa_source s);       /* 1 = on-a
 (1 or 2; 0 → default 1), `num_rays` (0 → default 4096), `num_bounces` (0 → default 16), `enabled`
 (0 = no bed created), `bake` (non-0 = precompute the reverb at a probe grid at `bwa_start`), and
 `reserved[3]` (zero; room to grow without an ABI break). The wet level is not config — it is
-`bwa_reflections_set_gain`, live, default 1. There is no "update Hz" field (the sim
+`bwa_reverb_set_gain`, live, default 1. There is no "update Hz" field (the sim
 rates are compile-time constants) and no shared-vs-per-source field (the bed is always the single
 shared instance).
 
 The per-source wet send:
 
-- **`bwa_source_set_reflection_send`** sets the source's wet-send **level** (default 1.0; 0 =
+- **`bwa_source_set_reverb_send`** sets the source's wet-send **level** (default 1.0; 0 =
   none). Drive it yourself for a manual dry/wet.
-- **`bwa_source_set_reflection_distance`** turns on **distance→wet**: the engine scales the send by
+- **`bwa_source_set_reverb_distance`** turns on **distance→wet**: the engine scales the send by
   the source↔listener distance, on top of the level — near = drier, far = wetter (0.25× at ≤1 m up
   to 1× at ≥6 m). Off by default.
 - Both are per-frame-safe. The final send gain is computed per block and **ramped** in `rt.c`
@@ -449,7 +449,7 @@ allocation sizes — see "Fixed-at-create" above); the wet gain is the one live 
 | `order`                    | bed directionality vs channel count / IR width  | 1 (max 2)     | baked at `bwa_start` |
 | `num_rays`                 | reflection accuracy vs ray-trace cost (off-thread) | 4096       | baked at `bwa_start` |
 | `num_bounces`              | bounce depth (off-thread)                       | 16            | baked at `bwa_start` |
-| wet level                  | reverb level summed onto the bus                | 1.0           | **live** (`bwa_reflections_set_gain`) |
+| wet level                  | reverb level summed onto the bus                | 1.0           | **live** (`bwa_reverb_set_gain`) |
 | sim update rate            | reflection responsiveness vs CPU (off-thread)   | 12 Hz         | compile-time (`REFL_HZ`) |
 
 Two multiplicative cost controls: **hybrid reverb** keeps each convolution short (early IR only;

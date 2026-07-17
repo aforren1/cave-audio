@@ -285,7 +285,7 @@ namespace BwAudio
             Bwa.bwa_set_max_re(_eng, maxRe);
             Bwa.bwa_set_tracked_room_eq(_eng, trackedRoomEq);
             Bwa.bwa_set_master_gain(_eng, masterGain);
-            Bwa.bwa_reflections_set_gain(_eng, reverbGain);   // valid pre-start: seeds whichever reverb bed bwa_start creates
+            Bwa.bwa_reverb_set_gain(_eng, reverbGain);   // valid pre-start: seeds whichever reverb bed bwa_start creates
             Bwa.bwa_early_reflections_set_gain(_eng, earlyReflectionGain);
             Bwa.bwa_set_limiter(_eng, limiter);
             Bwa.bwa_set_limiter_ceiling(_eng, limiterCeilingDb);
@@ -343,7 +343,7 @@ namespace BwAudio
         public float ReverbGain
         {
             get => reverbGain;
-            set { reverbGain = value; if (Ready) Bwa.bwa_reflections_set_gain(_eng, value); }
+            set { reverbGain = value; if (Ready) Bwa.bwa_reverb_set_gain(_eng, value); }
         }
 
         /// <summary>Level of the image-source EARLY reflections (the per-source wall bounces, opted into

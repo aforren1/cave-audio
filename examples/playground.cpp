@@ -828,9 +828,9 @@ static void rev_apply_wall(void) {                 /* add/remove the wall + togg
 }
 static void rev_enter(void) {
     bwa_source_set_gain(e, src, SRC_GAIN);
-    bwa_source_set_reflections(e, src, rev_on);    /* feed the source into the shared reverb bed */
-    bwa_source_set_reflection_distance(e, src, rev_dist);
-    bwa_reflections_set_gain(e, rev_wet);
+    bwa_source_set_reverb(e, src, rev_on);    /* feed the source into the shared reverb bed */
+    bwa_source_set_reverb_distance(e, src, rev_dist);
+    bwa_reverb_set_gain(e, rev_wet);
     source_pos = Vector3{ 0.0f, g_head.y, -3.0f }; /* behind where the wall sweeps, so the demo occludes out of the box */
     rev_wall = -1;                                 /* fresh engine build; re-add if enabled */
     rev_apply_wall();
@@ -842,8 +842,8 @@ static void rev_update(float dt) {
         build_engine(1);
         rev_enter();                               /* re-apply source gain + reflections + wet on the new engine */
     }
-    if (kp(KEY_G)) { rev_on = !rev_on; bwa_source_set_reflections(e, src, rev_on); }
-    if (kp(KEY_V)) { rev_dist = !rev_dist; bwa_source_set_reflection_distance(e, src, rev_dist); }
+    if (kp(KEY_G)) { rev_on = !rev_on; bwa_source_set_reverb(e, src, rev_on); }
+    if (kp(KEY_V)) { rev_dist = !rev_dist; bwa_source_set_reverb_distance(e, src, rev_dist); }
     if (kp(KEY_N)) { rev_wall_on = !rev_wall_on; rev_apply_wall(); }       /* movable occluder in/out */
     if (kp(KEY_SPACE)) rev_wall_sweep = !rev_wall_sweep;
     if (rev_wall_on && rev_wall_sweep) {           /* slide the wall through the ear line: occlusion + reverb both shift */
@@ -851,7 +851,7 @@ static void rev_update(float dt) {
     }
     if (kd(KEY_LEFT_BRACKET))  rev_wet = fmaxf(0.0f, rev_wet - 0.7f * dt);
     if (kd(KEY_RIGHT_BRACKET)) rev_wet = fminf(2.0f, rev_wet + 0.7f * dt);
-    bwa_reflections_set_gain(e, rev_wet);
+    bwa_reverb_set_gain(e, rev_wet);
     source_pos.x = Clamp(source_pos.x, -ROOM_W * 0.5f + 0.5f, ROOM_W * 0.5f - 0.5f); /* keep it inside the room */
     source_pos.y = Clamp(source_pos.y, 0.5f, ROOM_H - 0.5f);                         /* floor-based box: y 0..H */
     source_pos.z = Clamp(source_pos.z, -ROOM_D * 0.5f + 0.5f, ROOM_D * 0.5f - 0.5f);
@@ -941,7 +941,7 @@ static void build_engine(int with_reverb) {
     refl = bwa_source_create(e);  bwa_source_play(e, refl, sig_snd(), true);
     g_bed = bwa_bed_create(e);
     bwa_source_set_gain(e, refl, 0.0f);
-    if (with_reverb) bwa_source_set_reflections(e, src, rev_on);
+    if (with_reverb) bwa_source_set_reverb(e, src, rev_on);
     engine_has_reverb = with_reverb;
 }
 
@@ -1325,12 +1325,12 @@ static void draw_panel(void) {
         ImGui::TextWrapped("bursts = front (red), clicks = left-up (blue), plus a diffuse floor. "
                            "World-locked: the field is glued to the room, not the head.");
     } else {                                              /* Reverb bed */
-        if (chk("reverb send [G]", &rev_on)) bwa_source_set_reflections(e, src, rev_on);
+        if (chk("reverb send [G]", &rev_on)) bwa_source_set_reverb(e, src, rev_on);
         bwTip("opt the source into the shared reverb bed's wet send");
         ImGui::SetNextItemWidth(-FLT_MIN);
         ImGui::SliderFloat("##wet", &rev_wet, 0.0f, 2.0f, "wet %.2f  [ ] keys");   /* applied per frame in rev_update */
-        bwTip("live wet level of the whole bed (bwa_reflections_set_gain)");
-        if (chk("distance->wet [V]", &rev_dist)) bwa_source_set_reflection_distance(e, src, rev_dist);
+        bwTip("live wet level of the whole bed (bwa_reverb_set_gain)");
+        if (chk("distance->wet [V]", &rev_dist)) bwa_source_set_reverb_distance(e, src, rev_dist);
         bwTip("near = drier, far = wetter - walk the source away (WASD) and hear "
               "the room take over");
         ImGui::SetNextItemWidth(-FLT_MIN);

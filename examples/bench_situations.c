@@ -104,7 +104,7 @@ static int run_sit(const Sit* s, bwa_sound snd_unused, Stats* out, int K) {
         if (s->air)         bwa_source_set_air_absorption(e, v, true);
         if (s->spread)      bwa_source_set_spread(e, v, 0.6f);
         if (s->occl_manual) { float bands[3] = { 0.5f, 0.3f, 0.12f }; bwa_source_set_occlusion_manual(e, v, 0.35f, bands); }
-        if (s->reflections || s->fdn || s->reflect_bed) bwa_source_set_reflections(e, v, true);   /* feed the aux send */
+        if (s->reflections || s->fdn || s->reflect_bed) bwa_source_set_reverb(e, v, true);   /* feed the aux send */
         if (s->pathing)     bwa_source_set_pathing(e, v, true);
     }
     bwa_commit(e);

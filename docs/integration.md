@@ -142,8 +142,8 @@ The snippet shows the core calls. The shipped `Bwa.cs` binds the ABI **1:1** —
   `bwa_source_get_occlusion`, `bwa_source_set_occlusion_manual` (game-driven
   occlusion; **works without the Steam Audio build**),
   `bwa_source_set_directivity` (+ preset), `bwa_source_set_orientation`.
-- **Reflections + pathing**: `bwa_reflections_config`, `bwa_reflections_set_gain`,
-  `bwa_source_set_reflections` / `_reflection_send` / `_reflection_distance`,
+- **Reflections + pathing**: `bwa_reflections_config`, `bwa_reverb_set_gain`,
+  `bwa_source_set_reverb` / `_reflection_send` / `_reflection_distance`,
   `bwa_source_set_pathing` (engine-level enable rides `bwa_desc.enable_pathing`);
   the phonon-free **FDN reverb** (`bwa_fdn_config`).
 - **Ambisonic beds**: the full `bwa_bed_*` facade — `create` / `play` / `set_gain` /
@@ -166,7 +166,7 @@ The snippet shows the core calls. The shipped `Bwa.cs` binds the ABI **1:1** —
   (the layout's speaker count — see "Channel count" above; size meter/speaker
   arrays with it, never a hard-coded 26).
 - **Assets**: `bwa_load_sound_streaming`, `bwa_load_ambix`.
-- **Procedural (push) sources**: `bwa_source_create_stream`, `bwa_source_push`,
+- **Procedural (push) sources**: `bwa_source_create_push`, `bwa_source_push`,
   `bwa_source_push_space`, `bwa_source_push_end` — push mono engine-rate floats
   from the main thread (the binding's control thread); see api.md.
 

@@ -70,8 +70,11 @@ namespace BwAudio
 
         /// <summary>Current playhead into the soundfield clip, in engine-rate frames (latest-wins
         /// readback, ~one audio block of lag; freezes while the bed is paused). 0 while idle;
-        /// seconds = Position / Engine.Instance.sampleRate.</summary>
-        public ulong Position => _created && Eng != IntPtr.Zero ? Bwa.bwa_bed_get_position(Eng, _bed) : 0;
+        /// seconds = Playhead / Engine.Instance.sampleRate.</summary>
+        public ulong Playhead => _created && Eng != IntPtr.Zero ? Bwa.bwa_bed_get_playhead(Eng, _bed) : 0;
+
+        [System.Obsolete("Renamed to Playhead.")]
+        public ulong Position => Playhead;
 
         /// <summary>Master gain of the bed (ramped); applies immediately if live.</summary>
         public float Gain

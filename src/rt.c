@@ -2423,7 +2423,7 @@ uint32_t rt_bus_peaks(RtCore* c, float* out, uint32_t cap) {
 /* Control-thread readback: is the source's voice still producing audio? Reads the per-slot state the
  * audio thread republishes each block, gated on the handle's generation (a stale/recycled handle, or
  * a finished non-loop voice, reads as not-playing). Until the audio thread has published this
- * generation once (the window between a play — or bwa_source_create_stream's internal one — and the
+ * generation once (the window between a play — or bwa_source_create_push's internal one — and the
  * next rendered block), the control-side pending-play flag answers instead, so a fresh voice never
  * reads not-playing and a poll-then-destroy can't drop it. Best-effort: a sound shorter than a poll
  * interval may never be observed playing. */
