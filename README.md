@@ -47,7 +47,7 @@ maintain alongside it.
 - **Propagation**: distance attenuation, Doppler, air absorption, equal-loudness
   compensation, playback **pitch**; opt-in per source, ramped/glided.
 - **Assets**: WAV/FLAC/MP3, decoded and resampled at load; disk streaming for long
-  files; AmbiX ambisonic beds: matrix decode (sampling or AllRAD) or a
+  files; AmbiX ambisonic beds: matrix decode (AllRAD or EPAD) or a
   **parametric DirAC-style renderer** whose direct stream re-pans listener-relative
   (a walkable soundfield), with yaw rotation to line a capture up with the scene.
 - **Voices**: fixed pool with priority stealing; pause (per-voice, per-group, and
@@ -64,7 +64,7 @@ maintain alongside it.
 - **Real-time discipline**: no allocation, locks, or I/O on the audio thread;
   lock-free SPSC command/event rings; `bwa_commit` gives frame-coherent updates;
   every parameter change ramps—nothing steps.
-- **Validation**: the core math (SH encode, VBAP, AllRAD, biquads, EQ rendering)
+- **Validation**: the core math (SH encode, VBAP, AllRAD, EPAD, biquads, EQ rendering)
   is cross-checked against independent implementations (scipy/qhull/linear-
   programming goldens) in CI, alongside the DSP/concurrency test suite and
   UI-driven tests for all three tools.
@@ -84,7 +84,7 @@ The calibration commands behind the last row are under
 | tracking | `bwa_tracker_connect` | none - listener sits at the seat | track the main occupant + `bwa_set_extra_listeners` for the rest | push head pose, or track |
 | dual-band | off | **on** | off | your call (A/B it) |
 | calibration | `--eq` + `--room-eq-grid` | `--eq` + `--room-eq` at the seat | `--eq` only | `--eq` |
-| bed decoder | AllRAD if the array is irregular | sampling | AllRAD | either |
+| bed decoder | AllRAD (default); A/B EPAD | AllRAD | AllRAD; A/B EPAD | either |
 
 **Tracked roamer.** DBAP is listener-relative and re-solves every block, so the image
 follows you instead of degrading away from a centre. Leave dual-band and VBAP off:
