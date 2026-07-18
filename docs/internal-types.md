@@ -1,6 +1,6 @@
-# Internal types & helper contracts
+# Internal types and helper contracts
 
-These types are **internal** to `src/` — they are *not* part of the public ABI
+These types are **internal** to `src/`—they are *not* part of the public ABI
 and must **not** go in [`include/bw_audio.h`](../include/bw_audio.h).
 
 This file pins the protocol fields that [`concurrency.md`](./concurrency.md)
@@ -15,7 +15,7 @@ tables, and asset (`SoundSlot`) memory.
 
 ## Handles
 
-`bwa_source` / `bwa_sound` are `uint32_t = (index | generation<<16)` — the
+`bwa_source` / `bwa_sound` are `uint32_t = (index | generation<<16)`: the
 `BWA_H_IDX` / `BWA_H_GEN` / `BWA_MK_H` macros in [`src/rt.h`](../src/rt.h). Index
 and generation are each 16-bit, so the voice and sound tables are each ≤ 65536
 slots and generations wrap at 2¹⁶. The wrap is safe: a stale handle only has to
@@ -27,7 +27,7 @@ concurrency.md).
 
 ## DSP state (audio thread owns)
 
-`Voice` (rt.c) is ~50 fields. The protocol core — the fields the concurrency
+`Voice` (rt.c) is ~50 fields. The protocol core, the fields the concurrency
 doc's snapshot logic manipulates:
 
 ```c
@@ -55,36 +55,36 @@ typedef struct {
 ```
 
 `BWA_CHANNELS` (26) is defined in [`src/sink.h`](../src/sink.h) and is the
-**capacity**, not the count. Every `[BWA_CHANNELS]` array in these structs — gain
-vectors, the bed decode matrix, the meters — is sized to that capacity, but only
+**capacity**, not the count. Every `[BWA_CHANNELS]` array in these structs—gain
+vectors, the bed decode matrix, the meters—is sized to that capacity, but only
 the first `RtCore.channels` entries are used. `channels` is the loaded layout's
 speaker count (`Layout.count`, 4..26; 26 for the default grid), resolved in
 `bwa_create` *before* `rt_create` and fixed for the engine's lifetime. It is what
 `bwa_get_channel_count` reports. Loops over the bus must use `channels`, never
-`BWA_CHANNELS` — the tail entries belong to no speaker.
+`BWA_CHANNELS`—the tail entries belong to no speaker.
 
 The rest of the struct is per-subsystem DSP state, one group per feature. All of
 it is audio-thread-only (ramp state, filter histories), which is why it lives
 *inside* `Voice`:
 
-- **scheduling / streaming** — `oneshot` (self-recycling voice),
+- **scheduling / streaming**: `oneshot` (self-recycling voice),
   `stream_pos` (absolute position into a stream's ring),
   `start_sample` (dsp-sample for a scheduled `bwa_source_play_at`).
-- **dual-band panning** — `gtarget_lo` / `gcur_lo` (amplitude-normalised LF
+- **dual-band panning**: `gtarget_lo` / `gcur_lo` (amplitude-normalised LF
   gain set), `xover_lp` (crossover one-pole state), `dual_mix` (0↔1 A/B
   crossfade factor).
-- **occlusion / directivity** — `occ_cur`, `dir_cur` ramp state plus the
+- **occlusion / directivity**: `occ_cur`, `dir_cur` ramp state plus the
   3-band transmission-EQ biquad state (`eqg_cur`, `eq_co`, DF-I histories,
   `eq_engaged`). The published *targets* live in `RtCore`'s atomic arrays, not
   here (see below).
-- **reflection send** — `refl_send`, `refl_dist`, `refl_gain`, `refl_g_cur`
+- **reflection send**: `refl_send`, `refl_dist`, `refl_gain`, `refl_g_cur`
   (ramped effective send gain).
-- **pathing** — `path_on`, `path_sh_cur` (ramped SH coefficients), and a
+- **pathing**: `path_on`, `path_sh_cur` (ramped SH coefficients), and a
   second, structurally identical bending-loss EQ state (`path_eq*`).
-- **propagation** — `air_on` / `air_a_cur` / `air_y1` (air-absorption
+- **propagation**: `air_on` / `air_a_cur` / `air_y1` (air-absorption
   low-pass), `dop_on` / `dop_init` / `dop_delay` / `dop_dtgt` / `dop_w`
   (Doppler fractional-delay line), `spread` (source angular width).
-- **pause / seek** — `paused`, `pause_g` (the ramped gate), `stopping`
+- **pause / seek**: `paused`, `pause_g` (the ramped gate), `stopping`
   (fade-out for stop/steal), `seek_pending` / `seek_pos`.
 
 ## Listener (audio thread owns active; control writes via ring)
@@ -103,10 +103,10 @@ is also handed to the reflection/pathing taps. With a tracker connected,
 ## Sound (control thread owns; audio thread only reads via const*)
 
 A sound is two structs: the **payload** ([`src/sound.h`](../src/sound.h)) and
-the **lifecycle wrapper** (rt.c — the sound table is a `SoundSlot[]`):
+the **lifecycle wrapper** (rt.c; the sound table is a `SoundSlot[]`):
 
 ```c
-/* sound.h — the payload */
+/* sound.h - the payload */
 typedef struct {
     float*   pcm;            /* frames * channels interleaved; NULL when empty or streaming */
     uint32_t frames;
@@ -116,7 +116,7 @@ typedef struct {
     struct Stream* stream;   /* non-NULL = streamed from disk (mono; see stream.h) */
 } SoundData;
 
-/* rt.c — the lifecycle wrapper */
+/* rt.c - the lifecycle wrapper */
 typedef struct {
     SoundData data;
     uint16_t  gen;           /* generation for the sound handle */
@@ -139,7 +139,7 @@ Notes:
 
 See [`layout-schema.md`](./layout-schema.md) for the file format. Replaceable
 while the audio thread is stopped (`rt_set_layout`). Its `count` is the engine's
-channel count — the loader accepts 4..`BWA_CHANNELS` speakers whose indices form a
+channel count: the loader accepts 4..`BWA_CHANNELS` speakers whose indices form a
 complete `0..count-1` permutation, and a layout with fewer than `BWA_CHANNELS`
 leaves the tail `speakers[]` entries at the default grid's values (harmless:
 `count` gates every consumer). From [`src/layout.h`](../src/layout.h):
@@ -159,7 +159,7 @@ typedef struct {
 
 typedef struct {
     Speaker  speakers[BWA_CHANNELS];   /* capacity; only `count` are real */
-    uint32_t count;                /* 4..BWA_CHANNELS — and it IS the engine's channel count */
+    uint32_t count;                /* 4..BWA_CHANNELS - and it IS the engine's channel count */
     float    ref[3];               /* nominal listening point = the array centroid */
     float    rolloff_r;            /* DBAP spatial blur (meters) */
     /* distance attenuation: atten = clamp((ref/max(d,ref))^rolloff, min_lin, 1) */
@@ -198,8 +198,8 @@ struct bwa_engine {                /* abridged; see engine.c */
 ```
 
 There is no bus field in either struct. The bus is a `float* bus` **argument**
-to `rt_render`, supplied per block by whichever sink render callback is running
-— the device's own buffer for `cave`, `scratch26` for `binaural`. (`scratch26` is
+to `rt_render`, supplied per block by whichever sink render callback is running:
+the device's own buffer for `cave`, `scratch26` for `binaural`. (`scratch26` is
 allocated at the `BWA_CHANNELS` capacity; `rt_render` fills only `channels` of it.)
 
 ### Also lives in RtCore
@@ -207,32 +207,32 @@ allocated at the `BWA_CHANNELS` capacity; `rt_render` fills only `channels` of i
 Subsystem state parked in `RtCore` (the struct definition in rt.c is the
 reference):
 
-- **panner caches** — `SpcapState` / `VbapState`, self-invalidated via
+- **panner caches**: `SpcapState` / `VbapState`, self-invalidated via
   `layout_gen`; the `panner` / `dual_band` atomics.
-- **channel count** — `channels` (the layout's speaker count; set at `rt_create`),
+- **channel count**: `channels` (the layout's speaker count; set at `rt_create`),
   the width every bus loop, decode matrix, and meter array actually runs to.
-- **bed decode** — the `bed_decode[BWA_CHANNELS][BWA_AMBI_CH]` matrix (built for the
+- **bed decode**: the `bed_decode[BWA_CHANNELS][BWA_AMBI_CH]` matrix (built for the
   first `channels` rows) + `bed_decoder` selector (SAD / AllRAD).
-- **limiter** — `lim_on` / `lim_ceiling` atomics, the `lim_gain` envelope,
+- **limiter**: `lim_on` / `lim_ceiling` atomics, the `lim_gain` envelope,
   rate-derived attack/release coefficients.
-- **pathing publish** — the `PathPub` double buffer + `path_idx` flip atomics,
+- **pathing publish**: the `PathPub` double buffer + `path_idx` flip atomics,
   the `path_accum` ambisonic scratch, the path tap pointer.
-- **pose** — the `tracker` (`const PoseSlot*`, [`src/pose.h`](../src/pose.h))
+- **pose**: the `tracker` (`const PoseSlot*`, [`src/pose.h`](../src/pose.h))
   and the `readback` `PoseSlot` the audio thread publishes each block.
-- **streaming** — the `StreamSet` (background thread + ring pool) and the
+- **streaming**: the `StreamSet` (background thread + ring pool) and the
   per-block `stream_scratch`.
-- **occlusion publish** — the `occ_handle` / `occ_val` / `occ_eq` / `occ_dir`
+- **occlusion publish**: the `occ_handle` / `occ_val` / `occ_eq` / `occ_dir`
   atomic arrays (parallel to `voices`, outside `Voice` so a voice-create memset
   can't race a publish).
-- **readback / meters** — `play_pub` (per-slot playing state), `chan_peak`
+- **readback / meters**: `play_pub` (per-slot playing state), `chan_peak`
   (per-channel output peaks), `dsp_now` (the published dsp clock).
-- **misc DSP** — the reflection `aux` scratch, the `dop_ring` Doppler pool,
+- **misc DSP**: the reflection `aux` scratch, the `dop_ring` Doppler pool,
   the test-signal state, the `eq_proto` biquad prototypes.
 
 ## Helper signatures (implemented in `src/`)
 
-Everything marked *(audio)* MUST obey invariant 1 (no alloc/lock/syscall/I/O)
-— see [`CLAUDE.md`](../CLAUDE.md).
+Everything marked *(audio)* MUST obey invariant 1 (no alloc/lock/syscall/I/O);
+see [`CLAUDE.md`](../CLAUDE.md).
 
 ```c
 /* rings (rt.c; static) */

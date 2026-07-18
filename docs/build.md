@@ -1,9 +1,9 @@
-# Build, dependencies & licensing
+# Build, dependencies, and licensing
 
 ## Platform
 
 **Windows only.** ASIO is Windows-only; DVS is Windows/macOS. A cross-platform move
-means abstracting the device layer — ASIO is just the Windows sink, and the backend
+means abstracting the device layer: ASIO is only the Windows sink, and the backend
 elsewhere would be ALSA/JACK (Linux) or CoreAudio (macOS). Keep ASIO assumptions
 confined to `asio_sink.cpp`.
 
@@ -12,16 +12,16 @@ Build system: CMake + MSVC (Visual Studio 2022 toolset). The core is C (C11 with
 
 MSVC gates C11 atomics behind `/experimental:c11atomics`. CMake applies that flag per
 source file: `src/rt.c` and `src/stream.c` always, plus `src/steam_reflect.c` in the
-with-SDK build (its IR-publish seqlock uses `stdatomic.h` too) — both where the DLL
+with-SDK build (its IR-publish seqlock uses `stdatomic.h` too), both where the DLL
 compiles it and in the test targets (`reflect`, `bake`) that compile it directly.
 
 **Race-checking the rings.** The `test_rt` target drives the SPSC ring/commit logic
-off the real-time path — single-threaded, deterministic — and is what runs under
+off the real-time path (single-threaded, deterministic) and is what runs under
 `ctest` on MSVC. The full ThreadSanitizer/Helgrind pass the roadmap calls for needs a
 **Clang or Linux** build: MSVC ships no TSan, and Helgrind is Valgrind/Linux. Build
 `rt.c` + a two-thread driver with `clang -fsanitize=thread` (or run under Helgrind)
 and exercise one producer pushing commands while one consumer drains. Keep that
-driver off the RT path — never let the sanitizer harness add allocation/locks to the
+driver off the RT path: never let the sanitizer harness add allocation/locks to the
 callback.
 
 ## CMake options
@@ -43,7 +43,7 @@ Steam Audio has no option: CMake auto-enables it when the built phonon SDK sits 
 
 ### Building without Steam Audio
 
-**A no-SDK build is fully viable for the array** — it is not a degraded mode. You keep the whole
+**A no-SDK build is fully viable for the array**—it is not a degraded mode. You keep the whole
 spatializer, plus a complete geometric acoustics path: **image-source early reflections**
 (`bwa_source_set_early_reflections`, real parallax as the listener walks), the **directional FDN
 reverb** (`bwa_fdn_config`), and **manual occlusion** (`bwa_source_set_occlusion_manual`, driven by
@@ -51,12 +51,12 @@ your own game logic). That is what a collaborator site should start from: clone,
 
 What the SDK adds, and what you lose without it:
 
-- **Ray-traced occlusion + transmission** against arbitrary geometry — automatic, where the manual
+- **Ray-traced occlusion + transmission** against arbitrary geometry: automatic, where the manual
   path needs the game to know the answer. The main reason to build it.
 - **Sound pathing** (routing around occluders). No equivalent.
 - **A real HRTF binaural monitor.** Without it the `binaural` profile falls back to a lateral pan:
   fine for routing checks, useless for timbre or front/back. This is a *developer-workstation*
-  dependency — the production CAVE render is the 26-speaker array, which never uses HRTF.
+  dependency: the production CAVE render is the 26-speaker array, which never uses HRTF.
 - The Steam **reflection bed**, which the recommended configuration does not use anyway (see
   [materials.md](./materials.md) → "Choosing an acoustics path").
 
@@ -65,7 +65,7 @@ What the SDK adds, and what you lose without it:
 | dep            | role                                        | license / notes                          |
 |----------------|---------------------------------------------|------------------------------------------|
 | Steinberg ASIO SDK | device output to DVS; timing hooks       | dual GPLv3 / proprietary (see below)     |
-| Steam Audio (C API)| binaural HRTF decode; occlusion, reflections (with baking), pathing — all implemented | Apache-2.0 (`steam-audio-source/LICENSE.md`) |
+| Steam Audio (C API)| binaural HRTF decode; occlusion, reflections (with baking), pathing - all implemented | Apache-2.0 (`steam-audio-source/LICENSE.md`) |
 | dr_libs (dr_wav 0.14.5 / dr_flac 0.13.3 / dr_mp3 0.7.3) | WAV/FLAC/MP3 decode (`sound.c`, `stream.c`) | public domain / MIT-0; FetchContent, pinned |
 | cJSON v1.7.19  | layout + calibration JSON                    | MIT; FetchContent, pinned                |
 | NatNet         | OptiTrack pose ingest                        | consume off-wire; see below              |
@@ -85,7 +85,7 @@ default build or `bw_audio.dll`:
 | dep | pin | pulled in by | license |
 |-----|-----|--------------|---------|
 | imgui | v1.92.8 | PLAYGROUND, CALIBVIEW | MIT |
-| imgui_test_engine | v1.92.8 | PLAYGROUND, CALIBVIEW | Dear ImGui Test Engine License — **not MIT**, see below |
+| imgui_test_engine | v1.92.8 | PLAYGROUND, CALIBVIEW | Dear ImGui Test Engine License - **not MIT**, see below |
 | implot | v1.0 | CALIBVIEW | MIT |
 | implot3d | v0.4 | CALIBVIEW | MIT |
 | raylib | 5.5 | PLAYGROUND | zlib/libpng |
@@ -95,7 +95,7 @@ default build or `bw_audio.dll`:
 
 The imgui and imgui_test_engine tags track each other. Bump them together.
 
-### License inventory — what ships where
+### License inventory: what ships where
 
 Everything above, sorted by what it actually ends up in:
 
@@ -107,14 +107,14 @@ Everything above, sorted by what it actually ends up in:
 - **The GUI tools** (`bwa_playground`, `bwa_layout_tool`, `bwa_calib_view`, opt-in builds)
   additionally compile in imgui, implot, implot3d (**MIT**), raylib, rlImGui
   (**zlib/libpng**), the Roboto face (**Apache-2.0**), imgui_test_engine (**its own
-  dual license** — free tier, see below), and optionally Tracy (**BSD-3-Clause**).
+  dual license**: free tier, see below), and optionally Tracy (**BSD-3-Clause**).
   The tools ship in the CI artifact; the notices ride along in
   [`THIRD_PARTY-NOTICES.md`](../THIRD_PARTY-NOTICES.md) (repo root, copied into the
   artifact). Keep that file in sync when a pin bumps.
 - **Never linked**: the NatNet SDK. `third_party/NatNetSDK/` sits in the tree as a
-  **protocol reference only** (it is proprietary — OptiTrack's plugin license); no
+  **protocol reference only** (it is proprietary: OptiTrack's plugin license); no
   target compiles or links it, and it must never be distributed with this repo.
-  `natnet.c` speaks the documented wire protocol instead — see below.
+  `natnet.c` speaks the documented wire protocol instead; see below.
 - **Optional, user-supplied**: Intel Embree + TBB (**Apache-2.0** both) if you drop in
   an Embree-enabled `phonon` for `bwa_desc.embree` (see `docs/api.md`). This repo
   ships neither.
@@ -123,11 +123,11 @@ Everything above, sorted by what it actually ends up in:
 
 As of October 2025 the ASIO SDK is **dual-licensed GPLv3 / proprietary** (previously
 proprietary-only). You can use it under the GPLv3 option without signing an agreement.
-The catch is copyleft — pick the case that matches how you ship:
+The catch is copyleft—pick the case that matches how you ship:
 
 - **Distributed under GPLv3** → what this repo does. CI publishes `bw_audio.dll` as a
   workflow artifact under the repo's GPLv3 `LICENSE`, with the complete source
-  available as this repo at the built commit. That meets the GPLv3 terms — see the
+  available as this repo at the built commit. That meets the GPLv3 terms; see the
   CI section below.
 - **Internal, undistributed** → GPL obligations don't trigger (copyleft is a
   distribution condition). Use freely.
@@ -141,12 +141,12 @@ license text.
 `imgui_test_engine` is **not MIT**, unlike imgui itself. It ships under the
 "Dear ImGui Test Engine License" (v1.04 in the pinned tag): free if you are a natural
 person, an open-source project, an educational/research institution, or a small
-business under the license's revenue threshold — a paid license otherwise. Read
+business under the license's revenue threshold, and a paid license otherwise. Read
 `imgui_test_engine/LICENSE.txt` in the fetched tree for the exact criteria.
 
 That's fine here: this repo is GPLv3 open source, so the free tier applies, and the
 test engine compiles only into the GUI tools (`bwa_playground`, `bwa_layout_tool`,
-`bwa_calib_view`) — never into `bw_audio.dll`. The tools ship in the CI artifact with
+`bwa_calib_view`), never into `bw_audio.dll`. The tools ship in the CI artifact with
 the notice in `THIRD_PARTY-NOTICES.md`. Revisit if this repo's licensing changes.
 
 ### NatNet without the proprietary SDK
@@ -154,10 +154,10 @@ the notice in `THIRD_PARTY-NOTICES.md`. Revisit if this repo's licensing changes
 NaturalPoint's NatNet SDK is proprietary, which would conflict with GPLv3 under
 distribution. The protocol is documented, so `natnet.c` consumes the
 multicast/unicast stream directly rather than linking the SDK. The SDK copy at
-`third_party/NatNetSDK/` is a protocol reference for that implementation — no target
+`third_party/NatNetSDK/` is a protocol reference for that implementation: no target
 compiles or links it, and it stays out of anything distributed. It also lets the core
 read pose itself (`bwa_tracker_connect`) and sample the freshest head pose at
-audio-callback time — lower-latency than marshaling pose through the engine each frame.
+audio-callback time, lower-latency than marshaling pose through the engine each frame.
 
 ## Continuous integration
 
@@ -166,11 +166,11 @@ distribution channel:
 
 - **ASIO is built.** The workflow fetches the SDK from Steinberg's official URL
   (cached between runs), and the configure step fails loudly unless the log says
-  `ASIO backend ENABLED` — the artifact must contain the production device path.
+  `ASIO backend ENABLED`—the artifact must contain the production device path.
 - **Steam Audio is built, and cached.** CI runs the phonon recipe from
   [`third_party/README.md`](../third_party/README.md) (patched submodule, minimal
   core, `/MD`) and caches `third_party/steam-audio-artifacts/` keyed on the
-  submodule sha + the patch hash — the first run pays the phonon build, every later
+  submodule sha + the patch hash: the first run pays the phonon build, every later
   run restores it. The four with-SDK tests (`reflect`/`bake`/`path`/`steam_decode`)
   run, and binaural is the real HRTF decode. One CI-only tweak: the pinned phonon
   build scripts hard-code the VS 2022 generator, so the workflow rewrites that to
@@ -178,14 +178,14 @@ distribution channel:
 - **Tests force the null sink (`bwa_desc.sink = BWA_SINK_NULL`).** Runners have no audio hardware; forcing the
   null sink keeps runs deterministic instead of relying on fallback. The three GUI
   UI suites (`playground`/`layout_tool`/`calib_view`) are built but excluded from
-  the CI ctest run — they need a display and OpenGL, which runners don't have; run
+  the CI ctest run: they need a display and OpenGL, which runners don't have; run
   them locally.
 - **Two configs, x64 only.** RelWithDebInfo is the full build: tested, tools and
   all. Debug builds the engine (`bw_audio` + `bwa_minimal`) and smoke-runs it, for
   downstream debugging against a debug CRT.
 - **The tools are built and shipped.** CI configures with `BWA_BUILD_PLAYGROUND`,
   `BWA_BUILD_CALIBVIEW`, and `BWA_BUILD_CALIBRATE`, so the artifact carries
-  `bwa_playground`, `bwa_layout_tool`, `bwa_calib_view` (GUI — they need a display),
+  `bwa_playground`, `bwa_layout_tool`, `bwa_calib_view` (GUI; they need a display),
   plus `bwa_calibrate` and `bwa_zylia_probe` (console).
 - **The artifact is a GPLv3 distribution.** Each run uploads `RelWithDebInfo/`
   (engine + phonon + tools) and `Debug/` (engine + phonon) folders plus `bw_audio.h`,
@@ -195,51 +195,51 @@ distribution channel:
   terms with it.
 - **`bw_audio.dll` needs `phonon.dll` beside it.** With-SDK builds (including the CI
   artifact) link `phonon.lib`, so the DLL won't load without `phonon.dll` in the
-  same directory — keep the pair together. The CMake post-build step and the Unity
+  same directory; keep the pair together. The CMake post-build step and the Unity
   plugin staging both copy it for you. Only a no-SDK build is self-contained (with
   the simple-pan binaural fallback and acoustics calls as no-ops).
-- **Two audiences, two artifacts.** Every run uploads them separately — the engine
+- **Two audiences, two artifacts.** Every run uploads them separately: the engine
   (`bw_audio-win64-r<N>`: dll/lib/pdb + phonon + tools + header) and the Unity package
-  (`unity-package-r<N>`: one `.tgz`) — so downloading one no longer drags in the other.
+  (`unity-package-r<N>`: one `.tgz`). Downloading one no longer drags in the other.
 - **The Unity package is packed every run, and released on a tag.**
-  `tools/upm/pack.ps1` produces `com.brainworks.bw_audio-<version>.tgz` — the C#
-  binding with both DLLs inside it — so a broken package (a missing `.meta`, a lost
+  `tools/upm/pack.ps1` produces `com.brainworks.bw_audio-<version>.tgz`, the C#
+  binding with both DLLs inside it, so a broken package (a missing `.meta`, a lost
   plugin) fails the *build*, not a release. A `v*` tag then cuts a GitHub Release, and
   **the Release is the distribution**: there is no registry, no token, nothing to keep
   in sync. Unity installs the tarball directly (Package Manager → `+` → *Install
   package from tarball…*). The tag must match `bindings/unity/package.json`, or the
-  pack fails — so a tarball can never claim a version it isn't.
+  pack fails—so a tarball can never claim a version it isn't.
 - **A release carries TWO assets**, because workflow artifacts expire (30 days) and a
   release doesn't:
-  - `com.brainworks.bw_audio-<ver>.tgz` — the Unity package.
-  - `bw_audio-win64-<tag>.zip` — the engine itself: `bw_audio.dll`/`.lib`/`.pdb` +
-    `phonon.dll`, `bw_audio.h`, and the tools. This is the durable download for a C/C++
+  - `com.brainworks.bw_audio-<ver>.tgz`: the Unity package.
+  - `bw_audio-win64-<tag>.zip`: the engine itself (`bw_audio.dll`/`.lib`/`.pdb` +
+    `phonon.dll`, `bw_audio.h`, and the tools). This is the durable download for a C/C++
     consumer or the CAVE machine.
 
-  Both ship under GPLv3 (the `.zip` carries `LICENSE`, `THIRD_PARTY-NOTICES.md` and
+  Both ship under GPLv3 (the `.zip` carries `LICENSE`, `THIRD_PARTY-NOTICES.md`, and
   `DIST.txt`, which names the commit and links the complete source; the `.tgz` carries
-  the same inside it): an app that ships this DLL to third parties inherits GPLv3 —
+  the same inside it): an app that ships this DLL to third parties inherits GPLv3;
   see the ASIO section.
 
   Two constraints worth knowing before changing any of this:
 
   1. **The package's `.meta` files are committed on purpose**
-     (`tools/upm/gen-meta.ps1`) — an installed package is immutable, so assets without a
+     (`tools/upm/gen-meta.ps1`): an installed package is immutable, so assets without a
      `.meta` get a fresh GUID per project and scenes lose their script references. The
      native plugins' import settings (Windows x64, Editor on) ship the same way; they
      cannot be fixed in the Inspector afterwards.
   2. **Keep the engine bundle a `.zip`, and the package the only `.tgz` on a release.**
      A UPM registry (they all speak the npm protocol) keys on a single publishable
-     tarball. Nothing is listed on one today — the audience already has the repo, and a
-     public listing would invite installs into projects the GPLv3 would surprise — but
+     tarball. Nothing is listed on one today (the audience already has the repo, and a
+     public listing would invite installs into projects the GPLv3 would surprise), but
      the tarball IS what a registry would serve, so listing it later stays a config
      change rather than a rebuild. Preserving that costs nothing.
 
 ## DVS / Dante configuration
 
-- **Driver: ASIO.** The device must expose **enough output channels for your layout** —
+- **Driver: ASIO.** The device must expose **enough output channels for your layout**:
   26 for the CAVE array; fewer for a smaller install (the engine's channel count is the
-  layout's speaker count, 4..26). Do not use the WDM driver — it caps at 16 channels;
+  layout's speaker count, 4..26). Do not use the WDM driver—it caps at 16 channels;
   26 needs ASIO (up to 64).
 - **Format:** 48 kHz, 24-bit. Match the bit depth end-to-end; DVS truncates on
   mismatch. Read the driver's reported sample type via `ASIOGetChannelInfo` and
@@ -251,14 +251,14 @@ distribution channel:
   empirically against measured dropouts.
 - **Isolation (recommended):** consider running DVS on a machine separate from the
   engine, keeping the audio thread and Dante stack away from engine frame-rate
-  spikes — the usual source of dropouts. The control-only C ABI does not require
+  spikes, the usual source of dropouts. The control-only C ABI does not require
   this, but the design tolerates it.
 
 ## ASIO host bring-up (sequence for `asio_sink.c`)
 
 1. COM-load the driver (the SDK's `AsioDrivers`/`asiolist` helpers handle registry
    enumeration; DVS registers an ASIO driver). `CoInitialize` on the thread.
-2. `ASIOInit` → `ASIOGetChannels` (expect ≥ the layout's speaker count out — 26 for the
+2. `ASIOInit` → `ASIOGetChannels` (expect ≥ the layout's speaker count out; 26 for the
    CAVE) → `ASIOGetBufferSize`.
 3. `ASIOGetChannelInfo` per output channel to learn the sample type.
 4. `ASIOCreateBuffers` with the `bufferSwitch` / `bufferSwitchTimeInfo` callbacks →
@@ -274,7 +274,7 @@ Keep the callback allocation-free and lock-free per the invariants in `CLAUDE.md
 
 This sequence lives in `src/asio_sink.cpp`, behind the device-agnostic `src/sink.h`
 seam, so ASIO types never leak into the engine. It compiles only when the ASIO SDK is
-vendored — fetch it per [`../third_party/README.md`](../third_party/README.md); CMake
+vendored: fetch it per [`../third_party/README.md`](../third_party/README.md); CMake
 auto-detects `third_party/asiosdk/` and prints `ASIO backend ENABLED`. Without it, the
 offline `null_sink.c` backend builds instead: the library always builds and the audio
 loop is testable with no hardware. Pick a backend with `bwa_desc.sink`
@@ -296,9 +296,9 @@ relying on it:
   linked version, and that the 3rd-order encode/decode path (see `spatialization.md`)
   is supported.
 - [ ] **Other dependency licenses** unchanged in the versions you ship. The pinned
-  versions are verified in the "License inventory" above — re-check on any pin bump
+  versions are verified in the "License inventory" above; re-check on any pin bump
   and keep `THIRD_PARTY-NOTICES.md` in sync.
-- [ ] **Dante clock.** A hardware leader clock is present on the network — a
+- [ ] **Dante clock.** A hardware leader clock is present on the network; a
   pure-software DVS instance cannot be the standalone leader.
 - [ ] **This repo's own license** is GPLv3 (see `LICENSE`), matching the ASIO GPLv3
   option and the CI artifact. Revisit the ASIO and test-engine terms above before

@@ -11,7 +11,7 @@ precision are first-class requirements.
 
 The spatializer, mixer, device output, and tracking ingest all live in one native
 process behind a single audio callback. Unity/Unreal call a C ABI to trigger sounds
-and push positions. **No rendered audio crosses the boundary** — the mix never
+and push positions. **No rendered audio crosses the boundary**—the mix never
 routes through the game engine, only control. (The opt-in push-source API feeds
 caller-generated PCM *into* the engine over the same control thread; that is a
 source feed, not a render path.)
@@ -25,8 +25,8 @@ Why:
 - **Engine-agnostic.** One core, two thin clients. The only per-engine code reads
   transforms and tracking.
 - **One system to run and author.** The experiment deploys as a single process on
-  the machine running DVS. The alternative — an external renderer (Spat, SSR, Max)
-  driven over OSC — means a second implementation in a second system: authored
+  the machine running DVS. The alternative, an external renderer (Spat, SSR, Max)
+  driven over OSC, means a second implementation in a second system: authored
   separately, versioned separately, synchronized at runtime, and maintained by
   whoever still knows that system. In-process control leaves nothing to keep in
   sync.
@@ -44,7 +44,7 @@ one channel per speaker. *Consumers* read that bus:
 - **Binaural monitor (debug):** treats each bus channel as a virtual speaker at that
   speaker's surveyed room position, HRTFs them to stereo, and writes to an ordinary
   output device (a headphone DAC). It sits *after* the panner, so it auditions the
-  real array render — DBAP behavior and all — not an idealized version.
+  real array render (DBAP behavior and all), not an idealized version.
 
 The binaural monitor is just a second consumer of the bus. Keep it that way. The
 abstraction set is: a **render target** (the bus), one or more **device sinks**
@@ -68,12 +68,12 @@ stereo sink.
 
 ### The full render path
 
-The seam diagram above is the shape; this is the whole plumbing — every signal kind, in
+The seam diagram above is the shape; this is the whole plumbing: every signal kind, in
 processing order. Side taps (`└→`) leave the chain at that point and land on one of the
 named buses; the main chain continues downward. Everything between the two rules runs on
 the audio thread inside one `rt_render` block. (The same diagram as a rendered Mermaid
 graph, with each stage annotated with the functions that implement and configure it:
-[`signal-flow.md`](signal-flow.md) — this ASCII version is canonical for structure.)
+[`signal-flow.md`](signal-flow.md); this ASCII version is canonical for structure.)
 
 ```
  control thread (bwa_*)                                off-thread producers
@@ -87,17 +87,17 @@ graph, with each stage annotated with the functions that implement and configure
  every bwa_* call → command ring (SPSC)                  per-voice shCoeffs + bending tilt
  bwa_commit promotes pending → active (one snapshot)
 
-═ audio thread — rt_render, one block ═══════════════════════════════════════════════
+═ audio thread - rt_render, one block ═══════════════════════════════════════════════
 
- drain commands · sample the tracked pose (+ prediction lead) — a move dirties every solve
+ drain commands · sample the tracked pose (+ prediction lead) - a move dirties every solve
 
- MONO VOICE (mix_voice) — per sample                 gain solve — block rate, dirty-gated
+ MONO VOICE (mix_voice) - per sample                 gain solve - block rate, dirty-gated
  ───────────────────────────────────                 ─────────────────────────────────────
  read: pcm cursor · pitch resample · stream pull     panner DBAP/SPCAP/VBAP at the tracked
  × pause/seek gate                                   listener, energy-meaned over extra
  │ └→ s_raw → bending-loss EQ → × shCoeffs           listeners → per-source atten override
  │            → PATH ACCUM (ambisonic)               (by ratio) → spread render (LOBE ·
- transmission EQ (3 biquads — occlusion's tilt)      MDAP ring · SPECTRAL 6-band targets;
+ transmission EQ (3 biquads - occlusion's tilt)      MDAP ring · SPECTRAL 6-band targets;
  × occlusion level × directivity                     w×h extent · near-spread + size floors)
  │ ├→ × wet send (× distance) → AUX (mono)           → dual-band low derivation; × user gain
  │ └→ ISM: per-voice ring → 6 shoebox mirror         × group gain × timed fades
@@ -108,10 +108,10 @@ graph, with each stage annotated with the functions that implement and configure
  pan: single gains · dual-band (700 Hz) ·
       spectral (6 bands × 6 gain sets) ─→ BUS
 
- BED VOICE (mix_bed) — per sample
+ BED VOICE (mix_bed) - per sample
  ────────────────────────────────
  SH frames → rotate (yaw phasor · full 3-axis Ivanic-Ruedenberg matrix; glided)
- ├→ matrix render: × max-rE taper (crossfaded; opt. band-split — taper > 700 Hz
+ ├→ matrix render: × max-rE taper (crossfaded; opt. band-split - taper > 700 Hz
  │       only, rV decode below) → bed decode (AllRAD · EPAD) ────────────────→ BUS
  └→ parametric render (crossfaded): FOA band split → DirAC direction + diffuseness ψ
       direct  √(1−ψ)·W → listener-relative panner at the array shell ───────→ BUS
@@ -125,12 +125,12 @@ graph, with each stage annotated with the functions that implement and configure
          scaled · lines rendered as plane waves through the bed decode + max-rE pair)
  PATH ACCUM → path tap: phonon's own ambisonics decode ───────────────────────→ BUS
 
- output stage — everything that reaches a device passes through, in this order
+ output stage - everything that reaches a device passes through, in this order
  ─────────────────────────────────────────────────────────────────────────────
  × master gain (ramped)
  align: per-speaker correction FIR · room-EQ biquads (re-aimed at the tracked pose) ·
         gain trim · delay
- + test signal (bwa_set_test_signal — a raw channel, deliberately post-align)
+ + test signal (bwa_set_test_signal - a raw channel, deliberately post-align)
  linked limiter (default −1 dBFS) → per-channel peak meters
       │
       ├ cave      26-ch ASIO ► DVS ► the array
@@ -143,34 +143,34 @@ graph, with each stage annotated with the functions that implement and configure
 The tap ordering is deliberate, not incidental:
 
 - The **reverb send and the ISM images branch off before air absorption, loudness comp,
-  and Doppler** — those three model the *direct* path's propagation, and a reflection
+  and Doppler**: those three model the *direct* path's propagation, and a reflection
   travels its own path (the ISM applies its own delay/damping per image; the reverb bed
   models the room's).
-- **Pathing taps `s_raw` before the occlusion EQ** — the indirect route goes *around* the
+- **Pathing taps `s_raw` before the occlusion EQ**: the indirect route goes *around* the
   occluder, so it must not inherit the direct path's muffling; it takes its own
   bending-loss tilt instead.
 - The **decorrelation split leaves right before panning** so the incoherent share carries
   the full per-voice processing, and the velvet filters run once per *channel* (after the
   voice loop), not per voice.
 - **max-rE weighting** lives where the engine's own SH→speaker decode renders bed signal
-  (the matrix renderer, the FDN's line render) — broadband, or band-split (the taper only
+  (the matrix renderer, the FDN's line render): broadband, or band-split (the taper only
   above 700 Hz; the rV-optimal plain decode keeps the low band; bed matrix paths only, the
   FDN stays broadband). The parametric analysis and its re-panned direct stream see the
   raw field, and phonon's decodes (reflection bed, pathing, the HRTF monitor) are its own.
 - **Master gain sits before align** so per-speaker trims stay calibrated; the **test
   signal enters after align** so a wiring check is a raw channel, untouched by trims or
-  delays; the **limiter is last** so nothing — test signal included — can clip a driver.
+  delays; the **limiter is last** so nothing—test signal included—can clip a driver.
 
 ### How wide is the bus?
 
 **The layout's speaker count.** `BWA_CHANNELS` (26, `src/sink.h`) is the compile-time
-*capacity*; the **active** count is whatever the loaded `cave_layout.json` declares —
+*capacity*; the **active** count is whatever the loaded `cave_layout.json` declares:
 any N in **4..26**, resolved at `bwa_create` and fixed for the engine's lifetime. With
 no `layout_path` you get the built-in 26-speaker default grid. `bwa_get_channel_count()`
 is the readback, and everything downstream (panners, bed decodes, reverb, the
 monitor, the device sink, calibration) is driven from it.
 
-The CAVE installation is 26 speakers — that is the target deployment, not an engine
+The CAVE installation is 26 speakers; that is the target deployment, not an engine
 limit. A collaborator's 12- or 24-speaker rig loads its own layout into the same
 binary and the device opens that many channels.
 
@@ -208,7 +208,7 @@ orientation component.
 
 - **Transport: ASIO, not WDM.** DVS's WDM driver caps at 16 channels; ASIO carries
   up to 64. The CAVE's 26 channels make ASIO mandatory. The device must expose enough
-  outputs for your layout — 26 for the CAVE array.
+  outputs for your layout: 26 for the CAVE array.
 - **ASIO SDK used directly** under its GPLv3 option (dual-licensed GPLv3/proprietary
   as of Oct 2025), for direct access to the timing hooks. See `docs/build.md` for
   copyleft notes.
@@ -218,7 +218,7 @@ orientation component.
   carries the whole acoustics stack: the binaural HRTF decode (`src/steam_decode.c`),
   occlusion + per-band transmission EQ + directivity (`src/steam_scene.c`), the
   reflection bed with an optional baked mode (`src/steam_reflect.c`), and sound
-  pathing (`src/steam_path.c`) — all wired up in `src/engine.c` at `bwa_start`.
+  pathing (`src/steam_path.c`), all wired up in `src/engine.c` at `bwa_start`.
 - **Spatialization: listener-relative DBAP**, recomputed per frame from tracked
   position. Pure ambisonics fails for localized point sources here: its single sweet
   spot does not survive a 3×3 m roam. DBAP is the default; SPCAP and VBAP are
@@ -234,15 +234,15 @@ orientation component.
 
 The engine core links four external pieces:
 
-- **ASIO SDK** (GPLv3 option, vendored) — the device backend.
-- **Steam Audio (phonon)** — HRTF decode, occlusion, reflections, pathing. Optional:
+- **ASIO SDK** (GPLv3 option, vendored): the device backend.
+- **Steam Audio (phonon)**: HRTF decode, occlusion, reflections, pathing. Optional:
   auto-detected at `third_party/steam-audio-artifacts/` (`BWA_HAVE_STEAMAUDIO`);
   without it the simple-pan monitor is the fallback.
-- **dr_libs** (dr_wav/dr_flac/dr_mp3) — WAV/FLAC/MP3 decode in `src/sound.c`.
-- **cJSON** — `cave_layout.json` parsing in `src/layout.c`.
+- **dr_libs** (dr_wav/dr_flac/dr_mp3): WAV/FLAC/MP3 decode in `src/sound.c`.
+- **cJSON**: `cave_layout.json` parsing in `src/layout.c`.
 
 dr_libs and cJSON are fetched and pinned by CMake, not vendored. The NatNet
-(OptiTrack) consumer is first-party code in `src/natnet.c`, written off-wire — the
+(OptiTrack) consumer is first-party code in `src/natnet.c`, written off-wire; the
 proprietary SDK is a wire-format reference only, never linked.
 
 The opt-in tools carry their own stack, and the engine links none of it:

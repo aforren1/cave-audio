@@ -1,4 +1,4 @@
-# Profiling (Tracy) & real-time scheduling
+# Profiling (Tracy) and real-time scheduling
 
 The engine is instrumented for [Tracy](https://github.com/wolfpld/tracy) (pinned **v0.13.1**), opt-in.
 The instrumentation answers two questions: **are you inside the per-block time budget**, and **is
@@ -13,20 +13,20 @@ cmake --build build --config RelWithDebInfo
 
 This fetches Tracy and links its client into `bw_audio.dll`. The client is built **on-demand**, so it
 costs almost nothing until a profiler actually connects. Without `-DBWA_TRACY=ON`, the macros in
-[`src/profile.h`](../src/profile.h) compile to nothing — no dependency, no overhead.
+[`src/profile.h`](../src/profile.h) compile to nothing—no dependency, no overhead.
 
 ## What's instrumented
 
 - **A Tracy "frame" = one audio block.** That's the budget unit. At 256 samples / 48 kHz the block
   period is **5.33 ms**; the whole `asio block` (or `null block`) zone must stay well under it, with
   headroom for jitter. The audio thread shows up as `bw-audio (ASIO)` (the driver's `bufferSwitch`
-  thread) or `bw-audio (null)` (the no-hardware render thread — same `render()`, so you can profile
+  thread) or `bw-audio (null)` (the no-hardware render thread; same `render()`, so you can profile
   without a device).
 - **Zones**: `asio block` / `null block` (whole callback) → `rt_render` → `mix voices`, `reflect tap`,
   `path tap`, `align`; plus `binaural decode` and `convert_out`. The sim threads show
   `occlusion ray-trace` / `reflection ray-trace` on `bw-sim (occlusion)` / `bw-sim (reflections)`;
   the pathing sim thread appears as `bw-sim (pathing)`.
-- **Plot**: `rt voices` (active voice count) — load vs. block time at a glance.
+- **Plot**: `rt voices` (active voice count); load versus block time at a glance.
 
 ## The headless bench
 
@@ -40,14 +40,14 @@ bwa_profile_bench [seconds=20] [voices=16] [cave|binaural]
 
 It prints the block budget and renders the load on the engine's render thread exactly as the ASIO
 callback would. Attach the Tracy GUI, or capture headless (below). Your real app or the playground work
-too — anything that runs the engine.
+too—anything that runs the engine.
 
 ## The per-situation bench (headless numbers, no GUI)
 
 [`examples/bench_situations.c`](../examples/bench_situations.c) answers "**how much does each thing
 cost**" directly, without Tracy tooling: it renders a MATRIX of configurations (idle, DBAP scaling,
 binaural HRTF, occlusion EQ, spread/decorrelation, Doppler/air, FDN, the Steam reflection bed, pathing,
-everything-on) through the **manual sink** (`bwa_render_block`, synchronous — no device thread) and
+everything-on) through the **manual sink** (`bwa_render_block`, synchronous; no device thread) and
 times the per-block cost of each, printing mean / median / p99 / max in microseconds and as a
 percentage of the block budget.
 
@@ -55,11 +55,11 @@ percentage of the block budget.
 bwa_bench_situations [blocks=4000]
 ```
 
-It measures the **audio-thread budget** — the ray-tracing sim threads are background and not counted
+It measures the **audio-thread budget**: the ray-tracing sim threads are background and not counted
 (only the audio-thread reflect/path decode they feed is). Because it drives blocks synchronously it's
 deterministic and needs no capture tooling; build it with or without `-DBWA_TRACY=ON` (the numbers
-match within a few µs — the on-demand client is dormant). Caveat: the bench thread is normal priority,
-so `max` includes OS preemption the real (MMCSS-scheduled) ASIO thread wouldn't see — read `mean` /
+match within a few µs; the on-demand client is dormant). Caveat: the bench thread is normal priority,
+so `max` includes OS preemption the real (MMCSS-scheduled) ASIO thread wouldn't see; read `mean` /
 `median` for the DSP cost, `max` as a loose upper bound. The very first run right after a build can
 read high while the box settles; re-run for a stable number.
 
@@ -70,7 +70,7 @@ standard prompt). If you only ever profile on the **same machine**, configure wi
 skips the broadcast, which avoids the firewall prompt. Leave both off if the Tracy GUI runs on a
 different box on the LAN.
 
-## Text summaries (headless CSV) — no GUI
+## Text summaries (headless CSV, no GUI)
 
 The Tracy CLI tools (in the [release](https://github.com/wolfpld/tracy/releases), or built from
 `csvexport/` and `capture/` in the Tracy source) give a scriptable per-zone budget report:
@@ -109,12 +109,12 @@ per-zone *proportions*, not the absolute block total, from this build.
 
 ## Real-time scheduling / MMCSS
 
-- **The hard-RT audio thread is the ASIO driver's `bufferSwitch` thread — we don't create it.** A real
+- **The hard-RT audio thread is the ASIO driver's `bufferSwitch` thread; the host doesn't create it.** A real
   ASIO driver (including Dante Virtual Soundcard) already schedules its callback time-critical / via
   MMCSS "Pro Audio". The host shouldn't (and can't cleanly) re-register it. Nothing to do here.
-- **Our own threads are soft/background**: the `null_sink` render loop (no-hardware fallback), the
-  three Steam Audio **sim threads** — `bw-sim (occlusion)`, `bw-sim (reflections)`, `bw-sim (pathing)`
-  — and the NatNet receiver. The one real risk is the sim threads: they ray-trace at ~30 / 12 / 10 Hz
+- **The engine's own threads are soft/background**: the `null_sink` render loop (no-hardware fallback),
+  the three Steam Audio **sim threads** (`bw-sim (occlusion)`, `bw-sim (reflections)`,
+  `bw-sim (pathing)`), and the NatNet receiver. The one real risk is the sim threads: they ray-trace at ~30 / 12 / 10 Hz
   respectively and are CPU-heavy, so at normal priority they could preempt the audio callback and
   glitch it. All three are therefore dropped to `THREAD_PRIORITY_BELOW_NORMAL` (`steam_scene.c`,
   `steam_reflect.c`, `steam_path.c`). Tracy makes the interaction visible: the sim zones should
@@ -123,8 +123,8 @@ per-zone *proportions*, not the absolute block total, from this build.
 ## Memory budget
 
 The engine's heap is **static**: everything is allocated at `bwa_create` (the voice table, the per-voice
-Doppler rings, the speaker bus + scratch — sized to the `BWA_CHANNELS` capacity, though only the layout's
-channel count is rendered — sound PCM at load) and **nothing allocates on the audio thread**
-(hard invariant — see `docs/concurrency.md`). So the "memory budget" is just the create-time footprint;
+Doppler rings; the speaker bus + scratch, sized to the `BWA_CHANNELS` capacity, though only the layout's
+channel count is rendered; sound PCM at load) and **nothing allocates on the audio thread**
+(hard invariant; see `docs/concurrency.md`). So the "memory budget" is the create-time footprint;
 there is no real-time growth to chase. If you want allocation-level detail (footprint / leaks) in Tracy's
 memory view, wrap the big allocations with the `BWA_ALLOC` / `BWA_FREE` hooks already in `profile.h`.
