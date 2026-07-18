@@ -169,8 +169,9 @@ ctest --test-dir build -C RelWithDebInfo
 ```
 
 Usage docs live in [`docs/api.md`](./docs/api.md): quickstart, profiles, the
-threading contract, coordinates, error handling, environment variables, then a
-per-call reference. [`examples/minimal.c`](./examples/minimal.c) runs the whole
+threading contract, coordinates, how-to guides for the common setups (a room
+with reflections, audio-visual sync, desk versus rig), error handling,
+environment variables, then a per-call reference. [`examples/minimal.c`](./examples/minimal.c) runs the whole
 client lifecycle (create → load → play → per-frame commit → teardown); it builds
 as `bwa_minimal` and needs no hardware.
 

@@ -52,6 +52,24 @@ const PoseSlot* natnet_pose(const NatNet* nn);
 /* Stop the receiver thread and release the socket. Call after the audio thread is stopped. */
 void            natnet_close(NatNet* nn);
 
+/* Stream liveness, derived from LOCAL (QPC) arrival stamps — deliberately NOT the pose slot's
+ * t_ns, which rides the server clock on NatNet 4.1+ and so can't be compared to a local now.
+ * Control-thread poll; never blocks. Mirrors bwa_tracker_state minus DISCONNECTED (that case is
+ * nn == NULL, resolved by the caller). NO_DATA = no FrameOfData packets recently; NO_BODY = frames
+ * arriving but the selected rigid body has no recent valid pose (wrong id, or occluded). */
+typedef enum {
+    NN_STATUS_NO_DATA = 0,
+    NN_STATUS_NO_BODY,
+    NN_STATUS_LIVE
+} NatNetStatus;
+NatNetStatus natnet_status(const NatNet* nn);
+
+/* Pure classifier (no socket): decide liveness from monotonic-clock stamps. `now`, `last_frame`
+ * (last NAT_FRAMEOFDATA received) and `last_pose` (last valid pose published) share one clock;
+ * a 0 stamp means "never happened". `stale` is the age past which a stamp counts as dead. Factored
+ * out of natnet_status so the four-state logic is unit-testable off-wire (the socket path is not). */
+NatNetStatus natnet_classify(int64_t now, int64_t last_frame, int64_t last_pose, int64_t stale);
+
 /* Frame-suffix stamps, server-side clocks. NatNet 4.1..4.5 only: 4.1+ is where the size-prefixed
  * sections make the suffix reachable without decoding skeletons/force plates/devices, and 4.5 is
  * the newest layout the vendored reference certifies — an unknown newer bitstream refuses the

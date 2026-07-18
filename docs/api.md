@@ -118,6 +118,187 @@ point), not the origin. Gains are linear (1 = unity); sound offsets are
 engine-rate sample frames. The engine bindings convert from Unity/Unreal
 coordinates at the boundary ([integration.md](./integration.md)).
 
+## How-to guides
+
+Recipes for situations every client hits, composed from calls documented in the
+reference below; follow the links for the full contracts. The snippets are C. The
+Unity binding wraps each pattern ([integration.md](./integration.md)).
+
+### Put a moving source in a room
+
+The recommended reflections-and-reverb stack, no Steam Audio build required: the six
+first-order wall bounces from the
+[image-source model](#image-source-early-reflections-no-sdk-needed) carry the early
+field, a [directional FDN](#directional-fdn-reverb-no-sdk-needed) carries the late
+tail. The room and the reverb are load-time; only the motion is per-frame.
+
+```c
+// load time: geometry and reverb are baked before start
+bwa_desc cfg = { .profile = BWA_PROFILE_BINAURAL };        // CAVE on the rig
+bwa_engine* e = bwa_create(&cfg);
+
+bwa_material brick  = bwa_material_preset(e, BWA_MAT_BRICK);
+bwa_material carpet = bwa_material_preset(e, BWA_MAT_CARPET);
+bwa_material faces[6] = { brick, brick, carpet, brick, brick, brick };  // -x,+x,floor,+y,-z,+z
+bwa_scene_set_box(e, 8.f, 3.f, 10.f, faces);               // the VIRTUAL room; before start
+
+bwa_fdn_desc fdn = { .enabled = 1, .rt60_low_s = 1.4f, .rt60_high_s = 0.8f };
+bwa_fdn_config(e, &fdn);                                   // late tail; the Steam bed stays off
+
+bwa_start(e);
+
+// each source opts into the acoustics it needs
+bwa_sound hum = bwa_load_sound(e, "drone.wav");
+bwa_source s  = bwa_source_create(e);
+bwa_source_set_early_reflections(e, s, true);              // wall bounces, panned with parallax
+bwa_source_set_reverb(e, s, true);                         // feed the FDN's aux send
+bwa_source_set_reverb_distance(e, s, true);                // far = wetter
+bwa_source_set_doppler(e, s, true);                        // it is going to move
+bwa_source_play(e, s, hum, true);
+
+// per frame: move it, and the acoustics follow
+bwa_source_set_pos(e, s, x, y, z);
+bwa_set_listener_pose(e, hx, hy, hz, qx, qy, qz, qw);      // skip if a tracker is connected
+bwa_commit(e);
+```
+
+- **The box is the *virtual* room**, the space the content pretends to be in, never the
+  physical CAVE: the real room adds its own reflections on top, and modelling it
+  double-counts ([materials.md](./materials.md)). It's load-time only; set it between
+  `bwa_create` and `bwa_start`.
+- **Materials are audible in any build.** Each bounce is damped per band by its wall's
+  absorption: the carpet floor above kills the floor slap, the brick walls keep their
+  treble. Pick the six faces deliberately.
+- **Only the position updates per frame.** Reflection delays glide and gains ramp as the
+  source and listener move, so bounces bend instead of stepping, and the FDN send follows
+  distance on the audio thread.
+- **Leave `bwa_reflections_config` alone here.** The Steam reflection bed also renders
+  early reflections; running it with the image-source model plays them twice (the engine
+  warns once through `bwa_last_error`).
+- **The Steam Audio build adds occlusion on top**: the same box feeds the ray-traced
+  scene, so `bwa_source_set_occlusion(e, s, true)` makes the walls block and muffle.
+  Without the SDK, drive
+  [`bwa_source_set_occlusion_manual`](#manual-occlusion-no-sdk-needed) from game logic.
+- **Wet levels**: `bwa_reverb_set_gain` and `bwa_early_reflections_set_gain` are live,
+  default 1. Opt in the few sources that matter—each opted-in voice costs six panner
+  solves per block.
+
+### Land a sound on a visual event
+
+Your renderer decides *now* that something will be seen at wall time T (an animation
+lands, a metronome flashes), and the sound must be *heard* at T. Wall time and the
+dsp-sample clock are different clocks, so the recipe is: map T to a dsp sample using the
+device's own block stamps (`bwa_get_clock`), subtract the device's render→DAC latency
+(`bwa_get_output_latency`), and schedule with `bwa_source_play_at`
+(see [Sources](#sources-control-thread-non-blocking)). Here in a raylib client;
+`GetTime()` is the app clock, and any monotonic seconds clock works as long as you use
+the same one throughout.
+
+```c
+/* The wall<->dsp bridge. The driver-stamped (sample, host time) pair is exact, so the
+ * only thing to estimate is the constant epoch offset between the device's host clock
+ * and GetTime(). Each frame observes (offset - pair age); a decaying max converges on
+ * the true offset and tracks ppm drift. Same estimator as the Unity binding's DspTimeAt. */
+static struct { bool valid; uint64_t sample; double host, off; } clk;
+
+static void clock_refresh(bwa_engine* e) {
+    uint64_t cs, ct;
+    if (!bwa_get_clock(e, &cs, &ct)) { clk.valid = false; return; }
+    double host = ct * 1e-9, cand = host - GetTime();
+    if (!clk.valid || cs < clk.sample || fabs(cand - clk.off) > 0.5)
+        clk.off = cand;                          // first pair / device restart / epoch change
+    else
+        clk.off = fmax(cand, clk.off - 2e-6);    // decaying max
+    clk.sample = cs; clk.host = host; clk.valid = true;
+}
+
+static uint64_t dsp_at(bwa_engine* e, double t) {   // GetTime() seconds -> dsp sample
+    double fs = (double)bwa_get_sample_rate(e);
+    double d = clk.valid ? (double)clk.sample + (t + clk.off - clk.host) * fs
+                         : (double)bwa_get_dsp_time(e) + (t - GetTime()) * fs;  // pre-stamp fallback
+    return d > 0. ? (uint64_t)d : 0;
+}
+```
+
+The game loop schedules against it:
+
+```c
+const double display_s = 0.030;      // draw -> photons: measure once, one constant
+double anim_start = -1.;
+
+while (!WindowShouldClose()) {
+    clock_refresh(e);                             // once per frame, before any dsp_at
+
+    if (IsKeyPressed(KEY_SPACE)) {                // swing starts now, impact lands in 0.5 s
+        double t_seen  = GetTime() + 0.5 + display_s;   // when the impact frame is SEEN
+        uint64_t heard = dsp_at(e, t_seen);
+        uint32_t lat   = bwa_get_output_latency(e);     // render -> DAC, frames
+        bwa_source_play_at(e, s, thump, false, heard > lat ? heard - lat : 0);
+        anim_start = GetTime();
+    }
+
+    bwa_commit(e);
+
+    BeginDrawing();
+    // draw the swing; the impact frame renders at anim_start + 0.5
+    EndDrawing();
+}
+```
+
+- **Schedule with margin.** The play command lands on the audio thread at the next block;
+  give the start a few blocks of lead (the 0.5 s swing has plenty). A start already in
+  the past plays immediately, so the failure mode is graceful—but a *spontaneous* event
+  ("the collision is this frame") can never beat the physical output chain: play it
+  immediately and accept up to one output latency of error.
+- **`display_s` is yours to measure.** The engine reports its own output chain
+  (`bwa_get_output_latency`; DVS includes its Dante buffering) but cannot see your
+  display's. Measure draw→photons once (photodiode, or an AV-sync clapper against the
+  array) and that one constant aligns the whole chain.
+- **The fallback is often enough.** Before the first stamped block (and always on the
+  manual sink) `dsp_at` degrades to pairing `bwa_get_dsp_time` with your clock:
+  block-granular, about 5 ms at 256/48 kHz, already under half a 60 Hz frame. The
+  estimator buys sub-millisecond.
+- **The other direction needs no wall clock.** An event on the *audio* timeline (a cue
+  inside a track you scheduled) fires its visual when `bwa_get_dsp_time` crosses
+  `start + cue`, or off `bwa_source_get_playhead`.
+- **Unity**: `emitter.PlayAt(engine.DspTimeAt(tEvent))` is this whole recipe
+  ([integration.md](./integration.md)).
+
+### Develop at the desk, run on the rig
+
+The profile is the only seam: the binaural monitor renders the **same 26-channel mix**
+production plays, through virtual speakers at the surveyed room positions
+([Profiles and the master bus](#profiles-and-the-master-bus)). Panning, acoustics, and
+gain-staging bugs show up on headphones before the rig exists.
+
+```c
+bwa_desc cfg = { 0 };
+cfg.profile     = rig ? BWA_PROFILE_CAVE : BWA_PROFILE_BINAURAL;
+cfg.layout_path = rig ? "cave_layout.json" : NULL;         // desk: the default grid
+cfg.asio_driver = rig ? "Dante Virtual Soundcard" : NULL;  // desk: auto-pick a 2-ch device
+bwa_engine* e = bwa_create(&cfg);
+if (bwa_start(e) != BWA_OK) { /* a rig layout that fails to load refuses to start */ }
+printf("backend: %s\n", bwa_get_audio_backend(e));         // "asio:<driver>" or "null"
+
+if (rig) {
+    bwa_tracker_desc trk = { .server = "192.168.1.42" };   // Motive drives the listener
+    bwa_tracker_connect(e, &trk);
+}
+```
+
+Everything else (assets, sources, the per-frame loop) is identical. The differences that
+matter:
+
+- **Pose.** At the desk you push `bwa_set_listener_pose` per frame, and orientation
+  turns the virtual array around your head. On the rig the tracker overrides it, and
+  the array render uses position only.
+- **No device, still live.** With no usable ASIO driver the engine falls back to the
+  silent null sink and keeps rendering: `bwa_source_is_playing`, playheads, and clocks
+  all advance, so CI and visual-only demos run unchanged. Set `cfg.sink = BWA_SINK_ASIO`
+  where silence would hide a failure.
+- **`BWA_PROFILE_BOTH`** is the rig plus a monitor tap: the array over Dante and
+  headphones at the operator's desk at once.
+
 ## Lifecycle
 
 ```c
@@ -564,7 +745,7 @@ Position is used by both consumers. Orientation (the quaternion) is used by the
 **binaural monitor only**; the array render ignores it. With a tracker connected,
 do not call this: the core samples the freshest OptiTrack pose at block time.
 
-### Internal tracking (`bwa_tracker_connect`, M6)
+### Internal tracking (`bwa_tracker_connect`)
 
 ```c
 typedef struct {
@@ -598,6 +779,39 @@ The tracker's lifetime is independent of `bwa_start`/`bwa_stop` (it survives a d
 `bwa_destroy` disconnects it. One invariant carries over from `bwa_start`: a layout carrying
 **static `room_eq`** (fixed-listener room correction) refuses a tracker; recalibrate with
 `--room-eq-grid` for tracked sessions (see [calibration.md](./calibration.md)).
+
+### Tracker status
+
+```c
+typedef enum {
+    BWA_TRACKER_DISCONNECTED = 0,  // no tracker connected on this engine
+    BWA_TRACKER_NO_DATA      = 1,  // connected, but no frames arriving
+    BWA_TRACKER_NO_BODY      = 2,  // frames arriving, the followed body has no valid pose
+    BWA_TRACKER_LIVE         = 3,  // the followed body's pose is current
+} bwa_tracker_state;
+bwa_tracker_state bwa_tracker_status(bwa_engine* e);   // control thread; never blocks
+```
+
+A successful `bwa_tracker_connect` only means the socket opened. On multicast there is no handshake,
+so the connect return tells you nothing about whether Motive is actually streaming or whether your
+rigid body is in view—and if the stream drops mid-session, nothing tears the connection down. This
+reports what the wire is doing right now so you can drive a status light or a dropout alarm. You
+cannot get it from `bwa_get_listener_pose`: a dead tracker just holds the last pose, which reads the
+same as a working one parked at that spot.
+
+The two failure states are split because they need different fixes:
+
+| State | Meaning | What to check |
+|-------|---------|---------------|
+| `DISCONNECTED` | No tracker on this engine (also for a `NULL` engine). | You never called `bwa_tracker_connect`, or you disconnected. |
+| `NO_DATA` | No `FrameOfData` packets recently. | Motive is streaming, the network path, the data port, the multicast group. |
+| `NO_BODY` | Frames arrive, but the followed body has no valid pose. | The `rigid_body_id`/`rigid_body_name`, or the body is occluded right now. |
+| `LIVE` | The followed body's pose is arriving and fresh. | — |
+
+"Recent" is a ~250 ms window, so a live stream at 100–360 Hz never trips it and a couple of dropped
+frames don't flap the status. It is derived from local packet-arrival timing, not the pose stamps
+(those ride the server clock on NatNet 4.1+ and can't be compared to a local clock). The call never
+blocks and is cheap enough to poll every frame.
 
 ### Pose prediction
 

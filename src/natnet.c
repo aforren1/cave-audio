@@ -249,6 +249,13 @@ struct NatNet {
     double    ticks_to_ns;   /* NN_STAMP_MIDEXPO: 1e9 / server HighResClockFrequency */
     int32_t   rigid_body;
     PoseSlot  pose;
+    /* Liveness stamps, all on the LOCAL QPC clock (see natnet_status). last_frame: any FrameOfData
+     * received; last_pose: a valid pose published for the selected body; 0 = never. Written by the
+     * receiver thread with an interlocked 64-bit store, read by natnet_status on the control thread
+     * (a plain aligned 64-bit load is atomic on x64). qpc_freq is fixed at open. */
+    LONG64    qpc_freq;
+    volatile LONG64 last_frame_ticks;
+    volatile LONG64 last_pose_ticks;
 };
 
 static void nn_err(char* err, size_t cap, const char* msg) {
@@ -347,12 +354,15 @@ static DWORD WINAPI receiver(LPVOID arg) {
         uint16_t msg, nbytes;
         memcpy(&msg, buf, 2); memcpy(&nbytes, buf + 2, 2);
         if (msg != NAT_FRAMEOFDATA) continue;
+        LARGE_INTEGER qc; QueryPerformanceCounter(&qc);        /* one read: liveness stamps + arrival stamp */
+        _InterlockedExchange64(&nn->last_frame_ticks, qc.QuadPart);   /* a data frame arrived (any body) */
         size_t plen = (size_t)got - 4;
         if (nbytes <= plen) plen = nbytes;                     /* trust the smaller of header/recv */
         float sp[3], sq[4];
         bool tv = true;
         NatNetStamps st;
         if (natnet_parse_frame(buf + 4, plen, nn->major, nn->minor, nn->rigid_body, sp, sq, &tv, &st) && tv) {
+            _InterlockedExchange64(&nn->last_pose_ticks, qc.QuadPart);  /* a valid pose for our body */
             float p[3], q[4];
             to_room(sp, sq, p, q);
             /* stamp with the connection's clock (stamp_mode, fixed at open): rt.c differences
@@ -370,17 +380,32 @@ static DWORD WINAPI receiver(LPVOID arg) {
             case NN_STAMP_FTS:
                 if (st.timestamp > 0.0) t_ns = (unsigned __int64)(st.timestamp * 1e9);
                 break;
-            default: {
-                LARGE_INTEGER qc, qf;
-                QueryPerformanceCounter(&qc); QueryPerformanceFrequency(&qf);
-                t_ns = (unsigned __int64)((double)qc.QuadPart * 1e9 / (double)qf.QuadPart);
+            default:
+                t_ns = (unsigned __int64)((double)qc.QuadPart * 1e9 / (double)nn->qpc_freq);
                 break;
-            }
             }
             pose_write_t(&nn->pose, p, q, t_ns);
         }
     }
     return 0;
+}
+
+/* A body/stream is "current" if its last stamp is within this window. Loose enough that a couple
+ * of dropped frames at any Motive rate (100-360 Hz) don't flap the status, tight enough to catch a
+ * real dropout within a quarter second. */
+#define NN_STALE_MS 250
+
+NatNetStatus natnet_classify(int64_t now, int64_t last_frame, int64_t last_pose, int64_t stale) {
+    if (last_frame == 0 || now - last_frame > stale) return NN_STATUS_NO_DATA;
+    if (last_pose  == 0 || now - last_pose  > stale) return NN_STATUS_NO_BODY;
+    return NN_STATUS_LIVE;
+}
+
+NatNetStatus natnet_status(const NatNet* nn) {
+    if (!nn) return NN_STATUS_NO_DATA;
+    LARGE_INTEGER qc; QueryPerformanceCounter(&qc);
+    int64_t stale = nn->qpc_freq * NN_STALE_MS / 1000;
+    return natnet_classify(qc.QuadPart, nn->last_frame_ticks, nn->last_pose_ticks, stale);
 }
 
 NatNet* natnet_open(const NatNetConfig* cfg, char* err, size_t errcap) {
@@ -394,6 +419,7 @@ NatNet* natnet_open(const NatNetConfig* cfg, char* err, size_t errcap) {
     nn->sock = INVALID_SOCKET;
     nn->rigid_body = cfg->rigid_body;
     nn->pose.q[3] = 1.0f;                                       /* identity until the first frame */
+    { LARGE_INTEGER qf; QueryPerformanceFrequency(&qf); nn->qpc_freq = qf.QuadPart; }
 
     /* inet_pton accepts only numeric IPv4 literals; a hostname or typo silently becomes 0.0.0.0,
      * which downstream surfaces as a misleading "server didn't respond" / "rigid body not found".

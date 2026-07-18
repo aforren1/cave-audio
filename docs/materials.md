@@ -6,7 +6,8 @@ Two implementations now exist behind these features: Steam Audio's ray tracer
 (`src/steam_scene.c`, `src/steam_reflect.c`, `src/steam_path.c`, gated on the SDK build) and a
 phonon-free geometric path (`src/ism.c` early reflections + `src/fdn.c` late reverb + manual
 occlusion). **Read "Choosing an acoustics path" first**: they are complementary, not rivals, and
-the recommended configuration mixes them. "Implementation status" below says what is tested where.
+the recommended configuration mixes them. See [roadmap.md](./roadmap.md) for what's implemented and
+tested across the engine.
 
 ## Choosing an acoustics path
 
@@ -65,7 +66,7 @@ hard-wired 26.
 
 ## Where this fits the existing signal flow
 
-The direct path is DBAP (M4). Materials leave it unchanged except for occlusion. The **diffuse
+The direct path is DBAP. Materials leave it unchanged except for occlusion. The **diffuse
 layer** (ambient beds, reflections, reverb) is ambisonic: that energy is not
 sweet-spot-sensitive, so a fixed decode is robust across the moving observer
 ([spatialization.md](./spatialization.md) "Why DBAP, not ambisonics"). Materials build out that
@@ -99,34 +100,14 @@ The engine ships a **named palette of presets**: `generic` (the built-in default
 (Steam Audio's published example coefficients), plus custom materials. Materials are **static**.
 A surface's material never changes at audio rate.
 
-### Implemented C ABI (control thread, load-time)
+### Minting materials
 
-A `bwa_material` is an **opaque engine-scoped token** (a small integer; `0` is always the built-in
-`generic` default). Mint tokens, then attach them to geometry per triangle. Mint materials at
-load time; the table is fixed-capacity. Minting works with or without the Steam Audio build; the
-geometry setters are no-ops without it.
-
-```c
-bwa_material m_wall = bwa_material_preset(e, BWA_MAT_CONCRETE);    // built-in preset (bwa_material_type)
-float abs3[3] = {0.1f,0.1f,0.1f}, trn3[3] = {0.6f,0.6f,0.6f};
-bwa_material m_open = bwa_material_define(e, abs3, 0.5f, trn3);    // custom 3-band absorption/scattering/transmission
-
-// per-triangle: one bwa_material token per triangle (out-of-range clamps to the default)
-bwa_material tri_mat[N] = { m_wall, m_wall, m_open, /* … */ };
-bwa_scene_set_mesh_mat(e, verts, nverts, tris, ntris, tri_mat);
-
-// or a shoebox room: w×h×d metres, floor-based (x/z centred, y 0..h), one material per face
-bwa_material faces[6] = { m_wall,m_wall,m_wall,m_open,m_wall,m_wall };  // -x,+x,-y,+y,-z,+z
-bwa_scene_set_box(e, 6.f, 3.f, 6.f, faces);                      // triangle normals face inward
-```
-
-- **`bwa_material_preset` returns `0` for `BWA_MAT_GENERIC`**: it *is* the default token. No slot
-  is minted, so tagging many surfaces with it never exhausts the table.
-- **`0` is also what you get on a full table** (or an out-of-range enum value). That is the default
-  material, **not** an error sentinel; check `bwa_last_error` to distinguish. Presets and custom
-  materials return the same kind of token; the enum only names the preset.
-- **Custom coefficients are clamped to `[0,1]`** and NaN/Inf-sanitized before they reach phonon.
-- **A single-material mesh** is `bwa_scene_set_mesh_mat` with every triangle on one token.
+A `bwa_material` is an **opaque, engine-scoped token** (a small integer; `0` is always the built-in
+`generic` default): mint one from a preset (Steam Audio's published coefficients) or from custom
+3-band absorption/scattering/transmission, then attach a token per triangle. Minting works with or
+without the Steam Audio build; the geometry setters are no-ops without it. The signatures and their
+full contract — the preset enum, coefficient clamping, `bwa_material_release`, and the dynamic-mesh
+movers — live in [api.md](./api.md) → "Materials and scene geometry".
 
 **Scene lifecycle.** The geometry setters are safe to call at runtime, reflection bed or not. The
 occlusion sim owns the `IPLScene` and is the sole thread that commits it; the borrowing reflection
@@ -199,7 +180,7 @@ Set geometry before `bwa_start` if you use the reflection bed; the runtime-swap 
 
 ### Direct sound (per source): occlusion, not distance
 
-Spatialization stays **DBAP** (M4), and **DBAP keeps owning distance attenuation and air
+Spatialization stays **DBAP**, and **DBAP keeps owning distance attenuation and air
 absorption** (spatialization.md step 4 scales gains by `user_gain · atten(|src − lis|)`).
 Materials add only a per-source occlusion stage. The occlusion sim ray-traces with phonon's direct
 simulation configured for **occlusion + transmission only**: the `distanceAttenuation` and
@@ -314,7 +295,7 @@ listener-centric instance** (one immortal bed `IPLSource` co-located with the li
 convolution is **one** instance regardless of source count. Per-source reflection streams are not
 built; each would add a convolution. This call is the same one
 [internal-types.md](./internal-types.md) already flags ("its real-time safety is not assumed"):
-`iplReflectionEffectApply`/`iplAmbisonicsDecodeEffectApply` run per block, so the M5
+`iplReflectionEffectApply`/`iplAmbisonicsDecodeEffectApply` run per block, so the
 allocation-free verification gate applies to them; do not add anything to the tap that hasn't
 cleared it.
 
@@ -372,71 +353,26 @@ The hybrid reverb's FDN late tail already exposes what such a mapping targets (p
 early/late balance, band EQ), so a perceptual mode is a control mapping—**no new DSP**, same bus.
 It bypasses the scene and drives the late-reverb parameters directly, and is mutually exclusive
 with geometry *per source*: a source is either physically simulated or perceptually placed. **Not
-implemented** (see "Implementation status").
+implemented.**
 
-## Data surface / API (additive; load-time setup, per-frame-safe toggles)
+## The API surface
 
-Signatures live in [include/bw_audio.h](../include/bw_audio.h); per-call threading
-semantics are in [api.md](./api.md). An engine with no scene renders as if materials didn't exist.
-The shipped surface:
+The material and reflection calls are **additive**: an engine with no scene renders exactly as if
+materials didn't exist. The full surface — material minting, scene geometry, the per-source
+occlusion / directivity / reverb toggles, the wet sends, and the `bwa_reflections_desc` config — is
+documented with its per-call threading semantics in [api.md](./api.md) ("Materials and scene
+geometry", "Occlusion and directivity", "Reflection bed"); the signatures live in
+[include/bw_audio.h](../include/bw_audio.h).
 
-```c
-/* materials - engine-scoped tokens; 0 = the built-in generic default */
-bwa_material bwa_material_preset(bwa_engine* e, const char* name);   /* "concrete", "carpet", ... */
-bwa_material bwa_material_define(bwa_engine* e, const float absorption[3], float scattering,
-                              const float transmission[3]);
+Two design boundaries worth stating here, since they shape how a scene reaches the engine:
 
-/* scene geometry (room space; runtime-callable until the reflection bed runs - see "Scene lifecycle") */
-void bwa_scene_set_mesh_mat(bwa_engine* e, const float* verts, int nverts, const int* tris, int ntris,
-                           const bwa_material* tri_material);     /* per-triangle tokens */
-void bwa_scene_set_box     (bwa_engine* e, float w, float h, float d, const bwa_material faces[6]);
-
-/* reflection bed - config is load-time only (sizes are baked at bwa_start); wet gain is live */
-void bwa_reflections_config (bwa_engine* e, const bwa_reflections_desc* cfg);
-void bwa_reverb_set_gain(bwa_engine* e, float linear);        /* LIVE, per-frame-safe */
-
-/* per-source toggles (per-frame-safe: enqueue only) */
-void bwa_source_set_occlusion          (bwa_engine* e, bwa_source s, bool on);
-void bwa_source_set_reverb        (bwa_engine* e, bwa_source s, bool on);
-void bwa_source_set_reverb_send    (bwa_engine* e, bwa_source s, float gain);
-void bwa_source_set_reverb_distance(bwa_engine* e, bwa_source s, bool on);
-void bwa_source_set_pathing            (bwa_engine* e, bwa_source s, bool on);
-void bwa_source_set_orientation        (bwa_engine* e, bwa_source s, float qx, float qy, float qz, float qw);
-void bwa_source_set_directivity        (bwa_engine* e, bwa_source s, float weight, float power);
-void bwa_source_set_directivity_preset (bwa_engine* e, bwa_source s, bwa_directivity pattern);
-
-/* readbacks (HUD/diagnostics) */
-float bwa_source_get_occlusion  (bwa_engine* e, bwa_source s);       /* 1 = clear .. 0 = fully blocked */
-float bwa_source_get_directivity(bwa_engine* e, bwa_source s);       /* 1 = on-axis/omni .. 0 = full null */
-```
-
-`bwa_reflections_desc` (bw_audio.h) is: `ir_seconds` (0 → default 1.0, range ~0.5..2.0), `order`
-(1 or 2; 0 → default 1), `num_rays` (0 → default 4096), `num_bounces` (0 → default 16), `enabled`
-(0 = no bed created), `bake` (non-0 = precompute the reverb at a probe grid at `bwa_start`), and
-`reserved[3]` (zero; room to grow without an ABI break). The wet level is not config; it is
-`bwa_reverb_set_gain`, live, default 1. There is no "update Hz" field (the sim
-rates are compile-time constants) and no shared-versus-per-source field (the bed is always the single
-shared instance).
-
-The per-source wet send:
-
-- **`bwa_source_set_reverb_send`** sets the source's wet-send **level** (default 1.0; 0 =
-  none). Drive it yourself for a manual dry/wet.
-- **`bwa_source_set_reverb_distance`** turns on **distance→wet**: the engine scales the send by
-  the source↔listener distance, on top of the level; near = drier, far = wetter (0.25× at ≤1 m up
-  to 1× at ≥6 m). Off by default.
-- Both are per-frame-safe. The final send gain is computed per block and **ramped** in `rt.c`
-  (invariant 4), so motion and on/off never zipper the send. Sends shape how much each source
-  feeds the one shared bed; they do not add convolutions.
-
-Not built: a scene-file loader (`bwa_scene_load`) does not exist; engines push geometry through
-the setters above. A standalone scene JSON (a future `docs/scene-schema.md`, separate from the
-speaker layout) would be its own addition. A **perceptual reverb mode** (above) would add a small
-`bwa_perceptual_config` (presence / warmth / brillance / reverberance / envelopment) driving the
-late-reverb engine, also future.
-
-Provisioning today: **Unity/Unreal** push room-space geometry + materials at load time (the game
-owns the scene; see [integration.md](./integration.md)).
+- **There is no scene-file loader** (`bwa_scene_load` does not exist). A Unity/Unreal binding pushes
+  room-space geometry and materials through the setters at load time; the game owns the scene (see
+  [integration.md](./integration.md)). A standalone scene JSON, separate from the speaker layout,
+  would be its own future addition.
+- **A geometry-free perceptual reverb mode** (presence / warmth / brillance / reverberance /
+  envelopment, mapped onto the FDN late tail; see "Geometric default, perceptual option") is a
+  control mapping with no new DSP, and is also future.
 
 ## CPU budget and tuning knobs
 
@@ -457,52 +393,25 @@ Two multiplicative cost controls: **hybrid reverb** keeps each convolution short
 the long tail is a cheap recursive reverb), and the **single shared listener-centric bed** bounds
 it to one convolution regardless of source count.
 
-## The real room
+## Limitations
 
-Materials simulate the *virtual* scene. The physical CAVE also reflects sound off its real walls,
-and those reflections are not under engine control. For the simulated acoustics to read correctly,
-**the physical room should be acoustically treated (absorptive)** so the rendered virtual
-reflections dominate. That is a deployment requirement.
+By design this path does **not** do a few things, and they cluster by cause:
 
-## Scope and sequencing
+- **Fixed at effect-create.** phonon bakes an `IPLReflectionEffect`'s IR length and ambisonic order
+  at create, so **runtime order/IR-length changes**, **full-length-IR convolution** (the bed always
+  runs hybrid), and **GPU / TrueAudio Next convolution** are `bwa_stop`/`bwa_start`-class or out of
+  scope — not live knobs (see "Fixed-at-create, not live knobs" above).
+- **The mixed IR hides the image sources.** phonon's public API returns one mixed ambisonic IR, so
+  **per-image-source DBAP early reflections** can't be pulled out of it; that per-source parallax is
+  exactly what the [ISM path](./spatialization.md) renders instead.
 
-Built: occlusion + transmission EQ + directivity, the reflection bed, and the probe machinery on
-top of it (baked reflections `bwa_reflections_desc.bake`, sound pathing `bwa_desc.enable_pathing`),
-all below.
+Two more are simply future work: a **runtime scene swap under the reflection bed** (it needs a
+scene-swap handshake — today the setters are rejected while the bed runs, see "Scene lifecycle"),
+and the **perceptual reverb mode** (above). Doppler and air absorption are phonon-free per-voice DSP
+([api.md](./api.md)), not part of this path at all. See [roadmap.md](./roadmap.md) for milestone
+status across the engine.
 
-Still not built:
-
-- **Perceptual reverb mode** (geometry-free): a thin mapping onto the FDN late tail, for abstract
-  content.
-- **Runtime scene swap under the reflection bed**: needs a scene-swap handshake; today the
-  setters are rejected while the bed runs (see "Scene lifecycle").
-- **Per-image-source DBAP early reflections** (can't be extracted from the mixed ambisonic IR),
-  **full-length-IR convolution**, **GPU (TrueAudio Next) convolution**, and **runtime
-  order/IR-length changes** (phonon fixes effect sizes at create).
-
-**Doppler** is phonon-free per-voice DSP in `rt.c` (`bwa_source_set_doppler`; see
-[api.md](./api.md)), not part of the materials path.
-
-## Implementation status
-
-- **Occlusion + per-band transmission EQ + directivity: implemented** (`src/steam_scene.c`, gated on
-  the Steam Audio build; `bwa_scene_set_mesh_mat` / `bwa_scene_set_box` +
-  `bwa_source_set_occlusion` / `bwa_source_set_directivity` / `bwa_source_set_orientation` +
-  `bwa_source_get_occlusion` / `bwa_source_get_directivity`). The sim thread owns an `IPLScene` +
-  `IPLStaticMesh` (**per-triangle materials**) + an `IPLSimulator` and ray-traces **volumetric**
-  occlusion + transmission + directivity at 30 Hz; the audio thread ramps the published values
-  (mechanism under "Direct sound" and "Threading and RT-safety" above). The published
-  level/EQ/directivity ramp is asserted in `test/rt_test.c`; the playground wall is a real scene
-  mesh.
-- **Reflection bed: implemented** (`src/steam_reflect.c`; the sections above, plus the per-source
-  send controls in "Data surface / API"). The `reflect` test proves it is directional;
-  `bwa_reflections_desc.bake` precomputes it and the `bake` test proves the baked path stays directional.
-- **Sound pathing: implemented** (`src/steam_path.c`; the section below). The `path` test proves it
-  routes around a wall with the right direction; the `rt` test proves the SH-encode lands on `s·shCoeffs`.
-- **Perceptual reverb mode: designed, not yet implemented** (this document), a thin control mapping
-  onto the same bus, **no new DSP**.
-
-## Baked reflections: implemented (`bwa_reflections_desc.bake`)
+## Baked reflections (`bwa_reflections_desc.bake`)
 
 `bwa_reflections_desc.bake` precomputes the listener-centric reverb at a grid of probes covering the listening
 zone (`steam_reflect.c` `do_bake`, gated `BWA_HAVE_STEAMAUDIO`); the reflection sim thread then *looks
@@ -529,11 +438,11 @@ The CPU win for *this* installation is marginal (the real-time ray-trace already
 thread with Tracy headroom), but baking enables much higher bake-time quality and is the right
 default for a static room.
 
-## Pathing: wired (`bwa_desc.enable_pathing`)
+## Sound pathing (`bwa_desc.enable_pathing`)
 
 `IPL_SIMULATIONFLAGS_PATHING` + `iplPathBakerBake` + `IPLSimulationInputs.pathingProbes` route sound
-around occluders / through portals over the same probe network baking uses. It's wired end to
-end (`steam_path.c`, same with-SDK gate, opt in with `bwa_desc.enable_pathing` at `bwa_create`):
+around occluders / through portals over the same probe network baking uses (`steam_path.c`,
+with-SDK, opt in with `bwa_desc.enable_pathing` at `bwa_create`):
 
 - **Bake (Stage 1, `steam_path_create`).** A probe grid spans the layout (+margin) at mean speaker
   height, using the SAME OBB-transform convention learned for reflections (centre in the translation
@@ -566,3 +475,10 @@ path with no occluder to bend around costs nothing and is byte-identical to the 
 `rt` test asserts a non-flat tilt colours the encoded field (a DC source through `{0.5,1,1}` lands
 the accumulator at `0.5·shCoeffs`, the RBJ low-shelf DC gain). Pathing only does anything where the
 scene has real occluders to bend sound around; judge it by ear at the rig.
+
+## The real room
+
+Materials simulate the *virtual* scene. The physical CAVE also reflects sound off its real walls,
+and those reflections are not under engine control. For the simulated acoustics to read correctly,
+**the physical room should be acoustically treated (absorptive)** so the rendered virtual
+reflections dominate. That is a deployment requirement.

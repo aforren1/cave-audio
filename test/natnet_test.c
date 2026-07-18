@@ -183,6 +183,18 @@ int main(void) {
     for (size_t k = 0; k < d.n; ++k)
         (void)natnet_resolve_name(d.b, k, 4, 1, "Head", &rid);   /* truncation-safe (ASan-clean) */
 
+    /* --- stream-liveness classifier (pure; the live socket path is on-hardware-pending) --- */
+    {
+        const int64_t S = 1000;                 /* stale threshold, abstract ticks */
+        const int64_t now = 5000000;            /* a large "now", like a real QPC count */
+        CHECK(natnet_classify(now, 0, 0, S) == NN_STATUS_NO_DATA, "never a frame -> NO_DATA");
+        CHECK(natnet_classify(now, now, 0, S) == NN_STATUS_NO_BODY, "frames but no body -> NO_BODY");
+        CHECK(natnet_classify(now, now, now, S) == NN_STATUS_LIVE, "fresh frame + body -> LIVE");
+        CHECK(natnet_classify(now, now - S - 1, now - S - 1, S) == NN_STATUS_NO_DATA, "stale frames -> NO_DATA");
+        CHECK(natnet_classify(now, now - 1, now - S - 1, S) == NN_STATUS_NO_BODY, "fresh frames, stale body (occluded) -> NO_BODY");
+        CHECK(natnet_classify(now, now - S, now - S, S) == NN_STATUS_LIVE, "exactly at threshold -> still LIVE");
+    }
+
     /* --- pose seqlock roundtrip --- */
     PoseSlot slot; memset(&slot, 0, sizeof slot);
     float wp[3] = { 1, 2, 3 }, wq[4] = { 0, 0, 0, 1 }, rp[3], rq[4];
@@ -192,6 +204,6 @@ int main(void) {
     CHECK(rp[0] == 1 && rp[1] == 2 && rp[2] == 3 && rq[3] == 1, "pose roundtrip values");
 
     if (fails) { printf("natnet_test: %d FAILURES\n", fails); return 1; }
-    printf("natnet_test OK (parse v3/v4.1/v4.5, RB select, tracking-valid, suffix stamps, truncation-safe, seqlock)\n");
+    printf("natnet_test OK (parse v3/v4.1/v4.5, RB select, tracking-valid, suffix stamps, truncation-safe, liveness classify, seqlock)\n");
     return 0;
 }

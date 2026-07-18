@@ -434,6 +434,13 @@ namespace BwAudio
         /// <summary>Voices playing in the last block — a voice-pool gauge for a HUD.</summary>
         public uint ActiveVoices => Ready ? Bwa.bwa_get_active_voices(_eng) : 0;
 
+        /// <summary>Liveness of the internal tracker (OptiTrack/NatNet) — for a HUD indicator or a dropout
+        /// alarm. A successful connect only means the socket opened; this says whether frames are actually
+        /// arriving and whether the followed body has a current pose. NoData ⇒ check the stream/network/
+        /// port; NoBody ⇒ check the rigid body id/name, or the head is occluded. Disconnected when no
+        /// tracker is connected (or the engine isn't running). Cheap; safe to poll every frame.</summary>
+        public BwaTrackerState TrackerStatus => Ready ? Bwa.bwa_tracker_status(_eng) : BwaTrackerState.Disconnected;
+
         /// <summary>The engine's dsp-sample clock (device-anchored, monotonic). Add to it to schedule a
         /// sample-accurate start: <c>DspTime + sampleRate/2</c> plays half a second out.</summary>
         public ulong DspTime => Ready ? Bwa.bwa_get_dsp_time(_eng) : 0;

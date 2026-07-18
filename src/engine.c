@@ -474,6 +474,15 @@ void bwa_tracker_disconnect(bwa_engine* e) {
     natnet_close(old);
 }
 
+bwa_tracker_state bwa_tracker_status(bwa_engine* e) {
+    if (!e || !e->tracker) return BWA_TRACKER_DISCONNECTED;
+    switch (natnet_status(e->tracker)) {
+        case NN_STATUS_LIVE:    return BWA_TRACKER_LIVE;
+        case NN_STATUS_NO_BODY: return BWA_TRACKER_NO_BODY;
+        default:                return BWA_TRACKER_NO_DATA;
+    }
+}
+
 void bwa_destroy(bwa_engine* e) {
     if (!e) return;
     bwa_tracker_disconnect(e);                          /* tracker lifetime ends with the engine */

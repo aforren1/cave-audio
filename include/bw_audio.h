@@ -798,6 +798,24 @@ typedef struct {
 BWA_API bwa_result bwa_tracker_connect(bwa_engine* e, const bwa_tracker_desc* desc);
 BWA_API void       bwa_tracker_disconnect(bwa_engine* e);
 
+/* Liveness of a connected tracker's stream — for status displays and dropout alarms. A successful
+ * bwa_tracker_connect only means the socket opened; on multicast there is no handshake, so it says
+ * nothing about whether Motive is actually streaming or whether your rigid body is in view. This
+ * reports what the wire is doing right now, split so the two operator-actionable failures are
+ * distinct: NO_DATA -> check the stream/network/port; NO_BODY -> check the rigid body id/name, or
+ * the person is occluded. "Recent" means within ~250 ms; a live stream at 100-360 Hz never trips
+ * that. Derived from local arrival timing, not the pose stamps (those ride the server clock). */
+typedef enum {
+    BWA_TRACKER_DISCONNECTED = 0,  /* no tracker connected on this engine (or NULL engine) */
+    BWA_TRACKER_NO_DATA      = 1,  /* connected, but no frames arriving — Motive not streaming, a
+                                    * network/interface problem, or the wrong data port/multicast group */
+    BWA_TRACKER_NO_BODY      = 2,  /* frames ARE arriving, but the followed rigid body has no recent
+                                    * valid pose — wrong rigid_body_id/name, or the body is occluded now */
+    BWA_TRACKER_LIVE         = 3,  /* the followed rigid body's pose is arriving and current */
+} bwa_tracker_state;
+/* Control thread; never blocks; cheap enough to poll every frame. */
+BWA_API bwa_tracker_state bwa_tracker_status(bwa_engine* e);
+
 /* Pose prediction (internal tracking only — needs a connected tracker; 0 = off, the default):
  * extrapolate the tracked POSITION by
  * `lead_ms` along a velocity estimated from the tracker's own frame timestamps (smoothed ~100 ms,

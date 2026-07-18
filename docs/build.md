@@ -270,7 +270,7 @@ distribution channel:
 
 Keep the callback allocation-free and lock-free per the invariants in `CLAUDE.md`.
 
-### Implementation note (M1)
+### Implementation note
 
 This sequence lives in `src/asio_sink.cpp`, behind the device-agnostic `src/sink.h`
 seam, so ASIO types never leak into the engine. It compiles only when the ASIO SDK is

@@ -121,6 +121,35 @@ namespace BwAudio.EditorTools
                 $"channels: {a.ChannelCount}\n" +
                 $"active voices: {a.ActiveVoices}", kind);
 
+            // Internal tracking (NatNet): only meaningful when the engine reads the pose itself. A connect
+            // that "succeeded" only opened the socket — it can still be dead on the wire, and if the stream
+            // drops mid-session nothing tears it down. This is the live truth, so you catch it here instead
+            // of by noticing the listener has stopped moving.
+            if (!a.feedListener)
+            {
+                string msg; MessageType tk;
+                switch (a.TrackerStatus)
+                {
+                    case BwaTrackerState.Live:
+                        msg = "tracker: LIVE — head pose is arriving and current."; tk = MessageType.Info; break;
+                    case BwaTrackerState.NoData:
+                        msg = "tracker: NO DATA — no frames arriving. Check Motive is streaming, the network/" +
+                              "interface, and the data port or multicast group. The listener is frozen at its " +
+                              "last pose.";
+                        tk = MessageType.Warning; break;
+                    case BwaTrackerState.NoBody:
+                        msg = "tracker: NO BODY — frames are arriving but the followed rigid body has no pose. " +
+                              "Check the rigid body id/name, or the head is occluded right now. The listener is " +
+                              "frozen at its last pose.";
+                        tk = MessageType.Warning; break;
+                    default:
+                        msg = "tracker: DISCONNECTED — the NatNet connect did not succeed (see the console). The " +
+                              "listener stays at the committed/default pose.";
+                        tk = MessageType.Warning; break;
+                }
+                EditorGUILayout.HelpBox(msg, tk);
+            }
+
             var peaks = a.BusLevels();
             for (int i = 0; i < peaks.Length; i++)
             {

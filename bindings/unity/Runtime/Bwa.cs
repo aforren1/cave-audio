@@ -44,6 +44,12 @@ namespace BwAudio
     /// the deterministic caller-pumped sink (bwa_render_block — offline/golden tests, not Unity).</summary>
     public enum BwaSinkType : int { Auto = 0, Asio = 1, Null = 2, Manual = 3 }
 
+    /// <summary>Mirrors bwa_tracker_state: liveness of a connected tracker's stream (Engine.TrackerStatus).
+    /// Disconnected = no tracker on this engine; NoData = connected but no frames arriving (check the
+    /// stream/network/port); NoBody = frames arriving but the followed rigid body has no valid pose
+    /// (check the id/name, or it's occluded now); Live = the pose is arriving and current.</summary>
+    public enum BwaTrackerState : int { Disconnected = 0, NoData = 1, NoBody = 2, Live = 3 }
+
     [StructLayout(LayoutKind.Sequential)]
     public struct BwaDesc
     {
@@ -117,6 +123,7 @@ namespace BwAudio
         // ---- internal tracking (OptiTrack/NatNet; may block — lifecycle-class, not per-frame) ----
         [DllImport(DLL, CallingConvention = CC)] public static extern BwaResult bwa_tracker_connect(IntPtr e, in BwaTrackerDesc desc);
         [DllImport(DLL, CallingConvention = CC)] public static extern void      bwa_tracker_disconnect(IntPtr e);
+        [DllImport(DLL, CallingConvention = CC)] public static extern BwaTrackerState bwa_tracker_status(IntPtr e);  // never blocks; poll per-frame
 
         // ---- assets (load time; file I/O) ----
         [DllImport(DLL, CallingConvention = CC)] public static extern uint bwa_load_sound(IntPtr e, [MarshalAs(UnmanagedType.LPUTF8Str)] string path);

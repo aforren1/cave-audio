@@ -98,7 +98,7 @@ file omits `rolloff_r`, the loader derives it from the geometry: `0.25 ×` the m
 centroid→speaker distance (Sundstrom 2021's recommended 0.2–0.5 band), a defensible
 starting point, not a substitute for dialing it by ear.
 
-### Implemented formulation (M4 first cut, `dbap.c`)
+### Implemented formulation (`dbap.c`)
 
 For each speaker `k` (positions in room space):
 
