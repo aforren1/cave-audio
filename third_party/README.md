@@ -8,6 +8,12 @@ fetch them locally. CMake auto-detects each and enables the matching backend.
 The Steinberg ASIO SDK is dual-licensed **GPLv3 / proprietary** (see `docs/build.md`).
 This project uses it under the GPLv3 option, consistent with the repo `LICENSE`.
 
+Because it is fetched here rather than committed, the SDK source is not in the repo tree —
+but it is statically linked into `bw_audio.dll`, so it is part of that DLL's GPLv3
+corresponding source. CI redistributes it under the GPLv3 option as `asio-sdk-src.zip`
+beside every binary artifact (and as a release asset), which is what keeps the fetch-only
+setup GPLv3-complete for downstream binary recipients.
+
 **Fetch:**
 
 ```sh

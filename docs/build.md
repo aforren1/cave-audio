@@ -126,9 +126,12 @@ proprietary-only). You can use it under the GPLv3 option without signing an agre
 The catch is copyleft—pick the case that matches how you ship:
 
 - **Distributed under GPLv3** → what this repo does. CI publishes `bw_audio.dll` as a
-  workflow artifact under the repo's GPLv3 `LICENSE`, with the complete source
-  available as this repo at the built commit. That meets the GPLv3 terms; see the
-  CI section below.
+  workflow artifact under the repo's GPLv3 `LICENSE`. The complete corresponding source
+  is this repo at the built commit **plus** the ASIO SDK source that is statically linked
+  into the DLL — the repo fetches the SDK at build time rather than vendoring it, so CI
+  ships that source as `asio-sdk-src.zip` beside the binaries (a separate release asset,
+  `bw_audio-asio-sdk-src-<tag>.zip`, on a tag). That closes the corresponding-source loop
+  the fetch-only setup would otherwise leave open; see the CI section below.
 - **Internal, undistributed** → GPL obligations don't trigger (copyleft is a
   distribution condition). Use freely.
 - **Shipping closed** → take the proprietary ASIO license (the other half of the dual).
@@ -190,9 +193,11 @@ distribution channel:
 - **The artifact is a GPLv3 distribution.** Each run uploads `RelWithDebInfo/`
   (engine + phonon + tools) and `Debug/` (engine + phonon) folders plus `bw_audio.h`,
   the example layout + `constraints.json`, the `LICENSE`, `THIRD_PARTY-NOTICES.md`,
-  and a `DIST.txt` naming the commit and linking the complete source (this repo at
-  that commit). Downloading requires repo access; the artifact carries the GPLv3
-  terms with it.
+  a `DIST.txt` naming the commit and linking the complete source (this repo at
+  that commit), and `asio-sdk-src.zip` — the ASIO SDK source statically linked into
+  the DLL, redistributed under its GPLv3 option so the corresponding source travels
+  with the binary rather than living behind a fetch URL. Downloading requires repo
+  access; the artifact carries the GPLv3 terms with it.
 - **`bw_audio.dll` needs `phonon.dll` beside it.** With-SDK builds (including the CI
   artifact) link `phonon.lib`, so the DLL won't load without `phonon.dll` in the
   same directory; keep the pair together. The CMake post-build step and the Unity
@@ -209,17 +214,21 @@ distribution channel:
   in sync. Unity installs the tarball directly (Package Manager → `+` → *Install
   package from tarball…*). The tag must match `bindings/unity/package.json`, or the
   pack fails—so a tarball can never claim a version it isn't.
-- **A release carries TWO assets**, because workflow artifacts expire (30 days) and a
+- **A release carries THREE assets**, because workflow artifacts expire (30 days) and a
   release doesn't:
   - `com.brainworks.bw_audio-<ver>.tgz`: the Unity package.
   - `bw_audio-win64-<tag>.zip`: the engine itself (`bw_audio.dll`/`.lib`/`.pdb` +
     `phonon.dll`, `bw_audio.h`, and the tools). This is the durable download for a C/C++
     consumer or the CAVE machine.
+  - `bw_audio-asio-sdk-src-<tag>.zip`: the ASIO SDK source statically linked into the DLL,
+    kept as its own asset so it accompanies the binaries (GPLv3 corresponding source)
+    without bloating either the engine `.zip` or the `.tgz`.
 
-  Both ship under GPLv3 (the `.zip` carries `LICENSE`, `THIRD_PARTY-NOTICES.md`, and
+  All ship under GPLv3 (the `.zip` carries `LICENSE`, `THIRD_PARTY-NOTICES.md`, and
   `DIST.txt`, which names the commit and links the complete source; the `.tgz` carries
-  the same inside it): an app that ships this DLL to third parties inherits GPLv3;
-  see the ASIO section.
+  the same inside it — and both point at the SDK-source asset for the one GPL-covered
+  component the repo fetches rather than vendors): an app that ships this DLL to third
+  parties inherits GPLv3; see the ASIO section.
 
   Two constraints worth knowing before changing any of this:
 

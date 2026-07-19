@@ -165,6 +165,12 @@ jobs:
           Copy-Item include/bw_audio.h,
                     LICENSE,
                     THIRD_PARTY-NOTICES.md dist/
+          # GPLv3 corresponding source for the ASIO SDK statically compiled into bw_audio.dll.
+          # The SDK is redistributable under its GPLv3 option, so ship its source BESIDE the
+          # binaries (its own archive, deliberately NOT folded into the engine bundle) — a DLL
+          # recipient then has the complete corresponding source, not just a fetch URL (GPLv3
+          # section 6). Rides in this workflow artifact and, on a tag, as a third release asset.
+          Compress-Archive -Path third_party/asiosdk -DestinationPath dist/asio-sdk-src.zip -Force
           # the JSONs live NEXT TO the tools: playground/layout_tool resolve
           # ./cave_layout.json + ./constraints.json relative to their working dir
           Copy-Item examples/cave_layout.json,
@@ -203,8 +209,11 @@ jobs:
                    room, read by the tools from their own directory). Debug/ — engine
                    dll/.lib/.pdb + phonon.dll + bwa_minimal. Root — include/bw_audio.h.
                    x64 only.
-          license  GPLv3 (LICENSE) + THIRD_PARTY-NOTICES.md; complete source:
+          license  GPLv3 (LICENSE) + THIRD_PARTY-NOTICES.md. Complete corresponding
+                   source: this repo at
                    https://github.com/aforren1/cave-audio/tree/${{ github.sha }}
+                   PLUS the ASIO SDK source (statically linked into bw_audio.dll) in
+                   asio-sdk-src.zip beside these files — also a separate release asset.
           "@ | Out-File -Encoding utf8 dist/DIST.txt
           Get-Content dist/DIST.txt
 
@@ -246,19 +255,23 @@ jobs:
           if-no-files-found: error
 
       # ---- release (tags only) -------------------------------------------------------------------
-      # The Release IS the distribution - there is no registry. TWO assets, because there are two
-      # audiences and they want different bytes:
+      # The Release IS the distribution - there is no registry. THREE assets: two audiences want
+      # different bytes, and the third is the GPLv3 corresponding source that must accompany them:
       #
       #   com.brainworks.bw_audio-<ver>.tgz   the Unity package (C# + the two DLLs, import settings set).
       #                                      Installs via Package Manager > "+" > "from tarball".
       #   bw_audio-win64-<tag>.zip            the engine itself: dll/lib/pdb + bw_audio.h + the tools.
       #                                      The durable home for the native side - workflow artifacts
       #                                      expire, a release does not.
+      #   bw_audio-asio-sdk-src-<tag>.zip     the ASIO SDK source statically linked into bw_audio.dll,
+      #                                      redistributed under its GPLv3 option. Corresponding source
+      #                                      for the one GPL-covered component the repo does not itself
+      #                                      carry (it is gitignored, fetched from Steinberg at build).
       #
       # Keep the engine bundle a .zip, and the package the only .tgz on the release. Every UPM registry
       # speaks the npm protocol and keys on a single publishable tarball, so should this ever be listed
       # on one, that stays a config change rather than a rebuild. It costs nothing to preserve.
-      - name: Release (engine zip + Unity package tarball)
+      - name: Release (engine zip + Unity package tarball + ASIO SDK source zip)
         if: startsWith(github.ref, 'refs/tags/')
         shell: pwsh
         env:
@@ -276,8 +289,16 @@ jobs:
                            -DestinationPath $zip -Force
           $zip = (Get-Item $zip).FullName
 
+          # GPLv3 corresponding source for the ASIO SDK (staged in dist/asio-sdk-src.zip). It ships as
+          # its OWN release asset - deliberately NOT inside the engine .zip or the Unity .tgz - so it
+          # sits in the same place as the binaries without bloating them (GPLv3 section 6d).
+          $src = "dist/bw_audio-asio-sdk-src-$tag.zip"
+          Copy-Item dist/asio-sdk-src.zip $src -Force
+          $src = (Get-Item $src).FullName
+
           $notes = @"
-          Windows x64. Two downloads: the **Unity package**, and the **engine** itself.
+          Windows x64. Two downloads to use - the **Unity package** or the **engine** itself -
+          plus the **ASIO SDK source** (GPLv3 corresponding source; see License below).
 
           ## Unity
 
@@ -301,6 +322,10 @@ jobs:
           triggers copyleft - it is a *distribution* condition - but SHIPPING an app that includes this
           DLL to third parties would put that app under GPLv3. See ``docs/build.md`` for the
           proprietary-ASIO alternative.
+
+          Complete corresponding source is this repo at the commit named in ``DIST.txt``, plus
+          ``bw_audio-asio-sdk-src-$tag.zip`` below (the ASIO SDK source compiled into the DLL).
           "@
-          # One .tgz (the package) + one .zip (the engine). Keep it that way - see the note above.
-          gh release create $tag $tgz $zip --title "bw_audio $tag" --notes $notes
+          # One .tgz (the Unity package) + one .zip (the engine) + one .zip (the ASIO SDK corresponding
+          # source). Keep the first two as the only package/engine tarballs - see the note above.
+          gh release create $tag $tgz $zip $src --title "bw_audio $tag" --notes $notes

@@ -8,6 +8,10 @@ binaries.
 
 - **Steinberg ASIO SDK** — used under its GPLv3 option. This repository and the
   distributed DLL are GPLv3 (see `LICENSE`). (c) Steinberg Media Technologies GmbH.
+  The SDK is statically linked into `bw_audio.dll`, so its source is part of this
+  DLL's GPLv3 corresponding source. It ships as `asio-sdk-src.zip` alongside the
+  binaries (and as a `bw_audio-asio-sdk-src-<tag>.zip` asset on each GitHub Release),
+  since the repo itself fetches the SDK at build time rather than vendoring it.
 - **dr_libs** (dr_wav / dr_flac / dr_mp3) by David Reid — your choice of public
   domain (Unlicense) or MIT No Attribution.
 - **cJSON** — MIT (text below). Copyright (c) 2009-2017 Dave Gamble and cJSON
