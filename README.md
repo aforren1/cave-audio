@@ -52,8 +52,11 @@ maintain alongside it.
   (a walkable soundfield), with yaw rotation to line a capture up with the scene.
 - **Voices**: fixed pool with priority stealing; pause (per-voice, per-group, and
   global) and click-free seek; engine-side timed fades; **mix groups** for
-  category gain/ducking; sample-accurate start against a device-anchored DSP
-  clock (`bwa_source_play_at` / `bwa_get_dsp_time`).
+  category gain/ducking; sample-accurate start and scheduled click-free stop
+  against a device-anchored DSP clock (`bwa_source_play_at` / `bwa_source_stop_at`
+  / `bwa_get_dsp_time`); **intro→loop** regions (`bwa_source_play_loop`) and
+  **gapless chaining** into queued sounds (`bwa_source_queue`). Starts and stops are
+  click-free (one-block gain ramps either way).
 - **Tracking**: OptiTrack NatNet parsed off-wire; the audio thread samples the
   freshest head pose at block time, with optional **pose prediction** to hide
   motion-to-ears latency; **tracked room EQ** interpolates measured LF room

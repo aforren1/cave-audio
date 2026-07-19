@@ -231,6 +231,10 @@ BWA_API void     bwa_group_set_paused(bwa_engine* e, uint32_t group, bool paused
  * block (a change bends the pitch, never steps it) and compose with Doppler. Streamed sounds ignore
  * it (the stream ring is sequential); beds are unaffected. Per-frame-safe. */
 BWA_API void     bwa_source_set_pitch(bwa_engine* e, bwa_source s, float rate);
+/* Play `snd` on this source (looping or one-shot). Play on an already-playing source RESTARTS it
+ * (new sound, un-paused, from frame 0). The start is click-free: the per-channel gains ramp up from
+ * silence over the first block (~5 ms), so re-triggering a source whose asset doesn't begin near
+ * zero never pops — the same one-block ramp bwa_source_stop uses to fade out. */
 BWA_API void     bwa_source_play(bwa_engine* e, bwa_source s, bwa_sound snd, bool loop);
 /* Sample-accurate scheduled play: begin output exactly when the engine's dsp clock reaches
  * `start_sample` (the voice is silent until then, then starts at the precise in-block sample).
@@ -238,7 +242,36 @@ BWA_API void     bwa_source_play(bwa_engine* e, bwa_source s, bwa_sound snd, boo
  * play 0.5 s out: bwa_get_dsp_time(e) + rate/2. A start_sample already in the past plays
  * immediately (best-effort). 0 = play now (== bwa_source_play). */
 BWA_API void     bwa_source_play_at(bwa_engine* e, bwa_source s, bwa_sound snd, bool loop, uint64_t start_sample);
+/* Loop a sub-region (the intro->loop pattern): play from the start of the sound but, on reaching
+ * loop_end, wrap back to loop_beg instead of the clip end — so a non-repeating intro [0, loop_beg)
+ * plays once, then the body [loop_beg, loop_end) loops forever. Frames are engine-rate (seconds =
+ * frame / rate). loop_end 0 means the clip end, so loop_beg 0 / loop_end 0 == bwa_source_play(loop
+ * = true). Out-of-range bounds or loop_beg >= loop_end fall back to whole-clip looping. In-memory
+ * sounds only; a streamed source loops its whole file (the ring is sequential — the region is
+ * ignored). Always loops. Same threading + guards as bwa_source_play. The loop seam is a hard wrap
+ * (no crossfade), so the loop points want matched endpoints — as with any looped asset. */
+BWA_API void     bwa_source_play_loop(bwa_engine* e, bwa_source s, bwa_sound snd, uint64_t loop_beg, uint64_t loop_end);
 BWA_API void     bwa_source_stop(bwa_engine* e, bwa_source s);
+/* Schedule a click-free stop: when the engine's dsp clock reaches stop_sample, the voice fades to
+ * silence over one block (the same click-free path as bwa_source_stop) and ends — never a hard cut,
+ * so a scheduled stop cannot pop. Block-granular: the fade begins in the block that contains
+ * stop_sample, so silence lands within ~one block (~5 ms at 256/48k) of it. A stop_sample already
+ * in the past stops immediately (best-effort). A later bwa_source_play / _play_at / _play_loop on
+ * the same source clears a pending stop. Get "now" from bwa_get_dsp_time, like bwa_source_play_at.
+ * For push sources use bwa_source_stop / _push_end (their ring is control-thread owned). */
+BWA_API void     bwa_source_stop_at(bwa_engine* e, bwa_source s, uint64_t stop_sample);
+/* Gapless chaining: queue `snd` to play seamlessly the instant the current sound ends — no silence
+ * at the seam (the mixer swaps sounds mid-block if the boundary falls there). Queue several to build
+ * a sequence (A ends -> B -> C ...); a queued sound with `loop` = true is the terminal, looping item
+ * (an intro clip then a looping body across two files: play(intro, loop=false) then queue(body,
+ * loop=true)). Up to 7 pending (further queues drop). QUEUE AFTER the play: bwa_source_play / _at /
+ * _loop RESTART the source and clear the queue. Nothing chains after a LOOPING current sound (it
+ * never ends) or a stopped one. In-memory mono sounds only, on both ends: a multichannel/streamed/
+ * push `snd` is rejected (see bwa_last_error), and a queue behind a streamed current sound is
+ * ignored. The playhead (bwa_source_get_playhead) restarts at each chained item; the voice reads
+ * as playing throughout. Per-frame-safe. bwa_source_clear_queue drops the pending chain. */
+BWA_API void     bwa_source_queue(bwa_engine* e, bwa_source s, bwa_sound snd, bool loop);
+BWA_API void     bwa_source_clear_queue(bwa_engine* e, bwa_source s);
 /* Pause/resume the source's voice in place. The gate ramps over one block (~5 ms — no click) and the
  * playhead freezes once silent, so resume continues exactly where pause landed. Works for in-memory,
  * streamed, and bed sounds. A paused voice still reads as playing (it has not ended); bwa_source_play

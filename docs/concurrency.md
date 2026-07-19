@@ -94,11 +94,19 @@ enum {
 };
 ```
 
-`Cmd` is `type` + `handle` + a union of 14 small payload arms (rt.h:39-58).
+`Cmd` is `type` + `handle` + a union of small payload arms (see rt.h).
 Most arms are a handle plus a bool or a float. `play` carries
-`{ uint64_t start; uint32_t sound; uint8_t loop, oneshot; }`: `start` is the
-dsp-sample to begin at (0 = now), so sample-accurate scheduling is a wider
-command, not a new mechanism.
+`{ uint64_t start, loop_beg, loop_end; uint32_t sound; uint8_t loop, oneshot; }`:
+`start` is the dsp-sample to begin at (0 = now) and `loop_beg`/`loop_end` are the
+optional loop region (0/0 = whole clip), so both sample-accurate scheduling and
+intro→loop are wider commands, not new mechanisms. Scheduling a *stop*
+(`CMD_STOP_AT`, one `uint64_t` sample) is the mirror — the audio thread fires the
+existing click-free stop once a block reaches it. `CMD_QUEUE` appends a sound to a
+voice's gapless play queue (a fixed FIFO in the `Voice`, depth `BWA_QUEUE`): at a
+non-looping end the mixer pops the next entry and continues in the same block
+instead of stopping. The entries are resolved `SoundData*`, so `CMD_SOUND_RETIRE`
+tombstones any it frees (NULL) before acking — the same "detach before free"
+discipline that protects the voice's current `sound`.
 
 ```c
 #define RING_CAP 4096                 /* power of two; sized for a worst-case frame burst */
@@ -413,8 +421,13 @@ so resume continues exactly where pause landed. Seek is click-free: a pending
 `CMD_SEEK` lands only while the gate is silent, so seeking a running voice is
 ramp-out → jump → ramp-in (two blocks, ~10 ms at 256/48k). Streamed sounds
 ignore seek—the ring can't jump. `CMD_STOP` rides the same gate: fade out,
-*then* `playing = false`. Only `CMD_SRC_DESTROY` hard-cuts. A paused voice
-still reads as playing.
+*then* `playing = false`. `CMD_STOP_AT` is the scheduled form: `rt_render` fires
+that same fade once a block reaches `stop_at` (block-granular, so it can't pop).
+**Starts** are symmetric: `CMD_PLAY` zeroes `gcur` (the final per-channel gain),
+so the first block ramps up from silence—a fresh voice is already zero (create
+memset), so this only fades in a *replayed* slot that would otherwise reuse the
+prior solve's gains and click on the asset's first sample. Only
+`CMD_SRC_DESTROY` hard-cuts. A paused voice still reads as playing.
 
 ### Doppler delay rings
 

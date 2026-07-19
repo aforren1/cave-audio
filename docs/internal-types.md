@@ -69,7 +69,14 @@ it is audio-thread-only (ramp state, filter histories), which is why it lives
 
 - **scheduling / streaming**: `oneshot` (self-recycling voice),
   `stream_pos` (absolute position into a stream's ring),
-  `start_sample` (dsp-sample for a scheduled `bwa_source_play_at`).
+  `start_sample` (dsp-sample for a scheduled `bwa_source_play_at`),
+  `loop_beg`/`loop_end` (loop region for `bwa_source_play_loop`; resolved against the
+  asset at `CMD_PLAY`, 0/0 = whole clip — the mix seam wraps `cursor` to `loop_beg` at
+  `loop_end`), `stop_at`/`stop_sched` (a scheduled click-free stop, `bwa_source_stop_at`;
+  `rt_render` fires the one-block fade once the block reaches `stop_at`),
+  `queue`/`queue_loop`/`queue_head`/`queue_len` (the gapless chain FIFO, depth `BWA_QUEUE`;
+  entries are resolved `SoundData*` like `sound`, so `CMD_SOUND_RETIRE` NULL-tombstones any
+  it frees — `mix_voice` pops the next valid entry at a non-looping end instead of stopping).
 - **dual-band panning**: `gtarget_lo` / `gcur_lo` (amplitude-normalised LF
   gain set), `xover_lp` (crossover one-pole state), `dual_mix` (0↔1 A/B
   crossfade factor).

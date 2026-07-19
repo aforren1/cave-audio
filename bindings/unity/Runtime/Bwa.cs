@@ -153,6 +153,7 @@ namespace BwAudio
         [DllImport(DLL, CallingConvention = CC)] public static extern void bwa_source_set_pitch(IntPtr e, uint s, float rate);
         [DllImport(DLL, CallingConvention = CC)] public static extern void bwa_source_play(IntPtr e, uint s, uint snd, [MarshalAs(UnmanagedType.I1)] bool loop);
         [DllImport(DLL, CallingConvention = CC)] public static extern void bwa_source_play_at(IntPtr e, uint s, uint snd, [MarshalAs(UnmanagedType.I1)] bool loop, ulong startSample);
+        [DllImport(DLL, CallingConvention = CC)] public static extern void bwa_source_play_loop(IntPtr e, uint s, uint snd, ulong loopBeg, ulong loopEnd);
         [DllImport(DLL, CallingConvention = CC)] public static extern ulong bwa_get_dsp_time(IntPtr e);
         // The device-stamped (output sample, host time ns) pair for the last rendered block — the
         // jitter-free wall<->dsp bridge (see Engine.DspTimeAt). hostTimeNs is monotonic on a
@@ -162,6 +163,9 @@ namespace BwAudio
         // buffering). 0 = unknown / no physical output (null sink).
         [DllImport(DLL, CallingConvention = CC)] public static extern uint bwa_get_output_latency(IntPtr e);
         [DllImport(DLL, CallingConvention = CC)] public static extern void bwa_source_stop(IntPtr e, uint s);
+        [DllImport(DLL, CallingConvention = CC)] public static extern void bwa_source_stop_at(IntPtr e, uint s, ulong stopSample);
+        [DllImport(DLL, CallingConvention = CC)] public static extern void bwa_source_queue(IntPtr e, uint s, uint snd, [MarshalAs(UnmanagedType.I1)] bool loop);
+        [DllImport(DLL, CallingConvention = CC)] public static extern void bwa_source_clear_queue(IntPtr e, uint s);
         [DllImport(DLL, CallingConvention = CC)] public static extern void bwa_source_set_paused(IntPtr e, uint s, [MarshalAs(UnmanagedType.I1)] bool paused);
         // Global pause: EVERY voice (memory, streamed, bed) ramps out and freezes; resume continues exactly.
         [DllImport(DLL, CallingConvention = CC)] public static extern void bwa_set_paused(IntPtr e, [MarshalAs(UnmanagedType.I1)] bool paused);

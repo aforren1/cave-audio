@@ -32,6 +32,7 @@
 /* Command ring payload (control -> audio). Fixed-size POD, no framing. */
 #define BWA_EXTRA_LIS 3   /* extra (compromise) listener positions beyond the primary */
 #define BWA_GROUPS    8   /* mix groups (per-voice group id 0..7; group 0 is the default) */
+#define BWA_QUEUE     7   /* per-voice gapless play-queue depth (rt_source_queue / chaining) */
 
 enum {
     CMD_SRC_CREATE = 0, CMD_SRC_DESTROY, CMD_SET_POS, CMD_SET_GAIN,
@@ -49,7 +50,10 @@ enum {
     CMD_SET_PITCH,  /* per-voice playback rate (in-memory sounds) */
     CMD_BED_ROT,    /* per-bed soundfield orientation (yaw about up; + pitch/roll for the full rotation) */
     CMD_SET_ISM,    /* per-voice image-source early reflections */
-    CMD_SET_ATTEN   /* per-voice distance-attenuation override (replaces the layout curve for one source) */
+    CMD_SET_ATTEN,  /* per-voice distance-attenuation override (replaces the layout curve for one source) */
+    CMD_STOP_AT,    /* schedule a click-free stop when the dsp clock reaches a sample (rt_source_stop_at) */
+    CMD_QUEUE,      /* append a sound to a voice's gapless play queue (rt_source_queue / chaining) */
+    CMD_QUEUE_CLEAR /* drop a voice's pending play queue (rt_source_clear_queue) */
 };
 typedef struct {
     uint8_t  type;
@@ -57,7 +61,11 @@ typedef struct {
     union {
         struct { float x, y, z; }                      pos;
         struct { float g; }                            gain;
-        struct { uint64_t start; uint32_t sound; uint8_t loop, oneshot; } play;  /* start = dsp-sample to begin (0 = now) */
+        struct { uint64_t start, loop_beg, loop_end; uint32_t sound; uint8_t loop, oneshot; } play;
+                                         /* start = dsp-sample to begin (0 = now); loop_beg/loop_end =
+                                          * loop region in frames (0/0 = whole clip; used only when loop) */
+        struct { uint64_t sample; }                    stopat;/* dsp-sample to begin the click-free stop fade */
+        struct { uint32_t sound; uint8_t loop; }       enq;   /* queue a sound to chain after the current one */
         struct { float px, py, pz, qx, qy, qz, qw; }   lis;
         struct { uint8_t on; }                         refl;
         struct { uint8_t on; }                         dop;   /* per-voice Doppler enable */
@@ -173,6 +181,7 @@ uint32_t rt_load_fuma   (RtCore* c, const char* path, char* err, size_t errcap);
 uint16_t rt_sound_channels(RtCore* c, uint32_t sound);   /* 1 = mono, 4/9/16 = bed, 0 = invalid */
 uint64_t rt_sound_frames  (RtCore* c, uint32_t sound);   /* length in frames at the engine rate;
                                                           * 0 = invalid, or unknown (push streams) */
+bool     rt_sound_is_stream(RtCore* c, uint32_t sound);  /* streamed/push (reports 1 channel like mono) */
 bool     rt_unload_sound(RtCore* c, uint32_t sound);  /* safe any time; retire-acked internally.
                                                        * false = command ring full, nothing enqueued:
                                                        * retry later (internal sounds park in rt.c) */
@@ -200,7 +209,11 @@ void rt_source_set_pos (RtCore* c, uint32_t h, float x, float y, float z);
 void rt_source_set_gain(RtCore* c, uint32_t h, float linear);
 void rt_source_play    (RtCore* c, uint32_t h, uint32_t sound, bool loop);
 void rt_source_play_at (RtCore* c, uint32_t h, uint32_t sound, bool loop, uint64_t start_sample);  /* sample-accurate */
+void rt_source_play_loop(RtCore* c, uint32_t h, uint32_t sound, uint64_t loop_beg, uint64_t loop_end);  /* intro->loop region */
 void rt_source_stop    (RtCore* c, uint32_t h);
+void rt_source_stop_at (RtCore* c, uint32_t h, uint64_t stop_sample);   /* click-free stop when the dsp clock reaches it */
+void rt_source_queue   (RtCore* c, uint32_t h, uint32_t sound, bool loop);  /* chain: play after the current sound ends (gapless) */
+void rt_source_clear_queue(RtCore* c, uint32_t h);                     /* drop the pending chain */
 void rt_source_set_paused(RtCore* c, uint32_t h, bool paused);   /* ramped gate; the playhead freezes once silent */
 void rt_source_seek    (RtCore* c, uint32_t h, uint64_t frame);  /* click-free jump (in-memory sounds; streams ignore) */
 void rt_source_set_doppler(RtCore* c, uint32_t h, bool on);          /* propagation: glided delay -> pitch from radial motion */

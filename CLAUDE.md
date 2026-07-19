@@ -405,6 +405,27 @@ mechanics (exact-capacity fill, wrap, NaN scrub, underrun-vs-end).
 255 = protected) — a full pool steals the lowest-priority voice instead of failing the create; and
 **`bwa_source_play_at(start_sample)`** fires a voice sample-accurately off a published dsp clock
 (`bwa_get_dsp_time`, device-anchored), the mixer holding it silent until the exact in-block offset.
+**`bwa_source_play_loop(loop_beg, loop_end)`** is the intro→loop pattern: playback starts at 0 but
+the mix seam wraps `cursor` to `loop_beg` at `loop_end` instead of the clip end (a non-repeating
+intro `[0,loop_beg)` then a looping body), resolved against the asset at `CMD_PLAY` and honored by
+both `mix_voice` and `mix_bed` (0/0 = whole clip, so the existing loop path is unchanged; streams
+loop their whole file). **`bwa_source_stop_at(stop_sample)`** schedules a click-free stop: once a
+block reaches `stop_sample`, `rt_render` fires the SAME one-block gate fade as `bwa_source_stop`
+(block-granular, never a hard cut — so a scheduled stop can't pop; a fresh play clears it).
+**`bwa_source_queue(snd, loop)`** (+ `bwa_source_clear_queue`) is **gapless chaining**: a per-voice
+FIFO (`Voice.queue[BWA_QUEUE]`, resolved `SoundData*`) the mixer pops at a non-looping end
+(`queue_pop_valid`) and continues in the SAME block — no seam. A looping queued entry is the
+terminal item (two-file intro→loop: `play(intro, false)` then `queue(body, true)`); in-memory mono
+only; queue AFTER play (a fresh play clears it); `CMD_SOUND_RETIRE` NULL-tombstones any queued entry
+it frees (the "detach before free" rule that already guards the current `sound`). And
+**starts are click-free too**: `CMD_PLAY` zeroes `gcur`/`gcur_lo` (+ `fs_on`) so every (re)play
+ramps up from silence over the first block — `gcur` is the final per-channel multiply, so this
+fades in the whole direct path; a fresh voice is already zero (create memset), so goldens/first
+plays are byte-unchanged, only a REPLAYED slot (which kept the prior solve's gains and would hit
+the asset's first sample at full level) is fixed. The `rt` test pins the loop region wrap, the
+scheduled stop (fade + on-schedule end + replay-cancel), and the gapless chain (a queued voice
+outlives A's end vs an un-queued control, playhead restart, looping terminal, mid-block-seam
+fullness, clear_queue); the golden test confirms fresh plays are untouched.
 **Pause/seek** (`bwa_source_set_paused` / `bwa_source_seek`): a per-voice gate ramps over one block
 (invariant 4) and the playhead freezes only once silent, so resume continues exactly where pause
 landed and a seek on a running voice is ramp-out → jump → ramp-in (click-free); pause covers

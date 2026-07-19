@@ -127,7 +127,10 @@ The snippet shows the core calls. The shipped `Bwa.cs` binds the ABI **1:1**. Ev
 `BWA_API` function in `bw_audio.h` has an entry point. Beyond the core:
 
 - **Voice management + scheduling**: `bwa_source_set_priority`;
-  `bwa_source_play_at` + `bwa_get_dsp_time` (sample-accurate start);
+  `bwa_source_play_at` + `bwa_get_dsp_time` (sample-accurate start),
+  `bwa_source_play_loop` (`Emitter.PlayLoop` — intro→loop region),
+  `bwa_source_stop_at` (`Emitter.StopAt` — click-free scheduled stop on the dsp clock),
+  `bwa_source_queue` (`Emitter.Queue` — gapless chaining into the next sound);
   `bwa_get_active_voices`.
 - **Transport**: `bwa_source_set_paused`, `bwa_set_paused` (global),
   `bwa_source_seek`, `bwa_source_is_playing`; `Emitter` polls the playing state

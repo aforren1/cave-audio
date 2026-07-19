@@ -2057,6 +2057,166 @@ int main(void) {
         } else if (cq) { CHECK(0, "write seek wav"); rt_destroy(cq); }
     }
 
+    /* loop REGION (rt_source_play_loop / the intro->loop pattern): playback starts at 0, plays the
+     * intro once, then wraps at loop_end back to loop_beg — NOT to 0 and NOT at the clip end. A 5N
+     * const sound, body region [N, 3N). */
+    {
+        RtCore* cr = rt_create(4, 4, RATE, CH);
+        CHECK(cr != NULL, "rt_create (loop region)");
+        if (cr && write_const_wav("bwa_rt_loopreg.wav", 0.7f, 5 * N)) {
+            uint32_t sr = rt_load_sound(cr, "bwa_rt_loopreg.wav", err, sizeof err);
+            uint32_t h  = rt_source_create(cr);
+            rt_source_set_pos(cr, h, 1.f, 0.f, 1.f);
+            bwa_timestamp ts = { 0, 0 };
+            rt_source_play_loop(cr, h, sr, (uint64_t)N, (uint64_t)(3 * N));   /* body loops [N, 3N) */
+            rt_commit(cr);
+            rt_render(cr, bus, N, &ts);                                       /* intro: cursor 0 -> N */
+            CHECK(rt_source_get_position(cr, h) == (uint64_t)N, "region: intro plays from frame 0");
+            rt_render(cr, bus, N, &ts);                                       /* N -> 2N */
+            rt_render(cr, bus, N, &ts);                                       /* 2N -> 3N (reaches loop_end) */
+            CHECK(rt_source_get_position(cr, h) == (uint64_t)(3 * N), "region: cursor reaches loop_end");
+            rt_render(cr, bus, N, &ts);                                       /* wraps to loop_beg (N), then N -> 2N */
+            CHECK(rt_source_get_position(cr, h) == (uint64_t)(2 * N),
+                  "region: wraps to loop_beg (=> 2N), not to 0 (would read N) nor to the clip end");
+            for (int b = 0; b < 20; ++b) rt_render(cr, bus, N, &ts);         /* many wraps: stays confined */
+            uint64_t p = rt_source_get_position(cr, h);
+            CHECK(p >= (uint64_t)N && p <= (uint64_t)(3 * N), "region: cursor never leaves [loop_beg, loop_end]");
+            CHECK(rt_source_is_playing(cr, h), "region: a looped region never ends");
+            rt_destroy(cr);
+            remove("bwa_rt_loopreg.wav");
+        } else if (cr) { CHECK(0, "write loop-region wav"); rt_destroy(cr); }
+    }
+
+    /* scheduled STOP (rt_source_stop_at): when the dsp clock reaches stop_at the voice takes the
+     * click-free one-block fade (the same path as rt_source_stop) and ends — audible through the
+     * fade block, silent after, is_playing flips off on schedule. A looping const sound so only the
+     * schedule stops it; the dsp clock advances via the block-start timestamp (as the schedule test). */
+    {
+        RtCore* cs = rt_create(4, 4, RATE, CH);
+        CHECK(cs != NULL, "rt_create (stop_at)");
+        if (cs && write_const_wav("bwa_rt_stopat.wav", 0.8f, 64 * N)) {
+            uint32_t ss = rt_load_sound(cs, "bwa_rt_stopat.wav", err, sizeof err);
+            uint32_t h  = rt_source_create(cs);
+            rt_source_set_pos(cs, h, 1.f, 0.f, 1.f);
+            rt_source_play(cs, h, ss, true);                                  /* loop: only the schedule stops it */
+            rt_commit(cs);
+            uint64_t pos = 0;
+            bwa_timestamp t0 = { pos, 0 }; rt_render(cs, bus, N, &t0); pos += N;   /* [0, N) */
+            CHECK(total_l2() > 1e-3 && rt_source_is_playing(cs, h), "stop_at: audible before the schedule");
+            rt_source_stop_at(cs, h, (uint64_t)(3 * N));                      /* stop when the clock reaches 3N */
+            bwa_timestamp t1 = { pos, 0 }; rt_render(cs, bus, N, &t1); pos += N;   /* [N, 2N): armed, not yet reached */
+            CHECK(rt_source_is_playing(cs, h), "stop_at: still playing before stop_at");
+            bwa_timestamp t2 = { pos, 0 }; rt_render(cs, bus, N, &t2); pos += N;   /* [2N, 3N): the fade block */
+            CHECK(total_l2() > 1e-3, "stop_at: the stop is a one-block fade, not a hard cut (fade block audible)");
+            CHECK(rt_source_is_playing(cs, h), "stop_at: still playing during the fade block");
+            bwa_timestamp t3 = { pos, 0 }; rt_render(cs, bus, N, &t3); pos += N;   /* [3N, 4N): finalized */
+            CHECK(total_l2() < 1e-9, "stop_at: silent after the fade lands");
+            CHECK(!rt_source_is_playing(cs, h), "stop_at: the voice ended on schedule");
+            /* a fresh play clears a stale schedule: schedule far out, replay, run past it, still playing */
+            uint32_t h2 = rt_source_create(cs);
+            rt_source_set_pos(cs, h2, 1.f, 0.f, 1.f);
+            rt_source_play(cs, h2, ss, true); rt_commit(cs);
+            rt_source_stop_at(cs, h2, (uint64_t)(pos + 2 * N));
+            rt_source_play(cs, h2, ss, true);                                 /* replay cancels the pending stop */
+            rt_commit(cs);
+            for (int b = 0; b < 6; ++b) { bwa_timestamp t = { pos, 0 }; rt_render(cs, bus, N, &t); pos += N; }
+            CHECK(rt_source_is_playing(cs, h2), "stop_at: a fresh play cancels a pending scheduled stop");
+            rt_destroy(cs);
+            remove("bwa_rt_stopat.wav");
+        } else if (cs) { CHECK(0, "write stop_at wav"); rt_destroy(cs); }
+    }
+
+    /* gapless CHAINING (rt_source_queue): a queued sound plays the instant the current one ends, with
+     * no silence at the seam. A = one block, non-loop; B = looping terminal. Chaining keeps the voice
+     * alive past A's end (a non-queued A ends and goes silent — the negative control h2). */
+    {
+        RtCore* cc = rt_create(4, 4, RATE, CH);
+        CHECK(cc != NULL, "rt_create (chain)");
+        if (cc && write_const_wav("bwa_rt_chainA.wav", 0.5f, N)          /* A: exactly one block */
+               && write_const_wav("bwa_rt_chainB.wav", 0.5f, 4 * N)) {   /* B: the looping body */
+            uint32_t sa = rt_load_sound(cc, "bwa_rt_chainA.wav", err, sizeof err);
+            uint32_t sb = rt_load_sound(cc, "bwa_rt_chainB.wav", err, sizeof err);
+            uint32_t h  = rt_source_create(cc);
+            uint32_t h2 = rt_source_create(cc);                          /* negative control: A alone */
+            rt_source_set_pos(cc, h,  1.f, 0.f, 1.f);
+            rt_source_set_pos(cc, h2, 1.f, 0.f, 1.f);
+            bwa_timestamp ts = { 0, 0 };
+            rt_source_play (cc, h,  sa, false);
+            rt_source_queue(cc, h,  sb, true);                           /* chain: A -> looping B */
+            rt_source_play (cc, h2, sa, false);                          /* no queue */
+            rt_commit(cc);
+            rt_render(cc, bus, N, &ts);                                  /* block 1: A plays on both */
+            CHECK(rt_source_is_playing(cc, h) && rt_source_is_playing(cc, h2), "chain: A playing (both)");
+            rt_render(cc, bus, N, &ts);                                  /* block 2: h chains to B; h2's A ends */
+            CHECK(rt_source_is_playing(cc, h),  "chain: the queued voice keeps playing past A's end");
+            CHECK(!rt_source_is_playing(cc, h2), "chain: the un-queued voice ends at A's end (control)");
+            CHECK(rt_source_get_position(cc, h) == (uint64_t)N, "chain: the playhead restarts on the chained sound");
+            for (int b = 0; b < 8; ++b) rt_render(cc, bus, N, &ts);     /* B is the looping terminal */
+            CHECK(rt_source_is_playing(cc, h), "chain: the looping terminal item plays on");
+            rt_destroy(cc);
+            remove("bwa_rt_chainA.wav"); remove("bwa_rt_chainB.wav");
+        } else if (cc) { CHECK(0, "write chain wavs"); rt_destroy(cc); }
+    }
+
+    /* chain seam is gapless WITHIN a block: A spans 1.5 blocks, so A ends mid-block-2 and B fills the
+     * rest — block 2 must stay a full block (not half). And clear_queue drops the pending chain. */
+    {
+        RtCore* cg = rt_create(4, 4, RATE, CH);
+        CHECK(cg != NULL, "rt_create (chain seam)");
+        if (cg && write_const_wav("bwa_rt_seamA.wav", 0.5f, N + N / 2)   /* A: 1.5 blocks */
+               && write_const_wav("bwa_rt_seamB.wav", 0.5f, 4 * N)) {
+            uint32_t sa = rt_load_sound(cg, "bwa_rt_seamA.wav", err, sizeof err);
+            uint32_t sb = rt_load_sound(cg, "bwa_rt_seamB.wav", err, sizeof err);
+            uint32_t h  = rt_source_create(cg);
+            rt_source_set_pos(cg, h, 1.f, 0.f, 1.f);
+            bwa_timestamp ts = { 0, 0 };
+            rt_source_play (cg, h, sa, false);
+            rt_source_queue(cg, h, sb, true);
+            rt_commit(cg);
+            rt_render(cg, bus, N, &ts);                                  /* block 1: A (fade-in) */
+            rt_render(cg, bus, N, &ts); double e2 = total_l2();          /* block 2: A ends at N/2, B fills the rest */
+            rt_render(cg, bus, N, &ts); double e3 = total_l2();          /* block 3: pure B, a full reference block */
+            CHECK(e3 > 1e-3 && e2 > 0.7 * e3,                            /* e3 real (B chained in) AND block 2 full */
+                  "chain: no gap at a mid-block seam (the spanning block stays full)");
+            /* clear_queue drops the pending chain: a fresh A with the queue cleared ends alone */
+            uint32_t h3 = rt_source_create(cg);
+            rt_source_set_pos(cg, h3, 1.f, 0.f, 1.f);
+            rt_source_play (cg, h3, sa, false);
+            rt_source_queue(cg, h3, sb, true);
+            rt_source_clear_queue(cg, h3);
+            rt_commit(cg);
+            for (int b = 0; b < 3; ++b) rt_render(cg, bus, N, &ts);      /* A (1.5 blocks) ends, nothing chained */
+            CHECK(!rt_source_is_playing(cg, h3), "chain: clear_queue drops the pending chain (A ends alone)");
+            rt_destroy(cg);
+            remove("bwa_rt_seamA.wav"); remove("bwa_rt_seamB.wav");
+        } else if (cg) { CHECK(0, "write chain-seam wavs"); rt_destroy(cg); }
+    }
+
+    /* a stopping voice must NOT chain: a scheduled stop landing in the block where the current sound
+     * ends has to end the voice, not start the queued one (the seam's !stopping guard). */
+    {
+        RtCore* cx = rt_create(4, 4, RATE, CH);
+        CHECK(cx != NULL, "rt_create (chain vs stop)");
+        if (cx && write_const_wav("bwa_rt_csA.wav", 0.5f, N)            /* A: one block */
+               && write_const_wav("bwa_rt_csB.wav", 0.5f, 4 * N)) {     /* B: would-be looping chain */
+            uint32_t sa = rt_load_sound(cx, "bwa_rt_csA.wav", err, sizeof err);
+            uint32_t sb = rt_load_sound(cx, "bwa_rt_csB.wav", err, sizeof err);
+            uint32_t h  = rt_source_create(cx);
+            rt_source_set_pos(cx, h, 1.f, 0.f, 1.f);
+            rt_source_play (cx, h, sa, false);
+            rt_source_queue(cx, h, sb, true);
+            rt_source_stop_at(cx, h, (uint64_t)(2 * N));                /* fires in block 2, where A ends */
+            rt_commit(cx);
+            uint64_t pos = 0;
+            bwa_timestamp t0 = { pos, 0 }; rt_render(cx, bus, N, &t0); pos += N;   /* block 1: A */
+            CHECK(rt_source_is_playing(cx, h), "chain-vs-stop: playing during A");
+            bwa_timestamp t1 = { pos, 0 }; rt_render(cx, bus, N, &t1); pos += N;   /* block 2: A ends AND stop fires */
+            CHECK(!rt_source_is_playing(cx, h), "chain-vs-stop: a scheduled stop ends the voice, it does NOT chain into B");
+            rt_destroy(cx);
+            remove("bwa_rt_csA.wav"); remove("bwa_rt_csB.wav");
+        } else if (cx) { CHECK(0, "write chain-vs-stop wavs"); rt_destroy(cx); }
+    }
+
     /* output protection limiter: a linked gain caps the peak without shifting inter-channel balance.
      * The test signal is injected after align, so it hits the limiter (the final stage) directly. */
     {
@@ -2097,6 +2257,6 @@ int main(void) {
 
     remove(WAV);
     if (fails) { printf("rt_test: %d FAILURES\n", fails); return 1; }
-    printf("rt_test OK (DBAP, commit, gen-drop, gain, occlusion, EQ, directivity, bed, reflection-tap, channel-test, air+Doppler, spread+MDAP+spectral+size+extent, tracked-room-EQ, decorrelation, parametric-bed, pose-pred, near-spread, loudness-comp, multi-listener, master+groups+fades+global-pause, pitch, bed-rotation+orientation, max-rE+split, reverb-send, dual-band, voice-steal, scheduled-play, clock-pair, streaming, pause/seek, position-readback, limiter, bus-meter verified)\n");
+    printf("rt_test OK (DBAP, commit, gen-drop, gain, occlusion, EQ, directivity, bed, reflection-tap, channel-test, air+Doppler, spread+MDAP+spectral+size+extent, tracked-room-EQ, decorrelation, parametric-bed, pose-pred, near-spread, loudness-comp, multi-listener, master+groups+fades+global-pause, pitch, bed-rotation+orientation, max-rE+split, reverb-send, dual-band, voice-steal, scheduled-play, clock-pair, streaming, pause/seek, loop-region, scheduled-stop, gapless-chaining, position-readback, limiter, bus-meter verified)\n");
     return 0;
 }

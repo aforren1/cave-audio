@@ -4,6 +4,27 @@ All notable changes to `com.brainworks.bw_audio`.
 
 ## [Unreleased]
 
+### Added — gapless chaining
+
+- **`Emitter.Queue(clip, loopTerminal)` / `Emitter.ClearQueue()`** → new engine ABI
+  `bwa_source_queue` / `bwa_source_clear_queue`: queue a clip to play the instant the current one
+  ends, with no gap at the seam (the engine swaps mid-block if the boundary falls there). Queue
+  several for a sequence; a `loopTerminal: true` entry is the looping tail — `Play(intro)` then
+  `Queue(body, loopTerminal: true)` is an intro→loop across two files. Up to 7 pending; queue *after*
+  Play (Play restarts and clears the queue). In-memory mono clips only.
+
+### Added — loop regions + scheduled stop
+
+- **`Emitter.PlayLoop(loopBeg, loopEnd)`** → new engine ABI `bwa_source_play_loop`: the intro→loop
+  pattern. Playback starts at 0, plays the intro `[0, loopBeg)` once, then loops the body
+  `[loopBeg, loopEnd)` forever (wraps at loopEnd back to loopBeg, not the clip end). Frames are
+  engine-rate; loopEnd 0 = the clip end. In-memory clips; a stream loops its whole file. The seam is
+  a hard wrap, so author the loop points on matched endpoints.
+- **`Emitter.StopAt(stopSample)`** → new engine ABI `bwa_source_stop_at`: a click-free stop on the
+  dsp clock (same time base as `PlayAt`). When `Engine.DspTime` reaches stopSample the source fades
+  out over one block and ends — never a hard cut, so it can't pop. Block-granular; a later
+  Play/PlayAt/PlayLoop clears a pending stop.
+
 ### Changed — engine ABI clarity renames (native 0.9.0)
 
 The engine renamed seven symbols for clarity; the binding follows. C#-visible changes:

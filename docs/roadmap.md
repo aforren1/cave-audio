@@ -195,6 +195,13 @@ Features that landed without a milestone of their own, one line each:
   a full pool steals the lowest-priority voice through a fade reserve.
 - **Pause/seek**: `bwa_source_set_paused` / `bwa_source_seek`; ramped gates, so both
   are click-free.
+- **Loop regions + scheduled stop**: `bwa_source_play_loop` (intro→loop — wrap `cursor`
+  to `loop_beg` at `loop_end`, not the clip end) and `bwa_source_stop_at` (click-free
+  stop when the dsp clock reaches a sample). Starts are click-free too (`CMD_PLAY` ramps
+  the gains up from silence), mirroring the one-block stop fade.
+- **Gapless chaining**: `bwa_source_queue` (+ `bwa_source_clear_queue`); a per-voice FIFO
+  the mixer pops at a non-looping end and continues in the same block — no seam. In-memory
+  mono only; a looping queued entry is the terminal item (two-file intro→loop).
 - **Disk streaming**: `bwa_load_sound_streaming` (`src/stream.c`); a background
   decode thread feeds a per-stream SPSC ring the audio thread pulls from.
 - **Dual-band panning**: `bwa_set_dual_band`; 700 Hz crossover, amplitude-normalised

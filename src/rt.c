@@ -81,8 +81,19 @@ typedef struct {
     bool     active, playing, loop, dirty, oneshot;
     const SoundData* sound;                 /* bound sound (NULL when idle); audio reads pcm */
     uint32_t cursor;                        /* sample cursor into sound->pcm (in-memory sounds) */
+    uint32_t loop_beg, loop_end;            /* loop region [beg,end) in frames (in-memory/bed sounds); resolved
+                                             * at CMD_PLAY, 0/0 = whole clip. Used only when v->loop: on reaching
+                                             * loop_end the cursor wraps to loop_beg (the intro->loop pattern). */
     uint64_t stream_pos;                    /* absolute sample position into a streamed sound's ring */
     uint64_t start_sample;                  /* dsp-sample to begin output (0 = immediate); for scheduled play */
+    uint64_t stop_at;                       /* scheduled click-free stop: dsp-sample at which the stop fade begins */
+    bool     stop_sched;                    /* a stop_at is armed (rt_source_stop_at); cleared once it fires or on replay */
+    /* gapless play queue (rt_source_queue / chaining): a FIFO of sounds to play, seamlessly, after the
+     * current one ends. Entries are resolved SoundData pointers (like `sound`), so CMD_SOUND_RETIRE must
+     * NULL any entry it frees (tombstone; queue_pop_valid skips NULLs). In-memory mono sounds only. */
+    const SoundData* queue[BWA_QUEUE];
+    uint8_t  queue_loop[BWA_QUEUE];         /* per-entry loop flag (a looping entry is the terminal item) */
+    uint32_t queue_head, queue_len;         /* ring indices into queue[] */
     float    pos_pending[3], pos_active[3];
     float    gain_user;
     float    gtarget[BWA_CHANNELS], gcur[BWA_CHANNELS];
@@ -751,8 +762,26 @@ static void drain_commands(RtCore* c) {
                         if (&c->voices[j] != v && c->voices[j].sound == s) { c->voices[j].playing = false; c->voices[j].sound = NULL; }
                 v->sound = s; v->cursor = 0; v->cur_frac = 0.f; v->stream_pos = 0; v->loop = cmd->u.play.loop != 0;
                           v->oneshot = cmd->u.play.oneshot != 0; v->playing = true; v->dirty = true;
+                          /* loop region: resolve against the asset so the mix seam sees in-bounds values.
+                           * loop_end 0 (or out of range) = whole clip; a degenerate beg >= end = whole clip. */
+                          v->loop_beg = (cmd->u.play.loop_beg < (uint64_t)s->frames) ? (uint32_t)cmd->u.play.loop_beg : 0;
+                          v->loop_end = (cmd->u.play.loop_end != 0 && cmd->u.play.loop_end <= (uint64_t)s->frames)
+                                        ? (uint32_t)cmd->u.play.loop_end : 0;
+                          v->stop_sched = false; v->stop_at = 0;   /* a fresh play cancels any pending scheduled stop */
+                          for (uint32_t k = 0; k < BWA_QUEUE; ++k) v->queue[k] = NULL;
+                          v->queue_head = v->queue_len = 0;      /* and the pending chain (queue AFTER play) */
                           v->start_sample = cmd->u.play.start;  /* 0 = now; else hold output until this dsp-sample */
                           v->refl_g_cur = 0.f;                  /* fresh start: ramp the wet send up from 0, no stale burst */
+                          /* Click-free start: ramp the per-channel gains up from silence over the first
+                           * block. gcur is the FINAL per-channel multiply, so 0 -> gtarget fades in the
+                           * whole direct path (every pre-pan filter included) — a REPLAYED slot otherwise
+                           * keeps the prior solve's gains and hits the asset's first sample at full level
+                           * (a click if it isn't near zero). A fresh voice is already zero here (create
+                           * memset), so first-plays/goldens are unchanged; fs_on = 0 makes a replayed
+                           * spectral-spread voice re-engage and re-seed from the zeroed gains too. */
+                          memset(v->gcur,    0, sizeof v->gcur);
+                          memset(v->gcur_lo, 0, sizeof v->gcur_lo);
+                          v->fs_on = 0;
                           v->xover_lp = 0.f;                    /* fresh dual-band crossover state */
                           v->dual_mix = atomic_load_explicit(&c->dual_band, memory_order_relaxed) ? 1.f : 0.f;  /* start in the current mode */
                           v->re_mix   = atomic_load_explicit(&c->max_re,    memory_order_relaxed) ? 1.f : 0.f;  /* (beds) likewise */
@@ -762,7 +791,21 @@ static void drain_commands(RtCore* c) {
             /* Fade the gate to 0 over one block, then finalize (playing=false) in pause_gate — a
              * click-free explicit stop. Don't downgrade a steal-in-progress (2), which must still free
              * its slot. (CMD_SRC_DESTROY hard-cuts; automatic steal fades via CMD_SRC_STEAL below.) */
-            if (v && v->playing && v->stopping != 2) v->stopping = 1; } break;
+            if (v && v->playing && v->stopping != 2) v->stopping = 1; } break;   /* the seam's !stopping guard suppresses the chain */
+        case CMD_STOP_AT: { Voice* v = voice_for(c, cmd->handle);
+            /* Arm a scheduled stop; rt_render fires the click-free fade once the block reaches stop_at. */
+            if (v) { v->stop_at = cmd->u.stopat.sample; v->stop_sched = true; } } break;
+        case CMD_QUEUE: { Voice* v = voice_for(c, cmd->handle);
+            const SoundData* s = sound_for(c, cmd->u.enq.sound);
+            /* Append to the gapless queue. In-memory mono only (pcm set, not a stream, one channel);
+             * a full queue drops silently (BWA_QUEUE depth). The control side already gates these, so
+             * the checks here are defensive — a stale/incompatible handle just never enqueues. */
+            if (v && s && s->pcm && s->channels == 1 && !s->stream && v->queue_len < BWA_QUEUE) {
+                uint32_t slot = (v->queue_head + v->queue_len) % BWA_QUEUE;
+                v->queue[slot] = s; v->queue_loop[slot] = cmd->u.enq.loop; v->queue_len++;
+            } } break;
+        case CMD_QUEUE_CLEAR: { Voice* v = voice_for(c, cmd->handle);
+            if (v) { for (uint32_t k = 0; k < BWA_QUEUE; ++k) v->queue[k] = NULL; v->queue_head = v->queue_len = 0; } } break;
         case CMD_SRC_STEAL: { Voice* v = voice_for(c, cmd->handle);
             /* Fade the stolen voice out on its own slot, then free it (pause_gate finalize pushes
              * EVT_VOICE_ENDED so the control thread recycles the slot). The new source already started
@@ -860,8 +903,11 @@ static void drain_commands(RtCore* c) {
              * frees the buffer exactly once the audio thread has provably let go. */
             const SoundData* s = sound_for(c, cmd->handle);
             if (s) {
-                for (uint32_t i = 0; i < c->voice_cap; ++i)
+                for (uint32_t i = 0; i < c->voice_cap; ++i) {
                     if (c->voices[i].sound == s) { c->voices[i].playing = false; c->voices[i].sound = NULL; }
+                    for (uint32_t k = 0; k < BWA_QUEUE; ++k)     /* a queued (chained) reference dangles otherwise: */
+                        if (c->voices[i].queue[k] == s) c->voices[i].queue[k] = NULL;   /* tombstone (pop skips NULLs) */
+                }
             }
             Evt ev = { .type = EVT_SOUND_RETIRED, .handle = cmd->handle };
             evt_push(&c->events, &ev);
@@ -1345,6 +1391,31 @@ static int pause_gate(RtCore* c, Voice* v, uint16_t idx, uint32_t n, float* pg, 
     return 1;
 }
 
+/* Resolve a voice's loop region [*lbeg,*lend) against its bound sound's frame count: loop_end 0 or
+ * out of range = whole clip, and a degenerate beg >= end falls back to the whole clip too. For a
+ * streamed voice `frames` is 0, which yields 0/0 — unused, since the stream path ignores the region. */
+static void resolve_loop_region(const Voice* v, uint32_t frames, uint32_t* lbeg, uint32_t* lend) {
+    uint32_t e = v->loop_end, b = v->loop_beg;
+    if (e == 0 || e > frames) e = frames;
+    if (b >= e) b = 0;
+    *lbeg = b; *lend = e;
+}
+
+/* Gapless chaining: pop the next queued sound that still resolves to a playable in-memory mono asset,
+ * skipping tombstones a retire left behind (NULL) or any incompatible entry, and set v->loop from it.
+ * Returns NULL when the queue is exhausted (the voice then ends normally). Audio thread only. */
+static const SoundData* queue_pop_valid(Voice* v) {
+    while (v->queue_len > 0) {
+        const SoundData* nx = v->queue[v->queue_head];
+        uint8_t lp = v->queue_loop[v->queue_head];
+        v->queue[v->queue_head] = NULL;
+        v->queue_head = (v->queue_head + 1u) % BWA_QUEUE;
+        v->queue_len--;
+        if (nx && nx->pcm && nx->frames > 0 && nx->channels == 1 && !nx->stream) { v->loop = lp != 0; return nx; }
+    }
+    return NULL;
+}
+
 static void mix_voice(RtCore* c, Voice* v, uint16_t idx, float* bus, uint32_t n, uint32_t start, float* aux) {
     const SoundData* snd = v->sound;
     const uint32_t nr = n - start;      /* rendered samples this block: every per-sample ramp spans the AUDIBLE
@@ -1603,19 +1674,29 @@ static void mix_voice(RtCore* c, Voice* v, uint16_t idx, float* bus, uint32_t n,
     }
 
     uint32_t cur = v->cursor;
+    /* loop region [lbeg,lend): on reaching lend the cursor wraps to lbeg (not the clip end) — the
+     * intro->loop pattern. Streaming voices ignore it (frames unknown; the ring is sequential). */
+    uint32_t lbeg, lend;
+    resolve_loop_region(v, streaming ? 0u : snd->frames, &lbeg, &lend);
     bool ended = false;
     for (uint32_t i = 0; i < n; ++i) {
         if (i < start) continue;               /* scheduled start: this voice stays silent (and frozen) until the in-block offset */
-        if (!streaming && cur >= snd->frames) {
-            if (v->loop) do { cur -= snd->frames; } while (cur >= snd->frames);   /* pitch can overshoot the seam */
-            else         ended = true;
+        if (!streaming && cur >= lend) {
+            if (v->loop && lend > lbeg) { uint32_t span = lend - lbeg; do { cur -= span; } while (cur >= lend); }  /* pitch can overshoot the seam */
+            else {
+                const SoundData* nx = v->stopping ? NULL : queue_pop_valid(v);   /* never chain while stopping/
+                                                             * fading/steal-fading — the voice is on its way out */
+                if (nx) { snd = nx; v->sound = nx; cur = 0; v->cur_frac = 0.f; lbeg = 0; lend = snd->frames; }
+                else ended = true;                          /* queue empty (or stopping): natural end */
+            }
         }
         float s;
         if (streaming)      s = c->stream_scratch[i];
         else if (ended)     s = 0.f;
         else if (use_pitch) {                  /* linear interp between cur and its successor */
             uint32_t i2 = cur + 1;
-            if (i2 >= snd->frames) i2 = v->loop ? 0 : snd->frames - 1;
+            if (v->loop) { if (i2 >= lend) i2 = lbeg; }      /* wrap the interp partner to the loop start */
+            else if (i2 >= snd->frames) i2 = snd->frames - 1;
             s = snd->pcm[cur] + v->cur_frac * (snd->pcm[i2] - snd->pcm[cur]);
         } else s = snd->pcm[cur];
         s *= pg;                                               /* pause/seek gate (also gates the sends below) */
@@ -1919,12 +2000,16 @@ static void mix_bed(RtCore* c, Voice* v, uint16_t idx, float* bus, uint32_t n, u
     }
     const float* rw = c->re_w[(snd->order >= 1 && snd->order <= 3) ? snd->order - 1 : 2];
     uint32_t cur = v->cursor;
+    /* loop region [lbeg,lend) (see mix_voice); 0/0 = whole clip. A bed advances one frame per sample
+     * (no pitch), so the seam lands cur exactly on lend and wraps to lbeg. */
+    uint32_t lbeg, lend;
+    resolve_loop_region(v, snd->frames, &lbeg, &lend);
     bool ended = false;
 
     if (!use_p) {                       /* pure matrix decode: the settled default stays this cheap */
         for (uint32_t i = 0; i < n; ++i) {
             if (i < start) continue;               /* scheduled start: silent until the in-block offset */
-            if (cur >= snd->frames) { if (v->loop) cur = 0; else ended = true; }
+            if (cur >= lend) { if (v->loop && lend > lbeg) cur = lbeg; else ended = true; }
             if (!ended) {
                 const float* sh = &snd->pcm[(size_t)cur * nch];
                 float shr[BWA_AMBI_CH];
@@ -2004,7 +2089,7 @@ static void mix_bed(RtCore* c, Voice* v, uint16_t idx, float* bus, uint32_t n, u
 
         for (uint32_t i = 0; i < n; ++i) {
             if (i < start) continue;
-            if (cur >= snd->frames) { if (v->loop) cur = 0; else ended = true; }
+            if (cur >= lend) { if (v->loop && lend > lbeg) cur = lbeg; else ended = true; }
             if (!ended) {
                 const float* sh = &snd->pcm[(size_t)cur * nch];
                 float shr[BWA_AMBI_CH];
@@ -2264,6 +2349,13 @@ void rt_render(RtCore* c, float* bus, uint32_t nframes, const bwa_timestamp* ts)
             uint64_t d = v->start_sample - block_start;
             if (d >= nframes) continue;                /* starts in a later block: nothing to mix yet */
             off = (uint32_t)d;
+        }
+        /* scheduled stop (rt_source_stop_at): once this block reaches stop_at, begin the click-free
+         * one-block fade — the SAME path as an explicit rt_source_stop, never a hard cut, so it can't
+         * pop. Block-granular: silence lands within one block of stop_at. */
+        if (v->stop_sched && block_start + nframes >= v->stop_at) {
+            v->stop_sched = false;
+            if (v->playing && v->stopping != 2) v->stopping = 1;
         }
         if (v->fade_rate != 0.f) {                     /* timed fade: glide gain_user, re-solve each block
                                                         * (the per-channel gcur ramp keeps it click-free) */
@@ -2528,11 +2620,14 @@ uint32_t rt_source_create(RtCore* c) {
 
 /* The unguarded bind: enqueue CMD_PLAY + flag the pending play. rt_source_play_at wraps this in
  * the public guards (retiring sound, push source); rt_source_create_stream calls it directly for
- * its internal bind — an internal caller skips the guards by construction, not by write ordering. */
-static void source_bind(RtCore* c, uint32_t h, uint32_t sound, bool loop, uint64_t start_sample) {
+ * its internal bind — an internal caller skips the guards by construction, not by write ordering.
+ * loop_beg/loop_end are the loop region (0/0 = whole clip); the audio thread resolves them. */
+static void source_bind(RtCore* c, uint32_t h, uint32_t sound, bool loop, uint64_t start_sample,
+                        uint64_t loop_beg, uint64_t loop_end) {
     Cmd cmd = { .type = CMD_PLAY, .handle = h };
     cmd.u.play.sound = sound; cmd.u.play.loop = loop ? 1u : 0u; cmd.u.play.oneshot = 0u;
     cmd.u.play.start = start_sample;
+    cmd.u.play.loop_beg = loop_beg; cmd.u.play.loop_end = loop_end;
     if (cmd_push(&c->cmds, &cmd) && voice_live_ctrl(c, h))
         c->play_opt[BWA_H_IDX(h)] = 1;     /* pending play: is_playing reads true from NOW, not from
                                             * the first rendered block */
@@ -2581,9 +2676,9 @@ uint32_t rt_source_create_stream(RtCore* c, char* err, size_t errcap) {
     }
     /* Bind + start consuming NOW: an empty ring is an underrun (renders silence, never ends the
      * voice), so the source is live from the first pushed sample. source_bind skips the public
-     * play guards, so the push mapping can be installed first. */
+     * play guards, so the push mapping can be installed first (no loop region — a ring is sequential). */
     c->push_sound[BWA_H_IDX(h)] = snd;
-    source_bind(c, h, snd, false, 0);
+    source_bind(c, h, snd, false, 0, 0, 0);
     return h;
 }
 
@@ -2848,7 +2943,15 @@ void rt_source_play_at(RtCore* c, uint32_t h, uint32_t sound, bool loop, uint64_
     /* streamed sound: kick the background decode (re-seek + fill) now, off the audio thread. The
      * voice reads its ring from sample 0; the first blocks may be silent until the ring fills (~ms). */
     if (s->data.stream) stream_start(s->data.stream, loop ? 1 : 0);
-    source_bind(c, h, sound, loop, start_sample);
+    source_bind(c, h, sound, loop, start_sample, 0, 0);
+}
+
+void rt_source_play_loop(RtCore* c, uint32_t h, uint32_t sound, uint64_t loop_beg, uint64_t loop_end) {
+    SoundSlot* s = sound_slot_ctrl(c, sound);
+    if (!s || s->retiring) return;          /* invalid or being unloaded: drop the play (as play_at) */
+    if (rt_source_is_push(c, h)) return;    /* a PUSH source plays what is pushed (engine.c reports the error) */
+    if (s->data.stream) stream_start(s->data.stream, 1);   /* streams loop the whole file — no region */
+    source_bind(c, h, sound, true, 0, loop_beg, loop_end);  /* always looping; the region is the point */
 }
 
 void rt_source_stop(RtCore* c, uint32_t h) {
@@ -2857,6 +2960,27 @@ void rt_source_stop(RtCore* c, uint32_t h) {
                                         * like push_end: further pushes are refused instead of silently
                                         * feeding a ring nothing will ever drain again */
     Cmd cmd = { .type = CMD_STOP, .handle = h };
+    cmd_push(&c->cmds, &cmd);
+}
+
+void rt_source_stop_at(RtCore* c, uint32_t h, uint64_t stop_sample) {
+    Cmd cmd = { .type = CMD_STOP_AT, .handle = h };
+    cmd.u.stopat.sample = stop_sample;
+    cmd_push(&c->cmds, &cmd);           /* the audio thread fires the click-free fade at stop_sample */
+}
+
+void rt_source_queue(RtCore* c, uint32_t h, uint32_t sound, bool loop) {
+    SoundSlot* s = sound_slot_ctrl(c, sound);
+    if (!s || s->retiring) return;                            /* invalid or being unloaded: drop */
+    if (s->data.stream || s->data.channels != 1) return;      /* chaining is in-memory mono only */
+    if (rt_source_is_push(c, h)) return;                      /* a push source plays what is pushed */
+    Cmd cmd = { .type = CMD_QUEUE, .handle = h };
+    cmd.u.enq.sound = sound; cmd.u.enq.loop = loop ? 1u : 0u;
+    cmd_push(&c->cmds, &cmd);
+}
+
+void rt_source_clear_queue(RtCore* c, uint32_t h) {
+    Cmd cmd = { .type = CMD_QUEUE_CLEAR, .handle = h };
     cmd_push(&c->cmds, &cmd);
 }
 
@@ -2945,6 +3069,14 @@ uint64_t rt_sound_frames(RtCore* c, uint32_t sound) {
     if (!s) return 0;
     if (s->data.stream) return stream_total_frames(s->data.stream);
     return s->data.frames;
+}
+
+/* Is this a streamed (or push) sound (control thread)? A stream reports 1 channel like an in-memory
+ * mono sound, so the channel count alone can't tell them apart — the queue path needs this to reject
+ * a stream (chaining is in-memory only). False for an invalid handle. */
+bool rt_sound_is_stream(RtCore* c, uint32_t sound) {
+    SoundSlot* s = sound_slot_ctrl(c, sound);
+    return s && s->data.stream != NULL;
 }
 
 bool rt_unload_sound(RtCore* c, uint32_t sound) {

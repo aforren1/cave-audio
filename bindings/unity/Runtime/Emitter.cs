@@ -175,8 +175,41 @@ namespace BwAudio
             if (snd != 0) { Bwa.bwa_source_play_at(Eng, _src, snd, loop, startSample); _paused = false; }
         }
 
+        /// <summary>Play with an intro→loop region: the intro <c>[0, loopBeg)</c> plays once, then the
+        /// body <c>[loopBeg, loopEnd)</c> loops forever (wraps at loopEnd back to loopBeg, not the clip
+        /// end). Frames are engine-rate (seconds × Engine.SampleRate). loopEnd 0 = the clip end. Always
+        /// loops (ignores this.loop). In-memory clips only. Author the loop points on matched endpoints —
+        /// the seam is a hard wrap.</summary>
+        public void PlayLoop(ulong loopBeg, ulong loopEnd, string clipOverride = null)
+        {
+            if (!_created || Eng == IntPtr.Zero) return;
+            uint snd = Engine.Instance.Load(clipOverride ?? clip);
+            if (snd != 0) { Bwa.bwa_source_play_loop(Eng, _src, snd, loopBeg, loopEnd); _paused = false; }
+        }
+
         /// <summary>Stop this source — AudioSource.Stop equivalent.</summary>
         public void Stop() { if (_created && Eng != IntPtr.Zero) Bwa.bwa_source_stop(Eng, _src); }
+
+        /// <summary>Schedule a click-free stop on the engine's dsp clock: when Engine.DspTime reaches
+        /// stopSample the source fades out over one block and ends — never a hard cut, so it can't pop.
+        /// Block-granular (silence lands within ~one block of stopSample); a stopSample in the past
+        /// stops now; a later Play/PlayAt/PlayLoop clears it. Same time base as PlayAt.</summary>
+        public void StopAt(ulong stopSample) { if (_created && Eng != IntPtr.Zero) Bwa.bwa_source_stop_at(Eng, _src, stopSample); }
+
+        /// <summary>Gapless chaining: queue `clip` (or an override) to play the instant the current sound
+        /// ends — no gap at the seam. Queue several for a sequence; a queued clip with loopTerminal = true
+        /// is the looping tail (e.g. Play(intro, one-shot) then Queue(body, loopTerminal: true) for an
+        /// intro→loop across two files). Up to 7 pending. Queue AFTER Play (Play restarts and clears the
+        /// queue); nothing chains after a looping or stopped sound. In-memory mono clips only.</summary>
+        public void Queue(string clipOverride = null, bool loopTerminal = false)
+        {
+            if (!_created || Eng == IntPtr.Zero) return;
+            uint snd = Engine.Instance.Load(clipOverride ?? clip);
+            if (snd != 0) Bwa.bwa_source_queue(Eng, _src, snd, loopTerminal);
+        }
+
+        /// <summary>Drop the pending gapless chain queued with Queue.</summary>
+        public void ClearQueue() { if (_created && Eng != IntPtr.Zero) Bwa.bwa_source_clear_queue(Eng, _src); }
 
         /// <summary>Pause in place — AudioSource.Pause equivalent. Click-free (the engine ramps out
         /// over one block and freezes the playhead); a paused source still reads as IsPlaying.</summary>

@@ -693,10 +693,32 @@ void bwa_source_play_at(bwa_engine* e, bwa_source s, bwa_sound snd, bool loop, u
         return;
     rt_source_play_at(e->rt, s, snd, loop, start_sample);
 }
+void bwa_source_play_loop(bwa_engine* e, bwa_source s, bwa_sound snd, uint64_t loop_beg, uint64_t loop_end) {
+    if (!e) return;
+    if (rt_sound_channels(e->rt, snd) > 1) {
+        set_error(e, "bwa_source_play_loop: asset is multichannel — use bwa_bed_play (or bwa_load_sound for a point source)");
+        return;
+    }
+    if (refuse_push_play(e, s, "bwa_source_play_loop: push source (bwa_source_create_push) — feed it with bwa_source_push"))
+        return;
+    rt_source_play_loop(e->rt, s, snd, loop_beg, loop_end);
+}
 uint64_t bwa_get_dsp_time(bwa_engine* e)                                     { return e ? rt_dsp_time(e->rt) : 0; }
 bool bwa_get_clock(bwa_engine* e, uint64_t* dsp_sample, uint64_t* host_time_ns) { return e ? rt_get_clock(e->rt, dsp_sample, host_time_ns) : false; }
 uint32_t bwa_get_output_latency(bwa_engine* e)                               { return e ? bwa_sink_output_latency(e->sink) : 0; }
 void bwa_source_stop(bwa_engine* e, bwa_source s)                           { if (e) rt_source_stop(e->rt, s); }
+void bwa_source_stop_at(bwa_engine* e, bwa_source s, uint64_t stop_sample)  { if (e) rt_source_stop_at(e->rt, s, stop_sample); }
+void bwa_source_queue(bwa_engine* e, bwa_source s, bwa_sound snd, bool loop) {
+    if (!e) return;
+    if (rt_sound_channels(e->rt, snd) != 1 || rt_sound_is_stream(e->rt, snd)) {   /* in-memory mono only */
+        set_error(e, "bwa_source_queue: asset must be an in-memory mono sound (not a bed/stream/invalid)");
+        return;
+    }
+    if (refuse_push_play(e, s, "bwa_source_queue: push source (bwa_source_create_push) — feed it with bwa_source_push"))
+        return;
+    rt_source_queue(e->rt, s, snd, loop);
+}
+void bwa_source_clear_queue(bwa_engine* e, bwa_source s)                    { if (e) rt_source_clear_queue(e->rt, s); }
 void bwa_source_set_paused(bwa_engine* e, bwa_source s, bool paused)        { if (e) rt_source_set_paused(e->rt, s, paused); }
 void bwa_source_seek(bwa_engine* e, bwa_source s, uint64_t frame)           { if (e) rt_source_seek(e->rt, s, frame); }
 bool bwa_source_is_playing(bwa_engine* e, bwa_source s)                     { return e ? rt_source_is_playing(e->rt, s) : false; }
