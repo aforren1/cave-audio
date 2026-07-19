@@ -38,13 +38,41 @@ if (-not (Get-Command tar -ErrorAction SilentlyContinue)) {
     throw "tar not found on PATH (it ships with Windows 10+ as bsdtar)."
 }
 
+# Derive a dev version from `git describe` for a non-tag pack - the same idea setuptools_scm/hatch-vcs
+# use, adapted to SemVer (UPM's parser, not PEP 440): base tag + commit distance + short hash. So a
+# local or non-tag CI tarball reads e.g. 0.2.0-dev.4.g1a2b3c instead of a flat placeholder. The hash and
+# distance live in the PRERELEASE field (no `+` build metadata, which older UPM parsers dislike). Falls
+# back to $Fallback (the committed placeholder) whenever git can't answer: no matching tag, shallow
+# clone, or git not on PATH.
+function Get-DevVersion {
+    param([string] $Repo, [string] $Fallback)
+
+    if (-not (Get-Command git -ErrorAction SilentlyContinue)) { return $Fallback }
+    # --long: uniform "<tag>-<n>-g<hash>" form even on an exact tag (n=0). --match v*: only release tags.
+    try   { $desc = & git -C $Repo describe --tags --long --dirty --match 'v*' 2>$null }
+    catch { return $Fallback }
+    if ($LASTEXITCODE -ne 0 -or -not $desc) { return $Fallback }
+    $desc = ($desc | Select-Object -First 1).Trim()
+
+    # v0.2.0-4-g1a2b3c[-dirty] -> base (may itself carry a prerelease, e.g. 0.2.0-rc.1), distance, hash.
+    if ($desc -notmatch '^v?(.+?)-(\d+)-g([0-9a-fA-F]+)(-dirty)?$') { return $Fallback }
+    $base = $Matches[1]; $n = [int] $Matches[2]; $hash = $Matches[3]; $dirty = [bool] $Matches[4]
+
+    if ($n -eq 0 -and -not $dirty) { return $base }              # sitting on a clean tag: the release version
+    # Append into the prerelease: '-' if base has none yet, '.' to extend an existing one (rc.1 -> rc.1.dev...).
+    $sep = if ($base -match '-') { '.' } else { '-' }
+    $ver = "$base$sep" + "dev.$n.g$hash"
+    if ($dirty) { $ver += '.dirty' }
+    return $ver
+}
+
 # ---- version -------------------------------------------------------------------------------------
-# The tag (via -Version) wins; the committed manifest is only the fallback for a local dev pack. The
+# The tag (via -Version) wins; otherwise a dev version is derived from git (see Get-DevVersion). The
 # staged package.json is stamped to $pkgVersion below (after it is copied), so the tarball name, the
 # manifest inside it, and this line all agree without the committed file ever being edited.
 $manifest   = Get-Content (Join-Path $pkg 'package.json') -Raw | ConvertFrom-Json
 if ($Version) { $pkgVersion = $Version -replace '^v', '' }   # accept a raw git tag (v0.3.0) or a bare version
-else          { $pkgVersion = $manifest.version }            # dev pack: the placeholder rides through
+else          { $pkgVersion = Get-DevVersion -Repo $repo -Fallback $manifest.version }
 Write-Host "packing $($manifest.name) $pkgVersion"
 
 # ---- the native plugins must be present ----------------------------------------------------------
@@ -159,3 +187,10 @@ $listing | ForEach-Object { Write-Host "  $_" }
 Write-Host ""
 Write-Host "OK -> $tgz"
 Write-Host 'install: Unity, Package Manager, "+", "Install package from tarball..."'
+
+# Expose the packed version to the workflow (for the artifact name). No-op off CI, where the env var is
+# unset. AppendAllText is UTF-8 without a BOM - GITHUB_OUTPUT parsing chokes on the UTF-16 that 5.1's
+# `>>` would write, and on a mid-file BOM; the value is a single ASCII line, so no here-doc is needed.
+if ($env:GITHUB_OUTPUT) {
+    [System.IO.File]::AppendAllText($env:GITHUB_OUTPUT, "version=$pkgVersion`n")
+}

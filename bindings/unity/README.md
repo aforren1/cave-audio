@@ -97,6 +97,10 @@ cmake --build build --config RelWithDebInfo         # produces the DLLs
 powershell -File tools/upm/pack.ps1                 # -> dist/com.brainworks.bw_audio-<version>.tgz
 ```
 
+Without a `-Version`, the local pack derives its version from `git describe` (e.g.
+`0.2.0-dev.32.gcf83c8e` — 32 commits past `v0.2.0`), so a dev tarball is traceable to a commit instead
+of a flat placeholder. Pass `-Version` (or let CI pass the tag) for a release build.
+
 Two things that will bite if forgotten:
 
 - **New file in the package? Run `tools/upm/gen-meta.ps1`.** Every asset must ship a committed `.meta`,

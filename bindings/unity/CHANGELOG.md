@@ -9,8 +9,9 @@ All notable changes to `com.brainworks.bw_audio`.
 - **The git `v*` tag is now the single source of truth for the package version.** `pack.ps1` stamps
   the tag into the packaged `package.json` at build time, replacing the 0.2.0 version/tag guard. The
   committed manifest carries a `0.0.0-dev` placeholder that never needs bumping — cutting a release is
-  pushing a tag (plus this CHANGELOG). No consumer-visible change; the released tarball still carries
-  its real version.
+  pushing a tag (plus this CHANGELOG), and `tools/release.ps1` does both in one step. A non-tag pack
+  derives a SemVer dev version from `git describe` (`0.2.0-dev.<n>.g<hash>`) so dev tarballs stay
+  traceable. No consumer-visible change; the released tarball still carries its real version.
 
 ### Added — gapless chaining
 
