@@ -9,7 +9,10 @@
 #   M3 — wav playback (sound.c + dr_wav via FetchContent) + the retire-ack handshake.
 #   M4 — DBAP spatialization: layout.c (cave_layout.json via cJSON) + dbap.c + align.c.
 cmake_minimum_required(VERSION 3.20)
-project(bw_audio LANGUAGES C VERSION 0.0.1)
+# No project VERSION here: nothing consumes ${PROJECT_VERSION}, and two version streams own the real
+# numbers - the ABI version lives in include/bw_audio.h (BWA_VERSION*, what bwa_get_version returns),
+# and the distribution/release version is the git tag (stamped into the Unity package at pack time).
+project(bw_audio LANGUAGES C)
 
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)

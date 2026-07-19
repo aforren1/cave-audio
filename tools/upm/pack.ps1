@@ -16,13 +16,15 @@
 # tarball is written with `tar`, which ships with Windows 10+ - no Node/npm anywhere in the pipeline.
 #
 #   cmake --build build --config RelWithDebInfo      # produces the DLLs
-#   powershell -File tools/upm/pack.ps1 [-Version 0.2.0] [-OutDir dist]
+#   powershell -File tools/upm/pack.ps1 [-Version 0.3.0] [-OutDir dist]
 #
-# -Version, when given, must MATCH package.json. CI passes the git tag, so a tag/manifest mismatch
-# fails the release instead of publishing a tarball whose version lies about what is inside it.
+# The GIT TAG is the single source of truth for the release version. -Version (CI passes the tag)
+# STAMPS the staged package.json, so the committed manifest is a placeholder (0.0.0-dev) that never
+# needs bumping - you cut a release by pushing a `v*` tag, nothing else. Without -Version (a local
+# dev pack) the placeholder rides through, which is the honest version for an unreleased checkout.
 [CmdletBinding()]
 param(
-    [string] $Version,                 # optional: assert package.json matches (e.g. from a v0.2.0 tag)
+    [string] $Version,                 # optional: stamp this version into the tarball (e.g. from a v0.3.0 tag)
     [string] $OutDir,                  # default: <repo>/dist
     [string] $PluginsFrom              # optional: build dir to take bw_audio.dll + phonon.dll FROM
 )
@@ -37,14 +39,12 @@ if (-not (Get-Command tar -ErrorAction SilentlyContinue)) {
 }
 
 # ---- version -------------------------------------------------------------------------------------
+# The tag (via -Version) wins; the committed manifest is only the fallback for a local dev pack. The
+# staged package.json is stamped to $pkgVersion below (after it is copied), so the tarball name, the
+# manifest inside it, and this line all agree without the committed file ever being edited.
 $manifest   = Get-Content (Join-Path $pkg 'package.json') -Raw | ConvertFrom-Json
-$pkgVersion = $manifest.version
-if ($Version) {
-    $want = $Version -replace '^v', ''            # accept a raw git tag (v0.2.0) or a bare version
-    if ($want -ne $pkgVersion) {
-        throw "version mismatch: tag says '$want', bindings/unity/package.json says '$pkgVersion'. Bump the manifest (and the CHANGELOG) to match the tag."
-    }
-}
+if ($Version) { $pkgVersion = $Version -replace '^v', '' }   # accept a raw git tag (v0.3.0) or a bare version
+else          { $pkgVersion = $manifest.version }            # dev pack: the placeholder rides through
 Write-Host "packing $($manifest.name) $pkgVersion"
 
 # ---- the native plugins must be present ----------------------------------------------------------
@@ -86,6 +86,12 @@ if (Test-Path $stage) { Remove-Item $stage -Recurse -Force }
 New-Item -ItemType Directory $stage -Force | Out-Null
 
 Copy-Item (Join-Path $pkg 'package.json')      $stage
+# Stamp the release version into the STAGED manifest (never the committed one). A targeted regex on the
+# raw text keeps the file's formatting - and the description's embedded \n - byte-for-byte; a
+# ConvertTo-Json round-trip would reflow and re-escape the whole thing. Only the one top-level "version".
+$staged  = Join-Path $stage 'package.json'
+$content = (Get-Content $staged -Raw) -replace '("version"\s*:\s*")[^"]*"', ('${1}' + $pkgVersion + '"')
+[IO.File]::WriteAllText($staged, $content)
 Copy-Item (Join-Path $pkg 'README.md')         $stage
 Copy-Item (Join-Path $pkg 'CHANGELOG.md')      $stage
 Copy-Item (Join-Path $pkg 'package.json.meta') $stage

@@ -43,9 +43,11 @@
 extern "C" {
 #endif
 
-/* Header/DLL version. bwa_get_version() returns the DLL's BWA_VERSION so a client can verify
+/* Header/DLL ABI version. bwa_get_version() returns the DLL's BWA_VERSION so a client can verify
  * the binary matches the header it compiled against (the desc structs grow via reserved fields,
- * but enum VALUES and struct layouts are only guaranteed within a major.minor). */
+ * but enum VALUES and struct layouts are only guaranteed within a major.minor). This tracks ABI
+ * COMPATIBILITY and is bumped by hand only when the ABI changes - it is deliberately independent of
+ * the distribution/release version (the git tag), which moves on its own cadence. */
 #define BWA_VERSION_MAJOR 0
 #define BWA_VERSION_MINOR 9
 #define BWA_VERSION_PATCH 0

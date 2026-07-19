@@ -72,10 +72,20 @@ carries the binaries, or a local path against a built tree.
 
 **The GitHub Release is the distribution** — there's no registry, no token, and nothing to keep in sync.
 
-To cut a release: bump `version` in `package.json` (+ the CHANGELOG), then push a matching tag
-(`v0.2.0`). CI packs on *every* run — so a broken package fails the build rather than the release — and
-on a tag it creates the Release. **The pack fails if the tag and the manifest disagree**, so a tarball
-can't claim a version it isn't.
+To cut a release: fill in the CHANGELOG's `[Unreleased]` section, then run the helper — it rolls that
+heading to the version, commits, and creates the matching annotated tag:
+
+```
+powershell -File tools/release.ps1 0.3.0            # roll CHANGELOG, commit, tag v0.3.0 (no push)
+powershell -File tools/release.ps1 0.3.0 -DryRun    # preview the roll; change nothing
+powershell -File tools/release.ps1 0.3.0 -Push      # ...and push, which triggers the CI release
+```
+
+**The tag is the version** — CI stamps it into the packaged `package.json`, so there's no manifest
+field to bump and nothing to keep in sync (the committed `version` stays `0.0.0-dev`, the honest value
+for an unreleased checkout). Prefer `git tag v0.3.0` by hand? That works too; the helper just also does
+the CHANGELOG roll. CI packs on *every* run — so a broken package fails the build rather than the
+release — and on a tag it creates the Release with the stamped version.
 
 A release carries **two** assets: this package (`com.brainworks.bw_audio-<ver>.tgz`) and the engine on
 its own (`bw_audio-win64-<tag>.zip` — dll/lib/header/tools, for C/C++ consumers and the CAVE machine).

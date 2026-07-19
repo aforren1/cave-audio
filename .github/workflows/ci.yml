@@ -218,8 +218,9 @@ jobs:
           Get-Content dist/DIST.txt
 
       # The Unity package. Packed on EVERY run (not just tags) so a broken package - a missing .meta,
-      # a version/tag mismatch, a tarball that somehow lost its DLLs - fails the build rather than the
-      # release. It goes in its OWN folder (dist/unity), because engine consumers and Unity consumers
+      # a tarball that somehow lost its DLLs - fails the build rather than the release. On a tag the
+      # version is stamped from that tag (TAG below); off a tag it packs the 0.0.0-dev placeholder.
+      # It goes in its OWN folder (dist/unity), because engine consumers and Unity consumers
       # want different things and the release below ships them as separate assets.
       - name: Pack UPM package
         shell: pwsh
@@ -231,7 +232,7 @@ jobs:
           # NB: splat a HASHTABLE, not an array. Array splatting binds POSITIONALLY, so '-PluginsFrom'
           # would land in $Version and the trailing value would have no parameter left to bind to.
           $a = @{ PluginsFrom = 'build/RelWithDebInfo'; OutDir = 'dist/unity' }
-          if ($env:TAG) { $a.Version = $env:TAG }           # tag must match package.json, or this fails
+          if ($env:TAG) { $a.Version = $env:TAG }           # the tag is the version; pack stamps it into the manifest
           ./tools/upm/pack.ps1 @a
 
       # Two artifacts, not one bag: the engine (native consumers - the C ABI, the tools, the CAVE
