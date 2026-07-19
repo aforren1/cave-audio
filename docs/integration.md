@@ -146,7 +146,7 @@ The snippet shows the core calls. The shipped `Bwa.cs` binds the ABI **1:1**. Ev
   occlusion; **works without the Steam Audio build**),
   `bwa_source_set_directivity` (+ preset), `bwa_source_set_orientation`.
 - **Reflections + pathing**: `bwa_reflections_config`, `bwa_reverb_set_gain`,
-  `bwa_source_set_reverb` / `_reflection_send` / `_reflection_distance`,
+  `bwa_source_set_reverb` / `_reverb_send` / `_reverb_distance`,
   `bwa_source_set_pathing` (engine-level enable rides `bwa_desc.enable_pathing`);
   the phonon-free **FDN reverb** (`bwa_fdn_config`).
 - **Ambisonic beds**: the full `bwa_bed_*` facade (`create` / `play` / `set_gain` /

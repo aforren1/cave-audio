@@ -27,8 +27,8 @@ flowchart TD
   SOLVE["gain solve: compute_gains (block rate, dirty-gated)<br/>panner_gains → dbap_gains / spcap_gains / vbap_gains →<br/>per-source atten override (by ratio, atten_curve) →<br/>spread: spread_gains (LOBE) / mdap_gains / fs_solve (SPECTRAL);<br/>anisotropic w×h extent (up-anchored frame + affine squash)<br/><i>bwa_set_panner · _dual_band · _spread_mode · _near_spread ·<br/>_extra_listeners · bwa_source_set_spread / _extent / _size / _gain /<br/>_attenuation_override · bwa_group_set_gain · bwa_source_fade_to</i>"]
 
   subgraph VOICE["mono voice: mix_voice, per sample (inside rt_render)"]
-    READ["read: pcm cursor · pitch resample · stream_pull<br/><i>bwa_source_play / _play_at · bwa_source_set_pitch</i>"]
-    GATE["× pause / seek gate (pause_gate)<br/><i>bwa_source_set_paused · _seek · bwa_set_paused · stops/steals</i>"]
+    READ["read: pcm cursor · pitch resample · stream_pull<br/><i>bwa_source_play / _play_at / _play_loop / _queue · bwa_source_set_pitch</i>"]
+    GATE["× pause / seek gate (pause_gate)<br/><i>bwa_source_set_paused · _seek · _stop_at · bwa_set_paused · stops/steals</i>"]
     TEQ["transmission EQ (3 biquads - occlusion's tilt)<br/>coeffs from the scene sim's publish"]
     OCC["× occlusion level × directivity<br/>gated on the voice's own generation"]
     PROP["air-absorption LP → loudness shelf → Doppler ring<br/><i>bwa_source_set_air_absorption · _loudness_comp · _doppler</i>"]
@@ -51,7 +51,7 @@ flowchart TD
 
   GATE -. "s_raw → bending-loss EQ → × shCoeffs<br/><i>bwa_source_set_pathing</i>" .-> PACC
   PATHS -.-> PACC
-  OCC -. "× wet send (× distance)<br/><i>bwa_source_set_reverb · _reflection_send · _reflection_distance</i>" .-> AUX
+  OCC -. "× wet send (× distance)<br/><i>bwa_source_set_reverb · _reverb_send · _reverb_distance</i>" .-> AUX
   OCC -. "ISM: 6 shoebox mirror images (ism_images);<br/>frac delay · HF damp · per-image panner_gains<br/><i>bwa_source_set_early_reflections · bwa_scene_set_box ·<br/>bwa_early_reflections_set_gain</i>" .-> BUS
   PROP -. "decor split × √spread<br/><i>bwa_set_decorrelation</i>" .-> DECOR
   PAN --> BUS
