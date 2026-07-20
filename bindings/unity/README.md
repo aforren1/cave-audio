@@ -70,6 +70,9 @@ carries the binaries, or a local path against a built tree.
 
 ## Releasing (maintainers)
 
+The canonical whole-repo release process (version model, steps, dev versions) lives in
+[docs/build.md → Releasing](../../docs/build.md#releasing). This is the Unity-package view of it.
+
 **The GitHub Release is the distribution** — there's no registry, no token, and nothing to keep in sync.
 
 To cut a release: fill in the CHANGELOG's `[Unreleased]` section, then run the helper — it rolls that

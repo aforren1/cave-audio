@@ -162,6 +162,45 @@ compiles or links it, and it stays out of anything distributed. It also lets the
 read pose itself (`bwa_tracker_connect`) and sample the freshest head pose at
 audio-callback time, lower-latency than marshaling pose through the engine each frame.
 
+## Releasing
+
+The **git tag is the single source of truth for the release version.** You cut a release by
+pushing a `v*` tag; nothing else carries a version to bump. Two version streams stay separate,
+on purpose:
+
+- **Release version:** the tag (`v0.3.0`). `tools/upm/pack.ps1` stamps it into the packaged
+  `package.json` at build time, so the committed manifest is a permanent `0.0.0-dev` placeholder.
+  Nothing to keep in sync.
+- **ABI version:** `BWA_VERSION_*` in `include/bw_audio.h`, what `bwa_get_version()` returns. It
+  tracks binary compatibility (struct and enum layout) and moves only when the ABI changes. Bump it
+  by hand, independent of any release.
+
+### Steps
+
+1. **Fill in the CHANGELOG.** Entries land under `## [Unreleased]` in
+   `bindings/unity/CHANGELOG.md` as features merge.
+2. **Cut it:** `powershell -File tools/release.ps1 0.3.0`. The helper validates the version,
+   refuses if the tag already exists or the tree is dirty or `[Unreleased]` is empty, rolls
+   `## [Unreleased]` to `## [0.3.0]` (leaving a fresh empty `[Unreleased]`), commits that, and
+   creates an annotated `v0.3.0` tag. `-DryRun` previews the roll and changes nothing; `-Push` also
+   pushes.
+3. **Push:** `git push --follow-tags`. The tag triggers the CI release job.
+
+Prefer to tag by hand? `git tag v0.3.0` works; the helper's only extra service is the CHANGELOG roll.
+
+The tag builds, tests, stamps the version, and cuts a **GitHub Release** with three assets. The
+Release IS the distribution: no registry, no token. The asset breakdown and the GPLv3 corresponding
+source that rides along are in [Continuous integration](#continuous-integration) below.
+
+### Dev versions
+
+A non-tag build has no tag to stamp, so `pack.ps1` derives the version from `git describe`: the base
+tag, the commit distance, and the short hash, as SemVer for UPM (`0.2.0-dev.4.g1a2b3c`; a dirty tree
+adds `.dirty`). So a `main` push, a PR, or a local `pack.ps1` run labels itself to a commit instead of
+a flat placeholder. The hash and distance sit in the prerelease field, not `+build` metadata, which
+older UPM parsers reject. When git cannot answer (no tag, shallow clone, no git on `PATH`) it falls
+back to the manifest's `0.0.0-dev`.
+
 ## Continuous integration
 
 `.github/workflows/ci.yml` builds and tests on `windows-latest`, and doubles as the
@@ -204,16 +243,19 @@ distribution channel:
   plugin staging both copy it for you. Only a no-SDK build is self-contained (with
   the simple-pan binaural fallback and acoustics calls as no-ops).
 - **Two audiences, two artifacts.** Every run uploads them separately: the engine
-  (`bw_audio-win64-r<N>`: dll/lib/pdb + phonon + tools + header) and the Unity package
-  (`unity-package-r<N>`: one `.tgz`). Downloading one no longer drags in the other.
+  (`bw_audio-win64-<ver>-r<N>`: dll/lib/pdb + phonon + tools + header) and the Unity package
+  (`unity-package-<ver>-r<N>`: one `.tgz`). `<ver>` is the packed version (the tag on a release,
+  a git-describe dev version otherwise); the `r<N>` run number keeps re-runs of one commit from
+  colliding on a name. Downloading one no longer drags in the other.
 - **The Unity package is packed every run, and released on a tag.**
   `tools/upm/pack.ps1` produces `com.brainworks.bw_audio-<version>.tgz`, the C#
   binding with both DLLs inside it, so a broken package (a missing `.meta`, a lost
   plugin) fails the *build*, not a release. A `v*` tag then cuts a GitHub Release, and
   **the Release is the distribution**: there is no registry, no token, nothing to keep
   in sync. Unity installs the tarball directly (Package Manager → `+` → *Install
-  package from tarball…*). The tag must match `bindings/unity/package.json`, or the
-  pack fails—so a tarball can never claim a version it isn't.
+  package from tarball…*). The tag stamps the version into the packaged manifest (the committed
+  `package.json` stays `0.0.0-dev`), so a tarball can never claim a version it isn't and there is no
+  manifest field to bump. See [Releasing](#releasing) for the maintainer steps.
 - **A release carries THREE assets**, because workflow artifacts expire (30 days) and a
   release doesn't:
   - `com.brainworks.bw_audio-<ver>.tgz`: the Unity package.
