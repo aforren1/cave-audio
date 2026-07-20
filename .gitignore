@@ -56,6 +56,9 @@ bindings/unity/**/obj/
 /cave_layout.json
 /constraints.json
 
+# screen capture output from tests
+output/*
+
 # playground scratch (the demo generates this at startup, removes it on clean exit)
 playground_src.wav
 
