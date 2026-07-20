@@ -4,6 +4,8 @@ All notable changes to `com.brainworks.bw_audio`.
 
 ## [Unreleased]
 
+- Updated build docs.
+
 ## [0.3.0]
 
 ### Changed — release versioning
