@@ -4,6 +4,8 @@ All notable changes to `com.brainworks.bw_audio`.
 
 ## [Unreleased]
 
+## [0.3.0]
+
 ### Changed — release versioning
 
 - **The git `v*` tag is now the single source of truth for the package version.** `pack.ps1` stamps
