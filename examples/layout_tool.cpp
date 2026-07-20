@@ -78,7 +78,6 @@
 #define NSPK_MIN       4          /* the engine's layout loader accepts 4..NSPK speakers */
 #define SR             48000u
 #define SPEED_OF_SOUND 343.0f
-#define TEST_GAIN      0.4f
 #define PANEL_W        300.0f     /* control panel width (right side), in unscaled UI px */
 
 typedef struct { Vector3 pos; float gain_db; } Spk;
@@ -558,6 +557,7 @@ static bool CheckboxInt(const char* label, int* v) {
 
 static char  g_path[512] = "cave_layout.json";      /* save/load target (panel-editable) */
 static int   sel = 0, tone_on = 0, tone_kind = BWA_TEST_SINE, driven = -1;
+static float g_test_gain = 0.15f;                   /* test-signal output level (linear); panel slider, live */
 static int   fps_view = 0;                          /* first-person view from the observer's ears (H) */
 static float fps_yaw = 0.0f, fps_pitch = 0.0f, fps_fov = 75.0f;   /* yaw 0 = +z, the room's default facing */
 static float cam_yaw = 45.0f * DEG2RAD, cam_pitch = 30.0f * DEG2RAD, cam_dist = 9.0f;
@@ -731,7 +731,7 @@ static void drive_tone(void) {
     if (!audio || preview) return;
     if (tone_on) {
         if (driven >= 0 && driven != sel) bwa_set_test_signal(e, (uint32_t)driven, BWA_TEST_OFF, 0.0f);
-        bwa_set_test_signal(e, (uint32_t)sel, (bwa_test_kind)tone_kind, TEST_GAIN);
+        bwa_set_test_signal(e, (uint32_t)sel, (bwa_test_kind)tone_kind, g_test_gain);
         driven = sel;
     } else if (driven >= 0) {
         bwa_set_test_signal(e, (uint32_t)driven, BWA_TEST_OFF, 0.0f);
@@ -1008,6 +1008,10 @@ static void draw_panel(void) {
     { bool nb = tone_kind == BWA_TEST_NOISE;
       if (ImGui::Checkbox("noise [N]", &nb)) tone_kind = nb ? BWA_TEST_NOISE : BWA_TEST_SINE; }
     bwTip("test-signal type; noise is easier to localize by ear than a sine");
+    ImGui::SliderFloat("tone gain", &g_test_gain, 0.0f, 1.0f, "%.3f");
+    bwTip("test-signal output level (linear). It is injected AFTER align, so the per-speaker gain trim "
+          "above does NOT affect it - this is the only in-app control; the amps/Dante set room SPL. "
+          "Keep it modest (old fixed value was 0.4).");
     if (ImGui::Button("Snap all to constraints [K]", ImVec2(-1, 0))) do_snap();
     bwTip("project every speaker to its nearest allowed point: inside bounds, out of no-go and "
           "solid boxes (constraints.json next to the layout); y >= 0 always");
