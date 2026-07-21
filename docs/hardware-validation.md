@@ -7,10 +7,13 @@ assumes the one before it passed.
 
 What only the rig can prove:
 
-- the **ASIO full-duplex capture** (`bwa_calibrate` compiles but is unverified on hardware),
+- the **ASIO full-duplex capture**, in both tools (`calib_capture.cpp` for the sweep,
+  `valid_capture.cpp` for the phantom measurement). Both compile and both are unverified on
+  hardware; everything they feed is unit-tested,
 - **live Motive** (the NatNet parser + lifecycle are tested off-wire; real pose reception and
   the Motive-origin → room-frame agreement are not),
-- the **Zylia channel order + azimuth reference** (both survive every off-hardware check),
+- the **Zylia channel order + azimuth reference** (both survive every off-hardware check, and
+  both produce a confident *wrong* direction if they are wrong),
 - the **by-ear checks** (HRTF quality, the A/B/X knob bake-off, room EQ on the array).
 
 ## Before you go
@@ -26,7 +29,23 @@ What only the rig can prove:
       Dante endpoints commonly halve their channel count at 96 kHz.
 - [ ] **Kit**: omnidirectional measurement mic routed into the same ASIO device (it rides
       input slot `n`, the speaker count), tape measure + install drawings, headphones,
-      `examples/cave_layout.json` as the starting layout. Optional: the Zylia ZM-1.
+      `examples/cave_layout.json` as the starting layout. The **Zylia ZM-1** if you intend
+      Stage 4b, which needs it.
+- [ ] **ZM-1 mount, if you are tracking it** (strongly recommended, see Stage 4b). This is
+      *physical* prep that has to happen before rig day, not something the software can
+      arrange later:
+      - a **rigid** stand, and a rigid coupling. **No shock mount**—elastic suspension is
+        normal for microphones and exactly wrong here, because you are propagating an
+        orientation through the mount.
+      - markers on the **stand**, not the sphere (nothing acoustically scattering on the
+        array), defined as a rigid body in Motive with its streaming ID noted.
+      - **probe the offset** from the stand's body origin to the array's acoustic centre.
+        For a rigid sphere that centre is unambiguously the geometric centre, so a Motive
+        probe on a few equator points plus the pole settles it. Aim for a centimetre or
+        better: at Stage 4b's 1.4 m source radius, 5 cm of position error injects ~2° of
+        direction error, which is the size of the effect being measured.
+      - **witness-mark the collar** and do not loosen it after surveying. A quarter turn on
+        the thread is 90° of azimuth error and nothing downstream will notice.
 - [ ] **Motive**: streaming enabled (defaults: multicast `239.255.42.99`, data 1511,
       command 1510), a rigid body on the tracked head; note its **streaming ID** and name.
       Ground-plane calibrate with the origin at the **working-area centre, on the floor**:
@@ -40,7 +59,11 @@ bwa_calibrate --list-drivers        (or bwa_playground --list-drivers)
 ```
 
 - [ ] The Digiface's ASIO driver is listed with ≥ your layout's speaker count of outputs (26 for
-      the CAVE), plus one input for the mic when calibrating.
+      the CAVE), plus one input for the mic when calibrating—or **19 inputs** for Stage 4b,
+      which needs the whole ZM-1 on the same device. A device exposing fewer than 19 is
+      refused outright rather than fed silent channels.
+- [ ] Note the driver's **exact name** from this listing. RME registers under its own string,
+      which is not the product name; nothing should hardcode a guess at it.
 - [ ] `bwa_minimal` runs and prints `backend: asio`, not the null fallback. The null sink
       keeps everything rendering silently, so a wrong driver *looks* alive—always check
       `bwa_get_audio_backend`.
@@ -122,7 +145,18 @@ Two things no off-hardware test can catch; resolve both on the rig:
 - [ ] Better: run the **capsule self-survey** (Zylia tab → Capsule survey): claps from ≥ 6
       known positions, high and low (coplanar claps are refused: heights would be
       unconstrained). Solve → residual sub-µs, radius ≈ 49 mm → Install → Save. The result
-      *is* the channel order and orientation; re-survey if the unit or mount changes.
+      *is* the channel order and orientation.
+- [ ] **If you are tracking the stand, save the survey in BODY frame.** A room-axes survey
+      is pinned to the orientation it was taken at, so every remount invalidates it, and
+      `bwa_validate --track` refuses one. Sample the stand's pose at survey time, rotate the
+      result into the mount's frame, and save it with the probed offset. Then the survey is
+      good for every placement afterwards and a remount costs nothing—which is the whole
+      reason to bother with the stand. See [validation.md](validation.md).
+
+**Do this before Stage 4b, not after.** Everything downstream reads the capsule table, so an
+unsurveyed or wrongly-oriented ZM-1 produces precise, confident, systematically wrong
+directions for a whole session. It is the one prerequisite that silently invalidates
+everything rather than failing.
 
 `--zylia` sweeps need the ZM-1 on Dante (one ASIO device for outs + capsules); see
 [calibration.md](./calibration.md), "Getting the ZM-1 onto Dante".
@@ -193,9 +227,19 @@ Needs the ZM-1 on the same ASIO device as the 26 outputs (Dante Via, same unlock
 sweep path). Cheap in rig time: only the microphone moves, and one placement sweeps every
 direction electronically.
 
+**Prerequisite: the capsule survey (Stage 2) is done.** Not optional. Everything here reads
+that table.
+
 - [ ] **Dry run first**: `bwa_validate --layout cave_layout.json --simulate`. No hardware,
       and it gives you the rendering-term baseline the room will then add to. Do this while
       you're still authoring the layout, not on rig day.
+- [ ] **Write your placements down**: `--positions mics.txt` (one `x y z [label]` per line)
+      or repeated `--position x,y,z`. The built-in envelope is a plausible guess, not your
+      room. Labels come back in the report and the CSV, which matters past about four.
+- [ ] **Prove the integrity layer on your own signals**: one run with `--inject-fault <ch>`.
+      It corrupts that capsule in every capture and exits nonzero unless the check catches
+      it, so it exercises the check, the reporting and the exclusion threading against your
+      real room and noise floor rather than a model of them. Costs one extra run.
 - [ ] **Capsule health**: the tool checks once per placement and reports anything faulty.
       A *hot* capsule is the one to watch: array power still looks fine while every
       spherical-harmonic channel is poisoned. Note every exclusion in the log—a direction
@@ -203,8 +247,12 @@ direction electronically.
 - [ ] **Sweet spot**: `bwa_validate --driver <name> --mic-in <n>`, first placement at the
       listening point. Broadband miss here is the floor for everything else. If it's large,
       stop and re-check the layout and trims before collecting more cells.
-- [ ] **The walking envelope**: work through the placements the tool prompts for. *Measure*
-      each mic position; it's an input to the scoring, not a label.
+- [ ] **The walking envelope**: work through the placements. If the stand is tracked, add
+      `--track <id> --survey <body-frame survey>` and the pose supplies both the position and
+      the mount orientation; your typed placements become the plan, and the tool prints
+      tracked-versus-planned with the delta so a wrong rigid body shows up immediately.
+      Without tracking, *measure* each position properly: it is an input to the scoring, not
+      a label, and centimetres here are degrees in the result.
 - [ ] **Read the tracked-versus-fixed contrast**: this is the measurement that justifies
       tracking at all, and it's invisible from the sweet spot. Intervals that exclude zero
       are the claim.
