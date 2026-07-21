@@ -168,6 +168,34 @@ synthesizing the 19 arrivals from a known position and recovering it to machine 
   (~7 mm per sample). Fuse with the omni `--localize` when you want both the one-shot directions and
   a sub-mm distance.
 
+### The ZM-1's second job: measuring phantoms
+
+Everything above uses the ZM-1 to find **speakers**, from a transient, by arrival times. The same
+array also answers a different question: when the array *renders* a source, where does it actually
+end up? That needs a different estimator, because a phantom has no arrival time of its own—it is the
+summed output of many speakers—so the direction has to come out of continuous content.
+
+`zylia.c` carries both. They share the capsule table, the survey, and the capture rig:
+
+| | `zylia_doa` / `zylia_localize` | `zylia_intensity_doa` |
+| --- | --- | --- |
+| reads | arrival-time differences | active intensity per frequency bin |
+| needs | a transient (sweep, clap) | continuous content |
+| answers | where are my speakers | where did the array put this sound |
+| band | broadband | 400–1200 Hz (`kr ≈ 1` on a 49 mm sphere) |
+
+Two supporting pieces come with it, both worth knowing about even if you only ever run the survey:
+
+- **`zylia_check_capsules`** flags dead, hot, clipped, and incoherent capsules against the array's own
+  robust median. A capsule that goes *hot* is the dangerous case: total array power still looks
+  healthy while every spherical-harmonic channel is poisoned, because each one is a weighted sum over
+  all capsules. Two estimators agreeing does not clear it. Run this before believing any direction.
+- **`zylia_srp_doa`** is an independent steered-power cross-check, reaching `kr ≈ 3` at order 3.
+  Coarser than the intensity solve, so use it to check a number rather than to be one.
+
+The measurement workflow built on these is its own tool and its own doc: see
+[validation.md](validation.md) and `bwa_validate`.
+
 **Spatial room capture** *(design, not implemented; nothing consumes `er_delay` directionally yet)*
 rides the same 19-channel sweep with no new DSP. `--room` already finds each
 early reflection's *time* (`er_delay`); window the 19-ch IR around each one and run `zylia_doa` on

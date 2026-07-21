@@ -24,6 +24,37 @@ static void synth(const float center[3], const double src[3], double latency, do
     }
 }
 
+/* Coherent band-limited field at the 19 capsules for a source at `src`: a sum of tones, delayed
+ * EXACTLY per capsule — a tone delays by a phase shift, so there is no interpolation error anywhere
+ * in this forward model. It deliberately shares NOTHING with the frequency-domain estimators it
+ * feeds: no spherical harmonics, no mode strengths, no FFT convention. See the long note at the
+ * intensity-DOA tests for why that independence is the whole point. */
+#define FIELD_N 8192
+static void synth_field(const float center[3], const double src[3], double c, double fs,
+                        float buf[ZYLIA_MICS][FIELD_N], uint32_t n, const double* phase, int nt) {
+    float dirs[ZYLIA_MICS][3], R;
+    zylia_geometry(dirs, &R);
+    for (int ch = 0; ch < ZYLIA_MICS; ++ch) {
+        double mx = center[0] + R*dirs[ch][0], my = center[1] + R*dirs[ch][1], mz = center[2] + R*dirs[ch][2];
+        double dx = mx - src[0], dy = my - src[1], dz = mz - src[2];
+        double tau = sqrt(dx*dx + dy*dy + dz*dz) / c;
+        for (uint32_t i = 0; i < n; ++i) {
+            double tt = (double)i / fs - tau, v = 0.0;
+            for (int j = 0; j < nt; ++j) {
+                double fj = 420.0 + (1150.0 - 420.0) * (double)j / (double)(nt - 1);
+                v += sin(6.283185307179586 * fj * tt + phase[j]);
+            }
+            buf[ch][i] = (float)(v / nt);
+        }
+    }
+}
+
+/* great-circle angle (deg) between two unit vectors. */
+static double ang_deg(const float a[3], const double b[3]) {
+    double d = (double)a[0]*b[0] + (double)a[1]*b[1] + (double)a[2]*b[2];
+    return acos(fmax(-1.0, fmin(1.0, d))) * 180.0 / 3.14159265358979;
+}
+
 /* ---- the capsule table is a vertex-up dodecahedron minus its nadir vertex ----
  *
  * Worth being clear about what this can and cannot do. Every OTHER test in this file synthesizes its
@@ -374,6 +405,254 @@ int main(void) {
             ptr[chn] = buf[chn];
         }
         CHECK(!zylia_tdoa(ptr, N, FS, 32, arr_est), "steady noise (no transient) is rejected");
+    }
+
+    /* ---- validation-grade DOA: first-order active intensity (zylia_intensity_doa) ----
+     *
+     * READ THIS BEFORE ADDING A TEST HERE. The obvious way to test this estimator is to synthesize
+     * capsule pressures from the rigid-sphere SH model it inverts. Do not: that model IS the
+     * estimator's own assumption, so a conjugated Hankel function, a flipped FFT sign convention or a
+     * swapped axis appears on both sides and CANCELS EXACTLY — the same trap the capsule table has
+     * (see test_geometry). It would pass while pointing backwards on hardware.
+     *
+     * So the forward model below is a pure GEOMETRIC DELAY: a band-limited source, sampled at each
+     * capsule's exact arrival time. It shares nothing with the estimator — no spherical harmonics, no
+     * mode strengths, no FFT convention. It is free-field rather than a scattering sphere, and that
+     * mismatch is deliberately harmless: a wrong RADIAL model is one complex scalar per DEGREE, and
+     * all three first-order components share a degree, so it can scale or flip the intensity vector
+     * but CANNOT rotate it. Which makes this exactly the check worth having — it is blind to the
+     * modelling approximation and maximally sensitive to a sign error, the failure that matters.
+     */
+    {
+        const double FS = 48000.0;
+        enum { NS = 8192, NT = 24 };                  /* 4 frames of 2048 at 50% hop; 24 tones in band */
+        static float ibuf[ZYLIA_MICS][NS];
+        const float* iptr[ZYLIA_MICS];
+
+        double phase[NT];
+        unsigned int rng = 20260721u;
+        for (int j = 0; j < NT; ++j) {
+            rng = rng * 1664525u + 1013904223u;
+            phase[j] = ((double)(rng >> 8) / (double)(1u << 24)) * 6.283185307179586;
+        }
+
+        struct { double pos[3]; const char* name; } icases[] = {
+            {{  2.5,  1.2,  0.0 }, "int right"},
+            {{ -2.0,  1.2, -1.5 }, "int front-left"},
+            {{  0.0,  1.2, -2.5 }, "int front"},
+            {{  0.3,  3.0,  0.2 }, "int overhead"},
+            {{ -0.5,  1.0,  2.6 }, "int behind"},
+        };
+        for (int t = 0; t < 5; ++t) {
+            double tx = icases[t].pos[0]-center[0], ty = icases[t].pos[1]-center[1], tz = icases[t].pos[2]-center[2];
+            double tn = sqrt(tx*tx + ty*ty + tz*tz); tx/=tn; ty/=tn; tz/=tn;
+
+            synth_field(center, icases[t].pos, C, FS, ibuf, NS, phase, NT);
+            for (int chn = 0; chn < ZYLIA_MICS; ++chn) iptr[chn] = ibuf[chn];
+
+            float d[3], psi = -1.0f;
+            int ok = zylia_intensity_doa(iptr, NS, FS, C, 400.0, 1200.0, NULL, d, &psi);
+            double dot = ok ? d[0]*tx + d[1]*ty + d[2]*tz : -1.0;
+            double deg = acos(fmax(-1.0, fmin(1.0, dot))) * 180.0 / 3.14159265358979;
+            printf("[%-14s] intensity doa err=%.2f deg  diffuseness=%.3f\n", icases[t].name, deg, psi);
+            CHECK(ok && deg < 1.5, "active-intensity DOA recovers a coherent source");
+            /* Not ~0, and that is the forward model rather than the estimator: diffuseness compares
+             * |V| against |W|, which is exactly the ratio a free-field source read through a
+             * rigid-sphere inversion gets wrong. Direction is immune to that (one scalar per degree
+             * cannot rotate the vector); this is the one output that is not. On a real sphere it
+             * sits lower. Kept as a floor/ceiling check, not a precision one. */
+            CHECK(ok && psi < 0.35f, "a coherent source reads as low diffuseness");
+        }
+
+        /* CROSS-ESTIMATOR AGREEMENT — the load-bearing check. Same click, two estimators that share
+         * no physics: TDOA reads arrival ORDER in the time domain, intensity reads a spectral phase
+         * relationship. A sign/convention error in the intensity path flips it ~180 deg away from a
+         * TDOA answer that cannot be wrong about which side the sound came from. */
+        {
+            const double SIGMA = 3.0e-4;                 /* wider click: energy down in the 400-1200 band */
+            static float cbuf[ZYLIA_MICS][NS];
+            const float* cptr[ZYLIA_MICS];
+            double arr_true[ZYLIA_MICS], arr_est[ZYLIA_MICS];
+            double cpos[3] = { 1.8, 1.1, -1.9 };
+            synth(center, cpos, 0.0030, C, arr_true);
+            for (int chn = 0; chn < ZYLIA_MICS; ++chn) {
+                double t0 = 0.040 + arr_true[chn];
+                for (int i = 0; i < NS; ++i) {
+                    double td = (double)i / FS - t0;
+                    cbuf[chn][i] = (float)exp(-0.5 * (td / SIGMA) * (td / SIGMA));
+                }
+                cptr[chn] = cbuf[chn];
+            }
+            float di[3], dt[3];
+            int oki = zylia_intensity_doa(cptr, NS, FS, C, 400.0, 1200.0, NULL, di, NULL);
+            int okt = zylia_tdoa(cptr, NS, FS, 32, arr_est) && zylia_doa(arr_est, dt);
+            double dot = (oki && okt) ? di[0]*dt[0] + di[1]*dt[1] + di[2]*dt[2] : -1.0;
+            double deg = acos(fmax(-1.0, fmin(1.0, dot))) * 180.0 / 3.14159265358979;
+            printf("[cross-check   ] intensity vs tdoa disagreement = %.2f deg\n", deg);
+            CHECK(oki && okt && deg < 1.5, "intensity DOA agrees with the independent TDOA estimator");
+        }
+
+        /* A field with no coherent direction must not yield a confident one. Independent noise per
+         * capsule is the extreme case: the intensity vector averages to nothing, diffuseness -> 1. */
+        {
+            for (int chn = 0; chn < ZYLIA_MICS; ++chn) {
+                for (int i = 0; i < NS; ++i) {
+                    rng = rng * 1664525u + 1013904223u;
+                    ibuf[chn][i] = (float)((double)(int)(rng >> 9) / (double)(1 << 22) - 1.0);
+                }
+                iptr[chn] = ibuf[chn];
+            }
+            float d[3], psi = -1.0f;
+            int ok = zylia_intensity_doa(iptr, NS, FS, C, 400.0, 1200.0, NULL, d, &psi);
+            printf("[diffuse       ] incoherent field diffuseness=%.3f\n", ok ? psi : -1.0f);
+            CHECK(ok && psi > 0.9f, "an incoherent field reads as highly diffuse");
+        }
+
+        /* Band discipline: a request lying entirely above the first-order ceiling is REFUSED, not
+         * silently clamped into a band the array cannot resolve (the 6 kHz tone the paper drops). */
+        {
+            float d[3];
+            CHECK(!zylia_intensity_doa(iptr, NS, FS, C, 5000.0, 7000.0, NULL, d, NULL),
+                  "a band above the kr~1 ceiling is refused");
+            CHECK(!zylia_intensity_doa(iptr, 1024, FS, C, 400.0, 1200.0, NULL, d, NULL),
+                  "fewer samples than one analysis frame is refused");
+        }
+    }
+
+    /* ---- signal integrity + the independent SRP-PHAT cross-check ---- */
+    {
+        const double FS = 48000.0;
+        enum { NS = FIELD_N, NT = 24 };
+        static float sbuf[ZYLIA_MICS][NS], wbuf[ZYLIA_MICS][NS];
+        const float* sptr[ZYLIA_MICS];
+        const float* wptr[ZYLIA_MICS];
+        unsigned char flags[ZYLIA_MICS];
+        double phase[NT];
+        unsigned int rng = 13571113u;
+        for (int j = 0; j < NT; ++j) {
+            rng = rng * 1664525u + 1013904223u;
+            phase[j] = ((double)(rng >> 8) / (double)(1u << 24)) * 6.283185307179586;
+        }
+        double spos[3] = { 2.2, 1.4, -1.3 }, truth[3];
+        {
+            double tx = spos[0]-center[0], ty = spos[1]-center[1], tz = spos[2]-center[2];
+            double tn = sqrt(tx*tx + ty*ty + tz*tz);
+            truth[0] = tx/tn; truth[1] = ty/tn; truth[2] = tz/tn;
+        }
+        synth_field(center, spos, C, FS, sbuf, NS, phase, NT);
+        for (int ch = 0; ch < ZYLIA_MICS; ++ch) sptr[ch] = sbuf[ch];
+
+        double healthy_rms = 0.0;
+        for (int i = 0; i < NS; ++i) healthy_rms += (double)sbuf[0][i] * sbuf[0][i];
+        healthy_rms = sqrt(healthy_rms / NS);
+
+        int nbad = zylia_check_capsules(sptr, NS, flags);
+        printf("[integrity     ] healthy capture: %d faulty capsules\n", nbad);
+        CHECK(nbad == 0, "a healthy capture flags nothing (no false positives)");
+
+        /* SRP-PHAT on the same clean field. Steered power vs an intensity phase relationship: two
+         * estimators that fail differently, which is the only reason a cross-check is worth anything. */
+        {
+            float ds[3], di[3];
+            int oks = zylia_srp_doa(sptr, NS, FS, C, 400.0, 1200.0, NULL, ds);
+            int oki = zylia_intensity_doa(sptr, NS, FS, C, 400.0, 1200.0, NULL, di, NULL);
+            double dd[3] = { di[0], di[1], di[2] };
+            double es = oks ? ang_deg(ds, truth) : 999.0;
+            double ei = oki ? ang_deg(di, truth) : 999.0;
+            double dis = (oks && oki) ? ang_deg(ds, dd) : 999.0;
+            printf("[srp-phat      ] srp err=%.2f deg  intensity err=%.2f deg  disagreement=%.2f deg\n",
+                   es, ei, dis);
+            CHECK(oks && es < 4.0, "SRP-PHAT recovers the source (grid-limited, ~2 deg)");
+            CHECK(oks && oki && dis < 4.0, "SRP-PHAT and active intensity agree");
+        }
+
+        /* THE fault this layer exists for, and the reason a cross-check alone is not enough. One
+         * capsule goes hot with broadband self-noise: total array power still looks healthy, every
+         * other capsule is fine, and the direction is poisoned anyway — because every SH channel is a
+         * weighted sum over ALL capsules. Both estimators are corrupted IDENTICALLY, so they would
+         * agree with each other and both be wrong. Only the raw-signal check catches it. */
+        {
+            const int BADCH = 7;
+            /* A realistically QUIET capture, so a 45 dB fault has headroom to actually be 45 dB up
+             * instead of just pinning the converter — otherwise this tests clipping, not self-noise.
+             * 45 dB is the magnitude of the real documented fault, not a number picked to pass. */
+            const double QUIET = 0.005, FAULT_DB = 45.0;
+            for (int ch = 0; ch < ZYLIA_MICS; ++ch)
+                for (int i = 0; i < NS; ++i) wbuf[ch][i] = (float)(QUIET * (double)sbuf[ch][i]);
+            double fault_amp = healthy_rms * QUIET * pow(10.0, FAULT_DB / 20.0);
+            for (int i = 0; i < NS; ++i) {
+                rng = rng * 1664525u + 1013904223u;
+                wbuf[BADCH][i] = (float)(((double)(int)(rng >> 9)/(double)(1<<22) - 1.0) * fault_amp);
+            }
+            for (int ch = 0; ch < ZYLIA_MICS; ++ch) wptr[ch] = wbuf[ch];
+
+            int nb = zylia_check_capsules(wptr, NS, flags);
+            printf("[integrity     ] hot capsule: %d flagged, ch%d flags=0x%02X\n", nb, BADCH, flags[BADCH]);
+            CHECK(nb == 1 && (flags[BADCH] & ZYLIA_CAP_HOT), "a hot capsule is flagged, and only it");
+
+            float dbad[3], dfix[3];
+            int okb = zylia_intensity_doa(wptr, NS, FS, C, 400.0, 1200.0, NULL,  dbad, NULL);
+            int okf = zylia_intensity_doa(wptr, NS, FS, C, 400.0, 1200.0, flags, dfix, NULL);
+            double eb = okb ? ang_deg(dbad, truth) : 999.0;
+            double ef = okf ? ang_deg(dfix, truth) : 999.0;
+            printf("[integrity     ] DOA with the fault=%.1f deg   with it excluded=%.2f deg\n", eb, ef);
+            CHECK(okb && eb > 5.0, "the fault really does corrupt the direction (else this proves nothing)");
+            CHECK(okf && ef < 2.0, "excluding the flagged capsule restores the direction");
+
+            /* the same exclusion carries into the cross-check estimator */
+            float ds[3];
+            int oks = zylia_srp_doa(wptr, NS, FS, C, 400.0, 1200.0, flags, ds);
+            CHECK(oks && ang_deg(ds, truth) < 4.0, "SRP-PHAT honours the exclusion mask too");
+        }
+
+        /* Each remaining fault mode on its own capsule, so no flag is ambiguous. */
+        {
+            memcpy(wbuf, sbuf, sizeof sbuf);
+            for (int i = 0; i < NS; ++i) wbuf[3][i] = 0.0f;                  /* dead: silent */
+            for (int ch = 0; ch < ZYLIA_MICS; ++ch) wptr[ch] = wbuf[ch];
+            zylia_check_capsules(wptr, NS, flags);
+            printf("[integrity     ] dead capsule ch3 flags=0x%02X\n", flags[3]);
+            CHECK(flags[3] & ZYLIA_CAP_DEAD, "a silent capsule is flagged dead");
+
+            memcpy(wbuf, sbuf, sizeof sbuf);
+            for (int i = 0; i < NS; ++i) {                                   /* clipped, not hot */
+                double v = 3.0 * (double)sbuf[11][i];
+                wbuf[11][i] = (float)(v > 1.0 ? 1.0 : (v < -1.0 ? -1.0 : v));
+            }
+            for (int ch = 0; ch < ZYLIA_MICS; ++ch) wptr[ch] = wbuf[ch];
+            zylia_check_capsules(wptr, NS, flags);
+            printf("[integrity     ] clipped capsule ch11 flags=0x%02X\n", flags[11]);
+            CHECK(flags[11] & ZYLIA_CAP_CLIPPED, "a pinned capsule is flagged clipped");
+
+            memcpy(wbuf, sbuf, sizeof sbuf);
+            for (int i = 0; i < NS; ++i) {          /* right LEVEL, wrong SIGNAL — the level checks are
+                                                     * blind to this one; only coherence sees it */
+                rng = rng * 1664525u + 1013904223u;
+                wbuf[15][i] = (float)(((double)(int)(rng >> 9)/(double)(1<<22) - 1.0) * healthy_rms * 1.732);
+            }
+            for (int ch = 0; ch < ZYLIA_MICS; ++ch) wptr[ch] = wbuf[ch];
+            zylia_check_capsules(wptr, NS, flags);
+            printf("[integrity     ] incoherent capsule ch15 flags=0x%02X\n", flags[15]);
+            CHECK((flags[15] & ZYLIA_CAP_INCOHERENT) && !(flags[15] & (ZYLIA_CAP_DEAD|ZYLIA_CAP_HOT)),
+                  "a right-level wrong-signal capsule is caught by coherence alone");
+        }
+
+        /* Order step-down: strip enough capsules that order 3 no longer fits and SRP must fall back
+         * rather than over-fit. It should still answer, just more coarsely. */
+        {
+            unsigned char ex[ZYLIA_MICS] = { 0 };
+            for (int ch = 0; ch < 6; ++ch) ex[ch] = 1;        /* 13 capsules left: order 3 cannot fit */
+            float ds[3];
+            int oks = zylia_srp_doa(sptr, NS, FS, C, 400.0, 1200.0, ex, ds);
+            printf("[srp-phat      ] 13 capsules: ok=%d err=%.2f deg\n", oks, oks ? ang_deg(ds, truth) : -1.0);
+            CHECK(oks, "SRP-PHAT steps the order down instead of failing");
+
+            for (int ch = 0; ch < ZYLIA_MICS - 4; ++ch) ex[ch] = 1;   /* 4 left: not even first order */
+            CHECK(!zylia_srp_doa(sptr, NS, FS, C, 400.0, 1200.0, ex, ds),
+                  "too few capsules is refused, not over-fitted");
+            CHECK(!zylia_intensity_doa(sptr, NS, FS, C, 400.0, 1200.0, ex, ds, NULL),
+                  "intensity DOA refuses too few capsules as well");
+        }
     }
 
     printf("%s\n", fails ? "FAIL: zylia localization" : "PASS: zylia single-position localization");

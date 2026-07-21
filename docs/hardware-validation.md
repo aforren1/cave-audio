@@ -181,6 +181,40 @@ tracker connected.
 - [ ] **Limiter**: drive it (many loud sources) and confirm graceful, image-stable gain
       reduction: it's linked across channels, so the image must not shift when it engages.
 
+## Stage 4b: instrumental phantom accuracy (`bwa_validate`)
+
+Stage 4 confirms the array puts sound in the *right general place* and that the frame isn't
+mirrored. This puts a **number** on it: render a phantom in a known direction, measure where
+it actually landed, report the angular miss. Full doc: [validation.md](validation.md).
+
+Needs the ZM-1 on the same ASIO device as the 26 outputs (Dante Via, same unlock as the
+sweep path). Cheap in rig time: only the microphone moves, and one placement sweeps every
+direction electronically.
+
+- [ ] **Dry run first**: `bwa_validate --layout cave_layout.json --simulate`. No hardware,
+      and it gives you the rendering-term baseline the room will then add to. Do this while
+      you're still authoring the layout, not on rig day.
+- [ ] **Capsule health**: the tool checks once per placement and reports anything faulty.
+      A *hot* capsule is the one to watch: array power still looks fine while every
+      spherical-harmonic channel is poisoned. Note every exclusion in the log—a direction
+      from 17 capsules is fine, one you *believed* came from 19 is not.
+- [ ] **Sweet spot**: `bwa_validate --driver <name> --mic-in <n>`, first placement at the
+      listening point. Broadband miss here is the floor for everything else. If it's large,
+      stop and re-check the layout and trims before collecting more cells.
+- [ ] **The walking envelope**: work through the placements the tool prompts for. *Measure*
+      each mic position; it's an input to the scoring, not a label.
+- [ ] **Read the tracked-versus-fixed contrast**: this is the measurement that justifies
+      tracking at all, and it's invisible from the sweet spot. Intervals that exclude zero
+      are the claim.
+- [ ] **Height separately from horizontal**: expect these to behave differently. Tracking
+      fixes horizontal displacement and does not fix height, which is a placement and
+      calibration problem instead. Don't pool them into one "off-centre" number.
+- [ ] **Keep the CSV** (`--out cells.csv`). It's the before/after record for any later
+      layout or calibration change, and re-running is cheap once the rig is set up.
+
+Quote no number from this without its caveats: single point per placement, 400–1200 Hz,
+broadband stimulus, and a microphone is a more pessimistic observer than a listener.
+
 ## Stage 5: by-ear checks
 
 The checks with no assertion—bring ears you trust.

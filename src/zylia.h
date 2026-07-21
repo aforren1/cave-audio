@@ -55,6 +55,102 @@ int  zylia_doa(const double arrival_s[ZYLIA_MICS], float dir_out[3]);
 int  zylia_tdoa(const float* const x[ZYLIA_MICS], uint32_t n, double fs, uint32_t max_lag,
                 double arrival_s[ZYLIA_MICS]);
 
+/* ---- validation-grade DOA: active intensity in the spherical-harmonic domain ----
+ *
+ * Everything above answers "where are my SPEAKERS", from a transient, by arrival times. This answers
+ * a different question: "where does this SOUND appear to come from" — for arbitrary continuous
+ * content, over whatever the array is actually rendering. That is the measurement a rendered PHANTOM
+ * needs (a phantom has no arrival time of its own; it is the summed output of many speakers), and it
+ * is what a walking-listener panner comparison runs on. Two estimators, two jobs, one capture rig.
+ *
+ * Method (Jarrett/Habets/Naylor pseudointensity, the standard): STFT each capsule, least-squares
+ * project the 19 pressures onto first-order real SH (ACN/SN3D, via ambi_encode_sn3d so the basis is
+ * the engine's own xval-pinned one), divide out the RIGID-SPHERE mode strengths b_n(ka) — the ZM-1 is
+ * a scattering sphere, not an open array, and ignoring that biases the direction — then accumulate the
+ * active intensity I = sum_f Re{conj(W) . (X,Y,Z)} over the band. For a plane wave in SN3D the
+ * first-order components ARE the direction cosines, so I points straight AT the source.
+ *
+ * BAND. This is the estimator's real limit and it is not negotiable: a 49 mm sphere hits kr ~ 1 at
+ * about 1.1 kHz, and above that the first-order inversion stops being trustworthy. Broadband content
+ * gets 400-1200 Hz; a tone gets +-1/6 octave around itself. f_hi is CLAMPED to ZYLIA_FOA_FMAX, so a
+ * band that lies entirely above it (a 6 kHz tone) collapses and the call REFUSES — which is the point.
+ * A confident wrong direction is worse than no direction. Anything needing HF is a different estimator.
+ *
+ * x        = 19 planar channel pointers, n samples each, sample-locked (the ZM-1's shared ADC gives
+ *            this). n must be >= one 2048-sample frame; frames hop by half and are Hann-windowed.
+ * fs, c    = sample rate (Hz) and speed of sound (m/s); c sets ka, so it must be the real one.
+ * f_lo/f_hi= analysis band (Hz). See the clamp above.
+ * dir_out  = unit vector from the array centre TOWARD the source, ROOM axes (the frame zylia_geometry
+ *            and zylia_doa use), so it drops straight into the same angular-miss maths.
+ * diffuseness_out (optional) = 0 = a clean plane wave, 1 = fully diffuse. This is the "should I
+ *            believe this?" number, the counterpart of zylia_survey's resid_us: a measurement made in
+ *            the reverberant tail rather than the direct sound shows up here as a high value.
+ * Returns 1 on success, 0 on bad arguments, a collapsed band, too few samples, or a singular solve. */
+#define ZYLIA_FOA_FMAX 1200.0    /* first-order validity ceiling (kr ~ 1 on a 49 mm sphere) */
+
+int  zylia_intensity_doa(const float* const x[ZYLIA_MICS], uint32_t n, double fs, double c,
+                         double f_lo, double f_hi, const unsigned char* exclude,
+                         float dir_out[3], float* diffuseness_out);
+
+/* ---- per-session signal integrity: check the CAPSULES before believing any direction ----
+ *
+ * The failure this exists for is not a quiet one, it is a LOUD one. A capsule that dies goes to zero
+ * and is obvious; a capsule that goes hot — self-noise, a failing preamp — keeps the array's total
+ * power looking perfectly healthy while corrupting the spherical-harmonic projection, because every
+ * SH channel is a weighted sum over ALL capsules. One bad channel therefore poisons the direction and
+ * nothing about the level says so. Worse, it poisons every estimator equally, so agreement between
+ * two independent DOA methods does NOT clear it. This has to be caught on the raw signals or not at
+ * all. (The AES validation paper hit exactly this: one capsule emitting ~45 dB of broadband
+ * self-noise across five consecutive sessions; flagging and excluding it took one measurement cell
+ * from 60.5 deg of error back to 5.5.)
+ *
+ * Checks, all against the array's own ROBUST MEDIAN so a fault cannot define the baseline it is
+ * judged by: per-capsule RMS far below (dead) or far above (hot) the median, hard clipping, and
+ * coherence against the per-sample median signal over a small lag search (a capsule at the right
+ * LEVEL carrying the wrong SIGNAL). Thresholds are deliberately loose — this is a fault detector,
+ * not a calibration; it should fire on a broken capsule and never on a merely off-axis one.
+ *
+ * flags_out[i] = 0 for a healthy capsule, else the OR of the ZYLIA_CAP_* bits below. The array is
+ * directly usable as the `exclude` argument to zylia_intensity_doa / zylia_srp_doa, which is the
+ * intended flow: check, report what you dropped, then estimate on what is left. Returns the number
+ * of FAULTY capsules (0 = all healthy), or -1 on bad arguments.
+ *
+ * Report every exclusion. A direction computed on 17 capsules is fine; a direction computed on 17
+ * capsules that you believed came from 19 is not. */
+#define ZYLIA_CAP_DEAD        0x01   /* RMS far below the array median */
+#define ZYLIA_CAP_HOT         0x02   /* RMS far above it — the self-noise fault */
+#define ZYLIA_CAP_CLIPPED     0x04   /* pinned at full scale */
+#define ZYLIA_CAP_INCOHERENT  0x08   /* right level, wrong signal */
+
+int  zylia_check_capsules(const float* const x[ZYLIA_MICS], uint32_t n,
+                          unsigned char flags_out[ZYLIA_MICS]);
+
+/* ---- independent cross-check: SH-domain steered-response power, PHAT-whitened ----
+ *
+ * A second DOA estimator that shares as little as possible with zylia_intensity_doa. Intensity reads
+ * a PHASE relationship between two SH degrees at each bin; this steers a beam over a direction grid
+ * and takes the most powerful one. Different failure modes, so when they agree the answer is probably
+ * real, and when they diverge something is wrong with the CAPTURE — which is what you actually want
+ * to know before writing a number into a results table.
+ *
+ * Read the limits honestly. It is not a free upgrade over the intensity estimator:
+ *  - It goes HIGHER. 19 capsules support order 3 (16 channels), good to kr ~ 3 (~3.3 kHz), so this is
+ *    the only path here that sees above the first-order ceiling at all. f_hi clamps to ZYLIA_SH3_FMAX.
+ *  - It is COARSER. The answer is the best direction on a finite grid, so its resolution is the grid
+ *    (~2 deg), against the intensity vector's continuous solve. Use it to CHECK a number, not to be one.
+ *  - Order 3 on 19 capsules is a tight fit and the ZM-1 is no spherical design, so the projection is
+ *    ridge-regularized. Excluding capsules tightens it further: the order drops automatically to what
+ *    the remaining capsules support (3 -> 2 -> 1) rather than returning a confidently over-fitted answer.
+ *  - PHAT whitening normalizes every bin to unit norm, so loud bins cannot dominate. That is what makes
+ *    it reverberation-robust, and also what makes it ignore your stimulus's spectrum entirely.
+ *
+ * Arguments match zylia_intensity_doa. Returns 1 on success, 0 on bad arguments, a collapsed band,
+ * too few samples, or too few healthy capsules to resolve even first order. */
+#define ZYLIA_SH3_FMAX 3300.0    /* third-order validity ceiling (kr ~ 3) */
+
+int  zylia_srp_doa(const float* const x[ZYLIA_MICS], uint32_t n, double fs, double c,
+                   double f_lo, double f_hi, const unsigned char* exclude, float dir_out[3]);
+
 /* ---- capsule self-survey: MEASURE the array instead of trusting the table ----
  *
  * The built-in table says where the 19 capsules are, but not which ASIO channel each one feeds, nor how

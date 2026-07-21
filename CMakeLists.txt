@@ -81,6 +81,7 @@ add_library(bwa_core OBJECT
   src/measure.c
   src/calib.c
   src/zylia.c
+  src/valid.c
   src/stream.c
   ${CJSON_C}
 )
@@ -367,6 +368,10 @@ if(BWA_BUILD_TESTS)
   target_link_libraries(test_zylia PRIVATE bwa_core)
   add_test(NAME zylia COMMAND test_zylia)
 
+  add_executable(test_valid test/valid_test.c)
+  target_link_libraries(test_valid PRIVATE bwa_core)
+  add_test(NAME valid COMMAND test_valid)
+
   # Directional reflection-bed check (with-SDK only): compiles the steam objects in + links phonon,
   # drives steam_reflect_tap directly, asserts the reverb is directional. Needs the alignment patch.
   if(BWA_STEAMAUDIO_FOUND)
@@ -628,6 +633,25 @@ if(BWA_BUILD_CALIBRATE)
     message(STATUS "bw_audio: calibration tool with ASIO capture")
   else()
     message(STATUS "bw_audio: calibration tool (simulate only; no ASIO SDK)")
+  endif()
+
+  # Phantom-localization validation: render a source, measure where the array actually put it.
+  # Full-duplex like the sweep above (speaker feeds out + the ZM-1's 19 capsules in, one device),
+  # but steady-state, so it needs no latency solve. --simulate runs the whole flow off-hardware.
+  add_executable(bwa_validate examples/validate.cpp examples/valid_capture.cpp examples/asio_session.cpp)
+  target_link_libraries(bwa_validate PRIVATE bwa_core)
+  if(BWA_WITH_ASIO)
+    target_sources(bwa_validate PRIVATE
+      ${ASIO_SDK_DIR}/common/asio.cpp
+      ${ASIO_SDK_DIR}/host/asiodrivers.cpp
+      ${ASIO_SDK_DIR}/host/pc/asiolist.cpp)
+    target_include_directories(bwa_validate PRIVATE ${ASIO_SDK_DIR}/common ${ASIO_SDK_DIR}/host ${ASIO_SDK_DIR}/host/pc)
+    target_compile_definitions(bwa_validate PRIVATE BWA_HAVE_ASIO _CRT_SECURE_NO_WARNINGS)
+    target_link_libraries(bwa_validate PRIVATE ole32 user32 advapi32)
+  endif()
+  if(BWA_BUILD_TESTS)
+    # the whole session flow, hardware-free: plan -> render -> score -> contrasts -> report
+    add_test(NAME validate_sim COMMAND bwa_validate --simulate --azimuths 6)
   endif()
 
   # ZM-1 hardware bring-up probe: console meter over the shared capture shell (zylia_capture.cpp).

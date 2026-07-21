@@ -66,7 +66,12 @@ src/
   sound.h / sound.c    wav decode to mono float via dr_wav (Sound table lives in rt.c). [M3]
   layout.h / layout.c  speaker geometry load (cave_layout.json via cJSON) + default grid. [M4]
   measure.c/calib.c    bwa_calibrate DSP: sweep+deconvolution, trims, trilateration, room report. [calib]
-  zylia.h / zylia.c    Zylia ZM-1 single-position speaker localization (DOA + GN position). [calib]
+  zylia.h / zylia.c    Zylia ZM-1: single-position speaker localization (TDOA + GN position) AND the
+                       validation-grade estimators — active-intensity DOA, capsule integrity,
+                       SRP-PHAT cross-check. [calib]
+  valid.h / valid.c    phantom-localization validation: render a source, measure where the array
+                       actually put it (feeds/simulate/score + medians, bootstrap, matched-cell
+                       contrasts). Drives bwa_validate. [validation]
   dbap.h / dbap.c      listener-relative, constant-power DBAP gain solve. [M4]
   fdn.h / fdn.c        directional FDN reverb bed (phonon-free; takes the reflection bus tap). [innovations]
   ism.h / ism.c        image-source EARLY reflections: shoebox mirrors, panned as point sources. [innovations]
@@ -590,6 +595,9 @@ the production array render never uses HRTF.
 - `docs/build.md` — platform, dependencies, licensing, DVS/Dante config.
 - `docs/layout-schema.md` — `cave_layout.json` format: speaker geometry, per-speaker gain/delay, DBAP knobs.
 - `docs/calibration.md` — `bwa_calibrate`: acoustic position survey, delay/gain trims, room report → `cave_layout.json`.
+- `docs/validation.md` — `bwa_validate`: render a phantom, measure where it landed. The Zylia
+  intensity/integrity/SRP estimators, the solve-position-versus-mic-position seam, simulate versus
+  hardware, and what the measurements have said so far.
 - `docs/hardware-validation.md` — the rig-day runbook: staged on-hardware checks (device → wiring → calibration → Motive → end-to-end → by-ear) with pass criteria.
 - `docs/internal-types.md` — internal structs (`Voice`/`Sound`/`Layout`/`Listener`) + helper signatures. **Not ABI.**
 - `docs/roadmap.md` — milestone-ordered implementation plan.

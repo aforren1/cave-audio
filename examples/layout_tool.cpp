@@ -392,32 +392,66 @@ static float score_mean[3], score_worst[3];      /* [DBAP, SPCAP, VBAP] rE local
 static float score_spread[3];                    /* mean perceived spread (deg): Frank 2013's 186.4·(1−|rE|)+10.7 */
 static int   scored, score_stale, last_score_frame;   /* the per-panner scoreboard auto-refreshes on a throttle */
 
-/* mean + worst rE localization error (deg) over the shell, from the panner's observer model: DBAP over
- * the moving listener grid; SPCAP/VBAP from the fixed centre. Uses bwa_panner_gains_batch (the ACTUAL
- * engine solve), so the score reflects what will ship — not a re-implementation. spread_deg (optional)
- * is the mean perceived source width from the energy-vector MAGNITUDE (Frank 2013: ≈186.4°·(1−|rE|)
+/* SOLVE position vs EVALUATION position — the distinction this scoring turns on.
+ *
+ * A panner solves its gains for SOME listener position, and a listener then hears the result from
+ * wherever they actually are. Those are the same point only for a tracked renderer. A fixed install
+ * solves once, at the sweet spot, and every step the listener takes away from it is un-corrected.
+ * Scoring such a layout AT the sweet spot — which is what this tool used to do for SPCAP and VBAP —
+ * cannot see that degradation at all: it optimizes a single point and reports a number that is
+ * structurally incapable of moving. bwa_validate measures the same contrast acoustically and finds
+ * it large (SPCAP +10 deg, VBAP +5 deg at 0.7 m off-centre), so it is not a rounding error.
+ *
+ *   tracked = 1  solve at the listener's own position (what DBAP does per block)
+ *   tracked = 0  solve at the sweet spot, listen from elsewhere (what a fixed install does)
+ *
+ * Sources therefore sit at FIXED WORLD positions off the sweet spot rather than following the
+ * listener: only then is every listener position judged against the same physical sources, which is
+ * what makes an off-centre cell comparable to a centred one. At the sweet spot the two modes are the
+ * same render, and the tests pin exactly that. */
+static int track_mode = 0;      /* 0 = auto (DBAP tracked, SPCAP/VBAP fixed), 1 = force tracked, 2 = force fixed */
+static int panner_tracked(bwa_panner p) {
+    return (track_mode == 1) ? 1 : (track_mode == 2) ? 0 : (p == BWA_PAN_DBAP);
+}
+
+/* Default image-FOCUS weight per panner, from bwa_validate's proxy-vs-measurement correlation on
+ * this array: against the acoustic measurement, rE DIRECTION error ranks DBAP cells well
+ * (Spearman ~0.8) but VBAP cells barely at all (~0.2), where the Frank SPREAD is the strong
+ * predictor (~0.77). So the axis worth optimizing is not the same for every panner, and a single
+ * global default would be wrong for two of the three. Overridable — it is a starting point. */
+static float panner_focus_default(bwa_panner p) {
+    return (p == BWA_PAN_DBAP) ? 0.0f : (p == BWA_PAN_SPCAP) ? 0.5f : 1.0f;
+}
+
+/* mean + worst rE localization error (deg) over the shell, evaluated across the WHOLE listener grid
+ * for every panner (see the solve/eval note above). Uses bwa_panner_gains_batch (the ACTUAL engine
+ * solve), so the score reflects what will ship — not a re-implementation. spread_deg (optional) is
+ * the mean perceived source width from the energy-vector MAGNITUDE (Frank 2013: ≈186.4°·(1−|rE|)
  * + 10.7°) — the image-focus axis direction error alone can't see: a defocused-but-centred image
  * scores 0° error. */
-static void score_panner(bwa_panner panner, int stride, float* mean_deg, float* worst_deg, float* spread_deg) {
+static void score_panner(bwa_panner panner, int stride, int tracked,
+                         float* mean_deg, float* worst_deg, float* spread_deg) {
     static float gains[NCOV * NSPK], srcs[NCOV * 3];
     float pos[NSPK * 3];
     for (int i = 0; i < g_nspk; ++i) { pos[i*3] = spk[i].pos.x; pos[i*3+1] = spk[i].pos.y; pos[i*3+2] = spk[i].pos.z; }
     if (stride < 1) stride = 1;                     /* >1 subsamples the direction shell (coarse, for the optimizer) */
-    int NL = (panner == BWA_PAN_DBAP) ? 27 : 1;     /* DBAP: moving grid; SPCAP/VBAP: fixed centre */
+
+    Vector3 S = { 0.0f, obs_height, 0.0f };         /* the sweet spot: where a fixed install solves */
+    int ns = 0;                                     /* sources are world-fixed, so build them ONCE */
+    for (int i = 0; i < NCOV; i += stride) {
+        srcs[ns*3]   = S.x + COV_R * cov_dir[i].x;
+        srcs[ns*3+1] = S.y + COV_R * cov_dir[i].y;
+        srcs[ns*3+2] = S.z + COV_R * cov_dir[i].z;
+        ++ns;
+    }
     double sumerr = 0, sumspread = 0; float worst = 0; int cnt = 0;
-    for (int l = 0; l < NL; ++l) {
+    for (int l = 0; l < 27; ++l) {
         Vector3 Lp = cov_lis[l]; Lp.y += obs_height;    /* the listener's EARS are at obs_height, not the floor */
-        float lisf[3] = { Lp.x, Lp.y, Lp.z };
-        int ns = 0;
-        for (int i = 0; i < NCOV; i += stride) {
-            srcs[ns*3]   = Lp.x + COV_R * cov_dir[i].x;
-            srcs[ns*3+1] = Lp.y + COV_R * cov_dir[i].y;
-            srcs[ns*3+2] = Lp.z + COV_R * cov_dir[i].z;
-            ++ns;
-        }
-        bwa_panner_gains_batch(panner, pos, (uint32_t)g_nspk, lisf, srcs, ns, gains);
+        float lisf[3]   = { Lp.x, Lp.y, Lp.z };
+        float solvef[3] = { tracked ? Lp.x : S.x, tracked ? Lp.y : S.y, tracked ? Lp.z : S.z };
+        (void)lisf;
+        bwa_panner_gains_batch(panner, pos, (uint32_t)g_nspk, solvef, srcs, ns, gains);
         for (int j = 0; j < ns; ++j) {
-            int i = j * stride;                     /* the cov_dir index this sample came from */
             float* g = &gains[j * g_nspk];
             float rE[3] = { 0, 0, 0 }, esum = 0;
             for (int s = 0; s < g_nspk; ++s) {      /* energy-weighted speaker-direction vector (rE) */
@@ -429,7 +463,11 @@ static void score_panner(bwa_panner panner, int stride, float* mean_deg, float* 
             float rl = sqrtf(rE[0]*rE[0] + rE[1]*rE[1] + rE[2]*rE[2]);
             if (rl < 1e-9f || esum < 1e-12f) continue;
             Vector3 ev = { rE[0]/rl, rE[1]/rl, rE[2]/rl };
-            float err = loc_err_deg(cov_dir[i], ev);   /* perceptually weighted (azimuth >> elevation) */
+            /* the direction the source ACTUALLY subtends from this listener — not the shell
+             * direction, which is only the same thing at the sweet spot */
+            Vector3 tgt = Vector3Normalize(Vector3Subtract(
+                Vector3{ srcs[j*3], srcs[j*3+1], srcs[j*3+2] }, Lp));
+            float err = loc_err_deg(tgt, ev);          /* perceptually weighted (azimuth >> elevation) */
             float re_mag = rl / esum;                  /* |rE| in [0,1]: 1 = a single speaker carries it */
             if (re_mag > 1.f) re_mag = 1.f;
             sumspread += 186.4 * (1.0 - re_mag) + 10.7;   /* Frank 2013 perceived-spread model */
@@ -478,6 +516,97 @@ static void compute_cov_err(bwa_panner panner) {
     cov_err_valid = 1; cov_err_stale = 0; cov_err_panner = panner; cov_err_moving = coverage_moving; cov_err_frame = cov_frame;
 }
 
+/* ---- volumetric BADNESS MAP: where in the ROOM does this layout work? ----
+ *
+ * The coverage shell answers "which DIRECTIONS work, from one listening point". This answers the
+ * question a walking-listener installation actually has: "where can somebody STAND". Same solve,
+ * transposed — a grid of listener positions through the working volume, each scored over a coarse
+ * spread of directions, drawn as semitransparent voxels. Good regions fade out and bad ones light
+ * up, so the shape of the usable volume is the thing you see.
+ *
+ * It is worth toggling `tracked` while looking at it: a fixed solve draws a bright island around the
+ * sweet spot decaying outward, a tracked one stays flat. That contrast is the whole DBAP-vs-SPCAP
+ * argument in one picture, and no table makes it as obvious.
+ *
+ * The metric follows the panner for the reason panner_focus_default explains — direction error is
+ * what predicts the acoustic measurement for DBAP, spread is what predicts it for VBAP. Rendering
+ * the wrong one would draw a confident, misleading map. The acoustic measurement itself (an FFT per
+ * point, via bwa_validate) is far too slow to paint interactively; this is the cheap proxy it
+ * vouched for. */
+#define BAD_NX     9
+#define BAD_NY     5
+#define BAD_NZ     9
+#define NBAD       (BAD_NX * BAD_NY * BAD_NZ)
+#define BAD_STRIDE 8                       /* ~48 of the 380 shell directions per point */
+#define BAD_HALF   1.5f                    /* working volume half-extent in x/z (m) */
+#define BAD_VHALF  0.5f                    /* ...and in HEIGHT: seated to tall about the ear plane */
+static int     bad_on, bad_valid, bad_stale, bad_panner = -1, bad_tracked = -1;
+static int     bad_metric;                 /* 0 = rE direction error, 1 = Frank spread */
+static Vector3 bad_pos[NBAD];
+static float   bad_val[NBAD];
+static float   bad_lo, bad_hi, bad_mean;
+
+static void compute_badness(bwa_panner panner, int tracked) {
+    static float gains[NCOV * NSPK], srcs[NCOV * 3];
+    float pos[NSPK * 3];
+    for (int i = 0; i < g_nspk; ++i) { pos[i*3]=spk[i].pos.x; pos[i*3+1]=spk[i].pos.y; pos[i*3+2]=spk[i].pos.z; }
+
+    Vector3 S = { 0.0f, obs_height, 0.0f };
+    int ns = 0;
+    for (int i = 0; i < NCOV; i += BAD_STRIDE) {
+        srcs[ns*3]   = S.x + COV_R * cov_dir[i].x;
+        srcs[ns*3+1] = S.y + COV_R * cov_dir[i].y;
+        srcs[ns*3+2] = S.z + COV_R * cov_dir[i].z;
+        ++ns;
+    }
+    int w = 0;
+    double macc = 0.0;
+    bad_lo = 1e9f; bad_hi = -1e9f;
+    for (int iy = 0; iy < BAD_NY; ++iy)
+        for (int iz = 0; iz < BAD_NZ; ++iz)
+            for (int ix = 0; ix < BAD_NX; ++ix) {
+                Vector3 Lp = {
+                    -BAD_HALF + 2.0f*BAD_HALF * (float)ix / (float)(BAD_NX - 1),
+                    obs_height - BAD_VHALF + 2.0f*BAD_VHALF * (float)iy / (float)(BAD_NY - 1),
+                    -BAD_HALF + 2.0f*BAD_HALF * (float)iz / (float)(BAD_NZ - 1)
+                };
+                bad_pos[w] = Lp;
+                float solvef[3] = { tracked ? Lp.x : S.x, tracked ? Lp.y : S.y, tracked ? Lp.z : S.z };
+                bwa_panner_gains_batch(panner, pos, (uint32_t)g_nspk, solvef, srcs, ns, gains);
+                double acc = 0.0; int cnt = 0;
+                for (int j = 0; j < ns; ++j) {
+                    float* g = &gains[j * g_nspk];
+                    float rE[3] = { 0, 0, 0 }, esum = 0;
+                    for (int s = 0; s < g_nspk; ++s) {
+                        float ww = g[s] * g[s];
+                        Vector3 sd = Vector3Normalize(Vector3Subtract(spk[s].pos, Lp));
+                        rE[0] += ww*sd.x; rE[1] += ww*sd.y; rE[2] += ww*sd.z;
+                        esum  += ww;
+                    }
+                    float rl = sqrtf(rE[0]*rE[0] + rE[1]*rE[1] + rE[2]*rE[2]);
+                    if (rl < 1e-9f || esum < 1e-12f) continue;
+                    if (bad_metric == 0) {
+                        Vector3 ev  = { rE[0]/rl, rE[1]/rl, rE[2]/rl };
+                        Vector3 tgt = Vector3Normalize(Vector3Subtract(
+                            Vector3{ srcs[j*3], srcs[j*3+1], srcs[j*3+2] }, Lp));
+                        acc += loc_err_deg(tgt, ev);
+                    } else {
+                        float m = rl / esum;
+                        if (m > 1.f) m = 1.f;
+                        acc += 186.4 * (1.0 - m) + 10.7;
+                    }
+                    ++cnt;
+                }
+                bad_val[w] = cnt ? (float)(acc / cnt) : 0.f;
+                if (bad_val[w] < bad_lo) bad_lo = bad_val[w];
+                if (bad_val[w] > bad_hi) bad_hi = bad_val[w];
+                macc += bad_val[w];
+                ++w;
+            }
+    bad_mean = (float)(macc / NBAD);
+    bad_valid = 1; bad_stale = 0; bad_panner = panner; bad_tracked = tracked;
+}
+
 /* ---- auto-optimizer: stochastic hill-climb over the free positions, minimising a MULTI-OBJECTIVE
  * scalarization subject to the constraints: (1−w)·mean + w·worst rE error blends the average
  * experience against the worst direction/observer position (w = 1 is pure MAXIMIN — nothing is
@@ -494,7 +623,7 @@ static float   opt_focus_wt = 0.0f;                       /* deg-of-spread per d
 static Vector3 opt_anchor[NSPK];                          /* speaker positions captured when optimization started */
 
 static float opt_cost_of(bwa_panner p) {   /* coarse; + a penalty per speaker in a projector shadow so the climb clears them */
-    float m, w, sp; score_panner(p, 4, &m, &w, &sp);
+    float m, w, sp; score_panner(p, 4, panner_tracked(p), &m, &w, &sp);
     int occ = 0; for (int i = 0; i < g_nspk; ++i) if (!los_clear(spk[i].pos)) ++occ;
     return 2.0f * ((1.0f - opt_worst_wt) * m + opt_worst_wt * w) + opt_focus_wt * sp + 25.0f * (float)occ;
 }
@@ -502,8 +631,8 @@ static float frand(void) { return (float)rand() / ((float)RAND_MAX + 1.0f); }
 
 static int edited_unsaved;   /* any layout edit since the last successful save/reload (the quit guard) */
 
-static void mark_edit(void)  { layout_dirty = 1; score_stale = 1; cov_err_stale = 1; edited_unsaved = 1; }
-static void mark_score(void) { score_stale = 1; cov_err_stale = 1; }   /* metric knob changed; the layout file didn't */
+static void mark_edit(void)  { layout_dirty = 1; score_stale = 1; cov_err_stale = 1; bad_stale = 1; edited_unsaved = 1; }
+static void mark_score(void) { score_stale = 1; cov_err_stale = 1; bad_stale = 1; }   /* metric knob changed; the layout file didn't */
 
 static void optimize_step(bwa_panner p, int trials) {
     for (int t = 0; t < trials; ++t) {
@@ -534,6 +663,10 @@ static Color heat(float t) {
 }
 /* localization error (deg) -> heat, per the desired feel: <=2 great (green), 5-10 fine (a yellow
  * plateau), 10+ bad (ramps to red by 12). */
+/* Spread runs 10.7 (a point source) to ~197 (fully diffuse); the interesting band for a real array
+ * is roughly 20-90, so map that rather than the full theoretical range. */
+static Color spread_heat(float deg) { return heat((90.0f - deg) / 70.0f); }
+
 static Color err_heat(float e) {
     float t;
     if      (e <=  2.0f) t = 1.0f;                              /* great */
@@ -580,7 +713,9 @@ static void do_snap(void) {
     mark_edit();
 }
 static void do_score(void) {
-    for (int p = 0; p < 3; ++p) score_panner((bwa_panner)p, 1, &score_mean[p], &score_worst[p], &score_spread[p]);
+    for (int p = 0; p < 3; ++p)
+        score_panner((bwa_panner)p, 1, panner_tracked((bwa_panner)p),
+                     &score_mean[p], &score_worst[p], &score_spread[p]);
     scored = 1; score_stale = 0;
 }
 static void set_optimizing(int on) {
@@ -709,6 +844,7 @@ static void handle_edit_input(float dt, bool kb, bool ms, const Camera3D& cam) {
         if (IsKeyPressed(KEY_K)) do_snap();
         if (IsKeyPressed(KEY_C)) coverage_on = !coverage_on;
         if (IsKeyPressed(KEY_V)) coverage_moving = !coverage_moving;
+        if (IsKeyPressed(KEY_M)) bad_on = !bad_on;   /* volumetric badness map: where can you STAND */
         if (IsKeyPressed(KEY_G)) cov_metric ^= 1;   /* shade: gap <-> selected-panner rE error (cache stays valid) */
         if (IsKeyPressed(KEY_X)) do_score();
         if (IsKeyPressed(KEY_B)) pv_panner = (pv_panner + 1) % 3;   /* the score/optimize target panner */
@@ -847,6 +983,25 @@ static void draw_scene(const Camera3D& cam, float* cov_worst_out, float* cov_mea
         }
         cov_mean = (float)(macc / NCOV);
     }
+    if (bad_on && !preview) {                        /* volumetric badness map through the room */
+        int tracked = panner_tracked((bwa_panner)pv_panner);
+        int structural = (!bad_valid || bad_panner != pv_panner || bad_tracked != tracked);
+        if (structural || (bad_stale && cov_frame - cov_err_frame >= 6))
+            compute_badness((bwa_panner)pv_panner, tracked);
+        /* Transparent voxels with depth WRITES off: they are an overlay, and letting them occlude
+         * each other (or the speakers) by draw order would read as structure that isn't there. */
+        rlDisableDepthMask();
+        float span = (bad_hi > bad_lo + 1e-3f) ? (bad_hi - bad_lo) : 1.0f;
+        for (int i = 0; i < NBAD; ++i) {
+            float v = bad_val[i];
+            Color c = (bad_metric == 0) ? err_heat(v) : spread_heat(v);
+            float t = (v - bad_lo) / span;           /* fade the good regions out, light the bad ones up */
+            if (t < 0.f) t = 0.f; if (t > 1.f) t = 1.f;
+            c.a = (unsigned char)(20.0f + 150.0f * t * t);
+            DrawCubeV(bad_pos[i], Vector3{ 0.22f, 0.16f, 0.22f }, c);
+        }
+        rlEnableDepthMask();
+    }
     EndMode3D();
     *cov_worst_out = cov_worst;
     *cov_mean_out  = cov_mean;
@@ -928,6 +1083,12 @@ static void draw_hud(float cov_worst, float cov_mean) {
                                "%s rE error [%s]%s   worst %.0f  mean %.0f deg   (2 great / 5-10 ok / 10+ bad)   [G] -> gap",
                                panner_names[pv_panner], obs, perceptual ? " az>el" : "", cov_worst, cov_mean);
     }
+    if (bad_on && bad_valid && !preview)
+        ImGui::TextColored(imcol(bad_metric ? spread_heat(bad_mean) : err_heat(bad_mean)),
+                           "badness map [%s solve]  %s:  best %.0f / mean %.0f / worst %.0f deg  over %d room points",
+                           bad_tracked ? "tracked" : "fixed",
+                           bad_metric ? "Frank spread" : "rE direction error",
+                           bad_lo, bad_mean, bad_hi, NBAD);
     if (!preview && save_flash != 0.0f)
         ImGui::TextColored(save_flash > 0 ? ImVec4(0.51f, 0.96f, 0.59f, 1) : ImVec4(0.96f, 0.51f, 0.51f, 1),
                            save_flash > 0 ? "saved -> %s" : "SAVE FAILED (path not writable?)", g_path);
@@ -1027,7 +1188,12 @@ static void draw_panel(void) {
     bwTip("distance attenuation: floor - a source never drops below this");
 
     ImGui::SeparatorText("Analyze / optimize");      /* rE error of the target panner; O climbs it */
-    if (ImGui::Combo("panner", &pv_panner, "DBAP (moving)\0SPCAP (fixed)\0VBAP (fixed)\0")) mark_score();
+    if (ImGui::Combo("panner", &pv_panner, "DBAP (moving)\0SPCAP (fixed)\0VBAP (fixed)\0")) {
+        /* the focus weight and the map metric are not panner-independent — see panner_focus_default */
+        opt_focus_wt = panner_focus_default((bwa_panner)pv_panner);
+        bad_metric   = (pv_panner == BWA_PAN_DBAP) ? 0 : 1;
+        mark_score();
+    }
     bwTip("the panner Score / Optimize / the rE overlay evaluate ([B] cycles). DBAP tracks a "
           "MOVING listener; SPCAP/VBAP assume the centre sweet spot");
     if (ImGui::Button("Score [X]")) do_score();
@@ -1064,6 +1230,23 @@ static void draw_panel(void) {
     CheckboxInt("moving [V]", &coverage_moving);
     bwTip("observer model: average over a grid of listener positions across the working volume "
           "(this installation's case) instead of the centre sweet spot");
+    if (ImGui::Combo("solve at", &track_mode, "auto (per panner)\0tracked listener\0fixed sweet spot\0"))
+        mark_score();
+    bwTip("where the panner SOLVES, as opposed to where you listen from. A fixed install solves once "
+          "at the sweet spot and never corrects for you walking away; a tracked one re-solves at your "
+          "position every block. Scoring only at the sweet spot cannot see that difference at all - "
+          "auto gives each panner its real behaviour, and forcing a mode A/Bs the contrast");
+
+    CheckboxInt("badness map [M]", &bad_on);
+    bwTip("where in the ROOM does this layout work, rather than which directions work from the "
+          "centre: a grid of LISTENER positions through the working volume, each scored over a "
+          "spread of directions. Good regions fade out, bad ones light up. Toggle 'solve at' while "
+          "watching - a fixed solve draws an island around the sweet spot, a tracked one stays flat");
+    if (bad_on && ImGui::Combo("map metric", &bad_metric, "rE direction error\0Frank spread\0")) bad_stale = 1;
+    if (bad_on) bwTip("which proxy to paint. They are not interchangeable: against the acoustic "
+                      "measurement (bwa_validate) direction error ranks DBAP well and VBAP barely, "
+                      "where spread is the strong predictor - so this follows the panner by default");
+
     CheckboxInt("shade rE error (vs gap) [G]", &cov_metric);
     bwTip("colour by the selected panner's REAL solve (rE error) instead of the geometric "
           "nearest-speaker gap");
@@ -1165,7 +1348,7 @@ static void register_tests(ImGuiTestEngine* te) {
             bwa_destroy(te2);
         }
         float m = 0, w = 0;                                      /* the real panner solve, on 24 speakers */
-        score_panner(BWA_PAN_DBAP, 4, &m, &w, NULL);
+        score_panner(BWA_PAN_DBAP, 4, 1, &m, &w, NULL);
         IM_CHECK_GT(w, 0.0f);
         g_nspk = keep; seed_default(); layout_dirty = 1;
     };
@@ -1184,11 +1367,56 @@ static void register_tests(ImGuiTestEngine* te) {
         CON.bounds = sb; CON.nnogo = sn; CON.nobst = so; CON.loaded = sl;
     };
 
+    /* The solve/eval split is the whole point of scoring off-centre at all: a fixed solve keeps the
+     * sweet spot's gains while the listener walks away, so over the grid it cannot beat a tracked
+     * one. If `tracked` were being ignored the two would come back bit-identical, which is exactly
+     * what this catches. */
+    t = IM_REGISTER_TEST(te, "logic", "solve_eval");
+    t->TestFunc = [](ImGuiTestContext*) {
+        seed_default(); layout_dirty = 1;
+        float mt = -1, wt = -1, mf = -1, wf = -1;
+        score_panner(BWA_PAN_SPCAP, 4, 1, &mt, &wt, NULL);       /* solved at each listener */
+        score_panner(BWA_PAN_SPCAP, 4, 0, &mf, &wf, NULL);       /* solved once at the sweet spot */
+        IM_CHECK_GT(mt, 0.0f);
+        IM_CHECK_GT(fabsf(mf - mt), 1e-4f);                      /* the mode actually changes the render */
+        IM_CHECK_GE(mf, mt - 0.5f);                              /* ...and leaving the sweet spot never helps */
+        /* track_mode overrides it for A/B; auto gives each panner its real behaviour */
+        int save = track_mode;
+        track_mode = 0; IM_CHECK(panner_tracked(BWA_PAN_DBAP) && !panner_tracked(BWA_PAN_VBAP));
+        track_mode = 1; IM_CHECK(panner_tracked(BWA_PAN_VBAP));
+        track_mode = 2; IM_CHECK(!panner_tracked(BWA_PAN_DBAP));
+        track_mode = save;
+    };
+
+    /* The badness map's headline claim is visual: a FIXED solve draws an island around the sweet
+     * spot, a tracked one stays flat. That is a spread-of-values statement, so it is testable. */
+    t = IM_REGISTER_TEST(te, "logic", "badness_map");
+    t->TestFunc = [](ImGuiTestContext*) {
+        seed_default(); layout_dirty = 1;
+        int save_metric = bad_metric;
+        bad_metric = 0;
+        compute_badness(BWA_PAN_SPCAP, 1);
+        IM_CHECK(bad_valid);
+        float track_span = bad_hi - bad_lo, track_mean = bad_mean;
+        IM_CHECK_GT(bad_mean, 0.0f);
+        IM_CHECK_LT(bad_hi, 90.0f);
+        for (int i = 0; i < NBAD; ++i) IM_CHECK(bad_val[i] == bad_val[i]);   /* no NaN anywhere */
+        compute_badness(BWA_PAN_SPCAP, 0);
+        IM_CHECK_GT(bad_hi - bad_lo, track_span);                /* the fixed map is the uneven one */
+        IM_CHECK_GE(bad_mean, track_mean - 0.5f);
+        /* the map grid really does span the working volume in HEIGHT, not just the ear plane */
+        float ylo = 1e9f, yhi = -1e9f;
+        for (int i = 0; i < NBAD; ++i) { if (bad_pos[i].y < ylo) ylo = bad_pos[i].y;
+                                         if (bad_pos[i].y > yhi) yhi = bad_pos[i].y; }
+        IM_CHECK_GT(yhi - ylo, 0.9f);
+        bad_metric = save_metric;
+    };
+
     t = IM_REGISTER_TEST(te, "logic", "score");                  /* the real engine solve scores the default dome sanely */
     t->TestFunc = [](ImGuiTestContext*) {
         seed_default(); layout_dirty = 1;
         float m = -1, w = -1, sp = -1;
-        score_panner(BWA_PAN_DBAP, 2, &m, &w, &sp);
+        score_panner(BWA_PAN_DBAP, 2, 1, &m, &w, &sp);
         IM_CHECK_GT(m, 0.0f);
         IM_CHECK_LT(m, 90.0f);
         IM_CHECK_GE(w, m);
@@ -1202,7 +1430,7 @@ static void register_tests(ImGuiTestEngine* te) {
     t->TestFunc = [](ImGuiTestContext*) {
         seed_default(); layout_dirty = 1;
         float m, w, sp;
-        score_panner(BWA_PAN_DBAP, 4, &m, &w, &sp);              /* stride 4 = opt_cost_of's own sampling */
+        score_panner(BWA_PAN_DBAP, 4, 1, &m, &w, &sp);           /* stride 4 = opt_cost_of's own sampling */
         const float saveW = opt_worst_wt, saveF = opt_focus_wt;
         opt_worst_wt = 1.0f; opt_focus_wt = 0.0f;                /* pure maximin: cost = 2*worst (no occluders) */
         IM_CHECK_LT(fabsf(opt_cost_of(BWA_PAN_DBAP) - 2.0f * w), 0.5f);
@@ -1324,6 +1552,26 @@ static void register_tests(ImGuiTestEngine* te) {
         IM_CHECK(!preview);
         ctx->ItemUncheck("**/coverage [C]");
     };
+
+    /* the badness map through the panel, both solve modes, with a shot of each: the fixed one should
+     * look like an island and the tracked one flat, which is the pair of pictures worth keeping */
+    t = IM_REGISTER_TEST(te, "viewer", "badness_shots");
+    t->TestFunc = [](ImGuiTestContext* ctx) {
+        ctx->SetRef("layout");
+        ctx->ItemCheck("**/badness map [M]");
+        ctx->Yield(4);                                           /* compute + draw */
+        IM_CHECK(bad_on && bad_valid);
+        ctx->CaptureScreenshot();
+        int before = bad_tracked;
+        track_mode = (before == 1) ? 2 : 1;                      /* flip the solve mode and recompute */
+        mark_score();
+        ctx->Yield(8);
+        IM_CHECK_NE(bad_tracked, before);
+        ctx->CaptureReset();
+        ctx->CaptureScreenshot();
+        track_mode = 0;
+        ctx->ItemUncheck("**/badness map [M]");
+    };
 }
 
 /* ============================== main ============================== */
@@ -1381,7 +1629,12 @@ int main(int argc, char** argv) {
         cov_dir[i] = Vector3{ r * cosf(th), y, r * sinf(th) };
     }
     cov_lis[0] = Vector3{ 0, 0, 0 };
-    { const float ax[3] = { -1.0f, 0.0f, 1.0f }, ay[3] = { -0.3f, 0.0f, 0.3f }; int li = 1;   /* listener-movement envelope */
+    /* Listener-movement envelope. HEIGHT gets a realistic +-0.45 m (seated to tall), not a token
+     * nudge: bwa_validate measures off-height as a DISTINCT failure mode from off-centre-in-plane —
+     * the array's speakers sit mostly overhead and the alignment delays are computed for one
+     * reference height, so tracking the listener re-aims the solve but cannot fix either. A grid
+     * that barely varies height cannot see the problem it most needs to. */
+    { const float ax[3] = { -1.0f, 0.0f, 1.0f }, ay[3] = { -0.45f, 0.0f, 0.45f }; int li = 1;
       for (int xi = 0; xi < 3; ++xi) for (int zi = 0; zi < 3; ++zi) for (int yi = 0; yi < 3; ++yi)
           if (!(ax[xi] == 0 && ay[yi] == 0 && ax[zi] == 0)) cov_lis[li++] = Vector3{ ax[xi], ay[yi], ax[zi] }; }
 
@@ -1393,7 +1646,7 @@ int main(int argc, char** argv) {
     if (score_only) {                              /* headless: score the layout for each panner + exit */
         printf("layout: %s (%s)\n", g_path, loaded ? "loaded" : "default grid");
         for (int p = 0; p < 3; ++p) {
-            float m, w, sp; score_panner((bwa_panner)p, 1, &m, &w, &sp);
+            float m, w, sp; score_panner((bwa_panner)p, 1, panner_tracked((bwa_panner)p), &m, &w, &sp);
             printf("  %-14s rE-localize error:  mean %4.1f deg   worst %4.1f deg   focus (Frank spread) %4.1f deg\n",
                    panner_names[p], m, w, sp);
         }
@@ -1402,11 +1655,11 @@ int main(int argc, char** argv) {
     if (optimize_only) {                           /* headless: optimize in place for one panner + save */
         bwa_panner p = BWA_PAN_DBAP;
         if (argc > 3) { if (!strcmp(argv[3], "spcap")) p = BWA_PAN_SPCAP; else if (!strcmp(argv[3], "vbap")) p = BWA_PAN_VBAP; }
-        float m0, w0; score_panner(p, 1, &m0, &w0, NULL);
+        float m0, w0; score_panner(p, 1, panner_tracked(p), &m0, &w0, NULL);
         opt_cost = opt_cost_of(p); opt_step = 0.30f; opt_stall = 0; opt_iter = 0;
         for (int i = 0; i < g_nspk; ++i) opt_anchor[i] = spk[i].pos;           /* leash anchor (opt_leash defaults ~free) */
         while (opt_step > 0.02f && opt_iter < 120000) optimize_step(p, 200);   /* run to convergence (step floor) */
-        float m1, w1; score_panner(p, 1, &m1, &w1, NULL);
+        float m1, w1; score_panner(p, 1, panner_tracked(p), &m1, &w1, NULL);
         if (!save_json(g_path)) { printf("optimize: save failed: %s\n", g_path); return 1; }
         printf("optimized %s for %-5s:  rE mean %.1f -> %.1f deg   worst %.1f -> %.1f deg   (%d iters%s)\n",
                g_path, panner_names[p], m0, m1, w0, w1, opt_iter, CON.loaded ? ", within constraints" : "");

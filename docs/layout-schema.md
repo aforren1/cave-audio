@@ -44,6 +44,33 @@ binaural playground: `bwa_playground cave_layout.json`.
 each panner's rE-localization error: mean + worst over a direction shell × the
 working-volume listener grid, via `bwa_panner_gains_batch` (the same solve that ships).
 
+**Where the panner solves is not where you listen.** A fixed install solves once at the
+sweet spot and never corrects for you walking away; a tracked one re-solves at your
+position every block. Scoring only at the sweet spot cannot see that difference at all,
+so every panner is now evaluated across the whole listener grid, and the **solve at**
+control picks which position it solves for: *auto* gives each panner its real behaviour
+(DBAP tracked, SPCAP and VBAP fixed), and forcing a mode A/Bs the contrast. Sources sit
+at fixed world positions rather than following the listener, which is what makes an
+off-centre score comparable to a centred one.
+
+Expect worst-case numbers to be higher than they used to be. Those are the off-centre and
+off-height cells that were previously never evaluated. **A layout optimized for SPCAP or
+VBAP before this change was tuned against an objective that could not move, and is worth
+re-running.**
+
+Press **M** for the **badness map**: a grid of *listener* positions through the working
+volume, each scored over a spread of directions, drawn as semitransparent voxels. The
+coverage shell answers "which directions work from here"; this answers "where can somebody
+stand". Good regions fade out, bad ones light up. Toggle **solve at** while watching it:
+a fixed solve draws an island around the sweet spot, a tracked one stays flat.
+
+The map's metric follows the panner, and so does the optimizer's **focus wt** default.
+That is measured, not taste: against the acoustic measurement in
+[validation.md](validation.md), rE direction error ranks DBAP cells well (Spearman 0.82)
+and VBAP cells barely at all (0.19), where the Frank spread is the strong predictor
+(0.77). One global default would be wrong for two of the three panners. Both are
+overridable.
+
 Drop a **`constraints.json`** next to the layout (see `examples/constraints.json`) to
 declare where speakers may go:
 
@@ -70,7 +97,13 @@ Scoring/coverage target the observer at **ear height** (the `obs y` slider, defa
 shell to show where the array is weak. **G** switches its metric between the geometric
 *nearest-speaker gap* and the selected panner's *per-direction rE error* (green =
 accurate, red = mislocalised; hover a cube for its value). **V** toggles the observer
-model (fixed centre versus the moving working volume). The file:
+model (fixed centre versus the moving working volume).
+
+The listener grid spans ±0.45 m in **height**, a realistic seated-to-tall range rather
+than a token nudge. Off-height is a distinct failure mode from off-centre-in-plane: the
+speakers sit mostly overhead and the alignment delays are computed for one reference
+height, so tracking re-aims the solve but fixes neither. A grid that barely varies height
+cannot see the problem it most needs to. The file:
 
 ```jsonc
 {
