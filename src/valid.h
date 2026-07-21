@@ -43,10 +43,14 @@
 
 /* One measured or simulated cell of the grid. */
 typedef struct {
-    int   panner;         /* bwa_panner */
+    int   panner;         /* bwa_panner; meaningless when reference = 1 */
     int   tracked;        /* 1 = solved at the mic, 0 = solved at the sweet spot */
+    int   reference;      /* 0 = a grid phantom (tgt indexes the caller's target list)
+                           * 1 = ONE speaker driven directly, no panning: a physical source
+                           * 2 = the phantom MATCHED to it, rendered at that speaker's position.
+                           * For 1 and 2, tgt is the SPEAKER index, so a pair is (lis, tgt). */
     int   lis;            /* index into the caller's listener list */
-    int   tgt;            /* index into the caller's target list */
+    int   tgt;            /* index into the caller's target list, or the speaker index if reference */
     float mic[3];         /* where the array was listened from (room m) */
     float target[3];      /* unit direction the source SHOULD have come from, seen from mic */
     float measured[3];    /* unit direction it actually came from */
@@ -54,6 +58,50 @@ typedef struct {
     float diffuseness;    /* estimator confidence; high = measured in a smeared field */
     int   ok;             /* 0 = the estimator refused, miss_deg is meaningless */
 } ValidCell;
+
+/* ---- the measurement stimulus ----
+ *
+ * Localization accuracy is strongly content-dependent IN A ROOM: broadband localizes best, speech is
+ * intermediate, sustained narrowband tones are worst, sometimes by tens of degrees. The mechanism for
+ * the tone case is specific and worth knowing before reading any result — a steady tone sets up a
+ * standing-wave field, and the active-intensity vector reports the net energy flux at ONE point,
+ * which near a pressure node need not point back at the source. Broadband content averages that flux
+ * over many independent bins and the off-source contributions cancel; a tone in a narrow band has no
+ * such averaging.
+ *
+ * THERE ARE TWO MECHANISMS, and it is easy to credit only the first. The published study measured
+ * its anechoic control with a PHYSICAL loudspeaker — one coherent source, nothing to interfere with —
+ * and found every stimulus localized equally there, which makes the room look like the whole story.
+ * It is not, for a PHANTOM:
+ *  - **The room**: standing waves, as above. Needs hardware to see.
+ *  - **The array itself**: a phantom is a coherent sum of many speakers, so its interference pattern
+ *    is frequency-dependent even in free field. Broadband averages over that; one tone cannot. This
+ *    shows up ANECHOICALLY, and the harness measures it (the `valid` test reports the anechoic
+ *    content spread for a physical source versus a phantom: ~0.1 deg against tens of degrees).
+ *
+ * So --simulate DOES show content dependence for phantoms, and that is a result rather than a fault.
+ * The negative control is the REFERENCE arm: a single driven speaker must localize the same whatever
+ * the content, because there is nothing for it to interfere with. If that ever stops holding, the
+ * analysis chain is at fault and every content finding built on it is an artifact.
+ *
+ * One more property worth knowing: a tone's error is *precisely wrong* — sub-degree repeatable and
+ * tens of degrees biased. Repeat measurements agree beautifully with each other and with nothing else.
+ *
+ * The analysis band follows the stimulus: broadband gets 400-1200 Hz, a tone gets +-1/6 octave around
+ * itself. A tone whose band lies entirely above the array's first-order ceiling (a 6 kHz tone) is
+ * refused outright rather than measured badly.
+ *
+ * Module-level, control-thread only, mirroring zylia_set_capsules: these tools are single-threaded
+ * and the stimulus is a property of a whole run, not of one cell. Returns 1 if the stimulus is
+ * measurable, 0 if it is out of the array's reach (state is then unchanged). */
+typedef enum {
+    VALID_STIM_BROADBAND = 0,   /* a 24-tone sum across 420-1150 Hz: the default, best case */
+    VALID_STIM_TONE      = 1    /* one sustained tone at `hz`: the pathological case */
+} ValidStimKind;
+
+int         valid_set_stimulus(ValidStimKind kind, double hz);
+void        valid_get_stimulus_band(double* f_lo, double* f_hi);
+const char* valid_stimulus_name(void);
 
 /* Synthesize the 19 capsule signals a ZM-1 at `mic` records while the array renders a source at
  * world position `src_world`, with `panner` solved at `solve_pos`. buf = [ZYLIA_MICS][n] flat, row
@@ -100,6 +148,35 @@ int valid_speaker_feeds(const Layout* L, int panner, const float solve_pos[3],
 int valid_score(const Layout* L, int panner, int tracked, const float mic[3], const float src_world[3],
                 const float* cap19, uint32_t n, double fs, double c,
                 const unsigned char* exclude, ValidCell* out);
+
+/* ---- the physical reference arm: drive ONE speaker, measure where it lands ----
+ *
+ * Every miss above is an ABSOLUTE number, so it folds three things together: what the estimator
+ * costs, what the room costs, and what the renderer costs. Separating them needs a physical source
+ * measured through the same chain in the same room, which is why the published protocol moved a real
+ * loudspeaker to each target direction across dozens of sessions.
+ *
+ * We do not have to move anything. THE ARRAY'S OWN SPEAKERS ARE PHYSICAL SOURCES at known positions.
+ * Drive speaker i alone, with no panning, and the estimator's answer is a real-source measurement in
+ * this room. Two things fall out:
+ *
+ *  - **A matched-cell contrast.** Render a phantom AT SPEAKER i'S OWN POSITION and you have the same
+ *    direction, the same room and the same microphone placement, measured both ways. Subtracting is
+ *    then meaningful in the way an absolute miss is not: "+11 deg over a real source here", rather
+ *    than "16 deg", which silently includes the room and the instrument.
+ *  - **An end-to-end instrument check.** If the estimator cannot find speaker 7 where the surveyed
+ *    layout says speaker 7 is, nothing downstream is trustworthy — and you learn it in seconds
+ *    rather than after a full session.
+ *
+ * The target is taken from the LAYOUT, so a reference miss also prices in survey error. That is
+ * correct: a layout that misplaces a speaker misaims every phantom too.
+ *
+ * `valid_reference_feeds` is the hardware side (unit drive on one channel, still through its trim and
+ * alignment delay, exactly as align.c would); `valid_reference_cell` is the offline equivalent. */
+int valid_reference_feeds(const Layout* L, int spk, double fs, float* feeds, uint32_t n);
+
+int valid_reference_cell(const Layout* L, int spk, const float mic[3],
+                         double fs, double c, uint32_t n, ValidCell* out);
 
 /* The GEOMETRIC PROXIES the layout optimizer climbs, evaluated on the same cell the harness
  * measures acoustically — so the two can be compared directly, which is the entire point.

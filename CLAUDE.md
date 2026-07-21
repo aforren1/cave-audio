@@ -71,7 +71,9 @@ src/
                        SRP-PHAT cross-check. [calib]
   valid.h / valid.c    phantom-localization validation: render a source, measure where the array
                        actually put it (feeds/simulate/score + medians, bootstrap, matched-cell
-                       contrasts). Drives bwa_validate. [validation]
+                       contrasts). Also the PHYSICAL REFERENCE arm (drive one speaker alone = a real
+                       source, so a phantom miss reads against a floor) and stimulus selection
+                       (broadband or a tone, analysis band follows). Drives bwa_validate. [validation]
   dbap.h / dbap.c      listener-relative, constant-power DBAP gain solve. [M4]
   fdn.h / fdn.c        directional FDN reverb bed (phonon-free; takes the reflection bus tap). [innovations]
   ism.h / ism.c        image-source EARLY reflections: shoebox mirrors, panned as point sources. [innovations]

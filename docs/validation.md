@@ -16,6 +16,9 @@ Build it with `-DBWA_BUILD_CALIBRATE=ON` (same switch as `bwa_calibrate`). Run
   sweet spot, which is where measurements are usually taken, which is why this question normally
   goes unanswered.
 - Where in the room the layout works, and where it stops working.
+- **How much of the error is the renderer at all.** Driving one speaker alone gives a physical source
+  through the same chain, so the phantom miss can be read against a floor rather than in a vacuum.
+- **How much the content matters here**, by measuring the same cells broadband and on a tone.
 
 ## The seam: solve position versus microphone position
 
@@ -194,6 +197,8 @@ bwa_validate --layout cave_layout.json --azimuths 24 --out cells.csv
 | `--natnet-server <ip>` | Motive host; **required** to `--track` by name, since the streaming id is resolved from Motive's model definitions |
 | `--natnet-multicast <g>` | NatNet group (default 239.255.42.99) |
 | `--track-sim` | self-check, see below |
+| `--no-reference` | skip the physical reference arm (each speaker driven alone) |
+| `--tone <hz>` | measure with a sustained tone instead of broadband; see below |
 | `--inject-fault <ch>` | self-check, see below |
 
 The built-in placements are a plausible walking envelope, not your room. Pass your own with
@@ -267,6 +272,80 @@ Two safety behaviours worth knowing:
   while it announced the tracker was measuring. Asserting on the *result* would not have caught it:
   in simulate the field is synthesized from the same capsule table the estimator reads, so a wrong
   table cancels out and looks healthy. It is the `validate_track` ctest.
+
+### The physical reference arm
+
+Every miss elsewhere in this doc is an **absolute** number, so it silently folds together what the
+estimator costs, what the layout survey costs, what the room costs, and what the renderer costs.
+Separating them needs a real source measured through the same chain in the same room, which is why
+the published protocol moved a physical loudspeaker to each target across dozens of sessions.
+
+We do not have to move anything: **the array's own speakers are physical sources at known
+positions.** Drive speaker *i* alone, no panning, and the estimator's answer is a real-source
+measurement. On by default; `--no-reference` skips it.
+
+It buys two things.
+
+**A floor.** The reported `physical floor` is what the chain costs before any panning happens. In
+anechoic simulate it lands around 0.1°. On hardware it will be larger, and the increase *is* the
+room's contribution plus your survey error. If it is not small, stop: a directly driven speaker that
+does not land on its surveyed position means nothing measured afterwards is interpretable, and you
+find that out in seconds rather than after a session.
+
+**A matched contrast.** Render a phantom at speaker *i*'s own position and you have the same
+direction, the same room and the same placement measured both ways, so the pair differences cleanly.
+That is the published physical-versus-phantom comparison, obtained without moving a loudspeaker.
+
+Two things to know before reading that table:
+
+- **It is ~0 at the array centre, by symmetry.** A blurred phantom's energy vector still points at
+  the speaker when you are at the centre of a symmetric array. The off-centre rows carry the
+  information; the centre row is a null control.
+- **Never pool it across placements.** The distribution is bimodal (≈0 centred, degrees off-centre),
+  so a pooled median lands in the empty middle and reads as "no effect", the exact opposite of the
+  truth. The tool reports per placement for this reason. This is not hypothetical: pooling one
+  centred placement with one off-centre one during development produced 0.13°, against 1.8° for the
+  off-centre placement alone.
+
+Expect a triangle panner (VBAP) to show ~0 here even off-centre, because it collapses onto the
+coincident speaker, while a distance-blurred panner (DBAP) spreads and pays a real penalty. That
+difference is a genuine characterisation of the panners, not an artifact.
+
+### Stimulus, and where content dependence actually comes from
+
+`--tone <hz>` swaps the broadband default for a sustained tone. The analysis band follows: broadband
+gets 400–1200 Hz, a tone gets ±1/6 octave around itself, and a tone whose band sits entirely above
+the array's first-order ceiling is refused **with its frequency named**, rather than failing
+mysteriously per cell.
+
+Localization is strongly content-dependent, and it is natural to credit that entirely to the room.
+That is not the whole story, and the harness can show why.
+
+| | anechoic (simulate) | in a room |
+| --- | --- | --- |
+| **physical source** (one speaker) | content-**independent** | content-dependent (standing waves) |
+| **phantom** (many speakers) | content-**dependent** | more so |
+
+Two mechanisms, not one:
+
+- **The room.** A steady tone sets up a standing-wave field, and a single-point intensity vector
+  reports net energy flux, which near a pressure node need not point at the source. Hardware only.
+- **The array itself.** A phantom is a coherent sum of many speakers, so its interference pattern is
+  frequency-dependent *in free field*. Broadband averages over it; one tone cannot.
+
+The published study's anechoic control used a **physical loudspeaker**, which has nothing to
+interfere with, so it could only see the first mechanism. Measured here in simulate, the anechoic
+content spread is about **0.1° for a physical source and tens of degrees for a phantom**. So a
+simulate run *does* show content dependence for phantoms, and that is a result rather than a fault.
+
+**The negative control is therefore the reference arm, not simulate.** A single driven speaker must
+localize the same whatever the content. If that ever stops holding, the analysis chain is at fault
+and every content finding built on it is an artifact. The `valid` ctest asserts exactly that and
+merely reports the phantom spread, whose size is a property of the array rather than a contract.
+
+One property to keep in mind when reading tone results: the error is *precisely wrong*. Sub-degree
+repeatable, tens of degrees biased. Repeats will agree beautifully with each other and with nothing
+else.
 
 ### Proving the integrity layer on your own data
 
@@ -387,10 +466,14 @@ Say these out loud before quoting any number from this tool.
   ~3.3 kHz as a cross-check, not as the primary outcome.
 - **Simulate is anechoic.** Rendering term only.
 - **Single point per placement.** The map is as dense as the placements you measure.
-- **Content matters and this tool uses one stimulus.** Localization error is ordered by effective
-  bandwidth: broadband best, speech in between, narrowband tones far worse. A number quoted without
-  its stimulus is incomplete. The harness stimulus is broadband by design, so its numbers are the
-  optimistic end of that range.
+- **A number quoted without its stimulus is incomplete.** Localization error is ordered by effective
+  bandwidth: broadband best, narrowband tones far worse. The default is broadband, which is the
+  *optimistic* end of that range; `--tone` reaches the other end. Always say which one a figure came
+  from. The tool prints the stimulus and its analysis band in the header of every run for this reason.
+- **Synthetic stimuli only.** Broadband tone-sum or a single tone, both steady-state. Real programme
+  material (speech, applause, transients) is not covered, and speech in particular sits between the
+  two ends measured here. The steady-state property is what makes the measurement
+  latency-independent, so supporting file playback would cost that.
 
 ## Where the code lives
 

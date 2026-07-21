@@ -342,6 +342,117 @@ int main(void) {
         printf("\n");
     }
 
+    /* ---- the physical reference arm ----
+     *
+     * Driving one speaker alone is a real point source at a known position, so the estimator should
+     * find it very accurately: this is close to the instrument floor, and it is the baseline a
+     * phantom miss should be quoted AGAINST rather than as an absolute. Rendering a phantom at that
+     * same speaker's position gives a genuine matched-cell contrast — same direction, same room,
+     * same placement — which is the published physical-versus-phantom comparison with nothing moved.
+     */
+    {
+        static double refm[BWA_CHANNELS], phm[BWA_CHANNELS];
+        int nref = 0;
+        float mic[3] = { 0.4f, EY, -0.3f };
+        double worst_ref = 0.0;
+        for (uint32_t sp = 0; sp < L.count; ++sp) {
+            ValidCell rc, pc;
+            if (!valid_reference_cell(&L, (int)sp, mic, FS, C, NCAP, &rc) || !rc.ok) continue;
+            CHECK(rc.reference == 1 && rc.tgt == (int)sp, "a reference cell is tagged with its speaker");
+            if (rc.miss_deg > worst_ref) worst_ref = rc.miss_deg;
+            /* the matched phantom: a rendered source AT that speaker's own position */
+            float src[3] = { L.speakers[sp].pos[0], L.speakers[sp].pos[1], L.speakers[sp].pos[2] };
+            if (!valid_cell(&L, BWA_PAN_DBAP, 1, mic, src, FS, C, NCAP, &pc) || !pc.ok) continue;
+            if (nref < 4)
+                printf("[reference    ]   spk %2u: real %.2f  phantom-at-its-position %.2f deg\n",
+                       sp, rc.miss_deg, pc.miss_deg);
+            refm[nref] = rc.miss_deg; phm[nref] = pc.miss_deg; ++nref;
+        }
+        CHECK(nref >= 8, "most speakers yield a matched reference/phantom pair");
+
+        double rmed = valid_median(refm, nref), pmed = valid_median(phm, nref);
+        double md = 0, lo = 0, hi = 0;
+        valid_contrast(refm, phm, nref, 2000, 31337u, &md, &lo, &hi);
+        printf("[reference    ] physical %.2f deg (worst %.2f)   phantom %.2f deg   contrast %+.2f [%+.2f,%+.2f]\n",
+               rmed, worst_ref, pmed, md, lo, hi);
+
+        /* A single driven speaker must localize far better than anything panned. If it does not,
+         * the fault is upstream of the renderer — layout, estimator or geometry — and every phantom
+         * number in the run is resting on it. */
+        CHECK(rmed < 1.0, "a directly driven speaker lands essentially on its surveyed position");
+        CHECK(md > 0.0, "phantoms cost more than the physical source they are matched against");
+
+        /* an out-of-range speaker index is refused rather than read off the end */
+        ValidCell bad;
+        CHECK(!valid_reference_cell(&L, (int)L.count, mic, FS, C, NCAP, &bad), "bad speaker index refused");
+        CHECK(!valid_reference_cell(&L, -1, mic, FS, C, NCAP, &bad), "negative speaker index refused");
+    }
+
+    /* ---- stimulus selection, and the anechoic negative control ----
+     *
+     * Content dependence is a ROOM effect: a sustained tone sets up a standing-wave field and the
+     * single-point intensity vector stops pointing at the source. Simulate is anechoic, so every
+     * stimulus must localize about equally here. That makes this a CONTROL rather than a result — if
+     * a tone ever localizes much worse in simulate, the fault is in the estimator, not in acoustics,
+     * and any in-room content finding built on it would be an artifact.
+     */
+    {
+        float mic[3] = { 0.35f, EY, -0.25f };
+        float src[3] = { L.ref[0] + 1.4f*0.5f, L.ref[1] + 1.4f*0.2f, L.ref[2] - 1.4f*0.84f };
+        double f_lo = 0, f_hi = 0;
+
+        CHECK(valid_set_stimulus(VALID_STIM_BROADBAND, 0), "broadband selects");
+        valid_get_stimulus_band(&f_lo, &f_hi);
+        CHECK(f_lo > 300.0 && f_hi <= ZYLIA_FOA_FMAX + 1.0, "broadband band is the first-order band");
+        ValidCell bb;
+        CHECK(valid_cell(&L, BWA_PAN_DBAP, 1, mic, src, FS, C, 8192u, &bb) && bb.ok, "broadband cell");
+
+        /* a tone above the array's first-order reach is refused WITH its frequency, not measured */
+        CHECK(!valid_set_stimulus(VALID_STIM_TONE, 6000.0), "a 6 kHz tone is refused outright");
+        CHECK(!valid_set_stimulus(VALID_STIM_TONE, 0.0), "a zero-frequency tone is refused");
+        valid_get_stimulus_band(&f_lo, &f_hi);
+        CHECK(f_hi <= ZYLIA_FOA_FMAX + 1.0, "a refused tone leaves the previous stimulus in place");
+
+        /* THE CONTROL IS THE PHYSICAL SOURCE, NOT THE PHANTOM. A single driven speaker is one
+         * coherent source with nothing to interfere with, so anechoically it must localize the same
+         * whatever the content: that is a clean test of the ESTIMATOR across frequency. Asserting
+         * the same of a phantom would be wrong, and measuring it here showed why (below). */
+        CHECK(valid_set_stimulus(VALID_STIM_BROADBAND, 0), "broadband selects");
+        ValidCell rbb;
+        CHECK(valid_reference_cell(&L, 0, mic, FS, C, 8192u, &rbb) && rbb.ok, "reference broadband");
+        double worst_ref_spread = 0.0, worst_ph = 0.0;
+        const double hz[3] = { 500.0, 800.0, 1000.0 };
+        for (int i = 0; i < 3; ++i) {
+            CHECK(valid_set_stimulus(VALID_STIM_TONE, hz[i]), "an in-band tone selects");
+            valid_get_stimulus_band(&f_lo, &f_hi);
+            CHECK(f_lo < hz[i] && f_hi > hz[i], "the analysis band brackets the tone");
+            ValidCell rc, tc;
+            CHECK(valid_reference_cell(&L, 0, mic, FS, C, 8192u, &rc) && rc.ok, "reference tone cell");
+            CHECK(valid_cell(&L, BWA_PAN_DBAP, 1, mic, src, FS, C, 8192u, &tc) && tc.ok, "phantom tone cell");
+            double dr = fabs((double)rc.miss_deg - rbb.miss_deg);
+            double dp = fabs((double)tc.miss_deg - bb.miss_deg);
+            if (dr > worst_ref_spread) worst_ref_spread = dr;
+            if (dp > worst_ph) worst_ph = dp;
+            printf("[stimulus     ] %6.0f Hz: physical %.2f deg (broadband %.2f)   phantom %.2f deg (broadband %.2f)\n",
+                   hz[i], rc.miss_deg, rbb.miss_deg, tc.miss_deg, bb.miss_deg);
+        }
+
+        /* The estimator is content-independent on a real source. If this ever fails, a content
+         * finding anywhere else in the harness is an artifact of the analysis chain. */
+        CHECK(worst_ref_spread < 1.0,
+              "ANECHOIC + PHYSICAL source: content-independent, so the estimator is not the cause");
+
+        /* Phantoms are NOT content-independent even anechoically, and that is a real result rather
+         * than a fault: a phantom is a coherent multi-speaker sum, so its interference pattern is
+         * frequency-dependent in free field. Broadband averages over that; one tone cannot. The
+         * published study's anechoic control used a PHYSICAL loudspeaker, which has nothing to
+         * interfere with, so it could not see this — the room is an ADDITIONAL mechanism on top,
+         * not the only one. Reported, not asserted: the size is a property of the array. */
+        printf("[stimulus     ] anechoic content spread: physical %.2f deg, phantom %.2f deg\n",
+               worst_ref_spread, worst_ph);
+        valid_set_stimulus(VALID_STIM_BROADBAND, 0);      /* restore for anything after */
+    }
+
     /* ---- assertions: machinery and the geometrically necessary, not the result ---- */
 
     /* At the sweet spot the two modes solve at the SAME point, so they must agree cell for cell.

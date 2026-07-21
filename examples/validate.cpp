@@ -45,7 +45,9 @@ extern "C" {
 #include <string.h>
 
 #define MAX_LIS   64
-#define MAX_TGT   (36 * 3)
+/* 36 azimuths x 3 elevations of grid, PLUS one speaker-matched target per channel for the physical
+ * reference arm. The per-placement scratch arrays below are sized off this, so it has to cover both. */
+#define MAX_TGT   (36 * 3 + BWA_CHANNELS)
 #define NPAN      3
 #define LBL       32
 
@@ -245,7 +247,7 @@ static int track_place(void* user, int li, float mic_out[3]) {
 static int run_session(const Layout* L, CaptureFn cap, CapCtx* ctx,
                        const int* panners, int npan,
                        float (*lis)[3], char (*lisname)[LBL], int nlis,
-                       float (*tg)[3], int ntgt, float radius,
+                       float (*tg)[3], int ntgt, int ngrid, float radius, int do_ref,
                        int prompt, int (*place)(void*, int, float[3]), void* place_user,
                        ValidCell* cells, int* nchecked, int* nflagged, int* nplaced) {
     float* cap19 = (float*)malloc(sizeof(float) * (size_t)ZYLIA_MICS * VAL_ANALYZE);
@@ -275,9 +277,55 @@ static int run_session(const Layout* L, CaptureFn cap, CapCtx* ctx,
             if (nplaced) ++(*nplaced);            /* counts INVOCATIONS: 0 means the hook is unwired */
         }
 
+        /* The physical baseline: drive each speaker alone. No panner, so this is measured once per
+         * placement rather than per panner/mode. It is also the fastest possible sanity check on the
+         * whole chain — if a directly driven speaker does not land on its surveyed position, nothing
+         * measured afterwards at this placement means anything. */
+        if (do_ref) {
+            for (uint32_t sp = 0; sp < L->count; ++sp) {
+                ValidCell* c = &cells[w];
+                if (!valid_reference_cell(L, (int)sp, lis[li], VAL_FS, 343.0, VAL_ANALYZE, c)) {
+                    memset(c, 0, sizeof *c); c->reference = 1; c->tgt = (int)sp;
+                }
+                c->lis = li;
+                ++w;
+            }
+            double rm[BWA_CHANNELS]; int nr = 0;
+            for (int i = 0; i < w; ++i)
+                if (cells[i].lis == li && cells[i].reference && cells[i].ok) rm[nr++] = cells[i].miss_deg;
+            if (nr) {
+                double med = valid_median(rm, nr), wmax = 0.0;
+                for (int i = 0; i < nr; ++i) if (rm[i] > wmax) wmax = rm[i];
+                printf("  physical reference: median %.2f deg, worst %.2f deg over %d speakers%s\n",
+                       med, wmax, nr, (med > 5.0) ? "   <-- SUSPECT, check layout/survey" : "");
+            }
+        }
+
+        /* The MATCHED phantom for each reference: a rendered source at that speaker's own position.
+         * Same direction, same room, same placement, so the pair differences cleanly. It is not
+         * degenerate — a distance-blurred panner still spreads a source that sits on a speaker, and
+         * how much it spreads is exactly the rendering cost being asked about. */
+        if (do_ref)
+            for (int p = 0; p < npan; ++p)
+                for (int tracked = 1; tracked >= 0; --tracked)
+                    for (uint32_t sp = 0; sp < L->count; ++sp) {
+                        const float* q = L->speakers[sp].pos;
+                        float src[3] = { q[0], q[1], q[2] };
+                        const float* solve = tracked ? lis[li] : L->ref;
+                        ValidCell* c = &cells[w];
+                        int got = 0;
+                        if (cap(ctx, panners[p], solve, lis[li], src, cap19))
+                            got = valid_score(L, panners[p], tracked, lis[li], src,
+                                              cap19, VAL_ANALYZE, VAL_FS, 343.0, flags, c);
+                        if (!got) { memset(c, 0, sizeof *c); c->panner = panners[p]; c->tracked = tracked; }
+                        c->lis = li; c->tgt = (int)sp; c->reference = 2;
+                        ++w;
+                    }
+
         for (int p = 0; p < npan; ++p)
             for (int tracked = 1; tracked >= 0; --tracked)
                 for (int t = 0; t < ntgt; ++t) {
+                    (void)ngrid;
                     float src[3] = { L->ref[0] + radius*tg[t][0],
                                      L->ref[1] + radius*tg[t][1],
                                      L->ref[2] + radius*tg[t][2] };
@@ -340,6 +388,7 @@ int main(int argc, char** argv) {
     const char* nn_server = NULL;
     const char* nn_multicast = "239.255.42.99";
     int track_sim = 0;               /* synthetic mount pose: exercises the tracked path, no rig */
+    int do_ref = 1;                  /* physical reference arm: each speaker driven alone */
     float radius = 1.4f;
     static float lis[MAX_LIS][3];
     static char  lisname[MAX_LIS][LBL];
@@ -361,6 +410,17 @@ int main(int argc, char** argv) {
         else if (!strcmp(argv[i], "--natnet-server") && i+1 < argc) nn_server = argv[++i];
         else if (!strcmp(argv[i], "--natnet-multicast") && i+1 < argc) nn_multicast = argv[++i];
         else if (!strcmp(argv[i], "--track-sim"))                   track_sim = 1;
+        else if (!strcmp(argv[i], "--no-reference"))                do_ref = 0;
+        else if (!strcmp(argv[i], "--tone") && i+1 < argc) {
+            double hz = atof(argv[++i]);
+            if (!valid_set_stimulus(VALID_STIM_TONE, hz)) {
+                fprintf(stderr, "--tone %.0f Hz is outside the array's first-order reach: its\n"
+                                "+-1/6-octave band sits above the %.0f Hz ceiling (kr ~ 1 on a 49 mm\n"
+                                "sphere). Pick a lower tone, or use the broadband default.\n",
+                        hz, ZYLIA_FOA_FMAX);
+                return 2;
+            }
+        }
         else if (!strcmp(argv[i], "--position")  && i+1 < argc) {
             if (nlis_cli >= MAX_LIS) { fprintf(stderr, "too many --position\n"); return 2; }
             if (!parse_xyz(argv[++i], lis[nlis_cli])) {
@@ -388,6 +448,17 @@ int main(int argc, char** argv) {
                    "  --natnet-server <ip>  Motive host; REQUIRED to --track by name (the streaming id\n"
                    "                        is resolved from Motive's model definitions)\n"
                    "  --natnet-multicast <g>  NatNet group (default 239.255.42.99)\n"
+                   "  --tone <hz>           measure with a sustained TONE instead of broadband. Two\n"
+                   "                        mechanisms make this the hard case: room standing waves\n"
+                   "                        (hardware only), AND the array's own frequency-dependent\n"
+                   "                        interference, which shows up in --simulate too. A single\n"
+                   "                        driven speaker stays content-independent either way, so\n"
+                   "                        the reference arm is the control.\n"
+                   "  --no-reference        skip the physical reference arm (each speaker driven\n"
+                   "                        alone). That arm is what makes a phantom miss a CONTRAST\n"
+                   "                        against a real source rather than an absolute number, and\n"
+                   "                        it is the fastest check that the chain is sane at all —\n"
+                   "                        only skip it to save rig time.\n"
                    "  --track-sim           SELF-CHECK: drive the tracked path from a synthetic mount\n"
                    "                        pose, no rig. Still needs --survey. Nonzero exit if the\n"
                    "                        placement hook does not fire for every placement.\n"
@@ -412,6 +483,11 @@ int main(int argc, char** argv) {
     }
     printf("layout: %u speakers, sweet spot (%.2f, %.2f, %.2f)%s\n",
            L.count, L.ref[0], L.ref[1], L.ref[2], layout_path ? "" : "  [built-in default grid]");
+    {
+        double f_lo, f_hi;
+        valid_get_stimulus_band(&f_lo, &f_hi);
+        printf("stimulus: %s   analysis band %.0f-%.0f Hz\n", valid_stimulus_name(), f_lo, f_hi);
+    }
 
     float elev[3] = { -25.0f, 0.0f, 25.0f };
     static float tg[MAX_TGT][3];
@@ -434,9 +510,19 @@ int main(int argc, char** argv) {
            user_pos ? "(yours)" : "(defaults — pass --position/--positions for the real ones)");
 
     const int panners[NPAN] = { BWA_PAN_DBAP, BWA_PAN_SPCAP, BWA_PAN_VBAP };
-    const int ncell = NPAN * 2 * nlis * ntgt;
-    printf("plan: %d directions x %d panners x 2 modes x %d placements = %d cells\n",
-           ntgt, NPAN, nlis, ncell);
+    /* NOT a matched-cell design, deliberately. Rendering a phantom at a speaker's own position is
+     * degenerate — the panner puts essentially all the gain on that one speaker, so the "phantom"
+     * IS the speaker and the difference measures nothing (tried it: ~0.02 deg). A true matched
+     * physical/phantom pair needs a real source at a direction BETWEEN the speakers, which is why
+     * the published protocol had to physically move a loudspeaker. What the reference arm gives us
+     * instead is the FLOOR: what the instrument, the layout survey and the room cost before any
+     * panning happens. Phantom misses are then quoted above that floor rather than as absolutes. */
+    const int ngrid = ntgt;
+    const int ncell = NPAN * 2 * nlis * ntgt
+                    + (do_ref ? nlis * (int)L.count * (1 + NPAN * 2) : 0);
+    printf("plan: %d directions x %d panners x 2 modes x %d placements%s = %d cells\n",
+           ntgt, NPAN, nlis,
+           do_ref ? ", plus one physical reference per speaker" : "", ncell);
     if (inject >= 0) printf("SELF-CHECK: capsule %d will be corrupted in every capture\n", inject);
 
     /* ---- optional tracked mount ---- */
@@ -534,7 +620,8 @@ int main(int argc, char** argv) {
 
     int nflagged = 0, nchecked = 0, nplaced = 0;
     int w = run_session(&L, cap, &ctx, panners, NPAN, lis, lisname, nlis,
-                        tg, ntgt, radius, prompt, place_fn, place_user, cells, &nchecked, &nflagged, &nplaced);
+                        tg, ntgt, ngrid, radius, do_ref, prompt, place_fn, place_user,
+                        cells, &nchecked, &nflagged, &nplaced);
 
 #ifdef BWA_HAVE_ASIO
     if (have_hw) valid_asio_close();
@@ -565,6 +652,66 @@ int main(int argc, char** argv) {
                    (lo > 0.0 || hi < 0.0) ? "  *" : "");
         }
     printf("  (* = interval excludes zero)\n");
+
+    /* ---- the physical floor, and what panning costs above it ----
+     * Driving one speaker alone is a real source at a known position, measured through the same
+     * chain in the same room. That is the floor: instrument + layout survey + room, before any
+     * panning. Quoting a phantom miss against it says something an absolute number cannot. */
+    if (do_ref) {
+        static double rr[MAX_TGT * 8];
+        int nr = 0;
+        for (int i = 0; i < w && nr < (int)(sizeof rr / sizeof rr[0]); ++i)
+            if (cells[i].reference && cells[i].ok) rr[nr++] = cells[i].miss_deg;
+        if (nr >= 4) {
+            double floor_med, lo, hi;
+            floor_med = valid_median(rr, nr);
+            valid_bootstrap_ci(rr, nr, 2000, 4242u, &lo, &hi);
+            printf("\nphysical floor: %.2f deg  CI [%.2f, %.2f]  (%d speakers x placements,\n"
+                   "  each driven alone — instrument + survey + room, before any panning)\n",
+                   floor_med, lo, hi, nr);
+            if (floor_med > 5.0)
+                printf("  ** SUSPECT. A directly driven speaker should land near its surveyed\n"
+                       "  ** position. Until this is small, no phantom number here is interpretable.\n");
+        }
+
+        /* Physical versus phantom, MATCHED per speaker: the published comparison, nothing moved.
+         * Reported PER PLACEMENT and never pooled across them. Pooling is actively misleading here:
+         * at the array centre the penalty is ~0 by symmetry (a blurred phantom's energy vector still
+         * points at the speaker), while off-centre it is degrees. Pool the two and the median lands
+         * in the empty middle and looks like "no effect", which is the opposite of the truth. */
+        printf("\nphysical versus phantom, matched per speaker (phantom - real, same direction)\n");
+        for (int li = 0; li < nlis; ++li)
+        for (int p = 0; p < NPAN; ++p)
+            for (int tracked = 1; tracked >= 0; --tracked) {
+                static double ra[MAX_TGT * 8], pa[MAX_TGT * 8];
+                int n = 0;
+                for (int sp = 0; sp < (int)L.count; ++sp) {
+                    ValidCell *rc = NULL, *pc = NULL;
+                    for (int i = 0; i < w; ++i) {
+                        ValidCell* c = &cells[i];
+                        if (c->lis != li || c->tgt != sp) continue;
+                        if (c->reference == 1) rc = c;
+                        else if (c->reference == 2 && c->panner == panners[p] &&
+                                 c->tracked == tracked) pc = c;
+                    }
+                    if (rc && pc && rc->ok && pc->ok &&
+                        n < (int)(sizeof ra / sizeof ra[0])) {
+                        ra[n] = rc->miss_deg; pa[n] = pc->miss_deg; ++n;
+                    }
+                }
+                if (n < 8) continue;
+                double md, clo, chi;
+                if (!valid_contrast(ra, pa, n, 2000, 4242u, &md, &clo, &chi)) continue;
+                printf("  %-16s %-5s %-8s  real %5.2f  phantom %5.2f   penalty %+6.2f  CI [%+.2f, %+.2f]%s\n",
+                       lisname[li], pan_name(panners[p]), tracked ? "tracked" : "fixed",
+                       valid_median(ra, n), valid_median(pa, n), md, clo, chi,
+                       (clo > 0.0 || chi < 0.0) ? "  *" : "");
+            }
+        printf("  A source sitting ON a speaker is still spread by a distance-blurred panner, so this\n"
+               "  penalty is real. Expect ~0 at the array centre (symmetry) and degrees off-centre;\n"
+               "  read the off-centre rows, and do not average them together.\n");
+    }
+
     if (simulate)
         printf("\nSIMULATED: anechoic, so this is the RENDERING term only — the room adds to it.\n");
 

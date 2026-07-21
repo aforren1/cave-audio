@@ -244,9 +244,16 @@ that table.
       A *hot* capsule is the one to watch: array power still looks fine while every
       spherical-harmonic channel is poisoned. Note every exclusion in the log—a direction
       from 17 capsules is fine, one you *believed* came from 19 is not.
+- [ ] **Read the physical floor FIRST.** The run drives each speaker alone and reports a
+      `physical floor` before any phantom number. That is instrument + survey + room, and it
+      is the fastest possible check that the whole chain is sane. If a directly driven
+      speaker does not land near its surveyed position, stop and fix the layout, the survey
+      or the routing—nothing measured afterwards is interpretable.
 - [ ] **Sweet spot**: `bwa_validate --driver <name> --mic-in <n>`, first placement at the
-      listening point. Broadband miss here is the floor for everything else. If it's large,
-      stop and re-check the layout and trims before collecting more cells.
+      listening point. Note the matched physical-versus-phantom penalty is ~0 here by
+      symmetry; that row is a null control, not a result. The off-centre placements carry it,
+      and the table is deliberately per-placement because pooling those two shapes together
+      produces a meaningless middle.
 - [ ] **The walking envelope**: work through the placements. If the stand is tracked, add
       `--track <id> --survey <body-frame survey>` and the pose supplies both the position and
       the mount orientation; your typed placements become the plan, and the tool prints
@@ -259,11 +266,25 @@ that table.
 - [ ] **Height separately from horizontal**: expect these to behave differently. Tracking
       fixes horizontal displacement and does not fix height, which is a placement and
       calibration problem instead. Don't pool them into one "off-centre" number.
-- [ ] **Keep the CSV** (`--out cells.csv`). It's the before/after record for any later
-      layout or calibration change, and re-running is cheap once the rig is set up.
+- [ ] **Then repeat one placement on a tone**: `--tone 1000` and, if you want the hard case,
+      `--tone 250`. This is where content dependence lives, and it is the number a
+      stimulus-agnostic spec cannot give you. Two mechanisms contribute and only one is the
+      room, so compare against the *simulated* tone run for the same placement: the excess
+      is the room's share. Expect the tone error to be **precisely wrong**: sub-degree
+      repeatable and possibly tens of degrees biased, so do not read repeatability as
+      accuracy. (6 kHz is refused: it is above the array's first-order reach, as the
+      published study also had to drop it.)
+- [ ] **Sanity-check the reference across stimuli.** A directly driven speaker should
+      localize the same broadband and on a tone; it is one source with nothing to interfere
+      with. If it does not, the analysis chain is at fault and the tone result above is an
+      artifact rather than a room measurement.
+- [ ] **Keep the CSV** (`--out cells.csv`), one per stimulus. It's the before/after record
+      for any later layout or calibration change, and re-running is cheap once set up.
 
 Quote no number from this without its caveats: single point per placement, 400–1200 Hz,
-broadband stimulus, and a microphone is a more pessimistic observer than a listener.
+**and the stimulus it came from**: broadband and tone figures are the two ends of a wide
+range, not interchangeable. A microphone is also a more pessimistic observer than a
+listener, who gets two ears, head movement and the precedence effect.
 
 ## Stage 5: by-ear checks
 

@@ -9,6 +9,7 @@
 #include "vbap.h"
 
 #include <math.h>
+#include <stdio.h>         /* snprintf, for the stimulus label */
 #include <stdlib.h>
 #include <string.h>
 
@@ -39,29 +40,68 @@ static void valid_gains(const Layout* L, int panner, const float src[3], const f
     }
 }
 
-/* The harness stimulus, in one place so the simulated and hardware paths cannot drift apart: a fixed
- * broadband tone sum inside the estimator's own band. Fixed seed — a cell must be reproducible. */
-static void valid_stimulus(double* phase, double* freq) {
+/* Selected stimulus. Module-level and control-thread only (see valid.h): it is a property of a whole
+ * run, and threading it through every feed/field/score signature would buy nothing. */
+static ValidStimKind g_stim_kind = VALID_STIM_BROADBAND;
+static double        g_stim_hz   = 0.0;
+static char          g_stim_name[32] = "broadband 420-1150 Hz";
+
+void valid_get_stimulus_band(double* f_lo, double* f_hi) {
+    if (g_stim_kind == VALID_STIM_TONE) {
+        const double SIXTH = 1.1224620483;            /* 2^(1/6): the +-1/6-octave analysis band */
+        if (f_lo) *f_lo = g_stim_hz / SIXTH;
+        if (f_hi) *f_hi = g_stim_hz * SIXTH;
+    } else {
+        if (f_lo) *f_lo = 400.0;
+        if (f_hi) *f_hi = ZYLIA_FOA_FMAX;
+    }
+}
+
+const char* valid_stimulus_name(void) { return g_stim_name; }
+
+int valid_set_stimulus(ValidStimKind kind, double hz) {
+    if (kind == VALID_STIM_TONE) {
+        if (!(hz > 0.0)) return 0;
+        const double SIXTH = 1.1224620483;
+        /* The whole band has to be reachable. A tone above the array's first-order ceiling is
+         * refused HERE, with the frequency in hand, rather than letting every cell fail later with
+         * no explanation — the 6 kHz condition the published study also had to drop. */
+        if (hz / SIXTH >= ZYLIA_FOA_FMAX) return 0;
+        g_stim_kind = kind;
+        g_stim_hz   = hz;
+        snprintf(g_stim_name, sizeof g_stim_name, "%.0f Hz tone", hz);
+    } else {
+        g_stim_kind = VALID_STIM_BROADBAND;
+        g_stim_hz   = 0.0;
+        snprintf(g_stim_name, sizeof g_stim_name, "broadband 420-1150 Hz");
+    }
+    return 1;
+}
+
+/* The harness stimulus, in one place so the simulated and hardware paths cannot drift apart. Returns
+ * the number of tones written. Fixed seed — a cell must be reproducible. */
+static int valid_stimulus(double* phase, double* freq) {
+    if (g_stim_kind == VALID_STIM_TONE) {
+        phase[0] = 0.0;
+        freq[0]  = g_stim_hz;
+        return 1;                                     /* ONE tone: no cross-bin averaging, by design */
+    }
     unsigned int rng = 0x5eed1234u;
     for (int k = 0; k < VALID_NTONES; ++k) {
         rng = rng * 1664525u + 1013904223u;
         phase[k] = ((double)(rng >> 8) / (double)(1u << 24)) * TWO_PI;
         freq[k]  = VALID_F_LO + (VALID_F_HI - VALID_F_LO) * (double)k / (double)(VALID_NTONES - 1);
     }
+    return VALID_NTONES;
 }
 
-int valid_speaker_feeds(const Layout* L, int panner, const float solve_pos[3],
-                        const float src_world[3], double fs, float* feeds, uint32_t n) {
-    if (!L || !solve_pos || !src_world || !feeds || fs <= 0.0 || n < 64u) return 0;
+/* Feeds for an ARBITRARY per-speaker gain vector. Both the panned render and the single-speaker
+ * physical reference go through here, so they cannot drift apart in trim, delay or stimulus. */
+static int valid_feeds_from_gains(const Layout* L, const float* gains,
+                                  double fs, float* feeds, uint32_t n) {
     uint32_t nspk = L->count;
-    if (nspk < 4u || nspk > (uint32_t)BWA_CHANNELS) return 0;
-
-    float gains[BWA_CHANNELS];
-    memset(gains, 0, sizeof gains);
-    valid_gains(L, panner, src_world, solve_pos, gains);
-
     double phase[VALID_NTONES], freq[VALID_NTONES];
-    valid_stimulus(phase, freq);
+    int nt = valid_stimulus(phase, freq);
 
     /* One stimulus, generated once over [-maxd, n); every speaker is a scaled, delayed copy of it.
      * Generating it per speaker would be nspk x n x ntones trig for no reason. */
@@ -71,8 +111,8 @@ int valid_speaker_feeds(const Layout* L, int panner, const float solve_pos[3],
     if (!s) return 0;
     for (uint32_t j = 0; j < n + maxd; ++j) {
         double t = ((double)j - (double)maxd) / fs, v = 0.0;
-        for (int k = 0; k < VALID_NTONES; ++k) v += sin(TWO_PI * freq[k] * t + phase[k]);
-        s[j] = v / (double)VALID_NTONES;
+        for (int k = 0; k < nt; ++k) v += sin(TWO_PI * freq[k] * t + phase[k]);
+        s[j] = v / (double)nt;
     }
     for (uint32_t i = 0; i < nspk; ++i) {
         double A = (double)gains[i] * (double)L->speakers[i].gain_lin;
@@ -84,22 +124,40 @@ int valid_speaker_feeds(const Layout* L, int panner, const float solve_pos[3],
     return 1;
 }
 
-int valid_simulate(const Layout* L, int panner, const float solve_pos[3], const float mic[3],
-                   const float src_world[3], double fs, double c, float* buf, uint32_t n) {
-    if (!L || !solve_pos || !mic || !src_world || !buf) return 0;
-    if (fs <= 0.0 || c <= 0.0 || n < 64u) return 0;
-    uint32_t nspk = L->count;
-    if (nspk < 4u || nspk > (uint32_t)BWA_CHANNELS) return 0;
-
+int valid_speaker_feeds(const Layout* L, int panner, const float solve_pos[3],
+                        const float src_world[3], double fs, float* feeds, uint32_t n) {
+    if (!L || !solve_pos || !src_world || !feeds || fs <= 0.0 || n < 64u) return 0;
+    if (L->count < 4u || L->count > (uint32_t)BWA_CHANNELS) return 0;
     float gains[BWA_CHANNELS];
     memset(gains, 0, sizeof gains);
     valid_gains(L, panner, src_world, solve_pos, gains);
+    return valid_feeds_from_gains(L, gains, fs, feeds, n);
+}
 
+int valid_reference_feeds(const Layout* L, int spk, double fs, float* feeds, uint32_t n) {
+    if (!L || !feeds || fs <= 0.0 || n < 64u) return 0;
+    if (L->count < 4u || L->count > (uint32_t)BWA_CHANNELS) return 0;
+    if (spk < 0 || (uint32_t)spk >= L->count) return 0;
+    /* Unit drive on one channel, no panner. Its trim and alignment delay still apply — that IS the
+     * physical source the room presents, and leaving them out would measure a different speaker
+     * from the one the array actually uses. */
+    float gains[BWA_CHANNELS];
+    memset(gains, 0, sizeof gains);
+    gains[spk] = 1.0f;
+    return valid_feeds_from_gains(L, gains, fs, feeds, n);
+}
+
+/* The anechoic field at the 19 capsules for an ARBITRARY per-speaker gain vector. Shared by the
+ * panned render and the single-speaker reference, so the reference is measured through exactly the
+ * same propagation model, not a simplified one. */
+static int valid_field(const Layout* L, const float* gains, const float mic[3],
+                       double fs, double c, float* buf, uint32_t n) {
+    uint32_t nspk = L->count;
     float capd[ZYLIA_MICS][3], R;
     zylia_geometry(capd, &R);
 
     double phase[VALID_NTONES], freq[VALID_NTONES];
-    valid_stimulus(phase, freq);
+    int nt = valid_stimulus(phase, freq);
 
     /* Every (speaker, capsule) path is one complex gain per tone:
      *   A_ij sin(w_k t + phi_k - w_k tau_ij) = Im{ e^{i w_k t} . A_ij e^{i(phi_k - w_k tau_ij)} }
@@ -123,7 +181,7 @@ int valid_simulate(const Layout* L, int panner, const float solve_pos[3], const 
              * alignment is imperfect, which is a real effect and belongs in the measurement */
             double tau = r / c + (double)L->speakers[i].delay_samples / fs;
             double A   = (double)gains[i] * (double)L->speakers[i].gain_lin / r;
-            for (int k = 0; k < VALID_NTONES; ++k) {
+            for (int k = 0; k < nt; ++k) {
                 double ang = phase[k] - TWO_PI * freq[k] * tau;
                 Cr[j][k] += A * cos(ang);
                 Ci[j][k] += A * sin(ang);
@@ -134,12 +192,12 @@ int valid_simulate(const Layout* L, int panner, const float solve_pos[3], const 
     for (int j = 0; j < ZYLIA_MICS; ++j)
         for (uint32_t t = 0; t < n; ++t) buf[(size_t)j * n + t] = 0.0f;
 
-    for (int k = 0; k < VALID_NTONES; ++k) {
+    for (int k = 0; k < nt; ++k) {
         double w = TWO_PI * freq[k] / fs;
         for (uint32_t t = 0; t < n; ++t) {
             double s = sin(w * (double)t), cc = cos(w * (double)t);
             for (int j = 0; j < ZYLIA_MICS; ++j)
-                buf[(size_t)j * n + t] += (float)((Cr[j][k]*s + Ci[j][k]*cc) / (double)VALID_NTONES);
+                buf[(size_t)j * n + t] += (float)((Cr[j][k]*s + Ci[j][k]*cc) / (double)nt);
         }
     }
 
@@ -156,6 +214,17 @@ int valid_simulate(const Layout* L, int panner, const float solve_pos[3], const 
         for (size_t i = 0; i < (size_t)ZYLIA_MICS * n; ++i) buf[i] *= g;
     }
     return 1;
+}
+
+int valid_simulate(const Layout* L, int panner, const float solve_pos[3], const float mic[3],
+                   const float src_world[3], double fs, double c, float* buf, uint32_t n) {
+    if (!L || !solve_pos || !mic || !src_world || !buf) return 0;
+    if (fs <= 0.0 || c <= 0.0 || n < 64u) return 0;
+    if (L->count < 4u || L->count > (uint32_t)BWA_CHANNELS) return 0;
+    float gains[BWA_CHANNELS];
+    memset(gains, 0, sizeof gains);
+    valid_gains(L, panner, src_world, solve_pos, gains);
+    return valid_field(L, gains, mic, fs, c, buf, n);
 }
 
 int valid_score(const Layout* L, int panner, int tracked, const float mic[3], const float src_world[3],
@@ -179,7 +248,9 @@ int valid_score(const Layout* L, int panner, int tracked, const float mic[3], co
     for (int j = 0; j < ZYLIA_MICS; ++j) ptr[j] = cap19 + (size_t)j * n;
 
     float d[3], psi = 0.0f;
-    if (!zylia_intensity_doa(ptr, n, fs, c, 400.0, 1200.0, exclude, d, &psi)) { out->ok = 0; return 1; }
+    double f_lo, f_hi;
+    valid_get_stimulus_band(&f_lo, &f_hi);   /* a tone is scored in its own +-1/6 octave */
+    if (!zylia_intensity_doa(ptr, n, fs, c, f_lo, f_hi, exclude, d, &psi)) { out->ok = 0; return 1; }
 
     out->measured[0] = d[0]; out->measured[1] = d[1]; out->measured[2] = d[2];
     out->diffuseness = psi;
@@ -200,6 +271,28 @@ int valid_cell(const Layout* L, int panner, int tracked, const float mic[3], con
     if (!valid_simulate(L, panner, solve, mic, src_world, fs, c, buf, n)) { free(buf); return 0; }
     int r = valid_score(L, panner, tracked, mic, src_world, buf, n, fs, c, NULL, out);
     free(buf);
+    return r;
+}
+
+int valid_reference_cell(const Layout* L, int spk, const float mic[3],
+                         double fs, double c, uint32_t n, ValidCell* out) {
+    if (!L || !mic || !out) return 0;
+    if (spk < 0 || (uint32_t)spk >= L->count) return 0;
+
+    float gains[BWA_CHANNELS];
+    memset(gains, 0, sizeof gains);
+    gains[spk] = 1.0f;
+
+    float* buf = (float*)malloc(sizeof(float) * (size_t)ZYLIA_MICS * n);
+    if (!buf) return 0;
+    if (!valid_field(L, gains, mic, fs, c, buf, n)) { free(buf); return 0; }
+
+    /* The speaker's own surveyed position IS the target. A reference miss therefore also prices in
+     * survey error, which is correct: a layout that misplaces a speaker misaims every phantom too. */
+    float src[3] = { L->speakers[spk].pos[0], L->speakers[spk].pos[1], L->speakers[spk].pos[2] };
+    int r = valid_score(L, 0, 0, mic, src, buf, n, fs, c, NULL, out);
+    free(buf);
+    if (r) { out->reference = 1; out->tgt = spk; }
     return r;
 }
 
