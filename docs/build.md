@@ -2,7 +2,7 @@
 
 ## Platform
 
-**Windows only.** ASIO is Windows-only; DVS is Windows/macOS. A cross-platform move
+**Windows only.** ASIO is Windows-only; the Digiface is Windows/macOS. A cross-platform move
 means abstracting the device layer: ASIO is only the Windows sink, and the backend
 elsewhere would be ALSA/JACK (Linux) or CoreAudio (macOS). Keep ASIO assumptions
 confined to `asio_sink.cpp`.
@@ -64,7 +64,7 @@ What the SDK adds, and what you lose without it:
 
 | dep            | role                                        | license / notes                          |
 |----------------|---------------------------------------------|------------------------------------------|
-| Steinberg ASIO SDK | device output to DVS; timing hooks       | dual GPLv3 / proprietary (see below)     |
+| Steinberg ASIO SDK | device output to the Digiface; timing hooks       | dual GPLv3 / proprietary (see below)     |
 | Steam Audio (C API)| binaural HRTF decode; occlusion, reflections (with baking), pathing - all implemented | Apache-2.0 (`steam-audio-source/LICENSE.md`) |
 | dr_libs (dr_wav 0.14.5 / dr_flac 0.13.3 / dr_mp3 0.7.3) | WAV/FLAC/MP3 decode (`sound.c`, `stream.c`) | public domain / MIT-0; FetchContent, pinned |
 | cJSON v1.7.19  | layout + calibration JSON                    | MIT; FetchContent, pinned                |
@@ -286,29 +286,40 @@ distribution channel:
      the tarball IS what a registry would serve, so listing it later stays a config
      change rather than a rebuild. Preserving that costs nothing.
 
-## DVS / Dante configuration
+## Dante configuration
+
+The endpoint is an **RME Digiface Dante**: a hardware Dante interface that presents ASIO
+directly. Dante is still the transport to the amps, so everything about the network below
+is unchanged; what a hardware endpoint buys over a software one is in the clock and
+isolation bullets.
 
 - **Driver: ASIO.** The device must expose **enough output channels for your layout**:
   26 for the CAVE array; fewer for a smaller install (the engine's channel count is the
-  layout's speaker count, 4..26). Do not use the WDM driver—it caps at 16 channels;
-  26 needs ASIO (up to 64).
-- **Format:** 48 kHz, 24-bit. Match the bit depth end-to-end; DVS truncates on
-  mismatch. Read the driver's reported sample type via `ASIOGetChannelInfo` and
-  convert (DVS is typically Int32 or packed Int24).
-- **Clock:** a Dante network needs one **leader clock**. In the CAVE, let a hardware
-  Dante node (interface/amp/processor) be leader; DVS slaves to it. A pure-software
-  DVS instance can't run standalone without a leader on the net.
+  layout's speaker count, 4..26). Use the ASIO driver, not the WDM/DirectSound one: WDM is
+  a consumer path with its own mixing and resampling, and it is not the multichannel
+  low-latency route the array needs.
+- **Format:** 48 kHz, 24-bit. Match the bit depth end-to-end. Read the driver's reported
+  sample type via `ASIOGetChannelInfo` and convert rather than assuming: the engine renders
+  float and the device may want Int32 or packed Int24.
+- **Channel count at rate.** Confirm the device still offers your channel count at the rate
+  you intend to run. Dante endpoints commonly **reduce channel count at 96 kHz**, and 26 out
+  plus 19 Zylia inputs is 45 channels. Calibrate and validate at 48 kHz.
+- **Clock:** a Dante network needs one **leader clock**, and a hardware endpoint can *be* it.
+  That is the practical gain over a software endpoint, which has to follow some other node on
+  the net. Either let the Digiface lead, or point it at whichever hardware node you prefer as
+  leader—but pick deliberately and check it in Dante Controller, because an unlocked domain
+  shows up as a sample rate that wanders between runs (Stage 0 of the runbook measures this).
 - **Latency:** start ASIO buffer ~512–1024 and Dante latency 4–10 ms, then tighten
   empirically against measured dropouts.
-- **Isolation (recommended):** consider running DVS on a machine separate from the
-  engine, keeping the audio thread and Dante stack away from engine frame-rate
-  spikes, the usual source of dropouts. The control-only C ABI does not require
-  this, but the design tolerates it.
+- **Isolation:** less of a concern than with a software endpoint. A software Dante driver
+  packetizes on the host CPU, so it competes with engine frame-rate spikes and is worth
+  moving to its own machine; a hardware endpoint does that work on the device. The
+  control-only C ABI still tolerates splitting the machines if you want to.
 
 ## ASIO host bring-up (sequence for `asio_sink.c`)
 
 1. COM-load the driver (the SDK's `AsioDrivers`/`asiolist` helpers handle registry
-   enumeration; DVS registers an ASIO driver). `CoInitialize` on the thread.
+   enumeration; the Digiface registers an ASIO driver). `CoInitialize` on the thread.
 2. `ASIOInit` → `ASIOGetChannels` (expect ≥ the layout's speaker count out; 26 for the
    CAVE) → `ASIOGetBufferSize`.
 3. `ASIOGetChannelInfo` per output channel to learn the sample type.
@@ -349,8 +360,8 @@ relying on it:
 - [ ] **Other dependency licenses** unchanged in the versions you ship. The pinned
   versions are verified in the "License inventory" above; re-check on any pin bump
   and keep `THIRD_PARTY-NOTICES.md` in sync.
-- [ ] **Dante clock.** A hardware leader clock is present on the network; a
-  pure-software DVS instance cannot be the standalone leader.
+- [ ] **Dante clock.** Exactly one leader on the network, chosen deliberately. The
+  Digiface is hardware, so it can lead; confirm in Dante Controller either way.
 - [ ] **This repo's own license** is GPLv3 (see `LICENSE`), matching the ASIO GPLv3
   option and the CI artifact. Revisit the ASIO and test-engine terms above before
   changing it.

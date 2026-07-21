@@ -49,6 +49,12 @@ The `valid` ctest pins that they agree: it builds feeds, propagates them the lon
 per-speaker sum, interpolated fractional delay, 1/r), scores that, and compares against the analytic
 path. Worst disagreement 0.64°.
 
+The same unification happens one level up, in the tool. `bwa_validate` runs **one** session loop with
+two capture backends, so `--simulate` is not a shortcut around the hardware path: it executes the
+same placement loop, the same once-per-placement capsule check, the same exclusion threading, and the
+same reporting the rig will run. Only the handful of lines that actually talk to ASIO go untested,
+which is the irreducible part.
+
 ### What simulate does and does not include
 
 `valid_simulate` builds the field a ZM-1 records in an **anechoic** free field: every speaker's real
@@ -177,9 +183,103 @@ bwa_validate --layout cave_layout.json --azimuths 24 --out cells.csv
 | `--layout <path>` | `cave_layout.json` (default: the built-in grid) |
 | `--driver <name>` | ASIO driver (default: first with enough channels) |
 | `--mic-in <n>` | first Zylia input channel |
+| `--position x,y,z` | one placement; repeatable, replaces the defaults |
+| `--positions <file>` | placements from a file, `x y z [label]` per line, `#` comments |
 | `--azimuths <n>` | azimuths per elevation row (default 12) |
 | `--radius <m>` | source distance from the sweet spot (default 1.4) |
 | `--out <file.csv>` | every cell, one row each |
+| `--no-prompt` | don't wait for ENTER between placements (unattended runs) |
+| `--track <id or name>` | follow the ZM-1's stand as a tracked rigid body; needs `--survey` |
+| `--survey <file>` | body-frame capsule survey the tracker rotates per placement |
+| `--natnet-server <ip>` | Motive host; **required** to `--track` by name, since the streaming id is resolved from Motive's model definitions |
+| `--natnet-multicast <g>` | NatNet group (default 239.255.42.99) |
+| `--track-sim` | self-check, see below |
+| `--inject-fault <ch>` | self-check, see below |
+
+The built-in placements are a plausible walking envelope, not your room. Pass your own with
+`--position` or `--positions` and give them labels; the labels come back in the report and the CSV,
+which matters once you have more than about four.
+
+```
+# mics.txt — surveyed listening positions, room metres
+0.0  1.55  0.0    seated centre
+0.8  1.55 -0.4    front-right standing
+-0.9 1.20  0.6    back-left seated
+```
+
+### Tracking the microphone instead of measuring it
+
+`--track <id|name> --survey <body-frame survey>` follows the ZM-1's stand as a tracked rigid body.
+The pose then supplies both things a typed placement cannot.
+
+**Position.** A tape-measure number carries whatever error your tape does, and at the 1.4 m source
+radius a 5 cm error injects about 2° of direction error, which is the size of the phantom penalties
+being measured. Worse, in *tracked* mode the mic position is also the solve position, so a
+mis-measured mic is mathematically identical to a tracking error and you cannot separate the two
+afterwards.
+
+**Orientation, which is the bigger prize.** A survey pins the array's orientation for *that*
+mounting. The session remounts the mic six or seven times, and each remount is a fresh unknown yaw.
+Fitting that rotation back out of the data is possible but statistical, and it conflates mount error
+with the measurement. With a tracked stand it is measured:
+
+```
+capsules_room = R(pose) · capsules_body        centre = pose_pos + R(pose) · offset
+```
+
+So the workflow becomes **survey once, then track**. Run `zylia_survey` at any convenient mount pose,
+rotate the result into the stand's body frame, save it with a `ZyliaMount`, and it is good for every
+placement afterwards. The `zylia` test measures the payoff on synthetic data: a remount that leaves
+the stale survey **18.1° wrong** is reconstructed to **0.033°** from the live pose.
+
+You do not need markers on the sphere. Mount it to something the cameras already see and probe the
+offset from the stand's body origin to the array's acoustic centre. For a rigid sphere that centre is
+unambiguous—it is the geometric centre—unlike a general microphone where "where is it,
+acoustically" is a real question.
+
+Two things the tool will not do for you:
+
+- **The coupling must be rigid and stay rigid.** No shock mount, and do not loosen the collar after
+  surveying. You are propagating an orientation through the mount, so a quarter turn on the thread is
+  90° of azimuth error and nothing downstream notices. Mark the collar.
+- **The offset must be probed.** `zylia_survey` takes source positions relative to a centre, so it
+  cannot solve for that centre. The rotation falls out of the survey plus one pose sample; the
+  translation does not.
+
+With `--track` the placements you pass become the **plan**, not the measurement. The tool prints the
+tracked position beside the planned one with the delta, and warns past half a metre—a wrong rigid
+body or a frame mix-up shows up immediately rather than as a puzzling result three hours later.
+
+This is also the undemanding use of the tracker: the mic is static during a capture, so one good pose
+per placement is enough. No prediction, no velocity, no clock-domain question, none of the parts of
+the render path that make `natnet.c` hard.
+
+Two safety behaviours worth knowing:
+
+- **A stale pose is refused, not reused.** `pose_read` hands back the last *published* pose forever,
+  and NatNet only publishes tracking-valid frames, so an occluded stand or a wrong streaming id would
+  silently return the *previous* placement's pose and have it accepted as this one's measurement.
+  Each placement is gated on `natnet_status() == LIVE`; one with no live pose is skipped and reported
+  rather than measured against a stale one.
+- **`--track-sim` proves the wiring** without a rig: it drives the same path from a synthetic mount
+  pose and exits nonzero unless the placement hook fired for every placement. That check exists
+  because the hook was once passed into the session loop and never called, leaving `--track` inert
+  while it announced the tracker was measuring. Asserting on the *result* would not have caught it:
+  in simulate the field is synthesized from the same capsule table the estimator reads, so a wrong
+  table cancels out and looks healthy. It is the `validate_track` ctest.
+
+### Proving the integrity layer on your own data
+
+`--inject-fault <ch>` corrupts that capsule in **every** capture, then requires
+`zylia_check_capsules` to catch it at every placement. Exit code 3 if it does not.
+
+Use it before trusting a session. It exercises the check, the reporting, and the exclusion threading
+end to end on the exact signals your rig produces, and it costs one extra run. It works on hardware
+captures too, not only in simulate, so you can confirm the chain against your real room and your real
+noise floor rather than against a model of them.
+
+The negative control comes free: a clean run reports "all 19 healthy", so you can see the check is
+not simply flagging everything.
 
 ### The session shape
 
@@ -202,7 +302,7 @@ Measure each placement, do not eyeball it. The mic position is an input to the s
 The stimulus is **steady-state**, not a sweep. A swept measurement has to know its round-trip latency
 to the sample, which is most of the difficulty in `calib_capture.cpp`. Here you play and capture
 concurrently and analyse a window well inside the steady state, so device latency, driver buffering,
-and DVS's own delay never reach the result. `VAL_SKIP` is simply "long enough that everything has
+and the Digiface's own delay never reach the result. `VAL_SKIP` is simply "long enough that everything has
 arrived".
 
 `ASIOGetLatencies` is still logged at open, as a routing sanity check only. If it looks absurd, the
@@ -212,7 +312,7 @@ routing is wrong, and that is worth knowing before you spend an afternoon collec
 
 Full duplex on **one** device: speaker feeds out, 19 capsules in, one clock domain. Two separate
 interfaces would leave the render and the capture free-running against each other. Dante Via puts the
-ZM-1 on the network DVS already presents, so a single ASIO driver exposes both. Same unlock as the
+ZM-1 on the network the Digiface already presents, so a single ASIO driver exposes both. Same unlock as the
 sweep path, see `calibration.md` → "Getting the ZM-1 onto Dante".
 
 A device exposing fewer than 19 inputs is refused. Unfilled capsules would enter the SH projection as
@@ -301,6 +401,7 @@ Say these out loud before quoting any number from this tool.
 | `examples/validate.cpp` | `bwa_validate`, the session driver |
 | `examples/valid_capture.cpp` | full-duplex ASIO. **Rig-bound, not verified on hardware** |
 | `test/valid_test.c` | the `valid` ctest: statistics, the feed/analytic agreement, the sweep |
+| — | the `validate_sim` ctest: the whole session loop; `validate_fault`: the integrity chain |
 | `test/zylia_test.c` | the `zylia` ctest: estimator, sign cross-check, integrity, order step-down |
 
 `valid_capture.cpp` carries the same caveat as `calib_capture.cpp`: it mirrors a known-good ASIO host

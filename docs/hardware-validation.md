@@ -19,9 +19,11 @@ What only the rig can prove:
       -DBWA_BUILD_CALIBRATE=ON` (or the CI artifact, which carries all of it). Run
       `ctest --test-dir build -C RelWithDebInfo` green *before* leaving—never debug a known
       failure through speakers. `phonon.dll` must sit beside `bw_audio.dll`.
-- [ ] **DVS/Dante** configured per [build.md](./build.md): 48 kHz / 24-bit end-to-end, a
-      **hardware leader clock** on the net (DVS can't lead alone), ASIO buffer ~512–1024, and
-      Dante latency 4–10 ms to start. Calibrate at 48 kHz: DVS halves channels at 96 kHz.
+- [ ] **Dante** configured per [build.md](./build.md): 48 kHz / 24-bit end-to-end, exactly
+      **one leader clock** on the net and you know which node it is (the Digiface is hardware,
+      so it can lead), ASIO buffer ~512–1024, Dante latency 4–10 ms to start. Work at 48 kHz:
+      confirm the device still offers 26 out plus 19 inputs at whatever rate you pick, since
+      Dante endpoints commonly halve their channel count at 96 kHz.
 - [ ] **Kit**: omnidirectional measurement mic routed into the same ASIO device (it rides
       input slot `n`, the speaker count), tape measure + install drawings, headphones,
       `examples/cave_layout.json` as the starting layout. Optional: the Zylia ZM-1.
@@ -37,12 +39,12 @@ What only the rig can prove:
 bwa_calibrate --list-drivers        (or bwa_playground --list-drivers)
 ```
 
-- [ ] The DVS ASIO driver is listed with ≥ your layout's speaker count of outputs (26 for
+- [ ] The Digiface's ASIO driver is listed with ≥ your layout's speaker count of outputs (26 for
       the CAVE), plus one input for the mic when calibrating.
 - [ ] `bwa_minimal` runs and prints `backend: asio`, not the null fallback. The null sink
       keeps everything rendering silently, so a wrong driver *looks* alive—always check
       `bwa_get_audio_backend`.
-- [ ] `bwa_minimal`'s **device clock** line reads within ~±100 ppm of 48000 Hz *on DVS*,
+- [ ] `bwa_minimal`'s **device clock** line reads within ~±100 ppm of 48000 Hz *on the Digiface*,
       and repeat runs agree. It measures the device's true rate from two `bwa_get_clock`
       stamps across the 6 s run; what it exists to catch is GROSS clocking faults: a
       wrong nominal rate reads as *thousands* of ppm (44.1 k versus 48 k is 8%), an unlocked
@@ -52,11 +54,11 @@ bwa_calibrate --list-drivers        (or bwa_playground --list-drivers)
       entry, which puts tens of ppm of run-to-run scatter on a window this short (that
       scatter is measurement noise, not drift); and a consumer bridge like FlexASIO
       legitimately reads ~1000+ ppm off (its callback pacing is synthesized over WASAPI
-      and bursts). Deviations at that scale on DVS are a real problem.
+      and bursts). Deviations at that scale on the Digiface are a real problem.
 
 Minimal opens a 2-ch device (binaural profile), so this only proves the ASIO plumbing.
-The full 26-out DVS open is proven in Stage 1: `layout_tool` demands a real device and
-fails loudly if DVS won't open at the layout's channel count.
+The full 26-out Digiface open is proven in Stage 1: `layout_tool` demands a real device and
+fails loudly if the Digiface won't open at the layout's channel count.
 
 ## Stage 1: wiring + initial speaker positions
 
@@ -98,7 +100,7 @@ Then the real sequence:
       to the driver's own digital loop (`ASIOGetLatencies`, logged at capture open). The
       residual (DAC/ADC + analog) must be a *small positive* number: negative is
       physically impossible (wrong device / rate mismatch), tens of ms means an unexpected
-      buffer (check the DVS latency setting). The solved value stays authoritative.
+      buffer (check the Dante latency setting). The solved value stays authoritative.
 - [ ] **Trims**: a default run writes `delay_ms`/`gain_db`. Optionally `--eq` (per-speaker
       correction FIRs), `--save-irs prefix` (keep the kernels), `--room` (RT60 report: a
       treatment diagnostic, never numbers to copy into the reverb).

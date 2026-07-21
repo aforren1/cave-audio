@@ -4,13 +4,13 @@
  *
  * That single-device requirement is the whole reason this is practical. Two separate interfaces
  * would leave the render and the capture free-running against each other; here Dante Via puts the
- * ZM-1 on the same network DVS already presents, so one ASIO driver exposes the speaker outputs and
+ * ZM-1 on the same network the Digiface already presents, so one ASIO driver exposes the speaker outputs and
  * the 19 capsule inputs together. Same story as docs/calibration.md's sweep path.
  *
  * WHAT MAKES THIS EASY, AND IT IS WORTH SAYING PLAINLY: the harness stimulus is STEADY-STATE, not a
  * sweep. A swept measurement has to know its round-trip latency to the sample, which is most of the
  * difficulty in calib_capture. Here we play and record concurrently and analyse a window taken well
- * inside the steady state, so device latency, driver buffering and DVS's own delay never enter the
+ * inside the steady state, so device latency, driver buffering and the Digiface's own delay never enter the
  * result at all. VAL_SKIP is simply "long enough that everything has arrived".
  *
  * The DSP this feeds (valid_speaker_feeds -> valid_score, and zylia_intensity_doa under it) lives in

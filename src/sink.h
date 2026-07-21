@@ -7,7 +7,7 @@
  * the asio_sink.c boundary — everything here is device-agnostic.
  *
  * Backends:
- *   - asio_sink.c  (BWA_HAVE_ASIO): drives a real ASIO driver (DVS in production).
+ *   - asio_sink.c  (BWA_HAVE_ASIO): drives a real ASIO driver (the Digiface in production).
  *   - null_sink.c  (always built): a threaded *offline* sink that paces blocks from
  *                  a high-resolution clock and discards the audio. Lets the engine
  *                  run with no hardware (desk dev, CI, the `binaural` array path).
@@ -63,7 +63,7 @@ typedef struct {
     const char* (*backend)(bwa_sink*);
     uint32_t    (*block_size)(bwa_sink*);   /* actual frames per callback (driver dictates for ASIO) */
     /* Device-reported render->DAC output latency in FRAMES (ASIOGetLatencies for the ASIO sink —
-     * DVS includes its network buffering there). NULL entry or 0 = unknown / no physical output
+     * the Digiface includes its network buffering there). NULL entry or 0 = unknown / no physical output
      * (the null and manual sinks have no DAC). */
     uint32_t    (*output_latency)(bwa_sink*);
     /* MANUAL sink only (NULL on threaded backends): render ONE block synchronously on the CALLER's
@@ -86,7 +86,7 @@ bwa_sink* bwa_sink_open(uint32_t sample_rate, uint32_t block_size, uint32_t chan
 int          bwa_sink_start(bwa_sink* s);   /* begin the callback loop; 0 = ok        */
 void         bwa_sink_stop(bwa_sink* s);    /* stop the loop; safe if already stopped */
 void         bwa_sink_close(bwa_sink* s);   /* stop (if needed) + release             */
-const char*  bwa_sink_backend(bwa_sink* s); /* e.g. "asio:DVS" or "null"              */
+const char*  bwa_sink_backend(bwa_sink* s); /* e.g. "asio:Digiface" or "null"              */
 uint32_t     bwa_sink_block_size(bwa_sink* s); /* actual frames per block; 0 if none  */
 uint32_t     bwa_sink_output_latency(bwa_sink* s); /* device render->DAC latency, frames; 0 = unknown */
 /* Manual/offline: render one block synchronously (bwa_render_block). NULL unless this is a manual

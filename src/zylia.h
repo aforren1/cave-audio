@@ -210,9 +210,59 @@ void zylia_capsules(float caps_m[ZYLIA_MICS][3]);
  * it belongs beside the layout, not in it. Save writes the capsules plus the diagnostics that say
  * whether to believe them; load installs the result via zylia_set_capsules. Both return 1 on success,
  * 0 on an I/O or parse failure (err, if given, gets a one-line reason). */
+/* ---- tracked mount: survey once, then follow the stand ----
+ *
+ * A survey pins the array's orientation FOR THAT MOUNTING. Move the microphone, which a validation
+ * session does six or seven times, and the channel order survives but the orientation does not: a
+ * remount is a fresh unknown yaw, plus pitch and roll if the stand is not level. Fitting that
+ * rotation back out of the measurements afterwards is possible but statistical, and it conflates
+ * mount error with the thing you were trying to measure.
+ *
+ * If the mic is bolted to something the motion capture already tracks, you can MEASURE it instead:
+ *
+ *   survey once      caps_body = R_mount(survey)^T . caps_room     (zylia_capsules_rotate, transpose)
+ *   every placement  caps_room = R_mount(now)     . caps_body      (rotate back, then set_capsules)
+ *                    centre    = mount_pos + R_mount(now) . offset
+ *
+ * The capsule table comes back array-centred, so directions need no translation; only the array
+ * CENTRE does, and that is the `offset` below. Note the rotation falls out of the survey plus one
+ * pose sample and needs no probing. The offset does need probing, because zylia_survey takes source
+ * positions relative to a centre it therefore cannot solve for.
+ *
+ * MECHANICAL REQUIREMENT, and it is not optional: the coupling has to be rigid and stay rigid. No
+ * shock mount, and do not loosen the collar after surveying. You are propagating an ORIENTATION
+ * through the mount now, so a quarter turn on the thread is 90 degrees of azimuth error and nothing
+ * downstream will notice. Mark the collar.
+ *
+ * This is also the EASY use of the tracker: the mic does not move during a capture, so one static
+ * pose per placement is enough. No prediction, no velocity, no clock-domain question, and a wrong
+ * reading is visible rather than subtle. */
+typedef struct {
+    int   body_frame;      /* 1 = `capsules` are in the MOUNT's body frame, not room axes */
+    int   have_offset;
+    float offset_m[3];     /* mount body origin -> array acoustic centre, expressed in BODY axes */
+} ZyliaMount;
+
+/* Rotation matrix (ROW-major 3x3, v_room = R . v_body) from a unit quaternion in xyzw order, which
+ * is the layout NatNet delivers. A non-unit quaternion is normalized first. */
+void zylia_quat_to_matrix(const float q[4], float R[9]);
+
+/* Rotate a capsule table by a row-major 3x3. transpose = 0 applies R (body -> room), transpose = 1
+ * applies R^T (room -> body). `in` and `out` may be the same array. */
+void zylia_capsules_rotate(const float caps_in[ZYLIA_MICS][3], const float R[9], int transpose,
+                           float caps_out[ZYLIA_MICS][3]);
+
+/* `mount` (NULL ok) carries the tracked-mount metadata above. Saving with a NULL mount writes the
+ * historical room-axes form; loading a file without those fields reports body_frame = 0, so old
+ * surveys keep working unchanged.
+ * When body_frame comes back 1 the INSTALLED table is in the mount's axes, and you must rotate it by
+ * the live pose and re-install before any solve — otherwise every direction is wrong by whatever the
+ * mount happened to be turned to at survey time. Loading a body-frame file with a NULL mount_out is
+ * refused outright, because that caller has no way to find out it needs to. */
 int  zylia_survey_save(const char* path, const float caps_m[ZYLIA_MICS][3],
-                       float resid_us, float radius_m, float spread, int nobs, char* err, int errcap);
-int  zylia_survey_load(const char* path, char* err, int errcap);
+                       float resid_us, float radius_m, float spread, int nobs,
+                       const ZyliaMount* mount, char* err, int errcap);
+int  zylia_survey_load(const char* path, ZyliaMount* mount_out, char* err, int errcap);
 
 /* Full single-position localization: Gauss-Newton refine the source position against the exact
  * spherical-wavefront model. center = the array centre in room coords (m); latency_s = the known system

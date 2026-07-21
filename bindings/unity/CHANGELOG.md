@@ -84,7 +84,7 @@ The engine renamed seven symbols for clarity; the binding follows. C#-visible ch
   ppm clock drift, and fall back to block-granular `DspTime` pairing when the backend has no host
   stamp. `Engine.GetClock` exposes the raw pair.
 - **`Engine.OutputLatency`** → new engine ABI `bwa_get_output_latency`: the device's self-reported
-  render→DAC latency in frames (`ASIOGetLatencies` — DVS includes its Dante network buffering;
+  render→DAC latency in frames (`ASIOGetLatencies` — the Digiface includes its Dante buffering;
   0 on the null-sink fallback). A sound scheduled for dsp time T is *heard* at T + OutputLatency:
   the audio half of AV-latency alignment, so only the display delay is left to measure by hand.
 

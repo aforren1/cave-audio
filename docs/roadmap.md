@@ -13,16 +13,16 @@ engines. Don't start with the engine bindings.
 
 ## M1: ASIO sink, silence
 - `asio_sink.cpp`: driver load → `ASIOCreateBuffers` → `ASIOStart`, writing 26 channels
-  of silence to DVS. Capture the sample-position/`systemTime` timestamp.
-- **Done when:** DVS shows 26 active output channels and a stable callback with no
+  of silence to the Digiface. Capture the sample-position/`systemTime` timestamp.
+- **Done when:** the Digiface shows 26 active output channels and a stable callback with no
   dropouts; timestamp advances monotonically.
-- **Status: ~done, pending DVS hardware.** A device-sink seam (`src/sink.h`) keeps ASIO
+- **Status: ~done, pending Digiface hardware.** A device-sink seam (`src/sink.h`) keeps ASIO
   isolated. `asio_sink.cpp` implements the full bring-up against the vendored ASIO SDK
   and compiles, links, and runs: driver load → init → channel-count check → graceful
-  fallback, verified on real (non-DVS) hardware. A `null_sink.c` offline backend runs the
+  fallback, verified on real (non-Digiface) hardware. A `null_sink.c` offline backend runs the
   same render loop with no hardware and discharges the stable-callback +
   monotonic-timestamp criterion (`test_audio_sink`). **Remaining:** *26 active channels
-  in DVS with no dropouts*—needs a Dante Virtual Soundcard endpoint on site.
+  on the Digiface with no dropouts*—needs a Dante endpoint on site.
 
 ## M2: Concurrency spine
 - Two SPSC rings, the voice table, `drain_commands`, the commit snapshot, generation
@@ -151,7 +151,7 @@ engines. Don't start with the engine bindings.
   one-click disable) and `ClipDrawer.cs` (the `[Clip]` StreamingAssets picker).
   The engine's CMake build stages `bw_audio.dll` + `phonon.dll` into
   `Runtime/Plugins/x86_64/` automatically. The `cave`/`both`-on-hardware half of the
-  done-criterion rides the same on-site DVS check as M1.
+  done-criterion rides the same on-site Digiface check as M1.
 
 ## M8: Unreal binding
 - Subsystem + component mirroring Unity; UE→room coordinate conversion.

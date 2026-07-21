@@ -144,7 +144,7 @@ int calib_asio_open(const char* driver, int mic_in, int nspk, const float* sweep
      * negotiated buffer). out + in is the DIGITAL half of the sweep's round trip; every measured
      * delay contains it, plus DAC/ADC + analog. A rig-day diagnostic: if a solved system latency
      * ever lands BELOW this sum, the measurement chain is misconfigured, and if it lands tens of
-     * ms above, look at the DVS latency setting. */
+     * ms above, look at the Dante latency setting. */
     s_lat_in = s_lat_out = -1;
     { long il = 0, ol = 0;
       if (ASIOGetLatencies(&il, &ol) == ASE_OK && il >= 0 && ol >= 0) {

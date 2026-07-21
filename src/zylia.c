@@ -808,21 +808,75 @@ static void zy_err(char* err, int cap, const char* msg) {
     if (err && cap > 0) { snprintf(err, (size_t)cap, "%s", msg); }
 }
 
+/* ---- tracked mount helpers (see zylia.h) ----------------------------------------------------- */
+
+void zylia_quat_to_matrix(const float q[4], float R[9]) {
+    if (!q || !R) return;
+    double x = q[0], y = q[1], z = q[2], w = q[3];
+    double n = sqrt(x*x + y*y + z*z + w*w);
+    if (n < 1e-12) {                                  /* degenerate: hand back identity rather than NaN */
+        R[0]=1;R[1]=0;R[2]=0; R[3]=0;R[4]=1;R[5]=0; R[6]=0;R[7]=0;R[8]=1;
+        return;
+    }
+    x/=n; y/=n; z/=n; w/=n;
+    R[0] = (float)(1.0 - 2.0*(y*y + z*z));  R[1] = (float)(2.0*(x*y - w*z));        R[2] = (float)(2.0*(x*z + w*y));
+    R[3] = (float)(2.0*(x*y + w*z));        R[4] = (float)(1.0 - 2.0*(x*x + z*z));  R[5] = (float)(2.0*(y*z - w*x));
+    R[6] = (float)(2.0*(x*z - w*y));        R[7] = (float)(2.0*(y*z + w*x));        R[8] = (float)(1.0 - 2.0*(x*x + y*y));
+}
+
+void zylia_capsules_rotate(const float caps_in[ZYLIA_MICS][3], const float R[9], int transpose,
+                           float caps_out[ZYLIA_MICS][3]) {
+    if (!caps_in || !R || !caps_out) return;
+    for (int i = 0; i < ZYLIA_MICS; ++i) {
+        float v[3] = { caps_in[i][0], caps_in[i][1], caps_in[i][2] };   /* copy: in may alias out */
+        if (transpose) {
+            caps_out[i][0] = R[0]*v[0] + R[3]*v[1] + R[6]*v[2];
+            caps_out[i][1] = R[1]*v[0] + R[4]*v[1] + R[7]*v[2];
+            caps_out[i][2] = R[2]*v[0] + R[5]*v[1] + R[8]*v[2];
+        } else {
+            caps_out[i][0] = R[0]*v[0] + R[1]*v[1] + R[2]*v[2];
+            caps_out[i][1] = R[3]*v[0] + R[4]*v[1] + R[5]*v[2];
+            caps_out[i][2] = R[6]*v[0] + R[7]*v[1] + R[8]*v[2];
+        }
+    }
+}
+
 int zylia_survey_save(const char* path, const float caps_m[ZYLIA_MICS][3],
-                      float resid_us, float radius_m, float spread, int nobs, char* err, int errcap) {
+                      float resid_us, float radius_m, float spread, int nobs,
+                      const ZyliaMount* mount, char* err, int errcap) {
     if (!path || !caps_m) { zy_err(err, errcap, "zylia_survey_save: null argument"); return 0; }
     cJSON* root = cJSON_CreateObject();
     if (!root) { zy_err(err, errcap, "zylia_survey_save: out of memory"); return 0; }
 
+    /* The prose has to match the frame, because this is the artifact a human opens to decide whether
+     * the file is safe to reuse — a body-frame survey that claims to be room axes invites exactly the
+     * mistake the frame field exists to prevent. */
     cJSON_AddStringToObject(root, "_comment",
-        "ZM-1 capsule survey. Positions are metres, relative to the array centre, in ROOM axes "
-        "(+X right, +Y up, -Z front), indexed BY ASIO INPUT CHANNEL. This file therefore encodes the "
-        "channel order and the array's mounted orientation as well as the geometry. It is specific to "
-        "one physical ZM-1 on one mount: re-survey if either changes.");
+        (mount && mount->body_frame)
+        ? "ZM-1 capsule survey. Positions are metres, relative to the array centre, in the TRACKED "
+          "MOUNT'S BODY AXES (not room axes), indexed BY ASIO INPUT CHANNEL. Rotate by the mount's "
+          "live pose before solving: installed as-is, every direction is wrong by whatever the mount "
+          "was turned to at survey time. Encodes the channel order and the capsules' placement inside "
+          "the mount, NOT the array's orientation in the room — that is what the tracker supplies. "
+          "Specific to one physical ZM-1 rigidly coupled to one mount: re-survey if either changes."
+        : "ZM-1 capsule survey. Positions are metres, relative to the array centre, in ROOM axes "
+          "(+X right, +Y up, -Z front), indexed BY ASIO INPUT CHANNEL. This file therefore encodes the "
+          "channel order and the array's mounted orientation as well as the geometry. It is specific to "
+          "one physical ZM-1 on one mount: re-survey if either changes.");
     cJSON_AddNumberToObject(root, "residual_us", resid_us);
     cJSON_AddNumberToObject(root, "radius_m",    radius_m);
     cJSON_AddNumberToObject(root, "spread",      spread);
     cJSON_AddNumberToObject(root, "observations", nobs);
+    if (mount && mount->body_frame) {
+        /* Body-frame survey: the capsules are expressed in the TRACKED MOUNT's axes, so this file is
+         * no longer tied to one orientation — rotate it by the live pose at each placement. It is
+         * still tied to one physical ZM-1 on one mount (channel order + the rigid coupling). */
+        cJSON_AddStringToObject(root, "frame", "body");
+        if (mount->have_offset) {
+            cJSON* o = cJSON_AddArrayToObject(root, "mount_offset_m");
+            for (int a = 0; a < 3; ++a) cJSON_AddItemToArray(o, cJSON_CreateNumber(mount->offset_m[a]));
+        }
+    }
 
     cJSON* arr = cJSON_AddArrayToObject(root, "capsules");
     if (!arr) { cJSON_Delete(root); zy_err(err, errcap, "zylia_survey_save: out of memory"); return 0; }
@@ -846,7 +900,8 @@ int zylia_survey_save(const char* path, const float caps_m[ZYLIA_MICS][3],
     return 1;
 }
 
-int zylia_survey_load(const char* path, char* err, int errcap) {
+int zylia_survey_load(const char* path, ZyliaMount* mount_out, char* err, int errcap) {
+    if (mount_out) memset(mount_out, 0, sizeof *mount_out);   /* absent fields => a room-axes survey */
     if (!path) { zy_err(err, errcap, "zylia_survey_load: null path"); return 0; }
     FILE* f = fopen(path, "rb");
     if (!f) { zy_err(err, errcap, "zylia_survey_load: cannot open file"); return 0; }
@@ -888,6 +943,29 @@ int zylia_survey_load(const char* path, char* err, int errcap) {
                         (double)caps[i][2]*caps[i][2]);
         if (m < 0.005 || m > 0.5) {
             zy_err(err, errcap, "zylia_survey_load: capsule is not on a ~50 mm shell (units wrong?)");
+            goto done;
+        }
+    }
+    {   /* optional tracked-mount metadata; a file without these is the historical room-axes form */
+        cJSON* fr = cJSON_GetObjectItemCaseSensitive(root, "frame");
+        int body = (cJSON_IsString(fr) && fr->valuestring && !strcmp(fr->valuestring, "body"));
+        cJSON* off = cJSON_GetObjectItemCaseSensitive(root, "mount_offset_m");
+        if (mount_out) {
+            mount_out->body_frame = body;
+            if (cJSON_IsArray(off) && cJSON_GetArraySize(off) == 3) {
+                int good = 1;
+                for (int a = 0; a < 3; ++a) {
+                    cJSON* v = cJSON_GetArrayItem(off, a);
+                    if (!cJSON_IsNumber(v)) { good = 0; break; }
+                    mount_out->offset_m[a] = (float)v->valuedouble;
+                }
+                mount_out->have_offset = good;
+            }
+        } else if (body) {
+            /* The caller cannot learn this table is body-frame, so it would be installed and solved
+             * against as if it were room axes — every direction wrong by the mount's survey-time
+             * orientation. Refuse rather than answer confidently. */
+            zy_err(err, errcap, "zylia_survey_load: body-frame survey needs a ZyliaMount out-param");
             goto done;
         }
     }

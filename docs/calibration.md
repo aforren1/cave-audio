@@ -46,11 +46,11 @@ automatically.
   non-coplanar (GDOP): clustered points amplify error. Cross-check against the install drawings.
 
   The solved latency gets a free sanity check: at open, the capture shell logs the driver's own
-  `ASIOGetLatencies` numbers (out + in = the **digital** half of the loop; DVS reports its Dante
+  `ASIOGetLatencies` numbers (out + in = the **digital** half of the loop; the Digiface reports its Dante
   buffering there), and after the solve the CLI prints solved-vs-driver with the residual. The
   residual is what the driver *can't* see (DAC/ADC conversion + analog), so it must be a small
   positive number. **Negative is physically impossible** (wrong device, sample-rate mismatch);
-  tens of ms means an unexpected buffer (check the DVS latency setting). The solved value stays
+  tens of ms means an unexpected buffer (check the Dante latency setting). The solved value stays
   authoritative—the driver's numbers are nominal, the sweep measured reality.
 - **default**: trims. `calib_solve` turns the per-speaker measurements into `delay_ms`
   (arrival-align every speaker to the farthest) and `gain_db` (equalize sensitivity, with the
@@ -212,17 +212,17 @@ validated off-hardware; the sweep capture is the unbuilt piece (see "Getting the
 
 ### Getting the ZM-1 onto Dante
 
-The obstacle to `--zylia` on hardware was never the DSP—it was that the sweep plays out of the **DVS**
+The obstacle to `--zylia` on hardware was never the DSP—it was that the sweep plays out of the **Digiface**
 device and the ZM-1 is a **different** USB device, while the ASIO SDK has one process-wide current-driver
 slot (which is why `asio_session.cpp` exists). Two drivers at once is not a flag, it's a rewrite.
 
 **Put the ZM-1 on the Dante network and the problem dissolves.** Dante Via captures the ZM-1's ASIO
-stream and transmits its 19 capsules as Dante channels; DVS on the engine machine receives them as 19
+stream and transmits its 19 capsules as Dante channels; the Digiface on the engine machine receives them as 19
 **inputs on the same ASIO device that already owns the 26 outputs**. One driver, one clock domain,
 sample-locked: the two-device problem stops existing, and `calib_capture.cpp` goes from
 "open N outs + 1 mic input" to "open N outs + 19 inputs", which is a parameter, not an architecture.
 ([Danowski's write-up](https://blog.przemekdanowski.com/connecting-zylia-zm-1-to-dante-network/) is the
-recipe; DVS + Via is ~$60 with a 30-day trial.)
+recipe; Dante Via is a modest one-off licence and has a trial, so you can prove the route first.)
 
 What it buys, beyond unblocking the sweep:
 
@@ -237,10 +237,10 @@ What it buys, beyond unblocking the sweep:
 The cable run is a side benefit worth naming: the ZM-1 wants to sit in the *middle* of the CAVE, and USB
 will not reach. 100 m of Cat6 will.
 
-Caveats to check before buying: Via adds a constant 10 ms (irrelevant: it is measured, constant, and
-nowhere near the production path), and DVS's channel budget is **64 I/O at 48 kHz**, so 26 out + 19 in =
-45 fits comfortably, but DVS typically **halves its channel count at 96 kHz**, where 45 would not fit.
-Calibrate at 48 kHz.
+Caveats to check first: Via adds a constant 10 ms (irrelevant here—it is measured, constant, and
+nowhere near the production path), and 26 out + 19 in is **45 channels**, so confirm the Digiface
+offers that many at your rate. Dante endpoints commonly halve their channel count at 96 kHz, where
+45 would not fit. Calibrate at 48 kHz.
 
 None of this is required to *start*. The capsule survey below runs on claps through the capture
 shell that already exists, and its solver is the same one the sweep path will use: `zylia_survey` takes

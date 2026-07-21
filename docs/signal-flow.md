@@ -81,7 +81,7 @@ flowchart TD
   ALIGN --> TSIG["+ test signal (raw channel, post-align)<br/><i>bwa_set_test_signal</i>"]
   TSIG --> LIM["linked limiter → per-channel peak meters<br/><i>bwa_set_limiter · _limiter_ceiling · bwa_get_bus_levels</i>"]
 
-  LIM --> CAVE["cave: asio_sink.cpp bufferSwitch →<br/>26-ch ASIO ► DVS ► the array"]
+  LIM --> CAVE["cave: asio_sink.cpp bufferSwitch →<br/>26-ch ASIO ► Digiface ► the array"]
   LIM --> BIN["binaural: each channel = a virtual speaker →<br/>3rd-order SH encode (ambi_encode_sn3d) →<br/>phonon HRTF decode (steam_decode.c;<br/>binaural.c simple-pan fallback) → 2-ch device"]
   LIM --> BOTH["both: array sink + monitor on a second device<br/>(double-buffered handoff, engine.c)"]
   LIM --> NUL["null sink (null_sink.c): no device;<br/>keeps rendering in real time, silent"]

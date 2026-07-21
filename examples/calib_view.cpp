@@ -857,7 +857,7 @@ static void tab_zylia(void) {
         if (ImGui::Button("Save")) {
             char e[128] = {0};
             const char* p = Z.surv_path[0] ? Z.surv_path : "zylia_capsules.json";
-            if (zylia_survey_save(p, Z.surv_caps, Z.surv_resid, Z.surv_radius, Z.surv_spread, Z.surv_n,
+            if (zylia_survey_save(p, Z.surv_caps, Z.surv_resid, Z.surv_radius, Z.surv_spread, Z.surv_n, NULL,
                                   e, sizeof e))
                 snprintf(Z.surv_msg, sizeof Z.surv_msg, "saved to %s", p);
             else
@@ -870,7 +870,7 @@ static void tab_zylia(void) {
         if (ImGui::Button("Load")) {
             char e[128] = {0};
             const char* p = Z.surv_path[0] ? Z.surv_path : "zylia_capsules.json";
-            if (zylia_survey_load(p, e, sizeof e)) {
+            if (zylia_survey_load(p, NULL, e, sizeof e)) {
                 zylia_geometry(Z.dirs, &Z.R);
                 Z.surv_installed = true;
                 snprintf(Z.surv_msg, sizeof Z.surv_msg, "loaded %s — it is driving the DOA now", p);

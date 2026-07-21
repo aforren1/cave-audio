@@ -15,8 +15,9 @@
  *
  *   bwa_minimal [sound.wav] [--driver name]
  *     (no wav: a short ping is synthesized and used; no --driver: auto-pick the first
- *      ASIO driver with enough channels — name one to test a specific device, e.g.
- *      "Dante Virtual Soundcard" on the rig. bwa_calibrate --list-drivers enumerates.)
+ *      ASIO driver with enough channels — name one to test a specific device. The rig's
+ *      Digiface registers under RME's own driver name, which is NOT the product name:
+ *      read it off bwa_calibrate --list-drivers rather than guessing.)
  */
 #include "bw_audio.h"
 

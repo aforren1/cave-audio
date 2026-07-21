@@ -1,5 +1,5 @@
 /*
- * asio_sink.cpp — ASIO host backend (production path: 26 channels -> DVS -> Dante).
+ * asio_sink.cpp — ASIO host backend (production path: 26 channels -> Digiface -> Dante).
  *
  * Compiled ONLY when the Steinberg ASIO SDK is vendored (BWA_HAVE_ASIO; see
  * third_party/README.md). C++ because the SDK's driver-loading host helpers
@@ -15,7 +15,7 @@
  * time, so the live sink is held in a single file-scope pointer (g_sink).
  *
  * Build-only-with-SDK: this file has not been compiled in this environment (no SDK,
- * no 26-ch DVS endpoint). Treat it as M1 code pending on-hardware verification.
+ * no 26-ch Dante endpoint). Treat it as M1 code pending on-hardware verification.
  */
 extern "C" {
 #include "sink.h"
@@ -132,7 +132,7 @@ ASIOTime* bufferSwitchTimeInfo(ASIOTime* timeInfo, long index, ASIOBool /*proces
     if (timeInfo->timeInfo.flags & kSystemTimeValid)
         ts.system_time_ns = timestamp_ns(timeInfo->timeInfo.systemTime);
     else {
-        /* No driver stamp (FlexASIO omits systemTime on the TimeInfo path; DVS unknown until rig
+        /* No driver stamp (FlexASIO omits systemTime on the TimeInfo path; the Digiface unknown until rig
          * day): synthesize one from QPC at callback entry so bwa_get_clock still has a live pair —
          * a hair noisier than a driver stamp (it includes callback-dispatch jitter, tens of µs)
          * but a true correspondence. QPC is a userspace counter read (no kernel transition) — the
@@ -322,7 +322,7 @@ extern "C" bwa_sink* bwa_asio_sink_open(uint32_t sample_rate, uint32_t block_siz
         bufsize = bpref;                                             /* driver wants powers of two */
     }
 
-    /* Confirm the driver can actually run at the requested rate before committing. DVS is
+    /* Confirm the driver can actually run at the requested rate before committing. the Digiface is
      * fixed-rate (set in Dante Controller), and the engine is already built at cfg.sample_rate, so a
      * mismatch must fail loudly with the device's actual rate rather than run the whole engine at
      * the wrong rate. Query first (ASIOCanSampleRate), set, then re-query — some drivers report OK
@@ -330,7 +330,7 @@ extern "C" bwa_sink* bwa_asio_sink_open(uint32_t sample_rate, uint32_t block_siz
     if (ASIOCanSampleRate((ASIOSampleRate)sample_rate) != ASE_OK) {
         ASIOSampleRate cur = 0; ASIOGetSampleRate(&cur);
         char m[176];
-        snprintf(m, sizeof m, "asio: driver '%s' cannot run at %u Hz (device is at %.0f Hz; set DVS/Dante "
+        snprintf(m, sizeof m, "asio: driver '%s' cannot run at %u Hz (device is at %.0f Hz; set Dante "
                  "to %u Hz or match cfg.sample_rate to the device)", drv, sample_rate, (double)cur, sample_rate);
         set_err(err, errcap, m);
         ASIOExit(); asioDrivers->removeCurrentDriver(); return nullptr;
@@ -402,7 +402,7 @@ extern "C" bwa_sink* bwa_asio_sink_open(uint32_t sample_rate, uint32_t block_siz
     s->post_output = (ASIOOutputReady() == ASE_OK);
 
     /* Latencies are only final once the buffers exist (they depend on the negotiated size). The
-     * driver's outputLatency is the render->DAC delay in frames — for DVS that includes its Dante
+     * driver's outputLatency is the render->DAC delay in frames — for the Digiface that includes its Dante
      * network buffering — surfaced as bwa_get_output_latency for AV-latency alignment. */
     long ilat = 0, olat = 0;
     s->output_latency = (ASIOGetLatencies(&ilat, &olat) == ASE_OK && olat > 0) ? olat : 0;

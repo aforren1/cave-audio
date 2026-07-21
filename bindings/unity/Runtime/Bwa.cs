@@ -159,7 +159,7 @@ namespace BwAudio
         // jitter-free wall<->dsp bridge (see Engine.DspTimeAt). hostTimeNs is monotonic on a
         // backend-defined epoch. False (outputs zeroed) until a host-stamped block has rendered.
         [DllImport(DLL, CallingConvention = CC)] [return: MarshalAs(UnmanagedType.I1)] public static extern bool bwa_get_clock(IntPtr e, out ulong dspSample, out ulong hostTimeNs);
-        // Device-reported render->DAC latency in frames (ASIOGetLatencies; DVS includes its Dante
+        // Device-reported render->DAC latency in frames (ASIOGetLatencies; the Digiface includes its Dante
         // buffering). 0 = unknown / no physical output (null sink).
         [DllImport(DLL, CallingConvention = CC)] public static extern uint bwa_get_output_latency(IntPtr e);
         [DllImport(DLL, CallingConvention = CC)] public static extern void bwa_source_stop(IntPtr e, uint s);

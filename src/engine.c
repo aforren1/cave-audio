@@ -53,7 +53,7 @@ static const struct { const char* name; float absorption[3], scattering, transmi
 };
 
 /* The three profiles (docs/architecture.md):
- *   cave     — render the 26-ch array straight to a 26-ch device (ASIO/DVS).
+ *   cave     — render the 26-ch array straight to a 26-ch device (ASIO/Digiface).
  *   binaural — render the array into memory, decode to a 2-ch device (the monitor).
  *   both     — array to a 26-ch device AND the monitor to a 2-ch device, concurrently.
  * The monitor uses the listener's head orientation; the array render ignores it.

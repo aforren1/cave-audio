@@ -8,8 +8,8 @@ extends the engine or verifies it on hardware, against these specs.
 ## What this is
 
 A self-hosted native (C/C++) spatial audio engine for a CAVE installation. It
-drives a **26-speaker array** over **ASIO** into a **Dante Virtual Soundcard
-(DVS)**, with a **binaural (HRTF) debug monitor** as a second output. Unity and
+drives a **26-speaker array** over **ASIO** into an **RME Digiface Dante** (a hardware
+Dante endpoint), with a **binaural (HRTF) debug monitor** as a second output. Unity and
 Unreal are *thin control clients* over a C ABI — no rendered audio crosses that
 boundary, only control (sound triggers, source positions, listener pose). The one
 inbound exception is the opt-in push-source feed (caller PCM *into* the engine,
@@ -23,7 +23,7 @@ and a clean, engine-agnostic core. See `docs/architecture.md` for the why.
 
 Sources → per-voice **listener-relative DBAP** panning → an in-memory
 **26-channel master bus**. The bus has *consumers*:
-- **ASIO device** (production): writes the 26-ch bus straight to DVS.
+- **ASIO device** (production): writes the 26-ch bus straight to the Digiface.
 - **Binaural monitor** (debug): treats each bus channel as a virtual speaker at
   its room position, HRTFs to stereo, writes to a normal output device.
 
@@ -102,7 +102,7 @@ third_party/           asiosdk/ (GPLv3 option, vendored), steam-audio-source/ (s
 
 ## Build
 
-Target: **Windows only** (ASIO is Windows-only; DVS is Windows/macOS). CMake.
+Target: **Windows only** (ASIO is Windows-only; the Digiface is Windows/macOS). CMake.
 A future cross-platform move means abstracting the device layer (ASIO is just the
 Windows sink) — do not bake ASIO assumptions outside `asio_sink.c`.
 
@@ -315,9 +315,9 @@ sink always captured but rt_render used to discard — via a C11 seqlock (`clk_s
 clk_time`, odd = write open; an unstamped block KEEPS the last valid pair), giving clients a
 jitter-free wall↔dsp mapping for AV sync (epoch is backend-defined: drivers vary, the null sink
 counts from stream start, the MANUAL sink never stamps — reproducibility; the ASIO sink synthesizes
-a QPC stamp at callback entry when the driver omits systemTime — FlexASIO does, DVS unknown); **`bwa_get_output_latency`**
+a QPC stamp at callback entry when the driver omits systemTime — FlexASIO does, the Digiface unknown); **`bwa_get_output_latency`**
 surfaces `ASIOGetLatencies` through a new sink-vtbl entry (`output_latency`, queried after
-CreateBuffers; DVS reports its Dante buffering there; null/manual = 0) — when a scheduled sample is
+CreateBuffers; the Digiface reports its Dante buffering there; null/manual = 0) — when a scheduled sample is
 HEARD, not just rendered. Unity: `Engine.GetClock`/`OutputLatency`/`DspTimeAt`/`RealtimeAt` (the
 last two keep a decaying-max epoch-offset estimator refreshed each LateUpdate — converges through
 minimal-age refreshes, tracks ppm drift, falls back to block-granular DspTime pairing stampless).
@@ -454,7 +454,7 @@ simulator). The ASIO capture compiles but is unverified on hardware; `--simulate
 hardware-free. The capture shell logs the driver's OWN latencies at open (`ASIOGetLatencies`; the
 `calib_asio_latencies` accessor survives close) and `--localize` cross-checks the solved system latency
 against that digital loop — residual = DAC/ADC + analog, so negative is impossible (device/clocking
-mix-up) and tens of ms flags the DVS latency setting; `--live` without `--latency` prints the loop as
+mix-up) and tens of ms flags the Dante latency setting; `--live` without `--latency` prints the loop as
 the lower-bound starting value. `bwa_minimal` prints a measured device rate from two `bwa_get_clock`
 stamps (the Stage-0 Dante clock-lock check in docs/hardware-validation.md). **Zylia ZM-1 single-position localization** (`zylia.c`, unit-tested off-hardware via the `zylia`
 test) is the one-placement complement to the multi-position omni survey: the 19-capsule sphere sees each sweep
@@ -491,7 +491,7 @@ REFUSED for DOA (the unfilled snapshot channels would enter the fit as silent ar
 confidently wrong). Simulate mode synthesizes claps through the identical pipeline; `zylia/sim_doa` asserts the
 recovered direction lands within 2° of truth and `zylia/sim_survey` drives the whole survey flow, asserting it
 recovers the built-in table back (which only holds if the UI fed it the right positions, arrivals AND channel
-order). **Dante is the unlock for the sweep path**: the ZM-1 can join the Dante network via Dante Via, so DVS
+order). **Dante is the unlock for the sweep path**: the ZM-1 can join the Dante network via Dante Via, so the Digiface
 presents its 19 capsules as INPUTS ON THE SAME ASIO DEVICE as the 26 outputs — one driver, one clock domain,
 which dissolves the two-device problem that blocks `--zylia` on hardware (and makes latency measurable, so
 DISTANCE becomes real). `zylia_survey` is capture-agnostic: it takes (source position, 19 arrival times) and
@@ -549,8 +549,9 @@ builds `test_sound` under ASan.
 ## What NOT to do
 
 - Do not introduce FMOD/Wwise or route audio through the engine's mixer.
-- Do not use Unity's built-in audio (8-channel cap) or DVS's WDM driver
-  (16-channel cap). 26 channels requires ASIO. This is settled.
+- Do not use Unity's built-in audio (8-channel cap) or the device's WDM/DirectSound
+  driver (a consumer path: its own mixing, resampling, and no timing hooks).
+  26 channels requires ASIO. This is settled.
 - Do not pan via pure ambisonics for localized point sources — the listener moves
   across ~3×3 m and a single sweet spot fails. DBAP is recomputed per frame from
   tracked position. See `docs/spatialization.md`.
@@ -592,7 +593,7 @@ the production array render never uses HRTF.
 - `docs/spatialization.md` — DBAP, moving observer, binaural decode (3rd-order), speaker alignment.
 - `docs/materials.md` — material/geometry model → Steam Audio occlusion + reflections → the bus. **Design (Later).**
 - `docs/integration.md` — Unity binding + coordinate seam; Unreal notes.
-- `docs/build.md` — platform, dependencies, licensing, DVS/Dante config.
+- `docs/build.md` — platform, dependencies, licensing, Dante config.
 - `docs/layout-schema.md` — `cave_layout.json` format: speaker geometry, per-speaker gain/delay, DBAP knobs.
 - `docs/calibration.md` — `bwa_calibrate`: acoustic position survey, delay/gain trims, room report → `cave_layout.json`.
 - `docs/validation.md` — `bwa_validate`: render a phantom, measure where it landed. The Zylia

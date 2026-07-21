@@ -72,9 +72,9 @@ typedef uint32_t bwa_source;
 typedef uint32_t bwa_bed;       /* an ambisonic-bed voice (world-locked soundfield); see bwa_bed_* */
 
 typedef enum {
-    BWA_PROFILE_CAVE     = 0,  /* speaker bus -> ASIO/DVS. Listener POSITION only. */
+    BWA_PROFILE_CAVE     = 0,  /* speaker bus -> ASIO/Digiface. Listener POSITION only. */
     BWA_PROFILE_BINAURAL = 1,  /* speaker bus -> binaural monitor -> stereo device. Full POSE. */
-    BWA_PROFILE_BOTH     = 2,  /* array to DVS + binaural tap to a stereo device. Full POSE. */
+    BWA_PROFILE_BOTH     = 2,  /* array to the Digiface + binaural tap to a stereo device. Full POSE. */
 } bwa_profile;
 
 /* Diffuse-bed ambisonic decoder (fixed for the engine's lifetime — the decode matrix is built
@@ -106,7 +106,7 @@ typedef struct {
     const char*  hrtf_path;     /* HRTF (SOFA) or NULL for built-in. binaural/both. */
     uint32_t     sample_rate;   /* Hz; 0 = 48000. 48 kHz is the validated rate. The DSP is
                                  * rate-derived (96 kHz renders correctly in software), but rates
-                                 * above 48 k are unverified against the real DVS/hardware chain —
+                                 * above 48 k are unverified against the real Digiface/Dante chain —
                                  * treat 48 kHz as supported until the rig confirms more. */
     uint32_t     block_size;    /* render quantum, frames; 0 = 256. Also the ASIO buffer-size
                                  * HINT — a driver may run its own size (the sinks adapt);
@@ -321,7 +321,7 @@ BWA_API uint64_t bwa_get_dsp_time(bwa_engine* e);
  * docs/api.md, "Syncing with graphics". */
 BWA_API bool     bwa_get_clock(bwa_engine* e, uint64_t* dsp_sample, uint64_t* host_time_ns);
 /* The primary device's self-reported render->DAC latency in FRAMES at the engine rate
- * (ASIOGetLatencies — DVS includes its Dante network buffering): audio scheduled for dsp time T
+ * (ASIOGetLatencies — the Digiface includes its Dante buffering): audio scheduled for dsp time T
  * is HEARD at T + latency. The audio half of AV alignment (the video half — display delay — you
  * measure once; docs/api.md). 0 = unknown or no physical output (null sink, or before
  * bwa_start). Constant while the device is open. */
@@ -627,7 +627,7 @@ BWA_API void     bwa_source_set_size(bwa_engine* e, bwa_source s, float radius_m
  * tool, NOT a spatial path (it bypasses the panner; don't use it to "place" audio). `channel` is in
  * [0, bwa_get_channel_count()). Per-frame-safe, next block, no bwa_commit needed; multiple channels at once.
  * gain 0 or BWA_TEST_OFF silences a channel. Composes with the profiles: cave/both -> a raw tone on
- * that DVS channel/speaker; binaural -> that bus channel HRTF'd as its virtual speaker. */
+ * that Digiface channel/speaker; binaural -> that bus channel HRTF'd as its virtual speaker. */
 typedef enum { BWA_TEST_OFF = 0, BWA_TEST_SINE = 1, BWA_TEST_NOISE = 2 } bwa_test_kind;
 BWA_API void     bwa_set_test_signal(bwa_engine* e, uint32_t channel, bwa_test_kind kind, float gain);
 

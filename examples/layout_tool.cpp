@@ -5,7 +5,7 @@
  * engine loads via bwa_desc.layout_path; see docs/layout-schema.md). The killer feature is identify-
  * by-ear: each speaker's INDEX is its bus/output channel, so selecting speaker N and enabling the
  * tone drives that exact channel with the built-in test signal (bwa_set_test_signal) out the cave profile
- * -> DVS -> the physical speaker. So the survey loop is: pick an index, enable the tone, walk to
+ * -> the Digiface -> the physical speaker. So the survey loop is: pick an index, enable the tone, walk to
  * whichever speaker sounds, read its position, and place marker N there (nudge, or type exact coords
  * into the panel's position field).
  *
@@ -356,7 +356,7 @@ static void build_engine(const char* layout_path) {
     if (!e) return;
     if (bwa_start(e) != 0) {
         const char* err = bwa_last_error(e);
-        printf("bwa_start: %s — no audition (needs an ASIO device / DVS with an output per speaker); "
+        printf("bwa_start: %s — no audition (needs an ASIO device with an output per speaker); "
                "the editor still runs.\n", err ? err : "?");
     }
     backend = bwa_get_audio_backend(e);
@@ -447,9 +447,8 @@ static void score_panner(bwa_panner panner, int stride, int tracked,
     double sumerr = 0, sumspread = 0; float worst = 0; int cnt = 0;
     for (int l = 0; l < 27; ++l) {
         Vector3 Lp = cov_lis[l]; Lp.y += obs_height;    /* the listener's EARS are at obs_height, not the floor */
-        float lisf[3]   = { Lp.x, Lp.y, Lp.z };
+        /* the SOLVE position; the listener stays Lp, and the two differ whenever tracked == 0 */
         float solvef[3] = { tracked ? Lp.x : S.x, tracked ? Lp.y : S.y, tracked ? Lp.z : S.z };
-        (void)lisf;
         bwa_panner_gains_batch(panner, pos, (uint32_t)g_nspk, solvef, srcs, ns, gains);
         for (int j = 0; j < ns; ++j) {
             float* g = &gains[j * g_nspk];
@@ -1054,7 +1053,7 @@ static void draw_hud(float cov_worst, float cov_mean) {
                            sel, sel, spk[sel].pos.x, spk[sel].pos.y, spk[sel].pos.z, seldel, seld);
     }
     if (audio) ImGui::TextColored(ImVec4(0.43f, 0.92f, 0.51f, 1), "audio: %s  (tone drives the selected channel)", backend);
-    else       ImGui::TextColored(ImVec4(0.92f, 0.67f, 0.43f, 1), "audio: none - editor only (needs an ASIO/DVS device to audition)");
+    else       ImGui::TextColored(ImVec4(0.92f, 0.67f, 0.43f, 1), "audio: none - editor only (needs an ASIO/Digiface device to audition)");
     if (CON.loaded && !preview)
         ImGui::TextColored((con_bad || con_occ) ? ImVec4(0.96f, 0.51f, 0.51f, 1) : ImVec4(0.47f, 0.86f, 0.55f, 1),
                            "constraints: %d no-go  %d obstacle   %d out [K snap]  %d occluded (move clear)",
@@ -1164,7 +1163,7 @@ static void draw_panel(void) {
     bwTip("per-speaker level trim (gain_db in the file)");
     CheckboxInt("tone [T]", &tone_on);
     bwTip("drive THIS channel with the test signal out the array: walk the room, hear which "
-          "physical speaker it is, place its marker (needs the ASIO/DVS device)");
+          "physical speaker it is, place its marker (needs the ASIO/Digiface device)");
     ImGui::SameLine();
     { bool nb = tone_kind == BWA_TEST_NOISE;
       if (ImGui::Checkbox("noise [N]", &nb)) tone_kind = nb ? BWA_TEST_NOISE : BWA_TEST_SINE; }
@@ -1667,7 +1666,7 @@ int main(int argc, char** argv) {
     }
     printf("layout: %s (%s, %d speakers)\n", g_path, loaded ? "loaded" : "default dome", g_nspk);
 
-    /* cave profile so the test signal / DBAP preview goes out the DVS to the real speakers;
+    /* cave profile so the test signal / DBAP preview goes out the Digiface to the real speakers;
      * no audio (the editor still works) if no such ASIO device is present (off-site). */
     gen_pink_wav(PREV_WAV);                        /* the moving DBAP-preview source signal */
     build_engine(NULL);                            /* edit-mode engine (the test signal is layout-independent) */

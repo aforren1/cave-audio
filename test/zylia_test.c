@@ -49,6 +49,17 @@ static void synth_field(const float center[3], const double src[3], double c, do
     }
 }
 
+/* arrivals for an EXPLICIT capsule table, so a test can move the array without touching the
+ * installed one (the tracked-mount case: the physical geometry and the assumed geometry differ). */
+static void synth_caps(const float caps[ZYLIA_MICS][3], const float center[3], const double src[3],
+                       double c, double arr[ZYLIA_MICS]) {
+    for (int i = 0; i < ZYLIA_MICS; ++i) {
+        double mx = center[0] + caps[i][0], my = center[1] + caps[i][1], mz = center[2] + caps[i][2];
+        double dx = mx - src[0], dy = my - src[1], dz = mz - src[2];
+        arr[i] = sqrt(dx*dx + dy*dy + dz*dz) / c;
+    }
+}
+
 /* great-circle angle (deg) between two unit vectors. */
 static double ang_deg(const float a[3], const double b[3]) {
     double d = (double)a[0]*b[0] + (double)a[1]*b[1] + (double)a[2]*b[2];
@@ -274,10 +285,10 @@ static void test_survey(void) {
     {
         const char* path = "zylia_survey_test.json";
         char e[128] = {0};
-        CHECK(zylia_survey_save(path, caps, resid_us, radius, spread, NOBS, e, sizeof e), "survey saves");
+        CHECK(zylia_survey_save(path, caps, resid_us, radius, spread, NOBS, NULL, e, sizeof e), "survey saves");
 
         zylia_set_capsules(NULL);                        /* wipe it, so a no-op load would be caught */
-        CHECK(zylia_survey_load(path, e, sizeof e), "survey loads");
+        CHECK(zylia_survey_load(path, NULL, e, sizeof e), "survey loads");
 
         float back[ZYLIA_MICS][3];
         zylia_capsules(back);
@@ -297,8 +308,8 @@ static void test_survey(void) {
             float bad[ZYLIA_MICS][3];
             for (int i = 0; i < ZYLIA_MICS; ++i)
                 for (int a = 0; a < 3; ++a) bad[i][a] = caps[i][a] * 1000.0f;
-            CHECK(zylia_survey_save(path, bad, 0, 49, 1, NOBS, e, sizeof e), "save (bad units)");
-            CHECK(!zylia_survey_load(path, e, sizeof e), "a mm-vs-m unit slip is rejected on load");
+            CHECK(zylia_survey_save(path, bad, 0, 49, 1, NOBS, NULL, e, sizeof e), "save (bad units)");
+            CHECK(!zylia_survey_load(path, NULL, e, sizeof e), "a mm-vs-m unit slip is rejected on load");
         }
         remove(path);
     }
@@ -653,6 +664,104 @@ int main(void) {
             CHECK(!zylia_intensity_doa(sptr, NS, FS, C, 400.0, 1200.0, ex, ds, NULL),
                   "intensity DOA refuses too few capsules as well");
         }
+    }
+
+    /* ---- tracked mount: survey once in the stand's frame, then follow the pose ----
+     *
+     * The scenario this has to get right is the one a validation session creates seven times: the mic
+     * is surveyed at one mount pose, then physically MOVED and re-aimed. Channel order survives that;
+     * orientation does not. If the stand is a tracked rigid body the rotation is measurable, so the
+     * body-frame table plus the live pose should reconstruct the room-axes geometry exactly.
+     *
+     * The control at the end is the part that makes this a test rather than a demonstration: decoding
+     * the moved array against the STALE survey must come back badly wrong. If it didn't, the rotation
+     * would be buying nothing and the whole mechanism could be deleted without a failure.
+     */
+    {
+        const double C2 = 343.0;
+        float base[ZYLIA_MICS][3];
+        zylia_set_capsules(NULL);
+        zylia_capsules(base);                       /* the built-in table, array-centred */
+
+        /* two mount poses: A = where it was surveyed, B = where it ended up after a remount */
+        float qA[4] = { 0.0f, 0.3827f, 0.0f, 0.9239f };            /* 45 deg yaw */
+        float qB[4] = { 0.1830f, 0.3106f, 0.0223f, 0.9321f };      /* yaw + a tilted stand */
+        float RA[9], RB[9];
+        zylia_quat_to_matrix(qA, RA);
+        zylia_quat_to_matrix(qB, RB);
+
+        /* rotation matrices must be orthonormal or nothing downstream is a rotation */
+        double orth = 0.0;
+        for (int r = 0; r < 3; ++r)
+            for (int cc = 0; cc < 3; ++cc) {
+                double d = 0.0;
+                for (int k = 0; k < 3; ++k) d += (double)RB[r*3+k] * RB[cc*3+k];
+                orth += fabs(d - (r == cc ? 1.0 : 0.0));
+            }
+        CHECK(orth < 1e-5, "quaternion -> rotation matrix is orthonormal");
+
+        /* a quarter turn about +y takes +x to -z, which pins the handedness */
+        float qY[4] = { 0.0f, 0.7071068f, 0.0f, 0.7071068f }, RY[9];
+        zylia_quat_to_matrix(qY, RY);
+        CHECK(fabs(RY[0]) < 1e-5 && fabs(RY[6] + 1.0f) < 1e-5,
+              "+90 deg about +y maps +x to -z (right-handed, y up)");
+
+        /* what a survey at pose A recovers (room axes), and its body-frame form */
+        float capsA[ZYLIA_MICS][3], capsBody[ZYLIA_MICS][3], capsB[ZYLIA_MICS][3], back[ZYLIA_MICS][3];
+        zylia_capsules_rotate(base, RA, 0, capsA);              /* the array as mounted at A */
+        zylia_capsules_rotate(capsA, RA, 1, capsBody);          /* room -> body */
+        zylia_capsules_rotate(capsBody, RA, 0, back);           /* and back again */
+        double worst_rt = 0.0;
+        for (int i = 0; i < ZYLIA_MICS; ++i)
+            for (int a = 0; a < 3; ++a) {
+                double d = fabs(back[i][a] - capsA[i][a]);
+                if (d > worst_rt) worst_rt = d;
+            }
+        CHECK(worst_rt < 1e-6, "room -> body -> room round-trips exactly");
+
+        /* the mic is remounted at pose B: physically, the capsules are the body table under RB */
+        zylia_capsules_rotate(capsBody, RB, 0, capsB);
+
+        double src2[3] = { 1.7, 1.9, -2.3 };
+        float center2[3] = { 0.2f, 1.1f, -0.4f };
+        double arrB[ZYLIA_MICS];
+        synth_caps(capsB, center2, src2, C2, arrB);             /* what the moved array really hears */
+
+        double tx = src2[0]-center2[0], ty = src2[1]-center2[1], tz = src2[2]-center2[2];
+        double tn = sqrt(tx*tx+ty*ty+tz*tz);
+        double truth2[3] = { tx/tn, ty/tn, tz/tn };
+
+        float d_tracked[3], d_stale[3];
+        zylia_set_capsules(capsB);                              /* body table x live pose */
+        CHECK(zylia_doa(arrB, d_tracked), "tracked-mount DOA solves");
+        double e_tracked = ang_deg(d_tracked, truth2);
+
+        zylia_set_capsules(capsA);                              /* the CONTROL: survey-time table */
+        CHECK(zylia_doa(arrB, d_stale), "stale-mount DOA solves");
+        double e_stale = ang_deg(d_stale, truth2);
+
+        printf("[tracked mount] remounted: tracked err %.3f deg   stale survey err %.1f deg\n",
+               e_tracked, e_stale);
+        CHECK(e_tracked < 0.5, "the live pose reconstructs the moved array's geometry");
+        CHECK(e_stale > 10.0, "...and the stale survey is badly wrong, so the pose is doing the work");
+
+        /* the body-frame survey round-trips through the file, offset and all */
+        {
+            const char* path = "._zy_mount_test.json";
+            char e[128] = { 0 };
+            ZyliaMount m = { 1, 1, { 0.011f, -0.204f, 0.003f } }, got;
+            CHECK(zylia_survey_save(path, capsBody, 0.4f, 0.049f, 1.0f, 12, &m, e, sizeof e),
+                  "body-frame survey saves");
+            CHECK(zylia_survey_load(path, &got, e, sizeof e), "body-frame survey loads");
+            CHECK(got.body_frame == 1 && got.have_offset == 1, "the mount metadata survives");
+            CHECK(fabs(got.offset_m[1] + 0.204f) < 1e-6, "the probed offset survives");
+            /* a body-frame file handed to a caller that can't be told is refused, not silently
+             * installed as if it were room axes */
+            CHECK(!zylia_survey_load(path, NULL, e, sizeof e),
+                  "a body-frame survey is refused without a mount out-param");
+            remove(path);
+        }
+        zylia_set_capsules(NULL);
     }
 
     printf("%s\n", fails ? "FAIL: zylia localization" : "PASS: zylia single-position localization");

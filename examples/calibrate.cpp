@@ -163,7 +163,7 @@ int main(int argc, char** argv) {
         /* Cross-check the solved latency against the driver's own numbers: the solve recovers the
          * FULL loop (digital buffers + DAC/ADC + analog), the driver reports the digital half, so
          * solved-minus-driver must be a small positive residual. Negative is physically impossible
-         * (device mix-up, clocking); tens of ms points at an unexpected buffer (the DVS latency
+         * (device mix-up, clocking); tens of ms points at an unexpected buffer (the Dante latency
          * setting). Median over speakers — per-speaker latency should agree, it is one system. */
         { long il = 0, ol = 0;
           if (!simulate && calib_asio_latencies(&il, &ol)) {
@@ -181,7 +181,7 @@ int main(int argc, char** argv) {
                       printf("  WARNING: solved latency is BELOW the driver's own digital loop — physically impossible;\n"
                              "           check the device/clocking (wrong driver? sample-rate mismatch?)\n");
                   else if (resid_ms > 20.0)
-                      printf("  WARNING: residual is unexpectedly large for DAC/ADC + analog — check the DVS latency\n"
+                      printf("  WARNING: residual is unexpectedly large for DAC/ADC + analog — check the Dante latency\n"
                              "           setting / an extra buffer in the loop\n");
               }
           } }

@@ -455,7 +455,7 @@ namespace BwAudio
             return Ready && Bwa.bwa_get_clock(_eng, out dspSample, out hostTimeNs);
         }
 
-        /// <summary>Device-reported render→DAC output latency, frames at the engine rate (DVS includes
+        /// <summary>Device-reported render→DAC output latency, frames at the engine rate (the Digiface includes
         /// its Dante network buffering). A sound scheduled for dsp time T is HEARD at T + OutputLatency —
         /// fold it into AV alignment together with your measured display delay. 0 = unknown / no
         /// physical output (the silent null-sink fallback).</summary>

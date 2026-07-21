@@ -134,7 +134,7 @@ if(BWA_PROFILE_SELF AND NOT BWA_TRACY)
   message(STATUS "bw_audio: in-process zone profiler ENABLED")
 endif()
 
-# ---- optional ASIO backend (production: 26ch -> DVS -> Dante) ----
+# ---- optional ASIO backend (production: 26ch -> Digiface -> Dante) ----
 # Auto-enabled when the SDK is present; the SDK is GPLv3/proprietary dual-licensed
 # and is NOT committed to this repo (third_party/README.md explains how to fetch it).
 set(ASIO_SDK_DIR "${CMAKE_SOURCE_DIR}/third_party/asiosdk" CACHE PATH "Steinberg ASIO SDK root")
@@ -650,8 +650,17 @@ if(BWA_BUILD_CALIBRATE)
     target_link_libraries(bwa_validate PRIVATE ole32 user32 advapi32)
   endif()
   if(BWA_BUILD_TESTS)
-    # the whole session flow, hardware-free: plan -> render -> score -> contrasts -> report
-    add_test(NAME validate_sim COMMAND bwa_validate --simulate --azimuths 6)
+    # The whole session flow, hardware-free. Both backends run the SAME loop, so this covers the
+    # capsule check and the exclusion threading the rig will execute — not just the analytic field.
+    add_test(NAME validate_sim COMMAND bwa_validate --simulate --azimuths 6 --no-prompt)
+    # ...and the fault path: corrupt a capsule in every capture and require it to be caught
+    # (bwa_validate exits 3 if the integrity layer misses it).
+    add_test(NAME validate_fault COMMAND bwa_validate --simulate --azimuths 6 --inject-fault 7)
+    # ...and the tracked-mount path. This asserts the placement hook FIRES, not that the result looks
+    # right: in simulate the field is synthesized from the same capsule table the estimator reads, so
+    # a wrong table cancels out. The hook was once passed in and never called, which left --track
+    # silently inert while announcing that the tracker was measuring. Exits 4 if it regresses.
+    add_test(NAME validate_track COMMAND bwa_validate --simulate --track-sim --azimuths 4 --no-prompt)
   endif()
 
   # ZM-1 hardware bring-up probe: console meter over the shared capture shell (zylia_capture.cpp).

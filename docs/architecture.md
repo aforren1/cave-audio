@@ -4,7 +4,7 @@
 
 Render spatialized audio for a CAVE: a tracked observer moving within a ~3×3 m area
 inside a **26-speaker array**, fed from a game engine (Unity and/or Unreal). Output
-goes to a **Dante Virtual Soundcard (DVS)** over **ASIO**. Latency and timing
+goes to an **RME Digiface Dante** over **ASIO**. Latency and timing
 precision are first-class requirements.
 
 ## Top-level decision: self-hosted core, engines as control clients
@@ -25,7 +25,7 @@ Why:
 - **Engine-agnostic.** One core, two thin clients. The only per-engine code reads
   transforms and tracking.
 - **One system to run and author.** The experiment deploys as a single process on
-  the machine running DVS. The alternative, an external renderer (Spat, SSR, Max)
+  the machine running the endpoint. The alternative, an external renderer (Spat, SSR, Max)
   driven over OSC, means a second implementation in a second system: authored
   separately, versioned separately, synchronized at runtime, and maintained by
   whoever still knows that system. In-process control leaves nothing to keep in
@@ -40,7 +40,7 @@ The cost: you own voice management, wav playback, and the ASIO host glue.
 The panner does not write "to the device". It writes to an in-memory **master bus**,
 one channel per speaker. *Consumers* read that bus:
 
-- **ASIO device sink (production):** writes the bus straight to DVS.
+- **ASIO device sink (production):** writes the bus straight to the Digiface.
 - **Binaural monitor (debug):** treats each bus channel as a virtual speaker at that
   speaker's surveyed room position, HRTFs them to stereo, and writes to an ordinary
   output device (a headphone DAC). It sits *after* the panner, so it auditions the
@@ -62,7 +62,7 @@ stereo sink.
    per-ch gain/delay   bus→ambisonics→HRTF
    align               (single binaural decode)
         │                  │
-     ASIO ► DVS         stereo device
+     ASIO ► Digiface         stereo device
      (cave)             (binaural debug)
 ```
 
@@ -133,7 +133,7 @@ graph, with each stage annotated with the functions that implement and configure
  + test signal (bwa_set_test_signal - a raw channel, deliberately post-align)
  linked limiter (default −1 dBFS) → per-channel peak meters
       │
-      ├ cave      26-ch ASIO ► DVS ► the array
+      ├ cave      26-ch ASIO ► Digiface ► the array
       ├ binaural  each bus channel = a virtual speaker at its room position →
       │           3rd-order SH encode → phonon HRTF decode (simple-pan fallback) → 2 ch
       ├ both      the array sink + the monitor on a second device (double-buffered)
@@ -181,9 +181,9 @@ identical across all three:
 
 | profile    | bus consumers                         | tracking needed | Dante HW |
 |------------|---------------------------------------|-----------------|----------|
-| `cave`     | ASIO/DVS                              | position only   | yes      |
+| `cave`     | ASIO/Digiface                              | position only   | yes      |
 | `binaural` | binaural monitor → stereo             | full head pose  | no       |
-| `both`     | ASIO/DVS + binaural monitor → stereo  | full head pose  | yes      |
+| `both`     | ASIO/Digiface + binaural monitor → stereo  | full head pose  | yes      |
 
 `binaural` runs the array render into memory; only the stereo monitor touches a
 device, so it needs no Dante hardware. This is the desk-development profile.
@@ -206,9 +206,10 @@ orientation component.
 
 ## Locked decisions
 
-- **Transport: ASIO, not WDM.** DVS's WDM driver caps at 16 channels; ASIO carries
-  up to 64. The CAVE's 26 channels make ASIO mandatory. The device must expose enough
-  outputs for your layout: 26 for the CAVE array.
+- **Transport: ASIO, not WDM.** WDM is a consumer path with its own mixing, resampling and
+  channel limits; ASIO is the multichannel low-latency route and the only one that gives us
+  the timing hooks below. The CAVE's 26 channels make it mandatory. The device must expose
+  enough outputs for your layout: 26 for the CAVE array.
 - **ASIO SDK used directly** under its GPLv3 option (dual-licensed GPLv3/proprietary
   as of Oct 2025), for direct access to the timing hooks. See `docs/build.md` for
   copyleft notes.

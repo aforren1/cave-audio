@@ -110,7 +110,7 @@ per-zone *proportions*, not the absolute block total, from this build.
 ## Real-time scheduling / MMCSS
 
 - **The hard-RT audio thread is the ASIO driver's `bufferSwitch` thread; the host doesn't create it.** A real
-  ASIO driver (including Dante Virtual Soundcard) already schedules its callback time-critical / via
+  ASIO driver (including RME Digiface Dante) already schedules its callback time-critical / via
   MMCSS "Pro Audio". The host shouldn't (and can't cleanly) re-register it. Nothing to do here.
 - **The engine's own threads are soft/background**: the `null_sink` render loop (no-hardware fallback),
   the three Steam Audio **sim threads** (`bw-sim (occlusion)`, `bw-sim (reflections)`,

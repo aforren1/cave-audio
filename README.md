@@ -1,7 +1,7 @@
 # bw_audio
 
 Self-hosted spatial audio engine for a 26-speaker CAVE installation. Drives the
-array over **ASIO → Dante Virtual Soundcard**, with a **binaural HRTF monitor** for
+array over **ASIO → RME Digiface Dante**, with a **binaural HRTF monitor** for
 desk-side debugging. Unity and Unreal connect as thin control clients over a C ABI.
 
 ## Why self-hosted
@@ -10,7 +10,7 @@ Going direct (no FMOD/Wwise) gives sample-accurate access to ASIO timing hooks a
 keeps the core engine-agnostic, so the same library serves both engines with only a
 thin per-engine glue layer. The spatializer, mixer, output, and tracking all live
 in one process behind one audio callback—the experiment deploys as one system on
-the machine running DVS, with no external renderer to author, synchronize, and
+the machine running the endpoint, with no external renderer to author, synchronize, and
 maintain alongside it.
 
 ## Shape
@@ -23,7 +23,7 @@ maintain alongside it.
                      │  (one audio callback)                           │
                      └─────────────────────────────────────────────────┘
                                   │                         │
-                          ASIO ► DVS ► array        binaural monitor ► stereo
+                          ASIO ► Digiface ► array        binaural monitor ► stereo
                           (production)              (debug)
 ```
 
@@ -206,7 +206,7 @@ bwa_commit(e);
 | [`docs/integration.md`](./docs/integration.md) | Unity/Unreal bindings, coordinate seam |
 | [`docs/layout-schema.md`](./docs/layout-schema.md) | `cave_layout.json` format |
 | [`docs/calibration.md`](./docs/calibration.md) | trims, EQ, acoustic survey, room report |
-| [`docs/build.md`](./docs/build.md) | platform, dependencies, licensing, DVS/Dante config |
+| [`docs/build.md`](./docs/build.md) | platform, dependencies, licensing, Dante config |
 
 Contributor-facing notes live in [`docs/internal-types.md`](./docs/internal-types.md),
 [`docs/roadmap.md`](./docs/roadmap.md), [`docs/profiling.md`](./docs/profiling.md), and

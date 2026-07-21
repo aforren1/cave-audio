@@ -251,7 +251,7 @@ while (!WindowShouldClose()) {
   ("the collision is this frame") can never beat the physical output chain: play it
   immediately and accept up to one output latency of error.
 - **`display_s` is yours to measure.** The engine reports its own output chain
-  (`bwa_get_output_latency`; DVS includes its Dante buffering) but cannot see your
+  (`bwa_get_output_latency`; the Digiface includes its Dante buffering) but cannot see your
   display's. Measure draw→photons once (photodiode, or an AV-sync clapper against the
   array) and that one constant aligns the whole chain.
 - **The fallback is often enough.** Before the first stamped block (and always on the
@@ -272,10 +272,14 @@ production plays, through virtual speakers at the surveyed room positions
 gain-staging bugs show up on headphones before the rig exists.
 
 ```c
+// The rig's endpoint is an RME Digiface Dante. Its ASIO driver registers under RME's own
+// name, which is not the product name — enumerate with bwa_get_asio_driver_count/_name (or
+// bwa_calibrate --list-drivers) rather than hardcoding a guess. NULL auto-picks the first
+// driver with enough channels for the profile, which is usually what you want anyway.
 bwa_desc cfg = { 0 };
 cfg.profile     = rig ? BWA_PROFILE_CAVE : BWA_PROFILE_BINAURAL;
 cfg.layout_path = rig ? "cave_layout.json" : NULL;         // desk: the default grid
-cfg.asio_driver = rig ? "Dante Virtual Soundcard" : NULL;  // desk: auto-pick a 2-ch device
+cfg.asio_driver = rig ? rig_driver_name : NULL;            // NULL = auto-pick
 bwa_engine* e = bwa_create(&cfg);
 if (bwa_start(e) != BWA_OK) { /* a rig layout that fails to load refuses to start */ }
 printf("backend: %s\n", bwa_get_audio_backend(e));         // "asio:<driver>" or "null"
@@ -331,7 +335,7 @@ copied at call time).
 | `profile`        | `cave` / `binaural` / `both` (see architecture.md)                   |
 | `layout_path`    | surveyed speaker geometry (JSON); cave/both. NULL = the default 26-grid deliberately; a named file that fails to load fails `bwa_start` (`BWA_ERR_LAYOUT`) |
 | `hrtf_path`      | HRTF (SOFA) or NULL for built-in; binaural/both                     |
-| `sample_rate`    | Hz; 0 = 48000, the **validated** rate. The DSP is rate-derived and 96 kHz renders correctly in software, but rates above 48 k are unverified against the real DVS/hardware chain - treat 48 kHz as supported until the rig confirms more |
+| `sample_rate`    | Hz; 0 = 48000, the **validated** rate. The DSP is rate-derived and 96 kHz renders correctly in software, but rates above 48 k are unverified against the real Digiface/Dante chain - treat 48 kHz as supported until the rig confirms more |
 | `block_size`     | render quantum, frames; 0 = 256. Also the ASIO buffer-size *hint* - a driver may run its own size (the sinks adapt); `bwa_get_block_size` reads back the resolved quantum |
 | `sink`           | output-device policy: `BWA_SINK_AUTO` (0, default - try ASIO, fall back to the silent null sink), `BWA_SINK_ASIO` (demand a device: an open failure fails `bwa_start` loudly), `BWA_SINK_NULL` (force the offline sink - CI, profiling, tracking-only), `BWA_SINK_MANUAL` (no device/thread - pump blocks yourself with `bwa_render_block`; deterministic, for golden tests) |
 | `asio_driver`    | ASIO driver name to open; NULL = auto-pick the first registered driver with enough output channels for the profile (binaural finds a 2-ch headphone driver, cave a ≥layout-count one) |
@@ -557,7 +561,7 @@ clocks drift ~ppm; the Unity binding's `Engine.DspTimeAt`/`RealtimeAt` do this f
 decaying-max offset estimator). It returns false until a host-stamped block has rendered, and
 always on the **manual** sink, whose clock is deliberately wall-free so renders reproduce. Finally,
 the dsp clock stamps when a block is *rendered*, not heard: `bwa_get_output_latency` is the
-device's own render→DAC delay in frames (`ASIOGetLatencies`; DVS includes its Dante buffering), so
+device's own render→DAC delay in frames (`ASIOGetLatencies`; the Digiface includes its Dante buffering), so
 sound scheduled for dsp time T reaches the room at `T + latency`—subtract your measured display
 delay from it and one constant aligns the whole AV chain.
 
@@ -1166,7 +1170,7 @@ This is a speaker-check / wiring / calibration tool: walk a tone across every ch
 the channel→speaker map, find a dead speaker, set a trim. It is **not** a spatial path: it
 bypasses the panner, so don't use it to "place" a sound. Per-frame-safe, takes effect next block,
 no `bwa_commit` needed. Any number of channels at once; `gain 0` / `BWA_TEST_OFF` silences one.
-Works in every profile (cave/both: a raw tone on that DVS channel; binaural: that bus channel
+Works in every profile (cave/both: a raw tone on that Digiface channel; binaural: that bus channel
 HRTF'd as its virtual speaker). Needs no SDK.
 
 `bwa_get_bus_levels` is the matching **readback**: each output channel's last-block peak `|sample|`
