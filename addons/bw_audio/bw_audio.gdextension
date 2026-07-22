@@ -1,0 +1,38 @@
+[configuration]
+
+entry_symbol = "bw_audio_library_init"
+compatibility_minimum = "4.4"
+reloadable = false
+
+[libraries]
+
+windows.editor.x86_64 = "res://addons/bw_audio/bin/bw_audio_gd.windows.editor.x86_64.dll"
+; A debug export deliberately loads the RELEASE-built extension. godot-cpp's template_debug
+; differs only in its own internal checks, and the Asset Store requires that every shared
+; library named here actually be present — so listing a third flavour we do not build would
+; be an automatic rejection, and building one would triple the godot-cpp cost to debug code
+; that is not the code under debug. tools/godot/pack.ps1 parses this section and refuses to
+; ship if any path below is missing, so the two cannot drift apart.
+windows.template_debug.x86_64 = "res://addons/bw_audio/bin/bw_audio_gd.windows.template_release.x86_64.dll"
+windows.template_release.x86_64 = "res://addons/bw_audio/bin/bw_audio_gd.windows.template_release.x86_64.dll"
+
+[dependencies]
+
+; The OS resolves these as imports of the extension, from its own directory. Listing them
+; makes the EXPORTER copy them next to the binary too — without that an exported game ships
+; the extension alone and fails to load it, having worked perfectly in the editor.
+;
+; phonon.dll is here because bw_audio.dll imports it in a Steam Audio build. It is not
+; referenced by any Godot code, so nothing else would ever pull it in.
+windows.editor.x86_64 = {
+  "res://addons/bw_audio/bin/bw_audio.dll": "",
+  "res://addons/bw_audio/bin/phonon.dll": ""
+}
+windows.template_debug.x86_64 = {
+  "res://addons/bw_audio/bin/bw_audio.dll": "",
+  "res://addons/bw_audio/bin/phonon.dll": ""
+}
+windows.template_release.x86_64 = {
+  "res://addons/bw_audio/bin/bw_audio.dll": "",
+  "res://addons/bw_audio/bin/phonon.dll": ""
+}
