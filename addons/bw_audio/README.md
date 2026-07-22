@@ -4,31 +4,6 @@ A GDExtension binding for the CAVE spatial audio engine. Godot is a **thin contr
 client**: no rendered audio crosses the boundary, and Godot's own `AudioServer` is
 unused. The engine drives ASIO itself.
 
-This directory is both things at once:
-
-- `addons/bw_audio/` — the drop-in addon. Copy it into your project to install.
-- `project.godot` + `demo/` — a project that consumes it, so you can open this folder
-  in Godot and press play.
-
-## Build
-
-The extension is a CMake target in the main build, opt-in because fetching and
-generating godot-cpp's bindings is a multi-minute first build:
-
-```
-cmake -S . -B build-godot -A x64 -DBWA_BUILD_GODOT=ON -DGODOTCPP_TARGET=editor
-cmake --build build-godot --config RelWithDebInfo --target bwa_gdextension
-```
-
-The build writes `bw_audio_gd.windows.editor.x86_64.dll` into
-`bindings/godot/addons/bw_audio/bin/` and copies `bw_audio.dll` (plus `phonon.dll` when
-the Steam Audio build is on) beside it. Then open `bindings/godot/` in Godot.
-
-`GODOTCPP_TARGET` is a **build-wide** choice, so one configure tree produces one library
-flavour. It defaults to `editor` here — godot-cpp's own default is `template_debug`, which
-builds fine and then does not load in the editor, so the addon would look broken. A shipping
-build wants a second tree with `-DGODOTCPP_TARGET=template_release`.
-
 ## Install
 
 **From the Asset Store** (in the editor: AssetLib tab, search "bw_audio"), or by hand:
@@ -43,84 +18,6 @@ distribution branch is not something you can install *from* directly — it exis
 a store listing that pulls a repo archive.
 
 Windows x64 only, because the engine's device path is ASIO.
-
-## Distribution
-
-`tools/godot/pack.ps1` builds **both** library flavours, writes the release zip, and leaves a
-staged addon tree at `build/godot/addon`:
-
-```
-powershell -File tools/godot/pack.ps1
-```
-
-That staged tree is then pushed to the **`godot` branch** by
-`tools/dist/publish-branch.ps1`, which CI runs on a `v*` tag. The branch's root is
-`addons/bw_audio/`, and that layout is not cosmetic: **the Asset Library downloads a repo
-archive at a specific commit**, not a release asset, so the binaries have to be committed
-somewhere. Keeping them on their own branch leaves `main` source-only and its existing
-"no binaries in the tree" rule intact.
-
-Publishes are ordinary commits, never a force-push — an Asset Library entry pins a commit
-hash, and rewriting history would eventually orphan a published one. The standing cost is
-that the branch grows by roughly the addon's size per release; that is inherent to in-repo
-distribution.
-
-A release also attaches the zip beside the Unity `.tgz`, the engine bundle and the ASIO SDK
-source, for anyone who would rather not use the AssetLib.
-
-### Submitting a store listing
-
-The Asset Library has moved to the **[Asset Store](https://store.godotengine.org/)** (beta).
-Its guidelines matter to us in three specific ways:
-
-- **Precompiled binaries in a GDExtension are explicitly allowed** — with the condition that
-  *every shared library named in the `.gdextension` must be present*. `pack.ps1` parses the
-  manifest's `[libraries]` section and refuses to pack if any path is missing, so that rule is
-  enforced at build time rather than discovered at review.
-- **`windows.template_debug` points at the release binary on purpose.** godot-cpp's
-  template_debug differs only in its own internal checks, so building a third flavour would
-  triple the godot-cpp cost to debug code that is not the code under debug — but simply
-  *listing* a flavour we do not build would be an automatic rejection.
-- **The thumbnail must be 16:9**, where the old library wanted a square icon. Both are
-  committed: `examples/icons/bw_audio.png` (256×256) and `bw_audio_thumb.png` (1280×720).
-
-Whether the store hosts an uploaded zip or pulls a repo archive is not documented on its
-public pages, and it is in beta — so both are covered: the release zip is the upload, and the
-`godot` branch is the archive. Whichever it turns out to want, nothing needs rebuilding.
-
-Each release needs the listing edited by hand; there is no API. If it pulls a commit, use the
-hash the publish step printed (`published <sha> -> godot`). Icon URLs must be
-`raw.githubusercontent.com`, e.g.
-`https://raw.githubusercontent.com/aforren1/cave-audio/main/examples/icons/bw_audio.png`.
-License is GPL-3.0, and the LICENSE inside the addon carries the copyright holder and year
-the guidelines require. Submissions are human-reviewed.
-
-Both flavours are packed because either alone fails in a way that only shows up late —
-without `editor` the addon does nothing when you open the project, and without
-`template_release` it works right up until someone exports. The script refuses to pack if
-either is missing, rather than shipping a manifest that promises libraries it does not carry.
-
-Both flavours are packed because either alone fails in a way that only shows up late —
-without `editor` the addon does nothing when you open the project, and without
-`template_release` it works right up until someone exports. The script refuses to pack if
-either is missing, rather than shipping a manifest that promises libraries it does not carry.
-
-Two things it stages deliberately: it copies into a **clean** directory first, because
-`addons/bw_audio/bin/` is gitignored build output and anything packing the working tree
-naively yields an addon with no binaries; and `phonon.dll` is listed in the manifest's
-`[dependencies]` so Godot's **exporter** carries it. Nothing in Godot references phonon —
-it is an import of `bw_audio.dll` — so without that entry an exported game ships the
-extension alone and fails to load it, having worked perfectly in the editor.
-
-A no-SDK build is supported (ISM + FDN + manual occlusion); packing one warns rather than
-fails, and says what is lost.
-
-### godot-cpp version
-
-Pinned to a commit (`BWA_GODOT_CPP_COMMIT` in `CMakeLists.txt`), not a branch: godot-cpp's
-release branches lag the engine — 4.5 is the newest cut — while master already ships
-`extension_api.json` for 4.7, which is what the installed editor is. When the editor
-moves, bump the commit and check that api file's header still matches.
 
 ## Coordinate seam
 
@@ -269,77 +166,11 @@ stop is an arranged ending and the caller wants to know when it landed.
 thread, where calling into GDScript would allocate and take the interpreter lock — exactly
 what invariant 1 forbids. Use the MANUAL sink and `render_block()` for capture instead.
 
-## Tests
-
-```
-ctest --test-dir build-godot -C RelWithDebInfo -R godot_
-```
-
-- **`godot_room`** — the coordinate seam's property test. It asserts the *property* (a
-  node's Godot forward equals the converted quaternion's room facing) rather than
-  restating the conversion, over cardinal and random orientations. Pure float math, no
-  godot-cpp, so it always builds.
-- **`godot_smoke`**, **`godot_frame`**, **`godot_api_manual`**, **`godot_api_null`**,
-  **`godot_scene`**, **`godot_scene_no_room`**, **`godot_playground`** — the demo scenes and
-  the playground self-test, self-checking and headless. These need an editor binary, which is
-  not a build dependency, so point CMake at one:
-  `-DBWA_GODOT_EXE=".../Godot_v4.7.1-stable_mono_win64_console.exe"`. Without it they are
-  simply not registered.
-
-All of these **do** run in CI, unlike the three imgui tools: Godot's `--headless` needs no
-display or GL. CI passes `--no-tests=error` so an empty selection fails rather than passing —
-a bad filter, a missing `BWA_GODOT_EXE` and a stale build cache otherwise all look identical
-to success.
-
-Every scene test rides a **`godot_import` fixture** (`test/godot_import.cmake`), and it is
-load-bearing: a runtime scene launch loads only the GDExtensions named in
-`.godot/extension_list.cfg`, and only the editor's **import scan** writes that file. `.godot/`
-is gitignored, so on a fresh checkout — every CI run, every new clone — there is no list, no
-`Bwa*` classes, and each scene wedges on parse errors for its full timeout. The fixture runs
-`--headless --import` first and then checks the *postcondition* (the list exists and names
-`bw_audio.gdextension`) rather than Godot's exit code, which is nonzero even on a healthy
-project. ctest schedules it automatically for any selected dependent, so `-R` filters keep
-working.
-
-`api.tscn` drives the whole bound surface, and it runs **twice, on both sinks**, because
-either alone leaves a hole:
-
-- **MANUAL** has no device and no audio thread, so blocks advance only when the scene pumps
-  `render_block()`. Playheads become functions of how many blocks were requested rather
-  than of machine speed, which is what lets `seek(24000)` landing and a paused playhead
-  freezing be assertions instead of coin flips. But nothing there is concurrent: one thread
-  on the command ring, one thread on both ends of the push ring, no voice retiring under a
-  live mixer. That is not what ships.
-- **NULL** puts the audio thread back — the production topology minus the device — and the
-  scene loosens its timing assertions to what a wall clock can honestly promise.
-
-Both check what a binding can actually get wrong: that every call reaches the core with its
-arguments intact, that handles survive, and that readbacks come back shaped right. Whether
-the DSP is *correct* is the engine's own suite's job.
-
-`scene.tscn` covers the geometry path, where almost nothing is observable: there is no
-readback for the static mesh. The one crack of light is that enabling image-source early
-reflections without a captured room makes the core record *"no room — call
-bwa_scene_set_box first"*. Its **absence** is therefore evidence the box arrived — and
-`godot_scene_no_room` drops the box so the same assertion has to fail, which is what keeps
-the positive run from passing vacuously.
-
 ## The playground
 
-`playground/` is the Godot port of `examples/playground.cpp` — the by-ear harness. Open this
-folder in Godot and run `playground/playground.tscn`, or:
-
-```
-godot --path bindings/godot res://playground/playground.tscn
-```
-
-Same seven scenes, same keys, same synthesized signals. The C++ one stays: it needs no
-Godot, and it keeps its own imgui test suite. What running both buys you is a check on this
-binding — one engine build, two clients, and any audible difference is the binding's fault.
-
-The signal synthesis is a deliberately literal port (same LCG seeds, same Paul Kellet pink
-coefficients, same periods), so an A/B between the two playgrounds compares engine paths
-rather than two different noises.
+`addons/bw_audio/playground/` is the by-ear harness — it ships **inside the addon**, so
+however you installed, open `addons/bw_audio/playground/playground.tscn` and press play.
+Without an ASIO device it falls back to silent visual-only mode and says so in the HUD.
 
 Scenes, TAB to cycle: localization, occlusion and materials, directivity, channel walk,
 blind A/B/X, ambisonic bed, reverb bed. WASD/RF move the source, Q/E turn the head, 1–4 pick
@@ -365,14 +196,3 @@ Two things worth knowing:
 With no ASIO device the engine falls back to the null sink and everything still runs, just
 silent — visual-only is a supported state, not a failure, and the HUD says so.
 
-`godot_playground` walks all seven scenes headless, crosses the reverb boundary both ways,
-and renders each HUD. It cannot judge how anything *sounds* — that is the tool's job, not the
-test's — but it does catch the scene machinery and the rebuild falling over.
-
-## Status
-
-Phases 0–4 done: lifecycle, the coordinate seam, the frame loop, the full ABI surface,
-scene-authored acoustics, and the playground port.
-
-Not yet verified by ear on hardware, and `BwaDynamicGeometry` needs the Steam Audio build to
-attach — without it the node is inert and says so.

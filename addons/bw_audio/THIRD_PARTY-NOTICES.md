@@ -23,6 +23,9 @@ binaries.
 
 ## In the tools (`bwa_playground`, `bwa_layout_tool`, `bwa_calib_view`)
 
+- **godot-cpp** — MIT (text below). Copyright (c) 2017-present Godot Engine
+  contributors. Statically linked into the Godot extension
+  (`bw_audio_gd.*.dll`) only — no other artifact carries it.
 - **Dear ImGui** — MIT (text below). Copyright (c) 2014-2026 Omar Cornut.
 - **ImPlot** — MIT (text below). Copyright (c) 2020 Evan Pezent.
 - **ImPlot3D** — MIT (text below). Copyright (c) 2024-2026 Breno Cunha Queiroz.
@@ -42,7 +45,7 @@ binaries.
 `bwa_calibrate` and `bwa_zylia_probe` are console tools; they add nothing beyond
 the `bw_audio.dll` list.
 
-## MIT License (Dear ImGui, ImPlot, ImPlot3D, cJSON)
+## MIT License (godot-cpp, Dear ImGui, ImPlot, ImPlot3D, cJSON)
 
 Permission is hereby granted, free of charge, to any person obtaining a copy of
 this software and associated documentation files (the "Software"), to deal in
