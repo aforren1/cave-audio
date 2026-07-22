@@ -19,8 +19,8 @@
 ## just silent — visual-only mode is a supported state, not a failure.
 extends Node3D
 
-const Signals := preload("res://playground/signals.gd")
-const Scenes := preload("res://playground/scenes.gd")
+const Signals := preload("res://addons/bw_audio/playground/signals.gd")
+const Scenes := preload("res://addons/bw_audio/playground/scenes.gd")
 
 const SRC_GAIN := 0.8
 const ROOM := Vector3(8.0, 4.0, 8.0)   # the reverb scene's shoebox, matching the C++ ROOM_*
@@ -70,7 +70,7 @@ func _ready() -> void:
 	var gen := Signals.new()
 	sig_paths = gen.generate_all()
 
-	draw = preload("res://playground/draw3d.gd").new()
+	draw = preload("res://addons/bw_audio/playground/draw3d.gd").new()
 	add_child(draw)
 
 	_camera = Camera3D.new()
@@ -91,7 +91,7 @@ func _ready() -> void:
 	_build_rig(false)
 	switch_scene(0)
 
-	panel = preload("res://playground/panel.gd").new()
+	panel = preload("res://addons/bw_audio/playground/panel.gd").new()
 	add_child(panel)
 
 	if _headless:

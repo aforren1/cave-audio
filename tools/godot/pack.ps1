@@ -129,10 +129,35 @@ if (Test-Path $phonon) {
     Write-Host "stripped phonon.dll from the staged manifest's [dependencies]"
 }
 
+# The playground ships WITH the addon: it lives inside addons/bw_audio/ precisely so it can
+# (its res:// paths work unchanged in any project), and it is the consumer demo - open
+# playground/playground.tscn and press play. Exclude the editor's .uid sidecars: they are
+# per-checkout cache identity, and a user's editor mints its own.
+Copy-Item (Join-Path $addon 'playground') $dest -Recurse
+Get-ChildItem (Join-Path $dest 'playground') -Filter '*.uid' | Remove-Item
+
 # GPLv3 travels with the binaries, same as every other artifact this repo ships.
 Copy-Item (Join-Path $repo 'LICENSE') $dest
 Copy-Item (Join-Path $repo 'THIRD_PARTY-NOTICES.md') $dest -ErrorAction SilentlyContinue
-Copy-Item (Join-Path $repo 'bindings/godot/README.md') $dest
+# The binding README serves two readers: the addon CONSUMER (install, the coordinate seam,
+# the node reference, the traps) and the engine DEVELOPER (CMake trees, ctest, distribution,
+# the demo project you can "open and press play"). None of the developer half exists in the
+# shipped addon, so staging the file verbatim tells a paying-attention reader to open a demo
+# that is not there. The source README fences its dev-only regions in <!-- dev -->/<!-- /dev -->
+# markers; the staged copy drops them. Unbalanced markers fail the pack rather than shipping
+# a half-stripped document.
+$rl = Get-Content (Join-Path $repo 'bindings/godot/README.md')
+$out = [System.Collections.Generic.List[string]]::new()
+$depth = 0
+foreach ($line in $rl) {
+    if ($line -match '^\s*<!--\s*dev\s*-->')  { $depth++; continue }
+    if ($line -match '^\s*<!--\s*/dev\s*-->') { $depth--; if ($depth -lt 0) { throw "README: '<!-- /dev -->' without opener" }; continue }
+    if ($depth -eq 0) { $out.Add($line) }
+}
+if ($depth -ne 0) { throw "README: unbalanced <!-- dev --> markers (depth $depth at EOF)" }
+# Collapse the blank-line runs the removals leave behind, so the result reads as written.
+$textReadme = ($out -join "`n") -replace "(`n){3,}", "`n`n"
+Set-Content -Path (Join-Path $dest 'README.md') -Value $textReadme -Encoding utf8
 
 $commit = try { (& git -C $repo rev-parse HEAD).Trim() } catch { 'unknown' }
 @"
@@ -140,13 +165,41 @@ bw_audio for Godot $Version
 commit $commit
 
 Install: copy addons/bw_audio/ into your Godot project, then enable nothing - a GDExtension
-loads on project open. Restart the editor after copying.
+loads on project open. Restart the editor after copying. To hear it work, open
+addons/bw_audio/playground/playground.tscn and press play (seven by-ear scenes; falls back
+to silent visual-only mode without an ASIO device).
 
 Requires Godot 4.4 or newer (compatibility_minimum in the manifest); built and tested against
 4.7. The extension is Windows x64 only, because the engine's device path is ASIO.
 
 Licensed GPLv3 (see LICENSE). Complete corresponding source: this repo at the commit above.
 "@ | Set-Content -Path (Join-Path $dest 'DIST.txt') -Encoding ascii
+
+# A README at the STAGE ROOT - sibling of addons/, not inside it. This lands on the `godot`
+# distribution branch (publish-branch.ps1 pushes the whole stage), where it is the only thing
+# GitHub will render: without it the branch page is one bare addons/ folder that reads as a
+# broken checkout to anyone arriving from a store listing. It does NOT enter the release zip
+# (the tar below packs only addons/), so a manual unzip stays exactly the addon. The one cost:
+# an Asset Library install merges the repo archive, so this file can land in a user's project
+# root - Godot's install dialog lets them deselect it, and the file says it is safe to delete.
+@"
+# bw_audio - Godot addon (distribution branch)
+
+This branch is machine-published by CI on every release tag. It exists so the Godot Asset
+Library / Asset Store, which download a repository archive at a pinned commit, can serve the
+addon WITH its binaries - which are deliberately not committed to ``main``.
+
+The addon is ``addons/bw_audio/``: a GDExtension control client for the bw_audio spatial
+audio engine (26-speaker CAVE array over ASIO, binaural monitor). Windows x64 only.
+
+- Install: copy ``addons/bw_audio/`` into your project, restart the editor. Nothing to enable.
+- Try it: open ``addons/bw_audio/playground/playground.tscn`` and press play.
+- Docs, license, and the exact source commit: inside ``addons/bw_audio/``.
+- Source, issues, releases: https://github.com/aforren1/cave-audio (branch ``main``).
+
+If this file ended up in your project root via an Asset Library install, it is safe to delete
+- only ``addons/bw_audio/`` matters.
+"@ | Set-Content -Path (Join-Path $stage 'README.md') -Encoding ascii
 
 # ---- zip ------------------------------------------------------------------------------------
 New-Item -ItemType Directory -Force -Path $OutDir | Out-Null

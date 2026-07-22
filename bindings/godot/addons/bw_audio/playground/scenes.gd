@@ -717,7 +717,7 @@ class AmbisonicBed extends Base:
 		app.refl.gain = 0.0
 		_apply()
 		app.bed.set_gain(0.9)
-		app.bed.play_clip(preload("res://playground/signals.gd").BED_FILE)
+		app.bed.play_clip(preload("res://addons/bw_audio/playground/signals.gd").BED_FILE)
 
 	func key(code: int) -> void:
 		match code:
@@ -739,7 +739,7 @@ class AmbisonicBed extends Base:
 		# Where the field's content sits NOW: the encode bearings through the live
 		# orientation, pitch about room right then yaw about room up (the engine's order).
 		const COLS := [Color(0.92, 0.47, 0.47), Color(0.47, 0.78, 0.92)]
-		var dirs = preload("res://playground/signals.gd").BED_DIRS
+		var dirs = preload("res://addons/bw_audio/playground/signals.gd").BED_DIRS
 		var cy := cos(yaw)
 		var sy := sin(yaw)
 		var cp := cos(pitch)

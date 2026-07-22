@@ -143,9 +143,13 @@ if(BWA_BUILD_TESTS)
     # scene's HUD. It cannot judge how anything SOUNDS — that is the point of the tool, not
     # of the test — but it does catch the scene machinery and the rebuild falling over, which
     # is what actually broke while porting.
+    # The playground lives INSIDE the addon (addons/bw_audio/playground/) so it ships with
+    # every install path — zip, branch, store merge — and its res:// paths are identical in
+    # the source tree and in a user's project. The demo/ scenes stay outside: they are this
+    # suite's fixtures, not content anyone should install.
     add_test(NAME godot_playground
       COMMAND "${BWA_GODOT_EXE}" --headless --path "${CMAKE_CURRENT_SOURCE_DIR}"
-              "res://playground/playground.tscn" -- "--selftest")
+              "res://addons/bw_audio/playground/playground.tscn" -- "--selftest")
     set_tests_properties(godot_playground PROPERTIES TIMEOUT 180
       FIXTURES_REQUIRED godot_project)
   endif()

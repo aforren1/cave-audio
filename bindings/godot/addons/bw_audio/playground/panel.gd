@@ -7,7 +7,7 @@
 ## scene each frame, so pressing a key visibly moves the corresponding control.
 extends Control
 
-const Signals := preload("res://playground/signals.gd")
+const Signals := preload("res://addons/bw_audio/playground/signals.gd")
 
 var app: Node3D
 

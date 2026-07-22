@@ -4,6 +4,12 @@ A GDExtension binding for the CAVE spatial audio engine. Godot is a **thin contr
 client**: no rendered audio crosses the boundary, and Godot's own `AudioServer` is
 unused. The engine drives ASIO itself.
 
+<!-- dev -->
+<!-- Everything between dev markers is SOURCE-TREE material: it describes bindings/godot/
+     in the engine repo, not the shipped addon. tools/godot/pack.ps1 strips these regions
+     from the README it stages into the addon (and so from the `godot` branch and the
+     release zip), where a demo project, CMake trees and ctest do not exist and a reader
+     told to "press play" would rightly ask where the play button went. -->
 This directory is both things at once:
 
 - `addons/bw_audio/` — the drop-in addon. Copy it into your project to install.
@@ -28,6 +34,7 @@ the Steam Audio build is on) beside it. Then open `bindings/godot/` in Godot.
 flavour. It defaults to `editor` here — godot-cpp's own default is `template_debug`, which
 builds fine and then does not load in the editor, so the addon would look broken. A shipping
 build wants a second tree with `-DGODOTCPP_TARGET=template_release`.
+<!-- /dev -->
 
 ## Install
 
@@ -44,6 +51,7 @@ a store listing that pulls a repo archive.
 
 Windows x64 only, because the engine's device path is ASIO.
 
+<!-- dev -->
 ## Distribution
 
 `tools/godot/pack.ps1` builds **both** library flavours, writes the release zip, and leaves a
@@ -121,6 +129,7 @@ Pinned to a commit (`BWA_GODOT_CPP_COMMIT` in `CMakeLists.txt`), not a branch: g
 release branches lag the engine — 4.5 is the newest cut — while master already ships
 `extension_api.json` for 4.7, which is what the installed editor is. When the editor
 moves, bump the commit and check that api file's header still matches.
+<!-- /dev -->
 
 ## Coordinate seam
 
@@ -269,6 +278,7 @@ stop is an arranged ending and the caller wants to know when it landed.
 thread, where calling into GDScript would allocate and take the interpreter lock — exactly
 what invariant 1 forbids. Use the MANUAL sink and `render_block()` for capture instead.
 
+<!-- dev -->
 ## Tests
 
 ```
@@ -324,13 +334,19 @@ bwa_scene_set_box first"*. Its **absence** is therefore evidence the box arrived
 `godot_scene_no_room` drops the box so the same assertion has to fail, which is what keeps
 the positive run from passing vacuously.
 
+<!-- /dev -->
+
 ## The playground
 
-`playground/` is the Godot port of `examples/playground.cpp` — the by-ear harness. Open this
-folder in Godot and run `playground/playground.tscn`, or:
+`addons/bw_audio/playground/` is the by-ear harness — it ships **inside the addon**, so
+however you installed, open `addons/bw_audio/playground/playground.tscn` and press play.
+Without an ASIO device it falls back to silent visual-only mode and says so in the HUD.
+
+<!-- dev -->
+It is the Godot port of `examples/playground.cpp`. From the source tree:
 
 ```
-godot --path bindings/godot res://playground/playground.tscn
+godot --path bindings/godot res://addons/bw_audio/playground/playground.tscn
 ```
 
 Same seven scenes, same keys, same synthesized signals. The C++ one stays: it needs no
@@ -340,6 +356,7 @@ binding — one engine build, two clients, and any audible difference is the bin
 The signal synthesis is a deliberately literal port (same LCG seeds, same Paul Kellet pink
 coefficients, same periods), so an A/B between the two playgrounds compares engine paths
 rather than two different noises.
+<!-- /dev -->
 
 Scenes, TAB to cycle: localization, occlusion and materials, directivity, channel walk,
 blind A/B/X, ambisonic bed, reverb bed. WASD/RF move the source, Q/E turn the head, 1–4 pick
@@ -365,6 +382,7 @@ Two things worth knowing:
 With no ASIO device the engine falls back to the null sink and everything still runs, just
 silent — visual-only is a supported state, not a failure, and the HUD says so.
 
+<!-- dev -->
 `godot_playground` walks all seven scenes headless, crosses the reverb boundary both ways,
 and renders each HUD. It cannot judge how anything *sounds* — that is the tool's job, not the
 test's — but it does catch the scene machinery and the rebuild falling over.
@@ -376,3 +394,4 @@ scene-authored acoustics, and the playground port.
 
 Not yet verified by ear on hardware, and `BwaDynamicGeometry` needs the Steam Audio build to
 attach — without it the node is inert and says so.
+<!-- /dev -->
