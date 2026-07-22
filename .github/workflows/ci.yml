@@ -392,6 +392,47 @@ jobs:
           Copy-Item dist/asio-sdk-src.zip $src -Force
           $src = (Get-Item $src).FullName
 
+          $notes = @"
+          Windows x64. Three downloads to use - the **Unity package**, the **Godot addon**, or the
+          **engine** itself - plus the **ASIO SDK source** (GPLv3 corresponding source; see License below).
+
+          ## Unity
+
+          Download ``com.brainworks.bw_audio-*.tgz`` below, then in Unity:
+          **Package Manager > ``+`` > *Install package from tarball...*** That is the whole install.
+          (Or install from a git URL: ``https://github.com/aforren1/cave-audio.git#unity``.)
+
+          The package ships the native engine (``bw_audio.dll`` + ``phonon.dll``) with its import settings
+          already set - nothing to build. Requires **Unity 6**. Turn OFF Unity's built-in audio
+          (*Project Settings > Audio > Disable Unity Audio*): the engine owns the device.
+
+          ## Godot
+
+          Download ``bw_audio-godot-*.zip`` below and unzip it into your project so you end up with
+          ``addons/bw_audio/``, then restart the editor. A GDExtension loads on project open - there is
+          no plugin to enable. Requires **Godot 4.4+** (built against 4.7).
+
+          ## Engine (C ABI, tools)
+
+          ``bw_audio-win64-$tag.zip`` - ``bw_audio.dll`` / ``.lib`` / ``.pdb`` + ``phonon.dll`` (**keep the
+          pair together**, the dll will not load without it), ``bw_audio.h``, and the tools:
+          ``bwa_playground``, ``bwa_layout_tool``, ``bwa_calib_view``, ``bwa_calibrate``, ``bwa_zylia_probe``.
+          Needs the MSVC x64 runtime. See ``DIST.txt`` inside for the exact commit.
+
+          ## License
+
+          **GPLv3.** ``bw_audio.dll`` links the ASIO SDK under its GPLv3 option. Internal use never
+          triggers copyleft - it is a *distribution* condition - but SHIPPING an app that includes this
+          DLL to third parties would put that app under GPLv3. See ``docs/build.md`` for the
+          proprietary-ASIO alternative.
+
+          Complete corresponding source is this repo at the commit named in ``DIST.txt``, plus
+          ``bw_audio-asio-sdk-src-$tag.zip`` below (the ASIO SDK source compiled into the DLL).
+          "@
+          # One .tgz (the Unity package) + the Godot addon .zip + the engine .zip + the ASIO SDK
+          # corresponding-source .zip. Keep the .tgz as the only package tarball - see the note above.
+          gh release create $tag $tgz $gd $zip $src --title "bw_audio $tag" --notes $notes
+
       # ---- distribution branches (tags only) ------------------------------------------------------
       # The gh-pages idea applied to the bindings. `main` stays source-only; each binding also gets a
       # branch whose ROOT is the installable thing, because both standard installers install from a
@@ -421,37 +462,3 @@ jobs:
           $remote = "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git"
           ./tools/dist/publish-branch.ps1 -Branch unity -Source build/upm/package -Version $v -RemoteUrl $remote
           ./tools/dist/publish-branch.ps1 -Branch godot -Source build/godot/addon -Version $v -RemoteUrl $remote
-
-          $notes = @"
-          Windows x64. Two downloads to use - the **Unity package** or the **engine** itself -
-          plus the **ASIO SDK source** (GPLv3 corresponding source; see License below).
-
-          ## Unity
-
-          Download ``com.brainworks.bw_audio-*.tgz`` below, then in Unity:
-          **Package Manager > ``+`` > *Install package from tarball...*** That is the whole install.
-
-          The package ships the native engine (``bw_audio.dll`` + ``phonon.dll``) with its import settings
-          already set - nothing to build. Requires **Unity 6**. Turn OFF Unity's built-in audio
-          (*Project Settings > Audio > Disable Unity Audio*): the engine owns the device.
-
-          ## Engine (C ABI, tools)
-
-          ``bw_audio-win64-$tag.zip`` - ``bw_audio.dll`` / ``.lib`` / ``.pdb`` + ``phonon.dll`` (**keep the
-          pair together**, the dll will not load without it), ``bw_audio.h``, and the tools:
-          ``bwa_playground``, ``bwa_layout_tool``, ``bwa_calib_view``, ``bwa_calibrate``, ``bwa_zylia_probe``.
-          Needs the MSVC x64 runtime. See ``DIST.txt`` inside for the exact commit.
-
-          ## License
-
-          **GPLv3.** ``bw_audio.dll`` links the ASIO SDK under its GPLv3 option. Internal use never
-          triggers copyleft - it is a *distribution* condition - but SHIPPING an app that includes this
-          DLL to third parties would put that app under GPLv3. See ``docs/build.md`` for the
-          proprietary-ASIO alternative.
-
-          Complete corresponding source is this repo at the commit named in ``DIST.txt``, plus
-          ``bw_audio-asio-sdk-src-$tag.zip`` below (the ASIO SDK source compiled into the DLL).
-          "@
-          # One .tgz (the Unity package) + one .zip (the engine) + one .zip (the ASIO SDK corresponding
-          # source). Keep the first two as the only package/engine tarballs - see the note above.
-          gh release create $tag $tgz $gd $zip $src --title "bw_audio $tag" --notes $notes
