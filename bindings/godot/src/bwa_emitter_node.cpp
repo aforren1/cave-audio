@@ -115,6 +115,16 @@ void BwaEmitter::seek(int64_t frame) {
 	}
 }
 
+void BwaEmitter::stop() {
+	state = IDLE; // an explicit stop is not an end; see the header
+	BwaSource::stop();
+}
+
+void BwaEmitter::fade_out(float seconds) {
+	state = IDLE; // ends on the stop path once silent — same rule as stop()
+	BwaSource::fade_out(seconds);
+}
+
 void BwaEmitter::set_pitch(float rate) {
 	pitch = rate;
 	if (LIVE) {

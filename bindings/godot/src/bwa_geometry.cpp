@@ -265,6 +265,16 @@ PackedStringArray BwaRoomBox::_get_configuration_warnings() const {
 	if (size.x <= 0.0f || size.y <= 0.0f || size.z <= 0.0f) {
 		w.push_back("Every dimension must be positive; the engine rejects a degenerate box.");
 	}
+	if (!get_transform().is_equal_approx(Transform3D())) {
+		/* The split failure: wall_faces() bakes this node's transform into the merged
+		 * ray-traced mesh, but the core's ISM shoebox is origin-anchored by design
+		 * (bwa_scene_set_box takes only w/h/d) — so a moved box leaves early reflections
+		 * bouncing off a DIFFERENT room than occlusion sees. */
+		w.push_back("This node's transform moves the ray-traced walls but NOT the image-source "
+					"shoebox, which the engine anchors at the room origin (floor-based). The two "
+					"acoustics paths will disagree about where the room is. Keep this node at "
+					"the identity transform and size the box instead.");
+	}
 	w.push_back("This box is the VIRTUAL room, not the physical CAVE. Modelling the real room "
 				"double-counts its reflections, which already reach the listener acoustically.");
 	return w;

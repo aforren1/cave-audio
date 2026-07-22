@@ -210,7 +210,10 @@ func switch_scene(idx: int) -> void:
 	refl.gain = 0.0
 	source.occlusion = false
 	source.set_directivity_preset(BwaSource.DIR_OMNI)
-	source.set_orientation(Quaternion.IDENTITY)
+	# Room identity, not Godot identity: set_orientation is the facing seam, so a Godot
+	# identity would land the source facing room -Z. Inaudible while OMNI, but a reset should
+	# reset - the half-turn is what maps back to the room's own identity.
+	source.set_orientation(Quaternion(Vector3.UP, PI))
 	source.doppler = false
 	source.air_absorption = false
 	source.spread = 0.0
@@ -340,6 +343,23 @@ func _input(event: InputEvent) -> void:
 ## which is exactly what broke most often while porting.
 func _run_selftest() -> void:
 	var fail := 0
+	# Engine generations must be unique per instance PROCESS-WIDE: BwaMaterial keys its token
+	# cache on them, so two engines sharing a generation hands a stale token from a dead
+	# engine to a live one - the core clamps it to the default material, silently. The
+	# regression: a per-instance counter read 1 on every rebuilt rig.
+	var gen_a: int = engine.get_generation()
+	var mat := BwaMaterial.new()
+	mat.preset = BwaMaterial.PRESET_BRICK
+	var tok_a: int = mat.get_token(engine)
+	rebuild_rig(rig_has_reverb)
+	if engine.get_generation() == gen_a:
+		push_error("playground: rebuilt engine reused generation %d - material caches go stale" % gen_a)
+		fail += 1
+	# ...and the material must observe the change: a re-mint on the new engine, not the cache.
+	if mat.get_token(engine) == 0 and tok_a != 0:
+		push_error("playground: material failed to re-mint on the rebuilt engine")
+		fail += 1
+
 	for i in scenes.size():
 		switch_scene(i)
 		for f in 3:

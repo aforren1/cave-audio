@@ -115,6 +115,18 @@ if (Test-Path $phonon) {
     Copy-Item $phonon (Join-Path $dest 'bin')
 } else {
     Write-Warning "phonon.dll not present: packing a NO-SDK addon (no HRTF monitor, no ray-traced occlusion/reflections/pathing)."
+    # The manifest's [dependencies] promises phonon.dll unconditionally (the SDK build is the
+    # normal one). A no-SDK pack must not ship that promise: the store requires listed files
+    # to be present, and Godot's exporter would fail on the missing entry. Strip the phonon
+    # lines from the STAGED copy - comma first, so the remaining dictionary stays parseable.
+    $mf = Join-Path $dest 'bw_audio.gdextension'
+    $text = [IO.File]::ReadAllText($mf)
+    $text = [regex]::Replace($text, ',\s*"res://addons/bw_audio/bin/phonon\.dll":\s*""', '')
+    # Guard on FUNCTIONAL references (res:// paths) only - the manifest's comments also say
+    # "phonon.dll" while explaining why it is listed, and prose is not a promise to load.
+    if ($text -match '"res://[^"]*phonon\.dll"') { throw "failed to strip phonon.dll from the staged manifest" }
+    [IO.File]::WriteAllText($mf, $text)
+    Write-Host "stripped phonon.dll from the staged manifest's [dependencies]"
 }
 
 # GPLv3 travels with the binaries, same as every other artifact this repo ships.
@@ -140,9 +152,16 @@ Licensed GPLv3 (see LICENSE). Complete corresponding source: this repo at the co
 New-Item -ItemType Directory -Force -Path $OutDir | Out-Null
 $zip = Join-Path $OutDir "bw_audio-godot-$Version.zip"
 if (Test-Path $zip) { Remove-Item -Force $zip }
-# Compress the STAGE ROOT so the archive contains addons/bw_audio/... - unzipping into a project
-# then lands the addon exactly where Godot looks for it.
-Compress-Archive -Path (Join-Path $stage 'addons') -DestinationPath $zip -Force
+# tar (bsdtar, ships with Windows 10+), NOT Compress-Archive: under Windows PowerShell 5.1 the
+# latter writes BACKSLASH entry paths, which the zip spec forbids and non-Windows extractors
+# (including whatever a store backend runs) turn into literal 'addons\bw_audio\...' filenames.
+# bsdtar always writes forward slashes, on both 5.1 and pwsh. -C so the archive roots at
+# addons/bw_audio/... and unzipping into a project lands the addon where Godot looks for it.
+if (-not (Get-Command tar -ErrorAction SilentlyContinue)) {
+    throw "tar not found on PATH (it ships with Windows 10+ as bsdtar)."
+}
+& tar -a -cf $zip -C $stage addons
+if ($LASTEXITCODE -ne 0) { throw "tar failed" }
 
 Write-Host "packed $zip"
 Write-Host "stage kept at $stage (publish-branch.ps1 pushes this to the 'godot' branch)"

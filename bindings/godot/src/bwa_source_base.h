@@ -43,7 +43,11 @@ public:
 	void set_group(int g);
 	int get_group() const { return group; }
 	void fade_to(float target, float seconds);
-	void fade_out(float seconds);
+	/* Virtual, with stop() below: BwaEmitter overrides both to mark the halt as EXPLICIT, so
+	 * its end detector does not read the voice going silent as a natural end and fire
+	 * `finished`. That reset lived in the emitter's own stop() before these moved down here,
+	 * and losing it made every stop announce a finish. */
+	virtual void fade_out(float seconds);
 	void set_paused(bool p);
 	bool get_paused() const { return paused; }
 
@@ -97,7 +101,12 @@ public:
 	int64_t get_playhead() const;
 	double get_playhead_seconds() const;
 
-	void stop();
+	virtual void stop(); /* see fade_out */
+
+	/* Called by BwaEngine on ITS teardown for every still-registered source: the engine node
+	 * can be freed while sources live elsewhere in the tree, and without this their `owner`
+	 * back-pointer dangles — the next setter on the source is then a use-after-free. */
+	void engine_gone();
 
 protected:
 	static void _bind_methods();

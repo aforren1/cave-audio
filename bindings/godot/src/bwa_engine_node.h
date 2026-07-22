@@ -240,8 +240,12 @@ public:
 	bwa_engine *handle() const { return eng; }
 	void register_source(BwaSource *s);
 	void unregister_source(BwaSource *s);
-	/* Bumped on every successful create. Material tokens belong to the engine instance that
-	 * issued them, so BwaMaterial keys its cache on this rather than re-minting blindly. */
+	/* A PROCESS-WIDE monotonic id, taken from a static counter on every successful start.
+	 * Material tokens belong to the engine instance that issued them, so BwaMaterial keys
+	 * its cache on this. It must be process-wide, not per-instance: a per-instance counter
+	 * reads 1 on every fresh engine node, so a material cached against a torn-down engine
+	 * would match the REBUILT one and hand back a stale token — which the core clamps to
+	 * the default material, silently. The playground's rig rebuilds hit exactly that. */
 	int get_generation() const { return generation; }
 	/* Public because godot-cpp dispatches the virtual from Node, not from the subclass. */
 	PackedStringArray _get_configuration_warnings() const override;
@@ -257,8 +261,10 @@ private:
 	 * only way a room box and separate occluders can coexist. */
 	void build_static_scene();
 
+	static int next_generation; /* process-wide; see get_generation */
+
 	bwa_engine *eng = nullptr;
-	int generation = 0;
+	int generation = 0; /* 0 = never started; assigned from next_generation in _ready */
 	std::vector<BwaSource *> sources;
 	HashMap<String, bwa_sound> sounds;
 

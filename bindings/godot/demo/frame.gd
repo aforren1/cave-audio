@@ -110,9 +110,24 @@ func _process(delta: float) -> void:
 			"expected an active voice while the ping plays, got %d" % engine.get_active_voices())
 
 	# The 0.30 s ping is long done by frame 120 even at a slow headless tick.
-	if _frames >= 120:
+	if _frames == 120:
 		_check(not emitter.is_playing(), "one-shot should have ended by now")
 		_check(_finished_at != -1, "the `finished` signal never fired")
+		# Phase 2 of the finished contract: an explicit stop is NOT an end. Play a LOOP (which
+		# can never end by itself), stop it, and `finished` must stay quiet - the regression
+		# here fired it on every stop once the state reset was lost in a refactor.
+		_finished_at = -1
+		emitter.loop = true
+		emitter.play_clip(Tone.write_ping("ping", 440.0, 0.30))
+
+	if _frames == 160:
+		_check(emitter.is_playing(), "the loop should be running before the stop")
+		emitter.stop()
+
+	if _frames >= 220:
+		_check(not emitter.is_playing(), "the loop should be silent after stop()")
+		_check(_finished_at == -1,
+			"stop() fired `finished` (frame %d) - an explicit stop is not an end" % _finished_at)
 		_done()
 
 

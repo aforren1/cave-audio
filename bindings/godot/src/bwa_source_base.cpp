@@ -182,6 +182,12 @@ void BwaSource::stop() {
 	}
 }
 
+void BwaSource::engine_gone() {
+	/* No calls into the engine — it is mid-teardown. Just forget it. */
+	owner = nullptr;
+	src = 0;
+}
+
 /* --- extent --- */
 
 void BwaSource::set_spread(float amount) {

@@ -15,6 +15,7 @@
 using namespace godot;
 
 BwaEngine *BwaEngine::singleton = nullptr;
+int BwaEngine::next_generation = 0;
 
 /* res:// -> an OS path the C core can fopen. The core loads assets itself (it never goes
  * through Godot's VFS), so anything it reads must be a real file on disk. In an exported
@@ -91,7 +92,7 @@ void BwaEngine::_ready() {
 	if (fdn.enabled) {
 		bwa_fdn_config(eng, &fdn);
 	}
-	generation++;
+	generation = ++next_generation; /* process-wide, so no two engine instances ever share one */
 	build_static_scene();
 
 	const bwa_result r = bwa_start(eng);
@@ -137,8 +138,14 @@ void BwaEngine::_process(double delta) {
 		return;
 	}
 
-	for (BwaSource *s : sources) {
-		s->push_frame(); // all sources first...
+	/* By index, not by iterator: push_frame can emit `finished`, and a user handler may add
+	 * or free sources — freeing runs _exit_tree, which unregisters and mutates this vector.
+	 * An index survives that (a freed source is removed BEFORE its memory dies, so it is
+	 * never revisited; a same-frame addition is simply picked up or caught next frame). A
+	 * range-for here is iterator invalidation; a copied snapshot is worse — it would keep a
+	 * dangling pointer to anything the handler freed. */
+	for (size_t i = 0; i < sources.size(); i++) {
+		sources[i]->push_frame(); // all sources first...
 	}
 
 	if (feed_listener && !listener_path.is_empty()) {
@@ -165,6 +172,14 @@ void BwaEngine::_exit_tree() {
 	bwa_destroy(eng);
 	eng = nullptr;
 	sounds.clear();
+	/* Detach every source that outlives this engine, not just forget them: their `owner`
+	 * back-pointers would otherwise dangle, and the next setter call on such a source (from
+	 * a script, an animation, anywhere) would dereference a freed node. Exit order usually
+	 * saves the shipped scenes — sources exit before a first-child engine — but nothing
+	 * forces an engine to be the first child, or sources to share its subtree at all. */
+	for (BwaSource *s : sources) {
+		s->engine_gone();
+	}
 	sources.clear();
 }
 
@@ -559,7 +574,14 @@ void BwaEngine::scene_set_dynamic_transform(
 		return;
 	}
 	const Vector3 p = to_room_position(godot_pos);
-	const Quaternion q = to_room_orientation(Basis(rot));
+	/* Registration ONLY — deliberately not to_room_orientation. That helper is the FACING
+	 * conversion (its rotY(pi) makes a node's -Z forward read as room +Z), which is correct
+	 * for things that face: the listener, a directivity axis. A mesh transform is not a
+	 * facing: its local vertices go to the core untouched, so the placement must satisfy
+	 * p_room = Reg * T_godot * p_local exactly. Routing it through the facing helper spins
+	 * every dynamic mesh 180 degrees about Y relative to its visual node — invisible on the
+	 * demos' centred quads (symmetric under that turn), wrong for anything asymmetric. */
+	const Quaternion q = Quaternion((registration.basis * Basis(rot)).orthonormalized());
 	bwa_scene_set_dynamic_transform(
 			eng, handle, (float)p.x, (float)p.y, (float)p.z, (float)q.x, (float)q.y, (float)q.z,
 			(float)q.w);
@@ -839,6 +861,7 @@ void BwaEngine::_bind_methods() {
 	M0(is_running); M0(get_audio_backend); M0(get_last_error);
 	M0(get_channel_count); M0(get_resolved_sample_rate); M0(get_resolved_block_size);
 	M0(get_active_voices); M0(get_bus_levels); M0(get_speakers); M0(render_block);
+	M0(get_generation);
 #undef M
 #undef M0
 

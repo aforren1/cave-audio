@@ -261,6 +261,10 @@ so for a frame or two after a play the raw readback honestly says "not playing".
 actually *observed* playing can fire `finished`. Without that, a naive edge detector fires
 `finished` on frame one of every sound.
 
+`finished` means the sound **ran out** — a non-loop end, a drained queue. An explicit
+`stop()` or `fade_out()` never fires it; `stop_at()` deliberately does, because a scheduled
+stop is an arranged ending and the caller wants to know when it landed.
+
 `bwa_set_output_capture` is **not bound, on purpose.** Its callback runs on the audio
 thread, where calling into GDScript would allocate and take the interpreter lock — exactly
 what invariant 1 forbids. Use the MANUAL sink and `render_block()` for capture instead.

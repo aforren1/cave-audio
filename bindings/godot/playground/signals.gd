@@ -2,9 +2,10 @@
 ## examples/playground.cpp's gen_signal / gen_bed.
 ##
 ## The port is deliberately literal — same LCG seeds, same Paul Kellet pink filter
-## coefficients, same periods. If the Godot playground and the C++ one are ever A/B'd
-## against each other, any audible difference has to come from the ENGINE path, not from
-## two different noises.
+## coefficients, same periods. Structurally identical, not bit-identical: GDScript computes
+## in float64 where the C pipeline is float32, so low-order bits differ. That is inaudible,
+## which is what matters — if the Godot playground and the C++ one are ever A/B'd against
+## each other, any audible difference has to come from the ENGINE path, not the noises.
 ##
 ## Signal choice matters: broadband content with sharp onsets localises best, and it is the
 ## HF that carries elevation and front/back. The 1 kHz tone is in the list precisely because
