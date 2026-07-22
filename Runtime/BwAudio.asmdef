@@ -1,0 +1,14 @@
+{
+    "name": "BwAudio",
+    "rootNamespace": "BwAudio",
+    "references": [],
+    "includePlatforms": [],
+    "excludePlatforms": [],
+    "allowUnsafeCode": false,
+    "overrideReferences": false,
+    "precompiledReferences": [],
+    "autoReferenced": true,
+    "defineConstraints": [],
+    "versionDefines": [],
+    "noBwAudioReferences": false
+}

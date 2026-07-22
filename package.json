@@ -1,0 +1,14 @@
+{
+  "name": "com.brainworks.bw_audio",
+  "version": "0.3.2-rc1",
+  "displayName": "BwAudio (CAVE Spatial Audio)",
+  "description": "Unity control client for the bw_audio spatial-audio engine: a thin P/Invoke binding over the engine's C ABI (no audio crosses the boundary, only control). Drives a 26-speaker CAVE array over ASIO/Dante with a binaural debug monitor. Provides a centralized per-frame push (BwAudio.Engine) and a positional emitter (BwAudio.Emitter).\n\nWindows x64 only (ASIO is Windows-only). Ships the native engine (bw_audio.dll + phonon.dll) — see the README for the required project setup (disable Unity's built-in audio).",
+  "unity": "6000.0",
+  "keywords": [ "audio", "spatial", "ambisonics", "cave", "binaural", "asio" ],
+  "author": { "name": "Alex Forrence" },
+  "license": "GPL-3.0-only",
+  "licensesUrl": "https://github.com/aforren1/cave-audio/blob/main/LICENSE",
+  "documentationUrl": "https://github.com/aforren1/cave-audio/blob/main/docs/integration.md",
+  "changelogUrl": "https://github.com/aforren1/cave-audio/blob/main/bindings/unity/CHANGELOG.md",
+  "hideInEditor": false
+}

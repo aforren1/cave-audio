@@ -1,0 +1,14 @@
+{
+    "name": "BwAudio.Editor",
+    "rootNamespace": "BwAudio.EditorTools",
+    "references": [ "BwAudio" ],
+    "includePlatforms": [ "Editor" ],
+    "excludePlatforms": [],
+    "allowUnsafeCode": false,
+    "overrideReferences": false,
+    "precompiledReferences": [],
+    "autoReferenced": true,
+    "defineConstraints": [],
+    "versionDefines": [],
+    "noBwAudioReferences": false
+}
