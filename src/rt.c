@@ -2556,8 +2556,11 @@ uint64_t rt_dsp_time(RtCore* c) {
  * plus scheduling), this pair is stamped inside the audio stack itself, so the wall->dsp mapping
  * dsp(T) = sample + (T - time_ns) * rate / 1e9 is exact. The epoch of time_ns is backend-defined —
  * anchor it against your own monotonic clock and track the constant offset. False (outputs
- * untouched) until a host-stamped block has rendered: before start, on the manual sink (whose clock
- * is deliberately wall-free for reproducibility), or under a driver that reports no systemTime. */
+ * untouched) until a host-stamped block has rendered: before start, or under a driver that reports
+ * no systemTime. The manual sink DOES stamp, but a nominal time derived from sample_pos rather than
+ * a wall clock (manual_sink.c) — reproducible by design, so it is exact for arithmetic and
+ * meaningless as wall time. Note the stamp gate is `system_time_ns != 0`, so the very first block
+ * of a manual render (whose nominal time IS 0) publishes nothing; the clock goes valid on block 2. */
 bool rt_get_clock(RtCore* c, uint64_t* sample, uint64_t* time_ns) {
     if (!c) return false;
     for (int tries = 0; tries < 16; ++tries) {          /* seqlock read: retry a torn snapshot */

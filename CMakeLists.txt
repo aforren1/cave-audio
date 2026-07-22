@@ -500,6 +500,15 @@ if(BWA_BUILD_PLAYGROUND OR BWA_BUILD_CALIBVIEW)
     IMGUI_TEST_ENGINE_ENABLE_CAPTURE=1)
 endif()
 
+# ---- Optional: Godot GDExtension binding ----
+# Opt-in (it fetches godot-cpp, whose generated bindings are a multi-minute first build):
+# cmake -S . -B build -DBWA_BUILD_GODOT=ON. See bindings/godot/CMakeLists.txt.
+option(BWA_BUILD_GODOT "Build the Godot GDExtension binding (fetches godot-cpp)" OFF)
+if(BWA_BUILD_GODOT)
+  enable_language(CXX)
+  add_subdirectory(bindings/godot)
+endif()
+
 # ---- Optional: interactive playground (evaluate the binaural monitor by ear) ----
 # Opt-in so the default build stays lean: cmake -S . -B build -DBWA_BUILD_PLAYGROUND=ON
 # Drives the binaural profile live to headphones (auto-picked 2-ch ASIO driver; null-sink

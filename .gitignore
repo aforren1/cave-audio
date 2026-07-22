@@ -47,6 +47,11 @@ bindings/unity/**/Library/
 bindings/unity/**/Temp/
 bindings/unity/**/obj/
 
+# Godot binding: the editor's import/uid cache, and the built extension + the bw_audio.dll
+# CMake copies beside it (the *.dll rule above already covers the DLLs).
+bindings/godot/.godot/
+bindings/godot/addons/bw_audio/bin/
+
 # local config / surveyed data that shouldn't be shared verbatim
 *.local.json
 

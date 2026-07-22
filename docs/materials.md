@@ -166,12 +166,19 @@ arrive rotated/mirrored relative to the array, exactly the failure integration.m
 direct sources. Triangle **winding** must follow Steam Audio's inside/outside convention. The
 shoebox mode builds its mesh directly in room space.
 
-Two authoring modes:
+Two authoring modes — and they are **alternatives, not layers**:
 
 1. **Shoebox room**: `bwa_scene_set_box(w, h, d)` + a material per face. The engine generates the
    12-triangle mesh in room space. Covers the common room-like space with no asset pipeline.
 2. **Arbitrary mesh**: vertices/triangles/material-tokens from the content scene, via
    `bwa_scene_set_mesh_mat`.
+
+Mode 1 is implemented *as* mode 2, so it replaces the static mesh the same way. Doing both — a
+shoebox and then a pillar inside it — loses the walls, and loses them half-way: the image-source
+room is separate state and survives, so early reflections keep working off a room the ray tracer
+no longer has. Want both? Call `bwa_scene_set_box` first, because nothing else captures the ISM
+room, then a single `bwa_scene_set_mesh_mat` carrying the box walls plus your geometry. (The Godot
+binding does exactly this; see `bindings/godot/src/bwa_geometry.h`.)
 
 Set geometry before `bwa_start` if you use the reflection bed; the runtime-swap rule is under
 "Scene lifecycle" above.

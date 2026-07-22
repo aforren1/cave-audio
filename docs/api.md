@@ -963,6 +963,14 @@ Geometry rules:
   the listener stands inside.
 - **One scene, two consumers.** The same per-triangle materials feed both occlusion (per-band
   transmission) and the reflection bed (absorption/scattering): one shared `IPLScene`.
+- **The box and your own mesh are alternatives, not layers.** `bwa_scene_set_box` *is* a
+  `bwa_scene_set_mesh_mat` call, so it replaces the static mesh exactly like one. Calling
+  `_set_box` and then `_set_mesh_mat` — the natural order, room first and then the pillar
+  standing in it — drops the walls, and drops them **half-way**: the image-source shoebox is
+  separate state and survives, so early reflections keep bouncing off a room that occlusion
+  and the reflection bed can no longer see. To have both, call `_set_box` first (nothing else
+  captures the ISM room) and then **one** `_set_mesh_mat` carrying the box's 12 inward-facing
+  triangles alongside your own geometry.
 - **Static versus dynamic.** `bwa_scene_set_mesh_mat`/`_set_box` set the STATIC world: committed once,
   BVH built once. For things that MOVE, `bwa_scene_add_dynamic_mesh` registers a rigid **instance**
   (its own sub-scene) that you reposition with `bwa_scene_set_dynamic_transform` (room-space position

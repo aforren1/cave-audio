@@ -93,6 +93,11 @@ tools/xval/            gen_reference.py: cross-validation golden generator (scip
                        Needs numpy+scipy; ctest itself does not (the header is committed).
 bindings/
   unity/               P/Invoke + Engine/Emitter (see docs/integration.md).
+  godot/               GDExtension (godot-cpp, opt-in -DBWA_BUILD_GODOT=ON): addons/bw_audio/ is the
+                       drop-in addon, demo/ the self-checking test scenes, playground/ the Godot port
+                       of examples/playground.cpp. No 1:1 shim — each call lives on the class owning
+                       its handle (BwaEngine / BwaSource → BwaEmitter, BwaPushSource / BwaBed), plus
+                       BwaMaterial, Bwa{Acoustic,Dynamic}Geometry, BwaRoomBox, BwaSpeakerView.
   unreal/              module + component.
 docs/                  Specs. Start here.
 examples/              cave_layout.json (see docs/layout-schema.md); minimal.c (the client lifecycle),

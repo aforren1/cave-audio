@@ -41,15 +41,28 @@ engine owns decoding (and avoids Unity's 8-channel output cap entirely).
 **Windows x64 only** (ASIO is Windows-only). The released package **ships the native engine** —
 `bw_audio.dll` + `phonon.dll` are inside it, with import settings already configured. Nothing to build.
 
+### From a git URL
+
+**Package Manager → `+` → Add package from git URL…**, then:
+
+```
+https://github.com/aforren1/cave-audio.git#unity
+```
+
+`unity` is a distribution branch whose **root** is the package — `package.json` at the top level,
+with the two DLLs already in it — which is the only layout UPM's git installer accepts. CI republishes
+it on every `v*` tag. Pin a release instead of tracking the branch by using a tag ref
+(`#v0.4.0`) once one exists.
+
 ### From a release tarball
 
 Grab `com.brainworks.bw_audio-<version>.tgz` from the
 [Releases](https://github.com/aforren1/cave-audio/releases) page, then **Package Manager → `+` →
 Install package from tarball…**. That's the whole install.
 
-It pins by hand rather than resolving, so it won't notify you of upgrades — grab the newer `.tgz` and
-install it again. (This package isn't on a registry: it exists to drive one specific 26-speaker CAVE,
-and the audience is people who already have the repo.)
+Either route pins by hand rather than resolving, so neither notifies you of upgrades — take the newer
+one and install it again. (This package isn't on a registry: it exists to drive one specific
+26-speaker CAVE, and the audience is people who already have the repo.)
 
 ### From source (developing the engine itself)
 
@@ -59,9 +72,10 @@ Point the manifest at your working tree, and the CMake build's POST_BUILD copy k
 "com.brainworks.bw_audio": "file:../../cave-audio/bindings/unity"
 ```
 
-The DLLs are gitignored build output, so a **git-URL install of this repo will not work** — you'd get
-the C# with no engine behind it (`DllNotFoundException` on the first call). Use a release tarball, which
-carries the binaries, or a local path against a built tree.
+The DLLs are gitignored build output, so a git-URL install pointed at **`main`** will not work — you'd
+get the C# with no engine behind it (`DllNotFoundException` on the first call), and `package.json` is
+not at the repo root there either. That is what the `unity` branch above exists to fix: CI publishes a
+built, root-level copy of the package to it. Against a working tree, use a local path.
 
 > **License:** the engine is **GPLv3** (`bw_audio.dll` links the ASIO SDK under its GPLv3 option).
 > Internal use never triggers copyleft — it's a *distribution* condition. But shipping a Unity app

@@ -1,0 +1,27 @@
+[gd_scene load_steps=2 format=3]
+
+[ext_resource type="Script" path="res://demo/api.gd" id="1"]
+
+[node name="Api" type="Node3D"]
+script = ExtResource("1")
+
+[node name="BwaEngine" type="BwaEngine" parent="."]
+profile = 0
+sink = 3
+listener = NodePath("../Listener")
+enable_fdn = true
+fdn_rt60_low = 1.2
+fdn_rt60_high = 0.7
+
+[node name="Listener" type="Node3D" parent="."]
+
+[node name="Emitter" type="BwaEmitter" parent="."]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 1.5, 1.2, -1)
+autoplay = false
+loop = false
+
+[node name="Pusher" type="BwaPushSource" parent="."]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, -1.5, 1.2, 1)
+
+[node name="Bed" type="BwaBed" parent="."]
+autoplay = false

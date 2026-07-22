@@ -314,9 +314,12 @@ BWA_API uint64_t bwa_get_dsp_time(bwa_engine* e);
  * host_time_ns is monotonic ns on a BACKEND-DEFINED epoch (ASIO drivers differ; the null sink
  * counts from stream start) — anchor it against your own monotonic clock and refresh the offset
  * per frame (clocks drift ~ppm). Returns false with the outputs untouched until a host-stamped
- * block has rendered: before bwa_start, on the MANUAL sink (deliberately wall-free so renders
- * reproduce), or under a driver with no usable stamp (the sinks synthesize one from
- * QueryPerformanceCounter where they can — FlexASIO omits systemTime, for one). Lock-free.
+ * block has rendered: before bwa_start, or under a driver with no usable stamp (the sinks
+ * synthesize one from QueryPerformanceCounter where they can — FlexASIO omits systemTime, for
+ * one). The MANUAL sink DOES report a pair, but a NOMINAL one derived from the sample position
+ * (sample/rate), never a wall clock — so a fixed call sequence still renders bit-identically.
+ * Treat it as a sample-accurate fiction: exact for arithmetic, meaningless for wall-clock AV
+ * sync, since nothing on the manual path is bound to real time anyway. Lock-free.
  * The full sync recipe (epoch anchoring, graphics-side events, the Unity helpers) is
  * docs/api.md, "Syncing with graphics". */
 BWA_API bool     bwa_get_clock(bwa_engine* e, uint64_t* dsp_sample, uint64_t* host_time_ns);
@@ -436,7 +439,15 @@ BWA_API void     bwa_scene_set_mesh_mat(bwa_engine* e, const float* verts, int n
  * Works with AND without the Steam build: it feeds the ray-traced scene (SDK) and ALWAYS captures
  * the box for the image-source early reflections. Load-time ONLY — unlike bwa_scene_set_mesh_mat
  * above (whose scene swap the sim thread serializes), the ISM handoff assumes the audio thread is
- * not yet running. */
+ * not yet running.
+ *
+ * IT IS A bwa_scene_set_mesh_mat CALL, so it REPLACES the static mesh like any other — the box and
+ * your own geometry are alternatives, not layers. Calling set_box then set_mesh_mat (the natural
+ * order: room first, then the pillar in it) drops the walls from the ray-traced scene, and does it
+ * HALF-way: the ISM shoebox is separate state and survives, so early reflections keep working off a
+ * room that occlusion and the reflection bed can no longer see. To have both, call set_box first
+ * (nothing else captures the ISM room) and then ONE set_mesh_mat carrying the box's 12 inward
+ * triangles plus your own. */
 BWA_API void     bwa_scene_set_box(bwa_engine* e, float w, float h, float d, const bwa_material faces[6]);
 
 /* Dynamic (movable) occluders/reflectors — the acoustic analogue of a physics collider with a

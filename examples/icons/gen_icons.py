@@ -104,6 +104,24 @@ def glyph_track_monitor(d):
     dot(d, C + 60, C - 60, 84, PURPLE)                         # the tracked head, off-center
 
 
+def glyph_bw_audio(d):
+    """The engine itself (the Godot addon / Asset Library icon).
+
+    Not a tool but the LIBRARY, so the glyph is the thing every tool is about: the
+    speaker ring with a source panned into it. One dot is lit and a wavefront runs from
+    it through the listener at the centre -- the array, the source, the ear point."""
+    import math
+    pts = ring_pts(10, 300)
+    for i, (x, y) in enumerate(pts):
+        dot(d, x, y, 76, PURPLE if i == 3 else BLUE)          # the driven speaker
+    sx, sy = pts[3]
+    for k, r in enumerate((104, 168, 232)):                   # wavefront off that speaker
+        ang = math.degrees(math.atan2(C - sy, C - sx))
+        d.arc([sx - r, sy - r, sx + r, sy + r],
+              start=ang - 46, end=ang + 46, fill=PURPLE, width=22 - k * 4)
+    dot(d, C, C, 56, WHITE)                                   # the listener
+
+
 def glyph_profile_bench(d):
     d.line([(200, 812), (824, 812)], fill=GRAY, width=24)
     for i, (h, col) in enumerate([(220, GRAY), (380, BLUE), (540, PURPLE)]):
@@ -127,6 +145,33 @@ TOOLS = {
     "bwa_minimal":       glyph_minimal,
 }
 
+# The library's own mark, which is not a tool and so is not an .ico. It ships as committed
+# PNGs in TWO shapes because the two Godot listings disagree: the old Asset Library wants a
+# square icon of at least 128 px (served over raw.githubusercontent.com), while the new Asset
+# Store wants a 16:9 thumbnail. Same glyph, two frames.
+LIBRARY = {"bw_audio": glyph_bw_audio}
+
+
+def thumbnail(glyph, w=1280, h=720):
+    """The 16:9 store thumbnail: the glyph on the theme field, letterboxed rather than
+    stretched (a squashed speaker ring reads as a mistake, not a logo)."""
+    art = Image.new("RGBA", (S, S), (0, 0, 0, 0))
+    glyph(ImageDraw.Draw(art))                     # glyphs draw into the S x S canvas
+    art = art.resize((h, h), Image.LANCZOS)
+
+    img = Image.new("RGBA", (w, h), BG)
+    d = ImageDraw.Draw(img)
+    # A faint speaker ring bled off both edges, so the wide frame is composed rather than
+    # padded: the subject sits in a field of the array it drives.
+    import math
+    for i in range(28):
+        a = i / 28.0 * 2.0 * math.pi
+        d.ellipse([w / 2 + math.cos(a) * w * 0.46 - 9, h / 2 + math.sin(a) * h * 0.72 - 9,
+                   w / 2 + math.cos(a) * w * 0.46 + 9, h / 2 + math.sin(a) * h * 0.72 + 9],
+                  fill=(46, 50, 78, 255))
+    img.alpha_composite(art, ((w - h) // 2, 0))
+    return img
+
 
 def main():
     previews = []
@@ -137,6 +182,17 @@ def main():
         img256.save(os.path.join(OUT, name + ".ico"), format="ICO", sizes=ICO_SIZES)
         previews.append((name, img256))
         print("wrote", name + ".ico")
+
+    for name, glyph in LIBRARY.items():
+        img, d = base()
+        glyph(d)
+        img256 = img.resize((256, 256), Image.LANCZOS)
+        img256.save(os.path.join(OUT, name + ".png"), format="PNG")
+        previews.append((name, img256))
+        print("wrote", name + ".png")
+
+        thumbnail(glyph).save(os.path.join(OUT, name + "_thumb.png"), format="PNG")
+        print("wrote", name + "_thumb.png")
 
     # contact sheet (64 px + 16 px rows) to eyeball small-size legibility; not committed
     pad, cell = 16, 96

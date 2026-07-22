@@ -15,6 +15,11 @@
 #     shipped in the artifact. Their imgui-test-engine UI suites need a display +
 #     OpenGL, which runners don't have — ctest excludes those three suites here
 #     (they run locally / at the rig).
+#   - Godot binding: BUILT and TESTED. Unlike the imgui tools, Godot's --headless
+#     needs no display or GL, so the demo scenes and the Godot playground's self-test
+#     are ordinary CI. Its own build trees (GODOTCPP_TARGET is build-wide, and a
+#     shippable addon needs both editor and template_release), cached on the pinned
+#     godot-cpp commit. Ships as a fourth release asset.
 #   - Configs: x64 only. RelWithDebInfo is the full build (tested + tools);
 #     Debug builds the engine + bwa_minimal for downstream debugging (smoke-run).
 #
@@ -35,6 +40,14 @@ concurrency:
 
 permissions:
   contents: write       # the release step attaches the .tgz; everything else is read-only
+
+env:
+  # The Godot editor CI tests against, and the godot-cpp commit the extension builds against.
+  # These two must agree: godot-cpp's bundled extension_api.json declares which engine version
+  # its generated bindings target. Bump them together, and keep GODOT_CPP_COMMIT in step with
+  # BWA_GODOT_CPP_COMMIT in bindings/godot/CMakeLists.txt (this one only keys the cache).
+  GODOT_VERSION: 4.7.1-stable
+  GODOT_CPP_COMMIT: ba0edfed90512ec64aba51d4295a3e7e30112f86
 
 jobs:
   windows:
@@ -158,6 +171,67 @@ jobs:
         # (no device on the runner: the AUTO sink policy falls back to the silent null sink)
         run: build/Debug/bwa_minimal.exe
 
+      # ---- Godot binding ---------------------------------------------------------------------
+      # Its own build trees, because GODOTCPP_TARGET is a build-WIDE choice in godot-cpp: one
+      # tree yields one library flavour, and a shippable addon needs two (editor for the editor,
+      # template_release for exported games). tools/godot/pack.ps1 builds both.
+      #
+      # Unlike the three imgui tools, these tests DO run here: Godot's --headless mode needs no
+      # display or GL, so the demo scenes and the playground self-test are ordinary CI.
+      - name: Cache Godot editor
+        id: godot-cache
+        uses: actions/cache@v4
+        with:
+          path: godot-bin
+          key: godot-${{ env.GODOT_VERSION }}
+
+      - name: Fetch Godot editor
+        if: steps.godot-cache.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          # The standard build, not mono: a GDExtension needs no .NET runtime, and the mono
+          # download is much larger for nothing.
+          V=${GODOT_VERSION}
+          curl -fsSL -o godot.zip \
+            "https://github.com/godotengine/godot/releases/download/${V}/Godot_v${V}_win64.exe.zip"
+          mkdir -p godot-bin && unzip -q godot.zip -d godot-bin
+          test -f "godot-bin/Godot_v${V}_win64.exe"
+
+      - name: Cache godot-cpp build
+        uses: actions/cache@v4
+        with:
+          # Both trees: godot-cpp generates and compiles ~2100 binding files per flavour, which
+          # dwarfs our own nine. Keyed on the PINNED COMMIT, so bumping it invalidates cleanly;
+          # our sources rebuild incrementally on top.
+          path: |
+            build-godot-editor
+            build-godot-template_release
+          key: godot-cpp-${{ env.GODOT_CPP_COMMIT }}-${{ runner.os }}
+
+      - name: Test (Godot binding)
+        shell: bash
+        run: |
+          # BWA_BUILD_TESTS explicitly ON: this tree is CACHED between runs, so a stale cache
+          # entry with it off would leave ctest selecting nothing.
+          cmake -S . -B build-godot-editor -A x64 \
+                -DBWA_BUILD_GODOT=ON -DGODOTCPP_TARGET=editor -DBWA_BUILD_TESTS=ON \
+                -DBWA_GODOT_EXE="$PWD/godot-bin/Godot_v${GODOT_VERSION}_win64.exe"
+          cmake --build build-godot-editor --config RelWithDebInfo --target bwa_gdextension test_godot_room
+          # --no-tests=error: an empty selection is a FAILURE, not a pass. Without it a broken
+          # filter, a missing BWA_GODOT_EXE or a stale cache all look exactly like success.
+          ctest --test-dir build-godot-editor -C RelWithDebInfo --output-on-failure \
+                --no-tests=error -R '^godot_'
+
+      - name: Pack Godot addon
+        id: packgd
+        shell: pwsh
+        run: |
+          # -SkipBuild is wrong here: the editor tree is built but template_release is not, and
+          # pack.ps1 refuses to ship a manifest whose libraries are missing.
+          $a = @{ OutDir = 'dist/godot' }
+          if ($env:GITHUB_REF -like 'refs/tags/v*') { $a.Version = $env:GITHUB_REF_NAME.TrimStart('v') }
+          ./tools/godot/pack.ps1 @a
+
       - name: Stage dist
         shell: pwsh
         run: |
@@ -247,6 +321,15 @@ jobs:
           path: |
             dist/
             !dist/unity/**
+            !dist/godot/**
+          retention-days: 30
+          if-no-files-found: error
+
+      - name: Upload artifact (Godot addon)
+        uses: actions/upload-artifact@v6
+        with:
+          name: godot-addon-${{ steps.packgd.outputs.version }}-r${{ github.run_number }}
+          path: dist/godot/
           retention-days: 30
           if-no-files-found: error
 
@@ -259,11 +342,14 @@ jobs:
           if-no-files-found: error
 
       # ---- release (tags only) -------------------------------------------------------------------
-      # The Release IS the distribution - there is no registry. THREE assets: two audiences want
-      # different bytes, and the third is the GPLv3 corresponding source that must accompany them:
+      # The Release IS the distribution - there is no registry. FOUR assets: three audiences want
+      # different bytes, and the fourth is the GPLv3 corresponding source that must accompany them:
       #
       #   com.brainworks.bw_audio-<ver>.tgz   the Unity package (C# + the two DLLs, import settings set).
       #                                      Installs via Package Manager > "+" > "from tarball".
+      #   bw_audio-godot-<ver>.zip            the Godot addon (GDExtension + the two DLLs, both the
+      #                                      editor and template_release library flavours). Unzip into
+      #                                      a project; a GDExtension loads on open, nothing to enable.
       #   bw_audio-win64-<tag>.zip            the engine itself: dll/lib/pdb + bw_audio.h + the tools.
       #                                      The durable home for the native side - workflow artifacts
       #                                      expire, a release does not.
@@ -283,6 +369,10 @@ jobs:
         run: |
           $tag = $env:GITHUB_REF_NAME
           $tgz = (Get-Item dist/unity/*.tgz).FullName
+          # The Godot addon: unzip addons/bw_audio/ into a project and it loads on open. A zip
+          # rather than anything registry-shaped, because Godot's Asset Library wants a public
+          # repo laid out as an installable project, which this is not.
+          $gd  = (Get-Item dist/godot/*.zip).FullName
 
           # The engine bundle: everything staged in dist/ EXCEPT the Unity package (which ships on its
           # own). GPLv3 travels with it - LICENSE, THIRD_PARTY-NOTICES.md and DIST.txt (which names the
@@ -299,6 +389,36 @@ jobs:
           $src = "dist/bw_audio-asio-sdk-src-$tag.zip"
           Copy-Item dist/asio-sdk-src.zip $src -Force
           $src = (Get-Item $src).FullName
+
+      # ---- distribution branches (tags only) ------------------------------------------------------
+      # The gh-pages idea applied to the bindings. `main` stays source-only; each binding also gets a
+      # branch whose ROOT is the installable thing, because both standard installers install from a
+      # git ref and expect their manifest at the top level:
+      #
+      #   unity  ->  package.json at the root, so UPM takes a git URL directly:
+      #                Package Manager > "+" > "Add package from git URL..."
+      #                https://github.com/aforren1/cave-audio.git#unity
+      #   godot  ->  addons/bw_audio/ at the root, for the Asset Library — which downloads a repo
+      #              ARCHIVE at a specific commit, so the binaries must be IN the tree. A release
+      #              asset cannot serve that entry, which is why this branch exists at all.
+      #
+      # Normal commits, never a force-push: an Asset Library entry pins a commit hash, and rewriting
+      # history would eventually orphan a published one. The branches therefore grow by roughly the
+      # addon's size per release, which is the standing cost of in-repo distribution.
+      - name: Publish distribution branches
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: pwsh
+        env:
+          GIT_TERMINAL_PROMPT: '0'
+        run: |
+          $v = $env:GITHUB_REF_NAME.TrimStart('v')
+          # The remote URL must carry the token explicitly. actions/checkout puts the workflow
+          # credential in this clone's http.extraheader, NOT in the URL, so `git remote get-url`
+          # (the script's default) yields an unauthenticated URL and the push would fail. The
+          # script never echoes it, and Actions masks the token in logs regardless.
+          $remote = "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git"
+          ./tools/dist/publish-branch.ps1 -Branch unity -Source build/upm/package -Version $v -RemoteUrl $remote
+          ./tools/dist/publish-branch.ps1 -Branch godot -Source build/godot/addon -Version $v -RemoteUrl $remote
 
           $notes = @"
           Windows x64. Two downloads to use - the **Unity package** or the **engine** itself -
@@ -332,4 +452,4 @@ jobs:
           "@
           # One .tgz (the Unity package) + one .zip (the engine) + one .zip (the ASIO SDK corresponding
           # source). Keep the first two as the only package/engine tarballs - see the note above.
-          gh release create $tag $tgz $zip $src --title "bw_audio $tag" --notes $notes
+          gh release create $tag $tgz $gd $zip $src --title "bw_audio $tag" --notes $notes
