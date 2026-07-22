@@ -235,7 +235,9 @@ jobs:
       - name: Stage dist
         shell: pwsh
         run: |
-          New-Item -ItemType Directory dist, dist/RelWithDebInfo, dist/Debug | Out-Null
+          # -Force = mkdir -p (safe on DIRECTORIES; it truncates only files). Needed since the
+          # Godot pack step runs first and already creates dist/godot, so dist/ exists here.
+          New-Item -ItemType Directory -Force dist, dist/RelWithDebInfo, dist/Debug | Out-Null
           Copy-Item include/bw_audio.h,
                     LICENSE,
                     THIRD_PARTY-NOTICES.md dist/
