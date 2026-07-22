@@ -74,9 +74,13 @@ try {
 
     Copy-Item (Join-Path $src '*') $work -Recurse -Force
 
-    # An identity is required to commit and CI runners have none configured.
-    & git -C $work config user.name  'bw_audio ci'
-    & git -C $work config user.email 'ci@users.noreply.github.com'
+    # An identity is required to commit and CI runners have none configured. This must be the
+    # ACTIONS BOT identity, not an invented one: GitHub resolves USERNAME@users.noreply.github.com
+    # to that account, so a made-up local part attributes the commits to whoever owns that
+    # username - 'ci' is a real user, who briefly starred in this repo's history. The bot's
+    # address is id-prefixed and reserved, so it can never collide with a person.
+    & git -C $work config user.name  'github-actions[bot]'
+    & git -C $work config user.email '41898282+github-actions[bot]@users.noreply.github.com'
     & git -C $work add -A
 
     # `git diff --cached --quiet` exits 0 when nothing is staged. Re-running a publish for an
