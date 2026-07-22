@@ -291,6 +291,16 @@ display or GL. CI passes `--no-tests=error` so an empty selection fails rather t
 a bad filter, a missing `BWA_GODOT_EXE` and a stale build cache otherwise all look identical
 to success.
 
+Every scene test rides a **`godot_import` fixture** (`test/godot_import.cmake`), and it is
+load-bearing: a runtime scene launch loads only the GDExtensions named in
+`.godot/extension_list.cfg`, and only the editor's **import scan** writes that file. `.godot/`
+is gitignored, so on a fresh checkout — every CI run, every new clone — there is no list, no
+`Bwa*` classes, and each scene wedges on parse errors for its full timeout. The fixture runs
+`--headless --import` first and then checks the *postcondition* (the list exists and names
+`bw_audio.gdextension`) rather than Godot's exit code, which is nonzero even on a healthy
+project. ctest schedules it automatically for any selected dependent, so `-R` filters keep
+working.
+
 `api.tscn` drives the whole bound surface, and it runs **twice, on both sinks**, because
 either alone leaves a hole:
 

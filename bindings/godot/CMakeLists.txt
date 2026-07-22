@@ -90,12 +90,25 @@ if(BWA_BUILD_TESTS)
   #   cmake ... -DBWA_GODOT_EXE=".../Godot_v4.7.1-stable_mono_win64_console.exe"
   set(BWA_GODOT_EXE "" CACHE FILEPATH "Godot editor binary; set it to run the demo scenes under ctest")
   if(BWA_GODOT_EXE)
+    # Every scene test rides an import FIXTURE (test/godot_import.cmake): a runtime scene
+    # launch loads only the GDExtensions named in .godot/extension_list.cfg, and only the
+    # editor's import scan writes that file. .godot/ is gitignored, so without this a fresh
+    # checkout — every CI run — has no extension, no Bwa* classes, and each scene wedges for
+    # its full timeout. ctest runs the fixture automatically for any selected dependent, so
+    # -R filters keep working.
+    add_test(NAME godot_import
+      COMMAND ${CMAKE_COMMAND} -DGODOT_EXE=${BWA_GODOT_EXE}
+              -DPROJECT_DIR=${CMAKE_CURRENT_SOURCE_DIR}
+              -P ${CMAKE_CURRENT_SOURCE_DIR}/test/godot_import.cmake)
+    set_tests_properties(godot_import PROPERTIES FIXTURES_SETUP godot_project TIMEOUT 300)
+
     foreach(scene smoke frame)
       add_test(NAME godot_${scene}
         COMMAND "${BWA_GODOT_EXE}" --headless --path "${CMAKE_CURRENT_SOURCE_DIR}"
                 "res://demo/${scene}.tscn")
       # A scene that never reaches its own exit path would otherwise run forever.
-      set_tests_properties(godot_${scene} PROPERTIES TIMEOUT 120)
+      set_tests_properties(godot_${scene} PROPERTIES TIMEOUT 120
+        FIXTURES_REQUIRED godot_project)
     endforeach()
 
     # The API surface runs on BOTH sinks, and neither run is redundant. MANUAL has no audio
@@ -108,7 +121,8 @@ if(BWA_BUILD_TESTS)
       add_test(NAME godot_api_${sink}
         COMMAND "${BWA_GODOT_EXE}" --headless --path "${CMAKE_CURRENT_SOURCE_DIR}"
                 "res://demo/api.tscn" -- "--sink=${sink}")
-      set_tests_properties(godot_api_${sink} PROPERTIES TIMEOUT 120)
+      set_tests_properties(godot_api_${sink} PROPERTIES TIMEOUT 120
+        FIXTURES_REQUIRED godot_project)
     endforeach()
 
     # scene.tscn checks that the collected geometry actually reached the core, which is only
@@ -121,7 +135,8 @@ if(BWA_BUILD_TESTS)
     add_test(NAME godot_scene_no_room
       COMMAND "${BWA_GODOT_EXE}" --headless --path "${CMAKE_CURRENT_SOURCE_DIR}"
               "res://demo/scene.tscn" -- "--no-room")
-    set_tests_properties(godot_scene godot_scene_no_room PROPERTIES TIMEOUT 120)
+    set_tests_properties(godot_scene godot_scene_no_room PROPERTIES TIMEOUT 120
+      FIXTURES_REQUIRED godot_project)
 
     # The playground's own self-test: walk all seven scenes, including both crossings of the
     # reverb boundary (which tears the engine down and stands a new one up), and render each
@@ -131,7 +146,8 @@ if(BWA_BUILD_TESTS)
     add_test(NAME godot_playground
       COMMAND "${BWA_GODOT_EXE}" --headless --path "${CMAKE_CURRENT_SOURCE_DIR}"
               "res://playground/playground.tscn" -- "--selftest")
-    set_tests_properties(godot_playground PROPERTIES TIMEOUT 180)
+    set_tests_properties(godot_playground PROPERTIES TIMEOUT 180
+      FIXTURES_REQUIRED godot_project)
   endif()
 endif()
 
