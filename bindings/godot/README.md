@@ -12,9 +12,12 @@ unused. The engine drives ASIO itself.
      told to "press play" would rightly ask where the play button went. -->
 This directory is both things at once:
 
-- `addons/bw_audio/` — the drop-in addon. Copy it into your project to install.
-- `project.godot` + `demo/` — a project that consumes it, so you can open this folder
-  in Godot and press play.
+- `addons/bw_audio/` — the drop-in addon, which contains the playground (the shipped
+  by-ear demo). Copy the folder into your project to install.
+- `project.godot` + `demo/` — a project that consumes it: the self-checking test scenes
+  the ctest suite runs. Open this folder in Godot and run
+  `addons/bw_audio/playground/playground.tscn` to hear it; the default main scene is the
+  smoke test, which quits as soon as it has asserted.
 
 ## Build
 

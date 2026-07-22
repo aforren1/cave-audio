@@ -600,7 +600,7 @@ the production array render never uses HRTF.
 - `docs/api.md` — C ABI reference and per-call threading semantics.
 - `docs/spatialization.md` — DBAP, moving observer, binaural decode (3rd-order), speaker alignment.
 - `docs/materials.md` — material/geometry model → Steam Audio occlusion + reflections → the bus. **Design (Later).**
-- `docs/integration.md` — Unity binding + coordinate seam; Unreal notes.
+- `docs/integration.md` — Unity + Godot bindings + the per-engine coordinate seams; Unreal notes.
 - `docs/build.md` — platform, dependencies, licensing, Dante config.
 - `docs/layout-schema.md` — `cave_layout.json` format: speaker geometry, per-speaker gain/delay, DBAP knobs.
 - `docs/calibration.md` — `bwa_calibrate`: acoustic position survey, delay/gain trims, room report → `cave_layout.json`.

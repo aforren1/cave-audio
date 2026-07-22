@@ -1,9 +1,9 @@
 # Engine integration
 
-Unity and Unreal differ only in how transforms and tracking are read and
-converted at the boundary. The audio code is identical. No *rendered* audio
-crosses the boundary: the mix never routes through the game engine, only
-control calls on the main thread. The one inbound exception is the opt-in
+The game engines — Unity, Godot, Unreal — differ only in how transforms and
+tracking are read and converted at the boundary. The audio code is identical.
+No *rendered* audio crosses the boundary: the mix never routes through the game
+engine, only control calls on the main thread. The one inbound exception is the opt-in
 push-source feed (`bwa_source_push`): caller-generated PCM *into* the engine,
 on the same control thread—a source feed, not a render path.
 
@@ -309,6 +309,40 @@ public sealed class Emitter : MonoBehaviour {
 - **Bypass `AudioClip`.** The core loads wav itself. Hand it `StreamingAssets`
   paths (real files on desktop builds) and keep audio assets out of Unity's
   import pipeline.
+
+## Godot
+
+**Implemented as a GDExtension: [`bindings/godot/`](../bindings/godot/).** Its
+[README](../bindings/godot/README.md) is the manual — install, the node reference, the
+traps; this section carries only what belongs in the cross-engine comparison.
+
+No 1:1 binding layer: GDExtension needs no P/Invoke shim, so every call lives as a method
+on the class owning its handle (`BwaEngine`, `BwaSource` → `BwaEmitter`/`BwaPushSource`,
+`BwaBed`), plus scene-authored acoustics (`BwaMaterial`, `Bwa{Acoustic,Dynamic}Geometry`,
+`BwaRoomBox`) and a live `BwaSpeakerView`. The by-ear playground ships inside the addon.
+
+The seam is **simpler than Unity's, and Unity's advice must not be carried over**:
+
+- Godot is right-handed and +Y up like room space, so there is **no mirror**. Positions
+  pass through the CAVE registration transform and nothing else — if a source comes out
+  mirrored, the registration is wrong, not the handedness conversion.
+- The one conversion is the **facing convention**: Godot's forward is −Z, room identity
+  faces +Z, so orientations pick up a 180° yaw (a quaternion swizzle, pinned by the
+  `godot_room` ctest). This applies to *facings only* — listener pose, directivity axes.
+  Mesh/instance transforms take registration alone; routing them through the facing helper
+  spins every occluder 180° about Y.
+- `bwa_bed_set_rotation`'s **sense of rotation is preserved** — no mirror means no
+  reversal, where the Unity binding must flip it.
+
+Godot has no `LateUpdate`, so the centralized per-frame push rides `process_priority`
+instead (the `BwaEngine` node defaults high, so it samples after gameplay). Coherence never
+depends on that ordering — one node pushes all sources, then the listener, then commits —
+only freshness does.
+
+One platform trap with no Unity analogue: the core opens files by OS path, and in an
+exported build `res://` lives inside the `.pck` where no OS path exists. Ship layouts and
+audio beside the executable or stage them into `user://` (`StreamingAssets`, one layer
+down).
 
 ## Unreal (notes, not yet implemented)
 

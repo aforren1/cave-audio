@@ -35,6 +35,7 @@ Everything beyond the DLL + test suite is opt-in; the default build stays lean.
 | `BWA_BUILD_PLAYGROUND` | OFF | `bwa_playground` + `bwa_layout_tool` (fetches raylib/rlImGui/imgui/test-engine) |
 | `BWA_BUILD_CALIBVIEW` | OFF | `bwa_calib_view` (fetches imgui/test-engine/implot/implot3d) |
 | `BWA_BUILD_CALIBRATE` | OFF | `bwa_calibrate` + `bwa_zylia_probe` |
+| `BWA_BUILD_GODOT` | OFF | the Godot GDExtension (fetches godot-cpp — a multi-minute first build). `GODOTCPP_TARGET` picks the library flavour (`editor` default); `tools/godot/pack.ps1` builds both shippable ones. See `bindings/godot/README.md` |
 | `BWA_ASAN` | OFF | builds `test_sound` with AddressSanitizer (MSVC; needs tests ON) |
 | `BWA_TRACY` | OFF | Tracy profiler instrumentation (fetches Tracy; collects only while a profiler is attached) |
 
@@ -229,6 +230,11 @@ distribution channel:
   `BWA_BUILD_CALIBVIEW`, and `BWA_BUILD_CALIBRATE`, so the artifact carries
   `bwa_playground`, `bwa_layout_tool`, `bwa_calib_view` (GUI; they need a display),
   plus `bwa_calibrate` and `bwa_zylia_probe` (console).
+- **The Godot binding is built AND tested.** Unlike the imgui tools, Godot's
+  `--headless` needs no display, so its scene tests run on the runner (against a
+  cached editor download). The addon packs as its own artifact and, on a tag, a
+  fourth release asset — plus the `unity`/`godot` distribution branches
+  (installable git refs; see `bindings/godot/README.md` and the workflow header).
 - **The artifact is a GPLv3 distribution.** Each run uploads `RelWithDebInfo/`
   (engine + phonon + tools) and `Debug/` (engine + phonon) folders plus `bw_audio.h`,
   the example layout + `constraints.json`, the `LICENSE`, `THIRD_PARTY-NOTICES.md`,

@@ -22,7 +22,8 @@
 # Runs against a TEMPORARY CLONE, never the working tree, so a publish cannot disturb a build in
 # progress or leave the repo on another branch.
 #
-#   powershell -File tools/dist/publish-branch.ps1 -Branch godot -Source dist/.godot-stage -Version 0.4.0
+#   powershell -File tools/dist/publish-branch.ps1 -Branch godot -Source build/godot/addon -Version 0.4.0
+#   powershell -File tools/dist/publish-branch.ps1 -Branch unity -Source build/upm/package -Version 0.4.0
 [CmdletBinding()]
 param(
     [Parameter(Mandatory)] [string] $Branch,   # orphan branch to publish to (godot | unity)
