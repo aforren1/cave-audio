@@ -51,6 +51,14 @@
  *                         the by-ear check that geometry can change while the bed runs. The bed + room
  *                         geometry are LOAD-time, so entering/leaving this scene REBUILDS the engine (a
  *                         brief audio gap). Transient signals (clicks/bursts) show the tail best.
+ *   8 Underwater        — the api.md "listener submerges" recipe, live and phonon-free. SPACE dives:
+ *                         a source across the surface muffles (manual occlusion EQ) and goes diffuse
+ *                         (spread), the FDN retunes LIVE (bwa_fdn_set_decay — the tail's slope
+ *                         changes, no restart) and the speed of sound glides to 1480 (V Doppler makes
+ *                         it audible). Both ends under: the surface bounce renders off a PRESSURE-
+ *                         RELEASE plane (bwa_scene_set_ground) — push the source up toward the
+ *                         surface and the inverted image thins it out (Lloyd's mirror; L toggles).
+ *                         The FDN is load-time, so this scene rebuilds the engine like scene 7.
  *
  * Global keys: WASD/RF move source, Q/E head, 1-4 signal, TAB scene, F9 record output to WAV, ESC.
  * Custom content: the panel's "custom sound" section (or DROP a file on the window) loads YOUR
@@ -484,7 +492,9 @@ static void draw_head(Quaternion q) {
                    Vector3Add(g_head, Vector3Scale(fwd, 0.30f)), 0.06f, 0.0f, 10, ORANGE); /* nose */
 }
 
-static void build_engine(int with_reverb);   /* fwd: the reverb scene rebuilds to A/B the bed decoder */
+static void build_engine(int mode);   /* fwd: engine config — 0 interactive, 1 reverb (Steam bed + box),
+                                       * 2 underwater (FDN + pressure-release surface plane). The reverb
+                                       * scene rebuilds with mode 1 to A/B the bed decoder. */
 
 /* ============================= Scene 1: Localization (pure DBAP) ============================= */
 /* auto-move (SPACE): a hands-free demo that circles the listener while breathing near<->far and
@@ -866,6 +876,89 @@ static void rev_draw3d(void) {
         draw_wall(Vector3{ 0, 1.5f, rev_wall_z }, Vector3{ 1, 0, 0 }, Vector3{ 0, 1, 0 }, 1.5f, 1.5f,
                   Color{ 140, 110, 90, 90 }, Color{ 220, 180, 150, 255 });
 }
+/* ======================= Scene 8: Underwater (medium boundary) ======================= */
+/* The docs/api.md "listener submerges" recipe, live and phonon-free. SPACE dives: any source whose
+ * path CROSSES the surface gets the interface loss + water muffle (bwa_source_set_occlusion_manual)
+ * and diffuse localization (spread); the room-wide half retunes the FDN LIVE (bwa_fdn_set_decay —
+ * the tail keeps ringing, only its slope changes) and glides the speed of sound to the medium's
+ * (bwa_set_speed_of_sound — Doppler delays shrink 4.3x). With BOTH ends under, the surface bounce
+ * renders through a PRESSURE-RELEASE mirror plane (bwa_scene_set_ground + early reflections): the
+ * inverted image cancels the direct sound near the surface — push the source up toward it and hear
+ * it thin out (the Lloyd's-mirror comb; broadband signals show it best). The FDN is LOAD-time
+ * (the plane itself is live-safe), so this scene runs its own engine config (mode 2) — crossing
+ * its boundary rebuilds, like the reverb scene. */
+#define WATER_Y 2.4f             /* the surface height (room y); the listener (~1.5) sits below it */
+static int wat_under   = 0;      /* SPACE: the LISTENER dives / surfaces */
+static int wat_lloyd   = 1;      /* L: the surface bounce (pressure-release ISM) while submerged */
+static int wat_dop     = 1;      /* V: Doppler — what makes the speed of sound audible */
+static int wat_crossed = -1;     /* last pushed cross-surface state (-1 = force a re-push) */
+static int wat_er_on   = -1;     /* last pushed early-reflection enable (-1 = force) */
+
+static void wat_apply_medium(void) {   /* the room-wide half: the medium the LISTENER is in */
+    if (wat_under) {
+        bwa_fdn_set_decay(e, 3.0f, 0.3f, 800.0f);   /* hard boundaries: long LF tail, dead HF */
+        bwa_set_reverb_gain(e, 1.5f);
+        bwa_set_speed_of_sound(e, 1480.0f);         /* every delay glides to the medium's c */
+    } else {
+        bwa_fdn_set_decay(e, 1.2f, 0.7f, 2000.0f);  /* the air defaults */
+        bwa_set_reverb_gain(e, 0.6f);
+        bwa_set_speed_of_sound(e, 343.0f);
+    }
+    wat_crossed = -1;                                /* re-derive the per-source half */
+    wat_er_on   = -1;
+}
+static void wat_apply_source(void) {   /* the per-source half: does the path cross the surface? */
+    const int above   = source_pos.y > WATER_Y;
+    const int crossed = (above == wat_under);        /* listener under + source above, or vice versa */
+    if (crossed != wat_crossed) {
+        wat_crossed = crossed;
+        if (crossed) {                               /* ~-30 dB interface loss + the water muffle */
+            const float water[3] = { 0.30f, 0.06f, 0.01f };
+            bwa_source_set_occlusion_manual(e, src, 0.03f, water);
+            bwa_source_set_spread(e, src, 0.8f);     /* localization collapses across the boundary */
+        } else {
+            bwa_source_set_occlusion_manual(e, src, 1.0f, NULL);
+            bwa_source_set_spread(e, src, 0.0f);
+        }
+    }
+    /* the surface bounce renders only with BOTH ends under it: the plane mirrors from either side,
+     * but a cross-boundary image has no physical path (and the crossing source is muffled anyway) */
+    const int er = wat_lloyd && wat_under && !above;
+    if (er != wat_er_on) { wat_er_on = er; bwa_source_set_early_reflections(e, src, er); }
+}
+static void wat_enter(void) {
+    bwa_source_set_gain(e, src, SRC_GAIN);
+    bwa_source_set_reverb(e, src, true);             /* the FDN renders whichever medium's tail */
+    bwa_source_set_doppler(e, src, wat_dop);
+    source_pos = Vector3{ 0.0f, WATER_Y + 0.8f, -2.5f };   /* start ABOVE the surface: diving muffles it */
+    wat_under = 0;
+    wat_apply_medium();                              /* also forces the per-source push next update */
+}
+static void wat_update(float dt) {
+    (void)dt;
+    if (kp(KEY_SPACE)) { wat_under = !wat_under; wat_apply_medium(); }
+    if (kp(KEY_L)) { wat_lloyd = !wat_lloyd; wat_er_on = -1; }
+    if (kp(KEY_V)) { wat_dop = !wat_dop; bwa_source_set_doppler(e, src, wat_dop); }
+    source_pos.x = Clamp(source_pos.x, -4.0f, 4.0f);
+    source_pos.y = Clamp(source_pos.y, 0.4f, WATER_Y + 2.0f);   /* R/F pushes it through the surface */
+    source_pos.z = Clamp(source_pos.z, -4.0f, 4.0f);
+    bwa_source_set_pos(e, src, source_pos.x, source_pos.y, source_pos.z);
+    wat_apply_source();
+}
+static void wat_draw3d(void) {
+    /* the surface: a translucent sheet, denser when the listener is under it */
+    const Color surf = wat_under ? Color{ 60, 140, 200, 120 } : Color{ 80, 160, 220, 60 };
+    DrawCube(Vector3{ 0, WATER_Y, 0 }, 9.0f, 0.02f, 9.0f, surf);
+    DrawCubeWires(Vector3{ 0, WATER_Y, 0 }, 9.0f, 0.02f, 9.0f, Color{ 120, 190, 240, 160 });
+    const int above = source_pos.y > WATER_Y;
+    DrawSphere(source_pos, 0.18f, above ? Color{ 235, 200, 90, 255 } : Color{ 90, 180, 235, 255 });
+    DrawLine3D(g_head, source_pos, wat_crossed == 1 ? Color{ 96, 130, 170, 150 } : Color{ 90, 220, 90, 200 });
+    if (wat_er_on == 1) {                            /* the Lloyd's mirror: the inverted image above the surface */
+        Vector3 img = { source_pos.x, 2.0f * WATER_Y - source_pos.y, source_pos.z };
+        DrawSphereWires(img, 0.14f, 6, 8, Color{ 120, 190, 240, 180 });
+        DrawLine3D(img, g_head, Color{ 120, 190, 240, 90 });
+    }
+}
 /* ---- scene table (per-scene panel sections live in draw_panel) ---- */
 typedef struct {
     const char* name;
@@ -881,19 +974,25 @@ static const Scene scenes[] = {
     { "Blind A/B/X (hear it, prove it)", abx_enter, abx_update, abx_draw3d },
     { "Ambisonic bed (world-locked)", bed_enter, bed_update, bed_draw3d },
     { "Reverb bed (static room)", rev_enter,  rev_update,  rev_draw3d  },
+    { "Underwater (medium boundary)", wat_enter, wat_update, wat_draw3d },
 };
-enum { NSCENE = sizeof scenes / sizeof scenes[0], SCENE_REVERB = NSCENE - 1, SCENE_BED = NSCENE - 2 };
+enum { NSCENE = sizeof scenes / sizeof scenes[0],
+       SCENE_WATER = NSCENE - 1, SCENE_REVERB = NSCENE - 2, SCENE_BED = NSCENE - 3 };
 static int cur_scene;
-static int engine_has_reverb;       /* which config the live engine was built in */
+static int engine_mode;             /* which config the live engine was built in (0/1/2, see build_engine) */
 
-/* (re)build the engine in the interactive (no-bed, dynamic geometry) or reverb (bed + static room)
- * config, reloading assets + recreating sources. Used at startup and on each reverb-boundary switch. */
+/* (re)build the engine in the interactive (no-bed, dynamic geometry), reverb (Steam bed + static
+ * room), or underwater (FDN + pressure-release surface plane) config, reloading assets + recreating
+ * sources. Used at startup and on each config-boundary switch. */
 static bwa_sink_type g_sink_mode = BWA_SINK_AUTO;   /* --tests forces BWA_SINK_NULL (hermetic) */
 static const char*   g_asio_driver = NULL;          /* --driver <name>; NULL = auto-pick */
-static int           g_profile_direct = 0;          /* headphone render: 0 = cave_sim (array audition,
-                                                     * the default - the meters/gizmos read the bus),
-                                                     * 1 = binaural (direct per-source render). The
-                                                     * panel's render picker rebuilds to switch. */
+static int           g_render_pick = 0;             /* the panel's render picker (rebuilds to switch):
+                                                     * 0 = cave_sim (array audition on headphones, the
+                                                     * default - the meters/gizmos read the bus),
+                                                     * 1 = binaural (direct per-source render),
+                                                     * 2 = cave (the ARRAY ITSELF: 26-ch ASIO to the
+                                                     * rig; on a desk with no such device the null
+                                                     * sink renders visual-only). */
 static char          g_hpeq_path[260];              /* headphone EQ (AutoEq ParametricEQ.txt); the
                                                      * correction dies with an engine rebuild, so
                                                      * build_engine re-loads from THIS - the panel
@@ -901,13 +1000,16 @@ static char          g_hpeq_path[260];              /* headphone EQ (AutoEq Para
 static int           g_hpeq_loaded = 0;
 static bool          g_hpeq_on = true;
 
-static void build_engine(int with_reverb) {
+static void build_engine(int mode) {
     bwa_desc cfg = {
         /* Default CAVE_SIM: the playground is the desk CAVE simulator — the speaker gizmos light
          * from the array-bus meters, so the headphone feed defaults to the array audition. The
          * panel's render picker switches to BINAURAL (the direct per-source render) for by-ear
-         * A/B; the dry then bypasses the bus, so the gizmos going quiet is CORRECT there. */
-        .profile = g_profile_direct ? BWA_PROFILE_BINAURAL : BWA_PROFILE_CAVE_SIM,
+         * A/B — the dry then bypasses the bus, so the gizmos going quiet is CORRECT there — or
+         * to CAVE, which drives the real array over ASIO: the by-ear harness pointed at actual
+         * speakers on the rig machine (with no >=layout-count device it runs visual-only). */
+        .profile = g_render_pick == 2 ? BWA_PROFILE_CAVE
+                 : g_render_pick == 1 ? BWA_PROFILE_BINAURAL : BWA_PROFILE_CAVE_SIM,
         .layout_path = g_layout_path, .hrtf_path = NULL,
         .sample_rate = SR, .block_size = 256, .sink = g_sink_mode, .asio_driver = g_asio_driver,
         /* create-time: only the reverb scene cares, but it's harmless for the others */
@@ -916,7 +1018,7 @@ static void build_engine(int with_reverb) {
     e = bwa_create(&cfg);
     if (!e) { printf("bwa_create failed\n"); exit(1); }
     g_cmat = 0;                                              /* custom-material token died with the old engine */
-    if (with_reverb) {
+    if (mode == 1) {
         bwa_reflections_desc rc = { .ir_seconds = 1.0f, .order = 1, .num_rays = 4096,
                                   .num_bounces = 16, .enabled = 1 };
         bwa_reflections_config(e, &rc);
@@ -926,6 +1028,17 @@ static void build_engine(int with_reverb) {
         else                            rm = cmat_token();
         bwa_material faces[6] = { rm, rm, rm, rm, rm, rm };
         bwa_scene_set_box(e, ROOM_W, ROOM_H, ROOM_D, faces);     /* static room, BEFORE bwa_start */
+    } else if (mode == 2) {
+        /* the underwater config, all load-time (phonon-free): the FDN renders whichever medium's
+         * tail (the scene retunes it LIVE on a dive — that call is the demo), and the water surface
+         * is a pressure-release mirror plane, so the submerged surface bounce inverts (Lloyd's
+         * mirror). The plane's material: reflects nearly everything, transmits almost nothing. */
+        bwa_fdn_desc fd = { .enabled = 1 };                  /* zeros -> the air defaults; wat_apply_medium retunes */
+        bwa_fdn_config(e, &fd);
+        const float wabs[3] = { 0.01f, 0.01f, 0.02f };
+        const float wtrn[3] = { 0.30f, 0.06f, 0.01f };
+        bwa_material wm = bwa_material_define(e, wabs, 0.05f, wtrn);
+        bwa_scene_set_ground(e, WATER_Y, wm, true);          /* the surface, BEFORE bwa_start */
     }
     if (bwa_start(e) != 0) {
         const char* err = bwa_last_error(e);
@@ -960,22 +1073,24 @@ static void build_engine(int with_reverb) {
     refl = bwa_source_create(e);  bwa_source_play(e, refl, sig_snd(), true);
     g_bed = bwa_bed_create(e);
     bwa_source_set_gain(e, refl, 0.0f);
-    if (with_reverb) bwa_source_set_reverb(e, src, rev_on);
-    engine_has_reverb = with_reverb;
+    if (mode == 1) bwa_source_set_reverb(e, src, rev_on);
+    engine_mode = mode;
 }
 
 /* leave the current scene at a clean baseline, then enter the new one (rebuilding the engine if we
  * are crossing the reverb boundary, since the bed + room geometry are load-time) */
 static void switch_scene(int idx) {
-    int want_reverb = (idx == SCENE_REVERB);
+    int want_mode = (idx == SCENE_REVERB) ? 1 : (idx == SCENE_WATER) ? 2 : 0;
     if (e) {                                     /* drop any movable walls before a possible engine rebuild */
         if (occ_wall >= 0) { bwa_scene_remove_dynamic_mesh(e, occ_wall); occ_wall = -1; }
         if (rev_wall >= 0) { bwa_scene_remove_dynamic_mesh(e, rev_wall); rev_wall = -1; }
     }
-    if (want_reverb != engine_has_reverb) {
-        printf("rebuilding engine: %s\n", want_reverb ? "reverb (bed + static room)" : "interactive");
+    if (want_mode != engine_mode) {
+        printf("rebuilding engine: %s\n", want_mode == 1 ? "reverb (bed + static room)"
+                                        : want_mode == 2 ? "underwater (FDN + surface plane)"
+                                                         : "interactive");
         if (e) { bwa_stop(e); bwa_destroy(e); e = NULL; }
-        build_engine(want_reverb);
+        build_engine(want_mode);
     }
     for (uint32_t ch = 0; ch < (uint32_t)g_nspk; ++ch) bwa_set_test_signal(e, ch, BWA_TEST_OFF, 0.0f);  /* clear channel walk */
     bwa_source_set_gain(e, refl, 0.0f);
@@ -1006,7 +1121,7 @@ static void switch_scene(int idx) {
 static char g_drv_pick[64];                  /* the picked name g_asio_driver points at */
 static void rebuild_for_driver(void) {
     if (e) { bwa_stop(e); bwa_destroy(e); e = NULL; }
-    build_engine(engine_has_reverb);
+    build_engine(engine_mode);
     scenes[cur_scene].enter();
 }
 
@@ -1155,23 +1270,28 @@ static void draw_panel(void) {
               "outputs. A registered driver can still fail to open (unplugged/busy) - the engine "
               "falls back to the silent null sink; the audio line above is the truth.");
     }
-    {   /* headphone-render picker: cave_sim auditions the ARRAY render, binaural is the direct
-         * per-source render. Create-time like the driver, so switching rebuilds + re-enters. */
-        static const char* prof_names[2] = { "render: cave_sim (array audition)",
-                                             "render: binaural (direct)" };
-        int pr = g_profile_direct;
+    {   /* render picker: cave_sim auditions the ARRAY render on headphones, binaural is the
+         * direct per-source render, cave drives the REAL array over ASIO (the rig). Create-time
+         * like the driver, so switching rebuilds + re-enters. */
+        static const char* prof_names[3] = { "render: cave_sim (array audition)",
+                                             "render: binaural (direct)",
+                                             "render: cave (the array itself)" };
+        int pr = g_render_pick;
         ImGui::SetNextItemWidth(-FLT_MIN);
-        if (ImGui::Combo("##prof", &pr, prof_names, 2) && pr != g_profile_direct) {
-            g_profile_direct = pr;
+        if (ImGui::Combo("##prof", &pr, prof_names, 3) && pr != g_render_pick) {
+            g_render_pick = pr;
             rebuild_for_driver();                   /* same policy as the driver pick */
         }
-        bwTip("Which headphone render (bwa_desc.profile) - A/B them by ear on the same scene. "
+        bwTip("What renders (bwa_desc.profile) - the headphone pair A/Bs by ear on the same scene. "
               "cave_sim = the array render through virtual speakers, DBAP artifacts included; the "
               "meters below show exactly what lights the speakers. binaural = the first-class "
               "direct render (per-voice HRTF with the Steam build; point sources and beds bypass "
               "the speaker bus, so quiet meters there are CORRECT - only the FDN/reflection tails "
-              "still ride the bus). The audio line above names the live decode (direct vs sim). "
-              "Create-time: switching REBUILDS the engine (brief gap).");
+              "still ride the bus). cave = the ARRAY ITSELF: 26-ch ASIO to the rig - the by-ear "
+              "harness pointed at real speakers (pick the Digiface driver above; with no "
+              ">=layout-count device the null sink runs visual-only). The audio line above names "
+              "the live decode for the headphone renders. Create-time: switching REBUILDS the "
+              "engine (brief gap).");
     }
     {   /* headphone correction EQ (bwa_load_headphone_eq): correct YOUR headphones before judging
          * either render by ear. Path survives the render/driver rebuilds (build_engine re-loads). */
@@ -1188,7 +1308,8 @@ static void draw_panel(void) {
               "your headphone model (github.com/jaakkopasanen/AutoEq covers thousands). Applied "
               "to the final headphone stereo of every render - it corrects the TRANSDUCER, so "
               "A/B-ing sim vs direct stays fair. Enter or the button loads; an empty path "
-              "clears; a bad file keeps the previous EQ (the status line shows the reason).");
+              "clears; a bad file keeps the previous EQ (the status line shows the reason). "
+              "Inert in the cave render - real speakers get the per-speaker align stage instead.");
         if (g_hpeq_path[0] && !g_hpeq_loaded) {
             const char* why = bwa_last_error(e);
             ImGui::TextColored(ImVec4(1.00f, 0.45f, 0.45f, 1.0f), "EQ: %s", why ? why : "not loaded");
@@ -1387,7 +1508,7 @@ static void draw_panel(void) {
         ImGui::TextDisabled("yaw %.0f deg", fmodf(bed_yaw * 57.2958f, 360.0f));
         ImGui::TextWrapped("bursts = front (red), clicks = left-up (blue), plus a diffuse floor. "
                            "World-locked: the field is glued to the room, not the head.");
-    } else {                                              /* Reverb bed */
+    } else if (cur_scene == SCENE_REVERB) {               /* Reverb bed */
         if (chk("reverb send [G]", &rev_on)) bwa_source_set_reverb(e, src, rev_on);
         bwTip("opt the source into the shared reverb bed's wet send");
         ImGui::SetNextItemWidth(-FLT_MIN);
@@ -1438,6 +1559,23 @@ static void draw_panel(void) {
         chk("auto-sweep [SPACE]", &rev_wall_sweep);
         bwTip("slide the wall through the source->listener line; hear occlusion AND the reverb shift together");
         if (rev_wall_on) ImGui::TextDisabled("wall at z = %.2f", rev_wall_z); else ImGui::TextDisabled("no wall");
+    } else {                                              /* Underwater */
+        if (chk("submerged [SPACE]", &wat_under)) wat_apply_medium();
+        bwTip("dive/surface. The FDN retunes LIVE (the tail keeps ringing, only its slope changes), "
+              "the speed of sound glides to the medium's, and any source across the surface muffles "
+              "(~-30 dB + the water's transmission EQ) and goes diffuse");
+        if (chk("surface bounce [L]", &wat_lloyd)) wat_er_on = -1;
+        bwTip("the Lloyd's mirror: from below the surface reflects INVERTED (pressure-release), so "
+              "the bounce cancels the direct sound near it - push the source up toward the surface "
+              "and hear it thin out (broadband signals show the comb best)");
+        if (chk("Doppler [V]", &wat_dop)) bwa_source_set_doppler(e, src, wat_dop);
+        bwTip("what makes the speed of sound audible: in water the propagation delay is 4.3x "
+              "shorter - dive and hear the delay glide, not step");
+        ImGui::TextDisabled("source %s the surface%s", source_pos.y > WATER_Y ? "ABOVE" : "below",
+                            wat_crossed == 1 ? "  -  path CROSSES (muffled)" : "");
+        ImGui::TextWrapped("The api.md 'listener submerges' recipe, live and phonon-free. Per-source "
+                           "where the path crosses the boundary, room-wide for the medium itself. "
+                           "R/F pushes the source through the surface.");
     }
 
     ImGui::Separator();
@@ -1575,26 +1713,40 @@ static void register_tests(ImGuiTestEngine* te) {
         ctx->CaptureScreenshot();
     };
 
-    /* the render picker: cave_sim <-> binaural is create-time, so the combo pick REBUILDS the
-     * engine through the same path a user's click takes; the status line's decode name ("sim" vs
-     * "direct") is the observable. Ends back on the default so later tests see cave_sim. */
+    /* the render picker: all three renders are create-time, so each combo pick REBUILDS the
+     * engine through the same path a user's click takes; the status line is the observable —
+     * the headphone renders name their decode ("sim" / "direct"), cave names the bare device
+     * (no decode suffix). Ends back on the default so later tests see cave_sim. */
     t = IM_REGISTER_TEST(te, "viewer", "render_toggle");
     t->TestFunc = [](ImGuiTestContext* ctx) {
         ctx->SetRef("playground");
-        IM_CHECK_EQ(g_profile_direct, 0);
+        IM_CHECK_EQ(g_render_pick, 0);
         IM_CHECK(strstr(backend_name, "sim)") != NULL);          /* cave_sim names the sim decode */
         /* the combo HEADER resolves by direct ID path (a "##" BeginCombo registers no label for
          * the wildcard search); the popup's Selectables register normally, so "**" finds them */
         ctx->ItemClick("##prof");                                /* open the render combo... */
         ctx->ItemClick("**/render: binaural (direct)");          /* ...and pick the direct render */
-        IM_CHECK_EQ(g_profile_direct, 1);
+        IM_CHECK_EQ(g_render_pick, 1);
         IM_CHECK(e != NULL);                                     /* rebuilt + live */
         IM_CHECK(strstr(backend_name, "direct)") != NULL);       /* the decode name flipped */
         ctx->Yield(8);                                           /* a few live blocks in direct mode */
         IM_CHECK_GE(bwa_get_channel_count(e), 4u);
+        ctx->ItemClick("##prof");                                /* cave: the array device, no decode */
+        ctx->ItemClick("**/render: cave (the array itself)");
+        IM_CHECK_EQ(g_render_pick, 2);
+        IM_CHECK(e != NULL);
+        IM_CHECK(strstr(backend_name, "(") == NULL);             /* bare backend: no monitor suffix */
+        ctx->Yield(8);                                           /* the array render stays live (null
+                                                                  * sink here: visual-only, meters on) */
+        IM_CHECK_GE(bwa_get_channel_count(e), 4u);
+        {   /* the bus METERS carry the cave render (the suite's null sink still renders) */
+            uint32_t n = 0; float m = 0.0f;
+            for (int tries = 0; tries < 60 && m <= 1e-6f; ++tries) { ctx->Yield(4); m = meters_max(&n); }
+            IM_CHECK_GT(m, 1e-4f);
+        }
         ctx->ItemClick("##prof");
         ctx->ItemClick("**/render: cave_sim (array audition)");
-        IM_CHECK_EQ(g_profile_direct, 0);
+        IM_CHECK_EQ(g_render_pick, 0);
         IM_CHECK(strstr(backend_name, "sim)") != NULL);
     };
 
@@ -1754,6 +1906,48 @@ static void register_tests(ImGuiTestEngine* te) {
         ctx->ItemUncheck("**/dynamic wall [N]");
         IM_CHECK_EQ(rev_wall, -1);                       /* removing it releases the instance */
         switch_scene(0);                                 /* back to interactive (rebuilds the engine again) */
+    };
+
+    /* Scene 8: the in/out-of-water recipe. The boundary rebuilds into the FDN + surface-plane
+     * config; panel-diving retunes the FDN live, glides c, and muffles the cross-surface source
+     * (audible but ~-30 dB, not silenced); the Lloyd's-mirror bounce engages only with BOTH ends
+     * submerged, and disengages the moment the path crosses again. */
+    t = IM_REGISTER_TEST(te, "viewer", "underwater");
+    t->TestFunc = [](ImGuiTestContext* ctx) {
+        switch_scene(SCENE_WATER);                       /* rebuilds into the water config (FDN + plane) */
+        IM_CHECK(e != NULL);
+        IM_CHECK_EQ(engine_mode, 2);
+        uint32_t n = 0; float m = 0.0f;
+        for (int tries = 0; tries < 60 && m <= 1e-6f; ++tries) { ctx->Yield(4); m = meters_max(&n); }
+        IM_CHECK_GT(m, 1e-4f);                           /* the above-surface source reaches the bus */
+        IM_CHECK_EQ(wat_crossed, 0);                     /* listener in air, source above: clear path */
+        ctx->SetRef("playground");
+        ctx->ItemCheck("**/submerged [SPACE]");          /* dive: the path now crosses the surface */
+        IM_CHECK_EQ(wat_under, 1);
+        ctx->Yield(8);                                   /* the muffle ramps in + the FDN morphs, live */
+        IM_CHECK_EQ(wat_crossed, 1);
+        m = meters_max(&n);
+        IM_CHECK_GT(m, 1e-6f);                           /* muffled, not silenced (engine still live) */
+        source_pos.y = WATER_Y - 1.0f;                   /* sink the SOURCE too: same medium again */
+        ctx->Yield(4);
+        IM_CHECK_EQ(wat_crossed, 0);                     /* clear path underwater... */
+        IM_CHECK_EQ(wat_er_on, 1);                       /* ...and the Lloyd's-mirror bounce engages */
+        ctx->CaptureReset();
+        ctx->CaptureScreenshot();
+        ctx->ItemClick("**/surface bounce [L]");         /* the toggle reaches the ISM enable */
+        ctx->Yield(2);
+        IM_CHECK_EQ(wat_er_on, 0);
+        ctx->ItemClick("**/surface bounce [L]");
+        ctx->Yield(2);
+        IM_CHECK_EQ(wat_er_on, 1);
+        ctx->ItemUncheck("**/submerged [SPACE]");        /* surface again: the bounce dies with the dive */
+        ctx->Yield(4);
+        IM_CHECK_EQ(wat_under, 0);
+        IM_CHECK_EQ(wat_er_on, 0);
+        IM_CHECK_EQ(wat_crossed, 1);                     /* listener in air, source still under: crossed */
+        switch_scene(0);                                 /* leaving rebuilds back to interactive */
+        IM_CHECK(e != NULL);
+        IM_CHECK_EQ(engine_mode, 0);
     };
 }
 

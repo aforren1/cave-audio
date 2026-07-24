@@ -26,15 +26,18 @@ any driver buffer size works); `bwa_get_audio_backend()` reports the device actu
 time** (`rt_set_tracker`), configured at runtime via `bwa_tracker_connect`/`bwa_tracker_desc`
 (see docs/api.md). An
 interactive **playground** (`examples/playground.cpp`, opt-in `-DBWA_BUILD_PLAYGROUND=ON`)
-auditions binaural by ear across seven feature **scenes** (TAB): localization (with a SPACE auto-move
+auditions binaural by ear across eight feature **scenes** (TAB): localization (with a SPACE auto-move
 sweep), occlusion+materials, directivity, a channel-walk speaker check, an **ambisonic bed** room (a
 synthesized 3rd-order field, world-locked: spin/tilt via bwa_bed_set_orientation, matrix vs
 parametric renderer, max-rE decode weighting — the by-ear home for the bed knobs), a **blind A/B/X** harness
 (X is secretly A or B over one live knob — dual-band, DBAP vs SPCAP/VBAP, spread, spread RENDER
 (LOBE vs MDAP / LOBE vs SPECTRAL), decorrelation, air absorption —
 answer over N trials and a one-sided binomial p-value says whether the difference is genuinely
-audible, not just "sounds different to me"), and a reverb-bed room (which
-rebuilds the engine on entry/exit, since the bed + room geometry are load-time). Its 3D scene shades
+audible, not just "sounds different to me"), a reverb-bed room (which
+rebuilds the engine on entry/exit, since the bed + room geometry are load-time), and an
+**underwater** medium boundary (SPACE dives: live FDN retune + speed of sound, cross-surface
+manual occlusion, the pressure-release Lloyd's-mirror bounce; rebuilds like the reverb room —
+its FDN is load-time). Its 3D scene shades
 each speaker gizmo by that channel's live output level (`bwa_get_bus_levels`, mirrored as a meter
 strip in the panel), and with no ASIO device the engine falls back to the null sink and keeps
 rendering — visual-only mode is live, just silent. **`bwa_set_test_signal(channel, kind, gain)`** drives one

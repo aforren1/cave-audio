@@ -344,6 +344,7 @@ bwa_set_speed_of_sound(e, 1480.0f);          /* Doppler + reflection timing foll
 Sources submerged *with* the listener keep playing untouched — the FDN and the speed of sound
 already carry the medium. Resist the classic game pitch-drop: frequency is invariant across a
 medium boundary, so it's an aesthetic, not physics (`bwa_source_set_pitch` if you want it anyway).
+Hear the whole recipe live in the playground's **Underwater** scene (TAB to it; SPACE dives).
 
 #### The water surface overhead (Lloyd's mirror)
 

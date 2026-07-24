@@ -227,7 +227,10 @@ generation, because the core's material table is fixed-capacity and meant to be 
 an existing `MeshInstance3D`. **`BwaDynamicGeometry : Node3D`** — a movable occluder (a
 cheap BVH refit, not a rebuild; needs the Steam Audio build). **`BwaRoomBox : Node3D`** —
 the shoebox, which also captures the room for the image-source early reflections and so
-matters even in a phonon-free build.
+matters even in a phonon-free build. Its outdoor degenerate lives on `BwaEngine` as the
+`ground_*` properties: one horizontal mirror plane, the ground bounce, with
+`ground_pressure_release` turning it into a water surface seen from below (the
+Lloyd's-mirror comb). A `BwaRoomBox` wins when both exist — one room at a time.
 
 **`BwaSpeakerView : Node3D`** — one gizmo per speaker, lit by that channel's live output
 level. It reads the geometry back from the engine, so it draws the array the engine is
@@ -352,7 +355,7 @@ It is the Godot port of `examples/playground.cpp`. From the source tree:
 godot --path bindings/godot res://addons/bw_audio/playground/playground.tscn
 ```
 
-Same seven scenes, same keys, same synthesized signals. The C++ one stays: it needs no
+Same eight scenes, same keys, same synthesized signals. The C++ one stays: it needs no
 Godot, and it keeps its own imgui test suite. What running both buys you is a check on this
 binding — one engine build, two clients, and any audible difference is the binding's fault.
 
@@ -362,8 +365,8 @@ rather than two different noises.
 <!-- /dev -->
 
 Scenes, TAB to cycle: localization, occlusion and materials, directivity, channel walk,
-blind A/B/X, ambisonic bed, reverb bed. WASD/RF move the source, Q/E turn the head, 1–4 pick
-the signal. Every scene also declares its own controls — dropdowns, toggles, sliders — which
+blind A/B/X, ambisonic bed, reverb bed, underwater. WASD/RF move the source, Q/E turn the
+head, 1–4 pick the signal. Every scene also declares its own controls — dropdowns, toggles, sliders — which
 the panel builds; the keyboard shortcuts drive the *same* setters, so the two input paths
 cannot drift apart, and pressing a key visibly moves the matching widget.
 
@@ -375,9 +378,9 @@ the listener's right, matching the red right ear on the head gizmo.
 
 Two things worth knowing:
 
-- **The reverb scene rebuilds the engine** on entry and exit, because the bed and the room
-  geometry are load-time. Here that means tearing down the whole rig subtree and standing a
-  new one up, which is a brief audio gap by design.
+- **The reverb and underwater scenes rebuild the engine** on entry and exit, because the
+  Steam bed, the room geometry, and the FDN are load-time. Here that means tearing down the
+  whole rig subtree and standing a new one up, which is a brief audio gap by design.
 - **`switch_scene()` resets every engine-wide knob.** The knobs are global, so a scene that
   left SPCAP selected or a spread mode engaged would silently change what the *next* scene
   appears to demonstrate. That reset list is ported verbatim for exactly that reason.
@@ -386,8 +389,8 @@ With no ASIO device the engine falls back to the null sink and everything still 
 silent — visual-only is a supported state, not a failure, and the HUD says so.
 
 <!-- dev -->
-`godot_playground` walks all seven scenes headless, crosses the reverb boundary both ways,
-and renders each HUD. It cannot judge how anything *sounds* — that is the tool's job, not the
+`godot_playground` walks all eight scenes headless, crosses the reverb and underwater
+boundaries both ways, and renders each HUD. It cannot judge how anything *sounds* — that is the tool's job, not the
 test's — but it does catch the scene machinery and the rebuild falling over.
 
 ## Status

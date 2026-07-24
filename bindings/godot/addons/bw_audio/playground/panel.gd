@@ -58,13 +58,16 @@ func _ready() -> void:
 	_render_pick = OptionButton.new()
 	_render_pick.add_item("cave_sim (array audition)")
 	_render_pick.add_item("binaural (direct)")
-	_render_pick.item_selected.connect(func(i: int) -> void: app.set_profile_direct(i == 1))
+	_render_pick.add_item("cave (the array itself)")
+	_render_pick.item_selected.connect(func(i: int) -> void: app.set_render_pick(i))
 	_render_pick.tooltip_text = (
-		"Which headphone render - A/B them by ear on the same scene.\n"
+		"What renders - the headphone pair A/Bs by ear on the same scene.\n"
 		+ "cave_sim: the array render through virtual speakers, DBAP artifacts included;\n"
 		+ "the meters show exactly what lights the speakers.\n"
 		+ "binaural: the direct per-source render (per-voice HRTF with the Steam build);\n"
 		+ "point sources and beds bypass the speaker bus, so quiet meters there are correct.\n"
+		+ "cave: the ARRAY ITSELF over 26-ch ASIO - the by-ear harness on the rig machine\n"
+		+ "(with no such device the null sink runs visual-only).\n"
 		+ "Create-time: switching rebuilds the rig (brief gap).")
 	col.add_child(_row("render", _render_pick))
 
@@ -160,9 +163,8 @@ func _process(_dt: float) -> void:
 		_scene_pick.selected = app.cur_scene       # TAB moved it
 	if _signal_pick.selected != app.cur_sig:
 		_signal_pick.selected = app.cur_sig
-	var want_render := 1 if app.profile_direct else 0
-	if _render_pick.selected != want_render:
-		_render_pick.selected = want_render        # the selftest (or a script) switched it
+	if _render_pick.selected != app.render_pick:
+		_render_pick.selected = app.render_pick    # the selftest (or a script) switched it
 
 	# Pull each widget's value back from the scene, so a keyboard shortcut visibly moves the
 	# matching control. Skipped while a widget has focus, or dragging a slider would fight

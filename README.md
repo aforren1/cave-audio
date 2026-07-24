@@ -294,11 +294,17 @@ mis-correcting the array.
 
 ![bwa_playground](docs/img/playground.png)
 
-The array sim (`cave_sim`) on headphones (auto-picked 2-ch ASIO driver; without one
-the engine falls back to the null sink and keeps rendering—visual-only, live, just
-silent). Scenes: localization, occlusion + materials, directivity, channel walk,
-reverb bed, and a blind A/B/X comparison over single engine knobs (dual-band,
-panner choice, spread, air absorption) scored with a binomial p-value. The 3D
+The array sim (`cave_sim`) on headphones by default (auto-picked 2-ch ASIO driver;
+without one the engine falls back to the null sink and keeps rendering—visual-only,
+live, just silent). The panel's render picker switches to `binaural` (the direct
+per-source render, for by-ear A/Bs against the sim) or `cave` (the array itself over
+26-ch ASIO—the same harness pointed at real speakers on the rig machine), and a
+headphone-EQ field loads an AutoEq correction for your headphones.
+Scenes: localization, occlusion + materials, directivity, channel walk,
+reverb bed, an underwater medium boundary (live FDN retune, speed of sound,
+the Lloyd's-mirror surface bounce), and a blind A/B/X comparison over single
+engine knobs (dual-band, panner choice, spread, air absorption) scored with a
+binomial p-value. The 3D
 speakers shade by their live output level (mirrored as a meter strip in the
 panel), so you can watch the panner drive the array even with no audio device. A
 `constraints.json` next to the exe is drawn for orientation: the same room

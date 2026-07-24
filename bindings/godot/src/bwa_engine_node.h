@@ -35,6 +35,7 @@
 #include <godot_cpp/variant/vector3.hpp>
 
 #include "bw_audio.h"
+#include "bwa_material.h"   /* Ref<BwaMaterial>: the ground plane's surface */
 
 namespace godot {
 
@@ -124,6 +125,21 @@ public:
 	Vector3 get_fdn_decay_dir() const;
 	void set_fdn_decay_factor(float v) { fdn.decay_factor = v; }
 	float get_fdn_decay_factor() const { return fdn.decay_factor; }
+
+	/* --- the ground / water-surface plane: the outdoor degenerate of the room box ---
+	 * One horizontal mirror plane instead of a shoebox — the ground bounce. Applied between
+	 * create and start (load-time, like a BwaRoomBox, which WINS when both exist: one room at
+	 * a time). ground_height is a Godot-world height (the registration transform applies);
+	 * pressure_release inverts the reflection — a water surface with the listener below it,
+	 * the Lloyd's-mirror comb. */
+	void set_ground_enabled(bool v) { ground_enabled = v; }
+	bool get_ground_enabled() const { return ground_enabled; }
+	void set_ground_height(float v) { ground_height = v; }
+	float get_ground_height() const { return ground_height; }
+	void set_ground_pressure_release(bool v) { ground_pressure_release = v; }
+	bool get_ground_pressure_release() const { return ground_pressure_release; }
+	void set_ground_material(const Ref<BwaMaterial> &m) { ground_material = m; }
+	Ref<BwaMaterial> get_ground_material() const { return ground_material; }
 
 	/* --- the coordinate seam --- */
 	void set_registration(const Transform3D &t) { registration = t; }
@@ -306,6 +322,11 @@ private:
 
 	bwa_reflections_desc refl = {};
 	bwa_fdn_desc fdn = {};
+
+	bool ground_enabled = false;            /* the ground/surface plane (see the setters above) */
+	float ground_height = 0.0f;
+	bool ground_pressure_release = false;
+	Ref<BwaMaterial> ground_material;
 
 	Transform3D registration; /* Godot world -> room/Motive origin; identity until surveyed */
 	NodePath listener_path;

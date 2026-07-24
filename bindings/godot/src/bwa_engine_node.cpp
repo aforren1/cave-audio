@@ -192,6 +192,22 @@ void BwaEngine::_exit_tree() {
 void BwaEngine::build_static_scene() {
 	BwaRoomBox *box = BwaRoomBox::active();
 	const std::vector<BwaAcousticGeometry *> &geo = BwaAcousticGeometry::registry();
+
+	/* The ground/surface plane: the outdoor degenerate of the box, applied at the same
+	 * pre-start moment for the same reason (the image-source handoff is load-time). A
+	 * BwaRoomBox wins when both exist — one room at a time, and the box is the more
+	 * deliberate act of authoring. */
+	if (ground_enabled) {
+		if (box) {
+			UtilityFunctions::push_warning(
+					"BwaEngine: both a BwaRoomBox and ground_enabled — the box wins (one room at "
+					"a time); disable one.");
+		} else {
+			const int tok = ground_material.is_valid() ? (int)ground_material->token(this) : 0;
+			scene_set_ground(ground_height, tok, ground_pressure_release);
+		}
+	}
+
 	if (!box && geo.empty()) {
 		return;
 	}
@@ -958,6 +974,10 @@ void BwaEngine::_bind_methods() {
 	M(scene_set_box, "width", "height", "depth", "faces");
 	M(scene_set_ground, "y", "material", "pressure_release");
 	M(scene_set_pressure_release, "face_mask");
+	M(set_ground_enabled, "on"); M0(get_ground_enabled);
+	M(set_ground_height, "y"); M0(get_ground_height);
+	M(set_ground_pressure_release, "on"); M0(get_ground_pressure_release);
+	M(set_ground_material, "material"); M0(get_ground_material);
 	M(scene_set_mesh, "verts", "tris", "tri_materials");
 	M(scene_add_dynamic_mesh, "verts", "tris", "material");
 	M(scene_set_dynamic_transform, "handle", "position", "rotation");
@@ -995,6 +1015,15 @@ void BwaEngine::_bind_methods() {
 			"set_layout_path", "get_layout_path");
 	ADD_PROPERTY(PropertyInfo(Variant::TRANSFORM3D, "registration"), "set_registration",
 			"get_registration");
+	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "ground_enabled"), "set_ground_enabled",
+			"get_ground_enabled");
+	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "ground_height"), "set_ground_height",
+			"get_ground_height");
+	ADD_PROPERTY(PropertyInfo(Variant::OBJECT, "ground_material", PROPERTY_HINT_RESOURCE_TYPE,
+						 "BwaMaterial"),
+			"set_ground_material", "get_ground_material");
+	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "ground_pressure_release"),
+			"set_ground_pressure_release", "get_ground_pressure_release");
 
 	ADD_GROUP("Listener", "");
 	ADD_PROPERTY(PropertyInfo(Variant::NODE_PATH, "listener", PROPERTY_HINT_NODE_PATH_VALID_TYPES,
