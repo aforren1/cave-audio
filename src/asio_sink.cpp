@@ -242,6 +242,26 @@ static long asio_driver_names(char names[ASIO_ENUM_MAX][32]) {
     for (int i = 0; i < ASIO_ENUM_MAX; ++i) ptrs[i] = names[i];
     return list.getDriverNames(ptrs, ASIO_ENUM_MAX);
 }
+
+/* The SDK's asiolist reads driver names from the registry with the ANSI (-A) APIs, so its bytes are
+ * CP_ACP — but the bwa ABI speaks UTF-8 (both bindings marshal it that way). Convert at this seam:
+ * names go out CP_ACP -> UTF-8, and an explicit bwa_desc.asio_driver converts back before the SDK's
+ * byte-exact strcmp match. ASCII names (every mainstream ASIO driver) pass through unchanged; on a
+ * conversion failure the raw bytes pass through, which is the pre-conversion behavior. */
+static void acp_to_utf8(const char* in, char* out, int outcap) {
+    wchar_t w[96];
+    int wn = MultiByteToWideChar(CP_ACP, 0, in, -1, w, 96);
+    if (wn <= 0 || WideCharToMultiByte(CP_UTF8, 0, w, -1, out, outcap, nullptr, nullptr) <= 0) {
+        strncpy(out, in, (size_t)outcap - 1); out[outcap - 1] = 0;
+    }
+}
+static void utf8_to_acp(const char* in, char* out, int outcap) {
+    wchar_t w[96];
+    int wn = MultiByteToWideChar(CP_UTF8, 0, in, -1, w, 96);
+    if (wn <= 0 || WideCharToMultiByte(CP_ACP, 0, w, -1, out, outcap, nullptr, nullptr) <= 0) {
+        strncpy(out, in, (size_t)outcap - 1); out[outcap - 1] = 0;
+    }
+}
 extern "C" uint32_t sink_asio_driver_count(void) {
     char names[ASIO_ENUM_MAX][32];
     long n = asio_driver_names(names);
@@ -253,8 +273,7 @@ extern "C" bool sink_asio_driver_name(uint32_t index, char* buf, uint32_t cap) {
     char names[ASIO_ENUM_MAX][32];
     long n = asio_driver_names(names);
     if ((long)index >= (n < 0 ? 0 : n)) return false;
-    strncpy(buf, names[index], cap - 1);
-    buf[cap - 1] = 0;
+    acp_to_utf8(names[index], buf, (int)cap);
     return true;
 }
 
@@ -285,10 +304,12 @@ extern "C" bwa_sink* bwa_asio_sink_open(uint32_t sample_rate, uint32_t block_siz
     /* Auto-pick: bwa_desc.asio_driver if set, else the first registered driver that opens with
      * enough output channels (so binaural finds a 2-ch headphone driver — ASIO4ALL / FlexASIO /
      * the Steinberg built-in — and cave finds a >=26-ch one, without configuration). */
-    char drv[64] = {0};
+    char drv[64] = {0};       /* CP_ACP form, for the SDK's byte-exact registry match */
+    char drv_u8[96] = {0};    /* UTF-8 form, for error messages and the sink name */
     bool opened = false;
     if (driver && *driver) {
-        strncpy(drv, driver, sizeof drv - 1);
+        utf8_to_acp(driver, drv, sizeof drv);
+        strncpy(drv_u8, driver, sizeof drv_u8 - 1);
         opened = try_driver(drv, channels);
     } else {
         /* the SDK's global is created lazily by loadAsioDriver — on the PROCESS'S FIRST open it
@@ -300,7 +321,11 @@ extern "C" bwa_sink* bwa_asio_sink_open(uint32_t sample_rate, uint32_t block_siz
         for (int i = 0; i < 16; ++i) ptrs[i] = names[i];
         long ndrv = asioDrivers->getDriverNames(ptrs, 16);
         for (long i = 0; i < ndrv && !opened; ++i)
-            if (try_driver(names[i], channels)) { strncpy(drv, names[i], sizeof drv - 1); opened = true; }
+            if (try_driver(names[i], channels)) {
+                strncpy(drv, names[i], sizeof drv - 1);
+                acp_to_utf8(names[i], drv_u8, sizeof drv_u8);
+                opened = true;
+            }
     }
     if (!opened) {
         set_err(err, errcap, "asio: no driver opened with enough output channels");
@@ -331,7 +356,7 @@ extern "C" bwa_sink* bwa_asio_sink_open(uint32_t sample_rate, uint32_t block_siz
         ASIOSampleRate cur = 0; ASIOGetSampleRate(&cur);
         char m[176];
         snprintf(m, sizeof m, "asio: driver '%s' cannot run at %u Hz (device is at %.0f Hz; set Dante "
-                 "to %u Hz or match cfg.sample_rate to the device)", drv, sample_rate, (double)cur, sample_rate);
+                 "to %u Hz or match cfg.sample_rate to the device)", drv_u8, sample_rate, (double)cur, sample_rate);
         set_err(err, errcap, m);
         ASIOExit(); asioDrivers->removeCurrentDriver(); return nullptr;
     }
@@ -342,7 +367,7 @@ extern "C" bwa_sink* bwa_asio_sink_open(uint32_t sample_rate, uint32_t block_siz
     ASIOSampleRate got = 0;
     if (ASIOGetSampleRate(&got) == ASE_OK && (got < (double)sample_rate - 1.0 || got > (double)sample_rate + 1.0)) {
         char m[176];
-        snprintf(m, sizeof m, "asio: driver '%s' stayed at %.0f Hz, not the requested %u Hz", drv, (double)got, sample_rate);
+        snprintf(m, sizeof m, "asio: driver '%s' stayed at %.0f Hz, not the requested %u Hz", drv_u8, (double)got, sample_rate);
         set_err(err, errcap, m);
         ASIOExit(); asioDrivers->removeCurrentDriver(); return nullptr;
     }
@@ -356,7 +381,7 @@ extern "C" bwa_sink* bwa_asio_sink_open(uint32_t sample_rate, uint32_t block_siz
     s->render       = render;
     s->user         = user;
     strncpy(s->name, "asio:", sizeof s->name - 1);
-    strncat(s->name, drv, sizeof s->name - strlen(s->name) - 1);
+    strncat(s->name, drv_u8, sizeof s->name - strlen(s->name) - 1);
 
     for (uint32_t c = 0; c < channels; ++c) {
         s->bufferInfos[c].isInput    = ASIOFalse;

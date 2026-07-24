@@ -64,7 +64,7 @@ namespace BwAudio
         public bool limiter = true;
         [Tooltip("Limiter ceiling as a LINEAR peak amplitude in (0..1] (like every other gain). " +
                  "0.891251 = -1 dBFS, the default.")]
-        [Range(0f, 1f)] public float limiterCeiling = 0.891251f;
+        [Range(0.001f, 1f)] public float limiterCeiling = 0.891251f;   // floor > 0: the engine IGNORES <= 0, so a 0 here would silently diverge from it
 
         [Header("Panning")]
         [Tooltip("DBAP: listener-relative, for a MOVING observer (the CAVE case). SPCAP/VBAP assume a " +
@@ -164,8 +164,7 @@ namespace BwAudio
         public IntPtr Handle => _eng;
         public bool Ready => _eng != IntPtr.Zero;
 
-        readonly List<Emitter> _emitters = new();
-        readonly List<PushEmitter> _pushEmitters = new();   // procedural (push) sources, pushed in the same batch
+        readonly List<SourceBase> _sources = new();   // every source component (Emitter + PushEmitter), one registry
         readonly Dictionary<string, uint> _sounds = new();
         // Material tokens are minted into a FIXED 64-slot engine table and never freed, so mint each
         // MaterialAsset / preset ONCE and reuse it across every scene load — re-minting per load leaks
@@ -375,7 +374,9 @@ namespace BwAudio
         /// engaging never shifts the spatial image. Protection against digital overs, not mastering: if it
         /// engages in normal use, turn the content down.</summary>
         public void SetLimiter(bool on) { limiter = on; if (Ready) Bwa.bwa_set_limiter(_eng, on); }
-        public void SetLimiterCeiling(float linear) { limiterCeiling = linear; if (Ready) Bwa.bwa_set_limiter_ceiling(_eng, linear); }
+        // Clamped into (0..1] BEFORE caching: the engine silently ignores <= 0, so an unclamped 0 would
+        // leave the field claiming a ceiling the engine isn't running (0.001 = the old -60 dB floor).
+        public void SetLimiterCeiling(float linear) { limiterCeiling = Mathf.Clamp(linear, 0.001f, 1f); if (Ready) Bwa.bwa_set_limiter_ceiling(_eng, limiterCeiling); }
 
         /// <summary>Master gain over the whole mix (ramped — slider drags never zipper). The volume knob.</summary>
         public float MasterGain
@@ -733,16 +734,14 @@ namespace BwAudio
             tris.Add(baseIdx + i0); tris.Add(baseIdx + i1); tris.Add(baseIdx + i2);
         }
 
-        readonly List<Emitter> _pushBuf = new();   // reusable snapshot (Push may unregister mid-loop)
+        readonly List<SourceBase> _pushBuf = new();   // reusable snapshot (a FrameSync callback may unregister mid-loop)
 
-        public void Register(Emitter e)   { if (!_emitters.Contains(e)) _emitters.Add(e); }
-        public void Unregister(Emitter e) => _emitters.Remove(e);
-
-        // Procedural (push) sources ride the same centralized push: their transform goes in before the
-        // listener + the one commit, so a moving push voice is as coherent as any Emitter. No onFinished
-        // edge here, so SyncTransform can't unregister mid-loop — no snapshot needed.
-        public void Register(PushEmitter e)   { if (!_pushEmitters.Contains(e)) _pushEmitters.Add(e); }
-        public void Unregister(PushEmitter e) => _pushEmitters.Remove(e);
+        // One registry for every source kind (Emitter's clip voices and PushEmitter's push voices ride
+        // the same centralized per-frame push, before the listener + the one commit), all flowing
+        // through the same snapshot — so a callback that mutates the registry mid-loop is safe no
+        // matter which source kind fires it.
+        public void Register(SourceBase s)   { if (!_sources.Contains(s)) _sources.Add(s); }
+        public void Unregister(SourceBase s) => _sources.Remove(s);
 
         void LateUpdate()
         {
@@ -754,12 +753,11 @@ namespace BwAudio
                 RebuildSceneMesh(FindObjectsByType<AcousticGeometry>(FindObjectsSortMode.None));
             }
             // Iterate a snapshot: an emitter's onFinished handler may disable it, which runs OnDisable ->
-            // Unregister -> _emitters.Remove mid-loop. Mutating the list under a foreach would throw and
+            // Unregister -> _sources.Remove mid-loop. Mutating the list under a foreach would throw and
             // skip the commit. _pushBuf is cleared+refilled (no per-frame allocation after warmup).
             _pushBuf.Clear();
-            _pushBuf.AddRange(_emitters);
-            foreach (var e in _pushBuf) if (e) e.Push();           // all sources first...
-            foreach (var pe in _pushEmitters) if (pe) pe.SyncTransform();   // ...and the procedural sources...
+            _pushBuf.AddRange(_sources);
+            foreach (var s in _pushBuf) if (s) s.FrameSync();      // all sources first...
             if (feedListener && listener)
             {
                 var p = Room.Pos(listener.position);

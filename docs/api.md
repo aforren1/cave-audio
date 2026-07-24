@@ -419,9 +419,10 @@ bool     bwa_get_asio_driver_name(uint32_t index, char* buf, uint32_t cap);  // 
 ```
 
 Enumerate the OS's **registered** ASIO drivers: call before `bwa_create` to populate a device
-picker, then pass the chosen name as `bwa_desc.asio_driver`. Nothing is loaded, initialized, or
-opened (it reads the driver registry, fresh on every call; a newly installed driver appears
-immediately), so it's also safe alongside a running engine. A registered driver isn't necessarily
+picker, then pass the chosen name as `bwa_desc.asio_driver`. Names are UTF-8 (the engine converts
+from the registry's ANSI codepage and back, so a localized driver name round-trips). Nothing is
+loaded, initialized, or opened (it reads the driver registry, fresh on every call; a newly
+installed driver appears immediately), so it's also safe alongside a running engine. A registered driver isn't necessarily
 *openable* (hardware unplugged, exclusive-mode busy); the truth test is still `bwa_start` +
 `bwa_get_audio_backend`. A no-ASIO build reports zero drivers. The tools ride the same registry:
 `bwa_playground --list-drivers` / a live picker in its panel, `bwa_calibrate --list-drivers`,

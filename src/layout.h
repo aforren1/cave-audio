@@ -92,8 +92,8 @@ static inline float atten_curve(float d, float ref, float rolloff, float min_lin
 /* Unit direction from `from` to `to` (out = normalize(to - from)); degenerate (|to-from| <= 1e-6)
  * falls back to (0,0,1). Reciprocal-multiply, 1e-6 guard: shared by the sites whose per-speaker
  * normalization is op-for-op this (vbap.c, epad.c). Sites with a DIFFERENT degenerate fallback or a
- * division form (spcap 0,0,0; allrad 1,0,0; steam_decode 0,0,-1 + division; rt.c's fused permute)
- * keep their own inline — merging would change their numerics. */
+ * division form (spcap 0,0,0; allrad 1,0,0; steam_decode 0,0,-1 + division; rt.c's division-form
+ * bed_pref loop) keep their own inline — merging would change their numerics. */
 static inline void unit_dir(const float from[3], const float to[3], float out[3]) {
     float dx = to[0] - from[0], dy = to[1] - from[1], dz = to[2] - from[2];
     float len = sqrtf(dx * dx + dy * dy + dz * dz);

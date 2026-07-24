@@ -968,21 +968,12 @@ static void drain_commands(RtCore* c) {
     atomic_store_explicit(&r->read, rd, memory_order_release);
 }
 
-/* Build the ambisonic bed decode matrix from the layout: for each speaker, sample the SH basis at
- * its direction (room -> ambisonic axes) and scale by (2l+1)/L. Room convention (post +z-forward
- * flip): identity listener faces +z, right ear at -x, +y up; AmbiX axes are x=front/y=left/z=up, so
- * ambi front = room +z (where the listener faces / the main content sits), ambi left = room +x,
- * ambi up = room +y. World-locked: directions are from the array centroid, not the moving listener.
- * This is the projection/sampling decode, which assumes a roughly UNIFORM speaker distribution; the
- * cave grid is only approximately uniform, so it is good for a diffuse bed but a pseudo-inverse
- * (mode-matching) decode would be exact — a refinement, not needed for v1's diffuse content. */
-static void build_bed_decode_sad(RtCore* c) {
-    /* the sampling decode now lives in ambisonics.c (shared with the FDN's fallback); directions are
-     * from the array centroid (layout.ref), not the origin (which canonically sits on the floor). */
-    ambi_sad_decode(&c->layout, c->channels, c->bed_decode);
-}
-
-/* Dispatch the bed decode: AllRAD if selected (and the array triangulates), else the sampling decode.
+/* Dispatch the bed decode: AllRAD or EPAD if selected (and the build succeeds), else the shared
+ * sampling decode (ambi_sad_decode — assumes a roughly uniform array, fine for a diffuse bed).
+ * World-locked: directions are from the array centroid, not the moving listener. Room convention
+ * (post +z-forward flip): identity listener faces +z, right ear at -x, +y up; AmbiX axes are
+ * x=front/y=left/z=up, so ambi front = room +z (where the listener faces / the main content sits),
+ * ambi left = room +x, ambi up = room +y.
  * Also derives the parametric bed's constants from the result: bed_radius (the virtual-source shell
  * for the re-panned direct stream) and bed_pref (so a plane wave renders at the same loudness through
  * either bed renderer: the mean power the FOA matrix decode produces, averaged over the speaker
@@ -992,7 +983,7 @@ static void build_bed_decode(RtCore* c) {
     if      (c->bed_decoder == 1) built = allrad_build_decode(&c->layout, c->bed_decode);
     else if (c->bed_decoder == 2) built = epad_build_decode(&c->layout, c->bed_decode);
     if (!built)
-        build_bed_decode_sad(c);
+        ambi_sad_decode(&c->layout, c->channels, c->bed_decode);
     double rsum = 0.0, psum = 0.0;
     for (uint32_t s = 0; s < c->channels; ++s) {
         float p[3] = { c->layout.speakers[s].pos[0] - c->layout.ref[0],
@@ -1872,7 +1863,8 @@ static void bed_rotate_z(const float* sh, int nch, const float cm[3], const floa
  * convention), pitch about the room's right axis (positive tilts the field's front upward), roll
  * about room forward (+z; positive tilts the field's top toward room -x = the room's right).
  * Applied roll-first, yaw-last (aircraft order), then conjugated into ambi axes (x=front=room z,
- * y=left=room x, z=up=room y) — for a pure permutation that is an index remap. */
+ * y=left=room x, z=up=room y) — for a pure permutation that is an index remap through the shared
+ * room->ambi gather table (BWA_ROOM2AMBI, ambisonics.h). */
 static void bed_rot_ambi(float yaw, float pitch, float roll, float R[3][3]) {
     const float cy = cosf(yaw),  sy = sinf(yaw);
     const float cp = cosf(pitch), sp = sinf(pitch);
@@ -1889,8 +1881,8 @@ static void bed_rot_ambi(float yaw, float pitch, float roll, float R[3][3]) {
         float a = 0.f; for (int k = 0; k < 3; ++k) a += ry[i][k] * t[k][j];
         rm[i][j] = a;
     }
-    static const int cr3[3] = { 2, 0, 1 };               /* ambi component -> room component */
-    for (int i = 0; i < 3; ++i) for (int j = 0; j < 3; ++j) R[i][j] = rm[cr3[i]][cr3[j]];
+    for (int i = 0; i < 3; ++i) for (int j = 0; j < 3; ++j)
+        R[i][j] = rm[BWA_ROOM2AMBI[i]][BWA_ROOM2AMBI[j]];    /* ambi component i <- room component */
 }
 
 /* clamp-glide toward a target by at most dmax this block (lands exactly once within reach) */
@@ -2043,10 +2035,11 @@ static void mix_bed(RtCore* c, Voice* v, uint16_t idx, float* bus, uint32_t n, u
             da_tgt[b] = sqrtf(1.f - psi) * c->bed_pref;
             fa_tgt[b] = sqrtf(psi);
             if (In > 1e-9f) {                          /* doa (ambi) -> room -> virtual source on the shell */
-                float ax = pb->I[b][0]/In, ay = pb->I[b][1]/In, az = pb->I[b][2]/In;
-                float pos[3] = { c->layout.ref[0] + c->bed_radius * ay,     /* room x = ambi y */
-                                 c->layout.ref[1] + c->bed_radius * az,     /* room y = ambi z */
-                                 c->layout.ref[2] + c->bed_radius * ax };   /* room z = ambi x */
+                float a[3] = { pb->I[b][0]/In, pb->I[b][1]/In, pb->I[b][2]/In };
+                float dr[3]; ambi_to_room(a, dr);      /* the shared (z,x,y) permutation, inverted */
+                float pos[3] = { c->layout.ref[0] + c->bed_radius * dr[0],
+                                 c->layout.ref[1] + c->bed_radius * dr[1],
+                                 c->layout.ref[2] + c->bed_radius * dr[2] };
                 float gt[BWA_CHANNELS];
                 panner_gains(c, p, pos, 1.f, gt);
                 double gp = 0.0; for (uint32_t ch = 0; ch < c->channels; ++ch) gp += (double)gt[ch]*gt[ch];

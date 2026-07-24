@@ -5,7 +5,7 @@
  * DSP behaviour toggles layered on top: the ambisonic bed + bed renderers (rotation/orientation/
  * parametric/max-rE + band split), the panner variants (dual-band) and reflection/pathing taps,
  * source spread (lobe/MDAP/spectral) + extent + frame transport + near-spread + metric size,
- * decorrelation, occlusion/pathing transmission EQ, air absorption + Doppler + loudness comp +
+ * decorrelation, pathing transmission EQ, air absorption + Doppler + loudness comp +
  * distance→reverb send + attenuation override, tracked room EQ, pose prediction, multi-listener
  * compromise panning, image-source early reflections, and pitch.
  *

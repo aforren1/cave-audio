@@ -1,6 +1,7 @@
 /* measure.c — see measure.h. Exponential sine sweep + regularized deconvolution. Pure DSP. */
 #include "measure.h"
-#include "fft.h"                                   /* shared radix-2 fft() (+ bwa_pow2_ge via bits.h) */
+#include "fft.h"                                   /* shared radix-2 fft() */
+#include "bits.h"                                  /* bwa_pow2_ge */
 
 #include <math.h>
 #include <stdlib.h>

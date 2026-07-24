@@ -341,7 +341,7 @@ The diffuse layer (ambisonic beds, the reflection bed) is rendered by a fixed
 SH→speaker **decode matrix** applied per block (`build_bed_decode` / `mix_bed` in
 `rt.c`), built from the speaker geometry at load time. Two decoders are selectable with
 **`bwa_desc.bed_decoder`** (create-time); the plain **sampling (projection) decode**
-`decode[s][k] = (2l+1)·Y_k^SN3D(dir_s)/N` (`build_bed_decode_sad`) is **not** one of
+`decode[s][k] = (2l+1)·Y_k^SN3D(dir_s)/N` (`ambi_sad_decode`) is **not** one of
 them: exact on a perfectly uniform array, it over-energises dense regions on an
 irregular one (every speaker radiates a fixed diffuse energy regardless of position),
 which both selectable decoders dominate. It survives only as the automatic fallback

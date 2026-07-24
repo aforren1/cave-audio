@@ -4,8 +4,10 @@
  * old rt_test monolith: the command rings + commit snapshot + generation-gated handles, voice
  * lifecycle (create/destroy/steal/priority), scheduling (play_at / stop_at / loop regions /
  * gapless queue), streaming + push sources, pause/seek, fades + master gain + groups, the output
- * limiter, and the clock / playhead / bus-meter readbacks. The spatial-feature DSP toggles live in
- * rt_feature_test.c. Shared harness (layout, probes, wav writers, taps, CHECK) is rt_test_util.h.
+ * limiter, the clock / playhead / bus-meter readbacks, and occlusion level/EQ/directivity (kept
+ * here as the generation-gating and slot-recycling vehicle, sections 8-11). The other
+ * spatial-feature DSP toggles live in rt_feature_test.c. Shared harness (layout, probes, wav
+ * writers, taps, CHECK) is rt_test_util.h.
  *
  * The routing still goes through real DBAP, so the spine's observable is "a source at speaker k's
  * surveyed position makes channel k dominate"; the panner/DBAP properties themselves live in

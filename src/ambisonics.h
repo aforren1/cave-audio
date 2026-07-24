@@ -24,11 +24,19 @@
 #define BWA_AMBI_CH    16    /* (order + 1)^2 */
 
 /* room axes (+z fwd, +y up, -x right) -> ambisonic axes (x=front, y=left, z=up): the (z,x,y)
- * permutation. `d` must already be a unit room direction; `a` receives the ambisonic-axis direction
- * to feed ambi_encode_sn3d. Shared by the bed/AllRAD/EPAD/FDN decode builds so the convention lives
- * in ONE place. NOTE: steam_decode.c's room_to_ambi_dir is a DELIBERATELY different (phonon net-AmbiX,
- * negated: front=-z, left=-x) convention — do NOT route it through here; merging mirrors the HRTF field. */
-static inline void room_to_ambi(const float d[3], float a[3]) { a[0] = d[2]; a[1] = d[0]; a[2] = d[1]; }
+ * permutation, defined once as an index table so forward and inverse cannot diverge. Gather:
+ * a[i] = d[BWA_ROOM2AMBI[i]]; the inverse scatters back. `d` must already be a unit room direction.
+ * Consumers: the bed/AllRAD/EPAD/FDN decode builds (forward), the parametric bed's DOA unpack
+ * (inverse), and bed_rot_ambi's rotation conjugation (rt.c, raw table). NOTE: steam_decode.c's
+ * room_to_ambi_dir is a DELIBERATELY different (phonon net-AmbiX, negated: front=-z, left=-x)
+ * convention — do NOT route it through here; merging mirrors the HRTF field. */
+static const int BWA_ROOM2AMBI[3] = { 2, 0, 1 };
+static inline void room_to_ambi(const float d[3], float a[3]) {
+    for (int i = 0; i < 3; ++i) a[i] = d[BWA_ROOM2AMBI[i]];
+}
+static inline void ambi_to_room(const float a[3], float d[3]) {
+    for (int i = 0; i < 3; ++i) d[BWA_ROOM2AMBI[i]] = a[i];
+}
 
 /* i-th of M points on a Fibonacci sphere (golden-angle spiral), room axes, FLOAT precision. Shared by
  * allrad.c (virtual layer) and fdn.c (line directions). zylia.c uses a DOUBLE variant on purpose (it

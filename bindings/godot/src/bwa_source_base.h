@@ -130,6 +130,8 @@ private:
 	float spread = 0.0f;
 	Vector2 extent = Vector2(0.0f, 0.0f);
 	float size_m = 0.0f;
+	/* attenuation override cache: ref_dist <= 0 = none, mirroring the native clear semantic */
+	float atten_ref_dist = 0.0f, atten_rolloff = 0.0f, atten_min_gain = 0.0f;
 
 	bool doppler = false;
 	bool air_absorption = false;

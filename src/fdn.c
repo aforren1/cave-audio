@@ -89,7 +89,7 @@ Fdn* fdn_create(const Layout* L, uint32_t sample_rate, uint32_t channels, int be
      * layout's bed decode. `bed_decoder` is the rt-internal id engine.c maps from the public enum:
      * 2 = EPAD renders the lines through the same energy-preserving decode the beds use; anything
      * else keeps the FDN's house AllRAD (the sampling form below is only the non-triangulable
-     * fallback, mirroring rt.c's build_bed_decode_sad — not selectable). */
+     * fallback, mirroring rt.c's build_bed_decode fallback — not selectable). */
     float dec[BWA_CHANNELS][BWA_AMBI_CH];
     int built = 0;
     if (bed_decoder == 2) built = epad_build_decode(L, dec);

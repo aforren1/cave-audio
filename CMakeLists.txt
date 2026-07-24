@@ -239,18 +239,15 @@ function(bwa_copy_runtime_dll target)
 endfunction()
 
 # Build one with-SDK Steam Audio test: link phonon + bwa_core, define BWA_HAVE_STEAMAUDIO, stage
-# phonon.dll next to the .exe, and register the ctest. steam_reflect.c's IR-publish seqlock needs
-# /experimental:c11atomics on MSVC, so any target whose sources include it gets the flag (the property
-# is directory-scoped, so this matches the pre-refactor per-target application exactly).
+# phonon.dll next to the .exe, and register the ctest. steam_reflect.c's /experimental:c11atomics is
+# already set once in the SDK block above — source properties are directory-scoped, so it covers every
+# target here that compiles it.
 # Usage: bwa_add_steam_test(<target> <ctest-name> <source>...)
 function(bwa_add_steam_test target test_name)
   add_executable(${target} ${ARGN})
   target_include_directories(${target} PRIVATE src "${STEAMAUDIO_DIR}/include")
   target_link_libraries(${target} PRIVATE bwa_core "${STEAMAUDIO_DIR}/lib/windows-x64/phonon.lib")
   target_compile_definitions(${target} PRIVATE BWA_HAVE_STEAMAUDIO)
-  if(MSVC AND "${ARGN}" MATCHES "steam_reflect")
-    set_source_files_properties(src/steam_reflect.c PROPERTIES COMPILE_OPTIONS /experimental:c11atomics)
-  endif()
   if(WIN32)
     add_custom_command(TARGET ${target} POST_BUILD
       COMMAND ${CMAKE_COMMAND} -E copy_if_different
@@ -331,9 +328,10 @@ if(BWA_BUILD_TESTS)
   # The old rt_test monolith is split in two (shared harness in test/rt_test_util.h):
   #   test_rt_core    — the concurrency/lifecycle spine (rings, commit, generation handles,
   #                     voice lifecycle + steal + priority, scheduling, streaming + push,
-  #                     pause/seek, fades/groups, limiter, clock/playhead/meter readbacks)
+  #                     pause/seek, fades/groups, limiter, clock/playhead/meter readbacks,
+  #                     occlusion level/EQ/directivity — kept there as the generation-gating vehicle)
   #   test_rt_feature — the spatial-feature DSP toggles (panners, spread/extent, decorrelation,
-  #                     occlusion/pathing EQ, air/Doppler/loudness, beds, tracked room EQ, ISM, …)
+  #                     pathing EQ, air/Doppler/loudness, beds, tracked room EQ, ISM, …)
   add_executable(test_rt_core    test/rt_core_test.c)
   target_link_libraries(test_rt_core PRIVATE bwa_core)
   add_test(NAME rt_core COMMAND test_rt_core)

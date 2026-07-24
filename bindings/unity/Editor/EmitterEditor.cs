@@ -1,12 +1,14 @@
 // EmitterEditor.cs — custom inspector for a source. Hides the settings that only matter once their
 // feature is switched on, and shows what the engine is doing to this source while it runs (occlusion is
 // ray-traced off-thread, so the number is the only way to see whether the wall you built is working).
+// Registered on SourceBase with editorForChildClasses, so Emitter and PushEmitter get the same
+// conditional-hide and live readouts.
 using UnityEditor;
 using UnityEngine;
 
 namespace BwAudio.EditorTools
 {
-    [CustomEditor(typeof(Emitter))]
+    [CustomEditor(typeof(SourceBase), true)]
     [CanEditMultipleObjects]
     public sealed class EmitterEditor : Editor
     {
@@ -14,7 +16,7 @@ namespace BwAudio.EditorTools
 
         public override void OnInspectorGUI()
         {
-            var e = (Emitter)target;
+            var e = (SourceBase)target;
             serializedObject.Update();
 
             var it = serializedObject.GetIterator();
@@ -48,7 +50,7 @@ namespace BwAudio.EditorTools
             }
         }
 
-        static bool IsHidden(string p, Emitter e)
+        static bool IsHidden(string p, SourceBase e)
         {
             switch (p)
             {

@@ -9,8 +9,6 @@
 #ifndef BWA_FFT_H
 #define BWA_FFT_H
 
-#include "bits.h"          /* bwa_pow2_ge (was next_pow2) */
-
 #include <math.h>
 
 #ifndef M_PI

@@ -69,6 +69,9 @@ void BwaSource::apply_all() {
 	if (size_m > 0.0f) {
 		bwa_source_set_size(ENG, src, size_m);
 	}
+	if (atten_ref_dist > 0.0f) {
+		bwa_source_set_attenuation_override(ENG, src, atten_ref_dist, atten_rolloff, atten_min_gain);
+	}
 	if (doppler) {
 		bwa_source_set_doppler(ENG, src, true);
 	}
@@ -236,6 +239,12 @@ void BwaSource::set_loudness_comp(bool on) {
 }
 
 void BwaSource::set_attenuation_override(float ref_dist, float rolloff, float min_gain) {
+	/* Cached like every other standing knob (it is persistent per-source state, not a one-shot),
+	 * so a pre-ready call isn't silently dropped and apply_all() re-asserts it after a re-mint.
+	 * ref_dist <= 0 clears, mirroring the native contract. */
+	atten_ref_dist = ref_dist;
+	atten_rolloff = rolloff;
+	atten_min_gain = min_gain;
 	if (LIVE) {
 		bwa_source_set_attenuation_override(ENG, src, ref_dist, rolloff, min_gain);
 	}

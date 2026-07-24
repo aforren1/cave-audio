@@ -33,7 +33,9 @@ void ambi_encode_sn3d(const float dir[3], float y[BWA_AMBI_CH]) {
 /* Sampling (projection) SH->speaker decode over a layout (see ambisonics.h). Room convention: ambi
  * front = room +z, left = room +x, up = room +y (via room_to_ambi). Directions are from the array
  * centroid (L->ref), not the origin (which canonically sits on the floor). Byte-identical to the
- * former rt.c build_bed_decode_sad — the divisions and the (2l+1)*y*invL order are preserved. */
+ * former rt.c build_bed_decode_sad — the divisions and the (2l+1)*y*invL order are preserved.
+ * (fdn.c's former local copy divided by count instead of multiplying by invL, so its
+ * degenerate-array fallback can differ from pre-hoist output by 1 ULP.) */
 void ambi_sad_decode(const Layout* L, uint32_t count, float dec[BWA_CHANNELS][BWA_AMBI_CH]) {
     const float invL = 1.0f / (float)count;
     for (uint32_t s = 0; s < count; ++s) {

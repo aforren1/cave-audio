@@ -12,6 +12,8 @@
 #include "bwa_room.h"
 #include "bwa_source_base.h"
 
+#include <cmath>
+
 using namespace godot;
 
 BwaEngine *BwaEngine::singleton = nullptr;
@@ -480,9 +482,27 @@ BWA_LIVE_SETTER(max_re_split, bool, bwa_set_max_re_split(eng, v))
 BWA_LIVE_SETTER(bed_renderer, BedRenderer, bwa_set_bed_renderer(eng, (bwa_bed_renderer)v))
 BWA_LIVE_SETTER(tracked_room_eq, bool, bwa_set_tracked_room_eq(eng, v))
 BWA_LIVE_SETTER(limiter, bool, bwa_set_limiter(eng, v))
-BWA_LIVE_SETTER(limiter_ceiling, float, bwa_set_limiter_ceiling(eng, v))
 
 #undef BWA_LIVE_SETTER
+
+/* Hand-written (not BWA_LIVE_SETTER): the property kept its name across the 0.10 dB -> linear unit
+ * change, so a pre-0.10 scene replays its authored dB value (always <= 0) here — which the engine
+ * contract silently ignores, leaving the cached getter claiming a ceiling the engine isn't running.
+ * Convert instead and warn, so old scenes migrate loudly and re-save in linear; -60 dB (the old
+ * clamp floor) maps onto the new 0.001 hint floor. */
+void BwaEngine::set_limiter_ceiling(float v) {
+	if (v <= 0.f) {
+		const float lin = powf(10.f, v / 20.f);
+		UtilityFunctions::push_warning(vformat(
+				"BwaEngine: limiter_ceiling %.2f reads as a pre-0.10 dB value; converting to linear %.3f (re-save the scene)",
+				v, lin));
+		v = lin < 0.001f ? 0.001f : lin;
+	}
+	limiter_ceiling = v;
+	if (eng) {
+		bwa_set_limiter_ceiling(eng, v);
+	}
+}
 
 void BwaEngine::set_fdn_decay_dir(const Vector3 &v) {
 	/* A DIRECTION, so it takes the registration basis only — no translation. */
@@ -691,7 +711,7 @@ String BwaEngine::get_asio_driver_name(int index) {
 	if (!bwa_get_asio_driver_name((uint32_t)index, buf, sizeof buf)) {
 		return String();
 	}
-	return String(buf);
+	return String::utf8(buf);    /* the ABI speaks UTF-8 (asio_sink converts from the registry's ACP) */
 }
 
 int BwaEngine::get_version() { return (int)bwa_get_version(); }
@@ -920,7 +940,7 @@ void BwaEngine::_bind_methods() {
 	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "master_gain", PROPERTY_HINT_RANGE, "0,2,0.01"),
 			"set_master_gain", "get_master_gain");
 	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "limiter"), "set_limiter", "get_limiter");
-	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "limiter_ceiling", PROPERTY_HINT_RANGE, "0,1,0.001"),
+	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "limiter_ceiling", PROPERTY_HINT_RANGE, "0.001,1,0.001"),
 			"set_limiter_ceiling", "get_limiter_ceiling");
 
 	ADD_GROUP("Reverb", "");

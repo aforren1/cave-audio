@@ -653,14 +653,9 @@ int main(void) {
             float dep2[BWA_CHANNELS][BWA_AMBI_CH], dsad[BWA_CHANNELS][BWA_AMBI_CH];
             int okc = epad_build_decode(&LC, dep2);
             CHECK(okc, "epad_build_decode succeeds on the clustered array");
-            for (uint32_t s = 0; s < LC.count; ++s) {            /* the sampling decode, from its formula */
-                float p[3] = { LC.speakers[s].pos[0] - LC.ref[0], LC.speakers[s].pos[1] - LC.ref[1],
-                               LC.speakers[s].pos[2] - LC.ref[2] };
-                float pl = sqrtf(p[0]*p[0] + p[1]*p[1] + p[2]*p[2]);
-                float ad2[3] = { p[2]/pl, p[0]/pl, p[1]/pl }, ys[BWA_AMBI_CH]; ambi_encode_sn3d(ad2, ys);
-                for (int k = 0; k < BWA_AMBI_CH; ++k) { int l = (int)floorf(sqrtf((float)k));
-                    dsad[s][k] = (float)(2*l+1) * ys[k] / (float)LC.count; }
-            }
+            ambi_sad_decode(&LC, LC.count, dsad);                /* the engine's actual sampling decode
+                                                                  * (the foil guards allrad/epad's own
+                                                                  * closed-form constant, not this) */
             if (okc) {
                 double cv[2];
                 float (*mats[2])[BWA_AMBI_CH] = { dep2, dsad };

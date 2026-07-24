@@ -59,8 +59,8 @@ with the ones a scene actually authors surfaced on the components:
   `SetAttenuationOverride`, `SetOcclusionManual`, `Occlusion`, `Playhead` / `PlayheadSeconds`, `Stop`,
   and the inspector spatial toggles (occlusion, early reflections, reverb send/distance, pathing,
   directivity, doppler, air absorption, loudness comp). It registers with `Engine` and its transform
-  rides the same centralized per-frame push (`Engine` gained a `Register`/`Unregister(PushEmitter)`
-  overload and a second push loop before the commit). Deliberately OMITTED — the engine refuses them
+  rides the same centralized per-frame push, through the one source registry and snapshot loop
+  (see `SourceBase` under Changed). Deliberately OMITTED — the engine refuses them
   on a push voice: `Play` / `PlayAt` / `PlayLoop`, `Seek`, `Pitch`, `Queue` / `ClearQueue`,
   `PlayOneShot`, and the file `clip` / `loop` / `playOnEnable` machinery. Mirrors Godot's
   `BwaPushSource` (which splits off `BwaEmitter` for the same reason) adapted to `Emitter`'s Unity
@@ -79,11 +79,42 @@ with the ones a scene actually authors surfaced on the components:
 
 ### Changed
 
+- **`SourceBase`** — the source-generic surface `Emitter` and `PushEmitter` had duplicated
+  member-for-member (lifecycle, the per-frame transform push, the live `OnValidate` re-push, and the
+  whole knob surface) now lives on one abstract `SourceBase` MonoBehaviour, mirroring Godot's
+  `BwaSource` base: a subclass overrides only the create call and adds its own feed. `Engine` keeps
+  ONE source registry (the `Register`/`Unregister(PushEmitter)` overloads and the second per-frame
+  loop are gone — every source kind runs through the same mutation-safe snapshot loop), and the
+  custom inspector now registers on `SourceBase` with `editorForChildClasses`, so `PushEmitter` gets
+  the conditional hides + live occlusion bar too. Public API and serialized field names are
+  unchanged — existing scenes and scripts migrate untouched.
 - **`Emitter` directivity** — the cardioid-weight mapping + `set_directivity` call, duplicated in
   `TryInit` and `OnValidate`, moved into one `ApplyDirectivity()` helper (no behaviour change).
 
 ### Fixed
 
+- **Play-mode inspector edits no longer wipe a script-set `Extent`** — `OnValidate` re-pushes
+  `spread`, which the engine defines as resetting extent (last call wins), and now re-asserts the
+  extent after it, exactly like `TryInit` always did. Previously ANY inspector nudge on a live
+  source collapsed a script-set anisotropic extent to a point while the `Extent` getter kept
+  reporting the stale vector.
+- **`SetAttenuationOverride` is mirrored + replayed** (Unity and Godot): it is standing per-source
+  state, so a call that loses the init-order race now lands at create, and the override survives a
+  disable/re-enable instead of silently reverting to the layout curve.
+- **A stale source handle can no longer cross an `Engine` destroy+recreate** — a source component
+  records its owning `Engine`; if that engine is replaced while the component stays enabled, every
+  call (including `OnDisable`'s destroy) no-ops instead of aliasing the successor engine's
+  deterministically-recycled first handles, and the next enable re-creates cleanly.
+- **Limiter ceiling can't silently diverge from the engine** — the inspector slider floors at 0.001
+  and `SetLimiterCeiling` clamps into `(0..1]` before caching (the engine ignores `<= 0`); the
+  Godot hint floors the same way, and its setter converts a replayed pre-0.10 dB scene value to
+  linear with a warning instead of silently dropping the authored ceiling.
+- **ASIO driver names are UTF-8 across the ABI** — the native enumeration converts the registry's
+  ANSI bytes to UTF-8 (and converts an explicit `asioDriver` back before the SDK's byte-exact
+  match), so a non-ASCII driver name survives the picker round trip; Godot now decodes with
+  `String::utf8`.
+- **A failed source create logs on `Emitter` too** (previously only `PushEmitter` checked the
+  handle) — unified in `SourceBase.TryInit`.
 - **`ProjectCheck` warning** pointed at the wrong menu: "Tools → Engine → Disable Unity Audio" now
   reads "Tools → BwAudio → Disable Unity Audio", matching the actual `MenuItem` path.
 - **Docs**: the README and `docs/integration.md` "1:1" claims now name the two deliberately-unbound
