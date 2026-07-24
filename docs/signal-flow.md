@@ -48,13 +48,15 @@ flowchart TD
   DECOR[("DECOR bus")]
   AUX[("AUX (mono reverb send)")]
   PACC[("PATH ACCUM (ambisonic)")]
+  DIRECT[("DIRECT field (16-ch SH;<br/>BWA_PROFILE_BINAURAL only)")]
 
   GATE -. "s_raw → bending-loss EQ → × shCoeffs<br/><i>bwa_source_set_pathing</i>" .-> PACC
   PATHS -.-> PACC
   OCC -. "× wet send (× distance)<br/><i>bwa_source_set_reverb · _reverb_send · _reverb_distance</i>" .-> AUX
-  OCC -. "ISM: 6 shoebox mirror images (ism_images);<br/>frac delay · HF damp · per-image panner_gains<br/><i>bwa_source_set_early_reflections · bwa_scene_set_box ·<br/>bwa_set_early_reflections_gain</i>" .-> BUS
+  OCC -. "ISM: 6 shoebox mirror images (ism_images);<br/>frac delay · HF damp · per-image panner_gains<br/>(direct mode: per-image direct_gains_at)<br/><i>bwa_source_set_early_reflections · bwa_scene_set_box ·<br/>bwa_set_early_reflections_gain</i>" .-> BUS
   PROP -. "decor split × √spread<br/><i>bwa_set_decorrelation</i>" .-> DECOR
   PAN --> BUS
+  PAN -- "BINAURAL profile: direct_gains_at —<br/>16 SH gains at the TRUE direction<br/>(ambi_encode_phonon; voice + ISM images<br/>land here INSTEAD of the bus)" --> DIRECT
 
   subgraph BEDV["bed voice: mix_bed, per sample (inside rt_render)"]
     SH["SH frames (world-locked soundfield)<br/><i>bwa_bed_play · bwa_bed_set_gain</i>"]
@@ -69,12 +71,14 @@ flowchart TD
   BEDA --> SH
   FUMA --> SH
   MTX --> BUS
+  ROT -- "BINAURAL profile: SH->SH pass ×<br/>ambi_canon_to_phonon (one diagonal;<br/>max-rE + parametric gated off)" --> DIRECT
   PARA -- "direct √(1−ψ)·W → listener-relative<br/>panner_gains at the array shell" --> BUS
   PARA -- "diffuse √ψ·FOA → bed decode (raw)" --> DECOR
 
   DECOR --> VN["per-channel sparse velvet-noise filters<br/>(mutually incoherent copies; built in rt_create)"] --> BUS
   AUX --> RTAP["the ONE reverb tap (rt_set_bus_tap):<br/>steam_reflect_tap: convolve → ambisonic IR → phonon decode<br/>·or· fdn_tap: 16 lines · 2-band decay · direction-scaled ·<br/>plane waves through the bed decode + max-rE pair<br/><i>bwa_reflections_config · bwa_fdn_config · bwa_set_reverb_gain</i>"] --> BUS
   PACC --> PTAP["path tap (rt_set_path_tap):<br/>steam_path_tap: phonon's own ambisonics decode"] --> BUS
+  PACC -- "BINAURAL profile: summed raw<br/>(already phonon-basis SH; tap skipped)" --> DIRECT
 
   BUS --> MG["× master gain (ramped)<br/><i>bwa_set_master_gain</i>"]
   MG --> ALIGN["align_process + room_eq_track:<br/>per-speaker correction FIR · room-EQ biquads<br/>(re-aimed at the tracked pose) · gain trim · delay<br/><i>trims/EQ written by bwa_calibrate · bwa_set_tracked_room_eq</i>"]
@@ -82,8 +86,10 @@ flowchart TD
   TSIG --> LIM["linked limiter → per-channel peak meters<br/><i>bwa_set_limiter · _limiter_ceiling · bwa_get_bus_levels</i>"]
 
   LIM --> CAVE["cave: asio_sink.cpp bufferSwitch →<br/>26-ch ASIO ► Digiface ► the array"]
-  LIM --> BIN["binaural: each channel = a virtual speaker →<br/>3rd-order SH encode (ambi_encode_sn3d) →<br/>phonon HRTF decode (steam_decode.c;<br/>binaural.c simple-pan fallback) → 2-ch device"]
-  LIM --> BOTH["both: array sink + monitor on a second device<br/>(double-buffered handoff, engine.c)"]
+  LIM --> CSIM["cave_sim: each channel = a virtual speaker →<br/>3rd-order SH encode (ambi_encode_phonon) →<br/>phonon HRTF decode (steam_decode.c;<br/>binaural.c simple-pan fallback) → 2-ch device"]
+  LIM --> BINP["binaural: the bus (synthesized-diffuse taps) virtual-speaker-encoded<br/>+ the DIRECT field summed pre-decode → ONE phonon HRTF decode,<br/>+ the mode-2 per-voice point taps (rt_direct_voices) each through<br/>their OWN IPLBinauralEffect, summed<br/>(binaural.c cardioid+pan fallback, field-only) →<br/>hard clamp ±1 → 2-ch device"]
+  DIRECT --> BINP
+  LIM --> CBOTH["cave_both: array sink + the cave_sim monitor on a<br/>second device (double-buffered handoff, engine.c)"]
   LIM --> NUL["null sink (null_sink.c): no device;<br/>keeps rendering in real time, silent"]
 ```
 

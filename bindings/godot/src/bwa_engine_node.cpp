@@ -118,12 +118,14 @@ void BwaEngine::_ready() {
 	bwa_set_spread_mode(eng, (bwa_spread_mode)spread_mode);
 	bwa_set_decorrelation(eng, decorrelation);
 	bwa_set_near_spread(eng, near_spread);
+	bwa_set_speed_of_sound(eng, speed_of_sound);
 	bwa_set_max_re(eng, max_re);
 	bwa_set_max_re_split(eng, max_re_split);
 	bwa_set_bed_renderer(eng, (bwa_bed_renderer)bed_renderer);
 	bwa_set_tracked_room_eq(eng, tracked_room_eq);
 	bwa_set_limiter(eng, limiter);
 	bwa_set_limiter_ceiling(eng, limiter_ceiling);
+	bwa_set_headphone_eq(eng, headphone_eq_on);
 	if (paused) {
 		bwa_set_paused(eng, true);
 	}
@@ -477,6 +479,7 @@ BWA_LIVE_SETTER(dual_band, bool, bwa_set_dual_band(eng, v))
 BWA_LIVE_SETTER(spread_mode, SpreadMode, bwa_set_spread_mode(eng, (bwa_spread_mode)v))
 BWA_LIVE_SETTER(decorrelation, bool, bwa_set_decorrelation(eng, v))
 BWA_LIVE_SETTER(near_spread, float, bwa_set_near_spread(eng, v))
+BWA_LIVE_SETTER(speed_of_sound, float, bwa_set_speed_of_sound(eng, v))
 BWA_LIVE_SETTER(max_re, bool, bwa_set_max_re(eng, v))
 BWA_LIVE_SETTER(max_re_split, bool, bwa_set_max_re_split(eng, v))
 BWA_LIVE_SETTER(bed_renderer, BedRenderer, bwa_set_bed_renderer(eng, (bwa_bed_renderer)v))
@@ -501,6 +504,68 @@ void BwaEngine::set_limiter_ceiling(float v) {
 	limiter_ceiling = v;
 	if (eng) {
 		bwa_set_limiter_ceiling(eng, v);
+	}
+}
+
+/* Headphone correction EQ (bwa_load_headphone_eq): an AutoEq ParametricEQ.txt applied to the
+ * final headphone stereo (binaural/cave_sim/cave_both's tap; inert in cave). Load-class — file
+ * I/O, so call it from a load path, not per frame. Empty path clears. Returns the bwa_result
+ * (0 = OK; on failure get_last_error has the reason and the previous EQ is kept). The engine is
+ * created at _ready, so load AFTER the node is in the tree; a rebuild-free live toggle rides
+ * set_headphone_eq (ramped, default on). */
+int BwaEngine::load_headphone_eq(const String &path) {
+	if (!eng) {
+		return (int)BWA_ERR_STATE;
+	}
+	if (path.is_empty()) {
+		return (int)bwa_load_headphone_eq(eng, nullptr);
+	}
+	return (int)bwa_load_headphone_eq(eng, path.utf8().get_data());
+}
+
+void BwaEngine::set_headphone_eq(bool on) {
+	headphone_eq_on = on;
+	if (eng) {
+		bwa_set_headphone_eq(eng, on);
+	}
+}
+
+/* The three FDN decay parameters are live: stage into the desc (a pre-start edit rides
+ * bwa_fdn_config at start) and forward the full triple to bwa_fdn_set_decay while running — the
+ * tail keeps ringing, only its slope changes. */
+void BwaEngine::set_fdn_rt60_low(float v) {
+	fdn.rt60_low_s = v;
+	if (eng) {
+		bwa_fdn_set_decay(eng, fdn.rt60_low_s, fdn.rt60_high_s, fdn.xover_hz);
+	}
+}
+
+void BwaEngine::set_fdn_rt60_high(float v) {
+	fdn.rt60_high_s = v;
+	if (eng) {
+		bwa_fdn_set_decay(eng, fdn.rt60_low_s, fdn.rt60_high_s, fdn.xover_hz);
+	}
+}
+
+void BwaEngine::set_fdn_xover_hz(float v) {
+	fdn.xover_hz = v;
+	if (eng) {
+		bwa_fdn_set_decay(eng, fdn.rt60_low_s, fdn.rt60_high_s, fdn.xover_hz);
+	}
+}
+
+void BwaEngine::fdn_set_decay(float rt60_low_s, float rt60_high_s, float xover_hz) {
+	if (rt60_low_s > 0.0f) {
+		fdn.rt60_low_s = rt60_low_s;
+	}
+	if (rt60_high_s > 0.0f) {
+		fdn.rt60_high_s = rt60_high_s;
+	}
+	if (xover_hz > 0.0f) {
+		fdn.xover_hz = xover_hz;
+	}
+	if (eng) {
+		bwa_fdn_set_decay(eng, fdn.rt60_low_s, fdn.rt60_high_s, fdn.xover_hz);
 	}
 }
 
@@ -547,6 +612,22 @@ void BwaEngine::scene_set_box(float w, float h, float d, const PackedInt32Array 
 		f[i] = (bwa_material)faces[i];
 	}
 	bwa_scene_set_box(eng, w, h, d, f);
+}
+
+void BwaEngine::scene_set_ground(float y, int material, bool pressure_release) {
+	if (!eng) {
+		return;
+	}
+	/* y is a Godot-world height: the plane sits AT a position, so the registration transform
+	 * applies (the box escapes this only because it takes sizes, not positions). */
+	const float room_y = (float)to_room_position(Vector3(0, y, 0)).y;
+	bwa_scene_set_ground(eng, room_y, (bwa_material)material, pressure_release);
+}
+
+void BwaEngine::scene_set_pressure_release(int face_mask) {
+	if (eng) {
+		bwa_scene_set_pressure_release(eng, (uint32_t)face_mask);
+	}
 }
 
 void BwaEngine::scene_set_mesh(const PackedVector3Array &verts, const PackedInt32Array &tris,
@@ -765,10 +846,10 @@ PackedStringArray BwaEngine::_get_configuration_warnings() const {
 					"moves from the origin. Point it at the head/camera, or turn it off to let "
 					"the engine read NatNet itself.");
 	}
-	if (!feed_listener && profile == PROFILE_BINAURAL) {
-		w.push_back("The binaural profile needs a head POSE, but Feed Listener is off — so the "
-					"pose comes from a tracker, which must be connected for the monitor to "
-					"follow the head.");
+	if (!feed_listener && profile != PROFILE_CAVE) {
+		w.push_back("The headphone profiles (Binaural/CaveSim/CaveBoth) need a head POSE, but "
+					"Feed Listener is off — so the pose comes from a tracker, which must be "
+					"connected for the render to follow the head.");
 	}
 	if (!layout_path.is_empty()) {
 		/* A failed layout load is not fatal at create: the core falls back to the 26-speaker
@@ -854,23 +935,29 @@ void BwaEngine::_bind_methods() {
 	M(group_set_paused, "group", "paused");
 	M(reverb_set_gain, "linear"); M0(get_reverb_gain);
 	M(early_reflections_set_gain, "linear"); M0(get_early_reflections_gain);
+	M(fdn_set_decay, "rt60_low_s", "rt60_high_s", "xover_hz");
 
 	M(set_panner, "panner"); M0(get_panner);
 	M(set_dual_band, "on"); M0(get_dual_band);
 	M(set_spread_mode, "mode"); M0(get_spread_mode);
 	M(set_decorrelation, "on"); M0(get_decorrelation);
 	M(set_near_spread, "radius_m"); M0(get_near_spread);
+	M(set_speed_of_sound, "meters_per_sec"); M0(get_speed_of_sound);
 	M(set_max_re, "on"); M0(get_max_re);
 	M(set_max_re_split, "on"); M0(get_max_re_split);
 	M(set_bed_renderer, "renderer"); M0(get_bed_renderer);
 	M(set_tracked_room_eq, "on"); M0(get_tracked_room_eq);
 	M(set_limiter, "on"); M0(get_limiter);
 	M(set_limiter_ceiling, "linear"); M0(get_limiter_ceiling);
+	M(load_headphone_eq, "path");
+	M(set_headphone_eq, "on"); M0(get_headphone_eq);
 
 	M(material_preset, "preset");
 	M(material_define, "absorption", "scattering", "transmission");
 	M(material_release, "token");
 	M(scene_set_box, "width", "height", "depth", "faces");
+	M(scene_set_ground, "y", "material", "pressure_release");
+	M(scene_set_pressure_release, "face_mask");
 	M(scene_set_mesh, "verts", "tris", "tri_materials");
 	M(scene_add_dynamic_mesh, "verts", "tris", "material");
 	M(scene_set_dynamic_transform, "handle", "position", "rotation");
@@ -895,7 +982,7 @@ void BwaEngine::_bind_methods() {
 	ClassDB::bind_static_method("BwaEngine", D_METHOD("room_right"), &BwaEngine::room_right);
 
 	ADD_GROUP("Device", "");
-	ADD_PROPERTY(PropertyInfo(Variant::INT, "profile", PROPERTY_HINT_ENUM, "Cave,Binaural,Both"),
+	ADD_PROPERTY(PropertyInfo(Variant::INT, "profile", PROPERTY_HINT_ENUM, "Cave,Binaural,CaveSim,CaveBoth"),
 			"set_profile", "get_profile");
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "sink", PROPERTY_HINT_ENUM, "Auto,ASIO,Null,Manual"),
 			"set_sink", "get_sink");
@@ -926,6 +1013,9 @@ void BwaEngine::_bind_methods() {
 			PropertyInfo(Variant::BOOL, "decorrelation"), "set_decorrelation", "get_decorrelation");
 	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "near_spread", PROPERTY_HINT_RANGE, "0,4,0.05"),
 			"set_near_spread", "get_near_spread");
+	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "speed_of_sound", PROPERTY_HINT_RANGE,
+						 "30,20000,1,or_greater"),
+			"set_speed_of_sound", "get_speed_of_sound");
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "bed_decoder", PROPERTY_HINT_ENUM, "AllRAD,EPAD"),
 			"set_bed_decoder", "get_bed_decoder");
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "bed_renderer", PROPERTY_HINT_ENUM, "Matrix,Parametric"),
@@ -979,7 +1069,7 @@ void BwaEngine::_bind_methods() {
 			"get_enable_pathing");
 
 	BIND_ENUM_CONSTANT(PROFILE_CAVE); BIND_ENUM_CONSTANT(PROFILE_BINAURAL);
-	BIND_ENUM_CONSTANT(PROFILE_BOTH);
+	BIND_ENUM_CONSTANT(PROFILE_CAVE_SIM); BIND_ENUM_CONSTANT(PROFILE_CAVE_BOTH);
 	BIND_ENUM_CONSTANT(SINK_AUTO); BIND_ENUM_CONSTANT(SINK_ASIO);
 	BIND_ENUM_CONSTANT(SINK_NULL); BIND_ENUM_CONSTANT(SINK_MANUAL);
 	BIND_ENUM_CONSTANT(DECODE_ALLRAD); BIND_ENUM_CONSTANT(DECODE_EPAD);

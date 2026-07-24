@@ -45,7 +45,9 @@ class BwaEngine : public Node {
 
 public:
 	/* All mirror the C enums 1:1 — the values are ABI, so do not renumber. */
-	enum Profile { PROFILE_CAVE = 0, PROFILE_BINAURAL = 1, PROFILE_BOTH = 2 };
+	/* Mirrors bwa_profile: BINAURAL is the direct per-source headphone render, CAVE_SIM the
+	 * virtual-speaker array audition, CAVE_BOTH the rig plus that sim tap. */
+	enum Profile { PROFILE_CAVE = 0, PROFILE_BINAURAL = 1, PROFILE_CAVE_SIM = 2, PROFILE_CAVE_BOTH = 3 };
 	enum Sink { SINK_AUTO = 0, SINK_ASIO = 1, SINK_NULL = 2, SINK_MANUAL = 3 };
 	enum BedDecoder { DECODE_ALLRAD = 0, DECODE_EPAD = 1 };
 	enum Panner { PAN_DBAP = 0, PAN_SPCAP = 1, PAN_VBAP = 2 };
@@ -107,12 +109,17 @@ public:
 
 	void set_enable_fdn(bool v) { fdn.enabled = v; }
 	bool get_enable_fdn() const { return fdn.enabled != 0; }
-	void set_fdn_rt60_low(float v) { fdn.rt60_low_s = v; }
+	/* The three decay parameters are LIVE: they stage into the desc (a pre-start edit configures
+	 * bwa_start) and forward to bwa_fdn_set_decay while running — the tail keeps ringing, only its
+	 * slope changes. Structure (enable, anisotropy) stays load-time. */
+	void set_fdn_rt60_low(float v);
 	float get_fdn_rt60_low() const { return fdn.rt60_low_s; }
-	void set_fdn_rt60_high(float v) { fdn.rt60_high_s = v; }
+	void set_fdn_rt60_high(float v);
 	float get_fdn_rt60_high() const { return fdn.rt60_high_s; }
-	void set_fdn_xover_hz(float v) { fdn.xover_hz = v; }
+	void set_fdn_xover_hz(float v);
 	float get_fdn_xover_hz() const { return fdn.xover_hz; }
+	/* Script-facing live retune (the room-transition knob): <= 0 keeps a parameter's value. */
+	void fdn_set_decay(float rt60_low_s, float rt60_high_s, float xover_hz);
 	void set_fdn_decay_dir(const Vector3 &v);
 	Vector3 get_fdn_decay_dir() const;
 	void set_fdn_decay_factor(float v) { fdn.decay_factor = v; }
@@ -176,6 +183,10 @@ public:
 	bool get_decorrelation() const { return decorrelation; }
 	void set_near_spread(float radius_m);
 	float get_near_spread() const { return near_spread; }
+	/* Engine-wide speed of sound (m/s; live): Doppler + reflection delays derive from it and
+	 * glide to a change. 343 air, 1480 underwater; small values exaggerate Doppler (slow motion). */
+	void set_speed_of_sound(float meters_per_sec);
+	float get_speed_of_sound() const { return speed_of_sound; }
 	void set_max_re(bool on);
 	bool get_max_re() const { return max_re; }
 	void set_max_re_split(bool on);
@@ -188,6 +199,12 @@ public:
 	bool get_limiter() const { return limiter; }
 	void set_limiter_ceiling(float linear);
 	float get_limiter_ceiling() const { return limiter_ceiling; }
+	/* Headphone correction EQ (an AutoEq ParametricEQ.txt on the headphone stereo): load after
+	 * _ready (the engine must exist); returns the bwa_result (0 = OK). "" clears. The toggle is
+	 * the ramped live A/B (default on; survives an engine restart via the replay). */
+	int load_headphone_eq(const String &path);
+	void set_headphone_eq(bool on);
+	bool get_headphone_eq() const { return headphone_eq_on; }
 
 	/* --- materials + scene geometry --- */
 	int material_preset(Material preset);
@@ -195,8 +212,17 @@ public:
 	void material_release(int token);
 	/* Shoebox room, floor-based, one material per face in order -x,+x,-y,+y,-z,+z. Captures
 	 * the box for the image-source early reflections with OR without the Steam build, so
-	 * this is the one scene call a no-SDK build still needs. Load-time only. */
+	 * this is the one scene call a no-SDK build still needs. Live-safe (a room change
+	 * re-solves the reflections next block). */
 	void scene_set_box(float w, float h, float d, const PackedInt32Array &faces);
+	/* The outdoor degenerate of the box: one horizontal mirror plane at Godot-world height y —
+	 * the ground bounce. Replaces the box (one room at a time); live-safe like it (reflections
+	 * re-solve next block). Set
+	 * pressure_release when the plane is a water surface with the listener below it. */
+	void scene_set_ground(float y, int material, bool pressure_release);
+	/* Flag box faces whose image-source reflection inverts (bit f = face f, -x,+x,-y,+y,-z,+z):
+	 * an underwater room's ceiling-as-surface is 1 << 3. Call after scene_set_box/_set_ground. */
+	void scene_set_pressure_release(int face_mask);
 	void scene_set_mesh(const PackedVector3Array &verts, const PackedInt32Array &tris,
 			const PackedInt32Array &tri_materials);
 	int scene_add_dynamic_mesh(
@@ -294,12 +320,15 @@ private:
 	SpreadMode spread_mode = SPREAD_LOBE;
 	bool decorrelation = false;
 	float near_spread = 0.0f;
+	float speed_of_sound = 343.0f;
 	bool max_re = false;
 	bool max_re_split = false;
 	BedRenderer bed_renderer = BED_MATRIX;
 	bool tracked_room_eq = true;
 	bool limiter = true;
 	float limiter_ceiling = 0.891251f;   /* -1 dBFS, linear */
+	bool headphone_eq_on = true;         /* the headphone-EQ A/B (the loaded file dies with the
+	                                      * engine; re-load after a restart, the toggle replays) */
 };
 
 } // namespace godot

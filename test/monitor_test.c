@@ -3,10 +3,13 @@
  *   - a source on a right-side speaker is louder in the right ear (and vice-versa);
  *   - a source on the median plane (x≈0) is balanced L≈R;
  *   - rotating the head 180° flips left/right;
- *   - the decode is finite and roughly energy-preserving.
+ *   - the decode is finite and roughly energy-preserving;
+ *   - the direct-binaural field (BWA_PROFILE_BINAURAL, cardioid fallback decode): laterality,
+ *     the 180° flip, median balance, and the cardioid level.
  */
 #include "binaural.h"
 #include "layout.h"
+#include "ambisonics.h"
 
 #include <math.h>
 #include <stdio.h>
@@ -29,8 +32,22 @@ static void decode_channel(Monitor* m, int ch, const float q[4]) {
     const float p[3] = { 0, 1.5f, 0 };   /* the default grid's ear point (floor origin) */
     memset(bus, 0, sizeof bus);
     for (int i = 0; i < N; ++i) bus[(size_t)ch * N + i] = 1.0f;
-    monitor_process(m, bus, p, q, out, N);
-    monitor_process(m, bus, p, q, out, N);
+    monitor_process(m, bus, NULL, p, q, out, N);
+    monitor_process(m, bus, NULL, p, q, out, N);
+}
+
+/* drive the DIRECT field with a constant-amplitude plane wave from room direction `dir` (the
+ * per-channel SH coefficients rt.c's direct solve would produce for a unit signal), silent bus. */
+static float dfield[BWA_AMBI_CH * N];
+static void decode_direct(Monitor* m, const float dir[3], const float q[4]) {
+    const float p[3] = { 0, 1.5f, 0 };
+    float y[BWA_AMBI_CH];
+    ambi_encode_phonon(dir, y);
+    memset(bus, 0, sizeof bus);
+    for (int k = 0; k < BWA_AMBI_CH; ++k)
+        for (int i = 0; i < N; ++i) dfield[(size_t)k * N + i] = y[k];
+    monitor_process(m, bus, dfield, p, q, out, N);
+    monitor_process(m, bus, dfield, p, q, out, N);
 }
 
 static int fails = 0;
@@ -77,8 +94,44 @@ int main(void) {
     decode_channel(m, right, ident);
     CHECK(isfinite(e_left()) && isfinite(e_right()) && (e_left() + e_right()) > 0.0, "output finite and audible");
 
+    /* 5. direct-binaural field (the BWA_PROFILE_BINAURAL fallback decode): a plane wave from the
+     * listener's right (-x room) favors the right ear (the cardioid there reads 0.5*(1+1) = 1, the
+     * opposed one 0), flips on a 180° turn, and balances dead ahead at the 0.5 cardioid level. */
+    const float dRight[3] = { -1.f, 0.f, 0.f }, dAhead[3] = { 0.f, 0.f, 1.f };
+    decode_direct(m, dRight, ident);
+    CHECK(e_right() > e_left() * 1.2, "direct field from the right favors the right ear");
+    decode_direct(m, dRight, yaw180);
+    CHECK(e_left() > e_right() * 1.2, "direct field: a 180° turn flips the ears");
+    decode_direct(m, dAhead, ident);
+    CHECK(fabs(e_left() - e_right()) < 0.01 * (e_left() + e_right()) + 1e-6, "direct field ahead is balanced");
+    CHECK(fabs(e_left() - (double)N * 0.5) < 0.02 * (double)N, "direct field ahead at the cardioid level");
+
+    /* 6. the bed pass-through diagonal (ambi_canon_to_phonon): a canon-basis encode times the
+     * diagonal must equal the monitor-basis encode for ANY direction — pins the (-1)^|m| x
+     * orthonormal-rescale table against the shared encode, so it cannot silently drift. */
+    {
+        const float dirs[4][3] = { { 1, 0, 0 }, { 0, 0, 1 },
+                                   { 0.5773503f, 0.5773503f, 0.5773503f }, { -0.7f, 0.14f, 0.7f } };
+        double maxerr = 0.0;
+        for (int t = 0; t < 4; ++t) {
+            float dr[3] = { dirs[t][0], dirs[t][1], dirs[t][2] };
+            const float len = sqrtf(dr[0]*dr[0] + dr[1]*dr[1] + dr[2]*dr[2]);
+            dr[0] /= len; dr[1] /= len; dr[2] /= len;
+            float a[3]; room_to_ambi(dr, a);
+            float yc[BWA_AMBI_CH], yp[BWA_AMBI_CH];
+            ambi_encode_sn3d(a, yc);
+            ambi_encode_phonon(dr, yp);
+            for (int k = 0; k < BWA_AMBI_CH; ++k) {
+                const double e = fabs((double)yc[k] * ambi_canon_to_phonon[k] - yp[k]);
+                if (e > maxerr) maxerr = e;
+            }
+        }
+        CHECK(maxerr < 1e-5, "canon->phonon diagonal matches the monitor-basis encode");
+    }
+
     monitor_destroy(m);
     if (fails) { printf("monitor_test: %d FAILURES\n", fails); return 1; }
-    printf("monitor_test OK (L/R directionality, median balance, head-rotation flip)\n");
+    printf("monitor_test OK (L/R directionality, median balance, head-rotation flip, direct-field decode, "
+           "canon->phonon diagonal)\n");
     return 0;
 }

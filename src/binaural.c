@@ -17,6 +17,9 @@ struct Monitor {
     float    spk[BWA_CHANNELS][3];           /* speaker world positions */
     float    gL[BWA_CHANNELS], gR[BWA_CHANNELS];          /* target pan gains (recomputed on pose change) */
     float    gL_cur[BWA_CHANNELS], gR_cur[BWA_CHANNELS];  /* applied gains, ramped toward the target (invariant 4) */
+    float    aL[4], aR[4];                   /* direct-field decode: per-ear cardioid coefficients on the
+                                              * first-order SH channels (W/Y/Z/X, phonon monitor basis) */
+    float    aL_cur[4], aR_cur[4];           /* applied coefficients, ramped like the pan gains */
     float    last_p[3], last_q[4];
     int      have;
     int      primed;                        /* gL_cur seeded from the first solve (no ramp up from 0) */
@@ -57,18 +60,33 @@ static void recompute(Monitor* m, const float p[3], const float q[4]) {
         m->gL[k] = sqrtf(0.5f * (1.f - lateral));   /* constant power: gL^2 + gR^2 = 1 */
         m->gR[k] = sqrtf(0.5f * (1.f + lateral));
     }
+    /* direct-field decode: an opposed cardioid per ear on the first-order channels. In the phonon
+     * monitor basis a plane wave from unit dir u carries W = s/sqrt(4pi) and (Y,Z,X) =
+     * sqrt(3/4pi)*(u_left, u_up, u_front)*s, so 0.5*(W/Y00 + e.u_channels/Y1) decodes to
+     * 0.5*(1 + e.u)*s — a cardioid aimed at ear direction e. Room ear axis -> ambi axes is the
+     * phonon map (front=-z, left=-x, up=+y). ACN order of the channels is W,Y,Z,X. */
+    static const float invY00 = 0.5f / 0.2820948f, invY1 = 0.5f / 0.4886025f;
+    const float eR[3] = { -hr[2], -hr[0], hr[1] };            /* right ear (ambi frame: front,left,up) */
+    m->aR[0] = invY00;
+    m->aR[1] = invY1 * eR[1];   /* ACN1 = Y (left)  */
+    m->aR[2] = invY1 * eR[2];   /* ACN2 = Z (up)    */
+    m->aR[3] = invY1 * eR[0];   /* ACN3 = X (front) */
+    m->aL[0] = invY00;
+    m->aL[1] = -m->aR[1]; m->aL[2] = -m->aR[2]; m->aL[3] = -m->aR[3];   /* opposed: e_L = -e_R */
     memcpy(m->last_p, p, sizeof m->last_p);
     memcpy(m->last_q, q, sizeof m->last_q);
     m->have = 1;
 }
 
-void monitor_process(Monitor* m, const float* bus, const float p[3], const float q[4],
-                     float* out, uint32_t n) {
+void monitor_process(Monitor* m, const float* bus, const float* direct16,
+                     const float p[3], const float q[4], float* out, uint32_t n) {
     if (!m->have || memcmp(m->last_p, p, sizeof m->last_p) || memcmp(m->last_q, q, sizeof m->last_q))
         recompute(m, p, q);
     if (!m->primed) {                               /* seed the applied gains from the first solve (no ramp from 0) */
         memcpy(m->gL_cur, m->gL, sizeof m->gL_cur);
         memcpy(m->gR_cur, m->gR, sizeof m->gR_cur);
+        memcpy(m->aL_cur, m->aL, sizeof m->aL_cur);
+        memcpy(m->aR_cur, m->aR, sizeof m->aR_cur);
         m->primed = 1;
     }
     float* L = out;
@@ -82,6 +100,17 @@ void monitor_process(Monitor* m, const float* bus, const float p[3], const float
         const float dgr = (m->gR[k] - gr) * inv_n;
         for (uint32_t i = 0; i < n; ++i) { L[i] += gl * src[i]; R[i] += gr * src[i]; gl += dgl; gr += dgr; }
         m->gL_cur[k] = m->gL[k]; m->gR_cur[k] = m->gR[k];        /* land exactly */
+    }
+    if (direct16) {                                 /* direct-binaural field: per-ear cardioids on W/Y/Z/X,
+                                                     * coefficients ramped like the pan (invariant 4) */
+        for (int k = 0; k < 4; ++k) {
+            const float* src = direct16 + (size_t)k * n;
+            float al = m->aL_cur[k], ar = m->aR_cur[k];
+            const float dal = (m->aL[k] - al) * inv_n;
+            const float dar = (m->aR[k] - ar) * inv_n;
+            for (uint32_t i = 0; i < n; ++i) { L[i] += al * src[i]; R[i] += ar * src[i]; al += dal; ar += dar; }
+            m->aL_cur[k] = m->aL[k]; m->aR_cur[k] = m->aR[k];    /* land exactly */
+        }
     }
     /* Debug monitor: summing 26 virtual speakers into 2 channels is not level-calibrated
      * (the production Steam Audio decode normalizes). Clamp to keep the device in range. */

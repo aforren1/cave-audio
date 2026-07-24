@@ -60,7 +60,8 @@ int main(int argc, char** argv) {
 
     /* ---- load time: these may block, allocate, and touch disk ---- */
     bwa_desc cfg = { 0 };
-    cfg.profile        = BWA_PROFILE_BINAURAL;  /* desk profile: 26-ch bus -> HRTF -> stereo */
+    cfg.profile        = BWA_PROFILE_BINAURAL;  /* desk profile: direct per-source HRTF -> stereo
+                                                 * (BWA_PROFILE_CAVE_SIM auditions the array instead) */
     cfg.sample_rate    = 48000;
     cfg.block_size     = 256;
     cfg.asio_driver    = driver;                /* NULL = auto-pick by channel count */

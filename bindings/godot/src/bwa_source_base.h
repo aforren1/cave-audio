@@ -66,6 +66,8 @@ public:
 	bool get_air_absorption() const { return air_absorption; }
 	void set_loudness_comp(bool on);
 	bool get_loudness_comp() const { return loudness_comp; }
+	void set_proximity(bool on);
+	bool get_proximity() const { return proximity; }
 	/* ref_dist <= 0 clears the override and returns the source to the layout's curve. */
 	void set_attenuation_override(float ref_dist, float rolloff, float min_gain);
 
@@ -136,6 +138,7 @@ private:
 	bool doppler = false;
 	bool air_absorption = false;
 	bool loudness_comp = false;
+	bool proximity = false;
 
 	bool occlusion = false;
 	bool orientation_follows_node = false;

@@ -73,7 +73,55 @@ int main(void) {
     bad.valid = 1; bad.w = 0.f; bad.h = 3.f; bad.d = 3.f;
     CHECK(ism_images(&bad, src, img) == 0, "a zero-width room produces no images");
 
+    /* pressure-release face (bwa_scene_set_pressure_release): the flagged face NEGATES its pressure
+     * coefficient — every band — while the geometry and the other faces stay put. The damping ratio
+     * (high/mid) the renderer derives stays POSITIVE (both bands flip together). */
+    memset(&r, 0, sizeof r);
+    r.w = 10.f; r.h = 4.f; r.d = 8.f; r.valid = 1;
+    for (int f = 0; f < ISM_FACES; ++f) {
+        r.absorb[f][0] = 0.2f; r.absorb[f][1] = 0.3f; r.absorb[f][2] = 0.6f;
+    }
+    r.press[3] = 1;                                       /* +y: the ceiling is a water surface from below */
+    n = ism_images(&r, src, img);
+    CHECK(n == ISM_IMAGES, "pressure-release room still mirrors all six faces");
+    CHECK(fabsf(img[3].refl[0] + sqrtf(0.8f)) < 1e-5f, "pressure-release face: low band negated");
+    CHECK(fabsf(img[3].refl[1] + sqrtf(0.7f)) < 1e-5f, "pressure-release face: mid band negated");
+    CHECK(fabsf(img[3].refl[2] + sqrtf(0.4f)) < 1e-5f, "pressure-release face: high band negated");
+    CHECK(img[3].refl[2] / img[3].refl[1] > 0.f,       "both bands flip together: the damping ratio stays positive");
+    CHECK(fabsf(img[2].refl[1] - sqrtf(0.7f)) < 1e-5f, "unflagged faces keep their positive coefficient");
+    CHECK(fabsf(img[3].pos[1] - 6.5f) < 1e-4f,         "polarity does not move the image");
+
+    /* ground mode (bwa_scene_set_ground): ONE horizontal mirror at ground_y, no box, no inside test.
+     * The plane's absorption + polarity live in face slot 2. */
+    IsmRoom g; memset(&g, 0, sizeof g);
+    g.plane_only = 1; g.ground_y = 0.f; g.valid = 1;
+    g.absorb[2][0] = 0.1f; g.absorb[2][1] = 0.2f; g.absorb[2][2] = 0.4f;
+    const float s2[3] = { 2.f, 1.5f, -3.f };
+    n = ism_images(&g, s2, img);
+    CHECK(n == 1, "ground mode produces exactly one image");
+    CHECK(fabsf(img[0].pos[0] - 2.f) < 1e-6f && fabsf(img[0].pos[2] + 3.f) < 1e-6f,
+          "the ground image keeps x/z");
+    CHECK(fabsf(img[0].pos[1] + 1.5f) < 1e-6f, "the ground image mirrors below the plane");
+    CHECK(fabsf(img[0].refl[0] - sqrtf(0.9f)) < 1e-5f &&
+          fabsf(img[0].refl[1] - sqrtf(0.8f)) < 1e-5f &&
+          fabsf(img[0].refl[2] - sqrtf(0.6f)) < 1e-5f, "the plane uses face slot 2's absorption");
+
+    /* the plane mirrors from EITHER side (an elevated plane, source below = a submerged source
+     * under the water surface), and w/h/d stay unused in plane mode */
+    g.ground_y = 2.f;
+    const float s3[3] = { 0.f, 0.5f, 0.f };
+    n = ism_images(&g, s3, img);
+    CHECK(n == 1 && fabsf(img[0].pos[1] - 3.5f) < 1e-6f,
+          "a source below an elevated plane mirrors above it (2*2 - 0.5)");
+
+    /* the pressure-release water surface: same mirror, inverted polarity */
+    g.press[2] = 1;
+    n = ism_images(&g, s3, img);
+    CHECK(n == 1 && img[0].refl[1] < 0.f && fabsf(img[0].refl[1] + sqrtf(0.8f)) < 1e-5f,
+          "a pressure-release plane inverts the reflection (Lloyd's mirror)");
+
     if (fails) { printf("ism_test: %d FAILURES\n", fails); return 1; }
-    printf("ism_test OK (six mirrors, per-axis geometry, pressure coefficients, outside/degenerate guards)\n");
+    printf("ism_test OK (six mirrors, per-axis geometry, pressure coefficients, outside/degenerate guards, "
+           "pressure-release polarity, ground plane)\n");
     return 0;
 }

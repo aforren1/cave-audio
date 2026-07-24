@@ -27,9 +27,9 @@
  * permutation, defined once as an index table so forward and inverse cannot diverge. Gather:
  * a[i] = d[BWA_ROOM2AMBI[i]]; the inverse scatters back. `d` must already be a unit room direction.
  * Consumers: the bed/AllRAD/EPAD/FDN decode builds (forward), the parametric bed's DOA unpack
- * (inverse), and bed_rot_ambi's rotation conjugation (rt.c, raw table). NOTE: steam_decode.c's
- * room_to_ambi_dir is a DELIBERATELY different (phonon net-AmbiX, negated: front=-z, left=-x)
- * convention — do NOT route it through here; merging mirrors the HRTF field. */
+ * (inverse), and bed_rot_ambi's rotation conjugation (rt.c, raw table). NOTE: the monitor paths
+ * (ambi_encode_phonon below) use a DELIBERATELY different (phonon net-AmbiX, negated: front=-z,
+ * left=-x) convention — do NOT route them through here; merging mirrors the HRTF field. */
 static const int BWA_ROOM2AMBI[3] = { 2, 0, 1 };
 static inline void room_to_ambi(const float d[3], float a[3]) {
     for (int i = 0; i < 3; ++i) a[i] = d[BWA_ROOM2AMBI[i]];
@@ -70,6 +70,19 @@ void ambi_max_re_weights(int order, float w[BWA_AMBI_CH]);
  * indices; l = 0 is always identity) for the 3x3 direction rotation R (ambi axes, field convention:
  * applying M to an encoded plane wave from d yields the encode of R*d). Normalization-agnostic:
  * rotation mixes only within one degree l, and SN3D/N3D differ by a per-l scale. */
+/* MONITOR-basis encode: room direction -> the orthonormal real SH phonon decodes, in the phonon
+ * net-AmbiX axis convention (front=-z_room, left=-x_room, up=+y_room). This is the DELIBERATELY
+ * different convention the NOTE above warns about, as one shared function: steam_decode.c's
+ * virtual-speaker matrix and rt.c's direct-binaural bus (the BWA_PROFILE_BINAURAL per-voice encode)
+ * both use it, so their contributions sum in one consistent field. binaural.c's no-SDK fallback
+ * decodes the same basis. Do NOT route through room_to_ambi/ambi_encode_sn3d directly for monitor
+ * content — a convention mismatch mirrors the HRTF field (see steam_decode.c CONVENTION 2b). */
+void ambi_encode_phonon(const float room_dir[3], float y[BWA_AMBI_CH]);
+/* Per-channel diagonal taking an engine-canonical ACN/SN3D FIELD into that same monitor basis
+ * ((-1)^|m| axis flip x the orthonormal rescale) — the beds' SH->SH pass in the direct-binaural
+ * render. See ambisonics.c for the derivation. */
+extern const float ambi_canon_to_phonon[BWA_AMBI_CH];
+
 #define BWA_SH_ROT_N 83
 void ambi_rot_matrix(const float R[3][3], float M[BWA_SH_ROT_N]);
 /* Apply M to an ACN SH vector of nch channels (4/9/16; blocks past nch untouched). out != sh. */

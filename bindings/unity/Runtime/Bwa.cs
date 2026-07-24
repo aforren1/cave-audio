@@ -17,7 +17,10 @@ using System.Runtime.InteropServices;
 
 namespace BwAudio
 {
-    public enum BwaProfile : int { Cave = 0, Binaural = 1, Both = 2 }
+    // Cave drives the array; Binaural is the direct per-source headphone render (full pose);
+    // CaveSim auditions the array render on headphones (virtual speakers, DBAP artifacts included);
+    // CaveBoth is the rig plus the CaveSim tap. Maps 1:1 to bwa_profile in bw_audio.h.
+    public enum BwaProfile : int { Cave = 0, Binaural = 1, CaveSim = 2, CaveBoth = 3 }
     public enum BwaDirectivity : int { Omni = 0, Cardioid = 1, Figure8 = 2 }
     public enum BwaTestKind : int { Off = 0, Sine = 1, Noise = 2 }
     public enum BwaPanner : int { Dbap = 0, Spcap = 1, Vbap = 2 }
@@ -236,6 +239,18 @@ namespace BwAudio
         [DllImport(DLL, CallingConvention = CC)] public static extern void bwa_material_release(IntPtr e, uint token);
         [DllImport(DLL, CallingConvention = CC)] public static extern void bwa_scene_set_mesh_mat(IntPtr e, float[] verts, int nverts, int[] tris, int ntris, uint[] triMaterial);
         [DllImport(DLL, CallingConvention = CC)] public static extern void bwa_scene_set_box(IntPtr e, float w, float h, float d, uint[] faces);
+        // The outdoor degenerate of the box: ONE horizontal mirror plane at height y (room metres) — the
+        // ground bounce, the dominant early reflection when there is no room. Replaces any prior box
+        // (one room at a time); live-safe like the box (reflections re-solve next block); works with and
+        // without the Steam build.
+        // pressureRelease flips the reflection's polarity — set it when the "ground" is a water surface
+        // and the listener is under it (the Lloyd's-mirror comb).
+        [DllImport(DLL, CallingConvention = CC)] public static extern void bwa_scene_set_ground(IntPtr e, float y, uint mat, [MarshalAs(UnmanagedType.I1)] bool pressureRelease);
+        // Flag box faces whose image-source reflection NEGATES (bit f = face f, -x,+x,-y,+y,-z,+z order):
+        // reflecting off a much softer medium inverts (an underwater room's ceiling = the surface:
+        // 1u << 3). ISM only — occlusion/reverb keep the face's material. Call AFTER set_box/set_ground;
+        // a later room call resets every face.
+        [DllImport(DLL, CallingConvention = CC)] public static extern void bwa_scene_set_pressure_release(IntPtr e, uint faceMask);
         // Dynamic (movable) occluders/reflectors — an instanced sub-scene placed by a rigid transform, so
         // moving it is a cheap BVH refit (physics-collider-with-a-transform). add returns a handle >= 0 or
         // -1; geometry is in the mover's LOCAL space (room handedness), placed with set_dynamic_transform.
@@ -267,6 +282,10 @@ namespace BwAudio
         // bwa_create and bwa_start). Decay is a DESIGN parameter — do not copy the room's measured RT60;
         // the real room adds its own on top.
         [DllImport(DLL, CallingConvention = CC)] public static extern void bwa_fdn_config(IntPtr e, in BwaFdnDesc cfg);
+        // LIVE decay retune — the room-transition knob: the tail keeps ringing, only its slope changes
+        // (the FDN ramps its loss gains over ~5 ms). <= 0 keeps a parameter's current value; before
+        // Start it just updates the staged config, so call it unconditionally on a scene change.
+        [DllImport(DLL, CallingConvention = CC)] public static extern void bwa_fdn_set_decay(IntPtr e, float rt60LowS, float rt60HighS, float xoverHz);
 
         // ---- image-source EARLY reflections (per source; no SDK needed) ----
         // The other half of the phonon-free acoustics path: the FDN renders the late diffuse tail, this
@@ -283,6 +302,15 @@ namespace BwAudio
         // Equal-loudness distance compensation: an LF shelf tracking the panner's attenuation ("far, not
         // tinny"). A perceptual stylization, not physics — leave off for strict realism.
         [DllImport(DLL, CallingConvention = CC)] public static extern void  bwa_source_set_loudness_comp(IntPtr e, uint s, [MarshalAs(UnmanagedType.I1)] bool on);
+        // Near-field proximity boost: an LF shelf that RISES as the source closes inside ~1 m (up to
+        // +6 dB at the head) — the spherical-wavefront proximity effect, loudness comp's near mirror:
+        // at arm's length a source reads as BASS, not just level.
+        [DllImport(DLL, CallingConvention = CC)] public static extern void  bwa_source_set_proximity(IntPtr e, uint s, [MarshalAs(UnmanagedType.I1)] bool on);
+        // Engine-wide speed of sound (m/s; default 343 = air; live). Everything rendering a propagation
+        // DELAY derives from it — Doppler (delay + pitch magnitude) and the image-source reflection
+        // delays — and a change GLIDES every delay to its new target (bends, never steps). 1480 =
+        // underwater; small values exaggerate Doppler for slow motion. Clamped to [30, 20000].
+        [DllImport(DLL, CallingConvention = CC)] public static extern void  bwa_set_speed_of_sound(IntPtr e, float metersPerSec);
         // Override the LAYOUT's distance-attenuation curve for one source: atten = clamp((refDist /
         // max(d, refDist))^rolloff, minGain, 1). rolloff 0 = constant level at any distance (a direction-only
         // cue that never fades); refDist <= 0 CLEARS the override (back to the layout curve). Applied by ratio,
@@ -298,7 +326,8 @@ namespace BwAudio
         // the listener walks. Floors spread (the larger of the two wins).
         [DllImport(DLL, CallingConvention = CC)] public static extern void  bwa_source_set_size(IntPtr e, uint s, float radiusM);
 
-        // ---- directivity ----
+        // ---- directivity (works in EVERY build: with a Steam scene the sim evaluates it; without one
+        // the audio thread evaluates the same weighted dipole per block — walk-correct either way) ----
         [DllImport(DLL, CallingConvention = CC)] public static extern void  bwa_source_set_orientation(IntPtr e, uint s, float qx, float qy, float qz, float qw);
         [DllImport(DLL, CallingConvention = CC)] public static extern void  bwa_source_set_directivity(IntPtr e, uint s, float weight, float power);
         [DllImport(DLL, CallingConvention = CC)] public static extern void  bwa_source_set_directivity_preset(IntPtr e, uint s, BwaDirectivity pattern);
@@ -349,6 +378,13 @@ namespace BwAudio
         [DllImport(DLL, CallingConvention = CC)] public static extern void bwa_set_near_spread(IntPtr e, float radiusM);
         [DllImport(DLL, CallingConvention = CC)] public static extern void bwa_set_limiter(IntPtr e, [MarshalAs(UnmanagedType.I1)] bool on);
         [DllImport(DLL, CallingConvention = CC)] public static extern void bwa_set_limiter_ceiling(IntPtr e, float linear);   // linear peak ceiling in (0..1]; default 0.891251f (-1 dBFS)
+        // Headphone correction EQ (the headphone-side align stage): parse an AutoEq ParametricEQ.txt
+        // into a biquad cascade on the final stereo of every headphone profile (binaural/cave_sim/
+        // cave_both's tap; inert in cave). Load-class (file I/O, may block — not per-frame); a parse
+        // failure returns ErrConfig, keeps the previous EQ, and bwa_last_error has the reason.
+        // null/"" clears. The bool is the ramped live A/B (default on: loading engages).
+        [DllImport(DLL, CallingConvention = CC)] public static extern BwaResult bwa_load_headphone_eq(IntPtr e, [MarshalAs(UnmanagedType.LPUTF8Str)] string path);
+        [DllImport(DLL, CallingConvention = CC)] public static extern void bwa_set_headphone_eq(IntPtr e, [MarshalAs(UnmanagedType.I1)] bool on);
         // One ramped scalar over the whole mix, applied BEFORE the per-speaker align stage (trims + the raw
         // channel-test signal stay calibrated) and before the limiter. The volume knob / scene fade. Live.
         [DllImport(DLL, CallingConvention = CC)] public static extern void bwa_set_master_gain(IntPtr e, float linear);

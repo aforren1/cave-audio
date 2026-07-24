@@ -81,6 +81,9 @@ void BwaSource::apply_all() {
 	if (loudness_comp) {
 		bwa_source_set_loudness_comp(ENG, src, true);
 	}
+	if (proximity) {
+		bwa_source_set_proximity(ENG, src, true);
+	}
 	if (occlusion) {
 		bwa_source_set_occlusion(ENG, src, true);
 	}
@@ -238,6 +241,15 @@ void BwaSource::set_loudness_comp(bool on) {
 	}
 }
 
+/* Near-field proximity boost: LF rises as the source closes inside ~1 m of the listener, so
+ * "at arm's length" reads as bass, not just level. Loudness comp's near mirror. */
+void BwaSource::set_proximity(bool on) {
+	proximity = on;
+	if (LIVE) {
+		bwa_source_set_proximity(ENG, src, on);
+	}
+}
+
 void BwaSource::set_attenuation_override(float ref_dist, float rolloff, float min_gain) {
 	/* Cached like every other standing knob (it is persistent per-source state, not a one-shot),
 	 * so a pre-ready call isn't silently dropped and apply_all() re-asserts it after a re-mint.
@@ -377,6 +389,8 @@ void BwaSource::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("get_air_absorption"), &BwaSource::get_air_absorption);
 	ClassDB::bind_method(D_METHOD("set_loudness_comp", "on"), &BwaSource::set_loudness_comp);
 	ClassDB::bind_method(D_METHOD("get_loudness_comp"), &BwaSource::get_loudness_comp);
+	ClassDB::bind_method(D_METHOD("set_proximity", "on"), &BwaSource::set_proximity);
+	ClassDB::bind_method(D_METHOD("get_proximity"), &BwaSource::get_proximity);
 	ClassDB::bind_method(D_METHOD("set_attenuation_override", "ref_dist", "rolloff", "min_gain"),
 			&BwaSource::set_attenuation_override);
 
@@ -435,6 +449,7 @@ void BwaSource::_bind_methods() {
 			"get_air_absorption");
 	ADD_PROPERTY(
 			PropertyInfo(Variant::BOOL, "loudness_comp"), "set_loudness_comp", "get_loudness_comp");
+	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "proximity"), "set_proximity", "get_proximity");
 
 	ADD_GROUP("Occlusion", "");
 	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "occlusion"), "set_occlusion", "get_occlusion");

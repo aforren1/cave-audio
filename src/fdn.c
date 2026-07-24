@@ -48,24 +48,38 @@ struct Fdn {
     /* design parameters (kept to re-derive the gains when either setter runs) */
     float    rt_low, rt_high, xover_hz;
     float    ddir[3], dfactor;    /* anisotropy: decay-time scale toward ddir */
+    /* LIVE decay retune (fdn_set_decay while the tap runs): the setter stages the three parameters
+     * atomically + bumps decay_seq; the tap re-derives target gains on a seq change and ramps
+     * g_lf/g_hf/xa there across ONE block (per-sample steps, landing exactly — invariant 4; the
+     * loss gains scale the tail signal directly, so a raw step would step the output). The plain
+     * fields above stay the LOAD-TIME view (create / set_decay_direction, never read by the tap). */
+    _Atomic float    rt_low_st, rt_high_st, xover_st;
+    _Atomic uint32_t decay_seq;
+    uint32_t decay_seen;          /* audio-thread-only */
+    float    glf_t[FDN_N], ghf_t[FDN_N], xa_t;   /* audio-thread ramp targets (derived on seq change) */
     _Atomic float gain;           /* wet return level target (written live by the control thread) */
     float    gain_cur;            /* per-block ramp state (audio-thread-only) */
 };
 
 /* Line directions use the shared fib_sphere_dir (ambisonics.h) — same float construction as allrad.c. */
 
-/* re-derive every line's band gains from (rt_low, rt_high) x the direction scale:
- * g = 10^(-3 * len / (rt60_eff * fs)), the standard FDN loss for a target decay. */
-static void fdn_gains(Fdn* f) {
+/* derive every line's band gains from (rt_low, rt_high, xover) x the direction scale:
+ * g = 10^(-3 * len / (rt60_eff * fs)), the standard FDN loss for a target decay. Writes into
+ * caller-supplied arrays so the load-time path fills the live gains and the tap fills its ramp
+ * targets from the same math. */
+static void fdn_derive(const Fdn* f, float rt_low, float rt_high, float xover_hz,
+                       float* glf, float* ghf, float* xa) {
     for (int l = 0; l < FDN_N; ++l) {
         float wdir = 0.5f + 0.5f * (f->dir[l][0]*f->ddir[0] + f->dir[l][1]*f->ddir[1] + f->dir[l][2]*f->ddir[2]);
         float scale = 1.f + (f->dfactor - 1.f) * wdir;          /* 1 away from ddir .. factor toward it */
-        float rlo = f->rt_low  * scale, rhi = f->rt_high * scale;
-        f->g_lf[l] = powf(10.f, -3.f * (float)f->len[l] / (rlo * (float)f->sample_rate));
-        f->g_hf[l] = powf(10.f, -3.f * (float)f->len[l] / (rhi * (float)f->sample_rate));
+        float rlo = rt_low  * scale, rhi = rt_high * scale;
+        glf[l] = powf(10.f, -3.f * (float)f->len[l] / (rlo * (float)f->sample_rate));
+        ghf[l] = powf(10.f, -3.f * (float)f->len[l] / (rhi * (float)f->sample_rate));
     }
-    f->xa = 1.f - expf(-6.2831853f * f->xover_hz / (float)f->sample_rate);
+    *xa = 1.f - expf(-6.2831853f * xover_hz / (float)f->sample_rate);
 }
+
+static void fdn_gains(Fdn* f) { fdn_derive(f, f->rt_low, f->rt_high, f->xover_hz, f->g_lf, f->g_hf, &f->xa); }
 
 Fdn* fdn_create(const Layout* L, uint32_t sample_rate, uint32_t channels, int bed_decoder) {
     if (!L || sample_rate == 0 || channels == 0 || channels > BWA_CHANNELS) return NULL;
@@ -114,18 +128,29 @@ Fdn* fdn_create(const Layout* L, uint32_t sample_rate, uint32_t channels, int be
     f->ddir[0] = f->ddir[1] = f->ddir[2] = 0.f; f->dfactor = 1.f;   /* uniform until configured */
     atomic_store_explicit(&f->gain, 1.f, memory_order_relaxed);
     f->gain_cur = 1.f;
+    atomic_store_explicit(&f->rt_low_st,  f->rt_low,   memory_order_relaxed);
+    atomic_store_explicit(&f->rt_high_st, f->rt_high,  memory_order_relaxed);
+    atomic_store_explicit(&f->xover_st,   f->xover_hz, memory_order_relaxed);
     fdn_gains(f);
     return f;
 }
 
 void fdn_destroy(Fdn* f) { if (f) { free(f->mem); free(f); } }
 
+/* LIVE-safe (control thread, any time): stages the clamped parameters atomically and bumps the
+ * seq; the TAP re-derives + ramps the loss gains on its next block (one-block transition — the
+ * decay morphs in ~5 ms with no step in the tail). The plain fields are updated too, but only for
+ * the load-time paths (fdn_set_decay_direction's re-derive) — the tap never reads them, and
+ * fdn_gains is NOT called here (its direct g_lf/g_hf write would race a running tap). */
 void fdn_set_decay(Fdn* f, float rt60_low_s, float rt60_high_s, float xover_hz) {
     if (!f) return;
     f->rt_low   = rt60_low_s  < 0.05f ? 0.05f : (rt60_low_s  > 30.f ? 30.f : rt60_low_s);
     f->rt_high  = rt60_high_s < 0.05f ? 0.05f : (rt60_high_s > 30.f ? 30.f : rt60_high_s);
     f->xover_hz = xover_hz < 100.f ? 100.f : (xover_hz > 0.4f * (float)f->sample_rate ? 0.4f * (float)f->sample_rate : xover_hz);
-    fdn_gains(f);
+    atomic_store_explicit(&f->rt_low_st,  f->rt_low,   memory_order_relaxed);
+    atomic_store_explicit(&f->rt_high_st, f->rt_high,  memory_order_relaxed);
+    atomic_store_explicit(&f->xover_st,   f->xover_hz, memory_order_relaxed);
+    atomic_fetch_add_explicit(&f->decay_seq, 1u, memory_order_release);
 }
 
 void fdn_set_decay_direction(Fdn* f, const float dir[3], float factor) {
@@ -163,6 +188,29 @@ void fdn_tap(void* ud, float* bus, uint32_t n, const float* lp_, const float* lq
     float re = f->re_cur;
     const int   re_fade = (re_tgt != f->re_cur);
     float (*dc_set)[FDN_N] = (f->re_cur >= 1.f) ? f->dcomb_re : f->dcomb;   /* settled matrix */
+    /* LIVE decay retune: on a seq change, re-derive the per-line loss-gain targets from the staged
+     * parameters and ramp g_lf/g_hf/xa there across THIS block, landing exactly (invariant 4 —
+     * the loss gains scale the tail signal directly). Settled blocks pay nothing. The three staged
+     * params are separate atomics, so a tap racing the setter can pair one block's low with the
+     * next's high — transient by construction, corrected on the next seq check. */
+    int dfade = 0;
+    float glf_step[FDN_N], ghf_step[FDN_N], xa_step = 0.f;
+    {
+        const uint32_t dseq = atomic_load_explicit(&f->decay_seq, memory_order_acquire);
+        if (dseq != f->decay_seen) {
+            f->decay_seen = dseq;
+            fdn_derive(f, atomic_load_explicit(&f->rt_low_st,  memory_order_relaxed),
+                          atomic_load_explicit(&f->rt_high_st, memory_order_relaxed),
+                          atomic_load_explicit(&f->xover_st,   memory_order_relaxed),
+                       f->glf_t, f->ghf_t, &f->xa_t);
+            dfade = 1;
+            for (int l = 0; l < FDN_N; ++l) {
+                glf_step[l] = (f->glf_t[l] - f->g_lf[l]) / (float)n;
+                ghf_step[l] = (f->ghf_t[l] - f->g_hf[l]) / (float)n;
+            }
+            xa_step = (f->xa_t - f->xa) / (float)n;
+        }
+    }
     uint32_t w = f->w;
     for (uint32_t i = 0; i < n; ++i) {
         float y[FDN_N], sum = 0.f;
@@ -194,10 +242,18 @@ void fdn_tap(void* ud, float* bus, uint32_t n, const float* lp_, const float* lq
             }
             re += re_step;
         }
+        if (dfade) {                                            /* decay retune: advance the loss gains per sample */
+            for (int l = 0; l < FDN_N; ++l) { f->g_lf[l] += glf_step[l]; f->g_hf[l] += ghf_step[l]; }
+            f->xa += xa_step;
+        }
         g += g_step;
         ++w;
     }
     f->gain_cur = g_tgt;                                        /* land exactly (same local) */
     f->re_cur   = re_tgt;
+    if (dfade) {                                                /* land the retune exactly */
+        for (int l = 0; l < FDN_N; ++l) { f->g_lf[l] = f->glf_t[l]; f->g_hf[l] = f->ghf_t[l]; }
+        f->xa = f->xa_t;
+    }
     f->w = w;
 }

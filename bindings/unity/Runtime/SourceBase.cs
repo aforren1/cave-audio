@@ -59,6 +59,10 @@ namespace BwAudio
         [Tooltip("LF shelf that tracks the distance attenuation, so a far source reads far, not THIN. " +
                  "A perceptual stylization — leave off for strict realism.")]
         public bool loudnessComp = false;
+        [Tooltip("Near-field proximity boost: LF rises as the source closes inside ~1 m of the listener " +
+                 "(up to +6 dB at the head), so 'at arm's length' reads as bass, not just level. " +
+                 "Loudness comp's near mirror.")]
+        public bool proximity = false;
 
         protected uint _src;
         protected bool _created;
@@ -153,6 +157,7 @@ namespace BwAudio
             if (doppler)       Bwa.bwa_source_set_doppler(eng, _src, true);
             if (airAbsorption) Bwa.bwa_source_set_air_absorption(eng, _src, true);
             if (loudnessComp)  Bwa.bwa_source_set_loudness_comp(eng, _src, true);
+            if (proximity)     Bwa.bwa_source_set_proximity(eng, _src, true);
             if (directivity != BwaDirectivity.Omni) ApplyDirectivity();   // fresh source defaults to omni, so skip the no-op
             SyncTransform();
             OnSourceReady();
@@ -362,6 +367,7 @@ namespace BwAudio
             Bwa.bwa_source_set_doppler(eng, _src, doppler);
             Bwa.bwa_source_set_air_absorption(eng, _src, airAbsorption);
             Bwa.bwa_source_set_loudness_comp(eng, _src, loudnessComp);
+            Bwa.bwa_source_set_proximity(eng, _src, proximity);
             ApplyDirectivity();   // always push the preset, so switching back to Omni disables it live
         }
     }

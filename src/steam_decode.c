@@ -45,31 +45,30 @@ struct SteamMonitor {
     uint32_t                   frame_size;    /* phonon frameSize == the per-block n (fixed at create) */
     float                      encode[BWA_CHANNELS][BWA_AMBI_CH];  /* fixed 26→16 SH matrix */
     float*                     ambi;          /* 16 * frame_size, planar scratch */
+    /* per-voice fleet (BWA_PROFILE_BINAURAL mode 2): one binaural effect per rt voice slot. The
+     * effect carries overlap state, so a slot RECYCLE (generation change / inactive gap) resets it
+     * before reuse — otherwise a stolen slot's tail bleeds into the next voice's first block. */
+    IPLBinauralEffect*         pv_fx;         /* pv_cap effects; NULL = no fleet */
+    uint32_t                   pv_cap;
+    uint32_t*                  pv_gen;        /* last-seen voice generation per slot */
+    uint8_t*                   pv_live;       /* slot was active last block */
+    float*                     pv_scratch;    /* 2 * frame_size, one effect's stereo out */
 };
 
-/* CONVENTION 1 — axes. Map a room-space direction (x=right, y=up, z=back) to the ambisonic
- * convention ambi_encode_sn3d expects (AmbiX: x=front, y=left, z=up). front=-z_room, left=-x_room,
- * up=+y_room. VERIFY against the linked phonon build; if the image is mirrored/rotated, this and
- * head_basis() (CONVENTION 3) are where to correct it — they must be corrected together. */
-static void room_to_ambi_dir(const float r[3], float a[3]) {
-    a[0] = -r[2];   /* front */
-    a[1] = -r[0];   /* left  */
-    a[2] =  r[1];   /* up    */
-}
-
-/* CONVENTION 2 — normalization. RESOLVED from the phonon source: iplAmbisonicsDecodeEffect takes no
- * ambisonics-type param and decodes orthonormal real SH (= N3D/sqrt(4pi); core/.../sh/spherical_harmonics.cc,
- * audio_buffer.h "N3D is used internally for everything"). Scale the SN3D encode per ACN channel by
- * ambi_phonon_scale = sqrt(2l+1)/sqrt(4pi); test_ambi verifies the product against phonon's
- * hardcoded SH constants. (Deriving the matrix from iplAmbisonicsEncodeEffect is an equivalent path.) */
-/* No m<0 sign fix-up: phonon's real-SH convention matches ambi_encode_sn3d for ALL channels (the
+/* CONVENTIONS 1 + 2 — axes and normalization, now hosted as ambi_encode_phonon (ambisonics.c) so
+ * the SDK-independent direct-binaural encode (rt.c) shares the exact function. Axes: room
+ * (x=right, y=up, z=back) -> phonon net-AmbiX (front=-z_room, left=-x_room, up=+y_room; sh.cpp
+ * convertedDirection). Normalization: iplAmbisonicsDecodeEffect takes no ambisonics-type param and
+ * decodes orthonormal real SH (= N3D/sqrt(4pi); audio_buffer.h "N3D is used internally for
+ * everything"), so the SN3D encode is scaled per ACN channel by ambi_phonon_scale =
+ * sqrt(2l+1)/sqrt(4pi); test_ambi verifies the product against phonon's hardcoded SH constants.
+ * If the image is mirrored/rotated, ambi_encode_phonon and head_basis() (CONVENTION 3) are where
+ * to correct it — they must be corrected together.
+ * No m<0 sign fix-up: phonon's real-SH convention matches ambi_encode_sn3d for ALL channels (the
  * xval golden pins the encode against phonon's own SH table, sin harmonics included). See the
  * CONVENTION 2b note above for the history — a DC-driven test once argued otherwise, wrongly. */
 static void sh_encode(const float room_dir[3], float y[BWA_AMBI_CH]) {
-    float a[3];
-    room_to_ambi_dir(room_dir, a);
-    ambi_encode_sn3d(a, y);                                          /* SN3D, AmbiX axes */
-    for (int k = 0; k < BWA_AMBI_CH; ++k) y[k] *= ambi_phonon_scale[k];  /* -> phonon orthonormal SH */
+    ambi_encode_phonon(room_dir, y);
 }
 
 /* CONVENTION 3 — head orientation frame. phonon is right-handed x=right/y=up/-z=ahead (C API
@@ -86,7 +85,7 @@ static void head_basis(const float q[4], IPLCoordinateSpace3* cs) {
 }
 
 SteamMonitor* steam_monitor_create(const Layout* L, uint32_t sample_rate, uint32_t block_size,
-                                   const char* hrtf_path) {
+                                   const char* hrtf_path, uint32_t max_voices) {
     if (!L || block_size == 0) return NULL;
     SteamMonitor* m = (SteamMonitor*)calloc(1, sizeof *m);
     if (!m) return NULL;
@@ -131,11 +130,41 @@ SteamMonitor* steam_monitor_create(const Layout* L, uint32_t sample_rate, uint32
 
     m->ambi = (float*)calloc((size_t)BWA_AMBI_CH * block_size, sizeof(float));
     if (!m->ambi) { steam_monitor_destroy(m); return NULL; }
+
+    /* per-voice fleet (mode 2): NON-FATAL — a partial/failed fleet is torn down and the monitor
+     * still works in field mode (the engine reads steam_monitor_pervoice and keeps rt in mode 1).
+     * Effects are created here on the control thread; each holds only its overlap state at this
+     * frameSize, so even the full 256-slot fleet is modest. */
+    if (max_voices) {
+        m->pv_fx      = (IPLBinauralEffect*)calloc(max_voices, sizeof *m->pv_fx);
+        m->pv_gen     = (uint32_t*)calloc(max_voices, sizeof *m->pv_gen);
+        m->pv_live    = (uint8_t*)calloc(max_voices, sizeof *m->pv_live);
+        m->pv_scratch = (float*)calloc((size_t)2 * block_size, sizeof(float));
+        int ok = m->pv_fx && m->pv_gen && m->pv_live && m->pv_scratch;
+        if (ok) {
+            IPLBinauralEffectSettings bs = { 0 };
+            bs.hrtf = m->hrtf;
+            for (uint32_t i = 0; i < max_voices; ++i)
+                if (iplBinauralEffectCreate(m->context, &as, &bs, &m->pv_fx[i]) != IPL_STATUS_SUCCESS) {
+                    for (uint32_t j = 0; j < i; ++j) iplBinauralEffectRelease(&m->pv_fx[j]);
+                    ok = 0;
+                    break;
+                }
+        }
+        if (ok) m->pv_cap = max_voices;
+        else {
+            free(m->pv_fx); free(m->pv_gen); free(m->pv_live); free(m->pv_scratch);
+            m->pv_fx = NULL; m->pv_gen = NULL; m->pv_live = NULL; m->pv_scratch = NULL;
+        }
+    }
     return m;
 }
 
-void steam_monitor_process(SteamMonitor* m, const float* bus26, const float p[3], const float q[4],
-                           float* out, uint32_t n) {
+int steam_monitor_pervoice(const SteamMonitor* m) { return m && m->pv_cap > 0; }
+
+void steam_monitor_process(SteamMonitor* m, const float* bus26, const float* direct16,
+                           const RtDirectVoice* voices, uint32_t nvoices,
+                           const float p[3], const float q[4], float* out, uint32_t n) {
     (void)p;
     if (!m || n == 0) return;
     /* phonon's effect was created for exactly frame_size samples — an off-spec device block
@@ -154,6 +183,14 @@ void steam_monitor_process(SteamMonitor* m, const float* bus26, const float p[3]
             for (uint32_t i = 0; i < n; ++i) a[i] += gk * src[i];
         }
     }
+    /* direct-binaural field (BWA_PROFILE_BINAURAL): already in this basis (rt.c encodes with the
+     * same ambi_encode_phonon), so it sums straight into the virtual-speaker field — one decode. */
+    if (direct16)
+        for (uint32_t k = 0; k < BWA_AMBI_CH; ++k) {
+            float* a = m->ambi + (size_t)k * n;
+            const float* d = direct16 + (size_t)k * n;
+            for (uint32_t i = 0; i < n; ++i) a[i] += d[i];
+        }
 
     IPLfloat32* ambiPtrs[BWA_AMBI_CH];
     for (uint32_t k = 0; k < BWA_AMBI_CH; ++k) ambiPtrs[k] = m->ambi + (size_t)k * n;
@@ -169,10 +206,50 @@ void steam_monitor_process(SteamMonitor* m, const float* bus26, const float p[3]
     head_basis(q, &params.orientation);
 
     iplAmbisonicsDecodeEffectApply(m->decode, &params, &inBuf, &outBuf);
+
+    /* per-voice point taps (mode 2): one true HRTF convolution per active voice, summed onto the
+     * field decode. Directions arrive room-frame from rt; iplCalculateRelativeDirection turns them
+     * into the listener-local frame the binaural effect expects (CONVENTION 3's head basis — one
+     * source of truth for the orientation math). A slot whose generation changed (voice recycled)
+     * or that went inactive gets its effect reset, so no stale overlap tail bleeds into a new
+     * voice. Voices fade THROUGH the rt gain ramps before deactivating, so a dropped tail is a
+     * tail of silence. */
+    if (m->pv_fx && voices) {
+        IPLCoordinateSpace3 head;
+        head_basis(q, &head);
+        const uint32_t cap = nvoices < m->pv_cap ? nvoices : m->pv_cap;
+        for (uint32_t i = 0; i < cap; ++i) {
+            const RtDirectVoice* dv = &voices[i];
+            if (!dv->active || !dv->mono) { m->pv_live[i] = 0; continue; }
+            if (!m->pv_live[i] || m->pv_gen[i] != dv->gen) {
+                iplBinauralEffectReset(m->pv_fx[i]);
+                m->pv_gen[i] = dv->gen;
+            }
+            m->pv_live[i] = 1;
+
+            IPLBinauralEffectParams bp = { 0 };
+            bp.interpolation = IPL_HRTFINTERPOLATION_BILINEAR;   /* block-rate dirs: interpolate, no snap */
+            bp.spatialBlend  = 1.0f;
+            bp.hrtf          = m->hrtf;
+            const IPLVector3 src = { dv->dir[0], dv->dir[1], dv->dir[2] };
+            const IPLVector3 org = { 0, 0, 0 };
+            bp.direction = iplCalculateRelativeDirection(m->context, src, org, head.ahead, head.up);
+
+            IPLfloat32* inPtr[1]  = { (IPLfloat32*)dv->mono };
+            IPLfloat32* sc[2]     = { m->pv_scratch, m->pv_scratch + n };
+            IPLAudioBuffer vin    = { .numChannels = 1, .numSamples = (IPLint32)n, .data = inPtr };
+            IPLAudioBuffer vout   = { .numChannels = 2, .numSamples = (IPLint32)n, .data = sc };
+            iplBinauralEffectApply(m->pv_fx[i], &bp, &vin, &vout);
+            for (uint32_t s = 0; s < n; ++s) { out[s] += sc[0][s]; out[n + s] += sc[1][s]; }
+        }
+        for (uint32_t i = cap; i < m->pv_cap; ++i) m->pv_live[i] = 0;
+    }
 }
 
 void steam_monitor_destroy(SteamMonitor* m) {
     if (!m) return;
+    for (uint32_t i = 0; i < m->pv_cap; ++i) iplBinauralEffectRelease(&m->pv_fx[i]);
+    free(m->pv_fx); free(m->pv_gen); free(m->pv_live); free(m->pv_scratch);
     if (m->decode)  iplAmbisonicsDecodeEffectRelease(&m->decode);
     if (m->hrtf)    iplHRTFRelease(&m->hrtf);
     if (m->context) iplContextRelease(&m->context);

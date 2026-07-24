@@ -75,6 +75,7 @@ add_library(bwa_core OBJECT
   src/hull.c
   src/align.c
   src/binaural.c
+  src/hpeq.c
   src/ambisonics.c
   src/allrad.c
   src/epad.c

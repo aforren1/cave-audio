@@ -2,9 +2,10 @@
  * bw_audio.h — public C ABI for the spatial audio core.
  *
  * Self-hosted native audio engine driving a 26-speaker CAVE array via ASIO/Dante,
- * with a binaural (HRTF) debug monitor. Engines (Unity/Unreal) are thin control
- * clients; no audio buffers cross this boundary — only control (sound triggers,
- * source positions, the listener pose).
+ * with binaural (HRTF) headphone rendering: a first-class direct render
+ * (BWA_PROFILE_BINAURAL) and an array-audition monitor (BWA_PROFILE_CAVE_SIM).
+ * Engines (Unity/Unreal) are thin control clients; no audio buffers cross this
+ * boundary — only control (sound triggers, source positions, the listener pose).
  *
  * Usage docs: docs/api.md — quickstart, profiles, the threading contract,
  * coordinates, error handling, environment variables, and the per-call
@@ -71,10 +72,21 @@ typedef uint32_t bwa_sound;
 typedef uint32_t bwa_source;
 typedef uint32_t bwa_bed;       /* an ambisonic-bed voice (world-locked soundfield); see bwa_bed_* */
 
+/* Render profile — WHAT the engine renders, fixed at create:
+ *   CAVE      drives the physical array. BINAURAL is the first-class headphone render: point
+ *             sources (and their ISM reflections) SH-encode at their TRUE listener-relative
+ *             directions and HRTF-decode to stereo — no speaker-array simulation in the direct
+ *             path, so none of its phantom-source spread. The diffuse layer (ambisonic beds,
+ *             the FDN/reflection tails, pathing) still rides the virtual-speaker encode.
+ *   CAVE_SIM  auditions the ARRAY RENDER on headphones: every bus channel becomes a virtual
+ *             speaker at its surveyed position, DBAP artifacts included — what the room would
+ *             do, not the best a headphone can do. CAVE_BOTH is the rig plus that sim tap.
+ * BINAURAL/CAVE_SIM open a 2-ch device; CAVE/CAVE_BOTH open the array device. */
 typedef enum {
-    BWA_PROFILE_CAVE     = 0,  /* speaker bus -> ASIO/Digiface. Listener POSITION only. */
-    BWA_PROFILE_BINAURAL = 1,  /* speaker bus -> binaural monitor -> stereo device. Full POSE. */
-    BWA_PROFILE_BOTH     = 2,  /* array to the Digiface + binaural tap to a stereo device. Full POSE. */
+    BWA_PROFILE_CAVE      = 0,  /* speaker bus -> ASIO/Digiface. Listener POSITION only. */
+    BWA_PROFILE_BINAURAL  = 1,  /* direct per-source binaural -> stereo device. Full POSE. */
+    BWA_PROFILE_CAVE_SIM  = 2,  /* speaker bus -> virtual-speaker monitor -> stereo device. Full POSE. */
+    BWA_PROFILE_CAVE_BOTH = 3,  /* array to the Digiface + the CAVE_SIM tap to a stereo device. Full POSE. */
 } bwa_profile;
 
 /* Diffuse-bed ambisonic decoder (fixed for the engine's lifetime — the decode matrix is built
@@ -93,8 +105,8 @@ typedef enum { BWA_DECODE_ALLRAD = 0, BWA_DECODE_EPAD = 1 } bwa_bed_decoder;
  * — the engine keeps rendering with no device (the tools' visual-only mode). ASIO is an explicit
  * demand: an open failure fails bwa_start loudly instead of hiding behind silence (production, or
  * a speaker audition that must reach real speakers). NULL forces the offline sink (CI, profiling,
- * tracking-only tools). bwa_get_audio_backend reports what actually opened; in binaural/both it
- * also names the monitor in use — "(steam HRTF monitor)" or "(simple-pan monitor)" — because the
+ * tracking-only tools). bwa_get_audio_backend reports what actually opened; the headphone
+ * profiles also name the decode in use — "(steam HRTF ...)" or "(simple-pan ...)" — because the
  * HRTF decode falls back to the simple pan silently and a by-ear report needs to know which ran. */
 typedef enum { BWA_SINK_AUTO = 0, BWA_SINK_ASIO = 1, BWA_SINK_NULL = 2,
                BWA_SINK_MANUAL = 3 /* no device/thread — pump blocks yourself with bwa_render_block */ } bwa_sink_type;
@@ -102,8 +114,8 @@ typedef enum { BWA_SINK_AUTO = 0, BWA_SINK_ASIO = 1, BWA_SINK_NULL = 2,
 /* Engine configuration. Zero-init and set what you need — every field's zero is its default. */
 typedef struct {
     bwa_profile    profile;
-    const char*  layout_path;   /* surveyed speaker geometry (JSON). cave/both. */
-    const char*  hrtf_path;     /* HRTF (SOFA) or NULL for built-in. binaural/both. */
+    const char*  layout_path;   /* surveyed speaker geometry (JSON). cave/cave_both. */
+    const char*  hrtf_path;     /* HRTF (SOFA) or NULL for built-in. binaural/cave_sim/cave_both. */
     uint32_t     sample_rate;   /* Hz; 0 = 48000. 48 kHz is the validated rate. The DSP is
                                  * rate-derived (96 kHz renders correctly in software), but rates
                                  * above 48 k are unverified against the real Digiface/Dante chain —
@@ -151,8 +163,9 @@ BWA_API void      bwa_destroy(bwa_engine* e);
 BWA_API const char* bwa_last_error(bwa_engine* e);
 BWA_API uint32_t    bwa_get_version(void);   /* the DLL's BWA_VERSION — check against the header's */
 /* Backend actually in use after bwa_start: "asio:<driver>", "null" (offline/SILENT), or
- * "none" (not started); binaural/both also name the monitor in use — "(steam HRTF monitor)" vs
- * "(simple-pan monitor)". Human-readable (logs/HUDs); program logic wants bwa_get_sink_type. */
+ * "none" (not started); the headphone profiles also name the decode in use — "(steam HRTF
+ * direct)" / "(simple-pan direct)" for BINAURAL, "(steam HRTF sim)" / "(simple-pan sim)" for
+ * CAVE_SIM/CAVE_BOTH. Human-readable (logs/HUDs); program logic wants bwa_get_sink_type. */
 BWA_API const char* bwa_get_audio_backend(bwa_engine* e);
 /* The RESOLVED engine config (zero-defaulted desc fields resolved), valid from bwa_create on.
  * Derive time from these — seconds = frames / bwa_get_sample_rate(e) — not from the desc you
@@ -422,12 +435,32 @@ BWA_API void     bwa_scene_set_mesh_mat(bwa_engine* e, const float* verts, int n
  * (floor) to h — one material per face. faces[6] = (-x,+x,-y,+y,-z,+z), each a bwa_material token
  * (0 = default); triangle normals face inward. Works WITH and WITHOUT the Steam build: it feeds the
  * ray-traced scene (SDK) and ALWAYS captures the box for the image-source early reflections.
- * Load-time ONLY (the ISM handoff assumes the audio thread isn't running yet).
+ * LIVE-safe: the ISM capture publishes to the audio thread lock-free and each opted-in source
+ * re-solves its images next block (gains ramp, delays glide — a room change bends, not clicks);
+ * with the SDK a live call also pays set_mesh_mat's BVH rebuild.
  * It IS a bwa_scene_set_mesh_mat call, so it REPLACES the static mesh — the box and your own
  * geometry are alternatives, not layers; to keep both, call set_box first then ONE set_mesh_mat
  * carrying the box's 12 inward triangles plus yours. Why (the half-way drop): docs/api.md,
  * "Materials and scene geometry". */
 BWA_API void     bwa_scene_set_box(bwa_engine* e, float w, float h, float d, const bwa_material faces[6]);
+/* The OUTDOOR degenerate of the box: one horizontal mirror plane at height y (room metres) — the
+ * ground bounce, the dominant early reflection when there is no room around you. Same dual capture
+ * as the box: the image-source reflections get the plane (every build), the ray-traced scene (SDK)
+ * gets a large ground quad. REPLACES any prior box (one room at a time; last call wins), and like
+ * the box it is live-safe (a mid-scene call re-solves the reflections next block — the submerge
+ * transition). pressure_release flips the reflection's polarity — a boundary into
+ * a much SOFTER medium reflects inverted (the underside of a water surface: y = the surface height,
+ * a submerged listener, and the ground bounce becomes the Lloyd's-mirror comb that makes near-
+ * surface sources sound thin). For ordinary ground, pass false. */
+BWA_API void     bwa_scene_set_ground(bwa_engine* e, float y, bwa_material mat, bool pressure_release);
+/* Flag box faces as pressure-release boundaries (bit f = face f in the set_box order
+ * -x,+x,-y,+y,-z,+z): that face's image-source reflection NEGATES — the physics of reflecting off
+ * a much softer medium (air, seen from water: reflection coefficient ~ -1). The flagship case is a
+ * virtual underwater room whose ceiling is the surface: mask 1u<<3 (+y). Only the image-source
+ * renderer is affected (polarity is a specular concept); the ray-traced scene keeps the face's
+ * material for occlusion/reverb. Call AFTER set_box/set_ground (it flags the captured room);
+ * live-safe, like the room itself. A later set_box/set_ground resets every face to normal. */
+BWA_API void     bwa_scene_set_pressure_release(bwa_engine* e, uint32_t face_mask);
 
 /* Dynamic (movable) occluders/reflectors — the acoustic analogue of a physics collider with a
  * transform. The static mesh above is committed once (BVH built once); a dynamic mesh is a rigid
@@ -502,7 +535,8 @@ BWA_API void     bwa_set_reverb_gain(bwa_engine* e, float linear);
  * special case of the Directional FDN (Alary/Politis/Schlecht, JAES 2019). Enabling it takes the
  * reverb tap INSTEAD of the Steam bed (one reverb bed at a time); works in no-SDK builds — the
  * playground's reverb scene runs without phonon. Load-time (between bwa_create and bwa_start);
- * zero fields take the defaults; the wet level is bwa_set_reverb_gain (live, default 1). */
+ * zero fields take the defaults; the wet level is bwa_set_reverb_gain (live, default 1) and the
+ * DECAY is live-retunable after start via bwa_fdn_set_decay below. */
 typedef struct {
     int      enabled;        /* 0 = no FDN created (the default) */
     float    rt60_low_s;     /* low-band decay time; 0 -> default 1.2 */
@@ -514,6 +548,15 @@ typedef struct {
     uint32_t reserved[3];    /* zero; reserved so the struct can grow without an ABI break */
 } bwa_fdn_desc;
 BWA_API void     bwa_fdn_config(bwa_engine* e, const bwa_fdn_desc* cfg);
+/* LIVE decay retune — the acoustic character knob that works while the engine runs: the FDN ramps
+ * its per-line loss gains to the new decay across one block (~5 ms), so the tail keeps ringing and
+ * only its slope changes (no click, no restart). This is what a room TRANSITION sounds like:
+ * stepping into a cathedral, submerging (long low band, short high band), leaving for open air
+ * (both short) — pair it with bwa_set_reverb_gain for the wet level. <= 0 keeps a parameter's
+ * current value. Pre-start it updates the staged config (call it unconditionally); after start it
+ * needs the FDN enabled (bwa_last_error otherwise). Decay clamps to [0.05, 30] s, the crossover to
+ * [100, 0.4*rate] Hz. Control thread. */
+BWA_API void     bwa_fdn_set_decay(bwa_engine* e, float rt60_low_s, float rt60_high_s, float xover_hz);
 
 /* ---- image-source EARLY reflections (per source; no SDK needed) ----
  * The other half of a phonon-free acoustics path: the FDN above renders the late diffuse tail, this
@@ -546,16 +589,19 @@ BWA_API void     bwa_source_set_pathing(bwa_engine* e, bwa_source s, bool on);
 /* Read the source's current occlusion factor (1 = clear .. 0 = fully blocked) — for HUD/diagnostics. */
 BWA_API float    bwa_source_get_occlusion(bwa_engine* e, bwa_source s);
 
-/* ---- directivity (control thread; needs the Steam Audio build) ----
+/* ---- directivity (control thread; works in EVERY build) ----
  * Source radiation pattern. Sources are omni by default; set a weighted-dipole pattern + the
  * source's forward orientation, and a listener off the source's forward axis hears it attenuated.
- * Independent of occlusion (a source can be directional without being occluded). */
+ * Independent of occlusion (a source can be directional without being occluded). Two renderers,
+ * same |(1-w) + w cos(theta)|^p model: WITH the Steam scene the occlusion sim evaluates it
+ * (~10-30 Hz, published + ramped); without a scene (or without the SDK at all) the audio thread
+ * evaluates it per block from the same forward axis — walk-correct in both. */
 typedef enum { BWA_DIR_OMNI = 0, BWA_DIR_CARDIOID = 1, BWA_DIR_FIGURE8 = 2 } bwa_directivity;
 /* Source orientation as a quaternion (same room frame + handedness as bwa_set_listener_pose); the
- * dipole axis is the source's forward (+z rotated by q). Per-frame-safe. No-op without the SDK. */
+ * dipole axis is the source's forward (+z rotated by q). Per-frame-safe. */
 BWA_API void     bwa_source_set_orientation(bwa_engine* e, bwa_source s, float qx, float qy, float qz, float qw);
 /* Radiation pattern: weight 0=omni (off) .. 0.5=cardioid .. 1=figure-8; power>=1 sharpens the lobe.
- * Per-frame-safe. No-op without the Steam Audio backend. */
+ * Per-frame-safe. */
 BWA_API void     bwa_source_set_directivity(bwa_engine* e, bwa_source s, float weight, float power);
 /* Named-preset sugar over bwa_source_set_directivity (OMNI disables it). */
 BWA_API void     bwa_source_set_directivity_preset(bwa_engine* e, bwa_source s, bwa_directivity pattern);
@@ -579,6 +625,19 @@ BWA_API void     bwa_source_set_air_absorption(bwa_engine* e, bwa_source s, bool
  * "far, not tinny". A perceptual stylization, not physics; leave it off for strict realism. Direct
  * path only (like air/Doppler); ramped; per-frame-safe. */
 BWA_API void     bwa_source_set_loudness_comp(bwa_engine* e, bwa_source s, bool on);
+/* Near-field proximity boost: an LF shelf that RISES as the source closes inside ~1 m — the
+ * spherical-wavefront proximity effect, and the near mirror of loudness comp above (that one
+ * restores body far away). In a walkable volume this is the missing half of distance: "at arm's
+ * length" should read as bass, not just level (0 dB at 1 m, up to +6 dB at the head; ~300 Hz
+ * corner). Direct path only; ramped; per-frame-safe. */
+BWA_API void     bwa_source_set_proximity(bwa_engine* e, bwa_source s, bool on);
+/* Engine-wide speed of sound (m/s; default 343 — air). Everything that renders a propagation DELAY
+ * derives from it: Doppler (delay AND pitch-shift magnitude) and the image-source reflection
+ * delays. Live + per-frame-safe: a change glides every delay to its new target (bends, never
+ * steps). Underwater is 1480; small values exaggerate Doppler for slow-motion effects, saturating
+ * against each delay ring's capacity (~40 ms at 48 k) — clamped to [30, 20000]. The Steam sim's
+ * ray clock is phonon's own and does not follow this. */
+BWA_API void     bwa_set_speed_of_sound(bwa_engine* e, float meters_per_sec);
 /* Override the LAYOUT's distance-attenuation curve for one source (mono point sources; a bed has
  * no distance). Same formula as the layout knob: atten = clamp((ref/max(d,ref))^rolloff, min, 1),
  * with d the source→primary-listener distance. rolloff 0 = constant level at any distance (a
@@ -612,8 +671,10 @@ BWA_API void     bwa_source_set_size(bwa_engine* e, bwa_source s, float radius_m
  * stage (a raw value straight on the channel) — a speaker-check / wiring-verification / calibration
  * tool, NOT a spatial path (it bypasses the panner; don't use it to "place" audio). `channel` is in
  * [0, bwa_get_channel_count()). Per-frame-safe, next block, no bwa_commit needed; multiple channels at once.
- * gain 0 or BWA_TEST_OFF silences a channel. Composes with the profiles: cave/both -> a raw tone on
- * that Digiface channel/speaker; binaural -> that bus channel HRTF'd as its virtual speaker. */
+ * gain 0 or BWA_TEST_OFF silences a channel. Composes with the profiles: cave/cave_both -> a raw
+ * tone on that Digiface channel/speaker; the headphone profiles -> that bus channel HRTF'd as its
+ * virtual speaker (in BINAURAL the test tone rides the diffuse/virtual-speaker path — only point
+ * SOURCES render direct). */
 typedef enum { BWA_TEST_OFF = 0, BWA_TEST_SINE = 1, BWA_TEST_NOISE = 2 } bwa_test_kind;
 BWA_API void     bwa_set_test_signal(bwa_engine* e, uint32_t channel, bwa_test_kind kind, float gain);
 
@@ -638,7 +699,7 @@ BWA_API uint32_t bwa_get_active_voices(bwa_engine* e);
  * Tap the FINAL device-bound output — post-limiter, exactly what reaches the device. The callback runs
  * on the AUDIO thread, once per block, with PLANAR channel-major data: `planar[c*nframes + i]` is
  * channel c, sample i. `channels` is the PRIMARY device's channel count — the array count
- * (bwa_get_channel_count) for the 'cave' and 'both' profiles, 2 for 'binaural'. Obey the audio-thread
+ * (bwa_get_channel_count) for cave/cave_both, 2 for binaural/cave_sim. Obey the audio-thread
  * rules: copy out only, no alloc/lock/syscall/file I/O (write to a ring your OWN thread drains to a
  * file/buffer). Pass cb = NULL to stop; keep `user` alive until after the NULL set plus one block.
  * Run the engine on the offline null sink (bwa_desc.sink = BWA_SINK_NULL) for a hardware-free,
@@ -651,7 +712,7 @@ BWA_API void bwa_set_output_capture(bwa_engine* e, bwa_output_fn cb, void* user)
 /* ---- offline / deterministic render (bwa_desc.sink = BWA_SINK_MANUAL) ----
  * With a MANUAL sink, no device or audio thread is created; YOU pump one block at a time on your own
  * thread. Each call renders exactly one block (bwa_desc.block_size frames) of the profile's primary
- * output — binaural: 2 ch; cave/both: bwa_get_channel_count() ch — into engine-owned memory and returns
+ * output — binaural/cave_sim: 2 ch; cave/cave_both: bwa_get_channel_count() ch — into engine-owned memory and returns
  * a pointer to it (PLANAR, `channels * nframes` floats, `p[c*nframes + i]`), valid until the next call
  * or bwa_stop. Fills *channels / *nframes (either may be NULL). Returns NULL if the engine isn't started
  * or the sink isn't MANUAL. The timestamp is a pure sample counter (no wall clock), so a fixed input +
@@ -729,6 +790,23 @@ BWA_API void     bwa_set_near_spread(bwa_engine* e, float radius_m);
 BWA_API void     bwa_set_limiter(bwa_engine* e, bool on);
 BWA_API void     bwa_set_limiter_ceiling(bwa_engine* e, float linear);   /* peak amplitude ceiling, linear in (0..1]; default 0.891251f (-1 dBFS). A value >1 clamps to 1; <=0 is ignored. */
 
+/* ---- headphone correction EQ (the headphone-side align stage) ----
+ * Corrects the TRANSDUCER, not the render: an AutoEq-style parametric EQ file
+ * (ParametricEQ.txt — "Preamp: -6.4 dB" + "Filter N: ON PK Fc 105 Hz Gain -4.6 dB Q 0.70";
+ * PK/LSC/HSC map onto the engine's RBJ biquads) is parsed into a cascade applied to the final
+ * device-bound STEREO of every headphone profile (binaural, cave_sim, cave_both's monitor tap)
+ * — after the HRTF decode, before the output clamp. The array render never sees it (speakers
+ * get the per-speaker align stage instead); in the cave profile it is inert. AutoEq
+ * (github.com/jaakkopasanen/AutoEq) publishes corrections for thousands of headphone models;
+ * the Preamp line is honored — corrections boost dips, and the preamp is the headroom that
+ * keeps them out of the clamp.
+ * bwa_load_headphone_eq parses + swaps in click-free (a running correction ramps out, the new
+ * one ramps in); NULL or "" clears. Load-class: file I/O, may block — not per-frame. A parse
+ * failure returns BWA_ERR_CONFIG with the reason in bwa_last_error and KEEPS the previous EQ.
+ * bwa_set_headphone_eq is the ramped live A/B (default ON: loading engages). Per-frame-safe. */
+BWA_API bwa_result bwa_load_headphone_eq(bwa_engine* e, const char* path);
+BWA_API void       bwa_set_headphone_eq(bwa_engine* e, bool on);
+
 /* Select how ambisonic BEDS render (live: each bed crossfades to the selection — a click-free A/B).
  * MATRIX (default) is the static SH->speaker decode (AllRAD or EPAD per bwa_desc.bed_decoder) — cheap,
  * world-locked, sweet-spot-ish. PARAMETRIC analyzes the bed's first-order channels per frequency
@@ -761,8 +839,8 @@ BWA_API uint32_t bwa_panner_gains_batch(bwa_panner panner, const float* position
                                       const float lis[3], const float* srcs, uint32_t nsrc, float* out);
 
 /* ---- listener (control thread; skip when a tracker is connected) ---- */
-/* Position in room space. Quaternion is head orientation; used by the binaural
- * monitor only — the array render ignores orientation (real speakers, real ears).
+/* Position in room space. Quaternion is head orientation; used by the headphone
+ * renders only — the array render ignores orientation (real speakers, real ears).
  * ROOM FRAME: right-handed, +y up, metres, identity orientation faces +z (so the
  * right ear is at -x). The origin sits ON THE FLOOR at the working-area centre
  * (x/z) — Motive's ground-plane calibration — so OptiTrack rigid-body poses pass
@@ -848,8 +926,9 @@ BWA_API void bwa_set_pose_prediction(bwa_engine* e, float lead_s);
  * floats, copied at call; the primary listener stays bwa_set_listener_pose / tracking): every source's gains become
  * the per-speaker ENERGY MEAN of the per-listener solves — each occupant hears the image biased
  * toward their own solve instead of one exact + N wrong. Constant-power; works with every panner
- * (each extra gets its own SPCAP/VBAP cache). Spread/Doppler/air and the monitor stay primary-
- * relative. Per-frame-safe, commit-gated like the pose; count 0 restores single-listener panning. */
+ * (each extra gets its own SPCAP/VBAP cache). Spread/Doppler/air and the headphone renders stay
+ * primary-relative; BWA_PROFILE_BINAURAL ignores extras entirely (headphones: one head, one
+ * decode). Per-frame-safe, commit-gated like the pose; count 0 restores single-listener panning. */
 #define BWA_EXTRA_LIS 3
 BWA_API void bwa_set_extra_listeners(bwa_engine* e, const float* xyz, uint32_t count);
 

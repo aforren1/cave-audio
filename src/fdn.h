@@ -9,8 +9,9 @@
  * JAES 2019). The decay is a DESIGN parameter, not a model of the real room (matching would
  * double-count — docs/calibration.md).
  *
- * fdn_create/fdn_set_* run on the control thread BEFORE the audio thread starts (bwa_start stages
- * them); fdn_tap runs on the audio thread and never allocates or locks.
+ * fdn_create and fdn_set_decay_direction run on the control thread BEFORE the audio thread starts
+ * (bwa_start stages them); fdn_set_decay/fdn_set_gain/fdn_set_max_re are live-safe (atomic staging;
+ * the tap ramps). fdn_tap runs on the audio thread and never allocates or locks.
  */
 #ifndef BWA_FDN_H
 #define BWA_FDN_H
@@ -29,7 +30,9 @@ typedef struct Fdn Fdn;
 Fdn* fdn_create(const Layout* L, uint32_t sample_rate, uint32_t channels, int bed_decoder);
 void fdn_destroy(Fdn* f);
 
-/* Decay time (s) below/above `xover_hz`. Values clamp to [0.05, 30]. Before the audio thread runs. */
+/* Decay time (s) below/above `xover_hz`. Values clamp to [0.05, 30]. Safe LIVE (bwa_fdn_set_decay):
+ * the parameters stage atomically and the tap ramps its loss gains there across one block — the
+ * decay morphs in ~5 ms, click-free (the tail keeps ringing; only its slope changes). */
 void fdn_set_decay(Fdn* f, float rt60_low_s, float rt60_high_s, float xover_hz);
 
 /* Anisotropic decay: scale the decay time toward `dir` (room axes, need not be unit) by `factor`

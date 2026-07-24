@@ -1,7 +1,7 @@
 /*
  * smoke.c — lifecycle / link sanity against the public ABI (the DLL). Runs the full
  * control-side sequence for ALL THREE profiles (cave / binaural / both), so the
- * profile-specific device wiring — the binaural monitor and the 'both' dual-sink
+ * profile-specific device wiring — the headphone decodes and the 'cave_both' dual-sink
  * double-buffer handoff — is exercised end to end. Every desc forces the offline null
  * sink (.sink = BWA_SINK_NULL), so it needs no hardware. Asserts nothing about audio.
  */
@@ -292,16 +292,19 @@ static void capture_probe(void* user, const float* planar, uint32_t channels, ui
     if (channels != 2) return;
     for (uint32_t i = 0; i < n; ++i) { cap_sum[0] += fabs(planar[i]); cap_sum[1] += fabs(planar[n + i]); }
 }
-static int run_binaural_laterality(void) {
+/* Runs for BOTH headphone profiles: BINAURAL exercises the direct per-source render (the SH
+ * encode + the cardioid fallback decode, or the phonon decode with the SDK), CAVE_SIM the
+ * virtual-speaker audition. Same physics, same assertions. */
+static int run_binaural_laterality(bwa_profile profile, const char* name) {
     bwa_desc cfg = {
-        .profile     = BWA_PROFILE_BINAURAL,
+        .profile     = profile,
         .sample_rate = 48000,
         .block_size  = 256,
         .sink        = BWA_SINK_NULL,
     };
     int rc = 1;
     bwa_engine* e = bwa_create(&cfg);
-    if (!e) { fprintf(stderr, "FAIL[lat]: bwa_create returned NULL\n"); return 1; }
+    if (!e) { fprintf(stderr, "FAIL[lat:%s]: bwa_create returned NULL\n", name); return 1; }
     {
         bwa_source s = bwa_source_create_push(e);
         if (!s) { fprintf(stderr, "FAIL[lat]: create_stream: %s\n", bwa_last_error(e)); goto done; }
@@ -351,6 +354,90 @@ done:
     return rc;
 }
 
+/* headphone correction EQ (bwa_load_headphone_eq): parse an AutoEq fixture and verify the
+ * correction actually shapes the headphone stereo — a deep PK notch at the tone frequency plus
+ * the preamp must drop the output by roughly their combined gain (~ -24 dB); the ramped A/B
+ * restores the dry level; a garbage file fails loudly and KEEPS the working EQ. The MANUAL sink
+ * makes the pump deterministic (and single-threaded, so no ack waits). */
+static uint64_t hp_phase;
+static void hp_topup(bwa_engine* eng, bwa_source s) {   /* keep the push ring fed, phase-continuous
+                                                         * (660 Hz is integer-periodic in 48000) */
+    float b[1024];
+    while (bwa_source_push_space(eng, s) >= 1024) {
+        for (int i = 0; i < 1024; ++i)
+            b[i] = 0.25f * sinf(6.2831853f * 660.0f * (float)((hp_phase + (uint64_t)i) % 48000u) / 48000.0f);
+        hp_phase += 1024;
+        if (bwa_source_push(eng, s, b, 1024) == 0) break;
+    }
+}
+static double hp_blocks(bwa_engine* eng, bwa_source s, int nblocks) {   /* pump + sum |stereo| */
+    double sum = 0;
+    for (int b = 0; b < nblocks; ++b) {
+        hp_topup(eng, s);
+        uint32_t ch = 0, nf = 0;
+        const float* p = bwa_render_block(eng, &ch, &nf);
+        if (!p || ch != 2) return -1.0;
+        for (uint32_t i = 0; i < 2 * nf; ++i) sum += fabs(p[i]);
+    }
+    return sum;
+}
+static int run_headphone_eq(void) {
+    const char* EQF = "bwa_hpeq_test.txt";
+    const char* BAD = "bwa_hpeq_bad.txt";
+    { FILE* f = fopen(EQF, "wb");
+      if (!f) { fprintf(stderr, "FAIL[hpeq]: fixture write\n"); return 1; }
+      fputs("Preamp: -6.0 dB\nFilter 1: ON PK Fc 660 Hz Gain -18.0 dB Q 4.00\n", f);
+      fclose(f); }
+    { FILE* f = fopen(BAD, "wb"); if (f) { fputs("not an eq file\n", f); fclose(f); } }
+
+    bwa_desc cfg = { .profile = BWA_PROFILE_CAVE_SIM, .sample_rate = 48000, .block_size = 256,
+                     .sink = BWA_SINK_MANUAL };
+    int rc = 1;
+    bwa_engine* eng = bwa_create(&cfg);
+    if (!eng) { fprintf(stderr, "FAIL[hpeq]: bwa_create\n"); return 1; }
+    {
+        bwa_source s = bwa_source_create_push(eng);
+        if (!s) { fprintf(stderr, "FAIL[hpeq]: push source: %s\n", bwa_last_error(eng)); goto done; }
+        hp_phase = 0;
+        bwa_source_set_pos(eng, s, -1.5f, 1.5f, 0.0f);
+        bwa_set_listener_pose(eng, 0.f, 1.5f, 0.f, 0.f, 0.f, 0.f, 1.f);
+        bwa_commit(eng);
+        if (bwa_start(eng) != BWA_OK) { fprintf(stderr, "FAIL[hpeq]: start: %s\n", bwa_last_error(eng)); goto done; }
+        hp_blocks(eng, s, 4);                              /* voice ramp-in */
+        double e_dry = hp_blocks(eng, s, 8);
+        if (e_dry <= 0) { fprintf(stderr, "FAIL[hpeq]: no baseline output\n"); goto done; }
+
+        if (bwa_load_headphone_eq(eng, EQF) != BWA_OK) {
+            fprintf(stderr, "FAIL[hpeq]: load: %s\n", bwa_last_error(eng)); goto done; }
+        hp_blocks(eng, s, 3);                              /* adopt + the one-block ramp-in + settle */
+        double e_eq = hp_blocks(eng, s, 8);
+        double ratio = e_eq / e_dry;                       /* -6 dB preamp x -18 dB notch ~ -24 dB */
+        printf("smoke[hpeq] dry=%.4g eq=%.4g ratio=%.4f\n", e_dry, e_eq, ratio);
+        if (!(ratio > 0.01 && ratio < 0.20)) {
+            fprintf(stderr, "FAIL[hpeq]: corrected/dry ratio %.4f outside the ~-24 dB bounds\n", ratio); goto done; }
+
+        bwa_set_headphone_eq(eng, false);                  /* the ramped A/B back to dry */
+        hp_blocks(eng, s, 3);
+        double e_off = hp_blocks(eng, s, 8);
+        if (!(e_off > 0.8 * e_dry && e_off < 1.2 * e_dry)) {
+            fprintf(stderr, "FAIL[hpeq]: disable did not restore the dry level (%.4g vs %.4g)\n", e_off, e_dry); goto done; }
+
+        if (bwa_load_headphone_eq(eng, BAD) != BWA_ERR_CONFIG || !bwa_last_error(eng)) {
+            fprintf(stderr, "FAIL[hpeq]: a garbage file must fail with BWA_ERR_CONFIG + a reason\n"); goto done; }
+        bwa_set_headphone_eq(eng, true);                   /* the failed load kept the working EQ */
+        hp_blocks(eng, s, 3);
+        double e_back = hp_blocks(eng, s, 8);
+        if (!(e_back < 0.2 * e_dry)) {
+            fprintf(stderr, "FAIL[hpeq]: the previous EQ must survive a failed load\n"); goto done; }
+    }
+    printf("smoke[hpeq] load/correct/A-B/keep-on-failure OK\n");
+    rc = 0;
+done:
+    bwa_destroy(eng);
+    remove(EQF); remove(BAD);
+    return rc;
+}
+
 /* the material table's fill / release / reuse contract: define fills the 64-slot table, release frees a
  * slot, and the NEXT define reuses that exact slot instead of overflowing — the churn escape hatch. */
 static int run_material_release(void) {
@@ -383,14 +470,17 @@ done:
 }
 
 int main(void) {
-    if (run_profile(BWA_PROFILE_CAVE,     "cave"))     return 1;
-    if (run_profile(BWA_PROFILE_BINAURAL, "binaural")) return 1;
-    if (run_profile(BWA_PROFILE_BOTH,     "both"))     return 1;
+    if (run_profile(BWA_PROFILE_CAVE,      "cave"))      return 1;
+    if (run_profile(BWA_PROFILE_BINAURAL,  "binaural"))  return 1;
+    if (run_profile(BWA_PROFILE_CAVE_SIM,  "cave_sim"))  return 1;
+    if (run_profile(BWA_PROFILE_CAVE_BOTH, "cave_both")) return 1;
     if (run_room_eq_guard())                          return 1;
     if (run_layout_strict())                          return 1;
     if (run_push_guard())                             return 1;
-    if (run_binaural_laterality())                    return 1;
+    if (run_binaural_laterality(BWA_PROFILE_BINAURAL, "binaural")) return 1;   /* the direct render */
+    if (run_binaural_laterality(BWA_PROFILE_CAVE_SIM, "cave_sim")) return 1;   /* the array audition */
+    if (run_headphone_eq())                           return 1;
     if (run_material_release())                       return 1;
-    printf("smoke OK (cave, binaural, both lifecycles; room_eq start guard; push kind guards; binaural laterality; material release/reuse)\n");
+    printf("smoke OK (cave, binaural, cave_sim, cave_both lifecycles; room_eq start guard; push kind guards; binaural + cave_sim laterality; headphone EQ; material release/reuse)\n");
     return 0;
 }

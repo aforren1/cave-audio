@@ -9,7 +9,9 @@ extends the engine or verifies it on hardware, against these specs.
 
 A self-hosted native (C/C++) spatial audio engine for a CAVE installation. It
 drives a **26-speaker array** over **ASIO** into an **RME Digiface Dante** (a hardware
-Dante endpoint), with a **binaural (HRTF) debug monitor** as a second output. Unity and
+Dante endpoint), with **binaural (HRTF) headphone output** as a second path — a
+first-class direct render (`BWA_PROFILE_BINAURAL`) and an array-audition monitor
+(`BWA_PROFILE_CAVE_SIM`). Unity and
 Unreal are *thin control clients* over a C ABI — no rendered audio crosses that
 boundary, only control (sound triggers, source positions, listener pose). The one
 inbound exception is the opt-in push-source feed (caller PCM *into* the engine,
@@ -24,11 +26,20 @@ and a clean, engine-agnostic core. See `docs/architecture.md` for the why.
 Sources → per-voice **listener-relative DBAP** panning → an in-memory
 **26-channel master bus**. The bus has *consumers*:
 - **ASIO device** (production): writes the 26-ch bus straight to the Digiface.
-- **Binaural monitor** (debug): treats each bus channel as a virtual speaker at
-  its room position, HRTFs to stereo, writes to a normal output device.
+- **Array-sim monitor** (`cave_sim`, and `cave_both`'s tap): treats each bus channel
+  as a virtual speaker at its room position, HRTFs to stereo, writes to a normal
+  output device.
 
-Adding the binaural path did not complicate the core — it is just a second
-consumer of the same bus. Protect that property.
+Adding the sim path did not complicate the core — it is just a second consumer of
+the same bus. Protect that property. The one deliberate extension is the
+**direct binaural render** (`BWA_PROFILE_BINAURAL`): point voices bypass the
+panner — per-voice HRTF convolutions with the SDK (mode 2: rt exposes per-voice
+mono taps + directions; spread power-splits toward the field), a 16-ch SH direct
+field otherwise — beds pass SH->SH into that field (one diagonal,
+ambi_canon_to_phonon) and pathing sums in raw; ONE HRTF decode + the per-voice
+convolutions produce stereo. The bus keeps the synthesized-diffuse taps
+(FDN/reflection bed). These are profile-gated render targets, not a parallel
+engine — anything synthesized-diffuse still belongs on the bus.
 
 ## Hard invariants (do not violate)
 
@@ -78,9 +89,14 @@ src/
   fdn.h / fdn.c        directional FDN reverb bed (phonon-free; takes the reflection bus tap). [innovations]
   ism.h / ism.c        image-source EARLY reflections: shoebox mirrors, panned as point sources. [innovations]
   align.h / align.c    per-speaker gain trim + delay-line output stage. [M4]
-  binaural.h/binaural.c  head-oriented 26->stereo monitor (Steam Audio HRTF is the upgrade). [M5]
-  ambisonics.h/.c      3rd-order ACN/SN3D encode (+ phonon N3D scale) for the Steam decode. [M5]
-  steam_decode.h/.c    production ambisonics->stereo HRTF decode via phonon (with-SDK). [M5]
+  binaural.h/binaural.c  head-oriented 26->stereo monitor + the no-SDK cardioid decode of the
+                       direct-binaural field (Steam Audio HRTF is the upgrade). [M5]
+  hpeq.h / hpeq.c      headphone correction EQ: AutoEq ParametricEQ.txt -> RBJ biquad cascade on
+                       the headphone profiles' final stereo (bwa_load_headphone_eq). [binaural]
+  ambisonics.h/.c      3rd-order ACN/SN3D encode (+ ambi_encode_phonon, the monitor-basis encode
+                       shared by steam_decode and rt's direct mode). [M5]
+  steam_decode.h/.c    production ambisonics->stereo HRTF decode via phonon (with-SDK); sums the
+                       direct field into the virtual-speaker encode pre-decode. [M5]
   steam_scene.h/.c     materials occlusion: IPLScene+IPLSimulator on a sim thread (with-SDK). [materials]
   steam_reflect.h/.c   reflection bed: IPLSimulator reflections -> ambisonic IR -> SH->26 bus tap (with-SDK). [materials]
   steam_path.h/.c      sound pathing: indirect routing -> per-voice shCoeffs -> SH-encode -> bus tap (with-SDK). [materials]

@@ -1,7 +1,8 @@
 # bw_audio
 
 Self-hosted spatial audio engine for a 26-speaker CAVE installation. Drives the
-array over **ASIO → RME Digiface Dante**, with a **binaural HRTF monitor** for
+array over **ASIO → RME Digiface Dante**, with **binaural HRTF headphone
+rendering** — a first-class direct render, plus an array-audition monitor for
 desk-side debugging. Unity and Unreal connect as thin control clients over a C ABI.
 
 ## Why self-hosted
@@ -23,8 +24,8 @@ maintain alongside it.
                      │  (one audio callback)                           │
                      └─────────────────────────────────────────────────┘
                                   │                         │
-                          ASIO ► Digiface ► array        binaural monitor ► stereo
-                          (production)              (debug)
+                          ASIO ► Digiface ► array        HRTF decode ► stereo
+                          (production)              (binaural render / array sim)
 ```
 
 ## Engine features
@@ -61,8 +62,11 @@ maintain alongside it.
   freshest head pose at block time, with optional **pose prediction** to hide
   motion-to-ears latency; **tracked room EQ** interpolates measured LF room
   correction at the live listener position.
-- **Monitoring**: binaural HRTF render of the same speaker bus (3rd-order
-  ambisonic encode → Steam Audio decode) to any 2-ch ASIO device; per-channel
+- **Headphones**: a first-class **direct binaural render** (`binaural` profile:
+  point sources SH-encode at their true listener-relative directions → one Steam
+  Audio HRTF decode, no speaker-array simulation in the direct path) and an
+  **array-audition monitor** (`cave_sim`: the same speaker bus through virtual
+  speakers, DBAP artifacts included), both to any 2-ch ASIO device; per-channel
   test signal, output meters, voice gauge.
 - **Real-time discipline**: no allocation, locks, or I/O on the audio thread;
   lock-free SPSC command/event rings; `bwa_commit` gives frame-coherent updates;
@@ -82,7 +86,7 @@ The calibration commands behind the last row are under
 
 | | **tracked roamer** (the CAVE) | **fixed seat** (one chair) | **audience** (several people) | **desk** (headphones) |
 |---|---|---|---|---|
-| profile | `cave` | `cave` | `cave` | `binaural` |
+| profile | `cave` | `cave` | `cave` | `cave_sim` (verify the array) / `binaural` (best headphone render) |
 | panner | **DBAP** (default) | **VBAP**, else SPCAP | **DBAP** | any (DBAP) |
 | tracking | `bwa_tracker_connect` | none - listener sits at the seat | track the main occupant + `bwa_set_extra_listeners` for the rest | push head pose, or track |
 | dual-band | off | **on** | off | your call (A/B it) |
@@ -114,9 +118,11 @@ beyond `--eq` (which flattens the *speakers*, not the room, so it helps every se
 Raise `bwa_source_set_spread` on ambience: wide sources survive off-centre listening far
 better than points do.
 
-**Desk.** The `binaural` profile needs no layout, no Dante, and no hardware beyond
-headphones: the monitor renders the *same* speaker mix, so what you hear is the array
-render. Use it to develop; don't use it to judge timbre for the room.
+**Desk.** Neither headphone profile needs a layout, Dante, or hardware beyond
+headphones. `cave_sim` renders the *same* speaker mix through virtual speakers, so
+what you hear is the array render — use it to verify what the room will do.
+`binaural` renders sources directly at their true directions — the better *listen*,
+the wrong *probe*. Don't use either to judge timbre for the room.
 
 **Everywhere:** the output limiter is on at −1 dBFS (leave it; it's speaker protection, not
 mastering), and reflections are opt-in per source. Pick one reverb bed: Steam Audio's
@@ -288,8 +294,8 @@ mis-correcting the array.
 
 ![bwa_playground](docs/img/playground.png)
 
-Binaural monitor on headphones (auto-picked 2-ch ASIO driver; without one the
-engine falls back to the null sink and keeps rendering—visual-only, live, just
+The array sim (`cave_sim`) on headphones (auto-picked 2-ch ASIO driver; without one
+the engine falls back to the null sink and keeps rendering—visual-only, live, just
 silent). Scenes: localization, occlusion + materials, directivity, channel walk,
 reverb bed, and a blind A/B/X comparison over single engine knobs (dual-band,
 panner choice, spread, air absorption) scored with a binomial p-value. The 3D

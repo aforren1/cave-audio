@@ -453,3 +453,39 @@ outside `asio_sink.cpp`, and do not link the NatNet SDK (proprietary; reference 
 The atomics in `rt.c` need `/experimental:c11atomics` on MSVC (wired in CMake); `pose.h` uses
 Interlocked intrinsics instead, so `natnet.c`/tests need no extra flag. `-DBWA_ASAN=ON`
 builds `test_sound` under ASan.
+
+**Physical-emulation batch (2026-07-24):** six engine features filling out the propagation family,
+all following the established per-voice template (enqueue-only command, audio-thread ramp).
+`bwa_source_set_proximity` is loudness comp's near mirror (an LF shelf rising inside ~1 m, +6 dB
+max at 300 Hz — the spherical-wavefront proximity effect; the geometric half was already
+`bwa_set_near_spread`). `bwa_set_speed_of_sound` makes `c` a live atomic (RtCore.sos) that Doppler
+and ISM delays derive from per block — both glide, so a medium change bends rather than steps;
+delays saturate at ring capacity. `bwa_source_set_directivity`/`_set_orientation` now work in
+EVERY build: with a Steam scene the sim publishes as before; without one the audio thread
+evaluates the same weighted dipole per block from a control-side forward cache (engine.c
+src_fwd/src_dirw/src_dirp), with a dedicated handle-gated readback publish (RtCore.dir_pub) so
+`bwa_source_get_directivity` reports the manual path too. `bwa_fdn_set_decay` is the live FDN
+retune: fdn_set_decay stages the three params atomically + bumps a seq; the tap re-derives per-line
+loss-gain targets on a seq change and ramps g_lf/g_hf/xa across ONE block (the loss gains scale the
+tail signal directly, so a raw step would step the output). `bwa_scene_set_ground` is the outdoor
+degenerate of the box (one horizontal mirror in IsmRoom.plane_only mode, face slot 2; a big quad
+feeds the ray tracer with SDK), and `bwa_scene_set_pressure_release` flags box faces whose ISM
+coefficient NEGATES (water surface from below, R ~ -1 — the Lloyd's-mirror comb; rt.c's hf-damping
+ratio needed fabsf since both bands flip). Tests: ism (polarity + plane geometry), fdn (live retune
+slope change + tail continuity), rt_feature (proximity shelf — measured with the limiter disabled,
+a full-scale sine at 0.25 m rides the -1 dBFS ceiling and eats the boost; manual-directivity
+nulls; sos arrival times; ground-bounce delay + polarity inversion). docs/api.md gained a
+"Recipes: physical emulation" how-to (underwater listener, Lloyd's mirror, doorway portal, wind,
+slow motion, arm's length). Both bindings carry the batch (Unity externs + Engine/SourceBase
+surface, Godot properties/methods).
+
+**Review follow-up (2026-07-24):** four hardening fixes on the batch above. `rt_set_ism_room` now
+publishes through a pose.h-style seqlock (RtCore.ism_room_sh/ism_seq; rt_render adopts a stable
+copy at block start), making `bwa_scene_set_box`/`_set_ground`/`_set_pressure_release` LIVE-safe —
+the Unity wrapper had already exposed them post-start (its engine starts in Awake, so scripts have
+no pre-start window), which raced the old plain struct copy. `cave_both`'s monitor tap gets the
+same output clamp as `render_binaural` (factored as engine_clamp2 — the headphone EQ can boost
+past the limited level on that path too). Direct mode no longer seeds `dual_mix` at CMD_PLAY
+(gcur_lo is never solved there; a dual-band toggle used to buy every play one block of LF dip).
+The manual-directivity readback (dir_pub) clears when the pattern is disabled or the voice
+destroyed, so `bwa_source_get_directivity` can't report a stale dipole gain.

@@ -156,8 +156,9 @@ listener-keyed) and takes the per-speaker **energy mean**:
 Constant power is preserved (the mean of the solves' powers), and every occupant
 hears an image biased toward their own solve instead of one exact and the rest
 wrong. Spread direction, Doppler, air absorption, the reverb-send distance, and the
-binaural monitor stay primary-relative. Panner-agnostic, block-rate, one extra
-point solve per listener per dirty voice.
+headphone renders stay primary-relative (`BWA_PROFILE_BINAURAL` ignores extras
+entirely — one head). Panner-agnostic, block-rate, one extra point solve per
+listener per dirty voice.
 
 ## Gain ramping
 
@@ -285,19 +286,61 @@ transported one; equal extents are exactly the isotropic spread, same solve path
 The size/near floors apply to both axes. Pinned in the `rt` test (vertical-spill
 contrast + iso-equality).
 
-## Binaural debug path
+## Headphone renders: direct binaural and the array sim
 
-The binaural monitor is a **bus→stereo** transform. It consumes the same speaker bus
-the array render does, so it auditions the actual render.
+Two headphone profiles share one decode; they answer different questions.
 
-Two implementations sit behind the same seam:
+**`BWA_PROFILE_CAVE_SIM`** is the array audition — a **bus→stereo** transform. It
+consumes the same speaker bus the array render does, so it auditions the actual
+render: panner spread, alignment, gain staging, everything. Each bus channel is a
+virtual speaker at its surveyed room direction; head orientation rotates the
+virtual array. `BWA_PROFILE_CAVE_BOTH` runs this same transform as the rig's
+headphone tap.
 
-- **Production (`steam_decode.c`, gated `BWA_HAVE_STEAMAUDIO`)**: ambisonic encode →
-  Steam Audio HRTF decode, described below.
-- **Fallback (`binaural.c`, no SDK)**: a simple lateral-projection pan. Each bus
-  channel's bearing from the listener is projected onto the head's right axis and
-  constant-power panned to L/R (`gL² + gR² = 1`). No HRTF. It verifies routing and
-  gross laterality, not timbre or externalization.
+**`BWA_PROFILE_BINAURAL`** is the first-class headphone render. Point sources (and
+their ISM reflection images) bypass the speaker panner: the mixer SH-encodes each
+at its **true** listener-relative direction into a 16-channel direct field
+(`rt.c`, the same `gcur→gtarget` ramp machinery — the coefficients ramp, so motion
+never zippers), with the same user gain and layout distance curve the panner would
+apply. None of the array's phantom-source spread reaches the ears. Ambisonic
+**beds pass SH→SH** into the same field — one diagonal per channel
+(`ambi_canon_to_phonon`: the `(-1)^|m|` axis flip times the orthonormal rescale)
+instead of decode-to-speakers plus virtual-speaker re-encode — and the **pathing
+accumulator sums in raw** (it is already phonon-basis SH), which also puts head
+orientation on the indirect arrivals, as it should. Only the synthesized-diffuse
+taps (the FDN tail, the Steam reflection bed) still render to the speaker bus and
+join the decode as virtual speakers. Dual-band, decorrelation, the speaker spread
+modes, max-rE, the parametric bed renderer, and extra listeners are speaker-array
+concerns and don't apply; spread maps to a per-degree taper toward omni
+(energy-renormalized, `cos^l`). One decode serves every contribution.
+
+With the SDK, the dry render goes one step further: **one `IPLBinauralEffect` per
+voice** (mode 2, chosen at `bwa_start` when the phonon monitor and its per-voice
+fleet exist). Each point voice's post-DSP mono block and true direction feed a
+real per-source HRTF convolution — no ambisonic order ceiling on localization.
+Spread **power-splits** the dry between the point tap (`sqrt(1−s)`) and the
+tapered SH field (`sqrt(s)`), so both paths always exist and a spread change
+crossfades through the gain solve instead of switching render paths. A recycled
+voice slot resets its effect (generation-gated), so no overlap tail bleeds across
+voices. Without the SDK (or if the fleet fails to build) the render stays on the
+shared SH field — mode 1, the same 3rd-order path the tests pin.
+
+Either way, the chain ends at real headphones, which are not acoustically flat —
+`bwa_load_headphone_eq` runs an AutoEq correction on the final stereo of every
+headphone profile (the headphone-side align stage; docs/api.md "Headphone
+correction EQ"). Personalized SOFA HRTFs (`hrtf_path`) correct the ears, the EQ
+corrects the transducer; they compose.
+
+Two decode implementations sit behind the same seam:
+
+- **Production (`steam_decode.c`, gated `BWA_HAVE_STEAMAUDIO`)**: ambisonics →
+  Steam Audio HRTF decode, described below. The direct field sums straight into
+  the virtual-speaker encode's SH scratch — same basis by construction
+  (`ambi_encode_phonon`, shared with `rt.c`).
+- **Fallback (`binaural.c`, no SDK)**: a simple lateral-projection pan for the bus
+  channels (`gL² + gR² = 1`), plus two opposed cardioids at the ear axes on the
+  direct field's first-order channels. No HRTF. It verifies routing and gross
+  laterality, not timbre or externalization.
 
 The production decode is efficient—do **not** run one HRTF convolution per bus
 channel (26 of them on the CAVE array):
@@ -306,20 +349,29 @@ channel (26 of them on the CAVE array):
    speaker directions with the head.
 2. Encode those feeds into ambisonics: a fixed gain matrix from the speaker
    directions. Cheap.
-3. Do a single **ambisonics → binaural** decode (Steam Audio's ambisonics-binaural
+3. Sum the direct field (`BINAURAL` only — it is already in this basis).
+4. Do a single **ambisonics → binaural** decode (Steam Audio's ambisonics-binaural
    effect with the configured HRTF).
 
-Two convention details in the implemented encode matrix:
+Convention details in the implemented encode (one function, `ambi_encode_phonon`
+in `ambisonics.c`, used by the virtual-speaker matrix AND the direct-field solve
+so they cannot drift apart):
 
+- **Axes.** The phonon net-AmbiX map: front = `-z`room, left = `-x`room, up =
+  `+y`room (`steam_decode.c` CONVENTION 1).
 - **Normalization.** The engine encodes SN3D (AmbiX); phonon's
   `iplAmbisonicsDecodeEffect` decodes orthonormal real SH. Each ACN channel is
   rescaled per degree by `sqrt(2l+1)/sqrt(4π)` (`ambi_phonon_scale`,
   `ambisonics.c`).
-- **m<0 sign.** phonon's real-SH m<0 channels have the opposite sign to the
-  engine's encode, so ACN channels 1, 4, 5, 9, 10, 11 are negated (`SH_M_NEG`,
-  `steam_decode.c`). The sign must match or left/right invert. If you touch either
-  convention, run the `steam_decode` laterality test (right source → right ear, 180°
-  flips); `test_ambi` only checks m≥0 and will not catch it.
+- **m<0 sign: no fix-up.** phonon's real-SH m<0 convention **matches** the
+  engine's encode on every channel (the xval golden pins `ambi_encode_sn3d`
+  against phonon's own SH table, sin harmonics included). A negation of ACN
+  1, 4, 5, 9, 10, 11 lived in `steam_decode.c` briefly, added to satisfy a
+  DC-driven laterality test — the default HRTF's per-ear DC gains are laterally
+  opposite its audible ILD, so the DC assertion passed exactly when the field was
+  mirrored. If you touch any convention, run the `steam_decode` laterality test
+  (a 660 Hz **tone**, never DC; right source → right ear, 180° flips);
+  `test_ambi` only checks m≥0 and will not catch a mirror.
 
 **Ambisonic order:** default to **3rd order (16 channels, 3D)** for the
 encode/decode. This is the sweet spot for a 26-speaker array: order `N` uses
@@ -329,11 +381,12 @@ purpose; 1st–2nd order (4–9 ch) noticeably blurs the directionality the arra
 there to reproduce. Expose the order as a config/build knob (alongside `r` and the
 distance curve) so it can be traded against CPU on the monitor path, but 3rd order
 is the baseline. The decode cost is fixed by the order, **independent of the source
-count**: the reason the monitor goes through ambisonics rather than per-source HRTF.
-
-A second optional mode binauralizes the **sources directly**, bypassing the panner.
-Use it to isolate whether a problem is in tracking/positioning or in the decode. The
-virtual-speaker tap is the default; the direct mode is a diagnostic.
+count** — the right trade for the bus audition. `BINAURAL`'s dry render pays the
+per-source cost instead where it buys localization: mode 2 convolves each point
+voice through its own `IPLBinauralEffect` (O(voices), block-rate direction
+updates, bilinear HRTF interpolation), with the shared field carrying the wide
+shares, the beds, and the pathing. The field's 3rd-order ceiling then bounds only
+the diffuse-ish content, where it doesn't hurt.
 
 ## Diffuse-bed decode (AllRAD versus EPAD)
 

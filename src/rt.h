@@ -53,7 +53,9 @@ enum {
     CMD_SET_ATTEN,  /* per-voice distance-attenuation override (replaces the layout curve for one source) */
     CMD_STOP_AT,    /* schedule a click-free stop when the dsp clock reaches a sample (rt_source_stop_at) */
     CMD_QUEUE,      /* append a sound to a voice's gapless play queue (rt_source_queue / chaining) */
-    CMD_QUEUE_CLEAR /* drop a voice's pending play queue (rt_source_clear_queue) */
+    CMD_QUEUE_CLEAR,/* drop a voice's pending play queue (rt_source_clear_queue) */
+    CMD_SET_NF,     /* per-voice near-field proximity boost enable */
+    CMD_SET_DIR     /* per-voice MANUAL directivity: forward axis + weighted-dipole pattern (no-sim path) */
 };
 typedef struct {
     uint8_t  type;
@@ -90,6 +92,9 @@ typedef struct {
         struct { float yaw, pitch, roll; }             brot;  /* bed soundfield orientation (radians) */
         struct { uint8_t on; }                         ism;   /* per-voice early reflections */
         struct { float ref, rolloff, min_lin; }        atten; /* per-voice curve; ref <= 0 clears the override */
+        struct { uint8_t on; }                         nf;    /* per-voice near-field proximity boost enable */
+        struct { float fwd[3], weight, power; }        dir;   /* manual directivity: forward axis (room, unit)
+                                                               * + dipole weight 0..1 / power (weight 0 = off) */
     } u;
 } Cmd;
 
@@ -104,6 +109,29 @@ RtCore* rt_create(uint32_t voice_cap, uint32_t sound_cap, uint32_t sample_rate, 
 void    rt_destroy(RtCore* c);
 void    rt_set_layout(RtCore* c, const Layout* L);   /* call before bwa_start / while stopped */
 void    rt_set_panner(RtCore* c, int panner);        /* 0 = DBAP, 1 = SPCAP, 2 = VBAP; atomic, live-switchable */
+/* Direct-binaural render (BWA_PROFILE_BINAURAL): point voices SH-encode at their true listener-
+ * relative direction into a 16-ch ambisonic accumulator (phonon monitor basis, ambi_encode_phonon)
+ * instead of panning to the speaker bus; beds pass SH->SH into the same field and the pathing
+ * accumulator sums in raw (both already that basis); the speaker bus keeps the synthesized-diffuse
+ * layer (FDN / reflection-bed taps). Mode:
+ *   0 = off   1 = SH field only   2 = SH field + PER-VOICE point taps (mode 2 needs a phonon
+ * consumer: each point voice's post-DSP mono block + room-frame direction is exposed via
+ * rt_direct_voices for one IPLBinauralEffect per voice; spread power-splits point vs field, so
+ * the two render paths crossfade by solve, never switch). Set while STOPPED (engine create picks
+ * 1, bwa_start upgrades to 2 when the steam monitor is live) — not a live toggle; a mode change
+ * re-dirties every voice so the gain vectors re-solve in the new meaning.
+ * rt_direct_ambi returns the block's summed field right after rt_render (same thread;
+ * BWA_AMBI_CH planar channels of nframes), NULL when the mode is off. rt_direct_voices fills
+ * *out with the voice_cap-long per-slot view (mode 2; returns 0 / NULL otherwise). */
+typedef struct {
+    const float* mono;   /* the voice's point-share block (nframes samples; gain + atten applied) */
+    float    dir[3];     /* room-frame unit dir listener->source (block-rate, solved with the gains) */
+    uint32_t gen;        /* voice generation — the consumer resets its effect state on change */
+    uint8_t  active;     /* rendered this block (cleared at block start) */
+} RtDirectVoice;
+void    rt_set_direct_ambi(RtCore* c, int mode);
+const float* rt_direct_ambi(RtCore* c);
+uint32_t rt_direct_voices(RtCore* c, const RtDirectVoice** out);
 void    rt_set_bed_decoder(RtCore* c, int decoder);  /* 1 = AllRAD, 2 = EPAD (0 = the SAD fallback — internal only,
                                                       * no longer reachable from the public enum); before bwa_start */
 void    rt_set_dual_band(RtCore* c, int on);         /* dual-band panning (amplitude LF / power HF); live A/B */
@@ -117,8 +145,10 @@ void    rt_set_pose_prediction(RtCore* c, float lead_s);  /* tracked-pose lead (
 void    rt_set_near_spread(RtCore* c, float radius_m);    /* near-listener widening radius (0 = off); live */
 void    rt_set_extra_listeners(RtCore* c, const float* xyz, uint32_t n);   /* compromise panning; commit-gated */
 void    rt_set_master_gain(RtCore* c, float linear);      /* one ramped scalar over the whole mix; live */
-/* Image-source early reflections: the shoebox room (NULL/invalid = no reflections; set while stopped)
- * and the live reflection level. Voices opt in with rt_source_set_ism. */
+/* Image-source early reflections: the shoebox room (NULL/invalid = no reflections) and the live
+ * reflection level. The room is LIVE too — it publishes through a single-slot seqlock and the
+ * mixer adopts a stable copy at block start, then each opted-in voice re-solves its images next
+ * block (gains ramp, delays glide). Voices opt in with rt_source_set_ism. */
 void    rt_set_ism_room(RtCore* c, const IsmRoom* room);
 void    rt_set_ism_gain(RtCore* c, float linear);
 void    rt_set_all_paused(RtCore* c, int paused);         /* global pause gate (rides pause_gate); live */
@@ -219,6 +249,15 @@ void rt_source_seek    (RtCore* c, uint32_t h, uint64_t frame);  /* click-free j
 void rt_source_set_doppler(RtCore* c, uint32_t h, bool on);          /* propagation: glided delay -> pitch from radial motion */
 void rt_source_set_air_absorption(RtCore* c, uint32_t h, bool on);   /* propagation: distance-driven HF low-pass */
 void rt_source_set_loudness_comp(RtCore* c, uint32_t h, bool on);    /* equal-loudness LF shelf vs attenuation */
+void rt_source_set_proximity(RtCore* c, uint32_t h, bool on);        /* propagation: near-field LF boost (dist < ~1 m) */
+/* MANUAL directivity (no sim): the audio thread evaluates |(1-w) + w*cos(theta)|^p per block from
+ * the voice's forward axis and the active listener — walk-correct without the Steam sim. weight 0
+ * disables. Same ramped dir_cur the sim's publish drives; do not run both on one source. */
+void rt_source_set_directivity_manual(RtCore* c, uint32_t h, const float fwd[3], float weight, float power);
+/* Engine-wide speed of sound (m/s; default 343). Live + atomic: Doppler and ISM path delays derive
+ * from it next block (both glide, so a change bends, never steps). Delays saturate at each ring's
+ * capacity, so a c far below air's mostly shows up as pitch/glide behavior, not unbounded delay. */
+void rt_set_speed_of_sound(RtCore* c, float mps);
 void rt_source_set_spread(RtCore* c, uint32_t h, float amount);      /* source angular width: 0 = point .. 1 = wide */
 void rt_source_set_extent(RtCore* c, uint32_t h, float w, float hgt);/* anisotropic width/height extent (room-referenced) */
 void rt_source_set_attenuation(RtCore* c, uint32_t h, float ref_m, float rolloff, float min_lin);  /* per-source curve;

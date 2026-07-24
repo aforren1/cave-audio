@@ -54,6 +54,11 @@ var rig_has_reverb := false
 # Reverb-scene settings that are LOAD-time, so changing one rebuilds the rig.
 var rev_decoder := 0
 var want_sink := BwaEngine.SINK_AUTO
+# Headphone render (the panel's "render" picker; create-time, so switching rebuilds):
+# false = CAVE_SIM, the array audition — the speaker meters show what lights the speakers;
+# true = BINAURAL, the direct per-source render — point sources and beds bypass the speaker
+# bus, so quiet meters there are CORRECT. Mirrors the C++ playground's picker.
+var profile_direct := false
 
 var _cam_yaw := deg_to_rad(195.0)
 var _cam_pitch := deg_to_rad(25.0)
@@ -112,7 +117,8 @@ func _build_rig(with_reverb: bool) -> void:
 
 	engine = BwaEngine.new()
 	engine.name = "Engine"
-	engine.profile = BwaEngine.PROFILE_BINAURAL
+	engine.profile = BwaEngine.PROFILE_BINAURAL if profile_direct \
+		else BwaEngine.PROFILE_CAVE_SIM   # default: the array audition (the meters read the bus)
 	engine.sink = want_sink
 	engine.sample_rate = Signals.SR
 	engine.block_size = 256
@@ -237,6 +243,15 @@ func set_signal(which: int) -> void:
 	cur_sig = clampi(which, 0, sig_paths.size() - 1)
 	source.play_clip(sig_paths[cur_sig])
 	refl.play_clip(sig_paths[cur_sig])
+
+
+## The panel's "render" picker: cave_sim <-> binaural. Create-time (like the reverb decoder),
+## so an actual change rebuilds the rig and re-enters the current scene.
+func set_profile_direct(v: bool) -> void:
+	if v == profile_direct:
+		return
+	profile_direct = v
+	rebuild_rig(rig_has_reverb)
 
 
 func head_quat() -> Quaternion:
@@ -403,5 +418,24 @@ func _run_selftest() -> void:
 	if not engine.is_running():
 		push_error("playground: engine died returning from the reverb scene")
 		fail += 1
+
+	# The render picker crosses a create/start boundary too: binaural (direct) and back. The
+	# backend string names the live decode ("direct" vs "sim"), so assert it flips both ways
+	# and that the rebuilt engine survives each switch.
+	set_profile_direct(true)
+	if not engine.is_running():
+		push_error("playground: engine died switching to the binaural (direct) render")
+		fail += 1
+	if not backend.contains("direct"):
+		push_error("playground: binaural render did not report a direct decode (%s)" % backend)
+		fail += 1
+	set_profile_direct(false)
+	if not engine.is_running():
+		push_error("playground: engine died switching back to the cave_sim render")
+		fail += 1
+	if not backend.contains("sim"):
+		push_error("playground: cave_sim render did not report a sim decode (%s)" % backend)
+		fail += 1
+
 	print("playground: ", "PASS" if fail == 0 else "FAIL (%d)" % fail)
 	get_tree().quit(0 if fail == 0 else 1)

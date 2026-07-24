@@ -33,6 +33,13 @@ func _check(cond: bool, msg: String) -> void:
 ## can register (children's _enter_tree has not run yet at this point, so it never reaches
 ## BwaEngine's collection) and the same assertion must then FAIL to find a room.
 func _enter_tree() -> void:
+	# _test_audible's observable is the BUS meters, so this fixture must run a profile whose
+	# point sources actually land on the bus. The node default (BINAURAL) no longer does:
+	# its direct render bypasses the speaker bus by design — correct for headphones, silent
+	# meters here. CAVE_SIM keeps the whole render on the bus. (Set before the child's _ready
+	# creates the engine; profile is create-time.)
+	$BwaEngine.profile = BwaEngine.PROFILE_CAVE_SIM
+
 	_with_room = not "--no-room" in OS.get_cmdline_user_args()
 	if not _with_room:
 		var r := $Room

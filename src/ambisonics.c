@@ -158,3 +158,26 @@ const float ambi_phonon_scale[BWA_AMBI_CH] = {
     0.6307832f, 0.6307832f, 0.6307832f, 0.6307832f, 0.6307832f,                     /* l=2 */
     0.7463527f, 0.7463527f, 0.7463527f, 0.7463527f, 0.7463527f, 0.7463527f, 0.7463527f  /* l=3 */
 };
+
+/* Monitor-basis encode (see header): the phonon net-AmbiX axis map (front=-z_room, left=-x_room,
+ * up=+y_room — steam_decode.c CONVENTION 1) followed by the orthonormal rescale. Everything summed
+ * into the monitor's ambisonic field (the virtual-speaker matrix AND rt.c's direct-binaural bus)
+ * uses this one function, so the two contributions cannot drift apart in convention. */
+void ambi_encode_phonon(const float room_dir[3], float y[BWA_AMBI_CH]) {
+    float a[3] = { -room_dir[2], -room_dir[0], room_dir[1] };
+    ambi_encode_sn3d(a, y);
+    for (int k = 0; k < BWA_AMBI_CH; ++k) y[k] *= ambi_phonon_scale[k];
+}
+
+/* Diagonal converting an engine-canonical ACN/SN3D FIELD (room_to_ambi axes: front=+z_room,
+ * left=+x_room — beds, after rotation) into the phonon monitor basis above. The two axis maps
+ * differ by a pi rotation about up, whose real-SH action is diagonal ((-1)^|m| per channel — both
+ * cos and sin m-harmonics flip for odd m); compose with the per-degree orthonormal rescale and the
+ * whole basis change is one multiply per channel. monitor_test pins this against ambi_encode_phonon
+ * over random directions, so the table cannot silently drift from the encode. */
+const float ambi_canon_to_phonon[BWA_AMBI_CH] = {
+     0.2820948f,                                                                        /* l=0        */
+    -0.4886025f,  0.4886025f, -0.4886025f,                                              /* l=1 m -101 */
+     0.6307832f, -0.6307832f,  0.6307832f, -0.6307832f,  0.6307832f,                    /* l=2        */
+    -0.7463527f,  0.7463527f, -0.7463527f,  0.7463527f, -0.7463527f,  0.7463527f, -0.7463527f  /* l=3 */
+};

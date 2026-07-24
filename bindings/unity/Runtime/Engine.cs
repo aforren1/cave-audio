@@ -18,7 +18,7 @@ namespace BwAudio
         [Header("Engine")]
         public BwaProfile profile = BwaProfile.Binaural;   // inspector dropdown; maps 1:1 to the C enum
         [Tooltip("The surveyed speaker geometry, as a path RELATIVE TO Assets/StreamingAssets/ " +
-                 "(create that folder and put cave_layout.json in it). Used by the cave/both profiles. " +
+                 "(create that folder and put cave_layout.json in it). Used by the cave/cave_both profiles. " +
                  "If it fails to load the engine falls back to its default 26-speaker grid and logs an " +
                  "error — it does NOT stop, so a smaller rig would silently pan over the wrong geometry.")]
         [Clip(".json")] public string layoutFile = "cave_layout.json";
@@ -85,6 +85,9 @@ namespace BwAudio
         [Tooltip("Widen sources that come close to the head, instead of letting them snap across the " +
                  "nearest speaker. ~1 m is a good start; 0 = off.")]
         public float nearSpreadRadius = 0f;
+        [Tooltip("Speed of sound (m/s; live). Doppler and reflection delays derive from it and GLIDE to " +
+                 "a change. 343 = air, 1480 = underwater; small values exaggerate Doppler (slow motion).")]
+        public float speedOfSound = 343f;
         [Tooltip("For layouts carrying a room_eq_grid (bwa_calibrate --room-eq-grid): re-interpolate the LF " +
                  "modal cuts at the live listener position. No-op without a grid; this is the kill switch.")]
         public bool trackedRoomEq = true;
@@ -287,6 +290,7 @@ namespace BwAudio
             Bwa.bwa_set_spread_mode(_eng, spreadMode);
             Bwa.bwa_set_decorrelation(_eng, decorrelation);
             Bwa.bwa_set_near_spread(_eng, nearSpreadRadius);
+            Bwa.bwa_set_speed_of_sound(_eng, speedOfSound);
             Bwa.bwa_set_bed_renderer(_eng, bedRenderer);
             Bwa.bwa_set_max_re(_eng, maxRe);
             Bwa.bwa_set_max_re_split(_eng, maxReSplit);
@@ -383,6 +387,27 @@ namespace BwAudio
         {
             get => masterGain;
             set { masterGain = value; if (Ready) Bwa.bwa_set_master_gain(_eng, value); }
+        }
+
+        /// <summary>Engine-wide speed of sound (m/s; live). Doppler and reflection delays derive from it
+        /// and glide to a change — 343 air, 1480 underwater; small values exaggerate Doppler for slow
+        /// motion. Engine-side clamp [30, 20000].</summary>
+        public float SpeedOfSound
+        {
+            get => speedOfSound;
+            set { speedOfSound = value; if (Ready) Bwa.bwa_set_speed_of_sound(_eng, value); }
+        }
+
+        /// <summary>Retune the FDN reverb's decay LIVE — the room-transition knob: the tail keeps
+        /// ringing, only its slope changes (stepping into a cathedral, submerging, walking outside).
+        /// Values &lt;= 0 keep the current setting. Needs 'Enable Fdn Reverb'; pair with ReverbGain for
+        /// the wet level.</summary>
+        public void FdnSetDecay(float rt60LowSeconds, float rt60HighSeconds, float crossoverHz)
+        {
+            if (rt60LowSeconds  > 0f) fdnRt60LowSeconds  = rt60LowSeconds;
+            if (rt60HighSeconds > 0f) fdnRt60HighSeconds = rt60HighSeconds;
+            if (crossoverHz     > 0f) fdnCrossoverHz     = crossoverHz;
+            if (Ready) Bwa.bwa_fdn_set_decay(_eng, rt60LowSeconds, rt60HighSeconds, crossoverHz);
         }
 
         /// <summary>Global pause (focus loss, menu): EVERY voice — sources, streams, beds — ramps out and
@@ -625,6 +650,31 @@ namespace BwAudio
         {
             if (!Ready || a == null) return;
             if (_matCache.TryGetValue(a, out var t)) { Bwa.bwa_material_release(_eng, t); _matCache.Remove(a); }
+        }
+
+        /// <summary>The outdoor degenerate of the room box: ONE horizontal mirror plane at the given
+        /// Unity-world height — the ground bounce, the dominant early reflection when there is no room.
+        /// REPLACES the room box (one room at a time), so use it with 'Enable Room Box' off. Live-safe:
+        /// the room publishes to the audio thread lock-free and reflections re-solve next block, so
+        /// call it from Start or mid-game (a scene transition). Set pressureRelease
+        /// when the "ground" is a water surface and the listener is under it — the reflection inverts
+        /// (the Lloyd's-mirror comb that makes near-surface sources sound thin).</summary>
+        public void SceneSetGround(float worldY, MaterialAsset material = null, bool pressureRelease = false)
+        {
+            if (!Ready) return;
+            float roomY = Room.Pos(new Vector3(0f, worldY, 0f)).y;   // registration offset applies to heights too
+            Bwa.bwa_scene_set_ground(_eng, roomY, ResolveMaterial(material), pressureRelease);
+        }
+
+        /// <summary>Flag room-box faces whose image-source reflection inverts (pressure-release: the
+        /// physics of reflecting off a much softer medium). Bit f = face f in the box order
+        /// -x,+x,-y,+y,-z,+z; the flagship case is an underwater room whose ceiling is the surface:
+        /// 1u &lt;&lt; 3. Image-source only (occlusion and reverb keep the face's material); call after
+        /// the box/ground exists; live-safe like the room calls, and a later box/ground call resets
+        /// every face.</summary>
+        public void SceneSetPressureRelease(uint faceMask)
+        {
+            if (Ready) Bwa.bwa_scene_set_pressure_release(_eng, faceMask);
         }
 
         // Load-time (Awake) scene bake. The box-ONLY case uses the engine's own box helper, which also

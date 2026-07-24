@@ -198,7 +198,47 @@ int main(void) {
         }
     }
 
+    /* 6. LIVE decay retune (bwa_fdn_set_decay while the tap runs): a mid-run fdn_set_decay must
+     * (a) keep the tail continuous — no restart, no click, energy keeps decaying through the seam
+     * (the gains ramp across one block) — and (b) actually change the slope: the same tail decays
+     * at the OLD rate before the call and at the NEW rate after it. */
+    {
+        Fdn* f = fdn_create(&L, RATE, CH, 0);
+        CHECK(f != NULL, "fdn_create (live retune)");
+        if (f) {
+            enum { RETUNE = 200 };
+            fdn_set_decay(f, 2.0f, 2.0f, 2000.f);
+            static float bus[CH * N];
+            static float aux[N];
+            for (uint32_t b = 0; b < BLOCKS; ++b) {
+                if (b == RETUNE) fdn_set_decay(f, 0.25f, 0.25f, 2000.f);   /* the live call under test */
+                memset(bus, 0, sizeof bus);
+                memset(aux, 0, sizeof aux);
+                if (b == 0) aux[0] = 1.f;
+                fdn_tap(f, bus, N, NULL, NULL, aux);
+                double acc = 0;
+                for (uint32_t s = 0; s < L.count; ++s) {
+                    const float* p = &bus[(size_t)s * N];
+                    for (uint32_t i = 0; i < N; ++i) acc += (double)p[i] * p[i];
+                }
+                e[b] = acc;
+            }
+            double rt_slow = rt60_fit(e, 40, 180);
+            double rt_fast = rt60_fit(e, RETUNE + 10, RETUNE + 80);
+            printf("fdn: live retune rt60 %.3f s -> %.3f s (want 2.0 -> 0.25)\n", rt_slow, rt_fast);
+            CHECK(rt_slow > 1.5 && rt_slow < 2.7,  "pre-retune tail decays at the configured slow rate");
+            CHECK(rt_fast > 0.15 && rt_fast < 0.40, "post-retune tail decays at the NEW rate — the retune is live");
+            int cont = 1, finite = 1;
+            for (uint32_t b = RETUNE - 1; b < RETUNE + 6; ++b)   /* a click/restart would spike the energy */
+                if (e[b + 1] > e[b] * 2.0) cont = 0;
+            for (uint32_t b = 0; b < BLOCKS; ++b) if (!isfinite(e[b])) finite = 0;
+            CHECK(cont,   "the tail rides through the retune (no click, no restart)");
+            CHECK(finite, "live retune stays finite");
+            fdn_destroy(f);
+        }
+    }
+
     if (fails) { printf("fdn_test: %d FAILURES\n", fails); return 1; }
-    printf("fdn_test OK (tail, RT60 landing, 2-band decay, anisotropic decay, max-rE pair, stability)\n");
+    printf("fdn_test OK (tail, RT60 landing, 2-band decay, anisotropic decay, max-rE pair, stability, live retune)\n");
     return 0;
 }

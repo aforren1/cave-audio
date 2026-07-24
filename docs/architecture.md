@@ -41,29 +41,43 @@ The panner does not write "to the device". It writes to an in-memory **master bu
 one channel per speaker. *Consumers* read that bus:
 
 - **ASIO device sink (production):** writes the bus straight to the Digiface.
-- **Binaural monitor (debug):** treats each bus channel as a virtual speaker at that
-  speaker's surveyed room position, HRTFs them to stereo, and writes to an ordinary
-  output device (a headphone DAC). It sits *after* the panner, so it auditions the
-  real array render (DBAP behavior and all), not an idealized version.
+- **Array-sim monitor (`cave_sim`, and `cave_both`'s tap):** treats each bus channel
+  as a virtual speaker at that speaker's surveyed room position, HRTFs them to
+  stereo, and writes to an ordinary output device (a headphone DAC). It sits
+  *after* the panner, so it auditions the real array render (DBAP behavior and
+  all), not an idealized version.
 
-The binaural monitor is just a second consumer of the bus. Keep it that way. The
+The sim monitor is just a second consumer of the bus. Keep it that way. The
 abstraction set is: a **render target** (the bus), one or more **device sinks**
-consuming buses, and the binaural monitor as a **bus→bus transform** (N→2) feeding a
+consuming buses, and the monitor as a **bus→bus transform** (N→2) feeding a
 stereo sink.
+
+The **direct binaural render** (`BWA_PROFILE_BINAURAL`) is the one deliberate
+extension of that picture: point voices bypass the speaker panner and SH-encode at
+their true listener-relative directions into a 16-channel **direct field** beside
+the bus; beds pass SH→SH into the same field (one diagonal) and the pathing
+accumulator sums in raw (same basis). The bus keeps the synthesized-diffuse taps
+(the FDN tail, the reflection bed), and one HRTF decode consumes both. With the
+SDK, each point voice's dry additionally rides its own `IPLBinauralEffect` (the
+mode-2 point taps — true per-source HRTF, spread power-splitting point vs field).
+It is still "render targets + consumers" — the direct field and the point taps are
+profile-gated render targets, not a parallel engine. Anything synthesized-diffuse
+belongs on the bus.
 
 ```
             sources
               │  per-voice, listener-relative DBAP (recomputed on move)
+              │  (BINAURAL profile: per-voice SH encode at the true direction instead)
               ▼
-      ┌───────────────────┐
-      │  N-ch master bus  │  (in memory, owned by audio thread)
-      └───────────────────┘
-        │                  │
-   per-ch gain/delay   bus→ambisonics→HRTF
-   align               (single binaural decode)
+      ┌───────────────────┐   ┌──────────────────────────┐
+      │  N-ch master bus  │   │ 16-ch direct field (SH)  │  (BINAURAL only)
+      └───────────────────┘   └──────────────────────────┘
+        │                  │            │
+   per-ch gain/delay   bus→ambisonics ──┴─→ HRTF
+   align               (one binaural decode for both)
         │                  │
      ASIO ► Digiface         stereo device
-     (cave)             (binaural debug)
+   (cave, cave_both)    (binaural · cave_sim · cave_both's tap)
 ```
 
 ### The full render path
@@ -101,18 +115,24 @@ graph, with each stage annotated with the functions that implement and configure
  × occlusion level × directivity                     w×h extent · near-spread + size floors)
  │ ├→ × wet send (× distance) → AUX (mono)           → dual-band low derivation; × user gain
  │ └→ ISM: per-voice ring → 6 shoebox mirror         × group gain × timed fades
- │       images (frac delay · HF damp · per-
- │       image panner gains) ──────────→ BUS
- air-absorption LP → loudness shelf → Doppler ring
- │ └→ decor split (× √spread) ─────────→ DECOR
- pan: single gains · dual-band (700 Hz) ·
-      spectral (6 bands × 6 gain sets) ─→ BUS
+ │       images (frac delay · HF damp · per-         BINAURAL profile: the solve is instead
+ │       image panner gains) ──────────→ BUS         16 SH gains at the TRUE direction ×
+ air-absorption LP → loudness shelf → Doppler ring   atten × gain (spread = per-degree
+ │ └→ decor split (× √spread) ─────────→ DECOR       taper); voice + ISM images then
+ pan: single gains · dual-band (700 Hz) ·            accumulate to DIRECT, not BUS (dual-
+      spectral (6 bands × 6 gain sets) ─→ BUS        band/decor/spectral gated off). Mode 2
+                                                     (SDK): spread power-splits the dry —
+                                                     point share √(1−s) onto the voice's OWN
+                                                     mono tap (per-voice HRTF), wide √s onto
+                                                     the SH field
 
  BED VOICE (mix_bed) - per sample
  ────────────────────────────────
  SH frames → rotate (yaw phasor · full 3-axis Ivanic-Ruedenberg matrix; glided)
  ├→ matrix render: × max-rE taper (crossfaded; opt. band-split - taper > 700 Hz
  │       only, rV decode below) → bed decode (AllRAD · EPAD) ────────────────→ BUS
+ ├→ BINAURAL profile: SH->SH pass — × ambi_canon_to_phonon (one diagonal) ──→ DIRECT
+ │       (max-rE + parametric are speaker-decode concerns: gated off)
  └→ parametric render (crossfaded): FOA band split → DirAC direction + diffuseness ψ
       direct  √(1−ψ)·W → listener-relative panner at the array shell ───────→ BUS
       diffuse √ψ·FOA  → bed decode (raw) ───────────────────────────────────→ DECOR
@@ -124,6 +144,7 @@ graph, with each stage annotated with the functions that implement and configure
          decode)  ·or·  FDN (16 lines · Householder · 2-band decay · direction-
          scaled · lines rendered as plane waves through the bed decode + max-rE pair)
  PATH ACCUM → path tap: phonon's own ambisonics decode ───────────────────────→ BUS
+          └→ BINAURAL profile: summed raw instead (already phonon-basis SH) ─→ DIRECT
 
  output stage - everything that reaches a device passes through, in this order
  ─────────────────────────────────────────────────────────────────────────────
@@ -133,11 +154,15 @@ graph, with each stage annotated with the functions that implement and configure
  + test signal (bwa_set_test_signal - a raw channel, deliberately post-align)
  linked limiter (default −1 dBFS) → per-channel peak meters
       │
-      ├ cave      26-ch ASIO ► Digiface ► the array
-      ├ binaural  each bus channel = a virtual speaker at its room position →
-      │           3rd-order SH encode → phonon HRTF decode (simple-pan fallback) → 2 ch
-      ├ both      the array sink + the monitor on a second device (double-buffered)
-      └ null      no device: keeps rendering in real time, silent (tools' visual mode)
+      ├ cave       26-ch ASIO ► Digiface ► the array
+      ├ binaural   DIRECT (SH, unlimited - hard-clamped post-decode) + the bus's
+      │            virtual-speaker encode → ONE phonon HRTF decode, then the mode-2
+      │            per-voice point taps each through their OWN IPLBinauralEffect,
+      │            summed (cardioid+pan fallback, field-only) → 2 ch
+      ├ cave_sim   each bus channel = a virtual speaker at its room position →
+      │            3rd-order SH encode → phonon HRTF decode (simple-pan fallback) → 2 ch
+      ├ cave_both  the array sink + the cave_sim monitor on a second device (double-buffered)
+      └ null       no device: keeps rendering in real time, silent (tools' visual mode)
 ```
 
 The tap ordering is deliberate, not incidental:
@@ -177,29 +202,34 @@ binary and the device opens that many channels.
 ## Profiles
 
 You select a profile at startup (`bwa_desc.profile`); usage from the engine is
-identical across all three:
+identical across all four:
 
-| profile    | bus consumers                         | tracking needed | Dante HW |
-|------------|---------------------------------------|-----------------|----------|
-| `cave`     | ASIO/Digiface                              | position only   | yes      |
-| `binaural` | binaural monitor → stereo             | full head pose  | no       |
-| `both`     | ASIO/Digiface + binaural monitor → stereo  | full head pose  | yes      |
+| profile     | what renders                                              | tracking needed | Dante HW |
+|-------------|-----------------------------------------------------------|-----------------|----------|
+| `cave`      | bus → ASIO/Digiface                                       | position only   | yes      |
+| `binaural`  | direct field + diffuse bus → one HRTF decode → stereo     | full head pose  | no       |
+| `cave_sim`  | bus → virtual-speaker monitor → stereo                    | full head pose  | no       |
+| `cave_both` | bus → ASIO/Digiface + the `cave_sim` monitor → stereo     | full head pose  | yes      |
 
-`binaural` runs the array render into memory; only the stereo monitor touches a
-device, so it needs no Dante hardware. This is the desk-development profile.
+`binaural` is the first-class headphone render (point sources at their true
+directions, no array simulation in the direct path); `cave_sim` auditions the
+ARRAY render — same bus, DBAP artifacts included, the desk-verification profile.
+Both run the array render into memory; only the stereo device opens, so neither
+needs Dante hardware.
 
-`both` gives you a live headphone monitor of the CAVE render while standing at the
-rack. The two device clocks are independent: the monitor isn't sample-locked to the
-array, it just reads the same bus.
+`cave_both` gives you a live headphone monitor of the CAVE render while standing at
+the rack. The two device clocks are independent: the monitor isn't sample-locked to
+the array, it just reads the same bus.
 
 ## Tracking asymmetry (a correctness point)
 
-The two consumers need different tracking, and the API reflects this:
+The renders need different tracking, and the API reflects this:
 
 - **Array render** needs listener **position only**. Head orientation is irrelevant:
   this is real sound from real speakers, and the listener's actual ears localize it.
-- **Binaural monitor** needs full head **pose** (position + orientation), because it
-  simulates the room on headphones and must rotate the virtual speakers with the head.
+- **The headphone renders** need full head **pose** (position + orientation): the
+  sim monitor rotates the virtual speakers with the head, and the direct render
+  applies orientation at the HRTF decode.
 
 So the tracking layer always provides full pose; the array renderer ignores the
 orientation component.

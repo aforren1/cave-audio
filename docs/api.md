@@ -18,15 +18,18 @@ walks disk streaming + push sources. All three are console programs built every 
 - Per-speaker gain/delay/correction-EQ output stage driven by a measured layout
   file, with a linked protection limiter as the final stage.
 - Acoustics, **any build**: image-source early reflections (each wall bounce panned
-  as a point source, so it has parallax as the listener walks), a directional FDN
-  reverb tail, manual occlusion with per-band transmission EQ.
-- Acoustics, **Steam Audio builds**: ray-traced occlusion, source directivity, a
-  reflection bed (real-time or baked), sound pathing around occluders, and the HRTF
-  binaural monitor (without the SDK the binaural profile falls back to a simple pan).
-  Which reverb/reflection path to run is a real choice; see
+  as a point source, so it has parallax as the listener walks; a shoebox or a bare
+  ground plane, with pressure-release faces for water surfaces), a directional FDN
+  reverb tail with live decay retune, manual occlusion with per-band transmission EQ,
+  weighted-dipole source directivity.
+- Acoustics, **Steam Audio builds**: ray-traced occlusion, a reflection bed
+  (real-time or baked), sound pathing around occluders, and the HRTF binaural decode
+  (without the SDK the headphone profiles fall back to a simple pan). Which
+  reverb/reflection path to run is a real choice; see
   [materials.md](./materials.md) → "Choosing an acoustics path".
 - Propagation (any build): Doppler, air absorption, equal-loudness compensation,
-  pitch; opt-in per source.
+  near-field proximity, pitch; opt-in per source. The speed of sound itself is a
+  live engine-wide parameter (underwater, slow motion).
 - Assets: WAV/FLAC/MP3 decoded (and resampled) at load, disk streaming for long
   files, AmbiX ambisonic beds decoded world-locked to the array.
 - Voices: fixed pool with priority stealing, pause and click-free seek,
@@ -75,17 +78,20 @@ bwa_stop(eng); bwa_destroy(eng);
 
 Every voice is panned into an in-memory **master bus**, one channel per speaker
 (26 on the CAVE array; see [Channel count](#channel-count)). The profile selects
-who consumes it:
+who consumes it — and, for `BWA_PROFILE_BINAURAL`, changes how point sources
+render:
 
-| profile               | consumers |
-|-----------------------|-----------|
-| `BWA_PROFILE_CAVE`     | bus → ASIO → Dante (production). Listener **position** only - real speakers, real ears. |
-| `BWA_PROFILE_BINAURAL` | bus → HRTF monitor → any 2-ch ASIO device (desk debugging). Each bus channel is a virtual speaker at its surveyed room position; full **pose** - head orientation turns the virtual array around you. |
-| `BWA_PROFILE_BOTH`     | both at once: array to Dante + a monitor tap. |
+| profile                 | what renders |
+|-------------------------|--------------|
+| `BWA_PROFILE_CAVE`      | bus → ASIO → Dante (production). Listener **position** only - real speakers, real ears. |
+| `BWA_PROFILE_BINAURAL`  | the first-class headphone render → any 2-ch ASIO device. Point sources (and their ISM reflections) skip the speaker panner entirely — with the SDK each point voice gets its **own true HRTF convolution** (one `IPLBinauralEffect` per voice; spread crossfades toward a shared SH field), without it each SH-encodes at its **true** listener-relative direction into that field. Ambisonic beds pass SH→SH and pathing sums its indirect field in directly (no speaker round trip); only the FDN/reflection-bed tails ride the bus as virtual speakers. One HRTF decode + the per-voice convolutions produce stereo — none of the array's phantom-source spread. Full **pose**. |
+| `BWA_PROFILE_CAVE_SIM`  | bus → HRTF monitor → any 2-ch ASIO device (array auditioning). Each bus channel is a virtual speaker at its surveyed room position, DBAP artifacts included; full **pose** - head orientation turns the virtual array around you. |
+| `BWA_PROFILE_CAVE_BOTH` | array to Dante + the `CAVE_SIM` monitor tap, concurrently. |
 
-The binaural monitor hears the **same mix** production plays, panner and
-all—headphone debugging exercises the array render, not a parallel stereo path.
-See [architecture.md](./architecture.md).
+Pick by question, not habit: *"what will the room do?"* is `CAVE_SIM` — it hears
+the **same mix** production plays, panner and all. *"Best possible headphone
+rendering of this scene"* — demos, remote listening, development without the
+array — is `BINAURAL`. See [architecture.md](./architecture.md).
 
 ## The threading contract
 
@@ -129,7 +135,7 @@ The recommended reflections-and-reverb stack, no Steam Audio build required: the
 first-order wall bounces from the
 [image-source model](#image-source-early-reflections-no-sdk-needed) carry the early
 field, a [directional FDN](#directional-fdn-reverb-no-sdk-needed) carries the late
-tail. The room and the reverb are load-time; only the motion is per-frame.
+tail. The room and the reverb are set up once; only the motion is per-frame.
 
 ```c
 // load time: geometry and reverb are baked before start
@@ -163,8 +169,8 @@ bwa_commit(e);
 
 - **The box is the *virtual* room**, the space the content pretends to be in, never the
   physical CAVE: the real room adds its own reflections on top, and modelling it
-  double-counts ([materials.md](./materials.md)). It's load-time only; set it between
-  `bwa_create` and `bwa_start`.
+  double-counts ([materials.md](./materials.md)). Safe to call live — a room change
+  re-solves the reflections next block.
 - **Materials are audible in any build.** Each bounce is damped per band by its wall's
   absorption: the carpet floor above kills the floor slap, the brick walls keep their
   treble. Pick the six faces deliberately.
@@ -265,10 +271,13 @@ while (!WindowShouldClose()) {
 
 ### Develop at the desk, run on the rig
 
-The profile is the only seam: the binaural monitor renders the **same 26-channel mix**
-production plays, through virtual speakers at the surveyed room positions
-([Profiles and the master bus](#profiles-and-the-master-bus)). Panning, acoustics, and
-gain-staging bugs show up on headphones before the rig exists.
+The profile is the only seam. For rig verification use `BWA_PROFILE_CAVE_SIM`: it
+renders the **same 26-channel mix** production plays, through virtual speakers at
+the surveyed room positions
+([Profiles and the master bus](#profiles-and-the-master-bus)). Panning, acoustics,
+and gain-staging bugs show up on headphones before the rig exists.
+`BWA_PROFILE_BINAURAL` is the other headphone profile — the best-quality direct
+render, for when headphones are the product rather than the probe.
 
 ```c
 // The rig's endpoint is an RME Digiface Dante. Its ASIO driver registers under RME's own
@@ -276,7 +285,7 @@ gain-staging bugs show up on headphones before the rig exists.
 // bwa_calibrate --list-drivers) rather than hardcoding a guess. NULL auto-picks the first
 // driver with enough channels for the profile, which is usually what you want anyway.
 bwa_desc cfg = { 0 };
-cfg.profile     = rig ? BWA_PROFILE_CAVE : BWA_PROFILE_BINAURAL;
+cfg.profile     = rig ? BWA_PROFILE_CAVE : BWA_PROFILE_CAVE_SIM;   // desk: audition the array render
 cfg.layout_path = rig ? "cave_layout.json" : NULL;         // desk: the default grid
 cfg.asio_driver = rig ? rig_driver_name : NULL;            // NULL = auto-pick
 bwa_engine* e = bwa_create(&cfg);
@@ -299,8 +308,112 @@ matter:
   silent null sink and keeps rendering: `bwa_source_is_playing`, playheads, and clocks
   all advance, so CI and visual-only demos run unchanged. Set `cfg.sink = BWA_SINK_ASIO`
   where silence would hide a failure.
-- **`BWA_PROFILE_BOTH`** is the rig plus a monitor tap: the array over Dante and
-  headphones at the operator's desk at once.
+- **`BWA_PROFILE_CAVE_BOTH`** is the rig plus a monitor tap: the array over Dante and
+  headphones at the operator's desk at once (the tap is the `CAVE_SIM` audition —
+  a running rig's headphone feed answers "what is the array doing", not "what
+  could headphones do").
+
+### Recipes: physical emulation
+
+Composable patterns for physical effects that live in *your* code, built from calls the engine
+already has. Each is a few lines on the control thread; everything ramps, nothing blocks. The
+common thread: most "environment" effects are really per **source-listener pair** effects — apply
+them per source whose path crosses the boundary, not as a master-bus wash.
+
+#### The listener submerges
+
+Physics at an air-to-water boundary: ~30 dB of broadband transmission loss, water passes almost no
+treble, and localization collapses (only near-vertical rays penetrate; underwater interaural delays
+shrink 4.3x). Each maps to a knob. A bubbling vent next to the submerged listener needs *none* of
+this — its path never crosses the surface — which is why it's per source:
+
+```c
+/* every source on the OTHER side of the surface, on submerge/emerge: */
+void cross_surface(bwa_engine* e, bwa_source s, bool crossed) {
+    static const float water[3] = { 0.30f, 0.06f, 0.01f };  /* low/mid/high transmission */
+    bwa_source_set_occlusion_manual(e, s, crossed ? 0.03f : 1.0f, crossed ? water : NULL);
+    bwa_source_set_spread(e, s, crossed ? 0.8f : 0.0f);     /* direction goes diffuse */
+}
+
+/* the room-wide half, once per transition: */
+bwa_fdn_set_decay(e, 3.0f, 0.3f, 800.0f);    /* long LF tail, dead HF — hard walls under water */
+bwa_set_reverb_gain(e, 1.5f);
+bwa_set_speed_of_sound(e, 1480.0f);          /* Doppler + reflection timing follow the medium */
+```
+
+Sources submerged *with* the listener keep playing untouched — the FDN and the speed of sound
+already carry the medium. Resist the classic game pitch-drop: frequency is invariant across a
+medium boundary, so it's an aesthetic, not physics (`bwa_source_set_pitch` if you want it anyway).
+
+#### The water surface overhead (Lloyd's mirror)
+
+A surface seen from below reflects inverted (pressure-release, R ≈ -1): the flipped image cancels
+the direct sound near the boundary, which is why near-surface sources sound thin. Two assemblies,
+both live-safe (a mid-scene call re-solves the reflections next block — the submerge
+transition):
+
+```c
+/* a bounded underwater room: the ceiling (+y) is the surface */
+bwa_material faces[6] = { rock, rock, sand, 0 /*surface*/, rock, rock };
+bwa_scene_set_box(e, 10.0f, 4.0f, 10.0f, faces);
+bwa_scene_set_pressure_release(e, 1u << 3);            /* +y reflects inverted */
+
+/* open water: no walls, just the surface plane at y = 2 m, listener below it */
+bwa_scene_set_ground(e, 2.0f, 0, true);
+```
+
+Then `bwa_source_set_early_reflections(e, s, true)` on the sources near the surface — the comb
+falls out of the image-source render. (The same `bwa_scene_set_ground` with `false` is the plain
+outdoor recipe: the ground bounce, the one early reflection an open scene has.)
+
+#### A doorway to the next room
+
+The aperture *is* a secondary source. Park a proxy at the door frame, play the far room's content
+on it, and the listener-relative panner does the walking-past for you:
+
+```c
+bwa_source door = bwa_source_create(e);
+bwa_source_set_pos(e, door, 2.0f, 1.2f, -3.0f);        /* the frame's centre */
+bwa_source_set_size(e, door, 0.5f);                    /* the opening's radius: correct nearness */
+static const float leak[3] = { 1.0f, 0.6f, 0.3f };     /* an opening, not a wall: mild HF loss */
+bwa_source_set_occlusion_manual(e, door, 0.5f, leak);
+bwa_source_set_reverb_send(e, door, 1.5f);             /* it carries the far room's wet */
+```
+
+With a Steam scene, `bwa_source_set_pathing` automates this (the sim finds the aperture); the
+proxy is the no-SDK version, and also the *authored* version when you want control.
+
+#### Wind
+
+Upwind sources read quieter and duller. The engine has no weather model — your game does, so
+drive the same manual-occlusion knob from it per frame:
+
+```c
+/* updot in [-1, 1]: how upwind the source is; strength in [0, 1] */
+float loss = 1.0f - 0.4f * fmaxf(0.0f, updot) * strength;
+float tilt[3] = { 1.0f, 1.0f - 0.3f * updot * strength, 1.0f - 0.6f * updot * strength };
+bwa_source_set_occlusion_manual(e, s, loss, tilt);
+```
+
+#### Slow motion
+
+```c
+bwa_set_speed_of_sound(e, 70.0f);      /* delays and Doppler stretch 5x: bullet-time acoustics */
+bwa_source_set_pitch(e, s, 0.5f);      /* content rate is a separate, aesthetic decision */
+```
+
+Delays saturate at each voice's ring capacity (~40 ms at 48 kHz), so extreme factors cap — the
+pitch bends still track motion below that.
+
+#### At arm's length
+
+Not a boundary effect, but the same idea — finish the physics the panner starts. A close source
+should widen *and* gain body:
+
+```c
+bwa_set_near_spread(e, 1.0f);            /* geometric: sources widen inside 1 m (engine-wide) */
+bwa_source_set_proximity(e, s, true);    /* spectral: LF rises inside 1 m (per source) */
+```
 
 ## Lifecycle
 
@@ -331,13 +444,13 @@ copied at call time).
 
 | field            | meaning                                                              |
 |------------------|---------------------------------------------------------------------|
-| `profile`        | `cave` / `binaural` / `both` (see architecture.md)                   |
-| `layout_path`    | surveyed speaker geometry (JSON); cave/both. NULL = the default 26-grid deliberately; a named file that fails to load fails `bwa_start` (`BWA_ERR_LAYOUT`) |
-| `hrtf_path`      | HRTF (SOFA) or NULL for built-in; binaural/both                     |
+| `profile`        | `cave` / `binaural` / `cave_sim` / `cave_both` (see [Profiles](#profiles-and-the-master-bus)) |
+| `layout_path`    | surveyed speaker geometry (JSON); cave/cave_both. NULL = the default 26-grid deliberately; a named file that fails to load fails `bwa_start` (`BWA_ERR_LAYOUT`) |
+| `hrtf_path`      | HRTF (SOFA) or NULL for built-in; the headphone profiles             |
 | `sample_rate`    | Hz; 0 = 48000, the **validated** rate. The DSP is rate-derived and 96 kHz renders correctly in software, but rates above 48 k are unverified against the real Digiface/Dante chain - treat 48 kHz as supported until the rig confirms more |
 | `block_size`     | render quantum, frames; 0 = 256. Also the ASIO buffer-size *hint* - a driver may run its own size (the sinks adapt); `bwa_get_block_size` reads back the resolved quantum |
 | `sink`           | output-device policy: `BWA_SINK_AUTO` (0, default - try ASIO, fall back to the silent null sink), `BWA_SINK_ASIO` (demand a device: an open failure fails `bwa_start` loudly), `BWA_SINK_NULL` (force the offline sink - CI, profiling, tracking-only), `BWA_SINK_MANUAL` (no device/thread - pump blocks yourself with `bwa_render_block`; deterministic, for golden tests) |
-| `asio_driver`    | ASIO driver name to open; NULL = auto-pick the first registered driver with enough output channels for the profile (binaural finds a 2-ch headphone driver, cave a ≥layout-count one) |
+| `asio_driver`    | ASIO driver name to open; NULL = auto-pick the first registered driver with enough output channels for the profile (the headphone profiles find a 2-ch driver, cave a ≥layout-count one) |
 | `embree`         | ray-trace the acoustics sims on Intel Embree; silently falls back to the default tracer if the phonon build lacks it - see [Ray-tracing acceleration](#ray-tracing-acceleration-bwa_descembree) |
 | `enable_pathing` | run the sound-pathing sim from `bwa_start` (needs scene geometry + the Steam Audio build); sources opt in via `bwa_source_set_pathing` |
 | `bed_decoder`    | diffuse-bed SH→speaker decoder: AllRAD (0, default) or EPAD (1) - see [Panner and layout query](#panner-and-layout-query-control-thread) |
@@ -719,7 +832,7 @@ ambient content.
 
 Beds are **world-locked**: the soundfield is fixed to the room. The physical speakers are
 world-fixed too, so a listener walking through the field is handled by the real acoustics,
-and the binaural monitor's head-tracking applies downstream.
+and the headphone renders' head-tracking applies downstream.
 
 Load with `bwa_load_ambix` (a multichannel asset; mono and other channel counts are rejected),
 then drive with the `bwa_bed_*` family: no position, only a master gain. Legacy **FuMa** B-format
@@ -788,8 +901,8 @@ void bwa_set_listener_pose(bwa_engine* e, float px,float py,float pz,
                                        float qx,float qy,float qz,float qw);
 ```
 
-Position is used by both consumers. Orientation (the quaternion) is used by the
-**binaural monitor only**; the array render ignores it. With a tracker connected,
+Position is used by every render. Orientation (the quaternion) is used by the
+**headphone renders only**; the array render ignores it. With a tracker connected,
 do not call this: the core samples the freshest OptiTrack pose at block time.
 
 ### Internal tracking (`bwa_tracker_connect`)
@@ -880,7 +993,7 @@ either way. (If a future Motive outruns the parser, the unicast-only `Bitstream`
 the server to a known syntax; see `src/natnet.c`.)
 Set `lead_s` to your measured motion-to-ears latency (in seconds); too much lead **overshoots on
 direction changes**, so start at the measured value, not above it (clamped at 0.2 s). Orientation is not
-predicted (it only feeds the monitor). Internal tracking only (needs a connected tracker).
+predicted (it only feeds the headphone decodes). Internal tracking only (needs a connected tracker).
 
 ### Extra listeners (multi-occupant compromise)
 
@@ -895,7 +1008,8 @@ space; per-frame-safe, commit-gated like the pose): every source's gains become 
 each occupant hears an image biased toward their own solve instead of one exact and N wrong.
 Constant-power; works with every panner (each extra keeps its own SPCAP/VBAP cache, so the solves
 stay cache-warm). The primary listener remains `bwa_set_listener_pose`/tracking and still drives
-spread direction, Doppler, air absorption, the reverb-send distance, and the binaural monitor.
+spread direction, Doppler, air absorption, the reverb-send distance, and the headphone renders
+(`BWA_PROFILE_BINAURAL` ignores extras entirely — headphones are one head by construction).
 `count = 0` restores single-listener panning. Cost: one extra point solve per listener per dirty
 voice (block-rate, negligible).
 
@@ -963,6 +1077,19 @@ Geometry rules:
 - **Room space, RH metres, CCW triangles.** `bwa_scene_set_box` builds a floor-based shoebox
   with inward-facing normals: x/z centred on the origin, y from 0 (the floor) up to `h`;
   the listener stands inside.
+- **The outdoor degenerate: `bwa_scene_set_ground(e, y, mat, pressure_release)`.** One horizontal
+  mirror plane at height `y` instead of a box — the ground bounce, the dominant early reflection
+  when there is no room. Same dual capture as the box (ISM always, a large ground quad for the
+  ray tracer with SDK); replaces any prior box (one room at a time); live-safe like the box.
+  `pressure_release` flips the reflection's polarity — set it when the "ground" is a water
+  surface and the listener is under it.
+- **Pressure-release faces: `bwa_scene_set_pressure_release(e, face_mask)`.** Flags box faces
+  (bit f = face f, the `-x,+x,-y,+y,-z,+z` order) whose image-source reflection should NEGATE —
+  the physics of reflecting off a much softer medium. The flagship case is a virtual underwater
+  room whose ceiling is the surface (`1u << 3`): the inverted image interferes destructively with
+  the direct sound near the boundary, the Lloyd's-mirror comb. ISM only (polarity is a specular
+  concept); occlusion and the reverb bed keep the face's material. Call after `_set_box` or
+  `_set_ground`; a later room call resets every face.
 - **One scene, two consumers.** The same per-triangle materials feed both occlusion (per-band
   transmission) and the reflection bed (absorption/scattering): one shared `IPLScene`.
 - **The box and your own mesh are alternatives, not layers.** `bwa_scene_set_box` *is* a
@@ -993,9 +1120,11 @@ Geometry rules:
   build, except token minting (plain table state) and `bwa_scene_set_box`, which ALWAYS captures
   the shoebox for the image-source early reflections. `bwa_scene_add_dynamic_mesh` returns `-1`
   without the backend.
-- **`bwa_scene_set_box` is load-time only.** Unlike the static-mesh swap (which the sim thread
-  serializes), the box's ISM handoff assumes the audio thread is not yet running. Set it between
-  `bwa_create` and `bwa_start`.
+- **The room calls are live-safe.** `bwa_scene_set_box` / `_set_ground` / `_set_pressure_release`
+  publish the ISM room to the audio thread through a seqlock, and each opted-in source re-solves
+  its images next block — gains ramp, delays glide, so a mid-scene room change (the submerge
+  transition) bends the reflections instead of clicking. With the SDK a live box/ground also pays
+  the static-mesh BVH rebuild.
 
 ## Occlusion and directivity (control thread; per-frame except where noted)
 
@@ -1012,7 +1141,15 @@ The setters are **non-blocking, enqueue-only** (safe in the hot loop). The off-t
 at a low rate and publishes a per-source scalar (+ a 3-band transmission tilt for occlusion) that the
 **audio thread ramps**—never a jump. Occlusion and directivity are independent (a source can be
 directional without being occluded). The `_get_` reads return the latest published scalar for
-HUD/diagnostics and are safe to poll. No-ops without the Steam Audio build.
+HUD/diagnostics and are safe to poll. Occlusion is a no-op without the Steam Audio build (use the
+manual path below).
+
+**Directivity works in every build.** Same weighted-dipole model, `|(1-w) + w·cos θ|^p`, two
+renderers: with a Steam scene the occlusion sim evaluates it (~10-30 Hz, published + ramped);
+without one — no SDK, or SDK with no scene — the audio thread evaluates it per block from the
+source's forward axis and the active listener. Both are walk-correct; the readback reports
+whichever path is live. Don't expect bit-identical gains between the two (update rates differ),
+just the same pattern.
 
 ### Manual occlusion (no SDK needed)
 
@@ -1034,6 +1171,8 @@ with identical click-free rendering. Don't drive one source from both this and t
 void bwa_source_set_doppler        (bwa_engine* e, bwa_source s, bool on);
 void bwa_source_set_air_absorption (bwa_engine* e, bwa_source s, bool on);
 void bwa_source_set_loudness_comp  (bwa_engine* e, bwa_source s, bool on);
+void bwa_source_set_proximity      (bwa_engine* e, bwa_source s, bool on);
+void bwa_set_speed_of_sound        (bwa_engine* e, float meters_per_sec);   // engine-wide; live
 ```
 
 Opt-in, per source, default **off**, and (unlike occlusion/directivity) **pure per-voice DSP that
@@ -1053,6 +1192,17 @@ block from the committed positions.
   as well as far. This restores part of the body with a one-pole LF shelf (~250 Hz) whose boost
   tracks the attenuation the panner applied: +0.4 dB per dB taken, capped +8 dB. It's a
   stylization ("far, not tinny"), not physics; leave it off for strict realism.
+- **Proximity** is loudness compensation's near mirror: an LF shelf (~300 Hz) that *rises* as the
+  source closes inside ~1 m — 0 dB at the radius, up to +6 dB at the head — the spherical-wavefront
+  proximity effect. In a walkable volume this is the missing half of distance: at arm's length a
+  source should read as *bass*, not just level. Pair with `bwa_set_near_spread` (the geometric
+  half: a close source also widens).
+- **Speed of sound** (engine-wide, not per source): everything that renders a propagation *delay*
+  derives from `c` — Doppler (delay and pitch-shift magnitude) and the image-source reflection
+  delays. Default 343 (air); 1480 is underwater; small values exaggerate Doppler for slow-motion
+  effects. Live: a change **glides** every delay to its new target (bends, never steps). Delays
+  saturate against their ring capacity (~40 ms at 48 kHz), so extreme slow motion caps. Clamped to
+  [30, 20000]; the Steam sim's ray clock is phonon's own and does not follow it.
 
 All are **non-blocking, enqueue-only**, ramp on the audio thread (coefficients and gains glide across
 the block; no zipper), and are independent of each other and of the panner / profile. They apply to
@@ -1180,8 +1330,9 @@ This is a speaker-check / wiring / calibration tool: walk a tone across every ch
 the channel→speaker map, find a dead speaker, set a trim. It is **not** a spatial path: it
 bypasses the panner, so don't use it to "place" a sound. Per-frame-safe, takes effect next block,
 no `bwa_commit` needed. Any number of channels at once; `gain 0` / `BWA_TEST_OFF` silences one.
-Works in every profile (cave/both: a raw tone on that Digiface channel; binaural: that bus channel
-HRTF'd as its virtual speaker). Needs no SDK.
+Works in every profile (cave/cave_both: a raw tone on that Digiface channel; the headphone
+profiles: that bus channel HRTF'd as its virtual speaker — in `binaural` the tone rides the
+diffuse/virtual-speaker path, since only point sources render direct). Needs no SDK.
 
 `bwa_get_bus_levels` is the matching **readback**: each output channel's last-block peak `|sample|`
 (linear), measured at the very end of the render, after align, the test signal, and the limiter.
@@ -1201,7 +1352,7 @@ void bwa_set_output_capture(bwa_engine* e, bwa_output_fn cb, void* user);
 `bwa_set_output_capture` taps the **final device-bound output**: post-limiter, exactly what reaches
 the device. The callback runs on the **audio thread**, once per block, with **planar** channel-major
 data (`planar[c*nframes + i]`). `channels` is the primary device's channel count: the array count
-(`bwa_get_channel_count`) for `cave`/`both`, `2` for `binaural`. Same audio-thread contract as any
+(`bwa_get_channel_count`) for `cave`/`cave_both`, `2` for `binaural`/`cave_sim`. Same audio-thread contract as any
 callback here: **copy out only, no alloc/lock/syscall/file I/O**; write to a ring your own thread
 drains to a file or comparison buffer. Pass `cb = NULL` to stop, and keep `user` alive until after
 the NULL set plus one block.
@@ -1219,7 +1370,7 @@ const float* bwa_render_block(bwa_engine* e, uint32_t* channels, uint32_t* nfram
 
 Set `bwa_desc.sink = BWA_SINK_MANUAL` and no device or audio thread is created—**you** pump one block
 at a time on your own thread. Each call renders exactly one block (`bwa_desc.block_size` frames) of the
-profile's primary output (`binaural`: 2 ch; `cave`/`both`: `bwa_get_channel_count()` ch) into
+profile's primary output (`binaural`/`cave_sim`: 2 ch; `cave`/`cave_both`: `bwa_get_channel_count()` ch) into
 engine-owned memory and returns a pointer (**planar**, `channels * nframes` floats, valid until the
 next call or `bwa_stop`). Fills `*channels`/`*nframes` (either may be `NULL`). Returns `NULL` if the
 engine isn't started or the sink isn't `MANUAL`.
@@ -1346,8 +1497,46 @@ overshooting. The ceiling is a **linear** peak amplitude in `(0..1]` — like ev
 ABI — so `0.891251` is −1 dBFS; a value above 1 clamps to 1 and a non-positive value is ignored.
 
 This is driver/speaker **protection** against digital overs and pathological content, not a
-mastering limiter. If it engages in normal use, turn the content down. In the `binaural` profile
-the same limited bus feeds the monitor, so headphones inherit the ceiling too.
+mastering limiter. If it engages in normal use, turn the content down. In `cave_sim`/`cave_both`
+the same limited bus feeds the monitor, so headphones inherit the ceiling too. In `binaural` only
+the diffuse layer passes through it — the direct field bypasses the speaker bus, so the engine
+hard-clamps the final stereo at ±1 instead (no ramped limiting on the direct path; content that
+clips there is too hot).
+
+## Headphone correction EQ (control thread)
+
+```c
+bwa_result bwa_load_headphone_eq(bwa_engine* e, const char* path);   // load-class: file I/O; NULL/"" clears
+void       bwa_set_headphone_eq (bwa_engine* e, bool on);            // the ramped live A/B; default on
+```
+
+The headphone-side align stage. The HRTF decode assumes acoustically transparent headphones;
+real ones color the signal, so a serious binaural chain EQs the headphone flat first. This
+corrects the **transducer**, not the render: the cascade runs on the final device-bound stereo
+of every headphone profile (`binaural`, `cave_sim`, `cave_both`'s monitor tap) after the HRTF
+decode and before the output clamp — so A/B-ing the two renders stays fair, and the array
+render never sees it (speakers get the per-speaker align stage instead). In `cave` it is inert.
+
+The format is **AutoEq's `ParametricEQ.txt`**
+([github.com/jaakkopasanen/AutoEq](https://github.com/jaakkopasanen/AutoEq) — measured,
+target-compensated corrections for thousands of headphone models):
+
+```
+Preamp: -6.4 dB
+Filter 1: ON PK Fc 105 Hz Gain -4.6 dB Q 0.70
+```
+
+`PK`/`LSC`/`HSC` map onto the engine's RBJ biquads; `LS`/`HS` are accepted, a missing Q
+defaults to 0.707, `OFF` filters and unknown lines are skipped. The `Preamp` line is honored —
+corrections **boost** dips, and the preamp is the headroom that keeps them out of the clamp.
+A malformed `Filter` line, an unreadable file, or a file with no filters fails with
+`BWA_ERR_CONFIG` (`bwa_last_error` has the reason) and **keeps the previous EQ**.
+
+Loading is click-free: a running correction ramps out, the new one ramps in. The toggle
+crossfades the same way — flip it mid-listen to hear what the correction does. State does not
+survive `bwa_destroy`: reload after rebuilding an engine (the playground's EQ field does this
+for you across its render/driver rebuilds). Personalized **HRTFs are the other half**: SOFA via
+`bwa_desc.hrtf_path` corrects your ears, this corrects your headphones; they compose.
 
 ## Reflection bed (control thread)
 
@@ -1407,6 +1596,7 @@ typedef struct {
     uint32_t reserved[3];
 } bwa_fdn_desc;
 void bwa_fdn_config(bwa_engine* e, const bwa_fdn_desc* cfg);                             // LOAD-TIME
+void bwa_fdn_set_decay(bwa_engine* e, float rt60_low_s, float rt60_high_s, float xover_hz);  // LIVE
 ```
 
 A **phonon-free** late-reverb alternative that takes the reverb tap *instead of* the Steam bed
@@ -1423,6 +1613,14 @@ diagonal special case of the Directional FDN (Alary/Politis/Schlecht, JAES 2019)
 *design* a space (an open side, a treated wall); do **not** match the real room's RT60 (see
 [calibration.md](./calibration.md)).
 
+**The decay is live.** `bwa_fdn_set_decay` retunes the two-band decay while the engine runs: the
+FDN ramps its per-line loss gains to the new values across one block (~5 ms), so the tail keeps
+ringing and only its *slope* changes — no click, no restart. This is what a room transition sounds
+like: stepping into a cathedral, submerging (long low band, dead high band), walking out into open
+air. `<= 0` keeps a parameter's current value; pre-start it just updates the staged config, so a
+scene can call it unconditionally. Structure (enable, anisotropy) stays load-time; the wet level is
+`bwa_set_reverb_gain`, as always.
+
 Deterministic CPU (no rays, no IRs, infinite tail), works in no-SDK builds—the reverb path no
 longer requires the Steam Audio SDK.
 
@@ -1430,6 +1628,8 @@ longer requires the Steam Audio SDK.
 
 ```c
 void bwa_scene_set_box(bwa_engine* e, float w, float h, float d, const bwa_material faces[6]);  // the room
+void bwa_scene_set_ground(bwa_engine* e, float y, bwa_material mat, bool pressure_release);     // or a bare plane
+void bwa_scene_set_pressure_release(bwa_engine* e, uint32_t face_mask);      // flag inverting faces (water)
 void bwa_source_set_early_reflections(bwa_engine* e, bwa_source s, bool on);   // per source; per-frame-safe
 void bwa_set_early_reflections_gain(bwa_engine* e, float linear);            // live; default 1
 ```
@@ -1452,8 +1652,15 @@ source bends its reflections instead of stepping them.
 which is exactly what the FDN already renders, for free and with a proper decay. Spending
 per-voice DSP to reproduce it would be double work. A source outside the room renders dry.
 
-Cost: six panner solves per opted-in voice per block, plus six delay taps per sample. Opt in on the
-sources that matter (a few), not on everything.
+Two room variants beyond the box: `bwa_scene_set_ground` renders just the **ground bounce**
+(outdoor scenes: one plane, one image, mirrors a source on either side), and
+`bwa_scene_set_pressure_release` flags faces that reflect **inverted** — a water surface seen from
+below has reflection coefficient ≈ -1, so the flipped image cancels the direct sound near the
+boundary (the Lloyd's-mirror comb). See "Materials and scene geometry" for both, and the
+physical-emulation recipes (under "How-to guides") for the underwater assembly.
+
+Cost: six panner solves per opted-in voice per block (one for the ground plane), plus the delay
+taps per sample. Opt in on the sources that matter (a few), not on everything.
 
 ## Handle scheme
 

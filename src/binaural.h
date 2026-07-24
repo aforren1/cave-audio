@@ -9,6 +9,10 @@
  * position + head orientation. The production path is a higher-order ambisonic encode ->
  * single ambisonics->binaural HRTF decode via Steam Audio (one decode, not 26 convolutions);
  * that slots in here behind the same interface when the SDK is vendored (see docs/spatialization.md).
+ *
+ * BWA_PROFILE_BINAURAL adds the direct-binaural field (rt_direct_ambi): this fallback decodes
+ * its first-order channels with the same opposed-cardioid idea, so the direct render stays
+ * verifiable (routing, gross laterality) on a no-SDK build too.
  */
 #ifndef BWA_BINAURAL_H
 #define BWA_BINAURAL_H
@@ -24,8 +28,12 @@ void     monitor_destroy(Monitor* m);
 
 /* Decode one block of the planar `bus` (channels * nframes) to stereo for a listener at `p`
  * with head orientation quaternion `q` (xyzw). `out` is planar 2-ch: out[i]=L, out[nframes+i]=R.
- * Audio thread; no alloc/lock (recomputes the per-channel pan only when the pose changes). */
-void monitor_process(Monitor* m, const float* bus, const float p[3], const float q[4],
-                     float* out_stereo, uint32_t nframes);
+ * `direct16` is the optional direct-binaural SH field (BWA_AMBI_CH planar channels of nframes,
+ * phonon monitor basis — rt_direct_ambi; NULL = none): its first-order channels are decoded with
+ * two opposed cardioids at the ear axes — same fallback philosophy as the pan (routing + gross
+ * laterality, not timbre; the higher degrees are ignored). Audio thread; no alloc/lock
+ * (recomputes the per-channel pan + ear decode only when the pose changes). */
+void monitor_process(Monitor* m, const float* bus, const float* direct16,
+                     const float p[3], const float q[4], float* out_stereo, uint32_t nframes);
 
 #endif /* BWA_BINAURAL_H */

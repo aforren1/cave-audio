@@ -268,10 +268,11 @@ reflection aux-send buffer. `align_process` takes the `Aligner`, not the engine.
 
 Two things that are *not* helpers here:
 
-- **The binaural decode** is a sink render callback in engine.c
-  (`render_binaural` → `monitor_process` / `steam_monitor_process`), not a bus
-  tap. Steam Audio's phonon objects are created at `bwa_start`, and the decode
-  runs inside the sink callback.
+- **The headphone decode** is a sink render callback in engine.c
+  (`render_binaural` → `monitor_process` / `steam_monitor_process`, with the
+  `binaural` profile's direct SH field read via `rt_direct_ambi` on the same
+  thread), not a bus tap. Steam Audio's phonon objects are created at
+  `bwa_start`, and the decode runs inside the sink callback.
 - **Device output** goes through the `bwa_sink` abstraction
   ([`src/sink.h`](../src/sink.h)), whose render callback fills the device's
   planar buffers directly.

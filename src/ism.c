@@ -9,6 +9,19 @@
 
 int ism_images(const IsmRoom* r, const float src[3], IsmImage* out) {
     if (!r || !src || !out || !r->valid) return 0;
+
+    if (r->plane_only) {                                        /* ground mode: one horizontal mirror */
+        for (int k = 0; k < 3; ++k) out[0].pos[k] = src[k];
+        out[0].pos[1] = 2.f * r->ground_y - src[1];
+        for (int b = 0; b < 3; ++b) {
+            float a1 = r->absorb[2][b];                         /* the plane lives in face slot 2 (-y) */
+            if (a1 < 0.f) a1 = 0.f; else if (a1 > 1.f) a1 = 1.f;
+            float rc = sqrtf(1.f - a1);
+            out[0].refl[b] = r->press[2] ? -rc : rc;            /* pressure-release: polarity flip */
+        }
+        return 1;
+    }
+
     if (!(r->w > 0.f) || !(r->h > 0.f) || !(r->d > 0.f)) return 0;
 
     const float lo[3] = { -0.5f * r->w, 0.f,  -0.5f * r->d };   /* the six planes, in face order */
@@ -25,7 +38,8 @@ int ism_images(const IsmRoom* r, const float src[3], IsmImage* out) {
         for (int b = 0; b < 3; ++b) {
             float a1 = r->absorb[f][b];
             if (a1 < 0.f) a1 = 0.f; else if (a1 > 1.f) a1 = 1.f;
-            out[f].refl[b] = sqrtf(1.f - a1);                   /* energy absorption -> pressure coefficient */
+            float rc = sqrtf(1.f - a1);                         /* energy absorption -> pressure coefficient */
+            out[f].refl[b] = r->press[f] ? -rc : rc;            /* pressure-release: polarity flip */
         }
     }
     return ISM_IMAGES;

@@ -4,6 +4,31 @@ All notable changes to `com.brainworks.bw_audio`.
 
 ## [Unreleased]
 
+### Added — physical emulation batch
+
+- **`SourceBase.proximity`** (inspector toggle + `bwa_source_set_proximity`): near-field LF boost —
+  the shelf rises as the source closes inside ~1 m, so "at arm's length" reads as bass, not just
+  level. Loudness comp's near mirror; pushed on init and live from OnValidate like its siblings.
+- **`Engine.SpeedOfSound`** (inspector field + live property, `bwa_set_speed_of_sound`): Doppler
+  and reflection delays derive from it and glide to a change. 343 air, 1480 underwater; small
+  values exaggerate Doppler for slow motion.
+- **`Engine.FdnSetDecay(low, high, xover)`** (`bwa_fdn_set_decay`): LIVE FDN decay retune — the
+  room-transition knob; the tail keeps ringing, only its slope changes. `<= 0` keeps a parameter.
+- **`Engine.SceneSetGround(worldY, material, pressureRelease)`** (`bwa_scene_set_ground`): the
+  outdoor degenerate of the room box — one mirror plane, the ground bounce. Replaces the box.
+- **`Engine.SceneSetPressureRelease(faceMask)`** (`bwa_scene_set_pressure_release`): flag box faces
+  whose image-source reflection inverts — an underwater room's ceiling-as-surface (`1u << 3`), the
+  Lloyd's-mirror comb.
+- **Directivity note**: `directivity`/`directivityPower` now work in every build — without a Steam
+  scene the engine evaluates the same weighted dipole on the audio thread (no binding change).
+- **Headphone correction EQ** (`bwa_load_headphone_eq` / `bwa_set_headphone_eq`; Unity raw externs,
+  Godot `load_headphone_eq(path)` + the `set_headphone_eq` ramped A/B): an AutoEq ParametricEQ.txt
+  for your headphone model, applied to the final stereo of every headphone profile after the HRTF
+  decode — the headphone-side align stage (corrects the transducer, not the render; inert in
+  `cave`). The Preamp line is honored; a bad file fails with `ErrConfig` and keeps the previous EQ;
+  loading and toggling both crossfade. Reload after an engine rebuild (the correction dies with the
+  engine; the Godot toggle itself replays on restart).
+
 ### Changed — ABI breaks (pre-freeze cleanup, `BWA_VERSION` → 0.10.0)
 
 Deliberate, one-time ABI breaks before the pre-hardware freeze. Update call sites:
@@ -23,6 +48,19 @@ Deliberate, one-time ABI breaks before the pre-hardware freeze. Update call site
 - **`bwa_set_pose_prediction` lead is now in SECONDS**, not milliseconds (matching the fade-time
   calls). The Unity field is `posePredictionS` (was `posePredictionMs`, range `0..0.2`); the Godot
   `set_pose_prediction` argument is seconds.
+- **The profile enum was renamed and renumbered** around the new first-class binaural render:
+  `BWA_PROFILE_BINAURAL` (still 1) is now the DIRECT per-source headphone render (point sources
+  SH-encode at their true listener-relative directions and HRTF-decode — no speaker-array
+  simulation in the direct path); the old virtual-speaker array audition is
+  `BWA_PROFILE_CAVE_SIM` (2), and the old `BWA_PROFILE_BOTH` is `BWA_PROFILE_CAVE_BOTH` (3, rig +
+  the sim tap). Unity: `BwaProfile.{Cave, Binaural, CaveSim, CaveBoth}`; Godot:
+  `PROFILE_{CAVE, BINAURAL, CAVE_SIM, CAVE_BOTH}` (the Godot playground now uses CAVE_SIM, since
+  its speaker meters visualize the array bus). If you were using `Binaural` to audition the
+  ARRAY, switch to `CaveSim`; if you wanted the best headphone render, `Binaural` just got better:
+  with the Steam Audio build every point source gets its own true HRTF convolution (one
+  `IPLBinauralEffect` per voice), ambisonic beds pass SH→SH, and pathing's indirect field joins
+  the binaural decode directly — no speaker-array round trip anywhere in the direct render. No
+  API surface changed for this; it's all behind the profile.
 
 ### Added — ABI parity (the seven calls the binding had missed)
 

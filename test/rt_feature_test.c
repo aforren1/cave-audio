@@ -5,9 +5,11 @@
  * DSP behaviour toggles layered on top: the ambisonic bed + bed renderers (rotation/orientation/
  * parametric/max-rE + band split), the panner variants (dual-band) and reflection/pathing taps,
  * source spread (lobe/MDAP/spectral) + extent + frame transport + near-spread + metric size,
- * decorrelation, pathing transmission EQ, air absorption + Doppler + loudness comp +
+ * decorrelation, pathing transmission EQ, air absorption + Doppler + loudness comp + near-field
+ * proximity + manual directivity + the engine-wide speed of sound +
  * distance→reverb send + attenuation override, tracked room EQ, pose prediction, multi-listener
- * compromise panning, image-source early reflections, and pitch.
+ * compromise panning, image-source early reflections (box, ground plane, pressure-release
+ * polarity), pitch, and the direct-binaural SH routing (BWA_PROFILE_BINAURAL's rt half).
  *
  * Routing goes through real DBAP, so the observable is "a source at speaker k's surveyed position
  * makes channel k dominate"; the shared harness (layout, probes, wav writers, taps, CHECK) is
@@ -621,6 +623,113 @@ int main(void) {
         }
     }
 
+    /* near-field proximity boost (bwa_source_set_proximity): the near mirror of loudness comp — at
+     * 0.25 m the LF shelf sits at ~ +4.2 dB (6 dB * (1 - dist/1 m) through the ~300 Hz corner); a
+     * 5 kHz tone is untouched; a source outside the 1 m radius gets nothing; opt-out ramps flat. */
+    {
+        RtCore* cn = rt_create(8, 4, RATE, CH);
+        CHECK(cn != NULL, "rt_create (proximity)");
+        if (cn) {
+            /* a full-scale sine 0.25 m from the listener rides the -1 dBFS output limiter, which
+             * would eat part of the boost (and its ~120 ms release would smear the comparisons) —
+             * take protection out of the measurement */
+            rt_set_limiter(cn, 0);
+            const char* NW = "bwa_rt_nf100.wav";
+            if (write_sine_wav(NW, 100.0, 4800)) {
+                uint32_t sn = rt_load_sound(cn, NW, err, sizeof err);
+                uint32_t hn = rt_source_create(cn);
+                rt_source_play(cn, hn, sn, true);
+                rt_source_set_pos(cn, hn, LD.ref[0] + 0.25f, LD.ref[1], LD.ref[2]);   /* arm's length */
+                rt_commit(cn);
+                for (int b = 0; b < 4; ++b) render2(cn);
+                double l2_off = 0; for (int b = 0; b < 4; ++b) { render2(cn); l2_off += total_l2(); }
+                rt_source_set_proximity(cn, hn, true);
+                for (int b = 0; b < 8; ++b) render2(cn);     /* ramp + shelf settle */
+                double l2_on = 0; for (int b = 0; b < 4; ++b) { render2(cn); l2_on += total_l2(); }
+                double boost_db = 20.0 * log10(l2_on / l2_off);
+                printf("nf: 100 Hz boost at 0.25 m = %.2f dB (want ~4.2)\n", boost_db);
+                CHECK(boost_db > 3.0 && boost_db < 5.6, "the proximity shelf boosts LF at arm's length");
+                rt_source_set_proximity(cn, hn, false);
+                for (int b = 0; b < 8; ++b) render2(cn);
+                double l2_back = 0; for (int b = 0; b < 4; ++b) { render2(cn); l2_back += total_l2(); }
+                CHECK(fabs(20.0 * log10(l2_back / l2_off)) < 0.3, "opt-out ramps back to flat");
+                /* outside the radius: nothing (this is the near HALF of distance, not a fixed EQ) */
+                rt_source_set_pos(cn, hn, LD.ref[0] + 2.0f, LD.ref[1], LD.ref[2]);
+                rt_commit(cn);
+                for (int b = 0; b < 4; ++b) render2(cn);
+                double f_off = 0; for (int b = 0; b < 4; ++b) { render2(cn); f_off += total_l2(); }
+                rt_source_set_proximity(cn, hn, true);
+                for (int b = 0; b < 8; ++b) render2(cn);
+                double f_on = 0; for (int b = 0; b < 4; ++b) { render2(cn); f_on += total_l2(); }
+                CHECK(fabs(20.0 * log10(f_on / f_off)) < 0.3, "no boost outside the ~1 m near field");
+                rt_source_destroy(cn, hn); rt_commit(cn);
+                remove(NW);
+            } else CHECK(0, "write 100 Hz sine (nf)");
+            const char* NH = "bwa_rt_nf5k.wav";              /* HF: the shelf must not touch it */
+            if (write_sine_wav(NH, 5000.0, 4800)) {
+                uint32_t s5 = rt_load_sound(cn, NH, err, sizeof err);
+                uint32_t h5 = rt_source_create(cn);
+                rt_source_play(cn, h5, s5, true);
+                rt_source_set_pos(cn, h5, LD.ref[0] + 0.25f, LD.ref[1], LD.ref[2]);
+                rt_commit(cn);
+                for (int b = 0; b < 4; ++b) render2(cn);
+                double h_off = 0; for (int b = 0; b < 4; ++b) { render2(cn); h_off += total_l2(); }
+                rt_source_set_proximity(cn, h5, true);
+                for (int b = 0; b < 8; ++b) render2(cn);
+                double h_on = 0; for (int b = 0; b < 4; ++b) { render2(cn); h_on += total_l2(); }
+                CHECK(fabs(20.0 * log10(h_on / h_off)) < 0.8, "the proximity shelf leaves HF content alone");
+                rt_source_destroy(cn, h5); rt_commit(cn);
+                remove(NH);
+            } else CHECK(0, "write 5 kHz sine (nf)");
+            rt_destroy(cn);
+        }
+    }
+
+    /* MANUAL directivity (rt_source_set_directivity_manual — bwa_source_set_directivity's no-sim
+     * path): the audio thread evaluates the weighted dipole toward the active listener, per block.
+     * A cardioid facing away nulls; facing toward passes at full level; a figure-8 broadside nulls;
+     * weight 0 disables; the readback reports the manual gain (dir_pub). */
+    {
+        RtCore* cd = rt_create(8, 4, RATE, CH);
+        CHECK(cd != NULL, "rt_create (manual directivity)");
+        if (cd) {
+            uint32_t sd = rt_load_sound(cd, WAV, err, sizeof err);
+            uint32_t hd = rt_source_create(cd);
+            rt_source_play(cd, hd, sd, true);
+            rt_source_set_pos(cd, hd, LD.ref[0], LD.ref[1], LD.ref[2] + 2.f);   /* 2 m ahead */
+            rt_commit(cd);
+            render2(cd); render2(cd);
+            double e_base = total_energy();
+            CHECK(e_base > 0.0, "baseline renders");
+            /* cardioid facing AWAY (forward +z, listener at -z): cos = -1 -> |0.5 - 0.5| = 0 */
+            rt_source_set_directivity_manual(cd, hd, (const float[3]){ 0.f, 0.f, 1.f }, 0.5f, 1.f);
+            render2(cd); render2(cd); render2(cd);
+            double e_away = total_energy();
+            CHECK(e_away < 0.05 * e_base, "a cardioid facing away nulls the source");
+            CHECK(rt_get_directivity(cd, hd) < 0.05f, "readback reports the manual null");
+            /* cardioid facing TOWARD: cos = +1 -> full */
+            rt_source_set_directivity_manual(cd, hd, (const float[3]){ 0.f, 0.f, -1.f }, 0.5f, 1.f);
+            render2(cd); render2(cd); render2(cd);
+            double e_toward = total_energy();
+            CHECK(fabs(e_toward - e_base) < 0.1 * e_base, "a cardioid facing the listener passes at full level");
+            CHECK(fabsf(rt_get_directivity(cd, hd) - 1.f) < 0.05f, "readback reports on-axis");
+            /* figure-8 broadside (forward +x, listener at -z): cos = 0 -> |1 - 1 + 0| = 0 */
+            rt_source_set_directivity_manual(cd, hd, (const float[3]){ 1.f, 0.f, 0.f }, 1.f, 1.f);
+            render2(cd); render2(cd); render2(cd);
+            double e_side = total_energy();
+            CHECK(e_side < 0.05 * e_base, "a figure-8 broadside nulls the source");
+            /* weight 0 disables the pattern entirely (back to omni) */
+            rt_source_set_directivity_manual(cd, hd, (const float[3]){ 1.f, 0.f, 0.f }, 0.f, 1.f);
+            render2(cd); render2(cd);
+            double e_off = total_energy();
+            CHECK(fabs(e_off - e_base) < 0.1 * e_base, "weight 0 disables the pattern");
+            CHECK(fabsf(rt_get_directivity(cd, hd) - 1.f) < 1e-6f,
+                  "readback clears with the pattern (no stale dipole gain)");
+            rt_source_destroy(cd, hd); rt_commit(cd);
+            rt_destroy(cd);
+        }
+    }
+
     /* multi-listener compromise (rt_set_extra_listeners): one listener west of a centred source
      * biases the render east (DBAP weights the source's bearing); adding a mirrored second listener
      * makes the compromise SYMMETRIC at unchanged total power; clearing restores the bias. */
@@ -1079,6 +1188,55 @@ int main(void) {
         }
     }
 
+    /* ground-plane ISM (bwa_scene_set_ground): plane_only renders exactly ONE reflection — the
+     * ground bounce at its geometric path delay — and flipping the plane to pressure-release
+     * INVERTS it (the Lloyd's-mirror polarity, carried through the same ramped gain render). */
+    {
+        RtCore* cg = rt_create(8, 4, RATE, CH);
+        CHECK(cg != NULL, "rt_create (ground ISM)");
+        if (cg) {
+            IsmRoom plane; memset(&plane, 0, sizeof plane);
+            plane.plane_only = 1; plane.ground_y = 0.f; plane.valid = 1;   /* absorb 0: refl = +1 */
+            rt_set_ism_room(cg, &plane);
+            const float qg[4] = { 0, 0, 0, 1 };
+            rt_set_listener(cg, (const float[3]){ 0.f, 1.5f, 0.f }, qg);
+            const char* IW3 = "bwa_rt_imp_gnd.wav";
+            enum { GIMP = 300, GKB = 4 };
+            if (write_impulse_at_wav(IW3, GIMP, 8 * N)) {
+                uint32_t sg = rt_load_sound(cg, IW3, err, sizeof err);
+                static float gcap[GKB * N];
+                uint32_t hg = rt_source_create(cg);
+                rt_source_set_pos(cg, hg, 1.5f, 1.5f, 0.f);
+                rt_source_set_ism(cg, hg, true);
+                rt_source_play(cg, hg, sg, false);
+                rt_commit(cg);
+                render_capture_mono(cg, gcap, GKB);
+                /* image (1.5,-1.5,0), listener (0,1.5,0) -> path 3.354 m -> ~469 samples of delay */
+                const int w0 = GIMP + 380, w1 = GIMP + 560;
+                int pk = w0; float pv = 0;
+                for (int i = w0; i < w1; ++i) if (fabsf(gcap[i]) > pv) { pv = fabsf(gcap[i]); pk = i; }
+                printf("ground ism: bounce %d samples after the direct (want ~469), %s\n",
+                       pk - GIMP, gcap[pk] > 0.f ? "positive" : "NEGATIVE");
+                CHECK(pv > 0.02f * fabsf(gcap[GIMP]), "the ground bounce renders");
+                CHECK(pk - GIMP > 440 && pk - GIMP < 500, "the bounce lands at its geometric path delay");
+                CHECK(gcap[pk] > 0.f, "a hard ground reflects with positive polarity");
+                const float hard_pk = pv;
+                plane.press[2] = 1;                          /* the water surface: pressure-release */
+                rt_set_ism_room(cg, &plane);
+                rt_source_play(cg, hg, sg, false);           /* replay the impulse */
+                rt_commit(cg);
+                render_capture_mono(cg, gcap, GKB);
+                int pk2 = w0; float pv2 = 0;
+                for (int i = w0; i < w1; ++i) if (fabsf(gcap[i]) > pv2) { pv2 = fabsf(gcap[i]); pk2 = i; }
+                CHECK(gcap[pk2] < 0.f, "a pressure-release surface INVERTS the bounce (Lloyd's mirror)");
+                CHECK(fabs((double)pv2 - hard_pk) < 0.2 * hard_pk, "the polarity flip keeps the magnitude");
+                rt_source_destroy(cg, hg); rt_commit(cg);
+                remove(IW3);
+            } else CHECK(0, "write impulse wav (ground)");
+            rt_destroy(cg);
+        }
+    }
+
     /* propagation effects (opt-in per voice): air absorption (distance low-pass) + Doppler (glided delay) */
     {
         RtCore* cp = rt_create(8, 4, RATE, CH);
@@ -1170,6 +1328,46 @@ int main(void) {
                 remove(SW1);
             } else CHECK(0, "write 1k sine wav");
             rt_destroy(cp);
+        }
+    }
+
+    /* engine-wide speed of sound (rt_set_speed_of_sound): every propagation delay derives from c.
+     * The 3.43 m Doppler-delayed impulse that arrives at ~480 samples in air (343 m/s) arrives at
+     * ~111 in water (1480 m/s) and ~960 at half air speed (slow-motion). */
+    {
+        RtCore* cs = rt_create(8, 4, RATE, CH);
+        CHECK(cs != NULL, "rt_create (speed of sound)");
+        if (cs) {
+            const char* IW2 = "bwa_rt_imp_sos.wav";
+            if (write_impulse_wav(IW2, 16 * N)) {
+                uint32_t si2 = rt_load_sound(cs, IW2, err, sizeof err);
+                static float scap[8 * N];
+                rt_set_speed_of_sound(cs, 1480.f);           /* underwater */
+                uint32_t hw = rt_source_create(cs);
+                rt_source_set_pos(cs, hw, 3.43f, LD.ref[1], 0.f);
+                rt_source_set_doppler(cs, hw, true);
+                rt_source_play(cs, hw, si2, false);
+                rt_commit(cs);
+                render_capture_mono(cs, scap, 4);
+                int peak_w = argmax_abs(scap, 4 * N);
+                printf("sos: underwater arrival %d samples (want ~111)\n", peak_w);
+                CHECK(peak_w >= 105 && peak_w <= 118, "c = 1480 -> the propagation delay shrinks 4.3x");
+                rt_source_destroy(cs, hw); rt_commit(cs);
+
+                rt_set_speed_of_sound(cs, 171.5f);           /* half air speed: slow-motion */
+                uint32_t hs = rt_source_create(cs);
+                rt_source_set_pos(cs, hs, 3.43f, LD.ref[1], 0.f);
+                rt_source_set_doppler(cs, hs, true);
+                rt_source_play(cs, hs, si2, false);
+                rt_commit(cs);
+                render_capture_mono(cs, scap, 8);
+                int peak_s = argmax_abs(scap, 8 * N);
+                printf("sos: slow-motion arrival %d samples (want ~960)\n", peak_s);
+                CHECK(peak_s >= 950 && peak_s <= 972, "c = 171.5 -> the propagation delay doubles");
+                rt_source_destroy(cs, hs); rt_commit(cs);
+                remove(IW2);
+            } else CHECK(0, "write impulse wav (sos)");
+            rt_destroy(cs);
         }
     }
 
@@ -1273,11 +1471,129 @@ int main(void) {
         }
     }
 
+    /* direct-binaural mode (BWA_PROFILE_BINAURAL's rt half): point voices leave the speaker bus
+     * and land on the 16-ch SH accumulator (phonon monitor basis) at their true direction, carrying
+     * the layout's distance curve; beds keep rendering to the speaker bus (the diffuse layer). */
+    {
+        RtCore* cd = rt_create(8, 4, RATE, CH);
+        CHECK(cd != NULL, "rt_create (direct)");
+        if (cd) {
+            rt_set_direct_ambi(cd, 1);
+            uint32_t sd = rt_load_sound(cd, WAV, err, sizeof err);
+            uint32_t vd = rt_source_create(cd);
+            rt_source_play(cd, vd, sd, true);
+            /* 1 m to the room -x of the default listener (LD.ref) */
+            rt_source_set_pos(cd, vd, LD.ref[0] - 1.f, LD.ref[1], LD.ref[2]);
+            rt_commit(cd); render2(cd);
+            const float* d = rt_direct_ambi(cd);
+            CHECK(d != NULL, "direct: rt_direct_ambi exposes the accumulator");
+            CHECK(total_energy() < 1e-9, "direct: the point voice leaves the speaker bus silent");
+            /* settled W (ACN0) = source(1.0) * atten(dist) * Y00; the const source makes it exact */
+            const double a1 = atten_curve(1.f, LD.atten_ref_m, LD.atten_rolloff, LD.atten_min_lin);
+            const double w1 = d ? d[0 * N + (N - 1)] : 0.0;
+            CHECK(d && fabs(w1 - a1 * 0.2820948) < 2e-3, "direct: W = atten * Y00 for a unit source");
+            /* the first-order lateral channel carries the direction: |Y(ACN1)| = atten * Y1 (a pure
+             * -x source has no front/up component; laterality itself is pinned in monitor_test /
+             * steam_decode_test, which decode this exact basis) */
+            const double y1 = d ? d[1 * N + (N - 1)] : 0.0;
+            CHECK(d && fabs(fabs(y1) - a1 * 0.4886025) < 2e-3, "direct: the lateral SH channel carries the direction");
+            /* distance: re-solve at 3 m — the field scales by the layout curve's ratio */
+            rt_source_set_pos(cd, vd, LD.ref[0] - 3.f, LD.ref[1], LD.ref[2]);
+            rt_commit(cd); render2(cd);
+            const double a3 = atten_curve(3.f, LD.atten_ref_m, LD.atten_rolloff, LD.atten_min_lin);
+            const double w3 = d ? d[0 * N + (N - 1)] : 0.0;
+            CHECK(d && w1 > 0 && fabs(w3 / w1 - a3 / a1) < 1e-2,
+                  "direct: distance attenuation follows the layout curve");
+            rt_source_stop(cd, vd); render2(cd);
+            /* a bed passes SH->SH into the direct FIELD (one diagonal per channel), not the
+             * speaker bus: W keeps the orthonormal rescale, X (front) flips sign with the axis
+             * change (canon front = room +z, phonon front = room -z). */
+            const char* AMB = "bwa_rt_dir_amb.wav";
+            if (write_ambix4_wav(AMB, 0.5f, 0.f, 0.f, 0.25f, 4 * N)) {   /* W + X (front) */
+                uint32_t sb = rt_load_ambix(cd, AMB, err, sizeof err);
+                uint32_t vb = rt_source_create(cd);
+                rt_source_play(cd, vb, sb, true);
+                rt_commit(cd); render2(cd);
+                CHECK(total_energy() < 1e-9, "direct: the bed leaves the speaker bus silent");
+                const double bw = d ? d[0 * N + (N - 1)] : 0.0;
+                const double bx = d ? d[3 * N + (N - 1)] : 0.0;
+                CHECK(d && fabs(bw - 0.5 * 0.2820948) < 2e-3, "direct: bed W passes with the orthonormal rescale");
+                CHECK(d && fabs(bx - 0.25 * -0.4886025) < 2e-3, "direct: bed X passes with the axis-flip sign");
+                remove(AMB);
+            } else CHECK(0, "write direct-mode ambix wav");
+            rt_destroy(cd);
+        }
+    }
+
+    /* direct mode 2 (the per-voice point taps): a spread-0 voice rides its own mono slot
+     * (slot = source x atten, published with its direction) and leaves the SH field empty;
+     * at full spread the split flows the other way — the slot drains and the omni-tapered
+     * field carries the energy. No path switch, just the solve. */
+    {
+        RtCore* c2 = rt_create(8, 4, RATE, CH);
+        CHECK(c2 != NULL, "rt_create (direct mode 2)");
+        if (c2) {
+            rt_set_direct_ambi(c2, 2);
+            uint32_t s2 = rt_load_sound(c2, WAV, err, sizeof err);
+            uint32_t v2 = rt_source_create(c2);
+            rt_source_play(c2, v2, s2, true);
+            rt_source_set_pos(c2, v2, LD.ref[0] - 1.f, LD.ref[1], LD.ref[2]);
+            rt_commit(c2); render2(c2);
+            const RtDirectVoice* dv = NULL;
+            uint32_t nv = rt_direct_voices(c2, &dv);
+            CHECK(nv > 0 && dv != NULL, "mode2: rt_direct_voices exposes the view");
+            const double a1 = atten_curve(1.f, LD.atten_ref_m, LD.atten_rolloff, LD.atten_min_lin);
+            int vi = -1;
+            for (uint32_t i = 0; i < nv; ++i) if (dv[i].active) { vi = (int)i; break; }
+            CHECK(vi >= 0, "mode2: the point voice publishes a tap");
+            if (vi >= 0) {
+                CHECK(fabs(dv[vi].mono[N - 1] - a1) < 2e-3, "mode2: slot = source x atten at spread 0");
+                CHECK(dv[vi].dir[0] < -0.9f, "mode2: the published dir points at room -x");
+            }
+            const float* fld = rt_direct_ambi(c2);
+            double fe = 0; for (int k = 0; fld && k < 16 * N; ++k) fe += fabs(fld[k]);
+            CHECK(fld && fe < 1e-6, "mode2: the SH field stays empty at spread 0");
+            rt_source_set_spread(c2, v2, 1.f);
+            rt_commit(c2); render2(c2); render2(c2);
+            fe = 0; for (int k = 0; fld && k < 16 * N; ++k) fe += fabs(fld[k]);
+            CHECK(vi >= 0 && fabs(dv[vi].mono[N - 1]) < 1e-4, "mode2: the slot drains at full spread");
+            CHECK(fe > 1e-2, "mode2: the tapered field carries a fully-wide source");
+            rt_destroy(c2);
+        }
+    }
+
+    /* direct mode: the pathing accumulator (already phonon-basis SH) sums into the direct field;
+     * the speaker-decode path tap is skipped entirely. Field ACN0 settles on dry W + indirect W. */
+    {
+        RtCore* c3 = rt_create(8, 4, RATE, CH);
+        CHECK(c3 != NULL, "rt_create (direct path)");
+        if (c3) {
+            rt_set_direct_ambi(c3, 1);
+            uint32_t s3 = rt_load_sound(c3, WAV, err, sizeof err);
+            uint32_t v3 = rt_source_create(c3);
+            rt_source_play(c3, v3, s3, true);
+            rt_source_set_pos(c3, v3, LD.ref[0], LD.ref[1], LD.ref[2] + 2.f);
+            rt_set_path_tap(c3, test_path_tap, NULL, 4);
+            rt_source_set_pathing(c3, v3, true);
+            const float want[4] = { 0.4f, 0.2f, -0.1f, 0.25f };
+            rt_set_pathing(c3, v3, want, NULL, 4);
+            g_path_calls = 0;
+            rt_commit(c3); render2(c3);
+            CHECK(g_path_calls == 0, "direct: the speaker path tap is skipped");
+            const float* fld = rt_direct_ambi(c3);
+            const double a2 = atten_curve(2.f, LD.atten_ref_m, LD.atten_rolloff, LD.atten_min_lin);
+            CHECK(fld && fabs(fld[0 * N + (N - 1)] - (a2 * 0.2820948 + 0.4)) < 5e-3,
+                  "direct: the indirect field sums into the direct field");
+            rt_destroy(c3);
+        }
+    }
+
     remove(WAV);
     if (fails) { printf("rt_feature_test: %d FAILURES\n", fails); return 1; }
     printf("rt_feature_test OK (ambisonic-bed, reflection-tap, pathing+EQ, spread+MDAP+spectral+frame, "
            "tracked-room-EQ, decorrelation, parametric-bed, pose-pred, near-spread, source-size, "
-           "loudness-comp, multi-listener, pitch, bed-rotation+orientation, max-rE+split, extent, "
-           "asset-meta+attenuation, ISM early-reflections, air+Doppler, reverb-send, dual-band verified)\n");
+           "loudness-comp, proximity, manual-directivity, multi-listener, pitch, bed-rotation+orientation, "
+           "max-rE+split, extent, asset-meta+attenuation, ISM early-reflections+ground+polarity, "
+           "air+Doppler, speed-of-sound, reverb-send, dual-band, direct-binaural verified)\n");
     return 0;
 }

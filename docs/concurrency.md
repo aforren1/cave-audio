@@ -72,6 +72,7 @@ everything sampled is ramped in, never slammed.
 | generation-counted handles         | reuse source slots safely with no round-trip                 |
 | retire-ack via event ring          | free sound buffers only after the audio thread lets go       |
 | seqlock pose slot                  | a 7-float pose is too wide for one atomic store; bounded reader retry |
+| seqlock ISM-room slot              | a live room change (`bwa_scene_set_box`/`_set_ground`) must never tear under the mixer |
 | handle-gated atomic publish        | the occlusion sim may publish for a since-recycled voice     |
 | per-voice double buffer (pathing)  | a 16-float SH set must be read consistently, wait-free       |
 | per-stream SPSC ring               | file decode off the audio thread; underrun ≠ EOF             |
@@ -369,10 +370,14 @@ with the device's planar buffer (`cave` profile) or a scratch buffer
     `bwa_get_bus_levels`) and the active pose (the `readback` seqlock →
     `rt_read_pose`).
 
-The binaural monitor is not a bus tap: it is a *sink render callback* in
+The headphone decode is not a bus tap: it is a *sink render callback* in
 [`src/engine.c`](../src/engine.c) (`render_binaural`: `rt_render` into
-`scratch26`, then `monitor_process` / `steam_monitor_process` decodes to the
-2-ch device). Device output likewise goes through the `bwa_sink` abstraction
+`scratch26` — and, in the `binaural` profile, `rt_direct_ambi` /
+`rt_direct_voices` read the block's direct SH field and per-voice point taps on
+the same thread right after — then `monitor_process` / `steam_monitor_process`
+decodes to the 2-ch device). Neither the direct field nor the point taps ever
+cross a thread: `rt_render` fills them and the same callback consumes them before
+returning. Device output likewise goes through the `bwa_sink` abstraction
 ([`src/sink.h`](../src/sink.h)); the render callback fills the device's planar
 buffers directly.
 

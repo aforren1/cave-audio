@@ -890,10 +890,25 @@ static int engine_has_reverb;       /* which config the live engine was built in
  * config, reloading assets + recreating sources. Used at startup and on each reverb-boundary switch. */
 static bwa_sink_type g_sink_mode = BWA_SINK_AUTO;   /* --tests forces BWA_SINK_NULL (hermetic) */
 static const char*   g_asio_driver = NULL;          /* --driver <name>; NULL = auto-pick */
+static int           g_profile_direct = 0;          /* headphone render: 0 = cave_sim (array audition,
+                                                     * the default - the meters/gizmos read the bus),
+                                                     * 1 = binaural (direct per-source render). The
+                                                     * panel's render picker rebuilds to switch. */
+static char          g_hpeq_path[260];              /* headphone EQ (AutoEq ParametricEQ.txt); the
+                                                     * correction dies with an engine rebuild, so
+                                                     * build_engine re-loads from THIS - the panel
+                                                     * edits it and calls bwa_load_headphone_eq */
+static int           g_hpeq_loaded = 0;
+static bool          g_hpeq_on = true;
 
 static void build_engine(int with_reverb) {
     bwa_desc cfg = {
-        .profile = BWA_PROFILE_BINAURAL, .layout_path = g_layout_path, .hrtf_path = NULL,
+        /* Default CAVE_SIM: the playground is the desk CAVE simulator — the speaker gizmos light
+         * from the array-bus meters, so the headphone feed defaults to the array audition. The
+         * panel's render picker switches to BINAURAL (the direct per-source render) for by-ear
+         * A/B; the dry then bypasses the bus, so the gizmos going quiet is CORRECT there. */
+        .profile = g_profile_direct ? BWA_PROFILE_BINAURAL : BWA_PROFILE_CAVE_SIM,
+        .layout_path = g_layout_path, .hrtf_path = NULL,
         .sample_rate = SR, .block_size = 256, .sink = g_sink_mode, .asio_driver = g_asio_driver,
         /* create-time: only the reverb scene cares, but it's harmless for the others */
         .bed_decoder = rev_decoder ? BWA_DECODE_EPAD : BWA_DECODE_ALLRAD,
@@ -937,6 +952,10 @@ static void build_engine(int with_reverb) {
         if (!g_cust_bed) g_cust_bed_path[0] = 0;
     } else g_cust_bed = 0;
     for (int i = 0; i < NMAT; ++i) mats[i] = bwa_material_preset(e, mat_types[i]);
+    /* re-apply the headphone EQ: the correction lives in the engine, which was just rebuilt */
+    g_hpeq_loaded = (g_hpeq_path[0] && bwa_load_headphone_eq(e, g_hpeq_path) == BWA_OK) ? 1 : 0;
+    bwa_set_headphone_eq(e, g_hpeq_on);
+
     src  = bwa_source_create(e);  bwa_source_play(e, src,  sig_snd(), true);
     refl = bwa_source_create(e);  bwa_source_play(e, refl, sig_snd(), true);
     g_bed = bwa_bed_create(e);
@@ -1135,6 +1154,50 @@ static void draw_panel(void) {
               "the engine (brief gap). (auto-pick) = the first registered driver with enough "
               "outputs. A registered driver can still fail to open (unplugged/busy) - the engine "
               "falls back to the silent null sink; the audio line above is the truth.");
+    }
+    {   /* headphone-render picker: cave_sim auditions the ARRAY render, binaural is the direct
+         * per-source render. Create-time like the driver, so switching rebuilds + re-enters. */
+        static const char* prof_names[2] = { "render: cave_sim (array audition)",
+                                             "render: binaural (direct)" };
+        int pr = g_profile_direct;
+        ImGui::SetNextItemWidth(-FLT_MIN);
+        if (ImGui::Combo("##prof", &pr, prof_names, 2) && pr != g_profile_direct) {
+            g_profile_direct = pr;
+            rebuild_for_driver();                   /* same policy as the driver pick */
+        }
+        bwTip("Which headphone render (bwa_desc.profile) - A/B them by ear on the same scene. "
+              "cave_sim = the array render through virtual speakers, DBAP artifacts included; the "
+              "meters below show exactly what lights the speakers. binaural = the first-class "
+              "direct render (per-voice HRTF with the Steam build; point sources and beds bypass "
+              "the speaker bus, so quiet meters there are CORRECT - only the FDN/reflection tails "
+              "still ride the bus). The audio line above names the live decode (direct vs sim). "
+              "Create-time: switching REBUILDS the engine (brief gap).");
+    }
+    {   /* headphone correction EQ (bwa_load_headphone_eq): correct YOUR headphones before judging
+         * either render by ear. Path survives the render/driver rebuilds (build_engine re-loads). */
+        ImGui::SetNextItemWidth(-uiScaled(78.0f));
+        bool go = ImGui::InputTextWithHint("##hpeq", "headphone EQ (AutoEq ParametricEQ.txt)",
+                                           g_hpeq_path, sizeof g_hpeq_path,
+                                           ImGuiInputTextFlags_EnterReturnsTrue);
+        ImGui::SameLine();
+        if (ImGui::Button("load EQ") || go) {
+            if (!g_hpeq_path[0]) { bwa_load_headphone_eq(e, NULL); g_hpeq_loaded = 0; }
+            else g_hpeq_loaded = bwa_load_headphone_eq(e, g_hpeq_path) == BWA_OK ? 1 : 0;
+        }
+        bwTip("Headphone correction EQ (bwa_load_headphone_eq): an AutoEq ParametricEQ.txt for "
+              "your headphone model (github.com/jaakkopasanen/AutoEq covers thousands). Applied "
+              "to the final headphone stereo of every render - it corrects the TRANSDUCER, so "
+              "A/B-ing sim vs direct stays fair. Enter or the button loads; an empty path "
+              "clears; a bad file keeps the previous EQ (the status line shows the reason).");
+        if (g_hpeq_path[0] && !g_hpeq_loaded) {
+            const char* why = bwa_last_error(e);
+            ImGui::TextColored(ImVec4(1.00f, 0.45f, 0.45f, 1.0f), "EQ: %s", why ? why : "not loaded");
+        }
+        if (g_hpeq_loaded) {
+            if (ImGui::Checkbox("headphone EQ on", &g_hpeq_on)) bwa_set_headphone_eq(e, g_hpeq_on);
+            bwTip("The ramped A/B: flip mid-listen to hear what the correction does. On by default "
+                  "once a file loads.");
+        }
     }
     char mlabel[48];
     snprintf(mlabel, sizeof mlabel, "speakers 0-%d (60 dB window)", g_nspk - 1);
@@ -1457,8 +1520,8 @@ static void register_tests(ImGuiTestEngine* te) {
      * time, output meters flowing. A dead engine here once shipped as "visual-only mode". */
     t = IM_REGISTER_TEST(te, "viewer", "meters_live");
     t->TestFunc = [](ImGuiTestContext* ctx) {
-        /* fallback engaged; NOT "none" (dead engine). Prefix match: binaural appends the live
-         * monitor kind — "null (steam HRTF monitor)" / "null (simple-pan monitor)". */
+        /* fallback engaged; NOT "none" (dead engine). Prefix match: the headphone profiles append
+         * the live decode — "null (steam HRTF sim)" / "null (simple-pan sim)" (or "... direct"). */
         IM_CHECK(strncmp(backend_name, "null", 4) == 0);
         uint32_t n = 0;
         float m = 0.0f;
@@ -1510,6 +1573,29 @@ static void register_tests(ImGuiTestEngine* te) {
         ImGuiWindow* tip = ImGui::FindWindowByName("##Tooltip_00");
         IM_CHECK(tip != NULL && tip->WasActive);
         ctx->CaptureScreenshot();
+    };
+
+    /* the render picker: cave_sim <-> binaural is create-time, so the combo pick REBUILDS the
+     * engine through the same path a user's click takes; the status line's decode name ("sim" vs
+     * "direct") is the observable. Ends back on the default so later tests see cave_sim. */
+    t = IM_REGISTER_TEST(te, "viewer", "render_toggle");
+    t->TestFunc = [](ImGuiTestContext* ctx) {
+        ctx->SetRef("playground");
+        IM_CHECK_EQ(g_profile_direct, 0);
+        IM_CHECK(strstr(backend_name, "sim)") != NULL);          /* cave_sim names the sim decode */
+        /* the combo HEADER resolves by direct ID path (a "##" BeginCombo registers no label for
+         * the wildcard search); the popup's Selectables register normally, so "**" finds them */
+        ctx->ItemClick("##prof");                                /* open the render combo... */
+        ctx->ItemClick("**/render: binaural (direct)");          /* ...and pick the direct render */
+        IM_CHECK_EQ(g_profile_direct, 1);
+        IM_CHECK(e != NULL);                                     /* rebuilt + live */
+        IM_CHECK(strstr(backend_name, "direct)") != NULL);       /* the decode name flipped */
+        ctx->Yield(8);                                           /* a few live blocks in direct mode */
+        IM_CHECK_GE(bwa_get_channel_count(e), 4u);
+        ctx->ItemClick("##prof");
+        ctx->ItemClick("**/render: cave_sim (array audition)");
+        IM_CHECK_EQ(g_profile_direct, 0);
+        IM_CHECK(strstr(backend_name, "sim)") != NULL);
     };
 
     /* every scene enters cleanly; the reverb boundary rebuilds the engine BOTH ways and it stays

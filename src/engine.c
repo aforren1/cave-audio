@@ -22,7 +22,9 @@
 #include "steam_path.h"
 #include "fdn.h"
 #include "ism.h"
+#include "hpeq.h"           /* headphone correction EQ (bwa_load_headphone_eq) */
 
+#include <math.h>           /* isfinite (bwa_scene_set_ground) */
 #include <stdio.h>          /* snprintf (the backend readback string) */
 #include <stdlib.h>
 #include <string.h>
@@ -52,17 +54,22 @@ static const struct { const char* name; float absorption[3], scattering, transmi
     { "rock",     {0.13f,0.20f,0.24f}, 0.05f, {0.015f,0.002f,0.001f} },
 };
 
-/* The three profiles (docs/architecture.md):
- *   cave     — render the 26-ch array straight to a 26-ch device (ASIO/Digiface).
- *   binaural — render the array into memory, decode to a 2-ch device (the monitor).
- *   both     — array to a 26-ch device AND the monitor to a 2-ch device, concurrently.
- * The monitor uses the listener's head orientation; the array render ignores it.
+/* The four profiles (docs/architecture.md):
+ *   cave      — render the 26-ch array straight to a 26-ch device (ASIO/Digiface).
+ *   binaural  — the direct headphone render: point voices SH-encode at their true directions
+ *               (rt direct mode) while the diffuse layer renders to the in-memory array bus;
+ *               the monitor decodes bus + direct field to a 2-ch device in one pass.
+ *   cave_sim  — audition the ARRAY render on headphones: render the array into memory, decode
+ *               its channels as virtual speakers to a 2-ch device (no direct field).
+ *   cave_both — array to a 26-ch device AND the cave_sim monitor to a 2-ch device, concurrently.
+ * The headphone decodes use the listener's head orientation; the array render ignores it.
  *
- * NOTE: an ASIO driver picks its own buffer size, usually != cfg.block_size. binaural sizes
- * its render scratch to BWA_MAX_BLOCK and renders whatever block the device dictates, so it works
- * with any driver. The 'both' double-buffer still assumes the two devices share cfg.block_size (a
- * mismatched monitor block is silenced; the array renders any size). Live headphone output works
- * through a 2-ch ASIO driver (ASIO4ALL / FlexASIO / the Steinberg built-in); WASAPI is future. */
+ * NOTE: an ASIO driver picks its own buffer size, usually != cfg.block_size. binaural/cave_sim
+ * size their render scratch to BWA_MAX_BLOCK and render whatever block the device dictates, so they
+ * work with any driver. The 'cave_both' double-buffer still assumes the two devices share
+ * cfg.block_size (a mismatched monitor block is silenced; the array renders any size). Live
+ * headphone output works through a 2-ch ASIO driver (ASIO4ALL / FlexASIO / the Steinberg
+ * built-in); WASAPI is future. */
 struct bwa_engine {
     bwa_desc    cfg;
     int         started;
@@ -73,19 +80,19 @@ struct bwa_engine {
     int         panner;            /* mirror of bwa_set_panner (bwa_panner; 0 = DBAP) for the room_eq start guard */
 
     RtCore*     rt;               /* rings + voice/sound tables + mixer (rt.c) */
-    Monitor*    monitor;          /* binaural/both: 26->stereo decode */
+    Monitor*    monitor;          /* headphone profiles: 26->stereo decode (+ direct field in binaural) */
     Layout      layout;           /* effective speaker geometry (for the Steam decoder at start) */
     int         layout_failed;    /* an EXPLICIT layout_path failed to load at create — engine is on
                                    * the 26-grid fallback and bwa_start refuses with BWA_ERR_LAYOUT */
     char        layout_errbuf[256]; /* the load failure reason, preserved across start's error clear */
     uint32_t    cap;              /* scratch capacity in frames (== cfg.block_size) */
 
-    bwa_sink*     sink;             /* primary: cave 26ch / binaural 2ch / both array 26ch */
-    float*      scratch26;        /* binaural: 26-ch array render before the monitor */
+    bwa_sink*     sink;             /* primary: cave/cave_both array Nch / binaural+cave_sim 2ch */
+    float*      scratch26;        /* binaural/cave_sim: the array-bus render before the monitor decode */
 
-    bwa_sink*     sink_mon;         /* both: the monitor (2-ch) device */
-    float*      mon_buf[2];       /* both: stereo double-buffer (each 2*cap), array thread -> monitor thread */
-    volatile LONG mon_idx;        /* both: index of the latest published buffer */
+    bwa_sink*     sink_mon;         /* cave_both: the monitor (2-ch) device */
+    float*      mon_buf[2];       /* cave_both: stereo double-buffer (each 2*cap), array thread -> monitor thread */
+    volatile LONG mon_idx;        /* cave_both: index of the latest published buffer */
 
     NatNet*     tracker;          /* internal tracking (bwa_tracker_connect); NULL = pushed pose */
     SteamMonitor* steam;          /* production HRTF decode (binaural/both); NULL = first-cut pan */
@@ -103,6 +110,11 @@ struct bwa_engine {
     int           max_re;         /* mirror of bwa_set_max_re, so a pre-start toggle seeds the FDN */
     SteamPath*    path;           /* pathing (bwa_desc.enable_pathing); NULL otherwise */
     float         src_pos[BWA_VOICE_CAP][3];  /* control-side per-source positions, so set_pathing has the pos */
+    /* control-side directivity cache: bwa_source_set_orientation and _set_directivity arrive as
+     * separate calls, but the rt MANUAL path (no sim) wants them together — cache both and send the
+     * combined command on either. Defaults: forward = room ahead, weight 0 (off), power 1. */
+    float         src_fwd[BWA_VOICE_CAP][3];
+    float         src_dirw[BWA_VOICE_CAP], src_dirp[BWA_VOICE_CAP];
 
     /* material table (control-thread): token == index; [0] is the built-in default. Coefficients are
      * resolved to per-triangle materials when a mesh is set. mat_free marks released slots (reusable by
@@ -115,12 +127,58 @@ struct bwa_engine {
      * write-user-before-cb ordering (x64 store order) so a non-NULL cb is always seen with its user. */
     bwa_output_fn volatile capture_cb;
     void*         volatile capture_user;
+
+    /* headphone correction EQ (bwa_load_headphone_eq / bwa_set_headphone_eq): the control thread
+     * parses into the BACK design slot, publishes idx then gen (Interlocked = full barriers), and
+     * waits for the audio thread's ack before the slot may be rewritten (engine_hpeq ramps the old
+     * correction out, adopts, ramps the new in — a click-free swap). hpeq_on is the ramped A/B. */
+    HpEqDesign    hpeq[2];
+    volatile LONG hpeq_idx;       /* published design slot; -1 = none loaded */
+    volatile LONG hpeq_gen;       /* bumped per publish; the audio thread adopts on change */
+    volatile LONG hpeq_ack;       /* audio thread: last adopted gen (the control-side wait) */
+    volatile LONG hpeq_on;        /* the A/B toggle (default 1: loading engages) */
+    HpEqState     hpeq_st;        /* audio-thread-only: filter histories + the applied mix */
+    LONG          hpeq_adopted;   /* audio-thread-only: last adopted gen */
+    int           hpeq_active;    /* audio-thread-only: adopted slot (-1 = none) */
 };
+
+/* audio thread: hard-clamp a device-bound stereo block. The rt output limiter never sees the
+ * direct field (binaural: it bypasses the speaker bus) and the headphone EQ can boost past the
+ * limited level in ANY headphone profile — this is the last stop before the DAC, for both
+ * render_binaural and cave_both's monitor tap. */
+static inline void engine_clamp2(float* stereo, uint32_t n) {
+    for (uint32_t i = 0; i < n * 2; ++i) {
+        if (stereo[i] > 1.f) stereo[i] = 1.f; else if (stereo[i] < -1.f) stereo[i] = -1.f;
+    }
+}
 
 /* audio thread: hand the final device-bound block to the capture callback, if one is set. */
 static inline void engine_capture(bwa_engine* e, const float* planar, uint32_t channels, uint32_t n) {
     bwa_output_fn cb = e->capture_cb;
     if (cb) cb(e->capture_user, planar, channels, n);
+}
+
+/* audio thread: the headphone correction EQ on a device-bound stereo block. A published design
+ * change first ramps the RUNNING correction out (one block), then adopts + resets and ramps the
+ * new one in — so a live load never steps the spectrum (invariant 4 in spirit). Settled-off with
+ * nothing pending costs nothing. Runs on exactly one thread per engine: render_binaural
+ * (binaural/cave_sim) or render_both_array's monitor decode (cave_both) — never both. */
+static void engine_hpeq(bwa_engine* e, float* stereo, uint32_t n) {
+    const LONG gen = e->hpeq_gen;                       /* volatile reads; published idx-before-gen */
+    if (e->hpeq_adopted != gen) {
+        if (e->hpeq_st.mix > 1e-4f && e->hpeq_active >= 0) {   /* old correction still audible: */
+            hpeq_apply(&e->hpeq[e->hpeq_active], &e->hpeq_st, stereo, n, 0.f);   /* ramp it out */
+            return;
+        }
+        e->hpeq_adopted = gen;                          /* silent: adopt + reset, ramp in below */
+        e->hpeq_active  = (int)e->hpeq_idx;
+        hpeq_state_reset(&e->hpeq_st);
+        InterlockedExchange(&e->hpeq_ack, gen);         /* the back slot is now free to rewrite */
+    }
+    if (e->hpeq_active < 0) return;
+    const float tgt = e->hpeq_on ? 1.f : 0.f;
+    if (tgt == 0.f && e->hpeq_st.mix <= 1e-6f) { e->hpeq_st.mix = 0.f; return; }   /* settled off */
+    hpeq_apply(&e->hpeq[e->hpeq_active], &e->hpeq_st, stereo, n, tgt);
 }
 
 static void set_error(bwa_engine* e, const char* msg) {
@@ -157,29 +215,38 @@ static void render_cave(void* user, float* dev, uint32_t n, const bwa_timestamp*
     engine_capture(e, dev, e->layout.count, n);          /* final array output (post-limiter) */
 }
 
-/* binaural: render the 26-ch array to scratch, then decode to the 2-ch device. The scratch is
- * sized to BWA_MAX_BLOCK, so any device block size works (the binaural decode uses n internally
- * and consistently — no cross-buffer offset to keep in sync, unlike 'both'). */
+/* binaural + cave_sim: render the array bus to scratch (in binaural, rt also fills the direct SH
+ * field), then decode to the 2-ch device. The scratch is sized to BWA_MAX_BLOCK, so any device
+ * block size works (the decode uses n internally and consistently — no cross-buffer offset to
+ * keep in sync, unlike 'cave_both'). */
 static void render_binaural(void* user, float* dev2, uint32_t n, const bwa_timestamp* ts) {
     bwa_engine* e = (bwa_engine*)user;
     if (n > BWA_MAX_BLOCK) { memset(dev2, 0, sizeof(float) * (size_t)n * 2); return; }
     rt_render(e->rt, e->scratch26, n, ts);
+    const float* direct = rt_direct_ambi(e->rt);            /* non-NULL only in BWA_PROFILE_BINAURAL */
     float p[3], q[4];
     rt_get_listener(e->rt, p, q);
-    BWA_ZONE_BEGIN(zbin, "binaural decode");                /* 26 virtual speakers -> HRTF -> 2 ch */
+    BWA_ZONE_BEGIN(zbin, "binaural decode");                /* virtual speakers (+ direct field) -> HRTF -> 2 ch */
 #ifdef BWA_HAVE_STEAMAUDIO
-    if (e->steam) { steam_monitor_process(e->steam, e->scratch26, p, q, dev2, n); }
+    if (e->steam) {
+        const RtDirectVoice* dvs = NULL;                    /* mode 2: the per-voice point taps */
+        uint32_t ndv = rt_direct_voices(e->rt, &dvs);
+        steam_monitor_process(e->steam, e->scratch26, direct, dvs, ndv, p, q, dev2, n);
+    }
     else
 #endif
-    monitor_process(e->monitor, e->scratch26, p, q, dev2, n);
+    monitor_process(e->monitor, e->scratch26, direct, p, q, dev2, n);
+    engine_hpeq(e, dev2, n);                                /* headphone correction (post-decode) */
+    engine_clamp2(dev2, n);                                 /* protection clamp (see engine_clamp2) */
     if (bwa_null_sink_tap) bwa_null_sink_tap(dev2, 2, n);   /* test hook: observe the device-bound
                                                              * stereo on ANY sink (see null_sink.c) */
     engine_capture(e, dev2, 2, n);                          /* public capture: the binaural headphone output */
     BWA_ZONE_END(zbin);
 }
 
-/* both, array thread: render the array to the 26-ch device (any block size), then — when the
- * block matches cap — decode the monitor into the back buffer and publish it. */
+/* cave_both, array thread: render the array to the 26-ch device (any block size), then — when the
+ * block matches cap — decode the sim monitor into the back buffer and publish it (no direct
+ * field: the headphone tap of a running rig auditions what the ARRAY does). */
 static void render_both_array(void* user, float* dev26, uint32_t n, const bwa_timestamp* ts) {
     bwa_engine* e = (bwa_engine*)user;
     rt_render(e->rt, dev26, n, ts);
@@ -189,14 +256,16 @@ static void render_both_array(void* user, float* dev26, uint32_t n, const bwa_ti
     float p[3], q[4];
     rt_get_listener(e->rt, p, q);
 #ifdef BWA_HAVE_STEAMAUDIO
-    if (e->steam) steam_monitor_process(e->steam, dev26, p, q, e->mon_buf[1 - cur], n);
+    if (e->steam) steam_monitor_process(e->steam, dev26, NULL, NULL, 0, p, q, e->mon_buf[1 - cur], n);
     else
 #endif
-    monitor_process(e->monitor, dev26, p, q, e->mon_buf[1 - cur], n);
+    monitor_process(e->monitor, dev26, NULL, p, q, e->mon_buf[1 - cur], n);
+    engine_hpeq(e, e->mon_buf[1 - cur], n);             /* headphone correction on the monitor tap */
+    engine_clamp2(e->mon_buf[1 - cur], n);              /* protection clamp (see engine_clamp2) */
     InterlockedExchange(&e->mon_idx, 1 - cur);          /* publish the back buffer (full barrier) */
 }
 
-/* both, monitor thread: play the latest published stereo buffer. */
+/* cave_both, monitor thread: play the latest published stereo buffer. */
 static void render_both_monitor(void* user, float* dev2, uint32_t n, const bwa_timestamp* ts) {
     bwa_engine* e = (bwa_engine*)user;
     (void)ts;
@@ -218,6 +287,8 @@ bwa_engine* bwa_create(const bwa_desc* cfg) {
     if (e->cfg.sample_rate == 0) e->cfg.sample_rate = 48000;   /* sane defaults */
     if (e->cfg.block_size  == 0) e->cfg.block_size  = 256;
     e->profile = e->cfg.profile;
+    e->hpeq_idx = -1; e->hpeq_active = -1;      /* no headphone EQ loaded */
+    e->hpeq_on  = 1;                            /* loading engages (the A/B defaults on) */
 
     /* Resolve the speaker geometry FIRST: the engine's CHANNEL COUNT is the layout's speaker count
      * (a file with 4..BWA_CHANNELS speakers, or the built-in 26-grid default with no path — the
@@ -246,6 +317,10 @@ bwa_engine* bwa_create(const bwa_desc* cfg) {
      * fallback inside the builds when a degenerate layout defeats AllRAD/EPAD. */
     rt_set_bed_decoder(e->rt, e->cfg.bed_decoder == BWA_DECODE_EPAD ? 2 : 1);
     e->refl_wet = 1.0f;                             /* reverb wet default; bwa_set_reverb_gain */
+    for (int i = 0; i < BWA_VOICE_CAP; ++i) {       /* directivity cache: forward = room ahead, off */
+        e->src_fwd[i][2] = 1.f;
+        e->src_dirp[i]   = 1.f;
+    }
 
     /* material table: token 0 is always the built-in "generic" default (BWA_PRESETS[0]). */
     for (int b = 0; b < 3; ++b) {
@@ -255,10 +330,14 @@ bwa_engine* bwa_create(const bwa_desc* cfg) {
     e->materials[0].scattering = BWA_PRESETS[0].scattering;
     e->num_materials = 1;
 
-    if (e->profile == BWA_PROFILE_BINAURAL || e->profile == BWA_PROFILE_BOTH) {
+    if (e->profile == BWA_PROFILE_BINAURAL || e->profile == BWA_PROFILE_CAVE_SIM ||
+        e->profile == BWA_PROFILE_CAVE_BOTH) {
         e->monitor = monitor_create(&e->layout, e->cfg.sample_rate);   /* count-driven virtual speakers */
         if (!e->monitor) { rt_destroy(e->rt); free(e); return NULL; }
     }
+    /* BINAURAL routes point voices onto the direct SH bus for the engine's whole life (a create-
+     * time topology, like the profile itself — never toggled once the audio thread exists). */
+    rt_set_direct_ambi(e->rt, e->profile == BWA_PROFILE_BINAURAL);
 #ifdef BWA_HAVE_STEAMAUDIO
     /* materials occlusion sim (off-thread); non-fatal — occlusion is just unavailable if it fails */
     e->scene = steam_scene_create(e->rt, e->cfg.sample_rate, e->cfg.block_size, BWA_VOICE_CAP, e->cfg.embree);
@@ -331,11 +410,11 @@ bwa_result bwa_start(bwa_engine* e) {
 
     if (e->profile == BWA_PROFILE_CAVE) {
         e->sink = bwa_sink_open(sr, bs, e->layout.count, (int)e->cfg.sink, e->cfg.asio_driver, render_cave, e, e->errbuf, sizeof e->errbuf);
-    } else if (e->profile == BWA_PROFILE_BINAURAL) {
+    } else if (e->profile == BWA_PROFILE_BINAURAL || e->profile == BWA_PROFILE_CAVE_SIM) {
         e->scratch26 = (float*)calloc((size_t)BWA_MAX_BLOCK * BWA_CHANNELS, sizeof(float));
         if (e->scratch26)
             e->sink = bwa_sink_open(sr, bs, 2, (int)e->cfg.sink, e->cfg.asio_driver, render_binaural, e, e->errbuf, sizeof e->errbuf);
-    } else { /* both: a 26-ch array sink + a 2-ch monitor sink sharing a double-buffer */
+    } else { /* cave_both: a 26-ch array sink + a 2-ch monitor sink sharing a double-buffer */
         /* Size the handoff for ANY device block (the ASIO driver picks its own, != cfg.block_size in
          * general); cap is set to the ACTUAL array block below, once the sink reports it. */
         e->mon_buf[0] = (float*)calloc((size_t)BWA_MAX_BLOCK * 2, sizeof(float));
@@ -349,7 +428,7 @@ bwa_result bwa_start(bwa_engine* e) {
                 /* the double-buffer handoff exchanges cap-sized blocks, so the two devices must agree.
                  * A mismatch would leave the monitor silent — fail with a clear message instead. */
                 if (e->sink_mon && bwa_sink_block_size(e->sink_mon) != e->cap) {
-                    set_error(e, "both profile: the array and monitor ASIO devices must use the same buffer size");
+                    set_error(e, "cave_both profile: the array and monitor ASIO devices must use the same buffer size");
                     engine_close_devices(e);
                     return BWA_ERR_DEVICE;
                 }
@@ -357,20 +436,24 @@ bwa_result bwa_start(bwa_engine* e) {
         }
     }
 
-    if (!e->sink || (e->profile == BWA_PROFILE_BOTH && !e->sink_mon)) {
+    if (!e->sink || (e->profile == BWA_PROFILE_CAVE_BOTH && !e->sink_mon)) {
         set_error(e, e->errbuf[0] ? e->errbuf : "bwa_start: device open failed");
         engine_close_devices(e);
         return BWA_ERR_DEVICE;
     }
 
 #ifdef BWA_HAVE_STEAMAUDIO
-    /* production HRTF decode for binaural/both. phonon's effect frameSize is fixed at create and
-     * must equal the device block n, which the ASIO driver dictates (!= cfg.block_size in general)
-     * — so build it now that the sink is open and its real block size is known. Non-fatal: render
-     * falls back to the simple-pan monitor if NULL. Torn down in engine_close_devices. */
-    if (e->profile == BWA_PROFILE_BINAURAL || e->profile == BWA_PROFILE_BOTH)
+    /* production HRTF decode for the headphone profiles. phonon's effect frameSize is fixed at
+     * create and must equal the device block n, which the ASIO driver dictates (!= cfg.block_size
+     * in general) — so build it now that the sink is open and its real block size is known.
+     * Non-fatal: render falls back to the simple-pan monitor if NULL. Torn down in
+     * engine_close_devices. BINAURAL asks for the per-voice fleet (one IPLBinauralEffect per
+     * voice slot — the mode-2 point taps); the sim profiles decode the bus only. */
+    if (e->profile == BWA_PROFILE_BINAURAL || e->profile == BWA_PROFILE_CAVE_SIM ||
+        e->profile == BWA_PROFILE_CAVE_BOTH)
         e->steam = steam_monitor_create(&e->layout, e->cfg.sample_rate,
-                                        bwa_sink_block_size(e->sink), e->cfg.hrtf_path);
+                                        bwa_sink_block_size(e->sink), e->cfg.hrtf_path,
+                                        e->profile == BWA_PROFILE_BINAURAL ? BWA_VOICE_CAP : 0);
 
     /* reflection bed: a separate reflections sim + the audio-thread convolution registered as the rt
      * bus tap. Same frameSize-fixed-at-create reason as the monitor — build it now. Non-fatal: if it
@@ -410,6 +493,18 @@ bwa_result bwa_start(bwa_engine* e) {
             fdn_set_max_re(e->fdn, e->max_re);      /* a pre-start bwa_set_max_re reaches the FDN too */
             rt_set_bus_tap(e->rt, fdn_tap, e->fdn);
         } else set_error(e, "bwa_start: FDN reverb allocation failed (running dry)");
+    }
+
+    /* BINAURAL: pick the direct mode for this run, BEFORE the audio thread starts. Mode 2 (per-
+     * voice HRTF point taps) needs the phonon fleet; without it (no SDK, monitor/fleet creation
+     * failed) the render stays on the shared SH field (mode 1). Re-decided every start — a stop/
+     * start cycle re-dirties the voices, so the gain vectors re-solve in the new meaning. */
+    if (e->profile == BWA_PROFILE_BINAURAL) {
+        int mode = 1;
+#ifdef BWA_HAVE_STEAMAUDIO
+        if (e->steam && steam_monitor_pervoice(e->steam)) mode = 2;
+#endif
+        rt_set_direct_ambi(e->rt, mode);
     }
 
     if (bwa_sink_start(e->sink) != 0 || (e->sink_mon && bwa_sink_start(e->sink_mon) != 0)) {
@@ -504,12 +599,14 @@ const char* bwa_last_error(bwa_engine* e) {
 
 const char* bwa_get_audio_backend(bwa_engine* e) {
     if (!e || !e->sink) return "none";
-    if (e->profile == BWA_PROFILE_BINAURAL || e->profile == BWA_PROFILE_BOTH) {
-        /* name the monitor too: the HRTF decode falls back to the simple-pan monitor SILENTLY
+    if (e->profile != BWA_PROFILE_CAVE) {
+        /* name the decode too: the HRTF decode falls back to the simple-pan monitor SILENTLY
          * (steam_monitor_create is non-fatal), and a by-ear report is meaningless without knowing
-         * which of the two actually rendered it */
-        snprintf(e->backend_buf, sizeof e->backend_buf, "%s (%s monitor)", bwa_sink_backend(e->sink),
-                 e->steam ? "steam HRTF" : "simple-pan");
+         * which of the two actually rendered it — and whether it was the direct render (binaural)
+         * or the virtual-speaker audition (cave_sim / cave_both's tap) */
+        snprintf(e->backend_buf, sizeof e->backend_buf, "%s (%s %s)", bwa_sink_backend(e->sink),
+                 e->steam ? "steam HRTF" : "simple-pan",
+                 e->profile == BWA_PROFILE_BINAURAL ? "direct" : "sim");
         return e->backend_buf;
     }
     return bwa_sink_backend(e->sink);   /* cave: the array device */
@@ -742,6 +839,8 @@ void bwa_set_pose_prediction(bwa_engine* e, float lead_s) { if (e) rt_set_pose_p
 void bwa_set_near_spread(bwa_engine* e, float radius_m)    { if (e) rt_set_near_spread(e->rt, radius_m); }
 void bwa_set_extra_listeners(bwa_engine* e, const float* xyz, uint32_t count) { if (e) rt_set_extra_listeners(e->rt, xyz, count); }
 void bwa_source_set_loudness_comp(bwa_engine* e, bwa_source s, bool on) { if (e) rt_source_set_loudness_comp(e->rt, s, on); }
+void bwa_source_set_proximity(bwa_engine* e, bwa_source s, bool on) { if (e) rt_source_set_proximity(e->rt, s, on); }
+void bwa_set_speed_of_sound(bwa_engine* e, float mps) { if (e) rt_set_speed_of_sound(e->rt, mps); }
 void bwa_source_set_size(bwa_engine* e, bwa_source s, float radius_m) { if (e) rt_source_set_size(e->rt, s, radius_m); }
 
 void     bwa_set_master_gain(bwa_engine* e, float linear)  { if (e) rt_set_master_gain(e->rt, linear); }
@@ -790,6 +889,39 @@ void bwa_set_limiter_ceiling(bwa_engine* e, float linear) {
     if (!(linear > 0.f)) return;     /* contract is (0..1]; non-positive/NaN ignored (0 would mute the output) */
     if (linear > 1.f) linear = 1.f;  /* the ceiling is a maximum, never a boost */
     rt_set_limiter_ceiling(e->rt, linear);
+}
+
+/* publish the back design slot, then wait (bounded) for the audio thread's adoption ack so the
+ * next load can't rewrite a slot the renderer is still reading. No renderer = no reader: skip the
+ * wait when stopped, and on the MANUAL sink (its "audio thread" is the caller — the same thread
+ * as this one, so waiting would only burn the timeout; single-threaded means no race either). */
+static void hpeq_publish(bwa_engine* e, LONG idx) {
+    InterlockedExchange(&e->hpeq_idx, idx);
+    const LONG gen = InterlockedIncrement(&e->hpeq_gen);
+    if (!e->started || e->profile == BWA_PROFILE_CAVE ||     /* cave: no headphone render, no ack */
+        bwa_get_sink_type(e) == BWA_SINK_MANUAL) return;
+    for (int tries = 0; tries < 100 && e->hpeq_ack != gen; ++tries) Sleep(1);
+}
+
+bwa_result bwa_load_headphone_eq(bwa_engine* e, const char* path) {
+    if (!e) return BWA_ERR_CONFIG;
+    clear_error(e);
+    if (!path || !path[0]) {                         /* clear the correction (ramped out) */
+        if (e->hpeq_idx >= 0) hpeq_publish(e, -1);
+        return BWA_OK;
+    }
+    const LONG cur = e->hpeq_idx;
+    const LONG back = (cur == 0) ? 1 : 0;            /* -1 (none) writes slot 0 */
+    if (!hpeq_parse(path, e->cfg.sample_rate, &e->hpeq[back], e->errbuf, sizeof e->errbuf)) {
+        set_error(e, e->errbuf);                     /* parse failure keeps the previous EQ */
+        return BWA_ERR_CONFIG;
+    }
+    hpeq_publish(e, back);
+    return BWA_OK;
+}
+
+void bwa_set_headphone_eq(bwa_engine* e, bool on) {
+    if (e) InterlockedExchange(&e->hpeq_on, on ? 1 : 0);
 }
 
 /* Offline: the chosen panner's per-speaker gains for `nsrc` source positions heard from one listener,
@@ -951,13 +1083,15 @@ void bwa_scene_set_box(bwa_engine* e, float w, float h, float d, const bwa_mater
      * build is present — the same call configures the ray-traced scene (with SDK) and the geometric
      * early reflections (always), so a no-SDK build still knows the room it is in. */
     e->ism_room.w = w; e->ism_room.h = h; e->ism_room.d = d;
+    e->ism_room.plane_only = 0; e->ism_room.ground_y = 0.f;     /* a box replaces any prior ground plane */
+    memset(e->ism_room.press, 0, sizeof e->ism_room.press);     /* faces reflect normally until flagged */
     for (int f = 0; f < 6; ++f) {
         uint32_t m = faces ? faces[f] : 0;
         if (m >= e->num_materials) m = 0;
         for (int b = 0; b < 3; ++b) e->ism_room.absorb[f][b] = e->materials[m].absorption[b];
     }
     e->ism_room.valid = 1;
-    rt_set_ism_room(e->rt, &e->ism_room);          /* audio thread is stopped (scene setup is load-time) */
+    rt_set_ism_room(e->rt, &e->ism_room);          /* seqlock publish — live-safe (rt.h) */
 #ifdef BWA_HAVE_STEAMAUDIO
     if (scene_locked(e)) return;
     /* floor-based: x/z centred on the origin, y from 0 (the floor, where the room origin
@@ -978,6 +1112,49 @@ void bwa_scene_set_box(bwa_engine* e, float w, float h, float d, const bwa_mater
     }
     bwa_scene_set_mesh_mat(e, verts, 8, tris, 12, tri_mat);
 #endif
+}
+
+void bwa_scene_set_ground(bwa_engine* e, float y, bwa_material mat, bool pressure_release) {
+    if (!e) return;
+    if (!isfinite(y)) { set_error(e, "bwa_scene_set_ground: y must be finite"); return; }
+    /* The outdoor degenerate of the box: ONE horizontal mirror plane at height y — the ground
+     * bounce, the dominant early reflection when there is no room. Captured for the image-source
+     * reflections with or without the Steam build (the plane lives in face slot 2, the box's -y).
+     * pressure_release flips the reflection's polarity — the underside of a water surface. */
+    memset(&e->ism_room, 0, sizeof e->ism_room);
+    uint32_t m = mat;
+    if (m >= e->num_materials) m = 0;
+    for (int b = 0; b < 3; ++b) e->ism_room.absorb[2][b] = e->materials[m].absorption[b];
+    e->ism_room.press[2]   = pressure_release ? 1 : 0;
+    e->ism_room.plane_only = 1;
+    e->ism_room.ground_y   = y;
+    e->ism_room.valid      = 1;
+    rt_set_ism_room(e->rt, &e->ism_room);          /* seqlock publish — live-safe (rt.h) */
+#ifdef BWA_HAVE_STEAMAUDIO
+    if (scene_locked(e)) return;
+    /* a large finite quad for the ray tracer (occlusion sees the ground too), normal up */
+    const float H = 100.f;                          /* half-extent (m): far past any tracked volume */
+    float verts[4*3] = { -H, y, -H,   H, y, -H,   H, y, H,   -H, y, H };
+    int tris[2*3] = { 0, 2, 1,  0, 3, 2 };
+    bwa_material tri_mat[2] = { mat, mat };
+    bwa_scene_set_mesh_mat(e, verts, 4, tris, 2, tri_mat);
+#endif
+}
+
+void bwa_scene_set_pressure_release(bwa_engine* e, uint32_t face_mask) {
+    if (!e) return;
+    if (!e->ism_room.valid) {
+        set_error(e, "bwa_scene_set_pressure_release: no room — call bwa_scene_set_box (or _set_ground) first");
+        return;
+    }
+    /* Flag faces as pressure-release boundaries (bit f = face f, the bwa_scene_set_box order
+     * -x,+x,-y,+y,-z,+z): the reflection coefficient negates, so the image interferes destructively
+     * with the direct sound near the boundary — the Lloyd's-mirror comb of a water surface seen
+     * from below (+y for an underwater room's ceiling). Load-time, like the box itself. The ray-
+     * traced scene is untouched — polarity is an image-source concept; occlusion/reverb keep the
+     * face's material. */
+    for (int f = 0; f < 6; ++f) e->ism_room.press[f] = (face_mask >> f) & 1u;
+    rt_set_ism_room(e->rt, &e->ism_room);
 }
 
 /* ---- dynamic (movable) occluders/reflectors (instanced meshes; SDK-gated no-ops otherwise) ---- */
@@ -1029,7 +1206,7 @@ void bwa_scene_remove_dynamic_mesh(bwa_engine* e, int handle) {
 void bwa_source_set_early_reflections(bwa_engine* e, bwa_source s, bool on) {
     if (!e) return;
     if (on && !e->ism_room.valid) {
-        set_error(e, "bwa_source_set_early_reflections: no room — call bwa_scene_set_box first");
+        set_error(e, "bwa_source_set_early_reflections: no room — call bwa_scene_set_box (or bwa_scene_set_ground) first");
         return;
     }
 #ifdef BWA_HAVE_STEAMAUDIO
@@ -1100,6 +1277,23 @@ void bwa_fdn_config(bwa_engine* e, const bwa_fdn_desc* cfg) {
     /* out-of-range decay/direction values reach fdn_set_decay(_direction)'s own clamps at start */
 }
 
+/* LIVE decay retune: the one FDN parameter set that is safe while the audio thread runs (the tap
+ * ramps its loss gains over one block — the tail keeps ringing, only its slope changes). <= 0 keeps
+ * a parameter's current value. Pre-start it just updates the staged config, so a scene can call it
+ * unconditionally. The FDN's STRUCTURE (enable, anisotropy) stays load-time (bwa_fdn_config). */
+void bwa_fdn_set_decay(bwa_engine* e, float rt60_low_s, float rt60_high_s, float xover_hz) {
+    if (!e) return;
+    if (rt60_low_s  > 0.f) e->fdn_cfg.rt60_low_s  = rt60_low_s;
+    if (rt60_high_s > 0.f) e->fdn_cfg.rt60_high_s = rt60_high_s;
+    if (xover_hz    > 0.f) e->fdn_cfg.xover_hz    = xover_hz;
+    if (!e->started) return;                       /* staged; bwa_start applies it */
+    if (!e->fdn) {
+        set_error(e, "bwa_fdn_set_decay: no FDN bed (enable one with bwa_fdn_config before bwa_start)");
+        return;
+    }
+    fdn_set_decay(e->fdn, e->fdn_cfg.rt60_low_s, e->fdn_cfg.rt60_high_s, e->fdn_cfg.xover_hz);
+}
+
 void bwa_source_set_reverb(bwa_engine* e, bwa_source s, bool on) {
     if (e) rt_source_set_reflections(e->rt, s, on);             /* phonon-free; the tap consumes the send */
 }
@@ -1148,23 +1342,33 @@ void bwa_source_set_attenuation_override(bwa_engine* e, bwa_source s,
 }
 
 void bwa_source_set_orientation(bwa_engine* e, bwa_source s, float qx, float qy, float qz, float qw) {
-#ifdef BWA_HAVE_STEAMAUDIO
-    if (!e || !e->scene) return;
+    if (!e) return;
     /* the dipole axis is the source forward = q rotating the room frame's identity ahead */
     float q4[4] = { qx, qy, qz, qw }, f[3];
     frame_qrot(q4, BWA_ROOM_AHEAD, f);
-    steam_scene_set_orientation(e->scene, s, f[0], f[1], f[2]);
-#else
-    (void)e; (void)s; (void)qx; (void)qy; (void)qz; (void)qw;
+    uint16_t idx = (uint16_t)(s & 0xFFFFu);
+    if (idx < BWA_VOICE_CAP) { e->src_fwd[idx][0]=f[0]; e->src_fwd[idx][1]=f[1]; e->src_fwd[idx][2]=f[2]; }
+#ifdef BWA_HAVE_STEAMAUDIO
+    if (e->scene) { steam_scene_set_orientation(e->scene, s, f[0], f[1], f[2]); return; }
 #endif
+    /* no sim: keep the rt MANUAL dipole tracking the orientation. Only sources that actually have a
+     * pattern enqueue (this is per-frame-safe; an omni source should not pay a command per frame). */
+    if (idx < BWA_VOICE_CAP && e->src_dirw[idx] > 0.f)
+        rt_source_set_directivity_manual(e->rt, s, f, e->src_dirw[idx], e->src_dirp[idx]);
 }
 
 void bwa_source_set_directivity(bwa_engine* e, bwa_source s, float weight, float power) {
+    if (!e) return;
+    if (weight < 0.f) weight = 0.f; else if (weight > 1.f) weight = 1.f;
+    uint16_t idx = (uint16_t)(s & 0xFFFFu);
+    if (idx < BWA_VOICE_CAP) { e->src_dirw[idx] = weight; e->src_dirp[idx] = power; }
 #ifdef BWA_HAVE_STEAMAUDIO
-    if (e && e->scene) steam_scene_set_directivity(e->scene, s, weight, power);
-#else
-    (void)e; (void)s; (void)weight; (void)power;
+    if (e->scene) { steam_scene_set_directivity(e->scene, s, weight, power); return; }
 #endif
+    /* no sim (no SDK, or SDK without a scene): the rt core evaluates the same weighted dipole on
+     * the audio thread per block — walk-correct directivity from pure math. weight 0 disables. */
+    rt_source_set_directivity_manual(e->rt, s, (idx < BWA_VOICE_CAP) ? e->src_fwd[idx] : BWA_ROOM_AHEAD,
+                                     weight, power);
 }
 
 void bwa_source_set_directivity_preset(bwa_engine* e, bwa_source s, bwa_directivity pattern) {

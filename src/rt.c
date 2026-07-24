@@ -36,12 +36,21 @@
 #define BWA_RT_MAX_BLOCK 8192   /* aux-send scratch cap; must be >= any device block (matches engine's BWA_MAX_BLOCK) */
 
 /* propagation effects (opt-in, per voice) */
-#define BWA_SPEED_OF_SOUND   343.0f    /* m/s */
+#define BWA_SPEED_OF_SOUND   343.0f    /* m/s — the DEFAULT; live via rt_set_speed_of_sound (RtCore.sos) */
+#define BWA_SOS_MIN           30.0f    /* settable range: below ~30 m/s every delay saturates its ring */
+#define BWA_SOS_MAX        20000.0f
 #define BWA_DOPPLER_MAX_DIST 8.0f      /* propagation delay saturates past this (bounds the per-voice ring) */
 #define BWA_DOPPLER_TAU      0.032f    /* per-pole delay low-pass time (s); FFT-tuned, see mix_voice */
 #define BWA_AIR_FC_NEAR   18000.0f     /* air-absorption low-pass cutoff (Hz) at zero distance ... */
 #define BWA_AIR_FC_PER_M    650.0f     /* ... falling this many Hz per metre ... */
 #define BWA_AIR_FC_FLOOR   1200.0f     /* ... down to this floor */
+/* near-field proximity boost (opt-in, per voice): an LF shelf that rises as the source closes inside
+ * BWA_NF_RADIUS — the spherical-wavefront proximity effect, the near-distance mirror of the
+ * loudness-comp shelf (which restores body FAR away). Perceptually load-bearing in a walkable
+ * volume: "at arm's length" reads as bass, not just level. */
+#define BWA_NF_RADIUS  1.0f            /* boost region (m): 0 dB at the radius ... */
+#define BWA_NF_MAX_DB  6.0f            /* ... rising linearly to this at distance 0 */
+#define BWA_NF_FC    300.0f            /* shelf corner (Hz; one-pole, like the loudness-comp shelf) */
 /* distance->reverb send: the wet-send factor ramps from NEAR_SEND at NEAR_DIST to 1.0 at FAR_DIST */
 #define BWA_REFL_NEAR_DIST  1.0f
 #define BWA_REFL_FAR_DIST   6.0f
@@ -110,6 +119,9 @@ typedef struct {
     uint8_t  queue_loop[BWA_QUEUE];         /* per-entry loop flag (a looping entry is the terminal item) */
     uint32_t queue_head, queue_len;         /* ring indices into queue[] */
     float    pos_pending[3], pos_active[3];
+    float    dir_active[3];                 /* direct mode 2: room-frame unit dir listener->source,
+                                             * solved with the gains (dirty-gated); feeds the per-voice
+                                             * HRTF consumer via the RtDirectVoice view */
     float    gain_user;
     float    gtarget[BWA_CHANNELS], gcur[BWA_CHANNELS];
     float    gtarget_lo[BWA_CHANNELS], gcur_lo[BWA_CHANNELS];   /* dual-band low (amplitude-norm) band gains */
@@ -175,6 +187,16 @@ typedef struct {
     bool     ldc_on;
     float    ldc_g_cur;                      /* current shelf gain (linear; 1 = flat), ramped */
     float    ldc_lp;                         /* shelf one-pole state */
+    /* near-field proximity boost (opt-in): the same one-pole LF shelf shape, boosting as the source
+     * closes inside BWA_NF_RADIUS (the near-distance mirror of loudness comp; audio-thread). */
+    bool     nf_on;
+    float    nf_g_cur;                       /* current shelf gain (linear; 1 = flat), ramped */
+    float    nf_lp;                          /* shelf one-pole state */
+    /* MANUAL directivity (CMD_SET_DIR; no sim): forward axis + weighted-dipole pattern. weight 0 =
+     * off. The block preamble evaluates |(1-w) + w*cos|^p toward the active listener and feeds the
+     * SAME dir_cur ramp the sim's publish drives (the sim wins while it republishes — see mix_voice). */
+    float    dir_fwd[3];
+    float    dir_w, dir_pow;
     /* pause/seek gate: pause_g ramps 1 (running) <-> 0 (silent) across one block; the playhead only
      * freezes (and a pending seek only lands) once fully silent, so both are click-free (invariant 4).
      * A seek on a RUNNING voice is ramp-out -> jump -> ramp-in (two blocks, ~10 ms at 256/48k). */
@@ -261,6 +283,10 @@ struct RtCore {
     _Atomic float*    occ_val;              /* published broadband level (1 = clear) */
     _Atomic uint64_t* occ_eq;               /* published 3-band transmission tilt (3x16-bit, gated by occ_handle) */
     _Atomic float*    occ_dir;              /* published directivity gain (1 = on-axis/omni, gated by occ_handle) */
+    /* MANUAL-directivity readback (audio thread -> control, the reverse of occ_dir): the mixer
+     * packs (handle << 32 | float bits of the block's dipole gain) so rt_get_directivity can report
+     * the manual path too — one word, handle gate and value can never tear apart. */
+    _Atomic uint64_t* dir_pub;
 
     /* per-slot playback state for control-thread readback (rt_source_is_playing): packed
      * (gen<<1 | playing-bit), republished by the audio thread each block. The gen guards a stale
@@ -386,6 +412,9 @@ struct RtCore {
                                  * spread is floored by 1 - dist/radius (it subtends a growing angle
                                  * instead of collapsing into the nearest speaker). */
     float      ldc_a;        /* loudness-comp shelf one-pole coeff (~250 Hz), rate-derived at create */
+    float      nf_a;         /* near-field proximity shelf one-pole coeff (BWA_NF_FC), rate-derived at create */
+    _Atomic float sos;       /* engine-wide speed of sound (m/s; default BWA_SPEED_OF_SOUND) — live
+                              * (rt_set_speed_of_sound); Doppler + ISM delays derive from it per block */
     int        bed_decoder;  /* 1 = AllRAD (robust on irregular arrays); 2 = EPAD (energy-preserving,
                               * epad.c); 0 = the sampling decode (SAD) — internal-only: the engine
                               * never selects it, it is the fallback when a build fails (and what a
@@ -461,9 +490,16 @@ struct RtCore {
     _Atomic int* path_idx;       /* voice_cap: front-buffer index the sim flips after writing the back */
 
     /* image-source early reflections (ism.c): the room + a live gain, plus one delay ring per voice
-     * (the reflected copies are the direct signal, delayed by their longer paths). The room is set
-     * while stopped (bwa_scene_set_box); the gain and the per-voice enables are live. */
-    IsmRoom  ism_room;
+     * (the reflected copies are the direct signal, delayed by their longer paths). The room, the
+     * gain, and the per-voice enables are all LIVE: the control thread publishes the room through
+     * a single-slot seqlock (pose.h's protocol — the struct is too wide for one atomic store) and
+     * rt_render adopts a stable copy at block start, so a mid-scene bwa_scene_set_box/_set_ground/
+     * _set_pressure_release never tears under the mixer; the images then re-solve next block
+     * (gains ramp, delays glide — the room change bends the reflections, no click). */
+    IsmRoom  ism_room;           /* audio-thread block copy (the mixer reads only this) */
+    IsmRoom  ism_room_sh;        /* seqlock-shared slot (rt_set_ism_room writes) */
+    _Atomic uint32_t ism_seq;    /* even = stable, odd = write in progress */
+    uint32_t ism_seen;           /* audio-thread-only: last adopted seq */
     _Atomic float ism_gain;
     float*   ism_ring;           /* voice_cap contiguous power-of-two rings of ism_ringlen floats */
     uint32_t ism_ringlen;
@@ -473,6 +509,24 @@ struct RtCore {
      * Allocated once at create (control thread); the audio thread writes/reads its voice's slice. */
     float*   dop_ring;
     uint32_t dop_ringlen;
+
+    /* direct-binaural render (BWA_PROFILE_BINAURAL): point voices SH-encode at their TRUE
+     * listener-relative direction into this ambisonic accumulator (phonon monitor basis,
+     * ambi_encode_phonon) instead of panning to the speaker bus — the gain-ramp machinery ramps
+     * SH coefficients, and the monitor decodes bus + accumulator in one pass. Beds pass SH->SH
+     * (one diagonal, ambi_canon_to_phonon) and the pathing accumulator sums in raw (same basis);
+     * the FDN / reflection-bed taps still render to the speaker bus (synthesized-diffuse content
+     * rides the virtual-speaker encode). Mode 2 additionally exposes each point voice's post-DSP
+     * mono block + direction (dv_*) so a phonon consumer can run one IPLBinauralEffect per voice —
+     * spread power-splits between that point tap (sqrt(1-s)) and the SH field (sqrt(s)), so both
+     * paths always exist and a spread change never switches paths. Set while stopped
+     * (rt_set_direct_ambi); never toggled while the audio thread runs. */
+    int      direct_on;          /* 0 = off, 1 = SH field, 2 = SH field + per-voice point taps */
+    int      direct_blk;         /* the block's effective gate (rt_render; buffers verified) */
+    uint32_t mix_nch;            /* point-voice gain width: BWA_AMBI_CH when direct, else channels */
+    float*   ambi_direct;        /* BWA_AMBI_CH * BWA_RT_MAX_BLOCK; zeroed + accumulated per block */
+    float*   dv_mono;            /* mode 2: voice_cap slots x BWA_RT_MAX_BLOCK (each voice's point share) */
+    RtDirectVoice* dv_view;      /* mode 2: per-slot view published each block (rt_direct_voices) */
 };
 
 /* ---- ring primitives ---- */
@@ -734,6 +788,9 @@ static void drain_commands(RtCore* c) {
             v->dir_cur = 1.f;                       /* on-axis/omni by default */
             v->air_a_cur = 1.f;                     /* air low-pass passthrough by default */
             v->ldc_g_cur = 1.f;                     /* loudness-comp shelf flat by default */
+            v->nf_g_cur  = 1.f;                     /* near-field shelf flat by default */
+            v->dir_fwd[2] = 1.f;                    /* manual-directivity forward = room ahead (+z); weight 0 = off */
+            v->dir_pow   = 1.f;
             v->pitch = v->pitch_cur = 1.f;          /* native playback rate by default */
             v->refl_gain = 1.f;                     /* full wet-send level by default (gated by refl_send) */
             v->pause_g = 1.f;                       /* pause gate open (running) by default */
@@ -749,9 +806,13 @@ static void drain_commands(RtCore* c) {
             atomic_store_explicit(&c->occ_val[idx],    1.f,  memory_order_relaxed);
             atomic_store_explicit(&c->occ_eq[idx], eq_pack((float[3]){1.f,1.f,1.f}), memory_order_relaxed);
             atomic_store_explicit(&c->occ_dir[idx],    1.f,  memory_order_relaxed);
+            atomic_store_explicit(&c->dir_pub[idx],    0u,   memory_order_relaxed);
         } break;
         case CMD_SRC_DESTROY: { Voice* v = voice_for(c, cmd->handle);
-            if (v) { v->active = false; v->playing = false; v->sound = NULL; } } break;
+            if (v) { v->active = false; v->playing = false; v->sound = NULL;
+                     /* drop the manual-directivity readback with the voice — a stale handle must
+                      * read as omni (1), not the dead voice's last dipole gain */
+                     atomic_store_explicit(&c->dir_pub[BWA_H_IDX(cmd->handle)], 0u, memory_order_relaxed); } } break;
         case CMD_SET_POS: { Voice* v = voice_for(c, cmd->handle);
             if (v) memcpy(v->pos_pending, &cmd->u.pos, sizeof v->pos_pending); } break;
         case CMD_SET_GAIN: { Voice* v = voice_for(c, cmd->handle);
@@ -834,8 +895,13 @@ static void drain_commands(RtCore* c) {
                           memset(v->gcur_lo, 0, sizeof v->gcur_lo);
                           v->fs_on = 0;
                           v->xover_lp = 0.f;                    /* fresh dual-band crossover state */
-                          v->dual_mix = atomic_load_explicit(&c->dual_band, memory_order_relaxed) ? 1.f : 0.f;  /* start in the current mode */
-                          v->re_mix   = atomic_load_explicit(&c->max_re,    memory_order_relaxed) ? 1.f : 0.f;  /* (beds) likewise */
+                          v->dual_mix = (!c->direct_on &&                                                       /* start in the current mode; direct
+                                                                                                                 * has no dual-band (SH gains, and
+                                                                                                                 * gtarget_lo is never solved there) */
+                                         atomic_load_explicit(&c->dual_band, memory_order_relaxed)) ? 1.f : 0.f;
+                          v->re_mix   = (!c->direct_on &&                                                       /* (beds) likewise; direct mode
+                                                                                                                 * never engages the taper */
+                                         atomic_load_explicit(&c->max_re, memory_order_relaxed)) ? 1.f : 0.f;
                           v->paused = false; v->pause_g = 1.f; v->seek_pending = 0; v->stopping = 0;   /* play always starts running */
                           if (v->dop_on) dop_line_reset(c, v, BWA_H_IDX(cmd->handle)); } } break;
         case CMD_STOP: { Voice* v = voice_for(c, cmd->handle);
@@ -900,6 +966,15 @@ static void drain_commands(RtCore* c) {
             if (v) v->air_on = cmd->u.air.on != 0; } break;
         case CMD_SET_LDC: { Voice* v = voice_for(c, cmd->handle);
             if (v) v->ldc_on = cmd->u.ldc.on != 0; } break;      /* the mixer ramps the shelf in/out */
+        case CMD_SET_NF: { Voice* v = voice_for(c, cmd->handle);
+            if (v) v->nf_on = cmd->u.nf.on != 0; } break;        /* the mixer ramps the shelf in/out */
+        case CMD_SET_DIR: { Voice* v = voice_for(c, cmd->handle);
+            if (v) { memcpy(v->dir_fwd, cmd->u.dir.fwd, sizeof v->dir_fwd);
+                     v->dir_w = cmd->u.dir.weight; v->dir_pow = cmd->u.dir.power;
+                     if (!(v->dir_w > 0.f))         /* pattern off: the mixer stops republishing, so
+                                                     * drop the readback here or rt_get_directivity
+                                                     * would report the last dipole gain forever */
+                         atomic_store_explicit(&c->dir_pub[BWA_H_IDX(cmd->handle)], 0u, memory_order_relaxed); } } break;
         case CMD_SET_ATTEN: { Voice* v = voice_for(c, cmd->handle);
             if (v) {
                 float ref = cmd->u.atten.ref;
@@ -1264,12 +1339,112 @@ static void fs_solve(RtCore* c, Voice* v, int p, float spread, float ug) {
     }
 }
 
+/* Effective spread (shared by the panner and direct-binaural solves): the user's angular width,
+ * floored by the source's METRIC size (the angle its radius subtends from the listener — physical
+ * size stays constant as the listener walks, and a source that engulfs the listener goes fully
+ * wide) and by the engine-wide NEAR-LISTENER widening policy (rt_set_near_spread; a per-source
+ * size subsumes it for sized sources). Sets v->spread_eff (the decor split follows it) and the
+ * anisotropy ratios v->ext_u/ext_w (an extent carries a separate height: the physical floors
+ * apply to BOTH axes, the LARGER axis drives the mode gate). Returns s_eff. */
+static float solve_spread(RtCore* c, Voice* v) {
+    float s_w = v->spread; if (s_w > 1.f) s_w = 1.f; else if (s_w < 0.f) s_w = 0.f;
+    float s_h = v->spread_h; if (s_h > 1.f) s_h = 1.f;      /* < 0 = isotropic (follow the width) */
+    const float nearR = atomic_load_explicit(&c->near_spread, memory_order_relaxed);
+    if (v->size_m > 0.f || nearR > 0.f) {
+        float dx = v->pos_active[0]-c->lis.p_active[0], dy = v->pos_active[1]-c->lis.p_active[1],
+              dz = v->pos_active[2]-c->lis.p_active[2];
+        float dist = sqrtf(dx*dx + dy*dy + dz*dz);
+        float s_floor = 0.f;
+        if (v->size_m > 0.f) {
+            float ratio  = dist > 1e-6f ? v->size_m / dist : 2.f;
+            float s_size = ratio >= 1.f ? 1.f : asinf(ratio) * 0.636619772f;   /* subtended half-angle / (pi/2) */
+            if (s_size > s_floor) s_floor = s_size;
+        }
+        if (nearR > 0.f) {
+            float s_near = 1.f - dist / nearR;
+            if (s_near > 1.f) s_near = 1.f;
+            if (s_near > s_floor) s_floor = s_near;
+        }
+        if (s_floor > s_w) s_w = s_floor;
+        if (s_h >= 0.f && s_floor > s_h) s_h = s_floor;
+    }
+    float s_eff = (s_h > s_w) ? s_h : s_w;
+    v->spread_eff = s_eff;
+    v->ext_u = (s_eff > 1e-6f) ? s_w / s_eff : 1.f;         /* == 1 exactly when isotropic (s_w == s_eff) */
+    v->ext_w = (s_eff > 1e-6f && s_h >= 0.f) ? s_h / s_eff : v->ext_u;
+    return s_eff;
+}
+
+/* ACN channel -> SH degree l, order 3 (l = floor(sqrt(k))). */
+static const int acn_deg[BWA_AMBI_CH] = { 0, 1,1,1, 2,2,2,2,2, 3,3,3,3,3,3,3 };
+
+/* Direct-binaural gain solve (BWA_PROFILE_BINAURAL): the voice's gain vector becomes 16 SH
+ * coefficients (phonon monitor basis, ambi_encode_phonon) at the TRUE direction from the live
+ * listener to `pos`, times the same user gain and distance curve the speaker panner would apply —
+ * so cave and binaural renders of one scene agree in loudness, and the gcur->gtarget machinery
+ * ramps SH coefficients instead of speaker gains (invariant 4 holds unchanged). Head orientation
+ * enters at the DECODE (phonon's orientation param / the fallback's ear vectors); the encode stays
+ * room-frame. Spread tapers the high degrees toward omni (cos^l per degree), renormalized so the
+ * SH-field energy matches the point encode — a widened source keeps its decoded loudness.
+ * `v` supplies the per-voice attenuation override; NULL (the ISM images) takes the layout curve,
+ * matching the speaker path where panner_gains bakes the layout curve into each image. */
+/* distance attenuation + unit direction of the direct render, shared by the SH solve and the
+ * mode-2 point tap (override-aware; NULL v = the layout curve, as the speaker path bakes it). */
+static float direct_atten_dir(RtCore* c, const Voice* v, const float pos[3], float dir[3]) {
+    float d[3] = { pos[0] - c->lis.p_active[0], pos[1] - c->lis.p_active[1],
+                   pos[2] - c->lis.p_active[2] };
+    float dist = sqrtf(d[0]*d[0] + d[1]*d[1] + d[2]*d[2]);
+    dir[0] = 0.f; dir[1] = 0.f; dir[2] = 1.f;               /* on the listener: room ahead */
+    if (dist > 1e-6f) { dir[0] = d[0]/dist; dir[1] = d[1]/dist; dir[2] = d[2]/dist; }
+    return (v && v->att_ref > 0.f)
+         ? atten_curve(dist, v->att_ref, v->att_rolloff, v->att_min)
+         : atten_curve(dist, c->layout.atten_ref_m, c->layout.atten_rolloff,
+                       c->layout.atten_min_lin);
+}
+
+static void direct_gains_at(RtCore* c, const Voice* v, const float pos[3], float ug,
+                            float spread, float* g) {
+    float dir[3];
+    const float att = direct_atten_dir(c, v, pos, dir);
+    float y[BWA_AMBI_CH];
+    ambi_encode_phonon(dir, y);
+    if (spread > 1e-3f) {
+        const float cw = cosf(spread * 1.5707963f);         /* 1 at point .. 0 (W-only) at full */
+        const float wl[4] = { 1.f, cw, cw*cw, cw*cw*cw };
+        double e = 0.0;
+        for (int l = 0; l <= 3; ++l) e += (double)(2*l + 1) * wl[l] * wl[l];
+        const float nrm = (float)sqrt(16.0 / e);            /* orthonormal-basis energy match */
+        for (int k = 0; k < BWA_AMBI_CH; ++k) y[k] *= wl[acn_deg[k]] * nrm;
+    }
+    const float s = ug * att;
+    for (int k = 0; k < BWA_AMBI_CH; ++k) g[k] = y[k] * s;
+}
+
 /* DBAP gain solve (M4): listener-relative, dirty-gated. CMD_COMMIT re-dirties a voice on a
  * position change and dirties all voices on a listener move (gains are listener-relative). A bed
  * voice (multi-channel asset) has no DBAP position — its master gain rides gtarget[0]. */
 static void compute_gains(RtCore* c, Voice* v) {
     const float ug = v->gain_user * c->group_gain[v->group];   /* mix-group gain folds into the solve */
     if (v->sound && v->sound->channels > 1) { v->gtarget[0] = ug; return; }
+    if (c->direct_on) {                                     /* direct-binaural: SH gains, not speaker
+                                                             * gains. Extra listeners, dual-band, and
+                                                             * the speaker spread modes don't apply —
+                                                             * one head, one decode. */
+        const float s_eff = solve_spread(c, v);
+        if (c->direct_on == 2) {
+            /* mode 2 (per-voice HRTF): power-split the dry by spread — the point share
+             * sqrt(1-s) rides the per-voice tap (gtarget[BWA_AMBI_CH], a scalar the mixer ramps
+             * like any gain), the wide share sqrt(s) takes the tapered field encode. Both paths
+             * always exist, so a spread change crossfades through the solve instead of switching
+             * render paths. The direction lands beside the gains (same dirty gating). */
+            direct_gains_at(c, v, v->pos_active, ug * sqrtf(s_eff), s_eff, v->gtarget);
+            v->gtarget[BWA_AMBI_CH] = ug * sqrtf(1.f - s_eff)
+                                    * direct_atten_dir(c, v, v->pos_active, v->dir_active);
+        } else {
+            direct_gains_at(c, v, v->pos_active, ug, s_eff, v->gtarget);
+        }
+        return;
+    }
     int p = atomic_load_explicit(&c->panner, memory_order_acquire);
     panner_gains(c, p, v->pos_active, ug, v->gtarget);
 
@@ -1311,39 +1486,10 @@ static void compute_gains(RtCore* c, Voice* v) {
         }
     }
 
-    /* effective spread: the user's angular width, floored by the source's METRIC size (the angle its
-     * radius subtends from the listener — physical size stays constant as the listener walks, and a
-     * source that engulfs the listener goes fully wide) and by the engine-wide NEAR-LISTENER widening
-     * policy (rt_set_near_spread; a per-source size subsumes it for sized sources). The decor split
-     * follows spread_eff, so the widened part decorrelates too when enabled. An anisotropic extent
-     * (rt_source_set_extent) carries a separate height: the physical floors apply to BOTH axes
-     * (size/near-widening are isotropic), the LARGER axis drives the mode gate + decor split, and
-     * the ratios reach the ring/lobe solves as v->ext_u/ext_w. */
-    float s_w = v->spread; if (s_w > 1.f) s_w = 1.f; else if (s_w < 0.f) s_w = 0.f;
-    float s_h = v->spread_h; if (s_h > 1.f) s_h = 1.f;      /* < 0 = isotropic (follow the width) */
-    const float nearR = atomic_load_explicit(&c->near_spread, memory_order_relaxed);
-    if (v->size_m > 0.f || nearR > 0.f) {
-        float dx = v->pos_active[0]-c->lis.p_active[0], dy = v->pos_active[1]-c->lis.p_active[1],
-              dz = v->pos_active[2]-c->lis.p_active[2];
-        float dist = sqrtf(dx*dx + dy*dy + dz*dz);
-        float s_floor = 0.f;
-        if (v->size_m > 0.f) {
-            float ratio  = dist > 1e-6f ? v->size_m / dist : 2.f;
-            float s_size = ratio >= 1.f ? 1.f : asinf(ratio) * 0.636619772f;   /* subtended half-angle / (pi/2) */
-            if (s_size > s_floor) s_floor = s_size;
-        }
-        if (nearR > 0.f) {
-            float s_near = 1.f - dist / nearR;
-            if (s_near > 1.f) s_near = 1.f;
-            if (s_near > s_floor) s_floor = s_near;
-        }
-        if (s_floor > s_w) s_w = s_floor;
-        if (s_h >= 0.f && s_floor > s_h) s_h = s_floor;
-    }
-    float s_eff = (s_h > s_w) ? s_h : s_w;
-    v->spread_eff = s_eff;
-    v->ext_u = (s_eff > 1e-6f) ? s_w / s_eff : 1.f;         /* == 1 exactly when isotropic (s_w == s_eff) */
-    v->ext_w = (s_eff > 1e-6f && s_h >= 0.f) ? s_h / s_eff : v->ext_u;
+    /* effective spread (solve_spread above): user width + metric-size / near-listener floors +
+     * the anisotropy ratios. The decor split follows spread_eff, so the widened part decorrelates
+     * too when enabled. */
+    const float s_eff = solve_spread(c, v);
     const int smode = (s_eff > 1e-3f)                        /* widen the image if this source has size */
                     ? atomic_load_explicit(&c->spread_mode, memory_order_acquire) : -1;
     if      (smode == 2) fs_solve(c, v, p, s_eff, ug);       /* spectral: per-band targets; gtarget stays the point */
@@ -1441,23 +1587,42 @@ static void mix_voice(RtCore* c, Voice* v, uint16_t idx, float* bus, uint32_t n,
                                          * instead of snapping the unspent start/n fraction at the block end */
     float pg, pg_step;
     if (!pause_gate(c, v, idx, nr, &pg, &pg_step)) return;
+    /* point-voice gain width: the speaker count, or BWA_AMBI_CH when direct-binaural routes this
+     * voice onto the SH accumulator instead (`bus` here IS c->ambi_direct then — rt_render picks
+     * the target). The gain arrays are BWA_CHANNELS-wide either way; nch == c->channels outside
+     * direct mode, so nothing changes for the speaker render. */
+    const uint32_t nch = c->mix_nch;
     float step[BWA_CHANNELS];
-    for (uint32_t ch = 0; ch < c->channels; ++ch)
+    for (uint32_t ch = 0; ch < nch; ++ch)
         step[ch] = (v->gtarget[ch] - v->gcur[ch]) / (float)nr;
+    /* direct mode 2: the voice's point share renders into its OWN mono slot (per-voice HRTF needs
+     * unsummed signals) with a scalar ramp — gcur[BWA_AMBI_CH], solved beside the SH gains and
+     * landed with them. Published to the dv_view at the end of the mix (consumer: steam_decode). */
+    const int pv = c->direct_blk && c->direct_on == 2;
+    float* pv_slot = NULL;
+    float  pv_g = 0.f, pv_step = 0.f;
+    if (pv) {
+        pv_slot = c->dv_mono + (size_t)idx * BWA_RT_MAX_BLOCK;
+        if (start) memset(pv_slot, 0, sizeof(float) * start);   /* scheduled start: silent lead-in */
+        pv_g = v->gcur[BWA_AMBI_CH];
+        pv_step = (v->gtarget[BWA_AMBI_CH] - pv_g) / (float)nr;
+    }
     /* dual-band panning: split each sample at BWA_DUALBAND_FC; the low band uses amplitude-normalised
      * gains (gcur_lo, better LF velocity vector), the high band the power gains. The complementary
      * 1st-order crossover (hi = s - lo) sums flat. dual = gcur*s + (gcur_lo-gcur)*lo, so a `dual_mix`
      * factor ramped 0<->1 on an A/B toggle CROSSFADES the LF re-weighting instead of stepping it
      * (invariant 4). The full path runs only while dual is on OR mid-crossfade; settled-single stays
      * cheap and keeps xover_lp at 0 for a clean re-enable. */
-    const int dual = atomic_load_explicit(&c->dual_band, memory_order_acquire);
+    const int dual = c->direct_on ? 0                       /* dual-band is a speaker-array concern:
+                                                             * SH gains have no amplitude/power split */
+                                  : atomic_load_explicit(&c->dual_band, memory_order_acquire);
     const float target_mix = dual ? 1.f : 0.f;
     const int use_dual = (v->dual_mix > 0.f) || dual;
     float dmix = v->dual_mix;
     const float dmix_step = (target_mix - v->dual_mix) / (float)nr;
     const float xover_a = c->xover_a;
     float step_lo[BWA_CHANNELS];
-    if (use_dual) for (uint32_t ch = 0; ch < c->channels; ++ch)
+    if (use_dual) for (uint32_t ch = 0; ch < nch; ++ch)
         step_lo[ch] = (v->gtarget_lo[ch] - v->gcur_lo[ch]) / (float)nr;
     /* spectral widening (spread mode 2): while engaged the per-band gains REPLACE the single-path
      * output stage (dual-band included — its < 700 Hz share is folded into the band targets by
@@ -1465,7 +1630,7 @@ static void mix_voice(RtCore* c, Voice* v, uint16_t idx, float* bus, uint32_t n,
     const int fs = v->fs_on;
     float fs_step[BWA_FS_BANDS][BWA_CHANNELS];
     if (fs) for (int b = 0; b < BWA_FS_BANDS; ++b)
-        for (uint32_t ch = 0; ch < c->channels; ++ch)
+        for (uint32_t ch = 0; ch < nch; ++ch)
             fs_step[b][ch] = (v->fs_t[b][ch] - v->fs_g[b][ch]) / (float)nr;
     /* gate the sim's publish on our own generation (we own v->gen, so this is race-free): apply the
      * published transmittance only if it was published for THIS occupant, else treat as clear. Read
@@ -1474,10 +1639,6 @@ static void mix_voice(RtCore* c, Voice* v, uint16_t idx, float* bus, uint32_t n,
     const bool mine = atomic_load_explicit(&c->occ_handle[idx], memory_order_acquire) == myh;
     const float occ_tgt = mine ? atomic_load_explicit(&c->occ_val[idx], memory_order_relaxed) : 1.0f;
     const float occ_step = (occ_tgt - v->occ_cur) / (float)nr;   /* occlusion ramp (invariant 4) */
-    /* directivity (source-radiation gain): own ramp — it tracks source/listener motion, so a raw
-     * per-block jump would zipper (invariant 4). Gated on the same handle. */
-    const float dir_tgt = mine ? atomic_load_explicit(&c->occ_dir[idx], memory_order_relaxed) : 1.0f;
-    const float dir_step = (dir_tgt - v->dir_cur) / (float)nr;
 
     /* per-band EQ: read the gated tilt once + glide the band gains; compute this block's TARGET
      * biquad coeffs and interpolate the live coeffs toward them per sample, so the spectral envelope
@@ -1492,11 +1653,30 @@ static void mix_voice(RtCore* c, Voice* v, uint16_t idx, float* bus, uint32_t n,
      * Both ride the block: the air coeff ramps (invariant 4); the Doppler delay glides toward
      * distance/c and the glide rate IS the pitch shift. Indices stay integer (the ring is masked,
      * the delay's frac is a separate small float) so a long-lived voice never loses sample precision. */
-    float dist = 0.f;
-    if (v->air_on || v->dop_on || v->ldc_on || (v->refl_send && v->refl_dist)) {
-        float dx = v->pos_active[0]-c->lis.p_active[0], dy = v->pos_active[1]-c->lis.p_active[1], dz = v->pos_active[2]-c->lis.p_active[2];
-        dist = sqrtf(dx*dx + dy*dy + dz*dz);
+    const int dir_manual = !mine && v->dir_w > 0.f;   /* manual dipole: only while no sim publish owns the voice */
+    float dist = 0.f, slx = 0.f, sly = 0.f, slz = 0.f;             /* source -> listener */
+    if (v->air_on || v->dop_on || v->ldc_on || v->nf_on || dir_manual || (v->refl_send && v->refl_dist)) {
+        slx = c->lis.p_active[0]-v->pos_active[0]; sly = c->lis.p_active[1]-v->pos_active[1]; slz = c->lis.p_active[2]-v->pos_active[2];
+        dist = sqrtf(slx*slx + sly*sly + slz*slz);
     }
+    /* directivity (source-radiation gain): own ramp — it tracks source/listener motion, so a raw
+     * per-block jump would zipper (invariant 4). The sim's publish wins while it owns the voice
+     * (gated on the same handle); otherwise a MANUAL pattern (CMD_SET_DIR) evaluates right here —
+     * phonon's weighted dipole, |(1-w) + w cos|^p toward the active listener — so builds without
+     * the sim get walk-correct directivity, per block, from pure math. */
+    float dir_tgt = 1.0f;
+    if (mine) dir_tgt = atomic_load_explicit(&c->occ_dir[idx], memory_order_relaxed);
+    else if (dir_manual && dist > 1e-4f) {
+        const float cosb = (v->dir_fwd[0]*slx + v->dir_fwd[1]*sly + v->dir_fwd[2]*slz) / dist;
+        dir_tgt = powf(fabsf(1.f - v->dir_w + v->dir_w * cosb), v->dir_pow);
+    }
+    if (dir_manual) {                                            /* readback publish (rt_get_directivity) */
+        uint32_t fb; memcpy(&fb, &dir_tgt, sizeof fb);
+        atomic_store_explicit(&c->dir_pub[idx], ((uint64_t)myh << 32) | fb, memory_order_relaxed);
+    }
+    const float dir_step = (dir_tgt - v->dir_cur) / (float)nr;
+    /* engine-wide speed of sound (live, atomic): Doppler + ISM delays derive from it this block */
+    const float sos = atomic_load_explicit(&c->sos, memory_order_relaxed);
     /* reverb wet-send level: refl_gain, optionally scaled by distance (near = drier, far = wetter); ramped
      * (so motion + on/off don't zipper the send). do_send keeps ramping a just-disabled voice down to 0. */
     float refl_tgt = 0.f;
@@ -1537,9 +1717,20 @@ static void mix_voice(RtCore* c, Voice* v, uint16_t idx, float* bus, uint32_t n,
     }
     const int use_ldc = v->ldc_on || v->ldc_g_cur > 1.f + 1e-4f;   /* keep ramping a just-disabled voice flat */
     if (use_ldc) ldc_step = (ldc_tgt - v->ldc_g_cur) / (float)nr;
+    /* near-field proximity boost (opt-in): the LF shelf rises linearly to BWA_NF_MAX_DB as the
+     * source closes from BWA_NF_RADIUS to the head — the spherical-wavefront proximity effect,
+     * the near-distance mirror of the loudness-comp shelf above (that one restores body FAR away).
+     * Ramped (invariant 4); ramps back to flat after opt-out. Direct path only, like air/Doppler. */
+    float nf_tgt = 1.f, nf_step = 0.f;
+    if (v->nf_on && dist < BWA_NF_RADIUS) {
+        const float nf_db = BWA_NF_MAX_DB * (1.f - dist / BWA_NF_RADIUS);
+        nf_tgt = powf(10.f, nf_db / 20.f);
+    }
+    const int use_nf = v->nf_on || v->nf_g_cur > 1.f + 1e-4f;      /* keep ramping a just-disabled voice flat */
+    if (use_nf) nf_step = (nf_tgt - v->nf_g_cur) / (float)nr;
     float dop_ds = 0.f, dop_k = 0.f, *dring = NULL; uint32_t dmask = 0;
     if (v->dop_on && c->dop_ring) {
-        dop_ds = dist / BWA_SPEED_OF_SOUND * (float)c->sample_rate;     /* raw propagation delay (samples) */
+        dop_ds = dist / sos * (float)c->sample_rate;                    /* raw propagation delay (samples) */
         float maxd = (float)(c->dop_ringlen - 2);          /* keep both interpolation taps in-ring */
         if (dop_ds > maxd) dop_ds = maxd;
         if (v->dop_init) { v->dop_delay = dop_ds; v->dop_dtgt = dop_ds; v->dop_init = false; }  /* snap: no enable glitch */
@@ -1567,7 +1758,9 @@ static void mix_voice(RtCore* c, Voice* v, uint16_t idx, float* bus, uint32_t n,
     float dc_a = v->dc_amp, dc_step = 0.f;
     int use_dc = 0;
     {
-        const int dc_on = c->dc_on_blk;                   /* the block's single load (rt_render) */
+        const int dc_on = c->direct_on ? 0 : c->dc_on_blk;   /* the block's single load (rt_render);
+                                                              * decor is per-SPEAKER velvet filters —
+                                                              * meaningless on SH channels (direct) */
         const float sp = v->spread_eff;                   /* the SOLVED width (user + near-listener floor) */
         const float dc_tgt = dc_on ? sqrtf(sp) : 0.f;
         use_dc  = (dc_tgt > 0.f || v->dc_amp > 0.f);
@@ -1609,7 +1802,7 @@ static void mix_voice(RtCore* c, Voice* v, uint16_t idx, float* bus, uint32_t n,
         for (int m = 0; m < ISM_IMAGES; ++m) {
             if (m >= nimg) {                                     /* disabled / outside the room: fade this slot */
                 ism_dtgt[m] = v->ism_delay[m]; ism_a[m] = 1.f;
-                for (uint32_t k = 0; k < c->channels; ++k) {
+                for (uint32_t k = 0; k < nch; ++k) {
                     ism_gtgt[m][k]  = 0.f;
                     ism_gstep[m][k] = -v->ism_g[m][k] / (float)nr;
                 }
@@ -1618,18 +1811,28 @@ static void mix_voice(RtCore* c, Voice* v, uint16_t idx, float* bus, uint32_t n,
             float dx = img[m].pos[0]-c->lis.p_active[0], dy = img[m].pos[1]-c->lis.p_active[1],
                   dz = img[m].pos[2]-c->lis.p_active[2];
             float path = sqrtf(dx*dx + dy*dy + dz*dz);       /* the reflection's path length to the ears */
-            float dtg = path / BWA_SPEED_OF_SOUND * (float)c->sample_rate;
+            float dtg = path / sos * (float)c->sample_rate;
             ism_dtgt[m] = dtg > maxd ? maxd : dtg;
             if (v->ism_init) v->ism_delay[m] = ism_dtgt[m];      /* fresh enable: snap (a glide from 0 would sweep) */
             /* the panner gives direction + its own distance attenuation; the mid-band coefficient is
              * the broadband level, and the high-vs-mid ratio becomes a one-pole HF damping (a wall
-             * absorbs treble harder — why a reflection sounds duller than the direct sound) */
-            panner_gains(c, p, img[m].pos, v->gain_user * c->group_gain[v->group] * img[m].refl[1] * scale,
-                         ism_gtgt[m]);
-            float hf = img[m].refl[1] > 1e-6f ? img[m].refl[2] / img[m].refl[1] : 1.f;
+             * absorbs treble harder — why a reflection sounds duller than the direct sound). In
+             * direct-binaural mode each image SH-encodes at its own true direction instead — the
+             * same point-source treatment, headphone-rendered (v = NULL: images take the layout
+             * curve, as the speaker path bakes it). */
+            if (c->direct_on)
+                direct_gains_at(c, NULL, img[m].pos,
+                                v->gain_user * c->group_gain[v->group] * img[m].refl[1] * scale,
+                                0.f, ism_gtgt[m]);
+            else
+                panner_gains(c, p, img[m].pos, v->gain_user * c->group_gain[v->group] * img[m].refl[1] * scale,
+                             ism_gtgt[m]);
+            float hf = fabsf(img[m].refl[1]) > 1e-6f ? img[m].refl[2] / img[m].refl[1] : 1.f;   /* fabsf: a
+                                                                 * pressure-release face negates BOTH bands —
+                                                                 * the damping ratio must stay positive */
             if (hf > 1.f) hf = 1.f; else if (hf < 0.02f) hf = 0.02f;
             ism_a[m] = hf;                                       /* 1 = no damping .. 0 = fully dull */
-            for (uint32_t k = 0; k < c->channels; ++k)
+            for (uint32_t k = 0; k < nch; ++k)
                 ism_gstep[m][k] = (ism_gtgt[m][k] - v->ism_g[m][k]) / (float)nr;
         }
         v->ism_init = false;
@@ -1713,7 +1916,7 @@ static void mix_voice(RtCore* c, Voice* v, uint16_t idx, float* bus, uint32_t n,
                 float r = newer * (1.f - df) + older * df;      /* fractional read: no zipper as the path glides */
                 v->ism_lp[m] += ism_a[m] * (r - v->ism_lp[m]);  /* wall HF damping (one-pole) */
                 r = v->ism_lp[m];
-                for (uint32_t ch = 0; ch < c->channels; ++ch) {
+                for (uint32_t ch = 0; ch < nch; ++ch) {
                     bus[(size_t)ch * n + i] += v->ism_g[m][ch] * r;
                     v->ism_g[m][ch] += ism_gstep[m][ch];
                 }
@@ -1728,6 +1931,11 @@ static void mix_voice(RtCore* c, Voice* v, uint16_t idx, float* bus, uint32_t n,
             v->ldc_lp += c->ldc_a * (s - v->ldc_lp);
             s += (v->ldc_g_cur - 1.f) * v->ldc_lp;
             v->ldc_g_cur += ldc_step;
+        }
+        if (use_nf) {                                           /* near-field proximity: one-pole LF shelf (direct path) */
+            v->nf_lp += c->nf_a * (s - v->nf_lp);
+            s += (v->nf_g_cur - 1.f) * v->nf_lp;
+            v->nf_g_cur += nf_step;
         }
         if (dring) {                                            /* Doppler: write, read at the gliding fractional delay */
             dring[v->dop_w & dmask] = s;
@@ -1762,7 +1970,7 @@ static void mix_voice(RtCore* c, Voice* v, uint16_t idx, float* bus, uint32_t n,
             const float cs = 1.f - dc_a * dc_a;                /* ... coherent share stays on the main path */
             s *= cs > 0.f ? sqrtf(cs) : 0.f;                   /* (ramp float error can graze cs < 0) */
             const float* dcg = fs ? v->fs_g[0] : v->gcur;      /* spectral mode: band 0 IS the source direction */
-            for (uint32_t ch = 0; ch < c->channels; ++ch)
+            for (uint32_t ch = 0; ch < nch; ++ch)              /* (never direct: dc_on gated above) */
                 c->dc_bus[(size_t)ch * n + i] += dcg[ch] * sd;
             dc_a += dc_step;
         }
@@ -1775,7 +1983,7 @@ static void mix_voice(RtCore* c, Voice* v, uint16_t idx, float* bus, uint32_t n,
                 bnd[x] = v->fs_lp[x] - prev; prev = v->fs_lp[x];
             }
             bnd[BWA_FS_XOVERS] = s - prev;
-            for (uint32_t ch = 0; ch < c->channels; ++ch) {
+            for (uint32_t ch = 0; ch < nch; ++ch) {
                 float acc = 0.f;
                 for (int b = 0; b < BWA_FS_BANDS; ++b) {
                     acc += v->fs_g[b][ch] * bnd[b];
@@ -1785,22 +1993,23 @@ static void mix_voice(RtCore* c, Voice* v, uint16_t idx, float* bus, uint32_t n,
             }
         } else if (use_dual) {
             float lo = v->xover_lp + xover_a * (s - v->xover_lp); v->xover_lp = lo;   /* LP @ 700 Hz */
-            for (uint32_t ch = 0; ch < c->channels; ++ch) {                           /* single + dmix-scaled LF re-weight */
+            for (uint32_t ch = 0; ch < nch; ++ch) {                                   /* single + dmix-scaled LF re-weight */
                 bus[(size_t)ch * n + i] += v->gcur[ch] * s + dmix * (v->gcur_lo[ch] - v->gcur[ch]) * lo;
                 v->gcur_lo[ch] += step_lo[ch]; v->gcur[ch] += step[ch];
             }
             dmix += dmix_step;
         } else {
-            for (uint32_t ch = 0; ch < c->channels; ++ch) {
+            for (uint32_t ch = 0; ch < nch; ++ch) {
                 bus[(size_t)ch * n + i] += v->gcur[ch] * s;
                 v->gcur[ch] += step[ch];
             }
         }
+        if (pv_slot) { pv_slot[i] = pv_g * s; pv_g += pv_step; }   /* the point share (own slot: =, not +=) */
     }
     v->cursor = cur;
     if (ism_on) {                                               /* land the image gains exactly (invariant 4) */
         for (int m = 0; m < ism_n; ++m)
-            for (uint32_t ch = 0; ch < c->channels; ++ch) v->ism_g[m][ch] = ism_gtgt[m][ch];
+            for (uint32_t ch = 0; ch < nch; ++ch) v->ism_g[m][ch] = ism_gtgt[m][ch];
         v->ism_tail = 0;                                        /* the targets above were 0 when !ism_want, so
                                                                  * one block of ramp-out finishes the fade */
     }
@@ -1816,20 +2025,30 @@ static void mix_voice(RtCore* c, Voice* v, uint16_t idx, float* bus, uint32_t n,
     if (v->air_on) v->air_a_cur = air_a_tgt;                     /* land the ramped propagation params */
     if (use_ldc) { v->ldc_g_cur = ldc_tgt;                       /* land the shelf; reset once settled flat */
                    if (!v->ldc_on && ldc_tgt == 1.f) v->ldc_lp = 0.f; }
+    if (use_nf)  { v->nf_g_cur = nf_tgt;                         /* land the near-field shelf the same way */
+                   if (!v->nf_on && nf_tgt == 1.f) v->nf_lp = 0.f; }
     if (do_send)   v->refl_g_cur = refl_tgt;                     /* (the Doppler delay self-tracks per sample) */
     if (use_dual) {
-        for (uint32_t ch = 0; ch < c->channels; ++ch) v->gcur_lo[ch] = v->gtarget_lo[ch];  /* land lo band */
+        for (uint32_t ch = 0; ch < nch; ++ch) v->gcur_lo[ch] = v->gtarget_lo[ch];  /* land lo band */
         v->dual_mix = target_mix;                                    /* land the crossfade factor */
         if (target_mix == 0.f) v->xover_lp = 0.f;                    /* settled single next block: clean LP restart */
     }
     if (fs) {
         for (int b = 0; b < BWA_FS_BANDS; ++b)                       /* land the band gains exactly */
-            for (uint32_t ch = 0; ch < c->channels; ++ch) v->fs_g[b][ch] = v->fs_t[b][ch];
+            for (uint32_t ch = 0; ch < nch; ++ch) v->fs_g[b][ch] = v->fs_t[b][ch];
         if (v->fs_on == 2) v->fs_on = 0;   /* retiring: every band landed on the single-path target, and
                                             * gcur lands on the same gtarget below — exact handoff */
     }
     if (v->eq.engaged) eq_block_land(&v->eq, co_tgt, flat);      /* land occlusion-EQ coeffs; bypass once settled flat */
-    for (uint32_t ch = 0; ch < c->channels; ++ch) v->gcur[ch] = v->gtarget[ch]; /* land exactly */
+    for (uint32_t ch = 0; ch < nch; ++ch) v->gcur[ch] = v->gtarget[ch]; /* land exactly */
+    if (pv) {
+        v->gcur[BWA_AMBI_CH] = v->gtarget[BWA_AMBI_CH];          /* land the point-share scalar */
+        RtDirectVoice* dv = &c->dv_view[idx];                    /* publish this block's point tap */
+        dv->mono = pv_slot;
+        memcpy(dv->dir, v->dir_active, sizeof dv->dir);
+        dv->gen = v->gen;
+        dv->active = 1;
+    }
 
     if (ended) {
         v->playing = false;
@@ -1912,7 +2131,12 @@ static void mix_bed(RtCore* c, Voice* v, uint16_t idx, float* bus, uint32_t n, u
     const int nch = (int)snd->channels;
     const float g_step = (v->gtarget[0] - v->gcur[0]) / (float)nr;   /* master gain ramp (invariant 4) */
     ParaBed* pb = &c->para[idx];
-    const int want_p  = nch >= 4 && c->bed_param_blk;     /* the block's single load (rt_render) */
+    /* direct-binaural: the bed passes SH->SH into the direct field (one diagonal per channel —
+     * ambi_canon_to_phonon — instead of decode-to-speakers + virtual-speaker re-encode). The
+     * parametric renderer and the max-rE taper are SPEAKER-decode concerns and gate off with it
+     * (rotation still applies: it turns the field before either destination). */
+    const int direct  = c->direct_blk;
+    const int want_p  = nch >= 4 && !direct && c->bed_param_blk;  /* the block's single load (rt_render) */
     const int use_p   = want_p || pb->mix > 0.f;
     /* bed orientation (rt_bed_set_orientation): angles glide at BWA_BED_YAW_RATE, and rotation
      * happens BEFORE either renderer, so the matrix decode and the parametric analysis see the same
@@ -1956,7 +2180,7 @@ static void mix_bed(RtCore* c, Voice* v, uint16_t idx, float* bus, uint32_t n, u
      * decode (decode(w*sh) == the max-rE decode); re_mix ramps 0<->1 per sample so the A/B
      * crossfades. The parametric analysis, its re-panned direct stream, and the decorrelated
      * diffuse stream see the raw field (see RtCore.max_re). */
-    const int   re_on    = atomic_load_explicit(&c->max_re, memory_order_acquire);
+    const int   re_on    = direct ? 0 : atomic_load_explicit(&c->max_re, memory_order_acquire);
     const float re_tgt   = re_on ? 1.f : 0.f;
     const int   use_re   = re_on || v->re_mix > 0.f;
     float       rem      = v->re_mix;
@@ -2008,11 +2232,17 @@ static void mix_bed(RtCore* c, Voice* v, uint16_t idx, float* bus, uint32_t n, u
                     sh = shw;
                 }
                 const float g = v->gcur[0] * pg;   /* master gain x the pause/seek gate */
-                for (uint32_t s = 0; s < c->channels; ++s) {
-                    const float* D = c->bed_decode[s];
-                    float acc = 0.f;
-                    for (int k = 0; k < nch; ++k) acc += sh[k] * D[k];
-                    bus[(size_t)s * n + i] += g * acc;
+                if (direct) {                      /* SH->SH: the (rotated) field, basis-converted */
+                    float* ad = c->ambi_direct;
+                    for (int k = 0; k < nch; ++k)
+                        ad[(size_t)k * n + i] += g * sh[k] * ambi_canon_to_phonon[k];
+                } else {
+                    for (uint32_t s = 0; s < c->channels; ++s) {
+                        const float* D = c->bed_decode[s];
+                        float acc = 0.f;
+                        for (int k = 0; k < nch; ++k) acc += sh[k] * D[k];
+                        bus[(size_t)s * n + i] += g * acc;
+                    }
                 }
                 ++cur;
             }
@@ -2312,6 +2542,29 @@ void rt_render(RtCore* c, float* bus, uint32_t nframes, const bwa_timestamp* ts)
     const int dc_live = c->dc_on_blk || c->bed_param_blk || c->dc_tail > 0;
     if (dc_live) memset(c->dc_bus, 0, sizeof(float) * (size_t)c->channels * nframes);
     c->dc_wrote = 0;
+    /* direct-binaural: point voices accumulate into the SH bus this block (mix_voice's `bus`
+     * argument), leaving the speaker bus to the synthesized-diffuse layer. nframes <=
+     * BWA_RT_MAX_BLOCK here (the guard above), so the accumulator always fits. Mode 2 also
+     * clears the per-voice point-tap views; each rendered voice re-marks its own. */
+    c->direct_blk = c->direct_on && c->ambi_direct != NULL;
+    if (c->direct_blk) {
+        memset(c->ambi_direct, 0, sizeof(float) * (size_t)BWA_AMBI_CH * nframes);
+        if (c->direct_on == 2 && c->dv_view)
+            for (uint32_t i = 0; i < c->voice_cap; ++i) c->dv_view[i].active = 0;
+    }
+    /* adopt a published ISM-room change (rt_set_ism_room's seqlock): one attempt per block — on a
+     * torn read keep the previous copy and retry next block (wait-free; a lost race just delays
+     * adoption ~one block, inaudible under the image gain/delay ramps). */
+    {
+        const uint32_t is0 = atomic_load_explicit(&c->ism_seq, memory_order_seq_cst);
+        if (is0 != c->ism_seen && !(is0 & 1)) {
+            const IsmRoom tmp = c->ism_room_sh;
+            if (atomic_load_explicit(&c->ism_seq, memory_order_seq_cst) == is0) {
+                c->ism_room = tmp;
+                c->ism_seen = is0;
+            }
+        }
+    }
     int rt_active = 0;
     BWA_ZONE_BEGIN(zmix, "mix voices");
     for (uint32_t i = 0; i < c->voice_cap; ++i) {
@@ -2347,7 +2600,8 @@ void rt_render(RtCore* c, float* bus, uint32_t nframes, const bwa_timestamp* ts)
         }
         if (v->dirty) { compute_gains(c, v); v->dirty = false; }
         if (v->sound->channels > 1) mix_bed  (c, v, (uint16_t)i, bus, nframes, off);        /* ambisonic bed */
-        else                        mix_voice(c, v, (uint16_t)i, bus, nframes, off, aux);   /* mono point source */
+        else                        mix_voice(c, v, (uint16_t)i,                            /* mono point source */
+                                              c->direct_blk ? c->ambi_direct : bus, nframes, off, aux);
     }
     BWA_ZONE_END(zmix);
     BWA_PLOT("rt voices", rt_active);
@@ -2391,10 +2645,23 @@ void rt_render(RtCore* c, float* bus, uint32_t nframes, const bwa_timestamp* ts)
         bus_tap(c->bus_tap_ud, bus, nframes, c->lis.p_active, c->lis.q_active, aux);
         BWA_ZONE_END(zt);
     }
-    if (path_active) {   /* pathing: decode the summed indirect ambisonic field onto the bus (also pre-align) */
-        BWA_ZONE_BEGIN(zp, "path tap");
-        path_tap(c->path_tap_ud, bus, nframes, c->lis.p_active, c->lis.q_active, c->path_accum, c->path_ambi_ch);
-        BWA_ZONE_END(zp);
+    if (path_active) {
+        if (c->direct_blk) {
+            /* direct mode: the indirect field is already phonon-basis SH (steam_path publishes
+             * phonon's own shCoeffs) — sum it straight into the direct field. The speaker decode
+             * + virtual-speaker re-encode would be pure loss, and joining the HRTF decode means
+             * head orientation lands on the indirect arrivals too, as it should. */
+            const uint32_t kc = c->path_ambi_ch < BWA_AMBI_CH ? c->path_ambi_ch : BWA_AMBI_CH;
+            for (uint32_t k = 0; k < kc; ++k) {
+                float* ad = c->ambi_direct + (size_t)k * nframes;
+                const float* pa = c->path_accum + (size_t)k * nframes;
+                for (uint32_t i = 0; i < nframes; ++i) ad[i] += pa[i];
+            }
+        } else {   /* pathing: decode the summed indirect ambisonic field onto the bus (pre-align) */
+            BWA_ZONE_BEGIN(zp, "path tap");
+            path_tap(c->path_tap_ud, bus, nframes, c->lis.p_active, c->lis.q_active, c->path_accum, c->path_ambi_ch);
+            BWA_ZONE_END(zp);
+        }
     }
     /* master gain: one ramped scalar over everything mixed so far (voices, beds, reverb/path taps),
      * applied PRE-align so the per-speaker trims and the raw channel-test signal stay calibrated.
@@ -2825,10 +3092,18 @@ void rt_source_set_ism(RtCore* c, uint32_t h, bool on) {
 
 /* The shoebox for the image-source reflections. Set while the audio thread is stopped (bwa_start
  * reads it); NULL or an invalid room disables early reflections engine-wide. */
+/* Publish the room to the audio thread (single-slot seqlock, pose.h's protocol: the struct is too
+ * wide for one atomic store, and the seq_cst stores are full barriers that order the plain copy
+ * between them on this target). LIVE-safe — rt_render adopts a stable copy at block start and the
+ * opted-in voices re-solve their images next block (gains ramp, delays glide: a room change bends
+ * the reflections rather than clicking). Single writer: the control thread. */
 void rt_set_ism_room(RtCore* c, const IsmRoom* room) {
     if (!c) return;
-    if (room) c->ism_room = *room;
-    else      memset(&c->ism_room, 0, sizeof c->ism_room);
+    const uint32_t s0 = atomic_load_explicit(&c->ism_seq, memory_order_relaxed);
+    atomic_store_explicit(&c->ism_seq, s0 + 1, memory_order_seq_cst);   /* enter (odd) */
+    if (room) c->ism_room_sh = *room;
+    else      memset(&c->ism_room_sh, 0, sizeof c->ism_room_sh);
+    atomic_store_explicit(&c->ism_seq, s0 + 2, memory_order_seq_cst);   /* leave (even) */
 }
 
 void rt_set_ism_gain(RtCore* c, float linear) {
@@ -3113,6 +3388,7 @@ RtCore* rt_create(uint32_t req_voice_cap, uint32_t sound_cap, uint32_t sample_ra
     c->fade_reserve = BWA_FADE_RESERVE;
     c->sound_cap   = sound_cap;
     c->channels    = channels;
+    c->mix_nch     = channels;          /* point-voice gain width; rt_set_direct_ambi widens to SH */
     c->sample_rate = sample_rate;
     c->xover_a     = 1.f - expf(-6.2831853f * BWA_DUALBAND_FC / (float)sample_rate);   /* dual-band crossover */
     c->test_noise  = 0x9e3779b9u;       /* non-zero LCG seed for the channel-test noise */
@@ -3121,6 +3397,7 @@ RtCore* rt_create(uint32_t req_voice_cap, uint32_t sound_cap, uint32_t sample_ra
     c->occ_val    = (_Atomic float*)   calloc(voice_cap, sizeof(_Atomic float));
     c->occ_eq     = (_Atomic uint64_t*)calloc(voice_cap, sizeof(_Atomic uint64_t));
     c->occ_dir    = (_Atomic float*)   calloc(voice_cap, sizeof(_Atomic float));
+    c->dir_pub    = (_Atomic uint64_t*)calloc(voice_cap, sizeof(_Atomic uint64_t));
     c->play_pub   = (_Atomic uint32_t*)calloc(voice_cap, sizeof(_Atomic uint32_t));
     c->pos_pub    = (_Atomic uint64_t*)calloc(voice_cap, sizeof(_Atomic uint64_t));
     c->aux        = (float*)   calloc(BWA_RT_MAX_BLOCK, sizeof(float));   /* reflection aux-send scratch */
@@ -3218,7 +3495,9 @@ RtCore* rt_create(uint32_t req_voice_cap, uint32_t sound_cap, uint32_t sample_ra
     for (int o = 1; o <= 3; ++o)                              /* max-rE tapers per content order */
         ambi_max_re_weights(o, c->re_w[o - 1]);
     c->ldc_a = 1.f - expf(-6.2831853f * 250.f / (float)sample_rate);   /* loudness-comp shelf corner */
-    if (!c->voices || !c->occ_handle || !c->occ_val || !c->occ_eq || !c->occ_dir || !c->play_pub || !c->pos_pub || !c->aux ||
+    c->nf_a  = 1.f - expf(-6.2831853f * BWA_NF_FC / (float)sample_rate);   /* near-field shelf corner */
+    atomic_store_explicit(&c->sos, BWA_SPEED_OF_SOUND, memory_order_relaxed);
+    if (!c->voices || !c->occ_handle || !c->occ_val || !c->occ_eq || !c->occ_dir || !c->dir_pub || !c->play_pub || !c->pos_pub || !c->aux ||
         !c->stream_scratch || !c->streams || !c->path_accum || !c->path_pub || !c->path_idx ||
         !c->gen || !c->inuse || !c->priority || !c->stealing || !c->push_sound || !c->retire_park ||
         !c->play_opt || !c->freelist || !c->sounds || !c->sfreelist ||
@@ -3295,6 +3574,44 @@ void rt_set_layout(RtCore* c, const Layout* L) {
     c->layout_gen++;                             /* the SPCAP cache self-invalidates on the next gains call */
     for (uint32_t i = 0; i < c->voice_cap; ++i)
         if (c->voices[i].active) c->voices[i].dirty = true;
+}
+
+/* Direct-binaural mode (BWA_PROFILE_BINAURAL): route point voices onto the 16-ch SH accumulator
+ * (and, mode 2, their point share onto per-voice mono taps) instead of the speaker panner — see
+ * the rt.h contract. Call while the audio thread is STOPPED: the engine sets mode 1 at create and
+ * re-decides 1-vs-2 at each bwa_start (per the steam monitor); voices carry per-channel gain state
+ * whose MEANING changes with the mode, so a change re-dirties every voice (the ramp machinery then
+ * crossfades old-meaning gcur onto new-meaning targets in one block — click-free). */
+void rt_set_direct_ambi(RtCore* c, int mode) {
+    if (!c) return;
+    if (mode < 0) mode = 0; else if (mode > 2) mode = 2;
+    if (mode > 0 && !c->ambi_direct)
+        c->ambi_direct = (float*)calloc((size_t)BWA_AMBI_CH * BWA_RT_MAX_BLOCK, sizeof(float));
+    if (mode == 2 && !c->dv_mono) {
+        c->dv_mono = (float*)calloc((size_t)c->voice_cap * BWA_RT_MAX_BLOCK, sizeof(float));
+        c->dv_view = (RtDirectVoice*)calloc(c->voice_cap, sizeof *c->dv_view);
+    }
+    if (mode > 0 && !c->ambi_direct) mode = 0;              /* alloc failure: stay on the speaker path */
+    if (mode == 2 && (!c->dv_mono || !c->dv_view)) mode = 1;
+    if (mode != c->direct_on)
+        for (uint32_t i = 0; i < c->voice_cap; ++i)
+            if (c->voices[i].active) c->voices[i].dirty = true;
+    c->direct_on = mode;
+    c->mix_nch = mode ? BWA_AMBI_CH : c->channels;
+}
+
+/* Audio thread, after rt_render: the block's summed direct-binaural SH field (phonon monitor
+ * basis, BWA_AMBI_CH planar channels of the block's nframes). NULL unless direct mode is on. */
+const float* rt_direct_ambi(RtCore* c) {
+    return (c && c->direct_on) ? c->ambi_direct : NULL;
+}
+
+/* Audio thread, after rt_render (mode 2): the per-slot point-tap view. Slots marked active carry
+ * this block's mono point share + direction; consume before the next rt_render. */
+uint32_t rt_direct_voices(RtCore* c, const RtDirectVoice** out) {
+    if (!c || c->direct_on != 2 || !c->dv_view) { if (out) *out = NULL; return 0; }
+    if (out) *out = c->dv_view;
+    return c->voice_cap;
 }
 
 /* Select the panner: 0 = DBAP (default, moving observer), 1 = SPCAP, 2 = VBAP (both fixed observer).
@@ -3403,6 +3720,39 @@ void rt_source_set_loudness_comp(RtCore* c, uint32_t h, bool on) {
     cmd_push(&c->cmds, &cmd);
 }
 
+/* Per-voice near-field proximity boost (enqueue-only; the mixer ramps the shelf). */
+void rt_source_set_proximity(RtCore* c, uint32_t h, bool on) {
+    if (!c) return;
+    Cmd cmd = { .type = CMD_SET_NF, .handle = h };
+    cmd.u.nf.on = on ? 1 : 0;
+    cmd_push(&c->cmds, &cmd);
+}
+
+/* Manual directivity (enqueue-only): the forward axis is normalized here (control thread), the
+ * pattern clamped to phonon's ranges; weight 0 disables. The mixer evaluates + ramps per block. */
+void rt_source_set_directivity_manual(RtCore* c, uint32_t h, const float fwd[3], float weight, float power) {
+    if (!c || !fwd || !isfinite(weight) || !isfinite(power)) return;
+    Cmd cmd = { .type = CMD_SET_DIR, .handle = h };
+    const float nrm = sqrtf(fwd[0]*fwd[0] + fwd[1]*fwd[1] + fwd[2]*fwd[2]);
+    if (!(nrm > 1e-6f)) {                                       /* degenerate/NaN forward -> room ahead */
+        cmd.u.dir.fwd[0] = 0.f; cmd.u.dir.fwd[1] = 0.f; cmd.u.dir.fwd[2] = 1.f;
+    } else {
+        cmd.u.dir.fwd[0] = fwd[0]/nrm; cmd.u.dir.fwd[1] = fwd[1]/nrm; cmd.u.dir.fwd[2] = fwd[2]/nrm;
+    }
+    if (weight < 0.f) weight = 0.f; else if (weight > 1.f)  weight = 1.f;
+    if (power  < 0.f) power  = 0.f; else if (power  > 64.f) power  = 64.f;
+    cmd.u.dir.weight = weight; cmd.u.dir.power = power;
+    cmd_push(&c->cmds, &cmd);
+}
+
+/* Engine-wide speed of sound (m/s; live). Atomic store; mix_voice re-reads it per block, and both
+ * delay users glide toward their new targets — a change bends, never steps (invariant 4). */
+void rt_set_speed_of_sound(RtCore* c, float mps) {
+    if (!c || !isfinite(mps)) return;
+    if (mps < BWA_SOS_MIN) mps = BWA_SOS_MIN; else if (mps > BWA_SOS_MAX) mps = BWA_SOS_MAX;
+    atomic_store_explicit(&c->sos, mps, memory_order_relaxed);
+}
+
 /* Extra (compromise) listener positions — multi-listener panning. Latest-wins, commit-gated like
  * the pose; n = 0 restores single-listener panning. Control thread, enqueue-only. */
 void rt_set_extra_listeners(RtCore* c, const float* xyz, uint32_t n) {
@@ -3490,13 +3840,21 @@ float rt_get_occlusion(RtCore* c, uint32_t handle) {
          ? atomic_load_explicit(&c->occ_val[idx], memory_order_relaxed) : 1.f;
 }
 
-/* Read back the published directivity gain (1 = on-axis/omni) — for HUD/diagnostics. */
+/* Read back the published directivity gain (1 = on-axis/omni) — for HUD/diagnostics. The sim's
+ * publish (occ_dir) wins while it owns the voice; otherwise the mixer's manual-dipole publish
+ * (dir_pub, handle-gated in the same word) reports the audio thread's own evaluation. */
 float rt_get_directivity(RtCore* c, uint32_t handle) {
     if (!c) return 1.f;
     uint16_t idx = BWA_H_IDX(handle);
     if (idx >= c->voice_cap) return 1.f;
-    return (atomic_load_explicit(&c->occ_handle[idx], memory_order_acquire) == handle)
-         ? atomic_load_explicit(&c->occ_dir[idx], memory_order_relaxed) : 1.f;
+    if (atomic_load_explicit(&c->occ_handle[idx], memory_order_acquire) == handle)
+        return atomic_load_explicit(&c->occ_dir[idx], memory_order_relaxed);
+    const uint64_t dp = atomic_load_explicit(&c->dir_pub[idx], memory_order_relaxed);
+    if ((uint32_t)(dp >> 32) == handle) {
+        float g; uint32_t fb = (uint32_t)dp; memcpy(&g, &fb, sizeof g);
+        return g;
+    }
+    return 1.f;
 }
 
 void rt_destroy(RtCore* c) {
@@ -3522,10 +3880,12 @@ void rt_destroy(RtCore* c) {
     free(c->para);
     stream_set_destroy(c->streams);     /* stops the streaming thread, releases every open stream + ring */
     free(c->stream_scratch);
+    free(c->ambi_direct);
     free(c->path_accum);
     free(c->path_pub);
     free((void*)c->path_idx);
     free(c->aux);
+    free((void*)c->dir_pub);
     free((void*)c->occ_dir);            /* cast drops the _Atomic qualifier for free() */
     free((void*)c->pos_pub);
     free((void*)c->play_pub);

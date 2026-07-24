@@ -40,8 +40,8 @@ static void decode_channel(SteamMonitor* m, int ch, const float q[4]) {
      * previous rotation and interpolates), so the first block after a new q is a smear of old and
      * new. Render twice and measure the settled block. (The old head convention masked this: its
      * identity equalled phonon's initial internal rotation, so block 1 happened to be pure.) */
-    steam_monitor_process(m, bus, p, q, out, N);
-    steam_monitor_process(m, bus, p, q, out, N);
+    steam_monitor_process(m, bus, NULL, NULL, 0, p, q, out, N);
+    steam_monitor_process(m, bus, NULL, NULL, 0, p, q, out, N);
 }
 
 int main(void) {
@@ -50,9 +50,11 @@ int main(void) {
     out = (float*)calloc((size_t)2 * N, sizeof(float));
     if (!bus || !out) { printf("FAIL: alloc\n"); return 1; }
 
-    SteamMonitor* m = steam_monitor_create(&L, 48000, N, NULL);   /* built-in HRTF */
+    SteamMonitor* m = steam_monitor_create(&L, 48000, N, NULL, 8);   /* built-in HRTF + a small
+                                                                      * per-voice fleet (mode 2) */
     CHECK(m != NULL, "steam_monitor_create (built-in HRTF)");
     if (!m) { printf("steam_decode_test: %d FAILURES\n", fails); return 1; }
+    CHECK(steam_monitor_pervoice(m), "per-voice fleet created");
 
     int right = -1, left = -1;     /* pure-lateral speakers (y,z ~ 0) so the HRTF L/R isn't diluted by elevation */
     for (int k = 0; k < (int)BWA_CHANNELS; ++k) {     /* identity faces +z, so the listener's right is -x */
@@ -113,8 +115,8 @@ int main(void) {
             rt_render(c, bus, N, &ts);                       /* block 1: gains ramp in */
             rt_render(c, bus, N, &ts);                       /* settled */
             rt_get_listener(c, pg, qg);
-            steam_monitor_process(m, bus, pg, qg, out, N);   /* twice: phonon smears an orientation */
-            steam_monitor_process(m, bus, pg, qg, out, N);   /* change across its first block */
+            steam_monitor_process(m, bus, NULL, NULL, 0, pg, qg, out, N);   /* twice: phonon smears an orientation */
+            steam_monitor_process(m, bus, NULL, NULL, 0, pg, qg, out, N);   /* change across its first block */
             printf("live +x, ident: L=%.4g R=%.4g\n", e_left(), e_right());
             CHECK(e_left() > e_right() * 1.1, "live: +x source (listener's LEFT) favors the left ear");
             const float q180[4] = { 0, 1, 0, 0 };
@@ -122,10 +124,130 @@ int main(void) {
             rt_commit(c);
             rt_render(c, bus, N, &ts);
             rt_get_listener(c, pg, qg);
-            steam_monitor_process(m, bus, pg, qg, out, N);
-            steam_monitor_process(m, bus, pg, qg, out, N);
+            steam_monitor_process(m, bus, NULL, NULL, 0, pg, qg, out, N);
+            steam_monitor_process(m, bus, NULL, NULL, 0, pg, qg, out, N);
             printf("live +x, yaw180: L=%.4g R=%.4g\n", e_left(), e_right());
             CHECK(e_right() > e_left() * 1.1, "live: head turned 180 - the +x source now favors the right ear");
+            free(blk);
+            rt_destroy(c);
+        }
+    }
+
+    /* 5. the live DIRECT composition (BWA_PROFILE_BINAURAL minus the device): the same scene through
+     * rt's direct mode — the per-voice SH encode (ambi_encode_phonon at the true direction) summed
+     * into the decode alongside the (silent) bus. Pins the rt-direct × phonon seam: encode basis,
+     * ACN order, and the decode-side orientation, live. */
+    {
+        RtCore* c = rt_create(4, 4, 48000, BWA_CHANNELS);
+        CHECK(c != NULL, "direct: rt_create");
+        if (c) {
+            rt_set_direct_ambi(c, 1);
+            rt_set_layout(c, &L);
+            char perr[256] = {0};
+            uint32_t h = rt_source_create_stream(c, perr, sizeof perr);
+            CHECK(h != 0, "direct: push source");
+            float* blk = (float*)malloc(sizeof(float) * 4 * N);
+            for (uint32_t i = 0; i < 4 * N; ++i)             /* a tone, not DC (see decode_channel) */
+                blk[i] = 0.5f * sinf(6.2831853f * 660.0f * (float)i / 48000.0f);
+            rt_source_push(c, h, blk, 4 * N);
+            rt_source_set_pos(c, h, 1.5f, 1.5f, 0.f);        /* room +x = the identity listener's LEFT */
+            const float pl[3] = { 0.f, 1.5f, 0.f };
+            const float qi[4] = { 0, 0, 0, 1 };
+            rt_set_listener(c, pl, qi);
+            rt_commit(c);
+            bwa_timestamp ts = { 0, 0 };
+            float pg[3], qg[4];
+            rt_render(c, bus, N, &ts);
+            rt_render(c, bus, N, &ts);
+            const float* direct = rt_direct_ambi(c);
+            CHECK(direct != NULL, "direct: rt_direct_ambi returns the SH field");
+            {   /* the direct field carries the voice; the speaker bus does NOT (it kept the diffuse layer) */
+                double de = 0, be = 0;
+                for (uint32_t i = 0; i < 16 * N && direct; ++i) de += fabs(direct[i]);
+                for (uint32_t i = 0; i < (uint32_t)BWA_CHANNELS * N; ++i) be += fabs(bus[i]);
+                CHECK(de > 1e-3, "direct: the SH field is audible");
+                CHECK(be < 1e-9, "direct: the point voice stays OFF the speaker bus");
+            }
+            rt_get_listener(c, pg, qg);
+            steam_monitor_process(m, bus, direct, NULL, 0, pg, qg, out, N);
+            steam_monitor_process(m, bus, direct, NULL, 0, pg, qg, out, N);
+            printf("direct +x, ident: L=%.4g R=%.4g\n", e_left(), e_right());
+            CHECK(e_left() > e_right() * 1.1, "direct: +x source (listener's LEFT) favors the left ear");
+            const float q180[4] = { 0, 1, 0, 0 };
+            rt_set_listener(c, pl, q180);
+            rt_commit(c);
+            rt_render(c, bus, N, &ts);
+            direct = rt_direct_ambi(c);
+            rt_get_listener(c, pg, qg);
+            steam_monitor_process(m, bus, direct, NULL, 0, pg, qg, out, N);
+            steam_monitor_process(m, bus, direct, NULL, 0, pg, qg, out, N);
+            printf("direct +x, yaw180: L=%.4g R=%.4g\n", e_left(), e_right());
+            CHECK(e_right() > e_left() * 1.1, "direct: head turned 180 - the +x source now favors the right ear");
+            free(blk);
+            rt_destroy(c);
+        }
+    }
+
+    /* 6. the live MODE-2 composition (per-voice IPLBinauralEffect): the same scene through rt's
+     * per-voice point taps — a spread-0 voice leaves the SH field ~empty, rides its own mono slot,
+     * and the per-voice HRTF convolution carries the laterality (and flips with the head). Pins the
+     * whole mode-2 chain: the point/field power split, the slot render, the dv_view publish, the
+     * room->head-local direction handoff, and the effect fleet. */
+    {
+        RtCore* c = rt_create(4, 4, 48000, BWA_CHANNELS);
+        CHECK(c != NULL, "mode2: rt_create");
+        if (c) {
+            rt_set_direct_ambi(c, 2);
+            rt_set_layout(c, &L);
+            char perr[256] = {0};
+            uint32_t h = rt_source_create_stream(c, perr, sizeof perr);
+            CHECK(h != 0, "mode2: push source");
+            float* blk = (float*)malloc(sizeof(float) * 6 * N);
+            for (uint32_t i = 0; i < 6 * N; ++i)
+                blk[i] = 0.5f * sinf(6.2831853f * 660.0f * (float)i / 48000.0f);
+            rt_source_push(c, h, blk, 6 * N);
+            rt_source_set_pos(c, h, 1.5f, 1.5f, 0.f);        /* room +x = the identity listener's LEFT */
+            const float pl[3] = { 0.f, 1.5f, 0.f };
+            const float qi[4] = { 0, 0, 0, 1 };
+            rt_set_listener(c, pl, qi);
+            rt_commit(c);
+            bwa_timestamp ts = { 0, 0 };
+            float pg[3], qg[4];
+            rt_render(c, bus, N, &ts);
+            rt_render(c, bus, N, &ts);
+            const float* direct = rt_direct_ambi(c);
+            const RtDirectVoice* dvs = NULL;
+            uint32_t ndv = rt_direct_voices(c, &dvs);
+            CHECK(ndv > 0 && dvs != NULL, "mode2: rt_direct_voices exposes the point taps");
+            {   /* spread 0: the voice rides its slot; the SH field stays ~empty (sqrt(0) share) */
+                int found = 0; double fe = 0, se = 0;
+                for (uint32_t i = 0; i < ndv; ++i)
+                    if (dvs[i].active && dvs[i].mono) {
+                        ++found;
+                        for (uint32_t s = 0; s < N; ++s) se += fabs(dvs[i].mono[s]);
+                        CHECK(dvs[i].dir[0] > 0.9f, "mode2: the published dir points at room +x");
+                    }
+                for (uint32_t i = 0; direct && i < 16 * N; ++i) fe += fabs(direct[i]);
+                CHECK(found == 1, "mode2: exactly one active point tap");
+                CHECK(se > 1e-3, "mode2: the point slot carries the voice");
+                CHECK(fe < 1e-6 * (1.0 + se), "mode2: the SH field stays empty at spread 0");
+            }
+            rt_get_listener(c, pg, qg);
+            steam_monitor_process(m, bus, direct, dvs, ndv, pg, qg, out, N);
+            steam_monitor_process(m, bus, direct, dvs, ndv, pg, qg, out, N);
+            printf("mode2 +x, ident: L=%.4g R=%.4g\n", e_left(), e_right());
+            CHECK(e_left() > e_right() * 1.1, "mode2: +x source (listener's LEFT) favors the left ear");
+            const float q180[4] = { 0, 1, 0, 0 };
+            rt_set_listener(c, pl, q180);
+            rt_commit(c);
+            rt_render(c, bus, N, &ts);
+            direct = rt_direct_ambi(c);
+            ndv = rt_direct_voices(c, &dvs);
+            rt_get_listener(c, pg, qg);
+            steam_monitor_process(m, bus, direct, dvs, ndv, pg, qg, out, N);
+            steam_monitor_process(m, bus, direct, dvs, ndv, pg, qg, out, N);
+            printf("mode2 +x, yaw180: L=%.4g R=%.4g\n", e_left(), e_right());
+            CHECK(e_right() > e_left() * 1.1, "mode2: head turned 180 - the +x source now favors the right ear");
             free(blk);
             rt_destroy(c);
         }
@@ -134,6 +256,6 @@ int main(void) {
     steam_monitor_destroy(m);
     free(bus); free(out);
     if (fails) { printf("steam_decode_test: %d FAILURES\n", fails); return 1; }
-    printf("steam_decode_test OK (HRTF decode runs + preserves laterality)\n");
+    printf("steam_decode_test OK (HRTF decode runs + preserves laterality: virtual-speaker, direct field, per-voice)\n");
     return 0;
 }

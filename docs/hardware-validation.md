@@ -215,7 +215,7 @@ tracker connected.
       solve+network+block+DAC chain), then `bwa_set_pose_prediction` with the
       measured lead in **seconds** (0.02–0.04).
       Start at the measured value: too much lead overshoots on direction changes.
-- [ ] **`both` profile**: array + headphone monitor concurrently, same build, and the
+- [ ] **`cave_both` profile**: array + headphone monitor concurrently, same build, and the
       monitor's image agrees with the array's.
 - [ ] **Soak**: leave a busy scene running (looping sources, moving listener) for 30+
       minutes. On any dropout, widen the ASIO buffer / Dante latency and soak again; keep
