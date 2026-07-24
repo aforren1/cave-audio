@@ -107,16 +107,15 @@ The full model (rings, snapshot, lifetimes) is [concurrency.md](./concurrency.md
 
 ## Coordinates and units
 
-Room space is **right-handed, metres, +y up, +z forward**, and the origin sits
-**on the floor** at the working-area centre (Motive's ground-plane calibration);
-OptiTrack rigid-body poses pass through unchanged, and y is height above the
-floor. An identity orientation faces +z with the right ear at −x; derive basis
-vectors from `BWA_ROOM_AHEAD` / `BWA_ROOM_UP` / `BWA_ROOM_RIGHT` in the header
-rather than re-hardcoding the convention. The engine's world-locked decodes and
-its default listener position use the **array centroid** (the nominal listening
-point), not the origin. Gains are linear (1 = unity); sound offsets are
-engine-rate sample frames. The engine bindings convert from Unity/Unreal
-coordinates at the boundary ([integration.md](./integration.md)).
+Room space is **right-handed, metres, +y up, +z forward, origin on the floor** at
+the working-area centre — the frame [integration.md](./integration.md) →
+"Coordinate seam" owns (Motive's default streamed frame, the per-engine
+conversions, the handedness rationale). OptiTrack poses pass through unchanged, and
+an identity orientation faces +z with the right ear at −x; derive basis vectors
+from `BWA_ROOM_AHEAD` / `BWA_ROOM_UP` / `BWA_ROOM_RIGHT` in the header rather than
+re-hardcoding them. The engine's world-locked decodes and its default listener
+position use the **array centroid** (the nominal listening point), not the origin.
+Gains are linear (1 = unity); sound offsets are engine-rate sample frames.
 
 ## How-to guides
 
@@ -179,7 +178,7 @@ bwa_commit(e);
   scene, so `bwa_source_set_occlusion(e, s, true)` makes the walls block and muffle.
   Without the SDK, drive
   [`bwa_source_set_occlusion_manual`](#manual-occlusion-no-sdk-needed) from game logic.
-- **Wet levels**: `bwa_reverb_set_gain` and `bwa_early_reflections_set_gain` are live,
+- **Wet levels**: `bwa_set_reverb_gain` and `bwa_set_early_reflections_gain` are live,
   default 1. Opt in the few sources that matter—each opted-in voice costs six panner
   solves per block.
 
@@ -366,9 +365,9 @@ The API reports failure three ways, all read on the **control thread**:
 | `BWA_ERR_CONFIG` | 1     | invalid `bwa_desc` (bad profile, sample_rate, block_size) |
 | `BWA_ERR_DEVICE` | 2     | ASIO/output device could not be opened, lacked enough output channels for the layout, or failed to start |
 | `BWA_ERR_LAYOUT` | 3     | `bwa_start`: an explicitly-passed `layout_path` failed to load at create (missing/unparseable/failed validation - see [`layout-schema.md`](./layout-schema.md)) |
-| `BWA_ERR_HRTF`   | 4     | `hrtf_path` (SOFA) could not be loaded |
-| `BWA_ERR_STATE`  | 5     | called in the wrong state (for example, `bwa_start` while already running) |
-| `BWA_ERR_INTERNAL` | 6   | unexpected internal failure; `bwa_last_error` carries detail |
+| `BWA_ERR_HRTF`   | 4     | reserved; not currently returned. HRTF (SOFA) load failures are non-fatal — the monitor degrades and the reason lands in `bwa_last_error` |
+| `BWA_ERR_STATE`  | 5     | reserved; not currently returned. Wrong-state calls report through `bwa_last_error` instead |
+| `BWA_ERR_INTERNAL` | 6   | reserved; not currently returned |
 | `BWA_ERR_TRACKER` | 7    | `bwa_tracker_connect` failed (socket open, name didn't resolve, room_eq layout) |
 
 What actually comes back today:
@@ -558,8 +557,14 @@ from QPC on the null sink). Because the pair is captured *in* the callback, the 
 jitter that pairing `bwa_get_dsp_time` with your own clock read does. `host_time_ns` sits on a
 backend-defined epoch: anchor it against your clock once and re-sample per frame (device and OS
 clocks drift ~ppm; the Unity binding's `Engine.DspTimeAt`/`RealtimeAt` do this for you with a
-decaying-max offset estimator). It returns false until a host-stamped block has rendered, and
-always on the **manual** sink, whose clock is deliberately wall-free so renders reproduce. Finally,
+decaying-max offset estimator). It returns **false with the outputs untouched** until a
+host-stamped block has rendered: before `bwa_start`, or under a driver that reports no `systemTime`
+(FlexASIO is one; the ASIO and null sinks synthesize a QPC stamp where they can). The **manual**
+sink is the deliberate exception — it stamps a *nominal* time derived from the sample position
+(`sample / rate`), not a wall clock, so a fixed call sequence renders bit-identically; treat that
+pair as a sample-accurate fiction, exact for arithmetic and meaningless as wall time. Its first
+block carries nominal time 0 (read as "unstamped"), so the manual clock goes valid on block 2.
+Finally,
 the dsp clock stamps when a block is *rendered*, not heard: `bwa_get_output_latency` is the
 device's own render→DAC delay in frames (`ASIOGetLatencies`; the Digiface includes its Dante buffering), so
 sound scheduled for dsp time T reaches the room at `T + latency`—subtract your measured display
@@ -678,14 +683,13 @@ bwa_sound bwa_load_fuma (bwa_engine* e, const char* path);   // legacy FuMa B-fo
 bwa_bed   bwa_bed_create  (bwa_engine* e);
 void    bwa_bed_play    (bwa_engine* e, bwa_bed b, bwa_sound snd, bool loop);
 void    bwa_bed_set_gain(bwa_engine* e, bwa_bed b, float linear);       // master gain, ramped
-void    bwa_bed_set_rotation(bwa_engine* e, bwa_bed b, float yaw_rad);  // yaw the soundfield; glided
 void    bwa_bed_set_orientation(bwa_engine* e, bwa_bed b,               // full 3-axis (yaw/pitch/roll);
                               float yaw_rad, float pitch_rad, float roll_rad);   //   glided, live
 void    bwa_bed_stop    (bwa_engine* e, bwa_bed b);
 void    bwa_bed_destroy (bwa_engine* e, bwa_bed b);
 
-// same voice machinery as the bwa_source_* calls of the same name - bed-named so bed code
-// never mixes prefixes (semantics under "Sources"):
+// same voice machinery as the bwa_source_* calls of the same name - DELIBERATELY bed-named so bed
+// code never mixes prefixes (semantics under "Sources"):
 void    bwa_bed_fade_to     (bwa_engine* e, bwa_bed b, float gain, float seconds);
 void    bwa_bed_fade_out    (bwa_engine* e, bwa_bed b, float seconds);   // fade, then click-free stop
 void    bwa_bed_set_paused  (bwa_engine* e, bwa_bed b, bool paused);     // freeze/resume in place
@@ -696,20 +700,17 @@ bool    bwa_bed_is_playing  (bwa_engine* e, bwa_bed b);
 uint64_t bwa_bed_get_playhead(bwa_engine* e, bwa_bed b);   // content playhead, engine-rate frames
 ```
 
-`bwa_bed_set_rotation` yaws the recorded field about the room's vertical axis: line a capture up
-with the scene, or rotate it slowly for effect. Positive yaw turns the field from room **+z**
-(front) toward room **+x**. It's the closed-form yaw SH rotation (each degree's ±m channel pair
-rotates by m·yaw; exact at every order, no Wigner matrices), it **glides** to the target at ~one
-turn per second (click-free, live-safe), and it applies before *either* bed renderer, so the matrix
-decode and the parametric analysis see the same turned field.
-
-`bwa_bed_set_orientation` is the full 3-axis version, for **levelling** a capture whose "front"
-wasn't upright, or tilting a field for effect. Positive **pitch** tilts the field's front (+z)
-upward; positive **roll** tilts its top toward the room's right (−x); applied roll → pitch → yaw.
-Yaw-only stays on the closed-form phasor path; any pitch/roll runs a full SH rotation matrix
-(the Ivanic-Ruedenberg recursion), rebuilt per block from the glided angles and interpolated per
-sample—same click-free, live semantics as yaw. `bwa_bed_set_rotation(yaw)` is the shorthand for
-`bwa_bed_set_orientation(yaw, 0, 0)` (it resets pitch/roll).
+`bwa_bed_set_orientation` orients the recorded field in 3 axes: yaw it about the room's vertical
+axis (line a capture up with the scene, or turn it slowly for effect), and **level** a capture whose
+"front" wasn't upright, or tilt a field for effect. Positive **yaw** turns the field from room **+z**
+(front) toward room **+x**; positive **pitch** tilts the field's front (+z) upward; positive **roll**
+tilts its top toward the room's right (−x); applied roll → pitch → yaw. **Yaw-only** (pitch = roll =
+0) stays on the exact closed-form phasor path (each degree's ±m channel pair rotates by m·yaw; exact
+at every order, no Wigner matrices); any pitch/roll runs a full SH rotation matrix (the
+Ivanic-Ruedenberg recursion), rebuilt per block from the glided angles and interpolated per sample.
+Either way it **glides** to the target at ~one turn per second (click-free, live-safe) and applies
+before *either* bed renderer, so the matrix decode and the parametric analysis see the same turned
+field.
 
 A **bed** is a pre-encoded **AmbiX** soundfield (ACN ordering, SN3D normalization) decoded
 **straight to the speakers**. It is not panned and has no position; use it for diffuse,
@@ -742,7 +743,7 @@ engine's SH→speaker decode: the higher ambisonic orders are tapered, which sup
 sidelobes and lengthens the energy vector—**better localization away from the sweet spot**,
 exactly the walking-listener case, at a slightly wider main lobe. The weights are
 diffuse-energy-normalized per content order, so A and B stay level-fair. It reaches every consumer
-of the engine's own decode—bed matrix rendering (sampling / AllRAD / EPAD) and the FDN reverb's
+of the engine's own decode—bed matrix rendering (the sampling fallback / AllRAD / EPAD) and the FDN reverb's
 line render—but not the point-source panners (DBAP/SPCAP/VBAP pan, they don't decode) and not
 phonon's own decodes (reflection bed, pathing, the HRTF monitor). Off by default: the unweighted
 decode is the incumbent; bake the winner after the hardware bake-off.
@@ -861,12 +862,12 @@ blocks and is cheap enough to poll every frame.
 ### Pose prediction
 
 ```c
-void bwa_set_pose_prediction(bwa_engine* e, float lead_ms);   // 0 = off (default); live
+void bwa_set_pose_prediction(bwa_engine* e, float lead_s);    // 0 = off (default); live
 ```
 
 The tracking chain (Motive's solve, the network hop, the audio block, the DAC) puts the rendered
 pose **20–40 ms behind the head**; at walking speed that is 3–6 cm of panning lag. With a lead set,
-the tracked **position** is extrapolated `lead_ms` along a velocity estimated from the tracker's
+the tracked **position** is extrapolated `lead_s` seconds along a velocity estimated from the tracker's
 own frame timestamps (smoothed over ~100 ms so Motive's frame-to-frame jitter doesn't shake the
 image, speed-capped, and reset across drop-outs so a stale velocity never extrapolates). On
 NatNet 4.1–4.5 those timestamps come off the wire: the **server's camera clock** (mid-exposure when
@@ -876,8 +877,8 @@ change in Motive doesn't mis-scale it. Older streams (and streams **newer** than
 certified suffix layout) fall back to stamping at packet arrival, so prediction keeps working
 either way. (If a future Motive outruns the parser, the unicast-only `Bitstream` command can pin
 the server to a known syntax; see `src/natnet.c`.)
-Set `lead_ms` to your measured motion-to-ears latency; too much lead **overshoots on direction
-changes**, so start at the measured value, not above it (clamped at 200 ms). Orientation is not
+Set `lead_s` to your measured motion-to-ears latency (in seconds); too much lead **overshoots on
+direction changes**, so start at the measured value, not above it (clamped at 0.2 s). Orientation is not
 predicted (it only feeds the monitor). Internal tracking only (needs a connected tracker).
 
 ### Extra listeners (multi-occupant compromise)
@@ -1331,7 +1332,7 @@ layouts without a grid.
 
 ```c
 void bwa_set_limiter(bwa_engine* e, bool on);                     // live
-void bwa_set_limiter_ceiling(bwa_engine* e, float ceiling_db);    // default -1 dBFS; clamped [-60, 0]
+void bwa_set_limiter_ceiling(bwa_engine* e, float linear);        // linear peak ceiling in (0..1]; default 0.891251 (-1 dBFS)
 ```
 
 The final stage on the speaker output. Everything (voices, beds, the reflection/pathing taps, the
@@ -1340,7 +1341,8 @@ per-speaker align stage, the test signal) passes through it before the device.
 It is **linked** across channels: one gain, derived from the cross-channel peak, so engaging never
 shifts the spatial image. ~1 ms attack / ~120 ms release one-poles, then a hard clamp at the
 ceiling. The attack is not lookahead, so the first millisecond of a hot transient clips instead of
-overshooting.
+overshooting. The ceiling is a **linear** peak amplitude in `(0..1]` — like every other gain in the
+ABI — so `0.891251` is −1 dBFS; a value above 1 clamps to 1 and a non-positive value is ignored.
 
 This is driver/speaker **protection** against digital overs and pathological content, not a
 mastering limiter. If it engages in normal use, turn the content down. In the `binaural` profile
@@ -1351,7 +1353,7 @@ the same limited bus feeds the monitor, so headphones inherit the ceiling too.
 ```c
 typedef struct { float ir_seconds; uint32_t order, num_rays, num_bounces; int enabled, bake; uint32_t reserved[3]; } bwa_reflections_desc;
 void bwa_reflections_config   (bwa_engine* e, const bwa_reflections_desc* cfg);  // LOAD-TIME (before bwa_start)
-void bwa_reverb_set_gain (bwa_engine* e, float linear);                   // the wet level: live, default 1
+void bwa_set_reverb_gain (bwa_engine* e, float linear);                   // the wet level: live, default 1
 void bwa_source_set_reverb(bwa_engine* e, bwa_source s, bool on);           // per-frame; gates the wet send
 void bwa_source_set_reverb_send(bwa_engine* e, bwa_source s, float gain);    // per-source wet-send level (default 1)
 void bwa_source_set_reverb_distance(bwa_engine* e, bwa_source s, bool on);   // far = wetter
@@ -1381,7 +1383,7 @@ Configuration is load-time; the sends are live:
   `num_bounces` 16). `enabled = 0` creates no bed; the engine behaves exactly as without one.
   `bake` non-zero precomputes the reverb over a probe grid at `bwa_start`, so the sim thread looks
   it up instead of ray-tracing live (static scenes only, which the bed requires anyway).
-- **`bwa_reverb_set_gain`** is the wet level: the one control, live (a single atomic the
+- **`bwa_set_reverb_gain`** is the wet level: the one control, live (a single atomic the
   audio-thread tap reads), default 1. A value set before `bwa_start` seeds whichever reverb bed it
   creates (this bed or the FDN).
 - **`bwa_source_set_reverb`** opts a source into the bed's wet send. Per-frame, non-blocking;
@@ -1409,7 +1411,7 @@ void bwa_fdn_config(bwa_engine* e, const bwa_fdn_desc* cfg);                    
 A **phonon-free** late-reverb alternative that takes the reverb tap *instead of* the Steam bed
 (one reverb bed at a time; with the FDN enabled the Steam bed is skipped). It consumes the same
 mono aux send, so `bwa_source_set_reverb` and the per-source send levels apply unchanged, and
-`bwa_reverb_set_gain` sets its return level live.
+`bwa_set_reverb_gain` sets its return level live.
 
 Inside: a 16-line **feedback delay network** (Householder feedback; lossless prototype, the decay
 filters are the only loss), each line assigned a direction on the sphere and rendered as a plane
@@ -1428,7 +1430,7 @@ longer requires the Steam Audio SDK.
 ```c
 void bwa_scene_set_box(bwa_engine* e, float w, float h, float d, const bwa_material faces[6]);  // the room
 void bwa_source_set_early_reflections(bwa_engine* e, bwa_source s, bool on);   // per source; per-frame-safe
-void bwa_early_reflections_set_gain(bwa_engine* e, float linear);            // live; default 1
+void bwa_set_early_reflections_gain(bwa_engine* e, float linear);            // live; default 1
 ```
 
 The other half of the phonon-free acoustics path. The FDN renders the late diffuse tail; this

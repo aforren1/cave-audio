@@ -830,7 +830,7 @@ static void rev_enter(void) {
     bwa_source_set_gain(e, src, SRC_GAIN);
     bwa_source_set_reverb(e, src, rev_on);    /* feed the source into the shared reverb bed */
     bwa_source_set_reverb_distance(e, src, rev_dist);
-    bwa_reverb_set_gain(e, rev_wet);
+    bwa_set_reverb_gain(e, rev_wet);
     source_pos = Vector3{ 0.0f, g_head.y, -3.0f }; /* behind where the wall sweeps, so the demo occludes out of the box */
     rev_wall = -1;                                 /* fresh engine build; re-add if enabled */
     rev_apply_wall();
@@ -851,7 +851,7 @@ static void rev_update(float dt) {
     }
     if (kd(KEY_LEFT_BRACKET))  rev_wet = fmaxf(0.0f, rev_wet - 0.7f * dt);
     if (kd(KEY_RIGHT_BRACKET)) rev_wet = fminf(2.0f, rev_wet + 0.7f * dt);
-    bwa_reverb_set_gain(e, rev_wet);
+    bwa_set_reverb_gain(e, rev_wet);
     source_pos.x = Clamp(source_pos.x, -ROOM_W * 0.5f + 0.5f, ROOM_W * 0.5f - 0.5f); /* keep it inside the room */
     source_pos.y = Clamp(source_pos.y, 0.5f, ROOM_H - 0.5f);                         /* floor-based box: y 0..H */
     source_pos.z = Clamp(source_pos.z, -ROOM_D * 0.5f + 0.5f, ROOM_D * 0.5f - 0.5f);
@@ -1329,7 +1329,7 @@ static void draw_panel(void) {
         bwTip("opt the source into the shared reverb bed's wet send");
         ImGui::SetNextItemWidth(-FLT_MIN);
         ImGui::SliderFloat("##wet", &rev_wet, 0.0f, 2.0f, "wet %.2f  [ ] keys");   /* applied per frame in rev_update */
-        bwTip("live wet level of the whole bed (bwa_reverb_set_gain)");
+        bwTip("live wet level of the whole bed (bwa_set_reverb_gain)");
         if (chk("distance->wet [V]", &rev_dist)) bwa_source_set_reverb_distance(e, src, rev_dist);
         bwTip("near = drier, far = wetter - walk the source away (WASD) and hear "
               "the room take over");

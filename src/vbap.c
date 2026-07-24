@@ -11,13 +11,8 @@ void vbap_reset(VbapState* s) { if (s) s->valid = 0; }
  * listener or layout changes — once, for a fixed observer. */
 static void recompute(VbapState* s, const float lis[3], const Layout* L, uint32_t gen) {
     const uint32_t N = L->count;
-    for (uint32_t k = 0; k < N; ++k) {
-        const float* p = L->speakers[k].pos;
-        float dx = p[0] - lis[0], dy = p[1] - lis[1], dz = p[2] - lis[2];
-        float len = sqrtf(dx * dx + dy * dy + dz * dz);
-        if (len > 1e-6f) { float inv = 1.f / len; s->sdir[k][0] = dx * inv; s->sdir[k][1] = dy * inv; s->sdir[k][2] = dz * inv; }
-        else             { s->sdir[k][0] = 0.f; s->sdir[k][1] = 0.f; s->sdir[k][2] = 1.f; }
-    }
+    for (uint32_t k = 0; k < N; ++k)
+        unit_dir(lis, L->speakers[k].pos, s->sdir[k]);   /* degenerate -> (0,0,1) */
     s->ntri = hull_triangulate(s->sdir, N, s->tri, s->det, VBAP_MAXTRI);   /* 0 -> DBAP fallback in gains() */
     s->cached_lis[0] = lis[0]; s->cached_lis[1] = lis[1]; s->cached_lis[2] = lis[2];
     s->cached_gen = gen; s->valid = 1;
@@ -26,10 +21,7 @@ static void recompute(VbapState* s, const float lis[3], const Layout* L, uint32_
 void vbap_gains(VbapState* s, const float src[3], const float lis[3], const Layout* L,
                 uint32_t gen, float user_gain, float* out) {
     const uint32_t N = L->count;
-    if (!s->valid || s->cached_gen != gen ||
-        fabsf(s->cached_lis[0] - lis[0]) > 1e-4f ||
-        fabsf(s->cached_lis[1] - lis[1]) > 1e-4f ||
-        fabsf(s->cached_lis[2] - lis[2]) > 1e-4f)
+    if (panner_cache_stale(s->valid, s->cached_gen, s->cached_lis, gen, lis))
         recompute(s, lis, L, gen);
 
     float sx = src[0] - lis[0], sy = src[1] - lis[1], sz = src[2] - lis[2];
@@ -41,13 +33,7 @@ void vbap_gains(VbapState* s, const float src[3], const float lis[3], const Layo
 
     for (uint32_t k = 0; k < N; ++k) out[k] = 0.f;             /* VBAP: only the triangle's speakers sound */
 
-    float atten = 1.f;                                         /* source->listener distance attenuation (as DBAP) */
-    if (L->atten_ref_m > 0.f) {
-        float dd = (ds > L->atten_ref_m) ? ds : L->atten_ref_m;
-        atten = powf(L->atten_ref_m / dd, L->atten_rolloff);
-        if (atten < L->atten_min_lin) atten = L->atten_min_lin;
-        if (atten > 1.f) atten = 1.f;
-    }
+    float atten = atten_curve(ds, L->atten_ref_m, L->atten_rolloff, L->atten_min_lin);   /* source->listener (as DBAP) */
     float gg = user_gain * atten;
     for (int q = 0; q < 3; ++q) out[spk[q]] = gg * g[q];
 }

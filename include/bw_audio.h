@@ -49,7 +49,7 @@ extern "C" {
  * COMPATIBILITY and is bumped by hand only when the ABI changes - it is deliberately independent of
  * the distribution/release version (the git tag), which moves on its own cadence. */
 #define BWA_VERSION_MAJOR 0
-#define BWA_VERSION_MINOR 9
+#define BWA_VERSION_MINOR 10
 #define BWA_VERSION_PATCH 0
 #define BWA_VERSION ((BWA_VERSION_MAJOR << 16) | (BWA_VERSION_MINOR << 8) | BWA_VERSION_PATCH)
 
@@ -307,21 +307,15 @@ BWA_API void     bwa_play_oneshot(bwa_engine* e, bwa_sound snd, float x, float y
  * sample position when running, an internal block counter otherwise. Monotonic; 0 before the
  * first block. */
 BWA_API uint64_t bwa_get_dsp_time(bwa_engine* e);
-/* The (output sample position, host time) pair stamped INSIDE the most recent block callback —
- * the jitter-free wall<->dsp bridge for AV sync (pairing bwa_get_dsp_time with your own clock
- * read carries up to a block of slack; this pair does not):
+/* The (output sample position, host time) pair stamped INSIDE the last block callback — the
+ * jitter-free wall<->dsp bridge for AV sync (pairing bwa_get_dsp_time with your own clock read
+ * carries up to a block of slack; this does not). Map with
  *   dsp_at(T) = dsp_sample + (T_ns - host_time_ns) * rate / 1e9,   then bwa_source_play_at.
- * host_time_ns is monotonic ns on a BACKEND-DEFINED epoch (ASIO drivers differ; the null sink
- * counts from stream start) — anchor it against your own monotonic clock and refresh the offset
- * per frame (clocks drift ~ppm). Returns false with the outputs untouched until a host-stamped
- * block has rendered: before bwa_start, or under a driver with no usable stamp (the sinks
- * synthesize one from QueryPerformanceCounter where they can — FlexASIO omits systemTime, for
- * one). The MANUAL sink DOES report a pair, but a NOMINAL one derived from the sample position
- * (sample/rate), never a wall clock — so a fixed call sequence still renders bit-identically.
- * Treat it as a sample-accurate fiction: exact for arithmetic, meaningless for wall-clock AV
- * sync, since nothing on the manual path is bound to real time anyway. Lock-free.
- * The full sync recipe (epoch anchoring, graphics-side events, the Unity helpers) is
- * docs/api.md, "Syncing with graphics". */
+ * host_time_ns rides a BACKEND-DEFINED epoch (null sink: from stream start) — anchor it against
+ * your own monotonic clock and refresh the offset per frame (clocks drift ~ppm). Returns false
+ * (outputs untouched) until a host-stamped block renders; the manual sink stamps a nominal,
+ * wall-free time (exact for arithmetic, not real wall time). Lock-free.
+ * Full recipe (epochs, graphics-side events, Unity helpers): docs/api.md, "Syncing with graphics". */
 BWA_API bool     bwa_get_clock(bwa_engine* e, uint64_t* dsp_sample, uint64_t* host_time_ns);
 /* The primary device's self-reported render->DAC latency in FRAMES at the engine rate
  * (ASIOGetLatencies — the Digiface includes its Dante buffering): audio scheduled for dsp time T
@@ -330,22 +324,16 @@ BWA_API bool     bwa_get_clock(bwa_engine* e, uint64_t* dsp_sample, uint64_t* ho
  * bwa_start). Constant while the device is open. */
 BWA_API uint32_t bwa_get_output_latency(bwa_engine* e);
 
-/* ---- procedural (push) sources: engine-generated audio, no file ----
- * bwa_source_create_push returns a source whose voice plays PCM you PUSH — mono float frames at
- * the engine sample rate, through a per-source ring (65536 frames — ~1.37 s at 48 kHz). The full spatial path
- * applies: position, gain, spread, occlusion, Doppler, groups, fades — every bwa_source_* control
- * except play/seek/pitch (a push source plays what you push; those are rejected/ignored). It starts
- * consuming at create: silence until the first push, and if you fall behind (underrun) it renders
- * silence WITHOUT losing your place — output resumes at the next pushed sample (the stream clock is
- * data-driven: it slips, it never drops). Push from the ONE control thread, like every bwa_* call,
- * at least a frame's worth ahead. bwa_source_push returns the count accepted (< n when the ring is
- * full — pace with bwa_source_push_space). Non-finite samples are written as 0. bwa_source_push_end
- * marks end-of-data: the voice ends (is_playing -> false) once the ring drains and further pushes
- * are refused — a push source is not restartable, create a new one. bwa_source_stop / fade_out end
- * it the same one-way way (the unconsumed remainder is dropped, pushes refused); set_paused is the
- * temporary silence. A full pool can steal a push
- * source like any voice (its pushed audio is dropped); protect an important one with priority 255.
- * bwa_source_destroy releases the ring (safe while playing). */
+/* ---- procedural (push) sources: engine-generated audio, no file (full story: docs/api.md,
+ *      "Procedural (push) sources") ----
+ * bwa_source_create_push returns a source whose voice plays mono float PCM you PUSH at the engine
+ * rate through a per-source ring (65536 frames, ~1.37 s at 48 kHz). A normal source otherwise —
+ * position/gain/spread/occlusion/Doppler/groups/fades all apply; play/seek/pitch don't (rejected).
+ * It consumes from create: underrun renders silence without losing your place (the clock slips,
+ * never drops). Push from the ONE control thread, a frame ahead; bwa_source_push returns the count
+ * accepted (< n = ring full, pace with bwa_source_push_space); non-finite samples become 0.
+ * bwa_source_push_end ends the voice once the ring drains (one-way — not restartable; stop/fade_out
+ * end it the same way, set_paused just silences). destroy releases the ring, safe while playing. */
 BWA_API bwa_source bwa_source_create_push(bwa_engine* e);            /* 0 = failure (see bwa_last_error) */
 BWA_API uint32_t   bwa_source_push(bwa_engine* e, bwa_source s, const float* frames, uint32_t n);
 BWA_API uint32_t   bwa_source_push_space(bwa_engine* e, bwa_source s);
@@ -369,23 +357,20 @@ BWA_API void     bwa_set_paused(bwa_engine* e, bool paused);
 BWA_API bwa_bed bwa_bed_create(bwa_engine* e);
 BWA_API void  bwa_bed_play(bwa_engine* e, bwa_bed b, bwa_sound snd, bool loop);
 BWA_API void  bwa_bed_set_gain(bwa_engine* e, bwa_bed b, float linear);   /* master gain, ramped */
-/* Yaw the bed's soundfield about the room's vertical axis (radians; positive turns the field from
- * room +z/front toward room +x): line a capture up with the scene, or rotate it slowly for effect.
- * Closed-form yaw SH rotation (each degree's +-m pair rotates by m*yaw — exact, all orders), glides
- * to the target at ~one turn/s (click-free, live), applied before EITHER bed renderer (matrix and
- * parametric see the same turned field). Per-frame-safe. */
-BWA_API void  bwa_bed_set_rotation(bwa_engine* e, bwa_bed b, float yaw_rad);
-/* Full 3-axis orientation (radians; supersedes bwa_bed_set_rotation, which is the yaw-only shorthand
- * and resets pitch/roll to 0): LEVEL or reorient a recorded soundfield whose capture wasn't upright.
- * Yaw as above; positive pitch tilts the field's front (+z) upward; positive roll tilts its top
- * toward the room's right (-x). Applied roll -> pitch -> yaw. Yaw-only stays on the closed-form
- * phasor path; any pitch/roll runs a full SH rotation matrix (Ivanic-Ruedenberg), rebuilt per block
- * from angles that glide at ~one turn/s — click-free and live, same as yaw. Per-frame-safe. */
+/* Full 3-axis orientation of the bed's soundfield (radians): LEVEL or reorient a recorded soundfield
+ * whose capture wasn't upright, line a capture up with the scene, or spin it slowly for effect.
+ * Positive yaw turns the field about the room's vertical axis from room +z/front toward room +x;
+ * positive pitch tilts the field's front (+z) upward; positive roll tilts its top toward the room's
+ * right (-x). Applied roll -> pitch -> yaw. Yaw-only (pitch=roll=0) stays on the exact closed-form
+ * phasor path (each degree's +-m pair rotates by m*yaw — exact, all orders); any pitch/roll runs a
+ * full SH rotation matrix (Ivanic-Ruedenberg), rebuilt per block from angles that glide at ~one
+ * turn/s — click-free and live, applied before EITHER bed renderer (matrix and parametric see the
+ * same turned field). Per-frame-safe. */
 BWA_API void  bwa_bed_set_orientation(bwa_engine* e, bwa_bed b, float yaw_rad, float pitch_rad, float roll_rad);
 BWA_API void  bwa_bed_stop(bwa_engine* e, bwa_bed b);
 BWA_API void  bwa_bed_destroy(bwa_engine* e, bwa_bed b);
 /* The rest of a bed's control surface matches the bwa_source_* call of the same name (a bed IS a
- * voice — same pool, same semantics; these exist so bed code never mixes prefixes): timed fades
+ * voice — same pool, same semantics; these are DELIBERATE aliases so bed code never mixes prefixes): timed fades
  * (fade_out = the click-free stop), pause/seek (resume/jump lands exactly), steal priority (a bed
  * competes for voices like any source — protect a music bed with 255), mix groups, and the
  * is-playing/playhead readbacks. Position/spatial calls (pos, spread, occlusion, ...) do not apply —
@@ -433,21 +418,15 @@ BWA_API void         bwa_material_release(bwa_engine* e, bwa_material token);
  * No-op without the Steam Audio backend. */
 BWA_API void     bwa_scene_set_mesh_mat(bwa_engine* e, const float* verts, int nverts, const int* tris, int ntris,
                                       const bwa_material* tri_material);
-/* Convenience: a shoebox enclosure of size w x h x d metres, FLOOR-based — centred on the origin
- * in x/z, y from 0 (the floor) up to h — with one material per face. faces[6] = (-x,+x,-y,+y,-z,+z);
- * each a bwa_material token (0 = default). Triangle normals face inward (the listener is inside).
- * Works with AND without the Steam build: it feeds the ray-traced scene (SDK) and ALWAYS captures
- * the box for the image-source early reflections. Load-time ONLY — unlike bwa_scene_set_mesh_mat
- * above (whose scene swap the sim thread serializes), the ISM handoff assumes the audio thread is
- * not yet running.
- *
- * IT IS A bwa_scene_set_mesh_mat CALL, so it REPLACES the static mesh like any other — the box and
- * your own geometry are alternatives, not layers. Calling set_box then set_mesh_mat (the natural
- * order: room first, then the pillar in it) drops the walls from the ray-traced scene, and does it
- * HALF-way: the ISM shoebox is separate state and survives, so early reflections keep working off a
- * room that occlusion and the reflection bed can no longer see. To have both, call set_box first
- * (nothing else captures the ISM room) and then ONE set_mesh_mat carrying the box's 12 inward
- * triangles plus your own. */
+/* Convenience: a FLOOR-based shoebox of w x h x d metres — centred on the origin in x/z, y from 0
+ * (floor) to h — one material per face. faces[6] = (-x,+x,-y,+y,-z,+z), each a bwa_material token
+ * (0 = default); triangle normals face inward. Works WITH and WITHOUT the Steam build: it feeds the
+ * ray-traced scene (SDK) and ALWAYS captures the box for the image-source early reflections.
+ * Load-time ONLY (the ISM handoff assumes the audio thread isn't running yet).
+ * It IS a bwa_scene_set_mesh_mat call, so it REPLACES the static mesh — the box and your own
+ * geometry are alternatives, not layers; to keep both, call set_box first then ONE set_mesh_mat
+ * carrying the box's 12 inward triangles plus yours. Why (the half-way drop): docs/api.md,
+ * "Materials and scene geometry". */
 BWA_API void     bwa_scene_set_box(bwa_engine* e, float w, float h, float d, const bwa_material faces[6]);
 
 /* Dynamic (movable) occluders/reflectors — the acoustic analogue of a physics collider with a
@@ -483,16 +462,12 @@ BWA_API void     bwa_source_set_occlusion(bwa_engine* e, bwa_source s, bool on);
 BWA_API void     bwa_source_set_occlusion_manual(bwa_engine* e, bwa_source s, float level, const float bands[3]);
 
 /* ---- reverb & reflections: the map ----
- * Three systems share the naming; here is who does what:
- *   - the shared REVERB TAP: sources feed it via bwa_source_set_reverb (+ _send level and
- *     _distance below); it is rendered by EITHER the Steam reflection bed
- *     (bwa_reflections_config) OR the FDN (bwa_fdn_config) — one at a time — and
- *     bwa_reverb_set_gain is its single live wet level, whichever bed owns it.
- *   - image-source EARLY reflections (bwa_source_set_early_reflections +
- *     bwa_early_reflections_set_gain): a separate per-source system with real parallax. Pairs
- *     with the FDN; never run it with the Steam bed (the bed already contains early
- *     reflections — they would render twice; the engine warns once).
- * The full decision guide: docs/materials.md, "Choosing an acoustics path". */
+ * Shared REVERB TAP (bwa_source_set_reverb + _send / _distance): rendered by EITHER the Steam
+ * reflection bed (bwa_reflections_config) OR the FDN (bwa_fdn_config), one at a time, with
+ * bwa_set_reverb_gain the single live wet level. Image-source EARLY reflections
+ * (bwa_source_set_early_reflections) are a SEPARATE per-source system: pair them with the FDN,
+ * never with the Steam bed (double early reflections; the engine warns once).
+ * The decision guide: docs/materials.md, "Choosing an acoustics path". */
 
 /* ---- reflection bed (materials; needs the Steam Audio build) ----
  * A single shared listener-centric reverb bed (Steam Audio hybrid reverb), decoded straight to the
@@ -515,7 +490,7 @@ BWA_API void     bwa_reflections_config(bwa_engine* e, const bwa_reflections_des
 /* The reverb wet level (linear; 1 = unity, the default) — the ONE control, live, for whichever
  * reverb bed owns the tap (the Steam bed or the FDN below). Valid from bwa_create on: a value set
  * before bwa_start seeds the bed it creates. Per-frame-safe. */
-BWA_API void     bwa_reverb_set_gain(bwa_engine* e, float linear);
+BWA_API void     bwa_set_reverb_gain(bwa_engine* e, float linear);
 
 /* ---- directional FDN reverb bed (load-time; no SDK needed) ----
  * A phonon-free late-reverb alternative to the Steam reflection bed: a 16-line feedback delay
@@ -527,7 +502,7 @@ BWA_API void     bwa_reverb_set_gain(bwa_engine* e, float linear);
  * special case of the Directional FDN (Alary/Politis/Schlecht, JAES 2019). Enabling it takes the
  * reverb tap INSTEAD of the Steam bed (one reverb bed at a time); works in no-SDK builds — the
  * playground's reverb scene runs without phonon. Load-time (between bwa_create and bwa_start);
- * zero fields take the defaults; the wet level is bwa_reverb_set_gain (live, default 1). */
+ * zero fields take the defaults; the wet level is bwa_set_reverb_gain (live, default 1). */
 typedef struct {
     int      enabled;        /* 0 = no FDN created (the default) */
     float    rt60_low_s;     /* low-band decay time; 0 -> default 1.2 */
@@ -553,7 +528,7 @@ BWA_API void     bwa_fdn_config(bwa_engine* e, const bwa_fdn_desc* cfg);
  * orders blend into the diffuse field within tens of ms — that is the FDN's job, and it renders
  * them for free. A source outside the room renders dry. Per-frame-safe; the gain is live. */
 BWA_API void     bwa_source_set_early_reflections(bwa_engine* e, bwa_source s, bool on);
-BWA_API void     bwa_early_reflections_set_gain(bwa_engine* e, float linear);   /* default 1 */
+BWA_API void     bwa_set_early_reflections_gain(bwa_engine* e, float linear);   /* default 1 */
 /* Opt a source into the shared bed's wet send (per-frame-safe, enqueue-only). With the bed disabled
  * or no SDK, this just gates a send that goes nowhere. */
 BWA_API void     bwa_source_set_reverb(bwa_engine* e, bwa_source s, bool on);
@@ -722,17 +697,13 @@ BWA_API void     bwa_set_max_re(bwa_engine* e, bool on);
  * the incumbent A/B side). Bed matrix decodes only; the FDN's render stays broadband (a diffuse tail
  * has no LF image to sharpen). */
 BWA_API void     bwa_set_max_re_split(bwa_engine* e, bool on);
-/* How bwa_source_set_spread renders a source's width (live A/B; sources with spread 0 are unaffected).
- * LOBE (default) reshapes the point gains toward a width-controlled lobe — one solve, smooth,
- * approximate. MDAP (Pulkki's multiple-direction amplitude panning) pans a ring of virtual sources
- * around the source direction with the selected panner and sums — the extent is made of real panner
- * solves (panner-true: VBAP stays sparse, SPCAP stays placement-corrected), at ~13x the gain-solve
- * cost (block-rate + dirty-gated, still cheap). SPECTRAL is frequency-dependent panning (Zotter &
- * Frank's phantom-source widening): the source splits into 6 bands and each band is panned to its
- * own direction inside the spread cone (LF stays on the source direction) — the ear integrates the
- * scattered spectrum into width, with no decorrelation noise and no phantom collapse as the tracked
- * listener walks; costs ~6 band filters + gain sets per wide voice. All are constant-power (SPECTRAL
- * to within its crossover overlap, < ~1 dB). See docs/spatialization.md. */
+/* How bwa_source_set_spread renders a source's width (engine-wide, live A/B; spread-0 sources
+ * unaffected). LOBE (default): reshape the point gains toward a width lobe — one solve, cheap,
+ * approximate. MDAP (Pulkki): pan a ring of virtual sources around the direction with the selected
+ * panner and sum — panner-true extent (VBAP sparse, SPCAP placement-corrected), ~13x solve cost.
+ * SPECTRAL (Zotter/Frank): split into 6 bands, pan each to its own direction in the cone (LF stays
+ * put) — width with no decorrelation noise, nothing to comb as the listener walks. All constant-
+ * power. Full story: docs/api.md, "Source spread / size" (design: docs/spatialization.md). */
 typedef enum { BWA_SPREAD_LOBE = 0, BWA_SPREAD_MDAP = 1, BWA_SPREAD_SPECTRAL = 2 } bwa_spread_mode;
 BWA_API void     bwa_set_spread_mode(bwa_engine* e, bwa_spread_mode mode);
 /* Decorrelate the WIDE part of spread sources (off by default; live A/B). Amplitude panning feeds
@@ -756,7 +727,7 @@ BWA_API void     bwa_set_near_spread(bwa_engine* e, float radius_m);
  * then a hard clamp at the ceiling. This is driver/speaker protection against digital overs, not a
  * mastering limiter — if it engages in normal use, turn the content down. Control thread; live. */
 BWA_API void     bwa_set_limiter(bwa_engine* e, bool on);
-BWA_API void     bwa_set_limiter_ceiling(bwa_engine* e, float ceiling_db);   /* e.g. -1.0f; clamped to [-60, 0] */
+BWA_API void     bwa_set_limiter_ceiling(bwa_engine* e, float linear);   /* peak amplitude ceiling, linear in (0..1]; default 0.891251f (-1 dBFS). A value >1 clamps to 1; <=0 is ignored. */
 
 /* Select how ambisonic BEDS render (live: each bed crossfades to the selection — a click-free A/B).
  * MATRIX (default) is the static SH->speaker decode (AllRAD or EPAD per bwa_desc.bed_decoder) — cheap,
@@ -864,12 +835,12 @@ BWA_API bwa_tracker_state bwa_tracker_status(bwa_engine* e);
 
 /* Pose prediction (internal tracking only — needs a connected tracker; 0 = off, the default):
  * extrapolate the tracked POSITION by
- * `lead_ms` along a velocity estimated from the tracker's own frame timestamps (smoothed ~100 ms,
- * speed-capped, reset across drop-outs). The tracking chain — Motive solve, network, the audio
- * block, the DAC — puts the rendered pose 20-40 ms behind the head; at walking speed that is a few
- * cm of panning lag this hides. Set lead_ms to your measured motion-to-ears latency; too much lead
- * OVERSHOOTS on direction changes (clamped at 200 ms). Live-safe. */
-BWA_API void bwa_set_pose_prediction(bwa_engine* e, float lead_ms);
+ * `lead_s` SECONDS along a velocity estimated from the tracker's own frame timestamps (smoothed
+ * ~100 ms, speed-capped, reset across drop-outs). The tracking chain — Motive solve, network, the
+ * audio block, the DAC — puts the rendered pose 20-40 ms behind the head; at walking speed that is a
+ * few cm of panning lag this hides. Set lead_s to your measured motion-to-ears latency (in seconds);
+ * too much lead OVERSHOOTS on direction changes (clamped at 0.2 s). Live-safe. */
+BWA_API void bwa_set_pose_prediction(bwa_engine* e, float lead_s);
 
 /* Extra listeners (multi-occupant compromise panning; 0 = off, the default). A CAVE usually holds
  * more than one person, and single-listener panning is exact for the tracked head and wrong for

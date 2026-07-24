@@ -2,8 +2,8 @@
  * engine.c — public C ABI: lifecycle, the device sink, and the control-thread side of
  * the API. The real-time machinery (rings, voice table, commit snapshot, mixing) lives
  * in rt.c behind sink.h's render callback; engine.c forwards the per-frame bwa_* calls to
- * it. M0 = builds/links; M1 = device sink + audio loop; M2 = the concurrency spine.
- * Sounds (bwa_load_sound) are still stubs until M3.
+ * it. This layer also resolves the layout and opens the sink at bwa_start, and decodes
+ * assets on the control thread (bwa_load_sound: WAV/FLAC/MP3). No DSP runs here.
  */
 #include "bw_audio.h"
 #include "frame.h"         /* BWA_ROOM_* identity basis + frame_qrot */
@@ -98,7 +98,7 @@ struct bwa_engine {
     Fdn*          fdn;            /* directional FDN reverb bed (bwa_fdn_config; created at bwa_start) */
     bwa_fdn_desc   fdn_cfg;        /* staged pre-start (zeros normalized to defaults in bwa_fdn_config);
                                    * when enabled, the FDN takes the bus tap (not the Steam bed) */
-    float         refl_wet;       /* reverb wet level (bwa_reverb_set_gain, the one control);
+    float         refl_wet;       /* reverb wet level (bwa_set_reverb_gain, the one control);
                                    * seeds whichever bed bwa_start creates, live thereafter */
     int           max_re;         /* mirror of bwa_set_max_re, so a pre-start toggle seeds the FDN */
     SteamPath*    path;           /* pathing (bwa_desc.enable_pathing); NULL otherwise */
@@ -245,7 +245,7 @@ bwa_engine* bwa_create(const bwa_desc* cfg) {
      * decode, which is NOT selectable from the API any more — it survives only as the automatic
      * fallback inside the builds when a degenerate layout defeats AllRAD/EPAD. */
     rt_set_bed_decoder(e->rt, e->cfg.bed_decoder == BWA_DECODE_EPAD ? 2 : 1);
-    e->refl_wet = 1.0f;                             /* reverb wet default; bwa_reverb_set_gain */
+    e->refl_wet = 1.0f;                             /* reverb wet default; bwa_set_reverb_gain */
 
     /* material table: token 0 is always the built-in "generic" default (BWA_PRESETS[0]). */
     for (int b = 0; b < 3; ++b) {
@@ -738,7 +738,7 @@ void bwa_set_spread_mode(bwa_engine* e, bwa_spread_mode mode) { if (e) rt_set_sp
 void bwa_set_tracked_room_eq(bwa_engine* e, bool on)  { if (e) rt_set_room_eq_dyn(e->rt, on); }
 void bwa_set_decorrelation(bwa_engine* e, bool on)    { if (e) rt_set_decorrelation(e->rt, on); }
 void bwa_set_bed_renderer(bwa_engine* e, bwa_bed_renderer r) { if (e) rt_set_bed_renderer(e->rt, (int)r); }
-void bwa_set_pose_prediction(bwa_engine* e, float lead_ms) { if (e) rt_set_pose_prediction(e->rt, lead_ms * 1e-3f); }
+void bwa_set_pose_prediction(bwa_engine* e, float lead_s) { if (e) rt_set_pose_prediction(e->rt, lead_s); }
 void bwa_set_near_spread(bwa_engine* e, float radius_m)    { if (e) rt_set_near_spread(e->rt, radius_m); }
 void bwa_set_extra_listeners(bwa_engine* e, const float* xyz, uint32_t count) { if (e) rt_set_extra_listeners(e->rt, xyz, count); }
 void bwa_source_set_loudness_comp(bwa_engine* e, bwa_source s, bool on) { if (e) rt_source_set_loudness_comp(e->rt, s, on); }
@@ -766,7 +766,6 @@ void bwa_source_set_group(bwa_engine* e, bwa_source s, uint32_t group)  { if (e)
 void bwa_group_set_gain  (bwa_engine* e, uint32_t group, float linear){ if (e) rt_group_set_gain(e->rt, group, linear); }
 void bwa_group_set_paused(bwa_engine* e, uint32_t group, bool paused) { if (e) rt_group_set_paused(e->rt, group, paused); }
 void bwa_source_set_pitch(bwa_engine* e, bwa_source s, float rate)      { if (e) rt_source_set_pitch(e->rt, s, rate); }
-void bwa_bed_set_rotation(bwa_engine* e, bwa_bed b, float yaw_rad)      { if (e) rt_bed_set_rotation(e->rt, b, yaw_rad); }
 void bwa_bed_set_orientation(bwa_engine* e, bwa_bed b, float yaw_rad, float pitch_rad, float roll_rad) {
     if (e) rt_bed_set_orientation(e->rt, b, yaw_rad, pitch_rad, roll_rad);
 }
@@ -786,11 +785,11 @@ void bwa_source_set_occlusion_manual(bwa_engine* e, bwa_source s, float level, c
     }
 }
 void bwa_set_limiter(bwa_engine* e, bool on)         { if (e) rt_set_limiter(e->rt, on); }
-void bwa_set_limiter_ceiling(bwa_engine* e, float ceiling_db) {
+void bwa_set_limiter_ceiling(bwa_engine* e, float linear) {
     if (!e) return;
-    if (ceiling_db > 0.f)   ceiling_db = 0.f;      /* the ceiling is a maximum, never a boost */
-    if (ceiling_db < -60.f) ceiling_db = -60.f;
-    rt_set_limiter_ceiling(e->rt, powf(10.f, ceiling_db / 20.f));
+    if (!(linear > 0.f)) return;     /* contract is (0..1]; non-positive/NaN ignored (0 would mute the output) */
+    if (linear > 1.f) linear = 1.f;  /* the ceiling is a maximum, never a boost */
+    rt_set_limiter_ceiling(e->rt, linear);
 }
 
 /* Offline: the chosen panner's per-speaker gains for `nsrc` source positions heard from one listener,
@@ -1047,7 +1046,7 @@ void bwa_source_set_early_reflections(bwa_engine* e, bwa_source s, bool on) {
 #endif
     rt_source_set_ism(e->rt, s, on);
 }
-void bwa_early_reflections_set_gain(bwa_engine* e, float linear) { if (e) rt_set_ism_gain(e->rt, linear); }
+void bwa_set_early_reflections_gain(bwa_engine* e, float linear) { if (e) rt_set_ism_gain(e->rt, linear); }
 
 void bwa_source_set_occlusion(bwa_engine* e, bwa_source s, bool on) {
 #ifdef BWA_HAVE_STEAMAUDIO
@@ -1078,7 +1077,7 @@ void bwa_reflections_config(bwa_engine* e, const bwa_reflections_desc* cfg) {
 
 /* The ONE reverb wet control: stored on the engine (so a pre-start value seeds whichever bed
  * bwa_start creates) and forwarded live to whichever bed owns the tap. */
-void bwa_reverb_set_gain(bwa_engine* e, float linear) {
+void bwa_set_reverb_gain(bwa_engine* e, float linear) {
     if (!e) return;
     e->refl_wet = (linear < 0.f) ? 0.f : linear;
 #ifdef BWA_HAVE_STEAMAUDIO

@@ -23,13 +23,7 @@
  * leaves genuinely-covered poles alone (the cube grid's nadir gap is ~55°: unchanged). */
 #define ALLRAD_IMAG_COS 0.5f   /* cos(60°) */
 
-static void fib_dir(int i, int M, float d[3]) {
-    float y = 1.f - 2.f * ((float)i + 0.5f) / (float)M;
-    float r = sqrtf(fmaxf(0.f, 1.f - y * y)), th = (float)i * 2.39996323f;
-    d[0] = r * cosf(th); d[1] = y; d[2] = r * sinf(th);
-}
-/* room (+z fwd, +y up, -x right) -> ambisonic axes (x=front,y=left,z=up): (z,x,y) — matches build_bed_decode */
-static void room_to_ambi(const float d[3], float a[3]) { a[0] = d[2]; a[1] = d[0]; a[2] = d[1]; }
+/* fib_sphere_dir (virtual layer) + room_to_ambi (z,x,y) come from ambisonics.h — shared with fdn.c. */
 
 int allrad_build_decode(const Layout* L, float decode[BWA_CHANNELS][BWA_AMBI_CH]) {
     const uint32_t N = L->count;
@@ -68,7 +62,7 @@ int allrad_build_decode(const Layout* L, float decode[BWA_CHANNELS][BWA_AMBI_CH]
     /* accumulate decode = G * D_virt: VBAP each virtual loudspeaker onto the real array, scaled by its
      * sampling-decoder row (2l+1)*Y_SN3D(virt)/M */
     for (int v = 0; v < ALLRAD_M; ++v) {
-        float d[3]; fib_dir(v, ALLRAD_M, d);
+        float d[3]; fib_sphere_dir(v, ALLRAD_M, d);
         int spk[3]; float bg[3];
         if (!hull_vbap(d, r, tri, tdet, ntri, spk, bg)) continue;   /* VBAP this virtual loudspeaker */
 

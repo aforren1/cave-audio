@@ -28,6 +28,16 @@ costs almost nothing until a profiler actually connects. Without `-DBWA_TRACY=ON
   the pathing sim thread appears as `bw-sim (pathing)`.
 - **Plot**: `rt voices` (active voice count); load versus block time at a glance.
 
+## The benches (opt-in)
+
+Both benches below are dev/profiling tools, off by default. Build them with `-DBWA_BUILD_BENCH=ON`
+(pair with `-DBWA_TRACY=ON` when you want Tracy zones):
+
+```
+cmake -S . -B build -DBWA_BUILD_BENCH=ON
+cmake --build build --config RelWithDebInfo
+```
+
 ## The headless bench
 
 [`examples/profile_bench.c`](../examples/profile_bench.c) drives a representative load (moving voices
@@ -96,7 +106,7 @@ tiny in-process accumulator (`src/profile_self.c`) instead of Tracy, and `bwa_be
 prints a per-zone table (calls / total ms / mean us / **us/block**) under each situation:
 
 ```
-cmake -S . -B build-prof -DBWA_PROFILE_SELF=ON
+cmake -S . -B build-prof -DBWA_PROFILE_SELF=ON -DBWA_BUILD_BENCH=ON
 cmake --build build-prof --config RelWithDebInfo --target bwa_bench_situations
 bwa_bench_situations 1500 zones
 ```

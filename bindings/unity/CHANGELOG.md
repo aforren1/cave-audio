@@ -4,6 +4,92 @@ All notable changes to `com.brainworks.bw_audio`.
 
 ## [Unreleased]
 
+### Changed — ABI breaks (pre-freeze cleanup, `BWA_VERSION` → 0.10.0)
+
+Deliberate, one-time ABI breaks before the pre-hardware freeze. Update call sites:
+
+- **Removed the bed yaw-shorthand binding** (the `Bwa` P/Invoke was bound but never called). It was
+  the pure subset of `bwa_bed_set_orientation(yaw, 0, 0)` — call that with `pitch = roll = 0`
+  instead (bit-identical path: yaw-only stays on the exact phasor rotation).
+- **Renamed the two engine-global reverb setters** to the `bwa_set_<x>` form, matching the other
+  engine-global setters: now `bwa_set_reverb_gain` and `bwa_set_early_reflections_gain` (previously
+  the noun-first `..._set_gain` spelling). The Godot method names (`reverb_set_gain` /
+  `early_reflections_set_gain`) and the Unity properties (`ReverbGain` / `EarlyReflectionGain`) are
+  unchanged — only the underlying C symbol moved.
+- **`bwa_set_limiter_ceiling` now takes a LINEAR peak amplitude** in `(0..1]`, like every other gain
+  in the ABI — no longer decibels. The default is `0.891251f` (still −1 dBFS). The Unity inspector
+  field is now `limiterCeiling` (linear; was `limiterCeilingDb`) with `SetLimiterCeiling(float
+  linear)`; the Godot `limiter_ceiling` property range is now `0..1`.
+- **`bwa_set_pose_prediction` lead is now in SECONDS**, not milliseconds (matching the fade-time
+  calls). The Unity field is `posePredictionS` (was `posePredictionMs`, range `0..0.2`); the Godot
+  `set_pose_prediction` argument is seconds.
+
+### Added — ABI parity (the seven calls the binding had missed)
+
+`Bwa.cs` is **1:1 with `include/bw_audio.h`** again: it now binds every `BWA_API` function except
+`bwa_set_output_capture` (an audio-thread callback) and `bwa_render_block` (the manual-sink
+golden-render path), both deliberately unbound — Unity uses neither. Seven declarations were added,
+with the ones a scene actually authors surfaced on the components:
+
+- **`Emitter.Extent` (Vector2)** → `bwa_source_set_extent`: anisotropic angular width/height (a
+  shoreline is wide but not tall, rain tall but not wide). Equal values behave as the isotropic
+  `Spread`; setting `Spread` resets it to isotropic (last call wins).
+- **`Emitter.SetAttenuationOverride(refDist, rolloff, minGain)`** →
+  `bwa_source_set_attenuation_override`: a per-source distance-attenuation curve (rolloff 0 = a
+  direction-only cue that never fades; `refDist <= 0` clears it back to the layout curve).
+- **`Engine.maxReSplit` / `SetMaxReSplit`** → `bwa_set_max_re_split`: band-split max-rE (taper only
+  above ~700 Hz, plain decode below; needs `maxRe` on). Live A/B; the inspector hides it while
+  max-rE is off.
+- **`Engine.SoundFrames(clip)` / `SoundChannels(clip)`** → `bwa_sound_get_frames` /
+  `bwa_sound_get_channels`: asset length (engine-rate frames) and channel count, loaded on demand
+  through the same cache as `Load`.
+- **`Engine.AsioDriverCount` / `AsioDriverName(index)`** (static, engine-free) →
+  `bwa_get_asio_driver_count` / `bwa_get_asio_driver_name`: enumerate the registered ASIO drivers
+  before an `Engine` exists, to populate a picker for `asioDriver`.
+
+### Added — `PushEmitter` component
+
+- **`PushEmitter`** — a MonoBehaviour wrapper for procedural (push) sources, filling the one gap
+  where the raw `bwa_source_*` push calls (`bwa_source_create_push` / `_push` / `_push_space` /
+  `_push_end`) had no component like every other source concept. A positional source you FEED mono
+  float PCM at `Engine.SampleRate` instead of a clip (a synth, an engine model, a voice stream):
+  `Push(float[])` / `Push(float[], count)` (returns the count accepted), `PushSpace`, `PushEnd()`,
+  `IsPlaying`, plus the source-generic surface `Emitter` has that applies to a push voice — `Gain` /
+  `FadeTo` / `FadeOut`, `Spread` / `Extent` / `SizeMetres`, `Priority`, `Group`, `Pause` / `UnPause`,
+  `SetAttenuationOverride`, `SetOcclusionManual`, `Occlusion`, `Playhead` / `PlayheadSeconds`, `Stop`,
+  and the inspector spatial toggles (occlusion, early reflections, reverb send/distance, pathing,
+  directivity, doppler, air absorption, loudness comp). It registers with `Engine` and its transform
+  rides the same centralized per-frame push (`Engine` gained a `Register`/`Unregister(PushEmitter)`
+  overload and a second push loop before the commit). Deliberately OMITTED — the engine refuses them
+  on a push voice: `Play` / `PlayAt` / `PlayLoop`, `Seek`, `Pitch`, `Queue` / `ClearQueue`,
+  `PlayOneShot`, and the file `clip` / `loop` / `playOnEnable` machinery. Mirrors Godot's
+  `BwaPushSource` (which splits off `BwaEmitter` for the same reason) adapted to `Emitter`'s Unity
+  idioms (lazy `TryInit` with the init-order-race coroutine, generation-safe handle, live `OnValidate`
+  re-push). One-way: `PushEnd`/`Stop`/`FadeOut` end the voice, so re-enable the component for a fresh one.
+
+### Removed
+
+- **`Emitter.Position` / `Emitter.PositionSeconds` and `AmbisonicBed.Position`** — the `[Obsolete]`
+  forwarders left over from the 0.3.0 `Position → Playhead` rename are gone. Use `Playhead` /
+  `PlayheadSeconds` (the content playhead, unrelated to the spatial transform).
+- **`Bwa.MaterialPreset(engine, preset)`** — the thin static alias over the already-typed
+  `bwa_material_preset` extern is gone; call `Bwa.bwa_material_preset` directly (the two internal
+  callers, `Engine.ResolvePreset` and `MaterialAsset.Resolve`, were migrated). The engine-level
+  `Engine.MaterialPreset(preset)` convenience (the cached mint) is unaffected.
+
+### Changed
+
+- **`Emitter` directivity** — the cardioid-weight mapping + `set_directivity` call, duplicated in
+  `TryInit` and `OnValidate`, moved into one `ApplyDirectivity()` helper (no behaviour change).
+
+### Fixed
+
+- **`ProjectCheck` warning** pointed at the wrong menu: "Tools → Engine → Disable Unity Audio" now
+  reads "Tools → BwAudio → Disable Unity Audio", matching the actual `MenuItem` path.
+- **Docs**: the README and `docs/integration.md` "1:1" claims now name the two deliberately-unbound
+  calls instead of overclaiming. The README's live-A/B list gains SPECTRAL spread and max-rE, and
+  its load-time list names the bed decoder as AllRAD / EPAD (sampling is no longer selectable).
+
 ## [0.3.2-rc3]
 
 - CI tests
@@ -61,7 +147,7 @@ The engine renamed seven symbols for clarity; the binding follows. C#-visible ch
   playhead. The old properties remain as `[Obsolete]` forwarders for now.
 - Raw `Bwa` layer follows the C renames: `bwa_source_get_playhead` / `bwa_bed_get_playhead`
   (was `_get_position`), `bwa_source_create_push` (was `_create_stream`), and the reverb-send
-  family `bwa_reverb_set_gain` / `bwa_source_set_reverb` / `bwa_source_set_reverb_send` /
+  family `bwa_set_reverb_gain` / `bwa_source_set_reverb` / `bwa_source_set_reverb_send` /
   `bwa_source_set_reverb_distance` (was `bwa_reflections_set_gain` / `bwa_source_set_reflections`
   / `..._reflection_send` / `..._reflection_distance`) — "reflections" now always means the Steam
   reflection-bed config or the image-source earlies, "reverb" the shared send/tap.
@@ -373,7 +459,7 @@ authors:
 
 Two coordinate seams the new calls exposed, both now in `Room` so nothing re-derives them:
 `Room.YawRad` (the X mirror **reverses the sense of rotation** — a Unity euler angle passed straight
-to `bwa_bed_set_rotation` spins the soundfield the wrong way) and `Room.Dir` (a *direction*, e.g. the
+to the bed's yaw (`bwa_bed_set_orientation`) spins the soundfield the wrong way) and `Room.Dir` (a *direction*, e.g. the
 FDN's decay axis, must not pick up the registration transform's translation the way `Room.Pos` does).
 
 `Engine` now also **reports a failed layout load** (`bwa_last_error` right after `bwa_create`): it is

@@ -26,7 +26,7 @@ namespace BwAudio.EditorTools
                     "[bw_audio] Unity's built-in audio is ENABLED. The bw_audio engine owns the audio " +
                     "device, so leaving Unity audio on wastes CPU, can contend for the monitor's output " +
                     "device, and plays stray AudioSources the wrong way (not through the CAVE array). " +
-                    "Run Tools → Engine → Disable Unity Audio, or tick Project Settings → " +
+                    "Run Tools → BwAudio → Disable Unity Audio, or tick Project Settings → " +
                     "Audio → “Disable Unity Audio”.");
         }
 

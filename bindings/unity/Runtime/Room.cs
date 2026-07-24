@@ -58,7 +58,7 @@ namespace BwAudio
         }
 
         /// <summary>Unity yaw (degrees about +Y) -> room yaw (radians about +Y, RH: positive turns the field
-        /// from room +Z toward room +X) — the angle <c>bwa_bed_set_rotation</c> wants. The X mirror REVERSES
+        /// from room +Z toward room +X) — the angle <c>bwa_bed_set_orientation</c> wants. The X mirror REVERSES
         /// the sense of rotation (turning a bed to Unity's right turns it toward room -X, a NEGATIVE room
         /// yaw), so a Unity euler angle passed straight to the engine spins the soundfield the wrong way.
         /// Routed through Rot() so any yaw baked into UnityToRoom is included, not just the mirror.</summary>

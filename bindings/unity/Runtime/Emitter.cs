@@ -114,20 +114,12 @@ namespace BwAudio
             }
             if (pathing)       Bwa.bwa_source_set_pathing(Eng, _src, true);
             if (spread > 0f)   Bwa.bwa_source_set_spread(Eng, _src, spread);
+            if (_extent.x > 0f || _extent.y > 0f) Bwa.bwa_source_set_extent(Eng, _src, _extent.x, _extent.y);   // a script-set anisotropic extent, re-asserted after a re-enable
             if (sizeMetres > 0f) Bwa.bwa_source_set_size(Eng, _src, sizeMetres);
             if (doppler)       Bwa.bwa_source_set_doppler(Eng, _src, true);
             if (airAbsorption) Bwa.bwa_source_set_air_absorption(Eng, _src, true);
             if (loudnessComp)  Bwa.bwa_source_set_loudness_comp(Eng, _src, true);
-            if (directivity != BwaDirectivity.Omni)
-            {
-                Bwa.bwa_source_set_directivity_preset(Eng, _src, directivity);
-                if (directivityPower != 1f)
-                {
-                    // preset sets weight; re-issue with the chosen power (weight from the preset table)
-                    float w = directivity == BwaDirectivity.Cardioid ? 0.5f : 1.0f;
-                    Bwa.bwa_source_set_directivity(Eng, _src, w, directivityPower);
-                }
-            }
+            if (directivity != BwaDirectivity.Omni) ApplyDirectivity();   // fresh source defaults to omni, so skip the no-op
             Push();
             if (playOnEnable) Play();
             Engine.Instance.Register(this);
@@ -243,11 +235,6 @@ namespace BwAudio
         /// sample rate).</summary>
         public double PlayheadSeconds => Engine.Instance ? Playhead / (double)Engine.Instance.sampleRate : 0.0;
 
-        [System.Obsolete("Renamed: the content playhead is Playhead (Position collided with the spatial transform).")]
-        public ulong Position => Playhead;
-        [System.Obsolete("Renamed to PlayheadSeconds.")]
-        public double PositionSeconds => PlayheadSeconds;
-
         /// <summary>Linear gain — AudioSource.volume equivalent; applies immediately if live. Cancels a
         /// running FadeTo/FadeOut (an explicit gain wins over a fade).</summary>
         public float Gain
@@ -276,11 +263,34 @@ namespace BwAudio
             set { pitch = value; if (_created && Eng != IntPtr.Zero) Bwa.bwa_source_set_pitch(Eng, _src, value); }
         }
 
-        /// <summary>Angular width (0 = point .. 1 = wide). Floored by SizeMetres when that is set.</summary>
+        /// <summary>Angular width (0 = point .. 1 = wide). Floored by SizeMetres when that is set. Setting
+        /// this resets Extent to isotropic (spread and extent are the same knob — last call wins).</summary>
         public float Spread
         {
             get => spread;
-            set { spread = value; if (_created && Eng != IntPtr.Zero) Bwa.bwa_source_set_spread(Eng, _src, value); }
+            set { spread = value; _extent = Vector2.zero; if (_created && Eng != IntPtr.Zero) Bwa.bwa_source_set_spread(Eng, _src, value); }
+        }
+
+        /// <summary>Anisotropic angular extent (x = width, y = height, each 0 = point .. 1 = wide) — a
+        /// shoreline is wide but not tall, rain tall but not wide. Equal values behave as the isotropic
+        /// Spread; setting Spread resets this to isotropic (last call wins). Rides the spread mode, the
+        /// size/near floors, and decorrelation. Scripting only — the inspector's single Spread slider is
+        /// the isotropic knob.</summary>
+        public Vector2 Extent
+        {
+            get => _extent;
+            set { _extent = value; if (_created && Eng != IntPtr.Zero) Bwa.bwa_source_set_extent(Eng, _src, value.x, value.y); }
+        }
+        Vector2 _extent;
+
+        /// <summary>Override the layout's distance-attenuation curve for this source:
+        /// <c>atten = clamp((refDist / max(d, refDist))^rolloff, minGain, 1)</c>. rolloff 0 = constant level
+        /// at any distance (a direction-only cue that never fades); <c>refDist &lt;= 0</c> CLEARS the override
+        /// (back to the layout curve). Composes with spread, dual-band, decorrelation, and loudness comp.
+        /// Mono point sources only (a bed has no distance).</summary>
+        public void SetAttenuationOverride(float refDist, float rolloff, float minGain)
+        {
+            if (_created && Eng != IntPtr.Zero) Bwa.bwa_source_set_attenuation_override(Eng, _src, refDist, rolloff, minGain);
         }
 
         /// <summary>Physical radius in metres (0 = point): the source holds its real-world size as the
@@ -361,6 +371,15 @@ namespace BwAudio
             Bwa.bwa_source_set_doppler(Eng, _src, doppler);
             Bwa.bwa_source_set_air_absorption(Eng, _src, airAbsorption);
             Bwa.bwa_source_set_loudness_comp(Eng, _src, loudnessComp);
+            ApplyDirectivity();   // always push the preset, so switching back to Omni disables it live
+        }
+
+        // Push this source's directivity pattern + sharpness. The preset call sets the pattern (and,
+        // for Omni, turns directivity off); a non-omni pattern then re-issues with directivityPower, since
+        // the preset only sets the weight — mapping the pattern to its cardioid/figure-8 weight. Shared by
+        // TryInit and OnValidate; both call sites guard _created/Eng first.
+        void ApplyDirectivity()
+        {
             Bwa.bwa_source_set_directivity_preset(Eng, _src, directivity);
             if (directivity != BwaDirectivity.Omni)
             {

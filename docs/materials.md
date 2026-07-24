@@ -6,8 +6,8 @@ Two implementations now exist behind these features: Steam Audio's ray tracer
 (`src/steam_scene.c`, `src/steam_reflect.c`, `src/steam_path.c`, gated on the SDK build) and a
 phonon-free geometric path (`src/ism.c` early reflections + `src/fdn.c` late reverb + manual
 occlusion). **Read "Choosing an acoustics path" first**: they are complementary, not rivals, and
-the recommended configuration mixes them. See [roadmap.md](./roadmap.md) for what's implemented and
-tested across the engine.
+the recommended configuration mixes them. See [api.md](./api.md)'s "Feature overview" for what's
+implemented and tested across the engine.
 
 ## Choosing an acoustics path
 
@@ -311,7 +311,7 @@ cleared it.
 effect's** (a mismatch is a hard crash). So **IR length, ambisonic order, and the ray/bounce
 budget are load-time configuration**: `bwa_reflections_config` is callable only between
 `bwa_create` and `bwa_start`, and changing any of them means `bwa_stop`/`bwa_start`. The one live
-control is the wet gain: `bwa_reverb_set_gain` (an atomic the audio-thread tap reads). Per
+control is the wet gain: `bwa_set_reverb_gain` (an atomic the audio-thread tap reads). Per
 block, only `IPLReflectionEffectParams.numChannels` may be *reduced* (≤ created) to shed CPU;
 nothing is resized.
 
@@ -393,7 +393,7 @@ allocation sizes; see "Fixed-at-create" above); the wet gain is the one live con
 | `order`                    | bed directionality vs channel count / IR width  | 1 (max 2)     | baked at `bwa_start` |
 | `num_rays`                 | reflection accuracy vs ray-trace cost (off-thread) | 4096       | baked at `bwa_start` |
 | `num_bounces`              | bounce depth (off-thread)                       | 16            | baked at `bwa_start` |
-| wet level                  | reverb level summed onto the bus                | 1.0           | **live** (`bwa_reverb_set_gain`) |
+| wet level                  | reverb level summed onto the bus                | 1.0           | **live** (`bwa_set_reverb_gain`) |
 | sim update rate            | reflection responsiveness vs CPU (off-thread)   | 12 Hz         | compile-time (`REFL_HZ`) |
 
 Two multiplicative cost controls: **hybrid reverb** keeps each convolution short (early IR only;
@@ -415,8 +415,8 @@ By design this path does **not** do a few things, and they cluster by cause:
 Two more are simply future work: a **runtime scene swap under the reflection bed** (it needs a
 scene-swap handshake — today the setters are rejected while the bed runs, see "Scene lifecycle"),
 and the **perceptual reverb mode** (above). Doppler and air absorption are phonon-free per-voice DSP
-([api.md](./api.md)), not part of this path at all. See [roadmap.md](./roadmap.md) for milestone
-status across the engine.
+([api.md](./api.md)), not part of this path at all. See [api.md](./api.md)'s "Feature overview"
+for status across the engine.
 
 ## Baked reflections (`bwa_reflections_desc.bake`)
 

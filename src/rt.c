@@ -15,9 +15,10 @@
 #include "align.h"
 #include "ism.h"          /* image-source early reflections (shoebox geometry; phonon-free) */
 #include "biquad.h"       /* shared RBJ cookbook (also used by align.c's room_eq) */
-#include "ambisonics.h"   /* SH->26 decode for ambisonic beds */
+#include "ambisonics.h"   /* SH->26 decode for ambisonic beds (+ room_to_ambi, ambi_sad_decode) */
 #include "allrad.h"       /* robust SH->26 decode for irregular arrays */
 #include "epad.h"         /* energy-preserving SH->26 decode (bed_decoder = 2) */
+#include "bits.h"         /* bwa_pow2_ge */
 #include "profile.h"      /* Tracy zones/plots (no-ops unless BWA_TRACY=ON) */
 
 #include <math.h>
@@ -76,6 +77,20 @@ typedef struct { Cmd slots[RING_CAP]; _Atomic uint32_t write, read; } CmdRing;
 typedef struct { Evt slots[EVT_CAP];  _Atomic uint32_t write, read; } EvtRing;
 typedef struct { uint32_t handle; float sh[BWA_AMBI_CH]; float eq[3]; } PathPub;   /* one double-buffer slot of a voice's path field (directions + bending-loss band tilt) */
 
+typedef struct { float cw0, alpha; int type; } EqProto;   /* per-band biquad prototype, rate-derived at create */
+
+/* 3-band per-voice EQ state (audio-thread-only): the transmission (occlusion) EQ and the pathing
+ * bending-loss EQ are structurally identical, so both are a VoiceEq. g_cur are the slewed band gains;
+ * co the 3 sections' live biquad coeffs {b0,b1,b2,a1,a2}, INTERPOLATED per sample toward the block
+ * target so the envelope never steps (invariant 4); x1/x2/y1/y2 are the Direct-Form-I history;
+ * engaged gates the chain (bypassed once settled flat). See eq_block_setup/apply/land. */
+typedef struct {
+    float g_cur[3];
+    float co[3][5];
+    float x1[3], x2[3], y1[3], y2[3];
+    int   engaged;
+} VoiceEq;
+
 typedef struct {
     uint16_t gen;
     bool     active, playing, loop, dirty, oneshot;
@@ -103,13 +118,9 @@ typedef struct {
                                                               * so the LF re-weighting crossfades (no step) */
     int      path_on;                                         /* gated into the pathing (indirect) render */
     float    path_sh_cur[BWA_AMBI_CH];                         /* ramped path shCoeffs (toward the published target) */
-    /* pathing bending-loss EQ (audio-thread-only): a 3-band tilt on the indirect signal before the
-     * SH-encode, structurally identical to the occlusion EQ above but on the un-occluded s_raw and
-     * its own filter state. Bypassed while the tilt is flat (path_eq_engaged == 0). */
-    float    path_eqg_cur[3];
-    float    path_eq_co[3][5];
-    float    path_eq_x1[3], path_eq_x2[3], path_eq_y1[3], path_eq_y2[3];
-    int      path_eq_engaged;
+    /* pathing bending-loss EQ: a 3-band tilt on the indirect signal before the SH-encode, on the
+     * un-occluded s_raw. Same VoiceEq shape as the occlusion EQ below (structurally identical). */
+    VoiceEq  path_eq;
     /* occlusion ramp state (audio-thread-only). The published target lives in the RtCore.occ_*
      * atomic arrays (outside this memset'd struct, so the off-thread sim never races a voice
      * create). occ_cur ramps toward the gated published value, applied to the mono signal pre-pan. */
@@ -119,14 +130,9 @@ typedef struct {
     bool     refl_dist;                      /* scale the wet send by distance (far = wetter) */
     float    refl_gain;                      /* per-voice wet-send level (default 1) */
     float    refl_g_cur;                     /* ramped effective send gain (audio-thread-only) */
-    /* per-band transmission EQ state (audio-thread-only). eqg_cur are the slewed band gains; eq_co
-     * are the 3 sections' live coefficients {b0,b1,b2,a1,a2}, INTERPOLATED toward the block's target
-     * per sample so the spectral envelope never steps at a block boundary (invariant 4). The 4
-     * history arrays are the Direct-Form-I state; eq_engaged gates the chain (bypassed when settled flat). */
-    float    eqg_cur[3];
-    float    eq_co[3][5];
-    float    eq_x1[3], eq_x2[3], eq_y1[3], eq_y2[3];
-    int      eq_engaged;
+    /* per-band transmission (occlusion) EQ state: a wall muffles, not just attenuates. Same shape as
+     * the pathing EQ above; both driven by eq_block_setup/apply/land. */
+    VoiceEq  eq;
     /* propagation effects (audio-thread-only, opt-in). air_a_cur is the slewed one-pole coeff, air_y1
      * the filter memory. dop_delay is the current fractional delay (samples), gliding toward distance/c
      * each block - the glide IS the pitch shift; dop_w indexes this voice's slice of RtCore.dop_ring;
@@ -273,7 +279,7 @@ struct RtCore {
     float    test_gain[BWA_CHANNELS];
     float    test_phase[BWA_CHANNELS];   /* sine phase accumulator, radians */
     uint32_t test_noise;                /* shared LCG state for the noise kind */
-    struct { float cw0, alpha; int type; } eq_proto[3];   /* per-band biquad prototypes, rate-derived at create */
+    EqProto  eq_proto[3];               /* per-band biquad prototypes, rate-derived at create */
 
     /* per-channel output meter: each block's peak |sample| at the END of rt_render (post align/test
      * signal/limiter = exactly what the device channel received), relaxed-published for control-thread
@@ -658,6 +664,51 @@ static void eq_coeffs(int type, float cw0, float alpha, float g, float out[5]) {
     bwa_biquad_rbj(type, cw0, alpha, sqrt((double)g), out);
 }
 
+/* Per-block setup for a 3-band VoiceEq (the occlusion + pathing bending-loss EQs share this exactly).
+ * Glide the band gains toward tgt[3], detect flat, (re)engage the chain, and — when engaged — compute
+ * this block's target biquad coeffs (co_tgt) and per-sample glide steps (co_step). Returns whether the
+ * tilt is flat this block. Bit-identical to the two former inline copies (the caller reads the target
+ * first — occlusion via eq_unpack, pathing via pp->eq — since the gain glide has no cross-band deps). */
+static inline int eq_block_setup(VoiceEq* e, const float tgt[3], const EqProto proto[3],
+                                 uint32_t nr, float co_tgt[3][5], float co_step[3][5]) {
+    int flat = 1;
+    for (int b = 0; b < 3; ++b) {
+        e->g_cur[b] += (tgt[b] - e->g_cur[b]) * EQ_SLEW;
+        if (e->g_cur[b] < 1.f - EQ_FLAT_EPS || e->g_cur[b] > 1.f + EQ_FLAT_EPS) flat = 0;
+    }
+    if (!flat) e->engaged = 1;
+    if (e->engaged) {
+        for (int b = 0; b < 3; ++b) {
+            if (flat) { co_tgt[b][0] = 1.f; co_tgt[b][1] = co_tgt[b][2] = co_tgt[b][3] = co_tgt[b][4] = 0.f; }
+            else eq_coeffs(proto[b].type, proto[b].cw0, proto[b].alpha, e->g_cur[b], co_tgt[b]);
+            for (int k = 0; k < 5; ++k) co_step[b][k] = (co_tgt[b][k] - e->co[b][k]) / (float)nr;
+        }
+    }
+    return flat;
+}
+
+/* Per-sample apply: 3 biquads (Direct-Form-I), each section's coeffs glided by co_step. Returns the
+ * filtered sample. Bit-identical to the two former inline per-sample copies. */
+static inline float eq_block_apply(VoiceEq* e, float s, const float co_step[3][5]) {
+    for (int b = 0; b < 3; ++b) {
+        float* co = e->co[b];
+        float y = co[0]*s + co[1]*e->x1[b] + co[2]*e->x2[b] - co[3]*e->y1[b] - co[4]*e->y2[b];
+        e->x2[b]=e->x1[b]; e->x1[b]=s; e->y2[b]=e->y1[b]; e->y1[b]=y; s=y;
+        for (int k = 0; k < 5; ++k) co[k] += co_step[b][k];
+    }
+    return s;
+}
+
+/* End-of-block landing: snap the live coeffs to the block target; when settled flat, bypass + reset
+ * the DF-I history. Bit-identical to the two former inline landing copies. */
+static inline void eq_block_land(VoiceEq* e, const float co_tgt[3][5], int flat) {
+    for (int b = 0; b < 3; ++b) for (int k = 0; k < 5; ++k) e->co[b][k] = co_tgt[b][k];
+    if (flat) {
+        e->engaged = 0;
+        for (int b = 0; b < 3; ++b) { e->x1[b]=e->x2[b]=e->y1[b]=e->y2[b]=0.f; }
+    }
+}
+
 /* (re)start a voice's Doppler delay line clean: clear its ring slice + snap the delay next block, so a
  * fresh enable or a replay doesn't bleed the previous tail through the line. Audio thread (bounded). */
 static void dop_line_reset(RtCore* c, Voice* v, uint16_t idx) {
@@ -686,10 +737,10 @@ static void drain_commands(RtCore* c) {
             v->pitch = v->pitch_cur = 1.f;          /* native playback rate by default */
             v->refl_gain = 1.f;                     /* full wet-send level by default (gated by refl_send) */
             v->pause_g = 1.f;                       /* pause gate open (running) by default */
-            v->eqg_cur[0] = v->eqg_cur[1] = v->eqg_cur[2] = 1.f;   /* flat EQ (history zeroed by memset) */
-            for (int b = 0; b < 3; ++b) v->eq_co[b][0] = 1.f;     /* passthrough coeffs {1,0,0,0,0} */
-            v->path_eqg_cur[0] = v->path_eqg_cur[1] = v->path_eqg_cur[2] = 1.f;  /* flat pathing EQ */
-            for (int b = 0; b < 3; ++b) v->path_eq_co[b][0] = 1.f;
+            v->eq.g_cur[0] = v->eq.g_cur[1] = v->eq.g_cur[2] = 1.f;   /* flat EQ (history zeroed by memset) */
+            for (int b = 0; b < 3; ++b) v->eq.co[b][0] = 1.f;        /* passthrough coeffs {1,0,0,0,0} */
+            v->path_eq.g_cur[0] = v->path_eq.g_cur[1] = v->path_eq.g_cur[2] = 1.f;  /* flat pathing EQ */
+            for (int b = 0; b < 3; ++b) v->path_eq.co[b][0] = 1.f;
             memset(&c->para[idx], 0, sizeof c->para[idx]);   /* fresh parametric-bed state for the slot */
             /* drop any publish the sim left for the prior occupant of this slot (the stores are
              * atomic, so a concurrent sim publish for the old handle can't tear; either way the new
@@ -833,9 +884,9 @@ static void drain_commands(RtCore* c) {
             if (v) { v->path_on = cmd->u.path.on != 0;
                      if (!v->path_on) {                          /* clean restart: zero the ramp + flatten the EQ */
                          for (int k = 0; k < BWA_AMBI_CH; ++k) v->path_sh_cur[k] = 0.f;
-                         v->path_eq_engaged = 0;
-                         for (int b = 0; b < 3; ++b) { v->path_eqg_cur[b] = 1.f;
-                             v->path_eq_x1[b]=v->path_eq_x2[b]=v->path_eq_y1[b]=v->path_eq_y2[b]=0.f; } } } } break;
+                         v->path_eq.engaged = 0;
+                         for (int b = 0; b < 3; ++b) { v->path_eq.g_cur[b] = 1.f;
+                             v->path_eq.x1[b]=v->path_eq.x2[b]=v->path_eq.y1[b]=v->path_eq.y2[b]=0.f; } } } } break;
         case CMD_SET_REFL_SEND: { Voice* v = voice_for(c, cmd->handle);
             if (v) { float g = cmd->u.rsend.gain; v->refl_gain = g < 0.f ? 0.f : g; } } break;
         case CMD_SET_REFL_DIST: { Voice* v = voice_for(c, cmd->handle);
@@ -926,24 +977,9 @@ static void drain_commands(RtCore* c) {
  * cave grid is only approximately uniform, so it is good for a diffuse bed but a pseudo-inverse
  * (mode-matching) decode would be exact — a refinement, not needed for v1's diffuse content. */
 static void build_bed_decode_sad(RtCore* c) {
-    const float invL = 1.0f / (float)c->channels;
-    for (uint32_t s = 0; s < c->channels; ++s) {
-        /* speaker direction from the layout's nominal listening point (the array centroid) —
-         * NOT from the origin, which canonically sits on the floor (Motive ground plane) */
-        float p[3] = { c->layout.speakers[s].pos[0] - c->layout.ref[0],
-                       c->layout.speakers[s].pos[1] - c->layout.ref[1],
-                       c->layout.speakers[s].pos[2] - c->layout.ref[2] };
-        float len = sqrtf(p[0]*p[0] + p[1]*p[1] + p[2]*p[2]);
-        float ad[3];
-        if (len < 1e-6f) { ad[0] = 1.f; ad[1] = 0.f; ad[2] = 0.f; }          /* degenerate: face front */
-        else { ad[0] = p[2]/len; ad[1] = p[0]/len; ad[2] = p[1]/len; }       /* (z,x,y): ambi front=+z, left=+x, up=+y */
-        float y[BWA_AMBI_CH];
-        ambi_encode_sn3d(ad, y);
-        for (int k = 0; k < BWA_AMBI_CH; ++k) {
-            int l = (int)floorf(sqrtf((float)k));                            /* ACN order of channel k */
-            c->bed_decode[s][k] = (float)(2*l + 1) * y[k] * invL;
-        }
-    }
+    /* the sampling decode now lives in ambisonics.c (shared with the FDN's fallback); directions are
+     * from the array centroid (layout.ref), not the origin (which canonically sits on the floor). */
+    ambi_sad_decode(&c->layout, c->channels, c->bed_decode);
 }
 
 /* Dispatch the bed decode: AllRAD if selected (and the array triangulates), else the sampling decode.
@@ -964,7 +1000,8 @@ static void build_bed_decode(RtCore* c) {
                        c->layout.speakers[s].pos[2] - c->layout.ref[2] };
         float len = sqrtf(p[0]*p[0] + p[1]*p[1] + p[2]*p[2]);
         rsum += len;
-        float ad[3] = { len > 1e-6f ? p[2]/len : 1.f, len > 1e-6f ? p[0]/len : 0.f, len > 1e-6f ? p[1]/len : 0.f };
+        float dr[3] = { len > 1e-6f ? p[0]/len : 0.f, len > 1e-6f ? p[1]/len : 0.f, len > 1e-6f ? p[2]/len : 1.f };
+        float ad[3]; room_to_ambi(dr, ad);                     /* (z,x,y): ambi front=+z, left=+x, up=+y */
         float y[BWA_AMBI_CH]; ambi_encode_sn3d(ad, y);
         for (uint32_t ch = 0; ch < c->channels; ++ch) {        /* FOA plane wave from dir s -> power */
             float acc = 0.f;
@@ -1071,16 +1108,7 @@ static void panner_gains(RtCore* c, int p, const float src[3], float user_gain, 
     panner_gains_at(c, p, c->lis.p_active, &c->spcap, &c->vbap, src, user_gain, out);
 }
 
-/* The distance-attenuation formula with arbitrary parameters — the layout curve, the per-source
- * override, and loudness comp's tracker all share it: clamp((ref/max(d,ref))^rolloff, min, 1).
- * ref <= 0 = attenuation off (1 everywhere); rolloff 0 = constant 1 (the formula's own limit). */
-static float atten_curve(float d, float ref, float rolloff, float min_lin) {
-    if (ref <= 0.f) return 1.f;
-    float dd = d > ref ? d : ref;
-    float a = powf(ref / dd, rolloff);
-    if (a < min_lin) a = min_lin;
-    return a > 1.f ? 1.f : a;
-}
+/* atten_curve (the shared distance-attenuation formula) now lives in layout.h. */
 
 /* Orthonormal ring frame (u, w) around the source direction d, PARALLEL-TRANSPORTED per voice:
  * project the stored base off the new d rather than deriving u from a fixed up-vector, whose
@@ -1095,10 +1123,9 @@ static void spread_frame(Voice* v, const float d[3], float u[3], float w[3]) {
     u[0] = b[0] - dot*d[0]; u[1] = b[1] - dot*d[1]; u[2] = b[2] - dot*d[2];
     float ul = sqrtf(u[0]*u[0] + u[1]*u[1] + u[2]*u[2]);
     if (ul < 1e-4f) {                                    /* unset (zero) or parallel to d: (re)seed */
-        float up[3] = { 0.f, 1.f, 0.f };
-        if (d[1] > 0.9f || d[1] < -0.9f) { up[0] = 1.f; up[1] = 0.f; }
-        u[0] = up[1]*d[2]-up[2]*d[1]; u[1] = up[2]*d[0]-up[0]*d[2]; u[2] = up[0]*d[1]-up[1]*d[0];
-        ul = sqrtf(u[0]*u[0] + u[1]*u[1] + u[2]*u[2]);
+        up_frame(d, u, w);                               /* the fixed-up heuristic — same ops as the fall-through below */
+        v->sp_base[0] = u[0]; v->sp_base[1] = u[1]; v->sp_base[2] = u[2];
+        return;
     }
     u[0]/=ul; u[1]/=ul; u[2]/=ul;
     v->sp_base[0] = u[0]; v->sp_base[1] = u[1]; v->sp_base[2] = u[2];
@@ -1462,25 +1489,13 @@ static void mix_voice(RtCore* c, Voice* v, uint16_t idx, float* bus, uint32_t n,
     const float dir_step = (dir_tgt - v->dir_cur) / (float)nr;
 
     /* per-band EQ: read the gated tilt once + glide the band gains; compute this block's TARGET
-     * biquad coeffs and interpolate the live coeffs (eq_co) toward them per sample, so the spectral
-     * envelope never steps at a block boundary (invariant 4). Target is passthrough when flat; the
-     * chain is bypassed once it has fully settled flat. */
+     * biquad coeffs and interpolate the live coeffs toward them per sample, so the spectral envelope
+     * never steps at a block boundary (invariant 4). Target is passthrough when flat; the chain is
+     * bypassed once it has fully settled flat. eq_block_* share this with the pathing EQ below. */
     float gt[3];
     eq_unpack(mine ? atomic_load_explicit(&c->occ_eq[idx], memory_order_relaxed) : EQ_FLAT, gt);
-    bool flat = true;
-    for (int b = 0; b < 3; ++b) {
-        v->eqg_cur[b] += (gt[b] - v->eqg_cur[b]) * EQ_SLEW;
-        if (v->eqg_cur[b] < 1.f - EQ_FLAT_EPS || v->eqg_cur[b] > 1.f + EQ_FLAT_EPS) flat = false;
-    }
-    if (!flat) v->eq_engaged = 1;
     float co_tgt[3][5], co_step[3][5];
-    if (v->eq_engaged) {
-        for (int b = 0; b < 3; ++b) {
-            if (flat) { co_tgt[b][0] = 1.f; co_tgt[b][1] = co_tgt[b][2] = co_tgt[b][3] = co_tgt[b][4] = 0.f; }
-            else eq_coeffs(c->eq_proto[b].type, c->eq_proto[b].cw0, c->eq_proto[b].alpha, v->eqg_cur[b], co_tgt[b]);
-            for (int k = 0; k < 5; ++k) co_step[b][k] = (co_tgt[b][k] - v->eq_co[b][k]) / (float)nr;
-        }
-    }
+    int flat = eq_block_setup(&v->eq, gt, c->eq_proto, nr, co_tgt, co_step);
 
     /* propagation (opt-in): a distance-driven air-absorption low-pass + a glided Doppler delay line.
      * Both ride the block: the air coeff ramps (invariant 4); the Doppler delay glides toward
@@ -1655,22 +1670,12 @@ static void mix_voice(RtCore* c, Voice* v, uint16_t idx, float* bus, uint32_t n,
         const int mine_path = (pp->handle == myh);
         for (uint32_t k = 0; k < pac; ++k) path_tgt[k] = mine_path ? pp->sh[k] : 0.f;
         for (uint32_t k = 0; k < pac; ++k) path_step[k] = (path_tgt[k] - v->path_sh_cur[k]) / (float)nr;
-        /* bending-loss EQ: glide the band gains toward the published tilt (flat when not mine), then
-         * compute this block's target biquad coeffs and interpolate the live coeffs per sample — the
-         * same low-shelf/peak/high-shelf cascade the occlusion EQ uses, applied to s_raw pre-encode
-         * (phonon's own path effect: EQ the mono signal, then scale each SH channel — path_effect.cpp). */
+        /* bending-loss EQ: the same low-shelf/peak/high-shelf cascade the occlusion EQ uses, applied
+         * to s_raw pre-encode (phonon's own path effect: EQ the mono signal, then scale each SH
+         * channel — path_effect.cpp). Target is flat when the field isn't ours. Same eq_block_setup. */
         float peq_tgt[3];
-        for (int b = 0; b < 3; ++b) {
-            peq_tgt[b] = mine_path ? pp->eq[b] : 1.f;
-            v->path_eqg_cur[b] += (peq_tgt[b] - v->path_eqg_cur[b]) * EQ_SLEW;
-            if (v->path_eqg_cur[b] < 1.f - EQ_FLAT_EPS || v->path_eqg_cur[b] > 1.f + EQ_FLAT_EPS) path_flat = 0;
-        }
-        if (!path_flat) v->path_eq_engaged = 1;
-        if (v->path_eq_engaged) for (int b = 0; b < 3; ++b) {
-            if (path_flat) { pco_tgt[b][0] = 1.f; pco_tgt[b][1] = pco_tgt[b][2] = pco_tgt[b][3] = pco_tgt[b][4] = 0.f; }
-            else eq_coeffs(c->eq_proto[b].type, c->eq_proto[b].cw0, c->eq_proto[b].alpha, v->path_eqg_cur[b], pco_tgt[b]);
-            for (int k = 0; k < 5; ++k) pco_step[b][k] = (pco_tgt[b][k] - v->path_eq_co[b][k]) / (float)nr;
-        }
+        for (int b = 0; b < 3; ++b) peq_tgt[b] = mine_path ? pp->eq[b] : 1.f;
+        path_flat = eq_block_setup(&v->path_eq, peq_tgt, c->eq_proto, nr, pco_tgt, pco_step);
     }
 
     uint32_t cur = v->cursor;
@@ -1701,14 +1706,7 @@ static void mix_voice(RtCore* c, Voice* v, uint16_t idx, float* bus, uint32_t n,
         } else s = snd->pcm[cur];
         s *= pg;                                               /* pause/seek gate (also gates the sends below) */
         const float s_raw = s;                                 /* pre-occlusion source, for the indirect (pathing) field */
-        if (v->eq_engaged) {                                    /* 3 biquads (DF-I), coeffs interpolated per sample */
-            for (int b = 0; b < 3; ++b) {
-                float* co = v->eq_co[b];
-                float y = co[0]*s + co[1]*v->eq_x1[b] + co[2]*v->eq_x2[b] - co[3]*v->eq_y1[b] - co[4]*v->eq_y2[b];
-                v->eq_x2[b]=v->eq_x1[b]; v->eq_x1[b]=s; v->eq_y2[b]=v->eq_y1[b]; v->eq_y1[b]=y; s=y;
-                for (int k = 0; k < 5; ++k) co[k] += co_step[b][k];   /* glide toward the block target */
-            }
-        }
+        if (v->eq.engaged) s = eq_block_apply(&v->eq, s, co_step);   /* 3 biquads (DF-I), coeffs interpolated per sample */
         s *= v->occ_cur * v->dir_cur;                           /* occlusion level + directivity, pre-pan */
         if (do_send) { aux[i] += s * v->refl_g_cur; v->refl_g_cur += refl_step; }  /* reverb send: pre-propagation, distance/level-scaled */
         if (ism_on) {                                           /* early reflections: each image is a delayed,
@@ -1762,12 +1760,7 @@ static void mix_voice(RtCore* c, Voice* v, uint16_t idx, float* bus, uint32_t n,
         v->dir_cur += dir_step;
         if (path_on) {                                         /* SH-encode the indirect field (decoded later by the tap) */
             float sp = s_raw;                                  /* the indirect path is un-occluded (it bends around) ... */
-            if (v->path_eq_engaged) for (int b = 0; b < 3; ++b) {   /* ... but takes the bending-loss tilt (3 biquads, DF-I) */
-                float* co = v->path_eq_co[b];
-                float y = co[0]*sp + co[1]*v->path_eq_x1[b] + co[2]*v->path_eq_x2[b] - co[3]*v->path_eq_y1[b] - co[4]*v->path_eq_y2[b];
-                v->path_eq_x2[b]=v->path_eq_x1[b]; v->path_eq_x1[b]=sp; v->path_eq_y2[b]=v->path_eq_y1[b]; v->path_eq_y1[b]=y; sp=y;
-                for (int k = 0; k < 5; ++k) co[k] += pco_step[b][k];   /* glide toward the block target */
-            }
+            if (v->path_eq.engaged) sp = eq_block_apply(&v->path_eq, sp, pco_step);   /* ... but takes the bending-loss tilt */
             for (uint32_t k = 0; k < pac; ++k) {
                 c->path_accum[(size_t)k * n + i] += sp * v->path_sh_cur[k];
                 v->path_sh_cur[k] += path_step[k];
@@ -1822,11 +1815,7 @@ static void mix_voice(RtCore* c, Voice* v, uint16_t idx, float* bus, uint32_t n,
     }
     if (use_pitch) v->pitch_cur = v->pitch;                     /* land the rate glide exactly */
     if (path_on) for (uint32_t k = 0; k < pac; ++k) v->path_sh_cur[k] = path_tgt[k];   /* land exactly */
-    if (path_on && v->path_eq_engaged) {                        /* land the pathing-EQ coeffs; bypass once settled flat */
-        for (int b = 0; b < 3; ++b) for (int k = 0; k < 5; ++k) v->path_eq_co[b][k] = pco_tgt[b][k];
-        if (path_flat) { v->path_eq_engaged = 0;
-            for (int b = 0; b < 3; ++b) { v->path_eq_x1[b]=v->path_eq_x2[b]=v->path_eq_y1[b]=v->path_eq_y2[b]=0.f; } }
-    }
+    if (path_on && v->path_eq.engaged) eq_block_land(&v->path_eq, pco_tgt, path_flat);   /* land pathing-EQ coeffs; bypass once flat */
     if (streaming) {                                            /* advance the stream position; end at a true EOF (not underrun) */
         v->stream_pos += strm_got;
         if (stream_ended(snd->stream, v->stream_pos)) ended = true;
@@ -1848,13 +1837,7 @@ static void mix_voice(RtCore* c, Voice* v, uint16_t idx, float* bus, uint32_t n,
         if (v->fs_on == 2) v->fs_on = 0;   /* retiring: every band landed on the single-path target, and
                                             * gcur lands on the same gtarget below — exact handoff */
     }
-    if (v->eq_engaged) {
-        for (int b = 0; b < 3; ++b) for (int k = 0; k < 5; ++k) v->eq_co[b][k] = co_tgt[b][k];   /* land coeffs */
-        if (flat) {                                              /* settled to passthrough: bypass + reset history */
-            v->eq_engaged = 0;
-            for (int b = 0; b < 3; ++b) { v->eq_x1[b]=v->eq_x2[b]=v->eq_y1[b]=v->eq_y2[b]=0.f; }
-        }
-    }
+    if (v->eq.engaged) eq_block_land(&v->eq, co_tgt, flat);      /* land occlusion-EQ coeffs; bypass once settled flat */
     for (uint32_t ch = 0; ch < c->channels; ++ch) v->gcur[ch] = v->gtarget[ch]; /* land exactly */
 
     if (ended) {
@@ -1885,7 +1868,7 @@ static void bed_rotate_z(const float* sh, int nch, const float cm[3], const floa
 }
 
 /* Room-frame bed orientation -> the ambi-axes FIELD rotation matrix (rt_bed_set_orientation). Yaw
- * about room up (+y; positive turns the field from +z toward +x — the bwa_bed_set_rotation
+ * about room up (+y; positive turns the field from +z toward +x — the yaw-only orientation
  * convention), pitch about the room's right axis (positive tilts the field's front upward), roll
  * about room forward (+z; positive tilts the field's top toward room -x = the room's right).
  * Applied roll-first, yaw-last (aircraft order), then conjugated into ambi axes (x=front=room z,
@@ -2861,10 +2844,6 @@ void rt_set_ism_gain(RtCore* c, float linear) {
     atomic_store_explicit(&c->ism_gain, linear, memory_order_relaxed);   /* the solve re-reads it per block */
 }
 
-void rt_bed_set_rotation(RtCore* c, uint32_t h, float yaw_rad) {
-    rt_bed_set_orientation(c, h, yaw_rad, 0.f, 0.f);   /* the yaw shorthand resets pitch/roll */
-}
-
 void rt_bed_set_orientation(RtCore* c, uint32_t h, float yaw, float pitch, float roll) {
     if (!c) return;
     if (!(isfinite(yaw) && isfinite(pitch) && isfinite(roll))) return;
@@ -3169,7 +3148,7 @@ RtCore* rt_create(uint32_t req_voice_cap, uint32_t sound_cap, uint32_t sample_ra
     c->sfreelist = (uint32_t*) calloc(sound_cap, sizeof(uint32_t));
     {   /* Doppler ring pool: power-of-two ring per voice, sized to BWA_DOPPLER_MAX_DIST at this rate */
         uint32_t need = (uint32_t)(BWA_DOPPLER_MAX_DIST / BWA_SPEED_OF_SOUND * (float)sample_rate) + 2;
-        uint32_t rl = 1; while (rl < need) rl <<= 1;
+        uint32_t rl = bwa_pow2_ge(need);
         c->dop_ringlen = rl;
         c->dop_ring = (float*)calloc((size_t)voice_cap * rl, sizeof(float));
     }
@@ -3177,7 +3156,7 @@ RtCore* rt_create(uint32_t req_voice_cap, uint32_t sound_cap, uint32_t sample_ra
          * reflection path the renderer supports (BWA_ISM_MAX_M). Allocated with the voice pool — a
          * reflection is the direct signal delayed by its own path, so each voice needs its own. */
         uint32_t need = (uint32_t)(BWA_ISM_MAX_M / BWA_SPEED_OF_SOUND * (float)sample_rate) + 2;
-        uint32_t rl = 1; while (rl < need) rl <<= 1;
+        uint32_t rl = bwa_pow2_ge(need);
         c->ism_ringlen = rl;
         c->ism_ring = (float*)calloc((size_t)voice_cap * rl, sizeof(float));
         atomic_store_explicit(&c->ism_gain, 1.f, memory_order_relaxed);
@@ -3187,7 +3166,7 @@ RtCore* rt_create(uint32_t req_voice_cap, uint32_t sound_cap, uint32_t sample_ra
          * unit ENERGY (decorrelated copies must carry the power the coherent copy gave up). A
          * different LCG seed per channel makes the speaker feeds mutually incoherent. */
         uint32_t span = (uint32_t)(BWA_DECOR_MS * 1e-3f * (float)sample_rate);
-        uint32_t hl = 1; while (hl < span + BWA_RT_MAX_BLOCK) hl <<= 1;
+        uint32_t hl = bwa_pow2_ge(span + BWA_RT_MAX_BLOCK);
         c->dc_histlen = hl;
         c->dc_hmask   = hl - 1;
         c->dc_ntaps   = BWA_DECOR_TAPS;

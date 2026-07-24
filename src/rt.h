@@ -11,7 +11,7 @@
  * The mixing is the full production path: mix_voice plays sound->pcm through the
  * listener-relative DBAP/SPCAP/VBAP 26-gain solve with per-block gain ramps, plus occlusion,
  * directivity, Doppler, air absorption, reflection/pathing sends, dual-band panning, the
- * ambisonic bed, streaming, pause/seek, and the output limiter. See docs/roadmap.md for history.
+ * ambisonic bed, streaming, pause/seek, and the output limiter. See NOTES.md for history.
  */
 #ifndef BWA_RT_H
 #define BWA_RT_H
@@ -227,8 +227,7 @@ void rt_source_set_size  (RtCore* c, uint32_t h, float radius_m);    /* source M
 void rt_source_fade_to   (RtCore* c, uint32_t h, float gain, float seconds, bool stop_at_end);  /* timed fade */
 void rt_source_set_group (RtCore* c, uint32_t h, uint32_t group);    /* mix-group assignment (0 = default) */
 void rt_source_set_pitch (RtCore* c, uint32_t h, float rate);        /* playback rate [0.25, 4]; glided */
-void rt_bed_set_rotation (RtCore* c, uint32_t h, float yaw_rad);     /* bed soundfield yaw (= orientation yaw,0,0) */
-void rt_bed_set_orientation(RtCore* c, uint32_t h, float yaw, float pitch, float roll);  /* full 3-axis; glided */
+void rt_bed_set_orientation(RtCore* c, uint32_t h, float yaw, float pitch, float roll);  /* full 3-axis; glided (yaw,0,0 = the exact phasor yaw path) */
 void rt_source_set_ism   (RtCore* c, uint32_t h, bool on);           /* image-source early reflections */
 void rt_play_oneshot   (RtCore* c, uint32_t sound, float x, float y, float z, float gain);
 void rt_set_listener   (RtCore* c, const float p[3], const float q[4]);

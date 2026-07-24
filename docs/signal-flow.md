@@ -52,13 +52,13 @@ flowchart TD
   GATE -. "s_raw → bending-loss EQ → × shCoeffs<br/><i>bwa_source_set_pathing</i>" .-> PACC
   PATHS -.-> PACC
   OCC -. "× wet send (× distance)<br/><i>bwa_source_set_reverb · _reverb_send · _reverb_distance</i>" .-> AUX
-  OCC -. "ISM: 6 shoebox mirror images (ism_images);<br/>frac delay · HF damp · per-image panner_gains<br/><i>bwa_source_set_early_reflections · bwa_scene_set_box ·<br/>bwa_early_reflections_set_gain</i>" .-> BUS
+  OCC -. "ISM: 6 shoebox mirror images (ism_images);<br/>frac delay · HF damp · per-image panner_gains<br/><i>bwa_source_set_early_reflections · bwa_scene_set_box ·<br/>bwa_set_early_reflections_gain</i>" .-> BUS
   PROP -. "decor split × √spread<br/><i>bwa_set_decorrelation</i>" .-> DECOR
   PAN --> BUS
 
   subgraph BEDV["bed voice: mix_bed, per sample (inside rt_render)"]
     SH["SH frames (world-locked soundfield)<br/><i>bwa_bed_play · bwa_bed_set_gain</i>"]
-    ROT["rotate: yaw phasor (bed_rotate_z) ·<br/>full 3-axis ambi_rot_matrix / ambi_rot_apply (glided)<br/><i>bwa_bed_set_rotation · bwa_bed_set_orientation</i>"]
+    ROT["rotate: yaw phasor (bed_rotate_z) ·<br/>full 3-axis ambi_rot_matrix / ambi_rot_apply (glided)<br/><i>bwa_bed_set_orientation</i>"]
     MTX["matrix render: × max-rE taper (ambi_max_re_weights,<br/>crossfaded; opt. band-split: taper > 700 Hz only) →<br/>bed decode (build_bed_decode): allrad_build_decode /<br/>epad_build_decode (SAD = internal fallback)<br/><i>bwa_set_max_re · _max_re_split · bwa_desc.bed_decoder</i>"]
     PARA["parametric render (crossfaded): FOA bands →<br/>DirAC direction + diffuseness ψ<br/><i>bwa_set_bed_renderer</i>"]
     SH --> ROT
@@ -73,7 +73,7 @@ flowchart TD
   PARA -- "diffuse √ψ·FOA → bed decode (raw)" --> DECOR
 
   DECOR --> VN["per-channel sparse velvet-noise filters<br/>(mutually incoherent copies; built in rt_create)"] --> BUS
-  AUX --> RTAP["the ONE reverb tap (rt_set_bus_tap):<br/>steam_reflect_tap: convolve → ambisonic IR → phonon decode<br/>·or· fdn_tap: 16 lines · 2-band decay · direction-scaled ·<br/>plane waves through the bed decode + max-rE pair<br/><i>bwa_reflections_config · bwa_fdn_config · bwa_reverb_set_gain</i>"] --> BUS
+  AUX --> RTAP["the ONE reverb tap (rt_set_bus_tap):<br/>steam_reflect_tap: convolve → ambisonic IR → phonon decode<br/>·or· fdn_tap: 16 lines · 2-band decay · direction-scaled ·<br/>plane waves through the bed decode + max-rE pair<br/><i>bwa_reflections_config · bwa_fdn_config · bwa_set_reverb_gain</i>"] --> BUS
   PACC --> PTAP["path tap (rt_set_path_tap):<br/>steam_path_tap: phonon's own ambisonics decode"] --> BUS
 
   BUS --> MG["× master gain (ramped)<br/><i>bwa_set_master_gain</i>"]

@@ -9,6 +9,8 @@
 #ifndef BWA_FFT_H
 #define BWA_FFT_H
 
+#include "bits.h"          /* bwa_pow2_ge (was next_pow2) */
+
 #include <math.h>
 
 #ifndef M_PI
@@ -40,8 +42,5 @@ static inline void fft(double* re, double* im, int n, int dir) {
     }
     if (dir < 0) for (int i = 0; i < n; ++i) { re[i] /= n; im[i] /= n; }
 }
-
-/* smallest power of two >= x (for zero-padding a real signal up to a radix-2 length). */
-static inline int next_pow2(int x) { int p = 1; while (p < x) p <<= 1; return p; }
 
 #endif /* BWA_FFT_H */

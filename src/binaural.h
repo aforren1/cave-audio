@@ -8,7 +8,7 @@
  * (W/X) encode + two opposed cardioid decoders: cheap, real, and responsive to source
  * position + head orientation. The production path is a higher-order ambisonic encode ->
  * single ambisonics->binaural HRTF decode via Steam Audio (one decode, not 26 convolutions);
- * that slots in here behind the same interface when the SDK is vendored (see roadmap M5).
+ * that slots in here behind the same interface when the SDK is vendored (see docs/spatialization.md).
  */
 #ifndef BWA_BINAURAL_H
 #define BWA_BINAURAL_H

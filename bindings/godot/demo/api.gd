@@ -110,9 +110,9 @@ func _test_engine_knobs() -> void:
 	engine.tracked_room_eq = true
 
 	engine.master_gain = 0.8
-	engine.limiter_ceiling = -3.0
+	engine.limiter_ceiling = 0.7   # linear peak ceiling in (0..1]
 	_check(is_equal_approx(engine.master_gain, 0.8), "master_gain did not round-trip")
-	_check(is_equal_approx(engine.limiter_ceiling, -3.0), "limiter_ceiling did not round-trip")
+	_check(is_equal_approx(engine.limiter_ceiling, 0.7), "limiter_ceiling did not round-trip")
 	engine.master_gain = 1.0
 
 	engine.group_set_gain(1, 0.5)
@@ -125,7 +125,7 @@ func _test_engine_knobs() -> void:
 	engine.set_test_signal(engine.get_channel_count() - 1, BwaEngine.TEST_SINE, 0.1)
 	engine.set_test_signal(engine.get_channel_count() - 1, BwaEngine.TEST_OFF, 0.0)
 
-	engine.set_pose_prediction(20.0)
+	engine.set_pose_prediction(0.02)   # seconds (20 ms lead)
 	engine.set_pose_prediction(0.0)
 	engine.set_extra_listeners(PackedVector3Array([Vector3(1, 1.2, 0), Vector3(-1, 1.2, 0)]))
 	engine.set_extra_listeners(PackedVector3Array())

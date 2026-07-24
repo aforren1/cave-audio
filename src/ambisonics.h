@@ -16,11 +16,38 @@
 #ifndef BWA_AMBISONICS_H
 #define BWA_AMBISONICS_H
 
+#include "layout.h"        /* Layout + BWA_CHANNELS for ambi_sad_decode */
+
+#include <math.h>
+
 #define BWA_AMBI_ORDER 3
 #define BWA_AMBI_CH    16    /* (order + 1)^2 */
 
+/* room axes (+z fwd, +y up, -x right) -> ambisonic axes (x=front, y=left, z=up): the (z,x,y)
+ * permutation. `d` must already be a unit room direction; `a` receives the ambisonic-axis direction
+ * to feed ambi_encode_sn3d. Shared by the bed/AllRAD/EPAD/FDN decode builds so the convention lives
+ * in ONE place. NOTE: steam_decode.c's room_to_ambi_dir is a DELIBERATELY different (phonon net-AmbiX,
+ * negated: front=-z, left=-x) convention — do NOT route it through here; merging mirrors the HRTF field. */
+static inline void room_to_ambi(const float d[3], float a[3]) { a[0] = d[2]; a[1] = d[0]; a[2] = d[1]; }
+
+/* i-th of M points on a Fibonacci sphere (golden-angle spiral), room axes, FLOAT precision. Shared by
+ * allrad.c (virtual layer) and fdn.c (line directions). zylia.c uses a DOUBLE variant on purpose (it
+ * feeds a Gauss-Newton solver pinned to sub-degree accuracy) — keep that one; this must stay float so
+ * the AllRAD build stays byte-identical (xval pins it). */
+static inline void fib_sphere_dir(int i, int M, float d[3]) {
+    float y = 1.f - 2.f * ((float)i + 0.5f) / (float)M;
+    float r = sqrtf(fmaxf(0.f, 1.f - y * y)), th = (float)i * 2.39996323f;
+    d[0] = r * cosf(th); d[1] = y; d[2] = r * sinf(th);
+}
+
 /* Real SH gains for a unit direction `dir` (ambisonic axes), written to y[16] (ACN/SN3D). */
 void ambi_encode_sn3d(const float dir[3], float y[BWA_AMBI_CH]);
+
+/* Sampling (projection) ambisonic decode over a layout: each speaker's direction from L->ref is
+ * SH-sampled (room->ambi via room_to_ambi) and scaled by (2l+1)/count. This is the degenerate-array
+ * fallback both the bed decode (rt.c) and the FDN line render (fdn.c) share — assumes a roughly
+ * uniform speaker distribution; AllRAD/EPAD supersede it on irregular arrays. Writes `count` rows. */
+void ambi_sad_decode(const Layout* L, uint32_t count, float dec[BWA_CHANNELS][BWA_AMBI_CH]);
 
 /* max-rE decode weights (Zotter & Frank 2012) for content of `order` (1..3): per-ACN-channel gains
  * w[k] = gamma * P_l(r), where r is the largest zero of P_{order+1} and gamma renormalizes so a

@@ -45,7 +45,7 @@ static inline void bwa_godot_facing_quat(const float q[4], float out[4]) {
 	out[3] = y;
 }
 
-/* Room-frame yaw about +Y for a facing direction, the angle bwa_bed_set_rotation wants.
+/* Room-frame yaw about +Y for a facing direction, the angle bwa_bed_set_orientation wants.
  * Because there is no mirror, the sense of rotation is preserved straight through — the
  * Unity binding has to reverse it, this one must not. */
 static inline float bwa_room_yaw_from_dir(float x, float z) {

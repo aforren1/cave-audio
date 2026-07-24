@@ -48,11 +48,12 @@ namespace BwAudio.EditorTools
         {
             switch (p)
             {
+                case "maxReSplit":        return !a.maxRe;            // the band split only means anything with max-rE on
                 case "listener":          return !a.feedListener;      // the engine tracks itself
                 case "natnetServer":                                   // NatNet connection: tracking-only
                 case "natnetRigidBody":
-                case "posePredictionMs":  return a.feedListener;       // prediction is tracking-only
-                case "limiterCeilingDb":  return !a.limiter;
+                case "posePredictionS":   return a.feedListener;       // prediction is tracking-only
+                case "limiterCeiling":    return !a.limiter;
                 case "reverbSeconds":
                 case "reflectionOrder":
                 case "reverbGain":        return !a.enableReflections;

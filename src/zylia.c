@@ -608,6 +608,9 @@ int zylia_srp_doa(const float* const x[ZYLIA_MICS], uint32_t n, double fs, doubl
     if (!Yd || !Dd || !P || !re || !im) { free(Yd); free(Dd); free(P); free(re); free(im); return 0; }
 
     for (int d = 0; d < ZY_SRP_DIRS; ++d) {           /* even directions, golden angle */
+        /* DOUBLE-precision Fibonacci sphere (deliberately NOT the shared float fib_sphere_dir in
+         * ambisonics.h): this grid feeds the SRP-PHAT / Gauss-Newton estimators whose tests pin
+         * sub-degree accuracy, so the extra precision is load-bearing. */
         double yy = 1.0 - 2.0 * ((double)d + 0.5) / (double)ZY_SRP_DIRS;
         double rr = sqrt(1.0 - yy*yy < 0.0 ? 0.0 : 1.0 - yy*yy), th = (double)d * 2.399963229728653;
         float rd[3] = { (float)(rr * cos(th)), (float)yy, (float)(rr * sin(th)) };   /* room axes */

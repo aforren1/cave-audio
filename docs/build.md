@@ -15,9 +15,10 @@ source file: `src/rt.c` and `src/stream.c` always, plus `src/steam_reflect.c` in
 with-SDK build (its IR-publish seqlock uses `stdatomic.h` too), both where the DLL
 compiles it and in the test targets (`reflect`, `bake`) that compile it directly.
 
-**Race-checking the rings.** The `test_rt` target drives the SPSC ring/commit logic
+**Race-checking the rings.** The `test_rt_core` target drives the SPSC ring/commit logic
 off the real-time path (single-threaded, deterministic) and is what runs under
-`ctest` on MSVC. The full ThreadSanitizer/Helgrind pass the roadmap calls for needs a
+`ctest` on MSVC (the spatial-feature half lives in `test_rt_feature`; both share
+`test/rt_test_util.h`). The full ThreadSanitizer/Helgrind pass needs a
 **Clang or Linux** build: MSVC ships no TSan, and Helgrind is Valgrind/Linux. Build
 `rt.c` + a two-thread driver with `clang -fsanitize=thread` (or run under Helgrind)
 and exercise one producer pushing commands while one consumer drains. Keep that
@@ -37,7 +38,8 @@ Everything beyond the DLL + test suite is opt-in; the default build stays lean.
 | `BWA_BUILD_CALIBRATE` | OFF | `bwa_calibrate` + `bwa_zylia_probe` |
 | `BWA_BUILD_GODOT` | OFF | the Godot GDExtension (fetches godot-cpp — a multi-minute first build). `GODOTCPP_TARGET` picks the library flavour (`editor` default); `tools/godot/pack.ps1` builds both shippable ones. See `bindings/godot/README.md` |
 | `BWA_ASAN` | OFF | builds `test_sound` with AddressSanitizer (MSVC; needs tests ON) |
-| `BWA_TRACY` | OFF | Tracy profiler instrumentation (fetches Tracy; collects only while a profiler is attached) |
+| `BWA_TRACY` | OFF | Tracy profiler instrumentation (fetches Tracy; collects only while a profiler is attached). See [profiling.md](./profiling.md) |
+| `BWA_BUILD_BENCH` | OFF | the profiling benches (`bwa_profile_bench` + `bwa_bench_situations`). See [profiling.md](./profiling.md) |
 
 Steam Audio has no option: CMake auto-enables it when the built phonon SDK sits at
 `third_party/steam-audio-artifacts/` (see `third_party/README.md`).

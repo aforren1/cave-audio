@@ -8,6 +8,7 @@
 
 #include "sink.h"          /* BWA_CHANNELS */
 
+#include <math.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -75,5 +76,39 @@ bool layout_load(const char* path, uint32_t sample_rate, Layout* out, char* err,
 
 /* (Re)compute `ref` from the speaker positions — for callers that build a Layout by hand. */
 void layout_compute_ref(Layout* L);
+
+/* The distance-attenuation formula with arbitrary parameters — the layout curve, the per-source
+ * override, and loudness comp's tracker all share it: clamp((ref/max(d,ref))^rolloff, min, 1).
+ * ref <= 0 = attenuation off (1 everywhere); rolloff 0 = constant 1 (the formula's own limit). The
+ * per-block gain solve (dbap/spcap/vbap + rt.c) all call this — one source of truth for the curve. */
+static inline float atten_curve(float d, float ref, float rolloff, float min_lin) {
+    if (ref <= 0.f) return 1.f;
+    float dd = d > ref ? d : ref;
+    float a = powf(ref / dd, rolloff);
+    if (a < min_lin) a = min_lin;
+    return a > 1.f ? 1.f : a;
+}
+
+/* Unit direction from `from` to `to` (out = normalize(to - from)); degenerate (|to-from| <= 1e-6)
+ * falls back to (0,0,1). Reciprocal-multiply, 1e-6 guard: shared by the sites whose per-speaker
+ * normalization is op-for-op this (vbap.c, epad.c). Sites with a DIFFERENT degenerate fallback or a
+ * division form (spcap 0,0,0; allrad 1,0,0; steam_decode 0,0,-1 + division; rt.c's fused permute)
+ * keep their own inline — merging would change their numerics. */
+static inline void unit_dir(const float from[3], const float to[3], float out[3]) {
+    float dx = to[0] - from[0], dy = to[1] - from[1], dz = to[2] - from[2];
+    float len = sqrtf(dx * dx + dy * dy + dz * dz);
+    if (len > 1e-6f) { float inv = 1.f / len; out[0] = dx * inv; out[1] = dy * inv; out[2] = dz * inv; }
+    else             { out[0] = 0.f; out[1] = 0.f; out[2] = 1.f; }
+}
+
+/* Panner cache-invalidation predicate shared by spcap.c and vbap.c: stale when never built, the
+ * layout generation changed, or the listener moved more than 1e-4 m on any axis. */
+static inline int panner_cache_stale(int valid, uint32_t cached_gen, const float cached_lis[3],
+                                     uint32_t gen, const float lis[3]) {
+    return !valid || cached_gen != gen ||
+           fabsf(cached_lis[0] - lis[0]) > 1e-4f ||
+           fabsf(cached_lis[1] - lis[1]) > 1e-4f ||
+           fabsf(cached_lis[2] - lis[2]) > 1e-4f;
+}
 
 #endif /* BWA_LAYOUT_H */

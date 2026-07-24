@@ -1,6 +1,6 @@
 /* measure.c — see measure.h. Exponential sine sweep + regularized deconvolution. Pure DSP. */
 #include "measure.h"
-#include "fft.h"                                   /* shared radix-2 fft() + next_pow2() */
+#include "fft.h"                                   /* shared radix-2 fft() (+ bwa_pow2_ge via bits.h) */
 
 #include <math.h>
 #include <stdlib.h>
@@ -43,7 +43,7 @@ static float band_mean(const double* hre, const double* him, int L, double fs, d
 static int deconvolve(const float* capture, int ncap, const float* ref, int nref,
                       double f1, double f2, double fs, const double band_hz[2],
                       float* level, float band[3], float** ir_out) {
-    const int L = next_pow2(ncap + nref);
+    const int L = (int)bwa_pow2_ge((uint32_t)(ncap + nref));
     double* cre = (double*)calloc((size_t)L, sizeof(double));   /* Capture -> H -> h (reused) */
     double* cim = (double*)calloc((size_t)L, sizeof(double));
     double* rre = (double*)calloc((size_t)L, sizeof(double));   /* Reference (kept for |Ref|^2) */

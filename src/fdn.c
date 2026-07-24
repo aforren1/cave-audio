@@ -16,6 +16,7 @@
 #include "allrad.h"
 #include "epad.h"
 #include "ambisonics.h"
+#include "bits.h"          /* bwa_pow2_ge */
 
 #include <math.h>
 #include <stdatomic.h>     /* wet gain: control thread writes it live, the tap reads it (like steam_reflect) */
@@ -51,11 +52,7 @@ struct Fdn {
     float    gain_cur;            /* per-block ramp state (audio-thread-only) */
 };
 
-static void fib16(int i, float d[3]) {          /* same Fibonacci construction as allrad.c */
-    float y = 1.f - 2.f * ((float)i + 0.5f) / (float)FDN_N;
-    float r = sqrtf(fmaxf(0.f, 1.f - y * y)), th = (float)i * 2.39996323f;
-    d[0] = r * cosf(th); d[1] = y; d[2] = r * sinf(th);
-}
+/* Line directions use the shared fib_sphere_dir (ambisonics.h) — same float construction as allrad.c. */
 
 /* re-derive every line's band gains from (rt_low, rt_high) x the direction scale:
  * g = 10^(-3 * len / (rt60_eff * fs)), the standard FDN loss for a target decay. */
@@ -79,7 +76,7 @@ Fdn* fdn_create(const Layout* L, uint32_t sample_rate, uint32_t channels, int be
     for (int l = 0; l < FDN_N; ++l) {
         uint32_t len = (uint32_t)(fdn_ms[l] * 1e-3f * (float)sample_rate) | 1u;   /* odd */
         f->len[l] = len;
-        uint32_t rl = 1; while (rl < len + 1) rl <<= 1;
+        uint32_t rl = bwa_pow2_ge(len + 1);
         f->rlen[l] = rl; f->rmask[l] = rl - 1;
         total += rl;
     }
@@ -97,24 +94,12 @@ Fdn* fdn_create(const Layout* L, uint32_t sample_rate, uint32_t channels, int be
     int built = 0;
     if (bed_decoder == 2) built = epad_build_decode(L, dec);
     if (!built)           built = allrad_build_decode(L, dec);
-    if (!built) {
-        for (uint32_t s = 0; s < L->count; ++s) {               /* sampling decode: (2l+1)*Y/N per row */
-            float p[3] = { L->speakers[s].pos[0] - L->ref[0], L->speakers[s].pos[1] - L->ref[1],
-                           L->speakers[s].pos[2] - L->ref[2] };
-            float pl = sqrtf(p[0]*p[0] + p[1]*p[1] + p[2]*p[2]);
-            float ad[3] = { pl > 1e-6f ? p[2]/pl : 1.f, pl > 1e-6f ? p[0]/pl : 0.f, pl > 1e-6f ? p[1]/pl : 0.f };
-            float y[BWA_AMBI_CH]; ambi_encode_sn3d(ad, y);
-            for (int k = 0; k < BWA_AMBI_CH; ++k) {
-                int ll = (int)floorf(sqrtf((float)k));
-                dec[s][k] = (float)(2*ll + 1) * y[k] / (float)L->count;
-            }
-        }
-    }
+    if (!built) ambi_sad_decode(L, L->count, dec);              /* shared sampling decode (degenerate-array fallback) */
     float rw[BWA_AMBI_CH];
     ambi_max_re_weights(BWA_AMBI_ORDER, rw);                    /* the lines encode at full order */
     for (int l = 0; l < FDN_N; ++l) {
-        fib16(l, f->dir[l]);
-        float ad[3] = { f->dir[l][2], f->dir[l][0], f->dir[l][1] };   /* room -> ambi (z,x,y) */
+        fib_sphere_dir(l, FDN_N, f->dir[l]);
+        float ad[3]; room_to_ambi(f->dir[l], ad);                     /* room -> ambi (z,x,y) */
         float y[BWA_AMBI_CH]; ambi_encode_sn3d(ad, y);
         for (uint32_t s = 0; s < channels; ++s) {
             float acc = 0.f, acr = 0.f;

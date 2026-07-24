@@ -16,6 +16,11 @@ What only the rig can prove:
   both produce a confident *wrong* direction if they are wrong),
 - the **by-ear checks** (HRTF quality, the A/B/X knob bake-off, room EQ on the array).
 
+Of these, **live Motive** (Stage 3) and the **by-ear HRTF check** (Stage 5) are the last two open
+engine milestones — every other subsystem is implemented and tested off-hardware. Clearing both
+here closes the engine work; the remaining unbuilt piece is the Unreal binding, a control client
+rather than engine work ([integration.md](./integration.md)).
+
 ## Before you go
 
 - [ ] **Build**: RelWithDebInfo with `-DBWA_BUILD_PLAYGROUND=ON -DBWA_BUILD_CALIBVIEW=ON
@@ -50,7 +55,7 @@ What only the rig can prove:
       command 1510), a rigid body on the tracked head; note its **streaming ID** and name.
       Ground-plane calibrate with the origin at the **working-area centre, on the floor**:
       that *is* the engine's room frame (right-handed, metres, +y up, +z forward), so poses
-      pass through unchanged.
+      pass through unchanged. Full seam: [integration.md](./integration.md) → "Coordinate seam".
 
 ## Stage 0: device bring-up (no engine)
 
@@ -93,8 +98,8 @@ replaces them with acoustically surveyed ones.
 bwa_layout_tool cave_layout.json
 ```
 
-- [ ] Enter each speaker's measured position (room frame: metres, +y up, +z forward,
-      origin on the floor at the working-area centre; the same frame Motive streams in).
+- [ ] Enter each speaker's measured position in the **room frame** — metres, floor origin at
+      the working-area centre, the frame Motive streams in (axes as in the Motive prep above).
 - [ ] Walk the test signal across every channel (the tool drives `bwa_set_test_signal`, a
       raw post-align tone on one output; no panner involved). For each channel, confirm by
       ear it's the intended box; fix the channel map in the tool, not by re-patching Dante.
@@ -136,7 +141,8 @@ Then the real sequence:
 
 ### Zylia ZM-1 (if present)
 
-Two things no off-hardware test can catch; resolve both on the rig:
+Channel order and azimuth reference are the two things no off-hardware test can catch (why:
+[calibration.md](./calibration.md) → "The capsule self-survey"). Resolve both on the rig:
 
 - [ ] **Channel order**: `bwa_zylia_probe` (`--list` to find the driver). Tap each capsule,
       watch its channel jump. A device exposing < 19 inputs is refused for DOA.
@@ -154,9 +160,8 @@ Two things no off-hardware test can catch; resolve both on the rig:
       reason to bother with the stand. See [validation.md](validation.md).
 
 **Do this before Stage 4b, not after.** Everything downstream reads the capsule table, so an
-unsurveyed or wrongly-oriented ZM-1 produces precise, confident, systematically wrong
-directions for a whole session. It is the one prerequisite that silently invalidates
-everything rather than failing.
+unsurveyed or wrongly-oriented ZM-1 silently invalidates the whole session rather than failing
+loudly.
 
 `--zylia` sweeps need the ZM-1 on Dante (one ASIO device for outs + capsules); see
 [calibration.md](./calibration.md), "Getting the ZM-1 onto Dante".
@@ -207,7 +212,8 @@ tracker connected.
       position smoothly (DBAP re-solves per frame from the tracked pose).
 - [ ] **Motion-to-ears latency → pose prediction**: estimate the lag (move the head
       side-to-side, listen for the image trailing; 20–40 ms is typical for the
-      solve+network+block+DAC chain), then `bwa_set_pose_prediction(e, measured_ms)`.
+      solve+network+block+DAC chain), then `bwa_set_pose_prediction` with the
+      measured lead in **seconds** (0.02–0.04).
       Start at the measured value: too much lead overshoots on direction changes.
 - [ ] **`both` profile**: array + headphone monitor concurrently, same build, and the
       monitor's image agrees with the array's.

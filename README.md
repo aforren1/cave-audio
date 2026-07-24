@@ -209,8 +209,8 @@ bwa_commit(e);
 | [`docs/build.md`](./docs/build.md) | platform, dependencies, licensing, Dante config |
 
 Contributor-facing notes live in [`docs/internal-types.md`](./docs/internal-types.md),
-[`docs/roadmap.md`](./docs/roadmap.md), [`docs/profiling.md`](./docs/profiling.md), and
-`CLAUDE.md` (agent working notes, not user documentation).
+[`docs/profiling.md`](./docs/profiling.md), and `CLAUDE.md` (agent working notes, not
+user documentation).
 
 ## Tools
 

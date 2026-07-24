@@ -42,10 +42,7 @@ static void recompute(SpcapState* s, const float lis[3], const Layout* L, uint32
 void spcap_gains(SpcapState* s, const float src[3], const float lis[3], const Layout* L,
                  uint32_t gen, float user_gain, float* out) {
     const uint32_t N = L->count;
-    if (!s->valid || s->cached_gen != gen ||                  /* layout changed */
-        fabsf(s->cached_lis[0] - lis[0]) > 1e-4f ||           /* or the listener moved */
-        fabsf(s->cached_lis[1] - lis[1]) > 1e-4f ||
-        fabsf(s->cached_lis[2] - lis[2]) > 1e-4f)
+    if (panner_cache_stale(s->valid, s->cached_gen, s->cached_lis, gen, lis))   /* layout changed or listener moved */
         recompute(s, lis, L, gen);
 
     /* source bearing from the listener */
@@ -64,13 +61,7 @@ void spcap_gains(SpcapState* s, const float src[3], const float lis[3], const La
     }
     float invs = (sumr > 0.f) ? 1.f / sumr : 0.f;            /* g_i^2 = raw_i / sum -> constant power */
 
-    float atten = 1.f;                                       /* source->listener distance attenuation (as DBAP) */
-    if (L->atten_ref_m > 0.f) {
-        float d = (ds > L->atten_ref_m) ? ds : L->atten_ref_m;
-        atten = powf(L->atten_ref_m / d, L->atten_rolloff);
-        if (atten < L->atten_min_lin) atten = L->atten_min_lin;
-        if (atten > 1.f) atten = 1.f;
-    }
+    float atten = atten_curve(ds, L->atten_ref_m, L->atten_rolloff, L->atten_min_lin);   /* source->listener (as DBAP) */
 
     float g0 = user_gain * atten;
     for (uint32_t k = 0; k < N; ++k) out[k] = g0 * sqrtf(out[k] * invs);

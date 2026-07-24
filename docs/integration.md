@@ -51,7 +51,7 @@ See its [README](../bindings/unity/README.md) for install + plugin staging.
 
 Four core pieces:
 
-- **`Bwa`**: the P/Invoke layer, verified 1:1 against the ABI.
+- **`Bwa`**: the P/Invoke layer, verified against the ABI (the Binding section below names the two calls it skips).
 - **`Room`**: the coordinate seam.
 - **`Engine`**: the singleton manager + centralized per-frame push.
 - **`Emitter`**: the per-source component.
@@ -123,8 +123,9 @@ internal static class Bwa {
 }
 ```
 
-The snippet shows the core calls. The shipped `Bwa.cs` binds the ABI **1:1**. Every
-`BWA_API` function in `bw_audio.h` has an entry point. Beyond the core:
+The snippet shows the core calls. The shipped `Bwa.cs` binds every `BWA_API` function in
+`bw_audio.h` except two Unity never uses — `bwa_set_output_capture` (an audio-thread callback) and
+`bwa_render_block` (the manual-sink golden-render path). Beyond the core:
 
 - **Voice management + scheduling**: `bwa_source_set_priority`;
   `bwa_source_play_at` + `bwa_get_dsp_time` (sample-accurate start),
@@ -140,41 +141,53 @@ The snippet shows the core calls. The shipped `Bwa.cs` binds the ABI **1:1**. Ev
   groups (`bwa_source_set_group` + `bwa_group_set_gain` / `bwa_group_set_paused`).
 - **Propagation effects**: `bwa_source_set_doppler`, `bwa_source_set_air_absorption`,
   `bwa_source_set_loudness_comp`, `bwa_source_set_spread`, `bwa_source_set_size`
-  (metric radius).
+  (metric radius), `bwa_source_set_extent` (`Emitter.Extent` — anisotropic
+  width/height), and `bwa_source_set_attenuation_override`
+  (`Emitter.SetAttenuationOverride` — per-source distance curve; `ref <= 0` clears).
 - **Occlusion + directivity**: `bwa_source_set_occlusion` /
   `bwa_source_get_occlusion`, `bwa_source_set_occlusion_manual` (game-driven
   occlusion; **works without the Steam Audio build**),
   `bwa_source_set_directivity` (+ preset), `bwa_source_set_orientation`.
-- **Reflections + pathing**: `bwa_reflections_config`, `bwa_reverb_set_gain`,
+- **Reflections + pathing**: `bwa_reflections_config`, `bwa_set_reverb_gain`,
   `bwa_source_set_reverb` / `_reverb_send` / `_reverb_distance`,
   `bwa_source_set_pathing` (engine-level enable rides `bwa_desc.enable_pathing`);
   the phonon-free **FDN reverb** (`bwa_fdn_config`).
 - **Ambisonic beds**: the full `bwa_bed_*` facade (`create` / `play` / `set_gain` /
-  `set_rotation` / `stop` / `destroy`), plus the bed-named forms of the per-voice
-  calls (`fade_to` / `fade_out` / `set_paused` / `seek` / `set_priority` /
-  `set_group` / `is_playing`).
+  `set_orientation` (yaw/pitch/roll) / `stop` / `destroy`), plus the bed-named forms
+  of the per-voice calls (`fade_to` / `fade_out` / `set_paused` / `seek` /
+  `set_priority` / `set_group` / `is_playing`).
 - **Materials / scene geometry**: `bwa_material_preset`, `bwa_material_define`,
   `bwa_scene_set_mesh_mat`, `bwa_scene_set_box`.
 - **Rendering A/B (live)**: `bwa_set_panner`, `bwa_set_dual_band`,
-  `bwa_set_spread_mode`, `bwa_set_decorrelation`, `bwa_set_near_spread`,
-  `bwa_set_bed_renderer`, `bwa_set_tracked_room_eq` (the bed *decoder* is
-  create-time: `bwa_desc.bed_decoder`). `Engine` re-pushes these from
-  `OnValidate`, so the inspector A/Bs them by ear in Play mode, which is what
-  the engine makes them atomic for.
+  `bwa_set_spread_mode`, `bwa_set_max_re` + `bwa_set_max_re_split`,
+  `bwa_set_decorrelation`, `bwa_set_near_spread`, `bwa_set_bed_renderer`,
+  `bwa_set_tracked_room_eq` (the bed *decoder* is create-time:
+  `bwa_desc.bed_decoder`). `Engine` re-pushes these from `OnValidate`, so the
+  inspector A/Bs them by ear in Play mode, which is what the engine makes them
+  atomic for.
 - **Listener**: `bwa_set_pose_prediction` (internal tracking only) and
   `bwa_set_extra_listeners`, the other occupants, pushed by `Engine` in the same
   frame block as the primary pose (they are commit-gated the same way).
 - **Output stage + diagnostics**: `bwa_set_limiter` / `bwa_set_limiter_ceiling`,
   `bwa_get_bus_levels`, `bwa_set_test_signal`, `bwa_get_speakers` / `bwa_get_channel_count`
   (the layout's speaker count; see "Channel count" above; size meter/speaker
-  arrays with it, never a hard-coded 26).
-- **Assets**: `bwa_load_sound_streaming`, `bwa_load_ambix`.
+  arrays with it, never a hard-coded 26); and the engine-free ASIO driver
+  enumeration `bwa_get_asio_driver_count` / `bwa_get_asio_driver_name`
+  (`Engine.AsioDriverCount` / `AsioDriverName` — static, for a driver picker
+  before `bwa_create`).
+- **Assets**: `bwa_load_sound_streaming`, `bwa_load_ambix`, and the metadata
+  readbacks `bwa_sound_get_frames` / `bwa_sound_get_channels`
+  (`Engine.SoundFrames` / `SoundChannels`).
 - **Procedural (push) sources**: `bwa_source_create_push`, `bwa_source_push`,
-  `bwa_source_push_space`, `bwa_source_push_end`. Push mono engine-rate floats
-  from the main thread (the binding's control thread); see api.md.
+  `bwa_source_push_space`, `bwa_source_push_end`, surfaced as the **`PushEmitter`**
+  component — a positional source you feed mono engine-rate floats instead of a
+  clip (a synth, an engine model, a voice stream). It rides `Engine`'s centralized
+  push like `Emitter`, but the engine refuses play/seek/pitch/queue on a push
+  voice, so those aren't exposed. Feed from the main thread (the binding's control
+  thread); see api.md.
 
 Two seams a binding must not get wrong, both handled in `Room` (see below):
-`bwa_bed_set_rotation` takes a **room-frame** yaw, and the X mirror **reverses the
+`bwa_bed_set_orientation` takes a **room-frame** yaw, and the X mirror **reverses the
 sense of rotation**—pass a Unity euler angle straight in and the soundfield
 spins the wrong way (`Room.YawRad` converts). The FDN's decay direction is a
 **direction**, so it goes through `Room.Dir` (no registration translation), not
@@ -198,7 +211,7 @@ public static class Room {
         q = UnityToRoom.rotation * q;
         return new Quaternion(q.x, -q.y, -q.z, q.w);           // both frames face +Z: identity -> identity
     }
-    public static float YawRad(float unityYawDegrees) {        // for bwa_bed_set_rotation
+    public static float YawRad(float unityYawDegrees) {        // for bwa_bed_set_orientation
         Vector3 ahead = Rot(Quaternion.Euler(0f, unityYawDegrees, 0f)) * Vector3.forward;
         return Mathf.Atan2(ahead.x, ahead.z);                  // RH yaw about +Y - the mirror flips the sense
     }
@@ -331,7 +344,7 @@ The seam is **simpler than Unity's, and Unity's advice must not be carried over*
   `godot_room` ctest). This applies to *facings only* — listener pose, directivity axes.
   Mesh/instance transforms take registration alone; routing them through the facing helper
   spins every occluder 180° about Y.
-- `bwa_bed_set_rotation`'s **sense of rotation is preserved** — no mirror means no
+- `bwa_bed_set_orientation`'s **sense of rotation is preserved** — no mirror means no
   reversal, where the Unity binding must flip it.
 
 Godot has no `LateUpdate`, so the centralized per-frame push rides `process_priority`

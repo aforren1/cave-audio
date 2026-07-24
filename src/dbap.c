@@ -46,13 +46,7 @@ void dbap_gains(const float src[3], const float lis[3], const Layout* L,
 
     float scale = (norm2 > 0.f) ? 1.f / sqrtf(norm2) : 0.f;   /* constant power */
 
-    float atten = 1.f;                                   /* source->listener distance attenuation */
-    if (L->atten_ref_m > 0.f) {
-        float d = (ds > L->atten_ref_m) ? ds : L->atten_ref_m;
-        atten = powf(L->atten_ref_m / d, L->atten_rolloff);
-        if (atten < L->atten_min_lin) atten = L->atten_min_lin;
-        if (atten > 1.f) atten = 1.f;
-    }
+    float atten = atten_curve(ds, L->atten_ref_m, L->atten_rolloff, L->atten_min_lin);   /* source->listener distance attenuation */
 
     float s = user_gain * atten * scale;
     for (uint32_t k = 0; k < N; ++k) out[k] *= s;

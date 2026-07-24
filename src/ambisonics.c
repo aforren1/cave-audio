@@ -30,6 +30,30 @@ void ambi_encode_sn3d(const float dir[3], float y[BWA_AMBI_CH]) {
     y[15] = 0.7905694f * x * (x * x - 3.0f * yy * yy);       /*      m=+3    */
 }
 
+/* Sampling (projection) SH->speaker decode over a layout (see ambisonics.h). Room convention: ambi
+ * front = room +z, left = room +x, up = room +y (via room_to_ambi). Directions are from the array
+ * centroid (L->ref), not the origin (which canonically sits on the floor). Byte-identical to the
+ * former rt.c build_bed_decode_sad — the divisions and the (2l+1)*y*invL order are preserved. */
+void ambi_sad_decode(const Layout* L, uint32_t count, float dec[BWA_CHANNELS][BWA_AMBI_CH]) {
+    const float invL = 1.0f / (float)count;
+    for (uint32_t s = 0; s < count; ++s) {
+        float p[3] = { L->speakers[s].pos[0] - L->ref[0],
+                       L->speakers[s].pos[1] - L->ref[1],
+                       L->speakers[s].pos[2] - L->ref[2] };
+        float len = sqrtf(p[0]*p[0] + p[1]*p[1] + p[2]*p[2]);
+        float dr[3];
+        if (len < 1e-6f) { dr[0] = 0.f; dr[1] = 0.f; dr[2] = 1.f; }            /* degenerate: face room front */
+        else { dr[0] = p[0]/len; dr[1] = p[1]/len; dr[2] = p[2]/len; }
+        float ad[3]; room_to_ambi(dr, ad);                                     /* (z,x,y): ambi front=+z */
+        float y[BWA_AMBI_CH];
+        ambi_encode_sn3d(ad, y);
+        for (int k = 0; k < BWA_AMBI_CH; ++k) {
+            int l = (int)floorf(sqrtf((float)k));                              /* ACN order of channel k */
+            dec[s][k] = (float)(2*l + 1) * y[k] * invL;
+        }
+    }
+}
+
 /* max-rE weights: w_l = P_l(r) with r the largest zero of P_{order+1}, energy-renormalized (header).
  * The roots are exact: P_2 -> 1/sqrt(3), P_3 -> sqrt(3/5), P_4 -> sqrt((15 + 2*sqrt(30))/35). */
 void ambi_max_re_weights(int order, float w[BWA_AMBI_CH]) {

@@ -7,6 +7,7 @@
  */
 #include "align.h"
 #include "biquad.h"       /* shared RBJ cookbook (also used by rt.c's transmission/pathing EQ) */
+#include "bits.h"         /* bwa_pow2_ge */
 
 #include <math.h>
 #include <stdlib.h>
@@ -51,14 +52,12 @@ struct Aligner {
                               * enough to track a walking listener, far too slow to zipper (the cuts
                               * live below 200 Hz, where a 0.13 dB/block step at 256/48k is inaudible) */
 
-static uint32_t pow2_ge(uint32_t x) { uint32_t p = 1; while (p < x) p <<= 1; return p; }
-
 Aligner* align_create(uint32_t channels, const Layout* L, uint32_t sample_rate) {
     if (channels == 0 || channels > BWA_CHANNELS || !L || sample_rate == 0) return NULL;
     Aligner* a = (Aligner*)calloc(1, sizeof *a);
     if (!a) return NULL;
     a->channels = channels;
-    a->len  = pow2_ge(L->max_delay_samples + 1);   /* +1 so delay==max still has a slot */
+    a->len  = bwa_pow2_ge(L->max_delay_samples + 1);   /* +1 so delay==max still has a slot */
     a->mask = a->len - 1;
     a->w    = 0;
     for (uint32_t k = 0; k < channels; ++k) {
@@ -95,7 +94,7 @@ Aligner* align_create(uint32_t channels, const Layout* L, uint32_t sample_rate) 
     a->buf = (float*)calloc((size_t)channels * a->len, sizeof(float));
     if (!a->buf) { free(a); return NULL; }
     if (a->any_eq) {                               /* only pay the memory + DSP if a filter exists */
-        a->eqlen  = pow2_ge(BWA_EQ_TAPS);
+        a->eqlen  = bwa_pow2_ge(BWA_EQ_TAPS);
         a->eqmask = a->eqlen - 1;
         a->eq     = (float*)calloc((size_t)channels * BWA_EQ_TAPS, sizeof(float));
         a->eqhist = (float*)calloc((size_t)channels * a->eqlen, sizeof(float));

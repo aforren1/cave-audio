@@ -138,7 +138,7 @@ public:
 	Transform3D get_listener_transform() const;
 	/* Other occupants, for multi-listener compromise panning (up to 3). Godot space. */
 	void set_extra_listeners(const PackedVector3Array &positions);
-	void set_pose_prediction(float lead_ms);
+	void set_pose_prediction(float lead_s);
 
 	/* --- tracker (OptiTrack / NatNet) --- */
 	int tracker_connect(const String &server, const String &rigid_body_name, int rigid_body_id);
@@ -186,7 +186,7 @@ public:
 	bool get_tracked_room_eq() const { return tracked_room_eq; }
 	void set_limiter(bool on);
 	bool get_limiter() const { return limiter; }
-	void set_limiter_ceiling(float db);
+	void set_limiter_ceiling(float linear);
 	float get_limiter_ceiling() const { return limiter_ceiling; }
 
 	/* --- materials + scene geometry --- */
@@ -299,7 +299,7 @@ private:
 	BedRenderer bed_renderer = BED_MATRIX;
 	bool tracked_room_eq = true;
 	bool limiter = true;
-	float limiter_ceiling = -1.0f;
+	float limiter_ceiling = 0.891251f;   /* -1 dBFS, linear */
 };
 
 } // namespace godot

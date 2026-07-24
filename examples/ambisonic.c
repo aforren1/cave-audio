@@ -4,8 +4,8 @@
  *
  *   bwa_load_ambix / bwa_load_fuma   load a 4/9/16-ch B-format asset (FuMa converts at load)
  *   bwa_bed_create / bwa_bed_play    a bed is a voice playing a multichannel asset
- *   bwa_bed_set_rotation             yaw the field (glided at ~1 turn/s, click-free)
- *   bwa_bed_set_orientation          full 3-axis: level or tilt a capture (pitch/roll)
+ *   bwa_bed_set_orientation          full 3-axis: yaw the field (glided at ~1 turn/s, click-free),
+ *                                    or level/tilt a capture (pitch/roll)
  *   bwa_set_bed_renderer             matrix decode vs parametric (DirAC) — live A/B
  *   bwa_set_max_re                   max-rE decode weighting — live A/B
  *
@@ -157,9 +157,9 @@ int main(void) {
     /* ---- the walkthrough ---- */
     run(e, 5, "1) matrix decode, world-locked: bursts FRONT, clicks LEFT-UP, a diffuse floor");
 
-    printf("2) yaw: spinning the whole field (bwa_bed_set_rotation glides, click-free)\n");
+    printf("2) yaw: spinning the whole field (bwa_bed_set_orientation yaw glides, click-free)\n");
     for (int t = 0; t < 8 * 60; ++t) {                 /* ~one slow turn over 8 s */
-        bwa_bed_set_rotation(e, bed, 0.8f * (float)t / 60.0f);
+        bwa_bed_set_orientation(e, bed, 0.8f * (float)t / 60.0f, 0.f, 0.f);
         bwa_commit(e); Sleep(16);
     }
 

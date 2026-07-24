@@ -103,7 +103,7 @@ static int run_profile(bwa_profile profile, const char* name) {
     bwa_bed bed = bwa_bed_create(e);
     if (bed == 0) { fprintf(stderr, "FAIL[%s]: bwa_bed_create returned 0\n", name); bwa_destroy(e); return 1; }
     bwa_bed_set_gain(e, bed, 0.5f);
-    bwa_bed_set_rotation(e, bed, 0.5f);
+    bwa_bed_set_orientation(e, bed, 0.5f, 0.f, 0.f);
     bwa_bed_set_priority(e, bed, 255);
     bwa_bed_set_group(e, bed, 1);
     bwa_bed_fade_to(e, bed, 0.2f, 0.1f);

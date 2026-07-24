@@ -152,7 +152,7 @@ room_quat = Quaternion(registration.basis * node.global_basis) * Quaternion(Vect
 
 Two consequences worth knowing, both places Unity's advice does *not* carry over:
 
-- `bwa_bed_set_rotation` takes a room-frame yaw, and because there is no mirror the
+- `bwa_bed_set_orientation` takes a room-frame yaw, and because there is no mirror the
   **sense of rotation is preserved**. Unity's binding has to reverse it; this one does not.
 - Positions need no axis flip at all. If a source ends up mirrored, the registration
   transform is wrong — not the handedness conversion.

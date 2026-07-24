@@ -79,20 +79,18 @@ everything sampled is ramped in, never slammed.
 
 ## Command type and ring
 
-Fixed-size POD slots, no framing. Twenty types (current list:
-[`rt.h`](../src/rt.h)):
+Fixed-size POD slots, no framing. The command `enum` is the authoritative
+list — it lives in [`rt.h`](../src/rt.h) and grows as features land. Most
+commands need no explanation here; the few that carry protocol do:
 
-```c
-enum {
-    /* core: */
-    CMD_SRC_CREATE = 0, CMD_SRC_DESTROY, CMD_SET_POS, CMD_SET_GAIN,
-    CMD_PLAY, CMD_STOP, CMD_SET_LISTENER, CMD_COMMIT, CMD_SOUND_RETIRE,
-    /* per-voice features + scheduling: */
-    CMD_SET_REFLECTIONS, CMD_TEST_SIGNAL, CMD_SET_DOPPLER, CMD_SET_AIR, CMD_SET_SPREAD,
-    CMD_SET_REFL_SEND, CMD_SET_REFL_DIST, CMD_SET_PATHING, CMD_SET_PAUSED, CMD_SEEK,
-    CMD_SRC_STEAL
-};
-```
+- `CMD_SRC_CREATE` — async activation of a handle the control thread already
+  allocated and returned (synchronous handle, async activation).
+- `CMD_SET_POS` / `CMD_SET_LISTENER` — write source position / listener pose to
+  *pending*; a later `CMD_COMMIT` promotes them.
+- `CMD_COMMIT` — promote pending → active. Defines frame coherence.
+- `CMD_SOUND_RETIRE` — the control thread asks to free a sound, the audio thread
+  acks once it has let go (the retire-ack handshake).
+- `CMD_SRC_STEAL` — fade a stolen voice out on its own slot, then free it.
 
 `Cmd` is `type` + `handle` + a union of small payload arms (see rt.h).
 Most arms are a handle plus a bool or a float. `play` carries
@@ -211,8 +209,8 @@ static Voice* voice_for(RtCore* c, uint32_t h) {
 }
 ```
 
-The drain itself is a 20-case switch (the rest is in rt.c). The cases that
-carry the protocol:
+The drain is one switch over every command type (the rest is in rt.c). The
+cases that carry the protocol:
 
 ```c
 static void drain_commands(RtCore* c) {

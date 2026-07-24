@@ -109,8 +109,8 @@ void BwaEngine::_ready() {
 
 	/* Replay everything authored in the inspector before the engine existed. */
 	bwa_set_master_gain(eng, master_gain);
-	bwa_reverb_set_gain(eng, reverb_gain);
-	bwa_early_reflections_set_gain(eng, er_gain);
+	bwa_set_reverb_gain(eng, reverb_gain);
+	bwa_set_early_reflections_gain(eng, er_gain);
 	bwa_set_panner(eng, (bwa_panner)panner);
 	bwa_set_dual_band(eng, dual_band);
 	bwa_set_spread_mode(eng, (bwa_spread_mode)spread_mode);
@@ -307,9 +307,9 @@ void BwaEngine::set_extra_listeners(const PackedVector3Array &positions) {
 	bwa_set_extra_listeners(eng, xyz, (uint32_t)n);
 }
 
-void BwaEngine::set_pose_prediction(float lead_ms) {
+void BwaEngine::set_pose_prediction(float lead_s) {
 	if (eng) {
-		bwa_set_pose_prediction(eng, lead_ms);
+		bwa_set_pose_prediction(eng, lead_s);
 	}
 }
 
@@ -449,14 +449,14 @@ void BwaEngine::group_set_paused(int group, bool p) {
 void BwaEngine::reverb_set_gain(float linear) {
 	reverb_gain = linear;
 	if (eng) {
-		bwa_reverb_set_gain(eng, linear);
+		bwa_set_reverb_gain(eng, linear);
 	}
 }
 
 void BwaEngine::early_reflections_set_gain(float linear) {
 	er_gain = linear;
 	if (eng) {
-		bwa_early_reflections_set_gain(eng, linear);
+		bwa_set_early_reflections_gain(eng, linear);
 	}
 }
 
@@ -817,7 +817,7 @@ void BwaEngine::_bind_methods() {
 	M(set_listener_pose, "position", "rotation");
 	M0(get_listener_transform);
 	M(set_extra_listeners, "positions");
-	M(set_pose_prediction, "lead_ms");
+	M(set_pose_prediction, "lead_s");
 
 	M(tracker_connect, "server", "rigid_body_name", "rigid_body_id");
 	M0(tracker_disconnect);
@@ -845,7 +845,7 @@ void BwaEngine::_bind_methods() {
 	M(set_bed_renderer, "renderer"); M0(get_bed_renderer);
 	M(set_tracked_room_eq, "on"); M0(get_tracked_room_eq);
 	M(set_limiter, "on"); M0(get_limiter);
-	M(set_limiter_ceiling, "ceiling_db"); M0(get_limiter_ceiling);
+	M(set_limiter_ceiling, "linear"); M0(get_limiter_ceiling);
 
 	M(material_preset, "preset");
 	M(material_define, "absorption", "scattering", "transmission");
@@ -920,7 +920,7 @@ void BwaEngine::_bind_methods() {
 	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "master_gain", PROPERTY_HINT_RANGE, "0,2,0.01"),
 			"set_master_gain", "get_master_gain");
 	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "limiter"), "set_limiter", "get_limiter");
-	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "limiter_ceiling", PROPERTY_HINT_RANGE, "-60,0,0.1"),
+	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "limiter_ceiling", PROPERTY_HINT_RANGE, "0,1,0.001"),
 			"set_limiter_ceiling", "get_limiter_ceiling");
 
 	ADD_GROUP("Reverb", "");

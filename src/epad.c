@@ -14,8 +14,7 @@
 #include <math.h>
 #include <string.h>
 
-/* room (+z fwd, +y up, -x right) -> ambisonic axes (x=front,y=left,z=up): (z,x,y) — matches build_bed_decode */
-static void room_to_ambi(const float d[3], float a[3]) { a[0] = d[2]; a[1] = d[0]; a[2] = d[1]; }
+/* room_to_ambi (z,x,y) + unit_dir come from ambisonics.h / layout.h (shared). */
 
 /* Cyclic Jacobi eigensolve of a symmetric n×n matrix in place: A -> diag(eigenvalues), V -> the
  * eigenvectors (columns). Classic textbook form, double precision; n = 16 converges in a few sweeps. */
@@ -66,13 +65,7 @@ int epad_build_decode(const Layout* L, float decode[BWA_CHANNELS][BWA_AMBI_CH]) 
     /* Y: N3D encode of the speaker directions from the layout's nominal listening point */
     double Y[BWA_AMBI_CH][BWA_CHANNELS];
     for (uint32_t s = 0; s < N; ++s) {
-        float p[3] = { L->speakers[s].pos[0] - L->ref[0],
-                       L->speakers[s].pos[1] - L->ref[1],
-                       L->speakers[s].pos[2] - L->ref[2] };
-        float len = sqrtf(p[0]*p[0] + p[1]*p[1] + p[2]*p[2]);
-        float d[3];
-        if (len < 1e-6f) { d[0] = 0.f; d[1] = 0.f; d[2] = 1.f; }             /* degenerate: face front */
-        else { float inv = 1.f/len; d[0] = p[0]*inv; d[1] = p[1]*inv; d[2] = p[2]*inv; }
+        float d[3]; unit_dir(L->ref, L->speakers[s].pos, d);                 /* degenerate: face front (0,0,1) */
         float a3[3]; room_to_ambi(d, a3);
         float y[BWA_AMBI_CH]; ambi_encode_sn3d(a3, y);
         for (int k = 0; k < BWA_AMBI_CH; ++k) Y[k][s] = (double)y[k] * n3d[k];
