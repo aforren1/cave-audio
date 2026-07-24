@@ -401,9 +401,17 @@ recovered direction lands within 2° of truth and `zylia/sim_survey` drives the 
 recovers the built-in table back (which only holds if the UI fed it the right positions, arrivals AND channel
 order). **Dante is the unlock for the sweep path**: the ZM-1 can join the Dante network via Dante Via, so the Digiface
 presents its 19 capsules as INPUTS ON THE SAME ASIO DEVICE as the 26 outputs — one driver, one clock domain,
-which dissolves the two-device problem that blocks `--zylia` on hardware (and makes latency measurable, so
-DISTANCE becomes real). `zylia_survey` is capture-agnostic: it takes (source position, 19 arrival times) and
-does not care whether they came from a clap's cross-correlation or a sweep's deconvolved IR peak. See
+which dissolved the two-device problem that used to block `--zylia` on hardware (and makes latency measurable,
+so DISTANCE becomes real). The sweep path is WIRED on that basis: `calib_capture` grew
+`calib_asio_open_multi` (N outs + `nin` lockstep inputs; the omni modes are `nin = 1`), and `calibrate
+--zylia` sweeps each speaker, deconvolves all 19 capsules, and feeds `zylia_localize` — with `--survey`
+(room-axes; body-frame refused, no tracker here) pinning channel order + orientation, and the distance
+latency from `--latency` (loopback) or `--ref <spk> <m>` (ONE tape-measured distance solves it from that
+speaker's mean arrival, wavefront-tilt corrected; sim check: recovers an injected 3.5 m to ~1 mm). No
+latency given → directions print, writeback refused (distances would carry the full system latency
+radially). Like the omni sweep shell, the capture is rig bring-up code — unverified on hardware.
+`zylia_survey` is capture-agnostic: it takes (source position, 19 arrival times) and does not care
+whether they came from a clap's cross-correlation or a sweep's deconvolved IR peak. See
 docs/calibration.md.
 
 **`bwa_calib_view`** (opt-in `-DBWA_BUILD_CALIBVIEW=ON`) is the **calibration station** (imgui +

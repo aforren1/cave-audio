@@ -21,6 +21,25 @@ engine milestones — every other subsystem is implemented and tested off-hardwa
 here closes the engine work; the remaining unbuilt piece is the Unreal binding, a control client
 rather than engine work ([integration.md](./integration.md)).
 
+## First day, speakers anywhere
+
+The stages below assume the install. They do not require it: nothing in the engine cares where
+the speakers stand, only that the layout says where they actually are. For a bring-up day with
+the boxes wherever they fit, run the same list with three adjustments:
+
+- Stage 1 positions can be rough. Eyeballed is fine; honest is the requirement. The channel
+  walk matters as much as ever.
+- With the ZM-1 on Dante, real positions come from one placement: capsule survey first, then
+  the `--zylia` run (both in Stage 2) writes every speaker position, wherever the boxes ended
+  up. Do not move or rotate the ZM-1 between survey and sweep; a room-axes survey is pinned
+  to that mounting.
+- Skip trims, `--eq` and `--room`. They are properties of the final geometry and get redone
+  at the install.
+
+What such a day proves for good: Stage 0, the capture path's first contact, and Stage 3, which
+needs no audio device at all. Everything from the Stage 1 walk onward is simply repeated when
+the speakers land in their real places, and by then every tool has been run once.
+
 ## Before you go
 
 - [ ] **Build**: RelWithDebInfo with `-DBWA_BUILD_PLAYGROUND=ON -DBWA_BUILD_CALIBVIEW=ON
@@ -123,7 +142,9 @@ Then the real sequence:
 
 - [ ] **Positions**: `bwa_calibrate --localize positions.txt`. Capture at ≥ 5 known,
       non-coplanar mic positions (put an OptiTrack marker on the mic and let Motive hand
-      you the positions). Cross-check the recovered positions against the drawings.
+      you the positions). Cross-check the recovered positions against the drawings. (With
+      the ZM-1 surveyed and on Dante, `--zylia` does this from ONE placement — see the
+      Zylia section below.)
 - [ ] **Latency residual sane**: the localize run prints the solved system latency next
       to the driver's own digital loop (`ASIOGetLatencies`, logged at capture open). The
       residual (DAC/ADC + analog) must be a *small positive* number: negative is
@@ -158,6 +179,14 @@ Channel order and azimuth reference are the two things no off-hardware test can 
       result into the mount's frame, and save it with the probed offset. Then the survey is
       good for every placement afterwards and a remount costs nothing—which is the whole
       reason to bother with the stand. See [validation.md](validation.md).
+- [ ] **One-placement position survey** (the ZM-1 alternative to `--localize`): with the survey
+      installed and the ZM-1 on Dante, `bwa_calibrate --zylia --survey s.json --input <first>
+      --mic x y z --ref <spk> <m>` sweeps the array once and writes every speaker position from
+      this single placement — no mic moves, and it doesn't matter where the speakers are, only
+      where they turn out to be. `--ref` is one tape-measured centre→speaker distance (it
+      calibrates the system latency; a loopback-measured `--latency <m>` also works). Without
+      either, directions print and the writeback is refused. (calibrate needs a ROOM-AXES
+      survey — it has no tracker to re-aim a body-frame one.)
 
 **Do this before Stage 4b, not after.** Everything downstream reads the capsule table, so an
 unsurveyed or wrongly-oriented ZM-1 silently invalidates the whole session rather than failing

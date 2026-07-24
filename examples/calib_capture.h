@@ -1,11 +1,13 @@
 /*
  * calib_capture.h — the speaker-sweep capture backends, shared by bwa_calibrate (CLI) and
  * bwa_calib_view's Capture tab (the calibration-station front-end). Two backends behind one shape:
- * ASIO full-duplex (one output per speaker + one mic input, sample-aligned; rig bring-up code,
- * gated on BWA_HAVE_ASIO) and simulate (delay/attenuate the sweep per the layout's speaker->mic
- * distances + a deterministic sensitivity wobble, so the whole measure -> solve -> writeback path
- * runs without the rig). The speaker count is the LAYOUT's (Layout.count, 4..BWA_CHANNELS) — never
- * assume 26. The measurement/solve DSP these feed lives in measure.c / calib.c (unit-tested).
+ * ASIO full-duplex (one output per speaker + 1..CAL_MAX_INPUTS lockstep inputs, sample-aligned;
+ * rig bring-up code, gated on BWA_HAVE_ASIO) and simulate (delay/attenuate the sweep per the
+ * layout's speaker->mic distances + a deterministic sensitivity wobble, so the whole measure ->
+ * solve -> writeback path runs without the rig). One input is the omni-mic survey; 19 is the ZM-1
+ * over Dante Via (--zylia), whose capsules ride consecutive inputs on the SAME device as the
+ * outputs. The speaker count is the LAYOUT's (Layout.count, 4..BWA_CHANNELS) — never assume 26.
+ * The measurement/solve DSP these feed lives in measure.c / calib.c (unit-tested).
  */
 #ifndef BWA_CALIB_CAPTURE_H
 #define BWA_CALIB_CAPTURE_H
@@ -28,6 +30,7 @@ extern "C" {
 #define CAL_IRLEN   24000                /* 0.5 s room kernel retained per speaker */
 #define CAL_BAND_LO 300.0                /* sensitivity band for the level measure */
 #define CAL_BAND_HI 3000.0
+#define CAL_MAX_INPUTS 19                /* input ceiling per capture — sized for the ZM-1's capsules */
 
 /* simulate backend: synthesize what an ideal rig would capture for speaker `ch` (fractional
  * time-of-flight + 1/r + a deterministic +/-~1.4 dB sensitivity wobble). cap = CAL_CAPLEN floats. */
@@ -49,6 +52,11 @@ int calib_asio_list(void);                                  /* print them to std
  * (blocking, ~10 s watchdog; returns 0 on timeout). Single instance.
  * NOT verified on hardware here — rig bring-up code (mirrors asio_sink.cpp's host sequence). */
 int  calib_asio_open(const char* driver, int mic_in, int nspk, const float* sweep, float* cap);
+/* Same shell, `nin` consecutive inputs starting at `in_first` (1..CAL_MAX_INPUTS; open() is the
+ * nin = 1 case). All inputs record in lockstep — one clock domain, which the ZM-1-over-Dante
+ * route guarantees. `cap` is [nin][CAL_CAPLEN] flat; calib_asio_capture(ch) fills every row. */
+int  calib_asio_open_multi(const char* driver, int in_first, int nin, int nspk,
+                           const float* sweep, float* cap);
 int  calib_asio_capture(int ch);
 void calib_asio_close(void);
 /* Driver-reported latencies from the LAST calib_asio_open (valid until the next open — they

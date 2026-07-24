@@ -10,9 +10,10 @@
  *   calibrate --simulate                     # no hardware: synthesize captures from the layout geometry
  *
  * Two capture backends (extracted to calib_capture.cpp, shared with bwa_calib_view's Capture tab):
- *   - ASIO full-duplex (gated on BWA_HAVE_ASIO): 26 outputs + one mic input, sample-aligned. Built when
- *     the ASIO SDK is vendored. NOT verified on hardware here — treat as rig bring-up code (it mirrors
- *     asio_sink.cpp's host: load -> ASIOInit -> ASIOGetChannels -> create in+out buffers -> Start).
+ *   - ASIO full-duplex (gated on BWA_HAVE_ASIO): 26 outputs + one mic input, sample-aligned — or, with
+ *     --zylia, the ZM-1's 19 capsule inputs on the same device (Dante Via; docs/calibration.md). Built
+ *     when the ASIO SDK is vendored. NOT verified on hardware here — treat as rig bring-up code (it
+ *     mirrors asio_sink.cpp's host: load -> ASIOInit -> ASIOGetChannels -> create in+out buffers -> Start).
  *   - simulate: delays/attenuates the sweep per the layout's speaker->mic distances (+ a deterministic
  *     sensitivity wobble) so the whole measure -> solve -> writeback path runs without the rig.
  *
@@ -61,6 +62,8 @@ int main(int argc, char** argv) {
     float mic[3] = { 0.f, 0.f, 0.f };
     int   mic_in = 0, simulate = 0, room = 0, check = 0, live_speaker = -1, eq = 0, room_eq = 0, rq_grid = 0, zylia = 0;
     double known_latency = -1.0;
+    int    ref_spk = -1; double ref_dist = 0.0;               /* --ref: one tape-measured distance -> latency */
+    const char* survey_path = NULL;                           /* --survey: pinned ZM-1 channel order + orientation */
     const char* ir_prefix = NULL;
     const char* localize_file = NULL;
     for (int i = 1; i < argc; ++i) {
@@ -75,15 +78,22 @@ int main(int argc, char** argv) {
         else if (!strcmp(argv[i],"--localize") && i+1<argc) localize_file = argv[++i]; /* mic-positions file -> solve speaker positions */
         else if (!strcmp(argv[i],"--check"))              check       = 1;   /* flag speakers nudged from the stored layout */
         else if (!strcmp(argv[i],"--live") && i+1<argc)   live_speaker= atoi(argv[++i]); /* live distance readout for one speaker */
-        else if (!strcmp(argv[i],"--latency") && i+1<argc) known_latency = atof(argv[++i]); /* c*tau meters, for --live absolute distance */
+        else if (!strcmp(argv[i],"--latency") && i+1<argc) known_latency = atof(argv[++i]); /* c*tau meters: --live absolute distance, --zylia distances */
+        else if (!strcmp(argv[i],"--ref") && i+2<argc)    { ref_spk = atoi(argv[++i]); ref_dist = atof(argv[++i]); } /* --zylia: tape-measured centre->speaker distance -> solves the latency */
+        else if (!strcmp(argv[i],"--survey") && i+1<argc)  survey_path = argv[++i]; /* --zylia: capsule self-survey (room axes) */
         else if (!strcmp(argv[i],"--eq"))                 eq          = 1;   /* per-speaker direct-sound correction FIR */
         else if (!strcmp(argv[i],"--room-eq"))            eq = room_eq = 1;  /* + room correction AT THE MIC POINT (static listener only) */
         else if (!strcmp(argv[i],"--room-eq-grid"))       rq_grid     = 1;   /* accumulate LF modal cuts at THIS mic position into room_eq_grid (tracked room EQ) */
         else if (!strcmp(argv[i],"--zylia"))              zylia       = 1;   /* single-position localization with the ZM-1 */
         else if (!strcmp(argv[i],"--mic") && i+3<argc) { mic[0]=(float)atof(argv[++i]); mic[1]=(float)atof(argv[++i]); mic[2]=(float)atof(argv[++i]); }
-        else { fprintf(stderr, "usage: calibrate [--layout f] [--out f] [--mic x y z] [--input ch] [--driver name] [--list-drivers] [--simulate] [--room] [--eq | --room-eq | --room-eq-grid] [--zylia] [--save-irs prefix] [--localize positions.txt] [--check] [--live N] [--latency m]\n"); return 2; }
+        else { fprintf(stderr, "usage: calibrate [--layout f] [--out f] [--mic x y z] [--input ch] [--driver name] [--list-drivers] [--simulate] [--room] [--eq | --room-eq | --room-eq-grid] [--zylia] [--survey f] [--ref spk dist_m] [--save-irs prefix] [--localize positions.txt] [--check] [--live N] [--latency m]\n"
+                               "  --zylia: ZM-1 single-placement localization; --input is the FIRST of its 19 consecutive\n"
+                               "  capture channels, --mic is the array centre. Distances need --latency (loopback, m at c)\n"
+                               "  or --ref <spk> <m> (one tape-measured centre->speaker distance).\n"); return 2; }
     }
     if (room_eq && rq_grid) { fprintf(stderr, "calibrate: --room-eq and --room-eq-grid are mutually exclusive (one scheme per layout)\n"); return 2; }
+    if (zylia && (localize_file || check || live_speaker >= 0)) {
+        fprintf(stderr, "calibrate: --zylia is its own mode (19-input capture); drop --localize/--check/--live\n"); return 2; }
     if (room_eq)
         printf("calibrate: --room-eq corrects the ROOM at the mic position — valid only for a STATIC\n"
                "           listener seated there (SPCAP/VBAP deployments); a roaming listener wants plain --eq.\n"
@@ -103,6 +113,23 @@ int main(int argc, char** argv) {
     const int n = (int)L.count;
     printf("calibrate: %d speakers from %s; mic at (%.2f %.2f %.2f)%s\n",
            n, layout_path, mic[0], mic[1], mic[2], simulate ? "  [SIMULATE]" : "");
+    if (ref_spk >= 0 && (ref_spk >= n || ref_dist < 0.2)) {
+        fprintf(stderr, "calibrate: --ref wants a speaker 0..%d and a distance >= 0.2 m (got %d, %.3f)\n",
+                n - 1, ref_spk, ref_dist); return 2;
+    }
+    if (survey_path) {   /* pins the ZM-1's channel order + orientation; installs via zylia_set_capsules */
+        ZyliaMount mount; char serr[192] = {0};
+        if (!zylia_survey_load(survey_path, &mount, serr, sizeof serr)) {
+            fprintf(stderr, "calibrate: survey: %s\n", serr); return 1; }
+        if (mount.body_frame) {
+            fprintf(stderr, "calibrate: survey %s is BODY-FRAME (tracked mount); this tool has no tracker, so\n"
+                            "           it cannot re-aim the table. Use a room-axes survey taken at the CURRENT\n"
+                            "           mounting (calib_view -> Zylia -> Capsule survey), or bwa_validate --track.\n",
+                    survey_path);
+            return 1;
+        }
+        printf("calibrate: capsule survey %s installed (channel order + orientation pinned)\n", survey_path);
+    }
 
     float* sweep = (float*)malloc((size_t)NSWEEP * sizeof(float));
     float* cap   = (float*)malloc((size_t)CAPLEN * sizeof(float));
@@ -113,7 +140,15 @@ int main(int argc, char** argv) {
 
 #ifdef BWA_HAVE_ASIO
     int asio_up = 0;
-    if (!simulate) { if (calib_asio_open(driver, mic_in, n, sweep, cap) != 0) return 1; asio_up = 1; }
+    float* cap19 = NULL;                                       /* --zylia: [19][CAL_CAPLEN], one row per capsule */
+    if (!simulate) {
+        if (zylia) {
+            cap19 = (float*)malloc((size_t)ZYLIA_MICS * CAPLEN * sizeof(float));
+            if (!cap19) { fprintf(stderr, "calibrate: out of memory\n"); return 1; }
+            if (calib_asio_open_multi(driver, mic_in, ZYLIA_MICS, n, sweep, cap19) != 0) return 1;
+        } else if (calib_asio_open(driver, mic_in, n, sweep, cap) != 0) return 1;
+        asio_up = 1;
+    }
 #else
     if (!simulate) { fprintf(stderr, "calibrate: built without ASIO; re-run with --simulate or build the ASIO backend\n"); return 1; }
 #endif
@@ -195,44 +230,115 @@ int main(int argc, char** argv) {
 
     /* --- ZM-1 single-position localization: ONE mic placement, 19 capsules -> direction + distance --- */
     if (zylia) {
-        float dirs[ZYLIA_MICS][3]; float R; zylia_geometry(dirs, &R);
+        float caps[ZYLIA_MICS][3]; zylia_capsules(caps);       /* the installed survey if any, else built-in */
         const double C = 343.0;
-        const double latency = (known_latency >= 0.0) ? known_latency / C : 0.0;   /* c*tau meters -> seconds */
-        printf("zylia: array at (%.2f %.2f %.2f), 19 capsules, R=%.3f m%s\n",
-               mic[0], mic[1], mic[2], R, simulate ? "  [SIMULATE]" : "");
+        printf("zylia: array at (%.2f %.2f %.2f), %d capsules%s\n",
+               mic[0], mic[1], mic[2], ZYLIA_MICS, simulate ? "  [SIMULATE]" : "");
+        if (!simulate && !survey_path)
+            printf("zylia: no --survey: trusting the BUILT-IN capsule table. Channel order and the device's\n"
+                   "       orientation in the room are then unpinned — a yaw error rotates every recovered\n"
+                   "       position (docs/calibration.md, \"The capsule self-survey\").\n");
+
+        /* capture first, solve after: --ref needs the reference speaker's arrivals before any distance */
+        double* arr = (double*)malloc((size_t)n * ZYLIA_MICS * sizeof(double));
+        if (!arr) { fprintf(stderr, "calibrate: out of memory\n"); return 1; }
+        for (int s = 0; s < n; ++s) {
+            double* row = arr + (size_t)s * ZYLIA_MICS;
+            if (simulate) {                                    /* exact wavefront from the speaker's true pos */
+                double lat0 = (known_latency >= 0.0) ? known_latency / C : 0.0;
+                for (int j = 0; j < ZYLIA_MICS; ++j) {
+                    double cx = mic[0]+caps[j][0], cy = mic[1]+caps[j][1], cz = mic[2]+caps[j][2];
+                    double dx = cx-L.speakers[s].pos[0], dy = cy-L.speakers[s].pos[1], dz = cz-L.speakers[s].pos[2];
+                    row[j] = sqrt(dx*dx+dy*dy+dz*dz)/C + lat0;
+                }
+            }
+#ifdef BWA_HAVE_ASIO
+            else {
+                /* RIG: sweep speaker s, record all 19 capsules in lockstep (one device, one clock —
+                 * the Dante Via route), deconvolve each, take its sub-sample arrival. */
+                printf("  speaker %2d: playing sweep...\n", s); fflush(stdout);
+                if (!calib_asio_capture(s)) {
+                    fprintf(stderr, "calibrate: capture timed out on speaker %d\n", s);
+                    calib_asio_close(); free(cap19); free(arr); free(res); free(cap); free(sweep);
+                    return 1;
+                }
+                for (int j = 0; j < ZYLIA_MICS; ++j) {
+                    MeasureResult r;
+                    measure_response(cap19 + (size_t)j * CAPLEN, CAPLEN, sweep, NSWEEP, F1, F2, FS, BAND_HZ, &r);
+                    row[j] = ((double)r.delay_samples + r.delay_frac) / FS;
+                }
+            }
+#endif
+        }
+#ifdef BWA_HAVE_ASIO
+        if (asio_up) { calib_asio_close(); asio_up = 0; }
+        free(cap19); cap19 = NULL;
+#endif
+
+        /* latency: --ref (one tape-measured distance) beats --latency (a loopback measurement).
+         * Directions never need it; distances are c*(arrival - latency), so without either the
+         * hardware distances would carry the full system latency radially. */
+        double latency = (known_latency >= 0.0) ? known_latency / C : 0.0;
+        int lat_known = simulate || (known_latency >= 0.0);    /* simulate arrivals carry none (or exactly --latency) */
+        if (ref_spk >= 0) {
+            const double* rr = arr + (size_t)ref_spk * ZYLIA_MICS;
+            float dref[3] = { 0, 0, 0 };                       /* solve failure -> no tilt correction */
+            zylia_doa(rr, dref);
+            double mean_t = 0.0, mdotd = 0.0;                  /* mean arrival, wavefront-tilt corrected: the
+                                                                * capsule centroid is only ~0 (built-in table:
+                                                                * ~2.6 mm up), so project it out along the DOA */
+            for (int j = 0; j < ZYLIA_MICS; ++j) {
+                mean_t += rr[j] / ZYLIA_MICS;
+                mdotd  += (caps[j][0]*dref[0] + caps[j][1]*dref[1] + caps[j][2]*dref[2]) / ZYLIA_MICS;
+            }
+            double lat_ref = mean_t + mdotd / C - ref_dist / C;
+            if (known_latency >= 0.0)
+                printf("zylia: --ref solves latency %.3f m vs --latency %.3f m (delta %+.1f cm) — using --ref\n",
+                       lat_ref * C, known_latency, (lat_ref * C - known_latency) * 100.0);
+            latency = lat_ref; lat_known = 1;
+            printf("zylia: system latency from --ref %d @ %.3f m: %.2f ms (%.3f m at c)\n",
+                   ref_spk, ref_dist, latency * 1e3, latency * C);
+            if (!simulate && latency <= 0.0)
+                printf("  WARNING: solved latency is not positive — wrong --ref speaker or distance?\n");
+        }
+#ifdef BWA_HAVE_ASIO
+        /* Same lower-bound check as --localize: the driver's digital loop is inside every arrival, so
+         * a solved latency below it is physically impossible. No upper warning here — a Dante Via leg
+         * on the capsule inputs legitimately adds ~10 ms the driver does not report. */
+        { long il = 0, ol = 0;
+          if (!simulate && lat_known && calib_asio_latencies(&il, &ol)) {
+              double drv_m = 343.0 * (double)(il + ol) / FS;
+              double resid_ms = (latency * C - drv_m) / 343.0 * 1e3;
+              printf("zylia: system latency %.3f m vs driver digital loop %.3f m -> residual %+.2f ms\n",
+                     latency * C, drv_m, resid_ms);
+              if (resid_ms < -0.5)
+                  printf("  WARNING: below the driver's own digital loop — physically impossible; check the\n"
+                         "           device/clocking, the --ref distance, or the --latency value\n");
+          } }
+#endif
+
         float (*pos)[3] = (float(*)[3])malloc((size_t)n * 3 * sizeof(float));
         for (int s = 0; s < n; ++s) {
-            double arr[ZYLIA_MICS];
-            if (simulate) {                                    /* exact wavefront from the speaker's true pos */
-                for (int j = 0; j < ZYLIA_MICS; ++j) {
-                    double cx = mic[0]+R*dirs[j][0], cy = mic[1]+R*dirs[j][1], cz = mic[2]+R*dirs[j][2];
-                    double dx = cx-L.speakers[s].pos[0], dy = cy-L.speakers[s].pos[1], dz = cz-L.speakers[s].pos[2];
-                    arr[j] = sqrt(dx*dx+dy*dy+dz*dz)/C + latency;
-                }
-            } else {
-                /* RIG: play the sweep on speaker s, capture the ZM-1's 19 channels, deconvolve each, take its
-                 * sub-sample arrival -> arr[j]. The ZM-1 is a SEPARATE device from the Dante output; its 19
-                 * capsules are mutually sample-locked (one ADC), so the DOA is exact regardless of the
-                 * cross-device clock — but running two ASIO drivers at once is the unbuilt rig piece. */
-                fprintf(stderr, "calibrate: --zylia hardware capture is not wired in this build; use --simulate\n"
-                                "  (the ZM-1 is a second 19-ch input device — see docs/calibration.md)\n");
-#ifdef BWA_HAVE_ASIO
-                if (asio_up) calib_asio_close();
-#endif
-                free(pos); free(res); free(cap); free(sweep);
-                return 1;
-            }
+            const double* row = arr + (size_t)s * ZYLIA_MICS;
             float p[3], dir[3], dist;
-            if (!zylia_localize(arr, mic, latency, C, p, &dist)) { p[0]=p[1]=p[2]=0.f; dist=0.f; }
-            zylia_doa(arr, dir);
+            if (!zylia_localize(row, mic, latency, C, p, &dist)) { p[0]=p[1]=p[2]=0.f; dist=0.f; }
+            zylia_doa(row, dir);
             pos[s][0]=p[0]; pos[s][1]=p[1]; pos[s][2]=p[2];
-            printf("  spk %2d: dir=(%+.3f %+.3f %+.3f)  pos=(%+.3f %+.3f %+.3f)  dist=%.3f m\n",
-                   s, dir[0],dir[1],dir[2], p[0],p[1],p[2], dist);
+            printf("  spk %2d: dir=(%+.3f %+.3f %+.3f)  pos=(%+.3f %+.3f %+.3f)  dist=%.3f m%s\n",
+                   s, dir[0],dir[1],dir[2], p[0],p[1],p[2], dist,
+                   (s == ref_spk) ? "  [--ref: should read the taped distance]" : "");
+        }
+        if (!lat_known) {
+            fprintf(stderr, "zylia: NOT writing positions — no --latency/--ref, so every distance above carries\n"
+                            "       the full system latency radially (directions are exact). Tape ONE speaker's\n"
+                            "       distance from the array centre and re-run with --ref <spk> <m>, or measure a\n"
+                            "       loopback and pass --latency <m>.\n");
+            free(arr); free(pos); free(res); free(cap); free(sweep);
+            return 1;
         }
         if (!calib_write_positions(layout_path, out_path, pos, n, err, sizeof err)) { fprintf(stderr, "calibrate: %s\n", err); return 1; }
-        printf("zylia: wrote %d positions to %s%s\n", n, out_path,
-               (known_latency < 0.0) ? "  (no --latency: directions exact, distances uncalibrated)" : "");
-        free(pos); free(res); free(cap); free(sweep);
+        printf("zylia: wrote %d positions to %s\n", n, out_path);
+        free(arr); free(pos); free(res); free(cap); free(sweep);
         return 0;
     }
 

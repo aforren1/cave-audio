@@ -8,8 +8,8 @@ full-duplex capture is the only part that needs the rig.
 
 **Everything here follows the layout's speaker count** (`n`, 4..26; see
 [`layout-schema.md`](./layout-schema.md)), not a hard-wired 26: the capture opens `n` ASIO outputs
-plus the mic input (which rides buffer slot `n`), sweeps those `n` speakers, and writes `n` records
-back. `bwa_calib_view` likewise sizes its plots from each loaded layout, and refuses to Diff two
+plus the mic input (which rides buffer slot `n` — or, with `--zylia`, the ZM-1's 19 capsule inputs
+on slots `n`..`n+18`), sweeps those `n` speakers, and writes `n` records back. `bwa_calib_view` likewise sizes its plots from each loaded layout, and refuses to Diff two
 layouts with different speaker counts rather than mis-compare them.
 
 ## The two layout tools
@@ -19,8 +19,9 @@ layouts with different speaker counts rather than mis-compare them.
 - **`bwa_calibrate`**, *survey + tuning*: measures positions acoustically, and the per-speaker
   delay/gain trims, into the same `cave_layout.json`.
 
-Bring-up order: `layout_tool` (channel map) → `calibrate --localize` (positions) →
-`calibrate` (trims) → `calibrate --room` (sanity-check the room). Then the engine loads the layout.
+Bring-up order: `layout_tool` (channel map) → `calibrate --localize` (positions; or `--zylia` from
+one ZM-1 placement) → `calibrate` (trims) → `calibrate --room` (sanity-check the room). Then the
+engine loads the layout.
 
 ## How it measures (exponential sweep + deconvolution)
 
@@ -52,6 +53,9 @@ automatically.
   positive number. **Negative is physically impossible** (wrong device, sample-rate mismatch);
   tens of ms means an unexpected buffer (check the Dante latency setting). The solved value stays
   authoritative—the driver's numbers are nominal, the sweep measured reality.
+- **`--zylia`**: the same self-survey from **one** mic placement, using the ZM-1's 19 capsules
+  instead of five omni spots. Direction from arrival-time differences, distance from a known
+  latency (`--latency` or `--ref`). See "Zylia ZM-1: full 3D from one placement" below.
 - **default**: trims. `calib_solve` turns the per-speaker measurements into `delay_ms`
   (arrival-align every speaker to the farthest) and `gain_db` (equalize sensitivity, with the
   speaker→mic distance divided out so it corrects the *speaker*, not distance; cut-only so nothing
@@ -204,11 +208,30 @@ those arrivals to get each reflection's *direction*. That turns the room report 
 much. (A full ambisonic room IR is the same capture encoded to higher order; the directional
 early-reflection map is the actionable part.)
 
-Integration is a rig-bound shell (like the ASIO capture). The ZM-1 presents as a 19-ch input, so a
-`calibrate --zylia` mode captures the sweep, deconvolves per channel (measure.c), feeds the 19
-arrivals to `zylia_localize`, and writes `cave_layout.json`. `--zylia --simulate` synthesizes the 19
-arrivals from the layout and recovers every speaker position exactly, so the math + writeback are
-validated off-hardware; the sweep capture is the unbuilt piece (see "Getting the ZM-1 onto Dante").
+### Running it (`calibrate --zylia`)
+
+The speaker survey above is wired end to end: the capture shell opens the layout's `n` outputs
+plus 19 consecutive inputs starting at `--input`, on ONE ASIO device (the ZM-1 over Dante Via —
+next section), sweeps each speaker, deconvolves all 19 capsules (measure.c), and hands the
+sub-sample arrivals to `zylia_localize`. `--mic x y z` is the array **centre**. Positions go back
+into `cave_layout.json`. Two flags carry the physics the tool cannot know:
+
+- **`--survey <file>`**: a room-axes capsule survey (calib_view → Zylia tab → Capsule survey).
+  Without one the built-in table is trusted, and an unpinned channel order or yaw rotates the
+  whole recovered layout — the tool warns, but it cannot check. (A body-frame survey is refused:
+  this tool has no tracker to re-aim it with; that's `bwa_validate --track`.)
+- **`--latency <m>`** or **`--ref <spk> <m>`**: the distance calibration. `--latency` is a
+  loopback-measured round trip in meters at c. `--ref` solves it from ONE tape-measured
+  centre→speaker distance instead (that speaker's mean arrival, wavefront-tilt corrected), so a
+  tape measure replaces the loopback rig; the ref speaker's reported `dist` should then read back
+  the taped value. Given neither, the run prints directions and **refuses the writeback**: every
+  distance would carry the full system latency radially. The solved latency is cross-checked
+  against the driver's digital loop (below it = physically impossible). No tens-of-ms upper
+  warning here: a Dante Via input leg legitimately adds ~10 ms the driver never reports.
+
+`--zylia --simulate` runs the identical solve + writeback off-hardware from synthesized arrivals
+and recovers every position exactly. The capture shell itself is rig bring-up code like the rest
+([hardware-validation.md](./hardware-validation.md), Stage 2).
 
 ### Getting the ZM-1 onto Dante
 
@@ -219,8 +242,9 @@ slot (which is why `asio_session.cpp` exists). Two drivers at once is not a flag
 **Put the ZM-1 on the Dante network and the problem dissolves.** Dante Via captures the ZM-1's ASIO
 stream and transmits its 19 capsules as Dante channels; the Digiface on the engine machine receives them as 19
 **inputs on the same ASIO device that already owns the 26 outputs**. One driver, one clock domain,
-sample-locked: the two-device problem stops existing, and `calib_capture.cpp` goes from
-"open N outs + 1 mic input" to "open N outs + 19 inputs", which is a parameter, not an architecture.
+sample-locked: the two-device problem stops existing, and `calib_capture.cpp` went from
+"open N outs + 1 mic input" to "open N outs + 19 inputs" — a parameter, not an architecture
+(`calib_asio_open_multi`; the omni modes are its `nin = 1` case).
 ([Danowski's write-up](https://blog.przemekdanowski.com/connecting-zylia-zm-1-to-dante-network/) is the
 recipe; Dante Via is a modest one-off licence and has a trial, so you can prove the route first.)
 
