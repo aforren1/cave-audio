@@ -2,7 +2,7 @@
 
 All notable changes to `com.brainworks.bw_audio`.
 
-## [0.4.0]
+## [Unreleased]
 
 ### Added — physical emulation batch
 
