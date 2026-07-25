@@ -4,6 +4,177 @@ All notable changes to `com.brainworks.bw_audio`.
 
 ## [Unreleased]
 
+## [0.4.0]
+
+### Added — physical emulation batch
+
+- **`SourceBase.proximity`** (inspector toggle + `bwa_source_set_proximity`): near-field LF boost —
+  the shelf rises as the source closes inside ~1 m, so "at arm's length" reads as bass, not just
+  level. Loudness comp's near mirror; pushed on init and live from OnValidate like its siblings.
+- **`Engine.SpeedOfSound`** (inspector field + live property, `bwa_set_speed_of_sound`): Doppler
+  and reflection delays derive from it and glide to a change. 343 air, 1480 underwater; small
+  values exaggerate Doppler for slow motion.
+- **`Engine.FdnSetDecay(low, high, xover)`** (`bwa_fdn_set_decay`): LIVE FDN decay retune — the
+  room-transition knob; the tail keeps ringing, only its slope changes. `<= 0` keeps a parameter.
+- **`Engine.SceneSetGround(worldY, material, pressureRelease)`** (`bwa_scene_set_ground`): the
+  outdoor degenerate of the room box — one mirror plane, the ground bounce. Replaces the box.
+- **`Engine.SceneSetPressureRelease(faceMask)`** (`bwa_scene_set_pressure_release`): flag box faces
+  whose image-source reflection inverts — an underwater room's ceiling-as-surface (`1u << 3`), the
+  Lloyd's-mirror comb.
+- **Directivity note**: `directivity`/`directivityPower` now work in every build — without a Steam
+  scene the engine evaluates the same weighted dipole on the audio thread (no binding change).
+- **Headphone correction EQ** (`bwa_load_headphone_eq` / `bwa_set_headphone_eq`; Unity raw externs,
+  Godot `load_headphone_eq(path)` + the `set_headphone_eq` ramped A/B): an AutoEq ParametricEQ.txt
+  for your headphone model, applied to the final stereo of every headphone profile after the HRTF
+  decode — the headphone-side align stage (corrects the transducer, not the render; inert in
+  `cave`). The Preamp line is honored; a bad file fails with `ErrConfig` and keeps the previous EQ;
+  loading and toggling both crossfade. Reload after an engine rebuild (the correction dies with the
+  engine; the Godot toggle itself replays on restart).
+
+### Added — clock drift
+
+- **`Engine.GetClockModel(out BwaClockModel)`** → new engine ABI `bwa_get_clock_model`: how fast the
+  device clock actually runs against the host clock. `bwa_get_clock`'s pair fixes an exact *instant*;
+  this fits the *slope* by exponentially weighted least squares over the same per-block stamps
+  (~2 min window, on the audio thread), and reports it as `ppm` with its own `ppmSigma`, plus
+  `rateHz`, `spanS`, `jitterNs` and the effective stamp count. `DspTimeAt` re-anchors every frame and
+  needs none of it — reach for this when something else owns the timeline (a video file, timecode,
+  another render node), when a minutes-long extrapolation has to hold (use `rateHz` in place of the
+  nominal rate), or to log the rig's drift. False until the fit has ~1 s of stamps, and again for
+  ~1 s after a restart re-bases the device sample position. `ppmSigma` assumes independent stamp
+  noise, so read it as a lower bound; `jitterNs` grades the *driver's* stamps, and a driver without
+  `kSystemTimeValid` reads worse because the QPC fallback adds dispatch noise.
+
+### Changed — ABI breaks (pre-freeze cleanup, `BWA_VERSION` → 0.10.0)
+
+Deliberate, one-time ABI breaks before the pre-hardware freeze. Update call sites:
+
+- **Removed the bed yaw-shorthand binding** (the `Bwa` P/Invoke was bound but never called). It was
+  the pure subset of `bwa_bed_set_orientation(yaw, 0, 0)` — call that with `pitch = roll = 0`
+  instead (bit-identical path: yaw-only stays on the exact phasor rotation).
+- **Renamed the two engine-global reverb setters** to the `bwa_set_<x>` form, matching the other
+  engine-global setters: now `bwa_set_reverb_gain` and `bwa_set_early_reflections_gain` (previously
+  the noun-first `..._set_gain` spelling). The Godot method names (`reverb_set_gain` /
+  `early_reflections_set_gain`) and the Unity properties (`ReverbGain` / `EarlyReflectionGain`) are
+  unchanged — only the underlying C symbol moved.
+- **`bwa_set_limiter_ceiling` now takes a LINEAR peak amplitude** in `(0..1]`, like every other gain
+  in the ABI — no longer decibels. The default is `0.891251f` (still −1 dBFS). The Unity inspector
+  field is now `limiterCeiling` (linear; was `limiterCeilingDb`) with `SetLimiterCeiling(float
+  linear)`; the Godot `limiter_ceiling` property range is now `0..1`.
+- **`bwa_set_pose_prediction` lead is now in SECONDS**, not milliseconds (matching the fade-time
+  calls). The Unity field is `posePredictionS` (was `posePredictionMs`, range `0..0.2`); the Godot
+  `set_pose_prediction` argument is seconds.
+- **The profile enum was renamed and renumbered** around the new first-class binaural render:
+  `BWA_PROFILE_BINAURAL` (still 1) is now the DIRECT per-source headphone render (point sources
+  SH-encode at their true listener-relative directions and HRTF-decode — no speaker-array
+  simulation in the direct path); the old virtual-speaker array audition is
+  `BWA_PROFILE_CAVE_SIM` (2), and the old `BWA_PROFILE_BOTH` is `BWA_PROFILE_CAVE_BOTH` (3, rig +
+  the sim tap). Unity: `BwaProfile.{Cave, Binaural, CaveSim, CaveBoth}`; Godot:
+  `PROFILE_{CAVE, BINAURAL, CAVE_SIM, CAVE_BOTH}` (the Godot playground now uses CAVE_SIM, since
+  its speaker meters visualize the array bus). If you were using `Binaural` to audition the
+  ARRAY, switch to `CaveSim`; if you wanted the best headphone render, `Binaural` just got better:
+  with the Steam Audio build every point source gets its own true HRTF convolution (one
+  `IPLBinauralEffect` per voice), ambisonic beds pass SH→SH, and pathing's indirect field joins
+  the binaural decode directly — no speaker-array round trip anywhere in the direct render. No
+  API surface changed for this; it's all behind the profile.
+
+### Added — ABI parity (the seven calls the binding had missed)
+
+`Bwa.cs` is **1:1 with `include/bw_audio.h`** again: it now binds every `BWA_API` function except
+`bwa_set_output_capture` (an audio-thread callback) and `bwa_render_block` (the manual-sink
+golden-render path), both deliberately unbound — Unity uses neither. Seven declarations were added,
+with the ones a scene actually authors surfaced on the components:
+
+- **`Emitter.Extent` (Vector2)** → `bwa_source_set_extent`: anisotropic angular width/height (a
+  shoreline is wide but not tall, rain tall but not wide). Equal values behave as the isotropic
+  `Spread`; setting `Spread` resets it to isotropic (last call wins).
+- **`Emitter.SetAttenuationOverride(refDist, rolloff, minGain)`** →
+  `bwa_source_set_attenuation_override`: a per-source distance-attenuation curve (rolloff 0 = a
+  direction-only cue that never fades; `refDist <= 0` clears it back to the layout curve).
+- **`Engine.maxReSplit` / `SetMaxReSplit`** → `bwa_set_max_re_split`: band-split max-rE (taper only
+  above ~700 Hz, plain decode below; needs `maxRe` on). Live A/B; the inspector hides it while
+  max-rE is off.
+- **`Engine.SoundFrames(clip)` / `SoundChannels(clip)`** → `bwa_sound_get_frames` /
+  `bwa_sound_get_channels`: asset length (engine-rate frames) and channel count, loaded on demand
+  through the same cache as `Load`.
+- **`Engine.AsioDriverCount` / `AsioDriverName(index)`** (static, engine-free) →
+  `bwa_get_asio_driver_count` / `bwa_get_asio_driver_name`: enumerate the registered ASIO drivers
+  before an `Engine` exists, to populate a picker for `asioDriver`.
+
+### Added — `PushEmitter` component
+
+- **`PushEmitter`** — a MonoBehaviour wrapper for procedural (push) sources, filling the one gap
+  where the raw `bwa_source_*` push calls (`bwa_source_create_push` / `_push` / `_push_space` /
+  `_push_end`) had no component like every other source concept. A positional source you FEED mono
+  float PCM at `Engine.SampleRate` instead of a clip (a synth, an engine model, a voice stream):
+  `Push(float[])` / `Push(float[], count)` (returns the count accepted), `PushSpace`, `PushEnd()`,
+  `IsPlaying`, plus the source-generic surface `Emitter` has that applies to a push voice — `Gain` /
+  `FadeTo` / `FadeOut`, `Spread` / `Extent` / `SizeMetres`, `Priority`, `Group`, `Pause` / `UnPause`,
+  `SetAttenuationOverride`, `SetOcclusionManual`, `Occlusion`, `Playhead` / `PlayheadSeconds`, `Stop`,
+  and the inspector spatial toggles (occlusion, early reflections, reverb send/distance, pathing,
+  directivity, doppler, air absorption, loudness comp). It registers with `Engine` and its transform
+  rides the same centralized per-frame push, through the one source registry and snapshot loop
+  (see `SourceBase` under Changed). Deliberately OMITTED — the engine refuses them
+  on a push voice: `Play` / `PlayAt` / `PlayLoop`, `Seek`, `Pitch`, `Queue` / `ClearQueue`,
+  `PlayOneShot`, and the file `clip` / `loop` / `playOnEnable` machinery. Mirrors Godot's
+  `BwaPushSource` (which splits off `BwaEmitter` for the same reason) adapted to `Emitter`'s Unity
+  idioms (lazy `TryInit` with the init-order-race coroutine, generation-safe handle, live `OnValidate`
+  re-push). One-way: `PushEnd`/`Stop`/`FadeOut` end the voice, so re-enable the component for a fresh one.
+
+### Removed
+
+- **`Emitter.Position` / `Emitter.PositionSeconds` and `AmbisonicBed.Position`** — the `[Obsolete]`
+  forwarders left over from the 0.3.0 `Position → Playhead` rename are gone. Use `Playhead` /
+  `PlayheadSeconds` (the content playhead, unrelated to the spatial transform).
+- **`Bwa.MaterialPreset(engine, preset)`** — the thin static alias over the already-typed
+  `bwa_material_preset` extern is gone; call `Bwa.bwa_material_preset` directly (the two internal
+  callers, `Engine.ResolvePreset` and `MaterialAsset.Resolve`, were migrated). The engine-level
+  `Engine.MaterialPreset(preset)` convenience (the cached mint) is unaffected.
+
+### Changed
+
+- **`SourceBase`** — the source-generic surface `Emitter` and `PushEmitter` had duplicated
+  member-for-member (lifecycle, the per-frame transform push, the live `OnValidate` re-push, and the
+  whole knob surface) now lives on one abstract `SourceBase` MonoBehaviour, mirroring Godot's
+  `BwaSource` base: a subclass overrides only the create call and adds its own feed. `Engine` keeps
+  ONE source registry (the `Register`/`Unregister(PushEmitter)` overloads and the second per-frame
+  loop are gone — every source kind runs through the same mutation-safe snapshot loop), and the
+  custom inspector now registers on `SourceBase` with `editorForChildClasses`, so `PushEmitter` gets
+  the conditional hides + live occlusion bar too. Public API and serialized field names are
+  unchanged — existing scenes and scripts migrate untouched.
+- **`Emitter` directivity** — the cardioid-weight mapping + `set_directivity` call, duplicated in
+  `TryInit` and `OnValidate`, moved into one `ApplyDirectivity()` helper (no behaviour change).
+
+### Fixed
+
+- **Play-mode inspector edits no longer wipe a script-set `Extent`** — `OnValidate` re-pushes
+  `spread`, which the engine defines as resetting extent (last call wins), and now re-asserts the
+  extent after it, exactly like `TryInit` always did. Previously ANY inspector nudge on a live
+  source collapsed a script-set anisotropic extent to a point while the `Extent` getter kept
+  reporting the stale vector.
+- **`SetAttenuationOverride` is mirrored + replayed** (Unity and Godot): it is standing per-source
+  state, so a call that loses the init-order race now lands at create, and the override survives a
+  disable/re-enable instead of silently reverting to the layout curve.
+- **A stale source handle can no longer cross an `Engine` destroy+recreate** — a source component
+  records its owning `Engine`; if that engine is replaced while the component stays enabled, every
+  call (including `OnDisable`'s destroy) no-ops instead of aliasing the successor engine's
+  deterministically-recycled first handles, and the next enable re-creates cleanly.
+- **Limiter ceiling can't silently diverge from the engine** — the inspector slider floors at 0.001
+  and `SetLimiterCeiling` clamps into `(0..1]` before caching (the engine ignores `<= 0`); the
+  Godot hint floors the same way, and its setter converts a replayed pre-0.10 dB scene value to
+  linear with a warning instead of silently dropping the authored ceiling.
+- **ASIO driver names are UTF-8 across the ABI** — the native enumeration converts the registry's
+  ANSI bytes to UTF-8 (and converts an explicit `asioDriver` back before the SDK's byte-exact
+  match), so a non-ASCII driver name survives the picker round trip; Godot now decodes with
+  `String::utf8`.
+- **A failed source create logs on `Emitter` too** (previously only `PushEmitter` checked the
+  handle) — unified in `SourceBase.TryInit`.
+- **`ProjectCheck` warning** pointed at the wrong menu: "Tools → Engine → Disable Unity Audio" now
+  reads "Tools → BwAudio → Disable Unity Audio", matching the actual `MenuItem` path.
+- **Docs**: the README and `docs/integration.md` "1:1" claims now name the two deliberately-unbound
+  calls instead of overclaiming. The README's live-A/B list gains SPECTRAL spread and max-rE, and
+  its load-time list names the bed decoder as AllRAD / EPAD (sampling is no longer selectable).
+
 ## [0.3.2-rc3]
 
 - CI tests
@@ -61,7 +232,7 @@ The engine renamed seven symbols for clarity; the binding follows. C#-visible ch
   playhead. The old properties remain as `[Obsolete]` forwarders for now.
 - Raw `Bwa` layer follows the C renames: `bwa_source_get_playhead` / `bwa_bed_get_playhead`
   (was `_get_position`), `bwa_source_create_push` (was `_create_stream`), and the reverb-send
-  family `bwa_reverb_set_gain` / `bwa_source_set_reverb` / `bwa_source_set_reverb_send` /
+  family `bwa_set_reverb_gain` / `bwa_source_set_reverb` / `bwa_source_set_reverb_send` /
   `bwa_source_set_reverb_distance` (was `bwa_reflections_set_gain` / `bwa_source_set_reflections`
   / `..._reflection_send` / `..._reflection_distance`) — "reflections" now always means the Steam
   reflection-bed config or the image-source earlies, "reverb" the shared send/tap.
@@ -373,7 +544,7 @@ authors:
 
 Two coordinate seams the new calls exposed, both now in `Room` so nothing re-derives them:
 `Room.YawRad` (the X mirror **reverses the sense of rotation** — a Unity euler angle passed straight
-to `bwa_bed_set_rotation` spins the soundfield the wrong way) and `Room.Dir` (a *direction*, e.g. the
+to the bed's yaw (`bwa_bed_set_orientation`) spins the soundfield the wrong way) and `Room.Dir` (a *direction*, e.g. the
 FDN's decay axis, must not pick up the registration transform's translation the way `Room.Pos` does).
 
 `Engine` now also **reports a failed layout load** (`bwa_last_error` right after `bwa_create`): it is

@@ -27,7 +27,7 @@ namespace BwAudio
         public uint Resolve(IntPtr engine)
         {
             if (source == Source.Preset)
-                return Bwa.MaterialPreset(engine, preset);
+                return Bwa.bwa_material_preset(engine, preset);
             return Bwa.bwa_material_define(engine,
                 new[] { absorption.x, absorption.y, absorption.z }, scattering,
                 new[] { transmission.x, transmission.y, transmission.z });

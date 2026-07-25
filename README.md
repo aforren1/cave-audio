@@ -28,6 +28,7 @@ You **turn Unity's built-in audio off** (see below) and use these instead. It ma
 | `spatialBlend = 1` (3D) | always 3D — listener-relative DBAP across the speakers |
 | `AudioSource.spread` | `Emitter.spread` (angular) or `sizeMetres` (a physical radius — holds its real size as the listener walks) |
 | ambient / 2D music | `AmbisonicBed` — a world-locked AmbiX soundfield decoded to every speaker |
+| procedural audio (`OnAudioFilterRead`) | `PushEmitter` — a positional source you feed mono PCM you generate |
 | Audio Reverb Zone | the shared reverb bed: **Steam Audio reflections**, or the **FDN reverb** (no SDK needed) |
 | occlusion (3rd-party) | `Emitter.occlusion`, ray-traced against the acoustic geometry — or `SetOcclusionManual` from game logic (no SDK needed) |
 | Doppler / rolloff curves | `Emitter.doppler`, `airAbsorption`, `loudnessComp` (all physically derived from distance) |
@@ -215,6 +216,49 @@ startup, so it can't be flipped from a runtime script — it's a one-time projec
    listener, then one `bwa_commit` — so the audio thread never sees a half-moved frame (this is what
    makes the moving-observer case correct; do not push from individual emitters).
 
+### Procedural audio — `PushEmitter`
+
+When the audio isn't a file but something you **generate** — a software synth, an engine model, a
+network voice stream — add a **`PushEmitter`** instead of an `Emitter` and feed it mono float PCM at
+`Engine.SampleRate`. It's a full positional source (position, gain, spread, occlusion, reflections,
+Doppler, groups, fades all work and ride the same centralized push), so the only difference from
+`Emitter` is *where the samples come from*: there's no clip, and the engine **refuses**
+play / seek / pitch / queue on a push voice — so those members simply aren't here (the same reason
+Godot splits `BwaPushSource` off). Its transform still drives the source position every frame.
+
+The voice consumes from create (silence until the first push; an underrun renders silence without
+losing your place). Push a frame or so ahead and **pace against `PushSpace`**; `PushEnd()` ends the
+voice once the ring drains (one-way — a push voice is not restartable, so re-enable the component for
+a fresh one). The ring holds 65536 frames (~1.37 s at 48 kHz).
+
+```csharp
+using UnityEngine;
+using BwAudio;
+
+[RequireComponent(typeof(PushEmitter))]
+public sealed class SineFeeder : MonoBehaviour
+{
+    PushEmitter _pe;
+    double _phase;
+    float[] _buf = new float[4096];
+
+    void Awake() => _pe = GetComponent<PushEmitter>();
+
+    void Update()
+    {
+        int n = Mathf.Min(_pe.PushSpace, _buf.Length);   // only push what the ring will take
+        double step = 2.0 * Mathf.PI * 220.0 / Engine.Instance.sampleRate;
+        for (int i = 0; i < n; i++) { _buf[i] = 0.2f * (float)System.Math.Sin(_phase); _phase += step; }
+        _pe.Push(_buf, n);                                // returns the count accepted
+    }
+
+    // ...call _pe.PushEnd() when the stream is done.
+}
+```
+
+Feed from Unity's **main thread**, like every other `bw_audio` call — generate on a worker thread if
+you must, but hand the finished buffers to `Push` from `Update`/`LateUpdate`.
+
 ## Acoustic geometry & materials (authoring)
 
 Occlusion and reflections need the room's geometry. Two ways to author it, both **load-time**:
@@ -252,18 +296,20 @@ the physical room origin/axes). **Getting this wrong silently swaps front/back o
 
 ## API surface
 
-`Bwa` mirrors `include/bw_audio.h` **1:1** — every `BWA_API` function has an entry point. The
-MonoBehaviours cover the common path; for anything else, call `Bwa.*` directly with
-`Engine.Instance.Handle`.
+`Bwa` mirrors `include/bw_audio.h` — every `BWA_API` function has an entry point except two Unity
+never uses: `bwa_set_output_capture` (an audio-thread callback) and `bwa_render_block` (the
+manual-sink golden-render path). The MonoBehaviours cover the common path; for anything else, call
+`Bwa.*` directly with `Engine.Instance.Handle`.
 
 **Tune it by ear in Play mode.** The engine makes its rendering choices switchable *live* (atomic or
 crossfaded), so `Engine` re-pushes them whenever you touch the inspector: the panner (DBAP /
-SPCAP / VBAP), dual-band panning, the spread mode (LOBE / MDAP), decorrelation, near-listener
-widening, the bed renderer (MATRIX / **PARAMETRIC** — a recorded soundfield you can walk through),
-tracked room EQ, master gain, and the limiter. That is an A/B you can *hear*, not a restart.
+SPCAP / VBAP), dual-band panning, the spread mode (LOBE / MDAP / SPECTRAL), max-rE (and its band
+split), decorrelation, near-listener widening, the bed renderer (MATRIX / **PARAMETRIC** — a recorded
+soundfield you can walk through), tracked room EQ, master gain, and the limiter. That is an A/B you
+can *hear*, not a restart.
 
 Load-time settings (a scene restart to change): the profile, the reverb bed (Steam **or** FDN — they
-share one reverb tap, so pick one), the bed *decoder* (sampling / AllRAD), the room box, and all
+share one reverb tap, so pick one), the bed *decoder* (AllRAD / EPAD), the room box, and all
 acoustic geometry.
 
 Everything the CAVE needs but a desktop engine doesn't is on `Engine`: `ChannelCount` (the layout's

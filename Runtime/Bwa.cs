@@ -17,7 +17,10 @@ using System.Runtime.InteropServices;
 
 namespace BwAudio
 {
-    public enum BwaProfile : int { Cave = 0, Binaural = 1, Both = 2 }
+    // Cave drives the array; Binaural is the direct per-source headphone render (full pose);
+    // CaveSim auditions the array render on headphones (virtual speakers, DBAP artifacts included);
+    // CaveBoth is the rig plus the CaveSim tap. Maps 1:1 to bwa_profile in bw_audio.h.
+    public enum BwaProfile : int { Cave = 0, Binaural = 1, CaveSim = 2, CaveBoth = 3 }
     public enum BwaDirectivity : int { Omni = 0, Cardioid = 1, Figure8 = 2 }
     public enum BwaTestKind : int { Off = 0, Sine = 1, Noise = 2 }
     public enum BwaPanner : int { Dbap = 0, Spcap = 1, Vbap = 2 }
@@ -82,6 +85,19 @@ namespace BwAudio
         public uint   reserved0, reserved1, reserved2, reserved3;          // matches reserved[4]; keep zero
     }
 
+    /// <summary>Mirrors bwa_clock_model: how fast the device clock runs against the host clock,
+    /// fitted over the per-block stamps (see Engine.GetClockModel).</summary>
+    [StructLayout(LayoutKind.Sequential)]
+    public struct BwaClockModel
+    {
+        public double ppm;        // device vs host, parts per million (+ = device fast)
+        public double ppmSigma;   // 1-sigma standard error of ppm (optimistic: assumes independent stamp noise)
+        public double rateHz;     // fitted device rate, samples per host second
+        public double spanS;      // host seconds of stamps behind the fit
+        public double jitterNs;   // rms residual of the stamps about the fit (driver stamp quality)
+        public uint   stamps;     // effective (exponentially weighted) stamp count
+    }
+
     [StructLayout(LayoutKind.Sequential)]
     public struct BwaReflectionsDesc
     {
@@ -106,7 +122,9 @@ namespace BwAudio
         public uint  reserved0, reserved1, reserved2;   // matches reserved[3]; keep zero
     }
 
-    /// <summary>Raw P/Invoke entry points. 1:1 with include/bw_audio.h.</summary>
+    /// <summary>Raw P/Invoke entry points — every BWA_API function in include/bw_audio.h except
+    /// bwa_set_output_capture (an audio-thread callback) and bwa_render_block (the manual-sink
+    /// golden-render path), which Unity never uses.</summary>
     public static class Bwa
     {
         const string DLL = "bw_audio";
@@ -119,6 +137,13 @@ namespace BwAudio
         [DllImport(DLL, CallingConvention = CC)] public static extern void   bwa_destroy(IntPtr e);
         [DllImport(DLL, CallingConvention = CC)] public static extern IntPtr bwa_last_error(IntPtr e);     // PtrToStringUTF8; null = none
         [DllImport(DLL, CallingConvention = CC)] public static extern IntPtr bwa_get_audio_backend(IntPtr e);  // "asio:<drv>" / "null" / "none"; binaural/both append "(steam HRTF|simple-pan monitor)"
+
+        // ---- ASIO device query (engine-free; call before bwa_create to populate a driver picker for
+        // BwaDesc.asioDriver). Reads the OS's registered-driver list fresh each call; nothing is opened. ----
+        [DllImport(DLL, CallingConvention = CC)] public static extern uint bwa_get_asio_driver_count();
+        // Fills buf with driver `index`'s registered name (NUL-terminated, truncated to cap-1) — the exact
+        // string BwaDesc.asioDriver expects. False = index out of range. The AsioDriverName helper below wraps it.
+        [DllImport(DLL, CallingConvention = CC)] [return: MarshalAs(UnmanagedType.I1)] public static extern bool bwa_get_asio_driver_name(uint index, [Out] byte[] buf, uint cap);
 
         // ---- internal tracking (OptiTrack/NatNet; may block — lifecycle-class, not per-frame) ----
         [DllImport(DLL, CallingConvention = CC)] public static extern BwaResult bwa_tracker_connect(IntPtr e, in BwaTrackerDesc desc);
@@ -133,6 +158,12 @@ namespace BwAudio
         // Legacy FuMa B-format (.amb and friends: WXYZ order, MaxN + the W -3 dB) — converted to AmbiX
         // at load, so the returned asset is indistinguishable from bwa_load_ambix of the same field.
         [DllImport(DLL, CallingConvention = CC)] public static extern uint bwa_load_fuma(IntPtr e, [MarshalAs(UnmanagedType.LPUTF8Str)] string path);
+        // Asset metadata (any time after a successful load): frames at the ENGINE rate (seconds = frames /
+        // bwa_get_sample_rate). get_frames is 0 for an invalid handle or a stream of unknown length (push
+        // sources); get_channels is 1 for a mono point-source asset, 4/9/16 for an ambisonic bed (order
+        // 1/2/3), 0 for an invalid handle.
+        [DllImport(DLL, CallingConvention = CC)] public static extern ulong bwa_sound_get_frames(IntPtr e, uint snd);
+        [DllImport(DLL, CallingConvention = CC)] public static extern uint  bwa_sound_get_channels(IntPtr e, uint snd);
 
         // ---- sources (per-frame; non-blocking) ----
         [DllImport(DLL, CallingConvention = CC)] public static extern uint bwa_source_create(IntPtr e);
@@ -162,6 +193,9 @@ namespace BwAudio
         // Device-reported render->DAC latency in frames (ASIOGetLatencies; the Digiface includes its Dante
         // buffering). 0 = unknown / no physical output (null sink).
         [DllImport(DLL, CallingConvention = CC)] public static extern uint bwa_get_output_latency(IntPtr e);
+        // The fitted device-vs-host clock drift (see Engine.GetClockModel). False (out untouched) until
+        // the fit has ~1 s of stamps, and again for ~1 s after a restart re-bases the sample position.
+        [DllImport(DLL, CallingConvention = CC)] [return: MarshalAs(UnmanagedType.I1)] public static extern bool bwa_get_clock_model(IntPtr e, out BwaClockModel model);
         [DllImport(DLL, CallingConvention = CC)] public static extern void bwa_source_stop(IntPtr e, uint s);
         [DllImport(DLL, CallingConvention = CC)] public static extern void bwa_source_stop_at(IntPtr e, uint s, ulong stopSample);
         [DllImport(DLL, CallingConvention = CC)] public static extern void bwa_source_queue(IntPtr e, uint s, uint snd, [MarshalAs(UnmanagedType.I1)] bool loop);
@@ -196,14 +230,11 @@ namespace BwAudio
         [DllImport(DLL, CallingConvention = CC)] public static extern uint bwa_bed_create(IntPtr e);
         [DllImport(DLL, CallingConvention = CC)] public static extern void bwa_bed_play(IntPtr e, uint b, uint snd, [MarshalAs(UnmanagedType.I1)] bool loop);
         [DllImport(DLL, CallingConvention = CC)] public static extern void bwa_bed_set_gain(IntPtr e, uint b, float linear);
-        // Yaw the soundfield about the room's vertical axis, in RADIANS, in the ROOM frame (positive turns
-        // the field from room +z toward room +x). Unity's yaw is the opposite sense — convert with
-        // Room.YawRad, do not pass a Unity euler angle straight in. Glides (~1 turn/s), click-free.
-        [DllImport(DLL, CallingConvention = CC)] public static extern void bwa_bed_set_rotation(IntPtr e, uint b, float yawRad);
-        // Full 3-axis orientation, RADIANS, ROOM frame (level or tilt a capture; supersedes set_rotation,
-        // which is the yaw shorthand and resets pitch/roll). Room senses: positive pitch tilts the field's
-        // front upward, positive roll tilts its top toward room -x (the room's right). Across the seam:
-        // yaw needs Room.YawRad (the X mirror reverses it); pitch and roll pass through with the SAME
+        // Full 3-axis orientation of the soundfield, RADIANS, ROOM frame (level or tilt a capture, or spin
+        // it slowly for effect). Positive yaw turns the field about the room's vertical axis from room +z
+        // toward room +x; positive pitch tilts the field's front upward; positive roll tilts its top toward
+        // room -x (the room's right). Yaw-only (pitch=roll=0) stays on the exact phasor path. Across the
+        // seam: yaw needs Room.YawRad (the X mirror reverses it); pitch and roll pass through with the SAME
         // sense (front-up doesn't touch the mirrored axis, and Unity-right maps to room-right). Glided.
         [DllImport(DLL, CallingConvention = CC)] public static extern void bwa_bed_set_orientation(IntPtr e, uint b, float yawRad, float pitchRad, float rollRad);
         [DllImport(DLL, CallingConvention = CC)] public static extern void bwa_bed_stop(IntPtr e, uint b);
@@ -224,6 +255,18 @@ namespace BwAudio
         [DllImport(DLL, CallingConvention = CC)] public static extern void bwa_material_release(IntPtr e, uint token);
         [DllImport(DLL, CallingConvention = CC)] public static extern void bwa_scene_set_mesh_mat(IntPtr e, float[] verts, int nverts, int[] tris, int ntris, uint[] triMaterial);
         [DllImport(DLL, CallingConvention = CC)] public static extern void bwa_scene_set_box(IntPtr e, float w, float h, float d, uint[] faces);
+        // The outdoor degenerate of the box: ONE horizontal mirror plane at height y (room metres) — the
+        // ground bounce, the dominant early reflection when there is no room. Replaces any prior box
+        // (one room at a time); live-safe like the box (reflections re-solve next block); works with and
+        // without the Steam build.
+        // pressureRelease flips the reflection's polarity — set it when the "ground" is a water surface
+        // and the listener is under it (the Lloyd's-mirror comb).
+        [DllImport(DLL, CallingConvention = CC)] public static extern void bwa_scene_set_ground(IntPtr e, float y, uint mat, [MarshalAs(UnmanagedType.I1)] bool pressureRelease);
+        // Flag box faces whose image-source reflection NEGATES (bit f = face f, -x,+x,-y,+y,-z,+z order):
+        // reflecting off a much softer medium inverts (an underwater room's ceiling = the surface:
+        // 1u << 3). ISM only — occlusion/reverb keep the face's material. Call AFTER set_box/set_ground;
+        // a later room call resets every face.
+        [DllImport(DLL, CallingConvention = CC)] public static extern void bwa_scene_set_pressure_release(IntPtr e, uint faceMask);
         // Dynamic (movable) occluders/reflectors — an instanced sub-scene placed by a rigid transform, so
         // moving it is a cheap BVH refit (physics-collider-with-a-transform). add returns a handle >= 0 or
         // -1; geometry is in the mover's LOCAL space (room handedness), placed with set_dynamic_transform.
@@ -243,7 +286,7 @@ namespace BwAudio
 
         // ---- reflection bed ----
         [DllImport(DLL, CallingConvention = CC)] public static extern void bwa_reflections_config(IntPtr e, in BwaReflectionsDesc cfg);
-        [DllImport(DLL, CallingConvention = CC)] public static extern void bwa_reverb_set_gain(IntPtr e, float linear);
+        [DllImport(DLL, CallingConvention = CC)] public static extern void bwa_set_reverb_gain(IntPtr e, float linear);
         [DllImport(DLL, CallingConvention = CC)] public static extern void bwa_source_set_reverb(IntPtr e, uint s, [MarshalAs(UnmanagedType.I1)] bool on);
         [DllImport(DLL, CallingConvention = CC)] public static extern void bwa_source_set_reverb_send(IntPtr e, uint s, float gain);
         [DllImport(DLL, CallingConvention = CC)] public static extern void bwa_source_set_reverb_distance(IntPtr e, uint s, [MarshalAs(UnmanagedType.I1)] bool on);
@@ -255,6 +298,10 @@ namespace BwAudio
         // bwa_create and bwa_start). Decay is a DESIGN parameter — do not copy the room's measured RT60;
         // the real room adds its own on top.
         [DllImport(DLL, CallingConvention = CC)] public static extern void bwa_fdn_config(IntPtr e, in BwaFdnDesc cfg);
+        // LIVE decay retune — the room-transition knob: the tail keeps ringing, only its slope changes
+        // (the FDN ramps its loss gains over ~5 ms). <= 0 keeps a parameter's current value; before
+        // Start it just updates the staged config, so call it unconditionally on a scene change.
+        [DllImport(DLL, CallingConvention = CC)] public static extern void bwa_fdn_set_decay(IntPtr e, float rt60LowS, float rt60HighS, float xoverHz);
 
         // ---- image-source EARLY reflections (per source; no SDK needed) ----
         // The other half of the phonon-free acoustics path: the FDN renders the late diffuse tail, this
@@ -263,7 +310,7 @@ namespace BwAudio
         // listener-relative panner, so reflections keep correct direction AND parallax as the listener
         // walks — which no shared reverb bed can do. Needs the room: call bwa_scene_set_box first.
         [DllImport(DLL, CallingConvention = CC)] public static extern void bwa_source_set_early_reflections(IntPtr e, uint s, [MarshalAs(UnmanagedType.I1)] bool on);
-        [DllImport(DLL, CallingConvention = CC)] public static extern void bwa_early_reflections_set_gain(IntPtr e, float linear);   // default 1; live
+        [DllImport(DLL, CallingConvention = CC)] public static extern void bwa_set_early_reflections_gain(IntPtr e, float linear);   // default 1; live
 
         // ---- propagation effects (no SDK needed; opt-in per source, default off) ----
         [DllImport(DLL, CallingConvention = CC)] public static extern void  bwa_source_set_doppler(IntPtr e, uint s, [MarshalAs(UnmanagedType.I1)] bool on);
@@ -271,13 +318,32 @@ namespace BwAudio
         // Equal-loudness distance compensation: an LF shelf tracking the panner's attenuation ("far, not
         // tinny"). A perceptual stylization, not physics — leave off for strict realism.
         [DllImport(DLL, CallingConvention = CC)] public static extern void  bwa_source_set_loudness_comp(IntPtr e, uint s, [MarshalAs(UnmanagedType.I1)] bool on);
+        // Near-field proximity boost: an LF shelf that RISES as the source closes inside ~1 m (up to
+        // +6 dB at the head) — the spherical-wavefront proximity effect, loudness comp's near mirror:
+        // at arm's length a source reads as BASS, not just level.
+        [DllImport(DLL, CallingConvention = CC)] public static extern void  bwa_source_set_proximity(IntPtr e, uint s, [MarshalAs(UnmanagedType.I1)] bool on);
+        // Engine-wide speed of sound (m/s; default 343 = air; live). Everything rendering a propagation
+        // DELAY derives from it — Doppler (delay + pitch magnitude) and the image-source reflection
+        // delays — and a change GLIDES every delay to its new target (bends, never steps). 1480 =
+        // underwater; small values exaggerate Doppler for slow motion. Clamped to [30, 20000].
+        [DllImport(DLL, CallingConvention = CC)] public static extern void  bwa_set_speed_of_sound(IntPtr e, float metersPerSec);
+        // Override the LAYOUT's distance-attenuation curve for one source: atten = clamp((refDist /
+        // max(d, refDist))^rolloff, minGain, 1). rolloff 0 = constant level at any distance (a direction-only
+        // cue that never fades); refDist <= 0 CLEARS the override (back to the layout curve). Applied by ratio,
+        // so it composes with spread / dual-band / decorrelation / loudness comp. Mono point sources only.
+        [DllImport(DLL, CallingConvention = CC)] public static extern void  bwa_source_set_attenuation_override(IntPtr e, uint s, float refDist, float rolloff, float minGain);
         [DllImport(DLL, CallingConvention = CC)] public static extern void  bwa_source_set_spread(IntPtr e, uint s, float amount);
+        // Anisotropic extent (BS.2127-style width/height, each 0..1): a shoreline is wide but not tall, rain
+        // tall but not wide. Equal values behave as the isotropic spread; bwa_source_set_spread resets to
+        // isotropic (last call wins). Rides the spread mode, the size/near floors, and decorrelation.
+        [DllImport(DLL, CallingConvention = CC)] public static extern void  bwa_source_set_extent(IntPtr e, uint s, float width, float height);
         // Source size in METRES (radius; 0 = point). The physical alternative to the angular spread above:
         // the width is the angle the radius subtends from the listener, so a 2 m source STAYS 2 m wide as
         // the listener walks. Floors spread (the larger of the two wins).
         [DllImport(DLL, CallingConvention = CC)] public static extern void  bwa_source_set_size(IntPtr e, uint s, float radiusM);
 
-        // ---- directivity ----
+        // ---- directivity (works in EVERY build: with a Steam scene the sim evaluates it; without one
+        // the audio thread evaluates the same weighted dipole per block — walk-correct either way) ----
         [DllImport(DLL, CallingConvention = CC)] public static extern void  bwa_source_set_orientation(IntPtr e, uint s, float qx, float qy, float qz, float qw);
         [DllImport(DLL, CallingConvention = CC)] public static extern void  bwa_source_set_directivity(IntPtr e, uint s, float weight, float power);
         [DllImport(DLL, CallingConvention = CC)] public static extern void  bwa_source_set_directivity_preset(IntPtr e, uint s, BwaDirectivity pattern);
@@ -315,6 +381,10 @@ namespace BwAudio
         // fewer decode sidelobes, better localization away from the sweet spot. Reaches the bed matrix
         // renderer and the FDN's line render; point-source panners and phonon's decodes are untouched.
         [DllImport(DLL, CallingConvention = CC)] public static extern void bwa_set_max_re(IntPtr e, [MarshalAs(UnmanagedType.I1)] bool on);
+        // Band-split max-rE (needs bwa_set_max_re on; live A/B): apply the taper only ABOVE the ~700 Hz
+        // crossover and keep the unweighted (rV-optimal) decode below — the ear localizes LF by pressure, HF
+        // by energy (the Gerzon basic-LF/max-rE-HF split). Bed matrix decodes only; the FDN stays broadband.
+        [DllImport(DLL, CallingConvention = CC)] public static extern void bwa_set_max_re_split(IntPtr e, [MarshalAs(UnmanagedType.I1)] bool on);
         // Decorrelate the WIDE part of spread sources (live A/B): per-speaker velvet-noise filters make the
         // copies mutually incoherent — real extent, no phantom collapse or comb-filtering as the listener
         // walks. Point sources (spread 0) are untouched.
@@ -323,7 +393,14 @@ namespace BwAudio
         // flying at the head widens instead of snapping across the nearest speaker. ~1.0 m is a good start.
         [DllImport(DLL, CallingConvention = CC)] public static extern void bwa_set_near_spread(IntPtr e, float radiusM);
         [DllImport(DLL, CallingConvention = CC)] public static extern void bwa_set_limiter(IntPtr e, [MarshalAs(UnmanagedType.I1)] bool on);
-        [DllImport(DLL, CallingConvention = CC)] public static extern void bwa_set_limiter_ceiling(IntPtr e, float ceilingDb);   // default -1 dBFS; clamped [-60, 0]
+        [DllImport(DLL, CallingConvention = CC)] public static extern void bwa_set_limiter_ceiling(IntPtr e, float linear);   // linear peak ceiling in (0..1]; default 0.891251f (-1 dBFS)
+        // Headphone correction EQ (the headphone-side align stage): parse an AutoEq ParametricEQ.txt
+        // into a biquad cascade on the final stereo of every headphone profile (binaural/cave_sim/
+        // cave_both's tap; inert in cave). Load-class (file I/O, may block — not per-frame); a parse
+        // failure returns ErrConfig, keeps the previous EQ, and bwa_last_error has the reason.
+        // null/"" clears. The bool is the ramped live A/B (default on: loading engages).
+        [DllImport(DLL, CallingConvention = CC)] public static extern BwaResult bwa_load_headphone_eq(IntPtr e, [MarshalAs(UnmanagedType.LPUTF8Str)] string path);
+        [DllImport(DLL, CallingConvention = CC)] public static extern void bwa_set_headphone_eq(IntPtr e, [MarshalAs(UnmanagedType.I1)] bool on);
         // One ramped scalar over the whole mix, applied BEFORE the per-speaker align stage (trims + the raw
         // channel-test signal stay calibrated) and before the limiter. The volume knob / scene fade. Live.
         [DllImport(DLL, CallingConvention = CC)] public static extern void bwa_set_master_gain(IntPtr e, float linear);
@@ -342,11 +419,11 @@ namespace BwAudio
         // The engine writes p[0..2] and q[0..3] UNCONDITIONALLY — p must be length>=3, q length>=4, both
         // non-null, or the native write corrupts memory. Prefer the GetListenerPose helper below.
         [DllImport(DLL, CallingConvention = CC)] public static extern void bwa_get_listener_pose(IntPtr e, [Out] float[] p, [Out] float[] q);
-        // Pose prediction (internal tracking only; 0 = off): lead the TRACKED position by `leadMs` along the
-        // tracker's own velocity, hiding the motion-to-ears latency. Set it to your MEASURED latency —
-        // too much lead overshoots on direction changes (clamped at 200 ms). No effect when Unity feeds
+        // Pose prediction (internal tracking only; 0 = off): lead the TRACKED position by `leadS` SECONDS along
+        // the tracker's own velocity, hiding the motion-to-ears latency. Set it to your MEASURED latency —
+        // too much lead overshoots on direction changes (clamped at 0.2 s). No effect when Unity feeds
         // the pose (bwa_set_listener_pose): predict on your side instead.
-        [DllImport(DLL, CallingConvention = CC)] public static extern void bwa_set_pose_prediction(IntPtr e, float leadMs);
+        [DllImport(DLL, CallingConvention = CC)] public static extern void bwa_set_pose_prediction(IntPtr e, float leadS);
         // Extra listeners (multi-occupant compromise panning; up to 3, count 0 = off/single-listener). `xyz`
         // is count*3 floats in ROOM space — the OTHER occupants; the primary stays bwa_set_listener_pose /
         // tracking. Every source's gains become the per-speaker energy mean of the per-listener solves.
@@ -355,11 +432,6 @@ namespace BwAudio
         [DllImport(DLL, CallingConvention = CC)] public static extern void bwa_commit(IntPtr e);
 
         // ---- convenience ----
-        /// <summary>Mint a built-in material by preset (the extern is already typed — bwa_material_preset
-        /// takes the enum natively; this alias just reads better at call sites).</summary>
-        public static uint MaterialPreset(IntPtr e, BwaMaterialPreset preset)
-            => bwa_material_preset(e, preset);
-
         /// <summary>Human-readable last error (null if clean). Does not take ownership of the pointer.</summary>
         public static string LastError(IntPtr e)
         {
@@ -372,6 +444,17 @@ namespace BwAudio
         {
             var p = bwa_get_audio_backend(e);
             return p == IntPtr.Zero ? null : Marshal.PtrToStringUTF8(p);
+        }
+
+        /// <summary>Registered ASIO driver `index`'s name (the exact string BwaDesc.asioDriver expects), or
+        /// null if the index is out of range. Engine-free — call it before bwa_create (with
+        /// bwa_get_asio_driver_count) to build a driver picker.</summary>
+        public static string AsioDriverName(uint index)
+        {
+            var buf = new byte[256];
+            if (!bwa_get_asio_driver_name(index, buf, (uint)buf.Length)) return null;
+            int len = Array.IndexOf(buf, (byte)0);
+            return System.Text.Encoding.UTF8.GetString(buf, 0, len < 0 ? buf.Length : len);
         }
 
         /// <summary>Read the listener pose the engine is rendering with. Always allocates the correct

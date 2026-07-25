@@ -73,9 +73,6 @@ namespace BwAudio
         /// seconds = Playhead / Engine.Instance.sampleRate.</summary>
         public ulong Playhead => _created && Eng != IntPtr.Zero ? Bwa.bwa_bed_get_playhead(Eng, _bed) : 0;
 
-        [System.Obsolete("Renamed to Playhead.")]
-        public ulong Position => Playhead;
-
         /// <summary>Master gain of the bed (ramped); applies immediately if live.</summary>
         public float Gain
         {

@@ -18,7 +18,7 @@ namespace BwAudio
         [Header("Engine")]
         public BwaProfile profile = BwaProfile.Binaural;   // inspector dropdown; maps 1:1 to the C enum
         [Tooltip("The surveyed speaker geometry, as a path RELATIVE TO Assets/StreamingAssets/ " +
-                 "(create that folder and put cave_layout.json in it). Used by the cave/both profiles. " +
+                 "(create that folder and put cave_layout.json in it). Used by the cave/cave_both profiles. " +
                  "If it fails to load the engine falls back to its default 26-speaker grid and logs an " +
                  "error — it does NOT stop, so a smaller rig would silently pan over the wrong geometry.")]
         [Clip(".json")] public string layoutFile = "cave_layout.json";
@@ -50,9 +50,9 @@ namespace BwAudio
                  "listener and N wrong ones. Pushed every frame, like the primary listener.")]
         public Transform[] extraListeners;
         [Tooltip("Internal tracking only (Feed Listener off): lead the tracked position by your MEASURED " +
-                 "motion-to-ears latency (typically 20-40 ms). Too much lead overshoots on direction " +
-                 "changes. 0 = off.")]
-        [Range(0f, 200f)] public float posePredictionMs = 0f;
+                 "motion-to-ears latency, in SECONDS (typically 0.02-0.04 s). Too much lead overshoots on " +
+                 "direction changes. 0 = off.")]
+        [Range(0f, 0.2f)] public float posePredictionS = 0f;
 
         [Header("Output")]
         [Tooltip("One ramped scalar over the whole mix — applied before the per-speaker trims (which stay " +
@@ -62,7 +62,9 @@ namespace BwAudio
                  "never shifts the spatial image. Protection against digital overs, NOT mastering — if it " +
                  "engages in normal use, turn the content down.")]
         public bool limiter = true;
-        [Range(-60f, 0f)] public float limiterCeilingDb = -1f;
+        [Tooltip("Limiter ceiling as a LINEAR peak amplitude in (0..1] (like every other gain). " +
+                 "0.891251 = -1 dBFS, the default.")]
+        [Range(0.001f, 1f)] public float limiterCeiling = 0.891251f;   // floor > 0: the engine IGNORES <= 0, so a 0 here would silently diverge from it
 
         [Header("Panning")]
         [Tooltip("DBAP: listener-relative, for a MOVING observer (the CAVE case). SPCAP/VBAP assume a " +
@@ -83,6 +85,9 @@ namespace BwAudio
         [Tooltip("Widen sources that come close to the head, instead of letting them snap across the " +
                  "nearest speaker. ~1 m is a good start; 0 = off.")]
         public float nearSpreadRadius = 0f;
+        [Tooltip("Speed of sound (m/s; live). Doppler and reflection delays derive from it and GLIDE to " +
+                 "a change. 343 = air, 1480 = underwater; small values exaggerate Doppler (slow motion).")]
+        public float speedOfSound = 343f;
         [Tooltip("For layouts carrying a room_eq_grid (bwa_calibrate --room-eq-grid): re-interpolate the LF " +
                  "modal cuts at the live listener position. No-op without a grid; this is the kill switch.")]
         public bool trackedRoomEq = true;
@@ -99,6 +104,10 @@ namespace BwAudio
                  "orders — fewer decode sidelobes, better localization AWAY from the sweet spot (the " +
                  "walking-listener case), slightly wider main lobe. Live A/B, level-fair.")]
         public bool maxRe = false;
+        [Tooltip("Band-split max-rE (needs Max Re on): apply the taper only ABOVE ~700 Hz and keep the " +
+                 "unweighted decode below — the ear localizes LF by pressure (plain decode) and HF by " +
+                 "energy (max-rE). The Gerzon basic-LF/max-rE-HF split. Bed matrix decodes only. Live A/B.")]
+        public bool maxReSplit = false;
 
         [Header("Early reflections (image-source; no SDK needed)")]
         [Tooltip("Level of the per-source wall bounces (opt a source in with Emitter.earlyReflections). " +
@@ -158,7 +167,7 @@ namespace BwAudio
         public IntPtr Handle => _eng;
         public bool Ready => _eng != IntPtr.Zero;
 
-        readonly List<Emitter> _emitters = new();
+        readonly List<SourceBase> _sources = new();   // every source component (Emitter + PushEmitter), one registry
         readonly Dictionary<string, uint> _sounds = new();
         // Material tokens are minted into a FIXED 64-slot engine table and never freed, so mint each
         // MaterialAsset / preset ONCE and reuse it across every scene load — re-minting per load leaks
@@ -281,15 +290,17 @@ namespace BwAudio
             Bwa.bwa_set_spread_mode(_eng, spreadMode);
             Bwa.bwa_set_decorrelation(_eng, decorrelation);
             Bwa.bwa_set_near_spread(_eng, nearSpreadRadius);
+            Bwa.bwa_set_speed_of_sound(_eng, speedOfSound);
             Bwa.bwa_set_bed_renderer(_eng, bedRenderer);
             Bwa.bwa_set_max_re(_eng, maxRe);
+            Bwa.bwa_set_max_re_split(_eng, maxReSplit);
             Bwa.bwa_set_tracked_room_eq(_eng, trackedRoomEq);
             Bwa.bwa_set_master_gain(_eng, masterGain);
-            Bwa.bwa_reverb_set_gain(_eng, reverbGain);   // valid pre-start: seeds whichever reverb bed bwa_start creates
-            Bwa.bwa_early_reflections_set_gain(_eng, earlyReflectionGain);
+            Bwa.bwa_set_reverb_gain(_eng, reverbGain);   // valid pre-start: seeds whichever reverb bed bwa_start creates
+            Bwa.bwa_set_early_reflections_gain(_eng, earlyReflectionGain);
             Bwa.bwa_set_limiter(_eng, limiter);
-            Bwa.bwa_set_limiter_ceiling(_eng, limiterCeilingDb);
-            Bwa.bwa_set_pose_prediction(_eng, feedListener ? 0f : posePredictionMs);   // internal tracking only
+            Bwa.bwa_set_limiter_ceiling(_eng, limiterCeiling);
+            Bwa.bwa_set_pose_prediction(_eng, feedListener ? 0f : posePredictionS);   // internal tracking only
         }
 
         // Inspector edits take effect live in Play mode — that IS the workflow for these (the engine makes
@@ -335,6 +346,14 @@ namespace BwAudio
             _sounds[key] = s; return s;
         }
 
+        /// <summary>Length of a clip in engine-rate frames (seconds = SoundFrames / sampleRate). Loads it on
+        /// demand (cached, like Load). 0 for an unknown/failed clip, or a stream of unknown length.</summary>
+        public ulong SoundFrames(string clip) { var s = Load(clip); return s != 0 ? Bwa.bwa_sound_get_frames(_eng, s) : 0; }
+
+        /// <summary>Channel count of a clip: 1 for a mono point-source asset, 4/9/16 for an ambisonic bed
+        /// (order 1/2/3). Loads it on demand (cached). 0 for an unknown/failed clip.</summary>
+        public uint SoundChannels(string clip) { var s = Load(clip); return s != 0 ? Bwa.bwa_sound_get_channels(_eng, s) : 0; }
+
         /// <summary>Mint one of the engine's built-in materials. Cached (minted once per preset), so
         /// calling it per scene load is safe — null-engine-safe too.</summary>
         public uint MaterialPreset(BwaMaterialPreset preset) => Ready ? ResolvePreset(preset) : 0;
@@ -343,7 +362,7 @@ namespace BwAudio
         public float ReverbGain
         {
             get => reverbGain;
-            set { reverbGain = value; if (Ready) Bwa.bwa_reverb_set_gain(_eng, value); }
+            set { reverbGain = value; if (Ready) Bwa.bwa_set_reverb_gain(_eng, value); }
         }
 
         /// <summary>Level of the image-source EARLY reflections (the per-source wall bounces, opted into
@@ -352,20 +371,43 @@ namespace BwAudio
         public float EarlyReflectionGain
         {
             get => earlyReflectionGain;
-            set { earlyReflectionGain = value; if (Ready) Bwa.bwa_early_reflections_set_gain(_eng, value); }
+            set { earlyReflectionGain = value; if (Ready) Bwa.bwa_set_early_reflections_gain(_eng, value); }
         }
 
         /// <summary>Output protection limiter (engine default: ON at -1 dBFS). Linked across the channels —
         /// engaging never shifts the spatial image. Protection against digital overs, not mastering: if it
         /// engages in normal use, turn the content down.</summary>
         public void SetLimiter(bool on) { limiter = on; if (Ready) Bwa.bwa_set_limiter(_eng, on); }
-        public void SetLimiterCeiling(float ceilingDb) { limiterCeilingDb = ceilingDb; if (Ready) Bwa.bwa_set_limiter_ceiling(_eng, ceilingDb); }
+        // Clamped into (0..1] BEFORE caching: the engine silently ignores <= 0, so an unclamped 0 would
+        // leave the field claiming a ceiling the engine isn't running (0.001 = the old -60 dB floor).
+        public void SetLimiterCeiling(float linear) { limiterCeiling = Mathf.Clamp(linear, 0.001f, 1f); if (Ready) Bwa.bwa_set_limiter_ceiling(_eng, limiterCeiling); }
 
         /// <summary>Master gain over the whole mix (ramped — slider drags never zipper). The volume knob.</summary>
         public float MasterGain
         {
             get => masterGain;
             set { masterGain = value; if (Ready) Bwa.bwa_set_master_gain(_eng, value); }
+        }
+
+        /// <summary>Engine-wide speed of sound (m/s; live). Doppler and reflection delays derive from it
+        /// and glide to a change — 343 air, 1480 underwater; small values exaggerate Doppler for slow
+        /// motion. Engine-side clamp [30, 20000].</summary>
+        public float SpeedOfSound
+        {
+            get => speedOfSound;
+            set { speedOfSound = value; if (Ready) Bwa.bwa_set_speed_of_sound(_eng, value); }
+        }
+
+        /// <summary>Retune the FDN reverb's decay LIVE — the room-transition knob: the tail keeps
+        /// ringing, only its slope changes (stepping into a cathedral, submerging, walking outside).
+        /// Values &lt;= 0 keep the current setting. Needs 'Enable Fdn Reverb'; pair with ReverbGain for
+        /// the wet level.</summary>
+        public void FdnSetDecay(float rt60LowSeconds, float rt60HighSeconds, float crossoverHz)
+        {
+            if (rt60LowSeconds  > 0f) fdnRt60LowSeconds  = rt60LowSeconds;
+            if (rt60HighSeconds > 0f) fdnRt60HighSeconds = rt60HighSeconds;
+            if (crossoverHz     > 0f) fdnCrossoverHz     = crossoverHz;
+            if (Ready) Bwa.bwa_fdn_set_decay(_eng, rt60LowSeconds, rt60HighSeconds, crossoverHz);
         }
 
         /// <summary>Global pause (focus loss, menu): EVERY voice — sources, streams, beds — ramps out and
@@ -392,10 +434,12 @@ namespace BwAudio
         public void SetNearSpread(float radiusM) { nearSpreadRadius = radiusM; if (Ready) Bwa.bwa_set_near_spread(_eng, radiusM); }
         public void SetBedRenderer(BwaBedRenderer r) { bedRenderer = r; if (Ready) Bwa.bwa_set_bed_renderer(_eng, r); }
         public void SetMaxRe(bool on)            { maxRe = on;        if (Ready) Bwa.bwa_set_max_re(_eng, on); }
+        /// <summary>Band-split max-rE (needs max-rE on): taper only above ~700 Hz, plain decode below. Live A/B.</summary>
+        public void SetMaxReSplit(bool on)       { maxReSplit = on;   if (Ready) Bwa.bwa_set_max_re_split(_eng, on); }
         public void SetTrackedRoomEq(bool on)    { trackedRoomEq = on; if (Ready) Bwa.bwa_set_tracked_room_eq(_eng, on); }
-        /// <summary>Lead the TRACKED pose by `ms` to hide motion-to-ears latency. Internal tracking only
+        /// <summary>Lead the TRACKED pose by `seconds` to hide motion-to-ears latency. Internal tracking only
         /// (Feed Listener off) — when Unity feeds the pose, predict on the Unity side instead.</summary>
-        public void SetPosePrediction(float ms)  { posePredictionMs = ms; if (Ready && !feedListener) Bwa.bwa_set_pose_prediction(_eng, ms); }
+        public void SetPosePrediction(float seconds)  { posePredictionS = seconds; if (Ready && !feedListener) Bwa.bwa_set_pose_prediction(_eng, seconds); }
 
         // ---- readback (per-frame-safe: no locks, no allocation in the engine) -------------------------
         /// <summary>The engine's ACTIVE channel count — the layout's speaker count (4..26), NOT a constant.
@@ -461,6 +505,17 @@ namespace BwAudio
         /// physical output (the silent null-sink fallback).</summary>
         public uint OutputLatency => Ready ? Bwa.bwa_get_output_latency(_eng) : 0;
 
+        /// <summary>How fast the device clock runs against the host clock, fitted over the per-block
+        /// stamps (~2 min window). DspTimeAt re-anchors every frame and needs none of this; reach for
+        /// it when something ELSE owns the timeline (video, timecode, another node), when you want a
+        /// minutes-long extrapolation to hold, or to log the rig's drift. False until the fit has ~1 s
+        /// of stamps, and again for ~1 s after a restart re-bases the device sample position.</summary>
+        public bool GetClockModel(out Bwa.BwaClockModel model)
+        {
+            model = default;
+            return Ready && Bwa.bwa_get_clock_model(_eng, out model);
+        }
+
         /// <summary>Map a Time.realtimeSinceStartupAsDouble moment to the dsp-sample clock — THE way
         /// to land a sound on a visual event: <c>emitter.PlayAt(engine.DspTimeAt(tEvent))</c> (schedule
         /// with margin; a start in the past plays immediately). Built on the device's own block stamps
@@ -515,6 +570,15 @@ namespace BwAudio
         /// <summary>Drive ONE raw output channel with a test tone — a speaker-check / wiring tool, injected
         /// after the per-speaker trims. NOT a spatial path (it bypasses the panner). gain 0 or Off silences.</summary>
         public void TestSignal(uint channel, BwaTestKind kind, float gain) { if (Ready) Bwa.bwa_set_test_signal(_eng, channel, kind, gain); }
+
+        // ---- ASIO driver enumeration (engine-free: no handle, safe before the Engine exists) ---------
+        /// <summary>Number of ASIO drivers registered on this machine — engine-free, so it works before an
+        /// Engine is created (populate a picker for `asioDriver`). Reads the registry fresh each call.</summary>
+        public static uint AsioDriverCount => Bwa.bwa_get_asio_driver_count();
+
+        /// <summary>Registered ASIO driver `index`'s name (the exact string `asioDriver` expects), or null if
+        /// out of range. Engine-free — pair with AsioDriverCount to list the installed drivers.</summary>
+        public static string AsioDriverName(uint index) => Bwa.AsioDriverName(index);
 
         // ---- dynamic (movable) acoustic geometry --------------------------------------------------
         // Register a movable occluder/reflector from a LOW-POLY mesh (the acoustic analogue of a physics
@@ -587,7 +651,7 @@ namespace BwAudio
         uint ResolvePreset(BwaMaterialPreset p)
         {
             if (_presetCache.TryGetValue(p, out var t)) return t;
-            t = Bwa.MaterialPreset(_eng, p); _presetCache[p] = t; return t;
+            t = Bwa.bwa_material_preset(_eng, p); _presetCache[p] = t; return t;
         }
         /// <summary>Release a material minted via ResolveMaterial so the engine can reuse its table slot
         /// (evicts the cache; a later ResolveMaterial re-mints). Caller-managed lifetime — only release a
@@ -597,6 +661,31 @@ namespace BwAudio
         {
             if (!Ready || a == null) return;
             if (_matCache.TryGetValue(a, out var t)) { Bwa.bwa_material_release(_eng, t); _matCache.Remove(a); }
+        }
+
+        /// <summary>The outdoor degenerate of the room box: ONE horizontal mirror plane at the given
+        /// Unity-world height — the ground bounce, the dominant early reflection when there is no room.
+        /// REPLACES the room box (one room at a time), so use it with 'Enable Room Box' off. Live-safe:
+        /// the room publishes to the audio thread lock-free and reflections re-solve next block, so
+        /// call it from Start or mid-game (a scene transition). Set pressureRelease
+        /// when the "ground" is a water surface and the listener is under it — the reflection inverts
+        /// (the Lloyd's-mirror comb that makes near-surface sources sound thin).</summary>
+        public void SceneSetGround(float worldY, MaterialAsset material = null, bool pressureRelease = false)
+        {
+            if (!Ready) return;
+            float roomY = Room.Pos(new Vector3(0f, worldY, 0f)).y;   // registration offset applies to heights too
+            Bwa.bwa_scene_set_ground(_eng, roomY, ResolveMaterial(material), pressureRelease);
+        }
+
+        /// <summary>Flag room-box faces whose image-source reflection inverts (pressure-release: the
+        /// physics of reflecting off a much softer medium). Bit f = face f in the box order
+        /// -x,+x,-y,+y,-z,+z; the flagship case is an underwater room whose ceiling is the surface:
+        /// 1u &lt;&lt; 3. Image-source only (occlusion and reverb keep the face's material); call after
+        /// the box/ground exists; live-safe like the room calls, and a later box/ground call resets
+        /// every face.</summary>
+        public void SceneSetPressureRelease(uint faceMask)
+        {
+            if (Ready) Bwa.bwa_scene_set_pressure_release(_eng, faceMask);
         }
 
         // Load-time (Awake) scene bake. The box-ONLY case uses the engine's own box helper, which also
@@ -706,10 +795,14 @@ namespace BwAudio
             tris.Add(baseIdx + i0); tris.Add(baseIdx + i1); tris.Add(baseIdx + i2);
         }
 
-        readonly List<Emitter> _pushBuf = new();   // reusable snapshot (Push may unregister mid-loop)
+        readonly List<SourceBase> _pushBuf = new();   // reusable snapshot (a FrameSync callback may unregister mid-loop)
 
-        public void Register(Emitter e)   { if (!_emitters.Contains(e)) _emitters.Add(e); }
-        public void Unregister(Emitter e) => _emitters.Remove(e);
+        // One registry for every source kind (Emitter's clip voices and PushEmitter's push voices ride
+        // the same centralized per-frame push, before the listener + the one commit), all flowing
+        // through the same snapshot — so a callback that mutates the registry mid-loop is safe no
+        // matter which source kind fires it.
+        public void Register(SourceBase s)   { if (!_sources.Contains(s)) _sources.Add(s); }
+        public void Unregister(SourceBase s) => _sources.Remove(s);
 
         void LateUpdate()
         {
@@ -721,11 +814,11 @@ namespace BwAudio
                 RebuildSceneMesh(FindObjectsByType<AcousticGeometry>(FindObjectsSortMode.None));
             }
             // Iterate a snapshot: an emitter's onFinished handler may disable it, which runs OnDisable ->
-            // Unregister -> _emitters.Remove mid-loop. Mutating the list under a foreach would throw and
+            // Unregister -> _sources.Remove mid-loop. Mutating the list under a foreach would throw and
             // skip the commit. _pushBuf is cleared+refilled (no per-frame allocation after warmup).
             _pushBuf.Clear();
-            _pushBuf.AddRange(_emitters);
-            foreach (var e in _pushBuf) if (e) e.Push();           // all sources first...
+            _pushBuf.AddRange(_sources);
+            foreach (var s in _pushBuf) if (s) s.FrameSync();      // all sources first...
             if (feedListener && listener)
             {
                 var p = Room.Pos(listener.position);
