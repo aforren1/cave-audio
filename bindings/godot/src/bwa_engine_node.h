@@ -251,6 +251,9 @@ public:
 	/* {valid: bool, dsp_sample: int, host_time_ns: int} — the jitter-free wall<->dsp pair. */
 	Dictionary get_clock() const;
 	int get_output_latency() const;
+	/* {valid: bool, ppm: float, ppm_sigma: float, rate_hz: float, span_s: float, jitter_ns: float,
+	 * stamps: int} — the fitted device-vs-host drift, for a timeline you don't own or a rig log. */
+	Dictionary get_clock_model() const;
 
 	/* --- diagnostics --- */
 	void set_test_signal(int channel, TestKind kind, float gain);

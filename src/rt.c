@@ -35,6 +35,13 @@
 #define EVT_CAP  1024          /* power of two */
 #define BWA_RT_MAX_BLOCK 8192   /* aux-send scratch cap; must be >= any device block (matches engine's BWA_MAX_BLOCK) */
 
+/* clock-drift fit (RtCore.fit_*): the exponential window and the point at which the slope is worth
+ * reporting. TAU trades convergence against precision — 120 s is ~22k stamps at 256/48k, enough to
+ * pull sub-ppm out of stamp jitter, and short enough to follow a crystal warming up. Below MIN_SPAN
+ * the lever arm is too short for the number to mean anything, so rt_get_clock_model reports nothing. */
+#define BWA_CLK_TAU_S      120.0
+#define BWA_CLK_MIN_SPAN_S   1.0
+
 /* propagation effects (opt-in, per voice) */
 #define BWA_SPEED_OF_SOUND   343.0f    /* m/s — the DEFAULT; live via rt_set_speed_of_sound (RtCore.sos) */
 #define BWA_SOS_MIN           30.0f    /* settable range: below ~30 m/s every delay saturates its ring */
@@ -402,6 +409,25 @@ struct RtCore {
      * carrying a valid host stamp publish (ts NULL / time 0 keeps the last good pair). */
     _Atomic uint32_t clk_seq;
     _Atomic uint64_t clk_sample, clk_time;
+    /* Long-horizon drift fit. The pair above is an EXACT instant, but extrapolating it at the
+     * NOMINAL rate drifts: the device crystal and the host clock are different oscillators, and
+     * 10 ppm is 36 ms per hour — the whole long-show AV-sync problem. So fit the slope too, by
+     * exponentially weighted least squares over the same per-block stamps (rate against the host
+     * clock, plus its own standard error). Audio-thread-owned accumulators updated with the stable
+     * weighted-Welford form (~30 flops a block, no transcendentals); the derived model publishes
+     * inside the SAME seqlock window as the pair, bit-cast through uint64 because this core keeps
+     * its published fields in _Atomic slots. */
+    double   fit_x0, fit_y0;              /* fit origin (host seconds, sample position) */
+    double   fit_w, fit_mx, fit_my;       /* weight sum + weighted means of (x-x0, y-y0) */
+    double   fit_cxx, fit_cxy;            /* weighted central moments */
+    double   fit_b;                        /* last fitted slope (samples per host second) */
+    double   fit_sse;                      /* weighted sum of squared prediction errors (see below) */
+    double   fit_span;                    /* host seconds since the fit was seeded */
+    double   fit_lam;                     /* per-block forgetting factor (derived for fit_nframes) */
+    uint32_t fit_nframes;                 /* block size fit_lam was derived for (0 = not yet) */
+    uint64_t fit_prev_s, fit_prev_t;      /* previous stamp, for discontinuity detection */
+    _Atomic uint64_t fit_ppm, fit_sigma, fit_rate, fit_spanp, fit_jit;  /* published, bit-cast doubles */
+    _Atomic uint32_t fit_stamps;          /* published effective stamp count; 0 = no usable fit */
     uint32_t   layout_gen;   /* bumped on rt_set_layout; the SPCAP/VBAP caches compare it to self-invalidate */
     SpcapState spcap;        /* SPCAP cache (audio-thread-owned; rebuilt on listener/layout change) */
     VbapState  vbap;         /* VBAP cache (same) */
@@ -2438,6 +2464,94 @@ static void room_eq_track(RtCore* c) {
     c->rq_state = 1;
 }
 
+/* A seqlock's payload is ordinary data, but this core keeps every published field in an _Atomic
+ * slot; bit-cast doubles through uint64 so they ride the same relaxed load/store. */
+static inline void   pub_d(_Atomic uint64_t* slot, double v) {
+    uint64_t u; memcpy(&u, &v, sizeof u); atomic_store_explicit(slot, u, memory_order_relaxed);
+}
+static inline double ld_d(const _Atomic uint64_t* slot) {
+    uint64_t u = atomic_load_explicit(slot, memory_order_relaxed); double v; memcpy(&v, &u, sizeof v); return v;
+}
+
+/* Audio thread: fold one device stamp into the drift fit and republish the model. Called from
+ * rt_render INSIDE the clock seqlock's write window, so the pair and the model a control-thread
+ * reader sees always describe the same block.
+ *
+ * The regression is host seconds -> sample position, both taken relative to the fit origin so the
+ * accumulators never carry the raw magnitudes (a host-time ns count is ~1e18; squaring it would eat
+ * the mantissa). Weighted-Welford updates keep it stable indefinitely: means move first, then the
+ * central moments accumulate against the UPDATED mean, all in deviations. */
+static void clk_fit_update(RtCore* c, uint64_t sample, uint64_t time_ns, uint32_t nframes) {
+    /* Discontinuity check. A stop/start cycle re-bases the device's sample position while the host
+     * clock keeps running, and a line fitted through that jump reports pure fiction — so reseed
+     * instead. Backwards on either axis is nonsense; an implied rate far off nominal means the two
+     * stamps do not belong to the same run. A genuine gap (a stalled callback) leaves the rate
+     * plausible and is harmless to a line fit, so it survives. */
+    if (c->fit_w > 0.0) {
+        bool ok = sample > c->fit_prev_s && time_ns > c->fit_prev_t;
+        if (ok) {
+            double dy = (double)(sample - c->fit_prev_s);
+            double dx = (double)(time_ns - c->fit_prev_t) * 1e-9;
+            double r  = dy / dx;                               /* samples per host second, this interval */
+            ok = r > 0.5 * (double)c->sample_rate && r < 2.0 * (double)c->sample_rate;
+        }
+        if (!ok) c->fit_w = 0.0;                               /* drop the fit; reseed below */
+    }
+    if (c->fit_w <= 0.0) {                                     /* seed: one point, at the origin */
+        c->fit_x0  = (double)time_ns * 1e-9;
+        c->fit_y0  = (double)sample;
+        c->fit_mx  = c->fit_my = c->fit_cxx = c->fit_cxy = c->fit_sse = c->fit_span = 0.0;
+        c->fit_b   = (double)c->sample_rate;                   /* prior: nominal, until the fit has a slope */
+        c->fit_w   = 1.0;
+        c->fit_prev_s = sample; c->fit_prev_t = time_ns;
+        atomic_store_explicit(&c->fit_stamps, 0, memory_order_relaxed);   /* no slope from one point */
+        return;
+    }
+    if (nframes != c->fit_nframes) {         /* forgetting factor per block; exp(-dt/TAU) to first order
+                                              * (dt/TAU ~ 4e-5 at 256/48k, so the linear form is exact
+                                              * to a part in 1e9 — and costs no libm on the audio thread) */
+        double dt = (double)nframes / (double)c->sample_rate;
+        double lam = 1.0 - dt / BWA_CLK_TAU_S;
+        c->fit_lam     = lam > 0.0 ? lam : 0.0;
+        c->fit_nframes = nframes;
+    }
+    const double lam = c->fit_lam;
+    const double x = (double)time_ns * 1e-9 - c->fit_x0;       /* host seconds since the origin */
+    const double y = (double)sample - c->fit_y0;               /* samples since the origin */
+    const double w = lam * c->fit_w + 1.0;
+    const double dx = x - c->fit_mx, dy = y - c->fit_my;
+    /* Residual of this stamp against the fit as it stood BEFORE it — a one-step prediction error,
+     * and the only numerically sound route to a residual here. The textbook closed form
+     * (Cyy - b*Cxy) subtracts two quantities of order 1e16 samples^2 to land on ~1e-7 and returns
+     * nothing but rounding noise, because the fit is near-perfect over a lever arm of millions of
+     * samples. This differs by two terms in comparable magnitudes, so it stays exact: the fit line
+     * passes through (mx, my), making the prediction at x exactly my + b*dx. Held off until the
+     * slope has a few points behind it, since a 2-point fit's b is meaningless. */
+    if (w >= 8.0) { const double r = dy - c->fit_b * dx; c->fit_sse = lam * c->fit_sse + r * r; }
+    c->fit_mx  += dx / w;
+    c->fit_my  += dy / w;
+    c->fit_cxx  = lam * c->fit_cxx + dx * (x - c->fit_mx);
+    c->fit_cxy  = lam * c->fit_cxy + dx * (y - c->fit_my);
+    c->fit_w    = w;
+    c->fit_span = x;
+    c->fit_prev_s = sample; c->fit_prev_t = time_ns;
+    if (c->fit_cxx > 0.0) c->fit_b = c->fit_cxy / c->fit_cxx;  /* fitted samples per host second */
+
+    if (c->fit_span < BWA_CLK_MIN_SPAN_S || c->fit_w < 16.0 || c->fit_cxx <= 0.0) {
+        atomic_store_explicit(&c->fit_stamps, 0, memory_order_relaxed);
+        return;                                                /* too short a lever arm to mean anything */
+    }
+    const double b   = c->fit_b;
+    const double var = c->fit_sse / (c->fit_w - 2.0);          /* residual variance, samples^2 */
+    const double rate = (double)c->sample_rate;
+    pub_d(&c->fit_rate,  b);
+    pub_d(&c->fit_ppm,   (b / rate - 1.0) * 1e6);
+    pub_d(&c->fit_sigma, sqrt(var / c->fit_cxx) / rate * 1e6); /* std error of the slope, in ppm */
+    pub_d(&c->fit_jit,   sqrt(var) / rate * 1e9);              /* rms residual, in ns */
+    pub_d(&c->fit_spanp, c->fit_span);
+    atomic_store_explicit(&c->fit_stamps, (uint32_t)(c->fit_w + 0.5), memory_order_relaxed);
+}
+
 void rt_render(RtCore* c, float* bus, uint32_t nframes, const bwa_timestamp* ts) {
     /* dsp clock for sample-accurate scheduling: prefer the device sample position (ASIO/null); fall
      * back to an internal block counter when no timestamp is supplied (e.g. direct rt_render in tests).
@@ -2452,7 +2566,8 @@ void rt_render(RtCore* c, float* bus, uint32_t nframes, const bwa_timestamp* ts)
         atomic_thread_fence(memory_order_release);                              /* the odd seq lands before the data */
         atomic_store_explicit(&c->clk_sample, block_start, memory_order_relaxed);
         atomic_store_explicit(&c->clk_time, ts->system_time_ns, memory_order_relaxed);
-        atomic_store_explicit(&c->clk_seq, cs + 2, memory_order_release);       /* even: pair consistent */
+        clk_fit_update(c, block_start, ts->system_time_ns, nframes);            /* + the drift model, same window */
+        atomic_store_explicit(&c->clk_seq, cs + 2, memory_order_release);       /* even: pair + model consistent */
     }
 #if defined(_MSC_VER)
     /* Flush denormals to zero on the audio thread: gain ramps toward 0 (e.g. a voice
@@ -2819,6 +2934,28 @@ bool rt_get_clock(RtCore* c, uint64_t* sample, uint64_t* time_ns) {
         return true;
     }
     return false;   /* persistently torn — cannot happen at block cadence (one write per ~5 ms) */
+}
+
+/* Control-thread readback of the drift fit (same seqlock as the pair, so the model and the pair a
+ * caller reads describe the same block). False with `out` untouched until the fit has BWA_CLK_MIN_SPAN_S
+ * of stamps behind it — before that the slope is dominated by stamp jitter and reporting it would
+ * invite a caller to act on noise. Reseeds (device restart, re-based sample position) take it back
+ * to false until the new fit earns its span. */
+bool rt_get_clock_model(RtCore* c, RtClockFit* out) {
+    if (!c || !out) return false;
+    for (int tries = 0; tries < 16; ++tries) {
+        uint32_t s1 = atomic_load_explicit(&c->clk_seq, memory_order_acquire);
+        if (s1 & 1u) continue;                          /* write in progress */
+        uint32_t n = atomic_load_explicit(&c->fit_stamps, memory_order_relaxed);
+        RtClockFit f = { ld_d(&c->fit_ppm), ld_d(&c->fit_sigma), ld_d(&c->fit_rate),
+                         ld_d(&c->fit_spanp), ld_d(&c->fit_jit), n };
+        atomic_thread_fence(memory_order_acquire);      /* the data loads land before the re-check */
+        if (atomic_load_explicit(&c->clk_seq, memory_order_relaxed) != s1) continue;
+        if (n == 0) return false;                       /* no usable fit yet */
+        *out = f;
+        return true;
+    }
+    return false;
 }
 
 /* Active listener pose, for the binaural monitor. Audio thread only (same thread as

@@ -29,6 +29,20 @@ All notable changes to `com.brainworks.bw_audio`.
   loading and toggling both crossfade. Reload after an engine rebuild (the correction dies with the
   engine; the Godot toggle itself replays on restart).
 
+### Added — clock drift
+
+- **`Engine.GetClockModel(out BwaClockModel)`** → new engine ABI `bwa_get_clock_model`: how fast the
+  device clock actually runs against the host clock. `bwa_get_clock`'s pair fixes an exact *instant*;
+  this fits the *slope* by exponentially weighted least squares over the same per-block stamps
+  (~2 min window, on the audio thread), and reports it as `ppm` with its own `ppmSigma`, plus
+  `rateHz`, `spanS`, `jitterNs` and the effective stamp count. `DspTimeAt` re-anchors every frame and
+  needs none of it — reach for this when something else owns the timeline (a video file, timecode,
+  another render node), when a minutes-long extrapolation has to hold (use `rateHz` in place of the
+  nominal rate), or to log the rig's drift. False until the fit has ~1 s of stamps, and again for
+  ~1 s after a restart re-bases the device sample position. `ppmSigma` assumes independent stamp
+  noise, so read it as a lower bound; `jitterNs` grades the *driver's* stamps, and a driver without
+  `kSystemTimeValid` reads worse because the QPC fallback adds dispatch noise.
+
 ### Changed — ABI breaks (pre-freeze cleanup, `BWA_VERSION` → 0.10.0)
 
 Deliberate, one-time ABI breaks before the pre-hardware freeze. Update call sites:

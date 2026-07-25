@@ -330,6 +330,33 @@ BWA_API uint64_t bwa_get_dsp_time(bwa_engine* e);
  * wall-free time (exact for arithmetic, not real wall time). Lock-free.
  * Full recipe (epochs, graphics-side events, Unity helpers): docs/api.md, "Syncing with graphics". */
 BWA_API bool     bwa_get_clock(bwa_engine* e, uint64_t* dsp_sample, uint64_t* host_time_ns);
+/* How fast the device clock runs against the host clock. bwa_get_clock's pair is an exact INSTANT,
+ * but extrapolating it at the nominal rate drifts — the two are different oscillators, and 10 ppm is
+ * 36 ms per hour, which is the whole long-show AV-sync problem. This is the slope: an exponentially
+ * weighted least-squares fit (~2 min window) over the per-block stamps, so
+ *   dsp_at(T) = dsp_sample + (T_ns - host_time_ns) * rate_hz / 1e9
+ * stays true across a show instead of only near the anchor. Re-anchoring per frame off bwa_get_clock
+ * needs none of this; a MINUTES-long extrapolation, a drift readout for the rig log, or reconciling
+ * with an external master (video, timecode, another node) does. */
+typedef struct bwa_clock_model {
+    double   ppm;        /* device clock vs host clock, parts per million (+ = device fast) */
+    double   ppm_sigma;  /* 1-sigma standard error of `ppm` — the fit's own confidence. Assumes
+                          * independent stamp noise, so real correlated jitter makes it optimistic:
+                          * read it as a lower bound. Shrinks as span_s grows. */
+    double   rate_hz;    /* fitted device rate in samples per host second (nominal x (1 + ppm/1e6)) */
+    double   span_s;     /* host seconds of stamps behind the fit; the number is worth trusting to
+                          * sub-ppm after a minute or two (watch ppm_sigma, not the clock) */
+    double   jitter_ns;  /* rms residual of the stamps about the fit — driver stamp quality. A driver
+                          * stamping from its own hardware reads ~microseconds; the QPC-synthesized
+                          * fallback (no kSystemTimeValid) carries callback-dispatch jitter on top. */
+    uint32_t stamps;     /* effective (exponentially weighted) stamp count in the fit */
+} bwa_clock_model;
+/* False with `out` untouched until the fit has ~1 s of stamps: before bwa_start, under a backend
+ * with no host stamp, and again for ~1 s after a restart re-bases the device sample position (the
+ * fit reseeds rather than draw a line through the jump). The manual sink's clock is SYNTHESIZED from
+ * the sample position, so it fits ppm = 0 exactly — true of that fiction, not of any hardware.
+ * Lock-free; same seqlock as bwa_get_clock, so the pair and the model agree on a block. */
+BWA_API bool     bwa_get_clock_model(bwa_engine* e, bwa_clock_model* out);
 /* The primary device's self-reported render->DAC latency in FRAMES at the engine rate
  * (ASIOGetLatencies — the Digiface includes its Dante buffering): audio scheduled for dsp time T
  * is HEARD at T + latency. The audio half of AV alignment (the video half — display delay — you

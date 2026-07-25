@@ -85,6 +85,19 @@ namespace BwAudio
         public uint   reserved0, reserved1, reserved2, reserved3;          // matches reserved[4]; keep zero
     }
 
+    /// <summary>Mirrors bwa_clock_model: how fast the device clock runs against the host clock,
+    /// fitted over the per-block stamps (see Engine.GetClockModel).</summary>
+    [StructLayout(LayoutKind.Sequential)]
+    public struct BwaClockModel
+    {
+        public double ppm;        // device vs host, parts per million (+ = device fast)
+        public double ppmSigma;   // 1-sigma standard error of ppm (optimistic: assumes independent stamp noise)
+        public double rateHz;     // fitted device rate, samples per host second
+        public double spanS;      // host seconds of stamps behind the fit
+        public double jitterNs;   // rms residual of the stamps about the fit (driver stamp quality)
+        public uint   stamps;     // effective (exponentially weighted) stamp count
+    }
+
     [StructLayout(LayoutKind.Sequential)]
     public struct BwaReflectionsDesc
     {
@@ -180,6 +193,9 @@ namespace BwAudio
         // Device-reported render->DAC latency in frames (ASIOGetLatencies; the Digiface includes its Dante
         // buffering). 0 = unknown / no physical output (null sink).
         [DllImport(DLL, CallingConvention = CC)] public static extern uint bwa_get_output_latency(IntPtr e);
+        // The fitted device-vs-host clock drift (see Engine.GetClockModel). False (out untouched) until
+        // the fit has ~1 s of stamps, and again for ~1 s after a restart re-bases the sample position.
+        [DllImport(DLL, CallingConvention = CC)] [return: MarshalAs(UnmanagedType.I1)] public static extern bool bwa_get_clock_model(IntPtr e, out BwaClockModel model);
         [DllImport(DLL, CallingConvention = CC)] public static extern void bwa_source_stop(IntPtr e, uint s);
         [DllImport(DLL, CallingConvention = CC)] public static extern void bwa_source_stop_at(IntPtr e, uint s, ulong stopSample);
         [DllImport(DLL, CallingConvention = CC)] public static extern void bwa_source_queue(IntPtr e, uint s, uint snd, [MarshalAs(UnmanagedType.I1)] bool loop);

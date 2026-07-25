@@ -281,6 +281,13 @@ uint64_t rt_source_get_position(RtCore* c, uint32_t h);   /* control thread: con
 uint64_t rt_dsp_time(RtCore* c);                          /* control thread: current dsp-sample clock (for scheduling) */
 bool rt_get_clock(RtCore* c, uint64_t* sample, uint64_t* time_ns); /* control thread: device (sample, host-ns) pair;
                                                                     * false until a host-stamped block renders */
+/* Device-vs-host clock drift, fitted over the same block stamps (rt.c, RtCore.fit_*). Mirrors the
+ * public bwa_clock_model; engine.c copies it across so rt.h stays off the ABI. */
+typedef struct RtClockFit {
+    double   ppm, ppm_sigma, rate_hz, span_s, jitter_ns;
+    uint32_t stamps;
+} RtClockFit;
+bool rt_get_clock_model(RtCore* c, RtClockFit* out);      /* control thread: false until the fit has span */
 uint32_t rt_bus_peaks(RtCore* c, float* out, uint32_t cap); /* control thread: last block's per-channel output peak
                                                              * (post align/test/limiter); returns the count filled */
 

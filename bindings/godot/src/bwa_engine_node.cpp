@@ -728,6 +728,20 @@ int BwaEngine::get_output_latency() const {
 	return eng ? (int)bwa_get_output_latency(eng) : 0;
 }
 
+Dictionary BwaEngine::get_clock_model() const {
+	Dictionary d;
+	bwa_clock_model m = {};
+	const bool ok = eng && bwa_get_clock_model(eng, &m);
+	d["valid"] = ok;
+	d["ppm"] = m.ppm;
+	d["ppm_sigma"] = m.ppm_sigma;
+	d["rate_hz"] = m.rate_hz;
+	d["span_s"] = m.span_s;
+	d["jitter_ns"] = m.jitter_ns;
+	d["stamps"] = (int)m.stamps;
+	return d;
+}
+
 /* --- diagnostics --- */
 
 void BwaEngine::set_test_signal(int channel, TestKind kind, float gain) {
@@ -983,7 +997,7 @@ void BwaEngine::_bind_methods() {
 	M(scene_set_dynamic_transform, "handle", "position", "rotation");
 	M(scene_remove_dynamic_mesh, "handle");
 
-	M0(get_dsp_time); M0(get_clock); M0(get_output_latency);
+	M0(get_dsp_time); M0(get_clock); M0(get_output_latency); M0(get_clock_model);
 	M(set_test_signal, "channel", "kind", "gain");
 	M0(is_running); M0(get_audio_backend); M0(get_last_error);
 	M0(get_channel_count); M0(get_resolved_sample_rate); M0(get_resolved_block_size);

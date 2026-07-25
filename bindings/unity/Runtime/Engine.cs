@@ -505,6 +505,17 @@ namespace BwAudio
         /// physical output (the silent null-sink fallback).</summary>
         public uint OutputLatency => Ready ? Bwa.bwa_get_output_latency(_eng) : 0;
 
+        /// <summary>How fast the device clock runs against the host clock, fitted over the per-block
+        /// stamps (~2 min window). DspTimeAt re-anchors every frame and needs none of this; reach for
+        /// it when something ELSE owns the timeline (video, timecode, another node), when you want a
+        /// minutes-long extrapolation to hold, or to log the rig's drift. False until the fit has ~1 s
+        /// of stamps, and again for ~1 s after a restart re-bases the device sample position.</summary>
+        public bool GetClockModel(out Bwa.BwaClockModel model)
+        {
+            model = default;
+            return Ready && Bwa.bwa_get_clock_model(_eng, out model);
+        }
+
         /// <summary>Map a Time.realtimeSinceStartupAsDouble moment to the dsp-sample clock — THE way
         /// to land a sound on a visual event: <c>emitter.PlayAt(engine.DspTimeAt(tEvent))</c> (schedule
         /// with margin; a start in the past plays immediately). Built on the device's own block stamps

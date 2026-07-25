@@ -802,6 +802,13 @@ void bwa_source_play_loop(bwa_engine* e, bwa_source s, bwa_sound snd, uint64_t l
 }
 uint64_t bwa_get_dsp_time(bwa_engine* e)                                     { return e ? rt_dsp_time(e->rt) : 0; }
 bool bwa_get_clock(bwa_engine* e, uint64_t* dsp_sample, uint64_t* host_time_ns) { return e ? rt_get_clock(e->rt, dsp_sample, host_time_ns) : false; }
+bool bwa_get_clock_model(bwa_engine* e, bwa_clock_model* out) {
+    RtClockFit f;
+    if (!e || !out || !rt_get_clock_model(e->rt, &f)) return false;
+    out->ppm = f.ppm; out->ppm_sigma = f.ppm_sigma; out->rate_hz = f.rate_hz;
+    out->span_s = f.span_s; out->jitter_ns = f.jitter_ns; out->stamps = f.stamps;
+    return true;
+}
 uint32_t bwa_get_output_latency(bwa_engine* e)                               { return e ? bwa_sink_output_latency(e->sink) : 0; }
 void bwa_source_stop(bwa_engine* e, bwa_source s)                           { if (e) rt_source_stop(e->rt, s); }
 void bwa_source_stop_at(bwa_engine* e, bwa_source s, uint64_t stop_sample)  { if (e) rt_source_stop_at(e->rt, s, stop_sample); }

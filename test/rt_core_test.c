@@ -354,6 +354,81 @@ int main(void) {
         }
     }
 
+    /* clock drift model (rt_get_clock_model): the device-vs-host SLOPE, fitted over the same block
+     * stamps. Drive a host clock deliberately out of step with the sample clock and the fit must
+     * recover the ppm — this is what makes a minutes-long extrapolation hold instead of walking off
+     * at the nominal rate. `drift` is extra host seconds per sample, so the device runs SLOW against
+     * the host and ppm comes out negative: rate_hz = RATE / (1 + drift). */
+    {
+        RtCore* cd = rt_create(4, 4, RATE, CH);
+        CHECK(cd != NULL, "rt_create (clock model)");
+        if (cd) {
+            const double   drift = 1e-5;                  /* -9.9999 ppm */
+            const uint64_t epoch = 1000000000ull;         /* nonzero host epoch (time 0 reads as unstamped) */
+            RtClockFit f;
+            CHECK(!rt_get_clock_model(cd, &f), "no clock model before a stamped block renders");
+
+            uint64_t k = 0;
+            #define STAMP_BLOCK(cc, kk, dd) do {                                                  \
+                bwa_timestamp t_;                                                                 \
+                t_.sample_pos     = (kk) * N;                                                     \
+                t_.system_time_ns = epoch + (uint64_t)((double)((kk) * N) / (double)RATE          \
+                                                       * (1.0 + (dd)) * 1e9 + 0.5);               \
+                rt_render((cc), bus, N, &t_);                                                     \
+            } while (0)
+
+            for (; k < 100; ++k) STAMP_BLOCK(cd, k, drift);          /* ~0.53 s: under the min span */
+            CHECK(!rt_get_clock_model(cd, &f), "clock model withholds a slope until it has ~1 s of span");
+            for (; k < 1200; ++k) STAMP_BLOCK(cd, k, drift);         /* ~6.4 s */
+
+            CHECK(rt_get_clock_model(cd, &f), "clock model publishes once the fit has span");
+            CHECK(fabs(f.ppm + 9.9999) < 0.05, "clock model recovers the drift in ppm");
+            CHECK(fabs(f.rate_hz - (double)RATE / (1.0 + drift)) < 0.01, "clock model fits the device rate");
+            CHECK(f.ppm_sigma > 0.0 && f.ppm_sigma < 0.5, "clock model reports a tight standard error on clean stamps");
+            CHECK(f.jitter_ns >= 0.0 && f.jitter_ns < 5.0, "clock model reports near-zero jitter on clean stamps");
+            CHECK(f.span_s > 5.0 && f.span_s < 7.0, "clock model reports its accumulated span");
+            CHECK(f.stamps > 1000, "clock model counts the stamps behind the fit");
+
+            /* a restart re-bases the device sample position while the host clock runs on: fitting a
+             * line through that jump would report fiction, so the fit reseeds and goes quiet */
+            bwa_timestamp restart = { 0, epoch + 20000000000ull };
+            rt_render(cd, bus, N, &restart);
+            CHECK(!rt_get_clock_model(cd, &f), "a re-based sample position reseeds the fit");
+
+            /* ...and it re-converges on the new run's slope, not a blend with the old one */
+            const double drift2 = 2e-5;                              /* -19.9996 ppm */
+            for (k = 0; k < 1200; ++k) {
+                bwa_timestamp t2;
+                t2.sample_pos     = k * N;
+                t2.system_time_ns = epoch + 20000000000ull
+                                  + (uint64_t)((double)(k * N) / (double)RATE * (1.0 + drift2) * 1e9 + 0.5);
+                rt_render(cd, bus, N, &t2);
+            }
+            CHECK(rt_get_clock_model(cd, &f) && fabs(f.ppm + 19.9996) < 0.05,
+                  "the reseeded fit converges on the new run's drift");
+
+            /* jitter_ns is a real measurement, not a rounding artefact: hold the rate at nominal and
+             * dither the host stamp by a 4 us square wave (rms 2 us about its mean). The slope must
+             * survive it — white stamp noise averages out over a thousand blocks — while jitter_ns
+             * reports it. This is the assertion the closed-form residual could not pass. */
+            const uint64_t ep3 = epoch + 40000000000ull;
+            bwa_timestamp restart2 = { 0, ep3 };
+            rt_render(cd, bus, N, &restart2);
+            for (k = 0; k < 1200; ++k) {
+                bwa_timestamp t3;
+                t3.sample_pos     = k * N;
+                t3.system_time_ns = ep3 + (uint64_t)((double)(k * N) / (double)RATE * 1e9 + 0.5)
+                                  + ((k & 1) ? 4000ull : 0ull);
+                rt_render(cd, bus, N, &t3);
+            }
+            CHECK(rt_get_clock_model(cd, &f), "clock model publishes through stamp jitter");
+            CHECK(fabs(f.jitter_ns - 2000.0) < 200.0, "jitter_ns measures the injected stamp jitter");
+            CHECK(fabs(f.ppm) < 0.5, "the slope survives white stamp jitter");
+            #undef STAMP_BLOCK
+            rt_destroy(cd);
+        }
+    }
+
     /* streaming: a streamed sound feeds the mixer through the background ring (the standalone ring
      * mechanics are covered by stream_test; here we verify the rt integration produces audio). */
     {

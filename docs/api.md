@@ -33,7 +33,9 @@ walks disk streaming + push sources. All three are console programs built every 
 - Assets: WAV/FLAC/MP3 decoded (and resampled) at load, disk streaming for long
   files, AmbiX ambisonic beds decoded world-locked to the array.
 - Voices: fixed pool with priority stealing, pause and click-free seek,
-  sample-accurate scheduled starts against a device-anchored DSP clock.
+  sample-accurate scheduled starts against a device-anchored DSP clock. The device's own
+  block stamps bridge that clock to wall time for AV sync, with the device-vs-host drift
+  fitted in ppm for shows long enough to care.
 - Tracking: OptiTrack/NatNet ingested in-process; the audio thread samples the
   freshest head pose at block time.
 - Diagnostics: per-channel test tone, output-level and listener-pose readbacks,
@@ -266,6 +268,12 @@ while (!WindowShouldClose()) {
 - **The other direction needs no wall clock.** An event on the *audio* timeline (a cue
   inside a track you scheduled) fires its visual when `bwa_get_dsp_time` crosses
   `start + cue`, or off `bwa_source_get_playhead`.
+- **It holds for a two-hour show.** `clock_refresh` runs every frame, so the ppm difference
+  between the two crystals never accumulates—the standing error stays sub-millisecond however
+  long you run. What that buys is a rule: schedule far-out events in dsp *samples*
+  (`t0 + cue × rate`), never by predicting a future wall time. If something else owns the
+  timeline and you need the drift itself, `bwa_get_clock_model` fits it ("Long shows drift"
+  under [Sources](#sources-control-thread-non-blocking)).
 - **Unity**: `emitter.PlayAt(engine.DspTimeAt(tEvent))` is this whole recipe
   ([integration.md](./integration.md)).
 
@@ -659,6 +667,7 @@ playing, watch the playhead reset across the seam—there's no separate event.
 uint64_t bwa_get_dsp_time(bwa_engine* e);                       // current dsp-sample clock (device-anchored, monotonic)
 bool     bwa_get_clock(bwa_engine* e, uint64_t* dsp_sample, uint64_t* host_time_ns); // device (sample, host-time) pair
 uint32_t bwa_get_output_latency(bwa_engine* e);                 // device render->DAC latency, frames (0 = unknown)
+bool     bwa_get_clock_model(bwa_engine* e, bwa_clock_model* out); // fitted device-vs-host drift (ppm + its sigma)
 ```
 
 **Syncing with graphics.** Two cases. Events that live on the **audio timeline** (a cue in a track
@@ -684,6 +693,36 @@ the dsp clock stamps when a block is *rendered*, not heard: `bwa_get_output_late
 device's own render→DAC delay in frames (`ASIOGetLatencies`; the Digiface includes its Dante buffering), so
 sound scheduled for dsp time T reaches the room at `T + latency`—subtract your measured display
 delay from it and one constant aligns the whole AV chain.
+
+**Long shows drift.** The pair is exact at the instant it was stamped, but the device crystal and the
+host clock are different oscillators: 10 ppm is 36 ms an hour, and a spec-worst ±50 ppm part is
+~180 ms. Re-anchoring off `bwa_get_clock` every frame makes that vanish, because you never integrate
+the error—which is why `DspTimeAt` is accurate to well under a millisecond no matter how long the
+show has been running. The rule that follows is **schedule far-out events in dsp samples, not by
+predicting a future wall time**. `bwa_source_play_at` already takes a sample, so the natural pattern
+is to take `t0 = bwa_get_dsp_time` once at show start and place every cue at `t0 + cue × rate`. Now
+there is one clock in the system and drift is impossible rather than corrected.
+
+`bwa_get_clock_model` is for when you can't do that: something else owns the timeline (a video file,
+timecode, another render node), you want a minutes-long extrapolation to hold, or you just want the
+drift on the rig log. It fits the *slope* by exponentially weighted least squares over the same
+per-block stamps—a ~2 minute window, updated on the audio thread for a few dozen flops a block—and
+reports it as `ppm` with its own `ppm_sigma`. Use `rate_hz` in place of the nominal rate in the
+`dsp_at(T)` formula above and long extrapolations stop walking off. It returns false until the fit
+has ~1 s of stamps behind it, and goes quiet again for ~1 s after a restart re-bases the device
+sample position (it reseeds rather than draw a line through the jump). Two honest caveats: read
+`ppm_sigma` as a lower bound, since it assumes independent stamp noise and real jitter is correlated;
+and `jitter_ns`—the rms residual—tells you the *stamp* quality, so a driver without `kSystemTimeValid`
+reads worse because the QPC fallback adds callback-dispatch noise. The manual sink synthesizes its
+host time from the sample position, so it fits `ppm = 0` exactly; that is true of the fiction, not of
+any hardware.
+
+Correcting drift is a different problem from measuring it, and the engine deliberately doesn't do it.
+If audio must follow an external master indefinitely, the clean lever is a **push source**: run your
+own resampler and use `bwa_source_push_space` as the error signal for a control loop on ring fill.
+The best fix isn't in software at all—clock the display machines from the same reference as the audio
+device (the Digiface is a Dante endpoint, so it is already disciplined by a PTP grandmaster) and the
+two clocks become one.
 
 **Completion is a poll.** `bwa_source_is_playing` is a latest-wins readback (like
 `bwa_get_listener_pose`): the audio thread republishes each source's playing state every block, gated
