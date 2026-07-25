@@ -4,6 +4,8 @@ All notable changes to `com.brainworks.bw_audio`.
 
 ## [Unreleased]
 
+## [0.4.0]
+
 ### Added — physical emulation batch
 
 - **`SourceBase.proximity`** (inspector toggle + `bwa_source_set_proximity`): near-field LF boost —
