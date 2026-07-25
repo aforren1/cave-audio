@@ -1,4 +1,4 @@
-## The seven playground scenes, ported from examples/playground.cpp.
+## The eight playground scenes, ported from examples/playground.cpp.
 ##
 ## Each scene owns one feature and answers one by-ear question. They share the app's single
 ## source and reflection voice rather than minting their own, exactly as the C++ version
@@ -17,6 +17,7 @@ static func build(app) -> Array:
 	return [
 		Localization.new(app), Occlusion.new(app), Directivity.new(app),
 		ChannelWalk.new(app), Abx.new(app), AmbisonicBed.new(app), ReverbBed.new(app),
+		Underwater.new(app),
 	]
 
 
@@ -902,7 +903,7 @@ class ReverbBed extends Base:
 				"set": func(i: int) -> void:
 					if i != app.rev_decoder:
 						app.rev_decoder = i
-						app.rebuild_rig(true)},
+						app.rebuild_rig(1)},
 			{"kind": "toggle", "label": "occluder (N)",
 				"get": func() -> bool: return wall_on,
 				"set": func(v: bool) -> void:
@@ -911,4 +912,136 @@ class ReverbBed extends Base:
 			{"kind": "toggle", "label": "sweep it (SPACE)",
 				"get": func() -> bool: return sweep,
 				"set": func(v: bool) -> void: sweep = v},
+		]
+
+
+## ============================ 8. Underwater (medium boundary) ============================
+## The api.md "listener submerges" recipe, live and phonon-free. SPACE dives: a source across
+## the surface gets the interface loss + the water's transmission EQ (manual occlusion) and
+## goes diffuse (spread), the FDN retunes LIVE (the tail keeps ringing, only its slope
+## changes) and the speed of sound glides to the medium's — Doppler is what makes that
+## audible. With BOTH ends under, the surface bounce renders off the rig's PRESSURE-RELEASE
+## plane: push the source up toward the surface and the inverted image thins it out (the
+## Lloyd's-mirror comb; broadband signals show it best). The FDN is load-time (the plane
+## itself is live-safe), so this scene runs its own rig config — crossing its boundary
+## rebuilds, like scene 7.
+class Underwater extends Base:
+	var under := false
+	var lloyd := true
+	var doppler := true
+	var _crossed := -1        # last pushed cross-surface state (-1 = force a re-push)
+	var _er_on := -1          # last pushed early-reflection enable (-1 = force)
+
+	func _init(a) -> void:
+		super(a)
+		title = "Underwater (medium boundary)"
+		help = "SPACE dive/surface  L surface bounce  V doppler  R/F source through the surface"
+
+	## The room-wide half: the medium the LISTENER is in. fdn_set_decay is live — the tail
+	## keeps ringing through the retune, which is the point.
+	func _apply_medium() -> void:
+		if under:
+			app.engine.fdn_set_decay(3.0, 0.3, 800.0)   # hard boundaries: long LF tail, dead HF
+			app.engine.reverb_set_gain(1.5)
+			app.engine.set_speed_of_sound(1480.0)       # every delay glides to the medium's c
+		else:
+			app.engine.fdn_set_decay(1.2, 0.7, 2000.0)  # the air defaults
+			app.engine.reverb_set_gain(0.6)
+			app.engine.set_speed_of_sound(343.0)
+		_crossed = -1                                    # re-derive the per-source half
+		_er_on = -1
+
+	## The per-source half: does the source->listener path cross the surface?
+	func _apply_source() -> void:
+		var above: bool = app.source_pos.y > app.WATER_Y
+		var crossed := 1 if above == under else 0        # source side != listener side
+		if crossed != _crossed:
+			_crossed = crossed
+			if crossed == 1:                             # ~-30 dB interface loss + the muffle
+				app.source.set_occlusion_manual_bands(0.03, Vector3(0.30, 0.06, 0.01))
+				app.source.spread = 0.8                  # localization collapses across the boundary
+			else:
+				app.source.set_occlusion_manual(1.0)
+				app.source.spread = 0.0
+		# The surface bounce renders only with BOTH ends under it: the plane mirrors from
+		# either side, but a cross-boundary image has no physical path.
+		var er := 1 if (lloyd and under and not above) else 0
+		if er != _er_on:
+			_er_on = er
+			app.source.early_reflections = er == 1
+
+	func set_submerged(v: bool) -> void:
+		under = v
+		_apply_medium()
+
+	func enter() -> void:
+		app.source.gain = app.SRC_GAIN
+		app.source.reverb = true             # the FDN renders whichever medium's tail
+		app.source.doppler = doppler
+		app.source_pos = Vector3(0.0, app.WATER_Y + 0.8, -2.5)   # ABOVE: diving muffles it
+		under = false
+		_apply_medium()
+
+	func key(code: int) -> void:
+		match code:
+			KEY_SPACE:
+				set_submerged(not under)
+			KEY_L:
+				lloyd = not lloyd
+				_er_on = -1
+			KEY_V:
+				doppler = not doppler
+				app.source.doppler = doppler
+
+	func update(_dt: float) -> void:
+		app.source_pos.x = clampf(app.source_pos.x, -4.0, 4.0)
+		app.source_pos.y = clampf(app.source_pos.y, 0.4, app.WATER_Y + 2.0)
+		app.source_pos.z = clampf(app.source_pos.z, -4.0, 4.0)
+		app.source.gain = app.SRC_GAIN
+		_apply_source()
+
+	func draw(d) -> void:
+		# The surface: a translucent sheet, denser when the listener is under it.
+		d.quad(Vector3(0, app.WATER_Y, 0), Vector3(4.5, 0, 0), Vector3(0, 0, 4.5),
+			Color(0.3, 0.55, 0.8, 0.3 if under else 0.15))
+		var above: bool = app.source_pos.y > app.WATER_Y
+		d.sphere(app.source_pos, 0.18,
+			Color(0.92, 0.78, 0.35) if above else Color(0.35, 0.7, 0.92))
+		d.line(app.head, app.source_pos,
+			Color(0.38, 0.5, 0.66) if _crossed == 1 else GREEN)
+		if _er_on == 1:
+			# The Lloyd's mirror: the inverted image above the surface.
+			var img := Vector3(
+				app.source_pos.x, 2.0 * app.WATER_Y - app.source_pos.y, app.source_pos.z)
+			d.sphere(img, 0.13, Color(0.47, 0.74, 0.94, 0.5))
+			d.line(img, app.head, Color(0.47, 0.74, 0.94, 0.35))
+
+	func status() -> Array:
+		var above: bool = app.source_pos.y > app.WATER_Y
+		return [
+			["listener", "UNDER the surface" if under else "in air"],
+			["source", "above the surface" if above else "below"],
+			["path", "CROSSES (muffled)" if _crossed == 1 else "clear"],
+			["surface bounce", "on (Lloyd's mirror)" if _er_on == 1 else "off"],
+		]
+
+	func controls() -> Array:
+		return [
+			{"kind": "toggle", "label": "submerged (SPACE)",
+				"get": func() -> bool: return under,
+				"set": func(v: bool) -> void: set_submerged(v)},
+			{"kind": "toggle", "label": "surface bounce (L)",
+				"get": func() -> bool: return lloyd,
+				"set": func(v: bool) -> void:
+					lloyd = v
+					_er_on = -1},
+			{"kind": "toggle", "label": "doppler (V)",
+				"get": func() -> bool: return doppler,
+				"set": func(v: bool) -> void:
+					doppler = v
+					app.source.doppler = v},
+			{"kind": "slider", "label": "source depth (R/F)",
+				"min": 0.4, "max": app.WATER_Y + 2.0, "step": 0.05,
+				"get": func() -> float: return app.source_pos.y,
+				"set": func(v: float) -> void: app.source_pos.y = v},
 		]

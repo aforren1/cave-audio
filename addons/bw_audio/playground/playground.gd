@@ -1,6 +1,6 @@
 ## bwa_playground, Godot edition — the by-ear harness, ported from examples/playground.cpp.
 ##
-## Same seven scenes, same keys, same synthesized signals. What differs is the frame: the C++
+## Same eight scenes, same keys, same synthesized signals. What differs is the frame: the C++
 ## one is raylib + Dear ImGui, this one is Godot nodes driving the SAME public ABI through the
 ## GDExtension binding. Running both against one engine build is a way to catch a binding
 ## that quietly changes what you hear.
@@ -13,6 +13,10 @@
 ##   5 Blind A/B/X    - double-blind over live knobs, with a binomial p-value
 ##   6 Ambisonic bed  - a world-locked 3rd-order field; spin, tilt, renderer, max-rE
 ##   7 Reverb bed     - a shoebox + reverb; REBUILDS the engine on entry/exit
+##   8 Underwater     - the api.md "listener submerges" recipe: dive and the FDN retunes
+##                      LIVE, the speed of sound glides, crossing sources muffle, and the
+##                      pressure-release surface throws the Lloyd's-mirror bounce. Rebuilds
+##                      like scene 7 (its FDN is load-time), phonon-free.
 ##
 ## Global keys: WASD/RF move the source, Q/E turn the head, 1-4 signal, TAB scene, ESC quit.
 ## Without an ASIO device the engine falls back to the null sink and everything still runs,
@@ -24,6 +28,7 @@ const Scenes := preload("res://addons/bw_audio/playground/scenes.gd")
 
 const SRC_GAIN := 0.8
 const ROOM := Vector3(8.0, 4.0, 8.0)   # the reverb scene's shoebox, matching the C++ ROOM_*
+const WATER_Y := 2.4                   # the underwater scene's surface height (the C++ WATER_Y)
 
 # --- live rig (rebuilt across the reverb boundary) ---
 var engine: BwaEngine
@@ -49,11 +54,20 @@ var draw: Node3D
 var panel: Control
 var scenes: Array = []
 var cur_scene := 0
-var rig_has_reverb := false
+# Which config the live rig was built in: 0 interactive, 1 reverb (Steam bed + shoebox),
+# 2 underwater (FDN + pressure-release surface plane). Mirrors the C++ engine_mode.
+var rig_mode := 0
 
 # Reverb-scene settings that are LOAD-time, so changing one rebuilds the rig.
 var rev_decoder := 0
 var want_sink := BwaEngine.SINK_AUTO
+# The panel's "render" picker (create-time, so switching rebuilds):
+# 0 = CAVE_SIM, the array audition — the speaker meters show what lights the speakers;
+# 1 = BINAURAL, the direct per-source render — point sources and beds bypass the speaker
+# bus, so quiet meters there are CORRECT; 2 = CAVE, the array ITSELF over 26-ch ASIO (the
+# by-ear harness on the rig machine; with no such device the null sink runs visual-only).
+# Mirrors the C++ playground's picker.
+var render_pick := 0
 
 var _cam_yaw := deg_to_rad(195.0)
 var _cam_pitch := deg_to_rad(25.0)
@@ -88,7 +102,7 @@ func _ready() -> void:
 	add_child(env)
 
 	scenes = Scenes.build(self)
-	_build_rig(false)
+	_build_rig(0)
 	switch_scene(0)
 
 	panel = preload("res://addons/bw_audio/playground/panel.gd").new()
@@ -98,10 +112,11 @@ func _ready() -> void:
 		call_deferred("_run_selftest")   # let the panel's own _ready build its labels first
 
 
-## Tear the rig down and stand a new one up. The reverb bed and the room geometry are
-## load-time, so crossing that boundary is a create/start cycle — the same brief audio gap
-## the C++ playground takes, for the same reason.
-func _build_rig(with_reverb: bool) -> void:
+## Tear the rig down and stand a new one up. The reverb bed, the room geometry, and the FDN
+## are load-time, so crossing a config boundary is a create/start cycle — the same brief
+## audio gap the C++ playground takes, for the same reason.
+## mode: 0 interactive, 1 reverb (Steam bed + shoebox), 2 underwater (FDN + surface plane).
+func _build_rig(mode: int) -> void:
 	if rig:
 		remove_child(rig)
 		rig.free()          # free(), not queue_free(): the new engine must not find the old
@@ -112,18 +127,34 @@ func _build_rig(with_reverb: bool) -> void:
 
 	engine = BwaEngine.new()
 	engine.name = "Engine"
-	engine.profile = BwaEngine.PROFILE_BINAURAL
+	engine.profile = BwaEngine.PROFILE_CAVE if render_pick == 2 \
+		else BwaEngine.PROFILE_BINAURAL if render_pick == 1 \
+		else BwaEngine.PROFILE_CAVE_SIM   # default: the array audition (the meters read the bus)
 	engine.sink = want_sink
 	engine.sample_rate = Signals.SR
 	engine.block_size = 256
 	engine.feed_listener = true
 	engine.bed_decoder = BwaEngine.DECODE_EPAD if rev_decoder == 1 else BwaEngine.DECODE_ALLRAD
-	if with_reverb:
+	if mode == 1:
 		engine.enable_reflections = true
 		engine.reflections_ir_seconds = 1.0
 		engine.reflections_order = 1
 		engine.reflections_rays = 4096
 		engine.reflections_bounces = 16
+	elif mode == 2:
+		# The underwater rig, phonon-free: the FDN renders whichever medium's tail (the scene
+		# retunes it LIVE on a dive — fdn_set_decay is the demo), and the water surface is a
+		# pressure-release mirror plane, so the submerged bounce inverts (the Lloyd's mirror).
+		engine.enable_fdn = true
+		var surface := BwaMaterial.new()
+		surface.preset = BwaMaterial.PRESET_CUSTOM
+		surface.absorption = Vector3(0.01, 0.01, 0.02)    # the surface reflects nearly everything
+		surface.transmission = Vector3(0.30, 0.06, 0.01)  # ...and transmits almost nothing
+		surface.scattering = 0.05
+		engine.ground_enabled = true
+		engine.ground_height = WATER_Y
+		engine.ground_material = surface
+		engine.ground_pressure_release = true
 	rig.add_child(engine)
 
 	# The listener node the engine follows. Its transform is pushed every frame by BwaEngine,
@@ -133,7 +164,7 @@ func _build_rig(with_reverb: bool) -> void:
 	rig.add_child(listener)
 	engine.listener = NodePath("../Listener")
 
-	if with_reverb:
+	if mode == 1:
 		var box := BwaRoomBox.new()
 		box.name = "Room"
 		box.size = ROOM
@@ -167,7 +198,7 @@ func _build_rig(with_reverb: bool) -> void:
 	# and starts in _ready and the room box has to have registered by then.
 	add_child(rig)
 
-	rig_has_reverb = with_reverb
+	rig_mode = mode
 	backend = engine.get_audio_backend()
 	speakers = engine.get_speakers()
 	nspk = speakers.size()
@@ -190,8 +221,8 @@ func _build_rig(with_reverb: bool) -> void:
 	print("playground: %s, %d speakers" % [backend, nspk])
 
 
-func rebuild_rig(with_reverb: bool) -> void:
-	_build_rig(with_reverb)
+func rebuild_rig(mode: int) -> void:
+	_build_rig(mode)
 	scenes[cur_scene].enter()
 
 
@@ -201,9 +232,9 @@ func rebuild_rig(with_reverb: bool) -> void:
 ## that leaves SPCAP selected or a spread mode engaged silently changes what the next scene
 ## demonstrates. Ported verbatim from switch_scene() for exactly that reason.
 func switch_scene(idx: int) -> void:
-	var want_reverb := idx == 6
-	if want_reverb != rig_has_reverb:
-		_build_rig(want_reverb)
+	var want_mode := 1 if idx == 6 else (2 if idx == 7 else 0)
+	if want_mode != rig_mode:
+		_build_rig(want_mode)
 
 	for ch in nspk:
 		engine.set_test_signal(ch, BwaEngine.TEST_OFF, 0.0)
@@ -237,6 +268,16 @@ func set_signal(which: int) -> void:
 	cur_sig = clampi(which, 0, sig_paths.size() - 1)
 	source.play_clip(sig_paths[cur_sig])
 	refl.play_clip(sig_paths[cur_sig])
+
+
+## The panel's "render" picker: 0 cave_sim / 1 binaural / 2 cave. Create-time (like the
+## reverb decoder), so an actual change rebuilds the rig and re-enters the current scene.
+func set_render_pick(i: int) -> void:
+	i = clampi(i, 0, 2)
+	if i == render_pick:
+		return
+	render_pick = i
+	rebuild_rig(rig_mode)
 
 
 func head_quat() -> Quaternion:
@@ -351,7 +392,7 @@ func _run_selftest() -> void:
 	var mat := BwaMaterial.new()
 	mat.preset = BwaMaterial.PRESET_BRICK
 	var tok_a: int = mat.get_token(engine)
-	rebuild_rig(rig_has_reverb)
+	rebuild_rig(rig_mode)
 	if engine.get_generation() == gen_a:
 		push_error("playground: rebuilt engine reused generation %d - material caches go stale" % gen_a)
 		fail += 1
@@ -398,10 +439,62 @@ func _run_selftest() -> void:
 				"button":
 					pass   # pressing these mid-test would answer A/B/X trials or reset tallies
 		panel._process(1.0 / 60.0)
-	# Back across the reverb boundary the other way, which is the rebuild most likely to leak.
+	# Back across the config boundary the other way, which is the rebuild most likely to leak.
 	switch_scene(0)
 	if not engine.is_running():
-		push_error("playground: engine died returning from the reverb scene")
+		push_error("playground: engine died returning from the rebuild scenes")
 		fail += 1
+
+	# The underwater scene's cross-surface machinery, asserted where it is observable without
+	# audio: manual occlusion publishes synchronously, so diving under a still-above-surface
+	# source must read back heavily occluded, and surfacing must clear it. (The scene walk
+	# above already proved the mode-2 rig builds and survives; this pins the recipe's logic.)
+	switch_scene(7)
+	var wat = scenes[7]
+	wat.update(1.0 / 60.0)                 # source starts above the surface, listener in air
+	if source.get_occlusion_factor() < 0.9:
+		push_error("playground: underwater scene occluded a clear same-side path")
+		fail += 1
+	wat.set_submerged(true)
+	wat.update(1.0 / 60.0)                 # the path now crosses the surface
+	if source.get_occlusion_factor() > 0.1:
+		push_error("playground: diving did not muffle the cross-surface source (factor %.2f)"
+			% source.get_occlusion_factor())
+		fail += 1
+	wat.set_submerged(false)
+	wat.update(1.0 / 60.0)
+	if source.get_occlusion_factor() < 0.9:
+		push_error("playground: surfacing did not clear the crossing occlusion")
+		fail += 1
+	switch_scene(0)
+	if not engine.is_running():
+		push_error("playground: engine died returning from the underwater scene")
+		fail += 1
+
+	# The render picker crosses a create/start boundary per pick: binaural (direct), cave (the
+	# bare array device — no decode suffix), and back to cave_sim. The backend string is the
+	# observable; the engine must survive every switch.
+	set_render_pick(1)
+	if not engine.is_running():
+		push_error("playground: engine died switching to the binaural (direct) render")
+		fail += 1
+	if not backend.contains("direct"):
+		push_error("playground: binaural render did not report a direct decode (%s)" % backend)
+		fail += 1
+	set_render_pick(2)
+	if not engine.is_running():
+		push_error("playground: engine died switching to the cave (array) render")
+		fail += 1
+	if backend.contains("("):
+		push_error("playground: the cave render must report the bare device, no decode (%s)" % backend)
+		fail += 1
+	set_render_pick(0)
+	if not engine.is_running():
+		push_error("playground: engine died switching back to the cave_sim render")
+		fail += 1
+	if not backend.contains("sim"):
+		push_error("playground: cave_sim render did not report a sim decode (%s)" % backend)
+		fail += 1
+
 	print("playground: ", "PASS" if fail == 0 else "FAIL (%d)" % fail)
 	get_tree().quit(0 if fail == 0 else 1)

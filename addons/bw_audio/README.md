@@ -37,7 +37,7 @@ room_quat = Quaternion(registration.basis * node.global_basis) * Quaternion(Vect
 
 Two consequences worth knowing, both places Unity's advice does *not* carry over:
 
-- `bwa_bed_set_rotation` takes a room-frame yaw, and because there is no mirror the
+- `bwa_bed_set_orientation` takes a room-frame yaw, and because there is no mirror the
   **sense of rotation is preserved**. Unity's binding has to reverse it; this one does not.
 - Positions need no axis flip at all. If a source ends up mirrored, the registration
   transform is wrong — not the handedness conversion.
@@ -112,7 +112,10 @@ generation, because the core's material table is fixed-capacity and meant to be 
 an existing `MeshInstance3D`. **`BwaDynamicGeometry : Node3D`** — a movable occluder (a
 cheap BVH refit, not a rebuild; needs the Steam Audio build). **`BwaRoomBox : Node3D`** —
 the shoebox, which also captures the room for the image-source early reflections and so
-matters even in a phonon-free build.
+matters even in a phonon-free build. Its outdoor degenerate lives on `BwaEngine` as the
+`ground_*` properties: one horizontal mirror plane, the ground bounce, with
+`ground_pressure_release` turning it into a water surface seen from below (the
+Lloyd's-mirror comb). A `BwaRoomBox` wins when both exist — one room at a time.
 
 **`BwaSpeakerView : Node3D`** — one gizmo per speaker, lit by that channel's live output
 level. It reads the geometry back from the engine, so it draws the array the engine is
@@ -173,8 +176,8 @@ however you installed, open `addons/bw_audio/playground/playground.tscn` and pre
 Without an ASIO device it falls back to silent visual-only mode and says so in the HUD.
 
 Scenes, TAB to cycle: localization, occlusion and materials, directivity, channel walk,
-blind A/B/X, ambisonic bed, reverb bed. WASD/RF move the source, Q/E turn the head, 1–4 pick
-the signal. Every scene also declares its own controls — dropdowns, toggles, sliders — which
+blind A/B/X, ambisonic bed, reverb bed, underwater. WASD/RF move the source, Q/E turn the
+head, 1–4 pick the signal. Every scene also declares its own controls — dropdowns, toggles, sliders — which
 the panel builds; the keyboard shortcuts drive the *same* setters, so the two input paths
 cannot drift apart, and pressing a key visibly moves the matching widget.
 
@@ -186,9 +189,9 @@ the listener's right, matching the red right ear on the head gizmo.
 
 Two things worth knowing:
 
-- **The reverb scene rebuilds the engine** on entry and exit, because the bed and the room
-  geometry are load-time. Here that means tearing down the whole rig subtree and standing a
-  new one up, which is a brief audio gap by design.
+- **The reverb and underwater scenes rebuild the engine** on entry and exit, because the
+  Steam bed, the room geometry, and the FDN are load-time. Here that means tearing down the
+  whole rig subtree and standing a new one up, which is a brief audio gap by design.
 - **`switch_scene()` resets every engine-wide knob.** The knobs are global, so a scene that
   left SPCAP selected or a spread mode engaged would silently change what the *next* scene
   appears to demonstrate. That reset list is ported verbatim for exactly that reason.
