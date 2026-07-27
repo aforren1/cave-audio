@@ -133,14 +133,17 @@ namespace BwAudio
             set { pitch = value; if (Live) Bwa.bwa_source_set_pitch(Eng, _src, value); }
         }
 
-        /// <summary>Fire a one-shot at this transform (transient voice; no handle held).</summary>
-        public void PlayOneShot(string oneShotClip = null)
+        /// <summary>Fire a one-shot at this transform (transient voice; no handle held).
+        /// Returns whether it was ACCEPTED — false means the clip never loaded, or the voice pool
+        /// or command ring was momentarily full and it was dropped. There is no handle to poll,
+        /// so this is the only signal; Bwa.LastError says which it was.</summary>
+        public bool PlayOneShot(string oneShotClip = null)
         {
-            if (Eng == IntPtr.Zero) return;
+            if (Eng == IntPtr.Zero) return false;
             uint snd = Engine.Instance.Load(oneShotClip ?? clip);
-            if (snd == 0) return;
+            if (snd == 0) return false;
             var p = Room.Pos(transform.position);
-            Bwa.bwa_play_oneshot(Eng, snd, p.x, p.y, p.z, gain);
+            return Bwa.bwa_play_oneshot(Eng, snd, p.x, p.y, p.z, gain);
         }
 
         // The shared OnValidate re-pushes every source-generic knob; pitch is the clip-only extra.

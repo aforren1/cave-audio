@@ -127,7 +127,9 @@ int main(void) {
     if (c2) {
         uint32_t sB = rt_load_sound(c2, WAV_SHORT, err, sizeof err);
         CHECK(sB != 0, "load short wav (small core)");
-        rt_play_oneshot(c2, sB, LD.speakers[6].pos[0], LD.speakers[6].pos[1], LD.speakers[6].pos[2], 1.0f);
+        CHECK(rt_play_oneshot(c2, sB, LD.speakers[6].pos[0], LD.speakers[6].pos[1],
+                      LD.speakers[6].pos[2], 1.0f),
+                "oneshot accepted");
         rt_commit(c2);
         render1(c2);
         CHECK(total_energy() > 0.0, "oneshot audible");
@@ -136,6 +138,13 @@ int main(void) {
         uint32_t a = rt_source_create(c2);
         uint32_t b = rt_source_create(c2);
         CHECK(a != 0 && b != 0, "oneshot recycled its slot (both fresh sources allocate)");
+        /* The DROP has to be observable, which is the whole point of the return: with both
+         * voices of this 2-slot pool now held by named sources, a oneshot cannot allocate and
+         * must say so rather than looking like it played. */
+        CHECK(!rt_play_oneshot(c2, sB, 0.f, 1.f, 0.f, 1.0f),
+                "oneshot on a full voice pool reports the drop");
+        CHECK(!rt_play_oneshot(c2, 0, 0.f, 1.f, 0.f, 1.0f),
+                "oneshot on an invalid sound reports the drop");
         rt_destroy(c2);
     }
 

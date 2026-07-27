@@ -147,7 +147,7 @@ func _test_geometry_merge() -> void:
 	# The mover attaches only with the Steam Audio build, so its handle is allowed to be
 	# absent — but the node must survive either way rather than erroring out.
 	if not mover.is_attached():
-		print("scene: dynamic geometry inert (no Steam Audio build) — expected")
+		print("scene: dynamic geometry inert (no Steam Audio build) - expected")
 
 
 func _test_speaker_view() -> void:
@@ -171,7 +171,7 @@ func _test_audible() -> void:
 	# phonon-free path, so it must work in a build with no Steam Audio at all.
 	emitter.play_clip(Tone.write_ping("scene_ping", 440.0, 0.5))
 	await get_tree().create_timer(0.25).timeout
-	_check(emitter.get_playhead() > 0, "the emitter should be playing through the room")
+	_check(emitter.get_playhead_frames() > 0, "the emitter should be playing through the room")
 
 	var levels := engine.get_bus_levels()
 	_check(levels.size() == engine.get_channel_count(), "bus levels should follow the layout")

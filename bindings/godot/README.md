@@ -210,7 +210,7 @@ absorption, loudness compensation, attenuation override, occlusion (ray-traced o
 directivity, reverb sends, early reflections, pathing.
 
 **`BwaEmitter : BwaSource`** — plays a file. Adds `play`/`play_at`/`play_loop`/`stop_at`,
-gapless `queue`, `seek`, `pitch`, and a `finished` signal.
+gapless `queue`, `seek_frames`/`seek_seconds`, `pitch`, and a `finished` signal.
 
 **`BwaPushSource : BwaSource`** — you feed it PCM. Adds `push`/`push_space`/`push_end`.
 
@@ -261,7 +261,9 @@ core. It starts, it renders, it just sounds wrong:
   early reflections, so they render twice;
 - `feed_listener` on with no listener node, so the listener never leaves the origin;
 - a `layout_path` that does not exist, or a `res://` one that will not survive export;
-- ray-traced occlusion or pathing switched on without the SDK or without geometry.
+- ray-traced occlusion or pathing switched on without the SDK or without geometry;
+- `profile` set to Cave on a machine with no ASIO driver, which renders the 26-channel array
+  into nothing and is silent by design.
 
 The split into three source classes is deliberate. The core genuinely *refuses*
 play/seek/pitch on a push voice, so a single node with a mode flag would leave those
@@ -283,6 +285,80 @@ stop is an arranged ending and the caller wants to know when it landed.
 `bwa_set_output_capture` is **not bound, on purpose.** Its callback runs on the audio
 thread, where calling into GDScript would allocate and take the interpreter lock — exactly
 what invariant 1 forbids. Use the MANUAL sink and `render_block()` for capture instead.
+
+### Picking the profile, and the device
+
+`profile` is the highest-stakes property on the node, so the inspector spells out what each
+value does rather than just naming it. The short version: **Binaural** is the direct
+headphone render (the default, and what you want at a desk), **CaveSim** auditions the
+26-speaker array over those same headphones, **Cave** drives the rig and nothing else — on a
+machine with no rig it is correctly, deliberately silent. [docs/api.md](../../docs/api.md) has the
+full "pick by question, not habit" table.
+
+Whatever you pick, `get_audio_backend()` reports what actually happened, decode included:
+
+```gdscript
+print($BwaEngine.get_audio_backend())   # asio:RME Digiface Dante (steam HRTF direct)
+```
+
+To fill a device picker, ask for the drivers in one call. These are static, need no engine,
+and return the exact strings `asio_driver` accepts (empty picks the first usable device):
+
+```gdscript
+for name in BwaEngine.get_asio_drivers():
+    print(name)
+```
+
+`get_asio_driver_count()` and `get_asio_driver_name(i)` are still there for a caller that
+wants a single name without building the array.
+
+### Is the device being starved?
+
+`get_health()` returns a Dictionary — `measured`, `blocks`, `xruns`, `dropped_frames`,
+`driver_resyncs`, `late_blocks`, `stream_starves`, `peak_load` — and `get_xruns()` is the one-line
+form for a HUD. `xruns` is the device running on without us; `late_blocks` is our own render
+overrunning the block period, which is what causes them; `stream_starves` is a streamed voice whose
+ring ran dry. Read any of them against `blocks`.
+
+```gdscript
+var h := $BwaEngine.get_health()
+if not h["measured"]:
+    print("this driver cannot report dropouts - a zero xrun count proves nothing")
+elif h["xruns"] > 0:
+    print("%d dropouts over %d blocks, peak load %.2f" % [h["xruns"], h["blocks"], h["peak_load"]])
+```
+
+`measured` is the field that matters. It is false whenever nothing here can see a dropout — before
+start, on the manual sink (no deadline, so it cannot miss one), or on a driver that never stamps a
+valid sample position — and in all of those `xruns` reads 0. A zero that means "none" and a zero that
+means "never looked" are different answers.
+
+### Two returns worth checking
+
+`play_oneshot()` returns **whether the one-shot was accepted**. A one-shot holds no handle,
+so that boolean is the only signal it will ever give you — false means the clip failed to
+load, or the voice pool or command ring was momentarily full and the transient was dropped
+(one-shots never steal, so spam cannot evict your named sources). `get_last_error()` says
+which. The load failure also pushes an error; the drop deliberately does not, because the
+thing that causes it is one-shot spam and a per-drop message would bury the console.
+
+`get_output_latency_frames()` and `get_output_latency_seconds()` are named for their unit on
+purpose. Godot's own `AudioServer.get_output_latency()` returns **seconds**, so a bare
+`get_output_latency()` here returning frames reads as seconds to anyone who knows that call —
+and a device-less sink reporting 0 hides the mistake indefinitely, because 0 is 0 in either
+unit. Neither name here collides.
+
+`seek_frames()` / `seek_seconds()` on `BwaEmitter` and `BwaBed` follow the same rule, for the
+same reason: `AudioStreamPlayer3D.seek()` takes seconds, so a bare `seek()` taking frames is a
+trap where passing `1.5` lands on frame 1 and the clip just restarts. The engine's own unit is
+frames everywhere (`play_at`, `stop_at`, `play_loop`, `get_playhead_frames`) because that is what
+the dsp clock counts; the `_seconds` twins are conveniences over the resolved sample rate.
+
+The rule behind all three, if you are adding a call: **a unit belongs in the name when the quantity
+has two live units in this engine.** Time does — frames and seconds are both real here — so every
+time-valued name says which. Nothing else does: distances are metres, frequencies Hz, angles
+radians, gains linear (a decibel value would have to say `_db`), and suffixing those would add
+noise without removing a decision.
 
 <!-- dev -->
 ## Tests

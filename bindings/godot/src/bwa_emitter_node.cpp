@@ -109,9 +109,19 @@ void BwaEmitter::clear_queue() {
 	}
 }
 
-void BwaEmitter::seek(int64_t frame) {
+void BwaEmitter::seek_frames(int64_t frame) {
 	if (LIVE) {
 		bwa_source_seek(ENG, src, (uint64_t)frame);
+	}
+}
+
+void BwaEmitter::seek_seconds(double seconds) {
+	if (!LIVE || seconds < 0.0) {
+		return;
+	}
+	const int rate = owner->get_resolved_sample_rate();
+	if (rate > 0) {
+		seek_frames((int64_t)(seconds * (double)rate));
 	}
 }
 
@@ -160,7 +170,8 @@ void BwaEmitter::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("stop_at", "stop_sample"), &BwaEmitter::stop_at);
 	ClassDB::bind_method(D_METHOD("queue", "path", "loop"), &BwaEmitter::queue);
 	ClassDB::bind_method(D_METHOD("clear_queue"), &BwaEmitter::clear_queue);
-	ClassDB::bind_method(D_METHOD("seek", "frame"), &BwaEmitter::seek);
+	ClassDB::bind_method(D_METHOD("seek_frames", "frame"), &BwaEmitter::seek_frames);
+	ClassDB::bind_method(D_METHOD("seek_seconds", "seconds"), &BwaEmitter::seek_seconds);
 
 	ADD_PROPERTY(PropertyInfo(Variant::STRING, "clip", PROPERTY_HINT_FILE, "*.wav,*.flac,*.mp3"),
 			"set_clip", "get_clip");

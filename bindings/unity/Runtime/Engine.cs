@@ -503,7 +503,7 @@ namespace BwAudio
         /// its Dante network buffering). A sound scheduled for dsp time T is HEARD at T + OutputLatency —
         /// fold it into AV alignment together with your measured display delay. 0 = unknown / no
         /// physical output (the silent null-sink fallback).</summary>
-        public uint OutputLatency => Ready ? Bwa.bwa_get_output_latency(_eng) : 0;
+        public uint OutputLatency => Ready ? Bwa.bwa_get_output_latency_frames(_eng) : 0;
 
         /// <summary>How fast the device clock runs against the host clock, fitted over the per-block
         /// stamps (~2 min window). DspTimeAt re-anchors every frame and needs none of this; reach for
@@ -515,6 +515,21 @@ namespace BwAudio
             model = default;
             return Ready && Bwa.bwa_get_clock_model(_eng, out model);
         }
+
+        /// <summary>Device health: was the callback starved, and by whom. Returns whether the numbers
+        /// MEAN anything — false when this configuration cannot observe a dropout at all (not started,
+        /// or a driver that never flags a valid sample position), in which case a 0 xrun count is
+        /// indistinguishable from "never measured". Check it once at startup on an unfamiliar
+        /// driver, then poll Xruns for a HUD.</summary>
+        public bool GetHealth(out Bwa.BwaHealth health)
+        {
+            health = default;
+            return Ready && Bwa.bwa_get_health(_eng, out health);
+        }
+
+        /// <summary>Device dropouts since start — the one-line form, for a HUD or a log line. 0 both
+        /// when nothing dropped and when nothing could be measured; GetHealth tells them apart.</summary>
+        public ulong Xruns => Ready ? Bwa.bwa_get_xruns(_eng) : 0;
 
         /// <summary>Map a Time.realtimeSinceStartupAsDouble moment to the dsp-sample clock — THE way
         /// to land a sound on a visual event: <c>emitter.PlayAt(engine.DspTimeAt(tEvent))</c> (schedule
@@ -579,6 +594,20 @@ namespace BwAudio
         /// <summary>Registered ASIO driver `index`'s name (the exact string `asioDriver` expects), or null if
         /// out of range. Engine-free — pair with AsioDriverCount to list the installed drivers.</summary>
         public static string AsioDriverName(uint index) => Bwa.AsioDriverName(index);
+
+        /// <summary>Every installed ASIO driver's name, in enumeration order — the one call a device picker
+        /// actually wants, instead of an index loop over AsioDriverCount/AsioDriverName. Engine-free; the
+        /// strings are exactly what `asioDriver` accepts (empty picks the first usable device).</summary>
+        public static string[] AsioDrivers
+        {
+            get
+            {
+                uint n = AsioDriverCount;
+                var names = new string[n];
+                for (uint i = 0; i < n; i++) names[i] = AsioDriverName(i);
+                return names;
+            }
+        }
 
         // ---- dynamic (movable) acoustic geometry --------------------------------------------------
         // Register a movable occluder/reflector from a LOW-POLY mesh (the acoustic analogue of a physics

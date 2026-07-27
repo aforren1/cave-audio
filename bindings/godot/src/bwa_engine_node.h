@@ -174,7 +174,9 @@ public:
 	void unload_sound_path(const String &path);
 	int64_t sound_get_frames(const String &path);
 	int sound_get_channels(const String &path);
-	void play_oneshot(const String &path, const Vector3 &godot_pos, float gain);
+	/* false = nothing will be heard: the clip failed to load, or the voice pool / command ring
+	 * was momentarily full and the transient was dropped. get_last_error() says which. */
+	bool play_oneshot(const String &path, const Vector3 &godot_pos, float gain);
 
 	/* --- global mix --- */
 	void set_master_gain(float g);
@@ -250,10 +252,22 @@ public:
 	int64_t get_dsp_time() const;
 	/* {valid: bool, dsp_sample: int, host_time_ns: int} — the jitter-free wall<->dsp pair. */
 	Dictionary get_clock() const;
-	int get_output_latency() const;
+	/* Named for the UNIT, deliberately. Godot's own AudioServer.get_output_latency() returns
+	 * SECONDS, so a bare get_output_latency() here returning frames reads as seconds to anyone
+	 * who knows that call — and the null sink reporting 0 hides the mistake, because 0 is 0 in
+	 * either unit. Both units are exposed; neither is spelled the colliding way. */
+	int get_output_latency_frames() const;
+	float get_output_latency_seconds() const;
 	/* {valid: bool, ppm: float, ppm_sigma: float, rate_hz: float, span_s: float, jitter_ns: float,
 	 * stamps: int} — the fitted device-vs-host drift, for a timeline you don't own or a rig log. */
 	Dictionary get_clock_model() const;
+
+	/* --- device health: was the callback starved, and by whom ---
+	 * {measured, blocks, xruns, dropped_frames, driver_resyncs, late_blocks, stream_starves,
+	 * peak_load}. `measured` is false when this configuration cannot observe a dropout at all
+	 * (no engine, or a sink with no deadline), in which case a 0 xrun count proves nothing. */
+	Dictionary get_health() const;
+	int64_t get_xruns() const;
 
 	/* --- diagnostics --- */
 	void set_test_signal(int channel, TestKind kind, float gain);
@@ -271,6 +285,10 @@ public:
 	PackedFloat32Array render_block();
 
 	/* --- static helpers (no engine needed) --- */
+	/* Every installed ASIO driver's name, in the order the ABI enumerates them — the values
+	 * asio_driver accepts. One call, no index loop; the count/name pair remains for a caller
+	 * that wants a single name. */
+	static PackedStringArray get_asio_drivers();
 	static int get_asio_driver_count();
 	static String get_asio_driver_name(int index);
 	static int get_version();

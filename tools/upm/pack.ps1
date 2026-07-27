@@ -148,6 +148,17 @@ function New-TextMeta([string] $StagedFile, [string] $Relative) {
 New-TextMeta (Join-Path $stage 'LICENSE.md')             'LICENSE.md'
 New-TextMeta (Join-Path $stage 'Third Party Notices.md') 'Third Party Notices.md'
 
+# ---- doc pointers ---------------------------------------------------------------------------------
+# The tarball ships Runtime/Editor sources and three markdown files, not the repo's docs/ tree - so a
+# reference to docs/anything in a staged comment or README points at a file the installing user does
+# not have. Rewrite those to permalinks at the packed commit, and refuse to pack if any survive.
+# Shared with the Godot addon pack, which had exactly this bug found in the wild (a 0.4.0 zip citing
+# api.md and docs/build.md, neither shipped). Runs BEFORE the .meta check, because it only edits file
+# CONTENT and never adds or removes a staged file.
+$commit = try { (& git -C $repo rev-parse HEAD).Trim() } catch { 'main' }
+& (Join-Path $repo 'tools/dist/doc-pointers.ps1') -Stage $stage -Repo $repo -Ref $commit `
+    -Extensions @('.md', '.txt', '.cs', '.json')
+
 # ---- every asset must carry a .meta ---------------------------------------------------------------
 # A file arriving without one gets a fresh random GUID in EACH project, so a scene that references the
 # script breaks across machines ("Missing (Mono Script)"). Catch that here, not in a user's project.

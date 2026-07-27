@@ -18,7 +18,7 @@ void BwaBed::_ready() {
 	owner = BwaEngine::get_singleton();
 	if (!owner || !owner->is_running()) {
 		UtilityFunctions::push_warning(vformat(
-				"BwaBed (%s): no running BwaEngine in the scene — this bed is silent.", get_name()));
+				"BwaBed (%s): no running BwaEngine in the scene - this bed is silent.", get_name()));
 		owner = nullptr;
 		return;
 	}
@@ -139,16 +139,26 @@ void BwaBed::fade_out(float seconds) {
 	}
 }
 
-void BwaBed::seek(int64_t frame) {
+void BwaBed::seek_frames(int64_t frame) {
 	if (LIVE) {
 		bwa_bed_seek(ENG, bed, (uint64_t)frame);
 	}
 }
 
+void BwaBed::seek_seconds(double seconds) {
+	if (!LIVE || seconds < 0.0) {
+		return;
+	}
+	const int rate = owner->get_resolved_sample_rate();
+	if (rate > 0) {
+		seek_frames((int64_t)(seconds * (double)rate));
+	}
+}
+
 bool BwaBed::is_playing() const { return LIVE && bwa_bed_is_playing(ENG, bed); }
 
-int64_t BwaBed::get_playhead() const {
-	return LIVE ? (int64_t)bwa_bed_get_playhead(ENG, bed) : 0;
+int64_t BwaBed::get_playhead_frames() const {
+	return LIVE ? (int64_t)bwa_bed_get_playhead_frames(ENG, bed) : 0;
 }
 
 double BwaBed::get_playhead_seconds() const {
@@ -156,7 +166,7 @@ double BwaBed::get_playhead_seconds() const {
 		return 0.0;
 	}
 	const int rate = owner->get_resolved_sample_rate();
-	return rate > 0 ? (double)bwa_bed_get_playhead(ENG, bed) / (double)rate : 0.0;
+	return rate > 0 ? (double)bwa_bed_get_playhead_frames(ENG, bed) / (double)rate : 0.0;
 }
 
 void BwaBed::_bind_methods() {
@@ -185,9 +195,10 @@ void BwaBed::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("stop"), &BwaBed::stop);
 	ClassDB::bind_method(D_METHOD("fade_to", "gain", "seconds"), &BwaBed::fade_to);
 	ClassDB::bind_method(D_METHOD("fade_out", "seconds"), &BwaBed::fade_out);
-	ClassDB::bind_method(D_METHOD("seek", "frame"), &BwaBed::seek);
+	ClassDB::bind_method(D_METHOD("seek_frames", "frame"), &BwaBed::seek_frames);
+	ClassDB::bind_method(D_METHOD("seek_seconds", "seconds"), &BwaBed::seek_seconds);
 	ClassDB::bind_method(D_METHOD("is_playing"), &BwaBed::is_playing);
-	ClassDB::bind_method(D_METHOD("get_playhead"), &BwaBed::get_playhead);
+	ClassDB::bind_method(D_METHOD("get_playhead_frames"), &BwaBed::get_playhead_frames);
 	ClassDB::bind_method(D_METHOD("get_playhead_seconds"), &BwaBed::get_playhead_seconds);
 
 	ADD_PROPERTY(PropertyInfo(Variant::STRING, "clip", PROPERTY_HINT_FILE, "*.wav,*.flac,*.amb"),

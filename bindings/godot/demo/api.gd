@@ -78,6 +78,12 @@ func _test_statics() -> void:
 	for i in n:
 		_check(BwaEngine.get_asio_driver_name(i) != "", "driver %d has an empty name" % i)
 	_check(BwaEngine.get_asio_driver_name(n + 100) == "", "out-of-range driver should be empty")
+	# The one-call form must agree with the index loop it replaces.
+	var drivers := BwaEngine.get_asio_drivers()
+	_check(drivers.size() == n, "get_asio_drivers should hold every enumerated driver")
+	for i in n:
+		_check(drivers[i] == BwaEngine.get_asio_driver_name(i),
+			"get_asio_drivers[%d] disagrees with get_asio_driver_name" % i)
 	_check(BwaEngine.get_version() > 0, "version should be non-zero")
 
 
@@ -216,26 +222,35 @@ func _test_emitter() -> void:
 	emitter.pitch = 1.0
 	emitter.play_clip(clip)
 	await _pump(20)
-	var head := emitter.get_playhead()
+	var head := emitter.get_playhead_frames()
 	_check(head > 0, "playhead should have advanced after 20 blocks, got %d" % head)
 	_check(emitter.is_playing(), "emitter should still be playing a 1 s clip")
 
 	# Seek lands where it was told, which a no-op binding could not fake. On the null sink
 	# the voice keeps running while we look, so the landing is a floor, not a point.
-	emitter.seek(24000)
+	emitter.seek_frames(24000)
 	await _pump(4)
-	var after := emitter.get_playhead()
+	var after := emitter.get_playhead_frames()
 	_check(after >= 24000, "seek to 24000 landed at %d" % after)
+
+	# The seconds twin must land in the same place, and the frames-vs-seconds pair must be the
+	# only spelling: a bare seek() would read as AudioStreamPlayer3D.seek(), which takes seconds.
+	emitter.seek_seconds(0.75)
+	await _pump(4)
+	var after_s := emitter.get_playhead_frames()
+	_check(after_s >= int(0.75 * engine.get_resolved_sample_rate()),
+		"seek_seconds(0.75) landed at %d" % after_s)
+	_check(not emitter.has_method("seek"), "the unit-ambiguous seek() must stay gone")
 
 	# Pause freezes the playhead once the gate has ramped out. This one stays an equality on
 	# both sinks: a frozen playhead is frozen regardless of how much wall time passes, so if
 	# it moves here the pause did not take.
 	emitter.paused = true
 	await _pump(8)
-	var frozen := emitter.get_playhead()
+	var frozen := emitter.get_playhead_frames()
 	await _pump(8)
-	_check(emitter.get_playhead() == frozen,
-		"paused playhead moved from %d to %d" % [frozen, emitter.get_playhead()])
+	_check(emitter.get_playhead_frames() == frozen,
+		"paused playhead moved from %d to %d" % [frozen, emitter.get_playhead_frames()])
 	emitter.paused = false
 
 	# Gapless chaining, and the scheduled stop riding the dsp clock.
@@ -246,8 +261,12 @@ func _test_emitter() -> void:
 	await _pump(4)
 	emitter.stop()
 
-	# One-shot: no handle to manage, and it must not disturb the named sources.
-	engine.play_oneshot(clip, Vector3(1, 1, 1), 0.5)
+	# One-shot: no handle to manage, and it must not disturb the named sources. The return is
+	# the ONLY signal it gives, so assert it rather than assuming — a false here is the
+	# difference between "played" and "clip missing" and "dropped under load".
+	_check(engine.play_oneshot(clip, Vector3(1, 1, 1), 0.5), "the one-shot should be accepted")
+	_check(not engine.play_oneshot("res://does_not_exist.wav", Vector3.ZERO, 1.0),
+		"a one-shot on a missing clip must report the failure")
 	await _pump(4)
 
 	# Asset metadata comes back at the ENGINE rate, so a 1 s clip is one rate's worth.
@@ -274,7 +293,7 @@ func _test_push_source() -> void:
 	_check(pusher.push_space() < space, "push_space should shrink after a push")
 
 	await _pump(10)
-	_check(pusher.get_playhead() > 0, "a push source should consume what it was given")
+	_check(pusher.get_playhead_frames() > 0, "a push source should consume what it was given")
 
 	pusher.push_end()
 	_check(pusher.push(chunk) == 0, "pushes after push_end must be refused")
@@ -288,7 +307,7 @@ func _test_bed() -> void:
 	var field := Tone.write_ambix("api_field", Vector3(1, 0, 0), 220.0, 1.0)
 	bed.play_clip(field)
 	await _pump(20)
-	_check(bed.get_playhead() > 0, "bed playhead should advance")
+	_check(bed.get_playhead_frames() > 0, "bed playhead should advance")
 	_check(bed.is_playing(), "bed should be playing")
 
 	# Orientation is pushed from _process, so it takes a frame to land - the point here is
@@ -301,7 +320,8 @@ func _test_bed() -> void:
 		"set_yaw_from_basis should go through the seam, got %f" % bed.get_orientation().x)
 
 	bed.fade_to(0.5, 0.1)
-	bed.seek(1000)
+	bed.seek_frames(1000)
+	_check(not bed.has_method("seek"), "the bed's unit-ambiguous seek() must stay gone")
 	await _pump(4)
 	bed.fade_out(0.05)
 	await _pump(10)
@@ -336,7 +356,30 @@ func _test_clock() -> void:
 		_check(c2["host_time_ns"] > c["host_time_ns"], "host time should advance")
 		_check(c2["dsp_sample"] > c["dsp_sample"], "dsp sample should advance")
 
-	_check(engine.get_output_latency() == 0, "a sink with no device has no output latency")
+	# Both units, and the name that no longer collides with AudioServer.get_output_latency()
+	# (which is SECONDS). A device-less sink reports 0, which is 0 in either unit — exactly why
+	# the collision hid: the assertion below cannot tell the units apart, and neither could a
+	# reader of the old name.
+	_check(engine.get_output_latency_frames() == 0, "a sink with no device has no output latency")
+
+	# Device health. The two sinks answer differently ON PURPOSE, and that difference is the
+	# feature: the null sink has a thread on a real deadline so it MEASURES, while the manual sink
+	# has no deadline and must say it cannot know rather than report a clean bill.
+	var health := engine.get_health()
+	_check(health["measured"] == not _manual,
+		"health.measured should be %s on the %s sink" % [not _manual, "manual" if _manual else "null"])
+	_check(health["xruns"] == 0, "no xruns should be reported off-hardware")
+	_check(engine.get_xruns() == 0, "the one-line form should agree")
+	# stream_starves is deliberately NOT asserted zero: _test_push_source drains its ring and
+	# pumps past the pushed data, which is a real starve and is counted as one. That it shows up
+	# here is the counter working - a push source that runs dry renders silence indistinguishable
+	# from the end of a clip, which is the whole reason the two are counted separately.
+	_check(health["stream_starves"] >= 0, "stream_starves should be a count")
+	if not _manual:
+		_check(health["blocks"] > 0, "the null sink should have counted blocks")
+	_check(engine.get_output_latency_seconds() == 0.0, "no device means no latency in seconds either")
+	_check(not engine.has_method("get_output_latency"),
+		"the unit-ambiguous name must stay gone - it read as Godot's seconds-valued call")
 
 
 ## Advance the engine by at least n blocks.

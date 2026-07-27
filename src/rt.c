@@ -402,6 +402,11 @@ struct RtCore {
     float       xover_a;     /* one-pole LP coeff for the dual-band crossover (BWA_DUALBAND_FC), rate-derived */
     uint64_t    dsp_block;   /* audio-thread: next block's dsp-sample (fallback clock when no device timestamp) */
     _Atomic uint64_t dsp_now;/* published block-start dsp-sample; control thread reads via rt_dsp_time for scheduling */
+    /* Streamed voices that came up short without having ended: the disk (or push) thread did not
+     * refill the ring in time and the block's tail rendered silence. A DIFFERENT starvation from a
+     * device dropout — the device kept its deadline, we had nothing to give it — so it is counted
+     * separately and reported as its own field (bwa_health.stream_starves). */
+    _Atomic uint64_t strm_starves;
     /* device clock pair for rt_get_clock: the sink's (sample_pos, systemTime) stamp for the last
      * rendered block, published seqlock-style (odd seq = write in progress) so the control thread
      * always reads a CONSISTENT pair — the driver's own statement of "this output sample
@@ -1874,6 +1879,10 @@ static void mix_voice(RtCore* c, Voice* v, uint16_t idx, float* bus, uint32_t n,
         uint32_t want = (start < n) ? (n - start) : 0;
         strm_got = stream_pull(snd->stream, v->stream_pos, c->stream_scratch + start, want);
         for (uint32_t i = start + strm_got; i < n; ++i) c->stream_scratch[i] = 0.f;
+        /* A short pull is either the end of the asset or a STARVE. Only the second is a fault, and
+         * telling them apart is the whole value of the counter: the silence sounds identical. */
+        if (strm_got < want && !stream_ended(snd->stream, v->stream_pos + strm_got))
+            atomic_fetch_add_explicit(&c->strm_starves, 1, memory_order_relaxed);
     }
 
     /* pathing: SH-encode the UN-occluded source (the indirect path goes around the occluder, so it is
@@ -3480,18 +3489,19 @@ bool rt_unload_sound(RtCore* c, uint32_t sound) {
 }
 
 /* Fire-and-forget: a transient voice that recycles itself on EVT_VOICE_ENDED. Its position
- * takes effect on the next rt_commit (the engine's per-frame commit). */
-void rt_play_oneshot(RtCore* c, uint32_t sound, float x, float y, float z, float gain) {
+ * takes effect on the next rt_commit (the engine's per-frame commit). Returns whether the
+ * oneshot was ACCEPTED — every early return here is a drop the caller cannot otherwise see. */
+bool rt_play_oneshot(RtCore* c, uint32_t sound, float x, float y, float z, float gain) {
     SoundSlot* s = sound_slot_ctrl(c, sound);
-    if (!s || s->retiring) return;
-    if (!(isfinite(x) && isfinite(y) && isfinite(z) && isfinite(gain) && gain >= 0.f)) return;
+    if (!s || s->retiring) return false;
+    if (!(isfinite(x) && isfinite(y) && isfinite(z) && isfinite(gain) && gain >= 0.f)) return false;
     /* A oneshot enqueues 4 commands (CREATE/SET_POS/SET_GAIN/PLAY) that must all land, or
      * the transient voice is created-but-never-played and leaks (it never ends -> never
      * acks EVT_VOICE_ENDED -> never recycled). Reserve room for all 4 up front so a
      * ring-full case drops the whole oneshot rather than half of it. */
-    if (cmd_free(&c->cmds) < 4) return;
+    if (cmd_free(&c->cmds) < 4) return false;
     uint32_t h = (c->free_count > c->fade_reserve) ? alloc_handle(c) : 0;   /* don't spend the steal reserve */
-    if (!h) return;                          /* full pool: the fire-and-forget oneshot is simply dropped */
+    if (!h) return false;                    /* full pool: the fire-and-forget oneshot is simply dropped */
     Cmd create = { .type = CMD_SRC_CREATE, .handle = h };
     cmd_push(&c->cmds, &create);              /* the 4 pushes are guaranteed by cmd_free >= 4 */
     rt_source_set_pos(c, h, x, y, z);
@@ -3499,6 +3509,7 @@ void rt_play_oneshot(RtCore* c, uint32_t sound, float x, float y, float z, float
     Cmd play = { .type = CMD_PLAY, .handle = h };
     play.u.play.sound = sound; play.u.play.loop = 0u; play.u.play.oneshot = 1u;
     cmd_push(&c->cmds, &play);
+    return true;
 }
 
 /* ---- lifecycle ---- */
@@ -3839,6 +3850,10 @@ void rt_set_all_paused(RtCore* c, int paused) {
 
 uint32_t rt_active_voices(RtCore* c) {
     return c ? atomic_load_explicit(&c->active_pub, memory_order_relaxed) : 0;
+}
+
+uint64_t rt_stream_starves(RtCore* c) {
+    return c ? atomic_load_explicit(&c->strm_starves, memory_order_relaxed) : 0;
 }
 
 /* Near-listener widening: floor every source's spread at 1 - dist/radius. 0 disables (default).

@@ -487,6 +487,10 @@ int main(void) {
             CHECK(rt_source_is_playing(cps, h), "underrun does not end the voice");
             CHECK(rt_source_get_position(cps, h) == (uint64_t)2 * N,
                   "push: position counts frames CONSUMED — an underrun slips it, never advances it");
+            /* That silence is a STARVE, and it has to be countable: it sounds identical to the end
+               of an asset, which is exactly why bwa_health separates the two. The empty-ring render
+               above is one too, so the count is simply nonzero rather than pinned. */
+            CHECK(rt_stream_starves(cps) > 0, "an empty ring counts as a stream starve");
 
             /* data-driven clock: audio pushed after an underrun still plays (nothing was skipped) */
             CHECK(rt_source_push(cps, h, pblk, N) == N, "push after an underrun");

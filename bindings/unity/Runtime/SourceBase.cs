@@ -320,7 +320,7 @@ namespace BwAudio
         /// DspTime breaks: it freezes while Paused, lands where Seek lands, follows Pitch at the
         /// actual rate, and counts frames actually consumed for streamed clips and push voices.
         /// (The CONTENT position — unrelated to the source's spatial transform.)</summary>
-        public ulong Playhead => Live ? Bwa.bwa_source_get_playhead(Eng, _src) : 0;
+        public ulong Playhead => Live ? Bwa.bwa_source_get_playhead_frames(Eng, _src) : 0;
 
         /// <summary>Playhead in seconds — AudioSource.time-get equivalent (Playhead over the engine
         /// sample rate).</summary>

@@ -18,7 +18,7 @@ void BwaSpeakerView::_ready() {
 	owner = BwaEngine::get_singleton();
 	if (!owner || !owner->is_running()) {
 		UtilityFunctions::push_warning(
-				"BwaSpeakerView: no running BwaEngine — nothing to draw.");
+				"BwaSpeakerView: no running BwaEngine - nothing to draw.");
 		return;
 	}
 
@@ -91,7 +91,7 @@ int BwaSpeakerView::nearest_speaker(const Vector3 &godot_pos) const {
 PackedStringArray BwaSpeakerView::_get_configuration_warnings() const {
 	PackedStringArray w;
 	w.push_back("Speaker positions are read back from the running engine, so this node draws "
-				"nothing in the editor. It also draws the layout the engine RESOLVED — if that "
+				"nothing in the editor. It also draws the layout the engine RESOLVED - if that "
 				"is the 26-speaker default grid, the surveyed layout did not load.");
 	return w;
 }

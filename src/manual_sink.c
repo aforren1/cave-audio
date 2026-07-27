@@ -51,6 +51,10 @@ static const float* manual_render_block(bwa_sink* b, uint32_t* channels, uint32_
     return s->bus;
 }
 
+/* No .health entry, on purpose. This sink has no clock and no deadline — blocks happen when the
+ * caller asks for them, so "the device ran on without us" and "we overran the period" are both
+ * meaningless here. bwa_sink_get_health reports measured = false, which is the honest answer:
+ * an offline render cannot miss a deadline by construction, so it must not claim it never did. */
 static const bwa_sink_vtbl MANUAL_VT = {   /* designated: render_block is the manual-only extension */
     .start = manual_start, .stop = manual_stop, .close = manual_close,
     .backend = manual_backend, .block_size = manual_block_size, .render_block = manual_render_block,

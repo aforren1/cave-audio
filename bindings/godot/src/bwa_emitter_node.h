@@ -40,7 +40,11 @@ public:
 	/* Gapless chaining. Queue AFTER play — a fresh play clears the queue. */
 	void queue(const String &p, bool queue_loop);
 	void clear_queue();
-	void seek(int64_t frame);
+	/* Named for the unit, like get_output_latency_*: Godot's AudioStreamPlayer3D.seek() takes
+	 * SECONDS as a float, so a bare seek() here taking frames is a silent unit trap — a caller
+	 * passing 1.5 lands on frame 1 and the clip simply starts from the top. */
+	void seek_frames(int64_t frame);
+	void seek_seconds(double seconds);
 
 	/* An explicit halt is not an end: `finished` means the sound RAN OUT (a non-loop end, a
 	 * drained queue) — never that stop()/fade_out() was called. stop_at() deliberately DOES

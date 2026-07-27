@@ -201,6 +201,14 @@ If this file ended up in your project root via an Asset Library install, it is s
 - only ``addons/bw_audio/`` matters.
 "@ | Set-Content -Path (Join-Path $stage 'README.md') -Encoding ascii
 
+# ---- doc pointers --------------------------------------------------------------------------
+# The zip carries the ADDON, not the repo's docs/ tree, so a reference to a repo doc that survives
+# into the stage points at a file the installing user does not have. Shared with the Unity pack,
+# which ships the same kind of prose from the same repo; see tools/dist/doc-pointers.ps1 for what
+# it rewrites and what it refuses to let out.
+& (Join-Path $repo 'tools/dist/doc-pointers.ps1') -Stage $stage -Repo $repo -Ref $commit `
+    -Extensions @('.md', '.txt', '.gd', '.tscn', '.gdextension', '.cfg')
+
 # ---- zip ------------------------------------------------------------------------------------
 New-Item -ItemType Directory -Force -Path $OutDir | Out-Null
 $zip = Join-Path $OutDir "bw_audio-godot-$Version.zip"

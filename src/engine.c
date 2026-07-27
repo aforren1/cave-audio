@@ -719,7 +719,7 @@ void  bwa_bed_seek(bwa_engine* e, bwa_bed b, uint64_t frame)         { bwa_sourc
 void  bwa_bed_set_priority(bwa_engine* e, bwa_bed b, int priority)   { bwa_source_set_priority(e, b, priority); }
 void  bwa_bed_set_group(bwa_engine* e, bwa_bed b, uint32_t group)    { bwa_source_set_group(e, b, group); }
 bool  bwa_bed_is_playing(bwa_engine* e, bwa_bed b)                   { return bwa_source_is_playing(e, b); }
-uint64_t bwa_bed_get_playhead(bwa_engine* e, bwa_bed b)              { return bwa_source_get_playhead(e, b); }
+uint64_t bwa_bed_get_playhead_frames(bwa_engine* e, bwa_bed b)              { return bwa_source_get_playhead_frames(e, b); }
 
 /* ---- sources (forward to the rt core) ---- */
 
@@ -809,7 +809,32 @@ bool bwa_get_clock_model(bwa_engine* e, bwa_clock_model* out) {
     out->span_s = f.span_s; out->jitter_ns = f.jitter_ns; out->stamps = f.stamps;
     return true;
 }
-uint32_t bwa_get_output_latency(bwa_engine* e)                               { return e ? bwa_sink_output_latency(e->sink) : 0; }
+uint32_t bwa_get_output_latency_frames(bwa_engine* e)                               { return e ? bwa_sink_output_latency(e->sink) : 0; }
+
+bool bwa_get_health(bwa_engine* e, bwa_health* out) {
+    if (!out) return false;
+    memset(out, 0, sizeof *out);
+    if (!e) return false;
+
+    bwa_sink_health h;
+    bwa_sink_get_health(e->sink, &h);            /* zeroed + measured=false when there is no sink */
+    out->blocks         = h.blocks;
+    out->xruns          = h.dropouts;
+    out->dropped_frames = h.dropped_frames;
+    out->driver_resyncs = h.driver_resyncs;
+    out->late_blocks    = h.late_blocks;
+    /* The stream ring is the engine's, not the device's — it starves under ANY sink, so it is
+     * reported whether or not the device could be measured. */
+    out->stream_starves = rt_stream_starves(e->rt);
+    out->peak_load      = h.period_ns ? (float)((double)h.render_ns_peak / (double)h.period_ns) : 0.f;
+    return h.measured;
+}
+
+uint64_t bwa_get_xruns(bwa_engine* e) {
+    bwa_health h;
+    bwa_get_health(e, &h);                       /* false (unmeasurable) leaves h zeroed: 0 xruns */
+    return h.xruns;
+}
 void bwa_source_stop(bwa_engine* e, bwa_source s)                           { if (e) rt_source_stop(e->rt, s); }
 void bwa_source_stop_at(bwa_engine* e, bwa_source s, uint64_t stop_sample)  { if (e) rt_source_stop_at(e->rt, s, stop_sample); }
 void bwa_source_queue(bwa_engine* e, bwa_source s, bwa_sound snd, bool loop) {
@@ -826,7 +851,7 @@ void bwa_source_clear_queue(bwa_engine* e, bwa_source s)                    { if
 void bwa_source_set_paused(bwa_engine* e, bwa_source s, bool paused)        { if (e) rt_source_set_paused(e->rt, s, paused); }
 void bwa_source_seek(bwa_engine* e, bwa_source s, uint64_t frame)           { if (e) rt_source_seek(e->rt, s, frame); }
 bool bwa_source_is_playing(bwa_engine* e, bwa_source s)                     { return e ? rt_source_is_playing(e->rt, s) : false; }
-uint64_t bwa_source_get_playhead(bwa_engine* e, bwa_source s)               { return e ? rt_source_get_position(e->rt, s) : 0; }
+uint64_t bwa_source_get_playhead_frames(bwa_engine* e, bwa_source s)               { return e ? rt_source_get_position(e->rt, s) : 0; }
 void bwa_set_test_signal(bwa_engine* e, uint32_t channel, bwa_test_kind kind, float gain) { if (e) rt_test_signal(e->rt, channel, (uint8_t)kind, gain); }
 
 void bwa_set_panner(bwa_engine* e, bwa_panner panner) { if (e) { e->panner = (int)panner; rt_set_panner(e->rt, (int)panner); } }
@@ -978,13 +1003,25 @@ uint32_t bwa_get_bus_levels(bwa_engine* e, float* peaks, uint32_t cap) {
     return rt_bus_peaks(e->rt, peaks, cap);
 }
 
-void bwa_play_oneshot(bwa_engine* e, bwa_sound snd, float x, float y, float z, float gain) {
-    if (!e) return;
-    if (rt_sound_channels(e->rt, snd) > 1) {
-        set_error(e, "bwa_play_oneshot: asset is multichannel — oneshots are point sources (use bwa_load_sound)");
-        return;
+bool bwa_play_oneshot(bwa_engine* e, bwa_sound snd, float x, float y, float z, float gain) {
+    if (!e) return false;
+    const uint16_t ch = rt_sound_channels(e->rt, snd);
+    if (ch == 0) {
+        set_error(e, "bwa_play_oneshot: sound handle is stale or was never loaded");
+        return false;
     }
-    rt_play_oneshot(e->rt, snd, x, y, z, gain);
+    if (ch > 1) {
+        set_error(e, "bwa_play_oneshot: asset is multichannel — oneshots are point sources (use bwa_load_sound)");
+        return false;
+    }
+    if (!rt_play_oneshot(e->rt, snd, x, y, z, gain)) {
+        /* The transient drops: no free voice (the steal reserve is not spent on fire-and-forget,
+         * so oneshot spam can never evict a named source), or the command ring is momentarily
+         * full. Both are load, not a caller bug — but the caller still gets to know. */
+        set_error(e, "bwa_play_oneshot: dropped — voice pool or command ring full, or a bad position/gain");
+        return false;
+    }
+    return true;
 }
 
 /* ---- materials / occlusion (no-ops without the Steam Audio backend) ---- */

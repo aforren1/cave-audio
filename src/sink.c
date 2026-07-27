@@ -70,3 +70,26 @@ uint32_t    bwa_sink_output_latency(bwa_sink* s) { return (s && s->vt->output_la
 const float* bwa_sink_render_block(bwa_sink* s, uint32_t* channels, uint32_t* nframes) {
     return (s && s->vt->render_block) ? s->vt->render_block(s, channels, nframes) : NULL;
 }
+
+void bwa_sink_get_health(bwa_sink* s, bwa_sink_health* out) {
+    if (!out) return;
+    memset(out, 0, sizeof *out);            /* measured = false: no sink, or a backend that measures nothing */
+    if (s && s->vt->health) s->vt->health(s, out);
+}
+
+/* The gap rule, in one place because both threaded sinks and the test share it.
+ *
+ * A dropout is the device advancing PAST where our next callback was predicted to land: it clocked
+ * out audio we never rendered. Everything else that can move a reported position is deliberately
+ * NOT a dropout:
+ *   - actual < expected  the position went backward — a driver reset or a stale/garbage stamp.
+ *   - a jump beyond the sane window — same story, and counting it would report millions of lost
+ *     frames from one bad stamp, which is worse than missing a real dropout.
+ * The window is generous (a full second of blocks) because a genuine dropout under load can span
+ * many blocks, while a reset typically lands nowhere near the running position. */
+uint64_t sink_position_gap(uint64_t expected, uint64_t actual, uint32_t block) {
+    if (actual <= expected) return 0;
+    const uint64_t gap = actual - expected;
+    const uint64_t sane = (uint64_t)(block ? block : 1u) * 4096ull;
+    return gap <= sane ? gap : 0;
+}

@@ -67,6 +67,18 @@ static int render_scenario(double* total, double* negX, double* posX, float* hea
             for (uint32_t i = 0; i < n; ++i) { float v = out[(size_t)c * n + i]; e_ch[c] += (double)v * v; }
         for (uint32_t i = 0; i < n && hc < NHEAD; ++i) head[hc++] = out[i];   /* channel 0 fingerprint */
     }
+    /* The manual sink has no clock and no deadline, so it cannot miss one — and must SAY so rather
+     * than report a clean bill. This is the offline blind spot the counters exist to be honest
+     * about: everything else in this file is deterministic precisely because nothing here can be
+     * late. (bwa_get_xruns reads 0 here too, which is exactly why it is not proof of health.) */
+    {
+        bwa_health h;
+        if (bwa_get_health(e, &h)) {
+            fprintf(stderr, "golden: the manual sink cannot observe a dropout, but health claims it can\n");
+            bwa_stop(e); bwa_destroy(e); return -1;
+        }
+    }
+
     bwa_stop(e);
     bwa_destroy(e);
 

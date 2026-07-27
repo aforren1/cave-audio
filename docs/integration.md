@@ -117,7 +117,7 @@ internal static class Bwa {
     [DllImport(DLL, CallingConvention=CC)] public static extern void bwa_source_set_gain(IntPtr e, uint s, float g);
     [DllImport(DLL, CallingConvention=CC)] public static extern void bwa_source_play(IntPtr e, uint s, uint snd,[MarshalAs(UnmanagedType.I1)] bool loop);
     [DllImport(DLL, CallingConvention=CC)] public static extern void bwa_source_stop(IntPtr e, uint s);
-    [DllImport(DLL, CallingConvention=CC)] public static extern void bwa_play_oneshot(IntPtr e, uint snd, float x, float y, float z, float gain);
+    [DllImport(DLL, CallingConvention=CC)] [return: MarshalAs(UnmanagedType.I1)] public static extern bool bwa_play_oneshot(IntPtr e, uint snd, float x, float y, float z, float gain);
     [DllImport(DLL, CallingConvention=CC)] public static extern void bwa_set_listener_pose(IntPtr e, float px,float py,float pz, float qx,float qy,float qz,float qw);
     [DllImport(DLL, CallingConvention=CC)] public static extern void bwa_commit(IntPtr e);
 }

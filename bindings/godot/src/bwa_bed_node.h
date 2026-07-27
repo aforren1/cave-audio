@@ -66,9 +66,11 @@ public:
 	void stop();
 	void fade_to(float target, float seconds);
 	void fade_out(float seconds);
-	void seek(int64_t frame);
+	/* Unit in the name; see BwaEmitter::seek_frames for why a bare seek() is a trap. */
+	void seek_frames(int64_t frame);
+	void seek_seconds(double seconds);
 	bool is_playing() const;
-	int64_t get_playhead() const;
+	int64_t get_playhead_frames() const;
 	double get_playhead_seconds() const;
 
 protected:

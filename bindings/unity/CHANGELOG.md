@@ -4,6 +4,104 @@ All notable changes to `com.brainworks.bw_audio`.
 
 ## [Unreleased]
 
+### Added — device health (`bwa_get_health` / `bwa_get_xruns`)
+
+The third dogfooding gap, and the one that cost three probes: every readback described the RENDER —
+voices, meters, the clock — and nothing counted blocks the device asked for and didn't get. You could
+prove the render path was clean and still not know whether the callback missed its deadline.
+
+- **`bwa_get_xruns(e)`** answers "is the device being starved?" in one line. **`bwa_get_health(e, &h)`**
+  fills a `bwa_health` when you need the diagnosis: `blocks` (the denominator), `xruns` and
+  `dropped_frames` (the device ran on without us), `driver_resyncs` (the driver reporting a
+  discontinuity itself), `late_blocks` and `peak_load` (OUR render overrunning the block period —
+  the cause, not the symptom), and `stream_starves` (a streamed voice's ring ran dry; the device kept
+  its deadline, we had nothing to give it).
+- Most of this was already being computed and thrown away. The ASIO callback predicts the next
+  sample position for its fallback clock; comparing the driver's actual position against that
+  prediction IS the dropout, in one comparison. `kAsioResyncRequest` was already handled and its
+  information discarded.
+- **`bwa_get_health` returns a bool, and that is the load-bearing part.** False = this configuration
+  cannot observe a dropout at all: not started, the manual sink (no clock, no deadline — an offline
+  render cannot miss one by construction), or a driver that never flags a valid sample position. In
+  every one of those `xruns` is 0, and reading that as a clean bill of health is how a starved device
+  goes unnoticed. Same trap as the latency-0 bug two entries down; this time it is designed out.
+- **Tested off-hardware, honestly.** A real missed deadline needs a real device, but the arithmetic
+  that turns a position jump into a count is ordinary code: the gap rule is factored into
+  `sink_position_gap` and unit-tested (including its refusals — a backward or absurd jump is a driver
+  reset, not a dropout), and a null-sink injection hook makes the sink report a position skip it did
+  not render, so the whole path from detection to readback runs under ctest. The null sink's
+  `late_blocks` are real, not simulated: that thread has a genuine deadline.
+- Unity: `Engine.GetHealth(out BwaHealth)` and `Engine.Xruns`. Godot: `get_health()` returning a
+  Dictionary (`measured` included) and `get_xruns()`.
+
+### Changed — units in names, where they earn it
+
+The narrow generalization of the `get_output_latency` trap below, applied once and then written
+down. The rule: **a unit belongs in a name when the quantity has two live units.** Time is the only
+one in this ABI — frames and seconds are both real — so every time-valued name now says which.
+Distances (metres), frequencies (Hz), angles (radians) and gains (linear) have no competitor and
+stay unmarked, carrying the unit on the value (`radius_m`, `xover_hz`, `yaw_rad`) where it helps.
+A decibel value must say `_db`, since linear is the unmarked default. Stated in
+docs/api.md → "Coordinates and units".
+
+- **Three C symbols renamed** (the only frames-valued names that did not say so):
+  `bwa_get_output_latency` → `bwa_get_output_latency_frames`, `bwa_source_get_playhead` →
+  `bwa_source_get_playhead_frames`, `bwa_bed_get_playhead` → `bwa_bed_get_playhead_frames`.
+  Signatures and semantics are unchanged. This also closes a layer mismatch: the Godot binding
+  says `_frames`, so C now agrees with it.
+- **Godot: `get_playhead()` → `get_playhead_frames()`** on `BwaSource` and `BwaBed`, beside the
+  existing `get_playhead_seconds()`. That surface is now uniform: `seek_frames`/`seek_seconds`,
+  `get_playhead_frames`/`_seconds`, `get_output_latency_frames`/`_seconds`.
+- **Unity is unaffected at the C# level** — only the P/Invoke declarations follow the C symbols.
+  `Playhead` / `PlayheadSeconds` and `OutputLatency` keep their names: `AudioSource.timeSamples`
+  vs `time` is Unity's own spelling of the same pairing, and there is no host collision to fix.
+- Deliberately NOT renamed: the `sample`/`frame` synonym (`start_sample`, `dsp_sample`), which
+  denotes the same thing for mono voices and has never misled anyone, and `ir_seconds` → `ir_s`
+  for consistency with its `_s` siblings. Both are churn against a frozen-soon ABI.
+
+### Fixed — a dogfooding pass on the Godot addon
+
+All six from an outside install of `bw_audio-godot-0.4.0.zip`. The two expensive ones are the same
+failure in different clothes: a call that could not be checked, and a number that could not be
+interpreted. Both stayed invisible off-hardware, because the null sink returns the benign value
+(nothing to drop, zero latency).
+
+- **`bwa_play_oneshot` now returns `bool`** — whether the one-shot was ACCEPTED. It was `void`, so
+  a caller could not tell "played" from "clip missing" from "dropped because the voice pool or
+  command ring was full", and the only workaround was probing `sound_get_channels` as a proxy for
+  load success. False sets `bwa_last_error` to which of the three it was. The drop itself is
+  unchanged and still correct: one-shots never steal, so spam cannot evict named sources. There is
+  still no handle to poll — use `bwa_source_create` + `bwa_source_play` if you need to track the
+  voice. Unity: `Emitter.PlayOneShot()` returns `bool`. Godot: `BwaEngine.play_oneshot()` returns
+  `bool`. Adding a return to a `void` C function is caller-compatible, so existing C call sites
+  that ignore it keep working.
+- **Godot: `get_output_latency()` is now `get_output_latency_frames()`**, with a new
+  `get_output_latency_seconds()` beside it. Godot's own `AudioServer.get_output_latency()` returns
+  SECONDS, so the identical name returning frames read as seconds to anyone who knew that call — a
+  normal 960-frame ASIO latency displayed as `960000.0 ms`. It hid indefinitely because the null
+  sink returns 0, and 0 is 0 in any unit.
+- **Godot: `seek()` is now `seek_frames()`**, with a new `seek_seconds()`, on both `BwaEmitter` and
+  `BwaBed` — the same collision found by sweeping for it (`AudioStreamPlayer3D.seek()` takes
+  seconds, so `seek(1.5)` silently truncated to frame 1). The engine's own unit stays frames
+  everywhere, because that is what the dsp clock counts.
+- **Godot: the `profile` property now spells out what each value does** in the inspector
+  (`"Binaural — headphones, direct render"` and friends) instead of naming the enum, and a new
+  configuration warning fires when `profile` is Cave on a machine with no ASIO driver — the case
+  that renders 26 channels into nothing and is silent by design. It is the highest-stakes property
+  on the node and the inspector is where the choice is made.
+- **A one-call driver list**: `BwaEngine.get_asio_drivers() -> PackedStringArray` and Unity's
+  `Engine.AsioDrivers`. The count/name pair remains, but it was undocumented and had to be found by
+  grepping the DLL's strings.
+- **The release artifacts no longer ship dangling doc pointers.** The 0.4.0 zip contained
+  `playground.gd` and `scenes.gd` citing `api.md` and `THIRD_PARTY-NOTICES.md` citing
+  `docs/build.md`, none of which are in the zip. Both packs now run `tools/dist/doc-pointers.ps1`,
+  which rewrites every repo-doc reference in the staged tree to a permalink at the packed commit
+  and then FAILS the pack if any relative `.md` reference is left that the stage cannot satisfy.
+  The Unity tarball had the same bug and is fixed the same way.
+- **ASCII in every runtime-printed string** in the Godot binding: an en-dash in
+  `"no running BwaEngine in the scene"` came out as mojibake on a Windows console codepage. Comments
+  and docs keep their punctuation; only strings that reach a console changed.
+
 ## [0.4.0]
 
 ### Added — physical emulation batch

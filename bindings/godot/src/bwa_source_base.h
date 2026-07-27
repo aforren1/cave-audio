@@ -100,7 +100,7 @@ public:
 
 	/* --- readbacks --- */
 	virtual bool is_playing() const;
-	int64_t get_playhead() const;
+	int64_t get_playhead_frames() const;
 	double get_playhead_seconds() const;
 
 	virtual void stop(); /* see fade_out */

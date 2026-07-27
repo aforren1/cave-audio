@@ -125,6 +125,23 @@ re-hardcoding them. The engine's world-locked decodes and its default listener
 position use the **array centroid** (the nominal listening point), not the origin.
 Gains are linear (1 = unity); sound offsets are engine-rate sample frames.
 
+**Where units live in a name.** One quantity in this ABI has two live units: time is genuinely
+both frames (the dsp clock, `play_at`, `stop_at`, `seek`, the playheads, the output latency,
+`bwa_sound_get_frames`) and seconds (fades, RT60, IR length, the pose lead). So every time-valued
+name says which — a getter ends `_frames`, a parameter is named `seconds` or ends `_s`. Nothing
+else needs a suffix, because nothing else has a competitor: distances are metres, frequencies Hz,
+angles radians, gains linear. Those carry the unit on the *value* where it helps
+(`radius_m`, `xover_hz`, `yaw_rad`, `host_time_ns`) and never on the call.
+
+The one rule that constrains new calls: a **decibel** value must say `_db`. Linear is the unmarked
+default across the whole ABI, so a dB parameter that doesn't say so is invisible — `limiter_ceiling`
+changed from dB to linear in 0.4.0 and only its parameter name records it.
+
+Bindings inherit this and add one rule of their own: never borrow a host-engine name that carries
+a *different* unit. Godot's `AudioServer.get_output_latency()` is seconds and
+`AudioStreamPlayer3D.seek()` takes seconds, so the Godot binding spells its frame-valued twins
+`get_output_latency_frames` / `seek_frames` and offers `_seconds` beside them.
+
 ## How-to guides
 
 Recipes for situations every client hits, composed from calls documented in the
@@ -196,7 +213,7 @@ Your renderer decides *now* that something will be seen at wall time T (an anima
 lands, a metronome flashes), and the sound must be *heard* at T. Wall time and the
 dsp-sample clock are different clocks, so the recipe is: map T to a dsp sample using the
 device's own block stamps (`bwa_get_clock`), subtract the device's render→DAC latency
-(`bwa_get_output_latency`), and schedule with `bwa_source_play_at`
+(`bwa_get_output_latency_frames`), and schedule with `bwa_source_play_at`
 (see [Sources](#sources-control-thread-non-blocking)). Here in a raylib client;
 `GetTime()` is the app clock, and any monotonic seconds clock works as long as you use
 the same one throughout.
@@ -239,7 +256,7 @@ while (!WindowShouldClose()) {
     if (IsKeyPressed(KEY_SPACE)) {                // swing starts now, impact lands in 0.5 s
         double t_seen  = GetTime() + 0.5 + display_s;   // when the impact frame is SEEN
         uint64_t heard = dsp_at(e, t_seen);
-        uint32_t lat   = bwa_get_output_latency(e);     // render -> DAC, frames
+        uint32_t lat   = bwa_get_output_latency_frames(e);     // render -> DAC, frames
         bwa_source_play_at(e, s, thump, false, heard > lat ? heard - lat : 0);
         anim_start = GetTime();
     }
@@ -258,7 +275,7 @@ while (!WindowShouldClose()) {
   ("the collision is this frame") can never beat the physical output chain: play it
   immediately and accept up to one output latency of error.
 - **`display_s` is yours to measure.** The engine reports its own output chain
-  (`bwa_get_output_latency`; the Digiface includes its Dante buffering) but cannot see your
+  (`bwa_get_output_latency_frames`; the Digiface includes its Dante buffering) but cannot see your
   display's. Measure draw→photons once (photodiode, or an AV-sync clapper against the
   array) and that one constant aligns the whole chain.
 - **The fallback is often enough.** Before the first stamped block (and always on the
@@ -267,7 +284,7 @@ while (!WindowShouldClose()) {
   estimator buys sub-millisecond.
 - **The other direction needs no wall clock.** An event on the *audio* timeline (a cue
   inside a track you scheduled) fires its visual when `bwa_get_dsp_time` crosses
-  `start + cue`, or off `bwa_source_get_playhead`.
+  `start + cue`, or off `bwa_source_get_playhead_frames`.
 - **It holds for a two-hour show.** `clock_refresh` runs every frame, so the ppm difference
   between the two crystals never accumulates—the standing error stays sub-millisecond however
   long you run. What that buys is a rule: schedule far-out events in dsp *samples*
@@ -604,14 +621,14 @@ void     bwa_source_clear_queue(bwa_engine* e, bwa_source s);                   
 void     bwa_source_set_paused(bwa_engine* e, bwa_source s, bool paused);   // ramped; playhead freezes
 void     bwa_source_seek (bwa_engine* e, bwa_source s, uint64_t frame);     // click-free jump (in-memory)
 bool     bwa_source_is_playing(bwa_engine* e, bwa_source s);  // control-thread poll; see below
-uint64_t bwa_source_get_playhead(bwa_engine* e, bwa_source s); // CONTENT playhead, engine-rate frames
-void     bwa_play_oneshot(bwa_engine* e, bwa_sound snd, float x, float y, float z, float gain);
+uint64_t bwa_source_get_playhead_frames(bwa_engine* e, bwa_source s); // CONTENT playhead, engine-rate frames
+bool     bwa_play_oneshot(bwa_engine* e, bwa_sound snd, float x, float y, float z, float gain); // false = dropped
 ```
 
 **The model: a source drives at most one voice.** Play on an already-playing source restarts it
 (a new sound replaces the old, un-paused at frame 0); the same `bwa_sound` can play on any number
 of sources at once. And mind the near-namesakes: `bwa_source_set_pos` is the **spatial** position,
-`bwa_source_get_playhead` the **content** position—unrelated readouts.
+`bwa_source_get_playhead_frames` the **content** position—unrelated readouts.
 
 **Starts are click-free.** Every `play` / `play_at` / `play_loop` ramps the per-channel gains up
 from silence over the first block (~5 ms), the mirror of the one-block fade `stop` / `stop_at` use
@@ -658,7 +675,7 @@ restart the source and clear the queue, so the natural order is play-then-queue.
 after a *looping* current sound (it never ends) or a *stopping* one—a `stop` / `stop_at` / `fade_out`
 in flight ends the voice instead of starting the queued sound. In-memory mono on both ends: a
 bed/stream/push `snd` is rejected (`bwa_last_error`), and a queue behind a *streamed* current sound
-is ignored. `bwa_source_get_playhead` restarts at each chained item and the source reads as playing
+is ignored. `bwa_source_get_playhead_frames` restarts at each chained item and the source reads as playing
 throughout; `bwa_source_clear_queue` drops the pending chain. If you need to know *which* item is
 playing, watch the playhead reset across the seam—there's no separate event.
 
@@ -666,13 +683,13 @@ playing, watch the playhead reset across the seam—there's no separate event.
 // clock / scheduling - the time base for bwa_source_play_at:
 uint64_t bwa_get_dsp_time(bwa_engine* e);                       // current dsp-sample clock (device-anchored, monotonic)
 bool     bwa_get_clock(bwa_engine* e, uint64_t* dsp_sample, uint64_t* host_time_ns); // device (sample, host-time) pair
-uint32_t bwa_get_output_latency(bwa_engine* e);                 // device render->DAC latency, frames (0 = unknown)
+uint32_t bwa_get_output_latency_frames(bwa_engine* e);                 // device render->DAC latency, frames (0 = unknown)
 bool     bwa_get_clock_model(bwa_engine* e, bwa_clock_model* out); // fitted device-vs-host drift (ppm + its sigma)
 ```
 
 **Syncing with graphics.** Two cases. Events that live on the **audio timeline** (a cue in a track
 you scheduled) never need wall time: keep the `start_sample` you passed to `play_at` and fire the
-visual when `bwa_get_dsp_time` crosses `start + cue` (or poll `bwa_source_get_playhead`). Events
+visual when `bwa_get_dsp_time` crosses `start + cue` (or poll `bwa_source_get_playhead_frames`). Events
 that originate on the **graphics side** (the sound must land on an animation frame) need the
 wall→dsp mapping, and that is `bwa_get_clock`: the (output sample position, host time) pair the
 audio stack stamps inside each block callback (ASIO's `ASIOGetSamplePosition` pair, synthesized
@@ -689,7 +706,7 @@ sink is the deliberate exception — it stamps a *nominal* time derived from the
 pair as a sample-accurate fiction, exact for arithmetic and meaningless as wall time. Its first
 block carries nominal time 0 (read as "unstamped"), so the manual clock goes valid on block 2.
 Finally,
-the dsp clock stamps when a block is *rendered*, not heard: `bwa_get_output_latency` is the
+the dsp clock stamps when a block is *rendered*, not heard: `bwa_get_output_latency_frames` is the
 device's own render→DAC delay in frames (`ASIOGetLatencies`; the Digiface includes its Dante buffering), so
 sound scheduled for dsp time T reaches the room at `T + latency`—subtract your measured display
 delay from it and one constant aligns the whole AV chain.
@@ -731,7 +748,7 @@ finishes, after `stop`, or for a stale/destroyed handle. Poll it once per frame 
 "on finished" signal. It's best-effort: a sound shorter than your poll interval may never be
 observed as playing.
 
-**The playhead is a poll too.** `bwa_source_get_playhead` rides the same per-block republish: the
+**The playhead is a poll too.** `bwa_source_get_playhead_frames` rides the same per-block republish: the
 voice's **content** position in engine-rate frames (`seconds = position / sample_rate`). This is the
 engine-owned truth for driving synced visuals or a progress UI, correct exactly where deriving a
 playhead from `bwa_get_dsp_time` breaks: it freezes under pause, lands where a seek lands, follows a
@@ -774,8 +791,18 @@ it for one-shot variation, slow-mo, engines.
 Positions are in **room space** (see [Coordinates and units](#coordinates-and-units)).
 `bwa_play_oneshot` is the fire-and-forget path: it allocates a transient voice internally
 and recycles it on end, so the caller holds no handle. Unlike `bwa_source_create` it never
-**steals**: with the voice pool (or the command ring) momentarily full the oneshot is silently
-dropped, so oneshot spam can't evict your named sources.
+**steals**: with the voice pool (or the command ring) momentarily full the oneshot is dropped,
+so oneshot spam can't evict your named sources.
+
+It returns whether it was **accepted**, and that return is the only way to tell "played" from
+"never loaded" from "dropped under load" — check it. False sets `bwa_last_error` to which of the
+three it was. Fire-and-forget means no handle to poll, so this one boolean is the whole signal;
+if you need to track the voice afterwards, that is what `bwa_source_create` is for.
+
+```c
+if (!bwa_play_oneshot(e, impact, x, y, z, 1.f))
+    log("impact dropped: %s", bwa_last_error(e));
+```
 
 ### Procedural (push) sources
 
@@ -851,7 +878,7 @@ void    bwa_bed_seek        (bwa_engine* e, bwa_bed b, uint64_t frame);
 void    bwa_bed_set_priority(bwa_engine* e, bwa_bed b, int priority);    // beds share the voice pool -
 void    bwa_bed_set_group   (bwa_engine* e, bwa_bed b, uint32_t group);  //   protect a music bed with 255
 bool    bwa_bed_is_playing  (bwa_engine* e, bwa_bed b);
-uint64_t bwa_bed_get_playhead(bwa_engine* e, bwa_bed b);   // content playhead, engine-rate frames
+uint64_t bwa_bed_get_playhead_frames(bwa_engine* e, bwa_bed b);   // content playhead, engine-rate frames
 ```
 
 `bwa_bed_set_orientation` orients the recorded field in 3 axes: yaw it about the room's vertical
@@ -1356,6 +1383,8 @@ typedef enum { BWA_TEST_OFF = 0, BWA_TEST_SINE = 1, BWA_TEST_NOISE = 2 } bwa_tes
 void     bwa_set_test_signal(bwa_engine* e, uint32_t channel, bwa_test_kind kind, float gain);
 uint32_t bwa_get_bus_levels(bwa_engine* e, float* peaks, uint32_t cap);  // last block's per-channel output peak
 uint32_t bwa_get_active_voices(bwa_engine* e);                           // last block's active voice count
+bool     bwa_get_health(bwa_engine* e, bwa_health* out);                 // xruns + load; see below
+uint64_t bwa_get_xruns(bwa_engine* e);                                   // device dropouts, one line
 ```
 
 `bwa_get_active_voices` is the voice-pool gauge next to the meters: the audio thread publishes each
@@ -1381,6 +1410,57 @@ count filled (`bwa_get_channel_count()` when `cap` allows). Per-frame-safe (rela
 locks); levels read 0 until audio is
 running. Drive channel meters or a speaker-activity display with it; the playground lights each
 speaker gizmo from this.
+
+### Device health: was the callback starved?
+
+```c
+typedef struct bwa_health {
+    uint64_t blocks, xruns, dropped_frames, driver_resyncs, late_blocks, stream_starves;
+    float    peak_load;      // worst block's render time / block period
+} bwa_health;
+bool     bwa_get_health(bwa_engine* e, bwa_health* out);  // false = this setup cannot measure
+uint64_t bwa_get_xruns(bwa_engine* e);                    // the one-line form
+```
+
+Everything else on this page describes the **render**. None of it can tell you the device asked for
+a block and did not get one—which is the failure that makes a clean render sound broken, and the
+one thing an offline render cannot reproduce by construction. That is what these count.
+
+The fields answer two different questions with two different fixes:
+
+- **`xruns`** is the *device* running on without us. Its sample position jumped past where the last
+  callback said the next one would land, so it clocked out audio nobody rendered. Fix upstream: a
+  bigger buffer, fewer competing loads, a look at the driver. `dropped_frames` is how much audio
+  those gaps swallowed.
+- **`late_blocks`** is *us* overrunning the block period, which is what eventually produces xruns.
+  Fix downstream: a cheaper scene, fewer voices, and watch `peak_load`—it is the worst single block's
+  render time as a fraction of the period, so 1.0 means a block exactly consumed its budget and
+  anything near it is living dangerously.
+- **`stream_starves`** is neither. The device kept its deadline and a *streamed voice* had nothing to
+  give it, because the disk thread didn't refill in time; that block's tail rendered silence. It
+  sounds identical to a clip ending, which is exactly why it is counted separately.
+
+Read them against `blocks`. One xrun in two million blocks is a machine hiccup; one in a thousand is
+a configuration to fix.
+
+**The return value is the load-bearing part.** `bwa_get_health` returns whether the numbers mean
+anything at all. It is false when nothing here can observe a dropout: before `bwa_start`, on the
+manual sink (no clock, no deadline—it cannot miss one), or on an ASIO driver that never flags a valid
+sample position, leaving nothing to compare against. In every one of those cases `xruns` is zero, and
+reading that zero as a clean bill of health is precisely how a starved device goes unnoticed.
+
+```c
+bwa_health h;
+if (!bwa_get_health(e, &h))
+    log("device health unavailable on this driver — xruns cannot be detected here");
+else if (h.xruns)
+    log("%llu dropouts (%llu frames) over %llu blocks, peak load %.2f",
+        h.xruns, h.dropped_frames, h.blocks, h.peak_load);
+```
+
+Check the boolean once after `bwa_start` on an unfamiliar driver; poll `bwa_get_xruns` for a HUD
+afterwards. Both are control-thread, per-frame-safe (relaxed atomic reads), and every count is
+monotonic since start.
 
 ### Output capture (recording / golden checks)
 

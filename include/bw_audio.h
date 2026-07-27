@@ -170,7 +170,7 @@ BWA_API const char* bwa_get_audio_backend(bwa_engine* e);
 /* The RESOLVED engine config (zero-defaulted desc fields resolved), valid from bwa_create on.
  * Derive time from these — seconds = frames / bwa_get_sample_rate(e) — not from the desc you
  * passed, which may have said 0. The block size is the engine's render quantum (the device may
- * buffer differently; bwa_get_output_latency carries the real render->DAC delay). */
+ * buffer differently; bwa_get_output_latency_frames carries the real render->DAC delay). */
 BWA_API uint32_t bwa_get_sample_rate(bwa_engine* e);   /* Hz */
 BWA_API uint32_t bwa_get_block_size (bwa_engine* e);   /* frames per render block */
 /* The sink actually running — the machine-readable side of bwa_get_audio_backend: after
@@ -214,7 +214,7 @@ BWA_API uint32_t bwa_sound_get_channels(bwa_engine* e, bwa_sound snd);
 /* ---- sources (control thread; non-blocking, enqueue only) ----
  * The model: a source drives at most ONE voice. Play on an already-playing source restarts it
  * (and a new sound replaces the old); the same bwa_sound can play on any number of sources at
- * once. Sound-position readback is bwa_source_get_playhead — bwa_source_set_pos below is the
+ * once. Sound-position readback is bwa_source_get_playhead_frames — bwa_source_set_pos below is the
  * SPATIAL position, the playhead is the CONTENT position; they are unrelated. */
 BWA_API bwa_source bwa_source_create(bwa_engine* e);              /* handle returned synchronously */
 BWA_API void     bwa_source_destroy(bwa_engine* e, bwa_source s);
@@ -283,7 +283,7 @@ BWA_API void     bwa_source_stop_at(bwa_engine* e, bwa_source s, uint64_t stop_s
  * _loop RESTART the source and clear the queue. Nothing chains after a LOOPING current sound (it
  * never ends) or a stopped one. In-memory mono sounds only, on both ends: a multichannel/streamed/
  * push `snd` is rejected (see bwa_last_error), and a queue behind a streamed current sound is
- * ignored. The playhead (bwa_source_get_playhead) restarts at each chained item; the voice reads
+ * ignored. The playhead (bwa_source_get_playhead_frames) restarts at each chained item; the voice reads
  * as playing throughout. Per-frame-safe. bwa_source_clear_queue drops the pending chain. */
 BWA_API void     bwa_source_queue(bwa_engine* e, bwa_source s, bwa_sound snd, bool loop);
 BWA_API void     bwa_source_clear_queue(bwa_engine* e, bwa_source s);
@@ -309,11 +309,14 @@ BWA_API bool     bwa_source_is_playing(bwa_engine* e, bwa_source s);
  * voice, a play_at still held silent, or a stale handle reads 0. Block-granular latest-wins
  * readback like is_playing — for tighter-than-a-block timing use bwa_get_dsp_time arithmetic.
  * The full contract: docs/api.md, "The playhead is a poll too". */
-BWA_API uint64_t bwa_source_get_playhead(bwa_engine* e, bwa_source s);
+BWA_API uint64_t bwa_source_get_playhead_frames(bwa_engine* e, bwa_source s);
 /* Fire-and-forget: an internal transient voice at (x,y,z), recycled when the sound ends — no
  * handle to manage. Default priority, and it never STEALS: with the voice pool (or the command
- * ring) momentarily full the oneshot is silently dropped, so spam can't evict named sources. */
-BWA_API void     bwa_play_oneshot(bwa_engine* e, bwa_sound snd, float x, float y, float z, float gain);
+ * ring) momentarily full the oneshot is DROPPED, so spam can't evict named sources.
+ * Returns whether it was accepted; false means nothing will be heard, and bwa_last_error says
+ * which drop it was (stale handle, multichannel asset, or the full-pool/full-ring case). There
+ * is no handle to poll — if you need to track the voice, use bwa_source_create + bwa_source_play. */
+BWA_API bool     bwa_play_oneshot(bwa_engine* e, bwa_sound snd, float x, float y, float z, float gain);
 
 /* ---- clock / scheduling (control thread; the time base for bwa_source_play_at) ---- */
 /* The engine's dsp-sample clock: the most recently rendered block's first sample — the device
@@ -362,7 +365,7 @@ BWA_API bool     bwa_get_clock_model(bwa_engine* e, bwa_clock_model* out);
  * is HEARD at T + latency. The audio half of AV alignment (the video half — display delay — you
  * measure once; docs/api.md). 0 = unknown or no physical output (null sink, or before
  * bwa_start). Constant while the device is open. */
-BWA_API uint32_t bwa_get_output_latency(bwa_engine* e);
+BWA_API uint32_t bwa_get_output_latency_frames(bwa_engine* e);
 
 /* ---- procedural (push) sources: engine-generated audio, no file (full story: docs/api.md,
  *      "Procedural (push) sources") ----
@@ -422,7 +425,7 @@ BWA_API void  bwa_bed_seek(bwa_engine* e, bwa_bed b, uint64_t frame);
 BWA_API void  bwa_bed_set_priority(bwa_engine* e, bwa_bed b, int priority);
 BWA_API void  bwa_bed_set_group(bwa_engine* e, bwa_bed b, uint32_t group);
 BWA_API bool  bwa_bed_is_playing(bwa_engine* e, bwa_bed b);
-BWA_API uint64_t bwa_bed_get_playhead(bwa_engine* e, bwa_bed b);
+BWA_API uint64_t bwa_bed_get_playhead_frames(bwa_engine* e, bwa_bed b);
 
 /* ---- materials / occlusion (control thread; needs the Steam Audio build) ---- */
 
@@ -721,6 +724,45 @@ BWA_API uint32_t bwa_get_bus_levels(bwa_engine* e, float* peaks, uint32_t cap);
 /* Last block's ACTIVE voice count (playing, sound bound) — a voice-pool gauge for HUDs/health
  * monitoring next to the meters. Control thread, per-frame-safe; 0 until audio runs. */
 BWA_API uint32_t bwa_get_active_voices(bwa_engine* e);
+
+/* ---- device health: was the callback starved, and by whom ----
+ * Every other readback here describes the RENDER — voices, meters, the clock. None of them can tell
+ * you the device asked for a block and did not get one, which is the failure that makes a clean
+ * render sound broken. These counters do, and they are monotonic since bwa_start.
+ *
+ * The two halves answer different questions and have different fixes. `xruns` is the DEVICE running
+ * on without us: its sample position jumped past where the last callback said the next one would
+ * land, so it clocked out audio nobody rendered (bigger buffer, fewer other loads on the machine,
+ * check the driver). `late_blocks` is US overrunning the block period, which is what eventually
+ * produces those (cheaper scene, fewer voices, look at peak_load). `stream_starves` is neither: the
+ * device kept its deadline and a streamed voice had nothing to give it, because the disk thread
+ * didn't refill in time — the block's tail rendered silence.
+ *
+ * Reading it: the counts mean nothing without `blocks` under them. One xrun in two million blocks is
+ * a machine hiccup; one in a thousand is a configuration to fix. */
+typedef struct bwa_health {
+    uint64_t blocks;          /* blocks rendered since start — the denominator for everything else  */
+    uint64_t xruns;           /* device dropouts: it ran on without us                              */
+    uint64_t dropped_frames;  /* frames those dropouts swallowed (xruns tells you how many events)  */
+    uint64_t driver_resyncs;  /* the driver reporting a discontinuity itself (ASIO kAsioResyncRequest) */
+    uint64_t late_blocks;     /* our render overran the block period — we are the cause             */
+    uint64_t stream_starves;  /* a streamed voice's ring ran dry without the asset having ended     */
+    float    peak_load;       /* worst single-block render time / block period. 1.0 = exactly at
+                               * budget, so anything approaching it is living dangerously           */
+} bwa_health;
+/* Fills `out` and returns whether the numbers MEAN anything. False = this configuration cannot
+ * observe a dropout at all: no engine, not started, the manual sink (no clock, no deadline — an
+ * offline render cannot miss one by construction), or an ASIO driver that never flags a valid
+ * sample position, leaving nothing to compare against. `out` is zeroed either way.
+ *
+ * That boolean is the point. A zero xrun count means "none happened" ONLY when this returned true;
+ * on its own it is indistinguishable from "never measured", and silently reading it as a clean bill
+ * of health is exactly how a starved device goes unnoticed. Control thread, per-frame-safe. */
+BWA_API bool     bwa_get_health(bwa_engine* e, bwa_health* out);
+/* The one-line form: device dropouts since bwa_start, for a HUD or a log line. 0 when nothing was
+ * dropped AND when nothing could be measured — call bwa_get_health once at startup if you need to
+ * tell those apart (and you do, on an unfamiliar driver). */
+BWA_API uint64_t bwa_get_xruns(bwa_engine* e);
 
 /* ---- output capture (recording / offline sanity + golden checks) ----
  * Tap the FINAL device-bound output — post-limiter, exactly what reaches the device. The callback runs

@@ -39,6 +39,15 @@ __declspec(dllexport)
 #endif
 extern void (*bwa_null_sink_tap)(const float* bus, uint32_t channels, uint32_t block_size);
 
+/* TEST HOOK (defined in null_sink.c, exported from the dll; deliberately not in bw_audio.h):
+ * set it to N and the null sink's next block reports a device position N blocks further on than it
+ * rendered — a synthetic dropout, so the health accounting can be tested without a device. Consumed
+ * once. A real missed deadline cannot be produced offline; the arithmetic that counts one can. */
+#ifdef BWA_BUILD_DLL
+__declspec(dllexport)
+#endif
+extern volatile long bwa_null_sink_skip_blocks;
+
 /* Hardware-anchored timestamp captured at the top of each block. Mirrors what ASIO
  * delivers via ASIOTime (sample position + nanosecond systemTime); the null sink
  * synthesizes it from QueryPerformanceCounter. */
@@ -51,6 +60,33 @@ typedef struct {
  * MUST fill `bus` (planar, channels * nframes floats) and obey the audio-thread
  * invariants (no alloc/lock/syscall/I/O — see CLAUDE.md). `user` is the engine. */
 typedef void (*bwa_render_fn)(void* user, float* bus, uint32_t nframes, const bwa_timestamp* ts);
+
+/* Device health, accumulated on the audio thread and sampled from the control thread. Every count
+ * is monotonic since the sink started. This is the one thing an offline render CANNOT synthesize:
+ * a missed deadline needs a real clock and a real device, so the counters exist to answer "was the
+ * device starved, and by whom" on the rig rather than in CI.
+ *
+ * `measured` is load-bearing. A backend that cannot observe dropouts (the manual sink has no
+ * deadlines; an ASIO driver that never flags kSamplePositionValid gives us nothing to compare)
+ * reports false, so a caller can tell "none happened" from "cannot know". A zero that means both
+ * is exactly the trap bwa_get_output_latency_frames had. */
+typedef struct {
+    uint64_t blocks;           /* blocks rendered — the denominator for every count below   */
+    uint64_t dropouts;         /* device sample-position discontinuities: it ran on without us */
+    uint64_t dropped_frames;   /* frames those gaps swallowed                                */
+    uint64_t driver_resyncs;   /* the driver itself reporting a discontinuity (kAsioResyncRequest) */
+    uint64_t late_blocks;      /* OUR render overran the block period — we are the cause     */
+    uint64_t render_ns_peak;   /* worst single-block render time                             */
+    uint64_t period_ns;        /* the block period that budget is measured against; 0 = none */
+    bool     measured;         /* false = this backend cannot observe dropouts at all        */
+} bwa_sink_health;
+
+/* Frames lost between the position a callback was PREDICTED to report and the one it actually did.
+ * 0 = continuous (the normal case) — and also the answer when the device position went BACKWARD or
+ * jumped absurdly far, which is a driver reset or a stale stamp rather than a dropout, and must not
+ * be counted as one. Factored out of the backends so the accounting can be tested without a device
+ * (test/health_test.c); `block` bounds the sane-jump window. */
+uint64_t sink_position_gap(uint64_t expected, uint64_t actual, uint32_t block);
 
 typedef struct bwa_sink bwa_sink;
 
@@ -70,6 +106,9 @@ typedef struct {
      * thread into the sink's own bus, returning a pointer to it (planar, *channels * *nframes floats)
      * valid until the next call. This is the offline/deterministic render path (bwa_render_block). */
     const float* (*render_block)(bwa_sink*, uint32_t* channels, uint32_t* nframes);
+    /* Sample the health counters (see bwa_sink_health). NULL entry = this backend measures nothing,
+     * which bwa_sink_get_health reports as measured = false rather than as a clean bill. */
+    void        (*health)(bwa_sink*, bwa_sink_health*);
 } bwa_sink_vtbl;
 
 struct bwa_sink { const bwa_sink_vtbl* vt; };
@@ -92,6 +131,9 @@ uint32_t     bwa_sink_output_latency(bwa_sink* s); /* device render->DAC latency
 /* Manual/offline: render one block synchronously (bwa_render_block). NULL unless this is a manual
  * sink — threaded backends don't support caller-driven pumping. */
 const float* bwa_sink_render_block(bwa_sink* s, uint32_t* channels, uint32_t* nframes);
+/* Sample the device-health counters. Always writes `out` (zeroed, measured = false, when there is
+ * no sink or the backend measures nothing), so a caller never reads uninitialized counts. */
+void         bwa_sink_get_health(bwa_sink* s, bwa_sink_health* out);
 
 /* Backend constructors used by bwa_sink_open. null is always present; asio only when
  * BWA_HAVE_ASIO is defined (third_party/asiosdk vendored — see third_party/README.md). */

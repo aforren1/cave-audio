@@ -121,8 +121,11 @@ int main(int argc, char** argv) {
                rate, cfg.sample_rate, (rate / (double)cfg.sample_rate - 1.0) * 1e6);
     }
 
-    /* fire-and-forget at a fixed point: no handle to manage, the voice recycles itself */
-    bwa_play_oneshot(e, ping, -2.f, 1.5f, 0.f, 1.f);
+    /* fire-and-forget at a fixed point: no handle to manage, the voice recycles itself. The
+     * return is the ONLY signal a oneshot gives you -- false means it never sounded, so check
+     * it rather than assuming silence is the mix. */
+    if (!bwa_play_oneshot(e, ping, -2.f, 1.5f, 0.f, 1.f))
+        printf("oneshot dropped: %s\n", bwa_last_error(e));
     Sleep(600);                                 /* let the 0.5 s ping ring out — a oneshot has no
                                                  * handle to poll, and without the wait the play
                                                  * below starts on top of it (two overlapping dings,

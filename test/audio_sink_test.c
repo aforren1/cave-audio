@@ -42,6 +42,89 @@ static void on_render(void* user, float* bus, uint32_t nframes, const bwa_timest
     p->last_ns         = ts->system_time_ns;
 }
 
+/* The gap rule, on its own. A real missed deadline needs a real device, but the arithmetic that
+ * turns a position jump into a count is ordinary code — and it is the part that would silently
+ * regress. Both refusals matter as much as the detection: a driver reset that rewinds or flings the
+ * position must not be reported as millions of lost frames. */
+static int test_gap_rule(void) {
+    const uint32_t BS = 256;
+    struct { uint64_t expected, actual; uint64_t want; const char* what; } cases[] = {
+        { 1024, 1024,        0,        "continuous"                       },
+        { 1024, 1024 + 256,  256,      "one block lost"                   },
+        { 1024, 1024 + 2560, 2560,     "ten blocks lost"                  },
+        { 1024, 512,         0,        "position went backward (reset)"   },
+        { 1024, 1024ull + (uint64_t)256 * 4096 + 1, 0, "absurd jump (stale stamp)" },
+        { 1024, 1024ull + (uint64_t)256 * 4096,     (uint64_t)256 * 4096, "the window's edge still counts" },
+    };
+    int ok = 1;
+    for (size_t i = 0; i < sizeof cases / sizeof *cases; ++i) {
+        const uint64_t got = sink_position_gap(cases[i].expected, cases[i].actual, BS);
+        if (got != cases[i].want) {
+            fprintf(stderr, "FAIL: gap %s: got %llu, want %llu\n", cases[i].what,
+                    (unsigned long long)got, (unsigned long long)cases[i].want);
+            ok = 0;
+        }
+    }
+    return ok;
+}
+
+/* End to end through the real sink: inject a device position skip and the counters must report
+ * exactly one dropout of exactly that many frames. This is the closest an offline test can get to
+ * a starved device, and it covers every line between the position compare and the readback. */
+static int test_injected_drop(void) {
+    Probe p;
+    memset(&p, 0, sizeof p);
+    p.first = 1; p.time_monotonic = 1; p.pos_monotonic = 1;
+
+    const uint32_t SR = 48000, BS = 256, SKIP = 3;
+    char err[256] = {0};
+    bwa_sink* s = bwa_null_sink_open(SR, BS, BWA_CHANNELS, on_render, &p, err, sizeof err);
+    if (!s) { fprintf(stderr, "FAIL: inject open: %s\n", err[0] ? err : "(no message)"); return 0; }
+    if (bwa_sink_start(s) != 0) { fprintf(stderr, "FAIL: inject start\n"); bwa_sink_close(s); return 0; }
+
+    Sleep(50);
+    bwa_null_sink_skip_blocks = (long)SKIP;     /* the device runs on for 3 blocks without us */
+    Sleep(100);
+    bwa_sink_stop(s);
+
+    bwa_sink_health h;
+    bwa_sink_get_health(s, &h);
+    int ok = 1;
+    if (h.dropouts != 1) {
+        fprintf(stderr, "FAIL: injected one dropout, counted %llu\n", (unsigned long long)h.dropouts); ok = 0;
+    }
+    if (h.dropped_frames != (uint64_t)SKIP * BS) {
+        fprintf(stderr, "FAIL: dropped %llu frames, expected %u\n",
+                (unsigned long long)h.dropped_frames, SKIP * BS); ok = 0;
+    }
+    if (!h.measured) { fprintf(stderr, "FAIL: injected run reports unmeasured\n"); ok = 0; }
+    bwa_sink_close(s);
+    return ok;
+}
+
+/* The manual sink has no clock and no deadline, so it must say measured = false rather than report
+ * a clean bill. "Cannot know" and "nothing happened" are different answers, and conflating them is
+ * how a starved device goes unnoticed. */
+static int test_manual_unmeasured(void) {
+    Probe p;
+    memset(&p, 0, sizeof p);
+    p.first = 1;
+    char err[256] = {0};
+    bwa_sink* s = bwa_manual_sink_open(48000, 256, BWA_CHANNELS, on_render, &p, err, sizeof err);
+    if (!s) { fprintf(stderr, "FAIL: manual open: %s\n", err[0] ? err : "(no message)"); return 0; }
+
+    uint32_t ch = 0, nf = 0;
+    for (int i = 0; i < 4; ++i) bwa_sink_render_block(s, &ch, &nf);
+
+    bwa_sink_health h;
+    bwa_sink_get_health(s, &h);
+    int ok = 1;
+    if (h.measured) { fprintf(stderr, "FAIL: the manual sink cannot observe a dropout, but claims to\n"); ok = 0; }
+    if (h.dropouts || h.blocks) { fprintf(stderr, "FAIL: unmeasured health must be zeroed\n"); ok = 0; }
+    bwa_sink_close(s);
+    return ok;
+}
+
 int main(void) {
     Probe p;
     memset(&p, 0, sizeof p);
@@ -70,8 +153,23 @@ int main(void) {
         ok = 0;
     }
 
+    /* --- health, clean run --- */
+    bwa_sink_health h;
+    bwa_sink_get_health(s, &h);
+    if (!h.measured)          { fprintf(stderr, "FAIL: a threaded sink with a deadline must report measured\n"); ok = 0; }
+    if (h.blocks != blocks)   { fprintf(stderr, "FAIL: health counted %llu blocks, probe saw %lu\n",
+                                        (unsigned long long)h.blocks, blocks); ok = 0; }
+    if (h.dropouts != 0)      { fprintf(stderr, "FAIL: %llu dropouts on an uninjected run\n",
+                                        (unsigned long long)h.dropouts); ok = 0; }
+    if (h.dropped_frames != 0){ fprintf(stderr, "FAIL: frames dropped with no dropout\n"); ok = 0; }
+    if (h.period_ns == 0)     { fprintf(stderr, "FAIL: no block period to measure the budget against\n"); ok = 0; }
+
     bwa_sink_close(s);
     if (!ok) return 1;
+
+    if (!test_gap_rule())      return 1;
+    if (!test_injected_drop()) return 1;
+    if (!test_manual_unmeasured()) return 1;
 
     printf("audio sink OK: backend=%s blocks=%lu last_sample_pos=%llu last_ns=%llu\n",
            backend, blocks, (unsigned long long)p.last_sample_pos, (unsigned long long)p.last_ns);

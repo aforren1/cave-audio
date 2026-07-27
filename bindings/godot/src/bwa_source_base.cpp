@@ -20,7 +20,7 @@ void BwaSource::_ready() {
 	owner = BwaEngine::get_singleton();
 	if (!owner || !owner->is_running()) {
 		UtilityFunctions::push_warning(vformat(
-				"%s (%s): no running BwaEngine in the scene — this source is silent.",
+				"%s (%s): no running BwaEngine in the scene - this source is silent.",
 				get_class(), get_name()));
 		owner = nullptr;
 		return;
@@ -109,14 +109,14 @@ PackedStringArray BwaSource::_get_configuration_warnings() const {
 		 * ALREADY contains early reflections, so running both renders them twice — which
 		 * does not sound like a bug, only like a roomier room. */
 		w.push_back("Image-source early reflections pair with the FDN, never with the Steam "
-					"reflection bed — that bed already contains early reflections, so both "
+					"reflection bed - that bed already contains early reflections, so both "
 					"together render them twice.");
 		w.push_back("Early reflections need the room: set a BwaRoomBox in the scene, or this "
 					"source renders dry.");
 	}
 	if (occlusion) {
 		w.push_back("Ray-traced occlusion needs the Steam Audio build and scene geometry. "
-					"Without the SDK use set_occlusion_manual() instead — and never drive one "
+					"Without the SDK use set_occlusion_manual() instead - and never drive one "
 					"source through both, because the sim republishes every tick and wins.");
 	}
 	if (pathing) {
@@ -351,8 +351,8 @@ void BwaSource::set_pathing(bool on) {
 
 bool BwaSource::is_playing() const { return LIVE && bwa_source_is_playing(ENG, src); }
 
-int64_t BwaSource::get_playhead() const {
-	return LIVE ? (int64_t)bwa_source_get_playhead(ENG, src) : 0;
+int64_t BwaSource::get_playhead_frames() const {
+	return LIVE ? (int64_t)bwa_source_get_playhead_frames(ENG, src) : 0;
 }
 
 double BwaSource::get_playhead_seconds() const {
@@ -360,7 +360,7 @@ double BwaSource::get_playhead_seconds() const {
 		return 0.0;
 	}
 	const int rate = owner->get_resolved_sample_rate();
-	return rate > 0 ? (double)bwa_source_get_playhead(ENG, src) / (double)rate : 0.0;
+	return rate > 0 ? (double)bwa_source_get_playhead_frames(ENG, src) / (double)rate : 0.0;
 }
 
 void BwaSource::_bind_methods() {
@@ -424,7 +424,7 @@ void BwaSource::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("get_pathing"), &BwaSource::get_pathing);
 
 	ClassDB::bind_method(D_METHOD("is_playing"), &BwaSource::is_playing);
-	ClassDB::bind_method(D_METHOD("get_playhead"), &BwaSource::get_playhead);
+	ClassDB::bind_method(D_METHOD("get_playhead_frames"), &BwaSource::get_playhead_frames);
 	ClassDB::bind_method(D_METHOD("get_playhead_seconds"), &BwaSource::get_playhead_seconds);
 
 	ADD_GROUP("Mix", "");

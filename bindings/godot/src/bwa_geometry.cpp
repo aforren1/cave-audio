@@ -156,7 +156,7 @@ PackedStringArray BwaDynamicGeometry::_get_configuration_warnings() const {
 		w.push_back("No mesh: this mover has no geometry and will occlude nothing.");
 	}
 	w.push_back("Dynamic geometry needs the Steam Audio build. Without it this node is inert, "
-				"and BAKED reflections ignore it either way — the bake froze the scene.");
+				"and BAKED reflections ignore it either way - the bake froze the scene.");
 	return w;
 }
 
@@ -249,7 +249,7 @@ void BwaRoomBox::_enter_tree() {
 		/* The engine collects room boxes before bwa_start because the image-source handoff
 		 * assumes the audio thread is not yet running. Arriving late is not recoverable. */
 		UtilityFunctions::push_error(
-				"BwaRoomBox: added after the engine started. The room box is load-time only — put "
+				"BwaRoomBox: added after the engine started. The room box is load-time only - put "
 				"it in the scene alongside BwaEngine.");
 	}
 }

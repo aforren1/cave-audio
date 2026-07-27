@@ -95,7 +95,20 @@ static int run_profile(bwa_profile profile, const char* name) {
     bwa_source_set_attenuation_override(e, s, 0.0f, 0.0f, 0.0f);
     bwa_set_listener_pose(e, 0.f, 1.5f, 0.f, 0.f, 0.f, 0.f, 1.f);   /* the default grid's ear point */
     bwa_commit(e);
-    bwa_play_oneshot(e, snd, 0.f, 1.f, 0.f, 1.0f);
+    /* The oneshot's return is its only signal (no handle to poll), so both directions are ABI:
+     * a loaded asset is accepted, and a never-loaded handle reports the drop rather than
+     * looking like it played. `snd` is legitimately 0 when footsteps.wav is absent — which is
+     * itself the invalid-handle case, so the assertion follows the handle. */
+    if (snd) {
+        if (!bwa_play_oneshot(e, snd, 0.f, 1.f, 0.f, 1.0f)) {
+            fprintf(stderr, "FAIL[%s]: bwa_play_oneshot dropped a valid oneshot: %s\n", name, bwa_last_error(e));
+            bwa_destroy(e); return 1;
+        }
+    }
+    if (bwa_play_oneshot(e, 0, 0.f, 1.f, 0.f, 1.0f)) {
+        fprintf(stderr, "FAIL[%s]: bwa_play_oneshot accepted an invalid sound handle\n", name);
+        bwa_destroy(e); return 1;
+    }
 
     /* the bwa_bed_* facade forwards to the same per-voice machinery — exercise every export on a
      * live engine (no AmbiX asset here, so no bed_play; the rest is enqueue-only and must be safe
@@ -136,8 +149,36 @@ static int run_profile(bwa_profile profile, const char* name) {
             fprintf(stderr, "FAIL[%s]: clock pair does not advance with rendered blocks\n", name);
             bwa_destroy(e); return 1;
         }
-        if (bwa_get_output_latency(e) != 0) {
+        if (bwa_get_output_latency_frames(e) != 0) {
             fprintf(stderr, "FAIL[%s]: null sink reports a nonzero output latency\n", name);
+            bwa_destroy(e); return 1;
+        }
+    }
+
+    /* device health through the full dll. The null sink has a real thread on a real deadline, so it
+     * MEASURES — and a quiet 30 ms of blocks must come back clean. The point of asserting `measured`
+     * is that a 0 xrun count is only meaningful once it is true. */
+    {
+        bwa_health h;
+        if (!bwa_get_health(e, &h)) {
+            fprintf(stderr, "FAIL[%s]: the null sink has a deadline, so health must be measured\n", name);
+            bwa_destroy(e); return 1;
+        }
+        if (h.blocks == 0) {
+            fprintf(stderr, "FAIL[%s]: health counted no blocks after 45 ms of audio\n", name);
+            bwa_destroy(e); return 1;
+        }
+        if (h.xruns != 0 || h.dropped_frames != 0 || bwa_get_xruns(e) != 0) {
+            fprintf(stderr, "FAIL[%s]: %llu xruns (%llu frames) on an idle null-sink run\n", name,
+                    (unsigned long long)h.xruns, (unsigned long long)h.dropped_frames);
+            bwa_destroy(e); return 1;
+        }
+        if (h.stream_starves != 0) {   /* nothing streamed here */
+            fprintf(stderr, "FAIL[%s]: stream starves reported with no streamed voice\n", name);
+            bwa_destroy(e); return 1;
+        }
+        if (!(h.peak_load > 0.f)) {    /* a rendered block always takes SOME time */
+            fprintf(stderr, "FAIL[%s]: peak_load is zero after rendering blocks\n", name);
             bwa_destroy(e); return 1;
         }
     }

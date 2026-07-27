@@ -49,7 +49,7 @@ void BwaEngine::_ready() {
 	if (dll != BWA_VERSION) {
 		UtilityFunctions::push_warning(vformat(
 				"BwaEngine: bw_audio.dll is version %d.%d.%d but the extension was built against "
-				"%d.%d.%d — rebuild the binding against the DLL you are shipping.",
+				"%d.%d.%d - rebuild the binding against the DLL you are shipping.",
 				(dll >> 16) & 0xff, (dll >> 8) & 0xff, dll & 0xff, BWA_VERSION_MAJOR,
 				BWA_VERSION_MINOR, BWA_VERSION_PATCH));
 	}
@@ -200,7 +200,7 @@ void BwaEngine::build_static_scene() {
 	if (ground_enabled) {
 		if (box) {
 			UtilityFunctions::push_warning(
-					"BwaEngine: both a BwaRoomBox and ground_enabled — the box wins (one room at "
+					"BwaEngine: both a BwaRoomBox and ground_enabled - the box wins (one room at "
 					"a time); disable one.");
 		} else {
 			const int tok = ground_material.is_valid() ? (int)ground_material->token(this) : 0;
@@ -429,13 +429,18 @@ int BwaEngine::sound_get_channels(const String &path) {
 	return snd ? (int)bwa_sound_get_channels(eng, snd) : 0;
 }
 
-void BwaEngine::play_oneshot(const String &path, const Vector3 &godot_pos, float gain) {
+/* Returns whether the oneshot was ACCEPTED. A oneshot holds no handle, so this boolean is the
+ * only thing a caller can check — without it, "clip missing" and "dropped under load" and
+ * "played" all look identical from GDScript. The load failure already pushes an error (see
+ * load_sound); the DROP deliberately does not, because the case that produces it is oneshot
+ * spam and a per-drop message would bury the console at exactly the wrong moment. */
+bool BwaEngine::play_oneshot(const String &path, const Vector3 &godot_pos, float gain) {
 	const bwa_sound snd = load_sound(path, false);
 	if (!snd) {
-		return;
+		return false;
 	}
 	const Vector3 p = to_room_position(godot_pos);
-	bwa_play_oneshot(eng, snd, (float)p.x, (float)p.y, (float)p.z, gain);
+	return bwa_play_oneshot(eng, snd, (float)p.x, (float)p.y, (float)p.z, gain);
 }
 
 /* --- global mix --- */
@@ -724,8 +729,36 @@ Dictionary BwaEngine::get_clock() const {
 	return d;
 }
 
-int BwaEngine::get_output_latency() const {
-	return eng ? (int)bwa_get_output_latency(eng) : 0;
+int BwaEngine::get_output_latency_frames() const {
+	return eng ? (int)bwa_get_output_latency_frames(eng) : 0;
+}
+
+float BwaEngine::get_output_latency_seconds() const {
+	const int rate = get_resolved_sample_rate();
+	return rate > 0 ? (float)get_output_latency_frames() / (float)rate : 0.0f;
+}
+
+/* {measured, blocks, xruns, dropped_frames, driver_resyncs, late_blocks, stream_starves, peak_load}
+ * — a Dictionary rather than a fistful of getters, because these numbers only mean anything
+ * TOGETHER: a count without `blocks` under it has no scale, and any of them without `measured` may
+ * be zero simply because this configuration cannot see a dropout. */
+Dictionary BwaEngine::get_health() const {
+	Dictionary d;
+	bwa_health h = {};
+	const bool measured = eng ? bwa_get_health(eng, &h) : false;
+	d["measured"] = measured;
+	d["blocks"] = (int64_t)h.blocks;
+	d["xruns"] = (int64_t)h.xruns;
+	d["dropped_frames"] = (int64_t)h.dropped_frames;
+	d["driver_resyncs"] = (int64_t)h.driver_resyncs;
+	d["late_blocks"] = (int64_t)h.late_blocks;
+	d["stream_starves"] = (int64_t)h.stream_starves;
+	d["peak_load"] = h.peak_load;
+	return d;
+}
+
+int64_t BwaEngine::get_xruns() const {
+	return eng ? (int64_t)bwa_get_xruns(eng) : 0;
 }
 
 Dictionary BwaEngine::get_clock_model() const {
@@ -817,6 +850,18 @@ PackedFloat32Array BwaEngine::render_block() {
 
 int BwaEngine::get_asio_driver_count() { return (int)bwa_get_asio_driver_count(); }
 
+/* The one-call form: what you actually want before filling a dropdown or setting asio_driver.
+ * The count/name pair below is still there for a caller that wants one name without the array. */
+PackedStringArray BwaEngine::get_asio_drivers() {
+	const int n = get_asio_driver_count();
+	PackedStringArray out;
+	out.resize(n);
+	for (int i = 0; i < n; ++i) {
+		out.set(i, get_asio_driver_name(i));
+	}
+	return out;
+}
+
 String BwaEngine::get_asio_driver_name(int index) {
 	char buf[256];
 	if (!bwa_get_asio_driver_name((uint32_t)index, buf, sizeof buf)) {
@@ -869,7 +914,18 @@ PackedStringArray BwaEngine::_get_configuration_warnings() const {
 		/* The engine warns once at runtime too, but by then the double-rendered reflections
 		 * are already in the mix and sound merely "roomy". */
 		w.push_back("The Steam reflection bed already contains early reflections. Do not also "
-					"enable early_reflections on sources — they render twice.");
+					"enable early_reflections on sources - they render twice.");
+	}
+	/* The desk case, and the one that costs the most time: profile Cave renders the 26-channel
+	 * array and nothing else, so on a machine with no rig it is silent by design. get_audio_backend()
+	 * reports it after the fact — this says it before the run. CaveSim is the profile that
+	 * auditions the array on headphones; Binaural is the direct headphone render. */
+	if (profile == PROFILE_CAVE && sink != SINK_NULL && sink != SINK_MANUAL
+			&& BwaEngine::get_asio_driver_count() == 0) {
+		w.push_back("Profile is Cave (the 26-channel rig) but no ASIO driver is installed, so "
+					"this machine will render the array to nothing and you will hear silence. "
+					"Use CaveSim to audition the array on headphones, or Binaural for the "
+					"direct headphone render.");
 	}
 	if (feed_listener && listener_path.is_empty()) {
 		w.push_back("Feed Listener is on but no listener node is set, so the listener never "
@@ -878,7 +934,7 @@ PackedStringArray BwaEngine::_get_configuration_warnings() const {
 	}
 	if (!feed_listener && profile != PROFILE_CAVE) {
 		w.push_back("The headphone profiles (Binaural/CaveSim/CaveBoth) need a head POSE, but "
-					"Feed Listener is off — so the pose comes from a tracker, which must be "
+					"Feed Listener is off - so the pose comes from a tracker, which must be "
 					"connected for the render to follow the head.");
 	}
 	if (!layout_path.is_empty()) {
@@ -892,7 +948,7 @@ PackedStringArray BwaEngine::_get_configuration_warnings() const {
 		} else if (layout_path.begins_with("res://")) {
 			w.push_back("The core opens files by OS path, not through Godot's virtual "
 						"filesystem. A res:// layout works in the editor but will not exist "
-						"inside an exported .pck — ship it beside the executable or stage it "
+						"inside an exported .pck - ship it beside the executable or stage it "
 						"into user://.");
 		}
 	}
@@ -997,7 +1053,9 @@ void BwaEngine::_bind_methods() {
 	M(scene_set_dynamic_transform, "handle", "position", "rotation");
 	M(scene_remove_dynamic_mesh, "handle");
 
-	M0(get_dsp_time); M0(get_clock); M0(get_output_latency); M0(get_clock_model);
+	M0(get_dsp_time); M0(get_clock); M0(get_clock_model);
+	M0(get_health); M0(get_xruns);
+	M0(get_output_latency_frames); M0(get_output_latency_seconds);
 	M(set_test_signal, "channel", "kind", "gain");
 	M0(is_running); M0(get_audio_backend); M0(get_last_error);
 	M0(get_channel_count); M0(get_resolved_sample_rate); M0(get_resolved_block_size);
@@ -1006,6 +1064,8 @@ void BwaEngine::_bind_methods() {
 #undef M
 #undef M0
 
+	ClassDB::bind_static_method(
+			"BwaEngine", D_METHOD("get_asio_drivers"), &BwaEngine::get_asio_drivers);
 	ClassDB::bind_static_method(
 			"BwaEngine", D_METHOD("get_asio_driver_count"), &BwaEngine::get_asio_driver_count);
 	ClassDB::bind_static_method("BwaEngine", D_METHOD("get_asio_driver_name", "index"),
@@ -1016,9 +1076,19 @@ void BwaEngine::_bind_methods() {
 	ClassDB::bind_static_method("BwaEngine", D_METHOD("room_right"), &BwaEngine::room_right);
 
 	ADD_GROUP("Device", "");
-	ADD_PROPERTY(PropertyInfo(Variant::INT, "profile", PROPERTY_HINT_ENUM, "Cave,Binaural,CaveSim,CaveBoth"),
+	/* The hint labels carry the DECISION, not just the enum spelling. This is the highest-stakes
+	 * property on the node — it decides whether someone at a desk hears anything at all — and the
+	 * inspector is where the choice is made, so the answer has to be legible there rather than in
+	 * docs/api.md. Cave renders 26 channels to the rig and is inaudible on headphones; CaveSim is
+	 * the one that auditions the ARRAY at a desk; Binaural is the direct headphone render. */
+	ADD_PROPERTY(PropertyInfo(Variant::INT, "profile", PROPERTY_HINT_ENUM,
+						 "Cave - 26-ch rig only:0,"
+						 "Binaural - headphones, direct render:1,"
+						 "CaveSim - headphones, auditions the array:2,"
+						 "CaveBoth - rig + the sim tap:3"),
 			"set_profile", "get_profile");
-	ADD_PROPERTY(PropertyInfo(Variant::INT, "sink", PROPERTY_HINT_ENUM, "Auto,ASIO,Null,Manual"),
+	ADD_PROPERTY(PropertyInfo(Variant::INT, "sink", PROPERTY_HINT_ENUM,
+						 "Auto:0,ASIO - the rig:1,Null - silent/offline:2,Manual - render_block:3"),
 			"set_sink", "get_sink");
 	ADD_PROPERTY(PropertyInfo(Variant::STRING, "asio_driver"), "set_asio_driver", "get_asio_driver");
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "sample_rate"), "set_sample_rate", "get_sample_rate");

@@ -28,6 +28,8 @@ extern "C" {
 
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#include <atomic>
+#include <new>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -55,6 +57,24 @@ struct AsioSink {
     bool            post_output;     /* driver supports ASIOOutputReady */
     bool            running;
     char            name[64];
+
+    /* --- health (bwa_sink_health) ---
+     * Written on the driver's callback thread, read from the control thread, so relaxed atomics:
+     * these are counters nobody synchronizes ON, and a reader that sees one field a block stale is
+     * reading a monotonic count either way. Relaxed also means no fences in the callback.
+     *
+     * `pos_measured` is the honesty flag: it turns true the first time the driver hands us a sample
+     * position it flags VALID. A driver that never does leaves us comparing our own fallback counter
+     * against itself, which can never show a gap — so reporting 0 dropouts there would be a lie of
+     * omission, and health.measured stays false instead. */
+    std::atomic<uint64_t> h_blocks{0};
+    std::atomic<uint64_t> h_dropouts{0};
+    std::atomic<uint64_t> h_dropped_frames{0};
+    std::atomic<uint64_t> h_resyncs{0};
+    std::atomic<uint64_t> h_late{0};
+    std::atomic<uint64_t> h_render_ns_peak{0};
+    std::atomic<bool>     pos_measured{false};
+    uint64_t        predicted_pos;   /* where the NEXT valid callback should land; 0 = nothing to compare yet */
 };
 
 AsioSink* g_sink = nullptr;
@@ -124,10 +144,31 @@ ASIOTime* bufferSwitchTimeInfo(ASIOTime* timeInfo, long index, ASIOBool /*proces
      * stale value) would freeze the engine's dsp clock and break bwa_source_play_at scheduling. Fall
      * back to an internal block counter, kept in step with the device position while it IS valid. */
     bwa_timestamp ts;
-    if (timeInfo->timeInfo.flags & kSamplePositionValid)
+    const bool pos_valid = (timeInfo->timeInfo.flags & kSamplePositionValid) != 0;
+    if (pos_valid)
         ts.sample_pos = samples_u64(timeInfo->timeInfo.samplePosition);
     else
         ts.sample_pos = s->fallback_pos;
+
+    /* THE XRUN. The device's own position says where the stream is; s->predicted_pos says where the
+     * last callback expected this one to land. A forward gap between them is audio the device
+     * clocked out while we were not there to render it — the definition of a dropout, and the one
+     * fault an offline render cannot produce by construction.
+     *
+     * Only a driver-flagged position can answer this: the fallback counter is derived from our own
+     * callbacks, so comparing it against itself is always continuous by construction. Hence
+     * pos_measured, which gates health.measured. */
+    if (pos_valid) {
+        if (s->predicted_pos) {
+            const uint64_t lost = sink_position_gap(s->predicted_pos, ts.sample_pos, (uint32_t)s->buffer_size);
+            if (lost) {
+                s->h_dropouts.fetch_add(1, std::memory_order_relaxed);
+                s->h_dropped_frames.fetch_add(lost, std::memory_order_relaxed);
+            }
+        }
+        s->pos_measured.store(true, std::memory_order_relaxed);
+    }
+    s->predicted_pos  = ts.sample_pos + (uint64_t)s->buffer_size;
     s->fallback_pos   = ts.sample_pos + (uint64_t)s->buffer_size;
     if (timeInfo->timeInfo.flags & kSystemTimeValid)
         ts.system_time_ns = timestamp_ns(timeInfo->timeInfo.systemTime);
@@ -142,7 +183,22 @@ ASIOTime* bufferSwitchTimeInfo(ASIOTime* timeInfo, long index, ASIOBool /*proces
         ts.system_time_ns = f ? (t / f) * 1000000000ull + (t % f) * 1000000000ull / f : 0;
     }
 
+    /* The other half of "is the device being starved": whether WE are the ones starving it. The
+     * budget is one block period; a render that overruns it hands the driver its buffer late, and
+     * enough of those become the dropouts counted above. Two QPC reads, no kernel transition. */
+    LARGE_INTEGER t0; QueryPerformanceCounter(&t0);
     s->render(s->user, s->bus, (uint32_t)s->buffer_size, &ts);   /* engine fills the bus */
+    LARGE_INTEGER t1; QueryPerformanceCounter(&t1);
+    if (s->qpc_freq) {
+        const uint64_t ticks = (uint64_t)(t1.QuadPart - t0.QuadPart);
+        const uint64_t ns    = (ticks / s->qpc_freq) * 1000000000ull
+                             + (ticks % s->qpc_freq) * 1000000000ull / s->qpc_freq;
+        const uint64_t budget_ns = (uint64_t)s->buffer_size * 1000000000ull / (uint64_t)s->sample_rate;
+        if (ns > budget_ns) s->h_late.fetch_add(1, std::memory_order_relaxed);
+        uint64_t peak = s->h_render_ns_peak.load(std::memory_order_relaxed);
+        while (ns > peak && !s->h_render_ns_peak.compare_exchange_weak(peak, ns, std::memory_order_relaxed)) {}
+    }
+    s->h_blocks.fetch_add(1, std::memory_order_relaxed);
 
     BWA_ZONE_BEGIN(zcv, "convert_out");
     for (uint32_t c = 0; c < s->channels; ++c) {
@@ -181,6 +237,11 @@ long asioMessage(long selector, long value, void* /*msg*/, double* /*opt*/) {
          * driver control panel will stall output — change it before bwa_start, not during. */
         return 1L;
     case kAsioResyncRequest:
+        /* The driver telling us ITSELF that the stream lost continuity (a dropped buffer, a clock
+         * slip). Independent of the sample-position check in bufferSwitchTimeInfo — a driver may
+         * report one, the other, or both — so it gets its own counter rather than being folded in. */
+        if (g_sink) g_sink->h_resyncs.fetch_add(1, std::memory_order_relaxed);
+        return 1L;
     case kAsioLatenciesChanged:  return 1L;
     default:                     return 0L;
     }
@@ -221,10 +282,28 @@ const char* asio_backend(bwa_sink* base) { return ((AsioSink*)base)->name; }
 uint32_t asio_block_size(bwa_sink* base) { return (uint32_t)((AsioSink*)base)->buffer_size; }
 uint32_t asio_output_latency(bwa_sink* base) { return (uint32_t)((AsioSink*)base)->output_latency; }
 
+void asio_health(bwa_sink* base, bwa_sink_health* out) {
+    AsioSink* s = (AsioSink*)base;
+    out->blocks         = s->h_blocks.load(std::memory_order_relaxed);
+    out->dropouts       = s->h_dropouts.load(std::memory_order_relaxed);
+    out->dropped_frames = s->h_dropped_frames.load(std::memory_order_relaxed);
+    out->driver_resyncs = s->h_resyncs.load(std::memory_order_relaxed);
+    out->late_blocks    = s->h_late.load(std::memory_order_relaxed);
+    out->render_ns_peak = s->h_render_ns_peak.load(std::memory_order_relaxed);
+    out->period_ns      = s->sample_rate
+            ? (uint64_t)s->buffer_size * 1000000000ull / (uint64_t)s->sample_rate : 0;
+    /* Not "no dropouts" — "we were in a position to see one". A driver that never flags a valid
+     * sample position leaves the dropout count structurally 0, and saying `measured` there would
+     * turn "cannot know" into a clean bill of health. The resync and late-block counts are real
+     * either way, but the headline number is not. */
+    out->measured       = s->pos_measured.load(std::memory_order_relaxed);
+}
+
 const bwa_sink_vtbl ASIO_VT = {   /* designated: stop/close share a signature, so a positional swap would be silent */
     .start = asio_start, .stop = asio_stop, .close = asio_close,
     .backend = asio_backend, .block_size = asio_block_size,
     .output_latency = asio_output_latency,
+    .health = asio_health,
 };
 
 } /* namespace */
@@ -374,6 +453,9 @@ extern "C" bwa_sink* bwa_asio_sink_open(uint32_t sample_rate, uint32_t block_siz
 
     AsioSink* s = (AsioSink*)calloc(1, sizeof *s);
     if (!s) { set_err(err, errcap, "asio: out of memory"); ASIOExit(); asioDrivers->removeCurrentDriver(); return nullptr; }
+    new (s) AsioSink();             /* the health counters are std::atomic — calloc'd storage is not a
+                                     * constructed object, so value-initialize in place (zeroes the rest
+                                     * exactly as calloc already did) */
     s->base.vt      = &ASIO_VT;
     s->sample_rate  = sample_rate;
     s->channels     = channels;
@@ -428,7 +510,7 @@ extern "C" bwa_sink* bwa_asio_sink_open(uint32_t sample_rate, uint32_t block_siz
 
     /* Latencies are only final once the buffers exist (they depend on the negotiated size). The
      * driver's outputLatency is the render->DAC delay in frames — for the Digiface that includes its Dante
-     * network buffering — surfaced as bwa_get_output_latency for AV-latency alignment. */
+     * network buffering — surfaced as bwa_get_output_latency_frames for AV-latency alignment. */
     long ilat = 0, olat = 0;
     s->output_latency = (ASIOGetLatencies(&ilat, &olat) == ASE_OK && olat > 0) ? olat : 0;
     { LARGE_INTEGER qf; s->qpc_freq = QueryPerformanceFrequency(&qf) ? (uint64_t)qf.QuadPart : 0; }

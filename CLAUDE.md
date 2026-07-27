@@ -189,6 +189,27 @@ Regression-preventing gotchas. Each has bitten before or guards a real invariant
   Regenerating needs numpy + scipy; ctest stays hermetic on the committed header.
 - **`-DBWA_ASAN=ON`** builds `test_sound` under AddressSanitizer — the control-side
   use-after-free check for the sound retire handshake.
+- **A unit belongs in a NAME only when the quantity has two live units.** Time is the only one:
+  frames (dsp clock, `play_at`/`stop_at`/`seek`, playheads, output latency) and seconds (fades,
+  RT60, IR length, pose lead), so every time-valued name says which — `_frames` on a getter,
+  `seconds`/`_s` on a parameter. Distances (metres), frequencies (Hz), angles (radians) and gains
+  (linear) have no competitor, so they carry the unit on the VALUE (`radius_m`, `xover_hz`,
+  `yaw_rad`) and never on the call. The one hard rule for new calls: a decibel value must say
+  `_db`, because linear is the unmarked default everywhere. Full statement in docs/api.md →
+  "Coordinates and units".
+- **A binding call must not borrow a host-engine name with a different unit or meaning.**
+  Godot's `AudioServer.get_output_latency()` is SECONDS and `AudioStreamPlayer3D.seek()` takes
+  SECONDS; the binding's frame-valued twins are `get_output_latency_frames/_seconds` and
+  `seek_frames/_seconds` for that reason. The 0.4.0 zip shipped the colliding spelling and it hid
+  behind the null sink, which returns 0 — and 0 is 0 in any unit.
+- **Runtime-printed strings are ASCII.** An en-dash in a `push_warning` becomes mojibake on a
+  Windows console codepage. Comments, docs and inspector hint strings keep their punctuation;
+  anything that can reach a console does not. `rg '"[^"]*[^\x00-\x7F][^"]*"' bindings/godot/src`
+  should stay empty.
+- **A shipped artifact must not cite a doc it does not ship.** Both packs run
+  `tools/dist/doc-pointers.ps1`, which rewrites repo-doc references in the staged tree to
+  permalinks at the packed commit and then fails the pack on any relative `.md` reference the
+  stage cannot satisfy. The 0.4.0 Godot zip shipped three dangling ones.
 
 ## What NOT to do
 

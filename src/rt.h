@@ -155,6 +155,7 @@ void    rt_set_all_paused(RtCore* c, int paused);         /* global pause gate (
 void    rt_group_set_gain(RtCore* c, uint32_t group, float linear);   /* mix-group gain (enqueue) */
 void    rt_group_set_paused(RtCore* c, uint32_t group, bool paused);  /* mix-group pause (enqueue) */
 uint32_t rt_active_voices(RtCore* c);                     /* control thread: last block's active voice count */
+uint64_t rt_stream_starves(RtCore* c);                    /* streamed voices that ran dry without ending */
 void    rt_set_limiter(RtCore* c, int on);           /* output protection limiter (final stage; default ON); live */
 void    rt_set_limiter_ceiling(RtCore* c, float ceiling_linear);   /* limit/clamp ceiling, linear (default -1 dBFS); live */
 
@@ -268,7 +269,9 @@ void rt_source_set_group (RtCore* c, uint32_t h, uint32_t group);    /* mix-grou
 void rt_source_set_pitch (RtCore* c, uint32_t h, float rate);        /* playback rate [0.25, 4]; glided */
 void rt_bed_set_orientation(RtCore* c, uint32_t h, float yaw, float pitch, float roll);  /* full 3-axis; glided (yaw,0,0 = the exact phasor yaw path) */
 void rt_source_set_ism   (RtCore* c, uint32_t h, bool on);           /* image-source early reflections */
-void rt_play_oneshot   (RtCore* c, uint32_t sound, float x, float y, float z, float gain);
+bool rt_play_oneshot   (RtCore* c, uint32_t sound, float x, float y, float z, float gain);
+                                                     /* false = dropped (bad handle/args, full
+                                                      * voice pool, or full command ring) */
 void rt_set_listener   (RtCore* c, const float p[3], const float q[4]);
 void rt_commit         (RtCore* c);                   /* enqueue CMD_COMMIT + drain events */
 
