@@ -81,12 +81,12 @@ built, root-level copy of the package to it. Against a working tree, use a local
 > **License:** the engine is **GPLv3** (`bw_audio.dll` links the ASIO SDK under its GPLv3 option).
 > Internal use never triggers copyleft — it's a *distribution* condition. But shipping a Unity app
 > containing this DLL to third parties would place that app under GPLv3; see
-> [`docs/build.md`](../../docs/build.md) for the proprietary-ASIO alternative.
+> [`docs/build.md`](https://github.com/aforren1/cave-audio/blob/3c1f0fcc3de4/docs/build.md) for the proprietary-ASIO alternative.
 
 ## Releasing (maintainers)
 
 The canonical whole-repo release process (version model, steps, dev versions) lives in
-[docs/build.md → Releasing](../../docs/build.md#releasing). This is the Unity-package view of it.
+[docs/build.md → Releasing](https://github.com/aforren1/cave-audio/blob/3c1f0fcc3de4/docs/build.md#releasing). This is the Unity-package view of it.
 
 **The GitHub Release is the distribution** — there's no registry, no token, and nothing to keep in sync.
 

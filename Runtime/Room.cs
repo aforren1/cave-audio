@@ -3,7 +3,7 @@
 // Both share "up" and "forward", so the baseline conversion is a single X mirror (Unity's +X/right
 // becomes the room's -X, which IS the room's right for a +Z-facing listener). Getting this wrong
 // silently ruins spatial audio (front/back or left/right swaps), so it lives in one place.
-// See docs/integration.md.
+// See https://github.com/aforren1/cave-audio/blob/3c1f0fcc3de4/docs/integration.md.
 using UnityEngine;
 
 namespace BwAudio
