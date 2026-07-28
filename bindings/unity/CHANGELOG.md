@@ -4,6 +4,8 @@ All notable changes to `com.brainworks.bw_audio`.
 
 ## [Unreleased]
 
+## [0.5.0]
+
 ### Added — device health (`bwa_get_health` / `bwa_get_xruns`)
 
 The third dogfooding gap, and the one that cost three probes: every readback described the RENDER —
