@@ -13,7 +13,7 @@
 ##   5 Blind A/B/X    - double-blind over live knobs, with a binomial p-value
 ##   6 Ambisonic bed  - a world-locked 3rd-order field; spin, tilt, renderer, max-rE
 ##   7 Reverb bed     - a shoebox + reverb; REBUILDS the engine on entry/exit
-##   8 Underwater     - the api.md "listener submerges" recipe: dive and the FDN retunes
+##   8 Underwater     - the https://github.com/aforren1/cave-audio/blob/3c1f0fcc3de4/docs/api.md "listener submerges" recipe: dive and the FDN retunes
 ##                      LIVE, the speed of sound glides, crossing sources muffle, and the
 ##                      pressure-release surface throws the Lloyd's-mirror bounce. Rebuilds
 ##                      like scene 7 (its FDN is load-time), phonon-free.
