@@ -26,7 +26,12 @@ param(
     [Parameter(Mandatory)] [string]   $Repo,         # repo root (source of docs/ and its file list)
     [Parameter(Mandatory)] [string]   $Ref,          # commit-ish the links pin to
     [string[]] $Extensions = @('.md', '.txt', '.gd', '.tscn', '.gdextension', '.cfg', '.cs', '.json'),
-    [string]   $UrlBase = 'https://github.com/aforren1/cave-audio/blob'
+    [string]   $UrlBase = 'https://github.com/aforren1/cave-audio/blob',
+    # Repo files a pack SHIPS UNDER A DIFFERENT NAME, as @{ 'REPO-NAME.md' = 'Shipped Name.md' }.
+    # The Unity tarball renames THIRD_PARTY-NOTICES.md to "Third Party Notices.md" for the Package
+    # Manager UI, so prose citing the repo spelling is satisfied, not dangling — but only the pack
+    # knows that. Without this the check fails the release over a file that is right there.
+    [hashtable] $Aliases = @{}
 )
 $ErrorActionPreference = 'Stop'
 
@@ -73,10 +78,12 @@ foreach ($f in Get-ChildItem $Stage -Recurse -File | Where-Object { $Extensions 
     $t = [IO.File]::ReadAllText($f.FullName)
     foreach ($m in [regex]::Matches($t, "$skip((?:[\w.-]+/)*[\w.-]+\.md)\b")) {
         $ref = $m.Groups[1].Value
+        $leaf = Split-Path $ref -Leaf
+        if ($Aliases.ContainsKey($leaf)) { $leaf = $Aliases[$leaf] }   # shipped under a different name
         # Resolvable from the citing file, from the stage root, or (for a nested addon layout) from
         # wherever it lands - a shipped sibling doc is a valid pointer, only a missing one is not.
         $ok = (Test-Path (Join-Path $f.DirectoryName $ref)) -or (Test-Path (Join-Path $Stage $ref)) -or
-              ((Get-ChildItem $Stage -Recurse -File -Filter (Split-Path $ref -Leaf) | Measure-Object).Count -gt 0)
+              ((Get-ChildItem $Stage -Recurse -File | Where-Object { $_.Name -eq $leaf } | Measure-Object).Count -gt 0)
         if (-not $ok) {
             $rel = $f.FullName.Substring($Stage.Length).TrimStart('\', '/')
             $dangling.Add("$rel -> $ref")

@@ -157,7 +157,8 @@ New-TextMeta (Join-Path $stage 'Third Party Notices.md') 'Third Party Notices.md
 # CONTENT and never adds or removes a staged file.
 $commit = try { (& git -C $repo rev-parse HEAD).Trim() } catch { 'main' }
 & (Join-Path $repo 'tools/dist/doc-pointers.ps1') -Stage $stage -Repo $repo -Ref $commit `
-    -Extensions @('.md', '.txt', '.cs', '.json')
+    -Extensions @('.md', '.txt', '.cs', '.json') `
+    -Aliases @{ 'THIRD_PARTY-NOTICES.md' = 'Third Party Notices.md'; 'LICENSE' = 'LICENSE.md' }
 
 # ---- every asset must carry a .meta ---------------------------------------------------------------
 # A file arriving without one gets a fresh random GUID in EACH project, so a scene that references the
