@@ -28,7 +28,7 @@ You can author this file interactively with **`bwa_layout_tool`**
 (`examples/layout_tool.cpp`, built with `-DBWA_BUILD_PLAYGROUND=ON`). Place each
 speaker in 3D and **identify it by ear**: a speaker's `index` is its output channel,
 so the tool drives that channel with the test signal (`bwa_set_test_signal`) out the cave
-profile—you hear which physical speaker you're positioning.
+profile: you hear which physical speaker you're positioning.
 
 Press **P** for a **DBAP preview**: a source pans through your in-progress layout, so
 you can hear gaps/smoothness and walk the room to judge off-center coverage. The tool
@@ -81,8 +81,8 @@ declare where speakers may go:
 - **`obstacles`**: SOLID occluders (projectors, beams). A speaker can't be inside one
   *nor in its acoustic shadow*: a box on the segment from the speaker to the ears
   blocks its sound (line-of-sight to the observer at ear height). Drawn filled-orange.
-  Shadowed speakers are ringed orange, and the optimizer *penalises* them—it can't
-  push them out geometrically, so nudge them clear. A box only crudely bounds a
+  Shadowed speakers are ringed orange, and the optimizer *penalises* them (it can't
+  push them out geometrically, so nudge them clear). A box only crudely bounds a
   projector's throw frustum; size it to the body plus the near shadow you care about.
 
 The tool flags violations, and **K** snaps speakers off bounds/no-go/obstacle bodies.
@@ -90,7 +90,73 @@ Press **B** to pick the target panner, then **O** to **auto-optimize**: a constr
 hill-climb that nudges positions to minimise that panner's rE error while staying
 feasible. A **leash** slider caps how far a speaker may drift from where it started,
 so the optimizer refines rather than relocates. It runs live (O again to stop, S to
-save). Headless: `--optimize <file> [dbap|spcap|vbap]`.
+save). Headless: `--optimize <file> [dbap|spcap|vbap] [stages]`.
+
+What to optimize *for* is a named **condition**, not just slider positions. A
+condition bundles the objective knobs (worst wt, focus wt, elev wt), a scoring-shell
+elevation **band**, and a leash. Two ship: `3d` (the full sphere, the historical
+default) and `horizontal` (only source directions within 15° of the ear plane count,
+for a collaborator who values planar localization). The band is the honest form of
+"2D": with the full sphere, zeroing the elevation weight still spends effort on the
+azimuth of overhead sources, where azimuth is nearly meaningless. The Score board
+follows the active condition; the coverage overlay stays full-sphere so the view never
+hides what a condition ignores.
+
+Conditions chain as **stages**, each seeding the next: `--optimize cave_layout.json
+dbap horizontal,3d` climbs the plane objective to convergence, re-anchors the leash
+there, then climbs the 3D objective from that result. Per stage it prints before/after
+scores and how many speakers sit within 0.5 m of the ear plane. The plane stage pulls
+speakers toward the ear plane (elevated coverage costs it nothing), and its leash is
+the knob for how much of that migration you allow. In the GUI, stage by hand: optimize
+under one condition, stop, switch, optimize again. Each start re-anchors the leash.
+A warm start is not guaranteed to beat a direct 3D run (the climb is local), so A/B it
+with `--score <file> [condition]`. The optional condition scores under that objective:
+`--score out.json horizontal` answers "what did the 3D stage cost the plane".
+
+Both headless commands also take an observer token, `fixed` or `moving` (the
+default). This CAVE's listener roams, so scores average a 27-point grid across the
+working volume; a *seated* install listens from the sweet spot only, and scoring it
+over the roam punishes cells it will never occupy. `--score layout.json fixed`
+evaluates (and `--optimize ... fixed` optimizes) at the sweet spot alone.
+
+Both also take `ears=<m>`, the listener ear height above the floor (default 1.4).
+Everything plane-shaped anchors to it: the horizontal band, the pin slab, the
+scoring shell, and the delay-alignment point written on save. A seated install at
+1.2 m ears that optimizes without this flag gets a plane 20 cm too high, silently.
+The GUI's `obs ear y` slider is the same knob.
+
+When an allocation is a *requirement* ("26 speakers, spend 12 on the plane"), pin it,
+don't weight it. Objectives compete: a `3d` stage happily pulls plane speakers back
+toward elevation. **pin to plane** (per speaker, in the panel) confines that speaker
+to a slab about the ear plane (**pin slab**, default ±0.3 m); the optimizer's trials
+and **K** snap both project into it, so no later stage can undo the allocation.
+Pinned speakers label cyan. Pins ride the layout file (`"pin": "plane"` per speaker,
+`pin_slab_m` top-level) so the allocation travels into headless runs; the engine
+ignores both fields.
+
+What pinning costs, measured on the default 26-speaker dome (your numbers will
+differ; the shape will not):
+
+- **Without pins the allocation erodes.** Across a `horizontal,3d` staged run, DBAP's
+  in-slab population went 10 speakers to 5; VBAP's went 15 to 7, and a direct `3d`
+  run leaves 3. The plane preference effectively vanishes unless pinned.
+- **With 12 pinned, the plane score lands at its ceiling.** Both panners matched or
+  beat their plane-only run in-band (DBAP 3.8°/19.4° vs 3.9°/19.6°; VBAP 3.0°/16.3°
+  with the best in-band spread, 18.0°), because the 3d stage keeps refining the free
+  speakers while the pins hold the structure it would otherwise cannibalize.
+- **The full-sphere price is small where it counts.** Mean stays within 0.2° of the
+  unpinned result for both panners; the worst case gives up 3 to 5°.
+- **More pins trade full-sphere mean for the plane.** Full-sphere mean climbs with
+  pin count (DBAP 4.9° unpinned, 5.1° at 12 pins, 5.4° at 16; VBAP 4.6°, 4.6°, 5.1°)
+  while the plane gain past 12 is small and panner-dependent (DBAP 3.8° to 3.5°,
+  VBAP 3.0° to 3.5°, so VBAP regressed). These are single runs of a stochastic
+  climb; read trends, not decimals. On this dome 12 pins buy the plane ceiling.
+- **Judge VBAP's plane by spread, not direction error.** Against the acoustic
+  measurement the Frank spread is VBAP's strong predictor (Spearman 0.77 vs 0.19 for
+  direction error; see [validation.md](validation.md)).
+- **Cross-compare with care.** `horizontal` carries a 1 m leash and `3d` a 3 m one,
+  so a single-stage run and a staged run are not leash-matched. Comparisons within
+  one condition are clean.
 
 Scoring/coverage target the observer at **ear height** (the `obs y` slider, default
 1.4 m; a real head, not the floor). The **C** coverage overlay shades a direction
@@ -148,10 +214,11 @@ cannot see the problem it most needs to. The file:
 |-------|------|---------|
 | `schema_version` | int | reserved for breaking format changes. The loader currently ignores it - it is neither validated nor stored. |
 | `units` | object | documentation only. The loader always converts dB → linear gain and ms → samples at the engine rate (positions are read as meters); changing this field has no effect. |
-| `coordinate_space` | string | documentation of the frame; positions MUST match the `coordinate_space` value above (**room space**, floor origin). The engine works in it and the Unity/Unreal binding converts at its boundary — full seam: [`integration.md`](./integration.md) → "Coordinate seam". The engine derives its **nominal listening point from the array centroid** (world-locked bed/monitor decode directions + the default listener position), so the origin's exact spot is not load-bearing. |
+| `coordinate_space` | string | documentation of the frame; positions MUST match the `coordinate_space` value above (**room space**, floor origin). The engine works in it and the Unity/Unreal binding converts at its boundary; full seam: [`integration.md`](./integration.md) → "Coordinate seam". The engine derives its **nominal listening point from the array centroid** (world-locked bed/monitor decode directions + the default listener position), so the origin's exact spot is not load-bearing. |
 | `reference` | object | provenance for the alignment values; `speed_of_sound_mps` is used if delays are derived rather than measured. Informational - the engine applies `delay_ms` as written. |
 | `dbap.rolloff_r` | float | the **blur** knob `r` from [`spatialization.md`](./spatialization.md): larger spreads energy over more speakers. Must be > 0. **Omit it and the loader derives it from the geometry**: `0.25 ×` the mean centroid→speaker distance (Sundstrom 2021 recommends 0.2–0.5 of it) - ~0.53 m on the default grid. An explicit value always wins; treat the derived one as the starting point to dial against the real array. |
 | `dbap.distance_attenuation` | object | the source→listener distance-attenuation curve (the second tuning knob). The loader reads only `reference_distance_m` (> 0), `rolloff` (> 0), and `min_gain_db` (≤ 0; floors the attenuation). `model` is ignored - the inverse curve is the only one implemented. |
+| `pin_slab_m` | float (optional) | authoring only, engine-ignored: half-height of the ear-plane slab that `"pin": "plane"` speakers are confined to. Written by `bwa_layout_tool` when any speaker is pinned. |
 | `speakers[]` | array | **4..26** speaker records (26 = the compile-time `BWA_CHANNELS` capacity). **The speaker count IS the engine's channel count** - a 24-speaker install loads a 24-entry file into the same binary. Order is not significant for DBAP, but `index` is the channel the speaker maps to on the bus / ASIO output, and the indices must form a complete `0..N-1` permutation. |
 
 ### Per-speaker record
@@ -163,6 +230,7 @@ cannot see the problem it most needs to. The file:
 | `gain_db` | float | measured per-speaker level trim, applied in the align stage (`align_process`). `0.0` = no trim. Must be in **[-100, 24]**; anything outside rejects the file. |
 | `delay_ms` | float | per-speaker delay to time-align arrival to the reference; converted to whole samples at `sample_rate` on load. `0.0` = the reference (farthest) speaker. A negative value clamps to `0`; anything **over 1000 ms rejects the file**. |
 | `eq` | float array (optional) | minimum-phase correction-FIR taps (up to 512), written by `bwa_calibrate --eq` / `--room-eq`; applied per channel in the align stage before gain+delay. |
+| `pin` | string (optional) | authoring only, engine-ignored: `"plane"` holds this speaker to the ear-plane slab (`pin_slab_m`) during optimization and snap. The allocation constraint from the authoring section above. |
 | `room_eq` | object array (optional) | up to 8 LF modal-cut sections `{fc, gain_db, q}` (RBJ peaking, **cuts only**: `gain_db` in `[-24, 0]`, `fc` in `[10, 1000]`, `q` in `[0.25, 24]`), written by `bwa_calibrate --room-eq`. **Static-listener room correction** - see [`calibration.md`](./calibration.md); rendered as biquads at the engine rate. |
 
 ### Tracked room EQ: top-level `room_eq_grid` (optional)
@@ -214,7 +282,7 @@ if any of:
 reason in `bwa_last_error` and falls back to the **26-speaker default grid**, so desk/dev
 runs with no survey still work; `bwa_start` still returns success. An installation that
 must run on the surveyed geometry therefore **must check `bwa_last_error` after
-`bwa_create`**—a silently-defaulted layout pans the array with the wrong speaker
+`bwa_create`**: a silently-defaulted layout pans the array with the wrong speaker
 positions, and (since the count follows the layout) a **different channel count**: a
 20-speaker install whose file fails to load comes up as a 26-channel engine. A NULL/empty
 `layout_path` intentionally selects the default grid with no error.

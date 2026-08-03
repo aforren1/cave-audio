@@ -30,7 +30,12 @@
  * X scores the layout for each panner (mean/worst rE error + the Frank-spread FOCUS metric); O runs
  * the auto-optimizer — a hill-climb over a multi-objective scalarization of the selected panner's
  * scores ("worst wt" blends mean vs worst-case, 1 = pure maximin; "focus wt" adds image spread),
- * subject to the constraints; runs live, O again to stop, then save.
+ * subject to the constraints; runs live, O again to stop, then save. A named CONDITION bundles the
+ * objective knobs + a scoring-shell elevation band ("horizontal" = only directions near the ear
+ * plane count — a collaborator who values planar localization); conditions chain as stages, in the
+ * GUI by re-starting the optimizer under the next one, headless via --optimize's stage list. When
+ * an allocation is a REQUIREMENT ("spend 12 speakers on the plane"), pin it: "pin to plane" holds
+ * a speaker in the ear-plane slab through any stage (objectives compete; constraints hold).
  * K snaps all speakers to the nearest allowed point. Drop a `constraints.json` next to the layout
  * (an allowed `bounds` box + `nogo` boxes for screens/structure + solid `obstacles`) and the tool
  * draws them (green bounds / red no-go / orange solid), flags violating speakers, and K projects
@@ -80,7 +85,7 @@
 #define SPEED_OF_SOUND 343.0f
 #define PANEL_W        300.0f     /* control panel width (right side), in unscaled UI px */
 
-typedef struct { Vector3 pos; float gain_db; } Spk;
+typedef struct { Vector3 pos; float gain_db; int pin; } Spk;   /* pin: 1 = held to the ear-plane slab */
 static Spk spk[NSPK];
 static int g_nspk = NSPK;         /* speakers in the edited layout (4..NSPK) — the engine's channel count */
 
@@ -89,6 +94,12 @@ static float       dbap_r = 0.5f, dist_ref = 1.0f, dist_rolloff = 1.0f, dist_min
 static const char* dist_model = "inverse";
 static float       obs_height = 1.4f;      /* observer EAR height above the floor origin (m; ~4.6 ft) — the
                                               listener/scoring point + the line-of-sight source sit here, not at y=0 */
+/* Speaker ALLOCATION as a constraint: a pinned speaker is confined to a slab about the ear plane
+ * (|y - obs_height| <= pin_slab_m), enforced by the optimizer's trials and K snap. Objectives
+ * compete — a later 3d stage happily pulls plane speakers back toward elevation — so "spend 12 on
+ * the plane" must be a pin, not a weight. Round-trips through the layout file ("pin": "plane" per
+ * speaker + pin_slab_m top-level); the engine's loader ignores both. */
+static float       pin_slab_m = 0.3f;
 /* Psychophysics: human localization is anisotropic — horizontal (azimuth) acuity is far finer than
  * vertical. The minimum audible angle is ~1 deg for a frontal azimuth displacement (Mills, JASA 1958)
  * vs ~3-4 deg for a vertical one (Perrott & Saberi, JASA 1990); 2-D localization scatter is likewise
@@ -99,6 +110,12 @@ static float       obs_height = 1.4f;      /* observer EAR height above the floo
  * (elev_wt is a modelling choice from that ratio, not a value lifted from any single paper.) */
 static int         perceptual = 1;         /* weight azimuth over elevation in the rE error */
 static float       elev_wt    = 0.3f;      /* elevation-error weight vs azimuth (~1/3.5; slider 0..1) */
+/* Scoring-shell elevation band: 0 = the full sphere; >0 keeps only source directions within that many
+ * degrees of the ear plane. This is what "localization on the 2D plane" MEANS as an objective — not
+ * elev_wt = 0, which still spends effort on the azimuth of overhead sources (where azimuth is nearly
+ * meaningless). Applies to score_panner (the scoreboard + the optimizer's cost); the coverage/badness
+ * overlays keep the full shell so the view never hides what a condition ignores. */
+static float       shell_band_deg = 0.0f;
 
 /* speaker `i` of `n` on a hemisphere DOME (y >= 0): a Fibonacci half-sphere, radius ~2.4 m — the
  * listener sits under it. Even angular spread with no floor-crossing speakers (the CAVE floor is a
@@ -111,7 +128,7 @@ static Vector3 dome_pos(int i, int n) {
     return Vector3{ R * r * cosf(th), R * y, R * r * sinf(th) };
 }
 static void seed_default(void) {
-    for (int i = 0; i < g_nspk; ++i) { spk[i].pos = dome_pos(i, g_nspk); spk[i].gain_db = 0.0f; }
+    for (int i = 0; i < g_nspk; ++i) { spk[i].pos = dome_pos(i, g_nspk); spk[i].gain_db = 0.0f; spk[i].pin = 0; }
 }
 
 /* load positions/gain + dbap knobs from an existing cave_layout.json; returns #speakers read (0 = none).
@@ -149,9 +166,13 @@ static int load_json(const char* path) {
             spk[idx].pos.z = (float)pz->valuedouble;
             cJSON* g = cJSON_GetObjectItemCaseSensitive(sp, "gain_db");
             spk[idx].gain_db = cJSON_IsNumber(g) ? (float)g->valuedouble : 0.0f;
+            cJSON* pj = cJSON_GetObjectItemCaseSensitive(sp, "pin");
+            spk[idx].pin = (cJSON_IsString(pj) && strcmp(pj->valuestring, "plane") == 0) ? 1 : 0;
             ++loaded;
         }
     }
+    cJSON* psj = cJSON_GetObjectItemCaseSensitive(root, "pin_slab_m");
+    if (cJSON_IsNumber(psj)) pin_slab_m = (float)psj->valuedouble;
     cJSON* dbap = cJSON_GetObjectItemCaseSensitive(root, "dbap");
     if (cJSON_IsObject(dbap)) {
         cJSON* r = cJSON_GetObjectItemCaseSensitive(dbap, "rolloff_r");
@@ -185,14 +206,18 @@ static int save_json(const char* path) {
         "  \"units\": { \"position\": \"meters\", \"gain\": \"decibels\", \"delay\": \"milliseconds\" },\n"
         "  \"coordinate_space\": \"room, right-handed, +y up, +z forward (matches OptiTrack/Motive default); origin ON THE FLOOR at the working-area centre (x/z); y = height above the floor\",\n"
         "  \"reference\": { \"alignment\": \"max-distance\", \"speed_of_sound_mps\": %g, \"note\": \"delay_ms time-aligns each speaker arrival to the farthest speaker; gain_db is a measured per-speaker trim\" },\n"
-        "  \"dbap\": { \"rolloff_r\": %g, \"distance_attenuation\": { \"model\": \"%s\", \"reference_distance_m\": %g, \"rolloff\": %g, \"min_gain_db\": %g } },\n"
-        "  \"speakers\": [\n",
+        "  \"dbap\": { \"rolloff_r\": %g, \"distance_attenuation\": { \"model\": \"%s\", \"reference_distance_m\": %g, \"rolloff\": %g, \"min_gain_db\": %g } },\n",
         (double)SPEED_OF_SOUND, dbap_r, dist_model, dist_ref, dist_rolloff, dist_min_db);
+    int npin = 0;
+    for (int i = 0; i < g_nspk; ++i) npin += spk[i].pin;
+    if (npin) fprintf(f, "  \"pin_slab_m\": %g,\n", pin_slab_m);   /* authoring-only, like \"pin\"; the engine ignores it */
+    fprintf(f, "  \"speakers\": [\n");
     for (int i = 0; i < g_nspk; ++i) {
         float d = Vector3Distance(spk[i].pos, ear);
         float delay_ms = (dmax - d) / SPEED_OF_SOUND * 1000.0f;
-        fprintf(f, "    { \"index\": %d, \"position\": [%.4f, %.4f, %.4f], \"gain_db\": %.2f, \"delay_ms\": %.3f }%s\n",
-                i, spk[i].pos.x, spk[i].pos.y, spk[i].pos.z, spk[i].gain_db, delay_ms, (i < g_nspk - 1) ? "," : "");
+        fprintf(f, "    { \"index\": %d, \"position\": [%.4f, %.4f, %.4f], \"gain_db\": %.2f, \"delay_ms\": %.3f%s }%s\n",
+                i, spk[i].pos.x, spk[i].pos.y, spk[i].pos.z, spk[i].gain_db, delay_ms,
+                spk[i].pin ? ", \"pin\": \"plane\"" : "", (i < g_nspk - 1) ? "," : "");
     }
     fprintf(f, "  ]\n}\n");
     fclose(f);
@@ -277,6 +302,12 @@ static Vector3 constraint_project(Vector3 p) {           /* nearest allowed poin
     p.y = Clamp(p.y, CON.bounds.lo.y, CON.bounds.hi.y);
     p.z = Clamp(p.z, CON.bounds.lo.z, CON.bounds.hi.z);
     p.y = fmaxf(0.0f, p.y);                              /* ... but never below the floor */
+    return p;
+}
+/* the pin constraint: a pinned speaker lives in the ear-plane slab. Applied BEFORE
+ * constraint_project so the box constraints keep the last word on feasibility. */
+static Vector3 pin_project(Vector3 p, int pin) {
+    if (pin) p.y = Clamp(p.y, fmaxf(0.0f, obs_height - pin_slab_m), obs_height + pin_slab_m);
     return p;
 }
 /* ---- engine + DBAP preview state (file scope) ---- */
@@ -410,6 +441,11 @@ static int   scored, score_stale, last_score_frame;   /* the per-panner scoreboa
  * what makes an off-centre cell comparable to a centred one. At the sweet spot the two modes are the
  * same render, and the tests pin exactly that. */
 static int track_mode = 0;      /* 0 = auto (DBAP tracked, SPCAP/VBAP fixed), 1 = force tracked, 2 = force fixed */
+/* The observer model is the other half of a per-install objective: this CAVE's listener roams
+ * (score over the 27-point grid, the default), but a seated install listens from the sweet spot
+ * only, and scoring it over the roam punishes off-centre cells it will never occupy. Headless
+ * `fixed` token; the GUI keeps the moving model (this installation's case). */
+static int score_fixed_obs = 0; /* 1 = evaluate at the sweet spot only (seated install) */
 static int panner_tracked(bwa_panner p) {
     return (track_mode == 1) ? 1 : (track_mode == 2) ? 0 : (p == BWA_PAN_DBAP);
 }
@@ -437,15 +473,18 @@ static void score_panner(bwa_panner panner, int stride, int tracked,
     if (stride < 1) stride = 1;                     /* >1 subsamples the direction shell (coarse, for the optimizer) */
 
     Vector3 S = { 0.0f, obs_height, 0.0f };         /* the sweet spot: where a fixed install solves */
+    /* cov_dir is unit, so |y| = sin(elevation): the band keeps directions near the ear plane */
+    float band_sin = (shell_band_deg > 0.0f) ? sinf(shell_band_deg * DEG2RAD) : 2.0f;
     int ns = 0;                                     /* sources are world-fixed, so build them ONCE */
     for (int i = 0; i < NCOV; i += stride) {
+        if (fabsf(cov_dir[i].y) > band_sin) continue;
         srcs[ns*3]   = S.x + COV_R * cov_dir[i].x;
         srcs[ns*3+1] = S.y + COV_R * cov_dir[i].y;
         srcs[ns*3+2] = S.z + COV_R * cov_dir[i].z;
         ++ns;
     }
     double sumerr = 0, sumspread = 0; float worst = 0; int cnt = 0;
-    for (int l = 0; l < 27; ++l) {
+    for (int l = 0; l < (score_fixed_obs ? 1 : 27); ++l) {     /* [0] is the sweet spot */
         Vector3 Lp = cov_lis[l]; Lp.y += obs_height;    /* the listener's EARS are at obs_height, not the floor */
         /* the SOLVE position; the listener stays Lp, and the two differ whenever tracked == 0 */
         float solvef[3] = { tracked ? Lp.x : S.x, tracked ? Lp.y : S.y, tracked ? Lp.z : S.z };
@@ -633,6 +672,45 @@ static int edited_unsaved;   /* any layout edit since the last successful save/r
 static void mark_edit(void)  { layout_dirty = 1; score_stale = 1; cov_err_stale = 1; bad_stale = 1; edited_unsaved = 1; }
 static void mark_score(void) { score_stale = 1; cov_err_stale = 1; bad_stale = 1; }   /* metric knob changed; the layout file didn't */
 
+/* ---- named optimization CONDITIONS: what a collaborator's preference IS, as an artifact rather
+ * than slider positions. A condition bundles the objective knobs (mean/worst blend, focus, the
+ * perceptual elevation weight), the scoring-shell band, and a leash. They are starting values —
+ * every slider still overrides — and the headless --optimize chains them as STAGES (each stage
+ * re-anchors at the previous stage's result, so `horizontal,3d` seeds the 3D climb with the
+ * plane-optimal layout). The horizontal leash is deliberately modest: a pure-plane objective
+ * happily pulls speakers toward the ear plane (elevated coverage costs it nothing), and the leash
+ * is the knob that decides how much of that migration — speaker ALLOCATION to the plane — the
+ * stage may do. focus_wt < 0 = use the panner's own default (panner_focus_default). ---- */
+typedef struct { const char* name; float worst_wt, focus_wt, elev_wt, band_deg, leash_m; } OptCondition;
+static const OptCondition opt_conditions[] = {
+    { "3d",         0.333f, -1.0f, 0.3f,   0.0f, 3.0f },   /* the historical default: full sphere */
+    { "horizontal", 0.333f, -1.0f, 0.15f, 15.0f, 1.0f },   /* sources near the ear plane only */
+};
+#define NCONDITIONS ((int)(sizeof opt_conditions / sizeof opt_conditions[0]))
+static int opt_condition_idx = 0;                          /* panel combo state */
+
+static void apply_condition(int i, bwa_panner p) {
+    const OptCondition* c = &opt_conditions[i];
+    opt_worst_wt   = c->worst_wt;
+    opt_focus_wt   = (c->focus_wt < 0.0f) ? panner_focus_default(p) : c->focus_wt;
+    elev_wt        = c->elev_wt;
+    shell_band_deg = c->band_deg;
+    opt_leash      = c->leash_m;
+    opt_condition_idx = i;
+    mark_score();
+    if (opt_running) opt_cost = opt_cost_of(p);            /* the cached cost was on the old objective */
+}
+static int condition_find(const char* name) {
+    for (int i = 0; i < NCONDITIONS; ++i) if (strcmp(name, opt_conditions[i].name) == 0) return i;
+    return -1;
+}
+/* speakers within slab_m of the ear plane — the readout for how a stage ALLOCATED the array */
+static int plane_count(float slab_m) {
+    int n = 0;
+    for (int i = 0; i < g_nspk; ++i) if (fabsf(spk[i].pos.y - obs_height) <= slab_m) ++n;
+    return n;
+}
+
 static void optimize_step(bwa_panner p, int trials) {
     for (int t = 0; t < trials; ++t) {
         int s = rand() % g_nspk;
@@ -641,7 +719,7 @@ static void optimize_step(bwa_panner p, int trials) {
         Vector3 dv = Vector3Subtract(cand, opt_anchor[s]);       /* leash: never drift past opt_leash from where it started */
         float dl = Vector3Length(dv);
         if (dl > opt_leash) cand = Vector3Add(opt_anchor[s], Vector3Scale(dv, opt_leash / dl));
-        spk[s].pos = constraint_project(cand);     /* keep the trial feasible */
+        spk[s].pos = constraint_project(pin_project(cand, spk[s].pin));   /* keep the trial feasible */
         float c = opt_cost_of(p);
         if (c < opt_cost - 1e-4f) { opt_cost = c; opt_stall = 0; }              /* accept an improvement */
         else { spk[s].pos = old; if (++opt_stall > 6*g_nspk) { opt_step *= 0.7f; opt_stall = 0; } }  /* revert; shrink when stuck */
@@ -708,7 +786,7 @@ static void do_reload(void) {
     edited_unsaved = 0;                          /* state now equals the file — nothing to lose on quit */
 }
 static void do_snap(void) {
-    for (int i = 0; i < g_nspk; ++i) spk[i].pos = constraint_project(spk[i].pos);
+    for (int i = 0; i < g_nspk; ++i) spk[i].pos = constraint_project(pin_project(spk[i].pos, spk[i].pin));
     mark_edit();
 }
 static void do_score(void) {
@@ -719,8 +797,13 @@ static void do_score(void) {
 }
 static void set_optimizing(int on) {
     if (on && !opt_running) {
+        /* a file-authored pin may start OUTSIDE its slab (the checkbox and K snap project, a
+         * hand-edited or generated file doesn't) — without this it only enters the slab if some
+         * trial happens to be accepted, so enforce the constraint before the climb starts */
+        for (int i = 0; i < g_nspk; ++i)
+            if (spk[i].pin) { spk[i].pos = constraint_project(pin_project(spk[i].pos, 1)); mark_edit(); }
         opt_cost = opt_cost_of((bwa_panner)pv_panner); opt_step = 0.30f; opt_stall = 0; opt_iter = 0;
-        for (int i = 0; i < g_nspk; ++i) opt_anchor[i] = spk[i].pos;   /* leash anchor = here */
+        for (int i = 0; i < g_nspk; ++i) opt_anchor[i] = spk[i].pos;   /* leash anchor = here (post-projection) */
     }
     opt_running = on;
 }
@@ -1018,7 +1101,9 @@ static void draw_labels(const Camera3D& cam) {
         Vector2 s = GetWorldToScreen(spk[i].pos, cam);
         char buf[8]; snprintf(buf, sizeof buf, "%d", i);
         float sz = ImGui::GetFontSize() * (i == sel ? 1.15f : 0.8f);
-        ImU32 col = (i == sel) ? IM_COL32(250, 230, 120, 255) : IM_COL32(160, 160, 180, 220);
+        ImU32 col = (i == sel) ? IM_COL32(250, 230, 120, 255)      /* pinned reads cyan, so the */
+                  : spk[i].pin ? IM_COL32(110, 200, 235, 235)      /* allocation is visible at a glance */
+                               : IM_COL32(160, 160, 180, 220);
         dl->AddText(ImGui::GetFont(), sz, ImVec2(s.x + 6, s.y - 6), col, buf);
     }
 }
@@ -1161,6 +1246,23 @@ static void draw_panel(void) {
     bwTip("room-space metres, right-handed, +y up, origin on the floor at the working-area centre (Motive); drag, or ctrl-click to type");
     if (ImGui::SliderFloat("gain", &spk[sel].gain_db, -24.0f, 12.0f, "%+.1f dB")) mark_edit();
     bwTip("per-speaker level trim (gain_db in the file)");
+    { bool pb = spk[sel].pin != 0;
+      if (ImGui::Checkbox("pin to plane", &pb)) {
+          spk[sel].pin = pb;
+          if (pb) spk[sel].pos = constraint_project(pin_project(spk[sel].pos, 1));
+          mark_edit();
+      } }
+    bwTip("ALLOCATION as a constraint: hold this speaker in a slab about the ear plane - the "
+          "optimizer's trials and [K] snap both project into it, so a later 3d stage cannot pull "
+          "it back toward elevation ('spend 12 on the plane' = 12 pinned speakers). Saved in the "
+          "layout file (\"pin\": \"plane\"); the engine ignores it");
+    { int npin = 0; for (int i = 0; i < g_nspk; ++i) npin += spk[i].pin;
+      if (npin) {
+          ImGui::SameLine(); ImGui::TextDisabled("%d pinned", npin);
+          if (ImGui::SliderFloat("pin slab", &pin_slab_m, 0.05f, 1.0f, "%.2f m")) mark_edit();
+          bwTip("slab half-height about the ear plane a pinned speaker may occupy "
+                "(pin_slab_m in the file; snap re-applies it)");
+      } }
     CheckboxInt("tone [T]", &tone_on);
     bwTip("drive THIS channel with the test signal out the array: walk the room, hear which "
           "physical speaker it is, place its marker (needs the ASIO/Digiface device)");
@@ -1195,6 +1297,15 @@ static void draw_panel(void) {
     }
     bwTip("the panner Score / Optimize / the rE overlay evaluate ([B] cycles). DBAP tracks a "
           "MOVING listener; SPCAP/VBAP assume the centre sweet spot");
+    { int ci = opt_condition_idx;
+      if (ImGui::Combo("condition", &ci, "3d (full sphere)\0horizontal (plane band)\0"))
+          apply_condition(ci, (bwa_panner)pv_panner); }
+    bwTip("a named objective: what to optimize FOR. 'horizontal' scores only source directions "
+          "within 15 deg of the ear plane (a collaborator who values planar localization), with a "
+          "1 m leash - a plane-only objective pulls speakers toward the ear plane, and the leash "
+          "decides how much. These are starting values; every slider below still overrides. To "
+          "STAGE them, optimize under one, stop, switch, optimize again - each start re-anchors "
+          "the leash, so the second climb refines the first's result");
     if (ImGui::Button("Score [X]")) do_score();
     bwTip("rE localization error over a shell of directions, via the engine's real gain solve - "
           "mean/worst per panner land in the HUD scoreboard");
@@ -1222,6 +1333,13 @@ static void draw_panel(void) {
           "optimizer trades vertical accuracy for horizontal");
     if (perceptual && ImGui::SliderFloat("elev wt", &elev_wt, 0.0f, 1.0f, "%.2f")) mark_score();
     bwTip("elevation-error weight vs azimuth (0.3 ~ the psychophysics ratio; 1 = isotropic)");
+    if (ImGui::SliderFloat("band", &shell_band_deg, 0.0f, 90.0f, "%.0f deg")) {
+        mark_score();
+        if (opt_running) opt_cost = opt_cost_of((bwa_panner)pv_panner);   /* the cached cost is on the old shell */
+    }
+    bwTip("scoring-shell elevation band: only source directions within this many degrees of the "
+          "ear plane are scored/optimized; 0 = the full sphere. The Score board follows it too, "
+          "so the numbers always mean the active condition; the coverage overlay stays full-sphere");
     CheckboxInt("coverage [C]", &coverage_on);
     bwTip("shade a shell of source directions: green = the array localizes it well, red = a hole; "
           "hover a cube for its value");
@@ -1313,13 +1431,18 @@ static void register_tests(ImGuiTestEngine* te) {
     t->TestFunc = [](ImGuiTestContext*) {
         seed_default();
         spk[3].pos = Vector3{ 1.25f, 2.0f, -0.75f }; spk[3].gain_db = -4.5f; dbap_r = 0.77f;
+        spk[3].pin = 1; pin_slab_m = 0.4f;                       /* the allocation tag rides the file too */
         IM_CHECK(save_json(TEST_OUT));
-        seed_default(); dbap_r = 0.5f;
+        seed_default(); dbap_r = 0.5f; pin_slab_m = 0.3f;
         IM_CHECK_EQ(load_json(TEST_OUT), NSPK);
         IM_CHECK_LT(fabsf(spk[3].pos.x - 1.25f), 1e-3f);
         IM_CHECK_LT(fabsf(spk[3].pos.z + 0.75f), 1e-3f);
         IM_CHECK_LT(fabsf(spk[3].gain_db + 4.5f), 1e-2f);
         IM_CHECK_LT(fabsf(dbap_r - 0.77f), 1e-5f);
+        IM_CHECK_EQ(spk[3].pin, 1);
+        IM_CHECK_EQ(spk[4].pin, 0);
+        IM_CHECK_LT(fabsf(pin_slab_m - 0.4f), 1e-5f);
+        pin_slab_m = 0.3f;
         dbap_r = 0.5f; seed_default(); layout_dirty = 1;
     };
 
@@ -1385,6 +1508,15 @@ static void register_tests(ImGuiTestEngine* te) {
         track_mode = 1; IM_CHECK(panner_tracked(BWA_PAN_VBAP));
         track_mode = 2; IM_CHECK(!panner_tracked(BWA_PAN_DBAP));
         track_mode = save;
+        /* the OBSERVER model is the other objective axis: a seated install evaluates only the
+         * sweet spot, where a fixed solve is at home — strictly easier than the roam's mean */
+        score_fixed_obs = 1;
+        float ms = -1, ws = -1;
+        score_panner(BWA_PAN_SPCAP, 4, 0, &ms, &ws, NULL);
+        score_fixed_obs = 0;
+        IM_CHECK_GT(ms, 0.0f);
+        IM_CHECK_LT(ms, mf - 1e-3f);                             /* sweet spot beats the roam mean */
+        IM_CHECK_LE(ws, wf + 1e-4f);                             /* and its worst can't exceed the roam's */
     };
 
     /* The badness map's headline claim is visual: a FIXED solve draws an island around the sweet
@@ -1438,6 +1570,68 @@ static void register_tests(ImGuiTestEngine* te) {
         opt_worst_wt = 0.0f; opt_focus_wt = 1.0f;                /* the focus axis lands in the cost too */
         IM_CHECK_LT(fabsf(opt_cost_of(BWA_PAN_DBAP) - (2.0f * m + sp)), 0.75f);
         opt_worst_wt = saveW; opt_focus_wt = saveF;
+    };
+
+    /* The 2D condition really is the shell band, not just an elevation weight: a flat ring of
+     * speakers at ear height localizes in-plane sources well and overhead ones not at all, so the
+     * band-limited score must be clearly better than the full-sphere one on that layout. Plus the
+     * condition-preset wiring: applying 'horizontal' sets the band/leash the table promises. */
+    t = IM_REGISTER_TEST(te, "logic", "band_shell");
+    t->TestFunc = [](ImGuiTestContext*) {
+        const int keep = g_nspk;
+        g_nspk = 8;
+        for (int i = 0; i < 8; ++i) {                            /* a pure-planar array: a ring at ear height */
+            float a = (float)i / 8.0f * 2.0f * PI;
+            spk[i].pos = Vector3{ 2.4f * cosf(a), obs_height, 2.4f * sinf(a) };
+            spk[i].gain_db = 0.0f;
+        }
+        float fm, fw, bm, bw;
+        shell_band_deg = 0.0f;  score_panner(BWA_PAN_DBAP, 2, 1, &fm, &fw, NULL);
+        shell_band_deg = 15.0f; score_panner(BWA_PAN_DBAP, 2, 1, &bm, &bw, NULL);
+        IM_CHECK_LT(bm, fm);                                     /* dropping overhead directions must help a ring */
+        IM_CHECK_LT(bw, fw);
+        IM_CHECK_LT(bm, 30.0f);                                  /* in-band, the ring actually localizes */
+        IM_CHECK_GT(fw, 45.0f);                                  /* straight up is hopeless for a ring */
+        const float saveW = opt_worst_wt, saveF = opt_focus_wt, saveE = elev_wt, saveL = opt_leash;
+        const int   saveC = opt_condition_idx;
+        int hi = condition_find("horizontal");
+        IM_CHECK(hi >= 0);
+        IM_CHECK(condition_find("nonsense") < 0);
+        apply_condition(hi, BWA_PAN_DBAP);
+        IM_CHECK_EQ(shell_band_deg, opt_conditions[hi].band_deg);
+        IM_CHECK_EQ(opt_leash, opt_conditions[hi].leash_m);
+        IM_CHECK_EQ(plane_count(0.5f), 8);                       /* the whole ring sits on the ear plane */
+        opt_worst_wt = saveW; opt_focus_wt = saveF; elev_wt = saveE; opt_leash = saveL;
+        opt_condition_idx = saveC; shell_band_deg = 0.0f;
+        g_nspk = keep; seed_default(); layout_dirty = 1;
+    };
+
+    /* Pins are the allocation guarantee: snap projects a pinned speaker into the ear-plane slab,
+     * and a full-3d climb — the objective that WANTS elevation — cannot pull it back out. Without
+     * the constraint that erosion is exactly what happens (measured: 10 -> 5 in-slab speakers). */
+    t = IM_REGISTER_TEST(te, "logic", "pin_plane");
+    t->TestFunc = [](ImGuiTestContext*) {
+        seed_default(); layout_dirty = 1;
+        for (int i = 0; i < 12; ++i) spk[i].pin = 1;             /* "26 total, spend 12 on the plane" */
+        spk[0].pos = Vector3{ 0.5f, 2.4f, 0.5f };                /* parked well off the plane */
+        do_snap();
+        for (int i = 0; i < 12; ++i) IM_CHECK_LE(fabsf(spk[i].pos.y - obs_height), pin_slab_m + 1e-4f);
+        IM_CHECK_GE(plane_count(pin_slab_m + 1e-3f), 12);
+        srand(7);                                                /* deterministic climb */
+        const float saveL = opt_leash;
+        opt_leash = 3.0f;                                        /* ~free: only the pin holds them */
+        opt_cost = opt_cost_of(BWA_PAN_DBAP); opt_step = 0.30f; opt_stall = 0; opt_iter = 0;
+        for (int i = 0; i < g_nspk; ++i) opt_anchor[i] = spk[i].pos;
+        optimize_step(BWA_PAN_DBAP, 25);                         /* a 3d climb, full sphere */
+        for (int i = 0; i < 12; ++i) IM_CHECK_LE(fabsf(spk[i].pos.y - obs_height), pin_slab_m + 1e-4f);
+        opt_leash = saveL;
+        /* a FILE-authored pin can start outside its slab (no checkbox, no snap): starting the
+         * optimizer must project it in, not leave it to a lucky accepted trial */
+        spk[3].pos = Vector3{ 0.4f, 2.3f, -0.4f };               /* pinned, but parked off-plane */
+        set_optimizing(1);
+        IM_CHECK_LE(fabsf(spk[3].pos.y - obs_height), pin_slab_m + 1e-4f);
+        set_optimizing(0);
+        seed_default(); layout_dirty = 1;
     };
 
     t = IM_REGISTER_TEST(te, "viewer", "panel_edit");            /* fake inputs drive the panel; state follows */
@@ -1578,8 +1772,11 @@ static void register_tests(ImGuiTestEngine* te) {
 int main(int argc, char** argv) {
     /* headless (no window/audio, scriptable):
      *   --export   [file]            write the layout (default grid, or an existing file with delay_ms recomputed)
-     *   --score    [file]            print each panner's rE-localization error for the layout
-     *   --optimize [file] [panner]   hill-climb the layout for one panner (dbap|spcap|vbap, default dbap),
+     *   --score    [file] [condition]   print each panner's rE-localization error for the layout,
+     *                                under a named condition if given (default: the full sphere)
+     *   --optimize [file] [panner] [stages]   hill-climb the layout for one panner (dbap|spcap|vbap, default
+     *                                dbap) under a comma-separated chain of named conditions (default "3d";
+     *                                "horizontal,3d" seeds the 3D climb from the plane-optimal result),
      *                                within constraints.json if present, save in place, print before/after
      *   --tests    [filter]          run the imgui_test_engine suite (logic + the real UI) and exit pass/fail */
     bool selftest = false;
@@ -1590,8 +1787,17 @@ int main(int argc, char** argv) {
                    "  edit a speaker layout in 3D (default file: ./cave_layout.json;\n"
                    "  ./constraints.json bounds the placement if present)\n"
                    "  --export   [file]                    write the layout headless\n"
-                   "  --score    [file]                    print each panner's rE-localization error\n"
-                   "  --optimize [file] [dbap|spcap|vbap]  hill-climb within constraints, save in place\n"
+                   "  --score    [file] [condition] [fixed|moving] [ears=<m>]\n"
+                   "             print each panner's rE-localization error, under a named condition\n"
+                   "             if given (3d, horizontal); 'fixed' scores the sweet spot only\n"
+                   "             (a seated install) instead of the moving-listener grid; ears=<m>\n"
+                   "             sets the listener ear height (the plane; default 1.4)\n"
+                   "  --optimize [file] [dbap|spcap|vbap] [stages] [fixed|moving] [ears=<m>]\n"
+                   "             hill-climb within constraints, save in place; stages = a comma-\n"
+                   "             separated chain of conditions (3d, horizontal), each stage seeding\n"
+                   "             the next - e.g. horizontal,3d optimizes the plane first, then 3D;\n"
+                   "             'fixed' optimizes for the sweet spot only, ears=<m> sets the\n"
+                   "             listener ear height (the plane; default 1.4)\n"
                    "  --tests    [filter]                  run the UI test suite and exit pass/fail\n");
             return 0;
         }
@@ -1642,26 +1848,111 @@ int main(int argc, char** argv) {
         printf("exported layout -> %s (from %s)\n", g_path, loaded ? "existing file" : "default grid");
         return 0;
     }
-    if (score_only) {                              /* headless: score the layout for each panner + exit */
-        printf("layout: %s (%s)\n", g_path, loaded ? "loaded" : "default grid");
+    if (score_only) {                              /* headless: score the layout for each panner + exit,
+                                                    * optionally under a named condition (argv[3]) */
+        int ci = -1, ears_set = 0;
+        for (int a = 3; a < argc && a < 7; ++a) {
+            if      (!strcmp(argv[a], "fixed"))  score_fixed_obs = 1;   /* seated install: sweet spot only */
+            else if (!strcmp(argv[a], "moving")) score_fixed_obs = 0;
+            else if (!strncmp(argv[a], "ears=", 5)) {
+                obs_height = (float)atof(argv[a] + 5);                  /* the plane / scoring / alignment height */
+                if (!(obs_height > 0.0f && obs_height <= 3.0f)) { printf("score: ears=%s out of range (0..3 m)\n", argv[a] + 5); return 1; }
+                ears_set = 1;
+            }
+            else {
+                ci = condition_find(argv[a]);
+                if (ci < 0) {
+                    printf("score: unknown condition '%s' (have:", argv[a]);
+                    for (int i = 0; i < NCONDITIONS; ++i) printf(" %s", opt_conditions[i].name);
+                    printf(" fixed moving ears=<m>)\n");
+                    return 1;
+                }
+            }
+        }
+        printf("layout: %s (%s)", g_path, loaded ? "loaded" : "default grid");
+        if (score_fixed_obs) printf("   observer: fixed (sweet spot only)");
+        if (ears_set)        printf("   ears %.2f m", obs_height);
+        if (ci >= 0) {
+            const OptCondition* c = &opt_conditions[ci];
+            if (c->band_deg > 0) printf("   condition '%s' (band %.0f deg, elev wt %.2f)", c->name, c->band_deg, c->elev_wt);
+            else                 printf("   condition '%s' (full sphere, elev wt %.2f)", c->name, c->elev_wt);
+        }
+        printf("\n");
         for (int p = 0; p < 3; ++p) {
+            if (ci >= 0) apply_condition(ci, (bwa_panner)p);   /* per panner: the focus default differs */
             float m, w, sp; score_panner((bwa_panner)p, 1, panner_tracked((bwa_panner)p), &m, &w, &sp);
             printf("  %-14s rE-localize error:  mean %4.1f deg   worst %4.1f deg   focus (Frank spread) %4.1f deg\n",
                    panner_names[p], m, w, sp);
         }
         return 0;
     }
-    if (optimize_only) {                           /* headless: optimize in place for one panner + save */
+    if (optimize_only) {                           /* headless: optimize in place for one panner + save.
+                                                    * STAGES chain conditions: each stage re-anchors at the
+                                                    * previous result, so `horizontal,3d` seeds the 3D climb
+                                                    * with the plane-optimal layout. */
         bwa_panner p = BWA_PAN_DBAP;
-        if (argc > 3) { if (!strcmp(argv[3], "spcap")) p = BWA_PAN_SPCAP; else if (!strcmp(argv[3], "vbap")) p = BWA_PAN_VBAP; }
+        int stages[8], nstages = 0;
+        int ears_set = 0;
+        for (int a = 3; a < argc && a < 7; ++a) {  /* panner, stage list, observer model, ears height: any order */
+            if      (!strcmp(argv[a], "dbap"))  p = BWA_PAN_DBAP;
+            else if (!strcmp(argv[a], "spcap")) p = BWA_PAN_SPCAP;
+            else if (!strcmp(argv[a], "vbap"))  p = BWA_PAN_VBAP;
+            else if (!strcmp(argv[a], "fixed"))  score_fixed_obs = 1;   /* seated install: optimize FOR the sweet spot */
+            else if (!strcmp(argv[a], "moving")) score_fixed_obs = 0;
+            else if (!strncmp(argv[a], "ears=", 5)) {
+                obs_height = (float)atof(argv[a] + 5);                  /* moves the plane, the pin slab, and the
+                                                                         * delay-alignment point on save */
+                if (!(obs_height > 0.0f && obs_height <= 3.0f)) { printf("optimize: ears=%s out of range (0..3 m)\n", argv[a] + 5); return 1; }
+                ears_set = 1;
+            }
+            else {
+                char buf[128]; snprintf(buf, sizeof buf, "%s", argv[a]);
+                for (char* tok = strtok(buf, ","); tok; tok = strtok(NULL, ",")) {
+                    int ci = condition_find(tok);
+                    if (ci < 0) {
+                        printf("optimize: unknown condition '%s' (have:", tok);
+                        for (int i = 0; i < NCONDITIONS; ++i) printf(" %s", opt_conditions[i].name);
+                        printf(" fixed moving)\n");
+                        return 1;
+                    }
+                    if (nstages < 8) stages[nstages++] = ci;
+                }
+            }
+        }
+        if (!nstages) stages[nstages++] = 0;                                   /* default: the 3d condition */
+        const int last = stages[nstages - 1];
+        if (ears_set) printf("  ears: %.2f m (the plane, scoring, and delay-alignment height)\n", obs_height);
+        { int np = 0; for (int i = 0; i < g_nspk; ++i) np += spk[i].pin;
+          if (np) printf("  pins: %d speaker(s) held to the ear plane (slab +-%.2f m)\n", np, pin_slab_m); }
+        apply_condition(last, p);                  /* before/after report under the objective the result ships against */
         float m0, w0; score_panner(p, 1, panner_tracked(p), &m0, &w0, NULL);
-        opt_cost = opt_cost_of(p); opt_step = 0.30f; opt_stall = 0; opt_iter = 0;
-        for (int i = 0; i < g_nspk; ++i) opt_anchor[i] = spk[i].pos;           /* leash anchor (opt_leash defaults ~free) */
-        while (opt_step > 0.02f && opt_iter < 120000) optimize_step(p, 200);   /* run to convergence (step floor) */
+        int iters_total = 0;
+        for (int s = 0; s < nstages; ++s) {
+            const OptCondition* c = &opt_conditions[stages[s]];
+            apply_condition(stages[s], p);
+            float sm0, sw0; score_panner(p, 1, panner_tracked(p), &sm0, &sw0, NULL);
+            for (int i = 0; i < g_nspk; ++i)       /* enforce pins first: a file-authored pin may start outside its slab */
+                if (spk[i].pin) spk[i].pos = constraint_project(pin_project(spk[i].pos, 1));
+            opt_cost = opt_cost_of(p); opt_step = 0.30f; opt_stall = 0; opt_iter = 0;
+            for (int i = 0; i < g_nspk; ++i) opt_anchor[i] = spk[i].pos;       /* re-anchor: start from the previous stage */
+            while (opt_step > 0.02f && opt_iter < 120000) optimize_step(p, 200);   /* run to convergence (step floor) */
+            float sm1, sw1; score_panner(p, 1, panner_tracked(p), &sm1, &sw1, NULL);
+            char bandtxt[32];
+            if (c->band_deg > 0) snprintf(bandtxt, sizeof bandtxt, "band %.0f deg", c->band_deg);
+            else                 snprintf(bandtxt, sizeof bandtxt, "full sphere");
+            printf("  stage %-10s (%s, leash %.1f m):  mean %.1f -> %.1f deg   worst %.1f -> %.1f deg   "
+                   "(%d iters, %d/%d speakers within 0.5 m of the ear plane)\n",
+                   c->name, bandtxt, c->leash_m,
+                   sm0, sm1, sw0, sw1, opt_iter, plane_count(0.5f), g_nspk);
+            iters_total += opt_iter;
+        }
+        apply_condition(last, p);
         float m1, w1; score_panner(p, 1, panner_tracked(p), &m1, &w1, NULL);
         if (!save_json(g_path)) { printf("optimize: save failed: %s\n", g_path); return 1; }
-        printf("optimized %s for %-5s:  rE mean %.1f -> %.1f deg   worst %.1f -> %.1f deg   (%d iters%s)\n",
-               g_path, panner_names[p], m0, m1, w0, w1, opt_iter, CON.loaded ? ", within constraints" : "");
+        printf("optimized %s for %-5s under '%s'%s:  rE mean %.1f -> %.1f deg   worst %.1f -> %.1f deg   (%d iters%s)\n",
+               g_path, panner_names[p], opt_conditions[last].name,
+               score_fixed_obs ? " [fixed observer]" : "", m0, m1, w0, w1, iters_total,
+               CON.loaded ? ", within constraints" : "");
         return 0;
     }
     printf("layout: %s (%s, %d speakers)\n", g_path, loaded ? "loaded" : "default dome", g_nspk);
