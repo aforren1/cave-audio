@@ -4,6 +4,54 @@ All notable changes to `com.brainworks.bw_audio`.
 
 ## [Unreleased]
 
+### Added: layout-tool conditions, stages, and pinned speaker allocation
+
+What a layout is optimized FOR is now a first-class artifact in `bwa_layout_tool`,
+because collaborators disagree about it. A named **condition** bundles the objective
+knobs with a scoring-shell restriction: `3d` (the full sphere, the old behaviour),
+`horizontal` (only source directions within 15 deg of the ear plane, for planar
+localization), and `visual` (a front wedge, azimuth and elevation within 30 deg of
++z). The GUI gets a condition combo plus band/azi sliders; the Score board follows
+the active condition. Headless, conditions chain as **stages**
+(`--optimize file dbap horizontal,3d`), each stage re-anchoring the leash at the
+previous result and reporting before/after scores plus ear-plane occupancy.
+
+- Staging alone cannot protect an allocation: objectives compete, and a `3d` stage
+  pulls plane speakers back toward elevation (measured on the default dome: 10
+  in-slab speakers eroded to 5). Allocation is therefore a CONSTRAINT:
+  **`"pin": "plane"`** per speaker (plus top-level `pin_slab_m`) holds a speaker to
+  the ear-plane slab through optimizer trials, snap, and optimizer start. Both are
+  authoring-only fields; the engine's loader ignores them. With 12 of 26 pinned the
+  plane score lands at its ceiling for about 0.2 deg of full-sphere mean.
+- `--score [file] [condition] [fixed|moving] [ears=<m>]` scores under a named
+  condition, for a seated install (sweet spot only) instead of the roaming grid,
+  and at the install's actual ear height. `--optimize` takes the same tokens.
+  `ears=` moves everything plane-shaped together: the band, the pin slab, and the
+  delay-alignment point written on save.
+- `--optimize ... radial` moves speakers only along the ear ray: directions frozen,
+  radii free. The cross-panner pass; optimize for VBAP (direction structure), then
+  a radial DBAP pass refits distances without disturbing the triangulation.
+- `--optimize ... guard=<panner>[:tol]` is the constrained form: while climbing the
+  target panner, moves that let the guard panner's cost slip more than tol above
+  its stage-start value are rejected. "The best VBAP layout that never lets DBAP
+  slip" is DBAP-optimize first, then a guarded VBAP climb.
+- The search itself grew past greedy: best-so-far is always tracked and shipped
+  (stopping, preview, and headless all restore it), `anneal` adds Metropolis
+  acceptance with per-trial cooling, and `restarts=<n>` basin-hops from the best
+  layout plus a kick. Motivated by measured multimodality: identical inputs landed
+  26.8 vs 31.2 deg worst on different random paths.
+- The GUI climb now stops itself at the same step floor the headless runs use
+  (it previously ran until stopped by hand), restores the best layout, and reports
+  convergence in the HUD.
+- The measured tradeoffs live in docs/layout-schema.md (pin-count trend, the
+  visual-wedge verdict per panner, the leash-matching caveat). Headline: narrow
+  conditions express requirements, they are not accuracy shortcuts; DBAP gained
+  nothing in the wedge from wedge-only optimization, VBAP's fixed solve did.
+- The layout-tool suite grew 15 -> 17 tests: band/wedge scoring on synthetic
+  layouts, condition-preset wiring, pin enforcement (including the regression where
+  a file-authored pin starting outside its slab was never projected in), and the
+  fixed-observer scoring model.
+
 ## [0.5.0]
 
 ### Added — device health (`bwa_get_health` / `bwa_get_xruns`)

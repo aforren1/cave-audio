@@ -94,13 +94,17 @@ save). Headless: `--optimize <file> [dbap|spcap|vbap] [stages]`.
 
 What to optimize *for* is a named **condition**, not just slider positions. A
 condition bundles the objective knobs (worst wt, focus wt, elev wt), a scoring-shell
-elevation **band**, and a leash. Two ship: `3d` (the full sphere, the historical
-default) and `horizontal` (only source directions within 15° of the ear plane count,
-for a collaborator who values planar localization). The band is the honest form of
-"2D": with the full sphere, zeroing the elevation weight still spends effort on the
-azimuth of overhead sources, where azimuth is nearly meaningless. The Score board
-follows the active condition; the coverage overlay stays full-sphere so the view never
-hides what a condition ignores.
+elevation **band**, an **azi band** (an azimuth wedge about +z, the room's forward),
+and a leash. Three ship: `3d` (the full sphere, the historical default), `horizontal`
+(only source directions within 15° of the ear plane count, for a collaborator who
+values planar localization), and `visual` (azimuth and elevation within 30° of
+straight ahead: spend the accuracy where the listener looks). The band is the honest
+form of "2D": with the full sphere, zeroing the elevation weight still spends effort
+on the azimuth of overhead sources, where azimuth is nearly meaningless. The `visual`
+wedge is anchored to one canonical facing, which fits an install with a dominant
+screen direction and not a turn-anywhere CAVE. The Score board follows the active
+condition; the coverage overlay stays full-sphere so the view never hides what a
+condition ignores.
 
 Conditions chain as **stages**, each seeding the next: `--optimize cave_layout.json
 dbap horizontal,3d` climbs the plane objective to convergence, re-anchors the leash
@@ -113,11 +117,68 @@ A warm start is not guaranteed to beat a direct 3D run (the climb is local), so 
 with `--score <file> [condition]`. The optional condition scores under that objective:
 `--score out.json horizontal` answers "what did the 3D stage cost the plane".
 
+A narrow condition is for expressing a requirement, not a shortcut to accuracy.
+Measured on the default dome with DBAP: a wedge-only `visual` climb reached
+4.3°/18.3° inside the wedge, and a plain `3d` run scored the same wedge at
+4.3°/15.6° while staying usable everywhere else (26.8° vs 84.1° full-sphere worst).
+The wedge's floor is set by the roaming listener, not by how many speakers face
+front, so aiming everything at it bought nothing. VBAP is the exception that proves
+the A/B rule: its fixed solve does benefit from tighter frontal triangulation, so
+`visual,3d` staged beat the direct run inside the wedge (3.4°/14.3° vs 3.9°/20.0°)
+for about 3° of full-sphere worst; the wedge-only run still collapsed everywhere
+else (74.5° worst). When a collaborator proposes a narrow objective, run both and
+read the two `--score` columns before committing.
+
 Both headless commands also take an observer token, `fixed` or `moving` (the
 default). This CAVE's listener roams, so scores average a 27-point grid across the
 working volume; a *seated* install listens from the sweet spot only, and scoring it
 over the roam punishes cells it will never occupy. `--score layout.json fixed`
 evaluates (and `--optimize ... fixed` optimizes) at the sweet spot alone.
+
+`--optimize` also takes `radial`: trials move speakers only along the ray from the
+ears, so directions stay put and radii refit. This is the cross-panner pass. VBAP's
+asset is its direction structure (triangulation) and DBAP's sensitivity is distance,
+so `--optimize L.json vbap 3d` followed by `--optimize L.json dbap 3d radial` tunes
+the array for both: the second command loads the first's result (the file carries
+the state between invocations) and cannot disturb what the first one built.
+
+For a hard two-panner requirement, `guard=<panner>[:tol]` is the stronger tool:
+while climbing the target panner, any move that lets the guard panner's cost slip
+more than `tol` (default 0.5, cost units are roughly degrees) above its stage-start
+value is rejected. Two objectives cannot both be climbed, but one can be climbed
+inside the other's feasible set. The recipe for "the best VBAP layout that never
+lets DBAP slip": optimize DBAP first, then `--optimize L.json vbap 3d guard=dbap`;
+the guard baseline is wherever the stage starts, so guarding from an unoptimized
+layout protects very little. The stage report prints the guard's before/after
+scores next to the target's. Measured on the default dome, that recipe was the best
+two-panner result of every mechanism tried: it matched the pure-VBAP mean (4.5°),
+beat the pure-VBAP worst by 7° (28.9° vs 35.6°, the warm start plus the constraint
+acting as a regularizer), and held DBAP within 0.3° of its own optimum.
+
+The climb is greedy by default: only improving moves are accepted, and the step
+shrinks when progress stalls. That is basin-limited, and measurably so (identical
+inputs landed 26.8° and 31.2° worst on different random paths; stiff seeds barely
+improved at all). Two tokens loosen it, and both always keep and ship the **best
+layout seen**, so a run can never end worse than its best moment: `anneal` switches
+to Metropolis acceptance (uphill moves accepted with probability exp(-slip/T), the
+temperature cooling every trial), and `restarts=<n>` re-climbs n times, each
+restart hopping from the best layout plus a 0.25 m kick. Restarts explore near the
+seed's basin; they do not invent a new structure, so seed shape still dominates.
+Measured: on the default dome the upgrade is a wash (4.8°/28.8° vs greedy's
+26.8-31.2° spread, at 7x the iterations; the basin's floor is real), but it rescues
+a stiff seed outright: the clamped r=3.2 sphere that greedy left at 28.3° worst
+reached 4.5°/24.1°, the best moving-listener result measured on this array. VBAP
+saw no rescue anywhere: eight restarts across two very different seeds all landed
+within 2% of one cost, so its landscape is flat-bottomed and the extra wandering
+only added worst-case noise. Use the upgrade when a seed underperforms, not as the
+default.
+The GUI's `anneal` checkbox is the same switch, and stopping the optimizer (or
+entering preview) always restores the best layout.
+
+Every climb terminates on its own. Headless runs stop at the step floor (0.02 m)
+or a 120k-iteration cap, and the GUI climb now stops itself at the same floor,
+restores the best layout, and says so in the HUD; pressing **O** again re-climbs
+from there with a fresh step schedule.
 
 Both also take `ears=<m>`, the listener ear height above the floor (default 1.4).
 Everything plane-shaped anchors to it: the horizontal band, the pin slab, the

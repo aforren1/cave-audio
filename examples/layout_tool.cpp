@@ -116,6 +116,11 @@ static float       elev_wt    = 0.3f;      /* elevation-error weight vs azimuth 
  * meaningless). Applies to score_panner (the scoreboard + the optimizer's cost); the coverage/badness
  * overlays keep the full shell so the view never hides what a condition ignores. */
 static float       shell_band_deg = 0.0f;
+/* Azimuth wedge: 0 = all azimuths; >0 keeps only source directions within that many degrees of the
+ * room's FORWARD (+z, the same facing convention as the head view). This is the "visual area"
+ * objective: spend the array's accuracy where the listener looks. It bakes in one canonical facing,
+ * so it fits an install with a dominant screen direction, not a turn-anywhere CAVE. */
+static float       shell_azi_deg  = 0.0f;
 
 /* speaker `i` of `n` on a hemisphere DOME (y >= 0): a Fibonacci half-sphere, radius ~2.4 m — the
  * listener sits under it. Even angular spread with no floor-crossing speakers (the CAVE floor is a
@@ -475,9 +480,11 @@ static void score_panner(bwa_panner panner, int stride, int tracked,
     Vector3 S = { 0.0f, obs_height, 0.0f };         /* the sweet spot: where a fixed install solves */
     /* cov_dir is unit, so |y| = sin(elevation): the band keeps directions near the ear plane */
     float band_sin = (shell_band_deg > 0.0f) ? sinf(shell_band_deg * DEG2RAD) : 2.0f;
+    float azi_rad  = shell_azi_deg * DEG2RAD;       /* wedge about +z (room forward); 0 = all azimuths */
     int ns = 0;                                     /* sources are world-fixed, so build them ONCE */
     for (int i = 0; i < NCOV; i += stride) {
         if (fabsf(cov_dir[i].y) > band_sin) continue;
+        if (azi_rad > 0.0f && fabsf(atan2f(cov_dir[i].x, cov_dir[i].z)) > azi_rad) continue;
         srcs[ns*3]   = S.x + COV_R * cov_dir[i].x;
         srcs[ns*3+1] = S.y + COV_R * cov_dir[i].y;
         srcs[ns*3+2] = S.z + COV_R * cov_dir[i].z;
@@ -656,6 +663,36 @@ static void compute_badness(bwa_panner panner, int tracked) {
 static int     opt_running, opt_iter, opt_stall;
 static float   opt_step = 0.30f, opt_cost;
 static float   opt_leash = 3.0f;                          /* max optimizer displacement from the anchor (m); ~free at 3 m */
+static int     opt_radial = 0;                            /* trials move only ALONG the ear ray: directions (a panner's
+                                                           * triangulation) frozen, radii free - the cross-panner refit
+                                                           * pass ("optimize for vbap, then a dbap pass for radii") */
+/* Cross-panner GUARD: while climbing the target panner, a trial is additionally rejected if the
+ * guard panner's cost slips more than opt_guard_tol above its value at optimize start. This is the
+ * constrained form of "best VBAP layout that never lets DBAP slip" - two objectives cannot both be
+ * climbed, but one can be climbed inside the other's feasible set. The guard is evaluated under the
+ * SAME condition/weights as the climb (its own tracked mode), and only for trials that already
+ * improve the target, so the extra cost is small. Start FROM a layout already optimized for the
+ * guard panner, or the baseline it protects is a weak one. */
+static int     opt_guard_panner = -1;                     /* -1 = off; else bwa_panner to protect */
+static float   opt_guard_tol = 0.5f;                      /* allowed slip, in cost units (~degrees) */
+static float   opt_guard_base;                            /* guard cost captured at optimize start */
+/* Search upgrades over the greedy climb, both opt-in. The measured motivation: the objective is
+ * multimodal (identical inputs landed 26.8 vs 31.2 deg worst on different rand paths, and stiff
+ * seeds barely improved at all), and a strictly greedy walk cannot cross a cost barrier.
+ *  - BEST-SO-FAR is always tracked and shipped: a run can never end worse than its best moment.
+ *    (This is what makes uphill acceptance safe to stop at any time.)
+ *  - `anneal` = Metropolis acceptance: an uphill move of cost slip d is accepted with probability
+ *    exp(-d/T); T starts at SA_T0 and cools a little every trial, so the walk explores early and
+ *    freezes into a basin late. The step floor still terminates the climb.
+ *  - `restarts=<n>` = basin hopping: re-climb from the best layout plus a 0.25 m kick. Restarts
+ *    diversify NEAR the seed's basin; they do not invent a new structure (seeds still dominate). */
+#define SA_T0      0.75f                                  /* initial temperature (cost units ~degrees) */
+#define SA_DECAY   0.9997f                                /* per-trial cooling */
+static int     opt_sa = 0, opt_restarts = 1;
+static float   opt_sa_t = 0.0f;                           /* current temperature; 0 = greedy */
+static Vector3 opt_best_pos[NSPK];
+static float   opt_best_cost = 1e30f;
+static int     opt_converged = 0;                         /* the GUI climb auto-stopped at the step floor */
 static float   opt_worst_wt = 0.333f;                     /* mean<->worst blend (1/3 = the historical mean + 0.5*worst) */
 static float   opt_focus_wt = 0.0f;                       /* deg-of-spread per deg-of-error trade; 0 = direction only */
 static Vector3 opt_anchor[NSPK];                          /* speaker positions captured when optimization started */
@@ -681,10 +718,11 @@ static void mark_score(void) { score_stale = 1; cov_err_stale = 1; bad_stale = 1
  * happily pulls speakers toward the ear plane (elevated coverage costs it nothing), and the leash
  * is the knob that decides how much of that migration — speaker ALLOCATION to the plane — the
  * stage may do. focus_wt < 0 = use the panner's own default (panner_focus_default). ---- */
-typedef struct { const char* name; float worst_wt, focus_wt, elev_wt, band_deg, leash_m; } OptCondition;
+typedef struct { const char* name; float worst_wt, focus_wt, elev_wt, band_deg, azi_deg, leash_m; } OptCondition;
 static const OptCondition opt_conditions[] = {
-    { "3d",         0.333f, -1.0f, 0.3f,   0.0f, 3.0f },   /* the historical default: full sphere */
-    { "horizontal", 0.333f, -1.0f, 0.15f, 15.0f, 1.0f },   /* sources near the ear plane only */
+    { "3d",         0.333f, -1.0f, 0.3f,   0.0f,  0.0f, 3.0f },   /* the historical default: full sphere */
+    { "horizontal", 0.333f, -1.0f, 0.15f, 15.0f,  0.0f, 1.0f },   /* sources near the ear plane only */
+    { "visual",     0.333f, -1.0f, 0.3f,  30.0f, 30.0f, 1.0f },   /* the visual area: a front wedge about +z */
 };
 #define NCONDITIONS ((int)(sizeof opt_conditions / sizeof opt_conditions[0]))
 static int opt_condition_idx = 0;                          /* panel combo state */
@@ -695,6 +733,7 @@ static void apply_condition(int i, bwa_panner p) {
     opt_focus_wt   = (c->focus_wt < 0.0f) ? panner_focus_default(p) : c->focus_wt;
     elev_wt        = c->elev_wt;
     shell_band_deg = c->band_deg;
+    shell_azi_deg  = c->azi_deg;
     opt_leash      = c->leash_m;
     opt_condition_idx = i;
     mark_score();
@@ -715,14 +754,34 @@ static void optimize_step(bwa_panner p, int trials) {
     for (int t = 0; t < trials; ++t) {
         int s = rand() % g_nspk;
         Vector3 old = spk[s].pos;
-        Vector3 cand = { old.x + opt_step * (2*frand()-1), old.y + opt_step * (2*frand()-1), old.z + opt_step * (2*frand()-1) };
+        Vector3 cand;
+        if (opt_radial) {                          /* slide along the ear ray only (direction preserved; the
+                                                    * y>=0 floor / constraint projection keep the last word) */
+            Vector3 rd = Vector3Subtract(old, Vector3{ 0, obs_height, 0 });
+            float rl = Vector3Length(rd);
+            cand = (rl < 1e-3f) ? old : Vector3Add(old, Vector3Scale(rd, opt_step * (2*frand()-1) / rl));
+        } else {
+            cand = Vector3{ old.x + opt_step * (2*frand()-1), old.y + opt_step * (2*frand()-1), old.z + opt_step * (2*frand()-1) };
+        }
         Vector3 dv = Vector3Subtract(cand, opt_anchor[s]);       /* leash: never drift past opt_leash from where it started */
         float dl = Vector3Length(dv);
         if (dl > opt_leash) cand = Vector3Add(opt_anchor[s], Vector3Scale(dv, opt_leash / dl));
         spk[s].pos = constraint_project(pin_project(cand, spk[s].pin));   /* keep the trial feasible */
         float c = opt_cost_of(p);
-        if (c < opt_cost - 1e-4f) { opt_cost = c; opt_stall = 0; }              /* accept an improvement */
+        float d = c - opt_cost;
+        int ok = d < -1e-4f;
+        if (!ok && opt_sa_t > 1e-3f && frand() < expf(-d / opt_sa_t)) ok = 1;   /* Metropolis: sometimes uphill */
+        if (ok && opt_guard_panner >= 0)           /* the guard vetoes moves that trade its panner away */
+            ok = opt_cost_of((bwa_panner)opt_guard_panner) <= opt_guard_base + opt_guard_tol;
+        if (ok) {
+            opt_cost = c; opt_stall = 0;
+            if (c < opt_best_cost) {               /* best-so-far: the layout a run actually ships */
+                opt_best_cost = c;
+                for (int i = 0; i < g_nspk; ++i) opt_best_pos[i] = spk[i].pos;
+            }
+        }
         else { spk[s].pos = old; if (++opt_stall > 6*g_nspk) { opt_step *= 0.7f; opt_stall = 0; } }  /* revert; shrink when stuck */
+        if (opt_sa_t > 0.0f) opt_sa_t *= SA_DECAY;
         ++opt_iter;
     }
     mark_edit();
@@ -803,12 +862,32 @@ static void set_optimizing(int on) {
         for (int i = 0; i < g_nspk; ++i)
             if (spk[i].pin) { spk[i].pos = constraint_project(pin_project(spk[i].pos, 1)); mark_edit(); }
         opt_cost = opt_cost_of((bwa_panner)pv_panner); opt_step = 0.30f; opt_stall = 0; opt_iter = 0;
-        for (int i = 0; i < g_nspk; ++i) opt_anchor[i] = spk[i].pos;   /* leash anchor = here (post-projection) */
+        opt_sa_t = opt_sa ? SA_T0 : 0.0f;
+        opt_best_cost = opt_cost;
+        for (int i = 0; i < g_nspk; ++i) { opt_anchor[i] = spk[i].pos; opt_best_pos[i] = spk[i].pos; }
+        if (opt_guard_panner >= 0) opt_guard_base = opt_cost_of((bwa_panner)opt_guard_panner);
     }
+    if (!on && opt_running && opt_best_cost < opt_cost - 1e-4f) {
+        /* an annealed walk can stop above the best it saw; ship the best, always */
+        for (int i = 0; i < g_nspk; ++i) spk[i].pos = opt_best_pos[i];
+        opt_cost = opt_best_cost;
+        mark_edit();
+    }
+    if (on) opt_converged = 0;
     opt_running = on;
+}
+
+/* per-frame climb + the SAME stopping condition the headless runs use (the step floor): the GUI
+ * optimizer used to run forever, refining nothing at an ever-shrinking step until stopped by hand */
+static void optimize_tick(void) {
+    opt_cost = opt_cost_of((bwa_panner)pv_panner);   /* re-baseline so a manual nudge can't wedge the climb */
+    optimize_step((bwa_panner)pv_panner, 6);
+    if (opt_step <= 0.02f) { opt_converged = 1; set_optimizing(0); }   /* auto-stop; ships the best layout */
 }
 static void enter_preview(void) {      /* rebuild so the preview pans through the edited layout */
     if (driven >= 0 && e) { bwa_set_test_signal(e, (uint32_t)driven, BWA_TEST_OFF, 0.0f); driven = -1; }
+    set_optimizing(0);                           /* stop BEFORE the rebuild snapshots the layout, so the
+                                                  * preview plays the best layout seen, not the last walk */
     tone_on = 0; pv_orbit = 0; pv_t = 0.0f;      /* each preview session starts manual, fresh orbit phase */
     if (layout_dirty && e && audio) {            /* rebuild only when there's a device to hear it on */
         if (save_json(TEMP_LAYOUT)) {            /* ... and only if the temp layout actually wrote */
@@ -819,7 +898,6 @@ static void enter_preview(void) {      /* rebuild so the preview pans through th
             fprintf(stderr, "preview: cannot write %s (working dir not writable?) — previewing the last build\n", TEMP_LAYOUT);
         }
     }
-    opt_running = 0;                             /* stop the optimizer when leaving edit for preview */
     preview = 1;
     if (e) {
         bwa_set_panner(e, (bwa_panner)pv_panner);   /* rebuilt engine defaults to DBAP */
@@ -1144,8 +1222,11 @@ static void draw_hud(float cov_worst, float cov_mean) {
                            "constraints: %d no-go  %d obstacle   %d out [K snap]  %d occluded (move clear)",
                            CON.nnogo, CON.nobst, con_bad, con_occ);
     if (opt_running && !preview)
-        ImGui::TextColored(ImVec4(0.47f, 0.96f, 0.63f, 1), "OPTIMIZING %s   cost %.1f   iter %d   step %.2f m   [O] stop",
-                           panner_names[pv_panner], opt_cost, opt_iter, opt_step);
+        ImGui::TextColored(ImVec4(0.47f, 0.96f, 0.63f, 1), "OPTIMIZING %s   cost %.1f (best %.1f)   iter %d   step %.2f m   [O] stop",
+                           panner_names[pv_panner], opt_cost, opt_best_cost, opt_iter, opt_step);
+    else if (opt_converged && !preview)
+        ImGui::TextColored(ImVec4(0.59f, 0.86f, 0.71f, 1), "optimizer CONVERGED (step floor)   cost %.1f   %d iters   [O] climbs again",
+                           opt_cost, opt_iter);
     if (scored && !preview) {
         ImGui::TextColored(ImVec4(0.59f, 0.78f, 0.94f, 1),
                            "rE-err deg mean/worst (live%s):   %sDBAP %.0f/%.0f    %sSPCAP %.0f/%.0f    %sVBAP %.0f/%.0f",
@@ -1298,23 +1379,48 @@ static void draw_panel(void) {
     bwTip("the panner Score / Optimize / the rE overlay evaluate ([B] cycles). DBAP tracks a "
           "MOVING listener; SPCAP/VBAP assume the centre sweet spot");
     { int ci = opt_condition_idx;
-      if (ImGui::Combo("condition", &ci, "3d (full sphere)\0horizontal (plane band)\0"))
+      if (ImGui::Combo("condition", &ci, "3d (full sphere)\0horizontal (plane band)\0visual (front wedge)\0"))
           apply_condition(ci, (bwa_panner)pv_panner); }
     bwTip("a named objective: what to optimize FOR. 'horizontal' scores only source directions "
-          "within 15 deg of the ear plane (a collaborator who values planar localization), with a "
-          "1 m leash - a plane-only objective pulls speakers toward the ear plane, and the leash "
-          "decides how much. These are starting values; every slider below still overrides. To "
-          "STAGE them, optimize under one, stop, switch, optimize again - each start re-anchors "
-          "the leash, so the second climb refines the first's result");
+          "within 15 deg of the ear plane (planar localization); 'visual' only a front wedge "
+          "(azimuth and elevation within 30 deg of +z - where the listener looks). Both use a "
+          "1 m leash: a narrow objective pulls speakers toward its region, and the leash decides "
+          "how much. Starting values; every slider below still overrides. To STAGE them, optimize "
+          "under one, stop, switch, optimize again - each start re-anchors the leash");
     if (ImGui::Button("Score [X]")) do_score();
     bwTip("rE localization error over a shell of directions, via the engine's real gain solve - "
           "mean/worst per panner land in the HUD scoreboard");
     ImGui::SameLine();
     { bool ob = opt_running != 0; if (ImGui::Checkbox("Optimize [O]", &ob)) set_optimizing(ob); }
     bwTip("stochastic hill-climb of the speaker positions, minimising the target panner's rE error "
-          "within the constraints; runs live - watch it converge, stop, then Save");
+          "within the constraints; runs live - watch it converge. Stops ITSELF when the step size "
+          "hits the floor (same condition as the headless runs) and restores the best layout seen; "
+          "[O] again re-climbs from there");
     ImGui::SliderFloat("leash", &opt_leash, 0.1f, 3.0f, "%.2f m");   /* max optimizer move from the anchor */
     bwTip("how far the optimizer may move any speaker from where it started (3 m = essentially free)");
+    ImGui::SameLine();
+    CheckboxInt("radial", &opt_radial);
+    bwTip("trials move speakers only ALONG the ray from the ears: directions stay put, radii refit. "
+          "The cross-panner pass - optimize for VBAP, then a radial DBAP pass tunes distances "
+          "without disturbing the triangulation");
+    CheckboxInt("anneal", &opt_sa);
+    bwTip("Metropolis acceptance: uphill moves are sometimes taken while the temperature is high, "
+          "so the climb can cross cost barriers a greedy walk cannot. The best layout seen is "
+          "always kept and restored when you stop, so annealing can never end worse than it began");
+    { int gp = opt_guard_panner + 1;
+      if (ImGui::Combo("guard", &gp, "off\0DBAP\0SPCAP\0VBAP\0")) {
+          opt_guard_panner = gp - 1;
+          if (opt_running && opt_guard_panner >= 0) opt_guard_base = opt_cost_of((bwa_panner)opt_guard_panner);
+      } }
+    bwTip("constrained climb: while optimizing the target panner, REJECT any move that lets this "
+          "panner's cost slip more than the tolerance above where it started - 'the best VBAP "
+          "layout that never lets DBAP slip'. Start from a layout already optimized for the guard "
+          "panner, or the baseline it protects is a weak one");
+    if (opt_guard_panner >= 0) {
+        ImGui::SliderFloat("guard tol", &opt_guard_tol, 0.0f, 2.0f, "%.2f");
+        bwTip("allowed guard-cost slip, in cost units (roughly degrees); 0 = the guard may not "
+              "get worse at all (very restrictive for a stochastic climb)");
+    }
     if (ImGui::SliderFloat("worst wt", &opt_worst_wt, 0.0f, 1.0f, "%.2f") && opt_running)
         opt_cost = opt_cost_of((bwa_panner)pv_panner);   /* re-baseline: the cached cost is on the old blend */
     bwTip("mean<->worst-case blend the optimizer climbs: 0 optimizes the AVERAGE direction/observer "
@@ -1340,6 +1446,13 @@ static void draw_panel(void) {
     bwTip("scoring-shell elevation band: only source directions within this many degrees of the "
           "ear plane are scored/optimized; 0 = the full sphere. The Score board follows it too, "
           "so the numbers always mean the active condition; the coverage overlay stays full-sphere");
+    if (ImGui::SliderFloat("azi band", &shell_azi_deg, 0.0f, 180.0f, "%.0f deg")) {
+        mark_score();
+        if (opt_running) opt_cost = opt_cost_of((bwa_panner)pv_panner);
+    }
+    bwTip("scoring-shell azimuth wedge about +z (the room's forward): only source directions "
+          "within this many degrees of straight ahead count; 0 = all azimuths. Anchored to ONE "
+          "facing - right for a dominant-screen install, wrong for a turn-anywhere CAVE");
     CheckboxInt("coverage [C]", &coverage_on);
     bwTip("shade a shell of source directions: green = the array localizes it well, red = a hole; "
           "hover a cube for its value");
@@ -1601,8 +1714,25 @@ static void register_tests(ImGuiTestEngine* te) {
         IM_CHECK_EQ(shell_band_deg, opt_conditions[hi].band_deg);
         IM_CHECK_EQ(opt_leash, opt_conditions[hi].leash_m);
         IM_CHECK_EQ(plane_count(0.5f), 8);                       /* the whole ring sits on the ear plane */
+        /* the azimuth wedge: a FRONT-ONLY cluster is fine where you look, hopeless behind */
+        for (int i = 0; i < 8; ++i) {
+            float az = (-24.5f + 7.0f * (float)i) * DEG2RAD;     /* azimuths spread across +-25 deg of +z */
+            float el = ((i & 1) ? 15.0f : -15.0f) * DEG2RAD;
+            spk[i].pos = Vector3{ 2.4f * sinf(az) * cosf(el), obs_height + 2.4f * sinf(el), 2.4f * cosf(az) * cosf(el) };
+        }
+        int vi = condition_find("visual");
+        IM_CHECK(vi >= 0);
+        apply_condition(vi, BWA_PAN_DBAP);
+        IM_CHECK_EQ(shell_azi_deg, opt_conditions[vi].azi_deg);
+        float vm, vw;
+        score_panner(BWA_PAN_DBAP, 2, 1, &vm, &vw, NULL);        /* wedge only */
+        shell_band_deg = 0.0f; shell_azi_deg = 0.0f;
+        score_panner(BWA_PAN_DBAP, 2, 1, &fm, &fw, NULL);        /* full sphere, same layout */
+        IM_CHECK_LT(vm, fm);
+        IM_CHECK_LT(vm, 30.0f);                                  /* in the wedge the cluster localizes */
+        IM_CHECK_GT(fw, 45.0f);                                  /* behind the head it cannot */
         opt_worst_wt = saveW; opt_focus_wt = saveF; elev_wt = saveE; opt_leash = saveL;
-        opt_condition_idx = saveC; shell_band_deg = 0.0f;
+        opt_condition_idx = saveC; shell_band_deg = 0.0f; shell_azi_deg = 0.0f;
         g_nspk = keep; seed_default(); layout_dirty = 1;
     };
 
@@ -1630,6 +1760,104 @@ static void register_tests(ImGuiTestEngine* te) {
         spk[3].pos = Vector3{ 0.4f, 2.3f, -0.4f };               /* pinned, but parked off-plane */
         set_optimizing(1);
         IM_CHECK_LE(fabsf(spk[3].pos.y - obs_height), pin_slab_m + 1e-4f);
+        set_optimizing(0);
+        seed_default(); layout_dirty = 1;
+    };
+
+    /* Radial mode is a promise about what a pass may NOT touch: directions. A radial climb on the
+     * dome must change radii while every surviving direction stays put (the y>=0 floor clamp may
+     * bend the lowest speakers; those are exempt). */
+    t = IM_REGISTER_TEST(te, "logic", "radial");
+    t->TestFunc = [](ImGuiTestContext*) {
+        seed_default(); layout_dirty = 1;
+        Vector3 dir0[NSPK]; float r0[NSPK];
+        const Vector3 ear = { 0, obs_height, 0 };
+        for (int i = 0; i < g_nspk; ++i) {
+            Vector3 d = Vector3Subtract(spk[i].pos, ear);
+            r0[i] = Vector3Length(d); dir0[i] = Vector3Scale(d, 1.0f / r0[i]);
+        }
+        srand(11);
+        opt_radial = 1;
+        opt_cost = opt_cost_of(BWA_PAN_DBAP); opt_step = 0.30f; opt_stall = 0; opt_iter = 0;
+        for (int i = 0; i < g_nspk; ++i) opt_anchor[i] = spk[i].pos;
+        optimize_step(BWA_PAN_DBAP, 60);
+        opt_radial = 0;
+        int moved = 0;
+        for (int i = 0; i < g_nspk; ++i) {
+            Vector3 d = Vector3Subtract(spk[i].pos, ear);
+            float r = Vector3Length(d);
+            if (fabsf(r - r0[i]) > 1e-4f) ++moved;
+            if (spk[i].pos.y > 0.01f) {
+                Vector3 dn = Vector3Scale(d, 1.0f / r);
+                IM_CHECK_GT(Vector3DotProduct(dn, dir0[i]), 0.9999f);
+            }
+        }
+        IM_CHECK_GT(moved, 0);                                   /* radii DID move; directions did not */
+        seed_default(); layout_dirty = 1;
+    };
+
+    /* The guard is a veto, and the veto must actually bind: an impossible tolerance freezes the
+     * layout (every improving trial fails the guard), a huge one reduces to the unguarded climb. */
+    t = IM_REGISTER_TEST(te, "logic", "guard");
+    t->TestFunc = [](ImGuiTestContext*) {
+        seed_default(); layout_dirty = 1;
+        Vector3 before[NSPK];
+        for (int i = 0; i < g_nspk; ++i) before[i] = spk[i].pos;
+        srand(3);
+        opt_guard_panner = BWA_PAN_DBAP; opt_guard_tol = -1e9f;  /* nothing can satisfy this */
+        opt_guard_base = opt_cost_of(BWA_PAN_DBAP);
+        opt_cost = opt_cost_of(BWA_PAN_VBAP); opt_step = 0.30f; opt_stall = 0; opt_iter = 0;
+        for (int i = 0; i < g_nspk; ++i) opt_anchor[i] = spk[i].pos;
+        optimize_step(BWA_PAN_VBAP, 40);
+        for (int i = 0; i < g_nspk; ++i) IM_CHECK(memcmp(&spk[i].pos, &before[i], sizeof(Vector3)) == 0);
+        opt_guard_tol = 1e9f;                                    /* now the guard never binds */
+        opt_cost = opt_cost_of(BWA_PAN_VBAP); opt_step = 0.30f; opt_stall = 0;
+        optimize_step(BWA_PAN_VBAP, 120);
+        int moved = 0;
+        for (int i = 0; i < g_nspk; ++i) if (memcmp(&spk[i].pos, &before[i], sizeof(Vector3)) != 0) ++moved;
+        IM_CHECK_GT(moved, 0);
+        opt_guard_panner = -1; opt_guard_tol = 0.5f;
+        seed_default(); layout_dirty = 1;
+    };
+
+    /* Annealing's safety net is best-so-far: cooling actually runs, best never sits above current,
+     * and stopping restores the best layout even if the walk (or anything else) wandered off it. */
+    t = IM_REGISTER_TEST(te, "logic", "anneal_best");
+    t->TestFunc = [](ImGuiTestContext*) {
+        seed_default(); layout_dirty = 1;
+        srand(5);
+        opt_sa = 1;
+        set_optimizing(1);
+        IM_CHECK_GT(opt_sa_t, 0.0f);                             /* the temperature armed */
+        optimize_step(BWA_PAN_DBAP, 80);
+        IM_CHECK_LT(opt_sa_t, SA_T0);                            /* per-trial cooling ran */
+        IM_CHECK_LE(opt_best_cost, opt_cost + 1e-4f);            /* best <= current, always */
+        Vector3 best5 = opt_best_pos[5];
+        spk[5].pos = Vector3{ 9, 9, 9 };                         /* wreck the current state... */
+        opt_cost = opt_cost_of(BWA_PAN_DBAP);
+        set_optimizing(0);                                       /* ...stopping must ship the best */
+        IM_CHECK_LT(fabsf(spk[5].pos.x - best5.x), 1e-5f);
+        IM_CHECK_LT(fabsf(spk[5].pos.y - best5.y), 1e-5f);
+        opt_sa = 0; opt_sa_t = 0.0f;
+        seed_default(); layout_dirty = 1;
+    };
+
+    /* the GUI climb terminates itself: once the step decays to the floor, a tick stops the run
+     * (restoring the best) instead of burning trials forever */
+    t = IM_REGISTER_TEST(te, "logic", "auto_stop");
+    t->TestFunc = [](ImGuiTestContext*) {
+        seed_default(); layout_dirty = 1;
+        srand(9);
+        set_optimizing(1);
+        IM_CHECK(opt_running);
+        IM_CHECK(!opt_converged);
+        opt_step = 0.02f;                                        /* at the floor: the next tick must stop */
+        optimize_tick();
+        IM_CHECK(!opt_running);
+        IM_CHECK(opt_converged);
+        set_optimizing(1);                                       /* restarting clears the converged flag */
+        IM_CHECK(!opt_converged);
+        IM_CHECK_GT(opt_step, 0.02f);                            /* ...and re-arms the step schedule */
         set_optimizing(0);
         seed_default(); layout_dirty = 1;
     };
@@ -1789,15 +2017,22 @@ int main(int argc, char** argv) {
                    "  --export   [file]                    write the layout headless\n"
                    "  --score    [file] [condition] [fixed|moving] [ears=<m>]\n"
                    "             print each panner's rE-localization error, under a named condition\n"
-                   "             if given (3d, horizontal); 'fixed' scores the sweet spot only\n"
+                   "             if given (3d, horizontal, visual); 'fixed' scores the sweet spot only\n"
                    "             (a seated install) instead of the moving-listener grid; ears=<m>\n"
                    "             sets the listener ear height (the plane; default 1.4)\n"
-                   "  --optimize [file] [dbap|spcap|vbap] [stages] [fixed|moving] [ears=<m>]\n"
+                   "  --optimize [file] [dbap|spcap|vbap] [stages] [fixed|moving] [ears=<m>] [radial]\n"
+                   "             [guard=<panner>[:tol]] [anneal] [restarts=<n>]\n"
                    "             hill-climb within constraints, save in place; stages = a comma-\n"
-                   "             separated chain of conditions (3d, horizontal), each stage seeding\n"
-                   "             the next - e.g. horizontal,3d optimizes the plane first, then 3D;\n"
+                   "             separated chain of conditions (3d, horizontal, visual), each stage\n"
+                   "             seeding the next - horizontal,3d optimizes the plane first, then 3D;\n"
                    "             'fixed' optimizes for the sweet spot only, ears=<m> sets the\n"
-                   "             listener ear height (the plane; default 1.4)\n"
+                   "             listener ear height (the plane; default 1.4); 'radial' moves\n"
+                   "             speakers only along the ear ray - refit radii for one panner\n"
+                   "             without disturbing another's direction structure; guard=<panner>\n"
+                   "             rejects moves that let that panner's cost slip more than tol\n"
+                   "             (default 0.5) above its value at the stage start; 'anneal' allows\n"
+                   "             uphill moves early (escapes local basins), restarts=<n> re-climbs\n"
+                   "             from the best + a kick; both always ship the best layout seen\n"
                    "  --tests    [filter]                  run the UI test suite and exit pass/fail\n");
             return 0;
         }
@@ -1874,8 +2109,10 @@ int main(int argc, char** argv) {
         if (ears_set)        printf("   ears %.2f m", obs_height);
         if (ci >= 0) {
             const OptCondition* c = &opt_conditions[ci];
-            if (c->band_deg > 0) printf("   condition '%s' (band %.0f deg, elev wt %.2f)", c->name, c->band_deg, c->elev_wt);
-            else                 printf("   condition '%s' (full sphere, elev wt %.2f)", c->name, c->elev_wt);
+            printf("   condition '%s' (", c->name);
+            if (c->band_deg > 0) printf("el +-%.0f deg", c->band_deg); else printf("full elevation");
+            if (c->azi_deg  > 0) printf(", azi +-%.0f deg", c->azi_deg);
+            printf(", elev wt %.2f)", c->elev_wt);
         }
         printf("\n");
         for (int p = 0; p < 3; ++p) {
@@ -1893,12 +2130,28 @@ int main(int argc, char** argv) {
         bwa_panner p = BWA_PAN_DBAP;
         int stages[8], nstages = 0;
         int ears_set = 0;
-        for (int a = 3; a < argc && a < 7; ++a) {  /* panner, stage list, observer model, ears height: any order */
+        for (int a = 3; a < argc && a < 11; ++a) { /* panner, stages, observer, ears, radial, guard, anneal,
+                                                    * restarts: any order */
             if      (!strcmp(argv[a], "dbap"))  p = BWA_PAN_DBAP;
             else if (!strcmp(argv[a], "spcap")) p = BWA_PAN_SPCAP;
             else if (!strcmp(argv[a], "vbap"))  p = BWA_PAN_VBAP;
             else if (!strcmp(argv[a], "fixed"))  score_fixed_obs = 1;   /* seated install: optimize FOR the sweet spot */
             else if (!strcmp(argv[a], "moving")) score_fixed_obs = 0;
+            else if (!strcmp(argv[a], "radial")) opt_radial = 1;        /* refit radii only; keep the direction structure */
+            else if (!strcmp(argv[a], "anneal")) opt_sa = 1;            /* Metropolis acceptance (escape local basins) */
+            else if (!strncmp(argv[a], "restarts=", 9)) {
+                opt_restarts = atoi(argv[a] + 9);
+                if (opt_restarts < 1 || opt_restarts > 16) { printf("optimize: restarts=%s out of range (1..16)\n", argv[a] + 9); return 1; }
+            }
+            else if (!strncmp(argv[a], "guard=", 6)) {                  /* protect another panner while climbing this one */
+                char nm[24]; snprintf(nm, sizeof nm, "%s", argv[a] + 6);
+                char* colon = strchr(nm, ':');
+                if (colon) { *colon = 0; opt_guard_tol = (float)atof(colon + 1); }
+                if      (!strcmp(nm, "dbap"))  opt_guard_panner = BWA_PAN_DBAP;
+                else if (!strcmp(nm, "spcap")) opt_guard_panner = BWA_PAN_SPCAP;
+                else if (!strcmp(nm, "vbap"))  opt_guard_panner = BWA_PAN_VBAP;
+                else { printf("optimize: guard=%s is not a panner (dbap|spcap|vbap)\n", nm); return 1; }
+            }
             else if (!strncmp(argv[a], "ears=", 5)) {
                 obs_height = (float)atof(argv[a] + 5);                  /* moves the plane, the pin slab, and the
                                                                          * delay-alignment point on save */
@@ -1922,6 +2175,8 @@ int main(int argc, char** argv) {
         if (!nstages) stages[nstages++] = 0;                                   /* default: the 3d condition */
         const int last = stages[nstages - 1];
         if (ears_set) printf("  ears: %.2f m (the plane, scoring, and delay-alignment height)\n", obs_height);
+        if (opt_sa || opt_restarts > 1)
+            printf("  search: %s, %d restart(s), best-so-far kept\n", opt_sa ? "annealed" : "greedy", opt_restarts);
         { int np = 0; for (int i = 0; i < g_nspk; ++i) np += spk[i].pin;
           if (np) printf("  pins: %d speaker(s) held to the ear plane (slab +-%.2f m)\n", np, pin_slab_m); }
         apply_condition(last, p);                  /* before/after report under the objective the result ships against */
@@ -1933,16 +2188,60 @@ int main(int argc, char** argv) {
             float sm0, sw0; score_panner(p, 1, panner_tracked(p), &sm0, &sw0, NULL);
             for (int i = 0; i < g_nspk; ++i)       /* enforce pins first: a file-authored pin may start outside its slab */
                 if (spk[i].pin) spk[i].pos = constraint_project(pin_project(spk[i].pos, 1));
-            opt_cost = opt_cost_of(p); opt_step = 0.30f; opt_stall = 0; opt_iter = 0;
+            float gm0 = 0, gw0 = 0;
+            if (opt_guard_panner >= 0) {           /* the guard baseline: where this stage must not slip from */
+                opt_guard_base = opt_cost_of((bwa_panner)opt_guard_panner);
+                score_panner((bwa_panner)opt_guard_panner, 1, panner_tracked((bwa_panner)opt_guard_panner), &gm0, &gw0, NULL);
+            }
+            opt_iter = 0;
             for (int i = 0; i < g_nspk; ++i) opt_anchor[i] = spk[i].pos;       /* re-anchor: start from the previous stage */
-            while (opt_step > 0.02f && opt_iter < 120000) optimize_step(p, 200);   /* run to convergence (step floor) */
+            opt_best_cost = 1e30f;
+            for (int r = 0; r < opt_restarts; ++r) {
+                if (r > 0) {                       /* basin hop: restart from the best layout plus a kick */
+                    for (int i = 0; i < g_nspk; ++i) spk[i].pos = opt_best_pos[i];
+                    for (int i = 0; i < g_nspk; ++i) {
+                        Vector3 kp;
+                        if (opt_radial) {          /* radial mode's direction promise holds through the kick */
+                            Vector3 rd = Vector3Subtract(spk[i].pos, Vector3{ 0, obs_height, 0 });
+                            float rl = Vector3Length(rd);
+                            kp = (rl < 1e-3f) ? spk[i].pos
+                               : Vector3Add(spk[i].pos, Vector3Scale(rd, 0.25f * (2*frand()-1) / rl));
+                        } else {
+                            kp = Vector3{ spk[i].pos.x + 0.25f*(2*frand()-1),
+                                          spk[i].pos.y + 0.25f*(2*frand()-1),
+                                          spk[i].pos.z + 0.25f*(2*frand()-1) };
+                        }
+                        spk[i].pos = constraint_project(pin_project(kp, spk[i].pin));
+                    }
+                }
+                opt_cost = opt_cost_of(p); opt_step = 0.30f; opt_stall = 0;
+                opt_sa_t = opt_sa ? SA_T0 : 0.0f;
+                if (r == 0 && opt_cost < opt_best_cost) {    /* the incoming layout is a valid best; a
+                                                              * kicked state is not (it skipped the guard) */
+                    opt_best_cost = opt_cost;
+                    for (int i = 0; i < g_nspk; ++i) opt_best_pos[i] = spk[i].pos;
+                }
+                while (opt_step > 0.02f && opt_iter < 120000) optimize_step(p, 200);   /* run to the step floor */
+                if (opt_restarts > 1)
+                    printf("    restart %d/%d:  cost %.1f   best %.1f\n", r + 1, opt_restarts, opt_cost, opt_best_cost);
+            }
+            for (int i = 0; i < g_nspk; ++i) spk[i].pos = opt_best_pos[i];     /* ship the best layout seen */
             float sm1, sw1; score_panner(p, 1, panner_tracked(p), &sm1, &sw1, NULL);
-            char bandtxt[32];
-            if (c->band_deg > 0) snprintf(bandtxt, sizeof bandtxt, "band %.0f deg", c->band_deg);
-            else                 snprintf(bandtxt, sizeof bandtxt, "full sphere");
-            printf("  stage %-10s (%s, leash %.1f m):  mean %.1f -> %.1f deg   worst %.1f -> %.1f deg   "
+            if (opt_guard_panner >= 0) {
+                float gm1, gw1;
+                score_panner((bwa_panner)opt_guard_panner, 1, panner_tracked((bwa_panner)opt_guard_panner), &gm1, &gw1, NULL);
+                printf("    guard %-5s (tol %.2f):  mean %.1f -> %.1f deg   worst %.1f -> %.1f deg\n",
+                       panner_names[opt_guard_panner], opt_guard_tol, gm0, gm1, gw0, gw1);
+            }
+            char bandtxt[48];
+            if      (c->band_deg > 0 && c->azi_deg > 0)
+                snprintf(bandtxt, sizeof bandtxt, "el +-%.0f, azi +-%.0f deg", c->band_deg, c->azi_deg);
+            else if (c->band_deg > 0) snprintf(bandtxt, sizeof bandtxt, "band %.0f deg", c->band_deg);
+            else if (c->azi_deg  > 0) snprintf(bandtxt, sizeof bandtxt, "azi +-%.0f deg", c->azi_deg);
+            else                      snprintf(bandtxt, sizeof bandtxt, "full sphere");
+            printf("  stage %-10s (%s, leash %.1f m%s):  mean %.1f -> %.1f deg   worst %.1f -> %.1f deg   "
                    "(%d iters, %d/%d speakers within 0.5 m of the ear plane)\n",
-                   c->name, bandtxt, c->leash_m,
+                   c->name, bandtxt, c->leash_m, opt_radial ? ", radial" : "",
                    sm0, sm1, sw0, sw1, opt_iter, plane_count(0.5f), g_nspk);
             iters_total += opt_iter;
         }
@@ -2010,10 +2309,9 @@ int main(int argc, char** argv) {
         if (preview) handle_preview_input(dt, kb);
         else         handle_edit_input(dt, kb, ms, cam);
 
-        if (opt_running && !preview) {                    /* auto-optimizer: a few hill-climb trials per frame */
-            opt_cost = opt_cost_of((bwa_panner)pv_panner);  /* re-baseline so a manual nudge can't wedge the climb */
-            optimize_step((bwa_panner)pv_panner, 6);
-        }
+        if (opt_running && !preview)                      /* auto-optimizer: a few trials per frame, then
+                                                           * auto-stop at the step floor (optimize_tick) */
+            optimize_tick();
         for (int i = 0; i < g_nspk; ++i) if (spk[i].pos.y < 0.0f) spk[i].pos.y = 0.0f;   /* y >= 0: speakers never below the floor */
         if (scored && score_stale && (cov_frame - last_score_frame) >= 10) {
             do_score();                                   /* throttled live re-score (X forces an immediate one) */
