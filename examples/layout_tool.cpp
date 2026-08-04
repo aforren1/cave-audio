@@ -426,6 +426,12 @@ static float loc_err_deg(Vector3 d, Vector3 e) {
 /* ---- panner-specific layout scoring (offline, via the engine's real solve) ---- */
 static float score_mean[3], score_worst[3];      /* [DBAP, SPCAP, VBAP] rE localization error (deg) */
 static float score_spread[3];                    /* mean perceived spread (deg): Frank 2013's 186.4·(1−|rE|)+10.7 */
+static float score_bed_mean, score_bed_worst, score_bed_spread;   /* the AMBI-bed row */
+/* The bed row evaluates the decode the INSTALL ships: bwa_desc.bed_decoder (AllRAD default, EPAD
+ * opt-in) and bwa_set_max_re. Scoring a different decoder than the rig runs would grade the wrong
+ * render - same trap class as scoring only at the sweet spot. CLI: `epad` / `maxre` tokens. */
+static int bed_decoder = 0;    /* bwa_bed_decoder: 0 = AllRAD, 1 = EPAD */
+static int bed_max_re  = 0;
 static int   scored, score_stale, last_score_frame;   /* the per-panner scoreboard auto-refreshes on a throttle */
 
 /* SOLVE position vs EVALUATION position — the distinction this scoring turns on.
@@ -519,9 +525,63 @@ static void score_panner(bwa_panner panner, int stride, int tracked,
             sumerr += err; if (err > worst) worst = err; ++cnt;
         }
     }
-    *mean_deg = cnt ? (float)(sumerr / cnt) : 0.f;
-    *worst_deg = worst;
-    if (spread_deg) *spread_deg = cnt ? (float)(sumspread / cnt) : 0.f;
+    /* an EMPTY evaluation (a band/azi shell so narrow the stride skips every direction, or a layout
+     * with no energy anywhere) must read as PESSIMAL, not perfect — a 0 here would send the
+     * optimizer hunting for shells it cannot see */
+    *mean_deg  = cnt ? (float)(sumerr / cnt) : 90.f;
+    *worst_deg = cnt ? worst : 180.f;
+    if (spread_deg) *spread_deg = cnt ? (float)(sumspread / cnt) : 197.1f;
+}
+
+/* ---- bed (ambisonic) scoring: what DIFFUSE/bed content wants from the layout ----
+ * A bed decodes SH->speakers through a layout-FIXED matrix (AllRAD, the engine default; via
+ * bwa_bed_gains_batch = the engine's actual build), so it is fixed-solve by construction and there
+ * is no tracked variant. Content is plane waves at infinity: the target direction is the WORLD
+ * direction from every listener, not a positioned source. A layout that scores well here is a good
+ * quadrature of the sphere - a property the point-source panners cannot see (they want coverage/
+ * triangulation; a bed wants uniformity). Shares the condition shell (band/azi) and observer model. */
+static void score_bed(int stride, float* mean_deg, float* worst_deg, float* spread_deg) {
+    static float gains[NCOV * NSPK], dirs[NCOV * 3];
+    float pos[NSPK * 3];
+    for (int i = 0; i < g_nspk; ++i) { pos[i*3] = spk[i].pos.x; pos[i*3+1] = spk[i].pos.y; pos[i*3+2] = spk[i].pos.z; }
+    if (stride < 1) stride = 1;
+    float band_sin = (shell_band_deg > 0.0f) ? sinf(shell_band_deg * DEG2RAD) : 2.0f;
+    float azi_rad  = shell_azi_deg * DEG2RAD;
+    int nd = 0;
+    for (int i = 0; i < NCOV; i += stride) {
+        if (fabsf(cov_dir[i].y) > band_sin) continue;
+        if (azi_rad > 0.0f && fabsf(atan2f(cov_dir[i].x, cov_dir[i].z)) > azi_rad) continue;
+        dirs[nd*3] = cov_dir[i].x; dirs[nd*3+1] = cov_dir[i].y; dirs[nd*3+2] = cov_dir[i].z;
+        ++nd;
+    }
+    bwa_bed_gains_batch((bwa_bed_decoder)bed_decoder, bed_max_re != 0,
+                        pos, (uint32_t)g_nspk, dirs, (uint32_t)nd, gains);
+    double sumerr = 0, sumspread = 0; float worst = 0; int cnt = 0;
+    for (int l = 0; l < (score_fixed_obs ? 1 : 27); ++l) {
+        Vector3 Lp = cov_lis[l]; Lp.y += obs_height;
+        for (int j = 0; j < nd; ++j) {
+            float* g = &gains[j * g_nspk];
+            float rE[3] = { 0, 0, 0 }, esum = 0;
+            for (int s = 0; s < g_nspk; ++s) {
+                float w2 = g[s] * g[s];
+                Vector3 sd = Vector3Normalize(Vector3Subtract(spk[s].pos, Lp));
+                rE[0] += w2 * sd.x; rE[1] += w2 * sd.y; rE[2] += w2 * sd.z;
+                esum  += w2;
+            }
+            float rl = sqrtf(rE[0]*rE[0] + rE[1]*rE[1] + rE[2]*rE[2]);
+            if (rl < 1e-9f || esum < 1e-12f) continue;
+            Vector3 ev  = { rE[0]/rl, rE[1]/rl, rE[2]/rl };
+            Vector3 tgt = { dirs[j*3], dirs[j*3+1], dirs[j*3+2] };   /* infinity: the same from everywhere */
+            float err = loc_err_deg(tgt, ev);
+            float re_mag = rl / esum;
+            if (re_mag > 1.f) re_mag = 1.f;
+            sumspread += 186.4 * (1.0 - re_mag) + 10.7;
+            sumerr += err; if (err > worst) worst = err; ++cnt;
+        }
+    }
+    *mean_deg  = cnt ? (float)(sumerr / cnt) : 90.f;   /* empty shell = pessimal, same as score_panner */
+    *worst_deg = cnt ? worst : 180.f;
+    if (spread_deg) *spread_deg = cnt ? (float)(sumspread / cnt) : 197.1f;
 }
 
 /* fill cov_err[] with the selected panner's per-direction rE error (deg), averaged over the observer
@@ -697,10 +757,17 @@ static float   opt_worst_wt = 0.333f;                     /* mean<->worst blend 
 static float   opt_focus_wt = 0.0f;                       /* deg-of-spread per deg-of-error trade; 0 = direction only */
 static Vector3 opt_anchor[NSPK];                          /* speaker positions captured when optimization started */
 
+static float opt_bed_wt = 0.0f;            /* weight of the AMBI-bed decode error in the cost (0 = point sources only) */
+
 static float opt_cost_of(bwa_panner p) {   /* coarse; + a penalty per speaker in a projector shadow so the climb clears them */
     float m, w, sp; score_panner(p, 4, panner_tracked(p), &m, &w, &sp);
     int occ = 0; for (int i = 0; i < g_nspk; ++i) if (!los_clear(spk[i].pos)) ++occ;
-    return 2.0f * ((1.0f - opt_worst_wt) * m + opt_worst_wt * w) + opt_focus_wt * sp + 25.0f * (float)occ;
+    float c = 2.0f * ((1.0f - opt_worst_wt) * m + opt_worst_wt * w) + opt_focus_wt * sp + 25.0f * (float)occ;
+    if (opt_bed_wt > 0.0f) {               /* what the ambisonic beds want, same mean/worst blend */
+        float bm, bw, bs; score_bed(4, &bm, &bw, &bs);
+        c += opt_bed_wt * 2.0f * ((1.0f - opt_worst_wt) * bm + opt_worst_wt * bw);
+    }
+    return c;
 }
 static float frand(void) { return (float)rand() / ((float)RAND_MAX + 1.0f); }
 
@@ -771,8 +838,13 @@ static void optimize_step(bwa_panner p, int trials) {
         float d = c - opt_cost;
         int ok = d < -1e-4f;
         if (!ok && opt_sa_t > 1e-3f && frand() < expf(-d / opt_sa_t)) ok = 1;   /* Metropolis: sometimes uphill */
-        if (ok && opt_guard_panner >= 0)           /* the guard vetoes moves that trade its panner away */
+        if (ok && opt_guard_panner >= 0) {         /* the guard vetoes moves that trade its panner away.
+                                                    * It protects the PANNER alone: the bed term is layout-
+                                                    * global and would contaminate the guard's meaning. */
+            float bw_save = opt_bed_wt; opt_bed_wt = 0.0f;
             ok = opt_cost_of((bwa_panner)opt_guard_panner) <= opt_guard_base + opt_guard_tol;
+            opt_bed_wt = bw_save;
+        }
         if (ok) {
             opt_cost = c; opt_stall = 0;
             if (c < opt_best_cost) {               /* best-so-far: the layout a run actually ships */
@@ -852,6 +924,7 @@ static void do_score(void) {
     for (int p = 0; p < 3; ++p)
         score_panner((bwa_panner)p, 1, panner_tracked((bwa_panner)p),
                      &score_mean[p], &score_worst[p], &score_spread[p]);
+    score_bed(1, &score_bed_mean, &score_bed_worst, &score_bed_spread);
     scored = 1; score_stale = 0;
 }
 static void set_optimizing(int on) {
@@ -868,7 +941,11 @@ static void set_optimizing(int on) {
         opt_sa_t = opt_sa ? SA_T0 : 0.0f;
         opt_best_cost = opt_cost;
         for (int i = 0; i < g_nspk; ++i) { opt_anchor[i] = spk[i].pos; opt_best_pos[i] = spk[i].pos; }
-        if (opt_guard_panner >= 0) opt_guard_base = opt_cost_of((bwa_panner)opt_guard_panner);
+        if (opt_guard_panner >= 0) {               /* bed-term-free, matching the veto's evaluation */
+            float bw_save = opt_bed_wt; opt_bed_wt = 0.0f;
+            opt_guard_base = opt_cost_of((bwa_panner)opt_guard_panner);
+            opt_bed_wt = bw_save;
+        }
     }
     if (!on && opt_running && opt_best_cost < opt_cost - 1e-4f) {
         /* an annealed walk can stop above the best it saw; ship the best, always */
@@ -1240,6 +1317,11 @@ static void draw_hud(float cov_worst, float cov_mean) {
         ImGui::TextColored(ImVec4(0.59f, 0.78f, 0.94f, 1),
                            "focus - Frank spread deg (lower = sharper):   DBAP %.0f    SPCAP %.0f    VBAP %.0f",
                            score_spread[0], score_spread[1], score_spread[2]);
+        ImGui::TextColored(ImVec4(0.73f, 0.66f, 0.92f, 1),
+                           "AMBI bed (%s%s):   rE err %.0f/%.0f deg   spread %.0f deg%s",
+                           bed_decoder ? "EPAD" : "AllRAD", bed_max_re ? ", max-rE" : "",
+                           score_bed_mean, score_bed_worst, score_bed_spread,
+                           opt_bed_wt > 0 ? "   (in the cost)" : "");
     }
     if (coverage_on && !preview) {
         const char* obs = coverage_moving ? "moving" : "fixed";
@@ -1435,6 +1517,26 @@ static void draw_panel(void) {
     bwTip("adds the mean perceived source width (Frank 2013: ~186\xC2\xB0\xC2\xB7(1-|rE|)+11\xC2\xB0) to the cost - "
           "an accurate but DEFOCUSED image scores 0\xC2\xB0 direction error, this is the axis that sees it; "
           "0 = direction only, 1 = a degree of spread costs a degree of error");
+    if (ImGui::SliderFloat("bed wt", &opt_bed_wt, 0.0f, 2.0f, "%.2f") && opt_running)
+        opt_cost = opt_cost_of((bwa_panner)pv_panner);
+    bwTip("adds the AMBISONIC BED's decode error to the cost (plane waves at infinity, via the "
+          "engine's real build). Bed content wants a good spherical QUADRATURE - uniformity the "
+          "point-source score cannot see; 0 = point sources only, 1 = the bed's mean/worst blend "
+          "counts as much as the panner's. The scoreboard's AMBI row shows it either way");
+    { int bd = bed_decoder;
+      if (ImGui::Combo("bed decode", &bd, "AllRAD\0EPAD\0")) {
+          bed_decoder = bd; mark_score();
+          if (opt_running && opt_bed_wt > 0.0f) opt_cost = opt_cost_of((bwa_panner)pv_panner);
+      } }
+    bwTip("which SH->speaker decode the AMBI row (and bed wt) evaluates - match your install's "
+          "bwa_desc.bed_decoder, or you grade a render the rig never runs");
+    ImGui::SameLine();
+    { bool mr = bed_max_re != 0;
+      if (ImGui::Checkbox("max-rE", &mr)) {
+          bed_max_re = mr; mark_score();
+          if (opt_running && opt_bed_wt > 0.0f) opt_cost = opt_cost_of((bwa_panner)pv_panner);
+      } }
+    bwTip("apply max-rE weighting before the decode, matching bwa_set_max_re on the rig");
     if (ImGui::SliderFloat("obs ear y", &obs_height, 0.0f, 2.0f, "%.2f m")) mark_score();
     bwTip("listener EAR height above the floor - scoring, coverage, and the sightline checks all measure from here");
     if (CheckboxInt("perceptual (az>el)", &perceptual)) mark_score();   /* weight azimuth >> elevation */
@@ -1657,6 +1759,40 @@ static void register_tests(ImGuiTestEngine* te) {
                                          if (bad_pos[i].y > yhi) yhi = bad_pos[i].y; }
         IM_CHECK_GT(yhi - ylo, 0.9f);
         bad_metric = save_metric;
+    };
+
+    /* The bed row goes through the engine's REAL AllRAD build (bwa_bed_gains_batch): sane scores on
+     * the dome, the batch API's contract, and the bed term lands in the optimizer cost when weighted. */
+    t = IM_REGISTER_TEST(te, "logic", "bed_score");
+    t->TestFunc = [](ImGuiTestContext*) {
+        seed_default(); layout_dirty = 1;
+        float bm = -1, bw = -1, bs = -1;
+        score_bed(2, &bm, &bw, &bs);
+        IM_CHECK_GT(bm, 0.0f);
+        IM_CHECK_LT(bm, 90.0f);
+        IM_CHECK_GE(bw, bm);
+        IM_CHECK_GT(bs, 10.0f);                                  /* Frank spread bounds */
+        IM_CHECK_LT(bs, 197.2f);
+        float pos[NSPK * 3], g1[NSPK], d1[3] = { 0, 0, 1 };      /* the batch API directly: one plane wave */
+        for (int i = 0; i < g_nspk; ++i) { pos[i*3]=spk[i].pos.x; pos[i*3+1]=spk[i].pos.y; pos[i*3+2]=spk[i].pos.z; }
+        IM_CHECK_EQ(bwa_bed_gains_batch(BWA_DECODE_ALLRAD, false, pos, (uint32_t)g_nspk, d1, 1, g1), 1u);
+        float esum = 0; for (int s = 0; s < g_nspk; ++s) esum += g1[s] * g1[s];
+        IM_CHECK_GT(esum, 1e-6f);                                /* the decode carries energy */
+        const float saveW = opt_worst_wt, saveF = opt_focus_wt, saveB = opt_bed_wt;
+        float m, w2, sp; score_panner(BWA_PAN_DBAP, 4, 1, &m, &w2, &sp);
+        float bm4, bw4; score_bed(4, &bm4, &bw4, NULL);
+        opt_worst_wt = 0.0f; opt_focus_wt = 0.0f; opt_bed_wt = 1.0f;   /* cost = 2*mean + 2*bed_mean */
+        IM_CHECK_LT(fabsf(opt_cost_of(BWA_PAN_DBAP) - (2.0f * m + 2.0f * bm4)), 0.75f);
+        opt_worst_wt = saveW; opt_focus_wt = saveF; opt_bed_wt = saveB;
+        bed_decoder = 1; bed_max_re = 1;                         /* the EPAD + max-rE grading path */
+        float em, ew, es;
+        score_bed(2, &em, &ew, &es);
+        IM_CHECK_GT(em, 0.0f);
+        IM_CHECK_LT(em, 90.0f);
+        IM_CHECK_GE(ew, em);
+        IM_CHECK_GT(es, 10.0f);
+        IM_CHECK_LT(es, 197.2f);
+        bed_decoder = 0; bed_max_re = 0;
     };
 
     t = IM_REGISTER_TEST(te, "logic", "score");                  /* the real engine solve scores the default dome sanely */
@@ -2018,13 +2154,14 @@ int main(int argc, char** argv) {
                    "  edit a speaker layout in 3D (default file: ./cave_layout.json;\n"
                    "  ./constraints.json bounds the placement if present)\n"
                    "  --export   [file]                    write the layout headless\n"
-                   "  --score    [file] [condition] [fixed|moving] [ears=<m>]\n"
+                   "  --score    [file] [condition] [fixed|moving] [ears=<m>] [epad|allrad] [maxre]\n"
                    "             print each panner's rE-localization error, under a named condition\n"
                    "             if given (3d, horizontal, visual); 'fixed' scores the sweet spot only\n"
                    "             (a seated install) instead of the moving-listener grid; ears=<m>\n"
-                   "             sets the listener ear height (the plane; default 1.4)\n"
+                   "             sets the listener ear height (the plane; default 1.4); epad/maxre\n"
+                   "             grade the AMBI row with the decode the install ships\n"
                    "  --optimize [file] [dbap|spcap|vbap] [stages] [fixed|moving] [ears=<m>] [radial]\n"
-                   "             [guard=<panner>[:tol]] [anneal] [restarts=<n>] [leash=<m>]\n"
+                   "             [guard=<panner>[:tol]] [anneal] [restarts=<n>] [leash=<m>] [bed=<wt>]\n"
                    "             hill-climb within constraints, save in place; stages = a comma-\n"
                    "             separated chain of conditions (3d, horizontal, visual), each stage\n"
                    "             seeding the next - horizontal,3d optimizes the plane first, then 3D;\n"
@@ -2037,7 +2174,10 @@ int main(int argc, char** argv) {
                    "             uphill moves early (escapes local basins), restarts=<n> re-climbs\n"
                    "             from the best + a kick; both always ship the best layout seen;\n"
                    "             leash=<m> caps each speaker's move from the stage start,\n"
-                   "             overriding the condition's own leash\n"
+                   "             overriding the condition's own leash; bed=<wt> weighs the ambisonic\n"
+                   "             BED's decode error into the cost (what diffuse content wants;\n"
+                   "             --score prints its row either way); epad/allrad + maxre pick the\n"
+                   "             bed decode graded, matching the install\n"
                    "  --tests    [filter]                  run the UI test suite and exit pass/fail\n");
             return 0;
         }
@@ -2091,9 +2231,12 @@ int main(int argc, char** argv) {
     if (score_only) {                              /* headless: score the layout for each panner + exit,
                                                     * optionally under a named condition (argv[3]) */
         int ci = -1, ears_set = 0;
-        for (int a = 3; a < argc && a < 7; ++a) {
+        for (int a = 3; a < argc && a < 9; ++a) {
             if      (!strcmp(argv[a], "fixed"))  score_fixed_obs = 1;   /* seated install: sweet spot only */
             else if (!strcmp(argv[a], "moving")) score_fixed_obs = 0;
+            else if (!strcmp(argv[a], "epad"))   bed_decoder = 1;       /* grade the decode the install ships */
+            else if (!strcmp(argv[a], "allrad")) bed_decoder = 0;
+            else if (!strcmp(argv[a], "maxre"))  bed_max_re = 1;
             else if (!strncmp(argv[a], "ears=", 5)) {
                 obs_height = (float)atof(argv[a] + 5);                  /* the plane / scoring / alignment height */
                 if (!(obs_height > 0.0f && obs_height <= 3.0f)) { printf("score: ears=%s out of range (0..3 m)\n", argv[a] + 5); return 1; }
@@ -2104,7 +2247,7 @@ int main(int argc, char** argv) {
                 if (ci < 0) {
                     printf("score: unknown condition '%s' (have:", argv[a]);
                     for (int i = 0; i < NCONDITIONS; ++i) printf(" %s", opt_conditions[i].name);
-                    printf(" fixed moving ears=<m>)\n");
+                    printf(" fixed moving ears=<m> epad allrad maxre)\n");
                     return 1;
                 }
             }
@@ -2126,6 +2269,10 @@ int main(int argc, char** argv) {
             printf("  %-14s rE-localize error:  mean %4.1f deg   worst %4.1f deg   focus (Frank spread) %4.1f deg\n",
                    panner_names[p], m, w, sp);
         }
+        { float bm, bw, bs; score_bed(1, &bm, &bw, &bs);       /* what bed content gets from this array */
+          char lbl[24]; snprintf(lbl, sizeof lbl, "AMBI (%s)", bed_decoder ? "EPAD" : "AllRAD");
+          printf("  %-14s rE-localize error:  mean %4.1f deg   worst %4.1f deg   focus (Frank spread) %4.1f deg%s\n",
+                 lbl, bm, bw, bs, bed_max_re ? "   [max-rE]" : ""); }
         return 0;
     }
     if (optimize_only) {                           /* headless: optimize in place for one panner + save.
@@ -2136,8 +2283,8 @@ int main(int argc, char** argv) {
         int stages[8], nstages = 0;
         int ears_set = 0;
         float cli_leash = -1.0f;                   /* >0 = override every stage's condition leash */
-        for (int a = 3; a < argc && a < 12; ++a) { /* panner, stages, observer, ears, radial, guard, anneal,
-                                                    * restarts, leash: any order */
+        for (int a = 3; a < argc && a < 15; ++a) { /* panner, stages, observer, ears, radial, guard, anneal,
+                                                    * restarts, leash, bed, epad/allrad, maxre: any order */
             if      (!strcmp(argv[a], "dbap"))  p = BWA_PAN_DBAP;
             else if (!strcmp(argv[a], "spcap")) p = BWA_PAN_SPCAP;
             else if (!strcmp(argv[a], "vbap"))  p = BWA_PAN_VBAP;
@@ -2168,6 +2315,13 @@ int main(int argc, char** argv) {
                 cli_leash = (float)atof(argv[a] + 6);
                 if (!(cli_leash >= 0.05f && cli_leash <= 10.0f)) { printf("optimize: leash=%s out of range (0.05..10 m)\n", argv[a] + 6); return 1; }
             }
+            else if (!strncmp(argv[a], "bed=", 4)) {                    /* weight the AMBI-bed decode into the cost */
+                opt_bed_wt = (float)atof(argv[a] + 4);
+                if (!(opt_bed_wt >= 0.0f && opt_bed_wt <= 10.0f)) { printf("optimize: bed=%s out of range (0..10)\n", argv[a] + 4); return 1; }
+            }
+            else if (!strcmp(argv[a], "epad"))   bed_decoder = 1;       /* grade the decode the install ships */
+            else if (!strcmp(argv[a], "allrad")) bed_decoder = 0;
+            else if (!strcmp(argv[a], "maxre"))  bed_max_re = 1;
             else {
                 char buf[128]; snprintf(buf, sizeof buf, "%s", argv[a]);
                 for (char* tok = strtok(buf, ","); tok; tok = strtok(NULL, ",")) {
@@ -2187,6 +2341,9 @@ int main(int argc, char** argv) {
         if (ears_set) printf("  ears: %.2f m (the plane, scoring, and delay-alignment height)\n", obs_height);
         if (opt_sa || opt_restarts > 1)
             printf("  search: %s, %d restart(s), best-so-far kept\n", opt_sa ? "annealed" : "greedy", opt_restarts);
+        if (opt_bed_wt > 0.0f || bed_decoder || bed_max_re)
+            printf("  bed: %s%s decode, weight %.2f in the objective\n",
+                   bed_decoder ? "EPAD" : "AllRAD", bed_max_re ? " + max-rE" : "", opt_bed_wt);
         { int np = 0; for (int i = 0; i < g_nspk; ++i) np += spk[i].pin;
           if (np) printf("  pins: %d speaker(s) held to the ear plane (slab +-%.2f m)\n", np, pin_slab_m); }
         apply_condition(last, p);                  /* before/after report under the objective the result ships against */
@@ -2196,14 +2353,18 @@ int main(int argc, char** argv) {
             const OptCondition* c = &opt_conditions[stages[s]];
             apply_condition(stages[s], p);
             if (cli_leash > 0.0f) opt_leash = cli_leash;   /* an explicit leash beats the condition's */
-            float sm0, sw0; score_panner(p, 1, panner_tracked(p), &sm0, &sw0, NULL);
             for (int i = 0; i < g_nspk; ++i)       /* start feasible: pins and room constraints alike (a generated
                                                     * or hand-edited file may violate either; trials are projected,
-                                                    * the incoming layout must be too) */
+                                                    * the incoming layout must be too). BEFORE the before-score, so
+                                                    * the stage report and the guard baseline measure the same state */
                 spk[i].pos = constraint_project(pin_project(spk[i].pos, spk[i].pin));
+            float sm0, sw0; score_panner(p, 1, panner_tracked(p), &sm0, &sw0, NULL);
             float gm0 = 0, gw0 = 0;
-            if (opt_guard_panner >= 0) {           /* the guard baseline: where this stage must not slip from */
+            if (opt_guard_panner >= 0) {           /* the guard baseline: where this stage must not slip from
+                                                    * (bed-term-free, matching the veto's evaluation) */
+                float bw_save = opt_bed_wt; opt_bed_wt = 0.0f;
                 opt_guard_base = opt_cost_of((bwa_panner)opt_guard_panner);
+                opt_bed_wt = bw_save;
                 score_panner((bwa_panner)opt_guard_panner, 1, panner_tracked((bwa_panner)opt_guard_panner), &gm0, &gw0, NULL);
             }
             opt_iter = 0;
@@ -2245,6 +2406,12 @@ int main(int argc, char** argv) {
                 score_panner((bwa_panner)opt_guard_panner, 1, panner_tracked((bwa_panner)opt_guard_panner), &gm1, &gw1, NULL);
                 printf("    guard %-5s (tol %.2f):  mean %.1f -> %.1f deg   worst %.1f -> %.1f deg\n",
                        panner_names[opt_guard_panner], opt_guard_tol, gm0, gm1, gw0, gw1);
+            }
+            if (opt_bed_wt > 0.0f) {
+                float bm1, bw1;
+                score_bed(1, &bm1, &bw1, NULL);
+                printf("    bed (wt %.2f):  mean %.1f deg   worst %.1f deg  (after this stage)\n",
+                       opt_bed_wt, bm1, bw1);
             }
             char bandtxt[48];
             if      (c->band_deg > 0 && c->azi_deg > 0)

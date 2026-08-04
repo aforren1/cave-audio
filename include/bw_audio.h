@@ -907,6 +907,19 @@ BWA_API void     bwa_set_tracked_room_eq(bwa_engine* e, bool on);
 BWA_API uint32_t bwa_panner_gains_batch(bwa_panner panner, const float* positions, uint32_t n,
                                       const float lis[3], const float* srcs, uint32_t nsrc, float* out);
 
+/* The BED counterpart: the per-speaker gains the diffuse-bed decode produces for `ndir` plane-wave
+ * DIRECTIONS (`dirs` = ndir*3 unit vectors, room space; a bed is content at infinity, so directions,
+ * not positions), over a layout of `n` speaker positions. Builds the same SH->speaker decode the
+ * engine builds for this layout — AllRAD or EPAD per `decoder`, the sampling decode as the automatic
+ * degenerate fallback — encodes each direction (3rd order ACN/SN3D), applies max-rE weighting when
+ * `max_re`, and multiplies through. Writes out[i*n + s] (ndir*n floats; gains may be negative — SH
+ * sidelobes); returns ndir. Pure and reentrant, same as the panner batch. A layout that scores well
+ * here is a good QUADRATURE for the sphere, which is what ambisonic content wants from an array and
+ * what the point-source panners cannot see. */
+BWA_API uint32_t bwa_bed_gains_batch(bwa_bed_decoder decoder, bool max_re,
+                                     const float* positions, uint32_t n,
+                                     const float* dirs, uint32_t ndir, float* out);
+
 /* ---- listener (control thread; skip when a tracker is connected) ---- */
 /* Position in room space. Quaternion is head orientation; used by the headphone
  * renders only — the array render ignores orientation (real speakers, real ears).

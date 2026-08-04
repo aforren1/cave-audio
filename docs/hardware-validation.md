@@ -333,6 +333,13 @@ The checks with no assertion—bring ears you trust.
       max-rE…). N trials, one-sided binomial p-value: a knob that isn't distinguishable on
       the rig is a knob to retire. (A fixed-seat install and a roaming one need not pick
       the same winners; judge per install type, not once for all.)
+      **Strong prior for the max-rE trial**: the layout tool's bed metric
+      (`--score <layout> [epad] maxre`, 2026-08-04) has max-rE winning every axis on this
+      array under both decoders and both observer models, including AT the sweet spot,
+      where classical theory says plain decode should win. An irregular 26-array's decode
+      sidelobes bend rE even at centre; the taper suppresses them. If the rig agrees,
+      `bwa_set_max_re` defaulting to OFF is the wrong default and should flip. EPAD is
+      worst without the taper and best with it: bake off decoder and taper as PAIRS.
 - [ ] **Tracked room EQ** (if the install wants it): one `bwa_calibrate --room-eq-grid
       --mic x y z` run per mic placement, ~0.5–1 m spacing over the working area at ear
       height. Then walk the room A/B-ing `bwa_set_tracked_room_eq`; LF evenness should

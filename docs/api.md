@@ -39,7 +39,8 @@ walks disk streaming + push sources. All three are console programs built every 
 - Tracking: OptiTrack/NatNet ingested in-process; the audio thread samples the
   freshest head pose at block time.
 - Diagnostics: per-channel test tone, output-level and listener-pose readbacks,
-  offline panner evaluation for layout tools.
+  offline panner and bed-decode evaluation for layout tools
+  (`bwa_panner_gains_batch`, `bwa_bed_gains_batch`).
 
 ## Quickstart
 

@@ -13,6 +13,9 @@
 #include "dbap.h"          /* offline panner evaluation (bwa_panner_gains_batch) */
 #include "spcap.h"
 #include "vbap.h"
+#include "ambisonics.h"    /* offline bed evaluation (bwa_bed_gains_batch) */
+#include "allrad.h"
+#include "epad.h"
 #include "binaural.h"
 #include "natnet.h"
 #include "steam_decode.h"   /* phonon-free interfaces; impls linked only when BWA_HAVE_STEAMAUDIO */
@@ -984,6 +987,45 @@ uint32_t bwa_panner_gains_batch(bwa_panner panner, const float* positions, uint3
         else                            dbap_gains(src, lis, &L, 1.0f, o);
     }
     return nsrc;
+}
+
+/* Offline: the bed decode's per-speaker gains for `ndir` plane-wave directions over a layout of `n`
+ * speaker positions. Same builds the engine runs at load (allrad.c / epad.c, SAD on a degenerate
+ * layout), same encode (ambi_encode_sn3d) and max-rE weights the render applies — so a tool scores
+ * the layout against the ACTUAL diffuse-bed render, not a copy. Pure; see the header contract. */
+uint32_t bwa_bed_gains_batch(bwa_bed_decoder decoder, bool max_re,
+                             const float* positions, uint32_t n,
+                             const float* dirs, uint32_t ndir, float* out) {
+    if (!positions || !dirs || !out || n == 0 || n > BWA_CHANNELS || ndir == 0) return 0;
+    Layout L = layout_default();
+    L.count = n;
+    for (uint32_t s = 0; s < n; ++s) {
+        L.speakers[s].pos[0] = positions[s*3+0];
+        L.speakers[s].pos[1] = positions[s*3+1];
+        L.speakers[s].pos[2] = positions[s*3+2];
+        L.speakers[s].gain_lin = 1.0f;
+        L.speakers[s].delay_samples = 0;
+    }
+    layout_compute_ref(&L);          /* the decode aims from the array centroid, like the engine's */
+    float dec[BWA_CHANNELS][BWA_AMBI_CH];                        /* ~1.6 KB stack; keeps the call pure */
+    int ok = (decoder == BWA_DECODE_EPAD) ? epad_build_decode(&L, dec)
+                                          : allrad_build_decode(&L, dec);
+    if (!ok) ambi_sad_decode(&L, n, dec);                        /* the engine's own degenerate fallback */
+    float w[BWA_AMBI_CH];
+    if (max_re) ambi_max_re_weights(BWA_AMBI_ORDER, w);
+    for (uint32_t i = 0; i < ndir; ++i) {
+        float a[3], y[BWA_AMBI_CH];
+        room_to_ambi(&dirs[(size_t)i * 3], a);
+        ambi_encode_sn3d(a, y);
+        if (max_re) for (int k = 0; k < BWA_AMBI_CH; ++k) y[k] *= w[k];
+        float* o = &out[(size_t)i * n];
+        for (uint32_t s = 0; s < n; ++s) {
+            float acc = 0.f;
+            for (int k = 0; k < BWA_AMBI_CH; ++k) acc += dec[s][k] * y[k];
+            o[s] = acc;
+        }
+    }
+    return ndir;
 }
 uint32_t bwa_get_speakers(bwa_engine* e, float* xyz, uint32_t cap) {
     if (!e) return 0;

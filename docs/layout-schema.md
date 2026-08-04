@@ -180,6 +180,45 @@ or a 120k-iteration cap, and the GUI climb now stops itself at the same floor,
 restores the best layout, and says so in the HUD; pressing **O** again re-climbs
 from there with a fresh step schedule.
 
+Point sources are not the only consumer of the array: ambisonic **beds** decode
+SH to the speakers through a layout-fixed AllRAD matrix, and what a bed wants is a
+good *quadrature* of the sphere (uniformity), which the panner scores cannot see.
+The scoreboard and `--score` carry an **AMBI (AllRAD)** row: plane waves at
+infinity through the engine's real decode build (`bwa_bed_gains_batch`), evaluated
+over the same shell, condition, and observer model. To *optimize* for it too, pass
+`bed=<wt>` (or the GUI's `bed wt` slider): the bed's mean/worst blend joins the
+cost at that weight. 0 keeps the historical point-source-only objective. The row
+grades AllRAD without max-rE by default (the engine defaults); an install that
+ships EPAD or `bwa_set_max_re` passes `epad` / `maxre` (GUI: the bed decode combo
+and max-rE checkbox) so the score matches the render, not a sibling of it.
+
+Measured on the dome: point-source optimization already does most of the bed's
+work for free (bed 23.9°/126.8° at the seed, 17.0°/54.0° after a plain DBAP
+climb), and a naive `bed=1` co-optimization trades badly (2° of bed mean for 17°
+of DBAP worst). The recipe that works is the guard again: from the DBAP optimum,
+`--optimize L.json dbap 3d bed=3 guard=dbap` reached the best bed mean measured
+(14.1°) while DBAP actually improved to 4.8°/24.6°. The guard evaluates the
+panner alone (the bed term is excluded from it by design), so "best bed, don't
+let DBAP slip" means exactly that.
+
+Putting the whole session of evidence together, the full multi-consumer pipeline
+is one command per consumer, each stage climbing its own objective inside the
+previous winners' feasible set (the file carries the state):
+
+```
+bwa_layout_tool --optimize L.json dbap 3d                          # 1. the production panner
+bwa_layout_tool --optimize L.json vbap 3d guard=dbap               # 2. best VBAP that keeps DBAP
+bwa_layout_tool --optimize L.json vbap 3d bed=3 guard=dbap maxre   # 3. the bed, VBAP in the cost
+bwa_layout_tool --score L.json maxre                               # verify all four rows
+```
+
+Compose with the rest as the install demands: pins plus `horizontal,3d` stages in
+step 1 for a planar requirement, `constraints.json` in the working directory for
+the real room, `ears=<m>` for the install's height, `epad` if it ships EPAD,
+`anneal restarts=<n>` on a stage whose seed underperforms. The guard is single,
+so the production panner holds it throughout; the middle consumer is protected
+softly by staying in the later stages' objective.
+
 `--optimize` also takes `leash=<m>`, capping each speaker's displacement from the
 stage start and overriding the active condition's own leash. The room constraints
 do not make it redundant: the feasible shell between the CAVE screens and the room

@@ -47,6 +47,14 @@ previous result and reporting before/after scores plus ear-plane occupancy.
   (previously GUI-only), and every optimize start projects the incoming layout into
   the room constraints and pin slabs, so an infeasible generated file starts
   feasible instead of leaking through a run.
+- New ABI: **`bwa_bed_gains_batch`**, the bed counterpart of `bwa_panner_gains_batch`:
+  the per-speaker gains the diffuse-bed decode (AllRAD/EPAD, optional max-rE, the
+  engine's real builds) produces for plane-wave directions over a candidate layout.
+  The layout tool uses it for an **AMBI** scoreboard/--score row and a
+  `bed=<wt>` objective term, so a layout can be optimized for what ambisonic
+  content wants (spherical uniformity), not only for the point-source panners.
+  `epad` / `allrad` / `maxre` tokens (GUI: bed decode combo + max-rE checkbox)
+  grade the decode the install actually ships.
 - The measured tradeoffs live in docs/layout-schema.md (pin-count trend, the
   visual-wedge verdict per panner, the leash-matching caveat). Headline: narrow
   conditions express requirements, they are not accuracy shortcuts; DBAP gained

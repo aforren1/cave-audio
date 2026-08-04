@@ -510,6 +510,46 @@ done:
     return rc;
 }
 
+/* bwa_bed_gains_batch (the public offline bed evaluation, no engine handle): drives the REAL
+ * AllRAD/EPAD builds over a caller layout. A cube layout's gains for an upward plane wave must
+ * carry energy and favor the upper speakers; a clustered (hull-degenerate) layout must still
+ * decode finitely via the sampling fallback rather than fail. */
+static int run_bed_batch(void) {
+    float pos[8 * 3]; int k = 0;
+    for (int ix = -1; ix <= 1; ix += 2)               /* a 2 m cube of speakers about (0, 1.4, 0) */
+        for (int iy = -1; iy <= 1; iy += 2)
+            for (int iz = -1; iz <= 1; iz += 2) {
+                pos[k*3] = (float)ix; pos[k*3+1] = 1.4f + (float)iy; pos[k*3+2] = (float)iz; ++k;
+            }
+    float g[8];
+    const float up[3] = { 0.f, 1.f, 0.f };            /* room axes: straight up */
+    if (bwa_bed_gains_batch(BWA_DECODE_ALLRAD, false, pos, 8, up, 1, g) != 1u) {
+        fprintf(stderr, "FAIL[bed]: AllRAD batch did not return ndir\n"); return 1; }
+    float e = 0.f, e_up = 0.f; int fin = 1;
+    for (int s = 0; s < 8; ++s) {
+        fin &= isfinite(g[s]) ? 1 : 0;
+        e += g[s] * g[s];
+        if (pos[s*3+1] > 1.4f) e_up += g[s] * g[s];
+    }
+    if (!fin || e <= 1e-6f) { fprintf(stderr, "FAIL[bed]: AllRAD gains empty or non-finite\n"); return 1; }
+    if (e_up <= 0.5f * e)   { fprintf(stderr, "FAIL[bed]: an upward wave must favor the upper speakers\n"); return 1; }
+    if (bwa_bed_gains_batch(BWA_DECODE_EPAD, true, pos, 8, up, 1, g) != 1u) {
+        fprintf(stderr, "FAIL[bed]: EPAD + max-rE batch did not return ndir\n"); return 1; }
+    e = 0.f; for (int s = 0; s < 8; ++s) e += g[s] * g[s];
+    if (e <= 1e-6f) { fprintf(stderr, "FAIL[bed]: EPAD + max-rE gains carry no energy\n"); return 1; }
+    float clus[4 * 3];                                /* all ~one direction: defeats the hull */
+    for (int s = 0; s < 4; ++s) {
+        clus[s*3] = 2.f; clus[s*3+1] = 1.4f + 0.01f * (float)s; clus[s*3+2] = 0.01f * (float)s;
+    }
+    if (bwa_bed_gains_batch(BWA_DECODE_ALLRAD, false, clus, 4, up, 1, g) != 1u) {
+        fprintf(stderr, "FAIL[bed]: degenerate layout must fall back, not fail\n"); return 1; }
+    e = 0.f; fin = 1;
+    for (int s = 0; s < 4; ++s) { fin &= isfinite(g[s]) ? 1 : 0; e += g[s] * g[s]; }
+    if (!fin || e <= 1e-9f) { fprintf(stderr, "FAIL[bed]: fallback gains empty or non-finite\n"); return 1; }
+    printf("smoke[bed] AllRAD/EPAD/max-rE batch + degenerate fallback OK\n");
+    return 0;
+}
+
 int main(void) {
     if (run_profile(BWA_PROFILE_CAVE,      "cave"))      return 1;
     if (run_profile(BWA_PROFILE_BINAURAL,  "binaural"))  return 1;
@@ -522,6 +562,7 @@ int main(void) {
     if (run_binaural_laterality(BWA_PROFILE_CAVE_SIM, "cave_sim")) return 1;   /* the array audition */
     if (run_headphone_eq())                           return 1;
     if (run_material_release())                       return 1;
-    printf("smoke OK (cave, binaural, cave_sim, cave_both lifecycles; room_eq start guard; push kind guards; binaural + cave_sim laterality; headphone EQ; material release/reuse)\n");
+    if (run_bed_batch())                              return 1;
+    printf("smoke OK (cave, binaural, cave_sim, cave_both lifecycles; room_eq start guard; push kind guards; binaural + cave_sim laterality; headphone EQ; material release/reuse; bed gains batch)\n");
     return 0;
 }
