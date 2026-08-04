@@ -135,6 +135,15 @@ working volume; a *seated* install listens from the sweet spot only, and scoring
 over the roam punishes cells it will never occupy. `--score layout.json fixed`
 evaluates (and `--optimize ... fixed` optimizes) at the sweet spot alone.
 
+The observer models do not transfer symmetrically, and the measured gap is large.
+A sweet-spot-optimized layout scored under the roam came out WORSE than the
+unoptimized dome (12.6°/82.3° vs 10.2°/75.2° for DBAP): at the sweet spot radius
+and clustering cost nothing, so the fixed objective builds geometry that parallax
+then punishes. The reverse is benign; a roam-optimized layout at the sweet spot
+(2.6°/15.6° SPCAP) sits near the dedicated seated optimum (0.9°/3.9°) because the
+sweet spot is one of the roam's own cells. Optimize `fixed` only for an install
+that is genuinely and permanently seated; never ship its result to a roaming one.
+
 `--optimize` also takes `radial`: trials move speakers only along the ray from the
 ears, so directions stay put and radii refit. This is the cross-panner pass. VBAP's
 asset is its direction structure (triangulation) and DBAP's sensitivity is distance,
@@ -218,6 +227,14 @@ the real room, `ears=<m>` for the install's height, `epad` if it ships EPAD,
 `anneal restarts=<n>` on a stage whose seed underperforms. The guard is single,
 so the production panner holds it throughout; the middle consumer is protected
 softly by staying in the later stages' objective.
+
+This pipeline's output is the SHARED-array answer: one surveyed layout, and each
+use case picks its renderer on top (tracked DBAP for a roaming session, SPCAP or
+VBAP fixed-solve for a seated one, the bed renderer for ambisonic content).
+Measured, the shared layout costs the seated user about 1.5° mean against a
+dedicated seated-only array, while a seated-only array is unusable for everyone
+else. Verify any use case's slice of the same file with
+`--score L.json [condition] [fixed|moving] [epad] [maxre]`.
 
 `--optimize` also takes `leash=<m>`, capping each speaker's displacement from the
 stage start and overriding the active condition's own leash. The room constraints
