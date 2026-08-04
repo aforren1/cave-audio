@@ -180,6 +180,18 @@ or a 120k-iteration cap, and the GUI climb now stops itself at the same floor,
 restores the best layout, and says so in the HUD; pressing **O** again re-climbs
 from there with a fresh step schedule.
 
+`--optimize` also takes `leash=<m>`, capping each speaker's displacement from the
+stage start and overriding the active condition's own leash. The room constraints
+do not make it redundant: the feasible shell between the CAVE screens and the room
+walls is thin radially but long tangentially, and the leash is what stops a speaker
+from sliding meters around the perimeter away from its surveyed, rigged position.
+Measured with the real constraints file: a 0.75 m leash scored the same as a free
+one (6.5°/42.5° vs 6.4°/41.1°) while the free run wandered speakers up to 1.4 m
+further along the truss. The tight leash is free insurance for installability.
+Every optimize start (GUI and headless) now also projects the incoming layout into
+the constraints and pin slabs, the same projection every trial gets, so a generated
+or hand-edited file cannot smuggle an infeasible position through a run.
+
 Both also take `ears=<m>`, the listener ear height above the floor (default 1.4).
 Everything plane-shaped anchors to it: the horizontal band, the pin slab, the
 scoring shell, and the delay-alignment point written on save. A seated install at

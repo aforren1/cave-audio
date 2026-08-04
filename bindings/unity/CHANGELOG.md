@@ -43,6 +43,10 @@ previous result and reporting before/after scores plus ear-plane occupancy.
 - The GUI climb now stops itself at the same step floor the headless runs use
   (it previously ran until stopped by hand), restores the best layout, and reports
   convergence in the HUD.
+- `--optimize ... leash=<m>` sets the per-stage displacement cap from the CLI
+  (previously GUI-only), and every optimize start projects the incoming layout into
+  the room constraints and pin slabs, so an infeasible generated file starts
+  feasible instead of leaking through a run.
 - The measured tradeoffs live in docs/layout-schema.md (pin-count trend, the
   visual-wedge verdict per panner, the leash-matching caveat). Headline: narrow
   conditions express requirements, they are not accuracy shortcuts; DBAP gained

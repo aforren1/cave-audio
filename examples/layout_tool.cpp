@@ -856,11 +856,14 @@ static void do_score(void) {
 }
 static void set_optimizing(int on) {
     if (on && !opt_running) {
-        /* a file-authored pin may start OUTSIDE its slab (the checkbox and K snap project, a
-         * hand-edited or generated file doesn't) — without this it only enters the slab if some
-         * trial happens to be accepted, so enforce the constraint before the climb starts */
-        for (int i = 0; i < g_nspk; ++i)
-            if (spk[i].pin) { spk[i].pos = constraint_project(pin_project(spk[i].pos, 1)); mark_edit(); }
+        /* a file-authored layout may start OUTSIDE its constraints (the checkbox and K snap
+         * project, a hand-edited or generated file doesn't) — without this a violating speaker
+         * only becomes feasible if some trial happens to be accepted, so start feasible: pins
+         * AND the room constraints, the same projection every trial gets */
+        for (int i = 0; i < g_nspk; ++i) {
+            Vector3 q = constraint_project(pin_project(spk[i].pos, spk[i].pin));
+            if (memcmp(&q, &spk[i].pos, sizeof q) != 0) { spk[i].pos = q; mark_edit(); }
+        }
         opt_cost = opt_cost_of((bwa_panner)pv_panner); opt_step = 0.30f; opt_stall = 0; opt_iter = 0;
         opt_sa_t = opt_sa ? SA_T0 : 0.0f;
         opt_best_cost = opt_cost;
@@ -2021,7 +2024,7 @@ int main(int argc, char** argv) {
                    "             (a seated install) instead of the moving-listener grid; ears=<m>\n"
                    "             sets the listener ear height (the plane; default 1.4)\n"
                    "  --optimize [file] [dbap|spcap|vbap] [stages] [fixed|moving] [ears=<m>] [radial]\n"
-                   "             [guard=<panner>[:tol]] [anneal] [restarts=<n>]\n"
+                   "             [guard=<panner>[:tol]] [anneal] [restarts=<n>] [leash=<m>]\n"
                    "             hill-climb within constraints, save in place; stages = a comma-\n"
                    "             separated chain of conditions (3d, horizontal, visual), each stage\n"
                    "             seeding the next - horizontal,3d optimizes the plane first, then 3D;\n"
@@ -2032,7 +2035,9 @@ int main(int argc, char** argv) {
                    "             rejects moves that let that panner's cost slip more than tol\n"
                    "             (default 0.5) above its value at the stage start; 'anneal' allows\n"
                    "             uphill moves early (escapes local basins), restarts=<n> re-climbs\n"
-                   "             from the best + a kick; both always ship the best layout seen\n"
+                   "             from the best + a kick; both always ship the best layout seen;\n"
+                   "             leash=<m> caps each speaker's move from the stage start,\n"
+                   "             overriding the condition's own leash\n"
                    "  --tests    [filter]                  run the UI test suite and exit pass/fail\n");
             return 0;
         }
@@ -2130,8 +2135,9 @@ int main(int argc, char** argv) {
         bwa_panner p = BWA_PAN_DBAP;
         int stages[8], nstages = 0;
         int ears_set = 0;
-        for (int a = 3; a < argc && a < 11; ++a) { /* panner, stages, observer, ears, radial, guard, anneal,
-                                                    * restarts: any order */
+        float cli_leash = -1.0f;                   /* >0 = override every stage's condition leash */
+        for (int a = 3; a < argc && a < 12; ++a) { /* panner, stages, observer, ears, radial, guard, anneal,
+                                                    * restarts, leash: any order */
             if      (!strcmp(argv[a], "dbap"))  p = BWA_PAN_DBAP;
             else if (!strcmp(argv[a], "spcap")) p = BWA_PAN_SPCAP;
             else if (!strcmp(argv[a], "vbap"))  p = BWA_PAN_VBAP;
@@ -2157,6 +2163,10 @@ int main(int argc, char** argv) {
                                                                          * delay-alignment point on save */
                 if (!(obs_height > 0.0f && obs_height <= 3.0f)) { printf("optimize: ears=%s out of range (0..3 m)\n", argv[a] + 5); return 1; }
                 ears_set = 1;
+            }
+            else if (!strncmp(argv[a], "leash=", 6)) {                  /* cap displacement from the stage anchor */
+                cli_leash = (float)atof(argv[a] + 6);
+                if (!(cli_leash >= 0.05f && cli_leash <= 10.0f)) { printf("optimize: leash=%s out of range (0.05..10 m)\n", argv[a] + 6); return 1; }
             }
             else {
                 char buf[128]; snprintf(buf, sizeof buf, "%s", argv[a]);
@@ -2185,9 +2195,12 @@ int main(int argc, char** argv) {
         for (int s = 0; s < nstages; ++s) {
             const OptCondition* c = &opt_conditions[stages[s]];
             apply_condition(stages[s], p);
+            if (cli_leash > 0.0f) opt_leash = cli_leash;   /* an explicit leash beats the condition's */
             float sm0, sw0; score_panner(p, 1, panner_tracked(p), &sm0, &sw0, NULL);
-            for (int i = 0; i < g_nspk; ++i)       /* enforce pins first: a file-authored pin may start outside its slab */
-                if (spk[i].pin) spk[i].pos = constraint_project(pin_project(spk[i].pos, 1));
+            for (int i = 0; i < g_nspk; ++i)       /* start feasible: pins and room constraints alike (a generated
+                                                    * or hand-edited file may violate either; trials are projected,
+                                                    * the incoming layout must be too) */
+                spk[i].pos = constraint_project(pin_project(spk[i].pos, spk[i].pin));
             float gm0 = 0, gw0 = 0;
             if (opt_guard_panner >= 0) {           /* the guard baseline: where this stage must not slip from */
                 opt_guard_base = opt_cost_of((bwa_panner)opt_guard_panner);
@@ -2241,7 +2254,7 @@ int main(int argc, char** argv) {
             else                      snprintf(bandtxt, sizeof bandtxt, "full sphere");
             printf("  stage %-10s (%s, leash %.1f m%s):  mean %.1f -> %.1f deg   worst %.1f -> %.1f deg   "
                    "(%d iters, %d/%d speakers within 0.5 m of the ear plane)\n",
-                   c->name, bandtxt, c->leash_m, opt_radial ? ", radial" : "",
+                   c->name, bandtxt, opt_leash, opt_radial ? ", radial" : "",
                    sm0, sm1, sw0, sw1, opt_iter, plane_count(0.5f), g_nspk);
             iters_total += opt_iter;
         }
