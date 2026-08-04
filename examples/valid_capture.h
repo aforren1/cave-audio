@@ -9,7 +9,7 @@
  *
  * WHAT MAKES THIS EASY, AND IT IS WORTH SAYING PLAINLY: the harness stimulus is STEADY-STATE, not a
  * sweep. A swept measurement has to know its round-trip latency to the sample, which is most of the
- * difficulty in calib_capture. Here we play and record concurrently and analyse a window taken well
+ * difficulty in calib_capture. Here we play and record concurrently and analyze a window taken well
  * inside the steady state, so device latency, driver buffering and the Digiface's own delay never enter the
  * result at all. VAL_SKIP is simply "long enough that everything has arrived".
  *

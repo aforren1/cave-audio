@@ -45,7 +45,7 @@ int main(void) {
     Layout L = layout_default();
     rt_set_layout(rt, &L);
 
-    /* listener at the centre ear plane, source 3 m to +X on the same line */
+    /* listener at the center ear plane, source 3 m to +X on the same line */
     float lp[3] = { 0.0f, 1.5f, 0.0f }, lq[4] = { 0, 0, 0, 1 };
     rt_set_listener(rt, lp, lq); rt_commit(rt);
     float* bus = (float*)calloc((size_t)BWA_CHANNELS * BLK, sizeof(float));

@@ -21,7 +21,7 @@
 #define ISM_FACES  6      /* -x, +x, -y, +y, -z, +z (the bwa_scene_set_box face order) */
 #define ISM_IMAGES 6      /* one first-order image per face */
 
-/* The shoebox, in room space. Floor-based like bwa_scene_set_box: x/z centred on the origin, y from
+/* The shoebox, in room space. Floor-based like bwa_scene_set_box: x/z centered on the origin, y from
  * 0 (the floor) to `h`. absorb[f][b] is face f's energy absorption in band b (low/mid/high, 0..1);
  * the pressure reflection coefficient is sqrt(1 - absorb).
  *

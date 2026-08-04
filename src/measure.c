@@ -100,7 +100,7 @@ int measure_response(const float* capture, int ncap, const float* ref, int nref,
     if (!L) return 0;
     int p = ir_peak(ir, 0, ncap < L ? ncap : L);                /* physical arrival = strongest tap */
     out->delay_samples = p;
-    /* sub-sample refinement: fit a parabola to |IR| at the peak and its neighbours (true peak of a
+    /* sub-sample refinement: fit a parabola to |IR| at the peak and its neighbors (true peak of a
      * band-limited arrival lands between samples). Lifts delay precision from ~7 mm to well under 1 mm. */
     out->delay_frac = 0.f;
     if (p >= 1 && p + 1 < L) {

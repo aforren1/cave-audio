@@ -397,7 +397,7 @@ static void cap_worker(void) {
 #ifdef BWA_HAVE_ASIO
             if (asio_up) calib_asio_close();
 #endif
-            cap_fail("cancelled");
+            cap_fail("canceled");
             return;
         }
         if (J.simulate) calib_sim_capture(i, &L, J.mic, sweep, cap);
@@ -566,15 +566,15 @@ struct ZyState {
     bool      geom_init;
 
     /* ---- capsule survey (see zylia.h) ----
-     * Each accepted clap contributes one observation: WHERE it happened (relative to the array centre)
+     * Each accepted clap contributes one observation: WHERE it happened (relative to the array center)
      * and the 19 arrival times it produced. Solve over >= 6 well-spread ones and the capsule geometry —
      * channel order and mounted orientation included — falls out. */
     bool      surv_on;
-    float     surv_center[3];                        /* array centre, room coords (tape-measured) */
+    float     surv_center[3];                        /* array center, room coords (tape-measured) */
     float     surv_clap[3];                          /* where the NEXT clap will happen, room coords */
     int       surv_spk;                              /* -1 = manual, else autofill from layout A */
     int       surv_n;
-    float     surv_src[ZYLIA_SURVEY_MAX][3];         /* clap positions RELATIVE to the centre */
+    float     surv_src[ZYLIA_SURVEY_MAX][3];         /* clap positions RELATIVE to the center */
     double    surv_arr[ZYLIA_SURVEY_MAX][ZYLIA_MICS];
     bool      surv_solved, surv_installed;
     float     surv_caps[ZYLIA_MICS][3];
@@ -587,7 +587,7 @@ static ZyState Z;
 static float zy_az(const float d[3]) { return atan2f(d[0], -d[2]) * 57.29578f; }
 static float zy_el(const float d[3]) { return asinf(d[1] > 1.f ? 1.f : (d[1] < -1.f ? -1.f : d[1])) * 57.29578f; }
 
-#define ZY_SIM_DIST 2.0      /* how far a synthetic clap happens from the array centre (m) */
+#define ZY_SIM_DIST 2.0      /* how far a synthetic clap happens from the array center (m) */
 
 /* a clap-like Gaussian click sampled at each capsule's exact fractional arrival time (the synthesis
  * the zylia unit test validates), landed in the shared block exactly like the ASIO side would */
@@ -696,7 +696,7 @@ static void zy_sim_survey(void) {
     Z.surv_solved = Z.surv_installed = false;
     zylia_set_capsules(NULL);                                    /* recover from a clean slate */
     zylia_geometry(Z.dirs, &Z.R);
-    Z.surv_center[0] = Z.surv_center[1] = Z.surv_center[2] = 0.0f;   /* zy_sim_clap centres on the origin */
+    Z.surv_center[0] = Z.surv_center[1] = Z.surv_center[2] = 0.0f;   /* zy_sim_clap centers on the origin */
     for (int k = 0; k < N; ++k) {
         double yy = 1.0 - 2.0 * ((double)k + 0.5) / (double)N;   /* Fibonacci: spread, and crucially not
                                                                   * coplanar — it includes high and low */
@@ -803,7 +803,7 @@ static void tab_zylia(void) {
         ImGui::Spacing();
 
         ImGui::SetNextItemWidth(uiScaled(220));
-        ImGui::DragFloat3("array centre", Z.surv_center, 0.01f, -20.0f, 20.0f, "%.3f");
+        ImGui::DragFloat3("array center", Z.surv_center, 0.01f, -20.0f, 20.0f, "%.3f");
         bwTip("where the ZM-1 sits, room coords (m). A tape measure is plenty: at 2.5 m a 5 cm error "
               "tilts a clap direction by ~1 deg, which is already at the timing noise floor");
 
@@ -881,7 +881,7 @@ static void tab_zylia(void) {
         if (Z.surv_msg[0]) {
             /* residual is the "should I believe this?" number: it is what the recovered geometry FAILS
              * to explain, in microseconds. Sub-microsecond is a clean survey; tens of us means bad
-             * claps, a wrong array centre, or a clap position that was not where you said it was. */
+             * claps, a wrong array center, or a clap position that was not where you said it was. */
             bool bad = !Z.surv_solved || Z.surv_resid > 20.0f;
             ImGui::TextColored(bad ? ImVec4(0.95f, 0.45f, 0.35f, 1.0f) : ImVec4(0.45f, 0.85f, 0.55f, 1.0f),
                                "%s", Z.surv_msg);
@@ -1049,7 +1049,7 @@ static int write_fixture(const char* path, int variant_b) {
                "  \"speakers\": [\n");
     int idx = 0;
     for (int zi = -1; zi <= 1; ++zi) for (int yi = -1; yi <= 1; ++yi) for (int xi = -1; xi <= 1; ++xi) {
-        if (!zi && !yi && !xi) continue;                          /* 27 - centre = 26 */
+        if (!zi && !yi && !xi) continue;                          /* 27 - center = 26 */
         double x = 1.5 * xi, y = 1.5 * yi, z = 1.5 * zi, g = 0.0;
         if (variant_b && idx == 7) { x += 0.10; g = -1.5; }       /* the known deltas */
         fprintf(f, "    { \"index\": %d, \"position\": [%.4f, %.4f, %.4f], \"gain_db\": %.2f, \"delay_ms\": %.3f",

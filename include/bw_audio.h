@@ -223,7 +223,7 @@ BWA_API void     bwa_source_destroy(bwa_engine* e, bwa_source s);
  * room for the new one (so an overload drops the least-important sound instead of failing the
  * new one). Set high on music/critical SFX. */
 BWA_API void     bwa_source_set_priority(bwa_engine* e, bwa_source s, int priority);
-/* ROOM space, right-handed, metres. Commit-gated: takes effect at the next bwa_commit. */
+/* ROOM space, right-handed, meters. Commit-gated: takes effect at the next bwa_commit. */
 BWA_API void     bwa_source_set_pos(bwa_engine* e, bwa_source s, float x, float y, float z);
 BWA_API void     bwa_source_set_gain(bwa_engine* e, bwa_source s, float linear);
 /* Timed gain fade: glide the source's gain to `gain` over `seconds` (engine-side, so no per-frame
@@ -454,14 +454,14 @@ BWA_API bwa_material bwa_material_define(bwa_engine* e, const float absorption[3
  * token gets whatever the slot is reused for. Token 0 (the default) and out-of-range tokens are
  * refused (bwa_last_error says which). Most apps mint once and never release — this is opt-in. */
 BWA_API void         bwa_material_release(bwa_engine* e, bwa_material token);
-/* Set the STATIC occluding geometry (room space, RH metres; tris are CCW vertex-index triples) with
+/* Set the STATIC occluding geometry (room space, RH meters; tris are CCW vertex-index triples) with
  * PER-TRIANGLE materials: tri_material is ntris bwa_material tokens (one per triangle; out-of-range
  * clamps to the default). Replaces any prior static mesh. Safe to call at runtime, but it rebuilds the
  * whole scene BVH — for things that MOVE, use the dynamic-mesh API below (a cheap instance transform).
  * No-op without the Steam Audio backend. */
 BWA_API void     bwa_scene_set_mesh_mat(bwa_engine* e, const float* verts, int nverts, const int* tris, int ntris,
                                       const bwa_material* tri_material);
-/* Convenience: a FLOOR-based shoebox of w x h x d metres — centred on the origin in x/z, y from 0
+/* Convenience: a FLOOR-based shoebox of w x h x d meters — centered on the origin in x/z, y from 0
  * (floor) to h — one material per face. faces[6] = (-x,+x,-y,+y,-z,+z), each a bwa_material token
  * (0 = default); triangle normals face inward. Works WITH and WITHOUT the Steam build: it feeds the
  * ray-traced scene (SDK) and ALWAYS captures the box for the image-source early reflections.
@@ -473,7 +473,7 @@ BWA_API void     bwa_scene_set_mesh_mat(bwa_engine* e, const float* verts, int n
  * carrying the box's 12 inward triangles plus yours. Why (the half-way drop): docs/api.md,
  * "Materials and scene geometry". */
 BWA_API void     bwa_scene_set_box(bwa_engine* e, float w, float h, float d, const bwa_material faces[6]);
-/* The OUTDOOR degenerate of the box: one horizontal mirror plane at height y (room metres) — the
+/* The OUTDOOR degenerate of the box: one horizontal mirror plane at height y (room meters) — the
  * ground bounce, the dominant early reflection when there is no room around you. Same dual capture
  * as the box: the image-source reflections get the plane (every build), the ray-traced scene (SDK)
  * gets a large ground quad. REPLACES any prior box (one room at a time; last call wins), and like
@@ -498,7 +498,7 @@ BWA_API void     bwa_scene_set_pressure_release(bwa_engine* e, uint32_t face_mas
  * Occlusion and REAL-TIME reflections/pathing pick up the motion on their next sim tick (~10-30 Hz);
  * BAKED reflections/pathing do NOT (the bake froze the geometry — see docs/materials.md).
  *
- * add: geometry is in the mover's LOCAL space (metres, CCW), placed by set_dynamic_transform; one
+ * add: geometry is in the mover's LOCAL space (meters, CCW), placed by set_dynamic_transform; one
  * `material` token covers every triangle. Returns a handle >= 0, or -1 (no SDK / bad geometry / the
  * movable table is full — bwa_last_error distinguishes). Runtime- and load-time-safe. NOTE: this
  * handle is deliberately a plain small int index (movers are few and app-managed), not a
@@ -647,7 +647,7 @@ BWA_API float    bwa_source_get_directivity(bwa_engine* e, bwa_source s);
  * propagation latency. Best for fast movers; subtle for slow ones in a small room. */
 BWA_API void     bwa_source_set_doppler(bwa_engine* e, bwa_source s, bool on);
 /* Air absorption: a distance-driven high-frequency low-pass (far sources sound duller). Subtle at a
- * few metres, pronounced for sources placed at large virtual distances. */
+ * few meters, pronounced for sources placed at large virtual distances. */
 BWA_API void     bwa_source_set_air_absorption(bwa_engine* e, bwa_source s, bool on);
 /* Equal-loudness distance compensation: as distance attenuation takes level away, the ear also loses
  * LF sensitivity (ISO 226 contours), so an attenuated source reads THIN as well as far. This restores
@@ -679,7 +679,7 @@ BWA_API void     bwa_source_set_attenuation_override(bwa_engine* e, bwa_source s
                                                      float ref_dist, float rolloff, float min_gain);
 /* Source spread / size: angular width of the source, 0 = a point (default) .. 1 = wide. Spreads the
  * source's energy across the speakers around its direction (a waterfall/crowd/ambience that shouldn't
- * collapse to one point), centred on its direction and constant-power. Works with any panner. */
+ * collapse to one point), centered on its direction and constant-power. Works with any panner. */
 BWA_API void     bwa_source_set_spread(bwa_engine* e, bwa_source s, float amount);
 /* Anisotropic extent (BS.2127-style width/height): separate HORIZONTAL and VERTICAL angular extents,
  * each 0..1 — a shoreline is wide but not tall, rain is tall but not wide. Equal values behave as the
@@ -808,8 +808,8 @@ BWA_API void     bwa_set_panner(bwa_engine* e, bwa_panner panner);
  * FAILS bwa_start with BWA_ERR_LAYOUT — a wrong-channel-count session can't start silently. */
 BWA_API uint32_t bwa_get_channel_count(bwa_engine* e);
 /* Dual-band panning (off by default): split each source at ~700 Hz and pan the low band with
- * amplitude (pressure / velocity-vector) normalisation, the high band with the panner's usual power
- * (energy-vector) normalisation — better low-frequency localisation for a near-centred listener. Wraps
+ * amplitude (pressure / velocity-vector) normalization, the high band with the panner's usual power
+ * (energy-vector) normalization — better low-frequency localization for a near-centered listener. Wraps
  * the selected panner; live-toggleable for A/B. Sweet-spot dependent like VBAP (see docs). */
 BWA_API void     bwa_set_dual_band(bwa_engine* e, bool on);
 /* max-rE weighting for the SH->speaker BED decode (off by default; live A/B, crossfaded): tapers the
@@ -881,7 +881,7 @@ BWA_API void       bwa_set_headphone_eq(bwa_engine* e, bool on);
  * world-locked, sweet-spot-ish. PARAMETRIC analyzes the bed's first-order channels per frequency
  * band into a direction + diffuseness (DirAC-style intensity analysis): the non-diffuse stream is
  * RE-PANNED through the engine's listener-relative panner at the array shell — a recorded soundfield
- * becomes WALKABLE (off-centre listeners get correct directions + parallax, which no matrix decode
+ * becomes WALKABLE (off-center listeners get correct directions + parallax, which no matrix decode
  * can give) — and the diffuse stream decodes through the matrix into per-speaker decorrelators
  * (incoherent envelopment). Loudness-matched to the matrix decode; beds with < 4 channels stay on
  * the matrix. See docs/spatialization.md. */
@@ -923,8 +923,8 @@ BWA_API uint32_t bwa_bed_gains_batch(bwa_bed_decoder decoder, bool max_re,
 /* ---- listener (control thread; skip when a tracker is connected) ---- */
 /* Position in room space. Quaternion is head orientation; used by the headphone
  * renders only — the array render ignores orientation (real speakers, real ears).
- * ROOM FRAME: right-handed, +y up, metres, identity orientation faces +z (so the
- * right ear is at -x). The origin sits ON THE FLOOR at the working-area centre
+ * ROOM FRAME: right-handed, +y up, meters, identity orientation faces +z (so the
+ * right ear is at -x). The origin sits ON THE FLOOR at the working-area center
  * (x/z) — Motive's ground-plane calibration — so OptiTrack rigid-body poses pass
  * through unchanged and y is height above the floor. The engine's world-locked
  * decodes reference the ARRAY CENTROID (the nominal listening point, also the

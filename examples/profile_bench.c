@@ -89,7 +89,7 @@ int main(int argc, char** argv) {
         for (int i = 0; i < nv; ++i) {
             float a = ph + (float)i * (6.2831853f / (float)nv);
             float r = 2.0f + 1.5f * sinf(0.3f * ph + (float)i);
-            /* orbit about the array centre at ear height (1.5 m), the engine's nominal listening
+            /* orbit about the array center at ear height (1.5 m), the engine's nominal listening
              * point under the floor-origin frame — a floor-level listener would profile skewed distances */
             bwa_source_set_pos(e, src[i], r * cosf(a), 1.5f + 0.8f * sinf(0.7f * ph + (float)i), r * sinf(a));
         }

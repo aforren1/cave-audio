@@ -19,7 +19,7 @@
 #include "ambisonics.h"   /* BWA_AMBI_CH */
 
 /* Build the EPAD decode into `decode` (row s = speaker s, BWA_AMBI_CH SN3D/ACN coefficients),
- * energy-normalised to the sampling decode's diffuse level (level-fair decoder swap, as
+ * energy-normalized to the sampling decode's diffuse level (level-fair decoder swap, as
  * allrad.c). Returns 1 on success, 0 on a degenerate array (caller keeps the sampling decode). */
 int epad_build_decode(const Layout* L, float decode[BWA_CHANNELS][BWA_AMBI_CH]);
 

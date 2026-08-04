@@ -6,7 +6,7 @@
  *      inverse square root B = QΛ^(-1/2)Qᵀ — eigenvalues below 1e-6·λmax are DROPPED, which is
  *      the rank truncation of Zotter/Pomberger/Noisternig's SVD formulation (D = c·VUᵀ equals
  *      c·Yᵀ(YYᵀ)^(-1/2) on the kept subspace);
- *   3. D = Yᵀ·B, rescaled back to SN3D input and energy-normalised to the sampling decode's
+ *   3. D = Yᵀ·B, rescaled back to SN3D input and energy-normalized to the sampling decode's
  *      diffuse level (Σ D²/(2l+1) = BWA_AMBI_CH/N, the same metric allrad.c matches).
  */
 #include "epad.h"
@@ -94,7 +94,7 @@ int epad_build_decode(const Layout* L, float decode[BWA_CHANNELS][BWA_AMBI_CH]) 
             B[i][j] = acc;
         }
 
-    /* D = Yᵀ·B back to SN3D input, then energy-normalise to the sampling decode's diffuse level */
+    /* D = Yᵀ·B back to SN3D input, then energy-normalize to the sampling decode's diffuse level */
     memset(decode, 0, sizeof(float) * BWA_CHANNELS * BWA_AMBI_CH);
     double e = 0.0;
     for (uint32_t s = 0; s < N; ++s)

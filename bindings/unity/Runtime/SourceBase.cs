@@ -45,7 +45,7 @@ namespace BwAudio
         [Tooltip("Angular width: 0 = a point, 1 = wide. For a crowd/waterfall/ambience that shouldn't " +
                  "collapse to one speaker.")]
         [Range(0f, 1f)] public float spread = 0f;
-        [Tooltip("Physical radius in METRES (0 = point). The width becomes the angle the radius subtends " +
+        [Tooltip("Physical radius in METERS (0 = point). The width becomes the angle the radius subtends " +
                  "from the listener, so the source stays the same PHYSICAL size as the listener walks. " +
                  "Floors `spread` — the larger of the two wins.")]
         public float sizeMetres = 0f;
@@ -255,7 +255,7 @@ namespace BwAudio
             if (Live) Bwa.bwa_source_set_attenuation_override(Eng, _src, refDist, rolloff, minGain);
         }
 
-        /// <summary>Physical radius in metres (0 = point): the source holds its real-world size as the
+        /// <summary>Physical radius in meters (0 = point): the source holds its real-world size as the
         /// listener walks, where a fixed Spread would not.</summary>
         public float SizeMetres
         {

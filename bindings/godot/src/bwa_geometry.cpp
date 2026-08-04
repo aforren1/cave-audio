@@ -176,7 +176,7 @@ void BwaDynamicGeometry::_bind_methods() {
 
 /* ----------------------------------------------------------------------- room box --- */
 
-/* The core's own box: floor-based (x/z centred, y from 0 up to h), face order -x, +x, -y,
+/* The core's own box: floor-based (x/z centered, y from 0 up to h), face order -x, +x, -y,
  * +y, -z, +z, wound so the normals face INWARD because the listener is inside. Mirrored
  * here so the walls can join the merged static mesh — see the header for why they cannot
  * simply be left to bwa_scene_set_box. */
@@ -190,7 +190,7 @@ PackedVector3Array BwaRoomBox::wall_faces() const {
 		Vector3(-hw, 0, -hd), Vector3(hw, 0, -hd), Vector3(hw, h, -hd), Vector3(-hw, h, -hd),
 		Vector3(-hw, 0, hd), Vector3(hw, 0, hd), Vector3(hw, h, hd), Vector3(-hw, h, hd)
 	};
-	const Vector3 centre(0, h * 0.5f, 0);
+	const Vector3 center(0, h * 0.5f, 0);
 	const Transform3D xform = get_global_transform();
 
 	PackedVector3Array out;
@@ -200,9 +200,9 @@ PackedVector3Array BwaRoomBox::wall_faces() const {
 		const int quad[2][3] = { { a, b, c }, { a, c, d } };
 		for (int t = 0; t < 2; t++) {
 			Vector3 p0 = v[quad[t][0]], p1 = v[quad[t][1]], p2 = v[quad[t][2]];
-			/* Flip any triangle whose normal points away from the room centre, exactly as
+			/* Flip any triangle whose normal points away from the room center, exactly as
 			 * the core's emit_inward does — the winding is what makes it an enclosure. */
-			if ((p1 - p0).cross(p2 - p0).dot(centre - p0) < 0.0f) {
+			if ((p1 - p0).cross(p2 - p0).dot(center - p0) < 0.0f) {
 				const Vector3 tmp = p1;
 				p1 = p2;
 				p2 = tmp;
@@ -275,7 +275,7 @@ PackedStringArray BwaRoomBox::_get_configuration_warnings() const {
 					"acoustics paths will disagree about where the room is. Keep this node at "
 					"the identity transform and size the box instead.");
 	}
-	w.push_back("This box is the VIRTUAL room, not the physical CAVE. Modelling the real room "
+	w.push_back("This box is the VIRTUAL room, not the physical CAVE. Modeling the real room "
 				"double-counts its reflections, which already reach the listener acoustically.");
 	return w;
 }

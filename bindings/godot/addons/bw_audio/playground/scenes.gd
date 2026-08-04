@@ -216,13 +216,13 @@ class Occlusion extends Base:
 		return [u, wall_n.cross(u)]
 
 	## The wall as world triangles. Local corners for the dynamic path are the same offsets
-	## from centre, so a pure translation reproduces the static mesh's exact world triangles —
+	## from center, so a pure translation reproduces the static mesh's exact world triangles —
 	## which is what makes the A/B a comparison of PATHS rather than of two different walls.
-	func _corners(centred: bool) -> PackedVector3Array:
+	func _corners(centered: bool) -> PackedVector3Array:
 		var b := _wall_basis()
 		var u: Vector3 = b[0] * wall_hw
 		var v: Vector3 = b[1] * wall_hh
-		var c: Vector3 = Vector3.ZERO if centred else wall_c
+		var c: Vector3 = Vector3.ZERO if centered else wall_c
 		return PackedVector3Array([c - u - v, c + u - v, c + u + v, c - u + v])
 
 	func _apply_wall() -> void:

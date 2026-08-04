@@ -8,7 +8,7 @@ All notable changes to `com.brainworks.bw_audio`.
 
 What a layout is optimized FOR is now a first-class artifact in `bwa_layout_tool`,
 because collaborators disagree about it. A named **condition** bundles the objective
-knobs with a scoring-shell restriction: `3d` (the full sphere, the old behaviour),
+knobs with a scoring-shell restriction: `3d` (the full sphere, the old behavior),
 `horizontal` (only source directions within 15 deg of the ear plane, for planar
 localization), and `visual` (a front wedge, azimuth and elevation within 30 deg of
 +z). The GUI gets a condition combo plus band/azi sliders; the Score board follows
@@ -101,7 +101,7 @@ prove the render path was clean and still not know whether the callback missed i
 The narrow generalization of the `get_output_latency` trap below, applied once and then written
 down. The rule: **a unit belongs in a name when the quantity has two live units.** Time is the only
 one in this ABI — frames and seconds are both real — so every time-valued name now says which.
-Distances (metres), frequencies (Hz), angles (radians) and gains (linear) have no competitor and
+Distances (meters), frequencies (Hz), angles (radians) and gains (linear) have no competitor and
 stay unmarked, carrying the unit on the value (`radius_m`, `xover_hz`, `yaw_rad`) where it helps.
 A decibel value must say `_db`, since linear is the unmarked default. Stated in
 docs/api.md → "Coordinates and units".
@@ -303,7 +303,7 @@ with the ones a scene actually authors surfaced on the components:
   the conditional hides + live occlusion bar too. Public API and serialized field names are
   unchanged — existing scenes and scripts migrate untouched.
 - **`Emitter` directivity** — the cardioid-weight mapping + `set_directivity` call, duplicated in
-  `TryInit` and `OnValidate`, moved into one `ApplyDirectivity()` helper (no behaviour change).
+  `TryInit` and `OnValidate`, moved into one `ApplyDirectivity()` helper (no behavior change).
 
 ### Fixed
 
@@ -589,7 +589,7 @@ inspector where you can still see them.
   ray-traced occlusion, which is otherwise invisible.
 - **The room box is visible.** It draws as a wireframe gizmo (`Room.RoomToUnityMatrix` — the inverse of
   the coordinate seam, so a wrong `Room.UnityToRoom` makes the box land visibly in the wrong place).
-- **The speaker array is visible.** `Engine` draws each speaker as a gizmo, labelled with its channel
+- **The speaker array is visible.** `Engine` draws each speaker as a gizmo, labeled with its channel
   index. Stopped, the positions come from the layout **file**; in Play mode they come from the **engine**
   (`bwa_get_speakers`) and each one lights up with that channel's live output level, the same way the
   playground's gizmos do — so a dead or mis-wired speaker is visible at a glance. The Play-mode source
@@ -598,7 +598,7 @@ inspector where you can still see them.
 - **`SpeakerView` — live speaker activity you can see from inside the CAVE.** The gizmos above are an
   *editor* feature and don't render in a build, so this is the runtime counterpart: one unlit marker per
   channel, placed at the real speaker's position, brightening (and growing) with that channel's output.
-  Unlit on purpose — a CAVE is dark, so the colour computed is the colour seen, with no lights to set up.
+  Unlit on purpose — a CAVE is dark, so the color computed is the color seen, with no lights to set up.
   Instant attack + slow release, because the engine reports a per-*block* peak that strobes too fast to
   read raw. Uses the same `bwa_get_speakers` + `bwa_get_bus_levels` readbacks as everything else, writes no
   audio state, and picks its shader across URP / HDRP / built-in. Optional: delete it and nothing changes
@@ -611,7 +611,7 @@ inspector where you can still see them.
   the editor stopped) and nothing audible depends on it.
 - **Minimum Unity is now 6000.0 (Unity 6)**, up from 2021.3. Nothing had ever been tested below it, and
   the old floor was already forcing compatibility shims.
-- **No deprecation warnings.** The scene bake used `FindObjectsOfType`, deprecated in favour of
+- **No deprecation warnings.** The scene bake used `FindObjectsOfType`, deprecated in favor of
   `FindObjectsByType`, which forces you to say whether you need the results sorted. We don't — every
   geometry is baked into one mesh — so it passes `FindObjectsSortMode.None` and skips a pointless
   InstanceID sort.
@@ -631,7 +631,7 @@ Initial Unity binding (M7).
   matching Motive's default streamed frame). `Room`'s baseline handedness flip moved from the Z
   axis to the X axis; since Unity is also +Z-forward, identity rotations now map to identity.
 - Room origin is now canonically **on the floor** (Motive ground plane; y = height above the
-  floor), and the room box (`AddBox` / `bwa_scene_set_box`) is floor-based: x/z centred, y from 0
+  floor), and the room box (`AddBox` / `bwa_scene_set_box`) is floor-based: x/z centered, y from 0
   up to the box height. The engine references the array centroid, not the origin, for its
   world-locked decodes, so surveys with other origins keep working.
 

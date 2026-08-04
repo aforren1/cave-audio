@@ -23,7 +23,7 @@ typedef struct SteamScene SteamScene;
 SteamScene* steam_scene_create(RtCore* rt, uint32_t sample_rate, uint32_t frame_size, uint32_t voice_cap,
                                int use_embree /* try Embree ray tracing; falls back to default */);
 
-/* Set the occluding geometry with PER-TRIANGLE materials, in room space (RH, metres). verts is
+/* Set the occluding geometry with PER-TRIANGLE materials, in room space (RH, meters). verts is
  * nverts*3 floats; tris is ntris*3 vertex indices (CCW winding). nmat materials are given as flat
  * arrays: absorption[nmat*3], scattering[nmat], transmission[nmat*3] (each band/coeff 0..1).
  * tri_material is ntris entries, each an index in [0,nmat) (out-of-range clamps to 0; NULL = all
@@ -53,7 +53,7 @@ void steam_scene_source_gone    (SteamScene* s, uint32_t handle);
  * once; a dynamic mesh is a rigid INSTANCE of its own sub-scene, so moving it is a cheap top-level BVH
  * refit, not a geometry rebuild (Steam Audio's IPLInstancedMesh — the acoustic analogue of a physics
  * collider with a transform). Both the occlusion sim and the borrowing reflection/pathing sims see the
- * change on their next tick. Geometry is in the mover's LOCAL space (metres); place it with the rigid
+ * change on their next tick. Geometry is in the mover's LOCAL space (meters); place it with the rigid
  * transform. add returns a handle >= 0 (a slot index), or -1 on bad geometry / a full table.
  *
  * The mover carries a single material (absorption[3] / scattering / transmission[3], each 0..1). All

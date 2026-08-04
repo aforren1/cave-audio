@@ -56,7 +56,7 @@ flowchart TD
   OCC -. "ISM: 6 shoebox mirror images (ism_images);<br/>frac delay · HF damp · per-image panner_gains<br/>(direct mode: per-image direct_gains_at)<br/><i>bwa_source_set_early_reflections · bwa_scene_set_box ·<br/>bwa_set_early_reflections_gain</i>" .-> BUS
   PROP -. "decor split × √spread<br/><i>bwa_set_decorrelation</i>" .-> DECOR
   PAN --> BUS
-  PAN -- "BINAURAL profile: direct_gains_at —<br/>16 SH gains at the TRUE direction<br/>(ambi_encode_phonon; voice + ISM images<br/>land here INSTEAD of the bus)" --> DIRECT
+  PAN -- "BINAURAL profile: direct_gains_at -<br/>16 SH gains at the TRUE direction<br/>(ambi_encode_phonon; voice + ISM images<br/>land here INSTEAD of the bus)" --> DIRECT
 
   subgraph BEDV["bed voice: mix_bed, per sample (inside rt_render)"]
     SH["SH frames (world-locked soundfield)<br/><i>bwa_bed_play · bwa_bed_set_gain</i>"]
@@ -95,5 +95,5 @@ flowchart TD
 
 Reading the map: plain function names are where the DSP *runs* (almost all on the audio
 thread, inside one `rt_render` block); italic `bwa_*` names are the control-thread calls
-that *configure* that stage—every one of them crosses over via the command ring or an
+that *configure* that stage: every one of them crosses over via the command ring or an
 atomic, never by touching DSP state directly (`concurrency.md` is the contract).

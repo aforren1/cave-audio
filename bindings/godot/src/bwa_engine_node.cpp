@@ -702,7 +702,7 @@ void BwaEngine::scene_set_dynamic_transform(
 	 * facing: its local vertices go to the core untouched, so the placement must satisfy
 	 * p_room = Reg * T_godot * p_local exactly. Routing it through the facing helper spins
 	 * every dynamic mesh 180 degrees about Y relative to its visual node — invisible on the
-	 * demos' centred quads (symmetric under that turn), wrong for anything asymmetric. */
+	 * demos' centered quads (symmetric under that turn), wrong for anything asymmetric. */
 	const Quaternion q = Quaternion((registration.basis * Basis(rot)).orthonormalized());
 	bwa_scene_set_dynamic_transform(
 			eng, handle, (float)p.x, (float)p.y, (float)p.z, (float)q.x, (float)q.y, (float)q.z,

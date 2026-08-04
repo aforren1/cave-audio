@@ -30,7 +30,7 @@ These two communicate through two SPSC rings:
 - **Event ring** (audio → control): voice-ended and sound-retired acks.
 
 Both are single-producer/single-consumer, so the indices need only
-acquire/release—no CAS.
+acquire/release, not CAS.
 
 Around that backbone sit auxiliary producer threads, each with its own channel
 into the audio thread. Every channel is wait-free on the audio side; the audio
@@ -81,17 +81,17 @@ everything sampled is ramped in, never slammed.
 ## Command type and ring
 
 Fixed-size POD slots, no framing. The command `enum` is the authoritative
-list — it lives in [`rt.h`](../src/rt.h) and grows as features land. Most
+list: it lives in [`rt.h`](../src/rt.h) and grows as features land. Most
 commands need no explanation here; the few that carry protocol do:
 
-- `CMD_SRC_CREATE` — async activation of a handle the control thread already
+- `CMD_SRC_CREATE`: async activation of a handle the control thread already
   allocated and returned (synchronous handle, async activation).
-- `CMD_SET_POS` / `CMD_SET_LISTENER` — write source position / listener pose to
+- `CMD_SET_POS` / `CMD_SET_LISTENER`: write source position / listener pose to
   *pending*; a later `CMD_COMMIT` promotes them.
-- `CMD_COMMIT` — promote pending → active. Defines frame coherence.
-- `CMD_SOUND_RETIRE` — the control thread asks to free a sound, the audio thread
+- `CMD_COMMIT`: promote pending → active. Defines frame coherence.
+- `CMD_SOUND_RETIRE`: the control thread asks to free a sound, the audio thread
   acks once it has let go (the retire-ack handshake).
-- `CMD_SRC_STEAL` — fade a stolen voice out on its own slot, then free it.
+- `CMD_SRC_STEAL`: fade a stolen voice out on its own slot, then free it.
 
 `Cmd` is `type` + `handle` + a union of small payload arms (see rt.h).
 Most arms are a handle plus a bool or a float. `play` carries
@@ -99,12 +99,12 @@ Most arms are a handle plus a bool or a float. `play` carries
 `start` is the dsp-sample to begin at (0 = now) and `loop_beg`/`loop_end` are the
 optional loop region (0/0 = whole clip), so both sample-accurate scheduling and
 intro→loop are wider commands, not new mechanisms. Scheduling a *stop*
-(`CMD_STOP_AT`, one `uint64_t` sample) is the mirror — the audio thread fires the
+(`CMD_STOP_AT`, one `uint64_t` sample) is the mirror: the audio thread fires the
 existing click-free stop once a block reaches it. `CMD_QUEUE` appends a sound to a
 voice's gapless play queue (a fixed FIFO in the `Voice`, depth `BWA_QUEUE`): at a
 non-looping end the mixer pops the next entry and continues in the same block
 instead of stopping. The entries are resolved `SoundData*`, so `CMD_SOUND_RETIRE`
-tombstones any it frees (NULL) before acking — the same "detach before free"
+tombstones any it frees (NULL) before acking, the same "detach before free"
 discipline that protects the voice's current `sound`.
 
 ```c
@@ -125,7 +125,7 @@ Handles are `(index | generation << 16)`; the macros live in rt.h:
 The return path is symmetric and likewise SPSC, roles reversed: the **audio
 thread is the sole producer**, the **control thread the sole consumer**
 (`drain_events`, called from `rt_commit` / `bwa_commit`). There is no second
-producer—keep it that way, or the relaxed/acquire/release scheme stops being
+producer; keep it that way, or the relaxed/acquire/release scheme stops being
 sufficient.
 
 ```c
@@ -372,9 +372,9 @@ with the device's planar buffer (`cave` profile) or a scratch buffer
 
 The headphone decode is not a bus tap: it is a *sink render callback* in
 [`src/engine.c`](../src/engine.c) (`render_binaural`: `rt_render` into
-`scratch26` — and, in the `binaural` profile, `rt_direct_ambi` /
+`scratch26`; and, in the `binaural` profile, `rt_direct_ambi` /
 `rt_direct_voices` read the block's direct SH field and per-voice point taps on
-the same thread right after — then `monitor_process` / `steam_monitor_process`
+the same thread right after; then `monitor_process` / `steam_monitor_process`
 decodes to the 2-ch device). Neither the direct field nor the point taps ever
 cross a thread: `rt_render` fills them and the same callback consumes them before
 returning. Device output likewise goes through the `bwa_sink` abstraction
@@ -423,11 +423,11 @@ across one block (invariant 4) and the playhead freezes only once fully silent,
 so resume continues exactly where pause landed. Seek is click-free: a pending
 `CMD_SEEK` lands only while the gate is silent, so seeking a running voice is
 ramp-out → jump → ramp-in (two blocks, ~10 ms at 256/48k). Streamed sounds
-ignore seek—the ring can't jump. `CMD_STOP` rides the same gate: fade out,
+ignore seek: the ring can't jump. `CMD_STOP` rides the same gate: fade out,
 *then* `playing = false`. `CMD_STOP_AT` is the scheduled form: `rt_render` fires
 that same fade once a block reaches `stop_at` (block-granular, so it can't pop).
 **Starts** are symmetric: `CMD_PLAY` zeroes `gcur` (the final per-channel gain),
-so the first block ramps up from silence—a fresh voice is already zero (create
+so the first block ramps up from silence; a fresh voice is already zero (create
 memset), so this only fades in a *replayed* slot that would otherwise reuse the
 prior solve's gains and click on the asset's first sample. Only
 `CMD_SRC_DESTROY` hard-cuts. A paused voice still reads as playing.
@@ -445,7 +445,7 @@ Allocation at create time, DSP on the audio thread: invariant 1.
 ### Dual-band gains and the bed decode
 
 Both are plain audio-thread state, not new channels. `compute_gains` derives
-the amplitude-normalised LF gain set (`gtarget_lo`) on every solve, so
+the amplitude-normalized LF gain set (`gtarget_lo`) on every solve, so
 `bwa_set_dual_band` A/Bs live: an atomic flag the mixer reads, crossfaded per
 voice via `dual_mix`. The ambisonic-bed decode matrix (`bed_decode`) is rebuilt
 on the control thread only while the audio thread is stopped (`rt_set_layout` /
@@ -469,4 +469,4 @@ on the control thread only while the audio thread is stopped (`rt_set_layout` /
 
 That is the entire concurrency surface: two rings, a commit snapshot,
 generation gates, one ack handshake, and a handful of wait-free publish slots.
-Everything else—panners, EQs, the limiter—is single-threaded DSP behind it.
+Everything else (panners, EQs, the limiter) is single-threaded DSP behind it.

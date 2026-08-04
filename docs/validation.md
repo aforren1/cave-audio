@@ -4,7 +4,7 @@ Calibration *fixes* the array: trims, delays, positions, EQ. This *grades* it. R
 known direction, measure where the array actually put it, report the angular miss.
 
 That number is the one nobody has. You can listen to a layout all day and not produce it, and the
-usual substitutes—rE error, coverage maps, "sounds right to me"—are proxies for it, not it.
+usual substitutes (rE error, coverage maps, "sounds right to me") are proxies for it, not it.
 
 Build it with `-DBWA_BUILD_CALIBRATE=ON` (same switch as `bwa_calibrate`). Run
 `bwa_validate --simulate` to exercise the whole flow with no hardware.
@@ -34,7 +34,7 @@ sweet-spot measurement cannot.
 
 One consequence worth stating, because it is easy to get backwards: **sources sit at fixed world
 positions**, not at a bearing from the listener. Only then is every listening position judged against
-the same physical sources, and only then does a fixed solve mean anything—its gains were computed for
+the same physical sources, and only then does a fixed solve mean anything: its gains were computed for
 a source that must not move when the listener does.
 
 ## Two paths, one scorer
@@ -45,8 +45,8 @@ valid_speaker_feeds  →  [ play + record ]  →  valid_score  →  statistics
 ```
 
 `valid_score` is the seam. The hardware path plays real feeds into a real room and hands back a
-capture; the simulated path substitutes an analytic field. Everything above the seam—scoring,
-medians, bootstrap intervals, contrasts, the report—is shared, so the two paths cannot drift.
+capture; the simulated path substitutes an analytic field. Everything above the seam (scoring,
+medians, bootstrap intervals, contrasts, the report) is shared, so the two paths cannot drift.
 
 The `valid` ctest pins that they agree: it builds feeds, propagates them the long way (explicit
 per-speaker sum, interpolated fractional delay, 1/r), scores that, and compares against the analytic
@@ -72,13 +72,13 @@ the rendering term, which is the one placement and panner choice control, and th
 the listener walks. Do not read a simulated miss as a predicted in-room miss. Read it as the floor
 the room then adds to.
 
-Modelling the room here would repeat the trap `calibration.md` warns about with RT60: the physical
+Modeling the room here would repeat the trap `calibration.md` warns about with RT60: the physical
 room supplies its own acoustics, and baking a model of it into the measurement double-counts.
 
 ## The estimator: active intensity (`zylia_intensity_doa`)
 
 The rest of `zylia.c` answers "where are my speakers" from a transient, by arrival times. That will
-not work here. A phantom has no arrival time of its own—it is the summed output of many speakers—so
+not work here. A phantom has no arrival time of its own: it is the summed output of many speakers, so
 the measurement has to read direction out of continuous content.
 
 ```c
@@ -107,7 +107,7 @@ plane wave, 1 is fully diffuse. A measurement taken in the reverberant tail rath
 sound shows up here as a high value.
 
 If a capsule survey is installed, this estimator inherits its measured channel order and orientation
-for free—it reads `zylia_geometry` like everything else.
+for free: it reads `zylia_geometry` like everything else.
 
 ### A sign trap, recorded so nobody repeats it
 
@@ -206,8 +206,8 @@ The built-in placements are a plausible walking envelope, not your room. Pass yo
 which matters once you have more than about four.
 
 ```
-# mics.txt — surveyed listening positions, room metres
-0.0  1.55  0.0    seated centre
+# mics.txt - surveyed listening positions, room meters
+0.0  1.55  0.0    seated center
 0.8  1.55 -0.4    front-right standing
 -0.9 1.20  0.6    back-left seated
 ```
@@ -229,7 +229,7 @@ Fitting that rotation back out of the data is possible but statistical, and it c
 with the measurement. With a tracked stand it is measured:
 
 ```
-capsules_room = R(pose) · capsules_body        centre = pose_pos + R(pose) · offset
+capsules_room = R(pose) · capsules_body        center = pose_pos + R(pose) · offset
 ```
 
 So the workflow becomes **survey once, then track**. Run `zylia_survey` at any convenient mount pose,
@@ -238,8 +238,8 @@ placement afterwards. The `zylia` test measures the payoff on synthetic data: a 
 the stale survey **18.1° wrong** is reconstructed to **0.033°** from the live pose.
 
 You do not need markers on the sphere. Mount it to something the cameras already see and probe the
-offset from the stand's body origin to the array's acoustic centre. For a rigid sphere that centre is
-unambiguous—it is the geometric centre—unlike a general microphone where "where is it,
+offset from the stand's body origin to the array's acoustic center. For a rigid sphere that center is
+unambiguous (it is the geometric center), unlike a general microphone where "where is it,
 acoustically" is a real question.
 
 Two things the tool will not do for you:
@@ -247,19 +247,19 @@ Two things the tool will not do for you:
 - **The coupling must be rigid and stay rigid.** No shock mount, and do not loosen the collar after
   surveying. You are propagating an orientation through the mount, so a quarter turn on the thread is
   90° of azimuth error and nothing downstream notices. Mark the collar.
-- **The offset must be probed.** `zylia_survey` takes source positions relative to a centre, so it
-  cannot solve for that centre. The rotation falls out of the survey plus one pose sample; the
+- **The offset must be probed.** `zylia_survey` takes source positions relative to a center, so it
+  cannot solve for that center. The rotation falls out of the survey plus one pose sample; the
   translation does not.
 
 With `--track` the placements you pass become the **plan**, not the measurement. The tool prints the
-tracked position beside the planned one with the delta, and warns past half a metre—a wrong rigid
+tracked position beside the planned one with the delta, and warns past half a meter: a wrong rigid
 body or a frame mix-up shows up immediately rather than as a puzzling result three hours later.
 
 This is also the undemanding use of the tracker: the mic is static during a capture, so one good pose
 per placement is enough. No prediction, no velocity, no clock-domain question, none of the parts of
 the render path that make `natnet.c` hard.
 
-Two safety behaviours worth knowing:
+Two safety behaviors worth knowing:
 
 - **A stale pose is refused, not reused.** `pose_read` hands back the last *published* pose forever,
   and NatNet only publishes tracking-valid frames, so an occluded stand or a wrong streaming id would
@@ -298,18 +298,18 @@ That is the published physical-versus-phantom comparison, obtained without movin
 
 Two things to know before reading that table:
 
-- **It is ~0 at the array centre, by symmetry.** A blurred phantom's energy vector still points at
-  the speaker when you are at the centre of a symmetric array. The off-centre rows carry the
-  information; the centre row is a null control.
-- **Never pool it across placements.** The distribution is bimodal (≈0 centred, degrees off-centre),
+- **It is ~0 at the array center, by symmetry.** A blurred phantom's energy vector still points at
+  the speaker when you are at the center of a symmetric array. The off-center rows carry the
+  information; the center row is a null control.
+- **Never pool it across placements.** The distribution is bimodal (≈0 centered, degrees off-center),
   so a pooled median lands in the empty middle and reads as "no effect", the exact opposite of the
   truth. The tool reports per placement for this reason. This is not hypothetical: pooling one
-  centred placement with one off-centre one during development produced 0.13°, against 1.8° for the
-  off-centre placement alone.
+  centered placement with one off-center one during development produced 0.13°, against 1.8° for the
+  off-center placement alone.
 
-Expect a triangle panner (VBAP) to show ~0 here even off-centre, because it collapses onto the
+Expect a triangle panner (VBAP) to show ~0 here even off-center, because it collapses onto the
 coincident speaker, while a distance-blurred panner (DBAP) spreads and pays a real penalty. That
-difference is a genuine characterisation of the panners, not an artifact.
+difference is a genuine characterization of the panners, not an artifact.
 
 ### Stimulus, and where content dependence actually comes from
 
@@ -380,7 +380,7 @@ Measure each placement, do not eyeball it. The mic position is an input to the s
 
 The stimulus is **steady-state**, not a sweep. A swept measurement has to know its round-trip latency
 to the sample, which is most of the difficulty in `calib_capture.cpp`. Here you play and capture
-concurrently and analyse a window well inside the steady state, so device latency, driver buffering,
+concurrently and analyze a window well inside the steady state, so device latency, driver buffering,
 and the Digiface's own delay never reach the result. `VAL_SKIP` is simply "long enough that everything has
 arrived".
 
@@ -435,7 +435,7 @@ Height still hurts in absolute terms (SPCAP 1.9° → 7.9°). The panner solve r
 new height; what it cannot undo is that the array's vertical resolving power from there is worse, and
 that the alignment delays were computed for one reference height. **Horizontal displacement is a
 tracking problem. Height is a placement and calibration problem.** Different failure, different
-remedy, and pooling them into one "off-centre" number hides both.
+remedy, and pooling them into one "off-center" number hides both.
 
 **The optimizer's proxy is trustworthy for some panners and not others.** `valid_re_proxy` computes
 the energy-vector direction error and Frank spread that `bwa_layout_tool` climbs, on the same cells
@@ -470,7 +470,7 @@ Say these out loud before quoting any number from this tool.
   bandwidth: broadband best, narrowband tones far worse. The default is broadband, which is the
   *optimistic* end of that range; `--tone` reaches the other end. Always say which one a figure came
   from. The tool prints the stimulus and its analysis band in the header of every run for this reason.
-- **Synthetic stimuli only.** Broadband tone-sum or a single tone, both steady-state. Real programme
+- **Synthetic stimuli only.** Broadband tone-sum or a single tone, both steady-state. Real program
   material (speech, applause, transients) is not covered, and speech in particular sits between the
   two ends measured here. The steady-state property is what makes the measurement
   latency-independent, so supporting file playback would cost that.
@@ -484,7 +484,7 @@ Say these out loud before quoting any number from this tool.
 | `examples/validate.cpp` | `bwa_validate`, the session driver |
 | `examples/valid_capture.cpp` | full-duplex ASIO. **Rig-bound, not verified on hardware** |
 | `test/valid_test.c` | the `valid` ctest: statistics, the feed/analytic agreement, the sweep |
-| — | the `validate_sim` ctest: the whole session loop; `validate_fault`: the integrity chain |
+| - | the `validate_sim` ctest: the whole session loop; `validate_fault`: the integrity chain |
 | `test/zylia_test.c` | the `zylia` ctest: estimator, sign cross-check, integrity, order step-down |
 
 `valid_capture.cpp` carries the same caveat as `calib_capture.cpp`: it mirrors a known-good ASIO host

@@ -136,7 +136,7 @@ moves, bump the commit and check that api file's header still matches.
 
 ## Coordinate seam
 
-The core works in **room space: right-handed, +Y up, +Z forward, metres, origin on the
+The core works in **room space: right-handed, +Y up, +Z forward, meters, origin on the
 floor** — OptiTrack/Motive's default streamed frame.
 
 Godot is **also right-handed and Y-up**, so unlike Unity there is **no mirror**: positions
@@ -356,7 +356,7 @@ the dsp clock counts; the `_seconds` twins are conveniences over the resolved sa
 
 The rule behind all three, if you are adding a call: **a unit belongs in the name when the quantity
 has two live units in this engine.** Time does — frames and seconds are both real here — so every
-time-valued name says which. Nothing else does: distances are metres, frequencies Hz, angles
+time-valued name says which. Nothing else does: distances are meters, frequencies Hz, angles
 radians, gains linear (a decibel value would have to say `_db`), and suffixing those would add
 noise without removing a decision.
 

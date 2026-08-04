@@ -159,9 +159,9 @@ Assets/
 
 ### Seeing the room
 
-`Engine` draws the **speaker array** in the scene view, each speaker labelled with its channel index —
+`Engine` draws the **speaker array** in the scene view, each speaker labeled with its channel index —
 so, with `RoomConstraints`, the whole CAVE (truss, screens, projectors, speakers) is visible while you
-work, in real metres.
+work, in real meters.
 
 Two details worth knowing. Stopped, the speaker positions come from the layout **file**; in Play mode
 they come from the **engine**, and each speaker lights up with that channel's live output level (a dead
@@ -182,7 +182,7 @@ and you see it light up.
 
 It's a viewer, not a control: it only reads `bwa_get_speakers` / `bwa_get_bus_levels`, never writes audio
 state, and deleting it changes nothing you can hear. The markers are **unlit** deliberately (a CAVE is
-dark, so the colour computed is the colour seen — no lighting rig to set up), and the meter has an
+dark, so the color computed is the color seen — no lighting rig to set up), and the meter has an
 instant attack with a slow release, because the engine reports a per-*block* peak that strobes too fast
 to read raw.
 
@@ -263,7 +263,7 @@ you must, but hand the finished buffers to `Push` from `Update`/`LateUpdate`.
 
 Occlusion and reflections need the room's geometry. Two ways to author it, both **load-time**:
 
-- **Simple box** — tick `Enable Room Box` on `Engine`, set the size (metres) and a material preset.
+- **Simple box** — tick `Enable Room Box` on `Engine`, set the size (meters) and a material preset.
 - **Per-object meshes** — add **`AcousticGeometry`** to any object with a mesh (or set a low-poly
   `Mesh Override`) and assign a **material**. `Engine` bakes every one of them (plus the box, if on)
   into the engine's scene at startup — transforming each mesh from Unity world into room space.

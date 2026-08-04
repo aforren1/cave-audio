@@ -23,7 +23,7 @@ namespace BwAudio
         [Tooltip("Low-poly acoustic mesh. If empty, the sibling MeshFilter's sharedMesh is used.")]
         public Mesh meshOverride;
 
-        [Tooltip("Only push a new pose when it moved more than this many metres (0 = every frame).")]
+        [Tooltip("Only push a new pose when it moved more than this many meters (0 = every frame).")]
         public float positionEpsilon = 0.002f;
         [Tooltip("Only push a new pose when it rotated more than this many degrees (0 = every frame).")]
         public float angleEpsilon = 0.25f;

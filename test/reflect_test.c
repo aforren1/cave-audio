@@ -2,7 +2,7 @@
  * reflect_test.c — directional reflection-bed regression test (with-SDK only).
  *
  * Protects the property that the hybrid reverb bed renders DIRECTIONAL early reflections (not the
- * old omni-only workaround): with the listener placed off-centre — close to the +X wall of a box —
+ * old omni-only workaround): with the listener placed off-center — close to the +X wall of a box —
  * the reflections off that near wall must decode louder into the +X-facing speakers than the -X
  * ones. This exercises the full bw_audio path (phonon ambisonic convolution -> custom 26-speaker
  * decode -> bus sum) and depends on the vendored phonon's alignment patch (multichannel reflections
@@ -27,8 +27,8 @@ int main(void) {
     Layout L = layout_default();
     rt_set_layout(rt, &L);
 
-    /* Promote the off-centre listener pose BEFORE the reflection sim starts, so its accumulating
-     * energy field is built for (2,1.5,0) from the first tick (never the centred default). 1 m from
+    /* Promote the off-center listener pose BEFORE the reflection sim starts, so its accumulating
+     * energy field is built for (2,1.5,0) from the first tick (never the centered default). 1 m from
      * the +X wall, 5 m from -X, on the array's ear plane (floor origin: ears at y=1.5). */
     float p[3] = { 2.0f, 1.5f, 0.0f }, q[4] = { 0.0f, 0.0f, 0.0f, 1.0f };
     float* bus = (float*)calloc((size_t)BWA_CHANNELS * BLK, sizeof(float));

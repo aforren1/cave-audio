@@ -6,7 +6,7 @@
 // renderers, which is what this makes. Same data behind both (bwa_get_speakers + bwa_get_bus_levels).
 //
 // The markers are UNLIT on purpose: a CAVE is dark, and a lit material would need lights and would read
-// as geometry. Unlit means the colour you compute IS the colour you see, so a hot channel glows.
+// as geometry. Unlit means the color you compute IS the color you see, so a hot channel glows.
 //
 // It reads levels and draws; it never writes audio state. Deleting it changes nothing you can hear.
 using System;
@@ -19,13 +19,13 @@ namespace BwAudio
     public sealed class SpeakerView : MonoBehaviour
     {
         [Header("Markers")]
-        [Tooltip("Marker radius in metres.")]
+        [Tooltip("Marker radius in meters.")]
         [Range(0.01f, 0.5f)] public float radius = 0.08f;
         [Tooltip("Grow the marker with level as well as brightening it — easier to read from across the room.")]
         public bool scaleWithLevel = true;
         [Range(1f, 3f)] public float maxScale = 1.8f;
 
-        [Header("Colour")]
+        [Header("Color")]
         public Color idle = new Color(0.10f, 0.22f, 0.35f);   // dim, but visible: you can still see the array
         public Color hot  = new Color(1.00f, 0.60f, 0.15f);
 
@@ -115,7 +115,7 @@ namespace BwAudio
             }
         }
 
-        // The colour property differs by pipeline (URP/HDRP use _BaseColor, built-in Unlit uses _Color),
+        // The color property differs by pipeline (URP/HDRP use _BaseColor, built-in Unlit uses _Color),
         // so pick the shader first, then ask the material which one it actually has.
         Material MakeUnlitMaterial()
         {

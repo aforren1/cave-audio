@@ -114,8 +114,8 @@ func _test_geometry_merge() -> void:
 	var walls := room.wall_faces()
 	_check(walls.size() == 36, "a shoebox should be 12 triangles, got %d verts" % walls.size())
 
-	# Floor-based and centred, matching the core's own box (x/z centred on the node, y from
-	# 0 up). A binding that built a centre-origin box would put the floor at -h/2 and every
+	# Floor-based and centered, matching the core's own box (x/z centered on the node, y from
+	# 0 up). A binding that built a center-origin box would put the floor at -h/2 and every
 	# reflection would arrive from the wrong place.
 	var lo := walls[0]
 	var hi := walls[0]
@@ -126,17 +126,17 @@ func _test_geometry_merge() -> void:
 	_check(is_equal_approx(lo.y, 0.0), "the box floor should sit at y = 0, got %f" % lo.y)
 	_check(is_equal_approx(hi.y, size.y), "the box ceiling should be at y = height")
 	_check(is_equal_approx(lo.x, -size.x / 2) and is_equal_approx(hi.x, size.x / 2),
-		"the box should be centred in x")
+		"the box should be centered in x")
 	_check(is_equal_approx(lo.z, -size.z / 2) and is_equal_approx(hi.z, size.z / 2),
-		"the box should be centred in z")
+		"the box should be centered in z")
 
 	# Inward-facing normals: the listener is INSIDE, so every triangle's normal must point
-	# toward the room centre. Get this backwards and the ray tracer sees an open box.
-	var centre := Vector3(0, size.y / 2, 0)
+	# toward the room center. Get this backwards and the ray tracer sees an open box.
+	var center := Vector3(0, size.y / 2, 0)
 	var outward := 0
 	for t in range(0, walls.size(), 3):
 		var n := (walls[t + 1] - walls[t]).cross(walls[t + 2] - walls[t])
-		if n.dot(centre - walls[t]) < 0.0:
+		if n.dot(center - walls[t]) < 0.0:
 			outward += 1
 	_check(outward == 0, "%d of 12 box triangles face outward" % outward)
 

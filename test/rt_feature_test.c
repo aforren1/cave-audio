@@ -2,7 +2,7 @@
  * rt_feature_test.c — the spatial-feature DSP half of the old rt_test monolith, driven off the RT
  * path (single-threaded, deterministic). Where rt_core_test.c pins rt.c's machinery (rings, commit,
  * generation handles, voice lifecycle, scheduling, streaming, limiter, readbacks), this pins the
- * DSP behaviour toggles layered on top: the ambisonic bed + bed renderers (rotation/orientation/
+ * DSP behavior toggles layered on top: the ambisonic bed + bed renderers (rotation/orientation/
  * parametric/max-rE + band split), the panner variants (dual-band) and reflection/pathing taps,
  * source spread (lobe/MDAP/spectral) + extent + frame transport + near-spread + metric size,
  * decorrelation, pathing transmission EQ, air absorption + Doppler + loudness comp + near-field
@@ -18,7 +18,7 @@
 #include "rt_test_util.h"
 
 int main(void) {
-    LD = layout_default();                          /* listener stays at the default (the array centre, LD.ref) */
+    LD = layout_default();                          /* listener stays at the default (the array center, LD.ref) */
     const char* WAV = "bwa_rt_fconst.wav";          /* distinct from rt_core_test's scratch wav */
     if (!write_const_wav(WAV, 1.0f, 8 * N)) { printf("FAIL: write wav\n"); return 1; }
     char err[256] = {0};
@@ -108,7 +108,7 @@ int main(void) {
             int matched = 1;
             for (int k = 0; k < 4; ++k) if (fabs((double)g_path_cap[k] - want[k]) > 1e-3) matched = 0;
             CHECK(matched, "accumulator lands on s*shCoeffs (s=1) — the indirect field is encoded from the published directions");
-            /* bending-loss EQ: a non-flat band tilt colours the indirect signal BEFORE the SH-encode. The
+            /* bending-loss EQ: a non-flat band tilt colors the indirect signal BEFORE the SH-encode. The
              * source is DC (s=1) and the RBJ low-shelf DC gain is exactly its band gain, so {0.5,1,1} scales
              * every SH channel by 0.5 once the band-gain slew + biquads settle -> accumulator = 0.5*shCoeffs. */
             const float eqtilt[3] = { 0.5f, 1.0f, 1.0f };
@@ -730,7 +730,7 @@ int main(void) {
         }
     }
 
-    /* multi-listener compromise (rt_set_extra_listeners): one listener west of a centred source
+    /* multi-listener compromise (rt_set_extra_listeners): one listener west of a centered source
      * biases the render east (DBAP weights the source's bearing); adding a mirrored second listener
      * makes the compromise SYMMETRIC at unchanged total power; clearing restores the bias. */
     {
@@ -740,7 +740,7 @@ int main(void) {
             uint32_t sm = rt_load_sound(cm, WAV, err, sizeof err);
             uint32_t hm = rt_source_create(cm);
             rt_source_play(cm, hm, sm, true);
-            rt_source_set_pos(cm, hm, 0.f, 1.5f, 0.f);       /* the array centre */
+            rt_source_set_pos(cm, hm, 0.f, 1.5f, 0.f);       /* the array center */
             const float qid2[4] = { 0, 0, 0, 1 };
             rt_set_listener(cm, (const float[3]){ -1.f, 1.5f, 0.f }, qid2);
             rt_commit(cm); render2(cm);
@@ -987,7 +987,7 @@ int main(void) {
                 uint32_t nf = rt_load_sound(ce, NW4, err, sizeof err);
                 uint32_t hx = rt_source_create(ce);
                 rt_source_play(ce, hx, nf, true);
-                rt_source_set_pos(ce, hx, 1.5f, 1.5f, 0.f);          /* the +x wall's centre speaker */
+                rt_source_set_pos(ce, hx, 1.5f, 1.5f, 0.f);          /* the +x wall's center speaker */
                 bwa_timestamp tse = { 0, 0 };
                 /* vertical spill: energy on speakers OFF the source's horizontal plane (y != 1.5) */
                 #define VSPILL(OUT) do { double v_ = 0, t_ = 0;                                \
@@ -1104,7 +1104,7 @@ int main(void) {
                 for (int b = 0; b < 3; ++b) room.absorb[f][b] = 0.1f;
             rt_set_ism_room(ci, &room);
             const float qi[4] = { 0, 0, 0, 1 };
-            rt_set_listener(ci, (const float[3]){ 0.f, 1.5f, 0.f }, qi);   /* centre of the room */
+            rt_set_listener(ci, (const float[3]){ 0.f, 1.5f, 0.f }, qi);   /* center of the room */
 
             const char* IW = "bwa_rt_imp.wav";
             enum { IMP_AT = 300 };                               /* fires after the voice's one-block gain ramp-in */
@@ -1416,7 +1416,7 @@ int main(void) {
         }
     }
 
-    /* dual-band panning: low band amplitude-normalised (Sigma|g|=gain), high band power (Sigma g^2=gain^2) */
+    /* dual-band panning: low band amplitude-normalized (Sigma|g|=gain), high band power (Sigma g^2=gain^2) */
     {
         RtCore* cdb = rt_create(8, 4, RATE, CH);
         CHECK(cdb != NULL, "rt_create (dual-band)");

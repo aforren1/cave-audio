@@ -5,7 +5,7 @@
     "gain": "decibels",
     "delay": "milliseconds"
   },
-  "coordinate_space": "room, right-handed, +y up, +z forward (matches OptiTrack/Motive default); origin ON THE FLOOR at the working-area centre (x/z); y = height above the floor",
+  "coordinate_space": "room, right-handed, +y up, +z forward (matches OptiTrack/Motive default); origin ON THE FLOOR at the working-area center (x/z); y = height above the floor",
   "reference": {
     "alignment": "max-distance",
     "speed_of_sound_mps": 343,

@@ -90,7 +90,7 @@ func polyline(points: PackedVector3Array, color: Color, closed: bool = false) ->
 		line(points[points.size() - 1], points[0], color)
 
 
-## A wire quad, given centre and two half-extent axes: the occluder panels.
+## A wire quad, given center and two half-extent axes: the occluder panels.
 func quad(c: Vector3, u: Vector3, v: Vector3, color: Color) -> void:
 	var p := PackedVector3Array([c - u - v, c + u - v, c + u + v, c - u + v])
 	polyline(p, color, true)
@@ -103,13 +103,13 @@ func quad(c: Vector3, u: Vector3, v: Vector3, color: Color) -> void:
 ##
 ## The axis spurs are not decoration. Room space puts the listener's RIGHT at -X, which is
 ## the opposite of most people's reflex, and a scene with left and right swapped looks
-## completely plausible. Labelling the floor makes the convention visible instead of
+## completely plausible. Labeling the floor makes the convention visible instead of
 ## something you have to already know.
-func floor_grid(centre: Vector3, extent: float, step: float) -> void:
+func floor_grid(center: Vector3, extent: float, step: float) -> void:
 	var faint := Color(1, 1, 1, 0.07)
 	var mid := Color(1, 1, 1, 0.14)
-	var cx: float = roundf(centre.x / step) * step
-	var cz: float = roundf(centre.z / step) * step
+	var cx: float = roundf(center.x / step) * step
+	var cz: float = roundf(center.z / step) * step
 	var n := int(extent / step)
 	for i in range(-n, n + 1):
 		var col := mid if i % 5 == 0 else faint
@@ -134,11 +134,11 @@ func floor_grid(centre: Vector3, extent: float, step: float) -> void:
 
 
 ## An axis-aligned wire box, floor-based like the engine's own shoebox (y from 0 to size.y).
-func room_box(centre_xz: Vector3, size: Vector3, color: Color) -> void:
+func room_box(center_xz: Vector3, size: Vector3, color: Color) -> void:
 	var hw := size.x * 0.5
 	var hd := size.z * 0.5
-	var lo := Vector3(centre_xz.x - hw, 0.0, centre_xz.z - hd)
-	var hi := Vector3(centre_xz.x + hw, size.y, centre_xz.z + hd)
+	var lo := Vector3(center_xz.x - hw, 0.0, center_xz.z - hd)
+	var hi := Vector3(center_xz.x + hw, size.y, center_xz.z + hd)
 	var c := [
 		Vector3(lo.x, lo.y, lo.z), Vector3(hi.x, lo.y, lo.z),
 		Vector3(hi.x, lo.y, hi.z), Vector3(lo.x, lo.y, hi.z),

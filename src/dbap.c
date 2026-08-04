@@ -1,8 +1,8 @@
 /*
  * dbap.c — listener-relative DBAP. For each speaker we combine (a) DBAP proximity to the
  * source, blurred by r to control spread, with (b) a directional weight toward the
- * source's bearing *from the listener* so off-centre listeners still get a correct
- * distribution; then normalise for constant power and scale by user gain and the
+ * source's bearing *from the listener* so off-center listeners still get a correct
+ * distribution; then normalize for constant power and scale by user gain and the
  * source->listener distance attenuation. The exponents/r/curve are tuning knobs to dial
  * against the real array (docs/spatialization.md). This is the M4 first cut.
  */

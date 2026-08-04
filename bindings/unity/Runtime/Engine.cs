@@ -70,8 +70,8 @@ namespace BwAudio
         [Tooltip("DBAP: listener-relative, for a MOVING observer (the CAVE case). SPCAP/VBAP assume a " +
                  "FIXED listener — sharper, but only at the sweet spot.")]
         public BwaPanner panner = BwaPanner.Dbap;
-        [Tooltip("Split at ~700 Hz and pan the low band with amplitude normalisation: sharper LF " +
-                 "localisation for a near-centred listener. Sweet-spot dependent.")]
+        [Tooltip("Split at ~700 Hz and pan the low band with amplitude normalization: sharper LF " +
+                 "localization for a near-centered listener. Sweet-spot dependent.")]
         public bool dualBand = false;
         [Tooltip("How a source's spread renders. LOBE: one reshaped solve (cheap, smooth). MDAP: a ring of " +
                  "virtual sources panned with the selected panner (panner-true, ~13x the solve cost). " +
@@ -98,7 +98,7 @@ namespace BwAudio
         public BwaBedDecoder bedDecoder = BwaBedDecoder.Allrad;
         [Tooltip("MATRIX: the static SH->speaker decode. PARAMETRIC: DirAC analysis re-pans the directional " +
                  "part through the listener-relative panner — a recorded soundfield becomes WALKABLE " +
-                 "(correct directions + parallax off-centre). Live: beds crossfade, so it A/Bs.")]
+                 "(correct directions + parallax off-center). Live: beds crossfade, so it A/Bs.")]
         public BwaBedRenderer bedRenderer = BwaBedRenderer.Matrix;
         [Tooltip("max-rE weighting on the bed decode (and the FDN's render): tapers the high ambisonic " +
                  "orders — fewer decode sidelobes, better localization AWAY from the sweet spot (the " +
@@ -155,7 +155,7 @@ namespace BwAudio
 
         [Header("Room box (load-time; optional acoustic geometry)")]
         [Tooltip("A shoebox enclosure for occlusion/reflections, drawn as a yellow wireframe in the " +
-                 "scene view. FLOOR-BASED: centred on the origin in x/z, running from y=0 up to its " +
+                 "scene view. FLOOR-BASED: centered on the origin in x/z, running from y=0 up to its " +
                  "height. For anything more detailed, use AcousticGeometry instead.")]
         public bool enableRoomBox = false;
         public Vector3 roomSizeMetres = new Vector3(3f, 3f, 3f);
@@ -795,7 +795,7 @@ namespace BwAudio
             }
         }
 
-        // Append a FLOOR-based box (room metres: x/z centred, y from 0 up to size.y — matching
+        // Append a FLOOR-based box (room meters: x/z centered, y from 0 up to size.y — matching
         // bwa_scene_set_box), inward-facing normals (the listener is inside).
         static void AddBox(List<float> verts, List<int> tris, List<uint> triMat, Vector3 size, uint mat)
         {
@@ -815,7 +815,7 @@ namespace BwAudio
         }
 
         // Emit a box triangle, flipping the last two indices so its normal points toward the box
-        // centre (toward the ORIGIN would degenerate: a floor-based box's bottom face contains it).
+        // center (toward the ORIGIN would degenerate: a floor-based box's bottom face contains it).
         static void EmitInward(Vector3[] v, Vector3 ctr, List<int> tris, int baseIdx, int i0, int i1, int i2)
         {
             Vector3 n = Vector3.Cross(v[i1] - v[i0], v[i2] - v[i0]);
@@ -881,7 +881,7 @@ namespace BwAudio
         }
 
         // ---- scene view ------------------------------------------------------------------------------
-        // Everything here is drawn in ROOM metres through the inverse of the coordinate seam, so a wrong
+        // Everything here is drawn in ROOM meters through the inverse of the coordinate seam, so a wrong
         // Room.UnityToRoom puts the array and the box visibly in the wrong place — which is the cheapest
         // possible check on the one setting that silently ruins spatial audio.
         void OnDrawGizmos()

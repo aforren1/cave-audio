@@ -7,7 +7,7 @@
  * either at the listener (tracked) or at the sweet spot (fixed), over a listener set that separates
  * horizontal displacement from HEIGHT.
  *
- * Height is its own axis on purpose. Off-centre-in-the-plane and off-centre-in-height are different
+ * Height is its own axis on purpose. Off-center-in-the-plane and off-center-in-height are different
  * failure modes: this array's speakers sit mostly above ear level, and the layout's alignment delays
  * time-align arrivals at ONE reference point, so a seated or tall listener is mis-aligned in a way a
  * horizontal step does not reproduce. Pooling the two would average away both.
@@ -300,7 +300,7 @@ int main(void) {
      * layout_tool optimizes speaker positions against the energy-vector direction error and the Frank
      * spread. Those are GAIN-domain proxies: a weighted sum of speaker directions, blind to what the
      * speakers' outputs do to each other at a point. The harness sums real acoustic pressure at 19
-     * capsules. Correlating the two says whether the cheap thing the optimizer maximises actually
+     * capsules. Correlating the two says whether the cheap thing the optimizer maximizes actually
      * tracks the expensive thing a measurement will report.
      *
      * Reported POOLED and WITHIN-POSITION, because that distinction is where the published analysis

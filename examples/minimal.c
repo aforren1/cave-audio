@@ -8,10 +8,10 @@
  *
  * Runs anywhere: the binaural profile auto-picks a 2-ch ASIO device (headphones)
  * and falls back to the silent offline sink without one -- bwa_get_audio_backend says
- * which you got. Room frame is right-handed, +y up, +z forward, metres, origin on
+ * which you got. Room frame is right-handed, +y up, +z forward, meters, origin on
  * the FLOOR (Motive's default; an identity listener faces +z, right ear at -x, and
  * y is height above the floor); with no layout file the engine pans over its default
- * grid, a 3 m cube of 26 speakers with its centre (the ear point) at (0, 1.5, 0).
+ * grid, a 3 m cube of 26 speakers with its center (the ear point) at (0, 1.5, 0).
  *
  *   bwa_minimal [sound.wav] [--driver name]
  *     (no wav: a short ping is synthesized and used; no --driver: auto-pick the first
@@ -99,7 +99,7 @@ int main(int argc, char** argv) {
             have_clk = bwa_get_clock(e, &cs0, &ct0);
         float a = (float)(6.283185307179586 * frame / (3.0 * 60.0));   /* one lap / 3 s */
         bwa_source_set_pos(e, src, 2.f * cosf(a), 1.5f, -2.f * sinf(a));
-        bwa_set_listener_pose(e, 0.f, 1.5f, 0.f, 0.f, 0.f, 0.f, 1.f);   /* standing at the array centre */
+        bwa_set_listener_pose(e, 0.f, 1.5f, 0.f, 0.f, 0.f, 0.f, 1.f);   /* standing at the array center */
         bwa_commit(e);                          /* promote this frame's updates as one snapshot */
         Sleep(16);                             /* ~60 Hz, like an engine tick */
     }

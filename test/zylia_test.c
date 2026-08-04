@@ -14,7 +14,7 @@
 static int fails = 0;
 #define CHECK(cond, msg) do { if (!(cond)) { printf("FAIL: %s\n", msg); ++fails; } } while (0)
 
-/* exact arrival time at each capsule for a source at `src`, array centred at `center`. */
+/* exact arrival time at each capsule for a source at `src`, array centered at `center`. */
 static void synth(const float center[3], const double src[3], double latency, double c, double arr[ZYLIA_MICS]) {
     float dirs[ZYLIA_MICS][3]; float R; zylia_geometry(dirs, &R);
     for (int i = 0; i < ZYLIA_MICS; ++i) {
@@ -147,7 +147,7 @@ static void test_geometry(void) {
  * This is the test the others can't be. Build a "real" array that differs from the built-in table in
  * exactly the ways a real ZM-1 on a real stand does — its channels PERMUTED (node i is not ASIO input
  * i), the whole thing ROTATED (nobody knows which capsule faces front, and nobody aimed the stand),
- * and each capsule nudged half a millimetre — then synthesize claps off the EXACT spherical wavefront
+ * and each capsule nudged half a millimeter — then synthesize claps off the EXACT spherical wavefront
  * and check the survey recovers it. Both of those corruptions preserve every structural invariant
  * test_geometry() checks, and both are invisible to every other test in this file, because they all
  * synthesize and recover through the same table. Here they are the thing under test.
@@ -223,7 +223,7 @@ static void test_survey(void) {
      * little more error than that, and necessarily so: a translation of the whole cloud is invisible to
      * arrival times (see zylia.c), so the origin is pinned by assuming the capsules lie on a sphere —
      * and this truth array deliberately does NOT, having been perturbed by +-0.5 mm of build tolerance.
-     * That non-sphericity is the entire budget for the sub-0.2 mm centre error below. It costs nothing
+     * That non-sphericity is the entire budget for the sub-0.2 mm center error below. It costs nothing
      * where it counts: DOA is translation-invariant, which is why it comes out exact. */
     CHECK(resid_us < 0.02f, "residual ~5 ns: the recovered shape explains the arrivals exactly");
     CHECK(worst < 3e-4, "every capsule within 0.3 mm — through a permutation, a rotation, and 0.5 mm of slop");
@@ -303,7 +303,7 @@ static void test_survey(void) {
         CHECK(acos(fmax(-1.0, fmin(1.0, dot))) * 180.0 / 3.14159265358979 < 1.0,
               "the LOADED survey drives the solve — persistence reaches zylia_doa, not just the parser");
 
-        /* a mm-vs-m slip would put capsules 49 metres out and quietly destroy every direction */
+        /* a mm-vs-m slip would put capsules 49 meters out and quietly destroy every direction */
         {
             float bad[ZYLIA_MICS][3];
             for (int i = 0; i < ZYLIA_MICS; ++i)
@@ -432,7 +432,7 @@ int main(void) {
      * mismatch is deliberately harmless: a wrong RADIAL model is one complex scalar per DEGREE, and
      * all three first-order components share a degree, so it can scale or flip the intensity vector
      * but CANNOT rotate it. Which makes this exactly the check worth having — it is blind to the
-     * modelling approximation and maximally sensitive to a sign error, the failure that matters.
+     * modeling approximation and maximally sensitive to a sign error, the failure that matters.
      */
     {
         const double FS = 48000.0;
@@ -613,7 +613,7 @@ int main(void) {
             /* the same exclusion carries into the cross-check estimator */
             float ds[3];
             int oks = zylia_srp_doa(wptr, NS, FS, C, 400.0, 1200.0, flags, ds);
-            CHECK(oks && ang_deg(ds, truth) < 4.0, "SRP-PHAT honours the exclusion mask too");
+            CHECK(oks && ang_deg(ds, truth) < 4.0, "SRP-PHAT honors the exclusion mask too");
         }
 
         /* Each remaining fault mode on its own capsule, so no flag is ambiguous. */
@@ -681,7 +681,7 @@ int main(void) {
         const double C2 = 343.0;
         float base[ZYLIA_MICS][3];
         zylia_set_capsules(NULL);
-        zylia_capsules(base);                       /* the built-in table, array-centred */
+        zylia_capsules(base);                       /* the built-in table, array-centered */
 
         /* two mount poses: A = where it was surveyed, B = where it ended up after a remount */
         float qA[4] = { 0.0f, 0.3827f, 0.0f, 0.9239f };            /* 45 deg yaw */

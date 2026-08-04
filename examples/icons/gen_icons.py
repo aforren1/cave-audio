@@ -109,7 +109,7 @@ def glyph_bw_audio(d):
 
     Not a tool but the LIBRARY, so the glyph is the thing every tool is about: the
     speaker ring with a source panned into it. One dot is lit and a wavefront runs from
-    it through the listener at the centre -- the array, the source, the ear point."""
+    it through the listener at the center -- the array, the source, the ear point."""
     import math
     pts = ring_pts(10, 300)
     for i, (x, y) in enumerate(pts):

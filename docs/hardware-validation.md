@@ -17,7 +17,7 @@ What only the rig can prove:
 - the **by-ear checks** (HRTF quality, the A/B/X knob bake-off, room EQ on the array).
 
 Of these, **live Motive** (Stage 3) and the **by-ear HRTF check** (Stage 5) are the last two open
-engine milestones — every other subsystem is implemented and tested off-hardware. Clearing both
+engine milestones: every other subsystem is implemented and tested off-hardware. Clearing both
 here closes the engine work; the remaining unbuilt piece is the Unreal binding, a control client
 rather than engine work ([integration.md](./integration.md)).
 
@@ -44,7 +44,7 @@ the speakers land in their real places, and by then every tool has been run once
 
 - [ ] **Build**: RelWithDebInfo with `-DBWA_BUILD_PLAYGROUND=ON -DBWA_BUILD_CALIBVIEW=ON
       -DBWA_BUILD_CALIBRATE=ON` (or the CI artifact, which carries all of it). Run
-      `ctest --test-dir build -C RelWithDebInfo` green *before* leaving—never debug a known
+      `ctest --test-dir build -C RelWithDebInfo` green *before* leaving: never debug a known
       failure through speakers. `phonon.dll` must sit beside `bw_audio.dll`.
 - [ ] **Dante** configured per [build.md](./build.md): 48 kHz / 24-bit end-to-end, exactly
       **one leader clock** on the net and you know which node it is (the Digiface is hardware,
@@ -58,22 +58,22 @@ the speakers land in their real places, and by then every tool has been run once
 - [ ] **ZM-1 mount, if you are tracking it** (strongly recommended, see Stage 4b). This is
       *physical* prep that has to happen before rig day, not something the software can
       arrange later:
-      - a **rigid** stand, and a rigid coupling. **No shock mount**—elastic suspension is
+      - a **rigid** stand, and a rigid coupling. **No shock mount**: elastic suspension is
         normal for microphones and exactly wrong here, because you are propagating an
         orientation through the mount.
       - markers on the **stand**, not the sphere (nothing acoustically scattering on the
         array), defined as a rigid body in Motive with its streaming ID noted.
-      - **probe the offset** from the stand's body origin to the array's acoustic centre.
-        For a rigid sphere that centre is unambiguously the geometric centre, so a Motive
-        probe on a few equator points plus the pole settles it. Aim for a centimetre or
+      - **probe the offset** from the stand's body origin to the array's acoustic center.
+        For a rigid sphere that center is unambiguously the geometric center, so a Motive
+        probe on a few equator points plus the pole settles it. Aim for a centimeter or
         better: at Stage 4b's 1.4 m source radius, 5 cm of position error injects ~2° of
         direction error, which is the size of the effect being measured.
       - **witness-mark the collar** and do not loosen it after surveying. A quarter turn on
         the thread is 90° of azimuth error and nothing downstream will notice.
 - [ ] **Motive**: streaming enabled (defaults: multicast `239.255.42.99`, data 1511,
       command 1510), a rigid body on the tracked head; note its **streaming ID** and name.
-      Ground-plane calibrate with the origin at the **working-area centre, on the floor**:
-      that *is* the engine's room frame (right-handed, metres, +y up, +z forward), so poses
+      Ground-plane calibrate with the origin at the **working-area center, on the floor**:
+      that *is* the engine's room frame (right-handed, meters, +y up, +z forward), so poses
       pass through unchanged. Full seam: [integration.md](./integration.md) → "Coordinate seam".
 
 ## Stage 0: device bring-up (no engine)
@@ -83,13 +83,13 @@ bwa_calibrate --list-drivers        (or bwa_playground --list-drivers)
 ```
 
 - [ ] The Digiface's ASIO driver is listed with ≥ your layout's speaker count of outputs (26 for
-      the CAVE), plus one input for the mic when calibrating—or **19 inputs** for Stage 4b,
+      the CAVE), plus one input for the mic when calibrating, or **19 inputs** for Stage 4b,
       which needs the whole ZM-1 on the same device. A device exposing fewer than 19 is
       refused outright rather than fed silent channels.
 - [ ] Note the driver's **exact name** from this listing. RME registers under its own string,
       which is not the product name; nothing should hardcode a guess at it.
 - [ ] `bwa_minimal` runs and prints `backend: asio`, not the null fallback. The null sink
-      keeps everything rendering silently, so a wrong driver *looks* alive—always check
+      keeps everything rendering silently, so a wrong driver *looks* alive: always check
       `bwa_get_audio_backend`.
 - [ ] `bwa_minimal`'s **device clock** line reads within ~±100 ppm of 48000 Hz *on the Digiface*,
       and repeat runs agree. It measures the device's true rate from two `bwa_get_clock`
@@ -117,8 +117,8 @@ replaces them with acoustically surveyed ones.
 bwa_layout_tool cave_layout.json
 ```
 
-- [ ] Enter each speaker's measured position in the **room frame** — metres, floor origin at
-      the working-area centre, the frame Motive streams in (axes as in the Motive prep above).
+- [ ] Enter each speaker's measured position in the **room frame**: meters, floor origin at
+      the working-area center, the frame Motive streams in (axes as in the Motive prep above).
 - [ ] Walk the test signal across every channel (the tool drives `bwa_set_test_signal`, a
       raw post-align tone on one output; no panner involved). For each channel, confirm by
       ear it's the intended box; fix the channel map in the tool, not by re-patching Dante.
@@ -143,7 +143,7 @@ Then the real sequence:
 - [ ] **Positions**: `bwa_calibrate --localize positions.txt`. Capture at ≥ 5 known,
       non-coplanar mic positions (put an OptiTrack marker on the mic and let Motive hand
       you the positions). Cross-check the recovered positions against the drawings. (With
-      the ZM-1 surveyed and on Dante, `--zylia` does this from ONE placement — see the
+      the ZM-1 surveyed and on Dante, `--zylia` does this from ONE placement; see the
       Zylia section below.)
 - [ ] **Latency residual sane**: the localize run prints the solved system latency next
       to the driver's own digital loop (`ASIOGetLatencies`, logged at capture open). The
@@ -157,7 +157,7 @@ Then the real sequence:
       highlights outliers. A swapped channel, bad mic spot, or bogus localize solve is one
       glance here. Only then overwrite the production layout.
 - [ ] **Verify audibly**: re-run the Stage 1 walk with the calibrated layout; levels now
-      match speaker to speaker from the centre. (Delay alignment has no by-ear check with
+      match speaker to speaker from the center. (Delay alignment has no by-ear check with
       the built-in tools; trust the Diff numbers.)
 
 ### Zylia ZM-1 (if present)
@@ -177,16 +177,16 @@ Channel order and azimuth reference are the two things no off-hardware test can 
       is pinned to the orientation it was taken at, so every remount invalidates it, and
       `bwa_validate --track` refuses one. Sample the stand's pose at survey time, rotate the
       result into the mount's frame, and save it with the probed offset. Then the survey is
-      good for every placement afterwards and a remount costs nothing—which is the whole
+      good for every placement afterwards and a remount costs nothing, which is the whole
       reason to bother with the stand. See [validation.md](validation.md).
 - [ ] **One-placement position survey** (the ZM-1 alternative to `--localize`): with the survey
       installed and the ZM-1 on Dante, `bwa_calibrate --zylia --survey s.json --input <first>
       --mic x y z --ref <spk> <m>` sweeps the array once and writes every speaker position from
-      this single placement — no mic moves, and it doesn't matter where the speakers are, only
-      where they turn out to be. `--ref` is one tape-measured centre→speaker distance (it
+      this single placement: no mic moves, and it doesn't matter where the speakers are, only
+      where they turn out to be. `--ref` is one tape-measured center→speaker distance (it
       calibrates the system latency; a loopback-measured `--latency <m>` also works). Without
       either, directions print and the writeback is refused. (calibrate needs a ROOM-AXES
-      survey — it has no tracker to re-aim a body-frame one.)
+      survey: it has no tracker to re-aim a body-frame one.)
 
 **Do this before Stage 4b, not after.** Everything downstream reads the capsule table, so an
 unsurveyed or wrongly-oriented ZM-1 silently invalidates the whole session rather than failing
@@ -216,9 +216,9 @@ body in the frame.
 - [ ] **Right body**: hide/show the head markers; the readout freezes/resumes with *your*
       body, not someone else's wand.
 - [ ] **Frame agreement** (this is the room-space calibration check):
-      - stand at the room centre → position ≈ `[0, head-height, 0]`;
+      - stand at the room center → position ≈ `[0, head-height, 0]`;
       - walk toward the front wall → **+z** grows; step right → **+x** grows; the y value
-        *is* height above the floor in metres;
+        *is* height above the floor in meters;
       - face front → quaternion ≈ identity; turn left/right and confirm the sign.
       If any axis disagrees, fix it in **Motive's calibration** (ground plane / axis
       convention), not with a transform in the client; the engine takes poses unchanged.
@@ -232,12 +232,12 @@ tracker connected.
 
 - [ ] **Coordinate seam / known-position source**: place a source *at a surveyed speaker's
       position*; `examples/minimal.c` with `profile = cave` and `layout_path` set is the
-      ten-line client for this, or use your Unity/Unreal binding. `bwa_get_bus_levels`—and
-      your own ears—must peak in exactly that speaker. Repeat for a few speakers on
+      ten-line client for this, or use your Unity/Unreal binding. `bwa_get_bus_levels`,
+      and your own ears, must peak in exactly that speaker. Repeat for a few speakers on
       different walls. A consistent axis-swap or mirror here is a frame bug; find it before
       any by-ear tuning.
 - [ ] **Walk test**: park a source at a fixed room position, walk the tracked head around
-      it. The image stays **world-anchored**—it must not follow you. Panning follows your
+      it. The image stays **world-anchored**: it must not follow you. Panning follows your
       position smoothly (DBAP re-solves per frame from the tracked pose).
 - [ ] **Motion-to-ears latency → pose prediction**: estimate the lag (move the head
       side-to-side, listen for the image trailing; 20–40 ms is typical for the
@@ -277,16 +277,16 @@ that table.
       real room and noise floor rather than a model of them. Costs one extra run.
 - [ ] **Capsule health**: the tool checks once per placement and reports anything faulty.
       A *hot* capsule is the one to watch: array power still looks fine while every
-      spherical-harmonic channel is poisoned. Note every exclusion in the log—a direction
+      spherical-harmonic channel is poisoned. Note every exclusion in the log: a direction
       from 17 capsules is fine, one you *believed* came from 19 is not.
 - [ ] **Read the physical floor FIRST.** The run drives each speaker alone and reports a
       `physical floor` before any phantom number. That is instrument + survey + room, and it
       is the fastest possible check that the whole chain is sane. If a directly driven
       speaker does not land near its surveyed position, stop and fix the layout, the survey
-      or the routing—nothing measured afterwards is interpretable.
+      or the routing: nothing measured afterwards is interpretable.
 - [ ] **Sweet spot**: `bwa_validate --driver <name> --mic-in <n>`, first placement at the
       listening point. Note the matched physical-versus-phantom penalty is ~0 here by
-      symmetry; that row is a null control, not a result. The off-centre placements carry it,
+      symmetry; that row is a null control, not a result. The off-center placements carry it,
       and the table is deliberately per-placement because pooling those two shapes together
       produces a meaningless middle.
 - [ ] **The walking envelope**: work through the placements. If the stand is tracked, add
@@ -294,13 +294,13 @@ that table.
       the mount orientation; your typed placements become the plan, and the tool prints
       tracked-versus-planned with the delta so a wrong rigid body shows up immediately.
       Without tracking, *measure* each position properly: it is an input to the scoring, not
-      a label, and centimetres here are degrees in the result.
+      a label, and centimeters here are degrees in the result.
 - [ ] **Read the tracked-versus-fixed contrast**: this is the measurement that justifies
       tracking at all, and it's invisible from the sweet spot. Intervals that exclude zero
       are the claim.
 - [ ] **Height separately from horizontal**: expect these to behave differently. Tracking
       fixes horizontal displacement and does not fix height, which is a placement and
-      calibration problem instead. Don't pool them into one "off-centre" number.
+      calibration problem instead. Don't pool them into one "off-center" number.
 - [ ] **Then repeat one placement on a tone**: `--tone 1000` and, if you want the hard case,
       `--tone 250`. This is where content dependence lives, and it is the number a
       stimulus-agnostic spec cannot give you. Two mechanisms contribute and only one is the
@@ -323,7 +323,7 @@ listener, who gets two ears, head movement and the precedence effect.
 
 ## Stage 5: by-ear checks
 
-The checks with no assertion—bring ears you trust.
+The checks with no assertion: bring ears you trust.
 
 - [ ] **HRTF monitor quality** (the standing "remaining" item): `bwa_playground`,
       localization scene, headphones. Timbre, externalization, front/back: laterality is
@@ -337,7 +337,7 @@ The checks with no assertion—bring ears you trust.
       (`--score <layout> [epad] maxre`, 2026-08-04) has max-rE winning every axis on this
       array under both decoders and both observer models, including AT the sweet spot,
       where classical theory says plain decode should win. An irregular 26-array's decode
-      sidelobes bend rE even at centre; the taper suppresses them. If the rig agrees,
+      sidelobes bend rE even at center; the taper suppresses them. If the rig agrees,
       `bwa_set_max_re` defaulting to OFF is the wrong default and should flip. EPAD is
       worst without the taper and best with it: bake off decoder and taper as PAIRS.
 - [ ] **Tracked room EQ** (if the install wants it): one `bwa_calibrate --room-eq-grid

@@ -195,7 +195,7 @@ void steam_reflect_set_gain(SteamReflect* r, float linear) {
 /* Precompute the listener-centric reverb at a grid of probes covering the listening zone, then attach
  * the batch to the simulator so the sim thread looks the reverb up instead of ray-tracing each tick.
  * Probes are placed MANUALLY (one CENTROID call per grid point) because UNIFORMFLOOR's floor-finding is
- * mesh-winding-sensitive. NB: phonon's CENTROID generator reads the probe CENTRE from the transform's
+ * mesh-winding-sensitive. NB: phonon's CENTROID generator reads the probe CENTER from the transform's
  * translation column and the influence radius from the basis lengths (min/2) — so the translation is
  * the grid POINT (not a corner), and a box of 2*spacing gives radius == spacing => overlapping coverage,
  * which is what getInfluencingProbes needs to match the listener to a probe. */
@@ -219,7 +219,7 @@ static int do_bake(SteamReflect* r, const Layout* L) {
         if (iplProbeArrayCreate(r->ctx, &pa) != IPL_STATUS_SUCCESS) continue;
         IPLProbeGenerationParams gp; memset(&gp, 0, sizeof gp);
         gp.type = IPL_PROBEGENERATIONTYPE_CENTROID;
-        gp.transform.elements[0][0] = bs; gp.transform.elements[0][3] = x;     /* translation = box CENTRE = the grid point */
+        gp.transform.elements[0][0] = bs; gp.transform.elements[0][3] = x;     /* translation = box CENTER = the grid point */
         gp.transform.elements[1][1] = bs; gp.transform.elements[1][3] = head;
         gp.transform.elements[2][2] = bs; gp.transform.elements[2][3] = z;
         gp.transform.elements[3][3] = 1.f;

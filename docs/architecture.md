@@ -11,7 +11,7 @@ precision are first-class requirements.
 
 The spatializer, mixer, device output, and tracking ingest all live in one native
 process behind a single audio callback. Unity/Unreal call a C ABI to trigger sounds
-and push positions. **No rendered audio crosses the boundary**—the mix never
+and push positions. **No rendered audio crosses the boundary**: the mix never
 routes through the game engine, only control. (The opt-in push-source API feeds
 caller-generated PCM *into* the engine over the same control thread; that is a
 source feed, not a render path.)
@@ -59,8 +59,8 @@ the bus; beds pass SH→SH into the same field (one diagonal) and the pathing
 accumulator sums in raw (same basis). The bus keeps the synthesized-diffuse taps
 (the FDN tail, the reflection bed), and one HRTF decode consumes both. With the
 SDK, each point voice's dry additionally rides its own `IPLBinauralEffect` (the
-mode-2 point taps — true per-source HRTF, spread power-splitting point vs field).
-It is still "render targets + consumers" — the direct field and the point taps are
+mode-2 point taps: true per-source HRTF, spread power-splitting point vs field).
+It is still "render targets + consumers": the direct field and the point taps are
 profile-gated render targets, not a parallel engine. Anything synthesized-diffuse
 belongs on the bus.
 
@@ -121,7 +121,7 @@ graph, with each stage annotated with the functions that implement and configure
  │ └→ decor split (× √spread) ─────────→ DECOR       taper); voice + ISM images then
  pan: single gains · dual-band (700 Hz) ·            accumulate to DIRECT, not BUS (dual-
       spectral (6 bands × 6 gain sets) ─→ BUS        band/decor/spectral gated off). Mode 2
-                                                     (SDK): spread power-splits the dry —
+                                                     (SDK): spread power-splits the dry -
                                                      point share √(1−s) onto the voice's OWN
                                                      mono tap (per-voice HRTF), wide √s onto
                                                      the SH field
@@ -131,7 +131,7 @@ graph, with each stage annotated with the functions that implement and configure
  SH frames → rotate (yaw phasor · full 3-axis Ivanic-Ruedenberg matrix; glided)
  ├→ matrix render: × max-rE taper (crossfaded; opt. band-split - taper > 700 Hz
  │       only, rV decode below) → bed decode (AllRAD · EPAD) ────────────────→ BUS
- ├→ BINAURAL profile: SH->SH pass — × ambi_canon_to_phonon (one diagonal) ──→ DIRECT
+ ├→ BINAURAL profile: SH->SH pass - × ambi_canon_to_phonon (one diagonal) ──→ DIRECT
  │       (max-rE + parametric are speaker-decode concerns: gated off)
  └→ parametric render (crossfaded): FOA band split → DirAC direction + diffuseness ψ
       direct  √(1−ψ)·W → listener-relative panner at the array shell ───────→ BUS
@@ -184,7 +184,7 @@ The tap ordering is deliberate, not incidental:
   raw field, and phonon's decodes (reflection bed, pathing, the HRTF monitor) are its own.
 - **Master gain sits before align** so per-speaker trims stay calibrated; the **test
   signal enters after align** so a wiring check is a raw channel, untouched by trims or
-  delays; the **limiter is last** so nothing—test signal included—can clip a driver.
+  delays; the **limiter is last** so nothing (test signal included) can clip a driver.
 
 ### How wide is the bus?
 
@@ -213,7 +213,7 @@ identical across all four:
 
 `binaural` is the first-class headphone render (point sources at their true
 directions, no array simulation in the direct path); `cave_sim` auditions the
-ARRAY render — same bus, DBAP artifacts included, the desk-verification profile.
+ARRAY render: same bus, DBAP artifacts included, the desk-verification profile.
 Both run the array render into memory; only the stereo device opens, so neither
 needs Dante hardware.
 

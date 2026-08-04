@@ -174,8 +174,8 @@ static int load_positions(const char* path, float (*out)[3], char (*names)[LBL],
  * a tracked rigid body, both the position AND the mount orientation become measurements instead.
  *
  * The survey has to be a BODY-FRAME one (zylia.h): capsules in the stand's axes plus the probed
- * offset from the stand's body origin to the array's acoustic centre. Then per placement:
- *   capsules_room = R(pose) . capsules_body      and      centre = pose_pos + R(pose) . offset
+ * offset from the stand's body origin to the array's acoustic center. Then per placement:
+ *   capsules_room = R(pose) . capsules_body      and      center = pose_pos + R(pose) . offset
  *
  * This is the easy use of the tracker — the mic is static during a capture, so one good pose per
  * placement is enough. No prediction, no velocity, no clock domain. A wrong reading is also obvious
@@ -191,7 +191,7 @@ typedef struct {
     float      planned[MAX_LIS][3];
 } TrackCtx;
 
-/* Apply one mount pose: re-aim the capsule table and derive the array centre. Split out so the
+/* Apply one mount pose: re-aim the capsule table and derive the array center. Split out so the
  * synthetic self-check pose and a real tracker pose go through EXACTLY the same maths. */
 static void track_apply(TrackCtx* T, const float p[3], const float q[4], int li, float mic_out[3]) {
     float R[9], caps_room[ZYLIA_MICS][3];
@@ -208,7 +208,7 @@ static void track_apply(TrackCtx* T, const float p[3], const float q[4], int li,
                     (double)(mic_out[2]-plan[2])*(mic_out[2]-plan[2]));
     printf("  tracked: (%.3f, %.3f, %.3f)  planned (%.2f, %.2f, %.2f)  delta %.0f mm\n",
            mic_out[0], mic_out[1], mic_out[2], plan[0], plan[1], plan[2], d * 1000.0);
-    if (d > 0.5) printf("  WARNING: half a metre from the plan — right rigid body? right frame?\n");
+    if (d > 0.5) printf("  WARNING: half a meter from the plan — right rigid body? right frame?\n");
 }
 
 static int track_place(void* user, int li, float mic_out[3]) {
@@ -555,7 +555,7 @@ int main(int argc, char** argv) {
             return 2;
         }
         if (!trk.mount.have_offset)
-            printf("NOTE: survey carries no mount offset; assuming the body origin IS the array centre\n");
+            printf("NOTE: survey carries no mount offset; assuming the body origin IS the array center\n");
         zylia_capsules(trk.caps_body);            /* the loaded table, still in body axes */
         /* snapshot the plans: `place` writes into lis[], so they cannot be read back from there */
         for (int i = 0; i < nlis && i < MAX_LIS; ++i) memcpy(trk.planned[i], lis[i], sizeof lis[i]);
@@ -676,8 +676,8 @@ int main(int argc, char** argv) {
 
         /* Physical versus phantom, MATCHED per speaker: the published comparison, nothing moved.
          * Reported PER PLACEMENT and never pooled across them. Pooling is actively misleading here:
-         * at the array centre the penalty is ~0 by symmetry (a blurred phantom's energy vector still
-         * points at the speaker), while off-centre it is degrees. Pool the two and the median lands
+         * at the array center the penalty is ~0 by symmetry (a blurred phantom's energy vector still
+         * points at the speaker), while off-center it is degrees. Pool the two and the median lands
          * in the empty middle and looks like "no effect", which is the opposite of the truth. */
         printf("\nphysical versus phantom, matched per speaker (phantom - real, same direction)\n");
         for (int li = 0; li < nlis; ++li)
@@ -708,8 +708,8 @@ int main(int argc, char** argv) {
                        (clo > 0.0 || chi < 0.0) ? "  *" : "");
             }
         printf("  A source sitting ON a speaker is still spread by a distance-blurred panner, so this\n"
-               "  penalty is real. Expect ~0 at the array centre (symmetry) and degrees off-centre;\n"
-               "  read the off-centre rows, and do not average them together.\n");
+               "  penalty is real. Expect ~0 at the array center (symmetry) and degrees off-center;\n"
+               "  read the off-center rows, and do not average them together.\n");
     }
 
     if (simulate)

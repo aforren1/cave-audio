@@ -14,8 +14,8 @@
  * where phantom error actually comes from — but NO ROOM. Measured phantom error in a real room is
  * roughly a rendering term plus a room term; this isolates the RENDERING term, which is the one
  * placement and panner choice control, and the one that varies as the listener walks. The room term
- * needs hardware and is not modelled here. Do not read a simulated miss as a predicted in-room miss;
- * read it as the floor that the room then adds to. (Modelling the room here would repeat the
+ * needs hardware and is not modeled here. Do not read a simulated miss as a predicted in-room miss;
+ * read it as the floor that the room then adds to. (Modeling the room here would repeat the
  * calibration trap of matching a measured RT60: see docs/calibration.md.)
  *
  * THE COMPARISON THIS EXISTS FOR. A fixed-sweet-spot renderer and a tracked one are not distinguished
@@ -192,9 +192,9 @@ int valid_reference_cell(const Layout* L, int spk, const float mic[3],
 int valid_re_proxy(const Layout* L, int panner, const float solve_pos[3], const float mic[3],
                    const float src_world[3], float* re_err_deg, float* spread_deg);
 
-/* Sweep panners x listeners x targets. Sources are placed at `radius` metres from the layout's sweet
+/* Sweep panners x listeners x targets. Sources are placed at `radius` meters from the layout's sweet
  * spot along each target direction, so every listener is judged against the same physical sources —
- * which is what makes the off-centre cells comparable to the centred ones. cells_out must hold
+ * which is what makes the off-center cells comparable to the centered ones. cells_out must hold
  * npan * nlis * ntgt entries. Returns the number of cells written. */
 int valid_run(const Layout* L, const int* panners, int npan, int tracked,
               const float (*listeners)[3], int nlis,

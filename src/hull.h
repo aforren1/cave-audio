@@ -16,7 +16,7 @@
 int hull_triangulate(float (*dirs)[3], uint32_t n, int (*tri)[3], float* det, int maxtri);  /* dirs read-only */
 
 /* VBAP a unit direction `dir` onto the array: find the containing hull triangle (largest min gain),
- * write its 3 speaker indices to `spk[3]` and the clamped, L2-normalised (constant-power) gains to
+ * write its 3 speaker indices to `spk[3]` and the clamped, L2-normalized (constant-power) gains to
  * `gain[3]`. Returns 1 on success, 0 if no usable triangle (e.g. ntri == 0). (dirs, tri read-only —
  * non-const only because C won't implicitly add const through a `(*)[3]` array-pointer.) */
 int hull_vbap(const float dir[3], float (*dirs)[3], int (*tri)[3], const float* det,

@@ -20,7 +20,7 @@ int main(void) {
         r.absorb[f][0] = 0.2f; r.absorb[f][1] = 0.3f; r.absorb[f][2] = 0.6f;
     }
 
-    /* a source off-centre: 1 m from the +x wall, 3 m from -z, mid height */
+    /* a source off-center: 1 m from the +x wall, 3 m from -z, mid height */
     const float src[3] = { 4.f, 1.5f, -1.f };
     IsmImage img[ISM_IMAGES];
     int n = ism_images(&r, src, img);

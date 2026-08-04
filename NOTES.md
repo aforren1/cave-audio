@@ -80,7 +80,7 @@ encode lands on `s·shCoeffs`. The **bending-loss EQ is rendered** too: the sim 
 alongside the shCoeffs; the mixer applies the same low-shelf/peak/high-shelf biquad cascade occlusion
 uses to the *un-occluded* `s_raw` before the SH-encode (ramped + bypassed-when-flat), matching phonon's
 own `path_effect.cpp` order (EQ the mono signal, then scale each SH channel) — the `rt` test asserts a
-non-flat tilt colours the encoded field. See docs/materials.md.
+non-flat tilt colors the encoded field. See docs/materials.md.
 
 **Opt-in per-source
 propagation effects** are implemented (phonon-free,
@@ -92,7 +92,7 @@ Both compute the source↔listener distance per block, ramp per sample (invarian
 reflection send *before* themselves (direct path only); indices stay integer so a long-lived voice
 never loses sample precision. **Source spread/size** (`bwa_source_set_spread`, 0=point..1=wide) is also
 in, with three render modes behind **`bwa_set_spread_mode`** (atomic live A/B): LOBE (default) blends the
-panner's point gains toward a width-controlled lobe centred on the source direction, renormalised to the
+panner's point gains toward a width-controlled lobe centered on the source direction, renormalised to the
 panner's own power (widening never re-levels) — panner-agnostic; MDAP (Pulkki) pans a 12-direction
 virtual-source ring with the SELECTED panner and sums, so the extent inherits the panner's character
 (collapses to the point solve at spread 0); SPECTRAL (Zotter/Frank frequency-dependent panning, the
@@ -104,9 +104,9 @@ single-path gains (`fs_on` 0/1/2 in `rt.c`; the `rt` test pins all three modes +
 signature).
 
 **Dual-band panning** (`bwa_set_dual_band`, off by default, live A/B) wraps the selected panner: a 700 Hz
-complementary crossover splits each voice, the low band panned amplitude-normalised (`Σg = gain`,
-velocity-vector) and the high band power-normalised (the panners' usual `Σg² = gain²`) — SPAT's "VBP
-Dual-Band", for sharper LF localisation near the sweet spot; `compute_gains` derives `gtarget_lo` every
+complementary crossover splits each voice, the low band panned amplitude-normalized (`Σg = gain`,
+velocity-vector) and the high band power-normalized (the panners' usual `Σg² = gain²`) — SPAT's "VBP
+Dual-Band", for sharper LF localization near the sweet spot; `compute_gains` derives `gtarget_lo` every
 solve so it A/Bs live, and the mixer reads it only when on. **AllRAD adds imaginary pole speakers**: a
 pole no real speaker covers within 60° (a floor-less array's nadir) closes the hull with an imaginary
 speaker whose decode share is discarded, so downward diffuse energy is dropped instead of smeared onto
@@ -152,7 +152,7 @@ incoherent→coherent round-trip + power. **Parametric bed renderer** (`bwa_set_
 crossfade per bed): first-order DirAC in 4 time-domain bands (`mix_bed`) — per band the smoothed
 FOA intensity vector gives direction + diffuseness ψ; the direct stream (√(1−ψ)·W) re-pans through
 the LISTENER-RELATIVE panner at the array shell (`ref + bed_radius·doa` — a walkable bed: parallax
-off-centre, which no matrix decode gives), the diffuse stream (√ψ·FOA) decodes through bed_decode
+off-center, which no matrix decode gives), the diffuse stream (√ψ·FOA) decodes through bed_decode
 into the decorrelators; loudness-matched to the matrix decode via a direction-averaged plane-wave
 reference (`bed_pref`, derived in build_bed_decode). The `rt` test pins sharper-than-matrix
 localization, diffuse spread, power match both ways, and the round-trip. **Directional FDN reverb**
@@ -242,7 +242,7 @@ weighting** (`bwa_set_max_re`, off by default, live A/B): Zotter/Frank per-order
 (`ambi_max_re_weights`, diffuse-energy-normalized per content order so A/B stays level-fair) applied
 where the engine's own SH→speaker decode renders a bed's signal — `mix_bed`'s matrix paths (per-voice
 `re_mix` crossfade) and the FDN's line render (`dcomb`/`dcomb_re` pair) — suppressing decode sidelobes
-and lengthening the energy vector (better off-centre localization, THE walking-listener case);
+and lengthening the energy vector (better off-center localization, THE walking-listener case);
 point-source panners and phonon's own decodes untouched (the `ambi`/`dsp`/`rt`/`fdn` tests pin the
 weights, the rE lengthening through AllRAD, the rear-sidelobe shrink + level fairness, and the FDN
 pair). **Band-split max-rE** (`bwa_set_max_re_split`, off by default, live A/B, needs max_re on): the
@@ -369,7 +369,7 @@ test) is the one-placement complement to the multi-position omni survey: the 19-
 arrive at 19 times, so the arrival-time DIFFERENCES give a speaker's DIRECTION from ONE spot (latency-free,
 sub-degree — `zylia_doa`), and with the known latency a Gauss-Newton refine against the exact spherical
 wavefront gives the full position (`zylia_localize`). Distance is latency-limited (the array is too small to
-self-calibrate latency at metres). Spatial room capture (early-reflection DOA) is still DESIGN ONLY — nothing
+self-calibrate latency at meters). Spatial room capture (early-reflection DOA) is still DESIGN ONLY — nothing
 consumes `er_delay` directionally yet. The capsule geometry is REAL: the ZM-1's 19 capsules are a vertex-up
 **dodecahedron minus the nadir vertex** (Zylia's published node table; built from closed forms —
 `asin(√5/3)`, `asin(1/3)`, `atan(√(3/5))` — so nothing is rounded), and the `zylia` test pins the structure
@@ -385,7 +385,7 @@ sweep, no sample-sync and no second audio device**. Two subtleties the code docu
 SPHERE (curvature across the array is a systematic ~1.4 µs ≈ 2–3 mm), so the solver takes source POSITIONS and
 iterates an exact-minus-plane-wave correction; and translation is a GAUGE (unobservable), where the default
 choice is wrong — the capsule set is centroid-UNbalanced (missing nadir), its centroid sitting R/19 = 2.6 mm
-off the sphere centre, so the solve re-centres on the best-fit SPHERE each iteration. Coplanar claps (a
+off the sphere center, so the solve re-centers on the best-fit SPHERE each iteration. Coplanar claps (a
 horizontal ring) leave the capsules' HEIGHTS unconstrained; `spread` measures this and below 0.05 it refuses
 rather than return a flattened array. The 19-ch ASIO capture is the rig-bound shell, factored into
 `zylia_capture.cpp` (driver open, format conversion, transient trigger, snapshot publish via `ZpShared`;

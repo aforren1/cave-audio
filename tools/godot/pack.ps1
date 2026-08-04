@@ -38,7 +38,7 @@ if (-not $OutDir) { $OutDir = Join-Path $repo 'dist/godot' }
 
 if (-not $Version) {
     # Same dev-version idea as the Unity pack: base tag + distance + hash, so a non-tag build is
-    # honestly labelled rather than pretending to be a release.
+    # honestly labeled rather than pretending to be a release.
     $Version = '0.0.0-dev'
     if (Get-Command git -ErrorAction SilentlyContinue) {
         try {

@@ -13,7 +13,7 @@ cmake --build build --config RelWithDebInfo
 
 This fetches Tracy and links its client into `bw_audio.dll`. The client is built **on-demand**, so it
 costs almost nothing until a profiler actually connects. Without `-DBWA_TRACY=ON`, the macros in
-[`src/profile.h`](../src/profile.h) compile to nothing—no dependency, no overhead.
+[`src/profile.h`](../src/profile.h) compile to nothing: no dependency, no overhead.
 
 ## What's instrumented
 
@@ -50,7 +50,7 @@ bwa_profile_bench [seconds=20] [voices=16] [cave|binaural]
 
 It prints the block budget and renders the load on the engine's render thread exactly as the ASIO
 callback would. Attach the Tracy GUI, or capture headless (below). Your real app or the playground work
-too—anything that runs the engine.
+too. So does anything that runs the engine.
 
 ## The per-situation bench (headless numbers, no GUI)
 

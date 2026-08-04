@@ -5,14 +5,14 @@
  * and trilaterating. The ZM-1 has 19 capsules on a rigid sphere, so ONE placement already sees each
  * sweep arrive at 19 slightly-different times — the arrival-time DIFFERENCES across the sphere give the
  * direction-of-arrival (DOA) directly, and (with the known system latency) the distance. So a speaker's
- * position falls out of a SINGLE Zylia placement: direction x distance + the array centre.
+ * position falls out of a SINGLE Zylia placement: direction x distance + the array center.
  *
  * Accuracy characteristics (be honest about them):
  *   - DIRECTION is latency-independent (uses arrival DIFFERENCES) and reaches ~1 deg given sub-sample
  *     arrival times (measure.c's sub-sample IR peak delivers that). This is the headline: a quick
  *     "where is every speaker, from one spot" that the multi-position omni survey can't do in one shot.
- *   - DISTANCE is only as good as the supplied system latency. The array is ~5 cm, so at metres the
- *     wavefront curvature across it is sub-millimetre of differential delay — far too weak to
+ *   - DISTANCE is only as good as the supplied system latency. The array is ~5 cm, so at meters the
+ *     wavefront curvature across it is sub-millimeter of differential delay — far too weak to
  *     self-calibrate the latency. Feed a loopback-measured latency (or fuse with calib_trilaterate).
  *
  * zylia_geometry is the real array: a vertex-up dodecahedron minus its nadir vertex (see zylia.c). What
@@ -38,7 +38,7 @@
 void zylia_geometry(float dirs[ZYLIA_MICS][3], float* radius_m);
 
 /* Direction-of-arrival from 19 per-mic arrival times (seconds; the sub-sample IR peak per channel).
- * dir_out = unit vector from the array centre TOWARD the source. Latency-independent. Returns 1 on
+ * dir_out = unit vector from the array center TOWARD the source. Latency-independent. Returns 1 on
  * success, 0 if the linear solve is singular. Far-field fit — a small near-field direction bias at
  * close range that zylia_localize's refined position removes. */
 int  zylia_doa(const double arrival_s[ZYLIA_MICS], float dir_out[3]);
@@ -80,7 +80,7 @@ int  zylia_tdoa(const float* const x[ZYLIA_MICS], uint32_t n, double fs, uint32_
  *            this). n must be >= one 2048-sample frame; frames hop by half and are Hann-windowed.
  * fs, c    = sample rate (Hz) and speed of sound (m/s); c sets ka, so it must be the real one.
  * f_lo/f_hi= analysis band (Hz). See the clamp above.
- * dir_out  = unit vector from the array centre TOWARD the source, ROOM axes (the frame zylia_geometry
+ * dir_out  = unit vector from the array center TOWARD the source, ROOM axes (the frame zylia_geometry
  *            and zylia_doa use), so it drops straight into the same angular-miss maths.
  * diffuseness_out (optional) = 0 = a clean plane wave, 1 = fully diffuse. This is the "should I
  *            believe this?" number, the counterpart of zylia_survey's resid_us: a measurement made in
@@ -161,7 +161,7 @@ int  zylia_srp_doa(const float* const x[ZYLIA_MICS], uint32_t n, double fs, doub
  * there is nothing left to pin by hand.
  *
  * Sound from a KNOWN direction d_k reaches capsule i at   tau[k][i] = t0_k - (1/c) * m_i . d_k,
- * where m_i is the capsule's position relative to the array centre. t0_k is unknown and unknowable —
+ * where m_i is the capsule's position relative to the array center. t0_k is unknown and unknowable —
  * system latency, the moment the clap happened, whichever channel zylia_tdoa chose as its reference —
  * and it does not matter: it is one constant per observation, so subtracting each observation's MEAN
  * over the 19 capsules kills it exactly (that mean IS t0_k, once the gauge sum_i m_i = 0 is imposed,
@@ -174,21 +174,21 @@ int  zylia_srp_doa(const float* const x[ZYLIA_MICS], uint32_t n, double fs, doub
  * a 49 mm array is a systematic ~1.4 us, which is 2-3 mm of capsule error if ignored. So we take the
  * source's POSITION, not merely its direction (you know where you clapped — that is how you knew the
  * direction), and iterate the exact-minus-plane-wave correction on top of the linear seed. Cost: a few
- * extra passes. Benefit: the geometry comes back to well under a millimetre.
+ * extra passes. Benefit: the geometry comes back to well under a millimeter.
  *
  * Give it K >= 6 well-SPREAD source positions. Spread is the trap: claps in a horizontal ring around
  * the array are coplanar, the normal matrix goes singular in the vertical, and the capsules' heights
  * are unrecoverable — the solve would return a flattened array rather than admit it. Clap high and low
  * too. `spread_out` measures exactly this (1 = isotropic, 0 = coplanar); below 0.05 it refuses.
  *
- * The array centre enters only as the origin the source positions are measured from, so a tape measure
- * suffices: at 2.5 m a 5 cm centre error tilts a direction by ~1 deg, which lands at the TDOA noise
- * floor. (The recovered array is centred on its own capsule centroid — that IS the array centre, and
+ * The array center enters only as the origin the source positions are measured from, so a tape measure
+ * suffices: at 2.5 m a 5 cm center error tilts a direction by ~1 deg, which lands at the TDOA noise
+ * floor. (The recovered array is centered on its own capsule centroid — that IS the array center, and
  * it is what a subsequent zylia_doa / zylia_localize is relative to.)
  *
- * src_m    = [nobs][3] source positions RELATIVE TO THE ARRAY CENTRE (m, room axes). Must be >= 0.2 m.
+ * src_m    = [nobs][3] source positions RELATIVE TO THE ARRAY CENTER (m, room axes). Must be >= 0.2 m.
  * arrival_s= [nobs][19] per-capsule arrival times, as zylia_tdoa returns them (RELATIVE is fine).
- * caps_out = [19][3] recovered capsule positions (m, array-centred, room axes, ASIO-channel-indexed).
+ * caps_out = [19][3] recovered capsule positions (m, array-centered, room axes, ASIO-channel-indexed).
  * resid_us / radius_out / spread_out = optional diagnostics: RMS fit residual in MICROSECONDS (the
  * "should I trust this?" number — exact-model, per-observation constant fitted out), the recovered mean
  * |m_i| (should land near 49 mm), and the spread above. nobs is clamped to ZYLIA_SURVEY_MAX. Returns 1
@@ -197,12 +197,12 @@ int  zylia_srp_doa(const float* const x[ZYLIA_MICS], uint32_t n, double fs, doub
 int  zylia_survey(const float src_m[][3], const double (*arrival_s)[ZYLIA_MICS], int nobs, double c,
                   float caps_out[ZYLIA_MICS][3], float* resid_us, float* radius_out, float* spread_out);
 
-/* Install a surveyed capsule table (positions in m, array-centred, ASIO-channel-indexed). zylia_doa,
+/* Install a surveyed capsule table (positions in m, array-centered, ASIO-channel-indexed). zylia_doa,
  * zylia_localize and zylia_geometry all follow it from here on. NULL reverts to the built-in table.
  * Control-thread only (these tools are single-threaded); not for the audio thread. */
 void zylia_set_capsules(const float caps_m[ZYLIA_MICS][3]);
 
-/* The capsule POSITIONS the solves actually use (m, array-centred): the installed survey if there is
+/* The capsule POSITIONS the solves actually use (m, array-centered): the installed survey if there is
  * one, else radius x the built-in dodecahedral directions. */
 void zylia_capsules(float caps_m[ZYLIA_MICS][3]);
 
@@ -222,12 +222,12 @@ void zylia_capsules(float caps_m[ZYLIA_MICS][3]);
  *
  *   survey once      caps_body = R_mount(survey)^T . caps_room     (zylia_capsules_rotate, transpose)
  *   every placement  caps_room = R_mount(now)     . caps_body      (rotate back, then set_capsules)
- *                    centre    = mount_pos + R_mount(now) . offset
+ *                    center    = mount_pos + R_mount(now) . offset
  *
- * The capsule table comes back array-centred, so directions need no translation; only the array
- * CENTRE does, and that is the `offset` below. Note the rotation falls out of the survey plus one
+ * The capsule table comes back array-centered, so directions need no translation; only the array
+ * CENTER does, and that is the `offset` below. Note the rotation falls out of the survey plus one
  * pose sample and needs no probing. The offset does need probing, because zylia_survey takes source
- * positions relative to a centre it therefore cannot solve for.
+ * positions relative to a center it therefore cannot solve for.
  *
  * MECHANICAL REQUIREMENT, and it is not optional: the coupling has to be rigid and stay rigid. No
  * shock mount, and do not loosen the collar after surveying. You are propagating an ORIENTATION
@@ -240,7 +240,7 @@ void zylia_capsules(float caps_m[ZYLIA_MICS][3]);
 typedef struct {
     int   body_frame;      /* 1 = `capsules` are in the MOUNT's body frame, not room axes */
     int   have_offset;
-    float offset_m[3];     /* mount body origin -> array acoustic centre, expressed in BODY axes */
+    float offset_m[3];     /* mount body origin -> array acoustic center, expressed in BODY axes */
 } ZyliaMount;
 
 /* Rotation matrix (ROW-major 3x3, v_room = R . v_body) from a unit quaternion in xyzw order, which
@@ -265,9 +265,9 @@ int  zylia_survey_save(const char* path, const float caps_m[ZYLIA_MICS][3],
 int  zylia_survey_load(const char* path, ZyliaMount* mount_out, char* err, int errcap);
 
 /* Full single-position localization: Gauss-Newton refine the source position against the exact
- * spherical-wavefront model. center = the array centre in room coords (m); latency_s = the known system
+ * spherical-wavefront model. center = the array center in room coords (m); latency_s = the known system
  * latency (s); c = speed of sound (m/s). pos_out = source position (m); dist_out (optional) = range
- * from the centre. Returns 1 on success, 0 on a degenerate solve. The recovered DIRECTION is precise;
+ * from the center. Returns 1 on success, 0 on a degenerate solve. The recovered DIRECTION is precise;
  * the DISTANCE inherits the latency's accuracy (see the header). */
 int  zylia_localize(const double arrival_s[ZYLIA_MICS], const float center[3],
                     double latency_s, double c, float pos_out[3], float* dist_out);

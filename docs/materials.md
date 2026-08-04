@@ -28,7 +28,7 @@ occlusion, pathing, and a real HRTF monitor. Feature by feature:
 
 **Reflections are where the homegrown path wins the argument that matters here.** Steam's reflection
 bed is listener-*centric*: one ambisonic field decoded around one point. It cannot give
-parallax—walk toward a wall and the reflection does not change direction, structurally. The ISM
+parallax: walk toward a wall and the reflection does not change direction, structurally. The ISM
 renders each bounce as a point source through the listener-relative panner, updated every block.
 For a tracked listener roaming a 3×3 m area (the engine's whole premise), that is the correct
 model. The price is that it costs per *source*, where Steam's bed costs per *scene*.
@@ -46,12 +46,12 @@ the same time**: Steam's bed already contains early reflections, so you would he
 (`bwa_source_set_early_reflections` warns once via `bwa_last_error` if the bed owns the tap).
 
 **No-SDK builds are now fully viable** for the array: ISM + FDN + manual occlusion. What you lose is
-automatic occlusion, pathing, and—the practical one for a developer working off-site—the real
+automatic occlusion, pathing, and (the practical one for a developer working off-site) the real
 HRTF monitor (the fallback is a lateral pan: fine for routing checks, useless for timbre or
 front/back).
 
 **One doctrine reminder.** The ISM's shoebox is the **virtual** environment (a hall, a corridor), not
-the CAVE room you are standing in: the physical room supplies its own reflections, and modelling it
+the CAVE room you are standing in: the physical room supplies its own reflections, and modeling it
 double-counts. Same trap as matching the measured RT60 ([calibration.md](./calibration.md)).
 
 > The one rule that governs everything here: **materials never become a third consumer of the bus.**
@@ -106,8 +106,8 @@ A `bwa_material` is an **opaque, engine-scoped token** (a small integer; `0` is 
 `generic` default): mint one from a preset (Steam Audio's published coefficients) or from custom
 3-band absorption/scattering/transmission, then attach a token per triangle. Minting works with or
 without the Steam Audio build; the geometry setters are no-ops without it. The signatures and their
-full contract — the preset enum, coefficient clamping, `bwa_material_release`, and the dynamic-mesh
-movers — live in [api.md](./api.md) → "Materials and scene geometry".
+full contract (the preset enum, coefficient clamping, `bwa_material_release`, and the dynamic-mesh
+movers) live in [api.md](./api.md) → "Materials and scene geometry".
 
 **Scene lifecycle.** The geometry setters are safe to call at runtime, reflection bed or not. The
 occlusion sim owns the `IPLScene` and is the sole thread that commits it; the borrowing reflection
@@ -118,7 +118,7 @@ with `bwa_scene_set_dynamic_transform`), a cheap top-level BVH refit (not a geom
 acoustic analogue of a physics collider with a transform. Replacing the whole *static* mesh at runtime
 also works but rebuilds the entire BVH, so it's for occasional swaps, not per-frame motion. The one
 thing runtime geometry does **not** move is a **baked** reverb/pathing result: the bake froze the
-geometry at `bwa_start`, so a mover changes nothing there—use real-time reflections (the default) if
+geometry at `bwa_start`, so a mover changes nothing there: use real-time reflections (the default) if
 the scene animates. `scene_locked` in `src/engine.c` now only means "no scene" (no SDK / failed
 create).
 
@@ -127,7 +127,7 @@ create).
 The reflection bed runs Steam Audio's **HYBRID** reverb: an early-reflection **convolution** plus a
 **parametric (FDN)** late tail, rendered as a **full ambisonic field** (order `order`, decoded
 across the layout's speakers). The early reflections are **directional**: they arrive from the
-directions the geometry actually reflects them. A symmetric scene with a centred listener
+directions the geometry actually reflects them. A symmetric scene with a centered listener
 correctly collapses to a near-omni field (the directional ambisonic channels cancel); asymmetric
 geometry lights them up (verified: an offset source puts ~half the omni energy into a directional
 channel).
@@ -159,22 +159,22 @@ physical and stays separate).
 
 **Coordinate frame.** The mesh, the source/listener positions Steam Audio
 ray-traces against, and the ambisonic IR it returns are all in **room space** (right-handed,
-metres, the same frame DBAP and the layout use; see [integration.md](./integration.md)). A binding
+meters, the same frame DBAP and the layout use; see [integration.md](./integration.md)). A binding
 pushing geometry from a Unity/Unreal level **must convert mesh vertices through the same
 registration matrix** it already uses for source/listener positions. Skip that and reflections
 arrive rotated/mirrored relative to the array, exactly the failure integration.md warns about for
 direct sources. Triangle **winding** must follow Steam Audio's inside/outside convention. The
 shoebox mode builds its mesh directly in room space.
 
-Two authoring modes — and they are **alternatives, not layers**:
+Two authoring modes, and they are **alternatives, not layers**:
 
 1. **Shoebox room**: `bwa_scene_set_box(w, h, d)` + a material per face. The engine generates the
    12-triangle mesh in room space. Covers the common room-like space with no asset pipeline.
 2. **Arbitrary mesh**: vertices/triangles/material-tokens from the content scene, via
    `bwa_scene_set_mesh_mat`.
 
-Mode 1 is implemented *as* mode 2, so it replaces the static mesh the same way. Doing both — a
-shoebox and then a pillar inside it — loses the walls, and loses them half-way: the image-source
+Mode 1 is implemented *as* mode 2, so it replaces the static mesh the same way. Doing both (a
+shoebox and then a pillar inside it) loses the walls, and loses them half-way: the image-source
 room is separate state and survives, so early reflections keep working off a room the ray tracer
 no longer has. Want both? Call `bwa_scene_set_box` first, because nothing else captures the ISM
 room, then a single `bwa_scene_set_mesh_mat` carrying the box walls plus your geometry. (The Godot
@@ -242,7 +242,7 @@ yielding an ambisonic reflection signal, then **decodes it to the bus channels w
 geometry (one direction per layout speaker), and sums it onto the bus.
 
 Decoding an ambisonic field onto an **irregular** speaker grid (the CAVE's 3×3×3 boundary minus
-centre, *not* a uniform sphere) is the hard, non-unique direction: a naïve sampling/transpose or raw
+center, *not* a uniform sphere) is the hard, non-unique direction: a naïve sampling/transpose or raw
 pseudo-inverse gives uneven loudness and direction errors. Steam Audio's decoder handles the custom
 layout with a sane decode law and the right SH channel-order/normalization convention. A literal
 precomputed matrix is only an *optimization* of the same effect (skipping per-block effect
@@ -257,12 +257,12 @@ ambisonic order suffices** for a diffuse bed (`order` is 1 or 2, default 1; the 
 monitor uses 3rd), keeping the reflection channel count and convolution cheap.
 
 **Bounding the convolution cost: hybrid reverb.** Convolving a full IR (early + a long diffuse
-tail) every block is the feature's CPU cost centre (below). Steam Audio's **hybrid reverb** splits
+tail) every block is the feature's CPU cost center (below). Steam Audio's **hybrid reverb** splits
 it: a **short ray-traced early-reflection IR** (the part that carries spatial cues) convolved as
-above, plus a **parametric / FDN late tail** synthesised from the simulator's estimated per-band
+above, plus a **parametric / FDN late tail** synthesized from the simulator's estimated per-band
 decay (RT60; `reverb_estimator` / `hybrid_reverb_estimator` in the SDK). The convolution then runs
 against a *short* IR and the long tail is a cheap recursive reverb sharing the same ambisonic→bus
-decode—far less CPU for the same perceived space. The bed runs hybrid unconditionally
+decode, far less CPU for the same perceived space. The bed runs hybrid unconditionally
 (`REFL_TYPE` in `steam_reflect.c` is a compile-time constant); full-length-IR convolution would be
 a code change, not a config option.
 
@@ -292,7 +292,7 @@ dedicated **simulation threads**, and they are *not* the `bwa_*` control thread.
 - **`bwa_desc.embree`** runs the ray-tracing sims on Intel Embree: opt-in, with a graceful
   fallback to the default tracer. Details in [api.md](./api.md).
 
-**The reflection convolution is the feature's CPU cost centre on the audio thread—not "cheap."**
+**The reflection convolution is the feature's CPU cost center on the audio thread, not "cheap."**
 `iplReflectionEffectApply` is a **partitioned (FFT) convolution**
 (`IPL_REFLECTIONEFFECTTYPE_CONVOLUTION` on CPU for the early part; TrueAudio Next is GPU and out
 of scope) of the source against an `(order+1)²`-channel ambisonic IR, every block. A 1–2 s IR at
@@ -324,7 +324,7 @@ audio-thread tap reads it consistently or keeps the previous block's params. The
 sole writer; the tap is the sole reader and the sole consumer of the IR (apply mutates the IR's
 read state). Lifetime is solved by ownership, not a pool: `params.ir` aliases interior memory of
 the immortal bed `IPLSource`, which is created once and released only at destroy, after the audio
-thread has joined—no use-after-free window.
+thread has joined: no use-after-free window.
 
 **Per-source results are generation-keyed.** Occlusion/directivity publishes are keyed by the full
 generation-counted `bwa_source` handle and **dropped on a generation mismatch** at consume time
@@ -357,7 +357,7 @@ is the **default**. For content with no usable mesh (abstract or musical), the *
 **reverberance** (decay time), **envelopment**.
 
 The hybrid reverb's FDN late tail already exposes what such a mapping targets (per-band RT60,
-early/late balance, band EQ), so a perceptual mode is a control mapping—**no new DSP**, same bus.
+early/late balance, band EQ), so a perceptual mode is a control mapping (**no new DSP**), same bus.
 It bypasses the scene and drives the late-reverb parameters directly, and is mutually exclusive
 with geometry *per source*: a source is either physically simulated or perceptually placed. **Not
 implemented.**
@@ -365,8 +365,8 @@ implemented.**
 ## The API surface
 
 The material and reflection calls are **additive**: an engine with no scene renders exactly as if
-materials didn't exist. The full surface — material minting, scene geometry, the per-source
-occlusion / directivity / reverb toggles, the wet sends, and the `bwa_reflections_desc` config — is
+materials didn't exist. The full surface (material minting, scene geometry, the per-source
+occlusion / directivity / reverb toggles, the wet sends, and the `bwa_reflections_desc` config) is
 documented with its per-call threading semantics in [api.md](./api.md) ("Materials and scene
 geometry", "Occlusion and directivity", "Reflection bed"); the signatures live in
 [include/bw_audio.h](../include/bw_audio.h).
@@ -383,7 +383,7 @@ Two design boundaries worth stating here, since they shape how a scene reaches t
 
 ## CPU budget and tuning knobs
 
-Reflections are the cost centre. Every sizing knob is baked at `bwa_start` (it fixes effect/IR
+Reflections are the cost center. Every sizing knob is baked at `bwa_start` (it fixes effect/IR
 allocation sizes; see "Fixed-at-create" above); the wet gain is the one live control.
 
 | Knob                       | Effect                                          | Default       | When set |
@@ -407,13 +407,13 @@ By design this path does **not** do a few things, and they cluster by cause:
 - **Fixed at effect-create.** phonon bakes an `IPLReflectionEffect`'s IR length and ambisonic order
   at create, so **runtime order/IR-length changes**, **full-length-IR convolution** (the bed always
   runs hybrid), and **GPU / TrueAudio Next convolution** are `bwa_stop`/`bwa_start`-class or out of
-  scope — not live knobs (see "Fixed-at-create, not live knobs" above).
+  scope: not live knobs (see "Fixed-at-create, not live knobs" above).
 - **The mixed IR hides the image sources.** phonon's public API returns one mixed ambisonic IR, so
   **per-image-source DBAP early reflections** can't be pulled out of it; that per-source parallax is
   exactly what the [ISM path](./spatialization.md) renders instead.
 
 Two more are simply future work: a **runtime scene swap under the reflection bed** (it needs a
-scene-swap handshake — today the setters are rejected while the bed runs, see "Scene lifecycle"),
+scene-swap handshake, today the setters are rejected while the bed runs, see "Scene lifecycle"),
 and the **perceptual reverb mode** (above). Doppler and air absorption are phonon-free per-voice DSP
 ([api.md](./api.md)), not part of this path at all. See [api.md](./api.md)'s "Feature overview"
 for status across the engine.
@@ -431,9 +431,9 @@ Two things must be right:
 
 - **Probe placement.** `UNIFORMFLOOR` generation is sensitive to floor-mesh winding (it finds no floor
   in a box whose floor faces down). Place probes manually with one `CENTROID` call per grid point,
-  but phonon's `generateCentroidProbe` reads the probe **centre from the transform's translation
+  but phonon's `generateCentroidProbe` reads the probe **center from the transform's translation
   column** and the influence **radius from the basis-column lengths (min/2)** (it treats the matrix
-  as an OBB centre+basis, NOT the documented unit-cube→box mapping). So the translation must be the
+  as an OBB center+basis, NOT the documented unit-cube→box mapping). So the translation must be the
   grid point itself (not a corner), and a box edge of `2*spacing` gives `radius == spacing`, so the
   probes' influence spheres overlap.
 - **Influencing probes.** `SimulationManager::lookupBakedReflections` only fills the reverb for sources
@@ -452,7 +452,7 @@ around occluders / through portals over the same probe network baking uses (`ste
 with-SDK, opt in with `bwa_desc.enable_pathing` at `bwa_create`):
 
 - **Bake (Stage 1, `steam_path_create`).** A probe grid spans the layout (+margin) at mean speaker
-  height, using the SAME OBB-transform convention learned for reflections (centre in the translation
+  height, using the SAME OBB-transform convention learned for reflections (center in the translation
   column, radius from the basis lengths; see above). `iplPathBakerBake` writes the probe-to-probe
   visibility graph. Set the pathing sim's `IPLSimulationSettings.maxOrder` to the path order: if you
   don't, the path field is silently capped to order-0 (omni, no direction). The `path` test proves a
@@ -471,15 +471,15 @@ with-SDK, opt in with `bwa_desc.enable_pathing` at `bwa_create`):
 Opt sources in with `bwa_source_set_pathing`. The **bending-loss EQ (`eqCoeffs[3]`) is rendered
 too.** phonon splits a path's response two ways (`path_simulator.cpp`): `shCoeffs` carry the
 direction *and* level (each path is SH-projected weighted by its distance attenuation), while
-`eqCoeffs` carry the frequency-dependent *deviation* (bending) loss. To add the colour without
-disturbing the level, the sim normalizes `eqCoeffs` to a pure tilt—loudest band = 1, floored at
-phonon's `kMaxEQGain` (0.0625)—exactly phonon's `normalizeEQ` mode, and publishes it beside the
+`eqCoeffs` carry the frequency-dependent *deviation* (bending) loss. To add the color without
+disturbing the level, the sim normalizes `eqCoeffs` to a pure tilt (loudest band = 1, floored at
+phonon's `kMaxEQGain` (0.0625)), exactly phonon's `normalizeEQ` mode, and publishes it beside the
 shCoeffs (`rt_set_pathing`, same handle-gated double buffer). The mixer applies that tilt as the
 same low-shelf/peak/high-shelf biquad cascade the occlusion EQ uses, to the **un-occluded** `s_raw`
 *before* the SH-encode: precisely phonon's own `path_effect.cpp` render order (EQ the mono signal,
 then scale each SH channel). It's ramped per sample (invariant 4) and bypassed while flat, so a
 path with no occluder to bend around costs nothing and is byte-identical to the pre-EQ render. The
-`rt` test asserts a non-flat tilt colours the encoded field (a DC source through `{0.5,1,1}` lands
+`rt` test asserts a non-flat tilt colors the encoded field (a DC source through `{0.5,1,1}` lands
 the accumulator at `0.5·shCoeffs`, the RBJ low-shelf DC gain). Pathing only does anything where the
 scene has real occluders to bend sound around; judge it by ear at the rig.
 

@@ -59,7 +59,7 @@ static void cs_at(IPLCoordinateSpace3* cs, const float o[3]) {
 }
 
 /* probe grid + path (visibility) bake; returns probe count, 0 on failure. Same OBB convention as the
- * reflection bake: translation column = the probe CENTRE, basis lengths = the box (radius = min/2). */
+ * reflection bake: translation column = the probe CENTER, basis lengths = the box (radius = min/2). */
 static int do_path_bake(SteamPath* sp, const Layout* L) {
     float xmin=1e30f,xmax=-1e30f,zmin=1e30f,zmax=-1e30f,ysum=0.f;
     for (uint32_t s=0;s<L->count;++s){ const float* p=L->speakers[s].pos;
@@ -73,7 +73,7 @@ static int do_path_bake(SteamPath* sp, const Layout* L) {
     for (float z=zmin; z<=zmax+1e-3f; z+=PATH_SPACING) {
         IPLProbeArray pa=NULL; if (iplProbeArrayCreate(sp->ctx,&pa)!=IPL_STATUS_SUCCESS) continue;
         IPLProbeGenerationParams gp; memset(&gp,0,sizeof gp); gp.type=IPL_PROBEGENERATIONTYPE_CENTROID;
-        gp.transform.elements[0][0]=bs; gp.transform.elements[0][3]=x;     /* centre = grid point */
+        gp.transform.elements[0][0]=bs; gp.transform.elements[0][3]=x;     /* center = grid point */
         gp.transform.elements[1][1]=bs; gp.transform.elements[1][3]=head;
         gp.transform.elements[2][2]=bs; gp.transform.elements[2][3]=z;
         gp.transform.elements[3][3]=1.f;
@@ -162,7 +162,7 @@ static int find_slot(SteamPath* sp, uint32_t handle) {
 /* Normalize the raw bending-loss eqCoeffs to a pure spectral tilt (loudest band = 1), mirroring
  * phonon's EQEffect::normalizeGains / IPLPathEffectParams.normalizeEQ. The path LEVEL rides shCoeffs
  * (calcAmbisonicsCoeffsForPaths weights each path by its distance attenuation), so eqCoeffs must carry
- * only COLOUR here — else the deviation gain would double-count against the level in shCoeffs. Floor at
+ * only COLOR here — else the deviation gain would double-count against the level in shCoeffs. Floor at
  * phonon's kMaxEQGain so a single band can't cut more than ~-24 dB (guards over-aggressive filtering). */
 #define PATH_EQ_MIN_GAIN 0.0625f
 static void normalize_eq(float eq[3]) {
@@ -244,7 +244,7 @@ static DWORD WINAPI sim_thread(LPVOID arg) {
             IPLSource src = sp->srcs[i].src;         /* sim-thread-owned */
             if (!want || !src) { memset(sh, 0, sizeof(float)*sp->ambi_ch); rt_set_pathing(sp->rt, handle, sh, NULL, sp->ambi_ch); continue; }
             run_get(sp, lp, src, pos, eq, sh);       /* sh carries direction+level; eq is the bending-loss tilt */
-            normalize_eq(eq);                        /* -> pure colour (level already in sh); rt applies it pre-encode */
+            normalize_eq(eq);                        /* -> pure color (level already in sh); rt applies it pre-encode */
             rt_set_pathing(sp->rt, handle, sh, eq, sp->ambi_ch);
         }
         Sleep(1000 / PATH_HZ);

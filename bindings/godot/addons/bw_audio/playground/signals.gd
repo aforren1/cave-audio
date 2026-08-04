@@ -7,7 +7,7 @@
 ## which is what matters — if the Godot playground and the C++ one are ever A/B'd against
 ## each other, any audible difference has to come from the ENGINE path, not the noises.
 ##
-## Signal choice matters: broadband content with sharp onsets localises best, and it is the
+## Signal choice matters: broadband content with sharp onsets localizes best, and it is the
 ## HF that carries elevation and front/back. The 1 kHz tone is in the list precisely because
 ## it is narrowband and ambiguous — it is the control.
 extends RefCounted

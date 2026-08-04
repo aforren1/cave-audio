@@ -2,7 +2,7 @@
  * allrad.c — see allrad.h. Three stages, all at load time:
  *   1. a dense uniform VIRTUAL layout (Fibonacci sphere) + its sampling decoder D_virt;
  *   2. VBAP each virtual loudspeaker onto the real array via the array's convex-hull triangulation;
- *   3. accumulate decode = G * D_virt and energy-normalise to the sampling decode's diffuse level.
+ *   3. accumulate decode = G * D_virt and energy-normalize to the sampling decode's diffuse level.
  * The virtual layer is uniform so the sampling decoder is well-behaved there; VBAP absorbs the real
  * array's irregularity. (Standard AllRAD, Zotter & Frank 2012, with a Fibonacci virtual layer in
  * place of a t-design and a brute-force hull — fine for 26 points.)
@@ -79,7 +79,7 @@ int allrad_build_decode(const Layout* L, float decode[BWA_CHANNELS][BWA_AMBI_CH]
         }
     }
 
-    /* energy-normalise to the sampling decode's diffuse level (so swapping decoders keeps the bed
+    /* energy-normalize to the sampling decode's diffuse level (so swapping decoders keeps the bed
      * loudness): diffuse energy = sum_{s,k} D[s][k]^2 / (2l+1); the sampling decode's is 84/(4pi*N). */
     double e_all = 0.0;
     for (uint32_t s = 0; s < N; ++s)

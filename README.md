@@ -2,7 +2,7 @@
 
 Self-hosted spatial audio engine for a 26-speaker CAVE installation. Drives the
 array over **ASIO → RME Digiface Dante**, with **binaural HRTF headphone
-rendering** — a first-class direct render, plus an array-audition monitor for
+rendering**: a first-class direct render, plus an array-audition monitor for
 desk-side debugging. Unity and Unreal connect as thin control clients over a C ABI.
 
 ## Why self-hosted
@@ -10,7 +10,7 @@ desk-side debugging. Unity and Unreal connect as thin control clients over a C A
 Going direct (no FMOD/Wwise) gives sample-accurate access to ASIO timing hooks and
 keeps the core engine-agnostic, so the same library serves both engines with only a
 thin per-engine glue layer. The spatializer, mixer, output, and tracking all live
-in one process behind one audio callback—the experiment deploys as one system on
+in one process behind one audio callback: the experiment deploys as one system on
 the machine running the endpoint, with no external renderer to author, synchronize, and
 maintain alongside it.
 
@@ -70,7 +70,7 @@ maintain alongside it.
   test signal, output meters, voice gauge.
 - **Real-time discipline**: no allocation, locks, or I/O on the audio thread;
   lock-free SPSC command/event rings; `bwa_commit` gives frame-coherent updates;
-  every parameter change ramps—nothing steps.
+  every parameter change ramps; nothing steps.
 - **Validation**: the core math (SH encode, VBAP, AllRAD, EPAD, biquads, EQ rendering)
   is cross-checked against independent implementations (scipy/qhull/linear-
   programming goldens) in CI, alongside the DSP/concurrency test suite and
@@ -94,18 +94,18 @@ The calibration commands behind the last row are under
 | bed decoder | AllRAD (default); A/B EPAD | AllRAD | AllRAD; A/B EPAD | either |
 
 **Tracked roamer.** DBAP is listener-relative and re-solves every block, so the image
-follows you instead of degrading away from a centre. Leave dual-band and VBAP off:
+follows you instead of degrading away from a center. Leave dual-band and VBAP off:
 both sharpen the image *at a sweet spot*, and there isn't one. For room correction use the
 grid (`bwa_calibrate --room-eq-grid`, one run per mic position); the engine interpolates
 the LF cuts at your live position and glides the biquads. `bwa_set_pose_prediction` (start
 ~20–40 ms, your measured motion-to-ears latency) hides the panning lag; `bwa_set_decorrelation`
 keeps wide sources from comb-filtering as you move. Loading a static `room_eq` layout into
-a moving session **fails `bwa_start`** on purpose—one measurement point cannot correct a roam.
+a moving session **fails `bwa_start`** on purpose: one measurement point cannot correct a roam.
 
 **Fixed seat.** Now a sweet spot exists, so spend it: VBAP for the sharpest image (it needs
 a cleanly triangulable array; it falls back to DBAP if not), SPCAP if the array is uneven
 or you want a smoother, all-speaker image. Turn **dual-band on** for tighter bass
-localisation, and calibrate with `--room-eq` **with the mic at the seat**. Don't track;
+localization, and calibrate with `--room-eq` **with the mic at the seat**. Don't track;
 set the listener pose once.
 
 **Audience.** Panning is exact for one head and wrong for everyone else, so this is a
@@ -115,13 +115,13 @@ driver) and hand the *other* occupants' positions to **`bwa_set_extra_listeners`
 so each occupant gets an image biased toward their own seat instead of one exact and N
 wrong. Otherwise play it safe rather than sharp: DBAP, dual-band off, and no room EQ
 beyond `--eq` (which flattens the *speakers*, not the room, so it helps every seat).
-Raise `bwa_source_set_spread` on ambience: wide sources survive off-centre listening far
+Raise `bwa_source_set_spread` on ambience: wide sources survive off-center listening far
 better than points do.
 
 **Desk.** Neither headphone profile needs a layout, Dante, or hardware beyond
 headphones. `cave_sim` renders the *same* speaker mix through virtual speakers, so
-what you hear is the array render — use it to verify what the room will do.
-`binaural` renders sources directly at their true directions — the better *listen*,
+what you hear is the array render: use it to verify what the room will do.
+`binaural` renders sources directly at their true directions: the better *listen*,
 the wrong *probe*. Don't use either to judge timbre for the room.
 
 **Everywhere:** the output limiter is on at −1 dBFS (leave it; it's speaker protection, not
@@ -277,7 +277,7 @@ bwa_calibrate --layout cave_layout.roaming.json --mic -1 1.7 0 --room-eq-grid   
 - **Seated** (SPCAP/VBAP, fixed listener pose): trims aligned at the seat, room
   correction at the seat. `--room-eq` is only valid for a listener who stays at the
   measurement point.
-- **Roaming** (DBAP + tracking): trims aligned at the working-volume centre at
+- **Roaming** (DBAP + tracking): trims aligned at the working-volume center at
   standing ear height, speaker-only EQ; one point can't room-correct a roam.
 - **Roaming + tracked room EQ**: `--room-eq-grid` accumulates LF modal cuts one mic
   placement at a time (the `--mic` position is the grid key); the engine then
@@ -295,10 +295,10 @@ mis-correcting the array.
 ![bwa_playground](docs/img/playground.png)
 
 The array sim (`cave_sim`) on headphones by default (auto-picked 2-ch ASIO driver;
-without one the engine falls back to the null sink and keeps rendering—visual-only,
+without one the engine falls back to the null sink and keeps rendering, visual-only,
 live, just silent). The panel's render picker switches to `binaural` (the direct
 per-source render, for by-ear A/Bs against the sim) or `cave` (the array itself over
-26-ch ASIO—the same harness pointed at real speakers on the rig machine), and a
+26-ch ASIO, the same harness pointed at real speakers on the rig machine), and a
 headphone-EQ field loads an AutoEq correction for your headphones.
 Scenes: localization, occlusion + materials, directivity, channel walk,
 reverb bed, an underwater medium boundary (live FDN retune, speed of sound,

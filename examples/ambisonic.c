@@ -178,7 +178,7 @@ int main(void) {
 
     for (int i = 0; i < 2; ++i) {                      /* live max-rE A/B */
         bwa_set_max_re(e, true);
-        run(e, 3, "5) max-rE decode weighting ON (fewer sidelobes, better off-centre localization)");
+        run(e, 3, "5) max-rE decode weighting ON (fewer sidelobes, better off-center localization)");
         bwa_set_max_re(e, false);
         run(e, 3, "   max-rE OFF (the raw decode)");
     }

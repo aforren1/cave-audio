@@ -16,7 +16,7 @@
 #include "rt_test_util.h"
 
 int main(void) {
-    LD = layout_default();                          /* listener stays at the default (the array centre, LD.ref) */
+    LD = layout_default();                          /* listener stays at the default (the array center, LD.ref) */
     const char* WAV = "bwa_rt_const.wav";
     if (!write_const_wav(WAV, 1.0f, 8 * N)) { printf("FAIL: write wav\n"); return 1; }
 
@@ -407,7 +407,7 @@ int main(void) {
             CHECK(rt_get_clock_model(cd, &f) && fabs(f.ppm + 19.9996) < 0.05,
                   "the reseeded fit converges on the new run's drift");
 
-            /* jitter_ns is a real measurement, not a rounding artefact: hold the rate at nominal and
+            /* jitter_ns is a real measurement, not a rounding artifact: hold the rate at nominal and
              * dither the host stamp by a 4 us square wave (rms 2 us about its mean). The slope must
              * survive it — white stamp noise averages out over a thousand blocks — while jitter_ns
              * reports it. This is the assertion the closed-form residual could not pass. */

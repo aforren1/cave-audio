@@ -48,12 +48,12 @@ working-volume listener grid, via `bwa_panner_gains_batch` (the same solve that 
 sweet spot and never corrects for you walking away; a tracked one re-solves at your
 position every block. Scoring only at the sweet spot cannot see that difference at all,
 so every panner is now evaluated across the whole listener grid, and the **solve at**
-control picks which position it solves for: *auto* gives each panner its real behaviour
+control picks which position it solves for: *auto* gives each panner its real behavior
 (DBAP tracked, SPCAP and VBAP fixed), and forcing a mode A/Bs the contrast. Sources sit
 at fixed world positions rather than following the listener, which is what makes an
-off-centre score comparable to a centred one.
+off-center score comparable to a centered one.
 
-Expect worst-case numbers to be higher than they used to be. Those are the off-centre and
+Expect worst-case numbers to be higher than they used to be. Those are the off-center and
 off-height cells that were previously never evaluated. **A layout optimized for SPCAP or
 VBAP before this change was tuned against an objective that could not move, and is worth
 re-running.**
@@ -87,7 +87,7 @@ declare where speakers may go:
 
 The tool flags violations, and **K** snaps speakers off bounds/no-go/obstacle bodies.
 Press **B** to pick the target panner, then **O** to **auto-optimize**: a constrained
-hill-climb that nudges positions to minimise that panner's rE error while staying
+hill-climb that nudges positions to minimize that panner's rE error while staying
 feasible. A **leash** slider caps how far a speaker may drift from where it started,
 so the optimizer refines rather than relocates. It runs live (O again to stop, S to
 save). Headless: `--optimize <file> [dbap|spcap|vbap] [stages]`.
@@ -292,17 +292,17 @@ Scoring/coverage target the observer at **ear height** (the `obs y` slider, defa
 shell to show where the array is weak. **G** switches its metric between the geometric
 *nearest-speaker gap* and the selected panner's *per-direction rE error* (green =
 accurate, red = mislocalised; hover a cube for its value). **V** toggles the observer
-model (fixed centre versus the moving working volume).
+model (fixed center versus the moving working volume).
 
 The listener grid spans ±0.45 m in **height**, a realistic seated-to-tall range rather
-than a token nudge. Off-height is a distinct failure mode from off-centre-in-plane: the
+than a token nudge. Off-height is a distinct failure mode from off-center-in-plane: the
 speakers sit mostly overhead and the alignment delays are computed for one reference
 height, so tracking re-aims the solve but fixes neither. A grid that barely varies height
 cannot see the problem it most needs to. The file:
 
 ```jsonc
 {
-  "bounds": { "min": [-4, 0, -4], "max": [4, 4.5, 4] },        // allowed box (room metres, floor y=0)
+  "bounds": { "min": [-4, 0, -4], "max": [4, 4.5, 4] },        // allowed box (room meters, floor y=0)
   "nogo": [                                                     // keep-out: speakers must stay OUTSIDE
     { "min": [-2, 0, -2], "max": [2, 4, 2] }                    // e.g. the CAVE 4x4x4 interior
   ],
@@ -318,7 +318,7 @@ cannot see the problem it most needs to. The file:
 {
   "schema_version": 1,
   "units":            { "position": "meters", "gain": "decibels", "delay": "milliseconds" },
-  "coordinate_space": "room, right-handed, +y up, +z forward (matches OptiTrack/Motive default); origin ON THE FLOOR at the working-area centre (x/z); y = height above the floor",
+  "coordinate_space": "room, right-handed, +y up, +z forward (matches OptiTrack/Motive default); origin ON THE FLOOR at the working-area center (x/z); y = height above the floor",
   "reference": {
     "alignment":          "max-distance",   // how delay_ms was derived (documentation only)
     "speed_of_sound_mps": 343.0,

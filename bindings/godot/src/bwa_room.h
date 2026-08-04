@@ -1,6 +1,6 @@
 /* The coordinate seam, in plain floats so it can be tested without linking godot-cpp.
  *
- * Room space is right-handed, +Y up, +Z forward, metres, origin on the floor — Motive's
+ * Room space is right-handed, +Y up, +Z forward, meters, origin on the floor — Motive's
  * default streamed frame. Godot is right-handed and +Y up too, so unlike Unity there is
  * NO handedness mirror: positions and directions need only the CAVE registration
  * transform, which is plain Basis/Transform3D arithmetic and lives in the node code.

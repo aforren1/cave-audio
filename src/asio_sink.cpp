@@ -413,7 +413,7 @@ extern "C" bwa_sink* bwa_asio_sink_open(uint32_t sample_rate, uint32_t block_siz
 
     /* The driver dictates the true block size; bwa_desc.block_size is only a hint, and
      * the nframes passed to the render callback (== bufsize, the bus is sized to it) is
-     * authoritative. Clamp the hint into range and honour the driver's granularity so
+     * authoritative. Clamp the hint into range and honor the driver's granularity so
      * ASIOCreateBuffers never gets an invalid size. */
     long bmin = 0, bmax = 0, bpref = 0, bgran = 0;
     ASIOGetBufferSize(&bmin, &bmax, &bpref, &bgran);

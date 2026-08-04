@@ -18,7 +18,7 @@ static void set_err(char* err, size_t cap, const char* msg) {
 static float db_to_lin(double db) { return (float)pow(10.0, db / 20.0); }
 
 /* ref = the array centroid: the nominal listening point the world-locked decodes reference.
- * Computed from the positions, so it holds for any origin convention (floor or centre). */
+ * Computed from the positions, so it holds for any origin convention (floor or center). */
 void layout_compute_ref(Layout* L) {
     double s[3] = { 0, 0, 0 };
     for (uint32_t k = 0; k < L->count; ++k)
@@ -29,10 +29,10 @@ void layout_compute_ref(Layout* L) {
 Layout layout_default(void) {
     Layout L;
     memset(&L, 0, sizeof L);
-    const float ax[3] = { -1.5f, 0.0f, 1.5f };  /* x/z: centred on the room */
+    const float ax[3] = { -1.5f, 0.0f, 1.5f };  /* x/z: centered on the room */
     const float ay[3] = {  0.0f, 1.5f, 3.0f };  /* y: FLOOR origin, Motive-style */
     uint32_t k = 0;
-    for (int yi = 0; yi < 3; ++yi)              /* 3x3x3 boundary grid minus the centre = 26 */
+    for (int yi = 0; yi < 3; ++yi)              /* 3x3x3 boundary grid minus the center = 26 */
         for (int xi = 0; xi < 3; ++xi)
             for (int zi = 0; zi < 3; ++zi) {
                 if (ax[xi] == 0.0f && ay[yi] == 1.5f && ax[zi] == 0.0f) continue;
@@ -44,7 +44,7 @@ Layout layout_default(void) {
                 ++k;
             }
     L.count             = k;                    /* 26 */
-    layout_compute_ref(&L);                            /* (0, 1.5, 0) — the cube's centre */
+    layout_compute_ref(&L);                            /* (0, 1.5, 0) — the cube's center */
     L.rolloff_r         = 0.5f;
     L.atten_ref_m       = 1.0f;
     L.atten_rolloff     = 1.0f;

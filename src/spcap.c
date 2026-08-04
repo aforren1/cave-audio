@@ -2,7 +2,7 @@
  * spcap.c — Speaker-Placement Correction Amplitude Panning. For a source we weight every speaker by
  * a smooth lobe ((1+cos)/2)^focus pointed at the source's bearing *from the listener*, scaled by a
  * per-speaker placement correction (1/local-density) so a cluster of speakers doesn't pull the image
- * toward it; then normalise for constant power and apply the source->listener distance attenuation.
+ * toward it; then normalize for constant power and apply the source->listener distance attenuation.
  * The lobe is graceful (never identically zero across the sphere, so a source over a layout hole
  * fades rather than cutting out). focus / density-exponent are tuning knobs for the real array.
  * See docs/spatialization.md. SPCAP assumes a fixed observer; for a moving listener use DBAP.
@@ -31,7 +31,7 @@ static void recompute(SpcapState* s, const float lis[3], const Layout* L, uint32
         float dens = 0.f;
         for (uint32_t j = 0; j < N; ++j) {
             float d = s->sdir[k][0] * s->sdir[j][0] + s->sdir[k][1] * s->sdir[j][1] + s->sdir[k][2] * s->sdir[j][2];
-            if (d > 0.f) dens += powf(d, SPCAP_DENSITY);     /* count near (front-hemisphere) neighbours */
+            if (d > 0.f) dens += powf(d, SPCAP_DENSITY);     /* count near (front-hemisphere) neighbors */
         }
         s->c[k] = (dens > 0.f) ? 1.f / dens : 1.f;           /* dense -> down-weighted */
     }

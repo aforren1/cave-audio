@@ -79,7 +79,7 @@ int main(int argc, char** argv) {
         else if (!strcmp(argv[i],"--check"))              check       = 1;   /* flag speakers nudged from the stored layout */
         else if (!strcmp(argv[i],"--live") && i+1<argc)   live_speaker= atoi(argv[++i]); /* live distance readout for one speaker */
         else if (!strcmp(argv[i],"--latency") && i+1<argc) known_latency = atof(argv[++i]); /* c*tau meters: --live absolute distance, --zylia distances */
-        else if (!strcmp(argv[i],"--ref") && i+2<argc)    { ref_spk = atoi(argv[++i]); ref_dist = atof(argv[++i]); } /* --zylia: tape-measured centre->speaker distance -> solves the latency */
+        else if (!strcmp(argv[i],"--ref") && i+2<argc)    { ref_spk = atoi(argv[++i]); ref_dist = atof(argv[++i]); } /* --zylia: tape-measured center->speaker distance -> solves the latency */
         else if (!strcmp(argv[i],"--survey") && i+1<argc)  survey_path = argv[++i]; /* --zylia: capsule self-survey (room axes) */
         else if (!strcmp(argv[i],"--eq"))                 eq          = 1;   /* per-speaker direct-sound correction FIR */
         else if (!strcmp(argv[i],"--room-eq"))            eq = room_eq = 1;  /* + room correction AT THE MIC POINT (static listener only) */
@@ -88,8 +88,8 @@ int main(int argc, char** argv) {
         else if (!strcmp(argv[i],"--mic") && i+3<argc) { mic[0]=(float)atof(argv[++i]); mic[1]=(float)atof(argv[++i]); mic[2]=(float)atof(argv[++i]); }
         else { fprintf(stderr, "usage: calibrate [--layout f] [--out f] [--mic x y z] [--input ch] [--driver name] [--list-drivers] [--simulate] [--room] [--eq | --room-eq | --room-eq-grid] [--zylia] [--survey f] [--ref spk dist_m] [--save-irs prefix] [--localize positions.txt] [--check] [--live N] [--latency m]\n"
                                "  --zylia: ZM-1 single-placement localization; --input is the FIRST of its 19 consecutive\n"
-                               "  capture channels, --mic is the array centre. Distances need --latency (loopback, m at c)\n"
-                               "  or --ref <spk> <m> (one tape-measured centre->speaker distance).\n"); return 2; }
+                               "  capture channels, --mic is the array center. Distances need --latency (loopback, m at c)\n"
+                               "  or --ref <spk> <m> (one tape-measured center->speaker distance).\n"); return 2; }
     }
     if (room_eq && rq_grid) { fprintf(stderr, "calibrate: --room-eq and --room-eq-grid are mutually exclusive (one scheme per layout)\n"); return 2; }
     if (zylia && (localize_file || check || live_speaker >= 0)) {
@@ -331,7 +331,7 @@ int main(int argc, char** argv) {
         if (!lat_known) {
             fprintf(stderr, "zylia: NOT writing positions — no --latency/--ref, so every distance above carries\n"
                             "       the full system latency radially (directions are exact). Tape ONE speaker's\n"
-                            "       distance from the array centre and re-run with --ref <spk> <m>, or measure a\n"
+                            "       distance from the array center and re-run with --ref <spk> <m>, or measure a\n"
                             "       loopback and pass --latency <m>.\n");
             free(arr); free(pos); free(res); free(cap); free(sweep);
             return 1;

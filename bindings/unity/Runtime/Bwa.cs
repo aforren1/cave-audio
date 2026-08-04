@@ -276,7 +276,7 @@ namespace BwAudio
         [DllImport(DLL, CallingConvention = CC)] public static extern void bwa_material_release(IntPtr e, uint token);
         [DllImport(DLL, CallingConvention = CC)] public static extern void bwa_scene_set_mesh_mat(IntPtr e, float[] verts, int nverts, int[] tris, int ntris, uint[] triMaterial);
         [DllImport(DLL, CallingConvention = CC)] public static extern void bwa_scene_set_box(IntPtr e, float w, float h, float d, uint[] faces);
-        // The outdoor degenerate of the box: ONE horizontal mirror plane at height y (room metres) — the
+        // The outdoor degenerate of the box: ONE horizontal mirror plane at height y (room meters) — the
         // ground bounce, the dominant early reflection when there is no room. Replaces any prior box
         // (one room at a time); live-safe like the box (reflections re-solve next block); works with and
         // without the Steam build.
@@ -358,7 +358,7 @@ namespace BwAudio
         // tall but not wide. Equal values behave as the isotropic spread; bwa_source_set_spread resets to
         // isotropic (last call wins). Rides the spread mode, the size/near floors, and decorrelation.
         [DllImport(DLL, CallingConvention = CC)] public static extern void  bwa_source_set_extent(IntPtr e, uint s, float width, float height);
-        // Source size in METRES (radius; 0 = point). The physical alternative to the angular spread above:
+        // Source size in METERS (radius; 0 = point). The physical alternative to the angular spread above:
         // the width is the angle the radius subtends from the listener, so a 2 m source STAYS 2 m wide as
         // the listener walks. Floors spread (the larger of the two wins).
         [DllImport(DLL, CallingConvention = CC)] public static extern void  bwa_source_set_size(IntPtr e, uint s, float radiusM);
@@ -427,7 +427,7 @@ namespace BwAudio
         [DllImport(DLL, CallingConvention = CC)] public static extern void bwa_set_master_gain(IntPtr e, float linear);
         // How ambisonic BEDS render (live; each bed crossfades — a click-free A/B): MATRIX (default, the
         // static SH->speaker decode) or PARAMETRIC (DirAC: the directional stream is re-panned through the
-        // listener-relative panner, so a recorded soundfield becomes WALKABLE — parallax off-centre).
+        // listener-relative panner, so a recorded soundfield becomes WALKABLE — parallax off-center).
         [DllImport(DLL, CallingConvention = CC)] public static extern void bwa_set_bed_renderer(IntPtr e, BwaBedRenderer renderer);
         // Tracked room EQ (layouts carrying a room_eq_grid): the LF modal cuts follow the live listener
         // position. ON by default when a grid is present; this is the live kill switch. No-op without a grid.

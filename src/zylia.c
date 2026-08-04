@@ -125,7 +125,7 @@ static int solve_lin(int n, double* A, double* b, double* x) {
 int zylia_doa(const double arrival_s[ZYLIA_MICS], float dir_out[3]) {
     if (!arrival_s || !dir_out) return 0;
     float caps[ZYLIA_MICS][3]; zylia_capsules(caps);
-    /* Far field: tau_i = A - (1/c)(m_i . d), m_i = capsule position relative to the centre. Fit
+    /* Far field: tau_i = A - (1/c)(m_i . d), m_i = capsule position relative to the center. Fit
      * tau_i = A + b.m_i (4 unknowns) by least squares; b = -d/c points AWAY from the source, so
      * d = -normalize(b). Latency folds into A and cancels. Fitting against POSITIONS rather than
      * (radius x unit direction) is what lets a SURVEYED array — capsules not exactly on the nominal
@@ -203,7 +203,7 @@ int zylia_tdoa(const float* const x[ZYLIA_MICS], uint32_t n, double fs, uint32_t
         }
         double frac = 0.0;
         if (best > -(int)max_lag && best < (int)max_lag) {  /* interior peak: parabolic sub-sample refine */
-            for (int k = -1; k <= 1; ++k) {                 /* recompute the neighbours (cheaper than storing the curve) */
+            for (int k = -1; k <= 1; ++k) {                 /* recompute the neighbors (cheaper than storing the curve) */
                 int lag = best + k;
                 double r = 0.0;
                 const float* a = x[ref] + s0;
@@ -214,7 +214,7 @@ int zylia_tdoa(const float* const x[ZYLIA_MICS], uint32_t n, double fs, uint32_t
             rm1 = r_at[0]; rp1 = r_at[2];
             double denom = rm1 - 2.0 * r_at[1] + rp1;
             frac = (fabs(denom) > 1e-12) ? 0.5 * (rm1 - rp1) / denom : 0.0;
-            if (frac >  0.5) frac =  0.5;                   /* the true peak is between the neighbours */
+            if (frac >  0.5) frac =  0.5;                   /* the true peak is between the neighbors */
             if (frac < -0.5) frac = -0.5;
         }                                                   /* boundary peak: keep the integer lag as-is */
         arrival_s[ch] = ((double)best + frac) / fs;
@@ -757,14 +757,14 @@ int zylia_survey(const float src_m[][3], const double (*arrival_s)[ZYLIA_MICS], 
          * observation — and those are exactly what we fitted out. The translation is a gauge, so we
          * must CHOOSE it, and the one the linear solve lands on (sum_i m_i = 0, the centroid) is the
          * wrong choice. The ZM-1's capsules are not centroid-balanced: a dodecahedron MISSING its nadir
-         * vertex sums to the zenith, so the centroid sits R/19 = 2.6 mm ABOVE the sphere centre. Nobody
+         * vertex sums to the zenith, so the centroid sits R/19 = 2.6 mm ABOVE the sphere center. Nobody
          * tape-measures to the centroid. Fit the sphere the capsules actually lie on — algebraically,
          * |p-q|^2 = r^2  ->  2 p_i . q - k = |p_i|^2 with k = |q|^2 - r^2, linear in four unknowns —
-         * and re-centre on q, giving the physical centre of the shell: the point the operator measured
+         * and re-center on q, giving the physical center of the shell: the point the operator measured
          * the clap positions from, and what zylia_localize's `center` argument means.
          *
          * This happens INSIDE the loop, not after it: the near-field correction above needs m in the
-         * same frame src_m is measured in. Re-centring only at the end would leave the correction
+         * same frame src_m is measured in. Re-centering only at the end would leave the correction
          * computed 2.6 mm off, and it shows up as a residual that will not go away. */
         double S[16] = {0}, sb[4] = {0}, q[4];
         for (int i = 0; i < ZYLIA_MICS; ++i) {
@@ -856,13 +856,13 @@ int zylia_survey_save(const char* path, const float caps_m[ZYLIA_MICS][3],
      * mistake the frame field exists to prevent. */
     cJSON_AddStringToObject(root, "_comment",
         (mount && mount->body_frame)
-        ? "ZM-1 capsule survey. Positions are metres, relative to the array centre, in the TRACKED "
+        ? "ZM-1 capsule survey. Positions are meters, relative to the array center, in the TRACKED "
           "MOUNT'S BODY AXES (not room axes), indexed BY ASIO INPUT CHANNEL. Rotate by the mount's "
           "live pose before solving: installed as-is, every direction is wrong by whatever the mount "
           "was turned to at survey time. Encodes the channel order and the capsules' placement inside "
           "the mount, NOT the array's orientation in the room — that is what the tracker supplies. "
           "Specific to one physical ZM-1 rigidly coupled to one mount: re-survey if either changes."
-        : "ZM-1 capsule survey. Positions are metres, relative to the array centre, in ROOM axes "
+        : "ZM-1 capsule survey. Positions are meters, relative to the array center, in ROOM axes "
           "(+X right, +Y up, -Z front), indexed BY ASIO INPUT CHANNEL. This file therefore encodes the "
           "channel order and the array's mounted orientation as well as the geometry. It is specific to "
           "one physical ZM-1 on one mount: re-survey if either changes.");
@@ -940,7 +940,7 @@ int zylia_survey_load(const char* path, ZyliaMount* mount_out, char* err, int er
             if (!cJSON_IsNumber(v)) { zy_err(err, errcap, "zylia_survey_load: non-numeric capsule component"); goto done; }
             caps[i][a] = (float)v->valuedouble;
         }
-        /* A capsule metres from the array centre means a unit slip (mm vs m) or a corrupt file, and it
+        /* A capsule meters from the array center means a unit slip (mm vs m) or a corrupt file, and it
          * would silently wreck every DOA. Cheap to check, so check. */
         double m = sqrt((double)caps[i][0]*caps[i][0] + (double)caps[i][1]*caps[i][1] +
                         (double)caps[i][2]*caps[i][2]);

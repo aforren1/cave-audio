@@ -49,7 +49,7 @@
 #define BWA_DOPPLER_MAX_DIST 8.0f      /* propagation delay saturates past this (bounds the per-voice ring) */
 #define BWA_DOPPLER_TAU      0.032f    /* per-pole delay low-pass time (s); FFT-tuned, see mix_voice */
 #define BWA_AIR_FC_NEAR   18000.0f     /* air-absorption low-pass cutoff (Hz) at zero distance ... */
-#define BWA_AIR_FC_PER_M    650.0f     /* ... falling this many Hz per metre ... */
+#define BWA_AIR_FC_PER_M    650.0f     /* ... falling this many Hz per meter ... */
 #define BWA_AIR_FC_FLOOR   1200.0f     /* ... down to this floor */
 /* near-field proximity boost (opt-in, per voice): an LF shelf that rises as the source closes inside
  * BWA_NF_RADIUS — the spherical-wavefront proximity effect, the near-distance mirror of the
@@ -1139,7 +1139,7 @@ static float ext_scale(float eu, float ew, float cp, float sp) {
     return dn > 1e-9f ? eu * ew / dn : 1.f;
 }
 
-/* Source spread/size: blend the panner's point gains toward a width-controlled lobe centred on the
+/* Source spread/size: blend the panner's point gains toward a width-controlled lobe centered on the
  * source direction (from the listener), then renormalise constant-power. spread 0 = the point gains;
  * 1 = a wide lobe. Panner-agnostic; runs only in the per-block gain solve (not the sample loop). */
 static void spread_gains(RtCore* c, const Voice* v, float spread, float* g) {
@@ -1251,7 +1251,7 @@ static void mdap_gains(RtCore* c, int p, Voice* v, float spread, float user_gain
     else       spread_frame(v, d, u, w);                 /* transported frame: no pole snap */
     float s = spread; if (s > 1.f) s = 1.f;
     float acc[BWA_CHANNELS], gd[BWA_CHANNELS];
-    for (uint32_t k = 0; k < c->channels; ++k) acc[k] = g[k];   /* the point solve is the ring centre */
+    for (uint32_t k = 0; k < c->channels; ++k) acc[k] = g[k];   /* the point solve is the ring center */
     /* two rings — 8 at the full cone angle, 4 offset at half — approximate a uniform spherical cap */
     static const int   ring_n[2]   = { 8, 4 };
     static const float ring_a[2]   = { 1.f, 0.5f };
@@ -1266,7 +1266,7 @@ static void mdap_gains(RtCore* c, int p, Voice* v, float spread, float user_gain
             if (aniso) {
                 /* affine tangent squash: scale the ring offset per axis and renormalise — a 1×0
                  * extent becomes a sampled horizontal ARC (the polar-ellipse form would collapse
-                 * every off-axis point to the centre), matching BS.2127's squashed-cap weighting */
+                 * every off-axis point to the center), matching BS.2127's squashed-cap weighting */
                 const float ou = sa * cp * v->ext_u, ow = sa * sp * v->ext_w;
                 const float inv = 1.f / sqrtf(ca * ca + ou * ou + ow * ow);
                 for (int k = 0; k < 3; ++k)
@@ -1638,7 +1638,7 @@ static void mix_voice(RtCore* c, Voice* v, uint16_t idx, float* bus, uint32_t n,
         pv_g = v->gcur[BWA_AMBI_CH];
         pv_step = (v->gtarget[BWA_AMBI_CH] - pv_g) / (float)nr;
     }
-    /* dual-band panning: split each sample at BWA_DUALBAND_FC; the low band uses amplitude-normalised
+    /* dual-band panning: split each sample at BWA_DUALBAND_FC; the low band uses amplitude-normalized
      * gains (gcur_lo, better LF velocity vector), the high band the power gains. The complementary
      * 1st-order crossover (hi = s - lo) sums flat. dual = gcur*s + (gcur_lo-gcur)*lo, so a `dual_mix`
      * factor ramped 0<->1 on an A/B toggle CROSSFADES the LF re-weighting instead of stepping it
@@ -2154,7 +2154,7 @@ static float rot_glide(float cur, float tgt, float dmax) {
  * time-domain bands), the bed's FOA channels are analyzed per band into a direction + diffuseness
  * (smoothed intensity vector vs energy): the NON-DIFFUSE stream re-pans W through the
  * listener-relative panner at a virtual source on the array shell (ref + bed_radius*doa — the bed
- * becomes walkable: off-centre listeners get parallax a matrix decode can't give), and the DIFFUSE
+ * becomes walkable: off-center listeners get parallax a matrix decode can't give), and the DIFFUSE
  * stream decodes through the matrix into the DECORRELATORS (incoherent envelopment). Both are
  * loudness-matched to the matrix decode (bed_pref); a `mix` factor ramped 0<->1 on the toggle
  * crossfades the whole renderer, so the A/B is click-free (invariant 4). */
@@ -2433,7 +2433,7 @@ static void mix_bed(RtCore* c, Voice* v, uint16_t idx, float* bus, uint32_t n, u
 
 /* Tracked room EQ (layout room_eq_grid): interpolate the grid's per-speaker section-cut depths at
  * the live listener position — inverse-distance weighting over the measurement positions, smoothed
- * by an epsilon so standing exactly on a mic point still blends its neighbours — and hand them to
+ * by an epsilon so standing exactly on a mic point still blends its neighbors — and hand them to
  * the aligner as slew targets (align_room_eq_targets; the slew makes the walk click-free). Audio
  * thread, no alloc/locks; recomputed only when the listener moved > ~1 cm since the last solve
  * (align keeps slewing toward the standing targets meanwhile). The live kill switch
@@ -3661,7 +3661,7 @@ RtCore* rt_create(uint32_t req_voice_cap, uint32_t sound_cap, uint32_t sample_ra
     for (uint32_t ch = 0; ch < BWA_CHANNELS; ++ch)   /* output meter starts silent */
         atomic_store_explicit(&c->chan_peak[ch], 0.f, memory_order_relaxed);
     /* precompute the 3 EQ band prototypes from the runtime sample rate (so the EQ is correct at
-     * 48/96/192k). fc's: low-shelf 800, peaking at the geometric centre, high-shelf 8000. */
+     * 48/96/192k). fc's: low-shelf 800, peaking at the geometric center, high-shelf 8000. */
     {
         const float fc[3]  = { 800.f, sqrtf(800.f * 8000.f), 8000.f };
         const int   ty[3]  = { EQ_LOWSHELF, EQ_PEAK, EQ_HIGHSHELF };
@@ -3689,7 +3689,7 @@ RtCore* rt_create(uint32_t req_voice_cap, uint32_t sound_cap, uint32_t sample_ra
     c->lim_rel_a = 1.0f - expf(-1.0f / (0.120f * (float)sample_rate));
     c->layout  = layout_default();
     /* default listener POSITION = the layout's nominal listening point (re-set when the real
-     * layout arrives) — a pose-less client listens from the array centre, not the floor origin */
+     * layout arrives) — a pose-less client listens from the array center, not the floor origin */
     memcpy(c->lis.p_active,  c->layout.ref, sizeof c->lis.p_active);
     memcpy(c->lis.p_pending, c->layout.ref, sizeof c->lis.p_pending);
     memcpy(c->readback.p,    c->layout.ref, sizeof c->readback.p);
@@ -3713,7 +3713,7 @@ void rt_set_layout(RtCore* c, const Layout* L) {
     align_destroy(c->aligner);
     c->aligner = a;
     /* re-default the listener to the new layout's nominal listening point (load-time: poses
-     * pushed after start overwrite this every frame; a pose-less client hears from the centre) */
+     * pushed after start overwrite this every frame; a pose-less client hears from the center) */
     memcpy(c->lis.p_active,  c->layout.ref, sizeof c->lis.p_active);
     memcpy(c->lis.p_pending, c->layout.ref, sizeof c->lis.p_pending);
     memcpy(c->readback.p,    c->layout.ref, sizeof c->readback.p);

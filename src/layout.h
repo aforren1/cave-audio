@@ -41,7 +41,7 @@ typedef struct {
     uint8_t  npos;                                     /* measurement positions (0 = no grid) */
     float    pos[BWA_RQ_GRID_MAX][3];                   /* mic positions, room meters */
     uint8_t  nsec[BWA_CHANNELS];                        /* ladder size per speaker */
-    float    fc[BWA_CHANNELS][BWA_ROOM_EQ_MAX];          /* ladder: mode centre frequencies (Hz) */
+    float    fc[BWA_CHANNELS][BWA_ROOM_EQ_MAX];          /* ladder: mode center frequencies (Hz) */
     float    q [BWA_CHANNELS][BWA_ROOM_EQ_MAX];          /* ladder: mode Qs */
     float    gain_db[BWA_RQ_GRID_MAX][BWA_CHANNELS][BWA_ROOM_EQ_MAX];  /* per-position cut depths (<= 0) */
 } RoomEqGrid;
@@ -64,8 +64,8 @@ typedef struct {
     RoomEqGrid rq_grid;             /* tracked room EQ grid (npos = 0 when the layout has none) */
 } Layout;
 
-/* A sane default: a 3 m-cube 3x3x3 boundary grid (minus centre), FLOOR-origin — x/z at
- * +/-1.5 m around the room centre, y from 0 (floor) to 3 m, ref (ear point) at (0,1.5,0).
+/* A sane default: a 3 m-cube 3x3x3 boundary grid (minus center), FLOOR-origin — x/z at
+ * +/-1.5 m around the room center, y from 0 (floor) to 3 m, ref (ear point) at (0,1.5,0).
  * Unity trim, no delay. Lets the engine run with no layout file (binaural / desk dev / tests). */
 Layout layout_default(void);
 

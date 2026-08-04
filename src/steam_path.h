@@ -9,7 +9,7 @@
  * existing SH->26 bed decode), so the indirect sound decodes to the 26 speakers from the right
  * directions — e.g. out of an open doorway, not through the wall.
  *
- * Per-source like occlusion; the probe-transform convention (centre in the translation column, radius
+ * Per-source like occlusion; the probe-transform convention (center in the translation column, radius
  * from the basis lengths) is the one learned wiring baked reflections.
  */
 #ifndef BWA_STEAM_PATH_H

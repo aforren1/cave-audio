@@ -192,7 +192,7 @@ Regression-preventing gotchas. Each has bitten before or guards a real invariant
 - **A unit belongs in a NAME only when the quantity has two live units.** Time is the only one:
   frames (dsp clock, `play_at`/`stop_at`/`seek`, playheads, output latency) and seconds (fades,
   RT60, IR length, pose lead), so every time-valued name says which — `_frames` on a getter,
-  `seconds`/`_s` on a parameter. Distances (metres), frequencies (Hz), angles (radians) and gains
+  `seconds`/`_s` on a parameter. Distances (meters), frequencies (Hz), angles (radians) and gains
   (linear) have no competitor, so they carry the unit on the VALUE (`radius_m`, `xover_hz`,
   `yaw_rad`) and never on the call. The one hard rule for new calls: a decibel value must say
   `_db`, because linear is the unmarked default everywhere. Full statement in docs/api.md →
@@ -225,7 +225,7 @@ Regression-preventing gotchas. Each has bitten before or guards a real invariant
 - Do not run the Steam reflection bed AND the ISM early reflections together — the
   bed already contains early reflections, so they render twice (engine.c warns once).
 - Do not model the CAVE room itself with the ISM. Its shoebox is the *virtual*
-  environment; the physical room supplies its own reflections, and modelling it
+  environment; the physical room supplies its own reflections, and modeling it
   double-counts (same trap as matching the measured RT60 — docs/calibration.md).
 - Do not let any `bwa_*` per-frame call block or allocate.
 
@@ -247,6 +247,25 @@ That configuration never creates the Steam reflection bed. A **no-SDK build is f
 viable** (ISM + FDN + manual occlusion); what it loses is automatic occlusion, pathing,
 and the real HRTF monitor — the last being a *developer-workstation* dependency, since
 the production array render never uses HRTF.
+
+## Docs style
+
+**US English spelling, everywhere:** `docs/*.md`, headers, and code comments alike.
+`center`/`color`/`behavior`/`optimize`/`meter`/`license`, not `centre`/`colour`/
+`behaviour`/`optimise`/`metre`/`licence`. Catches the usual `-ise`/`-isation` family
+(`normalize`, not `normalise`) too.
+
+**Prose voice, `docs/*.md` and `README.md` only:** short, blunt prose (the
+floooh/sokol voice: direct statements, second person, no throat-clearing), following
+the Google developer documentation style guide beyond that. No em dashes, `e.g.`,
+`i.e.`, or `&`; spell out `for example`, `that is`, `and` (a hyphen or a rewritten
+sentence replaces the em dash). `vs` stays fine in an A/B-style label (`DBAP vs
+SPCAP`), just not in flowing prose. Code comments keep their own punctuation and are
+exempt from the voice rule.
+
+CLAUDE.md itself is not user-facing (see "Repo layout" note on `docs/api.md` owning
+the manual) and is exempt from the voice rule too; it predates it and mixes styles
+freely. It still follows the US English rule above.
 
 ## Doc index
 

@@ -14,7 +14,7 @@
  * dbap knobs round-trip. Loads an existing layout (argv[1] or ./cave_layout.json) to keep iterating.
  *
  * Coordinate frame: room space, right-handed, +y up, +z forward, origin ON THE FLOOR at the
- * working-area centre in x/z (Motive's default; y = height above the floor) — the same numbers the
+ * working-area center in x/z (Motive's default; y = height above the floor) — the same numbers the
  * JSON stores. The 3D view renders them directly; the audition (which physical
  * speaker sounds) is the ground truth for the channel<->speaker map, the numeric readout for position.
  *
@@ -107,7 +107,7 @@ static float       pin_slab_m = 0.3f;
  * coarser still (Blauert, Spatial Hearing, 1997). So azimuth is ~3-4x more resolvable than elevation:
  * split the localization error into azimuth + elevation and DOWN-weight elevation (elev_wt ~ 1/3.5), so
  * the optimizer trades vertical accuracy for horizontal, matching what a listener actually notices.
- * (elev_wt is a modelling choice from that ratio, not a value lifted from any single paper.) */
+ * (elev_wt is a modeling choice from that ratio, not a value lifted from any single paper.) */
 static int         perceptual = 1;         /* weight azimuth over elevation in the rE error */
 static float       elev_wt    = 0.3f;      /* elevation-error weight vs azimuth (~1/3.5; slider 0..1) */
 /* Scoring-shell elevation band: 0 = the full sphere; >0 keeps only source directions within that many
@@ -209,7 +209,7 @@ static int save_json(const char* path) {
         "{\n"
         "  \"schema_version\": 1,\n"
         "  \"units\": { \"position\": \"meters\", \"gain\": \"decibels\", \"delay\": \"milliseconds\" },\n"
-        "  \"coordinate_space\": \"room, right-handed, +y up, +z forward (matches OptiTrack/Motive default); origin ON THE FLOOR at the working-area centre (x/z); y = height above the floor\",\n"
+        "  \"coordinate_space\": \"room, right-handed, +y up, +z forward (matches OptiTrack/Motive default); origin ON THE FLOOR at the working-area center (x/z); y = height above the floor\",\n"
         "  \"reference\": { \"alignment\": \"max-distance\", \"speed_of_sound_mps\": %g, \"note\": \"delay_ms time-aligns each speaker arrival to the farthest speaker; gain_db is a measured per-speaker trim\" },\n"
         "  \"dbap\": { \"rolloff_r\": %g, \"distance_attenuation\": { \"model\": \"%s\", \"reference_distance_m\": %g, \"rolloff\": %g, \"min_gain_db\": %g } },\n",
         (double)SPEED_OF_SOUND, dbap_r, dist_model, dist_ref, dist_rolloff, dist_min_db);
@@ -333,7 +333,7 @@ static Vector3     src_pos = { 1.5f, 0.0f, 0.0f };
 /* ---- coverage overlay: angular gap to the nearest speaker, over a shell of source directions ----
  * A geometric proxy for DBAP localization: a direction with no nearby speaker forces the pan to
  * spread energy to far-off-axis speakers (a hole). Shades each direction green (covered) -> red (gap).
- * coverage_moving toggles the observer model: fixed = the centre sweet spot; moving = mean over a
+ * coverage_moving toggles the observer model: fixed = the center sweet spot; moving = mean over a
  * working-volume grid of listener positions (this installation's case — see docs/spatialization.md). */
 #define NCOV   380
 #define COV_R  3.0f
@@ -347,7 +347,7 @@ static float       cov_err[NCOV];                      /* per-direction rE error
 static float       cov_val[NCOV];                      /* per-cube value shown on hover (gap deg, or rE err deg) */
 static int         cov_err_valid, cov_err_stale, cov_err_panner = -1, cov_err_moving = -1, cov_err_frame;
 
-/* a ~2 s mono 16-bit pink-noise loop for the preview source (broadband -> localises well) */
+/* a ~2 s mono 16-bit pink-noise loop for the preview source (broadband -> localizes well) */
 static void gen_pink_wav(const char* p) {
     uint32_t n = SR * 2;
     short* pcm = (short*)malloc((size_t)n * sizeof(short));
@@ -442,19 +442,19 @@ static int   scored, score_stale, last_score_frame;   /* the per-panner scoreboa
  * Scoring such a layout AT the sweet spot — which is what this tool used to do for SPCAP and VBAP —
  * cannot see that degradation at all: it optimizes a single point and reports a number that is
  * structurally incapable of moving. bwa_validate measures the same contrast acoustically and finds
- * it large (SPCAP +10 deg, VBAP +5 deg at 0.7 m off-centre), so it is not a rounding error.
+ * it large (SPCAP +10 deg, VBAP +5 deg at 0.7 m off-center), so it is not a rounding error.
  *
  *   tracked = 1  solve at the listener's own position (what DBAP does per block)
  *   tracked = 0  solve at the sweet spot, listen from elsewhere (what a fixed install does)
  *
  * Sources therefore sit at FIXED WORLD positions off the sweet spot rather than following the
  * listener: only then is every listener position judged against the same physical sources, which is
- * what makes an off-centre cell comparable to a centred one. At the sweet spot the two modes are the
+ * what makes an off-center cell comparable to a centered one. At the sweet spot the two modes are the
  * same render, and the tests pin exactly that. */
 static int track_mode = 0;      /* 0 = auto (DBAP tracked, SPCAP/VBAP fixed), 1 = force tracked, 2 = force fixed */
 /* The observer model is the other half of a per-install objective: this CAVE's listener roams
  * (score over the 27-point grid, the default), but a seated install listens from the sweet spot
- * only, and scoring it over the roam punishes off-centre cells it will never occupy. Headless
+ * only, and scoring it over the roam punishes off-center cells it will never occupy. Headless
  * `fixed` token; the GUI keeps the moving model (this installation's case). */
 static int score_fixed_obs = 0; /* 1 = evaluate at the sweet spot only (seated install) */
 static int panner_tracked(bwa_panner p) {
@@ -474,7 +474,7 @@ static float panner_focus_default(bwa_panner p) {
  * for every panner (see the solve/eval note above). Uses bwa_panner_gains_batch (the ACTUAL engine
  * solve), so the score reflects what will ship — not a re-implementation. spread_deg (optional) is
  * the mean perceived source width from the energy-vector MAGNITUDE (Frank 2013: ≈186.4°·(1−|rE|)
- * + 10.7°) — the image-focus axis direction error alone can't see: a defocused-but-centred image
+ * + 10.7°) — the image-focus axis direction error alone can't see: a defocused-but-centered image
  * scores 0° error. */
 static void score_panner(bwa_panner panner, int stride, int tracked,
                          float* mean_deg, float* worst_deg, float* spread_deg) {
@@ -585,7 +585,7 @@ static void score_bed(int stride, float* mean_deg, float* worst_deg, float* spre
 }
 
 /* fill cov_err[] with the selected panner's per-direction rE error (deg), averaged over the observer
- * model score_panner uses (DBAP: the moving grid when coverage_moving; SPCAP/VBAP: the fixed centre).
+ * model score_panner uses (DBAP: the moving grid when coverage_moving; SPCAP/VBAP: the fixed center).
  * Same real solve as the X-score — this is its per-direction breakdown, for the overlay. */
 static void compute_cov_err(bwa_panner panner) {
     static float gains[NCOV * NSPK], srcs[NCOV * 3];
@@ -712,11 +712,11 @@ static void compute_badness(bwa_panner panner, int tracked) {
     bad_valid = 1; bad_stale = 0; bad_panner = panner; bad_tracked = tracked;
 }
 
-/* ---- auto-optimizer: stochastic hill-climb over the free positions, minimising a MULTI-OBJECTIVE
+/* ---- auto-optimizer: stochastic hill-climb over the free positions, minimizing a MULTI-OBJECTIVE
  * scalarization subject to the constraints: (1−w)·mean + w·worst rE error blends the average
  * experience against the worst direction/observer position (w = 1 is pure MAXIMIN — nothing is
  * sacrificed for the average, the right target when every occupant matters; cf. Yang et al. 2025,
- * Acoustics 7(4), who formalize that both can't be optimal at once for off-centre listeners), plus
+ * Acoustics 7(4), who formalize that both can't be optimal at once for off-center listeners), plus
  * an optional image-FOCUS term (mean Frank spread) direction error alone can't see. Each weight
  * setting climbs to a different point on the accuracy/robustness Pareto front. Runs incrementally
  * (a few trials per frame) so the layout is seen converging; stop any time and save. ---- */
@@ -1409,7 +1409,7 @@ static void draw_panel(void) {
     bwTip("the speaker's index IS its output/bus channel; [ ] steps, or click a sphere");
     ImGui::SameLine(); ImGui::Text("-> ch %d", sel);
     if (ImGui::DragFloat3("pos", &spk[sel].pos.x, 0.01f, 0, 0, "%.3f")) mark_edit();
-    bwTip("room-space metres, right-handed, +y up, origin on the floor at the working-area centre (Motive); drag, or ctrl-click to type");
+    bwTip("room-space meters, right-handed, +y up, origin on the floor at the working-area center (Motive); drag, or ctrl-click to type");
     if (ImGui::SliderFloat("gain", &spk[sel].gain_db, -24.0f, 12.0f, "%+.1f dB")) mark_edit();
     bwTip("per-speaker level trim (gain_db in the file)");
     { bool pb = spk[sel].pin != 0;
@@ -1462,7 +1462,7 @@ static void draw_panel(void) {
         mark_score();
     }
     bwTip("the panner Score / Optimize / the rE overlay evaluate ([B] cycles). DBAP tracks a "
-          "MOVING listener; SPCAP/VBAP assume the centre sweet spot");
+          "MOVING listener; SPCAP/VBAP assume the center sweet spot");
     { int ci = opt_condition_idx;
       if (ImGui::Combo("condition", &ci, "3d (full sphere)\0horizontal (plane band)\0visual (front wedge)\0"))
           apply_condition(ci, (bwa_panner)pv_panner); }
@@ -1477,7 +1477,7 @@ static void draw_panel(void) {
           "mean/worst per panner land in the HUD scoreboard");
     ImGui::SameLine();
     { bool ob = opt_running != 0; if (ImGui::Checkbox("Optimize [O]", &ob)) set_optimizing(ob); }
-    bwTip("stochastic hill-climb of the speaker positions, minimising the target panner's rE error "
+    bwTip("stochastic hill-climb of the speaker positions, minimizing the target panner's rE error "
           "within the constraints; runs live - watch it converge. Stops ITSELF when the step size "
           "hits the floor (same condition as the headless runs) and restores the best layout seen; "
           "[O] again re-climbs from there");
@@ -1564,17 +1564,17 @@ static void draw_panel(void) {
     ImGui::SameLine();
     CheckboxInt("moving [V]", &coverage_moving);
     bwTip("observer model: average over a grid of listener positions across the working volume "
-          "(this installation's case) instead of the centre sweet spot");
+          "(this installation's case) instead of the center sweet spot");
     if (ImGui::Combo("solve at", &track_mode, "auto (per panner)\0tracked listener\0fixed sweet spot\0"))
         mark_score();
     bwTip("where the panner SOLVES, as opposed to where you listen from. A fixed install solves once "
           "at the sweet spot and never corrects for you walking away; a tracked one re-solves at your "
           "position every block. Scoring only at the sweet spot cannot see that difference at all - "
-          "auto gives each panner its real behaviour, and forcing a mode A/Bs the contrast");
+          "auto gives each panner its real behavior, and forcing a mode A/Bs the contrast");
 
     CheckboxInt("badness map [M]", &bad_on);
     bwTip("where in the ROOM does this layout work, rather than which directions work from the "
-          "centre: a grid of LISTENER positions through the working volume, each scored over a "
+          "center: a grid of LISTENER positions through the working volume, each scored over a "
           "spread of directions. Good regions fade out, bad ones light up. Toggle 'solve at' while "
           "watching - a fixed solve draws an island around the sweet spot, a tracked one stays flat");
     if (bad_on && ImGui::Combo("map metric", &bad_metric, "rE direction error\0Frank spread\0")) bad_stale = 1;
@@ -1583,13 +1583,13 @@ static void draw_panel(void) {
                       "where spread is the strong predictor - so this follows the panner by default");
 
     CheckboxInt("shade rE error (vs gap) [G]", &cov_metric);
-    bwTip("colour by the selected panner's REAL solve (rE error) instead of the geometric "
+    bwTip("color by the selected panner's REAL solve (rE error) instead of the geometric "
           "nearest-speaker gap");
 
     ImGui::SeparatorText("Audition");
     if (ImGui::Button("Preview - audition [P]", ImVec2(-1, 0))) enter_preview();
     bwTip("pan a pink-noise source through the edited layout and judge it by ear (rebuilds the "
-          "engine - the layout is load-time); at the CAVE, walk the room for off-centre coverage");
+          "engine - the layout is load-time); at the CAVE, walk the room for off-center coverage");
 
     ImGui::SeparatorText("View");
     CheckboxInt("head view [H]", &fps_view);
@@ -1707,7 +1707,7 @@ static void register_tests(ImGuiTestEngine* te) {
         CON.bounds = sb; CON.nnogo = sn; CON.nobst = so; CON.loaded = sl;
     };
 
-    /* The solve/eval split is the whole point of scoring off-centre at all: a fixed solve keeps the
+    /* The solve/eval split is the whole point of scoring off-center at all: a fixed solve keeps the
      * sweet spot's gains while the listener walks away, so over the grid it cannot beat a tracked
      * one. If `tracked` were being ignored the two would come back bit-identical, which is exactly
      * what this catches. */
@@ -1720,7 +1720,7 @@ static void register_tests(ImGuiTestEngine* te) {
         IM_CHECK_GT(mt, 0.0f);
         IM_CHECK_GT(fabsf(mf - mt), 1e-4f);                      /* the mode actually changes the render */
         IM_CHECK_GE(mf, mt - 0.5f);                              /* ...and leaving the sweet spot never helps */
-        /* track_mode overrides it for A/B; auto gives each panner its real behaviour */
+        /* track_mode overrides it for A/B; auto gives each panner its real behavior */
         int save = track_mode;
         track_mode = 0; IM_CHECK(panner_tracked(BWA_PAN_DBAP) && !panner_tracked(BWA_PAN_VBAP));
         track_mode = 1; IM_CHECK(panner_tracked(BWA_PAN_VBAP));
@@ -2215,7 +2215,7 @@ int main(int argc, char** argv) {
     }
     cov_lis[0] = Vector3{ 0, 0, 0 };
     /* Listener-movement envelope. HEIGHT gets a realistic +-0.45 m (seated to tall), not a token
-     * nudge: bwa_validate measures off-height as a DISTINCT failure mode from off-centre-in-plane —
+     * nudge: bwa_validate measures off-height as a DISTINCT failure mode from off-center-in-plane —
      * the array's speakers sit mostly overhead and the alignment delays are computed for one
      * reference height, so tracking the listener re-aims the solve but cannot fix either. A grid
      * that barely varies height cannot see the problem it most needs to. */

@@ -1146,7 +1146,7 @@ void bwa_scene_set_mesh_mat(bwa_engine* e, const float* verts, int nverts, const
 
 #ifdef BWA_HAVE_STEAMAUDIO
 /* Emit triangle (i0,i1,i2) into tris[*n], flipping the last two indices if needed so the face normal
- * points toward `ctr` (the box centre — inward; the listener is inside). Testing toward the ORIGIN
+ * points toward `ctr` (the box center — inward; the listener is inside). Testing toward the ORIGIN
  * would degenerate for a floor-based box, whose bottom face contains the origin. */
 static void emit_inward(const float* v, const float ctr[3], int* tris, int* n, int i0, int i1, int i2) {
     const float *p0 = &v[i0*3], *p1 = &v[i1*3], *p2 = &v[i2*3];
@@ -1180,7 +1180,7 @@ void bwa_scene_set_box(bwa_engine* e, float w, float h, float d, const bwa_mater
     rt_set_ism_room(e->rt, &e->ism_room);          /* seqlock publish — live-safe (rt.h) */
 #ifdef BWA_HAVE_STEAMAUDIO
     if (scene_locked(e)) return;
-    /* floor-based: x/z centred on the origin, y from 0 (the floor, where the room origin
+    /* floor-based: x/z centered on the origin, y from 0 (the floor, where the room origin
      * canonically sits) up to h — so a listener at ear height stands inside the box */
     float hw = w*0.5f, hd = d*0.5f;
     float verts[8*3] = {

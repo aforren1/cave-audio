@@ -177,7 +177,7 @@ static int valid_field(const Layout* L, const float* gains, const float mic[3],
             double dz = mz - L->speakers[i].pos[2];
             double r  = sqrt(dx*dx + dy*dy + dz*dz);
             if (r < 0.05) r = 0.05;                   /* a capsule inside a cabinet is not a thing */
-            /* propagation + the layout's own alignment delay: at an off-centre listener that
+            /* propagation + the layout's own alignment delay: at an off-center listener that
              * alignment is imperfect, which is a real effect and belongs in the measurement */
             double tau = r / c + (double)L->speakers[i].delay_samples / fs;
             double A   = (double)gains[i] * (double)L->speakers[i].gain_lin / r;

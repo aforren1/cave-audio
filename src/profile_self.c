@@ -13,7 +13,7 @@
 #define BWA_PROF_MAXZ 64
 
 static CRITICAL_SECTION g_lock;
-static volatile LONG     g_ready;                 /* 1 once g_lock + g_ns_per_tick are initialised */
+static volatile LONG     g_ready;                 /* 1 once g_lock + g_ns_per_tick are initialized */
 static double            g_ns_per_tick;
 static struct { const char* name; volatile LONG64 total, count; } g_z[BWA_PROF_MAXZ];
 static volatile LONG     g_nz;                    /* published slot count (write name before bumping) */

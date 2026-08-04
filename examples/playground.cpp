@@ -15,7 +15,7 @@
  *
  * Scenes (cycle with TAB):
  *   1 Localization      — pure listener-relative DBAP. Move a source, turn your head, switch the
- *                         test signal (1-4); hear it localise around the 26-speaker array. SPACE
+ *                         test signal (1-4); hear it localize around the 26-speaker array. SPACE
  *                         auto-moves it: orbit + near/far + high/low, sweeping the whole space.
  *                         Opt-in per-source effects: V Doppler, B air absorption, C source size, M dual-band
  *                         (amplitude LF / power HF panning), X a fast straight flyby (X+V = race-car pitch sweep).
@@ -109,8 +109,8 @@
 #define REFL_GAIN 0.5f    /* base image-source level (scaled further by the wall material reflectivity) */
 #define TEST_GAIN 0.3f    /* channel-walk test signal level */
 
-/* ---- localization test signals (synthesised at startup) ----
- * Choice of signal matters: broadband + sharp onsets localise best, and HF content is what lets you
+/* ---- localization test signals (synthesized at startup) ----
+ * Choice of signal matters: broadband + sharp onsets localize best, and HF content is what lets you
  * hear elevation / front-back. 0 pink noise, 1 pink bursts, 2 click train, 3 a 1 kHz tone (ambiguous). */
 #define SIG_SECS 2u
 #define SIGLEN   (SR * SIG_SECS)
@@ -430,7 +430,7 @@ static float occ_anim_t = 0.0f;
 static void update_dyn_wall_xform(void) {
     if (occ_wall >= 0) bwa_scene_set_dynamic_transform(e, occ_wall, wall_c.x, wall_c.y, wall_c.z, 0, 0, 0, 1);
 }
-/* (re)create the dynamic wall. Its LOCAL geometry is the quad's corners as offsets from centre
+/* (re)create the dynamic wall. Its LOCAL geometry is the quad's corners as offsets from center
  * (wall_u*±hw + wall_v*±hh), so a pure translation reproduces push_wall_mesh's exact world triangles —
  * the occluder is geometrically identical to the static one, which is what makes the A/B meaningful. */
 static void make_dyn_wall(bwa_material mat) {
@@ -1397,7 +1397,7 @@ static void draw_panel(void) {
         if (chk("air absorption [B]", &loc_air))     bwa_source_set_air_absorption(e, src, loc_air);
         bwTip("distance-driven high-frequency roll-off: far sources sound duller");
         if (chk("dual-band panning [M]", &loc_dual)) bwa_set_dual_band(e, loc_dual);
-        bwTip("below ~700 Hz pans amplitude-normalised - sharper bass localisation "
+        bwTip("below ~700 Hz pans amplitude-normalized - sharper bass localization "
               "near the sweet spot; toggle it live and compare");
         ImGui::SetNextItemWidth(-FLT_MIN);
         if (ImGui::SliderFloat("##spread", &loc_spread, 0.0f, 1.0f, "size %.2f [C]"))
@@ -1406,7 +1406,7 @@ static void draw_panel(void) {
               "that shouldn't collapse to a point");
         ImGui::TextDisabled("source (%.2f, %.2f, %.2f)  head %.0f deg",
                             source_pos.x, source_pos.y, source_pos.z, head_yaw * 57.2958f);
-        ImGui::TextWrapped("broadband + sharp onsets localise best");
+        ImGui::TextWrapped("broadband + sharp onsets localize best");
     } else if (cur_scene == 1) {                          /* Occlusion & Materials */
         ImGui::SetNextItemWidth(-FLT_MIN);
         int m = cur_mat;
@@ -1500,7 +1500,7 @@ static void draw_panel(void) {
               "direct stream re-panned listener-relative - a walkable bed). Live crossfade");
         chk("max-rE decode [B]", &bed_re);
         bwTip("max-rE weighting tapers the high SH orders: fewer decode sidelobes, a longer "
-              "energy vector - better localization off-centre, slightly wider main lobe. Live A/B");
+              "energy vector - better localization off-center, slightly wider main lobe. Live A/B");
         chk("band-split max-rE [N]", &bed_re_split);
         bwTip("Gerzon split: the taper acts only above ~700 Hz, the unweighted (rV-optimal) decode "
               "keeps the low band - the ear localizes LF by pressure, HF by energy. Needs max-rE "
@@ -2004,7 +2004,7 @@ int main(int argc, char** argv) {
         if (lf) { fclose(lf); g_layout_path = "cave_layout.json"; }
     }
 
-    /* synthesise the localization test signals to wav (the engine loads sounds from file) */
+    /* synthesize the localization test signals to wav (the engine loads sounds from file) */
     float* sigbuf = (float*)malloc((size_t)SIGLEN * sizeof(float));
     if (!sigbuf) { printf("out of memory\n"); return 1; }
     for (int i = 0; i < NSIG; ++i) { gen_signal(i, sigbuf, SIGLEN); write_wav(sig_files[i], sigbuf, SIGLEN); }

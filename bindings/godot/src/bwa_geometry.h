@@ -99,10 +99,10 @@ private:
 	Ref<BwaMaterial> material;
 };
 
-/* The shoebox the virtual scene lives in: floor-based, centred on this node.
+/* The shoebox the virtual scene lives in: floor-based, centered on this node.
  *
  * Do NOT model the physical CAVE with this. Its box is the VIRTUAL environment; the real
- * room supplies its own reflections, and modelling it double-counts.
+ * room supplies its own reflections, and modeling it double-counts.
  */
 class BwaRoomBox : public Node3D {
 	GDCLASS(BwaRoomBox, Node3D)

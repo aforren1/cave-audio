@@ -30,7 +30,7 @@ namespace BwAudio.EditorTools
             EditorGUILayout.HelpBox(
                 $"loaded: bounds {(data?.bounds != null ? "yes" : "no")}, {nogo} keep-out, {obst} obstacle(s)\n" +
                 "Scene view: green = speaker truss (stay inside), red = keep-out (screens + observer), " +
-                "orange = obstacles (projectors). Drawn in room metres through Room.UnityToRoom — if the " +
+                "orange = obstacles (projectors). Drawn in room meters through Room.UnityToRoom — if the " +
                 "CAVE lands somewhere unexpected, that registration transform is wrong.",
                 MessageType.Info);
         }

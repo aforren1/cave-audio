@@ -262,10 +262,10 @@ static void nn_err(char* err, size_t cap, const char* msg) {
     if (err && cap) { strncpy(err, msg, cap - 1); err[cap - 1] = 0; }
 }
 
-/* Map OptiTrack/Motive space (default: Y-up, right-handed, +Z forward, metres) into the
+/* Map OptiTrack/Motive space (default: Y-up, right-handed, +Z forward, meters) into the
  * engine's room space — which IS that convention (identity head faces +z), so position AND
  * orientation pass through unchanged; the room origin/orientation calibration (where the
- * CAVE centre is relative to the Motive origin) is applied here when a real survey is wired in. */
+ * CAVE center is relative to the Motive origin) is applied here when a real survey is wired in. */
 static void to_room(const float src_p[3], const float src_q[4], float p[3], float q[4]) {
     memcpy(p, src_p, sizeof(float) * 3);
     memcpy(q, src_q, sizeof(float) * 4);

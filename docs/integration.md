@@ -1,15 +1,15 @@
 # Engine integration
 
-The game engines — Unity, Godot, Unreal — differ only in how transforms and
+The game engines (Unity, Godot, Unreal) differ only in how transforms and
 tracking are read and converted at the boundary. The audio code is identical.
 No *rendered* audio crosses the boundary: the mix never routes through the game
 engine, only control calls on the main thread. The one inbound exception is the opt-in
 push-source feed (`bwa_source_push`): caller-generated PCM *into* the engine,
-on the same control thread—a source feed, not a render path.
+on the same control thread: a source feed, not a render path.
 
 ## Coordinate seam (the part that silently ruins spatial audio)
 
-The core works in **room space: right-handed, +Y up, +Z forward, metres, origin on
+The core works in **room space: right-handed, +Y up, +Z forward, meters, origin on
 the floor**. This is exactly OptiTrack/Motive's default streamed frame (the
 ground-plane square defines the floor), so tracked rigid-body poses pass through
 unchanged: no rotation, no translation. An identity head quaternion faces +Z, the
@@ -39,7 +39,7 @@ The CAVE array is 26; a smaller rig loads its own file. Read it back with
 `bwa_get_channel_count` (or `bwa_get_speakers`, which returns the same number) and size any
 meter / speaker-gizmo / channel-test array from it. Never hard-code 26 in a binding.
 
-The trap: **a failed layout load is not fatal**—`bwa_create` falls back to the
+The trap: **a failed layout load is not fatal**: `bwa_create` falls back to the
 26-speaker default grid and only records the reason in `bwa_last_error`. On a smaller
 install that silently changes the channel count too. Check `bwa_last_error` right after
 `bwa_create` and fail loudly if the surveyed layout didn't load.
@@ -93,7 +93,7 @@ internal static class Bwa {
 
     // Mirrors bwa_profile in bw_audio.h. MUST be a 4-byte int enum, NOT a string - the
     // C ABI's bwa_desc.profile is an enum, so marshalling it as a string would push a
-    // pointer where the core expects 0/1/2 (undefined behaviour / crash).
+    // pointer where the core expects 0/1/2 (undefined behavior / crash).
     public enum bwa_profile : int { Cave = 0, Binaural = 1, Both = 2 }
 
     [StructLayout(LayoutKind.Sequential)]
@@ -124,14 +124,14 @@ internal static class Bwa {
 ```
 
 The snippet shows the core calls. The shipped `Bwa.cs` binds every `BWA_API` function in
-`bw_audio.h` except two Unity never uses — `bwa_set_output_capture` (an audio-thread callback) and
+`bw_audio.h` except two Unity never uses: `bwa_set_output_capture` (an audio-thread callback) and
 `bwa_render_block` (the manual-sink golden-render path). Beyond the core:
 
 - **Voice management + scheduling**: `bwa_source_set_priority`;
   `bwa_source_play_at` + `bwa_get_dsp_time` (sample-accurate start),
-  `bwa_source_play_loop` (`Emitter.PlayLoop` — intro→loop region),
-  `bwa_source_stop_at` (`Emitter.StopAt` — click-free scheduled stop on the dsp clock),
-  `bwa_source_queue` (`Emitter.Queue` — gapless chaining into the next sound);
+  `bwa_source_play_loop` (`Emitter.PlayLoop`: intro→loop region),
+  `bwa_source_stop_at` (`Emitter.StopAt`: click-free scheduled stop on the dsp clock),
+  `bwa_source_queue` (`Emitter.Queue`: gapless chaining into the next sound);
   `bwa_get_active_voices`.
 - **Transport**: `bwa_source_set_paused`, `bwa_set_paused` (global),
   `bwa_source_seek`, `bwa_source_is_playing`; `Emitter` polls the playing state
@@ -141,9 +141,9 @@ The snippet shows the core calls. The shipped `Bwa.cs` binds every `BWA_API` fun
   groups (`bwa_source_set_group` + `bwa_group_set_gain` / `bwa_group_set_paused`).
 - **Propagation effects**: `bwa_source_set_doppler`, `bwa_source_set_air_absorption`,
   `bwa_source_set_loudness_comp`, `bwa_source_set_spread`, `bwa_source_set_size`
-  (metric radius), `bwa_source_set_extent` (`Emitter.Extent` — anisotropic
+  (metric radius), `bwa_source_set_extent` (`Emitter.Extent`: anisotropic
   width/height), and `bwa_source_set_attenuation_override`
-  (`Emitter.SetAttenuationOverride` — per-source distance curve; `ref <= 0` clears).
+  (`Emitter.SetAttenuationOverride`: per-source distance curve; `ref <= 0` clears).
 - **Occlusion + directivity**: `bwa_source_set_occlusion` /
   `bwa_source_get_occlusion`, `bwa_source_set_occlusion_manual` (game-driven
   occlusion; **works without the Steam Audio build**),
@@ -173,14 +173,14 @@ The snippet shows the core calls. The shipped `Bwa.cs` binds every `BWA_API` fun
   (the layout's speaker count; see "Channel count" above; size meter/speaker
   arrays with it, never a hard-coded 26); and the engine-free ASIO driver
   enumeration `bwa_get_asio_driver_count` / `bwa_get_asio_driver_name`
-  (`Engine.AsioDriverCount` / `AsioDriverName` — static, for a driver picker
+  (`Engine.AsioDriverCount` / `AsioDriverName`; static, for a driver picker
   before `bwa_create`).
 - **Assets**: `bwa_load_sound_streaming`, `bwa_load_ambix`, and the metadata
   readbacks `bwa_sound_get_frames` / `bwa_sound_get_channels`
   (`Engine.SoundFrames` / `SoundChannels`).
 - **Procedural (push) sources**: `bwa_source_create_push`, `bwa_source_push`,
   `bwa_source_push_space`, `bwa_source_push_end`, surfaced as the **`PushEmitter`**
-  component — a positional source you feed mono engine-rate floats instead of a
+  component: a positional source you feed mono engine-rate floats instead of a
   clip (a synth, an engine model, a voice stream). It rides `Engine`'s centralized
   push like `Emitter`, but the engine refuses play/seek/pitch/queue on a push
   voice, so those aren't exposed. Feed from the main thread (the binding's control
@@ -188,7 +188,7 @@ The snippet shows the core calls. The shipped `Bwa.cs` binds every `BWA_API` fun
 
 Two seams a binding must not get wrong, both handled in `Room` (see below):
 `bwa_bed_set_orientation` takes a **room-frame** yaw, and the X mirror **reverses the
-sense of rotation**—pass a Unity euler angle straight in and the soundfield
+sense of rotation**: pass a Unity euler angle straight in and the soundfield
 spins the wrong way (`Room.YawRad` converts). The FDN's decay direction is a
 **direction**, so it goes through `Room.Dir` (no registration translation), not
 `Room.Pos`.
@@ -326,7 +326,7 @@ public sealed class Emitter : MonoBehaviour {
 ## Godot
 
 **Implemented as a GDExtension: [`bindings/godot/`](../bindings/godot/).** Its
-[README](../bindings/godot/README.md) is the manual — install, the node reference, the
+[README](../bindings/godot/README.md) is the manual: install, the node reference, the
 traps; this section carries only what belongs in the cross-engine comparison.
 
 No 1:1 binding layer: GDExtension needs no P/Invoke shim, so every call lives as a method
@@ -337,19 +337,19 @@ on the class owning its handle (`BwaEngine`, `BwaSource` → `BwaEmitter`/`BwaPu
 The seam is **simpler than Unity's, and Unity's advice must not be carried over**:
 
 - Godot is right-handed and +Y up like room space, so there is **no mirror**. Positions
-  pass through the CAVE registration transform and nothing else — if a source comes out
+  pass through the CAVE registration transform and nothing else: if a source comes out
   mirrored, the registration is wrong, not the handedness conversion.
 - The one conversion is the **facing convention**: Godot's forward is −Z, room identity
   faces +Z, so orientations pick up a 180° yaw (a quaternion swizzle, pinned by the
-  `godot_room` ctest). This applies to *facings only* — listener pose, directivity axes.
+  `godot_room` ctest). This applies to *facings only*: listener pose, directivity axes.
   Mesh/instance transforms take registration alone; routing them through the facing helper
   spins every occluder 180° about Y.
-- `bwa_bed_set_orientation`'s **sense of rotation is preserved** — no mirror means no
+- `bwa_bed_set_orientation`'s **sense of rotation is preserved**: no mirror means no
   reversal, where the Unity binding must flip it.
 
 Godot has no `LateUpdate`, so the centralized per-frame push rides `process_priority`
 instead (the `BwaEngine` node defaults high, so it samples after gameplay). Coherence never
-depends on that ordering — one node pushes all sources, then the listener, then commits —
+depends on that ordering (one node pushes all sources, then the listener, then commits);
 only freshness does.
 
 One platform trap with no Unity analogue: the core opens files by OS path, and in an
@@ -374,5 +374,5 @@ Same library, same C ABI, linked as a module. The per-engine work mirrors Unity:
 At the desk: run `binaural` with `feedListener = true` and `listener` pointed at
 the XR camera, driving the same emitters and calls. In the CAVE: run `cave` (or
 `both`) with `feedListener = false`; the core takes head pose straight from
-OptiTrack. Same build, same components, same control path—only the profile
+OptiTrack. Same build, same components, same control path; only the profile
 changes.

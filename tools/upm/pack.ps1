@@ -88,7 +88,7 @@ if ($PluginsFrom) {
         $to   = Join-Path $plugins $dll
         if (-not (Test-Path $from)) { throw "$dll not found in $src" }
 
-        # Skip the copy when it is already the same binary. Not just an optimisation: an OPEN UNITY
+        # Skip the copy when it is already the same binary. Not just an optimization: an OPEN UNITY
         # EDITOR holds these DLLs loaded (a local/embedded package loads them straight out of this
         # folder), which locks them against writing. Hashing still works, so the common case - pack
         # right after a build, Unity open - goes through untouched instead of dying on a lock.

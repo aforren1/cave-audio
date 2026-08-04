@@ -140,7 +140,7 @@ int main(void) {
 
     /* 3. DBAP localization (centered listener): source at speaker k -> channel k dominates */
     {
-        float lis[3] = { LD.ref[0], LD.ref[1], LD.ref[2] }, g[CH];   /* the array centre (floor origin) */
+        float lis[3] = { LD.ref[0], LD.ref[1], LD.ref[2] }, g[CH];   /* the array center (floor origin) */
         int ok = 1;
         for (int k = 0; k < CH; ++k) {
             dbap_gains(LD.speakers[k].pos, lis, &LD, 1.0f, g);
@@ -185,21 +185,21 @@ int main(void) {
     /* 6b. moving-listener localization (the headline feature): a source co-located with speaker k
      *     localizes to channel k from ANY listener position, because DBAP is listener-relative — the
      *     source and speaker k share a bearing from every point. A sign error in the listener-relative
-     *     direction would pull the image to the OPPOSITE speaker, which the centred test 3 can't see. */
+     *     direction would pull the image to the OPPOSITE speaker, which the centered test 3 can't see. */
     {
-        float lis[3] = { -1.0f, LD.ref[1] - 0.4f, 0.6f }, g[CH];   /* off-centre AND off the ear plane */
+        float lis[3] = { -1.0f, LD.ref[1] - 0.4f, 0.6f }, g[CH];   /* off-center AND off the ear plane */
         int ok = 1;
         for (int k = 0; k < CH; ++k) {
             dbap_gains(LD.speakers[k].pos, lis, &LD, 1.0f, g);
             if (argmax(g, CH) != k) ok = 0;
         }
-        CHECK(ok, "DBAP localizes a source at each speaker to that channel from an off-centre listener");
+        CHECK(ok, "DBAP localizes a source at each speaker to that channel from an off-center listener");
     }
 
     /* 6c. boundary-crossing continuity + injectivity: hull-projection DBAP has two documented
      *     failure modes outside the array (Sundstrom 2021, I3DA): gains become non-unique when the
      *     projection lands on a hull vertex, and total power "undulates wildly" across the boundary.
-     *     The engine's formulation is hull-free, so a source swept from the centre out through a
+     *     The engine's formulation is hull-free, so a source swept from the center out through a
      *     corner speaker and beyond must give (a) per-speaker gains continuous in position, (b) a
      *     total level monotone non-increasing past the reference distance, and (c) distinct gain
      *     vectors for distinct positions (no exterior collapse). The ray passes THROUGH the corner
@@ -313,7 +313,7 @@ int main(void) {
                 r7 += (double)buf[7*(size_t)NN+i] * buf[7*(size_t)NN+i];
             }
             double att_db = 10.0 * log10(r4 / r6);                  /* cut channel vs untouched at fc */
-            CHECK(att_db < -5.0 && att_db > -7.0, "room_eq section cuts ~6 dB at its centre frequency");
+            CHECK(att_db < -5.0 && att_db > -7.0, "room_eq section cuts ~6 dB at its center frequency");
             CHECK(fabs(10.0 * log10(r7 / (0.5 * (NN / 2)))) < 0.6,  "room_eq leaves off-fc content alone");
             align_destroy(a);
         }
@@ -443,7 +443,7 @@ int main(void) {
     /* 9. SPCAP panner: localization, constant power, multi-speaker spread, non-negative gains */
     {
         SpcapState sp; spcap_reset(&sp);
-        float lis[3] = { LD.ref[0], LD.ref[1], LD.ref[2] }, g[CH];   /* sweet spot = the array centre */
+        float lis[3] = { LD.ref[0], LD.ref[1], LD.ref[2] }, g[CH];   /* sweet spot = the array center */
         int loc_ok = 1, nonneg = 1;
         for (int k = 0; k < CH; ++k) {
             spcap_gains(&sp, LD.speakers[k].pos, lis, &LD, 1u, 1.0f, g);   /* source at speaker k's bearing */
@@ -478,7 +478,7 @@ int main(void) {
             double esad = 0;
             for (int s = 0; s < CH; ++s) {
                 float p[3] = { LD.speakers[s].pos[0] - LD.ref[0], LD.speakers[s].pos[1] - LD.ref[1],
-                               LD.speakers[s].pos[2] - LD.ref[2] };       /* dirs from the array centre */
+                               LD.speakers[s].pos[2] - LD.ref[2] };       /* dirs from the array center */
                 float pl = sqrtf(p[0]*p[0] + p[1]*p[1] + p[2]*p[2]);
                 float ad2[3] = { p[2]/pl, p[0]/pl, p[1]/pl }, ys[BWA_AMBI_CH]; ambi_encode_sn3d(ad2, ys);   /* (z,x,y): matches build_bed_decode */
                 for (int k = 0; k < BWA_AMBI_CH; ++k) { int l = (int)floorf(sqrtf((float)k));

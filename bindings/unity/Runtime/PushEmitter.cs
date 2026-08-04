@@ -1,4 +1,4 @@
-// PushEmitter.cs — a positional source you FEED PCM instead of a clip (procedural audio: a synthesised
+// PushEmitter.cs — a positional source you FEED PCM instead of a clip (procedural audio: a synthesized
 // engine, a software synth, a network voice stream). The full spatial path applies — position, gain,
 // spread, occlusion, reflections, Doppler, groups, fades all work exactly like Emitter (they live on
 // the shared SourceBase) — but the engine REFUSES play/seek/pitch/queue on a push voice, so those

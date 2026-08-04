@@ -7,7 +7,7 @@
  * the default layout + bus scratch, the energy/channel probes, the render harness, the
  * wav writers, the CHECK macro + fail counter, and the bus/path tap stubs — is defined
  * here, static, so each translation unit gets its own copy (the two exes never link
- * together). Moved verbatim from the original rt_test.c; do not edit behaviour here.
+ * together). Moved verbatim from the original rt_test.c; do not edit behavior here.
  */
 #ifndef RT_TEST_UTIL_H
 #define RT_TEST_UTIL_H

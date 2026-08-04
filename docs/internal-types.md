@@ -1,6 +1,6 @@
 # Internal types and helper contracts
 
-These types are **internal** to `src/`—they are *not* part of the public ABI
+These types are **internal** to `src/`: they are *not* part of the public ABI
 and must **not** go in [`include/bw_audio.h`](../include/bw_audio.h).
 
 This file pins the protocol fields that [`concurrency.md`](./concurrency.md)
@@ -55,13 +55,13 @@ typedef struct {
 ```
 
 `BWA_CHANNELS` (26) is defined in [`src/sink.h`](../src/sink.h) and is the
-**capacity**, not the count. Every `[BWA_CHANNELS]` array in these structs—gain
-vectors, the bed decode matrix, the meters—is sized to that capacity, but only
+**capacity**, not the count. Every `[BWA_CHANNELS]` array in these structs (gain
+vectors, the bed decode matrix, the meters) is sized to that capacity, but only
 the first `RtCore.channels` entries are used. `channels` is the loaded layout's
 speaker count (`Layout.count`, 4..26; 26 for the default grid), resolved in
 `bwa_create` *before* `rt_create` and fixed for the engine's lifetime. It is what
 `bwa_get_channel_count` reports. Loops over the bus must use `channels`, never
-`BWA_CHANNELS`—the tail entries belong to no speaker.
+`BWA_CHANNELS`: the tail entries belong to no speaker.
 
 The rest of the struct is per-subsystem DSP state, one group per feature. All of
 it is audio-thread-only (ramp state, filter histories), which is why it lives
@@ -71,13 +71,13 @@ it is audio-thread-only (ramp state, filter histories), which is why it lives
   `stream_pos` (absolute position into a stream's ring),
   `start_sample` (dsp-sample for a scheduled `bwa_source_play_at`),
   `loop_beg`/`loop_end` (loop region for `bwa_source_play_loop`; resolved against the
-  asset at `CMD_PLAY`, 0/0 = whole clip — the mix seam wraps `cursor` to `loop_beg` at
+  asset at `CMD_PLAY`, 0/0 = whole clip; the mix seam wraps `cursor` to `loop_beg` at
   `loop_end`), `stop_at`/`stop_sched` (a scheduled click-free stop, `bwa_source_stop_at`;
   `rt_render` fires the one-block fade once the block reaches `stop_at`),
   `queue`/`queue_loop`/`queue_head`/`queue_len` (the gapless chain FIFO, depth `BWA_QUEUE`;
   entries are resolved `SoundData*` like `sound`, so `CMD_SOUND_RETIRE` NULL-tombstones any
-  it frees — `mix_voice` pops the next valid entry at a non-looping end instead of stopping).
-- **dual-band panning**: `gtarget_lo` / `gcur_lo` (amplitude-normalised LF
+  it frees; `mix_voice` pops the next valid entry at a non-looping end instead of stopping).
+- **dual-band panning**: `gtarget_lo` / `gcur_lo` (amplitude-normalized LF
   gain set), `xover_lp` (crossover one-pole state), `dual_mix` (0↔1 A/B
   crossfade factor).
 - **occlusion / directivity**: `occ_cur`, `dir_cur` ramp state plus the

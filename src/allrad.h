@@ -3,7 +3,7 @@
  * (same [BWA_CHANNELS][BWA_AMBI_CH] shape + SN3D/ACN convention as the sampling decode in rt.c), but
  * robust on an IRREGULAR array: sampling-decode the ambisonic signal to a dense uniform VIRTUAL layout
  * (a Fibonacci sphere), then VBAP each virtual loudspeaker onto the real array (convex-hull
- * triangulation), then energy-normalise to the sampling decode. On a clustered/lopsided array this
+ * triangulation), then energy-normalize to the sampling decode. On a clustered/lopsided array this
  * keeps the diffuse field even (no loud directions) and improves localization, where the plain
  * sampling decode over-energises dense regions. A pole with no real speaker within ~60° (a
  * floor-less array's nadir) gets an IMAGINARY speaker whose decode share is discarded, so diffuse

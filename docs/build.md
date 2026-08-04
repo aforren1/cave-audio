@@ -36,7 +36,7 @@ Everything beyond the DLL + test suite is opt-in; the default build stays lean.
 | `BWA_BUILD_PLAYGROUND` | OFF | `bwa_playground` + `bwa_layout_tool` (fetches raylib/rlImGui/imgui/test-engine) |
 | `BWA_BUILD_CALIBVIEW` | OFF | `bwa_calib_view` (fetches imgui/test-engine/implot/implot3d) |
 | `BWA_BUILD_CALIBRATE` | OFF | `bwa_calibrate` + `bwa_zylia_probe` |
-| `BWA_BUILD_GODOT` | OFF | the Godot GDExtension (fetches godot-cpp — a multi-minute first build). `GODOTCPP_TARGET` picks the library flavour (`editor` default); `tools/godot/pack.ps1` builds both shippable ones. See `bindings/godot/README.md` |
+| `BWA_BUILD_GODOT` | OFF | the Godot GDExtension (fetches godot-cpp - a multi-minute first build). `GODOTCPP_TARGET` picks the library flavour (`editor` default); `tools/godot/pack.ps1` builds both shippable ones. See `bindings/godot/README.md` |
 | `BWA_ASAN` | OFF | builds `test_sound` with AddressSanitizer (MSVC; needs tests ON) |
 | `BWA_TRACY` | OFF | Tracy profiler instrumentation (fetches Tracy; collects only while a profiler is attached). See [profiling.md](./profiling.md) |
 | `BWA_BUILD_BENCH` | OFF | the profiling benches (`bwa_profile_bench` + `bwa_bench_situations`). See [profiling.md](./profiling.md) |
@@ -46,7 +46,7 @@ Steam Audio has no option: CMake auto-enables it when the built phonon SDK sits 
 
 ### Building without Steam Audio
 
-**A no-SDK build is fully viable for the array**—it is not a degraded mode. You keep the whole
+**A no-SDK build is fully viable for the array**: it is not a degraded mode. You keep the whole
 spatializer, plus a complete geometric acoustics path: **image-source early reflections**
 (`bwa_source_set_early_reflections`, real parallax as the listener walks), the **directional FDN
 reverb** (`bwa_fdn_config`), and **manual occlusion** (`bwa_source_set_occlusion_manual`, driven by
@@ -126,12 +126,12 @@ Everything above, sorted by what it actually ends up in:
 
 As of October 2025 the ASIO SDK is **dual-licensed GPLv3 / proprietary** (previously
 proprietary-only). You can use it under the GPLv3 option without signing an agreement.
-The catch is copyleft—pick the case that matches how you ship:
+The catch is copyleft. Pick the case that matches how you ship:
 
 - **Distributed under GPLv3** → what this repo does. CI publishes `bw_audio.dll` as a
   workflow artifact under the repo's GPLv3 `LICENSE`. The complete corresponding source
   is this repo at the built commit **plus** the ASIO SDK source that is statically linked
-  into the DLL — the repo fetches the SDK at build time rather than vendoring it, so CI
+  into the DLL (the repo fetches the SDK at build time rather than vendoring it), so CI
   ships that source as `asio-sdk-src.zip` beside the binaries (a separate release asset,
   `bw_audio-asio-sdk-src-<tag>.zip`, on a tag). That closes the corresponding-source loop
   the fetch-only setup would otherwise leave open; see the CI section below.
@@ -211,7 +211,7 @@ distribution channel:
 
 - **ASIO is built.** The workflow fetches the SDK from Steinberg's official URL
   (cached between runs), and the configure step fails loudly unless the log says
-  `ASIO backend ENABLED`—the artifact must contain the production device path.
+  `ASIO backend ENABLED`: the artifact must contain the production device path.
 - **Steam Audio is built, and cached.** CI runs the phonon recipe from
   [`third_party/README.md`](../third_party/README.md) (patched submodule, minimal
   core, `/MD`) and caches `third_party/steam-audio-artifacts/` keyed on the
@@ -235,15 +235,15 @@ distribution channel:
 - **The Godot binding is built AND tested.** Unlike the imgui tools, Godot's
   `--headless` needs no display, so its scene tests run on the runner (against a
   cached editor download). The addon packs as its own artifact and, on a tag, a
-  fourth release asset — plus the `unity`/`godot` distribution branches
+  fourth release asset, plus the `unity`/`godot` distribution branches
   (installable git refs; see `bindings/godot/README.md` and the workflow header).
 - **The artifact is a GPLv3 distribution.** Each run uploads `RelWithDebInfo/`
   (engine + phonon + tools) and `Debug/` (engine + phonon) folders plus `bw_audio.h`,
   the example layout + `constraints.json`, the `LICENSE`, `THIRD_PARTY-NOTICES.md`,
   a `DIST.txt` naming the commit and linking the complete source (this repo at
-  that commit), and `asio-sdk-src.zip` — the ASIO SDK source statically linked into
+  that commit), and `asio-sdk-src.zip` (the ASIO SDK source statically linked into
   the DLL, redistributed under its GPLv3 option so the corresponding source travels
-  with the binary rather than living behind a fetch URL. Downloading requires repo
+  with the binary rather than living behind a fetch URL). Downloading requires repo
   access; the artifact carries the GPLv3 terms with it.
 - **`bw_audio.dll` needs `phonon.dll` beside it.** With-SDK builds (including the CI
   artifact) link `phonon.lib`, so the DLL won't load without `phonon.dll` in the
@@ -276,7 +276,7 @@ distribution channel:
 
   All ship under GPLv3 (the `.zip` carries `LICENSE`, `THIRD_PARTY-NOTICES.md`, and
   `DIST.txt`, which names the commit and links the complete source; the `.tgz` carries
-  the same inside it — and both point at the SDK-source asset for the one GPL-covered
+  the same inside it, and both point at the SDK-source asset for the one GPL-covered
   component the repo fetches rather than vendors): an app that ships this DLL to third
   parties inherits GPLv3; see the ASIO section.
 
@@ -315,7 +315,7 @@ isolation bullets.
 - **Clock:** a Dante network needs one **leader clock**, and a hardware endpoint can *be* it.
   That is the practical gain over a software endpoint, which has to follow some other node on
   the net. Either let the Digiface lead, or point it at whichever hardware node you prefer as
-  leader—but pick deliberately and check it in Dante Controller, because an unlocked domain
+  leader, but pick deliberately and check it in Dante Controller, because an unlocked domain
   shows up as a sample rate that wanders between runs (Stage 0 of the runbook measures this).
 - **Latency:** start ASIO buffer ~512–1024 and Dante latency 4–10 ms, then tighten
   empirically against measured dropouts.

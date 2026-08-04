@@ -93,7 +93,7 @@ def check_sh():
 
 # ---------------------------------------------------------------- layouts (mirror layout.c)
 def default_grid():
-    """layout_default(): 3x3x3 boundary grid minus the centre, floor origin."""
+    """layout_default(): 3x3x3 boundary grid minus the center, floor origin."""
     ax, ay = (-1.5, 0.0, 1.5), (0.0, 1.5, 3.0)
     pos = []
     for yi in range(3):
@@ -197,7 +197,7 @@ def allrad_decode(pos):
             if bs[q] < N:                    # imaginary pole speaker: its share is discarded
                 decode[bs[q]] += g[q] * row
     e_all = np.sum(decode**2 / (2 * l_of + 1))
-    decode *= math.sqrt((AMBI_CH / N) / e_all)   # energy-normalise to the sampling decode
+    decode *= math.sqrt((AMBI_CH / N) / e_all)   # energy-normalize to the sampling decode
     return decode, len(dirs_all) - N
 
 # ---------------------------------------------------------------- EPAD via numpy SVD
@@ -215,7 +215,7 @@ def epad_decode(pos):
     D = Vh[keep].T @ U[:, keep].T                # (N, 16): the polar factor on the kept subspace
     D = D * n3d[None, :]                         # accept SN3D signals
     e = np.sum(D**2 / (2 * l_of + 1))
-    D *= math.sqrt((AMBI_CH / N) / e)            # energy-normalise to the sampling decode
+    D *= math.sqrt((AMBI_CH / N) / e)            # energy-normalize to the sampling decode
     return D
 
 # ---------------------------------------------------------------- SH rotation via lstsq
