@@ -25,6 +25,17 @@ failures are impossible by construction; the `dsp` test sweeps a source from the
 centre out through a corner speaker to 10 m and pins gain continuity, monotone
 level, and exterior injectivity.
 
+The sweet-spot claim is measured, not just argued. The layout tool's bed metric
+(`bwa_bed_gains_batch`, the engine's real AllRAD/EPAD builds; see
+[layout-schema.md](./layout-schema.md)) scores one co-optimized 26-speaker layout
+at 2.4°/8.1° mean/worst rE error for a sweet-spot listener and 14.4°/52.5° over
+the 3×3 m roam, against 5.0°/25.5° for tracked DBAP on the same speakers: the
+static decode is the best render on the array at the centre and loses 3× to the
+tracked panner everywhere else. The physics sets that scale. An order-N decode
+reconstructs the field only within roughly N·c/(2πf) of the centre, about 16 cm
+at 1 kHz for 3rd order, and no order 26 speakers can drive reaches a 3 m working
+volume.
+
 > **Fixed-observer installs are a supported mode.** The case above is the *moving*,
 > tracked listener. An install that seats the audience at one fixed spot needs no
 > extra machinery:
