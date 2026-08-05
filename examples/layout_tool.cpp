@@ -63,6 +63,7 @@
 #include "rlgl.h"            /* rlDrawRenderBatchActive: flush the 3D batch before a screenshot */
 #include "speaker_gizmo.h"   /* the "real speaker" glyph (cabinet + cone aimed at the listener) */
 #include "cJSON.h"
+#include "sos.h"             /* BWA_SOS_REF_MPS: the delay-alignment speed of sound, layout-carried */
 #include "constraints_view.h"   /* constraints.json load + box drawing, shared with the playground */
 #include "axes_hud.h"        /* screen-corner XYZ triad, shared with the playground */
 
@@ -82,7 +83,12 @@
 #define NSPK           26         /* array CAPACITY (== BWA_CHANNELS); g_nspk is the layout's ACTUAL count */
 #define NSPK_MIN       4          /* the engine's layout loader accepts 4..NSPK speakers */
 #define SR             48000u
-#define SPEED_OF_SOUND 343.0f
+/* Speed of sound for the delay-alignment derivation below. Seeded from the layout's
+ * reference.speed_of_sound_mps (see sos.h) so a rig surveyed at its own temperature keeps its own c
+ * rather than silently re-deriving delays at 20 C. 0.6% of a 3 ms alignment delay is 0.02 ms, which
+ * is inaudible — this is here so the tool AGREES with bwa_calibrate on one file, not because the
+ * delays need the precision. */
+static float speed_of_sound = (float)BWA_SOS_REF_MPS;
 #define PANEL_W        300.0f     /* control panel width (right side), in unscaled UI px */
 
 typedef struct { Vector3 pos; float gain_db; int pin; } Spk;   /* pin: 1 = held to the ear-plane slab */
@@ -178,6 +184,21 @@ static int load_json(const char* path) {
     }
     cJSON* psj = cJSON_GetObjectItemCaseSensitive(root, "pin_slab_m");
     if (cJSON_IsNumber(psj)) pin_slab_m = (float)psj->valuedouble;
+    /* reference.ears_m: the listening-point height this file's delay_ms was derived at. Resume at
+     * the file's OWN anchor rather than the 1.4 default, so reopening a 1.2 m layout and saving
+     * can't silently re-align every delay to a plane 20 cm too high. A CLI ears= parses after the
+     * load (main) and still wins. Same 0..3 m guard the CLI applies. */
+    cJSON* refj = cJSON_GetObjectItemCaseSensitive(root, "reference");
+    if (cJSON_IsObject(refj)) {
+        cJSON* ej = cJSON_GetObjectItemCaseSensitive(refj, "ears_m");
+        if (cJSON_IsNumber(ej) && ej->valuedouble > 0.0 && ej->valuedouble <= 3.0)
+            obs_height = (float)ej->valuedouble;
+        /* same idea for the rig's speed of sound: bwa_calibrate records the temperature it surveyed
+         * at, and re-deriving delays here at 20 C would quietly disagree with it. */
+        cJSON* cj = cJSON_GetObjectItemCaseSensitive(refj, "speed_of_sound_mps");
+        if (cJSON_IsNumber(cj) && cj->valuedouble >= BWA_SOS_MIN_MPS && cj->valuedouble <= BWA_SOS_MAX_MPS)
+            speed_of_sound = (float)cj->valuedouble;
+    }
     cJSON* dbap = cJSON_GetObjectItemCaseSensitive(root, "dbap");
     if (cJSON_IsObject(dbap)) {
         cJSON* r = cJSON_GetObjectItemCaseSensitive(dbap, "rolloff_r");
@@ -210,16 +231,16 @@ static int save_json(const char* path) {
         "  \"schema_version\": 1,\n"
         "  \"units\": { \"position\": \"meters\", \"gain\": \"decibels\", \"delay\": \"milliseconds\" },\n"
         "  \"coordinate_space\": \"room, right-handed, +y up, +z forward (matches OptiTrack/Motive default); origin ON THE FLOOR at the working-area center (x/z); y = height above the floor\",\n"
-        "  \"reference\": { \"alignment\": \"max-distance\", \"speed_of_sound_mps\": %g, \"note\": \"delay_ms time-aligns each speaker arrival to the farthest speaker; gain_db is a measured per-speaker trim\" },\n"
+        "  \"reference\": { \"alignment\": \"max-distance\", \"ears_m\": %g, \"speed_of_sound_mps\": %g, \"note\": \"delay_ms time-aligns each speaker arrival to the farthest speaker, heard at ears_m above the floor; gain_db is a measured per-speaker trim\" },\n"
         "  \"dbap\": { \"rolloff_r\": %g, \"distance_attenuation\": { \"model\": \"%s\", \"reference_distance_m\": %g, \"rolloff\": %g, \"min_gain_db\": %g } },\n",
-        (double)SPEED_OF_SOUND, dbap_r, dist_model, dist_ref, dist_rolloff, dist_min_db);
+        (double)obs_height, (double)speed_of_sound, dbap_r, dist_model, dist_ref, dist_rolloff, dist_min_db);
     int npin = 0;
     for (int i = 0; i < g_nspk; ++i) npin += spk[i].pin;
     if (npin) fprintf(f, "  \"pin_slab_m\": %g,\n", pin_slab_m);   /* authoring-only, like \"pin\"; the engine ignores it */
     fprintf(f, "  \"speakers\": [\n");
     for (int i = 0; i < g_nspk; ++i) {
         float d = Vector3Distance(spk[i].pos, ear);
-        float delay_ms = (dmax - d) / SPEED_OF_SOUND * 1000.0f;
+        float delay_ms = (dmax - d) / speed_of_sound * 1000.0f;
         fprintf(f, "    { \"index\": %d, \"position\": [%.4f, %.4f, %.4f], \"gain_db\": %.2f, \"delay_ms\": %.3f%s }%s\n",
                 i, spk[i].pos.x, spk[i].pos.y, spk[i].pos.z, spk[i].gain_db, delay_ms,
                 spk[i].pin ? ", \"pin\": \"plane\"" : "", (i < g_nspk - 1) ? "," : "");
@@ -1272,7 +1293,7 @@ static void draw_hud(float cov_worst, float cov_mean) {
     float dmax = 0.0f;
     for (int i = 0; i < g_nspk; ++i) { float dd = Vector3Distance(spk[i].pos, ear); if (dd > dmax) dmax = dd; }
     float seld   = Vector3Distance(spk[sel].pos, ear);
-    float seldel = (dmax - seld) / SPEED_OF_SOUND * 1000.0f;
+    float seldel = (dmax - seld) / speed_of_sound * 1000.0f;
     int con_bad = 0, con_occ = 0;
     if (CON.loaded) for (int i = 0; i < g_nspk; ++i) {
         if (!constraint_ok(spk[i].pos)) ++con_bad;   /* out of bounds / inside a solid body (snappable) */
@@ -1537,7 +1558,11 @@ static void draw_panel(void) {
           if (opt_running && opt_bed_wt > 0.0f) opt_cost = opt_cost_of((bwa_panner)pv_panner);
       } }
     bwTip("apply max-rE weighting before the decode, matching bwa_set_max_re on the rig");
-    if (ImGui::SliderFloat("obs ear y", &obs_height, 0.0f, 2.0f, "%.2f m")) mark_score();
+    /* Lower bound is 0.1, not 0: save_json writes obs_height as reference.ears_m and load_json only
+     * accepts (0, 3]. A slider that can reach exactly 0 writes an anchor the loader then drops, so a
+     * reopen would silently re-derive every delay at the 1.4 default — the round trip this field
+     * exists to close. Keep this range inside the loader's. */
+    if (ImGui::SliderFloat("obs ear y", &obs_height, 0.1f, 2.0f, "%.2f m")) mark_score();
     bwTip("listener EAR height above the floor - scoring, coverage, and the sightline checks all measure from here");
     if (CheckboxInt("perceptual (az>el)", &perceptual)) mark_score();   /* weight azimuth >> elevation */
     bwTip("weight azimuth error over elevation: human azimuth acuity is ~3.5x finer, so the "

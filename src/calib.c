@@ -1,6 +1,7 @@
 /* calib.c — see calib.h. Trim solve + cave_layout.json writeback. Pure + file I/O (no audio thread). */
 #include "calib.h"
 #include "layout.h"        /* BWA_RQ_GRID_MAX / BWA_ROOM_EQ_MAX (the room_eq_grid schema caps) */
+#include "sos.h"           /* BWA_SOS_MIN_MPS / BWA_SOS_MAX_MPS (the plausible-room guard) */
 
 #include <cJSON.h>
 
@@ -143,6 +144,60 @@ int calib_write_layout(const char* in_path, const char* out_path,
         if (g) cJSON_SetNumberValue(g, gain_db[i]);  else cJSON_AddNumberToObject(sp, "gain_db",  gain_db[i]);
         if (d) cJSON_SetNumberValue(d, delay_ms[i]); else cJSON_AddNumberToObject(sp, "delay_ms", delay_ms[i]);
     }
+
+    outtext = cJSON_Print(root);
+    if (!outtext) FAIL("calib: failed to serialize layout");
+    FILE* f = fopen(out_path, "wb");
+    if (!f) FAIL("calib: cannot open output for writing");
+    fwrite(outtext, 1, strlen(outtext), f); fclose(f);
+    ok = 1;
+fail:
+    free(outtext); cJSON_Delete(root); free(text);
+    return ok;
+    #undef FAIL
+}
+
+int calib_read_sos(const char* path, double* out_mps) {
+    if (!path || !out_mps) return 0;
+    char* text = read_file(path, NULL);
+    if (!text) return 0;
+    cJSON* root = cJSON_Parse(text);
+    int ok = 0;
+    if (root) {
+        cJSON* ref = cJSON_GetObjectItemCaseSensitive(root, "reference");
+        if (cJSON_IsObject(ref)) {
+            cJSON* c = cJSON_GetObjectItemCaseSensitive(ref, "speed_of_sound_mps");
+            if (cJSON_IsNumber(c) && c->valuedouble >= BWA_SOS_MIN_MPS && c->valuedouble <= BWA_SOS_MAX_MPS) {
+                *out_mps = c->valuedouble; ok = 1;
+            }
+        }
+        cJSON_Delete(root);
+    }
+    free(text);
+    return ok;
+}
+
+int calib_write_sos(const char* in_path, const char* out_path, double mps, char* err, size_t errcap) {
+    #define FAIL(msg) do { if (err && errcap) snprintf(err, errcap, "%s", msg); goto fail; } while (0)
+    char* text = NULL; cJSON* root = NULL; char* outtext = NULL; int ok = 0;
+    if (!(mps >= BWA_SOS_MIN_MPS && mps <= BWA_SOS_MAX_MPS)) {
+        if (err && errcap) snprintf(err, errcap, "calib: speed of sound %.1f m/s out of range", mps);
+        return 0;
+    }
+    text = read_file(in_path, NULL);
+    if (!text) { if (err && errcap) snprintf(err, errcap, "calib: cannot read %s", in_path); return 0; }
+    root = cJSON_Parse(text);
+    if (!root) FAIL("calib: layout is not valid JSON");
+    /* the `reference` block is provenance: create it if the file predates this field */
+    cJSON* ref = cJSON_GetObjectItemCaseSensitive(root, "reference");
+    if (!cJSON_IsObject(ref)) { cJSON_DeleteItemFromObjectCaseSensitive(root, "reference");
+                                ref = cJSON_AddObjectToObject(root, "reference"); }
+    if (!ref) FAIL("calib: cannot create the 'reference' block");
+    /* 2 decimals: 0.01 m/s is 3e-5 of c, about 0.1 mm on a 4 m range — far below anything that
+     * matters, and it keeps the file readable instead of carrying a float artifact. */
+    mps = round(mps * 100.0) / 100.0;
+    cJSON* c = cJSON_GetObjectItemCaseSensitive(ref, "speed_of_sound_mps");
+    if (c) cJSON_SetNumberValue(c, mps); else cJSON_AddNumberToObject(ref, "speed_of_sound_mps", mps);
 
     outtext = cJSON_Print(root);
     if (!outtext) FAIL("calib: failed to serialize layout");

@@ -34,6 +34,7 @@
 extern "C" {                       /* engine internals (C, no extern-C guards of their own) */
 #include "layout.h"
 #include "sound.h"
+#include "sos.h"                   /* room-temperature speed of sound (the capsule survey scales with it) */
 #include "zylia_capture.h"         /* ZM-1 ASIO shell + ZpShared (pulls in zylia.h: tdoa/doa) */
 }
 #include "calib_capture.h"         /* sweep constants + the simulate/ASIO capture backends (Capture tab) */
@@ -122,12 +123,24 @@ static void refresh_diff(void) {
     }
 }
 
+/* Room-temperature speed of sound, inherited from layout A's reference.speed_of_sound_mps
+ * (bwa_calibrate records it there — docs/calibration.md, "Air temperature"). The ZM-1 capsule survey
+ * solves geometry from arrival TIMES, so the solved radius scales directly with c: 1% of c is 0.5 mm
+ * on the 49 mm array, the same order as the capsule error that tab exists to measure. The synthetic
+ * clap generator reads the SAME value on purpose — if the two disagreed, simulate mode would report
+ * a residual that is really just a temperature mismatch. */
+static double g_room_sos = BWA_SOS_REF_MPS;
+
 static void load_layout(int which) {                             /* 0 = A, 1 = B */
     Layout* L    = which ? &V.B : &V.A;
     bool*   has  = which ? &V.hasB : &V.hasA;
     char*   path = which ? V.pathB : V.pathA;
     char err[256];
     *has = layout_load(path, IR_FS, L, err, sizeof err);
+    /* A is the rig's layout (the survey autofills clap positions from it), so it also carries the
+     * rig's speed of sound. Absent from the file = the 20 C reference, which is what the tab
+     * defaulted to before this field existed. */
+    if (*has && !which && !calib_read_sos(path, &g_room_sos)) g_room_sos = BWA_SOS_REF_MPS;
     if (*has) {
         int neq = 0; for (uint32_t i = 0; i < L->count; ++i) if (L->speakers[i].eq_len) ++neq;
         snprintf(V.status, sizeof V.status, "%c: %u speakers loaded from %s (%d with eq)",
@@ -400,7 +413,7 @@ static void cap_worker(void) {
             cap_fail("canceled");
             return;
         }
-        if (J.simulate) calib_sim_capture(i, &L, J.mic, sweep, cap);
+        if (J.simulate) calib_sim_capture(i, &L, J.mic, g_room_sos, sweep, cap);
 #ifdef BWA_HAVE_ASIO
         else if (!calib_asio_capture(i)) { calib_asio_close(); cap_fail("capture timed out (speaker not wired? see console)"); return; }
 #endif
@@ -584,6 +597,10 @@ struct ZyState {
 };
 static ZyState Z;
 
+/* Guarded read: a hand-edited or malformed layout must never land 0 here (it would divide by zero
+ * in the clap synthesis below). */
+static double zy_c(void) { return g_room_sos > 0.0 ? g_room_sos : BWA_SOS_REF_MPS; }
+
 static float zy_az(const float d[3]) { return atan2f(d[0], -d[2]) * 57.29578f; }
 static float zy_el(const float d[3]) { return asinf(d[1] > 1.f ? 1.f : (d[1] < -1.f ? -1.f : d[1])) * 57.29578f; }
 
@@ -592,7 +609,7 @@ static float zy_el(const float d[3]) { return asinf(d[1] > 1.f ? 1.f : (d[1] < -
 /* a clap-like Gaussian click sampled at each capsule's exact fractional arrival time (the synthesis
  * the zylia unit test validates), landed in the shared block exactly like the ASIO side would */
 static void zy_sim_clap(ZpShared* sh, const float dir[3]) {
-    const double C = 343.0, FS = sh->rate, SIGMA = 1.0e-4, DIST = ZY_SIM_DIST;
+    const double C = zy_c(), FS = sh->rate, SIGMA = 1.0e-4, DIST = ZY_SIM_DIST;   /* == zy_solve's c */
     unsigned int rng = (unsigned int)(sh->seq * 2654435761u + 12345u);
     double src[3] = { dir[0] * DIST, dir[1] * DIST, dir[2] * DIST };
     for (int ch = 0; ch < ZYLIA_MICS; ++ch) {
@@ -637,7 +654,9 @@ static void zy_process(ZpShared* sh, float dt) {
         memcpy(snap, (const void*)sh->snap, sizeof snap);
         const float* ptr[ZYLIA_MICS];
         for (int ch = 0; ch < ZYLIA_MICS; ++ch) ptr[ch] = snap[ch];
-        uint32_t max_lag = (uint32_t)(sh->rate * (2.0 * 0.049 / 343.0) * 2.0) + 4;   /* 2x the array's max TDOA */
+        /* 2x the array's max TDOA. Deliberately NOT tracking zy_c(): this is a search bound, and the
+         * 2x margin already swallows any room temperature (1% of c moves it by 1%). */
+        uint32_t max_lag = (uint32_t)(sh->rate * (2.0 * 0.049 / 343.0) * 2.0) + 4;
         double arr[ZYLIA_MICS]; float dir[3];
         if (zylia_tdoa(ptr, ZP_SNAP_N, sh->rate, max_lag, arr) && zylia_doa(arr, dir)) {
             auto* h = &Z.hist[Z.hist_n++ % ZY_HIST];
@@ -665,12 +684,12 @@ static void zy_solve(void) {
         snprintf(Z.surv_msg, sizeof Z.surv_msg, "need at least 6 claps (have %d)", Z.surv_n);
         Z.surv_solved = false; return;
     }
-    if (zylia_survey(Z.surv_src, Z.surv_arr, Z.surv_n, 343.0, Z.surv_caps,
+    if (zylia_survey(Z.surv_src, Z.surv_arr, Z.surv_n, zy_c(), Z.surv_caps,
                      &Z.surv_resid, &Z.surv_radius, &Z.surv_spread)) {
         Z.surv_solved = true;
         snprintf(Z.surv_msg, sizeof Z.surv_msg,
-                 "solved from %d claps: residual %.2f us, radius %.1f mm, spread %.2f",
-                 Z.surv_n, Z.surv_resid, Z.surv_radius * 1000.0f, Z.surv_spread);
+                 "solved from %d claps: residual %.2f us, radius %.1f mm, spread %.2f (c = %.1f m/s)",
+                 Z.surv_n, Z.surv_resid, Z.surv_radius * 1000.0f, Z.surv_spread, zy_c());
     } else {
         Z.surv_solved = false;
         snprintf(Z.surv_msg, sizeof Z.surv_msg,

@@ -31,6 +31,16 @@ void calib_solve(const MeasureResult* m, const float (*pos)[3], const float mic[
 int calib_write_layout(const char* in_path, const char* out_path,
                        const float* gain_db, const float* delay_ms, int n, char* err, size_t errcap);
 
+/* The layout file's recorded speed of sound (reference.speed_of_sound_mps), the room-temperature c
+ * every acoustic RANGE in a survey is scaled by. Reads 1 + the value when the file carries a
+ * plausible one (see sos.h), 0 otherwise — the caller then falls back to BWA_SOS_REF_MPS. Keeping it
+ * in the file means an install sets its temperature once instead of remembering a flag per run, and
+ * a collaborator rig at a different temperature carries its own. calib_write_sos records it back
+ * (creating the `reference` block if the file predates the field); like every calib_write_*, it
+ * re-parses and re-serializes so unknown fields survive. */
+int calib_read_sos(const char* path, double* out_mps);
+int calib_write_sos(const char* in_path, const char* out_path, double mps, char* err, size_t errcap);
+
 /* Acoustic self-localization: solve one speaker's 3D position from its measured RANGE (= c * delay,
  * in meters, latency INCLUDED) to K known mic positions. The unknown constant system latency is
  * recovered jointly (as a range, c*tau) by linear least squares — so no separate loopback is needed.

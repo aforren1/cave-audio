@@ -3,6 +3,7 @@
  * bwa_calib_view's Capture tab share ONE copy of the sweep-capture backends.
  */
 #include "calib_capture.h"
+#include "sos.h"                       /* BWA_SOS_REF_MPS + the plausible-c guard */
 
 #include <cmath>
 #include <cstdio>
@@ -18,12 +19,16 @@ void calib_write_wav_f32(const char* path, const float* x, int n, int fs) {
     fwrite("data",1,4,f); fwrite(&ds,4,1,f); fwrite(x,4,(size_t)n,f); fclose(f);
 }
 
-void calib_sim_capture(int ch, const Layout* L, const float mic[3], const float* sweep, float* cap) {
+void calib_sim_capture(int ch, const Layout* L, const float mic[3], double sos, const float* sweep, float* cap) {
     memset(cap, 0, (size_t)CAL_CAPLEN * sizeof(float));
     const float* p = L->speakers[ch].pos;
     double dist = sqrt((p[0]-mic[0])*(p[0]-mic[0]) + (p[1]-mic[1])*(p[1]-mic[1]) + (p[2]-mic[2])*(p[2]-mic[2]));
     if (dist < 0.05) dist = 0.05;
-    double delay_f = 512.0 + dist / 343.0 * CAL_FS;               /* system latency + time of flight (fractional) */
+    /* MUST be the same c the caller's analyzer divides back out (range = c * delay). Pinning this to
+     * 343.0 while the analyzer follows the layout's recorded temperature splits the matched pair and
+     * inflates every solved position by their ratio — silently, and --localize writes it back. */
+    if (!(sos >= BWA_SOS_MIN_MPS && sos <= BWA_SOS_MAX_MPS)) sos = BWA_SOS_REF_MPS;
+    double delay_f = 512.0 + dist / sos * CAL_FS;                 /* system latency + time of flight (fractional) */
     int    di = (int)delay_f; float frac = (float)(delay_f - di);
     double sens = 1.0 + 0.15 * sin(ch * 1.3);                     /* deterministic +/- ~1.4 dB wobble */
     float  g    = (float)(sens / dist);                           /* 1/r at the mic */

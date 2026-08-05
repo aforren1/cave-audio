@@ -1,6 +1,7 @@
 /* calib_test.c — the calibration trim solve + layout writeback, verified without the rig. */
 #include "calib.h"
 #include "layout.h"        /* BWA_ROOM_EQ_MAX (the room_eq writeback round-trip) */
+#include "sos.h"           /* the temperature parsers + the plausible-c guard */
 
 #include <cJSON.h>
 #include <math.h>
@@ -333,7 +334,59 @@ int main(void) {
               "unmoved speakers read ~0 (common latency removed by the median)");
     }
 
+    /* ---- speed of sound: the temperature parsers + the layout round trip (sos.h, calib_*_sos) ---- */
+    {
+        double v = 0.0;
+        CHECK(sos_parse_temp("20", &v)   && fabs(v - 343.42) < 0.01, "bare number parses as Celsius");
+        CHECK(sos_parse_temp("20C", &v)  && fabs(v - 343.42) < 0.01, "C suffix");
+        CHECK(sos_parse_temp("20c", &v)  && fabs(v - 343.42) < 0.01, "lowercase c suffix");
+        CHECK(sos_parse_temp("73F", &v)  && fabs(v - 345.10) < 0.01, "F suffix converts (73 F = 22.78 C)");
+        CHECK(sos_parse_temp("-10", &v)  && fabs(v - 325.24) < 0.01, "negative Celsius (a cold room)");
+        /* rejects: no number, trailing junk, and out-of-guard values in BOTH directions */
+        CHECK(!sos_parse_temp("", &v)     , "empty rejected");
+        CHECK(!sos_parse_temp("abc", &v)  , "non-numeric rejected");
+        CHECK(!sos_parse_temp("20X", &v)  , "unknown suffix rejected, not silently Celsius");
+        CHECK(!sos_parse_temp("20CC", &v) , "trailing junk after a valid suffix rejected");
+        CHECK(!sos_parse_temp("730", &v)  , "730 C rejected (the fat-finger case)");
+        CHECK(!sos_parse_temp("-100", &v) , "-100 C rejected");
+        CHECK(sos_parse_mps("345.1", &v) && fabs(v - 345.1) < 1e-9, "direct c parses");
+        CHECK(!sos_parse_mps("5", &v)     , "5 m/s rejected");
+        CHECK(!sos_parse_mps("345.1x", &v), "trailing junk on --c rejected");
+        CHECK(!sos_parse_mps("", &v)      , "empty --c rejected");
+
+        /* round trip through a layout file, including the case the field does not exist yet */
+        const char* p = "calib_sos_rt.json";
+        FILE* f = fopen(p, "wb");
+        CHECK(f != NULL, "open the sos round-trip fixture");
+        if (f) {
+            fprintf(f, "{\n  \"reference\": { \"alignment\": \"max-distance\", \"ears_m\": 1.2 },\n"
+                       "  \"note_kept\": \"unknown fields must survive\",\n"
+                       "  \"speakers\": []\n}\n");
+            fclose(f);
+            double got = 0.0;
+            CHECK(!calib_read_sos(p, &got), "a file with no speed_of_sound_mps reads as absent");
+            char err[256] = {0};
+            CHECK(calib_write_sos(p, p, 345.1, err, sizeof err), "write into an existing reference block");
+            CHECK(calib_read_sos(p, &got) && fabs(got - 345.1) < 0.01, "reads back what was written");
+            /* non-destructive, like every other calib_write_*: siblings and unknown keys survive */
+            char* txt = NULL; long len = 0;
+            FILE* rf = fopen(p, "rb");
+            if (rf) { fseek(rf, 0, SEEK_END); len = ftell(rf); fseek(rf, 0, SEEK_SET);
+                      txt = (char*)malloc((size_t)len + 1);
+                      if (txt) { size_t rd = fread(txt, 1, (size_t)len, rf); txt[rd] = '\0'; }
+                      fclose(rf); }
+            CHECK(txt && strstr(txt, "note_kept")  != NULL, "unknown top-level field survives");
+            CHECK(txt && strstr(txt, "ears_m")     != NULL, "the sibling ears_m survives");
+            CHECK(txt && strstr(txt, "max-distance") != NULL, "the sibling alignment survives");
+            free(txt);
+            CHECK(!calib_write_sos(p, p, 5.0, err, sizeof err), "out-of-range c refused, file untouched");
+            CHECK(calib_read_sos(p, &got) && fabs(got - 345.1) < 0.01, "refused write left the old value");
+            remove(p);
+        }
+        CHECK(!calib_read_sos("no_such_layout_file.json", &v), "missing file reads as absent, no crash");
+    }
+
     if (fails) { printf("calib_test: %d FAILURES\n", fails); return 1; }
-    printf("calib_test OK (delay align, sensitivity EQ, dead-speaker guard, writeback, trilateration, positions, drift-check verified)\n");
+    printf("calib_test OK (delay align, sensitivity EQ, dead-speaker guard, writeback, trilateration, positions, drift-check, speed-of-sound round trip verified)\n");
     return 0;
 }

@@ -29,12 +29,45 @@ Each speaker plays a Farina exponential sine sweep; an omni mic records it. `mea
 recovers that speaker's impulse response by regularized deconvolution and reads two numbers: the
 **delay** (direct-path arrival = system latency + time of flight) and the **level** (broadband
 sensitivity). One sample at 48 kHz = 7 mm, and sub-sample peak interpolation gets well below that,
-so the limit is the mic-position accuracy, not the acoustics.
+so the limit is the mic-position accuracy and the assumed speed of sound, not the acoustics. Set the
+second one: see "Air temperature" below.
 
 Use an **omnidirectional** measurement mic. It's flat and direction-independent, so each speaker's
 delay/level/response comes back uncolored. Measuring *through* the acoustically-transparent screens
 is correct: that's what the listener hears, and the screen's slight HF loss is captured in the trim
 automatically.
+
+## Air temperature
+
+Every range the survey solves is `c * delay`, and `c` moves about 0.6 m/s per degree C. A room at
+15 C runs 340.4 m/s and one at 25 C runs 346.4, so assuming the textbook 343.0 in a room that is not
+at 20 C biases every surveyed distance by up to 1%. At a 4 m range that is 4 cm, larger than both the
+7 mm timing resolution above and a tracker-placed mic, and an order of magnitude above the 2 to 3 mm
+capsule-geometry term the ZM-1 solve already bothers to correct.
+
+Tell the tool the room temperature:
+
+```
+bwa_calibrate --layout cave_layout.json --temp 73F   --localize positions.txt
+bwa_calibrate --layout cave_layout.json --temp 22.8  ...   # bare number or a C suffix is Celsius
+bwa_calibrate --layout cave_layout.json --c 345.1    ...   # if you measured c directly
+```
+
+The value is recorded into the layout as `reference.speed_of_sound_mps`, and every later run on that
+file picks it up, so you pass the flag once per rig rather than remembering it every session. An
+explicit flag always beats the file. `bwa_layout_tool` reads the same field for its delay
+derivation, so the two tools agree on one file instead of quietly disagreeing by a temperature.
+
+A layout with no such field falls back to 343.0. `--simulate` synthesizes its arrival times at
+whichever `c` the run is using, not at a fixed 343.0, so a simulated survey stays self-consistent at
+any temperature and recovers the geometry it started from. That matching matters: generate at one
+`c` and solve at another and every solved position inflates by their ratio, silently, and
+`--localize` writes the result back.
+
+**This does not change what you hear.** 4 cm of speaker position error at 3 m is under half a degree
+of direction error, against the 4 to 6 degrees the array carries anyway. Set the temperature so the
+survey is honest as a measurement, and so it agrees with the install drawings when you cross-check
+it. Do not expect it to be audible.
 
 ## Modes
 

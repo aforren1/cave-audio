@@ -33,8 +33,11 @@ extern "C" {
 #define CAL_MAX_INPUTS 19                /* input ceiling per capture — sized for the ZM-1's capsules */
 
 /* simulate backend: synthesize what an ideal rig would capture for speaker `ch` (fractional
- * time-of-flight + 1/r + a deterministic +/-~1.4 dB sensitivity wobble). cap = CAL_CAPLEN floats. */
-void calib_sim_capture(int ch, const Layout* L, const float mic[3], const float* sweep, float* cap);
+ * time-of-flight + 1/r + a deterministic +/-~1.4 dB sensitivity wobble). cap = CAL_CAPLEN floats.
+ * `sos` is the speed of sound the time of flight is generated at: pass the SAME value the caller's
+ * analyzer will divide back out, or the survey inflates every position by their ratio. Out-of-range
+ * falls back to BWA_SOS_REF_MPS (sos.h). */
+void calib_sim_capture(int ch, const Layout* L, const float mic[3], double sos, const float* sweep, float* cap);
 
 /* minimal mono IEEE-float WAV writer (retained per-speaker impulse responses) */
 void calib_write_wav_f32(const char* path, const float* x, int n, int fs);

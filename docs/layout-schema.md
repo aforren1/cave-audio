@@ -254,6 +254,12 @@ scoring shell, and the delay-alignment point written on save. A seated install a
 1.2 m ears that optimizes without this flag gets a plane 20 cm too high, silently.
 The GUI's `obs ear y` slider is the same knob.
 
+The value rides the file as `reference.ears_m` and is read back on load, so you pass
+the flag once and the file remembers. Without that, every reopen starts at the 1.4 m
+default and the next save re-aligns the delays to it, which hands the same silent
+20 cm error to someone who got the flag right the first time. An explicit `ears=<m>`
+still overrides what the file carries.
+
 When an allocation is a *requirement* ("26 speakers, spend 12 on the plane"), pin it,
 don't weight it. Objectives compete: a `3d` stage happily pulls plane speakers back
 toward elevation. **pin to plane** (per speaker, in the panel) confines that speaker
@@ -321,6 +327,7 @@ cannot see the problem it most needs to. The file:
   "coordinate_space": "room, right-handed, +y up, +z forward (matches OptiTrack/Motive default); origin ON THE FLOOR at the working-area center (x/z); y = height above the floor",
   "reference": {
     "alignment":          "max-distance",   // how delay_ms was derived (documentation only)
+    "ears_m":             1.4,              // the listening-point height it was derived AT
     "speed_of_sound_mps": 343.0,
     "note":               "..."
   },
@@ -344,7 +351,9 @@ cannot see the problem it most needs to. The file:
 | `schema_version` | int | reserved for breaking format changes. The loader currently ignores it - it is neither validated nor stored. |
 | `units` | object | documentation only. The loader always converts dB → linear gain and ms → samples at the engine rate (positions are read as meters); changing this field has no effect. |
 | `coordinate_space` | string | documentation of the frame; positions MUST match the `coordinate_space` value above (**room space**, floor origin). The engine works in it and the Unity/Unreal binding converts at its boundary; full seam: [`integration.md`](./integration.md) → "Coordinate seam". The engine derives its **nominal listening point from the array centroid** (world-locked bed/monitor decode directions + the default listener position), so the origin's exact spot is not load-bearing. |
-| `reference` | object | provenance for the alignment values; `speed_of_sound_mps` is used if delays are derived rather than measured. Informational - the engine applies `delay_ms` as written. |
+| `reference` | object | provenance for the alignment values. Informational - the engine applies `delay_ms` as written. |
+| `reference.speed_of_sound_mps` | float (optional) | the room-temperature speed of sound the survey and the delay derivation assumed. `bwa_calibrate` records the value it used (`--temp` / `--c`) and reads it back on the next run, so a rig sets its temperature once; `bwa_layout_tool` reads it too, so both tools agree on one file. Range `306..380` m/s. Absent means the 20 C reference, 343.0. See [`calibration.md`](./calibration.md) -> "Air temperature". |
+| `reference.ears_m` | float (optional) | authoring only, engine-ignored: the listening-point height (meters above the floor) that `delay_ms` was time-aligned at, and the anchor the optimizer scored against. `bwa_layout_tool` writes it from `ears=<m>` and reads it back on load, so a file reopens at its own anchor. Without it, reopening a 1.2 m layout and saving silently re-aligns every delay to the 1.4 m default. An explicit `ears=<m>` on the command line still wins (it parses after the load). |
 | `dbap.rolloff_r` | float | the **blur** knob `r` from [`spatialization.md`](./spatialization.md): larger spreads energy over more speakers. Must be > 0. **Omit it and the loader derives it from the geometry**: `0.25 ×` the mean centroid→speaker distance (Sundstrom 2021 recommends 0.2–0.5 of it) - ~0.53 m on the default grid. An explicit value always wins; treat the derived one as the starting point to dial against the real array. |
 | `dbap.distance_attenuation` | object | the source→listener distance-attenuation curve (the second tuning knob). The loader reads only `reference_distance_m` (> 0), `rolloff` (> 0), and `min_gain_db` (≤ 0; floors the attenuation). `model` is ignored - the inverse curve is the only one implemented. |
 | `pin_slab_m` | float (optional) | authoring only, engine-ignored: half-height of the ear-plane slab that `"pin": "plane"` speakers are confined to. Written by `bwa_layout_tool` when any speaker is pinned. |

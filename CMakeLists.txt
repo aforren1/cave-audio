@@ -536,7 +536,7 @@ if(BWA_BUILD_PLAYGROUND)
   # with imgui_test_engine driving the panel under ctest (`--tests`). Compiles its own cJSON copy.
   add_executable(bwa_layout_tool examples/layout_tool.cpp ${CJSON_C}
     ${rlimgui_SOURCE_DIR}/rlImGui.cpp ${BWA_IMGUI_SOURCES})
-  target_include_directories(bwa_layout_tool PRIVATE ${CJSON_INC} ${rlimgui_SOURCE_DIR} ${BWA_IMGUI_INC})
+  target_include_directories(bwa_layout_tool PRIVATE src ${CJSON_INC} ${rlimgui_SOURCE_DIR} ${BWA_IMGUI_INC})  # src/: sos.h (the layout-carried speed of sound)
   # STB_IMAGE_WRITE_STATIC: raylib's rtextures embeds stb_image_write with external linkage, and so
   # does the test engine's capture tool — making the latter's copy static avoids the LNK2005 clash.
   target_compile_definitions(bwa_layout_tool PRIVATE ${BWA_IMGUI_DEFS} NO_FONT_AWESOME STB_IMAGE_WRITE_STATIC)

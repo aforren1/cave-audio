@@ -26,6 +26,7 @@ extern "C" {
 #include "layout.h"
 #include "zylia.h"
 #include "sink.h"          /* BWA_CHANNELS */
+#include "sos.h"           /* room-temperature speed of sound: --temp / --c, or the layout's */
 }
 #include "calib_capture.h" /* sweep constants + the simulate/ASIO capture backends */
 
@@ -47,6 +48,15 @@ static const int    NSWEEP     = CAL_NSWEEP;
 static const int    CAPLEN     = CAL_CAPLEN;
 static const int    IR_LEN     = CAL_IRLEN;
 
+/* Record the c every range was scaled by into the layout that just received them, so a rerun on this
+ * file inherits the rig's temperature instead of needing the flag again, and a reader can tell which
+ * c the survey assumed. Non-fatal: the measurements themselves are already written. */
+static void record_sos(const char* path, double sos) {
+    char err[256] = {0};
+    if (!calib_write_sos(path, path, sos, err, sizeof err))
+        fprintf(stderr, "calibrate: warning: could not record speed of sound (%s)\n", err);
+}
+
 /* read mic positions ("x y z" per line) for --localize; returns the count (<= maxK) */
 static int read_positions(const char* path, float (*out)[3], int maxK) {
     FILE* f = fopen(path, "r"); if (!f) return 0;
@@ -66,6 +76,13 @@ int main(int argc, char** argv) {
     const char* survey_path = NULL;                           /* --survey: pinned ZM-1 channel order + orientation */
     const char* ir_prefix = NULL;
     const char* localize_file = NULL;
+    /* Room-temperature speed of sound. Every acoustic RANGE below is c * delay, so a 2% error in c
+     * is a 2% systematic in every surveyed position (8 cm at 4 m) — the dominant error term in the
+     * survey, well above the 7 mm timing resolution. Precedence: --temp/--c, else the layout's
+     * reference.speed_of_sound_mps, else the 20 C reference. See sos.h. */
+    double sos = BWA_SOS_REF_MPS;
+    int    sos_set = 0;                    /* an explicit flag beats the file */
+    int    n_temp = 0, n_c = 0;            /* --temp and --c are alternatives, not a pair */
     for (int i = 1; i < argc; ++i) {
         if      (!strcmp(argv[i],"--layout") && i+1<argc) layout_path = argv[++i];
         else if (!strcmp(argv[i],"--out")    && i+1<argc) out_path    = argv[++i];
@@ -86,11 +103,30 @@ int main(int argc, char** argv) {
         else if (!strcmp(argv[i],"--room-eq-grid"))       rq_grid     = 1;   /* accumulate LF modal cuts at THIS mic position into room_eq_grid (tracked room EQ) */
         else if (!strcmp(argv[i],"--zylia"))              zylia       = 1;   /* single-position localization with the ZM-1 */
         else if (!strcmp(argv[i],"--mic") && i+3<argc) { mic[0]=(float)atof(argv[++i]); mic[1]=(float)atof(argv[++i]); mic[2]=(float)atof(argv[++i]); }
-        else { fprintf(stderr, "usage: calibrate [--layout f] [--out f] [--mic x y z] [--input ch] [--driver name] [--list-drivers] [--simulate] [--room] [--eq | --room-eq | --room-eq-grid] [--zylia] [--survey f] [--ref spk dist_m] [--save-irs prefix] [--localize positions.txt] [--check] [--live N] [--latency m]\n"
+        else if (!strcmp(argv[i],"--temp") && i+1<argc) {   /* "22.8", "22.8C", "73F" */
+            if (!sos_parse_temp(argv[++i], &sos)) {
+                fprintf(stderr, "calibrate: --temp '%s' is not a plausible room temperature "
+                                "(bare number or C suffix = Celsius, F suffix = Fahrenheit)\n", argv[i]); return 2; }
+            sos_set = 1; ++n_temp;
+        }
+        else if (!strcmp(argv[i],"--c") && i+1<argc) {      /* someone who measured c directly */
+            if (!sos_parse_mps(argv[++i], &sos)) {
+                fprintf(stderr, "calibrate: --c '%s' is not a plausible speed of sound (%.0f..%.0f m/s)\n",
+                        argv[i], BWA_SOS_MIN_MPS, BWA_SOS_MAX_MPS); return 2; }
+            sos_set = 1; ++n_c;
+        }
+        else if (!strcmp(argv[i],"--temp") || !strcmp(argv[i],"--c")) {   /* present but no value */
+            fprintf(stderr, "calibrate: %s needs a value\n", argv[i]); return 2;
+        }
+        else { fprintf(stderr, "usage: calibrate [--layout f] [--out f] [--mic x y z] [--input ch] [--driver name] [--list-drivers] [--simulate] [--room] [--eq | --room-eq | --room-eq-grid] [--zylia] [--survey f] [--ref spk dist_m] [--save-irs prefix] [--localize positions.txt] [--check] [--live N] [--latency m] [--temp T[C|F] | --c mps]\n"
                                "  --zylia: ZM-1 single-placement localization; --input is the FIRST of its 19 consecutive\n"
                                "  capture channels, --mic is the array center. Distances need --latency (loopback, m at c)\n"
-                               "  or --ref <spk> <m> (one tape-measured center->speaker distance).\n"); return 2; }
+                               "  or --ref <spk> <m> (one tape-measured center->speaker distance).\n"
+                               "  --temp: room air temperature; every surveyed range scales with it (2%% of c = 8 cm at\n"
+                               "  4 m). Recorded into the layout's reference.speed_of_sound_mps, so set it once per rig.\n"); return 2; }
     }
+    if (n_temp && n_c) {
+        fprintf(stderr, "calibrate: --temp and --c set the same thing; pass one\n"); return 2; }
     if (room_eq && rq_grid) { fprintf(stderr, "calibrate: --room-eq and --room-eq-grid are mutually exclusive (one scheme per layout)\n"); return 2; }
     if (zylia && (localize_file || check || live_speaker >= 0)) {
         fprintf(stderr, "calibrate: --zylia is its own mode (19-input capture); drop --localize/--check/--live\n"); return 2; }
@@ -111,8 +147,15 @@ int main(int argc, char** argv) {
         fprintf(stderr, "calibrate: %s\n", err); return 1;
     }
     const int n = (int)L.count;
+    /* No explicit flag: inherit the rig's own c from the layout it was surveyed with. Falls back to
+     * the 20 C reference, which is also what the synthetic-capture path assumes (calib_capture.cpp),
+     * so --simulate stays bit-identical unless you deliberately ask for another temperature. */
+    const char* sos_src = "default";
+    if (sos_set)                                sos_src = "--temp/--c";
+    else if (calib_read_sos(layout_path, &sos)) sos_src = "layout";
     printf("calibrate: %d speakers from %s; mic at (%.2f %.2f %.2f)%s\n",
            n, layout_path, mic[0], mic[1], mic[2], simulate ? "  [SIMULATE]" : "");
+    printf("           speed of sound %.1f m/s (%s)\n", sos, sos_src);
     if (ref_spk >= 0 && (ref_spk >= n || ref_dist < 0.2)) {
         fprintf(stderr, "calibrate: --ref wants a speaker 0..%d and a distance >= 0.2 m (got %d, %.3f)\n",
                 n - 1, ref_spk, ref_dist); return 2;
@@ -169,12 +212,12 @@ int main(int argc, char** argv) {
         for (int k = 0; k < K; ++k) {
             if (!simulate) { printf("  -> place the mic at (%.2f %.2f %.2f) and press Enter...", micpos[k][0], micpos[k][1], micpos[k][2]); fflush(stdout); getchar(); }
             for (int s = 0; s < n; ++s) {
-                if (simulate) calib_sim_capture(s, &L, micpos[k], sweep, cap);
+                if (simulate) calib_sim_capture(s, &L, micpos[k], sos, sweep, cap);
 #ifdef BWA_HAVE_ASIO
                 else if (!calib_asio_capture(s)) { fprintf(stderr, "calibrate: capture timed out (spk %d, pos %d)\n", s, k); calib_asio_close(); return 1; }
 #endif
                 MeasureResult r; measure_response(cap, CAPLEN, sweep, NSWEEP, F1, F2, FS, BAND_HZ, &r);
-                range[(size_t)s * K + k] = ((double)r.delay_samples + r.delay_frac) * 343.0 / FS; /* c*delay, meters (sub-sample) */
+                range[(size_t)s * K + k] = ((double)r.delay_samples + r.delay_frac) * sos / FS; /* c*delay, meters (sub-sample) */
             }
         }
 #ifdef BWA_HAVE_ASIO
@@ -208,10 +251,10 @@ int main(int argc, char** argv) {
                   for (int a = 1; a < nl; ++a) { double v = lats[a]; int b = a;   /* tiny insertion sort */
                       while (b > 0 && lats[b-1] > v) { lats[b] = lats[b-1]; --b; } lats[b] = v; }
                   double med_m = (nl & 1) ? lats[nl/2] : 0.5 * (lats[nl/2 - 1] + lats[nl/2]);
-                  double drv_m = 343.0 * (double)(il + ol) / FS;
-                  double resid_ms = (med_m - drv_m) / 343.0 * 1e3;
+                  double drv_m = sos * (double)(il + ol) / FS;
+                  double resid_ms = (med_m - drv_m) / sos * 1e3;
                   printf("localize: solved system latency %.3f m (%.2f ms) vs driver digital loop %.3f m (%.2f ms) -> residual %+.2f ms\n",
-                         med_m, med_m / 343.0 * 1e3, drv_m, drv_m / 343.0 * 1e3, resid_ms);
+                         med_m, med_m / sos * 1e3, drv_m, drv_m / sos * 1e3, resid_ms);
                   if (resid_ms < -0.5)
                       printf("  WARNING: solved latency is BELOW the driver's own digital loop — physically impossible;\n"
                              "           check the device/clocking (wrong driver? sample-rate mismatch?)\n");
@@ -223,6 +266,7 @@ int main(int argc, char** argv) {
 #endif
         free(latv);
         if (!calib_write_positions(layout_path, out_path, pos, n, err, sizeof err)) { fprintf(stderr, "calibrate: %s\n", err); return 1; }
+        record_sos(out_path, sos);
         printf("localize: wrote %d positions to %s%s\n", n, out_path, failed ? "  (some failed, set to 0)" : "");
         free(range); free(pos); free(res); free(cap); free(sweep);
         return 0;
@@ -231,7 +275,7 @@ int main(int argc, char** argv) {
     /* --- ZM-1 single-position localization: ONE mic placement, 19 capsules -> direction + distance --- */
     if (zylia) {
         float caps[ZYLIA_MICS][3]; zylia_capsules(caps);       /* the installed survey if any, else built-in */
-        const double C = 343.0;
+        const double C = sos;
         printf("zylia: array at (%.2f %.2f %.2f), %d capsules%s\n",
                mic[0], mic[1], mic[2], ZYLIA_MICS, simulate ? "  [SIMULATE]" : "");
         if (!simulate && !survey_path)
@@ -307,8 +351,8 @@ int main(int argc, char** argv) {
          * on the capsule inputs legitimately adds ~10 ms the driver does not report. */
         { long il = 0, ol = 0;
           if (!simulate && lat_known && calib_asio_latencies(&il, &ol)) {
-              double drv_m = 343.0 * (double)(il + ol) / FS;
-              double resid_ms = (latency * C - drv_m) / 343.0 * 1e3;
+              double drv_m = sos * (double)(il + ol) / FS;
+              double resid_ms = (latency * C - drv_m) / sos * 1e3;
               printf("zylia: system latency %.3f m vs driver digital loop %.3f m -> residual %+.2f ms\n",
                      latency * C, drv_m, resid_ms);
               if (resid_ms < -0.5)
@@ -337,6 +381,7 @@ int main(int argc, char** argv) {
             return 1;
         }
         if (!calib_write_positions(layout_path, out_path, pos, n, err, sizeof err)) { fprintf(stderr, "calibrate: %s\n", err); return 1; }
+        record_sos(out_path, sos);
         printf("zylia: wrote %d positions to %s\n", n, out_path);
         free(arr); free(pos); free(res); free(cap); free(sweep);
         return 0;
@@ -348,12 +393,12 @@ int main(int argc, char** argv) {
         for (int s = 0; s < n; ++s) { pos[s][0]=L.speakers[s].pos[0]; pos[s][1]=L.speakers[s].pos[1]; pos[s][2]=L.speakers[s].pos[2]; }
         double* range = (double*)malloc((size_t)n * sizeof(double));
         for (int s = 0; s < n; ++s) {
-            if (simulate) calib_sim_capture(s, &L, mic, sweep, cap);
+            if (simulate) calib_sim_capture(s, &L, mic, sos, sweep, cap);
 #ifdef BWA_HAVE_ASIO
             else if (!calib_asio_capture(s)) { fprintf(stderr, "calibrate: capture timed out (spk %d)\n", s); calib_asio_close(); return 1; }
 #endif
             MeasureResult r; measure_response(cap, CAPLEN, sweep, NSWEEP, F1, F2, FS, BAND_HZ, &r);
-            range[s] = ((double)r.delay_samples + r.delay_frac) * 343.0 / FS;
+            range[s] = ((double)r.delay_samples + r.delay_frac) * sos / FS;
         }
 #ifdef BWA_HAVE_ASIO
         if (asio_up) calib_asio_close();
@@ -386,11 +431,11 @@ int main(int argc, char** argv) {
         { long il = 0, ol = 0;
           if (known_latency < 0.0 && !simulate && calib_asio_latencies(&il, &ol))
               printf("  (driver digital loop = %.3f m of the range below — a lower bound for --latency)\n",
-                     343.0 * (double)(il + ol) / FS); }
+                     sos * (double)(il + ol) / FS); }
 #endif
         int iters = simulate ? 4 : (1 << 30);
         for (int t = 0; t < iters; ++t) {
-            if (simulate) calib_sim_capture(live_speaker, &L, mic, sweep, cap);
+            if (simulate) calib_sim_capture(live_speaker, &L, mic, sos, sweep, cap);
 #ifdef BWA_HAVE_ASIO
             else {
                 if (!calib_asio_capture(live_speaker)) { fprintf(stderr, "\ncalibrate: capture timed out\n"); calib_asio_close(); return 1; }
@@ -398,7 +443,7 @@ int main(int argc, char** argv) {
             }
 #endif
             MeasureResult r; measure_response(cap, CAPLEN, sweep, NSWEEP, F1, F2, FS, BAND_HZ, &r);
-            double range = ((double)r.delay_samples + r.delay_frac) * 343.0 / FS;
+            double range = ((double)r.delay_samples + r.delay_frac) * sos / FS;
             if (known_latency >= 0.0)
                 printf("\r  distance %.3f m   target %.3f   delta %+.1f cm        ", range - known_latency, target, (range - known_latency - target) * 100.0);
             else
@@ -422,7 +467,7 @@ int main(int argc, char** argv) {
                               rq_counts = (int*)calloc((size_t)n, sizeof(int)); }
     for (int i = 0; i < n; ++i) {
         if (simulate) {
-            calib_sim_capture(i, &L, mic, sweep, cap);
+            calib_sim_capture(i, &L, mic, sos, sweep, cap);
         } else {
 #ifdef BWA_HAVE_ASIO
             printf("  speaker %2d: playing sweep...\n", i); fflush(stdout);
@@ -498,6 +543,7 @@ int main(int argc, char** argv) {
     if (!calib_write_layout(layout_path, out_path, gdb, dms, n, err, sizeof err)) {
         fprintf(stderr, "calibrate: %s\n", err); return 1;
     }
+    record_sos(out_path, sos);
     printf("calibrate: wrote %s\n", out_path);
 
     if (eq) {   /* write the correction filters into the file the trims just wrote */
