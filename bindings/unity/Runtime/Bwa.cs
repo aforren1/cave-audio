@@ -392,6 +392,11 @@ namespace BwAudio
         // Panner selection (load-time, or live — the switch is atomic): DBAP (moving observer, default),
         // SPCAP or VBAP (both fixed-observer sweet-spot panners).
         [DllImport(DLL, CallingConvention = CC)] public static extern void bwa_set_panner(IntPtr e, BwaPanner panner);
+        // SPCAP's two tuning exponents (inert under DBAP/VBAP; live). focus = lobe sharpness: higher
+        // concentrates a source on fewer speakers, lower spreads it. density = the placement-correction
+        // kernel exponent (2 is the default and rarely worth moving). Pass <= 0 for either to revert THAT
+        // one to its default — focus falls back to a value derived from the array geometry.
+        [DllImport(DLL, CallingConvention = CC)] public static extern void bwa_set_spcap_focus(IntPtr e, float focus, float density);
         [DllImport(DLL, CallingConvention = CC)] public static extern void bwa_set_dual_band(IntPtr e, [MarshalAs(UnmanagedType.I1)] bool on);
         // How bwa_source_set_spread renders width (live A/B): LOBE (default, one reshaped solve), MDAP
         // (a ring of virtual sources panned with the selected panner — panner-true, ~13x the solve cost),
@@ -433,7 +438,9 @@ namespace BwAudio
         // position. ON by default when a grid is present; this is the live kill switch. No-op without a grid.
         [DllImport(DLL, CallingConvention = CC)] public static extern void bwa_set_tracked_room_eq(IntPtr e, [MarshalAs(UnmanagedType.I1)] bool on);
         // Offline panner evaluation (no engine handle): out = nsrc*n gains for a layout/panner; for layout scoring.
-        [DllImport(DLL, CallingConvention = CC)] public static extern uint bwa_panner_gains_batch(BwaPanner panner, float[] positions, uint n, float[] lis, float[] srcs, uint nsrc, [Out] float[] outGains);
+        // focus/density are SPCAP's tuning knobs, same <= 0 = default sentinel as bwa_set_spcap_focus, and
+        // inert under DBAP/VBAP. Pass 0, 0 to score at the focus this array's geometry derives.
+        [DllImport(DLL, CallingConvention = CC)] public static extern uint bwa_panner_gains_batch(BwaPanner panner, float[] positions, uint n, float[] lis, float[] srcs, uint nsrc, float focus, float density, [Out] float[] outGains);
 
         // ---- listener + frame boundary ----
         [DllImport(DLL, CallingConvention = CC)] public static extern void bwa_set_listener_pose(IntPtr e, float px, float py, float pz, float qx, float qy, float qz, float qw);

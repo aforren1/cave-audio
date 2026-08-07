@@ -446,7 +446,8 @@ int main(void) {
         float lis[3] = { LD.ref[0], LD.ref[1], LD.ref[2] }, g[CH];   /* sweet spot = the array center */
         int loc_ok = 1, nonneg = 1;
         for (int k = 0; k < CH; ++k) {
-            spcap_gains(&sp, LD.speakers[k].pos, lis, &LD, 1u, 1.0f, g);   /* source at speaker k's bearing */
+            spcap_gains(&sp, LD.speakers[k].pos, lis, &LD, 1u, LD.spcap_focus, LD.spcap_density,
+                        1.0f, g);                                          /* source at speaker k's bearing */
             if (argmax(g, CH) != k) loc_ok = 0;
             for (int i = 0; i < CH; ++i) if (g[i] < -1e-6f) nonneg = 0;
         }
@@ -454,11 +455,91 @@ int main(void) {
         CHECK(nonneg, "SPCAP gains are non-negative");
 
         float src[3] = { 0.5f, LD.ref[1], 0.5f }, gain = 0.8f;
-        spcap_gains(&sp, src, lis, &LD, 1u, gain, g);
+        spcap_gains(&sp, src, lis, &LD, 1u, LD.spcap_focus, LD.spcap_density, gain, g);
         double p = 0; int active = 0;
         for (int k = 0; k < CH; ++k) { p += (double)g[k] * g[k]; if (g[k] > 0.05f * gain) ++active; }
         CHECK(fabs(sqrt(p) - gain) < 0.02, "SPCAP is constant-power (||g|| ~ user_gain)");
         CHECK(active >= 3 && active <= 20, "SPCAP spreads across several speakers (not 1, not all)");
+    }
+
+    /* 9b. SPCAP tuning knobs: the geometry-derived focus default, focus monotonicity (with constant
+     * power held), and the density change invalidating the cached placement correction. */
+    {
+        const float lis[3] = { LD.ref[0], LD.ref[1], LD.ref[2] };   /* sweet spot = the array center */
+        printf("spcap: derived focus on the default cube grid = %.2f\n", (double)LD.spcap_focus);
+        CHECK(LD.spcap_focus > 8.f && LD.spcap_focus < 20.f,
+              "derived SPCAP focus lands in a sane band on the default grid");
+
+        /* the -6 dB-at-nearest-neighbor formula, checked at three known angles: a two-speaker array
+         * separated by `deg` has exactly that mean nearest-neighbor separation */
+        const double want[3] = { 19.99, 8.75, 4.82 };
+        const float  degs[3] = { 30.f, 45.f, 60.f };
+        for (int t = 0; t < 3; ++t) {
+            Layout P; memset(&P, 0, sizeof P);
+            P.count = 2;
+            float a = degs[t] * 3.14159265358979f / 180.f;
+            P.speakers[0].pos[0] =  sinf(0.5f*a); P.speakers[0].pos[2] = cosf(0.5f*a);
+            P.speakers[1].pos[0] = -sinf(0.5f*a); P.speakers[1].pos[2] = cosf(0.5f*a);
+            P.speakers[0].pos[1] = P.speakers[1].pos[1] = 0.f;
+            P.ref[0] = P.ref[1] = P.ref[2] = 0.f;             /* solve from the origin, not the centroid */
+            float f = layout_derive_spcap_focus(&P);
+            CHECK(fabs((double)f - want[t]) < 0.05, "derived focus matches the -6 dB formula");
+        }
+
+        /* a WIDER array wants a broader lobe (lower focus), a DENSER one a tighter lobe. Six
+         * speakers on the axes sit 90 deg apart; a 5x5x5 shell is packed tighter than the 3x3x3. */
+        Layout WIDE = LD;
+        const float ax6[6][3] = { {1,0,0}, {-1,0,0}, {0,1,0}, {0,-1,0}, {0,0,1}, {0,0,-1} };
+        WIDE.count = 6;
+        for (int k = 0; k < 6; ++k) for (int j = 0; j < 3; ++j)
+            WIDE.speakers[k].pos[j] = LD.ref[j] + 2.f * ax6[k][j];
+        float f_wide = layout_derive_spcap_focus(&WIDE);
+
+        Layout DENSE = LD;                                    /* a 12-speaker ring: 30 deg apart, so
+                                                               * denser than the grid's 37.5 deg */
+        DENSE.count = 12;
+        for (int k = 0; k < 12; ++k) {
+            float a = (float)k * (2.f * 3.14159265358979f / 12.f);
+            DENSE.speakers[k].pos[0] = LD.ref[0] + 2.f * sinf(a);
+            DENSE.speakers[k].pos[1] = LD.ref[1];
+            DENSE.speakers[k].pos[2] = LD.ref[2] + 2.f * cosf(a);
+        }
+        float f_dense = layout_derive_spcap_focus(&DENSE);
+        printf("spcap: derived focus, grid %.2f, 6-speaker cross %.2f, 12-speaker ring %.2f\n",
+               (double)LD.spcap_focus, (double)f_wide, (double)f_dense);
+        CHECK(f_wide < LD.spcap_focus, "a wider array derives a broader lobe (lower focus)");
+        CHECK(f_dense > LD.spcap_focus, "a denser array derives a tighter lobe (higher focus)");
+        CHECK(f_wide >= 1.f && f_wide <= 64.f && f_dense >= 1.f && f_dense <= 64.f,
+              "derived focus stays inside the clamp band");
+
+        /* focus monotonicity: raise it and the energy concentrates, while ||g|| stays at user_gain */
+        float src2[3] = { 0.35f, LD.ref[1] + 0.2f, 0.9f };
+        float gl[CH], gh[CH];
+        SpcapState sl; spcap_reset(&sl);
+        SpcapState sh; spcap_reset(&sh);
+        spcap_gains(&sl, src2, lis, &LD, 1u,  4.f, LD.spcap_density, 1.0f, gl);
+        spcap_gains(&sh, src2, lis, &LD, 1u, 32.f, LD.spcap_density, 1.0f, gh);
+        double pl = 0, ph = 0; float peakl = 0, peakh = 0; int nl = 0, nh = 0;
+        for (int k = 0; k < CH; ++k) {
+            pl += (double)gl[k]*gl[k]; ph += (double)gh[k]*gh[k];
+            if (gl[k] > peakl) peakl = gl[k];
+            if (gh[k] > peakh) peakh = gh[k];
+        }
+        for (int k = 0; k < CH; ++k) { if (gl[k] > 0.25f * peakl) ++nl; if (gh[k] > 0.25f * peakh) ++nh; }
+        CHECK(peakh > peakl, "higher focus raises the peak speaker gain");
+        CHECK(nh < nl, "higher focus lights fewer speakers above a quarter of peak");
+        CHECK(fabs(sqrt(pl) - 1.0) < 0.02 && fabs(sqrt(ph) - 1.0) < 0.02,
+              "constant power holds across focus values");
+
+        /* density feeds the CACHED correction: reusing one state across a density change must
+         * rebuild it, not silently keep the old c[] */
+        float gd1[CH], gd2[CH];
+        SpcapState sd; spcap_reset(&sd);
+        spcap_gains(&sd, src2, lis, &LD, 1u, LD.spcap_focus, 1.0f, 1.0f, gd1);
+        spcap_gains(&sd, src2, lis, &LD, 1u, LD.spcap_focus, 6.0f, 1.0f, gd2);
+        double dmax = 0;
+        for (int k = 0; k < CH; ++k) { double d = fabs((double)gd1[k] - gd2[k]); if (d > dmax) dmax = d; }
+        CHECK(dmax > 1e-4, "a density change invalidates the cached placement correction");
     }
 
     /* 10. AllRAD bed decoder: builds, finite, energy ~ the sampling decode, localizes plane waves */

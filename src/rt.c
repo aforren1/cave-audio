@@ -110,6 +110,8 @@ typedef struct {
 typedef struct {
     uint16_t gen;
     bool     active, playing, loop, dirty, oneshot;
+    uint32_t pan_gen;                       /* RtCore.pan_gen this voice last solved at; a mismatch
+                                             * re-solves it (see RtCore.pan_gen). Audio thread only. */
     const SoundData* sound;                 /* bound sound (NULL when idle); audio reads pcm */
     uint32_t cursor;                        /* sample cursor into sound->pcm (in-memory sounds) */
     uint32_t loop_beg, loop_end;            /* loop region [beg,end) in frames (in-memory/bed sounds); resolved
@@ -439,6 +441,21 @@ struct RtCore {
     SpcapState spcap_x[BWA_EXTRA_LIS];   /* per-extra-listener caches (compromise panning): each cache is
                                          * keyed to ONE listener, so each extra gets its own */
     VbapState  vbap_x[BWA_EXTRA_LIS];
+    /* SPCAP tuning overrides (rt_set_spcap_focus; both dimensionless). <= 0 means "use the layout's
+     * default" — the geometry-derived focus, the constant density — and the fallback is resolved at
+     * SOLVE time, not latched at set time, so a later rt_set_layout can't strand a stale value.
+     * Resolved ONCE per block into spcap_focus_blk/_density_blk so no block mixes two values. */
+    _Atomic float spcap_focus, spcap_density;
+    float      spcap_focus_blk, spcap_density_blk;
+    /* Panner-parameter generation. A live SPCAP knob changes the gain vector of EVERY source,
+     * static ones included, so a dirty-only gate would leave a still scene deaf to the knob. The
+     * two dirty-all sites (rt_set_layout, rt_set_direct_ambi) write v->dirty from the CONTROL
+     * thread and are legal only because the audio thread is stopped there; a LIVE setter must not
+     * (invariant 3: the audio thread owns the voice table). So the setter's only write is this
+     * counter, and the mixer re-solves any voice whose stored pan_gen lags — on the audio thread.
+     * Release/acquire, not relaxed: a voice that saw the new generation with the old focus would
+     * stamp itself current and swallow the change until the next bump. */
+    _Atomic uint32_t pan_gen;
     _Atomic float near_spread;  /* near-listener widening radius (m); 0 = off. An approaching source's
                                  * spread is floored by 1 - dist/radius (it subtends a growing angle
                                  * instead of collapsing into the nearest speaker). */
@@ -814,6 +831,9 @@ static void drain_commands(RtCore* c) {
             memset(v, 0, sizeof *v);
             v->gen = BWA_H_GEN(cmd->handle);
             v->active = true; v->gain_user = 1.f; v->dirty = true;
+            /* start coherent with the live panner generation (it is created dirty, so it solves
+             * either way; this just keeps the memset zero from reading as a stale generation) */
+            v->pan_gen = atomic_load_explicit(&c->pan_gen, memory_order_acquire);
             v->occ_cur = 1.f;                       /* clear (un-occluded) by default */
             v->spread_h = -1.f;                     /* isotropic until rt_source_set_extent */
             v->dir_cur = 1.f;                       /* on-axis/omni by default */
@@ -1193,7 +1213,8 @@ static void spread_gains(RtCore* c, const Voice* v, float spread, float* g) {
 static void panner_gains_at(RtCore* c, int p, const float lis[3], SpcapState* ss, VbapState* vs,
                             const float src[3], float user_gain, float* out) {
     if (p == 1)
-        spcap_gains(ss, src, lis, &c->layout, c->layout_gen, user_gain, out);
+        spcap_gains(ss, src, lis, &c->layout, c->layout_gen,
+                    c->spcap_focus_blk, c->spcap_density_blk, user_gain, out);
     else if (p == 2)
         vbap_gains(vs, src, lis, &c->layout, c->layout_gen, user_gain, out);
     else
@@ -2663,6 +2684,21 @@ void rt_render(RtCore* c, float* bus, uint32_t nframes, const bwa_timestamp* ts)
     c->bed_param_blk = atomic_load_explicit(&c->bed_param, memory_order_acquire);
     c->all_paused_blk = atomic_load_explicit(&c->all_paused, memory_order_acquire);   /* one load: every
                                                                                        * gate agrees this block */
+    /* The block's panner-parameter generation: ONE acquire load for every voice (a live SPCAP knob
+     * moves every source's gains, so a lagging generation re-solves the voice — see RtCore.pan_gen).
+     * This load MUST come before the knob loads below. The setter publishes focus/density and THEN
+     * release-bumps pan_gen, so only a reader that acquires the generation first is guaranteed to
+     * see the values that belong to it. Read in the other order, a block can pair the NEW generation
+     * with the OLD focus, stamp every voice current, and swallow the change until the next bump —
+     * which for the last set of a slider drag means the knob silently never takes. */
+    const uint32_t pan_gen_blk = atomic_load_explicit(&c->pan_gen, memory_order_acquire);
+    /* SPCAP knobs, resolved once for the block (<= 0 = the layout's derived/constant default) */
+    {
+        const float sf = atomic_load_explicit(&c->spcap_focus,   memory_order_relaxed);
+        const float sd = atomic_load_explicit(&c->spcap_density, memory_order_relaxed);
+        c->spcap_focus_blk   = sf > 0.f ? sf : c->layout.spcap_focus;
+        c->spcap_density_blk = sd > 0.f ? sd : c->layout.spcap_density;
+    }
     const int dc_live = c->dc_on_blk || c->bed_param_blk || c->dc_tail > 0;
     if (dc_live) memset(c->dc_bus, 0, sizeof(float) * (size_t)c->channels * nframes);
     c->dc_wrote = 0;
@@ -2722,7 +2758,7 @@ void rt_render(RtCore* c, float* bus, uint32_t nframes, const bwa_timestamp* ts)
             }
             v->dirty = true;
         }
-        if (v->dirty) { compute_gains(c, v); v->dirty = false; }
+        if (v->dirty || v->pan_gen != pan_gen_blk) { compute_gains(c, v); v->dirty = false; v->pan_gen = pan_gen_blk; }
         if (v->sound->channels > 1) mix_bed  (c, v, (uint16_t)i, bus, nframes, off);        /* ambisonic bed */
         else                        mix_voice(c, v, (uint16_t)i,                            /* mono point source */
                                               c->direct_blk ? c->ambi_direct : bus, nframes, off, aux);
@@ -3679,6 +3715,9 @@ RtCore* rt_create(uint32_t req_voice_cap, uint32_t sound_cap, uint32_t sample_ra
     c->readback.q[3]    = 1.0f;        /* readback identity until the first block publishes */
     atomic_store_explicit(&c->room_eq_dyn, 1, memory_order_relaxed);   /* tracked room EQ: on when a grid is present */
     atomic_store_explicit(&c->master_gain, 1.f, memory_order_relaxed);
+    atomic_store_explicit(&c->spcap_focus,   0.f, memory_order_relaxed);   /* 0 = the layout's own */
+    atomic_store_explicit(&c->spcap_density, 0.f, memory_order_relaxed);   /* derived / constant default */
+    atomic_store_explicit(&c->pan_gen, 0u, memory_order_relaxed);
     c->master_g_cur = 1.f;
     for (int j = 0; j < BWA_GROUPS; ++j) c->group_gain[j] = 1.f;        /* mix groups start at unity, unpaused */
     /* protection limiter: ON at -1 dBFS by default; ~1 ms attack / ~120 ms release one-poles */
@@ -3688,6 +3727,8 @@ RtCore* rt_create(uint32_t req_voice_cap, uint32_t sound_cap, uint32_t sample_ra
     c->lim_att_a = 1.0f - expf(-1.0f / (0.001f * (float)sample_rate));
     c->lim_rel_a = 1.0f - expf(-1.0f / (0.120f * (float)sample_rate));
     c->layout  = layout_default();
+    c->spcap_focus_blk   = c->layout.spcap_focus;     /* seed the block-resolved pair; rt_render */
+    c->spcap_density_blk = c->layout.spcap_density;   /* re-resolves it every block */
     /* default listener POSITION = the layout's nominal listening point (re-set when the real
      * layout arrives) — a pose-less client listens from the array center, not the floor origin */
     memcpy(c->lis.p_active,  c->layout.ref, sizeof c->lis.p_active);
@@ -3862,6 +3903,28 @@ void rt_set_near_spread(RtCore* c, float radius_m) {
     if (!c) return;
     if (radius_m < 0.f) radius_m = 0.f; else if (radius_m > 10.f) radius_m = 10.f;
     atomic_store_explicit(&c->near_spread, radius_m, memory_order_relaxed);
+}
+
+/* SPCAP tuning: lobe sharpness + placement-correction density exponent, both dimensionless. Either
+ * <= 0 reverts THAT knob to the layout's default (the geometry-derived focus, the constant density);
+ * the fallback is resolved per block, so it survives a later rt_set_layout. Live-safe: the values
+ * are plain atomics and the gains they move ramp like any solve.
+ *
+ * The bump is the point. Focus rewrites the gain vector of every source, static ones included, so a
+ * dirty-only gate would leave a motionless scene deaf to the knob — and this setter cannot write
+ * v->dirty the way rt_set_layout does, because that is a control-thread write to audio-thread state
+ * and is legal there only because the audio thread is stopped. Bumping pan_gen instead lets the
+ * MIXER notice the change and re-solve, on its own thread. Release-ordered so a voice can never see
+ * the new generation with the old focus (it would stamp itself current and swallow the change). */
+void rt_set_spcap_focus(RtCore* c, float focus, float density) {
+    if (!c) return;
+    if (focus > 0.f)   { if (focus < 1.f) focus = 1.f; else if (focus > 64.f) focus = 64.f; }
+    else                 focus = 0.f;                    /* sentinel: back to the derived default */
+    if (density > 0.f) { if (density > 16.f) density = 16.f; }
+    else                 density = 0.f;                  /* sentinel: back to the constant default */
+    atomic_store_explicit(&c->spcap_focus,   focus,   memory_order_relaxed);
+    atomic_store_explicit(&c->spcap_density, density, memory_order_relaxed);
+    atomic_fetch_add_explicit(&c->pan_gen, 1u, memory_order_release);
 }
 
 /* Per-voice equal-loudness distance compensation (enqueue-only; the mixer ramps the shelf). */

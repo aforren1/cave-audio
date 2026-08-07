@@ -73,6 +73,13 @@ namespace BwAudio
         [Tooltip("Split at ~700 Hz and pan the low band with amplitude normalization: sharper LF " +
                  "localization for a near-centered listener. Sweet-spot dependent.")]
         public bool dualBand = false;
+        [Tooltip("SPCAP only: lobe sharpness. Higher concentrates a source on fewer speakers (tighter " +
+                 "image), lower spreads it (smoother). 0 or less = the default derived from your array's " +
+                 "speaker spacing (about 12.7 on the 26-speaker grid).")]
+        public float spcapFocus = 0f;
+        [Tooltip("SPCAP only: exponent of the placement-correction kernel that de-biases a clustered " +
+                 "array. 0 or less = the 2.0 default, which is rarely worth moving.")]
+        public float spcapDensity = 0f;
         [Tooltip("How a source's spread renders. LOBE: one reshaped solve (cheap, smooth). MDAP: a ring of " +
                  "virtual sources panned with the selected panner (panner-true, ~13x the solve cost). " +
                  "SPECTRAL: frequency-dependent panning — 6 bands, each from its own direction in the " +
@@ -287,6 +294,7 @@ namespace BwAudio
         {
             Bwa.bwa_set_panner(_eng, panner);
             Bwa.bwa_set_dual_band(_eng, dualBand);
+            Bwa.bwa_set_spcap_focus(_eng, spcapFocus, spcapDensity);
             Bwa.bwa_set_spread_mode(_eng, spreadMode);
             Bwa.bwa_set_decorrelation(_eng, decorrelation);
             Bwa.bwa_set_near_spread(_eng, nearSpreadRadius);
@@ -429,6 +437,11 @@ namespace BwAudio
         // ---- live rendering A/B (each of these is atomic / crossfaded engine-side) --------------------
         public void SetPanner(BwaPanner p)        { panner = p;        if (Ready) Bwa.bwa_set_panner(_eng, p); }
         public void SetDualBand(bool on)         { dualBand = on;     if (Ready) Bwa.bwa_set_dual_band(_eng, on); }
+        /// <summary>SPCAP's lobe sharpness and placement-correction density exponent (inert under DBAP/VBAP).
+        /// Pass 0 or less for either to revert THAT one to its default: focus to the value derived from the
+        /// array geometry, density to 2.0. Every source re-solves next block, static ones included.</summary>
+        public void SetSpcapFocus(float focus, float density = 0f)
+            { spcapFocus = focus; spcapDensity = density; if (Ready) Bwa.bwa_set_spcap_focus(_eng, focus, density); }
         public void SetSpreadMode(BwaSpreadMode m){ spreadMode = m;    if (Ready) Bwa.bwa_set_spread_mode(_eng, m); }
         public void SetDecorrelation(bool on)    { decorrelation = on; if (Ready) Bwa.bwa_set_decorrelation(_eng, on); }
         public void SetNearSpread(float radiusM) { nearSpreadRadius = radiusM; if (Ready) Bwa.bwa_set_near_spread(_eng, radiusM); }
@@ -510,7 +523,7 @@ namespace BwAudio
         /// it when something ELSE owns the timeline (video, timecode, another node), when you want a
         /// minutes-long extrapolation to hold, or to log the rig's drift. False until the fit has ~1 s
         /// of stamps, and again for ~1 s after a restart re-bases the device sample position.</summary>
-        public bool GetClockModel(out Bwa.BwaClockModel model)
+        public bool GetClockModel(out BwaClockModel model)
         {
             model = default;
             return Ready && Bwa.bwa_get_clock_model(_eng, out model);
@@ -521,7 +534,7 @@ namespace BwAudio
         /// or a driver that never flags a valid sample position), in which case a 0 xrun count is
         /// indistinguishable from "never measured". Check it once at startup on an unfamiliar
         /// driver, then poll Xruns for a HUD.</summary>
-        public bool GetHealth(out Bwa.BwaHealth health)
+        public bool GetHealth(out BwaHealth health)
         {
             health = default;
             return Ready && Bwa.bwa_get_health(_eng, out health);

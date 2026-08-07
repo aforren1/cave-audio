@@ -59,6 +59,12 @@ class Localization extends Base:
 	var air := false
 	var dual := false
 	var spread := 0.0
+	## The point-source panner, and under SPCAP its two live tuning exponents. 0 on either
+	## exponent means "the default": focus derived from the array geometry, density 2.0.
+	var panner := BwaEngine.PAN_DBAP
+	var focus := 0.0
+	var density := 0.0
+	var _focus_def := 0.0   ## cached at enter(): the derivation is O(N^2), the layout is not live
 	var _t := 0.0
 	var _fly_t := 0.0
 	var _trail: PackedVector3Array = PackedVector3Array()
@@ -78,6 +84,10 @@ class Localization extends Base:
 		app.source.air_absorption = air
 		app.source.spread = spread
 		app.engine.dual_band = dual
+		app.engine.panner = panner
+		app.engine.spcap_focus = focus
+		app.engine.spcap_density = density
+		_focus_def = app.engine.get_spcap_focus_default()
 
 	func key(code: int) -> void:
 		match code:
@@ -135,6 +145,7 @@ class Localization extends Base:
 		return [
 			["motion", "orbit" if auto else ("flyby" if flyby else "manual")],
 			["size (spread)", "%.2f" % spread],
+			["SPCAP focus", ("%.1f" % focus) if focus > 0.0 else "default %.1f" % _focus_def],
 		]
 
 	func controls() -> Array:
@@ -167,6 +178,26 @@ class Localization extends Base:
 				"set": func(v: float) -> void:
 					spread = v
 					app.source.spread = v},
+			{"kind": "option", "label": "panner", "items": ["DBAP (moving)", "SPCAP (fixed)",
+					"VBAP (fixed)"],
+				"get": func() -> int: return panner,
+				"set": func(i: int) -> void:
+					panner = i
+					app.engine.panner = i},
+			# SPCAP only. 0 = revert to the default (derived focus, density 2.0); the status line
+			# above shows what this array derives.
+			{"kind": "slider", "label": "SPCAP focus (0 = derived)", "min": 0.0, "max": 48.0,
+				"step": 0.5,
+				"get": func() -> float: return focus,
+				"set": func(v: float) -> void:
+					focus = v
+					app.engine.spcap_focus = v},
+			{"kind": "slider", "label": "SPCAP density (0 = 2.0)", "min": 0.0, "max": 8.0,
+				"step": 0.1,
+				"get": func() -> float: return density,
+				"set": func(v: float) -> void:
+					density = v
+					app.engine.spcap_density = v},
 		]
 
 

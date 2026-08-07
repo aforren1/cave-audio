@@ -55,6 +55,13 @@ typedef struct {
      * sit anywhere (canonically on the floor, Motive-style) without skewing a decode. */
     float    ref[3];
     float    rolloff_r;             /* DBAP spatial blur (meters) */
+    /* SPCAP defaults (dimensionless exponents, spcap.c). DERIVED, never parsed: the layout file is a
+     * geometry/calibration artifact and nothing measures a lobe width. focus = lobe sharpness
+     * ((1+cos)/2)^focus, derived from the array's speaker spacing; density = the
+     * placement-correction kernel exponent, a plain constant (no geometry link). bwa_set_spcap_focus
+     * overrides both at runtime like the other live knobs; these are what it reverts to. */
+    float    spcap_focus;
+    float    spcap_density;
     /* distance attenuation, source -> listener (inverse model):
      *   atten = clamp( (ref / max(d, ref))^rolloff , min_lin, 1 ) */
     float    atten_ref_m;
@@ -76,6 +83,16 @@ bool layout_load(const char* path, uint32_t sample_rate, Layout* out, char* err,
 
 /* (Re)compute `ref` from the speaker positions — for callers that build a Layout by hand. */
 void layout_compute_ref(Layout* L);
+
+/* SPCAP's default lobe sharpness for THIS array: mean nearest-neighbor angular separation delta of
+ * the speaker directions seen from `ref`, then the exponent that puts the lobe ((1+cos)/2)^n 6 dB
+ * down in energy at delta — n = ln(0.25)/ln((1+cos delta)/2). A wide array (few speakers, far apart)
+ * wants a broad lobe, a dense one a tight one; the hard-coded 12 only ever fit the 26-speaker cave.
+ * Clamped to 1..64, and falls back to 12 on a degenerate survey (< 2 speakers, delta ~ 0 or ~ pi).
+ * Needs `count` + `ref` set — call after layout_compute_ref. Control thread; O(N^2), load-time only. */
+float layout_derive_spcap_focus(const Layout* L);
+
+#define BWA_SPCAP_DENSITY_DEFAULT 2.0f   /* placement-correction density exponent (no geometry link) */
 
 /* The distance-attenuation formula with arbitrary parameters — the layout curve, the per-source
  * override, and loudness comp's tracker all share it: clamp((ref/max(d,ref))^rolloff, min, 1).

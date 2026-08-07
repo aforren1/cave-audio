@@ -44,6 +44,24 @@ The trap: **a failed layout load is not fatal**: `bwa_create` falls back to the
 install that silently changes the channel count too. Check `bwa_last_error` right after
 `bwa_create` and fail loudly if the surveyed layout didn't load.
 
+## There are two speeds of sound
+
+Both bindings expose one (`speed_of_sound` in Godot, `speedOfSound` in Unity), and the layout
+file carries another (`reference.speed_of_sound_mps`). They are both in meters per second and
+they are not the same quantity. Setting either does nothing to the other.
+
+- **The binding property** is `bwa_set_speed_of_sound`, the **propagation medium**. Doppler and
+  reflection delays derive from it and glide to a change. 343 is air, 1480 is underwater, and
+  small values exaggerate Doppler for slow motion. It is live, and it is yours to drive as an
+  effect.
+- **The layout field** is the **room air temperature the acoustic survey was measured at**, which
+  scales the ranges `bwa_calibrate` solves positions from. See
+  [`calibration.md`](./calibration.md) -> "Air temperature". The engine never reads it; only the
+  calibration and authoring tools do. A binding has nothing to do with it.
+
+If you are writing an underwater scene, set the binding property. If your room is not at 20 C,
+pass `--temp` to `bwa_calibrate` once and the layout remembers it. Do not copy one into the other.
+
 ## Unity
 
 **Implemented as a UPM package: [`bindings/unity/`](../bindings/unity/) (`com.brainworks.bw_audio`).**
@@ -159,7 +177,9 @@ The snippet shows the core calls. The shipped `Bwa.cs` binds every `BWA_API` fun
 - **Materials / scene geometry**: `bwa_material_preset`, `bwa_material_define`,
   `bwa_scene_set_mesh_mat`, `bwa_scene_set_box`.
 - **Rendering A/B (live)**: `bwa_set_panner`, `bwa_set_dual_band`,
-  `bwa_set_spread_mode`, `bwa_set_max_re` + `bwa_set_max_re_split`,
+  `bwa_set_spcap_focus` (SPCAP's lobe sharpness and placement-correction density;
+  0 or less on either reverts that one to the default, focus to whatever the array
+  geometry implies), `bwa_set_spread_mode`, `bwa_set_max_re` + `bwa_set_max_re_split`,
   `bwa_set_decorrelation`, `bwa_set_near_spread`, `bwa_set_bed_renderer`,
   `bwa_set_tracked_room_eq` (the bed *decoder* is create-time:
   `bwa_desc.bed_decoder`). `Engine` re-pushes these from `OnValidate`, so the

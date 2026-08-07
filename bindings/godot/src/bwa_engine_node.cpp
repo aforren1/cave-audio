@@ -115,6 +115,7 @@ void BwaEngine::_ready() {
 	bwa_set_early_reflections_gain(eng, er_gain);
 	bwa_set_panner(eng, (bwa_panner)panner);
 	bwa_set_dual_band(eng, dual_band);
+	bwa_set_spcap_focus(eng, spcap_focus, spcap_density);
 	bwa_set_spread_mode(eng, (bwa_spread_mode)spread_mode);
 	bwa_set_decorrelation(eng, decorrelation);
 	bwa_set_near_spread(eng, near_spread);
@@ -497,6 +498,9 @@ void BwaEngine::early_reflections_set_gain(float linear) {
 
 BWA_LIVE_SETTER(panner, Panner, bwa_set_panner(eng, (bwa_panner)v))
 BWA_LIVE_SETTER(dual_band, bool, bwa_set_dual_band(eng, v))
+/* one C call carries both SPCAP exponents, so each property setter re-sends the pair */
+BWA_LIVE_SETTER(spcap_focus, float, bwa_set_spcap_focus(eng, spcap_focus, spcap_density))
+BWA_LIVE_SETTER(spcap_density, float, bwa_set_spcap_focus(eng, spcap_focus, spcap_density))
 BWA_LIVE_SETTER(spread_mode, SpreadMode, bwa_set_spread_mode(eng, (bwa_spread_mode)v))
 BWA_LIVE_SETTER(decorrelation, bool, bwa_set_decorrelation(eng, v))
 BWA_LIVE_SETTER(near_spread, float, bwa_set_near_spread(eng, v))
@@ -831,6 +835,21 @@ PackedVector3Array BwaEngine::get_speakers() const {
 	return out;
 }
 
+/* What spcap_focus falls back to on the engine's ACTIVE layout: the speakers come back in engine
+ * (room) space, which is what the derivation wants - it is centroid-relative and angle-only. */
+float BwaEngine::get_spcap_focus_default() const {
+	if (!eng) {
+		return 0.0f;
+	}
+	const uint32_t n = bwa_get_speakers(eng, nullptr, 0);
+	if (n < 2) {
+		return 0.0f;
+	}
+	std::vector<float> xyz(n * 3);
+	bwa_get_speakers(eng, xyz.data(), n);
+	return bwa_spcap_focus_default(xyz.data(), n);
+}
+
 PackedFloat32Array BwaEngine::render_block() {
 	PackedFloat32Array out;
 	if (!eng) {
@@ -1025,6 +1044,8 @@ void BwaEngine::_bind_methods() {
 
 	M(set_panner, "panner"); M0(get_panner);
 	M(set_dual_band, "on"); M0(get_dual_band);
+	M(set_spcap_focus, "focus"); M0(get_spcap_focus);
+	M(set_spcap_density, "density"); M0(get_spcap_density);
 	M(set_spread_mode, "mode"); M0(get_spread_mode);
 	M(set_decorrelation, "on"); M0(get_decorrelation);
 	M(set_near_spread, "radius_m"); M0(get_near_spread);
@@ -1059,7 +1080,8 @@ void BwaEngine::_bind_methods() {
 	M(set_test_signal, "channel", "kind", "gain");
 	M0(is_running); M0(get_audio_backend); M0(get_last_error);
 	M0(get_channel_count); M0(get_resolved_sample_rate); M0(get_resolved_block_size);
-	M0(get_active_voices); M0(get_bus_levels); M0(get_speakers); M0(render_block);
+	M0(get_active_voices); M0(get_bus_levels); M0(get_speakers); M0(get_spcap_focus_default);
+	M0(render_block);
 	M0(get_generation);
 #undef M
 #undef M0
@@ -1120,6 +1142,11 @@ void BwaEngine::_bind_methods() {
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "panner", PROPERTY_HINT_ENUM, "DBAP,SPCAP,VBAP"),
 			"set_panner", "get_panner");
 	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "dual_band"), "set_dual_band", "get_dual_band");
+	/* SPCAP only. 0 = the default: focus derived from the array geometry, density 2.0. */
+	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "spcap_focus", PROPERTY_HINT_RANGE, "0,64,0.1"),
+			"set_spcap_focus", "get_spcap_focus");
+	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "spcap_density", PROPERTY_HINT_RANGE, "0,16,0.1"),
+			"set_spcap_density", "get_spcap_density");
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "spread_mode", PROPERTY_HINT_ENUM, "Lobe,MDAP,Spectral"),
 			"set_spread_mode", "get_spread_mode");
 	ADD_PROPERTY(

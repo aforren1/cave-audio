@@ -22,16 +22,27 @@
 #define VALID_F_LO   420.0     /* inside zylia_intensity_doa's 400-1200 band, clear of its edges */
 #define VALID_F_HI   1150.0
 
+/* The <= 0 sentinel, in ONE place: either knob <= 0 reverts that one to the default for THIS array.
+ * The layout already carries them resolved (spcap_focus is layout_derive_spcap_focus, spcap_density
+ * the constant), which is what makes "the caller's real layout" the right fallback here rather than
+ * bwa_panner_gains_batch's layout_default() stand-in. */
+static void valid_tuning(const Layout* L, float focus, float density, float* f_out, float* d_out) {
+    *f_out = (focus   > 0.f) ? focus   : L->spcap_focus;
+    *d_out = (density > 0.f) ? density : L->spcap_density;
+}
+
 /* The engine's OWN panner solves, so this scores what will actually ship rather than a copy. Called
  * directly rather than through bwa_panner_gains_batch: that public wrapper substitutes a
  * layout_default() for its DBAP/attenuation tuning and flattens the per-speaker trims, and here we
  * have the caller's REAL layout and want its rolloff_r and its trims to count. (It also lives in
  * engine.c, which is compiled into the DLL rather than into this library.) */
 static void valid_gains(const Layout* L, int panner, const float src[3], const float lis[3],
-                        float* out) {
+                        float focus, float density, float* out) {
     if (panner == BWA_PAN_SPCAP) {
+        float f, d;
+        valid_tuning(L, focus, density, &f, &d);
         SpcapState sp; spcap_reset(&sp);
-        spcap_gains(&sp, src, lis, L, 1u, 1.0f, out);
+        spcap_gains(&sp, src, lis, L, 1u, f, d, 1.0f, out);
     } else if (panner == BWA_PAN_VBAP) {
         VbapState vb; vbap_reset(&vb);
         vbap_gains(&vb, src, lis, L, 1u, 1.0f, out);
@@ -125,12 +136,13 @@ static int valid_feeds_from_gains(const Layout* L, const float* gains,
 }
 
 int valid_speaker_feeds(const Layout* L, int panner, const float solve_pos[3],
-                        const float src_world[3], double fs, float* feeds, uint32_t n) {
+                        const float src_world[3], double fs, float focus, float density,
+                        float* feeds, uint32_t n) {
     if (!L || !solve_pos || !src_world || !feeds || fs <= 0.0 || n < 64u) return 0;
     if (L->count < 4u || L->count > (uint32_t)BWA_CHANNELS) return 0;
     float gains[BWA_CHANNELS];
     memset(gains, 0, sizeof gains);
-    valid_gains(L, panner, src_world, solve_pos, gains);
+    valid_gains(L, panner, src_world, solve_pos, focus, density, gains);
     return valid_feeds_from_gains(L, gains, fs, feeds, n);
 }
 
@@ -217,18 +229,19 @@ static int valid_field(const Layout* L, const float* gains, const float mic[3],
 }
 
 int valid_simulate(const Layout* L, int panner, const float solve_pos[3], const float mic[3],
-                   const float src_world[3], double fs, double c, float* buf, uint32_t n) {
+                   const float src_world[3], double fs, double c, float focus, float density,
+                   float* buf, uint32_t n) {
     if (!L || !solve_pos || !mic || !src_world || !buf) return 0;
     if (fs <= 0.0 || c <= 0.0 || n < 64u) return 0;
     if (L->count < 4u || L->count > (uint32_t)BWA_CHANNELS) return 0;
     float gains[BWA_CHANNELS];
     memset(gains, 0, sizeof gains);
-    valid_gains(L, panner, src_world, solve_pos, gains);
+    valid_gains(L, panner, src_world, solve_pos, focus, density, gains);
     return valid_field(L, gains, mic, fs, c, buf, n);
 }
 
 int valid_score(const Layout* L, int panner, int tracked, const float mic[3], const float src_world[3],
-                const float* cap19, uint32_t n, double fs, double c,
+                const float* cap19, uint32_t n, double fs, double c, float focus, float density,
                 const unsigned char* exclude, ValidCell* out) {
     if (!L || !mic || !src_world || !cap19 || !out) return 0;
 
@@ -236,6 +249,7 @@ int valid_score(const Layout* L, int panner, int tracked, const float mic[3], co
     out->panner = panner;
     out->tracked = tracked ? 1 : 0;
     out->mic[0] = mic[0]; out->mic[1] = mic[1]; out->mic[2] = mic[2];
+    valid_tuning(L, focus, density, &out->focus, &out->density);
 
     double tx = (double)src_world[0] - mic[0];
     double ty = (double)src_world[1] - mic[1];
@@ -250,6 +264,18 @@ int valid_score(const Layout* L, int panner, int tracked, const float mic[3], co
     float d[3], psi = 0.0f;
     double f_lo, f_hi;
     valid_get_stimulus_band(&f_lo, &f_hi);   /* a tone is scored in its own +-1/6 octave */
+
+    /* Comb depth FIRST, and unconditionally: it is an independent measurement of the same capture, so
+     * a cell whose direction the estimator refuses can still report what the render did to the
+     * spectrum. A tone's narrow band is refused by zylia_comb_depth on purpose (one frequency cannot
+     * show a frequency-dependent effect), which is why comb_ok is its own flag. */
+    float cdb = 0.0f, cq = 0.0f;
+    if (zylia_comb_depth(ptr, n, fs, f_lo, f_hi, exclude, &cdb, &cq)) {
+        out->comb_db = cdb;
+        out->comb_q  = cq;
+        out->comb_ok = 1;
+    }
+
     if (!zylia_intensity_doa(ptr, n, fs, c, f_lo, f_hi, exclude, d, &psi)) { out->ok = 0; return 1; }
 
     out->measured[0] = d[0]; out->measured[1] = d[1]; out->measured[2] = d[2];
@@ -263,13 +289,15 @@ int valid_score(const Layout* L, int panner, int tracked, const float mic[3], co
 }
 
 int valid_cell(const Layout* L, int panner, int tracked, const float mic[3], const float src_world[3],
-               double fs, double c, uint32_t n, ValidCell* out) {
+               double fs, double c, float focus, float density, uint32_t n, ValidCell* out) {
     if (!L || !mic || !src_world || !out) return 0;
     float* buf = (float*)malloc(sizeof(float) * (size_t)ZYLIA_MICS * n);
     if (!buf) return 0;
     const float* solve = tracked ? mic : L->ref;
-    if (!valid_simulate(L, panner, solve, mic, src_world, fs, c, buf, n)) { free(buf); return 0; }
-    int r = valid_score(L, panner, tracked, mic, src_world, buf, n, fs, c, NULL, out);
+    if (!valid_simulate(L, panner, solve, mic, src_world, fs, c, focus, density, buf, n)) {
+        free(buf); return 0;
+    }
+    int r = valid_score(L, panner, tracked, mic, src_world, buf, n, fs, c, focus, density, NULL, out);
     free(buf);
     return r;
 }
@@ -290,21 +318,24 @@ int valid_reference_cell(const Layout* L, int spk, const float mic[3],
     /* The speaker's own surveyed position IS the target. A reference miss therefore also prices in
      * survey error, which is correct: a layout that misplaces a speaker misaims every phantom too. */
     float src[3] = { L->speakers[spk].pos[0], L->speakers[spk].pos[1], L->speakers[spk].pos[2] };
-    int r = valid_score(L, 0, 0, mic, src, buf, n, fs, c, NULL, out);
+    int r = valid_score(L, 0, 0, mic, src, buf, n, fs, c, 0.f, 0.f, NULL, out);
     free(buf);
-    if (r) { out->reference = 1; out->tgt = spk; }
+    /* No panner ran, so the tuning columns are meaningless here — blank them rather than report the
+     * array's defaults on a row that never used them. */
+    if (r) { out->reference = 1; out->tgt = spk; out->focus = 0.f; out->density = 0.f; }
     return r;
 }
 
 int valid_re_proxy(const Layout* L, int panner, const float solve_pos[3], const float mic[3],
-                   const float src_world[3], float* re_err_deg, float* spread_deg) {
+                   const float src_world[3], float focus, float density,
+                   float* re_err_deg, float* spread_deg) {
     if (!L || !solve_pos || !mic || !src_world) return 0;
     uint32_t nspk = L->count;
     if (nspk < 4u || nspk > (uint32_t)BWA_CHANNELS) return 0;
 
     float gains[BWA_CHANNELS];
     memset(gains, 0, sizeof gains);
-    valid_gains(L, panner, src_world, solve_pos, gains);
+    valid_gains(L, panner, src_world, solve_pos, focus, density, gains);
 
     /* energy vector, speaker directions taken FROM THE LISTENER (layout_tool does the same) */
     double rE[3] = { 0, 0, 0 }, esum = 0.0;
@@ -338,7 +369,8 @@ int valid_re_proxy(const Layout* L, int panner, const float solve_pos[3], const 
 int valid_run(const Layout* L, const int* panners, int npan, int tracked,
               const float (*listeners)[3], int nlis,
               const float (*targets)[3], int ntgt,
-              float radius, double fs, double c, uint32_t n, ValidCell* cells_out) {
+              float radius, double fs, double c, float focus, float density,
+              uint32_t n, ValidCell* cells_out) {
     if (!L || !panners || !listeners || !targets || !cells_out) return 0;
     if (npan < 1 || nlis < 1 || ntgt < 1 || radius <= 0.0f) return 0;
 
@@ -352,10 +384,12 @@ int valid_run(const Layout* L, const int* panners, int npan, int tracked,
                                  L->ref[1] + radius * targets[t][1],
                                  L->ref[2] + radius * targets[t][2] };
                 ValidCell* cc = &cells_out[w];
-                if (!valid_cell(L, panners[p], tracked, listeners[li], src, fs, c, n, cc)) {
+                if (!valid_cell(L, panners[p], tracked, listeners[li], src, fs, c,
+                                focus, density, n, cc)) {
                     memset(cc, 0, sizeof *cc);
                     cc->panner = panners[p];
                     cc->tracked = tracked ? 1 : 0;
+                    valid_tuning(L, focus, density, &cc->focus, &cc->density);
                 }
                 cc->lis = li;
                 cc->tgt = t;

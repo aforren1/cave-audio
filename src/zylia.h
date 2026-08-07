@@ -151,6 +151,70 @@ int  zylia_check_capsules(const float* const x[ZYLIA_MICS], uint32_t n,
 int  zylia_srp_doa(const float* const x[ZYLIA_MICS], uint32_t n, double fs, double c,
                    double f_lo, double f_hi, const unsigned char* exclude, float dir_out[3]);
 
+/* ---- how much does the array COMB? the timbral cost of spreading a source over many speakers ----
+ *
+ * A phantom is N loudspeakers radiating COHERENT copies of ONE signal. At any point in the room those
+ * copies arrive at N different times, so what a microphone sees is the source through a comb filter:
+ * peaks where the copies add, notches where they cancel. That is the price amplitude panning pays for
+ * a phantom, it is invisible to every direction estimator above (a comb barely moves the intensity
+ * vector), and it is exactly what SPCAP's `focus` knob trades. High focus puts a source on few
+ * speakers and combs little; low focus spreads it over many and combs hard. So this is the number that
+ * turns "focus sounds tighter" into a measurement.
+ *
+ * THE DISCRIMINATING AXIS IS FREQUENCY, NOT THE CAPSULE AXIS, and getting that backwards is the one
+ * design mistake worth naming here. The ZM-1's shell is 49 mm, so the widest capsule pair sits 98 mm
+ * apart, while a 400-1200 Hz analysis band spans wavelengths from 0.86 m down to 0.29 m: every pair
+ * lies within 0.11 to 0.34 of a wavelength, so all 19 capsules see very nearly the SAME comb. They
+ * average its noise down; they do NOT sample it independently. A statistic taken ACROSS capsules would
+ * therefore be measuring nothing. The statistic is the ROUGHNESS ALONG FREQUENCY of one capsule's
+ * spectrum, and the 19 capsules only average that.
+ *
+ * Method: Welch power spectrum per capsule (ZYLIA_COMB_NFFT-point Hann frames, half-overlapped), then
+ * band energies over the analysis band in overlapping sub-bands one eighth of the band wide, in dB,
+ * with a straight line in (log f, dB) fitted out. What is left is the ripple. `depth_db` is its
+ * INTERDECILE range (90th minus 10th percentile), averaged over the included capsules — a peak-to-notch
+ * figure that one catastrophic null cannot run away with. 0 dB is a flat response, which is what a
+ * single coherent arrival gives.
+ *
+ * READ IT AS AN EXCESS, NEVER AS AN ABSOLUTE. Three other things put ripple in a spectrum: the room,
+ * the stimulus's own line structure, and the analysis itself (a sub-band holds a whole number of
+ * stimulus tones, and that count jitters band to band). All three are present when ONE speaker is
+ * driven alone, which is exactly what valid.c's physical reference arm already does for the angular
+ * miss. Measure the reference the same way and subtract; the difference is what panning cost. An
+ * absolute comb depth says as little on its own as an absolute angular miss, and for the same reason.
+ *
+ * LIMITS, all of them structural:
+ *  - Ripple SLOWER than the analysis band is indistinguishable from a spectral tilt and the detrend
+ *    removes it. Copies within about 1 ms of each other put their first notch above the band and read
+ *    as flat. That is the time-aligned case, and it is the right answer at the point the alignment was
+ *    computed for and the wrong one everywhere else.
+ *  - Ripple FASTER than a sub-band is averaged away. On a 400-1200 Hz band the sub-band is 100 Hz, so
+ *    notch spacings under about 200 Hz (copies more than about 5 ms apart) are understated.
+ *  - A band too narrow to hold enough sub-bands is REFUSED, which is why a single-tone stimulus gets no
+ *    comb number. That is correct rather than a gap: one frequency cannot show a frequency-dependent
+ *    effect, and a comb evaluated at one point is just a gain.
+ *  - There is no first-order ceiling here. Nothing inverts b_n(ka) or projects onto spherical
+ *    harmonics, so ZYLIA_FOA_FMAX does not apply and the band is yours. Match it to the DOA band
+ *    anyway when the two numbers are to be read side by side.
+ *  - n must be >= ZYLIA_COMB_NFFT. The frame is four times the DOA's because here the frequency
+ *    resolution IS the measurement, where the DOA only integrates a vector over bins.
+ *
+ * x / n / fs / exclude match zylia_intensity_doa. There is no `c`: nothing here depends on the speed
+ * of sound. `exclude` is zylia_check_capsules' flags again, and a flagged capsule is skipped outright.
+ * depth_db_out (optional) = the number above, in dB.
+ * quality_out (optional) = 0..1, the counterpart of zylia_intensity_doa's diffuseness and read the
+ *   other way round: 1 means the capsules AGREE about the depth, which the geometry above says they
+ *   must. It falls with the spread across capsules, which is the only honest use of that axis. Below
+ *   about 0.5 they are not seeing one comb: suspect a capsule fault (run zylia_check_capsules first),
+ *   a band far above the shell's coherence, or a capture that drifted.
+ * Returns 1 on success, 0 on bad arguments, too few samples, a band too narrow, too few healthy
+ * capsules, or a silent capture. */
+#define ZYLIA_COMB_NFFT 8192     /* analysis frame: 5.9 Hz bins at 48 kHz, and the minimum n */
+
+int  zylia_comb_depth(const float* const x[ZYLIA_MICS], uint32_t n, double fs,
+                      double f_lo, double f_hi, const unsigned char* exclude,
+                      float* depth_db_out, float* quality_out);
+
 /* ---- capsule self-survey: MEASURE the array instead of trusting the table ----
  *
  * The built-in table says where the 19 capsules are, but not which ASIO channel each one feeds, nor how

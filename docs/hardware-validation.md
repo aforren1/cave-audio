@@ -12,7 +12,8 @@ What only the rig can prove:
   hardware; everything they feed is unit-tested,
 - **live Motive** (the NatNet parser + lifecycle are tested off-wire; real pose reception and
   the Motive-origin → room-frame agreement are not),
-- the **Zylia channel order + azimuth reference** (both survive every off-hardware check, and
+- the **Zylia [channel order](./glossary.md#channel-order) +
+  [azimuth reference](./glossary.md#azimuth-reference)** (both survive every off-hardware check, and
   both produce a confident *wrong* direction if they are wrong),
 - the **by-ear checks** (HRTF quality, the A/B/X knob bake-off, room EQ on the array).
 
@@ -313,6 +314,21 @@ that table.
       localize the same broadband and on a tone; it is one source with nothing to interfere
       with. If it does not, the analysis chain is at fault and the tone result above is an
       artifact rather than a room measurement.
+- [ ] **Sweep SPCAP focus, and aim it at speakers**: `--focus 2,8,16,32,64` reports comb
+      depth per cell beside the angular miss. Comb depth is the timbral price of a phantom:
+      N speakers radiating coherent copies of one signal comb-filter at the microphone, and
+      focus is the knob that sets N. **Put the targets on the speakers' own positions.** In
+      simulate the curve there runs 7.5 dB down to 1.1 dB across focus 2 to 64 against a
+      0.8 dB floor, monotone the whole way, because a tight enough lobe collapses onto the
+      one real speaker and stops combing. Aimed between speakers it goes flat and
+      non-monotone: the tightest render available there is two near-equal copies, and two
+      equal copies null harder than twenty spread ones do. That is physics rather than a
+      tool limit, so plan the placements around it instead of expecting a curve everywhere.
+- [ ] **Read comb depth as an excess, never as an absolute.** The room, the stimulus's own
+      line structure and the analysis itself all put ripple in a spectrum, and all three are
+      there when one speaker is driven alone. Subtract the physical floor, exactly as you do
+      for the angular miss. Broadband only: a tone gets no comb number by design, because
+      one frequency cannot show a frequency-dependent effect.
 - [ ] **Keep the CSV** (`--out cells.csv`), one per stimulus. It's the before/after record
       for any later layout or calibration change, and re-running is cheap once set up.
 
@@ -329,10 +345,18 @@ The checks with no assertion: bring ears you trust.
       localization scene, headphones. Timbre, externalization, front/back: laterality is
       already pinned by tests; this is everything tests can't hear.
 - [ ] **The knob bake-off**: playground's blind A/B/X harness over the live knobs
-      (dual-band, DBAP vs SPCAP/VBAP, spread render modes, decorrelation, air absorption,
-      max-rE…). N trials, one-sided binomial p-value: a knob that isn't distinguishable on
-      the rig is a knob to retire. (A fixed-seat install and a roaming one need not pick
-      the same winners; judge per install type, not once for all.)
+      (dual-band, DBAP vs SPCAP/VBAP, SPCAP focus, spread render modes, decorrelation, air
+      absorption, max-rE…). N trials, one-sided binomial p-value: a knob that isn't
+      distinguishable on the rig is a knob to retire. (A fixed-seat install and a roaming one
+      need not pick the same winners; judge per install type, not once for all.)
+      **The SPCAP focus trial is the one the instruments cannot settle**, and that is why it
+      is here. The three measurements point different ways over the same move. Going from
+      this array's derived 12.7 up to 40, the layout tool's score (`--score <layout>
+      focus=<n>`) cuts the Frank spread from 35.7° to 19.5°, a visibly tighter image, while
+      rE error gets worse over exactly that move, 6.9° to 8.4° mean. `bwa_validate --focus`
+      measures the third axis, comb depth, which favors the tight end too. Sharper image,
+      worse direction, cleaner timbre: the numbers bracket the answer and your ears pick
+      inside it. Start the trial at the derived default and bracket it both ways.
       **Strong prior for the max-rE trial**: the layout tool's bed metric
       (`--score <layout> [epad] maxre`, 2026-08-04) has max-rE winning every axis on this
       array under both decoders and both observer models, including AT the sweet spot,

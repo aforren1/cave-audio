@@ -9,12 +9,16 @@ sources, and per-frame updates. Declarations in
 rotation/tilt, the renderer and max-rE A/Bs) and [`examples/streaming.c`](../examples/streaming.c)
 walks disk streaming + push sources. All three are console programs built every build.
 
+Terms used here without definition are in [glossary.md](./glossary.md).
+
 ## Feature overview
 
 - Listener-relative spatialization over the speaker array (26 speakers on the
   CAVE; any 4..26 layout works), recomputed per audio block from the tracked head
   position: DBAP for a moving listener (the default), SPCAP/VBAP for a fixed one,
-  an optional dual-band mode, per-source angular spread.
+  an optional dual-band mode, per-source angular spread. SPCAP's lobe width defaults
+  to what the array's own speaker spacing implies and is a live knob
+  (`bwa_set_spcap_focus`) you can dial by ear.
 - Per-speaker gain/delay/correction-EQ output stage driven by a measured layout
   file, with a linked protection limiter as the final stage.
 - Acoustics, **any build**: image-source early reflections (each wall bounce panned
@@ -40,7 +44,8 @@ walks disk streaming + push sources. All three are console programs built every 
   freshest head pose at block time.
 - Diagnostics: per-channel test tone, output-level and listener-pose readbacks,
   offline panner and bed-decode evaluation for layout tools
-  (`bwa_panner_gains_batch`, `bwa_bed_gains_batch`).
+  (`bwa_panner_gains_batch`, which also takes SPCAP's focus and density knobs so a
+  layout can be graded at the tuning it ships with, and `bwa_bed_gains_batch`).
 
 ## Quickstart
 
@@ -1512,6 +1517,8 @@ typedef enum { BWA_PAN_DBAP = 0, BWA_PAN_SPCAP = 1, BWA_PAN_VBAP = 2 } bwa_panne
 typedef enum { BWA_DECODE_ALLRAD = 0, BWA_DECODE_EPAD = 1 } bwa_bed_decoder;   // bwa_desc.bed_decoder
 void     bwa_set_panner(bwa_engine* e, bwa_panner panner);            // load-time or live (atomic switch)
 void     bwa_set_dual_band(bwa_engine* e, bool on);                // live A/B; wraps the selected panner
+void     bwa_set_spcap_focus(bwa_engine* e, float focus, float density);  // SPCAP tuning; <= 0 = default
+float    bwa_spcap_focus_default(const float* positions, uint32_t n);     // pure: what the geometry implies
 uint32_t bwa_get_speakers(bwa_engine* e, float* xyz, uint32_t cap); // read back the layout; NULL xyz = count only
 ```
 
@@ -1527,6 +1534,36 @@ uint32_t bwa_get_speakers(bwa_engine* e, float* xyz, uint32_t cap); // read back
 
 The switch is atomic, so flipping it live is safe; the layout tool's `B` key A/Bs panners
 exactly this way.
+
+`bwa_set_spcap_focus` is SPCAP's own tuning, and it does nothing under the other two panners.
+`focus` is the lobe sharpness in `((1+cos)/2)^focus`: raise it to concentrate a source on fewer
+speakers (tighter image, harder edges), lower it to spread the source out (smoother, blurrier).
+`density` is the exponent of the placement-correction kernel that de-biases a clustered array,
+and 2.0 is right almost always. Pass 0 or less for either argument to revert that one to its
+default.
+
+The focus default is **derived from your array**, not a constant. The engine measures the mean
+angle from each speaker to its nearest neighbor and picks the exponent that puts the lobe 6 dB
+down in energy at that angle, so a sparse array gets a broad lobe and a dense one a tight lobe.
+The 26-speaker cube grid lands near 12.7. `bwa_spcap_focus_default` computes the same number for
+an arbitrary set of speaker positions (3 floats each, the `bwa_panner_gains_batch` convention)
+without an engine, so a tool can show what a layout implies before you override it.
+
+`bwa_panner_gains_batch` takes the same two knobs, with the same sentinel, so you can score a
+layout at the tuning you will ship rather than only at the derived default. See "Offline panner
+and bed evaluation" below.
+
+Both knobs are live and per-frame-safe, and the change reaches **every** source on the next block,
+including sources that never move. Neither value lives in the layout file: like the rest of the
+live A/B surface (`bwa_set_near_spread`, `bwa_set_dual_band`, `bwa_set_max_re`), persisting a
+dialed value is your application's business. Dial by ear with the playground or the layout tool's
+preview, then set it at startup.
+
+You do not have to settle it by ear alone. What focus trades is the number of speakers carrying a
+source, and coherent copies from many speakers comb. `bwa_validate --focus 4,32` sweeps the knob in
+one measurement session and reports the comb depth each setting costs, against one speaker driven
+alone as the floor. See `docs/validation.md` → "Sweeping SPCAP focus", including where that sweep has
+power and where it does not.
 
 `bwa_set_dual_band` (off by default, live-toggleable) **wraps** the selected panner. It splits
 each source at ~700 Hz, then pans the low band with **amplitude** (pressure / velocity-vector)
@@ -1579,6 +1616,43 @@ The old sharp edge here is now fenced: a **failed** explicit layout load still l
 on the 26-grid default (reason in `bwa_last_error`, readable after `bwa_create`), but
 `bwa_start` refuses it with `BWA_ERR_LAYOUT`, so a 24-speaker deployment can no longer silently
 render 26 channels. Only `layout_path = NULL` runs the default grid.
+
+### Offline panner and bed evaluation
+
+```c
+uint32_t bwa_panner_gains_batch(bwa_panner panner, const float* positions, uint32_t n,
+                                const float lis[3], const float* srcs, uint32_t nsrc,
+                                float focus, float density, float* out);
+uint32_t bwa_bed_gains_batch(bwa_bed_decoder decoder, bool max_re,
+                             const float* positions, uint32_t n,
+                             const float* dirs, uint32_t ndir, float* out);
+```
+
+Both take no engine handle. They run the engine's own solves over a **candidate** layout you pass
+in, so a layout tool scores what will ship instead of a re-implementation. Both are pure and
+reentrant: the per-listener cache is per-call stack state, so any thread can call them, including
+while an engine renders.
+
+`bwa_panner_gains_batch` writes `out[i*n + s]`, `nsrc*n` floats, and returns `nsrc`. It uses the
+default DBAP and distance tuning, and shares the SPCAP/VBAP per-listener cache across the batch,
+which is what makes a grid sweep cheap.
+
+`focus` and `density` are SPCAP's two knobs, the same pair `bwa_set_spcap_focus` sets live and
+under the same rule: pass 0 or less for either one to get the default for **this** array, meaning
+the geometry-derived focus (what `bwa_spcap_focus_default` returns for `positions`) and density
+2.0. Both are inert under `BWA_PAN_DBAP` and `BWA_PAN_VBAP`, which have no lobe to sharpen, so any
+value scores the same there. Score at the tuning you will ship: a layout graded at the derived
+focus tells you nothing about how it behaves once you dial the knob.
+
+`bwa_bed_gains_batch` is the diffuse-bed counterpart. It takes plane-wave **directions** rather
+than positions, because a bed is content at infinity, builds the same AllRAD or EPAD decode the
+engine builds for this layout, applies max-rE weighting when you ask for it, and writes `ndir*n`
+gains. Those gains can be negative (SH sidelobes). A layout that scores well here is a good
+quadrature for the sphere, which is what ambisonic content wants from an array and what the
+point-source panners cannot see.
+
+`bwa_layout_tool` drives both: the Score board, the rE coverage overlay, the badness map, and the
+optimizer cost all go through them. See [`layout-schema.md`](./layout-schema.md).
 
 ## Tracked room EQ (control thread; live)
 

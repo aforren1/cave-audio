@@ -79,12 +79,15 @@ src/
   measure.c/calib.c    bwa_calibrate DSP: sweep+deconvolution, trims, trilateration, room report. [calib]
   zylia.h / zylia.c    Zylia ZM-1: single-position speaker localization (TDOA + GN position) AND the
                        validation-grade estimators — active-intensity DOA, capsule integrity,
-                       SRP-PHAT cross-check. [calib]
+                       SRP-PHAT cross-check, comb depth (spectral ripple: what coherent multi-speaker
+                       copies cost in timbre, the measurable side of SPCAP focus). [calib]
   valid.h / valid.c    phantom-localization validation: render a source, measure where the array
                        actually put it (feeds/simulate/score + medians, bootstrap, matched-cell
                        contrasts). Also the PHYSICAL REFERENCE arm (drive one speaker alone = a real
-                       source, so a phantom miss reads against a floor) and stimulus selection
-                       (broadband or a tone, analysis band follows). Drives bwa_validate. [validation]
+                       source, so a phantom miss reads against a floor -- also the comb-depth floor)
+                       and stimulus selection (broadband or a tone, analysis band follows). The SPCAP
+                       focus/density knobs thread through every solve here, so bwa_validate --focus
+                       sweeps them. Drives bwa_validate. [validation]
   dbap.h / dbap.c      listener-relative, constant-power DBAP gain solve. [M4]
   fdn.h / fdn.c        directional FDN reverb bed (phonon-free; takes the reflection bus tap). [innovations]
   ism.h / ism.c        image-source EARLY reflections: shoebox mirrors, panned as point sources. [innovations]
@@ -139,8 +142,10 @@ ctest --test-dir build -C RelWithDebInfo      # runs the full test suite (test_*
 ```
 
 **Current state (M6 + occlusion).** The engine builds `bw_audio.dll` and the full ctest
-suite — 19 tests with the Steam Audio SDK, 15 without — plus the three GUI-tool suites
-(`calib_view`, `layout_tool`, `playground`) under their build flags. `rt.c` is the concurrency
+suite — 31 tests with the Steam Audio SDK, 26 without (the 5 SDK-gated ones are `reflect`,
+`bake`, `path`, `dynmesh`, `steam_decode`) — a count that INCLUDES the three GUI-tool suites
+(`calib_view`, `layout_tool`, `playground`) and the three `validate_*` runs, all under their
+build flags. `rt.c` is the concurrency
 spine (two SPSC rings, voice + sound tables, commit snapshot, generation handles, retire-ack)
 and the whole `bwa_*` API forwards to it. Spatialization (the DBAP/SPCAP/VBAP gain solve,
 layout load, per-speaker align), calibration (`bwa_calibrate`, the Zylia capsule survey),
@@ -178,6 +183,19 @@ Regression-preventing gotchas. Each has bitten before or guards a real invariant
   inverted polarity (the default HRTF's per-ear DC gains oppose its audible ILD), mis-diagnosed a
   correct encode, and shipped a left/right mirror that only a by-ear report caught. Drive tones,
   never DC. See NOTES.md.
+- **`powf(base, exp)` with a negative base and a NON-INTEGER exponent is NaN**, and one NaN
+  poisons a whole normalized gain vector. `spcap.c`'s lobe `0.5 + 0.5*cos` rounds to ~-5e-8 for an
+  antipodal speaker, which was harmless for as long as the focus exponent was the integer 12 and
+  silenced *every* default-grid SPCAP solve the moment focus became geometry-derived (12.70). The
+  lobe is clamped at 0 now. Any exponent that stops being a literal integer re-opens this class:
+  clamp the base, do not trust the caller's range.
+- **Publish-then-flag needs the reader to acquire the flag FIRST.** `rt_set_spcap_focus` stores
+  focus/density and then release-bumps `RtCore.pan_gen`; `rt_render` must acquire `pan_gen` *before*
+  loading the knobs. Read in the other order it is not a memory-model subtlety but a plain
+  program-order interleaving (it bites on x86): a block pairs the NEW generation with the OLD value,
+  stamps every voice current, and swallows the change until the next bump, so the last set of a
+  slider drag silently never takes. Same rule for any future live knob that uses a generation
+  counter, and note this is untestable single-threaded, so the ordering comment is the guard.
 - **`/experimental:c11atomics`** is required on MSVC for the `stdatomic.h` in `rt.c`/`stream.c`
   (and `steam_reflect.c` with the SDK) — wired per-file in CMake. `pose.h` uses Interlocked
   intrinsics instead, so `natnet.c` and its tests need no flag.
@@ -282,7 +300,12 @@ freely. It still follows the US English rule above.
 - `docs/layout-schema.md` — `cave_layout.json` format: speaker geometry, per-speaker gain/delay, DBAP knobs.
 - `docs/calibration.md` — `bwa_calibrate`: acoustic position survey, delay/gain trims, room report → `cave_layout.json`.
 - `docs/validation.md` — `bwa_validate`: render a phantom, measure where it landed. The Zylia
-  intensity/integrity/SRP estimators, the solve-position-versus-mic-position seam, simulate versus
-  hardware, and what the measurements have said so far.
+  intensity/integrity/SRP/comb-depth estimators, the solve-position-versus-mic-position seam, the
+  SPCAP focus sweep (and where it has power), simulate versus hardware, and what the measurements
+  have said so far.
 - `docs/hardware-validation.md` — the rig-day runbook: staged on-hardware checks (device → wiring → calibration → Motive → end-to-end → by-ear) with pass criteria.
 - `docs/internal-types.md` — internal structs (`Voice`/`Sound`/`Layout`/`Listener`) + helper signatures. **Not ABI.**
+- `docs/glossary.md` — the domain vocabulary across all of the above (panners + knobs, rE/rV metrics,
+  ambisonic decoders, spread/decorrelation, acoustics paths, binaural, calibration + validation
+  coinages), each entry short, formula-cited to `file:line`, and linked to the doc that owns it.
+  Threading vocabulary is deliberately excluded (concurrency.md owns it).

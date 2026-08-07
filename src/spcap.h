@@ -16,6 +16,7 @@ typedef struct {
     float    sdir[BWA_CHANNELS][3];    /* unit speaker directions from the cached listener */
     float    cached_lis[3];           /* listener the cache was built for */
     uint32_t cached_gen;              /* layout generation the cache was built for */
+    float    cached_density;          /* density exponent c[] was built with (a live change rebuilds it) */
     int      valid;
 } SpcapState;
 
@@ -28,8 +29,13 @@ void spcap_reset(SpcapState* s);
  * distance attenuation as DBAP. `gen` is the caller's layout generation — the cached placement
  * correction is rebuilt when it changes (or the listener moves). Writes L->count gains into out[]
  * (caller provides >= BWA_CHANNELS). SPCAP assumes a FIXED observer; with a moving (tracked) listener
- * the correction rebuilds every block — use DBAP for a moving observer. */
+ * the correction rebuilds every block — use DBAP for a moving observer.
+ *
+ * `focus` (lobe sharpness) and `density` (placement-correction kernel exponent) are the two tuning
+ * knobs, both dimensionless. Callers pass the layout's values (Layout.spcap_focus /
+ * .spcap_density) or the engine's live override (bwa_set_spcap_focus). focus is a pure per-solve
+ * term; density feeds the CACHED correction, so changing it forces a rebuild. */
 void spcap_gains(SpcapState* s, const float src[3], const float lis[3], const Layout* L,
-                 uint32_t gen, float user_gain, float* out);
+                 uint32_t gen, float focus, float density, float user_gain, float* out);
 
 #endif /* BWA_SPCAP_H */

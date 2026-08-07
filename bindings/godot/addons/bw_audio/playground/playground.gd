@@ -250,6 +250,8 @@ func switch_scene(idx: int) -> void:
 	source.spread = 0.0
 	engine.dual_band = false
 	engine.panner = BwaEngine.PAN_DBAP        # the A/B/X scene may have left SPCAP or VBAP on
+	engine.spcap_focus = 0.0                  # ...and the localization scene a dialed SPCAP lobe
+	engine.spcap_density = 0.0
 	engine.spread_mode = BwaEngine.SPREAD_LOBE
 	engine.decorrelation = false
 	bed.stop()

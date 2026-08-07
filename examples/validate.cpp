@@ -49,10 +49,26 @@ extern "C" {
  * reference arm. The per-placement scratch arrays below are sized off this, so it has to cover both. */
 #define MAX_TGT   (36 * 3 + BWA_CHANNELS)
 #define NPAN      3
+#define MAX_FOCUS 6
 #define LBL       32
 
 static const char* pan_name(int p) {
     return p == BWA_PAN_DBAP ? "DBAP" : (p == BWA_PAN_SPCAP ? "SPCAP" : "VBAP");
+}
+
+/* One measured CONDITION: a panner at one SPCAP focus. Focus is inert under DBAP and VBAP, so those
+ * two get exactly one condition however long the --focus list is — sweeping them would re-measure an
+ * identical cell and cost rig time for nothing. The focus stored here is already RESOLVED (the <= 0
+ * sentinel is applied in main), so it compares bit-exactly against the value valid_score writes into
+ * each cell, which is how the reports below sort cells back into conditions. */
+typedef struct { int panner; float focus; } Cond;
+
+/* "SPCAP f 12.70" / "DBAP         ". The focus column is BLANK where focus has no meaning, because a
+ * number printed beside DBAP would read as a setting that did something. */
+static const char* cond_label(const Cond* c, char* buf, int cap) {
+    if (c->panner == BWA_PAN_SPCAP) snprintf(buf, (size_t)cap, "%-5s f%6.2f", pan_name(c->panner), c->focus);
+    else                            snprintf(buf, (size_t)cap, "%-5s        ", pan_name(c->panner));
+    return buf;
 }
 
 /* ---- capture backends behind one shape ------------------------------------------------------ */
@@ -62,9 +78,10 @@ typedef struct {
     float*        feeds;        /* scratch for the hardware path: [nspk][VAL_CAPLEN] */
     int           inject;       /* capsule to corrupt, or -1 — a self-check, see --inject-fault */
     unsigned int  rng;
+    float         density;      /* SPCAP placement-correction exponent, one value for the whole run */
 } CapCtx;
 
-typedef int (*CaptureFn)(CapCtx*, int panner, const float solve[3], const float mic[3],
+typedef int (*CaptureFn)(CapCtx*, int panner, float focus, const float solve[3], const float mic[3],
                          const float src[3], float* cap19);
 
 /* Corrupt one capsule the way a real fault does: broadband self-noise, well above the array's own
@@ -85,18 +102,20 @@ static void inject_fault(CapCtx* ctx, float* cap19, int ch) {
     }
 }
 
-static int cap_simulate(CapCtx* ctx, int panner, const float solve[3], const float mic[3],
+static int cap_simulate(CapCtx* ctx, int panner, float focus, const float solve[3], const float mic[3],
                         const float src[3], float* cap19) {
-    if (!valid_simulate(ctx->L, panner, solve, mic, src, VAL_FS, 343.0, cap19, VAL_ANALYZE)) return 0;
+    if (!valid_simulate(ctx->L, panner, solve, mic, src, VAL_FS, 343.0, focus, ctx->density,
+                        cap19, VAL_ANALYZE)) return 0;
     if (ctx->inject >= 0) inject_fault(ctx, cap19, ctx->inject);
     return 1;
 }
 
 #ifdef BWA_HAVE_ASIO
-static int cap_asio(CapCtx* ctx, int panner, const float solve[3], const float mic[3],
+static int cap_asio(CapCtx* ctx, int panner, float focus, const float solve[3], const float mic[3],
                     const float src[3], float* cap19) {
     (void)mic;                                            /* the room decides what the mic hears */
-    if (!valid_speaker_feeds(ctx->L, panner, solve, src, VAL_FS, ctx->feeds, VAL_CAPLEN)) return 0;
+    if (!valid_speaker_feeds(ctx->L, panner, solve, src, VAL_FS, focus, ctx->density,
+                             ctx->feeds, VAL_CAPLEN)) return 0;
     if (!valid_asio_capture(ctx->feeds, cap19)) return 0;
     if (ctx->inject >= 0) inject_fault(ctx, cap19, ctx->inject);
     return 1;
@@ -245,7 +264,7 @@ static int track_place(void* user, int li, float mic_out[3]) {
  * the caller's accounting has to come from what actually happened rather than from nlis: `nchecked`
  * counts placements that were measured, `nflagged` those where the injected capsule was caught. */
 static int run_session(const Layout* L, CaptureFn cap, CapCtx* ctx,
-                       const int* panners, int npan,
+                       const Cond* cond, int ncond,
                        float (*lis)[3], char (*lisname)[LBL], int nlis,
                        float (*tg)[3], int ntgt, int ngrid, float radius, int do_ref,
                        int prompt, int (*place)(void*, int, float[3]), void* place_user,
@@ -292,13 +311,21 @@ static int run_session(const Layout* L, CaptureFn cap, CapCtx* ctx,
             }
             double rm[BWA_CHANNELS]; int nr = 0;
             for (int i = 0; i < w; ++i)
-                if (cells[i].lis == li && cells[i].reference && cells[i].ok) rm[nr++] = cells[i].miss_deg;
+                if (cells[i].lis == li && cells[i].reference == 1 && cells[i].ok) rm[nr++] = cells[i].miss_deg;
             if (nr) {
                 double med = valid_median(rm, nr), wmax = 0.0;
                 for (int i = 0; i < nr; ++i) if (rm[i] > wmax) wmax = rm[i];
                 printf("  physical reference: median %.2f deg, worst %.2f deg over %d speakers%s\n",
                        med, wmax, nr, (med > 5.0) ? "   <-- SUSPECT, check layout/survey" : "");
             }
+            /* The comb FLOOR. One speaker alone radiates one coherent copy, so whatever ripple this
+             * shows is the stimulus's line structure, the analysis, and the room — never interference.
+             * Every phantom comb depth below is only meaningful as an excess over it. */
+            double rc[BWA_CHANNELS]; int nrc = 0;
+            for (int i = 0; i < w; ++i)
+                if (cells[i].lis == li && cells[i].reference == 1 && cells[i].comb_ok) rc[nrc++] = cells[i].comb_db;
+            if (nrc) printf("  comb floor: %.2f dB over %d speakers driven alone (no interference to comb)\n",
+                            valid_median(rc, nrc), nrc);
         }
 
         /* The MATCHED phantom for each reference: a rendered source at that speaker's own position.
@@ -306,7 +333,7 @@ static int run_session(const Layout* L, CaptureFn cap, CapCtx* ctx,
          * degenerate — a distance-blurred panner still spreads a source that sits on a speaker, and
          * how much it spreads is exactly the rendering cost being asked about. */
         if (do_ref)
-            for (int p = 0; p < npan; ++p)
+            for (int ci = 0; ci < ncond; ++ci)
                 for (int tracked = 1; tracked >= 0; --tracked)
                     for (uint32_t sp = 0; sp < L->count; ++sp) {
                         const float* q = L->speakers[sp].pos;
@@ -314,15 +341,20 @@ static int run_session(const Layout* L, CaptureFn cap, CapCtx* ctx,
                         const float* solve = tracked ? lis[li] : L->ref;
                         ValidCell* c = &cells[w];
                         int got = 0;
-                        if (cap(ctx, panners[p], solve, lis[li], src, cap19))
-                            got = valid_score(L, panners[p], tracked, lis[li], src,
-                                              cap19, VAL_ANALYZE, VAL_FS, 343.0, flags, c);
-                        if (!got) { memset(c, 0, sizeof *c); c->panner = panners[p]; c->tracked = tracked; }
+                        if (cap(ctx, cond[ci].panner, cond[ci].focus, solve, lis[li], src, cap19))
+                            got = valid_score(L, cond[ci].panner, tracked, lis[li], src,
+                                              cap19, VAL_ANALYZE, VAL_FS, 343.0,
+                                              cond[ci].focus, ctx->density, flags, c);
+                        if (!got) {
+                            memset(c, 0, sizeof *c);
+                            c->panner = cond[ci].panner; c->tracked = tracked;
+                            c->focus = cond[ci].focus;   c->density = ctx->density;
+                        }
                         c->lis = li; c->tgt = (int)sp; c->reference = 2;
                         ++w;
                     }
 
-        for (int p = 0; p < npan; ++p)
+        for (int ci = 0; ci < ncond; ++ci)
             for (int tracked = 1; tracked >= 0; --tracked)
                 for (int t = 0; t < ntgt; ++t) {
                     (void)ngrid;
@@ -333,7 +365,7 @@ static int run_session(const Layout* L, CaptureFn cap, CapCtx* ctx,
                     ValidCell* c = &cells[w];
                     int got = 0;
 
-                    if (cap(ctx, panners[p], solve, lis[li], src, cap19)) {
+                    if (cap(ctx, cond[ci].panner, cond[ci].focus, solve, lis[li], src, cap19)) {
                         /* ONE capsule check per placement, on its first capture: a fault is a
                          * property of the session, and re-checking every cell would only cost time.
                          * Anything flagged is excluded from every cell that follows. */
@@ -351,26 +383,40 @@ static int run_session(const Layout* L, CaptureFn cap, CapCtx* ctx,
                             if (nchecked) ++(*nchecked);
                             checked = 1;
                         }
-                        got = valid_score(L, panners[p], tracked, lis[li], src,
-                                          cap19, VAL_ANALYZE, VAL_FS, 343.0, flags, c);
+                        got = valid_score(L, cond[ci].panner, tracked, lis[li], src,
+                                          cap19, VAL_ANALYZE, VAL_FS, 343.0,
+                                          cond[ci].focus, ctx->density, flags, c);
                     }
-                    if (!got) { memset(c, 0, sizeof *c); c->panner = panners[p]; c->tracked = tracked; }
+                    if (!got) {
+                        memset(c, 0, sizeof *c);
+                        c->panner = cond[ci].panner; c->tracked = tracked;
+                        c->focus = cond[ci].focus;   c->density = ctx->density;
+                    }
                     c->lis = li; c->tgt = t;
                     ++w;
                 }
 
-        /* per-placement summary, so a bad placement is visible before you move the mic again */
-        for (int p = 0; p < npan; ++p) {
-            static double mt[MAX_TGT], mf[MAX_TGT];
-            int nt = 0, nf = 0;
+        /* per-placement summary, so a bad placement is visible before you move the mic again.
+         * Comb depth sits beside the angular miss because they are different failures: a render can
+         * aim perfectly and still comb the timbre to pieces, and only one of the two is audible as a
+         * direction error. */
+        for (int ci = 0; ci < ncond; ++ci) {
+            static double mt[MAX_TGT], mf[MAX_TGT], ct[MAX_TGT], cf[MAX_TGT];
+            int nt = 0, nf = 0, nct = 0, ncf = 0;
             for (int i = 0; i < w; ++i) {
                 ValidCell* c = &cells[i];
-                if (c->lis != li || c->panner != panners[p] || !c->ok) continue;
-                if (c->tracked) mt[nt++] = c->miss_deg; else mf[nf++] = c->miss_deg;
+                if (c->lis != li || c->reference || c->panner != cond[ci].panner ||
+                    c->focus != cond[ci].focus) continue;
+                if (c->ok)      { if (c->tracked) mt[nt++]  = c->miss_deg; else mf[nf++]  = c->miss_deg; }
+                if (c->comb_ok) { if (c->tracked) ct[nct++] = c->comb_db;  else cf[ncf++] = c->comb_db; }
             }
-            if (nt && nf)
-                printf("  %-5s  tracked %5.1f deg   fixed %5.1f deg   (n=%d/%d)\n",
-                       pan_name(panners[p]), valid_median(mt, nt), valid_median(mf, nf), nt, nf);
+            if (!nt || !nf) continue;
+            char cl[32];
+            printf("  %-13s  miss tracked %5.1f  fixed %5.1f deg", cond_label(&cond[ci], cl, sizeof cl),
+                   valid_median(mt, nt), valid_median(mf, nf));
+            if (nct && ncf)
+                printf("   comb tracked %5.2f  fixed %5.2f dB", valid_median(ct, nct), valid_median(cf, ncf));
+            printf("   (n=%d/%d)\n", nt, nf);
         }
     }
     free(cap19);
@@ -390,6 +436,9 @@ int main(int argc, char** argv) {
     int track_sim = 0;               /* synthetic mount pose: exercises the tracked path, no rig */
     int do_ref = 1;                  /* physical reference arm: each speaker driven alone */
     float radius = 1.4f;
+    float focus_req[MAX_FOCUS] = { 0.f };   /* 0 = the array's derived default, resolved below */
+    int   nfocus = 1;
+    float density = 0.f;             /* 0 = the layout's own */
     static float lis[MAX_LIS][3];
     static char  lisname[MAX_LIS][LBL];
     int nlis_cli = 0;
@@ -411,6 +460,26 @@ int main(int argc, char** argv) {
         else if (!strcmp(argv[i], "--natnet-multicast") && i+1 < argc) nn_multicast = argv[++i];
         else if (!strcmp(argv[i], "--track-sim"))                   track_sim = 1;
         else if (!strcmp(argv[i], "--no-reference"))                do_ref = 0;
+        else if (!strcmp(argv[i], "--density")   && i+1 < argc)     density = (float)atof(argv[++i]);
+        else if (!strcmp(argv[i], "--focus")     && i+1 < argc) {
+            /* one value, or a comma-separated sweep. Each value is a separate measured condition for
+             * SPCAP and is ignored by the other two panners (focus has no meaning there). */
+            const char* s = argv[++i];
+            nfocus = 0;
+            while (*s && nfocus < MAX_FOCUS) {
+                char* endp = NULL;
+                double v = strtod(s, &endp);
+                if (endp == s) { fprintf(stderr, "--focus wants a number or a comma-separated list\n"); return 2; }
+                if (!(v > 0.0)) { fprintf(stderr, "--focus values must be > 0 (0 is the sentinel for "
+                                                  "the array's derived default, which is what you get "
+                                                  "by leaving --focus off)\n"); return 2; }
+                focus_req[nfocus++] = (float)v;
+                s = endp;
+                while (*s == ',' || *s == ' ') ++s;
+            }
+            if (!nfocus) { fprintf(stderr, "--focus wants at least one value\n"); return 2; }
+            if (*s) { fprintf(stderr, "--focus takes at most %d values\n", MAX_FOCUS); return 2; }
+        }
         else if (!strcmp(argv[i], "--tone") && i+1 < argc) {
             double hz = atof(argv[++i]);
             if (!valid_set_stimulus(VALID_STIM_TONE, hz)) {
@@ -438,6 +507,16 @@ int main(int argc, char** argv) {
                    "  --positions <file>    placements from a file: 'x y z [label]' per line, # comments\n"
                    "  --azimuths <n>        azimuths per elevation row (default 12)\n"
                    "  --radius <m>          source distance from the sweet spot (default 1.4)\n"
+                   "  --focus <v[,v,...]>   SPCAP lobe sharpness. A list SWEEPS it: each value is a\n"
+                   "                        separate condition measured in the same session, at the\n"
+                   "                        same placements and directions, so the focus contrasts are\n"
+                   "                        matched-cell. Focus trades image tightness against COMB\n"
+                   "                        DEPTH (fewer speakers interfere less), which is the number\n"
+                   "                        this reports and the ear cannot put a figure on. Inert\n"
+                   "                        under DBAP/VBAP, so those are measured once. Default: the\n"
+                   "                        array's geometry-derived value.\n"
+                   "  --density <v>          SPCAP placement-correction exponent (default: the\n"
+                   "                        layout's, 2.0). One value for the whole run.\n"
                    "  --out <file.csv>      write every cell\n"
                    "  --no-prompt           don't wait for ENTER between placements (unattended runs)\n"
                    "  --track <id|name>     follow the ZM-1's stand as a tracked rigid body: the pose\n"
@@ -510,6 +589,27 @@ int main(int argc, char** argv) {
            user_pos ? "(yours)" : "(defaults — pass --position/--positions for the real ones)");
 
     const int panners[NPAN] = { BWA_PAN_DBAP, BWA_PAN_SPCAP, BWA_PAN_VBAP };
+
+    /* Resolve the <= 0 focus sentinel HERE, once, against the layout the run actually loaded. From
+     * this point every condition carries a real number, which is what lets a cell be matched back to
+     * its condition by plain equality against the value valid_score recorded. */
+    static Cond cond[NPAN * MAX_FOCUS];
+    int ncond = 0;
+    for (int fi = 0; fi < nfocus; ++fi)
+        if (!(focus_req[fi] > 0.f)) focus_req[fi] = L.spcap_focus;
+    for (int p = 0; p < NPAN; ++p) {
+        int nf = (panners[p] == BWA_PAN_SPCAP) ? nfocus : 1;
+        for (int fi = 0; fi < nf; ++fi) {
+            cond[ncond].panner = panners[p];
+            cond[ncond].focus  = focus_req[fi];
+            ++ncond;
+        }
+    }
+    printf("SPCAP tuning: focus");
+    for (int fi = 0; fi < nfocus; ++fi) printf(" %.2f", focus_req[fi]);
+    printf("%s   density %.2f\n", nfocus > 1 ? "  (swept)" : "",
+           density > 0.f ? density : L.spcap_density);
+
     /* NOT a matched-cell design, deliberately. Rendering a phantom at a speaker's own position is
      * degenerate — the panner puts essentially all the gain on that one speaker, so the "phantom"
      * IS the speaker and the difference measures nothing (tried it: ~0.02 deg). A true matched
@@ -518,10 +618,10 @@ int main(int argc, char** argv) {
      * instead is the FLOOR: what the instrument, the layout survey and the room cost before any
      * panning happens. Phantom misses are then quoted above that floor rather than as absolutes. */
     const int ngrid = ntgt;
-    const int ncell = NPAN * 2 * nlis * ntgt
-                    + (do_ref ? nlis * (int)L.count * (1 + NPAN * 2) : 0);
-    printf("plan: %d directions x %d panners x 2 modes x %d placements%s = %d cells\n",
-           ntgt, NPAN, nlis,
+    const int ncell = ncond * 2 * nlis * ntgt
+                    + (do_ref ? nlis * (int)L.count * (1 + ncond * 2) : 0);
+    printf("plan: %d directions x %d conditions x 2 modes x %d placements%s = %d cells\n",
+           ntgt, ncond, nlis,
            do_ref ? ", plus one physical reference per speaker" : "", ncell);
     if (inject >= 0) printf("SELF-CHECK: capsule %d will be corrupted in every capture\n", inject);
 
@@ -589,7 +689,7 @@ int main(int argc, char** argv) {
 
     CapCtx ctx;
     memset(&ctx, 0, sizeof ctx);
-    ctx.L = &L; ctx.inject = inject; ctx.rng = 0xC0FFEEu;
+    ctx.L = &L; ctx.inject = inject; ctx.rng = 0xC0FFEEu; ctx.density = density;
     CaptureFn cap = &cap_simulate;
     int prompt = 0;
 
@@ -619,7 +719,7 @@ int main(int argc, char** argv) {
     if (!cells) { fprintf(stderr, "out of memory\n"); return 1; }
 
     int nflagged = 0, nchecked = 0, nplaced = 0;
-    int w = run_session(&L, cap, &ctx, panners, NPAN, lis, lisname, nlis,
+    int w = run_session(&L, cap, &ctx, cond, ncond, lis, lisname, nlis,
                         tg, ntgt, ngrid, radius, do_ref, prompt, place_fn, place_user,
                         cells, &nchecked, &nflagged, &nplaced);
 
@@ -631,7 +731,7 @@ int main(int argc, char** argv) {
 
     /* ---- matched-cell contrasts, the claim worth making ---- */
     printf("\nmatched-cell contrast (fixed - tracked), median of paired differences\n");
-    for (int p = 0; p < NPAN; ++p)
+    for (int ci = 0; ci < ncond; ++ci)
         for (int li = 0; li < nlis; ++li) {
             static double a[MAX_TGT], b[MAX_TGT];
             int n = 0;
@@ -639,7 +739,8 @@ int main(int argc, char** argv) {
                 ValidCell *ct = NULL, *cf = NULL;
                 for (int i = 0; i < w; ++i) {
                     ValidCell* c = &cells[i];
-                    if (c->lis != li || c->tgt != t || c->panner != panners[p]) continue;
+                    if (c->lis != li || c->tgt != t || c->reference) continue;
+                    if (c->panner != cond[ci].panner || c->focus != cond[ci].focus) continue;
                     if (c->tracked) ct = c; else cf = c;
                 }
                 if (ct && cf && ct->ok && cf->ok) { a[n] = ct->miss_deg; b[n] = cf->miss_deg; ++n; }
@@ -647,11 +748,55 @@ int main(int argc, char** argv) {
             if (n < 8) continue;
             double md, lo, hi;
             if (!valid_contrast(a, b, n, 2000, 777u, &md, &lo, &hi)) continue;
-            printf("  %-5s  %-16s %+6.1f  CI [%+.1f, %+.1f]%s\n",
-                   pan_name(panners[p]), lisname[li], md, lo, hi,
+            char cl[32];
+            printf("  %-13s  %-16s %+6.1f  CI [%+.1f, %+.1f]%s\n",
+                   cond_label(&cond[ci], cl, sizeof cl), lisname[li], md, lo, hi,
                    (lo > 0.0 || hi < 0.0) ? "  *" : "");
         }
     printf("  (* = interval excludes zero)\n");
+
+    /* ---- the focus sweep: what tightening SPCAP's lobe costs in comb depth ----
+     *
+     * Focus is dialed by ear today, and the ear cannot put a figure on the thing focus actually
+     * trades. Fewer speakers carrying a source means fewer coherent copies interfering, so a tighter
+     * lobe combs less; a looser one buys a smoother, better-covered image and pays in ripple. Both
+     * columns are matched-cell against the FIRST focus in the list: same placement, same direction,
+     * same capture chain, so the paired difference is the claim and its interval is the evidence.
+     * The comb column is the one that discriminates. Read it against the placement's comb floor
+     * printed above, not as an absolute. */
+    if (nfocus > 1) {
+        printf("\nSPCAP focus sweep, matched-cell against focus %.2f (tracked solve)\n", focus_req[0]);
+        printf("  %-16s %8s %10s %10s %10s %10s\n",
+               "placement", "focus", "miss deg", "d miss", "comb dB", "d comb");
+        for (int li = 0; li < nlis; ++li)
+            for (int fi = 0; fi < nfocus; ++fi) {
+                static double m0[MAX_TGT], m1[MAX_TGT], c0[MAX_TGT], c1[MAX_TGT];
+                int nm = 0, nc = 0;
+                for (int t = 0; t < ntgt; ++t) {
+                    ValidCell *ca = NULL, *cb = NULL;
+                    for (int i = 0; i < w; ++i) {
+                        ValidCell* c = &cells[i];
+                        if (c->lis != li || c->tgt != t || c->reference || !c->tracked) continue;
+                        if (c->panner != BWA_PAN_SPCAP) continue;
+                        if (c->focus == focus_req[0])  ca = c;
+                        if (c->focus == focus_req[fi]) cb = c;
+                    }
+                    if (!ca || !cb) continue;
+                    if (ca->ok && cb->ok)           { m0[nm] = ca->miss_deg; m1[nm] = cb->miss_deg; ++nm; }
+                    if (ca->comb_ok && cb->comb_ok) { c0[nc] = ca->comb_db;  c1[nc] = cb->comb_db;  ++nc; }
+                }
+                if (nm < 8) continue;
+                double dm = 0, dmlo = 0, dmhi = 0, dc = 0, dclo = 0, dchi = 0;
+                valid_contrast(m0, m1, nm, 2000, 909u, &dm, &dmlo, &dmhi);
+                printf("  %-16s %8.2f %10.1f %+7.1f%-3s", lisname[li], focus_req[fi],
+                       valid_median(m1, nm), dm, (dmlo > 0.0 || dmhi < 0.0) ? " *" : "");
+                if (nc >= 8 && valid_contrast(c0, c1, nc, 2000, 909u, &dc, &dclo, &dchi))
+                    printf(" %10.2f %+7.2f%-3s", valid_median(c1, nc), dc,
+                           (dclo > 0.0 || dchi < 0.0) ? " *" : "");
+                printf("\n");
+            }
+        printf("  (* = bootstrap interval on the paired difference excludes zero)\n");
+    }
 
     /* ---- the physical floor, and what panning costs above it ----
      * Driving one speaker alone is a real source at a known position, measured through the same
@@ -660,8 +805,11 @@ int main(int argc, char** argv) {
     if (do_ref) {
         static double rr[MAX_TGT * 8];
         int nr = 0;
+        /* reference == 1 ONLY. `reference` is also 2 for the MATCHED PHANTOM at a speaker's position,
+         * so a truthiness test here would pool phantoms into the physical floor and inflate it by
+         * whatever panning costs — which is the one thing the floor exists to be free of. */
         for (int i = 0; i < w && nr < (int)(sizeof rr / sizeof rr[0]); ++i)
-            if (cells[i].reference && cells[i].ok) rr[nr++] = cells[i].miss_deg;
+            if (cells[i].reference == 1 && cells[i].ok) rr[nr++] = cells[i].miss_deg;
         if (nr >= 4) {
             double floor_med, lo, hi;
             floor_med = valid_median(rr, nr);
@@ -681,35 +829,48 @@ int main(int argc, char** argv) {
          * in the empty middle and looks like "no effect", which is the opposite of the truth. */
         printf("\nphysical versus phantom, matched per speaker (phantom - real, same direction)\n");
         for (int li = 0; li < nlis; ++li)
-        for (int p = 0; p < NPAN; ++p)
+        for (int ci = 0; ci < ncond; ++ci)
             for (int tracked = 1; tracked >= 0; --tracked) {
-                static double ra[MAX_TGT * 8], pa[MAX_TGT * 8];
-                int n = 0;
+                static double ra[MAX_TGT * 8], pa[MAX_TGT * 8], rk[MAX_TGT * 8], pk[MAX_TGT * 8];
+                int n = 0, nk = 0;
                 for (int sp = 0; sp < (int)L.count; ++sp) {
                     ValidCell *rc = NULL, *pc = NULL;
                     for (int i = 0; i < w; ++i) {
                         ValidCell* c = &cells[i];
                         if (c->lis != li || c->tgt != sp) continue;
                         if (c->reference == 1) rc = c;
-                        else if (c->reference == 2 && c->panner == panners[p] &&
-                                 c->tracked == tracked) pc = c;
+                        else if (c->reference == 2 && c->panner == cond[ci].panner &&
+                                 c->focus == cond[ci].focus && c->tracked == tracked) pc = c;
                     }
-                    if (rc && pc && rc->ok && pc->ok &&
-                        n < (int)(sizeof ra / sizeof ra[0])) {
+                    if (!rc || !pc) continue;
+                    if (rc->ok && pc->ok && n < (int)(sizeof ra / sizeof ra[0])) {
                         ra[n] = rc->miss_deg; pa[n] = pc->miss_deg; ++n;
+                    }
+                    /* The comb EXCESS, matched the same way: same direction, same placement, one
+                     * speaker against many. This is the pair that makes a comb depth mean something. */
+                    if (rc->comb_ok && pc->comb_ok && nk < (int)(sizeof rk / sizeof rk[0])) {
+                        rk[nk] = rc->comb_db; pk[nk] = pc->comb_db; ++nk;
                     }
                 }
                 if (n < 8) continue;
                 double md, clo, chi;
                 if (!valid_contrast(ra, pa, n, 2000, 4242u, &md, &clo, &chi)) continue;
-                printf("  %-16s %-5s %-8s  real %5.2f  phantom %5.2f   penalty %+6.2f  CI [%+.2f, %+.2f]%s\n",
-                       lisname[li], pan_name(panners[p]), tracked ? "tracked" : "fixed",
+                char cl[32];
+                printf("  %-16s %-13s %-8s  real %5.2f  phantom %5.2f   penalty %+6.2f  CI [%+.2f, %+.2f]%s",
+                       lisname[li], cond_label(&cond[ci], cl, sizeof cl),
+                       tracked ? "tracked" : "fixed",
                        valid_median(ra, n), valid_median(pa, n), md, clo, chi,
                        (clo > 0.0 || chi < 0.0) ? "  *" : "");
+                double kd, klo, khi;
+                if (nk >= 8 && valid_contrast(rk, pk, nk, 2000, 4242u, &kd, &klo, &khi))
+                    printf("   comb %+6.2f dB CI [%+.2f, %+.2f]%s", kd, klo, khi,
+                           (klo > 0.0 || khi < 0.0) ? " *" : "");
+                printf("\n");
             }
         printf("  A source sitting ON a speaker is still spread by a distance-blurred panner, so this\n"
                "  penalty is real. Expect ~0 at the array center (symmetry) and degrees off-center;\n"
-               "  read the off-center rows, and do not average them together.\n");
+               "  read the off-center rows, and do not average them together. The comb column has no\n"
+               "  such symmetry escape: many coherent copies interfere everywhere, center included.\n");
     }
 
     if (simulate)
@@ -719,16 +880,20 @@ int main(int argc, char** argv) {
         FILE* f = fopen(csv, "w");
         if (!f) { fprintf(stderr, "cannot write %s\n", csv); }
         else {
-            fprintf(f, "panner,tracked,lis,lis_name,tgt,mic_x,mic_y,mic_z,"
-                       "tgt_x,tgt_y,tgt_z,meas_x,meas_y,meas_z,miss_deg,diffuseness,ok\n");
+            fprintf(f, "panner,focus,density,reference,tracked,lis,lis_name,tgt,mic_x,mic_y,mic_z,"
+                       "tgt_x,tgt_y,tgt_z,meas_x,meas_y,meas_z,miss_deg,diffuseness,ok,"
+                       "comb_db,comb_q,comb_ok\n");
             for (int i = 0; i < w; ++i) {
                 ValidCell* c = &cells[i];
-                fprintf(f, "%s,%d,%d,%s,%d,%.4f,%.4f,%.4f,%.5f,%.5f,%.5f,%.5f,%.5f,%.5f,%.3f,%.3f,%d\n",
-                        pan_name(c->panner), c->tracked, c->lis, lisname[c->lis], c->tgt,
+                fprintf(f, "%s,%.4f,%.4f,%d,%d,%d,%s,%d,%.4f,%.4f,%.4f,"
+                           "%.5f,%.5f,%.5f,%.5f,%.5f,%.5f,%.3f,%.3f,%d,%.3f,%.3f,%d\n",
+                        c->reference == 1 ? "-" : pan_name(c->panner), c->focus, c->density,
+                        c->reference, c->tracked, c->lis, lisname[c->lis], c->tgt,
                         c->mic[0], c->mic[1], c->mic[2],
                         c->target[0], c->target[1], c->target[2],
                         c->measured[0], c->measured[1], c->measured[2],
-                        c->miss_deg, c->diffuseness, c->ok);
+                        c->miss_deg, c->diffuseness, c->ok,
+                        c->comb_db, c->comb_q, c->comb_ok);
             }
             fclose(f);
             printf("wrote %d cells to %s\n", w, csv);

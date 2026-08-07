@@ -143,6 +143,10 @@ void    rt_set_decorrelation(RtCore* c, int on);     /* velvet-noise wide-part d
 void    rt_set_bed_renderer(RtCore* c, int parametric);   /* bed: 0 = matrix decode, 1 = parametric (DirAC); live A/B */
 void    rt_set_pose_prediction(RtCore* c, float lead_s);  /* tracked-pose lead (0 = off); live */
 void    rt_set_near_spread(RtCore* c, float radius_m);    /* near-listener widening radius (0 = off); live */
+/* SPCAP lobe sharpness + placement-correction density exponent; either <= 0 reverts that knob to the
+ * layout's default (derived focus, constant density). Live: bumps the panner generation so even a
+ * motionless voice re-solves (rt.c, RtCore.pan_gen). */
+void    rt_set_spcap_focus(RtCore* c, float focus, float density);
 void    rt_set_extra_listeners(RtCore* c, const float* xyz, uint32_t n);   /* compromise panning; commit-gated */
 void    rt_set_master_gain(RtCore* c, float linear);      /* one ramped scalar over the whole mix; live */
 /* Image-source early reflections: the shoebox room (NULL/invalid = no reflections) and the live

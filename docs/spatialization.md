@@ -1,5 +1,8 @@
 # Spatialization
 
+This doc defines most of the engine's spatial vocabulary. For a one-line lookup of any term here,
+or of one this doc uses without defining, see [glossary.md](./glossary.md).
+
 ## Why DBAP, not ambisonics, for point sources
 
 The observer moves across a ~3×3 m area inside the array. Ambisonics is a
@@ -28,7 +31,7 @@ level, and exterior injectivity.
 The sweet-spot claim is measured, not just argued. The layout tool's bed metric
 (`bwa_bed_gains_batch`, the engine's real AllRAD/EPAD builds; see
 [layout-schema.md](./layout-schema.md)) scores one co-optimized 26-speaker layout
-at 2.4°/8.1° mean/worst rE error for a sweet-spot listener and 14.4°/52.5° over
+at 2.4°/8.1° mean/worst [rE error](./glossary.md#re-error) for a sweet-spot listener and 14.4°/52.5° over
 the 3×3 m roam, against 5.0°/25.5° for tracked DBAP on the same speakers: the
 static decode is the best render on the array at the center and loses 3× to the
 tracked panner everywhere else. The physics sets that scale. An order-N decode
@@ -60,8 +63,35 @@ volume.
 > cached and rebuilt only when the listener or layout changes, so the per-voice
 > solve stays alloc/lock-free.
 >
+> **The lobe width follows the array.** `focus` used to be a compile-time 12, which
+> was right for this 26-speaker grid and arbitrary anywhere else. The default now
+> comes from the geometry: measure the mean angle from each speaker to its nearest
+> neighbor, then pick the exponent that puts the lobe 6 dB down in energy at that
+> angle, `n = ln(0.25) / ln((1+cos delta)/2)`. A sparse array gets a broad lobe, a
+> dense one a tight lobe. The cube grid sits at 37.5 degrees of mean spacing and
+> lands on 12.7, close to the constant it replaced. `bwa_spcap_focus_default`
+> computes the same number for any set of speaker positions, so a layout tool can
+> show what an in-progress array implies.
+>
+> **Both exponents are live knobs**, not file settings:
+> `bwa_set_spcap_focus(e, focus, density)` retunes the render on the next block, and
+> 0 or less on either argument reverts that one to its default. They sit in the same
+> group as `bwa_set_near_spread` and `bwa_set_dual_band`, so they persist nowhere on
+> disk and your application sets whatever it dialed. Focus rewrites the gain vector
+> of every source, so the engine re-solves even sources that never move (rt.c bumps a
+> panner generation the mixer compares against, rather than writing voice state from
+> the control thread). Drag it in the playground's localization scene or the layout
+> tool's preview panel, both of which print what the loaded array derives.
+>
+> The knobs also reach the OFFLINE scoring path: `bwa_panner_gains_batch` takes
+> `focus` and `density` with the same "0 or less means this array's default"
+> sentinel, so a layout can be graded at the tuning it ships with rather than only
+> at the derived value. They are inert under DBAP and VBAP, which have no lobe.
+>
 > **Pick DBAP for a moving observer, SPCAP for a fixed one.** The layout tool's `V`
-> key scores a layout for either model; its preview `B` key A/Bs the panners live.
+> key scores a layout for either model; its preview `B` key A/Bs the panners live,
+> with the focus and density sliders beside it, and the same sliders on the
+> analyze panel move the Score board and the rE overlay.
 >
 > **VBAP** (`BWA_PAN_VBAP`, `vbap.c`) is also selectable: the 2-3 nearest speakers of
 > the hull triangle containing the source carry it. It is the **sharpest** of the
@@ -163,7 +193,7 @@ occupant, and CAVEs usually hold a group. With extra listener positions supplied
 (up to 3, commit-gated like the pose), `compute_gains` solves the same source once
 per listener (each extra keeps its **own** SPCAP/VBAP cache, since those caches are
 listener-keyed) and takes the per-speaker **energy mean**:
-`g[k] = sqrt(mean_i g_i[k]²)`, the L2 barycentre of the individual renderings.
+`g[k] = sqrt(mean_i g_i[k]²)`, the L2 barycenter of the individual renderings.
 Constant power is preserved (the mean of the solves' powers), and every occupant
 hears an image biased toward their own solve instead of one exact and the rest
 wrong. Spread direction, Doppler, air absorption, the reverb-send distance, and the
@@ -231,9 +261,9 @@ Both ramp per sample (no zipper) and tap the reflection send *before* themselves
 
 **Source spread/size** gives a source angular width: a waterfall or a crowd
 shouldn't collapse to a point. It runs in the per-block gain solve, not the sample
-loop, renormalised to *the panner's own power*: widening redistributes energy
-without re-levelling and keeps the centroid on the source direction. It is
-panner-agnostic, and the new gains ramp like any other gain change. Two render
+loop, renormalized to *the panner's own power*: widening redistributes energy
+without re-leveling and keeps the centroid on the source direction. It is
+panner-agnostic, and the new gains ramp like any other gain change. Three render
 modes sit behind `bwa_set_spread_mode` (an atomic live A/B, like the panner switch):
 
 - **Lobe** (default): the panner's point gains are blended toward a
@@ -243,12 +273,21 @@ modes sit behind `bwa_set_spread_mode` (an atomic live A/B, like the panner swit
 - **MDAP** (Pulkki 1999, multiple-direction amplitude panning): a ring of virtual
   sources around the source direction: 8 at the full cone angle (`spread`·90°)
   plus 4 offset at half, at the source's own distance, each panned with the
-  *selected panner*, summed, and renormalised to the point solve's power. The
+  *selected panner*, summed, and renormalized to the point solve's power. The
   extent is built from real panner solves, so it inherits the panner's character
   (VBAP stays sparse per direction, SPCAP stays placement-corrected) and sharpens
   the extent's edge. ~13× the gain-solve cost, block-rate + dirty-gated, so still
-  cheap. At spread→0 the ring collapses onto the point solve, so the two modes
+  cheap. At spread→0 the ring collapses onto the point solve, so MDAP and lobe
   meet continuously.
+- **Spectral** (Zotter/Frank phantom-source widening): the source splits into 6
+  complementary bands (crossovers at 250, 700, 1800, 4500 and 10000 Hz) and each
+  band pans to its *own* direction inside the cone, the low band staying put. Every
+  band gain is a real panner solve, so the extent is panner-true as MDAP's is. The
+  difference is what arrives at the speakers: different frequencies come from
+  different speakers, so there are no coherent copies to collapse into a phantom or
+  to comb as the listener walks. That is width with no decorrelation noise, and it
+  is the mode to reach for when a wide source has to survive a walking listener.
+  About 6 band filters plus 6 gain sets per wide voice; point sources pay nothing.
 
 Both MDAP's ring and the spectral mode's band directions hang off an orthonormal
 frame around the source direction. That frame is **parallel-transported** per voice

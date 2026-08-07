@@ -195,6 +195,16 @@ public:
 	Panner get_panner() const { return panner; }
 	void set_dual_band(bool on);
 	bool get_dual_band() const { return dual_band; }
+	/* SPCAP's two tuning exponents (inert under DBAP/VBAP; live, and every source re-solves next
+	 * block, static ones included). focus = lobe sharpness: higher concentrates a source on fewer
+	 * speakers, lower spreads it. density = the placement-correction kernel exponent that de-biases
+	 * a clustered array; 2 is the default and is rarely worth moving. 0 or less on EITHER reverts
+	 * that one to its default - focus to a value derived from the array geometry (about 12.7 on the
+	 * 26-speaker grid, lower on a sparser array), density to 2.0. */
+	void set_spcap_focus(float focus);
+	float get_spcap_focus() const { return spcap_focus; }
+	void set_spcap_density(float density);
+	float get_spcap_density() const { return spcap_density; }
 	void set_spread_mode(SpreadMode m);
 	SpreadMode get_spread_mode() const { return spread_mode; }
 	void set_decorrelation(bool on);
@@ -202,7 +212,11 @@ public:
 	void set_near_spread(float radius_m);
 	float get_near_spread() const { return near_spread; }
 	/* Engine-wide speed of sound (m/s; live): Doppler + reflection delays derive from it and
-	 * glide to a change. 343 air, 1480 underwater; small values exaggerate Doppler (slow motion). */
+	 * glide to a change. 343 air, 1480 underwater; small values exaggerate Doppler (slow motion).
+	 * NOT the layout file's reference.speed_of_sound_mps, which is the ROOM AIR TEMPERATURE the
+	 * acoustic survey was measured at (docs/calibration.md, "Air temperature"). That one is
+	 * tool-side provenance the engine never reads; this one is the propagation medium and is
+	 * yours to drive. Same units, different quantities: setting either does nothing to the other. */
 	void set_speed_of_sound(float meters_per_sec);
 	float get_speed_of_sound() const { return speed_of_sound; }
 	void set_max_re(bool on);
@@ -280,6 +294,9 @@ public:
 	int get_active_voices() const;
 	PackedFloat32Array get_bus_levels() const;
 	PackedVector3Array get_speakers() const;
+	/* The focus value spcap_focus = 0 reverts to, derived from the active layout's geometry. Read
+	 * it to show what the array itself implies before you override the knob. 0 with no engine. */
+	float get_spcap_focus_default() const;
 	/* MANUAL sink only: render one block and return it PLANAR (channel-major). Empty
 	 * otherwise. The deterministic path — golden renders, offline capture. */
 	PackedFloat32Array render_block();
@@ -359,6 +376,8 @@ private:
 	float er_gain = 1.0f;
 	Panner panner = PAN_DBAP;
 	bool dual_band = false;
+	float spcap_focus = 0.0f;   /* 0 = the geometry-derived default */
+	float spcap_density = 0.0f; /* 0 = the 2.0 constant default */
 	SpreadMode spread_mode = SPREAD_LOBE;
 	bool decorrelation = false;
 	float near_spread = 0.0f;

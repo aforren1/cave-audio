@@ -50,7 +50,7 @@ extern "C" {
  * COMPATIBILITY and is bumped by hand only when the ABI changes - it is deliberately independent of
  * the distribution/release version (the git tag), which moves on its own cadence. */
 #define BWA_VERSION_MAJOR 0
-#define BWA_VERSION_MINOR 10
+#define BWA_VERSION_MINOR 11
 #define BWA_VERSION_PATCH 0
 #define BWA_VERSION ((BWA_VERSION_MAJOR << 16) | (BWA_VERSION_MINOR << 8) | BWA_VERSION_PATCH)
 
@@ -801,6 +801,21 @@ BWA_API const float* bwa_render_block(bwa_engine* e, uint32_t* channels, uint32_
  * for a moving observer). Does not affect the diffuse bed / ambisonic paths. See docs/spatialization.md. */
 typedef enum { BWA_PAN_DBAP = 0, BWA_PAN_SPCAP = 1, BWA_PAN_VBAP = 2 } bwa_panner;
 BWA_API void     bwa_set_panner(bwa_engine* e, bwa_panner panner);
+/* SPCAP's two tuning knobs (dimensionless exponents; inert under DBAP/VBAP). `focus` is the lobe
+ * sharpness in ((1+cos)/2)^focus: higher concentrates a source on fewer speakers (tighter image),
+ * lower spreads it (smoother, blurrier). `density` is the exponent of the placement-correction
+ * kernel that de-biases a clustered array; 2.0 is the default and it is rarely worth moving.
+ * Pass <= 0 for EITHER argument to revert that one to the default: focus falls back to a value
+ * DERIVED from the array geometry (the exponent that puts the lobe 6 dB down at the mean
+ * nearest-neighbor speaker angle — about 12.7 on the 26-speaker cube grid, wider on a sparse array),
+ * density to 2.0. Live and per-frame-safe: every source re-solves on the next block, static ones
+ * included, and the gains ramp. A runtime knob like the other live A/B toggles, so it lives nowhere
+ * on disk — persisting a dialed value is your application's business, not the layout file's. */
+BWA_API void     bwa_set_spcap_focus(bwa_engine* e, float focus, float density);
+/* The focus value bwa_set_spcap_focus reverts to, for an array given as `n` speaker positions
+ * (3 floats each, the bwa_panner_gains_batch convention). Pure, not engine state: a tool can show
+ * what an in-progress layout implies before you override it. Returns 0 on bad arguments. */
+BWA_API float    bwa_spcap_focus_default(const float* positions, uint32_t n);
 /* The engine's ACTIVE channel count = the layout's speaker count (4..26; the 26-grid default with no
  * layout_path). Fixed for the engine's lifetime — size meter/speaker arrays with it. BWA_CHANNELS(26)
  * is only the compile-time CAPACITY; a collaborator's 24-speaker layout loads into the same binary.
@@ -903,9 +918,18 @@ BWA_API void     bwa_set_tracked_room_eq(bwa_engine* e, bool on);
  * per-listener cache across the batch (efficient over a grid). Pure AND reentrant — the cache is
  * per-call stack state, no globals, so any thread may call it, concurrently with a running engine.
  * Uses the same panner solves the audio path does, so a tool scores a layout against the ACTUAL
- * panner, not a copy. */
+ * panner, not a copy.
+ *
+ * `focus` / `density` are SPCAP's tuning knobs, the SAME two bwa_set_spcap_focus sets live and with
+ * the SAME <= 0 sentinel: either one <= 0 reverts that one to the default for THIS array (focus to
+ * the geometry-derived value bwa_spcap_focus_default returns for `positions`, density to 2.0). Pass
+ * 0, 0 for the array's own defaults. Both are INERT under BWA_PAN_DBAP and BWA_PAN_VBAP — those
+ * panners have no lobe to sharpen, so any value scores the same. Score the panner you will ship at
+ * the tuning you will ship it at: a layout graded at the derived focus says nothing about how it
+ * behaves once you dial the knob. */
 BWA_API uint32_t bwa_panner_gains_batch(bwa_panner panner, const float* positions, uint32_t n,
-                                      const float lis[3], const float* srcs, uint32_t nsrc, float* out);
+                                      const float lis[3], const float* srcs, uint32_t nsrc,
+                                      float focus, float density, float* out);
 
 /* The BED counterpart: the per-speaker gains the diffuse-bed decode produces for `ndir` plane-wave
  * DIRECTIONS (`dirs` = ndir*3 unit vectors, room space; a bed is content at infinity, so directions,

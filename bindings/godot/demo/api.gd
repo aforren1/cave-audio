@@ -108,6 +108,15 @@ func _test_engine_knobs() -> void:
 	_check(engine.dual_band and engine.decorrelation and engine.max_re and engine.max_re_split,
 		"a boolean A/B knob did not round-trip")
 	_check(is_equal_approx(engine.near_spread, 1.0), "near_spread did not round-trip")
+
+	engine.spcap_focus = 20.0
+	engine.spcap_density = 3.0
+	_check(is_equal_approx(engine.spcap_focus, 20.0), "spcap_focus did not round-trip")
+	_check(is_equal_approx(engine.spcap_density, 3.0), "spcap_density did not round-trip")
+	engine.spcap_focus = 0.0     # 0 = back to the geometry-derived default
+	engine.spcap_density = 0.0
+	_check(is_equal_approx(engine.spcap_focus, 0.0), "spcap_focus default sentinel did not round-trip")
+
 	engine.dual_band = false
 	engine.decorrelation = false
 	engine.max_re = false

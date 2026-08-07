@@ -29,9 +29,20 @@
  * perceive changes with them and the target follows honestly. Sweep listener positions across the
  * tracked walking envelope and the two renderers separate.
  *
+ * WHAT A CELL MEASURES, BEYOND THE ANGLE. A phantom is many speakers radiating coherent copies of one
+ * signal, so besides landing in the wrong DIRECTION it also combs: the copies arrive at different
+ * times and interfere, and the result is a rippled magnitude response. Every cell therefore carries a
+ * comb depth (zylia_comb_depth) beside its angular miss. That is the number that grades SPCAP's
+ * `focus` knob, which trades exactly this: high focus concentrates a source on few speakers and combs
+ * little, low focus spreads it over many and combs hard, and no direction estimator can see the
+ * difference. Like the miss, it is only meaningful as an EXCESS over the physical reference arm below.
+ *
  * Everything here is control-thread, offline analysis: it allocates, and it is not for the audio
- * thread. It drives the engine's OWN panner solve (bwa_panner_gains_batch), so it scores what will
- * actually ship rather than a reimplementation.
+ * thread. It calls the engine's OWN panner solves (dbap_gains / spcap_gains / vbap_gains) directly,
+ * so it scores what will actually ship rather than a reimplementation. Deliberately NOT through the
+ * public bwa_panner_gains_batch wrapper: that one substitutes a layout_default() for its
+ * DBAP/attenuation tuning and flattens the per-speaker trims, and validation has the caller's REAL
+ * layout in hand and wants its rolloff and its trims to count.
  */
 #ifndef BWA_VALID_H
 #define BWA_VALID_H
@@ -57,7 +68,26 @@ typedef struct {
     float miss_deg;       /* great-circle angle between them — the number */
     float diffuseness;    /* estimator confidence; high = measured in a smeared field */
     int   ok;             /* 0 = the estimator refused, miss_deg is meaningless */
+    float comb_db;        /* zylia_comb_depth: spectral ripple, the timbral cost of the render */
+    float comb_q;         /* its believability, 1 = the capsules agree (see zylia.h) */
+    int   comb_ok;        /* 0 = the comb estimator refused, comb_db is meaningless */
+    float focus;          /* the SPCAP tuning this cell was RENDERED at, resolved (never the <= 0 */
+    float density;        /* sentinel). 0 on a reference cell, which has no panner. */
 } ValidCell;
+
+/* ---- the SPCAP tuning a cell is rendered at ----
+ *
+ * `focus` and `density` run through every call below that solves a panner. They are the SAME two knobs
+ * bwa_set_spcap_focus sets live and bwa_panner_gains_batch scores with, and they honor the SAME
+ * sentinel: either one <= 0 reverts THAT one to the default for this array (focus to the layout's
+ * geometry-derived value, density to its constant). Pass 0, 0 for the array's own defaults.
+ *
+ * Both are INERT under DBAP and VBAP, which have no lobe to sharpen, so sweeping focus over those two
+ * panners measures the same cell repeatedly.
+ *
+ * The point of threading them here rather than reading the layout's defaults is that focus is a
+ * SHIPPING decision, dialed by ear today. A harness that can only measure the derived default cannot
+ * say what dialing it costs, and comb depth is the measurement that answers it. */
 
 /* ---- the measurement stimulus ----
  *
@@ -111,13 +141,14 @@ const char* valid_stimulus_name(void);
  * phase shift, so every one of the 26 x 19 propagation paths is applied EXACTLY, with no fractional
  * -delay interpolation error anywhere in the model. Returns 1 on success, 0 on bad arguments. */
 int valid_simulate(const Layout* L, int panner, const float solve_pos[3], const float mic[3],
-                   const float src_world[3], double fs, double c, float* buf, uint32_t n);
+                   const float src_world[3], double fs, double c, float focus, float density,
+                   float* buf, uint32_t n);
 
 /* Simulate one cell and score it: render, measure, fill `out`. `n` samples of capture (>= one
- * analysis frame; 8192 is plenty). Returns 1 if the cell was scored (check out->ok for whether the
- * estimator actually resolved it). */
+ * analysis frame; 8192 also buys the comb estimator, which needs ZYLIA_COMB_NFFT). Returns 1 if the
+ * cell was scored (check out->ok for whether the estimator actually resolved it). */
 int valid_cell(const Layout* L, int panner, int tracked, const float mic[3], const float src_world[3],
-               double fs, double c, uint32_t n, ValidCell* out);
+               double fs, double c, float focus, float density, uint32_t n, ValidCell* out);
 
 /* The nspk speaker feeds the array emits to render `src_world` with `panner` solved at `solve_pos`:
  * the panner gains, the layout's per-speaker level trim and alignment delay, driving the harness's
@@ -134,7 +165,8 @@ int valid_cell(const Layout* L, int panner, int tracked, const float mic[3], con
  * analyze any window that is comfortably inside the steady state, and device latency simply does not
  * enter. Returns 1 on success, 0 on bad arguments. */
 int valid_speaker_feeds(const Layout* L, int panner, const float solve_pos[3],
-                        const float src_world[3], double fs, float* feeds, uint32_t n);
+                        const float src_world[3], double fs, float focus, float density,
+                        float* feeds, uint32_t n);
 
 /* Score an ALREADY-CAPTURED 19-channel buffer (cap19 = [ZYLIA_MICS][n] flat, row stride n) against
  * the direction the source should have come from. This is the seam the hardware path enters
@@ -144,9 +176,14 @@ int valid_speaker_feeds(const Layout* L, int panner, const float solve_pos[3],
  * `exclude` is zylia_check_capsules' flags (or NULL): pass the session's mask so a faulty capsule is
  * dropped from the estimate rather than silently poisoning every cell of that placement — that check
  * is the one thing no amount of downstream agreement can substitute for.
+ * `focus` / `density` are RECORDED here, not used: nothing is rendered at this point, and a cell has
+ * to carry the tuning its capture came from or a focus sweep cannot sort its own results afterwards.
+ * The resolved values land in out->focus / out->density.
+ * Scoring fills BOTH measurements: the angular miss (zylia_intensity_doa) and the comb depth
+ * (zylia_comb_depth). They refuse independently, so check out->ok and out->comb_ok separately.
  * Returns 1 if the cell was scored (check out->ok). */
 int valid_score(const Layout* L, int panner, int tracked, const float mic[3], const float src_world[3],
-                const float* cap19, uint32_t n, double fs, double c,
+                const float* cap19, uint32_t n, double fs, double c, float focus, float density,
                 const unsigned char* exclude, ValidCell* out);
 
 /* ---- the physical reference arm: drive ONE speaker, measure where it lands ----
@@ -190,7 +227,8 @@ int valid_reference_cell(const Layout* L, int spk, const float mic[3],
  * climbing the wrong hill, and that is worth knowing before trusting a layout it produced.
  * Returns 1 on success, 0 on bad arguments or a degenerate solve. */
 int valid_re_proxy(const Layout* L, int panner, const float solve_pos[3], const float mic[3],
-                   const float src_world[3], float* re_err_deg, float* spread_deg);
+                   const float src_world[3], float focus, float density,
+                   float* re_err_deg, float* spread_deg);
 
 /* Sweep panners x listeners x targets. Sources are placed at `radius` meters from the layout's sweet
  * spot along each target direction, so every listener is judged against the same physical sources —
@@ -199,7 +237,8 @@ int valid_re_proxy(const Layout* L, int panner, const float solve_pos[3], const 
 int valid_run(const Layout* L, const int* panners, int npan, int tracked,
               const float (*listeners)[3], int nlis,
               const float (*targets)[3], int ntgt,
-              float radius, double fs, double c, uint32_t n, ValidCell* cells_out);
+              float radius, double fs, double c, float focus, float density,
+              uint32_t n, ValidCell* cells_out);
 
 /* Unit target directions on an azimuth x elevation grid (the paper's 24 x 3 shape). Azimuths are
  * naz even steps from 0; elevations are given in degrees. Returns the count written (naz * nel),

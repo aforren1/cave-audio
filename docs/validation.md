@@ -4,7 +4,8 @@ Calibration *fixes* the array: trims, delays, positions, EQ. This *grades* it. R
 known direction, measure where the array actually put it, report the angular miss.
 
 That number is the one nobody has. You can listen to a layout all day and not produce it, and the
-usual substitutes (rE error, coverage maps, "sounds right to me") are proxies for it, not it.
+usual substitutes ([rE error](./glossary.md#re-error), coverage maps, "sounds right to me") are
+proxies for it, not it. [glossary.md](./glossary.md) is the one-line lookup for every term below.
 
 Build it with `-DBWA_BUILD_CALIBRATE=ON` (same switch as `bwa_calibrate`). Run
 `bwa_validate --simulate` to exercise the whole flow with no hardware.
@@ -19,6 +20,9 @@ Build it with `-DBWA_BUILD_CALIBRATE=ON` (same switch as `bwa_calibrate`). Run
 - **How much of the error is the renderer at all.** Driving one speaker alone gives a physical source
   through the same chain, so the phantom miss can be read against a floor rather than in a vacuum.
 - **How much the content matters here**, by measuring the same cells broadband and on a tone.
+- **What the render costs in timbre, not just in direction.** A phantom is many speakers radiating
+  coherent copies of one signal, so it combs. Every cell carries a comb depth beside its angular miss,
+  and `--focus` sweeps the SPCAP knob that trades one against the other.
 
 ## The seam: solve position versus microphone position
 
@@ -172,6 +176,117 @@ It is not a free upgrade:
 - Excluding capsules **steps the order down** automatically (3 → 2 → 1) rather than returning a
   confidently over-fitted answer.
 
+## Comb depth (`zylia_comb_depth`)
+
+Everything above measures *where* a phantom went. This measures what making one cost.
+
+A phantom is N loudspeakers radiating **coherent copies of one signal**. At any point in the room
+those copies arrive at N different times, so the microphone sees the source through a comb filter:
+peaks where they add, notches where they cancel. That is the timbral price of amplitude panning. No
+direction estimator can see it, because a comb barely moves the intensity vector.
+
+```c
+int zylia_comb_depth(const float* const x[ZYLIA_MICS], uint32_t n, double fs,
+                     double f_lo, double f_hi, const unsigned char* exclude,
+                     float* depth_db_out, float* quality_out);
+```
+
+Welch power spectrum per capsule, sub-band energies across the analysis band, in dB, with a straight
+line in (log f, dB) fitted out. What is left is the ripple. `depth_db` is its interdecile range, the
+90th percentile minus the 10th, averaged over the included capsules. 0 dB is a flat response, which is
+what a single coherent arrival gives.
+
+### The axis is frequency, not the capsules
+
+This is the design mistake worth naming, because it is the natural one to make.
+
+The ZM-1's shell is 49 mm, so the widest capsule pair sits 98 mm apart. The 400–1200 Hz band spans
+wavelengths from 0.86 m down to 0.29 m, so every pair lies within 0.11 to 0.34 of a wavelength. All 19
+capsules see very nearly the **same** comb. They average its noise down. They do not sample it
+independently.
+
+So a statistic taken *across* capsules measures nothing. The statistic is roughness **along
+frequency**, computed per capsule, and the capsules only average it.
+
+`quality_out` is the one honest use of the capsule axis: it is the standard error of that average, not
+the raw spread, because the spread is what the averaging already handled. It reads the opposite way to
+`diffuseness`: 1 is good. Below about 0.5 the capsules are not seeing one comb, so suspect a capsule
+fault, a band far above the shell's coherence, or a capture that drifted.
+
+### Read it as an excess, never as an absolute
+
+Three other things put ripple in a spectrum: the room, the stimulus's own line structure, and the
+analysis itself. All three are present when **one speaker is driven alone**, which is exactly what the
+physical reference arm already does. Measure the reference the same way and subtract. The tool reports
+that subtraction as a matched-cell contrast, per speaker, in the physical-versus-phantom table.
+
+An absolute comb depth says as little on its own as an absolute angular miss, and for the same reason.
+
+### Limits
+
+- Ripple **slower** than the analysis band is indistinguishable from a spectral tilt, and the detrend
+  removes it. Copies within about 1 ms of each other put their first notch above the band and read as
+  flat. That is the time-aligned case, and it is the right answer at the point the alignment was
+  computed for and the wrong one everywhere else.
+- Ripple **faster** than a sub-band is averaged away. On a 400–1200 Hz band the sub-band is 100 Hz, so
+  copies more than about 5 ms apart are understated.
+- A band too narrow to hold enough sub-bands is **refused**, so `--tone` cells get no comb number.
+  That is correct rather than a gap: one frequency cannot show a frequency-dependent effect, and a
+  comb evaluated at one point is just a gain. `comb_ok` is a separate flag from `ok` for this reason.
+- There is **no first-order ceiling** here. Nothing inverts `b_n(ka)` or projects onto spherical
+  harmonics, so `ZYLIA_FOA_FMAX` does not apply. The band is still matched to the DOA's so the two
+  numbers can be read side by side, and because the harness stimulus has no energy outside it.
+- `n` must be at least `ZYLIA_COMB_NFFT` (8192, which is `VAL_ANALYZE`). The frame is four times the
+  DOA's because here the frequency resolution *is* the measurement, where the DOA only integrates a
+  vector over bins.
+
+Measured in the `zylia` test on a synthetic delay-and-add: one coherent copy reads 1.6 dB, the
+analysis floor. Adding weaker copies takes it to 4.6, 5.6, 8.6, 10.3 dB. One capsule carrying a
+different comb pulls the answer 0.4 dB off and drops quality from 1.00 to 0.58; masking it recovers the
+clean answer exactly.
+
+## Sweeping SPCAP focus
+
+`--focus 4,32` measures more than one SPCAP focus in **one session**, at the same placements and the
+same directions, so the focus contrasts are matched-cell. Focus is inert under DBAP and VBAP, so those
+are measured once however long the list is.
+
+This exists because focus was dialed by ear and nothing could put a figure on what dialing it did.
+Focus sets how many speakers carry a source. More speakers means more coherent copies interfering, so
+the knob trades image tightness against comb depth, and comb depth is now a number.
+
+**Where the sweep has power, and where it does not.** Two target populations behave completely
+differently, and mixing them hides the effect:
+
+| target | what a tight lobe does | sweep |
+| --- | --- | --- |
+| **at a speaker's own position** | collapses onto that one real speaker: one copy, nothing to interfere with | full range, monotone |
+| **an arbitrary direction** | falls between speakers, so the tightest render is two near-equal copies | weak, non-monotone |
+
+Two equal copies null completely. They comb harder than twenty do. So tightening focus does **not**
+monotonically reduce comb depth on a general direction, and reading focus off the grid rows will
+mislead you.
+
+Read the **physical-versus-phantom table** instead. Its targets sit on speaker positions and every row
+carries the comb excess over that same speaker driven alone. On the default grid, off center, in
+simulate:
+
+| focus | comb depth | over the real source |
+| --- | --- | --- |
+| 2 | 7.5 dB | +6.7 |
+| 8 | 7.4 dB | +6.5 |
+| 16 | 7.1 dB | +6.3 |
+| 32 | 3.5 dB | +2.7 |
+| 64 | 1.1 dB | +0.3 |
+
+Every interval excludes zero. The physical floor is 0.8 dB. Read that as: below about focus 16 this
+array is combing as hard as it can, and the knob does not start buying anything back until the lobe is
+tight enough to land on a single speaker.
+
+What the sweep cannot tell you is which setting to ship. Comb depth is one side of the trade; the
+other is coverage and image stability as the listener walks, which the angular miss and the
+tracked-versus-fixed contrast measure. Run both columns and decide against both.
+
 ## Running it
 
 ```
@@ -190,6 +305,8 @@ bwa_validate --layout cave_layout.json --azimuths 24 --out cells.csv
 | `--positions <file>` | placements from a file, `x y z [label]` per line, `#` comments |
 | `--azimuths <n>` | azimuths per elevation row (default 12) |
 | `--radius <m>` | source distance from the sweet spot (default 1.4) |
+| `--focus <v[,v,…]>` | SPCAP lobe sharpness; a list sweeps it in one session. See above |
+| `--density <v>` | SPCAP placement-correction exponent, one value for the run |
 | `--out <file.csv>` | every cell, one row each |
 | `--no-prompt` | don't wait for ENTER between placements (unattended runs) |
 | `--track <id or name>` | follow the ZM-1's stand as a tracked rigid body; needs `--survey` |
@@ -365,8 +482,12 @@ not simply flagging everything.
 ```
 for each microphone placement (you move the ZM-1, the tool waits):
     check the capsules once, report anything faulty, exclude it for the rest
-    for each panner × {tracked, fixed} × direction:  render → capture → score
+    for each condition × {tracked, fixed} × direction:  render → capture → score
 ```
+
+A **condition** is a panner at one SPCAP focus. With no `--focus` there is one per panner, which is
+the old shape. With a `--focus` list SPCAP gets one condition per value and the other two panners
+still get one, so a sweep costs only what it measures.
 
 **Only the microphone moves.** Phantom sources are rendered, not carried, so a whole direction grid
 sweeps electronically from one placement. That inverts the usual cost of this measurement: a study
@@ -416,8 +537,10 @@ are percentile bootstrap on the median, fixed seed, so a reported interval is re
 Medians rather than means throughout. Localization error is heavy-tailed, a handful of directions
 fail badly, and a mean would follow them around.
 
-`--out` writes every cell: panner, mode, positions, target direction, measured direction, miss,
-diffuseness, and whether the estimator resolved it.
+`--out` writes every cell: panner, focus, density, arm, mode, positions, target direction, measured
+direction, miss, diffuseness, comb depth, comb quality, and whether each estimator resolved it. The
+`reference` column says which arm a row came from: 0 is a grid phantom, 1 is a speaker driven alone,
+2 is the phantom matched to it.
 
 ## What it has found so far
 
@@ -457,6 +580,9 @@ exactly this basis, see `layout-schema.md`.
 
 Say these out loud before quoting any number from this tool.
 
+- **Comb depth is a spectrum statistic, not a loudness model.** It says how rippled the response is,
+  not how audible that is. The ear is far less bothered by a comb it can move its head out of than by
+  one that follows it, and this measurement cannot tell those apart from one static point.
 - **A microphone is not a listener.** A single-point intensity vector is a conservative observer.
   Listeners get two ears, head movement, and the precedence effect. Expect this to over-report,
   especially for narrowband content, where a standing wave can send the net energy flux at one point
@@ -480,11 +606,11 @@ Say these out loud before quoting any number from this tool.
 | file | what |
 | --- | --- |
 | `src/valid.c` / `valid.h` | render, score, statistics, the simulated field. Hardware-free, unit-tested |
-| `src/zylia.c` | the estimators: intensity DOA, integrity, SRP-PHAT cross-check |
+| `src/zylia.c` | the estimators: intensity DOA, integrity, SRP-PHAT cross-check, comb depth |
 | `examples/validate.cpp` | `bwa_validate`, the session driver |
 | `examples/valid_capture.cpp` | full-duplex ASIO. **Rig-bound, not verified on hardware** |
 | `test/valid_test.c` | the `valid` ctest: statistics, the feed/analytic agreement, the sweep |
-| - | the `validate_sim` ctest: the whole session loop; `validate_fault`: the integrity chain |
+| - | the `validate_sim` ctest: the whole session loop; `validate_fault`: the integrity chain; `validate_focus`: the multi-condition sweep |
 | `test/zylia_test.c` | the `zylia` ctest: estimator, sign cross-check, integrity, order step-down |
 
 `valid_capture.cpp` carries the same caveat as `calib_capture.cpp`: it mirrors a known-good ASIO host

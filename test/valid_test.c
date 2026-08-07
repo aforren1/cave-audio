@@ -183,7 +183,7 @@ static void test_feed_path(const Layout* L, double FS, double C) {
     float src[3] = { L->ref[0] + 1.4f*0.6f, L->ref[1] + 1.4f*0.3f, L->ref[2] - 1.4f*0.74f };
     double worst = 0.0;
     for (int p = 0; p < 3; ++p) {
-        CHECK(valid_speaker_feeds(L, pans[p], mic, src, FS, feeds, NN + PRE), "feeds build");
+        CHECK(valid_speaker_feeds(L, pans[p], mic, src, FS, 0.f, 0.f, feeds, NN + PRE), "feeds build");
         propagate(L, feeds, mic, C, FS, wide, NN + PRE);
         /* drop the pre-roll: until the farthest speaker has arrived the field is incomplete, and
          * that transient is an artifact of starting the model, not something the rig would see */
@@ -191,8 +191,8 @@ static void test_feed_path(const Layout* L, double FS, double C) {
             memcpy(cap + (size_t)j*NN, wide + (size_t)j*(NN+PRE) + PRE, sizeof(float)*NN);
 
         ValidCell viaFeeds, viaSim;
-        CHECK(valid_score(L, pans[p], 1, mic, src, cap, NN, FS, C, NULL, &viaFeeds), "score from a capture");
-        CHECK(valid_cell(L, pans[p], 1, mic, src, FS, C, NN, &viaSim), "score from the simulation");
+        CHECK(valid_score(L, pans[p], 1, mic, src, cap, NN, FS, C, 0.f, 0.f, NULL, &viaFeeds), "score from a capture");
+        CHECK(valid_cell(L, pans[p], 1, mic, src, FS, C, 0.f, 0.f, NN, &viaSim), "score from the simulation");
         if (viaFeeds.ok && viaSim.ok) {
             double d = (double)viaFeeds.measured[0]*viaSim.measured[0]
                      + (double)viaFeeds.measured[1]*viaSim.measured[1]
@@ -208,6 +208,185 @@ static void test_feed_path(const Layout* L, double FS, double C) {
     free(feeds); free(wide); free(cap);
 }
 
+/* ---- the SPCAP focus knob, made measurable -----------------------------------------------------
+ *
+ * Focus is the lobe sharpness in ((1+cos)/2)^focus, and until now it was judgeable only by ear. What
+ * it trades is the NUMBER OF SPEAKERS carrying a source, and a phantom's speakers radiate coherent
+ * copies of one signal, so the copies interfere and the render combs. No direction estimator can see
+ * that; zylia_comb_depth is what reads it.
+ *
+ * WHERE THE SWEEP HAS POWER, AND WHERE IT DOES NOT. This is the finding, and it is not the obvious
+ * one. Two target populations behave completely differently:
+ *
+ *  - A source AT A SPEAKER'S OWN POSITION. Tighten the lobe far enough and the panner collapses onto
+ *    that one real speaker: one copy, nothing to interfere with, and the comb falls all the way to the
+ *    physical floor. Loosen it and the whole array joins in. So the sweep runs its full range here and
+ *    every step of it is measurable. It is also exactly the population the harness already renders for
+ *    the physical reference arm, so the excess over a REAL source is available cell for cell.
+ *  - An ARBITRARY grid direction. A tight lobe collapses onto nothing, because the direction falls
+ *    BETWEEN speakers: the tightest achievable render is two near-equal copies, and two equal copies
+ *    null completely. So comb depth does not fall away at high focus there, and the sweep comes out
+ *    weak and non-monotone. Reported below, never asserted.
+ *
+ * So the assertions live on the speaker-coincident arm, where the physics is unambiguous, and the grid
+ * arm is printed for a human to read. That split follows this file's rule: assert the machinery and
+ * what geometry forces, report the result.
+ *
+ * Every number is read as an EXCESS over one speaker driven alone. An absolute comb depth also
+ * contains the stimulus's line structure, the analysis, and (on hardware) the room, and only the
+ * excess is attributable to panning. */
+static void test_comb_sweep(const Layout* L, double FS, double C) {
+    const uint32_t NC = 8192u;                    /* zylia_comb_depth's frame; NCAP is too short */
+    enum { NF = 5, NSPK = BWA_CHANNELS, NDIR = 12 };
+    const float FOCUS[NF] = { 2.0f, 8.0f, 16.0f, 32.0f, 64.0f };
+    float mic[3] = { 0.55f, 1.5f, -0.35f };       /* off the sweet spot: the case that matters */
+
+    /* ---- arm 1: sources at speaker positions, against the same speaker driven alone ---- */
+    static double comb[NF][NSPK], refc[NSPK], qall[NF * NSPK];
+    int n = 0, nq = 0;
+    float worst_q = 1.0f;
+    for (uint32_t sp = 0; sp < L->count; ++sp) {
+        ValidCell rc;
+        if (!valid_reference_cell(L, (int)sp, mic, FS, C, NC, &rc) || !rc.comb_ok) continue;
+        CHECK(rc.focus == 0.f && rc.density == 0.f, "a reference cell carries no panner tuning");
+        float src[3] = { L->speakers[sp].pos[0], L->speakers[sp].pos[1], L->speakers[sp].pos[2] };
+        double got[NF];
+        int all = 1;
+        for (int f = 0; f < NF; ++f) {
+            ValidCell c;
+            if (!valid_cell(L, BWA_PAN_SPCAP, 1, mic, src, FS, C, FOCUS[f], 0.f, NC, &c) || !c.comb_ok) {
+                all = 0; break;
+            }
+            CHECK(c.focus == FOCUS[f], "the cell records the focus it rendered at");
+            CHECK(c.comb_q >= 0.f && c.comb_q <= 1.f, "the comb quality is a 0..1 figure");
+            qall[nq++] = c.comb_q;
+            if (c.comb_q < worst_q) worst_q = c.comb_q;
+            got[f] = c.comb_db;
+        }
+        if (!all) continue;
+        refc[n] = rc.comb_db;
+        for (int f = 0; f < NF; ++f) comb[f][n] = got[f];
+        ++n;
+    }
+    CHECK(n >= 8, "most speakers yield a full focus sweep");
+    if (n < 8) return;
+
+    double floor_db = valid_median(refc, n);
+    printf("\n  SPCAP focus sweep on SPEAKER-COINCIDENT sources, listener (%.2f, %.2f, %.2f)\n",
+           mic[0], mic[1], mic[2]);
+    printf("  %8s %10s %14s %22s\n", "focus", "comb dB", "over real", "matched-cell CI");
+    for (int f = 0; f < NF; ++f) {
+        double md = 0, lo = 0, hi = 0;
+        CHECK(valid_contrast(refc, comb[f], n, 2000, 909u, &md, &lo, &hi), "the excess contrast runs");
+        CHECK(lo <= md && md <= hi, "the bootstrap interval brackets its own estimate");
+        printf("  %8.1f %10.2f %14.2f   [%+6.2f, %+6.2f]%s\n",
+               FOCUS[f], valid_median(comb[f], n), md, lo, hi, (lo > 0.0) ? " *" : "");
+    }
+    printf("  one speaker driven alone: %.2f dB over %d speakers   (* = excess excludes zero)\n",
+           floor_db, n);
+    /* Quality is a per-cell diagnostic, not a contract: a handful of directions genuinely put the 19
+     * capsules at more scattered points of the interference field, and the mean over them is still
+     * the answer. So the TYPICAL cell has to be well determined, and the worst is only reported. */
+    printf("  comb quality: median %.2f, worst %.2f over %d cells\n",
+           valid_median(qall, nq), worst_q, nq);
+    CHECK(valid_median(qall, nq) > 0.5, "a typical cell's comb depth is well determined");
+
+    /* The physics, asserted as an ordering rather than as dB. A source sitting on a speaker is the one
+     * case where a tight enough lobe really is a single coherent copy, so the sweep has to run from
+     * "the whole array interferes" down to "the floor". */
+    for (int f = 1; f < NF; ++f)
+        CHECK(valid_median(comb[f], n) < valid_median(comb[f-1], n),
+              "a tighter SPCAP focus combs less on a speaker-coincident source");
+    CHECK(valid_median(comb[0], n) > floor_db + 3.0,
+          "a loose lobe combs well above the physical floor");
+    CHECK(valid_median(comb[NF-1], n) < floor_db + 1.5,
+          "...and a tight enough lobe collapses onto the real speaker and stops combing");
+
+    {   /* the matched-cell contrast, the same paired arithmetic every other claim here uses */
+        double md = 0, lo = 0, hi = 0;
+        CHECK(valid_contrast(comb[0], comb[NF-1], n, 2000, 555u, &md, &lo, &hi), "focus contrast runs");
+        printf("  matched-cell contrast (focus %.0f - focus %.0f): %+.2f dB  CI [%+.2f, %+.2f]\n",
+               FOCUS[NF-1], FOCUS[0], md, lo, hi);
+        CHECK(hi < 0.0, "two well-separated focus values measure differently, interval excluding zero");
+    }
+
+    /* ---- arm 2: arbitrary grid directions, reported only ---- */
+    {
+        static float dir[NDIR][3];
+        static double gc[NF][NDIR], gm[NF][NDIR];
+        float el0 = 0.0f;
+        valid_target_grid(NDIR, &el0, 1, dir, NDIR);
+        int ng = 0;
+        for (int t = 0; t < NDIR; ++t) {
+            float src[3] = { L->ref[0] + 1.4f*dir[t][0], L->ref[1] + 1.4f*dir[t][1],
+                             L->ref[2] + 1.4f*dir[t][2] };
+            double c1[NF], m1[NF];
+            int all = 1;
+            for (int f = 0; f < NF; ++f) {
+                ValidCell c;
+                if (!valid_cell(L, BWA_PAN_SPCAP, 1, mic, src, FS, C, FOCUS[f], 0.f, NC, &c) ||
+                    !c.comb_ok || !c.ok) { all = 0; break; }
+                c1[f] = c.comb_db; m1[f] = c.miss_deg;
+            }
+            if (!all) continue;
+            for (int f = 0; f < NF; ++f) { gc[f][ng] = c1[f]; gm[f][ng] = m1[f]; }
+            ++ng;
+        }
+        CHECK(ng >= NDIR / 2, "most grid directions sweep");
+        printf("  same sweep on ARBITRARY grid directions (no speaker to collapse onto)\n");
+        printf("  %8s %10s %14s %10s\n", "focus", "comb dB", "over real", "miss deg");
+        for (int f = 0; f < NF && ng; ++f)
+            printf("  %8.1f %10.2f %14.2f %10.1f\n", FOCUS[f], valid_median(gc[f], ng),
+                   valid_median(gc[f], ng) - floor_db, valid_median(gm[f], ng));
+        printf("  Weak and non-monotone by construction: between speakers the tightest render is two\n"
+               "  near-equal copies, and two equal copies null completely. Do not read focus off this.\n");
+    }
+
+    /* ---- the <= 0 sentinel, and inertness where focus has no meaning ---- */
+    {
+        float src[3] = { L->ref[0] + 0.9f, L->ref[1] + 0.3f, L->ref[2] - 1.0f };
+        ValidCell a, b;
+        CHECK(valid_cell(L, BWA_PAN_SPCAP, 1, mic, src, FS, C, 0.f, 0.f, NC, &a) &&
+              valid_cell(L, BWA_PAN_SPCAP, 1, mic, src, FS, C, L->spcap_focus, L->spcap_density, NC, &b),
+              "sentinel cells render");
+        CHECK(a.focus == L->spcap_focus && a.density == L->spcap_density,
+              "focus/density <= 0 resolves to the LAYOUT's own values, not a stand-in default");
+        CHECK(a.comb_db == b.comb_db && a.miss_deg == b.miss_deg,
+              "...and renders identically to passing them explicitly");
+
+        /* DBAP has no lobe, so focus must not reach it at all. If this ever fails, focus has leaked
+         * somewhere it does not belong. */
+        ValidCell d1, d2;
+        CHECK(valid_cell(L, BWA_PAN_DBAP, 1, mic, src, FS, C,  2.0f, 0.f, NC, &d1) &&
+              valid_cell(L, BWA_PAN_DBAP, 1, mic, src, FS, C, 64.0f, 0.f, NC, &d2),
+              "DBAP cells render at two focus values");
+        CHECK(d1.comb_db == d2.comb_db && d1.miss_deg == d2.miss_deg, "focus is inert under DBAP");
+
+        /* ...and the FEEDS path honors it too, so the hardware arm sweeps the same knob the offline
+         * arm does. Without this the rig would silently measure the derived default forever. */
+        enum { FN = 4096 };
+        float* f1 = (float*)malloc(sizeof(float) * (size_t)BWA_CHANNELS * FN);
+        float* f2 = (float*)malloc(sizeof(float) * (size_t)BWA_CHANNELS * FN);
+        if (f1 && f2) {
+            CHECK(valid_speaker_feeds(L, BWA_PAN_SPCAP, mic, src, FS,  2.0f, 0.f, f1, FN) &&
+                  valid_speaker_feeds(L, BWA_PAN_SPCAP, mic, src, FS, 64.0f, 0.f, f2, FN),
+                  "feeds build at two focus values");
+            CHECK(memcmp(f1, f2, sizeof(float) * (size_t)L->count * FN) != 0,
+                  "the hardware feed path sweeps focus too, not just the simulated field");
+        }
+        free(f1); free(f2);
+
+        /* the rE proxy takes the tuning as well, so the optimizer comparison is made at the tuning
+         * that will ship rather than at whatever the geometry implies */
+        float re1 = 0.f, re2 = 0.f, sp1 = 0.f, sp2 = 0.f;
+        CHECK(valid_re_proxy(L, BWA_PAN_SPCAP, mic, mic, src,  2.0f, 0.f, &re1, &sp1) &&
+              valid_re_proxy(L, BWA_PAN_SPCAP, mic, mic, src, 64.0f, 0.f, &re2, &sp2),
+              "the rE proxy runs at two focus values");
+        CHECK(sp1 != sp2, "the rE proxy follows focus too");
+    }
+    printf("\n");
+}
+
 int main(void) {
     test_stats();
     test_grid();
@@ -217,6 +396,7 @@ int main(void) {
     printf("[layout       ] %u speakers, sweet spot (%.2f, %.2f, %.2f)\n",
            L.count, L.ref[0], L.ref[1], L.ref[2]);
     test_feed_path(&L, FS, C);
+    test_comb_sweep(&L, FS, C);
 
     float elev[NEL] = { -25.0f, 0.0f, 25.0f };
     static float tg[NTGT][3];
@@ -247,8 +427,8 @@ int main(void) {
     ValidCell* fixed   = (ValidCell*)malloc(sizeof(ValidCell) * NPAN * NLIS * NTGT);
     if (!tracked || !fixed) { printf("FAIL: out of memory\n"); return 1; }
 
-    int nt = valid_run(&L, panners, NPAN, 1, lispos, NLIS, tg, NTGT, RADIUS, FS, C, NCAP, tracked);
-    int nf = valid_run(&L, panners, NPAN, 0, lispos, NLIS, tg, NTGT, RADIUS, FS, C, NCAP, fixed);
+    int nt = valid_run(&L, panners, NPAN, 1, lispos, NLIS, tg, NTGT, RADIUS, FS, C, 0.f, 0.f, NCAP, tracked);
+    int nf = valid_run(&L, panners, NPAN, 0, lispos, NLIS, tg, NTGT, RADIUS, FS, C, 0.f, 0.f, NCAP, fixed);
     CHECK(nt == NPAN * NLIS * NTGT && nf == nt, "the sweep fills every cell");
 
     int nok = 0;
@@ -324,7 +504,7 @@ int main(void) {
                                      L.ref[1] + RADIUS*tg[t][1],
                                      L.ref[2] + RADIUS*tg[t][2] };
                     float re = 0.0f, sp = 0.0f;
-                    if (!valid_re_proxy(&L, panners[p], lispos[li], lispos[li], src, &re, &sp)) continue;
+                    if (!valid_re_proxy(&L, panners[p], lispos[li], lispos[li], src, 0.f, 0.f, &re, &sp)) continue;
                     mm[all + n] = c->miss_deg; pe[all + n] = re; ps[all + n] = sp; ++n;
                 }
                 if (n >= 8) {                       /* within-position: no between-position structure */
@@ -362,7 +542,7 @@ int main(void) {
             if (rc.miss_deg > worst_ref) worst_ref = rc.miss_deg;
             /* the matched phantom: a rendered source AT that speaker's own position */
             float src[3] = { L.speakers[sp].pos[0], L.speakers[sp].pos[1], L.speakers[sp].pos[2] };
-            if (!valid_cell(&L, BWA_PAN_DBAP, 1, mic, src, FS, C, NCAP, &pc) || !pc.ok) continue;
+            if (!valid_cell(&L, BWA_PAN_DBAP, 1, mic, src, FS, C, 0.f, 0.f, NCAP, &pc) || !pc.ok) continue;
             if (nref < 4)
                 printf("[reference    ]   spk %2u: real %.2f  phantom-at-its-position %.2f deg\n",
                        sp, rc.miss_deg, pc.miss_deg);
@@ -405,7 +585,7 @@ int main(void) {
         valid_get_stimulus_band(&f_lo, &f_hi);
         CHECK(f_lo > 300.0 && f_hi <= ZYLIA_FOA_FMAX + 1.0, "broadband band is the first-order band");
         ValidCell bb;
-        CHECK(valid_cell(&L, BWA_PAN_DBAP, 1, mic, src, FS, C, 8192u, &bb) && bb.ok, "broadband cell");
+        CHECK(valid_cell(&L, BWA_PAN_DBAP, 1, mic, src, FS, C, 0.f, 0.f, 8192u, &bb) && bb.ok, "broadband cell");
 
         /* a tone above the array's first-order reach is refused WITH its frequency, not measured */
         CHECK(!valid_set_stimulus(VALID_STIM_TONE, 6000.0), "a 6 kHz tone is refused outright");
@@ -428,7 +608,7 @@ int main(void) {
             CHECK(f_lo < hz[i] && f_hi > hz[i], "the analysis band brackets the tone");
             ValidCell rc, tc;
             CHECK(valid_reference_cell(&L, 0, mic, FS, C, 8192u, &rc) && rc.ok, "reference tone cell");
-            CHECK(valid_cell(&L, BWA_PAN_DBAP, 1, mic, src, FS, C, 8192u, &tc) && tc.ok, "phantom tone cell");
+            CHECK(valid_cell(&L, BWA_PAN_DBAP, 1, mic, src, FS, C, 0.f, 0.f, 8192u, &tc) && tc.ok, "phantom tone cell");
             double dr = fabs((double)rc.miss_deg - rbb.miss_deg);
             double dp = fabs((double)tc.miss_deg - bb.miss_deg);
             if (dr > worst_ref_spread) worst_ref_spread = dr;

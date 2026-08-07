@@ -538,6 +538,45 @@ int main(void) {
         }
     }
 
+    /* SPCAP live tuning (rt_set_spcap_focus). The point of the panner generation counter: a voice
+     * that never moves, in a scene whose listener never moves, must still re-solve when the knob
+     * turns. Nothing here nudges a position or commits — remove the counter and this section fails.
+     * Also pins the <= 0 sentinel (revert to the layout's derived default). */
+    {
+        RtCore* cf = rt_create(8, 4, RATE, CH);
+        CHECK(cf != NULL, "rt_create (spcap focus)");
+        if (cf) {
+            rt_set_panner(cf, 1);                            /* 1 = SPCAP */
+            uint32_t fs = rt_load_sound(cf, WAV, err, sizeof err);
+            uint32_t hf = rt_source_create(cf);
+            rt_source_play(cf, hf, fs, true);
+            rt_source_set_pos(cf, hf, 0.6f, LD.ref[1] + 0.3f, 1.2f);
+            rt_commit(cf); render2(cf); render2(cf);
+            double e_def[CH]; for (int k = 0; k < CH; ++k) e_def[k] = chan_energy(k);
+            int act_def = active_channels(0.03);
+
+            rt_set_spcap_focus(cf, 40.f, 0.f);               /* the ONLY call: no move, no commit */
+            render2(cf); render2(cf);
+            int act_tight = active_channels(0.03);
+            double moved = 0;
+            for (int k = 0; k < CH; ++k) moved += fabs(chan_energy(k) - e_def[k]);
+            CHECK(moved > 1e-3, "a STATIC voice re-solves after rt_set_spcap_focus (pan_gen)");
+            CHECK(act_tight < act_def, "raising focus concentrates a static source on fewer speakers");
+
+            rt_set_spcap_focus(cf, 2.f, 0.f);                /* broad lobe: more speakers, not fewer */
+            render2(cf); render2(cf);
+            CHECK(active_channels(0.03) > act_tight, "lowering focus spreads it back out");
+
+            rt_set_spcap_focus(cf, 0.f, 0.f);                /* sentinel: back to the derived default */
+            render2(cf); render2(cf);
+            double back = 0;
+            for (int k = 0; k < CH; ++k) back += fabs(chan_energy(k) - e_def[k]);
+            CHECK(back < 1e-3, "focus <= 0 reverts to the geometry-derived default");
+            rt_source_destroy(cf, hf); rt_commit(cf);
+            rt_destroy(cf);
+        }
+    }
+
     /* metric source size (bwa_source_set_size): the rendered width is the angle the radius subtends
      * from the listener — a source that engulfs the listener is fully wide, the SAME physical size
      * narrows with distance, and size 0 restores the point solve. */

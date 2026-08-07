@@ -26,6 +26,42 @@ void layout_compute_ref(Layout* L) {
     for (int i = 0; i < 3; ++i) L->ref[i] = L->count ? (float)(s[i] / L->count) : 0.f;
 }
 
+/* SPCAP focus from the geometry (see layout.h): mean nearest-neighbor angle between speaker
+ * directions seen from ref, then the -6 dB-at-that-angle lobe exponent. Sanity: 30 deg -> ~20,
+ * 45 deg -> ~8.8, 60 deg -> ~4.8; the default 26-speaker cube grid -> ~12.7. */
+float layout_derive_spcap_focus(const Layout* L) {
+    const uint32_t N = L ? L->count : 0;
+    if (N < 2) return 12.0f;                       /* nothing to measure a separation against */
+    double sum = 0.0;
+    uint32_t used = 0;
+    for (uint32_t k = 0; k < N; ++k) {
+        float dk[3];
+        unit_dir(L->ref, L->speakers[k].pos, dk);
+        double best = -2.0;                        /* largest cos = smallest angle = nearest neighbor */
+        for (uint32_t j = 0; j < N; ++j) {
+            if (j == k) continue;
+            float dj[3];
+            unit_dir(L->ref, L->speakers[j].pos, dj);
+            double c = (double)dk[0]*dj[0] + (double)dk[1]*dj[1] + (double)dk[2]*dj[2];
+            if (c > best) best = c;
+        }
+        if (best <= -2.0) continue;
+        if (best >  1.0) best =  1.0;
+        if (best < -1.0) best = -1.0;
+        sum += acos(best); ++used;
+    }
+    if (!used) return 12.0f;
+    const double delta = sum / used;
+    /* co-located speakers (delta ~ 0) blow the log up; an antipodal-only array (delta ~ pi) sends the
+     * denominator to -inf. Both are degenerate surveys — keep the historical constant. */
+    if (delta < 1e-3 || delta > 3.1) return 12.0f;
+    const double denom = log(0.5 * (1.0 + cos(delta)));
+    if (!(denom < -1e-9)) return 12.0f;
+    double n = log(0.25) / denom;
+    if (n < 1.0) n = 1.0; else if (n > 64.0) n = 64.0;
+    return (float)n;
+}
+
 Layout layout_default(void) {
     Layout L;
     memset(&L, 0, sizeof L);
@@ -46,6 +82,8 @@ Layout layout_default(void) {
     L.count             = k;                    /* 26 */
     layout_compute_ref(&L);                            /* (0, 1.5, 0) — the cube's center */
     L.rolloff_r         = 0.5f;
+    L.spcap_focus       = layout_derive_spcap_focus(&L);   /* ~12.7 on this grid (37.5 deg spacing) */
+    L.spcap_density     = BWA_SPCAP_DENSITY_DEFAULT;
     L.atten_ref_m       = 1.0f;
     L.atten_rolloff     = 1.0f;
     L.atten_min_lin     = db_to_lin(-40.0);
@@ -288,6 +326,10 @@ bool layout_load(const char* path, uint32_t sample_rate, Layout* out, char* err,
         out->rolloff_r = (float)(0.25 * s / nspk);
         if (out->rolloff_r < 0.05f) out->rolloff_r = 0.05f;   /* keep the >0 invariant on a degenerate survey */
     }
+    /* SPCAP's lobe width follows the survey the same way: the file never carries it (it is a
+     * perceptual knob, not a measured quantity), so it is always derived here. */
+    out->spcap_focus   = layout_derive_spcap_focus(out);
+    out->spcap_density = BWA_SPCAP_DENSITY_DEFAULT;
     ok = true;
 done:
     cJSON_Delete(root);

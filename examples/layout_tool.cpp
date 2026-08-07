@@ -347,6 +347,14 @@ static bwa_sound     pv_sound;
 static bwa_source    pv_src;
 static int         preview, pv_orbit, layout_dirty = 1;   /* dirty=1 forces the first preview to rebuild from spk[] */
 static int         pv_panner;                             /* 0=DBAP 1=SPCAP 2=VBAP (= bwa_panner; live A/B, B key) */
+/* SPCAP's live tuning exponents (bwa_set_spcap_focus). 0 on either = its default: focus derived from
+ * the edited geometry, density 2.0. pv_focus_def is what the CURRENT spk[] implies, recomputed on
+ * every edit so you can see the geometry's own answer before overriding it.
+ * They drive BOTH sides of the tool: the audible preview through bwa_set_spcap_focus, and every
+ * SCORE (scoreboard, --score, the rE overlay, the badness map, the optimizer cost) through
+ * bwa_panner_gains_batch's focus/density arguments. Same sentinel on both, so 0 means the same
+ * thing to the ear and to the number. */
+static float       pv_focus, pv_density, pv_focus_def;
 static const char* panner_names[] = { "DBAP (moving)", "SPCAP (fixed)", "VBAP (fixed)" };
 static float       pv_t;
 static Vector3     src_pos = { 1.5f, 0.0f, 0.0f };
@@ -496,7 +504,8 @@ static float panner_focus_default(bwa_panner p) {
  * solve), so the score reflects what will ship — not a re-implementation. spread_deg (optional) is
  * the mean perceived source width from the energy-vector MAGNITUDE (Frank 2013: ≈186.4°·(1−|rE|)
  * + 10.7°) — the image-focus axis direction error alone can't see: a defocused-but-centered image
- * scores 0° error. */
+ * scores 0° error. Under SPCAP it solves at the dialed pv_focus/pv_density (0 = this array's
+ * derived default), so the score grades the tuning you will ship, not a fixed one. */
 static void score_panner(bwa_panner panner, int stride, int tracked,
                          float* mean_deg, float* worst_deg, float* spread_deg) {
     static float gains[NCOV * NSPK], srcs[NCOV * 3];
@@ -522,7 +531,7 @@ static void score_panner(bwa_panner panner, int stride, int tracked,
         Vector3 Lp = cov_lis[l]; Lp.y += obs_height;    /* the listener's EARS are at obs_height, not the floor */
         /* the SOLVE position; the listener stays Lp, and the two differ whenever tracked == 0 */
         float solvef[3] = { tracked ? Lp.x : S.x, tracked ? Lp.y : S.y, tracked ? Lp.z : S.z };
-        bwa_panner_gains_batch(panner, pos, (uint32_t)g_nspk, solvef, srcs, ns, gains);
+        bwa_panner_gains_batch(panner, pos, (uint32_t)g_nspk, solvef, srcs, ns, pv_focus, pv_density, gains);
         for (int j = 0; j < ns; ++j) {
             float* g = &gains[j * g_nspk];
             float rE[3] = { 0, 0, 0 }, esum = 0;
@@ -620,7 +629,7 @@ static void compute_cov_err(bwa_panner panner) {
         for (int i = 0; i < NCOV; ++i) {
             srcs[i*3]=Lp.x+COV_R*cov_dir[i].x; srcs[i*3+1]=Lp.y+COV_R*cov_dir[i].y; srcs[i*3+2]=Lp.z+COV_R*cov_dir[i].z;
         }
-        bwa_panner_gains_batch(panner, pos, (uint32_t)g_nspk, lisf, srcs, NCOV, gains);
+        bwa_panner_gains_batch(panner, pos, (uint32_t)g_nspk, lisf, srcs, NCOV, pv_focus, pv_density, gains);
         for (int i = 0; i < NCOV; ++i) {
             float* g = &gains[i * g_nspk];
             float rE[3] = { 0, 0, 0 };
@@ -698,7 +707,7 @@ static void compute_badness(bwa_panner panner, int tracked) {
                 };
                 bad_pos[w] = Lp;
                 float solvef[3] = { tracked ? Lp.x : S.x, tracked ? Lp.y : S.y, tracked ? Lp.z : S.z };
-                bwa_panner_gains_batch(panner, pos, (uint32_t)g_nspk, solvef, srcs, ns, gains);
+                bwa_panner_gains_batch(panner, pos, (uint32_t)g_nspk, solvef, srcs, ns, pv_focus, pv_density, gains);
                 double acc = 0.0; int cnt = 0;
                 for (int j = 0; j < ns; ++j) {
                     float* g = &gains[j * g_nspk];
@@ -1000,8 +1009,16 @@ static void enter_preview(void) {      /* rebuild so the preview pans through th
         }
     }
     preview = 1;
+    {   /* what the edited geometry implies for SPCAP's lobe, shown next to the override */
+        static float pos[NSPK][3];
+        for (int i = 0; i < g_nspk; ++i) {
+            pos[i][0] = spk[i].pos.x; pos[i][1] = spk[i].pos.y; pos[i][2] = spk[i].pos.z;
+        }
+        pv_focus_def = bwa_spcap_focus_default((const float*)pos, (uint32_t)g_nspk);
+    }
     if (e) {
         bwa_set_panner(e, (bwa_panner)pv_panner);   /* rebuilt engine defaults to DBAP */
+        bwa_set_spcap_focus(e, pv_focus, pv_density);   /* ...and to the derived focus */
         bwa_source_set_gain(e, pv_src, SRC_GAIN);
         bwa_commit(e);
     }
@@ -1387,6 +1404,32 @@ static void draw_panel(void) {
         if (ImGui::Combo("panner", &pv_panner, "DBAP (moving)\0SPCAP (fixed)\0VBAP (fixed)\0") && e)
             bwa_set_panner(e, (bwa_panner)pv_panner);   /* live A/B (atomic, safe while running) */
         bwTip("A/B by ear while it plays - the switch is atomic (no glitch)");
+        /* SPCAP's own knobs, in the same live-A/B group as the panner (B) and the observer model (V) */
+        ImGui::BeginDisabled(pv_panner != BWA_PAN_SPCAP);
+        if (ImGui::SliderFloat("focus", &pv_focus, 0.0f, 48.0f,
+                               pv_focus > 0.0f ? "%.1f" : "(default)")) {
+            if (e) bwa_set_spcap_focus(e, pv_focus, pv_density);
+            mark_score();                            /* the scoring path solves at this value too */
+        }
+        bwTip("SPCAP lobe sharpness: higher concentrates a source on fewer speakers, lower spreads "
+              "it. 0 = the default this array's speaker spacing implies. Live, and even a parked "
+              "source re-solves - drag it while the orbit runs and listen to the image tighten. "
+              "The Score board and the rE overlay follow it.");
+        if (ImGui::SliderFloat("density", &pv_density, 0.0f, 8.0f,
+                               pv_density > 0.0f ? "%.2f" : "(default 2.0)")) {
+            if (e) bwa_set_spcap_focus(e, pv_focus, pv_density);
+            mark_score();
+        }
+        bwTip("placement-correction exponent: how hard a cluster of speakers is de-weighted so it "
+              "can't pull the image. 2.0 is the default and is rarely worth moving.");
+        if (ImGui::Button("SPCAP default", ImVec2(-1, 0))) {
+            pv_focus = 0.0f; pv_density = 0.0f;
+            if (e) bwa_set_spcap_focus(e, pv_focus, pv_density);
+            mark_score();
+        }
+        bwTip("send 0 for both (the ABI's revert-to-default sentinel)");
+        ImGui::TextDisabled("this layout derives focus %.1f", (double)pv_focus_def);
+        ImGui::EndDisabled();
         ImGui::TextDisabled("WASD/RF move the source");
         if (ImGui::Button("Back to edit [P]", ImVec2(-1, 0))) leave_preview();
         ImGui::PopItemWidth();
@@ -1484,6 +1527,26 @@ static void draw_panel(void) {
     }
     bwTip("the panner Score / Optimize / the rE overlay evaluate ([B] cycles). DBAP tracks a "
           "MOVING listener; SPCAP/VBAP assume the center sweet spot");
+    /* SPCAP's tuning, on the SCORING side of the tool: the same two globals the preview panel dials
+     * by ear, passed straight into bwa_panner_gains_batch. A layout graded at the derived focus says
+     * nothing about how it behaves at the focus you actually ship, so the score follows the knob. */
+    if (pv_panner == BWA_PAN_SPCAP) {
+        int knob = 0;
+        knob |= ImGui::SliderFloat("focus", &pv_focus, 0.0f, 48.0f,
+                                   pv_focus > 0.0f ? "%.1f" : "(default)") ? 1 : 0;
+        bwTip("SPCAP lobe sharpness the Score / Optimize / overlay solve at. 0 = the value this "
+              "geometry derives (shown below). Dial it by ear in the preview, then score it here");
+        knob |= ImGui::SliderFloat("density", &pv_density, 0.0f, 8.0f,
+                                   pv_density > 0.0f ? "%.2f" : "(default 2.0)") ? 1 : 0;
+        bwTip("placement-correction exponent: how hard a cluster of speakers is de-weighted so it "
+              "can't pull the image. 2.0 is the default and is rarely worth moving");
+        if (knob) {
+            if (e) bwa_set_spcap_focus(e, pv_focus, pv_density);   /* keep a live preview in step */
+            mark_score();                                          /* scoreboard + overlays + map */
+            if (opt_running) opt_cost = opt_cost_of((bwa_panner)pv_panner);   /* the cached cost was on the old lobe */
+        }
+        ImGui::TextDisabled("this layout derives focus %.1f", (double)pv_focus_def);
+    }
     { int ci = opt_condition_idx;
       if (ImGui::Combo("condition", &ci, "3d (full sphere)\0horizontal (plane band)\0visual (front wedge)\0"))
           apply_condition(ci, (bwa_panner)pv_panner); }
@@ -2138,6 +2201,108 @@ static void register_tests(ImGuiTestEngine* te) {
         ctx->ItemUncheck("**/coverage [C]");
     };
 
+    /* SPCAP's live knobs on the preview side, in the same group as the panner A/B: the derived
+     * default reflects the EDITED geometry, the sliders arm only under SPCAP, and the button sends
+     * the revert sentinel. Spreading the array wider must lower what it derives. */
+    t = IM_REGISTER_TEST(te, "viewer", "spcap_focus");
+    t->TestFunc = [](ImGuiTestContext* ctx) {
+        ctx->SetRef("layout");
+        ctx->ItemClick("**/Preview - audition [P]");
+        IM_CHECK(preview);
+        IM_CHECK_GT(pv_focus_def, 1.0f);                         /* the edited layout derives a usable one */
+        IM_CHECK_LT(pv_focus_def, 64.0f);
+        float dense = pv_focus_def;
+        ctx->ItemClick("**/Back to edit [P]");
+
+        int keep = g_nspk;                                       /* a 6-speaker array is far sparser */
+        g_nspk = 6;
+        mark_edit();
+        ctx->ItemClick("**/Preview - audition [P]");
+        IM_CHECK_LT(pv_focus_def, dense);                        /* wider spacing -> broader lobe */
+        ctx->ItemClick("**/Back to edit [P]");
+        g_nspk = keep;
+        mark_edit();
+
+        ctx->ItemClick("**/Preview - audition [P]");
+        int keep_pan = pv_panner;
+        pv_panner = BWA_PAN_SPCAP;                               /* arm the sliders (BeginDisabled gate) */
+        if (e) bwa_set_panner(e, BWA_PAN_SPCAP);
+        ctx->Yield(2);
+        ctx->ItemInputValue("**/focus", 24.0f);
+        IM_CHECK_EQ(pv_focus, 24.0f);
+        ctx->ItemInputValue("**/density", 3.0f);
+        IM_CHECK_EQ(pv_density, 3.0f);
+        ctx->Yield(4);
+        ctx->ItemClick("**/SPCAP default");                      /* the revert sentinel */
+        IM_CHECK_EQ(pv_focus, 0.0f);
+        IM_CHECK_EQ(pv_density, 0.0f);
+        pv_panner = keep_pan;
+        if (e) bwa_set_panner(e, (bwa_panner)pv_panner);
+        ctx->ItemClick("**/Back to edit [P]");
+        IM_CHECK(!preview);
+    };
+
+    /* the SCORING side of the same two globals: they ride bwa_panner_gains_batch's focus/density
+     * arguments, so the board, the rE overlay and the optimizer cost must all MOVE with the knob —
+     * and must not move for DBAP/VBAP, where the arguments are inert. Without this the tool could
+     * only A/B the lobe by ear, which is the whole reason the signature widened. */
+    t = IM_REGISTER_TEST(te, "viewer", "spcap_focus_score");
+    t->TestFunc = [](ImGuiTestContext* ctx) {
+        ctx->SetRef("layout");
+        seed_default(); mark_edit();
+        const float keep_f = pv_focus, keep_d = pv_density;
+        const int   keep_pan = pv_panner;
+
+        pv_focus = 0.0f; pv_density = 0.0f;                      /* the derived default */
+        float m_def, w_def, sp_def;
+        score_panner(BWA_PAN_SPCAP, 4, 0, &m_def, &w_def, &sp_def);
+        pv_focus = 40.0f;                                        /* well above the grid's ~12.7 */
+        float m_hi, w_hi, sp_hi;
+        score_panner(BWA_PAN_SPCAP, 4, 0, &m_hi, &w_hi, &sp_hi);
+        IM_CHECK_LT(sp_hi, sp_def - 1.0f);                       /* a tighter lobe = a narrower image */
+        pv_focus = 3.0f;                                         /* well below it */
+        float m_lo, w_lo, sp_lo;
+        score_panner(BWA_PAN_SPCAP, 4, 0, &m_lo, &w_lo, &sp_lo);
+        IM_CHECK_GT(sp_lo, sp_def + 1.0f);                       /* a broader lobe = a wider image */
+
+        /* the per-direction overlay is the same solve, so it must follow too */
+        pv_focus = 0.0f;  compute_cov_err(BWA_PAN_SPCAP);
+        float e_def[NCOV]; memcpy(e_def, cov_err, sizeof e_def);
+        pv_focus = 40.0f; compute_cov_err(BWA_PAN_SPCAP);
+        float dmax = 0.0f;
+        for (int i = 0; i < NCOV; ++i) { float d = fabsf(cov_err[i] - e_def[i]); if (d > dmax) dmax = d; }
+        IM_CHECK_GT(dmax, 0.01f);
+
+        /* inert under the other two panners: same arguments, bit-identical score */
+        for (int p = 0; p < 3; ++p) {
+            if (p == BWA_PAN_SPCAP) continue;
+            float ma, wa, mb, wb;
+            pv_focus = 0.0f;  pv_density = 0.0f;
+            score_panner((bwa_panner)p, 4, panner_tracked((bwa_panner)p), &ma, &wa, NULL);
+            pv_focus = 40.0f; pv_density = 6.0f;
+            score_panner((bwa_panner)p, 4, panner_tracked((bwa_panner)p), &mb, &wb, NULL);
+            IM_CHECK_EQ(ma, mb);
+            IM_CHECK_EQ(wa, wb);
+        }
+
+        /* and the edit-panel sliders reach those globals + invalidate the cached score */
+        pv_focus = 0.0f; pv_density = 0.0f;
+        pv_panner = BWA_PAN_SPCAP;                               /* the sliders only draw under SPCAP */
+        ctx->Yield(2);
+        ctx->ItemClick("**/Score [X]");
+        IM_CHECK(scored);
+        IM_CHECK_EQ(score_stale, 0);
+        const float board_def = score_spread[BWA_PAN_SPCAP];
+        ctx->ItemInputValue("**/focus", 40.0f);                   /* the slider marks the board stale... */
+        IM_CHECK_EQ(pv_focus, 40.0f);
+        ctx->Yield(16);                                          /* ...and the throttled auto-refresh re-scores */
+        IM_CHECK_LT(score_spread[BWA_PAN_SPCAP], board_def - 1.0f);
+        IM_CHECK_EQ(score_stale, 0);                             /* the board is current again, at the new lobe */
+
+        pv_focus = keep_f; pv_density = keep_d; pv_panner = keep_pan;
+        mark_score();
+    };
+
     /* the badness map through the panel, both solve modes, with a shot of each: the fixed one should
      * look like an island and the tracked one flat, which is the pair of pictures worth keeping */
     t = IM_REGISTER_TEST(te, "viewer", "badness_shots");
@@ -2165,7 +2330,8 @@ int main(int argc, char** argv) {
     /* headless (no window/audio, scriptable):
      *   --export   [file]            write the layout (default grid, or an existing file with delay_ms recomputed)
      *   --score    [file] [condition]   print each panner's rE-localization error for the layout,
-     *                                under a named condition if given (default: the full sphere)
+     *                                under a named condition if given (default: the full sphere),
+     *                                at an SPCAP tuning if given (focus=/density=; 0 = derived)
      *   --optimize [file] [panner] [stages]   hill-climb the layout for one panner (dbap|spcap|vbap, default
      *                                dbap) under a comma-separated chain of named conditions (default "3d";
      *                                "horizontal,3d" seeds the 3D climb from the plane-optimal result),
@@ -2179,11 +2345,14 @@ int main(int argc, char** argv) {
                    "  edit a speaker layout in 3D (default file: ./cave_layout.json;\n"
                    "  ./constraints.json bounds the placement if present)\n"
                    "  --export   [file]                    write the layout headless\n"
-                   "  --score    [file] [condition] [fixed|moving] [ears=<m>] [epad|allrad] [maxre]\n"
+                   "  --score    [file] [condition] [fixed|moving] [ears=<m>] [focus=<n>]\n"
+                   "             [density=<n>] [epad|allrad] [maxre]\n"
                    "             print each panner's rE-localization error, under a named condition\n"
                    "             if given (3d, horizontal, visual); 'fixed' scores the sweet spot only\n"
                    "             (a seated install) instead of the moving-listener grid; ears=<m>\n"
-                   "             sets the listener ear height (the plane; default 1.4); epad/maxre\n"
+                   "             sets the listener ear height (the plane; default 1.4); focus=<n>\n"
+                   "             and density=<n> score the SPCAP row at that tuning (0 = the value\n"
+                   "             the geometry derives), so the knob can be swept offline; epad/maxre\n"
                    "             grade the AMBI row with the decode the install ships\n"
                    "  --optimize [file] [dbap|spcap|vbap] [stages] [fixed|moving] [ears=<m>] [radial]\n"
                    "             [guard=<panner>[:tol]] [anneal] [restarts=<n>] [leash=<m>] [bed=<wt>]\n"
@@ -2256,12 +2425,28 @@ int main(int argc, char** argv) {
     if (score_only) {                              /* headless: score the layout for each panner + exit,
                                                     * optionally under a named condition (argv[3]) */
         int ci = -1, ears_set = 0;
-        for (int a = 3; a < argc && a < 9; ++a) {
+        for (int a = 3; a < argc && a < 12; ++a) {
             if      (!strcmp(argv[a], "fixed"))  score_fixed_obs = 1;   /* seated install: sweet spot only */
             else if (!strcmp(argv[a], "moving")) score_fixed_obs = 0;
             else if (!strcmp(argv[a], "epad"))   bed_decoder = 1;       /* grade the decode the install ships */
             else if (!strcmp(argv[a], "allrad")) bed_decoder = 0;
             else if (!strcmp(argv[a], "maxre"))  bed_max_re = 1;
+            /* SPCAP's knobs: sweep the lobe headless. 0 is a LEGAL value here (the revert sentinel),
+             * so a garbage token cannot be caught by the range alone - check that it parsed at all. */
+            else if (!strncmp(argv[a], "focus=", 6)) {
+                const char* v = argv[a] + 6;
+                char* end = NULL;
+                pv_focus = strtof(v, &end);
+                if (end == v || *end || !(pv_focus >= 0.0f && pv_focus <= 64.0f)) {
+                    printf("score: focus=%s is not a number in 0..64 (0 = the derived default)\n", v); return 1; }
+            }
+            else if (!strncmp(argv[a], "density=", 8)) {
+                const char* v = argv[a] + 8;
+                char* end = NULL;
+                pv_density = strtof(v, &end);
+                if (end == v || *end || !(pv_density >= 0.0f && pv_density <= 8.0f)) {
+                    printf("score: density=%s is not a number in 0..8 (0 = the 2.0 default)\n", v); return 1; }
+            }
             else if (!strncmp(argv[a], "ears=", 5)) {
                 obs_height = (float)atof(argv[a] + 5);                  /* the plane / scoring / alignment height */
                 if (!(obs_height > 0.0f && obs_height <= 3.0f)) { printf("score: ears=%s out of range (0..3 m)\n", argv[a] + 5); return 1; }
@@ -2272,7 +2457,7 @@ int main(int argc, char** argv) {
                 if (ci < 0) {
                     printf("score: unknown condition '%s' (have:", argv[a]);
                     for (int i = 0; i < NCONDITIONS; ++i) printf(" %s", opt_conditions[i].name);
-                    printf(" fixed moving ears=<m> epad allrad maxre)\n");
+                    printf(" fixed moving ears=<m> focus=<n> density=<n> epad allrad maxre)\n");
                     return 1;
                 }
             }
@@ -2280,6 +2465,8 @@ int main(int argc, char** argv) {
         printf("layout: %s (%s)", g_path, loaded ? "loaded" : "default grid");
         if (score_fixed_obs) printf("   observer: fixed (sweet spot only)");
         if (ears_set)        printf("   ears %.2f m", obs_height);
+        if (pv_focus   > 0)  printf("   SPCAP focus %.2f", (double)pv_focus);
+        if (pv_density > 0)  printf("   SPCAP density %.2f", (double)pv_density);
         if (ci >= 0) {
             const OptCondition* c = &opt_conditions[ci];
             printf("   condition '%s' (", c->name);

@@ -680,6 +680,175 @@ int zylia_srp_doa(const float* const x[ZYLIA_MICS], uint32_t n, double fs, doubl
     return (frames && bestd >= 0) ? 1 : 0;
 }
 
+/* ==============================================================================================
+ * Comb depth: roughness along FREQUENCY, per capsule, averaged over capsules. See zylia.h for what
+ * the number means, why the capsule axis is not the measurement, and why it is only readable as an
+ * excess over the single-speaker reference.
+ * ============================================================================================== */
+
+#define ZY_COMB_SUBBANDS  8      /* sub-band width = analysis band / this. Sets the finest ripple the
+                                  * estimator can see, and the coarsest stimulus line spacing it can
+                                  * tolerate: a sub-band narrower than the stimulus's tone spacing
+                                  * would contain EMPTY bands, whose leakage-only level is 30 dB of
+                                  * pure artifact. Wider is safer here; 1/8 of the band leaves the
+                                  * default 400-1200 Hz sweep 100 Hz sub-bands over a 24-tone
+                                  * stimulus spaced 32 Hz, so no band is ever empty. */
+#define ZY_COMB_OVERSAMP  4      /* hop = width / this. Oversampling only samples the ripple more
+                                  * densely; the width alone sets the smoothing. */
+#define ZY_COMB_MINBANDS  12     /* below this the percentiles are noise, so REFUSE */
+#define ZY_COMB_MINBW_HZ  50.0   /* and a sub-band this narrow cannot hold a stimulus line reliably */
+#define ZY_COMB_MINBINS   8      /* ...nor an energy estimate, at this frame length */
+#define ZY_COMB_MAXBANDS  512    /* table cap; the count is really SUBBANDS*OVERSAMP-3, so ~29 */
+#define ZY_COMB_MINCAPS   3      /* fewer than this and `quality` has no spread to measure */
+#define ZY_COMB_QSPREAD   1.0    /* standard error of the capsule mean (dB) that takes quality to 0 */
+
+/* Percentile of an ASCENDING-sorted array, linearly interpolated between order statistics. */
+static double zy_pct(const double* s, int m, double p) {
+    if (m < 1) return 0.0;
+    double x = p * (double)(m - 1);
+    int i = (int)x;
+    if (i < 0) return s[0];
+    if (i >= m - 1) return s[m-1];
+    double f = x - (double)i;
+    return s[i] * (1.0 - f) + s[i+1] * f;
+}
+
+static int zy_cmp_double(const void* a, const void* b) {
+    double x = *(const double*)a, y = *(const double*)b;
+    return (x < y) ? -1 : ((x > y) ? 1 : 0);
+}
+
+int zylia_comb_depth(const float* const x[ZYLIA_MICS], uint32_t n, double fs,
+                     double f_lo, double f_hi, const unsigned char* exclude,
+                     float* depth_db_out, float* quality_out) {
+    if (!x || fs <= 0.0) return 0;
+    if (f_lo <= 0.0 || f_hi <= f_lo) return 0;
+    if (n < (uint32_t)ZYLIA_COMB_NFFT) return 0;
+    for (int i = 0; i < ZYLIA_MICS; ++i) if (!x[i]) return 0;
+
+    const int N = ZYLIA_COMB_NFFT, H = N / 2;
+    double nyq = 0.5 * fs;
+    if (f_hi > 0.98 * nyq) f_hi = 0.98 * nyq;     /* no ka ceiling here, only the transform's own */
+    if (f_hi <= f_lo) return 0;
+
+    /* Sub-band table, built once: geometry of the analysis, identical for every capsule. */
+    const double bw  = (f_hi - f_lo) / (double)ZY_COMB_SUBBANDS;
+    const double hop = bw / (double)ZY_COMB_OVERSAMP;
+    if (bw < ZY_COMB_MINBW_HZ) return 0;          /* a tone's +-1/6 octave lands here, by design */
+
+    int nb = 0, kmin = N, kmax = 0;
+    int* b0 = (int*)malloc(sizeof(int) * ZY_COMB_MAXBANDS);
+    int* b1 = (int*)malloc(sizeof(int) * ZY_COMB_MAXBANDS);
+    double* lf = (double*)malloc(sizeof(double) * ZY_COMB_MAXBANDS);
+    if (!b0 || !b1 || !lf) { free(b0); free(b1); free(lf); return 0; }
+    for (double lo = f_lo; lo + bw <= f_hi + 1e-9 && nb < ZY_COMB_MAXBANDS; lo += hop) {
+        int k0 = (int)ceil ( lo        * (double)N / fs);
+        int k1 = (int)floor((lo + bw)  * (double)N / fs);
+        if (k0 < 1) k0 = 1;
+        if (k1 > N/2 - 1) k1 = N/2 - 1;
+        if (k1 - k0 + 1 < ZY_COMB_MINBINS) continue;
+        b0[nb] = k0; b1[nb] = k1;
+        lf[nb] = log(lo + 0.5 * bw);              /* detrend against log f, not f */
+        if (k0 < kmin) kmin = k0;
+        if (k1 > kmax) kmax = k1;
+        ++nb;
+    }
+    if (nb < ZY_COMB_MINBANDS) { free(b0); free(b1); free(lf); return 0; }
+
+    double* re = (double*)malloc(sizeof(double) * (size_t)N);
+    double* im = (double*)malloc(sizeof(double) * (size_t)N);
+    double* P  = (double*)malloc(sizeof(double) * (size_t)N);
+    double* lv = (double*)malloc(sizeof(double) * (size_t)nb);
+    double* rs = (double*)malloc(sizeof(double) * (size_t)nb);
+    if (!re || !im || !P || !lv || !rs) {
+        free(b0); free(b1); free(lf); free(re); free(im); free(P); free(lv); free(rs);
+        return 0;
+    }
+
+    /* Detrend design matrix is the same for every capsule too: fit level = a + b * log f and keep the
+     * residual. Anything smoother than the analysis band is a spectral tilt, not a comb, and it is
+     * present in the single-speaker reference as well — so removing it here costs nothing and stops a
+     * loudspeaker's own response from reading as interference. */
+    double su = 0.0, suu = 0.0;
+    for (int b = 0; b < nb; ++b) { su += lf[b]; suu += lf[b] * lf[b]; }
+    double umean = su / (double)nb, uvar = suu - su * su / (double)nb;
+    if (uvar < 1e-18) uvar = 1e-18;
+
+    double depth[ZYLIA_MICS];
+    int ndep = 0;
+    for (int ch = 0; ch < ZYLIA_MICS; ++ch) {
+        if (exclude && exclude[ch]) continue;     /* skipped outright: 0 * NaN is NaN */
+
+        for (int k = 0; k < N; ++k) P[k] = 0.0;
+        int frames = 0;
+        for (uint32_t off = 0; off + (uint32_t)N <= n; off += (uint32_t)H) {
+            for (int t = 0; t < N; ++t) {
+                double w = 0.5 - 0.5 * cos(2.0 * M_PI * (double)t / (double)(N - 1));   /* Hann */
+                re[t] = w * (double)x[ch][off + (uint32_t)t];
+                im[t] = 0.0;
+            }
+            fft(re, im, N, +1);
+            for (int k = kmin; k <= kmax; ++k) P[k] += re[k]*re[k] + im[k]*im[k];
+            ++frames;
+        }
+        if (!frames) continue;
+
+        double emax = 0.0;
+        for (int b = 0; b < nb; ++b) {
+            double e = 0.0;
+            for (int k = b0[b]; k <= b1[b]; ++k) e += P[k];
+            e /= (double)frames * (double)(b1[b] - b0[b] + 1);
+            lv[b] = e;
+            if (e > emax) emax = e;
+        }
+        if (!(emax > 0.0)) continue;              /* silent (or non-finite) capsule: nothing to read */
+
+        /* dB, with a floor 120 dB under the band's own peak. A notch deeper than that is a notch
+         * either way, and the floor keeps one arbitrarily deep null from setting the scale. */
+        double efloor = emax * 1e-12;
+        for (int b = 0; b < nb; ++b) lv[b] = 10.0 * log10((lv[b] > efloor ? lv[b] : efloor));
+
+        double sv = 0.0, suv = 0.0;
+        for (int b = 0; b < nb; ++b) { sv += lv[b]; suv += lf[b] * lv[b]; }
+        double slope = (suv - su * sv / (double)nb) / uvar;
+        double icept = sv / (double)nb - slope * umean;
+        for (int b = 0; b < nb; ++b) rs[b] = lv[b] - (icept + slope * lf[b]);
+
+        qsort(rs, (size_t)nb, sizeof(double), zy_cmp_double);
+        double d = zy_pct(rs, nb, 0.90) - zy_pct(rs, nb, 0.10);
+        if (!(d == d) || d < 0.0 || d > 1e5) continue;      /* NaN / nonsense: drop the capsule */
+        depth[ndep++] = d;
+    }
+
+    free(b0); free(b1); free(lf); free(re); free(im); free(P); free(lv); free(rs);
+    if (ndep < ZY_COMB_MINCAPS) return 0;
+
+    /* MEAN over capsules, not median: the capsules are averaging one comb's noise down, which is the
+     * only thing the capsule axis is good for here. Robustness against a broken capsule is
+     * zylia_check_capsules' job, through `exclude` — that is the division of labor everywhere else in
+     * this file, and duplicating it with a robust average would only hide faults the check reports. */
+    double mean = 0.0;
+    for (int i = 0; i < ndep; ++i) mean += depth[i];
+    mean /= (double)ndep;
+    if (depth_db_out) *depth_db_out = (float)mean;
+
+    if (quality_out) {
+        /* How well determined is the mean above? The capsules scatter for two reasons: estimator noise,
+         * and the fact that they really do sit at 19 slightly different points of one interference
+         * field. Both are beaten down by averaging, so the believability figure is the STANDARD ERROR
+         * of the mean, not the raw spread — quoting the spread would condemn a perfectly good number
+         * for a reason the averaging already handled. What it still catches is the failure that
+         * matters: a capsule carrying a comb that is not the array's, which no amount of averaging
+         * fixes and which drags the SEM up immediately. */
+        double var = 0.0;
+        for (int i = 0; i < ndep; ++i) { double e = depth[i] - mean; var += e * e; }
+        double sem = sqrt(var / (double)ndep) / sqrt((double)ndep);
+        double q = 1.0 - sem / ZY_COMB_QSPREAD;
+        *quality_out = (float)(q < 0.0 ? 0.0 : (q > 1.0 ? 1.0 : q));
+    }
+    return 1;
+}
+
 int zylia_survey(const float src_m[][3], const double (*arrival_s)[ZYLIA_MICS], int nobs, double c,
                  float caps_out[ZYLIA_MICS][3], float* resid_us, float* radius_out, float* spread_out) {
     if (!src_m || !arrival_s || !caps_out || nobs < 4 || c <= 0.0) return 0;

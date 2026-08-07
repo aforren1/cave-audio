@@ -7,7 +7,8 @@ Two implementations now exist behind these features: Steam Audio's ray tracer
 phonon-free geometric path (`src/ism.c` early reflections + `src/fdn.c` late reverb + manual
 occlusion). **Read "Choosing an acoustics path" first**: they are complementary, not rivals, and
 the recommended configuration mixes them. See [api.md](./api.md)'s "Feature overview" for what's
-implemented and tested across the engine.
+implemented and tested across the engine, and [glossary.md](./glossary.md) for a one-line lookup of
+any term below.
 
 ## Choosing an acoustics path
 

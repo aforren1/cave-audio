@@ -4,6 +4,38 @@ All notable changes to `com.brainworks.bw_audio`.
 
 ## [Unreleased]
 
+### Added — SPCAP focus/density tuning, and an ABI break to score it (`BWA_VERSION` → 0.11.0)
+
+SPCAP's lobe sharpness and placement-correction exponent were compile-time `#define`s (12.0 / 2.0).
+The 12 was only ever right for the 26-speaker cave, so `focus` now **derives from the array**: the
+mean nearest-neighbor angle between speaker directions, then the exponent that puts the lobe 6 dB
+down in energy there. The cube grid lands on 12.70; a 6-speaker cross derives 2.0, a 12-speaker ring
+20.0. `density` keeps a plain 2.0 (nothing measurable maps onto it).
+
+- **`bwa_set_spcap_focus(e, focus, density)`** retunes SPCAP live, per-frame-safe, and the change
+  reaches **every** source on the next block including sources that never move. Pass `0` or less for
+  either argument to revert *that one* to its default. Inert under DBAP and VBAP. Neither value
+  lives in the layout file: like `bwa_set_near_spread` and `bwa_set_dual_band`, persisting a dialed
+  value is your application's business. Unity: `spcapFocus` / `spcapDensity` inspector fields plus
+  `SetSpcapFocus(focus, density)`. Godot: `BwaEngine.set_spcap_focus` and
+  `BwaEngine.get_spcap_focus_default`.
+- **`bwa_spcap_focus_default(positions, n)`** is the pure companion (no engine handle, same contract
+  as `bwa_panner_gains_batch`), so a tool can print what an in-progress array implies before you
+  override it. Returns 0 on bad arguments.
+- **ABI break: `bwa_panner_gains_batch` gained `float focus, float density`** immediately before
+  `out`, honoring the same `<= 0` sentinel: either one at or below zero means "the default for THIS
+  array", so `focus` falls back to the value derived from the `positions` you passed, `density` to
+  2.0. Both are inert under `BWA_PAN_DBAP` and `BWA_PAN_VBAP`. Update call sites: the old
+  `(panner, positions, n, lis, srcs, nsrc, out)` becomes
+  `(panner, positions, n, lis, srcs, nsrc, 0f, 0f, out)` for identical behavior. This is what lets a
+  layout be **scored** at the tuning it ships with. `bwa_layout_tool` now runs its Score board, its
+  rE coverage overlay, its badness map and its optimizer cost through the dialed value, with focus
+  and density sliders on the analyze panel beside the preview panel's live pair, and a headless
+  `--score <file> focus=<n> density=<n>` for sweeping the knob offline.
+- Both GUI tools drive the knobs by ear too: the playground's localization scene gained a panner
+  combo, focus and density sliders and a "default" button; the layout tool's preview panel the same
+  beside its `B` panner A/B. Each prints what the loaded array derives.
+
 ### Added: layout-tool conditions, stages, and pinned speaker allocation
 
 What a layout is optimized FOR is now a first-class artifact in `bwa_layout_tool`,

@@ -155,6 +155,128 @@ static void test_geometry(void) {
  * The last check is the one that matters: the same arrivals, decoded against the BUILT-IN table, must
  * come out badly wrong. If they didn't, the survey wouldn't be buying anything.
  */
+/* ---- comb depth, on a signal whose comb we built by hand ----------------------------------------
+ *
+ * The physics the estimator claims to read: N coherent copies of ONE signal, arriving at N different
+ * times, interfere into a rippled magnitude response. So build exactly that and nothing else. A single
+ * broadband source, delayed and scaled into 1..5 copies, summed identically at every capsule (which is
+ * what the geometry says really happens across a 98 mm shell in this band) plus independent per-capsule
+ * noise so the capsules are not literally the same signal.
+ *
+ * Note the amplitude profile: one dominant copy plus progressively more copies at HALF its amplitude.
+ * That is a panner lobe loosening, and it is the sequence the metric has to be monotone in. Equal
+ * amplitudes would NOT be: two equal copies null completely and comb harder than twenty do, so a test
+ * built on equal copies would fail for a correct estimator and teach the wrong lesson about focus.
+ *
+ * Nothing here shares a line with the estimator: no FFT, no bands, no dB. The forward model is a
+ * delay-and-add in the time domain. */
+#define COMB_N   32768u
+#define COMB_PRE 512u
+
+static void comb_field(float* buf, const double* s, uint32_t n, int ncopy, const int* delay,
+                       unsigned int seed, int oddball, const int* odd_delay) {
+    unsigned int rng = seed;
+    for (int ch = 0; ch < ZYLIA_MICS; ++ch) {
+        const int* d = (ch == oddball) ? odd_delay : delay;
+        for (uint32_t t = 0; t < n; ++t) {
+            double v = 0.0;
+            for (int k = 0; k < ncopy; ++k)
+                v += (k == 0 ? 1.0 : 0.5) * s[(size_t)COMB_PRE + t - (uint32_t)d[k]];
+            rng = rng * 1664525u + 1013904223u;
+            v += ((double)(int)(rng >> 9) / (double)(1 << 22) - 1.0) * 0.01;   /* -40 dB, independent */
+            buf[(size_t)ch * n + t] = (float)(v * 0.2);
+        }
+    }
+}
+
+static void test_comb(void) {
+    const double FS = 48000.0;
+    /* Copy delays: 0 to 5 ms, so the first notch of every pair (907 Hz down to 199 Hz apart) lands
+     * inside the 400-1200 Hz band the estimator is asked for. */
+    const int DEL[6]  = { 0, 53, 97, 149, 199, 241 };
+    const int ODD[6]  = { 0,  7, 11,  17,  23,  29 };   /* a capsule seeing a completely different comb */
+
+    double* s   = (double*)malloc(sizeof(double) * (COMB_N + COMB_PRE));
+    float*  buf = (float*)malloc(sizeof(float) * (size_t)ZYLIA_MICS * COMB_N);
+    if (!s || !buf) { printf("FAIL: comb test out of memory\n"); ++fails; free(s); free(buf); return; }
+    const float* ptr[ZYLIA_MICS];
+    for (int ch = 0; ch < ZYLIA_MICS; ++ch) ptr[ch] = buf + (size_t)ch * COMB_N;
+
+    unsigned int rng = 20260807u;
+    for (uint32_t i = 0; i < COMB_N + COMB_PRE; ++i) {
+        rng = rng * 1664525u + 1013904223u;
+        s[i] = (double)(int)(rng >> 9) / (double)(1 << 22) - 1.0;      /* broadband, flat, seeded */
+    }
+
+    double prev = -1.0, one = 0.0, four = 0.0;
+    for (int ncopy = 1; ncopy <= 5; ++ncopy) {
+        comb_field(buf, s, COMB_N, ncopy, DEL, 4242u, -1, NULL);
+        float d = 0.f, q = 0.f;
+        CHECK(zylia_comb_depth(ptr, COMB_N, FS, 400.0, 1200.0, NULL, &d, &q), "comb depth resolves");
+        printf("[comb         ] %d coherent cop%s: depth %5.2f dB   quality %.2f\n",
+               ncopy, ncopy == 1 ? "y " : "ies", d, q);
+        CHECK(q > 0.7f, "the capsules agree about the comb, as the geometry says they must");
+        CHECK((double)d > prev + 0.25, "comb depth rises with every added coherent copy");
+        prev = d;
+        if (ncopy == 1) one  = d;
+        if (ncopy == 4) four = d;
+    }
+    /* ONE copy is not a comb at all: whatever is left is the analysis floor (a periodogram's own
+     * scatter), and it must be small enough that the multi-copy numbers are not measuring it. */
+    CHECK(one < 2.5, "a single coherent copy reads at the analysis floor");
+    CHECK(four > one + 4.0, "...and four copies stand well clear of that floor");
+
+    /* EXCESS OVER A REFERENCE, which is the only way this number is readable. The one-copy case is
+     * structurally what valid.c's physical reference arm measures (one speaker driven alone), so the
+     * subtraction below is the same arithmetic the harness runs through valid_contrast. */
+    printf("[comb         ] excess over the one-copy reference: %.2f dB\n", four - one);
+    CHECK(four - one > 4.0, "the excess over a single-copy reference is the comb");
+
+    /* ---- the exclude mask ----
+     * Give ONE capsule a completely different comb (copies 0.15 to 0.6 ms apart, whose notches sit
+     * above the band, so it reads nearly flat). The mask must remove it, and the un-masked answer must
+     * visibly differ — otherwise the mask is decorative. */
+    {
+        comb_field(buf, s, COMB_N, 5, DEL, 4242u, 5, ODD);
+        unsigned char ex[ZYLIA_MICS] = { 0 };
+        float d_in = 0.f, q_in = 0.f, d_ex = 0.f, q_ex = 0.f;
+        CHECK(zylia_comb_depth(ptr, COMB_N, FS, 400.0, 1200.0, NULL, &d_in, &q_in), "unmasked resolves");
+        ex[5] = ZYLIA_CAP_INCOHERENT;
+        CHECK(zylia_comb_depth(ptr, COMB_N, FS, 400.0, 1200.0, ex, &d_ex, &q_ex), "masked resolves");
+        comb_field(buf, s, COMB_N, 5, DEL, 4242u, -1, NULL);
+        float d_clean = 0.f;
+        zylia_comb_depth(ptr, COMB_N, FS, 400.0, 1200.0, NULL, &d_clean, NULL);
+        printf("[comb         ] one odd capsule: unmasked %.2f dB (q %.2f)  masked %.2f dB (q %.2f)  "
+               "clean %.2f dB\n", d_in, q_in, d_ex, q_ex, d_clean);
+        CHECK(fabs((double)d_ex - d_clean) < 0.05, "excluding the odd capsule recovers the clean answer");
+        CHECK(fabs((double)d_in - d_clean) > 0.20, "...and leaving it in does not, so the mask matters");
+        CHECK(q_ex > q_in, "quality reports the disagreement the odd capsule causes");
+
+        /* the mask can also empty the array: too few capsules left is a refusal, not a guess */
+        for (int ch = 0; ch < ZYLIA_MICS; ++ch) ex[ch] = ZYLIA_CAP_DEAD;
+        ex[0] = 0; ex[1] = 0;
+        CHECK(!zylia_comb_depth(ptr, COMB_N, FS, 400.0, 1200.0, ex, &d_ex, NULL),
+              "two surviving capsules is too few to report a spread");
+    }
+
+    /* ---- refusals ----
+     * A narrow band is the important one. bwa_validate's --tone stimulus analyzes +-1/6 octave around
+     * one frequency, and a comb evaluated at one frequency is just a gain: there is no ripple to have.
+     * Refusing is the honest answer, and it is why ValidCell carries comb_ok separately from ok. */
+    {
+        float d = 0.f;
+        CHECK(!zylia_comb_depth(ptr, 4096u, FS, 400.0, 1200.0, NULL, &d, NULL),
+              "fewer than ZYLIA_COMB_NFFT samples is refused");
+        CHECK(!zylia_comb_depth(ptr, COMB_N, FS, 891.0, 1122.0, NULL, &d, NULL),
+              "a tone's +-1/6-octave band is too narrow to hold a comb, and is refused");
+        CHECK(!zylia_comb_depth(ptr, COMB_N, FS, 1200.0, 400.0, NULL, &d, NULL), "an inverted band is refused");
+        CHECK(!zylia_comb_depth(NULL, COMB_N, FS, 400.0, 1200.0, NULL, &d, NULL), "a null capture is refused");
+        CHECK(!zylia_comb_depth(ptr, COMB_N, 0.0, 400.0, 1200.0, NULL, &d, NULL), "a zero sample rate is refused");
+    }
+
+    free(s); free(buf);
+}
+
 static void test_survey(void) {
     const double C = 343.0;
     enum { NOBS = 14 };
@@ -323,6 +445,7 @@ int main(void) {
 
     test_geometry();
     test_survey();
+    test_comb();
 
     struct { double pos[3]; const char* name; } cases[] = {
         {{  2.0,  1.2, -0.3 }, "right  (+X)"},

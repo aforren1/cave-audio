@@ -872,6 +872,7 @@ void bwa_set_decorrelation(bwa_engine* e, bool on)    { if (e) rt_set_decorrelat
 void bwa_set_bed_renderer(bwa_engine* e, bwa_bed_renderer r) { if (e) rt_set_bed_renderer(e->rt, (int)r); }
 void bwa_set_pose_prediction(bwa_engine* e, float lead_s) { if (e) rt_set_pose_prediction(e->rt, lead_s); }
 void bwa_set_near_spread(bwa_engine* e, float radius_m)    { if (e) rt_set_near_spread(e->rt, radius_m); }
+void bwa_set_spcap_focus(bwa_engine* e, float focus, float density) { if (e) rt_set_spcap_focus(e->rt, focus, density); }
 void bwa_set_extra_listeners(bwa_engine* e, const float* xyz, uint32_t count) { if (e) rt_set_extra_listeners(e->rt, xyz, count); }
 void bwa_source_set_loudness_comp(bwa_engine* e, bwa_source s, bool on) { if (e) rt_source_set_loudness_comp(e->rt, s, on); }
 void bwa_source_set_proximity(bwa_engine* e, bwa_source s, bool on) { if (e) rt_source_set_proximity(e->rt, s, on); }
@@ -959,12 +960,31 @@ void bwa_set_headphone_eq(bwa_engine* e, bool on) {
     if (e) InterlockedExchange(&e->hpeq_on, on ? 1 : 0);
 }
 
+/* Offline: SPCAP's geometry-derived default focus for an array of `n` speaker positions. Pure —
+ * same "for layout scoring/optimization in tools" contract as bwa_panner_gains_batch below. */
+float bwa_spcap_focus_default(const float* positions, uint32_t n) {
+    if (!positions || n < 2 || n > BWA_CHANNELS) return 0.f;
+    Layout L;
+    memset(&L, 0, sizeof L);
+    L.count = n;
+    for (uint32_t s = 0; s < n; ++s) {
+        L.speakers[s].pos[0] = positions[s*3+0];
+        L.speakers[s].pos[1] = positions[s*3+1];
+        L.speakers[s].pos[2] = positions[s*3+2];
+    }
+    layout_compute_ref(&L);                          /* the derivation is centroid-relative */
+    return layout_derive_spcap_focus(&L);
+}
+
 /* Offline: the chosen panner's per-speaker gains for `nsrc` source positions heard from one listener,
  * over a layout given as `n` speaker positions (3 floats each). Default DBAP/distance tuning. Shares
  * the SPCAP/VBAP per-listener cache across the batch, so it is efficient for grid evaluation. Writes
- * out[i*n + s]; returns nsrc. Not engine state — pure, for layout scoring/optimization in tools. */
+ * out[i*n + s]; returns nsrc. Not engine state — pure, for layout scoring/optimization in tools.
+ * `focus`/`density` are SPCAP's knobs (inert for DBAP/VBAP, which have no lobe); <= 0 on either
+ * reverts that one to this array's default. See the header contract. */
 uint32_t bwa_panner_gains_batch(bwa_panner panner, const float* positions, uint32_t n,
-                               const float lis[3], const float* srcs, uint32_t nsrc, float* out) {
+                               const float lis[3], const float* srcs, uint32_t nsrc,
+                               float focus, float density, float* out) {
     if (!positions || !lis || !srcs || !out || n == 0 || n > BWA_CHANNELS || nsrc == 0) return 0;
     Layout L = layout_default();                         /* default rolloff_r / distance attenuation */
     L.count = n;
@@ -977,12 +997,22 @@ uint32_t bwa_panner_gains_batch(bwa_panner panner, const float* positions, uint3
     }
     layout_compute_ref(&L);          /* keep the struct coherent (the panners themselves are listener-relative) */
     SpcapState sp; VbapState vb;
-    if (panner == BWA_PAN_SPCAP) spcap_reset(&sp);
+    if (panner == BWA_PAN_SPCAP) {
+        /* the same <= 0 sentinel bwa_set_spcap_focus honors: revert to the default for THIS array,
+         * which for focus means derive it from the caller's geometry rather than inherit the default
+         * grid's. Only SPCAP reads these and the derivation is O(N^2), so DBAP/VBAP skip it — a
+         * layout optimizer calls this in a hot loop. That is also what makes the two arguments
+         * INERT for those panners: nothing downstream of here looks at them. */
+        L.spcap_focus   = (focus   > 0.f) ? focus   : layout_derive_spcap_focus(&L);
+        L.spcap_density = (density > 0.f) ? density : BWA_SPCAP_DENSITY_DEFAULT;
+        spcap_reset(&sp);
+    }
     else if (panner == BWA_PAN_VBAP) vbap_reset(&vb);
     for (uint32_t i = 0; i < nsrc; ++i) {
         const float* src = &srcs[(size_t)i * 3];
         float* o = &out[(size_t)i * n];
-        if (panner == BWA_PAN_SPCAP)     spcap_gains(&sp, src, lis, &L, 1u, 1.0f, o);  /* cache reused across the batch */
+        if (panner == BWA_PAN_SPCAP)     spcap_gains(&sp, src, lis, &L, 1u, L.spcap_focus,   /* cache reused */
+                                                     L.spcap_density, 1.0f, o);              /* across the batch */
         else if (panner == BWA_PAN_VBAP) vbap_gains(&vb, src, lis, &L, 1u, 1.0f, o);
         else                            dbap_gains(src, lis, &L, 1.0f, o);
     }

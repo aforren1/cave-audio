@@ -500,3 +500,68 @@ past the limited level on that path too). Direct mode no longer seeds `dual_mix`
 (gcur_lo is never solved there; a dual-band toggle used to buy every play one block of LF dip).
 The manual-directivity readback (dir_pub) clears when the pattern is disabled or the voice
 destroyed, so `bwa_source_get_directivity` can't report a stale dipole gain.
+
+**SPCAP tuning became runtime (2026-08-07):** `focus` and `density` were `#define`s in `spcap.c`
+(12.0 / 2.0), so retuning the lobe meant a rebuild and the 12 was only ever right for the
+26-speaker cave. `focus` now DERIVES from the array: `layout_derive_spcap_focus` (layout.c, beside
+the `rolloff_r` derivation) takes the mean nearest-neighbor angle between speaker directions seen
+from `ref` and picks the exponent that puts the lobe 6 dB down in energy there,
+`n = ln(0.25)/ln((1+cos delta)/2)`, clamped 1..64. The cube grid measures 37.5 deg and derives
+12.70, so the constant it replaces was about right for this array and wrong for a sparse one (a
+6-speaker cross derives 2.0, a 12-speaker ring 20.0). `density` keeps a plain 2.0; nothing
+measurable maps onto it. Neither is a layout-file field — the file is a geometry/calibration
+artifact and nothing measures a lobe width, so they sit with the other live A/B knobs
+(`bwa_set_near_spread`, `bwa_set_dual_band`) and persist nowhere.
+
+`bwa_set_spcap_focus(e, focus, density)` is live, with `<= 0` on either argument meaning "revert
+that one to its default". The sentinel resolves at SOLVE time (rt_render re-reads
+`c->layout.spcap_focus` each block), so a later `rt_set_layout` can never strand a latched value.
+The load-bearing part is the re-solve: focus changes the gain vector of every source including
+motionless ones, and the two existing dirty-all sites write `v->dirty` from the CONTROL thread,
+legal only because both document a stopped audio thread. A live setter cannot (invariant 3), so
+RtCore gained `_Atomic uint32_t pan_gen` whose ONLY writer is the setter; each Voice carries a
+plain `pan_gen`, the mixer loads the counter once per block and re-solves any voice whose stamp
+lags. Release/acquire rather than relaxed: a voice that saw the new generation with the old focus
+would stamp itself current and swallow the change. `rt_feature_test`'s new section is the
+regression — a voice that never moves, in a scene whose listener never moves, must respond to the
+knob.
+
+Latent bug the change exposed: `powf(lobe, focus)` with a NEGATIVE base and a NON-INTEGER exponent
+is NaN, and one NaN poisons the whole normalized gain vector. An antipodal speaker rounds `cosang`
+a hair below -1, so `lobe` lands at about -5e-8. Invisible while focus was the integer 12; the
+derived 12.70 turned every default-grid solve into NaN until `spcap.c` clamped the lobe at 0.
+
+`bwa_spcap_focus_default(positions, n)` is the pure companion (same contract as
+`bwa_panner_gains_batch`), so a tool can print what an array implies without an engine. Both GUI
+tools drive the knobs: the playground's localization scene gained a panner combo plus focus and
+density sliders and a "default" button, the layout tool's preview panel the same beside its `B`
+panner A/B, each printing the derived number. Both `--tests` suites cover them.
+
+**...and the scoring path followed (2026-08-07, ABI break, `BWA_VERSION` -> 0.11.0):**
+`bwa_panner_gains_batch` gained `float focus, float density` before `out`, honoring the same `<= 0`
+sentinel. One sentinel across the whole feature was the point: `<= 0` means "the default for THIS
+array" at the setter, at `bwa_spcap_focus_default`, and now at the batch, where focus falls back to
+`layout_derive_spcap_focus` on the CALLER's geometry rather than the default grid's. Both arguments
+are inert for DBAP and VBAP.
+
+Two floats on a general call rather than an options struct, because the sibling
+`bwa_bed_gains_batch` already carries its decoder-specific knob (`max_re`) as a plain parameter, and
+a struct would need its own answer to "what does zero mean" next to a sentinel that already has one.
+The placement is trailing (before `out`) so the geometry/query arguments keep their positions; the
+alternative worth naming is `(panner, focus, density, positions, ...)`, which would match
+`bwa_bed_gains_batch`'s "mode then its knobs" front-loading.
+
+The payoff is in `layout_tool`: `pv_focus`/`pv_density` now feed all three batch call sites (the X
+score, the rE coverage overlay, the badness map), the same two globals the preview panel already
+dialed by ear, so a knob change re-scores instead of only re-rendering. The sliders got a second
+home on the analyze panel (where the overlays are actually visible; the preview panel hides them)
+and both copies call `mark_score()`. Headless, `--score <file> focus=<n> density=<n>` sweeps it. The
+new `viewer/spcap_focus_score` test is the regression, and it asserts the direction: raising focus
+above the derived 12.7 must NARROW the Frank spread, lowering it must widen it, the overlay's
+per-direction errors must move, and the DBAP/VBAP rows must be bit-identical whatever is passed.
+
+The two pure tools-API calls also got their first direct unit test, `test_tools_api` (a new target,
+not a `test_smoke` extension: it links `bwa_core` alongside the DLL so it can cross-check
+`bwa_spcap_focus_default` against the internal `layout_derive_spcap_focus`, which the DLL does not
+export). It pins the sentinel by construction: `focus <= 0` must reproduce the gains you get by
+passing `bwa_spcap_focus_default`'s answer for the same array, bit for bit.

@@ -41,8 +41,9 @@ binaural playground: `bwa_playground cave_layout.json`.
 
 **Scoring, constraints, and auto-optimization.** The tool can also *evaluate* and
 *improve* a layout for a chosen panner. Press **X** (or run `--score <file>`) to print
-each panner's rE-localization error: mean + worst over a direction shell × the
-working-volume listener grid, via `bwa_panner_gains_batch` (the same solve that ships).
+each panner's [rE-localization error](./glossary.md#re-error): mean + worst over a direction shell ×
+the working-volume listener grid, via `bwa_panner_gains_batch` (the same solve that ships). It is
+azimuth-weighted, not a plain angle; see [perceptual weighting](./glossary.md#perceptual-weighting).
 
 **Where the panner solves is not where you listen.** A fixed install solves once at the
 sweet spot and never corrects for you walking away; a tracked one re-solves at your
@@ -57,6 +58,15 @@ Expect worst-case numbers to be higher than they used to be. Those are the off-c
 off-height cells that were previously never evaluated. **A layout optimized for SPCAP or
 VBAP before this change was tuned against an objective that could not move, and is worth
 re-running.**
+
+**Scoring SPCAP scores a tuning, not just a geometry.** SPCAP's lobe sharpness is a
+runtime knob (`bwa_set_spcap_focus`), so the score has to know which value you mean. The
+tool's **focus** and **density** sliders feed `bwa_panner_gains_batch` directly, and the
+Score board, the rE overlay, the badness map, and the optimizer cost all follow them.
+0 keeps the value the geometry derives, which is what the panel prints under the sliders.
+Headless, `--score <file> focus=<n> density=<n>` sweeps the knob offline, so you can find
+the lobe a layout likes before you dial it by ear. The knobs are inert for DBAP and VBAP:
+those rows do not move whatever you pass.
 
 Press **M** for the **badness map**: a grid of *listener* positions through the working
 volume, each scored over a spread of directions, drawn as semitransparent voxels. The

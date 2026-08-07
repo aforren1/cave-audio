@@ -311,6 +311,15 @@ if(BWA_BUILD_TESTS)
   add_test(NAME smoke COMMAND test_smoke)
   bwa_copy_runtime_dll(test_smoke)
 
+  # The PURE tools API (bwa_spcap_focus_default / bwa_panner_gains_batch): no engine handle, so it
+  # is all numeric assertions on the real DLL. Links bwa_core TOO, because the focus default has to
+  # be cross-checked against the internal layout_derive_spcap_focus the DLL does not export. That
+  # cross-check is why it is not a smoke.c section (smoke.c is the public ABI and nothing else).
+  add_executable(test_tools_api test/tools_api_test.c)
+  target_link_libraries(test_tools_api PRIVATE bw_audio bwa_core)
+  add_test(NAME tools_api COMMAND test_tools_api)
+  bwa_copy_runtime_dll(test_tools_api)
+
   # Deterministic end-to-end golden through the manual sink (bwa_render_block): links the real dll.
   add_executable(test_golden test/golden_test.c)
   target_link_libraries(test_golden PRIVATE bw_audio)
@@ -632,6 +641,12 @@ if(BWA_BUILD_CALIBRATE)
     # a wrong table cancels out. The hook was once passed in and never called, which left --track
     # silently inert while announcing that the tracker was measuring. Exits 4 if it regresses.
     add_test(NAME validate_track COMMAND bwa_validate --simulate --track-sim --azimuths 4 --no-prompt)
+    # ...and the SPCAP focus sweep: more than one measured condition per panner, which is a different
+    # session shape (the condition list replaces the panner list) and a different report. The DSP the
+    # sweep reads is pinned in the valid/zylia ctests; this pins that the tool actually walks it.
+    add_test(NAME validate_focus
+             COMMAND bwa_validate --simulate --focus 4,32 --azimuths 4 --no-prompt
+                     --position 0.5,1.5,-0.3)
   endif()
 
   # ZM-1 hardware bring-up probe: console meter over the shared capture shell (zylia_capture.cpp).

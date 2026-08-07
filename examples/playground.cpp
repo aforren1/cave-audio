@@ -327,6 +327,7 @@ static const char* g_layout_path;          /* optional cave_layout.json; NULL = 
 
 static Vector3 speakers[NSPK];
 static int     g_nspk = NSPK;     /* the engine's ACTIVE channel count (bwa_get_speakers); the layout's */
+static float   g_spcap_def;       /* SPCAP's geometry-derived default focus for the loaded layout */
 static Vector3 g_head;            /* the ear point = array centroid (the engine's nominal listening point);
                                    * room origin is on the FLOOR, so the head is NOT at the origin */
 static Vector3 source_pos = { 1.5f, 0.0f, 0.0f };   /* y re-based to ear height once the layout is known */
@@ -501,6 +502,11 @@ static void build_engine(int mode);   /* fwd: engine config — 0 interactive, 1
  * bobbing high<->low on three incommensurate periods, so the source sweeps the whole space over time. */
 static int   loc_auto, loc_flyby, loc_dop, loc_air, loc_dual;   /* loc_dop/loc_air/loc_spread/loc_dual persist */
 static float loc_t, loc_fly_t, loc_spread;
+/* the point-source panner and, under SPCAP, its two live tuning exponents. 0 on either exponent
+ * means "the default" (focus derived from the array geometry, density 2.0) - the same sentinel the
+ * ABI takes. These persist across a scene switch like loc_dual, and loc_enter re-applies them. */
+static int   loc_panner;
+static float loc_focus, loc_density;
 enum { LOC_TRAIL = 96 };
 static Vector3 loc_trail[LOC_TRAIL];
 static int     loc_trail_len;
@@ -511,6 +517,8 @@ static void loc_enter(void)  {
     bwa_source_set_air_absorption(e, src, loc_air);
     bwa_source_set_spread(e, src, loc_spread);
     bwa_set_dual_band(e, loc_dual);
+    bwa_set_panner(e, (bwa_panner)loc_panner);          /* switch_scene reset it to DBAP */
+    bwa_set_spcap_focus(e, loc_focus, loc_density);
 }
 static void loc_update(float dt) {
     if (kp(KEY_SPACE)) { loc_auto = !loc_auto; if (loc_auto) { loc_flyby = 0; loc_t = 0.0f; loc_trail_len = 0; } }
@@ -1054,6 +1062,9 @@ static void build_engine(int mode) {
     g_head = Vector3{ 0, 0, 0 };                         /* ear point = array centroid (the engine's own ref) */
     for (int i = 0; i < g_nspk; ++i) g_head = Vector3Add(g_head, speakers[i]);
     g_head = Vector3Scale(g_head, 1.0f / (float)g_nspk);
+    /* what SPCAP's focus knob falls back to on THIS array (bwa_spcap_focus_default is pure, so it
+     * reads the geometry we just pulled back rather than any engine state) */
+    g_spcap_def = bwa_spcap_focus_default((const float*)speakers, (uint32_t)g_nspk);
     for (int i = 0; i < NSIG; ++i) sounds[i] = bwa_load_sound(e, sig_files[i]);
     g_bed_snd = bwa_load_ambix(e, BED_FILE);             /* the bed scene's field (silent until played) */
     if (g_cust_mono_path[0]) {                           /* custom assets died with the old engine: reload */
@@ -1102,6 +1113,7 @@ static void switch_scene(int idx) {
     bwa_source_set_spread(e, src, 0.0f);
     bwa_set_dual_band(e, false);
     bwa_set_panner(e, BWA_PAN_DBAP);                               /* the ABX scene may leave SPCAP/VBAP selected */
+    bwa_set_spcap_focus(e, 0.0f, 0.0f);                            /* ...and the localization scene a dialed focus */
     bwa_set_spread_mode(e, BWA_SPREAD_LOBE);                       /* ...or a spread render / decorrelation */
     bwa_set_decorrelation(e, false);
     bwa_bed_stop(e, g_bed);                                        /* the bed scene's field + its knobs */
@@ -1399,6 +1411,39 @@ static void draw_panel(void) {
         if (chk("dual-band panning [M]", &loc_dual)) bwa_set_dual_band(e, loc_dual);
         bwTip("below ~700 Hz pans amplitude-normalized - sharper bass localization "
               "near the sweet spot; toggle it live and compare");
+        {   /* the point-source panner and, under SPCAP, its two live exponents */
+            static const char* pan_names[3] = { "panner: DBAP (moving observer)",
+                                                "panner: SPCAP (fixed observer)",
+                                                "panner: VBAP (fixed, sharpest)" };
+            ImGui::SetNextItemWidth(-FLT_MIN);
+            if (ImGui::Combo("##pan", &loc_panner, pan_names, 3)) bwa_set_panner(e, (bwa_panner)loc_panner);
+            bwTip("which panner writes the speaker bus. DBAP re-solves from the tracked position every "
+                  "block (the CAVE case); SPCAP and VBAP solve once for a FIXED sweet spot. The two "
+                  "sliders below are SPCAP's own knobs and do nothing under the other two.");
+            ImGui::BeginDisabled(loc_panner != 1);
+            ImGui::SetNextItemWidth(-uiScaled(62.0f));
+            if (ImGui::SliderFloat("##spcapfocus", &loc_focus, 0.0f, 48.0f,
+                                   loc_focus > 0.0f ? "focus %.1f" : "focus (default)"))
+                bwa_set_spcap_focus(e, loc_focus, loc_density);
+            bwTip("SPCAP lobe sharpness: higher concentrates a source on fewer speakers (tighter "
+                  "image, harder edges), lower spreads it (smoother, blurrier). 0 = the default "
+                  "derived from your array's speaker spacing. Live - even a parked source re-solves.");
+            ImGui::SameLine();
+            if (ImGui::Button("default##spcap")) {
+                loc_focus = 0.0f; loc_density = 0.0f;
+                bwa_set_spcap_focus(e, loc_focus, loc_density);
+            }
+            bwTip("back to the geometry-derived focus and the 2.0 density (sends 0, the ABI's sentinel)");
+            ImGui::SetNextItemWidth(-FLT_MIN);
+            if (ImGui::SliderFloat("##spcapdens", &loc_density, 0.0f, 8.0f,
+                                   loc_density > 0.0f ? "density %.2f" : "density (default 2.0)"))
+                bwa_set_spcap_focus(e, loc_focus, loc_density);
+            bwTip("exponent of the placement correction that de-biases a clustered array: higher "
+                  "pushes energy away from wherever speakers crowd together. Rarely worth moving. "
+                  "It feeds a cached per-speaker term, so dragging this rebuilds that cache.");
+            ImGui::TextDisabled("this array derives focus %.1f", (double)g_spcap_def);
+            ImGui::EndDisabled();
+        }
         ImGui::SetNextItemWidth(-FLT_MIN);
         if (ImGui::SliderFloat("##spread", &loc_spread, 0.0f, 1.0f, "size %.2f [C]"))
             bwa_source_set_spread(e, src, loc_spread);
@@ -1700,6 +1745,41 @@ static void register_tests(ImGuiTestEngine* te) {
         IM_CHECK_EQ(loc_auto, 0);
         ctx->ItemClick("**/pink noise");
         IM_CHECK_EQ(cur_sig, 0);
+    };
+
+    /* SPCAP's live tuning knobs, driven through the real panel: the panner combo arms them, the
+     * sliders push focus/density, and "default" sends the <= 0 sentinel that reverts both. The
+     * engine must stay live across all of it (the knob re-solves every voice, including parked ones). */
+    t = IM_REGISTER_TEST(te, "viewer", "spcap_focus");
+    t->TestFunc = [](ImGuiTestContext* ctx) {
+        switch_scene(0);
+        ctx->SetRef("playground");
+        IM_CHECK_GT(g_spcap_def, 1.0f);                          /* the array derives a usable default */
+        IM_CHECK_LT(g_spcap_def, 64.0f);
+        ctx->ItemClick("##pan");                                 /* the "##" combo header resolves by ID */
+        ctx->ItemClick("**/panner: SPCAP (fixed observer)");
+        IM_CHECK_EQ(loc_panner, 1);
+        ctx->ItemInputValue("**/##spcapfocus", 30.0f);           /* the sliders are live only under SPCAP */
+        IM_CHECK_EQ(loc_focus, 30.0f);
+        ctx->ItemInputValue("**/##spcapdens", 4.0f);
+        IM_CHECK_EQ(loc_density, 4.0f);
+        {   /* still rendering with the dialed knobs */
+            uint32_t n = 0; float m = 0.0f;
+            for (int tries = 0; tries < 60 && m <= 1e-6f; ++tries) { ctx->Yield(4); m = meters_max(&n); }
+            IM_CHECK_GT(m, 1e-4f);
+        }
+        ctx->ItemClick("**/default##spcap");                     /* the sentinel path */
+        IM_CHECK_EQ(loc_focus, 0.0f);
+        IM_CHECK_EQ(loc_density, 0.0f);
+        ctx->Yield(8);
+        ctx->ItemClick("##pan");                                 /* leave the scene on the default panner */
+        ctx->ItemClick("**/panner: DBAP (moving observer)");
+        IM_CHECK_EQ(loc_panner, 0);
+        {
+            uint32_t n = 0; float m = 0.0f;
+            for (int tries = 0; tries < 60 && m <= 1e-6f; ++tries) { ctx->Yield(4); m = meters_max(&n); }
+            IM_CHECK_GT(m, 1e-4f);
+        }
     };
 
     t = IM_REGISTER_TEST(te, "viewer", "tooltips");              /* the hover help actually shows */
