@@ -6,6 +6,8 @@ raw-readable version; **edit that one first and keep this in sync**. On top of t
 this page carries the *code map*: each stage names the function(s) that implement it (plain
 text, mostly `rt.c` and the module files) and the `bwa_*` calls that configure it (italics).
 The tap-order rationale (why the sends branch where they do) lives with the ASCII diagram.
+The signal kinds the graph labels (bed, direct field, reflection bed, pathing, and the rest)
+are defined one line each in [glossary.md](./glossary.md).
 
 ```mermaid
 flowchart TD

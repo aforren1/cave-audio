@@ -5,6 +5,9 @@ array over **ASIO → RME Digiface Dante**, with **binaural HRTF headphone
 rendering**: a first-class direct render, plus an array-audition monitor for
 desk-side debugging. Unity and Unreal connect as thin control clients over a C ABI.
 
+New to the vocabulary? [docs/glossary.md](docs/glossary.md) defines every term the docs use,
+grouped by topic, with each entry saying what it means for a decision.
+
 ## Why self-hosted
 
 Going direct (no FMOD/Wwise) gives sample-accurate access to ASIO timing hooks and

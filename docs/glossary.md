@@ -19,6 +19,29 @@ gains have no competitor and carry the unit on the value instead (`radius_m`, `x
 never on the call. The one hard rule is that a decibel value must say `_db`, because linear is the
 unmarked default everywhere.
 
+## By topic
+
+Use this when you do not yet know the term's name. Entries are grouped so the trade-offs sit
+together: rE beside rV, the three panners in one place, the three reverb paths in another.
+
+- [Panning and the array render](#panning-and-the-array-render) - the three panners, their knobs,
+  and what "listener-relative" buys.
+- [Energy-vector metrics and layout scoring](#energy-vector-metrics-and-layout-scoring) - how a
+  layout gets a number, and why two of those numbers move in opposite directions.
+- [Ambisonics, beds and decoders](#ambisonics-beds-and-decoders) - the diffuse layer, its
+  conventions, and the decoders that put it on speakers.
+- [Source width: spread, extent, decorrelation](#source-width-spread-extent-decorrelation) - the
+  three render modes for a source that is not a point.
+- [Acoustics: reflections, reverb and materials](#acoustics-reflections-reverb-and-materials) -
+  early versus late, and which of the three paths to run.
+- [Binaural and headphone renders](#binaural-and-headphone-renders) - the two headphone profiles
+  and the decode they share.
+- [Per-source propagation effects](#per-source-propagation-effects) - distance-driven per-voice DSP.
+- [Calibration and the acoustic survey](#calibration-and-the-acoustic-survey) - what
+  `bwa_calibrate` measures and writes.
+- [Validation vocabulary](#validation-vocabulary) - what `bwa_validate` measures, and the engine's
+  own coinages for reading it.
+
 ## Index
 
 **A** [Absorption](#absorption), [ACN](#acn), [Active-intensity DOA](#active-intensity-doa),

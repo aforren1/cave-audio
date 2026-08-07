@@ -1,5 +1,8 @@
 # Architecture
 
+This doc names most of the engine's moving parts. For a one-line definition of any
+spatial-audio term it uses, see [glossary.md](./glossary.md).
+
 ## Goal
 
 Render spatialized audio for a CAVE: a tracked observer moving within a ~3×3 m area

@@ -6,6 +6,10 @@ between the control thread and the audio thread. That spine lives in
 The `Voice`, `SoundData`, `Layout`, `Listener`, and `RtCore` structs are documented in
 [`internal-types.md`](./internal-types.md).
 
+This doc owns the threading and lifetime vocabulary: SPSC ring, commit snapshot, generation
+handle, retire-ack, seqlock. [glossary.md](./glossary.md) deliberately does not repeat any of
+it and sends you here instead. Go the other way for the spatial-audio terms.
+
 ## Threads
 
 Two threads carry the core:

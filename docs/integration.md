@@ -7,6 +7,9 @@ engine, only control calls on the main thread. The one inbound exception is the 
 push-source feed (`bwa_source_push`): caller-generated PCM *into* the engine,
 on the same control thread: a source feed, not a render path.
 
+If a term in the binding surface is unfamiliar, [glossary.md](./glossary.md) defines it in one
+line and points at the doc that owns it.
+
 ## Coordinate seam (the part that silently ruins spatial audio)
 
 The core works in **room space: right-handed, +Y up, +Z forward, meters, origin on

@@ -3,6 +3,9 @@
 These types are **internal** to `src/`: they are *not* part of the public ABI
 and must **not** go in [`include/bw_audio.h`](../include/bw_audio.h).
 
+The field names below carry the engine's domain vocabulary; [glossary.md](./glossary.md)
+defines those terms in one line each.
+
 This file pins the protocol fields that [`concurrency.md`](./concurrency.md)
 reasons about and summarizes the per-subsystem field groups around them. It
 tracks the *shape* of the structs, not every field; the full definitions live in
