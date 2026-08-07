@@ -26,7 +26,7 @@ flowchart TD
     PATHS["path sim 10 Hz: per-voice shCoeffs + bending tilt<br/>steam_path.c → rt_set_pathing<br/><i>bwa_desc.enable_pathing · bwa_source_set_pathing</i>"]
   end
 
-  SOLVE["gain solve: compute_gains (block rate, dirty-gated)<br/>panner_gains → dbap_gains / spcap_gains / vbap_gains →<br/>per-source atten override (by ratio, atten_curve) →<br/>spread: spread_gains (LOBE) / mdap_gains / fs_solve (SPECTRAL);<br/>anisotropic w×h extent (up-anchored frame + affine squash)<br/><i>bwa_set_panner · _dual_band · _spread_mode · _near_spread ·<br/>_extra_listeners · bwa_source_set_spread / _extent / _size / _gain /<br/>_attenuation_override · bwa_group_set_gain · bwa_source_fade_to</i>"]
+  SOLVE["gain solve: compute_gains (block rate, dirty-gated)<br/>panner_gains → dbap_gains / spcap_gains / vbap_gains →<br/>per-source atten override (by ratio, atten_curve) →<br/>spread: spread_gains (LOBE) / mdap_gains / fs_solve (SPECTRAL);<br/>anisotropic w×h extent (up-anchored frame + affine squash)<br/><i>bwa_set_panner · _spcap_focus · _dual_band · _spread_mode ·<br/>_near_spread · _extra_listeners · bwa_source_set_spread / _extent /<br/>_size / _gain / _attenuation_override · bwa_group_set_gain ·<br/>bwa_source_fade_to</i>"]
 
   subgraph VOICE["mono voice: mix_voice, per sample (inside rt_render)"]
     READ["read: pcm cursor · pitch resample · stream_pull<br/><i>bwa_source_play / _play_at / _play_loop / _queue · bwa_source_set_pitch</i>"]
