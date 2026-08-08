@@ -26,12 +26,12 @@ void layout_compute_ref(Layout* L) {
     for (int i = 0; i < 3; ++i) L->ref[i] = L->count ? (float)(s[i] / L->count) : 0.f;
 }
 
-/* SPCAP focus from the geometry (see layout.h): mean nearest-neighbor angle between speaker
- * directions seen from ref, then the -6 dB-at-that-angle lobe exponent. Sanity: 30 deg -> ~20,
- * 45 deg -> ~8.8, 60 deg -> ~4.8; the default 26-speaker cube grid -> ~12.7. */
-float layout_derive_spcap_focus(const Layout* L) {
+/* The array's own angular scale (see layout.h): mean nearest-neighbor angle between speaker
+ * directions seen from ref. Two features derive from it — SPCAP's lobe width (below) and the
+ * hole-aware spread floor's knee (hole.c) — so it lives here once. */
+float layout_mean_speaker_spacing(const Layout* L) {
     const uint32_t N = L ? L->count : 0;
-    if (N < 2) return 12.0f;                       /* nothing to measure a separation against */
+    if (N < 2) return 0.f;                         /* nothing to measure a separation against */
     double sum = 0.0;
     uint32_t used = 0;
     for (uint32_t k = 0; k < N; ++k) {
@@ -50,10 +50,17 @@ float layout_derive_spcap_focus(const Layout* L) {
         if (best < -1.0) best = -1.0;
         sum += acos(best); ++used;
     }
-    if (!used) return 12.0f;
-    const double delta = sum / used;
+    return used ? (float)(sum / used) : 0.f;
+}
+
+/* SPCAP focus from the geometry (see layout.h): the mean nearest-neighbor speaker angle above, then
+ * the -6 dB-at-that-angle lobe exponent. Sanity: 30 deg -> ~20, 45 deg -> ~8.8, 60 deg -> ~4.8; the
+ * default 26-speaker cube grid -> ~12.7. */
+float layout_derive_spcap_focus(const Layout* L) {
+    const double delta = layout_mean_speaker_spacing(L);
     /* co-located speakers (delta ~ 0) blow the log up; an antipodal-only array (delta ~ pi) sends the
-     * denominator to -inf. Both are degenerate surveys — keep the historical constant. */
+     * denominator to -inf. Both are degenerate surveys (as is a < 2 speaker one, which reads 0
+     * here) — keep the historical constant. */
     if (delta < 1e-3 || delta > 3.1) return 12.0f;
     const double denom = log(0.5 * (1.0 + cos(delta)));
     if (!(denom < -1e-9)) return 12.0f;

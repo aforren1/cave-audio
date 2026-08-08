@@ -73,6 +73,10 @@ namespace BwAudio
         [Tooltip("Split at ~700 Hz and pan the low band with amplitude normalization: sharper LF " +
                  "localization for a near-centered listener. Sweet-spot dependent.")]
         public bool dualBand = false;
+        [Tooltip("Needs Dual Band. Corrects the low band's interaural time difference for the tracked " +
+                 "head ORIENTATION, so a source holds still as the listener turns their head. Wants a " +
+                 "real tracked pose; aimed at a seated listener.")]
+        public bool cap = false;
         [Tooltip("SPCAP only: lobe sharpness. Higher concentrates a source on fewer speakers (tighter " +
                  "image), lower spreads it (smoother). 0 or less = the default derived from your array's " +
                  "speaker spacing (about 12.7 on the 26-speaker grid).")]
@@ -92,12 +96,28 @@ namespace BwAudio
         [Tooltip("Widen sources that come close to the head, instead of letting them snap across the " +
                  "nearest speaker. ~1 m is a good start; 0 = off.")]
         public float nearSpreadRadius = 0f;
+        [Tooltip("Widen sources aimed where the array has NO speaker (the CAVE barrel is open at both " +
+                 "poles), instead of rendering them as a split image across two distant speakers. Inert " +
+                 "on an array that surrounds the listener. 1 = the honest width; 0 = off.")]
+        [Range(0f, 2f)] public float holeSpread = 0f;
         [Tooltip("Speed of sound (m/s; live). Doppler and reflection delays derive from it and GLIDE to " +
                  "a change. 343 = air, 1480 = underwater; small values exaggerate Doppler (slow motion).")]
         public float speedOfSound = 343f;
         [Tooltip("For layouts carrying a room_eq_grid (bwa_calibrate --room-eq-grid): re-interpolate the LF " +
                  "modal cuts at the live listener position. No-op without a grid; this is the kill switch.")]
         public bool trackedRoomEq = true;
+        [Tooltip("Re-align the array's arrival times on the TRACKED listener instead of the fixed array " +
+                 "centroid, so time coherence follows the head. OFF by default: every delay change resamples, " +
+                 "so a walking listener Doppler-shifts the whole array. Try it, listen for warble.")]
+        public bool trackedAlign = false;
+        [Tooltip("Tracked align: how far the head must move (METERS) before the alignment is recomputed. " +
+                 "Tracker jitter would otherwise keep the array permanently gliding. 0 = the 5 cm default.")]
+        [Range(0f, 0.5f)] public float trackedAlignDeadZone = 0f;
+        [Tooltip("Tracked align: cap on how fast a speaker's delay may change, in AUDIO frames per second " +
+                 "(not video FPS). This over the sample rate is the resampling ratio, so it is what bounds " +
+                 "the pitch shift. 0 = the default (~63 at 48 kHz, following a 0.45 m/s walk); higher tracks " +
+                 "a faster listener and is more audible.")]
+        public float trackedAlignSlew = 0f;
 
         [Header("Diffuse beds (AmbisonicBed / reverb)")]
         [Tooltip("Load-time. AllRAD (default) localizes a touch sharper; EPAD keeps a panned wave's loudness " +
@@ -294,15 +314,18 @@ namespace BwAudio
         {
             Bwa.bwa_set_panner(_eng, panner);
             Bwa.bwa_set_dual_band(_eng, dualBand);
+            Bwa.bwa_set_cap(_eng, cap);
             Bwa.bwa_set_spcap_focus(_eng, spcapFocus, spcapDensity);
             Bwa.bwa_set_spread_mode(_eng, spreadMode);
             Bwa.bwa_set_decorrelation(_eng, decorrelation);
             Bwa.bwa_set_near_spread(_eng, nearSpreadRadius);
+            Bwa.bwa_set_hole_spread(_eng, holeSpread);
             Bwa.bwa_set_speed_of_sound(_eng, speedOfSound);
             Bwa.bwa_set_bed_renderer(_eng, bedRenderer);
             Bwa.bwa_set_max_re(_eng, maxRe);
             Bwa.bwa_set_max_re_split(_eng, maxReSplit);
             Bwa.bwa_set_tracked_room_eq(_eng, trackedRoomEq);
+            Bwa.bwa_set_tracked_align(_eng, trackedAlign, trackedAlignDeadZone, trackedAlignSlew);
             Bwa.bwa_set_master_gain(_eng, masterGain);
             Bwa.bwa_set_reverb_gain(_eng, reverbGain);   // valid pre-start: seeds whichever reverb bed bwa_start creates
             Bwa.bwa_set_early_reflections_gain(_eng, earlyReflectionGain);
@@ -437,6 +460,10 @@ namespace BwAudio
         // ---- live rendering A/B (each of these is atomic / crossfaded engine-side) --------------------
         public void SetPanner(BwaPanner p)        { panner = p;        if (Ready) Bwa.bwa_set_panner(_eng, p); }
         public void SetDualBand(bool on)         { dualBand = on;     if (Ready) Bwa.bwa_set_dual_band(_eng, on); }
+        /// <summary>Compensated amplitude panning on the dual-band low band. Inert unless
+        /// <see cref="SetDualBand"/> is on. Corrects the rendered interaural time difference for the
+        /// tracked head orientation, so an image holds still under head rotation.</summary>
+        public void SetCap(bool on)              { cap = on;          if (Ready) Bwa.bwa_set_cap(_eng, on); }
         /// <summary>SPCAP's lobe sharpness and placement-correction density exponent (inert under DBAP/VBAP).
         /// Pass 0 or less for either to revert THAT one to its default: focus to the value derived from the
         /// array geometry, density to 2.0. Every source re-solves next block, static ones included.</summary>
@@ -445,11 +472,25 @@ namespace BwAudio
         public void SetSpreadMode(BwaSpreadMode m){ spreadMode = m;    if (Ready) Bwa.bwa_set_spread_mode(_eng, m); }
         public void SetDecorrelation(bool on)    { decorrelation = on; if (Ready) Bwa.bwa_set_decorrelation(_eng, on); }
         public void SetNearSpread(float radiusM) { nearSpreadRadius = radiusM; if (Ready) Bwa.bwa_set_near_spread(_eng, radiusM); }
+        /// <summary>Floor a source's spread by how far its bearing sits from the nearest speaker, so a source
+        /// aimed into an array HOLE renders as an honest wide source instead of a split image. 0 = off;
+        /// 1 = the honest width. Inert on an array that surrounds the listener, and every source re-solves
+        /// next block, static ones included.</summary>
+        public void SetHoleSpread(float strength) { holeSpread = strength; if (Ready) Bwa.bwa_set_hole_spread(_eng, strength); }
         public void SetBedRenderer(BwaBedRenderer r) { bedRenderer = r; if (Ready) Bwa.bwa_set_bed_renderer(_eng, r); }
         public void SetMaxRe(bool on)            { maxRe = on;        if (Ready) Bwa.bwa_set_max_re(_eng, on); }
         /// <summary>Band-split max-rE (needs max-rE on): taper only above ~700 Hz, plain decode below. Live A/B.</summary>
         public void SetMaxReSplit(bool on)       { maxReSplit = on;   if (Ready) Bwa.bwa_set_max_re_split(_eng, on); }
         public void SetTrackedRoomEq(bool on)    { trackedRoomEq = on; if (Ready) Bwa.bwa_set_tracked_room_eq(_eng, on); }
+        /// <summary>Re-align the array's arrival times on the TRACKED listener instead of the fixed array
+        /// centroid. OFF by default: every delay change is a resampling event, so a walking listener glides
+        /// all 26 delays at once. `deadZoneM` is how far the head must move before anything is recomputed
+        /// (0 = the 5 cm default); `slewFramesPerS` caps how fast a delay may change, in audio frames per
+        /// second (0 = the default, about 63 at 48 kHz, which follows a 0.45 m/s walk). A faster listener
+        /// LAGS rather than pitch-shifting. Off glides back to the layout's own trims.</summary>
+        public void SetTrackedAlign(bool on, float deadZoneM = 0f, float slewFramesPerS = 0f)
+            { trackedAlign = on; trackedAlignDeadZone = deadZoneM; trackedAlignSlew = slewFramesPerS;
+              if (Ready) Bwa.bwa_set_tracked_align(_eng, on, deadZoneM, slewFramesPerS); }
         /// <summary>Lead the TRACKED pose by `seconds` to hide motion-to-ears latency. Internal tracking only
         /// (Feed Listener off) — when Unity feeds the pose, predict on the Unity side instead.</summary>
         public void SetPosePrediction(float seconds)  { posePredictionS = seconds; if (Ready && !feedListener) Bwa.bwa_set_pose_prediction(_eng, seconds); }

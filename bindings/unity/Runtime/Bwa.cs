@@ -398,6 +398,11 @@ namespace BwAudio
         // one to its default — focus falls back to a value derived from the array geometry.
         [DllImport(DLL, CallingConvention = CC)] public static extern void bwa_set_spcap_focus(IntPtr e, float focus, float density);
         [DllImport(DLL, CallingConvention = CC)] public static extern void bwa_set_dual_band(IntPtr e, [MarshalAs(UnmanagedType.I1)] bool on);
+        // Compensated amplitude panning on that low band. REQUIRES dual band (the low band is the only
+        // thing it touches). Constrains the interaural component of the summed field to a real source's,
+        // using the tracked head ORIENTATION, so the image holds still as the listener turns. A no-op
+        // facing the source, and it fades out with source spread.
+        [DllImport(DLL, CallingConvention = CC)] public static extern void bwa_set_cap(IntPtr e, [MarshalAs(UnmanagedType.I1)] bool on);
         // How bwa_source_set_spread renders width (live A/B): LOBE (default, one reshaped solve), MDAP
         // (a ring of virtual sources panned with the selected panner — panner-true, ~13x the solve cost),
         // or SPECTRAL (frequency-dependent panning: 6 bands, each to its own direction in the cone — width
@@ -418,6 +423,12 @@ namespace BwAudio
         // Near-listener widening (0 = off): floor every source's spread at 1 - dist/radius, so a source
         // flying at the head widens instead of snapping across the nearest speaker. ~1.0 m is a good start.
         [DllImport(DLL, CallingConvention = CC)] public static extern void bwa_set_near_spread(IntPtr e, float radiusM);
+        // Hole-aware spread floor (0 = off): floor a source's spread by how far its bearing sits from the
+        // nearest speaker, so a source aimed where the array has no speaker (the CAVE barrel's open poles)
+        // renders as an honest wide source instead of a split image across two distant speakers. Zero until
+        // the gap exceeds the array's own mean speaker spacing, so a surrounding array is inert. 1.0 = the
+        // honest width; clamped at 2.
+        [DllImport(DLL, CallingConvention = CC)] public static extern void bwa_set_hole_spread(IntPtr e, float strength);
         [DllImport(DLL, CallingConvention = CC)] public static extern void bwa_set_limiter(IntPtr e, [MarshalAs(UnmanagedType.I1)] bool on);
         [DllImport(DLL, CallingConvention = CC)] public static extern void bwa_set_limiter_ceiling(IntPtr e, float linear);   // linear peak ceiling in (0..1]; default 0.891251f (-1 dBFS)
         // Headphone correction EQ (the headphone-side align stage): parse an AutoEq ParametricEQ.txt
@@ -437,6 +448,15 @@ namespace BwAudio
         // Tracked room EQ (layouts carrying a room_eq_grid): the LF modal cuts follow the live listener
         // position. ON by default when a grid is present; this is the live kill switch. No-op without a grid.
         [DllImport(DLL, CallingConvention = CC)] public static extern void bwa_set_tracked_room_eq(IntPtr e, [MarshalAs(UnmanagedType.I1)] bool on);
+        // Tracked listener alignment (OFF by default). The layout's per-speaker delay/gain trims align the
+        // array at ONE point (the array centroid); this re-references them onto the TRACKED listener, adding
+        // each speaker's extra propagation delay and 1/r level for |speaker - listener| vs |speaker - centroid|.
+        // Opt-in because a moving delay line resamples: a walking listener glides every speaker's delay at
+        // once, which is a Doppler shift on the whole array. deadZoneM (default 0.05) is how far the head must
+        // move before anything is recomputed; slewFramesPerS (default ~63 at 48 kHz, which follows a 0.45 m/s
+        // walk) caps how fast a delay may change, so a faster listener LAGS instead of warbling. Either <= 0
+        // takes the default. Live A/B; off glides back to the layout's own trims.
+        [DllImport(DLL, CallingConvention = CC)] public static extern void bwa_set_tracked_align(IntPtr e, [MarshalAs(UnmanagedType.I1)] bool on, float deadZoneM, float slewFramesPerS);
         // Offline panner evaluation (no engine handle): out = nsrc*n gains for a layout/panner; for layout scoring.
         // focus/density are SPCAP's tuning knobs, same <= 0 = default sentinel as bwa_set_spcap_focus, and
         // inert under DBAP/VBAP. Pass 0, 0 to score at the focus this array's geometry derives.

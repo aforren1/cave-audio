@@ -153,7 +153,8 @@ graph, with each stage annotated with the functions that implement and configure
  ─────────────────────────────────────────────────────────────────────────────
  × master gain (ramped)
  align: per-speaker correction FIR · room-EQ biquads (re-aimed at the tracked pose) ·
-        gain trim · delay
+        gain trim · delay (re-referenced onto the tracked head: bwa_set_tracked_align,
+        slewed + dead-zoned; off = the exact integer tap)
  + test signal (bwa_set_test_signal - a raw channel, deliberately post-align)
  linked limiter (default −1 dBFS) → per-channel peak meters
       │

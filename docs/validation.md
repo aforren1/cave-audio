@@ -601,6 +601,42 @@ Say these out loud before quoting any number from this tool.
   two ends measured here. The steady-state property is what makes the measurement
   latency-independent, so supporting file playback would cost that.
 
+## Not built yet: the rotating two-mic ITD rig
+
+`bwa_set_cap` (compensated amplitude panning, [spatialization.md](./spatialization.md)) claims the
+rendered ITD stays correct **as the listener turns their head**. Nothing in this tool can see that. A
+spherical microphone array measures the field at a point; ITD is a property of two ears on a head, and
+rotating the ZM-1 does not create one. So CAP currently has unit-test evidence and no hardware
+evidence.
+
+The instrument that would settle it is cheap. Two omnis at ear spacing on a rigid sphere, rotated
+through yaw, with the ITD read by cross-correlation. Notes for whoever builds it:
+
+- **Rotation is the measurement, not extra sampling.** A spherical array at a fixed point already
+  samples the field completely up to its order, so turning it tells you nothing new about the field.
+  What rotation changes is the **ear pair's orientation**, which is the only variable CAP's claim is
+  about.
+- **The ZM-1 is a half-scale head.** Two roughly antipodal equatorial capsules on its ~10 cm sphere
+  give a usable ITD proxy for free, before anyone buys anything. Rigid-sphere diffraction holds below
+  ka ~ 1, so a ~5 cm radius stays valid to about 1.1 kHz, which covers CAP's whole band and is
+  actually a wider valid range than a real head's ~620 Hz. The cost is that the ITD comes out roughly
+  half a head's, so this validates **stability under rotation** and **monotonicity with intended
+  azimuth**, never absolute correctness. Stability is the discriminating half.
+- **Put markers on the mount.** OptiTrack is already in the room, so the rotation angle can be
+  measured rather than assumed.
+- **The floor already exists.** The physical reference arm above drives one speaker alone, which is a
+  real source. Put a phantom at the same bearing, sweep yaw, and compare ITD against that speaker.
+  Plain dual-band should drift with yaw and CAP should not. If both sit under JND at this array
+  density, that kills CAP for the cost of one sweep, which is the point of measuring first.
+- **It settles the CAP band too.** The 700 Hz crossover CAP inherits is a rV/rE number, not an ITD
+  number, and the sources disagree (VISR says ~1000 Hz, Zhao et al. 1500 Hz). Sweeping the analysis
+  band on this rig answers it directly.
+
+The same rotation buys two things for free on the estimators already here: same field, different
+capsules, which separates capsule error from field structure far more sharply than
+`zylia_check_capsules` can from one orientation, and a direct bias check on
+`zylia_intensity_doa`/`zylia_srp_doa`, whose estimates should rotate exactly with the array.
+
 ## Where the code lives
 
 | file | what |

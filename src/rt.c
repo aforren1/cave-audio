@@ -12,6 +12,8 @@
 #include "dbap.h"
 #include "spcap.h"
 #include "vbap.h"
+#include "cap.h"          /* compensated amplitude panning: the dual-band low band's ITD correction */
+#include "hole.h"         /* hole-aware spread floor: array holes widen a source instead of splitting it */
 #include "align.h"
 #include "ism.h"          /* image-source early reflections (shoebox geometry; phonon-free) */
 #include "biquad.h"       /* shared RBJ cookbook (also used by align.c's room_eq) */
@@ -358,8 +360,19 @@ struct RtCore {
     _Atomic int room_eq_dyn;     /* tracked room EQ enable (default ON when a grid is present); live A/B */
     float     rq_lis[3];
     int       rq_state;
+    /* tracked listener alignment (rt_set_tracked_align; OFF by default): the same shape one layer down
+     * in the output stage — per block the audio thread re-derives the aligner's per-speaker delay/gain
+     * from the LIVE listener instead of Layout.ref (listener_align_track) and align_process slews
+     * toward it. lc_state mirrors rq_state: 0 = nothing sent, 1 = targets for lc_lis, 2 = identity. */
+    _Atomic int   lc_on;
+    _Atomic float lc_dead_m;     /* dead zone (m; <= 0 = LC_DEAD_ZONE_M) */
+    _Atomic float lc_slew;       /* rate limit (frames/s; <= 0 = derived from LC_SLEW_SPEED_MS) */
+    float     lc_lis[3];
+    int       lc_state;
     _Atomic int panner;      /* 0 = DBAP (moving observer); 1 = SPCAP; 2 = VBAP (both fixed observer); atomic for A/B */
     _Atomic int dual_band;   /* 0 = single (power) panning; 1 = dual-band (amplitude LF / power HF); atomic for A/B */
+    _Atomic int cap_on;      /* compensated amplitude panning on the LF band (cap.c). INERT unless dual_band
+                              * is on — the mixer only reads gtarget_lo there. Atomic for A/B. */
     _Atomic int spread_mode; /* 0 = lobe reshape (spread_gains); 1 = MDAP virtual-source ring; atomic for A/B */
     _Atomic int decor_on;    /* decorrelate spread sources' wide part (velvet-noise path); atomic for A/B */
 
@@ -438,6 +451,9 @@ struct RtCore {
     uint32_t   layout_gen;   /* bumped on rt_set_layout; the SPCAP/VBAP caches compare it to self-invalidate */
     SpcapState spcap;        /* SPCAP cache (audio-thread-owned; rebuilt on listener/layout change) */
     VbapState  vbap;         /* VBAP cache (same) */
+    CapState   cap;          /* CAP interaural cache (same, plus head ORIENTATION — the one piece of
+                              * DSP state a pure head turn invalidates; see CMD_COMMIT) */
+    HoleState  hole;         /* hole-aware spread-floor cache (same self-invalidation as SPCAP's) */
     SpcapState spcap_x[BWA_EXTRA_LIS];   /* per-extra-listener caches (compromise panning): each cache is
                                          * keyed to ONE listener, so each extra gets its own */
     VbapState  vbap_x[BWA_EXTRA_LIS];
@@ -459,6 +475,12 @@ struct RtCore {
     _Atomic float near_spread;  /* near-listener widening radius (m); 0 = off. An approaching source's
                                  * spread is floored by 1 - dist/radius (it subtends a growing angle
                                  * instead of collapsing into the nearest speaker). */
+    /* hole-aware spread floor (rt_set_hole_spread; dimensionless scale, 0 = off): a source aimed
+     * where the array has NO speaker is floored wide instead of rendered as a split image (hole.h).
+     * Resolved once per block into hole_spread_blk so no block mixes two values, and the setter
+     * bumps pan_gen because it moves the gains of sources that never move. */
+    _Atomic float hole_spread;
+    float      hole_spread_blk;
     float      ldc_a;        /* loudness-comp shelf one-pole coeff (~250 Hz), rate-derived at create */
     float      nf_a;         /* near-field proximity shelf one-pole coeff (BWA_NF_FC), rate-derived at create */
     _Atomic float sos;       /* engine-wide speed of sound (m/s; default BWA_SPEED_OF_SOUND) — live
@@ -1061,6 +1083,13 @@ static void drain_commands(RtCore* c) {
             bool lis_moved = memcmp(c->lis.p_active, c->lis.p_pending, sizeof c->lis.p_active) != 0 ||
                              c->lis.nex_active != c->lis.nex_pending ||
                              memcmp(c->lis.ex_active, c->lis.ex_pending, sizeof c->lis.ex_active) != 0;
+            /* Head ORIENTATION moves the gains only under CAP (cap.c): every other panner is
+             * position-relative, and orientation reaches them not at all — it enters at the binaural
+             * decode instead. So this comparison is gated, not unconditional: without the gate a
+             * tracked head would re-solve every voice every block for a rotation nothing downstream
+             * reads, which is precisely the per-block resolve cost DBAP exists to avoid. */
+            if (!lis_moved && atomic_load_explicit(&c->cap_on, memory_order_acquire))
+                lis_moved = memcmp(c->lis.q_active, c->lis.q_pending, sizeof c->lis.q_active) != 0;
             memcpy(c->lis.p_active, c->lis.p_pending, sizeof c->lis.p_active);
             memcpy(c->lis.q_active, c->lis.q_pending, sizeof c->lis.q_active);
             memcpy(c->lis.ex_active, c->lis.ex_pending, sizeof c->lis.ex_active);
@@ -1380,6 +1409,13 @@ static void fs_solve(RtCore* c, Voice* v, int p, float spread, float ug) {
                 for (uint32_t k = 0; k < c->channels; ++k) v->fs_t[b][k] *= comp;
         }
     }
+    /* NOTE: CAP (cap.c) does NOT reach this path. Spectral spread replaces the single-path output
+     * stage wholesale, so a spread source under smode 2 gets the PLAIN amplitude normalization below
+     * for its low bands — the exact A-side CAP exists to replace — rather than CAP's fade-with-spread.
+     * Projecting here is not a one-liner: band 1 is scattered off the point bearing by the cone, so
+     * it needs its own ITD target, and the overlap compensation above has already rescaled the set.
+     * Left as a known exclusion (both modes are off by default); documented in bw_audio.h and
+     * docs/spatialization.md rather than silently wrong. */
     if (atomic_load_explicit(&c->dual_band, memory_order_acquire)) {
         for (int b = 0; b <= 1; ++b) {                   /* < 700 Hz: amplitude (pressure) norm, as gtarget_lo */
             float* t = v->fs_t[b];
@@ -1394,15 +1430,21 @@ static void fs_solve(RtCore* c, Voice* v, int p, float spread, float ug) {
 /* Effective spread (shared by the panner and direct-binaural solves): the user's angular width,
  * floored by the source's METRIC size (the angle its radius subtends from the listener — physical
  * size stays constant as the listener walks, and a source that engulfs the listener goes fully
- * wide) and by the engine-wide NEAR-LISTENER widening policy (rt_set_near_spread; a per-source
- * size subsumes it for sized sources). Sets v->spread_eff (the decor split follows it) and the
- * anisotropy ratios v->ext_u/ext_w (an extent carries a separate height: the physical floors
- * apply to BOTH axes, the LARGER axis drives the mode gate). Returns s_eff. */
+ * wide), by the engine-wide NEAR-LISTENER widening policy (rt_set_near_spread; a per-source size
+ * subsumes it for sized sources), and by the ARRAY-HOLE policy (rt_set_hole_spread; hole.h — a
+ * source with no speaker near its bearing is not a point and is floored wide). The floors compose
+ * as a max: each states a width the render cannot honestly go below, so the widest one wins.
+ * Sets v->spread_eff (the decor split follows it) and the anisotropy ratios v->ext_u/ext_w (an
+ * extent carries a separate height: the physical floors apply to BOTH axes, the LARGER axis drives
+ * the mode gate). Returns s_eff. */
 static float solve_spread(RtCore* c, Voice* v) {
     float s_w = v->spread; if (s_w > 1.f) s_w = 1.f; else if (s_w < 0.f) s_w = 0.f;
     float s_h = v->spread_h; if (s_h > 1.f) s_h = 1.f;      /* < 0 = isotropic (follow the width) */
     const float nearR = atomic_load_explicit(&c->near_spread, memory_order_relaxed);
-    if (v->size_m > 0.f || nearR > 0.f) {
+    /* the hole floor is a SPEAKER-ARRAY property: the direct-binaural render has no speakers and so
+     * no holes, and its gain vector is an SH encode the array geometry never touches. */
+    const float holeS = c->direct_on ? 0.f : c->hole_spread_blk;
+    if (v->size_m > 0.f || nearR > 0.f || holeS > 0.f) {
         float dx = v->pos_active[0]-c->lis.p_active[0], dy = v->pos_active[1]-c->lis.p_active[1],
               dz = v->pos_active[2]-c->lis.p_active[2];
         float dist = sqrtf(dx*dx + dy*dy + dz*dz);
@@ -1416,6 +1458,14 @@ static float solve_spread(RtCore* c, Voice* v) {
             float s_near = 1.f - dist / nearR;
             if (s_near > 1.f) s_near = 1.f;
             if (s_near > s_floor) s_floor = s_near;
+        }
+        if (holeS > 0.f) {
+            float u[3];
+            unit_dir(c->lis.p_active, v->pos_active, u);        /* degenerate (at the listener) -> (0,0,1) */
+            hole_block(&c->hole, &c->layout, c->lis.p_active, c->layout_gen);   /* cached; early-outs */
+            float s_hole = holeS * hole_floor(&c->hole, u);
+            if (s_hole > 1.f) s_hole = 1.f;
+            if (s_hole > s_floor) s_floor = s_hole;
         }
         if (s_floor > s_w) s_w = s_floor;
         if (s_h >= 0.f && s_floor > s_h) s_h = s_floor;
@@ -1560,6 +1610,17 @@ static void compute_gains(RtCore* c, Voice* v) {
      * by the panner) — NOT bare gain_user, which would cancel the distance attenuation and leave a
      * distant source's bass at full level. So the LF coherent pressure sum matches the HF energy level
      * at every distance. Always computed (cheap) so dual_band A/Bs live; the mixer reads it only when on. */
+    if (atomic_load_explicit(&c->cap_on, memory_order_acquire)) {
+        /* CAP (cap.c): same band, same level convention, but the low gains are the point solve
+         * PROJECTED so the rendered ITD matches a real source at this bearing, for the head's
+         * CURRENT orientation. The correction fades out with spread — an engulfing source has no
+         * one bearing to fix. Facing the source it is a no-op, so this reduces to the panner. */
+        cap_block(&c->cap, &c->layout, c->lis.p_active, c->lis.q_active, c->layout_gen);
+        float u[3];
+        unit_dir(c->lis.p_active, v->pos_active, u);       /* degenerate (at the listener) -> (0,0,1) */
+        cap_gains_lo(&c->cap, v->gtarget, u, 1.f - s_eff, v->gtarget_lo);
+        return;
+    }
     double gs = 0.0, gp = 0.0;
     for (uint32_t k = 0; k < c->channels; ++k) { gs += v->gtarget[k]; gp += (double)v->gtarget[k] * v->gtarget[k]; }
     if (gs > 1e-9) { float sc = (float)(sqrt(gp) / gs);
@@ -2494,6 +2555,96 @@ static void room_eq_track(RtCore* c) {
     c->rq_state = 1;
 }
 
+/* Tracked listener alignment (rt_set_tracked_align, OFF by default). The layout's per-speaker delay
+ * and gain trims align the array at ONE point, Layout.ref, so the array is time-coherent there and
+ * progressively less so as the listener walks away. This re-references that alignment onto the live
+ * listener: per speaker the correction is the geometry, nothing more —
+ *
+ *     dref = |speaker - ref|,  dlis = |speaker - listener|
+ *     extra delay (frames) = (dref - dlis) * rate / sos      > 0 when the listener moved TOWARD it
+ *     extra gain  (linear) =  dlis / dref                    < 1 when the listener moved TOWARD it
+ *
+ * SIGN: walking toward a speaker makes its wavefront arrive EARLY and LOUD, so the fix delays it more
+ * and turns it down. The delay set is then shifted so its per-block MINIMUM is zero, which makes the
+ * correction purely relative (a common delay is just latency), keeps every target non-negative so the
+ * aligner only ever reads further back in its ring, and makes a listener standing exactly at `ref`
+ * exact identity rather than approximate.
+ *
+ * The whole feature is opt-in because a moving delay line is a resampling event: N speakers gliding
+ * continuously is N simultaneous Doppler shifts on everything the array plays, which is a GLOBAL
+ * audible failure, not a local one. Two guards, both live knobs:
+ *   - a DEAD ZONE: nothing is recomputed until the listener has moved further than `dead` from where
+ *     the standing targets were solved, so Motive's position jitter changes nothing at all;
+ *   - a RATE LIMIT on the slew (align_tracked_slew), so a listener who moves faster than the limit
+ *     gets a lagging alignment instead of a pitch-shifted array.
+ * Audio thread, no alloc/locks. Reads c->lis.p_active, which BOTH listener paths write (CMD_COMMIT
+ * and the internal tracker block at the top of rt_render) — the same reason room_eq_track above lives
+ * here rather than hanging off commit.
+ *
+ * Note it deliberately does NOT bump pan_gen: this is the output stage, downstream of every gain
+ * solve, so no voice's panning changes and there is nothing to re-solve. */
+#define LC_DEAD_ZONE_M   0.05f  /* 5 cm. Motive's jitter is sub-millimeter, so this is pure noise
+                                 * rejection; the residual it allows is 5 cm / 343 m/s = 0.15 ms of
+                                 * arrival error, an order under the ~1 ms scale where precedence and
+                                 * comb-filtering start to read, and ~3% of the correction the feature
+                                 * is applying at a 1.5 m excursion. */
+#define LC_SLEW_SPEED_MS 0.45f  /* The default rate limit, stated as the listener closing speed it can
+                                 * follow: 0.45 m/s (a slow walk) = 0.45/343 = 0.13% resampling = ~2.3
+                                 * cents of pitch shift at worst, which sits under the JND for a
+                                 * sustained tone. A brisk walk (1.4 m/s) therefore OUTRUNS it on
+                                 * purpose: stale alignment is the cheap failure, warble is not.
+                                 * Converted to frames/s against the live rate and speed of sound, so
+                                 * it means the same thing at 96 kHz or in a different medium. */
+static void listener_align_track(RtCore* c) {
+    if (!c->aligner) return;
+    /* Publish-then-flag, reader side (CLAUDE.md): acquire the ENABLE first, then load the knobs the
+     * setter published before it. The knobs are re-read every block rather than stamped by a
+     * generation, so a lost update self-corrects on the next block — but the ordering still has to
+     * hold for the enable itself. */
+    if (!atomic_load_explicit(&c->lc_on, memory_order_acquire)) {
+        if (c->lc_state != 2) {                       /* toggled off: slew back to identity, once */
+            align_tracked_targets(c->aligner, NULL, NULL);
+            c->lc_state = 2;
+        }
+        return;
+    }
+    const float sos  = atomic_load_explicit(&c->sos,       memory_order_relaxed);
+    float       slew = atomic_load_explicit(&c->lc_slew,   memory_order_relaxed);
+    float       dead = atomic_load_explicit(&c->lc_dead_m, memory_order_relaxed);
+    if (!(sos > 1.f)) return;                         /* nonsense medium: leave the alignment alone */
+    if (slew <= 0.f) slew = LC_SLEW_SPEED_MS / sos * (float)c->sample_rate;
+    if (dead <= 0.f) dead = LC_DEAD_ZONE_M;
+    align_tracked_slew(c->aligner, slew);             /* cheap, and keeps a live slider honest */
+    const float* lp = c->lis.p_active;
+    if (c->lc_state == 1) {
+        float dx = lp[0]-c->lc_lis[0], dy = lp[1]-c->lc_lis[1], dz = lp[2]-c->lc_lis[2];
+        if (dx*dx + dy*dy + dz*dz < dead*dead) return;   /* inside the dead zone: nothing moves */
+    }
+    const Layout* L = &c->layout;
+    float dly[BWA_CHANNELS], gn[BWA_CHANNELS];
+    const float k_frames = (float)c->sample_rate / sos;
+    float dmin = 0.f;
+    for (uint32_t k = 0; k < c->channels; ++k) {
+        const float* s = L->speakers[k].pos;
+        float ax = s[0]-L->ref[0], ay = s[1]-L->ref[1], az = s[2]-L->ref[2];
+        float bx = s[0]-lp[0],     by = s[1]-lp[1],     bz = s[2]-lp[2];
+        float dref = sqrtf(ax*ax + ay*ay + az*az);
+        float dlis = sqrtf(bx*bx + by*by + bz*bz);
+        float t = (dref - dlis) * k_frames;
+        dly[k] = t;
+        gn[k]  = (dref > 1e-3f && dlis > 1e-3f) ? dlis / dref : 1.f;   /* degenerate: leave it alone */
+        if (k == 0 || t < dmin) dmin = t;
+    }
+    const float cap = (float)align_tracked_max_frames(c->aligner);
+    for (uint32_t k = 0; k < c->channels; ++k) {
+        float d = dly[k] - dmin;                      /* re-zero: relative correction only */
+        dly[k] = d > cap ? cap : d;                   /* past the reserved headroom: degrade, don't wrap */
+    }
+    align_tracked_targets(c->aligner, dly, gn);
+    memcpy(c->lc_lis, lp, sizeof c->lc_lis);
+    c->lc_state = 1;
+}
+
 /* A seqlock's payload is ordinary data, but this core keeps every published field in an _Atomic
  * slot; bit-cast doubles through uint64 so they ride the same relaxed load/store. */
 static inline void   pub_d(_Atomic uint64_t* slot, double v) {
@@ -2660,6 +2811,15 @@ void rt_render(RtCore* c, float* bus, uint32_t nframes, const bwa_timestamp* ts)
                 for (int j = 0; j < 3; ++j) tp[j] += c->pp_vel[j] * lead;
             } else if (c->pp_valid) { c->pp_valid = 0; memset(c->pp_vel, 0, sizeof c->pp_vel); }
             bool moved = memcmp(c->lis.p_active, tp, sizeof tp) != 0;
+            /* Same orientation gate as CMD_COMMIT, and it MUST live here too: the tracker path does
+             * not go through commit at all, it overwrites the active pose directly. Without this a
+             * pure head TURN from Motive never dirties a voice, so CAP stays solved for whatever
+             * orientation the listener last happened to translate at — the seated case the feature
+             * is aimed at is exactly the one where position holds still. Tested BEFORE q_active is
+             * overwritten below, and gated on cap_on so a tracked head does not re-solve every voice
+             * every block for a rotation nothing downstream reads. */
+            if (!moved && atomic_load_explicit(&c->cap_on, memory_order_acquire))
+                moved = memcmp(c->lis.q_active, tq, sizeof tq) != 0;
             memcpy(c->lis.p_active, tp, sizeof tp);
             memcpy(c->lis.q_active, tq, sizeof tq);
             if (moved) for (uint32_t i = 0; i < c->voice_cap; ++i) c->voices[i].dirty = true;
@@ -2699,6 +2859,9 @@ void rt_render(RtCore* c, float* bus, uint32_t nframes, const bwa_timestamp* ts)
         c->spcap_focus_blk   = sf > 0.f ? sf : c->layout.spcap_focus;
         c->spcap_density_blk = sd > 0.f ? sd : c->layout.spcap_density;
     }
+    /* hole-aware spread floor, same rule: one load, after the pan_gen acquire above, so every voice
+     * this block agrees on the strength AND on which generation it belongs to (rt_set_hole_spread). */
+    c->hole_spread_blk = atomic_load_explicit(&c->hole_spread, memory_order_relaxed);
     const int dc_live = c->dc_on_blk || c->bed_param_blk || c->dc_tail > 0;
     if (dc_live) memset(c->dc_bus, 0, sizeof(float) * (size_t)c->channels * nframes);
     c->dc_wrote = 0;
@@ -2839,6 +3002,7 @@ void rt_render(RtCore* c, float* bus, uint32_t nframes, const bwa_timestamp* ts)
         }
     }
     room_eq_track(c);                          /* tracked room EQ: re-aim the align biquads at the pose */
+    listener_align_track(c);                   /* tracked alignment: re-aim the align delays at the pose */
     BWA_ZONE_BEGIN(za, "align");
     align_process(c->aligner, bus, nframes);   /* per-speaker gain trim + delay (output stage) */
     BWA_ZONE_END(za);
@@ -3714,6 +3878,9 @@ RtCore* rt_create(uint32_t req_voice_cap, uint32_t sound_cap, uint32_t sample_ra
     c->lis.q_pending[3] = 1.0f;
     c->readback.q[3]    = 1.0f;        /* readback identity until the first block publishes */
     atomic_store_explicit(&c->room_eq_dyn, 1, memory_order_relaxed);   /* tracked room EQ: on when a grid is present */
+    atomic_store_explicit(&c->lc_on, 0, memory_order_relaxed);         /* tracked alignment: OFF (opt-in) */
+    atomic_store_explicit(&c->lc_dead_m, 0.f, memory_order_relaxed);   /* 0 = the built-in defaults */
+    atomic_store_explicit(&c->lc_slew,   0.f, memory_order_relaxed);
     atomic_store_explicit(&c->master_gain, 1.f, memory_order_relaxed);
     atomic_store_explicit(&c->spcap_focus,   0.f, memory_order_relaxed);   /* 0 = the layout's own */
     atomic_store_explicit(&c->spcap_density, 0.f, memory_order_relaxed);   /* derived / constant default */
@@ -3760,6 +3927,7 @@ void rt_set_layout(RtCore* c, const Layout* L) {
     memcpy(c->readback.p,    c->layout.ref, sizeof c->readback.p);
     build_bed_decode(c);                         /* re-derive the bed decode for the new geometry */
     c->rq_state = 0;                             /* new aligner starts flat: re-send the room-EQ targets */
+    c->lc_state = 0;                             /* ... and the tracked-alignment targets */
     c->layout_gen++;                             /* the SPCAP cache self-invalidates on the next gains call */
     for (uint32_t i = 0; i < c->voice_cap; ++i)
         if (c->voices[i].active) c->voices[i].dirty = true;
@@ -3818,6 +3986,21 @@ void rt_set_dual_band(RtCore* c, int on) {
     atomic_store_explicit(&c->dual_band, on ? 1 : 0, memory_order_release);
 }
 
+/* Compensated amplitude panning on the dual-band low band (cap.c). Inert unless dual-band is on —
+ * that is the only consumer of gtarget_lo — so the two toggles compose rather than one implying the
+ * other.
+ *
+ * Two reasons this needs the pan_gen bump rather than a plain store (same argument as
+ * rt_set_spcap_focus): the flag rewrites the low band of EVERY source, so a motionless scene would
+ * otherwise stay deaf to the toggle; and turning CAP ON is what starts head ORIENTATION dirtying
+ * voices at CMD_COMMIT, so without the bump the first re-solve would wait for the listener to
+ * translate. Release-ordered so a voice cannot see the new generation with the old flag. */
+void rt_set_cap(RtCore* c, int on) {
+    if (!c) return;
+    atomic_store_explicit(&c->cap_on, on ? 1 : 0, memory_order_release);
+    atomic_fetch_add_explicit(&c->pan_gen, 1u, memory_order_release);
+}
+
 /* Spread rendering: 0 = lobe reshape (default), 1 = MDAP virtual-source ring, 2 = spectral
  * (frequency-dependent panning). Read per gain solve, so it is a live A/B atomic like the panner;
  * voices with spread 0 are unaffected either way. */
@@ -3848,6 +4031,21 @@ void rt_set_max_re_split(RtCore* c, int on) {
 void rt_set_room_eq_dyn(RtCore* c, int on) {
     if (!c) return;
     atomic_store_explicit(&c->room_eq_dyn, on ? 1 : 0, memory_order_release);
+}
+
+/* Tracked listener alignment (listener_align_track): default OFF; off slews every channel back to the
+ * layout's own trims, so the toggle is a click-free live A/B. Either knob <= 0 reverts it to the
+ * built-in default. Publish-then-flag: the knobs land BEFORE the release store on the enable, and
+ * listener_align_track acquires the enable before loading them (CLAUDE.md's ordering trap). */
+void rt_set_tracked_align(RtCore* c, int on, float dead_zone_m, float slew_frames_per_s) {
+    if (!c) return;
+    if (!(dead_zone_m > 0.f))       dead_zone_m = 0.f;         /* NaN-safe: 0 = the default */
+    else if (dead_zone_m > 0.5f)    dead_zone_m = 0.5f;        /* half a meter of slack is already useless */
+    if (!(slew_frames_per_s > 0.f)) slew_frames_per_s = 0.f;
+    else if (slew_frames_per_s > 4096.f) slew_frames_per_s = 4096.f;
+    atomic_store_explicit(&c->lc_dead_m, dead_zone_m,       memory_order_relaxed);
+    atomic_store_explicit(&c->lc_slew,   slew_frames_per_s, memory_order_relaxed);
+    atomic_store_explicit(&c->lc_on,     on ? 1 : 0,        memory_order_release);
 }
 
 /* Decorrelation (velvet-noise path) for spread sources' wide part (and the parametric bed's diffuse
@@ -3903,6 +4101,24 @@ void rt_set_near_spread(RtCore* c, float radius_m) {
     if (!c) return;
     if (radius_m < 0.f) radius_m = 0.f; else if (radius_m > 10.f) radius_m = 10.f;
     atomic_store_explicit(&c->near_spread, radius_m, memory_order_relaxed);
+}
+
+/* Hole-aware spread floor (hole.h): floor a source's spread by how far its bearing sits from the
+ * nearest speaker, so a source aimed into an array hole renders as an honest WIDE source instead of
+ * a split image across the hull triangle that closes the hole. `strength` scales the derived floor;
+ * 0 disables (the default, so an array with no holes and a caller who never sets it are both
+ * bit-identical to before). Clamped to 2 — past that the floor stops being an honest width.
+ *
+ * Bumps pan_gen for the same reason rt_set_spcap_focus does: this changes the gain vector of every
+ * source whose bearing is in a hole, INCLUDING ones that never move, and a live setter must not
+ * write v->dirty (invariant 3 — the audio thread owns the voice table). The store is release-ordered
+ * ahead of the bump and rt_render acquires pan_gen before latching hole_spread_blk, so a block can
+ * never pair the new generation with the old strength and swallow the change. */
+void rt_set_hole_spread(RtCore* c, float strength) {
+    if (!c) return;
+    if (strength < 0.f) strength = 0.f; else if (strength > 2.f) strength = 2.f;
+    atomic_store_explicit(&c->hole_spread, strength, memory_order_release);
+    atomic_fetch_add_explicit(&c->pan_gen, 1u, memory_order_release);
 }
 
 /* SPCAP tuning: lobe sharpness + placement-correction density exponent, both dimensionless. Either

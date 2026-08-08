@@ -4,12 +4,16 @@
  *     dbap params, gain_db->linear, delay_ms->samples);
  *   - DBAP localizes a source at each speaker to that channel (centered listener), is
  *     constant-power, splits between two speakers, and responds to listener moves;
- *   - align applies the per-channel gain trim and integer-sample delay.
+ *   - align applies the per-channel gain trim and integer-sample delay;
+ *   - the hole-aware spread floor engages on a barrel (open poles) and is inert on the
+ *     surrounding cube grid.
  */
 #include "layout.h"
 #include "dbap.h"
 #include "spcap.h"
 #include "vbap.h"
+#include "cap.h"
+#include "hole.h"
 #include "align.h"
 #include "ambisonics.h"
 #include "allrad.h"
@@ -30,6 +34,36 @@ static int argmax(const float* g, int n) {
     int b = 0; float m = g[0];
     for (int i = 1; i < n; ++i) if (g[i] > m) { m = g[i]; b = i; }
     return b;
+}
+static int argmax_abs(const float* x, int n) {
+    int b = 0; float m = -1.f;
+    for (int i = 0; i < n; ++i) { float v = fabsf(x[i]); if (v > m) { m = v; b = i; } }
+    return b;
+}
+static float lcg_noise(uint32_t* s) {                /* rt.c's LCG, [-1, 1) */
+    *s = *s * 1664525u + 1013904223u;
+    return (float)(*s >> 9) * (1.0f / 4194304.0f) - 1.0f;
+}
+
+static double dot3(const float a[3], const float b[3]) {
+    return (double)a[0]*b[0] + (double)a[1]*b[1] + (double)a[2]*b[2];
+}
+
+/* The interaural component of a gain vector's velocity vector, rV.e = sum(g*ce)/sum(g) — the LF
+ * localization cue CAP constrains, and what a two-mic ITD measurement reads on the rig. */
+static double itd_component(const float* g, const float* ce, uint32_t n) {
+    double sg = 0.0, sce = 0.0;
+    for (uint32_t k = 0; k < n; ++k) { sg += g[k]; sce += (double)g[k] * ce[k]; }
+    return sg > 1e-12 ? sce / sg : 0.0;
+}
+
+/* The plain dual-band low band (rt.c's derivation), as the A-side reference. */
+static void dual_band_lo(const float* g0, uint32_t n, float* out) {
+    double gs = 0.0, gp = 0.0;
+    for (uint32_t k = 0; k < n; ++k) { gs += g0[k]; gp += (double)g0[k] * g0[k]; }
+    if (gs > 1e-9) { const float sc = (float)(sqrt(gp) / gs);
+        for (uint32_t k = 0; k < n; ++k) out[k] = g0[k] * sc; }
+    else for (uint32_t k = 0; k < n; ++k) out[k] = g0[k];
 }
 
 /* Emit a valid cave_layout.json: the default grid, with speaker 5 trimmed and 9 delayed. */
@@ -119,6 +153,55 @@ static int write_layout_n(const char* path, int n, int bad_index) {
     fprintf(f, "] }\n");
     fclose(f);
     return 1;
+}
+
+/* A BARREL: 8 perimeter positions x 3 heights, no top or bottom cap — the CAVE array's real shape
+ * (speakers mount in the band between the screen cube and the truss, so nothing covers the poles).
+ * 24 speakers, 1.5 m radius, ear-height listener. */
+static Layout make_barrel(void) {
+    Layout L;
+    memset(&L, 0, sizeof L);
+    const float rad = 1.5f, ys[3] = { 0.5f, 1.5f, 2.5f };
+    uint32_t k = 0;
+    for (int ri = 0; ri < 3; ++ri)
+        for (int a = 0; a < 8; ++a, ++k) {
+            const float th = (float)a * 0.785398163f;          /* 8 azimuths, 45 deg apart */
+            L.speakers[k].pos[0] = rad * cosf(th);
+            L.speakers[k].pos[1] = ys[ri];
+            L.speakers[k].pos[2] = rad * sinf(th);
+            L.speakers[k].gain_lin = 1.f;
+        }
+    L.count = k;
+    layout_compute_ref(&L);
+    L.rolloff_r     = 0.7f;
+    L.spcap_focus   = layout_derive_spcap_focus(&L);
+    L.spcap_density = BWA_SPCAP_DENSITY_DEFAULT;
+    L.atten_ref_m   = 1.f;
+    L.atten_rolloff = 1.f;
+    L.atten_min_lin = 0.01f;
+    return L;
+}
+
+/* i-th of `n` directions on a Fibonacci sphere (near-uniform coverage, no pole clustering) */
+static void fib_dir(int i, int n, float out[3]) {
+    const float y  = 1.f - 2.f * ((float)i + 0.5f) / (float)n;
+    const float r  = sqrtf(fmaxf(0.f, 1.f - y * y));
+    const float th = (float)i * 2.39996323f;
+    out[0] = r * cosf(th); out[1] = y; out[2] = r * sinf(th);
+}
+
+/* angle (degrees) from `u` to the nearest speaker seen from `lis` — what hole.c's floor reads */
+static double nearest_speaker_deg(const Layout* L, const float lis[3], const float u[3]) {
+    double best = -2.0;
+    for (uint32_t k = 0; k < L->count; ++k) {
+        float d[3];
+        unit_dir(lis, L->speakers[k].pos, d);
+        double c = (double)u[0]*d[0] + (double)u[1]*d[1] + (double)u[2]*d[2];
+        if (c > best) best = c;
+    }
+    if (best >  1.0) best =  1.0;
+    if (best < -1.0) best = -1.0;
+    return acos(best) * 57.2957795;
 }
 
 int main(void) {
@@ -361,6 +444,139 @@ int main(void) {
             #undef GRID_WIN_DB
             align_destroy(a);
         }
+    }
+
+    /* 7a4. tracked listener alignment (align_tracked_targets / align_tracked_slew): an EXTRA
+     * fractional delay + gain per channel on top of the layout trims. Checked here at the DSP level:
+     * OFF is bit-identical to an aligner that was never told about the feature, an engaged target
+     * lands where it was aimed (fraction included), the rate limit bounds the per-block delay change,
+     * and a gliding tap does not click. rt.c owns turning a listener position into these targets. */
+    {
+        Layout T = layout_default();                  /* unity gains, zero delays: align is identity */
+        Aligner* a  = align_create(CH, &T, RATE);
+        Aligner* rf = align_create(CH, &T, RATE);     /* control: never told about the feature */
+        CHECK(a != NULL && rf != NULL, "align_create (tracked align)");
+        if (a && rf) {
+            enum { BL = 256 };
+            static float blk[CH * BL], blk2[CH * BL];
+            float tgt[BWA_CHANNELS], gtg[BWA_CHANNELS], dst[BWA_CHANNELS], gst[BWA_CHANNELS];
+            for (int k = 0; k < CH; ++k) { tgt[k] = 0.f; gtg[k] = 1.f; }
+            uint32_t rs = 12345;
+            /* (a) off: the knobs are set, the targets are identity — every sample must match the
+             * control aligner bit for bit (this is the "default costs nothing" guarantee). */
+            align_tracked_slew(a, 96.f);
+            align_tracked_targets(a, NULL, NULL);
+            int bitsame = 1;
+            for (int b = 0; b < 8; ++b) {
+                for (int i = 0; i < CH * BL; ++i) { blk[i] = 0.25f * lcg_noise(&rs); blk2[i] = blk[i]; }
+                align_process(a, blk, BL);
+                align_process(rf, blk2, BL);
+                if (memcmp(blk, blk2, sizeof blk) != 0) bitsame = 0;
+            }
+            CHECK(bitsame, "tracked align off: output is bit-identical to an aligner without it");
+            align_destroy(rf);
+
+            /* flush the rings, then land a 10-frame comp on channel 3 with the rate limit wide open */
+            memset(blk, 0, sizeof blk);
+            for (int b = 0; b < 4; ++b) { memset(blk, 0, sizeof blk); align_process(a, blk, BL); }
+            align_tracked_slew(a, 20000.f);
+            tgt[3] = 10.f;
+            align_tracked_targets(a, tgt, gtg);
+            for (int b = 0; b < 8; ++b) { memset(blk, 0, sizeof blk); align_process(a, blk, BL); }
+            align_tracked_state(a, dst, gst);
+            CHECK(fabs(dst[3] - 10.0) < 1e-4, "tracked align: the comp delay lands on its target");
+            memset(blk, 0, sizeof blk);
+            blk[3 * BL + 0] = 1.0f;                   /* impulse on the displaced channel */
+            blk[1 * BL + 0] = 1.0f;                   /* and on an untouched one */
+            align_process(a, blk, BL);
+            printf("tracked align: 10-frame target -> peak at frame %d (want 10)\n", argmax_abs(&blk[3*BL], 32));
+            CHECK(fabs(blk[3*BL + 10] - 1.0f) < 1e-5 && fabs(blk[3*BL + 0]) < 1e-6,
+                  "tracked align: an integer comp delay shifts the impulse by exactly that many frames");
+            CHECK(fabs(blk[1*BL + 0] - 1.0f) < 1e-6,
+                  "tracked align: a channel with no comp still passes through untouched");
+
+            /* (b) fractional target: linear interpolation splits the impulse across two frames */
+            tgt[3] = 4.25f;
+            align_tracked_targets(a, tgt, gtg);
+            for (int b = 0; b < 8; ++b) { memset(blk, 0, sizeof blk); align_process(a, blk, BL); }
+            memset(blk, 0, sizeof blk);
+            blk[3 * BL + 0] = 1.0f;
+            align_process(a, blk, BL);
+            printf("tracked align: 4.25-frame target -> taps %.3f / %.3f (want 0.750 / 0.250)\n",
+                   blk[3*BL + 4], blk[3*BL + 5]);
+            CHECK(fabs(blk[3*BL + 4] - 0.75f) < 1e-5 && fabs(blk[3*BL + 5] - 0.25f) < 1e-5,
+                  "tracked align: a fractional comp delay interpolates between the two taps");
+
+            /* (c) extra gain: a 0.5 target halves the channel once landed */
+            gtg[3] = 0.5f;
+            align_tracked_targets(a, tgt, gtg);       /* gain slews at 4/s: 0.5 needs ~0.125 s */
+            for (int b = 0; b < 40; ++b) { memset(blk, 0, sizeof blk); align_process(a, blk, BL); }
+            memset(blk, 0, sizeof blk);
+            blk[3 * BL + 0] = 1.0f;
+            align_process(a, blk, BL);
+            CHECK(fabs((blk[3*BL+4] + blk[3*BL+5]) - 0.5f) < 1e-5,
+                  "tracked align: the comp gain scales the channel");
+            gtg[3] = 1.f;
+
+            /* (d) rate limit: with the delay ceiling at 64 frames/s, ONE 256-frame block may move the
+             * tap by at most 64 * 256 / 48000 = 0.3413 frames, however far away the target is. */
+            tgt[3] = 0.f;
+            align_tracked_targets(a, tgt, gtg);
+            for (int b = 0; b < 40; ++b) { memset(blk, 0, sizeof blk); align_process(a, blk, BL); }
+            align_tracked_slew(a, 64.f);
+            tgt[3] = 400.f;                           /* far out of reach in one block */
+            align_tracked_targets(a, tgt, gtg);
+            memset(blk, 0, sizeof blk);
+            align_process(a, blk, BL);
+            align_tracked_state(a, dst, gst);
+            double want = 64.0 * BL / (double)RATE;
+            printf("tracked align: rate limit moved the tap %.4f frames in one 256-frame block (want %.4f)\n",
+                   dst[3], want);
+            CHECK(fabs(dst[3] - want) < 1e-4, "tracked align: the rate limit bounds the per-block delay change");
+            double per_blk_max = 0, prev = dst[3];
+            for (int b = 0; b < 200; ++b) {
+                memset(blk, 0, sizeof blk); align_process(a, blk, BL);
+                align_tracked_state(a, dst, gst);
+                if (dst[3] - prev > per_blk_max) per_blk_max = dst[3] - prev;
+                prev = dst[3];
+            }
+            CHECK(per_blk_max <= want + 1e-4, "tracked align: no block ever exceeds the rate limit");
+
+            /* (e) no click: a 500 Hz tone through a tap gliding at an aggressive 4096 frames/s stays
+             * continuous — the biggest sample-to-sample step must stay near the tone's own max slope
+             * (2*pi*500/48000 = 0.0654 for unit amplitude), not jump. */
+            tgt[3] = 0.f;
+            align_tracked_targets(a, tgt, gtg);
+            for (int b = 0; b < 600; ++b) { memset(blk, 0, sizeof blk); align_process(a, blk, BL); }
+            align_tracked_slew(a, 4096.f);
+            tgt[3] = 300.f;
+            align_tracked_targets(a, tgt, gtg);
+            double maxstep = 0; int ph = 0, finite = 1; float last = 0.f;
+            for (int b = 0; b < 60; ++b) {
+                memset(blk, 0, sizeof blk);
+                for (int i = 0; i < BL; ++i, ++ph)
+                    blk[3 * BL + i] = sinf(2.f * 3.14159265f * 500.f * (float)ph / (float)RATE);
+                align_process(a, blk, BL);
+                for (int i = 0; i < BL; ++i) {
+                    float v = blk[3 * BL + i];
+                    if (!(v > -2.f && v < 2.f)) finite = 0;
+                    if (b > 2) { double s = fabs((double)v - last); if (s > maxstep) maxstep = s; }
+                    last = v;
+                }
+            }
+            printf("tracked align: max sample step while gliding = %.5f (tone slope 0.0654)\n", maxstep);
+            CHECK(finite, "tracked align: the gliding tap stays bounded (no NaN, no blowup)");
+            CHECK(maxstep < 0.08, "tracked align: a gliding comp delay does not click");
+
+            /* (f) release: aimed back at identity it slews home and the aligner drops back to the
+             * integer path (state exactly 0 / 1, so the bit-identical guarantee is restored). */
+            align_tracked_slew(a, 20000.f);
+            align_tracked_targets(a, NULL, NULL);
+            for (int b = 0; b < 8; ++b) { memset(blk, 0, sizeof blk); align_process(a, blk, BL); }
+            align_tracked_state(a, dst, gst);
+            CHECK(dst[3] == 0.f && gst[3] == 1.f, "tracked align: aiming at identity returns exactly home");
+            align_destroy(a);
+        } else if (rf) align_destroy(rf);
     }
 
     /* 7b. layout_load rejects out-of-range values (so bad JSON can't reach the audio thread) */
@@ -784,8 +1000,232 @@ int main(void) {
         CHECK(active >= 1 && active <= 3, "VBAP uses at most 3 speakers (the containing triangle)");
     }
 
+    /* 12. CAP: the dual-band low band projected so the rendered ITD matches a real source's, for the
+     *     head's current orientation (cap.c). The quantity under test throughout is the interaural
+     *     component of the velocity vector, rV.e = sum(g*ce)/sum(g) — what the ear reads as ITD
+     *     below the crossover — against the real source's own u_s.e. */
+    {
+        CapState cp; cap_reset(&cp);
+        float lis[3] = { LD.ref[0], LD.ref[1], LD.ref[2] };
+        const float qid[4] = { 0.f, 0.f, 0.f, 1.f };            /* identity head: facing room-ahead */
+        float g0[CH], gl[CH], ref[CH];
+
+        /* a source OFF the median plane, close enough that atten == 1 */
+        float src[3] = { lis[0] + 1.0f, lis[1] + 0.2f, lis[2] + 0.5f };
+        dbap_gains(src, lis, &LD, 1.0f, g0);
+        cap_block(&cp, &LD, lis, qid, 1u);
+        float us[3]; unit_dir(lis, src, us);
+        cap_gains_lo(&cp, g0, us, 1.f, gl);
+
+        CHECK(fabs(itd_component(gl, cp.ce, LD.count) - dot3(us, cp.e)) < 1e-5,
+              "CAP makes the LF interaural component exact (rV.e == u_s.e)");
+        /* the test must be able to FAIL: plain dual-band renormalization leaves rV.e short */
+        dual_band_lo(g0, LD.count, ref);
+        CHECK(fabs(itd_component(ref, cp.ce, LD.count) - dot3(us, cp.e)) > 1e-3,
+              "plain dual-band does NOT (so the check above discriminates)");
+
+        /* level convention unchanged: the LF amplitude sum still equals the HF power magnitude */
+        double as = 0.0, pw = 0.0;
+        for (uint32_t k = 0; k < LD.count; ++k) { as += gl[k]; pw += (double)g0[k] * g0[k]; }
+        CHECK(fabs(as - sqrt(pw)) < 1e-4, "CAP keeps the dual-band level convention (sum g_lo == ||g||_2)");
+
+        /* HEAD ROTATION is the whole claim: sweep yaw and the ITD must not drift.
+         *
+         * The target is only achievable while it lies inside [min ce, max ce] over the lit speakers.
+         * rV is a convex combination of speaker directions, so the array cannot render an ITD MORE
+         * LATERAL than its own most lateral speaker — an array-density bound, not a CAP defect. On
+         * this grid that bites only where the head turns to put the source within ~11 deg of the
+         * interaural axis while the nearest speaker is 15 deg off it. So the contract under test is:
+         * exact wherever feasible, saturated at the bound otherwise, and never worse than plain. */
+        {
+            int cap_ok = 1, plain_drifts = 0, infeasible = 0, worse = 0;
+            double cap_worst = 0.0, plain_worst = 0.0;
+            for (int d = 0; d < 360; d += 15) {
+                const float a = (float)d * 3.14159265358979f / 180.f;
+                const float q[4] = { 0.f, sinf(a * 0.5f), 0.f, cosf(a * 0.5f) };   /* yaw about room up */
+                cap_block(&cp, &LD, lis, q, 1u);
+                cap_gains_lo(&cp, g0, us, 1.f, gl);
+
+                const double want = dot3(us, cp.e);
+                double lo = 1.0, hi = -1.0;
+                for (uint32_t k = 0; k < LD.count; ++k) {
+                    if (g0[k] <= 0.f) continue;
+                    if (cp.ce[k] < lo) lo = cp.ce[k];
+                    if (cp.ce[k] > hi) hi = cp.ce[k];
+                }
+                double feasible = want < lo ? lo : (want > hi ? hi : want);
+                if (feasible != want) ++infeasible;
+
+                const double ec = fabs(itd_component(gl,  cp.ce, LD.count) - want);
+                const double ep = fabs(itd_component(ref, cp.ce, LD.count) - want);
+                if (fabs(itd_component(gl, cp.ce, LD.count) - feasible) > 1e-5) cap_ok = 0;
+                if (ep > 1e-3) plain_drifts = 1;
+                if (ec > ep + 1e-6) worse = 1;
+                if (ec > cap_worst)   cap_worst = ec;
+                if (ep > plain_worst) plain_worst = ep;
+            }
+            printf("cap: yaw sweep worst |rV.e - u_s.e| = %.4f (CAP) vs %.4f (dual-band); "
+                   "%d/24 yaws beyond the array's lateral limit\n", cap_worst, plain_worst, infeasible);
+            CHECK(cap_ok, "CAP holds the ITD at its feasible target through a full head yaw sweep");
+            CHECK(!worse, "CAP is never worse than plain dual-band at any head yaw");
+            CHECK(plain_drifts, "plain dual-band's ITD drifts with head yaw (the failure CAP fixes)");
+        }
+
+        /* facing the source (median plane, symmetric array) the constraint is already satisfied:
+         * CAP must reduce to the panner it wrapped, not merely approximate it */
+        {
+            float msrc[3] = { lis[0], lis[1] + 0.2f, lis[2] + 0.9f };   /* x == listener x -> median plane */
+            dbap_gains(msrc, lis, &LD, 1.0f, g0);
+            cap_block(&cp, &LD, lis, qid, 1u);
+            unit_dir(lis, msrc, us);
+            cap_gains_lo(&cp, g0, us, 1.f, gl);
+            dual_band_lo(g0, LD.count, ref);
+            double worst = 0.0;
+            for (uint32_t k = 0; k < LD.count; ++k) { double e = fabs(gl[k] - ref[k]); if (e > worst) worst = e; }
+            CHECK(worst < 1e-5, "CAP is a no-op for a median-plane source (reduces to the panner)");
+        }
+
+        /* a VBAP seed must stay sparse: the g0-weighted projection is multiplicative, so a speaker
+         * the panner left silent can never be recruited to buy an ITD */
+        {
+            VbapState vb; vbap_reset(&vb);
+            float vsrc[3] = { lis[0] + 0.8f, lis[1] + 0.3f, lis[2] + 0.4f };
+            vbap_gains(&vb, vsrc, lis, &LD, 1u, 1.0f, g0);
+            cap_block(&cp, &LD, lis, qid, 1u);
+            unit_dir(lis, vsrc, us);
+            cap_gains_lo(&cp, g0, us, 1.f, gl);
+            int leaked = 0, active = 0;
+            for (uint32_t k = 0; k < LD.count; ++k) {
+                if (g0[k] <= 0.f && gl[k] != 0.f) leaked = 1;
+                if (gl[k] > 1e-4f) ++active;
+            }
+            CHECK(!leaked, "CAP never activates a speaker the panner left silent (support preserved)");
+            CHECK(active >= 1 && active <= 3, "CAP keeps a VBAP seed on its triangle");
+            CHECK(fabs(itd_component(gl, cp.ce, LD.count) - dot3(us, cp.e)) < 1e-5,
+                  "CAP is ITD-exact on a 3-speaker VBAP seed too");
+        }
+
+        /* strength 0 (an engulfing, fully-spread source) is provably inert: the target collapses
+         * onto the seed's own rV.e, so there is nothing to correct and the widening survives */
+        {
+            dbap_gains(src, lis, &LD, 1.0f, g0);
+            cap_block(&cp, &LD, lis, qid, 1u);
+            unit_dir(lis, src, us);
+            cap_gains_lo(&cp, g0, us, 0.f, gl);
+            dual_band_lo(g0, LD.count, ref);
+            double worst = 0.0;
+            for (uint32_t k = 0; k < LD.count; ++k) { double e = fabs(gl[k] - ref[k]); if (e > worst) worst = e; }
+            CHECK(worst < 1e-5, "CAP at strength 0 is exactly the plain dual-band low band");
+        }
+    }
+
+    /* 13. hole-aware spread floor (hole.c): a source aimed where the array has NO speaker is floored
+     *     wide instead of rendered as a split image. The discriminating pair is a BARREL (open at
+     *     both poles, the real CAVE shape) against the default cube grid (speakers at both poles,
+     *     no holes at all) — the floor must engage on the first and be identically inert on the
+     *     second, with no per-layout tuning: the knee is the array's own mean speaker spacing. */
+    {
+        const Layout LB = make_barrel();
+        const float lisB[3] = { 0.f, 1.4f, 0.f };                 /* seated ear height in the barrel */
+        const float lisG[3] = { LD.ref[0], LD.ref[1], LD.ref[2] };
+        const float NADIR[3] = { 0.f, -1.f, 0.f }, ZENITH[3] = { 0.f, 1.f, 0.f };
+        HoleState hb, hg;
+        hole_reset(&hb); hole_reset(&hg);
+        hole_block(&hb, &LB, lisB, 1u);
+        hole_block(&hg, &LD, lisG, 1u);
+
+        const double knee_b = layout_mean_speaker_spacing(&LB) * 57.2957795;
+        const double knee_g = layout_mean_speaker_spacing(&LD) * 57.2957795;
+        printf("hole: mean speaker spacing %.1f deg (barrel, %u spk) vs %.1f deg (cube grid, %u spk)\n",
+               knee_b, LB.count, knee_g, LD.count);
+        CHECK(knee_g > 30.0 && knee_g < 45.0, "cube grid's mean speaker spacing is ~37 deg");
+        /* the exported spacing IS what the SPCAP focus default is built on (one geometry, two users) */
+        CHECK(fabs(layout_derive_spcap_focus(&LD) -
+                   log(0.25) / log(0.5 * (1.0 + cos(layout_mean_speaker_spacing(&LD))))) < 1e-3,
+              "layout_mean_speaker_spacing is the same delta SPCAP's derived focus uses");
+
+        /* the poles: the barrel's holes, and where the split image lives */
+        const double gap_n = nearest_speaker_deg(&LB, lisB, NADIR);
+        const double gap_z = nearest_speaker_deg(&LB, lisB, ZENITH);
+        const float  f_n = hole_floor(&hb, NADIR), f_z = hole_floor(&hb, ZENITH);
+        printf("hole: barrel nadir gap %.1f deg -> spread floor %.3f; zenith gap %.1f deg -> %.3f\n",
+               gap_n, (double)f_n, gap_z, (double)f_z);
+        CHECK(f_n > 0.25f, "the barrel's nadir hole floors the spread (a wide source, not a split image)");
+        CHECK(f_z > 0.15f, "the barrel's zenith hole floors it too");
+
+        /* inert wherever the array actually has a speaker, on both layouts */
+        {
+            int quiet = 1;
+            for (uint32_t k = 0; k < LB.count; ++k) {
+                float u[3]; unit_dir(lisB, LB.speakers[k].pos, u);
+                if (hole_floor(&hb, u) != 0.f) quiet = 0;
+            }
+            CHECK(quiet, "no floor at any barrel speaker's own bearing");
+        }
+
+        /* the discriminating half: sweep the whole sphere on the SURROUNDING grid and find nothing */
+        {
+            enum { SWEEP = 4096 };
+            double worst_gap_g = 0.0, worst_gap_b = 0.0;
+            float  worst_f_g = 0.f, worst_f_b = 0.f;
+            for (int i = 0; i < SWEEP; ++i) {
+                float u[3]; fib_dir(i, SWEEP, u);
+                double gg = nearest_speaker_deg(&LD, lisG, u), gb = nearest_speaker_deg(&LB, lisB, u);
+                float  fg = hole_floor(&hg, u),                fb = hole_floor(&hb, u);
+                if (gg > worst_gap_g) worst_gap_g = gg;
+                if (gb > worst_gap_b) worst_gap_b = gb;
+                if (fg > worst_f_g)   worst_f_g = fg;
+                if (fb > worst_f_b)   worst_f_b = fb;
+            }
+            printf("hole: sphere sweep worst gap %.1f deg -> floor %.3f (cube grid) vs "
+                   "%.1f deg -> %.3f (barrel)\n", worst_gap_g, (double)worst_f_g,
+                   worst_gap_b, (double)worst_f_b);
+            CHECK(worst_f_g == 0.f, "the surrounding cube grid never floors anything (inert by construction)");
+            CHECK(worst_f_b > 0.25f, "the barrel does (so the check above discriminates)");
+        }
+
+        /* monotone in depth: diving from the horizon toward nadir can only widen, never narrow */
+        {
+            int mono = 1; float prev = -1.f;
+            for (int d = 0; d <= 90; d += 5) {
+                const float a = (float)d * 0.0174532925f;
+                const float u[3] = { cosf(a), -sinf(a), 0.f };     /* az 0 (a speaker column), dive to nadir */
+                const float f = hole_floor(&hb, u);
+                if (f < prev - 1e-6f) mono = 0;
+                prev = f;
+            }
+            CHECK(mono, "the floor rises monotonically as a source dives into the hole");
+        }
+
+        /* the cache self-invalidates on a listener move: standing up shrinks the nadir hole (the
+         * bottom ring drops further below the horizon), so the floor must FALL — a stale direction
+         * cache would hold the old value */
+        {
+            const float lis_hi[3] = { 0.f, 2.3f, 0.f };
+            hole_block(&hb, &LB, lis_hi, 1u);
+            const float f_hi = hole_floor(&hb, NADIR);
+            printf("hole: listener 1.4 m -> nadir floor %.3f; 2.3 m -> %.3f (gap %.1f deg)\n",
+                   (double)f_n, (double)f_hi, nearest_speaker_deg(&LB, lis_hi, NADIR));
+            CHECK(f_hi < f_n - 0.05f, "the direction cache self-invalidates on a listener move");
+            hole_block(&hb, &LB, lisB, 1u);                        /* back, and idempotent */
+            CHECK(fabsf(hole_floor(&hb, NADIR) - f_n) < 1e-6f, "hole_block is idempotent");
+        }
+
+        /* a layout-generation change rebuilds the cache too: raise the bottom ring toward ear height
+         * and the nadir hole opens wider, so the floor must rise */
+        {
+            Layout LB2 = LB;
+            for (uint32_t k = 0; k < 8; ++k) LB2.speakers[k].pos[1] = 1.0f;
+            layout_compute_ref(&LB2);
+            hole_block(&hb, &LB2, lisB, 2u);
+            const float f2 = hole_floor(&hb, NADIR);
+            CHECK(f2 > f_n + 0.05f, "a layout change rebuilds the cache (a raised ring opens the nadir hole)");
+        }
+    }
+
     remove(LJ);
     if (fails) { printf("dsp_test: %d FAILURES\n", fails); return 1; }
-    printf("dsp_test OK (layout parse, DBAP + SPCAP + VBAP, AllRAD + EPAD bed decodes + max-rE, align gain+delay)\n");
+    printf("dsp_test OK (layout parse, DBAP + SPCAP + VBAP + CAP, AllRAD + EPAD bed decodes + max-rE, "
+           "hole-aware spread floor, align gain+delay)\n");
     return 0;
 }

@@ -827,6 +827,28 @@ BWA_API uint32_t bwa_get_channel_count(bwa_engine* e);
  * (energy-vector) normalization — better low-frequency localization for a near-centered listener. Wraps
  * the selected panner; live-toggleable for A/B. Sweet-spot dependent like VBAP (see docs). */
 BWA_API void     bwa_set_dual_band(bwa_engine* e, bool on);
+/* Compensated amplitude panning on that low band (off by default; live A/B). REQUIRES dual-band: the
+ * low band is the only thing it touches, so with bwa_set_dual_band off this call changes nothing.
+ *
+ * Dual-band's low band aims the velocity vector at the source and accepts whatever |rV| < 1 the
+ * speaker geometry gives, which leaves the rendered ITD short of a real source's by a direction-
+ * dependent amount — so the image shifts when you turn your head. CAP instead constrains the one
+ * quantity the ear reads below ~700 Hz, the INTERAURAL component of the summed field, to equal a
+ * real source's at that bearing, using the tracked head ORIENTATION. Matching one scalar is
+ * satisfiable where matching a 3-vector is not, so the ITD comes out exact and stays exact as the
+ * head turns. Facing the source it is a no-op and reduces to the selected panner; it fades out with
+ * bwa_source_set_spread (an engulfing source has no single bearing to fix).
+ *
+ * This is the one engine feature that reads head orientation into the SPEAKER path — everywhere
+ * else orientation enters only at the binaural decode. So it wants a real pose: with an untracked
+ * (identity) head it still corrects ITD for a listener facing room-ahead, but the head-rotation
+ * benefit is exactly what you are not getting. Aimed at the seated/fixed-position case, where it
+ * costs one 3-vector rotate plus one dot product per speaker per block and rebuilds no panner cache.
+ * Composes with any panner and with the multi-listener compromise (primary head). Spread fades it
+ * out under LOBE and MDAP, but BWA_SPREAD_SPECTRAL bypasses it entirely: that mode replaces the
+ * single-path output stage, so a spread source there gets plain dual-band on its low bands and no
+ * ITD correction at all. Known exclusion. See docs/spatialization.md. */
+BWA_API void     bwa_set_cap(bwa_engine* e, bool on);
 /* max-rE weighting for the SH->speaker BED decode (off by default; live A/B, crossfaded): tapers the
  * higher ambisonic orders (Zotter & Frank's psychoacoustic decoder weights, diffuse-energy-matched so
  * A and B stay level-fair), which suppresses decode sidelobes and lengthens the energy vector —
@@ -864,6 +886,28 @@ BWA_API void     bwa_set_decorrelation(bwa_engine* e, bool on);
  * nearest speaker and snapping across it. radius_m ~ 1.0 is a good start; the widened part follows
  * the selected spread mode and (when enabled) decorrelates. Engine-wide policy; live-safe. */
 BWA_API void     bwa_set_near_spread(bwa_engine* e, float radius_m);
+/* Hole-aware spread floor (0 = off, the default): floor a source's spread by how far its bearing
+ * sits from the NEAREST speaker, so a source aimed where the array has no speaker renders as an
+ * honest WIDE source instead of a fake point.
+ *
+ * Only arrays with holes are affected. The CAVE array is a barrel: speakers mount between the screen
+ * cube and the truss, so nothing covers the poles. Aim a source into one and the panner closes the
+ * hole with a big triangle of distant speakers — the direction comes out about right, but the energy
+ * is carried by speakers up to 113 degrees apart, which is a split image, not a phantom. A source
+ * with no speaker anywhere near it is genuinely not a point, so this stops pretending it is.
+ *
+ * The floor is 0 until the nearest speaker is more than one mean inter-speaker spacing away (the
+ * same array geometry bwa_spcap_focus_default measures, so it self-scales), then rises linearly,
+ * reaching fully wide when no speaker is within 90 degrees. A surrounding array is therefore inert
+ * by construction, not by tuning: no direction on it is ever a full speaker spacing from a speaker.
+ *
+ * `strength` scales the derived floor: 1.0 is the honest width, below that a partial widening, above
+ * it an exaggeration (clamped at 2). The widened part follows the selected spread mode and (when
+ * enabled) decorrelates, exactly like bwa_source_set_spread, and it composes with the other spread
+ * floors as a max — the widest claim wins. Engine-wide policy; live-safe, and every source re-solves
+ * on the next block, static ones included. No effect in BWA_PROFILE_BINAURAL (no speakers, no
+ * holes). Full story: docs/spatialization.md, "Array holes". */
+BWA_API void     bwa_set_hole_spread(bwa_engine* e, float strength);
 
 /* ---- output protection limiter (ON by default at -1 dBFS) ----
  * The final stage on the speaker output — everything (voices, beds, reflections, pathing, per-speaker
@@ -910,6 +954,36 @@ BWA_API void     bwa_set_bed_renderer(bwa_engine* e, bwa_bed_renderer renderer);
  * present; this is the live kill switch (off glides every cut to flat — a click-free A/B). A no-op
  * for layouts without a grid. Control thread, per-frame-safe. See docs/calibration.md. */
 BWA_API void     bwa_set_tracked_room_eq(bwa_engine* e, bool on);
+
+/* Tracked listener alignment (OFF by default). The layout's per-speaker delay and gain trims align
+ * the array's arrival times at ONE point, the array centroid, so the array is time-coherent there and
+ * progressively less so as the listener walks away. Turn this on and the output stage re-references
+ * that alignment onto the TRACKED listener instead: per speaker it adds the propagation delay and the
+ * 1/r level for |speaker - listener| against |speaker - centroid|, so coherence follows the head.
+ * Purely geometric, downstream of every panner, and works with any of them.
+ *
+ * It is opt-in because a moving delay line is a resampling event. A walking listener means every
+ * speaker's delay gliding at once, which is a Doppler shift on everything the array plays — a global,
+ * always-audible failure mode rather than a local one. Two guards keep it usable, and both are yours
+ * to tune (pass <= 0 for either to take the default):
+ *
+ *   dead_zone_m         How far the head must move before anything is recomputed. Default 0.05 (5 cm).
+ *                       Tracker position output is jittery; without a dead zone the array glides
+ *                       permanently. 5 cm of slack is 0.15 ms of residual arrival error.
+ *   slew_frames_per_s   Ceiling on how fast a speaker's delay may change, in output FRAMES per second.
+ *                       This ratio against the sample rate IS the resampling ratio, so it is what
+ *                       bounds the pitch shift. The default follows a listener closing on a speaker at
+ *                       0.45 m/s, which is about 63 frames/s at 48 kHz and 0.13% (2.3 cents) of shift.
+ *                       Move faster than that and the alignment LAGS instead of warbling, which is the
+ *                       trade the default takes deliberately. Raise it for tighter tracking of a fast
+ *                       listener, and expect to hear it.
+ *
+ * Corrections saturate about 4 m from the centroid (the reserved delay headroom) and the per-speaker
+ * level trim is clamped to +/-6 dB. Off is exact: the trims revert to the layout's own values, and
+ * toggling either way glides rather than steps. Control thread, per-frame-safe, live A/B.
+ * See docs/spatialization.md, "Re-aligning to the tracked listener". */
+BWA_API void     bwa_set_tracked_align(bwa_engine* e, bool on, float dead_zone_m,
+                                       float slew_frames_per_s);
 
 /* ---- offline panner evaluation (no engine handle; for layout scoring/optimization in tools) ----
  * The per-speaker gains the given `panner` produces for `nsrc` source positions heard from one

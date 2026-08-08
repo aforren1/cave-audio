@@ -26,7 +26,7 @@ flowchart TD
     PATHS["path sim 10 Hz: per-voice shCoeffs + bending tilt<br/>steam_path.c → rt_set_pathing<br/><i>bwa_desc.enable_pathing · bwa_source_set_pathing</i>"]
   end
 
-  SOLVE["gain solve: compute_gains (block rate, dirty-gated)<br/>panner_gains → dbap_gains / spcap_gains / vbap_gains →<br/>per-source atten override (by ratio, atten_curve) →<br/>spread: spread_gains (LOBE) / mdap_gains / fs_solve (SPECTRAL);<br/>anisotropic w×h extent (up-anchored frame + affine squash)<br/><i>bwa_set_panner · _spcap_focus · _dual_band · _spread_mode ·<br/>_near_spread · _extra_listeners · bwa_source_set_spread / _extent /<br/>_size / _gain / _attenuation_override · bwa_group_set_gain ·<br/>bwa_source_fade_to</i>"]
+  SOLVE["gain solve: compute_gains (block rate, dirty-gated)<br/>panner_gains → dbap_gains / spcap_gains / vbap_gains →<br/>per-source atten override (by ratio, atten_curve) →<br/>spread: spread_gains (LOBE) / mdap_gains / fs_solve (SPECTRAL);<br/>anisotropic w×h extent (up-anchored frame + affine squash)<br/><i>bwa_set_panner · _spcap_focus · _dual_band · _spread_mode ·<br/>_near_spread · _hole_spread · _extra_listeners · bwa_source_set_spread / _extent /<br/>_size / _gain / _attenuation_override · bwa_group_set_gain ·<br/>bwa_source_fade_to</i>"]
 
   subgraph VOICE["mono voice: mix_voice, per sample (inside rt_render)"]
     READ["read: pcm cursor · pitch resample · stream_pull<br/><i>bwa_source_play / _play_at / _play_loop / _queue · bwa_source_set_pitch</i>"]
@@ -83,7 +83,7 @@ flowchart TD
   PACC -- "BINAURAL profile: summed raw<br/>(already phonon-basis SH; tap skipped)" --> DIRECT
 
   BUS --> MG["× master gain (ramped)<br/><i>bwa_set_master_gain</i>"]
-  MG --> ALIGN["align_process + room_eq_track:<br/>per-speaker correction FIR · room-EQ biquads<br/>(re-aimed at the tracked pose) · gain trim · delay<br/><i>trims/EQ written by bwa_calibrate · bwa_set_tracked_room_eq</i>"]
+  MG --> ALIGN["align_process + room_eq_track + listener_align_track:<br/>per-speaker correction FIR · room-EQ biquads<br/>(re-aimed at the tracked pose) · gain trim · delay<br/>(delay+trim re-referenced onto the tracked head, slewed)<br/><i>trims/EQ written by bwa_calibrate · bwa_set_tracked_room_eq · bwa_set_tracked_align</i>"]
   ALIGN --> TSIG["+ test signal (raw channel, post-align)<br/><i>bwa_set_test_signal</i>"]
   TSIG --> LIM["linked limiter → per-channel peak meters<br/><i>bwa_set_limiter · _limiter_ceiling · bwa_get_bus_levels</i>"]
 

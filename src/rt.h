@@ -135,14 +135,24 @@ uint32_t rt_direct_voices(RtCore* c, const RtDirectVoice** out);
 void    rt_set_bed_decoder(RtCore* c, int decoder);  /* 1 = AllRAD, 2 = EPAD (0 = the SAD fallback — internal only,
                                                       * no longer reachable from the public enum); before bwa_start */
 void    rt_set_dual_band(RtCore* c, int on);         /* dual-band panning (amplitude LF / power HF); live A/B */
+void    rt_set_cap(RtCore* c, int on);               /* CAP on the dual-band low band (ITD-exact); live A/B */
 void    rt_set_spread_mode(RtCore* c, int mode);     /* spread render: 0 = lobe, 1 = MDAP ring, 2 = spectral; live A/B */
 void    rt_set_max_re(RtCore* c, int on);            /* max-rE bed-decode weighting (matrix paths + FDN); live A/B */
 void    rt_set_max_re_split(RtCore* c, int on);      /* band-split max-rE: taper only > ~700 Hz (rV decode below); live A/B */
 void    rt_set_room_eq_dyn(RtCore* c, int on);       /* tracked room EQ (room_eq_grid layouts): default on; live A/B */
+/* Tracked listener alignment (align.h): re-reference the output stage's per-speaker delay + gain from
+ * Layout.ref onto the live listener. Default OFF. `dead_zone_m` is how far the listener must move
+ * before anything is recomputed, `slew_frames_per_s` the ceiling on delay change (the resampling
+ * ratio, hence the pitch shift); either <= 0 reverts that one to its default. Live A/B. */
+void    rt_set_tracked_align(RtCore* c, int on, float dead_zone_m, float slew_frames_per_s);
 void    rt_set_decorrelation(RtCore* c, int on);     /* velvet-noise wide-part decorrelation; live A/B */
 void    rt_set_bed_renderer(RtCore* c, int parametric);   /* bed: 0 = matrix decode, 1 = parametric (DirAC); live A/B */
 void    rt_set_pose_prediction(RtCore* c, float lead_s);  /* tracked-pose lead (0 = off); live */
 void    rt_set_near_spread(RtCore* c, float radius_m);    /* near-listener widening radius (0 = off); live */
+/* Hole-aware spread floor (hole.h): a source aimed where the array has no speaker is floored WIDE
+ * rather than rendered as a split image. `strength` scales the derived floor; 0 = off (default).
+ * Live: bumps the panner generation so even a motionless voice re-solves (rt.c, RtCore.pan_gen). */
+void    rt_set_hole_spread(RtCore* c, float strength);
 /* SPCAP lobe sharpness + placement-correction density exponent; either <= 0 reverts that knob to the
  * layout's default (derived focus, constant density). Live: bumps the panner generation so even a
  * motionless voice re-solves (rt.c, RtCore.pan_gen). */

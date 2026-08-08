@@ -195,6 +195,12 @@ public:
 	Panner get_panner() const { return panner; }
 	void set_dual_band(bool on);
 	bool get_dual_band() const { return dual_band; }
+	/* Compensated amplitude panning on the dual-band low band. INERT unless dual_band is on.
+	 * Constrains the interaural component of the summed field to a real source's, using the
+	 * tracked head ORIENTATION, so an image holds still as the listener turns. A no-op facing
+	 * the source, and it fades out with source spread. */
+	void set_cap(bool on);
+	bool get_cap() const { return cap; }
 	/* SPCAP's two tuning exponents (inert under DBAP/VBAP; live, and every source re-solves next
 	 * block, static ones included). focus = lobe sharpness: higher concentrates a source on fewer
 	 * speakers, lower spreads it. density = the placement-correction kernel exponent that de-biases
@@ -211,6 +217,15 @@ public:
 	bool get_decorrelation() const { return decorrelation; }
 	void set_near_spread(float radius_m);
 	float get_near_spread() const { return near_spread; }
+	/* Hole-aware spread floor (0 = off). Floors a source's spread by how far its bearing sits from
+	 * the NEAREST speaker, so a source aimed where the array has no speaker - the CAVE array is a
+	 * barrel, open at both poles - renders as an honest WIDE source instead of a split image across
+	 * the two distant speakers that close the hole. The floor stays 0 until the gap exceeds the
+	 * array's own mean speaker spacing, so an array that surrounds the listener is inert by
+	 * construction. 1 = the honest width, below that a partial widening, above it an exaggeration
+	 * (clamped at 2). Live: every source re-solves next block, static ones included. */
+	void set_hole_spread(float strength);
+	float get_hole_spread() const { return hole_spread; }
 	/* Engine-wide speed of sound (m/s; live): Doppler + reflection delays derive from it and
 	 * glide to a change. 343 air, 1480 underwater; small values exaggerate Doppler (slow motion).
 	 * NOT the layout file's reference.speed_of_sound_mps, which is the ROOM AIR TEMPERATURE the
@@ -227,6 +242,15 @@ public:
 	BedRenderer get_bed_renderer() const { return bed_renderer; }
 	void set_tracked_room_eq(bool on);
 	bool get_tracked_room_eq() const { return tracked_room_eq; }
+	/* Tracked listener alignment: re-reference the per-speaker delay/gain trims from the fixed array
+	 * centroid onto the TRACKED listener. OFF by default (every delay change resamples). One C call
+	 * carries all three, so each setter re-sends the trio, like the SPCAP pair. */
+	void set_tracked_align(bool on);
+	bool get_tracked_align() const { return tracked_align; }
+	void set_tracked_align_dead_zone(float meters);
+	float get_tracked_align_dead_zone() const { return tracked_align_dead_zone; }
+	void set_tracked_align_slew(float frames_per_s);
+	float get_tracked_align_slew() const { return tracked_align_slew; }
 	void set_limiter(bool on);
 	bool get_limiter() const { return limiter; }
 	void set_limiter_ceiling(float linear);
@@ -376,16 +400,21 @@ private:
 	float er_gain = 1.0f;
 	Panner panner = PAN_DBAP;
 	bool dual_band = false;
+	bool cap = false;
 	float spcap_focus = 0.0f;   /* 0 = the geometry-derived default */
 	float spcap_density = 0.0f; /* 0 = the 2.0 constant default */
 	SpreadMode spread_mode = SPREAD_LOBE;
 	bool decorrelation = false;
 	float near_spread = 0.0f;
+	float hole_spread = 0.0f;   /* 0 = off; only arrays with holes are affected at all */
 	float speed_of_sound = 343.0f;
 	bool max_re = false;
 	bool max_re_split = false;
 	BedRenderer bed_renderer = BED_MATRIX;
 	bool tracked_room_eq = true;
+	bool tracked_align = false;             /* opt-in: a moving delay line resamples the whole array */
+	float tracked_align_dead_zone = 0.0f;   /* 0 = the 5 cm default */
+	float tracked_align_slew = 0.0f;        /* 0 = the default (~63 audio frames/s at 48 kHz) */
 	bool limiter = true;
 	float limiter_ceiling = 0.891251f;   /* -1 dBFS, linear */
 	bool headphone_eq_on = true;         /* the headphone-EQ A/B (the loaded file dies with the

@@ -84,12 +84,21 @@ bool layout_load(const char* path, uint32_t sample_rate, Layout* out, char* err,
 /* (Re)compute `ref` from the speaker positions — for callers that build a Layout by hand. */
 void layout_compute_ref(Layout* L);
 
-/* SPCAP's default lobe sharpness for THIS array: mean nearest-neighbor angular separation delta of
- * the speaker directions seen from `ref`, then the exponent that puts the lobe ((1+cos)/2)^n 6 dB
- * down in energy at delta — n = ln(0.25)/ln((1+cos delta)/2). A wide array (few speakers, far apart)
- * wants a broad lobe, a dense one a tight one; the hard-coded 12 only ever fit the 26-speaker cave.
- * Clamped to 1..64, and falls back to 12 on a degenerate survey (< 2 speakers, delta ~ 0 or ~ pi).
- * Needs `count` + `ref` set — call after layout_compute_ref. Control thread; O(N^2), load-time only. */
+/* The array's angular scale: the mean nearest-neighbor angular separation (RADIANS) of the speaker
+ * directions seen from `ref`. 37.5 deg on the default 26-speaker cube grid. Returns 0 on a
+ * degenerate survey (fewer than 2 speakers). Needs `count` + `ref` set — call after
+ * layout_compute_ref. Control thread; O(N^2), load-time only.
+ *
+ * Two features scale themselves off it, which is why it is exported rather than inlined into either:
+ * SPCAP's default lobe width (below) and the hole-aware spread floor's knee (hole.h). */
+float layout_mean_speaker_spacing(const Layout* L);
+
+/* SPCAP's default lobe sharpness for THIS array: the mean nearest-neighbor angular separation delta
+ * above, then the exponent that puts the lobe ((1+cos)/2)^n 6 dB down in energy at delta —
+ * n = ln(0.25)/ln((1+cos delta)/2). A wide array (few speakers, far apart) wants a broad lobe, a
+ * dense one a tight one; the hard-coded 12 only ever fit the 26-speaker cave. Clamped to 1..64, and
+ * falls back to 12 on a degenerate survey (< 2 speakers, delta ~ 0 or ~ pi). Same preconditions and
+ * cost as layout_mean_speaker_spacing. */
 float layout_derive_spcap_focus(const Layout* L);
 
 #define BWA_SPCAP_DENSITY_DEFAULT 2.0f   /* placement-correction density exponent (no geometry link) */

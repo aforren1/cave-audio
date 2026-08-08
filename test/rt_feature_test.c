@@ -4,7 +4,8 @@
  * generation handles, voice lifecycle, scheduling, streaming, limiter, readbacks), this pins the
  * DSP behavior toggles layered on top: the ambisonic bed + bed renderers (rotation/orientation/
  * parametric/max-rE + band split), the panner variants (dual-band) and reflection/pathing taps,
- * source spread (lobe/MDAP/spectral) + extent + frame transport + near-spread + metric size,
+ * source spread (lobe/MDAP/spectral) + extent + frame transport + near-spread + hole-aware
+ * spread floor + metric size,
  * decorrelation, pathing transmission EQ, air absorption + Doppler + loudness comp + near-field
  * proximity + manual directivity + the engine-wide speed of sound +
  * distance→reverb send + attenuation override, tracked room EQ, pose prediction, multi-listener
@@ -16,6 +17,78 @@
  * rt_test_util.h. Uses its own scratch wav name so it never collides with rt_core_test's.
  */
 #include "rt_test_util.h"
+#include "hole.h"        /* the hole-floor section derives its expected width straight from hole.c */
+
+/* ---- tracked listener alignment helpers (rt_set_tracked_align) ----------------------------------
+ * The expected per-channel comp: (|spk - ref| - |spk - listener|) * rate / c, with the set's minimum
+ * re-zeroed. This is the test's own restatement of listener_align_track's math, so a sign flip or a
+ * dropped normalization in rt.c shows up as a mismatch rather than as "some number changed". */
+static void lc_expect(const float lp[3], float* out) {
+    float dmin = 0.f;
+    for (int k = 0; k < CH; ++k) {
+        const float* s = LD.speakers[k].pos;
+        float ax = s[0]-LD.ref[0], ay = s[1]-LD.ref[1], az = s[2]-LD.ref[2];
+        float bx = s[0]-lp[0],     by = s[1]-lp[1],     bz = s[2]-lp[2];
+        out[k] = (sqrtf(ax*ax+ay*ay+az*az) - sqrtf(bx*bx+by*by+bz*bz)) * (float)RATE / 343.f;
+        if (k == 0 || out[k] < dmin) dmin = out[k];
+    }
+    for (int k = 0; k < CH; ++k) out[k] -= dmin;
+}
+/* Sub-sample arrival time of an impulse on one channel: the energy centroid over the capture (exact
+ * for the aligner's two-tap linear interpolation, which an integer argmax would round away). */
+static float lc_arrival(RtCore* c, int ch, int nb) {
+    bwa_timestamp ts = { 0, 0 };
+    double num = 0, den = 0; long t = 0;
+    for (int b = 0; b < nb; ++b) {
+        rt_render(c, bus, N, &ts);
+        for (int i = 0; i < N; ++i, ++t) {
+            double v = bus[(size_t)ch * N + i]; v *= v;
+            num += v * (double)t; den += v;
+        }
+    }
+    return den > 0 ? (float)(num / den) : -1.f;
+}
+/* One measurement: a fresh one-shot impulse voice at speaker K, captured on channel K. Fresh each
+ * time so the voice's gain ramp and the capture window line up identically across runs. */
+static float lc_measure(RtCore* c, uint32_t snd, int K) {
+    uint32_t h = rt_source_create(c);
+    rt_source_play(c, h, snd, false);
+    set_pos_spk(c, h, K);
+    rt_commit(c);
+    float t = lc_arrival(c, K, 12);
+    rt_source_destroy(c, h); rt_commit(c);
+    return t;
+}
+static void lc_settle(RtCore* c, int nb) {              /* silence: let the comp glide land + flush */
+    bwa_timestamp ts = { 0, 0 };
+    for (int b = 0; b < nb; ++b) rt_render(c, bus, N, &ts);
+}
+
+/* A BARREL: 8 perimeter positions x 3 heights, no top or bottom cap — the CAVE array's real shape,
+ * open at both poles. 24 speakers, so its RtCore is 24 channels wide, not 26. */
+static Layout make_barrel(void) {
+    Layout L;
+    memset(&L, 0, sizeof L);
+    const float rad = 1.5f, ys[3] = { 0.5f, 1.5f, 2.5f };
+    uint32_t k = 0;
+    for (int ri = 0; ri < 3; ++ri)
+        for (int a = 0; a < 8; ++a, ++k) {
+            const float th = (float)a * 0.785398163f;
+            L.speakers[k].pos[0] = rad * cosf(th);
+            L.speakers[k].pos[1] = ys[ri];
+            L.speakers[k].pos[2] = rad * sinf(th);
+            L.speakers[k].gain_lin = 1.f;
+        }
+    L.count = k;
+    layout_compute_ref(&L);
+    L.rolloff_r     = 0.7f;
+    L.spcap_focus   = layout_derive_spcap_focus(&L);
+    L.spcap_density = BWA_SPCAP_DENSITY_DEFAULT;
+    L.atten_ref_m   = 1.f;
+    L.atten_rolloff = 1.f;
+    L.atten_min_lin = 0.01f;
+    return L;
+}
 
 int main(void) {
     LD = layout_default();                          /* listener stays at the default (the array center, LD.ref) */
@@ -356,6 +429,154 @@ int main(void) {
         }
     }
 
+    /* tracked listener alignment (rt_set_tracked_align): the output stage's per-speaker delay is
+     * re-referenced from Layout.ref onto the live listener. Measured end to end — an impulse voice at
+     * speaker K, and where it ARRIVES on channel K. Off must be bit-identical, on must shift by the
+     * geometry (lc_expect), the dead zone must swallow jitter, and it must engage off the TRACKER
+     * pose as well as off a committed one (the tracker overwrites p_active without ever passing
+     * through commit, so a feature hooked only to commit would be dead on the rig). */
+    {
+        const char* IMP = "bwa_rt_lc_imp.wav";
+        if (write_impulse_at_wav(IMP, 512, 4 * N)) {
+            const int K = 7;                              /* the speaker we walk toward */
+            const float qid[4] = { 0, 0, 0, 1 };
+            float dir[3];
+            unit_dir(LD.ref, LD.speakers[K].pos, dir);
+            float lp[3], lpj[3], lpm[3], want[CH], wantm[CH];
+            for (int j = 0; j < 3; ++j) {
+                lp[j]  = LD.ref[j] + 1.00f * dir[j];      /* 1 m off the reference, straight at K */
+                lpj[j] = LD.ref[j] + 1.02f * dir[j];      /* + 2 cm: inside the 5 cm dead zone */
+                lpm[j] = LD.ref[j] + 1.30f * dir[j];      /* + 30 cm: a real move */
+            }
+            lc_expect(lp,  want);
+            lc_expect(lpm, wantm);
+
+            /* (1) OFF is inert, bit for bit: two identical cores, one of which had the call made with
+             * on = 0 and both knobs set. Same displaced listener, same voice, same blocks. */
+            {
+                RtCore* ca = rt_create(8, 4, RATE, CH);
+                RtCore* cb = rt_create(8, 4, RATE, CH);
+                CHECK(ca && cb, "rt_create (tracked align, off-path)");
+                if (ca && cb) {
+                    static float tmp[CH * N];
+                    rt_set_tracked_align(cb, 0, 0.02f, 500.f);   /* knobs live, feature off */
+                    uint32_t sa = rt_load_sound(ca, IMP, err, sizeof err);
+                    uint32_t sb = rt_load_sound(cb, IMP, err, sizeof err);
+                    uint32_t ha = rt_source_create(ca), hb = rt_source_create(cb);
+                    rt_source_play(ca, ha, sa, false); rt_source_play(cb, hb, sb, false);
+                    set_pos_spk(ca, ha, K);            set_pos_spk(cb, hb, K);
+                    rt_set_listener(ca, lp, qid);      rt_set_listener(cb, lp, qid);
+                    rt_commit(ca);                     rt_commit(cb);
+                    int same = 1;
+                    bwa_timestamp ts = { 0, 0 };
+                    for (int b = 0; b < 12; ++b) {
+                        rt_render(ca, bus, N, &ts);
+                        memcpy(tmp, bus, sizeof tmp);
+                        rt_render(cb, bus, N, &ts);
+                        if (memcmp(tmp, bus, sizeof tmp) != 0) same = 0;
+                    }
+                    CHECK(same, "tracked align off: the bus is bit-identical to a core that never saw the call");
+                    rt_destroy(ca); rt_destroy(cb);
+                }
+            }
+
+            /* (2) engaged, via the COMMIT path: sign, magnitude, dead zone, and the off round trip */
+            {
+                RtCore* cl = rt_create(8, 4, RATE, CH);
+                CHECK(cl != NULL, "rt_create (tracked align)");
+                if (cl) {
+                    uint32_t sl = rt_load_sound(cl, IMP, err, sizeof err);
+                    rt_set_listener(cl, lp, qid); rt_commit(cl);
+                    float t_off = lc_measure(cl, sl, K);
+                    /* slew wide open here: this section is about the geometry, not the rate limit */
+                    rt_set_tracked_align(cl, 1, 0.05f, 20000.f);
+                    lc_settle(cl, 120);
+                    float t_on = lc_measure(cl, sl, K);
+                    printf("tracked align: 1.0 m toward speaker %d -> channel %d arrives %+.2f frames "
+                           "later (want %+.2f)\n", K, K, t_on - t_off, want[K]);
+                    CHECK(t_on - t_off > 1.f,
+                          "tracked align: walking TOWARD a speaker DELAYS it (sign)");
+                    CHECK(fabs((t_on - t_off) - want[K]) < 0.5,
+                          "tracked align: the shift matches the speaker/listener geometry (magnitude)");
+                    /* dead zone: 2 cm of jitter must change nothing at all */
+                    rt_set_listener(cl, lpj, qid); rt_commit(cl);
+                    lc_settle(cl, 60);
+                    float t_jit = lc_measure(cl, sl, K);
+                    printf("tracked align: 2 cm jitter moved the arrival %.4f frames (dead zone 5 cm)\n",
+                           t_jit - t_on);
+                    CHECK(fabs(t_jit - t_on) < 0.01, "tracked align: the dead zone suppresses small jitter");
+                    /* 30 cm is a real move: it re-solves, to the new geometry */
+                    rt_set_listener(cl, lpm, qid); rt_commit(cl);
+                    lc_settle(cl, 120);
+                    float t_mov = lc_measure(cl, sl, K);
+                    printf("tracked align: +30 cm -> %+.2f frames from the off baseline (want %+.2f)\n",
+                           t_mov - t_off, wantm[K]);
+                    CHECK(fabs((t_mov - t_off) - wantm[K]) < 0.5,
+                          "tracked align: a move past the dead zone re-solves the alignment");
+                    /* off again: glides back to exactly the layout's own trims */
+                    rt_set_tracked_align(cl, 0, 0.f, 0.f);
+                    lc_settle(cl, 200);
+                    rt_set_listener(cl, lp, qid); rt_commit(cl);
+                    float t_back = lc_measure(cl, sl, K);
+                    CHECK(fabs(t_back - t_off) < 0.01, "tracked align: off glides back to the fixed reference");
+                    rt_destroy(cl);
+                }
+            }
+
+            /* (3) the TRACKER path: no listener is ever committed, the pose arrives only through the
+             * seqlock slot rt_render samples. The same shift must appear. */
+            {
+                RtCore* ct = rt_create(8, 4, RATE, CH);
+                CHECK(ct != NULL, "rt_create (tracked align, tracker path)");
+                if (ct) {
+                    static PoseSlot slot;                 /* single writer (this thread) */
+                    memset(&slot, 0, sizeof slot);
+                    pose_write(&slot, lp, qid);           /* the ONLY place this position is published */
+                    rt_set_tracker(ct, &slot);
+                    uint32_t st = rt_load_sound(ct, IMP, err, sizeof err);
+                    lc_settle(ct, 4);
+                    float t_off = lc_measure(ct, st, K);
+                    rt_set_tracked_align(ct, 1, 0.05f, 20000.f);
+                    lc_settle(ct, 120);
+                    float t_on = lc_measure(ct, st, K);
+                    printf("tracked align: via the TRACKER slot -> %+.2f frames (want %+.2f)\n",
+                           t_on - t_off, want[K]);
+                    CHECK(fabs((t_on - t_off) - want[K]) < 0.5,
+                          "tracked align: engages off the tracker pose, with no commit at all");
+                    rt_set_tracker(ct, NULL);
+                    rt_destroy(ct);
+                }
+            }
+
+            /* (4) the rate limit at the rt level: with the DEFAULT slew (about 63 frames/s at 48 kHz)
+             * a 1 m teleport cannot land inside one block — after 4 blocks the arrival has moved only
+             * a fraction of the way, which is the whole point (stale beats warble). */
+            {
+                RtCore* cr = rt_create(8, 4, RATE, CH);
+                CHECK(cr != NULL, "rt_create (tracked align, rate limit)");
+                if (cr) {
+                    uint32_t sr = rt_load_sound(cr, IMP, err, sizeof err);
+                    rt_set_listener(cr, LD.ref, qid); rt_commit(cr);
+                    rt_set_tracked_align(cr, 1, 0.05f, 0.f);      /* 0 = the default rate limit */
+                    lc_settle(cr, 20);
+                    float t_ref = lc_measure(cr, sr, K);          /* at the reference: comp == identity */
+                    rt_set_listener(cr, lp, qid); rt_commit(cr);
+                    lc_settle(cr, 4);                             /* 4 blocks = 1024 frames */
+                    float t_4 = lc_measure(cr, sr, K);
+                    double cap = 63.0 * (4 + 12) * N / (double)RATE;   /* the capture glides on too */
+                    printf("tracked align: default slew moved the arrival %.2f frames in %d blocks "
+                           "(ceiling %.2f, target %.2f)\n", t_4 - t_ref, 4 + 12, cap, want[K]);
+                    CHECK(t_4 - t_ref > 0.f && (t_4 - t_ref) < cap + 1.0,
+                          "tracked align: the default rate limit bounds how fast the alignment moves");
+                    CHECK((t_4 - t_ref) < 0.5 * want[K],
+                          "tracked align: a 1 m teleport LAGS rather than snapping (rate limited)");
+                    rt_destroy(cr);
+                }
+            }
+            remove(IMP);
+        } else CHECK(0, "write impulse wav (tracked align)");
+    }
+
     /* decorrelation (bwa_set_decorrelation): a fully-spread noise source's speaker feeds are IDENTICAL
      * scaled copies with decor off (zero-lag correlation ~ +1) and mutually incoherent with it on
      * (each channel passes its own velvet filter), at the same total power; toggling back restores
@@ -535,6 +756,105 @@ int main(void) {
             CHECK(abs(act_far - act_far_off) <= 1, "a source beyond the radius is untouched");
             rt_source_destroy(cn, hn); rt_commit(cn);
             rt_destroy(cn);
+        }
+    }
+
+    /* hole-aware spread floor (rt_set_hole_spread): on an array with a HOLE, a source aimed into it
+     * is floored wide instead of rendered as a split image across the hull triangle that closes the
+     * hole. Three claims, in order: the floor equals the user having asked for exactly that spread
+     * (so the mapping is pinned, not just "something changed"); it engages on a STATIC voice with no
+     * position nudge (the pan_gen bump); and it is bit-identical to off wherever the array actually
+     * covers the bearing, plus everywhere on the surrounding default grid. */
+    {
+        memset(bus, 0, sizeof bus);                      /* the barrel is 24-wide: park channels 24-25 */
+        const Layout LBAR = make_barrel();
+        RtCore* ch = rt_create(8, 4, RATE, LBAR.count);
+        CHECK(ch != NULL, "rt_create (hole spread)");
+        if (ch) {
+            rt_set_layout(ch, &LBAR);                    /* also re-centers the listener on LBAR.ref */
+            uint32_t hs = rt_load_sound(ch, WAV, err, sizeof err);
+            uint32_t hh = rt_source_create(ch);
+            rt_source_play(ch, hh, hs, true);
+
+            /* straight down: the nadir hole. 1 m below the ear point, so atten == 1. */
+            const float nad[3] = { LBAR.ref[0], LBAR.ref[1] - 1.f, LBAR.ref[2] };
+            rt_source_set_pos(ch, hh, nad[0], nad[1], nad[2]);
+            rt_commit(ch); render2(ch); render2(ch);
+            double e_off[CH]; for (int k = 0; k < CH; ++k) e_off[k] = chan_energy(k);
+            const double l2_off = total_l2();
+
+            /* what the floor SHOULD be at this bearing, straight from hole.c */
+            HoleState hst; hole_reset(&hst);
+            hole_block(&hst, &LBAR, LBAR.ref, 1u);
+            float u_nad[3]; unit_dir(LBAR.ref, nad, u_nad);
+            const float want = hole_floor(&hst, u_nad);
+
+            rt_set_hole_spread(ch, 1.0f);                /* the ONLY call: no move, no commit */
+            render2(ch); render2(ch);
+            double e_on[CH]; for (int k = 0; k < CH; ++k) e_on[k] = chan_energy(k);
+            const double l2_on = total_l2();
+            double moved = 0, e_tot = 0;
+            for (int k = 0; k < CH; ++k) { moved += fabs(e_on[k] - e_off[k]); e_tot += e_off[k]; }
+            printf("hole: barrel nadir floor %.3f moves %.1f%% of the energy across channels, "
+                   "power %.4f -> %.4f\n", (double)want, 100.0 * moved / e_tot, l2_off, l2_on);
+            CHECK(want > 0.25f, "the barrel's nadir bearing derives a real spread floor");
+            CHECK(moved > 1e-3, "a STATIC voice re-solves after rt_set_hole_spread (pan_gen)");
+            CHECK(l2_off > 0 && fabs(l2_on - l2_off) / l2_off < 0.02,
+                  "the floor is constant-power (it widens the image, it does not change level)");
+
+            /* the mapping, pinned: flooring to `want` must render exactly like asking for `want` */
+            rt_set_hole_spread(ch, 0.f);
+            rt_source_set_spread(ch, hh, want);
+            rt_commit(ch); render2(ch); render2(ch);
+            double diff = 0, tot = 0;
+            for (int k = 0; k < CH; ++k) { diff += fabs(chan_energy(k) - e_on[k]); tot += e_on[k]; }
+            CHECK(tot > 0 && diff / tot < 1e-3,
+                  "the hole floor renders exactly as bwa_source_set_spread at the derived width");
+            rt_source_set_spread(ch, hh, 0.f);
+
+            /* in-coverage bearing: aimed AT a speaker, the knob must change nothing at all */
+            const float* sp0 = LBAR.speakers[0].pos;
+            rt_source_set_pos(ch, hh, sp0[0], sp0[1], sp0[2]);
+            rt_commit(ch); render2(ch); render2(ch);
+            double e_cov[CH]; for (int k = 0; k < CH; ++k) e_cov[k] = chan_energy(k);
+            rt_set_hole_spread(ch, 1.0f);
+            render2(ch); render2(ch);
+            double cov_diff = 0;
+            for (int k = 0; k < CH; ++k) cov_diff += fabs(chan_energy(k) - e_cov[k]);
+            CHECK(cov_diff < 1e-6, "a covered bearing is untouched, even with the knob on");
+            rt_source_destroy(ch, hh); rt_commit(ch);
+            rt_destroy(ch);
+        }
+        memset(bus, 0, sizeof bus);
+    }
+
+    /* the discriminating other half: the default grid SURROUNDS the listener (speakers at both
+     * poles, no holes), so the same knob at full strength must be inert at every bearing. */
+    {
+        RtCore* cg = rt_create(8, 4, RATE, CH);
+        CHECK(cg != NULL, "rt_create (hole spread, no holes)");
+        if (cg) {
+            uint32_t gs = rt_load_sound(cg, WAV, err, sizeof err);
+            uint32_t hg = rt_source_create(cg);
+            rt_source_play(cg, hg, gs, true);
+            double worst = 0;
+            for (int i = 0; i < 24; ++i) {              /* a coarse sweep of bearings, poles included */
+                const float y  = 1.f - 2.f * ((float)i + 0.5f) / 24.f;
+                const float r  = sqrtf(fmaxf(0.f, 1.f - y * y)), th = (float)i * 2.39996323f;
+                rt_set_hole_spread(cg, 0.f);
+                rt_source_set_pos(cg, hg, LD.ref[0] + 1.2f * r * cosf(th), LD.ref[1] + 1.2f * y,
+                                  LD.ref[2] + 1.2f * r * sinf(th));
+                rt_commit(cg); render2(cg); render2(cg);
+                double e0[CH]; for (int k = 0; k < CH; ++k) e0[k] = chan_energy(k);
+                rt_set_hole_spread(cg, 2.0f);           /* full strength: still nothing to floor */
+                render2(cg); render2(cg);
+                double d = 0; for (int k = 0; k < CH; ++k) d += fabs(chan_energy(k) - e0[k]);
+                if (d > worst) worst = d;
+            }
+            printf("hole: default grid, worst per-bearing energy change with the knob at 2.0 = %.2e\n", worst);
+            CHECK(worst < 1e-6, "a surrounding array is inert under the hole floor (off-by-default parity)");
+            rt_source_destroy(cg, hg); rt_commit(cg);
+            rt_destroy(cg);
         }
     }
 
@@ -1630,7 +1950,7 @@ int main(void) {
     remove(WAV);
     if (fails) { printf("rt_feature_test: %d FAILURES\n", fails); return 1; }
     printf("rt_feature_test OK (ambisonic-bed, reflection-tap, pathing+EQ, spread+MDAP+spectral+frame, "
-           "tracked-room-EQ, decorrelation, parametric-bed, pose-pred, near-spread, source-size, "
+           "tracked-room-EQ, decorrelation, parametric-bed, pose-pred, near-spread, hole-spread, source-size, "
            "loudness-comp, proximity, manual-directivity, multi-listener, pitch, bed-rotation+orientation, "
            "max-rE+split, extent, asset-meta+attenuation, ISM early-reflections+ground+polarity, "
            "air+Doppler, speed-of-sound, reverb-send, dual-band, direct-binaural verified)\n");

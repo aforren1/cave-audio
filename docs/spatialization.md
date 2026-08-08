@@ -104,6 +104,98 @@ volume.
 > *sparse* panner: with non-negative gains, the ℓ1-optimal speaker-gain solution is
 > exactly VBAP over a Delaunay triangulation (Franck, Wang & Fazi 2017, IEEE TASLP).
 
+### Array holes, and why the panner has no imaginary speakers
+
+The real array does not surround the listener. Speakers mount in the band between the
+CAVE screen cube and the truss (`constraints.json`), floor to structure top, with no room
+above or below the screens: a **barrel**, open at both poles. From seated ear height the
+worst case is roughly a 46 degree hole at nadir and 54 at zenith, though the final
+geometry should beat the zenith figure because a few speakers can poke through the top.
+The nadir hole is the floor and does not improve. The hull closes those holes
+with big triangles of distant speakers, so a source aimed into one is carried by speakers
+far apart. At exact nadir on a symmetric barrel the containing triangle is an antipodal
+pair 113 degrees apart, which is a split image, not a phantom.
+
+The obvious fix is [allrad.c](../src/allrad.c)'s imaginary pole speaker, which the bed
+decode already uses, or VISR's `<virtualspeaker>` with explicit routes. **It was tried and
+it makes point-source localization worse.** Measured on a jittered barrel, rE direction
+error against the intended bearing:
+
+| Source elevation | Plain hull | Imaginary speaker, routed to the rim | Imaginary speaker, share discarded |
+|---|---|---|---|
+| -60 deg | 14.0 | 26.4 | 29.8 |
+| -70 deg | 13.7 | 31.0 | 39.7 |
+| -80 deg | 9.1 | 26.0 | 49.6 |
+| -90 deg (nadir) | 4.3 | 1.5 | 90 (silent) |
+
+An imaginary speaker at the pole is a triangulation vertex, so it claims a share of every
+direction in the hole and drags it toward the pole. Routing that share to the rim smears
+it; discarding it fades the source out. Only the exact pole improves, and only slightly.
+The plain hull already interpolates across the hole about as well as the geometry allows.
+
+The distinction that makes this make sense: BS.2127 and VISR use virtual loudspeakers for
+**channel-format compatibility**, so a layout can render content authored for a nominal
+channel that is not physically present. That virtual speaker sits where content actually
+is. It is not a general hole-filler for arbitrary 3D directions, and using it as one costs
+accuracy. AllRAD's imaginary speaker is a different case again: a diffuse bed aimed into a
+hole *should* lose that energy, so discarding is right there and wrong here.
+
+What the plain hull still does badly is image **compactness**, not direction: in the
+mid-hole band it spreads a source across speakers up to 113 degrees apart while keeping
+the direction roughly right. The fix is not a virtual speaker. It is flooring the source's
+spread as it enters the hole, the way near-listener widening already floors it for close
+sources. A source with no speaker anywhere near it is genuinely not a point, and rendering
+it as an honest wide source beats pretending.
+
+`bwa_set_hole_spread(e, strength)` turns that on. It is off by default (`strength` 0), so
+an array you never asked about renders exactly as before. Per voice the engine measures one
+angle: the **gap** from the source bearing to the nearest speaker bearing, both seen from
+the tracked listener. The spread floor follows
+
+```
+floor = strength * clamp( (gap - knee) / (90 degrees - knee), 0, 1 )
+```
+
+`knee` is the array's own mean nearest-neighbor speaker angle, the same geometry SPCAP's
+lobe width comes from (`layout_mean_speaker_spacing`), so the feature scales itself to any
+layout instead of hard-coding an angle. Both ends of the ramp carry meaning:
+
+- Below the knee the floor is exactly 0. On an array that surrounds the listener, no
+  direction is ever a full speaker spacing away from a speaker, so the feature is inert
+  there **by construction**, not by tuning. It wakes up only where coverage stops.
+- At a 90 degree gap the floor is fully wide. A source with no speaker in its own
+  hemisphere has nothing point-like left to render, so diffuse is the honest answer.
+- The slope scales too. A sparse array has a wider knee, so less angular room between
+  covered and fully wide, so it widens faster. That is what a sparse array needs.
+
+The floor composes with the metric-size and near-listener floors as a **max**, so the
+widest honest claim wins, and it feeds the ordinary spread machinery: it follows the
+selected spread mode, it decorrelates when decorrelation is on, and the gains ramp like any
+other solve. `strength` scales the result. 1.0 is the honest width, less is a partial
+widening, more exaggerates (clamped at 2). It does nothing in `BWA_PROFILE_BINAURAL`, which
+has no speakers and so no holes.
+
+**It weakens CAP on the sources it widens, by design.** CAP's correction strength is
+`1 - spread`, so raising the floor lowers it: a source deep in a hole ends up with most of
+its ITD correction withdrawn. That is the right behavior, because a deliberately wide source
+has no single bearing whose ITD is worth fixing. Know about it before you A/B the two knobs
+on the rig, since turning hole spread up quietly turns CAP down in exactly the directions
+where the array is worst.
+
+The cost is small and the cache self-invalidates. The per-listener part, the unit speaker
+directions, rebuilds only when the listener moves or the layout changes, the same idiom
+SPCAP and VBAP use. The knee rebuilds only on a layout change. Per voice it is one dot
+product per speaker plus one arc cosine.
+
+Measured on a barrel of 8 perimeter positions at 3 heights with the listener at 1.4 m: mean
+speaker spacing 33.7 degrees, nadir gap 59.0 degrees, floor 0.45, which is a 40 degree
+half-width. The zenith gap is 53.7 degrees and floors at 0.36. The default 26-speaker cube
+grid never exceeds a 27.3 degree gap in any direction, well inside its 37.5 degree knee, so
+its floor is 0 everywhere. Both numbers come out of the `dsp_test` suite, which prints them.
+
+Still untested by ear on the rig. The mapping is a defensible first cut, not a measured
+optimum, and `strength` is the knob to A/B on rig day.
+
 Ambisonics is still the right tool for the **diffuse layer** (ambient beds,
 reflections/reverb). Diffuse energy isn't sweet-spot-sensitive, so a fixed decode is
 fine: decode it with a static matrix (see below). The material-driven build-out of
@@ -186,6 +278,101 @@ atomic is on, so it A/Bs live.
 Dual-band is sweet-spot dependent (like VBAP). The dense array + small working area
 is favorable, but whether it helps a *roaming* listener is a by-ear/rig call.
 
+## Compensated amplitude panning (`bwa_set_cap`, off by default)
+
+Dual-band's low band aims the velocity vector at the source and takes whatever
+`|rV| < 1` the geometry gives. The shortfall is direction-dependent, so the rendered
+ITD is short of a real source's by a varying amount, and the image shifts when you
+turn your head. CAP (Menzies and Fazi) fixes that by constraining the one quantity
+the ear actually reads below the crossover.
+
+Below ~700 Hz the ear localizes by ITD, and ITD depends only on the **interaural
+component** of the incident field. The rigid-sphere low-frequency diffraction factor
+multiplies every incident wave equally, so it cancels out of the ratio and leaves one
+scalar constraint on the gains:
+
+```
+rV . e  ==  u_s . e        e = interaural axis, u_s = source direction
+```
+
+Matching one scalar is satisfiable where matching a 3-vector is not. Any two speakers
+straddling the target hit it exactly, so the rendered ITD equals a real source's at
+that bearing. Because `e` is fixed in the head frame while the speakers are not,
+re-solving per block against the current `e` **is** the head-rotation compensation.
+
+`cap.c` applies this as a projection on top of the selected panner, not as a fourth
+panner. Weighting the correction by the seed gains collapses it to a multiplicative
+tilt `g_k = g0_k * (1 - lam * a_k)`, which means a speaker the panner left silent
+stays exactly silent: CAP never recruits a distant speaker to buy an ITD, and a VBAP
+seed stays on its triangle. Facing the source the constraint is already satisfied and
+CAP is a no-op, so it reduces to whatever panner seeded it. It fades out with
+`bwa_source_set_spread`, because an engulfing source has no single bearing to fix.
+
+**Two known exclusions.** Spectral spread (`BWA_SPREAD_SPECTRAL`) replaces the
+single-path output stage with per-band targets, and those bands never see the
+projection, so a spread source in that mode gets plain dual-band on its low bands and
+no ITD correction at all rather than the documented fade. Projecting them is not a
+one-liner: the scattered bands each sit off the point bearing and need their own ITD
+target. Both modes are off by default, so it is a corner, but a real one. Second, the
+offline scoring path (`bwa_panner_gains_batch`) never solves a low band, so CAP cannot
+be swept there the way `--focus` sweeps SPCAP.
+
+Everything is computed in room space on purpose. The SPCAP and VBAP direction caches
+key on listener **position**, so rotating the interaural axis into room space rather
+than rotating the speakers into head space means a head that only turns invalidates
+no panner cache. A seated listener costs one 3-vector rotate plus one dot product per
+speaker per block.
+
+**What the array can and cannot do.** `rV` is a convex combination of speaker
+directions, so no non-negative gain vector renders an ITD more lateral than the most
+lateral speaker the panner lit. CAP clamps the target into that range and saturates
+there rather than diverging. On the default grid from the center this binds only when
+the head turns to put the source within about 11 degrees of the interaural axis while
+the nearest speaker sits 15 degrees off it. Over the `dsp_test` yaw sweep that is 2 of
+24 angles, and the worst residual is 0.017 against dual-band's 0.404.
+
+CAP requires dual-band, since the low band is the only thing it touches. It is the one
+engine feature that reads head orientation into the speaker path, so it wants a real
+tracked pose: with an identity head it still corrects ITD for a listener facing room
+ahead, but the head-rotation benefit is exactly what you are not getting.
+
+The near-field ILD arm of the published method (one first-order filter per image) is
+deliberately left out. It needs per-speaker frequency-dependent gain, which would make
+this a render mode rather than a gain-vector modifier and break the bus seam. The
+near-field proximity shelf and near-listener widening cover adjacent ground.
+
+### How this differs from the reference implementation
+
+VISR (`librcl/cap_gain_calculator`, `libpanning/CAP`) is the authors' own CAP, and it
+uses the **same constraint**: its `a[i] = rL . (r[i] - rI)` is this file's
+`a_k = u_k.e - u_s.e`. Two things differ, both deliberate.
+
+**The objective.** VISR minimizes total energy subject to the constraint plus a unit
+gain sum, which has the closed form `g_i = (-b*a_i + c) / (c*n - b*b)`. That makes CAP a
+standalone panner. This engine instead minimizes the *seed-weighted* change from the
+selected panner's gains, which makes CAP a modifier: it inherits DBAP's or VBAP's image
+and only corrects ITD, and it reduces exactly to the seed when the constraint is already
+satisfied.
+
+**Non-negativity.** The min-energy solution is free to go **negative**, which is how it
+reaches ITDs more lateral than any real speaker. This engine's multiplicative tilt on a
+non-negative seed cannot, which is where the lateral limit above comes from. That is a
+deliberate trade: negative low-frequency gains are a crosstalk-cancellation-flavored
+trick that is sharply position-dependent and can blow up, and VISR needs a singularity
+guard plus two gain clamps (1.5 pre-compensation, 10 overall) to hold it together. A
+CAVE listener who walks and turns is the worst case for that, so this implementation
+takes the conservative arm and saturates instead.
+
+### Open question: the CAP band
+
+CAP currently rides the dual-band low band, so its crossover is 700 Hz. That number comes
+from the Gerzon rV/rE argument, not from ITD. The ITD literature puts the useful range
+higher, and the three sources disagree: VISR's own header says "valid in ITD frequency
+range ~(0,1000) Hz", Zhao et al. (2025) low-pass at 1500 Hz, and this engine splits at
+700 Hz. Since CAP is justified by ITD and not by rV, there is a real case for decoupling
+the two crossovers and running CAP wider than the panner's dual-band split. Untested: it
+needs a listening or measurement call on the rig, not a decision from theory.
+
 ## Multi-listener compromise (`bwa_set_extra_listeners`)
 
 Single-listener panning is exact for the tracked head and wrong for every other
@@ -229,6 +416,84 @@ The gain trim + delay are not optional for a real array, but they are trivial DS
 The two EQ stages are optional and bypass when absent. See
 [calibration.md](./calibration.md) for how `bwa_calibrate` measures and writes all
 four.
+
+### Re-aligning to the tracked listener (`bwa_set_tracked_align`, off by default)
+
+The reference the trims align to is **fixed**, so the array is time-coherent at one point
+and progressively less so as the listener walks away from it. Turn this on and the output
+stage re-references that alignment onto the tracked listener, so coherence follows the
+head. VISR has the same component (`librcl/listener_compensation`).
+
+The correction is pure geometry. Per speaker, against `Layout.ref`:
+
+```
+dref = |speaker - ref|
+dlis = |speaker - listener|
+extra delay (frames) = (dref - dlis) * rate / c
+extra gain  (linear) = dlis / dref
+```
+
+Sign: walk **toward** a speaker and its wavefront arrives early and loud, so the fix
+delays it further and turns it down. The delay set is then shifted so its minimum over the
+array is zero, which makes the correction purely relative (a delay common to every speaker
+is just latency), keeps every target non-negative so the aligner only ever reads further
+back in its ring, and makes a listener standing exactly at `ref` bit-exact identity rather
+than approximately so. The cost of that choice is added latency: at 1 m off-center the
+whole array runs about 280 frames (5.8 ms) later than it does at the reference.
+
+Both corrections ride on top of the layout's own trims and are slewed, never stepped.
+Nothing here touches the gain solve, so it composes with every panner and re-solves
+nothing.
+
+#### Why it is off by default
+
+Every delay change is a resampling event on that speaker. A walking listener means all 26
+delay lines gliding at once, which is 26 simultaneous Doppler shifts on everything the
+array plays. That is a global, always-audible failure mode, unlike a local one. Two guards
+keep it usable, and both are yours to tune:
+
+- **Dead zone** (`dead_zone_m`, default 0.05). Nothing is recomputed until the head has
+  moved further than this from wherever the standing targets were solved. Tracker position
+  output is jittery; without a dead zone the array glides permanently. 5 cm of slack costs
+  0.15 ms of residual arrival error, well under the ~1 ms scale where precedence and
+  comb-filtering start to read, and about 3% of the correction at a 1.5 m excursion.
+- **Rate limit** (`slew_frames_per_s`, default about 63 at 48 kHz). The ceiling on how fast
+  a speaker's delay may change. That rate over the sample rate **is** the resampling ratio,
+  so it is what bounds the pitch shift. The default is stated as a listener closing speed
+  it can follow, 0.45 m/s, which works out to 0.13% of shift (2.3 cents). A brisk walk at
+  1.4 m/s therefore outruns it on purpose: the alignment lags and catches up when the
+  listener slows. Stale alignment is the cheap failure. Warble is not.
+
+The mechanics mirror the tracked room EQ above it: `rt.c` re-derives the targets each block
+from the live listener position and hands them to `align.c`, which slews toward them.
+Because it reads the active listener position it fires on both listener paths, the
+committed pose and the internal tracker, which writes that field directly.
+
+Off is exact, not approximate. While no channel is displaced, `align_process` runs its
+original integer delay tap and the output is bit-identical to a build without the feature.
+The fractional (linear-interpolated) tap engages only once something leaves identity, and
+disengages again the moment everything lands back. Toggling either way glides.
+
+Two limits to know. Corrections saturate about 4 m from the reference, which is the delay
+headroom the ring reserves. The per-speaker level trim is clamped to +/-6 dB, because a
+listener standing on top of a speaker asks for an unbounded cut on it and an unbounded
+boost on the far side.
+
+**That level clamp binds inside the working area, so treat the gain half as partial.** On
+the shipped grid a listener 1 m off center already asks for -9.5 dB on the nearest speaker
+against a -6 dB clamp, and at 1.5 m they are standing on one. The delay half stays exact
+across the same excursion. Saturating is the safe failure, but it does mean the level
+re-reference is fully applied only near the middle. The two halves ride one toggle; if the
+rig says the level half hurts, splitting it off is a small change.
+
+**The added latency is not reported anywhere.** `bwa_get_output_latency_frames` does not
+include the tracked-align shift, so a client doing audio-video sync against the DSP clock
+will drift by up to those ~280 frames as the listener walks, and drift back as they return.
+Nothing else in the engine has position-dependent latency. Worth knowing before you use
+this in a session that also cares about AV sync.
+
+Untested on hardware. The by-ear question is whether the improvement in coherence is worth
+any warble the rate limit still lets through, and that is a rig call, not a theory call.
 
 ## Propagation effects (opt-in, per source)
 

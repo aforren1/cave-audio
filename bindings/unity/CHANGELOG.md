@@ -4,7 +4,117 @@ All notable changes to `com.brainworks.bw_audio`.
 
 ## [Unreleased]
 
-### Added — SPCAP focus/density tuning, and an ABI break to score it (`BWA_VERSION` → 0.11.0)
+### Added: compensated amplitude panning (`bwa_set_cap`)
+
+Dual-band's low band aims the velocity vector at the source and takes whatever `|rV| < 1` the speaker
+geometry gives. The shortfall is direction-dependent, so the rendered interaural time difference falls
+short of a real source's by a varying amount and the image **shifts when you turn your head**. CAP
+(Menzies and Fazi) constrains the one quantity the ear reads below the crossover instead: the
+interaural component of the summed field, `rV . e == u_s . e`. Matching one scalar is satisfiable
+where matching a 3-vector is not, so the ITD comes out exact and stays exact as the head turns.
+
+- **`bwa_set_cap(e, on)`** is off by default, live-toggleable, and it **requires `bwa_set_dual_band`**
+  since the low band is the only thing it touches. Applied as a projection on top of the selected
+  panner rather than as a fourth panner, so it inherits DBAP's or VBAP's image and only corrects ITD:
+  facing the source it is a no-op and reduces to the seed panner, and it fades out with
+  `bwa_source_set_spread` (an engulfing source has no single bearing to fix). Unity: a `cap`
+  inspector toggle plus `SetCap(bool)`. Godot: the `cap` property and `BwaEngine.set_cap`.
+- **This is the first engine feature that reads head orientation into the speaker path.** Everywhere
+  else orientation enters only at the binaural decode, so `CMD_COMMIT` now dirties voices on a
+  quaternion change, gated on CAP being on so a tracked head does not re-solve every voice every
+  block for a rotation nothing downstream reads. Wants a real tracked pose; aimed at the seated case,
+  where it rebuilds no panner cache at all (everything is computed in room space, so a head that only
+  turns invalidates neither the SPCAP nor the VBAP direction cache).
+- Measured over a full head-yaw sweep on the default grid, worst `|rV.e - u_s.e|` is **0.017 with CAP
+  against 0.404 without**. CAP's entire residual is the 2 of 24 yaw angles where the target is not
+  achievable: `rV` is a convex combination of speaker directions, so no non-negative gain vector can
+  render an ITD **more lateral than the most lateral speaker the panner lit**. CAP saturates at that
+  bound rather than diverging. It is an array-density limit, not a defect.
+- Not implemented: the published method's near-field ILD arm (one first-order filter per image). It
+  needs per-speaker frequency-dependent gain, which would make this a render mode rather than a
+  gain-vector modifier. The near-field proximity shelf and near-listener widening cover adjacent
+  ground. See docs/spatialization.md for how this differs from VISR's own CAP, which minimizes energy
+  and permits negative gains where this minimizes change from the seed and does not.
+
+### Added: re-align the array to the tracked listener (`bwa_set_tracked_align`)
+
+The per-speaker delay and gain trims align arrival times at ONE fixed point, `Layout.ref`, so the
+array is time-coherent there and progressively less so as the listener walks away. This re-references
+that alignment onto the tracked head, in the output stage, so coherence follows the listener. Same
+idea as VISR's `librcl/listener_compensation`.
+
+- **`bwa_set_tracked_align(e, on, dead_zone_m, slew_frames_per_s)`** is off by default. Per speaker
+  the correction is pure geometry against `Layout.ref`: `extra delay = (dref - dlis) * rate / c` and
+  `extra gain = dlis / dref`, so walking toward a speaker delays it further and turns it down. The
+  delay set is shifted to a minimum of zero, which keeps it purely relative and makes a listener
+  standing at `ref` **bit-exact** identity rather than approximately so. Both `<= 0` arguments revert
+  that one knob to its default, the same sentinel `bwa_set_spcap_focus` uses. Unity: `trackedAlign` /
+  `trackedAlignDeadZoneM` / `trackedAlignSlew` plus `SetTrackedAlign(...)`. Godot: the matching
+  properties and `BwaEngine.set_tracked_align`.
+- **Off by default because every delay change is a resampling event.** A walking listener means 26
+  delay lines gliding at once. Two guards, both tunable: a **dead zone** (default 0.05 m, since
+  tracker jitter would otherwise keep the array permanently gliding) and a **rate limit** (default
+  about 63 frames/s at 48 kHz, stated internally as a 0.45 m/s closing speed so it means the same
+  thing at any sample rate or speed of sound). That rate over the sample rate IS the resampling
+  ratio, so the default bounds the pitch shift at 0.13%, about 2.3 cents. A brisk walk outruns it on
+  purpose: stale alignment is the cheap failure, warble is not.
+- Nothing here touches the gain solve, so it composes with every panner and re-solves nothing, and
+  it needs no `pan_gen` bump. It reads the active listener position, so it fires on **both** listener
+  paths, the committed pose and the internal tracker that writes that field directly.
+- **Two limits worth knowing before rig day.** The level trim is clamped to +/-6 dB, and that clamp
+  binds inside the working area: on the shipped grid a listener 1 m off center already asks for
+  -9.5 dB on the nearest speaker, and at 1.5 m is standing on one. Treat the level half as partial
+  (the delay half stays exact). And the min-subtraction adds position-dependent latency, about 280
+  frames (5.8 ms) at 1 m off center, which `bwa_get_output_latency_frames` does **not** report, so a
+  client syncing video against the DSP clock will drift as the listener walks.
+- Untested on hardware. Whether the coherence gain beats the warble the rate limit still lets through
+  is a by-ear rig call.
+
+### Added: hole-aware spread floor (`bwa_set_hole_spread`)
+
+The real array is a barrel, open at both poles, so a source aimed into a pole has no speaker anywhere
+near it. The panner's hull closes the hole with big triangles of distant speakers: the rendered
+direction stays about right, but the energy is carried by speakers up to 113 degrees apart, which is
+a split image rather than a phantom. Imaginary pole speakers were tried and rejected (see below).
+This is the other fix. A source with no speaker near it is genuinely not a point, so stop asking the
+array to pretend, and widen it into an honest diffuse source instead.
+
+- **`bwa_set_hole_spread(e, strength)`** is off by default (`strength` 0), live, and clamped at 2.
+  Per voice the engine measures one angle, the **gap** from the source bearing to the nearest speaker
+  bearing seen from the tracked listener, and floors the voice's effective spread at
+  `strength * clamp((gap - knee) / (90 deg - knee), 0, 1)`. Unity: a `holeSpread` inspector slider
+  plus `SetHoleSpread(float)`. Godot: the `hole_spread` property and `BwaEngine.set_hole_spread`.
+- **`knee` is the array's own mean nearest-neighbor speaker angle**, the same geometry SPCAP derives
+  its lobe width from. That measurement moved into a shared `layout_mean_speaker_spacing()` and the
+  SPCAP focus derivation now sits on top of it, so the two features read one measurement of the
+  geometry instead of mirroring it. The cube grid still derives focus 12.70, unchanged.
+- **Inert on a covering array by construction, not by tuning.** No direction on an array that
+  surrounds the listener is ever a full speaker spacing from a speaker, so the floor is exactly 0
+  there. Measured: the default grid's worst gap over a 4096-direction sweep is 27.3 degrees against a
+  37.5 degree knee, and the test pins the worst per-bearing energy change at **exactly 0.00e+00** with
+  the knob at full strength. On the barrel the same sweep reaches a 57.8 degree gap and a 0.428 floor.
+- Composes with the metric-size and near-listener floors as a **max**, feeds the ordinary spread
+  machinery (spread mode, decorrelation, gain ramps), and does nothing under `BWA_PROFILE_BINAURAL`,
+  which has no speakers and so no holes.
+- **It weakens CAP on the sources it widens**, because CAP's strength is `1 - spread`. That is correct
+  (a deliberately wide source has no single bearing whose ITD is worth fixing) but worth knowing
+  before A/B-ing the two knobs together, since raising one quietly lowers the other.
+- The mapping is a defensible first cut, not a measured optimum. `strength` is the rig-day A/B knob.
+  Two known gaps: the offline scoring path (`bwa_panner_gains_batch`) does not run the spread solve,
+  so this cannot be swept the way `--focus` sweeps SPCAP, and ISM reflection images bypass it.
+
+### Investigated and rejected: imaginary speakers in the point-source panner
+
+The real array does not surround the listener (speakers mount between the CAVE screen cube and the
+truss, so it is a barrel open at both poles). Closing those holes with an imaginary pole speaker, as
+`allrad.c` already does for the diffuse bed and as VISR's `<virtualspeaker>` does with explicit
+routes, **was tried and made point-source localization worse**: rE direction error against the
+intended bearing rose from 14 degrees to 26 (routed to the rim) or 30 (share discarded) at 60 degrees
+below the horizon, and only the exact pole improved. An imaginary speaker is a triangulation vertex,
+so it claims a share of every direction in the hole and drags it poleward. No code change; the
+measurements and the reasoning are recorded in docs/spatialization.md so nobody repeats it.
+
+### Added: SPCAP focus/density tuning, and an ABI break to score it (`BWA_VERSION` → 0.11.0)
 
 SPCAP's lobe sharpness and placement-correction exponent were compile-time `#define`s (12.0 / 2.0).
 The 12 was only ever right for the 26-speaker cave, so `focus` now **derives from the array**: the

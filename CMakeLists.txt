@@ -72,6 +72,8 @@ add_library(bwa_core OBJECT
   src/dbap.c
   src/spcap.c
   src/vbap.c
+  src/cap.c
+  src/hole.c
   src/hull.c
   src/align.c
   src/binaural.c

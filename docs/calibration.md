@@ -94,7 +94,10 @@ it. Do not expect it to be audible.
 - **default**: trims. `calib_solve` turns the per-speaker measurements into `delay_ms`
   (arrival-align every speaker to the farthest) and `gain_db` (equalize sensitivity, with the
   speaker→mic distance divided out so it corrects the *speaker*, not distance; cut-only so nothing
-  clips).
+  clips). Those trims align the array at **one** point. The engine can optionally re-reference them
+  onto the tracked listener at runtime (`bwa_set_tracked_align`, off by default), the time-alignment
+  counterpart of `--room-eq-grid` below; see
+  [`spatialization.md`](./spatialization.md#re-aligning-to-the-tracked-listener-bwa_set_tracked_align-off-by-default).
 - **`--room`**: RT60 (Schroeder) + early reflections from the captured IRs. It measures **how live
   your room is**. **Do not copy the measured RT60 into the engine's reverb settings.** The room's
   own decay is a **floor**: you cannot render a space deader than the room you're in, and nearby

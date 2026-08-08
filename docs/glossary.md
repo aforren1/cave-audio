@@ -109,7 +109,8 @@ together: rE beside rV, the three panners in one place, the three reverb paths i
 [Spread](#spread), [SRP-PHAT](#srp-phat), [Stimulus](#stimulus), [Survey spread](#survey-spread),
 [Sweet spot](#sweet-spot)
 
-**T** [Tracked room EQ](#tracked-room-eq), [Tracked versus fixed solve](#tracked-versus-fixed-solve),
+**T** [Tracked listener alignment](#tracked-listener-alignment),
+[Tracked room EQ](#tracked-room-eq), [Tracked versus fixed solve](#tracked-versus-fixed-solve),
 [Transmission](#transmission), [Transported frame](#transported-frame),
 [Trilateration](#trilateration)
 
@@ -131,6 +132,21 @@ is not optional. Omit `dbap.rolloff_r` from the layout file and the loader deriv
 the mean centroid-to-speaker distance (`src/layout.c:326`), which is a starting point to dial
 against the real array, not a finished tuning. Schema:
 [layout-schema.md](./layout-schema.md#fields).
+
+### CAP (compensated amplitude panning)
+
+`bwa_set_cap` (Menzies and Fazi), a projection applied on top of the selected panner's gain vector
+that corrects the [dual-band](#dual-band-panning) low band's **interaural time difference** for the
+tracked head **orientation**. Below the crossover the ear localizes by ITD, which depends only on the
+interaural component of the summed field, so the constraint is one scalar: `rV . e == u_s . e`, with
+`e` the interaural axis and `u_s` the source bearing (`src/cap.c:57`). Matching one scalar is
+satisfiable where matching a whole 3-vector is not, so the ITD comes out exact and stays exact as the
+head turns, which is what plain dual-band does not do. Weighting the correction by the seed gains
+collapses it to a multiplicative tilt, so a speaker the panner left silent stays silent. Facing the
+source it is a no-op and reduces to the seed panner. Bounded by the array: `rV` is a convex
+combination of speaker directions, so no non-negative gain vector renders an ITD more lateral than
+the most lateral speaker lit, and CAP saturates there. See
+[spatialization.md](./spatialization.md).
 
 ### Constant power
 
@@ -559,6 +575,19 @@ stream. It and [spectral widening](#spectral-widening) are two different answers
 same code path. Width and height are **room-referenced**, so anisotropic sources use the up-anchored
 frame instead of the [transported frame](#transported-frame) and inherit its pole ambiguity: "width"
 straight overhead is undefined, as it is in BS.2127.
+
+### Hole-aware widening
+
+`bwa_set_hole_spread`, an engine-wide policy for arrays with **holes** (the CAVE array is a barrel,
+open at both poles). It floors a source's [spread](#spread) by the angular **gap** from the source
+bearing to the nearest speaker bearing, both listener-relative:
+`floor = strength * clamp((gap - knee)/(pi/2 - knee), 0, 1)` (`src/hole.c:53`). `knee` is the array's
+own mean nearest-neighbor speaker angle (`layout_mean_speaker_spacing`), the same geometry SPCAP's
+lobe width derives from, so the policy scales itself to any layout. It exists because the panner's
+hull closes a hole with a big triangle of distant speakers, which renders a split image rather than
+a phantom; a source with no speaker near it is not a point, so it is rendered honestly wide instead.
+An array that surrounds the listener derives no floor at any bearing. See
+[spatialization.md](./spatialization.md).
 
 ### Lobe mode
 
@@ -1017,6 +1046,20 @@ vertical and the capsule **heights** unrecoverable, so below 0.05 the solver ref
 handing back a flattened array and a confident wrong answer. **Clap high and low, not just around.**
 Unrelated to source [spread](#spread), which is a width. See
 [calibration.md](./calibration.md#the-capsule-self-survey-zylia_survey).
+
+### Tracked listener alignment
+
+`bwa_set_tracked_align`, off by default. The per-speaker delay and gain trims re-referenced from the
+array centroid onto the **tracked** listener, so the array's time coherence follows the head instead
+of staying pinned to one point. Per speaker the correction is geometric: the extra propagation delay
+and 1/r level for `|speaker - listener|` against `|speaker - centroid|`
+(`rt.c:2598`, `listener_align_track`). Opt-in because every delay change is a resampling event, so a
+walking listener Doppler-shifts the entire array at once. A **dead zone** (default 5 cm) rejects
+tracker jitter and a **rate limit** on the slew (default about 63 frames/s at 48 kHz, which follows a
+0.45 m/s walk) bounds the pitch shift, so a faster listener gets a lagging alignment rather than a
+warbling one. The tracked-position sibling of [tracked room EQ](#tracked-room-eq), one stage further
+down the same output block. See
+[spatialization.md](./spatialization.md#re-aligning-to-the-tracked-listener-bwa_set_tracked_align-off-by-default).
 
 ### Tracked room EQ
 

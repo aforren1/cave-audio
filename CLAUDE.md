@@ -89,9 +89,20 @@ src/
                        focus/density knobs thread through every solve here, so bwa_validate --focus
                        sweeps them. Drives bwa_validate. [validation]
   dbap.h / dbap.c      listener-relative, constant-power DBAP gain solve. [M4]
+  cap.h / cap.c        compensated amplitude panning: projects the dual-band LOW band so the rendered
+                       ITD matches a real source's for the head's CURRENT orientation. NOT a panner -
+                       a modifier on whatever panner is selected, so it reduces to that panner facing
+                       the source. The one place head ORIENTATION reaches the speaker path.
+                       bwa_set_cap. [spatialization]
+  hole.h / hole.c      hole-aware spread floor: a source aimed where the array has NO speaker (the
+                       barrel's open poles) is floored WIDE instead of split across the hull triangle
+                       that closes the hole. Cached per listener like spcap/vbap; bwa_set_hole_spread. [spatialization]
   fdn.h / fdn.c        directional FDN reverb bed (phonon-free; takes the reflection bus tap). [innovations]
   ism.h / ism.c        image-source EARLY reflections: shoebox mirrors, panned as point sources. [innovations]
-  align.h / align.c    per-speaker gain trim + delay-line output stage. [M4]
+  align.h / align.c    per-speaker gain trim + delay-line output stage. [M4] Also the tracked-listener
+                       re-reference (bwa_set_tracked_align): re-aims the trims from the layout's fixed
+                       ref onto the live head, slewed + dead-zoned because every delay change is a
+                       resampling event. Off = the exact integer tap, bit-identical. [spatialization]
   binaural.h/binaural.c  head-oriented 26->stereo monitor + the no-SDK cardioid decode of the
                        direct-binaural field (Steam Audio HRTF is the upgrade). [M5]
   hpeq.h / hpeq.c      headphone correction EQ: AutoEq ParametricEQ.txt -> RBJ biquad cascade on

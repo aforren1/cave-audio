@@ -859,6 +859,7 @@ void bwa_set_test_signal(bwa_engine* e, uint32_t channel, bwa_test_kind kind, fl
 
 void bwa_set_panner(bwa_engine* e, bwa_panner panner) { if (e) { e->panner = (int)panner; rt_set_panner(e->rt, (int)panner); } }
 void bwa_set_dual_band(bwa_engine* e, bool on)       { if (e) rt_set_dual_band(e->rt, on); }
+void bwa_set_cap(bwa_engine* e, bool on)             { if (e) rt_set_cap(e->rt, on); }
 void bwa_set_max_re(bwa_engine* e, bool on) {
     if (!e) return;
     e->max_re = on ? 1 : 0;                          /* staged for the FDN bwa_start may still create */
@@ -868,10 +869,14 @@ void bwa_set_max_re(bwa_engine* e, bool on) {
 void bwa_set_max_re_split(bwa_engine* e, bool on)     { if (e) rt_set_max_re_split(e->rt, on); }
 void bwa_set_spread_mode(bwa_engine* e, bwa_spread_mode mode) { if (e) rt_set_spread_mode(e->rt, (int)mode); }
 void bwa_set_tracked_room_eq(bwa_engine* e, bool on)  { if (e) rt_set_room_eq_dyn(e->rt, on); }
+void bwa_set_tracked_align(bwa_engine* e, bool on, float dead_zone_m, float slew_frames_per_s) {
+    if (e) rt_set_tracked_align(e->rt, on, dead_zone_m, slew_frames_per_s);
+}
 void bwa_set_decorrelation(bwa_engine* e, bool on)    { if (e) rt_set_decorrelation(e->rt, on); }
 void bwa_set_bed_renderer(bwa_engine* e, bwa_bed_renderer r) { if (e) rt_set_bed_renderer(e->rt, (int)r); }
 void bwa_set_pose_prediction(bwa_engine* e, float lead_s) { if (e) rt_set_pose_prediction(e->rt, lead_s); }
 void bwa_set_near_spread(bwa_engine* e, float radius_m)    { if (e) rt_set_near_spread(e->rt, radius_m); }
+void bwa_set_hole_spread(bwa_engine* e, float strength)    { if (e) rt_set_hole_spread(e->rt, strength); }
 void bwa_set_spcap_focus(bwa_engine* e, float focus, float density) { if (e) rt_set_spcap_focus(e->rt, focus, density); }
 void bwa_set_extra_listeners(bwa_engine* e, const float* xyz, uint32_t count) { if (e) rt_set_extra_listeners(e->rt, xyz, count); }
 void bwa_source_set_loudness_comp(bwa_engine* e, bwa_source s, bool on) { if (e) rt_source_set_loudness_comp(e->rt, s, on); }
