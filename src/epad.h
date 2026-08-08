@@ -3,7 +3,7 @@
  * Acustica 98) for the diffuse layer. Same [BWA_CHANNELS][BWA_AMBI_CH] shape + SN3D/ACN
  * convention as the sampling/AllRAD decodes: the decode is the POLAR FACTOR of the transposed
  * encode matrix, D = c·Yᵀ(YYᵀ)^(-1/2), which makes the decoded ENERGY of a panned plane wave
- * constant over direction on an IRREGULAR array — the sampling decode over-energises dense
+ * constant over direction on an IRREGULAR array — the sampling decode over-energizes dense
  * speaker regions, and mode-matching (pinv) blows up on lopsided ones. Rank-deficient
  * directions (a coplanar survey's missing axis) truncate out of the inverse square root, so
  * unreproducible field components are dropped rather than amplified.

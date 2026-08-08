@@ -93,7 +93,7 @@ src/
                        ITD matches a real source's for the head's CURRENT orientation. NOT a panner -
                        a modifier on whatever panner is selected, so it reduces to that panner facing
                        the source. The one place head ORIENTATION reaches the speaker path.
-                       bwa_set_cap. [spatialization]
+                       bwa_set_dual_band_cap. [spatialization]
   hole.h / hole.c      hole-aware spread floor: a source aimed where the array has NO speaker (the
                        barrel's open poles) is floored WIDE instead of split across the hull triangle
                        that closes the hole. Cached per listener like spcap/vbap; bwa_set_hole_spread. [spatialization]

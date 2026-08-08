@@ -4,7 +4,7 @@ All notable changes to `com.brainworks.bw_audio`.
 
 ## [Unreleased]
 
-### Added: compensated amplitude panning (`bwa_set_cap`)
+### Added: compensated amplitude panning (`bwa_set_dual_band_cap`)
 
 Dual-band's low band aims the velocity vector at the source and takes whatever `|rV| < 1` the speaker
 geometry gives. The shortfall is direction-dependent, so the rendered interaural time difference falls
@@ -13,12 +13,15 @@ short of a real source's by a varying amount and the image **shifts when you tur
 interaural component of the summed field, `rV . e == u_s . e`. Matching one scalar is satisfiable
 where matching a 3-vector is not, so the ITD comes out exact and stays exact as the head turns.
 
-- **`bwa_set_cap(e, on)`** is off by default, live-toggleable, and it **requires `bwa_set_dual_band`**
+- **`bwa_set_dual_band_cap(e, on)`** is off by default, live-toggleable, and it **requires `bwa_set_dual_band`**
   since the low band is the only thing it touches. Applied as a projection on top of the selected
   panner rather than as a fourth panner, so it inherits DBAP's or VBAP's image and only corrects ITD:
   facing the source it is a no-op and reduces to the seed panner, and it fades out with
-  `bwa_source_set_spread` (an engulfing source has no single bearing to fix). Unity: a `cap`
-  inspector toggle plus `SetCap(bool)`. Godot: the `cap` property and `BwaEngine.set_cap`.
+  `bwa_source_set_spread` (an engulfing source has no single bearing to fix).
+  Renamed from `bwa_set_cap` before release: `cap` already means CAPACITY in three calls in this same
+  header, and carrying the parent toggle's name matches `bwa_set_max_re` -> `bwa_set_max_re_split`.
+  Unity: a `dualBandCap` inspector toggle plus `SetDualBandCap(bool)`. Godot: the `dual_band_cap`
+  property and `BwaEngine.set_dual_band_cap`.
 - **This is the first engine feature that reads head orientation into the speaker path.** Everywhere
   else orientation enters only at the binaural decode, so `CMD_COMMIT` now dirties voices on a
   quaternion change, gated on CAP being on so a tracked head does not re-solve every voice every
@@ -43,13 +46,16 @@ array is time-coherent there and progressively less so as the listener walks awa
 that alignment onto the tracked head, in the output stage, so coherence follows the listener. Same
 idea as VISR's `librcl/listener_compensation`.
 
-- **`bwa_set_tracked_align(e, on, dead_zone_m, slew_frames_per_s)`** is off by default. Per speaker
-  the correction is pure geometry against `Layout.ref`: `extra delay = (dref - dlis) * rate / c` and
+- **`bwa_set_tracked_align(e, on)`** plus **`bwa_set_tracked_align_guards(e, dead_zone_m,
+  slew_frames_per_s)`**, off by default. The enable and its tuning are separate calls, matching
+  `bwa_set_limiter` / `bwa_set_limiter_ceiling`, so A/B-ing the toggle never resets a dialed guard.
+  Per speaker the correction is pure geometry against `Layout.ref`: `extra delay = (dref - dlis) * rate / c` and
   `extra gain = dlis / dref`, so walking toward a speaker delays it further and turns it down. The
   delay set is shifted to a minimum of zero, which keeps it purely relative and makes a listener
   standing at `ref` **bit-exact** identity rather than approximately so. Both `<= 0` arguments revert
   that one knob to its default, the same sentinel `bwa_set_spcap_focus` uses. Unity: `trackedAlign` /
-  `trackedAlignDeadZoneM` / `trackedAlignSlew` plus `SetTrackedAlign(...)`. Godot: the matching
+  `trackedAlignDeadZone` / `trackedAlignSlewFramesPerSecond` plus `SetTrackedAlign(bool)` and
+  `SetTrackedAlignGuards(float, float)`. Godot: the matching
   properties and `BwaEngine.set_tracked_align`.
 - **Off by default because every delay change is a resampling event.** A walking listener means 26
   delay lines gliding at once. Two guards, both tunable: a **dead zone** (default 0.05 m, since

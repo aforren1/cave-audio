@@ -4037,7 +4037,17 @@ void rt_set_room_eq_dyn(RtCore* c, int on) {
  * layout's own trims, so the toggle is a click-free live A/B. Either knob <= 0 reverts it to the
  * built-in default. Publish-then-flag: the knobs land BEFORE the release store on the enable, and
  * listener_align_track acquires the enable before loading them (CLAUDE.md's ordering trap). */
-void rt_set_tracked_align(RtCore* c, int on, float dead_zone_m, float slew_frames_per_s) {
+void rt_set_tracked_align(RtCore* c, int on) {
+    if (!c) return;
+    atomic_store_explicit(&c->lc_on, on ? 1 : 0, memory_order_release);
+}
+
+/* The guards, separately from the enable (bwa_set_tracked_align_guards). Safe in either order and
+ * safe while running: listener_align_track acquires lc_on and then re-reads both of these RELAXED
+ * every block, so setting a guard after the enable costs at most one block of the old value. That is
+ * unlike the SPCAP knobs, where a lagging read would be stamped current and swallowed until the next
+ * bump, which is why those need the pan_gen generation and these do not. */
+void rt_set_tracked_align_guards(RtCore* c, float dead_zone_m, float slew_frames_per_s) {
     if (!c) return;
     if (!(dead_zone_m > 0.f))       dead_zone_m = 0.f;         /* NaN-safe: 0 = the default */
     else if (dead_zone_m > 0.5f)    dead_zone_m = 0.5f;        /* half a meter of slack is already useless */
@@ -4045,7 +4055,6 @@ void rt_set_tracked_align(RtCore* c, int on, float dead_zone_m, float slew_frame
     else if (slew_frames_per_s > 4096.f) slew_frames_per_s = 4096.f;
     atomic_store_explicit(&c->lc_dead_m, dead_zone_m,       memory_order_relaxed);
     atomic_store_explicit(&c->lc_slew,   slew_frames_per_s, memory_order_relaxed);
-    atomic_store_explicit(&c->lc_on,     on ? 1 : 0,        memory_order_release);
 }
 
 /* Decorrelation (velvet-noise path) for spread sources' wide part (and the parametric bed's diffuse

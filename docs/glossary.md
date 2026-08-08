@@ -135,7 +135,7 @@ against the real array, not a finished tuning. Schema:
 
 ### CAP (compensated amplitude panning)
 
-`bwa_set_cap` (Menzies and Fazi), a projection applied on top of the selected panner's gain vector
+`bwa_set_dual_band_cap` (Menzies and Fazi), a projection applied on top of the selected panner's gain vector
 that corrects the [dual-band](#dual-band-panning) low band's **interaural time difference** for the
 tracked head **orientation**. Below the crossover the ear localizes by ITD, which depends only on the
 interaural component of the summed field, so the constraint is one scalar: `rV . e == u_s . e`, with

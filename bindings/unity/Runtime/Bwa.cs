@@ -402,7 +402,7 @@ namespace BwAudio
         // thing it touches). Constrains the interaural component of the summed field to a real source's,
         // using the tracked head ORIENTATION, so the image holds still as the listener turns. A no-op
         // facing the source, and it fades out with source spread.
-        [DllImport(DLL, CallingConvention = CC)] public static extern void bwa_set_cap(IntPtr e, [MarshalAs(UnmanagedType.I1)] bool on);
+        [DllImport(DLL, CallingConvention = CC)] public static extern void bwa_set_dual_band_cap(IntPtr e, [MarshalAs(UnmanagedType.I1)] bool on);
         // How bwa_source_set_spread renders width (live A/B): LOBE (default, one reshaped solve), MDAP
         // (a ring of virtual sources panned with the selected panner — panner-true, ~13x the solve cost),
         // or SPECTRAL (frequency-dependent panning: 6 bands, each to its own direction in the cone — width
@@ -456,7 +456,8 @@ namespace BwAudio
         // move before anything is recomputed; slewFramesPerS (default ~63 at 48 kHz, which follows a 0.45 m/s
         // walk) caps how fast a delay may change, so a faster listener LAGS instead of warbling. Either <= 0
         // takes the default. Live A/B; off glides back to the layout's own trims.
-        [DllImport(DLL, CallingConvention = CC)] public static extern void bwa_set_tracked_align(IntPtr e, [MarshalAs(UnmanagedType.I1)] bool on, float deadZoneM, float slewFramesPerS);
+        [DllImport(DLL, CallingConvention = CC)] public static extern void bwa_set_tracked_align(IntPtr e, [MarshalAs(UnmanagedType.I1)] bool on);
+        [DllImport(DLL, CallingConvention = CC)] public static extern void bwa_set_tracked_align_guards(IntPtr e, float deadZoneM, float slewFramesPerS);
         // Offline panner evaluation (no engine handle): out = nsrc*n gains for a layout/panner; for layout scoring.
         // focus/density are SPCAP's tuning knobs, same <= 0 = default sentinel as bwa_set_spcap_focus, and
         // inert under DBAP/VBAP. Pass 0, 0 to score at the focus this array's geometry derives.

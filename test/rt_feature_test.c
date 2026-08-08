@@ -459,7 +459,7 @@ int main(void) {
                 CHECK(ca && cb, "rt_create (tracked align, off-path)");
                 if (ca && cb) {
                     static float tmp[CH * N];
-                    rt_set_tracked_align(cb, 0, 0.02f, 500.f);   /* knobs live, feature off */
+                    rt_set_tracked_align_guards(cb, 0.02f, 500.f); rt_set_tracked_align(cb, 0);   /* knobs live, feature off */
                     uint32_t sa = rt_load_sound(ca, IMP, err, sizeof err);
                     uint32_t sb = rt_load_sound(cb, IMP, err, sizeof err);
                     uint32_t ha = rt_source_create(ca), hb = rt_source_create(cb);
@@ -489,7 +489,7 @@ int main(void) {
                     rt_set_listener(cl, lp, qid); rt_commit(cl);
                     float t_off = lc_measure(cl, sl, K);
                     /* slew wide open here: this section is about the geometry, not the rate limit */
-                    rt_set_tracked_align(cl, 1, 0.05f, 20000.f);
+                    rt_set_tracked_align_guards(cl, 0.05f, 20000.f); rt_set_tracked_align(cl, 1);
                     lc_settle(cl, 120);
                     float t_on = lc_measure(cl, sl, K);
                     printf("tracked align: 1.0 m toward speaker %d -> channel %d arrives %+.2f frames "
@@ -514,7 +514,7 @@ int main(void) {
                     CHECK(fabs((t_mov - t_off) - wantm[K]) < 0.5,
                           "tracked align: a move past the dead zone re-solves the alignment");
                     /* off again: glides back to exactly the layout's own trims */
-                    rt_set_tracked_align(cl, 0, 0.f, 0.f);
+                    rt_set_tracked_align_guards(cl, 0.f, 0.f); rt_set_tracked_align(cl, 0);
                     lc_settle(cl, 200);
                     rt_set_listener(cl, lp, qid); rt_commit(cl);
                     float t_back = lc_measure(cl, sl, K);
@@ -536,7 +536,7 @@ int main(void) {
                     uint32_t st = rt_load_sound(ct, IMP, err, sizeof err);
                     lc_settle(ct, 4);
                     float t_off = lc_measure(ct, st, K);
-                    rt_set_tracked_align(ct, 1, 0.05f, 20000.f);
+                    rt_set_tracked_align_guards(ct, 0.05f, 20000.f); rt_set_tracked_align(ct, 1);
                     lc_settle(ct, 120);
                     float t_on = lc_measure(ct, st, K);
                     printf("tracked align: via the TRACKER slot -> %+.2f frames (want %+.2f)\n",
@@ -557,7 +557,7 @@ int main(void) {
                 if (cr) {
                     uint32_t sr = rt_load_sound(cr, IMP, err, sizeof err);
                     rt_set_listener(cr, LD.ref, qid); rt_commit(cr);
-                    rt_set_tracked_align(cr, 1, 0.05f, 0.f);      /* 0 = the default rate limit */
+                    rt_set_tracked_align_guards(cr, 0.05f, 0.f); rt_set_tracked_align(cr, 1);      /* 0 = the default rate limit */
                     lc_settle(cr, 20);
                     float t_ref = lc_measure(cr, sr, K);          /* at the reference: comp == identity */
                     rt_set_listener(cr, lp, qid); rt_commit(cr);

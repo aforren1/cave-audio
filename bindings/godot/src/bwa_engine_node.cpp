@@ -115,7 +115,7 @@ void BwaEngine::_ready() {
 	bwa_set_early_reflections_gain(eng, er_gain);
 	bwa_set_panner(eng, (bwa_panner)panner);
 	bwa_set_dual_band(eng, dual_band);
-	bwa_set_cap(eng, cap);
+	bwa_set_dual_band_cap(eng, dual_band_cap);
 	bwa_set_spcap_focus(eng, spcap_focus, spcap_density);
 	bwa_set_spread_mode(eng, (bwa_spread_mode)spread_mode);
 	bwa_set_decorrelation(eng, decorrelation);
@@ -126,7 +126,8 @@ void BwaEngine::_ready() {
 	bwa_set_max_re_split(eng, max_re_split);
 	bwa_set_bed_renderer(eng, (bwa_bed_renderer)bed_renderer);
 	bwa_set_tracked_room_eq(eng, tracked_room_eq);
-	bwa_set_tracked_align(eng, tracked_align, tracked_align_dead_zone, tracked_align_slew);
+	bwa_set_tracked_align_guards(eng, tracked_align_dead_zone, tracked_align_slew_frames_per_s);
+	bwa_set_tracked_align(eng, tracked_align);
 	bwa_set_limiter(eng, limiter);
 	bwa_set_limiter_ceiling(eng, limiter_ceiling);
 	bwa_set_headphone_eq(eng, headphone_eq_on);
@@ -501,7 +502,7 @@ void BwaEngine::early_reflections_set_gain(float linear) {
 
 BWA_LIVE_SETTER(panner, Panner, bwa_set_panner(eng, (bwa_panner)v))
 BWA_LIVE_SETTER(dual_band, bool, bwa_set_dual_band(eng, v))
-BWA_LIVE_SETTER(cap, bool, bwa_set_cap(eng, v))
+BWA_LIVE_SETTER(dual_band_cap, bool, bwa_set_dual_band_cap(eng, v))
 /* one C call carries both SPCAP exponents, so each property setter re-sends the pair */
 BWA_LIVE_SETTER(spcap_focus, float, bwa_set_spcap_focus(eng, spcap_focus, spcap_density))
 BWA_LIVE_SETTER(spcap_density, float, bwa_set_spcap_focus(eng, spcap_focus, spcap_density))
@@ -515,9 +516,9 @@ BWA_LIVE_SETTER(max_re_split, bool, bwa_set_max_re_split(eng, v))
 BWA_LIVE_SETTER(bed_renderer, BedRenderer, bwa_set_bed_renderer(eng, (bwa_bed_renderer)v))
 BWA_LIVE_SETTER(tracked_room_eq, bool, bwa_set_tracked_room_eq(eng, v))
 /* one C call carries the toggle and both knobs, so each property setter re-sends the trio */
-BWA_LIVE_SETTER(tracked_align, bool, bwa_set_tracked_align(eng, tracked_align, tracked_align_dead_zone, tracked_align_slew))
-BWA_LIVE_SETTER(tracked_align_dead_zone, float, bwa_set_tracked_align(eng, tracked_align, tracked_align_dead_zone, tracked_align_slew))
-BWA_LIVE_SETTER(tracked_align_slew, float, bwa_set_tracked_align(eng, tracked_align, tracked_align_dead_zone, tracked_align_slew))
+BWA_LIVE_SETTER(tracked_align, bool, bwa_set_tracked_align(eng, v))
+BWA_LIVE_SETTER(tracked_align_dead_zone, float, bwa_set_tracked_align_guards(eng, tracked_align_dead_zone, tracked_align_slew_frames_per_s))
+BWA_LIVE_SETTER(tracked_align_slew_frames_per_s, float, bwa_set_tracked_align_guards(eng, tracked_align_dead_zone, tracked_align_slew_frames_per_s))
 BWA_LIVE_SETTER(limiter, bool, bwa_set_limiter(eng, v))
 
 #undef BWA_LIVE_SETTER
@@ -1053,21 +1054,21 @@ void BwaEngine::_bind_methods() {
 
 	M(set_panner, "panner"); M0(get_panner);
 	M(set_dual_band, "on"); M0(get_dual_band);
-	M(set_cap, "on"); M0(get_cap);
+	M(set_dual_band_cap, "on"); M0(get_dual_band_cap);
 	M(set_spcap_focus, "focus"); M0(get_spcap_focus);
 	M(set_spcap_density, "density"); M0(get_spcap_density);
 	M(set_spread_mode, "mode"); M0(get_spread_mode);
 	M(set_decorrelation, "on"); M0(get_decorrelation);
 	M(set_near_spread, "radius_m"); M0(get_near_spread);
 	M(set_hole_spread, "strength"); M0(get_hole_spread);
-	M(set_speed_of_sound, "meters_per_sec"); M0(get_speed_of_sound);
+	M(set_speed_of_sound, "meters_per_s"); M0(get_speed_of_sound);
 	M(set_max_re, "on"); M0(get_max_re);
 	M(set_max_re_split, "on"); M0(get_max_re_split);
 	M(set_bed_renderer, "renderer"); M0(get_bed_renderer);
 	M(set_tracked_room_eq, "on"); M0(get_tracked_room_eq);
 	M(set_tracked_align, "on"); M0(get_tracked_align);
-	M(set_tracked_align_dead_zone, "meters"); M0(get_tracked_align_dead_zone);
-	M(set_tracked_align_slew, "frames_per_s"); M0(get_tracked_align_slew);
+	M(set_tracked_align_dead_zone, "dead_zone_m"); M0(get_tracked_align_dead_zone);
+	M(set_tracked_align_slew_frames_per_s, "frames_per_s"); M0(get_tracked_align_slew_frames_per_s);
 	M(set_limiter, "on"); M0(get_limiter);
 	M(set_limiter_ceiling, "linear"); M0(get_limiter_ceiling);
 	M(load_headphone_eq, "path");
@@ -1157,7 +1158,7 @@ void BwaEngine::_bind_methods() {
 			"set_panner", "get_panner");
 	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "dual_band"), "set_dual_band", "get_dual_band");
 	/* Needs dual_band: it corrects that low band only. */
-	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "cap"), "set_cap", "get_cap");
+	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "dual_band_cap"), "set_dual_band_cap", "get_dual_band_cap");
 	/* SPCAP only. 0 = the default: focus derived from the array geometry, density 2.0. */
 	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "spcap_focus", PROPERTY_HINT_RANGE, "0,64,0.1"),
 			"set_spcap_focus", "get_spcap_focus");
@@ -1189,9 +1190,9 @@ void BwaEngine::_bind_methods() {
 	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "tracked_align_dead_zone", PROPERTY_HINT_RANGE,
 						"0,0.5,0.005"),
 			"set_tracked_align_dead_zone", "get_tracked_align_dead_zone");
-	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "tracked_align_slew", PROPERTY_HINT_RANGE,
+	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "tracked_align_slew_frames_per_s", PROPERTY_HINT_RANGE,
 						"0,1024,1"),
-			"set_tracked_align_slew", "get_tracked_align_slew");
+			"set_tracked_align_slew_frames_per_s", "get_tracked_align_slew_frames_per_s");
 
 	ADD_GROUP("Output", "");
 	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "master_gain", PROPERTY_HINT_RANGE, "0,2,0.01"),

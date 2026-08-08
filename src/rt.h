@@ -144,7 +144,8 @@ void    rt_set_room_eq_dyn(RtCore* c, int on);       /* tracked room EQ (room_eq
  * Layout.ref onto the live listener. Default OFF. `dead_zone_m` is how far the listener must move
  * before anything is recomputed, `slew_frames_per_s` the ceiling on delay change (the resampling
  * ratio, hence the pitch shift); either <= 0 reverts that one to its default. Live A/B. */
-void    rt_set_tracked_align(RtCore* c, int on, float dead_zone_m, float slew_frames_per_s);
+void    rt_set_tracked_align(RtCore* c, int on);
+void    rt_set_tracked_align_guards(RtCore* c, float dead_zone_m, float slew_frames_per_s);
 void    rt_set_decorrelation(RtCore* c, int on);     /* velvet-noise wide-part decorrelation; live A/B */
 void    rt_set_bed_renderer(RtCore* c, int parametric);   /* bed: 0 = matrix decode, 1 = parametric (DirAC); live A/B */
 void    rt_set_pose_prediction(RtCore* c, float lead_s);  /* tracked-pose lead (0 = off); live */

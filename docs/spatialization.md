@@ -278,7 +278,7 @@ atomic is on, so it A/Bs live.
 Dual-band is sweet-spot dependent (like VBAP). The dense array + small working area
 is favorable, but whether it helps a *roaming* listener is a by-ear/rig call.
 
-## Compensated amplitude panning (`bwa_set_cap`, off by default)
+## Compensated amplitude panning (`bwa_set_dual_band_cap`, off by default)
 
 Dual-band's low band aims the velocity vector at the source and takes whatever
 `|rV| < 1` the geometry gives. The shortfall is direction-dependent, so the rendered
@@ -710,7 +710,7 @@ SH→speaker **decode matrix** applied per block (`build_bed_decode` / `mix_bed`
 `rt.c`), built from the speaker geometry at load time. Two decoders are selectable with
 **`bwa_desc.bed_decoder`** (create-time); the plain **sampling (projection) decode**
 `decode[s][k] = (2l+1)·Y_k^SN3D(dir_s)/N` (`ambi_sad_decode`) is **not** one of
-them: exact on a perfectly uniform array, it over-energises dense regions on an
+them: exact on a perfectly uniform array, it over-energizes dense regions on an
 irregular one (every speaker radiates a fixed diffuse energy regardless of position),
 which both selectable decoders dominate. It survives only as the automatic fallback
 when a degenerate layout defeats the chosen build, and as the FDN's

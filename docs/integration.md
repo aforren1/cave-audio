@@ -184,9 +184,10 @@ The snippet shows the core calls. The shipped `Bwa.cs` binds every `BWA_API` fun
   0 or less on either reverts that one to the default, focus to whatever the array
   geometry implies), `bwa_set_spread_mode`, `bwa_set_max_re` + `bwa_set_max_re_split`,
   `bwa_set_decorrelation`, `bwa_set_near_spread`, `bwa_set_hole_spread`,
-  `bwa_set_cap` (inert unless `bwa_set_dual_band` is also on: it corrects that low
+  `bwa_set_dual_band_cap` (inert unless `bwa_set_dual_band` is also on: it corrects that low
   band's ITD for the tracked head orientation, so it wants a real pose),
-  `bwa_set_bed_renderer`, `bwa_set_tracked_align` (re-references the per-speaker
+  `bwa_set_bed_renderer`, `bwa_set_tracked_align` + `bwa_set_tracked_align_guards`
+  (re-references the per-speaker
   delay and gain trims onto the tracked head; output stage, so it re-solves nothing),
   `bwa_set_tracked_room_eq` (the bed *decoder* is create-time:
   `bwa_desc.bed_decoder`). `Engine` re-pushes these from `OnValidate`, so the

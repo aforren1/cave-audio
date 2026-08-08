@@ -96,7 +96,7 @@ typedef enum {
  * makes a panned plane wave's decoded ENERGY constant over direction by construction — the
  * flattest loudness-vs-direction of the two. Which sounds better on a real array is a by-ear
  * call. The plain sampling (projection) decode is NOT selectable: on an irregular array it
- * over-energises dense speaker regions (dominated by both options above) — it survives only as
+ * over-energizes dense speaker regions (dominated by both options above) — it survives only as
  * the engine's automatic fallback when a degenerate layout defeats the chosen build. Affects the
  * ambisonic + reflection BEDS only, not the point-source panner. See docs/spatialization.md. */
 typedef enum { BWA_DECODE_ALLRAD = 0, BWA_DECODE_EPAD = 1 } bwa_bed_decoder;
@@ -667,7 +667,7 @@ BWA_API void     bwa_source_set_proximity(bwa_engine* e, bwa_source s, bool on);
  * steps). Underwater is 1480; small values exaggerate Doppler for slow-motion effects, saturating
  * against each delay ring's capacity (~40 ms at 48 k) — clamped to [30, 20000]. The Steam sim's
  * ray clock is phonon's own and does not follow this. */
-BWA_API void     bwa_set_speed_of_sound(bwa_engine* e, float meters_per_sec);
+BWA_API void     bwa_set_speed_of_sound(bwa_engine* e, float meters_per_s);
 /* Override the LAYOUT's distance-attenuation curve for one source (mono point sources; a bed has
  * no distance). Same formula as the layout knob: atten = clamp((ref/max(d,ref))^rolloff, min, 1),
  * with d the source→primary-listener distance. rolloff 0 = constant level at any distance (a
@@ -848,7 +848,7 @@ BWA_API void     bwa_set_dual_band(bwa_engine* e, bool on);
  * out under LOBE and MDAP, but BWA_SPREAD_SPECTRAL bypasses it entirely: that mode replaces the
  * single-path output stage, so a spread source there gets plain dual-band on its low bands and no
  * ITD correction at all. Known exclusion. See docs/spatialization.md. */
-BWA_API void     bwa_set_cap(bwa_engine* e, bool on);
+BWA_API void     bwa_set_dual_band_cap(bwa_engine* e, bool on);
 /* max-rE weighting for the SH->speaker BED decode (off by default; live A/B, crossfaded): tapers the
  * higher ambisonic orders (Zotter & Frank's psychoacoustic decoder weights, diffuse-energy-matched so
  * A and B stay level-fair), which suppresses decode sidelobes and lengthens the energy vector —
@@ -902,7 +902,8 @@ BWA_API void     bwa_set_near_spread(bwa_engine* e, float radius_m);
  * by construction, not by tuning: no direction on it is ever a full speaker spacing from a speaker.
  *
  * `strength` scales the derived floor: 1.0 is the honest width, below that a partial widening, above
- * it an exaggeration (clamped at 2). The widened part follows the selected spread mode and (when
+ * it an exaggeration (clamped to 0..2, so a negative value reads as off). The widened part follows
+ * the selected spread mode and (when
  * enabled) decorrelates, exactly like bwa_source_set_spread, and it composes with the other spread
  * floors as a max — the widest claim wins. Engine-wide policy; live-safe, and every source re-solves
  * on the next block, static ones included. No effect in BWA_PROFILE_BINAURAL (no speakers, no
@@ -981,9 +982,15 @@ BWA_API void     bwa_set_tracked_room_eq(bwa_engine* e, bool on);
  * Corrections saturate about 4 m from the centroid (the reserved delay headroom) and the per-speaker
  * level trim is clamped to +/-6 dB. Off is exact: the trims revert to the layout's own values, and
  * toggling either way glides rather than steps. Control thread, per-frame-safe, live A/B.
+ *
+ * The enable and its guards are SEPARATE calls, the same split as bwa_set_limiter /
+ * bwa_set_limiter_ceiling: the enable is what you A/B, and toggling it must not silently reset a
+ * dialed guard. Order does not matter, and the guards may be changed while it is running (the
+ * renderer re-reads them every block).
  * See docs/spatialization.md, "Re-aligning to the tracked listener". */
-BWA_API void     bwa_set_tracked_align(bwa_engine* e, bool on, float dead_zone_m,
-                                       float slew_frames_per_s);
+BWA_API void     bwa_set_tracked_align(bwa_engine* e, bool on);
+BWA_API void     bwa_set_tracked_align_guards(bwa_engine* e, float dead_zone_m,
+                                              float slew_frames_per_s);
 
 /* ---- offline panner evaluation (no engine handle; for layout scoring/optimization in tools) ----
  * The per-speaker gains the given `panner` produces for `nsrc` source positions heard from one

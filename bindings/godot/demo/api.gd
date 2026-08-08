@@ -99,7 +99,7 @@ func _test_engine_knobs() -> void:
 	engine.spread_mode = BwaEngine.SPREAD_LOBE
 
 	engine.dual_band = true
-	engine.cap = true
+	engine.dual_band_cap = true
 	engine.decorrelation = true
 	engine.near_spread = 1.0
 	engine.hole_spread = 1.0
@@ -108,16 +108,16 @@ func _test_engine_knobs() -> void:
 	engine.bed_renderer = BwaEngine.BED_PARAMETRIC
 	engine.tracked_room_eq = false
 	engine.tracked_align_dead_zone = 0.08
-	engine.tracked_align_slew = 128.0
+	engine.tracked_align_slew_frames_per_s = 128.0
 	engine.tracked_align = true
 	_check(engine.dual_band and engine.decorrelation and engine.max_re and engine.max_re_split,
 		"a boolean A/B knob did not round-trip")
 	_check(is_equal_approx(engine.near_spread, 1.0), "near_spread did not round-trip")
 	_check(is_equal_approx(engine.hole_spread, 1.0), "hole_spread did not round-trip")
-	_check(engine.cap, "cap did not round-trip")
+	_check(engine.dual_band_cap, "dual_band_cap did not round-trip")
 	_check(engine.tracked_align, "tracked_align did not round-trip")
 	_check(is_equal_approx(engine.tracked_align_dead_zone, 0.08), "tracked_align_dead_zone did not round-trip")
-	_check(is_equal_approx(engine.tracked_align_slew, 128.0), "tracked_align_slew did not round-trip")
+	_check(is_equal_approx(engine.tracked_align_slew_frames_per_s, 128.0), "tracked_align_slew_frames_per_s did not round-trip")
 
 	engine.spcap_focus = 20.0
 	engine.spcap_density = 3.0
@@ -135,7 +135,7 @@ func _test_engine_knobs() -> void:
 	engine.tracked_room_eq = true
 	engine.tracked_align = false
 	engine.tracked_align_dead_zone = 0.0
-	engine.tracked_align_slew = 0.0
+	engine.tracked_align_slew_frames_per_s = 0.0
 
 	engine.master_gain = 0.8
 	engine.limiter_ceiling = 0.7   # linear peak ceiling in (0..1]

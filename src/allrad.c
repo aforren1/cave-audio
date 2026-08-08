@@ -17,7 +17,7 @@
 #define ALLRAD_MAXTRI  1024    /* hull-triangle cap; overflow (extreme coplanarity) -> fall back to SAD */
 /* Imaginary-loudspeaker gap threshold (IEM AllRADecoder practice): if no real speaker lies within
  * this angle of a pole (nadir/zenith), the hull spans the hole with triangles of DISTANT speakers
- * and diffuse energy aimed into the hole smears onto them (a floor-less CAVE array over-energises
+ * and diffuse energy aimed into the hole smears onto them (a floor-less CAVE array over-energizes
  * its bottom ring). Adding an imaginary speaker at the pole closes the triangulation there, and its
  * decode row is DISCARDED — energy pointed where no speaker exists is dropped, not mis-panned. 60°
  * leaves genuinely-covered poles alone (the cube grid's nadir gap is ~55°: unchanged). */

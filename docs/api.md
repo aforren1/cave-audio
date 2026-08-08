@@ -1247,7 +1247,7 @@ void bwa_source_set_doppler        (bwa_engine* e, bwa_source s, bool on);
 void bwa_source_set_air_absorption (bwa_engine* e, bwa_source s, bool on);
 void bwa_source_set_loudness_comp  (bwa_engine* e, bwa_source s, bool on);
 void bwa_source_set_proximity      (bwa_engine* e, bwa_source s, bool on);
-void bwa_set_speed_of_sound        (bwa_engine* e, float meters_per_sec);   // engine-wide; live
+void bwa_set_speed_of_sound        (bwa_engine* e, float meters_per_s);   // engine-wide; live
 ```
 
 Opt-in, per source, default **off**, and (unlike occlusion/directivity) **pure per-voice DSP that
@@ -1537,7 +1537,7 @@ typedef enum { BWA_PAN_DBAP = 0, BWA_PAN_SPCAP = 1, BWA_PAN_VBAP = 2 } bwa_panne
 typedef enum { BWA_DECODE_ALLRAD = 0, BWA_DECODE_EPAD = 1 } bwa_bed_decoder;   // bwa_desc.bed_decoder
 void     bwa_set_panner(bwa_engine* e, bwa_panner panner);            // load-time or live (atomic switch)
 void     bwa_set_dual_band(bwa_engine* e, bool on);                // live A/B; wraps the selected panner
-void     bwa_set_cap(bwa_engine* e, bool on);                      // live A/B; ITD-corrects dual_band's low band
+void     bwa_set_dual_band_cap(bwa_engine* e, bool on);                      // live A/B; ITD-corrects dual_band's low band
 void     bwa_set_spcap_focus(bwa_engine* e, float focus, float density);  // SPCAP tuning; <= 0 = default
 float    bwa_spcap_focus_default(const float* positions, uint32_t n);     // pure: what the geometry implies
 uint32_t bwa_get_speakers(bwa_engine* e, float* xyz, uint32_t cap); // read back the layout; NULL xyz = count only
@@ -1593,7 +1593,7 @@ SPAT's "VBP Dual-Band". You get sharper low-frequency localization for a near-ce
 The panning *direction* is unchanged; only the low band's level/coherence differs. It is
 sweet-spot dependent like VBAP, so for a roaming listener it's a by-ear / measurement call.
 
-`bwa_set_cap` (off by default, live-toggleable) corrects that low band's **interaural time
+`bwa_set_dual_band_cap` (off by default, live-toggleable) corrects that low band's **interaural time
 difference**, and **requires `bwa_set_dual_band`** since the low band is the only thing it
 touches. Dual-band aims the velocity vector at the source and accepts whatever `|rV| < 1` the
 geometry gives, so the rendered ITD is short of a real source's by a direction-dependent amount
@@ -1621,7 +1621,7 @@ and reflection beds only, never the point-source panner:
   its house AllRAD render).
 
 The plain sampling (projection) decode is **not selectable**: on an irregular array it
-over-energises dense speaker regions (dominated by both options above), so it survives only as
+over-energizes dense speaker regions (dominated by both options above), so it survives only as
 the engine's automatic fallback when a *degenerate* layout defeats the chosen build (a failed
 fallback is silent by design; a degenerate survey should be fixed, not decoded around).
 
@@ -1712,7 +1712,8 @@ layouts without a grid.
 ## Tracked listener alignment (control thread; live, OFF by default)
 
 ```c
-void bwa_set_tracked_align(bwa_engine* e, bool on, float dead_zone_m, float slew_frames_per_s);
+void bwa_set_tracked_align(bwa_engine* e, bool on);
+void bwa_set_tracked_align_guards(bwa_engine* e, float dead_zone_m, float slew_frames_per_s);
 ```
 
 The layout's per-speaker delay and gain trims align the array's arrival times at **one** point, the
@@ -1726,6 +1727,11 @@ It is off by default because a moving delay line is a resampling event. A walkin
 every speaker's delay at once, which is a Doppler shift on everything the array plays: a global,
 always-audible failure mode rather than a local one. Two guards make it usable, and both are yours
 to tune. Pass 0 or less for either to take its default.
+
+The enable and the guards are **separate calls**, the same split as `bwa_set_limiter` and
+`bwa_set_limiter_ceiling`. The enable is the thing you A/B, and toggling it must not quietly reset a
+guard you dialed. Order does not matter, and the guards are live: the renderer re-reads them every
+block, so changing one while the feature runs takes effect on the next block.
 
 | Argument | Default | What it does |
 | --- | --- | --- |

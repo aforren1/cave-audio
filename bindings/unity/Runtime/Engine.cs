@@ -76,7 +76,7 @@ namespace BwAudio
         [Tooltip("Needs Dual Band. Corrects the low band's interaural time difference for the tracked " +
                  "head ORIENTATION, so a source holds still as the listener turns their head. Wants a " +
                  "real tracked pose; aimed at a seated listener.")]
-        public bool cap = false;
+        public bool dualBandCap = false;
         [Tooltip("SPCAP only: lobe sharpness. Higher concentrates a source on fewer speakers (tighter " +
                  "image), lower spreads it (smoother). 0 or less = the default derived from your array's " +
                  "speaker spacing (about 12.7 on the 26-speaker grid).")]
@@ -117,7 +117,7 @@ namespace BwAudio
                  "(not video FPS). This over the sample rate is the resampling ratio, so it is what bounds " +
                  "the pitch shift. 0 = the default (~63 at 48 kHz, following a 0.45 m/s walk); higher tracks " +
                  "a faster listener and is more audible.")]
-        public float trackedAlignSlew = 0f;
+        public float trackedAlignSlewFramesPerSecond = 0f;
 
         [Header("Diffuse beds (AmbisonicBed / reverb)")]
         [Tooltip("Load-time. AllRAD (default) localizes a touch sharper; EPAD keeps a panned wave's loudness " +
@@ -314,7 +314,7 @@ namespace BwAudio
         {
             Bwa.bwa_set_panner(_eng, panner);
             Bwa.bwa_set_dual_band(_eng, dualBand);
-            Bwa.bwa_set_cap(_eng, cap);
+            Bwa.bwa_set_dual_band_cap(_eng, dualBandCap);
             Bwa.bwa_set_spcap_focus(_eng, spcapFocus, spcapDensity);
             Bwa.bwa_set_spread_mode(_eng, spreadMode);
             Bwa.bwa_set_decorrelation(_eng, decorrelation);
@@ -325,7 +325,8 @@ namespace BwAudio
             Bwa.bwa_set_max_re(_eng, maxRe);
             Bwa.bwa_set_max_re_split(_eng, maxReSplit);
             Bwa.bwa_set_tracked_room_eq(_eng, trackedRoomEq);
-            Bwa.bwa_set_tracked_align(_eng, trackedAlign, trackedAlignDeadZone, trackedAlignSlew);
+            Bwa.bwa_set_tracked_align_guards(_eng, trackedAlignDeadZone, trackedAlignSlewFramesPerSecond);
+            Bwa.bwa_set_tracked_align(_eng, trackedAlign);
             Bwa.bwa_set_master_gain(_eng, masterGain);
             Bwa.bwa_set_reverb_gain(_eng, reverbGain);   // valid pre-start: seeds whichever reverb bed bwa_start creates
             Bwa.bwa_set_early_reflections_gain(_eng, earlyReflectionGain);
@@ -463,7 +464,7 @@ namespace BwAudio
         /// <summary>Compensated amplitude panning on the dual-band low band. Inert unless
         /// <see cref="SetDualBand"/> is on. Corrects the rendered interaural time difference for the
         /// tracked head orientation, so an image holds still under head rotation.</summary>
-        public void SetCap(bool on)              { cap = on;          if (Ready) Bwa.bwa_set_cap(_eng, on); }
+        public void SetDualBandCap(bool on)      { dualBandCap = on;  if (Ready) Bwa.bwa_set_dual_band_cap(_eng, on); }
         /// <summary>SPCAP's lobe sharpness and placement-correction density exponent (inert under DBAP/VBAP).
         /// Pass 0 or less for either to revert THAT one to its default: focus to the value derived from the
         /// array geometry, density to 2.0. Every source re-solves next block, static ones included.</summary>
@@ -487,10 +488,15 @@ namespace BwAudio
         /// all 26 delays at once. `deadZoneM` is how far the head must move before anything is recomputed
         /// (0 = the 5 cm default); `slewFramesPerS` caps how fast a delay may change, in audio frames per
         /// second (0 = the default, about 63 at 48 kHz, which follows a 0.45 m/s walk). A faster listener
-        /// LAGS rather than pitch-shifting. Off glides back to the layout's own trims.</summary>
-        public void SetTrackedAlign(bool on, float deadZoneM = 0f, float slewFramesPerS = 0f)
-            { trackedAlign = on; trackedAlignDeadZone = deadZoneM; trackedAlignSlew = slewFramesPerS;
-              if (Ready) Bwa.bwa_set_tracked_align(_eng, on, deadZoneM, slewFramesPerS); }
+        /// LAGS rather than pitch-shifting. Off glides back to the layout's own trims.
+        /// The enable and its guards are separate calls, so A/B-ing the toggle never disturbs a dialed
+        /// guard. Order does not matter and the guards are live.</summary>
+        public void SetTrackedAlign(bool on)
+            { trackedAlign = on; if (Ready) Bwa.bwa_set_tracked_align(_eng, on); }
+        /// <summary>The two guards, live. 0 on either takes that one's default.</summary>
+        public void SetTrackedAlignGuards(float deadZoneM, float slewFramesPerSecond)
+            { trackedAlignDeadZone = deadZoneM; trackedAlignSlewFramesPerSecond = slewFramesPerSecond;
+              if (Ready) Bwa.bwa_set_tracked_align_guards(_eng, deadZoneM, slewFramesPerSecond); }
         /// <summary>Lead the TRACKED pose by `seconds` to hide motion-to-ears latency. Internal tracking only
         /// (Feed Listener off) — when Unity feeds the pose, predict on the Unity side instead.</summary>
         public void SetPosePrediction(float seconds)  { posePredictionS = seconds; if (Ready && !feedListener) Bwa.bwa_set_pose_prediction(_eng, seconds); }

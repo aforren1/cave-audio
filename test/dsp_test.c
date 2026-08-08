@@ -876,7 +876,7 @@ int main(void) {
     /* 10b. EPAD bed decoder (epad.c): builds, finite, diffuse energy matched to the sampling
      *      decode (level-fair swap), localizes plane waves — and delivers THE property it exists
      *      for: a panned plane wave's decoded ENERGY is ~constant over direction on an irregular
-     *      array, where the sampling decode over-energises dense speaker regions. Pinned as the
+     *      array, where the sampling decode over-energizes dense speaker regions. Pinned as the
      *      loudness-vs-direction spread (CV) on a deliberately clustered array: EPAD's must come
      *      in far under the sampling decode's. */
     {

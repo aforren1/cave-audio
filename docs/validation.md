@@ -603,7 +603,7 @@ Say these out loud before quoting any number from this tool.
 
 ## Not built yet: the rotating two-mic ITD rig
 
-`bwa_set_cap` (compensated amplitude panning, [spatialization.md](./spatialization.md)) claims the
+`bwa_set_dual_band_cap` (compensated amplitude panning, [spatialization.md](./spatialization.md)) claims the
 rendered ITD stays correct **as the listener turns their head**. Nothing in this tool can see that. A
 spherical microphone array measures the field at a point; ITD is a property of two ears on a head, and
 rotating the ZM-1 does not create one. So CAP currently has unit-test evidence and no hardware

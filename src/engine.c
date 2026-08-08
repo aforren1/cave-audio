@@ -859,7 +859,7 @@ void bwa_set_test_signal(bwa_engine* e, uint32_t channel, bwa_test_kind kind, fl
 
 void bwa_set_panner(bwa_engine* e, bwa_panner panner) { if (e) { e->panner = (int)panner; rt_set_panner(e->rt, (int)panner); } }
 void bwa_set_dual_band(bwa_engine* e, bool on)       { if (e) rt_set_dual_band(e->rt, on); }
-void bwa_set_cap(bwa_engine* e, bool on)             { if (e) rt_set_cap(e->rt, on); }
+void bwa_set_dual_band_cap(bwa_engine* e, bool on)             { if (e) rt_set_cap(e->rt, on); }
 void bwa_set_max_re(bwa_engine* e, bool on) {
     if (!e) return;
     e->max_re = on ? 1 : 0;                          /* staged for the FDN bwa_start may still create */
@@ -869,8 +869,11 @@ void bwa_set_max_re(bwa_engine* e, bool on) {
 void bwa_set_max_re_split(bwa_engine* e, bool on)     { if (e) rt_set_max_re_split(e->rt, on); }
 void bwa_set_spread_mode(bwa_engine* e, bwa_spread_mode mode) { if (e) rt_set_spread_mode(e->rt, (int)mode); }
 void bwa_set_tracked_room_eq(bwa_engine* e, bool on)  { if (e) rt_set_room_eq_dyn(e->rt, on); }
-void bwa_set_tracked_align(bwa_engine* e, bool on, float dead_zone_m, float slew_frames_per_s) {
-    if (e) rt_set_tracked_align(e->rt, on, dead_zone_m, slew_frames_per_s);
+void bwa_set_tracked_align(bwa_engine* e, bool on) {
+    if (e) rt_set_tracked_align(e->rt, on);
+}
+void bwa_set_tracked_align_guards(bwa_engine* e, float dead_zone_m, float slew_frames_per_s) {
+    if (e) rt_set_tracked_align_guards(e->rt, dead_zone_m, slew_frames_per_s);
 }
 void bwa_set_decorrelation(bwa_engine* e, bool on)    { if (e) rt_set_decorrelation(e->rt, on); }
 void bwa_set_bed_renderer(bwa_engine* e, bwa_bed_renderer r) { if (e) rt_set_bed_renderer(e->rt, (int)r); }

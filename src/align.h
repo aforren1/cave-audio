@@ -23,7 +23,7 @@ void     align_process(Aligner* a, float* bus, uint32_t nframes);  /* in place; 
  * as align_process — plain stores, no atomics needed); no-op for a gridless layout. */
 void     align_room_eq_targets(Aligner* a, const float (*gain_db)[BWA_ROOM_EQ_MAX]);
 
-/* ---- tracked listener alignment (bwa_set_tracked_align; OFF by default) --------------------------
+/* ---- tracked listener alignment (bwa_set_tracked_align + _guards; OFF by default) ----------------
  * The layout's delay/gain trims align the array at ONE point (Layout.ref). These three calls add an
  * EXTRA per-channel delay and gain on top, re-referencing that alignment onto the tracked listener:
  * rt.c derives the targets from |speaker - listener| against |speaker - ref| (listener_align_track),
