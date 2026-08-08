@@ -131,12 +131,12 @@ int main(int argc, char** argv) {
     if (zylia && (localize_file || check || live_speaker >= 0)) {
         fprintf(stderr, "calibrate: --zylia is its own mode (19-input capture); drop --localize/--check/--live\n"); return 2; }
     if (room_eq)
-        printf("calibrate: --room-eq corrects the ROOM at the mic position — valid only for a STATIC\n"
+        printf("calibrate: --room-eq corrects the ROOM at the mic position - valid only for a STATIC\n"
                "           listener seated there (SPCAP/VBAP deployments); a roaming listener wants plain --eq.\n"
                "           Place the mic at the listening position, ear height.\n");
     if (rq_grid)
         printf("calibrate: --room-eq-grid measures this mic position's LF modal cuts and merges them into\n"
-               "           the layout's room_eq_grid — one run per mic placement, --mic x y z IS the grid\n"
+               "           the layout's room_eq_grid - one run per mic placement, --mic x y z IS the grid\n"
                "           key (a rerun within 5 cm replaces that entry). Cover the working area (ear\n"
                "           height, ~0.5-1 m spacing); the engine interpolates between positions live.\n");
     if (!out_path) out_path = layout_path;                    /* in-place by default */
@@ -256,10 +256,10 @@ int main(int argc, char** argv) {
                   printf("localize: solved system latency %.3f m (%.2f ms) vs driver digital loop %.3f m (%.2f ms) -> residual %+.2f ms\n",
                          med_m, med_m / sos * 1e3, drv_m, drv_m / sos * 1e3, resid_ms);
                   if (resid_ms < -0.5)
-                      printf("  WARNING: solved latency is BELOW the driver's own digital loop — physically impossible;\n"
+                      printf("  WARNING: solved latency is BELOW the driver's own digital loop - physically impossible;\n"
                              "           check the device/clocking (wrong driver? sample-rate mismatch?)\n");
                   else if (resid_ms > 20.0)
-                      printf("  WARNING: residual is unexpectedly large for DAC/ADC + analog — check the Dante latency\n"
+                      printf("  WARNING: residual is unexpectedly large for DAC/ADC + analog - check the Dante latency\n"
                              "           setting / an extra buffer in the loop\n");
               }
           } }
@@ -280,7 +280,7 @@ int main(int argc, char** argv) {
                mic[0], mic[1], mic[2], ZYLIA_MICS, simulate ? "  [SIMULATE]" : "");
         if (!simulate && !survey_path)
             printf("zylia: no --survey: trusting the BUILT-IN capsule table. Channel order and the device's\n"
-                   "       orientation in the room are then unpinned — a yaw error rotates every recovered\n"
+                   "       orientation in the room are then unpinned - a yaw error rotates every recovered\n"
                    "       position (docs/calibration.md, \"The capsule self-survey\").\n");
 
         /* capture first, solve after: --ref needs the reference speaker's arrivals before any distance */
@@ -337,13 +337,13 @@ int main(int argc, char** argv) {
             }
             double lat_ref = mean_t + mdotd / C - ref_dist / C;
             if (known_latency >= 0.0)
-                printf("zylia: --ref solves latency %.3f m vs --latency %.3f m (delta %+.1f cm) — using --ref\n",
+                printf("zylia: --ref solves latency %.3f m vs --latency %.3f m (delta %+.1f cm) - using --ref\n",
                        lat_ref * C, known_latency, (lat_ref * C - known_latency) * 100.0);
             latency = lat_ref; lat_known = 1;
             printf("zylia: system latency from --ref %d @ %.3f m: %.2f ms (%.3f m at c)\n",
                    ref_spk, ref_dist, latency * 1e3, latency * C);
             if (!simulate && latency <= 0.0)
-                printf("  WARNING: solved latency is not positive — wrong --ref speaker or distance?\n");
+                printf("  WARNING: solved latency is not positive - wrong --ref speaker or distance?\n");
         }
 #ifdef BWA_HAVE_ASIO
         /* Same lower-bound check as --localize: the driver's digital loop is inside every arrival, so
@@ -356,7 +356,7 @@ int main(int argc, char** argv) {
               printf("zylia: system latency %.3f m vs driver digital loop %.3f m -> residual %+.2f ms\n",
                      latency * C, drv_m, resid_ms);
               if (resid_ms < -0.5)
-                  printf("  WARNING: below the driver's own digital loop — physically impossible; check the\n"
+                  printf("  WARNING: below the driver's own digital loop - physically impossible; check the\n"
                          "           device/clocking, the --ref distance, or the --latency value\n");
           } }
 #endif
@@ -373,7 +373,7 @@ int main(int argc, char** argv) {
                    (s == ref_spk) ? "  [--ref: should read the taped distance]" : "");
         }
         if (!lat_known) {
-            fprintf(stderr, "zylia: NOT writing positions — no --latency/--ref, so every distance above carries\n"
+            fprintf(stderr, "zylia: NOT writing positions - no --latency/--ref, so every distance above carries\n"
                             "       the full system latency radially (directions are exact). Tape ONE speaker's\n"
                             "       distance from the array center and re-run with --ref <spk> <m>, or measure a\n"
                             "       loopback and pass --latency <m>.\n");
@@ -430,7 +430,7 @@ int main(int argc, char** argv) {
          * it exactly, and prints this same comparison). */
         { long il = 0, ol = 0;
           if (known_latency < 0.0 && !simulate && calib_asio_latencies(&il, &ol))
-              printf("  (driver digital loop = %.3f m of the range below — a lower bound for --latency)\n",
+              printf("  (driver digital loop = %.3f m of the range below - a lower bound for --latency)\n",
                      sos * (double)(il + ol) / FS); }
 #endif
         int iters = simulate ? 4 : (1 << 30);

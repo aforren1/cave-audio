@@ -122,7 +122,7 @@ namespace BwAudio
         [Header("Diffuse beds (AmbisonicBed / reverb)")]
         [Tooltip("Load-time. AllRAD (default) localizes a touch sharper; EPAD keeps a panned wave's loudness " +
                  "constant over direction by construction (flattest on an irregular array). A by-ear call.")]
-        public BwaBedDecoder bedDecoder = BwaBedDecoder.Allrad;
+        public BwaBedDecoder bedDecoder = BwaBedDecoder.Default;
         [Tooltip("MATRIX: the static SH->speaker decode. PARAMETRIC: DirAC analysis re-pans the directional " +
                  "part through the listener-relative panner — a recorded soundfield becomes WALKABLE " +
                  "(correct directions + parallax off-center). Live: beds crossfade, so it A/Bs.")]
@@ -130,7 +130,7 @@ namespace BwAudio
         [Tooltip("max-rE weighting on the bed decode (and the FDN's render): tapers the high ambisonic " +
                  "orders — fewer decode sidelobes, better localization AWAY from the sweet spot (the " +
                  "walking-listener case), slightly wider main lobe. Live A/B, level-fair.")]
-        public bool maxRe = false;
+        public bool maxRe = true;
         [Tooltip("Band-split max-rE (needs Max Re on): apply the taper only ABOVE ~700 Hz and keep the " +
                  "unweighted decode below — the ear localizes LF by pressure (plain decode) and HF by " +
                  "energy (max-rE). The Gerzon basic-LF/max-rE-HF split. Bed matrix decodes only. Live A/B.")]

@@ -87,7 +87,10 @@ void layout_compute_ref(Layout* L);
 /* The array's angular scale: the mean nearest-neighbor angular separation (RADIANS) of the speaker
  * directions seen from `ref`. 37.5 deg on the default 26-speaker cube grid. Returns 0 on a
  * degenerate survey (fewer than 2 speakers). Needs `count` + `ref` set — call after
- * layout_compute_ref. Control thread; O(N^2), load-time only.
+ * layout_compute_ref. O(N^2) but pure and alloc-free, and hole.c calls it from the AUDIO thread on a
+ * layout-generation change (not per block; the knee is cached with the direction set). So it is not
+ * "load-time only" any more: it must stay allocation-free, lock-free and logging-free, or hole_block
+ * breaks invariant 1. Keep it pure.
  *
  * Two features scale themselves off it, which is why it is exported rather than inlined into either:
  * SPCAP's default lobe width (below) and the hole-aware spread floor's knee (hole.h). */

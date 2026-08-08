@@ -119,6 +119,15 @@ func _test_engine_knobs() -> void:
 	_check(is_equal_approx(engine.tracked_align_dead_zone, 0.08), "tracked_align_dead_zone did not round-trip")
 	_check(is_equal_approx(engine.tracked_align_slew_frames_per_s, 128.0), "tracked_align_slew_frames_per_s did not round-trip")
 
+	# situation tuning: the Dictionary form is inspectable, apply_setup pushes it
+	var seated := engine.get_setup_tuning(BwaEngine.SETUP_SEATED)
+	var roaming := engine.get_setup_tuning(BwaEngine.SETUP_ROAMING)
+	_check(seated.has("panner") and seated.size() >= 16, "setup tuning should be a full table")
+	_check(seated["panner"] != roaming["panner"], "seated and roaming should differ on the panner")
+	_check(bool(seated["max_re"]) and bool(roaming["max_re"]), "max-rE should be on in both setups")
+	_check(engine.apply_setup(BwaEngine.SETUP_ROAMING), "apply_setup should succeed")
+	_check(engine.panner == BwaEngine.PAN_DBAP, "apply_setup should mirror into the node properties")
+
 	engine.spcap_focus = 20.0
 	engine.spcap_density = 3.0
 	_check(is_equal_approx(engine.spcap_focus, 20.0), "spcap_focus did not round-trip")

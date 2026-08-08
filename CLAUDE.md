@@ -83,11 +83,18 @@ src/
                        copies cost in timbre, the measurable side of SPCAP focus). [calib]
   valid.h / valid.c    phantom-localization validation: render a source, measure where the array
                        actually put it (feeds/simulate/score + medians, bootstrap, matched-cell
-                       contrasts). Also the PHYSICAL REFERENCE arm (drive one speaker alone = a real
-                       source, so a phantom miss reads against a floor -- also the comb-depth floor)
-                       and stimulus selection (broadband or a tone, analysis band follows). The SPCAP
-                       focus/density knobs thread through every solve here, so bwa_validate --focus
-                       sweeps them. Drives bwa_validate. [validation]
+                       contrasts). The PHANTOM arm renders through a REAL ENGINE CORE (a cached
+                       RtCore + push voice, limiter off, ramps settled, deterministic timestamp --
+                       the same path bwa_render_block/BWA_SINK_MANUAL drives), so every live A/B knob
+                       (ValidRender: focus/density, dual-band, CAP, hole spread, tracked align,
+                       spread mode/decorrelation/near spread) is sweepable and valid_simulate just
+                       propagates those feeds to the 19 capsules. The PHYSICAL REFERENCE arm (drive
+                       one speaker alone = a real source, so a phantom miss reads against a floor --
+                       also the comb-depth floor) deliberately does NOT: no panner, no knob, no
+                       engine state. valid_speaker_feeds_direct is the pre-engine builder, kept as
+                       the regression baseline the ctest pins the engine render against. Also
+                       stimulus selection (broadband or a tone, analysis band follows). Drives
+                       bwa_validate. [validation]
   dbap.h / dbap.c      listener-relative, constant-power DBAP gain solve. [M4]
   cap.h / cap.c        compensated amplitude panning: projects the dual-band LOW band so the rendered
                        ITD matches a real source's for the head's CURRENT orientation. NOT a panner -

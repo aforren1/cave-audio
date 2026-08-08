@@ -860,6 +860,10 @@ int main(void) {
         CHECK(cl != NULL, "rt_create (limiter)");
         if (cl) {
             bwa_timestamp ts = { 0, 0 };
+            /* Assert the state under test rather than inheriting it. The limiter happens to default
+             * ON, but a test that leans on that measures nothing the day the default moves - which is
+             * exactly how the max-rE tests came to read 0.056 -> 0.056 and pass. */
+            rt_set_limiter(cl, 1);
             rt_test_signal(cl, 0, 1, 2.0f);                /* sine, peak 2.0 — over the -1 dBFS ceiling */
             rt_test_signal(cl, 1, 1, 0.5f);                /* the same waveform at 1/4 the level */
             for (int b = 0; b < 20; ++b) rt_render(cl, bus, N, &ts);   /* settle the envelope */

@@ -183,7 +183,7 @@ static void test_feed_path(const Layout* L, double FS, double C) {
     float src[3] = { L->ref[0] + 1.4f*0.6f, L->ref[1] + 1.4f*0.3f, L->ref[2] - 1.4f*0.74f };
     double worst = 0.0;
     for (int p = 0; p < 3; ++p) {
-        CHECK(valid_speaker_feeds(L, pans[p], mic, src, FS, 0.f, 0.f, feeds, NN + PRE), "feeds build");
+        CHECK(valid_speaker_feeds(L, pans[p], NULL, mic, src, FS, feeds, NN + PRE), "feeds build");
         propagate(L, feeds, mic, C, FS, wide, NN + PRE);
         /* drop the pre-roll: until the farthest speaker has arrived the field is incomplete, and
          * that transient is an artifact of starting the model, not something the rig would see */
@@ -191,8 +191,8 @@ static void test_feed_path(const Layout* L, double FS, double C) {
             memcpy(cap + (size_t)j*NN, wide + (size_t)j*(NN+PRE) + PRE, sizeof(float)*NN);
 
         ValidCell viaFeeds, viaSim;
-        CHECK(valid_score(L, pans[p], 1, mic, src, cap, NN, FS, C, 0.f, 0.f, NULL, &viaFeeds), "score from a capture");
-        CHECK(valid_cell(L, pans[p], 1, mic, src, FS, C, 0.f, 0.f, NN, &viaSim), "score from the simulation");
+        CHECK(valid_score(L, pans[p], NULL, 1, mic, src, cap, NN, FS, C, NULL, &viaFeeds), "score from a capture");
+        CHECK(valid_cell(L, pans[p], NULL, 1, mic, src, FS, C, NN, &viaSim), "score from the simulation");
         if (viaFeeds.ok && viaSim.ok) {
             double d = (double)viaFeeds.measured[0]*viaSim.measured[0]
                      + (double)viaFeeds.measured[1]*viaSim.measured[1]
@@ -205,7 +205,355 @@ static void test_feed_path(const Layout* L, double FS, double C) {
         }
     }
     printf("[feed path    ] worst feeds-vs-analytic disagreement %.2f deg\n", worst);
+
+    /* THE TWO ARMS NOW USE DIFFERENT PROPAGATION MODELS, and the physical-versus-phantom table
+     * SUBTRACTS them, so any systematic difference between the models would land in that contrast
+     * wearing the phantom's name. The phantom arm propagates real engine feeds with a cubic
+     * fractional tap (a feed is no longer a scaled copy of one stimulus, so the exact phase-domain
+     * model cannot apply); the reference arm keeps the exact model. Pin the pair: drive one speaker
+     * alone, propagate its feed the explicit way, and require the answer to match the analytic
+     * reference cell it will be differenced against. */
+    {
+        double worst_ref = 0.0, worst_comb = 0.0;
+        int n = 0;
+        for (uint32_t sp = 0; sp < L->count; sp += 5) {
+            ValidCell viaFeeds, viaField;
+            float tgt[3] = { L->speakers[sp].pos[0], L->speakers[sp].pos[1], L->speakers[sp].pos[2] };
+            if (!valid_reference_feeds(L, (int)sp, FS, feeds, NN + PRE)) { CHECK(0, "reference feeds"); continue; }
+            propagate(L, feeds, mic, C, FS, wide, NN + PRE);
+            for (int j = 0; j < ZYLIA_MICS; ++j)
+                memcpy(cap + (size_t)j*NN, wide + (size_t)j*(NN+PRE) + PRE, sizeof(float)*NN);
+            if (!valid_score(L, 0, NULL, 0, mic, tgt, cap, NN, FS, C, NULL, &viaFeeds) ||
+                !valid_reference_cell(L, (int)sp, mic, FS, C, NN, &viaField)) { CHECK(0, "reference cells"); continue; }
+            if (!viaFeeds.ok || !viaField.ok) { CHECK(0, "both reference paths resolve"); continue; }
+            double d = (double)viaFeeds.measured[0]*viaField.measured[0]
+                     + (double)viaFeeds.measured[1]*viaField.measured[1]
+                     + (double)viaFeeds.measured[2]*viaField.measured[2];
+            double deg = acos(fmax(-1.0, fmin(1.0, d))) * 180.0 / 3.14159265358979;
+            if (deg > worst_ref) worst_ref = deg;
+            if (viaFeeds.comb_ok && viaField.comb_ok) {
+                double dk = fabs((double)viaFeeds.comb_db - viaField.comb_db);
+                if (dk > worst_comb) worst_comb = dk;
+            }
+            ++n;
+        }
+        printf("[feed path    ] reference arm, explicit propagation vs the analytic field: worst\n"
+               "                %.2f deg, %.2f dB comb over %d speakers\n", worst_ref, worst_comb, n);
+        CHECK(n >= 4, "the reference-arm model check runs on several speakers");
+        CHECK(worst_ref < 1.0 && worst_comb < 0.5,
+              "the two arms' propagation models agree, so the matched contrast between them is real");
+    }
     free(feeds); free(wide); free(cap);
+}
+
+/* ---- the engine-rendered phantom arm ------------------------------------------------------------
+ *
+ * The phantom arm no longer scales a stimulus by a panner solve: it drives a real engine core and
+ * takes the speaker bus, which is the only way the shipping knobs (dual-band, CAP, the spread modes,
+ * decorrelation, the hole floor, tracked alignment) can reach a measurement at all. Two things have
+ * to hold for that reroute to be trustworthy, and they are opposite claims:
+ *
+ *   1. With every knob OFF it must reproduce the old feeds. That is what says the numbers this
+ *      harness has already reported are still the same numbers.
+ *   2. With a knob ON it must move a measured number. Otherwise the sweep is decorative.
+ *
+ * Both are below. The second is reported per knob and asserted only where the physics is unambiguous.
+ */
+
+/* layout_default() is a cube GRID with unity trims and NO delays, so its arrivals are not
+ * time-aligned anywhere — dref runs from 1.5 m to 2.6 m. A calibrated install is not like that, and
+ * the difference matters for tracked alignment, which RE-REFERENCES an existing alignment rather than
+ * creating one. This is the same grid with the per-speaker delay a calibration would have written:
+ * arrivals coincide at the layout reference. */
+static Layout make_aligned_grid(double fs, double c) {
+    Layout L = layout_default();
+    double d[BWA_CHANNELS], dmax = 0.0;
+    for (uint32_t k = 0; k < L.count; ++k) {
+        double dx = L.speakers[k].pos[0] - L.ref[0];
+        double dy = L.speakers[k].pos[1] - L.ref[1];
+        double dz = L.speakers[k].pos[2] - L.ref[2];
+        d[k] = sqrt(dx*dx + dy*dy + dz*dz);
+        if (d[k] > dmax) dmax = d[k];
+    }
+    uint32_t mx = 0;
+    for (uint32_t k = 0; k < L.count; ++k) {
+        L.speakers[k].delay_samples = (uint32_t)((dmax - d[k]) / c * fs + 0.5);
+        if (L.speakers[k].delay_samples > mx) mx = L.speakers[k].delay_samples;
+    }
+    L.max_delay_samples = mx;
+    return L;
+}
+
+/* A BARREL: 8 perimeter positions x 3 heights, no top or bottom cap — the CAVE array's real shape,
+ * open at both poles, and the only geometry on which the hole-aware spread floor does anything. The
+ * same construction dsp_test and rt_feature_test use, so the three agree on what a hole is. */
+static Layout make_barrel(void) {
+    Layout L;
+    memset(&L, 0, sizeof L);
+    const float rad = 1.5f, ys[3] = { 0.5f, 1.5f, 2.5f };
+    uint32_t k = 0;
+    for (int ri = 0; ri < 3; ++ri)
+        for (int a = 0; a < 8; ++a, ++k) {
+            const float th = (float)a * 0.785398163f;
+            L.speakers[k].pos[0] = rad * cosf(th);
+            L.speakers[k].pos[1] = ys[ri];
+            L.speakers[k].pos[2] = rad * sinf(th);
+            L.speakers[k].gain_lin = 1.f;
+        }
+    L.count = k;
+    layout_compute_ref(&L);
+    L.rolloff_r     = 0.7f;
+    L.spcap_focus   = layout_derive_spcap_focus(&L);
+    L.spcap_density = BWA_SPCAP_DENSITY_DEFAULT;
+    L.atten_ref_m   = 1.f;
+    L.atten_rolloff = 1.f;
+    L.atten_min_lin = 0.01f;
+    return L;
+}
+
+/* CLAIM 1: with every knob off, the engine render reproduces the pre-engine feed builder.
+ *
+ * Not bit-identical, and it cannot be. The engine multiplies a float stimulus sample by a float gain
+ * and then by align.c's float trim; the direct builder folds gain and trim into one double and
+ * multiplies once. Same panner solve, same trim, same integer delay, different rounding — so the
+ * disagreement is float epsilon on the product, not a difference in what is rendered. Anything
+ * larger means something in the render path is no longer a plain gain. */
+static void test_engine_vs_direct(const Layout* L, double FS) {
+    enum { FN = 4096 };
+    const int pans[3] = { BWA_PAN_DBAP, BWA_PAN_SPCAP, BWA_PAN_VBAP };
+    float* fe = (float*)malloc(sizeof(float) * (size_t)BWA_CHANNELS * FN);
+    float* fd = (float*)malloc(sizeof(float) * (size_t)BWA_CHANNELS * FN);
+    if (!fe || !fd) { printf("FAIL: out of memory\n"); ++fails; free(fe); free(fd); return; }
+    float mic[3] = { 0.55f, 1.5f, -0.35f };
+    float src[3] = { L->ref[0] + 1.4f*0.6f, L->ref[1] + 1.4f*0.3f, L->ref[2] - 1.4f*0.74f };
+    double worst = 0.0;
+    for (int p = 0; p < 3; ++p) {
+        CHECK(valid_speaker_feeds(L, pans[p], NULL, mic, src, FS, fe, FN), "engine feeds build");
+        CHECK(valid_speaker_feeds_direct(L, pans[p], mic, src, FS, 0.f, 0.f, fd, FN),
+              "direct feeds build");
+        double peak = 0.0, diff = 0.0;
+        for (size_t i = 0; i < (size_t)L->count * FN; ++i) {
+            double a = fabs((double)fd[i]);
+            double e = fabs((double)fe[i] - (double)fd[i]);
+            if (a > peak) peak = a;
+            if (e > diff) diff = e;
+        }
+        double rel = (peak > 0.0) ? diff / peak : 1.0;
+        if (rel > worst) worst = rel;
+        printf("[engine feeds ] %-5s peak %.5f, worst |engine - direct| %.3e  (%.2e of peak)\n",
+               pan_name(pans[p]), peak, diff, rel);
+    }
+    CHECK(worst < 1e-5, "the engine render reproduces the pre-engine feeds to float epsilon");
+    free(fe); free(fd);
+}
+
+/* Render one cell and hand back its three numbers, so the knob checks below read as a table rather
+ * than as thirty lines of boilerplate. Returns 0 if either estimator refused. */
+static int cell_of(const Layout* L, int panner, const ValidRender* r, const float mic[3],
+                   const float src[3], double FS, double C, uint32_t n,
+                   double* miss, double* comb, double* psi) {
+    ValidCell c;
+    if (!valid_cell(L, panner, r, 1, mic, src, FS, C, n, &c) || !c.ok || !c.comb_ok) return 0;
+    if (miss) *miss = c.miss_deg;
+    if (comb) *comb = c.comb_db;
+    if (psi)  *psi  = c.diffuseness;
+    return 1;
+}
+
+/* The property that makes any of this quotable: the same inputs give the same numbers.
+ *
+ * Asserted twice over, because the two ways it can break are different. The engine core is CACHED
+ * across cells, so a cell must not depend on which cell ran before it (filter state, the alignment
+ * ring, the tracked-alignment glide). And a fresh process must agree with a warm one, which is what
+ * valid_engine_release exercises. */
+static void test_engine_determinism(const Layout* L, double FS, double C) {
+    const uint32_t NC = 8192u;
+    float mic[3]   = { 0.6f, 1.5f, -0.4f };
+    float src[3]   = { L->ref[0] + 0.9f, L->ref[1] + 0.3f, L->ref[2] - 1.0f };
+    float other[3] = { L->ref[0] - 1.1f, L->ref[1] - 0.2f, L->ref[2] + 0.6f };
+    ValidRender r;
+    valid_render_init(&r);
+    r.dual_band = 1; r.tracked_align = 1; r.decorrelation = 1; r.spread = 0.4f;
+
+    ValidCell a, b, c, d;
+    CHECK(valid_cell(L, BWA_PAN_DBAP,  &r, 1, mic, src,   FS, C, NC, &a), "determinism cell a");
+    CHECK(valid_cell(L, BWA_PAN_SPCAP, &r, 1, mic, other, FS, C, NC, &c), "an unrelated cell between");
+    CHECK(valid_cell(L, BWA_PAN_DBAP,  &r, 1, mic, src,   FS, C, NC, &b), "determinism cell b");
+    CHECK(a.miss_deg == b.miss_deg && a.comb_db == b.comb_db && a.diffuseness == b.diffuseness,
+          "a cell does not depend on which cell ran before it (the engine core is cached)");
+    printf("[determinism  ] warm cache: miss %.6f/%.6f  comb %.6f/%.6f\n",
+           a.miss_deg, b.miss_deg, a.comb_db, b.comb_db);
+
+    valid_engine_release();                         /* the cold-start path a fresh process takes */
+    CHECK(valid_cell(L, BWA_PAN_DBAP, &r, 1, mic, src, FS, C, NC, &d), "determinism cell d");
+    CHECK(a.miss_deg == d.miss_deg && a.comb_db == d.comb_db && a.diffuseness == d.diffuseness,
+          "...and a cold engine renders the same cell as a warm one");
+    printf("[determinism  ] cold start: miss %.6f  comb %.6f\n", d.miss_deg, d.comb_db);
+}
+
+/* CLAIM 2: each knob moves a measured number, and where the physics says WHICH WAY, assert it.
+ *
+ * Read the tracked-alignment rows against TWO layouts, because how much the knob buys depends on the
+ * calibration under it and that is easy to miss with one. It re-references an existing alignment onto
+ * the live head. On a layout whose per-speaker delays already equalize arrival at the reference
+ * (make_aligned_grid), moving that reference onto an off-center listener restores coincidence there
+ * and the comb falls all the way to the stimulus floor. On the built-in grid, whose trims are unity
+ * and whose delays are ZERO, the comp still equalizes what geometry it can and the comb falls too,
+ * but only part way — there was never an alignment there to move. Both are measured; only the
+ * calibrated case is asserted, because only there is the size of the drop forced by the physics. */
+static void test_engine_knobs(double FS, double C) {
+    const uint32_t NC = 8192u;
+    const Layout LG = layout_default();
+    const Layout LA = make_aligned_grid(FS, C);
+    const float  off[3] = { 0.7f, 1.5f, -0.2f };        /* an off-center listener: where it can matter */
+    float src[3] = { LA.ref[0] + 1.4f*0.6f, LA.ref[1] + 1.4f*0.2f, LA.ref[2] - 1.4f*0.77f };
+
+    printf("\n  tracked alignment, DBAP, tracked solve (the listener IS the solve point)\n");
+    printf("  %-26s %10s %10s %10s %10s\n", "layout / listener", "miss off", "miss on", "comb off", "comb on");
+    ValidRender base, ta;
+    valid_render_init(&base);
+    valid_render_init(&ta); ta.tracked_align = 1;
+
+    double m0, m1, k0, k1;
+    /* the calibrated case: delays that align at the reference, listener elsewhere */
+    if (cell_of(&LA, BWA_PAN_DBAP, &base, off, src, FS, C, NC, &m0, &k0, NULL) &&
+        cell_of(&LA, BWA_PAN_DBAP, &ta,   off, src, FS, C, NC, &m1, &k1, NULL)) {
+        printf("  %-26s %10.2f %10.2f %10.2f %10.2f\n", "aligned grid / off-center", m0, m1, k0, k1);
+        CHECK(k1 < k0 - 0.2,
+              "tracked alignment LOWERS comb depth off-center on a time-aligned array");
+    } else CHECK(0, "the aligned-grid tracked-alignment cells resolve");
+
+    /* the control: at the layout reference the comp is identity, so nothing may move */
+    double r0, r1, c0, c1;
+    if (cell_of(&LA, BWA_PAN_DBAP, &base, LA.ref, src, FS, C, NC, &r0, &c0, NULL) &&
+        cell_of(&LA, BWA_PAN_DBAP, &ta,   LA.ref, src, FS, C, NC, &r1, &c1, NULL)) {
+        printf("  %-26s %10.2f %10.2f %10.2f %10.2f\n", "aligned grid / at the ref", r0, r1, c0, c1);
+        /* A TIGHT null on purpose. At the reference the compensation is bitwise identity, so these
+         * two cells must agree to rounding, not merely to a tolerance. The loose 0.5 deg / 0.15 dB
+         * this used to carry was wide enough to pass while measuring a bug: the OFF cell ran right
+         * after an ON cell on the cached core and opened its capture window while the aligner was
+         * still gliding home, reading 3.38 against a true 3.21. ve_settle now waits out that glide
+         * (g_ve.lc_dirty), and this bound is what stops the leak coming back unnoticed. */
+        CHECK(fabs(c1 - c0) < 0.01 && fabs(r1 - r0) < 0.02,
+              "...and is inert at the reference the trims were computed for (an exact null)");
+    } else CHECK(0, "the at-reference tracked-alignment cells resolve");
+
+    /* the built-in grid: nothing to re-reference, so the drop is partial. Reported, not asserted as a
+     * size — the point is that how much this knob buys is a property of the CALIBRATION under it. */
+    double g0, g1, gc0, gc1;
+    if (cell_of(&LG, BWA_PAN_DBAP, &base, off, src, FS, C, NC, &g0, &gc0, NULL) &&
+        cell_of(&LG, BWA_PAN_DBAP, &ta,   off, src, FS, C, NC, &g1, &gc1, NULL)) {
+        printf("  %-26s %10.2f %10.2f %10.2f %10.2f   <- no layout delays to re-reference\n",
+               "built-in grid / off-center", g0, g1, gc0, gc1);
+        CHECK(fabs(g1 - g0) > 0.5 || fabs(gc1 - gc0) > 0.1,
+              "tracked alignment still reaches the render on an un-delayed layout");
+    } else CHECK(0, "the built-in-grid tracked-alignment cells resolve");
+
+    /* ---- the hole-aware spread floor, on the one geometry that has holes ---- */
+    {
+        const Layout LB = make_barrel();
+        const float lis[3] = { 0.25f, 1.4f, -0.15f };    /* seated ear height, slightly off the axis */
+        /* Straight down FROM THE LISTENER: the barrel's open nadir, where the hull closes the hole
+         * with a triangle of distant speakers and the render is a split image rather than a phantom.
+         * The bearing has to be taken from the LISTENER, not from the layout reference — hole.c
+         * derives its gap against the tracked listener, and a bearing measured from the reference
+         * lands inside the knee here and floors at exactly 0. */
+        float low[3] = { lis[0], lis[1] - 1.0f, lis[2] };
+        /* Swept, not toggled, and that is the finding. `strength` scales a floor the geometry
+         * derives, and this barrel's nadir gap (59 deg against a 33.7 deg knee) derives only 0.45 at
+         * strength 1.0. Both measured numbers move the way the feature claims — comb down, the image
+         * more diffuse — but at 1.0 the diffuseness change is smaller than the scatter between
+         * neighboring bearings, so only the comb column resolves it. At 2.0 (the clamp, an
+         * exaggerated width) both do. Asserted accordingly: comb at every strength, diffuseness only
+         * where the floor is decisive. If you A/B this knob on the rig, read the comb column. */
+        const float STR[2] = { 1.0f, 2.0f };
+        ValidRender hoff;
+        valid_render_init(&hoff);
+        double hm0, hk0, hp0;
+        if (cell_of(&LB, BWA_PAN_VBAP, &hoff, lis, low, FS, C, NC, &hm0, &hk0, &hp0)) {
+            printf("\n  hole-aware spread floor, barrel (24 spk, open poles), source at the listener's nadir\n");
+            printf("  %-26s %10s %10s %12s\n", "VBAP, tracked solve", "miss deg", "comb dB", "diffuseness");
+            printf("  %-26s %10.2f %10.2f %12.3f\n", "floor off", hm0, hk0, hp0);
+            double hp_last = hp0;
+            for (int i = 0; i < 2; ++i) {
+                ValidRender hon;
+                valid_render_init(&hon); hon.hole_spread = STR[i];
+                double hm1, hk1, hp1;
+                char row[32];
+                if (!cell_of(&LB, BWA_PAN_VBAP, &hon, lis, low, FS, C, NC, &hm1, &hk1, &hp1)) {
+                    CHECK(0, "the barrel hole-spread cells resolve"); continue;
+                }
+                snprintf(row, sizeof row, "strength %.1f", (double)STR[i]);
+                printf("  %-26s %10.2f %10.2f %12.3f\n", row, hm1, hk1, hp1);
+                CHECK(hk1 < hk0, "the hole floor lowers comb depth (fewer near-equal coherent copies)");
+                hp_last = hp1;
+            }
+            CHECK(hp_last > hp0,
+                  "...and at a decisive floor it also reads as a more diffuse image, which is the claim");
+        } else CHECK(0, "the barrel hole-spread reference cell resolves");
+
+        /* the negative control the feature's own design promises: a source aimed at a speaker's own
+         * bearing is inside the knee, so the floor is 0 and the render must be untouched */
+        float atspk[3] = { LB.speakers[8].pos[0], LB.speakers[8].pos[1], LB.speakers[8].pos[2] };
+        ValidRender hfull;
+        valid_render_init(&hfull); hfull.hole_spread = 2.0f;
+        double am0, am1, ak0, ak1;
+        if (cell_of(&LB, BWA_PAN_VBAP, &hoff,  lis, atspk, FS, C, NC, &am0, &ak0, NULL) &&
+            cell_of(&LB, BWA_PAN_VBAP, &hfull, lis, atspk, FS, C, NC, &am1, &ak1, NULL))
+            CHECK(am0 == am1 && ak0 == ak1,
+                  "the hole floor is exactly inert at a covered bearing (0 floor, identical render)");
+    }
+
+    /* ---- every remaining knob: does it reach the feeds, and what does it move? ---- */
+    {
+        enum { FN = 4096 };
+        float* f0 = (float*)malloc(sizeof(float) * (size_t)BWA_CHANNELS * FN);
+        float* f1 = (float*)malloc(sizeof(float) * (size_t)BWA_CHANNELS * FN);
+        if (!f0 || !f1) { printf("FAIL: out of memory\n"); ++fails; free(f0); free(f1); return; }
+        /* a WIDE source: the spread modes and decorrelation act on the wide part, so with a point
+         * source they have nothing to do and a "no effect" reading would mean nothing */
+        float near_src[3] = { off[0] + 0.45f, off[1] + 0.1f, off[2] - 0.2f };
+        ValidRender b2;
+        valid_render_init(&b2); b2.spread = 0.5f;
+        struct { const char* name; ValidRender r; const float* src; } K[6];
+        int nk = 0;
+        for (int i = 0; i < 6; ++i) { K[i].r = b2; K[i].src = src; K[i].name = ""; }
+        K[nk].name = "dual-band";       K[nk].r.dual_band = 1;                          ++nk;
+        K[nk].name = "dual+CAP";        K[nk].r.dual_band = 1; K[nk].r.cap = 1;         ++nk;
+        K[nk].name = "spread MDAP";     K[nk].r.spread_mode = 1;                        ++nk;
+        K[nk].name = "spread spectral"; K[nk].r.spread_mode = 2;                        ++nk;
+        K[nk].name = "decorrelation";   K[nk].r.decorrelation = 1;                      ++nk;
+        /* 2 m, not 1. The floor is 1 - dist/radius, and at this source distance a 1 m radius derives
+         * 0.498, which the source's own 0.5 width already covers — so the knob would measure nothing
+         * and read exactly like a broken knob. Worth knowing before A/Bing it on the rig. */
+        K[nk].name = "near spread";     K[nk].r.near_spread = 2.0f; K[nk].src = near_src; ++nk;
+
+        printf("\n  the remaining knobs, DBAP on the built-in grid, source width 0.5\n");
+        printf("  %-18s %9s %9s %9s %9s %9s %9s\n", "knob",
+               "miss off", "miss on", "comb off", "comb on", "psi off", "psi on");
+        for (int i = 0; i < nk; ++i) {
+            double q0, q1, w0, w1, p0, p1;
+            ValidRender ref = b2;
+            if (!cell_of(&LG, BWA_PAN_DBAP, &ref,    off, K[i].src, FS, C, NC, &q0, &w0, &p0) ||
+                !cell_of(&LG, BWA_PAN_DBAP, &K[i].r, off, K[i].src, FS, C, NC, &q1, &w1, &p1)) {
+                CHECK(0, "the knob cells resolve"); continue;
+            }
+            printf("  %-18s %9.2f %9.2f %9.2f %9.2f %9.3f %9.3f\n",
+                   K[i].name, q0, q1, w0, w1, p0, p1);
+            /* The claim asserted is REACHABILITY, not a direction: which way dual-band or a spread
+             * mode moves a single-point intensity vector is a result about this array, and asserting
+             * it would bake today's answer into a regression test. What must hold is that the knob
+             * changes the speaker feeds at all — a flag that swept nothing was the whole reason for
+             * routing this arm through the engine. */
+            CHECK(valid_speaker_feeds(&LG, BWA_PAN_DBAP, &ref,    off, K[i].src, FS, f0, FN) &&
+                  valid_speaker_feeds(&LG, BWA_PAN_DBAP, &K[i].r, off, K[i].src, FS, f1, FN),
+                  "knob feeds build");
+            CHECK(memcmp(f0, f1, sizeof(float) * (size_t)LG.count * FN) != 0,
+                  "the knob reaches the speaker feeds");
+        }
+        free(f0); free(f1);
+    }
+    printf("\n");
 }
 
 /* ---- the SPCAP focus knob, made measurable -----------------------------------------------------
@@ -248,16 +596,17 @@ static void test_comb_sweep(const Layout* L, double FS, double C) {
     for (uint32_t sp = 0; sp < L->count; ++sp) {
         ValidCell rc;
         if (!valid_reference_cell(L, (int)sp, mic, FS, C, NC, &rc) || !rc.comb_ok) continue;
-        CHECK(rc.focus == 0.f && rc.density == 0.f, "a reference cell carries no panner tuning");
+        CHECK(rc.render.focus == 0.f && rc.render.density == 0.f, "a reference cell carries no panner tuning");
         float src[3] = { L->speakers[sp].pos[0], L->speakers[sp].pos[1], L->speakers[sp].pos[2] };
         double got[NF];
         int all = 1;
         for (int f = 0; f < NF; ++f) {
             ValidCell c;
-            if (!valid_cell(L, BWA_PAN_SPCAP, 1, mic, src, FS, C, FOCUS[f], 0.f, NC, &c) || !c.comb_ok) {
+            ValidRender rf; valid_render_init(&rf); rf.focus = FOCUS[f];
+            if (!valid_cell(L, BWA_PAN_SPCAP, &rf, 1, mic, src, FS, C, NC, &c) || !c.comb_ok) {
                 all = 0; break;
             }
-            CHECK(c.focus == FOCUS[f], "the cell records the focus it rendered at");
+            CHECK(c.render.focus == FOCUS[f], "the cell records the focus it rendered at");
             CHECK(c.comb_q >= 0.f && c.comb_q <= 1.f, "the comb quality is a 0..1 figure");
             qall[nq++] = c.comb_q;
             if (c.comb_q < worst_q) worst_q = c.comb_q;
@@ -324,7 +673,8 @@ static void test_comb_sweep(const Layout* L, double FS, double C) {
             int all = 1;
             for (int f = 0; f < NF; ++f) {
                 ValidCell c;
-                if (!valid_cell(L, BWA_PAN_SPCAP, 1, mic, src, FS, C, FOCUS[f], 0.f, NC, &c) ||
+                ValidRender rf; valid_render_init(&rf); rf.focus = FOCUS[f];
+                if (!valid_cell(L, BWA_PAN_SPCAP, &rf, 1, mic, src, FS, C, NC, &c) ||
                     !c.comb_ok || !c.ok) { all = 0; break; }
                 c1[f] = c.comb_db; m1[f] = c.miss_deg;
             }
@@ -346,10 +696,13 @@ static void test_comb_sweep(const Layout* L, double FS, double C) {
     {
         float src[3] = { L->ref[0] + 0.9f, L->ref[1] + 0.3f, L->ref[2] - 1.0f };
         ValidCell a, b;
-        CHECK(valid_cell(L, BWA_PAN_SPCAP, 1, mic, src, FS, C, 0.f, 0.f, NC, &a) &&
-              valid_cell(L, BWA_PAN_SPCAP, 1, mic, src, FS, C, L->spcap_focus, L->spcap_density, NC, &b),
+        ValidRender ra, rb;
+        valid_render_init(&ra);
+        valid_render_init(&rb); rb.focus = L->spcap_focus; rb.density = L->spcap_density;
+        CHECK(valid_cell(L, BWA_PAN_SPCAP, &ra, 1, mic, src, FS, C, NC, &a) &&
+              valid_cell(L, BWA_PAN_SPCAP, &rb, 1, mic, src, FS, C, NC, &b),
               "sentinel cells render");
-        CHECK(a.focus == L->spcap_focus && a.density == L->spcap_density,
+        CHECK(a.render.focus == L->spcap_focus && a.render.density == L->spcap_density,
               "focus/density <= 0 resolves to the LAYOUT's own values, not a stand-in default");
         CHECK(a.comb_db == b.comb_db && a.miss_deg == b.miss_deg,
               "...and renders identically to passing them explicitly");
@@ -357,8 +710,11 @@ static void test_comb_sweep(const Layout* L, double FS, double C) {
         /* DBAP has no lobe, so focus must not reach it at all. If this ever fails, focus has leaked
          * somewhere it does not belong. */
         ValidCell d1, d2;
-        CHECK(valid_cell(L, BWA_PAN_DBAP, 1, mic, src, FS, C,  2.0f, 0.f, NC, &d1) &&
-              valid_cell(L, BWA_PAN_DBAP, 1, mic, src, FS, C, 64.0f, 0.f, NC, &d2),
+        ValidRender rlo, rhi;
+        valid_render_init(&rlo); rlo.focus =  2.0f;
+        valid_render_init(&rhi); rhi.focus = 64.0f;
+        CHECK(valid_cell(L, BWA_PAN_DBAP, &rlo, 1, mic, src, FS, C, NC, &d1) &&
+              valid_cell(L, BWA_PAN_DBAP, &rhi, 1, mic, src, FS, C, NC, &d2),
               "DBAP cells render at two focus values");
         CHECK(d1.comb_db == d2.comb_db && d1.miss_deg == d2.miss_deg, "focus is inert under DBAP");
 
@@ -368,8 +724,8 @@ static void test_comb_sweep(const Layout* L, double FS, double C) {
         float* f1 = (float*)malloc(sizeof(float) * (size_t)BWA_CHANNELS * FN);
         float* f2 = (float*)malloc(sizeof(float) * (size_t)BWA_CHANNELS * FN);
         if (f1 && f2) {
-            CHECK(valid_speaker_feeds(L, BWA_PAN_SPCAP, mic, src, FS,  2.0f, 0.f, f1, FN) &&
-                  valid_speaker_feeds(L, BWA_PAN_SPCAP, mic, src, FS, 64.0f, 0.f, f2, FN),
+            CHECK(valid_speaker_feeds(L, BWA_PAN_SPCAP, &rlo, mic, src, FS, f1, FN) &&
+                  valid_speaker_feeds(L, BWA_PAN_SPCAP, &rhi, mic, src, FS, f2, FN),
                   "feeds build at two focus values");
             CHECK(memcmp(f1, f2, sizeof(float) * (size_t)L->count * FN) != 0,
                   "the hardware feed path sweeps focus too, not just the simulated field");
@@ -396,6 +752,9 @@ int main(void) {
     printf("[layout       ] %u speakers, sweet spot (%.2f, %.2f, %.2f)\n",
            L.count, L.ref[0], L.ref[1], L.ref[2]);
     test_feed_path(&L, FS, C);
+    test_engine_vs_direct(&L, FS);
+    test_engine_determinism(&L, FS, C);
+    test_engine_knobs(FS, C);
     test_comb_sweep(&L, FS, C);
 
     float elev[NEL] = { -25.0f, 0.0f, 25.0f };
@@ -427,8 +786,8 @@ int main(void) {
     ValidCell* fixed   = (ValidCell*)malloc(sizeof(ValidCell) * NPAN * NLIS * NTGT);
     if (!tracked || !fixed) { printf("FAIL: out of memory\n"); return 1; }
 
-    int nt = valid_run(&L, panners, NPAN, 1, lispos, NLIS, tg, NTGT, RADIUS, FS, C, 0.f, 0.f, NCAP, tracked);
-    int nf = valid_run(&L, panners, NPAN, 0, lispos, NLIS, tg, NTGT, RADIUS, FS, C, 0.f, 0.f, NCAP, fixed);
+    int nt = valid_run(&L, panners, NPAN, NULL, 1, lispos, NLIS, tg, NTGT, RADIUS, FS, C, NCAP, tracked);
+    int nf = valid_run(&L, panners, NPAN, NULL, 0, lispos, NLIS, tg, NTGT, RADIUS, FS, C, NCAP, fixed);
     CHECK(nt == NPAN * NLIS * NTGT && nf == nt, "the sweep fills every cell");
 
     int nok = 0;
@@ -542,7 +901,7 @@ int main(void) {
             if (rc.miss_deg > worst_ref) worst_ref = rc.miss_deg;
             /* the matched phantom: a rendered source AT that speaker's own position */
             float src[3] = { L.speakers[sp].pos[0], L.speakers[sp].pos[1], L.speakers[sp].pos[2] };
-            if (!valid_cell(&L, BWA_PAN_DBAP, 1, mic, src, FS, C, 0.f, 0.f, NCAP, &pc) || !pc.ok) continue;
+            if (!valid_cell(&L, BWA_PAN_DBAP, NULL, 1, mic, src, FS, C, NCAP, &pc) || !pc.ok) continue;
             if (nref < 4)
                 printf("[reference    ]   spk %2u: real %.2f  phantom-at-its-position %.2f deg\n",
                        sp, rc.miss_deg, pc.miss_deg);
@@ -585,7 +944,7 @@ int main(void) {
         valid_get_stimulus_band(&f_lo, &f_hi);
         CHECK(f_lo > 300.0 && f_hi <= ZYLIA_FOA_FMAX + 1.0, "broadband band is the first-order band");
         ValidCell bb;
-        CHECK(valid_cell(&L, BWA_PAN_DBAP, 1, mic, src, FS, C, 0.f, 0.f, 8192u, &bb) && bb.ok, "broadband cell");
+        CHECK(valid_cell(&L, BWA_PAN_DBAP, NULL, 1, mic, src, FS, C, 8192u, &bb) && bb.ok, "broadband cell");
 
         /* a tone above the array's first-order reach is refused WITH its frequency, not measured */
         CHECK(!valid_set_stimulus(VALID_STIM_TONE, 6000.0), "a 6 kHz tone is refused outright");
@@ -608,7 +967,7 @@ int main(void) {
             CHECK(f_lo < hz[i] && f_hi > hz[i], "the analysis band brackets the tone");
             ValidCell rc, tc;
             CHECK(valid_reference_cell(&L, 0, mic, FS, C, 8192u, &rc) && rc.ok, "reference tone cell");
-            CHECK(valid_cell(&L, BWA_PAN_DBAP, 1, mic, src, FS, C, 0.f, 0.f, 8192u, &tc) && tc.ok, "phantom tone cell");
+            CHECK(valid_cell(&L, BWA_PAN_DBAP, NULL, 1, mic, src, FS, C, 8192u, &tc) && tc.ok, "phantom tone cell");
             double dr = fabs((double)rc.miss_deg - rbb.miss_deg);
             double dp = fabs((double)tc.miss_deg - bb.miss_deg);
             if (dr > worst_ref_spread) worst_ref_spread = dr;

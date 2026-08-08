@@ -727,7 +727,7 @@ class Abx extends Base:
 class AmbisonicBed extends Base:
 	var spin := false
 	var parametric := false
-	var max_re := false
+	var max_re := true   # mirrors the engine default (ON)
 	var re_split := false
 	var yaw := 0.0
 	var pitch := 0.0

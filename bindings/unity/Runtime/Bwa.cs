@@ -24,7 +24,9 @@ namespace BwAudio
     public enum BwaDirectivity : int { Omni = 0, Cardioid = 1, Figure8 = 2 }
     public enum BwaTestKind : int { Off = 0, Sine = 1, Noise = 2 }
     public enum BwaPanner : int { Dbap = 0, Spcap = 1, Vbap = 2 }
-    public enum BwaBedDecoder : int { Allrad = 0, Epad = 1 }   // sampling is no longer selectable (internal fallback)
+    // Value 0 is RESERVED for default-init and mirrors the C enum: it means "the engine's current
+    // default", not a named algorithm, so the default can move without an ABI break.
+    public enum BwaBedDecoder : int { Default = 0, Allrad = 1, Epad = 2 }
     public enum BwaSpreadMode : int { Lobe = 0, Mdap = 1, Spectral = 2 }
     public enum BwaBedRenderer : int { Matrix = 0, Parametric = 1 }
 
@@ -65,7 +67,7 @@ namespace BwAudio
         [MarshalAs(UnmanagedType.LPUTF8Str)] public string asioDriver;  // ASIO driver name; null = auto-pick
         [MarshalAs(UnmanagedType.I1)] public bool embree;               // Embree ray tracing (falls back if absent)
         [MarshalAs(UnmanagedType.I1)] public bool enablePathing;        // sound-pathing sim at bwa_start (needs SDK + scene)
-        public BwaBedDecoder bedDecoder;                                 // diffuse-bed decoder; 0 = AllRAD (default)
+        public BwaBedDecoder bedDecoder;                                 // diffuse-bed decoder; 0 = the engine default
         public uint reserved0, reserved1, reserved2, reserved3;         // matches reserved[4]; keep zero
     }
 
@@ -458,6 +460,35 @@ namespace BwAudio
         // takes the default. Live A/B; off glides back to the layout's own trims.
         [DllImport(DLL, CallingConvention = CC)] public static extern void bwa_set_tracked_align(IntPtr e, [MarshalAs(UnmanagedType.I1)] bool on);
         [DllImport(DLL, CallingConvention = CC)] public static extern void bwa_set_tracked_align_guards(IntPtr e, float deadZoneM, float slewFramesPerS);
+
+        // Situation tuning. Fill a BwaTuning from a preset, edit what you disagree with, apply it.
+        // NEVER apply a default(BwaTuning): this struct's zero is not its default (it would force
+        // max-rE off), which is exactly what structSize makes fail loudly.
+        public enum BwaSetup : int { Default = 0, Seated = 1, Roaming = 2 }
+
+        [StructLayout(LayoutKind.Sequential)]
+        public struct BwaTuning
+        {
+            public uint structSize;
+            public BwaPanner panner;
+            public float spcapFocus, spcapDensity;
+            [MarshalAs(UnmanagedType.I1)] public bool dualBand;
+            [MarshalAs(UnmanagedType.I1)] public bool dualBandCap;
+            public BwaSpreadMode spreadMode;
+            [MarshalAs(UnmanagedType.I1)] public bool decorrelation;
+            public float nearSpread, holeSpread;
+            [MarshalAs(UnmanagedType.I1)] public bool maxRe;
+            [MarshalAs(UnmanagedType.I1)] public bool maxReSplit;
+            public BwaBedRenderer bedRenderer;
+            [MarshalAs(UnmanagedType.I1)] public bool trackedRoomEq;
+            [MarshalAs(UnmanagedType.I1)] public bool trackedAlign;
+            public float alignDeadZoneM, alignSlewFramesPerSecond;
+            public uint r0, r1, r2, r3;
+        }
+
+        [DllImport(DLL, CallingConvention = CC)] public static extern void bwa_tuning_preset(BwaSetup setup, out BwaTuning outTuning);
+        [DllImport(DLL, CallingConvention = CC)] [return: MarshalAs(UnmanagedType.I1)]
+        public static extern bool bwa_apply_tuning(IntPtr e, ref BwaTuning t);
         // Offline panner evaluation (no engine handle): out = nsrc*n gains for a layout/panner; for layout scoring.
         // focus/density are SPCAP's tuning knobs, same <= 0 = default sentinel as bwa_set_spcap_focus, and
         // inert under DBAP/VBAP. Pass 0, 0 to score at the focus this array's geometry derives.

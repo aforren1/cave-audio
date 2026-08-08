@@ -207,9 +207,10 @@ infinity through the engine's real decode build (`bwa_bed_gains_batch`), evaluat
 over the same shell, condition, and observer model. To *optimize* for it too, pass
 `bed=<wt>` (or the GUI's `bed wt` slider): the bed's mean/worst blend joins the
 cost at that weight. 0 keeps the historical point-source-only objective. The row
-grades AllRAD without max-rE by default (the engine defaults); an install that
-ships EPAD or `bwa_set_max_re` passes `epad` / `maxre` (GUI: the bed decode combo
-and max-rE checkbox) so the score matches the render, not a sibling of it.
+grades AllRAD with max-rE by default, which is what the engine now defaults to; an
+install that ships EPAD passes `epad` (GUI: the bed decode combo and max-rE
+checkbox) so the score matches the render, not a sibling of it. Pass `maxre` to
+force the taper on when you have turned it off some other way.
 
 Measured on the dome: point-source optimization already does most of the bed's
 work for free (bed 23.9°/126.8° at the seed, 17.0°/54.0° after a plain DBAP

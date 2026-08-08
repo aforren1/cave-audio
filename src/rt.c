@@ -3888,6 +3888,14 @@ RtCore* rt_create(uint32_t req_voice_cap, uint32_t sound_cap, uint32_t sample_ra
     c->master_g_cur = 1.f;
     for (int j = 0; j < BWA_GROUPS; ++j) c->group_gain[j] = 1.f;        /* mix groups start at unity, unpaused */
     /* protection limiter: ON at -1 dBFS by default; ~1 ms attack / ~120 ms release one-poles */
+    /* max-rE bed taper: ON. It was off through the bake-off and the offline evidence flipped it. The
+     * layout tool's bed metric (bwa_bed_gains_batch, the engine's real AllRAD/EPAD builds) has the
+     * taper winning EVERY axis on this array, under both decoders and both observer models, including
+     * AT the sweet spot where classical theory says the plain decode should win: an irregular
+     * 26-array's decode sidelobes bend rE even at center, and the taper suppresses them. The rig trial
+     * now confirms rather than gates (docs/hardware-validation.md). Point-source panning is untouched;
+     * this is the diffuse layer only. */
+    atomic_store_explicit(&c->max_re, 1, memory_order_relaxed);
     atomic_store_explicit(&c->lim_on, 1, memory_order_relaxed);
     atomic_store_explicit(&c->lim_ceiling, 0.891251f, memory_order_relaxed);   /* 10^(-1/20) */
     c->lim_gain  = 1.0f;

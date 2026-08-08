@@ -3,8 +3,10 @@
  *
  * Render a source in a known direction, capture it with the ZM-1 at a known listening position,
  * estimate the direction of arrival, report the angular miss. Sweep that over directions, over
- * panners, over tracked-vs-fixed rendering, and over listener positions, and you have graded the
- * layout, the panner and the calibration with numbers instead of opinions. See docs/validation.md.
+ * panners, over tracked-vs-fixed rendering, over the engine's live A/B knobs, and over listener
+ * positions, and you have graded the layout, the panner and the calibration with numbers instead of
+ * opinions. The phantom arm renders through a REAL ENGINE CORE (valid.h), which is what makes the
+ * knobs sweepable at all. See docs/validation.md.
  *
  * THE SESSION SHAPE, and why it is cheap. Phantom sources are rendered, not carried, so a whole
  * direction grid sweeps electronically from one microphone placement. Only the MICROPHONE moves.
@@ -14,7 +16,7 @@
  *
  *   for each microphone placement (you move the ZM-1, the tool waits):
  *       check the capsules once, report anything faulty, exclude it for the rest of the placement
- *       for each panner x {tracked, fixed} x direction:  render -> capture -> score
+ *       for each condition x {tracked, fixed} x direction:  render -> capture -> score
  *
  * ONE session loop, two capture backends. The simulated path is not a shortcut around the hardware
  * path — it is the same loop with the analytic field substituted for the device, so --simulate
@@ -50,25 +52,71 @@ extern "C" {
 #define MAX_TGT   (36 * 3 + BWA_CHANNELS)
 #define NPAN      3
 #define MAX_FOCUS 6
+#define MAX_LIST  6        /* values per swept knob (--focus, --hole-spread, --near-spread) */
+#define MAX_COND  96       /* measured conditions; a factorial past this is refused, with the count */
 #define LBL       32
+#define CLBL      48       /* condition-label width */
 
 static const char* pan_name(int p) {
     return p == BWA_PAN_DBAP ? "DBAP" : (p == BWA_PAN_SPCAP ? "SPCAP" : "VBAP");
 }
 
-/* One measured CONDITION: a panner at one SPCAP focus. Focus is inert under DBAP and VBAP, so those
- * two get exactly one condition however long the --focus list is — sweeping them would re-measure an
- * identical cell and cost rig time for nothing. The focus stored here is already RESOLVED (the <= 0
- * sentinel is applied in main), so it compares bit-exactly against the value valid_score writes into
- * each cell, which is how the reports below sort cells back into conditions. */
-typedef struct { int panner; float focus; } Cond;
+/* One measured CONDITION: a panner plus the render settings it is measured at (ValidRender — the
+ * live engine knobs, valid.h). The phantom arm renders through a real engine core, so every one of
+ * them reaches the speaker feeds and can be swept.
+ *
+ * Focus is inert under DBAP and VBAP, so those two never get more than one condition per focus value
+ * however long the --focus list is — sweeping them would re-measure an identical cell and cost rig
+ * time for nothing. The settings stored here are already RESOLVED (the <= 0 focus sentinel is applied
+ * in main), so they compare field-for-field against what valid_score wrote into each cell, which is
+ * how the reports below sort cells back into conditions. */
+typedef struct { int panner; ValidRender r; } Cond;
 
-/* "SPCAP f 12.70" / "DBAP         ". The focus column is BLANK where focus has no meaning, because a
- * number printed beside DBAP would read as a setting that did something. */
+static void tag_add(char* k, size_t cap, const char* s) {
+    size_t at = strlen(k);
+    if (at && at + 1 < cap) { k[at++] = '+'; k[at] = 0; }
+    snprintf(k + at, cap - at, "%s", s);
+}
+
+/* "SPCAP f 12.70 dual+cap" / "DBAP          -". Two columns after the panner: the SPCAP focus, and
+ * the knobs that are ON. The focus column is BLANK under DBAP/VBAP, because a number printed beside
+ * a panner with no lobe would read as a setting that did something. A row with nothing on reads "-",
+ * so the baseline is never confused with a truncated label. */
 static const char* cond_label(const Cond* c, char* buf, int cap) {
-    if (c->panner == BWA_PAN_SPCAP) snprintf(buf, (size_t)cap, "%-5s f%6.2f", pan_name(c->panner), c->focus);
-    else                            snprintf(buf, (size_t)cap, "%-5s        ", pan_name(c->panner));
+    char f[12], k[64], t[24];
+    k[0] = 0;
+    if (c->panner == BWA_PAN_SPCAP) snprintf(f, sizeof f, "f%6.2f", c->r.focus);
+    else                            snprintf(f, sizeof f, "       ");
+    if (c->r.dual_band)             tag_add(k, sizeof k, c->r.cap ? "dual+cap" : "dual");
+    if (c->r.hole_spread > 0.f)   { snprintf(t, sizeof t, "hole%.2f", c->r.hole_spread); tag_add(k, sizeof k, t); }
+    if (c->r.tracked_align)         tag_add(k, sizeof k, "talign");
+    if (c->r.spread_mode == 1)      tag_add(k, sizeof k, "mdap");
+    else if (c->r.spread_mode == 2) tag_add(k, sizeof k, "spectral");
+    if (c->r.decorrelation)         tag_add(k, sizeof k, "decorr");
+    if (c->r.near_spread > 0.f)   { snprintf(t, sizeof t, "near%.2f", c->r.near_spread); tag_add(k, sizeof k, t); }
+    if (c->r.spread > 0.f)        { snprintf(t, sizeof t, "spr%.2f", c->r.spread); tag_add(k, sizeof k, t); }
+    if (!k[0]) snprintf(k, sizeof k, "-");
+    snprintf(buf, (size_t)cap, "%-5s %s %-20s", pan_name(c->panner), f, k);
     return buf;
+}
+
+/* Append one condition, or count it as overflow. Split out because the builder in main emits from
+ * eight places and a silently truncated condition list would be a measured session missing a row.
+ *
+ * DUPLICATES ARE DROPPED, and a factorial needs that: CAP implies dual-band, so the cross product
+ * asks for (dual off, cap on) and gets (dual on, cap on), which some other cell of the product
+ * already covers. A duplicate condition would measure the same cells twice and then match both of
+ * them in every report below. */
+static void cond_emit(Cond* cond, int* n, int* over, int panner, const ValidRender* r) {
+    for (int i = 0; i < *n; ++i)
+        if (cond[i].panner == panner && valid_render_equal(&cond[i].r, r)) return;
+    if (*n < MAX_COND) { cond[*n].panner = panner; cond[*n].r = *r; ++(*n); }
+    else ++(*over);
+}
+
+/* Does this cell belong to this condition? Panner plus every render setting, field for field. */
+static int cell_in_cond(const ValidCell* c, const Cond* q) {
+    return c->panner == q->panner && valid_render_equal(&c->render, &q->r);
 }
 
 /* ---- capture backends behind one shape ------------------------------------------------------ */
@@ -78,10 +126,9 @@ typedef struct {
     float*        feeds;        /* scratch for the hardware path: [nspk][VAL_CAPLEN] */
     int           inject;       /* capsule to corrupt, or -1 — a self-check, see --inject-fault */
     unsigned int  rng;
-    float         density;      /* SPCAP placement-correction exponent, one value for the whole run */
 } CapCtx;
 
-typedef int (*CaptureFn)(CapCtx*, int panner, float focus, const float solve[3], const float mic[3],
+typedef int (*CaptureFn)(CapCtx*, const Cond* q, const float solve[3], const float mic[3],
                          const float src[3], float* cap19);
 
 /* Corrupt one capsule the way a real fault does: broadband self-noise, well above the array's own
@@ -102,19 +149,19 @@ static void inject_fault(CapCtx* ctx, float* cap19, int ch) {
     }
 }
 
-static int cap_simulate(CapCtx* ctx, int panner, float focus, const float solve[3], const float mic[3],
+static int cap_simulate(CapCtx* ctx, const Cond* q, const float solve[3], const float mic[3],
                         const float src[3], float* cap19) {
-    if (!valid_simulate(ctx->L, panner, solve, mic, src, VAL_FS, 343.0, focus, ctx->density,
+    if (!valid_simulate(ctx->L, q->panner, &q->r, solve, mic, src, VAL_FS, 343.0,
                         cap19, VAL_ANALYZE)) return 0;
     if (ctx->inject >= 0) inject_fault(ctx, cap19, ctx->inject);
     return 1;
 }
 
 #ifdef BWA_HAVE_ASIO
-static int cap_asio(CapCtx* ctx, int panner, float focus, const float solve[3], const float mic[3],
+static int cap_asio(CapCtx* ctx, const Cond* q, const float solve[3], const float mic[3],
                     const float src[3], float* cap19) {
     (void)mic;                                            /* the room decides what the mic hears */
-    if (!valid_speaker_feeds(ctx->L, panner, solve, src, VAL_FS, focus, ctx->density,
+    if (!valid_speaker_feeds(ctx->L, q->panner, &q->r, solve, src, VAL_FS,
                              ctx->feeds, VAL_CAPLEN)) return 0;
     if (!valid_asio_capture(ctx->feeds, cap19)) return 0;
     if (ctx->inject >= 0) inject_fault(ctx, cap19, ctx->inject);
@@ -227,7 +274,7 @@ static void track_apply(TrackCtx* T, const float p[3], const float q[4], int li,
                     (double)(mic_out[2]-plan[2])*(mic_out[2]-plan[2]));
     printf("  tracked: (%.3f, %.3f, %.3f)  planned (%.2f, %.2f, %.2f)  delta %.0f mm\n",
            mic_out[0], mic_out[1], mic_out[2], plan[0], plan[1], plan[2], d * 1000.0);
-    if (d > 0.5) printf("  WARNING: half a meter from the plan — right rigid body? right frame?\n");
+    if (d > 0.5) printf("  WARNING: half a meter from the plan - right rigid body? right frame?\n");
 }
 
 static int track_place(void* user, int li, float mic_out[3]) {
@@ -251,7 +298,7 @@ static int track_place(void* user, int li, float mic_out[3]) {
         Sleep(10);
     }
     fprintf(stderr, "  no LIVE pose for the tracked rigid body (occluded, wrong id, or Motive not "
-                    "streaming) — refusing to reuse a stale one\n");
+                    "streaming) - refusing to reuse a stale one\n");
     return 0;
 }
 
@@ -341,14 +388,13 @@ static int run_session(const Layout* L, CaptureFn cap, CapCtx* ctx,
                         const float* solve = tracked ? lis[li] : L->ref;
                         ValidCell* c = &cells[w];
                         int got = 0;
-                        if (cap(ctx, cond[ci].panner, cond[ci].focus, solve, lis[li], src, cap19))
-                            got = valid_score(L, cond[ci].panner, tracked, lis[li], src,
-                                              cap19, VAL_ANALYZE, VAL_FS, 343.0,
-                                              cond[ci].focus, ctx->density, flags, c);
+                        if (cap(ctx, &cond[ci], solve, lis[li], src, cap19))
+                            got = valid_score(L, cond[ci].panner, &cond[ci].r, tracked, lis[li], src,
+                                              cap19, VAL_ANALYZE, VAL_FS, 343.0, flags, c);
                         if (!got) {
                             memset(c, 0, sizeof *c);
                             c->panner = cond[ci].panner; c->tracked = tracked;
-                            c->focus = cond[ci].focus;   c->density = ctx->density;
+                            c->render = cond[ci].r;
                         }
                         c->lis = li; c->tgt = (int)sp; c->reference = 2;
                         ++w;
@@ -365,7 +411,7 @@ static int run_session(const Layout* L, CaptureFn cap, CapCtx* ctx,
                     ValidCell* c = &cells[w];
                     int got = 0;
 
-                    if (cap(ctx, cond[ci].panner, cond[ci].focus, solve, lis[li], src, cap19)) {
+                    if (cap(ctx, &cond[ci], solve, lis[li], src, cap19)) {
                         /* ONE capsule check per placement, on its first capture: a fault is a
                          * property of the session, and re-checking every cell would only cost time.
                          * Anything flagged is excluded from every cell that follows. */
@@ -374,7 +420,7 @@ static int run_session(const Layout* L, CaptureFn cap, CapCtx* ctx,
                             for (int j = 0; j < ZYLIA_MICS; ++j) ptr[j] = cap19 + (size_t)j * VAL_ANALYZE;
                             int nb = zylia_check_capsules(ptr, VAL_ANALYZE, flags);
                             if (nb > 0) {
-                                printf("  capsule check: %d FAULTY —", nb);
+                                printf("  capsule check: %d FAULTY  - ", nb);
                                 for (int j = 0; j < ZYLIA_MICS; ++j)
                                     if (flags[j]) printf(" ch%d(0x%02X)", j, flags[j]);
                                 printf("  (excluded for this placement)\n");
@@ -383,14 +429,13 @@ static int run_session(const Layout* L, CaptureFn cap, CapCtx* ctx,
                             if (nchecked) ++(*nchecked);
                             checked = 1;
                         }
-                        got = valid_score(L, cond[ci].panner, tracked, lis[li], src,
-                                          cap19, VAL_ANALYZE, VAL_FS, 343.0,
-                                          cond[ci].focus, ctx->density, flags, c);
+                        got = valid_score(L, cond[ci].panner, &cond[ci].r, tracked, lis[li], src,
+                                          cap19, VAL_ANALYZE, VAL_FS, 343.0, flags, c);
                     }
                     if (!got) {
                         memset(c, 0, sizeof *c);
                         c->panner = cond[ci].panner; c->tracked = tracked;
-                        c->focus = cond[ci].focus;   c->density = ctx->density;
+                        c->render = cond[ci].r;
                     }
                     c->lis = li; c->tgt = t;
                     ++w;
@@ -405,14 +450,13 @@ static int run_session(const Layout* L, CaptureFn cap, CapCtx* ctx,
             int nt = 0, nf = 0, nct = 0, ncf = 0;
             for (int i = 0; i < w; ++i) {
                 ValidCell* c = &cells[i];
-                if (c->lis != li || c->reference || c->panner != cond[ci].panner ||
-                    c->focus != cond[ci].focus) continue;
+                if (c->lis != li || c->reference || !cell_in_cond(c, &cond[ci])) continue;
                 if (c->ok)      { if (c->tracked) mt[nt++]  = c->miss_deg; else mf[nf++]  = c->miss_deg; }
                 if (c->comb_ok) { if (c->tracked) ct[nct++] = c->comb_db;  else cf[ncf++] = c->comb_db; }
             }
             if (!nt || !nf) continue;
-            char cl[32];
-            printf("  %-13s  miss tracked %5.1f  fixed %5.1f deg", cond_label(&cond[ci], cl, sizeof cl),
+            char cl[CLBL];
+            printf("  %-36s miss tracked %5.1f  fixed %5.1f deg", cond_label(&cond[ci], cl, sizeof cl),
                    valid_median(mt, nt), valid_median(mf, nf));
             if (nct && ncf)
                 printf("   comb tracked %5.2f  fixed %5.2f dB", valid_median(ct, nct), valid_median(cf, ncf));
@@ -421,6 +465,33 @@ static int run_session(const Layout* L, CaptureFn cap, CapCtx* ctx,
     }
     free(cap19);
     return w;
+}
+
+/* off|on|both -> {0} / {1} / {0,1}. Element 0 is the baseline, so "both" always measures OFF as the
+ * baseline and ON as the one-knob variant. */
+static int parse_onoff(const char* s, int* out, int* n) {
+    if (!strcmp(s, "off"))  { out[0] = 0; *n = 1; return 1; }
+    if (!strcmp(s, "on"))   { out[0] = 1; *n = 1; return 1; }
+    if (!strcmp(s, "both")) { out[0] = 0; out[1] = 1; *n = 2; return 1; }
+    return 0;
+}
+
+/* "1,2.5,4" -> a float list. Same shape as --focus, and the same rule: element 0 is the baseline. */
+static int parse_flist(const char* s, float* out, int cap, int* n, int allow_zero) {
+    int w = 0;
+    while (*s && w < cap) {
+        char* endp = NULL;
+        double v = strtod(s, &endp);
+        if (endp == s) return 0;
+        if (!(v > 0.0) && !allow_zero) return 0;
+        if (v < 0.0) return 0;
+        out[w++] = (float)v;
+        s = endp;
+        while (*s == ',' || *s == ' ') ++s;
+    }
+    if (!w || *s) return 0;
+    *n = w;
+    return 1;
 }
 
 int main(int argc, char** argv) {
@@ -439,6 +510,17 @@ int main(int argc, char** argv) {
     float focus_req[MAX_FOCUS] = { 0.f };   /* 0 = the array's derived default, resolved below */
     int   nfocus = 1;
     float density = 0.f;             /* 0 = the layout's own */
+    /* The swept knob axes. Element 0 of each is the BASELINE value, and by default only element 0
+     * appears in combination with the others: see the condition builder below. */
+    int   ax_db[2] = { 0, 0 };  int n_db = 1;      /* dual-band */
+    int   ax_cp[2] = { 0, 0 };  int n_cp = 1;      /* CAP on the dual-band low band */
+    int   ax_ta[2] = { 0, 0 };  int n_ta = 1;      /* tracked alignment */
+    int   ax_dc[2] = { 0, 0 };  int n_dc = 1;      /* decorrelation */
+    int   ax_sm[3] = { 0, 0, 0 }; int n_sm = 1;    /* spread mode */
+    float ax_hs[MAX_LIST] = { 0.f }; int n_hs = 1; /* hole-aware spread floor strength */
+    float ax_ns[MAX_LIST] = { 0.f }; int n_ns = 1; /* near-listener widening radius */
+    float spread = 0.f;              /* the source's own width; the spread knobs act on this */
+    int   factorial = 0;             /* opt in to the full cross product (see the builder) */
     static float lis[MAX_LIS][3];
     static char  lisname[MAX_LIS][LBL];
     int nlis_cli = 0;
@@ -461,6 +543,36 @@ int main(int argc, char** argv) {
         else if (!strcmp(argv[i], "--track-sim"))                   track_sim = 1;
         else if (!strcmp(argv[i], "--no-reference"))                do_ref = 0;
         else if (!strcmp(argv[i], "--density")   && i+1 < argc)     density = (float)atof(argv[++i]);
+        else if (!strcmp(argv[i], "--factorial"))                   factorial = 1;
+        else if (!strcmp(argv[i], "--spread")    && i+1 < argc)     spread = (float)atof(argv[++i]);
+        else if (!strcmp(argv[i], "--dual-band") && i+1 < argc) {
+            if (!parse_onoff(argv[++i], ax_db, &n_db)) { fprintf(stderr, "--dual-band wants off|on|both\n"); return 2; }
+        }
+        else if (!strcmp(argv[i], "--cap") && i+1 < argc) {
+            if (!parse_onoff(argv[++i], ax_cp, &n_cp)) { fprintf(stderr, "--cap wants off|on|both\n"); return 2; }
+        }
+        else if (!strcmp(argv[i], "--tracked-align") && i+1 < argc) {
+            if (!parse_onoff(argv[++i], ax_ta, &n_ta)) { fprintf(stderr, "--tracked-align wants off|on|both\n"); return 2; }
+        }
+        else if (!strcmp(argv[i], "--decorrelation") && i+1 < argc) {
+            if (!parse_onoff(argv[++i], ax_dc, &n_dc)) { fprintf(stderr, "--decorrelation wants off|on|both\n"); return 2; }
+        }
+        else if (!strcmp(argv[i], "--spread-mode") && i+1 < argc) {
+            const char* m = argv[++i];
+            if      (!strcmp(m, "lobe"))     { ax_sm[0] = 0; n_sm = 1; }
+            else if (!strcmp(m, "mdap"))     { ax_sm[0] = 1; n_sm = 1; }
+            else if (!strcmp(m, "spectral")) { ax_sm[0] = 2; n_sm = 1; }
+            else if (!strcmp(m, "all"))      { ax_sm[0] = 0; ax_sm[1] = 1; ax_sm[2] = 2; n_sm = 3; }
+            else { fprintf(stderr, "--spread-mode wants lobe|mdap|spectral|all\n"); return 2; }
+        }
+        else if (!strcmp(argv[i], "--hole-spread") && i+1 < argc) {
+            if (!parse_flist(argv[++i], ax_hs, MAX_LIST, &n_hs, 1)) {
+                fprintf(stderr, "--hole-spread wants a value (or comma-separated list) in 0..2; 0 is off\n"); return 2; }
+        }
+        else if (!strcmp(argv[i], "--near-spread") && i+1 < argc) {
+            if (!parse_flist(argv[++i], ax_ns, MAX_LIST, &n_ns, 1)) {
+                fprintf(stderr, "--near-spread wants a radius in meters (or a list); 0 is off\n"); return 2; }
+        }
         else if (!strcmp(argv[i], "--focus")     && i+1 < argc) {
             /* one value, or a comma-separated sweep. Each value is a separate measured condition for
              * SPCAP and is ignored by the other two panners (focus has no meaning there). */
@@ -498,8 +610,9 @@ int main(int argc, char** argv) {
             ++nlis_cli;
         }
         else if (!strcmp(argv[i], "--help") || !strcmp(argv[i], "-h")) {
-            printf("bwa_validate — measure where the array actually puts a phantom source\n\n"
-                   "  --simulate            run the whole flow with no hardware (analytic field)\n"
+            printf("bwa_validate - measure where the array actually puts a phantom source\n\n"
+                   "  --simulate            run the whole flow with no hardware: the engine renders\n"
+                   "                        the feeds, they propagate to the capsules analytically\n"
                    "  --layout <path>       cave_layout.json (default: the built-in grid)\n"
                    "  --driver <name>       ASIO driver (default: first with enough channels)\n"
                    "  --mic-in <n>          first Zylia input channel (default 0)\n"
@@ -517,6 +630,29 @@ int main(int argc, char** argv) {
                    "                        array's geometry-derived value.\n"
                    "  --density <v>          SPCAP placement-correction exponent (default: the\n"
                    "                        layout's, 2.0). One value for the whole run.\n"
+                   "\n"
+                   "  The phantom arm renders through a real engine, so these live A/B knobs are\n"
+                   "  measurable. Each is a swept AXIS: the first value is the baseline, and by\n"
+                   "  default every other value is measured ONE AT A TIME against that baseline\n"
+                   "  (N extra conditions, not 2^N). --factorial measures the cross product.\n"
+                   "  --dual-band off|on|both   ~700 Hz split: amplitude LF, power HF\n"
+                   "  --cap off|on|both     ITD-exact low band. REQUIRES dual-band, and a cap\n"
+                   "                        condition turns it on for you (labelled dual+cap).\n"
+                   "                        Measured facing room-ahead only: this tool cannot see\n"
+                   "                        CAP's head-rotation claim (docs/validation.md).\n"
+                   "  --tracked-align off|on|both  re-reference the per-speaker delay/gain trims\n"
+                   "                        onto the solve listener. Inert at the layout reference.\n"
+                   "  --hole-spread <v[,v]> hole-aware spread floor strength (0 = off). Inert on\n"
+                   "                        an array with no holes, by construction.\n"
+                   "  --spread-mode lobe|mdap|spectral|all   how width renders\n"
+                   "  --decorrelation off|on|both  velvet-noise decorrelation of the wide part\n"
+                   "  --near-spread <v[,v]> near-listener widening radius, meters (0 = off)\n"
+                   "  --spread <0..1>       the SOURCE's own width. The three knobs above act on\n"
+                   "                        the wide part of a source, so with spread 0 and no floor\n"
+                   "                        engaged they have nothing to do. Set it to sweep them.\n"
+                   "  --factorial           measure the full cross product instead of one knob at\n"
+                   "                        a time. Cells explode; the count is printed either way.\n"
+                   "\n"
                    "  --out <file.csv>      write every cell\n"
                    "  --no-prompt           don't wait for ENTER between placements (unattended runs)\n"
                    "  --track <id|name>     follow the ZM-1's stand as a tracked rigid body: the pose\n"
@@ -536,7 +672,7 @@ int main(int argc, char** argv) {
                    "  --no-reference        skip the physical reference arm (each speaker driven\n"
                    "                        alone). That arm is what makes a phantom miss a CONTRAST\n"
                    "                        against a real source rather than an absolute number, and\n"
-                   "                        it is the fastest check that the chain is sane at all —\n"
+                   "                        it is the fastest check that the chain is sane at all  - \n"
                    "                        only skip it to save rig time.\n"
                    "  --track-sim           SELF-CHECK: drive the tracked path from a synthetic mount\n"
                    "                        pose, no rig. Still needs --survey. Nonzero exit if the\n"
@@ -582,33 +718,118 @@ int main(int argc, char** argv) {
      * announcing "(yours)" would run a whole session at the wrong places and say they were yours. */
     int user_pos = (nlis > 0);
     if (!nlis) {
-        if (posfile) fprintf(stderr, "note: %s held no placements — falling back to the defaults\n", posfile);
+        if (posfile) fprintf(stderr, "note: %s held no placements - falling back to the defaults\n", posfile);
         nlis = default_listeners(lis, lisname, L.ref);
     }
     printf("placements: %d %s\n", nlis,
-           user_pos ? "(yours)" : "(defaults — pass --position/--positions for the real ones)");
+           user_pos ? "(yours)" : "(defaults - pass --position/--positions for the real ones)");
 
     const int panners[NPAN] = { BWA_PAN_DBAP, BWA_PAN_SPCAP, BWA_PAN_VBAP };
 
-    /* Resolve the <= 0 focus sentinel HERE, once, against the layout the run actually loaded. From
-     * this point every condition carries a real number, which is what lets a cell be matched back to
-     * its condition by plain equality against the value valid_score recorded. */
-    static Cond cond[NPAN * MAX_FOCUS];
-    int ncond = 0;
+    /* ---- the condition space ----
+     *
+     * Resolve the <= 0 focus sentinel HERE, once, against the layout the run actually loaded. From
+     * this point every condition carries real numbers, which is what lets a cell be matched back to
+     * its condition by plain field equality against what valid_score recorded.
+     *
+     * ONE KNOB AT A TIME IS THE DEFAULT, and the reason is rig time. A full factorial over these
+     * axes is 2^N sessions' worth of cells and answers a question nobody asked: what settles a knob
+     * is its contrast against a fixed baseline, measured on the same directions at the same
+     * placements. So the builder emits the baseline plus one condition per non-baseline value, which
+     * is N extra passes. --factorial takes the cross product when an interaction is genuinely
+     * suspected, and the cell count is printed before anything is measured either way.
+     *
+     * CAP is the one dependency: it touches the dual-band low band and nothing else, so a cap
+     * condition turns dual-band on with it rather than measuring a knob that provably did nothing. */
+    if (n_cp == 1 && ax_cp[0] == 1 && n_db == 1 && ax_db[0] == 0) {
+        fprintf(stderr, "--cap on with --dual-band off measures nothing: CAP replaces the dual-band\n"
+                        "low band, and with no dual-band there is no low band to replace. Pass\n"
+                        "--dual-band on. (A cap VARIANT condition turns dual-band on for itself; a\n"
+                        "cap BASELINE cannot, because there is nothing left to vary against.)\n");
+        return 2;
+    }
     for (int fi = 0; fi < nfocus; ++fi)
         if (!(focus_req[fi] > 0.f)) focus_req[fi] = L.spcap_focus;
-    for (int p = 0; p < NPAN; ++p) {
-        int nf = (panners[p] == BWA_PAN_SPCAP) ? nfocus : 1;
-        for (int fi = 0; fi < nf; ++fi) {
-            cond[ncond].panner = panners[p];
-            cond[ncond].focus  = focus_req[fi];
-            ++ncond;
+    if (!(density > 0.f)) density = L.spcap_density;   /* the same sentinel, resolved the same once */
+
+    static Cond cond[MAX_COND];
+    int ncond = 0, over = 0;
+    ValidRender B;
+    {
+        valid_render_init(&B);
+        B.density       = density;
+        B.dual_band     = ax_db[0];
+        B.cap           = ax_cp[0];
+        B.hole_spread   = ax_hs[0];
+        B.tracked_align = ax_ta[0];
+        B.spread_mode   = ax_sm[0];
+        B.decorrelation = ax_dc[0];
+        B.near_spread   = ax_ns[0];
+        B.spread        = spread;
+
+        for (int p = 0; p < NPAN; ++p) {
+            const int nf = (panners[p] == BWA_PAN_SPCAP) ? nfocus : 1;  /* no lobe, no focus */
+            for (int fi = 0; fi < nf; ++fi) {
+                ValidRender b = B;
+                b.focus = focus_req[fi];
+                if (factorial) {
+                    for (int a = 0; a < n_db; ++a)
+                    for (int k = 0; k < n_cp; ++k)
+                    for (int h = 0; h < n_hs; ++h)
+                    for (int t = 0; t < n_ta; ++t)
+                    for (int m = 0; m < n_sm; ++m)
+                    for (int d = 0; d < n_dc; ++d)
+                    for (int e = 0; e < n_ns; ++e) {
+                        ValidRender r = b;
+                        r.dual_band = ax_db[a];
+                        r.cap       = ax_cp[k];
+                        if (r.cap) r.dual_band = 1;                     /* CAP implies dual-band */
+                        r.hole_spread   = ax_hs[h];
+                        r.tracked_align = ax_ta[t];
+                        r.spread_mode   = ax_sm[m];
+                        r.decorrelation = ax_dc[d];
+                        r.near_spread   = ax_ns[e];
+                        cond_emit(cond, &ncond, &over, panners[p], &r);
+                    }
+                    continue;
+                }
+                cond_emit(cond, &ncond, &over, panners[p], &b);         /* the baseline */
+                for (int a = 1; a < n_db; ++a) { ValidRender r = b; r.dual_band = ax_db[a];
+                                                 cond_emit(cond, &ncond, &over, panners[p], &r); }
+                for (int a = 1; a < n_cp; ++a) { ValidRender r = b; r.cap = ax_cp[a];
+                                                 if (r.cap) r.dual_band = 1;
+                                                 cond_emit(cond, &ncond, &over, panners[p], &r); }
+                for (int a = 1; a < n_hs; ++a) { ValidRender r = b; r.hole_spread = ax_hs[a];
+                                                 cond_emit(cond, &ncond, &over, panners[p], &r); }
+                for (int a = 1; a < n_ta; ++a) { ValidRender r = b; r.tracked_align = ax_ta[a];
+                                                 cond_emit(cond, &ncond, &over, panners[p], &r); }
+                for (int a = 1; a < n_sm; ++a) { ValidRender r = b; r.spread_mode = ax_sm[a];
+                                                 cond_emit(cond, &ncond, &over, panners[p], &r); }
+                for (int a = 1; a < n_dc; ++a) { ValidRender r = b; r.decorrelation = ax_dc[a];
+                                                 cond_emit(cond, &ncond, &over, panners[p], &r); }
+                for (int a = 1; a < n_ns; ++a) { ValidRender r = b; r.near_spread = ax_ns[a];
+                                                 cond_emit(cond, &ncond, &over, panners[p], &r); }
+            }
         }
+    }
+    if (over) {
+        fprintf(stderr, "that asks for %d conditions and the cap is %d. Drop an axis, or run the\n"
+                        "sweeps as separate sessions.\n", ncond + over, MAX_COND);
+        return 2;
     }
     printf("SPCAP tuning: focus");
     for (int fi = 0; fi < nfocus; ++fi) printf(" %.2f", focus_req[fi]);
     printf("%s   density %.2f\n", nfocus > 1 ? "  (swept)" : "",
            density > 0.f ? density : L.spcap_density);
+    /* Print the condition table BEFORE measuring: an operator asking for a factorial should see what
+     * they just asked for while it is still cheap to change their mind. */
+    printf("conditions: %d  (%s)\n", ncond,
+           factorial ? "factorial: the full cross product"
+                     : "one knob at a time against the baseline; --factorial for the cross product");
+    for (int ci = 0; ci < ncond; ++ci) {
+        char cl[CLBL];
+        printf("  %2d  %s\n", ci + 1, cond_label(&cond[ci], cl, sizeof cl));
+    }
 
     /* NOT a matched-cell design, deliberately. Rendering a phantom at a speaker's own position is
      * degenerate — the panner puts essentially all the gain on that one speaker, so the "phantom"
@@ -649,7 +870,7 @@ int main(int argc, char** argv) {
             return 2;
         }
         if (!trk.mount.body_frame) {
-            fprintf(stderr, "survey %s is in ROOM axes, not the mount's body frame — it is tied to one\n"
+            fprintf(stderr, "survey %s is in ROOM axes, not the mount's body frame - it is tied to one\n"
                             "orientation, so it cannot follow a moving stand. Re-save it with a mount.\n",
                     survey_path);
             return 2;
@@ -682,14 +903,14 @@ int main(int argc, char** argv) {
             }
             trk.nn = natnet_open(&nc, e, sizeof e);
             if (!trk.nn) { fprintf(stderr, "tracker: %s\n", e); return 1; }
-            printf("tracking rigid body '%s' — placements are PLANS, the pose is the measurement\n",
+            printf("tracking rigid body '%s' - placements are PLANS, the pose is the measurement\n",
                    track_body);
         }
     }
 
     CapCtx ctx;
     memset(&ctx, 0, sizeof ctx);
-    ctx.L = &L; ctx.inject = inject; ctx.rng = 0xC0FFEEu; ctx.density = density;
+    ctx.L = &L; ctx.inject = inject; ctx.rng = 0xC0FFEEu;
     CaptureFn cap = &cap_simulate;
     int prompt = 0;
 
@@ -710,7 +931,7 @@ int main(int argc, char** argv) {
 #else
     (void)driver; (void)mic_in; (void)no_prompt;
     if (!simulate) {
-        fprintf(stderr, "this build has no ASIO SDK — only --simulate is available\n");
+        fprintf(stderr, "this build has no ASIO SDK - only --simulate is available\n");
         return 1;
     }
 #endif
@@ -740,7 +961,7 @@ int main(int argc, char** argv) {
                 for (int i = 0; i < w; ++i) {
                     ValidCell* c = &cells[i];
                     if (c->lis != li || c->tgt != t || c->reference) continue;
-                    if (c->panner != cond[ci].panner || c->focus != cond[ci].focus) continue;
+                    if (!cell_in_cond(c, &cond[ci])) continue;
                     if (c->tracked) ct = c; else cf = c;
                 }
                 if (ct && cf && ct->ok && cf->ok) { a[n] = ct->miss_deg; b[n] = cf->miss_deg; ++n; }
@@ -754,22 +975,32 @@ int main(int argc, char** argv) {
                    (lo > 0.0 || hi < 0.0) ? "  *" : "");
         }
     printf("  (* = interval excludes zero)\n");
-
-    /* ---- the focus sweep: what tightening SPCAP's lobe costs in comb depth ----
+    /* ---- the knob sweep: what each A/B costs, matched-cell against the baseline ----
      *
-     * Focus is dialed by ear today, and the ear cannot put a figure on the thing focus actually
-     * trades. Fewer speakers carrying a source means fewer coherent copies interfering, so a tighter
-     * lobe combs less; a looser one buys a smoother, better-covered image and pays in ripple. Both
-     * columns are matched-cell against the FIRST focus in the list: same placement, same direction,
-     * same capture chain, so the paired difference is the claim and its interval is the evidence.
-     * The comb column is the one that discriminates. Read it against the placement's comb floor
-     * printed above, not as an absolute. */
-    if (nfocus > 1) {
-        printf("\nSPCAP focus sweep, matched-cell against focus %.2f (tracked solve)\n", focus_req[0]);
-        printf("  %-16s %8s %10s %10s %10s %10s\n",
-               "placement", "focus", "miss deg", "d miss", "comb dB", "d comb");
+     * Every condition after the first for a panner changes exactly one thing (unless --factorial was
+     * asked for), so its paired difference against that panner's baseline IS the effect of that knob
+     * on this array: same placement, same direction, same capture chain. Two columns, because a
+     * render can fail two ways that do not track each other. Angular miss is where the phantom went;
+     * comb depth is what making it cost in timbre, and read that one against the placement's comb
+     * floor printed above rather than as an absolute.
+     *
+     * Focus is one of the swept knobs and reads here like the rest. What it trades is the NUMBER of
+     * speakers carrying a source: fewer coherent copies interfering means a tighter lobe combs less,
+     * a looser one buys a smoother, better-covered image and pays in ripple. That trade was dialed by
+     * ear and the ear cannot put a figure on it. */
+    if (ncond > NPAN) {
+        int base_of[MAX_COND];
+        for (int ci = 0; ci < ncond; ++ci) {
+            base_of[ci] = ci;
+            for (int cj = 0; cj < ncond; ++cj)      /* the panner's FIRST condition is its baseline */
+                if (cond[cj].panner == cond[ci].panner) { base_of[ci] = cj; break; }
+        }
+        printf("\nknob sweep, matched-cell against each panner's baseline (tracked solve)\n");
+        printf("  %-16s %-36s %9s %8s %9s %8s\n",
+               "placement", "condition", "miss deg", "d miss", "comb dB", "d comb");
         for (int li = 0; li < nlis; ++li)
-            for (int fi = 0; fi < nfocus; ++fi) {
+            for (int ci = 0; ci < ncond; ++ci) {
+                if (base_of[ci] == ci) continue;                /* the baseline is the reference */
                 static double m0[MAX_TGT], m1[MAX_TGT], c0[MAX_TGT], c1[MAX_TGT];
                 int nm = 0, nc = 0;
                 for (int t = 0; t < ntgt; ++t) {
@@ -777,9 +1008,8 @@ int main(int argc, char** argv) {
                     for (int i = 0; i < w; ++i) {
                         ValidCell* c = &cells[i];
                         if (c->lis != li || c->tgt != t || c->reference || !c->tracked) continue;
-                        if (c->panner != BWA_PAN_SPCAP) continue;
-                        if (c->focus == focus_req[0])  ca = c;
-                        if (c->focus == focus_req[fi]) cb = c;
+                        if (cell_in_cond(c, &cond[base_of[ci]])) ca = c;
+                        if (cell_in_cond(c, &cond[ci]))          cb = c;
                     }
                     if (!ca || !cb) continue;
                     if (ca->ok && cb->ok)           { m0[nm] = ca->miss_deg; m1[nm] = cb->miss_deg; ++nm; }
@@ -787,11 +1017,13 @@ int main(int argc, char** argv) {
                 }
                 if (nm < 8) continue;
                 double dm = 0, dmlo = 0, dmhi = 0, dc = 0, dclo = 0, dchi = 0;
+                char cl[CLBL];
                 valid_contrast(m0, m1, nm, 2000, 909u, &dm, &dmlo, &dmhi);
-                printf("  %-16s %8.2f %10.1f %+7.1f%-3s", lisname[li], focus_req[fi],
+                printf("  %-16s %-36s %9.1f %+7.1f%-2s", lisname[li],
+                       cond_label(&cond[ci], cl, sizeof cl),
                        valid_median(m1, nm), dm, (dmlo > 0.0 || dmhi < 0.0) ? " *" : "");
                 if (nc >= 8 && valid_contrast(c0, c1, nc, 2000, 909u, &dc, &dclo, &dchi))
-                    printf(" %10.2f %+7.2f%-3s", valid_median(c1, nc), dc,
+                    printf(" %9.2f %+7.2f%-2s", valid_median(c1, nc), dc,
                            (dclo > 0.0 || dchi < 0.0) ? " *" : "");
                 printf("\n");
             }
@@ -815,7 +1047,7 @@ int main(int argc, char** argv) {
             floor_med = valid_median(rr, nr);
             valid_bootstrap_ci(rr, nr, 2000, 4242u, &lo, &hi);
             printf("\nphysical floor: %.2f deg  CI [%.2f, %.2f]  (%d speakers x placements,\n"
-                   "  each driven alone — instrument + survey + room, before any panning)\n",
+                   "  each driven alone - instrument + survey + room, before any panning)\n",
                    floor_med, lo, hi, nr);
             if (floor_med > 5.0)
                 printf("  ** SUSPECT. A directly driven speaker should land near its surveyed\n"
@@ -839,8 +1071,8 @@ int main(int argc, char** argv) {
                         ValidCell* c = &cells[i];
                         if (c->lis != li || c->tgt != sp) continue;
                         if (c->reference == 1) rc = c;
-                        else if (c->reference == 2 && c->panner == cond[ci].panner &&
-                                 c->focus == cond[ci].focus && c->tracked == tracked) pc = c;
+                        else if (c->reference == 2 && cell_in_cond(c, &cond[ci]) &&
+                                 c->tracked == tracked) pc = c;
                     }
                     if (!rc || !pc) continue;
                     if (rc->ok && pc->ok && n < (int)(sizeof ra / sizeof ra[0])) {
@@ -855,8 +1087,8 @@ int main(int argc, char** argv) {
                 if (n < 8) continue;
                 double md, clo, chi;
                 if (!valid_contrast(ra, pa, n, 2000, 4242u, &md, &clo, &chi)) continue;
-                char cl[32];
-                printf("  %-16s %-13s %-8s  real %5.2f  phantom %5.2f   penalty %+6.2f  CI [%+.2f, %+.2f]%s",
+                char cl[CLBL];
+                printf("  %-16s %-36s %-8s  real %5.2f  phantom %5.2f   penalty %+6.2f  CI [%+.2f, %+.2f]%s",
                        lisname[li], cond_label(&cond[ci], cl, sizeof cl),
                        tracked ? "tracked" : "fixed",
                        valid_median(ra, n), valid_median(pa, n), md, clo, chi,
@@ -874,20 +1106,27 @@ int main(int argc, char** argv) {
     }
 
     if (simulate)
-        printf("\nSIMULATED: anechoic, so this is the RENDERING term only — the room adds to it.\n");
+        printf("\nSIMULATED: anechoic, so this is the RENDERING term only - the room adds to it.\n");
 
     if (csv) {
         FILE* f = fopen(csv, "w");
         if (!f) { fprintf(stderr, "cannot write %s\n", csv); }
         else {
-            fprintf(f, "panner,focus,density,reference,tracked,lis,lis_name,tgt,mic_x,mic_y,mic_z,"
-                       "tgt_x,tgt_y,tgt_z,meas_x,meas_y,meas_z,miss_deg,diffuseness,ok,"
-                       "comb_db,comb_q,comb_ok\n");
+            /* One column per swept knob, so a session's results can be re-analyzed against the
+             * settings they came from without re-deriving them from a label. A reference row carries
+             * zeros throughout: it ran no panner and no knob. */
+            fprintf(f, "panner,focus,density,dual_band,cap,hole_spread,tracked_align,spread_mode,"
+                       "decorrelation,near_spread,spread,reference,tracked,lis,lis_name,tgt,"
+                       "mic_x,mic_y,mic_z,tgt_x,tgt_y,tgt_z,meas_x,meas_y,meas_z,miss_deg,"
+                       "diffuseness,ok,comb_db,comb_q,comb_ok\n");
             for (int i = 0; i < w; ++i) {
                 ValidCell* c = &cells[i];
-                fprintf(f, "%s,%.4f,%.4f,%d,%d,%d,%s,%d,%.4f,%.4f,%.4f,"
-                           "%.5f,%.5f,%.5f,%.5f,%.5f,%.5f,%.3f,%.3f,%d,%.3f,%.3f,%d\n",
-                        c->reference == 1 ? "-" : pan_name(c->panner), c->focus, c->density,
+                fprintf(f, "%s,%.4f,%.4f,%d,%d,%.4f,%d,%d,%d,%.4f,%.4f,%d,%d,%d,%s,%d,"
+                           "%.4f,%.4f,%.4f,%.5f,%.5f,%.5f,%.5f,%.5f,%.5f,%.3f,%.3f,%d,%.3f,%.3f,%d\n",
+                        c->reference == 1 ? "-" : pan_name(c->panner),
+                        c->render.focus, c->render.density, c->render.dual_band, c->render.cap,
+                        c->render.hole_spread, c->render.tracked_align, c->render.spread_mode,
+                        c->render.decorrelation, c->render.near_spread, c->render.spread,
                         c->reference, c->tracked, c->lis, lisname[c->lis], c->tgt,
                         c->mic[0], c->mic[1], c->mic[2],
                         c->target[0], c->target[1], c->target[2],
@@ -921,7 +1160,7 @@ int main(int argc, char** argv) {
         printf("\ntrack self-check: placement hook fired %d/%d times\n", nplaced, nchecked);
         if (nchecked == 0 || nplaced != nchecked) {
             fprintf(stderr, "TRACK SELF-CHECK FAILED: the placement hook is not wired into the "
-                            "session loop — --track would run with the survey's body-frame capsule "
+                            "session loop - --track would run with the survey's body-frame capsule "
                             "table installed as if it were room axes\n");
             return 4;
         }

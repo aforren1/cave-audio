@@ -362,7 +362,8 @@ The checks with no assertion: bring ears you trust.
       array under both decoders and both observer models, including AT the sweet spot,
       where classical theory says plain decode should win. An irregular 26-array's decode
       sidelobes bend rE even at center; the taper suppresses them. If the rig agrees,
-      `bwa_set_max_re` defaulting to OFF is the wrong default and should flip. EPAD is
+      `bwa_set_max_re` now defaults to ON on the strength of that metric, so this trial
+      CONFIRMS rather than gates: if the rig disagrees, revert the default. EPAD is
       worst without the taper and best with it: bake off decoder and taper as PAIRS.
 - [ ] **Tracked room EQ** (if the install wants it): one `bwa_calibrate --room-eq-grid
       --mic x y z` run per mic placement, ~0.5–1 m spacing over the working area at ear

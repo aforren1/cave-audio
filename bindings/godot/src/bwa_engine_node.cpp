@@ -503,6 +503,56 @@ void BwaEngine::early_reflections_set_gain(float linear) {
 BWA_LIVE_SETTER(panner, Panner, bwa_set_panner(eng, (bwa_panner)v))
 BWA_LIVE_SETTER(dual_band, bool, bwa_set_dual_band(eng, v))
 BWA_LIVE_SETTER(dual_band_cap, bool, bwa_set_dual_band_cap(eng, v))
+
+/* Situation tuning. The Dictionary form exists so the preset can be printed and diffed rather than
+ * trusted blind, which is the whole reason the C API fills a struct instead of applying one. */
+static godot::Dictionary tuning_to_dict(const bwa_tuning& t) {
+	godot::Dictionary d;
+	d["panner"] = (int)t.panner;
+	d["spcap_focus"] = t.spcap_focus;
+	d["spcap_density"] = t.spcap_density;
+	d["dual_band"] = t.dual_band;
+	d["dual_band_cap"] = t.dual_band_cap;
+	d["spread_mode"] = (int)t.spread_mode;
+	d["decorrelation"] = t.decorrelation;
+	d["near_spread"] = t.near_spread;
+	d["hole_spread"] = t.hole_spread;
+	d["max_re"] = t.max_re;
+	d["max_re_split"] = t.max_re_split;
+	d["bed_renderer"] = (int)t.bed_renderer;
+	d["tracked_room_eq"] = t.tracked_room_eq;
+	d["tracked_align"] = t.tracked_align;
+	d["align_dead_zone_m"] = t.align_dead_zone_m;
+	d["align_slew_frames_per_s"] = t.align_slew_frames_per_s;
+	return d;
+}
+
+godot::Dictionary BwaEngine::get_setup_tuning(Setup setup) const {
+	bwa_tuning t;
+	bwa_tuning_preset((bwa_setup)setup, &t);
+	return tuning_to_dict(t);
+}
+
+bool BwaEngine::apply_setup(Setup setup) {
+	if (!eng) return false;
+	bwa_tuning t;
+	bwa_tuning_preset((bwa_setup)setup, &t);
+	if (!bwa_apply_tuning(eng, &t)) return false;
+	/* mirror into the node's own properties so the inspector does not lie about the live state */
+	panner = (Panner)t.panner;
+	spcap_focus = t.spcap_focus; spcap_density = t.spcap_density;
+	dual_band = t.dual_band; dual_band_cap = t.dual_band_cap;
+	spread_mode = (SpreadMode)t.spread_mode;
+	decorrelation = t.decorrelation;
+	near_spread = t.near_spread; hole_spread = t.hole_spread;
+	max_re = t.max_re; max_re_split = t.max_re_split;
+	bed_renderer = (BedRenderer)t.bed_renderer;
+	tracked_room_eq = t.tracked_room_eq;
+	tracked_align = t.tracked_align;
+	tracked_align_dead_zone = t.align_dead_zone_m;
+	tracked_align_slew_frames_per_s = t.align_slew_frames_per_s;
+	return true;
+}
 /* one C call carries both SPCAP exponents, so each property setter re-sends the pair */
 BWA_LIVE_SETTER(spcap_focus, float, bwa_set_spcap_focus(eng, spcap_focus, spcap_density))
 BWA_LIVE_SETTER(spcap_density, float, bwa_set_spcap_focus(eng, spcap_focus, spcap_density))
@@ -1055,6 +1105,7 @@ void BwaEngine::_bind_methods() {
 	M(set_panner, "panner"); M0(get_panner);
 	M(set_dual_band, "on"); M0(get_dual_band);
 	M(set_dual_band_cap, "on"); M0(get_dual_band_cap);
+	M(get_setup_tuning, "setup"); M(apply_setup, "setup");
 	M(set_spcap_focus, "focus"); M0(get_spcap_focus);
 	M(set_spcap_density, "density"); M0(get_spcap_density);
 	M(set_spread_mode, "mode"); M0(get_spread_mode);
@@ -1176,7 +1227,7 @@ void BwaEngine::_bind_methods() {
 	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "speed_of_sound", PROPERTY_HINT_RANGE,
 						 "30,20000,1,or_greater"),
 			"set_speed_of_sound", "get_speed_of_sound");
-	ADD_PROPERTY(PropertyInfo(Variant::INT, "bed_decoder", PROPERTY_HINT_ENUM, "AllRAD,EPAD"),
+	ADD_PROPERTY(PropertyInfo(Variant::INT, "bed_decoder", PROPERTY_HINT_ENUM, "Default,AllRAD,EPAD"),
 			"set_bed_decoder", "get_bed_decoder");
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "bed_renderer", PROPERTY_HINT_ENUM, "Matrix,Parametric"),
 			"set_bed_renderer", "get_bed_renderer");
@@ -1240,7 +1291,8 @@ void BwaEngine::_bind_methods() {
 	BIND_ENUM_CONSTANT(PROFILE_CAVE_SIM); BIND_ENUM_CONSTANT(PROFILE_CAVE_BOTH);
 	BIND_ENUM_CONSTANT(SINK_AUTO); BIND_ENUM_CONSTANT(SINK_ASIO);
 	BIND_ENUM_CONSTANT(SINK_NULL); BIND_ENUM_CONSTANT(SINK_MANUAL);
-	BIND_ENUM_CONSTANT(DECODE_ALLRAD); BIND_ENUM_CONSTANT(DECODE_EPAD);
+	BIND_ENUM_CONSTANT(DECODE_DEFAULT); BIND_ENUM_CONSTANT(DECODE_ALLRAD); BIND_ENUM_CONSTANT(DECODE_EPAD);
+	BIND_ENUM_CONSTANT(SETUP_DEFAULT); BIND_ENUM_CONSTANT(SETUP_SEATED); BIND_ENUM_CONSTANT(SETUP_ROAMING);
 	BIND_ENUM_CONSTANT(PAN_DBAP); BIND_ENUM_CONSTANT(PAN_SPCAP); BIND_ENUM_CONSTANT(PAN_VBAP);
 	BIND_ENUM_CONSTANT(SPREAD_LOBE); BIND_ENUM_CONSTANT(SPREAD_MDAP);
 	BIND_ENUM_CONSTANT(SPREAD_SPECTRAL);

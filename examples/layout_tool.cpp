@@ -421,7 +421,7 @@ static void build_engine(const char* layout_path) {
     if (!e) return;
     if (bwa_start(e) != 0) {
         const char* err = bwa_last_error(e);
-        printf("bwa_start: %s — no audition (needs an ASIO device with an output per speaker); "
+        printf("bwa_start: %s - no audition (needs an ASIO device with an output per speaker); "
                "the editor still runs.\n", err ? err : "?");
     }
     backend = bwa_get_audio_backend(e);
@@ -459,8 +459,11 @@ static float score_bed_mean, score_bed_worst, score_bed_spread;   /* the AMBI-be
 /* The bed row evaluates the decode the INSTALL ships: bwa_desc.bed_decoder (AllRAD default, EPAD
  * opt-in) and bwa_set_max_re. Scoring a different decoder than the rig runs would grade the wrong
  * render - same trap class as scoring only at the sweet spot. CLI: `epad` / `maxre` tokens. */
-static int bed_decoder = 0;    /* bwa_bed_decoder: 0 = AllRAD, 1 = EPAD */
-static int bed_max_re  = 0;
+static int bed_decoder = 0;    /* UI index: 0 = AllRAD, 1 = EPAD. NOT the bwa_bed_decoder value -
+                                * that enum reserves 0 for default-init, so map before passing. */
+static int bed_max_re  = 1;    /* tracks the ENGINE default, which flipped ON after the offline
+                                * bake-off (rt.c). A scorer whose default disagrees with the engine
+                                * grades a render nobody ships - the trap this comment block names. */
 static int   scored, score_stale, last_score_frame;   /* the per-panner scoreboard auto-refreshes on a throttle */
 
 /* SOLVE position vs EVALUATION position — the distinction this scoring turns on.
@@ -584,7 +587,7 @@ static void score_bed(int stride, float* mean_deg, float* worst_deg, float* spre
         dirs[nd*3] = cov_dir[i].x; dirs[nd*3+1] = cov_dir[i].y; dirs[nd*3+2] = cov_dir[i].z;
         ++nd;
     }
-    bwa_bed_gains_batch((bwa_bed_decoder)bed_decoder, bed_max_re != 0,
+    bwa_bed_gains_batch(bed_decoder ? BWA_DECODE_EPAD : BWA_DECODE_ALLRAD, bed_max_re != 0,
                         pos, (uint32_t)g_nspk, dirs, (uint32_t)nd, gains);
     double sumerr = 0, sumspread = 0; float worst = 0; int cnt = 0;
     for (int l = 0; l < (score_fixed_obs ? 1 : 27); ++l) {
@@ -939,7 +942,7 @@ static void do_save(void) {
     int ok = save_json(g_path);
     save_flash = ok ? 2.0f : -2.0f;
     if (ok) edited_unsaved = 0;
-    else fprintf(stderr, "save failed: cannot write '%s' (working dir %s) — check the path / permissions\n",
+    else fprintf(stderr, "save failed: cannot write '%s' (working dir %s) - check the path / permissions\n",
                  g_path, GetWorkingDirectory());
 }
 static void do_reload(void) {
@@ -1005,7 +1008,7 @@ static void enter_preview(void) {      /* rebuild so the preview pans through th
             build_engine(TEMP_LAYOUT);
             layout_dirty = 0; driven = -1;
         } else {
-            fprintf(stderr, "preview: cannot write %s (working dir not writable?) — previewing the last build\n", TEMP_LAYOUT);
+            fprintf(stderr, "preview: cannot write %s (working dir not writable?) - previewing the last build\n", TEMP_LAYOUT);
         }
     }
     preview = 1;
@@ -2398,7 +2401,7 @@ int main(int argc, char** argv) {
         if (cv_load("constraints.json", &CON))
             printf("constraints: bounds + %d no-go + %d obstacle box(es) from ./constraints.json\n", CON.nnogo, CON.nobst);
         else
-            printf("constraints: none (no ./constraints.json here) — every placement allowed except the y>=0 floor\n");
+            printf("constraints: none (no ./constraints.json here) - every placement allowed except the y>=0 floor\n");
     }
 
     /* coverage/scoring shell: even directions on a sphere (Fibonacci) + a working-volume listener grid */

@@ -280,6 +280,21 @@ static void render_both_monitor(void* user, float* dev2, uint32_t n, const bwa_t
     memcpy(dev2 + n, src + e->cap, sizeof(float) * n);  /* R */
 }
 
+/* Resolve bwa_bed_decoder to rt's internal numbering (1 = AllRAD, 2 = EPAD; 0 there means the bare
+ * sampling decode a raw rt core uses). BWA_DECODE_DEFAULT is value 0 in the public enum precisely so
+ * a zero-filled bwa_desc does not name an algorithm, and THIS is the one line that says which
+ * algorithm the default currently is. Moving the diffuse-bed default is editing this function; it is
+ * not an ABI break, and a caller who explicitly asked for AllRAD keeps getting AllRAD.
+ *
+ * The current answer is AllRAD. The taper (bwa_set_max_re) flipped ON after the offline bake-off, but
+ * the decoder choice did not flip with it: the evidence there is a TRADE, EPAD winning
+ * loudness-versus-direction and AllRAD localizing a touch sharper, not a sweep-wide win. See
+ * docs/spatialization.md. */
+static int resolve_bed_decoder(bwa_bed_decoder d) {
+    if (d == BWA_DECODE_DEFAULT) d = BWA_DECODE_ALLRAD;
+    return (d == BWA_DECODE_EPAD) ? 2 : 1;
+}
+
 /* ---- lifecycle ---- */
 
 bwa_engine* bwa_create(const bwa_desc* cfg) {
@@ -312,13 +327,15 @@ bwa_engine* bwa_create(const bwa_desc* cfg) {
 
     e->rt = rt_create(BWA_VOICE_CAP, BWA_SOUND_CAP, e->cfg.sample_rate, L.count);
     if (!e->rt) { free(e); return NULL; }
+    e->max_re = 1;                                  /* match rt_create's default so the FDN bwa_start
+                                                     * creates is seeded ON too (see rt.c) */
     rt_set_layout(e->rt, &L);
     /* diffuse-bed decoder is create-time config: the SH->speaker decode matrix is (re)built here on
      * the control thread — it must not race mix_bed once the audio thread runs. */
     /* public decoder -> the rt/fdn-internal id (1 = AllRAD, 2 = EPAD). Internal 0 is the sampling
      * decode, which is NOT selectable from the API any more — it survives only as the automatic
      * fallback inside the builds when a degenerate layout defeats AllRAD/EPAD. */
-    rt_set_bed_decoder(e->rt, e->cfg.bed_decoder == BWA_DECODE_EPAD ? 2 : 1);
+    rt_set_bed_decoder(e->rt, resolve_bed_decoder(e->cfg.bed_decoder));
     e->refl_wet = 1.0f;                             /* reverb wet default; bwa_set_reverb_gain */
     for (int i = 0; i < BWA_VOICE_CAP; ++i) {       /* directivity cache: forward = room ahead, off */
         e->src_fwd[i][2] = 1.f;
@@ -485,7 +502,7 @@ bwa_result bwa_start(bwa_engine* e) {
      * allocation failure: no tap, the engine runs dry, the reason surfaces via bwa_last_error. */
     if (e->fdn_cfg.enabled) {
         e->fdn = fdn_create(&e->layout, e->cfg.sample_rate, e->layout.count,
-                            e->cfg.bed_decoder == BWA_DECODE_EPAD ? 2 : 1);   /* same internal mapping as rt */
+                            resolve_bed_decoder(e->cfg.bed_decoder));   /* same internal mapping as rt */
         if (e->fdn) {
             fdn_set_decay(e->fdn, e->fdn_cfg.rt60_low_s, e->fdn_cfg.rt60_high_s, e->fdn_cfg.xover_hz);
             const float* d = e->fdn_cfg.decay_dir;
@@ -876,6 +893,75 @@ void bwa_set_tracked_align_guards(bwa_engine* e, float dead_zone_m, float slew_f
     if (e) rt_set_tracked_align_guards(e->rt, dead_zone_m, slew_frames_per_s);
 }
 void bwa_set_decorrelation(bwa_engine* e, bool on)    { if (e) rt_set_decorrelation(e->rt, on); }
+
+/* ---- situation tuning (bwa_setup / bwa_tuning; see the header for the design and the evidence) ----
+ *
+ * Everything a preset asserts is one of three things and the header labels which: MEASURED (a sweep
+ * in docs/validation.md or the offline bed metric), design INTENT (the docs argue for it but no
+ * hardware has), or LEFT AT THE ENGINE DEFAULT because it is still a rig-day question. Values that
+ * would be guesses are deliberately not guessed - a preset that launders opinion as a recommendation
+ * is worse than no preset, in an install whose whole purpose is measuring which settings are right.
+ *
+ * Today SEATED and ROAMING differ in exactly three fields. That is not an oversight, it is what the
+ * evidence currently supports; the gap should widen after the rig day. */
+void bwa_tuning_preset(bwa_setup setup, bwa_tuning* out) {
+    if (!out) return;
+    memset(out, 0, sizeof *out);
+    out->struct_size = (uint32_t)sizeof(bwa_tuning);
+
+    /* shared across setups: measured, or left at the engine default on purpose */
+    out->panner          = BWA_PAN_DBAP;
+    out->spcap_focus     = 0.f;              /* the array-derived default */
+    out->spcap_density   = 0.f;
+    out->spread_mode     = BWA_SPREAD_LOBE;  /* measured: sharpest of the three */
+    out->decorrelation   = false;            /* measured: worse on both axes at the sweet spot */
+    out->near_spread     = 0.f;              /* measured mixed; an install-specific radius anyway */
+    out->hole_spread     = 0.f;              /* measured cost, benefit invisible to the estimators */
+    out->max_re          = true;             /* measured: won every axis in the offline bed sweep */
+    out->max_re_split    = false;            /* no evidence either way */
+    out->bed_renderer    = BWA_BED_MATRIX;   /* parametric's claim needs a walking listener */
+    out->tracked_room_eq = true;             /* no-op without a room_eq_grid; harmless when absent */
+    out->tracked_align   = false;            /* needs a CALIBRATED layout; measures worse without one */
+    out->align_dead_zone_m       = 0.f;      /* 0 = the built-in guards */
+    out->align_slew_frames_per_s = 0.f;
+
+    /* the three that actually depend on the situation */
+    if (setup == BWA_SETUP_SEATED) {
+        out->panner        = BWA_PAN_SPCAP;  /* the documented fixed-observer default */
+        out->dual_band     = true;           /* sweet-spot dependent, which a seat satisfies */
+        out->dual_band_cap = true;           /* its stated target case; UNMEASURED on hardware */
+    } else {                                 /* ROAMING, and DEFAULT resolves here */
+        out->panner        = BWA_PAN_DBAP;   /* listener-relative, re-solved per block */
+        out->dual_band     = false;          /* sweet-spot dependent, which roaming does not satisfy */
+        out->dual_band_cap = false;          /* inert without dual_band anyway */
+    }
+}
+
+bool bwa_apply_tuning(bwa_engine* e, const bwa_tuning* t) {
+    if (!e) return false;
+    if (!t || t->struct_size != (uint32_t)sizeof(bwa_tuning)) {
+        set_error(e, "bwa_apply_tuning: NULL or wrong-sized bwa_tuning. This struct's zero is NOT its "
+                     "default (a zero-filled one forces max-rE off), so start from bwa_tuning_preset "
+                     "and edit what you disagree with.");
+        return false;
+    }
+    bwa_set_panner(e, t->panner);
+    bwa_set_spcap_focus(e, t->spcap_focus, t->spcap_density);
+    bwa_set_dual_band(e, t->dual_band);
+    bwa_set_dual_band_cap(e, t->dual_band_cap);
+    bwa_set_spread_mode(e, t->spread_mode);
+    bwa_set_decorrelation(e, t->decorrelation);
+    bwa_set_near_spread(e, t->near_spread);
+    bwa_set_hole_spread(e, t->hole_spread);
+    bwa_set_max_re(e, t->max_re);
+    bwa_set_max_re_split(e, t->max_re_split);
+    bwa_set_bed_renderer(e, t->bed_renderer);
+    bwa_set_tracked_room_eq(e, t->tracked_room_eq);
+    /* guards before the enable, so turning it on never runs a block at stale guards */
+    bwa_set_tracked_align_guards(e, t->align_dead_zone_m, t->align_slew_frames_per_s);
+    bwa_set_tracked_align(e, t->tracked_align);
+    return true;
+}
 void bwa_set_bed_renderer(bwa_engine* e, bwa_bed_renderer r) { if (e) rt_set_bed_renderer(e->rt, (int)r); }
 void bwa_set_pose_prediction(bwa_engine* e, float lead_s) { if (e) rt_set_pose_prediction(e->rt, lead_s); }
 void bwa_set_near_spread(bwa_engine* e, float radius_m)    { if (e) rt_set_near_spread(e->rt, radius_m); }
@@ -1046,8 +1132,8 @@ uint32_t bwa_bed_gains_batch(bwa_bed_decoder decoder, bool max_re,
     }
     layout_compute_ref(&L);          /* the decode aims from the array centroid, like the engine's */
     float dec[BWA_CHANNELS][BWA_AMBI_CH];                        /* ~1.6 KB stack; keeps the call pure */
-    int ok = (decoder == BWA_DECODE_EPAD) ? epad_build_decode(&L, dec)
-                                          : allrad_build_decode(&L, dec);
+    int ok = (resolve_bed_decoder(decoder) == 2) ? epad_build_decode(&L, dec)
+                                                 : allrad_build_decode(&L, dec);
     if (!ok) ambi_sad_decode(&L, n, dec);                        /* the engine's own degenerate fallback */
     float w[BWA_AMBI_CH];
     if (max_re) ambi_max_re_weights(BWA_AMBI_ORDER, w);

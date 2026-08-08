@@ -19,8 +19,15 @@
  * with `knee` = the array's own mean nearest-neighbor speaker spacing (layout_mean_speaker_spacing,
  * the same geometry SPCAP derives its lobe width from). Both ends carry meaning:
  *   - Below the knee the floor is exactly 0. On a well-covered array NO direction is further than
- *     one inter-speaker spacing from a speaker, so the whole feature is inert there by construction
- *     rather than by tuning. It only wakes up where coverage actually stops.
+ *     one inter-speaker spacing from a speaker AS SEEN FROM THE REFERENCE, so the floor is 0 there.
+ *     Note the asymmetry: `knee` is measured from Layout.ref (it is an array property, and keeping
+ *     the O(N^2) spacing measurement off the per-block path is why) while `gap` is measured from the
+ *     LIVE listener. Angular gaps stretch as the listener leaves the middle, so a hole-free array can
+ *     still derive a floor off-center: on the default 26 grid the worst gap runs 27.5 deg at center,
+ *     39.7 deg at 0.7 m out and 61 deg at a corner, against a 37.5 deg knee. That is the feature
+ *     working, not misfiring, because from a corner those bearings genuinely have no speaker near
+ *     them. It is NOT "inert on a surrounding array" without qualification, and the docs used to say
+ *     so. It only wakes up where coverage actually stops, for the listener who is actually there.
  *   - At gap == 90 degrees the floor is 1 (fully wide): no speaker within a hemisphere of the
  *     source means nothing about the render is point-like, and diffuse is the honest answer.
  *   - The slope self-scales. A sparse array has a wider knee, so less angular room between "covered"

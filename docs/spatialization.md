@@ -161,8 +161,13 @@ lobe width comes from (`layout_mean_speaker_spacing`), so the feature scales its
 layout instead of hard-coding an angle. Both ends of the ramp carry meaning:
 
 - Below the knee the floor is exactly 0. On an array that surrounds the listener, no
-  direction is ever a full speaker spacing away from a speaker, so the feature is inert
-  there **by construction**, not by tuning. It wakes up only where coverage stops.
+  direction is ever a full speaker spacing away from a speaker **as seen from the
+  reference**, so the floor is 0 there. Watch the frame mismatch though: the knee is an
+  array property measured from `Layout.ref`, while the gap follows the live listener, and
+  angular gaps stretch as you leave the middle. On the default grid the worst gap is 27.5
+  degrees at center, 39.7 at 0.7 m out and 61 at a corner, against a 37.5 degree knee, so a
+  hole-free array can still derive a floor off-center. That is the feature working rather
+  than misfiring: from a corner those bearings really do have no speaker near them.
 - At a 90 degree gap the floor is fully wide. A source with no speaker in its own
   hemisphere has nothing point-like left to render, so diffuse is the honest answer.
 - The slope scales too. A sparse array has a wider knee, so less angular room between

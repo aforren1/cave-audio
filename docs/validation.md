@@ -23,6 +23,9 @@ Build it with `-DBWA_BUILD_CALIBRATE=ON` (same switch as `bwa_calibrate`). Run
 - **What the render costs in timbre, not just in direction.** A phantom is many speakers radiating
   coherent copies of one signal, so it combs. Every cell carries a comb depth beside its angular miss,
   and `--focus` sweeps the SPCAP knob that trades one against the other.
+- **What each live A/B knob actually buys.** Dual-band, CAP, the spread modes, decorrelation, the
+  hole-aware spread floor and tracked alignment are all settings someone has to settle on rig day.
+  Each is a swept axis here, measured as a matched-cell contrast against a fixed baseline.
 
 ## The seam: solve position versus microphone position
 
@@ -41,20 +44,66 @@ positions**, not at a bearing from the listener. Only then is every listening po
 the same physical sources, and only then does a fixed solve mean anything: its gains were computed for
 a source that must not move when the listener does.
 
+## What the phantom is rendered by
+
+A real engine core. `valid_speaker_feeds` places a push voice at the source, parks the listener at
+the solve position, sets the knobs, and pumps blocks through `rt_render` into the 26-channel speaker
+bus, after `align.c`'s per-speaker trim and delay. What comes back out is what the array would emit.
+
+That matters because the shipping render is much more than a panner solve. Dual-band panning and CAP
+renormalize the low band, the spread modes and decorrelation reshape the gain vector, the hole-aware
+floor widens a source aimed into a hole, and tracked alignment re-references the per-speaker delays
+onto the live head. A harness that multiplied a stimulus by panner gains could sweep every one of
+those flags and measure nothing, which is exactly what it used to do.
+
+Three things are forced for measurement and are not part of what is being measured:
+
+- **The limiter is off.** It is on by default at -1 dBFS and would quietly compress the very gains
+  being read.
+- **Master gain is exactly 1.**
+- **The tracked-alignment slew guards are opened wide.** They exist to manage the transient of a
+  walking head. This measurement is steady-state.
+
+Blocks are rendered and discarded until the gain ramps, the alignment delay lines and the
+tracked-alignment glide have all settled, then the capture window is taken. Gains ramp rather than
+jump, so the first blocks after any change are a ramp, not the answer.
+
+The engine core is created once and reused across cells. It has no audio thread and no wall clock,
+so a cell renders identically every run. The `valid` ctest pins that both ways: a cell does not
+depend on which cell ran before it, and a cold engine renders the same cell as a warm one.
+
+**The physical reference arm does not go through the engine.** Driving one speaker alone involves no
+panner and no knob, and it is the floor everything else is quoted against, so it must not acquire
+dependencies on engine runtime state. It still builds its feed the direct way.
+
 ## Two paths, one scorer
 
 ```
 valid_speaker_feeds  →  [ play + record ]  →  valid_score  →  statistics
-                     ↘  valid_simulate    ↗
+   (engine render)   ↘  valid_simulate    ↗
 ```
 
 `valid_score` is the seam. The hardware path plays real feeds into a real room and hands back a
-capture; the simulated path substitutes an analytic field. Everything above the seam (scoring,
-medians, bootstrap intervals, contrasts, the report) is shared, so the two paths cannot drift.
+capture; the simulated path propagates the same feeds to the capsules analytically. Everything above
+the seam (scoring, medians, bootstrap intervals, contrasts, the report) is shared, so the two paths
+cannot drift.
 
 The `valid` ctest pins that they agree: it builds feeds, propagates them the long way (explicit
-per-speaker sum, interpolated fractional delay, 1/r), scores that, and compares against the analytic
-path. Worst disagreement 0.64°.
+per-speaker sum, interpolated fractional delay, 1/r), scores that, and compares against the harness's
+own propagation. Worst disagreement 0.64°.
+
+The two arms now propagate differently, and that needs its own pin, because the
+physical-versus-phantom table **subtracts** them. The phantom arm propagates real engine feeds with a
+cubic fractional tap; the reference arm keeps the exact phase-domain model, which a feed built from
+one stimulus still allows. Drive one speaker alone through both and they agree to 0.02° and 0.01 dB
+of comb depth, so the matched contrast is a difference between renders and not between models.
+
+It also pins the reroute itself. With every knob off, the engine render reproduces the pre-engine
+feed builder (`valid_speaker_feeds_direct`, still exported for exactly this) to about 1e-7 of peak
+across all three panners. That is float rounding, not a difference in what is rendered: the engine
+multiplies a float sample by a float gain and then by a float trim, where the direct builder folds
+gain and trim into one double and multiplies once. Anything larger would mean something in the render
+path stopped being a plain gain.
 
 The same unification happens one level up, in the tool. `bwa_validate` runs **one** session loop with
 two capture backends, so `--simulate` is not a shortcut around the hardware path: it executes the
@@ -64,10 +113,16 @@ which is the irreducible part.
 
 ### What simulate does and does not include
 
-`valid_simulate` builds the field a ZM-1 records in an **anechoic** free field: every speaker's real
-solved gain, its layout trim and alignment delay, 1/r spreading, and the exact propagation delay to
-each of the 19 capsules, summed coherently. So it has the real phantom-source physics, inter-speaker
-interference included, which is where phantom error comes from.
+`valid_simulate` builds the field a ZM-1 records in an **anechoic** free field: it takes the real
+engine feeds and adds 1/r spreading and the propagation delay to each of the 19 capsules, summed
+coherently. So it has the real phantom-source physics, inter-speaker interference included, which is
+where phantom error comes from.
+
+The fractional part of each delay is a 4-tap Lagrange (cubic) interpolation. The pre-engine model
+carried every delay as a phase shift and was exact, which a feed built from one stimulus allows and
+an engine render does not. Cubic costs almost nothing at these frequencies: the analysis band tops
+out at 1200 Hz against a 48 kHz rate, where the interpolator is flat to better than 1e-5 dB, four
+orders below the ripple comb depth reports.
 
 It has **no room**.
 
@@ -245,13 +300,46 @@ analysis floor. Adding weaker copies takes it to 4.6, 5.6, 8.6, 10.3 dB. One cap
 different comb pulls the answer 0.4 dB off and drops quality from 1.00 to 0.58; masking it recovers the
 clean answer exactly.
 
-## Sweeping SPCAP focus
+## Sweeping the render knobs
 
-`--focus 4,32` measures more than one SPCAP focus in **one session**, at the same placements and the
-same directions, so the focus contrasts are matched-cell. Focus is inert under DBAP and VBAP, so those
-are measured once however long the list is.
+Every live A/B knob is a swept **axis**. The first value of each is the baseline, and each axis
+carries into one condition per value:
 
-This exists because focus was dialed by ear and nothing could put a figure on what dialing it did.
+| flag | axis |
+| --- | --- |
+| `--focus <v[,v,…]>` | SPCAP lobe sharpness. Inert under DBAP and VBAP, so those two are measured once however long the list is |
+| `--dual-band off\|on\|both` | the ~700 Hz split: amplitude LF, power HF |
+| `--cap off\|on\|both` | the ITD-exact low band. Needs dual-band, so a cap condition turns dual-band on with it |
+| `--hole-spread <v[,v,…]>` | hole-aware spread floor strength. 0 is off |
+| `--tracked-align off\|on\|both` | re-reference the per-speaker delay and gain trims onto the solve listener |
+| `--spread-mode lobe\|mdap\|spectral\|all` | how source width renders |
+| `--decorrelation off\|on\|both` | velvet-noise decorrelation of the wide part |
+| `--near-spread <v[,v,…]>` | near-listener widening radius in meters. 0 is off |
+| `--spread <0..1>` | the source's own width. Not an axis: one value for the run |
+
+**One knob at a time is the default, and rig time is why.** A full factorial over these axes is 2^N
+sessions' worth of cells and answers a question nobody asked. What settles a knob is its contrast
+against a fixed baseline on the same directions at the same placements, so the tool measures the
+baseline plus one condition per non-baseline value. That is N extra passes, not 2^N. `--factorial`
+takes the cross product when you genuinely suspect an interaction.
+
+The condition table prints before anything is measured, one line per condition, followed by the cell
+count. Ask for a factorial and you see what you asked for while it is still cheap to change your mind.
+
+Set `--spread` before sweeping `--spread-mode`, `--decorrelation` or `--near-spread`. Those three act
+on the **wide part** of a source, so a point source gives them nothing to do and they read as broken
+knobs. `--near-spread` has the same trap in its own right: the floor is `1 - dist/radius`, so a radius
+that derives a floor below the width the source already has changes nothing.
+
+Every condition after a panner's first appears in the **knob sweep** table, as a matched-cell contrast
+against that panner's baseline, in two columns. Angular miss is where the phantom went; comb depth is
+what making it cost in timbre. Read the comb column against the placement's comb floor rather than as
+an absolute.
+
+### Focus, and where the sweep has power
+
+Focus is the oldest of these knobs and the most studied here. It exists because focus was dialed by
+ear and nothing could put a figure on what dialing it did.
 Focus sets how many speakers carry a source. More speakers means more coherent copies interfering, so
 the knob trades image tightness against comb depth, and comb depth is now a number.
 
@@ -287,17 +375,114 @@ What the sweep cannot tell you is which setting to ship. Comb depth is one side 
 other is coverage and image stability as the listener walks, which the angular miss and the
 tracked-versus-fixed contrast measure. Run both columns and decide against both.
 
+### What each knob moves, measured
+
+From the `valid` ctest, in simulate, one off-center listener, so this is the rendering term with no
+room. Treat it as evidence that the sweep has teeth, not as a result about your installation.
+
+**Tracked alignment is the largest effect here, and how large depends on the calibration under it.**
+It re-references an existing alignment onto the live head. It does not create one.
+
+| layout, listener | miss off | miss on | comb off | comb on |
+| --- | --- | --- | --- | --- |
+| delays aligned at the reference, listener 0.7 m off | 16.7° | 9.3° | 8.54 dB | 0.80 dB |
+| the same, listener at the reference | 3.2° | 3.2° | 0.81 dB | 0.81 dB |
+| built-in grid (unity trims, no delays), 0.7 m off | 16.6° | 11.1° | 9.94 dB | 7.43 dB |
+
+Row one is the calibrated case: coherence follows the head and the comb falls all the way to the
+stimulus floor. Row two is the control, and it has to be a null, because at the point the trims were
+computed for the correction is identity. Row three is the same knob on a layout that was never
+aligned anywhere, and the comb only falls part way. **Calibrate first, then A/B this.**
+
+Row three understates the risk. On an uncalibrated layout the knob does not merely help less, it can
+measure **worse**. A `--simulate --tracked-align both` run over the shipped example layout, which
+carries unity trims and no delays, has DBAP's comb going 7.04 to 7.71 dB at one placement and SPCAP's
+miss going 1.1 to 4.6 degrees at another, both in the wrong direction. Re-referencing an alignment
+that was never established just displaces speakers that were already coincident. Judge this knob on a
+surveyed layout or do not judge it at all.
+
+**The other knobs, DBAP on the built-in grid, source width 0.5:**
+
+| knob | miss off | miss on | comb off | comb on | diffuseness off | on |
+| --- | --- | --- | --- | --- | --- | --- |
+| dual-band | 11.9° | 12.3° | 9.93 dB | 9.77 dB | 0.166 | 0.170 |
+| dual-band plus CAP | 11.9° | 12.4° | 9.93 dB | 9.90 dB | 0.166 | 0.175 |
+| spread MDAP | 11.9° | 19.1° | 9.93 dB | 9.60 dB | 0.166 | 0.319 |
+| spread spectral | 11.9° | 15.5° | 9.93 dB | 9.01 dB | 0.166 | 0.255 |
+| decorrelation | 11.9° | 9.5° | 9.93 dB | 6.50 dB | 0.166 | 0.254 |
+| near spread (radius 2 m) | 27.5° | 19.5° | 5.59 dB | 7.12 dB | 0.242 | 0.302 |
+
+The dual-band and CAP rows are the smallest movers of the set, and that is expected rather than
+disappointing: both act below 700 Hz and the analysis band starts at 400 Hz, so most of what the
+estimator sees is untouched. Read those two as "the knob reaches the feeds", not as a verdict. The
+test asserts reachability for this whole group and nothing about direction, because which way a
+single-point intensity vector moves under a spread mode is a property of the array, and asserting it
+would bake today's answer into a regression test.
+
+**Decorrelation looks good in one cell and does not survive the sweep.** A single condition at source
+width 0.5 on the built-in grid has it improving both numbers, miss 11.9° to 9.5° and comb 9.93 to
+6.50 dB, which reads like a candidate for defaulting ON. Sweep it properly
+(`--simulate --spread 0.5 --decorrelation both`) and that disappears. At the sweet spot it is worse on
+both axes for all three panners, SPCAP worst at miss 1.0° to 3.0° and comb 5.48 to 7.53 dB. Off-center
+it is mixed, helping VBAP on both and hurting SPCAP on both. Nothing here supports a default change.
+
+Two things to take from that. One, a single cell is not evidence, which is the entire reason this tool
+sweeps directions and placements. Two, the same caution as the hole-aware floor applies: the simulated
+path is anechoic and every cell is a static point, while decorrelation earns its keep by stopping a
+wide source collapsing or comb-filtering **as the listener moves through a room**. So this sweep
+bounds the knob's cost and cannot see its benefit. Leave it off by default and settle it by ear.
+
+**The hole-aware spread floor needs a barrel and a decisive floor.** On a barrel of 8 perimeter
+positions at 3 heights with the listener at 1.4 m, a source at the listener's nadir, VBAP:
+
+| | miss | comb dB | diffuseness |
+| --- | --- | --- | --- |
+| floor off | 25.1° | 7.92 | 0.505 |
+| strength 1.0 | 32.1° | 7.64 | 0.495 |
+| strength 2.0 | 33.5° | 7.44 | 0.539 |
+
+Comb depth falls at both strengths, which is the feature's own claim: fewer near-equal coherent
+copies. But read the whole table before you conclude anything, because **on these numbers the knob
+looks bad**. It costs 8.4° of angular miss to buy 0.48 dB of comb, and diffuseness, the one column
+that would show the image actually getting wider, goes the wrong way at strength 1.0 and only rises
+at 2.0.
+
+The reason is not that the feature misbehaves. It is that these three estimators can see the knob's
+cost and cannot see its benefit. The claim is that a source with no speaker near it is better
+rendered as an honestly wide image than as a split image across two distant speakers, and a
+single-point intensity vector has no way to prefer the second: it reports where the net energy flux
+points, and widening genuinely moves that away from nadir toward the rim where the speakers are. The
+angular miss is real, not an artifact. Whether it is worth paying is a by-ear question this tool
+cannot answer.
+
+So: **do not A/B the hole-aware floor on `bwa_validate` numbers alone.** Judged that way the evidence
+says leave it off, and the evidence is not wrong, it is incomplete. Use the comb column to confirm
+the knob is doing something, then settle it by ear.
+
+One more caveat on the strengths. This barrel's nadir gap is 59° against a 33.7° knee, so strength
+1.0 derives a floor of only 0.45, which moves diffuseness by less than the scatter between
+neighboring bearings. A layout with a wider hole would show a decisive floor and a clearer picture.
+
+On the default 26-speaker grid the floor is 0 in every direction **from the reference**, and the tool
+measures the knob as identical renders there. Do not read that as unconditional inertness. The knee is
+measured from `Layout.ref` while the gap follows the live listener, so angular gaps stretch off-center:
+the grid's worst gap runs 27.5 degrees at center, 39.7 at 0.7 m out and 61 at a corner, against a 37.5
+degree knee. A hole-free array can therefore derive a floor at an off-center placement, which is the
+feature working rather than misfiring. The inertness this tool observes on the default placements is
+real but placement-dependent, not structural.
+
 ## Running it
 
 ```
 bwa_validate --simulate                                   the whole flow, no hardware
 bwa_validate --driver "ASIO MADIface USB" --mic-in 26     on the rig
 bwa_validate --layout cave_layout.json --azimuths 24 --out cells.csv
+bwa_validate --simulate --tracked-align both --dual-band both --cap both
 ```
 
 | flag | meaning |
 | --- | --- |
-| `--simulate` | analytic field instead of a capture; no device needed |
+| `--simulate` | propagate the engine's feeds analytically instead of capturing them; no device needed |
 | `--layout <path>` | `cave_layout.json` (default: the built-in grid) |
 | `--driver <name>` | ASIO driver (default: first with enough channels) |
 | `--mic-in <n>` | first Zylia input channel |
@@ -307,6 +492,15 @@ bwa_validate --layout cave_layout.json --azimuths 24 --out cells.csv
 | `--radius <m>` | source distance from the sweet spot (default 1.4) |
 | `--focus <v[,v,…]>` | SPCAP lobe sharpness; a list sweeps it in one session. See above |
 | `--density <v>` | SPCAP placement-correction exponent, one value for the run |
+| `--dual-band off\|on\|both` | swept axis, see "Sweeping the render knobs" |
+| `--cap off\|on\|both` | swept axis; a cap condition turns dual-band on with it |
+| `--hole-spread <v[,v,…]>` | swept axis; 0 is off |
+| `--tracked-align off\|on\|both` | swept axis |
+| `--spread-mode lobe\|mdap\|spectral\|all` | swept axis |
+| `--decorrelation off\|on\|both` | swept axis |
+| `--near-spread <v[,v,…]>` | swept axis, meters; 0 is off |
+| `--spread <0..1>` | the source's own width; set it before sweeping the three knobs that act on width |
+| `--factorial` | measure the cross product of the axes instead of one knob at a time |
 | `--out <file.csv>` | every cell, one row each |
 | `--no-prompt` | don't wait for ENTER between placements (unattended runs) |
 | `--track <id or name>` | follow the ZM-1's stand as a tracked rigid body; needs `--survey` |
@@ -485,9 +679,16 @@ for each microphone placement (you move the ZM-1, the tool waits):
     for each condition × {tracked, fixed} × direction:  render → capture → score
 ```
 
-A **condition** is a panner at one SPCAP focus. With no `--focus` there is one per panner, which is
-the old shape. With a `--focus` list SPCAP gets one condition per value and the other two panners
-still get one, so a sweep costs only what it measures.
+A **condition** is a panner plus one setting of every render knob. With no sweep flags there is one
+per panner, which is the old shape. Each swept axis adds one condition per non-baseline value, per
+panner, and focus adds them only under SPCAP, so a sweep costs only what it measures.
+
+The arithmetic for a realistic session: three panners, one baseline each is 3 conditions. Add
+`--tracked-align both --dual-band both --cap both` and it is 3 + 3×3 = 12. Twelve conditions × 2
+solve modes × 36 directions is 864 grid cells per placement, plus 26 physical references and
+26 × 12 × 2 = 624 matched phantoms, so 1514 cells per placement and about 9000 over six placements.
+The same three axes as a `--factorial` is 3 × 2 × 3 = 18 conditions, which is not the explosion,
+but add `--spread-mode all` and `--decorrelation both` and it is 108, six times the session.
 
 **Only the microphone moves.** Phantom sources are rendered, not carried, so a whole direction grid
 sweeps electronically from one placement. That inverts the usual cost of this measurement: a study
@@ -537,10 +738,12 @@ are percentile bootstrap on the median, fixed seed, so a reported interval is re
 Medians rather than means throughout. Localization error is heavy-tailed, a handful of directions
 fail badly, and a mean would follow them around.
 
-`--out` writes every cell: panner, focus, density, arm, mode, positions, target direction, measured
-direction, miss, diffuseness, comb depth, comb quality, and whether each estimator resolved it. The
-`reference` column says which arm a row came from: 0 is a grid phantom, 1 is a speaker driven alone,
-2 is the phantom matched to it.
+`--out` writes every cell: panner, one column per render knob (focus, density, dual_band, cap,
+hole_spread, tracked_align, spread_mode, decorrelation, near_spread, spread), arm, mode, positions,
+target direction, measured direction, miss, diffuseness, comb depth, comb quality, and whether each
+estimator resolved it. The `reference` column says which arm a row came from: 0 is a grid phantom,
+1 is a speaker driven alone, 2 is the phantom matched to it. A reference row carries zeros in every
+knob column, because it ran no panner and no knob.
 
 ## What it has found so far
 
@@ -601,13 +804,50 @@ Say these out loud before quoting any number from this tool.
   two ends measured here. The steady-state property is what makes the measurement
   latency-independent, so supporting file playback would cost that.
 
+### What the knob sweep still cannot see
+
+The phantom arm renders through the engine, so the knobs reach the measurement. Three of their claims
+still do not.
+
+- **CAP's head-rotation claim.** Every cell is measured with the listener facing room-ahead, because
+  the pose the harness hands the engine is position plus identity orientation. CAP is the one engine
+  feature that reads head **orientation** into the speaker path, and its claim is that the rendered
+  ITD stays correct as you turn your head. A spherical array at a fixed point cannot see that at all.
+  It needs the rotating two-mic rig below. What the sweep does measure is CAP facing ahead, which is
+  the case where it is closest to a no-op.
+- **Anything that only shows up while the listener walks.** `bwa_set_bed_renderer`'s parametric mode
+  earns its keep by giving an off-center listener correct directions **and parallax**, and the
+  decorrelation and spread-mode arguments are largely about timbre staying stable in motion. Every
+  cell here is a static point. You can measure a walking envelope one placement at a time and read
+  the spread across placements, which is worth doing, but it is not the same as measuring what
+  motion does.
+- **Beds at all.** The harness renders a point source. The ambisonic bed path, its decoder choice and
+  the max-rE taper never enter, so `--spread-mode` and friends are measured on the point panner only.
+  This is a deliberate omission, not a gap waiting to be filled. Three reasons. The bed is the layer
+  the engine renders with a **static** decode precisely because diffuse energy is not sweet-spot
+  sensitive, so this tool's whole reason for existing, keeping the solve position and the microphone
+  position apart, does not apply to it. The decoder and the taper already have a metric: the layout
+  tool scores them offline through the engine's real AllRAD and EPAD builds
+  (`--score <layout> [epad] maxre`), and it orders them decisively, with `dsp_test` pinning EPAD's
+  energy flatness besides. And what is left after that is a by-ear question that
+  [hardware-validation.md](./hardware-validation.md) already schedules as a trial with a stated prior
+  and a binomial test. A third measurement of a settled ordering is rig time spent on confirmation.
+
+  The exception, if you ever want one, is `bwa_set_bed_renderer`. Alone among the bed knobs its claim
+  is **position dependent**, it has no offline metric, and no trial is scheduled for it. That makes it
+  the one bed question this tool's placement sweep is actually shaped to answer. The build would be
+  narrow: encode a plane wave at each target direction, render it through the bed path, and score it
+  with the DOA machinery and the placements that already exist. The taper would come along in the same
+  mode for free, which would give the pending `bwa_set_max_re` default flip its rig confirmation.
+
 ## Not built yet: the rotating two-mic ITD rig
 
 `bwa_set_dual_band_cap` (compensated amplitude panning, [spatialization.md](./spatialization.md)) claims the
 rendered ITD stays correct **as the listener turns their head**. Nothing in this tool can see that. A
 spherical microphone array measures the field at a point; ITD is a property of two ears on a head, and
-rotating the ZM-1 does not create one. So CAP currently has unit-test evidence and no hardware
-evidence.
+rotating the ZM-1 does not create one. `--cap both` measures CAP facing room-ahead, which is the case
+where it is closest to a no-op, so CAP still has unit-test evidence and no hardware evidence for the
+claim that actually distinguishes it.
 
 The instrument that would settle it is cheap. Two omnis at ear spacing on a rigid sphere, rotated
 through yaw, with the ITD read by cross-correlation. Notes for whoever builds it:
@@ -641,11 +881,11 @@ capsules, which separates capsule error from field structure far more sharply th
 
 | file | what |
 | --- | --- |
-| `src/valid.c` / `valid.h` | render, score, statistics, the simulated field. Hardware-free, unit-tested |
+| `src/valid.c` / `valid.h` | the engine render, the propagation to the capsules, scoring, statistics. Hardware-free, unit-tested |
 | `src/zylia.c` | the estimators: intensity DOA, integrity, SRP-PHAT cross-check, comb depth |
 | `examples/validate.cpp` | `bwa_validate`, the session driver |
 | `examples/valid_capture.cpp` | full-duplex ASIO. **Rig-bound, not verified on hardware** |
-| `test/valid_test.c` | the `valid` ctest: statistics, the feed/analytic agreement, the sweep |
+| `test/valid_test.c` | the `valid` ctest: statistics, the feed/analytic agreement, the engine-versus-direct regression, determinism, the per-knob effects, the sweep |
 | - | the `validate_sim` ctest: the whole session loop; `validate_fault`: the integrity chain; `validate_focus`: the multi-condition sweep |
 | `test/zylia_test.c` | the `zylia` ctest: estimator, sign cross-check, integrity, order step-down |
 

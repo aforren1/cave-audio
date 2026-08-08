@@ -117,8 +117,9 @@ constant over direction by construction (the `dsp` test measures CV 0.09 vs samp
 clustered array; a 16×16 Jacobi eigensolve at load; `xval`
 pins it against numpy's SVD polar factor; the FDN's line render follows EPAD too — AllRAD selected
 keeps the FDN's house AllRAD, the `fdn` test pins the EPAD build). **The sampling (projection)
-decode is no longer selectable** — the public enum is `BWA_DECODE_ALLRAD` (0, the default) /
-`BWA_DECODE_EPAD` (1); the lit review was unanimous that SAD is dominated on irregular arrays, so it
+decode is no longer selectable** — the public enum was then `BWA_DECODE_ALLRAD` (0, the default) /
+`BWA_DECODE_EPAD` (1), since renumbered to reserve 0 for default-init (see the 0.11.0 changelog);
+the lit review was unanimous that SAD is dominated on irregular arrays, so it
 survives only as the internal degenerate-array fallback (rt-internal decoder id 0; engine.c maps the
 public enum to internal 1/2, and a bare rt core without rt_set_bed_decoder still defaults to SAD —
 which the rt tests rely on). **The MDAP/spectral spread ring frame is

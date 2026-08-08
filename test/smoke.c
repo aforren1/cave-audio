@@ -550,6 +550,65 @@ static int run_bed_batch(void) {
     return 0;
 }
 
+
+/* ---- situation tuning (bwa_tuning_preset / bwa_apply_tuning) -------------------------------------
+ * Three things worth pinning: the preset is PURE and deterministic, apply REFUSES a zero-initialized
+ * struct (this struct's zero is not its default - the whole reason struct_size exists), and SEATED
+ * and ROAMING differ in exactly the fields the header says they do. That last one is the guard
+ * against a preset quietly growing opinions nobody measured. */
+static int run_tuning(void) {
+    bwa_tuning a, b, seated, roaming, dflt;
+
+    bwa_tuning_preset(BWA_SETUP_SEATED, &a);
+    bwa_tuning_preset(BWA_SETUP_SEATED, &b);
+    if (memcmp(&a, &b, sizeof a) != 0) { printf("smoke[tuning] preset is not deterministic\n"); return 1; }
+    if (a.struct_size != (uint32_t)sizeof(bwa_tuning)) { printf("smoke[tuning] struct_size unset\n"); return 1; }
+
+    bwa_tuning_preset(BWA_SETUP_SEATED,  &seated);
+    bwa_tuning_preset(BWA_SETUP_ROAMING, &roaming);
+    bwa_tuning_preset(BWA_SETUP_DEFAULT, &dflt);
+    if (memcmp(&dflt, &roaming, sizeof dflt) != 0) {
+        printf("smoke[tuning] DEFAULT should resolve to ROAMING\n"); return 1; }
+
+    /* exactly three fields may differ, and they are named in the header */
+    if (!(seated.panner == BWA_PAN_SPCAP && roaming.panner == BWA_PAN_DBAP)) {
+        printf("smoke[tuning] panner does not follow the setup\n"); return 1; }
+    if (!(seated.dual_band && !roaming.dual_band)) {
+        printf("smoke[tuning] dual_band does not follow the setup\n"); return 1; }
+    if (!(seated.dual_band_cap && !roaming.dual_band_cap)) {
+        printf("smoke[tuning] dual_band_cap does not follow the setup\n"); return 1; }
+    /* CAP is inert without dual-band, so a preset must never ship the one without the other */
+    if (seated.dual_band_cap && !seated.dual_band) {
+        printf("smoke[tuning] cap enabled without dual_band\n"); return 1; }
+    /* and everything else must agree, or an unmeasured opinion has crept in */
+    seated.panner = roaming.panner;
+    seated.dual_band = roaming.dual_band;
+    seated.dual_band_cap = roaming.dual_band_cap;
+    if (memcmp(&seated, &roaming, sizeof seated) != 0) {
+        printf("smoke[tuning] setups differ in a field beyond the documented three\n"); return 1; }
+
+    /* the measured ones, asserted so a silent regression in the table is caught */
+    if (!roaming.max_re)                              { printf("smoke[tuning] max_re should be on\n");        return 1; }
+    if (roaming.decorrelation)                        { printf("smoke[tuning] decorrelation should be off\n");return 1; }
+    if (roaming.spread_mode != BWA_SPREAD_LOBE)       { printf("smoke[tuning] spread_mode should be LOBE\n"); return 1; }
+    if (roaming.tracked_align)                        { printf("smoke[tuning] tracked_align should be off\n");return 1; }
+
+    bwa_desc d = { 0 };
+    d.profile = BWA_PROFILE_CAVE; d.sink = BWA_SINK_NULL; d.block_size = 256;
+    bwa_engine* e = bwa_create(&d);
+    if (!e) { printf("smoke[tuning] create failed\n"); return 1; }
+
+    bwa_tuning zero;                       /* the footgun: zero-init must be REFUSED, not applied */
+    memset(&zero, 0, sizeof zero);
+    if (bwa_apply_tuning(e, &zero))  { printf("smoke[tuning] zero-init was accepted\n"); bwa_destroy(e); return 1; }
+    if (bwa_apply_tuning(e, NULL))   { printf("smoke[tuning] NULL was accepted\n");      bwa_destroy(e); return 1; }
+    if (!bwa_last_error(e))          { printf("smoke[tuning] refusal set no error\n");   bwa_destroy(e); return 1; }
+    if (!bwa_apply_tuning(e, &seated)) { printf("smoke[tuning] apply failed\n");         bwa_destroy(e); return 1; }
+    bwa_destroy(e);
+    printf("smoke[tuning] preset pure + DEFAULT==ROAMING + 3 situational fields + zero-init refused OK\n");
+    return 0;
+}
+
 int main(void) {
     if (run_profile(BWA_PROFILE_CAVE,      "cave"))      return 1;
     if (run_profile(BWA_PROFILE_BINAURAL,  "binaural"))  return 1;
@@ -563,6 +622,7 @@ int main(void) {
     if (run_headphone_eq())                           return 1;
     if (run_material_release())                       return 1;
     if (run_bed_batch())                              return 1;
-    printf("smoke OK (cave, binaural, cave_sim, cave_both lifecycles; room_eq start guard; push kind guards; binaural + cave_sim laterality; headphone EQ; material release/reuse; bed gains batch)\n");
+    if (run_tuning())                                 return 1;
+    printf("smoke OK (cave, binaural, cave_sim, cave_both lifecycles; room_eq start guard; push kind guards; binaural + cave_sim laterality; headphone EQ; material release/reuse; bed gains batch; situation tuning)\n");
     return 0;
 }

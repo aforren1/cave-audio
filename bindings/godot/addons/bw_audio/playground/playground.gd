@@ -256,7 +256,7 @@ func switch_scene(idx: int) -> void:
 	engine.decorrelation = false
 	bed.stop()
 	engine.bed_renderer = BwaEngine.BED_MATRIX
-	engine.max_re = false
+	engine.max_re = true   # the engine default since the offline bake-off
 	engine.max_re_split = false
 	source_yaw = 0.0
 	source.gain = SRC_GAIN

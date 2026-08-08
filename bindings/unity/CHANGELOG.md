@@ -39,6 +39,122 @@ where matching a 3-vector is not, so the ITD comes out exact and stays exact as 
   ground. See docs/spatialization.md for how this differs from VISR's own CAP, which minimizes energy
   and permits negative gains where this minimizes change from the seed and does not.
 
+### Added: situation tuning (`bwa_tuning_preset` / `bwa_apply_tuning`)
+
+Fourteen rendering knobs is a lot to get right, and the right answer depends on whether the listener
+sits or roams. `bwa_setup` names that, `bwa_tuning_preset` fills a complete `bwa_tuning` for it, and
+`bwa_apply_tuning` pushes every live knob in one call.
+
+- **Fill-then-apply, not apply-a-preset.** You can print what the preset chose, which matters because
+  most of these values are contested; preset then override then apply composes where
+  apply-then-re-override is order dependent; `bwa_tuning_preset` is pure so a tool can show the table
+  off-hardware; and two setups diff field by field, which is the natural rig-day question. Unity
+  marshals the struct directly. Godot gets `get_setup_tuning` (a Dictionary, so it is inspectable
+  there too) plus `apply_setup`, which also mirrors into the node properties so the inspector cannot
+  lie about the live state.
+- **Orthogonal to `bwa_profile`.** Profile is what you render to, setup is how the listener uses it.
+  Seated-CAVE, roaming-CAVE and seated-binaural are all real combinations.
+- **This struct's zero is NOT its default**, unlike `bwa_desc`. A zero-filled `bwa_tuning` would force
+  max-rE off, which stopped being the engine default. `struct_size` makes that fail loudly:
+  `bwa_apply_tuning` refuses a wrong-sized struct rather than silently misconfiguring the render.
+- **Seated and roaming differ in exactly three fields** today (`panner`, `dual_band`,
+  `dual_band_cap`), and `smoke` asserts that count. That is not an oversight, it is what the evidence
+  supports: most knobs are still rig-day questions and are left at the engine default rather than
+  guessed. docs/api.md carries a per-field evidence table marking each value as measured, design
+  intent, or unmeasured, so a preset cannot quietly become folklore.
+
+### Changed (ABI): enum value 0 reserved for default-init, and every public enum is width-pinned
+
+Two related changes to the enum surface, taken while the C ABI for 0.11.0 is still unreleased.
+
+> **MIGRATION, and the one place "unreleased" does not cover it.** The C ABI is unreleased; the
+> **bindings' serialized-scene contract is not**. The 0.4.0 packs shipped `BwaBedDecoder` /
+> `BedDecoder`, and both Godot `.tscn` and Unity YAML store an inspector enum as a bare integer. A
+> scene saved before this change with **EPAD** stored `1`, which now reads back as `DECODE_ALLRAD`.
+> Nothing warns, because 1 is still a valid value. **Re-pick the bed decoder in any scene or prefab
+> saved before 0.11.0.** Scenes that used AllRAD stored `0` and now read `DECODE_DEFAULT`, which
+> resolves to AllRAD, so those are correct by luck rather than by design. The renumbering was kept
+> anyway rather than mapping at the binding seam, because a binding whose enum numbering permanently
+> disagrees with the C header is a worse long-term trap than a one-time re-pick.
+
+- **`bwa_bed_decoder` reserves value 0.** It is now `BWA_DECODE_DEFAULT = 0`, `BWA_DECODE_ALLRAD = 1`,
+  `BWA_DECODE_EPAD = 2`. A zero-filled `bwa_desc` asks for the engine's current default rather than
+  naming an algorithm, which is what the struct's own "every field's zero is its default" contract
+  always claimed. Behavior today is unchanged, since the default resolves to AllRAD. The point is that
+  the default can move later without an ABI break, and without silently re-pointing a caller who did
+  name a decoder. `engine.c`'s `resolve_bed_decoder` is the one line that says what the default is.
+  This is the sokol convention (`_SG_PIXELFORMAT_DEFAULT` and 21 siblings, "value 0 reserved for
+  default-init"), and it is the mechanism the max-rE flip showed was missing: that knob was a live
+  setter so its default moved in one line, while the decoder's was welded to an enum value.
+  **Update call sites that passed a literal `0` or `1`** rather than the named constants. Unity's
+  `BwaBedDecoder` and Godot's `BedDecoder` mirror the new numbering, and both inspector defaults are
+  now `Default` so a fresh scene tracks the engine instead of pinning AllRAD.
+- **Every public enum gained `*_FORCE_U32 = 0x7FFFFFFF`.** C leaves an enum's underlying type
+  implementation-defined; this DLL is consumed by C# P/Invoke and a GDExtension, both of which marshal
+  enums as 4-byte ints. MSVC would not shrink these today, so this is defensive, but a width mismatch
+  at that boundary is silent corruption rather than a compile error. Never pass it. Only enums are
+  affected, not the `bwa_*_desc` structs.
+
+Only `bwa_desc.bed_decoder` needed the reserved zero. The setter enums (`bwa_set_panner`,
+`bwa_set_spread_mode`, `bwa_set_bed_renderer`, `bwa_source_set_directivity`, `bwa_set_test_signal`)
+do not, because no zero-initialized struct carries them: the caller always passes an explicit value
+and the engine's own default lives in `rt_create`. `bwa_sink_type` already worked this way, since
+`BWA_SINK_AUTO = 0` is a default sentinel under another name.
+
+### Changed: max-rE bed weighting now defaults to ON
+
+`bwa_set_max_re` defaulted to OFF through the bake-off. The offline evidence flipped it: the layout
+tool's bed metric, which scores through the engine's own AllRAD and EPAD builds, has the taper winning
+**every axis on this array, under both decoders and both observer models, including at the sweet
+spot** where classical theory says the plain decode should win. An irregular 26-speaker array's decode
+sidelobes bend rE even at center, and the taper suppresses them.
+
+- This is the **diffuse layer only**. Point-source panning is untouched, and so is `BWA_PROFILE_BINAURAL`,
+  where the taper is gated off anyway. What changes is ambisonic beds, the reflection bed and the FDN
+  reverb's line render.
+- The rig trial in `docs/hardware-validation.md` now **confirms rather than gates**. If the rig
+  disagrees, revert the default. Turn it off with `bwa_set_max_re(e, false)`.
+- `bwa_set_max_re_split` stays OFF. Nothing in the evidence speaks to the band split, so the broadband
+  taper remains the incumbent.
+- The layout tool's `--score` default moved with it: it grades AllRAD **with** max-rE now, because a
+  scorer whose default disagrees with the engine grades a render nobody ships. Pass `maxre` only if
+  you turned the taper off some other way.
+- Unity's `maxRe` and Godot's `max_re` inspector defaults moved too, so a fresh scene matches the
+  engine rather than quietly overriding it on the first push.
+
+**Three tests were measuring nothing** and this exposed them: they read their A-side from the engine
+default instead of setting it, so with the taper on by default the max-rE comparison read
+`rear share 0.056 -> 0.056` and passed. Set explicitly, the same test now reads **0.210 -> 0.056**. The
+limiter's own tests had the same shape and were made explicit as well. A sweep of the remaining
+defaults found no other test leaning on one.
+
+### Changed: `bwa_validate` renders through the engine, and sweeps the render knobs
+
+`bwa_validate` built its speaker feeds by calling the panner solves directly and applying only the
+layout's static gain and delay. That is a partial reimplementation of the render path, so the tool
+could not see dual-band, CAP, the spread modes, decorrelation, the hole-aware floor or tracked
+alignment: everything that lives downstream of the gain solve. The phantom arm now places a voice in a
+real engine core and pumps blocks through `rt_render` into the 26-channel bus, after `align.c`. What
+it measures is what the array would emit.
+
+- Engine-rendered feeds reproduce the old builder to **1.1e-7 of peak** with every knob off, which is
+  one float ULP: the engine multiplies stimulus by gain by trim in floats where the old builder folded
+  gain and trim into one double. Same solve, same trim, same delay, different rounding. Pinned.
+- New sweep axes with matching flags: `--dual-band`, `--cap`, `--tracked-align`, `--decorrelation`,
+  `--spread-mode`, `--hole-spread`, `--near-spread`, plus `--spread` for the source width the width
+  knobs act on. Default is **one knob at a time** against a baseline (N extra passes); `--factorial`
+  takes the cross product. The condition table and cell count print before anything is measured.
+  `--cap on` with `--dual-band off` is rejected rather than silently rendering nothing.
+- The **physical reference arm is unchanged** and still uses the direct builder. It is the measurement
+  floor, it involves no panner and no knob, and it must not acquire new dependencies.
+- Measured, and worth reading before rig day: tracked alignment is the largest effect (comb 8.54 to
+  0.80 dB off-center on a calibrated layout, with a clean null at the reference) but **only on a
+  calibrated layout**. On an unaligned one it can measure worse. The hole-aware floor's benefit is
+  invisible to these estimators while its angular cost is not, so it cannot be A/B'd on these numbers
+  alone. Dual-band and CAP barely move: they act below 700 Hz and the analysis band is 400 to 1200 Hz.
+- Cost: the tool got about 3x slower (`--simulate` 12 s to 37 s), because per-capsule propagation
+  replaced an analytic collapse. Still off-hardware and still deterministic, bit-identical run to run.
+
 ### Added: re-align the array to the tracked listener (`bwa_set_tracked_align`)
 
 The per-speaker delay and gain trims align arrival times at ONE fixed point, `Layout.ref`, so the

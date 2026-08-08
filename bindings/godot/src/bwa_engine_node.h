@@ -50,7 +50,10 @@ public:
 	 * virtual-speaker array audition, CAVE_BOTH the rig plus that sim tap. */
 	enum Profile { PROFILE_CAVE = 0, PROFILE_BINAURAL = 1, PROFILE_CAVE_SIM = 2, PROFILE_CAVE_BOTH = 3 };
 	enum Sink { SINK_AUTO = 0, SINK_ASIO = 1, SINK_NULL = 2, SINK_MANUAL = 3 };
-	enum BedDecoder { DECODE_ALLRAD = 0, DECODE_EPAD = 1 };
+	/* Value 0 is RESERVED for default-init, mirroring the C enum: it means the engine's current
+	 * default rather than a named algorithm, so the default can move without an ABI break. */
+	enum BedDecoder { DECODE_DEFAULT = 0, DECODE_ALLRAD = 1, DECODE_EPAD = 2 };
+	enum Setup { SETUP_DEFAULT = 0, SETUP_SEATED = 1, SETUP_ROAMING = 2 };
 	enum Panner { PAN_DBAP = 0, PAN_SPCAP = 1, PAN_VBAP = 2 };
 	enum SpreadMode { SPREAD_LOBE = 0, SPREAD_MDAP = 1, SPREAD_SPECTRAL = 2 };
 	enum BedRenderer { BED_MATRIX = 0, BED_PARAMETRIC = 1 };
@@ -199,6 +202,10 @@ public:
 	 * Constrains the interaural component of the summed field to a real source's, using the
 	 * tracked head ORIENTATION, so an image holds still as the listener turns. A no-op facing
 	 * the source, and it fades out with source spread. */
+	/* Situation tuning. get_setup_tuning returns the preset as a Dictionary so it can be PRINTED and
+	 * diffed before you commit to it; apply_setup pushes one straight through. */
+	godot::Dictionary get_setup_tuning(Setup setup) const;
+	bool apply_setup(Setup setup);
 	void set_dual_band_cap(bool on);
 	bool get_dual_band_cap() const { return dual_band_cap; }
 	/* SPCAP's two tuning exponents (inert under DBAP/VBAP; live, and every source re-solves next
@@ -374,7 +381,7 @@ private:
 
 	Profile profile = PROFILE_BINAURAL;
 	Sink sink = SINK_AUTO;
-	BedDecoder bed_decoder = DECODE_ALLRAD;
+	BedDecoder bed_decoder = DECODE_DEFAULT;
 	String layout_path;
 	String asio_driver;
 	int sample_rate = 48000;
@@ -408,7 +415,7 @@ private:
 	float near_spread = 0.0f;
 	float hole_spread = 0.0f;   /* 0 = off; only arrays with holes are affected at all */
 	float speed_of_sound = 343.0f;
-	bool max_re = false;
+	bool max_re = true;
 	bool max_re_split = false;
 	BedRenderer bed_renderer = BED_MATRIX;
 	bool tracked_room_eq = true;
@@ -426,6 +433,7 @@ private:
 VARIANT_ENUM_CAST(godot::BwaEngine::Profile);
 VARIANT_ENUM_CAST(godot::BwaEngine::Sink);
 VARIANT_ENUM_CAST(godot::BwaEngine::BedDecoder);
+VARIANT_ENUM_CAST(godot::BwaEngine::Setup);
 VARIANT_ENUM_CAST(godot::BwaEngine::Panner);
 VARIANT_ENUM_CAST(godot::BwaEngine::SpreadMode);
 VARIANT_ENUM_CAST(godot::BwaEngine::BedRenderer);

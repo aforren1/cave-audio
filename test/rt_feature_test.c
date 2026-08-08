@@ -636,6 +636,10 @@ int main(void) {
         RtCore* cb = rt_create(8, 4, RATE, CH);
         CHECK(cb != NULL, "rt_create (parametric bed)");
         if (cb) {
+            /* This block A/Bs the bed RENDERER, so pin the taper to a known state and compare like
+             * with like. The engine default is max-rE ON; leaving it there would put the taper on the
+             * matrix side of every comparison below and silently change what they mean. */
+            rt_set_max_re(cb, 0);
             const char* PW = "bwa_rt_bed_pw.wav", *DW = "bwa_rt_bed_w.wav";
             if (write_ambix4_noise_wav(PW, 1.f, 0.f, 0.f, 1.f, 8 * N) &&
                 write_ambix4_noise_wav(DW, 1.f, 0.f, 0.f, 0.f, 8 * N)) {
@@ -1256,6 +1260,11 @@ int main(void) {
                         t_ += e_; if (LD.speakers[ch_].pos[2] < LD.ref[2] - 0.5f) r_ += e_; } \
                     (OUT) = t_ > 0 ? r_ / t_ : 1.0; } while (0)
                 double share_off, share_on, share_back, l_off, l_on;
+                /* Set the A-side EXPLICITLY. The engine default is max-rE ON, and a test that reads
+                 * its baseline from whatever the default happens to be measures nothing the day that
+                 * default moves. */
+                rt_set_max_re(cm, 0);
+                for (int b = 0; b < 8; ++b) render2(cm);
                 REAR_SHARE(share_off); l_off = total_l2();
                 rt_set_max_re(cm, 1);
                 for (int b = 0; b < 8; ++b) render2(cm);     /* re_mix crossfades within a block */

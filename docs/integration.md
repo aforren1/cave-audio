@@ -179,6 +179,11 @@ The snippet shows the core calls. The shipped `Bwa.cs` binds every `BWA_API` fun
   `set_priority` / `set_group` / `is_playing`).
 - **Materials / scene geometry**: `bwa_material_preset`, `bwa_material_define`,
   `bwa_scene_set_mesh_mat`, `bwa_scene_set_box`.
+- **Situation tuning**: `bwa_tuning_preset` fills a complete tuning for `BWA_SETUP_SEATED` or
+  `BWA_SETUP_ROAMING` and `bwa_apply_tuning` pushes every knob below in one call. Unity marshals
+  the struct; Godot has `get_setup_tuning` (a Dictionary, so you can print it) and `apply_setup`.
+  Start from the preset: this struct's zero is not its default and applying a zero-filled one is
+  refused. See docs/api.md for what each field rests on.
 - **Rendering A/B (live)**: `bwa_set_panner`, `bwa_set_dual_band`,
   `bwa_set_spcap_focus` (SPCAP's lobe sharpness and placement-correction density;
   0 or less on either reverts that one to the default, focus to whatever the array

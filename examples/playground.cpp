@@ -764,7 +764,8 @@ static void abx_draw3d(void) {
  * (bwa_bed_set_orientation glides, click-free), the tilt slider pitches it (the full 3-axis
  * rotation), G A/Bs matrix vs parametric rendering, B A/Bs max-rE decode weighting, N A/Bs the
  * band-split (taper only > 700 Hz) against the broadband taper. */
-static int   bed_spin, bed_param, bed_re, bed_re_split;
+static int   bed_spin, bed_param, bed_re_split;
+static int   bed_re = 1;        /* mirrors the engine default (ON) */
 static float bed_yaw, bed_pitch;
 
 static void bed_apply(void) {
@@ -1050,7 +1051,7 @@ static void build_engine(int mode) {
     }
     if (bwa_start(e) != 0) {
         const char* err = bwa_last_error(e);
-        printf("bwa_start: %s — no audio (install/select an ASIO driver, e.g. ASIO4ALL); the scene still runs.\n",
+        printf("bwa_start: %s - no audio (install/select an ASIO driver, e.g. ASIO4ALL); the scene still runs.\n",
                err ? err : "?");
     }
     bwa_set_output_capture(e, capture_cb, NULL);             /* F9 records the binaural output to WAV */
@@ -1118,7 +1119,8 @@ static void switch_scene(int idx) {
     bwa_set_decorrelation(e, false);
     bwa_bed_stop(e, g_bed);                                        /* the bed scene's field + its knobs */
     bwa_set_bed_renderer(e, BWA_BED_MATRIX);
-    bwa_set_max_re(e, false);
+    bwa_set_max_re(e, true);        /* the ENGINE default since the offline bake-off; resetting to
+                                     * false here would demo a render nobody ships */
     bwa_set_max_re_split(e, false);
     source_yaw = 0.0f;
     bwa_source_set_gain(e, src, SRC_GAIN);
@@ -1462,7 +1464,7 @@ static void draw_panel(void) {
         if (chk("dynamic instanced mesh [Y]", &occ_dynamic)) apply_wall();
         bwTip("A/B the movable-geometry path: ON = one instanced mesh moved by a transform (a cheap "
               "BVH refit); OFF = bwa_scene_set_mesh_mat rebuilds the whole scene on every move. Same "
-              "occluder either way — it should sound IDENTICAL.");
+              "occluder either way - it should sound IDENTICAL.");
         chk("auto-sweep the wall [SPACE]", &occ_sweep);
         bwTip("slide the wall in and out through the ear line, hands-free, so occlusion pumps");
         chk("audible reflection [T]", &refl_audible);
@@ -1470,7 +1472,7 @@ static void draw_panel(void) {
         if (chk("occlusion [G]", &occ_audible)) bwa_source_set_occlusion(e, src, occ_audible);
         bwTip("ray-traced: the wall between source and listener attenuates AND muffles "
               "it (per-band transmission EQ), ramped - not a hard mute");
-        ImGui::TextDisabled("[ ] slide  ·  now: %s", occ_dynamic ? "dynamic (instanced)" : "static (rebuild)");
+        ImGui::TextDisabled("[ ] slide  -  now: %s", occ_dynamic ? "dynamic (instanced)" : "static (rebuild)");
         if (occ_refl_valid)    ImGui::TextColored(ImVec4(1.00f, 0.70f, 0.30f, 1.0f), "in FRONT: REFLECTING (image source)");
         else if (occ_occluded) ImGui::TextColored(ImVec4(0.96f, 0.55f, 0.55f, 1.0f), "BEHIND: OCCLUDED (material tilt)");
         else                   ImGui::TextUnformatted("wall: clear line of sight");
@@ -1617,7 +1619,7 @@ static void draw_panel(void) {
         bwTip("what makes the speed of sound audible: in water the propagation delay is 4.3x "
               "shorter - dive and hear the delay glide, not step");
         ImGui::TextDisabled("source %s the surface%s", source_pos.y > WATER_Y ? "ABOVE" : "below",
-                            wat_crossed == 1 ? "  -  path CROSSES (muffled)" : "");
+                            wat_crossed == 1 ? " - path CROSSES (muffled)" : "");
         ImGui::TextWrapped("The api.md 'listener submerges' recipe, live and phonon-free. Per-source "
                            "where the path crosses the boundary, room-wide for the medium itself. "
                            "R/F pushes the source through the surface.");
@@ -2103,7 +2105,7 @@ int main(int argc, char** argv) {
     build_engine(0);                                          /* start in the interactive config (fills speakers[], g_head) */
     source_pos.y = g_head.y;                                  /* start the source on the ear plane */
     printf("layout: %s    audio backend: %s%s\n", g_layout_path ? g_layout_path : "default grid", backend_name,
-           backend_silent ? "   (SILENT — run with --driver <your headphone driver>)" : "");
+           backend_silent ? "   (SILENT - run with --driver <your headphone driver>)" : "");
     if (cv_load("constraints.json", &g_con))                  /* orientation only; the layout tool edits against these */
         printf("constraints: bounds + %d no-go + %d obstacle box(es) drawn from ./constraints.json\n", g_con.nnogo, g_con.nobst);
 

@@ -87,6 +87,7 @@ typedef enum {
     BWA_PROFILE_BINAURAL  = 1,  /* direct per-source binaural -> stereo device. Full POSE. */
     BWA_PROFILE_CAVE_SIM  = 2,  /* speaker bus -> virtual-speaker monitor -> stereo device. Full POSE. */
     BWA_PROFILE_CAVE_BOTH = 3,  /* array to the Digiface + the CAVE_SIM tap to a stereo device. Full POSE. */
+    BWA_PROFILE_FORCE_U32 = 0x7FFFFFFF   /* pins the ABI width for P/Invoke and GDExtension; never passed */
 } bwa_profile;
 
 /* Diffuse-bed ambisonic decoder (fixed for the engine's lifetime — the decode matrix is built
@@ -99,7 +100,14 @@ typedef enum {
  * over-energizes dense speaker regions (dominated by both options above) — it survives only as
  * the engine's automatic fallback when a degenerate layout defeats the chosen build. Affects the
  * ambisonic + reflection BEDS only, not the point-source panner. See docs/spatialization.md. */
-typedef enum { BWA_DECODE_ALLRAD = 0, BWA_DECODE_EPAD = 1 } bwa_bed_decoder;
+/* Diffuse-bed SH->speaker decoder. Value 0 is RESERVED for default-init (the sokol convention): a
+ * zero-filled bwa_desc means "whatever the engine currently defaults to", not a named algorithm, so
+ * the default can move without an ABI break and without silently re-pointing callers who did pick
+ * one. Resolve it in exactly one place (engine.c's resolve_bed_decoder). */
+typedef enum { BWA_DECODE_DEFAULT = 0,   /* reserved: the engine's current default */
+               BWA_DECODE_ALLRAD  = 1,
+               BWA_DECODE_EPAD    = 2,
+               BWA_DECODE_FORCE_U32 = 0x7FFFFFFF } bwa_bed_decoder;
 
 /* Output-device policy. AUTO (the default) tries ASIO and falls back to the silent offline sink
  * — the engine keeps rendering with no device (the tools' visual-only mode). ASIO is an explicit
@@ -109,7 +117,8 @@ typedef enum { BWA_DECODE_ALLRAD = 0, BWA_DECODE_EPAD = 1 } bwa_bed_decoder;
  * profiles also name the decode in use — "(steam HRTF ...)" or "(simple-pan ...)" — because the
  * HRTF decode falls back to the simple pan silently and a by-ear report needs to know which ran. */
 typedef enum { BWA_SINK_AUTO = 0, BWA_SINK_ASIO = 1, BWA_SINK_NULL = 2,
-               BWA_SINK_MANUAL = 3 /* no device/thread — pump blocks yourself with bwa_render_block */ } bwa_sink_type;
+               BWA_SINK_MANUAL = 3, /* no device/thread — pump blocks yourself with bwa_render_block */
+               BWA_SINK_FORCE_U32 = 0x7FFFFFFF } bwa_sink_type;
 
 /* Engine configuration. Zero-init and set what you need — every field's zero is its default. */
 typedef struct {
@@ -131,7 +140,7 @@ typedef struct {
                                  * tracer (one stderr notice) otherwise. No-op without the SDK. */
     bool         enable_pathing;/* run the sound-pathing sim from bwa_start (needs scene geometry +
                                  * the Steam Audio build; sources opt in via bwa_source_set_pathing). */
-    bwa_bed_decoder bed_decoder;   /* diffuse-bed SH->speaker decoder; 0 = AllRAD (the default). */
+    bwa_bed_decoder bed_decoder;   /* diffuse-bed SH->speaker decoder; 0 = the engine default. */
     uint32_t     reserved[4];   /* zero; reserved so the struct can grow without an ABI break */
 } bwa_desc;
 
@@ -148,6 +157,7 @@ typedef enum {
     BWA_ERR_STATE    = 5,   /* reserved: wrong-state calls currently report via bwa_last_error */
     BWA_ERR_INTERNAL = 6,   /* reserved */
     BWA_ERR_TRACKER  = 7,   /* tracker (NatNet) connection failed — bwa_last_error has the reason */
+    BWA_RESULT_FORCE_U32 = 0x7FFFFFFF   /* pins the ABI width for P/Invoke and GDExtension; never passed */
 } bwa_result;
 
 /* ---- lifecycle (control thread; may block/allocate; do at load time) ---- */
@@ -437,6 +447,7 @@ typedef uint32_t bwa_material;
 typedef enum {
     BWA_MAT_GENERIC = 0, BWA_MAT_BRICK, BWA_MAT_CONCRETE, BWA_MAT_CERAMIC, BWA_MAT_GRAVEL,
     BWA_MAT_CARPET, BWA_MAT_GLASS, BWA_MAT_PLASTER, BWA_MAT_WOOD, BWA_MAT_METAL, BWA_MAT_ROCK,
+    BWA_MAT_FORCE_U32 = 0x7FFFFFFF   /* pins the ABI width for P/Invoke and GDExtension; never passed */
 } bwa_material_type;
 /* Mint a material from a built-in preset. GENERIC returns the canonical token 0 without minting
  * (it IS the default — tag as many surfaces as you like without spending table slots). Returns 0
@@ -626,7 +637,7 @@ BWA_API float    bwa_source_get_occlusion(bwa_engine* e, bwa_source s);
  * same |(1-w) + w cos(theta)|^p model: WITH the Steam scene the occlusion sim evaluates it
  * (~10-30 Hz, published + ramped); without a scene (or without the SDK at all) the audio thread
  * evaluates it per block from the same forward axis — walk-correct in both. */
-typedef enum { BWA_DIR_OMNI = 0, BWA_DIR_CARDIOID = 1, BWA_DIR_FIGURE8 = 2 } bwa_directivity;
+typedef enum { BWA_DIR_OMNI = 0, BWA_DIR_CARDIOID = 1, BWA_DIR_FIGURE8 = 2, BWA_DIR_FORCE_U32 = 0x7FFFFFFF } bwa_directivity;
 /* Source orientation as a quaternion (same room frame + handedness as bwa_set_listener_pose); the
  * dipole axis is the source's forward (+z rotated by q). Per-frame-safe. */
 BWA_API void     bwa_source_set_orientation(bwa_engine* e, bwa_source s, float qx, float qy, float qz, float qw);
@@ -705,7 +716,7 @@ BWA_API void     bwa_source_set_size(bwa_engine* e, bwa_source s, float radius_m
  * tone on that Digiface channel/speaker; the headphone profiles -> that bus channel HRTF'd as its
  * virtual speaker (in BINAURAL the test tone rides the diffuse/virtual-speaker path — only point
  * SOURCES render direct). */
-typedef enum { BWA_TEST_OFF = 0, BWA_TEST_SINE = 1, BWA_TEST_NOISE = 2 } bwa_test_kind;
+typedef enum { BWA_TEST_OFF = 0, BWA_TEST_SINE = 1, BWA_TEST_NOISE = 2, BWA_TEST_FORCE_U32 = 0x7FFFFFFF } bwa_test_kind;
 BWA_API void     bwa_set_test_signal(bwa_engine* e, uint32_t channel, bwa_test_kind kind, float gain);
 
 /* Read back the effective speaker layout (the default grid, or the file from bwa_desc.layout_path):
@@ -799,7 +810,7 @@ BWA_API const float* bwa_render_block(bwa_engine* e, uint32_t* channels, uint32_
  * best when the array triangulates cleanly; it falls back to DBAP for a non-triangulable array. SPCAP
  * and VBAP assume a fixed listener (with internal tracking their cache rebuilds every block — use DBAP
  * for a moving observer). Does not affect the diffuse bed / ambisonic paths. See docs/spatialization.md. */
-typedef enum { BWA_PAN_DBAP = 0, BWA_PAN_SPCAP = 1, BWA_PAN_VBAP = 2 } bwa_panner;
+typedef enum { BWA_PAN_DBAP = 0, BWA_PAN_SPCAP = 1, BWA_PAN_VBAP = 2, BWA_PAN_FORCE_U32 = 0x7FFFFFFF } bwa_panner;
 BWA_API void     bwa_set_panner(bwa_engine* e, bwa_panner panner);
 /* SPCAP's two tuning knobs (dimensionless exponents; inert under DBAP/VBAP). `focus` is the lobe
  * sharpness in ((1+cos)/2)^focus: higher concentrates a source on fewer speakers (tighter image),
@@ -849,7 +860,8 @@ BWA_API void     bwa_set_dual_band(bwa_engine* e, bool on);
  * single-path output stage, so a spread source there gets plain dual-band on its low bands and no
  * ITD correction at all. Known exclusion. See docs/spatialization.md. */
 BWA_API void     bwa_set_dual_band_cap(bwa_engine* e, bool on);
-/* max-rE weighting for the SH->speaker BED decode (off by default; live A/B, crossfaded): tapers the
+/* max-rE weighting for the SH->speaker BED decode (ON by default since the offline bake-off; live
+ * A/B, crossfaded): tapers the
  * higher ambisonic orders (Zotter & Frank's psychoacoustic decoder weights, diffuse-energy-matched so
  * A and B stay level-fair), which suppresses decode sidelobes and lengthens the energy vector —
  * better localization AWAY from the sweet spot, exactly the walking-listener case, at a slightly
@@ -871,7 +883,7 @@ BWA_API void     bwa_set_max_re_split(bwa_engine* e, bool on);
  * SPECTRAL (Zotter/Frank): split into 6 bands, pan each to its own direction in the cone (LF stays
  * put) — width with no decorrelation noise, nothing to comb as the listener walks. All constant-
  * power. Full story: docs/api.md, "Source spread / size" (design: docs/spatialization.md). */
-typedef enum { BWA_SPREAD_LOBE = 0, BWA_SPREAD_MDAP = 1, BWA_SPREAD_SPECTRAL = 2 } bwa_spread_mode;
+typedef enum { BWA_SPREAD_LOBE = 0, BWA_SPREAD_MDAP = 1, BWA_SPREAD_SPECTRAL = 2, BWA_SPREAD_FORCE_U32 = 0x7FFFFFFF } bwa_spread_mode;
 BWA_API void     bwa_set_spread_mode(bwa_engine* e, bwa_spread_mode mode);
 /* Decorrelate the WIDE part of spread sources (off by default; live A/B). Amplitude panning feeds
  * every speaker the SAME signal, so a wide source still collapses to phantom images and comb-filters
@@ -945,7 +957,7 @@ BWA_API void       bwa_set_headphone_eq(bwa_engine* e, bool on);
  * can give) — and the diffuse stream decodes through the matrix into per-speaker decorrelators
  * (incoherent envelopment). Loudness-matched to the matrix decode; beds with < 4 channels stay on
  * the matrix. See docs/spatialization.md. */
-typedef enum { BWA_BED_MATRIX = 0, BWA_BED_PARAMETRIC = 1 } bwa_bed_renderer;
+typedef enum { BWA_BED_MATRIX = 0, BWA_BED_PARAMETRIC = 1, BWA_BED_FORCE_U32 = 0x7FFFFFFF } bwa_bed_renderer;
 BWA_API void     bwa_set_bed_renderer(bwa_engine* e, bwa_bed_renderer renderer);
 
 /* Tracked room EQ (layouts carrying a room_eq_grid, written by bwa_calibrate --room-eq-grid): the LF
@@ -991,6 +1003,71 @@ BWA_API void     bwa_set_tracked_room_eq(bwa_engine* e, bool on);
 BWA_API void     bwa_set_tracked_align(bwa_engine* e, bool on);
 BWA_API void     bwa_set_tracked_align_guards(bwa_engine* e, float dead_zone_m,
                                               float slew_frames_per_s);
+
+/* ---- situation tuning: every rendering knob at once ------------------------------------------
+ * The knobs above are individually meaningful and collectively a lot to get right. `bwa_setup` names
+ * how the LISTENER uses the install, `bwa_tuning_preset` fills a complete tuning for it, and
+ * `bwa_apply_tuning` pushes the lot in one call.
+ *
+ * Fill-then-apply, deliberately, rather than a single apply_preset(e, SEATED):
+ *   - you can PRINT what the preset chose, which matters because most of these values are contested
+ *     and measured rather than obvious;
+ *   - preset -> override a field -> apply composes, where apply-then-re-override is order-dependent;
+ *   - bwa_tuning_preset is pure (no engine handle), so a tool can show the table off-hardware, the
+ *     same contract as bwa_spcap_focus_default and bwa_panner_gains_batch;
+ *   - two setups diff field by field, which is the natural rig-day question.
+ *
+ * ORTHOGONAL TO bwa_profile. Profile is what you render TO (array, binaural, sim); setup is how the
+ * listener uses it. Seated-CAVE, roaming-CAVE and seated-binaural are all real. Create-time config is
+ * deliberately NOT part of this: bwa_desc.bed_decoder already defaults correctly and profile is the
+ * caller's to choose.
+ *
+ * HOW SETTLED ARE THE VALUES? Unevenly, and the header says so per field below. Several are measured
+ * (docs/validation.md), several are documented design intent with no hardware behind them yet, and
+ * the ones still marked for rig day are left at the engine default rather than guessed. Read the
+ * evidence table in docs/api.md before treating a preset as a recommendation. */
+typedef enum { BWA_SETUP_DEFAULT = 0,   /* reserved for default-init; currently resolves to ROAMING */
+               BWA_SETUP_SEATED  = 1,   /* one listener at a fixed spot; sweet-spot renders are fair game */
+               BWA_SETUP_ROAMING = 2,   /* tracked listener crossing the array; the CAVE's own case */
+               BWA_SETUP_FORCE_U32 = 0x7FFFFFFF } bwa_setup;
+
+typedef struct {
+    uint32_t struct_size;        /* sizeof(bwa_tuning). bwa_tuning_preset sets it; bwa_apply_tuning
+                                  * REFUSES a struct whose size is wrong. That is deliberate: unlike
+                                  * bwa_desc this struct's zero is NOT its default (a zero-filled one
+                                  * would force max-rE off, which is no longer the engine default), so
+                                  * a zero-init mistake has to fail loudly instead of silently
+                                  * misconfiguring the render. Always start from bwa_tuning_preset. */
+    bwa_panner       panner;         /* SEATED: SPCAP. ROAMING: DBAP. Design intent (docs). */
+    float            spcap_focus;    /* 0 = the array-derived default. Both. */
+    float            spcap_density;  /* 0 = the 2.0 default. Both. */
+    bool             dual_band;      /* SEATED: on. ROAMING: off. Sweet-spot dependent, so intent. */
+    bool             dual_band_cap;  /* SEATED: on (its stated target case). ROAMING: off. UNMEASURED
+                                      * on hardware: needs the rotating two-mic rig. */
+    bwa_spread_mode  spread_mode;    /* LOBE both. MEASURED: MDAP 19.1 deg against LOBE's 11.9. */
+    bool             decorrelation;  /* off both. MEASURED: worse on both axes at the sweet spot. */
+    float            near_spread;    /* 0 both. Measured mixed (direction better, comb worse). */
+    float            hole_spread;    /* 0 both. Measured cost, benefit invisible to the estimators. */
+    bool             max_re;         /* ON both. MEASURED: won every axis in the offline bed sweep. */
+    bool             max_re_split;   /* off both. No evidence either way. */
+    bwa_bed_renderer bed_renderer;   /* MATRIX both. Parametric's claim needs a walking listener. */
+    bool             tracked_room_eq;/* on both; a no-op without a room_eq_grid in the layout. */
+    bool             tracked_align;  /* OFF both, though it is the largest measured effect there is
+                                      * (comb 8.54 -> 0.80 dB off-center). It requires a CALIBRATED
+                                      * layout and measures WORSE without one, and a preset cannot
+                                      * know whether you surveyed. Turn it on after bwa_calibrate. */
+    float            align_dead_zone_m;      /* 0 = the 5 cm default. */
+    float            align_slew_frames_per_s;/* 0 = the ~63 at 48 kHz default. */
+    uint32_t         reserved[4];    /* zero; reserved so the struct can grow without an ABI break */
+} bwa_tuning;
+
+/* Fill `out` with the complete tuning for `setup`. Pure: no engine, no allocation, deterministic.
+ * Sets struct_size. Does nothing if `out` is NULL. */
+BWA_API void     bwa_tuning_preset(bwa_setup setup, bwa_tuning* out);
+/* Push every field of `t` to the engine, in one call. Per-frame-safe and live, like the individual
+ * setters it wraps. Returns false (and sets bwa_last_error) if `t` is NULL or its struct_size is
+ * wrong, which is what a zero-initialized struct looks like. */
+BWA_API bool     bwa_apply_tuning(bwa_engine* e, const bwa_tuning* t);
 
 /* ---- offline panner evaluation (no engine handle; for layout scoring/optimization in tools) ----
  * The per-speaker gains the given `panner` produces for `nsrc` source positions heard from one
@@ -1094,6 +1171,7 @@ typedef enum {
     BWA_TRACKER_NO_BODY      = 2,  /* frames ARE arriving, but the followed rigid body has no recent
                                     * valid pose — wrong rigid_body_id/name, or the body is occluded now */
     BWA_TRACKER_LIVE         = 3,  /* the followed rigid body's pose is arriving and current */
+    BWA_TRACKER_FORCE_U32 = 0x7FFFFFFF   /* pins the ABI width for P/Invoke and GDExtension; never passed */
 } bwa_tracker_state;
 /* Control thread; never blocks; cheap enough to poll every frame. */
 BWA_API bwa_tracker_state bwa_tracker_status(bwa_engine* e);

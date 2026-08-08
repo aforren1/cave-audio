@@ -487,7 +487,7 @@ Zero-init `bwa_desc` and set what you need; every field's zero is its default:
 | `asio_driver`    | ASIO driver name to open; NULL = auto-pick the first registered driver with enough output channels for the profile (the headphone profiles find a 2-ch driver, cave a ≥layout-count one) |
 | `embree`         | ray-trace the acoustics sims on Intel Embree; silently falls back to the default tracer if the phonon build lacks it - see [Ray-tracing acceleration](#ray-tracing-acceleration-bwa_descembree) |
 | `enable_pathing` | run the sound-pathing sim from `bwa_start` (needs scene geometry + the Steam Audio build); sources opt in via `bwa_source_set_pathing` |
-| `bed_decoder`    | diffuse-bed SH→speaker decoder: AllRAD (0, default) or EPAD (1) - see [Panner and layout query](#panner-and-layout-query-control-thread) |
+| `bed_decoder`    | diffuse-bed SH→speaker decoder: 0 is the engine default (reserved, currently AllRAD), AllRAD (1) or EPAD (2) - see [Panner and layout query](#panner-and-layout-query-control-thread) |
 | `reserved[4]`    | zero; room to grow without an ABI break                             |
 
 ## Errors and return codes
@@ -923,7 +923,7 @@ SFX overload. The decode is a static SN3D SH→speaker matrix (AllRAD or EPAD pe
 `bwa_desc.bed_decoder`; see below), rebuilt from the layout.
 
 ```c
-void bwa_set_max_re(bwa_engine* e, bool on);         // off by default; live A/B (crossfaded)
+void bwa_set_max_re(bwa_engine* e, bool on);         // ON by default; live A/B (crossfaded)
 void bwa_set_max_re_split(bwa_engine* e, bool on);   // off by default; live A/B; needs max_re on
 ```
 
@@ -1534,7 +1534,9 @@ callback on a manual sink, but reading `bwa_render_block`'s return value directl
 
 ```c
 typedef enum { BWA_PAN_DBAP = 0, BWA_PAN_SPCAP = 1, BWA_PAN_VBAP = 2 } bwa_panner;
-typedef enum { BWA_DECODE_ALLRAD = 0, BWA_DECODE_EPAD = 1 } bwa_bed_decoder;   // bwa_desc.bed_decoder
+typedef enum { BWA_DECODE_DEFAULT = 0,   // reserved for default-init; NOT a named algorithm
+               BWA_DECODE_ALLRAD  = 1,
+               BWA_DECODE_EPAD    = 2 } bwa_bed_decoder;   // bwa_desc.bed_decoder
 void     bwa_set_panner(bwa_engine* e, bwa_panner panner);            // load-time or live (atomic switch)
 void     bwa_set_dual_band(bwa_engine* e, bool on);                // live A/B; wraps the selected panner
 void     bwa_set_dual_band_cap(bwa_engine* e, bool on);                      // live A/B; ITD-corrects dual_band's low band
@@ -1605,6 +1607,14 @@ fourth panner: facing the source it is a no-op and reduces to the seed, and it f
 speaker path, so it wants a real tracked pose. Two known exclusions: `BWA_SPREAD_SPECTRAL`
 bypasses it entirely, and the offline `bwa_panner_gains_batch` never solves a low band, so it
 cannot be swept there. See [spatialization.md](./spatialization.md).
+
+`bwa_desc.bed_decoder` reserves **value 0 for default-init**, the sokol convention. A zero-filled
+`bwa_desc` therefore asks for whatever the engine currently defaults to rather than naming an
+algorithm, so that default can move later without an ABI break and without silently re-pointing a
+caller who did name one. `engine.c`'s `resolve_bed_decoder` is the single line that says what the
+default is today (AllRAD). Every public enum also carries a `*_FORCE_U32 = 0x7FFFFFFF` member that
+pins its width to 32 bits: C leaves an enum's underlying type implementation-defined, and this DLL is
+consumed by C# P/Invoke and a GDExtension, both of which marshal enums as 4-byte ints. Never pass it.
 
 `bwa_desc.bed_decoder` chooses the **diffuse-bed** SH→speaker decoder. It affects the ambisonic
 and reflection beds only, never the point-source panner:
@@ -1752,6 +1762,58 @@ through the internal tracker.
 Nothing here touches a gain solve, so it composes with every panner and re-solves no sources.
 Untested on hardware: see [`spatialization.md`](./spatialization.md), "Re-aligning to the tracked
 listener".
+
+## Situation tuning (`bwa_tuning_preset`, `bwa_apply_tuning`)
+
+```c
+typedef enum { BWA_SETUP_DEFAULT = 0, BWA_SETUP_SEATED = 1, BWA_SETUP_ROAMING = 2 } bwa_setup;
+void bwa_tuning_preset(bwa_setup setup, bwa_tuning* out);   // pure, no engine handle
+bool bwa_apply_tuning(bwa_engine* e, const bwa_tuning* t);  // one call, every live knob
+```
+
+Fourteen rendering knobs is a lot to get right. `bwa_setup` names how the **listener** uses the
+install, `bwa_tuning_preset` fills a complete tuning for it, and `bwa_apply_tuning` pushes the lot.
+
+Fill-then-apply rather than one `apply_preset(e, SEATED)`, deliberately. You can print what the preset
+chose, which matters because most of these values are contested. Preset, override a field, apply,
+composes where apply-then-re-override is order dependent. The preset is pure, so a tool can show the
+table off-hardware, the same contract as `bwa_spcap_focus_default`. And two setups diff field by
+field, which is the natural rig-day question.
+
+`bwa_setup` is **orthogonal to `bwa_profile`**. Profile is what you render *to*; setup is how the
+listener uses it. Seated-CAVE, roaming-CAVE and seated-binaural are all real. Create-time config is
+not part of a preset: `bwa_desc.bed_decoder` already defaults correctly, and the profile is yours.
+
+**This struct's zero is NOT its default.** A zero-filled `bwa_tuning` would force max-rE off, which
+stopped being the engine default. `struct_size` exists to make that fail loudly: `bwa_apply_tuning`
+refuses a struct whose size is wrong, which is what a zero-init mistake looks like. Always start from
+`bwa_tuning_preset`.
+
+### What each field rests on
+
+Read this before treating a preset as a recommendation. Where there is no evidence the field is left
+at the engine default rather than guessed.
+
+| Field | Seated | Roaming | Evidence |
+| --- | --- | --- | --- |
+| `panner` | SPCAP | DBAP | **Intent.** SPCAP is the documented fixed-observer default; DBAP re-solves per block for a moving one |
+| `dual_band` | on | off | **Intent.** Sweet-spot dependent, which a seat satisfies and roaming does not |
+| `dual_band_cap` | on | off | **Intent, unmeasured on hardware.** Its stated target is the seated case; the ITD claim needs the rotating two-mic rig |
+| `max_re` | on | on | **Measured.** Won every axis of the offline bed sweep, under both decoders and both observer models |
+| `spread_mode` | LOBE | LOBE | **Measured.** MDAP 19.1 deg against LOBE's 11.9 |
+| `decorrelation` | off | off | **Measured.** Worse on both axes at the sweet spot when swept properly |
+| `hole_spread` | 0 | 0 | **Measured.** Costs direction, and its benefit is invisible to these estimators |
+| `near_spread` | 0 | 0 | Measured mixed, and the useful radius is install specific |
+| `tracked_align` | off | off | **Measured, and the largest effect there is** (comb 8.54 to 0.80 dB off-center). It needs a *calibrated* layout and measures worse without one, and a preset cannot know whether you surveyed. Turn it on after `bwa_calibrate` |
+| `max_re_split` | off | off | No evidence either way |
+| `bed_renderer` | MATRIX | MATRIX | Parametric's claim needs a walking listener, which nothing has measured |
+| `tracked_room_eq` | on | on | Engine default, and a no-op without a `room_eq_grid` |
+| `spcap_focus` / `_density` | 0 | 0 | 0 means the array-derived default |
+| `align_*` guards | 0 | 0 | 0 means the built-in guards |
+
+Seated and roaming differ in exactly **three** fields today. That is not an oversight, it is what the
+evidence supports. The gap should widen after the rig day, and `smoke` asserts the count so a fourth
+opinion cannot arrive unannounced.
 
 ## Output protection limiter (control thread; ON by default)
 
