@@ -3,9 +3,9 @@
 Calibration *fixes* the array: trims, delays, positions, EQ. This *grades* it. Render a source in a
 known direction, measure where the array actually put it, report the angular miss.
 
-That number is the one nobody has. You can listen to a layout all day and not produce it, and the
-usual substitutes ([rE error](./glossary.md#re-error), coverage maps, "sounds right to me") are
-proxies for it, not it. [glossary.md](./glossary.md) is the one-line lookup for every term below.
+That number is the one nobody has. You can listen to a layout all day and not produce it. The usual
+substitutes ([rE error](./glossary.md#re-error), coverage maps, "sounds right to me") are proxies
+for it, not it. [glossary.md](./glossary.md) is the one-line lookup for every term below.
 
 Build it with `-DBWA_BUILD_CALIBRATE=ON` (same switch as `bwa_calibrate`). Run
 `bwa_validate --simulate` to exercise the whole flow with no hardware.
@@ -14,11 +14,11 @@ Build it with `-DBWA_BUILD_CALIBRATE=ON` (same switch as `bwa_calibrate`). Run
 
 - How far off is a phantom from its target, per direction, per panner, per listening position.
 - **Does tracking actually buy anything.** A tracked renderer and a fixed one are identical at the
-  sweet spot, which is where measurements are usually taken, which is why this question normally
-  goes unanswered.
+  sweet spot. That is where measurements are usually taken, so this question normally goes
+  unanswered.
 - Where in the room the layout works, and where it stops working.
 - **How much of the error is the renderer at all.** Driving one speaker alone gives a physical source
-  through the same chain, so the phantom miss can be read against a floor rather than in a vacuum.
+  through the same chain, so you read the phantom miss against a floor rather than in a vacuum.
 - **How much the content matters here**, by measuring the same cells broadband and on a tone.
 - **What the render costs in timbre, not just in direction.** A phantom is many speakers radiating
   coherent copies of one signal, so it combs. Every cell carries a comb depth beside its angular miss,
@@ -36,13 +36,13 @@ wherever they actually are. Those are the same point only for a tracked renderer
 - **fixed**: the panner solves once at the sweet spot and never corrects. What an SPCAP or VBAP
   install does at load.
 
-`bwa_validate` keeps those two positions separate, and that is the whole reason it can see anything a
+`bwa_validate` keeps those two positions separate. That is the whole reason it can see anything a
 sweet-spot measurement cannot.
 
 One consequence worth stating, because it is easy to get backwards: **sources sit at fixed world
 positions**, not at a bearing from the listener. Only then is every listening position judged against
-the same physical sources, and only then does a fixed solve mean anything: its gains were computed for
-a source that must not move when the listener does.
+the same physical sources, and only then does a fixed solve mean anything. Its gains were computed
+for a source that must not move when the listener does.
 
 ## What the phantom is rendered by
 
@@ -50,13 +50,13 @@ A real engine core. `valid_speaker_feeds` places a push voice at the source, par
 the solve position, sets the knobs, and pumps blocks through `rt_render` into the 26-channel speaker
 bus, after `align.c`'s per-speaker trim and delay. What comes back out is what the array would emit.
 
-That matters because the shipping render is much more than a panner solve. Dual-band panning and CAP
-renormalize the low band, the spread modes and decorrelation reshape the gain vector, the hole-aware
-floor widens a source aimed into a hole, and tracked alignment re-references the per-speaker delays
-onto the live head. A harness that multiplied a stimulus by panner gains could sweep every one of
-those flags and measure nothing, which is exactly what it used to do.
+That matters because the shipping render is much more than a panner solve: dual-band and CAP
+renormalize the low band, the spread modes and decorrelation reshape the gain vector, the
+hole-aware floor widens, tracked alignment re-references the delays. A harness that multiplied a
+stimulus by panner gains could sweep every one of those flags and measure nothing. That is exactly
+what it used to do.
 
-Three things are forced for measurement and are not part of what is being measured:
+The harness forces three things for measurement. They are not part of what it measures:
 
 - **The limiter is off.** It is on by default at -1 dBFS and would quietly compress the very gains
   being read.
@@ -64,16 +64,15 @@ Three things are forced for measurement and are not part of what is being measur
 - **The tracked-alignment slew guards are opened wide.** They exist to manage the transient of a
   walking head. This measurement is steady-state.
 
-Blocks are rendered and discarded until the gain ramps, the alignment delay lines and the
-tracked-alignment glide have all settled, then the capture window is taken. Gains ramp rather than
-jump, so the first blocks after any change are a ramp, not the answer.
+The harness renders and discards blocks until the gain ramps, the alignment delay lines, and the
+tracked-alignment glide have settled. Then it takes the capture window. Gains ramp rather than
+jump, so the first blocks after any change are a ramp, not the answer. The harness creates the
+engine core once and reuses it across cells. The core has no audio thread and no wall clock, so a
+cell renders identically every run. The `valid` ctest pins both: a cell does not depend on which
+cell ran before it, and a cold engine renders the same cell as a warm one.
 
-The engine core is created once and reused across cells. It has no audio thread and no wall clock,
-so a cell renders identically every run. The `valid` ctest pins that both ways: a cell does not
-depend on which cell ran before it, and a cold engine renders the same cell as a warm one.
-
-**The physical reference arm does not go through the engine.** Driving one speaker alone involves no
-panner and no knob, and it is the floor everything else is quoted against, so it must not acquire
+**The physical reference arm does not go through the engine.** Driving one speaker alone involves
+no panner and no knob. It is the floor everything else is quoted against, so it must not acquire
 dependencies on engine runtime state. It still builds its feed the direct way.
 
 ## Two paths, one scorer
@@ -84,55 +83,45 @@ valid_speaker_feeds  →  [ play + record ]  →  valid_score  →  statistics
 ```
 
 `valid_score` is the seam. The hardware path plays real feeds into a real room and hands back a
-capture; the simulated path propagates the same feeds to the capsules analytically. Everything above
-the seam (scoring, medians, bootstrap intervals, contrasts, the report) is shared, so the two paths
+capture; the simulated path propagates the same feeds to the capsules analytically. Both paths share
+everything above the seam (scoring, medians, bootstrap intervals, contrasts, the report), so they
 cannot drift.
 
-The `valid` ctest pins that they agree: it builds feeds, propagates them the long way (explicit
-per-speaker sum, interpolated fractional delay, 1/r), scores that, and compares against the harness's
-own propagation. Worst disagreement 0.64°.
+Three pins hold the seam together, all in the `valid` ctest:
 
-The two arms now propagate differently, and that needs its own pin, because the
-physical-versus-phantom table **subtracts** them. The phantom arm propagates real engine feeds with a
-cubic fractional tap; the reference arm keeps the exact phase-domain model, which a feed built from
-one stimulus still allows. Drive one speaker alone through both and they agree to 0.02° and 0.01 dB
-of comb depth, so the matched contrast is a difference between renders and not between models.
+- **Feed/analytic agreement.** Feeds propagated the long way (explicit per-speaker sum,
+  interpolated fractional delay, 1/r) score against the harness's own propagation to a worst
+  disagreement of 0.64°.
+- **The two arms' propagation models agree**, which matters because the physical-versus-phantom
+  table **subtracts** them: the phantom arm uses a cubic fractional tap, the reference arm keeps
+  the exact phase-domain model. One speaker driven through both agrees to 0.02° and 0.01 dB of
+  comb depth, so the matched contrast is a difference between renders, not between models.
+- **The engine reroute is a plain gain.** With every knob off, the engine render reproduces the
+  pre-engine feed builder (`valid_speaker_feeds_direct`, still exported for this) to about 1e-7
+  of peak across all three panners: float rounding (float gain then float trim, versus one folded
+  double multiply). Anything larger would mean something in the render path stopped being a
+  plain gain.
 
-It also pins the reroute itself. With every knob off, the engine render reproduces the pre-engine
-feed builder (`valid_speaker_feeds_direct`, still exported for exactly this) to about 1e-7 of peak
-across all three panners. That is float rounding, not a difference in what is rendered: the engine
-multiplies a float sample by a float gain and then by a float trim, where the direct builder folds
-gain and trim into one double and multiplies once. Anything larger would mean something in the render
-path stopped being a plain gain.
-
-The same unification happens one level up, in the tool. `bwa_validate` runs **one** session loop with
-two capture backends, so `--simulate` is not a shortcut around the hardware path: it executes the
-same placement loop, the same once-per-placement capsule check, the same exclusion threading, and the
-same reporting the rig will run. Only the handful of lines that actually talk to ASIO go untested,
-which is the irreducible part.
+The same unification happens one level up: `bwa_validate` runs **one** session loop with two
+capture backends, so `--simulate` executes the same placement loop, capsule check, exclusion
+threading, and reporting the rig will run. Only the handful of lines that actually talk to ASIO
+go untested. That is the irreducible part.
 
 ### What simulate does and does not include
 
-`valid_simulate` builds the field a ZM-1 records in an **anechoic** free field: it takes the real
-engine feeds and adds 1/r spreading and the propagation delay to each of the 19 capsules, summed
-coherently. So it has the real phantom-source physics, inter-speaker interference included, which is
-where phantom error comes from.
+`valid_simulate` builds the field a ZM-1 records in an **anechoic** free field: the real engine
+feeds plus 1/r spreading and the propagation delay to each of the 19 capsules, summed coherently.
+So it has the real phantom-source physics, inter-speaker interference included, which is where
+phantom error comes from. The fractional part of each delay is a 4-tap Lagrange (cubic)
+interpolation. At these frequencies (analysis band under 1200 Hz against 48 kHz) the interpolator
+is flat to better than 1e-5 dB, four orders below the ripple comb depth reports.
 
-The fractional part of each delay is a 4-tap Lagrange (cubic) interpolation. The pre-engine model
-carried every delay as a phase shift and was exact, which a feed built from one stimulus allows and
-an engine render does not. Cubic costs almost nothing at these frequencies: the analysis band tops
-out at 1200 Hz against a 48 kHz rate, where the interpolator is flat to better than 1e-5 dB, four
-orders below the ripple comb depth reports.
-
-It has **no room**.
-
-Measured phantom error in a real room is roughly a rendering term plus a room term. Simulate isolates
-the rendering term, which is the one placement and panner choice control, and the one that varies as
-the listener walks. Do not read a simulated miss as a predicted in-room miss. Read it as the floor
-the room then adds to.
-
-Modeling the room here would repeat the trap `calibration.md` warns about with RT60: the physical
-room supplies its own acoustics, and baking a model of it into the measurement double-counts.
+It has **no room**. Measured phantom error in a real room is roughly a rendering term plus a room
+term. Simulate isolates the rendering term, the one placement and panner choice control and the
+one that varies as the listener walks. Do not read a simulated miss as a predicted in-room miss;
+read it as the floor the room then adds to. Modeling the room here would repeat the RT60 trap
+(`calibration.md`): the physical room supplies its own acoustics, and baking a model of it into
+the measurement double-counts.
 
 ## The estimator: active intensity (`zylia_intensity_doa`)
 
@@ -176,7 +165,7 @@ looks broken: `|b_n|` is identical, so levels, diffuseness, and conditioning are
 the DOA comes back exactly 180° out. Exactly 180, because the residual factor is
 `cos(2(θ₀ − θ₁))` and at low `ka` consecutive degrees sit 90° apart.
 
-This is the same class of bug as the `steam_decode` DC-polarity incident. It **cannot** be caught by
+This is the same class of bug as the `steam_decode` DC-polarity incident. You **cannot** catch it by
 synthesizing test input from the model being inverted, because the error cancels on both sides. The
 `zylia` test pins it with a pure geometric-delay forward model and a cross-check against the TDOA
 estimator instead. Do not "simplify" that test into a spherical-harmonic round trip.
@@ -187,12 +176,12 @@ Check the capsules before believing any direction.
 
 The failure this exists for is not a quiet one. A dead capsule goes to zero and is obvious. A capsule
 that goes **hot**, self-noise or a failing preamp, keeps the array's total power looking perfectly
-healthy while corrupting the spherical-harmonic projection, because every SH channel is a weighted
-sum over *all* capsules.
+healthy while it corrupts the spherical-harmonic projection. Every SH channel is a weighted sum over
+*all* capsules.
 
 **Two estimators agreeing does not clear this.** A hot capsule poisons every SH-domain estimator
-identically, so intensity and steered-power will agree with each other and both be wrong. This has to
-be caught on the raw signals or not at all.
+identically, so intensity and steered-power will agree with each other and both be wrong. You have to
+catch this on the raw signals or not at all.
 
 ```c
 int zylia_check_capsules(const float* const x[ZYLIA_MICS], uint32_t n,
@@ -202,8 +191,8 @@ int zylia_check_capsules(const float* const x[ZYLIA_MICS], uint32_t n,
 Returns the number of faulty capsules. Flags are `ZYLIA_CAP_DEAD`, `_HOT`, `_CLIPPED`,
 `_INCOHERENT`. Everything is judged against the array's own **robust median**, so a fault cannot
 define the baseline it is measured by. The coherence check correlates each capsule against the
-per-sample median signal over a small lag search, which catches a capsule at the right level carrying
-the wrong signal, and does not mistake a healthy off-axis capsule for a broken one.
+per-sample median signal over a small lag search. That catches a capsule at the right level carrying
+the wrong signal, and it does not mistake a healthy off-axis capsule for a broken one.
 
 The flags array drops straight in as the `exclude` argument to either estimator. That is the intended
 flow: check, report what you dropped, then estimate on what is left. **Report every exclusion.** A
@@ -253,20 +242,17 @@ what a single coherent arrival gives.
 
 ### The axis is frequency, not the capsules
 
-This is the design mistake worth naming, because it is the natural one to make.
+This is the design mistake worth naming, because it is the natural one to make. The ZM-1's shell
+is 49 mm, so the widest capsule pair sits 98 mm apart. Across 400–1200 Hz every pair lies within
+0.11 to 0.34 of a wavelength, so all 19 capsules see very nearly the **same** comb. They average
+its noise down; they do not sample it independently. A statistic taken *across* capsules
+measures nothing: the statistic is roughness **along frequency**, computed per capsule, and the
+capsules only average it.
 
-The ZM-1's shell is 49 mm, so the widest capsule pair sits 98 mm apart. The 400–1200 Hz band spans
-wavelengths from 0.86 m down to 0.29 m, so every pair lies within 0.11 to 0.34 of a wavelength. All 19
-capsules see very nearly the **same** comb. They average its noise down. They do not sample it
-independently.
-
-So a statistic taken *across* capsules measures nothing. The statistic is roughness **along
-frequency**, computed per capsule, and the capsules only average it.
-
-`quality_out` is the one honest use of the capsule axis: it is the standard error of that average, not
-the raw spread, because the spread is what the averaging already handled. It reads the opposite way to
-`diffuseness`: 1 is good. Below about 0.5 the capsules are not seeing one comb, so suspect a capsule
-fault, a band far above the shell's coherence, or a capture that drifted.
+`quality_out` is the one honest use of the capsule axis: the standard error of that average, not
+the raw spread (the spread is what the averaging already handled). It reads the opposite way to
+`diffuseness`: 1 is good. Below about 0.5 the capsules are not seeing one comb, so suspect a
+capsule fault, a band far above the shell's coherence, or a capture that drifted.
 
 ### Read it as an excess, never as an absolute
 
@@ -319,7 +305,7 @@ carries into one condition per value:
 
 **One knob at a time is the default, and rig time is why.** A full factorial over these axes is 2^N
 sessions' worth of cells and answers a question nobody asked. What settles a knob is its contrast
-against a fixed baseline on the same directions at the same placements, so the tool measures the
+against a fixed baseline on the same directions at the same placements. So the tool measures the
 baseline plus one condition per non-baseline value. That is N extra passes, not 2^N. `--factorial`
 takes the cross product when you genuinely suspect an interaction.
 
@@ -338,13 +324,9 @@ an absolute.
 
 ### Focus, and where the sweep has power
 
-Focus is the oldest of these knobs and the most studied here. It exists because focus was dialed by
-ear and nothing could put a figure on what dialing it did.
-Focus sets how many speakers carry a source. More speakers means more coherent copies interfering, so
-the knob trades image tightness against comb depth, and comb depth is now a number.
-
-**Where the sweep has power, and where it does not.** Two target populations behave completely
-differently, and mixing them hides the effect:
+Focus sets how many speakers carry a source. More speakers means more coherent copies
+interfering, so the knob trades image tightness against comb depth, and comb depth is now a
+number. Two target populations behave completely differently, and mixing them hides the effect:
 
 | target | what a tight lobe does | sweep |
 | --- | --- | --- |
@@ -395,11 +377,11 @@ computed for the correction is identity. Row three is the same knob on a layout 
 aligned anywhere, and the comb only falls part way. **Calibrate first, then A/B this.**
 
 Row three understates the risk. On an uncalibrated layout the knob does not merely help less, it can
-measure **worse**. A `--simulate --tracked-align both` run over the shipped example layout, which
-carries unity trims and no delays, has DBAP's comb going 7.04 to 7.71 dB at one placement and SPCAP's
-miss going 1.1 to 4.6 degrees at another, both in the wrong direction. Re-referencing an alignment
-that was never established just displaces speakers that were already coincident. Judge this knob on a
-surveyed layout or do not judge it at all.
+measure **worse**. The shipped example layout carries unity trims and no delays. A
+`--simulate --tracked-align both` run over it has DBAP's comb going 7.04 to 7.71 dB at one placement
+and SPCAP's miss going 1.1 to 4.6 degrees at another, both in the wrong direction. Re-referencing an
+alignment that was never established just displaces speakers that were already coincident. Judge
+this knob on a surveyed layout or do not judge it at all.
 
 **The other knobs, DBAP on the built-in grid, source width 0.5:**
 
@@ -415,22 +397,20 @@ surveyed layout or do not judge it at all.
 The dual-band and CAP rows are the smallest movers of the set, and that is expected rather than
 disappointing: both act below 700 Hz and the analysis band starts at 400 Hz, so most of what the
 estimator sees is untouched. Read those two as "the knob reaches the feeds", not as a verdict. The
-test asserts reachability for this whole group and nothing about direction, because which way a
-single-point intensity vector moves under a spread mode is a property of the array, and asserting it
-would bake today's answer into a regression test.
+test asserts reachability for this whole group and nothing about direction. Which way a single-point
+intensity vector moves under a spread mode is a property of the array, and an assertion on it would
+bake today's answer into a regression test.
 
-**Decorrelation looks good in one cell and does not survive the sweep.** A single condition at source
-width 0.5 on the built-in grid has it improving both numbers, miss 11.9° to 9.5° and comb 9.93 to
-6.50 dB, which reads like a candidate for defaulting ON. Sweep it properly
-(`--simulate --spread 0.5 --decorrelation both`) and that disappears. At the sweet spot it is worse on
-both axes for all three panners, SPCAP worst at miss 1.0° to 3.0° and comb 5.48 to 7.53 dB. Off-center
-it is mixed, helping VBAP on both and hurting SPCAP on both. Nothing here supports a default change.
-
-Two things to take from that. One, a single cell is not evidence, which is the entire reason this tool
-sweeps directions and placements. Two, the same caution as the hole-aware floor applies: the simulated
-path is anechoic and every cell is a static point, while decorrelation earns its keep by stopping a
-wide source collapsing or comb-filtering **as the listener moves through a room**. So this sweep
-bounds the knob's cost and cannot see its benefit. Leave it off by default and settle it by ear.
+**Decorrelation looks good in one cell and does not survive the sweep.** A single condition at
+source width 0.5 on the built-in grid has it improving both numbers (miss 11.9° to 9.5°, comb
+9.93 to 6.50 dB), which reads like a candidate for defaulting ON. Sweep it properly
+(`--simulate --spread 0.5 --decorrelation both`) and that disappears: at the sweet spot it is
+worse on both axes for all three panners (SPCAP worst, miss 1.0° to 3.0° and comb 5.48 to
+7.53 dB), and off-center it is mixed. Nothing here supports a default change. Two lessons.
+First, a single cell is not evidence (the entire reason this tool sweeps directions and
+placements). Second, the sweep bounds the knob's cost while it stays blind to the benefit, which is
+stopping a wide source collapsing or comb-filtering **as the listener moves through a room**. Every
+cell here is a static anechoic point. Leave it off by default and settle it by ear.
 
 **The hole-aware spread floor needs a barrel and a decisive floor.** On a barrel of 8 perimeter
 positions at 3 heights with the listener at 1.4 m, a source at the listener's nadir, VBAP:
@@ -442,34 +422,29 @@ positions at 3 heights with the listener at 1.4 m, a source at the listener's na
 | strength 2.0 | 33.5° | 7.44 | 0.539 |
 
 Comb depth falls at both strengths, which is the feature's own claim: fewer near-equal coherent
-copies. But read the whole table before you conclude anything, because **on these numbers the knob
-looks bad**. It costs 8.4° of angular miss to buy 0.48 dB of comb, and diffuseness, the one column
-that would show the image actually getting wider, goes the wrong way at strength 1.0 and only rises
-at 2.0.
+copies. But **on these numbers the knob looks bad**: it costs 8.4° of angular miss to buy 0.48 dB
+of comb. Diffuseness, the one column that would show the image actually getting wider, goes the
+wrong way at strength 1.0 and only rises at 2.0.
 
-The reason is not that the feature misbehaves. It is that these three estimators can see the knob's
-cost and cannot see its benefit. The claim is that a source with no speaker near it is better
-rendered as an honestly wide image than as a split image across two distant speakers, and a
-single-point intensity vector has no way to prefer the second: it reports where the net energy flux
-points, and widening genuinely moves that away from nadir toward the rim where the speakers are. The
-angular miss is real, not an artifact. Whether it is worth paying is a by-ear question this tool
-cannot answer.
-
-So: **do not A/B the hole-aware floor on `bwa_validate` numbers alone.** Judged that way the evidence
-says leave it off, and the evidence is not wrong, it is incomplete. Use the comb column to confirm
+The reason is not that the feature misbehaves; these estimators can see the knob's cost and
+cannot see its benefit. The claim is that a source with no speaker near it is better rendered
+honestly wide than as a split image across two distant speakers. A single-point intensity
+vector has no way to prefer the first: widening genuinely moves the net energy flux away from
+nadir toward the rim where the speakers are. The angular miss is real, not an artifact. So: **do
+not A/B the hole-aware floor on `bwa_validate` numbers alone.** Use the comb column to confirm
 the knob is doing something, then settle it by ear.
 
-One more caveat on the strengths. This barrel's nadir gap is 59° against a 33.7° knee, so strength
-1.0 derives a floor of only 0.45, which moves diffuseness by less than the scatter between
-neighboring bearings. A layout with a wider hole would show a decisive floor and a clearer picture.
+One caveat on the strengths: this barrel's nadir gap is 59° against a 33.7° knee, so strength 1.0
+derives a floor of only 0.45. That moves diffuseness by less than the scatter between
+neighboring bearings. A layout with a wider hole would show a decisive floor.
 
 On the default 26-speaker grid the floor is 0 in every direction **from the reference**, and the tool
-measures the knob as identical renders there. Do not read that as unconditional inertness. The knee is
-measured from `Layout.ref` while the gap follows the live listener, so angular gaps stretch off-center:
-the grid's worst gap runs 27.5 degrees at center, 39.7 at 0.7 m out and 61 at a corner, against a 37.5
-degree knee. A hole-free array can therefore derive a floor at an off-center placement, which is the
-feature working rather than misfiring. The inertness this tool observes on the default placements is
-real but placement-dependent, not structural.
+measures the knob as identical renders there. Do not read that as unconditional inertness. The knee
+comes from `Layout.ref` while the gap follows the live listener, so angular gaps stretch
+off-center. The grid's worst gap runs 27.5 degrees at center, 39.7 at 0.7 m out and 61 at a corner,
+against a 37.5 degree knee. A hole-free array can therefore derive a floor at an off-center
+placement, which is the feature working rather than misfiring. The inertness this tool observes on
+the default placements is real but placement-dependent, not structural.
 
 ## Running it
 
@@ -513,7 +488,7 @@ bwa_validate --simulate --tracked-align both --dual-band both --cap both
 | `--inject-fault <ch>` | self-check, see below |
 
 The built-in placements are a plausible walking envelope, not your room. Pass your own with
-`--position` or `--positions` and give them labels; the labels come back in the report and the CSV,
+`--position` or `--positions` and give them labels. The labels come back in the report and the CSV,
 which matters once you have more than about four.
 
 ```
@@ -526,32 +501,28 @@ which matters once you have more than about four.
 ### Tracking the microphone instead of measuring it
 
 `--track <id|name> --survey <body-frame survey>` follows the ZM-1's stand as a tracked rigid body.
-The pose then supplies both things a typed placement cannot.
+The pose supplies both things a typed placement cannot:
 
-**Position.** A tape-measure number carries whatever error your tape does, and at the 1.4 m source
-radius a 5 cm error injects about 2° of direction error, which is the size of the phantom penalties
-being measured. Worse, in *tracked* mode the mic position is also the solve position, so a
-mis-measured mic is mathematically identical to a tracking error and you cannot separate the two
-afterwards.
+**Position.** At the 1.4 m source radius a 5 cm tape-measure error injects about 2° of direction
+error, the size of the phantom penalties you are measuring. Worse, in *tracked* mode the mic
+position is also the solve position, so a mis-measured mic is mathematically identical to a
+tracking error. You cannot separate the two afterwards.
 
-**Orientation, which is the bigger prize.** A survey pins the array's orientation for *that*
-mounting. The session remounts the mic six or seven times, and each remount is a fresh unknown yaw.
-Fitting that rotation back out of the data is possible but statistical, and it conflates mount error
-with the measurement. With a tracked stand it is measured:
+**Orientation, the bigger prize.** A survey pins the array's orientation for *that* mounting, and
+each remount is a fresh unknown yaw. With a tracked stand the tracker measures it:
 
 ```
 capsules_room = R(pose) · capsules_body        center = pose_pos + R(pose) · offset
 ```
 
-So the workflow becomes **survey once, then track**. Run `zylia_survey` at any convenient mount pose,
-rotate the result into the stand's body frame, save it with a `ZyliaMount`, and it is good for every
-placement afterwards. The `zylia` test measures the payoff on synthetic data: a remount that leaves
+So the workflow is **survey once, then track**: run `zylia_survey` at any convenient mount pose,
+rotate the result into the stand's body frame, save it with a `ZyliaMount`, and it is good for
+every placement afterwards. Measured payoff (`zylia` test, synthetic data): a remount that leaves
 the stale survey **18.1° wrong** is reconstructed to **0.033°** from the live pose.
 
-You do not need markers on the sphere. Mount it to something the cameras already see and probe the
-offset from the stand's body origin to the array's acoustic center. For a rigid sphere that center is
-unambiguous (it is the geometric center), unlike a general microphone where "where is it,
-acoustically" is a real question.
+You do not need markers on the sphere: mount it to something the cameras already see and probe
+the offset from the stand's body origin to the array's acoustic center, which for a rigid sphere
+is unambiguously the geometric center.
 
 Two things the tool will not do for you:
 
@@ -562,50 +533,45 @@ Two things the tool will not do for you:
   cannot solve for that center. The rotation falls out of the survey plus one pose sample; the
   translation does not.
 
-With `--track` the placements you pass become the **plan**, not the measurement. The tool prints the
-tracked position beside the planned one with the delta, and warns past half a meter: a wrong rigid
-body or a frame mix-up shows up immediately rather than as a puzzling result three hours later.
-
-This is also the undemanding use of the tracker: the mic is static during a capture, so one good pose
-per placement is enough. No prediction, no velocity, no clock-domain question, none of the parts of
-the render path that make `natnet.c` hard.
+With `--track` the placements you pass become the **plan**, not the measurement. The tool prints
+tracked beside planned with the delta, and warns past half a meter: a wrong rigid body or a frame
+mix-up shows up immediately rather than as a puzzling result three hours later. This is also the
+undemanding use of the tracker: the mic is static during a capture, so one good pose per
+placement is enough.
 
 Two safety behaviors worth knowing:
 
 - **A stale pose is refused, not reused.** `pose_read` hands back the last *published* pose forever,
-  and NatNet only publishes tracking-valid frames, so an occluded stand or a wrong streaming id would
-  silently return the *previous* placement's pose and have it accepted as this one's measurement.
-  Each placement is gated on `natnet_status() == LIVE`; one with no live pose is skipped and reported
-  rather than measured against a stale one.
+  and NatNet only publishes tracking-valid frames. So an occluded stand or a wrong streaming id would
+  silently return the *previous* placement's pose, and the tool would accept it as this one's
+  measurement. Each placement is gated on `natnet_status() == LIVE`. A placement with no live pose is
+  skipped and reported rather than measured against a stale one.
 - **`--track-sim` proves the wiring** without a rig: it drives the same path from a synthetic mount
   pose and exits nonzero unless the placement hook fired for every placement. That check exists
-  because the hook was once passed into the session loop and never called, leaving `--track` inert
+  because the hook was once passed into the session loop and never called. `--track` stayed inert
   while it announced the tracker was measuring. Asserting on the *result* would not have caught it:
   in simulate the field is synthesized from the same capsule table the estimator reads, so a wrong
   table cancels out and looks healthy. It is the `validate_track` ctest.
 
 ### The physical reference arm
 
-Every miss elsewhere in this doc is an **absolute** number, so it silently folds together what the
-estimator costs, what the layout survey costs, what the room costs, and what the renderer costs.
-Separating them needs a real source measured through the same chain in the same room, which is why
-the published protocol moved a physical loudspeaker to each target across dozens of sessions.
+Every miss elsewhere in this doc is an **absolute** number: it silently folds together what the
+estimator, the layout survey, the room, and the renderer each cost. Separating them needs a real
+source measured through the same chain in the same room. That is why the published protocol
+moved a physical loudspeaker to each target across dozens of sessions. You do not have to move
+anything: **the array's own speakers are physical sources at known positions.** Drive speaker *i*
+alone, no panning, and the estimator's answer is a real-source measurement. On by default;
+`--no-reference` skips it. It buys two things:
 
-We do not have to move anything: **the array's own speakers are physical sources at known
-positions.** Drive speaker *i* alone, no panning, and the estimator's answer is a real-source
-measurement. On by default; `--no-reference` skips it.
+**A floor.** The reported `physical floor` is what the chain costs before any panning happens:
+around 0.1° in anechoic simulate, larger on hardware, and the increase *is* the room's
+contribution plus your survey error. If it is not small, stop: a directly driven speaker that
+does not land on its surveyed position means nothing measured afterwards is interpretable. You find
+that out in seconds rather than after a session.
 
-It buys two things.
-
-**A floor.** The reported `physical floor` is what the chain costs before any panning happens. In
-anechoic simulate it lands around 0.1°. On hardware it will be larger, and the increase *is* the
-room's contribution plus your survey error. If it is not small, stop: a directly driven speaker that
-does not land on its surveyed position means nothing measured afterwards is interpretable, and you
-find that out in seconds rather than after a session.
-
-**A matched contrast.** Render a phantom at speaker *i*'s own position and you have the same
-direction, the same room and the same placement measured both ways, so the pair differences cleanly.
-That is the published physical-versus-phantom comparison, obtained without moving a loudspeaker.
+**A matched contrast.** Render a phantom at speaker *i*'s own position. The tool then measures the
+same direction, room, and placement both ways, so the pair differences cleanly: the published
+physical-versus-phantom comparison, obtained without moving a loudspeaker.
 
 Two things to know before reading that table:
 
@@ -624,13 +590,12 @@ difference is a genuine characterization of the panners, not an artifact.
 
 ### Stimulus, and where content dependence actually comes from
 
-`--tone <hz>` swaps the broadband default for a sustained tone. The analysis band follows: broadband
-gets 400–1200 Hz, a tone gets ±1/6 octave around itself, and a tone whose band sits entirely above
-the array's first-order ceiling is refused **with its frequency named**, rather than failing
-mysteriously per cell.
+`--tone <hz>` swaps the broadband default for a sustained tone. The analysis band follows:
+broadband gets 400–1200 Hz, a tone gets ±1/6 octave around itself, and a tone whose band sits
+entirely above the array's first-order ceiling is refused **with its frequency named**.
 
-Localization is strongly content-dependent, and it is natural to credit that entirely to the room.
-That is not the whole story, and the harness can show why.
+Localization is strongly content-dependent, and it is natural to credit that entirely to the
+room. That is not the whole story:
 
 | | anechoic (simulate) | in a room |
 | --- | --- | --- |
@@ -664,7 +629,7 @@ else.
 `zylia_check_capsules` to catch it at every placement. Exit code 3 if it does not.
 
 Use it before trusting a session. It exercises the check, the reporting, and the exclusion threading
-end to end on the exact signals your rig produces, and it costs one extra run. It works on hardware
+end to end on the exact signals your rig produces. It costs one extra run. It works on hardware
 captures too, not only in simulate, so you can confirm the chain against your real room and your real
 noise floor rather than against a model of them.
 
@@ -691,9 +656,9 @@ The same three axes as a `--factorial` is 3 × 2 × 3 = 18 conditions, which is 
 but add `--spread-mode all` and `--decorrelation both` and it is 108, six times the session.
 
 **Only the microphone moves.** Phantom sources are rendered, not carried, so a whole direction grid
-sweeps electronically from one placement. That inverts the usual cost of this measurement: a study
-that moves a physical reference speaker needs one session per direction, this needs one per
-*listening position* and gets every direction free. Half a dozen placements covers the walking
+sweeps electronically from one placement. That inverts the usual cost of this measurement. A study
+that moves a physical reference speaker needs one session per direction. This tool needs one per
+*listening position*, and it gets every direction free. Half a dozen placements covers the walking
 envelope.
 
 Measure each placement, do not eyeball it. The mic position is an input to the scoring.
@@ -706,8 +671,8 @@ concurrently and analyze a window well inside the steady state, so device latenc
 and the Digiface's own delay never reach the result. `VAL_SKIP` is simply "long enough that everything has
 arrived".
 
-`ASIOGetLatencies` is still logged at open, as a routing sanity check only. If it looks absurd, the
-routing is wrong, and that is worth knowing before you spend an afternoon collecting cells.
+The tool still logs `ASIOGetLatencies` at open, as a routing sanity check only. If it looks absurd,
+the routing is wrong, and that is worth knowing before you spend an afternoon collecting cells.
 
 ### Getting the ZM-1 onto the same device
 
@@ -758,7 +723,7 @@ worked example, not as a result about your installation.
 | height, 0.4 m | all three intervals include zero |
 
 Height still hurts in absolute terms (SPCAP 1.9° → 7.9°). The panner solve re-aims correctly for your
-new height; what it cannot undo is that the array's vertical resolving power from there is worse, and
+new height. What it cannot undo is that the array's vertical resolving power from there is worse, and
 that the alignment delays were computed for one reference height. **Horizontal displacement is a
 tracking problem. Height is a placement and calibration problem.** Different failure, different
 remedy, and pooling them into one "off-center" number hides both.
@@ -774,7 +739,7 @@ the harness measures acoustically. Spearman ρ against the measurement:
 | VBAP | 0.19 | **0.77** |
 
 So the axis worth optimizing is not the same for every panner. VBAP puts all energy on two or three
-speakers and gets direction right by construction, leaving image focus to carry the variation; DBAP
+speakers and gets direction right by construction, so image focus carries the variation. DBAP
 spreads energy over many speakers, so its direction error genuinely varies and tracks the acoustic
 outcome. `bwa_layout_tool` now defaults its focus weight and its badness-map metric per panner on
 exactly this basis, see `layout-schema.md`.
@@ -809,8 +774,8 @@ Say these out loud before quoting any number from this tool.
 The phantom arm renders through the engine, so the knobs reach the measurement. Three of their claims
 still do not.
 
-- **CAP's head-rotation claim.** Every cell is measured with the listener facing room-ahead, because
-  the pose the harness hands the engine is position plus identity orientation. CAP is the one engine
+- **CAP's head-rotation claim.** The harness measures every cell with the listener facing room-ahead,
+  because the pose it hands the engine is position plus identity orientation. CAP is the one engine
   feature that reads head **orientation** into the speaker path, and its claim is that the rendered
   ITD stays correct as you turn your head. A spherical array at a fixed point cannot see that at all.
   It needs the rotating two-mic rig below. What the sweep does measure is CAP facing ahead, which is
@@ -821,36 +786,29 @@ still do not.
   cell here is a static point. You can measure a walking envelope one placement at a time and read
   the spread across placements, which is worth doing, but it is not the same as measuring what
   motion does.
-- **Beds at all.** The harness renders a point source. The ambisonic bed path, its decoder choice and
-  the max-rE taper never enter, so `--spread-mode` and friends are measured on the point panner only.
-  This is a deliberate omission, not a gap waiting to be filled. Three reasons. The bed is the layer
-  the engine renders with a **static** decode precisely because diffuse energy is not sweet-spot
-  sensitive, so this tool's whole reason for existing, keeping the solve position and the microphone
-  position apart, does not apply to it. The decoder and the taper already have a metric: the layout
-  tool scores them offline through the engine's real AllRAD and EPAD builds
-  (`--score <layout> [epad] maxre`), and it orders them decisively, with `dsp_test` pinning EPAD's
-  energy flatness besides. And what is left after that is a by-ear question that
-  [hardware-validation.md](./hardware-validation.md) already schedules as a trial with a stated prior
-  and a binomial test. A third measurement of a settled ordering is rig time spent on confirmation.
-
-  The exception, if you ever want one, is `bwa_set_bed_renderer`. Alone among the bed knobs its claim
-  is **position dependent**, it has no offline metric, and no trial is scheduled for it. That makes it
-  the one bed question this tool's placement sweep is actually shaped to answer. The build would be
-  narrow: encode a plane wave at each target direction, render it through the bed path, and score it
-  with the DOA machinery and the placements that already exist. The taper would come along in the same
-  mode for free, which would give the pending `bwa_set_max_re` default flip its rig confirmation.
+- **Beds at all.** The harness renders a point source; the bed path, its decoder choice, and the
+  max-rE taper never enter. A deliberate omission, for three reasons: the bed is rendered with a
+  **static** decode precisely because diffuse energy is not sweet-spot sensitive, so this tool's
+  solve-versus-microphone seam does not apply to it; the decoder and taper already have an
+  offline metric that orders them decisively (`--score <layout> [epad] maxre`, with `dsp_test`
+  pinning EPAD's energy flatness); and what remains is a by-ear question
+  [hardware-validation.md](./hardware-validation.md) already schedules with a stated prior and a
+  binomial test. The exception, if you ever want one, is `bwa_set_bed_renderer`: alone among the
+  bed knobs its claim is **position dependent**, it has no offline metric, and no trial is
+  scheduled for it. The build would be narrow (encode a plane wave per target direction, render
+  through the bed path, score with the DOA machinery and the existing placements), and the taper
+  would come along in the same mode for free. That gives the pending `bwa_set_max_re` default flip
+  its rig confirmation.
 
 ## Not built yet: the rotating two-mic ITD rig
 
-`bwa_set_dual_band_cap` (compensated amplitude panning, [spatialization.md](./spatialization.md)) claims the
-rendered ITD stays correct **as the listener turns their head**. Nothing in this tool can see that. A
-spherical microphone array measures the field at a point; ITD is a property of two ears on a head, and
-rotating the ZM-1 does not create one. `--cap both` measures CAP facing room-ahead, which is the case
-where it is closest to a no-op, so CAP still has unit-test evidence and no hardware evidence for the
-claim that actually distinguishes it.
+`bwa_set_dual_band_cap` ([spatialization.md](./spatialization.md)) claims the rendered ITD stays
+correct **as the listener turns their head**. Nothing in this tool can see that: a spherical
+array measures the field at a point, and ITD is a property of two ears on a head. So CAP has
+unit-test evidence and no hardware evidence for the claim that actually distinguishes it.
 
-The instrument that would settle it is cheap. Two omnis at ear spacing on a rigid sphere, rotated
-through yaw, with the ITD read by cross-correlation. Notes for whoever builds it:
+The instrument that would settle it is cheap: two omnis at ear spacing on a rigid sphere, rotated
+through yaw, ITD read by cross-correlation. Notes for whoever builds it:
 
 - **Rotation is the measurement, not extra sampling.** A spherical array at a fixed point already
   samples the field completely up to its order, so turning it tells you nothing new about the field.
@@ -858,7 +816,7 @@ through yaw, with the ITD read by cross-correlation. Notes for whoever builds it
   about.
 - **The ZM-1 is a half-scale head.** Two roughly antipodal equatorial capsules on its ~10 cm sphere
   give a usable ITD proxy for free, before anyone buys anything. Rigid-sphere diffraction holds below
-  ka ~ 1, so a ~5 cm radius stays valid to about 1.1 kHz, which covers CAP's whole band and is
+  ka ~ 1, so a ~5 cm radius stays valid to about 1.1 kHz. That covers CAP's whole band, and it is
   actually a wider valid range than a real head's ~620 Hz. The cost is that the ITD comes out roughly
   half a head's, so this validates **stability under rotation** and **monotonicity with intended
   azimuth**, never absolute correctness. Stability is the discriminating half.
@@ -872,9 +830,9 @@ through yaw, with the ITD read by cross-correlation. Notes for whoever builds it
   number, and the sources disagree (VISR says ~1000 Hz, Zhao et al. 1500 Hz). Sweeping the analysis
   band on this rig answers it directly.
 
-The same rotation buys two things for free on the estimators already here: same field, different
-capsules, which separates capsule error from field structure far more sharply than
-`zylia_check_capsules` can from one orientation, and a direct bias check on
+The same rotation buys two things for free on the estimators already here. First, the same field
+through different capsules, which separates capsule error from field structure far more sharply than
+`zylia_check_capsules` can from one orientation. Second, a direct bias check on
 `zylia_intensity_doa`/`zylia_srp_doa`, whose estimates should rotate exactly with the array.
 
 ## Where the code lives

@@ -59,6 +59,7 @@ struct SteamScene {
     struct { uint32_t handle; float pos[3]; uint8_t features;
              float dir_weight, dir_power, fwd[3]; } *shadow;          /* [voice_cap] by voice slot */
     int           mesh_dirty;
+    int           pend_clear;   /* the staged change is an explicit CLEAR, not a replacement */
     uint32_t      mesh_gen;         /* bumped per staged mesh (under `lock`) ... */
     uint32_t      mesh_gen_applied; /* ... and raised to the taken gen once that mesh is COMMITTED —
                                      * steam_scene_flush waits on this, so "flushed" really means
@@ -145,6 +146,20 @@ static void mesh_mark_applied(SteamScene* s, uint32_t gen) {
     EnterCriticalSection(&s->lock);
     if ((int32_t)(gen - s->mesh_gen_applied) > 0) s->mesh_gen_applied = gen;
     LeaveCriticalSection(&s->lock);
+}
+
+/* (sim thread) Drop the committed static mesh and commit the now-empty scene. Same lock discipline as
+ * apply_mesh. This is what an explicit clear resolves to; without it the only way to "remove" geometry
+ * was to replace it with something harmless, and a caller really did ship a degenerate triangle parked
+ * far off-scene to fake it. */
+static void clear_mesh(SteamScene* s, uint32_t gen) {
+    scene_w_lock(s);
+    if (s->mesh) { iplStaticMeshRemove(s->mesh, s->scene); iplStaticMeshRelease(&s->mesh); s->mesh = NULL; }
+    free(s->mesh_verts); free(s->mesh_tris); free(s->mesh_mi); free(s->mesh_mats);
+    s->mesh_verts = NULL; s->mesh_tris = NULL; s->mesh_mi = NULL; s->mesh_mats = NULL;
+    iplSceneCommit(s->scene);
+    scene_w_unlock(s);
+    mesh_mark_applied(s, gen);
 }
 
 static void apply_mesh(SteamScene* s, IPLVector3* verts, int nverts, IPLTriangle* tris, int ntris,
@@ -298,9 +313,11 @@ static DWORD WINAPI sim_thread(LPVOID arg) {
         /* 1. snapshot the shadow + take the pending mesh */
         IPLVector3* verts = NULL; IPLTriangle* tris = NULL; int nverts = 0, ntris = 0;
         IPLMaterial* mats = NULL; int nmat = 0; IPLint32* tri_mat = NULL; uint32_t mgen = 0;
+        int do_clear = 0;
         EnterCriticalSection(&s->lock);
         if (s->mesh_dirty) {
             s->mesh_dirty = 0;
+            do_clear = s->pend_clear; s->pend_clear = 0;
             mgen = s->mesh_gen;                            /* the taken buffers ARE this staged gen */
             verts = s->pend_verts; tris = s->pend_tris; nverts = s->pend_nverts; ntris = s->pend_ntris;
             mats = s->pend_mats; nmat = s->pend_nmat; tri_mat = s->pend_tri_mat;
@@ -319,7 +336,8 @@ static DWORD WINAPI sim_thread(LPVOID arg) {
 
         /* 2. apply geometry change: the static mesh, then reconcile the instanced movers. Both mutate +
          * commit the main scene under the exclusive scene lock (scene_w_lock/unlock). */
-        if (verts && tris && mats && tri_mat) apply_mesh(s, verts, nverts, tris, ntris, mats, nmat, tri_mat, mgen);
+        if (do_clear) { free(verts); free(tris); free(mats); free(tri_mat); clear_mesh(s, mgen); }
+        else if (verts && tris && mats && tri_mat) apply_mesh(s, verts, nverts, tris, ntris, mats, nmat, tri_mat, mgen);
         else { free(verts); free(tris); free(mats); free(tri_mat);     /* partial set: drop it intact... */
                if (mgen) mesh_mark_applied(s, mgen); }                 /* ...but never leave flush waiting */
         reconcile_dynamic(s);
@@ -472,7 +490,19 @@ fail:
 static void set_mesh_internal(SteamScene* s, const float* verts, int nverts, const int* tris, int ntris,
                               int nmat, const float* absorption, const float* scattering,
                               const float* transmission, const int* tri_material) {
-    if (!s || nverts <= 0 || ntris <= 0 || nmat <= 0) return;
+    if (!s) return;
+    /* Explicit CLEAR: no vertices, no triangles, no arrays. Distinguished from a malformed partial set
+     * (dropped intact below) by requiring BOTH pointers null AND both counts non-positive. */
+    if (!verts && !tris && nverts <= 0 && ntris <= 0) {
+        EnterCriticalSection(&s->lock);
+        free(s->pend_verts); free(s->pend_tris); free(s->pend_mats); free(s->pend_tri_mat);
+        s->pend_verts = NULL; s->pend_tris = NULL; s->pend_mats = NULL; s->pend_tri_mat = NULL;
+        s->pend_nverts = s->pend_ntris = s->pend_nmat = 0;
+        s->pend_clear = 1; s->mesh_dirty = 1; s->mesh_gen++;
+        LeaveCriticalSection(&s->lock);
+        return;
+    }
+    if (nverts <= 0 || ntris <= 0 || nmat <= 0) return;
     if (!verts || !tris || !absorption || !scattering || !transmission) return;   /* tri_material may be NULL */
     IPLVector3*  v  = (IPLVector3*)malloc((size_t)nverts * sizeof(IPLVector3));
     IPLTriangle* t  = (IPLTriangle*)malloc((size_t)ntris  * sizeof(IPLTriangle));
@@ -497,6 +527,8 @@ static void set_mesh_internal(SteamScene* s, const float* verts, int nverts, con
     s->pend_tris = t;  s->pend_ntris = ntris;
     s->pend_mats = m;  s->pend_nmat = nmat;
     s->pend_tri_mat = mi; s->mesh_dirty = 1;
+    s->pend_clear = 0;                             /* a real set SUPERSEDES a staged clear; leaving the
+                                                    * flag set would clear this very mesh instead */
     s->mesh_gen++;                                 /* steam_scene_flush waits for THIS gen to commit */
     LeaveCriticalSection(&s->lock);
 }
@@ -516,17 +548,23 @@ void steam_scene_flush(SteamScene* s) {
     IPLVector3* verts = NULL; IPLTriangle* tris = NULL; int nverts = 0, ntris = 0;
     IPLMaterial* mats = NULL; int nmat = 0; IPLint32* tri_mat = NULL;
     uint32_t target, mgen = 0;
+    int do_clear = 0;
     EnterCriticalSection(&s->lock);
     target = s->mesh_gen;
     if (s->mesh_dirty) {
         s->mesh_dirty = 0;
+        do_clear = s->pend_clear; s->pend_clear = 0;   /* part of the staged tuple, not a side flag */
         mgen = s->mesh_gen;
         verts = s->pend_verts; tris = s->pend_tris; nverts = s->pend_nverts; ntris = s->pend_ntris;
         mats = s->pend_mats; nmat = s->pend_nmat; tri_mat = s->pend_tri_mat;
         s->pend_verts = NULL; s->pend_tris = NULL; s->pend_mats = NULL; s->pend_tri_mat = NULL;
     }
     LeaveCriticalSection(&s->lock);
-    if (verts && tris && mats && tri_mat) apply_mesh(s, verts, nverts, tris, ntris, mats, nmat, tri_mat, mgen);
+    /* A staged CLEAR carries null buffers, so it MUST be recognised here. Falling through to the wait
+     * below blocks on a generation the sim thread can no longer apply (mesh_dirty was just consumed
+     * here), which hung bwa_start outright. */
+    if (do_clear) { free(verts); free(tris); free(mats); free(tri_mat); clear_mesh(s, mgen); }
+    else if (verts && tris && mats && tri_mat) apply_mesh(s, verts, nverts, tris, ntris, mats, nmat, tri_mat, mgen);
     else {
         free(verts); free(tris); free(mats); free(tri_mat);
         for (;;) {                                 /* sim thread claimed it: wait for its commit */

@@ -3,14 +3,15 @@
 How the speaker array (26 in the CAVE) is surveyed, trimmed, and characterized at install time, and
 how those numbers reach the engine. The tool is `bwa_calibrate` (`examples/calibrate.cpp`, opt-in
 `-DBWA_BUILD_CALIBRATE=ON`). The measurement DSP is `measure.c`; the solve + JSON writeback is
-`calib.c`. All of it is unit-tested off-hardware (`test_measure`, `test_calib`); the ASIO
+`calib.c`. All of it is unit-tested off-hardware (`test_measure`, `test_calib`). The ASIO
 full-duplex capture is the only part that needs the rig. Terms used here without definition are in
 [glossary.md](./glossary.md).
 
 **Everything here follows the layout's speaker count** (`n`, 4..26; see
-[`layout-schema.md`](./layout-schema.md)), not a hard-wired 26: the capture opens `n` ASIO outputs
+[`layout-schema.md`](./layout-schema.md)), not a hard-wired 26. The capture opens `n` ASIO outputs
 plus the mic input (which rides buffer slot `n`, or, with `--zylia`, the ZM-1's 19 capsule inputs
-on slots `n`..`n+18`), sweeps those `n` speakers, and writes `n` records back. `bwa_calib_view` likewise sizes its plots from each loaded layout, and refuses to Diff two
+on slots `n`..`n+18`). It sweeps those `n` speakers and writes `n` records back.
+`bwa_calib_view` likewise sizes its plots from each loaded layout. It refuses to Diff two
 layouts with different speaker counts rather than mis-compare them.
 
 ## The two layout tools
@@ -29,22 +30,21 @@ engine loads the layout.
 Each speaker plays a Farina exponential sine sweep; an omni mic records it. `measure_response`
 recovers that speaker's impulse response by regularized deconvolution and reads two numbers: the
 **delay** (direct-path arrival = system latency + time of flight) and the **level** (broadband
-sensitivity). One sample at 48 kHz = 7 mm, and sub-sample peak interpolation gets well below that,
-so the limit is the mic-position accuracy and the assumed speed of sound, not the acoustics. Set the
+sensitivity). One sample at 48 kHz = 7 mm, and sub-sample peak interpolation gets well below that.
+So the limit is the mic-position accuracy and the assumed speed of sound, not the acoustics. Set the
 second one: see "Air temperature" below.
 
 Use an **omnidirectional** measurement mic. It's flat and direction-independent, so each speaker's
-delay/level/response comes back uncolored. Measuring *through* the acoustically-transparent screens
-is correct: that's what the listener hears, and the screen's slight HF loss is captured in the trim
-automatically.
+delay/level/response comes back uncolored. Measure *through* the acoustically-transparent screens.
+That's what the listener hears, and the trim captures the screen's slight HF loss automatically.
 
 ## Air temperature
 
 Every range the survey solves is `c * delay`, and `c` moves about 0.6 m/s per degree C. A room at
-15 C runs 340.4 m/s and one at 25 C runs 346.4, so assuming the textbook 343.0 in a room that is not
-at 20 C biases every surveyed distance by up to 1%. At a 4 m range that is 4 cm, larger than both the
-7 mm timing resolution above and a tracker-placed mic, and an order of magnitude above the 2 to 3 mm
-capsule-geometry term the ZM-1 solve already bothers to correct.
+15 C runs 340.4 m/s and one at 25 C runs 346.4. Assume the textbook 343.0 in a room that is not at
+20 C and you bias every surveyed distance by up to 1%. At a 4 m range that is 4 cm, larger than both
+the 7 mm timing resolution above and a tracker-placed mic. It is an order of magnitude above the
+2 to 3 mm capsule-geometry term the ZM-1 solve already bothers to correct.
 
 Tell the tool the room temperature:
 
@@ -54,16 +54,16 @@ bwa_calibrate --layout cave_layout.json --temp 22.8  ...   # bare number or a C 
 bwa_calibrate --layout cave_layout.json --c 345.1    ...   # if you measured c directly
 ```
 
-The value is recorded into the layout as `reference.speed_of_sound_mps`, and every later run on that
-file picks it up, so you pass the flag once per rig rather than remembering it every session. An
+The tool records the value into the layout as `reference.speed_of_sound_mps`, and every later run on
+that file picks it up. So you pass the flag once per rig rather than remembering it every session. An
 explicit flag always beats the file. `bwa_layout_tool` reads the same field for its delay
 derivation, so the two tools agree on one file instead of quietly disagreeing by a temperature.
 
 A layout with no such field falls back to 343.0. `--simulate` synthesizes its arrival times at
-whichever `c` the run is using, not at a fixed 343.0, so a simulated survey stays self-consistent at
-any temperature and recovers the geometry it started from. That matching matters: generate at one
-`c` and solve at another and every solved position inflates by their ratio, silently, and
-`--localize` writes the result back.
+whichever `c` the run is using, not at a fixed 343.0. A simulated survey therefore stays
+self-consistent at any temperature and recovers the geometry it started from. That matching matters:
+generate at one `c` and solve at another, and every solved position inflates by their ratio,
+silently. Then `--localize` writes the result back.
 
 **This does not change what you hear.** 4 cm of speaker position error at 3 m is under half a degree
 of direction error, against the 4 to 6 degrees the array carries anyway. Set the temperature so the
@@ -73,7 +73,7 @@ it. Do not expect it to be audible.
 ## Modes
 
 - **`--localize positions.txt`**: acoustic self-survey. Capture every speaker at K ≥ 5 known mic
-  positions; `calib_trilaterate` solves each speaker's 3D position *and* the unknown constant system
+  positions. `calib_trilaterate` solves each speaker's 3D position *and* the unknown constant system
   latency jointly (linear least squares). This **sees speakers optical trackers can't**: the sweep
   passes through the screens. Pair it with the OptiTrack you already have for head tracking: put a
   marker on the *mic* (open line-of-sight) so OptiTrack hands you the known mic positions, and let
@@ -83,31 +83,31 @@ it. Do not expect it to be audible.
 
   The solved latency gets a free sanity check: at open, the capture shell logs the driver's own
   `ASIOGetLatencies` numbers (out + in = the **digital** half of the loop; the Digiface reports its Dante
-  buffering there), and after the solve the CLI prints solved-vs-driver with the residual. The
+  buffering there). After the solve the CLI prints solved-vs-driver with the residual. The
   residual is what the driver *can't* see (DAC/ADC conversion + analog), so it must be a small
-  positive number. **Negative is physically impossible** (wrong device, sample-rate mismatch);
-  tens of ms means an unexpected buffer (check the Dante latency setting). The solved value stays
+  positive number. **Negative is physically impossible** (wrong device, sample-rate mismatch).
+  Tens of ms means an unexpected buffer (check the Dante latency setting). The solved value stays
   authoritative: the driver's numbers are nominal, the sweep measured reality.
-- **`--zylia`**: the same self-survey from **one** mic placement, using the ZM-1's 19 capsules
-  instead of five omni spots. Direction from arrival-time differences, distance from a known
+- **`--zylia`**: the same self-survey from **one** mic placement, with the ZM-1's 19 capsules
+  instead of five omni mic positions. Direction from arrival-time differences, distance from a known
   latency (`--latency` or `--ref`). See "Zylia ZM-1: full 3D from one placement" below.
 - **default**: trims. `calib_solve` turns the per-speaker measurements into `delay_ms`
   (arrival-align every speaker to the farthest) and `gain_db` (equalize sensitivity, with the
   speaker→mic distance divided out so it corrects the *speaker*, not distance; cut-only so nothing
   clips). Those trims align the array at **one** point. The engine can optionally re-reference them
   onto the tracked listener at runtime (`bwa_set_tracked_align`, off by default), the time-alignment
-  counterpart of `--room-eq-grid` below; see
+  counterpart of `--room-eq-grid` below. See
   [`spatialization.md`](./spatialization.md#re-aligning-to-the-tracked-listener-bwa_set_tracked_align-off-by-default).
 - **`--room`**: RT60 (Schroeder) + early reflections from the captured IRs. It measures **how live
   your room is**. **Do not copy the measured RT60 into the engine's reverb settings.** The room's
-  own decay is a **floor**: you cannot render a space deader than the room you're in, and nearby
+  own decay is a **floor**: you cannot render a space deader than the room you're in. Nearby
   surfaces that throw early reflections smear localization. If the room is too live, **treat it
   physically**: you cannot DSP reverb away for a moving listener (it is non-invertible and
-  position-dependent). The binaural monitor (headphones, room-free) is the clean reference;
-  comparing array-vs-monitor measures how much the room is adding.
-- **`--check`**: drift detector. One fast pass from the mic position; `calib_check_drift` compares
-  each speaker's measured distance to its stored position (removing the common latency as the median
-  residual, so it's robust to a few moved speakers) and flags anything beyond ~20 mm. Catches a
+  position-dependent). The binaural monitor (headphones, room-free) is the clean reference.
+  Comparing array-vs-monitor measures how much the room is adding.
+- **`--check`**: drift detector. One fast pass from the mic position. `calib_check_drift` compares
+  each speaker's measured distance to its stored position (it removes the common latency as the
+  median residual, so it's robust to a few moved speakers) and flags anything beyond ~20 mm. Catches a
   bumped speaker in seconds. Radial only (a purely tangential move doesn't change the distance),
   so re-run `--localize` for a full re-survey. Exit code 3 if anything is flagged (scriptable).
 - **`--live N`**: positioning aid. Repeatedly measures speaker N's distance from the mic while you
@@ -118,7 +118,7 @@ it. Do not expect it to be audible.
   interpolation puts the reading at well under 1 mm.
 - **`--save-irs prefix`**: dump the per-speaker impulse responses (the deconvolved kernels). One
   capture session therefore serves trims, the room report, AND a future **headphone room simulator**:
-  convolving these IRs into the binaural monitor previews the installed sound while developing
+  convolving these IRs into the binaural monitor previews the installed sound while you work
   off-site. For the *spatial* version, do a second capture pass with in-ear/dummy-head mics: those
   IRs are BRIRs (direction + room); the omni pass gives timbre/reverb only.
 
@@ -141,34 +141,36 @@ it. Do not expect it to be audible.
   fixed-observer SPCAP/VBAP deployments: one seat, one sweet spot; put the mic there, at ear
   height). A roaming listener keeps plain `--eq`; the one-point objection above applies in full.
   Two halves, split at 200 Hz so nothing is corrected twice:
-  - **200 Hz and up**: the `eq` FIR is designed from a **frequency-dependent window**
-    (`measure_correction_room`): each frequency's magnitude comes from the IR windowed to ~6 cycles,
-    clamped between the direct-sound gate and 400 ms. At HF the window shrinks to the gate (identical
-    to `--eq`, and the ~1/6-octave resolution is the broad-stroke smoothing that survives head sway);
-    toward LF it grows to include the room. Boosts are capped at **+3 dB**: a seated head still
-    sways a few cm, and interference dips move with it, so dips are never fought hard.
+  - **200 Hz and up**: `measure_correction_room` designs the `eq` FIR from a
+    **frequency-dependent window**: each frequency's magnitude comes from the IR windowed to
+    ~6 cycles, clamped between the direct-sound gate and 400 ms. At HF the window shrinks to the
+    gate (identical to `--eq`, and the ~1/6-octave resolution is the broad-stroke smoothing that
+    survives head sway); toward LF it grows to include the room. Boosts are capped at **+3 dB**: a
+    seated head still sways a few cm, and interference dips move with it. So dips are never fought
+    hard.
   - **30–200 Hz**: discrete **modal cuts** (`measure_room_cuts` → each speaker's `room_eq` array of
     `{fc, gain_db, q}` peaking sections, rendered as biquads in `align.c`). Below the room's Schroeder
-    frequency modes are approximately minimum-phase, so a magnitude cut also fixes the ringing, and
-    the correction stays valid over meter-scale distances. **Cut-only** by design and by schema
-    (`gain_db <= 0`; the loader rejects boosts): peaks are modal energy you can remove; dips are
-    position-dependent cancellations you cannot fill.
+    frequency, modes are approximately minimum-phase, so a magnitude cut also fixes the ringing. The
+    correction stays valid over meter-scale distances. **Cut-only** by design and by schema
+    (`gain_db <= 0`; the loader rejects boosts), and capped at **12 dB** deep: peaks are modal
+    energy you can remove; dips are position-dependent cancellations you cannot fill. The schema
+    accepts down to -24 dB, but the solver never designs a cut past -12.
 
   What no EQ fixes: **decay**. A ringing room still smears transients once its steady-state
   coloration is flattened. That stays a treatment problem; see `--room` above.
 
   The wrong-file mistake fails loudly: **`bwa_start` refuses** a layout carrying `room_eq` sections
-  when the session renders a moving listener (the DBAP panner and/or a connected tracker); see
+  when the session renders a moving listener (the DBAP panner and/or a connected tracker). See
   `bwa_last_error`. Load the roaming variant, recalibrate with `--room-eq-grid`, or run SPCAP/VBAP
   with a fixed pose.
 
 - **`--room-eq-grid`**: **tracked room EQ**, the moving-listener answer to `--room-eq`'s modal
   half (Lindfors/Liski/Välimäki, JAES 2022, adapted to the tracked CAVE). One point can't room-EQ a
   roaming listener; a **grid of points can**. Below ~200 Hz the room's mode *frequencies* are fixed
-  properties of the room; only how strongly each mode reads varies with position, and that varies
+  properties of the room. Only how strongly each mode reads varies with position, and that varies
   smoothly on the half-meter scale of LF wavelengths.
 
-  Workflow: run once per mic placement; `--mic x y z` **is the grid key** (a rerun within 5 cm
+  Workflow: run once per mic placement. `--mic x y z` **is the grid key** (a rerun within 5 cm
   replaces that entry; up to 16 positions, `BWA_RQ_GRID_MAX`). Cover the working area at ear height,
   ~0.5–1 m spacing. Each run measures this position's modal cuts (`measure_room_cuts`, same
   30–200 Hz band and 12 dB depth cap as `--room-eq`) and **merges** them into the layout's
@@ -178,7 +180,7 @@ it. Do not expect it to be audible.
   [`layout-schema.md`](./layout-schema.md) for the format.
 
   At runtime the engine interpolates the depths at the **live listener position** every block
-  (inverse-distance weights over the grid points) and the align biquads glide toward them at
+  (inverse-distance weights over the grid points). The align biquads glide toward them at
   24 dB/s: click-free by construction, fast enough to track a walk. `bwa_set_tracked_room_eq` is
   the live kill switch (off glides to flat) for A/B on the rig. Works with every panner; `bwa_start`
   has no objection to a grid in a moving session: that's the point.
@@ -191,9 +193,9 @@ it. Do not expect it to be audible.
 
 ## Zylia ZM-1: full 3D from one placement
 
-`--localize` needs the omni mic at ≥5 spots because one omni gives only **distance**. The ZM-1 is 19
-capsules on a rigid ~10 cm sphere, so a single placement already records each sweep arriving at 19
-slightly-different times, and the arrival-time **differences** across the sphere are a
+`--localize` needs the omni mic at ≥5 positions because one omni gives only **distance**. The ZM-1
+is 19 capsules on a rigid ~10 cm sphere, so a single placement already records each sweep arriving at 19
+slightly-different times. The arrival-time **differences** across the sphere are a
 **direction**. A speaker's full position falls out of ONE Zylia placement: direction × distance +
 the array center.
 
@@ -206,7 +208,7 @@ synthesizing the 19 arrivals from a known position and recovering it to machine 
   screen-hidden speakers too.
 - **Distance**: `c·(arrival − latency)`. The array is too small for the wavefront curvature across
   it to self-calibrate the latency at meters (sub-mm of differential delay), so feed a
-  loopback-measured or `--localize`-recovered latency; then the distance is as good as that latency
+  loopback-measured or `--localize`-recovered latency. Then the distance is as good as that latency
   (~7 mm per sample). Fuse with the omni `--localize` when you want both the one-shot directions and
   a sub-mm distance.
 
@@ -215,7 +217,7 @@ synthesizing the 19 arrivals from a known position and recovering it to machine 
 Everything above uses the ZM-1 to find **speakers**, from a transient, by arrival times. The same
 array also answers a different question: when the array *renders* a source, where does it actually
 end up? That needs a different estimator, because a phantom has no arrival time of its own (it is the
-summed output of many speakers), so the direction has to come out of continuous content.
+summed output of many speakers). So the direction has to come out of continuous content.
 
 `zylia.c` carries both. They share the capsule table, the survey, and the capture rig:
 
@@ -240,7 +242,7 @@ The measurement workflow built on these is its own tool and its own doc: see
 
 **Spatial room capture** *(design, not implemented; nothing consumes `er_delay` directionally yet)*
 rides the same 19-channel sweep with no new DSP. `--room` already finds each
-early reflection's *time* (`er_delay`); window the 19-ch IR around each one and run `zylia_doa` on
+early reflection's *time* (`er_delay`). Window the 19-ch IR around each one and run `zylia_doa` on
 those arrivals to get each reflection's *direction*. That turns the room report from "how live" into
 "the first slap comes off the **left wall** at 6 ms", that is, *which* surface to treat, not just how
 much. (A full ambisonic room IR is the same capture encoded to higher order; the directional
@@ -250,20 +252,20 @@ early-reflection map is the actionable part.)
 
 The speaker survey above is wired end to end: the capture shell opens the layout's `n` outputs
 plus 19 consecutive inputs starting at `--input`, on ONE ASIO device (the ZM-1 over Dante Via,
-next section), sweeps each speaker, deconvolves all 19 capsules (measure.c), and hands the
+next section). It sweeps each speaker, deconvolves all 19 capsules (measure.c), and hands the
 sub-sample arrivals to `zylia_localize`. `--mic x y z` is the array **center**. Positions go back
 into `cave_layout.json`. Two flags carry the physics the tool cannot know:
 
 - **`--survey <file>`**: a room-axes capsule survey (calib_view → Zylia tab → Capsule survey).
-  Without one the built-in table is trusted, and an unpinned channel order or yaw rotates the
-  whole recovered layout; the tool warns, but it cannot check. (A body-frame survey is refused:
-  this tool has no tracker to re-aim it with; that's `bwa_validate --track`.)
+  Without one the tool trusts the built-in table, and an unpinned channel order or yaw rotates the
+  whole recovered layout. The tool warns, but it cannot check. (The tool refuses a body-frame
+  survey: it has no tracker to re-aim one with. That's `bwa_validate --track`.)
 - **`--latency <m>`** or **`--ref <spk> <m>`**: the distance calibration. `--latency` is a
   loopback-measured round trip in meters at c. `--ref` solves it from ONE tape-measured
   center→speaker distance instead (that speaker's mean arrival, wavefront-tilt corrected), so a
-  tape measure replaces the loopback rig; the ref speaker's reported `dist` should then read back
+  tape measure replaces the loopback rig. The ref speaker's reported `dist` should then read back
   the taped value. Given neither, the run prints directions and **refuses the writeback**: every
-  distance would carry the full system latency radially. The solved latency is cross-checked
+  distance would carry the full system latency radially. The tool cross-checks the solved latency
   against the driver's digital loop (below it = physically impossible). No tens-of-ms upper
   warning here: a Dante Via input leg legitimately adds ~10 ms the driver never reports.
 
@@ -273,41 +275,39 @@ and recovers every position exactly. The capture shell itself is rig bring-up co
 
 ### Getting the ZM-1 onto Dante
 
-The obstacle to `--zylia` on hardware was never the DSP: it was that the sweep plays out of the **Digiface**
-device and the ZM-1 is a **different** USB device, while the ASIO SDK has one process-wide current-driver
-slot (which is why `asio_session.cpp` exists). Two drivers at once is not a flag, it's a rewrite.
+The obstacle to `--zylia` on hardware was never the DSP: the sweep plays out of the **Digiface**
+and the ZM-1 is a **different** USB device. The ASIO SDK has one process-wide
+current-driver slot (why `asio_session.cpp` exists). Two drivers at once is not a flag, it's a
+rewrite.
 
-**Put the ZM-1 on the Dante network and the problem dissolves.** Dante Via captures the ZM-1's ASIO
-stream and transmits its 19 capsules as Dante channels; the Digiface on the engine machine receives them as 19
-**inputs on the same ASIO device that already owns the 26 outputs**. One driver, one clock domain,
-sample-locked: the two-device problem stops existing, and `calib_capture.cpp` went from
-"open N outs + 1 mic input" to "open N outs + 19 inputs": a parameter, not an architecture
-(`calib_asio_open_multi`; the omni modes are its `nin = 1` case).
-([Danowski's write-up](https://blog.przemekdanowski.com/connecting-zylia-zm-1-to-dante-network/) is the
-recipe; Dante Via is a modest one-off license and has a trial, so you can prove the route first.)
+**Put the ZM-1 on the Dante network and the problem dissolves.** Dante Via transmits the ZM-1's
+19 capsules as Dante channels. The Digiface receives them as 19 **inputs on the same ASIO device
+that already owns the 26 outputs**. One driver, one clock domain, sample-locked:
+`calib_capture.cpp` went from "N outs + 1 mic input" to "N outs + 19 inputs", a parameter, not an
+architecture (`calib_asio_open_multi`; the omni modes are its `nin = 1` case).
+([Danowski's write-up](https://blog.przemekdanowski.com/connecting-zylia-zm-1-to-dante-network/)
+is the recipe; Dante Via has a trial, so you can prove the route first.)
 
 What it buys, beyond unblocking the sweep:
 
-- **Absolute latency, so distance becomes real.** Right now `zylia_localize`'s range is only as good as
-  the latency you feed it, and the array is far too small to self-calibrate that (below). Sample-locked
-  playback and capture make the round-trip latency a measurable constant, so the ZM-1 delivers full 3D
+- **Absolute latency, so distance becomes real.** `zylia_localize`'s range is only as good as the
+  latency you feed it, and the array is far too small to self-calibrate that. Sample-locked
+  playback and capture make the round-trip a measurable constant, so the ZM-1 delivers full 3D
   **positions** from one placement, not just directions.
-- **Sweeps instead of claps** for the capsule survey: enormously better SNR, sub-sample arrival times
-  straight off `measure.c`'s deconvolved IR peak, and 26 known source directions for free.
+- **Sweeps instead of claps** for the capsule survey: far better SNR, sub-sample arrivals off the
+  deconvolved IR peak, 26 known source directions for free.
 - **Spatial room capture** (above) becomes buildable at all: it needs the 19-channel IR.
+- The cable run: the ZM-1 wants to sit in the *middle* of the CAVE, and USB will not reach.
+  100 m of Cat6 will.
 
-The cable run is a side benefit worth naming: the ZM-1 wants to sit in the *middle* of the CAVE, and USB
-will not reach. 100 m of Cat6 will.
+Caveats to check first: Via adds a constant 10 ms (measured, constant, nowhere near the
+production path). 26 out + 19 in is **45 channels**, so confirm the Digiface offers that many
+at your rate. Dante endpoints commonly halve their channel count at 96 kHz; calibrate at 48 kHz.
 
-Caveats to check first: Via adds a constant 10 ms (irrelevant here: it is measured, constant, and
-nowhere near the production path), and 26 out + 19 in is **45 channels**, so confirm the Digiface
-offers that many at your rate. Dante endpoints commonly halve their channel count at 96 kHz, where
-45 would not fit. Calibrate at 48 kHz.
-
-None of this is required to *start*. The capsule survey below runs on claps through the capture
-shell that already exists, and its solver is the same one the sweep path will use: `zylia_survey` takes
-(source position, 19 arrival times) and does not care whether those arrivals came from a clap's
-cross-correlation or a sweep's deconvolved IR peak. Dante is the precision upgrade, not the prerequisite.
+None of this is required to *start*. The capsule survey below runs on claps through the existing
+capture shell, and `zylia_survey` does not care whether its arrivals came from a clap's
+cross-correlation or a sweep's deconvolved IR peak. Dante is the precision upgrade, not the
+prerequisite.
 
 ### The capsule geometry
 
@@ -345,9 +345,9 @@ result **is** the channel order and **is** the mounted orientation. Nothing is l
 
 Sound from a known direction `d_k` reaches capsule `i` at `τ[k][i] = t0_k − (1/c)·m_i·d_k`. The `t0_k` is
 unknown and unknowable (system latency, the moment the clap happened, whichever channel `zylia_tdoa`
-picked as its reference), and it *does not matter*: it is one constant per observation, so subtracting
-each observation's mean across the 19 capsules kills it exactly. What's left is linear in `m_i` and
-**separates**: each capsule gets its own 3-unknown least squares, all sharing one 3×3 normal matrix.
+picked as its reference), and it *does not matter*. It is one constant per observation, so
+subtracting each observation's mean across the 19 capsules kills it exactly. What's left is linear
+in `m_i` and **separates**: each capsule gets its own 3-unknown least squares, all sharing one 3×3 normal matrix.
 
 Three consequences worth drawing out:
 
@@ -356,33 +356,33 @@ Three consequences worth drawing out:
 - **A plane wave is not quite the truth.** A clap 2.5 m out is a sphere, and its curvature across a
   49 mm array is a systematic ~1.4 µs: 2–3 mm of capsule error if ignored. So the solver takes the
   source's *position*, not merely its direction (you know where you clapped; that's how you knew the
-  direction), and iterates the exact-minus-plane-wave correction on top of the linear seed. The
+  direction). It iterates the exact-minus-plane-wave correction on top of the linear seed. The
   geometry lands well under a millimeter.
 - **Where is the origin?** Arrival times fix the capsule cloud's *shape* but not its *position*:
-  translating the whole cloud is absorbed by the per-observation constants. So the origin must be
-  chosen, and the obvious choice is wrong: the ZM-1's capsule set is a dodecahedron *missing its nadir*,
+  the per-observation constants absorb any translation of the whole cloud. So you must choose the
+  origin, and the obvious choice is wrong. The ZM-1's capsule set is a dodecahedron *missing its nadir*,
   so it is not centroid-balanced and its centroid sits **R/19 = 2.6 mm above the sphere center**. Nobody
   tape-measures to the centroid. The solver therefore fits the sphere the capsules lie on and re-centers
-  on that, giving the physical center of the shell: the point the operator measured the clap positions
-  from, and what `zylia_localize`'s `center` means.
+  on that. That gives the physical center of the shell: the point the operator measured the clap
+  positions from, and what `zylia_localize`'s `center` means.
 
 **Running it** (calib_view's Zylia tab → *Capsule survey*): tape-measure where the ZM-1 is, set the clap
-position, clap. Repeat from ≥ 6 spots. If layout A is loaded you can pick "clap at speaker *N*" and the
-position autofills from the surveyed geometry: stand at a speaker, clap, move on. Then **Solve** →
+position, clap. Repeat from ≥ 6 clap positions. If layout A is loaded you can pick "clap at
+speaker *N*" and the position autofills from the surveyed geometry: stand at a speaker, clap, move on. Then **Solve** →
 **Install** → **Save**. `--tests zylia` drives the whole flow on synthetic claps.
 
 **Spread is the trap.** Claps in a horizontal ring around the array are *coplanar*: the normal matrix
 goes singular in the vertical and the capsules' **heights** are unrecoverable. A solver that shrugged
-would hand back a flattened array and a confident wrong answer, so this one refuses: `spread` is 1 for
-isotropic directions, 0 for coplanar, and below 0.05 it declines to solve and tells you why. **Clap high
+would hand back a flattened array and a confident wrong answer, so this one refuses. `spread` is 1 for
+isotropic directions, 0 for coplanar, and below 0.05 the solver declines and tells you why. **Clap high
 and low, not just around.**
 
 **Reading the result.** `residual` is the number that says whether to believe it: what the recovered
 geometry *fails* to explain, in microseconds. Sub-microsecond is clean. Tens of microseconds means bad
 claps, a wrong array center, or a clap that wasn't where you said it was. `radius` should land near
 49 mm; if it doesn't, something is badly wrong upstream. Save writes JSON that encodes the geometry,
-the channel order *and* the orientation together, so it is specific to **one ZM-1 on one mount**:
-re-survey if either changes.
+the channel order *and* the orientation together. The result is specific to **one ZM-1 on one
+mount**, so re-survey if either changes.
 
 **Bring-up.** Before any of that, run the "is it talking?" checks the moment the ZM-1 is plugged in
 (input-only, no rig needed). Both ride the same capture shell (`zylia_capture.cpp`: driver open,
@@ -400,37 +400,30 @@ transient trigger, snapshot publish):
   dot somewhere absurd. Its simulate mode runs the identical snapshot→tdoa→doa→draw pipeline on
   synthesized claps (truth marker drawn; "Clap now" for a deterministic one): the hardware-free
   check of everything but the ASIO capture. The math is unit-tested in the `zylia` ctest, and the
-  whole tab is driven by the `zylia/sim_doa` UI test in `calib_view`.
+  `zylia/sim_doa` UI test in `calib_view` drives the whole tab.
 
 ## Reviewing the results (`bwa_calib_view`)
 
-Before trusting a calibration run, LOOK at it. `bwa_calib_view` (opt-in `-DBWA_BUILD_CALIBVIEW=ON`;
-Dear ImGui + ImPlot/ImPlot3D on win32+d3d11) loads layouts through the engine's own loader and shows
-
-- the **array in 3D** with per-speaker index labels (the wiring sanity check),
-- **gain/delay trims** as bar charts,
-- each speaker's **correction-EQ magnitude** (`--eq` filters, 20 Hz–20 kHz),
-- the retained **IR kernels** (`--save-irs <prefix>` → `<prefix>_NN.wav`) with the direct-arrival tag,
-- and, the main event, a **layout diff**: `bwa_calib_view before.json after.json` tables Δposition /
-  Δgain / Δdelay / eq-taps per speaker with outliers highlighted, so a swapped channel, a bad mic
-  placement, or a bogus `--localize` solve is one glance, not an evening.
+Before trusting a calibration run, LOOK at it. `bwa_calib_view` (opt-in `-DBWA_BUILD_CALIBVIEW=ON`)
+loads layouts through the engine's own loader and shows the array in 3D with index labels,
+gain/delay trims as bar charts, each speaker's correction-EQ magnitude, the retained IR kernels,
+and, the main event, a **layout diff**. `bwa_calib_view before.json after.json` tables
+Δposition / Δgain / Δdelay / eq-taps per speaker with outliers highlighted, so a swapped channel,
+a bad mic placement, or a bogus `--localize` solve is one glance, not an evening.
 
 It is the **calibration station**: one window for the rig session. The **Capture tab** runs the
-calibration itself: sweep every speaker, solve the trims, write the layout, all on a worker thread with
-live per-speaker progress, through the same capture backends (`calib_capture.cpp`) and measure/solve
-DSP as the CLI (simulate hardware-free; ASIO full-duplex at the rig, mic position + input channel +
-room/eq/IR options in-window). One button loads the result into Diff (A = input, B = what calibration
-wrote) for review before you accept it. The **Zylia tab** (live clap-DOA, see "Bring-up" above)
-covers the ZM-1.
+calibration itself (sweep, solve, write, on a worker thread, through the same capture backends
+and measure/solve DSP as the CLI; simulate hardware-free, ASIO full-duplex at the rig). One
+button loads the result into Diff for review before you accept it. The **Zylia tab** (live
+clap-DOA, see "Bring-up" above) covers the ZM-1.
 
-`bwa_calibrate` remains the headless CLI over the same code: scriptable, and the only place for the
-multi-placement modes (`--localize`, `--zylia`, `--check`, `--live`).
-`bwa_calib_view --tests [filter]` runs its imgui_test_engine suite (fake inputs drive the actual UI
-against generated fixture layouts + synthesized claps, screenshots land in `output/captures/`) and
-is wired into ctest as `calib_view`.
+`bwa_calibrate` remains the headless CLI over the same code: scriptable, and the only place for
+the multi-placement modes (`--localize`, `--zylia`, `--check`, `--live`).
+`bwa_calib_view --tests [filter]` runs its imgui_test_engine suite, wired into ctest as
+`calib_view`.
 
 ## What feeds the engine
 
 `cave_layout.json` carries per-speaker `position`, `gain_db`, `delay_ms` (consumed by `dbap.c` +
-`align.c`). The room itself, if you want simulated reverb, is modeled in Steam Audio as geometry +
+`align.c`). Model the room itself, if you want simulated reverb, in Steam Audio as geometry +
 material absorption (`steam_reflect.c`) tuned to creative intent, **not** to the measured RT60.

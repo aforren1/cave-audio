@@ -185,7 +185,7 @@ namespace BwAudio
                  "scene view. FLOOR-BASED: centered on the origin in x/z, running from y=0 up to its " +
                  "height. For anything more detailed, use AcousticGeometry instead.")]
         public bool enableRoomBox = false;
-        public Vector3 roomSizeMetres = new Vector3(3f, 3f, 3f);
+        public Vector3 roomSizeMeters = new Vector3(3f, 3f, 3f);
         [Tooltip("Material for all six faces. For per-face or custom materials, build the room out of " +
                  "AcousticGeometry objects instead.")]
         public BwaMaterialPreset roomMaterial = BwaMaterialPreset.Concrete;
@@ -333,6 +333,69 @@ namespace BwAudio
             Bwa.bwa_set_limiter(_eng, limiter);
             Bwa.bwa_set_limiter_ceiling(_eng, limiterCeiling);
             Bwa.bwa_set_pose_prediction(_eng, feedListener ? 0f : posePredictionS);   // internal tracking only
+        }
+
+        // ---- situation tuning (seated / roaming) ----------------------------------------------------
+        //
+        // A preset seeds THE INSPECTOR FIELDS above, then re-pushes them through ApplyLiveSettings. It
+        // deliberately does NOT call bwa_apply_tuning directly: the fields are this component's single
+        // source of truth, and an engine configured behind their back would show stale values and get
+        // silently reverted by the next OnValidate. Seeding them keeps one answer to "what is set".
+        //
+        // For an A/B, call this from a UI button and listen. Everything a preset touches is a live knob,
+        // so switching situations mid-session is audible immediately and needs no restart.
+
+        [Header("Situation tuning")]
+        [Tooltip("A starting point for the live knobs above: Seated optimizes one listening position, " +
+                 "Roaming optimizes a moving listener. Applying a preset OVERWRITES those fields.")]
+        public Bwa.BwaSetup situation = Bwa.BwaSetup.Default;
+
+        /// <summary>
+        /// Overwrite the live knobs from `situation`'s preset and push them. Safe before or during play.
+        /// Returns false only if the preset could not be read.
+        /// </summary>
+        public bool ApplySituation() => ApplySituation(situation);
+
+        /// <summary>Overwrite the live knobs from a named preset and push them.</summary>
+        public bool ApplySituation(Bwa.BwaSetup setup)
+        {
+            Bwa.bwa_tuning_preset(setup, out var t);
+            if (t.structSize == 0) return false;      // the ABI never returns a zero structSize on success
+            situation = setup;
+            AdoptTuning(t);
+            if (Ready) ApplyLiveSettings();
+            return true;
+        }
+
+        /// <summary>Copy a tuning struct into the inspector fields. Does not push; ApplySituation does.</summary>
+        public void AdoptTuning(Bwa.BwaTuning t)
+        {
+            panner        = t.panner;
+            spcapFocus    = t.spcapFocus;
+            spcapDensity  = t.spcapDensity;
+            dualBand      = t.dualBand;
+            dualBandCap   = t.dualBandCap;
+            spreadMode    = t.spreadMode;
+            decorrelation = t.decorrelation;
+            nearSpreadRadius = t.nearSpread;
+            holeSpread    = t.holeSpread;
+            maxRe         = t.maxRe;
+            maxReSplit    = t.maxReSplit;
+            bedRenderer   = t.bedRenderer;
+            trackedRoomEq = t.trackedRoomEq;
+            trackedAlign  = t.trackedAlign;
+            trackedAlignDeadZone            = t.alignDeadZoneM;
+            trackedAlignSlewFramesPerSecond = t.alignSlewFramesPerSecond;
+        }
+
+        /// <summary>
+        /// What the ENGINE currently has, read back rather than assumed. Use it to record what a rig-day
+        /// A/B actually ran with, instead of trusting that the inspector and the engine agree.
+        /// </summary>
+        public bool TryGetEngineTuning(out Bwa.BwaTuning t)
+        {
+            t = default;
+            return Ready && Bwa.bwa_get_tuning(_eng, out t);
         }
 
         // Inspector edits take effect live in Play mode — that IS the workflow for these (the engine makes
@@ -789,7 +852,7 @@ namespace BwAudio
             {
                 uint mb = ResolvePreset(roomMaterial);
                 var faces = new[] { mb, mb, mb, mb, mb, mb };
-                Bwa.bwa_scene_set_box(_eng, roomSizeMetres.x, roomSizeMetres.y, roomSizeMetres.z, faces);
+                Bwa.bwa_scene_set_box(_eng, roomSizeMeters.x, roomSizeMeters.y, roomSizeMeters.z, faces);
                 _hasStaticMesh = true;
                 return;
             }
@@ -805,7 +868,7 @@ namespace BwAudio
         {
             var verts = new List<float>(); var tris = new List<int>(); var triMat = new List<uint>();
             if (enableRoomBox)
-                AddBox(verts, tris, triMat, roomSizeMetres, ResolvePreset(roomMaterial));
+                AddBox(verts, tris, triMat, roomSizeMeters, ResolvePreset(roomMaterial));
             if (geos != null)
                 foreach (var g in geos)
                 {
@@ -952,7 +1015,7 @@ namespace BwAudio
             if (enableRoomBox)
             {
                 Gizmos.color = new Color(1f, 0.9f, 0.3f, 0.9f);
-                var size = new Vector3(roomSizeMetres.x, roomSizeMetres.y, roomSizeMetres.z);
+                var size = new Vector3(roomSizeMeters.x, roomSizeMeters.y, roomSizeMeters.z);
                 Gizmos.DrawWireCube(new Vector3(0f, size.y * 0.5f, 0f), size);   // floor-based: y from 0 up
             }
             if (showSpeakers) DrawSpeakers();

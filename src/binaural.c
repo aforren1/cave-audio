@@ -113,9 +113,12 @@ void monitor_process(Monitor* m, const float* bus, const float* direct16,
         }
     }
     /* Debug monitor: summing 26 virtual speakers into 2 channels is not level-calibrated
-     * (the production Steam Audio decode normalizes). Clamp to keep the device in range. */
+     * (the production Steam Audio decode normalizes). Clamp to keep the device in range —
+     * NaN-scrubbing, since a plain clamp passes NaN and this is the last stop on this path. */
     for (uint32_t i = 0; i < n; ++i) {
-        if      (L[i] >  1.f) L[i] =  1.f; else if (L[i] < -1.f) L[i] = -1.f;
-        if      (R[i] >  1.f) R[i] =  1.f; else if (R[i] < -1.f) R[i] = -1.f;
+        if      (!isfinite(L[i])) L[i] = 0.f;
+        else if (L[i] >  1.f) L[i] =  1.f; else if (L[i] < -1.f) L[i] = -1.f;
+        if      (!isfinite(R[i])) R[i] = 0.f;
+        else if (R[i] >  1.f) R[i] =  1.f; else if (R[i] < -1.f) R[i] = -1.f;
     }
 }

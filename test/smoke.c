@@ -310,6 +310,7 @@ static int run_push_guard(void) {
     rc = 0;
 done:
     bwa_destroy(e);
+    remove("bwa_ergo_tone.wav");
     return rc;
 }
 
@@ -609,6 +610,219 @@ static int run_tuning(void) {
     return 0;
 }
 
+
+/* A minimal 16-bit mono PCM wav, so a test can own a sound that actually FINISHES. */
+static int write_mono_wav(const char* path, uint32_t frames) {
+    FILE* f = fopen(path, "wb");
+    if (!f) return 0;
+    const uint32_t rate = 48000u, data = frames * 2u;
+    uint32_t u; uint16_t w;
+    fwrite("RIFF", 1, 4, f); u = 0; fwrite(&u, 4, 1, f);
+    fwrite("WAVEfmt ", 1, 8, f);
+    u = 16;      fwrite(&u, 4, 1, f);
+    w = 1;       fwrite(&w, 2, 1, f);      /* PCM */
+    w = 1;       fwrite(&w, 2, 1, f);      /* mono */
+    u = rate;    fwrite(&u, 4, 1, f);
+    u = rate*2u; fwrite(&u, 4, 1, f);
+    w = 2;       fwrite(&w, 2, 1, f);
+    w = 16;      fwrite(&w, 2, 1, f);
+    fwrite("data", 1, 4, f); fwrite(&data, 4, 1, f);
+    for (uint32_t i = 0; i < frames; ++i) {
+        int16_t v = (int16_t)(6000.0 * sin(6.2831853 * 440.0 * (double)i / (double)rate));
+        fwrite(&v, 2, 1, f);
+    }
+    long end = ftell(f);
+    u = (uint32_t)(end - 8); fseek(f, 4, SEEK_SET); fwrite(&u, 4, 1, f);
+    fclose(f);
+    return 1;
+}
+
+/* ---- ergonomics: completion events, the re-play window, tuning readback, the box mesh ----------
+ * All four came out of an API-usability review. The re-play case is the regression that matters:
+ * bwa_source_is_playing used to answer from the published block state alone, which cannot tell "not
+ * playing, BEFORE your play" from "after it" (same generation, same 0 bit), so a re-play on a handle
+ * whose voice had already ended read false until the next rendered block. Every client had built a
+ * state machine or a sleep around that. */
+static int run_ergonomics(void) {
+    bwa_desc cfg = { .profile = BWA_PROFILE_CAVE, .sample_rate = 48000, .block_size = 256,
+                     .sink = BWA_SINK_MANUAL };
+    bwa_engine* e = bwa_create(&cfg);
+    if (!e) { printf("smoke[ergo] create failed\n"); return 1; }
+    int rc = 1;
+    if (bwa_start(e) != 0) { printf("smoke[ergo] start: %s\n", bwa_last_error(e)); goto done; }
+
+    /* A finite in-memory sound. A push source underruns to SILENCE without ending, and an explicit
+     * stop is not a completion, so natural end is the only path that posts EVT_VOICE_DONE. */
+    const char* WAV = "bwa_ergo_tone.wav";
+    if (!write_mono_wav(WAV, 512)) { printf("smoke[ergo] wav fixture\n"); goto done; }
+    uint32_t snd = bwa_load_sound(e, WAV);
+    if (!snd) { printf("smoke[ergo] load: %s\n", bwa_last_error(e)); goto done; }
+    bwa_source s = bwa_source_create(e);
+    if (!s) { printf("smoke[ergo] source\n"); goto done; }
+    bwa_source_play(e, s, snd, false);
+    bwa_commit(e);
+    if (!bwa_source_is_playing(e, s)) { printf("smoke[ergo] fresh play should read playing\n"); goto done; }
+
+    /* --- get_tuning: the readback half of apply_tuning --- */
+    {
+        bwa_tuning t, back;
+        bwa_tuning_preset(BWA_SETUP_SEATED, &t);
+        if (!bwa_apply_tuning(e, &t)) { printf("smoke[ergo] apply_tuning\n"); goto done; }
+        if (!bwa_get_tuning(e, &back)) { printf("smoke[ergo] get_tuning\n"); goto done; }
+        if (memcmp(&t, &back, sizeof t) != 0) {
+            printf("smoke[ergo] get_tuning did not round-trip apply_tuning\n"); goto done; }
+        /* and an INDIVIDUAL setter must reach the same shadow, or the two writer paths drift */
+        bwa_set_hole_spread(e, 1.5f);
+        bwa_set_panner(e, BWA_PAN_VBAP);
+        if (!bwa_get_tuning(e, &back)) { printf("smoke[ergo] get_tuning 2\n"); goto done; }
+        if (back.hole_spread != 1.5f || back.panner != BWA_PAN_VBAP) {
+            printf("smoke[ergo] an individual setter did not reach the tuning shadow\n"); goto done; }
+        if (!bwa_get_tuning(e, &back) || back.struct_size != (uint32_t)sizeof(bwa_tuning)) {
+            printf("smoke[ergo] get_tuning must fill struct_size so it can be fed back\n"); goto done; }
+        bwa_tuning_preset(BWA_SETUP_DEFAULT, &t); bwa_apply_tuning(e, &t);   /* back to defaults */
+    }
+
+    /* --- run it dry so the voice ends, then poll for the completion EVENT --- */
+    for (int b = 0; b < 8; ++b) { uint32_t ch = 0, nf = 0; bwa_render_block(e, &ch, &nf); }
+    bwa_commit(e);
+    {
+        bwa_source ended[8]; uint64_t dropped = 0;
+        uint32_t n = bwa_poll_ended(e, ended, 8, &dropped);
+        if (n != 1 || ended[0] != s) {
+            printf("smoke[ergo] poll_ended reported %u handles, wanted the one that ended\n", n); goto done; }
+        if (bwa_poll_ended(e, ended, 8, &dropped) != 0) {
+            printf("smoke[ergo] poll_ended must DRAIN, not repeat\n"); goto done; }
+        if (dropped != 0) { printf("smoke[ergo] nothing should have been dropped\n"); goto done; }
+    }
+
+    /* --- THE REGRESSION: re-play on a handle whose voice already ended reads playing at once --- */
+    {
+        /* The SAME handle, replayed after its voice ended. A plain source is not recycled on end, so
+         * the published word still carries this generation with a 0 playing bit: exactly the state the
+         * old code could not tell apart from "your play has not landed yet". */
+        if (bwa_source_is_playing(e, s)) { printf("smoke[ergo] voice should have ended\n"); goto done; }
+        bwa_source_play(e, s, snd, false);
+        bwa_commit(e);
+        if (!bwa_source_is_playing(e, s)) {
+            printf("smoke[ergo] a RE-play must read playing BEFORE the next block\n"); goto done; }
+        for (int b = 0; b < 8; ++b) { uint32_t ch = 0, nf = 0; bwa_render_block(e, &ch, &nf); }
+        bwa_commit(e);
+        { bwa_source ended2[4]; uint32_t n2 = bwa_poll_ended(e, ended2, 4, NULL);
+          if (n2 != 1 || ended2[0] != s) {
+              printf("smoke[ergo] the re-play's completion should report too (%u)\n", n2); goto done; } }
+    }
+
+    /* --- a completion superseded by a RE-play must not be reported ---
+     * Between the audio thread posting the notice and the drain, the caller can already have
+     * re-played the handle. Announcing the old play's end while the new one is audible is how a
+     * client frees or re-triggers the wrong thing, so the notice carries its play sequence and a
+     * superseded one is dropped. */
+    {
+        bwa_source_play(e, s, snd, false);
+        bwa_commit(e);
+        for (int b = 0; b < 8; ++b) { uint32_t ch = 0, nf = 0; bwa_render_block(e, &ch, &nf); }
+        /* the voice has ended and its notice is in the ring, but NOT yet drained; re-play first */
+        bwa_source_play(e, s, snd, false);
+        bwa_commit(e);
+        bwa_source sup[4];
+        uint32_t ns = bwa_poll_ended(e, sup, 4, NULL);
+        if (ns != 0) {
+            printf("smoke[ergo] a superseded completion was reported (%u)\n", ns); goto done; }
+        if (!bwa_source_is_playing(e, s)) {
+            printf("smoke[ergo] the re-play should still be playing\n"); goto done; }
+        for (int b = 0; b < 8; ++b) { uint32_t ch = 0, nf = 0; bwa_render_block(e, &ch, &nf); }
+        bwa_commit(e);
+        if (bwa_poll_ended(e, sup, 4, NULL) != 1) {
+            printf("smoke[ergo] the re-play's own completion should report\n"); goto done; }
+    }
+
+    /* --- a finished ONESHOT is NOT reported at all ---
+     * bwa_play_oneshot hands back no handle, so there is nothing for a caller to match a completion
+     * against; the header says so. This asserted "exactly once" at first, which was still wrong:
+     * the oneshot's DONE carried seq 0 and the drain's seq gate let 0 == 0 through, so a handle the
+     * caller never held was surfacing. Oneshots post no completion now. */
+    {
+        if (!bwa_play_oneshot(e, snd, 0.f, 1.5f, 0.f, 1.f)) {
+            printf("smoke[ergo] oneshot rejected: %s\n", bwa_last_error(e)); goto done; }
+        bwa_commit(e);
+        for (int b = 0; b < 8; ++b) { uint32_t ch = 0, nf = 0; bwa_render_block(e, &ch, &nf); }
+        bwa_commit(e);
+        bwa_source ended3[8];
+        uint32_t n3 = bwa_poll_ended(e, ended3, 8, NULL);
+        if (n3 != 0) { printf("smoke[ergo] a oneshot reported %u times, wanted 0\n", n3); goto done; }
+    }
+
+    /* --- a completion must not cross a voice generation ---
+     * Seq alone is per-SLOT. Leave a completion undrained, destroy the source, create a new one on
+     * the same slot and play it: both plays are seq 1, so a seq-only gate reported the DESTROYED
+     * handle to a caller that had already freed it. */
+    {
+        bwa_source a = bwa_source_create(e);
+        bwa_source_play(e, a, snd, false);
+        bwa_commit(e);
+        for (int b = 0; b < 8; ++b) { uint32_t ch = 0, nf = 0; bwa_render_block(e, &ch, &nf); }
+        /* a has ended; its notice is in the ring, undrained. Destroy and re-create on that slot. */
+        bwa_source_destroy(e, a);
+        bwa_commit(e);
+        bwa_source b2 = bwa_source_create(e);
+        bwa_source_play(e, b2, snd, false);
+        bwa_commit(e);
+        bwa_source got[8];
+        uint32_t ng = bwa_poll_ended(e, got, 8, NULL);
+        for (uint32_t i = 0; i < ng; ++i)
+            if (got[i] == a) { printf("smoke[ergo] a destroyed handle was reported as ended\n"); goto done; }
+        for (int b = 0; b < 8; ++b) { uint32_t ch = 0, nf = 0; bwa_render_block(e, &ch, &nf); }
+        bwa_commit(e);
+        bwa_poll_ended(e, got, 8, NULL);
+        bwa_source_destroy(e, b2); bwa_commit(e);
+    }
+
+    /* --- the readback reports what the engine RENDERS, not the raw argument ---
+     * rt clamps these; a readback whose job is to stop an inspector lying must not itself report an
+     * unsanitized value. */
+    {
+        bwa_tuning t;
+        bwa_set_tracked_align_guards(e, 5.0f, 999999.f);   /* both far past rt's clamps */
+        bwa_set_hole_spread(e, 99.f);
+        bwa_set_panner(e, (bwa_panner)7);                  /* out of range -> DBAP */
+        if (!bwa_get_tuning(e, &t)) { printf("smoke[ergo] get_tuning 3\n"); goto done; }
+        if (t.align_dead_zone_m > 0.5f || t.align_slew_frames_per_s > 4096.f ||
+            t.hole_spread > 2.f || t.panner != BWA_PAN_DBAP) {
+            printf("smoke[ergo] get_tuning reported unsanitized values (%.2f %.0f %.2f %d)\n",
+                   t.align_dead_zone_m, t.align_slew_frames_per_s, t.hole_spread, (int)t.panner);
+            goto done; }
+        bwa_tuning d; bwa_tuning_preset(BWA_SETUP_DEFAULT, &d); bwa_apply_tuning(e, &d);
+    }
+
+    /* --- box mesh: 12 triangles, and every normal faces the interior --- */
+    {
+        float v[24]; int tri[36]; bwa_material m[12];
+        if (!bwa_box_mesh(4.f, 3.f, 5.f, NULL, v, tri, m)) { printf("smoke[ergo] box_mesh\n"); goto done; }
+        if (bwa_box_mesh(0.f, 3.f, 5.f, NULL, v, tri, m)) { printf("smoke[ergo] box_mesh took w=0\n"); goto done; }
+        const float ctr[3] = { 0.f, 1.5f, 0.f };
+        for (int t = 0; t < 12; ++t) {
+            const float *a = &v[tri[t*3+0]*3], *b = &v[tri[t*3+1]*3], *c = &v[tri[t*3+2]*3];
+            float e1[3], e2[3], nrm[3], mid[3], to_ctr[3];
+            for (int k = 0; k < 3; ++k) { e1[k] = b[k]-a[k]; e2[k] = c[k]-a[k];
+                                          mid[k] = (a[k]+b[k]+c[k])/3.f; to_ctr[k] = ctr[k]-mid[k]; }
+            nrm[0] = e1[1]*e2[2]-e1[2]*e2[1]; nrm[1] = e1[2]*e2[0]-e1[0]*e2[2]; nrm[2] = e1[0]*e2[1]-e1[1]*e2[0];
+            if (nrm[0]*to_ctr[0] + nrm[1]*to_ctr[1] + nrm[2]*to_ctr[2] <= 0.f) {
+                printf("smoke[ergo] box triangle %d faces outward\n", t); goto done; }
+        }
+    }
+
+    /* --- clearing the static mesh must not need a fake triangle --- */
+    bwa_scene_set_box(e, 4.f, 3.f, 5.f, NULL);
+    bwa_scene_set_mesh_mat(e, NULL, 0, NULL, 0, NULL);      /* the clear; no-op without the SDK */
+    for (int b = 0; b < 4; ++b) { uint32_t ch = 0, nf = 0; bwa_render_block(e, &ch, &nf); }
+
+    printf("smoke[ergo] poll_ended drains + re-play reads playing + get_tuning round-trips + box mesh faces inward OK\n");
+    rc = 0;
+done:
+    bwa_destroy(e);
+    return rc;
+}
+
 int main(void) {
     if (run_profile(BWA_PROFILE_CAVE,      "cave"))      return 1;
     if (run_profile(BWA_PROFILE_BINAURAL,  "binaural"))  return 1;
@@ -623,6 +837,7 @@ int main(void) {
     if (run_material_release())                       return 1;
     if (run_bed_batch())                              return 1;
     if (run_tuning())                                 return 1;
-    printf("smoke OK (cave, binaural, cave_sim, cave_both lifecycles; room_eq start guard; push kind guards; binaural + cave_sim laterality; headphone EQ; material release/reuse; bed gains batch; situation tuning)\n");
+    if (run_ergonomics())                             return 1;
+    printf("smoke OK (cave, binaural, cave_sim, cave_both lifecycles; room_eq start guard; push kind guards; binaural + cave_sim laterality; headphone EQ; material release/reuse; bed gains batch; situation tuning; completion events + tuning readback + box mesh)\n");
     return 0;
 }

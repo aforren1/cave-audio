@@ -129,9 +129,18 @@ Aligner* align_create(uint32_t channels, const Layout* L, uint32_t sample_rate) 
         for (uint32_t k = 0; k < channels; ++k) {
             uint8_t m = L->rq_grid.nsec[k] > BWA_ROOM_EQ_MAX ? BWA_ROOM_EQ_MAX : L->rq_grid.nsec[k];
             for (uint8_t s = 0; s < m; ++s) {
-                double w0 = 2.0 * M_PI * (double)L->rq_grid.fc[k][s] / (double)sample_rate;
+                double fcv = (double)L->rq_grid.fc[k][s], qv = (double)L->rq_grid.q[k][s];
+                /* same guard the static path has at its bwa_biquad_rbj_hz call above (layout.c bounds
+                 * these, but a q of 0/NaN here would be Inf/NaN alpha -> NaN coefficients forever).
+                 * No compaction — rt.c interpolates depths BY LADDER INDEX — so a bad section
+                 * becomes unity (alpha 0) instead of being skipped. */
+                if (!(fcv > 0.0) || fcv >= 0.5 * (double)sample_rate || !(qv > 0.0)) {
+                    a->rq_cw0[k][s] = 1.f; a->rq_alpha[k][s] = 0.f;
+                    continue;
+                }
+                double w0 = 2.0 * M_PI * fcv / (double)sample_rate;
                 a->rq_cw0[k][s]   = (float)cos(w0);
-                a->rq_alpha[k][s] = (float)(sin(w0) / (2.0 * (double)L->rq_grid.q[k][s]));
+                a->rq_alpha[k][s] = (float)(sin(w0) / (2.0 * qv));
             }
             a->rq_n[k] = m;
         }
@@ -160,8 +169,11 @@ void align_room_eq_targets(Aligner* a, const float (*gain_db)[BWA_ROOM_EQ_MAX]) 
     for (uint32_t k = 0; k < a->channels; ++k)
         for (uint8_t s = 0; s < a->rq_n[k]; ++s) {
             float g = gain_db[k][s];
-            if (g > 0.f)   g = 0.f;                /* the grid is cut-only by schema; clamp defensively */
-            if (g < -24.f) g = -24.f;
+            if (!(g < 0.f))   g = 0.f;             /* the grid is cut-only by schema; clamp defensively.
+                                                    * NaN-cleansing form: a NaN target would pass both
+                                                    * plain compares and NaN the biquad coefficients
+                                                    * for the rest of the session */
+            else if (g < -24.f) g = -24.f;
             a->rq_gtgt[k][s] = g;
         }
 }

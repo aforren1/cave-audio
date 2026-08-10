@@ -448,7 +448,9 @@ int zylia_intensity_doa(const float* const x[ZYLIA_MICS], uint32_t n, double fs,
     if (!frames) return 0;
 
     double mag = sqrt(Ix*Ix + Iy*Iy + Iz*Iz);
-    if (mag < 1e-30) return 0;
+    if (!(mag >= 1e-30) || !isfinite(mag)) return 0;   /* NaN-safe: one NaN capture sample would otherwise
+                                                        * come out as a "successful" NaN DOA and poison the
+                                                        * report's medians (qsort on NaN is UB) */
     double ax = Ix/mag, ay = Iy/mag, az = Iz/mag;     /* ambisonic -> room */
     dir_out[0] = (float)(-ay);
     dir_out[1] = (float)( az);
@@ -858,7 +860,8 @@ int zylia_survey(const float src_m[][3], const double (*arrival_s)[ZYLIA_MICS], 
     for (int k = 0; k < nobs; ++k) {
         D[k] = sqrt((double)src_m[k][0]*src_m[k][0] + (double)src_m[k][1]*src_m[k][1] +
                     (double)src_m[k][2]*src_m[k][2]);
-        if (D[k] < 0.2) return 0;                            /* inside/at the array: the model is nonsense */
+        if (!(D[k] >= 0.2)) return 0;                        /* inside/at the array (or NaN from an unparsed
+                                                              * clap position): the model is nonsense */
         d[k][0] = src_m[k][0] / D[k]; d[k][1] = src_m[k][1] / D[k]; d[k][2] = src_m[k][2] / D[k];
     }
 
@@ -877,7 +880,7 @@ int zylia_survey(const float src_m[][3], const double (*arrival_s)[ZYLIA_MICS], 
                - A[1]*s * (A[3]*s*A[8]*s - A[5]*s*A[6]*s)
                + A[2]*s * (A[3]*s*A[7]*s - A[4]*s*A[6]*s);
     double spread = 27.0 * det;
-    if (spread < 0.0) spread = 0.0;
+    if (!(spread > 0.0)) spread = 0.0;         /* NaN-safe: a NaN spread must not defeat the refusal below */
     if (spread_out) *spread_out = (float)spread;
     if (spread < 0.05) return 0;               /* coplanar / clustered: the vertical is unrecoverable */
 
@@ -1128,7 +1131,10 @@ int zylia_survey_load(const char* path, ZyliaMount* mount_out, char* err, int er
                 int good = 1;
                 for (int a = 0; a < 3; ++a) {
                     cJSON* v = cJSON_GetArrayItem(off, a);
-                    if (!cJSON_IsNumber(v)) { good = 0; break; }
+                    /* same double-vs-float hazard the capsule check above guards: 1e300 is finite as
+                     * a double but Inf once cast, and a mount offset beyond a couple of meters is a
+                     * corrupt file, not a mount (the arm is ~10 cm) */
+                    if (!cJSON_IsNumber(v) || !isfinite(v->valuedouble) || fabs(v->valuedouble) > 10.0) { good = 0; break; }
                     mount_out->offset_m[a] = (float)v->valuedouble;
                 }
                 mount_out->have_offset = good;

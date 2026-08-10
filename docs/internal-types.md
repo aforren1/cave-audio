@@ -61,9 +61,9 @@ typedef struct {
 **capacity**, not the count. Every `[BWA_CHANNELS]` array in these structs (gain
 vectors, the bed decode matrix, the meters) is sized to that capacity, but only
 the first `RtCore.channels` entries are used. `channels` is the loaded layout's
-speaker count (`Layout.count`, 4..26; 26 for the default grid), resolved in
-`bwa_create` *before* `rt_create` and fixed for the engine's lifetime. It is what
-`bwa_get_channel_count` reports. Loops over the bus must use `channels`, never
+speaker count (`Layout.count`, 4..26; 26 for the default grid). `bwa_create`
+resolves it *before* `rt_create`, and it stays fixed for the engine's lifetime. It is
+what `bwa_get_channel_count` reports. Loops over the bus must use `channels`, never
 `BWA_CHANNELS`: the tail entries belong to no speaker.
 
 The rest of the struct is per-subsystem DSP state, one group per feature. All of
@@ -106,8 +106,8 @@ typedef struct {
 } Listener;
 ```
 
-The position drives the panners; the quaternion drives the binaural monitor and
-is also handed to the reflection/pathing taps. With a tracker connected,
+The position drives the panners. The quaternion drives the binaural monitor, and
+the reflection/pathing taps receive it too. With a tracker connected,
 `rt_render` overwrites the active fields from the tracker's seqlock each block.
 
 ## Sound (control thread owns; audio thread only reads via const*)
@@ -149,8 +149,8 @@ Notes:
 
 See [`layout-schema.md`](./layout-schema.md) for the file format. Replaceable
 while the audio thread is stopped (`rt_set_layout`). Its `count` is the engine's
-channel count: the loader accepts 4..`BWA_CHANNELS` speakers whose indices form a
-complete `0..count-1` permutation, and a layout with fewer than `BWA_CHANNELS`
+channel count. The loader accepts 4..`BWA_CHANNELS` speakers whose indices form a
+complete `0..count-1` permutation. A layout with fewer than `BWA_CHANNELS` speakers
 leaves the tail `speakers[]` entries at the default grid's values (harmless:
 `count` gates every consumer). From [`src/layout.h`](../src/layout.h):
 
@@ -208,7 +208,7 @@ struct bwa_engine {                /* abridged; see engine.c */
 ```
 
 There is no bus field in either struct. The bus is a `float* bus` **argument**
-to `rt_render`, supplied per block by whichever sink render callback is running:
+to `rt_render`. Whichever sink render callback is running supplies it per block:
 the device's own buffer for `cave`, `scratch26` for `binaural`. (`scratch26` is
 allocated at the `BWA_CHANNELS` capacity; `rt_render` fills only `channels` of it.)
 
@@ -222,7 +222,8 @@ reference):
 - **channel count**: `channels` (the layout's speaker count; set at `rt_create`),
   the width every bus loop, decode matrix, and meter array actually runs to.
 - **bed decode**: the `bed_decode[BWA_CHANNELS][BWA_AMBI_CH]` matrix (built for the
-  first `channels` rows) + `bed_decoder` selector (SAD / AllRAD).
+  first `channels` rows) + `bed_decoder` selector (rt-internal numbering: 1 = AllRAD, 2 = EPAD;
+  0 is the sampling fallback a bare rt core uses and is not selectable through the public ABI).
 - **limiter**: `lim_on` / `lim_ceiling` atomics, the `lim_gain` envelope,
   rate-derived attack/release coefficients.
 - **pathing publish**: the `PathPub` double buffer + `path_idx` flip atomics,
@@ -274,8 +275,8 @@ Two things that are *not* helpers here:
 - **The headphone decode** is a sink render callback in engine.c
   (`render_binaural` → `monitor_process` / `steam_monitor_process`, with the
   `binaural` profile's direct SH field read via `rt_direct_ambi` on the same
-  thread), not a bus tap. Steam Audio's phonon objects are created at
-  `bwa_start`, and the decode runs inside the sink callback.
+  thread), not a bus tap. The engine creates Steam Audio's phonon objects at
+  `bwa_start`, and the decode runs inside the sink render callback.
 - **Device output** goes through the `bwa_sink` abstraction
   ([`src/sink.h`](../src/sink.h)), whose render callback fills the device's
   planar buffers directly.

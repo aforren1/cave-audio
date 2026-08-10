@@ -356,6 +356,21 @@ if(BWA_BUILD_TESTS)
   target_link_libraries(test_sound PRIVATE bwa_core)
   add_test(NAME sound COMMAND test_sound)
 
+  # Deliberate MISUSE of the public ABI (NULLs, stale/recycled handles, wrong call order, boundary
+  # and NaN arguments, cap exhaustion). Links the DLL, because misuse has to hit the real exported
+  # entry points and their guards, not the internals.
+  add_executable(test_abuse test/abuse_test.c)
+  target_link_libraries(test_abuse PRIVATE bw_audio)
+  add_test(NAME abuse COMMAND test_abuse)
+  bwa_copy_runtime_dll(test_abuse)
+
+  # Seeded random API call sequences. Deterministic per seed so a failure reproduces from its seed
+  # alone; ctest runs a fixed set, and the binary takes --seed/--iters for longer local soaks.
+  add_executable(test_fuzz_api test/fuzz_api.c)
+  target_link_libraries(test_fuzz_api PRIVATE bw_audio)
+  add_test(NAME fuzz_api COMMAND test_fuzz_api)
+  bwa_copy_runtime_dll(test_fuzz_api)
+
   add_executable(test_dsp   test/dsp_test.c)
   target_link_libraries(test_dsp PRIVATE bwa_core)
   add_test(NAME dsp COMMAND test_dsp)
@@ -443,10 +458,14 @@ if(BWA_BUILD_TESTS)
   target_link_libraries(test_doppler_fft PRIVATE bwa_core)
 
   # Optional: AddressSanitizer build of the sound test (M3 unload-safety / UAF check).
-  option(BWA_ASAN "Build test_sound with AddressSanitizer" OFF)
+  # AddressSanitizer over the tests most likely to catch a lifetime bug: the sound retire handshake
+  # (the original reason this existed), plus the two that deliberately provoke the engine.
+  option(BWA_ASAN "Build the lifetime/misuse tests with AddressSanitizer" OFF)
   if(BWA_ASAN AND MSVC)
-    target_compile_options(test_sound PRIVATE /fsanitize=address)
-    target_link_options(test_sound PRIVATE /INCREMENTAL:NO)
+    foreach(t test_sound test_abuse test_fuzz_api)
+      target_compile_options(${t} PRIVATE /fsanitize=address)
+      target_link_options(${t} PRIVATE /INCREMENTAL:NO)
+    endforeach()
   endif()
 endif()
 

@@ -217,9 +217,9 @@ void BwaEngine::build_static_scene() {
 		return;
 	}
 
-	/* The room box goes FIRST and on its own, because bwa_scene_set_box is the only way to
-	 * capture the shoebox for the image-source early reflections — and that half works with
-	 * or without the Steam Audio SDK, so it matters even in a phonon-free build. */
+	/* Capture the shoebox for the image-source early reflections. That half works with or without
+	 * the Steam Audio SDK, so it matters even in a phonon-free build. Uses the ISM-ONLY call, so it
+	 * no longer clobbers the static mesh and the ordering below stopped mattering. */
 	PackedVector3Array faces;
 	PackedInt32Array tri_materials;
 	if (box) {
@@ -229,11 +229,9 @@ void BwaEngine::build_static_scene() {
 			face_tokens.push_back(m.is_valid() ? (int)m->token(this) : 0);
 		}
 		const Vector3 s = box->room_size();
-		scene_set_box((float)s.x, (float)s.y, (float)s.z, face_tokens);
+		scene_set_ism_room((float)s.x, (float)s.y, (float)s.z, face_tokens);
 
-		/* ...and then its walls join the merged mesh, because that same call REPLACED the
-		 * static mesh with just the box. Without this the walls would vanish the moment any
-		 * other occluder exists. */
+		/* Its walls then join the merged mesh as ordinary geometry, alongside everything else. */
 		faces.append_array(box->wall_faces());
 		for (int t = 0; t < 12; t++) {
 			tri_materials.push_back(face_tokens[t / 2]);
@@ -253,9 +251,13 @@ void BwaEngine::build_static_scene() {
 		}
 	}
 
-	/* With a box and nothing else, scene_set_box already committed exactly this mesh; a
-	 * second identical call would only buy a redundant BVH rebuild. */
-	if (faces.is_empty() || (box && geo.empty())) {
+	/* Nothing to commit only when there is genuinely no geometry. The box no longer commits itself:
+	 * scene_set_ism_room captures the shoebox for the image-source path and deliberately leaves the
+	 * ray-traced static mesh alone, so a box-with-no-other-occluders scene reaches here with its 12
+	 * wall triangles in `faces` and MUST still be committed. Skipping it (as the old
+	 * "scene_set_box already committed exactly this mesh" early-out did) left the commonest Godot
+	 * setup with an empty ray-traced scene: no occlusion from the room's own walls. */
+	if (faces.is_empty()) {
 		return;
 	}
 
@@ -527,6 +529,24 @@ static godot::Dictionary tuning_to_dict(const bwa_tuning& t) {
 	return d;
 }
 
+godot::Dictionary BwaEngine::get_live_tuning() const {
+	bwa_tuning t;
+	if (!eng || !bwa_get_tuning(eng, &t)) return godot::Dictionary();
+	return tuning_to_dict(t);
+}
+
+godot::PackedInt64Array BwaEngine::poll_ended() {
+	godot::PackedInt64Array out;
+	if (!eng) return out;
+	uint32_t buf[64];
+	for (;;) {
+		uint32_t n = bwa_poll_ended(eng, buf, 64, nullptr);
+		for (uint32_t i = 0; i < n; ++i) out.push_back((int64_t)buf[i]);
+		if (n < 64) break;                     /* drained */
+	}
+	return out;
+}
+
 godot::Dictionary BwaEngine::get_setup_tuning(Setup setup) const {
 	bwa_tuning t;
 	bwa_tuning_preset((bwa_setup)setup, &t);
@@ -686,6 +706,19 @@ void BwaEngine::material_release(int token) {
 	if (eng) {
 		bwa_material_release(eng, (bwa_material)token);
 	}
+}
+
+/* The ISM shoebox only: does not touch the ray-traced static mesh, so the box composes with other
+ * occluders instead of replacing them. scene_set_box remains for the box-IS-the-scene case. */
+void BwaEngine::scene_set_ism_room(float w, float h, float d, const PackedInt32Array &faces) {
+	if (!eng) {
+		return;
+	}
+	bwa_material f[6] = {};
+	for (int i = 0; i < MIN(faces.size(), 6); i++) {
+		f[i] = (bwa_material)faces[i];
+	}
+	bwa_scene_set_ism_room(eng, w, h, d, f);
 }
 
 void BwaEngine::scene_set_box(float w, float h, float d, const PackedInt32Array &faces) {
@@ -1106,6 +1139,7 @@ void BwaEngine::_bind_methods() {
 	M(set_dual_band, "on"); M0(get_dual_band);
 	M(set_dual_band_cap, "on"); M0(get_dual_band_cap);
 	M(get_setup_tuning, "setup"); M(apply_setup, "setup");
+	M0(get_live_tuning); M0(poll_ended);
 	M(set_spcap_focus, "focus"); M0(get_spcap_focus);
 	M(set_spcap_density, "density"); M0(get_spcap_density);
 	M(set_spread_mode, "mode"); M0(get_spread_mode);
@@ -1129,6 +1163,7 @@ void BwaEngine::_bind_methods() {
 	M(material_define, "absorption", "scattering", "transmission");
 	M(material_release, "token");
 	M(scene_set_box, "width", "height", "depth", "faces");
+	M(scene_set_ism_room, "width", "height", "depth", "faces");
 	M(scene_set_ground, "y", "material", "pressure_release");
 	M(scene_set_pressure_release, "face_mask");
 	M(set_ground_enabled, "on"); M0(get_ground_enabled);

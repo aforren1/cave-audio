@@ -12,7 +12,7 @@
 #endif
 
 void measure_sweep(float* out, int n, double f1, double f2, double fs) {
-    if (n <= 0) return;
+    if (!out || n <= 0 || !(fs > 0.0) || !(f1 > 0.0) || !(f2 > f1)) return;
     const double w1 = 2.0 * M_PI * f1 / fs;           /* per-sample angular frequencies */
     const double w2 = 2.0 * M_PI * f2 / fs;
     const double T  = (double)n;
@@ -94,7 +94,9 @@ static int ir_peak(const float* ir, int from, int to) {        /* strongest |tap
 
 int measure_response(const float* capture, int ncap, const float* ref, int nref,
                      double f1, double f2, double fs, const double band_hz[2], MeasureResult* out) {
-    if (!capture || !ref || !out || ncap <= 0 || nref <= 0) return 0;
+    if (!capture || !ref || !out || ncap <= 0 || nref <= 0 || !(fs > 0.0)) return 0;
+    /* bwa_pow2_ge spins forever above 2^31, and ncap + nref is signed int arithmetic — bound it */
+    if ((int64_t)ncap + nref > (1 << 30)) return 0;
     float* ir = NULL;
     int L = deconvolve(capture, ncap, ref, nref, f1, f2, fs, band_hz, &out->level, out->band, &ir);
     if (!L) return 0;
@@ -116,8 +118,9 @@ int measure_response(const float* capture, int ncap, const float* ref, int nref,
 #define ER_WINDOW_S 0.08       /* search for reflections within this many seconds after the direct */
 
 void measure_rt60(const float* ir, int nir, int direct_idx, double fs, RoomResult* out) {
+    if (!out) return;                    /* the memset dereferenced out BEFORE any guard */
     memset(out, 0, sizeof *out);
-    if (!ir || direct_idx < 0 || direct_idx >= nir - 2) return;
+    if (!ir || direct_idx < 0 || direct_idx >= nir - 2 || !(fs > 0.0)) return;
     const int n = nir - direct_idx;
 
     /* Schroeder backward energy integration from the direct arrival, then T20 (-5 dB -> -25 dB,
@@ -235,7 +238,10 @@ static int correction_from_mag(const double* mag, double f1, double f2, double f
 int measure_correction(const float* ir, int nir, int direct, int gate_len,
                        double f1, double f2, double fs, double max_boost_db, double max_cut_db,
                        int ntaps, float* taps) {
-    if (!ir || !taps || direct < 0 || gate_len < 4 || direct + gate_len > nir || ntaps < 1) return 0;
+    /* `direct > nir - gate_len` rather than `direct + gate_len > nir`: the sum overflows int for an
+     * absurd `direct` and the wrapped negative passes the check into an out-of-bounds gate read */
+    if (!ir || !taps || direct < 0 || gate_len < 4 || gate_len > nir || direct > nir - gate_len || ntaps < 1) return 0;
+    if (!(fs > 0.0)) return 0;
     double* re  = (double*)malloc((size_t)CORR_N * sizeof(double));
     double* im  = (double*)malloc((size_t)CORR_N * sizeof(double));
     double* mag = (double*)malloc((size_t)(CORR_N / 2 + 1) * sizeof(double));
@@ -252,8 +258,8 @@ int measure_correction_room(const float* ir, int nir, int direct, int gate_len,
                             double cycles, double max_win_s,
                             double f1, double f2, double fs, double max_boost_db, double max_cut_db,
                             int ntaps, float* taps) {
-    if (!ir || !taps || direct < 0 || gate_len < 4 || direct + gate_len > nir || ntaps < 1) return 0;
-    if (!(cycles > 0.0) || !(max_win_s > 0.0)) return 0;
+    if (!ir || !taps || direct < 0 || gate_len < 4 || gate_len > nir || direct > nir - gate_len || ntaps < 1) return 0;
+    if (!(cycles > 0.0) || !(max_win_s > 0.0) || !(fs > 0.0)) return 0;
     const int N = CORR_N;
     /* dyadic window ladder: gate_len, 2*gate_len, ... up to max_win_s (clamped to the IR and to N).
      * The per-frequency magnitude is log-blended between the two windows bracketing cycles/f. */
@@ -300,7 +306,7 @@ int measure_room_cuts(const float* ir, int nir, int direct, double fs,
                       double f_lo, double f_hi, double max_cut_db,
                       int max_sections, MeasureEqSection* out) {
     if (!ir || !out || direct < 0 || nir - direct < 256 || max_sections < 1) return -1;
-    if (!(f_lo > 0.0) || !(f_hi > f_lo) || !(max_cut_db > 0.0)) return -1;
+    if (!(f_lo > 0.0) || !(f_hi > f_lo) || !(max_cut_db > 0.0) || !(fs > 0.0)) return -1;
     const int N = CUTS_N;
     int avail = nir - direct; if (avail > N) avail = N;
     double* re = (double*)calloc((size_t)N, sizeof(double));
@@ -365,7 +371,8 @@ int measure_room_cuts(const float* ir, int nir, int direct, double fs,
 
 int measure_room(const float* capture, int ncap, const float* ref, int nref,
                  double f1, double f2, double fs, RoomResult* out, float* ir_out, int ir_cap) {
-    if (!capture || !ref || !out || ncap <= 0 || nref <= 0) return 0;
+    if (!capture || !ref || !out || ncap <= 0 || nref <= 0 || !(fs > 0.0)) return 0;
+    if ((int64_t)ncap + nref > (1 << 30)) return 0;   /* bwa_pow2_ge spins forever above 2^31 */
     const double band_hz[2] = { 300.0, 3000.0 };
     float* ir = NULL;
     int L = deconvolve(capture, ncap, ref, nref, f1, f2, fs, band_hz, NULL, NULL, &ir);

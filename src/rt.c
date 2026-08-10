@@ -21,6 +21,7 @@
 #include "allrad.h"       /* robust SH->26 decode for irregular arrays */
 #include "epad.h"         /* energy-preserving SH->26 decode (bed_decoder = 2) */
 #include "bits.h"         /* bwa_pow2_ge */
+#include "sane.h"         /* bwa_quat_unit, bwa_finite3, bwa_finite_clamp */
 #include "profile.h"      /* Tracy zones/plots (no-ops unless BWA_TRACY=ON) */
 
 #include <math.h>
@@ -112,6 +113,7 @@ typedef struct {
 typedef struct {
     uint16_t gen;
     bool     active, playing, loop, dirty, oneshot;
+    uint8_t  play_seq;                      /* the control-side play counter this voice was started at */
     uint32_t pan_gen;                       /* RtCore.pan_gen this voice last solved at; a mismatch
                                              * re-solves it (see RtCore.pan_gen). Audio thread only. */
     const SoundData* sound;                 /* bound sound (NULL when idle); audio reads pcm */
@@ -300,8 +302,12 @@ struct RtCore {
     _Atomic uint64_t* dir_pub;
 
     /* per-slot playback state for control-thread readback (rt_source_is_playing): packed
-     * (gen<<1 | playing-bit), republished by the audio thread each block. The gen guards a stale
-     * or recycled handle (a mismatched gen reads as not-playing). */
+     * (gen<<9 | consumed-play-seq<<1 | playing-bit), republished by the audio thread each block. The
+     * gen guards a stale or recycled handle (a mismatched gen reads as not-playing), and the SEQ is
+     * what makes a RE-play on a handle whose voice already ended read as playing immediately: the
+     * published word alone cannot tell "not playing, before your play" from "after it", since both
+     * carry the same gen and the same 0 bit. Comparing the published seq against the control-side
+     * counter makes a queued-but-unconsumed play unambiguous. */
     _Atomic uint32_t* play_pub;
     /* per-slot playhead for control-thread readback (rt_source_get_position): packed
      * (gen<<48 | frames<<0, 48-bit position), republished alongside play_pub. One word, so the gen
@@ -335,7 +341,16 @@ struct RtCore {
                                              * internal (the user never saw it), so nobody else can retry — dropping
                                              * it would leak the slot + a push stream's ring for the engine's life. */
     uint32_t  retire_parked;
-    uint8_t*  play_opt;                     /* control-side pending-play flag, set when a CMD_PLAY enqueues for this
+    /* Voice-ended handles held for rt_poll_ended (control thread). drain_events already sees every
+     * EVT_VOICE_ENDED and recycles the slot; without this they were discarded, so every client
+     * rebuilt completion detection out of is_playing polling. Fixed ring, drop-OLDEST on overflow:
+     * a caller who never polls must not grow it, and the newest completions are the useful ones. */
+    uint32_t* ended;
+    uint32_t  ended_cap, ended_head, ended_len;
+    uint64_t  ended_dropped;
+    _Atomic uint64_t done_dropped;   /* completions the AUDIO thread refused to post, to protect the
+                                      * ownership acks. Folded into rt_poll_ended's dropped total. */
+    uint8_t*  play_seq;                     /* control-side play COUNTER (wrapping, never 0 once used), bumped when a CMD_PLAY enqueues for this
                                              * slot's current gen: rt_source_is_playing reads it until the audio
                                              * thread first PUBLISHES that gen, so a fresh play/create_stream never
                                              * reads not-playing in the one-block window before the next render. */
@@ -618,6 +633,26 @@ static uint32_t cmd_free(const CmdRing* r) {
     return RING_CAP - (w - rd);
 }
 
+/* Push a BEST-EFFORT completion notice. EVT_VOICE_DONE is unlike the other two events: a plain voice
+ * re-arms with just a CMD_PLAY, so it needs no control-side drain in between and can be emitted
+ * without bound. That breaks the "voice_cap + sound_cap <= EVT_CAP means un-overflowable" reasoning
+ * the ring is sized on, and a full ring would then drop the ownership-carrying events instead:
+ * a missed EVT_VOICE_ENDED leaks a voice slot, a missed EVT_SOUND_RETIRED never frees the buffer.
+ * So DONE yields. It is only pushed while that many slots remain free, and a refusal is COUNTED so
+ * rt_poll_ended can still tell a caller it missed completions rather than silently losing them. */
+static void evt_push_done(RtCore* c, const Evt* e) {          /* audio thread */
+    EvtRing* r = &c->events;
+    const uint32_t reserve = c->voice_cap + c->sound_cap;     /* headroom the critical events own */
+    uint32_t w  = atomic_load_explicit(&r->write, memory_order_relaxed);
+    uint32_t rd = atomic_load_explicit(&r->read,  memory_order_acquire);
+    if (w - rd >= EVT_CAP - reserve) {
+        atomic_fetch_add_explicit(&c->done_dropped, 1u, memory_order_relaxed);
+        return;
+    }
+    r->slots[w & (EVT_CAP - 1)] = *e;
+    atomic_store_explicit(&r->write, w + 1, memory_order_release);
+}
+
 static bool evt_push(EvtRing* r, const Evt* e) {              /* audio thread */
     uint32_t w  = atomic_load_explicit(&r->write, memory_order_relaxed);
     uint32_t rd = atomic_load_explicit(&r->read,  memory_order_acquire);
@@ -641,7 +676,7 @@ static uint32_t alloc_handle(RtCore* c) {
     c->stealing[idx] = 0;                                     /* a fresh slot is not mid-steal (clears a leaked flag
                                                               * if the app destroyed a voice while it faded) */
     c->push_sound[idx] = 0;                                   /* a fresh slot is not push-fed */
-    c->play_opt[idx] = 0;                                     /* no pending play for the new gen yet */
+    c->play_seq[idx] = 0;                                     /* no play enqueued for the new gen yet */
     return BWA_MK_H(idx, g);
 }
 
@@ -715,6 +750,18 @@ static void push_sound_release(RtCore* c, uint32_t h) {
     }
 }
 
+/* Append an ended handle to the poll ring (control thread). Drop-OLDEST when full, counting the loss,
+ * so a caller who never polls cannot grow it and the newest completions are the ones kept. */
+static void ended_note(RtCore* c, uint32_t h) {
+    if (!c->ended_cap) return;
+    if (c->ended_len == c->ended_cap) {
+        c->ended_head = (c->ended_head + 1u) % c->ended_cap;
+        --c->ended_len; ++c->ended_dropped;
+    }
+    c->ended[(c->ended_head + c->ended_len) % c->ended_cap] = h;
+    ++c->ended_len;
+}
+
 static void drain_events(RtCore* c) {                          /* control thread */
     for (uint32_t i = 0; i < c->retire_parked; )               /* re-try parked internal retires (the
                                                                 * command ring was full when they died) */
@@ -726,7 +773,30 @@ static void drain_events(RtCore* c) {                          /* control thread
     for (; rd != w; ++rd) {
         const Evt* ev = &r->slots[rd & (EVT_CAP - 1)];
         switch (ev->type) {
+        case EVT_VOICE_DONE:                                          /* pure notice: recycle nothing */
+            /* Report only if this completion belongs to the LATEST play of that slot. Between the
+             * audio thread posting it and the control thread draining, the caller may already have
+             * re-played the same handle; announcing the old play's end while the new one is audible
+             * is how a client frees or re-triggers the wrong thing. A superseded completion is
+             * dropped, not counted: nothing was lost, the caller moved on. */
+            {   /* The generation must match too. Seq alone is per-SLOT, so a completion left
+                 * undrained while the caller destroyed the source and created a new one on the same
+                 * slot would match the new occupant's counter (both plays are seq 1) and report a
+                 * handle the caller has already freed. Seq 0 means "no play was ever enqueued at
+                 * this generation", which no real completion can carry. */
+                const uint16_t i2 = BWA_H_IDX(ev->handle);
+                if (ev->seq != 0 && c->inuse[i2] && c->gen[i2] == BWA_H_GEN(ev->handle)
+                    && c->play_seq[i2] == ev->seq) ended_note(c, ev->handle);
+            }
+            break;
         case EVT_VOICE_ENDED:    push_sound_release(c, ev->handle);   /* a stolen push source dies here */
+                                 /* NOT reported here. A naturally ending ONESHOT posts DONE as well,
+                                  * and reporting both surfaced it twice — with a handle the caller
+                                  * never held, since bwa_play_oneshot returns no handle. A STEAL
+                                  * posts only ENDED, and a stolen voice is not a completion either:
+                                  * the engine took the slot, the sound did not finish. */
+                                 /* Record BEFORE recycle_handle bumps the generation, so the handle
+                                  * handed to rt_poll_ended is the one the caller still holds. */
                                  recycle_handle(c, ev->handle); c->stealing[BWA_H_IDX(ev->handle)] = 0; break;
         case EVT_SOUND_RETIRED: {        /* audio dropped all refs: free pcm / close the stream + recycle the slot */
             SoundSlot* s = sound_slot_ctrl(c, ev->handle);
@@ -770,11 +840,15 @@ enum { EQ_LOWSHELF = BWA_BIQUAD_LOWSHELF, EQ_PEAK = BWA_BIQUAD_PEAK, EQ_HIGHSHEL
                                 * (a deliberately inaudible threshold that keeps un-occluded voices off the
                                 * biquad path; the per-band attenuation floor lives in steam_scene.c). */
 
-/* pack 3 band gains (each clamped to [0,1]) into one u64 = 3x16-bit, for a tear-free atomic publish */
+/* pack 3 band gains (each clamped to [0,1]) into one u64 = 3x16-bit, for a tear-free atomic publish.
+ * The clamp is the NaN-CLEANSING form: the bands arrive from the sim thread (whatever the ray
+ * tracer computed), and a NaN through `< 0` would reach a float->uint16 conversion, which is UB
+ * out of range. NULL reads as flat (occlusion clear). */
 static inline uint64_t eq_pack(const float g[3]) {
+    if (!g) return 0xFFFFFFFFFFFFull;                  /* 3x 0xFFFF = all-clear */
     uint64_t p = 0;
     for (int i = 0; i < 3; ++i) {
-        float v = g[i] < 0.f ? 0.f : (g[i] > 1.f ? 1.f : g[i]);
+        float v = !(g[i] > 0.f) ? 0.f : (g[i] > 1.f ? 1.f : g[i]);
         p |= (uint64_t)(uint16_t)(v * 65535.f + 0.5f) << (16 * i);
     }
     return p;
@@ -893,8 +967,10 @@ static void drain_commands(RtCore* c) {
                      v->fade_rate = 0.f; v->fade_stop = 0; } } break;   /* an explicit set cancels a fade */
         case CMD_FADE: { Voice* v = voice_for(c, cmd->handle);
             if (v) {
-                float tgt = cmd->u.fade.target < 0.f ? 0.f : cmd->u.fade.target;
-                if (cmd->u.fade.seconds <= 0.f || tgt == v->gain_user) {   /* instant (or already there) */
+                float tgt = !(cmd->u.fade.target > 0.f) ? 0.f : cmd->u.fade.target;   /* NaN-safe */
+                /* NaN-safe: `seconds <= 0` is FALSE for NaN, so a NaN duration used to fall through
+                 * to the ramp and make fade_rate = (tgt-g)/(NaN*rate) NaN. Treat it as instant. */
+                if (!(cmd->u.fade.seconds > 0.f) || tgt == v->gain_user) {   /* instant (or already there) */
                     v->gain_user = tgt; v->dirty = true;
                     v->fade_rate = 0.f; v->fade_stop = 0;
                     if (cmd->u.fade.stop && v->playing && v->stopping != 2) v->stopping = 1;
@@ -909,7 +985,7 @@ static void drain_commands(RtCore* c) {
         case CMD_GROUP_GAIN: {
             uint8_t id = cmd->u.ggain.id;
             if (id < BWA_GROUPS) {
-                c->group_gain[id] = cmd->u.ggain.gain < 0.f ? 0.f : cmd->u.ggain.gain;
+                c->group_gain[id] = !(cmd->u.ggain.gain > 0.f) ? 0.f : cmd->u.ggain.gain;   /* NaN-safe */
                 for (uint32_t i = 0; i < c->voice_cap; ++i)          /* the group's voices re-solve (ramped) */
                     if (c->voices[i].active && c->voices[i].group == id) c->voices[i].dirty = true;
             } } break;
@@ -918,7 +994,8 @@ static void drain_commands(RtCore* c) {
             if (id < BWA_GROUPS) c->group_paused[id] = cmd->u.gpause.on;   /* pause_gate ramps/freezes */
             } break;
         case CMD_SET_PITCH: { Voice* v = voice_for(c, cmd->handle);
-            if (v) { float r2 = cmd->u.pitch.rate;
+            if (v && isfinite(cmd->u.pitch.rate)) {   /* NaN passes a two-sided clamp and sticks forever */
+                     float r2 = cmd->u.pitch.rate;
                      v->pitch = r2 < 0.25f ? 0.25f : (r2 > 4.f ? 4.f : r2); } } break;   /* mixer glides */
         case CMD_BED_ROT: { Voice* v = voice_for(c, cmd->handle);
             if (v) { v->yaw = cmd->u.brot.yaw; v->bpitch = cmd->u.brot.pitch;
@@ -945,6 +1022,7 @@ static void drain_commands(RtCore* c) {
                 if (s->stream)                       /* one voice per stream: the ring is SPSC. Detach any OTHER */
                     for (uint32_t j = 0; j < c->voice_cap; ++j)   /* voice on this stream so two consumers can't corrupt it */
                         if (&c->voices[j] != v && c->voices[j].sound == s) { c->voices[j].playing = false; c->voices[j].sound = NULL; }
+                v->play_seq = cmd->u.play.seq;   /* what rt_source_is_playing compares against */
                 v->sound = s; v->cursor = 0; v->cur_frac = 0.f; v->stream_pos = 0; v->loop = cmd->u.play.loop != 0;
                           v->oneshot = cmd->u.play.oneshot != 0; v->playing = true; v->dirty = true;
                           /* loop region: resolve against the asset so the mix seam sees in-bounds values.
@@ -1027,7 +1105,7 @@ static void drain_commands(RtCore* c) {
                          for (int b = 0; b < 3; ++b) { v->path_eq.g_cur[b] = 1.f;
                              v->path_eq.x1[b]=v->path_eq.x2[b]=v->path_eq.y1[b]=v->path_eq.y2[b]=0.f; } } } } break;
         case CMD_SET_REFL_SEND: { Voice* v = voice_for(c, cmd->handle);
-            if (v) { float g = cmd->u.rsend.gain; v->refl_gain = g < 0.f ? 0.f : g; } } break;
+            if (v) { float g = cmd->u.rsend.gain; v->refl_gain = !(g > 0.f) ? 0.f : g; } } break;   /* NaN-safe */
         case CMD_SET_REFL_DIST: { Voice* v = voice_for(c, cmd->handle);
             if (v) v->refl_dist = cmd->u.rdist.on != 0; } break;
         case CMD_SET_DOPPLER: { Voice* v = voice_for(c, cmd->handle);
@@ -2169,6 +2247,12 @@ static void mix_voice(RtCore* c, Voice* v, uint16_t idx, float* bus, uint32_t n,
 
     if (ended) {
         v->playing = false;
+        if (!v->oneshot) {                     /* a oneshot has no caller handle to report AGAINST:
+                                                * rt_play_oneshot never bumps play_seq, so its 0 would
+                                                * also sail through the drain's 0 == 0 seq gate. */
+            Evt done = { .type = EVT_VOICE_DONE, .seq = v->play_seq, .handle = BWA_MK_H(idx, v->gen) };
+            evt_push_done(c, &done);           /* best-effort; must never displace an ownership ack */
+        }
         if (v->oneshot) {
             v->active = false;                 /* transient voice is finished */
             Evt ev = { .type = EVT_VOICE_ENDED, .handle = BWA_MK_H(idx, v->gen) };
@@ -2505,6 +2589,12 @@ static void mix_bed(RtCore* c, Voice* v, uint16_t idx, float* bus, uint32_t n, u
     if (rot_mode == 2) memcpy(v->rot_m, rot_end, sizeof(float) * rot_n);   /* land the live matrix */
     if (ended) {
         v->playing = false;
+        if (!v->oneshot) {                     /* a oneshot has no caller handle to report AGAINST:
+                                                * rt_play_oneshot never bumps play_seq, so its 0 would
+                                                * also sail through the drain's 0 == 0 seq gate. */
+            Evt done = { .type = EVT_VOICE_DONE, .seq = v->play_seq, .handle = BWA_MK_H(idx, v->gen) };
+            evt_push_done(c, &done);           /* best-effort; must never displace an ownership ack */
+        }
         if (v->oneshot) {
             v->active = false;
             Evt ev = { .type = EVT_VOICE_ENDED, .handle = BWA_MK_H(idx, v->gen) };
@@ -2539,13 +2629,17 @@ static void room_eq_track(RtCore* c) {
     }
     double w[BWA_RQ_GRID_MAX], wsum = 0.0;
     for (uint8_t i = 0; i < g->npos; ++i) {           /* IDW: w = 1/(d² + eps²), eps = 15 cm */
-        float dx = lp[0]-g->pos[i][0], dy = lp[1]-g->pos[i][1], dz = lp[2]-g->pos[i][2];
-        w[i] = 1.0 / ((double)(dx*dx + dy*dy + dz*dz) + 0.0225);
+        /* squares in DOUBLE: a large-but-finite listener coordinate (isfinite-gated only) would
+         * overflow the float square to Inf, zero every weight, and make inv below 1/0 — and
+         * 0 * Inf = NaN would land in the align biquad targets permanently */
+        double dx = (double)lp[0]-g->pos[i][0], dy = (double)lp[1]-g->pos[i][1], dz = (double)lp[2]-g->pos[i][2];
+        w[i] = 1.0 / (dx*dx + dy*dy + dz*dz + 0.0225);
         wsum += w[i];
     }
+    if (!(wsum > 0.0)) return;                        /* unreachable with the double math; belt for the NaN class */
     double inv = 1.0 / wsum;
     for (uint32_t k = 0; k < c->channels; ++k)
-        for (uint8_t s = 0; s < g->nsec[k]; ++s) {
+        for (uint8_t s = 0; s < g->nsec[k] && s < BWA_ROOM_EQ_MAX; ++s) {
             double acc = 0.0;
             for (uint8_t i = 0; i < g->npos; ++i) acc += w[i] * (double)g->gain_db[i][k][s];
             tgt[k][s] = (float)(acc * inv);
@@ -2733,6 +2827,7 @@ static void clk_fit_update(RtCore* c, uint64_t sample, uint64_t time_ns, uint32_
     atomic_store_explicit(&c->fit_stamps, (uint32_t)(c->fit_w + 0.5), memory_order_relaxed);
 }
 
+
 void rt_render(RtCore* c, float* bus, uint32_t nframes, const bwa_timestamp* ts) {
     /* dsp clock for sample-accurate scheduling: prefer the device sample position (ASIO/null); fall
      * back to an internal block counter when no timestamp is supplied (e.g. direct rt_render in tests).
@@ -2778,6 +2873,15 @@ void rt_render(RtCore* c, float* bus, uint32_t nframes, const bwa_timestamp* ts)
         float tp[3], tq[4];
         uint64_t tns = 0;
         if (pose_read_t(trk, tp, tq, &tns)) {
+            /* SANITIZE THE WIRE POSE. This is the production path and it does NOT go through
+             * rt_set_listener, so that call's finite guard and quaternion normalization reach it not
+             * at all: natnet.c copies wire floats into the seqlock unvalidated. One corrupt Motive
+             * packet would otherwise NaN every panner solve permanently, because a NaN in gcur can
+             * never leave the ramp x + (t - x) * k, and an un-normalized wire quat overflows
+             * frame_qrot exactly as a large one does through the client path. Drop a non-finite
+             * frame outright (keep the last good pose, which is what a dropped frame means anyway)
+             * and normalize the quaternion, degenerate falling back to identity. */
+            if (!(bwa_finite3(tp) && bwa_quat_unit(tq))) goto pose_done;
             /* pose prediction: lead the position along a velocity estimated from the tracker's own
              * timestamps (differences only — never compared to the device clock). The estimate
              * smooths over ~100 ms (Motive's frame-to-frame velocity is jittery), resets across a
@@ -2824,6 +2928,7 @@ void rt_render(RtCore* c, float* bus, uint32_t nframes, const bwa_timestamp* ts)
             memcpy(c->lis.q_active, tq, sizeof tq);
             if (moved) for (uint32_t i = 0; i < c->voice_cap; ++i) c->voices[i].dirty = true;
         }
+        pose_done: ;
     }
 
     memset(bus, 0, sizeof(float) * (size_t)nframes * c->channels);
@@ -2932,7 +3037,7 @@ void rt_render(RtCore* c, float* bus, uint32_t nframes, const bwa_timestamp* ts)
     /* decorrelation: convolve the decor bus through each channel's sparse velvet filter into the main
      * bus. Runs while anything wrote this block, plus one filter-length of flush so the tail rings
      * out; on going idle the history is wiped, so a later re-engage can never replay stale samples. */
-    if (c->dc_wrote) c->dc_tail = c->dc_histlen;
+    if (dc_live)    if (dc_live)    if (c->dc_wrote) c->dc_tail = c->dc_histlen;
     if (dc_live && c->dc_tail > 0) {
         BWA_ZONE_BEGIN(zdc, "decorrelate");
         const uint32_t hm = c->dc_hmask, hl = c->dc_histlen, w = c->dc_w, nt = c->dc_ntaps;
@@ -2957,7 +3062,8 @@ void rt_render(RtCore* c, float* bus, uint32_t nframes, const bwa_timestamp* ts)
     }
     for (uint32_t i = 0; i < c->voice_cap; ++i) {   /* publish playback state for rt_source_is_playing (control thread) */
         const Voice* v = &c->voices[i];
-        uint32_t st = ((uint32_t)v->gen << 1) | ((v->active && v->playing && v->sound) ? 1u : 0u);
+        uint32_t st = ((uint32_t)v->gen << 9) | ((uint32_t)v->play_seq << 1)
+                    | ((v->active && v->playing && v->sound) ? 1u : 0u);
         atomic_store_explicit(&c->play_pub[i], st, memory_order_release);
         uint64_t pos = v->sound ? (v->sound->stream ? v->stream_pos : (uint64_t)v->cursor) : 0;
         atomic_store_explicit(&c->pos_pub[i], ((uint64_t)v->gen << 48) | (pos & 0xFFFFFFFFFFFFULL),
@@ -3045,8 +3151,13 @@ void rt_render(RtCore* c, float* bus, uint32_t nframes, const bwa_timestamp* ts)
             for (uint32_t ch = 0; ch < c->channels; ++ch) {
                 float* p = &bus[(size_t)ch * nframes + i];
                 float s = *p * g;
-                if (s >  lim_c) s =  lim_c;
-                if (s < -lim_c) s = -lim_c;
+                /* the hard clamp is the designated last line of defense, so it must not pass the two
+                 * things a clamp can't see: NaN fails both compares, and an Inf bus sample drives
+                 * `want` to 0 so g underflows and Inf * 0 = NaN right here. Scrub to 0 (silence),
+                 * never to the ceiling (a full-scale DC step). */
+                if (!isfinite(s)) s = 0.f;
+                else if (s >  lim_c) s =  lim_c;
+                else if (s < -lim_c) s = -lim_c;
                 *p = s;
             }
         }
@@ -3090,9 +3201,61 @@ bool rt_source_is_playing(RtCore* c, uint32_t h) {
     if (!c || h == 0) return false;
     uint32_t idx = BWA_H_IDX(h);
     if (idx >= c->voice_cap) return false;
+    if (!(c->inuse[idx] && c->gen[idx] == BWA_H_GEN(h))) return false;   /* stale or recycled handle */
+    const uint8_t seq = c->play_seq[idx];
     uint32_t st = atomic_load_explicit(&c->play_pub[idx], memory_order_acquire);
-    if ((st >> 1) == BWA_H_GEN(h)) return (st & 1u) != 0u;   /* published this gen: authoritative */
-    return c->inuse[idx] && c->gen[idx] == BWA_H_GEN(h) && c->play_opt[idx] != 0;   /* play still queued */
+    if ((st >> 9) != BWA_H_GEN(h)) return seq != 0;          /* gen never published: true iff a play is queued */
+    if ((uint8_t)((st >> 1) & 0xFFu) != seq) return true;    /* a NEWER play is queued, not yet consumed */
+    return (st & 1u) != 0u;                                  /* the audio thread has our play: authoritative */
+}
+
+/* Control-thread: drain the handles whose voices have ENDED since the last call, oldest first.
+ * Writes at most `cap` of them to `out` and returns how many. The events already existed (the audio
+ * thread posts EVT_VOICE_ENDED and drain_events consumes it); this just stops throwing them away, so
+ * a client can react to completion instead of rebuilding it from is_playing polling.
+ *
+ * Handles are reported as the caller knew them, so a straight compare against a stored handle works.
+ * A plain source's handle stays VALID and re-playing it is normal; only a oneshot's transient handle
+ * is recycled, and those are not reported (the caller was never given one). Steals are not reported
+ * either: the engine took the slot, the sound did not finish.
+ *
+ * Fills from the same drain rt_commit runs, so poll after commit. Unpolled events are bounded and
+ * drop OLDEST; `dropped_out` (optional) reports the running total so a client can tell "nothing
+ * finished" from "I did not poll often enough". */
+/* Control thread: the live values of the knobs rt SANITIZES, so a readback reports what will be
+ * rendered rather than what the caller passed. Every one of these is stored post-clamp by its setter,
+ * so this is a plain read; keeping it here rather than re-clamping in engine.c means there is exactly
+ * one copy of each range. A 0 that is a "use the default" sentinel stays 0, which is what was set. */
+/* The SPCAP knobs post-clamp, for the same reason as the rest: rt bounds focus to [1,64] and density
+ * to (0,16], and a readback that reported the raw argument would contradict its own contract. 0 stays
+ * 0, because 0 is the "use this array's derived default" sentinel and that IS what was set. */
+void rt_get_spcap_sanitized(RtCore* c, float* focus, float* density) {
+    if (!c) return;
+    if (focus)   *focus   = atomic_load_explicit(&c->spcap_focus,   memory_order_relaxed);
+    if (density) *density = atomic_load_explicit(&c->spcap_density, memory_order_relaxed);
+}
+
+void rt_get_tuning_sanitized(RtCore* c, int* panner, int* spread_mode, float* near_spread,
+                             float* hole_spread, float* dead_zone_m, float* slew_frames_per_s) {
+    if (!c) return;
+    if (panner)       *panner       = atomic_load_explicit(&c->panner,       memory_order_relaxed);
+    if (spread_mode)  *spread_mode  = atomic_load_explicit(&c->spread_mode,  memory_order_relaxed);
+    if (near_spread)  *near_spread  = atomic_load_explicit(&c->near_spread,  memory_order_relaxed);
+    if (hole_spread)  *hole_spread  = atomic_load_explicit(&c->hole_spread,  memory_order_relaxed);
+    if (dead_zone_m)  *dead_zone_m  = atomic_load_explicit(&c->lc_dead_m,    memory_order_relaxed);
+    if (slew_frames_per_s) *slew_frames_per_s = atomic_load_explicit(&c->lc_slew, memory_order_relaxed);
+}
+
+uint32_t rt_poll_ended(RtCore* c, uint32_t* out, uint32_t cap, uint64_t* dropped_out) {
+    if (!c) return 0;
+    if (dropped_out) *dropped_out = c->ended_dropped
+                                  + atomic_load_explicit(&c->done_dropped, memory_order_relaxed);
+    if (!out || cap == 0u) return 0;
+    uint32_t n = c->ended_len < cap ? c->ended_len : cap;
+    for (uint32_t i = 0; i < n; ++i) out[i] = c->ended[(c->ended_head + i) % c->ended_cap];
+    c->ended_head = (c->ended_head + n) % c->ended_cap;
+    c->ended_len -= n;
+    return n;
 }
 
 /* Control-thread readback: the voice's content playhead in engine-rate frames, as of the last
@@ -3128,6 +3291,20 @@ uint64_t rt_dsp_time(RtCore* c) {
  * a wall clock (manual_sink.c) — reproducible by design, so it is exact for arithmetic and
  * meaningless as wall time. Note the stamp gate is `system_time_ns != 0`, so the very first block
  * of a manual render (whose nominal time IS 0) publishes nothing; the clock goes valid on block 2. */
+/* Invalidate the published device-clock pair. Called when the engine stops, because a restart
+ * RE-BASES the sample clock to 0 while the last pair still describes the previous session: an
+ * AV-sync client reading it would map into the old epoch. `time_ns == 0` is already rt_get_clock's
+ * "nothing published yet", which is the honest answer between sessions, and the manual sink's first
+ * re-based block legitimately stamps 0 so it cannot clear this by itself. */
+void rt_reset_clock(RtCore* c) {
+    if (!c) return;
+    uint32_t s1 = atomic_load_explicit(&c->clk_seq, memory_order_relaxed);
+    atomic_store_explicit(&c->clk_seq, s1 + 1u, memory_order_release);   /* odd: write in progress */
+    atomic_store_explicit(&c->clk_sample, 0u, memory_order_relaxed);
+    atomic_store_explicit(&c->clk_time,   0u, memory_order_relaxed);
+    atomic_store_explicit(&c->clk_seq, s1 + 2u, memory_order_release);
+}
+
 bool rt_get_clock(RtCore* c, uint64_t* sample, uint64_t* time_ns) {
     if (!c) return false;
     for (int tries = 0; tries < 16; ++tries) {          /* seqlock read: retry a torn snapshot */
@@ -3220,9 +3397,21 @@ static void source_bind(RtCore* c, uint32_t h, uint32_t sound, bool loop, uint64
     cmd.u.play.sound = sound; cmd.u.play.loop = loop ? 1u : 0u; cmd.u.play.oneshot = 0u;
     cmd.u.play.start = start_sample;
     cmd.u.play.loop_beg = loop_beg; cmd.u.play.loop_end = loop_end;
-    if (cmd_push(&c->cmds, &cmd) && voice_live_ctrl(c, h))
-        c->play_opt[BWA_H_IDX(h)] = 1;     /* pending play: is_playing reads true from NOW, not from
-                                            * the first rendered block */
+    if (voice_live_ctrl(c, h)) {
+        /* Bump BEFORE the push, so the audio thread can never consume a play carrying a seq the
+         * control side has not recorded yet (that would read as "a newer play is queued" forever).
+         * 0 is reserved for "no play enqueued at this generation", so the counter skips it.
+         * If the ring REFUSES the push the play never happens, so the bump has to be undone: a
+         * counter left ahead of the published seq makes is_playing answer true forever with no
+         * voice. Both are same-thread, so the rollback is safe. */
+        uint8_t* q = &c->play_seq[BWA_H_IDX(h)];
+        const uint8_t prev = *q;
+        if (++(*q) == 0) *q = 1;
+        cmd.u.play.seq = *q;
+        if (!cmd_push(&c->cmds, &cmd)) *q = prev;
+        return;
+    }
+    cmd_push(&c->cmds, &cmd);
 }
 
 /* Bind an open stream to a fresh sound slot (shared by file streaming and push sources); on a
@@ -3336,6 +3525,7 @@ void rt_source_set_pos(RtCore* c, uint32_t h, float x, float y, float z) {
 
 void rt_source_set_gain(RtCore* c, uint32_t h, float linear) {
     if (!isfinite(linear) || linear < 0.f) return;             /* reject NaN/Inf/negative gain */
+    if (linear > BWA_MAX_GAIN) linear = BWA_MAX_GAIN;   /* finite is not enough: an absurd gain overflows the bus to Inf */
     Cmd cmd = { .type = CMD_SET_GAIN, .handle = h };
     cmd.u.gain.g = linear;
     cmd_push(&c->cmds, &cmd);
@@ -3379,6 +3569,7 @@ void rt_set_pathing(RtCore* c, uint32_t handle, const float* sh, const float* eq
 
 void rt_source_set_reflection_send(RtCore* c, uint32_t h, float gain) {
     if (!isfinite(gain) || gain < 0.f) return;
+    if (gain > BWA_MAX_GAIN) gain = BWA_MAX_GAIN;   /* finite is not enough: an absurd gain overflows the bus to Inf */
     Cmd cmd = { .type = CMD_SET_REFL_SEND, .handle = h };
     cmd.u.rsend.gain = gain;
     cmd_push(&c->cmds, &cmd);
@@ -3403,7 +3594,7 @@ void rt_source_set_air_absorption(RtCore* c, uint32_t h, bool on) {
 }
 
 void rt_source_set_size(RtCore* c, uint32_t h, float radius_m) {
-    if (!c) return;
+    if (!c || !isfinite(radius_m)) return;      /* keep NaN out of audio-thread state (handler clamp passes it) */
     Cmd cmd = { .type = CMD_SET_SIZE, .handle = h };
     cmd.u.size.radius = radius_m;
     cmd_push(&c->cmds, &cmd);
@@ -3411,6 +3602,14 @@ void rt_source_set_size(RtCore* c, uint32_t h, float radius_m) {
 
 void rt_source_fade_to(RtCore* c, uint32_t h, float gain, float seconds, bool stop_at_end) {
     if (!c) return;
+    /* The handler's `!(target > 0)` cleanses NaN but not an absurd finite target: seconds <= 0 takes
+     * the INSTANT branch, so gain_user = 3e38 lands on the bus in the very next block. Same cap as
+     * rt_source_set_gain. Non-finite/huge seconds would make fade_rate 0 and a fade_out that never
+     * stops the voice, so they degrade to instant / an hour. */
+    if (!isfinite(gain) || gain < 0.f) gain = 0.f;
+    if (gain > BWA_MAX_GAIN) gain = BWA_MAX_GAIN;   /* finite is not enough: an absurd gain overflows the bus to Inf */
+    if (!isfinite(seconds)) seconds = 0.f;
+    else if (seconds > 3600.f) seconds = 3600.f;
     if (stop_at_end) {                 /* fade-out: one-way for a push source, same as stop above */
         Stream* st = push_stream_ctrl(c, h);
         if (st) stream_push_end(st);
@@ -3454,7 +3653,8 @@ void rt_set_ism_room(RtCore* c, const IsmRoom* room) {
 
 void rt_set_ism_gain(RtCore* c, float linear) {
     if (!c) return;
-    if (linear < 0.f) linear = 0.f;
+    if (!(linear > 0.f)) linear = 0.f;          /* NaN-safe */
+    if (linear > BWA_MAX_GAIN) linear = BWA_MAX_GAIN;   /* finite is not enough: an absurd gain overflows the bus to Inf */
     atomic_store_explicit(&c->ism_gain, linear, memory_order_relaxed);   /* the solve re-reads it per block */
 }
 
@@ -3475,6 +3675,8 @@ void rt_source_set_group(RtCore* c, uint32_t h, uint32_t group) {
 
 void rt_group_set_gain(RtCore* c, uint32_t group, float linear) {
     if (!c || group >= BWA_GROUPS) return;
+    if (!isfinite(linear) || linear < 0.f) return;             /* reject NaN/Inf/negative gain */
+    if (linear > BWA_MAX_GAIN) linear = BWA_MAX_GAIN;   /* finite is not enough: an absurd gain overflows the bus to Inf */
     Cmd cmd = { .type = CMD_GROUP_GAIN, .handle = 0 };
     cmd.u.ggain.id = (uint8_t)group;
     cmd.u.ggain.gain = linear;
@@ -3521,6 +3723,8 @@ void rt_source_set_extent(RtCore* c, uint32_t h, float w, float hgt) {
 
 void rt_test_signal(RtCore* c, uint32_t channel, uint8_t kind, float gain) {
     if (!c) return;
+    if (!isfinite(gain)) return;                /* injected post-align: a NaN here reaches the device */
+    if (gain > BWA_MAX_GAIN) gain = BWA_MAX_GAIN;   /* finite is not enough: an absurd gain overflows the bus to Inf */
     Cmd cmd = { .type = CMD_TEST_SIGNAL };
     cmd.u.test.channel = channel; cmd.u.test.kind = kind; cmd.u.test.gain = gain;
     cmd_push(&c->cmds, &cmd);
@@ -3593,9 +3797,17 @@ void rt_source_seek(RtCore* c, uint32_t h, uint64_t frame) {
 }
 
 void rt_set_listener(RtCore* c, const float p[3], const float q[4]) {
+    if (!p || !q) return;
+    /* Same finite guard rt_source_set_pos has, and for a worse reason: a NaN listener NaNs EVERY
+     * panner solve, and once NaN is in gcur the ramp x + (t-x)*k can never leave it, so it survives
+     * until the engine restarts. The asymmetry with the source setter was the whole bug. */
+    /* bwa_quat_unit normalizes, because finite is not enough here — see sane.h for why, and for the
+     * degenerate-to-identity rule that keeps an unset orientation facing room-ahead. */
+    float nq[4] = { q[0], q[1], q[2], q[3] };
+    if (!(bwa_finite3(p) && bwa_quat_unit(nq))) return;
     Cmd cmd = { .type = CMD_SET_LISTENER };
     cmd.u.lis.px = p[0]; cmd.u.lis.py = p[1]; cmd.u.lis.pz = p[2];
-    cmd.u.lis.qx = q[0]; cmd.u.lis.qy = q[1]; cmd.u.lis.qz = q[2]; cmd.u.lis.qw = q[3];
+    cmd.u.lis.qx = nq[0]; cmd.u.lis.qy = nq[1]; cmd.u.lis.qz = nq[2]; cmd.u.lis.qw = nq[3];
     cmd_push(&c->cmds, &cmd);
 }
 
@@ -3695,6 +3907,7 @@ bool rt_play_oneshot(RtCore* c, uint32_t sound, float x, float y, float z, float
     SoundSlot* s = sound_slot_ctrl(c, sound);
     if (!s || s->retiring) return false;
     if (!(isfinite(x) && isfinite(y) && isfinite(z) && isfinite(gain) && gain >= 0.f)) return false;
+    if (gain > BWA_MAX_GAIN) gain = BWA_MAX_GAIN;   /* finite is not enough: an absurd gain overflows the bus to Inf */
     /* A oneshot enqueues 4 commands (CREATE/SET_POS/SET_GAIN/PLAY) that must all land, or
      * the transient voice is created-but-never-played and leaks (it never ends -> never
      * acks EVT_VOICE_ENDED -> never recycled). Reserve room for all 4 up front so a
@@ -3725,10 +3938,11 @@ RtCore* rt_create(uint32_t req_voice_cap, uint32_t sound_cap, uint32_t sample_ra
         channels  == 0 || channels  > BWA_CHANNELS || sample_rate == 0)
         return NULL;
     const uint32_t voice_cap = req_voice_cap + BWA_FADE_RESERVE;   /* physical slots (user pool + fade reserve) */
-    /* Bound the event ring: between two control-thread drains the audio thread emits at
-     * most one EVT_VOICE_ENDED per voice plus one EVT_SOUND_RETIRED per sound, so
-     * EVT_CAP >= voice_cap + sound_cap makes the event ring un-overflowable (acks can
-     * never be silently dropped on the audio thread). */
+    /* Bound the event ring for the OWNERSHIP acks: between two control-thread drains the audio thread
+     * emits at most one EVT_VOICE_ENDED per voice plus one EVT_SOUND_RETIRED per sound, so
+     * EVT_CAP >= voice_cap + sound_cap keeps those un-overflowable (an ack can never be silently
+     * dropped on the audio thread). EVT_VOICE_DONE is NOT bounded that way, which is exactly why it
+     * goes through evt_push_done and yields this much headroom instead of sharing it. */
     if ((uint64_t)voice_cap + sound_cap > EVT_CAP) return NULL;
     RtCore* c = (RtCore*)calloc(1, sizeof *c);
     if (!c) return NULL;
@@ -3760,7 +3974,9 @@ RtCore* rt_create(uint32_t req_voice_cap, uint32_t sound_cap, uint32_t sample_ra
     c->stealing  = (uint8_t*)  calloc(voice_cap, sizeof(uint8_t));
     c->push_sound = (uint32_t*)calloc(voice_cap, sizeof(uint32_t));
     c->retire_park = (uint32_t*)calloc(sound_cap, sizeof(uint32_t));
-    c->play_opt  = (uint8_t*)  calloc(voice_cap, sizeof(uint8_t));
+    c->play_seq  = (uint8_t*)  calloc(voice_cap, sizeof(uint8_t));
+    c->ended_cap = voice_cap * 2u;   /* two generations of every slot between polls is ample */
+    c->ended     = (uint32_t*)  calloc(c->ended_cap, sizeof(uint32_t));
     c->freelist  = (uint32_t*) calloc(voice_cap, sizeof(uint32_t));
     c->sounds    = (SoundSlot*)calloc(sound_cap, sizeof(SoundSlot));
     c->sfreelist = (uint32_t*) calloc(sound_cap, sizeof(uint32_t));
@@ -3848,7 +4064,7 @@ RtCore* rt_create(uint32_t req_voice_cap, uint32_t sound_cap, uint32_t sample_ra
     if (!c->voices || !c->occ_handle || !c->occ_val || !c->occ_eq || !c->occ_dir || !c->dir_pub || !c->play_pub || !c->pos_pub || !c->aux ||
         !c->stream_scratch || !c->streams || !c->path_accum || !c->path_pub || !c->path_idx ||
         !c->gen || !c->inuse || !c->priority || !c->stealing || !c->push_sound || !c->retire_park ||
-        !c->play_opt || !c->freelist || !c->sounds || !c->sfreelist ||
+        !c->play_seq || !c->ended || !c->freelist || !c->sounds || !c->sfreelist ||
         !c->dop_ring || !c->dc_bus || !c->dc_hist || !c->para || !c->ism_ring) {
         rt_destroy(c); return NULL;
     }
@@ -4085,7 +4301,7 @@ void rt_set_bed_renderer(RtCore* c, int parametric) {
  * (velocity from the tracker's own timestamps). 0 disables (default). Live-safe atomic. */
 void rt_set_pose_prediction(RtCore* c, float lead_s) {
     if (!c) return;
-    if (lead_s < 0.f) lead_s = 0.f; else if (lead_s > 0.2f) lead_s = 0.2f;   /* a lead past ~200 ms is overshoot, not latency hiding */
+    if (!(lead_s > 0.f)) lead_s = 0.f; else if (lead_s > 0.2f) lead_s = 0.2f;   /* a lead past ~200 ms is overshoot, not latency hiding */
     atomic_store_explicit(&c->pred_lead, lead_s, memory_order_relaxed);
 }
 
@@ -4093,7 +4309,15 @@ void rt_set_pose_prediction(RtCore* c, float lead_s) {
  * toward it across the block, so a slider drag never zippers. */
 void rt_set_master_gain(RtCore* c, float linear) {
     if (!c) return;
+    if (!isfinite(linear)) return;              /* NaN slips a `< 0` clamp and NaNs the whole bus */
     if (linear < 0.f) linear = 0.f;
+    /* Finite is not enough: `bus * 3e38` OVERFLOWS to +/-Inf. The gain is sticky, so EVERY later
+     * block overflows too, and the Inf reaches the align delay line and (when room EQ is on) the
+     * biquad state, where an IIR feedback path holds it past any later correction. Cap at +80 dB —
+     * far past any musical use, and overflow-safe against any sample the bus legitimately carries.
+     * Found by test_fuzz_api seed 12648430: isfinite(3e38) is TRUE, so the reject-guard above
+     * passes it. Finite-but-absurd is a separate class from non-finite; see BWA_MAX_GAIN. */
+    if (linear > BWA_MAX_GAIN) linear = BWA_MAX_GAIN;
     atomic_store_explicit(&c->master_gain, linear, memory_order_relaxed);
 }
 
@@ -4116,7 +4340,7 @@ uint64_t rt_stream_starves(RtCore* c) {
  * Live-safe atomic; the gains it changes ramp like any solve. */
 void rt_set_near_spread(RtCore* c, float radius_m) {
     if (!c) return;
-    if (radius_m < 0.f) radius_m = 0.f; else if (radius_m > 10.f) radius_m = 10.f;
+    if (!(radius_m > 0.f)) radius_m = 0.f; else if (radius_m > 10.f) radius_m = 10.f;   /* NaN-safe */
     atomic_store_explicit(&c->near_spread, radius_m, memory_order_relaxed);
 }
 
@@ -4133,7 +4357,7 @@ void rt_set_near_spread(RtCore* c, float radius_m) {
  * never pair the new generation with the old strength and swallow the change. */
 void rt_set_hole_spread(RtCore* c, float strength) {
     if (!c) return;
-    if (strength < 0.f) strength = 0.f; else if (strength > 2.f) strength = 2.f;
+    if (!(strength > 0.f)) strength = 0.f; else if (strength > 2.f) strength = 2.f;   /* NaN-safe */
     atomic_store_explicit(&c->hole_spread, strength, memory_order_release);
     atomic_fetch_add_explicit(&c->pan_gen, 1u, memory_order_release);
 }
@@ -4196,8 +4420,7 @@ void rt_source_set_directivity_manual(RtCore* c, uint32_t h, const float fwd[3],
 /* Engine-wide speed of sound (m/s; live). Atomic store; mix_voice re-reads it per block, and both
  * delay users glide toward their new targets — a change bends, never steps (invariant 4). */
 void rt_set_speed_of_sound(RtCore* c, float mps) {
-    if (!c || !isfinite(mps)) return;
-    if (mps < BWA_SOS_MIN) mps = BWA_SOS_MIN; else if (mps > BWA_SOS_MAX) mps = BWA_SOS_MAX;
+    if (!c || !bwa_finite_clamp(&mps, BWA_SOS_MIN, BWA_SOS_MAX)) return;
     atomic_store_explicit(&c->sos, mps, memory_order_relaxed);
 }
 
@@ -4208,7 +4431,13 @@ void rt_set_extra_listeners(RtCore* c, const float* xyz, uint32_t n) {
     Cmd cmd = { .type = CMD_SET_EXTRA_LIS, .handle = 0 };
     if (n > BWA_EXTRA_LIS) n = BWA_EXTRA_LIS;
     memset(cmd.u.exlis.p, 0, sizeof cmd.u.exlis.p);
-    if (xyz) for (uint32_t j = 0; j < n; ++j) memcpy(cmd.u.exlis.p[j], &xyz[j * 3], sizeof(float) * 3);
+    /* Same finite guard the primary listener and the source setter have. INF is the dangerous one
+     * here rather than NaN: dbap_gains computes inv = 1/Inf = 0 and then -Inf * 0 = NaN, which
+     * survives both clamp branches and lands in the gain vector. */
+    if (xyz) for (uint32_t j = 0; j < n; ++j) {
+        if (!bwa_finite3(&xyz[j*3])) return;
+        memcpy(cmd.u.exlis.p[j], &xyz[j * 3], sizeof(float) * 3);
+    }
     cmd.u.exlis.n = (uint8_t)(xyz ? n : 0);
     cmd_push(&c->cmds, &cmd);
 }
@@ -4262,8 +4491,11 @@ void rt_set_direct(RtCore* c, uint32_t handle, float level, const float bands[3]
     if (!c) return;
     uint16_t idx = BWA_H_IDX(handle);
     if (idx >= c->voice_cap) return;
-    if (level < 0.f) level = 0.f; if (level > 1.f) level = 1.f;
-    if (dir   < 0.f) dir   = 0.f; if (dir   > 1.f) dir   = 1.f;
+    /* NaN-safe, and this is the backstop that matters: these values arrive from the SIM thread,
+     * so they fence whatever the ray tracer computed from a degenerate scene as well as whatever
+     * the caller passed. `x < lo` reads false for NaN and let it straight into a mixer gain. */
+    if (!(level > 0.f)) level = 0.f; else if (level > 1.f) level = 1.f;
+    if (!(dir   > 0.f)) dir   = 0.f; else if (dir   > 1.f) dir   = 1.f;
     atomic_store_explicit(&c->occ_val[idx],  level,          memory_order_relaxed);
     atomic_store_explicit(&c->occ_eq[idx],   eq_pack(bands), memory_order_relaxed);
     atomic_store_explicit(&c->occ_dir[idx],  dir,            memory_order_relaxed);
@@ -4318,7 +4550,8 @@ void rt_destroy(RtCore* c) {
     free(c->priority);
     free(c->push_sound);
     free(c->retire_park);
-    free(c->play_opt);
+    free(c->play_seq);
+    free(c->ended);
     free(c->inuse);
     free(c->gen);
     free(c->dop_ring);

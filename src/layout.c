@@ -216,8 +216,12 @@ bool layout_load(const char* path, uint32_t sample_rate, Layout* out, char* err,
             }
             for (int t = 0; t < m; ++t) {
                 cJSON* v = cJSON_GetArrayItem(eqj, t);
-                if (!cJSON_IsNumber(v) || !isfinite(v->valuedouble)) {   /* a silent 0 would corrupt the response */
-                    set_err(err, errcap, "layout: non-numeric/non-finite eq tap"); goto done;
+                /* the magnitude bound matters as much as isfinite: the check is on the DOUBLE but the
+                 * store is a FLOAT, so 1e300 passes isfinite and the cast overflows to Inf — and a
+                 * finite 1e30 tap overflows the bus the first time the FIR runs (a correction kernel's
+                 * taps are O(1); 100 is generous) */
+                if (!cJSON_IsNumber(v) || !isfinite(v->valuedouble) || fabs(v->valuedouble) > 100.0) {
+                    set_err(err, errcap, "layout: eq tap non-numeric, non-finite, or out of range (+/-100)"); goto done;
                 }
                 spk->eq[t] = (float)v->valuedouble;
             }

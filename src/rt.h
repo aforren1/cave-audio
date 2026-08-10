@@ -14,6 +14,16 @@
  * ambisonic bed, streaming, pause/seek, and the output limiter. See NOTES.md for history.
  */
 #ifndef BWA_RT_H
+/* Upper bound for any linear gain the ABI accepts (+80 dB). Guards the finite-but-absurd case:
+ * a merely `isfinite` gain can still overflow the bus to Inf and poison downstream filter state. */
+#define BWA_MAX_GAIN 1.0e4f
+
+/* Upper bound for any SAMPLE that enters from outside — decoded files (sound.c) and the push/stream
+ * rings (stream.c). Same finite-but-absurd class as BWA_MAX_GAIN: a float wav can carry 3e38
+ * verbatim, and the align delay lines + room-EQ biquads sit BEFORE the limiter, so an overflow
+ * lands in filter state that never recovers. +30 dBFS clears any legitimately hot float master. */
+#define BWA_MAX_SAMPLE 32.0f
+
 #define BWA_RT_H
 
 #include "sink.h"          /* bwa_timestamp, BWA_CHANNELS */
@@ -63,7 +73,7 @@ typedef struct {
     union {
         struct { float x, y, z; }                      pos;
         struct { float g; }                            gain;
-        struct { uint64_t start, loop_beg, loop_end; uint32_t sound; uint8_t loop, oneshot; } play;
+        struct { uint64_t start, loop_beg, loop_end; uint32_t sound; uint8_t loop, oneshot, seq; } play;
                                          /* start = dsp-sample to begin (0 = now); loop_beg/loop_end =
                                           * loop region in frames (0/0 = whole clip; used only when loop) */
         struct { uint64_t sample; }                    stopat;/* dsp-sample to begin the click-free stop fade */
@@ -99,8 +109,13 @@ typedef struct {
 } Cmd;
 
 /* Event ring payload (audio -> control). */
-enum { EVT_VOICE_ENDED = 0, EVT_SOUND_RETIRED };
-typedef struct { uint8_t type; uint32_t handle; } Evt;
+/* EVT_VOICE_ENDED means RECYCLE this transient handle (a oneshot finishing, or a stolen slot).
+ * EVT_VOICE_DONE is a pure NOTIFICATION that a caller-owned voice stopped playing: same ring, but
+ * the handle stays the caller's, so drain_events records it for rt_poll_ended and recycles nothing.
+ * They had to be separate: completion is not ownership, and the existing event only ever fired for
+ * the handles the engine was taking back. */
+enum { EVT_VOICE_ENDED = 0, EVT_SOUND_RETIRED, EVT_VOICE_DONE };
+typedef struct { uint8_t type, seq; uint32_t handle; } Evt;   /* seq: the play a DONE belongs to */
 
 typedef struct RtCore RtCore;   /* opaque */
 
@@ -295,8 +310,15 @@ void rt_render(RtCore* c, float* bus, uint32_t nframes, const bwa_timestamp* ts)
 void rt_get_listener(RtCore* c, float p[3], float q[4]);   /* audio thread: active pose */
 void rt_read_pose(RtCore* c, float p[3], float q[4]);      /* control thread: active pose (seqlock readback) */
 bool rt_source_is_playing(RtCore* c, uint32_t h);         /* control thread: is the source's voice still playing? */
+/* control thread: drain handles whose voices ENDED since the last call (see rt.c) */
+uint32_t rt_poll_ended(RtCore* c, uint32_t* out, uint32_t cap, uint64_t* dropped_out);
+/* control thread: the live POST-CLAMP values of the knobs rt sanitizes (see rt.c) */
+void rt_get_spcap_sanitized(RtCore* c, float* focus, float* density);
+void rt_get_tuning_sanitized(RtCore* c, int* panner, int* spread_mode, float* near_spread,
+                             float* hole_spread, float* dead_zone_m, float* slew_frames_per_s);
 uint64_t rt_source_get_position(RtCore* c, uint32_t h);   /* control thread: content playhead (engine-rate frames) */
 uint64_t rt_dsp_time(RtCore* c);                          /* control thread: current dsp-sample clock (for scheduling) */
+void rt_reset_clock(RtCore* c);   /* drop the device-clock pair: a restart re-bases the sample clock */
 bool rt_get_clock(RtCore* c, uint64_t* sample, uint64_t* time_ns); /* control thread: device (sample, host-ns) pair;
                                                                     * false until a host-stamped block renders */
 /* Device-vs-host clock drift, fitted over the same block stamps (rt.c, RtCore.fit_*). Mirrors the

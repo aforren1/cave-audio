@@ -537,7 +537,9 @@ int valid_score(const Layout* L, int panner, const ValidRender* R, int tracked, 
     double ty = (double)src_world[1] - mic[1];
     double tz = (double)src_world[2] - mic[2];
     double tn = sqrt(tx*tx + ty*ty + tz*tz);
-    if (tn < 1e-6) return 0;                          /* source on top of the listener */
+    if (!(tn >= 1e-6) || !isfinite(tn)) return 0;     /* source on top of the listener — or a NaN/Inf
+                                                       * position (an unvalidated --radius) that would
+                                                       * score every cell "ok" with a NaN miss */
     out->target[0] = (float)(tx/tn); out->target[1] = (float)(ty/tn); out->target[2] = (float)(tz/tn);
 
     const float* ptr[ZYLIA_MICS];
@@ -563,6 +565,9 @@ int valid_score(const Layout* L, int panner, const ValidRender* R, int tracked, 
     out->measured[0] = d[0]; out->measured[1] = d[1]; out->measured[2] = d[2];
     out->diffuseness = psi;
     double dot = (double)d[0]*out->target[0] + (double)d[1]*out->target[1] + (double)d[2]*out->target[2];
+    if (!isfinite(dot)) { out->ok = 0; return 1; }    /* a NaN passes both clamps below, and a NaN
+                                                       * miss_deg with ok=1 breaks the medians (qsort
+                                                       * with NaN is not a strict weak ordering) */
     if (dot >  1.0) dot =  1.0;
     if (dot < -1.0) dot = -1.0;
     out->miss_deg = (float)(acos(dot) * 180.0 / M_PI);
@@ -654,7 +659,7 @@ int valid_run(const Layout* L, const int* panners, int npan, const ValidRender* 
               float radius, double fs, double c,
               uint32_t n, ValidCell* cells_out) {
     if (!L || !panners || !listeners || !targets || !cells_out) return 0;
-    if (npan < 1 || nlis < 1 || ntgt < 1 || radius <= 0.0f) return 0;
+    if (npan < 1 || nlis < 1 || ntgt < 1 || !(radius > 0.0f) || !isfinite(radius)) return 0;   /* NaN-safe */
 
     int w = 0;
     for (int p = 0; p < npan; ++p)
@@ -681,7 +686,7 @@ int valid_run(const Layout* L, const int* panners, int npan, const ValidRender* 
 
 int valid_target_grid(int naz, const float* elev_deg, int nel, float (*out)[3], int cap) {
     if (naz < 1 || nel < 1 || !elev_deg || !out) return 0;
-    if (naz * nel > cap) return 0;
+    if ((long long)naz * nel > cap) return 0;   /* the int product wraps at 2^31 and would pass the cap */
     int w = 0;
     for (int e = 0; e < nel; ++e) {
         double el = (double)elev_deg[e] * M_PI / 180.0, ce = cos(el), se = sin(el);

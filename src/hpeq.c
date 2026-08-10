@@ -30,7 +30,15 @@ int hpeq_parse(const char* path, uint32_t sample_rate, HpEqDesign* d, char* err,
         const char* p = line + strspn(line, " \t");
         if (strncmp(p, "PREAMP:", 7) == 0) {
             float db = 0.f;
-            if (sscanf(p + 7, "%f", &db) == 1) d->preamp = powf(10.0f, db / 20.0f);
+            if (sscanf(p + 7, "%f", &db) == 1) {
+                /* %f parses "NAN"/"INF" too, and a finite-but-absurd dB overflows the cascade.
+                 * The negated compare rejects NaN (every NaN comparison is false). */
+                if (!(db >= -120.f && db <= 60.f)) {
+                    s_err(err, errcap, "Preamp out of range [-120, 60] dB", lineno);
+                    fclose(f); return 0;
+                }
+                d->preamp = powf(10.0f, db / 20.0f);
+            }
             continue;
         }
         if (strncmp(p, "FILTER", 6) != 0) continue;          /* lenient: unknown lines skipped */
@@ -52,8 +60,14 @@ int hpeq_parse(const char* path, uint32_t sample_rate, HpEqDesign* d, char* err,
         else if (strcmp(type, "LSC") == 0 || strcmp(type, "LS") == 0) bt = BWA_BIQUAD_LOWSHELF;
         else if (strcmp(type, "HSC") == 0 || strcmp(type, "HS") == 0) bt = BWA_BIQUAD_HIGHSHELF;
         else { s_err(err, errcap, "unknown filter type", lineno); fclose(f); return 0; }
-        if (fc <= 0.f || q <= 0.f) { s_err(err, errcap, "non-positive Fc/Q", lineno); fclose(f); return 0; }
-        if (fc >= 0.49f * (float)sample_rate) continue;      /* at/above Nyquist: skip (header) */
+        /* negated compares so a NaN Fc/Q/gain is rejected, not passed ("NAN" parses; a NaN slips
+         * `fc <= 0.f` because every NaN comparison is false and would poison the biquad state for
+         * the session). The gain bound also stops a finite-but-absurd dB from overflowing the
+         * coefficients to Inf — same class as BWA_MAX_GAIN (rt.h). */
+        if (!(fc > 0.f) || !(q > 0.f)) { s_err(err, errcap, "non-positive Fc/Q", lineno); fclose(f); return 0; }
+        if (!(q <= 256.f))             { s_err(err, errcap, "Q out of range (0, 256]", lineno); fclose(f); return 0; }
+        if (!(gain >= -60.f && gain <= 60.f)) { s_err(err, errcap, "Gain out of range [-60, 60] dB", lineno); fclose(f); return 0; }
+        if (fc >= 0.49f * (float)sample_rate) continue;      /* at/above Nyquist: skip (header; also catches Inf) */
         if (d->nsec >= BWA_HPEQ_MAX_SEC) {
             s_err(err, errcap, "too many filters", lineno);
             fclose(f); return 0;

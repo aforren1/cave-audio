@@ -7,6 +7,7 @@
  */
 #include "bw_audio.h"
 #include "frame.h"         /* BWA_ROOM_* identity basis + frame_qrot */
+#include "sane.h"         /* bwa_quat_unit, bwa_finite3, bwa_finite_clamp */
 #include "sink.h"
 #include "rt.h"
 #include "layout.h"
@@ -111,6 +112,14 @@ struct bwa_engine {
     float         refl_wet;       /* reverb wet level (bwa_set_reverb_gain, the one control);
                                    * seeds whichever bed bwa_start creates, live thereafter */
     int           max_re;         /* mirror of bwa_set_max_re, so a pre-start toggle seeds the FDN */
+    bwa_tuning    cur;            /* live shadow of every knob bwa_tuning carries, so bwa_get_tuning
+                                   * can read them back. The engine keeps no getters for the
+                                   * individual A/B knobs by design; this is the readback half of a
+                                   * struct the ABI already owns, and it exists because BOTH bindings
+                                   * were hand-mirroring 16 fields to keep their inspectors honest.
+                                   * EVERY setter below must update it, or the two writer paths
+                                   * (individual setters and bwa_apply_tuning) drift apart. */
+    int           beds_warned;    /* the "two reverb beds, one tap" notice, once */
     SteamPath*    path;           /* pathing (bwa_desc.enable_pathing); NULL otherwise */
     float         src_pos[BWA_VOICE_CAP][3];  /* control-side per-source positions, so set_pathing has the pos */
     /* control-side directivity cache: bwa_source_set_orientation and _set_directivity arrive as
@@ -151,7 +160,10 @@ struct bwa_engine {
  * render_binaural and cave_both's monitor tap. */
 static inline void engine_clamp2(float* stereo, uint32_t n) {
     for (uint32_t i = 0; i < n * 2; ++i) {
-        if (stereo[i] > 1.f) stereo[i] = 1.f; else if (stereo[i] < -1.f) stereo[i] = -1.f;
+        /* a plain two-sided clamp passes NaN (every NaN comparison is false) — and this IS the
+         * last stop, so scrub non-finite to 0 (silence), never to the rail (a DC step) */
+        if (!isfinite(stereo[i])) stereo[i] = 0.f;
+        else if (stereo[i] > 1.f) stereo[i] = 1.f; else if (stereo[i] < -1.f) stereo[i] = -1.f;
     }
 }
 
@@ -329,6 +341,10 @@ bwa_engine* bwa_create(const bwa_desc* cfg) {
     if (!e->rt) { free(e); return NULL; }
     e->max_re = 1;                                  /* match rt_create's default so the FDN bwa_start
                                                      * creates is seeded ON too (see rt.c) */
+    /* The DEFAULT preset IS the engine's own defaults, field for field, so this seeds the shadow
+     * without a second list to keep in sync. Nothing asserts that today: if you move a default in
+     * rt_create, move it in bwa_tuning_preset too. */
+    bwa_tuning_preset(BWA_SETUP_DEFAULT, &e->cur);
     rt_set_layout(e->rt, &L);
     /* diffuse-bed decoder is create-time config: the SH->speaker decode matrix is (re)built here on
      * the control thread — it must not race mix_bed once the audio thread runs. */
@@ -501,6 +517,15 @@ bwa_result bwa_start(bwa_engine* e) {
      * when the FDN is enabled). Consumes the same mono aux send + per-voice send levels. Non-fatal on
      * allocation failure: no tap, the engine runs dry, the reason surfaces via bwa_last_error. */
     if (e->fdn_cfg.enabled) {
+        /* One reverb tap, two candidate beds. The Steam block above is SKIPPED when the FDN is on, so
+         * a caller who configured both used to get a silent choice. Say which one won, once, the same
+         * way the ISM-plus-Steam double-render is reported (bwa_source_set_early_reflections). */
+        if (e->refl_cfg.enabled && !e->beds_warned) {
+            e->beds_warned = 1;
+            set_error(e, "both reverb beds were configured (bwa_reflections_config + bwa_fdn_config) "
+                         "and they share ONE reverb tap: the FDN took it and the Steam reflection bed "
+                         "was not created. Enable exactly one.");
+        }
         e->fdn = fdn_create(&e->layout, e->cfg.sample_rate, e->layout.count,
                             resolve_bed_decoder(e->cfg.bed_decoder));   /* same internal mapping as rt */
         if (e->fdn) {
@@ -539,6 +564,7 @@ bwa_result bwa_start(bwa_engine* e) {
 bwa_result bwa_stop(bwa_engine* e) {
     if (!e) return BWA_ERR_CONFIG;
     engine_close_devices(e);                            /* joins the audio thread(s) */
+    rt_reset_clock(e->rt);   /* a restart re-bases the sample clock; the old pair must not survive */
     e->started = 0;
     return BWA_OK;
 }
@@ -874,25 +900,27 @@ bool bwa_source_is_playing(bwa_engine* e, bwa_source s)                     { re
 uint64_t bwa_source_get_playhead_frames(bwa_engine* e, bwa_source s)               { return e ? rt_source_get_position(e->rt, s) : 0; }
 void bwa_set_test_signal(bwa_engine* e, uint32_t channel, bwa_test_kind kind, float gain) { if (e) rt_test_signal(e->rt, channel, (uint8_t)kind, gain); }
 
-void bwa_set_panner(bwa_engine* e, bwa_panner panner) { if (e) { e->panner = (int)panner; rt_set_panner(e->rt, (int)panner); } }
-void bwa_set_dual_band(bwa_engine* e, bool on)       { if (e) rt_set_dual_band(e->rt, on); }
-void bwa_set_dual_band_cap(bwa_engine* e, bool on)             { if (e) rt_set_cap(e->rt, on); }
+void bwa_set_panner(bwa_engine* e, bwa_panner panner) { if (e) { e->panner = (int)panner; e->cur.panner = panner; rt_set_panner(e->rt, (int)panner); } }
+void bwa_set_dual_band(bwa_engine* e, bool on)       { if (e) { e->cur.dual_band = on; rt_set_dual_band(e->rt, on); } }
+void bwa_set_dual_band_cap(bwa_engine* e, bool on)   { if (e) { e->cur.dual_band_cap = on; rt_set_cap(e->rt, on); } }
 void bwa_set_max_re(bwa_engine* e, bool on) {
     if (!e) return;
+    e->cur.max_re = on;
     e->max_re = on ? 1 : 0;                          /* staged for the FDN bwa_start may still create */
     rt_set_max_re(e->rt, e->max_re);
     if (e->fdn) fdn_set_max_re(e->fdn, e->max_re);   /* live: the FDN crossfades its render pair */
 }
-void bwa_set_max_re_split(bwa_engine* e, bool on)     { if (e) rt_set_max_re_split(e->rt, on); }
-void bwa_set_spread_mode(bwa_engine* e, bwa_spread_mode mode) { if (e) rt_set_spread_mode(e->rt, (int)mode); }
-void bwa_set_tracked_room_eq(bwa_engine* e, bool on)  { if (e) rt_set_room_eq_dyn(e->rt, on); }
+void bwa_set_max_re_split(bwa_engine* e, bool on)     { if (e) { e->cur.max_re_split = on; rt_set_max_re_split(e->rt, on); } }
+void bwa_set_spread_mode(bwa_engine* e, bwa_spread_mode mode) { if (e) { e->cur.spread_mode = mode; rt_set_spread_mode(e->rt, (int)mode); } }
+void bwa_set_tracked_room_eq(bwa_engine* e, bool on)  { if (e) { e->cur.tracked_room_eq = on; rt_set_room_eq_dyn(e->rt, on); } }
 void bwa_set_tracked_align(bwa_engine* e, bool on) {
-    if (e) rt_set_tracked_align(e->rt, on);
+    if (e) { e->cur.tracked_align = on; rt_set_tracked_align(e->rt, on); }
 }
 void bwa_set_tracked_align_guards(bwa_engine* e, float dead_zone_m, float slew_frames_per_s) {
-    if (e) rt_set_tracked_align_guards(e->rt, dead_zone_m, slew_frames_per_s);
+    if (e) { e->cur.align_dead_zone_m = dead_zone_m; e->cur.align_slew_frames_per_s = slew_frames_per_s;
+             rt_set_tracked_align_guards(e->rt, dead_zone_m, slew_frames_per_s); }
 }
-void bwa_set_decorrelation(bwa_engine* e, bool on)    { if (e) rt_set_decorrelation(e->rt, on); }
+void bwa_set_decorrelation(bwa_engine* e, bool on)    { if (e) { e->cur.decorrelation = on; rt_set_decorrelation(e->rt, on); } }
 
 /* ---- situation tuning (bwa_setup / bwa_tuning; see the header for the design and the evidence) ----
  *
@@ -937,6 +965,34 @@ void bwa_tuning_preset(bwa_setup setup, bwa_tuning* out) {
     }
 }
 
+/* The readback half of bwa_apply_tuning: whatever the individual setters and apply_tuning have left
+ * the engine at. Not "getters for the A/B knobs" one at a time, which the engine deliberately does
+ * not have; this is one struct the ABI already defines, and it exists because both bindings were
+ * hand-mirroring its fields to stop their inspectors lying about live state. */
+bool bwa_get_tuning(bwa_engine* e, bwa_tuning* out) {
+    if (!e || !out) return false;
+    *out = e->cur;
+    /* Report what the engine will RENDER, not what the caller asked for. rt clamps or rejects several
+     * of these (guards to [0, 0.5] m and [0, 4096] frames/s, near-spread and hole-spread to their own
+     * ranges, an out-of-range panner or spread mode to 0), and a readback whose whole job is to stop
+     * an inspector lying about live state must not itself report the unsanitized value. */
+    {
+        int pan = 0, spm = 0;
+        rt_get_tuning_sanitized(e->rt, &pan, &spm, &out->near_spread, &out->hole_spread,
+                                &out->align_dead_zone_m, &out->align_slew_frames_per_s);
+        rt_get_spcap_sanitized(e->rt, &out->spcap_focus, &out->spcap_density);
+        out->panner = (bwa_panner)pan;
+        out->spread_mode = (bwa_spread_mode)spm;
+    }
+    out->struct_size = (uint32_t)sizeof(bwa_tuning);
+    return true;
+}
+
+uint32_t bwa_poll_ended(bwa_engine* e, bwa_source* out, uint32_t cap, uint64_t* dropped_out) {
+    if (!e) { if (dropped_out) *dropped_out = 0; return 0; }
+    return rt_poll_ended(e->rt, out, cap, dropped_out);
+}
+
 bool bwa_apply_tuning(bwa_engine* e, const bwa_tuning* t) {
     if (!e) return false;
     if (!t || t->struct_size != (uint32_t)sizeof(bwa_tuning)) {
@@ -962,11 +1018,11 @@ bool bwa_apply_tuning(bwa_engine* e, const bwa_tuning* t) {
     bwa_set_tracked_align(e, t->tracked_align);
     return true;
 }
-void bwa_set_bed_renderer(bwa_engine* e, bwa_bed_renderer r) { if (e) rt_set_bed_renderer(e->rt, (int)r); }
+void bwa_set_bed_renderer(bwa_engine* e, bwa_bed_renderer r) { if (e) { e->cur.bed_renderer = r; rt_set_bed_renderer(e->rt, (int)r); } }
 void bwa_set_pose_prediction(bwa_engine* e, float lead_s) { if (e) rt_set_pose_prediction(e->rt, lead_s); }
-void bwa_set_near_spread(bwa_engine* e, float radius_m)    { if (e) rt_set_near_spread(e->rt, radius_m); }
-void bwa_set_hole_spread(bwa_engine* e, float strength)    { if (e) rt_set_hole_spread(e->rt, strength); }
-void bwa_set_spcap_focus(bwa_engine* e, float focus, float density) { if (e) rt_set_spcap_focus(e->rt, focus, density); }
+void bwa_set_near_spread(bwa_engine* e, float radius_m)    { if (e) { e->cur.near_spread = radius_m; rt_set_near_spread(e->rt, radius_m); } }
+void bwa_set_hole_spread(bwa_engine* e, float strength)    { if (e) { e->cur.hole_spread = strength; rt_set_hole_spread(e->rt, strength); } }
+void bwa_set_spcap_focus(bwa_engine* e, float focus, float density) { if (e) { e->cur.spcap_focus = focus; e->cur.spcap_density = density; rt_set_spcap_focus(e->rt, focus, density); } }
 void bwa_set_extra_listeners(bwa_engine* e, const float* xyz, uint32_t count) { if (e) rt_set_extra_listeners(e->rt, xyz, count); }
 void bwa_source_set_loudness_comp(bwa_engine* e, bwa_source s, bool on) { if (e) rt_source_set_loudness_comp(e->rt, s, on); }
 void bwa_source_set_proximity(bwa_engine* e, bwa_source s, bool on) { if (e) rt_source_set_proximity(e->rt, s, on); }
@@ -1004,10 +1060,11 @@ void bwa_bed_set_orientation(bwa_engine* e, bwa_bed b, float yaw_rad, float pitc
  * from BOTH this and the sim (bwa_source_set_occlusion) — the sim republishes every tick and wins. */
 void bwa_source_set_occlusion_manual(bwa_engine* e, bwa_source s, float level, const float bands[3]) {
     if (!e) return;
-    if (level < 0.f) level = 0.f; else if (level > 1.f) level = 1.f;
+    if (!(level > 0.f)) level = 0.f; else if (level > 1.f) level = 1.f;   /* NaN-safe: a NaN here
+                                                                          * reaches the mixer gain */
     if (bands) {
         float b[3];
-        for (int i = 0; i < 3; ++i) b[i] = bands[i] < 0.f ? 0.f : (bands[i] > 1.f ? 1.f : bands[i]);
+        for (int i = 0; i < 3; ++i) b[i] = !(bands[i] > 0.f) ? 0.f : (bands[i] > 1.f ? 1.f : bands[i]);
         rt_set_occlusion_eq(e->rt, s, level, b);
     } else {
         rt_set_occlusion(e->rt, s, level);
@@ -1283,15 +1340,43 @@ static void emit_inward(const float* v, const float ctr[3], int* tris, int* n, i
 }
 #endif
 
-void bwa_scene_set_box(bwa_engine* e, float w, float h, float d, const bwa_material faces[6]) {
+/* The 8 vertices / 12 inward-facing triangles of a floor-based shoebox, and the per-triangle material
+ * for each. Pure: no engine, no allocation, same contract as bwa_spcap_focus_default. It exists so a
+ * caller composing a scene does not have to re-derive the box (both bindings did, including the
+ * flip-toward-center subtlety) just to keep it alongside their own geometry. Writes 24 floats,
+ * 36 ints and 12 materials. Returns false on non-positive dims or a NULL output. */
+bool bwa_box_mesh(float w, float h, float d, const bwa_material faces[6],
+                  float* out_verts, int* out_tris, bwa_material* out_tri_material) {
+    if (!(w > 0.f) || !(h > 0.f) || !(d > 0.f) || !out_verts || !out_tris) return false;
+    const float hw = w*0.5f, hd = d*0.5f;
+    const float v[8*3] = {
+        -hw, 0.f,-hd,   hw, 0.f,-hd,   hw, h,-hd,  -hw, h,-hd,
+        -hw, 0.f, hd,   hw, 0.f, hd,   hw, h, hd,  -hw, h, hd };
+    memcpy(out_verts, v, sizeof v);
+    static const int quad[6][4] = {            /* face order: -x,+x,-y,+y,-z,+z (matches faces[6]) */
+        {0,4,7,3}, {1,2,6,5}, {0,1,5,4}, {3,7,6,2}, {0,3,2,1}, {4,5,6,7} };
+    const float ctr[3] = { 0.f, h * 0.5f, 0.f };
+    int n = 0;
+    for (int fq = 0; fq < 6; ++fq) {
+        const bwa_material m = faces ? faces[fq] : 0;
+        const int a = quad[fq][0], b = quad[fq][1], c = quad[fq][2], dd = quad[fq][3];
+        emit_inward(out_verts, ctr, out_tris, &n, a, b, c);  if (out_tri_material) out_tri_material[n-1] = m;
+        emit_inward(out_verts, ctr, out_tris, &n, a, c, dd); if (out_tri_material) out_tri_material[n-1] = m;
+    }
+    return true;
+}
+
+/* The shoebox for the IMAGE-SOURCE reflections (ism.c) ONLY. Phonon-free, so it works in a no-SDK
+ * build, and it does NOT touch the ray-traced static mesh. Use this plus bwa_box_mesh when you are
+ * composing a scene out of the box AND your own geometry; use bwa_scene_set_box when the box IS the
+ * scene. Splitting the two is why neither is order-dependent any more. */
+void bwa_scene_set_ism_room(bwa_engine* e, float w, float h, float d, const bwa_material faces[6]) {
     if (!e) return;
-    if (!(w > 0.f) || !(h > 0.f) || !(d > 0.f)) {   /* reject zero/negative/NaN dims (degenerate triangles) */
-        set_error(e, "bwa_scene_set_box: w/h/d must be positive");
+    if (!(w > 0.f) || !(h > 0.f) || !(d > 0.f)) {
+        set_error(e, "scene box: w/h/d must be positive");   /* named for the caller, who may have
+                                                              * reached here through set_box */
         return;
     }
-    /* The box is captured for the IMAGE-SOURCE reflections (ism.c) whether or not the Steam Audio
-     * build is present — the same call configures the ray-traced scene (with SDK) and the geometric
-     * early reflections (always), so a no-SDK build still knows the room it is in. */
     e->ism_room.w = w; e->ism_room.h = h; e->ism_room.d = d;
     e->ism_room.plane_only = 0; e->ism_room.ground_y = 0.f;     /* a box replaces any prior ground plane */
     memset(e->ism_room.press, 0, sizeof e->ism_room.press);     /* faces reflect normally until flagged */
@@ -1302,25 +1387,22 @@ void bwa_scene_set_box(bwa_engine* e, float w, float h, float d, const bwa_mater
     }
     e->ism_room.valid = 1;
     rt_set_ism_room(e->rt, &e->ism_room);          /* seqlock publish — live-safe (rt.h) */
+}
+
+/* The box AS the whole scene: the ISM shoebox plus a ray-traced static mesh of the same box. This
+ * REPLACES the static mesh, which is fine when the box is all the geometry there is. To keep the box
+ * alongside your own, call bwa_scene_set_ism_room and compose bwa_box_mesh into one set_mesh_mat. */
+void bwa_scene_set_box(bwa_engine* e, float w, float h, float d, const bwa_material faces[6]) {
+    if (!e) return;
+    bwa_scene_set_ism_room(e, w, h, d, faces);
+    if (!e->ism_room.valid) return;                /* set_ism_room rejected the dims and said why */
 #ifdef BWA_HAVE_STEAMAUDIO
     if (scene_locked(e)) return;
     /* floor-based: x/z centered on the origin, y from 0 (the floor, where the room origin
      * canonically sits) up to h — so a listener at ear height stands inside the box */
-    float hw = w*0.5f, hd = d*0.5f;
-    float verts[8*3] = {
-        -hw, 0.f,-hd,   hw, 0.f,-hd,   hw, h,-hd,  -hw, h,-hd,
-        -hw, 0.f, hd,   hw, 0.f, hd,   hw, h, hd,  -hw, h, hd };
-    static const int quad[6][4] = {            /* face order: -x,+x,-y,+y,-z,+z (matches faces[6]) */
-        {0,4,7,3}, {1,2,6,5}, {0,1,5,4}, {3,7,6,2}, {0,3,2,1}, {4,5,6,7} };
-    int tris[12*3]; bwa_material tri_mat[12]; int n = 0;
-    const float ctr[3] = { 0.f, h * 0.5f, 0.f };
-    for (int f = 0; f < 6; ++f) {
-        bwa_material m = faces ? faces[f] : 0;
-        int a = quad[f][0], b = quad[f][1], c = quad[f][2], dd = quad[f][3];
-        emit_inward(verts, ctr, tris, &n, a, b, c);  tri_mat[n-1] = m;
-        emit_inward(verts, ctr, tris, &n, a, c, dd); tri_mat[n-1] = m;
-    }
-    bwa_scene_set_mesh_mat(e, verts, 8, tris, 12, tri_mat);
+    float verts[8*3]; int tris[12*3]; bwa_material tri_mat[12];
+    if (bwa_box_mesh(w, h, d, faces, verts, tris, tri_mat))
+        bwa_scene_set_mesh_mat(e, verts, 8, tris, 12, tri_mat);
 #endif
 }
 
@@ -1466,7 +1548,9 @@ void bwa_reflections_config(bwa_engine* e, const bwa_reflections_desc* cfg) {
  * bwa_start creates) and forwarded live to whichever bed owns the tap. */
 void bwa_set_reverb_gain(bwa_engine* e, float linear) {
     if (!e) return;
-    e->refl_wet = (linear < 0.f) ? 0.f : linear;
+    e->refl_wet = !(linear > 0.f) ? 0.f : linear;   /* NaN-safe: this multiplies the reverb bed */
+    if (e->refl_wet > BWA_MAX_GAIN) e->refl_wet = BWA_MAX_GAIN;   /* finite is not enough: an absurd
+                                                                   * wet gain overflows the bus to Inf */
 #ifdef BWA_HAVE_STEAMAUDIO
     if (e->reflect) steam_reflect_set_gain(e->reflect, e->refl_wet);
 #endif
@@ -1481,9 +1565,11 @@ void bwa_fdn_config(bwa_engine* e, const bwa_fdn_desc* cfg) {
         return;
     }
     e->fdn_cfg = *cfg;                                          /* applied at bwa_start; zero -> defaults */
-    if (e->fdn_cfg.rt60_low_s  <= 0.f) e->fdn_cfg.rt60_low_s  = 1.2f;
-    if (e->fdn_cfg.rt60_high_s <= 0.f) e->fdn_cfg.rt60_high_s = 0.7f;
-    if (e->fdn_cfg.xover_hz    <= 0.f) e->fdn_cfg.xover_hz    = 2000.f;
+    /* `<= 0` is FALSE for NaN, so these defaults used to let a NaN through into the decay
+     * coefficients and out to the device. `!(x > 0)` takes the default for NaN too. */
+    if (!(e->fdn_cfg.rt60_low_s  > 0.f)) e->fdn_cfg.rt60_low_s  = 1.2f;
+    if (!(e->fdn_cfg.rt60_high_s > 0.f)) e->fdn_cfg.rt60_high_s = 0.7f;
+    if (!(e->fdn_cfg.xover_hz    > 0.f)) e->fdn_cfg.xover_hz    = 2000.f;
     /* out-of-range decay/direction values reach fdn_set_decay(_direction)'s own clamps at start */
 }
 
@@ -1553,8 +1639,12 @@ void bwa_source_set_attenuation_override(bwa_engine* e, bwa_source s,
 
 void bwa_source_set_orientation(bwa_engine* e, bwa_source s, float qx, float qy, float qz, float qw) {
     if (!e) return;
-    /* the dipole axis is the source forward = q rotating the room frame's identity ahead */
+    /* Same treatment as the listener quaternion, for the same reason: frame_qrot assumes a UNIT
+     * quat, so a finite but large one overflows it and a non-finite one poisons the forward axis
+     * that feeds the sim. Reject non-finite, normalize the rest, degenerate falls back to
+     * identity (which points the dipole at room-ahead). */
     float q4[4] = { qx, qy, qz, qw }, f[3];
+    if (!bwa_quat_unit(q4)) return;
     frame_qrot(q4, BWA_ROOM_AHEAD, f);
     uint16_t idx = (uint16_t)(s & 0xFFFFu);
     if (idx < BWA_VOICE_CAP) { e->src_fwd[idx][0]=f[0]; e->src_fwd[idx][1]=f[1]; e->src_fwd[idx][2]=f[2]; }
@@ -1569,7 +1659,8 @@ void bwa_source_set_orientation(bwa_engine* e, bwa_source s, float qx, float qy,
 
 void bwa_source_set_directivity(bwa_engine* e, bwa_source s, float weight, float power) {
     if (!e) return;
-    if (weight < 0.f) weight = 0.f; else if (weight > 1.f) weight = 1.f;
+    if (!isfinite(power)) return;               /* never clamped anywhere; goes raw into the sim */
+    if (!(weight > 0.f)) weight = 0.f; else if (weight > 1.f) weight = 1.f;   /* NaN-safe */
     uint16_t idx = (uint16_t)(s & 0xFFFFu);
     if (idx < BWA_VOICE_CAP) { e->src_dirw[idx] = weight; e->src_dirp[idx] = power; }
 #ifdef BWA_HAVE_STEAMAUDIO

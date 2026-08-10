@@ -144,9 +144,11 @@ void fdn_destroy(Fdn* f) { if (f) { free(f->mem); free(f); } }
  * fdn_gains is NOT called here (its direct g_lf/g_hf write would race a running tap). */
 void fdn_set_decay(Fdn* f, float rt60_low_s, float rt60_high_s, float xover_hz) {
     if (!f) return;
-    f->rt_low   = rt60_low_s  < 0.05f ? 0.05f : (rt60_low_s  > 30.f ? 30.f : rt60_low_s);
-    f->rt_high  = rt60_high_s < 0.05f ? 0.05f : (rt60_high_s > 30.f ? 30.f : rt60_high_s);
-    f->xover_hz = xover_hz < 100.f ? 100.f : (xover_hz > 0.4f * (float)f->sample_rate ? 0.4f * (float)f->sample_rate : xover_hz);
+    /* NaN-safe two-sided clamps: `x < lo` is false for NaN, so the plain form passed it through
+     * into the decay coefficients and the tail went non-finite. */
+    f->rt_low   = !(rt60_low_s  > 0.05f) ? 0.05f : (rt60_low_s  > 30.f ? 30.f : rt60_low_s);
+    f->rt_high  = !(rt60_high_s > 0.05f) ? 0.05f : (rt60_high_s > 30.f ? 30.f : rt60_high_s);
+    f->xover_hz = !(xover_hz > 100.f) ? 100.f : (xover_hz > 0.4f * (float)f->sample_rate ? 0.4f * (float)f->sample_rate : xover_hz);
     atomic_store_explicit(&f->rt_low_st,  f->rt_low,   memory_order_relaxed);
     atomic_store_explicit(&f->rt_high_st, f->rt_high,  memory_order_relaxed);
     atomic_store_explicit(&f->xover_st,   f->xover_hz, memory_order_relaxed);
@@ -156,16 +158,19 @@ void fdn_set_decay(Fdn* f, float rt60_low_s, float rt60_high_s, float xover_hz) 
 void fdn_set_decay_direction(Fdn* f, const float dir[3], float factor) {
     if (!f || !dir) return;
     float n = sqrtf(dir[0]*dir[0] + dir[1]*dir[1] + dir[2]*dir[2]);
-    if (n < 1e-6f) { f->ddir[0] = f->ddir[1] = f->ddir[2] = 0.f; f->dfactor = 1.f; }
+    /* NaN-safe forms, matching fdn_set_decay above: `n < 1e-6f` is false for a NaN direction, so
+     * the plain test took the normalize branch and NaN/NaN went into the per-line loss gains —
+     * a FEEDBACK network, so the tail is NaN for the rest of the session. */
+    if (!(n > 1e-6f)) { f->ddir[0] = f->ddir[1] = f->ddir[2] = 0.f; f->dfactor = 1.f; }
     else {
         f->ddir[0] = dir[0]/n; f->ddir[1] = dir[1]/n; f->ddir[2] = dir[2]/n;
-        f->dfactor = factor < 0.25f ? 0.25f : (factor > 4.f ? 4.f : factor);
+        f->dfactor = !(factor > 0.25f) ? 0.25f : (factor > 4.f ? 4.f : factor);
     }
     fdn_gains(f);
 }
 
 void fdn_set_gain(Fdn* f, float gain) {
-    if (f) atomic_store_explicit(&f->gain, gain < 0.f ? 0.f : gain, memory_order_relaxed);
+    if (f) atomic_store_explicit(&f->gain, !(gain > 0.f) ? 0.f : gain, memory_order_relaxed);   /* NaN-safe */
 }
 
 void fdn_set_max_re(Fdn* f, int on) {

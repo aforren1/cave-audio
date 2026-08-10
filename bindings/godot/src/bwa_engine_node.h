@@ -205,6 +205,12 @@ public:
 	/* Situation tuning. get_setup_tuning returns the preset as a Dictionary so it can be PRINTED and
 	 * diffed before you commit to it; apply_setup pushes one straight through. */
 	godot::Dictionary get_setup_tuning(Setup setup) const;
+	/* The engine's CURRENT tuning, so the inspector can be reconciled with live state instead of
+	 * shadowing every field by hand. */
+	godot::Dictionary get_live_tuning() const;
+	/* Handles whose voices ENDED since the last call. Completion as an event: BwaEmitter no longer
+	 * has to guess from is_playing, which cannot see a clip shorter than a frame. */
+	godot::PackedInt64Array poll_ended();
 	bool apply_setup(Setup setup);
 	void set_dual_band_cap(bool on);
 	bool get_dual_band_cap() const { return dual_band_cap; }
@@ -278,6 +284,8 @@ public:
 	 * this is the one scene call a no-SDK build still needs. Live-safe (a room change
 	 * re-solves the reflections next block). */
 	void scene_set_box(float w, float h, float d, const PackedInt32Array &faces);
+	/* the ISM shoebox only: leaves the ray-traced static mesh alone, so the box composes */
+	void scene_set_ism_room(float w, float h, float d, const PackedInt32Array &faces);
 	/* The outdoor degenerate of the box: one horizontal mirror plane at Godot-world height y —
 	 * the ground bounce. Replaces the box (one room at a time); live-safe like it (reflections
 	 * re-solve next block). Set

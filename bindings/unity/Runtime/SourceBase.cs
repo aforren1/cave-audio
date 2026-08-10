@@ -48,7 +48,7 @@ namespace BwAudio
         [Tooltip("Physical radius in METERS (0 = point). The width becomes the angle the radius subtends " +
                  "from the listener, so the source stays the same PHYSICAL size as the listener walks. " +
                  "Floors `spread` — the larger of the two wins.")]
-        public float sizeMetres = 0f;
+        public float sizeMeters = 0f;
 
         [Header("Propagation (opt-in; derived from source↔listener distance)")]
         [Tooltip("Render through the propagation delay (distance/c): pitch up approaching, down receding. " +
@@ -152,7 +152,7 @@ namespace BwAudio
             if (pathing)       Bwa.bwa_source_set_pathing(eng, _src, true);
             if (spread > 0f)   Bwa.bwa_source_set_spread(eng, _src, spread);
             if (_extent.x > 0f || _extent.y > 0f) Bwa.bwa_source_set_extent(eng, _src, _extent.x, _extent.y);   // a script-set anisotropic extent, re-asserted after a re-enable
-            if (sizeMetres > 0f) Bwa.bwa_source_set_size(eng, _src, sizeMetres);
+            if (sizeMeters > 0f) Bwa.bwa_source_set_size(eng, _src, sizeMeters);
             if (_attSet)       Bwa.bwa_source_set_attenuation_override(eng, _src, _attRef, _attRolloff, _attMin);   // standing state, replayed like _extent
             if (doppler)       Bwa.bwa_source_set_doppler(eng, _src, true);
             if (airAbsorption) Bwa.bwa_source_set_air_absorption(eng, _src, true);
@@ -222,7 +222,7 @@ namespace BwAudio
         /// one-call "fade this out and clean it up". One-way for a push voice, like PushEnd.</summary>
         public void FadeOut(float seconds) { if (Live) Bwa.bwa_source_fade_out(Eng, _src, seconds); }
 
-        /// <summary>Angular width (0 = point .. 1 = wide). Floored by SizeMetres when that is set. Setting
+        /// <summary>Angular width (0 = point .. 1 = wide). Floored by SizeMeters when that is set. Setting
         /// this resets Extent to isotropic (spread and extent are the same knob — last call wins).</summary>
         public float Spread
         {
@@ -257,10 +257,10 @@ namespace BwAudio
 
         /// <summary>Physical radius in meters (0 = point): the source holds its real-world size as the
         /// listener walks, where a fixed Spread would not.</summary>
-        public float SizeMetres
+        public float SizeMeters
         {
-            get => sizeMetres;
-            set { sizeMetres = value; if (Live) Bwa.bwa_source_set_size(Eng, _src, value); }
+            get => sizeMeters;
+            set { sizeMeters = value; if (Live) Bwa.bwa_source_set_size(Eng, _src, value); }
         }
 
         /// <summary>Voice-steal priority (0 = expendable .. 255 = protected). A full voice pool steals the
@@ -357,7 +357,7 @@ namespace BwAudio
             // re-assert it exactly like TryInit does — otherwise any inspector edit in Play mode
             // silently collapses the extent while the Extent getter keeps reporting it.
             if (_extent.x > 0f || _extent.y > 0f) Bwa.bwa_source_set_extent(eng, _src, _extent.x, _extent.y);
-            Bwa.bwa_source_set_size(eng, _src, sizeMetres);
+            Bwa.bwa_source_set_size(eng, _src, sizeMeters);
             Bwa.bwa_source_set_occlusion(eng, _src, occlusion);
             Bwa.bwa_source_set_early_reflections(eng, _src, earlyReflections);
             Bwa.bwa_source_set_reverb(eng, _src, reflections);

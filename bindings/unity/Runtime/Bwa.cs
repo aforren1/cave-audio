@@ -488,6 +488,16 @@ namespace BwAudio
 
         [DllImport(DLL, CallingConvention = CC)] public static extern void bwa_tuning_preset(BwaSetup setup, out BwaTuning outTuning);
         [DllImport(DLL, CallingConvention = CC)] [return: MarshalAs(UnmanagedType.I1)]
+        public static extern bool bwa_get_tuning(IntPtr e, out BwaTuning outTuning);
+        // Completion as an EVENT. Drains handles whose voices ended; prefer it over edge-detecting
+        // bwa_source_is_playing, which misses any sound shorter than your frame interval.
+        [DllImport(DLL, CallingConvention = CC)] public static extern uint bwa_poll_ended(IntPtr e, [Out] uint[] outHandles, uint cap, out ulong dropped);
+        // The ISM shoebox WITHOUT replacing the static mesh, and the box's own triangles, so the
+        // box can be composed with your geometry instead of replacing it.
+        [DllImport(DLL, CallingConvention = CC)] public static extern void bwa_scene_set_ism_room(IntPtr e, float w, float h, float d, uint[] faces);
+        [DllImport(DLL, CallingConvention = CC)] [return: MarshalAs(UnmanagedType.I1)]
+        public static extern bool bwa_box_mesh(float w, float h, float d, uint[] faces, [Out] float[] outVerts, [Out] int[] outTris, [Out] uint[] outTriMaterial);
+        [DllImport(DLL, CallingConvention = CC)] [return: MarshalAs(UnmanagedType.I1)]
         public static extern bool bwa_apply_tuning(IntPtr e, ref BwaTuning t);
         // Offline panner evaluation (no engine handle): out = nsrc*n gains for a layout/panner; for layout scoring.
         // focus/density are SPCAP's tuning knobs, same <= 0 = default sentinel as bwa_set_spcap_focus, and

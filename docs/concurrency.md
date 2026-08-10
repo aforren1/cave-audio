@@ -1,14 +1,14 @@
 # Concurrency and real-time model
 
-The spine of the engine is two SPSC rings and a voice table, with a hard split
-between the control thread and the audio thread. That spine lives in
+The spine of the engine is two SPSC rings and a voice table. A hard split
+separates the control thread from the audio thread. That spine lives in
 [`src/rt.c`](../src/rt.c) / [`src/rt.h`](../src/rt.h).
 The `Voice`, `SoundData`, `Layout`, `Listener`, and `RtCore` structs are documented in
 [`internal-types.md`](./internal-types.md).
 
 This doc owns the threading and lifetime vocabulary: SPSC ring, commit snapshot, generation
 handle, retire-ack, seqlock. [glossary.md](./glossary.md) deliberately does not repeat any of
-it and sends you here instead. Go the other way for the spatial-audio terms.
+it. It sends you here instead. Go the other way for the spatial-audio terms.
 
 ## Threads
 
@@ -28,7 +28,7 @@ fixed for the engine's lifetime: resolved at `bwa_create`, before `rt_create`.
 `BWA_CHANNELS` (26, [`src/sink.h`](../src/sink.h)) is only the compile-time
 *capacity* that sizes the fixed arrays.
 
-These two communicate through two SPSC rings:
+The two threads communicate through two SPSC rings:
 
 - **Command ring** (control → audio): source/listener updates, play/stop, commit.
 - **Event ring** (audio → control): voice-ended and sound-retired acks.
@@ -36,13 +36,13 @@ These two communicate through two SPSC rings:
 Both are single-producer/single-consumer, so the indices need only
 acquire/release, not CAS.
 
-Around that backbone sit auxiliary producer threads, each with its own channel
-into the audio thread. Every channel is wait-free on the audio side; the audio
+Around that spine sit auxiliary producer threads, each with its own channel
+into the audio thread. Every channel is wait-free on the audio side. The audio
 thread never blocks on any of them:
 
 - **NatNet receiver thread** (`bwa_tracker_connect`): publishes the tracked head pose
   through a single-slot seqlock (`PoseSlot`, [`src/pose.h`](../src/pose.h)).
-  `rt_render` samples the freshest pose once per block; if the position moved,
+  `rt_render` samples the freshest pose once per block. If the position moved,
   it dirties every voice. If the reader loses the seqlock race it keeps the
   previous pose: bounded retries, never a block. The audio thread publishes
   the active pose back through a second seqlock slot for control-thread
@@ -51,7 +51,7 @@ thread never blocks on any of them:
   (level, 3-band EQ tilt, directivity) through the `occ_handle` / `occ_val` /
   `occ_eq` / `occ_dir` atomic arrays in `RtCore`. These live *outside* the
   `Voice` struct so a voice-create memset never races a publish. The handle is
-  stored last with release; the audio thread gates on its own `v->gen` and
+  stored last with release. The audio thread gates on its own `v->gen` and
   ramps toward the published values.
 - **Pathing sim thread** (`steam_path.c`): publishes per-voice SH coefficients
   plus a bending-loss tilt through a per-voice double buffer (`rt_set_pathing`:
@@ -61,16 +61,16 @@ thread never blocks on any of them:
   (see [`src/stream.h`](../src/stream.h)).
 
 One rule generalizes across all of these: the audio thread owns its state and
-*samples* published values. Publishers never touch audio-thread fields directly,
-publishes for a stale or recycled handle are dropped on the audio side, and
-everything sampled is ramped in, never slammed.
+*samples* published values. Publishers never touch audio-thread fields directly.
+The audio side drops any publish for a stale or recycled handle. Everything
+sampled is ramped in, never slammed.
 
 ## Why each mechanism exists
 
 | mechanism                          | problem it solves                                            |
 |------------------------------------|--------------------------------------------------------------|
 | SPSC command ring                  | get control onto the audio thread without locks              |
-| staging→active + `CMD_COMMIT`      | the mixer never sees a half-updated frame (listener moved, source not) |
+| pending→active + `CMD_COMMIT`      | the mixer never sees a half-updated frame (listener moved, source not) |
 | per-voice `dirty` flag             | skip the gain solve for static sources                       |
 | gain ramp `gcur→gtarget`           | avoid zipper noise on position jumps                         |
 | generation-counted handles         | reuse source slots safely with no round-trip                 |
@@ -101,15 +101,15 @@ commands need no explanation here; the few that carry protocol do:
 Most arms are a handle plus a bool or a float. `play` carries
 `{ uint64_t start, loop_beg, loop_end; uint32_t sound; uint8_t loop, oneshot; }`:
 `start` is the dsp-sample to begin at (0 = now) and `loop_beg`/`loop_end` are the
-optional loop region (0/0 = whole clip), so both sample-accurate scheduling and
+optional loop region (0/0 = whole clip). Both sample-accurate scheduling and
 intro→loop are wider commands, not new mechanisms. Scheduling a *stop*
 (`CMD_STOP_AT`, one `uint64_t` sample) is the mirror: the audio thread fires the
 existing click-free stop once a block reaches it. `CMD_QUEUE` appends a sound to a
-voice's gapless play queue (a fixed FIFO in the `Voice`, depth `BWA_QUEUE`): at a
+voice's gapless play queue (a fixed FIFO in the `Voice`, depth `BWA_QUEUE`). At a
 non-looping end the mixer pops the next entry and continues in the same block
 instead of stopping. The entries are resolved `SoundData*`, so `CMD_SOUND_RETIRE`
-tombstones any it frees (NULL) before acking, the same "detach before free"
-discipline that protects the voice's current `sound`.
+tombstones any it frees (NULL) before acking. That is the same "detach before
+free" discipline that protects the voice's current `sound`.
 
 ```c
 #define RING_CAP 4096                 /* power of two; sized for a worst-case frame burst */
@@ -129,7 +129,7 @@ Handles are `(index | generation << 16)`; the macros live in rt.h:
 The return path is symmetric and likewise SPSC, roles reversed: the **audio
 thread is the sole producer**, the **control thread the sole consumer**
 (`drain_events`, called from `rt_commit` / `bwa_commit`). There is no second
-producer; keep it that way, or the relaxed/acquire/release scheme stops being
+producer. Keep it that way, or the relaxed/acquire/release scheme stops being
 sufficient.
 
 ```c
@@ -192,12 +192,12 @@ void rt_commit(RtCore* c) {
 `rt_source_create` is the one call that does **not** round-trip. The control
 thread owns the free-list and generation table, so it allocates an index, bumps
 the generation, returns `BWA_MK_H(idx, gen)` synchronously, and enqueues
-`CMD_SRC_CREATE`. Synchronous handle, async activation. When the pool is full it
-steals a voice instead of failing (see "Voice steal" below).
+`CMD_SRC_CREATE`. Synchronous handle, async activation. When the pool is full,
+`rt_source_create` steals a voice instead of failing (see "Voice steal" below).
 
 ## Consumer side (audio thread): the snapshot
 
-Drain runs once at block start. Structural commands apply immediately;
+The drain runs once at block start. Structural commands apply immediately;
 continuous parameters write to *pending* fields and promote to *active* only on
 `CMD_COMMIT`. The mixer reads only active fields. A frame the producer hasn't
 finished (set_pos sent, commit not yet) leaves pending half-updated but active
@@ -269,14 +269,14 @@ static void drain_commands(RtCore* c) {
   `CMD_SET_POS` aimed at a destroyed-then-recycled slot fails the `gen` check
   and is dropped; the new voice in that slot has a fresh generation. Voices
   need no round-trip. Only *sound buffers* do (generations don't protect
-  freed memory); hence `CMD_SOUND_RETIRE` detaches references and acks back so
-  the control thread frees exactly once the audio thread has provably let go.
+  freed memory). `CMD_SOUND_RETIRE` detaches references and acks back, so the
+  control thread frees exactly once the audio thread has provably let go.
 
 ## Sound lifetime: the retire-ack handshake (control side)
 
 The audio side (above) detaches references on `CMD_SOUND_RETIRE` and acks with
 `EVT_SOUND_RETIRED`. The control side closes the loop: `rt_unload_sound` only
-*requests* retirement and marks the slot; the actual free happens later, when
+*requests* retirement and marks the slot. The actual free happens later, when
 `drain_events` (run from `rt_commit`) sees the ack. Freeing in
 `rt_unload_sound` directly would be a use-after-free: an audio block can still
 be mid-mix on that buffer.
@@ -329,22 +329,22 @@ with the device's planar buffer (`cave` profile) or a scratch buffer
 `bus[ch * nframes + i]`, `channels * nframes` floats. Stages, in order:
 
 1. **Clock.** Take the block-start dsp-sample from the device timestamp
-   (`ts->sample_pos`), falling back to an internal block counter when no
+   (`ts->sample_pos`). Fall back to an internal block counter when no
    timestamp is supplied (direct `rt_render` in tests). Publish it (`dsp_now`)
-   for control-thread scheduling via `rt_dsp_time`. Denormals are flushed to
+   for control-thread scheduling via `rt_dsp_time`. Flush denormals to
    zero (FTZ/DAZ): gain ramps toward 0 otherwise produce subnormals that
    stall the FP pipeline.
 2. **Drain commands** (the snapshot above). A block larger than
    `BWA_RT_MAX_BLOCK` then renders silence instead of overflowing the RT
-   scratch buffers, but commands were already drained, so the ring never
+   scratch buffers. Commands were already drained, so the ring never
    backs up.
 3. **Sample the tracker pose.** With a tracker connected, read the seqlock slot
-   and overwrite the active listener; a moved position dirties every voice.
+   and overwrite the active listener. A moved position dirties every voice.
    This bypasses the commit path: lower latency than routing pose through the
    command ring.
-4. **Zero the bus; latch the taps.** The reflection and path tap function
-   pointers are acquire-loaded once per block (they were published with
-   release *after* their user-data, so registration mid-run can't tear). Zero
+4. **Zero the bus; latch the taps.** Acquire-load the reflection and path tap
+   function pointers once per block (they were published with release *after*
+   their user-data, so registration mid-run can't tear). Zero
    the aux-send and ambisonic scratch buffers if the taps want them.
 5. **Voice loop.** Per playing voice: hold a scheduled start until the block
    containing its `start_sample`, then begin at the exact in-block offset. If
@@ -382,7 +382,7 @@ the same thread right after; then `monitor_process` / `steam_monitor_process`
 decodes to the 2-ch device). Neither the direct field nor the point taps ever
 cross a thread: `rt_render` fills them and the same callback consumes them before
 returning. Device output likewise goes through the `bwa_sink` abstraction
-([`src/sink.h`](../src/sink.h)); the render callback fills the device's planar
+([`src/sink.h`](../src/sink.h)). The render callback fills the device's planar
 buffers directly.
 
 `mix_voice` interpolates `gcur → gtarget` across the block, never slams the new
@@ -393,9 +393,9 @@ non-looping voice flips `playing` off; only oneshots (and steal fades) push
 
 ## Newer machinery, same rules
 
-None of the machinery below adds a new kind of synchronization; each piece is
-the existing invariants applied again: allocation on the control thread, ramps
-for every audible change, generation-gated handles, acks over the event ring.
+None of the machinery below adds a new kind of synchronization. Each piece applies the
+existing invariants again: allocation on the control thread, ramps for every audible
+change, generation-gated handles, and acks over the event ring.
 
 ### Voice steal (fade reserve + priority)
 
@@ -406,7 +406,7 @@ normal allocation never draws them down. When the user pool is full,
 mid-steal are skipped), gives the *new* source a reserve slot, and enqueues
 `CMD_SRC_STEAL` for the victim. The audio thread fades the victim's gate to
 zero over one block, then finalizes in `pause_gate`: `active = false` plus
-`EVT_VOICE_ENDED`, and the control thread recycles the slot on the ack. If the
+`EVT_VOICE_ENDED`. The control thread recycles the slot on the ack. If the
 reserve is exhausted (a steal burst) or the ring is full, the steal degrades to
 a hard cut (`rt_source_destroy` + immediate reuse). Oneshots never spend the
 reserve: a full pool drops them.
@@ -415,23 +415,23 @@ reserve: a full pool drops them.
 
 The audio thread publishes each block's starting dsp-sample (`dsp_now`,
 device-anchored via the sink timestamp). `rt_dsp_time` reads it on the control
-thread; `rt_source_play_at` carries the target sample in the `play` command,
-and the mixer holds the voice silent until the block that contains it, starting
+thread. `rt_source_play_at` carries the target sample in the `play` command.
+The mixer holds the voice silent until the block that contains it, then starts
 at the exact in-block offset. All per-sample ramps span only the audible part
 of the block, so a scheduled start lands its gains exactly.
 
 ### Pause, seek, and click-free stop
 
-`CMD_SET_PAUSED` sets a target; the mixer's gate (`pause_g`) ramps toward it
-across one block (invariant 4) and the playhead freezes only once fully silent,
-so resume continues exactly where pause landed. Seek is click-free: a pending
+`CMD_SET_PAUSED` sets a target. The mixer's gate (`pause_g`) ramps toward it
+across one block (invariant 4), and the playhead freezes only once fully silent.
+Resume then continues exactly where pause landed. Seek is click-free: a pending
 `CMD_SEEK` lands only while the gate is silent, so seeking a running voice is
 ramp-out → jump → ramp-in (two blocks, ~10 ms at 256/48k). Streamed sounds
 ignore seek: the ring can't jump. `CMD_STOP` rides the same gate: fade out,
 *then* `playing = false`. `CMD_STOP_AT` is the scheduled form: `rt_render` fires
 that same fade once a block reaches `stop_at` (block-granular, so it can't pop).
 **Starts** are symmetric: `CMD_PLAY` zeroes `gcur` (the final per-channel gain),
-so the first block ramps up from silence; a fresh voice is already zero (create
+so the first block ramps up from silence. A fresh voice is already zero (create
 memset), so this only fades in a *replayed* slot that would otherwise reuse the
 prior solve's gains and click on the asset's first sample. Only
 `CMD_SRC_DESTROY` hard-cuts. A paused voice still reads as playing.
@@ -441,7 +441,7 @@ prior solve's gains and click on the asset's first sample. Only
 Per-voice fractional-delay rings live in one contiguous `RtCore.dop_ring`
 allocation: one power-of-two slice per voice, sized at `rt_create` for
 `BWA_DOPPLER_MAX_DIST` (8 m) at the engine rate. The audio thread writes each
-sample and reads at a delay gliding toward `distance/c`; the glide *is* the
+sample and reads at a delay that glides toward `distance/c`. The glide *is* the
 pitch shift. The write index stays integer (masked ring) with the fraction as a
 separate small float, so a long-lived voice never loses sample precision.
 Allocation at create time, DSP on the audio thread: invariant 1.
@@ -451,8 +451,8 @@ Allocation at create time, DSP on the audio thread: invariant 1.
 Both are plain audio-thread state, not new channels. `compute_gains` derives
 the amplitude-normalized LF gain set (`gtarget_lo`) on every solve, so
 `bwa_set_dual_band` A/Bs live: an atomic flag the mixer reads, crossfaded per
-voice via `dual_mix`. The ambisonic-bed decode matrix (`bed_decode`) is rebuilt
-on the control thread only while the audio thread is stopped (`rt_set_layout` /
+voice via `dual_mix`. The control thread rebuilds the ambisonic-bed decode
+matrix (`bed_decode`) only while the audio thread is stopped (`rt_set_layout` /
 `rt_set_bed_decoder`), like the aligner and the taps.
 
 ## Invariants recap
@@ -463,7 +463,7 @@ on the control thread only while the audio thread is stopped (`rt_set_layout` /
   sim threads, which are also not the audio thread).
 - The command ring is sized so a worst-case frame's burst can't fill it between
   two drains (~one audio block apart). If it fills anyway, the code does not
-  spin; it makes the drop safe: `rt_source_destroy` recycles the
+  spin. It makes the drop safe instead: `rt_source_destroy` recycles the
   handle only if the destroy actually enqueued, `rt_source_create` undoes its
   allocation, `rt_unload_sound` reverts the `retiring` flag so it can be
   retried, and a oneshot reserves its 4 commands up front (`cmd_free`) so it

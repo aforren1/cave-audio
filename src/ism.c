@@ -15,7 +15,7 @@ int ism_images(const IsmRoom* r, const float src[3], IsmImage* out) {
         out[0].pos[1] = 2.f * r->ground_y - src[1];
         for (int b = 0; b < 3; ++b) {
             float a1 = r->absorb[2][b];                         /* the plane lives in face slot 2 (-y) */
-            if (a1 < 0.f) a1 = 0.f; else if (a1 > 1.f) a1 = 1.f;
+            if (!(a1 > 0.f)) a1 = 0.f; else if (a1 > 1.f) a1 = 1.f;   /* NaN-safe: sqrtf(NaN) below sticks */
             float rc = sqrtf(1.f - a1);
             out[0].refl[b] = r->press[2] ? -rc : rc;            /* pressure-release: polarity flip */
         }
@@ -37,7 +37,7 @@ int ism_images(const IsmRoom* r, const float src[3], IsmImage* out) {
         out[f].pos[axis] = 2.f * plane - src[axis];             /* mirror across the face */
         for (int b = 0; b < 3; ++b) {
             float a1 = r->absorb[f][b];
-            if (a1 < 0.f) a1 = 0.f; else if (a1 > 1.f) a1 = 1.f;
+            if (!(a1 > 0.f)) a1 = 0.f; else if (a1 > 1.f) a1 = 1.f;   /* NaN-safe: sqrtf(NaN) below sticks */
             float rc = sqrtf(1.f - a1);                         /* energy absorption -> pressure coefficient */
             out[f].refl[b] = r->press[f] ? -rc : rc;            /* pressure-release: polarity flip */
         }

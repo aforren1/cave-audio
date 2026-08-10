@@ -304,6 +304,34 @@ static int track_place(void* user, int li, float mic_out[3]) {
 
 /* ---- the session ---------------------------------------------------------------------------- */
 
+/* ONE capsule check per placement, run on the FIRST capture at that placement no matter which arm
+ * produced it. A fault is a property of the session, so re-checking every cell would only cost time.
+ *
+ * It has to run BEFORE the first valid_score, and that is why this is a function rather than a block
+ * inside the grid loop where it used to live. valid_score takes `flags` as its EXCLUSION MASK, and
+ * the matched-phantom arm captures first — so with the check downstream of it, every matched cell
+ * was scored against an all-zero mask and a dead capsule silently entered the reference pair. The
+ * physical/phantom difference is the headline number here, so that is the one place it could do the
+ * most damage. Reproduce the old behavior with `--simulate --inject-fault`. */
+static void capsule_check_once(int* checked, const float* cap19, unsigned char* flags,
+                               const CapCtx* ctx, int* nchecked, int* nflagged) {
+    if (*checked) return;
+    *checked = 1;
+    const float* ptr[ZYLIA_MICS];
+    for (int j = 0; j < ZYLIA_MICS; ++j) ptr[j] = cap19 + (size_t)j * VAL_ANALYZE;
+    int nb = zylia_check_capsules(ptr, VAL_ANALYZE, flags);
+    if (nb > 0) {
+        printf("  capsule check: %d FAULTY  - ", nb);
+        for (int j = 0; j < ZYLIA_MICS; ++j)
+            if (flags[j]) printf(" ch%d(0x%02X)", j, flags[j]);
+        printf("  (excluded for this placement)\n");
+    } else {
+        printf("  capsule check: all %d healthy\n", ZYLIA_MICS);
+    }
+    if (nflagged && ctx->inject >= 0 && flags[ctx->inject]) ++(*nflagged);
+    if (nchecked) ++(*nchecked);
+}
+
 /* Sweep every placement. Identical for both backends — that is the point: the hardware run executes
  * exactly the code --simulate already proved.
  * `place` (optional) resolves each placement's microphone position before its cells are measured, and
@@ -388,9 +416,12 @@ static int run_session(const Layout* L, CaptureFn cap, CapCtx* ctx,
                         const float* solve = tracked ? lis[li] : L->ref;
                         ValidCell* c = &cells[w];
                         int got = 0;
-                        if (cap(ctx, &cond[ci], solve, lis[li], src, cap19))
+                        if (cap(ctx, &cond[ci], solve, lis[li], src, cap19)) {
+                            /* first capture of the placement lands here, so the check runs here */
+                            capsule_check_once(&checked, cap19, flags, ctx, nchecked, nflagged);
                             got = valid_score(L, cond[ci].panner, &cond[ci].r, tracked, lis[li], src,
                                               cap19, VAL_ANALYZE, VAL_FS, 343.0, flags, c);
+                        }
                         if (!got) {
                             memset(c, 0, sizeof *c);
                             c->panner = cond[ci].panner; c->tracked = tracked;
@@ -412,23 +443,8 @@ static int run_session(const Layout* L, CaptureFn cap, CapCtx* ctx,
                     int got = 0;
 
                     if (cap(ctx, &cond[ci], solve, lis[li], src, cap19)) {
-                        /* ONE capsule check per placement, on its first capture: a fault is a
-                         * property of the session, and re-checking every cell would only cost time.
-                         * Anything flagged is excluded from every cell that follows. */
-                        if (!checked) {
-                            const float* ptr[ZYLIA_MICS];
-                            for (int j = 0; j < ZYLIA_MICS; ++j) ptr[j] = cap19 + (size_t)j * VAL_ANALYZE;
-                            int nb = zylia_check_capsules(ptr, VAL_ANALYZE, flags);
-                            if (nb > 0) {
-                                printf("  capsule check: %d FAULTY  - ", nb);
-                                for (int j = 0; j < ZYLIA_MICS; ++j)
-                                    if (flags[j]) printf(" ch%d(0x%02X)", j, flags[j]);
-                                printf("  (excluded for this placement)\n");
-                            } else printf("  capsule check: all %d healthy\n", ZYLIA_MICS);
-                            if (nflagged && ctx->inject >= 0 && flags[ctx->inject]) ++(*nflagged);
-                            if (nchecked) ++(*nchecked);
-                            checked = 1;
-                        }
+                        /* still needed: with --no-reference this grid arm captures first */
+                        capsule_check_once(&checked, cap19, flags, ctx, nchecked, nflagged);
                         got = valid_score(L, cond[ci].panner, &cond[ci].r, tracked, lis[li], src,
                                           cap19, VAL_ANALYZE, VAL_FS, 343.0, flags, c);
                     }

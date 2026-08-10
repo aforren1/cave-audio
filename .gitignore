@@ -75,3 +75,6 @@ bwa_minimal_ping.wav
 
 # bwa_profile_bench scratch (generated at startup in the working dir)
 bwa_bench.wav
+
+# test_smoke ergonomics scratch (tone written into the working dir on every run)
+bwa_ergo_tone.wav

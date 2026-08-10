@@ -1,5 +1,6 @@
 /* stream.c — see stream.h. Background-thread file streaming into per-stream SPSC rings. */
 #include "stream.h"
+#include "rt.h"          /* BWA_MAX_SAMPLE: the outside-sample cap (dec_read / stream_push) */
 
 #include "dr_wav.h"      /* implementations live in sound.c; here we include the headers only */
 #include "dr_flac.h"
@@ -93,6 +94,17 @@ static uint64_t dec_read(Stream* s, uint64_t frames) {   /* read into s->inter, 
             for (uint32_t c = 0; c < ch; ++c) a += s->inter[i * ch + c];
             s->mono[i] = a * inv;
         }
+    }
+    /* scrub before the ring: an IEEE-float file delivers its bit patterns verbatim, and this is
+     * the last stop before the audio thread — non-finite becomes 0 (the stream_push contract),
+     * finite-but-absurd is capped (BWA_MAX_SAMPLE, rt.h: the align/room-EQ state sits before the
+     * limiter, so one 3e38 sample would poison it for the session) */
+    for (uint64_t i = 0; i < got; ++i) {
+        float x = s->mono[i];
+        if (!isfinite(x)) x = 0.f;
+        else if (x >  BWA_MAX_SAMPLE) x =  BWA_MAX_SAMPLE;
+        else if (x < -BWA_MAX_SAMPLE) x = -BWA_MAX_SAMPLE;
+        s->mono[i] = x;
     }
     return got;
 }
@@ -276,7 +288,11 @@ uint32_t stream_push(Stream* s, const float* src, uint32_t n) {
     uint64_t w = s->w_priv;                          /* producer-private cursor (control thread here) */
     for (uint32_t k = 0; k < put; ++k) {
         float x = src[k];
-        s->ring[(w + k) & s->ring_mask] = isfinite(x) ? x : 0.f;   /* nothing may hand NaN to the audio thread */
+        if (!isfinite(x)) x = 0.f;                       /* nothing may hand NaN to the audio thread */
+        else if (x >  BWA_MAX_SAMPLE) x =  BWA_MAX_SAMPLE;   /* finite is not enough: 3e38 overflows the
+                                                              * bus into pre-limiter filter state (rt.h) */
+        else if (x < -BWA_MAX_SAMPLE) x = -BWA_MAX_SAMPLE;
+        s->ring[(w + k) & s->ring_mask] = x;
     }
     s->w_priv = w + put;
     atomic_store_explicit(&s->w, s->w_priv, memory_order_release);

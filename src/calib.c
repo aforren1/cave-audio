@@ -12,14 +12,14 @@
 
 void calib_solve(const MeasureResult* m, const float (*pos)[3], const float mic[3], int n, double fs,
                  float* gain_db, float* delay_ms) {
-    if (!m || !pos || !mic || !gain_db || !delay_ms || n <= 0) return;
+    if (!m || !pos || !mic || !gain_db || !delay_ms || n <= 0 || !(fs > 0.0)) return;
 
     /* delays: align every arrival to the farthest (largest measured delay). Latency cancels. */
     int maxd = 0;
     for (int i = 0; i < n; ++i) if (m[i].delay_samples > maxd) maxd = m[i].delay_samples;
     for (int i = 0; i < n; ++i) {
         double ms = (maxd - m[i].delay_samples) / fs * 1000.0;
-        if (ms < 0.0) ms = 0.0; else if (ms > 1000.0) ms = 1000.0;
+        if (!(ms > 0.0)) ms = 0.0; else if (ms > 1000.0) ms = 1000.0;   /* NaN-safe */
         delay_ms[i] = (float)(round(ms * 1000.0) / 1000.0);
     }
 
@@ -34,12 +34,15 @@ void calib_solve(const MeasureResult* m, const float (*pos)[3], const float mic[
     }
     if (sref >= 1e30) sref = 1.0;                 /* every speaker silent: leave trims at unity */
     for (int i = 0; i < n; ++i) {
-        if (m[i].level <= 1e-3) { gain_db[i] = 0.f; continue; }
+        /* NaN-safe skip: `level <= 1e-3` is FALSE for a NaN level (an unplugged/broken capture leg
+         * delivers non-finite samples straight through deconvolution), which used to fall through
+         * into the solve and write gain_db = NaN — serialized as `null`, destroying the layout. */
+        if (!(m[i].level > 1e-3)) { gain_db[i] = 0.f; continue; }
         double dx = pos[i][0]-mic[0], dy = pos[i][1]-mic[1], dz = pos[i][2]-mic[2];
         double dist = sqrt(dx*dx + dy*dy + dz*dz); if (dist < 0.05) dist = 0.05;
         double s  = (double)m[i].level * dist;
         double db = 20.0 * log10(sref / s);       /* sref <= s, so db <= 0 (cut-only) */
-        if (db > 0.0) db = 0.0; else if (db < -40.0) db = -40.0;
+        if (!(db < 0.0)) db = 0.0; else if (db < -40.0) db = -40.0;   /* NaN-safe */
         gain_db[i] = (float)(round(db * 100.0) / 100.0);
     }
 }
@@ -49,7 +52,8 @@ static int solve4(double A[4][4], double b[4], double x[4]) {
     for (int c = 0; c < 4; ++c) {
         int piv = c;
         for (int r = c + 1; r < 4; ++r) if (fabs(A[r][c]) > fabs(A[piv][c])) piv = r;
-        if (fabs(A[piv][c]) < 1e-12) return 0;
+        if (!(fabs(A[piv][c]) >= 1e-12)) return 0;   /* NaN-safe: a NaN pivot (NaN mic positions from a
+                                                      * text file) must read SINGULAR, not solvable */
         if (piv != c) {
             for (int j = 0; j < 4; ++j) { double t = A[c][j]; A[c][j] = A[piv][j]; A[piv][j] = t; }
             double t = b[c]; b[c] = b[piv]; b[piv] = t;
@@ -136,6 +140,14 @@ int calib_write_layout(const char* in_path, const char* out_path,
     cJSON* speakers = cJSON_GetObjectItemCaseSensitive(root, "speakers");
     if (!cJSON_IsArray(speakers)) FAIL("calib: layout has no 'speakers' array");
     if (cJSON_GetArraySize(speakers) != n) FAIL("calib: speaker count does not match the measurements");
+
+    /* refuse values the loader is KNOWN to reject before touching the file: a NaN trim (a broken
+     * capture leg survives the solve as NaN) serializes as JSON `null`, and out_path usually IS the
+     * layout — the write would destroy the good calibration in place and only fail at next load */
+    for (int i = 0; i < n; ++i)
+        if (!isfinite(gain_db[i]) || gain_db[i] < -100.f || gain_db[i] > 24.f ||
+            !isfinite(delay_ms[i]) || delay_ms[i] < 0.f || delay_ms[i] > 1000.f)
+            FAIL("calib: refusing to write a non-finite/out-of-range trim (bad measurement?)");
 
     for (int i = 0; i < n; ++i) {
         cJSON* sp = cJSON_GetArrayItem(speakers, i);
@@ -556,6 +568,13 @@ int calib_write_positions(const char* in_path, const char* out_path, const float
     cJSON* speakers = cJSON_GetObjectItemCaseSensitive(root, "speakers");
     if (!cJSON_IsArray(speakers)) FAIL("calib: layout has no 'speakers' array");
     if (cJSON_GetArraySize(speakers) != n) FAIL("calib: speaker count does not match the positions");
+
+    /* same refusal as calib_write_layout: a NaN position (NaN mic file -> a "successful"
+     * trilateration) serializes as `null` and destroys the layout in place */
+    for (int i = 0; i < n; ++i)
+        if (!isfinite(pos[i][0]) || !isfinite(pos[i][1]) || !isfinite(pos[i][2]) ||
+            fabs(pos[i][0]) > 1000.f || fabs(pos[i][1]) > 1000.f || fabs(pos[i][2]) > 1000.f)
+            FAIL("calib: refusing to write a non-finite/out-of-range position (degenerate solve?)");
 
     for (int i = 0; i < n; ++i) {
         cJSON* sp = cJSON_GetArrayItem(speakers, i);

@@ -63,6 +63,127 @@ sits or roams. `bwa_setup` names that, `bwa_tuning_preset` fills a complete `bwa
   guessed. docs/api.md carries a per-field evidence table marking each value as measured, design
   intent, or unmeasured, so a preset cannot quietly become folklore.
 
+### Fixed: a finite but un-normalized listener quaternion poisoned the render
+
+Found by the new seeded fuzzer (`test_fuzz_api`), and a direct follow-on to the NaN sweep below: the
+finite guard added to `bwa_set_listener_pose` was NOT enough. Every consumer of that quaternion assumes
+a unit (`frame_qrot` says so outright). A finite quaternion of large magnitude, with a component around
+1e6 from an uninitialized or un-normalized caller pose, overflowed the rotation math downstream. It
+drove the render non-finite exactly as a NaN would. `rt_set_listener` normalizes now, with a degenerate or zero
+quaternion falling back to identity rather than being dropped, so a caller who never set an orientation
+still gets a listener facing room ahead. Doing it once at the edge means no consumer has to.
+
+The fuzzer had clamped the value behind a comment naming the defect and its reproducing seed rather
+than hiding it; that clamp is gone and the un-normalized case is fuzzed for real now. Seeds 104, 106
+and 119 reproduced it; all three pass, plus 10 fresh seeds at 8000 operations each.
+
+Doc correction from the same run: `bwa_get_health` claimed `out` is zeroed when the numbers are not
+measurable, but `stream_starves` is deliberately filled either way, because the stream ring is the
+engine's rather than the device's. The header said one thing and the implementation another.
+
+### Fixed: NaN could reach the device through twelve entry points
+
+A deliberate-misuse test suite (`test_abuse`, new) fed non-finite values into every float parameter on
+the ABI and asserted the device-bound output stays finite. Twelve assertions failed, all one bug class:
+a two-sided clamp written `x < lo ? lo : (x > hi ? hi : x)` passes NaN straight through, because every
+comparison against NaN is false. The engine already had the right idiom in places (`isfinite` guards
+at the ABI edge, "keep NaN/Inf off the audio thread"), so this was an asymmetry rather than an
+oversight, which is exactly the kind of thing a systematic sweep finds and spot checks do not.
+
+**Eight of the twelve reached the rendered output**: `bwa_set_master_gain` (NaN and Inf, which NaNs the
+whole bus), `bwa_group_set_gain`, `bwa_source_fade_to` in both the target and the DURATION (a NaN
+duration slips `seconds <= 0` and makes the fade rate NaN), `bwa_source_set_pitch`,
+`bwa_set_test_signal`, `bwa_source_set_occlusion_manual`, and `bwa_set_listener_pose`. That last one
+is the worst: it had no finite guard at all while `bwa_source_set_pos` did, a NaN listener NaNs every
+panner solve, and once NaN is in a gain ramp the interpolation `x + (t - x) * k` can never leave it,
+so it survived until the engine restarted.
+
+**Four poisoned a readback**: the listener pose, `near_spread`, `hole_spread`, and the SPCAP knobs,
+where `bwa_get_tuning` reported the raw argument although rt clamps focus to 64. That one broke the
+readback's own stated rule, so `rt_get_spcap_sanitized` was added alongside the existing sanitized
+reads and `bwa_get_tuning` now reports post-clamp values for every field it covers.
+
+All twelve are fixed, and the suite pins them. Two idioms are now used deliberately: `isfinite` to
+REJECT at the ABI edge where a bad value has no sensible interpretation, and `!(x > lo)` where the
+value should clamp, because that reads false for NaN and lands on the floor.
+
+Also new: **`test_fuzz_api`**, seeded random API call sequences (deterministic per seed, so a failure
+replays from its seed alone), and `-DBWA_ASAN=ON` now instruments `test_sound`, `test_abuse` and
+`test_fuzz_api` rather than `test_sound` alone. AddressSanitizer reported **zero diagnostics** across
+the misuse suite: no heap overflow, use-after-free or out-of-bounds anywhere in those paths, including
+the NaN-pitch cursor. Note the ASAN build needs `clang_rt.asan_dynamic-x86_64.dll` on PATH (a VS dev
+prompt provides it).
+
+### Added: the four API-ergonomics fixes (completion events, scene composition, tuning readback)
+
+An API-usability review looked at the real call sequences rather than the declarations, and found the
+friction concentrated where BOTH bindings had independently invented the same workaround. That is the
+tell, so all four are fixed at the C level and the workarounds can go.
+
+- **`bwa_poll_ended(e, out, cap, dropped_out)`: completion as an EVENT.** Godot had built a
+  three-state machine with a 4-frame grace timeout that FABRICATED a `finished` signal for clips it
+  never observed, Unity a `_wasPlaying` edge detector that admits it can miss short clips, and
+  `minimal.c` a literal `Sleep(50)`. All three existed because completion was poll-only. Drain the
+  handles instead. Handles come back as you knew them (before the generation bump) so a compare
+  works; unpolled events are bounded and drop OLDEST, and `dropped_out` tells you which happened.
+  - This needed a **new event**, not the existing one. `EVT_VOICE_ENDED` fires only for one-shots and
+    steals, because it means "recycle this transient handle" and not "this voice finished". A plain
+    source finishing posted nothing at all. `EVT_VOICE_DONE` is the notification: same ring, handle
+    stays yours, nothing is recycled.
+- **`bwa_source_is_playing` no longer lies about a RE-play.** The published word carries a play
+  SEQUENCE now, because it alone cannot tell "not playing, before your play" from "after it": same
+  generation, same 0 bit. A re-play on a handle whose voice already ended used to read false until
+  the next rendered block, while `docs/api.md` claimed the opposite in as many words. Prefer
+  `bwa_poll_ended` for completion regardless; is_playing still cannot see a clip shorter than your
+  poll interval, and no sequence fixes that.
+- **Scene composition no longer needs a lie or a re-derivation.** `bwa_scene_set_mesh_mat` **clears**
+  the static mesh when passed NULL geometry, so removing it does not mean replacing it with something
+  harmless (Unity was pushing a degenerate 2 cm triangle parked at (1000, 1000, 1000)). And
+  `bwa_scene_set_box` is now the two calls it was always made of: **`bwa_scene_set_ism_room`** for the
+  shoebox alone, and **`bwa_box_mesh`** (pure, no engine) for its 12 inward-facing triangles, so the
+  box composes with your own geometry instead of replacing it. Godot was re-appending the box after
+  every call; Unity was hand-rolling the triangles, flip-toward-center subtlety included. `set_box`
+  itself is unchanged for the box-IS-the-scene case, and neither of the new calls is order-dependent.
+- **Two reverb beds no longer resolve silently.** Configuring both `bwa_reflections_config` and
+  `bwa_fdn_config` shares one reverb tap; the FDN won and the Steam bed was skipped without a word,
+  so both bindings had added their own warning. The engine now says which one took the tap, once,
+  the same way the ISM-plus-Steam double-render is reported.
+- **`bwa_get_tuning(e, out)`: the readback half of `bwa_apply_tuning`.** Godot's `apply_setup` was
+  hand-mirroring 16 fields to stop its inspector lying about live state, and every new knob had to be
+  added in four places. The engine now shadows the whole struct, updated by the individual setters
+  AND by `bwa_apply_tuning`, so the two writer paths cannot drift. Godot also gets `get_live_tuning`
+  and `poll_ended`. This is not per-knob getters, which the live A/B surface still deliberately lacks.
+- Doc correction while in the area: the stated rule that per-frame calls never touch
+  `bwa_last_error` was false. Per-frame calls that **reject** set it; ones that merely enqueue do not.
+  A successful call that DEGRADED something also sets it now (the two-beds notice), which the contract
+  says explicitly rather than leaving as an exception readers have to discover.
+
+**A review of this work found eight defects in it, all fixed before this entry was written.** Recording
+them because two were the kind that pass every test:
+
+- **`bwa_start` could hang forever.** `steam_scene_flush` claimed a staged mesh change but never read
+  the new clear flag, so a staged clear left it waiting on a generation the sim thread could no longer
+  apply. `pend_clear` is part of the staged tuple now, taken under the same lock as the buffers by both
+  consumers, and a real set supersedes a staged clear instead of poisoning the next one.
+- **The event ring could overflow.** `EVT_VOICE_DONE` broke the sizing argument the ring rests on: a
+  plain voice re-arms with just a play, needing no drain, so completions are unbounded where the
+  ownership acks are not. A full ring would then have dropped an `EVT_VOICE_ENDED` (leaking a voice
+  slot) or an `EVT_SOUND_RETIRED` (never freeing the buffer), which is the exact failure the
+  retire-ack handshake exists to prevent. Completions now yield `voice_cap + sound_cap` slots of
+  headroom and count their own refusals into `dropped_out`.
+- A play the command ring refused left `play_seq` permanently ahead, so `bwa_source_is_playing`
+  answered true forever with no voice. The bump is rolled back when the push fails.
+- A finished one-shot reported **twice**, once with a handle the caller never held. Only the
+  notification reports now; the recycle event does not, and a steal is not a completion at all.
+- A completion could be attributed to the **wrong play** of the same handle. Notices carry their play
+  sequence and a superseded one is dropped, so a client cannot free or re-trigger the wrong play.
+- `bwa_get_tuning` reported raw arguments where rt clamps them, so the readback whose job is to stop
+  an inspector lying could itself lie. It reads the post-clamp values now.
+- Godot lost the room's walls from the ray-traced scene entirely for the commonest setup (a room box
+  and nothing else), because an early-out still assumed `scene_set_box` had committed the mesh.
+- Plus contract corrections: `bwa_poll_ended` does not hand back recycled handles for plain sources,
+  and an error message named a function the caller never called.
+
 ### Changed (ABI): enum value 0 reserved for default-init, and every public enum is width-pinned
 
 Two related changes to the enum surface, taken while the C ABI for 0.11.0 is still unreleased.
@@ -330,16 +451,16 @@ previous result and reporting before/after scores plus ear-plane occupancy.
 
 ## [0.5.0]
 
-### Added — device health (`bwa_get_health` / `bwa_get_xruns`)
+### Added - device health (`bwa_get_health` / `bwa_get_xruns`)
 
-The third dogfooding gap, and the one that cost three probes: every readback described the RENDER —
-voices, meters, the clock — and nothing counted blocks the device asked for and didn't get. You could
+The third dogfooding gap, and the one that cost three probes: every readback described the RENDER -
+voices, meters, the clock - and nothing counted blocks the device asked for and didn't get. You could
 prove the render path was clean and still not know whether the callback missed its deadline.
 
 - **`bwa_get_xruns(e)`** answers "is the device being starved?" in one line. **`bwa_get_health(e, &h)`**
   fills a `bwa_health` when you need the diagnosis: `blocks` (the denominator), `xruns` and
   `dropped_frames` (the device ran on without us), `driver_resyncs` (the driver reporting a
-  discontinuity itself), `late_blocks` and `peak_load` (OUR render overrunning the block period —
+  discontinuity itself), `late_blocks` and `peak_load` (OUR render overrunning the block period -
   the cause, not the symptom), and `stream_starves` (a streamed voice's ring ran dry; the device kept
   its deadline, we had nothing to give it).
 - Most of this was already being computed and thrown away. The ASIO callback predicts the next
@@ -347,24 +468,24 @@ prove the render path was clean and still not know whether the callback missed i
   prediction IS the dropout, in one comparison. `kAsioResyncRequest` was already handled and its
   information discarded.
 - **`bwa_get_health` returns a bool, and that is the load-bearing part.** False = this configuration
-  cannot observe a dropout at all: not started, the manual sink (no clock, no deadline — an offline
+  cannot observe a dropout at all: not started, the manual sink (no clock, no deadline - an offline
   render cannot miss one by construction), or a driver that never flags a valid sample position. In
   every one of those `xruns` is 0, and reading that as a clean bill of health is how a starved device
   goes unnoticed. Same trap as the latency-0 bug two entries down; this time it is designed out.
 - **Tested off-hardware, honestly.** A real missed deadline needs a real device, but the arithmetic
   that turns a position jump into a count is ordinary code: the gap rule is factored into
-  `sink_position_gap` and unit-tested (including its refusals — a backward or absurd jump is a driver
+  `sink_position_gap` and unit-tested (including its refusals - a backward or absurd jump is a driver
   reset, not a dropout), and a null-sink injection hook makes the sink report a position skip it did
   not render, so the whole path from detection to readback runs under ctest. The null sink's
   `late_blocks` are real, not simulated: that thread has a genuine deadline.
 - Unity: `Engine.GetHealth(out BwaHealth)` and `Engine.Xruns`. Godot: `get_health()` returning a
   Dictionary (`measured` included) and `get_xruns()`.
 
-### Changed — units in names, where they earn it
+### Changed - units in names, where they earn it
 
 The narrow generalization of the `get_output_latency` trap below, applied once and then written
 down. The rule: **a unit belongs in a name when the quantity has two live units.** Time is the only
-one in this ABI — frames and seconds are both real — so every time-valued name now says which.
+one in this ABI - frames and seconds are both real - so every time-valued name now says which.
 Distances (meters), frequencies (Hz), angles (radians) and gains (linear) have no competitor and
 stay unmarked, carrying the unit on the value (`radius_m`, `xover_hz`, `yaw_rad`) where it helps.
 A decibel value must say `_db`, since linear is the unmarked default. Stated in
@@ -378,41 +499,41 @@ docs/api.md → "Coordinates and units".
 - **Godot: `get_playhead()` → `get_playhead_frames()`** on `BwaSource` and `BwaBed`, beside the
   existing `get_playhead_seconds()`. That surface is now uniform: `seek_frames`/`seek_seconds`,
   `get_playhead_frames`/`_seconds`, `get_output_latency_frames`/`_seconds`.
-- **Unity is unaffected at the C# level** — only the P/Invoke declarations follow the C symbols.
+- **Unity is unaffected at the C# level** - only the P/Invoke declarations follow the C symbols.
   `Playhead` / `PlayheadSeconds` and `OutputLatency` keep their names: `AudioSource.timeSamples`
   vs `time` is Unity's own spelling of the same pairing, and there is no host collision to fix.
 - Deliberately NOT renamed: the `sample`/`frame` synonym (`start_sample`, `dsp_sample`), which
   denotes the same thing for mono voices and has never misled anyone, and `ir_seconds` → `ir_s`
   for consistency with its `_s` siblings. Both are churn against a frozen-soon ABI.
 
-### Fixed — a dogfooding pass on the Godot addon
+### Fixed - a dogfooding pass on the Godot addon
 
 All six from an outside install of `bw_audio-godot-0.4.0.zip`. The two expensive ones are the same
 failure in different clothes: a call that could not be checked, and a number that could not be
 interpreted. Both stayed invisible off-hardware, because the null sink returns the benign value
 (nothing to drop, zero latency).
 
-- **`bwa_play_oneshot` now returns `bool`** — whether the one-shot was ACCEPTED. It was `void`, so
+- **`bwa_play_oneshot` now returns `bool`** - whether the one-shot was ACCEPTED. It was `void`, so
   a caller could not tell "played" from "clip missing" from "dropped because the voice pool or
   command ring was full", and the only workaround was probing `sound_get_channels` as a proxy for
   load success. False sets `bwa_last_error` to which of the three it was. The drop itself is
   unchanged and still correct: one-shots never steal, so spam cannot evict named sources. There is
-  still no handle to poll — use `bwa_source_create` + `bwa_source_play` if you need to track the
+  still no handle to poll - use `bwa_source_create` + `bwa_source_play` if you need to track the
   voice. Unity: `Emitter.PlayOneShot()` returns `bool`. Godot: `BwaEngine.play_oneshot()` returns
   `bool`. Adding a return to a `void` C function is caller-compatible, so existing C call sites
   that ignore it keep working.
 - **Godot: `get_output_latency()` is now `get_output_latency_frames()`**, with a new
   `get_output_latency_seconds()` beside it. Godot's own `AudioServer.get_output_latency()` returns
-  SECONDS, so the identical name returning frames read as seconds to anyone who knew that call — a
+  SECONDS, so the identical name returning frames read as seconds to anyone who knew that call - a
   normal 960-frame ASIO latency displayed as `960000.0 ms`. It hid indefinitely because the null
   sink returns 0, and 0 is 0 in any unit.
 - **Godot: `seek()` is now `seek_frames()`**, with a new `seek_seconds()`, on both `BwaEmitter` and
-  `BwaBed` — the same collision found by sweeping for it (`AudioStreamPlayer3D.seek()` takes
+  `BwaBed` - the same collision found by sweeping for it (`AudioStreamPlayer3D.seek()` takes
   seconds, so `seek(1.5)` silently truncated to frame 1). The engine's own unit stays frames
   everywhere, because that is what the dsp clock counts.
 - **Godot: the `profile` property now spells out what each value does** in the inspector
-  (`"Binaural — headphones, direct render"` and friends) instead of naming the enum, and a new
-  configuration warning fires when `profile` is Cave on a machine with no ASIO driver — the case
+  (`"Binaural - headphones, direct render"` and friends) instead of naming the enum, and a new
+  configuration warning fires when `profile` is Cave on a machine with no ASIO driver - the case
   that renders 26 channels into nothing and is silent by design. It is the highest-stakes property
   on the node and the inspector is where the choice is made.
 - **A one-call driver list**: `BwaEngine.get_asio_drivers() -> PackedStringArray` and Unity's
@@ -430,59 +551,59 @@ interpreted. Both stayed invisible off-hardware, because the null sink returns t
 
 ## [0.4.0]
 
-### Added — physical emulation batch
+### Added - physical emulation batch
 
-- **`SourceBase.proximity`** (inspector toggle + `bwa_source_set_proximity`): near-field LF boost —
+- **`SourceBase.proximity`** (inspector toggle + `bwa_source_set_proximity`): near-field LF boost -
   the shelf rises as the source closes inside ~1 m, so "at arm's length" reads as bass, not just
   level. Loudness comp's near mirror; pushed on init and live from OnValidate like its siblings.
 - **`Engine.SpeedOfSound`** (inspector field + live property, `bwa_set_speed_of_sound`): Doppler
   and reflection delays derive from it and glide to a change. 343 air, 1480 underwater; small
   values exaggerate Doppler for slow motion.
-- **`Engine.FdnSetDecay(low, high, xover)`** (`bwa_fdn_set_decay`): LIVE FDN decay retune — the
+- **`Engine.FdnSetDecay(low, high, xover)`** (`bwa_fdn_set_decay`): LIVE FDN decay retune - the
   room-transition knob; the tail keeps ringing, only its slope changes. `<= 0` keeps a parameter.
 - **`Engine.SceneSetGround(worldY, material, pressureRelease)`** (`bwa_scene_set_ground`): the
-  outdoor degenerate of the room box — one mirror plane, the ground bounce. Replaces the box.
+  outdoor degenerate of the room box - one mirror plane, the ground bounce. Replaces the box.
 - **`Engine.SceneSetPressureRelease(faceMask)`** (`bwa_scene_set_pressure_release`): flag box faces
-  whose image-source reflection inverts — an underwater room's ceiling-as-surface (`1u << 3`), the
+  whose image-source reflection inverts - an underwater room's ceiling-as-surface (`1u << 3`), the
   Lloyd's-mirror comb.
-- **Directivity note**: `directivity`/`directivityPower` now work in every build — without a Steam
+- **Directivity note**: `directivity`/`directivityPower` now work in every build - without a Steam
   scene the engine evaluates the same weighted dipole on the audio thread (no binding change).
 - **Headphone correction EQ** (`bwa_load_headphone_eq` / `bwa_set_headphone_eq`; Unity raw externs,
   Godot `load_headphone_eq(path)` + the `set_headphone_eq` ramped A/B): an AutoEq ParametricEQ.txt
   for your headphone model, applied to the final stereo of every headphone profile after the HRTF
-  decode — the headphone-side align stage (corrects the transducer, not the render; inert in
+  decode - the headphone-side align stage (corrects the transducer, not the render; inert in
   `cave`). The Preamp line is honored; a bad file fails with `ErrConfig` and keeps the previous EQ;
   loading and toggling both crossfade. Reload after an engine rebuild (the correction dies with the
   engine; the Godot toggle itself replays on restart).
 
-### Added — clock drift
+### Added - clock drift
 
 - **`Engine.GetClockModel(out BwaClockModel)`** → new engine ABI `bwa_get_clock_model`: how fast the
   device clock actually runs against the host clock. `bwa_get_clock`'s pair fixes an exact *instant*;
   this fits the *slope* by exponentially weighted least squares over the same per-block stamps
   (~2 min window, on the audio thread), and reports it as `ppm` with its own `ppmSigma`, plus
   `rateHz`, `spanS`, `jitterNs` and the effective stamp count. `DspTimeAt` re-anchors every frame and
-  needs none of it — reach for this when something else owns the timeline (a video file, timecode,
+  needs none of it - reach for this when something else owns the timeline (a video file, timecode,
   another render node), when a minutes-long extrapolation has to hold (use `rateHz` in place of the
   nominal rate), or to log the rig's drift. False until the fit has ~1 s of stamps, and again for
   ~1 s after a restart re-bases the device sample position. `ppmSigma` assumes independent stamp
   noise, so read it as a lower bound; `jitterNs` grades the *driver's* stamps, and a driver without
   `kSystemTimeValid` reads worse because the QPC fallback adds dispatch noise.
 
-### Changed — ABI breaks (pre-freeze cleanup, `BWA_VERSION` → 0.10.0)
+### Changed - ABI breaks (pre-freeze cleanup, `BWA_VERSION` → 0.10.0)
 
 Deliberate, one-time ABI breaks before the pre-hardware freeze. Update call sites:
 
 - **Removed the bed yaw-shorthand binding** (the `Bwa` P/Invoke was bound but never called). It was
-  the pure subset of `bwa_bed_set_orientation(yaw, 0, 0)` — call that with `pitch = roll = 0`
+  the pure subset of `bwa_bed_set_orientation(yaw, 0, 0)` - call that with `pitch = roll = 0`
   instead (bit-identical path: yaw-only stays on the exact phasor rotation).
 - **Renamed the two engine-global reverb setters** to the `bwa_set_<x>` form, matching the other
   engine-global setters: now `bwa_set_reverb_gain` and `bwa_set_early_reflections_gain` (previously
   the noun-first `..._set_gain` spelling). The Godot method names (`reverb_set_gain` /
   `early_reflections_set_gain`) and the Unity properties (`ReverbGain` / `EarlyReflectionGain`) are
-  unchanged — only the underlying C symbol moved.
+  unchanged - only the underlying C symbol moved.
 - **`bwa_set_limiter_ceiling` now takes a LINEAR peak amplitude** in `(0..1]`, like every other gain
-  in the ABI — no longer decibels. The default is `0.891251f` (still −1 dBFS). The Unity inspector
+  in the ABI - no longer decibels. The default is `0.891251f` (still -1 dBFS). The Unity inspector
   field is now `limiterCeiling` (linear; was `limiterCeilingDb`) with `SetLimiterCeiling(float
   linear)`; the Godot `limiter_ceiling` property range is now `0..1`.
 - **`bwa_set_pose_prediction` lead is now in SECONDS**, not milliseconds (matching the fade-time
@@ -490,7 +611,7 @@ Deliberate, one-time ABI breaks before the pre-hardware freeze. Update call site
   `set_pose_prediction` argument is seconds.
 - **The profile enum was renamed and renumbered** around the new first-class binaural render:
   `BWA_PROFILE_BINAURAL` (still 1) is now the DIRECT per-source headphone render (point sources
-  SH-encode at their true listener-relative directions and HRTF-decode — no speaker-array
+  SH-encode at their true listener-relative directions and HRTF-decode - no speaker-array
   simulation in the direct path); the old virtual-speaker array audition is
   `BWA_PROFILE_CAVE_SIM` (2), and the old `BWA_PROFILE_BOTH` is `BWA_PROFILE_CAVE_BOTH` (3, rig +
   the sim tap). Unity: `BwaProfile.{Cave, Binaural, CaveSim, CaveBoth}`; Godot:
@@ -499,14 +620,14 @@ Deliberate, one-time ABI breaks before the pre-hardware freeze. Update call site
   ARRAY, switch to `CaveSim`; if you wanted the best headphone render, `Binaural` just got better:
   with the Steam Audio build every point source gets its own true HRTF convolution (one
   `IPLBinauralEffect` per voice), ambisonic beds pass SH→SH, and pathing's indirect field joins
-  the binaural decode directly — no speaker-array round trip anywhere in the direct render. No
+  the binaural decode directly - no speaker-array round trip anywhere in the direct render. No
   API surface changed for this; it's all behind the profile.
 
-### Added — ABI parity (the seven calls the binding had missed)
+### Added - ABI parity (the seven calls the binding had missed)
 
 `Bwa.cs` is **1:1 with `include/bw_audio.h`** again: it now binds every `BWA_API` function except
 `bwa_set_output_capture` (an audio-thread callback) and `bwa_render_block` (the manual-sink
-golden-render path), both deliberately unbound — Unity uses neither. Seven declarations were added,
+golden-render path), both deliberately unbound - Unity uses neither. Seven declarations were added,
 with the ones a scene actually authors surfaced on the components:
 
 - **`Emitter.Extent` (Vector2)** → `bwa_source_set_extent`: anisotropic angular width/height (a
@@ -525,20 +646,20 @@ with the ones a scene actually authors surfaced on the components:
   `bwa_get_asio_driver_count` / `bwa_get_asio_driver_name`: enumerate the registered ASIO drivers
   before an `Engine` exists, to populate a picker for `asioDriver`.
 
-### Added — `PushEmitter` component
+### Added - `PushEmitter` component
 
-- **`PushEmitter`** — a MonoBehaviour wrapper for procedural (push) sources, filling the one gap
+- **`PushEmitter`** - a MonoBehaviour wrapper for procedural (push) sources, filling the one gap
   where the raw `bwa_source_*` push calls (`bwa_source_create_push` / `_push` / `_push_space` /
   `_push_end`) had no component like every other source concept. A positional source you FEED mono
   float PCM at `Engine.SampleRate` instead of a clip (a synth, an engine model, a voice stream):
   `Push(float[])` / `Push(float[], count)` (returns the count accepted), `PushSpace`, `PushEnd()`,
-  `IsPlaying`, plus the source-generic surface `Emitter` has that applies to a push voice — `Gain` /
-  `FadeTo` / `FadeOut`, `Spread` / `Extent` / `SizeMetres`, `Priority`, `Group`, `Pause` / `UnPause`,
+  `IsPlaying`, plus the source-generic surface `Emitter` has that applies to a push voice - `Gain` /
+  `FadeTo` / `FadeOut`, `Spread` / `Extent` / `SizeMeters`, `Priority`, `Group`, `Pause` / `UnPause`,
   `SetAttenuationOverride`, `SetOcclusionManual`, `Occlusion`, `Playhead` / `PlayheadSeconds`, `Stop`,
   and the inspector spatial toggles (occlusion, early reflections, reverb send/distance, pathing,
   directivity, doppler, air absorption, loudness comp). It registers with `Engine` and its transform
   rides the same centralized per-frame push, through the one source registry and snapshot loop
-  (see `SourceBase` under Changed). Deliberately OMITTED — the engine refuses them
+  (see `SourceBase` under Changed). Deliberately OMITTED - the engine refuses them
   on a push voice: `Play` / `PlayAt` / `PlayLoop`, `Seek`, `Pitch`, `Queue` / `ClearQueue`,
   `PlayOneShot`, and the file `clip` / `loop` / `playOnEnable` machinery. Mirrors Godot's
   `BwaPushSource` (which splits off `BwaEmitter` for the same reason) adapted to `Emitter`'s Unity
@@ -547,31 +668,31 @@ with the ones a scene actually authors surfaced on the components:
 
 ### Removed
 
-- **`Emitter.Position` / `Emitter.PositionSeconds` and `AmbisonicBed.Position`** — the `[Obsolete]`
+- **`Emitter.Position` / `Emitter.PositionSeconds` and `AmbisonicBed.Position`** - the `[Obsolete]`
   forwarders left over from the 0.3.0 `Position → Playhead` rename are gone. Use `Playhead` /
   `PlayheadSeconds` (the content playhead, unrelated to the spatial transform).
-- **`Bwa.MaterialPreset(engine, preset)`** — the thin static alias over the already-typed
+- **`Bwa.MaterialPreset(engine, preset)`** - the thin static alias over the already-typed
   `bwa_material_preset` extern is gone; call `Bwa.bwa_material_preset` directly (the two internal
   callers, `Engine.ResolvePreset` and `MaterialAsset.Resolve`, were migrated). The engine-level
   `Engine.MaterialPreset(preset)` convenience (the cached mint) is unaffected.
 
 ### Changed
 
-- **`SourceBase`** — the source-generic surface `Emitter` and `PushEmitter` had duplicated
+- **`SourceBase`** - the source-generic surface `Emitter` and `PushEmitter` had duplicated
   member-for-member (lifecycle, the per-frame transform push, the live `OnValidate` re-push, and the
   whole knob surface) now lives on one abstract `SourceBase` MonoBehaviour, mirroring Godot's
   `BwaSource` base: a subclass overrides only the create call and adds its own feed. `Engine` keeps
   ONE source registry (the `Register`/`Unregister(PushEmitter)` overloads and the second per-frame
-  loop are gone — every source kind runs through the same mutation-safe snapshot loop), and the
+  loop are gone - every source kind runs through the same mutation-safe snapshot loop), and the
   custom inspector now registers on `SourceBase` with `editorForChildClasses`, so `PushEmitter` gets
   the conditional hides + live occlusion bar too. Public API and serialized field names are
-  unchanged — existing scenes and scripts migrate untouched.
-- **`Emitter` directivity** — the cardioid-weight mapping + `set_directivity` call, duplicated in
+  unchanged - existing scenes and scripts migrate untouched.
+- **`Emitter` directivity** - the cardioid-weight mapping + `set_directivity` call, duplicated in
   `TryInit` and `OnValidate`, moved into one `ApplyDirectivity()` helper (no behavior change).
 
 ### Fixed
 
-- **Play-mode inspector edits no longer wipe a script-set `Extent`** — `OnValidate` re-pushes
+- **Play-mode inspector edits no longer wipe a script-set `Extent`** - `OnValidate` re-pushes
   `spread`, which the engine defines as resetting extent (last call wins), and now re-asserts the
   extent after it, exactly like `TryInit` always did. Previously ANY inspector nudge on a live
   source collapsed a script-set anisotropic extent to a point while the `Extent` getter kept
@@ -579,20 +700,20 @@ with the ones a scene actually authors surfaced on the components:
 - **`SetAttenuationOverride` is mirrored + replayed** (Unity and Godot): it is standing per-source
   state, so a call that loses the init-order race now lands at create, and the override survives a
   disable/re-enable instead of silently reverting to the layout curve.
-- **A stale source handle can no longer cross an `Engine` destroy+recreate** — a source component
+- **A stale source handle can no longer cross an `Engine` destroy+recreate** - a source component
   records its owning `Engine`; if that engine is replaced while the component stays enabled, every
   call (including `OnDisable`'s destroy) no-ops instead of aliasing the successor engine's
   deterministically-recycled first handles, and the next enable re-creates cleanly.
-- **Limiter ceiling can't silently diverge from the engine** — the inspector slider floors at 0.001
+- **Limiter ceiling can't silently diverge from the engine** - the inspector slider floors at 0.001
   and `SetLimiterCeiling` clamps into `(0..1]` before caching (the engine ignores `<= 0`); the
   Godot hint floors the same way, and its setter converts a replayed pre-0.10 dB scene value to
   linear with a warning instead of silently dropping the authored ceiling.
-- **ASIO driver names are UTF-8 across the ABI** — the native enumeration converts the registry's
+- **ASIO driver names are UTF-8 across the ABI** - the native enumeration converts the registry's
   ANSI bytes to UTF-8 (and converts an explicit `asioDriver` back before the SDK's byte-exact
   match), so a non-ASCII driver name survives the picker round trip; Godot now decodes with
   `String::utf8`.
 - **A failed source create logs on `Emitter` too** (previously only `PushEmitter` checked the
-  handle) — unified in `SourceBase.TryInit`.
+  handle) - unified in `SourceBase.TryInit`.
 - **`ProjectCheck` warning** pointed at the wrong menu: "Tools → Engine → Disable Unity Audio" now
   reads "Tools → BwAudio → Disable Unity Audio", matching the actual `MenuItem` path.
 - **Docs**: the README and `docs/integration.md` "1:1" claims now name the two deliberately-unbound
@@ -617,25 +738,25 @@ with the ones a scene actually authors surfaced on the components:
 
 ## [0.3.0]
 
-### Changed — release versioning
+### Changed - release versioning
 
 - **The git `v*` tag is now the single source of truth for the package version.** `pack.ps1` stamps
   the tag into the packaged `package.json` at build time, replacing the 0.2.0 version/tag guard. The
-  committed manifest carries a `0.0.0-dev` placeholder that never needs bumping — cutting a release is
+  committed manifest carries a `0.0.0-dev` placeholder that never needs bumping - cutting a release is
   pushing a tag (plus this CHANGELOG), and `tools/release.ps1` does both in one step. A non-tag pack
   derives a SemVer dev version from `git describe` (`0.2.0-dev.<n>.g<hash>`) so dev tarballs stay
   traceable. No consumer-visible change; the released tarball still carries its real version.
 
-### Added — gapless chaining
+### Added - gapless chaining
 
 - **`Emitter.Queue(clip, loopTerminal)` / `Emitter.ClearQueue()`** → new engine ABI
   `bwa_source_queue` / `bwa_source_clear_queue`: queue a clip to play the instant the current one
   ends, with no gap at the seam (the engine swaps mid-block if the boundary falls there). Queue
-  several for a sequence; a `loopTerminal: true` entry is the looping tail — `Play(intro)` then
+  several for a sequence; a `loopTerminal: true` entry is the looping tail - `Play(intro)` then
   `Queue(body, loopTerminal: true)` is an intro→loop across two files. Up to 7 pending; queue *after*
   Play (Play restarts and clears the queue). In-memory mono clips only.
 
-### Added — loop regions + scheduled stop
+### Added - loop regions + scheduled stop
 
 - **`Emitter.PlayLoop(loopBeg, loopEnd)`** → new engine ABI `bwa_source_play_loop`: the intro→loop
   pattern. Playback starts at 0, plays the intro `[0, loopBeg)` once, then loops the body
@@ -644,113 +765,113 @@ with the ones a scene actually authors surfaced on the components:
   a hard wrap, so author the loop points on matched endpoints.
 - **`Emitter.StopAt(stopSample)`** → new engine ABI `bwa_source_stop_at`: a click-free stop on the
   dsp clock (same time base as `PlayAt`). When `Engine.DspTime` reaches stopSample the source fades
-  out over one block and ends — never a hard cut, so it can't pop. Block-granular; a later
+  out over one block and ends - never a hard cut, so it can't pop. Block-granular; a later
   Play/PlayAt/PlayLoop clears a pending stop.
 
-### Changed — engine ABI clarity renames (native 0.9.0)
+### Changed - engine ABI clarity renames (native 0.9.0)
 
 The engine renamed seven symbols for clarity; the binding follows. C#-visible changes:
 
 - **`Emitter.Position`/`PositionSeconds` → `Playhead`/`PlayheadSeconds`**, **`AmbisonicBed.Position`
-  → `Playhead`** — "Position" collided with the spatial transform; the readback is the CONTENT
+  → `Playhead`** - "Position" collided with the spatial transform; the readback is the CONTENT
   playhead. The old properties remain as `[Obsolete]` forwarders for now.
 - Raw `Bwa` layer follows the C renames: `bwa_source_get_playhead` / `bwa_bed_get_playhead`
   (was `_get_position`), `bwa_source_create_push` (was `_create_stream`), and the reverb-send
   family `bwa_set_reverb_gain` / `bwa_source_set_reverb` / `bwa_source_set_reverb_send` /
   `bwa_source_set_reverb_distance` (was `bwa_reflections_set_gain` / `bwa_source_set_reflections`
-  / `..._reflection_send` / `..._reflection_distance`) — "reflections" now always means the Steam
+  / `..._reflection_send` / `..._reflection_distance`) - "reflections" now always means the Steam
   reflection-bed config or the image-source earlies, "reverb" the shared send/tap.
-- New imports: `bwa_get_version` (the DLL's packed version — check it against the header rev at
-  startup), `bwa_get_sample_rate` / `bwa_get_block_size` (resolved config — divide frames by THIS,
+- New imports: `bwa_get_version` (the DLL's packed version - check it against the header rev at
+  startup), `bwa_get_sample_rate` / `bwa_get_block_size` (resolved config - divide frames by THIS,
   not by what you put in the desc), `bwa_get_sink_type` (enum-typed backend readback; `BwaSinkType`
   gains `Manual`).
 - A failed **explicit** `layoutPath` now fails `bwa_start` with `BwaResult.ErrLayout` instead of
   silently running the 26-grid default at the wrong channel count (`layoutPath = null` still
   means the default grid deliberately).
 
-### Added — AV sync surface (scheduled play + playhead readback)
+### Added - AV sync surface (scheduled play + playhead readback)
 
 - **`Emitter.PlayAt(startSample)`** → the already-bound `bwa_source_play_at`: sample-accurate
-  scheduled play on the engine's dsp clock (`Engine.DspTime`) — the `AudioSource.PlayScheduled`
+  scheduled play on the engine's dsp clock (`Engine.DspTime`) - the `AudioSource.PlayScheduled`
   equivalent, previously reachable only through the raw `Bwa` layer. Keep the startSample you
   passed: `DspTime - startSample` is the sync clock for beat-cued visuals.
 - **`Emitter.Position` / `PositionSeconds`** and **`AmbisonicBed.Position`** → new engine ABI
   `bwa_source_get_position` / `bwa_bed_get_position` (latest-wins per-voice playhead readback,
   like `is_playing`): the content playhead in engine-rate frames, correct where client-side
-  `DspTime` arithmetic breaks — it freezes under pause, lands where a seek lands, follows pitch
+  `DspTime` arithmetic breaks - it freezes under pause, lands where a seek lands, follows pitch
   at the actual rate, and for streamed clips counts frames actually consumed (an underrun slips
   it, exactly like the audible clock). ~One audio block of lag; for tighter-than-a-block
   scheduling keep using `DspTime` arithmetic.
 - **`Engine.DspTimeAt(realtime)` / `RealtimeAt(dspSample)`** → new engine ABI `bwa_get_clock`:
   the wall↔dsp bridge. The engine now publishes the device's own (sample position, host time)
-  stamp from each audio callback — `ASIOTime`'s pair, previously captured at the sink and
-  discarded — so mapping a `Time.realtimeSinceStartupAsDouble` moment to a dsp sample no longer
+  stamp from each audio callback - `ASIOTime`'s pair, previously captured at the sink and
+  discarded - so mapping a `Time.realtimeSinceStartupAsDouble` moment to a dsp sample no longer
   carries a block of jitter: `emitter.PlayAt(engine.DspTimeAt(tEvent))` lands a sound on a visual
   event to well under a millisecond. The helpers maintain the epoch offset between the driver's
   clock and Unity's (decaying-max estimator, refreshed per frame from `LateUpdate`), self-correct
   ppm clock drift, and fall back to block-granular `DspTime` pairing when the backend has no host
   stamp. `Engine.GetClock` exposes the raw pair.
 - **`Engine.OutputLatency`** → new engine ABI `bwa_get_output_latency`: the device's self-reported
-  render→DAC latency in frames (`ASIOGetLatencies` — the Digiface includes its Dante buffering;
+  render→DAC latency in frames (`ASIOGetLatencies` - the Digiface includes its Dante buffering;
   0 on the null-sink fallback). A sound scheduled for dsp time T is *heard* at T + OutputLatency:
   the audio half of AV-latency alignment, so only the display delay is left to measure by hand.
 
-### Added — multi-scene support
+### Added - multi-scene support
 
 - The `Engine` (a `DontDestroyOnLoad` singleton = the physical CAVE, not a level) now **follows Unity's
   loaded scenes**: it subscribes to `SceneManager.sceneLoaded`/`sceneUnloaded` and re-bakes the static
   `AcousticGeometry` whenever scenes change (deferred one frame so additive loads coalesce into a single
   BVH rebuild; `sceneUnloaded` fires after teardown, so an unloaded scene's geometry drops naturally).
-  Made possible by the runtime-safe geometry work — no engine rebuild, no audio gap. Additive scenes
+  Made possible by the runtime-safe geometry work - no engine rebuild, no audio gap. Additive scenes
   compose (a re-bake spans all loaded scenes); emitters were already per-scene via `OnEnable`/`OnDisable`.
 - **Persistent material cache** (`Engine.ResolveMaterial`): material tokens are minted into a fixed
   64-slot engine table, so each `MaterialAsset`/preset is now minted **once** and reused across every
   scene load. Re-minting per load (the old per-`SetupScene` cache, and `AddDynamicMesh`) would exhaust
-  the table in a multi-scene game — both now route through the shared cache.
+  the table in a multi-scene game - both now route through the shared cache.
 - **`Engine.ReleaseMaterial`** → `bwa_material_release`: frees a material's table slot for reuse and
-  evicts it from the cache (a later `ResolveMaterial` re-mints). Caller-managed — only release a
+  evicts it from the cache (a later `ResolveMaterial` re-mints). Caller-managed - only release a
   material no live mesh/occluder references. The mint-once cache covers the common case; this is the
   escape hatch for apps that churn many *distinct* materials over a long session.
 - Recommended pattern: put the `Engine` in a **persistent bootstrap scene**, load levels on top
   (single or additive). Sources, dynamic occluders, and static geometry all track the loaded scenes;
   the reflection-bed *config* (IR/order, room box) and the speaker layout stay engine-level (rebuild
-  the engine only if those must change — rare for a fixed install).
+  the engine only if those must change - rare for a fixed install).
 
-### Added — dynamic (movable) acoustic geometry
+### Added - dynamic (movable) acoustic geometry
 
 - **`DynamicAcousticGeometry`** component + **`Engine.AddDynamicMesh` / `SetDynamicTransform` /
   `RemoveDynamicMesh`** → `bwa_scene_add_dynamic_mesh` & co.: mark a MOVING object (door, lift,
   rotating panel) as an occluder/reflector. It registers a low-poly acoustic mesh as a rigid
   instance (Steam Audio `IPLInstancedMesh`) and pushes its pose each frame (throttled by
-  `positionEpsilon`/`angleEpsilon`), so occlusion and REAL-TIME reflections track it — moving it is a
+  `positionEpsilon`/`angleEpsilon`), so occlusion and REAL-TIME reflections track it - moving it is a
   cheap scene-BVH refit, not a geometry rebuild. Same "keep it simple / use `meshOverride`" rules as
   `AcousticGeometry`; scale is captured at registration (rigid-body). Coordinate seam handled: the
   mesh bakes into room handedness once (X-flip + scale, winding reversed) and the per-frame pose goes
   through `Room.Pos`/`Room.Rot`. Baked reflections/pathing do NOT track movement (real-time does).
   Needs the Steam Audio backend (a no-op otherwise). Static geometry stays on `AcousticGeometry`,
-  which is now also safe to re-push at runtime (a full scene rebuild — prefer dynamic meshes for
+  which is now also safe to re-push at runtime (a full scene rebuild - prefer dynamic meshes for
   movers).
 
-### Added — parity with the engine's A/B round (max-rE · spectral spread · FuMa · bed orientation)
+### Added - parity with the engine's A/B round (max-rE · spectral spread · FuMa · bed orientation)
 
 - **`Engine.maxRe` / `SetMaxRe`** → `bwa_set_max_re`: max-rE weighting on the bed decode and the
-  FDN's render (live A/B, crossfaded, level-fair) — fewer decode sidelobes, better localization
+  FDN's render (live A/B, crossfaded, level-fair) - fewer decode sidelobes, better localization
   away from the sweet spot. Sits under the *Diffuse beds* header; off by default like the engine.
-- **`BwaSpreadMode.Spectral`**: the third spread render — frequency-dependent panning (6 bands,
+- **`BwaSpreadMode.Spectral`**: the third spread render - frequency-dependent panning (6 bands,
   each from its own direction inside the cone; width with no coherent copies to collapse or
-  comb-filter — the decorrelation alternative). The existing `spreadMode` field/`SetSpreadMode`
+  comb-filter - the decorrelation alternative). The existing `spreadMode` field/`SetSpreadMode`
   pass it through unchanged.
 - **`Engine.LoadFuma`** + **`AmbisonicBed.fumaClip`** → `bwa_load_fuma`: legacy FuMa B-format
-  clips (WXYZ order, MaxN, the W −3 dB) convert to AmbiX at load — downstream they are AmbiX
+  clips (WXYZ order, MaxN, the W -3 dB) convert to AmbiX at load - downstream they are AmbiX
   assets, cached under a separate `fuma:` key so the same path can be loaded both ways.
 - **`AmbisonicBed.pitchDegrees` / `rollDegrees`** (+ `PitchDegrees`/`RollDegrees` properties) →
   `bwa_bed_set_orientation`: level or tilt a capture, glided and click-free like yaw. Coordinate
   seam: yaw still converts through `Room.YawRad` (the X mirror reverses its sense), while pitch
-  and roll pass through with the **same** sense — "front tilts up" never touches the mirrored
+  and roll pass through with the **same** sense - "front tilts up" never touches the mirrored
   axis, and Unity-right maps to room-right. All orientation paths (inspector, properties,
   enable) now go through one `ApplyOrientation()`.
 
-**Breaking** — the native ABI was reshaped for consistency (nothing had shipped against it, so no
+**Breaking** - the native ABI was reshaped for consistency (nothing had shipped against it, so no
 migration window): load-time configuration lives in config structs, live control lives in setters,
 one door per knob.
 
@@ -758,9 +879,9 @@ one door per knob.
   `bw_audio.h`; `bw` stays free as the family namespace), C types are lowercase snake_case with
   `_desc` config structs (`bwa_desc`, `bwa_reflections_desc`, `bwa_fdn_desc`), constants are
   `BWA_*`, env vars are `BWA_*` (were `BWAUDIO_*`), and the native library is `bw_audio.dll`
-  (was `bwaudio.dll`) — one product string everywhere.
+  (was `bwaudio.dll`) - one product string everywhere.
 - **The C# namespace is `BwAudio`** (was `CaveAudio`) **and the components lost their `Bw`
-  prefix** — the namespace is the prefix now: `BwAudio.Engine` (the manager, previously the
+  prefix** - the namespace is the prefix now: `BwAudio.Engine` (the manager, previously the
   `BwAudio` class), `BwAudio.Emitter`, `AmbisonicBed`, `SpeakerView`, `AcousticGeometry`, `MaterialAsset`,
   `RoomConstraints`, and the `[Clip]` attribute. The raw P/Invoke layer keeps its C shape on
   purpose: `Bwa.bwa_*` with `Bwa*` mirror types (`BwaDesc`, `BwaPanner`, …). Scene/prefab
@@ -769,36 +890,36 @@ one door per knob.
 - **`BwaDesc`** gained `enablePathing` (replaces the `BWAUDIO_PATHING` env var), `bedDecoder`
   (replaces the removed `bwa_set_bed_decoder`), and reserved fields so future growth won't break
   the ABI again.
-- **`BwaReflectionsDesc.wetGain` is gone** — `bwa_reflections_set_gain` is the one wet-level
+- **`BwaReflectionsDesc.wetGain` is gone** - `bwa_reflections_set_gain` is the one wet-level
   control (live; a value pushed before `bwa_start` seeds whichever reverb bed starts). New `bake`
   field (replaces the `BWAUDIO_BAKE` env var).
 - **The FDN setters** (`bwa_reverb_fdn`, `bwa_fdn_set_decay`, `bwa_fdn_set_decay_direction`)
-  collapsed into one `bwa_fdn_config(in BwaFdnDesc)` — same shape as the reflection config.
-- **`bwa_scene_set_mesh` (single-material) removed** — use `bwa_scene_set_mesh_mat` with one
+  collapsed into one `bwa_fdn_config(in BwaFdnDesc)` - same shape as the reflection config.
+- **`bwa_scene_set_mesh` (single-material) removed** - use `bwa_scene_set_mesh_mat` with one
   material token.
 - **The `bwa_bed_*` facade is complete**: `bwa_bed_fade_to` / `fade_out` / `set_paused` / `seek` /
-  `set_priority` / `set_group` / `is_playing` — a bed is a voice; bed code never needs the
+  `set_priority` / `set_group` / `is_playing` - a bed is a voice; bed code never needs the
   `bwa_source_*` prefix. Note a bed CAN be voice-stolen at default priority; protect a music bed
   with priority 255.
 - **`Engine` inspector**: new `enablePathing` and `bakeReflections` toggles; `reverbGain` now
   rides the live setter (re-applied from `OnValidate` like the other live knobs).
-- **Typed results**: the documented error codes are now a real enum — `bwa_result` in C,
-  `BwaResult` here — and `bwa_start`/`bwa_stop`/`bwa_tracker_connect` return it.
+- **Typed results**: the documented error codes are now a real enum - `bwa_result` in C,
+  `BwaResult` here - and `bwa_start`/`bwa_stop`/`bwa_tracker_connect` return it.
 - **The tracker is a runtime API, not env vars**: `bwa_tracker_connect(in BwaTrackerDesc)` /
   `bwa_tracker_disconnect` replace the `BWA_NATNET_*` environment variables AND the
   `BwaDesc.trackInternal` flag (connect/reconnect/disconnect any time, like every other NatNet
   client; the pose-source swap is glitch-free). `Engine` gained `natnetServer` / `natnetRigidBody`
   inspector fields and connects after start when Feed Listener is off.
 - **Material presets are typed end to end**: `bwa_material_preset` takes `bwa_material_type`
-  (mirrored by the existing `BwaMaterialPreset`) instead of a name string — the misspelled-name
+  (mirrored by the existing `BwaMaterialPreset`) instead of a name string - the misspelled-name
   footgun is gone, and the C# `PresetName` shim with it. Custom materials are unchanged:
   `bwa_material_define` returns the same kind of `bwa_material` token.
 - **Readback naming unified**: `bwa_get_channel_count`, `bwa_get_dsp_time`,
   `bwa_get_audio_backend` (were `bwa_channel_count`/`bwa_dsp_time`/`bwa_audio_backend`), and the
   test tone is a setter like its siblings: `bwa_set_test_signal` (was `bwa_test_signal`).
-- **The last env vars moved into `BwaDesc`** — there are now NO environment variables:
+- **The last env vars moved into `BwaDesc`** - there are now NO environment variables:
   `sink` (`BwaSinkType`: Auto = try ASIO then fall back to the silent null sink; Asio = demand a
-  device, fail loudly; Null = force offline — replaces `BWA_SINK`), `asioDriver` (replaces
+  device, fail loudly; Null = force offline - replaces `BWA_SINK`), `asioDriver` (replaces
   `BWA_ASIO_DRIVER`; empty = auto-pick by channel count), and `embree` (replaces `BWA_EMBREE`;
   silently falls back to the default ray tracer when the phonon build lacks Embree). `Engine`
   gained `sink` + `asioDriver` inspector fields.
@@ -811,35 +932,35 @@ without building any C++.
 
 - **Renamed to `com.brainworks.bw_audio`** (was `com.cave.bw_audio`). Done before anything shipped, so
   there is nothing to migrate: the scope you add to `manifest.json` is now `com.brainworks`. The C#
-  namespace is `BwAudio` — this is the package identity, not the code.
-- **Distribution** — `tools/upm/pack.ps1` packs `com.brainworks.bw_audio-<version>.tgz` (uses `tar`, no
+  namespace is `BwAudio` - this is the package identity, not the code.
+- **Distribution** - `tools/upm/pack.ps1` packs `com.brainworks.bw_audio-<version>.tgz` (uses `tar`, no
   Node anywhere; CI packs on *every* run, so a broken package fails the build rather than the release).
-  A `v*` tag cuts a GitHub Release with that tarball attached, and **the Release is the distribution** —
+  A `v*` tag cuts a GitHub Release with that tarball attached, and **the Release is the distribution** -
   no registry, no token, nothing to keep in sync. Install it with Package Manager → `+` → *Install
   package from tarball…*. See the README.
 - **`.meta` files are now committed** (`tools/upm/gen-meta.ps1`). An installed package is
   immutable, so assets arriving without a `.meta` get a fresh random GUID in every project: a scene
   referencing `Emitter` on one machine would deserialize as *"Missing (Mono Script)"* on another. The
-  native plugins' import settings (Windows x64, Editor enabled) ship the same way — in an immutable
+  native plugins' import settings (Windows x64, Editor enabled) ship the same way - in an immutable
   package the user cannot fix them in the Inspector.
-- **Version/tag guard** — the pack fails if the git tag and `package.json` disagree, so a tarball can't
+- **Version/tag guard** - the pack fails if the git tag and `package.json` disagree, so a tarball can't
   claim a version it isn't.
 
 ### Usability pass
 
-The theme: the binding had several settings that failed *silently* — the engine survives them, logs
+The theme: the binding had several settings that failed *silently* - the engine survives them, logs
 something, and carries on sounding subtly wrong. Those are now impossible to express, or caught in the
 inspector where you can still see them.
 
 - **Materials are a dropdown, not a string.** `BwaMaterialPreset` (mirrors the engine's table) replaces
-  the free-text preset name on `Engine.roomMaterial` and `MaterialAsset.preset`. An unrecognised name
-  was never an error — `bwa_material_preset` quietly returns material 0 (generic) and leaves the reason in
-  `bwa_last_error` — so a typo'd `"concreet"` wall just *sounded* wrong. **Breaking:** `MaterialAsset`
+  the free-text preset name on `Engine.roomMaterial` and `MaterialAsset.preset`. An unrecognized name
+  was never an error - `bwa_material_preset` quietly returns material 0 (generic) and leaves the reason in
+  `bwa_last_error` - so a typo'd `"concreet"` wall just *sounded* wrong. **Breaking:** `MaterialAsset`
   assets whose preset wasn't `concrete` will reset to Concrete; re-pick it from the dropdown.
 - **The layout file says where it goes.** `layoutFile` uses the `[Clip(".json")]` picker (the same one
   audio clips use), so it lists the JSON files actually present under `StreamingAssets`, flags a missing
   one in red, and tooltips that the path is *relative to `Assets/StreamingAssets/`*. The inspector also
-  shows the **absolute path the engine will look in** when the file isn't there — paired with the
+  shows the **absolute path the engine will look in** when the file isn't there - paired with the
   runtime error, both ends of that trap are now closed.
 - **Inspector sliders work in Play mode.** `Emitter` gained the `OnValidate` re-push that `Engine` and
   `AmbisonicBed` already had. Dragging Gain/Pitch/Spread during Play used to change the field and
@@ -847,47 +968,47 @@ inspector where you can still see them.
 - **Custom inspectors** for `Engine`, `Emitter` and `MaterialAsset`: settings that don't apply are
   hidden (FDN decay with the FDN off, pose prediction when Unity feeds the pose, custom coefficients
   under a preset material…), and the mistakes the engine merely *warns* about are surfaced as inspector
-  warnings — a missing layout, both reverb beds fighting over the one tap, reflections with no geometry
+  warnings - a missing layout, both reverb beds fighting over the one tap, reflections with no geometry
   to reflect off. In Play mode `Engine` shows the live backend (flagging a **silent** fallback to the
   null sink), channel count, active voices and per-channel output meters; `Emitter` shows its
   ray-traced occlusion, which is otherwise invisible.
-- **The room box is visible.** It draws as a wireframe gizmo (`Room.RoomToUnityMatrix` — the inverse of
+- **The room box is visible.** It draws as a wireframe gizmo (`Room.RoomToUnityMatrix` - the inverse of
   the coordinate seam, so a wrong `Room.UnityToRoom` makes the box land visibly in the wrong place).
 - **The speaker array is visible.** `Engine` draws each speaker as a gizmo, labeled with its channel
   index. Stopped, the positions come from the layout **file**; in Play mode they come from the **engine**
   (`bwa_get_speakers`) and each one lights up with that channel's live output level, the same way the
-  playground's gizmos do — so a dead or mis-wired speaker is visible at a glance. The Play-mode source
+  playground's gizmos do - so a dead or mis-wired speaker is visible at a glance. The Play-mode source
   matters: it's the geometry the engine is *actually* panning over, which means a failed layout load
   shows up as the built-in 26-grid sitting where your room isn't.
-- **`SpeakerView` — live speaker activity you can see from inside the CAVE.** The gizmos above are an
+- **`SpeakerView` - live speaker activity you can see from inside the CAVE.** The gizmos above are an
   *editor* feature and don't render in a build, so this is the runtime counterpart: one unlit marker per
   channel, placed at the real speaker's position, brightening (and growing) with that channel's output.
-  Unlit on purpose — a CAVE is dark, so the color computed is the color seen, with no lights to set up.
+  Unlit on purpose - a CAVE is dark, so the color computed is the color seen, with no lights to set up.
   Instant attack + slow release, because the engine reports a per-*block* peak that strobes too fast to
   read raw. Uses the same `bwa_get_speakers` + `bwa_get_bus_levels` readbacks as everything else, writes no
   audio state, and picks its shader across URP / HDRP / built-in. Optional: delete it and nothing changes
   audibly.
-- **`RoomConstraints` — the physical room, in the scene view.** Reads the surveyed `constraints.json`
+- **`RoomConstraints` - the physical room, in the scene view.** Reads the surveyed `constraints.json`
   (from StreamingAssets) and draws it: green = the speaker truss, red = the CAVE screen cube / observer
   keep-out, orange = the projectors. It's the **same file** `bwa_layout_tool` and `bwa_playground` read,
   so the room has one source of truth and doesn't get re-authored as Unity geometry that can drift from
-  the survey. Purely a scene-view aid — no engine needed (it parses the JSON directly, so it works with
+  the survey. Purely a scene-view aid - no engine needed (it parses the JSON directly, so it works with
   the editor stopped) and nothing audible depends on it.
 - **Minimum Unity is now 6000.0 (Unity 6)**, up from 2021.3. Nothing had ever been tested below it, and
   the old floor was already forcing compatibility shims.
 - **No deprecation warnings.** The scene bake used `FindObjectsOfType`, deprecated in favor of
-  `FindObjectsByType`, which forces you to say whether you need the results sorted. We don't — every
-  geometry is baked into one mesh — so it passes `FindObjectsSortMode.None` and skips a pointless
+  `FindObjectsByType`, which forces you to say whether you need the results sorted. We don't - every
+  geometry is baked into one mesh - so it passes `FindObjectsSortMode.None` and skips a pointless
   InstanceID sort.
 - **Packing no longer dies on a locked DLL.** An open Unity Editor holds `bw_audio.dll` loaded out of
-  `Runtime/Plugins/x86_64/`, so it can't be overwritten — `pack.ps1` now hashes first and skips the copy
+  `Runtime/Plugins/x86_64/`, so it can't be overwritten - `pack.ps1` now hashes first and skips the copy
   when the binary is already identical, and explains itself instead of throwing a raw IOException when
   it genuinely has to write. (A CMake rebuild hits the same lock; close the editor first.)
-- **A tracked listener with nothing to track now warns** — `feedListener` on with no `listener` Transform
+- **A tracked listener with nothing to track now warns** - `feedListener` on with no `listener` Transform
   silently left the listener parked at the array centroid, panning every source for a head that never
   moves.
 
-## [0.1.0] — unreleased
+## [0.1.0] - unreleased
 
 Initial Unity binding (M7).
 
@@ -901,30 +1022,30 @@ Initial Unity binding (M7).
 
 - Pause/seek + the output protection limiter (engine `9d60c6e`): `Emitter.Pause()/UnPause()/Paused`
   (AudioSource.Pause/UnPause equivalents; click-free, the playhead freezes, paused still reads as
-  IsPlaying) and `Emitter.Seek(samples)` (a timeSamples-set equivalent; in-memory clips only —
+  IsPlaying) and `Emitter.Seek(samples)` (a timeSamples-set equivalent; in-memory clips only -
   streamed clips ignore it); `Engine.SetLimiter(bool)` / `SetLimiterCeiling(dB)` over the
   engine-default ON at -1 dBFS.
 
-- `Bwa` — P/Invoke layer, 1:1 with the bw_audio C ABI (`include/bw_audio.h`): lifecycle, assets,
+- `Bwa` - P/Invoke layer, 1:1 with the bw_audio C ABI (`include/bw_audio.h`): lifecycle, assets,
   sources, ambisonic beds, materials/occlusion, directivity, reflection bed, listener, commit.
   Verified against the real `bw_audio.dll` (struct layout, calling convention, string/array/bool
   marshalling).
-- `Room` — the room-space (RH) ↔ Unity (LH) coordinate seam.
-- `Engine` — scene manager singleton: owns the engine handle, loads assets, configures reflections +
+- `Room` - the room-space (RH) ↔ Unity (LH) coordinate seam.
+- `Engine` - scene manager singleton: owns the engine handle, loads assets, configures reflections +
   an optional room box at load time, and runs the centralized per-frame push (sources → listener →
   one commit).
-- `Emitter` — positional source: transform-driven position/orientation, with `occlusion`,
+- `Emitter` - positional source: transform-driven position/orientation, with `occlusion`,
   `reflections`, and `directivity` toggles, plus a one-shot helper.
 - Editor guardrail (`ProjectCheck`): warns if Unity's built-in audio is still enabled (the
   engine owns the device) and offers one-click **Tools → Engine → Disable Unity Audio**.
 - Acoustic-scene authoring: `MaterialAsset` (Create → Engine → Acoustic Material; preset or custom
   3-band) and `AcousticGeometry` (mark a mesh as occluding/reflecting, assign a material, scene-view
   gizmo). `Engine` bakes all geometry (+ the optional room box) world→room into one mesh at load.
-- Audio-file authoring: `[Clip]` attribute + `ClipDrawer` — an editor picker that lists the
+- Audio-file authoring: `[Clip]` attribute + `ClipDrawer` - an editor picker that lists the
   `.wav`/`.flac`/`.mp3` files under StreamingAssets (with a browse button and a missing-file flag)
   instead of a hand-typed path. `Emitter` gains AudioSource-style `Play()`/`Stop()`/`Gain`. README
   has a "Replacing Unity audio" mapping table.
-- `AmbisonicBed` — world-locked AmbiX soundfield component (wraps `bwa_bed_*`): play/stop/gain for
+- `AmbisonicBed` - world-locked AmbiX soundfield component (wraps `bwa_bed_*`): play/stop/gain for
   diffuse ambience/music, decoded straight to all 26 speakers.
 - Reverb wet level: `Engine.reverbGain` (inspector) + a live `ReverbGain` property, backed by the
   new engine config field `wet_gain` + `bwa_reflections_set_gain`.
@@ -937,42 +1058,42 @@ The engine had grown 23 `BWA_API` calls the binding never got. `Bwa` is **1:1 wi
 (verified by diffing the exported symbols), and the components expose the ones a scene actually
 authors:
 
-- **Mixing** — `Emitter.FadeTo()` / `FadeOut()` (the engine runs the fade on the audio thread; no
-  coroutine, and `FadeOut` lands on the click-free stop path), `Emitter.Pitch` (glides — a change
+- **Mixing** - `Emitter.FadeTo()` / `FadeOut()` (the engine runs the fade on the audio thread; no
+  coroutine, and `FadeOut` lands on the click-free stop path), `Emitter.Pitch` (glides - a change
   bends the pitch rather than stepping it), `Emitter.Priority` (voice-steal), mix groups
-  (`Emitter.group` + `Engine.SetGroupGain` / `SetGroupPaused` — duck the SFX, keep the dialog),
+  (`Emitter.group` + `Engine.SetGroupGain` / `SetGroupPaused` - duck the SFX, keep the dialog),
   `Engine.MasterGain`, and `Engine.Paused` (global freeze; resume continues exactly).
-- **Width** — `Emitter.spread` was bound but had no inspector field; `sizeMetres` (a physical
+- **Width** - `Emitter.spread` was bound but had no inspector field; `sizeMeters` (a physical
   radius: the source keeps its real-world size as the listener walks, where a fixed angular spread
   would not) is new, as are the engine-wide `spreadMode` (LOBE / MDAP), `decorrelation` (wide sources
   stop collapsing to phantom images as you walk), and `nearSpreadRadius`.
-- **Propagation** — `Emitter.loudnessComp` (an LF shelf tracking the distance attenuation: far, not
+- **Propagation** - `Emitter.loudnessComp` (an LF shelf tracking the distance attenuation: far, not
   thin) joins `doppler` and `airAbsorption`.
-- **Reverb without the SDK** — `Engine.enableFdnReverb` + the decay controls: a directional FDN bed
+- **Reverb without the SDK** - `Engine.enableFdnReverb` + the decay controls: a directional FDN bed
   that takes the reverb tap **instead of** the Steam bed (the manager warns if both are ticked) and is
   fed by the same per-emitter sends, so reverb works in a build with no phonon. Likewise
-  `Emitter.SetOcclusionManual()` — game-driven occlusion (a door the gameplay knows about,
+  `Emitter.SetOcclusionManual()` - game-driven occlusion (a door the gameplay knows about,
   underwater) through the sim's own ramped, band-tilted publish path, no SDK required.
-- **Beds** — `AmbisonicBed.YawDegrees` (turn a recorded soundfield to line up with the scene) and
+- **Beds** - `AmbisonicBed.YawDegrees` (turn a recorded soundfield to line up with the scene) and
   `Engine.bedRenderer`: MATRIX, or **PARAMETRIC**, which re-pans the directional part of the field
-  through the listener-relative panner — a recorded soundfield becomes *walkable*.
-- **Listener** — `Engine.extraListeners` (up to 3 other occupants; panning becomes the energy mean of
+  through the listener-relative panner - a recorded soundfield becomes *walkable*.
+- **Listener** - `Engine.extraListeners` (up to 3 other occupants; panning becomes the energy mean of
   everyone's solve, instead of exact for one head and wrong for the rest), pushed in the same frame
   block as the primary pose since it is commit-gated the same way; and `posePredictionMs`, which leads
   the *tracked* pose by your measured motion-to-ears latency.
-- **Diagnostics** — `Engine.ChannelCount` / `BusLevels()` / `SpeakerPositions()` / `ActiveVoices` /
+- **Diagnostics** - `Engine.ChannelCount` / `BusLevels()` / `SpeakerPositions()` / `ActiveVoices` /
   `TestSignal()` / `DspTime`.
-- **Live A/B by ear** — `Engine.OnValidate` re-pushes every knob the engine makes atomic or
+- **Live A/B by ear** - `Engine.OnValidate` re-pushes every knob the engine makes atomic or
   crossfaded (panner, dual-band, spread mode, decorrelation, near-spread, bed renderer, tracked room
   EQ, master gain, limiter), so inspector tweaks are audible in Play mode instead of needing a restart.
 
 Two coordinate seams the new calls exposed, both now in `Room` so nothing re-derives them:
-`Room.YawRad` (the X mirror **reverses the sense of rotation** — a Unity euler angle passed straight
+`Room.YawRad` (the X mirror **reverses the sense of rotation** - a Unity euler angle passed straight
 to the bed's yaw (`bwa_bed_set_orientation`) spins the soundfield the wrong way) and `Room.Dir` (a *direction*, e.g. the
 FDN's decay axis, must not pick up the registration transform's translation the way `Room.Pos` does).
 
 `Engine` now also **reports a failed layout load** (`bwa_last_error` right after `bwa_create`): it is
-non-fatal — the engine falls back to its 26-speaker default grid — which on a smaller rig silently
+non-fatal - the engine falls back to its 26-speaker default grid - which on a smaller rig silently
 changes the channel count and pans every source over geometry that isn't the one in the room.
 
 ### Hardened (adversarial review)

@@ -1,21 +1,21 @@
 # bw_audio
 
-Self-hosted spatial audio engine for a 26-speaker CAVE installation. Drives the
-array over **ASIO → RME Digiface Dante**, with **binaural HRTF headphone
-rendering**: a first-class direct render, plus an array-audition monitor for
-desk-side debugging. Unity and Unreal connect as thin control clients over a C ABI.
+Self-hosted spatial audio engine for a 26-speaker CAVE installation. It drives the
+array over **ASIO → RME Digiface Dante**. A second path does **binaural HRTF
+headphone rendering**: a first-class direct render, plus an array-audition monitor
+for desk-side debugging. Unity and Unreal connect as thin control clients over a C ABI.
 
 New to the vocabulary? [docs/glossary.md](docs/glossary.md) defines every term the docs use,
-grouped by topic, with each entry saying what it means for a decision.
+grouped by topic. Each entry says what the term means for a decision.
 
 ## Why self-hosted
 
-Going direct (no FMOD/Wwise) gives sample-accurate access to ASIO timing hooks and
-keeps the core engine-agnostic, so the same library serves both engines with only a
-thin per-engine glue layer. The spatializer, mixer, output, and tracking all live
-in one process behind one audio callback: the experiment deploys as one system on
-the machine running the endpoint, with no external renderer to author, synchronize, and
-maintain alongside it.
+Going direct (no FMOD/Wwise) gives sample-accurate access to ASIO timing hooks. It
+also keeps the library game-engine-agnostic, so one library serves both engines with
+only a thin per-engine glue layer. The spatializer, mixer, output, and tracking all
+live in one process behind one audio callback. The experiment deploys as one system
+on the machine that runs the endpoint. There is no external renderer to author,
+synchronize, and maintain alongside it.
 
 ## Shape
 
@@ -83,7 +83,7 @@ maintain alongside it.
 
 The defaults target the CAVE: **one tracked listener roaming the array.** Change the
 setup and the right settings change with it, mostly because a *sweet spot* either
-exists or it doesn't. These are starting points; A/B them by ear in the playground.
+exists or it doesn't. These are starting points. A/B them by ear in the playground.
 The calibration commands behind the last row are under
 [One array, several audiences](#calibrate-bwa_calib_view).
 
@@ -98,39 +98,40 @@ The calibration commands behind the last row are under
 
 **Tracked roamer.** DBAP is listener-relative and re-solves every block, so the image
 follows you instead of degrading away from a center. Leave dual-band and VBAP off:
-both sharpen the image *at a sweet spot*, and there isn't one. For room correction use the
-grid (`bwa_calibrate --room-eq-grid`, one run per mic position); the engine interpolates
-the LF cuts at your live position and glides the biquads. `bwa_set_pose_prediction` (start
-~20–40 ms, your measured motion-to-ears latency) hides the panning lag; `bwa_set_decorrelation`
-keeps wide sources from comb-filtering as you move. Loading a static `room_eq` layout into
-a moving session **fails `bwa_start`** on purpose: one measurement point cannot correct a roam.
+both sharpen the image *at a sweet spot*, and there isn't one. Use the grid for room
+correction (`bwa_calibrate --room-eq-grid`, one run per mic position). The engine
+interpolates the LF cuts at your live position and glides the biquads.
+`bwa_set_pose_prediction` (start ~20–40 ms, your measured motion-to-ears latency) hides
+the panning lag. `bwa_set_decorrelation` keeps wide sources from comb-filtering as you
+move. Loading a static `room_eq` layout into a moving session **fails `bwa_start`** on
+purpose: one measurement point cannot correct a roam.
 
-**Fixed seat.** Now a sweet spot exists, so spend it: VBAP for the sharpest image (it needs
-a cleanly triangulable array; it falls back to DBAP if not), SPCAP if the array is uneven
-or you want a smoother, all-speaker image. Turn **dual-band on** for tighter bass
-localization, and calibrate with `--room-eq` **with the mic at the seat**. Don't track;
-set the listener pose once.
+**Fixed seat.** Now a sweet spot exists, so spend it. Use VBAP for the sharpest image. It
+needs a cleanly triangulable array, and it falls back to DBAP if not. Use SPCAP if the
+array is uneven, or if you want a smoother, all-speaker image. Turn **dual-band on** for
+tighter bass localization, and calibrate with `--room-eq` **with the mic at the seat**.
+Don't track; set the listener pose once.
 
 **Audience.** Panning is exact for one head and wrong for everyone else, so this is a
 compromise by construction. Track the person who matters (the participant, the demo
-driver) and hand the *other* occupants' positions to **`bwa_set_extra_listeners`** (up to
-3): every source's gains become the per-speaker energy mean of the per-listener solves,
-so each occupant gets an image biased toward their own seat instead of one exact and N
-wrong. Otherwise play it safe rather than sharp: DBAP, dual-band off, and no room EQ
+driver). Hand the *other* occupants' positions to **`bwa_set_extra_listeners`** (up to
+3). Every source's gains become the per-speaker energy mean of the per-listener solves.
+Each occupant then gets an image biased toward their own seat, instead of one exact image
+and N wrong ones. Otherwise play it safe rather than sharp: DBAP, dual-band off, and no room EQ
 beyond `--eq` (which flattens the *speakers*, not the room, so it helps every seat).
 Raise `bwa_source_set_spread` on ambience: wide sources survive off-center listening far
 better than points do.
 
 **Desk.** Neither headphone profile needs a layout, Dante, or hardware beyond
 headphones. `cave_sim` renders the *same* speaker mix through virtual speakers, so
-what you hear is the array render: use it to verify what the room will do.
+what you hear is the array render. Use it to verify what the room will do.
 `binaural` renders sources directly at their true directions: the better *listen*,
 the wrong *probe*. Don't use either to judge timbre for the room.
 
-**Everywhere:** the output limiter is on at −1 dBFS (leave it; it's speaker protection, not
-mastering), and reflections are opt-in per source. Pick one reverb bed: Steam Audio's
-(needs the SDK, ray-traced from your geometry) *or* the phonon-free FDN (`bwa_fdn_config`,
-a designed decay: cheaper, works in no-SDK builds). Details in
+**Everywhere:** the output limiter is on at −1 dBFS. Leave it on; it is speaker
+protection, not mastering. Reflections are opt-in per source. Pick one reverb bed: Steam
+Audio's (needs the SDK, ray-traced from your geometry) *or* the phonon-free FDN
+(`bwa_fdn_config`, a designed decay: cheaper, works in no-SDK builds). Details in
 [`docs/spatialization.md`](./docs/spatialization.md) and
 [`docs/calibration.md`](./docs/calibration.md).
 
@@ -140,23 +141,23 @@ bw_audio is not middleware. There are no events, banks, mixer graphs, or authori
 app: the ABI is create/play/position/commit. Game-side audio (UI, menus) stays in
 the game engine's own mixer.
 
-- **Fixed target.** The speaker geometry, including the channel count, is data:
-  a layout file carries 4..26 speakers and the engine's channel count follows it
-  (26 is the compile-time capacity; collaborator arrays with fewer speakers load
-  into the same binary). Still not a general 5.1/Atmos renderer.
+- **Fixed target.** The speaker geometry, including the channel count, is data.
+  A layout file carries 4..26 speakers and the engine's channel count follows it.
+  26 is the compile-time capacity, so collaborator arrays with fewer speakers load
+  into the same binary. Still not a general 5.1/Atmos renderer.
 - **Windows + ASIO only.** One *tracked* listener: the multi-listener mode is a
   panning compromise for extra occupants, not per-head rendering.
 - **Room EQ is opt-in.** Static-listener correction at one point
   (`bwa_calibrate --room-eq`, fixed-seat installs), or **tracked room EQ** from a
-  measured grid (`--room-eq-grid`) for a roaming listener: LF modal cuts only;
-  mid/HF stays speaker-only correction, because one room can't be flattened for
+  measured grid (`--room-eq-grid`) for a roaming listener: LF modal cuts only.
+  Mid/HF stays speaker-only correction, because you cannot flatten one room for
   every position at once.
 
 **Steam Audio is optional.** A no-SDK build is fully viable for the array: the whole
 spatializer plus geometric early reflections, FDN reverb, and manual occlusion. The
-SDK adds ray-traced (automatic) occlusion, sound pathing, and the real HRTF monitor;
-that last one is a *developer-workstation* dependency, since the production array
-render never uses HRTF. Which reverb/reflection path to run is a genuine choice;
+SDK adds ray-traced (automatic) occlusion, sound pathing, and the real HRTF monitor.
+That last one is a *developer-workstation* dependency, since the production array
+render never uses HRTF. Which reverb/reflection path to run is a genuine choice.
 [`docs/materials.md`](./docs/materials.md) has the comparison and the recommendation.
 
 Current gaps (may change):
@@ -184,7 +185,7 @@ Usage docs live in [`docs/api.md`](./docs/api.md): quickstart, profiles, the
 threading contract, coordinates, how-to guides for the common setups (a room
 with reflections, audio-visual sync, desk versus rig), error handling,
 environment variables, then a per-call reference. [`examples/minimal.c`](./examples/minimal.c) runs the whole
-client lifecycle (create → load → play → per-frame commit → teardown); it builds
+client lifecycle (create → load → play → per-frame commit → teardown). It builds
 as `bwa_minimal` and needs no hardware.
 
 ```c
@@ -241,7 +242,7 @@ Authors `cave_layout.json`:
   so the built-in test tone tells you which physical speaker is which.
 - Load placement constraints from `constraints.json`.
 - Shade a coverage shell by nearest-speaker gap, or by the selected panner's
-  rE-localization error, computed with the engine's own gain solve.
+  rE-localization error. The tool computes that error with the engine's own gain solve.
 - Optionally hill-climb the positions against that error.
 - Preview a moving pink-noise source through the edited layout.
 
@@ -253,8 +254,8 @@ Headless: `--export`, `--score`, `--optimize`.
 
 The Capture tab runs sweep → measure → solve → writeback (simulated, or full-duplex
 ASIO with a measurement mic), then loads the result into a layout diff: A the
-input, B what was written. A swapped channel or a bad mic placement is caught
-before the file is trusted.
+input, B what was written. You catch a swapped channel or a bad mic placement
+before you trust the file.
 
 Other tabs: the array in 3D, gain/delay trims, correction-EQ curves, retained IRs.
 The Zylia tab shows clap direction-of-arrival on a ZM-1 capsule sphere: a
@@ -266,9 +267,9 @@ seconds-fast check of capsule mapping and geometry.
 `bwa_zylia_probe` is a console level meter. See
 [`docs/calibration.md`](./docs/calibration.md).
 
-**One array, several audiences.** Speaker positions are surveyed once, but trims and
-EQ are measured relative to a reference point, so one installation can keep several
-calibrated variants of the same geometry and pick one per session
+**One array, several audiences.** You survey the speaker positions once. The trims and
+EQ are relative to a reference point, so one installation can keep several calibrated
+variants of the same geometry and pick one per session
 (`bwa_desc.layout_path` + the panner):
 
 ```
@@ -283,15 +284,15 @@ bwa_calibrate --layout cave_layout.roaming.json --mic -1 1.7 0 --room-eq-grid   
 - **Roaming** (DBAP + tracking): trims aligned at the working-volume center at
   standing ear height, speaker-only EQ; one point can't room-correct a roam.
 - **Roaming + tracked room EQ**: `--room-eq-grid` accumulates LF modal cuts one mic
-  placement at a time (the `--mic` position is the grid key); the engine then
+  placement at a time (the `--mic` position is the grid key). The engine then
   interpolates the cuts at the live tracked position: grid-based room correction
   that survives a walk.
 
-Diffing the two files in calib_view should show identical positions and only trim/EQ
+Diff the two files in calib_view. You should see identical positions and only trim/EQ
 differences. Unknown JSON fields survive recalibration, so a variant can carry its
-own annotation (for example, `"intent": "seated, SPCAP"`). And loading the seated file into
-a moving-listener session (DBAP or tracking) fails `bwa_start` rather than quietly
-mis-correcting the array.
+own annotation (for example, `"intent": "seated, SPCAP"`). Loading the seated file into
+a moving-listener session (DBAP or tracking) fails `bwa_start`. It does not quietly
+mis-correct the array.
 
 ### Audition: `bwa_playground`
 
@@ -301,7 +302,7 @@ The array sim (`cave_sim`) on headphones by default (auto-picked 2-ch ASIO drive
 without one the engine falls back to the null sink and keeps rendering, visual-only,
 live, just silent). The panel's render picker switches to `binaural` (the direct
 per-source render, for by-ear A/Bs against the sim) or `cave` (the array itself over
-26-ch ASIO, the same harness pointed at real speakers on the rig machine), and a
+26-ch ASIO, the same harness pointed at real speakers on the rig machine). A
 headphone-EQ field loads an AutoEq correction for your headphones.
 Scenes: localization, occlusion + materials, directivity, channel walk,
 reverb bed, an underwater medium boundary (live FDN retune, speed of sound,
@@ -309,12 +310,12 @@ the Lloyd's-mirror surface bounce), and a blind A/B/X comparison over single
 engine knobs (dual-band, panner choice, spread, air absorption) scored with a
 binomial p-value. The 3D
 speakers shade by their live output level (mirrored as a meter strip in the
-panel), so you can watch the panner drive the array even with no audio device. A
-`constraints.json` next to the exe is drawn for orientation: the same room
+panel), so you can watch the panner drive the array even with no audio device. The
+playground draws a `constraints.json` next to the exe for orientation: the same room
 boxes the layout tool edits against.
 
-All three GUI tools run their UI test suites under ctest (`--tests`); screenshots
-above are from those runs.
+All three GUI tools run their UI test suites under ctest (`--tests`). The screenshots
+above come from those runs.
 
 ## Platform and licensing
 

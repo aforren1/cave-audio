@@ -4,6 +4,7 @@
  * windowed-sinc pass — handy for the 44.1 kHz MP3s people drag along). Never runs on the audio thread.
  */
 #include "sound.h"
+#include "rt.h"          /* BWA_MAX_SAMPLE: the file-sample cap (see scrub_samples) */
 
 #include <math.h>
 #include <stdlib.h>
@@ -47,6 +48,21 @@ static float* decode_any(const char* path, unsigned int* ch, unsigned int* rate,
     drwav_uint64 f = 0;                               /* default / .wav */
     float* p = drwav_open_file_and_read_pcm_frames_f32(path, ch, rate, &f, NULL);
     *frames = (uint64_t)f; return p;
+}
+
+/* Scrub decoded samples in place: non-finite -> 0 (the same contract bwa_source_push documents) and
+ * magnitude capped at BWA_MAX_SAMPLE (rt.h). An IEEE-float wav delivers its bit patterns VERBATIM,
+ * so a crafted (or corrupt) file hands the audio thread NaN/Inf/3e38 directly — and the align delay
+ * lines + room-EQ biquads sit before the limiter, so one absurd sample poisons filter state for the
+ * session. Runs before any resample, so a NaN cannot smear across the sinc window first. */
+static void scrub_samples(float* s, uint64_t n) {
+    for (uint64_t i = 0; i < n; ++i) {
+        float x = s[i];
+        if (!isfinite(x)) x = 0.f;
+        else if (x >  BWA_MAX_SAMPLE) x =  BWA_MAX_SAMPLE;
+        else if (x < -BWA_MAX_SAMPLE) x = -BWA_MAX_SAMPLE;
+        s[i] = x;
+    }
 }
 
 static double sinc(double x) { return (x == 0.0) ? 1.0 : sin(BWA_PI * x) / (BWA_PI * x); }
@@ -94,6 +110,9 @@ bool sound_load(const char* path, uint32_t want_rate, SoundData* out, char* err,
     if (!interleaved)                 { set_err(err, errcap, "sound: cannot open/decode (wav/flac/mp3)"); return false; }
     if (channels == 0 || frames == 0) { free(interleaved); set_err(err, errcap, "sound: empty file"); return false; }
     if (rate == 0)                    { free(interleaved); set_err(err, errcap, "sound: invalid sample rate (0)"); return false; }
+    /* a wav header can declare ANY rate; rate 1 would ask the resampler below for a 48000x
+     * upsample (a multi-GB allocation and a very long loop). Nothing legitimate sits outside this. */
+    if (rate < 1000 || rate > 1000000) { free(interleaved); set_err(err, errcap, "sound: implausible sample rate (must be 1 kHz .. 1 MHz)"); return false; }
 
     /* downmix to mono (equal weight) */
     float* mono = (float*)malloc((size_t)frames * sizeof(float));
@@ -109,6 +128,7 @@ bool sound_load(const char* path, uint32_t want_rate, SoundData* out, char* err,
         }
     }
     free(interleaved);
+    scrub_samples(mono, frames);                      /* NaN/Inf/absurd out before anything consumes it */
 
     /* resample to the engine rate if needed (a load-time pass; the audio thread assumes want_rate) */
     if (rate != want_rate) {
@@ -180,12 +200,14 @@ static bool load_bed(const char* path, uint32_t want_rate, SoundData* out, char*
     if (!inter)               { set_err(err, errcap, "ambix: cannot open/decode (wav/flac/mp3)"); return false; }
     if (frames == 0)          { free(inter); set_err(err, errcap, "ambix: empty file"); return false; }
     if (rate == 0)            { free(inter); set_err(err, errcap, "ambix: invalid sample rate (0)"); return false; }
+    if (rate < 1000 || rate > 1000000) { free(inter); set_err(err, errcap, "ambix: implausible sample rate (must be 1 kHz .. 1 MHz)"); return false; }
     if (channels != 4 && channels != 9 && channels != 16) {
         free(inter); set_err(err, errcap, fuma ? "fuma: channel count must be 4, 9, or 16 (full 3D 1st/2nd/3rd order)"
                                                : "ambix: channel count must be 4, 9, or 16 (1st/2nd/3rd order)");
         return false;
     }
     uint16_t order = (channels == 4) ? 1 : (channels == 9) ? 2 : 3;
+    scrub_samples(inter, frames * channels);               /* NaN/Inf/absurd out before the SH math */
 
     if (fuma) {                                            /* reorder + rescale each frame in place */
         float tmp[16];

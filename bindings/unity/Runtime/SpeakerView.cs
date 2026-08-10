@@ -115,26 +115,9 @@ namespace BwAudio
             }
         }
 
-        // The color property differs by pipeline (URP/HDRP use _BaseColor, built-in Unlit uses _Color),
-        // so pick the shader first, then ask the material which one it actually has.
-        Material MakeUnlitMaterial()
-        {
-            string[] shaders = { "Universal Render Pipeline/Unlit", "HDRP/Unlit", "Unlit/Color", "Sprites/Default" };
-            foreach (var name in shaders)
-            {
-                var sh = Shader.Find(name);
-                if (sh == null) continue;
-                var m = new Material(sh) { hideFlags = HideFlags.DontSave };
-                foreach (var prop in new[] { "_BaseColor", "_UnlitColor", "_Color" })
-                {
-                    if (!m.HasProperty(prop)) continue;
-                    _colorId = Shader.PropertyToID(prop);
-                    return m;
-                }
-                DestroyImmediate(m);
-            }
-            return null;
-        }
+        // Shared with RoomView: same pipeline-dependent shader and color-property search. See
+        // UnlitMaterial.cs for why the property is discovered rather than assumed.
+        Material MakeUnlitMaterial() => UnlitMaterial.Make(out _colorId);
 
         void OnDisable() => Teardown();
 

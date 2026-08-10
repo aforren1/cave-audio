@@ -143,7 +143,7 @@ docs/                  Specs. Start here.
 examples/              cave_layout.json (see docs/layout-schema.md); minimal.c (the client lifecycle),
                        ambisonic.c (beds: AmbiX/FuMa load, rotate/tilt, renderer + max-rE A/B),
                        streaming.c (disk streaming + push sources) — console walkthroughs, built every build.
-third_party/           asiosdk/ (GPLv3 option, vendored), steam-audio-source/ (submodule) + steam-audio-artifacts/ (built phonon SDK); dr_wav + cJSON are
+third_party/           asiosdk/ (GPLv3 option, fetched not committed), steam-audio-source/ (submodule) + steam-audio-artifacts/ (built phonon SDK); dr_wav + cJSON are
                        fetched by CMake (FetchContent, pinned) — see third_party/README.md.
 ```
 
@@ -201,6 +201,13 @@ Regression-preventing gotchas. Each has bitten before or guards a real invariant
   inverted polarity (the default HRTF's per-ear DC gains oppose its audible ILD), mis-diagnosed a
   correct encode, and shipped a left/right mirror that only a by-ear report caught. Drive tones,
   never DC. See NOTES.md.
+- **`isfinite()` is not a range check — finite-but-absurd is its own defect class.** `isfinite(3e38)`
+  is TRUE, so the whole reject-non-finite guard family passes it, and then `bus * 3e38` OVERFLOWS to
+  Inf. Gains are sticky, so every later block overflows too, and the Inf reaches the align delay line
+  and the room-EQ biquads, whose IIR state holds it past any later correction. `test_fuzz_api` seed
+  12648430 found this on master gain; the whole linear-gain family is capped at `BWA_MAX_GAIN`
+  (`rt.h`, +80 dB) now. Any new value that SCALES the bus needs a magnitude cap, not just a finite
+  check. Note this is invisible to a reviewer scanning for missing guards — the guard is right there.
 - **`powf(base, exp)` with a negative base and a NON-INTEGER exponent is NaN**, and one NaN
   poisons a whole normalized gain vector. `spcap.c`'s lobe `0.5 + 0.5*cos` rounds to ~-5e-8 for an
   antipodal speaker, which was harmless for as long as the focus exponent was the integer 12 and

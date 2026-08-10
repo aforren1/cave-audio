@@ -62,7 +62,7 @@ namespace BwAudio.EditorTools
                 case "fdnCrossoverHz":
                 case "fdnDecayDirection":
                 case "fdnDecayFactor":    return !a.enableFdnReverb;
-                case "roomSizeMetres":
+                case "roomSizeMeters":
                 case "roomMaterial":      return !a.enableRoomBox;
                 case "speakerGizmoRadius":
                 case "showSpeakerIndices": return !a.showSpeakers;
