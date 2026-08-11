@@ -21,6 +21,7 @@
 #include <godot_cpp/variant/packed_vector3_array.hpp>
 
 #include "bw_audio.h"
+#include "bwa_client.h"
 
 namespace godot {
 
@@ -69,7 +70,7 @@ private:
 /* A movable occluder: its own sub-scene instance, so moving it is a cheap BVH refit rather
  * than a geometry rebuild. Needs the Steam Audio build; without it the handle stays -1 and
  * the node is inert (which the configuration warning says out loud). */
-class BwaDynamicGeometry : public Node3D {
+class BwaDynamicGeometry : public Node3D, public BwaEngineClient {
 	GDCLASS(BwaDynamicGeometry, Node3D)
 
 public:
@@ -80,6 +81,9 @@ public:
 	void _process(double delta) override;
 	void _exit_tree() override;
 	PackedStringArray _get_configuration_warnings() const override;
+
+	/* Called by BwaEngine on ITS teardown while this mover still lives (see bwa_client.h). */
+	void engine_gone() override;
 
 	void set_mesh(const Ref<Mesh> &m) { mesh = m; }
 	Ref<Mesh> get_mesh() const { return mesh; }

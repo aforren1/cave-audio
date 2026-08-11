@@ -35,6 +35,7 @@
 #include <godot_cpp/variant/vector3.hpp>
 
 #include "bw_audio.h"
+#include "bwa_client.h"     /* BwaEngineClient: the non-source detach contract */
 #include "bwa_material.h"   /* Ref<BwaMaterial>: the ground plane's surface */
 
 namespace godot {
@@ -152,6 +153,9 @@ public:
 	Quaternion to_room_orientation(const Basis &b) const;
 	float to_room_yaw(const Basis &b) const;
 	Vector3 from_room_position(const Vector3 &v) const;
+	Vector3 from_room_direction(const Vector3 &v) const {
+		return registration.basis.inverse().xform(v);
+	}
 	Quaternion from_room_orientation(const Quaternion &q) const;
 
 	/* --- listener --- */
@@ -175,6 +179,10 @@ public:
 	bwa_sound load_sound(const String &path, bool streaming);
 	bwa_sound load_ambisonic(const String &path, bool fuma);
 	void unload_sound_path(const String &path);
+	/* Metadata for a path already loaded by a player (or a load_* call); 0 for a path this
+	 * engine never loaded. Deliberately CACHED-ONLY: the ABI has no metadata-only probe, so
+	 * answering for an uncached path would mean a full hidden decode - and always a MONO one,
+	 * which reports 1 channel for an ambisonic bed. */
 	int64_t sound_get_frames(const String &path);
 	int sound_get_channels(const String &path);
 	/* false = nothing will be heard: the clip failed to load, or the voice pool / command ring
@@ -359,6 +367,10 @@ public:
 	bwa_engine *handle() const { return eng; }
 	void register_source(BwaSource *s);
 	void unregister_source(BwaSource *s);
+	/* Non-source nodes holding a back-pointer (beds, speaker views, dynamic geometry): same
+	 * detach protocol as sources, minus the per-frame pull. See bwa_client.h. */
+	void register_client(BwaEngineClient *c);
+	void unregister_client(BwaEngineClient *c);
 	/* A PROCESS-WIDE monotonic id, taken from a static counter on every successful start.
 	 * Material tokens belong to the engine instance that issued them, so BwaMaterial keys
 	 * its cache on this. It must be process-wide, not per-instance: a per-instance counter
@@ -385,7 +397,11 @@ private:
 	bwa_engine *eng = nullptr;
 	int generation = 0; /* 0 = never started; assigned from next_generation in _ready */
 	std::vector<BwaSource *> sources;
+	std::vector<BwaEngineClient *> clients;
 	HashMap<String, bwa_sound> sounds;
+
+	/* Metadata lookup across every cache key prefix; 0 when the path was never loaded. */
+	bwa_sound find_loaded_sound(const String &path) const;
 
 	Profile profile = PROFILE_BINAURAL;
 	Sink sink = SINK_AUTO;

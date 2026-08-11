@@ -19,8 +19,10 @@ void BwaSpeakerView::_ready() {
 	if (!owner || !owner->is_running()) {
 		UtilityFunctions::push_warning(
 				"BwaSpeakerView: no running BwaEngine - nothing to draw.");
+		owner = nullptr; // a kept pointer to a never-started engine still dangles later
 		return;
 	}
+	owner->register_client(this); // for the engine-freed-first teardown order
 
 	/* Sized by the layout the engine actually resolved, not by BWA_CHANNELS. */
 	const PackedVector3Array speakers = owner->get_speakers();
@@ -73,6 +75,19 @@ void BwaSpeakerView::_process(double delta) {
 		materials[i]->set_emission(active_color);
 		materials[i]->set_emission_energy_multiplier(t * 2.0f);
 	}
+}
+
+void BwaSpeakerView::_exit_tree() {
+	if (owner) {
+		owner->unregister_client(this); // the child-exits-first order: drop us from its list
+		owner = nullptr;
+	}
+}
+
+void BwaSpeakerView::engine_gone() {
+	/* No calls into the engine — it is mid-teardown. The gizmos stay (they are plain child
+	 * nodes); only the levels stop updating, which _process's owner check now guarantees. */
+	owner = nullptr;
 }
 
 int BwaSpeakerView::nearest_speaker(const Vector3 &godot_pos) const {

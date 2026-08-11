@@ -104,8 +104,10 @@ void BwaDynamicGeometry::_ready() {
 	}
 	owner = BwaEngine::get_singleton();
 	if (!owner || !owner->is_running() || mesh.is_null()) {
+		owner = nullptr; // a kept pointer with no registration dangles when the engine dies
 		return;
 	}
+	owner->register_client(this); // for the engine-freed-first teardown order
 
 	/* Dynamic geometry lives in the MOVER's own space, so it takes no registration here —
 	 * only the placement below crosses the seam. */
@@ -143,11 +145,20 @@ void BwaDynamicGeometry::_process(double delta) {
 }
 
 void BwaDynamicGeometry::_exit_tree() {
-	if (handle >= 0 && owner && owner->is_running()) {
-		owner->scene_remove_dynamic_mesh(handle);
+	if (owner) {
+		owner->unregister_client(this); // the child-exits-first order: drop us from its list
+		if (handle >= 0 && owner->is_running()) {
+			owner->scene_remove_dynamic_mesh(handle);
+		}
 	}
 	handle = -1;
 	owner = nullptr;
+}
+
+void BwaDynamicGeometry::engine_gone() {
+	/* No calls into the engine — it is mid-teardown, and its dynamic meshes die with it. */
+	owner = nullptr;
+	handle = -1;
 }
 
 PackedStringArray BwaDynamicGeometry::_get_configuration_warnings() const {

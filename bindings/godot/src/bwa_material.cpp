@@ -6,25 +6,28 @@
 
 using namespace godot;
 
+/* Edits set `dirty` rather than clobbering cached_generation: the generation must keep
+ * recording which engine instance minted `cached`, or the release below could hand a
+ * dead engine's token number to a live engine's table. */
 void BwaMaterial::set_preset(Preset p) {
 	preset = p;
-	cached_generation = -1; // force a re-mint
+	dirty = true;
 	notify_property_list_changed(); // show/hide the custom coefficients
 }
 
 void BwaMaterial::set_absorption(const Vector3 &v) {
 	absorption = v;
-	cached_generation = -1;
+	dirty = true;
 }
 
 void BwaMaterial::set_transmission(const Vector3 &v) {
 	transmission = v;
-	cached_generation = -1;
+	dirty = true;
 }
 
 void BwaMaterial::set_scattering(float v) {
 	scattering = v;
-	cached_generation = -1;
+	dirty = true;
 }
 
 bwa_material BwaMaterial::token(BwaEngine *engine) {
@@ -34,8 +37,17 @@ bwa_material BwaMaterial::token(BwaEngine *engine) {
 	/* Tokens index a table owned by one engine instance, so a rebuilt engine invalidates
 	 * them. Keying the cache on the engine's generation is what stops a stale token from
 	 * quietly addressing whatever now lives in that slot. */
-	if (cached_generation == engine->get_generation()) {
+	if (!dirty && cached_generation == engine->get_generation()) {
 		return cached;
+	}
+	/* Re-minting after an EDIT on the same live engine: release the superseded token first,
+	 * or live-tuning a coefficient bleeds the 64-slot table one slot per edit. Safe per the
+	 * ABI (bw_audio.h, bwa_material_release): meshes copy the material at set time, so
+	 * geometry already carrying the old token is unaffected, and the core refuses token 0.
+	 * A generation MISMATCH means the token belongs to a torn-down engine - nothing to
+	 * release, and the number must not reach this engine's table. */
+	if (cached != 0 && cached_generation == engine->get_generation()) {
+		engine->material_release((int)cached);
 	}
 	if (preset == PRESET_CUSTOM) {
 		cached = (bwa_material)engine->material_define(absorption, scattering, transmission);
@@ -43,6 +55,7 @@ bwa_material BwaMaterial::token(BwaEngine *engine) {
 		cached = (bwa_material)engine->material_preset((BwaEngine::Material)preset);
 	}
 	cached_generation = engine->get_generation();
+	dirty = false;
 	return cached;
 }
 

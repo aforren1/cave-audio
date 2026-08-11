@@ -36,14 +36,17 @@ struct SteamPath {
     uint32_t     channels;       /* the layout's speaker count (<= BWA_CHANNELS capacity) */
     uint32_t     order, ambi_ch, n, sample_rate;
 
-    /* Per-source state, steam_scene-style split: handle/pos/want are the CONTROL thread's shadow
-     * (written under `lock`); `src` is the phonon object, created/committed ONLY by the sim thread
-     * (reconcile_sources) — iplSimulatorCommit must never race iplSimulatorRunPathing, and both now
-     * live on one thread. (The debug seam reconciles inline; it documents "no sim thread running".)
-     * Slots are claim-once: a muted source keeps its slot + IPLSource until destroy. */
+    /* Per-source state, steam_scene-style split: handle/pos/want/dead are the CONTROL thread's
+     * shadow (written under `lock`); `src` is the phonon object, created/committed ONLY by the sim
+     * thread (reconcile_sources) — iplSimulatorCommit must never race iplSimulatorRunPathing, and
+     * both now live on one thread. (The debug seam reconciles inline; it documents "no sim thread
+     * running".) A muted source (want=0) keeps its slot + IPLSource; a DESTROYED one (dead=1,
+     * steam_path_source_gone) is swept by the sim thread — IPLSource released, handle cleared,
+     * slot returned to the pool — because a long-running installation churns sources indefinitely
+     * and claim-forever slots exhausted the table (and leaked IPLSources) at 64 distinct handles. */
     CRITICAL_SECTION lock;
-    struct { uint32_t handle; float pos[3]; uint8_t want; IPLSource src; } srcs[PATH_MAX_SRC];
-    int          nsrc;
+    struct { uint32_t handle; float pos[3]; uint8_t want, dead; IPLSource src; } srcs[PATH_MAX_SRC];
+    int          nsrc;           /* high-water mark of ever-claimed slots (freed ones have handle 0) */
 
     HANDLE        thread;
     volatile LONG stop;
@@ -104,15 +107,37 @@ static int do_path_bake(SteamPath* sp, const Layout* L) {
 }
 
 /* (sim thread — or the debug seam with no sim thread running) create + add IPLSources for wanted
- * slots that lack one, then ONE iplSimulatorCommit. Runs on the same thread as RunPathing, which is
- * the point: phonon forbids committing while a simulation runs, so creation must not stay on the
- * control thread. Phonon calls happen outside `lock` (only the shadow snapshot is under it). */
+ * slots that lack one, sweep dead ones, then ONE iplSimulatorCommit. Runs on the same thread as
+ * RunPathing, which is the point: phonon forbids committing while a simulation runs, so neither
+ * creation nor release may stay on the control thread — a destroy only MARKS (dead=1) and this
+ * sweep does the phonon teardown. Phonon calls happen outside `lock` (only the shadow is under it). */
 static void reconcile_sources(SteamPath* sp) {
     int changed = 0;
     for (int i = 0; i < PATH_MAX_SRC; ++i) {
         EnterCriticalSection(&sp->lock);
-        int need = (i < sp->nsrc) && sp->srcs[i].want && !sp->srcs[i].src;
+        int in_use      = (i < sp->nsrc) && sp->srcs[i].handle;
+        uint32_t handle = in_use ? sp->srcs[i].handle : 0;
+        int dead        = in_use && sp->srcs[i].dead;
+        int need        = in_use && !dead && sp->srcs[i].want && !sp->srcs[i].src;
         LeaveCriticalSection(&sp->lock);
+        if (dead) {
+            /* One final zero publish cuts the dying voice's indirect field (the audio thread drops
+             * it anyway once the generation recycles); then release the phonon object and return
+             * the slot to the pool. The clear runs AFTER the release so the control thread cannot
+             * re-claim a slot whose IPLSource is still being torn down. */
+            float zsh[BWA_AMBI_CH];
+            memset(zsh, 0, sizeof(float) * sp->ambi_ch);
+            rt_set_pathing(sp->rt, handle, zsh, NULL, sp->ambi_ch);
+            if (sp->srcs[i].src) {
+                iplSourceRemove(sp->srcs[i].src, sp->sim);
+                iplSourceRelease(&sp->srcs[i].src);
+                changed = 1;
+            }
+            EnterCriticalSection(&sp->lock);
+            sp->srcs[i].handle = 0; sp->srcs[i].want = 0; sp->srcs[i].dead = 0;
+            LeaveCriticalSection(&sp->lock);
+            continue;
+        }
         if (!need) continue;
         IPLSourceSettings ss; memset(&ss,0,sizeof ss); ss.flags = IPL_SIMULATIONFLAGS_PATHING;
         IPLSource src = NULL;
@@ -177,14 +202,29 @@ static void normalize_eq(float eq[3]) {
  * created by reconcile_sources on the sim thread (first tick after the claim; the sim publishes a
  * zero path until then, which is also what a just-enabled blocked source would render). */
 void steam_path_set_source(SteamPath* sp, uint32_t handle, const float pos[3], int on) {
+    if (!sp || !handle) return;
+    EnterCriticalSection(&sp->lock);
+    int slot = find_slot(sp, handle);
+    if (slot < 0 && on) {
+        for (int i = 0; i < sp->nsrc; ++i)         /* prefer a swept (freed) slot over growing */
+            if (sp->srcs[i].handle == 0) { slot = i; break; }
+        if (slot < 0 && sp->nsrc < PATH_MAX_SRC) slot = sp->nsrc++;
+        if (slot >= 0) { sp->srcs[slot].handle = handle; sp->srcs[slot].dead = 0; }   /* src stays NULL: the sim thread creates it */
+    }
+    if (slot >= 0) { sp->srcs[slot].pos[0]=pos[0]; sp->srcs[slot].pos[1]=pos[1]; sp->srcs[slot].pos[2]=pos[2]; sp->srcs[slot].want=(uint8_t)(on!=0); }
+    LeaveCriticalSection(&sp->lock);
+}
+
+/* CONTROL thread, on bwa_source_destroy: mark the slot for reclamation. The sim thread owns the
+ * phonon objects, so the actual release happens on its next tick (reconcile_sources); the slot then
+ * returns to the pool. Distinct from set_source(off), which mutes but keeps the slot: a destroyed
+ * handle never comes back, so keeping it leaks the table dry under source churn — and its stale
+ * republish would intermittently hard-cut a recycled voice index's indirect field. */
+void steam_path_source_gone(SteamPath* sp, uint32_t handle) {
     if (!sp) return;
     EnterCriticalSection(&sp->lock);
     int slot = find_slot(sp, handle);
-    if (slot < 0 && on && sp->nsrc < PATH_MAX_SRC) {
-        slot = sp->nsrc++;
-        sp->srcs[slot].handle = handle;            /* src stays NULL: the sim thread creates it */
-    }
-    if (slot >= 0) { sp->srcs[slot].pos[0]=pos[0]; sp->srcs[slot].pos[1]=pos[1]; sp->srcs[slot].pos[2]=pos[2]; sp->srcs[slot].want=(uint8_t)(on!=0); }
+    if (slot >= 0) { sp->srcs[slot].want = 0; sp->srcs[slot].dead = 1; }
     LeaveCriticalSection(&sp->lock);
 }
 
@@ -238,9 +278,11 @@ static DWORD WINAPI sim_thread(LPVOID arg) {
         EnterCriticalSection(&sp->lock); int n = sp->nsrc; LeaveCriticalSection(&sp->lock);
         for (int i = 0; i < n; ++i) {
             EnterCriticalSection(&sp->lock);         /* snapshot the slot's shadow (no torn pos reads) */
-            uint32_t handle = sp->srcs[i].handle; uint8_t want = sp->srcs[i].want;
+            uint32_t handle = sp->srcs[i].handle; uint8_t want = sp->srcs[i].want && !sp->srcs[i].dead;
             float pos[3] = { sp->srcs[i].pos[0], sp->srcs[i].pos[1], sp->srcs[i].pos[2] };
             LeaveCriticalSection(&sp->lock);
+            if (!handle) continue;                   /* swept slot: publishing its zeros would clobber
+                                                      * whatever live voice now owns this index's pub */
             IPLSource src = sp->srcs[i].src;         /* sim-thread-owned */
             if (!want || !src) { memset(sh, 0, sizeof(float)*sp->ambi_ch); rt_set_pathing(sp->rt, handle, sh, NULL, sp->ambi_ch); continue; }
             run_get(sp, lp, src, pos, eq, sh);       /* sh carries direction+level; eq is the bending-loss tilt */

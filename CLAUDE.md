@@ -226,6 +226,24 @@ Regression-preventing gotchas. Each has bitten before or guards a real invariant
   intrinsics instead, so `natnet.c` and its tests need no flag.
 - **Do not link the NatNet SDK.** It is proprietary and conflicts with GPLv3 under distribution.
   `natnet.c` parses the wire format off-wire (reference only, never linked).
+- **Proprietary VR-toolkit integrations (MiddleVR, Igloo) live OUTSIDE this repo**, in their own
+  package consuming a released `com.brainworks.bw_audio`. Same reasoning as the NatNet rule: the
+  Unity package is `GPL-3.0-only`, and an assembly referencing proprietary DLLs shipped inside it
+  raises the same distribution conflict. Second, independent reason: CI has no license for either, so
+  in-repo code would never be compiled by anything, giving sprawl AND silent drift. The sync cost is
+  small because the contact patch is small (pose, registration, listener), and an integration SHOULD
+  pin a released ABI rather than chase a moving one. What must track the ABI exactly (the rig-day
+  harness) stays in-repo, where CI compiles it.
+- **Assemblies point INWARD only.** `BwAudio` (core, no references) <- `BwAudio.RigDay` <-
+  `BwAudio.RigDay.Editor`. The core must never reference a tool or an integration, and the asmdefs
+  make that a compile error rather than a matter of discipline. The rig-day assemblies are
+  `autoReferenced: false` so they stay out of a consumer's default reference set.
+- **`tools/upm/gen-meta.ps1` must RECURSE.** An `.asmdef` governs its own folder, so assembly splits
+  mean subfolders, and the original flat `Get-ChildItem -File` silently skipped every asset in one
+  (folders included, which need a `.meta` as much as files do). A missing `.meta` regenerates that
+  GUID per project and breaks every reference into it, which is the exact failure the script exists
+  to prevent. Both existing asmdefs also carried `noBwAudioReferences`, a mangled `noEngineReferences`
+  that Unity silently ignores.
 - **Do not bake ASIO assumptions outside `asio_sink.cpp`.** ASIO is just the Windows sink; a
   future cross-platform move abstracts the device layer behind the sink seam.
 - **`test/xval_data.h` is GENERATED** by `tools/xval/gen_reference.py` — don't hand-edit.

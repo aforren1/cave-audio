@@ -33,11 +33,24 @@ namespace BwAudio
 
         uint _bed;
         bool _created;
-        IntPtr Eng => Engine.Instance ? Engine.Instance.Handle : IntPtr.Zero;
+        Engine _owner;                         // the Engine this bed was created under
+
+        // Valid only while the CREATING Engine is still the live instance (SourceBase's guard, same
+        // reason): bed handles are slot+generation like source handles, so a destroyed+recreated
+        // Engine mints deterministically colliding ones (a fresh engine's first bed is slot 0, gen 1
+        // again). A stale _bed must never reach a successor engine — it would drive, or in OnDisable
+        // DESTROY, whatever occupies the colliding slot there. Once the owner is gone this reads
+        // Zero, every op no-ops, and the next enable re-creates under the new engine.
+        IntPtr Eng => _owner != null && ReferenceEquals(Engine.Instance, _owner) ? _owner.Handle : IntPtr.Zero;
+
+        // Guard shorthand: the bed exists and its engine is still the live one.
+        bool Live => _created && Eng != IntPtr.Zero;
 
         void OnEnable()
         {
-            if (Eng == IntPtr.Zero) { enabled = false; return; }   // Engine not ready yet
+            var engine = Engine.Instance;
+            if (!engine || engine.Handle == IntPtr.Zero) { enabled = false; return; }   // Engine not ready yet
+            _owner = engine;
             _bed = Bwa.bwa_bed_create(Eng);
             _created = true;
             Bwa.bwa_bed_set_gain(Eng, _bed, gain);
@@ -51,7 +64,7 @@ namespace BwAudio
         // room-right, so both already mean what the engine means.
         void ApplyOrientation()
         {
-            if (_created && Eng != IntPtr.Zero)
+            if (Live)
                 Bwa.bwa_bed_set_orientation(Eng, _bed, Room.YawRad(yawDegrees),
                                             pitchDegrees * Mathf.Deg2Rad, rollDegrees * Mathf.Deg2Rad);
         }
@@ -59,25 +72,25 @@ namespace BwAudio
         /// <summary>Play `clip` (or an override) as the soundfield, loading it on demand.</summary>
         public void Play(string clipOverride = null)
         {
-            if (!_created || Eng == IntPtr.Zero) return;
+            if (!Live) return;
             var path = clipOverride ?? clip;
             uint snd = fumaClip ? Engine.Instance.LoadFuma(path)      // FuMa converts at load
                                 : Engine.Instance.LoadAmbix(path);    // rejects mono
             if (snd != 0) Bwa.bwa_bed_play(Eng, _bed, snd, loop);
         }
 
-        public void Stop() { if (_created && Eng != IntPtr.Zero) Bwa.bwa_bed_stop(Eng, _bed); }
+        public void Stop() { if (Live) Bwa.bwa_bed_stop(Eng, _bed); }
 
         /// <summary>Current playhead into the soundfield clip, in engine-rate frames (latest-wins
         /// readback, ~one audio block of lag; freezes while the bed is paused). 0 while idle;
         /// seconds = Playhead / Engine.Instance.sampleRate.</summary>
-        public ulong Playhead => _created && Eng != IntPtr.Zero ? Bwa.bwa_bed_get_playhead_frames(Eng, _bed) : 0;
+        public ulong Playhead => Live ? Bwa.bwa_bed_get_playhead_frames(Eng, _bed) : 0;
 
         /// <summary>Master gain of the bed (ramped); applies immediately if live.</summary>
         public float Gain
         {
             get => gain;
-            set { gain = value; if (_created && Eng != IntPtr.Zero) Bwa.bwa_bed_set_gain(Eng, _bed, value); }
+            set { gain = value; if (Live) Bwa.bwa_bed_set_gain(Eng, _bed, value); }
         }
 
         /// <summary>Yaw of the soundfield in DEGREES, Unity's sense (positive = turn it to the right).
@@ -107,7 +120,7 @@ namespace BwAudio
         // Inspector edits are audible in Play mode (the engine glides to the new orientation).
         void OnValidate()
         {
-            if (Application.isPlaying && _created && Eng != IntPtr.Zero)
+            if (Application.isPlaying && Live)
             {
                 Bwa.bwa_bed_set_gain(Eng, _bed, gain);
                 ApplyOrientation();
@@ -116,9 +129,10 @@ namespace BwAudio
 
         void OnDisable()
         {
-            if (!_created || Eng == IntPtr.Zero) return;
-            Bwa.bwa_bed_destroy(Eng, _bed);
+            if (Live)                            // owner gone (engine destroyed/replaced) -> Live is false:
+                Bwa.bwa_bed_destroy(Eng, _bed);  // the stale handle never destroys a successor's bed
             _created = false;
+            _owner = null;
         }
     }
 }

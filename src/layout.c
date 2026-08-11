@@ -141,6 +141,9 @@ bool layout_load(const char* path, uint32_t sample_rate, Layout* out, char* err,
         if (cJSON_IsNumber(rr)) {
             if (!(rr->valuedouble > 0.0)) { set_err(err, errcap, "layout: dbap.rolloff_r must be > 0"); goto done; }
             out->rolloff_r = (float)rr->valuedouble;
+            /* 1 mm floor: below any audible blur, but r^2 can no longer underflow to 0 in the DBAP
+             * solve (a tiny r with a source ON a speaker made 1/d^2 overflow into a sticky NaN gain). */
+            if (out->rolloff_r < 0.001f) out->rolloff_r = 0.001f;
             have_rolloff = true;
         }
         cJSON* da = cJSON_GetObjectItemCaseSensitive(dbap, "distance_attenuation");

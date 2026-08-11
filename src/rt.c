@@ -857,8 +857,15 @@ static inline void eq_unpack(uint64_t p, float g[3]) {
     for (int i = 0; i < 3; ++i) g[i] = (float)((p >> (16 * i)) & 0xFFFFu) * (1.f / 65535.f);
 }
 
-/* g is the linear band gain (A = sqrt(g)); cw0/alpha are precomputed per filter (see eq_proto). */
+/* g is the linear band gain (A = sqrt(g)); cw0/alpha are precomputed per filter (see eq_proto).
+ * Floored well above 0: band 0 is legal at the ABI ([0,1]), the EQ_SLEW glide halves toward it and
+ * (under the FTZ mode rt_render sets) REACHES exact 0, and A = sqrt(0) turns the RBJ peak design
+ * into Inf*0 = NaN — coefficients that poison every IIR downstream (FDN feedback, align room EQ).
+ * eq_pack's [0,1] clamp cannot catch this: 0 is in range. -60 dB per band is inaudibly far below
+ * the broadband cut, which rides the occ_cur scalar, not the tilt. */
+#define EQ_GAIN_FLOOR 1e-3f
 static void eq_coeffs(int type, float cw0, float alpha, float g, float out[5]) {
+    if (!(g > EQ_GAIN_FLOOR)) g = EQ_GAIN_FLOOR;         /* NaN-safe */
     bwa_biquad_rbj(type, cw0, alpha, sqrt((double)g), out);
 }
 
@@ -3561,9 +3568,23 @@ void rt_set_pathing(RtCore* c, uint32_t handle, const float* sh, const float* eq
     int cur = atomic_load_explicit(&c->path_idx[idx], memory_order_relaxed);
     PathPub* back = &c->path_pub[(size_t)idx * 2 + (size_t)(1 - cur)];
     back->handle = handle;
-    for (uint32_t k = 0; k < ambi_ch; ++k)        back->sh[k] = sh[k];
+    /* Same backstop as rt_set_direct, for the same reason: these values arrive from the SIM thread,
+     * so they fence whatever the ray tracer computed from a degenerate scene. A NaN shCoeff ramps
+     * into path_sh_cur (a ramp never sheds NaN) and decodes onto the bus; a finite-but-absurd one
+     * overflows it — the BWA_MAX_GAIN class. The eq bands get the eq_pack cleanse ([0,1], NaN-safe);
+     * eq_coeffs floors an exact 0 before the biquad design. */
+    for (uint32_t k = 0; k < ambi_ch; ++k) {
+        float v = sh[k];
+        if (!isfinite(v))            v = 0.f;
+        else if (v >  BWA_MAX_GAIN)  v =  BWA_MAX_GAIN;
+        else if (v < -BWA_MAX_GAIN)  v = -BWA_MAX_GAIN;
+        back->sh[k] = v;
+    }
     for (uint32_t k = ambi_ch; k < BWA_AMBI_CH; ++k) back->sh[k] = 0.f;
-    for (int b = 0; b < 3; ++b) back->eq[b] = eq ? eq[b] : 1.f;   /* NULL eq = flat (no bending loss) */
+    for (int b = 0; b < 3; ++b) {
+        float g = eq ? eq[b] : 1.f;                       /* NULL eq = flat (no bending loss) */
+        back->eq[b] = !(g > 0.f) ? 0.f : (g > 1.f ? 1.f : g);
+    }
     atomic_store_explicit(&c->path_idx[idx], 1 - cur, memory_order_release);
 }
 
@@ -3927,11 +3948,10 @@ bool rt_play_oneshot(RtCore* c, uint32_t sound, float x, float y, float z, float
 
 /* ---- lifecycle ---- */
 
-/* Extra physical voice slots beyond the caller's pool. A full-pool steal fades the victim out on its
- * own slot (one block) and places the new source on a reserve slot, so the steal is click-free; the
- * victim's slot returns to the pool when the fade completes. Bounds how many steals per frame can be
- * click-free (beyond it, a steal falls back to a hard cut). */
-#define BWA_FADE_RESERVE 8
+/* BWA_FADE_RESERVE (rt.h): extra physical slots beyond the caller's pool. A full-pool steal fades
+ * the victim out on its own slot (one block) and places the new source on a reserve slot, so the
+ * steal is click-free; the victim's slot returns to the pool when the fade completes. Bounds how
+ * many steals per frame can be click-free (beyond it, a steal falls back to a hard cut). */
 
 RtCore* rt_create(uint32_t req_voice_cap, uint32_t sound_cap, uint32_t sample_rate, uint32_t channels) {
     if (req_voice_cap == 0 || req_voice_cap > 0xFFFFu - BWA_FADE_RESERVE || sound_cap == 0 || sound_cap > 0xFFFFu ||

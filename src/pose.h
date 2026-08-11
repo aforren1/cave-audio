@@ -28,14 +28,19 @@ typedef struct {
                             * never compare against another clock (ASIO systemTime, QPC elsewhere). */
 } PoseSlot;
 
-/* Writer (NatNet receiver thread): publish a new pose, stamped with the writer's clock. */
+/* Writer (NatNet receiver thread): publish a new pose, stamped with the writer's clock.
+ * Unsigned counter math: `s0 + 1` on a long is signed overflow (UB) once the counter tops out,
+ * and the wrap runs THROUGH 0 — the reader's "never published" sentinel — which would drop one
+ * sample per 2^31 writes. The exit value skips 0 so the sentinel stays unambiguous. */
 static inline void pose_write_t(PoseSlot* s, const float p[3], const float q[4], unsigned __int64 t_ns) {
-    long s0 = s->seq;
-    _InterlockedExchange(&s->seq, s0 + 1);          /* enter (odd) — full barrier */
+    unsigned long s0 = (unsigned long)s->seq;
+    _InterlockedExchange(&s->seq, (long)(s0 + 1u)); /* enter (odd) — full barrier */
     memcpy(s->p, p, sizeof s->p);
     memcpy(s->q, q, sizeof s->q);
     s->t_ns = t_ns;
-    _InterlockedExchange(&s->seq, s0 + 2);          /* leave (even) — full barrier */
+    unsigned long s2 = s0 + 2u;
+    if (s2 == 0u) s2 = 2u;                          /* skip the never-published sentinel on wrap */
+    _InterlockedExchange(&s->seq, (long)s2);        /* leave (even) — full barrier */
 }
 static inline void pose_write(PoseSlot* s, const float p[3], const float q[4]) {
     pose_write_t(s, p, q, 0);                       /* untimestamped (e.g. the readback slot) */

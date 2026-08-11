@@ -16,11 +16,13 @@
 #include <godot_cpp/classes/standard_material3d.hpp>
 #include <godot_cpp/variant/color.hpp>
 
+#include "bwa_client.h"
+
 namespace godot {
 
 class BwaEngine;
 
-class BwaSpeakerView : public Node3D {
+class BwaSpeakerView : public Node3D, public BwaEngineClient {
 	GDCLASS(BwaSpeakerView, Node3D)
 
 public:
@@ -29,7 +31,12 @@ public:
 
 	void _ready() override;
 	void _process(double delta) override;
+	void _exit_tree() override;
 	PackedStringArray _get_configuration_warnings() const override;
+
+	/* Called by BwaEngine on ITS teardown while this view still lives (see bwa_client.h);
+	 * without it the next _process tick dereferences the freed engine node. */
+	void engine_gone() override;
 
 	void set_gizmo_radius(float r) { gizmo_radius = r; }
 	float get_gizmo_radius() const { return gizmo_radius; }

@@ -80,6 +80,7 @@ public:
 	void set_directivity(float weight, float power);
 	void set_directivity_preset(Directivity pattern);
 	float get_directivity_gain() const;
+	/* Godot-frame, converted through the facing seam before it reaches the ABI. */
 	void set_orientation(const Quaternion &q);
 	/* Push this node's own rotation as the directivity axis every frame — the reason a
 	 * source is a Node3D rather than a position. */
@@ -123,6 +124,7 @@ protected:
 
 private:
 	void apply_all(); /* re-push authored state onto a freshly created source */
+	void push_orientation(const Quaternion &q); /* the facing seam, applied in one place */
 
 	float gain = 1.0f;
 	int priority = 128;
@@ -142,6 +144,17 @@ private:
 
 	bool occlusion = false;
 	bool orientation_follows_node = false;
+	/* Standing-knob caches with has-been-set flags: each "unset" state is a live core default
+	 * the binding must not restate, so only an authored value replays through apply_all(). */
+	bool occ_manual_set = false, occ_manual_banded = false;
+	float occ_manual_level = 1.0f;
+	Vector3 occ_manual_bands = Vector3(1.0f, 1.0f, 1.0f);
+	enum DirSet { DIRSET_NONE = 0, DIRSET_CUSTOM, DIRSET_PRESET };
+	DirSet dir_mode = DIRSET_NONE; /* remembers WHICH spelling was used (last one wins) */
+	float dir_weight = 0.0f, dir_power = 1.0f;
+	Directivity dir_preset = DIR_OMNI;
+	bool orientation_set = false;
+	Quaternion orientation_q; /* Godot frame; converted at push time, when `owner` exists */
 
 	bool reverb = false;
 	float reverb_send = 1.0f;

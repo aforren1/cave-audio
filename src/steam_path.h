@@ -39,6 +39,10 @@ void       steam_path_tap(void* ud, float* bus, uint32_t n, const float* lp, con
  * params on its own generation. */
 void       steam_path_set_source(SteamPath* sp, uint32_t handle, const float pos[3], int on);
 void       steam_path_set_pos(SteamPath* sp, uint32_t handle, float x, float y, float z);  /* update an enabled source's pos */
+/* On bwa_source_destroy: reclaim the handle's slot. The sim thread releases the IPLSource on its
+ * next tick and returns the slot to the pool; without this, indefinite source churn exhausts the
+ * table and leaks IPLSources until engine teardown. Control thread; non-blocking (mark-only). */
+void       steam_path_source_gone(SteamPath* sp, uint32_t handle);
 
 /* ---- test seam (exercised by path_test without the sim thread): run one pathing pass for a given
  * listener and read a source's path params directly. eq[3] + sh[(order+1)^2]; returns 1 if a path

@@ -167,6 +167,13 @@ int main(void) {
                 }
                 free(buf);
             }
+            /* same refusal policy as the trims writer: a NaN fit must be refused BEFORE the write —
+             * serialized it becomes JSON `null`, and out_path is usually the layout itself */
+            cuts[1].gain_db = NAN;
+            err[0] = 0;
+            CHECK(!calib_write_room_eq(RIN, ROUT, cuts, counts, 2, BWA_ROOM_EQ_MAX, err, sizeof err) && err[0],
+                  "a NaN room_eq section is refused with a reason");
+            cuts[1].gain_db = -3.5f;
             remove(RIN); remove(ROUT);
         }
     }
@@ -227,6 +234,14 @@ int main(void) {
             float micB2[3] = { 0.52f, 1.5f, 0.f };
             CHECK(calib_write_room_eq_grid(GIN, GIN, micB2, cuts, counts, 2, BWA_ROOM_EQ_MAX, err, sizeof err),
                   err[0] ? err : "grid writeback run 3");
+            /* the grid writer's schema clamps are two-sided compares that pass NaN: the refusal
+             * must fire first, and the accumulated grid file must survive untouched */
+            memset(cuts, 0, sizeof cuts);
+            cuts[0].fc = 45.5f; cuts[0].gain_db = NAN; cuts[0].q = 6.f;
+            counts[0] = 1; counts[1] = 0;
+            err[0] = 0;
+            CHECK(!calib_write_room_eq_grid(GIN, GIN, micB2, cuts, counts, 2, BWA_ROOM_EQ_MAX, err, sizeof err) && err[0],
+                  "a NaN grid section is refused with a reason");
             FILE* rf = fopen(GIN, "rb");
             if (rf) {
                 fseek(rf, 0, SEEK_END); long len = ftell(rf); fseek(rf, 0, SEEK_SET);

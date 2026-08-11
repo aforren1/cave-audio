@@ -18,9 +18,10 @@ namespace BwAudio
         [Header("Engine")]
         public BwaProfile profile = BwaProfile.Binaural;   // inspector dropdown; maps 1:1 to the C enum
         [Tooltip("The surveyed speaker geometry, as a path RELATIVE TO Assets/StreamingAssets/ " +
-                 "(create that folder and put cave_layout.json in it). Used by the cave/cave_both profiles. " +
-                 "If it fails to load the engine falls back to its default 26-speaker grid and logs an " +
-                 "error — it does NOT stop, so a smaller rig would silently pan over the wrong geometry.")]
+                 "(create that folder and put cave_layout.json in it). EMPTY runs the engine's built-in " +
+                 "default 26-speaker grid — the only way to opt into it. A non-empty path MUST load: on " +
+                 "a failed load the engine logs the reason and REFUSES to start (BWA_ERR_LAYOUT), so a " +
+                 "session can never silently pan over geometry that isn't the one in the room.")]
         [Clip(".json")] public string layoutFile = "cave_layout.json";
         public uint sampleRate = 48000;
         public uint blockSize = 256;
@@ -174,8 +175,8 @@ namespace BwAudio
         [Header("Scene view")]
         [Tooltip("Draw the speaker array. Stopped, these come from the layout FILE. In Play mode they " +
                  "come from the ENGINE (bwa_get_speakers) and light up with each channel's live output " +
-                 "level — so you see the geometry actually being panned over, which is how a failed " +
-                 "layout load looks: the default 26-grid, not your room.")]
+                 "level — so you see the geometry actually being panned over. An empty Layout File shows " +
+                 "as the default 26-grid, not your room.")]
         public bool showSpeakers = true;
         [Range(0.02f, 0.5f)] public float speakerGizmoRadius = 0.12f;
         public bool showSpeakerIndices = true;
@@ -209,9 +210,27 @@ namespace BwAudio
         {
             if (Instance != null) { Destroy(gameObject); return; }   // a working manager already owns the engine
 
+            // ABI guard, before any struct crosses the boundary: a stale staged bw_audio.dll after an
+            // ABI break runs with mismatched enums/struct layouts — silent corruption, not a crash. The
+            // header guarantees compatibility only within a major.minor (bw_audio.h, BWA_VERSION), so
+            // refuse on that; a patch difference is compatible and passes.
+            uint dllVersion = Bwa.bwa_get_version();
+            if ((dllVersion >> 8) != (Bwa.BoundVersion >> 8))
+            {
+                Debug.LogError("[bw_audio] ABI version mismatch: bw_audio.dll is " +
+                               Bwa.VersionString(dllVersion) + ", this binding was built against " +
+                               Bwa.VersionString(Bwa.BoundVersion) + ". Refusing to start — restage " +
+                               "the DLL or update the package so they match.");
+                return;                                              // Instance NOT claimed
+            }
+
             var cfg = new BwaDesc {
                 profile = profile,
-                layoutPath = Path.Combine(Application.streamingAssetsPath, layoutFile),
+                // Empty maps to layout_path = NULL — the ABI's only way to run the default grid —
+                // exactly like asioDriver below. Path.Combine of an empty string would yield the
+                // StreamingAssets DIRECTORY: still an explicit path, which fails to load and then
+                // fails bwa_start (BWA_ERR_LAYOUT), leaving the default grid unreachable.
+                layoutPath = layoutFile.Length > 0 ? Path.Combine(Application.streamingAssetsPath, layoutFile) : null,
                 hrtfPath = null, sampleRate = sampleRate, blockSize = blockSize,
                 sink = sink,
                 asioDriver = asioDriver.Length > 0 ? asioDriver : null,
@@ -222,15 +241,18 @@ namespace BwAudio
             if (_eng == IntPtr.Zero) { Debug.LogError("[bw_audio] bwa_create failed"); return; }   // Instance NOT claimed
 
             // The layout resolves inside bwa_create, so the channel count is known before start — and it is
-            // the LAYOUT's speaker count, not a constant. A FAILED load is NOT fatal: the engine falls back
-            // to the built-in 26-speaker grid and only records why in bwa_last_error (which bwa_create sets
-            // for nothing else). On a smaller rig that silently changes the count too, so every source would
-            // be panned over geometry that isn't the one in the room. Say so, loudly.
+            // the LAYOUT's speaker count, not a constant. A failed EXPLICIT load leaves bwa_create usable
+            // on the default 26-grid, but bwa_start then REFUSES the session with BWA_ERR_LAYOUT — only an
+            // empty Layout File (layout_path = NULL) runs the default grid. bwa_last_error carries the load
+            // failure (bwa_create sets it for nothing else), so report it HERE, where the message can name
+            // the layout file and the fix, instead of letting the start failure below say only "layout".
             _channels = Bwa.bwa_get_channel_count(_eng);
             var loadErr = Bwa.LastError(_eng);
             if (loadErr != null)
-                Debug.LogError($"[bw_audio] layout '{cfg.layoutPath}' did not load — the engine fell back to " +
-                               $"its default {_channels}-speaker grid: {loadErr}");
+                Debug.LogError($"[bw_audio] layout '{cfg.layoutPath}' did not load — bwa_start will REFUSE " +
+                               $"to run this session (BWA_ERR_LAYOUT). Fix the file, or clear 'Layout File' " +
+                               $"to run the built-in default {_channels}-speaker grid deliberately. " +
+                               $"Reason: {loadErr}");
 
             ApplyLoadTimeSettings();
             SetupScene();   // acoustic geometry + optional room box -> the engine's scene (load-time)
@@ -583,7 +605,8 @@ namespace BwAudio
         float[] _levels;
 
         /// <summary>Speaker positions in ROOM space (3 floats each, in channel order) — the geometry the
-        /// engine is actually panning with (the loaded layout, or the default grid it fell back to). The
+        /// engine is actually panning with (the loaded layout, or the default grid when Layout File is
+        /// empty). The
         /// layout is fixed for the engine's lifetime, so this is read once and cached; the array is
         /// reused, so don't mutate it.</summary>
         public float[] SpeakerPositions()

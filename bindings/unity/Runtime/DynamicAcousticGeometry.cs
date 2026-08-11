@@ -32,8 +32,16 @@ namespace BwAudio
         public bool alwaysDrawGizmo = true;
 
         int _handle = -1;
+        Engine _owner;                         // the Engine this mesh was registered under
         Vector3 _lastPos;
         Quaternion _lastRot;
+
+        // Valid only while the REGISTERING Engine is still the live instance (SourceBase's guard,
+        // same reason but sharper: the dynamic-mesh handle is a plain index with NO generation, so
+        // on a destroyed+recreated Engine a stale handle silently addresses a FOREIGN mesh —
+        // RemoveDynamicMesh(0) would remove whatever registered first under the successor). Owner
+        // gone -> null, every op no-ops, and a disable/enable re-registers under the new engine.
+        Engine Owner => _owner != null && ReferenceEquals(Engine.Instance, _owner) ? _owner : null;
 
         /// <summary>The mesh that will be contributed (override, else the MeshFilter), or null.</summary>
         public Mesh ResolveMesh()
@@ -60,14 +68,14 @@ namespace BwAudio
             var mesh = ResolveMesh();
             if (mesh == null) { Debug.LogWarning("[bw_audio] DynamicAcousticGeometry with no mesh: " + name); return true; }  // stop retrying
             _handle = eng.AddDynamicMesh(mesh, transform, material);
-            if (_handle >= 0) { _lastPos = transform.position; _lastRot = transform.rotation; }
+            if (_handle >= 0) { _owner = eng; _lastPos = transform.position; _lastRot = transform.rotation; }
             return true;
         }
 
         void Update()
         {
             if (_handle < 0) return;
-            var eng = Engine.Instance;
+            var eng = Owner;                     // stale owner -> no-op: never push into a successor
             if (eng == null) return;
             if (Vector3.Distance(transform.position, _lastPos) <= positionEpsilon &&
                 Quaternion.Angle(transform.rotation, _lastRot) <= angleEpsilon) return;
@@ -77,8 +85,11 @@ namespace BwAudio
 
         void OnDisable()
         {
-            if (_handle >= 0 && Engine.Instance != null) Engine.Instance.RemoveDynamicMesh(_handle);
+            var eng = Owner;                     // owner gone -> the mesh died with its engine:
+            if (_handle >= 0 && eng != null)     // never remove a successor's mesh by index
+                eng.RemoveDynamicMesh(_handle);
             _handle = -1;
+            _owner = null;
         }
 
         void OnDrawGizmos()         { if (alwaysDrawGizmo) DrawGizmo(new Color(1f, 0.6f, 0.2f, 0.25f)); }

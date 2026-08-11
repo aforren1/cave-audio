@@ -70,8 +70,9 @@ namespace BwAudio.EditorTools
             }
         }
 
-        // Everything here is a mistake the engine survives — it logs and carries on — which is exactly
-        // why it is worth catching in the inspector, where you can still see it.
+        // Mistakes worth catching in the inspector, where you can still see them. Most the engine
+        // survives with a log; the missing layout is the exception — bwa_start refuses it outright
+        // (BWA_ERR_LAYOUT), so that one draws as an Error.
         static void DrawProblems(Engine a)
         {
             if (!string.IsNullOrEmpty(a.layoutFile))
@@ -80,10 +81,11 @@ namespace BwAudio.EditorTools
                 if (!File.Exists(full))
                     EditorGUILayout.HelpBox(
                         "Speaker layout not found. The engine will look for it here:\n\n" + full +
-                        "\n\nCreate the Assets/StreamingAssets folder and put the layout there (the field " +
-                        "is a path relative to it). Without it the engine does NOT stop — it falls back " +
-                        "to its built-in 26-speaker grid, so a smaller rig would be panned over geometry " +
-                        "that isn't the one in your room.", MessageType.Warning);
+                        "\n\nAn explicit layout MUST load: bwa_start refuses a failed load with " +
+                        "BWA_ERR_LAYOUT, so this scene will start with NO AUDIO. Create the " +
+                        "Assets/StreamingAssets folder and put the layout there (the field is a path " +
+                        "relative to it) — or clear the field to run the engine's built-in default " +
+                        "26-speaker grid deliberately.", MessageType.Error);
             }
 
             if (a.enableReflections && a.enableFdnReverb)

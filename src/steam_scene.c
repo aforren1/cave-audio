@@ -148,23 +148,43 @@ static void mesh_mark_applied(SteamScene* s, uint32_t gen) {
     LeaveCriticalSection(&s->lock);
 }
 
+/* (either applier, called UNDER the exclusive scene lock) TRUE when a mesh of this generation or
+ * newer already committed. Two appliers claim staged meshes independently (the sim thread's tick
+ * and steam_scene_flush), and a PREEMPTED sim thread could otherwise commit OLD geometry over the
+ * flush's newer commit — after the bakes traced the new one. Race-free because every commit marks
+ * its generation before releasing the scene lock (scene_w_lock -> s->lock nesting is the
+ * established order here; see reconcile_dynamic's live_ack updates). */
+static int mesh_gen_stale(SteamScene* s, uint32_t gen) {
+    EnterCriticalSection(&s->lock);
+    int stale = (int32_t)(gen - s->mesh_gen_applied) <= 0;
+    LeaveCriticalSection(&s->lock);
+    return stale;
+}
+
 /* (sim thread) Drop the committed static mesh and commit the now-empty scene. Same lock discipline as
  * apply_mesh. This is what an explicit clear resolves to; without it the only way to "remove" geometry
  * was to replace it with something harmless, and a caller really did ship a degenerate triangle parked
  * far off-scene to fake it. */
 static void clear_mesh(SteamScene* s, uint32_t gen) {
     scene_w_lock(s);
+    if (mesh_gen_stale(s, gen)) { scene_w_unlock(s); return; }   /* a newer commit already landed */
     if (s->mesh) { iplStaticMeshRemove(s->mesh, s->scene); iplStaticMeshRelease(&s->mesh); s->mesh = NULL; }
     free(s->mesh_verts); free(s->mesh_tris); free(s->mesh_mi); free(s->mesh_mats);
     s->mesh_verts = NULL; s->mesh_tris = NULL; s->mesh_mi = NULL; s->mesh_mats = NULL;
     iplSceneCommit(s->scene);
+    mesh_mark_applied(s, gen);     /* under the scene lock: commit + mark are one ordered event */
     scene_w_unlock(s);
-    mesh_mark_applied(s, gen);
 }
 
 static void apply_mesh(SteamScene* s, IPLVector3* verts, int nverts, IPLTriangle* tris, int ntris,
                        IPLMaterial* mats, int nmat, IPLint32* tri_mat, uint32_t gen) {
     scene_w_lock(s);
+    if (mesh_gen_stale(s, gen)) {  /* a newer commit already landed: dropping this one keeps
+                                    * generation order (a preempted sim tick vs steam_scene_flush) */
+        scene_w_unlock(s);
+        free(verts); free(tris); free(mats); free(tri_mat);
+        return;
+    }
     if (s->mesh) { iplStaticMeshRemove(s->mesh, s->scene); iplStaticMeshRelease(&s->mesh); s->mesh = NULL; }
     free(s->mesh_verts); free(s->mesh_tris); free(s->mesh_mi); free(s->mesh_mats);
     s->mesh_verts = verts; s->mesh_tris = tris; s->mesh_mi = tri_mat; s->mesh_mats = mats;
@@ -176,8 +196,9 @@ static void apply_mesh(SteamScene* s, IPLVector3* verts, int nverts, IPLTriangle
         iplStaticMeshAdd(s->mesh, s->scene);
         iplSceneCommit(s->scene);
     }
+    mesh_mark_applied(s, gen);     /* under the scene lock, after the commit: flush's wait means
+                                    * COMMITTED, and no older applier can slip in past the mark */
     scene_w_unlock(s);
-    mesh_mark_applied(s, gen);     /* after the commit: flush's wait means COMMITTED */
 }
 
 /* (sim thread) Build slot d's sub-scene + mesh + instance and ADD the instance to the main scene
@@ -324,15 +345,25 @@ static DWORD WINAPI sim_thread(LPVOID arg) {
             s->pend_verts = NULL; s->pend_tris = NULL;     /* ownership moves to the sim thread */
             s->pend_mats = NULL; s->pend_tri_mat = NULL;
         }
-        for (uint32_t i = 0; i < cap; ++i) {
-            snap_h[i]    = s->shadow[i].handle;
-            snap_feat[i] = s->shadow[i].features;
-            snap_dw[i]   = s->shadow[i].dir_weight;
-            snap_dp[i]   = s->shadow[i].dir_power;
-            snap_p[i*3+0]   = s->shadow[i].pos[0]; snap_p[i*3+1]   = s->shadow[i].pos[1]; snap_p[i*3+2]   = s->shadow[i].pos[2];
-            snap_fwd[i*3+0] = s->shadow[i].fwd[0]; snap_fwd[i*3+1] = s->shadow[i].fwd[1]; snap_fwd[i*3+2] = s->shadow[i].fwd[2];
-        }
         LeaveCriticalSection(&s->lock);
+        /* Chunked snapshot: this thread runs BELOW_NORMAL, so holding the CS across the whole
+         * shadow while preempted stalls the control thread's per-frame set_pos (a priority
+         * inversion measured as a frame hitch on a loaded machine). Each SLOT is still copied
+         * whole under the lock (no torn pos/fwd); cross-chunk skew between slots is harmless —
+         * everything republishes at SIM_HZ and the audio thread ramps every output. */
+        for (uint32_t i0 = 0; i0 < cap; i0 += 32) {
+            uint32_t i1 = i0 + 32 < cap ? i0 + 32 : cap;
+            EnterCriticalSection(&s->lock);
+            for (uint32_t i = i0; i < i1; ++i) {
+                snap_h[i]    = s->shadow[i].handle;
+                snap_feat[i] = s->shadow[i].features;
+                snap_dw[i]   = s->shadow[i].dir_weight;
+                snap_dp[i]   = s->shadow[i].dir_power;
+                snap_p[i*3+0]   = s->shadow[i].pos[0]; snap_p[i*3+1]   = s->shadow[i].pos[1]; snap_p[i*3+2]   = s->shadow[i].pos[2];
+                snap_fwd[i*3+0] = s->shadow[i].fwd[0]; snap_fwd[i*3+1] = s->shadow[i].fwd[1]; snap_fwd[i*3+2] = s->shadow[i].fwd[2];
+            }
+            LeaveCriticalSection(&s->lock);
+        }
 
         /* 2. apply geometry change: the static mesh, then reconcile the instanced movers. Both mutate +
          * commit the main scene under the exclusive scene lock (scene_w_lock/unlock). */

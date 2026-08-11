@@ -60,7 +60,8 @@ private:
 	float scattering = 0.05f;
 
 	bwa_material cached = 0;
-	int cached_generation = -1;
+	int cached_generation = -1; /* engine generation `cached` was minted on; -1 = never */
+	bool dirty = true; /* a coefficient/preset edit happened since the last mint */
 };
 
 } // namespace godot

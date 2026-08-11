@@ -18,6 +18,7 @@
  */
 #include "rt_test_util.h"
 #include "hole.h"        /* the hole-floor section derives its expected width straight from hole.c */
+#include "biquad.h"      /* the zero-band section pins the shared RBJ design's gain floor directly */
 
 /* ---- tracked listener alignment helpers (rt_set_tracked_align) ----------------------------------
  * The expected per-channel comp: (|spk - ref| - |spk - listener|) * rate / c, with the set's minimum
@@ -1953,6 +1954,82 @@ int main(void) {
             CHECK(fld && fabs(fld[0 * N + (N - 1)] - (a2 * 0.2820948 + 0.4)) < 5e-3,
                   "direct: the indirect field sums into the direct field");
             rt_destroy(c3);
+        }
+    }
+
+    /* occlusion EQ at band gain EXACTLY 0: legal at the ABI ([0,1]), and the EQ_SLEW glide reaches
+     * exact 0 under the FTZ mode rt_render sets — which used to make the RBJ peak design divide by
+     * zero and emit NaN coefficients. The poison only appears once the glide has fully settled
+     * (>200 blocks), and the limiter scrubs NaN to silence, so this renders LONG with the limiter
+     * OFF and asserts the raw bus stays finite. */
+    {
+        RtCore* cz = rt_create(8, 4, RATE, CH);
+        CHECK(cz != NULL, "rt_create (eq zero band)");
+        if (cz) {
+            rt_set_limiter(cz, 0);                       /* the limiter must not mask NaN as silence */
+            uint32_t sz = rt_load_sound(cz, WAV, err, sizeof err);
+            uint32_t vz = rt_source_create(cz);
+            rt_source_play(cz, vz, sz, true);
+            set_pos_spk(cz, vz, 3);
+            const float zero_band[3] = { 1.f, 0.f, 1.f };   /* band 1 = the PEAK section: A=0 is the
+                                                             * Inf*0=NaN design (the shelves only
+                                                             * degrade to a marginal double pole) */
+            rt_set_occlusion_eq(cz, vz, 1.0f, zero_band);
+            rt_commit(cz);
+            bwa_timestamp tz = { 0, 0 };
+            int finite = 1;
+            for (int b = 0; b < 400 && finite; ++b) {    /* well past the glide landing on exact 0 */
+                rt_render(cz, bus, N, &tz);
+                for (int i = 0; i < CH * N; ++i) if (!isfinite(bus[i])) { finite = 0; break; }
+            }
+            CHECK(finite, "a 0 band gain never reaches the biquad design (bus stays finite, limiter off)");
+            CHECK(total_energy() > 0.0, "the floored band still renders the voice (not silenced)");
+            rt_destroy(cz);
+        }
+        /* Unit pin: gain 0 into the shared RBJ design (the PEAK variant) must yield finite
+         * coefficients — alpha/A at A=0 is Inf and the a0-normalize is Inf*0 = NaN. The render
+         * above cannot pin this on every toolchain: whether the live glide REACHES exact 0 under
+         * FTZ is codegen-dependent (an FMA-contracted build flushes to 0; plain mul/add stalls at
+         * FLT_MIN), so the design-time floor gets its own deterministic check. */
+        {
+            float co[5];
+            bwa_biquad_rbj(BWA_BIQUAD_PEAK, cos(0.33), sin(0.33) / (2.0 * 0.707), 0.0, co);
+            int fin = 1;
+            for (int k = 0; k < 5; ++k) if (!isfinite(co[k])) fin = 0;
+            CHECK(fin, "RBJ peak design at gain 0 stays finite (the A floor)");
+        }
+    }
+
+    /* rt_set_pathing fence: the sim thread is the untrusted producer here (same contract as
+     * rt_set_direct). NaN/Inf shCoeffs must cleanse to 0, finite-but-absurd ones must cap at
+     * BWA_MAX_GAIN, and a NaN/0 EQ band must not reach the biquad design. */
+    {
+        RtCore* cf = rt_create(8, 4, RATE, CH);
+        CHECK(cf != NULL, "rt_create (path fence)");
+        if (cf) {
+            rt_set_limiter(cf, 0);
+            uint32_t sf = rt_load_sound(cf, WAV, err, sizeof err);
+            uint32_t vf = rt_source_create(cf);
+            rt_source_play(cf, vf, sf, true);
+            set_pos_spk(cf, vf, 2);
+            rt_set_path_tap(cf, test_path_tap, NULL, 4);
+            rt_source_set_pathing(cf, vf, true);
+            const float bad_sh[4] = { NAN, INFINITY, 3e38f, 0.5f };
+            const float bad_eq[3] = { NAN, 0.f, 1.f };
+            rt_set_pathing(cf, vf, bad_sh, bad_eq, 4);
+            rt_commit(cf);
+            bwa_timestamp tf = { 0, 0 };
+            int finite = 1;
+            for (int b = 0; b < 32 && finite; ++b) {     /* settle the sh ramp + the EQ glide */
+                rt_render(cf, bus, N, &tf);
+                for (int i = 0; i < CH * N; ++i) if (!isfinite(bus[i])) { finite = 0; break; }
+            }
+            CHECK(finite, "NaN/Inf/absurd path publish never reaches the bus non-finite");
+            int cap_ok = 1;
+            for (int k = 0; k < 4; ++k)
+                if (!isfinite(g_path_cap[k]) || fabsf(g_path_cap[k]) > BWA_MAX_GAIN * 1.01f) cap_ok = 0;
+            CHECK(cap_ok, "published shCoeffs land cleansed (NaN/Inf -> 0) and magnitude-capped");
+            rt_destroy(cf);
         }
     }
 

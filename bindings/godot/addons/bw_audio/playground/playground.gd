@@ -241,10 +241,10 @@ func switch_scene(idx: int) -> void:
 	refl.gain = 0.0
 	source.occlusion = false
 	source.set_directivity_preset(BwaSource.DIR_OMNI)
-	# Room identity, not Godot identity: set_orientation is the facing seam, so a Godot
-	# identity would land the source facing room -Z. Inaudible while OMNI, but a reset should
-	# reset - the half-turn is what maps back to the room's own identity.
-	source.set_orientation(Quaternion(Vector3.UP, PI))
+	# set_orientation takes a node-space orientation (the binding converts through the
+	# facing seam), so identity here is the same aim an untouched node carries - the
+	# honest reset. Inaudible while OMNI, but a reset should reset.
+	source.set_orientation(Quaternion.IDENTITY)
 	source.doppler = false
 	source.air_absorption = false
 	source.spread = 0.0

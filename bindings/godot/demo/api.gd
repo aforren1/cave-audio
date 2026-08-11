@@ -61,12 +61,14 @@ func _ready() -> void:
 
 	_test_statics()
 	_test_engine_knobs()
+	await _test_directivity_aim()   # BEFORE any scene exists - see the function comment
 	_test_materials_and_scene()
 	_test_render_block()
 	await _test_emitter()
 	await _test_push_source()
 	await _test_bed()
 	await _test_clock()
+	await _test_teardown_order()   # LAST: it frees the engine node
 	_finish()
 
 
@@ -307,6 +309,59 @@ func _test_emitter() -> void:
 		"a 1 s clip should be about one sample rate long, got %d" % frames)
 
 
+## set_orientation must land the audible dipole on the NODE's facing (its -Z), through the
+## same seam push_frame uses - not on the raw quaternion's room reading, which is a silent
+## half-turn. A dedicated source keeps this away from _test_emitter's manual-occlusion
+## publish, which takes over the directivity readback for that voice.
+##
+## Runs BEFORE _test_materials_and_scene so no authored geometry muddies the reading. The
+## readback is POLLED, not sampled: in a Steam Audio build the sim owns directivity and
+## publishes on its own wall-clock tick (which no fixed number of pumped blocks can wait
+## out on the manual sink); without the SDK the rt dipole needs a rendered block. The
+## polling loop covers both, and the timeout turns "never converges" into a failure.
+func _test_directivity_aim() -> void:
+	var clip := Tone.write_ping("api_dir", 330.0, 1.0)
+	var dir_src := BwaEmitter.new()
+	dir_src.autoplay = false
+	dir_src.loop = true                    # outlive the polling below regardless of sink pace
+	dir_src.position = Vector3(0, 0, -2)   # listener at the origin; source 2 m out on -Z
+	add_child(dir_src)
+	dir_src.play_clip(clip)
+	dir_src.set_directivity_preset(BwaSource.DIR_CARDIOID)
+	# TWO frame awaits: process_frame fires BEFORE node processing, so one await resumes
+	# with the engine's push+commit not yet run this frame - fatal on the manual sink,
+	# where nothing else advances the frame and the voice would render at the origin.
+	await get_tree().process_frame
+	await get_tree().process_frame         # the engine pushed the position and committed
+
+	# Node identity faces Godot -Z: dead away from the listener, a cardioid's near-null.
+	dir_src.set_orientation(Quaternion.IDENTITY)
+	var away := await _wait_directivity(dir_src, 0.2, true)
+	# The about-face aims the node's -Z at the listener: the cardioid's on-axis 1.
+	dir_src.set_orientation(Quaternion(Vector3.UP, PI))
+	var toward := await _wait_directivity(dir_src, 0.8, false)
+	_check(away < 0.2, "a cardioid facing away from the listener should be near its null, got %f" % away)
+	_check(toward > 0.8, "a cardioid facing the listener should be near on-axis, got %f" % toward)
+	dir_src.free()
+
+
+## Poll the directivity readback until it crosses `bound` (below it when `want_low`), or
+## give up after 3 s and return the last reading for the assertion to report.
+func _wait_directivity(src: BwaSource, bound: float, want_low: bool) -> float:
+	var g: float = src.get_directivity_gain()
+	var waited := 0.0
+	while waited < 3.0:
+		if (want_low and g < bound) or (not want_low and g > bound):
+			break
+		await get_tree().create_timer(0.05).timeout
+		if _manual:
+			for i in 2:
+				engine.render_block()   # commands and ramps only advance with blocks here
+		waited += 0.05
+		g = src.get_directivity_gain()
+	return g
+
+
 func _test_push_source() -> void:
 	var space := pusher.push_space()
 	_check(space > 0, "a fresh push source should have ring space, got %d" % space)
@@ -349,6 +404,16 @@ func _test_bed() -> void:
 	bed.set_yaw_from_basis(Basis(Vector3.UP, PI / 2))
 	_check(is_equal_approx(bed.get_orientation().x, -PI / 2),
 		"set_yaw_from_basis should go through the seam, got %f" % bed.get_orientation().x)
+
+	# Metadata answers for the asset as LOADED: the field is cached as an ambisonic bed, so
+	# its real channel count comes back - not a hidden second MONO decode's 1, which is what
+	# a load-as-side-effect getter produced. And a getter must not load: a path this engine
+	# never touched reports 0, it does not silently decode a file.
+	_check(engine.sound_get_channels(field) == 4,
+		"an order-1 bed should report 4 channels, got %d" % engine.sound_get_channels(field))
+	_check(engine.sound_get_frames(field) > 0, "a loaded bed should report its length")
+	_check(engine.sound_get_channels("user://never_loaded.wav") == 0,
+		"metadata getters must not decode uncached paths as a side effect")
 
 	bed.fade_to(0.5, 0.1)
 	bed.seek_frames(1000)
@@ -411,6 +476,39 @@ func _test_clock() -> void:
 	_check(engine.get_output_latency_seconds() == 0.0, "no device means no latency in seconds either")
 	_check(not engine.has_method("get_output_latency"),
 		"the unit-ambiguous name must stay gone - it read as Godot's seconds-valued call")
+
+
+## Both teardown orders, for every class holding a BwaEngine back-pointer. A client freed
+## BEFORE the engine must leave its registry (or the engine's own teardown walks a freed
+## child); the engine freed FIRST must detach every survivor (or the survivor's next call
+## - a bed setter, a speaker view's _process tick - is a heap use-after-free). Runs last:
+## the engine node does not come back.
+func _test_teardown_order() -> void:
+	var view_first := BwaSpeakerView.new()
+	add_child(view_first)
+	view_first.free()          # child-first: the registry must forget it before the engine dies
+
+	var view := BwaSpeakerView.new()
+	add_child(view)
+	var geo := BwaDynamicGeometry.new()
+	geo.mesh = BoxMesh.new()
+	add_child(geo)
+
+	engine.free()              # engine-first: emitter, pusher, bed, view, geo all outlive it
+
+	bed.set_gain(0.5)          # every survivor must take calls as a quiet no-op now
+	bed.stop()
+	_check(not bed.is_playing(), "a bed with no engine cannot be playing")
+	emitter.set_gain(0.5)
+	emitter.stop()
+	# Let the tree tick the survivors' _process with the engine gone - the exact frame
+	# that dereferenced the freed engine node before the detach protocol covered them.
+	await get_tree().process_frame
+	await get_tree().process_frame
+	_check(view.get_speaker_count() >= 0, "a detached view still answers its counts")
+	_check(not geo.is_attached(), "a mover with no engine cannot stay attached")
+	view.free()
+	geo.free()
 
 
 ## Advance the engine by at least n blocks.

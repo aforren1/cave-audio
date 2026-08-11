@@ -297,6 +297,17 @@ int calib_write_room_eq(const char* in_path, const char* out_path,
     if (!cJSON_IsArray(speakers)) FAIL("calib: layout has no 'speakers' array");
     if (cJSON_GetArraySize(speakers) != n) FAIL("calib: speaker count does not match the measurements");
 
+    /* same refusal as the trims writer (calib_write_layout): a NaN fit serializes as JSON `null`,
+     * and out_path usually IS the layout — the write would destroy the good calibration in place */
+    for (int i = 0; i < n; ++i) {
+        int m = counts[i]; if (m > max_sections) m = max_sections;
+        for (int s = 0; s < m; ++s) {
+            const MeasureEqSection* c = &cuts[(size_t)i * max_sections + s];
+            if (!isfinite(c->fc) || !isfinite(c->gain_db) || !isfinite(c->q))
+                FAIL("calib: refusing to write a non-finite room-EQ section (bad measurement?)");
+        }
+    }
+
     for (int i = 0; i < n; ++i) {
         cJSON* sp = cJSON_GetArrayItem(speakers, i);
         cJSON_DeleteItemFromObjectCaseSensitive(sp, "room_eq");   /* replace any prior */
@@ -425,6 +436,20 @@ int calib_write_room_eq_grid(const char* in_path, const char* out_path, const fl
     cJSON* speakers = cJSON_GetObjectItemCaseSensitive(root, "speakers");
     if (!cJSON_IsArray(speakers)) FAIL("calib: layout has no 'speakers' array");
     if (cJSON_GetArraySize(speakers) != n) FAIL("calib: speaker count does not match the measurements");
+
+    /* same refusal as the trims writer: the schema clamps below are two-sided compares that PASS
+     * NaN, so a NaN fit would serialize as JSON `null` and destroy the layout in place */
+    if (!isfinite(mic[0]) || !isfinite(mic[1]) || !isfinite(mic[2]))
+        FAIL("calib: refusing to write a non-finite mic position");
+    for (int s = 0; s < n; ++s) {
+        int m = counts[s] > BWA_ROOM_EQ_MAX ? BWA_ROOM_EQ_MAX : counts[s];
+        if (m > max_sections) m = max_sections;
+        for (int t = 0; t < m; ++t) {
+            const MeasureEqSection* c = &cuts[(size_t)s * max_sections + t];
+            if (!isfinite(c->fc) || !isfinite(c->gain_db) || !isfinite(c->q))
+                FAIL("calib: refusing to write a non-finite room-EQ section (bad measurement?)");
+        }
+    }
 
     all    = (MeasureEqSection*)calloc((size_t)BWA_RQ_GRID_MAX * n * BWA_ROOM_EQ_MAX, sizeof *all);
     acount = (int*)calloc((size_t)BWA_RQ_GRID_MAX * n, sizeof *acount);

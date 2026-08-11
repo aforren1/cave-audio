@@ -1282,6 +1282,13 @@ static void parser_abuse(void) {
               { "absurd Q",     "Filter 1: ON PK Fc 1000 Hz Gain 2.0 dB Q 3e8\n" },
               { "NaN Preamp",   "Preamp: nan dB\nFilter 1: ON PK Fc 1000 Hz Gain 2.0 dB Q 1.41\n" },
               { "absurd Preamp","Preamp: 400 dB\nFilter 1: ON PK Fc 1000 Hz Gain 2.0 dB Q 1.41\n" },
+              /* Q passes `q > 0` but designs a marginally-stable section whose ringing never decays */
+              { "marginal Q",   "Filter 1: ON PK Fc 1000 Hz Gain 2.0 dB Q 1e-9\n" },
+              /* each section is in range; the CASCADE composes to +60 dB (per-section bounds
+               * don't bound the composed response) */
+              { "composed boost", "Filter 1: ON PK Fc 500 Hz Gain 20.0 dB Q 1.41\n"
+                                  "Filter 2: ON PK Fc 1000 Hz Gain 20.0 dB Q 1.41\n"
+                                  "Filter 3: ON PK Fc 2000 Hz Gain 20.0 dB Q 1.41\n" },
           };
           for (size_t i = 0; i < sizeof bad / sizeof bad[0]; ++i) {
               CHECK(write_text_file(EQTXT, bad[i].text), "eq fixture write");

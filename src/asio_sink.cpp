@@ -88,6 +88,8 @@ inline uint64_t timestamp_ns(const ASIOTimeStamp& t){ return asio64(t.hi, t.lo);
 inline int32_t to_i32(float v) {
     if (v >=  1.0f) return  2147483647;
     if (v <= -1.0f) return -2147483647 - 1;
+    if (v != v)     return 0;       /* NaN (reachable with the limiter disabled): both clamps read
+                                     * false, and float->int out of range is UB. Silence, not a pop. */
     return (int32_t)(v * 2147483647.0f);
 }
 
@@ -124,6 +126,7 @@ void convert_out(void* dst, const float* src, long n, long type) {
         for (long i = 0; i < n; ++i) {
             float v = src[i];
             v = v >  1.0f ?  1.0f : (v < -1.0f ? -1.0f : v);
+            if (v != v) v = 0.0f;   /* NaN slips both clamp compares; float->int16 would be UB */
             d[i] = (int16_t)(v * 32767.0f);
         }
         break;

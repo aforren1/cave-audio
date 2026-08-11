@@ -4,6 +4,55 @@ All notable changes to `com.brainworks.bw_audio`.
 
 ## [Unreleased]
 
+### Fixed: the default speaker grid was unreachable, and the binding claimed a failed layout was survivable
+
+`Engine` always passed an explicit `layout_path`, so there was no way to express `layout_path = NULL`,
+the ABI's only route to the built-in default 26-speaker grid. An empty Layout File field produced the
+StreamingAssets *directory* as the path, which fails to load — and since the `BWA_ERR_LAYOUT` change
+`bwa_start` REFUSES a failed explicit layout. Concrete failure: a fresh project on the default
+Binaural profile without `StreamingAssets/cave_layout.json` got no audio while three pieces of binding
+text (the inspector tooltip, the startup log, the editor HelpBox) still described the old
+falls-back-and-carries-on contract.
+
+- **An empty Layout File now maps to `layout_path = NULL`** — the deliberate opt-in to the default
+  grid, exactly like the sibling `asioDriver` field's empty-to-null mapping.
+- All three texts now state the real contract: an explicit path must load, or `bwa_start` refuses
+  with `BWA_ERR_LAYOUT`. The startup error for a failed explicit load says what will happen (start
+  will refuse) and both fixes (fix the file, or clear the field); the editor HelpBox for a missing
+  layout file is an Error now, not a Warning, because the scene will start with no audio.
+
+### Added: startup ABI version check (`bwa_get_version`)
+
+`Bwa.cs` bound `bwa_get_version` and promised verification that never happened; only `bwa_tuning`
+had a `struct_size` guard. The exposure is the in-repo dev loop: a stale staged `bw_audio.dll` after
+an ABI break runs with mismatched enums and struct layouts — silent corruption, not a crash.
+`Bwa.BoundVersion` now records the header revision the bindings were written against (0.11.0), and
+`Engine.Awake` compares it against the DLL's before `bwa_create`: a **major.minor** mismatch logs
+both versions and refuses to start (the header guarantees enum values and struct layouts only within
+a major.minor); a patch difference is compatible and passes silently.
+
+### Fixed: stale handles could reach a successor engine (`AmbisonicBed`, `DynamicAcousticGeometry`)
+
+`SourceBase` already refused to let a handle minted under a destroyed `Engine` act on a replacement
+(a fresh engine's first handle is slot 0, gen 1 again — deterministic collision), but the bed and
+dynamic-mesh components lacked the guard: a stale bed handle would drive (or in `OnDisable`
+*destroy*) whatever occupied the colliding slot in a successor engine, and the dynamic-mesh handle
+is a plain index with no generation at all, so `RemoveDynamicMesh(0)` removed a foreign mesh. Both
+components now carry `SourceBase`'s `_owner` pattern: once the creating engine is gone, every
+operation (the destroy paths included) no-ops, and the next enable re-creates under the new engine.
+
+### Fixed: `Bwa.cs` is 1:1 with the header again (two bindings were missing)
+
+The completeness claim ("every `BWA_API` function except `bwa_set_output_capture` and
+`bwa_render_block`") had drifted false by two: `bwa_spcap_focus_default` and `bwa_bed_gains_batch`
+were unbound. Both are pure, engine-free evaluators with the same marshaling shape as the already
+bound `bwa_panner_gains_batch`, so they are bound now and the claim is true as written.
+
+### Added: `SourceBase.AirAbsorption` live property
+
+The `airAbsorption` field as a live property, pushed like `Spread`/`SizeMeters`; setting the field
+alone changed nothing until the next re-enable.
+
 ### Added: compensated amplitude panning (`bwa_set_dual_band_cap`)
 
 Dual-band's low band aims the velocity vector at the source and takes whatever `|rV| < 1` the speaker

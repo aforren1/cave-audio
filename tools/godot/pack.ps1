@@ -166,11 +166,12 @@ commit $commit
 
 Install: copy addons/bw_audio/ into your Godot project, then enable nothing - a GDExtension
 loads on project open. Restart the editor after copying. To hear it work, open
-addons/bw_audio/playground/playground.tscn and press play (seven by-ear scenes; falls back
+addons/bw_audio/playground/playground.tscn and press play (eight by-ear scenes; falls back
 to silent visual-only mode without an ASIO device).
 
-Requires Godot 4.4 or newer (compatibility_minimum in the manifest); built and tested against
-4.7. The extension is Windows x64 only, because the engine's device path is ASIO.
+Requires Godot 4.7 or newer: compatibility_minimum in the manifest now matches the 4.7
+extension API the binary is compiled against (earlier packs understated it as 4.4). The
+extension is Windows x64 only, because the engine's device path is ASIO.
 
 Licensed GPLv3 (see LICENSE). Complete corresponding source: this repo at the commit above.
 "@ | Set-Content -Path (Join-Path $dest 'DIST.txt') -Encoding ascii

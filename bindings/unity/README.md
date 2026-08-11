@@ -153,7 +153,8 @@ Assets/
   `bwa_last_error`, and then `bwa_start` refuses that fallback with `BWA_ERR_LAYOUT`. So a bad layout
   does not mis-render, it stops the session. `Engine` logs an error at startup if this happens. The
   inspector also warns before you ever hit Play, and shows the exact absolute path the engine will
-  look in.
+  look in. To run the built-in default grid deliberately (headphone-only development, no surveyed
+  rig yet), leave the `Engine` component's Layout File field **empty**.
 - `constraints.json` *(optional)* - the surveyed **room**: the speaker truss, the CAVE screen cube, the
   projectors. Add a **`RoomConstraints`** component and it draws them in the scene view: green truss,
   red keep-out, orange obstacles. Place content against the real room instead of guessing. It's the

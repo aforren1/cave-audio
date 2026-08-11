@@ -24,6 +24,8 @@ int hpeq_parse(const char* path, uint32_t sample_rate, HpEqDesign* d, char* err,
     }
     char line[256];
     int lineno = 0;
+    float preamp_db = 0.f;
+    float boost_db  = 0.f;      /* sum of positive section gains: the composed worst-case boost */
     while (fgets(line, sizeof line, f)) {
         ++lineno;
         s_upper(line);
@@ -37,6 +39,7 @@ int hpeq_parse(const char* path, uint32_t sample_rate, HpEqDesign* d, char* err,
                     s_err(err, errcap, "Preamp out of range [-120, 60] dB", lineno);
                     fclose(f); return 0;
                 }
+                preamp_db = db;
                 d->preamp = powf(10.0f, db / 20.0f);
             }
             continue;
@@ -62,11 +65,15 @@ int hpeq_parse(const char* path, uint32_t sample_rate, HpEqDesign* d, char* err,
         else { s_err(err, errcap, "unknown filter type", lineno); fclose(f); return 0; }
         /* negated compares so a NaN Fc/Q/gain is rejected, not passed ("NAN" parses; a NaN slips
          * `fc <= 0.f` because every NaN comparison is false and would poison the biquad state for
-         * the session). The gain bound also stops a finite-but-absurd dB from overflowing the
-         * coefficients to Inf — same class as BWA_MAX_GAIN (rt.h). */
-        if (!(fc > 0.f) || !(q > 0.f)) { s_err(err, errcap, "non-positive Fc/Q", lineno); fclose(f); return 0; }
-        if (!(q <= 256.f))             { s_err(err, errcap, "Q out of range (0, 256]", lineno); fclose(f); return 0; }
-        if (!(gain >= -60.f && gain <= 60.f)) { s_err(err, errcap, "Gain out of range [-60, 60] dB", lineno); fclose(f); return 0; }
+         * the session). The bounds also stop finite-but-absurd values — same class as BWA_MAX_GAIN
+         * (rt.h): a near-zero Q designs a marginally-stable section whose ringing never decays, and
+         * stacked large gains compose to an overflow the DF-I state then holds forever. The ranges
+         * cover real AutoEq output with wide margin (its default caps gain at +-12 dB; Q stays
+         * within roughly 0.3..10, shelves near 0.7). */
+        if (!(fc > 0.f))                     { s_err(err, errcap, "non-positive Fc", lineno); fclose(f); return 0; }
+        if (!(q >= 0.1f && q <= 20.f))       { s_err(err, errcap, "Q out of range [0.1, 20]", lineno); fclose(f); return 0; }
+        if (!(gain >= -24.f && gain <= 24.f)) { s_err(err, errcap, "Gain out of range [-24, 24] dB", lineno); fclose(f); return 0; }
+        if (gain > 0.f) boost_db += gain;                    /* worst-case composed boost (see below) */
         if (fc >= 0.49f * (float)sample_rate) continue;      /* at/above Nyquist: skip (header; also catches Inf) */
         if (d->nsec >= BWA_HPEQ_MAX_SEC) {
             s_err(err, errcap, "too many filters", lineno);
@@ -79,6 +86,16 @@ int hpeq_parse(const char* path, uint32_t sample_rate, HpEqDesign* d, char* err,
     if (d->nsec == 0) {                                      /* nothing parsed (a preamp alone is
                                                               * not a correction): wrong file */
         if (err && errcap) snprintf(err, errcap, "headphone EQ: no filters in %s", path);
+        return 0;
+    }
+    /* Per-section bounds do not bound the CASCADE: sections in range individually can still
+     * compose to an absurd total boost that overflows the float path downstream. The metric is
+     * the worst case (every boost overlapping), so the bound is generous: a real AutoEq
+     * correction's preamp compensates its boosts and composes near 0 dB. */
+    if (preamp_db + boost_db > 40.f) {
+        if (err && errcap)
+            snprintf(err, errcap, "headphone EQ: worst-case composed boost %+.1f dB exceeds +40 dB (not a correction file?)",
+                     (double)(preamp_db + boost_db));
         return 0;
     }
     return 1;

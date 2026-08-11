@@ -377,8 +377,17 @@ namespace BwAudio
         // The engine's active channel count = the layout's speaker count (4..26). Size meter/speaker
         // arrays with this; never hard-code 26 (that is only the compile-time capacity).
         [DllImport(DLL, CallingConvention = CC)] public static extern uint bwa_get_channel_count(IntPtr e);
-        // The DLL's packed BWA_VERSION (major<<16 | minor<<8 | patch) — verify against the bound header rev.
+        // The DLL's packed BWA_VERSION (major<<16 | minor<<8 | patch). Engine.Awake compares it against
+        // BoundVersion below and refuses to start on a major.minor mismatch.
         [DllImport(DLL, CallingConvention = CC)] public static extern uint bwa_get_version();
+        // The BWA_VERSION these bindings were written against (bw_audio.h). The header guarantees enum
+        // values and struct layouts only WITHIN a major.minor, so a DLL with a different major.minor may
+        // marshal every struct in this file wrong — silent corruption, not a crash. Bump this alongside
+        // any re-sync with a header whose BWA_VERSION moved.
+        public const uint BoundVersion = (0u << 16) | (11u << 8) | 0u;   // 0.11.0
+
+        /// <summary>A packed BWA_VERSION as "major.minor.patch", for logs.</summary>
+        public static string VersionString(uint v) => (v >> 16) + "." + ((v >> 8) & 0xFF) + "." + (v & 0xFF);
         // Resolved engine config (zero-defaulted desc fields resolved at create) — derive seconds from these.
         [DllImport(DLL, CallingConvention = CC)] public static extern uint bwa_get_sample_rate(IntPtr e);
         [DllImport(DLL, CallingConvention = CC)] public static extern uint bwa_get_block_size(IntPtr e);
@@ -503,6 +512,15 @@ namespace BwAudio
         // focus/density are SPCAP's tuning knobs, same <= 0 = default sentinel as bwa_set_spcap_focus, and
         // inert under DBAP/VBAP. Pass 0, 0 to score at the focus this array's geometry derives.
         [DllImport(DLL, CallingConvention = CC)] public static extern uint bwa_panner_gains_batch(BwaPanner panner, float[] positions, uint n, float[] lis, float[] srcs, uint nsrc, float focus, float density, [Out] float[] outGains);
+        // The pure companion of bwa_set_spcap_focus (no engine handle): the focus its <= 0 sentinel
+        // reverts to, derived from n speaker positions (3 floats each) — so a tool can show what an
+        // in-progress layout implies before you override it. Returns 0 on bad arguments.
+        [DllImport(DLL, CallingConvention = CC)] public static extern float bwa_spcap_focus_default(float[] positions, uint n);
+        // The BED counterpart of the panner batch: per-speaker gains of the diffuse-bed decode (the
+        // engine's real AllRAD/EPAD builds, optional max-rE) for ndir plane-wave DIRECTIONS (unit
+        // vectors — a bed is content at infinity) over a layout of n speaker positions. outGains =
+        // ndir*n floats (gains may be negative — SH sidelobes); returns ndir. Pure and reentrant.
+        [DllImport(DLL, CallingConvention = CC)] public static extern uint bwa_bed_gains_batch(BwaBedDecoder decoder, [MarshalAs(UnmanagedType.I1)] bool maxRe, float[] positions, uint n, float[] dirs, uint ndir, [Out] float[] outGains);
 
         // ---- listener + frame boundary ----
         [DllImport(DLL, CallingConvention = CC)] public static extern void bwa_set_listener_pose(IntPtr e, float px, float py, float pz, float qx, float qy, float qz, float qw);

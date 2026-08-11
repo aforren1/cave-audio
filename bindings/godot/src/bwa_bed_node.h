@@ -15,12 +15,13 @@
 #include <godot_cpp/variant/vector3.hpp>
 
 #include "bw_audio.h"
+#include "bwa_client.h"
 
 namespace godot {
 
 class BwaEngine;
 
-class BwaBed : public Node {
+class BwaBed : public Node, public BwaEngineClient {
 	GDCLASS(BwaBed, Node)
 
 public:
@@ -72,6 +73,9 @@ public:
 	bool is_playing() const;
 	int64_t get_playhead_frames() const;
 	double get_playhead_seconds() const;
+
+	/* Called by BwaEngine on ITS teardown while this bed still lives (see bwa_client.h). */
+	void engine_gone() override;
 
 protected:
 	static void _bind_methods();

@@ -263,6 +263,15 @@ namespace BwAudio
             set { sizeMeters = value; if (Live) Bwa.bwa_source_set_size(Eng, _src, value); }
         }
 
+        /// <summary>Distance-driven HF low-pass (far sources sound duller) — the `airAbsorption` field
+        /// as a live property, pushed like Spread/SizeMeters; setting the field alone would change
+        /// nothing until the next re-enable.</summary>
+        public bool AirAbsorption
+        {
+            get => airAbsorption;
+            set { airAbsorption = value; if (Live) Bwa.bwa_source_set_air_absorption(Eng, _src, value); }
+        }
+
         /// <summary>Voice-steal priority (0 = expendable .. 255 = protected). A full voice pool steals the
         /// lowest-priority source rather than failing the new one.</summary>
         public int Priority

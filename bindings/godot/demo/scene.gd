@@ -103,10 +103,15 @@ func _test_materials() -> void:
 	custom.scattering = 0.3
 	var tc := custom.get_token(engine)
 	_check(tc != 0 and tc != t1, "a custom material should mint its own token")
-	# Editing the coefficients must invalidate the cache, or the resource keeps handing back
-	# a token describing the OLD material.
-	custom.absorption = Vector3(0.1, 0.1, 0.1)
-	_check(custom.get_token(engine) != tc, "editing a custom material should re-mint its token")
+	# Editing the coefficients must re-mint: the superseded token is RELEASED and the slot
+	# reused, so the token NUMBER may legitimately come back the same - what a stale cache
+	# could not survive is the volume test. The core's table is 64 slots; without the
+	# release, live-tuning leaks one slot per edit and mint 100 comes back 0.
+	for i in 100:
+		custom.scattering = 0.3 + 0.001 * i
+		if custom.get_token(engine) == 0:
+			_check(false, "edit %d exhausted the material table - releases are leaking" % i)
+			break
 
 
 func _test_geometry_merge() -> void:

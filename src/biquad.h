@@ -24,6 +24,13 @@ enum { BWA_BIQUAD_LOWSHELF = 0, BWA_BIQUAD_PEAK = 1, BWA_BIQUAD_HIGHSHELF = 2 };
  * rt.c precomputes cw0/alpha once per sample rate (fixed fc) so only A varies per update — the trig
  * stays off the hot path, which is why this takes them ready-made rather than deriving from fc/Q. */
 static inline void bwa_biquad_rbj(int type, double cw0, double alpha, double A, float out[5]) {
+    /* A = 0 (a fully-cut band) sends the peak design's alpha/A to Inf and the a0-normalize to
+     * Inf*0 = NaN, and parks the shelf variants on a marginally-stable double pole. Callers floor
+     * their band gains, but this helper is shared (rt.c, align.c, hpeq.c) and "the caller checked"
+     * is exactly the assumption that let the occlusion EQ ship a NaN generator — defend locally
+     * too. 1e-4 in A is a -80 dB gain, far below any legitimate design; a NaN A also lands here
+     * (every NaN comparison is false). */
+    if (!(A > 1e-4)) A = 1e-4;
     double b0, b1, b2, a0, a1, a2;
     if (type == BWA_BIQUAD_PEAK) {
         a0 = 1.0 + alpha / A; a1 = -2.0 * cw0;        a2 = 1.0 - alpha / A;

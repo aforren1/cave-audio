@@ -190,6 +190,12 @@ void BwaEngine::_exit_tree() {
 		s->engine_gone();
 	}
 	sources.clear();
+	/* Same protocol for the non-source clients (beds, speaker views, dynamic geometry) —
+	 * a bed setter or a speaker view's next _process tick is the identical use-after-free. */
+	for (BwaEngineClient *c : clients) {
+		c->engine_gone();
+	}
+	clients.clear();
 }
 
 /* --- static scene assembly --- */
@@ -426,13 +432,34 @@ void BwaEngine::unload_sound_path(const String &path) {
 	}
 }
 
+/* One path can be cached under several keys (memory / streamed / ambisonic); metadata must
+ * answer for whichever form was actually loaded, in the order a multi-role path would want:
+ * the point-source copies first, then the bed ones. */
+bwa_sound BwaEngine::find_loaded_sound(const String &path) const {
+	for (const String prefix : { String("m:"), String("s:"), String("a:"), String("f:") }) {
+		if (const bwa_sound *hit = sounds.getptr(prefix + path)) {
+			return *hit;
+		}
+	}
+	return 0;
+}
+
+/* CACHED-ONLY, deliberately (see the header): the old fallback decoded an uncached path as a
+ * hidden side effect - and decoded it MONO, so an ambisonic bed answered channels=1 forever
+ * and the ABI's 4/9/16 answers were unreachable through this getter. */
 int64_t BwaEngine::sound_get_frames(const String &path) {
-	const bwa_sound snd = load_sound(path, false);
+	if (!eng) {
+		return 0;
+	}
+	const bwa_sound snd = find_loaded_sound(path);
 	return snd ? (int64_t)bwa_sound_get_frames(eng, snd) : 0;
 }
 
 int BwaEngine::sound_get_channels(const String &path) {
-	const bwa_sound snd = load_sound(path, false);
+	if (!eng) {
+		return 0;
+	}
+	const bwa_sound snd = find_loaded_sound(path);
 	return snd ? (int)bwa_sound_get_channels(eng, snd) : 0;
 }
 
@@ -683,7 +710,10 @@ void BwaEngine::set_fdn_decay_dir(const Vector3 &v) {
 }
 
 Vector3 BwaEngine::get_fdn_decay_dir() const {
-	return Vector3(fdn.decay_dir[0], fdn.decay_dir[1], fdn.decay_dir[2]);
+	/* Inverted back through the registration so the PROPERTY round-trips exactly. The desc
+	 * stores room space; returning that raw meant every save/load under a rotated
+	 * registration re-applied the rotation and the direction drifted one step per cycle. */
+	return from_room_direction(Vector3(fdn.decay_dir[0], fdn.decay_dir[1], fdn.decay_dir[2]));
 }
 
 /* --- materials + scene geometry --- */
@@ -1012,6 +1042,24 @@ void BwaEngine::unregister_source(BwaSource *s) {
 	}
 }
 
+void BwaEngine::register_client(BwaEngineClient *c) {
+	for (BwaEngineClient *x : clients) {
+		if (x == c) {
+			return;
+		}
+	}
+	clients.push_back(c);
+}
+
+void BwaEngine::unregister_client(BwaEngineClient *c) {
+	for (size_t i = 0; i < clients.size(); i++) {
+		if (clients[i] == c) {
+			clients.erase(clients.begin() + (long)i);
+			return;
+		}
+	}
+}
+
 /* The settings that fail QUIETLY are the ones worth surfacing. None of these are errors to
  * the core — it starts, it renders, it just sounds wrong — so the scene tree's own warning
  * marker is the right place for them. */
@@ -1109,7 +1157,8 @@ void BwaEngine::_bind_methods() {
 	M(set_registration, "xform"); M0(get_registration);
 	M(to_room_position, "v"); M(to_room_direction, "v");
 	M(to_room_orientation, "basis"); M(to_room_yaw, "basis");
-	M(from_room_position, "v"); M(from_room_orientation, "quaternion");
+	M(from_room_position, "v"); M(from_room_direction, "v");
+	M(from_room_orientation, "quaternion");
 
 	M(set_listener, "path"); M0(get_listener);
 	M(set_feed_listener, "enabled"); M0(get_feed_listener);

@@ -31,7 +31,11 @@ void dbap_gains(const float src[3], const float lis[3], const Layout* L,
     float norm2 = 0.f;
     for (uint32_t k = 0; k < N; ++k) {
         const float* spk = L->speakers[k].pos;
-        float dk = sqrtf(dist2(src, spk) + r2);         /* blurred source->speaker distance */
+        float d2 = dist2(src, spk) + r2;                /* blurred source->speaker distance^2 */
+        if (d2 < 1e-8f) d2 = 1e-8f;                     /* layout floors rolloff_r, but a caller-built
+                                                         * Layout may not: 1/powf(0,a) is Inf, and one
+                                                         * Inf makes the whole normalized vector NaN */
+        float dk = sqrtf(d2);
         float g  = 1.f / powf(dk, a);                   /* proximity weight */
         if (have_dir) {
             float kx = spk[0] - lis[0], ky = spk[1] - lis[1], kz = spk[2] - lis[2];

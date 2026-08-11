@@ -96,10 +96,24 @@ $assets = @(
     'Runtime', 'Runtime/Plugins', 'Runtime/Plugins/x86_64', 'Editor',
     'Runtime/Plugins/x86_64/bw_audio.dll', 'Runtime/Plugins/x86_64/phonon.dll'
 )
+# RECURSE. An .asmdef governs its own folder and everything under it, so splitting the package into
+# assemblies (BwAudio, BwAudio.RigDay) necessarily means subfolders. A flat scan silently skips them,
+# and the assets ship with no .meta at all - which is the exact failure this script exists to prevent.
+# Folders need a .meta as much as files do: without one Unity regenerates the folder GUID per project
+# and every reference into it breaks. Anything with a '~' segment is Unity-invisible (Samples~), so it
+# neither ships as an asset nor wants a .meta.
 foreach ($dir in 'Runtime', 'Editor') {
-    Get-ChildItem (Join-Path $PackageDir $dir) -File |
+    $root = Join-Path $PackageDir $dir
+    $rel  = { $args[0].Substring($PackageDir.Length + 1).Replace([char]92, '/') }   # 92 = backslash
+    Get-ChildItem $root -Recurse -Directory |
+        ForEach-Object { & $rel $_.FullName } |
+        Where-Object { $_ -notmatch '~' } |
+        ForEach-Object { $assets += $_ }
+    Get-ChildItem $root -Recurse -File |
         Where-Object { $_.Extension -in '.cs', '.asmdef' } |
-        ForEach-Object { $assets += "$dir/$($_.Name)" }
+        ForEach-Object { & $rel $_.FullName } |
+        Where-Object { $_ -notmatch '~' } |
+        ForEach-Object { $assets += $_ }
 }
 
 $made = 0

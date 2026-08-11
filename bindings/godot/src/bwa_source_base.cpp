@@ -100,6 +100,23 @@ void BwaSource::apply_all() {
 	if (pathing) {
 		bwa_source_set_pathing(ENG, src, true);
 	}
+	if (occ_manual_set) {
+		if (occ_manual_banded) {
+			const float b[3] = { (float)occ_manual_bands.x, (float)occ_manual_bands.y,
+				(float)occ_manual_bands.z };
+			bwa_source_set_occlusion_manual(ENG, src, occ_manual_level, b);
+		} else {
+			bwa_source_set_occlusion_manual(ENG, src, occ_manual_level, nullptr);
+		}
+	}
+	if (dir_mode == DIRSET_CUSTOM) {
+		bwa_source_set_directivity(ENG, src, dir_weight, dir_power);
+	} else if (dir_mode == DIRSET_PRESET) {
+		bwa_source_set_directivity_preset(ENG, src, (bwa_directivity)dir_preset);
+	}
+	if (orientation_set) {
+		push_orientation(orientation_q);
+	}
 }
 
 PackedStringArray BwaSource::_get_configuration_warnings() const {
@@ -137,6 +154,13 @@ void BwaSource::push_frame() {
 		const Quaternion q = owner->to_room_orientation(get_global_basis());
 		bwa_source_set_orientation(ENG, src, (float)q.x, (float)q.y, (float)q.z, (float)q.w);
 	}
+}
+
+/* The one place a caller-supplied orientation reaches the ABI, so the FACING seam is applied
+ * here and nowhere else. Callers only ever hold Godot-frame quaternions. */
+void BwaSource::push_orientation(const Quaternion &q) {
+	const Quaternion r = owner->to_room_orientation(Basis(q));
+	bwa_source_set_orientation(ENG, src, (float)r.x, (float)r.y, (float)r.z, (float)r.w);
 }
 
 /* --- level / routing --- */
@@ -272,12 +296,19 @@ void BwaSource::set_occlusion(bool on) {
 }
 
 void BwaSource::set_occlusion_manual(float level) {
+	occ_manual_set = true;
+	occ_manual_banded = false;
+	occ_manual_level = level;
 	if (LIVE) {
 		bwa_source_set_occlusion_manual(ENG, src, level, nullptr);
 	}
 }
 
 void BwaSource::set_occlusion_manual_bands(float level, const Vector3 &bands) {
+	occ_manual_set = true;
+	occ_manual_banded = true;
+	occ_manual_level = level;
+	occ_manual_bands = bands;
 	if (LIVE) {
 		const float b[3] = { (float)bands.x, (float)bands.y, (float)bands.z };
 		bwa_source_set_occlusion_manual(ENG, src, level, b);
@@ -288,13 +319,21 @@ float BwaSource::get_occlusion_factor() const {
 	return LIVE ? bwa_source_get_occlusion(ENG, src) : 1.0f;
 }
 
+/* Cached like every standing knob (the set_attenuation_override rule), so a pre-ready call
+ * is not silently dropped and apply_all() re-asserts it after a re-mint. The two spellings
+ * are last-one-wins, so the cache remembers WHICH was used, not both. */
 void BwaSource::set_directivity(float weight, float power) {
+	dir_mode = DIRSET_CUSTOM;
+	dir_weight = weight;
+	dir_power = power;
 	if (LIVE) {
 		bwa_source_set_directivity(ENG, src, weight, power);
 	}
 }
 
 void BwaSource::set_directivity_preset(Directivity pattern) {
+	dir_mode = DIRSET_PRESET;
+	dir_preset = pattern;
 	if (LIVE) {
 		bwa_source_set_directivity_preset(ENG, src, (bwa_directivity)pattern);
 	}
@@ -304,9 +343,15 @@ float BwaSource::get_directivity_gain() const {
 	return LIVE ? bwa_source_get_directivity(ENG, src) : 1.0f;
 }
 
+/* Takes a GODOT-frame orientation, like every geometric input on this node: it goes through
+ * the facing seam (registration included), exactly as push_frame does for
+ * orientation_follows_node. Passing it raw shipped once and aimed every dipole 180 degrees
+ * from the node it was authored on. */
 void BwaSource::set_orientation(const Quaternion &q) {
+	orientation_set = true;
+	orientation_q = q;
 	if (LIVE) {
-		bwa_source_set_orientation(ENG, src, (float)q.x, (float)q.y, (float)q.z, (float)q.w);
+		push_orientation(q);
 	}
 }
 

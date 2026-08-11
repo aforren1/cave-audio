@@ -189,6 +189,9 @@ The snippet shows the essential calls. The shipped `Bwa.cs` binds every `BWA_API
   the struct; Godot has `get_setup_tuning` (a Dictionary, so you can print it) and `apply_setup`.
   Start from the preset: this struct's zero is not its default, and the engine refuses a
   zero-filled one. See docs/api.md for what each field rests on.
+- **Offline evaluation (pure, no engine handle)**: `bwa_panner_gains_batch`,
+  `bwa_bed_gains_batch`, and `bwa_spcap_focus_default`, for layout scoring from
+  C# tooling. They never touch a running engine.
 - **Rendering A/B (live)**: `bwa_set_panner`, `bwa_set_dual_band`, `bwa_set_dual_band_cap`,
   `bwa_set_spcap_focus`, `bwa_set_spread_mode`, `bwa_set_max_re` + `bwa_set_max_re_split`,
   `bwa_set_decorrelation`, `bwa_set_near_spread`, `bwa_set_hole_spread`,

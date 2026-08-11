@@ -34,6 +34,13 @@
 #include <stdbool.h>
 #include <stdint.h>
 
+/* Extra physical voice slots beyond the caller's requested pool (rt_create allocates
+ * req_voice_cap + BWA_FADE_RESERVE). A full-pool steal fades the victim out on its own slot and
+ * places the NEW source on a reserve slot — so a live handle's index can reach the physical count,
+ * not just the requested pool. Any per-source table indexed by BWA_H_IDX must be sized to the
+ * PHYSICAL count, or exactly the sources that survived pool pressure silently lose features. */
+#define BWA_FADE_RESERVE 8
+
 /* Handles are (index | generation<<16); 0 is invalid (see include/bw_audio.h). */
 #define BWA_H_IDX(h)   ((uint16_t)((h) & 0xFFFFu))
 #define BWA_H_GEN(h)   ((uint16_t)((h) >> 16))

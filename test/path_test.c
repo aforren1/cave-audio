@@ -55,6 +55,24 @@ int main(void) {
     printf("%s\n", pass ? "PASS: pathing routes around the wall (indirect energy + direction)"
                         : "FAIL: no path found around the wall");
 
+    /* Slot reclamation under source churn: a long-running installation creates and destroys pathing
+     * sources indefinitely, so a destroyed handle's slot must return to the pool (and its IPLSource
+     * release) — claim-forever slots exhaust the 64-slot table for good. Churn well past the table
+     * size; each debug_run_get reconciles inline, which is where the sweep runs (no sim thread here).
+     * If reclamation regresses, the final source finds no slot and paths nothing. */
+    int churn_ok = 1;
+    for (uint32_t i = 0; i < 80; ++i) {
+        uint32_t h = 1000u + i;                       /* 80 distinct handles > PATH_MAX_SRC (64) */
+        steam_path_set_source(sp, h, src, 1);
+        steam_path_source_gone(sp, h);
+        steam_path_debug_run_get(sp, listener, h, eq, sh);   /* reconcile: sweeps the dead slot */
+    }
+    steam_path_set_source(sp, /*handle*/2, src, /*on*/1);
+    churn_ok = steam_path_debug_run_get(sp, listener, 2, eq, sh) && sh[0] > 1e-4f;
+    printf("%s\n", churn_ok ? "PASS: destroyed sources return their pathing slots (churn > table size)"
+                            : "FAIL: pathing slot table exhausted under source churn");
+    pass = pass && churn_ok;
+
     steam_path_destroy(sp);
     steam_scene_destroy(scene);
     rt_destroy(rt);

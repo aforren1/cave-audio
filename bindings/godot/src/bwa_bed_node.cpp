@@ -43,6 +43,7 @@ void BwaBed::_ready() {
 		pushed_orientation = orientation;
 	}
 
+	owner->register_client(this); // for the engine-freed-first teardown order
 	set_process(true);
 	if (autoplay) {
 		play();
@@ -62,14 +63,21 @@ void BwaBed::_process(double delta) {
 }
 
 void BwaBed::_exit_tree() {
-	if (!owner || !bed) {
+	if (!owner) {
 		return;
 	}
-	if (owner->is_running()) {
+	owner->unregister_client(this); // the child-exits-first order: drop us from its list
+	if (bed && owner->is_running()) {
 		bwa_bed_destroy(ENG, bed);
 	}
 	bed = 0;
 	owner = nullptr;
+}
+
+void BwaBed::engine_gone() {
+	/* No calls into the engine — it is mid-teardown. Just forget it. */
+	owner = nullptr;
+	bed = 0;
 }
 
 void BwaBed::play() { play_clip(clip); }

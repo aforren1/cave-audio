@@ -138,7 +138,7 @@ if(BWA_BUILD_TESTS)
     set_tests_properties(godot_scene godot_scene_no_room PROPERTIES TIMEOUT 120
       FIXTURES_REQUIRED godot_project)
 
-    # The playground's own self-test: walk all seven scenes, including both crossings of the
+    # The playground's own self-test: walk all eight scenes, including both crossings of the
     # reverb boundary (which tears the engine down and stands a new one up), and render each
     # scene's HUD. It cannot judge how anything SOUNDS — that is the point of the tool, not
     # of the test — but it does catch the scene machinery and the rebuild falling over, which

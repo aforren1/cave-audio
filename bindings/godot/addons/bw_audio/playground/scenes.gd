@@ -421,11 +421,13 @@ class Directivity extends Base:
 		var rt := 1.8 * dt
 		if Input.is_key_pressed(KEY_COMMA): app.source_yaw += rt
 		if Input.is_key_pressed(KEY_PERIOD): app.source_yaw -= rt
-		# set_orientation goes through the FACING seam: the audible aim is the node's -Z, but
-		# this scene (like the C++ playground) draws and reports the lobe on room +Z at yaw.
-		# The half-turn reconciles them - drop it and the drawn lobe points exactly 180 deg
-		# away from what you hear, in the one tool whose job is ear-vs-eye agreement.
-		app.source.set_orientation(Quaternion(Vector3.UP, app.source_yaw + PI))
+		# set_orientation takes a NODE-space orientation (the binding's facing seam converts
+		# it): aim the node's own forward, -Z, along the same room direction the lobe below
+		# is drawn on. looking_at is that statement made directly - no hand-written
+		# half-turn to drift out of sync with the draw, in the one tool whose job is
+		# ear-vs-eye agreement.
+		var aim := Vector3(sin(app.source_yaw), 0.0, cos(app.source_yaw))
+		app.source.set_orientation(Quaternion(Basis.looking_at(aim)))
 		app.source.gain = app.SRC_GAIN
 		_gain = app.source.get_directivity_gain()
 
