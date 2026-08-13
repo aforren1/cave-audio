@@ -347,8 +347,9 @@ int main(int argc, char** argv) {
         }
 #ifdef BWA_HAVE_ASIO
         /* Same lower-bound check as --localize: the driver's digital loop is inside every arrival, so
-         * a solved latency below it is physically impossible. No upper warning here — a Dante Via leg
-         * on the capsule inputs legitimately adds ~10 ms the driver does not report. */
+         * a solved latency below it is physically impossible. No upper warning here — the ZM-1's USB
+         * stack plus the Dante Via legs legitimately add tens of ms the driver does not report (a clap
+         * loopback on the rig measured ~60 ms, ~20 m at c, so the residual is HUGE and still correct). */
         { long il = 0, ol = 0;
           if (!simulate && lat_known && calib_asio_latencies(&il, &ol)) {
               double drv_m = sos * (double)(il + ol) / FS;

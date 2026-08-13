@@ -267,7 +267,9 @@ into `cave_layout.json`. Two flags carry the physics the tool cannot know:
   the taped value. Given neither, the run prints directions and **refuses the writeback**: every
   distance would carry the full system latency radially. The tool cross-checks the solved latency
   against the driver's digital loop (below it = physically impossible). No tens-of-ms upper
-  warning here: a Dante Via input leg legitimately adds ~10 ms the driver never reports.
+  warning here: the capture chain legitimately adds tens of milliseconds the driver never reports.
+  A clap loopback on the rig measured about 60 ms, which is about 20 m at c. A solved latency
+  several times the array's own extent is the expected reading, not a fault.
 
 `--zylia --simulate` runs the identical solve + writeback off-hardware from synthesized arrivals
 and recovers every position exactly. The capture shell itself is rig bring-up code like the rest
@@ -300,9 +302,21 @@ What it buys, beyond unblocking the sweep:
 - The cable run: the ZM-1 wants to sit in the *middle* of the CAVE, and USB will not reach.
   100 m of Cat6 will.
 
-Caveats to check first: Via adds a constant 10 ms (measured, constant, nowhere near the
-production path). 26 out + 19 in is **45 channels**, so confirm the Digiface offers that many
+Caveats to check first. **The capture chain is slow: about 60 ms, not the ~10 ms a single Via leg
+suggests.** Measured with a clap loopback, that is, ZM-1 in, straight back out to a speaker, both
+the clap and its replay recorded on an independent device. The ZM-1's own USB stack, a Via leg in
+each direction, and the ASIO buffer all stack up. This costs nothing as long as you remember it:
+the number is constant and measurable, so `--latency` absorbs it (60 ms is 20.6 m at c), the 0.5 s
+capture tail (`CAL_NTAIL`) covers it many times over, and the production render never runs the ZM-1
+at all. What it does rule out is guessing the latency instead of measuring it.
+
+26 out + 19 in is **45 channels**, so confirm the Digiface offers that many
 at your rate. Dante endpoints commonly halve their channel count at 96 kHz; calibrate at 48 kHz.
+
+**Dante Via presents the ZM-1 as 20 input channels, not 19.** The 20th carries no capsule and
+appears to be inactive. Only the first 19 of the block are capsules, in order, so `--input` still
+points at the first capsule and the tool still reads 19 consecutive inputs. Budget the routing
+for 20 channels and leave the last one unpatched.
 
 None of this is required to *start*. The capsule survey below runs on claps through the existing
 capture shell, and `zylia_survey` does not care whether its arrivals came from a clap's
