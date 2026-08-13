@@ -1,7 +1,9 @@
 [configuration]
 
 entry_symbol = "bw_audio_library_init"
-compatibility_minimum = "4.4"
+; Matches the extension_api.json the pinned godot-cpp compiles against (4.7.stable; see
+; bindings/godot/CMakeLists.txt) - the minimum must never sit below the compiled API.
+compatibility_minimum = "4.7"
 reloadable = false
 
 [libraries]

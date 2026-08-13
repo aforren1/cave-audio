@@ -13,7 +13,7 @@
 ##   5 Blind A/B/X    - double-blind over live knobs, with a binomial p-value
 ##   6 Ambisonic bed  - a world-locked 3rd-order field; spin, tilt, renderer, max-rE
 ##   7 Reverb bed     - a shoebox + reverb; REBUILDS the engine on entry/exit
-##   8 Underwater     - the https://github.com/aforren1/cave-audio/blob/3c1f0fcc3de4/docs/api.md "listener submerges" recipe: dive and the FDN retunes
+##   8 Underwater     - the https://github.com/aforren1/cave-audio/blob/fb85546ccff1/docs/api.md "listener submerges" recipe: dive and the FDN retunes
 ##                      LIVE, the speed of sound glides, crossing sources muffle, and the
 ##                      pressure-release surface throws the Lloyd's-mirror bounce. Rebuilds
 ##                      like scene 7 (its FDN is load-time), phonon-free.
@@ -241,20 +241,22 @@ func switch_scene(idx: int) -> void:
 	refl.gain = 0.0
 	source.occlusion = false
 	source.set_directivity_preset(BwaSource.DIR_OMNI)
-	# Room identity, not Godot identity: set_orientation is the facing seam, so a Godot
-	# identity would land the source facing room -Z. Inaudible while OMNI, but a reset should
-	# reset - the half-turn is what maps back to the room's own identity.
-	source.set_orientation(Quaternion(Vector3.UP, PI))
+	# set_orientation takes a node-space orientation (the binding converts through the
+	# facing seam), so identity here is the same aim an untouched node carries - the
+	# honest reset. Inaudible while OMNI, but a reset should reset.
+	source.set_orientation(Quaternion.IDENTITY)
 	source.doppler = false
 	source.air_absorption = false
 	source.spread = 0.0
 	engine.dual_band = false
 	engine.panner = BwaEngine.PAN_DBAP        # the A/B/X scene may have left SPCAP or VBAP on
+	engine.spcap_focus = 0.0                  # ...and the localization scene a dialed SPCAP lobe
+	engine.spcap_density = 0.0
 	engine.spread_mode = BwaEngine.SPREAD_LOBE
 	engine.decorrelation = false
 	bed.stop()
 	engine.bed_renderer = BwaEngine.BED_MATRIX
-	engine.max_re = false
+	engine.max_re = true   # the engine default since the offline bake-off
 	engine.max_re_split = false
 	source_yaw = 0.0
 	source.gain = SRC_GAIN

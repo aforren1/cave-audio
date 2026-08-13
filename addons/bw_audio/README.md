@@ -9,25 +9,25 @@ unused. The engine drives ASIO itself.
 **From the Asset Store** (in the editor: AssetLib tab, search "bw_audio"), or by hand:
 download `bw_audio-godot-<version>.zip` from a GitHub Release and unzip it into your project
 so you end up with `addons/bw_audio/`. Either way, restart the editor afterwards. A
-GDExtension loads on project open — there is no plugin to enable.
+GDExtension loads on project open, so there is no plugin to enable.
 
-Godot has **no equivalent of Unity's "add package from git URL"**: the documented routes are
-the store's own listing and a manual zip extract, and there is no install-from-URL or
-install-from-file entry point in the editor. So unlike the Unity binding, the `godot`
-distribution branch is not something you can install *from* directly — it exists to satisfy
-a store listing that pulls a repo archive.
+Godot has **no equivalent of Unity's "add package from git URL"**. The documented routes are
+the store's own listing and a manual zip extract. The editor has no install-from-URL or
+install-from-file entry point. So unlike the Unity binding, you cannot install *from* the
+`godot` distribution branch directly. It exists to satisfy a store listing that pulls a repo
+archive.
 
 Windows x64 only, because the engine's device path is ASIO.
 
 ## Coordinate seam
 
-The core works in **room space: right-handed, +Y up, +Z forward, metres, origin on the
-floor** — OptiTrack/Motive's default streamed frame.
+The engine works in **room space: right-handed, +Y up, +Z forward, meters, origin on the
+floor** - OptiTrack/Motive's default streamed frame.
 
 Godot is **also right-handed and Y-up**, so unlike Unity there is **no mirror**: positions
 and directions pass through the CAVE registration transform and nothing else. The one
-difference is a facing convention — Godot's `Vector3.FORWARD` is `-Z`, room's identity
-quaternion faces `+Z` — so orientations pick up a 180° yaw:
+difference is a facing convention. Godot's `Vector3.FORWARD` is `-Z` and room's identity
+quaternion faces `+Z`, so orientations pick up a 180° yaw:
 
 ```gdscript
 room_pos  = registration * node.global_position
@@ -40,7 +40,7 @@ Two consequences worth knowing, both places Unity's advice does *not* carry over
 - `bwa_bed_set_orientation` takes a room-frame yaw, and because there is no mirror the
   **sense of rotation is preserved**. Unity's binding has to reverse it; this one does not.
 - Positions need no axis flip at all. If a source ends up mirrored, the registration
-  transform is wrong — not the handedness conversion.
+  transform is wrong - not the handedness conversion.
 
 Budget time to verify with a known-position test source before trusting anything else.
 
@@ -50,14 +50,14 @@ The engine's channel count is **the layout's speaker count** (4..26), not a cons
 it with `BwaEngine.get_channel_count()` and size any meter or speaker-gizmo array from it.
 Never hard-code 26.
 
-The trap: a failed layout load is **not** fatal at create — the core falls back to the
+The trap: a failed layout load is **not** fatal at create. The core falls back to the
 26-speaker default grid and only records the reason. `BwaEngine` surfaces that as a
 warning, and `bwa_start` refuses the fallback when a path was given, so a bad layout fails
 loudly instead of quietly changing the channel count.
 
 ## Asset paths
 
-The core loads audio and layout files itself, by OS path — it never goes through Godot's
+The core loads audio and layout files itself, by OS path. It never goes through Godot's
 virtual filesystem. `res://` paths are globalized for you, but in an **exported** build
 `res://` lives inside the `.pck` and that path will not exist. Ship those files beside the
 executable, or stage them into `user://` at startup. (Same trap as Unity's
@@ -67,12 +67,12 @@ executable, or stage them into `user://` at startup. (Same trap as Unity's
 
 **One node pushes everything.** Each `_process`, `BwaEngine` pulls every registered
 emitter's transform, pushes the listener pose, then calls `bwa_commit` once. Emitters
-deliberately do *not* push themselves: the commit is what defines frame coherence, so
-everything it covers has to be sampled together, or you can commit a frame where the
-listener moved but some sources hadn't.
+deliberately do *not* push themselves. The commit is what defines frame coherence, so
+everything it covers has to be sampled together. Otherwise you can commit a frame where the
+listener moved but some sources had not.
 
-Godot has no `LateUpdate`, so freshness comes from `process_priority` instead —
-`BwaEngine` defaults to `1000` so it runs after ordinary gameplay nodes. Coherence does
+Godot has no `LateUpdate`, so freshness comes from `process_priority` instead.
+`BwaEngine` defaults to `1000`, so it runs after ordinary gameplay nodes. Coherence does
 not depend on that: if a source moves after we sampled it, every source *and* the listener
 are one frame old together, which is inaudible. Only freshness is at stake.
 
@@ -81,7 +81,7 @@ are one frame old together, which is inaudible. Only freshness is at stake.
 There is no separate 1:1 P/Invoke-style layer. GDExtension needs no such shim, so every
 call lives as a method on whichever class owns the handle it operates on.
 
-**`BwaEngine : Node`** — everything engine-global: lifecycle, the registration transform,
+**`BwaEngine : Node`** - everything engine-global: lifecycle, the registration transform,
 listener and tracker wiring, the asset cache, master gain/pause and mix groups, the reverb
 configuration (Steam bed *or* FDN), materials and scene geometry, the clock, the
 diagnostics readbacks, and the live A/B knobs (panner, dual-band, spread mode,
@@ -89,35 +89,36 @@ decorrelation, near-spread, max-rE and its band split, bed renderer, tracked roo
 limiter). Those are exported properties that also apply live, so the inspector *is* the
 A/B tool.
 
-**`BwaSource : Node3D`** (abstract) — everything a spatial voice can do regardless of where
+**`BwaSource : Node3D`** (abstract) - everything a spatial voice can do regardless of where
 its audio comes from: gain, priority, group, fades, pause, spread/extent/size, Doppler, air
 absorption, loudness compensation, attenuation override, occlusion (ray-traced or manual),
 directivity, reverb sends, early reflections, pathing.
 
-**`BwaEmitter : BwaSource`** — plays a file. Adds `play`/`play_at`/`play_loop`/`stop_at`,
+**`BwaEmitter : BwaSource`** - plays a file. Adds `play`/`play_at`/`play_loop`/`stop_at`,
 gapless `queue`, `seek_frames`/`seek_seconds`, `pitch`, and a `finished` signal.
 
-**`BwaPushSource : BwaSource`** — you feed it PCM. Adds `push`/`push_space`/`push_end`.
+**`BwaPushSource : BwaSource`** - you feed it PCM. Adds `push`/`push_space`/`push_end`.
 
-**`BwaBed : Node`** — a world-locked ambisonic soundfield. A `Node`, not a `Node3D`: a bed
+**`BwaBed : Node`** - a world-locked ambisonic soundfield. A `Node`, not a `Node3D`: a bed
 has no position, only an orientation.
 
-**`BwaMaterial : Resource`** — an acoustic material as a `.tres`. Either a built-in preset
+**`BwaMaterial : Resource`** - an acoustic material as a `.tres`. Either a built-in preset
 or custom 3-band coefficients. The preset is an **enum, not a string**: the core answers an
 unknown material name with the generic default and a note in `bwa_last_error`, which is not
-an error, just a wrong sound. Tokens are minted lazily and cached against the engine's
-generation, because the core's material table is fixed-capacity and meant to be filled once.
+an error, just a wrong sound. The binding mints tokens lazily and caches them against the
+engine's generation, because the core's material table is fixed-capacity and meant to be
+filled once.
 
-**`BwaAcousticGeometry : Node3D`** — static occluding/reflecting geometry, from a `Mesh` or
-an existing `MeshInstance3D`. **`BwaDynamicGeometry : Node3D`** — a movable occluder (a
-cheap BVH refit, not a rebuild; needs the Steam Audio build). **`BwaRoomBox : Node3D`** —
+**`BwaAcousticGeometry : Node3D`** - static occluding/reflecting geometry, from a `Mesh` or
+an existing `MeshInstance3D`. **`BwaDynamicGeometry : Node3D`** - a movable occluder (a
+cheap BVH refit, not a rebuild; needs the Steam Audio build). **`BwaRoomBox : Node3D`** -
 the shoebox, which also captures the room for the image-source early reflections and so
 matters even in a phonon-free build. Its outdoor degenerate lives on `BwaEngine` as the
-`ground_*` properties: one horizontal mirror plane, the ground bounce, with
-`ground_pressure_release` turning it into a water surface seen from below (the
-Lloyd's-mirror comb). A `BwaRoomBox` wins when both exist — one room at a time.
+`ground_*` properties: one horizontal mirror plane, the ground bounce. `ground_pressure_release`
+turns that plane into a water surface seen from below (the Lloyd's-mirror comb). A
+`BwaRoomBox` wins when both exist - one room at a time.
 
-**`BwaSpeakerView : Node3D`** — one gizmo per speaker, lit by that channel's live output
+**`BwaSpeakerView : Node3D`** - one gizmo per speaker, lit by that channel's live output
 level. It reads the geometry back from the engine, so it draws the array the engine is
 *actually* panning with: a layout that failed to load and fell back to the default grid
 looks wrong immediately instead of sounding wrong later.
@@ -125,20 +126,22 @@ looks wrong immediately instead of sounding wrong later.
 ### Geometry is collected, not pushed
 
 `bwa_scene_set_mesh_mat` **replaces** the whole static mesh, and `bwa_scene_set_box` is a
-convenience that calls it. Per-node calls would therefore clobber each other — a scene with
-a room box and a pillar would lose one of them, silently, with the loser simply inaudible.
+convenience that calls it. Per-node calls would therefore clobber each other. A scene with
+a room box and a pillar would lose one of them, silently, and the loser would simply be
+inaudible.
 
 So every static piece registers in `_enter_tree` (which Godot runs top-down, before any
 `_ready`) and `BwaEngine` merges them into **one** call before `bwa_start`. The room box
-goes first and alone, because `scene_set_box` is the only way to capture the shoebox for
-the image-source reflections, and then contributes its own 12 inward-facing wall triangles
-to that merged mesh — otherwise the walls would vanish the instant any other occluder
-existed.
+takes two steps. `bwa_scene_set_ism_room` records the shoebox for the image-source
+reflections without touching the static mesh, then the box's own 12 inward-facing wall
+triangles join the merge like any other occluder. Otherwise the walls would vanish the
+instant any other occluder existed. (`bwa_scene_set_box` still does both at once, for the
+case where the box **is** the whole scene.)
 
 ### Warnings for the settings that fail quietly
 
 Godot's `_get_configuration_warnings()` gives the scene tree a warning marker, which is
-exactly where the engine's *survivable* mistakes belong — none of these are errors to the
+exactly where the engine's *survivable* mistakes belong. None of these are errors to the
 core. It starts, it renders, it just sounds wrong:
 
 - both reverb beds enabled, contending for the one tap;
@@ -152,23 +155,27 @@ core. It starts, it renders, it just sounds wrong:
 
 The split into three source classes is deliberate. The core genuinely *refuses*
 play/seek/pitch on a push voice, so a single node with a mode flag would leave those
-visible in the inspector and silently inert — the exact class of quiet failure this binding
-tries to make unrepresentable.
+visible in the inspector and silently inert. That is the exact class of quiet failure this
+binding tries to make unrepresentable.
 
 ### Two things that bite anything polling a voice
 
 `bwa_source_play` only **enqueues**, and `bwa_source_is_playing` is a per-block republish,
 so for a frame or two after a play the raw readback honestly says "not playing".
-`BwaEmitter` absorbs that window — a just-issued play counts as playing, and only a voice
+`BwaEmitter` absorbs that window. A just-issued play counts as playing, and only a voice
 actually *observed* playing can fire `finished`. Without that, a naive edge detector fires
 `finished` on frame one of every sound.
 
-`finished` means the sound **ran out** — a non-loop end, a drained queue. An explicit
+If you would rather not poll at all, `BwaEngine.poll_ended()` returns the voices that
+finished since the last call, so you can drive your own bookkeeping off that instead of
+edge-detecting `is_playing`.
+
+`finished` means the sound **ran out** - a non-loop end, a drained queue. An explicit
 `stop()` or `fade_out()` never fires it; `stop_at()` deliberately does, because a scheduled
 stop is an arranged ending and the caller wants to know when it landed.
 
 `bwa_set_output_capture` is **not bound, on purpose.** Its callback runs on the audio
-thread, where calling into GDScript would allocate and take the interpreter lock — exactly
+thread, where calling into GDScript would allocate and take the interpreter lock - exactly
 what invariant 1 forbids. Use the MANUAL sink and `render_block()` for capture instead.
 
 ### Picking the profile, and the device
@@ -176,9 +183,9 @@ what invariant 1 forbids. Use the MANUAL sink and `render_block()` for capture i
 `profile` is the highest-stakes property on the node, so the inspector spells out what each
 value does rather than just naming it. The short version: **Binaural** is the direct
 headphone render (the default, and what you want at a desk), **CaveSim** auditions the
-26-speaker array over those same headphones, **Cave** drives the rig and nothing else — on a
-machine with no rig it is correctly, deliberately silent. [docs/api.md](https://github.com/aforren1/cave-audio/blob/3c1f0fcc3de4/docs/api.md) has the
-full "pick by question, not habit" table.
+26-speaker array over those same headphones, **Cave** drives the rig and nothing else. On a
+machine with no rig, Cave is correctly, deliberately silent. [docs/api.md](https://github.com/aforren1/cave-audio/blob/fb85546ccff1/docs/api.md)
+has the full "pick by question, not habit" table.
 
 Whatever you pick, `get_audio_backend()` reports what actually happened, decode included:
 
@@ -199,8 +206,8 @@ wants a single name without building the array.
 
 ### Is the device being starved?
 
-`get_health()` returns a Dictionary — `measured`, `blocks`, `xruns`, `dropped_frames`,
-`driver_resyncs`, `late_blocks`, `stream_starves`, `peak_load` — and `get_xruns()` is the one-line
+`get_health()` returns a Dictionary - `measured`, `blocks`, `xruns`, `dropped_frames`,
+`driver_resyncs`, `late_blocks`, `stream_starves`, `peak_load` - and `get_xruns()` is the one-line
 form for a HUD. `xruns` is the device running on without us; `late_blocks` is our own render
 overrunning the block period, which is what causes them; `stream_starves` is a streamed voice whose
 ring ran dry. Read any of them against `blocks`.
@@ -213,65 +220,65 @@ elif h["xruns"] > 0:
     print("%d dropouts over %d blocks, peak load %.2f" % [h["xruns"], h["blocks"], h["peak_load"]])
 ```
 
-`measured` is the field that matters. It is false whenever nothing here can see a dropout — before
+`measured` is the field that matters. It is false whenever nothing here can see a dropout: before
 start, on the manual sink (no deadline, so it cannot miss one), or on a driver that never stamps a
-valid sample position — and in all of those `xruns` reads 0. A zero that means "none" and a zero that
+valid sample position. In all of those, `xruns` reads 0. A zero that means "none" and a zero that
 means "never looked" are different answers.
 
 ### Two returns worth checking
 
 `play_oneshot()` returns **whether the one-shot was accepted**. A one-shot holds no handle,
-so that boolean is the only signal it will ever give you — false means the clip failed to
-load, or the voice pool or command ring was momentarily full and the transient was dropped
-(one-shots never steal, so spam cannot evict your named sources). `get_last_error()` says
-which. The load failure also pushes an error; the drop deliberately does not, because the
-thing that causes it is one-shot spam and a per-drop message would bury the console.
+so that boolean is the only signal it will ever give you. False means the clip failed to
+load, or that the voice pool or command ring was momentarily full and the engine dropped the
+transient. One-shots never steal, so spam cannot evict your named sources. `get_last_error()`
+says which. The load failure also pushes an error; the drop deliberately does not, because
+the thing that causes it is one-shot spam and a per-drop message would bury the console.
 
 `get_output_latency_frames()` and `get_output_latency_seconds()` are named for their unit on
 purpose. Godot's own `AudioServer.get_output_latency()` returns **seconds**, so a bare
-`get_output_latency()` here returning frames reads as seconds to anyone who knows that call —
-and a device-less sink reporting 0 hides the mistake indefinitely, because 0 is 0 in either
+`get_output_latency()` here returning frames reads as seconds to anyone who knows that call.
+A device-less sink reporting 0 then hides the mistake indefinitely, because 0 is 0 in either
 unit. Neither name here collides.
 
 `seek_frames()` / `seek_seconds()` on `BwaEmitter` and `BwaBed` follow the same rule, for the
-same reason: `AudioStreamPlayer3D.seek()` takes seconds, so a bare `seek()` taking frames is a
-trap where passing `1.5` lands on frame 1 and the clip just restarts. The engine's own unit is
+same reason. `AudioStreamPlayer3D.seek()` takes seconds, so a bare `seek()` taking frames is a
+trap: passing `1.5` lands on frame 1 and the clip just restarts. The engine's own unit is
 frames everywhere (`play_at`, `stop_at`, `play_loop`, `get_playhead_frames`) because that is what
 the dsp clock counts; the `_seconds` twins are conveniences over the resolved sample rate.
 
 The rule behind all three, if you are adding a call: **a unit belongs in the name when the quantity
-has two live units in this engine.** Time does — frames and seconds are both real here — so every
-time-valued name says which. Nothing else does: distances are metres, frequencies Hz, angles
+has two live units in this engine.** Time does - frames and seconds are both real here - so every
+time-valued name says which. Nothing else does: distances are meters, frequencies Hz, angles
 radians, gains linear (a decibel value would have to say `_db`), and suffixing those would add
 noise without removing a decision.
 
 ## The playground
 
-`addons/bw_audio/playground/` is the by-ear harness — it ships **inside the addon**, so
-however you installed, open `addons/bw_audio/playground/playground.tscn` and press play.
+`addons/bw_audio/playground/` is the by-ear harness, and it ships **inside the addon**.
+However you installed, open `addons/bw_audio/playground/playground.tscn` and press play.
 Without an ASIO device it falls back to silent visual-only mode and says so in the HUD.
 
 Scenes, TAB to cycle: localization, occlusion and materials, directivity, channel walk,
 blind A/B/X, ambisonic bed, reverb bed, underwater. WASD/RF move the source, Q/E turn the
-head, 1–4 pick the signal. Every scene also declares its own controls — dropdowns, toggles, sliders — which
-the panel builds; the keyboard shortcuts drive the *same* setters, so the two input paths
-cannot drift apart, and pressing a key visibly moves the matching widget.
+head, 1-4 pick the signal. Every scene also declares its own controls (dropdowns, toggles,
+sliders) and the panel builds them. The keyboard shortcuts drive the *same* setters, so the
+two input paths cannot drift apart, and pressing a key visibly moves the matching widget.
 
 **Movement follows the room basis, read from the ABI** (`BwaEngine.room_right()` and
-friends), not from written-out signs. Room right is **−X**, which is the opposite of the
-reflex — and a hardcoded guess yields a scene that looks entirely plausible with left and
+friends), not from written-out signs. Room right is **-X**, which is the opposite of the
+reflex. A hardcoded guess yields a scene that looks entirely plausible with left and
 right swapped. The floor grid marks the two axes for the same reason: green ahead, red to
 the listener's right, matching the red right ear on the head gizmo.
 
 Two things worth knowing:
 
 - **The reverb and underwater scenes rebuild the engine** on entry and exit, because the
-  Steam bed, the room geometry, and the FDN are load-time. Here that means tearing down the
-  whole rig subtree and standing a new one up, which is a brief audio gap by design.
+  Steam bed, the room geometry, and the FDN are load-time. Here the playground tears down the
+  whole rig subtree and stands a new one up, which is a brief audio gap by design.
 - **`switch_scene()` resets every engine-wide knob.** The knobs are global, so a scene that
   left SPCAP selected or a spread mode engaged would silently change what the *next* scene
   appears to demonstrate. That reset list is ported verbatim for exactly that reason.
 
 With no ASIO device the engine falls back to the null sink and everything still runs, just
-silent — visual-only is a supported state, not a failure, and the HUD says so.
+silent. Visual-only is a supported state, not a failure, and the HUD says so.
 

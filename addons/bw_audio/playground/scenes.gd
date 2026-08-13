@@ -59,6 +59,12 @@ class Localization extends Base:
 	var air := false
 	var dual := false
 	var spread := 0.0
+	## The point-source panner, and under SPCAP its two live tuning exponents. 0 on either
+	## exponent means "the default": focus derived from the array geometry, density 2.0.
+	var panner := BwaEngine.PAN_DBAP
+	var focus := 0.0
+	var density := 0.0
+	var _focus_def := 0.0   ## cached at enter(): the derivation is O(N^2), the layout is not live
 	var _t := 0.0
 	var _fly_t := 0.0
 	var _trail: PackedVector3Array = PackedVector3Array()
@@ -78,6 +84,10 @@ class Localization extends Base:
 		app.source.air_absorption = air
 		app.source.spread = spread
 		app.engine.dual_band = dual
+		app.engine.panner = panner
+		app.engine.spcap_focus = focus
+		app.engine.spcap_density = density
+		_focus_def = app.engine.get_spcap_focus_default()
 
 	func key(code: int) -> void:
 		match code:
@@ -135,6 +145,7 @@ class Localization extends Base:
 		return [
 			["motion", "orbit" if auto else ("flyby" if flyby else "manual")],
 			["size (spread)", "%.2f" % spread],
+			["SPCAP focus", ("%.1f" % focus) if focus > 0.0 else "default %.1f" % _focus_def],
 		]
 
 	func controls() -> Array:
@@ -167,6 +178,26 @@ class Localization extends Base:
 				"set": func(v: float) -> void:
 					spread = v
 					app.source.spread = v},
+			{"kind": "option", "label": "panner", "items": ["DBAP (moving)", "SPCAP (fixed)",
+					"VBAP (fixed)"],
+				"get": func() -> int: return panner,
+				"set": func(i: int) -> void:
+					panner = i
+					app.engine.panner = i},
+			# SPCAP only. 0 = revert to the default (derived focus, density 2.0); the status line
+			# above shows what this array derives.
+			{"kind": "slider", "label": "SPCAP focus (0 = derived)", "min": 0.0, "max": 48.0,
+				"step": 0.5,
+				"get": func() -> float: return focus,
+				"set": func(v: float) -> void:
+					focus = v
+					app.engine.spcap_focus = v},
+			{"kind": "slider", "label": "SPCAP density (0 = 2.0)", "min": 0.0, "max": 8.0,
+				"step": 0.1,
+				"get": func() -> float: return density,
+				"set": func(v: float) -> void:
+					density = v
+					app.engine.spcap_density = v},
 		]
 
 
@@ -216,13 +247,13 @@ class Occlusion extends Base:
 		return [u, wall_n.cross(u)]
 
 	## The wall as world triangles. Local corners for the dynamic path are the same offsets
-	## from centre, so a pure translation reproduces the static mesh's exact world triangles —
+	## from center, so a pure translation reproduces the static mesh's exact world triangles —
 	## which is what makes the A/B a comparison of PATHS rather than of two different walls.
-	func _corners(centred: bool) -> PackedVector3Array:
+	func _corners(centered: bool) -> PackedVector3Array:
 		var b := _wall_basis()
 		var u: Vector3 = b[0] * wall_hw
 		var v: Vector3 = b[1] * wall_hh
-		var c: Vector3 = Vector3.ZERO if centred else wall_c
+		var c: Vector3 = Vector3.ZERO if centered else wall_c
 		return PackedVector3Array([c - u - v, c + u - v, c + u + v, c - u + v])
 
 	func _apply_wall() -> void:
@@ -390,11 +421,13 @@ class Directivity extends Base:
 		var rt := 1.8 * dt
 		if Input.is_key_pressed(KEY_COMMA): app.source_yaw += rt
 		if Input.is_key_pressed(KEY_PERIOD): app.source_yaw -= rt
-		# set_orientation goes through the FACING seam: the audible aim is the node's -Z, but
-		# this scene (like the C++ playground) draws and reports the lobe on room +Z at yaw.
-		# The half-turn reconciles them - drop it and the drawn lobe points exactly 180 deg
-		# away from what you hear, in the one tool whose job is ear-vs-eye agreement.
-		app.source.set_orientation(Quaternion(Vector3.UP, app.source_yaw + PI))
+		# set_orientation takes a NODE-space orientation (the binding's facing seam converts
+		# it): aim the node's own forward, -Z, along the same room direction the lobe below
+		# is drawn on. looking_at is that statement made directly - no hand-written
+		# half-turn to drift out of sync with the draw, in the one tool whose job is
+		# ear-vs-eye agreement.
+		var aim := Vector3(sin(app.source_yaw), 0.0, cos(app.source_yaw))
+		app.source.set_orientation(Quaternion(Basis.looking_at(aim)))
 		app.source.gain = app.SRC_GAIN
 		_gain = app.source.get_directivity_gain()
 
@@ -696,7 +729,7 @@ class Abx extends Base:
 class AmbisonicBed extends Base:
 	var spin := false
 	var parametric := false
-	var max_re := false
+	var max_re := true   # mirrors the engine default (ON)
 	var re_split := false
 	var yaw := 0.0
 	var pitch := 0.0
@@ -916,7 +949,7 @@ class ReverbBed extends Base:
 
 
 ## ============================ 8. Underwater (medium boundary) ============================
-## The https://github.com/aforren1/cave-audio/blob/3c1f0fcc3de4/docs/api.md "listener submerges" recipe, live and phonon-free. SPACE dives: a source across
+## The https://github.com/aforren1/cave-audio/blob/fb85546ccff1/docs/api.md "listener submerges" recipe, live and phonon-free. SPACE dives: a source across
 ## the surface gets the interface loss + the water's transmission EQ (manual occlusion) and
 ## goes diffuse (spread), the FDN retunes LIVE (the tail keeps ringing, only its slope
 ## changes) and the speed of sound glides to the medium's — Doppler is what makes that
