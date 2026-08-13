@@ -1,7 +1,7 @@
 // Engine.cs — the manager. ONE per scene (singleton). Owns the engine handle, loads assets, and
 // runs the CENTRALIZED per-frame push: all sources, then the listener, then one commit — so every
 // block the audio thread sees is internally consistent (Unity does not order LateUpdate across
-// components, so per-emitter pushes could commit a half-moved frame). See https://github.com/aforren1/cave-audio/blob/3c1f0fcc3de4/docs/integration.md.
+// components, so per-emitter pushes could commit a half-moved frame). See https://github.com/aforren1/cave-audio/blob/fb85546ccff1/docs/integration.md.
 using System;
 using System.Collections.Generic;
 using System.IO;
@@ -18,9 +18,10 @@ namespace BwAudio
         [Header("Engine")]
         public BwaProfile profile = BwaProfile.Binaural;   // inspector dropdown; maps 1:1 to the C enum
         [Tooltip("The surveyed speaker geometry, as a path RELATIVE TO Assets/StreamingAssets/ " +
-                 "(create that folder and put cave_layout.json in it). Used by the cave/cave_both profiles. " +
-                 "If it fails to load the engine falls back to its default 26-speaker grid and logs an " +
-                 "error — it does NOT stop, so a smaller rig would silently pan over the wrong geometry.")]
+                 "(create that folder and put cave_layout.json in it). EMPTY runs the engine's built-in " +
+                 "default 26-speaker grid — the only way to opt into it. A non-empty path MUST load: on " +
+                 "a failed load the engine logs the reason and REFUSES to start (BWA_ERR_LAYOUT), so a " +
+                 "session can never silently pan over geometry that isn't the one in the room.")]
         [Clip(".json")] public string layoutFile = "cave_layout.json";
         public uint sampleRate = 48000;
         public uint blockSize = 256;
@@ -70,9 +71,20 @@ namespace BwAudio
         [Tooltip("DBAP: listener-relative, for a MOVING observer (the CAVE case). SPCAP/VBAP assume a " +
                  "FIXED listener — sharper, but only at the sweet spot.")]
         public BwaPanner panner = BwaPanner.Dbap;
-        [Tooltip("Split at ~700 Hz and pan the low band with amplitude normalisation: sharper LF " +
-                 "localisation for a near-centred listener. Sweet-spot dependent.")]
+        [Tooltip("Split at ~700 Hz and pan the low band with amplitude normalization: sharper LF " +
+                 "localization for a near-centered listener. Sweet-spot dependent.")]
         public bool dualBand = false;
+        [Tooltip("Needs Dual Band. Corrects the low band's interaural time difference for the tracked " +
+                 "head ORIENTATION, so a source holds still as the listener turns their head. Wants a " +
+                 "real tracked pose; aimed at a seated listener.")]
+        public bool dualBandCap = false;
+        [Tooltip("SPCAP only: lobe sharpness. Higher concentrates a source on fewer speakers (tighter " +
+                 "image), lower spreads it (smoother). 0 or less = the default derived from your array's " +
+                 "speaker spacing (about 12.7 on the 26-speaker grid).")]
+        public float spcapFocus = 0f;
+        [Tooltip("SPCAP only: exponent of the placement-correction kernel that de-biases a clustered " +
+                 "array. 0 or less = the 2.0 default, which is rarely worth moving.")]
+        public float spcapDensity = 0f;
         [Tooltip("How a source's spread renders. LOBE: one reshaped solve (cheap, smooth). MDAP: a ring of " +
                  "virtual sources panned with the selected panner (panner-true, ~13x the solve cost). " +
                  "SPECTRAL: frequency-dependent panning — 6 bands, each from its own direction in the " +
@@ -85,25 +97,41 @@ namespace BwAudio
         [Tooltip("Widen sources that come close to the head, instead of letting them snap across the " +
                  "nearest speaker. ~1 m is a good start; 0 = off.")]
         public float nearSpreadRadius = 0f;
+        [Tooltip("Widen sources aimed where the array has NO speaker (the CAVE barrel is open at both " +
+                 "poles), instead of rendering them as a split image across two distant speakers. Inert " +
+                 "on an array that surrounds the listener. 1 = the honest width; 0 = off.")]
+        [Range(0f, 2f)] public float holeSpread = 0f;
         [Tooltip("Speed of sound (m/s; live). Doppler and reflection delays derive from it and GLIDE to " +
                  "a change. 343 = air, 1480 = underwater; small values exaggerate Doppler (slow motion).")]
         public float speedOfSound = 343f;
         [Tooltip("For layouts carrying a room_eq_grid (bwa_calibrate --room-eq-grid): re-interpolate the LF " +
                  "modal cuts at the live listener position. No-op without a grid; this is the kill switch.")]
         public bool trackedRoomEq = true;
+        [Tooltip("Re-align the array's arrival times on the TRACKED listener instead of the fixed array " +
+                 "centroid, so time coherence follows the head. OFF by default: every delay change resamples, " +
+                 "so a walking listener Doppler-shifts the whole array. Try it, listen for warble.")]
+        public bool trackedAlign = false;
+        [Tooltip("Tracked align: how far the head must move (METERS) before the alignment is recomputed. " +
+                 "Tracker jitter would otherwise keep the array permanently gliding. 0 = the 5 cm default.")]
+        [Range(0f, 0.5f)] public float trackedAlignDeadZone = 0f;
+        [Tooltip("Tracked align: cap on how fast a speaker's delay may change, in AUDIO frames per second " +
+                 "(not video FPS). This over the sample rate is the resampling ratio, so it is what bounds " +
+                 "the pitch shift. 0 = the default (~63 at 48 kHz, following a 0.45 m/s walk); higher tracks " +
+                 "a faster listener and is more audible.")]
+        public float trackedAlignSlewFramesPerSecond = 0f;
 
         [Header("Diffuse beds (AmbisonicBed / reverb)")]
         [Tooltip("Load-time. AllRAD (default) localizes a touch sharper; EPAD keeps a panned wave's loudness " +
                  "constant over direction by construction (flattest on an irregular array). A by-ear call.")]
-        public BwaBedDecoder bedDecoder = BwaBedDecoder.Allrad;
+        public BwaBedDecoder bedDecoder = BwaBedDecoder.Default;
         [Tooltip("MATRIX: the static SH->speaker decode. PARAMETRIC: DirAC analysis re-pans the directional " +
                  "part through the listener-relative panner — a recorded soundfield becomes WALKABLE " +
-                 "(correct directions + parallax off-centre). Live: beds crossfade, so it A/Bs.")]
+                 "(correct directions + parallax off-center). Live: beds crossfade, so it A/Bs.")]
         public BwaBedRenderer bedRenderer = BwaBedRenderer.Matrix;
         [Tooltip("max-rE weighting on the bed decode (and the FDN's render): tapers the high ambisonic " +
                  "orders — fewer decode sidelobes, better localization AWAY from the sweet spot (the " +
                  "walking-listener case), slightly wider main lobe. Live A/B, level-fair.")]
-        public bool maxRe = false;
+        public bool maxRe = true;
         [Tooltip("Band-split max-rE (needs Max Re on): apply the taper only ABOVE ~700 Hz and keep the " +
                  "unweighted decode below — the ear localizes LF by pressure (plain decode) and HF by " +
                  "energy (max-rE). The Gerzon basic-LF/max-rE-HF split. Bed matrix decodes only. Live A/B.")]
@@ -147,18 +175,18 @@ namespace BwAudio
         [Header("Scene view")]
         [Tooltip("Draw the speaker array. Stopped, these come from the layout FILE. In Play mode they " +
                  "come from the ENGINE (bwa_get_speakers) and light up with each channel's live output " +
-                 "level — so you see the geometry actually being panned over, which is how a failed " +
-                 "layout load looks: the default 26-grid, not your room.")]
+                 "level — so you see the geometry actually being panned over. An empty Layout File shows " +
+                 "as the default 26-grid, not your room.")]
         public bool showSpeakers = true;
         [Range(0.02f, 0.5f)] public float speakerGizmoRadius = 0.12f;
         public bool showSpeakerIndices = true;
 
         [Header("Room box (load-time; optional acoustic geometry)")]
         [Tooltip("A shoebox enclosure for occlusion/reflections, drawn as a yellow wireframe in the " +
-                 "scene view. FLOOR-BASED: centred on the origin in x/z, running from y=0 up to its " +
+                 "scene view. FLOOR-BASED: centered on the origin in x/z, running from y=0 up to its " +
                  "height. For anything more detailed, use AcousticGeometry instead.")]
         public bool enableRoomBox = false;
-        public Vector3 roomSizeMetres = new Vector3(3f, 3f, 3f);
+        public Vector3 roomSizeMeters = new Vector3(3f, 3f, 3f);
         [Tooltip("Material for all six faces. For per-face or custom materials, build the room out of " +
                  "AcousticGeometry objects instead.")]
         public BwaMaterialPreset roomMaterial = BwaMaterialPreset.Concrete;
@@ -182,9 +210,27 @@ namespace BwAudio
         {
             if (Instance != null) { Destroy(gameObject); return; }   // a working manager already owns the engine
 
+            // ABI guard, before any struct crosses the boundary: a stale staged bw_audio.dll after an
+            // ABI break runs with mismatched enums/struct layouts — silent corruption, not a crash. The
+            // header guarantees compatibility only within a major.minor (bw_audio.h, BWA_VERSION), so
+            // refuse on that; a patch difference is compatible and passes.
+            uint dllVersion = Bwa.bwa_get_version();
+            if ((dllVersion >> 8) != (Bwa.BoundVersion >> 8))
+            {
+                Debug.LogError("[bw_audio] ABI version mismatch: bw_audio.dll is " +
+                               Bwa.VersionString(dllVersion) + ", this binding was built against " +
+                               Bwa.VersionString(Bwa.BoundVersion) + ". Refusing to start — restage " +
+                               "the DLL or update the package so they match.");
+                return;                                              // Instance NOT claimed
+            }
+
             var cfg = new BwaDesc {
                 profile = profile,
-                layoutPath = Path.Combine(Application.streamingAssetsPath, layoutFile),
+                // Empty maps to layout_path = NULL — the ABI's only way to run the default grid —
+                // exactly like asioDriver below. Path.Combine of an empty string would yield the
+                // StreamingAssets DIRECTORY: still an explicit path, which fails to load and then
+                // fails bwa_start (BWA_ERR_LAYOUT), leaving the default grid unreachable.
+                layoutPath = layoutFile.Length > 0 ? Path.Combine(Application.streamingAssetsPath, layoutFile) : null,
                 hrtfPath = null, sampleRate = sampleRate, blockSize = blockSize,
                 sink = sink,
                 asioDriver = asioDriver.Length > 0 ? asioDriver : null,
@@ -195,15 +241,18 @@ namespace BwAudio
             if (_eng == IntPtr.Zero) { Debug.LogError("[bw_audio] bwa_create failed"); return; }   // Instance NOT claimed
 
             // The layout resolves inside bwa_create, so the channel count is known before start — and it is
-            // the LAYOUT's speaker count, not a constant. A FAILED load is NOT fatal: the engine falls back
-            // to the built-in 26-speaker grid and only records why in bwa_last_error (which bwa_create sets
-            // for nothing else). On a smaller rig that silently changes the count too, so every source would
-            // be panned over geometry that isn't the one in the room. Say so, loudly.
+            // the LAYOUT's speaker count, not a constant. A failed EXPLICIT load leaves bwa_create usable
+            // on the default 26-grid, but bwa_start then REFUSES the session with BWA_ERR_LAYOUT — only an
+            // empty Layout File (layout_path = NULL) runs the default grid. bwa_last_error carries the load
+            // failure (bwa_create sets it for nothing else), so report it HERE, where the message can name
+            // the layout file and the fix, instead of letting the start failure below say only "layout".
             _channels = Bwa.bwa_get_channel_count(_eng);
             var loadErr = Bwa.LastError(_eng);
             if (loadErr != null)
-                Debug.LogError($"[bw_audio] layout '{cfg.layoutPath}' did not load — the engine fell back to " +
-                               $"its default {_channels}-speaker grid: {loadErr}");
+                Debug.LogError($"[bw_audio] layout '{cfg.layoutPath}' did not load — bwa_start will REFUSE " +
+                               $"to run this session (BWA_ERR_LAYOUT). Fix the file, or clear 'Layout File' " +
+                               $"to run the built-in default {_channels}-speaker grid deliberately. " +
+                               $"Reason: {loadErr}");
 
             ApplyLoadTimeSettings();
             SetupScene();   // acoustic geometry + optional room box -> the engine's scene (load-time)
@@ -287,20 +336,88 @@ namespace BwAudio
         {
             Bwa.bwa_set_panner(_eng, panner);
             Bwa.bwa_set_dual_band(_eng, dualBand);
+            Bwa.bwa_set_dual_band_cap(_eng, dualBandCap);
+            Bwa.bwa_set_spcap_focus(_eng, spcapFocus, spcapDensity);
             Bwa.bwa_set_spread_mode(_eng, spreadMode);
             Bwa.bwa_set_decorrelation(_eng, decorrelation);
             Bwa.bwa_set_near_spread(_eng, nearSpreadRadius);
+            Bwa.bwa_set_hole_spread(_eng, holeSpread);
             Bwa.bwa_set_speed_of_sound(_eng, speedOfSound);
             Bwa.bwa_set_bed_renderer(_eng, bedRenderer);
             Bwa.bwa_set_max_re(_eng, maxRe);
             Bwa.bwa_set_max_re_split(_eng, maxReSplit);
             Bwa.bwa_set_tracked_room_eq(_eng, trackedRoomEq);
+            Bwa.bwa_set_tracked_align_guards(_eng, trackedAlignDeadZone, trackedAlignSlewFramesPerSecond);
+            Bwa.bwa_set_tracked_align(_eng, trackedAlign);
             Bwa.bwa_set_master_gain(_eng, masterGain);
             Bwa.bwa_set_reverb_gain(_eng, reverbGain);   // valid pre-start: seeds whichever reverb bed bwa_start creates
             Bwa.bwa_set_early_reflections_gain(_eng, earlyReflectionGain);
             Bwa.bwa_set_limiter(_eng, limiter);
             Bwa.bwa_set_limiter_ceiling(_eng, limiterCeiling);
             Bwa.bwa_set_pose_prediction(_eng, feedListener ? 0f : posePredictionS);   // internal tracking only
+        }
+
+        // ---- situation tuning (seated / roaming) ----------------------------------------------------
+        //
+        // A preset seeds THE INSPECTOR FIELDS above, then re-pushes them through ApplyLiveSettings. It
+        // deliberately does NOT call bwa_apply_tuning directly: the fields are this component's single
+        // source of truth, and an engine configured behind their back would show stale values and get
+        // silently reverted by the next OnValidate. Seeding them keeps one answer to "what is set".
+        //
+        // For an A/B, call this from a UI button and listen. Everything a preset touches is a live knob,
+        // so switching situations mid-session is audible immediately and needs no restart.
+
+        [Header("Situation tuning")]
+        [Tooltip("A starting point for the live knobs above: Seated optimizes one listening position, " +
+                 "Roaming optimizes a moving listener. Applying a preset OVERWRITES those fields.")]
+        public Bwa.BwaSetup situation = Bwa.BwaSetup.Default;
+
+        /// <summary>
+        /// Overwrite the live knobs from `situation`'s preset and push them. Safe before or during play.
+        /// Returns false only if the preset could not be read.
+        /// </summary>
+        public bool ApplySituation() => ApplySituation(situation);
+
+        /// <summary>Overwrite the live knobs from a named preset and push them.</summary>
+        public bool ApplySituation(Bwa.BwaSetup setup)
+        {
+            Bwa.bwa_tuning_preset(setup, out var t);
+            if (t.structSize == 0) return false;      // the ABI never returns a zero structSize on success
+            situation = setup;
+            AdoptTuning(t);
+            if (Ready) ApplyLiveSettings();
+            return true;
+        }
+
+        /// <summary>Copy a tuning struct into the inspector fields. Does not push; ApplySituation does.</summary>
+        public void AdoptTuning(Bwa.BwaTuning t)
+        {
+            panner        = t.panner;
+            spcapFocus    = t.spcapFocus;
+            spcapDensity  = t.spcapDensity;
+            dualBand      = t.dualBand;
+            dualBandCap   = t.dualBandCap;
+            spreadMode    = t.spreadMode;
+            decorrelation = t.decorrelation;
+            nearSpreadRadius = t.nearSpread;
+            holeSpread    = t.holeSpread;
+            maxRe         = t.maxRe;
+            maxReSplit    = t.maxReSplit;
+            bedRenderer   = t.bedRenderer;
+            trackedRoomEq = t.trackedRoomEq;
+            trackedAlign  = t.trackedAlign;
+            trackedAlignDeadZone            = t.alignDeadZoneM;
+            trackedAlignSlewFramesPerSecond = t.alignSlewFramesPerSecond;
+        }
+
+        /// <summary>
+        /// What the ENGINE currently has, read back rather than assumed. Use it to record what a rig-day
+        /// A/B actually ran with, instead of trusting that the inspector and the engine agree.
+        /// </summary>
+        public bool TryGetEngineTuning(out Bwa.BwaTuning t)
+        {
+            t = default;
+            return Ready && Bwa.bwa_get_tuning(_eng, out t);
         }
 
         // Inspector edits take effect live in Play mode — that IS the workflow for these (the engine makes
@@ -429,14 +546,42 @@ namespace BwAudio
         // ---- live rendering A/B (each of these is atomic / crossfaded engine-side) --------------------
         public void SetPanner(BwaPanner p)        { panner = p;        if (Ready) Bwa.bwa_set_panner(_eng, p); }
         public void SetDualBand(bool on)         { dualBand = on;     if (Ready) Bwa.bwa_set_dual_band(_eng, on); }
+        /// <summary>Compensated amplitude panning on the dual-band low band. Inert unless
+        /// <see cref="SetDualBand"/> is on. Corrects the rendered interaural time difference for the
+        /// tracked head orientation, so an image holds still under head rotation.</summary>
+        public void SetDualBandCap(bool on)      { dualBandCap = on;  if (Ready) Bwa.bwa_set_dual_band_cap(_eng, on); }
+        /// <summary>SPCAP's lobe sharpness and placement-correction density exponent (inert under DBAP/VBAP).
+        /// Pass 0 or less for either to revert THAT one to its default: focus to the value derived from the
+        /// array geometry, density to 2.0. Every source re-solves next block, static ones included.</summary>
+        public void SetSpcapFocus(float focus, float density = 0f)
+            { spcapFocus = focus; spcapDensity = density; if (Ready) Bwa.bwa_set_spcap_focus(_eng, focus, density); }
         public void SetSpreadMode(BwaSpreadMode m){ spreadMode = m;    if (Ready) Bwa.bwa_set_spread_mode(_eng, m); }
         public void SetDecorrelation(bool on)    { decorrelation = on; if (Ready) Bwa.bwa_set_decorrelation(_eng, on); }
         public void SetNearSpread(float radiusM) { nearSpreadRadius = radiusM; if (Ready) Bwa.bwa_set_near_spread(_eng, radiusM); }
+        /// <summary>Floor a source's spread by how far its bearing sits from the nearest speaker, so a source
+        /// aimed into an array HOLE renders as an honest wide source instead of a split image. 0 = off;
+        /// 1 = the honest width. Inert on an array that surrounds the listener, and every source re-solves
+        /// next block, static ones included.</summary>
+        public void SetHoleSpread(float strength) { holeSpread = strength; if (Ready) Bwa.bwa_set_hole_spread(_eng, strength); }
         public void SetBedRenderer(BwaBedRenderer r) { bedRenderer = r; if (Ready) Bwa.bwa_set_bed_renderer(_eng, r); }
         public void SetMaxRe(bool on)            { maxRe = on;        if (Ready) Bwa.bwa_set_max_re(_eng, on); }
         /// <summary>Band-split max-rE (needs max-rE on): taper only above ~700 Hz, plain decode below. Live A/B.</summary>
         public void SetMaxReSplit(bool on)       { maxReSplit = on;   if (Ready) Bwa.bwa_set_max_re_split(_eng, on); }
         public void SetTrackedRoomEq(bool on)    { trackedRoomEq = on; if (Ready) Bwa.bwa_set_tracked_room_eq(_eng, on); }
+        /// <summary>Re-align the array's arrival times on the TRACKED listener instead of the fixed array
+        /// centroid. OFF by default: every delay change is a resampling event, so a walking listener glides
+        /// all 26 delays at once. `deadZoneM` is how far the head must move before anything is recomputed
+        /// (0 = the 5 cm default); `slewFramesPerS` caps how fast a delay may change, in audio frames per
+        /// second (0 = the default, about 63 at 48 kHz, which follows a 0.45 m/s walk). A faster listener
+        /// LAGS rather than pitch-shifting. Off glides back to the layout's own trims.
+        /// The enable and its guards are separate calls, so A/B-ing the toggle never disturbs a dialed
+        /// guard. Order does not matter and the guards are live.</summary>
+        public void SetTrackedAlign(bool on)
+            { trackedAlign = on; if (Ready) Bwa.bwa_set_tracked_align(_eng, on); }
+        /// <summary>The two guards, live. 0 on either takes that one's default.</summary>
+        public void SetTrackedAlignGuards(float deadZoneM, float slewFramesPerSecond)
+            { trackedAlignDeadZone = deadZoneM; trackedAlignSlewFramesPerSecond = slewFramesPerSecond;
+              if (Ready) Bwa.bwa_set_tracked_align_guards(_eng, deadZoneM, slewFramesPerSecond); }
         /// <summary>Lead the TRACKED pose by `seconds` to hide motion-to-ears latency. Internal tracking only
         /// (Feed Listener off) — when Unity feeds the pose, predict on the Unity side instead.</summary>
         public void SetPosePrediction(float seconds)  { posePredictionS = seconds; if (Ready && !feedListener) Bwa.bwa_set_pose_prediction(_eng, seconds); }
@@ -460,7 +605,8 @@ namespace BwAudio
         float[] _levels;
 
         /// <summary>Speaker positions in ROOM space (3 floats each, in channel order) — the geometry the
-        /// engine is actually panning with (the loaded layout, or the default grid it fell back to). The
+        /// engine is actually panning with (the loaded layout, or the default grid when Layout File is
+        /// empty). The
         /// layout is fixed for the engine's lifetime, so this is read once and cached; the array is
         /// reused, so don't mutate it.</summary>
         public float[] SpeakerPositions()
@@ -510,7 +656,7 @@ namespace BwAudio
         /// it when something ELSE owns the timeline (video, timecode, another node), when you want a
         /// minutes-long extrapolation to hold, or to log the rig's drift. False until the fit has ~1 s
         /// of stamps, and again for ~1 s after a restart re-bases the device sample position.</summary>
-        public bool GetClockModel(out Bwa.BwaClockModel model)
+        public bool GetClockModel(out BwaClockModel model)
         {
             model = default;
             return Ready && Bwa.bwa_get_clock_model(_eng, out model);
@@ -521,7 +667,7 @@ namespace BwAudio
         /// or a driver that never flags a valid sample position), in which case a 0 xrun count is
         /// indistinguishable from "never measured". Check it once at startup on an unfamiliar
         /// driver, then poll Xruns for a HUD.</summary>
-        public bool GetHealth(out Bwa.BwaHealth health)
+        public bool GetHealth(out BwaHealth health)
         {
             health = default;
             return Ready && Bwa.bwa_get_health(_eng, out health);
@@ -729,7 +875,7 @@ namespace BwAudio
             {
                 uint mb = ResolvePreset(roomMaterial);
                 var faces = new[] { mb, mb, mb, mb, mb, mb };
-                Bwa.bwa_scene_set_box(_eng, roomSizeMetres.x, roomSizeMetres.y, roomSizeMetres.z, faces);
+                Bwa.bwa_scene_set_box(_eng, roomSizeMeters.x, roomSizeMeters.y, roomSizeMeters.z, faces);
                 _hasStaticMesh = true;
                 return;
             }
@@ -745,7 +891,7 @@ namespace BwAudio
         {
             var verts = new List<float>(); var tris = new List<int>(); var triMat = new List<uint>();
             if (enableRoomBox)
-                AddBox(verts, tris, triMat, roomSizeMetres, ResolvePreset(roomMaterial));
+                AddBox(verts, tris, triMat, roomSizeMeters, ResolvePreset(roomMaterial));
             if (geos != null)
                 foreach (var g in geos)
                 {
@@ -795,7 +941,7 @@ namespace BwAudio
             }
         }
 
-        // Append a FLOOR-based box (room metres: x/z centred, y from 0 up to size.y — matching
+        // Append a FLOOR-based box (room meters: x/z centered, y from 0 up to size.y — matching
         // bwa_scene_set_box), inward-facing normals (the listener is inside).
         static void AddBox(List<float> verts, List<int> tris, List<uint> triMat, Vector3 size, uint mat)
         {
@@ -815,7 +961,7 @@ namespace BwAudio
         }
 
         // Emit a box triangle, flipping the last two indices so its normal points toward the box
-        // centre (toward the ORIGIN would degenerate: a floor-based box's bottom face contains it).
+        // center (toward the ORIGIN would degenerate: a floor-based box's bottom face contains it).
         static void EmitInward(Vector3[] v, Vector3 ctr, List<int> tris, int baseIdx, int i0, int i1, int i2)
         {
             Vector3 n = Vector3.Cross(v[i1] - v[i0], v[i2] - v[i0]);
@@ -881,7 +1027,7 @@ namespace BwAudio
         }
 
         // ---- scene view ------------------------------------------------------------------------------
-        // Everything here is drawn in ROOM metres through the inverse of the coordinate seam, so a wrong
+        // Everything here is drawn in ROOM meters through the inverse of the coordinate seam, so a wrong
         // Room.UnityToRoom puts the array and the box visibly in the wrong place — which is the cheapest
         // possible check on the one setting that silently ruins spatial audio.
         void OnDrawGizmos()
@@ -892,7 +1038,7 @@ namespace BwAudio
             if (enableRoomBox)
             {
                 Gizmos.color = new Color(1f, 0.9f, 0.3f, 0.9f);
-                var size = new Vector3(roomSizeMetres.x, roomSizeMetres.y, roomSizeMetres.z);
+                var size = new Vector3(roomSizeMeters.x, roomSizeMeters.y, roomSizeMeters.z);
                 Gizmos.DrawWireCube(new Vector3(0f, size.y * 0.5f, 0f), size);   // floor-based: y from 0 up
             }
             if (showSpeakers) DrawSpeakers();

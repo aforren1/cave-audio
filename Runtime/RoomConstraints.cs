@@ -6,8 +6,8 @@
 // Unity geometry: the file comes from the survey, and a second copy of it is a second thing to be wrong.
 //
 // Purely a scene-view aid — it drives no audio, and needs no engine (it parses the JSON directly, so it
-// works with the editor stopped). Colours match the raylib tools: green truss, red keep-out, orange
-// obstacles. Room space is floor-based (y = 0 is the floor, x/z centred), so the boxes are drawn through
+// works with the editor stopped). Colors match the raylib tools: green truss, red keep-out, orange
+// obstacles. Room space is floor-based (y = 0 is the floor, x/z centered), so the boxes are drawn through
 // the inverse of the coordinate seam — which means a wrong Room.UnityToRoom puts the whole CAVE visibly
 // in the wrong place, exactly where you want to find out about it.
 using System;
@@ -22,7 +22,7 @@ namespace BwAudio
         [Header("Constraints file (under StreamingAssets)")]
         [Tooltip("The surveyed room: 'bounds' = the speaker truss (speakers must be INSIDE), 'nogo' = " +
                  "keep-out volumes (the screen cube + observer), 'obstacles' = solid objects (projectors). " +
-                 "Room metres, floor-based origin. The same file bwa_layout_tool and bwa_playground read.")]
+                 "Room meters, floor-based origin. The same file bwa_layout_tool and bwa_playground read.")]
         [Clip(".json")] public string constraintsFile = "constraints.json";
 
         [Header("Draw")]
@@ -71,7 +71,7 @@ namespace BwAudio
             if (_data == null) return;
 
             var prev = Gizmos.matrix;
-            Gizmos.matrix = Room.RoomToUnityMatrix();   // the boxes are in ROOM metres
+            Gizmos.matrix = Room.RoomToUnityMatrix();   // the boxes are in ROOM meters
 
             if (showBounds && _data.bounds != null)
                 Wire(_data.bounds, new Color(90 / 255f, 200 / 255f, 120 / 255f, alpha));

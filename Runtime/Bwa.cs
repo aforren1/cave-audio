@@ -3,7 +3,7 @@
 // Pure marshalling layer, no Unity dependency (so it compiles + can be unit-tested standalone; the
 // MonoBehaviour wrappers live in Engine.cs / Emitter.cs). Drop bw_audio.dll + phonon.dll in
 // Assets/Plugins/. THREADING: every call must come from ONE thread (Unity's main thread); the
-// per-frame calls are non-blocking. See https://github.com/aforren1/cave-audio/blob/3c1f0fcc3de4/docs/api.md + https://github.com/aforren1/cave-audio/blob/3c1f0fcc3de4/docs/concurrency.md.
+// per-frame calls are non-blocking. See https://github.com/aforren1/cave-audio/blob/fb85546ccff1/docs/api.md + https://github.com/aforren1/cave-audio/blob/fb85546ccff1/docs/concurrency.md.
 //
 // Marshalling rules that matter here:
 //   * C `bool` is 1 byte  -> [MarshalAs(UnmanagedType.I1)].
@@ -24,7 +24,9 @@ namespace BwAudio
     public enum BwaDirectivity : int { Omni = 0, Cardioid = 1, Figure8 = 2 }
     public enum BwaTestKind : int { Off = 0, Sine = 1, Noise = 2 }
     public enum BwaPanner : int { Dbap = 0, Spcap = 1, Vbap = 2 }
-    public enum BwaBedDecoder : int { Allrad = 0, Epad = 1 }   // sampling is no longer selectable (internal fallback)
+    // Value 0 is RESERVED for default-init and mirrors the C enum: it means "the engine's current
+    // default", not a named algorithm, so the default can move without an ABI break.
+    public enum BwaBedDecoder : int { Default = 0, Allrad = 1, Epad = 2 }
     public enum BwaSpreadMode : int { Lobe = 0, Mdap = 1, Spectral = 2 }
     public enum BwaBedRenderer : int { Matrix = 0, Parametric = 1 }
 
@@ -65,7 +67,7 @@ namespace BwAudio
         [MarshalAs(UnmanagedType.LPUTF8Str)] public string asioDriver;  // ASIO driver name; null = auto-pick
         [MarshalAs(UnmanagedType.I1)] public bool embree;               // Embree ray tracing (falls back if absent)
         [MarshalAs(UnmanagedType.I1)] public bool enablePathing;        // sound-pathing sim at bwa_start (needs SDK + scene)
-        public BwaBedDecoder bedDecoder;                                 // diffuse-bed decoder; 0 = AllRAD (default)
+        public BwaBedDecoder bedDecoder;                                 // diffuse-bed decoder; 0 = the engine default
         public uint reserved0, reserved1, reserved2, reserved3;         // matches reserved[4]; keep zero
     }
 
@@ -276,7 +278,7 @@ namespace BwAudio
         [DllImport(DLL, CallingConvention = CC)] public static extern void bwa_material_release(IntPtr e, uint token);
         [DllImport(DLL, CallingConvention = CC)] public static extern void bwa_scene_set_mesh_mat(IntPtr e, float[] verts, int nverts, int[] tris, int ntris, uint[] triMaterial);
         [DllImport(DLL, CallingConvention = CC)] public static extern void bwa_scene_set_box(IntPtr e, float w, float h, float d, uint[] faces);
-        // The outdoor degenerate of the box: ONE horizontal mirror plane at height y (room metres) — the
+        // The outdoor degenerate of the box: ONE horizontal mirror plane at height y (room meters) — the
         // ground bounce, the dominant early reflection when there is no room. Replaces any prior box
         // (one room at a time); live-safe like the box (reflections re-solve next block); works with and
         // without the Steam build.
@@ -358,7 +360,7 @@ namespace BwAudio
         // tall but not wide. Equal values behave as the isotropic spread; bwa_source_set_spread resets to
         // isotropic (last call wins). Rides the spread mode, the size/near floors, and decorrelation.
         [DllImport(DLL, CallingConvention = CC)] public static extern void  bwa_source_set_extent(IntPtr e, uint s, float width, float height);
-        // Source size in METRES (radius; 0 = point). The physical alternative to the angular spread above:
+        // Source size in METERS (radius; 0 = point). The physical alternative to the angular spread above:
         // the width is the angle the radius subtends from the listener, so a 2 m source STAYS 2 m wide as
         // the listener walks. Floors spread (the larger of the two wins).
         [DllImport(DLL, CallingConvention = CC)] public static extern void  bwa_source_set_size(IntPtr e, uint s, float radiusM);
@@ -375,8 +377,17 @@ namespace BwAudio
         // The engine's active channel count = the layout's speaker count (4..26). Size meter/speaker
         // arrays with this; never hard-code 26 (that is only the compile-time capacity).
         [DllImport(DLL, CallingConvention = CC)] public static extern uint bwa_get_channel_count(IntPtr e);
-        // The DLL's packed BWA_VERSION (major<<16 | minor<<8 | patch) — verify against the bound header rev.
+        // The DLL's packed BWA_VERSION (major<<16 | minor<<8 | patch). Engine.Awake compares it against
+        // BoundVersion below and refuses to start on a major.minor mismatch.
         [DllImport(DLL, CallingConvention = CC)] public static extern uint bwa_get_version();
+        // The BWA_VERSION these bindings were written against (bw_audio.h). The header guarantees enum
+        // values and struct layouts only WITHIN a major.minor, so a DLL with a different major.minor may
+        // marshal every struct in this file wrong — silent corruption, not a crash. Bump this alongside
+        // any re-sync with a header whose BWA_VERSION moved.
+        public const uint BoundVersion = (0u << 16) | (11u << 8) | 0u;   // 0.11.0
+
+        /// <summary>A packed BWA_VERSION as "major.minor.patch", for logs.</summary>
+        public static string VersionString(uint v) => (v >> 16) + "." + ((v >> 8) & 0xFF) + "." + (v & 0xFF);
         // Resolved engine config (zero-defaulted desc fields resolved at create) — derive seconds from these.
         [DllImport(DLL, CallingConvention = CC)] public static extern uint bwa_get_sample_rate(IntPtr e);
         [DllImport(DLL, CallingConvention = CC)] public static extern uint bwa_get_block_size(IntPtr e);
@@ -392,7 +403,17 @@ namespace BwAudio
         // Panner selection (load-time, or live — the switch is atomic): DBAP (moving observer, default),
         // SPCAP or VBAP (both fixed-observer sweet-spot panners).
         [DllImport(DLL, CallingConvention = CC)] public static extern void bwa_set_panner(IntPtr e, BwaPanner panner);
+        // SPCAP's two tuning exponents (inert under DBAP/VBAP; live). focus = lobe sharpness: higher
+        // concentrates a source on fewer speakers, lower spreads it. density = the placement-correction
+        // kernel exponent (2 is the default and rarely worth moving). Pass <= 0 for either to revert THAT
+        // one to its default — focus falls back to a value derived from the array geometry.
+        [DllImport(DLL, CallingConvention = CC)] public static extern void bwa_set_spcap_focus(IntPtr e, float focus, float density);
         [DllImport(DLL, CallingConvention = CC)] public static extern void bwa_set_dual_band(IntPtr e, [MarshalAs(UnmanagedType.I1)] bool on);
+        // Compensated amplitude panning on that low band. REQUIRES dual band (the low band is the only
+        // thing it touches). Constrains the interaural component of the summed field to a real source's,
+        // using the tracked head ORIENTATION, so the image holds still as the listener turns. A no-op
+        // facing the source, and it fades out with source spread.
+        [DllImport(DLL, CallingConvention = CC)] public static extern void bwa_set_dual_band_cap(IntPtr e, [MarshalAs(UnmanagedType.I1)] bool on);
         // How bwa_source_set_spread renders width (live A/B): LOBE (default, one reshaped solve), MDAP
         // (a ring of virtual sources panned with the selected panner — panner-true, ~13x the solve cost),
         // or SPECTRAL (frequency-dependent panning: 6 bands, each to its own direction in the cone — width
@@ -413,6 +434,12 @@ namespace BwAudio
         // Near-listener widening (0 = off): floor every source's spread at 1 - dist/radius, so a source
         // flying at the head widens instead of snapping across the nearest speaker. ~1.0 m is a good start.
         [DllImport(DLL, CallingConvention = CC)] public static extern void bwa_set_near_spread(IntPtr e, float radiusM);
+        // Hole-aware spread floor (0 = off): floor a source's spread by how far its bearing sits from the
+        // nearest speaker, so a source aimed where the array has no speaker (the CAVE barrel's open poles)
+        // renders as an honest wide source instead of a split image across two distant speakers. Zero until
+        // the gap exceeds the array's own mean speaker spacing, so a surrounding array is inert. 1.0 = the
+        // honest width; clamped at 2.
+        [DllImport(DLL, CallingConvention = CC)] public static extern void bwa_set_hole_spread(IntPtr e, float strength);
         [DllImport(DLL, CallingConvention = CC)] public static extern void bwa_set_limiter(IntPtr e, [MarshalAs(UnmanagedType.I1)] bool on);
         [DllImport(DLL, CallingConvention = CC)] public static extern void bwa_set_limiter_ceiling(IntPtr e, float linear);   // linear peak ceiling in (0..1]; default 0.891251f (-1 dBFS)
         // Headphone correction EQ (the headphone-side align stage): parse an AutoEq ParametricEQ.txt
@@ -427,13 +454,73 @@ namespace BwAudio
         [DllImport(DLL, CallingConvention = CC)] public static extern void bwa_set_master_gain(IntPtr e, float linear);
         // How ambisonic BEDS render (live; each bed crossfades — a click-free A/B): MATRIX (default, the
         // static SH->speaker decode) or PARAMETRIC (DirAC: the directional stream is re-panned through the
-        // listener-relative panner, so a recorded soundfield becomes WALKABLE — parallax off-centre).
+        // listener-relative panner, so a recorded soundfield becomes WALKABLE — parallax off-center).
         [DllImport(DLL, CallingConvention = CC)] public static extern void bwa_set_bed_renderer(IntPtr e, BwaBedRenderer renderer);
         // Tracked room EQ (layouts carrying a room_eq_grid): the LF modal cuts follow the live listener
         // position. ON by default when a grid is present; this is the live kill switch. No-op without a grid.
         [DllImport(DLL, CallingConvention = CC)] public static extern void bwa_set_tracked_room_eq(IntPtr e, [MarshalAs(UnmanagedType.I1)] bool on);
+        // Tracked listener alignment (OFF by default). The layout's per-speaker delay/gain trims align the
+        // array at ONE point (the array centroid); this re-references them onto the TRACKED listener, adding
+        // each speaker's extra propagation delay and 1/r level for |speaker - listener| vs |speaker - centroid|.
+        // Opt-in because a moving delay line resamples: a walking listener glides every speaker's delay at
+        // once, which is a Doppler shift on the whole array. deadZoneM (default 0.05) is how far the head must
+        // move before anything is recomputed; slewFramesPerS (default ~63 at 48 kHz, which follows a 0.45 m/s
+        // walk) caps how fast a delay may change, so a faster listener LAGS instead of warbling. Either <= 0
+        // takes the default. Live A/B; off glides back to the layout's own trims.
+        [DllImport(DLL, CallingConvention = CC)] public static extern void bwa_set_tracked_align(IntPtr e, [MarshalAs(UnmanagedType.I1)] bool on);
+        [DllImport(DLL, CallingConvention = CC)] public static extern void bwa_set_tracked_align_guards(IntPtr e, float deadZoneM, float slewFramesPerS);
+
+        // Situation tuning. Fill a BwaTuning from a preset, edit what you disagree with, apply it.
+        // NEVER apply a default(BwaTuning): this struct's zero is not its default (it would force
+        // max-rE off), which is exactly what structSize makes fail loudly.
+        public enum BwaSetup : int { Default = 0, Seated = 1, Roaming = 2 }
+
+        [StructLayout(LayoutKind.Sequential)]
+        public struct BwaTuning
+        {
+            public uint structSize;
+            public BwaPanner panner;
+            public float spcapFocus, spcapDensity;
+            [MarshalAs(UnmanagedType.I1)] public bool dualBand;
+            [MarshalAs(UnmanagedType.I1)] public bool dualBandCap;
+            public BwaSpreadMode spreadMode;
+            [MarshalAs(UnmanagedType.I1)] public bool decorrelation;
+            public float nearSpread, holeSpread;
+            [MarshalAs(UnmanagedType.I1)] public bool maxRe;
+            [MarshalAs(UnmanagedType.I1)] public bool maxReSplit;
+            public BwaBedRenderer bedRenderer;
+            [MarshalAs(UnmanagedType.I1)] public bool trackedRoomEq;
+            [MarshalAs(UnmanagedType.I1)] public bool trackedAlign;
+            public float alignDeadZoneM, alignSlewFramesPerSecond;
+            public uint r0, r1, r2, r3;
+        }
+
+        [DllImport(DLL, CallingConvention = CC)] public static extern void bwa_tuning_preset(BwaSetup setup, out BwaTuning outTuning);
+        [DllImport(DLL, CallingConvention = CC)] [return: MarshalAs(UnmanagedType.I1)]
+        public static extern bool bwa_get_tuning(IntPtr e, out BwaTuning outTuning);
+        // Completion as an EVENT. Drains handles whose voices ended; prefer it over edge-detecting
+        // bwa_source_is_playing, which misses any sound shorter than your frame interval.
+        [DllImport(DLL, CallingConvention = CC)] public static extern uint bwa_poll_ended(IntPtr e, [Out] uint[] outHandles, uint cap, out ulong dropped);
+        // The ISM shoebox WITHOUT replacing the static mesh, and the box's own triangles, so the
+        // box can be composed with your geometry instead of replacing it.
+        [DllImport(DLL, CallingConvention = CC)] public static extern void bwa_scene_set_ism_room(IntPtr e, float w, float h, float d, uint[] faces);
+        [DllImport(DLL, CallingConvention = CC)] [return: MarshalAs(UnmanagedType.I1)]
+        public static extern bool bwa_box_mesh(float w, float h, float d, uint[] faces, [Out] float[] outVerts, [Out] int[] outTris, [Out] uint[] outTriMaterial);
+        [DllImport(DLL, CallingConvention = CC)] [return: MarshalAs(UnmanagedType.I1)]
+        public static extern bool bwa_apply_tuning(IntPtr e, ref BwaTuning t);
         // Offline panner evaluation (no engine handle): out = nsrc*n gains for a layout/panner; for layout scoring.
-        [DllImport(DLL, CallingConvention = CC)] public static extern uint bwa_panner_gains_batch(BwaPanner panner, float[] positions, uint n, float[] lis, float[] srcs, uint nsrc, [Out] float[] outGains);
+        // focus/density are SPCAP's tuning knobs, same <= 0 = default sentinel as bwa_set_spcap_focus, and
+        // inert under DBAP/VBAP. Pass 0, 0 to score at the focus this array's geometry derives.
+        [DllImport(DLL, CallingConvention = CC)] public static extern uint bwa_panner_gains_batch(BwaPanner panner, float[] positions, uint n, float[] lis, float[] srcs, uint nsrc, float focus, float density, [Out] float[] outGains);
+        // The pure companion of bwa_set_spcap_focus (no engine handle): the focus its <= 0 sentinel
+        // reverts to, derived from n speaker positions (3 floats each) — so a tool can show what an
+        // in-progress layout implies before you override it. Returns 0 on bad arguments.
+        [DllImport(DLL, CallingConvention = CC)] public static extern float bwa_spcap_focus_default(float[] positions, uint n);
+        // The BED counterpart of the panner batch: per-speaker gains of the diffuse-bed decode (the
+        // engine's real AllRAD/EPAD builds, optional max-rE) for ndir plane-wave DIRECTIONS (unit
+        // vectors — a bed is content at infinity) over a layout of n speaker positions. outGains =
+        // ndir*n floats (gains may be negative — SH sidelobes); returns ndir. Pure and reentrant.
+        [DllImport(DLL, CallingConvention = CC)] public static extern uint bwa_bed_gains_batch(BwaBedDecoder decoder, [MarshalAs(UnmanagedType.I1)] bool maxRe, float[] positions, uint n, float[] dirs, uint ndir, [Out] float[] outGains);
 
         // ---- listener + frame boundary ----
         [DllImport(DLL, CallingConvention = CC)] public static extern void bwa_set_listener_pose(IntPtr e, float px, float py, float pz, float qx, float qy, float qz, float qw);

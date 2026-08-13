@@ -3,7 +3,7 @@
 // Both share "up" and "forward", so the baseline conversion is a single X mirror (Unity's +X/right
 // becomes the room's -X, which IS the room's right for a +Z-facing listener). Getting this wrong
 // silently ruins spatial audio (front/back or left/right swaps), so it lives in one place.
-// See https://github.com/aforren1/cave-audio/blob/3c1f0fcc3de4/docs/integration.md.
+// See https://github.com/aforren1/cave-audio/blob/fb85546ccff1/docs/integration.md.
 using UnityEngine;
 
 namespace BwAudio
@@ -24,7 +24,7 @@ namespace BwAudio
         public static bool ReversesWinding(Matrix4x4 localToWorld)
             => (-1f * UnityToRoom.determinant * localToWorld.determinant) < 0f;   // the -1 is the X negation
 
-        /// <summary>Unity world position -> room space (RH metres).</summary>
+        /// <summary>Unity world position -> room space (RH meters).</summary>
         public static Vector3 Pos(Vector3 v)
         {
             v = UnityToRoom.MultiplyPoint3x4(v);
@@ -33,7 +33,7 @@ namespace BwAudio
 
         /// <summary>Room space -> Unity world, the inverse of Pos(). For DRAWING what the engine reports
         /// back in room coordinates (the acoustic room box, speaker positions from bwa_get_speakers): set
-        /// it as Gizmos.matrix and then draw in plain room metres. Handy side effect — a wrong
+        /// it as Gizmos.matrix and then draw in plain room meters. Handy side effect — a wrong
         /// UnityToRoom makes the gizmo land visibly in the wrong place.</summary>
         public static Matrix4x4 RoomToUnityMatrix()
             => UnityToRoom.inverse * Matrix4x4.Scale(new Vector3(-1f, 1f, 1f));   // the X mirror is its own inverse

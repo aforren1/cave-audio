@@ -10,5 +10,5 @@
     "autoReferenced": true,
     "defineConstraints": [],
     "versionDefines": [],
-    "noBwAudioReferences": false
+    "noEngineReferences": false
 }

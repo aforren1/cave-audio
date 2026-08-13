@@ -37,7 +37,7 @@ namespace BwAudio.EditorTools
                 Debug.Log("[bw_audio] Unity built-in audio disabled. Re-enter Play mode to apply.");
         }
 
-        // grey out the menu item once it's already disabled
+        // gray out the menu item once it's already disabled
         [MenuItem("Tools/BwAudio/Disable Unity Audio", isValidateFunction: true)]
         static bool DisableUnityAudio_Validate() => !IsUnityAudioDisabled();
 

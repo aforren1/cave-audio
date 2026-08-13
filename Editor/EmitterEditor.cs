@@ -33,7 +33,7 @@ namespace BwAudio.EditorTools
 
             serializedObject.ApplyModifiedProperties();   // fires Emitter.OnValidate -> live re-push
 
-            if (e.spread > 0f && e.sizeMetres > 0f)
+            if (e.spread > 0f && e.sizeMeters > 0f)
                 EditorGUILayout.HelpBox(
                     "Spread and Size both set. They don't add up — the engine takes the WIDER of the two, " +
                     "and Size (a physical radius) usually wins as the listener gets close. Pick one.",

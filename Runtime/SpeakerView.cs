@@ -6,7 +6,7 @@
 // renderers, which is what this makes. Same data behind both (bwa_get_speakers + bwa_get_bus_levels).
 //
 // The markers are UNLIT on purpose: a CAVE is dark, and a lit material would need lights and would read
-// as geometry. Unlit means the colour you compute IS the colour you see, so a hot channel glows.
+// as geometry. Unlit means the color you compute IS the color you see, so a hot channel glows.
 //
 // It reads levels and draws; it never writes audio state. Deleting it changes nothing you can hear.
 using System;
@@ -19,13 +19,13 @@ namespace BwAudio
     public sealed class SpeakerView : MonoBehaviour
     {
         [Header("Markers")]
-        [Tooltip("Marker radius in metres.")]
+        [Tooltip("Marker radius in meters.")]
         [Range(0.01f, 0.5f)] public float radius = 0.08f;
         [Tooltip("Grow the marker with level as well as brightening it — easier to read from across the room.")]
         public bool scaleWithLevel = true;
         [Range(1f, 3f)] public float maxScale = 1.8f;
 
-        [Header("Colour")]
+        [Header("Color")]
         public Color idle = new Color(0.10f, 0.22f, 0.35f);   // dim, but visible: you can still see the array
         public Color hot  = new Color(1.00f, 0.60f, 0.15f);
 
@@ -115,26 +115,9 @@ namespace BwAudio
             }
         }
 
-        // The colour property differs by pipeline (URP/HDRP use _BaseColor, built-in Unlit uses _Color),
-        // so pick the shader first, then ask the material which one it actually has.
-        Material MakeUnlitMaterial()
-        {
-            string[] shaders = { "Universal Render Pipeline/Unlit", "HDRP/Unlit", "Unlit/Color", "Sprites/Default" };
-            foreach (var name in shaders)
-            {
-                var sh = Shader.Find(name);
-                if (sh == null) continue;
-                var m = new Material(sh) { hideFlags = HideFlags.DontSave };
-                foreach (var prop in new[] { "_BaseColor", "_UnlitColor", "_Color" })
-                {
-                    if (!m.HasProperty(prop)) continue;
-                    _colorId = Shader.PropertyToID(prop);
-                    return m;
-                }
-                DestroyImmediate(m);
-            }
-            return null;
-        }
+        // Shared with RoomView: same pipeline-dependent shader and color-property search. See
+        // UnlitMaterial.cs for why the property is discovered rather than assumed.
+        Material MakeUnlitMaterial() => UnlitMaterial.Make(out _colorId);
 
         void OnDisable() => Teardown();
 
