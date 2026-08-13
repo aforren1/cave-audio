@@ -4,6 +4,8 @@ All notable changes to `com.brainworks.bw_audio`.
 
 ## [Unreleased]
 
+## [0.6.0]
+
 ### Fixed: the default speaker grid was unreachable, and the binding claimed a failed layout was survivable
 
 `Engine` always passed an explicit `layout_path`, so there was no way to express `layout_path = NULL`,
