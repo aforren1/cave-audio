@@ -4,6 +4,8 @@
 /out/
 # CI staging + the packed UPM tarball (tools/upm/pack.ps1)
 /dist/
+# scratch folder
+/temp/
 # nothing here publishes to a registry, but keep this ignored so a stray `npm login`
 # can never commit an auth token
 .npmrc
