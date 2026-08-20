@@ -7,6 +7,7 @@
 // mono file is rejected by the engine. AmbiX by default; tick `fumaClip` for legacy FuMa recordings
 // (converted at load). FLAC is the natural lossless container; MP3 can't carry ambisonics.
 using System;
+using System.Collections;
 using UnityEngine;
 
 namespace BwAudio
@@ -20,6 +21,13 @@ namespace BwAudio
         public bool fumaClip = false;
         public bool loop = true;
         public bool playOnEnable = true;
+        [Tooltip("Decode the soundfield on the engine's loader thread instead of blocking this one. " +
+                 "Play() returns immediately and the bed stays SILENT until the data lands, then starts " +
+                 "from the top with nothing skipped. Beds are the biggest assets in a scene (4/9/16 " +
+                 "channels, usually long), so this is the one that hurts most to load in-frame. For " +
+                 "content that appears MID-SESSION (a streamed-in level, a downloaded ambience). Leave " +
+                 "OFF for the CAVE's normal path, which is load-time and synchronous.")]
+        public bool loadAsync = false;
         [Range(0f, 1f)] public float gain = 1f;
         [Tooltip("Turn the soundfield about the vertical axis (degrees, Unity's sense) — line a recording " +
                  "up with the scene, or spin it slowly for effect. Glides to the target (~1 turn/s), so it " +
@@ -33,6 +41,8 @@ namespace BwAudio
 
         uint _bed;
         bool _created;
+        uint _pending;                         // an async asset bound to this bed but not yet decoded (0 = none)
+        bool _watching;                        // a WatchPendingLoad coroutine is running
         Engine _owner;                         // the Engine this bed was created under
 
         // Valid only while the CREATING Engine is still the live instance (SourceBase's guard, same
@@ -69,17 +79,63 @@ namespace BwAudio
                                             pitchDegrees * Mathf.Deg2Rad, rollDegrees * Mathf.Deg2Rad);
         }
 
-        /// <summary>Play `clip` (or an override) as the soundfield, loading it on demand.</summary>
+        // The load flags ARE the bed's kind: the engine judges an async play against them (the asset
+        // reports 0 channels until its decode lands, so the channel count cannot judge it yet), and a
+        // handle acquired mono would be refused by bwa_bed_play. FuMa converts to AmbiX at load, so
+        // past the acquire the two are the same asset kind.
+        BwaLoadFlags LoadFlags => fumaClip ? BwaLoadFlags.Fuma : BwaLoadFlags.Ambix;
+
+        /// <summary>Play `clip` (or an override) as the soundfield, loading it on demand.
+        /// With `loadAsync` on this returns immediately and the field starts, from its first frame, on
+        /// the block its data lands.</summary>
         public void Play(string clipOverride = null)
         {
             if (!Live) return;
+            var engine = Engine.Instance;
+            if (!engine) return;
             var path = clipOverride ?? clip;
-            uint snd = fumaClip ? Engine.Instance.LoadFuma(path)      // FuMa converts at load
-                                : Engine.Instance.LoadAmbix(path);    // rejects mono
-            if (snd != 0) Bwa.bwa_bed_play(Eng, _bed, snd, loop);
+            bool held = false;
+            uint snd;
+            if (loadAsync)
+            {
+                snd = engine.AcquireAsync(path, LoadFlags);            // returns at once; rt holds the play
+                if (snd != 0) held = !engine.IsSoundReady(snd, out _);
+            }
+            else snd = engine.Acquire(path, LoadFlags);                // blocking decode; rejects mono
+            if (snd == 0) return;
+            Bwa.bwa_bed_play(Eng, _bed, snd, loop);
+            // Always overwrite: a second Play that resolved READY supersedes a still-pending first one,
+            // and leaving the watch on the old handle would later warn that the bed "stays silent" while
+            // the new clip is audibly playing.
+            _pending = held ? snd : 0;          // a watch already running picks the new handle up
+            if (held && !_watching) StartCoroutine(WatchLoop());
         }
 
-        public void Stop() { if (Live) Bwa.bwa_bed_stop(Eng, _bed); }
+        // While an async load is in flight the bed is bound and silent, which looks exactly like a decode
+        // that FAILED — a failure never becomes ready. A bed is world-locked, so unlike a source it has
+        // no per-frame push to poll from; the watch is a coroutine that exists only while a load is in
+        // flight, and Unity stops it when the component is disabled (OnDisable clears _pending, so a
+        // re-enable starts a fresh one rather than leaving a dead handle behind).
+        IEnumerator WatchLoop()
+        {
+            _watching = true;                   // set before StartCoroutine returns (the body runs to the
+            while (_pending != 0)               // first yield inline), so Play never starts a second watch
+            {
+                yield return null;
+                // Live-gated like Emitter's poll: the engine can be destroyed and replaced mid-decode,
+                // and the helper resolves Engine.Instance fresh, so an ungated probe would ask the
+                // SUCCESSOR engine about this engine's handle. Drop the watch instead.
+                if (!Live) { _pending = 0; break; }
+                _pending = Engine.WatchPendingLoad(_pending, this, "bed");
+            }
+            _watching = false;
+        }
+
+        public void Stop()
+        {
+            _pending = 0;                        // the engine cancels a held play on stop; stop watching it
+            if (Live) Bwa.bwa_bed_stop(Eng, _bed);
+        }
 
         /// <summary>Current playhead into the soundfield clip, in engine-rate frames (latest-wins
         /// readback, ~one audio block of lag; freezes while the bed is paused). 0 while idle;
@@ -129,6 +185,8 @@ namespace BwAudio
 
         void OnDisable()
         {
+            StopAllCoroutines();                 // cancel a running WatchPendingLoad
+            _pending = 0; _watching = false;    // StopAllCoroutines never runs its exit line
             if (Live)                            // owner gone (engine destroyed/replaced) -> Live is false:
                 Bwa.bwa_bed_destroy(Eng, _bed);  // the stale handle never destroys a successor's bed
             _created = false;

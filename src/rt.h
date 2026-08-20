@@ -27,6 +27,7 @@
 #define BWA_RT_H
 
 #include "sink.h"          /* bwa_timestamp, BWA_CHANNELS */
+#include "sound.h"         /* SoundData (for the async staging calls at the end of the assets block) */
 #include "layout.h"        /* Layout (for rt_set_layout) */
 #include "pose.h"          /* PoseSlot (for rt_set_tracker) */
 #include "ism.h"           /* IsmRoom (for rt_set_ism_room) */
@@ -72,7 +73,14 @@ enum {
     CMD_QUEUE,      /* append a sound to a voice's gapless play queue (rt_source_queue / chaining) */
     CMD_QUEUE_CLEAR,/* drop a voice's pending play queue (rt_source_clear_queue) */
     CMD_SET_NF,     /* per-voice near-field proximity boost enable */
-    CMD_SET_DIR     /* per-voice MANUAL directivity: forward axis + weighted-dipole pattern (no-sim path) */
+    CMD_SET_DIR,    /* per-voice MANUAL directivity: forward axis + weighted-dipole pattern (no-sim path) */
+    CMD_SRC_CFG,    /* per-voice CONFIGURATION in one command (rt_source_apply_cfg / bwa_source_apply):
+                     * every ring-carried per-source knob at once, so a struct apply costs ONE ring
+                     * slot instead of fifteen. The payload is packed (bitfield flags) to keep the
+                     * Cmd union at the width `exlis` already sets — a wider Cmd would tax every
+                     * command in the ring for the benefit of this one. */
+    CMD_GROUP_STOP, /* click-free stop of every voice in one mix group (rt_group_stop) */
+    CMD_STOP_ALL    /* click-free stop of every voice, whatever its group (rt_stop_all) */
 };
 typedef struct {
     uint8_t  type;
@@ -112,8 +120,24 @@ typedef struct {
         struct { uint8_t on; }                         nf;    /* per-voice near-field proximity boost enable */
         struct { float fwd[3], weight, power; }        dir;   /* manual directivity: forward axis (room, unit)
                                                                * + dipole weight 0..1 / power (weight 0 = off) */
+        /* One-command per-voice configuration (CMD_SRC_CFG). Sanitized on the control thread by
+         * rt_source_apply_cfg, exactly like the individual setters it replaces. 9 floats + 2 bytes
+         * = 40, which is what `exlis` already costs, so this member does NOT widen Cmd. */
+        struct { float gain, pitch, spread, extent_h, size_m, rsend, aref, aroll, amin;
+                 uint8_t group, flags; }               cfg;
     } u;
 } Cmd;
+
+/* CMD_SRC_CFG boolean payload. Packed rather than nine bytes so the cfg member stays inside the
+ * union's existing width (see the member's comment). */
+#define BWA_CFG_DOPPLER 0x01u
+#define BWA_CFG_AIR     0x02u
+#define BWA_CFG_LDC     0x04u
+#define BWA_CFG_NF      0x08u
+#define BWA_CFG_ISM     0x10u
+#define BWA_CFG_REVERB  0x20u
+#define BWA_CFG_RDIST   0x40u
+#define BWA_CFG_PATH    0x80u
 
 /* Event ring payload (audio -> control). */
 /* EVT_VOICE_ENDED means RECYCLE this transient handle (a oneshot finishing, or a stolen slot).
@@ -191,6 +215,11 @@ void    rt_set_ism_gain(RtCore* c, float linear);
 void    rt_set_all_paused(RtCore* c, int paused);         /* global pause gate (rides pause_gate); live */
 void    rt_group_set_gain(RtCore* c, uint32_t group, float linear);   /* mix-group gain (enqueue) */
 void    rt_group_set_paused(RtCore* c, uint32_t group, bool paused);  /* mix-group pause (enqueue) */
+/* Click-free stop of a whole group / of everything (enqueue; one command each). Every matching
+ * voice takes rt_source_stop's one-block fade and drops its pending chain. An out-of-range group
+ * is ignored, as with the gain/pause calls. */
+void    rt_group_stop(RtCore* c, uint32_t group);
+void    rt_stop_all(RtCore* c);
 uint32_t rt_active_voices(RtCore* c);                     /* control thread: last block's active voice count */
 uint64_t rt_stream_starves(RtCore* c);                    /* streamed voices that ran dry without ending */
 void    rt_set_limiter(RtCore* c, int on);           /* output protection limiter (final stage; default ON); live */
@@ -254,6 +283,30 @@ bool     rt_unload_sound(RtCore* c, uint32_t sound);  /* safe any time; retire-a
                                                        * false = command ring full, nothing enqueued:
                                                        * retry later (internal sounds park in rt.c) */
 
+/* ---- async staging (control thread; the asset cache's half of bwa_sound_acquire_async) ----
+ * A RESERVED slot is a live, generation-counted sound handle whose PCM has not arrived yet. The
+ * audio thread must never hold a pointer into a slot the control thread is still going to write,
+ * so every bind path refuses a reserved handle; a play issued against one is HELD here and
+ * re-issued by rt_sound_publish, which makes it an ordinary CMD_PLAY carrying finished data. That
+ * is the whole synchronization: the existing command-ring release/acquire publishes the buffer,
+ * exactly as it does for a synchronous load. Nothing new reaches the audio thread. */
+uint32_t rt_sound_reserve(RtCore* c, char* err, size_t errcap);  /* 0 = sound table full */
+bool     rt_sound_pending(RtCore* c, uint32_t sound);            /* reserved, data not published yet */
+/* Publish decoded PCM into a reserved slot and release every play held against it. Takes OWNERSHIP
+ * of *d. false = stale or not-reserved handle, and then the CALLER still owns *d (sound_unload it).
+ * A held play whose KIND disagrees with the decoded asset (a bed play that resolved to mono, or a
+ * point-source play that resolved to 4/9/16 channels) is DROPPED here, not bound, and counted in
+ * rt_held_kind_drops. A reserved slot reports 0 channels, so this is the first moment the kind can
+ * be checked at all. */
+bool     rt_sound_publish(RtCore* c, uint32_t sound, const SoundData* d);
+/* Running total of the held plays rt_sound_publish dropped for a kind mismatch (control thread).
+ * Monotonic, so a caller compares it against what it last saw; engine.c does exactly that in
+ * bwa_commit and reports each new drop through bwa_last_error. */
+uint64_t rt_held_kind_drops(RtCore* c);
+/* Drop a reserved slot whose load failed or was cancelled: discard the held plays and recycle the
+ * handle. No retire-ack is needed because the audio thread was never given the slot. */
+void     rt_sound_abandon(RtCore* c, uint32_t sound);
+
 /* ---- control thread: handle allocation is synchronous, the rest enqueue ---- */
 uint32_t rt_source_create(RtCore* c);                 /* steals the lowest-priority source if the table is full */
 /* PUSH source (procedural audio): a source whose voice plays caller-pushed PCM through a per-source
@@ -278,6 +331,10 @@ void rt_source_set_gain(RtCore* c, uint32_t h, float linear);
 void rt_source_play    (RtCore* c, uint32_t h, uint32_t sound, bool loop);
 void rt_source_play_at (RtCore* c, uint32_t h, uint32_t sound, bool loop, uint64_t start_sample);  /* sample-accurate */
 void rt_source_play_loop(RtCore* c, uint32_t h, uint32_t sound, uint64_t loop_beg, uint64_t loop_end);  /* intro->loop region */
+/* Same bind as rt_source_play, tagged as an ambisonic BED. A bed is the same voice on the same
+ * path, so the only difference is the kind recorded for an async (held) play — the voice itself
+ * cannot be asked later which kind the caller meant. engine.c's bwa_bed_play calls this. */
+void rt_bed_play       (RtCore* c, uint32_t h, uint32_t sound, bool loop);
 void rt_source_stop    (RtCore* c, uint32_t h);
 void rt_source_stop_at (RtCore* c, uint32_t h, uint64_t stop_sample);   /* click-free stop when the dsp clock reaches it */
 void rt_source_queue   (RtCore* c, uint32_t h, uint32_t sound, bool loop);  /* chain: play after the current sound ends (gapless) */
@@ -301,6 +358,19 @@ void rt_source_set_extent(RtCore* c, uint32_t h, float w, float hgt);/* anisotro
 void rt_source_set_attenuation(RtCore* c, uint32_t h, float ref_m, float rolloff, float min_lin);  /* per-source curve;
                                                                       * ref <= 0 = back to the layout's; rolloff 0 = constant */
 void rt_source_set_size  (RtCore* c, uint32_t h, float radius_m);    /* source METRIC size: spread from subtended angle */
+/* Every ring-carried per-source knob at once (bwa_source_apply). Same fields, same units, and the
+ * same control-thread sanitizing as the individual setters above — it is one COMMAND, not one
+ * semantics. Anything per-frame (position, orientation, playback state) is deliberately absent, and
+ * so is anything that never reaches the ring (steal priority, the occlusion/directivity sims —
+ * engine.c owns those). extent_h < 0 = isotropic (the spread field is then the whole width);
+ * atten_ref <= 0 clears the distance-attenuation override. */
+typedef struct RtSrcCfg {
+    float gain, pitch, spread, extent_h, size_m, reverb_send;
+    float atten_ref, atten_rolloff, atten_min;
+    uint32_t group;
+    bool  doppler, air, loudness_comp, proximity, early_reflections, reverb, reverb_distance, pathing;
+} RtSrcCfg;
+void rt_source_apply_cfg(RtCore* c, uint32_t h, const RtSrcCfg* cfg);
 void rt_source_fade_to   (RtCore* c, uint32_t h, float gain, float seconds, bool stop_at_end);  /* timed fade */
 void rt_source_set_group (RtCore* c, uint32_t h, uint32_t group);    /* mix-group assignment (0 = default) */
 void rt_source_set_pitch (RtCore* c, uint32_t h, float rate);        /* playback rate [0.25, 4]; glided */

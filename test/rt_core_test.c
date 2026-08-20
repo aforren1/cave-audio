@@ -14,6 +14,20 @@
  * dsp_test.c and rt_feature_test.c.
  */
 #include "rt_test_util.h"
+#include "sound.h"        /* SoundData, for the async-staging (rt_sound_publish) section */
+
+/* A decoded asset built by hand, so the async-staging section can publish a KIND of its choosing
+ * into a reserved slot without a file behind it. rt_sound_publish takes ownership of the pcm and
+ * frees it through the ordinary retire path, so it must be malloc'd. */
+static SoundData make_test_pcm(uint16_t channels, uint32_t frames, float value) {
+    SoundData d;
+    memset(&d, 0, sizeof d);
+    d.pcm = (float*)malloc((size_t)frames * channels * sizeof(float));
+    if (d.pcm) for (uint32_t i = 0; i < frames * channels; ++i) d.pcm[i] = value;
+    d.frames = frames; d.sample_rate = RATE; d.channels = channels;
+    d.order = (channels == 4) ? 1 : (channels == 9) ? 2 : (channels == 16) ? 3 : 0;
+    return d;
+}
 
 int main(void) {
     LD = layout_default();                          /* listener stays at the default (the array center, LD.ref) */
@@ -209,6 +223,123 @@ int main(void) {
             rt_source_destroy(cq, h1); rt_source_destroy(cq, h2); rt_commit(cq);
             rt_destroy(cq);
         }
+    }
+
+    /* group STOP + stop-all (rt_group_stop / rt_stop_all): the scene-transition pair. Both take the
+     * SAME click-free one-block fade rt_source_stop takes, so the assertions are (a) only the
+     * addressed group went quiet, (b) the fade is a RAMP and not a cut — no sample-to-sample step
+     * bigger than the ramp itself, which is exact here because the default layout's trims are unity
+     * gain / zero delay. Three voices in three groups at three speakers, so (a) reads per-channel. */
+    {
+        RtCore* cg = rt_create(8, 4, RATE, CH);
+        CHECK(cg != NULL, "rt_create (group stop)");
+        if (cg) {
+            uint32_t sg = rt_load_sound(cg, WAV, err, sizeof err);
+            uint32_t g1 = rt_source_create(cg), g2 = rt_source_create(cg), g0 = rt_source_create(cg);
+            rt_source_play(cg, g1, sg, true); set_pos_spk(cg, g1, 3);  rt_source_set_group(cg, g1, 1);
+            rt_source_play(cg, g2, sg, true); set_pos_spk(cg, g2, 20); rt_source_set_group(cg, g2, 2);
+            rt_source_play(cg, g0, sg, true); set_pos_spk(cg, g0, 10); /* left in group 0, the default */
+            rt_source_set_gain(cg, g1, 0.5f); rt_source_set_gain(cg, g2, 0.5f); rt_source_set_gain(cg, g0, 0.5f);
+            rt_commit(cg);
+            bwa_timestamp tg = { 0, 0 };
+            for (int b = 0; b < 4; ++b) rt_render(cg, bus, N, &tg);   /* gains settled: a flat block */
+            double b3 = chan_energy(3), b20 = chan_energy(20), b10 = chan_energy(10);
+            CHECK(b3 > 0.1 && b20 > 0.1 && b10 > 0.1, "group stop: all three voices render");
+
+            rt_group_stop(cg, 9999u);                    /* out of range: ignored, as group gain/pause are */
+            rt_render(cg, bus, N, &tg);
+            CHECK(chan_energy(3) > b3 * 0.9 && chan_energy(20) > b20 * 0.9 && chan_energy(10) > b10 * 0.9,
+                  "group stop: an out-of-range group id is ignored");
+
+            /* THE fade block. Keep the previous block's last sample so the block SEAM is covered too:
+             * a hard cut would show up as one step of the full level, at i = 0 or anywhere inside. */
+            float  prev_last = bus[(size_t)3 * N + (N - 1)];
+            double peak = 0;
+            for (int i = 0; i < N; ++i) { double a = fabs(bus[(size_t)3 * N + i]); if (a > peak) peak = a; }
+            rt_group_stop(cg, 1);
+            rt_render(cg, bus, N, &tg);
+            double step_max = fabs(bus[(size_t)3 * N + 0] - prev_last);
+            for (int i = 1; i < N; ++i) {
+                double s = fabs(bus[(size_t)3 * N + i] - bus[(size_t)3 * N + i - 1]);
+                if (s > step_max) step_max = s;
+            }
+            CHECK(peak > 1e-3 && step_max < 4.0 * peak / (double)N,
+                  "group stop: the stop is a one-block ramp, no discontinuity (invariant 4)");
+            CHECK(chan_energy(3) > b3 * 0.2 && chan_energy(3) < b3 * 0.9,
+                  "group stop: the fade block is a partial level, not a hard cut");
+
+            rt_render(cg, bus, N, &tg);                  /* the fade has landed */
+            CHECK(chan_energy(3) < b3 * 0.10, "group stop: the addressed group is silent");
+            CHECK(chan_energy(20) > b20 * 0.9 && chan_energy(10) > b10 * 0.9,
+                  "group stop: the other groups are untouched");
+            CHECK(!rt_source_is_playing(cg, g1), "group stop: the member's voice ended");
+            CHECK(rt_source_is_playing(cg, g2) && rt_source_is_playing(cg, g0),
+                  "group stop: non-members keep playing");
+
+            rt_source_play(cg, g1, sg, true);            /* a stopped handle stays VALID: re-play works */
+            rt_commit(cg);
+            for (int b = 0; b < 4; ++b) rt_render(cg, bus, N, &tg);
+            CHECK(chan_energy(3) > b3 * 0.9, "group stop: a stopped source handle re-plays");
+
+            rt_stop_all(cg);
+            rt_render(cg, bus, N, &tg);
+            CHECK(total_energy() > 1e-3, "stop_all: the fade block is still audible (not a hard cut)");
+            rt_render(cg, bus, N, &tg);
+            CHECK(total_energy() < 1e-6, "stop_all: everything is silent");
+            CHECK(!rt_source_is_playing(cg, g1) && !rt_source_is_playing(cg, g2)
+                  && !rt_source_is_playing(cg, g0), "stop_all: every voice ended, whatever its group");
+            /* The gauge is the PREVIOUS block's count, taken at the top of the mix loop, and the
+             * stop finalizes inside pause_gate partway through that same block. So the dying voices
+             * are still counted for the block they die in (true of bwa_source_stop too); the gauge
+             * reads 0 one block later. */
+            rt_render(cg, bus, N, &tg);
+            CHECK(rt_active_voices(cg) == 0, "stop_all: the active-voice gauge drops to 0");
+
+            rt_group_stop(NULL, 0); rt_stop_all(NULL);   /* NULL core: safe no-ops (bwa_* NULL: abuse_test) */
+
+            /* a stop is not a mixer reset: group gain / pause survive it, so a re-played scene comes
+             * back at the levels the client dialed rather than silently at unity */
+            rt_group_set_gain(cg, 1, 0.25f);
+            rt_stop_all(cg); rt_render(cg, bus, N, &tg); rt_render(cg, bus, N, &tg);
+            rt_source_play(cg, g1, sg, true); rt_commit(cg);
+            for (int b = 0; b < 4; ++b) rt_render(cg, bus, N, &tg);
+            CHECK(fabs(20.0 * log10(chan_energy(3) / b3) + 12.04) < 0.8,
+                  "stop_all: group gain survives the stop (a stop is not a mixer reset)");
+
+            rt_source_destroy(cg, g1); rt_source_destroy(cg, g2); rt_source_destroy(cg, g0);
+            rt_commit(cg);
+            rt_destroy(cg);
+        }
+    }
+
+    /* oneshot + stop_all: a oneshot's transient handle is engine-internal, so ONLY an
+     * EVT_VOICE_ENDED ever recycles its slot. Before rt_stop_all no public call could stop one; the
+     * voice-table sweep can, so the stop path has to free the slot exactly as a natural end does.
+     * Fill the pool with oneshots, stop them all, and check every slot came back. */
+    {
+        RtCore* co = rt_create(4, 4, RATE, CH);
+        CHECK(co != NULL, "rt_create (oneshot stop_all)");
+        if (co && write_const_wav("bwa_rt_oneshot.wav", 0.5f, 64 * N)) {   /* long: only the stop ends it */
+            uint32_t so = rt_load_sound(co, "bwa_rt_oneshot.wav", err, sizeof err);
+            bwa_timestamp to = { 0, 0 };
+            for (int k = 0; k < 4; ++k) CHECK(rt_play_oneshot(co, so, 1.f, 1.5f, 1.f, 0.25f), "oneshot fires");
+            rt_commit(co);
+            rt_render(co, bus, N, &to); rt_render(co, bus, N, &to);
+            CHECK(rt_active_voices(co) == 4, "oneshot stop_all: four transient voices playing");
+            rt_stop_all(co);
+            rt_render(co, bus, N, &to);                  /* fade block */
+            rt_render(co, bus, N, &to);                  /* finalize: slots freed, EVT_VOICE_ENDED posted */
+            CHECK(total_energy() < 1e-6, "oneshot stop_all: silent");
+            rt_render(co, bus, N, &to);                  /* the gauge lags one block (see stop_all above) */
+            CHECK(rt_active_voices(co) == 0, "oneshot stop_all: no voice left playing");
+            rt_commit(co);                               /* drains the events -> recycles the slots */
+            /* the pool is free again only if every stopped oneshot acked; a leak fails this */
+            for (int k = 0; k < 4; ++k) CHECK(rt_play_oneshot(co, so, 1.f, 1.5f, 1.f, 0.25f),
+                                              "oneshot stop_all: the slot was recycled, not leaked");
+            rt_commit(co);
+            rt_destroy(co);
+            remove("bwa_rt_oneshot.wav");
+        } else if (co) { CHECK(0, "write oneshot wav"); rt_destroy(co); }
     }
 
     /* runtime channel count: a 24-speaker layout drives a 24-channel core end to end — point panning,
@@ -892,6 +1023,70 @@ int main(void) {
             p0 = 0; for (int i = 0; i < N; ++i) { float a = fabsf(bus[0 * N + i]); if (a > p0) p0 = a; }
             CHECK(p0 > 1.5f, "limiter off passes the raw signal");
             rt_destroy(cl);
+        }
+    }
+
+    /* async staging: the KIND re-check at rt_sound_publish. A RESERVED slot reports 0 channels, so
+     * a play held against it was accepted on trust; when the decode lands, a play issued as a point
+     * source must not be bound to a bed (or the reverse), because the mixer dispatches on the
+     * ASSET's channel count and would render the caller's point source as a soundfield. engine.c
+     * refuses the mismatch at the call itself (the asset cache knows the load flags); this is the
+     * backstop under that, so it is driven straight at rt where a mismatch can be constructed. */
+    {
+        RtCore* ck = rt_create(4, 6, RATE, CH);
+        CHECK(ck != NULL, "rt_create (async kind)");
+        if (ck) {
+            bwa_timestamp ts = { 0, 0 };
+            const uint64_t drops0 = rt_held_kind_drops(ck);
+
+            /* 1. a point-source play whose asset lands as a 4-channel bed: dropped, not bound */
+            uint32_t rb = rt_sound_reserve(ck, err, sizeof err);
+            uint32_t hb = rt_source_create(ck);
+            CHECK(rb != 0 && hb != 0, "async kind: reserve + source");
+            set_pos_spk(ck, hb, 7);
+            rt_source_play(ck, hb, rb, true);              /* held: the slot is still empty */
+            rt_commit(ck); render2(ck);
+            CHECK(total_energy() < 1e-9, "async kind: a held play is silent before the publish");
+            SoundData bed4 = make_test_pcm(4, 4 * N, 0.25f);
+            CHECK(rt_sound_publish(ck, rb, &bed4), "async kind: publish the bed into the reserved slot");
+            rt_commit(ck); render2(ck);
+            CHECK(rt_held_kind_drops(ck) == drops0 + 1, "async kind: a bed published under a point-source play is counted");
+            CHECK(!rt_source_is_playing(ck, hb), "async kind: ...and the play is dropped, not bound");
+            CHECK(total_energy() < 1e-9, "async kind: ...so nothing renders");
+
+            /* 2. a bed play whose asset lands as mono: dropped the same way */
+            uint32_t rm = rt_sound_reserve(ck, err, sizeof err);
+            uint32_t hm = rt_source_create(ck);
+            CHECK(rm != 0 && hm != 0, "async kind: reserve + bed voice");
+            rt_bed_play(ck, hm, rm, true);
+            SoundData mono = make_test_pcm(1, 4 * N, 0.5f);
+            CHECK(rt_sound_publish(ck, rm, &mono), "async kind: publish mono into the reserved slot");
+            rt_commit(ck); render2(ck);
+            CHECK(rt_held_kind_drops(ck) == drops0 + 2, "async kind: mono published under a bed play is counted");
+            CHECK(!rt_source_is_playing(ck, hm), "async kind: ...and that play is dropped too");
+
+            /* 3. the matching kinds still bind: mono to a point source, a bed to rt_bed_play */
+            uint32_t rok = rt_sound_reserve(ck, err, sizeof err);
+            uint32_t hok = rt_source_create(ck);
+            set_pos_spk(ck, hok, 7);
+            rt_source_play(ck, hok, rok, true);
+            SoundData ok1 = make_test_pcm(1, 4 * N, 0.5f);
+            CHECK(rt_sound_publish(ck, rok, &ok1), "async kind: publish mono for the point source");
+            rt_commit(ck); render2(ck);
+            CHECK(rt_held_kind_drops(ck) == drops0 + 2, "async kind: a matching publish drops nothing");
+            CHECK(rt_source_is_playing(ck, hok), "async kind: mono on a point source binds and plays");
+            CHECK(argmax_channel() == 7, "async kind: ...through the ordinary panner");
+
+            uint32_t rok2 = rt_sound_reserve(ck, err, sizeof err);
+            uint32_t hok2 = rt_source_create(ck);
+            rt_bed_play(ck, hok2, rok2, true);
+            SoundData ok4 = make_test_pcm(4, 4 * N, 0.25f);
+            CHECK(rt_sound_publish(ck, rok2, &ok4), "async kind: publish a bed for the bed voice");
+            rt_commit(ck);
+            rt_render(ck, bus, N, &ts); rt_render(ck, bus, N, &ts);
+            CHECK(rt_held_kind_drops(ck) == drops0 + 2, "async kind: a matching bed publish drops nothing");
+            CHECK(rt_source_is_playing(ck, hok2), "async kind: a bed on a bed voice binds and plays");
+            rt_destroy(ck);
         }
     }
 

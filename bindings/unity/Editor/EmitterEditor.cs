@@ -3,6 +3,7 @@
 // ray-traced off-thread, so the number is the only way to see whether the wall you built is working).
 // Registered on SourceBase with editorForChildClasses, so Emitter and PushEmitter get the same
 // conditional-hide and live readouts.
+using System;
 using UnityEditor;
 using UnityEngine;
 
@@ -12,6 +13,8 @@ namespace BwAudio.EditorTools
     [CanEditMultipleObjects]
     public sealed class EmitterEditor : Editor
     {
+        BwaSourceKind _preset = BwaSourceKind.Default;   // the preset picker's selection (editor-only)
+
         public override bool RequiresConstantRepaint() => Application.isPlaying;
 
         public override void OnInspectorGUI()
@@ -33,6 +36,35 @@ namespace BwAudio.EditorTools
 
             serializedObject.ApplyModifiedProperties();   // fires Emitter.OnValidate -> live re-push
 
+            // Fill every knob above from one of the engine's own source presets (bwa_source_preset).
+            // It writes the FIELDS, undoably, rather than configuring the source behind the inspector's
+            // back — the fields stay the source of truth. Nothing in that table is measured: it is a
+            // starting point, not a recommendation (docs/api.md, "What each preset rests on").
+            EditorGUILayout.Space();
+            using (new EditorGUILayout.HorizontalScope())
+            {
+                _preset = (BwaSourceKind)EditorGUILayout.EnumPopup("Preset", _preset);
+                if (GUILayout.Button("Apply", GUILayout.Width(60)))
+                {
+                    Undo.RecordObjects(targets, "Apply source preset");
+                    // bwa_source_preset is pure, but it is still a P/Invoke: a project that has not
+                    // staged bw_audio.dll yet throws on the first call, and an exception escaping
+                    // OnInspectorGUI re-throws on every repaint and takes the whole inspector with it.
+                    // Same guard, same reason, as SourceBase.Reset.
+                    try
+                    {
+                        foreach (var t in targets)
+                        {
+                            ((SourceBase)t).ApplyPreset(_preset);
+                            EditorUtility.SetDirty(t);
+                        }
+                    }
+                    catch (DllNotFoundException)       { WarnNoPlugin(); }
+                    catch (EntryPointNotFoundException) { WarnNoPlugin(); }
+                    serializedObject.Update();            // redraw the fields the preset just moved
+                }
+            }
+
             if (e.spread > 0f && e.sizeMeters > 0f)
                 EditorGUILayout.HelpBox(
                     "Spread and Size both set. They don't add up — the engine takes the WIDER of the two, " +
@@ -49,6 +81,10 @@ namespace BwAudio.EditorTools
                 EditorGUI.ProgressBar(r, e.Occlusion, $"unoccluded  {e.Occlusion:0.00}");
             }
         }
+
+        static void WarnNoPlugin() => Debug.LogWarning(
+            "[BwAudio] Source presets need the native plugin: stage bw_audio.dll into " +
+            "Runtime/Plugins/x86_64 (see the package README). The fields were left alone.");
 
         static bool IsHidden(string p, SourceBase e)
         {

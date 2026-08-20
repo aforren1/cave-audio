@@ -183,6 +183,7 @@ static void null_engine_sweep(void) {
     bwa_source_fade_to(NULL, 1, 1.f, 1.f);  bwa_source_fade_out(NULL, 1, 1.f);
     bwa_source_set_group(NULL, 1, 0);       bwa_group_set_gain(NULL, 0, 1.f);
     bwa_group_set_paused(NULL, 0, true);    bwa_source_set_pitch(NULL, 1, 1.f);
+    bwa_group_stop(NULL, 0);                bwa_stop_all(NULL);
     bwa_source_play(NULL, 1, 1, false);     bwa_source_play_at(NULL, 1, 1, false, 0);
     bwa_source_play_loop(NULL, 1, 1, 0, 0); bwa_source_stop(NULL, 1);
     bwa_source_stop_at(NULL, 1, 0);         bwa_source_queue(NULL, 1, 1, false);
@@ -750,6 +751,7 @@ static void poison_boundary(bwa_engine* e, bwa_source s) {
     bwa_source_set_group(e, s, 9999u);                   /* documented: falls back to group 0 */
     bwa_group_set_gain(e, 9999u, 0.f);                   /* documented: ignored */
     bwa_group_set_paused(e, 9999u, true);
+    bwa_group_stop(e, 9999u);
     bwa_set_test_signal(e, 9999u, BWA_TEST_SINE, 0.5f);  /* out-of-range channel: ignored */
     bwa_set_panner(e, (bwa_panner)7);                    /* out-of-range enum: sanitized */
     bwa_set_spread_mode(e, (bwa_spread_mode)9);

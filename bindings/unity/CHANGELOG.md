@@ -4,6 +4,302 @@ All notable changes to `com.brainworks.bw_audio`.
 
 ## [Unreleased]
 
+### Added: a convenience tier over the core ABI (`BWA_VERSION` -> 0.12.0)
+
+Four additions in the same spirit, all of them control-thread sugar over calls that already existed.
+The C ABI sat one tier below what a client actually writes, so every client rebuilt the same three
+things by hand. `docs/api.md` gains an "API tiers" section that states the split and the guarantee
+that goes with it: a convenience call writes the same command ring and lands in the same mixer, so
+nothing new reaches the audio thread and there is no second render path.
+
+- **Shared asset ownership: `bwa_sound_acquire` / `bwa_sound_release`.** A by-path, refcounted cache
+  keyed on `(normalized path, flags)`, with the four loaders folded into one `bwa_load_flags`
+  parameter (`BWA_LOAD_STREAM`, `BWA_LOAD_AMBIX`, `BWA_LOAD_FUMA`). Both bindings had already built
+  this privately, and the Godot side had to carry a `unload_sound_path` fan-out precisely because one
+  path can be cached under several keys. That is the engine's own key, so it is the engine's job now.
+  The explicit-ownership loaders (`bwa_load_sound` and siblings) are unchanged; mixing the two tiers
+  on one handle is refused with an error string rather than silently corrupting the refcount.
+- **Async loading: `bwa_sound_acquire_async` / `bwa_sound_is_ready`.** Returns a usable handle
+  immediately and decodes on a lazily started loader thread, for content that arrives mid-session.
+  A play issued against a not-yet-ready handle is held on the control thread and re-issued as an
+  ordinary `CMD_PLAY` once the data lands, so playback starts from frame 0 with nothing skipped. The
+  audio thread never sees a reserved slot and gained no new branch. See `docs/concurrency.md`,
+  "Async asset staging".
+- **Source configuration: `bwa_source_desc` with `bwa_source_preset`, `bwa_source_create_desc`,
+  `bwa_source_apply`, `bwa_source_get_desc`.** There were 24 per-source setters and readback for two
+  of them, so configuring one prop took 15 or more calls, and nothing could print or reset a source.
+  This is the same fill-then-apply shape as `bwa_tuning` and it carries the same `struct_size` guard
+  for the same reason: this struct's zero is not its default (gain 0 is silence, pitch 0 is invalid),
+  so a zero-initialized struct must fail loudly. Position, orientation, and playback state are
+  deliberately excluded; they are per-frame, not configuration. `bwa_source_apply` is one ring
+  command, and the payload packs inside the union's existing width, so no other command pays for it.
+- **Scene transitions: `bwa_group_stop` and `bwa_stop_all`.** Mix groups had gain and pause but no
+  stop. Both ride the existing one-block fade, so they are click-free (invariant 4), and both stop
+  beds and drop pending play queues. Neither resets the mixer: group gains, pause gates, and master
+  gain survive, so a re-played scene returns at the levels the client dialed.
+
+`Bwa.BoundVersion` moves to 0.12.0 to match the header. The Unity binding rides all four additions
+now, in the entry below, and `Engine.cs`'s `Dictionary<string, uint> _sounds` is gone with them.
+
+The Godot migration turned out to delete less than the sentence here first claimed. Its
+deduplication, its reference counting, and the four-prefix key fan-out ("m:", "s:", "a:", "f:") all
+go, because that fan-out existed only for the want of a shared key. The path-to-handle RECORD stays,
+but for a narrower job than it had: `unload_sound_path` releases the references this NODE holds and
+no others, and `sound_is_ready` answers only for keys this node acquired. The metadata getters do
+not use it at all any more. They go through `bwa_sound_find` (below), which the migration added for
+exactly this and which answers for any resident path, not just the ones this node loaded.
+
+A fourth console walkthrough, `examples/convenience.c` (`bwa_convenience`), demonstrates the whole
+tier against a running engine: two systems acquiring one clip and getting one decode, the same file
+resident in RAM and streamed at once, a probe that does not load, a handle handed out before its PCM
+exists, a source configured and read back through one struct, and the two scene-transition stops.
+Every part ends by naming the core calls it replaces, because the claim of this tier is that the two
+spellings are the same audio. The three existing examples keep teaching the explicit tier and now
+point at it. `examples/playground.cpp`'s per-source scene reset became one `bwa_source_apply`.
+
+All four console examples now run under ctest as `example_*`. A new `--tests` flag forces the offline
+sink, so the suite never depends on an ASIO driver being installed, and cuts the listening time
+(17 seconds for all four). They exercise the real ABI end to end, which catches a change that still
+compiles but misbehaves, and `bwa_convenience` verifies every claim it prints and exits nonzero on a
+mismatch rather than only proving it did not crash.
+
+### Fixed: the async tests could not tell whether they had covered the held-play window
+
+Review turned up a test that could not fail. Both the C asset test and the Godot demo fixture claimed
+to cover the window in which a play waits on a decode, and neither could know whether it had: a small
+asset usually decodes before the first render, so the play binds immediately, the held path goes
+untouched, and every assertion still passes.
+
+The fix is ordering, not machinery. A finished decode is adopted only at a pump point
+(`bwa_sound_acquire`, `bwa_sound_is_ready`, `bwa_sound_find`, `bwa_sound_release`, `bwa_commit`), and
+`bwa_source_play` is not one of them, so a play issued straight after `bwa_sound_acquire_async` with
+nothing pumping in between is guaranteed to be held. `test/assets_test.c` now does exactly that and
+asserts it, using `bwa_sound_get_channels` (0 while the slot is reserved, and it does not pump) as
+the witness. Checked in both directions: inserting a readiness check before the play makes those
+assertions fail, which is the silent way the coverage was being lost.
+
+A `bwa_set_loader_stall` diagnostic was built for this first and then removed. It worked, but it put
+a call in the public ABI that existed only for testing, and ordering gets the same guarantee for
+nothing. Two cases genuinely cannot be pinned this way and now say so instead of implying otherwise:
+cancelling an in-flight load (`bwa_sound_release` pumps on entry, so the decode may already be
+adopted) and the Godot fixture (the binding checks readiness on its way to playing). Both assert the
+outcome, which holds either way, and neither claims to have exercised the hold.
+
+### Added: `bwa_sound_find`, a by-path probe that does not load
+
+Migrating both bindings onto the shared asset tier turned up one gap, and both hit it independently:
+there was no way to ask "which handle does this path have" without `bwa_sound_acquire`, whose miss
+path *loads* the file. Godot has three public methods that are by path (`unload_sound_path`,
+`sound_get_frames`, `sound_get_channels`), and probing them with an acquire would have reinstated
+exactly the hidden-decode bug those getters were fixed for in an earlier release. It would also have
+decoded mono, so an ambisonic bed would report 1 channel forever.
+
+`bwa_sound_find(engine, path, flags)` returns the handle for a key the cache already holds, or 0. It
+never loads, never touches the disk, and never takes a reference, so the handle it returns is
+borrowed: read metadata from it, do not release against it. A still-loading async entry answers with
+its handle (it is resident; ask `bwa_sound_is_ready` about the data), while a failed one answers 0
+because it holds nothing to answer about.
+
+Godot's `find_loaded_sound` now asks the engine instead of scanning its own record, so it answers for
+any resident path rather than only the ones loaded through the node. Unity's `SoundFrames` and
+`SoundChannels` probe first, so asking a resident clip its length no longer takes a reference.
+
+Failure stays deliberately uncached on the synchronous path: a failed `bwa_sound_acquire` records
+nothing and the next call retries the file, which is what a late-appearing file wants. A client that
+asks in a loop should remember its own failures, which is why `Engine` keeps a small set of failed
+keys rather than re-hitting the disk every frame.
+
+### Added: the Unity binding rides the convenience tier
+
+`Bwa.cs` binds the eleven new entry points: `bwa_sound_acquire`, `bwa_sound_acquire_async`,
+`bwa_sound_is_ready`, `bwa_sound_find`, `bwa_sound_release`, `bwa_group_stop`, `bwa_stop_all`,
+`bwa_source_preset`, `bwa_source_create_desc`, `bwa_source_apply`, and `bwa_source_get_desc`,
+with `BwaLoadFlags`,
+`BwaSourceKind`, and the `BwaSourceDesc` struct. That file claims to bind every `BWA_API` function
+except `bwa_set_output_capture` and `bwa_render_block`, a claim that has been false before, so it was
+re-checked by diffing the header's `BWA_API` list against the file's `DllImport` list: those two are
+the only difference.
+
+`BwaSourceDesc` follows the `BwaTuning` precedent field for field, including the `structSize` guard
+and `UnmanagedType.I1` for the C `bool`. `Engine.Awake` now proves that layout rather than trusting
+it: `bwa_source_preset` is pure and fills `struct_size` with the engine's own `sizeof`, so comparing
+it against `Marshal.SizeOf<BwaSourceDesc>()` catches a field the binding got wrong. A mismatch there
+is not a crash, it is the marshaller handing the engine a short buffer to read past, so the check
+refuses to start for the same reason the version check does.
+
+**`Engine`'s asset dictionary is gone.** The `"ambix:"` and `"fuma:"` key prefixes existed only
+because the ABI had four separate loaders; the engine keys on `(path, flags)` itself now, so
+`Engine.Acquire(clip, flags)` is the one path and `Load` / `LoadAmbix` / `LoadFuma` are one-liners
+over it. `LoadStreaming` comes free with the flag. Behavior is unchanged: the same clip returns the
+same handle, assets live for the engine's lifetime, and `bwa_destroy` frees them whatever the
+refcount, so there is nothing to release at teardown. One small map survives, and it holds no
+handles: a **negative** cache of clips that failed to load. A synchronous acquire that fails inserts
+no cache entry, so without it a missing clip would re-open the file and re-log the warning on every
+`Play`.
+
+**Async loading is opt-in per emitter.** `Emitter.loadAsync` routes `Play` through
+`Engine.AcquireAsync`: the call returns at once and the source stays silent until the data lands,
+then starts from the clip's first frame. It is off by default because the CAVE's normal path is
+load-time and synchronous. The not-ready window is handled where the ABI says it must be:
+`Emitter.Queue` and `Emitter.PlayOneShot` refuse a still-decoding clip and say so, because neither
+can be held, and the emitter polls `bwa_sound_is_ready` while a load is in flight so a decode that
+FAILS gets reported instead of leaving a silent source and no explanation.
+
+**Sources configure in one call.** `SourceBase` gains `BuildDesc`, `ApplyDesc`, `TryGetDesc`,
+`ApplyPreset(kind)`, and the editor `Reset`, and the create-time push is now a single
+`bwa_source_apply` instead of the seventeen setters it used to issue. That matters when a prefab
+spawns: the engine packs the audio-thread knobs into one ring command, and `bwa_play_oneshot`
+already documents dropping when the ring is momentarily full. The per-property setters and
+`OnValidate`'s live re-push are untouched, so an inspector drag still behaves exactly as before. The
+inspector fields stay the source of truth in both directions, which is why `ApplyPreset` writes them
+rather than configuring the source behind their back, and why the new preset picker in the source
+inspector is undoable. `bwa_source_preset` is pure, but it is still a P/Invoke, so both entry points
+into it from the editor (the picker's Apply button and the component's `Reset`) catch
+`DllNotFoundException`: a project that has not staged `bw_audio.dll` yet would otherwise throw from
+inside `OnInspectorGUI` and lose the whole inspector on every repaint.
+
+`Engine.StopGroup(group)` and `Engine.StopAll()` sit beside the existing group gain and pause
+wrappers. Both are click-free, both stop beds, and neither resets the mixer.
+
+### Added: `AmbisonicBed` loads asynchronously too
+
+`AmbisonicBed.loadAsync` is the opt-in `Emitter` already had, on the component that gains most from
+it: a bed is a 4, 9, or 16 channel file and usually a long one, so it is the biggest in-frame decode
+a scene does. `Play` routes through `Engine.AcquireAsync`, returns at once, and the field starts from
+its first frame on the block its data lands. It is off by default for the same reason the emitter's
+is, that the CAVE's normal path is load-time and synchronous.
+
+The acquire flags carry the kind, and that is what makes an async bed play safe. `fumaClip` picks
+`BWA_LOAD_AMBIX` or `BWA_LOAD_FUMA`, and the engine judges the play against those flags rather than
+against a channel count, because a still-decoding asset reports 0 channels and has no count to judge.
+A handle acquired as mono is refused at `bwa_bed_play` itself, and as a backstop a held play whose
+asset lands as the other kind is dropped rather than bound, with the `bwa_commit` that dropped it
+reporting so. The window between the acquire and the decode is guarded at both ends: the bed either
+plays as a soundfield or does not play at all.
+
+A bed is world-locked, so it has no per-frame push to hang a readiness poll on the way an emitter
+does. The watch is a coroutine that exists only while a load is in flight, which is why a bed still
+costs nothing per frame when it is not loading. The poll itself is now `Engine.WatchPendingLoad`,
+shared by both components: a decode that FAILS never becomes ready, so silence alone cannot separate
+"still decoding" from "failed", and the one warning that separates them has a single implementation
+instead of two that drift. `Emitter` keeps its behavior and the exact wording of its warning.
+
+### Added: the Godot binding rides the convenience tier
+
+**`BwaEngine`'s asset cache is the engine's now.** The `"m:"` / `"s:"` / `"a:"` / `"f:"` key
+prefixes are gone, and with them the fan-out `unload_sound_path` had to do over all four. They
+existed only because the ABI had four separate loaders with no shared key. `load_sound` and
+`load_ambisonic` are one-liners over one `acquire_sound(path, flags, async)`, and the binding no
+longer deduplicates or counts references.
+
+What could NOT be deleted, and why: `unload_sound_path(path)` and `sound_is_ready(path, flags)` are
+questions about the references this NODE owns, and the ABI cannot answer those. So `BwaEngine` keeps
+a flat record of the `(path, flags)` keys it acquired, holding one reference each. It is an ownership
+ledger now, not a cache. `sound_get_frames(path)` and `sound_get_channels(path)` do not consult it:
+they go through `bwa_sound_find` (added for this, above), which never loads on a miss and so
+cannot restore the hidden-decode bug those getters were fixed for.
+
+**Three new by-path calls on `BwaEngine`:** `preload_sound(path, flags)` warms the cache before the
+first play, `preload_sound_async(path, flags)` starts the decode without a player, and
+`sound_is_ready(path, flags)` reports the landing. `flags` is a bound bitfield, `LOAD_MEMORY` /
+`LOAD_STREAM` / `LOAD_AMBIX` / `LOAD_FUMA`, so the four loaders are one argument here too.
+`group_stop(group)` and `stop_all()` join the group gain and pause wrappers.
+
+**Async loading is opt-in per player.** `async_load` on `BwaEmitter` and on `BwaBed` is off by
+default, for the same reason as Unity's: the CAVE's normal path is load-time and synchronous. A bed
+gets the switch as well because a soundfield is the case that most wants it. The not-ready window is
+handled where it bites: an emitter's end detector reads the voice as "not playing" for the whole
+hold, so it would spend its four-frame grace and announce a `finished` for a sound that had not
+started. The grace now only runs once the handle is READY, and a decode that FAILS is reported and
+clears the detector instead of leaving it pending forever. `is_loading()` exposes the window, and
+`queue` stays synchronous because the core refuses to resolve a queue entry against a not-ready
+handle.
+
+**Sources configure in one value.** `BwaSource` gains `get_desc()`, `apply_desc(dict)`,
+`reset_to_preset(kind)`, and the static, engine-free `BwaSource.get_preset(kind)`, mirroring
+`get_setup_tuning` / `apply_setup` for the engine knobs, and for the same stated reason: a
+Dictionary can be printed and diffed. `apply_desc` OVERLAYS, so only the keys present change and a
+`get_desc` round trip is a no-op. Creation now goes through `bwa_source_create_desc`, so a source
+arrives configured in one ring command instead of fifteen, and the desc is validated before a voice
+is allocated. `BwaPushSource` creates first and applies second, since a push voice has no
+`create_desc` form. Applying a desc writes the node's own properties too, so the inspector cannot
+disagree with what the engine is rendering.
+
+`demo/api.tscn` covers the lot on both sinks: the preset table, the desc round trip and overlay, the
+preload and unload path, the async landing with a check that no `finished` fires during the hold,
+and both scene stops.
+
+### Fixed: an async asset could be bound as the wrong KIND, silently
+
+Found in review of the async tier, before it shipped.
+
+The engine tells a mono point source from an ambisonic bed by channel count, and both play calls
+guard on it: `bwa_source_play` refuses a multichannel asset, `bwa_bed_play` requires one. A
+still-decoding `bwa_sound_acquire_async` handle reports 0 channels, so it passed both guards. Play a
+pending AmbiX handle on a point source and the play was accepted, held, and bound to a bed when the
+decode landed. The mixer dispatches on the asset, so it then rendered as a soundfield, and the
+spread, directivity, and panner settings the caller had dialed in did nothing. Nothing reported
+this, at the call or afterwards. A pending mono asset sailed through `bwa_bed_play` the same way.
+`bwa_play_oneshot` and `bwa_source_queue` were never affected, because they refuse a not-ready
+handle outright.
+
+The load flags already fix the kind at acquire time, and the asset cache keeps them per entry, so
+the mismatch is now refused at the play call itself with the reason in `bwa_last_error`. That is
+where a caller can still do something about it. Behind that, a held play carries the kind it was
+issued as (one byte), and `rt_sound_publish` re-checks it against the real channel count once the
+data lands: a mismatch is dropped rather than bound, and the `bwa_commit` that dropped it says so
+through `bwa_last_error`, so a client that never polls readiness is not left with silence and no
+trace. Beds reach the core through their own `rt_bed_play` entry point now, because a voice cannot
+be asked afterwards which kind the caller meant.
+
+That backstop notice is the one exception to the documented `bwa_last_error` rule, which says a
+per-frame call that merely enqueues never sets it and that you should read it right after the call
+you are checking. The drop belongs to a play call that returned successfully several frames earlier,
+so there is no call to attribute it to. Both `bwa_last_error` and `bwa_commit` now say this at their
+declarations rather than leaving the header contradicting itself.
+
+### Fixed: a play could cancel a voice steal, and stale-handle directivity could poison a live source
+
+Both are pre-existing holes that the convenience tier made easier to reach, found in review of it.
+
+`CMD_PLAY` cleared a voice's `stopping` flag unconditionally, which silently downgraded a
+steal-in-progress. `CMD_STOP` right beside it already knew not to do that. A steal has already handed
+the caller a replacement handle on a reserve slot and is waiting on the victim to fade, free, and
+acknowledge; resurrecting the victim cancels that acknowledgement, so its `stealing` flag stays set
+and the source can never be stolen again for as long as it lives, leaving the pool a slot short. A
+client playing a mid-steal handle could always reach this. What changed is that `rt_sound_publish`
+can now re-issue a held play by itself, so the engine could do it to itself at the timing of a
+decode landing. `CMD_PLAY` now refuses to downgrade a steal.
+
+`bwa_source_set_directivity` wrote its control-side cache with only a bounds check, no generation
+gate, even though the comment on that cache block claims every per-source setter is gated. A stale
+handle could therefore scribble a value that the slot's NEXT occupant inherited. That used to be
+harmless, because the rt and sim calls drop a stale handle on their own. It stopped being harmless
+when `bwa_source_apply` began reading that cache to skip a directivity change that already matches,
+and `bwa_source_get_desc` began reporting from it: the apply would conclude "already matches" and
+skip a real change, so the source rendered omni while the readback claimed figure-8. Now gated like
+every other setter.
+
+Two smaller hardening fixes alongside: `rt_unload_sound` now refuses a reserved (async, not yet
+published) sound slot, which is the invariant the staging comment states and the function it names
+(unreachable through the public ABI today, so this guards the next internal caller); and
+`rt_stop_all` pushes its command before dropping held plays, so a momentarily full ring no longer
+leaves the half-effect of voices still playing with the pending plays silently gone.
+
+### Fixed: a stopped one-shot leaked its voice slot forever
+
+`pause_gate`'s stop-finalize freed the voice slot only for a steal. A one-shot's handle is
+engine-internal, so nothing else ever recycles it, and the natural-end path had always done this
+free. The bug was unreachable until now because no public call could stop a one-shot mid-play; the
+new voice-table sweeps reach it, and without the fix a scene transition would burn a slot per
+one-shot until the pool ran dry. Found while testing `bwa_stop_all`, with a regression test that
+fails without the fix.
+
+### Fixed: a recycled source slot inherited the previous occupant's directivity
+
+`bwa_source_create` did not reset the control-side `src_fwd` / `src_dirw` / `src_dirp` / `src_pos`
+caches for a reused slot, while rt had already cleared the corresponding `Voice`. The two now agree.
+
 ## [0.6.0]
 
 ### Fixed: the default speaker grid was unreachable, and the binding claimed a failed layout was survivable

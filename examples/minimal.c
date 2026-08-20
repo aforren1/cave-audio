@@ -13,6 +13,10 @@
  * y is height above the floor); with no layout file the engine pans over its default
  * grid, a 3 m cube of 26 speakers with its center (the ear point) at (0, 1.5, 0).
  *
+ * This is the CORE tier throughout: load, create, a setter per knob, commit. bwa_convenience
+ * walks the calls layered over it (shared/async assets, a source's whole config as one struct,
+ * click-free group stops) and shows which core calls each one replaces.
+ *
  *   bwa_minimal [sound.wav] [--driver name]
  *     (no wav: a short ping is synthesized and used; no --driver: auto-pick the first
  *      ASIO driver with enough channels — name one to test a specific device. The rig's
@@ -50,10 +54,15 @@ static const char* ensure_ping(const char* wav_arg) {
     return path;
 }
 
+/* --tests: force the offline sink and cut the orbit short, so ctest runs this without a device.
+ * The CALLS are identical either way; only the listening time goes. */
+static int g_tests = 0;
+
 int main(int argc, char** argv) {
     const char* wav_arg = NULL, * driver = NULL;
     for (int i = 1; i < argc; ++i) {
         if (!strcmp(argv[i], "--driver") && i + 1 < argc) driver = argv[++i];
+        else if (!strcmp(argv[i], "--tests")) g_tests = 1;
         else wav_arg = argv[i];
     }
     const char* wav = ensure_ping(wav_arg);
@@ -65,6 +74,7 @@ int main(int argc, char** argv) {
     cfg.sample_rate    = 48000;
     cfg.block_size     = 256;
     cfg.asio_driver    = driver;                /* NULL = auto-pick by channel count */
+    if (g_tests) cfg.sink = BWA_SINK_NULL;      /* no device, deterministic */
     /* no tracker connected: this "game" pushes the listener pose itself */
 
     bwa_engine* e = bwa_create(&cfg);
@@ -91,7 +101,8 @@ int main(int argc, char** argv) {
     uint64_t cs0 = 0, ct0 = 0;                 /* baseline device clock pair (rate check below) */
     bool have_clk = false;
     printf("orbiting a looping ping around the listener (6 s)...\n");
-    for (int frame = 0; frame < 6 * 60; ++frame) {
+    const int frames_total = g_tests ? 45 : 6 * 60;
+    for (int frame = 0; frame < frames_total; ++frame) {
         if (frame == 30 && !have_clk)          /* baseline ~0.5 s in: skip the start-of-stream
                                                 * prefill burst (drivers fill their ring with a few
                                                 * back-to-back callbacks at start, which would read

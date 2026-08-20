@@ -10,13 +10,29 @@ using namespace godot;
 #define ENG (owner->handle())
 #define LIVE (owner && src && owner->is_running())
 
+/* No pitch push here: it is a bwa_source_desc field, so it rode in with the create desc. */
 void BwaEmitter::on_source_ready() {
-	if (pitch != 1.0f) {
-		bwa_source_set_pitch(ENG, src, pitch);
-	}
 	if (autoplay) {
 		play();
 	}
+}
+
+void BwaEmitter::fill_desc(bwa_source_desc *d) const {
+	BwaSource::fill_desc(d);
+	d->pitch = pitch;
+}
+
+void BwaEmitter::mirror_desc(const bwa_source_desc &d) {
+	BwaSource::mirror_desc(d);
+	pitch = d.pitch;
+}
+
+/* BwaEngine::group_stop / stop_all stopped this voice. Same rule as stop(): an explicit halt
+ * is not an end, so drop the detector rather than let the silence read as one. */
+void BwaEmitter::on_stopped_externally() {
+	state = IDLE;
+	pending_snd = 0;
+	pending_async = false;
 }
 
 void BwaEmitter::push_frame() {
@@ -30,6 +46,23 @@ void BwaEmitter::push_frame() {
 		case PENDING:
 			if (now) {
 				state = PLAYING; // the audio thread picked the play up; the end is detectable now
+				pending_async = false;
+			} else if (pending_async) {
+				/* An async play is HELD control-side, so "not playing" here means "not loaded
+				 * yet", never "already over". Spend no grace on it: the window reopens, from
+				 * zero, on the frame the data lands. */
+				const int ready = owner->sound_ready_state(pending_snd);
+				if (ready < 0) {
+					UtilityFunctions::push_error(
+							vformat("BwaEmitter (%s): the async load of \"%s\" failed: %s",
+									get_name(), pending_path, owner->get_last_error()));
+					state = IDLE;
+					pending_async = false;
+					pending_snd = 0;
+				} else if (ready > 0) {
+					pending_async = false;
+					pending_frames = 0;
+				}
 			} else if (++pending_frames > PENDING_GRACE) {
 				state = IDLE; // clip shorter than a frame — it came and went unobserved
 				emit_signal("finished");
@@ -52,14 +85,26 @@ bool BwaEmitter::begin(const String &p, bwa_sound *out) {
 	if (!LIVE) {
 		return false;
 	}
-	const bwa_sound snd = owner->load_sound(p, streaming);
+	const bwa_sound snd = owner->load_sound(p, streaming, async_load);
 	if (!snd) {
 		return false;
 	}
 	*out = snd;
 	state = PENDING;
 	pending_frames = 0;
+	pending_snd = snd;
+	pending_path = p;
+	/* A streamed clip is never deferred (the ABI loads it synchronously here), and a cache HIT
+	 * is already resident, so only ask about the ones that can actually still be decoding. */
+	pending_async = async_load && !streaming && owner->sound_ready_state(snd) == 0;
 	return true;
+}
+
+/* Asks the HANDLE, not the cached flag: push_frame is what clears `pending_async`, and a
+ * caller may look between two frames (or on the manual sink, where blocks advance without
+ * one). The flag only keeps the probe off the synchronous path, where it is always true. */
+bool BwaEmitter::is_loading() const {
+	return LIVE && state == PENDING && pending_async && owner->sound_ready_state(pending_snd) == 0;
 }
 
 void BwaEmitter::play() { play_clip(clip); }
@@ -126,12 +171,14 @@ void BwaEmitter::seek_seconds(double seconds) {
 }
 
 void BwaEmitter::stop() {
-	state = IDLE; // an explicit stop is not an end; see the header
+	/* An explicit stop is not an end (see the header). It also cancels a play still waiting on
+	 * an async decode: the core drops that hold on the same call, so the detector must too. */
+	on_stopped_externally();
 	BwaSource::stop();
 }
 
 void BwaEmitter::fade_out(float seconds) {
-	state = IDLE; // ends on the stop path once silent — same rule as stop()
+	on_stopped_externally(); // ends on the stop path once silent — same rule as stop()
 	BwaSource::fade_out(seconds);
 }
 
@@ -159,6 +206,9 @@ void BwaEmitter::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("get_autoplay"), &BwaEmitter::get_autoplay);
 	ClassDB::bind_method(D_METHOD("set_streaming", "enabled"), &BwaEmitter::set_streaming);
 	ClassDB::bind_method(D_METHOD("get_streaming"), &BwaEmitter::get_streaming);
+	ClassDB::bind_method(D_METHOD("set_async_load", "enabled"), &BwaEmitter::set_async_load);
+	ClassDB::bind_method(D_METHOD("get_async_load"), &BwaEmitter::get_async_load);
+	ClassDB::bind_method(D_METHOD("is_loading"), &BwaEmitter::is_loading);
 	ClassDB::bind_method(D_METHOD("set_pitch", "rate"), &BwaEmitter::set_pitch);
 	ClassDB::bind_method(D_METHOD("get_pitch"), &BwaEmitter::get_pitch);
 
@@ -178,6 +228,10 @@ void BwaEmitter::_bind_methods() {
 	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "loop"), "set_loop", "get_loop");
 	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "autoplay"), "set_autoplay", "get_autoplay");
 	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "streaming"), "set_streaming", "get_streaming");
+	/* Off by default on purpose: the load-time path stays synchronous, and this is the
+	 * mid-session case. A play against a still-decoding clip binds the voice and starts it
+	 * from the top when the data lands - is_loading() covers that window. */
+	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "async_load"), "set_async_load", "get_async_load");
 	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "pitch", PROPERTY_HINT_RANGE, "0.25,4,0.01"),
 			"set_pitch", "get_pitch");
 

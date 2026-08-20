@@ -10,6 +10,7 @@
 #include "sane.h"         /* bwa_quat_unit, bwa_finite3, bwa_finite_clamp */
 #include "sink.h"
 #include "rt.h"
+#include "assets.h"        /* by-path asset cache + loader thread (bwa_sound_acquire/_async) */
 #include "layout.h"
 #include "dbap.h"          /* offline panner evaluation (bwa_panner_gains_batch) */
 #include "spcap.h"
@@ -88,6 +89,8 @@ struct bwa_engine {
     int         panner;            /* mirror of bwa_set_panner (bwa_panner; 0 = DBAP) for the room_eq start guard */
 
     RtCore*     rt;               /* rings + voice/sound tables + mixer (rt.c) */
+    AssetCache* assets;           /* refcounted by-path cache over the same loaders (assets.c);
+                                   * owns the handles it hands out, so bwa_unload_sound refuses them */
     Monitor*    monitor;          /* headphone profiles: 26->stereo decode (+ direct field in binaural) */
     Layout      layout;           /* effective speaker geometry (for the Steam decoder at start) */
     int         layout_failed;    /* an EXPLICIT layout_path failed to load at create — engine is on
@@ -132,6 +135,9 @@ struct bwa_engine {
                                    * EVERY setter below must update it, or the two writer paths
                                    * (individual setters and bwa_apply_tuning) drift apart. */
     int           beds_warned;    /* the "two reverb beds, one tap" notice, once */
+    uint64_t      kind_drops_seen;  /* rt_held_kind_drops as of the last bwa_commit, so a NEW drop
+                                     * (an async play whose asset landed as the other kind) becomes
+                                     * a bwa_last_error notice instead of a silent no-sound */
     SteamPath*    path;           /* pathing (bwa_desc.enable_pathing); NULL otherwise */
     float         src_pos[BWA_VOICE_SLOTS][3];  /* control-side per-source positions, so set_pathing has the pos */
     /* control-side directivity cache: bwa_source_set_orientation and _set_directivity arrive as
@@ -139,6 +145,18 @@ struct bwa_engine {
      * combined command on either. Defaults: forward = room ahead, weight 0 (off), power 1. */
     float         src_fwd[BWA_VOICE_SLOTS][3];
     float         src_dirw[BWA_VOICE_SLOTS], src_dirp[BWA_VOICE_SLOTS];
+    /* control-side shadow of every bwa_source_desc field, per voice SLOT — the readback half of
+     * bwa_source_apply, and the exact mirror of `cur` above for bwa_tuning. It lives here rather
+     * than in rt because the desc spans three owners (ring knobs, the control-side steal priority,
+     * and the sims' occlusion/directivity gates) and only this layer sees all three; reading it
+     * back out of the audio thread would need a publish path per field for no gain (invariant 3).
+     * src_desc_h[] is the generation gate: a STALE handle must neither read nor write the slot's
+     * current occupant, so every access goes through src_desc_slot(). EVERY per-source setter
+     * below must update it, or the two writer paths (individual setters and bwa_source_apply)
+     * drift apart. Directivity is the deliberate exception: src_dirw/src_dirp above already are
+     * that shadow, so get_desc reads them instead of keeping a third copy. */
+    uint32_t         src_desc_h[BWA_VOICE_SLOTS];
+    bwa_source_desc  src_desc[BWA_VOICE_SLOTS];
 
     /* material table (control-thread): token == index; [0] is the built-in default. Coefficients are
      * resolved to per-triangle materials when a mesh is set. mat_free marks released slots (reusable by
@@ -222,6 +240,20 @@ static void clear_error(bwa_engine* e) { if (e) { e->errbuf[0] = 0; e->last_erro
  * on the engine layer to report. Returns true when the play must be refused. */
 static bool refuse_push_play(bwa_engine* e, bwa_source s, const char* msg) {
     if (!rt_source_is_push(e->rt, s)) return false;
+    set_error(e, msg);
+    return true;
+}
+
+/* A still-decoding async asset reports 0 CHANNELS, so the channel-count kind guards on the play
+ * calls have nothing to judge and both of them let it through: a bed sailed into bwa_source_play
+ * and a mono file into bwa_bed_play, and the mismatch only showed up as the wrong render once the
+ * decode landed. The cache can answer, though - the load flags fixed the kind at acquire time - so
+ * refuse it HERE, at the call that made the mistake, instead of dropping the held play silently
+ * later. Returns true when the play must be refused. `want_bed` is the kind the call implies. */
+static bool refuse_pending_kind(bwa_engine* e, bwa_sound snd, bool want_bed, const char* msg) {
+    if (!rt_sound_pending(e->rt, snd)) return false;    /* decoded already: the channel count judges it */
+    const int kind = assets_kind(e->assets, snd);       /* -1 = not cache-owned, so not judgeable */
+    if (kind < 0 || (kind != 0) == want_bed) return false;
     set_error(e, msg);
     return true;
 }
@@ -368,6 +400,8 @@ bwa_engine* bwa_create(const bwa_desc* cfg) {
 
     e->rt = rt_create(BWA_VOICE_CAP, BWA_SOUND_CAP, e->cfg.sample_rate, L.count);
     if (!e->rt) { free(e); return NULL; }
+    e->assets = assets_create(e->rt, e->cfg.sample_rate, BWA_SOUND_CAP);   /* bounded by the sound table */
+    if (!e->assets) { rt_destroy(e->rt); free(e); return NULL; }
     e->max_re = 1;                                  /* match rt_create's default so the FDN bwa_start
                                                      * creates is seeded ON too (see rt.c) */
     /* The DEFAULT preset IS the engine's own defaults, field for field, so this seeds the shadow
@@ -398,7 +432,7 @@ bwa_engine* bwa_create(const bwa_desc* cfg) {
     if (e->profile == BWA_PROFILE_BINAURAL || e->profile == BWA_PROFILE_CAVE_SIM ||
         e->profile == BWA_PROFILE_CAVE_BOTH) {
         e->monitor = monitor_create(&e->layout, e->cfg.sample_rate);   /* count-driven virtual speakers */
-        if (!e->monitor) { rt_destroy(e->rt); free(e); return NULL; }
+        if (!e->monitor) { assets_destroy(e->assets); rt_destroy(e->rt); free(e); return NULL; }
     }
     /* BINAURAL routes point voices onto the direct SH bus for the engine's whole life (a create-
      * time topology, like the profile itself — never toggled once the audio thread exists). */
@@ -664,6 +698,7 @@ void bwa_destroy(bwa_engine* e) {
     steam_scene_destroy(e->scene);                      /* join the occlusion sim thread before rt is freed */
 #endif
     monitor_destroy(e->monitor);
+    assets_destroy(e->assets);                          /* joins the loader thread before rt's tables go */
     rt_destroy(e->rt);
     free((void*)e->cfg.layout_path);                    /* owned copies from bwa_create */
     free((void*)e->cfg.hrtf_path);
@@ -727,7 +762,62 @@ bwa_sound bwa_load_sound_streaming(bwa_engine* e, const char* path) {
 }
 
 void bwa_unload_sound(bwa_engine* e, bwa_sound snd) {
-    if (e) rt_unload_sound(e->rt, snd);   /* safe any time; retire-acked internally */
+    if (!e) return;
+    clear_error(e);
+    /* A cache-owned handle has other holders by construction: unloading it here would free the
+     * buffer under them AND leave the cache pointing at a recycled slot. Refuse loudly instead of
+     * corrupting the refcount - the two ownership tiers stay separable (see bw_audio.h). */
+    if (assets_owns(e->assets, snd)) {
+        set_error(e, "bwa_unload_sound: handle came from bwa_sound_acquire - release it with bwa_sound_release");
+        return;
+    }
+    rt_unload_sound(e->rt, snd);          /* safe any time; retire-acked internally */
+}
+
+/* ---- shared-ownership asset cache (bw_audio.h). The whole tier is control thread: assets.c
+ * allocates, does the I/O, and drives the SAME rt loaders bwa_load_* drives. ---- */
+
+/* assets.c mirrors the flag bits rather than including the public header. This is the one place
+ * both are visible, so it is where the mirror is pinned. */
+_Static_assert((int)BWA_LOAD_STREAM == (int)BWA_AF_STREAM &&
+               (int)BWA_LOAD_AMBIX  == (int)BWA_AF_AMBIX  &&
+               (int)BWA_LOAD_FUMA   == (int)BWA_AF_FUMA,
+               "bwa_load_flags and assets.h's BWA_AF_* mirror have drifted apart");
+
+bwa_sound bwa_sound_acquire(bwa_engine* e, const char* path, uint32_t flags) {
+    if (!e) return 0;
+    clear_error(e);
+    bwa_sound snd = assets_acquire(e->assets, path, flags, e->errbuf, sizeof e->errbuf);
+    if (snd == 0) set_error(e, e->errbuf[0] ? e->errbuf : "bwa_sound_acquire: failed");
+    return snd;
+}
+
+bwa_sound bwa_sound_acquire_async(bwa_engine* e, const char* path, uint32_t flags) {
+    if (!e) return 0;
+    clear_error(e);
+    bwa_sound snd = assets_acquire_async(e->assets, path, flags, e->errbuf, sizeof e->errbuf);
+    if (snd == 0) set_error(e, e->errbuf[0] ? e->errbuf : "bwa_sound_acquire_async: failed");
+    return snd;
+}
+
+bwa_sound bwa_sound_find(bwa_engine* e, const char* path, uint32_t flags) {
+    if (!e) return 0;
+    return assets_find(e->assets, path, flags);   /* pure lookup: no error to report, 0 = not resident */
+}
+
+bool bwa_sound_is_ready(bwa_engine* e, bwa_sound snd) {
+    if (!e) return false;
+    clear_error(e);
+    bool ready = assets_is_ready(e->assets, snd, e->errbuf, sizeof e->errbuf);
+    if (!ready && e->errbuf[0]) set_error(e, e->errbuf);   /* still-decoding is not an error */
+    return ready;
+}
+
+void bwa_sound_release(bwa_engine* e, bwa_sound snd) {
+    if (!e) return;
+    clear_error(e);
+    if (!assets_release(e->assets, snd, e->errbuf, sizeof e->errbuf))
+        set_error(e, e->errbuf[0] ? e->errbuf : "bwa_sound_release: failed");
 }
 
 uint64_t bwa_sound_get_frames(bwa_engine* e, bwa_sound snd) {
@@ -778,13 +868,21 @@ bwa_sound bwa_load_fuma(bwa_engine* e, const char* path) {
 bwa_bed bwa_bed_create(bwa_engine* e)                                { return bwa_source_create(e); }
 void  bwa_bed_play(bwa_engine* e, bwa_bed b, bwa_sound snd, bool loop) {
     if (!e) return;
-    if (rt_sound_channels(e->rt, snd) <= 1) {       /* a bed needs an ambisonic (multichannel) asset */
+    /* A still-loading async asset reports 0 channels (nothing is decoded yet), so the mono guard
+     * would reject a perfectly good bed. Let it through: rt holds the play until the data lands.
+     * Its acquire flags still say which kind it will be, and a mono one is refused right here. */
+    if (refuse_pending_kind(e, snd, true,
+            "bwa_bed_play: this async asset was acquired as mono - acquire it with BWA_LOAD_AMBIX or BWA_LOAD_FUMA"))
+        return;
+    if (rt_sound_channels(e->rt, snd) <= 1 && !rt_sound_pending(e->rt, snd)) {
         set_error(e, "bwa_bed_play: asset is mono — load it with bwa_load_ambix (a 4/9/16-ch AmbiX file)");
         return;
     }
     if (refuse_push_play(e, b, "bwa_bed_play: push source (bwa_source_create_push) — feed it with bwa_source_push"))
         return;
-    rt_source_play(e->rt, b, snd, loop);            /* direct: bypass bwa_source_play's mono-only guard */
+    rt_bed_play(e->rt, b, snd, loop);               /* direct: bypass bwa_source_play's mono-only guard.
+                                                     * The bed-kind entry point, so a HELD play carries
+                                                     * the kind into rt_sound_publish's re-check. */
 }
 void  bwa_bed_set_gain(bwa_engine* e, bwa_bed b, float linear)       { bwa_source_set_gain(e, b, linear); }
 void  bwa_bed_stop(bwa_engine* e, bwa_bed b)                         { bwa_source_stop(e, b); }
@@ -801,8 +899,35 @@ uint64_t bwa_bed_get_playhead_frames(bwa_engine* e, bwa_bed b)              { re
 
 /* ---- sources (forward to the rt core) ---- */
 
+/* The desc shadow's slot for `s`, or NULL when `s` does not own it. The handle compare IS the
+ * generation gate (handles are index | gen << 16), so a stale handle can neither read another
+ * source's configuration nor scribble on it. */
+static bwa_source_desc* src_desc_slot(bwa_engine* e, bwa_source s) {
+    if (!e || s == 0) return NULL;
+    uint16_t idx = (uint16_t)(s & 0xFFFFu);
+    if (idx >= BWA_VOICE_SLOTS || e->src_desc_h[idx] != s) return NULL;
+    return &e->src_desc[idx];
+}
+
+/* Claim the slot for a freshly created source and seed every control-side per-source cache with the
+ * engine's own defaults. A slot is RECYCLED, so anything left here would otherwise be inherited by
+ * the next occupant — rt memsets its Voice on CMD_SRC_CREATE for exactly this reason, and the caches
+ * up here have to agree with it or the readback lies. */
+static void src_desc_reset(bwa_engine* e, bwa_source s) {
+    uint16_t idx = (uint16_t)(s & 0xFFFFu);
+    if (!e || s == 0 || idx >= BWA_VOICE_SLOTS) return;
+    e->src_desc_h[idx] = s;
+    bwa_source_preset(BWA_SRC_DEFAULT, &e->src_desc[idx]);
+    e->src_pos[idx][0] = e->src_pos[idx][1] = e->src_pos[idx][2] = 0.f;
+    e->src_fwd[idx][0] = 0.f; e->src_fwd[idx][1] = 0.f; e->src_fwd[idx][2] = 1.f;  /* room ahead */
+    e->src_dirw[idx] = 0.f; e->src_dirp[idx] = 1.f;                                /* omni, matching rt */
+}
+
 bwa_source bwa_source_create(bwa_engine* e) {
-    return e ? rt_source_create(e->rt) : 0;
+    if (!e) return 0;
+    bwa_source s = rt_source_create(e->rt);
+    src_desc_reset(e, s);
+    return s;
 }
 /* procedural (push) sources: the voice plays caller-pushed PCM (see bw_audio.h) */
 bwa_source bwa_source_create_push(bwa_engine* e) {
@@ -810,6 +935,7 @@ bwa_source bwa_source_create_push(bwa_engine* e) {
     clear_error(e);
     bwa_source s = rt_source_create_stream(e->rt, e->errbuf, sizeof e->errbuf);
     if (s == 0) set_error(e, e->errbuf[0] ? e->errbuf : "bwa_source_create_push: failed");
+    src_desc_reset(e, s);
     return s;
 }
 uint32_t bwa_source_push(bwa_engine* e, bwa_source s, const float* frames, uint32_t n) {
@@ -825,10 +951,15 @@ void bwa_source_push_end(bwa_engine* e, bwa_source s) {
         rt_source_push_end(e->rt, s);
 }
 void bwa_source_set_priority(bwa_engine* e, bwa_source s, int priority) {
-    if (e) rt_source_set_priority(e->rt, s, priority);
+    if (!e) return;
+    rt_source_set_priority(e->rt, s, priority);
+    bwa_source_desc* d = src_desc_slot(e, s);
+    if (d) d->priority = priority < 0 ? 0 : (priority > 255 ? 255 : priority);   /* rt's own clamp */
 }
 void bwa_source_destroy(bwa_engine* e, bwa_source s) {
     if (!e) return;
+    { uint16_t idx = (uint16_t)(s & 0xFFFFu);   /* release the shadow slot with the handle */
+      if (idx < BWA_VOICE_SLOTS && e->src_desc_h[idx] == s) e->src_desc_h[idx] = 0; }
 #ifdef BWA_HAVE_STEAMAUDIO
     /* clear ALL scene features (occlusion + directivity) so the sim tears down this source's
      * IPLSource and stops simulating the slot (else it leaks + a recycled slot inherits stale state). */
@@ -851,13 +982,23 @@ void bwa_source_set_pos(bwa_engine* e, bwa_source s, float x, float y, float z) 
     if (e->path)  steam_path_set_pos(e->path, s, x, y, z);     /* keep the pathing sim in sync */
 #endif
 }
-void bwa_source_set_gain(bwa_engine* e, bwa_source s, float linear)          { if (e) rt_source_set_gain(e->rt, s, linear); }
+void bwa_source_set_gain(bwa_engine* e, bwa_source s, float linear) {
+    if (!e) return;
+    rt_source_set_gain(e->rt, s, linear);
+    bwa_source_desc* d = src_desc_slot(e, s);
+    /* mirror rt's guard exactly: it REJECTS a non-finite/negative gain, so the shadow must keep the
+     * old value there too or the readback reports a setting the engine never took */
+    if (d && isfinite(linear) && linear >= 0.f) d->gain = linear > BWA_MAX_GAIN ? BWA_MAX_GAIN : linear;
+}
 void bwa_source_play(bwa_engine* e, bwa_source s, bwa_sound snd, bool loop) {
     if (!e) return;
     if (rt_sound_channels(e->rt, snd) > 1) {        /* a multichannel asset is a bed, not a point source */
         set_error(e, "bwa_source_play: asset is multichannel — use bwa_bed_play (or bwa_load_sound for a point source)");
         return;
     }
+    if (refuse_pending_kind(e, snd, false,          /* not decoded yet, but acquired as a bed */
+            "bwa_source_play: this async asset was acquired as an ambisonic bed - use bwa_bed_play"))
+        return;
     if (refuse_push_play(e, s, "bwa_source_play: push source (bwa_source_create_push) — feed it with bwa_source_push"))
         return;
     rt_source_play(e->rt, s, snd, loop);
@@ -868,6 +1009,9 @@ void bwa_source_play_at(bwa_engine* e, bwa_source s, bwa_sound snd, bool loop, u
         set_error(e, "bwa_source_play_at: asset is multichannel — use a point source");
         return;
     }
+    if (refuse_pending_kind(e, snd, false,
+            "bwa_source_play_at: this async asset was acquired as an ambisonic bed - use bwa_bed_play"))
+        return;
     if (refuse_push_play(e, s, "bwa_source_play_at: push source (bwa_source_create_push) — feed it with bwa_source_push"))
         return;
     rt_source_play_at(e->rt, s, snd, loop, start_sample);
@@ -878,6 +1022,9 @@ void bwa_source_play_loop(bwa_engine* e, bwa_source s, bwa_sound snd, uint64_t l
         set_error(e, "bwa_source_play_loop: asset is multichannel — use bwa_bed_play (or bwa_load_sound for a point source)");
         return;
     }
+    if (refuse_pending_kind(e, snd, false,
+            "bwa_source_play_loop: this async asset was acquired as an ambisonic bed - use bwa_bed_play"))
+        return;
     if (refuse_push_play(e, s, "bwa_source_play_loop: push source (bwa_source_create_push) — feed it with bwa_source_push"))
         return;
     rt_source_play_loop(e->rt, s, snd, loop_beg, loop_end);
@@ -922,7 +1069,9 @@ void bwa_source_stop_at(bwa_engine* e, bwa_source s, uint64_t stop_sample)  { if
 void bwa_source_queue(bwa_engine* e, bwa_source s, bwa_sound snd, bool loop) {
     if (!e) return;
     if (rt_sound_channels(e->rt, snd) != 1 || rt_sound_is_stream(e->rt, snd)) {   /* in-memory mono only */
-        set_error(e, "bwa_source_queue: asset must be an in-memory mono sound (not a bed/stream/invalid)");
+        set_error(e, rt_sound_pending(e->rt, snd)
+                     ? "bwa_source_queue: asset is still loading (bwa_sound_acquire_async) - a queue entry resolves at bind time; check bwa_sound_is_ready"
+                     : "bwa_source_queue: asset must be an in-memory mono sound (not a bed/stream/invalid)");
         return;
     }
     if (refuse_push_play(e, s, "bwa_source_queue: push source (bwa_source_create_push) — feed it with bwa_source_push"))
@@ -935,6 +1084,7 @@ void bwa_source_seek(bwa_engine* e, bwa_source s, uint64_t frame)           { if
 bool bwa_source_is_playing(bwa_engine* e, bwa_source s)                     { return e ? rt_source_is_playing(e->rt, s) : false; }
 uint64_t bwa_source_get_playhead_frames(bwa_engine* e, bwa_source s)               { return e ? rt_source_get_position(e->rt, s) : 0; }
 void bwa_set_test_signal(bwa_engine* e, uint32_t channel, bwa_test_kind kind, float gain) { if (e) rt_test_signal(e->rt, channel, (uint8_t)kind, gain); }
+
 
 void bwa_set_panner(bwa_engine* e, bwa_panner panner) { if (e) { e->panner = (int)panner; e->cur.panner = panner; rt_set_panner(e->rt, (int)panner); } }
 void bwa_set_dual_band(bwa_engine* e, bool on)       { if (e) { e->cur.dual_band = on; rt_set_dual_band(e->rt, on); } }
@@ -1060,10 +1210,23 @@ void bwa_set_near_spread(bwa_engine* e, float radius_m)    { if (e) { e->cur.nea
 void bwa_set_hole_spread(bwa_engine* e, float strength)    { if (e) { e->cur.hole_spread = strength; rt_set_hole_spread(e->rt, strength); } }
 void bwa_set_spcap_focus(bwa_engine* e, float focus, float density) { if (e) { e->cur.spcap_focus = focus; e->cur.spcap_density = density; rt_set_spcap_focus(e->rt, focus, density); } }
 void bwa_set_extra_listeners(bwa_engine* e, const float* xyz, uint32_t count) { if (e) rt_set_extra_listeners(e->rt, xyz, count); }
-void bwa_source_set_loudness_comp(bwa_engine* e, bwa_source s, bool on) { if (e) rt_source_set_loudness_comp(e->rt, s, on); }
-void bwa_source_set_proximity(bwa_engine* e, bwa_source s, bool on) { if (e) rt_source_set_proximity(e->rt, s, on); }
+void bwa_source_set_loudness_comp(bwa_engine* e, bwa_source s, bool on) {
+    if (!e) return;
+    rt_source_set_loudness_comp(e->rt, s, on);
+    bwa_source_desc* d = src_desc_slot(e, s); if (d) d->loudness_comp = on;
+}
+void bwa_source_set_proximity(bwa_engine* e, bwa_source s, bool on) {
+    if (!e) return;
+    rt_source_set_proximity(e->rt, s, on);
+    bwa_source_desc* d = src_desc_slot(e, s); if (d) d->proximity = on;
+}
 void bwa_set_speed_of_sound(bwa_engine* e, float mps) { if (e) rt_set_speed_of_sound(e->rt, mps); }
-void bwa_source_set_size(bwa_engine* e, bwa_source s, float radius_m) { if (e) rt_source_set_size(e->rt, s, radius_m); }
+void bwa_source_set_size(bwa_engine* e, bwa_source s, float radius_m) {
+    if (!e) return;
+    rt_source_set_size(e->rt, s, radius_m);
+    bwa_source_desc* d = src_desc_slot(e, s);
+    if (d && isfinite(radius_m)) d->size_m = radius_m < 0.f ? 0.f : radius_m;   /* rt's clamp */
+}
 
 void     bwa_set_master_gain(bwa_engine* e, float linear)  { if (e) rt_set_master_gain(e->rt, linear); }
 void     bwa_set_paused(bwa_engine* e, bool paused)        { if (e) rt_set_all_paused(e->rt, paused); }
@@ -1081,12 +1244,35 @@ const float* bwa_render_block(bwa_engine* e, uint32_t* channels, uint32_t* nfram
     if (!out) set_error(e, "bwa_render_block: requires bwa_desc.sink = BWA_SINK_MANUAL");
     return out;
 }
-void bwa_source_fade_to (bwa_engine* e, bwa_source s, float gain, float seconds) { if (e) rt_source_fade_to(e->rt, s, gain, seconds, false); }
+/* fade_to is a gain SETTING spread over time, so the desc shadow takes its target (a round-trip
+ * once the fade lands is then exact). fade_out is a STOP, not a gain setting — it must not rewrite
+ * the source's configured level to 0, or replaying it later would come back silent. */
+void bwa_source_fade_to (bwa_engine* e, bwa_source s, float gain, float seconds) {
+    if (!e) return;
+    rt_source_fade_to(e->rt, s, gain, seconds, false);
+    bwa_source_desc* d = src_desc_slot(e, s);
+    if (d) { float g = (!isfinite(gain) || gain < 0.f) ? 0.f : gain;   /* rt's own cleanse */
+             d->gain = g > BWA_MAX_GAIN ? BWA_MAX_GAIN : g; }
+}
 void bwa_source_fade_out(bwa_engine* e, bwa_source s, float seconds)             { if (e) rt_source_fade_to(e->rt, s, 0.f, seconds, true); }
-void bwa_source_set_group(bwa_engine* e, bwa_source s, uint32_t group)  { if (e) rt_source_set_group(e->rt, s, group); }
+void bwa_source_set_group(bwa_engine* e, bwa_source s, uint32_t group) {
+    if (!e) return;
+    rt_source_set_group(e->rt, s, group);
+    bwa_source_desc* d = src_desc_slot(e, s);
+    if (d) d->group = group < BWA_GROUPS ? group : 0;                  /* rt's own fallback */
+}
 void bwa_group_set_gain  (bwa_engine* e, uint32_t group, float linear){ if (e) rt_group_set_gain(e->rt, group, linear); }
 void bwa_group_set_paused(bwa_engine* e, uint32_t group, bool paused) { if (e) rt_group_set_paused(e->rt, group, paused); }
-void bwa_source_set_pitch(bwa_engine* e, bwa_source s, float rate)      { if (e) rt_source_set_pitch(e->rt, s, rate); }
+/* Scene transition: stop a whole category, or everything. One ring command each, and the audio
+ * thread stops each member on rt_source_stop's click-free path (see bw_audio.h). */
+void bwa_group_stop      (bwa_engine* e, uint32_t group)              { if (e) rt_group_stop(e->rt, group); }
+void bwa_stop_all        (bwa_engine* e)                              { if (e) rt_stop_all(e->rt); }
+void bwa_source_set_pitch(bwa_engine* e, bwa_source s, float rate) {
+    if (!e) return;
+    rt_source_set_pitch(e->rt, s, rate);
+    bwa_source_desc* d = src_desc_slot(e, s);
+    if (d && isfinite(rate)) d->pitch = rate < 0.25f ? 0.25f : (rate > 4.f ? 4.f : rate);  /* rt's clamp */
+}
 void bwa_bed_set_orientation(bwa_engine* e, bwa_bed b, float yaw_rad, float pitch_rad, float roll_rad) {
     if (e) rt_bed_set_orientation(e->rt, b, yaw_rad, pitch_rad, roll_rad);
 }
@@ -1266,7 +1452,9 @@ bool bwa_play_oneshot(bwa_engine* e, bwa_sound snd, float x, float y, float z, f
     if (!e) return false;
     const uint16_t ch = rt_sound_channels(e->rt, snd);
     if (ch == 0) {
-        set_error(e, "bwa_play_oneshot: sound handle is stale or was never loaded");
+        set_error(e, rt_sound_pending(e->rt, snd)
+                     ? "bwa_play_oneshot: asset is still loading (bwa_sound_acquire_async) - a oneshot owns no handle to start later; check bwa_sound_is_ready"
+                     : "bwa_play_oneshot: sound handle is stale or was never loaded");
         return false;
     }
     if (ch > 1) {
@@ -1550,14 +1738,17 @@ void bwa_source_set_early_reflections(bwa_engine* e, bwa_source s, bool on) {
     }
 #endif
     rt_source_set_ism(e->rt, s, on);
+    bwa_source_desc* d = src_desc_slot(e, s); if (d) d->early_reflections = on;
 }
 void bwa_set_early_reflections_gain(bwa_engine* e, float linear) { if (e) rt_set_ism_gain(e->rt, linear); }
 
 void bwa_source_set_occlusion(bwa_engine* e, bwa_source s, bool on) {
+    if (!e) return;
+    /* the shadow records the REQUEST even in a no-SDK build: the setting is what the desc carries,
+     * and whether a sim exists to honor it is a build property, not a per-source one */
+    bwa_source_desc* d = src_desc_slot(e, s); if (d) d->occlusion = on;
 #ifdef BWA_HAVE_STEAMAUDIO
-    if (e && e->scene) steam_scene_set_occlusion(e->scene, s, on);
-#else
-    (void)e; (void)s; (void)on;
+    if (e->scene) steam_scene_set_occlusion(e->scene, s, on);   /* no-SDK: the shadow above is all there is */
 #endif
 }
 
@@ -1627,12 +1818,15 @@ void bwa_fdn_set_decay(bwa_engine* e, float rt60_low_s, float rt60_high_s, float
 }
 
 void bwa_source_set_reverb(bwa_engine* e, bwa_source s, bool on) {
-    if (e) rt_source_set_reflections(e->rt, s, on);             /* phonon-free; the tap consumes the send */
+    if (!e) return;
+    rt_source_set_reflections(e->rt, s, on);                    /* phonon-free; the tap consumes the send */
+    bwa_source_desc* d = src_desc_slot(e, s); if (d) d->reverb = on;
 }
 
 void bwa_source_set_pathing(bwa_engine* e, bwa_source s, bool on) {
     if (!e) return;
     rt_source_set_pathing(e->rt, s, on);                        /* gate the voice into the indirect render */
+    { bwa_source_desc* d = src_desc_slot(e, s); if (d) d->pathing = on; }
 #ifdef BWA_HAVE_STEAMAUDIO
     if (e->path) {                                              /* register/enable in the sim with the tracked pos */
         uint16_t idx = (uint16_t)(s & 0xFFFFu);
@@ -1645,32 +1839,63 @@ void bwa_source_set_pathing(bwa_engine* e, bwa_source s, bool on) {
 }
 
 void bwa_source_set_reverb_send(bwa_engine* e, bwa_source s, float gain) {
-    if (e) rt_source_set_reflection_send(e->rt, s, gain);
+    if (!e) return;
+    rt_source_set_reflection_send(e->rt, s, gain);
+    bwa_source_desc* d = src_desc_slot(e, s);
+    if (d && isfinite(gain) && gain >= 0.f) d->reverb_send = gain > BWA_MAX_GAIN ? BWA_MAX_GAIN : gain;
 }
 
 void bwa_source_set_reverb_distance(bwa_engine* e, bwa_source s, bool on) {
-    if (e) rt_source_set_reflection_distance(e->rt, s, on);
+    if (!e) return;
+    rt_source_set_reflection_distance(e->rt, s, on);
+    bwa_source_desc* d = src_desc_slot(e, s); if (d) d->reverb_distance = on;
 }
 
 void bwa_source_set_doppler(bwa_engine* e, bwa_source s, bool on) {
-    if (e) rt_source_set_doppler(e->rt, s, on);
+    if (!e) return;
+    rt_source_set_doppler(e->rt, s, on);
+    bwa_source_desc* d = src_desc_slot(e, s); if (d) d->doppler = on;
 }
 
 void bwa_source_set_air_absorption(bwa_engine* e, bwa_source s, bool on) {
-    if (e) rt_source_set_air_absorption(e->rt, s, on);
+    if (!e) return;
+    rt_source_set_air_absorption(e->rt, s, on);
+    bwa_source_desc* d = src_desc_slot(e, s); if (d) d->air_absorption = on;
 }
 
 void bwa_source_set_spread(bwa_engine* e, bwa_source s, float amount) {
-    if (e) rt_source_set_spread(e->rt, s, amount);
+    if (!e) return;
+    rt_source_set_spread(e->rt, s, amount);
+    bwa_source_desc* d = src_desc_slot(e, s);
+    if (d && isfinite(amount)) {
+        d->spread = amount < 0.f ? 0.f : (amount > 1.f ? 1.f : amount);   /* rt's clamp */
+        d->extent_height = -1.f;              /* a scalar spread resets to isotropic (last call wins) */
+    }
 }
 
 void bwa_source_set_extent(bwa_engine* e, bwa_source s, float width, float height) {
-    if (e) rt_source_set_extent(e->rt, s, width, height);
+    if (!e) return;
+    rt_source_set_extent(e->rt, s, width, height);
+    bwa_source_desc* d = src_desc_slot(e, s);
+    if (d && isfinite(width) && isfinite(height)) {
+        d->spread        = width  < 0.f ? 0.f : (width  > 1.f ? 1.f : width);
+        d->extent_height = height < 0.f ? 0.f : (height > 1.f ? 1.f : height);  /* never "unset" */
+    }
 }
 
 void bwa_source_set_attenuation_override(bwa_engine* e, bwa_source s,
                                          float ref_dist, float rolloff, float min_gain) {
-    if (e) rt_source_set_attenuation(e->rt, s, ref_dist, rolloff, min_gain);
+    if (!e) return;
+    rt_source_set_attenuation(e->rt, s, ref_dist, rolloff, min_gain);
+    bwa_source_desc* d = src_desc_slot(e, s);
+    if (d && isfinite(ref_dist) && isfinite(rolloff) && isfinite(min_gain)) {
+        if (ref_dist <= 0.f) { d->atten_ref_dist = 0.f; d->atten_rolloff = 0.f; d->atten_min_gain = 0.f; }
+        else {
+            d->atten_ref_dist = ref_dist;
+            d->atten_rolloff  = rolloff  < 0.f ? 0.f : rolloff;
+            d->atten_min_gain = min_gain < 0.f ? 0.f : (min_gain > 1.f ? 1.f : min_gain);
+        }
+    }
 }
 
 void bwa_source_set_orientation(bwa_engine* e, bwa_source s, float qx, float qy, float qz, float qw) {
@@ -1698,7 +1923,14 @@ void bwa_source_set_directivity(bwa_engine* e, bwa_source s, float weight, float
     if (!isfinite(power)) return;               /* never clamped anywhere; goes raw into the sim */
     if (!(weight > 0.f)) weight = 0.f; else if (weight > 1.f) weight = 1.f;   /* NaN-safe */
     uint16_t idx = (uint16_t)(s & 0xFFFFu);
-    if (idx < BWA_VOICE_SLOTS) { e->src_dirw[idx] = weight; e->src_dirp[idx] = power; }
+    /* GENERATION-GATED like every other per-source setter (invariant 5). The rt and sim calls below
+     * drop a stale handle on their own, but this CACHE is now read by bwa_source_apply (to skip a
+     * matching pattern) and by bwa_source_get_desc, so an ungated write from a stale handle would
+     * outlive its source: the slot's NEXT occupant would inherit the value, apply would conclude
+     * "already matches" and skip a real change, and the readback would report a pattern the mixer
+     * is not rendering. Silent, and invisible to anyone reading the setter alone. */
+    if (!src_desc_slot(e, s)) return;                                /* stale/destroyed: drop it */
+    e->src_dirw[idx] = weight; e->src_dirp[idx] = power;
 #ifdef BWA_HAVE_STEAMAUDIO
     if (e->scene) { steam_scene_set_directivity(e->scene, s, weight, power); return; }
 #endif
@@ -1719,6 +1951,250 @@ float bwa_source_get_directivity(bwa_engine* e, bwa_source s) {
     return e ? rt_get_directivity(e->rt, s) : 1.0f;
 }
 
+/* ---- source configuration (bwa_source_kind / bwa_source_desc; see the header for the design) ----
+ *
+ * Same three-way honesty rule bwa_tuning_preset follows, and the answer comes out weaker here:
+ * NOTHING in this table is measured. A kind differs from BWA_SRC_DEFAULT only where a doc already
+ * argues the case, and every other field sits at the engine default. Where a value had to be
+ * picked, it is an ENDPOINT the ABI already names (1 = wide, 255 = protected, rolloff 0 = constant
+ * level) rather than a tuned middle number, because a middle number here would be opinion wearing
+ * a measurement's clothes. */
+
+/* Clamp every field to the range the individual setters clamp it to. IDEMPOTENT by construction,
+ * which is what makes get_desc -> apply a no-op: the shadow only ever holds sanitized values, so a
+ * round-trip re-applies exactly what is already there. Both writers (this and rt_source_apply_cfg)
+ * must agree, so keep the two lists in step. Non-finite is not clamped here - bwa_source_apply
+ * refuses it outright - but the guards are written NaN-safe anyway, because bwa_source_preset and
+ * the reset path also come through. */
+static void src_desc_sanitize(bwa_source_desc* d) {
+    d->gain     = (!isfinite(d->gain) || d->gain < 0.f) ? 0.f
+                : (d->gain > BWA_MAX_GAIN ? BWA_MAX_GAIN : d->gain);
+    d->pitch    = !isfinite(d->pitch) ? 1.f
+                : (d->pitch < 0.25f ? 0.25f : (d->pitch > 4.f ? 4.f : d->pitch));
+    d->priority = d->priority < 0 ? 0 : (d->priority > 255 ? 255 : d->priority);
+    d->group    = d->group < BWA_GROUPS ? d->group : 0;
+    d->spread   = (!isfinite(d->spread) || d->spread < 0.f) ? 0.f
+                : (d->spread > 1.f ? 1.f : d->spread);
+    d->extent_height = (!isfinite(d->extent_height) || d->extent_height < 0.f) ? -1.f
+                     : (d->extent_height > 1.f ? 1.f : d->extent_height);   /* < 0 = isotropic */
+    d->size_m   = (!isfinite(d->size_m) || d->size_m < 0.f) ? 0.f : d->size_m;
+    d->reverb_send = (!isfinite(d->reverb_send) || d->reverb_send < 0.f) ? 0.f
+                   : (d->reverb_send > BWA_MAX_GAIN ? BWA_MAX_GAIN : d->reverb_send);
+    /* the attenuation override travels as a unit: a ref that does not enable it zeroes the rest,
+     * so two descs that both mean "no override" compare equal */
+    if (!isfinite(d->atten_ref_dist) || d->atten_ref_dist <= 0.f) {
+        d->atten_ref_dist = 0.f; d->atten_rolloff = 0.f; d->atten_min_gain = 0.f;
+    } else {
+        d->atten_rolloff  = (!isfinite(d->atten_rolloff) || d->atten_rolloff < 0.f) ? 0.f : d->atten_rolloff;
+        d->atten_min_gain = (!isfinite(d->atten_min_gain) || d->atten_min_gain < 0.f) ? 0.f
+                          : (d->atten_min_gain > 1.f ? 1.f : d->atten_min_gain);
+    }
+    /* directivity mirrors bwa_source_set_directivity, which clamps the WEIGHT and only requires the
+     * power to be finite (the sim takes it raw; rt's manual dipole clamps it at its own boundary).
+     * Clamping the power here as well would break the round-trip against a source configured
+     * through the individual setter. */
+    d->directivity_weight = !(d->directivity_weight > 0.f) ? 0.f
+                          : (d->directivity_weight > 1.f ? 1.f : d->directivity_weight);
+    if (!isfinite(d->directivity_power)) d->directivity_power = 1.f;
+    for (int i = 0; i < 4; ++i) d->reserved[i] = 0;
+}
+
+void bwa_source_preset(bwa_source_kind kind, bwa_source_desc* out) {
+    if (!out) return;
+    memset(out, 0, sizeof *out);
+    out->struct_size = (uint32_t)sizeof(bwa_source_desc);
+
+    /* BWA_SRC_DEFAULT IS the engine's own per-source defaults, field for field (rt.c's
+     * CMD_SRC_CREATE and alloc_handle). Nothing asserts that today: if you move a default there,
+     * move it here too - src_desc_reset seeds the readback shadow from this call. */
+    out->gain               = 1.f;
+    out->pitch              = 1.f;
+    out->priority           = 128;    /* alloc_handle's defined default for every slot */
+    out->group              = 0;
+    out->spread             = 0.f;
+    out->extent_height      = -1.f;   /* isotropic (rt: spread_h < 0) */
+    out->size_m             = 0.f;
+    out->reverb_send        = 1.f;    /* full wet-send level, gated by `reverb` */
+    out->atten_ref_dist     = 0.f;    /* no override: the layout's curve */
+    out->directivity_weight = 0.f;    /* omni */
+    out->directivity_power  = 1.f;
+    /* every bool stays false: the engine's per-source effects are all opt-in */
+
+    switch (kind) {
+    case BWA_SRC_PROP:
+        /* A physical object in a walkable room. INTENT, from the header's own arguments: proximity
+         * is "the missing half of distance" in a volume you can walk up to, air absorption is what
+         * distance does to timbre, and a real object is occluded by real geometry and excites the
+         * room (wetter far, drier near). Doppler stays OFF: the header calls it best for fast
+         * movers and subtle for slow ones, and "prop" says nothing about speed - turn it on for the
+         * ones that move. Early reflections stay off too: they need a room AND cost O(N) in
+         * sources, so they are an explicit per-source opt-in, not something a preset spends. */
+        out->proximity       = true;
+        out->air_absorption  = true;
+        out->occlusion       = true;
+        out->reverb          = true;
+        out->reverb_distance = true;
+        break;
+    case BWA_SRC_VOICE:
+        /* Dialog. Same room behavior as a prop, minus the effects that trade intelligibility for
+         * realism (air absorption dulls a distant line; proximity is a walk-up cue a talker rarely
+         * gets). INTENT. Priority is the ABI's own "protected" endpoint, not a tuned number: a full
+         * pool must drop an effect before it drops a line. Directivity stays OMNI even though a
+         * mouth is a cardioid, because a pattern without an ORIENTATION aims at room-ahead and the
+         * orientation is per-frame - a preset that quietly nulls an un-aimed source is a trap. */
+        out->priority        = 255;
+        out->occlusion       = true;
+        out->reverb          = true;
+        out->reverb_distance = true;
+        break;
+    case BWA_SRC_AMBIENCE:
+        /* A layer that must not collapse to a point. spread 1 is the ABI's documented WIDE
+         * endpoint, not a tuned width - dial it down, or use size_m for a physical extent that
+         * holds as the listener walks. No reverb send: ambience content usually already carries its
+         * space, and sending it to the shared bed double-counts, the same argument that keeps the
+         * CAVE room itself out of the image-source model. */
+        out->spread = 1.f;
+        break;
+    case BWA_SRC_UI:
+        /* Non-diegetic. It should not obey the room at all, and the ABI already has the exact tool:
+         * an attenuation override with rolloff 0 is "constant level at any distance, a direction-only
+         * cue that never fades". 1 m is the canonical reference distance, and min_gain 1 keeps the
+         * floor out of the way. Priority 255 for the same reason as VOICE. */
+        out->priority       = 255;
+        out->atten_ref_dist = 1.f;
+        out->atten_rolloff  = 0.f;
+        out->atten_min_gain = 1.f;
+        break;
+    default: break;                   /* BWA_SRC_DEFAULT, and anything unknown, resolves here */
+    }
+    src_desc_sanitize(out);
+}
+
+/* Shared by apply and create_desc - create_desc must not allocate a voice for a desc it will
+ * refuse, so the whole check runs before anything is created. */
+static bool src_desc_check(bwa_engine* e, const bwa_source_desc* d, const char* who) {
+    char msg[256];
+    if (!d || d->struct_size != (uint32_t)sizeof(bwa_source_desc)) {
+        snprintf(msg, sizeof msg,
+                 "%s: NULL or wrong-sized bwa_source_desc. This struct's zero is NOT its default "
+                 "(a zero-filled one means gain 0 and pitch 0), so start from bwa_source_preset and "
+                 "edit what you disagree with.", who);
+        set_error(e, msg);
+        return false;
+    }
+    if (!(isfinite(d->gain) && isfinite(d->pitch) && isfinite(d->spread) &&
+          isfinite(d->extent_height) && isfinite(d->size_m) && isfinite(d->reverb_send) &&
+          isfinite(d->atten_ref_dist) && isfinite(d->atten_rolloff) && isfinite(d->atten_min_gain) &&
+          isfinite(d->directivity_weight) && isfinite(d->directivity_power))) {
+        snprintf(msg, sizeof msg,
+                 "%s: a bwa_source_desc field is NaN or infinite. Out-of-range FINITE values clamp "
+                 "to the documented range; non-finite ones are a caller bug and refuse the whole "
+                 "apply rather than land half a configuration.", who);
+        set_error(e, msg);
+        return false;
+    }
+    return true;
+}
+
+bool bwa_source_apply(bwa_engine* e, bwa_source s, const bwa_source_desc* d) {
+    if (!e) return false;
+    /* no clear_error here, deliberately: this is a PER-FRAME call, and the lifecycle contract
+     * (bw_audio.h) says only the lifecycle/load-class calls clear. A per-frame call that clears
+     * would wipe an error the caller has not read yet. Same as bwa_apply_tuning. */
+    if (!src_desc_check(e, d, "bwa_source_apply")) return false;
+
+    bwa_source_desc cfg = *d;
+    src_desc_sanitize(&cfg);
+
+    /* Same guard bwa_source_set_early_reflections applies, and the same reason: the ISM has nothing
+     * to mirror against without a room. Report it, drop THAT field, and let the rest land - the
+     * call still succeeded, so the return stays true (bwa_last_error carries the degradation, the
+     * documented pattern for a call that succeeds but gives something up). */
+    if (cfg.early_reflections && !e->ism_room.valid) {
+        cfg.early_reflections = false;
+        set_error(e, "bwa_source_apply: early reflections need a room - call bwa_scene_set_box (or "
+                     "bwa_scene_set_ground) first. The rest of the desc was applied.");
+    }
+
+    /* Liveness comes from rt, not from the shadow: a STOLEN voice's slot is recycled by the event
+     * drain, which engine.c never sees, so the shadow can still be claimed by a handle rt has
+     * already retired. rt would drop the command anyway; checking here keeps the shadow from
+     * recording a configuration that never happened. */
+    if (!rt_source_live(e->rt, s)) return true;   /* stale handle: the documented silent no-op */
+    bwa_source_desc* sh = src_desc_slot(e, s);
+
+    /* ONE ring command for the fifteen knobs the audio thread owns. */
+    RtSrcCfg rc;
+    rc.gain              = cfg.gain;
+    rc.pitch             = cfg.pitch;
+    rc.spread            = cfg.spread;
+    rc.extent_h          = cfg.extent_height;
+    rc.size_m            = cfg.size_m;
+    rc.reverb_send       = cfg.reverb_send;
+    rc.atten_ref         = cfg.atten_ref_dist;
+    rc.atten_rolloff     = cfg.atten_rolloff;
+    rc.atten_min         = cfg.atten_min_gain;
+    rc.group             = cfg.group;
+    rc.doppler           = cfg.doppler;
+    rc.air               = cfg.air_absorption;
+    rc.loudness_comp     = cfg.loudness_comp;
+    rc.proximity         = cfg.proximity;
+    rc.early_reflections = cfg.early_reflections;
+    rc.reverb            = cfg.reverb;
+    rc.reverb_distance   = cfg.reverb_distance;
+    rc.pathing           = cfg.pathing;
+    rt_source_apply_cfg(e->rt, s, &rc);
+
+    /* The rest never travels the ring: steal priority is control-side state, and occlusion +
+     * directivity are sim gates that branch on whether a scene exists. */
+    rt_source_set_priority(e->rt, s, cfg.priority);
+    bwa_source_set_occlusion(e, s, cfg.occlusion);
+    /* Directivity cannot ride the cfg command (it needs the control-side forward-axis cache and the
+     * sim/no-sim branch), so it is the one call that CAN cost a second ring slot. Skip it when the
+     * pattern already matches, which is the omni case every ordinary source is in - so an apply on
+     * a plain source stays exactly one command. */
+    { uint16_t idx = (uint16_t)(s & 0xFFFFu);
+      if (idx >= BWA_VOICE_SLOTS ||
+          e->src_dirw[idx] != cfg.directivity_weight || e->src_dirp[idx] != cfg.directivity_power)
+          bwa_source_set_directivity(e, s, cfg.directivity_weight, cfg.directivity_power);
+#ifdef BWA_HAVE_STEAMAUDIO
+      if (e->path) {                            /* register/enable in the pathing sim with the tracked pos */
+          float zero[3] = { 0.f, 0.f, 0.f };
+          steam_path_set_source(e->path, s, (idx < BWA_VOICE_SLOTS) ? e->src_pos[idx] : zero, cfg.pathing);
+      }
+#endif
+    }
+
+    if (sh) *sh = cfg;   /* the readback shadow holds only sanitized values (see src_desc_sanitize) */
+    return true;
+}
+
+bool bwa_source_get_desc(bwa_engine* e, bwa_source s, bwa_source_desc* out) {
+    if (!e || !out) return false;
+    const bwa_source_desc* sh = src_desc_slot(e, s);
+    /* rt_source_live for the same reason bwa_source_apply checks it: a stolen voice's slot is
+     * recycled behind engine.c's back, so the shadow alone would report a dead source's settings. */
+    if (!sh || !rt_source_live(e->rt, s)) return false;   /* stale/destroyed: nothing to report */
+    *out = *sh;
+    /* directivity lives in the control-side cache the sim path shares, so read it from there rather
+     * than keep a third copy that could disagree with what bwa_source_set_directivity published */
+    { uint16_t idx = (uint16_t)(s & 0xFFFFu);
+      out->directivity_weight = e->src_dirw[idx];
+      out->directivity_power  = e->src_dirp[idx]; }
+    out->struct_size = (uint32_t)sizeof(bwa_source_desc);
+    return true;
+}
+
+bwa_source bwa_source_create_desc(bwa_engine* e, const bwa_source_desc* d) {
+    if (!e) return 0;
+    clear_error(e);
+    if (!src_desc_check(e, d, "bwa_source_create_desc")) return 0;   /* check BEFORE the voice exists */
+    bwa_source s = bwa_source_create(e);
+    if (s == 0) { set_error(e, "bwa_source_create_desc: no voice available"); return 0; }
+    bwa_source_apply(e, s, d);
+    return s;
+}
+
 /* ---- listener ---- */
 
 void bwa_set_listener_pose(bwa_engine* e, float px, float py, float pz,
@@ -1737,5 +2213,19 @@ void bwa_get_listener_pose(bwa_engine* e, float p[3], float q[4]) {
 /* ---- frame boundary ---- */
 
 void bwa_commit(bwa_engine* e) {
-    if (e) rt_commit(e->rt);
+    if (!e) return;
+    /* Adopt finished async decodes BEFORE the commit, so a load that landed this frame is bound to
+     * its waiting voice within the same frame boundary the rest of the pose/position state gets. */
+    assets_pump(e->assets);
+    /* The publish above may have dropped a held play whose asset landed as the other kind. That
+     * happens long after the call that issued it returned, and a client that never polls readiness
+     * would otherwise only hear silence, so report it here: the drop is rare enough that one notice
+     * per drop costs nothing, and this is the frame boundary every client already crosses. */
+    const uint64_t kind_drops = rt_held_kind_drops(e->rt);
+    if (kind_drops != e->kind_drops_seen) {
+        e->kind_drops_seen = kind_drops;
+        set_error(e, "bwa_commit: an async asset landed as the other kind than the play that was waiting on it "
+                     "(a bed on a point source, or a mono asset on a bed) - the play was dropped, not bound");
+    }
+    rt_commit(e->rt);
 }

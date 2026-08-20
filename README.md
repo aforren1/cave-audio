@@ -51,7 +51,10 @@ synchronize, and maintain alongside it.
 - **Propagation**: distance attenuation, Doppler, air absorption, equal-loudness
   compensation, playback **pitch**; opt-in per source, ramped/glided.
 - **Assets**: WAV/FLAC/MP3, decoded and resampled at load; disk streaming for long
-  files; AmbiX ambisonic beds: matrix decode (AllRAD or EPAD) or a
+  files; an optional **shared-ownership cache** (`bwa_sound_acquire` /
+  `bwa_sound_release`) that dedupes by path plus load flags and refcounts, with **async loading**
+  (`bwa_sound_acquire_async`) for content that arrives mid-session; AmbiX
+  ambisonic beds: matrix decode (AllRAD or EPAD) or a
   **parametric DirAC-style renderer** whose direct stream re-pans listener-relative
   (a walkable soundfield), with yaw rotation to line a capture up with the scene.
 - **Voices**: fixed pool with priority stealing; pause (per-voice, per-group, and
@@ -60,7 +63,10 @@ synchronize, and maintain alongside it.
   against a device-anchored DSP clock (`bwa_source_play_at` / `bwa_source_stop_at`
   / `bwa_get_dsp_time`); **intro→loop** regions (`bwa_source_play_loop`) and
   **gapless chaining** into queued sounds (`bwa_source_queue`). Starts and stops are
-  click-free (one-block gain ramps either way).
+  click-free (one-block gain ramps either way), including the scene-transition
+  sweeps (`bwa_group_stop`, `bwa_stop_all`). A source's whole configuration is one
+  printable, diffable struct (`bwa_source_desc`) you fill from a preset and apply
+  in one call, instead of a setter per knob.
 - **Tracking**: OptiTrack NatNet parsed off-wire; the audio thread samples the
   freshest head pose at block time, with optional **pose prediction** to hide
   motion-to-ears latency; **tracked room EQ** interpolates measured LF room

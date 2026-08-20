@@ -196,7 +196,13 @@ namespace BwAudio
         public bool Ready => _eng != IntPtr.Zero;
 
         readonly List<SourceBase> _sources = new();   // every source component (Emitter + PushEmitter), one registry
-        readonly Dictionary<string, uint> _sounds = new();
+        // The path->handle dictionary this used to keep is GONE: bwa_sound_acquire is a by-path cache
+        // keyed on (path, flags) inside the engine, so the same clip returns the same handle and the
+        // "ambix:"/"fuma:" key prefixes this binding invented (one path, several loaders) are the
+        // engine's own key now. What stays is a NEGATIVE cache, and only because the ABI has no
+        // negative one: a SYNCHRONOUS acquire that fails inserts no entry, so without this a missing
+        // clip would re-open the file and re-log the warning on every Play. Keys are "<flags>|<clip>".
+        readonly HashSet<string> _loadFailed = new();
         // Material tokens are minted into a FIXED 64-slot engine table and never freed, so mint each
         // MaterialAsset / preset ONCE and reuse it across every scene load — re-minting per load leaks
         // the table (multi-scene games hit this fast). The cache is engine-lifetime (assets are Project
@@ -221,6 +227,21 @@ namespace BwAudio
                                Bwa.VersionString(dllVersion) + ", this binding was built against " +
                                Bwa.VersionString(Bwa.BoundVersion) + ". Refusing to start — restage " +
                                "the DLL or update the package so they match.");
+                return;                                              // Instance NOT claimed
+            }
+
+            // Struct-layout guard, same class of failure as the version check above and the one struct
+            // the binding can check for free: bwa_source_preset is PURE and fills struct_size with the
+            // engine's own sizeof, so comparing it against the marshalled size proves BwaSourceDesc's
+            // field list and padding match the C struct. A mismatch is not a crash — the marshaller would
+            // hand the engine a short buffer it reads past — so refuse rather than corrupt memory.
+            int descSize = System.Runtime.InteropServices.Marshal.SizeOf<BwaSourceDesc>();
+            if (Bwa.SourcePreset(BwaSourceKind.Default).structSize != (uint)descSize)
+            {
+                Debug.LogError("[bw_audio] BwaSourceDesc layout mismatch: the DLL's bwa_source_desc is " +
+                               Bwa.SourcePreset(BwaSourceKind.Default).structSize + " bytes, the binding " +
+                               "marshals " + descSize + ". Refusing to start — restage the DLL or update " +
+                               "the package so they match.");
                 return;                                              // Instance NOT claimed
             }
 
@@ -429,47 +450,119 @@ namespace BwAudio
             if (Application.isPlaying && Ready) ApplyLiveSettings();
         }
 
-        /// <summary>Load a mono point-source asset (cached by path). Returns 0 on failure.</summary>
-        public uint Load(string clip)
+        /// <summary>Load a clip through the engine's shared asset cache. `flags` picks the loader, and the
+        /// cache key is (path, flags): the same clip with the same flags always returns the same handle,
+        /// and the same clip with DIFFERENT flags is a different asset (a file held in RAM and the same
+        /// file streamed are two things). Returns 0 on failure.
+        /// <para>Ownership: assets loaded here live for the engine's lifetime, which is what the old
+        /// dictionary gave you too. Every call takes one more reference and the binding never releases,
+        /// because bwa_destroy frees every cached asset whatever the refcount. Do not call
+        /// Bwa.bwa_unload_sound on a handle from here (the engine refuses it): release what you acquired,
+        /// unload what you loaded.</para></summary>
+        public uint Acquire(string clip, BwaLoadFlags flags = BwaLoadFlags.None)
         {
-            if (!Ready) return 0;
-            if (_sounds.TryGetValue(clip, out var s)) return s;
-            s = Bwa.bwa_load_sound(_eng, Path.Combine(Application.streamingAssetsPath, clip));
-            if (s == 0) Debug.LogWarning("[bw_audio] load failed: " + clip + " (" + Bwa.LastError(_eng) + ")");
-            _sounds[clip] = s; return s;
+            if (!Ready || string.IsNullOrEmpty(clip)) return 0;
+            var key = (uint)flags + "|" + clip;
+            if (_loadFailed.Contains(key)) return 0;          // already logged; don't re-hit the disk
+            uint s = Bwa.bwa_sound_acquire(_eng, Path.Combine(Application.streamingAssetsPath, clip), flags);
+            if (s == 0)
+            {
+                _loadFailed.Add(key);
+                Debug.LogWarning("[bw_audio] load failed: " + clip + " (" + Bwa.LastError(_eng) + ")");
+            }
+            return s;
         }
 
-        /// <summary>Load a pre-encoded AmbiX soundfield for a world-locked bed (cached). Returns 0 on failure.</summary>
-        public uint LoadAmbix(string clip)
+        /// <summary>Load a clip WITHOUT blocking: the handle comes back immediately and the decode runs on
+        /// the engine's loader thread. Play it at once — the source binds and stays silent until the data
+        /// lands, then starts from the top with nothing skipped. Two calls refuse a not-ready handle
+        /// instead of holding it, so check <see cref="IsSoundReady"/> before Emitter.Queue and
+        /// Emitter.PlayOneShot.
+        /// <para>This is for content that appears MID-SESSION. The CAVE's normal path is load-time and
+        /// synchronous, so reach for <see cref="Acquire"/> first. Same cache and same key as Acquire: a
+        /// clip already resident comes back ready. A decode that FAILS never becomes ready — IsSoundReady
+        /// reports the reason.</para></summary>
+        public uint AcquireAsync(string clip, BwaLoadFlags flags = BwaLoadFlags.None)
         {
-            if (!Ready) return 0;
-            var key = "ambix:" + clip;
-            if (_sounds.TryGetValue(key, out var s)) return s;
-            s = Bwa.bwa_load_ambix(_eng, Path.Combine(Application.streamingAssetsPath, clip));
-            if (s == 0) Debug.LogWarning("[bw_audio] ambix load failed: " + clip + " (" + Bwa.LastError(_eng) + ")");
-            _sounds[key] = s; return s;
+            if (!Ready || string.IsNullOrEmpty(clip)) return 0;
+            var key = (uint)flags + "|" + clip;
+            if (_loadFailed.Contains(key)) return 0;
+            uint s = Bwa.bwa_sound_acquire_async(_eng, Path.Combine(Application.streamingAssetsPath, clip), flags);
+            if (s == 0)
+            {
+                _loadFailed.Add(key);
+                Debug.LogWarning("[bw_audio] async load failed: " + clip + " (" + Bwa.LastError(_eng) + ")");
+            }
+            return s;
         }
+
+        /// <summary>Has an asynchronously loaded clip's data landed? True at once for anything from
+        /// <see cref="Acquire"/>. `error` is null while a load is still in flight and carries the
+        /// decoder's reason when it FAILED — a failed load never becomes ready, so that is the only way
+        /// to tell the two apart.</summary>
+        public bool IsSoundReady(uint snd, out string error)
+        {
+            error = null;
+            if (!Ready || snd == 0) return false;
+            if (Bwa.bwa_sound_is_ready(_eng, snd)) return true;
+            error = Bwa.LastError(_eng);        // set by that call ONLY on a failed decode
+            return false;
+        }
+
+        /// <summary>Poll a handle a component is waiting on and report a decode that FAILED, once.
+        /// Returns the handle while the load is still in flight (keep watching) and 0 once it has
+        /// resolved either way, so the caller assigns the result back over its pending field.
+        /// <para>Shared by every component that opts into async loading (Emitter, AmbisonicBed), because
+        /// the two silences it tells apart — "still decoding" and "the decode failed" — are the same
+        /// distinction for all of them, and two copies of it would drift.</para></summary>
+        internal static uint WatchPendingLoad(uint pending, MonoBehaviour owner, string subject)
+        {
+            if (pending == 0 || !owner) return 0;
+            var engine = Instance;
+            if (!engine) return 0;
+            if (engine.IsSoundReady(pending, out var error)) return 0;
+            if (error == null) return pending;                 // still decoding
+            Debug.LogWarning("[" + owner.GetType().Name + "] async load failed on " + owner.name +
+                             ", the " + subject + " stays silent: " + error);
+            return 0;
+        }
+
+        /// <summary>Load a mono point-source asset (cached by path). Returns 0 on failure.</summary>
+        public uint Load(string clip) => Acquire(clip, BwaLoadFlags.None);
+
+        /// <summary>Load a mono point-source asset STREAMED from disk instead of held in RAM — for long
+        /// music or ambience. One voice at a time, no seek, no pitch. Returns 0 on failure.</summary>
+        public uint LoadStreaming(string clip) => Acquire(clip, BwaLoadFlags.Stream);
+
+        /// <summary>Load a pre-encoded AmbiX soundfield for a world-locked bed (cached). Returns 0 on failure.</summary>
+        public uint LoadAmbix(string clip) => Acquire(clip, BwaLoadFlags.Ambix);
 
         /// <summary>Load a legacy FuMa B-format soundfield (.amb-style: WXYZ order, MaxN, W -3 dB) for a
         /// world-locked bed (cached). Converted to AmbiX at load — past this call it IS an AmbiX asset.
         /// Full 3D sets only (4/9/16 channels). Returns 0 on failure.</summary>
-        public uint LoadFuma(string clip)
-        {
-            if (!Ready) return 0;
-            var key = "fuma:" + clip;
-            if (_sounds.TryGetValue(key, out var s)) return s;
-            s = Bwa.bwa_load_fuma(_eng, Path.Combine(Application.streamingAssetsPath, clip));
-            if (s == 0) Debug.LogWarning("[bw_audio] fuma load failed: " + clip + " (" + Bwa.LastError(_eng) + ")");
-            _sounds[key] = s; return s;
-        }
+        public uint LoadFuma(string clip) => Acquire(clip, BwaLoadFlags.Fuma);
+
+        /// <summary>The handle for a clip that is ALREADY resident, or 0. Pure probe: it never loads,
+        /// never touches the disk, and never takes a reference, so it cannot answer for a clip nobody
+        /// asked for yet. Use it to ask "is this in memory" without the side effect of putting it there.
+        /// <para>Because it takes no reference, treat the handle as borrowed: read metadata from it, do
+        /// not release against it.</para></summary>
+        public uint Find(string clip, BwaLoadFlags flags = BwaLoadFlags.None)
+            => Ready && !string.IsNullOrEmpty(clip)
+                 ? Bwa.bwa_sound_find(_eng, Path.Combine(Application.streamingAssetsPath, clip), flags)
+                 : 0;
+
+        // Metadata probes the cache FIRST so asking a resident clip its length costs no reference.
+        // On a miss it still loads on demand, which is the documented contract.
+        uint MetaHandle(string clip) { var s = Find(clip); return s != 0 ? s : Load(clip); }
 
         /// <summary>Length of a clip in engine-rate frames (seconds = SoundFrames / sampleRate). Loads it on
-        /// demand (cached, like Load). 0 for an unknown/failed clip, or a stream of unknown length.</summary>
-        public ulong SoundFrames(string clip) { var s = Load(clip); return s != 0 ? Bwa.bwa_sound_get_frames(_eng, s) : 0; }
+        /// demand if it is not already resident. 0 for an unknown/failed clip, or a stream of unknown length.</summary>
+        public ulong SoundFrames(string clip) { var s = MetaHandle(clip); return s != 0 ? Bwa.bwa_sound_get_frames(_eng, s) : 0; }
 
         /// <summary>Channel count of a clip: 1 for a mono point-source asset, 4/9/16 for an ambisonic bed
-        /// (order 1/2/3). Loads it on demand (cached). 0 for an unknown/failed clip.</summary>
-        public uint SoundChannels(string clip) { var s = Load(clip); return s != 0 ? Bwa.bwa_sound_get_channels(_eng, s) : 0; }
+        /// (order 1/2/3). Loads it on demand if not already resident. 0 for an unknown/failed clip.</summary>
+        public uint SoundChannels(string clip) { var s = MetaHandle(clip); return s != 0 ? Bwa.bwa_sound_get_channels(_eng, s) : 0; }
 
         /// <summary>Mint one of the engine's built-in materials. Cached (minted once per preset), so
         /// calling it per scene load is safe — null-engine-safe too.</summary>
@@ -542,6 +635,20 @@ namespace BwAudio
 
         /// <summary>Pause a whole mix group (0..7) — same click-free freeze as per-source pause.</summary>
         public void SetGroupPaused(uint group, bool paused) { if (Ready) Bwa.bwa_group_set_paused(_eng, group, paused); }
+
+        /// <summary>Stop every voice in one mix group (0..7) — "kill the SFX, keep the dialog". Each voice
+        /// takes the click-free stop path (a one-block fade, then end) and drops its pending Queue chain.
+        /// Group gains and pause gates are untouched: a stop stops sound, it does not reset the mixer.
+        /// Source handles stay valid and re-playable, so an Emitter can Play again straight after.</summary>
+        public void StopGroup(uint group) { if (Ready) Bwa.bwa_group_stop(_eng, group); }
+
+        /// <summary>Stop every voice in the engine, beds included — the one-call scene transition. Same
+        /// click-free path and the same "does not reset the mixer" rule as <see cref="StopGroup"/>. It
+        /// also drops plays still waiting on an async decode, which would otherwise start by themselves
+        /// the moment their data landed (StopGroup cannot: a held play has no voice to read a group from).
+        /// A PUSH voice stops like any other, but its feed ring is NOT ended — call PushEmitter.PushEnd
+        /// yourself if you are done with it.</summary>
+        public void StopAll() { if (Ready) Bwa.bwa_stop_all(_eng); }
 
         // ---- live rendering A/B (each of these is atomic / crossfaded engine-side) --------------------
         public void SetPanner(BwaPanner p)        { panner = p;        if (Ready) Bwa.bwa_set_panner(_eng, p); }

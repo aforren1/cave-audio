@@ -11,7 +11,13 @@ using namespace godot;
 #define ENG (owner->handle())
 #define LIVE (owner && src && owner->is_running())
 
-bwa_source BwaSource::create_source() { return bwa_source_create(ENG); }
+/* ONE command instead of fifteen, and the desc is checked BEFORE a voice is allocated, so a
+ * refused configuration cannot leak one. */
+bwa_source BwaSource::create_source() {
+	bwa_source_desc d;
+	fill_desc(&d);
+	return bwa_source_create_desc(ENG, &d);
+}
 
 void BwaSource::_ready() {
 	if (Engine::get_singleton()->is_editor_hint()) {
@@ -52,53 +58,16 @@ void BwaSource::_exit_tree() {
 	owner = nullptr;
 }
 
-/* The inspector is authored before the engine exists, so every setter caches into a field
- * AND pushes when live; this replays the cache onto a source that has just been minted. */
+/* The inspector is authored before the engine exists, so every setter caches into a field AND
+ * pushes when live; this replays the cache onto a source that has just been minted.
+ *
+ * The CONFIGURATION half of that replay rides the desc, which create_source already handed to
+ * bwa_source_create_desc (BwaPushSource applies it right after bwa_source_create_push, the one
+ * mint with no desc form). What is left here is exactly what bwa_source_desc deliberately
+ * leaves out: playback state, the manual-occlusion measurement, and orientation. */
 void BwaSource::apply_all() {
-	bwa_source_set_gain(ENG, src, gain);
-	bwa_source_set_priority(ENG, src, priority);
-	bwa_source_set_group(ENG, src, (uint32_t)group);
 	if (paused) {
 		bwa_source_set_paused(ENG, src, true);
-	}
-	if (extent != Vector2(0.0f, 0.0f)) {
-		bwa_source_set_extent(ENG, src, (float)extent.x, (float)extent.y);
-	} else if (spread > 0.0f) {
-		bwa_source_set_spread(ENG, src, spread);
-	}
-	if (size_m > 0.0f) {
-		bwa_source_set_size(ENG, src, size_m);
-	}
-	if (atten_ref_dist > 0.0f) {
-		bwa_source_set_attenuation_override(ENG, src, atten_ref_dist, atten_rolloff, atten_min_gain);
-	}
-	if (doppler) {
-		bwa_source_set_doppler(ENG, src, true);
-	}
-	if (air_absorption) {
-		bwa_source_set_air_absorption(ENG, src, true);
-	}
-	if (loudness_comp) {
-		bwa_source_set_loudness_comp(ENG, src, true);
-	}
-	if (proximity) {
-		bwa_source_set_proximity(ENG, src, true);
-	}
-	if (occlusion) {
-		bwa_source_set_occlusion(ENG, src, true);
-	}
-	if (reverb) {
-		bwa_source_set_reverb(ENG, src, true);
-	}
-	bwa_source_set_reverb_send(ENG, src, reverb_send);
-	if (reverb_distance) {
-		bwa_source_set_reverb_distance(ENG, src, true);
-	}
-	if (early_reflections) {
-		bwa_source_set_early_reflections(ENG, src, true);
-	}
-	if (pathing) {
-		bwa_source_set_pathing(ENG, src, true);
 	}
 	if (occ_manual_set) {
 		if (occ_manual_banded) {
@@ -109,14 +78,214 @@ void BwaSource::apply_all() {
 			bwa_source_set_occlusion_manual(ENG, src, occ_manual_level, nullptr);
 		}
 	}
-	if (dir_mode == DIRSET_CUSTOM) {
-		bwa_source_set_directivity(ENG, src, dir_weight, dir_power);
-	} else if (dir_mode == DIRSET_PRESET) {
-		bwa_source_set_directivity_preset(ENG, src, (bwa_directivity)dir_preset);
-	}
 	if (orientation_set) {
 		push_orientation(orientation_q);
 	}
+}
+
+/* --- configuration as one value (bwa_source_desc) --- */
+
+/* The Dictionary keys are the C field names, so a printed desc reads against bw_audio.h
+ * without a translation table. struct_size and reserved stay out: they are the ABI's
+ * business, and the binding always fills them from bwa_source_preset. */
+static Dictionary desc_to_dict(const bwa_source_desc &d) {
+	Dictionary o;
+	o["gain"] = d.gain;
+	o["pitch"] = d.pitch;
+	o["priority"] = d.priority;
+	o["group"] = (int)d.group;
+	o["spread"] = d.spread;
+	o["extent_height"] = d.extent_height;
+	o["size_m"] = d.size_m;
+	o["reverb_send"] = d.reverb_send;
+	o["atten_ref_dist"] = d.atten_ref_dist;
+	o["atten_rolloff"] = d.atten_rolloff;
+	o["atten_min_gain"] = d.atten_min_gain;
+	o["directivity_weight"] = d.directivity_weight;
+	o["directivity_power"] = d.directivity_power;
+	o["doppler"] = d.doppler;
+	o["air_absorption"] = d.air_absorption;
+	o["loudness_comp"] = d.loudness_comp;
+	o["proximity"] = d.proximity;
+	o["occlusion"] = d.occlusion;
+	o["early_reflections"] = d.early_reflections;
+	o["reverb"] = d.reverb;
+	o["reverb_distance"] = d.reverb_distance;
+	o["pathing"] = d.pathing;
+	return o;
+}
+
+/* Overlay, not replace: an absent key keeps the value already in `d`. An unknown key is
+ * reported rather than dropped - a mistyped "gian" is a setting that silently never took,
+ * which is the failure class this binding exists to make visible. */
+static void dict_to_desc(const Dictionary &src, bwa_source_desc *d) {
+	static const char *const KNOWN[] = { "gain", "pitch", "priority", "group", "spread",
+		"extent_height", "size_m", "reverb_send", "atten_ref_dist", "atten_rolloff",
+		"atten_min_gain", "directivity_weight", "directivity_power", "doppler",
+		"air_absorption", "loudness_comp", "proximity", "occlusion", "early_reflections",
+		"reverb", "reverb_distance", "pathing", nullptr };
+	const Array keys = src.keys();
+	for (int i = 0; i < keys.size(); i++) {
+		const String k = keys[i];
+		bool known = false;
+		for (int j = 0; KNOWN[j]; j++) {
+			if (k == String(KNOWN[j])) {
+				known = true;
+				break;
+			}
+		}
+		if (!known) {
+			UtilityFunctions::push_warning(
+					vformat("BwaSource.apply_desc: unknown key \"%s\" (see get_desc() for the "
+							"field names); it was ignored.",
+							k));
+		}
+	}
+
+#define BWA_DESC_F(key, field) \
+	if (src.has(key)) d->field = (float)(double)src.get(key, (double)d->field)
+#define BWA_DESC_B(key, field) \
+	if (src.has(key)) d->field = (bool)src.get(key, d->field)
+
+	BWA_DESC_F("gain", gain);
+	BWA_DESC_F("pitch", pitch);
+	if (src.has("priority")) {
+		d->priority = (int32_t)(int64_t)src.get("priority", (int64_t)d->priority);
+	}
+	if (src.has("group")) {
+		d->group = (uint32_t)(int64_t)src.get("group", (int64_t)d->group);
+	}
+	BWA_DESC_F("spread", spread);
+	BWA_DESC_F("extent_height", extent_height);
+	BWA_DESC_F("size_m", size_m);
+	BWA_DESC_F("reverb_send", reverb_send);
+	BWA_DESC_F("atten_ref_dist", atten_ref_dist);
+	BWA_DESC_F("atten_rolloff", atten_rolloff);
+	BWA_DESC_F("atten_min_gain", atten_min_gain);
+	BWA_DESC_F("directivity_weight", directivity_weight);
+	BWA_DESC_F("directivity_power", directivity_power);
+	BWA_DESC_B("doppler", doppler);
+	BWA_DESC_B("air_absorption", air_absorption);
+	BWA_DESC_B("loudness_comp", loudness_comp);
+	BWA_DESC_B("proximity", proximity);
+	BWA_DESC_B("occlusion", occlusion);
+	BWA_DESC_B("early_reflections", early_reflections);
+	BWA_DESC_B("reverb", reverb);
+	BWA_DESC_B("reverb_distance", reverb_distance);
+	BWA_DESC_B("pathing", pathing);
+#undef BWA_DESC_F
+#undef BWA_DESC_B
+}
+
+void BwaSource::fill_desc(bwa_source_desc *d) const {
+	bwa_source_preset(BWA_SRC_DEFAULT, d); /* struct_size, and a base that is never a zero-fill */
+	d->gain = gain;
+	d->priority = priority;
+	d->group = (uint32_t)group;
+	/* set_spread mirrors into `extent`, so equal axes ARE the isotropic case - which is what
+	 * extent_height < 0 means to the core. Keep that reduction, or a plain spread would ship
+	 * as an anisotropic extent that merely happens to be square. */
+	const float w = (float)extent.x, h = (float)extent.y;
+	if (w == h) {
+		d->spread = (w != 0.0f) ? w : spread;
+		d->extent_height = -1.0f;
+	} else {
+		d->spread = w;
+		d->extent_height = h;
+	}
+	d->size_m = size_m;
+	d->reverb_send = reverb_send;
+	d->atten_ref_dist = atten_ref_dist;
+	d->atten_rolloff = atten_rolloff;
+	d->atten_min_gain = atten_min_gain;
+	/* A directivity PRESET is a named (weight, power) pair, so it reduces to the desc's two
+	 * fields exactly (bwa_source_set_directivity_preset does the same arithmetic). */
+	if (dir_mode == DIRSET_CUSTOM) {
+		d->directivity_weight = dir_weight;
+		d->directivity_power = dir_power;
+	} else if (dir_mode == DIRSET_PRESET) {
+		d->directivity_weight = dir_preset == DIR_CARDIOID ? 0.5f : (dir_preset == DIR_FIGURE8 ? 1.0f : 0.0f);
+		d->directivity_power = 1.0f;
+	}
+	d->doppler = doppler;
+	d->air_absorption = air_absorption;
+	d->loudness_comp = loudness_comp;
+	d->proximity = proximity;
+	d->occlusion = occlusion;
+	d->early_reflections = early_reflections;
+	d->reverb = reverb;
+	d->reverb_distance = reverb_distance;
+	d->pathing = pathing;
+}
+
+void BwaSource::mirror_desc(const bwa_source_desc &d) {
+	gain = d.gain;
+	priority = d.priority;
+	group = (int)d.group;
+	spread = d.spread;
+	extent = d.extent_height < 0.0f ? Vector2(d.spread, d.spread)
+									: Vector2(d.spread, d.extent_height);
+	size_m = d.size_m;
+	reverb_send = d.reverb_send;
+	atten_ref_dist = d.atten_ref_dist;
+	atten_rolloff = d.atten_rolloff;
+	atten_min_gain = d.atten_min_gain;
+	/* CUSTOM, whatever spelling got us here: a desc names weight and power, and omni is just
+	 * weight 0. Keeping PRESET would let apply_all re-push the old pattern over this one. */
+	dir_mode = DIRSET_CUSTOM;
+	dir_weight = d.directivity_weight;
+	dir_power = d.directivity_power;
+	doppler = d.doppler;
+	air_absorption = d.air_absorption;
+	loudness_comp = d.loudness_comp;
+	proximity = d.proximity;
+	occlusion = d.occlusion;
+	early_reflections = d.early_reflections;
+	reverb = d.reverb;
+	reverb_distance = d.reverb_distance;
+	pathing = d.pathing;
+}
+
+bool BwaSource::push_desc(const bwa_source_desc &d) {
+	mirror_desc(d);
+	if (!LIVE) {
+		return true; /* authored before _ready; create_source carries it in */
+	}
+	if (bwa_source_apply(ENG, src, &d)) {
+		return true;
+	}
+	UtilityFunctions::push_error(vformat("%s (%s): the source desc was refused: %s", get_class(),
+			get_name(), owner->get_last_error()));
+	return false;
+}
+
+Dictionary BwaSource::get_preset(Kind kind) {
+	bwa_source_desc d;
+	bwa_source_preset((bwa_source_kind)kind, &d);
+	return desc_to_dict(d);
+}
+
+Dictionary BwaSource::get_desc() const {
+	bwa_source_desc d;
+	/* The engine reports what it was SET to (its readback shadow). With no engine yet, the
+	 * node's own authored state is the honest answer, so the editor is not left with {}. */
+	if (!LIVE || !bwa_source_get_desc(ENG, src, &d)) {
+		fill_desc(&d);
+	}
+	return desc_to_dict(d);
+}
+
+bool BwaSource::apply_desc(const Dictionary &dict) {
+	bwa_source_desc d;
+	fill_desc(&d); /* the current configuration is the base the keys overlay onto */
+	dict_to_desc(dict, &d);
+	return push_desc(d);
+}
+
+bool BwaSource::reset_to_preset(Kind kind) {
+	bwa_source_desc d;
+	bwa_source_preset((bwa_source_kind)kind, &d);
+	return push_desc(d);
 }
 
 PackedStringArray BwaSource::_get_configuration_warnings() const {
@@ -468,6 +637,14 @@ void BwaSource::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("set_pathing", "on"), &BwaSource::set_pathing);
 	ClassDB::bind_method(D_METHOD("get_pathing"), &BwaSource::get_pathing);
 
+	ClassDB::bind_method(D_METHOD("get_desc"), &BwaSource::get_desc);
+	ClassDB::bind_method(D_METHOD("apply_desc", "desc"), &BwaSource::apply_desc);
+	ClassDB::bind_method(D_METHOD("reset_to_preset", "kind"), &BwaSource::reset_to_preset);
+	/* Static: bwa_source_preset needs no engine, so a tool can print the table with nothing
+	 * running - BwaSource.get_preset(BwaSource.KIND_PROP). */
+	ClassDB::bind_static_method(
+			"BwaSource", D_METHOD("get_preset", "kind"), &BwaSource::get_preset);
+
 	ClassDB::bind_method(D_METHOD("is_playing"), &BwaSource::is_playing);
 	ClassDB::bind_method(D_METHOD("get_playhead_frames"), &BwaSource::get_playhead_frames);
 	ClassDB::bind_method(D_METHOD("get_playhead_seconds"), &BwaSource::get_playhead_seconds);
@@ -514,4 +691,10 @@ void BwaSource::_bind_methods() {
 	BIND_ENUM_CONSTANT(DIR_OMNI);
 	BIND_ENUM_CONSTANT(DIR_CARDIOID);
 	BIND_ENUM_CONSTANT(DIR_FIGURE8);
+
+	BIND_ENUM_CONSTANT(KIND_DEFAULT);
+	BIND_ENUM_CONSTANT(KIND_PROP);
+	BIND_ENUM_CONSTANT(KIND_VOICE);
+	BIND_ENUM_CONSTANT(KIND_AMBIENCE);
+	BIND_ENUM_CONSTANT(KIND_UI);
 }

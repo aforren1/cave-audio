@@ -86,13 +86,22 @@ void BwaBed::play_clip(const String &p) {
 	if (!LIVE) {
 		return;
 	}
-	const bwa_sound snd = owner->load_ambisonic(p, format == FORMAT_FUMA);
+	const bwa_sound snd = owner->load_ambisonic(p, format == FORMAT_FUMA, async_load);
 	if (snd) {
+		playing_snd = snd;
+		/* A not-ready handle is fine here: the core holds the play control-side and starts the
+		 * field from the top on the block its data lands. It also skips the mono guard for a
+		 * still-loading asset, which reports 0 channels because nothing is decoded yet. */
 		bwa_bed_play(ENG, bed, snd, loop);
 	}
 }
 
+bool BwaBed::is_loading() const {
+	return LIVE && playing_snd && owner->sound_ready_state(playing_snd) == 0;
+}
+
 void BwaBed::stop() {
+	playing_snd = 0;   /* also cancels a play still held for an async decode (rt drops it) */
 	if (LIVE) {
 		bwa_bed_stop(ENG, bed);
 	}
@@ -186,6 +195,9 @@ void BwaBed::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("get_loop"), &BwaBed::get_loop);
 	ClassDB::bind_method(D_METHOD("set_autoplay", "enabled"), &BwaBed::set_autoplay);
 	ClassDB::bind_method(D_METHOD("get_autoplay"), &BwaBed::get_autoplay);
+	ClassDB::bind_method(D_METHOD("set_async_load", "enabled"), &BwaBed::set_async_load);
+	ClassDB::bind_method(D_METHOD("get_async_load"), &BwaBed::get_async_load);
+	ClassDB::bind_method(D_METHOD("is_loading"), &BwaBed::is_loading);
 	ClassDB::bind_method(D_METHOD("set_gain", "linear"), &BwaBed::set_gain);
 	ClassDB::bind_method(D_METHOD("get_gain"), &BwaBed::get_gain);
 	ClassDB::bind_method(D_METHOD("set_priority", "priority"), &BwaBed::set_priority);
@@ -215,6 +227,7 @@ void BwaBed::_bind_methods() {
 			"set_format", "get_format");
 	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "loop"), "set_loop", "get_loop");
 	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "autoplay"), "set_autoplay", "get_autoplay");
+	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "async_load"), "set_async_load", "get_async_load");
 	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "gain", PROPERTY_HINT_RANGE, "0,2,0.01"), "set_gain",
 			"get_gain");
 	ADD_PROPERTY(PropertyInfo(Variant::VECTOR3, "orientation"), "set_orientation",

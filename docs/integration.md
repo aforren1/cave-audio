@@ -209,9 +209,35 @@ The snippet shows the essential calls. The shipped `Bwa.cs` binds every `BWA_API
   enumeration `bwa_get_asio_driver_count` / `bwa_get_asio_driver_name`
   (`Engine.AsioDriverCount` / `AsioDriverName`; static, for a driver picker
   before `bwa_create`).
-- **Assets**: `bwa_load_sound_streaming`, `bwa_load_ambix`, and the metadata
-  readbacks `bwa_sound_get_frames` / `bwa_sound_get_channels`
-  (`Engine.SoundFrames` / `SoundChannels`).
+- **Assets**: `bwa_sound_acquire` / `bwa_sound_release` (the shared, refcounted
+  by-path tier) drive `Engine.Acquire`, and `Load` / `LoadStreaming` / `LoadAmbix` /
+  `LoadFuma` are one call each over it with the matching `BwaLoadFlags`. The binding
+  keeps no path-to-handle dictionary of its own: the cache key is `(path, flags)`
+  inside the engine, so the same clip returns the same handle. Assets live for the
+  engine's lifetime and `bwa_destroy` frees them, so nothing is released at teardown.
+  `bwa_sound_acquire_async` + `bwa_sound_is_ready` are `Engine.AcquireAsync` /
+  `IsSoundReady`, opted into per component with `Emitter.loadAsync` and
+  `AmbisonicBed.loadAsync`: `Play` returns at once and the source stays silent until
+  the data lands. Leave it off for the CAVE's
+  normal path, which is load-time and synchronous. `Queue` and `PlayOneShot` refuse a
+  still-decoding clip, because neither can be held. `bwa_sound_find` is `Engine.Find`:
+  a pure by-path probe that never loads, never takes a reference, and answers 0 for a clip
+  nobody asked for yet. Use it to ask whether something is resident without the side effect of
+  making it so, and treat what it returns as borrowed (never release against it). Plus the
+  metadata readbacks `bwa_sound_get_frames` / `bwa_sound_get_channels` (`Engine.SoundFrames` /
+  `SoundChannels`, which probe `Find` first and load on a miss) and the explicit-tier
+  `bwa_load_sound_streaming` / `bwa_load_ambix`.
+- **Source configuration**: `bwa_source_preset` fills a complete `BwaSourceDesc` for a
+  `BwaSourceKind`, and `bwa_source_apply` pushes the lot as ONE ring command.
+  `SourceBase.BuildDesc` / `ApplyDesc` / `TryGetDesc` / `ApplyPreset` wrap it, the
+  source inspector gets a preset picker, and the create-time push is a single apply
+  instead of seventeen setters. The serialized inspector fields stay the source of
+  truth: `ApplyPreset` writes them, `BuildDesc` reads them, and the per-property
+  setters still push live on their own. Start from a preset, because this struct's
+  zero is not its default and the engine refuses a zero-filled one. See
+  [api.md](./api.md) for what each preset rests on.
+- **Scene transitions**: `bwa_group_stop` and `bwa_stop_all` (`Engine.StopGroup` /
+  `StopAll`): click-free, beds included, and neither resets the mixer.
 - **Procedural (push) sources**: `bwa_source_create_push`, `bwa_source_push`,
   `bwa_source_push_space`, `bwa_source_push_end`, surfaced as the **`PushEmitter`**
   component: a positional source you feed mono engine-rate floats instead of a
@@ -270,7 +296,6 @@ public sealed class Engine : MonoBehaviour {
 
     IntPtr _eng; public IntPtr Handle => _eng;
     readonly System.Collections.Generic.List<Emitter> _emitters = new();
-    readonly System.Collections.Generic.Dictionary<string,uint> _sounds = new();
 
     void Awake() {
         if (Instance != null) { Destroy(gameObject); return; }
@@ -290,11 +315,11 @@ public sealed class Engine : MonoBehaviour {
                 Debug.LogError("tracker: " + Bwa.LastError(_eng));
         }
     }
-    public uint Load(string p) {
-        if (_sounds.TryGetValue(p, out var s)) return s;
-        s = Bwa.bwa_load_sound(_eng, System.IO.Path.Combine(Application.streamingAssetsPath, p));
-        _sounds[p] = s; return s;
-    }
+    // No path->handle dictionary: bwa_sound_acquire IS one, keyed on (path, flags) inside the
+    // engine, so the same clip returns the same handle with one more reference.
+    public uint Load(string p) =>
+        Bwa.bwa_sound_acquire(_eng, System.IO.Path.Combine(Application.streamingAssetsPath, p),
+                              BwaLoadFlags.None);
     public void Register(Emitter e)   => _emitters.Add(e);
     public void Unregister(Emitter e) => _emitters.Remove(e);
 
@@ -367,6 +392,17 @@ No 1:1 binding layer: GDExtension needs no P/Invoke shim, so every call lives as
 on the class owning its handle (`BwaEngine`, `BwaSource` → `BwaEmitter`/`BwaPushSource`,
 `BwaBed`), plus scene-authored acoustics (`BwaMaterial`, `Bwa{Acoustic,Dynamic}Geometry`,
 `BwaRoomBox`) and a live `BwaSpeakerView`. The by-ear playground ships inside the addon.
+
+The 0.12.0 convenience tier lands as three things. Assets: `BwaEngine` no longer keeps a cache
+of its own. It acquires through the core's `(path, flags)` cache, and keeps only a record of
+the keys it acquired, so that `unload_sound_path` releases the references **this node** holds
+and no others. `sound_get_frames` and `sound_get_channels` do not use that record at all: they
+go through `bwa_sound_find`, the ABI's by-path lookup, which never loads on a miss.
+Loading: `async_load` on `BwaEmitter` and `BwaBed` is an opt-in, off by default, and a play
+against a still-decoding clip is held until the data lands rather than dropped. Sources:
+`get_desc` and `apply_desc` carry `bwa_source_desc` as a Dictionary, for the same reason
+`get_setup_tuning` carries the engine tuning as one, plus `reset_to_preset` and the static,
+engine-free `BwaSource.get_preset`.
 
 The seam is **simpler than Unity's, so do not carry Unity's advice over**:
 

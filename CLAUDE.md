@@ -75,6 +75,15 @@ src/
   null_sink.c          offline (no-hardware) sink: threaded silence + timestamps. [M1]
   asio_sink.cpp        ASIO host: driver load, bufferSwitch, sample-pos timestamp. [M1]
   sound.h / sound.c    wav decode to mono float via dr_wav (Sound table lives in rt.c). [M3]
+  assets.h / assets.c  the SHARED-ownership asset tier: a by-path cache (key = normalized path +
+                       load flags, so "one file, memory vs streamed vs ambisonic" is just different
+                       entries) with a refcount, over the SAME rt loaders bwa_load_* drives — the
+                       Dictionary<path,handle> every binding was rebuilding, moved inward. Plus ONE
+                       loader thread for bwa_sound_acquire_async: it decodes off the control thread
+                       and hands the buffer over through an SPSC result ring; the control thread
+                       publishes it (rt_sound_reserve/publish/abandon) and a play issued meanwhile
+                       is HELD control-side until then, so the audio thread only ever sees a
+                       finished asset and gains no new branch. [assets]
   layout.h / layout.c  speaker geometry load (cave_layout.json via cJSON) + default grid. [M4]
   measure.c/calib.c    bwa_calibrate DSP: sweep+deconvolution, trims, trilateration, room report. [calib]
   zylia.h / zylia.c    Zylia ZM-1: single-position speaker localization (TDOA + GN position) AND the
@@ -142,7 +151,9 @@ bindings/
 docs/                  Specs. Start here.
 examples/              cave_layout.json (see docs/layout-schema.md); minimal.c (the client lifecycle),
                        ambisonic.c (beds: AmbiX/FuMa load, rotate/tilt, renderer + max-rE A/B),
-                       streaming.c (disk streaming + push sources) — console walkthroughs, built every build.
+                       streaming.c (disk streaming + push sources), convenience.c (the convenience
+                       tier: shared/async assets, bwa_source_desc, group + scene stops, each part
+                       naming the core calls it replaces) — console walkthroughs, built every build.
 third_party/           asiosdk/ (GPLv3 option, fetched not committed), steam-audio-source/ (submodule) + steam-audio-artifacts/ (built phonon SDK); dr_wav + cJSON are
                        fetched by CMake (FetchContent, pinned) — see third_party/README.md.
 ```
@@ -160,10 +171,11 @@ ctest --test-dir build -C RelWithDebInfo      # runs the full test suite (test_*
 ```
 
 **Current state (M6 + occlusion).** The engine builds `bw_audio.dll` and the full ctest
-suite — 31 tests with the Steam Audio SDK, 26 without (the 5 SDK-gated ones are `reflect`,
+suite — 39 tests with the Steam Audio SDK, 34 without (the 5 SDK-gated ones are `reflect`,
 `bake`, `path`, `dynmesh`, `steam_decode`) — a count that INCLUDES the three GUI-tool suites
-(`calib_view`, `layout_tool`, `playground`) and the three `validate_*` runs, all under their
-build flags. `rt.c` is the concurrency
+(`calib_view`, `layout_tool`, `playground`), the four `validate_*` runs, and the four
+`example_*` runs (the console examples driven with `--tests`: offline sink, short waits), all
+under their build flags. `rt.c` is the concurrency
 spine (two SPSC rings, voice + sound tables, commit snapshot, generation handles, retire-ack)
 and the whole `bwa_*` API forwards to it. Spatialization (the DBAP/SPCAP/VBAP gain solve,
 layout load, per-speaker align), calibration (`bwa_calibrate`, the Zylia capsule survey),
@@ -246,6 +258,28 @@ Regression-preventing gotchas. Each has bitten before or guards a real invariant
   that Unity silently ignores.
 - **Do not bake ASIO assumptions outside `asio_sink.cpp`.** ASIO is just the Windows sink; a
   future cross-platform move abstracts the device layer behind the sink seam.
+- **A self-checking test that CANNOT FAIL is the default outcome, not a rare mistake.** It happened
+  three times in the convenience-tier work alone. `examples/convenience.c` counted its failures and
+  then returned 0 regardless, so it could only ever have caught a crash. `demo/api.gd` asserted
+  `get_preset(KIND_UI)["atten_rolloff"] == 0.0`, which `BWA_SRC_DEFAULT` also satisfies (the
+  sanitizer zeroes the whole attenuation triple when `atten_ref_dist <= 0`), so it would have passed
+  against a completely unimplemented `BWA_SRC_UI`. And both async tests "covered" the held-play
+  window while a fast decode meant the held path never ran. The rule that catches all three: BREAK
+  THE THING ON PURPOSE and confirm the test goes red, before believing it green. Where a race is what
+  hides the coverage, prefer ORDERING over a test hook: an async decode is adopted only at a pump
+  point (acquire / is_ready / find / release / commit), and `bwa_source_play` is not one, so a play
+  issued straight after `bwa_sound_acquire_async` is deterministically HELD. A `bwa_set_loader_stall`
+  diagnostic was written for this and then deleted, because ordering buys the same guarantee without
+  a public call that exists only for tests. Two corollaries: an assertion whose two sides both land
+  near zero when the mechanism breaks is a COIN FLIP, so demand a margin; and `clock()` does not
+  advance while a thread sleeps, so a test timing an async wait needs a wall clock (`GetTickCount64`)
+  or it measures nothing. Where neither ordering nor a margin can settle it, SAY SO in the test
+  rather than let it imply coverage it does not have.
+- **A restored file can keep an OLD mtime, so the build skips it and you test a stale binary.** `mv`
+  and `cp -p` preserve timestamps, so reverting an A/B edit from a backup can leave the object file
+  newer than the source. Half an hour went into "the hook is broken" that was really an unrebuilt
+  DLL. `touch` the file after any restore, and when a result contradicts the code you are reading,
+  suspect the binary before the logic.
 - **`test/xval_data.h` is GENERATED** by `tools/xval/gen_reference.py` — don't hand-edit.
   Regenerating needs numpy + scipy; ctest stays hermetic on the committed header.
 - **`-DBWA_ASAN=ON`** builds `test_sound` under AddressSanitizer — the control-side

@@ -1106,24 +1106,34 @@ static void switch_scene(int idx) {
     }
     for (uint32_t ch = 0; ch < (uint32_t)g_nspk; ++ch) bwa_set_test_signal(e, ch, BWA_TEST_OFF, 0.0f);  /* clear channel walk */
     bwa_source_set_gain(e, refl, 0.0f);
-    bwa_source_set_occlusion(e, src, false);
-    bwa_source_set_directivity_preset(e, src, BWA_DIR_OMNI);
+    /* per-SOURCE reset: one bwa_source_apply, the same fill-then-apply shape the engine tuning uses
+     * below. BWA_SRC_DEFAULT is the engine's own create-time state, so this returns src to what
+     * bwa_source_create would have given, then overrides the one field this demo disagrees with.
+     * It clears MORE than the old per-knob block did (reverb send, early reflections, size, the
+     * attenuation override), which is what a baseline should do: every scene's enter() sets what it
+     * needs, and a knob left behind by the previous scene is exactly the bug this block exists to
+     * prevent. Orientation is deliberately NOT in the desc (it is per-frame aim, not configuration),
+     * so the directivity scene's leftover rotation still clears by hand. */
+    bwa_source_desc sd;
+    bwa_source_preset(BWA_SRC_DEFAULT, &sd);
+    sd.gain = SRC_GAIN;
+    bwa_source_apply(e, src, &sd);
     bwa_source_set_orientation(e, src, 0.0f, 0.0f, 0.0f, 1.0f);   /* clear any aim left by the directivity scene */
-    bwa_source_set_doppler(e, src, false);                        /* propagation/size effects are localization-scene only */
-    bwa_source_set_air_absorption(e, src, false);
-    bwa_source_set_spread(e, src, 0.0f);
-    bwa_set_dual_band(e, false);
-    bwa_set_panner(e, BWA_PAN_DBAP);                               /* the ABX scene may leave SPCAP/VBAP selected */
-    bwa_set_spcap_focus(e, 0.0f, 0.0f);                            /* ...and the localization scene a dialed focus */
-    bwa_set_spread_mode(e, BWA_SPREAD_LOBE);                       /* ...or a spread render / decorrelation */
-    bwa_set_decorrelation(e, false);
-    bwa_bed_stop(e, g_bed);                                        /* the bed scene's field + its knobs */
-    bwa_set_bed_renderer(e, BWA_BED_MATRIX);
-    bwa_set_max_re(e, true);        /* the ENGINE default since the offline bake-off; resetting to
-                                     * false here would demo a render nobody ships */
-    bwa_set_max_re_split(e, false);
-    source_yaw = 0.0f;
-    bwa_source_set_gain(e, src, SRC_GAIN);
+    bwa_bed_stop(e, g_bed);                                       /* the bed scene's field (its KNOBS reset below) */
+    /* ENGINE tuning back to baseline: bwa_tuning_preset + bwa_apply_tuning, not eight setters. The
+     * ABX scene may leave SPCAP/VBAP selected, the localization scene a dialed focus, the spread
+     * scene a spread mode or decorrelation, the bed scene a renderer or a max-rE pick.
+     * ROAMING is the CAVE's own case AND, field for field, the engine's own create-time defaults
+     * (engine.c seeds its shadow from BWA_SETUP_DEFAULT, which resolves to ROAMING), so this
+     * restores exactly what build_engine started from. It agrees with every value the old
+     * hand-written reset set — including max_re TRUE, the engine default since the offline bake-off,
+     * where resetting to false would demo a render nobody ships — and additionally clears the knobs
+     * no scene here touches (dual-band CAP, near/hole spread, tracked room EQ and align), which is
+     * what a baseline should do. Override a field between the two calls if a scene ever needs one. */
+    bwa_tuning tune;
+    bwa_tuning_preset(BWA_SETUP_ROAMING, &tune);
+    bwa_apply_tuning(e, &tune);
+    source_yaw = 0.0f;                       /* gain rode the desc above */
     cur_scene = idx;
     scenes[idx].enter();
 }

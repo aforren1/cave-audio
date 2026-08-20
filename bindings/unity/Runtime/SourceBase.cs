@@ -133,32 +133,14 @@ namespace BwAudio
                 return true;                                // don't retry a genuine failure forever
             }
 
-            var eng = engine.Handle;
-            Bwa.bwa_source_set_gain(eng, _src, gain);
-            Bwa.bwa_source_set_priority(eng, _src, priority);
-            if (group != 0) Bwa.bwa_source_set_group(eng, _src, (uint)group);
+            // ONE bwa_source_apply for the whole field set instead of the fifteen-or-so setters this used
+            // to issue. The engine packs the audio-thread knobs into a SINGLE ring command, which is what
+            // makes this worth doing: bwa_play_oneshot already documents dropping when the ring is
+            // momentarily full, so spawning a prefab that issued fifteen commands was real pressure. The
+            // standing script-set state (Extent, SetAttenuationOverride) rides along, so it is replayed on
+            // a re-enable exactly as before.
+            ApplyDesc();
             ApplyExtraSettings();
-
-            // The engine defaults every opt-in below to OFF/point/unity, so only push what differs — a
-            // fresh source already IS the default (this runs again on every re-enable).
-            if (occlusion)        Bwa.bwa_source_set_occlusion(eng, _src, true);
-            if (earlyReflections) Bwa.bwa_source_set_early_reflections(eng, _src, true);
-            if (reflections)
-            {
-                Bwa.bwa_source_set_reverb(eng, _src, true);
-                if (reflectionSend != 1f)  Bwa.bwa_source_set_reverb_send(eng, _src, reflectionSend);
-                if (reflectionDistance)    Bwa.bwa_source_set_reverb_distance(eng, _src, true);
-            }
-            if (pathing)       Bwa.bwa_source_set_pathing(eng, _src, true);
-            if (spread > 0f)   Bwa.bwa_source_set_spread(eng, _src, spread);
-            if (_extent.x > 0f || _extent.y > 0f) Bwa.bwa_source_set_extent(eng, _src, _extent.x, _extent.y);   // a script-set anisotropic extent, re-asserted after a re-enable
-            if (sizeMeters > 0f) Bwa.bwa_source_set_size(eng, _src, sizeMeters);
-            if (_attSet)       Bwa.bwa_source_set_attenuation_override(eng, _src, _attRef, _attRolloff, _attMin);   // standing state, replayed like _extent
-            if (doppler)       Bwa.bwa_source_set_doppler(eng, _src, true);
-            if (airAbsorption) Bwa.bwa_source_set_air_absorption(eng, _src, true);
-            if (loudnessComp)  Bwa.bwa_source_set_loudness_comp(eng, _src, true);
-            if (proximity)     Bwa.bwa_source_set_proximity(eng, _src, true);
-            if (directivity != BwaDirectivity.Omni) ApplyDirectivity();   // fresh source defaults to omni, so skip the no-op
             SyncTransform();
             OnSourceReady();
             engine.Register(this);
@@ -200,7 +182,7 @@ namespace BwAudio
 
         /// <summary>Stop this source — AudioSource.Stop equivalent, the click-free stop path (a push
         /// voice ends exactly like a drained PushEnd).</summary>
-        public void Stop() { if (Live) Bwa.bwa_source_stop(Eng, _src); }
+        public virtual void Stop() { if (Live) Bwa.bwa_source_stop(Eng, _src); }
 
         /// <summary>Linear gain — AudioSource.volume equivalent; applies immediately if live. Cancels a
         /// running FadeTo/FadeOut (an explicit gain wins over a fade).</summary>
@@ -334,6 +316,130 @@ namespace BwAudio
         /// <summary>Playhead in seconds — AudioSource.time-get equivalent (Playhead over the engine
         /// sample rate).</summary>
         public double PlayheadSeconds => Engine.Instance ? Playhead / (double)Engine.Instance.sampleRate : 0.0;
+
+        // ---- bulk configuration (bwa_source_desc) ----------------------------------------------------
+        // The per-property setters above stay the live, incremental path. This is the WHOLE field set in
+        // one call, which is what the create-time push uses and what a preset needs. The inspector fields
+        // remain the source of truth in both directions: BuildDesc reads them, ApplyPreset writes them.
+
+        /// <summary>This component's whole configuration as a BwaSourceDesc, starting from the engine's
+        /// own defaults so every field is set (never build one from default(BwaSourceDesc) — its zero is
+        /// not its default). Position, orientation and playback state are deliberately not in it.</summary>
+        public BwaSourceDesc BuildDesc()
+        {
+            var d = Bwa.SourcePreset(BwaSourceKind.Default);
+            WriteDesc(ref d);
+            return d;
+        }
+
+        /// <summary>Push this component's whole field set to the engine in ONE call. Safe any time (it
+        /// no-ops before the source exists, and the create-time push replays the fields anyway). False
+        /// means the source isn't live, or the engine refused the desc (a NaN in a field).</summary>
+        public bool ApplyDesc() => ApplyDesc(BuildDesc());
+
+        /// <summary>Push an explicit desc — read one back with <see cref="TryGetDesc"/>, edit it, hand it
+        /// back. This does NOT update the inspector fields, so a later per-property edit or re-enable
+        /// pushes the fields again; use <see cref="ApplyPreset"/> when you want both to move.</summary>
+        public bool ApplyDesc(in BwaSourceDesc d)
+        {
+            if (!Live) return false;
+            if (Bwa.bwa_source_apply(Eng, _src, in d)) return true;
+            Debug.LogWarning("[" + GetType().Name + "] source apply refused on " + name + ": " + Bwa.LastError(Eng));
+            return false;
+        }
+
+        /// <summary>Read back what the ENGINE has this source configured at (what you set, not what the
+        /// sim is currently doing — that is <see cref="Occlusion"/>). False for a source that isn't
+        /// live.</summary>
+        public bool TryGetDesc(out BwaSourceDesc d)
+        {
+            if (Live) return Bwa.bwa_source_get_desc(Eng, _src, out d);
+            d = default;
+            return false;
+        }
+
+        /// <summary>Configure this source as a KIND: fill the engine's preset for it, mirror it into the
+        /// inspector fields, and push the lot in one call. This is also the source RESET the API had no
+        /// way to express before — <c>ApplyPreset(BwaSourceKind.Default)</c>.
+        /// <para>Nothing in the preset table is measured. A kind differs from Default only where a doc
+        /// already argues the case (docs/api.md, "What each preset rests on"), so treat it as a starting
+        /// point and edit what you disagree with.</para></summary>
+        public void ApplyPreset(BwaSourceKind kind)
+        {
+            var d = Bwa.SourcePreset(kind);
+            ReadDesc(in d);      // keep the inspector truthful about what the engine is running
+            ApplyDesc(in d);
+        }
+
+        /// <summary>Fill `d` from this component's fields. Override to add a subclass's own knobs (Emitter
+        /// adds pitch); call base first.</summary>
+        protected virtual void WriteDesc(ref BwaSourceDesc d)
+        {
+            d.gain     = gain;
+            d.priority = priority;
+            d.group    = (uint)group;
+            // A script-set anisotropic extent wins over the isotropic slider, which is the engine's own
+            // last-call-wins rule between set_spread and set_extent (and the reason TryInit used to
+            // re-assert the extent right after the spread).
+            if (_extent.x > 0f || _extent.y > 0f) { d.spread = _extent.x; d.extentHeight = _extent.y; }
+            else                                  { d.spread = spread;    d.extentHeight = -1f; }
+            d.sizeMeters = sizeMeters;
+            d.reverbSend = reflectionSend;
+            if (_attSet) { d.attenRefDist = _attRef; d.attenRolloff = _attRolloff; d.attenMinGain = _attMin; }
+            // Same mapping bwa_source_set_directivity_preset uses: omni = weight 0 (off, power 1),
+            // cardioid = 0.5, figure-8 = 1, with the component's sharpness on the non-omni patterns.
+            d.directivityWeight = directivity == BwaDirectivity.Omni     ? 0f
+                                : directivity == BwaDirectivity.Cardioid ? 0.5f : 1f;
+            d.directivityPower  = directivity == BwaDirectivity.Omni ? 1f : directivityPower;
+            d.doppler          = doppler;
+            d.airAbsorption    = airAbsorption;
+            d.loudnessComp     = loudnessComp;
+            d.proximity        = proximity;
+            d.occlusion        = occlusion;
+            d.earlyReflections = earlyReflections;
+            d.reverb           = reflections;
+            d.reverbDistance   = reflectionDistance;
+            d.pathing          = pathing;
+        }
+
+        /// <summary>Write `d` into this component's fields (the inverse of <see cref="WriteDesc"/>).
+        /// Override alongside it; call base first.</summary>
+        protected virtual void ReadDesc(in BwaSourceDesc d)
+        {
+            gain     = d.gain;
+            priority = d.priority;
+            group    = (int)d.group;
+            spread   = d.spread;
+            _extent  = d.extentHeight >= 0f ? new Vector2(d.spread, d.extentHeight) : Vector2.zero;
+            sizeMeters     = d.sizeMeters;
+            reflectionSend = d.reverbSend;
+            _attSet   = d.attenRefDist > 0f;
+            _attRef   = d.attenRefDist; _attRolloff = d.attenRolloff; _attMin = d.attenMinGain;
+            directivity = d.directivityWeight <= 0f    ? BwaDirectivity.Omni
+                        : d.directivityWeight >= 0.99f ? BwaDirectivity.Figure8 : BwaDirectivity.Cardioid;
+            if (directivity != BwaDirectivity.Omni) directivityPower = d.directivityPower;
+            doppler            = d.doppler;
+            airAbsorption      = d.airAbsorption;
+            loudnessComp       = d.loudnessComp;
+            proximity          = d.proximity;
+            occlusion          = d.occlusion;
+            earlyReflections   = d.earlyReflections;
+            reflections        = d.reverb;
+            reflectionDistance = d.reverbDistance;
+            pathing            = d.pathing;
+        }
+
+        // Unity's editor Reset (the component's context menu, and adding it to a GameObject). Unity has
+        // already restored the field initializers by the time this runs; re-filling from the engine's own
+        // BWA_SRC_DEFAULT keeps the two in step if a default ever moves. bwa_source_preset is PURE, so it
+        // needs no running engine — but it IS a P/Invoke, and a project that has not staged bw_audio.dll
+        // yet would throw here, where the field initializers are already the right answer.
+        protected virtual void Reset()
+        {
+            try { ApplyPreset(BwaSourceKind.Default); }
+            catch (DllNotFoundException) { }
+            catch (EntryPointNotFoundException) { }
+        }
 
         // Push this source's directivity pattern + sharpness. The preset call sets the pattern (and,
         // for Omni, turns directivity off); a non-omni pattern then re-issues with directivityPower, since

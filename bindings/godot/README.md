@@ -201,15 +201,20 @@ A/B tool.
 **`BwaSource : Node3D`** (abstract) - everything a spatial voice can do regardless of where
 its audio comes from: gain, priority, group, fades, pause, spread/extent/size, Doppler, air
 absorption, loudness compensation, attenuation override, occlusion (ray-traced or manual),
-directivity, reverb sends, early reflections, pathing.
+directivity, reverb sends, early reflections, pathing. The settings among those are also
+readable and writable as one Dictionary: `get_desc()`, `apply_desc()`, `reset_to_preset()`,
+and the static `BwaSource.get_preset()`. What a source is DOING stays out of that Dictionary:
+fades, pause, and the per-frame manual occlusion level are calls, not configuration.
 
 **`BwaEmitter : BwaSource`** - plays a file. Adds `play`/`play_at`/`play_loop`/`stop_at`,
-gapless `queue`, `seek_frames`/`seek_seconds`, `pitch`, and a `finished` signal.
+gapless `queue`, `seek_frames`/`seek_seconds`, `pitch`, `async_load` with `is_loading()`, and a
+`finished` signal.
 
 **`BwaPushSource : BwaSource`** - you feed it PCM. Adds `push`/`push_space`/`push_end`.
 
 **`BwaBed : Node`** - a world-locked ambisonic soundfield. A `Node`, not a `Node3D`: a bed
-has no position, only an orientation.
+has no position, only an orientation. It takes the same `async_load` opt-in as `BwaEmitter`,
+which is where a soundfield usually wants it: 4 to 16 channels of long recording.
 
 **`BwaMaterial : Resource`** - an acoustic material as a `.tres`. Either a built-in preset
 or custom 3-band coefficients. The preset is an **enum, not a string**: the core answers an
@@ -286,6 +291,77 @@ stop is an arranged ending and the caller wants to know when it landed.
 `bwa_set_output_capture` is **not bound, on purpose.** Its callback runs on the audio
 thread, where calling into GDScript would allocate and take the interpreter lock - exactly
 what invariant 1 forbids. Use the MANUAL sink and `render_block()` for capture instead.
+
+### Assets: the engine owns the cache
+
+The core holds a by-path, reference-counted asset cache, keyed on the **path plus the load
+flags**. A file kept in RAM and the same file streamed are two assets, which is why the key
+carries the flags. Nodes acquire through the engine node, so the same clip on twenty emitters
+loads once.
+
+`preload_sound(path, flags)` warms it before the first play. `flags` is a `BwaEngine`
+bitfield: `LOAD_MEMORY` (0, the default), `LOAD_STREAM`, `LOAD_AMBIX`, `LOAD_FUMA`. The core
+refuses a combination no loader can express, such as AmbiX with FuMa.
+
+`unload_sound_path(path)` drops this node's reference to **every** form of the path. Other
+holders keep theirs, so nothing is pulled out from under a playing voice.
+
+`sound_get_frames(path)` and `sound_get_channels(path)` are **cached-only** on purpose. They
+ask the core through `bwa_sound_find`, a pure lookup that never loads and never takes a
+reference, so a path the engine has not loaded reports 0 instead of decoding as a side effect.
+An earlier version decoded on the miss, and it always decoded MONO, so an ambisonic bed
+answered 1 channel forever.
+
+`BwaEngine` still records the `(path, flags)` keys it acquired, but only to know which
+references are **its own**: `unload_sound_path` releases exactly those, and `sound_is_ready`
+answers only for them. That record is the last asset state left in the binding. The
+deduplication, the reference counting, and the lifetime are the engine's.
+
+### Loading late, without stalling the frame
+
+`async_load` on `BwaEmitter` and `BwaBed` is an **opt-in**, and off by default: the CAVE's
+normal path is load-time and synchronous. Turn it on for content that appears mid-session.
+
+A play against a still-decoding clip is held on the control thread. The voice binds, stays
+silent, and starts from the top of the clip on the block the data lands, so nothing clicks and
+no frames are skipped. `is_loading()` covers that window. `finished` is not fired in it: a
+sound that has not started cannot have ended.
+
+`BwaEngine.preload_sound_async(path, flags)` starts a decode without a player, and
+`sound_is_ready(path, flags)` reports the landing. False covers three cases, so do not poll it
+without knowing which: still decoding, the decode failed, or this engine never acquired that
+`(path, flags)` pair at all. Only the failure reports itself, through `get_last_error()`.
+
+Two calls refuse a not-ready handle rather than hold it, so the binding always loads them
+synchronously: `play_oneshot`, which owns no handle to start later, and `BwaEmitter.queue`,
+whose entry resolves at bind time.
+
+### Configuring a source in one value
+
+Twenty-plus setters describe a source, and until now nothing read your settings back. The two
+getters that existed report what the simulation is currently doing, not what you asked for. `get_desc()`
+returns the whole configuration as a Dictionary, so you can print it, diff two sources, and
+find the one that sounds wrong:
+
+```gdscript
+print(emitter.get_desc())
+emitter.apply_desc({"gain": 0.5, "occlusion": true})   # only the keys you pass change
+emitter.reset_to_preset(BwaSource.KIND_PROP)           # back to a clean configuration
+print(BwaSource.get_preset(BwaSource.KIND_AMBIENCE))   # static: no engine needed
+```
+
+The kinds are `KIND_DEFAULT`, `KIND_PROP`, `KIND_VOICE`, `KIND_AMBIENCE`, and `KIND_UI`. They
+name what a source **is**. Nothing in the table is measured: a kind differs from the default
+only where [docs/api.md](../../docs/api.md) argues the case, and every other field sits at the
+engine default.
+
+Position, orientation, and playback state are deliberately **out**. Position and orientation
+are per-frame and commit-gated, so they belong to the frame loop. Playback is what a source is
+doing, not what it is, and an apply must never restart a sound. The manual occlusion level is
+out for the same reason: it is a measurement the game publishes each frame.
+
+Applying a desc updates the node's own properties too, so the inspector never disagrees with
+what the engine is rendering.
 
 ### Picking the profile, and the device
 

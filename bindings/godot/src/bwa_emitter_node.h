@@ -26,6 +26,16 @@ public:
 	bool get_autoplay() const { return autoplay; }
 	void set_streaming(bool v) { streaming = v; }
 	bool get_streaming() const { return streaming; }
+	/* Opt-in async load (bwa_sound_acquire_async): play returns at once and the voice stays
+	 * SILENT until the decode lands, then starts from the top of the clip. For content that
+	 * appears mid-session; the load-time path should stay synchronous, so this is OFF by
+	 * default. Ignored by queue(), which the core refuses to resolve against a not-ready
+	 * handle, and a streamed clip loads synchronously either way (the ABI says so: a stream
+	 * open is cheap and already decodes off this thread). */
+	void set_async_load(bool v) { async_load = v; }
+	bool get_async_load() const { return async_load; }
+	/* True between an async play and its data landing. The voice is bound and silent. */
+	bool is_loading() const;
 	void set_pitch(float rate);
 	float get_pitch() const { return pitch; }
 
@@ -58,6 +68,10 @@ public:
 protected:
 	static void _bind_methods();
 	void on_source_ready() override;
+	void on_stopped_externally() override;
+	/* `pitch` is a desc field, and this is the only source class that owns one. */
+	void fill_desc(bwa_source_desc *d) const override;
+	void mirror_desc(const bwa_source_desc &d) override;
 
 private:
 	bool begin(const String &p, bwa_sound *out);
@@ -66,6 +80,7 @@ private:
 	bool loop = true;
 	bool autoplay = true;
 	bool streaming = false; /* long file: stream from disk instead of decoding into RAM */
+	bool async_load = false; /* opt-in: decode on the loader thread, play when it lands */
 	float pitch = 1.0f;
 
 	/* Edge-detecting the end needs three states, not two. bwa_source_play only ENQUEUES;
@@ -81,6 +96,16 @@ private:
 	enum State { IDLE, PENDING, PLAYING };
 	State state = IDLE;
 	int pending_frames = 0;
+	/* The async play's handle, and whether the play took that route at all. An async play is
+	 * HELD on the control thread until the data lands, so the voice honestly reads "not
+	 * playing" for as long as the decode takes - which the grace window below would spend and
+	 * then announce a `finished` for a clip that has not started. The grace only runs once the
+	 * handle is READY, so a slow disk cannot manufacture an end. The flag keeps the readiness
+	 * probe off the synchronous path, where it would clear bwa_last_error every frame for an
+	 * answer that is always true. */
+	bwa_sound pending_snd = 0;
+	bool pending_async = false;
+	String pending_path; /* what begin() was handed, for the failure message */
 	/* ...and the window cannot be open-ended, because the ABI documents is_playing as
 	 * best-effort: "a sound shorter than the caller's poll interval may never be observed
 	 * as playing". Past this grace we take the readback at its word, so a very short clip

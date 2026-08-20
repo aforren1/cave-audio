@@ -44,6 +44,14 @@ public:
 	bool get_loop() const { return loop; }
 	void set_autoplay(bool v) { autoplay = v; }
 	bool get_autoplay() const { return autoplay; }
+	/* Opt-in async load (bwa_sound_acquire_async). A bed is the common case for it: a
+	 * soundfield is 4 to 16 channels of long recording, and a mid-session scene change should
+	 * not stall the frame on the decode. The bed binds at once and stays silent until the data
+	 * lands, then plays from the top. OFF by default, like BwaEmitter's. */
+	void set_async_load(bool v) { async_load = v; }
+	bool get_async_load() const { return async_load; }
+	/* True between an async play and its data landing. */
+	bool is_loading() const;
 	void set_gain(float g);
 	float get_gain() const { return gain; }
 	void set_priority(int p);
@@ -88,6 +96,8 @@ private:
 	Format format = FORMAT_AMBIX;
 	bool loop = true;
 	bool autoplay = true;
+	bool async_load = false;
+	bwa_sound playing_snd = 0; /* the handle play_clip bound, for the readiness probe */
 	float gain = 1.0f;
 	int priority = 128;
 	int group = 0;

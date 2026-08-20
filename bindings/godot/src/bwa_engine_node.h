@@ -66,6 +66,12 @@ public:
 	enum TrackerState {
 		TRACKER_DISCONNECTED = 0, TRACKER_NO_DATA = 1, TRACKER_NO_BODY = 2, TRACKER_LIVE = 3,
 	};
+	/* Mirrors bwa_load_flags — a BITFIELD, because the core's cache key is (path, flags) and
+	 * the flags pick the loader. LOAD_MEMORY is the zero (decode into RAM). The core refuses
+	 * combinations no loader can express (AmbiX with FuMa, streaming with either). */
+	enum LoadFlags {
+		LOAD_MEMORY = 0, LOAD_STREAM = 1 << 0, LOAD_AMBIX = 1 << 1, LOAD_FUMA = 1 << 2,
+	};
 
 	/* Godot runs _process in ascending process_priority, so a high default puts the push +
 	 * commit after ordinary gameplay nodes. Overridable in the inspector like any node's. */
@@ -175,9 +181,25 @@ public:
 	void tracker_disconnect();
 	TrackerState get_tracker_status() const;
 
-	/* --- assets --- */
-	bwa_sound load_sound(const String &path, bool streaming);
-	bwa_sound load_ambisonic(const String &path, bool fuma);
+	/* --- assets ---------------------------------------------------------------------------
+	 * The cache is the CORE's now (bwa_sound_acquire / bwa_sound_release, keyed on the same
+	 * (path, flags) pair this binding used to spell as a "m:"/"s:"/"a:"/"f:" prefix). This
+	 * node no longer dedups and no longer refcounts; it holds exactly one reference per key
+	 * it acquired and records that key, because the three PATH-taking calls below have no
+	 * ABI to answer them: nothing turns "res://ping.wav" back into a handle from outside.
+	 * A player takes the two C++ forms; script takes the bound ones. */
+	bwa_sound load_sound(const String &path, bool streaming, bool async = false);
+	bwa_sound load_ambisonic(const String &path, bool fuma, bool async = false);
+	/* Warm the cache before the first play. `flags` is the LoadFlags bitfield. The _async
+	 * form returns as soon as the decode is queued; poll sound_is_ready for the landing. */
+	bool preload_sound(const String &path, int flags);
+	bool preload_sound_async(const String &path, int flags);
+	/* False for a path this node never acquired, for a decode still running, and for one that
+	 * FAILED (get_last_error says which of the last two). True is "playable now". */
+	bool sound_is_ready(const String &path, int flags) const;
+	/* Release this node's reference to EVERY form of `path`. One file can be held as more
+	 * than one asset (memory, streamed, ambisonic), and "unload this file" means all of them.
+	 * Other holders keep theirs; the core frees on the last release. */
 	void unload_sound_path(const String &path);
 	/* Metadata for a path already loaded by a player (or a load_* call); 0 for a path this
 	 * engine never loaded. Deliberately CACHED-ONLY: the ABI has no metadata-only probe, so
@@ -185,6 +207,10 @@ public:
 	 * which reports 1 channel for an ambisonic bed. */
 	int64_t sound_get_frames(const String &path);
 	int sound_get_channels(const String &path);
+	/* Handle-level readiness for a caller that already holds one: 1 = playable, 0 = the async
+	 * decode is still running, -1 = it failed (reason in get_last_error). Not bound - script
+	 * holds paths, not handles; BwaEmitter/BwaBed hold handles. */
+	int sound_ready_state(bwa_sound snd) const;
 	/* false = nothing will be heard: the clip failed to load, or the voice pool / command ring
 	 * was momentarily full and the transient was dropped. get_last_error() says which. */
 	bool play_oneshot(const String &path, const Vector3 &godot_pos, float gain);
@@ -196,6 +222,14 @@ public:
 	bool get_paused() const { return paused; }
 	void group_set_gain(int group, float linear);
 	void group_set_paused(int group, bool p);
+	/* Scene transitions. Both take the click-free one-block fade every stop takes, both stop
+	 * beds (a bed is a voice), and both drop the stopped voices' pending queues. Neither
+	 * touches group gains, the pause gates, or the master gain: a stop stops sound, it does
+	 * not reset the mixer. stop_all additionally drops plays still waiting on an async
+	 * decode; group_stop cannot, because an unbound held play has no voice to read a group
+	 * from. Both tell the emitters so a scene change never reads as a `finished`. */
+	void group_stop(int group);
+	void stop_all();
 	void reverb_set_gain(float linear);
 	float get_reverb_gain() const { return reverb_gain; }
 	void early_reflections_set_gain(float linear);
@@ -398,9 +432,22 @@ private:
 	int generation = 0; /* 0 = never started; assigned from next_generation in _ready */
 	std::vector<BwaSource *> sources;
 	std::vector<BwaEngineClient *> clients;
-	HashMap<String, bwa_sound> sounds;
 
-	/* Metadata lookup across every cache key prefix; 0 when the path was never loaded. */
+	/* One record per (path, flags) key this node acquired, holding exactly ONE reference.
+	 * A flat vector, not a map: the core does the deduplication and the refcounting now, so
+	 * this is a lookup table for the by-path calls and nothing else. Both of those want
+	 * every entry for a path anyway, and an asset list is small. */
+	struct HeldSound {
+		String path;
+		uint32_t flags;
+		bwa_sound snd;
+	};
+	std::vector<HeldSound> sounds;
+
+	/* The one acquire path: hit the record, else bwa_sound_acquire(_async) and record it. */
+	bwa_sound acquire_sound(const String &path, uint32_t flags, bool async);
+	/* Metadata lookup, preferring the point-source forms over the bed ones (a multi-role path
+	 * would want the mono answer first); 0 when the path was never acquired. */
 	bwa_sound find_loaded_sound(const String &path) const;
 
 	Profile profile = PROFILE_BINAURAL;
@@ -464,3 +511,4 @@ VARIANT_ENUM_CAST(godot::BwaEngine::BedRenderer);
 VARIANT_ENUM_CAST(godot::BwaEngine::TestKind);
 VARIANT_ENUM_CAST(godot::BwaEngine::Material);
 VARIANT_ENUM_CAST(godot::BwaEngine::TrackerState);
+VARIANT_BITFIELD_CAST(godot::BwaEngine::LoadFlags);

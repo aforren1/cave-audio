@@ -11,6 +11,7 @@
 #pragma once
 
 #include <godot_cpp/classes/node3d.hpp>
+#include <godot_cpp/variant/dictionary.hpp>
 #include <godot_cpp/variant/vector3.hpp>
 
 #include "bw_audio.h"
@@ -24,6 +25,10 @@ class BwaSource : public Node3D {
 
 public:
 	enum Directivity { DIR_OMNI = 0, DIR_CARDIOID = 1, DIR_FIGURE8 = 2 };
+	/* Mirrors bwa_source_kind: what the source IS, which is what a preset is named for. */
+	enum Kind {
+		KIND_DEFAULT = 0, KIND_PROP = 1, KIND_VOICE = 2, KIND_AMBIENCE = 3, KIND_UI = 4,
+	};
 
 	BwaSource() = default;
 	~BwaSource() override = default;
@@ -99,6 +104,28 @@ public:
 	void set_pathing(bool on);
 	bool get_pathing() const { return pathing; }
 
+	/* --- configuration as one value (bwa_source_desc) --------------------------------------
+	 * The same shape BwaEngine::get_setup_tuning uses for the engine knobs, and for the same
+	 * reason: a Dictionary can be PRINTED and diffed, where a struct behind 24 setters cannot.
+	 *
+	 * WHAT IS IN: configuration, the settings that describe the source. WHAT IS OUT: position
+	 * and orientation (per-frame, pushed by BwaEngine every commit), playback state (what the
+	 * source is DOING, not what it is - an apply must never restart a sound), and the manual
+	 * occlusion LEVEL, which is a per-frame measurement the game publishes.
+	 *
+	 * get_preset is pure, so a tool can print the table with no engine in the scene. */
+	static Dictionary get_preset(Kind kind);
+	/* What this source is configured at. Reads the engine back when live, the node's authored
+	 * state otherwise, so it answers in the editor too. Round-trips through apply_desc. */
+	Dictionary get_desc() const;
+	/* Overlay: only the keys PRESENT are changed, the rest keep their current value. So
+	 * apply_desc({"gain": 0.5}) is a one-field edit and get_desc() -> apply_desc() is a no-op.
+	 * An unknown key is a warning, not a silent miss. False = the engine refused the desc. */
+	bool apply_desc(const Dictionary &d);
+	/* The reset the API had no way to express: fill the preset for `kind` and push the lot.
+	 * Every configured field goes back to that preset, authored inspector values included. */
+	bool reset_to_preset(Kind kind);
+
 	/* --- readbacks --- */
 	virtual bool is_playing() const;
 	int64_t get_playhead_frames() const;
@@ -110,20 +137,33 @@ public:
 	 * can be freed while sources live elsewhere in the tree, and without this their `owner`
 	 * back-pointer dangles — the next setter on the source is then a use-after-free. */
 	void engine_gone();
+	/* Something outside this node stopped the voice (BwaEngine::group_stop / stop_all), so it
+	 * is called BY the engine like push_frame. An emitter uses it to keep its end detector
+	 * from reading a scene change as a finish. */
+	virtual void on_stopped_externally() {}
 
 protected:
 	static void _bind_methods();
 
-	/* Subclasses mint their own kind of source (bwa_source_create vs _create_push) and are
-	 * told when it is live so they can apply their own state. */
+	/* Subclasses mint their own kind of source (bwa_source_create_desc vs _create_push) and
+	 * are told when it is live so they can apply their own state. */
 	virtual bwa_source create_source();
 	virtual void on_source_ready() {}
+	/* The node's authored configuration as a desc, and the way back. Virtual because `pitch`
+	 * belongs to the desc but only BwaEmitter owns a pitch (the core refuses it on a push
+	 * voice), so the emitter extends both halves. Always start from bwa_source_preset: this
+	 * struct's zero is not its default. */
+	virtual void fill_desc(bwa_source_desc *d) const;
+	virtual void mirror_desc(const bwa_source_desc &d);
 
 	BwaEngine *owner = nullptr;
 	bwa_source src = 0;
 
 private:
 	void apply_all(); /* re-push authored state onto a freshly created source */
+	/* Mirror `d` into the node's caches (so the inspector does not lie) and push it if the
+	 * source is live. Not live = authored early, and apply_all replays it at _ready. */
+	bool push_desc(const bwa_source_desc &d);
 	void push_orientation(const Quaternion &q); /* the facing seam, applied in one place */
 
 	float gain = 1.0f;
@@ -166,3 +206,4 @@ private:
 } // namespace godot
 
 VARIANT_ENUM_CAST(godot::BwaSource::Directivity);
+VARIANT_ENUM_CAST(godot::BwaSource::Kind);

@@ -6,8 +6,10 @@ sources, and per-frame updates. Declarations in
 [`include/bw_audio.h`](../include/bw_audio.h) carry their contracts as comments;
 [`examples/minimal.c`](../examples/minimal.c) runs the whole client lifecycle;
 [`examples/ambisonic.c`](../examples/ambisonic.c) walks the bed API (AmbiX/FuMa loading,
-rotation/tilt, the renderer and max-rE A/Bs) and [`examples/streaming.c`](../examples/streaming.c)
-walks disk streaming + push sources. All three are console programs built every build.
+rotation/tilt, the renderer and max-rE A/Bs), [`examples/streaming.c`](../examples/streaming.c)
+walks disk streaming + push sources, and [`examples/convenience.c`](../examples/convenience.c)
+walks the convenience tier below, with each part naming the core calls it replaces. All four are
+console programs built every build.
 
 Terms used here without definition are in [glossary.md](./glossary.md).
 
@@ -37,7 +39,14 @@ Terms used here without definition are in [glossary.md](./glossary.md).
   near-field proximity, pitch; opt-in per source. The speed of sound itself is a
   live engine-wide parameter (underwater, slow motion).
 - Assets: WAV/FLAC/MP3 decoded (and resampled) at load, disk streaming for long
-  files, AmbiX ambisonic beds decoded world-locked to the array.
+  files, AmbiX ambisonic beds decoded world-locked to the array. Two ownership tiers:
+  explicit load/unload, and a refcounted by-path cache (`bwa_sound_acquire`,
+  `bwa_sound_release`) keyed on path plus load flags, with an async twin for content
+  that appears mid-session.
+- Source configuration as a struct: fill a preset for what the source is, override what you
+  disagree with, apply the lot in one call, and read back what a source is set to
+  (`bwa_source_preset`, `bwa_source_apply`, `bwa_source_get_desc`). The engine-wide equivalent is
+  `bwa_tuning_preset` / `bwa_apply_tuning`.
 - Voices: fixed pool with priority stealing, pause and click-free seek,
   sample-accurate scheduled starts against a device-anchored DSP clock. The device's own
   block stamps bridge that clock to wall time for AV sync, with the device-vs-host drift
@@ -83,6 +92,32 @@ bwa_stop(eng); bwa_destroy(eng);
   whose voices finished since you last asked. Prefer it. `bwa_source_is_playing` is
   still there and still correct, but it is a per-block readback. A sound shorter
   than your frame interval can begin and end without you ever seeing it play.
+
+## API tiers: core and convenience
+
+The API has two tiers. Know the split before you read the rest.
+
+The **core tier** is what everything else reduces to: `bwa_create` and `bwa_start`, an asset load
+(`bwa_load_sound` and its siblings), `bwa_source_create`, the per-frame setters
+(`bwa_source_set_pos`, `bwa_source_set_gain`, `bwa_set_listener_pose`), `bwa_source_play`, and
+`bwa_commit`. That is the whole engine. The Quickstart above uses nothing else.
+
+The **convenience tier** is everything that saves you writing the core calls yourself:
+`bwa_play_oneshot`, the mix-group calls (`bwa_group_set_gain`, `bwa_group_set_paused`,
+`bwa_group_stop`, `bwa_stop_all`), the asset helpers (`bwa_sound_acquire`, `bwa_sound_release`,
+`bwa_sound_acquire_async`, `bwa_sound_is_ready`, `bwa_sound_find`), the source-description calls
+(`bwa_source_preset`, `bwa_source_create_desc`, `bwa_source_apply`, `bwa_source_get_desc`),
+`bwa_tuning_preset` with `bwa_apply_tuning`, and `bwa_material_preset`.
+
+A convenience call is control-thread sugar. It runs on the control thread, writes the same command
+ring the core calls write, and lands in the same mixer. Nothing new reaches the audio thread and
+there is no second render path. Whatever one convenience call does, a handful of core calls do too,
+and the audio is identical either way. Read that as permission to mix the tiers freely, and as a
+warning not to look for extra behavior that is not there.
+
+`bwa_sound_acquire_async` is the one call that adds machinery rather than only saving you typing: it
+starts a background loader thread to decode off the control thread. That thread never touches the
+audio thread or the mixer, so the guarantee above still holds.
 
 ## Profiles and the master bus
 
@@ -597,6 +632,152 @@ must already match), so `seconds = frames / bwa_get_sample_rate(e)`. `get_frames
 invalid handle or a stream whose length is unknown (push sources); `get_channels` returns 0 for
 an invalid handle. Control thread, any time after the load.
 
+### Shared ownership: `bwa_sound_acquire` / `bwa_sound_release`
+
+```c
+typedef enum {
+    BWA_LOAD_STREAM = 1 << 0,   // as bwa_load_sound_streaming
+    BWA_LOAD_AMBIX  = 1 << 1,   // as bwa_load_ambix
+    BWA_LOAD_FUMA   = 1 << 2    // as bwa_load_fuma
+} bwa_load_flags;
+
+bwa_sound bwa_sound_acquire(bwa_engine* e, const char* path, uint32_t flags);
+void      bwa_sound_release(bwa_engine* e, bwa_sound snd);
+```
+
+The four `bwa_load_*` calls are the **explicit** tier: you loaded it, you unload it, once. That
+tier does not dedup and does not count references, so every client ends up writing the same
+path-to-handle dictionary. `bwa_sound_acquire` is the **shared** tier over those same loaders.
+
+The cache key is the path plus the flags. Ask for the same key twice and you get the same handle
+with one more reference. Ask for the same path with different flags and you get **different**
+entries, because a file held in RAM and the same file streamed are two different assets. Flags 0
+means `bwa_load_sound`.
+
+Paths compare case-insensitively, and `/` and `\` are equivalent. Nothing else is normalized:
+`./sound.wav` and `sound.wav` are two entries. There is no `..` collapse and no symlink
+resolution.
+
+A combination no loader can express is refused with a message in `bwa_last_error`, never narrowed
+to one of the two: `BWA_LOAD_AMBIX | BWA_LOAD_FUMA` (one file is in one format) and
+`BWA_LOAD_STREAM` with either of them (streaming is mono only). Unknown bits are refused too.
+
+`bwa_sound_release` drops one reference. The last release unloads through the same retire-ack path
+`bwa_unload_sound` uses, so releasing an asset a voice is still playing is safe.
+
+**Do not mix the tiers on one handle.** `bwa_unload_sound` on an acquired handle is refused: it is
+a no-op plus an error string, because freeing the buffer would pull the asset out from under the
+other holders and leave the cache pointing at a recycled slot. `bwa_sound_release` on a handle the
+cache does not own is refused the same way. Release what you acquired, unload what you loaded.
+
+Both tiers are control thread only, and neither adds anything to the audio thread. The cache
+allocates, does the file I/O, and hands the core the same asset the explicit loaders hand it.
+
+#### Probing without loading: `bwa_sound_find`
+
+```c
+bwa_sound bwa_sound_find(bwa_engine* e, const char* path, uint32_t flags);
+```
+
+Returns the handle for a key the cache already holds, or 0. It never loads, never touches the
+disk, and never takes a reference.
+
+Use this to answer a question **about a path** rather than to get an asset: how long is this clip,
+how many channels does it have, is it in memory yet, which handle does this file have so I can
+release it. Do not use `bwa_sound_acquire` for those. A miss there loads the file, which turns a
+metadata question into a hidden decode, and it loads mono, so an ambisonic bed would answer 1
+channel forever.
+
+A still-loading async entry answers with its handle, because it is resident and playable; ask
+`bwa_sound_is_ready` about the data itself. An entry whose load failed answers 0, because it holds
+nothing to answer about.
+
+The handle is **borrowed**. `bwa_sound_find` took no reference, so the asset stays alive only as
+long as the references you already hold. Read metadata from it; do not release against it.
+
+Failure is deliberately **not** cached on the synchronous path: a `bwa_sound_acquire` that fails
+records nothing, so the next call retries the file. That suits a file that appears late, and it
+means a client that calls in a loop should remember its own failures rather than re-asking every
+frame. The async path differs, because there the handle already escaped: a failed decode is sticky
+and reports at `bwa_sound_is_ready` until you release it.
+
+### Async loading: `bwa_sound_acquire_async`
+
+```c
+bwa_sound bwa_sound_acquire_async(bwa_engine* e, const char* path, uint32_t flags);
+bool      bwa_sound_is_ready(bwa_engine* e, bwa_sound snd);
+```
+
+This is for content that appears **mid-session**. The CAVE's normal path is load-time and
+synchronous, so reach for `bwa_sound_acquire` first.
+
+`bwa_sound_acquire_async` returns a usable handle straight away and decodes on the engine's loader
+thread. There is one such thread per engine. It starts on the first async acquire, so a session
+that never loads asynchronously never pays for it, and `bwa_destroy` joins it.
+
+The handle is playable at once. Bind it to a source and the source stays **silent** until the data
+lands, then starts playing from the top of the asset on the block it arrives. No frames are
+skipped and nothing clicks. That hold lives on the control thread: the audio thread is only ever
+handed a finished asset, so it neither allocates nor branches for a not-ready sound.
+
+Two calls refuse a not-ready handle instead of holding it, and say so through `bwa_last_error`:
+
+- `bwa_play_oneshot`, because a oneshot owns no handle you could start later.
+- `bwa_source_queue`, because a queue entry resolves to the asset at bind time.
+
+`BWA_LOAD_STREAM` loads synchronously here. A stream open is cheap and streaming already decodes
+off the control thread, so there is nothing to defer.
+
+**The point-source and bed split still applies while the decode is in flight.** A handle acquired
+with `BWA_LOAD_AMBIX` or `BWA_LOAD_FUMA` is a bed, and only `bwa_bed_play` takes it. Anything else
+is a point source, and only `bwa_source_play`, `bwa_source_play_at`, and `bwa_source_play_loop`
+take it. The wrong call is refused where you made it, with the reason in `bwa_last_error`, even
+though the handle still reports 0 channels at that moment. The flags fixed the kind at acquire
+time, so the engine does not have to wait for the decode to answer.
+
+The refusal is what you should see. As a backstop, a held play whose asset lands as the other kind
+is dropped rather than bound, and the `bwa_commit` that dropped it reports so through
+`bwa_last_error`. Binding it instead would render your point source as a soundfield, because the
+mixer dispatches on the asset's channel count, and your spread, directivity, and panner settings
+would quietly do nothing.
+
+`bwa_sound_is_ready` reports whether the data landed. It returns true for anything acquired
+synchronously and false for a handle the cache does not own. Calling it also adopts finished
+loads, and so does `bwa_commit`, so a client that commits every frame needs nothing else.
+
+A decode that **fails** never becomes ready. The handle stays valid so it can never be recycled
+under you, `bwa_sound_is_ready` keeps returning false, and the decoder's reason is in
+`bwa_last_error` at that call. Release the handle; acquiring the same key again then retries the
+load.
+
+Releasing a still-loading handle is safe and **cancels** it. The reservation is dropped
+immediately and the worker's result is discarded when it arrives.
+
+#### Testing the held window
+
+A test that means to cover the held window has a problem: a small asset usually decodes before the
+first render, so the play binds at once, the held path never runs, and the test passes anyway.
+
+Ordering solves it, without any test hook. A finished decode is adopted **only** at a pump point:
+`bwa_sound_acquire`, `bwa_sound_is_ready`, `bwa_sound_find`, `bwa_sound_release`, and `bwa_commit`.
+`bwa_source_play` is not one. So a play issued straight after `bwa_sound_acquire_async`, with
+nothing pumping in between, is guaranteed to be held. Check it with `bwa_sound_get_channels`, which
+reads 0 while the slot is still reserved and does not pump.
+
+Slipping a readiness check in before the play is what breaks this, and it breaks it silently: the
+decode gets adopted and the case turns into an ordinary bind while every assertion still passes.
+`test/assets_test.c` does it in the guaranteed order and says so.
+
+Cancelling an in-flight load cannot be pinned down this way, because `bwa_sound_release` pumps on
+entry. Both outcomes are safe, so that test covers the behavior without being able to claim which
+branch ran.
+
+The ownership handoff, for the record: the loader thread allocates the PCM and owns it until it
+publishes the result. From the moment the control thread picks that result up, the control thread
+owns the buffer, hands it to the sound table, and frees it later through the retire-ack. The audio
+thread reaches it only through the ordinary play command, which is the same release the
+synchronous loaders have always used. See [concurrency.md](./concurrency.md).
+
 ## Sources (control thread, non-blocking)
 
 ```c
@@ -610,6 +791,8 @@ void     bwa_source_fade_out(bwa_engine* e, bwa_source s, float seconds);       
 void     bwa_source_set_group(bwa_engine* e, bwa_source s, uint32_t group);           // mix group 0..7 (default 0)
 void     bwa_group_set_gain  (bwa_engine* e, uint32_t group, float linear);         // scales every member (ramped)
 void     bwa_group_set_paused(bwa_engine* e, uint32_t group, bool paused);          // pause a whole category
+void     bwa_group_stop      (bwa_engine* e, uint32_t group);                       // stop a whole category (click-free)
+void     bwa_stop_all        (bwa_engine* e);                                       // stop every voice (scene transition)
 void     bwa_source_set_pitch(bwa_engine* e, bwa_source s, float rate);               // playback rate [0.25, 4]; glided
 void     bwa_source_play (bwa_engine* e, bwa_source s, bwa_sound snd, bool loop);
 void     bwa_source_play_at(bwa_engine* e, bwa_source s, bwa_sound snd, bool loop, uint64_t start_sample); // sample-accurate
@@ -785,8 +968,22 @@ same click-free stop path `bwa_source_stop` uses.
 multiplies into every member's gain solve (ramped like any solve). Pausing a group ramps its
 members out and freezes their playheads exactly like per-voice pause: duck the SFX and keep the
 dialog, silence the ambience category for a cutscene. Sources start in group 0; group state
-persists across `play`. Out of range: `set_group` falls back to group 0, group gain/pause calls
+persists across `play`. Out of range: `set_group` falls back to group 0, group gain/pause/stop calls
 are ignored.
+
+**Stopping a scene.** `bwa_group_stop` stops every member of one group. `bwa_stop_all` stops every
+voice in the engine, whatever its group. Use them for a scene transition instead of looping over
+your own handles. Both take the same click-free path `bwa_source_stop` takes: each voice fades to
+silence over one block, around 5 ms, then ends, so a whole-scene stop cannot pop. Both also drop
+each stopped voice's pending chain (`bwa_source_queue`), so nothing you queued starts after the
+transition. Beds are voices, so `bwa_bed_*` stops with everything else. A stopped source handle
+stays valid and re-playable. Only `bwa_play_oneshot`'s transient voices are recycled. Two things
+they do not do: a push source's voice stops like any other but its feed ring stays open (end it
+with `bwa_source_push_end` or `bwa_source_stop`), and neither call touches group gains, group
+pause, the global pause, or the master gain. A stop stops sound, it does not reset the mixer. One
+asymmetry: `bwa_stop_all` also drops the plays still waiting on an async decode
+(`bwa_sound_acquire_async`), which would otherwise start by themselves once their data lands.
+`bwa_group_stop` cannot, because an unbound held play has no voice to read a group from.
 
 **Pitch** (`bwa_source_set_pitch`, 1 = native, clamped `[0.25, 4]`) resamples **in-memory** sounds
 with a fractional playback cursor (linear interpolation; the cursor stays integer + fraction, so a
@@ -1407,6 +1604,126 @@ cosine per voice per solve). It composes with the other spread floors as a max, 
 selected spread mode and the decorrelators, and re-solves every source on the next block, static
 ones included. No effect in `BWA_PROFILE_BINAURAL`. Design and measured numbers:
 [spatialization.md](./spatialization.md) → "Array holes".
+
+## Source configuration (`bwa_source_preset`, `bwa_source_apply`)
+
+```c
+typedef enum { BWA_SRC_DEFAULT = 0, BWA_SRC_PROP, BWA_SRC_VOICE, BWA_SRC_AMBIENCE, BWA_SRC_UI } bwa_source_kind;
+void       bwa_source_preset(bwa_source_kind kind, bwa_source_desc* out);        // pure, no engine handle
+bwa_source bwa_source_create_desc(bwa_engine* e, const bwa_source_desc* d);      // create + apply, in one
+bool       bwa_source_apply(bwa_engine* e, bwa_source s, const bwa_source_desc* d);   // every knob, one call
+bool       bwa_source_get_desc(bwa_engine* e, bwa_source s, bwa_source_desc* out);    // what it is set to
+```
+
+There are 24 `bwa_source_set_*` calls and configuring one source fully takes eighteen of them. This is
+[Situation tuning](#situation-tuning-bwa_tuning_preset-bwa_apply_tuning) applied to a source instead
+of the engine: `bwa_source_kind` names what the source **is**, `bwa_source_preset` fills a complete
+configuration for it, and `bwa_source_apply` pushes the lot.
+
+```c
+bwa_source_desc d;
+bwa_source_preset(BWA_SRC_PROP, &d);   // a physical object in the room
+d.doppler = true;                       // this one moves fast
+bwa_source generator = bwa_source_create_desc(e, &d);
+```
+
+Fill-then-apply rather than one `apply_preset(e, s, PROP)`, for the same four reasons the engine
+tuning gives. You can **print** what a source is set to, which nothing could do before: only
+occlusion and directivity had getters, and those report the sim's live value, not your setting.
+Preset, override a field, apply, composes where apply-then-re-override is order dependent. The
+preset is pure, so a tool can show the table off-hardware. And two sources diff field by field,
+which is how you find the one that sounds wrong. It also gives a source a **reset**, which the API
+had no way to express: fill a preset, apply, done.
+
+**What is in, and what is out.** The struct carries **configuration**: the settings that describe
+the source and stay put. Three things are deliberately absent. **Position and orientation** are
+per-frame (latest-wins, pushed every frame, commit gated), so they belong to the frame loop.
+**Playback state** (play, stop, pause, seek, queue, fade) is what the source is *doing*, not what it
+is; an apply must never restart a sound. **Manual occlusion** is a live value your game publishes
+per frame, the same kind of thing the sim publishes, so the desc carries the on/off and not the
+level. Push data is a feed, not a setting.
+
+**This struct's zero is NOT its default.** A zero-filled `bwa_source_desc` means gain 0 (silence)
+and pitch 0 (invalid), so a zero-init mistake has to fail loudly instead of silently
+misconfiguring the source. `struct_size` is what makes it fail: `bwa_source_apply` refuses a struct
+whose size is wrong, which is exactly what a zero-init looks like. Note this is the opposite call
+from `bwa_desc`, whose zero **is** its default, and it is the same call `bwa_tuning` makes. Always
+start from `bwa_source_preset`.
+
+Out-of-range **finite** values clamp to the documented range, exactly as the individual setters
+clamp them. **Non-finite** values refuse the whole apply, because landing half a configuration is
+worse than landing none. A stale or destroyed handle is the usual silent no-op and still returns
+true: the desc was valid, the source was not. `bwa_source_get_desc` returns false there instead,
+because there is nothing to report.
+
+**Cost.** `bwa_source_apply` is per-frame safe and non-blocking, like the setters it wraps, and it
+is **one** command on the ring for the fifteen knobs the audio thread owns. That matters:
+`bwa_play_oneshot` already documents dropping when the ring is momentarily full, so a
+fifteen-command spawn is real pressure. Steal priority is control-side state and costs nothing.
+Occlusion, pathing registration and directivity go to the sims, not the ring. Directivity is the one
+call that can cost a second ring slot, and only when the pattern actually changes, so an ordinary
+omni source stays at one command.
+
+**Round-trip.** `bwa_source_get_desc` fills `struct_size`, so you can edit the result and hand it
+straight back: feeding a readback into `bwa_source_apply` is a no-op. It reports what you **set**;
+for what the sim is currently **doing** to a source, use `bwa_source_get_occlusion` and
+`bwa_source_get_directivity`, which report live per-block values. A gain fade in flight already
+reads its target, because `bwa_source_fade_to` is a gain setting spread over time.
+`bwa_source_fade_out` is a stop, not a gain setting, so it leaves the configured level alone.
+
+### What each preset rests on
+
+Read this before treating a preset as a recommendation. **Nothing here is measured.** A kind
+differs from `BWA_SRC_DEFAULT` only where a doc already argues the case, and every other field sits
+at the engine default. Where a value had to be picked it is an **endpoint the ABI already names**
+(1 = wide, 255 = protected, rolloff 0 = constant level), never a tuned middle number.
+
+| Field | `DEFAULT` | `PROP` | `VOICE` | `AMBIENCE` | `UI` |
+| --- | --- | --- | --- | --- | --- |
+| `gain` / `pitch` | 1 / 1 | 1 / 1 | 1 / 1 | 1 / 1 | 1 / 1 |
+| `priority` | 128 | 128 | **255** | 128 | **255** |
+| `group` | 0 | 0 | 0 | 0 | 0 |
+| `spread` | 0 | 0 | 0 | **1** | 0 |
+| `extent_height` | -1 | -1 | -1 | -1 | -1 |
+| `size_m` | 0 | 0 | 0 | 0 | 0 |
+| `occlusion` | off | **on** | **on** | off | off |
+| `reverb` / `reverb_distance` | off | **on** | **on** | off | off |
+| `reverb_send` | 1 | 1 | 1 | 1 | 1 |
+| `air_absorption` | off | **on** | off | off | off |
+| `proximity` | off | **on** | off | off | off |
+| `doppler` | off | off | off | off | off |
+| `loudness_comp` | off | off | off | off | off |
+| `early_reflections` | off | off | off | off | off |
+| `pathing` | off | off | off | off | off |
+| `atten_*` | layout curve | layout curve | layout curve | layout curve | **1 m, rolloff 0, floor 1** |
+| `directivity_*` | omni | omni | omni | omni | omni |
+
+Why each non-default value:
+
+- `PROP` **proximity, air absorption**: intent, from the header's own arguments. Proximity is the
+  missing half of distance in a volume you can walk up to; air absorption is what distance does to
+  timbre.
+- `PROP` and `VOICE` **occlusion, reverb, reverb distance**: intent. A real object is occluded by
+  real geometry and excites the room, wetter far and drier near.
+- `VOICE` drops **air absorption and proximity**: intent. Both trade intelligibility for realism,
+  and a talker rarely gets a walk-up cue.
+- `VOICE` and `UI` **priority 255**: the ABI's own "protected" endpoint, not a tuned number. A full
+  pool must drop an effect before it drops a line or a click.
+- `AMBIENCE` **spread 1**: the ABI's documented wide endpoint. Dial it down, or use `size_m` for a
+  physical extent that holds as the listener walks. No reverb send, because ambience content
+  usually already carries its space and sending it to the shared bed double-counts. That is the same
+  argument that keeps the CAVE room itself out of the image-source model.
+- `UI` **attenuation override**: `rolloff` 0 is the ABI's own "constant level at any distance, a
+  direction-only cue that never fades". 1 m is the canonical reference distance and a floor of 1
+  keeps the minimum out of the way.
+- **Doppler stays off everywhere**, including `PROP`. The header calls it best for fast movers and
+  subtle for slow ones, and "prop" says nothing about speed. Turn it on for the ones that move.
+- **Early reflections stay off everywhere.** They need a room and cost O(N) in sources, so they are
+  an explicit per-source opt-in, not something a preset spends. Applying a desc that asks for them
+  with no room set leaves them off, says so in `bwa_last_error`, and applies the rest.
+- **Directivity stays omni everywhere**, even for `VOICE`, where a mouth is a cardioid. A pattern
+  without an orientation aims at room-ahead, and the orientation is per-frame, so a preset that
+  quietly nulls an un-aimed source is a trap. Set the pattern yourself once you aim the source.
 
 ## Channel test / diagnostics (control thread)
 

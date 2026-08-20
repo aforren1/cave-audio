@@ -68,6 +68,7 @@ endif()
 add_library(bwa_core OBJECT
   src/rt.c
   src/sound.c
+  src/assets.c
   src/layout.c
   src/dbap.c
   src/spcap.c
@@ -99,6 +100,7 @@ if(MSVC)
   # so it applies wherever rt.c is compiled). cJSON is third-party: silence its warnings.
   set_source_files_properties(src/rt.c PROPERTIES COMPILE_OPTIONS /experimental:c11atomics)
   set_source_files_properties(src/stream.c PROPERTIES COMPILE_OPTIONS /experimental:c11atomics)
+  set_source_files_properties(src/assets.c PROPERTIES COMPILE_OPTIONS /experimental:c11atomics)   # the loader thread's two SPSC rings
   set_source_files_properties(src/fdn.c PROPERTIES COMPILE_OPTIONS /experimental:c11atomics)   # the live wet-gain atomic
   set_source_files_properties(${CJSON_C} PROPERTIES COMPILE_OPTIONS /W0)
 endif()
@@ -276,6 +278,11 @@ add_executable(bwa_streaming examples/streaming.c)
 target_link_libraries(bwa_streaming PRIVATE bw_audio)
 bwa_tool_icon(bwa_streaming)
 bwa_copy_runtime_dll(bwa_streaming)
+# ---- the convenience tier (shared assets + async, source descs, scene stops) ----
+add_executable(bwa_convenience examples/convenience.c)
+target_link_libraries(bwa_convenience PRIVATE bw_audio)
+bwa_tool_icon(bwa_convenience)
+bwa_copy_runtime_dll(bwa_convenience)
 
 # ---- track monitor example (console; prints the live tracked pose) ----
 add_executable(bwa_track_monitor examples/track_monitor.c)
@@ -306,6 +313,16 @@ endif()
 option(BWA_BUILD_TESTS "Build the bw_audio tests" ON)
 if(BWA_BUILD_TESTS)
   enable_testing()
+
+  # The console examples double as regression tests. `--tests` forces the offline sink (so CI never
+  # depends on an ASIO driver being installed) and cuts the listening time; the CALLS are the same
+  # ones a reader sees, which is the point of testing the example rather than a copy of it. An ABI
+  # change that still compiles but misbehaves fails here. bwa_convenience additionally CHECKS every
+  # claim it prints and exits nonzero on a mismatch.
+  foreach(ex bwa_minimal bwa_ambisonic bwa_streaming bwa_convenience)
+    add_test(NAME example_${ex} COMMAND ${ex} --tests)
+    set_tests_properties(example_${ex} PROPERTIES TIMEOUT 120)
+  endforeach()
 
   # lifecycle smoke against the public ABI / DLL
   add_executable(test_smoke test/smoke.c)
@@ -356,6 +373,14 @@ if(BWA_BUILD_TESTS)
   target_link_libraries(test_sound PRIVATE bwa_core)
   add_test(NAME sound COMMAND test_sound)
 
+  # The by-path asset cache (bwa_sound_acquire/_release/_acquire_async) against the real DLL.
+  # bwa_core comes in TOO, for dr_wav's write API used to synthesize the test files (same reason
+  # as test_tools_api links both).
+  add_executable(test_assets test/assets_test.c)
+  target_link_libraries(test_assets PRIVATE bw_audio bwa_core)
+  add_test(NAME assets COMMAND test_assets)
+  bwa_copy_runtime_dll(test_assets)
+
   # Deliberate MISUSE of the public ABI (NULLs, stale/recycled handles, wrong call order, boundary
   # and NaN arguments, cap exhaustion). Links the DLL, because misuse has to hit the real exported
   # entry points and their guards, not the internals.
@@ -363,6 +388,14 @@ if(BWA_BUILD_TESTS)
   target_link_libraries(test_abuse PRIVATE bw_audio)
   add_test(NAME abuse COMMAND test_abuse)
   bwa_copy_runtime_dll(test_abuse)
+
+  # Fill-then-apply source configuration (bwa_source_preset / _create_desc / _apply / _get_desc).
+  # Links the DLL, like test_abuse: the struct_size guard and the stale-handle drop are ABI
+  # contracts, so they have to be exercised through the real exported entry points.
+  add_executable(test_source_desc test/source_desc_test.c)
+  target_link_libraries(test_source_desc PRIVATE bw_audio)
+  add_test(NAME source_desc COMMAND test_source_desc)
+  bwa_copy_runtime_dll(test_source_desc)
 
   # Seeded random API call sequences. Deterministic per seed so a failure reproduces from its seed
   # alone; ctest runs a fixed set, and the binary takes --seed/--iters for longer local soaks.
@@ -462,7 +495,7 @@ if(BWA_BUILD_TESTS)
   # (the original reason this existed), plus the two that deliberately provoke the engine.
   option(BWA_ASAN "Build the lifetime/misuse tests with AddressSanitizer" OFF)
   if(BWA_ASAN AND MSVC)
-    foreach(t test_sound test_abuse test_fuzz_api)
+    foreach(t test_sound test_assets test_abuse test_fuzz_api)   # test_assets: refcounted unload + the loader thread's handoff
       target_compile_options(${t} PRIVATE /fsanitize=address)
       target_link_options(${t} PRIVATE /INCREMENTAL:NO)
     endforeach()

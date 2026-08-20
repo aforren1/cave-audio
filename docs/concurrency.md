@@ -59,6 +59,14 @@ thread never blocks on any of them:
 - **Streaming thread** (`stream.c`): decodes file chunks into per-stream SPSC
   rings. `mix_voice` drains them with `stream_pull`: pure ring reads, no I/O
   (see [`src/stream.h`](../src/stream.h)).
+- **Asset loader thread** (`assets.c`, started lazily by the first
+  `bwa_sound_acquire_async`): decodes and resamples a file off the control
+  thread. This one is the odd member of the list, because it does not publish
+  into the audio thread at all. It hands the finished buffer back to the
+  *control* thread through a result ring that `bwa_commit` drains, and the
+  control thread then writes the sound table it already owns. The audio thread
+  learns about the asset only through an ordinary `CMD_PLAY`, so the loader adds
+  no new audio-side channel and no new audio-side rule.
 
 One rule generalizes across all of these: the audio thread owns its state and
 *samples* published values. Publishers never touch audio-thread fields directly.
@@ -435,6 +443,36 @@ so the first block ramps up from silence. A fresh voice is already zero (create
 memset), so this only fades in a *replayed* slot that would otherwise reuse the
 prior solve's gains and click on the asset's first sample. Only
 `CMD_SRC_DESTROY` hard-cuts. A paused voice still reads as playing.
+
+### Async asset staging (held plays)
+
+`bwa_sound_acquire_async` returns a usable handle before the PCM exists, which
+sounds like it breaks the asset-memory rule. It does not, because the audio
+thread never sees the slot until the data is real. `rt_sound_reserve` takes a
+sound slot and leaves it empty. While a slot is reserved, no command may carry
+it: `CMD_PLAY`, `CMD_QUEUE`, and `CMD_SOUND_RETIRE` all refuse a pending handle,
+so the audio thread cannot hold a pointer into a slot the control thread is
+about to write.
+
+A play issued against a reserved slot is recorded on the control thread as a
+`HeldPlay` instead of being enqueued. When the loader thread returns the buffer,
+`bwa_commit` drains it, `rt_sound_publish` writes the slot, and only then does
+the held play go out as an ordinary `CMD_PLAY`. That command is the same
+release/acquire hand-off a synchronous load has always used, so the publish
+needs no barrier of its own and the mixer needs no new branch.
+
+A held play also carries the **kind** it was issued as, one byte per entry: point source, or bed
+(`rt_bed_play`). A reserved slot reports 0 channels, so the kind guards at the ABI boundary have
+nothing to compare against and the check has to run again at the publish. `rt_sound_publish` drops
+a held play whose asset landed as the other kind instead of binding it, and counts the drop in
+`rt_held_kind_drops`, which `bwa_commit` turns into a `bwa_last_error` notice. The engine layer
+refuses the mismatch at the play call itself, because the asset cache knows the load flags, so this
+is the backstop rather than the first line.
+
+Cancellation follows the voice, not the asset: `rt_source_stop`, `rt_stop_all`,
+a newer play on the same source, an unload, and source destroy or steal all drop
+a pending held play. `rt_group_stop` is the one gap, because a held play is not
+yet bound to a voice and so has no group to match against.
 
 ### Doppler delay rings
 

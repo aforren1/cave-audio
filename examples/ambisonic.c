@@ -13,6 +13,10 @@
  * train from the LEFT-UP, a low diffuse floor), plus the SAME field written in FuMa channel
  * order/normalization — the two loads must sound identical, which is the point of bwa_load_fuma.
  *
+ * The two loaders here are the EXPLICIT tier (you loaded it, you unload it). The shared tier
+ * spells the same two loads bwa_sound_acquire(path, BWA_LOAD_AMBIX) and BWA_LOAD_FUMA, which is
+ * how one file can be resident in more than one form at once; see bwa_convenience.
+ *
  * Runs anywhere: binaural profile, auto-picked 2-ch ASIO device, silent null-sink fallback
  * without one (bwa_get_audio_backend says which you got).
  *
@@ -117,13 +121,22 @@ static void ambix_to_fuma(const float* ambi, float* fuma, uint32_t frames) {
             fuma[(size_t)i * 16 + k] = ambi[(size_t)i * 16 + acn[k]] * s2f[k];
 }
 
+
+/* --tests: force the offline sink and cut the waits, so ctest runs this without a device. The
+ * CALLS are identical either way; only the listening time goes. */
+static int g_tests = 0;
+static int ticks(int n) { return g_tests ? (n < 8 ? 1 : n / 8) : n; }
+
 /* run `secs` of the demo loop: per-frame commit, like an engine tick */
 static void run(bwa_engine* e, double secs, const char* msg) {
     if (msg) printf("%s\n", msg);
-    for (int t = 0; t < (int)(secs * 60.0); ++t) { bwa_commit(e); Sleep(16); }
+    for (int t = 0; t < ticks((int)(secs * 60.0)); ++t) { bwa_commit(e); Sleep(16); }
 }
 
-int main(void) {
+int main(int argc, char** argv) {
+    for (int i = 1; i < argc; ++i)
+        if (!strcmp(argv[i], "--tests")) g_tests = 1;
+
     /* ---- synthesize the two variants of the same field ---- */
     printf("synthesizing a 3rd-order field (front bursts / left-up clicks / diffuse floor)...\n");
     float* ambi = (float*)malloc((size_t)FRAMES * 16 * sizeof(float));
@@ -140,6 +153,7 @@ int main(void) {
     cfg.profile     = BWA_PROFILE_BINAURAL;
     cfg.sample_rate = RATE;
     cfg.block_size  = 256;
+    if (g_tests) cfg.sink = BWA_SINK_NULL;   /* no device, deterministic */
     bwa_engine* e = bwa_create(&cfg);
     if (!e) { fprintf(stderr, "bwa_create failed\n"); return 1; }
     if (bwa_start(e) != 0) { fprintf(stderr, "bwa_start: %s\n", bwa_last_error(e)); bwa_destroy(e); return 1; }
@@ -158,7 +172,7 @@ int main(void) {
     run(e, 5, "1) matrix decode, world-locked: bursts FRONT, clicks LEFT-UP, a diffuse floor");
 
     printf("2) yaw: spinning the whole field (bwa_bed_set_orientation yaw glides, click-free)\n");
-    for (int t = 0; t < 8 * 60; ++t) {                 /* ~one slow turn over 8 s */
+    for (int t = 0; t < ticks(8 * 60); ++t) {                 /* ~one slow turn over 8 s */
         bwa_bed_set_orientation(e, bed, 0.8f * (float)t / 60.0f, 0.f, 0.f);
         bwa_commit(e); Sleep(16);
     }

@@ -30,6 +30,19 @@ namespace BwAudio
     public enum BwaSpreadMode : int { Lobe = 0, Mdap = 1, Spectral = 2 }
     public enum BwaBedRenderer : int { Matrix = 0, Parametric = 1 }
 
+    /// <summary>Mirrors bwa_load_flags: which loader the shared asset cache uses for a path. The cache
+    /// key is (path, flags), so the SAME file held in RAM and streamed are two different entries — which
+    /// is exactly the multi-key case a binding-side dictionary had to special-case. None = the in-memory
+    /// mono loader (bwa_load_sound). Combinations no loader can express (Ambix|Fuma, Stream with either)
+    /// are REFUSED with a message in bwa_last_error, never narrowed to one of them.</summary>
+    [Flags]
+    public enum BwaLoadFlags : uint { None = 0, Stream = 1 << 0, Ambix = 1 << 1, Fuma = 1 << 2 }
+
+    /// <summary>Mirrors bwa_source_kind: what a source IS, which is what bwa_source_preset fills a
+    /// complete BwaSourceDesc for. Nothing in the preset table is measured — a kind differs from
+    /// Default only where a doc already argues the case. See docs/api.md, "What each preset rests on".</summary>
+    public enum BwaSourceKind : int { Default = 0, Prop = 1, Voice = 2, Ambience = 3, Ui = 4 }
+
     /// <summary>Mirrors bwa_material_type: the engine's built-in acoustic materials, in ABI order
     /// (the value indexes the engine's coefficient table).</summary>
     public enum BwaMaterialPreset : int
@@ -141,6 +154,43 @@ namespace BwAudio
         public uint  reserved0, reserved1, reserved2;   // matches reserved[3]; keep zero
     }
 
+    /// <summary>Mirrors bwa_source_desc: every per-source CONFIGURATION knob in one struct, the same
+    /// fill-then-apply shape as Bwa.BwaTuning (which does it for the ENGINE knobs) and with the same
+    /// structSize guard for the same reason: THIS STRUCT'S ZERO IS NOT ITS DEFAULT (a zero-filled one
+    /// means gain 0 = silence and pitch 0 = invalid), so a zero-init mistake must fail loudly. NEVER
+    /// apply a default(BwaSourceDesc) — always start from Bwa.SourcePreset.
+    /// <para>What is deliberately OUT: position and orientation (per-frame, commit-gated, so they belong
+    /// to the frame loop), playback state (an apply must never restart a sound), and the manual-occlusion
+    /// LEVEL (a live per-frame value; the desc carries only the occlusion on/off).</para></summary>
+    [StructLayout(LayoutKind.Sequential)]
+    public struct BwaSourceDesc
+    {
+        public uint  structSize;        // set by Bwa.SourcePreset / bwa_source_get_desc; apply refuses a wrong one
+        public float gain;              // linear; 1 = unity
+        public float pitch;             // playback rate; 1 = native, clamped [0.25, 4]
+        public int   priority;          // steal priority 0..255; 128 = default
+        public uint  group;             // mix group 0..7
+        public float spread;            // angular width 0 = point .. 1 = wide
+        public float extentHeight;      // vertical extent 0..1 when >= 0 (spread is then the WIDTH); < 0 = isotropic
+        public float sizeMeters;        // metric radius (m); 0 = point
+        public float reverbSend;        // wet-send level; 1 = default
+        public float attenRefDist;      // distance-curve override: <= 0 = no override (the layout's curve)
+        public float attenRolloff;      // ... its exponent; 0 = constant level at any distance
+        public float attenMinGain;      // ... its floor, 0..1
+        public float directivityWeight; // 0 = omni (off) .. 0.5 = cardioid .. 1 = figure-8
+        public float directivityPower;  // ... lobe sharpness, >= 1; 1 = default
+        [MarshalAs(UnmanagedType.I1)] public bool doppler;
+        [MarshalAs(UnmanagedType.I1)] public bool airAbsorption;
+        [MarshalAs(UnmanagedType.I1)] public bool loudnessComp;
+        [MarshalAs(UnmanagedType.I1)] public bool proximity;
+        [MarshalAs(UnmanagedType.I1)] public bool occlusion;
+        [MarshalAs(UnmanagedType.I1)] public bool earlyReflections;
+        [MarshalAs(UnmanagedType.I1)] public bool reverb;
+        [MarshalAs(UnmanagedType.I1)] public bool reverbDistance;
+        [MarshalAs(UnmanagedType.I1)] public bool pathing;
+        public uint r0, r1, r2, r3;     // matches reserved[4]; keep zero
+    }
+
     /// <summary>Raw P/Invoke entry points — every BWA_API function in include/bw_audio.h except
     /// bwa_set_output_capture (an audio-thread callback) and bwa_render_block (the manual-sink
     /// golden-render path), which Unity never uses.</summary>
@@ -184,6 +234,30 @@ namespace BwAudio
         [DllImport(DLL, CallingConvention = CC)] public static extern ulong bwa_sound_get_frames(IntPtr e, uint snd);
         [DllImport(DLL, CallingConvention = CC)] public static extern uint  bwa_sound_get_channels(IntPtr e, uint snd);
 
+        // ---- shared-ownership asset cache (load time; file I/O) ----
+        // The by-path, refcounted tier over the same four loaders above: the key is (path, flags), the
+        // same key returns the SAME handle with one more reference, and the last release unloads through
+        // the retire-ack path (safe while playing). Engine.Load/LoadAmbix/LoadFuma ride this instead of a
+        // binding-side dictionary. Do NOT mix tiers on one handle: bwa_unload_sound on an acquired handle
+        // is refused, and so is bwa_sound_release on a handle the cache does not own.
+        [DllImport(DLL, CallingConvention = CC)] public static extern uint bwa_sound_acquire(IntPtr e, [MarshalAs(UnmanagedType.LPUTF8Str)] string path, BwaLoadFlags flags);
+        // Async twin: a usable handle IMMEDIATELY, decoded on the engine's loader thread. Play it at once —
+        // the source binds and stays SILENT until the data lands, then starts from the top. bwa_play_oneshot
+        // and bwa_source_queue REFUSE a not-ready handle (neither can be held), so check bwa_sound_is_ready
+        // before those two. BWA_LOAD_STREAM loads synchronously here.
+        [DllImport(DLL, CallingConvention = CC)] public static extern uint bwa_sound_acquire_async(IntPtr e, [MarshalAs(UnmanagedType.LPUTF8Str)] string path, BwaLoadFlags flags);
+        // Has the data landed? True for anything acquired synchronously; false for a handle the cache does
+        // not own. A decode that FAILED never becomes ready and puts its reason in bwa_last_error AT THIS
+        // CALL — that is the only way to tell "still decoding" (no error) from "failed" (an error). Calling
+        // it also adopts finished loads, as does bwa_commit.
+        [DllImport(DLL, CallingConvention = CC)] [return: MarshalAs(UnmanagedType.I1)] public static extern bool bwa_sound_is_ready(IntPtr e, uint snd);
+        [DllImport(DLL, CallingConvention = CC)] public static extern void bwa_sound_release(IntPtr e, uint snd);
+        // The handle for (path, flags) if the cache ALREADY holds it, else 0. Pure lookup: never loads,
+        // never takes a reference. Probe with THIS, not with bwa_sound_acquire, whose miss path loads the
+        // file (and loads it mono, so a bed would answer 1 channel). The handle is borrowed: do not
+        // release against it.
+        [DllImport(DLL, CallingConvention = CC)] public static extern uint bwa_sound_find(IntPtr e, [MarshalAs(UnmanagedType.LPUTF8Str)] string path, BwaLoadFlags flags);
+
         // ---- sources (per-frame; non-blocking) ----
         [DllImport(DLL, CallingConvention = CC)] public static extern uint bwa_source_create(IntPtr e);
         [DllImport(DLL, CallingConvention = CC)] public static extern void bwa_source_set_priority(IntPtr e, uint s, int priority);
@@ -199,6 +273,14 @@ namespace BwAudio
         [DllImport(DLL, CallingConvention = CC)] public static extern void bwa_source_set_group(IntPtr e, uint s, uint group);
         [DllImport(DLL, CallingConvention = CC)] public static extern void bwa_group_set_gain(IntPtr e, uint group, float linear);
         [DllImport(DLL, CallingConvention = CC)] public static extern void bwa_group_set_paused(IntPtr e, uint group, [MarshalAs(UnmanagedType.I1)] bool paused);
+        // Scene transitions. Both take the SAME click-free path as bwa_source_stop (one-block fade, then
+        // end), stop BEDS too, and drop each stopped voice's pending queue. Neither touches group gains,
+        // group pause, the global pause, or the master gain: a stop stops sound, it does not reset the
+        // mixer. Stopped source handles stay valid and re-playable. bwa_stop_all additionally drops the
+        // plays still waiting on an async decode; bwa_group_stop cannot (an unbound held play has no
+        // voice to read a group from).
+        [DllImport(DLL, CallingConvention = CC)] public static extern void bwa_group_stop(IntPtr e, uint group);
+        [DllImport(DLL, CallingConvention = CC)] public static extern void bwa_stop_all(IntPtr e);
         // Playback rate, clamped [0.25, 4] (glides across a block). In-memory sounds only — streams ignore it.
         [DllImport(DLL, CallingConvention = CC)] public static extern void bwa_source_set_pitch(IntPtr e, uint s, float rate);
         [DllImport(DLL, CallingConvention = CC)] public static extern void bwa_source_play(IntPtr e, uint s, uint snd, [MarshalAs(UnmanagedType.I1)] bool loop);
@@ -384,7 +466,7 @@ namespace BwAudio
         // values and struct layouts only WITHIN a major.minor, so a DLL with a different major.minor may
         // marshal every struct in this file wrong — silent corruption, not a crash. Bump this alongside
         // any re-sync with a header whose BWA_VERSION moved.
-        public const uint BoundVersion = (0u << 16) | (11u << 8) | 0u;   // 0.11.0
+        public const uint BoundVersion = (0u << 16) | (12u << 8) | 0u;   // 0.12.0
 
         /// <summary>A packed BWA_VERSION as "major.minor.patch", for logs.</summary>
         public static string VersionString(uint v) => (v >> 16) + "." + ((v >> 8) & 0xFF) + "." + (v & 0xFF);
@@ -493,6 +575,32 @@ namespace BwAudio
             [MarshalAs(UnmanagedType.I1)] public bool trackedAlign;
             public float alignDeadZoneM, alignSlewFramesPerSecond;
             public uint r0, r1, r2, r3;
+        }
+
+        // Source configuration. Same fill-then-apply shape as the engine tuning above, for a SOURCE:
+        // fill a BwaSourceDesc from a kind's preset, edit what you disagree with, apply it. NEVER apply a
+        // default(BwaSourceDesc) — its zero is not its default, which is what structSize makes fail loudly.
+        // The preset call is PURE (no engine handle), so it works in edit mode with nothing running.
+        [DllImport(DLL, CallingConvention = CC)] public static extern void bwa_source_preset(BwaSourceKind kind, out BwaSourceDesc outDesc);
+        [DllImport(DLL, CallingConvention = CC)] public static extern uint bwa_source_create_desc(IntPtr e, in BwaSourceDesc d);
+        // ONE ring command for the fifteen knobs the audio thread owns. Out-of-range FINITE values clamp
+        // exactly as the individual setters clamp them; NaN/Inf refuses the whole apply (false + an error).
+        // A stale handle is the usual silent no-op and still returns TRUE — the desc was valid, the source
+        // was not. earlyReflections with no room set leaves them off, says so in bwa_last_error, and still
+        // returns true (the rest of the configuration landed).
+        [DllImport(DLL, CallingConvention = CC)] [return: MarshalAs(UnmanagedType.I1)]
+        public static extern bool bwa_source_apply(IntPtr e, uint s, in BwaSourceDesc d);
+        // What the source is SET to (not what the sim is doing to it — that is bwa_source_get_occlusion /
+        // bwa_source_get_directivity). Fills structSize, so a readback hands straight back to apply.
+        [DllImport(DLL, CallingConvention = CC)] [return: MarshalAs(UnmanagedType.I1)]
+        public static extern bool bwa_source_get_desc(IntPtr e, uint s, out BwaSourceDesc outDesc);
+
+        /// <summary>A complete BwaSourceDesc for `kind` (with structSize filled). Pure: no engine, so it
+        /// works in edit mode. Start every desc here — the struct's zero is not its default.</summary>
+        public static BwaSourceDesc SourcePreset(BwaSourceKind kind)
+        {
+            bwa_source_preset(kind, out var d);
+            return d;
         }
 
         [DllImport(DLL, CallingConvention = CC)] public static extern void bwa_tuning_preset(BwaSetup setup, out BwaTuning outTuning);

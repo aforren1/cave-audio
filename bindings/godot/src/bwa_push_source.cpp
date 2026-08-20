@@ -9,7 +9,18 @@ using namespace godot;
 #define ENG (owner->handle())
 #define LIVE (owner && src && owner->is_running())
 
-bwa_source BwaPushSource::create_source() { return bwa_source_create_push(ENG); }
+/* The one mint with no desc form: bwa_source_create_desc always makes an ORDINARY source, and
+ * a push voice is a different creature. So create first, then apply the authored configuration
+ * as its own call - the handle is in hand, and the desc is the same one call either way. */
+bwa_source BwaPushSource::create_source() {
+	const bwa_source s = bwa_source_create_push(ENG);
+	if (s) {
+		bwa_source_desc d;
+		fill_desc(&d);
+		bwa_source_apply(ENG, s, &d);
+	}
+	return s;
+}
 
 int BwaPushSource::push(const PackedFloat32Array &frames) {
 	if (!LIVE || frames.is_empty()) {

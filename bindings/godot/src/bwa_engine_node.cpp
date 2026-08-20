@@ -180,7 +180,7 @@ void BwaEngine::_exit_tree() {
 	bwa_stop(eng);
 	bwa_destroy(eng);
 	eng = nullptr;
-	sounds.clear();
+	sounds.clear(); /* no releases: bwa_destroy took the whole cache with it */
 	/* Detach every source that outlives this engine, not just forget them: their `owner`
 	 * back-pointers would otherwise dangle, and the next setter call on such a source (from
 	 * a script, an animation, anywhere) would dereference a freed node. Exit order usually
@@ -376,69 +376,112 @@ BwaEngine::TrackerState BwaEngine::get_tracker_status() const {
 	return eng ? (TrackerState)bwa_tracker_status(eng) : TRACKER_DISCONNECTED;
 }
 
-/* --- assets (cached by path, so the same clip on many sources loads once) --- */
+/* --- assets ---------------------------------------------------------------------------
+ *
+ * The by-path cache moved INTO the core (bwa_sound_acquire / bwa_sound_release, keyed on
+ * (path, flags)), so this node no longer deduplicates and no longer counts references. What
+ * stays is a RECORD of the keys it acquired, and only because the public by-path calls have
+ * no ABI to lean on: bwa_sound_acquire cannot be used as a probe, because on a miss it
+ * LOADS - which is the hidden-decode bug the metadata getters were fixed for once already.
+ *
+ * The node holds exactly one reference per key for its own lifetime, which is the same
+ * ownership the old cache had: acquired on first use, released by unload_sound_path or with
+ * the engine. */
 
-bwa_sound BwaEngine::load_sound(const String &path, bool stream) {
+bwa_sound BwaEngine::acquire_sound(const String &path, uint32_t flags, bool async) {
 	if (!eng || path.is_empty()) {
 		return 0;
 	}
-	const String key = (stream ? String("s:") : String("m:")) + path;
-	if (bwa_sound *hit = sounds.getptr(key)) {
-		return *hit;
+	for (const HeldSound &h : sounds) {
+		if (h.flags == flags && h.path == path) {
+			return h.snd; /* our reference, already taken */
+		}
 	}
 	const CharString os = to_os_path(path).utf8();
-	const bwa_sound snd = stream ? bwa_load_sound_streaming(eng, os.get_data())
-								 : bwa_load_sound(eng, os.get_data());
+	const bwa_sound snd = async ? bwa_sound_acquire_async(eng, os.get_data(), flags)
+								: bwa_sound_acquire(eng, os.get_data(), flags);
 	if (!snd) {
 		UtilityFunctions::push_error(
 				vformat("BwaEngine: could not load \"%s\": %s", path, get_last_error()));
 		return 0;
 	}
-	sounds.insert(key, snd);
+	sounds.push_back({ path, flags, snd });
 	return snd;
 }
 
-bwa_sound BwaEngine::load_ambisonic(const String &path, bool fuma) {
-	if (!eng || path.is_empty()) {
-		return 0;
+bwa_sound BwaEngine::load_sound(const String &path, bool stream, bool async) {
+	return acquire_sound(path, stream ? (uint32_t)BWA_LOAD_STREAM : 0u, async);
+}
+
+bwa_sound BwaEngine::load_ambisonic(const String &path, bool fuma, bool async) {
+	return acquire_sound(path, fuma ? (uint32_t)BWA_LOAD_FUMA : (uint32_t)BWA_LOAD_AMBIX, async);
+}
+
+bool BwaEngine::preload_sound(const String &path, int flags) {
+	return acquire_sound(path, (uint32_t)flags, false) != 0;
+}
+
+bool BwaEngine::preload_sound_async(const String &path, int flags) {
+	return acquire_sound(path, (uint32_t)flags, true) != 0;
+}
+
+bool BwaEngine::sound_is_ready(const String &path, int flags) const {
+	if (!eng) {
+		return false;
 	}
-	const String key = (fuma ? String("f:") : String("a:")) + path;
-	if (bwa_sound *hit = sounds.getptr(key)) {
-		return *hit;
+	for (const HeldSound &h : sounds) {
+		if (h.flags == (uint32_t)flags && h.path == path) {
+			return bwa_sound_is_ready(eng, h.snd);
+		}
 	}
-	const CharString os = to_os_path(path).utf8();
-	const bwa_sound snd = fuma ? bwa_load_fuma(eng, os.get_data()) : bwa_load_ambix(eng, os.get_data());
-	if (!snd) {
-		UtilityFunctions::push_error(
-				vformat("BwaEngine: could not load soundfield \"%s\": %s", path, get_last_error()));
-		return 0;
+	return false; /* never acquired: nothing is on its way, so nothing is ready */
+}
+
+/* Still-decoding is NOT an error, so the ABI leaves bwa_last_error clear for it and sets it
+ * only when the load failed (or the handle is not the cache's). That is the whole difference
+ * between "wait" and "give up", and it is why bwa_sound_is_ready clears the error first. */
+int BwaEngine::sound_ready_state(bwa_sound snd) const {
+	if (!eng || !snd) {
+		return 1; /* nothing to wait for */
 	}
-	sounds.insert(key, snd);
-	return snd;
+	if (bwa_sound_is_ready(eng, snd)) {
+		return 1;
+	}
+	return bwa_last_error(eng) ? -1 : 0;
 }
 
 void BwaEngine::unload_sound_path(const String &path) {
 	if (!eng) {
 		return;
 	}
-	/* One path can be cached under several keys (memory vs streamed vs ambisonic); drop
-	 * every one, so "unload this file" means what it says. */
-	for (const String prefix : { String("m:"), String("s:"), String("a:"), String("f:") }) {
-		const String key = prefix + path;
-		if (bwa_sound *hit = sounds.getptr(key)) {
-			bwa_unload_sound(eng, *hit);
-			sounds.erase(key);
+	/* One path can be held under several flag sets (memory vs streamed vs ambisonic), so drop
+	 * every one and "unload this file" means what it says. The engine frees on the LAST
+	 * reference, so another holder keeps the asset alive - which is the point of the tier. */
+	for (size_t i = sounds.size(); i-- > 0;) {
+		if (sounds[i].path == path) {
+			bwa_sound_release(eng, sounds[i].snd);
+			sounds.erase(sounds.begin() + (ptrdiff_t)i);
 		}
 	}
 }
 
-/* One path can be cached under several keys (memory / streamed / ambisonic); metadata must
- * answer for whichever form was actually loaded, in the order a multi-role path would want:
- * the point-source copies first, then the bed ones. */
+/* Metadata must answer for whichever form was actually loaded, in the order a multi-role path
+ * would want: the point-source copies first, then the bed ones. */
+/* Asks the ENGINE's cache, not our own record: bwa_sound_find is a pure lookup that never loads
+ * and never takes a reference, so it answers for anything resident, including a path acquired
+ * through the C ABI directly rather than through this node. Probing with bwa_sound_acquire would
+ * LOAD on a miss, which is the hidden decode the getters below exist to avoid. The order is the
+ * one a multi-role path wants: the point-source forms first, then the bed ones. */
 bwa_sound BwaEngine::find_loaded_sound(const String &path) const {
-	for (const String prefix : { String("m:"), String("s:"), String("a:"), String("f:") }) {
-		if (const bwa_sound *hit = sounds.getptr(prefix + path)) {
-			return *hit;
+	if (!eng || path.is_empty()) {
+		return 0;
+	}
+	const CharString os = to_os_path(path).utf8();
+	const uint32_t order[4] = { 0u, (uint32_t)BWA_LOAD_STREAM, (uint32_t)BWA_LOAD_AMBIX,
+		(uint32_t)BWA_LOAD_FUMA };
+	for (uint32_t flags : order) {
+		if (const bwa_sound snd = bwa_sound_find(eng, os.get_data(), flags)) {
+			return snd;
 		}
 	}
 	return 0;
@@ -502,6 +545,32 @@ void BwaEngine::group_set_gain(int group, float linear) {
 void BwaEngine::group_set_paused(int group, bool p) {
 	if (eng) {
 		bwa_group_set_paused(eng, (uint32_t)group, p);
+	}
+}
+
+/* The scene transition. The core does the stopping; the loop is only there to tell the
+ * sources, because an emitter that is not told reads the voice going quiet as a natural end
+ * and announces `finished` - and a scene change is the one moment every emitter would do it
+ * at once. Same rule as BwaEmitter::stop(): an explicit halt is not an end. */
+void BwaEngine::group_stop(int group) {
+	if (!eng) {
+		return;
+	}
+	bwa_group_stop(eng, (uint32_t)group);
+	for (BwaSource *s : sources) {
+		if (s->get_group() == group) {
+			s->on_stopped_externally();
+		}
+	}
+}
+
+void BwaEngine::stop_all() {
+	if (!eng) {
+		return;
+	}
+	bwa_stop_all(eng);
+	for (BwaSource *s : sources) {
+		s->on_stopped_externally();
 	}
 }
 
@@ -1175,11 +1244,19 @@ void BwaEngine::_bind_methods() {
 	M(sound_get_frames, "path");
 	M(sound_get_channels, "path");
 	M(play_oneshot, "path", "position", "gain");
+	/* flags defaults to LOAD_MEMORY, which is the case nearly every caller wants. */
+	ClassDB::bind_method(D_METHOD("preload_sound", "path", "flags"), &BwaEngine::preload_sound,
+			DEFVAL(0));
+	ClassDB::bind_method(D_METHOD("preload_sound_async", "path", "flags"),
+			&BwaEngine::preload_sound_async, DEFVAL(0));
+	ClassDB::bind_method(
+			D_METHOD("sound_is_ready", "path", "flags"), &BwaEngine::sound_is_ready, DEFVAL(0));
 
 	M(set_master_gain, "linear"); M0(get_master_gain);
 	M(set_paused, "paused"); M0(get_paused);
 	M(group_set_gain, "group", "linear");
 	M(group_set_paused, "group", "paused");
+	M(group_stop, "group"); M0(stop_all);
 	M(reverb_set_gain, "linear"); M0(get_reverb_gain);
 	M(early_reflections_set_gain, "linear"); M0(get_early_reflections_gain);
 	M(fdn_set_decay, "rt60_low_s", "rt60_high_s", "xover_hz");
@@ -1388,4 +1465,6 @@ void BwaEngine::_bind_methods() {
 	BIND_ENUM_CONSTANT(MAT_METAL); BIND_ENUM_CONSTANT(MAT_ROCK);
 	BIND_ENUM_CONSTANT(TRACKER_DISCONNECTED); BIND_ENUM_CONSTANT(TRACKER_NO_DATA);
 	BIND_ENUM_CONSTANT(TRACKER_NO_BODY); BIND_ENUM_CONSTANT(TRACKER_LIVE);
+	BIND_BITFIELD_FLAG(LOAD_MEMORY); BIND_BITFIELD_FLAG(LOAD_STREAM);
+	BIND_BITFIELD_FLAG(LOAD_AMBIX); BIND_BITFIELD_FLAG(LOAD_FUMA);
 }

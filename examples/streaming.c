@@ -19,6 +19,10 @@
  *     ring drains; create a new one to restart;
  *   - protect a music stream from voice-stealing with priority 255.
  *
+ * The stream load here is the EXPLICIT tier. bwa_sound_acquire(path, BWA_LOAD_STREAM) is the same
+ * load through the shared cache, where the streamed form and an in-RAM copy of one file are two
+ * entries rather than a collision; see bwa_convenience.
+ *
  * Runs anywhere (binaural profile; silent null-sink fallback without an ASIO device).
  *
  *   bwa_streaming
@@ -31,6 +35,12 @@
 #include <windows.h>
 
 #define RATE 48000u
+
+
+/* --tests: force the offline sink and cut the waits, so ctest runs this without a device. The
+ * CALLS are identical either way; only the listening time goes. */
+static int g_tests = 0;
+static int ticks(int n) { return g_tests ? (n < 8 ? 1 : n / 8) : n; }
 
 /* -- scaffolding: write a 20 s "music" wav (16-bit PCM mono) so the example ships no assets.
  *    A pentatonic arpeggio with a soft envelope — long enough that streaming it matters. -- */
@@ -60,13 +70,17 @@ static int write_music(const char* path, uint32_t secs) {
     return 1;
 }
 
-int main(void) {
+int main(int argc, char** argv) {
+    for (int i = 1; i < argc; ++i)
+        if (!strcmp(argv[i], "--tests")) g_tests = 1;
+
     if (!write_music("bwa_demo_music.wav", 20)) { fprintf(stderr, "cannot write demo wav\n"); return 1; }
 
     bwa_desc cfg = { 0 };
     cfg.profile     = BWA_PROFILE_BINAURAL;
     cfg.sample_rate = RATE;                     /* streamed files must match this rate */
     cfg.block_size  = 256;
+    if (g_tests) cfg.sink = BWA_SINK_NULL;   /* no device, deterministic */
     bwa_engine* e = bwa_create(&cfg);
     if (!e) { fprintf(stderr, "bwa_create failed\n"); return 1; }
     if (bwa_start(e) != 0) { fprintf(stderr, "bwa_start: %s\n", bwa_last_error(e)); bwa_destroy(e); return 1; }
@@ -83,7 +97,7 @@ int main(void) {
     bwa_source_set_priority(e, s1, 255);        /* music: never let an SFX overload steal this voice */
     bwa_source_set_gain(e, s1, 0.9f);
     bwa_source_play(e, s1, music, false);       /* the streaming thread re-seeks + fills the ring now */
-    for (int t = 0; t < 8 * 60; ++t) {
+    for (int t = 0; t < ticks(8 * 60); ++t) {
         float a = 6.2831853f * t / (5.0f * 60.0f);
         bwa_source_set_pos(e, s1, 2.0f * cosf(a), 1.5f, 2.0f * sinf(a));
         bwa_set_listener_pose(e, 0.f, 1.5f, 0.f, 0.f, 0.f, 0.f, 1.f);

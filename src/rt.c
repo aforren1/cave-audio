@@ -280,7 +280,26 @@ typedef struct {
     uint16_t  gen;
     uint8_t   inuse;
     uint8_t   retiring;                     /* unload requested; awaiting EVT_SOUND_RETIRED ack */
+    uint8_t   pending;                      /* RESERVED for an async load: the handle is live but
+                                             * `data` is still empty, so no bind may reference it
+                                             * (rt_sound_reserve / rt_sound_publish) */
 } SoundSlot;
+
+/* A play issued against a still-reserved (async) sound. Held on the CONTROL thread and re-issued
+ * by rt_sound_publish once the slot carries real PCM — the audio thread never sees a half-written
+ * slot because it never sees the slot at all until the publish. Fixed capacity: this is a
+ * mid-session convenience, not a queue anything should depend on at depth. */
+#define BWA_ASYNC_HOLD 32
+typedef struct {
+    uint32_t src, snd;
+    uint64_t start, loop_beg, loop_end;
+    uint8_t  loop;
+    uint8_t  bed;                           /* the KIND this play was issued as: 1 = bed (rt_bed_play),
+                                             * 0 = point source. A pending slot reports 0 channels, so
+                                             * the caller's kind cannot be checked against the asset
+                                             * until the publish — this byte is what it is checked
+                                             * against there (it fits the struct's existing padding) */
+} HeldPlay;
 
 struct RtCore {
     uint32_t voice_cap, channels, sample_rate;
@@ -341,6 +360,14 @@ struct RtCore {
                                              * internal (the user never saw it), so nobody else can retry — dropping
                                              * it would leak the slot + a push stream's ring for the engine's life. */
     uint32_t  retire_parked;
+    /* Plays issued against a sound whose async decode has not landed yet (control thread only;
+     * see HeldPlay). Fixed array, linear scan: it is empty except while an async load is in
+     * flight, and a source can hold at most one entry. */
+    HeldPlay  held[BWA_ASYNC_HOLD];
+    uint32_t  held_n;
+    uint64_t  held_kind_drops;              /* held plays rt_sound_publish refused because the decoded
+                                             * asset turned out to be the other KIND (control thread;
+                                             * engine.c turns each new one into a bwa_last_error notice) */
     /* Voice-ended handles held for rt_poll_ended (control thread). drain_events already sees every
      * EVT_VOICE_ENDED and recycles the slot; without this they were discarded, so every client
      * rebuilt completion detection out of is_playing polling. Fixed ring, drop-OLDEST on overflow:
@@ -708,6 +735,7 @@ static uint32_t salloc_sound(RtCore* c) {
     c->sounds[idx].gen = g;
     c->sounds[idx].inuse = 1;
     c->sounds[idx].retiring = 0;
+    c->sounds[idx].pending  = 0;
     return BWA_MK_H(idx, g);
 }
 
@@ -715,8 +743,30 @@ static void srecycle_sound(RtCore* c, uint16_t idx) {
     if (idx < c->sound_cap && c->sounds[idx].inuse) {
         c->sounds[idx].inuse = 0;
         c->sounds[idx].retiring = 0;
+        c->sounds[idx].pending  = 0;   /* a reserved slot that was abandoned must not come back pending */
         c->sfreelist[c->sfree_count++] = idx;
     }
+}
+
+/* ---- held plays (control thread; see HeldPlay). Swap-remove, so order is not preserved: nothing
+ * depends on it, a source can only hold one entry and each entry fires at most once. ---- */
+static void held_drop_src(RtCore* c, uint32_t src) {
+    for (uint32_t i = 0; i < c->held_n; )
+        if (c->held[i].src == src) c->held[i] = c->held[--c->held_n];
+        else ++i;
+}
+static void held_drop_snd(RtCore* c, uint32_t snd) {
+    for (uint32_t i = 0; i < c->held_n; )
+        if (c->held[i].snd == snd) c->held[i] = c->held[--c->held_n];
+        else ++i;
+}
+static void held_add(RtCore* c, uint32_t src, uint32_t snd, bool loop,
+                     uint64_t start, uint64_t loop_beg, uint64_t loop_end, bool bed) {
+    if (c->held_n >= BWA_ASYNC_HOLD) return;   /* full: the play is simply dropped, like a full command ring */
+    HeldPlay* p = &c->held[c->held_n++];
+    p->src = src; p->snd = snd; p->loop = loop ? 1u : 0u;
+    p->start = start; p->loop_beg = loop_beg; p->loop_end = loop_end;
+    p->bed = bed ? 1u : 0u;                    /* re-checked against the real channel count at publish */
 }
 
 /* control-thread resolve: the slot iff the handle is its current occupant */
@@ -921,6 +971,53 @@ static void dop_line_reset(RtCore* c, Voice* v, uint16_t idx) {
     memset(c->dop_ring + (size_t)idx * c->dop_ringlen, 0, (size_t)c->dop_ringlen * sizeof(float));
 }
 
+/* Begin ONE voice's click-free stop — the CMD_STOP body, reused by the group/global sweeps
+ * (CMD_GROUP_STOP / CMD_STOP_ALL). Fades the gate to 0 over one block; pause_gate finalizes.
+ * Never downgrades a steal-in-progress (2), which must still free its slot.
+ * The sweeps additionally drop the pending chain: CMD_STOP can leave it (the mix seam's !stopping
+ * guard suppresses chaining anyway, and the next CMD_PLAY clears it), but a scene transition is a
+ * one-shot gesture with no later play to do the clearing, so it must not leave a queue behind that
+ * a re-play of the same handle would inherit. Audio thread, bounded, no allocation. */
+static void voice_begin_stop(Voice* v) {
+    if (!v->playing || v->stopping == 2) return;
+    v->stopping = 1;
+    v->stop_sched = false;                     /* a pending scheduled stop is moot now */
+    for (uint32_t k = 0; k < BWA_QUEUE; ++k) v->queue[k] = NULL;
+    v->queue_head = v->queue_len = 0;
+}
+
+/* ---- shared per-voice flag transitions -------------------------------------------------------
+ * Three of the per-voice enables are NOT plain flags: each edge carries state work (clear a
+ * recycled slot's delay ring, reset a Doppler line, ring the reflections/pathing out instead of
+ * cutting them). CMD_SRC_CFG applies the same knobs as the single-knob commands, so both paths go
+ * through these helpers rather than keeping two copies that can drift apart. */
+static void ism_set(RtCore* c, Voice* v, uint16_t idx, bool on) {
+    if (on && !v->ism_on && c->ism_ring) {   /* fresh enable: a clean ring (a recycled slot must
+                                              * never replay the previous occupant), zeroed filter
+                                              * state, gains from 0 (the reflections fade in), and
+                                              * delays snapped on the first render (ism_init) */
+        memset(c->ism_ring + (size_t)idx * c->ism_ringlen, 0, sizeof(float) * c->ism_ringlen);
+        memset(v->ism_g,  0, sizeof v->ism_g);
+        memset(v->ism_lp, 0, sizeof v->ism_lp);
+        v->ism_w = 0; v->ism_init = true;
+    }
+    if (!on && v->ism_on) v->ism_tail = 1;   /* ramp the reflections out over one block */
+    v->ism_on = on;
+}
+static void dop_set(RtCore* c, Voice* v, uint16_t idx, bool on) {
+    if (on && !v->dop_on) dop_line_reset(c, v, idx);   /* fresh enable */
+    v->dop_on = on;
+}
+static void path_set(Voice* v, bool on) {
+    v->path_on = on;
+    if (!on) {                                          /* clean restart: zero the ramp + flatten the EQ */
+        for (int k = 0; k < BWA_AMBI_CH; ++k) v->path_sh_cur[k] = 0.f;
+        v->path_eq.engaged = 0;
+        for (int b = 0; b < 3; ++b) { v->path_eq.g_cur[b] = 1.f;
+            v->path_eq.x1[b] = v->path_eq.x2[b] = v->path_eq.y1[b] = v->path_eq.y2[b] = 0.f; }
+    }
+}
+
 static void drain_commands(RtCore* c) {
     CmdRing* r = &c->cmds;
     uint32_t rd = atomic_load_explicit(&r->read,  memory_order_relaxed);
@@ -1000,6 +1097,22 @@ static void drain_commands(RtCore* c) {
             uint8_t id = cmd->u.gpause.id;
             if (id < BWA_GROUPS) c->group_paused[id] = cmd->u.gpause.on;   /* pause_gate ramps/freezes */
             } break;
+        case CMD_GROUP_STOP: {
+            /* Same sweep shape as CMD_GROUP_GAIN, but the members STOP instead of re-solving: each
+             * takes rt_source_stop's one-block fade, so a category-wide stop is as click-free as a
+             * single one. Bounded by voice_cap, no allocation — invariant 1 holds. */
+            uint8_t id = cmd->u.group.id;
+            if (id < BWA_GROUPS)
+                for (uint32_t i = 0; i < c->voice_cap; ++i)
+                    if (c->voices[i].active && c->voices[i].group == id) voice_begin_stop(&c->voices[i]);
+            } break;
+        case CMD_STOP_ALL:
+            /* The scene transition: every voice, whatever its group. Beds are voices, so they stop
+             * here too. Group gains, group/global pause and the master gain are deliberately left
+             * alone — this stops sound, it does not reset the mixer. */
+            for (uint32_t i = 0; i < c->voice_cap; ++i)
+                if (c->voices[i].active) voice_begin_stop(&c->voices[i]);
+            break;
         case CMD_SET_PITCH: { Voice* v = voice_for(c, cmd->handle);
             if (v && isfinite(cmd->u.pitch.rate)) {   /* NaN passes a two-sided clamp and sticks forever */
                      float r2 = cmd->u.pitch.rate;
@@ -1008,21 +1121,7 @@ static void drain_commands(RtCore* c) {
             if (v) { v->yaw = cmd->u.brot.yaw; v->bpitch = cmd->u.brot.pitch;
                      v->broll = cmd->u.brot.roll; } } break;              /* mix_bed glides toward them */
         case CMD_SET_ISM: { Voice* v = voice_for(c, cmd->handle);
-            if (v) {
-                const bool on = cmd->u.ism.on != 0;
-                if (on && !v->ism_on && c->ism_ring) {   /* fresh enable: a clean ring (a recycled slot must
-                                                          * never replay the previous occupant), zeroed filter
-                                                          * state, gains from 0 (the reflections fade in), and
-                                                          * delays snapped on the first render (ism_init) */
-                    memset(c->ism_ring + (size_t)BWA_H_IDX(cmd->handle) * c->ism_ringlen, 0,
-                           sizeof(float) * c->ism_ringlen);
-                    memset(v->ism_g, 0, sizeof v->ism_g);
-                    memset(v->ism_lp, 0, sizeof v->ism_lp);
-                    v->ism_w = 0; v->ism_init = true;
-                }
-                if (!on && v->ism_on) v->ism_tail = 1;   /* ramp the reflections out over one block */
-                v->ism_on = on;
-            } } break;
+            if (v) ism_set(c, v, BWA_H_IDX(cmd->handle), cmd->u.ism.on != 0); } break;
         case CMD_PLAY: { Voice* v = voice_for(c, cmd->handle);
             const SoundData* s = sound_for(c, cmd->u.play.sound);
             if (v && s) {
@@ -1060,7 +1159,16 @@ static void drain_commands(RtCore* c) {
                           v->re_mix   = (!c->direct_on &&                                                       /* (beds) likewise; direct mode
                                                                                                                  * never engages the taper */
                                          atomic_load_explicit(&c->max_re, memory_order_relaxed)) ? 1.f : 0.f;
-                          v->paused = false; v->pause_g = 1.f; v->seek_pending = 0; v->stopping = 0;   /* play always starts running */
+                          v->paused = false; v->pause_g = 1.f; v->seek_pending = 0;
+                          /* Play always starts running, EXCEPT that it must not downgrade a
+                           * steal-in-progress (2) - the same rule CMD_STOP follows below. A steal
+                           * has already handed the caller a replacement handle on a reserve slot
+                           * and is counting on this voice to fade, free, and ack. Resurrecting it
+                           * cancels that ack, so stealing[] stays set and the source can never be
+                           * stolen again while it lives, leaving the pool a slot short. A client
+                           * playing a mid-steal handle could always reach this; rt_sound_publish
+                           * made the engine able to do it to itself, at a decode's timing. */
+                          if (v->stopping != 2) v->stopping = 0;
                           if (v->dop_on) dop_line_reset(c, v, BWA_H_IDX(cmd->handle)); } } break;
         case CMD_STOP: { Voice* v = voice_for(c, cmd->handle);
             /* Fade the gate to 0 over one block, then finalize (playing=false) in pause_gate — a
@@ -1105,21 +1213,13 @@ static void drain_commands(RtCore* c) {
         case CMD_SET_REFLECTIONS: { Voice* v = voice_for(c, cmd->handle);
             if (v) v->refl_send = cmd->u.refl.on != 0; } break;
         case CMD_SET_PATHING: { Voice* v = voice_for(c, cmd->handle);
-            if (v) { v->path_on = cmd->u.path.on != 0;
-                     if (!v->path_on) {                          /* clean restart: zero the ramp + flatten the EQ */
-                         for (int k = 0; k < BWA_AMBI_CH; ++k) v->path_sh_cur[k] = 0.f;
-                         v->path_eq.engaged = 0;
-                         for (int b = 0; b < 3; ++b) { v->path_eq.g_cur[b] = 1.f;
-                             v->path_eq.x1[b]=v->path_eq.x2[b]=v->path_eq.y1[b]=v->path_eq.y2[b]=0.f; } } } } break;
+            if (v) path_set(v, cmd->u.path.on != 0); } break;
         case CMD_SET_REFL_SEND: { Voice* v = voice_for(c, cmd->handle);
             if (v) { float g = cmd->u.rsend.gain; v->refl_gain = !(g > 0.f) ? 0.f : g; } } break;   /* NaN-safe */
         case CMD_SET_REFL_DIST: { Voice* v = voice_for(c, cmd->handle);
             if (v) v->refl_dist = cmd->u.rdist.on != 0; } break;
         case CMD_SET_DOPPLER: { Voice* v = voice_for(c, cmd->handle);
-            if (v) {
-                if (cmd->u.dop.on && !v->dop_on) dop_line_reset(c, v, BWA_H_IDX(cmd->handle));  /* fresh enable */
-                v->dop_on = cmd->u.dop.on != 0;
-            } } break;
+            if (v) dop_set(c, v, BWA_H_IDX(cmd->handle), cmd->u.dop.on != 0); } break;
         case CMD_SET_AIR: { Voice* v = voice_for(c, cmd->handle);
             if (v) v->air_on = cmd->u.air.on != 0; } break;
         case CMD_SET_LDC: { Voice* v = voice_for(c, cmd->handle);
@@ -1133,6 +1233,36 @@ static void drain_commands(RtCore* c) {
                                                      * drop the readback here or rt_get_directivity
                                                      * would report the last dipole gain forever */
                          atomic_store_explicit(&c->dir_pub[BWA_H_IDX(cmd->handle)], 0u, memory_order_relaxed); } } break;
+        /* One command, every ring-carried per-source knob (bwa_source_apply). rt_source_apply_cfg
+         * already sanitized the payload on the control thread with the SAME guards the single-knob
+         * setters use, so this handler only stores — and it routes the three stateful enables
+         * through ism_set/dop_set/path_set so the two paths cannot drift. Latest-wins against the
+         * single-knob commands: they share one ring, so program order IS apply order. */
+        case CMD_SRC_CFG: { Voice* v = voice_for(c, cmd->handle);
+            if (v) {
+                const uint16_t idx = BWA_H_IDX(cmd->handle);
+                const uint8_t  f   = cmd->u.cfg.flags;
+                v->gain_user = cmd->u.cfg.gain;
+                v->fade_rate = 0.f; v->fade_stop = 0;    /* an explicit set cancels a fade (CMD_SET_GAIN) */
+                v->pitch     = cmd->u.cfg.pitch;
+                v->group     = cmd->u.cfg.group;
+                v->spread    = cmd->u.cfg.spread;
+                v->spread_h  = cmd->u.cfg.extent_h;
+                v->size_m    = cmd->u.cfg.size_m;
+                v->refl_gain = cmd->u.cfg.rsend;
+                v->att_ref   = cmd->u.cfg.aref;          /* 0 = no override (back to the layout curve) */
+                v->att_rolloff = cmd->u.cfg.aroll;
+                v->att_min   = cmd->u.cfg.amin;
+                v->air_on    = (f & BWA_CFG_AIR)    != 0;
+                v->ldc_on    = (f & BWA_CFG_LDC)    != 0;
+                v->nf_on     = (f & BWA_CFG_NF)     != 0;
+                v->refl_send = (f & BWA_CFG_REVERB) != 0;
+                v->refl_dist = (f & BWA_CFG_RDIST)  != 0;
+                dop_set (c, v, idx, (f & BWA_CFG_DOPPLER) != 0);
+                ism_set (c, v, idx, (f & BWA_CFG_ISM)     != 0);
+                path_set(v,         (f & BWA_CFG_PATH)    != 0);
+                v->dirty = true;                         /* gain/group/spread/size/atten all re-solve */
+            } } break;
         case CMD_SET_ATTEN: { Voice* v = voice_for(c, cmd->handle);
             if (v) {
                 float ref = cmd->u.atten.ref;
@@ -1728,7 +1858,12 @@ static int pause_gate(RtCore* c, Voice* v, uint16_t idx, uint32_t n, float* pg, 
     if (v->pause_g == 0.f && tgt == 0.f) {
         if (v->stopping) {                           /* faded to silence: finalize the stop/steal */
             uint8_t how = v->stopping; v->stopping = 0; v->playing = false;
-            if (how == 2) {                          /* steal: free the slot (control thread recycles on the ack) */
+            /* Free the slot for a steal (2), and for ANY stopped oneshot. A oneshot's handle is
+             * engine-internal (bwa_play_oneshot returns nothing), so only an EVT_VOICE_ENDED ever
+             * recycles it — the natural-end path does exactly this. Before bwa_group_stop /
+             * bwa_stop_all no public call could stop one, so how == 1 on a oneshot was unreachable;
+             * the voice-table sweeps reach it, and without this the slot would leak forever. */
+            if (how == 2 || v->oneshot) {
                 v->active = false;
                 Evt ev = { .type = EVT_VOICE_ENDED, .handle = BWA_MK_H(idx, v->gen) };
                 evt_push(&c->events, &ev);
@@ -3712,6 +3847,33 @@ void rt_group_set_paused(RtCore* c, uint32_t group, bool paused) {
     cmd_push(&c->cmds, &cmd);
 }
 
+/* Stop a whole mix group / everything: ONE command each, the sweep runs on the audio thread (which
+ * owns the voice table and the per-voice group id — the control side never sees either). Every
+ * member takes the same click-free one-block fade rt_source_stop uses. Out-of-range group ignored,
+ * matching rt_group_set_gain / rt_group_set_paused.
+ * NOT the same as looping rt_source_stop over your handles: that one also ENDS a push source's feed
+ * ring, which needs the control-side handle these sweeps do not have. A push voice stops here; its
+ * ring stays open (rt_source_push_end). */
+void rt_group_stop(RtCore* c, uint32_t group) {
+    if (!c || group >= BWA_GROUPS) return;
+    Cmd cmd = { .type = CMD_GROUP_STOP, .handle = 0 };
+    cmd.u.group.id = (uint8_t)group;
+    cmd_push(&c->cmds, &cmd);
+}
+
+void rt_stop_all(RtCore* c) {
+    if (!c) return;
+    /* Push FIRST, then drop the held plays: on a momentarily full ring the stop never reaches the
+     * audio thread, and clearing first would leave a half-effect (voices still playing, but the
+     * pending plays silently gone) with no way for the caller to tell. Same rollback discipline as
+     * rt_source_destroy / rt_unload_sound. */
+    Cmd cmd = { .type = CMD_STOP_ALL, .handle = 0 };
+    if (!cmd_push(&c->cmds, &cmd)) return;
+    c->held_n = 0;      /* "stop everything" includes the plays still waiting on an async decode,
+                         * or they would start by themselves the moment their data lands. A GROUP
+                         * stop cannot do this: an unbound held play has no voice to read a group from. */
+}
+
 void rt_source_set_spread(RtCore* c, uint32_t h, float amount) {
     if (!isfinite(amount)) return;
     Cmd cmd = { .type = CMD_SET_SPREAD, .handle = h };
@@ -3742,6 +3904,68 @@ void rt_source_set_extent(RtCore* c, uint32_t h, float w, float hgt) {
     cmd_push(&c->cmds, &cmd);
 }
 
+/* Every ring-carried per-source knob in ONE command (bwa_source_apply). Fourteen single-knob
+ * commands per spawn is real ring pressure — bwa_play_oneshot already documents dropping when the
+ * ring is momentarily full — so a struct apply costs one slot, not fifteen.
+ *
+ * Sanitizing is the point of this half: the payload lands on the audio thread verbatim, so every
+ * field takes the SAME control-thread guard its individual setter applies (isfinite first, then the
+ * range clamp). A single-knob setter can afford to DROP a bad value, because dropping loses one
+ * knob; dropping here would lose the whole configuration, so out-of-range values clamp to the
+ * documented range instead. engine.c refuses a non-finite desc at the ABI boundary before it ever
+ * reaches this — these guards are the backstop, not the diagnosis. */
+void rt_source_apply_cfg(RtCore* c, uint32_t h, const RtSrcCfg* cfg) {
+    if (!c || !cfg) return;
+    Cmd cmd = { .type = CMD_SRC_CFG, .handle = h };
+
+    float g = cfg->gain;
+    if (!isfinite(g) || g < 0.f) g = 0.f; else if (g > BWA_MAX_GAIN) g = BWA_MAX_GAIN;
+    cmd.u.cfg.gain = g;
+
+    float p = cfg->pitch;
+    if (!isfinite(p)) p = 1.f;                 /* NaN passes a two-sided clamp and sticks forever */
+    cmd.u.cfg.pitch = p < 0.25f ? 0.25f : (p > 4.f ? 4.f : p);
+
+    float s = cfg->spread;
+    if (!isfinite(s) || s < 0.f) s = 0.f; else if (s > 1.f) s = 1.f;
+    cmd.u.cfg.spread = s;
+
+    float eh = cfg->extent_h;
+    if (!isfinite(eh) || eh < 0.f) eh = -1.f;  /* < 0 = isotropic (the width covers both axes) */
+    else if (eh > 1.f) eh = 1.f;
+    cmd.u.cfg.extent_h = eh;
+
+    float rad = cfg->size_m;
+    if (!isfinite(rad) || rad < 0.f) rad = 0.f;
+    cmd.u.cfg.size_m = rad;
+
+    float rs = cfg->reverb_send;
+    if (!isfinite(rs) || rs < 0.f) rs = 0.f; else if (rs > BWA_MAX_GAIN) rs = BWA_MAX_GAIN;
+    cmd.u.cfg.rsend = rs;
+
+    /* the attenuation override travels as a unit: a ref that does not enable it zeroes the rest, so
+     * the audio thread never holds a half-set curve */
+    float ar = cfg->atten_ref;
+    if (!isfinite(ar) || ar <= 0.f) { cmd.u.cfg.aref = 0.f; cmd.u.cfg.aroll = 0.f; cmd.u.cfg.amin = 0.f; }
+    else {
+        float ro = cfg->atten_rolloff, mn = cfg->atten_min;
+        if (!isfinite(ro) || ro < 0.f) ro = 0.f;
+        if (!isfinite(mn) || mn < 0.f) mn = 0.f; else if (mn > 1.f) mn = 1.f;
+        cmd.u.cfg.aref = ar; cmd.u.cfg.aroll = ro; cmd.u.cfg.amin = mn;
+    }
+
+    cmd.u.cfg.group = cfg->group < BWA_GROUPS ? (uint8_t)cfg->group : 0u;
+    cmd.u.cfg.flags = (uint8_t)((cfg->doppler           ? BWA_CFG_DOPPLER : 0u) |
+                                (cfg->air               ? BWA_CFG_AIR     : 0u) |
+                                (cfg->loudness_comp     ? BWA_CFG_LDC     : 0u) |
+                                (cfg->proximity         ? BWA_CFG_NF      : 0u) |
+                                (cfg->early_reflections ? BWA_CFG_ISM     : 0u) |
+                                (cfg->reverb            ? BWA_CFG_REVERB  : 0u) |
+                                (cfg->reverb_distance   ? BWA_CFG_RDIST   : 0u) |
+                                (cfg->pathing           ? BWA_CFG_PATH    : 0u));
+    cmd_push(&c->cmds, &cmd);
+}
+
 void rt_test_signal(RtCore* c, uint32_t channel, uint8_t kind, float gain) {
     if (!c) return;
     if (!isfinite(gain)) return;                /* injected post-align: a NaN here reaches the device */
@@ -3755,27 +3979,51 @@ void rt_source_play(RtCore* c, uint32_t h, uint32_t sound, bool loop) {
     rt_source_play_at(c, h, sound, loop, 0);   /* 0 = start immediately */
 }
 
-void rt_source_play_at(RtCore* c, uint32_t h, uint32_t sound, bool loop, uint64_t start_sample) {
+/* The shared body of rt_source_play_at and rt_bed_play. `bed` is the kind the CALLER issued the
+ * play as, and it exists only for the held (async) case: a reserved slot reports 0 channels, so
+ * the kind guards at the ABI boundary have nothing to judge and the check has to happen again at
+ * the publish. See rt_sound_publish. */
+static void play_at_kind(RtCore* c, uint32_t h, uint32_t sound, bool loop, uint64_t start_sample, bool bed) {
     SoundSlot* s = sound_slot_ctrl(c, sound);
     if (!s || s->retiring) return;          /* invalid or being unloaded: drop the play so the
                                              * audio thread can never bind a retiring sound */
     if (rt_source_is_push(c, h)) return;    /* a PUSH source plays what is pushed; rebinding it to an
                                              * asset would orphan its ring (engine.c reports the error) */
+    held_drop_src(c, h);                    /* any newer play supersedes a play held for an async load */
+    if (s->pending) { held_add(c, h, sound, loop, start_sample, 0, 0, bed); return; }   /* data not in yet */
     /* streamed sound: kick the background decode (re-seek + fill) now, off the audio thread. The
      * voice reads its ring from sample 0; the first blocks may be silent until the ring fills (~ms). */
     if (s->data.stream) stream_start(s->data.stream, loop ? 1 : 0);
     source_bind(c, h, sound, loop, start_sample, 0, 0);
 }
 
+void rt_source_play_at(RtCore* c, uint32_t h, uint32_t sound, bool loop, uint64_t start_sample) {
+    play_at_kind(c, h, sound, loop, start_sample, false);   /* point source: a mono asset */
+}
+
+/* A bed is the SAME voice on the same path (engine.c's bwa_bed_* facade), so this differs from
+ * rt_source_play only in the kind it records. It has to be its own entry point precisely because
+ * the voice cannot be asked afterwards which kind the caller meant. */
+void rt_bed_play(RtCore* c, uint32_t h, uint32_t sound, bool loop) {
+    play_at_kind(c, h, sound, loop, 0, true);
+}
+
 void rt_source_play_loop(RtCore* c, uint32_t h, uint32_t sound, uint64_t loop_beg, uint64_t loop_end) {
     SoundSlot* s = sound_slot_ctrl(c, sound);
     if (!s || s->retiring) return;          /* invalid or being unloaded: drop the play (as play_at) */
     if (rt_source_is_push(c, h)) return;    /* a PUSH source plays what is pushed (engine.c reports the error) */
+    held_drop_src(c, h);
+    /* Kind is hardcoded POINT SOURCE (the false): loop REGIONS are point-source-only, since a bed
+     * loops whole-file through bwa_bed_play and there is no bwa_bed_play_loop. A future bed-region
+     * caller must pass the kind through, or its play is dropped at publish as a mismatch. */
+    if (s->pending) { held_add(c, h, sound, true, 0, loop_beg, loop_end, false); return; }   /* data not in yet */
     if (s->data.stream) stream_start(s->data.stream, 1);   /* streams loop the whole file — no region */
     source_bind(c, h, sound, true, 0, loop_beg, loop_end);  /* always looping; the region is the point */
 }
 
 void rt_source_stop(RtCore* c, uint32_t h) {
+    held_drop_src(c, h);               /* a stop must also cancel a play still waiting on an async load,
+                                        * or the asset would start by itself when the decode lands */
     Stream* st = push_stream_ctrl(c, h);
     if (st) stream_push_end(st);       /* a push source cannot re-arm (play is refused), so stop ENDS it
                                         * like push_end: further pushes are refused instead of silently
@@ -3792,7 +4040,10 @@ void rt_source_stop_at(RtCore* c, uint32_t h, uint64_t stop_sample) {
 
 void rt_source_queue(RtCore* c, uint32_t h, uint32_t sound, bool loop) {
     SoundSlot* s = sound_slot_ctrl(c, sound);
-    if (!s || s->retiring) return;                            /* invalid or being unloaded: drop */
+    if (!s || s->retiring || s->pending) return;              /* invalid, being unloaded, or still loading:
+                                                               * drop. A queue entry resolves to a SoundData
+                                                               * pointer at bind time, so there is nothing
+                                                               * to hold it against (engine.c reports it) */
     if (s->data.stream || s->data.channels != 1) return;      /* chaining is in-memory mono only */
     if (rt_source_is_push(c, h)) return;                      /* a push source plays what is pushed */
     Cmd cmd = { .type = CMD_QUEUE, .handle = h };
@@ -3911,6 +4162,13 @@ bool rt_sound_is_stream(RtCore* c, uint32_t sound) {
 bool rt_unload_sound(RtCore* c, uint32_t sound) {
     SoundSlot* s = sound_slot_ctrl(c, sound);
     if (!s || s->retiring) return true;  /* invalid or already retiring: idempotent no-op (nothing to retry) */
+    /* A RESERVED (async, not yet published) slot must never ride CMD_SOUND_RETIRE - that is the
+     * invariant the staging comment below states, and this is the function it names. Unreachable
+     * through the public ABI today (a pending handle is always cache-owned, and bwa_unload_sound
+     * refuses cache-owned handles), so this guards the next internal caller rather than a live bug.
+     * rt_sound_abandon is the correct way to drop one. */
+    if (s->pending) return true;
+    held_drop_snd(c, sound);             /* a play waiting on this sound must not fire after the unload */
     s->retiring = 1;                     /* refuse new binds (rt_source_play checks this) */
     Cmd cmd = { .type = CMD_SOUND_RETIRE, .handle = sound };
     if (!cmd_push(&c->cmds, &cmd)) {     /* ring full: revert so the caller can retry (internal
@@ -3921,12 +4179,78 @@ bool rt_unload_sound(RtCore* c, uint32_t sound) {
     return true;
 }
 
+/* ---- async staging (control thread; see rt.h). The ONE ordering rule here: a reserved slot is
+ * never handed to the audio thread. No CMD_PLAY / CMD_QUEUE / CMD_SOUND_RETIRE can carry a
+ * pending handle, so the audio thread cannot hold a pointer into a slot rt_sound_publish is about
+ * to write. The publish therefore needs no barrier of its own — the CMD_PLAY it re-issues is the
+ * same release/acquire hand-off a synchronous load has always used. ---- */
+
+uint32_t rt_sound_reserve(RtCore* c, char* err, size_t errcap) {
+    if (!c) return 0;
+    uint32_t h = salloc_sound(c);
+    if (!h) { set_err(err, errcap, "sound: table full"); return 0; }
+    SoundSlot* s = &c->sounds[BWA_H_IDX(h)];
+    memset(&s->data, 0, sizeof s->data);   /* empty until the publish; nothing may bind it meanwhile */
+    s->pending = 1;
+    return h;
+}
+
+bool rt_sound_pending(RtCore* c, uint32_t sound) {
+    if (!c) return false;
+    SoundSlot* s = sound_slot_ctrl(c, sound);
+    return s && s->pending;
+}
+
+bool rt_sound_publish(RtCore* c, uint32_t sound, const SoundData* d) {
+    if (!c || !d) return false;
+    SoundSlot* s = sound_slot_ctrl(c, sound);
+    if (!s || !s->pending || s->retiring) return false;   /* stale/abandoned: the caller keeps the buffer */
+    s->data = *d;                        /* ownership moves to the slot; the retire-ack frees it */
+    s->pending = 0;
+    /* The asset's KIND is only knowable now: a reserved slot reports 0 channels, which passes both
+     * of the ABI's kind guards, so a play held against it was accepted on trust. Judge it here and
+     * DROP a mismatch rather than bind it — binding a 4/9/16-channel bed to what the caller built as
+     * a point source would render it as a bed (the mixer dispatches on the asset), silently voiding
+     * spread, directivity and the panner the caller asked for. engine.c refuses this at the call
+     * itself for every public path (the cache knows the load flags), so this is the backstop for an
+     * asset whose channel count disagrees with the flags it was acquired under. */
+    const bool is_bed = s->data.channels > 1;
+    for (uint32_t i = 0; i < c->held_n; ) {               /* release the plays held for this sound */
+        if (c->held[i].snd != sound) { ++i; continue; }
+        HeldPlay p = c->held[i];
+        c->held[i] = c->held[--c->held_n];                /* swap-remove: do NOT advance i */
+        /* Liveness FIRST, then kind. A play whose source died would not have bound either way, so
+         * counting it as a kind drop would raise a "the play was dropped" notice for a play that
+         * was never going to sound - the counter has to mean exactly what the notice claims. */
+        if (!voice_live_ctrl(c, p.src) || rt_source_is_push(c, p.src)) continue;   /* source died meanwhile */
+        if ((p.bed != 0) != is_bed) { ++c->held_kind_drops; continue; }   /* wrong kind: drop, never bind */
+        if (s->data.stream) stream_start(s->data.stream, p.loop ? 1 : 0);
+        source_bind(c, p.src, p.snd, p.loop != 0, p.start, p.loop_beg, p.loop_end);
+    }
+    return true;
+}
+
+uint64_t rt_held_kind_drops(RtCore* c) {
+    return c ? c->held_kind_drops : 0;
+}
+
+void rt_sound_abandon(RtCore* c, uint32_t sound) {
+    if (!c) return;
+    SoundSlot* s = sound_slot_ctrl(c, sound);
+    if (!s || !s->pending) return;       /* only a RESERVED slot may be dropped this way; a published
+                                          * one has to go through the retire-ack (rt_unload_sound) */
+    held_drop_snd(c, sound);
+    srecycle_sound(c, BWA_H_IDX(sound));
+}
+
 /* Fire-and-forget: a transient voice that recycles itself on EVT_VOICE_ENDED. Its position
  * takes effect on the next rt_commit (the engine's per-frame commit). Returns whether the
  * oneshot was ACCEPTED — every early return here is a drop the caller cannot otherwise see. */
 bool rt_play_oneshot(RtCore* c, uint32_t sound, float x, float y, float z, float gain) {
     SoundSlot* s = sound_slot_ctrl(c, sound);
-    if (!s || s->retiring) return false;
+    if (!s || s->retiring || s->pending) return false;   /* a oneshot owns no handle the caller could
+                                                          * re-play, so a still-loading asset has nothing
+                                                          * to hold the play against: it is refused */
     if (!(isfinite(x) && isfinite(y) && isfinite(z) && isfinite(gain) && gain >= 0.f)) return false;
     if (gain > BWA_MAX_GAIN) gain = BWA_MAX_GAIN;   /* finite is not enough: an absurd gain overflows the bus to Inf */
     /* A oneshot enqueues 4 commands (CREATE/SET_POS/SET_GAIN/PLAY) that must all land, or
