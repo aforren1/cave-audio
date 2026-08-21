@@ -990,8 +990,11 @@ class Underwater extends Base:
 		var crossed := 1 if above == under else 0        # source side != listener side
 		if crossed != _crossed:
 			_crossed = crossed
-			if crossed == 1:                             # ~-30 dB interface loss + the muffle
-				app.source.set_occlusion_manual_bands(0.03, Vector3(0.30, 0.06, 0.01))
+			if crossed == 1:                             # the -30 dB interface loss, tilted by the muffle
+				# the tilt is RELATIVE to the level (the engine multiplies them), so its low band is
+				# pinned at 1: the interface loss is charged once and the vector only says how much
+				# MORE the mid and high bands lose. Net -30 / -44 / -60 dB.
+				app.source.set_occlusion_manual_bands(0.03, Vector3(1.0, 0.2, 0.033))
 				app.source.spread = 0.8                  # localization collapses across the boundary
 			else:
 				app.source.set_occlusion_manual(1.0)

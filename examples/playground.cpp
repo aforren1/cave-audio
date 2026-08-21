@@ -921,8 +921,11 @@ static void wat_apply_source(void) {   /* the per-source half: does the path cro
     const int crossed = (above == wat_under);        /* listener under + source above, or vice versa */
     if (crossed != wat_crossed) {
         wat_crossed = crossed;
-        if (crossed) {                               /* ~-30 dB interface loss + the water muffle */
-            const float water[3] = { 0.30f, 0.06f, 0.01f };
+        if (crossed) {                               /* the -30 dB interface loss, tilted by the water muffle */
+            /* the tilt is RELATIVE to `level` (rt.c multiplies them), so its low band is pinned at
+             * 1: the interface loss is charged once, and the triple only says how much MORE the mid
+             * and high bands lose. Net -30 / -44 / -60 dB, which leaves the LF thump audible. */
+            const float water[3] = { 1.00f, 0.20f, 0.033f };
             bwa_source_set_occlusion_manual(e, src, 0.03f, water);
             bwa_source_set_spread(e, src, 0.8f);     /* localization collapses across the boundary */
         } else {
@@ -1672,6 +1675,22 @@ static float meters_max(uint32_t* count_out) {
     return m;
 }
 
+/* the same peak, held over a WALL-CLOCK window. Three reasons it cannot be a frame count: the null
+ * sink paces in real time while the test UI runs uncapped (frames say nothing about how much audio
+ * was rendered), a block peak on noise swings a few dB so any PROPORTIONAL check needs a window
+ * rather than one sample, and a state change here retunes the FDN - the tail from BEFORE the change
+ * rings for an RT60 (3 s submerged), so `settle_s` has to outlast it or the measurement reads the
+ * OLD state. raylib's GetTime is the glfw monotonic clock, which (unlike clock()) advances across
+ * the sink's Sleep. */
+static float meters_max_over(ImGuiTestContext* ctx, double settle_s, double window_s) {
+    const double t0 = GetTime();
+    while (GetTime() - t0 < settle_s) ctx->Yield();
+    float m = 0.0f;
+    const double t1 = GetTime();
+    while (GetTime() - t1 < window_s) { ctx->Yield(); float v = meters_max(NULL); if (v > m) m = v; }
+    return m;
+}
+
 static void register_tests(ImGuiTestEngine* te) {
     ImGuiTest* t;
 
@@ -2002,7 +2021,8 @@ static void register_tests(ImGuiTestEngine* te) {
 
     /* Scene 8: the in/out-of-water recipe. The boundary rebuilds into the FDN + surface-plane
      * config; panel-diving retunes the FDN live, glides c, and muffles the cross-surface source
-     * (audible but ~-30 dB, not silenced); the Lloyd's-mirror bounce engages only with BOTH ends
+     * (audible, roughly -24 dB on the bus once the FDN settles, not silenced); the Lloyd's-mirror
+     * bounce engages only with BOTH ends
      * submerged, and disengages the moment the path crosses again. */
     t = IM_REGISTER_TEST(te, "viewer", "underwater");
     t->TestFunc = [](ImGuiTestContext* ctx) {
@@ -2013,13 +2033,25 @@ static void register_tests(ImGuiTestEngine* te) {
         for (int tries = 0; tries < 60 && m <= 1e-6f; ++tries) { ctx->Yield(4); m = meters_max(&n); }
         IM_CHECK_GT(m, 1e-4f);                           /* the above-surface source reaches the bus */
         IM_CHECK_EQ(wat_crossed, 0);                     /* listener in air, source above: clear path */
+        /* the muffle is a PROPORTIONAL claim, so measure it as one: bus peak submerged against bus
+         * peak in air. The old absolute `> 1e-6f` here was 60 dB below the check on the line above
+         * and passed for anything short of digital silence, including a fully muted source - which
+         * is roughly what the scene shipped, because `level` and `bands` both carried the 30 dB
+         * interface loss and the low band landed at -41 dB. Both bounds have teeth now: the ceiling
+         * fails if the muffle never reaches the voice, the floor fails if it over-attenuates back
+         * into inaudibility. The window is wide because it measures the WHOLE transition (the FDN
+         * retunes louder and longer on the dive, which offsets part of the direct cut) - as shipped
+         * it reads -24 dB, and the double-counted triple read -36 dB. */
+        const float clear_pk = meters_max_over(ctx, 0.4, 0.4);   /* reference: source in air, listener in air */
         ctx->SetRef("playground");
         ctx->ItemCheck("**/submerged [SPACE]");          /* dive: the path now crosses the surface */
         IM_CHECK_EQ(wat_under, 1);
         ctx->Yield(8);                                   /* the muffle ramps in + the FDN morphs, live */
         IM_CHECK_EQ(wat_crossed, 1);
-        m = meters_max(&n);
-        IM_CHECK_GT(m, 1e-6f);                           /* muffled, not silenced (engine still live) */
+        const float cross_pk = meters_max_over(ctx, 4.0, 0.4);   /* 4 s > the submerged RT60: past the old tail */
+        IM_CHECK_GT(clear_pk, 1e-4f);                    /* the reference is real (guards the ratio below) */
+        IM_CHECK_LT(cross_pk, clear_pk * 0.20f);         /* muffled: at least 14 dB down */
+        IM_CHECK_GT(cross_pk, clear_pk * 0.03f);         /* but not silenced: no more than 30 dB down */
         source_pos.y = WATER_Y - 1.0f;                   /* sink the SOURCE too: same medium again */
         ctx->Yield(4);
         IM_CHECK_EQ(wat_crossed, 0);                     /* clear path underwater... */

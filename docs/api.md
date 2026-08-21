@@ -388,7 +388,7 @@ this (its path never crosses the surface), which is why it's per source:
 ```c
 /* every source on the OTHER side of the surface, on submerge/emerge: */
 void cross_surface(bwa_engine* e, bwa_source s, bool crossed) {
-    static const float water[3] = { 0.30f, 0.06f, 0.01f };  /* low/mid/high transmission */
+    static const float water[3] = { 1.0f, 0.2f, 0.033f };   /* the TILT, relative to the level */
     bwa_source_set_occlusion_manual(e, s, crossed ? 0.03f : 1.0f, crossed ? water : NULL);
     bwa_source_set_spread(e, s, crossed ? 0.8f : 0.0f);     /* direction goes diffuse */
 }
@@ -398,6 +398,10 @@ bwa_fdn_set_decay(e, 3.0f, 0.3f, 800.0f);    /* long LF tail, dead HF - hard wal
 bwa_set_reverb_gain(e, 1.5f);
 bwa_set_speed_of_sound(e, 1480.0f);          /* Doppler + reflection timing follow the medium */
 ```
+
+The level carries the 30 dB, so the triple only tilts it: the net is -30 / -44 / -60 dB, quiet
+but still there. Move the 30 dB into the triple as well and the low band lands at -41 dB, which
+reads as a dead source and an empty speaker meter.
 
 Sources submerged *with* the listener keep playing untouched: the FDN and the speed of sound
 already carry the medium. Resist the classic game pitch-drop: frequency is invariant across a
@@ -1446,10 +1450,16 @@ void bwa_source_set_occlusion_manual(bwa_engine* e, bwa_source s, float level, c
 Drives the **same** handle-gated, audio-thread-ramped publish path the ray-tracing sim uses, from
 your own game logic. `level` is broadband transmittance (1 = clear .. 0 = blocked); `bands`
 (optional; NULL = broadband only) is a low/mid/high tilt in `[0,1]` rendered as the same 3-biquad
-transmission EQ, so a wall *muffles* rather than only attenuating. This is how a no-SDK build gets
-gameplay-driven occlusion ("behind a door the game knows about", underwater, muffled-behind-a-menu)
-with identical click-free rendering. Don't drive one source from both this and the sim
-(`bwa_source_set_occlusion`): the sim republishes every tick and wins.
+transmission EQ, so a wall *muffles* rather than only attenuating. The two **multiply**: `level`
+carries the broadband loss and `bands` is only the tilt on top of it, so pin the tilt at 1 in its
+loudest band and let the other two say how much *more* they lose. A triple that repeats the
+broadband figure charges it twice and the source falls out of hearing. That is the convention the
+sim publishes on: it sets `level` to the loudest band and divides the tilt through by it, so a
+normalized triple is what the audio thread expects from either producer.
+
+This is how a no-SDK build gets gameplay-driven occlusion ("behind a door the game knows about",
+underwater, muffled-behind-a-menu) with identical click-free rendering. Don't drive one source
+from both this and the sim (`bwa_source_set_occlusion`): the sim republishes every tick and wins.
 
 ## Propagation effects (control thread; per-frame)
 
