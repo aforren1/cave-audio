@@ -1146,6 +1146,20 @@ static void switch_scene(int idx) {
  * REBUILDS the engine (the reverb scene's decoder-combo policy) and re-enters the current scene
  * (every scene's enter() is already rebuild-safe — switch_scene relies on that). ---- */
 static char g_drv_pick[64];                  /* the picked name g_asio_driver points at */
+/* Name snapshot: every bwa_get_asio_driver_* call reads the registry FRESH (see asio_sink.cpp), so
+ * enumerating inside the open combo cost 1 + N registry scans PER FRAME and visibly stalled the UI
+ * for as long as the list was open. Snapshot once per open instead; closing invalidates it, so
+ * re-opening still picks up a driver installed since. */
+enum { DRV_MAX = 32 };
+static char g_drv_names[DRV_MAX][64];
+static int  g_drv_n = -1;                    /* -1 = no snapshot (combo closed) */
+static void drv_snapshot(void) {
+    uint32_t nd = bwa_get_asio_driver_count();
+    if (nd > (uint32_t)DRV_MAX) nd = (uint32_t)DRV_MAX;
+    g_drv_n = 0;
+    for (uint32_t i = 0; i < nd; ++i)
+        if (bwa_get_asio_driver_name(i, g_drv_names[g_drv_n], sizeof g_drv_names[0])) g_drv_n++;
+}
 static void rebuild_for_driver(void) {
     if (e) { bwa_stop(e); bwa_destroy(e); e = NULL; }
     build_engine(engine_mode);
@@ -1271,18 +1285,17 @@ static void draw_panel(void) {
     if (backend_silent && ImGui::IsItemHovered(ImGuiHoveredFlags_ForTooltip))
         ImGui::SetTooltip("no ASIO device opened - the offline null sink renders silently\n"
                           "(pick a driver below, or run with --driver <name>)");
-    {   /* registered-driver picker: the list is read only while the combo is open (a fresh
-         * registry scan per bwa_get_asio_driver_count call); picking rebuilds the engine */
+    {   /* registered-driver picker: the list is snapshotted on open (drv_snapshot - the
+         * enumeration is a registry scan per call); picking rebuilds the engine */
         ImGui::SetNextItemWidth(-FLT_MIN);
         if (ImGui::BeginCombo("##drv", g_asio_driver ? g_asio_driver : "driver: (auto-pick)")) {
+            if (g_drv_n < 0) drv_snapshot();                 /* first frame of this open */
             if (ImGui::Selectable("(auto-pick)", g_asio_driver == NULL) && g_asio_driver) {
                 g_asio_driver = NULL;
                 rebuild_for_driver();
             }
-            char nm[64];
-            uint32_t nd = bwa_get_asio_driver_count();
-            for (uint32_t i = 0; i < nd; ++i) {
-                if (!bwa_get_asio_driver_name(i, nm, sizeof nm)) continue;
+            for (int i = 0; i < g_drv_n; ++i) {
+                const char* nm = g_drv_names[i];
                 bool sel = g_asio_driver && strcmp(g_asio_driver, nm) == 0;
                 if (ImGui::Selectable(nm, sel) && !sel) {
                     snprintf(g_drv_pick, sizeof g_drv_pick, "%s", nm);
@@ -1291,6 +1304,8 @@ static void draw_panel(void) {
                 }
             }
             ImGui::EndCombo();
+        } else {
+            g_drv_n = -1;                                    /* closed: re-scan on the next open */
         }
         bwTip("ASIO driver for the output (bwa_desc.asio_driver). Create-time, so picking REBUILDS "
               "the engine (brief gap). (auto-pick) = the first registered driver with enough "
@@ -1706,6 +1721,23 @@ static void register_tests(ImGuiTestEngine* te) {
         rebuild_for_driver();                              /* exactly what a combo pick runs */
         IM_CHECK(e != NULL);
         IM_CHECK_GE(bwa_get_channel_count(e), 4u);         /* the rebuilt engine is live */
+    };
+
+    /* the driver combo's name SNAPSHOT: taken on the frame the list opens, dropped on close (the
+     * enumeration is a registry scan per call, so reading it per frame stalled the panel). */
+    t = IM_REGISTER_TEST(te, "viewer", "driver_combo_snapshot");
+    t->TestFunc = [](ImGuiTestContext* ctx) {
+        ctx->SetRef("playground");
+        IM_CHECK_EQ(g_drv_n, -1);                          /* closed: nothing held */
+        ctx->ItemClick("##drv");
+        ctx->Yield();
+        IM_CHECK_GE(g_drv_n, 0);                           /* open: snapshotted (0 drivers is a valid list) */
+        uint32_t nd = bwa_get_asio_driver_count();
+        IM_CHECK_EQ((uint32_t)g_drv_n, nd < (uint32_t)DRV_MAX ? nd : (uint32_t)DRV_MAX);
+        ctx->ItemClick("**/(auto-pick)");                  /* already auto-pick: closes, no rebuild */
+        ctx->Yield();
+        IM_CHECK_EQ(g_drv_n, -1);                          /* closed again: the next open re-scans */
+        IM_CHECK(g_asio_driver == NULL);
     };
 
     t = IM_REGISTER_TEST(te, "logic", "abx_pvalue");

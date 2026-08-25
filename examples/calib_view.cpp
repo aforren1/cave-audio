@@ -204,7 +204,9 @@ static void wav_to_prefix(char* p) {
 }
 
 static void tab_array(void) {
-    if (!ImPlot3D::BeginPlot("##array", ImGui::GetContentRegionAvail())) return;
+    /* NoPan: every axis auto-fits, and a re-fit overwrites the pan translation on the next
+       frame, so the view snaps back mid-drag. Rotate + zoom still read naturally. */
+    if (!ImPlot3D::BeginPlot("##array", ImGui::GetContentRegionAvail(), ImPlot3DFlags_NoPan)) return;
     ImPlot3D::SetupAxes("x (m)", "z (m)", "y up (m)",            /* auto-fit: implot3d defaults to 0..1 */
                         ImPlot3DAxisFlags_AutoFit, ImPlot3DAxisFlags_AutoFit, ImPlot3DAxisFlags_AutoFit);
     if (V.hasA) {
@@ -921,7 +923,10 @@ static void tab_zylia(void) {
         ImPlot::EndPlot();
     }
     ImGui::SameLine();
-    if (ImPlot3D::BeginPlot("##zysphere", ImGui::GetContentRegionAvail(), ImPlot3DFlags_NoLegend)) {
+    /* NoPan: the view is a fixed unit sphere centered on the mic, so translating it away from
+       the origin only breaks the "which way did the sound come from" read. Rotate + zoom only. */
+    if (ImPlot3D::BeginPlot("##zysphere", ImGui::GetContentRegionAvail(),
+                            ImPlot3DFlags_NoLegend | ImPlot3DFlags_NoPan)) {
         ImPlot3D::SetupAxes("x", "z", "y up");
         ImPlot3D::SetupAxesLimits(-1.4, 1.4, -1.4, 1.4, -1.4, 1.4, ImPlot3DCond_Once);
         const ImU32 wire = IM_COL32(110, 110, 128, 120);
