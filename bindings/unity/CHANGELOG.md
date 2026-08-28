@@ -108,8 +108,8 @@ and the seek agree with the frames ones exactly; a bed raises both events throug
 handle map, and bed and source events do not cross; and `EndedEventsDropped` / `LoopEventsDropped`
 rise when starved and stay at zero when pumped.
 
-Two properties keep it from being a suite that cannot fail, which is what CLAUDE.md's trap says the
-default outcome is:
+Two properties keep it from being a suite that cannot fail, which is the default outcome for a test
+suite rather than a rare mistake:
 
 - **Determinism comes from ordering, not from timing.** Several tests turn the `Engine` component
   off for a stretch. Only `bwa_commit` is frame-gated, so a play still reaches the audio thread and
