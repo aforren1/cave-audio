@@ -455,18 +455,23 @@ func _run_selftest() -> void:
 	var wat = scenes[7]
 	wat.update(1.0 / 60.0)                 # source starts above the surface, listener in air
 	if source.get_occlusion_factor() < 0.9:
-		push_error("playground: underwater scene occluded a clear same-side path")
+		push_error("playground: underwater scene occluded a clear same-side path (factor %.2f, %s)"
+			% [source.get_occlusion_factor(), wat.debug_state()])
 		fail += 1
 	wat.set_submerged(true)
 	wat.update(1.0 / 60.0)                 # the path now crosses the surface
 	if source.get_occlusion_factor() > 0.1:
-		push_error("playground: diving did not muffle the cross-surface source (factor %.2f)"
-			% source.get_occlusion_factor())
+		# The state comes with it because a bare factor cannot tell the two causes apart: crossed=0
+		# means the scene never pushed the interface loss, while crossed=1 with sim=true means the
+		# ray-traced sim republished over it (the ABI says the sim wins, so both must never be on).
+		push_error("playground: diving did not muffle the cross-surface source (factor %.2f, %s)"
+			% [source.get_occlusion_factor(), wat.debug_state()])
 		fail += 1
 	wat.set_submerged(false)
 	wat.update(1.0 / 60.0)
 	if source.get_occlusion_factor() < 0.9:
-		push_error("playground: surfacing did not clear the crossing occlusion")
+		push_error("playground: surfacing did not clear the crossing occlusion (factor %.2f, %s)"
+			% [source.get_occlusion_factor(), wat.debug_state()])
 		fail += 1
 	switch_scene(0)
 	if not engine.is_running():
