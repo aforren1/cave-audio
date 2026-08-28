@@ -154,14 +154,32 @@ The snippet shows the essential calls. The shipped `Bwa.cs` binds every `BWA_API
 `bwa_render_block` (the manual-sink golden-render path). Beyond those:
 
 - **Voice management + scheduling**: `bwa_source_set_priority`;
-  `bwa_source_play_at` + `bwa_get_dsp_time` (sample-accurate start),
+  `bwa_source_play_at` + `bwa_get_dsp_time_frames` (sample-accurate start),
   `bwa_source_play_loop` (`Emitter.PlayLoop`: intro→loop region),
   `bwa_source_stop_at` (`Emitter.StopAt`: click-free scheduled stop on the dsp clock),
   `bwa_source_queue` (`Emitter.Queue`: gapless chaining into the next sound);
   `bwa_get_active_voices`.
 - **Transport**: `bwa_source_set_paused`, `bwa_set_paused` (global),
-  `bwa_source_seek`, `bwa_source_is_playing`; `Emitter` polls the playing state
-  each frame to fire its `onFinished` UnityEvent.
+  `bwa_source_seek`, `bwa_source_is_playing`, and `bwa_source_set_region`
+  (`Emitter.SetRegionFrames` / `SetRegionSeconds`: bound a clip to a region, which both
+  truncates a one-shot and sets a loop). See "Completion and loop events" below for how
+  `Emitter` learns that a sound ended.
+- **Completion and loop events**: `bwa_poll_ended` and `bwa_poll_looped` drive
+  `Emitter.onFinished` / `onLoop` and `AmbisonicBed.onFinished` / `onLoop`. `Engine` is the
+  only caller of either, and
+  `Engine.EndedEventsDropped` / `LoopEventsDropped` report what the engine dropped. See
+  "Completion and loop events" below.
+- **Direct output-channel route**: `bwa_source_set_channel` (`SourceBase.Channel`,
+  `Bwa.CHANNEL_AUTO` to go back to the panner). Sends one source out of one speaker with no
+  spatial processing: the psychophysics ground-truth condition, and a wiring check you can run
+  with real content. It is not `bwa_set_test_signal`, which injects a built-in tone after the
+  per-speaker align stage and is therefore not level-comparable with a rendered source.
+  Both bindings refuse an index outside `0 .. bwa_get_channel_count() - 1` and keep the channel
+  the source already had. That matters because the property is readable: cache a refused value and
+  the getter reports a speaker the voice is not on, which is how a reference source gets read as
+  ground truth while it is still panned. `CHANNEL_AUTO` is the only negative that means anything.
+  Every other negative is refused too, and refused before the source is live, because a negative
+  needs no channel count to judge.
 - **Mixing**: `bwa_source_fade_to` / `bwa_source_fade_out` (engine-side timed
   fades, no coroutines), `bwa_source_set_pitch`, `bwa_set_master_gain`, and mix
   groups (`bwa_source_set_group` + `bwa_group_set_gain` / `bwa_group_set_paused`).
@@ -178,10 +196,12 @@ The snippet shows the essential calls. The shipped `Bwa.cs` binds every `BWA_API
   `bwa_source_set_reverb` / `_reverb_send` / `_reverb_distance`,
   `bwa_source_set_pathing` (engine-level enable rides `bwa_desc.enable_pathing`);
   the phonon-free **FDN reverb** (`bwa_fdn_config`).
-- **Ambisonic beds**: the full `bwa_bed_*` facade (`create` / `play` / `set_gain` /
-  `set_orientation` (yaw/pitch/roll) / `stop` / `destroy`), plus the bed-named forms
-  of the per-voice calls (`fade_to` / `fade_out` / `set_paused` / `seek` /
-  `set_priority` / `set_group` / `is_playing`).
+- **Ambisonic beds**: the full `bwa_bed_*` facade (`create` / `play` / `play_at` /
+  `play_loop` / `set_gain` / `set_orientation` (yaw/pitch/roll) / `stop` / `destroy`),
+  plus the bed-named forms of the per-voice calls (`stop_at` / `fade_to` / `fade_out` /
+  `set_paused` / `seek` / `set_region` / `set_priority` / `set_group` / `is_playing`).
+  A bed is a voice, so it also carries the two event feeds an emitter does: Unity's
+  `AmbisonicBed.onFinished` / `onLoop`, Godot's `BwaBed` `finished` / `looped`.
 - **Materials / scene geometry**: `bwa_material_preset`, `bwa_material_define`,
   `bwa_scene_set_mesh_mat`, `bwa_scene_set_box`.
 - **Situation tuning**: `bwa_tuning_preset` fills a complete tuning for `BWA_SETUP_SEATED` or
@@ -237,7 +257,9 @@ The snippet shows the essential calls. The shipped `Bwa.cs` binds every `BWA_API
   zero is not its default and the engine refuses a zero-filled one. See
   [api.md](./api.md) for what each preset rests on.
 - **Scene transitions**: `bwa_group_stop` and `bwa_stop_all` (`Engine.StopGroup` /
-  `StopAll`): click-free, beds included, and neither resets the mixer.
+  `StopAll`): click-free, beds included, and neither resets the mixer. Both also
+  drop the matching plays that are still waiting on an async decode, so nothing
+  you stopped can start on you a moment later.
 - **Procedural (push) sources**: `bwa_source_create_push`, `bwa_source_push`,
   `bwa_source_push_space`, `bwa_source_push_end`, surfaced as the **`PushEmitter`**
   component: a positional source you feed mono engine-rate floats instead of a
@@ -371,6 +393,90 @@ public sealed class Emitter : MonoBehaviour {
 }
 ```
 
+### Completion and loop events
+
+The engine reports both as events. Poll them, do not watch a playing flag: a sound shorter
+than your frame interval may never once read as playing, so an edge detector misses it, and a
+looping voice never ends at all.
+
+`Engine` drains both rings once per frame, right after `bwa_commit`. That order matters:
+`bwa_commit` runs the pass that fills the rings, so a drain placed before it reports every
+event a frame late. `Engine` is also the ONLY caller of `bwa_poll_ended` and
+`bwa_poll_looped`. Both drains are engine-wide and destructive, so a second caller anywhere
+eats events belonging to somebody else's sources and those callbacks never fire. `Engine`
+routes each handle to the component that owns it and calls `Emitter.onFinished` or
+`Emitter.onLoop`.
+
+A bed is a voice, so the core reports a bed handle through the same two rings. `AmbisonicBed`
+is not a `SourceBase` (a bed has no position, and the source registry exists to push one every
+frame), so `Engine` keeps a second handle map for beds and consults it when a handle does not
+belong to a source. Bed and source handles come from one pool, so a handle is a source's or a
+bed's and never both. `AmbisonicBed.onFinished` and `onLoop` carry the same contract as the
+emitter's, halt fallback included. Godot's `BwaBed` gets the same pair through the same second
+registry, and its `finished` follows Godot's rule rather than Unity's: silent for `stop()`,
+`fade_out()` and a group stop, and fired for `stop_at()`.
+
+One thing the events cannot tell you: an explicit halt. `Stop`, `StopAt`, `FadeOut`,
+`Engine.StopGroup` and `Engine.StopAll` all take the click-free stop path, which posts no
+completion, and a stolen voice posts none either. Unity's `onFinished` has always fired for a
+halt, so `Emitter` keeps a narrow is-playing edge for exactly that case, read after the drain.
+A one-shot latch keeps a halt and a completion that describe the same end from both reporting
+it. Godot's `BwaEmitter` is built the same way, with the same latch, except that its
+`finished` signal deliberately stays silent for `stop()` and `fade_out()`.
+
+**The latch is voided by the next play that BINDS, not by the next play.** A play held on an
+async decode has not bound. The engine bumps a voice's play counter only at bind time, and that
+counter is the gate that drops a completion straggling in from the previous play, so until it
+moves the straggler is still deliverable and the latch is the only thing standing in its way.
+Both bindings therefore keep the latch armed across a held play and clear it on the frame the
+data lands. The case to picture is a stop that lands on the block a clip runs out in: the engine
+posts a completion for that stopped voice anyway, and a play issued before the next drain used to
+open the way for it.
+
+Both rings are bounded and drop the OLDEST entry when nothing reads them, so a rising
+`EndedEventsDropped` means that many `onFinished` callbacks never fired. `LoopEventsDropped`
+can rise for a second, harmless reason: a loop region shorter than a frame wraps more often
+than any frame rate can read it. Pace trials off the wraps you receive.
+
+### Tests
+
+The binding has a headless PlayMode suite in [`bindings/unity/test~/`](../bindings/unity/test~/). It
+drives the real components against the real `bw_audio.dll`, so the completion and loop feeds, the
+region and seek calls, and the bed event route are executed, not only compiled.
+
+Run it with the rest of the suite:
+
+```
+cmake -S . -B build -A x64 -DBWA_UNITY_EXE="C:/path/to/Editor/Unity.exe"
+cmake --build build --config RelWithDebInfo
+ctest --test-dir build -C RelWithDebInfo -R unity_playmode
+```
+
+Without `BWA_UNITY_EXE` the `unity_playmode` test is not registered, the same way the Godot scene
+tests gate on `BWA_GODOT_EXE`. Unity is not a build dependency and CI has no editor.
+
+Three choices make it work without hardware:
+
+- **PlayMode, not EditMode.** `Engine.LateUpdate` is the pump and both event drains run in it.
+  EditMode turns no frames, so it can never report a completion.
+- **The offline sink.** The suite sets `sink = Null`, which is the shipping topology minus the
+  device: a real audio thread, a real command ring, real event rings. `Manual` has no audio thread
+  and has to be pumped with `bwa_render_block`, which the binding does not bind.
+- **The staged DLL.** `bindings/unity/Runtime/Plugins/x86_64/bw_audio.dll` is build output. The
+  `bw_audio` target copies it there after every build, so `cmake --build` followed by `ctest` runs
+  against the engine that build produced. There is no copy step to forget.
+
+The suite gets its determinism from ordering, not from timing. Several tests turn the `Engine`
+component off for a stretch. `bwa_source_play` reaches the audio thread on its own, because only
+`bwa_commit` is frame-gated, so a voice still starts, plays and ends while nothing commits, drains,
+or polls is-playing. Turning the pump back on then gives exactly one pump against a known state.
+That is what makes "a clip shorter than a frame fires `onFinished` exactly once" decidable instead
+of a race the test happens to win.
+
+The folder is named `test~` because Unity ignores any folder whose name ends in `~`. Drop the suffix
+and the package carries a second copy of the test assembly into every project that references it,
+which is a duplicate assembly name and a compile error.
+
 ### Unity-specific traps
 
 - **Native plugins don't unload between Editor play sessions.** The DLL and its
@@ -403,6 +509,26 @@ against a still-decoding clip is held until the data lands rather than dropped. 
 `get_desc` and `apply_desc` carry `bwa_source_desc` as a Dictionary, for the same reason
 `get_setup_tuning` carries the engine tuning as one, plus `reset_to_preset` and the static,
 engine-free `BwaSource.get_preset`.
+
+`BwaEmitter.finished` is driven by the same `bwa_poll_ended` drain Unity uses, and
+`BwaEmitter.looped` by `bwa_poll_looped`. `BwaEngine` owns both drains, for the reason above,
+and `BwaEngine.get_ended_this_frame()` / `get_looped_this_frame()` hand back THIS FRAME'S batch rather than
+draining again. `get_ended_events_dropped()` and `get_loop_events_dropped()` carry the running
+dropped totals. `BwaEmitter` gains `set_region_frames` / `set_region_seconds`, and every source
+gains `set_channel` with `BwaSource.CHANNEL_AUTO`. `BwaBed` carries the same region pair,
+plus `play_at` / `play_loop` / `stop_at` and the `finished` / `looped` signals. The unit lives in the region call's name for
+the reason `seek_frames` carries one: the seconds spelling differs from the frames one by a
+factor of the sample rate. `BwaEngine.get_dsp_time_frames()` / `get_dsp_time_seconds()` is the same
+pair, and it exists because every host's dsp-time call is seconds: Unity's `AudioSettings.dspTime`
+is a seconds `double`, and Godot's own `AudioServer` times are seconds too. Schedule with the frame
+value. `channel` takes no suffix, because a channel index is not a quantity with two units.
+
+**A Godot call that refuses an argument says so.** Every time-valued argument on the transport
+surface (`play_at`, `play_loop`, `stop_at`, `seek_frames`, `set_region_frames` and their seconds
+twins) reaches the C ABI unsigned, so a negative does not fail. It becomes an enormous positive:
+-1 frames is 1.8e19, about twelve million years of dsp clock, which schedules a start for never
+and leaves a voice that reads as playing and stays silent. All of them refuse a negative with a
+warning instead, the same way `set_channel` refuses an index it cannot route.
 
 The seam is **simpler than Unity's, so do not carry Unity's advice over**:
 

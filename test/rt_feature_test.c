@@ -1089,7 +1089,17 @@ int main(void) {
             CHECK(fabs(e_off - e_base) < 0.1 * e_base, "weight 0 disables the pattern");
             CHECK(fabsf(rt_get_directivity(cd, hd) - 1.f) < 1e-6f,
                   "readback clears with the pattern (no stale dipole gain)");
-            rt_source_destroy(cd, hd); rt_commit(cd);
+            /* The dead-handle window: the mixer clears dir_pub when it consumes CMD_SRC_DESTROY,
+             * which is a block away, so a read taken BEFORE the next render can only be answered by
+             * the control-side handle table. Re-arm a deep null first so the margin is real (a
+             * readback that trusts the publish reports ~0, a correct one reports omni = 1). */
+            rt_source_set_directivity_manual(cd, hd, (const float[3]){ 0.f, 0.f, 1.f }, 0.5f, 1.f);
+            render2(cd); render2(cd); render2(cd);
+            CHECK(rt_get_directivity(cd, hd) < 0.05f, "re-armed null publishes before the destroy");
+            rt_source_destroy(cd, hd);                 /* no render: the publish still names hd */
+            CHECK(fabsf(rt_get_directivity(cd, hd) - 1.f) < 1e-6f,
+                  "a destroyed handle reads omni BEFORE the next block");
+            rt_commit(cd);
             rt_destroy(cd);
         }
     }
@@ -2033,12 +2043,236 @@ int main(void) {
         }
     }
 
+    /* DIRECT output-channel route (rt_source_set_channel): the psychophysics reference condition.
+     * The observable is deliberately absolute, not relative: a constant-1.0 asset at gain 1 through a
+     * one-hot vector must land at EXACTLY 1.0 on the routed channel (the default layout's trims are
+     * unity), which simultaneously pins "no distance attenuation" — the panned solve at the same
+     * position is well under 1. And the switch must RAMP: the first block after the command starts at
+     * silence and lands on 1, which a jump would show as a full-level sample 0. */
+    {
+        RtCore* cd = rt_create(8, 4, RATE, CH);
+        CHECK(cd != NULL, "rt_create (direct channel)");
+        if (cd) {
+            rt_set_limiter(cd, 0);                     /* a constant 1.0 would otherwise be pulled down */
+            uint32_t ds = rt_load_sound(cd, WAV, err, sizeof err);
+            uint32_t h  = rt_source_create(cd);
+            rt_source_play(cd, h, ds, true);
+            set_pos_spk(cd, h, 7);                     /* panned: speaker 7's position */
+            rt_commit(cd);
+            bwa_timestamp ts = { 0, 0 };
+            rt_render(cd, bus, N, &ts); rt_render(cd, bus, N, &ts);
+            CHECK(argmax_channel() == 7, "direct channel: panned baseline localizes to 7");
+            const double panned7 = chan_energy(7) / (double)N;
+            CHECK(panned7 < 0.9, "direct channel: the PANNED solve is attenuated (so the route's 1.0 means something)");
+
+            rt_source_set_channel(cd, h, 3);           /* route to channel 3; no commit needed */
+            rt_render(cd, bus, N, &ts);                /* the ramp block */
+            const float first = fabsf(bus[(size_t)3 * N + 0]), last = fabsf(bus[(size_t)3 * N + N - 1]);
+            CHECK(first < 0.05f && last > 0.95f,
+                  "direct channel: switching IN ramps across the block (a jump would start at full level)");
+            rt_render(cd, bus, N, &ts);                /* settled */
+            const double e3 = chan_energy(3) / (double)N;
+            double rest = 0;
+            for (int k = 0; k < CH; ++k) if (k != 3) rest += chan_energy(k);
+            CHECK(fabs(e3 - 1.0) < 0.01,
+                  "direct channel: the routed channel carries the asset at unity (no attenuation, no spread)");
+            CHECK(rest < 1e-6, "direct channel: every OTHER channel is silent");
+
+            /* The suppressions the reference depends on. Each one chosen so it would MOVE this
+             * constant-1.0 level if it ran: full spread would scatter energy onto the other channels,
+             * the steep attenuation override would crush the level, occlusion multiplies it by 0.1,
+             * and a dipole aimed straight away from the listener nulls it. (Air absorption and
+             * Doppler are suppressed too but are deliberately NOT asserted here: a low-pass and a
+             * delay are both identities on a constant signal, so the check could not fail.) */
+            rt_source_set_spread(cd, h, 1.f);
+            rt_source_set_attenuation(cd, h, 0.1f, 4.f, 0.f);   /* would crush a panned voice */
+            rt_set_occlusion(cd, h, 0.1f);                      /* would take 20 dB off */
+            {   const float* sp7 = LD.speakers[7].pos;
+                float fx = LD.ref[0]-sp7[0], fy = LD.ref[1]-sp7[1], fz = LD.ref[2]-sp7[2];
+                const float fl = sqrtf(fx*fx + fy*fy + fz*fz);
+                const float fwd[3] = { -fx/fl, -fy/fl, -fz/fl };   /* points AWAY: cos = -1 */
+                rt_source_set_directivity_manual(cd, h, fwd, 0.5f, 1.f);   /* |0.5 + 0.5cos| = 0 */
+            }
+            rt_commit(cd);
+            for (int b = 0; b < 8; ++b) rt_render(cd, bus, N, &ts);
+            double rest2 = 0;
+            for (int k = 0; k < CH; ++k) if (k != 3) rest2 += chan_energy(k);
+            CHECK(fabs(chan_energy(3) / (double)N - 1.0) < 0.01 && rest2 < 1e-6,
+                  "direct channel: spread/attenuation/occlusion/directivity do not touch a routed voice");
+
+            /* -1 (BWA_CHANNEL_AUTO) is the ONLY negative. Any other one is refused at the control
+             * thread, so the route must SURVIVE it. Folding it into AUTO instead sends the voice
+             * back to the panner: channel 3 would collapse and 7 would take over, which is exactly
+             * the state the next stanza asserts, so this has a full-scale margin either way. */
+            rt_source_set_channel(cd, h, -5);
+            for (int b = 0; b < 4; ++b) rt_render(cd, bus, N, &ts);
+            CHECK(fabs(chan_energy(3) / (double)N - 1.0) < 0.01 && argmax_channel() == 3,
+                  "direct channel: a negative that is not AUTO is refused (the route holds)");
+
+            rt_source_set_channel(cd, h, -1);                    /* BWA_CHANNEL_AUTO: back to the panner */
+            rt_render(cd, bus, N, &ts);                          /* the ramp-out block */
+            const float back0 = fabsf(bus[(size_t)3 * N + 0]), back1 = fabsf(bus[(size_t)3 * N + N - 1]);
+            CHECK(back0 > 0.95f && back1 < 0.15f,
+                  "direct channel: switching OUT ramps too (channel 3 decays across the block)");
+            rt_source_set_spread(cd, h, 0.f);
+            rt_source_set_attenuation(cd, h, 0.f, 0.f, 0.f);
+            rt_set_occlusion(cd, h, 1.f);
+            {   const float fwd[3] = { 0.f, 0.f, 1.f };
+                rt_source_set_directivity_manual(cd, h, fwd, 0.f, 1.f); }   /* weight 0 = off */
+            rt_commit(cd);
+            for (int b = 0; b < 8; ++b) rt_render(cd, bus, N, &ts);
+            CHECK(argmax_channel() == 7 && chan_energy(3) < chan_energy(7),
+                  "direct channel: AUTO restores the spatial solve (position was remembered)");
+            rt_destroy(cd);
+        }
+    }
+
+    /* The BINAURAL half of the output-channel route (direct_channel_gains' other branch, which every
+     * test above walked past). Under BWA_PROFILE_BINAURAL point voices never reach the speaker bus,
+     * so "route to channel k" has to mean something else, and the header says what: render the voice
+     * as a point source AT that speaker's surveyed position, dry. Both modes are pinned, because the
+     * two headphone profiles have to agree with each other and with what cave_sim does to a bus
+     * channel.
+     *
+     * TONES, never DC. This repo shipped a left/right mirror because a DC-driven laterality
+     * assertion had the polarity backwards (CLAUDE.md, "Laterality checks must never drive DC"), and
+     * these assertions are about direction. 3 kHz is exactly 16 cycles per 256-frame block, so a
+     * settled block has an exact RMS and an exact mean-absolute value. */
+    {
+        const char* SINE = "bwa_rt_dirch_tone.wav";
+        if (write_sine_wav(SINE, 3000.0, 8 * N)) {
+            /* what the route must encode: the unit direction listener (LD.ref) -> speaker 3 */
+            const float* s3 = LD.speakers[3].pos;
+            float d3[3] = { s3[0]-LD.ref[0], s3[1]-LD.ref[1], s3[2]-LD.ref[2] };
+            const float l3 = sqrtf(d3[0]*d3[0] + d3[1]*d3[1] + d3[2]*d3[2]);
+            d3[0]/=l3; d3[1]/=l3; d3[2]/=l3;
+            float y3[BWA_AMBI_CH]; ambi_encode_phonon(d3, y3);
+            /* and speaker 7's, which is where the SOURCE sits: the route must ignore it */
+            const float* s7 = LD.speakers[7].pos;
+            float d7[3] = { s7[0]-LD.ref[0], s7[1]-LD.ref[1], s7[2]-LD.ref[2] };
+            const float l7 = sqrtf(d7[0]*d7[0] + d7[1]*d7[1] + d7[2]*d7[2]);
+            d7[0]/=l7; d7[1]/=l7; d7[2]/=l7;
+            float y7[BWA_AMBI_CH]; ambi_encode_phonon(d7, y7);
+
+            /* mode 1: the whole voice SH-encodes at the speaker's direction into the 16-ch field */
+            RtCore* cb = rt_create(4, 4, RATE, CH);
+            CHECK(cb != NULL, "rt_create (binaural route, mode 1)");
+            if (cb) {
+                rt_set_direct_ambi(cb, 1);
+                uint32_t sb = rt_load_sound(cb, SINE, err, sizeof err);
+                uint32_t hb = rt_source_create(cb);
+                rt_source_play(cb, hb, sb, true);
+                set_pos_spk(cb, hb, 7);                       /* the SOURCE is at speaker 7 ... */
+                rt_source_set_channel(cb, hb, 3);             /* ... the ROUTE says speaker 3 */
+                rt_commit(cb);
+                for (int b = 0; b < 4; ++b) render2(cb);      /* settle the gain ramp */
+                const float* f = rt_direct_ambi(cb);
+                CHECK(f != NULL, "binaural route: the direct field exists");
+                CHECK(total_energy() < 1e-9, "binaural route: a routed point voice leaves the speaker bus silent");
+                double den = 0;
+                for (int i = 0; i < N; ++i) { double w = f ? f[i] : 0.0; den += w * w; }
+                /* dry and at unity: W = source x Y00, and a unit sine has RMS 1/sqrt(2). Speaker 3
+                 * is meters away, so an attenuated route reads far under this. */
+                CHECK(f && fabs(sqrt(den / (double)N) - 0.2820948 * 0.70710678) < 5e-3,
+                      "binaural route: W = Y00 x the source, dry (the route takes no distance curve)");
+                /* the DIRECTION. Every SH channel carries the same signal, so channel k projected on
+                 * channel 0 is exactly y[k]/y[0]. A signed projection, not a magnitude, so a
+                 * mirrored encode fails instead of passing on |.|. */
+                int enc_ok = 1, differs = 0;
+                for (int k = 1; k < BWA_AMBI_CH && f && den > 0; ++k) {
+                    double num = 0;
+                    for (int i = 0; i < N; ++i) num += (double)f[(size_t)k * N + i] * f[i];
+                    const double got = num / den * y3[0];
+                    if (fabs(got - y3[k]) > 5e-3) enc_ok = 0;
+                    if (fabs(y7[k] - y3[k]) > 0.05) differs = 1;
+                }
+                CHECK(enc_ok, "binaural route: the field encodes the SPEAKER's direction, all 16 channels");
+                CHECK(differs, "binaural route: ...and the source's own direction is a different encode "
+                               "(so the check above can fail)");
+                rt_destroy(cb);
+            }
+
+            /* mode 2: the whole voice rides its own per-voice HRTF point tap instead, publishing the
+             * same direction. The field must be EMPTY, or the voice would render twice. */
+            RtCore* c2 = rt_create(4, 4, RATE, CH);
+            CHECK(c2 != NULL, "rt_create (binaural route, mode 2)");
+            if (c2) {
+                rt_set_direct_ambi(c2, 2);
+                uint32_t s2 = rt_load_sound(c2, SINE, err, sizeof err);
+                uint32_t h2 = rt_source_create(c2);
+                rt_source_play(c2, h2, s2, true);
+                set_pos_spk(c2, h2, 7);
+                rt_source_set_channel(c2, h2, 3);
+                rt_commit(c2);
+                for (int b = 0; b < 4; ++b) render2(c2);
+                const RtDirectVoice* dv = NULL;
+                uint32_t nv = rt_direct_voices(c2, &dv);
+                int vi = -1;
+                for (uint32_t i = 0; i < nv && dv; ++i) if (dv[i].active) { vi = (int)i; break; }
+                CHECK(vi >= 0, "binaural route (mode 2): the routed voice publishes a point tap");
+                if (vi >= 0) {
+                    double e = 0;
+                    for (int i = 0; i < N; ++i) e += (double)dv[vi].mono[i] * dv[vi].mono[i];
+                    CHECK(fabs(sqrt(e / (double)N) - 0.70710678) < 5e-3,
+                          "binaural route (mode 2): the WHOLE voice rides the tap, dry (RMS = the source's)");
+                    CHECK(fabs(dv[vi].dir[0] - d3[0]) < 1e-3 && fabs(dv[vi].dir[1] - d3[1]) < 1e-3 &&
+                          fabs(dv[vi].dir[2] - d3[2]) < 1e-3,
+                          "binaural route (mode 2): the published direction is the SPEAKER's");
+                    CHECK(fabsf(d7[0] - d3[0]) + fabsf(d7[1] - d3[1]) + fabsf(d7[2] - d3[2]) > 0.1f,
+                          "binaural route (mode 2): ...and speaker 7's differs (so that can fail)");
+                }
+                const float* fl = rt_direct_ambi(c2);
+                double fe = 0;
+                for (int k = 0; fl && k < BWA_AMBI_CH * N; ++k) fe += fabs(fl[k]);
+                CHECK(fl && fe < 1e-6, "binaural route (mode 2): the SH field stays empty (no double render)");
+                rt_destroy(c2);
+            }
+
+            /* The fs_on RETIRE that both branches share. A voice widened by SPECTRAL spread runs on a
+             * per-band gain set that REPLACES the output stage, and compute_gains returns at the route
+             * before fs_solve could run again - so without the retire the bands freeze on the last
+             * spread solve and the "route" keeps scattering energy across the array forever.
+             * Speaker bus only, and that is the whole reachable set: under direct mode compute_gains
+             * returns at the direct branch before any spread mode is consulted, so fs_solve never
+             * runs and the retire has no binaural case to cover. Driven with the 3 kHz tone because
+             * spectral spread leaves band 0 (LF) on the source direction: a DC asset would sit
+             * entirely in that band and never scatter, and the pre-check below could not fail. */
+            RtCore* cs = rt_create(4, 4, RATE, CH);
+            CHECK(cs != NULL, "rt_create (route retires spectral spread)");
+            if (cs) {
+                rt_set_limiter(cs, 0);
+                rt_set_spread_mode(cs, 2);                    /* spectral */
+                uint32_t ss = rt_load_sound(cs, SINE, err, sizeof err);
+                uint32_t hs = rt_source_create(cs);
+                rt_source_play(cs, hs, ss, true);
+                set_pos_spk(cs, hs, 7);
+                rt_source_set_spread(cs, hs, 1.f);            /* fully wide: fs_solve engages */
+                rt_commit(cs);
+                for (int b = 0; b < 6; ++b) render2(cs);
+                double tot = total_energy();
+                CHECK(tot > 1e-3 && chan_energy(7) < 0.5 * tot,
+                      "route retire: spectral spread really engaged (the image left speaker 7)");
+                rt_source_set_channel(cs, hs, 3);
+                rt_commit(cs);
+                for (int b = 0; b < 6; ++b) render2(cs);
+                double rest = 0;
+                for (int k = 0; k < CH; ++k) if (k != 3) rest += chan_energy(k);
+                /* mean |sin| over whole cycles is 2/pi; chan_energy is that sum over the block */
+                CHECK(fabs(chan_energy(3) / (double)N - 0.63661977) < 0.02,
+                      "route retire: the routed channel lands on the raw source (bands handed back exactly)");
+                CHECK(rest < 1e-6, "route retire: and every band left the other channels (none frozen wide)");
+                rt_destroy(cs);
+            }
+            remove(SINE);
+        } else CHECK(0, "write the 3 kHz route tone");
+    }
+
     remove(WAV);
     if (fails) { printf("rt_feature_test: %d FAILURES\n", fails); return 1; }
     printf("rt_feature_test OK (ambisonic-bed, reflection-tap, pathing+EQ, spread+MDAP+spectral+frame, "
            "tracked-room-EQ, decorrelation, parametric-bed, pose-pred, near-spread, hole-spread, source-size, "
            "loudness-comp, proximity, manual-directivity, multi-listener, pitch, bed-rotation+orientation, "
            "max-rE+split, extent, asset-meta+attenuation, ISM early-reflections+ground+polarity, "
-           "air+Doppler, speed-of-sound, reverb-send, dual-band, direct-binaural verified)\n");
+           "air+Doppler, speed-of-sound, reverb-send, dual-band, direct-binaural, direct-channel-route+binaural verified)\n");
     return 0;
 }

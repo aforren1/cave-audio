@@ -251,6 +251,77 @@ int main(void) {
     bwa_sound_release(e, km);
     render_energy(e, 2);
 
+    /* ---- async: the documented call order survives the adoption ---- */
+    /* Every layer says to set the region AFTER the play, because the bounds resolve against the
+     * bound asset. A HELD play has not reached the audio thread, so a plain enqueue would be
+     * consumed against a voice with nothing bound and the adoption would then reset the region from
+     * the play call - losing it silently, on the only order the docs allow. Same DETERMINISM BY
+     * ORDERING as the held-play case above: neither bwa_source_play nor bwa_source_set_region is a
+     * pump point, so the play below is guaranteed held. Do not insert an is_ready between them. */
+    CHECK(write_wav("bwa_assets_region.wav", 1, 0.5f, 8 * BLK) != 0, "write the async region wav");
+    bwa_source rsrc = bwa_source_create(e);
+    bwa_source_set_pos(e, rsrc, spk[0], spk[1], spk[2]);
+    bwa_commit(e);
+    bwa_sound rsnd = bwa_sound_acquire_async(e, "bwa_assets_region.wav", 0);
+    CHECK(rsnd != 0, "async region: acquire hands back a handle");
+    bwa_source_play(e, rsrc, rsnd, true);                 /* looping the whole 8-block clip ... */
+    bwa_source_set_region(e, rsrc, 0, 2 * BLK);           /* ... narrowed to the first 2 blocks */
+    CHECK(bwa_sound_get_channels(e, rsnd) == 0, "async region: the play was HELD");
+    CHECK(wait_ready(e, rsnd) != 0, "async region: the decode lands");
+    render_energy(e, 3);                                  /* 0->256, 256->512 (the end), wrap then 0->256 */
+    CHECK(bwa_source_get_playhead_frames(e, rsrc) == BLK,
+          "async region: the region survives the adoption (=> 256; a lost region reads 768)");
+    bwa_source_stop(e, rsrc);
+    render_energy(e, 2);
+    bwa_source_destroy(e, rsrc);
+    bwa_sound_release(e, rsnd);
+    render_energy(e, 2);
+
+    /* ---- a scene stop cancels the HELD plays it owns ---- */
+    /* bwa_stop_all always dropped every held play, or one would start by itself the moment its
+     * decode landed - a sound beginning after the caller said stop. bwa_group_stop now does the
+     * same for its own members, so the rule is the same whichever stop you reach for.
+     *
+     * DETERMINISM BY ORDERING: neither bwa_source_play nor bwa_group_stop is a pump point, and
+     * bwa_sound_get_channels forwards straight to the sound table, so the plays below are
+     * GUARANTEED still held when the stop runs. ONE asset feeds both sources on purpose: a second
+     * bwa_sound_acquire_async would pump on entry and could adopt this decode before the plays,
+     * which would silently turn a held play into an ordinary bind and delete the coverage. Both
+     * held entries then resolve in the SAME publish, so the group is the only thing separating
+     * them.
+     *
+     * The KEPT arm is not decoration. Without it an engine that dropped EVERY held play, whatever
+     * its group, would pass the stopped arm. */
+    CHECK(write_wav("bwa_assets_gstop.wav", 1, 0.5f, LEN) != 0, "write the group-stop wav");
+    bwa_source gs = bwa_source_create(e), gk = bwa_source_create(e);
+    CHECK(gs != 0 && gk != 0, "group stop: two sources");
+    bwa_source_set_pos(e, gs, spk[0], spk[1], spk[2]);
+    bwa_source_set_pos(e, gk, spk[3], spk[4], spk[5]);
+    bwa_source_set_group(e, gs, 1);            /* the group that gets stopped */
+    bwa_source_set_group(e, gk, 2);            /* the group that does not */
+    bwa_commit(e);
+    bwa_sound gsn = bwa_sound_acquire_async(e, "bwa_assets_gstop.wav", 0);
+    CHECK(gsn != 0, "group stop: async acquire hands back a handle");
+    bwa_source_play(e, gs, gsn, true);
+    bwa_source_play(e, gk, gsn, true);
+    CHECK(bwa_sound_get_channels(e, gsn) == 0, "group stop: unpublished, so BOTH plays were HELD");
+    bwa_group_stop(e, 1);
+    CHECK(wait_ready(e, gsn) != 0, "group stop: the decode lands");
+    CHECK(render_energy(e, 4) > 0.0, "group stop: the surviving play is audible");
+    CHECK(bwa_source_is_playing(e, gs) == false,
+          "group stop: the held play in the stopped group never starts");
+    CHECK(bwa_source_is_playing(e, gk),
+          "group stop: a held play in ANOTHER group is untouched and starts");
+    for (int i = 0; i < 20; ++i) { bwa_commit(e); }   /* pump well past the adoption */
+    render_energy(e, 4);
+    CHECK(bwa_source_is_playing(e, gs) == false, "group stop: ...and it does not start later either");
+    bwa_source_stop(e, gk);
+    render_energy(e, 2);
+    bwa_source_destroy(e, gs);
+    bwa_source_destroy(e, gk);
+    bwa_sound_release(e, gsn);
+    render_energy(e, 2);
+
     /* ---- releasing an in-flight async load ---- */
     /* Unlike the held-play case above, this one canNOT be made deterministic by ordering:
      * bwa_sound_release pumps on entry, so a decode that already finished is adopted before the
@@ -303,7 +374,7 @@ int main(void) {
 
     remove(MONO); remove(BED);
     remove("bwa_assets_async.wav"); remove("bwa_assets_cancel.wav");
-    remove("bwa_assets_kbed.wav"); remove("bwa_assets_kmono.wav");
+    remove("bwa_assets_kbed.wav"); remove("bwa_assets_kmono.wav"); remove("bwa_assets_region.wav");
 
     if (fails) { printf("assets: %d FAILED\n", fails); return 1; }
     printf("assets: OK\n");

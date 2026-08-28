@@ -33,6 +33,14 @@ static int fails;
 static const char* WAV  = "bwa_abuse_tone.wav";   /* mono 48 k point-source fixture */
 static const char* QUAD = "bwa_abuse_quad.wav";   /* 4-ch 48 k AmbiX-shaped bed fixture */
 
+/* The absurd-but-finite pairs, up here rather than beside the probes that name them, because
+ * bwa_box_mesh is PURE and its probes run in the engine-free sweep below. absurd_coords() and
+ * absurd_room_dims() own the reasoning for the values. */
+#define ABSURD_COORD    3.0e38f
+#define LEGAL_COORD     1.0e6f   /* BWA_MAX_COORD: the largest coordinate that must be ACCEPTED */
+#define ABSURD_ROOM_DIM 3.0e38f
+#define LEGAL_ROOM_DIM  5.0e5f   /* BWA_MAX_ROOM_DIM: the largest dimension that must be ACCEPTED */
+
 /* 16-bit PCM wav, `nch` interleaved copies of a 440 Hz tone at the engine rate — mono for the
  * point-source cases, 4-ch so bwa_load_ambix yields a genuine multichannel (bed) handle. */
 static int write_wav(const char* path, uint32_t frames, uint16_t nch) {
@@ -118,7 +126,7 @@ static void null_engine_sweep(void) {
     CHECK(bwa_get_sample_rate(NULL) == 0 && bwa_get_block_size(NULL) == 0,
           "resolved config of a NULL engine reads 0");
     CHECK(bwa_get_channel_count(NULL) == 0, "channel count of a NULL engine reads 0");
-    CHECK(bwa_get_dsp_time(NULL) == 0, "dsp time of a NULL engine reads 0");
+    CHECK(bwa_get_dsp_time_frames(NULL) == 0, "dsp time of a NULL engine reads 0");
     CHECK(bwa_get_output_latency_frames(NULL) == 0, "latency of a NULL engine reads 0");
     CHECK(bwa_get_active_voices(NULL) == 0, "active voices of a NULL engine reads 0");
     CHECK(bwa_get_xruns(NULL) == 0, "xruns of a NULL engine reads 0");
@@ -139,7 +147,12 @@ static void null_engine_sweep(void) {
         bwa_source out[4]; uint64_t dropped = 77;
         CHECK(bwa_poll_ended(NULL, out, 4, &dropped) == 0 && dropped == 0,
               "poll_ended on a NULL engine reads 0 events, 0 dropped");
+        dropped = 77;
+        CHECK(bwa_poll_looped(NULL, out, 4, &dropped) == 0 && dropped == 0,
+              "poll_looped on a NULL engine reads 0 events, 0 dropped");
     }
+    bwa_source_set_channel(NULL, 1, 0);       /* void setters on a NULL engine: must not crash */
+    bwa_source_set_region(NULL, 1, 0, 100);
     CHECK(bwa_source_create(NULL) == 0 && bwa_source_create_push(NULL) == 0,
           "source create on a NULL engine returns 0");
     CHECK(bwa_bed_create(NULL) == 0, "bed create on a NULL engine returns 0");
@@ -196,6 +209,8 @@ static void null_engine_sweep(void) {
     bwa_bed_fade_out(NULL, 1, 1.f);         bwa_bed_set_paused(NULL, 1, true);
     bwa_bed_seek(NULL, 1, 0);               bwa_bed_set_priority(NULL, 1, 1);
     bwa_bed_set_group(NULL, 1, 0);          bwa_unload_sound(NULL, 1);
+    bwa_bed_play_at(NULL, 1, 1, false, 0);  bwa_bed_play_loop(NULL, 1, 1, 0, 100);
+    bwa_bed_stop_at(NULL, 1, 0);            bwa_bed_set_region(NULL, 1, 0, 100);
     bwa_material_release(NULL, 1);
     bwa_scene_set_mesh_mat(NULL, NULL, 0, NULL, 0, NULL);
     bwa_scene_set_box(NULL, 4, 3, 5, NULL); bwa_scene_set_ism_room(NULL, 4, 3, 5, NULL);
@@ -270,6 +285,43 @@ static void null_engine_sweep(void) {
         CHECK(!bwa_box_mesh(4, -3, 5, NULL, v, tr, m), "box mesh: negative height refused");
         CHECK(!bwa_box_mesh(4, 3, NAN, NULL, v, tr, m), "box mesh: NaN depth refused");
         CHECK(bwa_box_mesh(4, 3, 5, NULL, v, tr, NULL), "box mesh: NULL tri_material is allowed");
+
+        /* Absurd-but-finite dimensions, the class absurd_room_dims() covers for the two ROOM calls.
+         * bwa_box_mesh needs its own probes because it is PURE and exported: a caller reaches it
+         * with no engine at all, so bwa_scene_set_box's guard never sees that call. What it emits
+         * is +/-w/2, 0..h, +/-d/2, and those vertices legitimately go on to bwa_scene_set_mesh_mat
+         * or bwa_scene_add_dynamic_mesh, which read them as ROOM COORDINATES - so 3e38 in returns
+         * 1.5e38 out, and the caller feeds the engine geometry no coordinate guard would accept.
+         * There is no engine here, so the bool return is the entire report. */
+        CHECK(!bwa_box_mesh(ABSURD_ROOM_DIM, 3, 5, NULL, v, tr, m), "box mesh: absurd width refused");
+        CHECK(!bwa_box_mesh(4, ABSURD_ROOM_DIM, 5, NULL, v, tr, m), "box mesh: absurd height refused");
+        CHECK(!bwa_box_mesh(4, 3, ABSURD_ROOM_DIM, NULL, v, tr, m), "box mesh: absurd depth refused");
+
+        /* A refused call writes NOTHING: the header says so, and a caller that ignores the bool
+         * must not end up handing stale-or-garbage vertices to set_mesh_mat. Sentinel the outputs,
+         * refuse, and check they are untouched - this is what pins the guard AHEAD of the memcpy. */
+        for (int i = 0; i < 24; ++i) v[i] = -12345.f;
+        tr[0] = -1; m[0] = 7u;
+        (void)bwa_box_mesh(ABSURD_ROOM_DIM, ABSURD_ROOM_DIM, ABSURD_ROOM_DIM, NULL, v, tr, m);
+        { int untouched = (tr[0] == -1) && (m[0] == 7u);
+          for (int i = 0; i < 24; ++i) if (v[i] != -12345.f) untouched = 0;
+          CHECK(untouched, "a refused box mesh must write nothing to the caller's arrays"); }
+
+        /* The bound must not be TIGHT: the largest legal room is the one bwa_scene_set_ism_room
+         * accepts, and box_mesh has to agree or the composition recipe in the header half-succeeds
+         * (a shoebox the engine took, with no triangles for it). */
+        CHECK(bwa_box_mesh(LEGAL_ROOM_DIM, LEGAL_ROOM_DIM, LEGAL_ROOM_DIM, NULL, v, tr, m),
+              "box mesh: the largest LEGAL room dimension must be accepted");
+        /* and what it emits at that extreme is still inside the coordinate envelope, which is the
+         * whole reason the room-dimension bound (half BWA_MAX_COORD) is the right one here. The
+         * largest vertex is the +y face at exactly h, so testing for h rather than merely "small"
+         * keeps this red when a too-tight bound refuses the call and leaves the sentinel behind. */
+        { float mx = 0.f;
+          for (int i = 0; i < 24; ++i) { const float a = fabsf(v[i]); if (a > mx) mx = a; }
+          CHECK(mx == LEGAL_ROOM_DIM && mx <= LEGAL_COORD,
+                "the largest legal box must emit its own extent (%g, expected %g) and every vertex "
+                "must stay a legal room coordinate (within %g)",
+                (double)mx, (double)LEGAL_ROOM_DIM, (double)LEGAL_COORD); }
     }
     {
         uint32_t nd = bwa_get_asio_driver_count();
@@ -314,7 +366,9 @@ static void with_engine_null_zero(void) {
     bwa_get_listener_pose(e, NULL, NULL);              /* documented guard: no crash */
     { bwa_source out[2];
       CHECK(bwa_poll_ended(e, NULL, 4, NULL) == 0, "poll_ended NULL out reads 0");
-      CHECK(bwa_poll_ended(e, out, 0, NULL) == 0, "poll_ended cap 0 reads 0"); }
+      CHECK(bwa_poll_ended(e, out, 0, NULL) == 0, "poll_ended cap 0 reads 0");
+      CHECK(bwa_poll_looped(e, NULL, 4, NULL) == 0, "poll_looped NULL out reads 0");
+      CHECK(bwa_poll_looped(e, out, 0, NULL) == 0, "poll_looped cap 0 reads 0"); }
     { bwa_health h; CHECK(!bwa_get_health(e, NULL), "health with NULL out must report false");
       /* manual sink: no deadline, so health is documented UNMEASURABLE — false, out zeroed */
       memset(&h, 0xAA, sizeof h);
@@ -567,18 +621,83 @@ static void kind_mismatch(void) {
     CHECK(!bwa_play_oneshot(e, ambi, 0, 1, 0, 1.f) && bwa_last_error(e) != NULL,
           "a oneshot on a bed asset must be refused with a reason");
 
-    /* a mono asset on a bed: documented reject */
+    /* a mono asset on a bed: documented reject. Every bed PLAY form carries the same guard - the
+     * scheduled and region forms are separate entry points, not aliases, so each needs its own
+     * assertion or an unguarded one would only show up as a soundfield rendered as a point source. */
     clr(e);
     bwa_bed_play(e, b, mono, true);
     CHECK(bwa_last_error(e) != NULL, "a mono asset on a bed must be reported");
     CHECK(!bwa_bed_is_playing(e, b), "the mismatched bed play must not have started");
+    clr(e);
+    bwa_bed_play_at(e, b, mono, true, 0);
+    CHECK(bwa_last_error(e) != NULL, "a mono asset on bed_play_at must be reported");
+    CHECK(!bwa_bed_is_playing(e, b), "the mismatched bed_play_at must not have started");
+    clr(e);
+    bwa_bed_play_loop(e, b, mono, 0, 100);
+    CHECK(bwa_last_error(e) != NULL, "a mono asset on bed_play_loop must be reported");
+    CHECK(!bwa_bed_is_playing(e, b), "the mismatched bed_play_loop must not have started");
     /* and the right pairing still works after all the rejections */
     clr(e);
     bwa_bed_play(e, b, ambi, true);
     CHECK(bwa_last_error(e) == NULL, "a correct bed play must not report");
     bwa_commit(e);
     CHECK(render_blocks(e, 2) == 1 && bwa_bed_is_playing(e, b), "the bed actually plays");
+    /* the bed facade's own region guard: it must refuse a degenerate pair AND name ITSELF, because
+     * a bed caller reading bwa_last_error should never be pointed at a bwa_source_* call. */
+    clr(e);
+    bwa_bed_set_region(e, b, 200, 100);
+    { const char* m = bwa_last_error(e);
+      CHECK(m && strstr(m, "bwa_bed_set_region"),
+            "bed_set_region: a degenerate region is refused, and the message names bwa_bed_set_region"); }
+    clr(e);
+    bwa_bed_set_region(e, b, 0, 100);
+    CHECK(bwa_last_error(e) == NULL, "bed_set_region: a well-ordered region is accepted silently");
+    /* and it REACHES the bed, not just the error path. The fixture is 512 frames and the block is
+     * 256, so a whole-clip loop parks the playhead on 512; the 100-frame region then catches the
+     * cursor up (512 -> 512 % 100 = 12) and wraps twice more inside the block, landing on
+     * (12 + 255) % 100 + 1 = 68. Nothing near zero on either side, and a bed that ignored the
+     * region would read 256 or 512.
+     * This used to read 56, because mix_bed slammed the catch-up cursor to start_frame and threw
+     * the remainder away while mix_voice kept it. bwa_bed_set_region is an ALIAS of
+     * bwa_source_set_region, so the two answering differently was the defect; both mixers now share
+     * one seam helper (loop_wrap). */
+    CHECK(render_blocks(e, 1) == 1 && bwa_bed_is_playing(e, b) &&
+          bwa_bed_get_playhead_frames(e, b) == 68,
+          "bed_set_region: the region reaches the bed voice (playhead 68, not 256/512)");
+    /* bed_stop_at: the scheduled stop reaches a BED voice too (the fire point is in the shared
+     * voice loop, not in mix_voice). Two arms, because either alone is weak: a stop one second out
+     * must NOT stop it within a few blocks, and a stop one sample out MUST. */
+    clr(e);
+    bwa_bed_stop_at(e, b, bwa_get_dsp_time_frames(e) + 48000);
+    CHECK(render_blocks(e, 4) == 1 && bwa_last_error(e) == NULL && bwa_bed_is_playing(e, b),
+          "bed_stop_at: a stop one second out does not stop the bed yet");
+    bwa_bed_stop_at(e, b, bwa_get_dsp_time_frames(e) + 1);
+    CHECK(render_blocks(e, 4) == 1 && !bwa_bed_is_playing(e, b),
+          "bed_stop_at: a stop the next block reaches actually stops the bed");
     bwa_bed_stop(e, b);
+    /* the correct pairing on the scheduled and region forms too. bed_play_at gets the real
+     * scheduling observable (silent, THEN audible), because "it plays" alone would pass on a call
+     * that threw start_sample away. */
+    clr(e);
+    bwa_bed_play_at(e, b, ambi, true, bwa_get_dsp_time_frames(e) + 3 * 256);
+    CHECK(bwa_last_error(e) == NULL, "a correct bed_play_at must not report");
+    bwa_commit(e);
+    { double pk = 0;
+      CHECK(render_peak(e, 2, &pk) == 1 && pk < 1e-6, "bed_play_at: silent before the scheduled sample");
+      pk = 0;
+      CHECK(render_peak(e, 4, &pk) == 1 && pk > 1e-3 && bwa_bed_is_playing(e, b),
+            "bed_play_at: audible once the dsp clock reaches the scheduled sample"); }
+    bwa_bed_stop(e, b);
+    CHECK(render_blocks(e, 4) == 1, "settle the bed stop");
+    clr(e);
+    bwa_bed_play_loop(e, b, ambi, 0, 100);
+    CHECK(bwa_last_error(e) == NULL, "a correct bed_play_loop must not report");
+    bwa_commit(e);
+    CHECK(render_blocks(e, 1) == 1 && bwa_bed_is_playing(e, b) &&
+          bwa_bed_get_playhead_frames(e, b) == 56,
+          "bed_play_loop: the play-time region takes (playhead 56, not the whole-clip 256)");
+    bwa_bed_stop(e, b);
+    CHECK(render_blocks(e, 4) == 1, "settle the bed stop");
 
     /* the queue is documented in-memory mono only: bed assets and streams are rejected */
     bwa_source_play(e, s, mono, false);
@@ -762,7 +881,546 @@ static void poison_boundary(bwa_engine* e, bwa_source s) {
     bwa_source_seek(e, s, ~0ull);                        /* past-the-end seek: wraps or ends */
 }
 
+/* ---- absurd-but-finite COORDINATES --------------------------------------------------------
+ * A finite-but-absurd COORDINATE is its own defect class, and the isfinite-reject family above
+ * does not cover it: 3e38 passes every isfinite() guard on a position, and the first thing every
+ * spatial solve does is SQUARE the difference (dbap.c's dist2, the spread frame's normalize, the
+ * ISM path length), so dx*dx overflows to +Inf before any downstream guard sees a number it could
+ * reject. The Inf/Inf and Inf*0 of the normalize that follows are NaN; the NaN lands in the gain
+ * vector, and the ramp x + (t - x) * k can never leave it, so every later block is poisoned too
+ * and the value reaches the align delay line and the room-EQ biquads, whose IIR state holds it
+ * past any later correction. test_fuzz_api seeds 126 / 142 / 185 (and 232 / 237) found this on the
+ * listener pose. Coordinates are bounded at BWA_MAX_COORD (rt.h) now, and REJECTED rather than
+ * clamped, so the last good position stands.
+ *
+ * Two things make these assertions able to fail, and both are load-bearing:
+ *   - the limiter is OFF, exactly as in the group-gain probe below. Its hard clamp scrubs
+ *     non-finite samples to 0, which would make the finite-output assertion unfailable.
+ *   - MDAP spread is on. The overflow needs a spread frame around the listener->source direction;
+ *     the default LOBE mode absorbed the same pose, so a probe that left spread alone would be
+ *     green by numerical luck rather than by a guard (measured: pan x spread-mode sweep, MDAP and
+ *     SPECTRAL non-finite pre-fix, LOBE clean).
+ * Every probe also asserts the voice stays AUDIBLE at its old level, which is what separates a
+ * real reject from a fix that silences the bus or clamps the source out to 1e6 m.
+ *
+ * Which assertion carries which falsification (each was run, red confirmed, then restored):
+ *   remove the bound (BWA_MAX_COORD = FLT_MAX)  -> 1's three, 2's level, 4's refuse go red
+ *   clamp instead of reject                     -> 1's level + readback, 2's level, 4's refuse
+ *   bound too tight (1e3)                       -> 5's readback
+ *   bound below every legal position (0.5)      -> 4's accept, 5's readback
+ * The finite-output assertions in 2, 4 and 5 did NOT go red on their own: an out-of-range SOURCE
+ * yields all-zero gains rather than a NaN. They state the contract; the level and readback
+ * assertions beside them are what actually pin the fix. */
+/* ABSURD_COORD / LEGAL_COORD are defined at the top of the file, beside the room-dimension pair. */
+
+/* one engine with a live, audible, MDAP-spread voice and the limiter off. Returns NULL on any
+ * setup failure (already CHECKed), else the engine with `*pk0` = the settled pre-poison peak. */
+static bwa_engine* coord_probe_engine(const char* what, bwa_source* s_out, double* pk0) {
+    bwa_desc d = manual_desc();
+    bwa_engine* e = bwa_create(&d);
+    if (!e) { CHECK(0, "%s: probe engine create failed", what); return NULL; }
+    bwa_set_limiter(e, false);
+    bwa_set_spread_mode(e, BWA_SPREAD_MDAP);
+    uint32_t snd = bwa_load_sound(e, WAV);
+    bwa_source s = bwa_source_create(e);
+    bwa_source_play(e, s, snd, true);
+    bwa_source_set_pos(e, s, 1.f, 1.5f, 0.f);
+    bwa_source_set_spread(e, s, 0.6f);
+    bwa_set_listener_pose(e, 0.f, 1.5f, 0.f, 0.f, 0.f, 0.f, 1.f);
+    bwa_commit(e);
+    if (bwa_start(e) != BWA_OK || !snd || !bwa_source_is_playing(e, s)) {
+        CHECK(0, "%s: probe voice did not come up (snd=%u playing=%d)", what, snd,
+              (int)bwa_source_is_playing(e, s));
+        bwa_destroy(e); return NULL;
+    }
+    render_blocks(e, 8);                                  /* let the gain ramps settle */
+    *pk0 = 0;
+    if (render_peak(e, 4, pk0) != 1 || !(*pk0 > 1e-6)) {  /* else every assertion below is vacuous */
+        CHECK(0, "%s: probe voice is silent or already non-finite before the poison (peak %g)", what, *pk0);
+        bwa_destroy(e); return NULL;
+    }
+    *s_out = s;
+    return e;
+}
+
+static void absurd_coords(void) {
+    /* 1. the listener pose — the exact condition the three fuzz seeds hit */
+    {   bwa_source s; double pk0 = 0;
+        bwa_engine* e = coord_probe_engine("absurd listener coordinate", &s, &pk0);
+        if (e) {
+            bwa_set_listener_pose(e, 0.f, ABSURD_COORD, 0.f, 0.f, 0.f, 0.f, 1.f);
+            bwa_commit(e);
+            /* 48 blocks before measuring: a gain change RAMPS, so a poison that silences the voice
+             * still shows the old level for the first few blocks. Measuring too early makes the
+             * reject-versus-clamp assertion a coin flip (it was: 8 blocks passed either way). */
+            int r0 = render_blocks(e, 48);
+            double pk = 0;
+            int r = (r0 == 1) ? render_peak(e, 8, &pk) : r0;
+            CHECK(r == 1, "an absurd (finite) listener coordinate must not push non-finite samples "
+                          "to the device (render=%d)", r);
+            /* rejected, not clamped: a clamp to 1e6 m would attenuate the voice to nothing, so
+             * holding the pre-poison level is what proves the previous pose still stands */
+            CHECK(pk > pk0 * 0.5, "an absurd listener coordinate must be REJECTED, leaving the "
+                                  "previous pose and level (peak %g, was %g)", pk, pk0);
+            float p[3] = { -1.f, -1.f, -1.f }, q[4] = { 9, 9, 9, 9 };
+            bwa_get_listener_pose(e, p, q);
+            CHECK(p[1] == 1.5f, "the listener readback must still report the last GOOD pose after an "
+                                "absurd set (y = %g, expected 1.5)", (double)p[1]);
+            bwa_destroy(e);
+        } }
+    /* 2. the source position: same class, the other end of the same subtraction */
+    {   bwa_source s; double pk0 = 0;
+        bwa_engine* e = coord_probe_engine("absurd source coordinate", &s, &pk0);
+        if (e) {
+            bwa_source_set_pos(e, s, ABSURD_COORD, 1.5f, 0.f);
+            bwa_commit(e);
+            /* 48 blocks before measuring, for the reason spelled out in probe 1 */
+            int r0 = render_blocks(e, 48);
+            double pk = 0;
+            int r = (r0 == 1) ? render_peak(e, 8, &pk) : r0;
+            CHECK(r == 1, "an absurd (finite) source coordinate must not push non-finite samples "
+                          "to the device (render=%d)", r);
+            CHECK(pk > pk0 * 0.5, "an absurd source coordinate must be REJECTED, leaving the source "
+                                  "where it was (peak %g, was %g)", pk, pk0);
+            bwa_destroy(e);
+        } }
+    /* 3. an EXTRA listener: its own setter, its own guard. HONEST LIMIT: neither assertion here
+     * was falsifiable. Removing the bound and switching it to a clamp were both tried, and this
+     * block stayed green either way, because the compromise solve happens to turn an out-of-range
+     * extra listener into all-zero weights rather than a NaN and the primary listener still
+     * carries the image. So this pins no defect today. It is kept as a forward guard: the
+     * compromise solve is the one place a future change would start SQUARING an extra listener's
+     * coordinate, and this probe would then be the thing that noticed. Do not read it as coverage. */
+    {   bwa_source s; double pk0 = 0;
+        bwa_engine* e = coord_probe_engine("absurd extra-listener coordinate", &s, &pk0);
+        if (e) {
+            float xyz[3] = { ABSURD_COORD, 1.5f, 0.f };
+            bwa_set_extra_listeners(e, xyz, 1);
+            bwa_commit(e);
+            /* 48 blocks before measuring, for the reason spelled out in probe 1 */
+            int r0 = render_blocks(e, 48);
+            double pk = 0;
+            int r = (r0 == 1) ? render_peak(e, 8, &pk) : r0;
+            CHECK(r == 1, "an absurd (finite) extra-listener coordinate must not push non-finite "
+                          "samples to the device (render=%d)", r);
+            CHECK(pk > pk0 * 0.5, "an absurd extra-listener coordinate must be REJECTED (peak %g, "
+                                  "was %g)", pk, pk0);
+            bwa_destroy(e);
+        } }
+    /* 4. a oneshot's position: it owns no handle, so a rejected set_pos would leave the transient
+     * playing at the origin instead of not playing at all — the reason it guards separately */
+    {   bwa_desc d = manual_desc();
+        bwa_engine* e = bwa_create(&d);
+        CHECK(e != NULL, "absurd oneshot coordinate: probe engine create failed");
+        if (e) {
+            bwa_set_limiter(e, false);
+            uint32_t snd = bwa_load_sound(e, WAV);
+            CHECK(bwa_start(e) == BWA_OK && snd != 0, "absurd oneshot coordinate: probe setup");
+            CHECK(bwa_play_oneshot(e, snd, 1.f, 1.5f, 0.f, 1.f),
+                  "a LEGAL oneshot position must be accepted (else the reject below proves nothing)");
+            CHECK(!bwa_play_oneshot(e, snd, ABSURD_COORD, 1.5f, 0.f, 1.f),
+                  "an absurd (finite) oneshot coordinate must be refused");
+            bwa_commit(e);
+            int r = render_blocks(e, 8);
+            CHECK(r == 1, "a refused oneshot must not push non-finite samples (render=%d)", r);
+            bwa_destroy(e);
+        } }
+    /* 5. the bound must not be TIGHT: 1e6 m is a legal (if silly) coordinate and has to be
+     * accepted, or "no NaN" could be bought by rejecting everything. The listener really moves. */
+    {   bwa_source s; double pk0 = 0;
+        bwa_engine* e = coord_probe_engine("legal extreme coordinate", &s, &pk0);
+        if (e) {
+            bwa_set_listener_pose(e, 0.f, LEGAL_COORD, 0.f, 0.f, 0.f, 0.f, 1.f);
+            bwa_commit(e);
+            /* 48 blocks before measuring, for the reason spelled out in probe 1 */
+            int r0 = render_blocks(e, 48);
+            double pk = 0;
+            int r = (r0 == 1) ? render_peak(e, 8, &pk) : r0;
+            CHECK(r == 1, "a legal extreme coordinate must render finite (render=%d)", r);
+            float p[3] = { -1.f, -1.f, -1.f }, q[4] = { 9, 9, 9, 9 };
+            bwa_get_listener_pose(e, p, q);
+            CHECK(p[1] == LEGAL_COORD, "%g m must be ACCEPTED, not rejected as absurd (readback y = %g)",
+                  (double)LEGAL_COORD, (double)p[1]);
+            bwa_destroy(e);
+        } }
+}
+
+/* ---- absurd-but-finite ROOM GEOMETRY -------------------------------------------------------
+ * The same defect class one step removed. A room dimension and a ground-plane height are not
+ * coordinates the panner reads; they are what ism.c MIRRORS a source across (`2*plane - src`), so
+ * an absurd-but-finite room is an absurd IMAGE POSITION, and the image goes straight into
+ * panner_gains, whose dist2 overflows to +Inf and normalizes to NaN. The NaN sticks in the
+ * per-image gain ramp (v->ism_g) for the same reason the voice ramp holds one. w = h = d = 3e38
+ * passes the shoebox's own inside test (the faces are at +/-1.5e38), so nothing downstream of the
+ * setter can catch it. Dimensions are bounded at BWA_MAX_ROOM_DIM and the ground height at
+ * BWA_MAX_COORD (both rt.h), both REJECTED rather than clamped.
+ *
+ * The limiter is OFF in the render probes for the reason absurd_coords() gives: its hard clamp
+ * scrubs non-finite samples to 0, which makes a finite-output assertion unfailable.
+ *
+ * Which assertion carries which falsification (each was run, red confirmed, then restored):
+ *   remove the dimension bound (BWA_MAX_ROOM_DIM = FLT_MAX) -> 1's refusal + 1's room readback,
+ *                                                              2's finite + 2's level
+ *   remove the ground bound (back to plain isfinite)        -> 3's refusal, 3's finite + level
+ *   dimension bound too tight (1e2)                         -> 4's accept + 4's ISM enable
+ *   ground bound too tight (1e2)                            -> 4's ground accept
+ * Probe 1's ROOM READBACK is the discrete one: an engine that never had a room refuses
+ * bwa_source_set_early_reflections by name, so it reports whether the absurd room was stored. */
+/* ABSURD_ROOM_DIM / LEGAL_ROOM_DIM are defined at the top of the file: bwa_box_mesh takes no engine,
+ * so its probes for the same bound run in the engine-free sweep, ahead of this section. */
+
+/* one engine with a live, audible voice whose IMAGE-SOURCE reflections are on over a good shoebox,
+ * limiter off. Returns NULL on any setup failure (already CHECKed), else `*pk0` = settled peak. */
+static bwa_engine* ism_probe_engine(const char* what, double* pk0) {
+    bwa_desc d = manual_desc();
+    bwa_engine* e = bwa_create(&d);
+    if (!e) { CHECK(0, "%s: probe engine create failed", what); return NULL; }
+    bwa_set_limiter(e, false);
+    uint32_t snd = bwa_load_sound(e, WAV);
+    bwa_source s = bwa_source_create(e);
+    bwa_source_play(e, s, snd, true);
+    bwa_source_set_pos(e, s, 1.f, 1.5f, 0.f);
+    bwa_set_listener_pose(e, 0.f, 1.5f, 0.f, 0.f, 0.f, 0.f, 1.f);
+    bwa_scene_set_ism_room(e, 8.f, 4.f, 8.f, NULL);   /* not set_box: keeps the ray-traced mesh, and
+                                                       * therefore the SDK, out of the probe */
+    clr(e);
+    bwa_source_set_early_reflections(e, s, true);
+    bwa_commit(e);
+    if (bwa_start(e) != BWA_OK || !snd || bwa_last_error(e) != NULL || !bwa_source_is_playing(e, s)) {
+        CHECK(0, "%s: probe voice did not come up with reflections (snd=%u err=%s)", what, snd,
+              bwa_last_error(e) ? bwa_last_error(e) : "none");
+        bwa_destroy(e); return NULL;
+    }
+    render_blocks(e, 8);                                  /* let the gain ramps settle */
+    *pk0 = 0;
+    if (render_peak(e, 4, pk0) != 1 || !(*pk0 > 1e-6)) {  /* else every assertion below is vacuous */
+        CHECK(0, "%s: probe voice is silent or already non-finite before the poison (peak %g)", what, *pk0);
+        bwa_destroy(e); return NULL;
+    }
+    return e;
+}
+
+static void absurd_room_dims(void) {
+    /* 1. the dimensions are refused, AND the refused room is not stored. The second half is the
+     * discrete readback: with no room ever set, enabling reflections names the missing room. */
+    {   bwa_desc d = manual_desc();
+        bwa_engine* e = bwa_create(&d);
+        CHECK(e != NULL, "absurd room dimensions: probe engine create failed");
+        if (e) {
+            clr(e);
+            bwa_scene_set_ism_room(e, ABSURD_ROOM_DIM, ABSURD_ROOM_DIM, ABSURD_ROOM_DIM, NULL);
+            CHECK(bwa_last_error(e) != NULL,
+                  "an absurd (finite) ISM room dimension must be refused with a reason");
+            clr(e);
+            bwa_source s = bwa_source_create(e);
+            bwa_source_set_early_reflections(e, s, true);
+            CHECK(bwa_last_error(e) != NULL,
+                  "a refused room must not become the scene's room (enabling reflections after it "
+                  "must still report the missing room)");
+            bwa_destroy(e);
+        } }
+    /* 2. a live ISM voice: poisoning the room mid-render must leave the previous room standing,
+     * so the reflections keep rendering finite AND audible. The level is what separates a real
+     * reject from an accept that mirrors every image out to +Inf and NaNs the bus. */
+    {   double pk0 = 0;
+        bwa_engine* e = ism_probe_engine("absurd room dimensions, live", &pk0);
+        if (e) {
+            bwa_scene_set_ism_room(e, ABSURD_ROOM_DIM, ABSURD_ROOM_DIM, ABSURD_ROOM_DIM, NULL);
+            bwa_commit(e);
+            /* 48 blocks before measuring, for the reason absurd_coords() probe 1 spells out */
+            int r0 = render_blocks(e, 48);
+            double pk = 0;
+            int r = (r0 == 1) ? render_peak(e, 8, &pk) : r0;
+            CHECK(r == 1, "an absurd (finite) ISM room must not push non-finite samples to the "
+                          "device (render=%d)", r);
+            CHECK(pk > pk0 * 0.5, "an absurd ISM room must be REJECTED, leaving the previous room "
+                                  "and level (peak %g, was %g)", pk, pk0);
+            bwa_destroy(e);
+        } }
+    /* 3. the ground plane: its own setter, and the one with NO inside test, so the image is
+     * 2*y - src_y with nothing bounding src beyond BWA_MAX_COORD */
+    {   double pk0 = 0;
+        bwa_engine* e = ism_probe_engine("absurd ground height, live", &pk0);
+        if (e) {
+            clr(e);
+            bwa_scene_set_ground(e, ABSURD_COORD, 0, false);
+            CHECK(bwa_last_error(e) != NULL,
+                  "an absurd (finite) ground height must be refused with a reason");
+            bwa_commit(e);
+            /* 48 blocks before measuring, for the reason absurd_coords() probe 1 spells out */
+            int r0 = render_blocks(e, 48);
+            double pk = 0;
+            int r = (r0 == 1) ? render_peak(e, 8, &pk) : r0;
+            CHECK(r == 1, "an absurd (finite) ground height must not push non-finite samples to "
+                          "the device (render=%d)", r);
+            CHECK(pk > pk0 * 0.5, "an absurd ground height must be REJECTED, leaving the previous "
+                                  "room and level (peak %g, was %g)", pk, pk0);
+            bwa_destroy(e);
+        } }
+    /* 4. the bounds must not be TIGHT: the largest legal room and the largest legal ground height
+     * have to be accepted, or "no NaN" could be bought by refusing everything */
+    {   bwa_desc d = manual_desc();
+        bwa_engine* e = bwa_create(&d);
+        CHECK(e != NULL, "legal extreme room: probe engine create failed");
+        if (e) {
+            clr(e);
+            bwa_scene_set_ism_room(e, LEGAL_ROOM_DIM, LEGAL_ROOM_DIM, LEGAL_ROOM_DIM, NULL);
+            CHECK(bwa_last_error(e) == NULL, "a %g m room must be ACCEPTED, not refused as absurd (%s)",
+                  (double)LEGAL_ROOM_DIM, bwa_last_error(e) ? bwa_last_error(e) : "");
+            clr(e);
+            bwa_source s = bwa_source_create(e);
+            bwa_source_set_early_reflections(e, s, true);
+            CHECK(bwa_last_error(e) == NULL, "the accepted room must be the scene's room (enabling "
+                  "reflections must not report (%s))", bwa_last_error(e) ? bwa_last_error(e) : "");
+            clr(e);
+            bwa_scene_set_ground(e, LEGAL_COORD, 0, false);
+            CHECK(bwa_last_error(e) == NULL, "a ground plane at %g m must be ACCEPTED, not refused "
+                  "as absurd (%s)", (double)LEGAL_COORD, bwa_last_error(e) ? bwa_last_error(e) : "");
+            bwa_destroy(e);
+        } }
+}
+
+/* ---- a REFUSED bwa_scene_set_box must not become the RAY-TRACED scene (with-SDK only) --------
+ * absurd_room_dims() probe 1 covers the ISM half of set_box through bwa_last_error. The other half
+ * is the static mesh set_box hands to the ray tracer, which is SDK-side and has no readback - so
+ * this probe makes it observable the only way the ABI allows, by measuring what it OCCLUDES.
+ *
+ * Geometry: listener at the origin, source 100 m out on +X. An 8x4x8 box puts a wall between them
+ * (occluded); a 5e5 box swallows both (clear). Occlusion is a deterministic visibility trace, so
+ * the three states are far apart, not a threshold argument.
+ *
+ * Which assertion carries which falsification (each was run, red confirmed, then restored):
+ *   set_box's `!ism_dims_ok(...)` back to `!e->ism_room.valid` (only)  -> nothing goes red
+ *   bwa_box_mesh's dimension bound removed (only)                      -> nothing goes red HERE
+ *   BOTH of the above, the true pre-fix state                          -> the REFUSAL assertion,
+ *                                                                         occlusion 0.1 -> 1
+ *   bwa_box_mesh's bound alone tightened to 1e2                        -> the last assertion (0.1)
+ *   ism_dims_ok tightened to 1e2                                       -> the accept + the last
+ *   set_box no longer calling set_mesh_mat                             -> the 8x4x8 + the refusal
+ *   the 8x4x8 box set BEFORE the empty reading                         -> the empty reading
+ *
+ * READ THE FIRST TWO LINES HONESTLY. This probe cannot isolate either guard, and that is the shape
+ * of the fix rather than a gap in the probe: once bwa_box_mesh took the same bound, the two guards
+ * test an IDENTICAL predicate, so no input separates them. What it pins is the PROPERTY - a refused
+ * box never reaches the ray tracer - which is exactly what a future change deleting both would
+ * break. Do not read the refusal assertion as coverage of set_box's line on its own.
+ *
+ * The stale-flag bug it descends from: set_box guarded on ism_room.valid, which stays set from an
+ * EARLIER good room, so a refused room still built the mesh from the refused dimensions. */
+#define OCC_SETTLE_MS 300u          /* the occlusion sim runs at ~30 Hz; dynmesh_test settles in 250 */
+static void refused_box_ray_traced_mesh(void) {
+    bwa_desc d = manual_desc();
+    bwa_engine* e = bwa_create(&d);
+    CHECK(e != NULL, "refused box vs ray-traced mesh: probe engine create failed");
+    if (!e) return;
+
+    /* Is there a ray-traced scene at all? Without the Steam Audio backend set_box builds no mesh,
+     * occlusion reads a permanent 1.0, and every assertion below would be vacuous - so skip. The
+     * two failure modes are distinguishable: the no-SDK build returns -1 with NO error string,
+     * while an SDK build that failed for a real reason sets one. Do not let the second look like
+     * the first, or the whole probe silently stops running. */
+    static const float dv[4*3] = { 0,-1,-1,  0,1,-1,  0,1,1,  0,-1,1 };
+    static const int   dt[2*3] = { 0,1,2,  0,2,3 };
+    clr(e);
+    const int scene_probe = bwa_scene_add_dynamic_mesh(e, dv, 4, dt, 2, 0);
+    if (scene_probe < 0) {
+        CHECK(bwa_last_error(e) == NULL, "the ray-traced scene probe failed WITH a reason (%s): the "
+              "SDK is present but the occlusion probes were skipped as if it were not",
+              bwa_last_error(e) ? bwa_last_error(e) : "");
+        bwa_destroy(e); return;
+    }
+    bwa_scene_remove_dynamic_mesh(e, scene_probe);
+
+    bwa_source s = bwa_source_create(e);
+    bwa_source_set_pos(e, s, 100.f, 1.5f, 0.f);
+    bwa_source_set_occlusion(e, s, true);
+    bwa_set_listener_pose(e, 0.f, 1.5f, 0.f, 0.f, 0.f, 0.f, 1.f);
+    bwa_commit(e);
+    if (bwa_start(e) != BWA_OK || !s) {
+        CHECK(0, "refused box vs ray-traced mesh: probe setup (source=%u)", s);
+        bwa_destroy(e); return;
+    }
+    render_blocks(e, 4);              /* promote the pose: the sim traces from the PUBLISHED listener */
+    Sleep(OCC_SETTLE_MS);
+    const float occ_empty = bwa_source_get_occlusion(e, s);
+    CHECK(occ_empty > 0.9f, "with no scene geometry the line of sight must read clear (%g)",
+          (double)occ_empty);
+
+    /* the probe's POWER check: set_box really does reach the ray tracer, and this source really is
+     * outside an 8x4x8 box. Without this the refusal assertion below could pass on an engine whose
+     * set_box never built a mesh at all. */
+    bwa_scene_set_box(e, 8.f, 4.f, 8.f, NULL);
+    Sleep(OCC_SETTLE_MS);
+    const float occ_boxed = bwa_source_get_occlusion(e, s);
+    CHECK(occ_boxed < 0.5f, "an 8x4x8 box must occlude a source 100 m outside it (%g)",
+          (double)occ_boxed);
+
+    clr(e);
+    bwa_scene_set_box(e, ABSURD_ROOM_DIM, ABSURD_ROOM_DIM, ABSURD_ROOM_DIM, NULL);
+    CHECK(bwa_last_error(e) != NULL, "an absurd set_box must be refused with a reason");
+    Sleep(OCC_SETTLE_MS);
+    const float occ_refused = bwa_source_get_occlusion(e, s);
+    CHECK(occ_refused < 0.5f, "a REFUSED bwa_scene_set_box must leave the previous ray-traced mesh "
+          "standing, not rebuild it from the refused dimensions (occlusion %g, was %g)",
+          (double)occ_refused, (double)occ_boxed);
+
+    /* the bound must not be TIGHT, and this is also what proves the assertion above saw a REFUSAL
+     * rather than a set_box that cannot rebuild a large box at all */
+    clr(e);
+    bwa_scene_set_box(e, LEGAL_ROOM_DIM, LEGAL_ROOM_DIM, LEGAL_ROOM_DIM, NULL);
+    CHECK(bwa_last_error(e) == NULL, "a %g m box must be ACCEPTED, not refused as absurd (%s)",
+          (double)LEGAL_ROOM_DIM, bwa_last_error(e) ? bwa_last_error(e) : "");
+    Sleep(OCC_SETTLE_MS);
+    const float occ_huge = bwa_source_get_occlusion(e, s);
+    CHECK(occ_huge > 0.9f, "an accepted %g m box must rebuild the ray-traced mesh - the source is "
+          "inside it now, so the line of sight is clear again (%g)",
+          (double)LEGAL_ROOM_DIM, (double)occ_huge);
+
+    CHECK(render_blocks(e, 4) == 1, "renders finite across the box traffic");
+    bwa_destroy(e);
+}
+
+/* bwa_scene_set_dynamic_transform's translation is a ROOM POSITION reaching the same shared scene
+ * bwa_source_set_pos guards, and it had no bound of its own. The observable is the same one the
+ * probe above uses: a wall between listener and source occludes, so if a REFUSED transform were
+ * applied anyway the wall would move off and the line of sight would clear.
+ *
+ * Both sides are asserted. The refusal alone would pass against a bound so tight that no transform
+ * ever moves anything, which is why the legal move below has to CLEAR the occlusion. */
+static void refused_dynamic_transform(void) {
+    bwa_desc d = manual_desc();
+    bwa_engine* e = bwa_create(&d);
+    CHECK(e != NULL, "refused dynamic transform: probe engine create failed");
+    if (!e) return;
+
+    /* A 2x2 wall in the yz plane, moved into place by the transform under test. */
+    static const float dv[4*3] = { 0,-1,-1,  0,1,-1,  0,1,1,  0,-1,1 };
+    static const int   dt[2*3] = { 0,1,2,  0,2,3 };
+    clr(e);
+    const int wall = bwa_scene_add_dynamic_mesh(e, dv, 4, dt, 2, 0);
+    if (wall < 0) {   /* same skip rule as the probe above: no SDK means no scene, so this is vacuous */
+        CHECK(bwa_last_error(e) == NULL, "the dynamic-mesh probe failed WITH a reason (%s): the SDK "
+              "is present but the transform probe was skipped as if it were not",
+              bwa_last_error(e) ? bwa_last_error(e) : "");
+        bwa_destroy(e); return;
+    }
+
+    bwa_source s = bwa_source_create(e);
+    bwa_source_set_pos(e, s, 3.f, 1.5f, 0.f);
+    bwa_source_set_occlusion(e, s, true);
+    bwa_set_listener_pose(e, 0.f, 1.5f, 0.f, 0.f, 0.f, 0.f, 1.f);
+    bwa_commit(e);
+    if (bwa_start(e) != BWA_OK || !s) {
+        CHECK(0, "refused dynamic transform: probe setup (source=%u)", s);
+        bwa_destroy(e); return;
+    }
+    render_blocks(e, 4);              /* promote the pose: the sim traces from the PUBLISHED listener */
+
+    /* the probe's POWER check: the wall really does occlude when it sits between the two. */
+    bwa_scene_set_dynamic_transform(e, wall, 1.5f, 1.5f, 0.f, 0.f, 0.f, 0.f, 1.f);
+    Sleep(OCC_SETTLE_MS);
+    const float occ_blocked = bwa_source_get_occlusion(e, s);
+    CHECK(occ_blocked < 0.5f, "the wall must occlude while it sits between listener and source (%g)",
+          (double)occ_blocked);
+
+    clr(e);
+    bwa_scene_set_dynamic_transform(e, wall, ABSURD_COORD, 1.5f, 0.f, 0.f, 0.f, 0.f, 1.f);
+    CHECK(bwa_last_error(e) != NULL, "an absurd dynamic transform must be refused with a reason");
+    Sleep(OCC_SETTLE_MS);
+    const float occ_refused = bwa_source_get_occlusion(e, s);
+    CHECK(occ_refused < 0.5f, "a REFUSED bwa_scene_set_dynamic_transform must leave the instance "
+          "where it was, not move it to the refused position (occlusion %g, was %g)",
+          (double)occ_refused, (double)occ_blocked);
+
+    /* the bound must not be TIGHT, and this proves the assertion above saw a REFUSAL rather than a
+     * transform that cannot move the instance at all. */
+    clr(e);
+    bwa_scene_set_dynamic_transform(e, wall, -5.f, 1.5f, 0.f, 0.f, 0.f, 0.f, 1.f);
+    CHECK(bwa_last_error(e) == NULL, "a legal dynamic transform must be ACCEPTED (%s)",
+          bwa_last_error(e) ? bwa_last_error(e) : "");
+    Sleep(OCC_SETTLE_MS);
+    const float occ_moved = bwa_source_get_occlusion(e, s);
+    CHECK(occ_moved > 0.9f, "an ACCEPTED transform must move the wall off the line of sight, "
+          "clearing the occlusion (%g, was %g)", (double)occ_moved, (double)occ_blocked);
+
+    CHECK(render_blocks(e, 4) == 1, "renders finite across the transform traffic");
+    bwa_destroy(e);
+}
+
+/* A triangle index outside [0, nverts) is not a wrong VALUE, it is an out-of-bounds read inside
+ * phonon's BVH build, so it has to be refused before the geometry crosses the ABI. Both public mesh
+ * entry points take caller data, and Godot's geometry node pushes scene meshes straight through.
+ *
+ * The accept arm is not decoration: a check that refused everything would satisfy the reject arm
+ * alone. The occlusion readback is what proves an ACCEPTED mesh still reaches the ray tracer, and
+ * that a REFUSED one left the previous geometry standing rather than half-applying. */
+static void bad_triangle_indices(void) {
+    bwa_desc d = manual_desc();
+    bwa_engine* e = bwa_create(&d);
+    CHECK(e != NULL, "bad triangle indices: probe engine create failed");
+    if (!e) return;
+
+    /* a 2x2 wall in the yz plane, placed between listener and source by the transform below (local
+     * coordinates like the probe above: the listener sits at y = 1.5, so a wall left at the origin
+     * spans y in [-1,1] and the ray passes clean over the top of it) */
+    static const float wv[4*3] = { 0,-1,-1,  0,1,-1,  0,1,1,  0,-1,1 };
+    static const int   wt[2*3] = { 0,1,2,  0,2,3 };
+    clr(e);
+    const int wall = bwa_scene_add_dynamic_mesh(e, wv, 4, wt, 2, 0);
+    if (wall < 0) {   /* no SDK means no scene, so every assertion below would be vacuous - skip */
+        CHECK(bwa_last_error(e) == NULL, "the mesh probe failed WITH a reason (%s): the SDK is "
+              "present but the triangle-index probe was skipped as if it were not",
+              bwa_last_error(e) ? bwa_last_error(e) : "");
+        bwa_destroy(e); return;
+    }
+    CHECK(bwa_last_error(e) == NULL, "a VALID mesh must be accepted, not refused (%s)",
+          bwa_last_error(e) ? bwa_last_error(e) : "");
+
+    bwa_source s = bwa_source_create(e);
+    bwa_source_set_pos(e, s, 3.f, 1.5f, 0.f);
+    bwa_source_set_occlusion(e, s, true);
+    bwa_set_listener_pose(e, 0.f, 1.5f, 0.f, 0.f, 0.f, 0.f, 1.f);
+    bwa_commit(e);
+    if (bwa_start(e) != BWA_OK || !s) {
+        CHECK(0, "bad triangle indices: probe setup (source=%u)", s);
+        bwa_destroy(e); return;
+    }
+    render_blocks(e, 4);              /* promote the pose: the sim traces from the PUBLISHED listener */
+    bwa_scene_set_dynamic_transform(e, wall, 1.5f, 1.5f, 0.f, 0.f, 0.f, 0.f, 1.f);
+    Sleep(OCC_SETTLE_MS);
+    const float occ_walled = bwa_source_get_occlusion(e, s);
+    CHECK(occ_walled < 0.5f, "the accepted wall must reach the ray tracer and occlude (%g)",
+          (double)occ_walled);
+
+    /* index == nverts is the off-by-one a caller actually writes, so probe THAT, not a wild value */
+    static const int edge_tri[2*3] = { 0,1,2,  0,2,4 };      /* 4 is one past the last vertex */
+    static const int neg_tri [2*3] = { 0,1,2,  0,2,-1 };
+    clr(e);
+    CHECK(bwa_scene_add_dynamic_mesh(e, wv, 4, edge_tri, 2, 0) < 0 && bwa_last_error(e) != NULL,
+          "an index one past the last vertex must be refused with a reason");
+    clr(e);
+    CHECK(bwa_scene_add_dynamic_mesh(e, wv, 4, neg_tri, 2, 0) < 0 && bwa_last_error(e) != NULL,
+          "a negative triangle index must be refused with a reason");
+    clr(e);
+    bwa_scene_set_mesh_mat(e, wv, 4, edge_tri, 2, NULL);
+    CHECK(bwa_last_error(e) != NULL, "set_mesh_mat must refuse a bad index too (it returns void, so "
+          "bwa_last_error is the only way a caller can hear about it)");
+
+    Sleep(OCC_SETTLE_MS);
+    const float occ_after = bwa_source_get_occlusion(e, s);
+    CHECK(occ_after < 0.5f, "a REFUSED mesh must leave the standing geometry alone, not half-apply "
+          "(occlusion %g, was %g)", (double)occ_after, (double)occ_walled);
+
+    CHECK(render_blocks(e, 4) == 1, "renders finite across the refused-mesh traffic");
+    bwa_destroy(e);
+}
+
 static void nonfinite_and_boundary(void) {
+    absurd_coords();
+    absurd_room_dims();
+    refused_box_ray_traced_mesh();
+    refused_dynamic_transform();
+    bad_triangle_indices();
     nan_probe("NaN master gain", poison_master_nan);
     nan_probe("Inf master gain", poison_master_inf);
     nan_probe("NaN group gain", poison_group_nan);
@@ -1052,6 +1710,52 @@ static void newest_surfaces(void) {
       CHECK(bwa_poll_ended(e, out, 4, NULL) == 1 && out[0] == s,
             "the zero-cap and NULL-out polls must not have consumed the event");
       CHECK(bwa_poll_ended(e, out, 4, NULL) == 0, "a drained queue reads empty");
+      bwa_source_destroy(e, s); }
+
+    /* set_channel: the range guard. An out-of-range index must be REFUSED with a reason, not
+     * clamped and not silently swallowed - it would route a reference stimulus to the wrong
+     * speaker, which reads as a real result. BWA_CHANNEL_AUTO and every valid index are accepted
+     * silently (a live source, so a stale-handle no-op cannot be what leaves the error NULL). */
+    { bwa_source s = bwa_source_create(e);
+      const int32_t nch = (int32_t)bwa_get_channel_count(e);
+      clr(e);
+      bwa_source_set_channel(e, s, nch);
+      CHECK(bwa_last_error(e) != NULL, "set_channel: channel == count must be refused with a reason");
+      clr(e);
+      bwa_source_set_channel(e, s, nch + 1000);
+      CHECK(bwa_last_error(e) != NULL, "set_channel: a wildly out-of-range channel must be refused");
+      clr(e);
+      bwa_source_set_channel(e, s, nch - 1);
+      CHECK(bwa_last_error(e) == NULL, "set_channel: the last valid channel is accepted silently");
+      clr(e);
+      bwa_source_set_channel(e, s, BWA_CHANNEL_AUTO);
+      CHECK(bwa_last_error(e) == NULL, "set_channel: BWA_CHANNEL_AUTO is accepted silently");
+      /* AUTO is the ONLY negative. Any other one is a caller bug, and an upper-bound-only guard
+       * would swallow it as "restore panning" - accepted, unreported, and indistinguishable from
+       * a route that never took. */
+      clr(e);
+      bwa_source_set_channel(e, s, -2);
+      CHECK(bwa_last_error(e) != NULL, "set_channel: -2 must be refused, not read as AUTO");
+      clr(e);
+      bwa_source_set_channel(e, s, -47);
+      CHECK(bwa_last_error(e) != NULL, "set_channel: a wildly negative channel must be refused");
+      clr(e);
+      bwa_source_set_channel(e, s, INT32_MIN);
+      CHECK(bwa_last_error(e) != NULL, "set_channel: INT32_MIN must be refused");
+      /* set_region: end 0 means the asset end, so only end <= start with end != 0 is degenerate */
+      clr(e);
+      bwa_source_set_region(e, s, 200, 100);
+      CHECK(bwa_last_error(e) != NULL, "set_region: end_frame <= start_frame must be refused with a reason");
+      clr(e);
+      bwa_source_set_region(e, s, 100, 100);
+      CHECK(bwa_last_error(e) != NULL, "set_region: an empty region (end == start) must be refused too");
+      clr(e);
+      bwa_source_set_region(e, s, 100, 0);
+      CHECK(bwa_last_error(e) == NULL, "set_region: end_frame 0 (the asset end) is accepted silently");
+      clr(e);
+      bwa_source_set_region(e, s, 100, 200);
+      CHECK(bwa_last_error(e) == NULL, "set_region: a well-ordered region is accepted silently");
+      CHECK(render_blocks(e, 2) == 1, "engine renders across the channel/region guard traffic");
       bwa_source_destroy(e, s); }
 
     /* tuning: a zero-initialized struct MUST be refused (its zero is not its default), as must a
@@ -1355,7 +2059,7 @@ static void null_sink_lifecycle(void) {
     bwa_source_set_pos(e, s, 1, 1.5f, 0);
     bwa_commit(e);
     Sleep(30);                                           /* let several blocks land */
-    CHECK(bwa_get_dsp_time(e) > 0, "the audio thread must have rendered");
+    CHECK(bwa_get_dsp_time_frames(e) > 0, "the audio thread must have rendered");
     /* stale traffic against the live thread */
     bwa_source stale = s ^ 0x10000u;
     bwa_source_play(e, stale, snd, true);
@@ -1394,6 +2098,8 @@ int main(void) {
     }
     printf("abuse OK (NULL/zero args; stale/bogus/cross-engine handles; call order; non-finite and "
            "boundary arguments; pool/table/ring exhaustion; poll_ended/tuning/box-mesh/mesh-mat "
-           "surfaces; kind mismatches; poisoned wav/EQ/layout parsers; null-sink lifecycle)\n");
+           "surfaces; set_channel/set_region guards; poll_looped; kind mismatches; poisoned "
+           "wav/EQ/layout parsers; absurd-but-finite coordinates and room geometry; a refused box "
+           "never reaching the ray-traced mesh; null-sink lifecycle)\n");
     return 0;
 }

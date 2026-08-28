@@ -189,6 +189,12 @@ The tap ordering is deliberate, not incidental:
 - **Master gain sits before align** so per-speaker trims stay calibrated. The **test
   signal enters after align** so a wiring check is a raw channel, untouched by trims or
   delays. The **limiter is last** so nothing (test signal included) can clip a driver.
+- The **direct channel route** (`bwa_source_set_channel`) enters at the other end of that
+  same stage, and the contrast is the point. It replaces a voice's panner solve with a
+  one-hot gain vector, so the routed voice still passes through align, room EQ, master
+  gain and the limiter. That is what makes one real speaker level-comparable with the
+  phantom you are A/B'ing it against, and it is why the post-align test signal is not.
+  Being a gain vector also means the route ramps in and out like any other gain change.
 
 ### How wide is the bus?
 

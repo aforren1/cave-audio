@@ -7,6 +7,7 @@
 #include <godot_cpp/core/class_db.hpp>
 #include <godot_cpp/variant/utility_functions.hpp>
 
+#include "bwa_bed_node.h"
 #include "bwa_geometry.h"
 #include "bwa_material.h"
 #include "bwa_room.h"
@@ -168,6 +169,108 @@ void BwaEngine::_process(double delta) {
 	}
 
 	bwa_commit(eng); // ...and one atomic snapshot of the pair
+
+	/* ...and only THEN the event drains: bwa_commit runs the pass that FILLS both event rings, so
+	 * draining before it reads a frame-old picture and delays every signal by a frame. */
+	drain_events();
+
+	/* The per-source POST-COMMIT pass, after both drains. An emitter's explicit-halt fallback reads
+	 * bwa_source_is_playing here, and it has to read it AFTER the ended drain or one end reaches
+	 * both feeds with nothing to say which arrived first. By index for the same reason the push
+	 * loop above is: a `finished` handler is user code and may free a source. */
+	for (size_t i = 0; i < sources.size(); i++) {
+		sources[i]->post_commit();
+	}
+	/* Beds take the same pass, for the same reason: a bed's halt fallback reads
+	 * bwa_bed_is_playing and must read it AFTER the ended drain. By index for the same reason
+	 * too - a `finished` handler is user code and may free a bed. */
+	for (size_t i = 0; i < beds.size(); i++) {
+		beds[i]->post_commit();
+	}
+}
+
+BwaSource *BwaEngine::source_for_handle(uint32_t h) const {
+	for (BwaSource *s : sources) {
+		if (s->native_handle() == h) {
+			return s;
+		}
+	}
+	return nullptr; /* normal, not an error: freed between the event and this drain */
+}
+
+BwaBed *BwaEngine::bed_for_handle(uint32_t h) const {
+	for (BwaBed *b : beds) {
+		if (b->native_handle() == h) {
+			return b;
+		}
+	}
+	return nullptr; /* normal: a source's handle, or a bed freed since the event */
+}
+
+void BwaEngine::drain_events() {
+	ended_this_frame.clear();
+	looped_this_frame.clear();
+	if (!eng) {
+		return;
+	}
+	uint32_t buf[64];
+	uint64_t dropped = 0;
+
+	for (;;) {
+		const uint32_t n = bwa_poll_ended(eng, buf, 64, &dropped);
+		for (uint32_t i = 0; i < n; ++i) {
+			ended_this_frame.push_back((int64_t)buf[i]);
+			BwaSource *s = source_for_handle(buf[i]);
+			if (s) {
+				s->notify_ended();
+			} else if (BwaBed *b = bed_for_handle(buf[i])) {
+				b->notify_ended();
+			}
+		}
+		if (n < 64) {
+			break; /* drained */
+		}
+	}
+	if (dropped != ended_dropped) {
+		ended_dropped = dropped;
+		if (!ended_drop_warned) {
+			ended_drop_warned = true;
+			UtilityFunctions::push_warning(vformat(
+					"BwaEngine: %d voice-completion events were dropped before anything read "
+					"them, so that many \"finished\" signals never fired. The engine's ended ring "
+					"is bounded and drops the OLDEST, so something stalled the frame. "
+					"get_ended_events_dropped() carries the running total (this warns once).",
+					(int64_t)dropped));
+		}
+	}
+
+	for (;;) {
+		const uint32_t n = bwa_poll_looped(eng, buf, 64, &dropped);
+		for (uint32_t i = 0; i < n; ++i) {
+			looped_this_frame.push_back((int64_t)buf[i]);
+			BwaSource *s = source_for_handle(buf[i]);
+			if (s) {
+				s->notify_looped();
+			} else if (BwaBed *b = bed_for_handle(buf[i])) {
+				b->notify_looped();
+			}
+		}
+		if (n < 64) {
+			break;
+		}
+	}
+	if (dropped != looped_dropped) {
+		looped_dropped = dropped;
+		if (!loop_drop_warned) {
+			loop_drop_warned = true;
+			UtilityFunctions::push_warning(vformat(
+					"BwaEngine: %d loop-boundary events were dropped before anything read them, "
+					"so that many \"looped\" signals never fired. Either the frame stalled, or a "
+					"loop region is short enough to wrap faster than the frame rate reads it. "
+					"get_loop_events_dropped() carries the running total (this warns once).",
+					(int64_t)dropped));
+		}
+	}
 }
 
 void BwaEngine::_exit_tree() {
@@ -196,6 +299,9 @@ void BwaEngine::_exit_tree() {
 		c->engine_gone();
 	}
 	clients.clear();
+	/* The beds are in `clients` too and were just detached; drop the event route as well or the
+	 * next drain scans freed nodes. */
+	beds.clear();
 }
 
 /* --- static scene assembly --- */
@@ -562,6 +668,13 @@ void BwaEngine::group_stop(int group) {
 			s->on_stopped_externally();
 		}
 	}
+	/* Beds carry a mix group too, and a bed that is not told reads the silence as a natural end
+	 * exactly as an emitter would. */
+	for (BwaBed *b : beds) {
+		if (b->get_group() == group) {
+			b->on_stopped_externally();
+		}
+	}
 }
 
 void BwaEngine::stop_all() {
@@ -571,6 +684,9 @@ void BwaEngine::stop_all() {
 	bwa_stop_all(eng);
 	for (BwaSource *s : sources) {
 		s->on_stopped_externally();
+	}
+	for (BwaBed *b : beds) {
+		b->on_stopped_externally();
 	}
 }
 
@@ -629,18 +745,6 @@ godot::Dictionary BwaEngine::get_live_tuning() const {
 	bwa_tuning t;
 	if (!eng || !bwa_get_tuning(eng, &t)) return godot::Dictionary();
 	return tuning_to_dict(t);
-}
-
-godot::PackedInt64Array BwaEngine::poll_ended() {
-	godot::PackedInt64Array out;
-	if (!eng) return out;
-	uint32_t buf[64];
-	for (;;) {
-		uint32_t n = bwa_poll_ended(eng, buf, 64, nullptr);
-		for (uint32_t i = 0; i < n; ++i) out.push_back((int64_t)buf[i]);
-		if (n < 64) break;                     /* drained */
-	}
-	return out;
 }
 
 godot::Dictionary BwaEngine::get_setup_tuning(Setup setup) const {
@@ -913,7 +1017,12 @@ void BwaEngine::scene_remove_dynamic_mesh(int handle) {
 
 /* --- clock / scheduling --- */
 
-int64_t BwaEngine::get_dsp_time() const { return eng ? (int64_t)bwa_get_dsp_time(eng) : 0; }
+int64_t BwaEngine::get_dsp_time_frames() const { return eng ? (int64_t)bwa_get_dsp_time_frames(eng) : 0; }
+
+float BwaEngine::get_dsp_time_seconds() const {
+	const int rate = get_resolved_sample_rate();
+	return rate > 0 ? (float)((double)get_dsp_time_frames() / (double)rate) : 0.0f;
+}
 
 Dictionary BwaEngine::get_clock() const {
 	Dictionary d;
@@ -1111,6 +1220,24 @@ void BwaEngine::unregister_source(BwaSource *s) {
 	}
 }
 
+void BwaEngine::register_bed(BwaBed *b) {
+	for (BwaBed *x : beds) {
+		if (x == b) {
+			return;
+		}
+	}
+	beds.push_back(b);
+}
+
+void BwaEngine::unregister_bed(BwaBed *b) {
+	for (size_t i = 0; i < beds.size(); i++) {
+		if (beds[i] == b) {
+			beds.erase(beds.begin() + (long)i);
+			return;
+		}
+	}
+}
+
 void BwaEngine::register_client(BwaEngineClient *c) {
 	for (BwaEngineClient *x : clients) {
 		if (x == c) {
@@ -1265,7 +1392,8 @@ void BwaEngine::_bind_methods() {
 	M(set_dual_band, "on"); M0(get_dual_band);
 	M(set_dual_band_cap, "on"); M0(get_dual_band_cap);
 	M(get_setup_tuning, "setup"); M(apply_setup, "setup");
-	M0(get_live_tuning); M0(poll_ended);
+	M0(get_live_tuning); M0(get_ended_this_frame); M0(get_looped_this_frame);
+	M0(get_ended_events_dropped); M0(get_loop_events_dropped);
 	M(set_spcap_focus, "focus"); M0(get_spcap_focus);
 	M(set_spcap_density, "density"); M0(get_spcap_density);
 	M(set_spread_mode, "mode"); M0(get_spread_mode);
@@ -1301,7 +1429,7 @@ void BwaEngine::_bind_methods() {
 	M(scene_set_dynamic_transform, "handle", "position", "rotation");
 	M(scene_remove_dynamic_mesh, "handle");
 
-	M0(get_dsp_time); M0(get_clock); M0(get_clock_model);
+	M0(get_dsp_time_frames); M0(get_dsp_time_seconds); M0(get_clock); M0(get_clock_model);
 	M0(get_health); M0(get_xruns);
 	M0(get_output_latency_frames); M0(get_output_latency_seconds);
 	M(set_test_signal, "channel", "kind", "gain");

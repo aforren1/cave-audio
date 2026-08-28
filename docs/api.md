@@ -47,13 +47,17 @@ Terms used here without definition are in [glossary.md](./glossary.md).
   disagree with, apply the lot in one call, and read back what a source is set to
   (`bwa_source_preset`, `bwa_source_apply`, `bwa_source_get_desc`). The engine-wide equivalent is
   `bwa_tuning_preset` / `bwa_apply_tuning`.
-- Voices: fixed pool with priority stealing, pause and click-free seek,
+- Voices: fixed pool with priority stealing, pause and click-free seek, a play region
+  (`bwa_source_set_region`) that truncates a one-shot or loops a sub-range, loop-boundary
+  events (`bwa_poll_looped`) beside completion events,
   sample-accurate scheduled starts against a device-anchored DSP clock. The device's own
   block stamps bridge that clock to wall time for AV sync, with the device-vs-host drift
   fitted in ppm for shows long enough to care.
 - Tracking: OptiTrack/NatNet ingested in-process; the audio thread samples the
   freshest head pose at block time.
-- Diagnostics: per-channel test tone, output-level and listener-pose readbacks,
+- Diagnostics: per-channel test tone, direct output-channel routing of a real source
+  (`bwa_source_set_channel`, the single-speaker reference condition), output-level and
+  listener-pose readbacks,
   offline panner and bed-decode evaluation for layout tools
   (`bwa_panner_gains_batch`, which also takes SPCAP's focus and density knobs so a
   layout can be graded at the tuning it ships with, and `bwa_bed_gains_batch`).
@@ -168,6 +172,26 @@ re-hardcoding them. The engine's world-locked decodes and its default listener
 position use the **array centroid** (the nominal listening point), not the origin.
 Gains are linear (1 = unity); sound offsets are engine-rate sample frames.
 
+**Coordinates have a range, not just a finiteness rule.** Every call that takes a room position
+(`bwa_source_set_pos`, `bwa_set_listener_pose`, `bwa_set_extra_listeners`, `bwa_play_oneshot`, and
+the tracked head pose) accepts each axis in the range -1e6 to 1e6 meters. Outside that range, or
+non-finite, the call is a no-op: the previous position stands, so a bad frame reads as a dropped
+frame. The bound is not tidiness. Every spatial solve starts by squaring a coordinate difference,
+so a value near the float maximum overflows to infinity, the normalization that follows turns that
+into NaN, and the NaN sticks in the gain ramp and in the output-stage filter state for the rest of
+the run. 1e6 meters is far past any real scene, so a position outside it is a caller bug.
+
+Room geometry has its own bound. `bwa_scene_set_ism_room`, `bwa_scene_set_box` and `bwa_box_mesh`
+take each dimension positive and at most 5e5 meters. A dimension is not a coordinate: the
+image-source renderer mirrors a source across the faces, so an absurd dimension is an absurd image
+position, and half the coordinate bound is exactly the factor that one mirror multiplies through.
+Out of range, the two engine calls are refused with a reason in `bwa_last_error` and any room
+already set stands. `bwa_box_mesh` takes no engine, so it reports by returning false and writing
+nothing. It shares the bound for two reasons: the vertices it writes are room coordinates a caller
+feeds straight to `bwa_scene_set_mesh_mat`, and a helper that accepted a box the engine refuses
+would make the composition recipe below half-succeed. `bwa_scene_set_ground` takes the coordinate
+bound instead, because a plane height is a room coordinate.
+
 **Where units live in a name.** One quantity in this ABI has two live units: time is genuinely
 both frames (the dsp clock, `play_at`, `stop_at`, `seek`, the playheads, the output latency,
 `bwa_sound_get_frames`) and seconds (fades, RT60, IR length, the pose lead). So every time-valued
@@ -175,6 +199,16 @@ name says which: a getter ends `_frames`, a parameter is named `seconds` or ends
 else needs a suffix, because nothing else has a competitor: distances are meters, frequencies Hz,
 angles radians, gains linear. Those carry the unit on the *value* where it helps
 (`radius_m`, `xover_hz`, `yaw_rad`, `host_time_ns`) and never on the call.
+
+The rule binds the bindings too, and there the risk is higher, because a host engine supplies its
+own spelling of the same idea in the other unit. Unity's `AudioSettings.dspTime` is a `double` of
+seconds and Godot's `AudioServer.get_output_latency()` returns seconds, so both bindings expose
+`DspTimeFrames` / `DspTimeSeconds` and `get_dsp_time_frames()` / `get_dsp_time_seconds()` rather
+than a bare name that reads as the host's. See [integration.md](./integration.md).
+
+`start_sample`, `stop_sample` and `dsp_sample` keep the word `sample` for the frames they count.
+For a mono voice a sample is a frame, and the name already carries a unit, so it is not the bare
+case this rule is about.
 
 The one rule that constrains new calls: a **decibel** value must say `_db`. Linear is the unmarked
 default across the whole ABI, so a dB parameter that doesn't say so is invisible: `limiter_ceiling`
@@ -184,6 +218,10 @@ Bindings inherit this and add one rule of their own: never borrow a host-engine 
 a *different* unit. Godot's `AudioServer.get_output_latency()` is seconds and
 `AudioStreamPlayer3D.seek()` takes seconds, so the Godot binding spells its frame-valued twins
 `get_output_latency_frames` / `seek_frames` and offers `_seconds` beside them.
+`bwa_source_set_region` follows the same pattern: `set_region_frames` / `set_region_seconds` in
+Godot, `SetRegionFrames` / `SetRegionSeconds` in Unity, and no bare spelling in either.
+`bwa_source_set_channel` takes no suffix anywhere, because a channel index is not a quantity with
+two live units.
 
 ## How-to guides
 
@@ -260,7 +298,7 @@ the same one throughout.
 /* The wall<->dsp bridge. The driver-stamped (sample, host time) pair is exact, so the
  * only thing to estimate is the constant epoch offset between the device's host clock
  * and GetTime(). Each frame observes (offset - pair age); a decaying max converges on
- * the true offset and tracks ppm drift. Same estimator as the Unity binding's DspTimeAt. */
+ * the true offset and tracks ppm drift. Same estimator as the Unity binding's DspTimeFramesAt. */
 static struct { bool valid; uint64_t sample; double host, off; } clk;
 
 static void clock_refresh(bwa_engine* e) {
@@ -277,7 +315,7 @@ static void clock_refresh(bwa_engine* e) {
 static uint64_t dsp_at(bwa_engine* e, double t) {   // GetTime() seconds -> dsp sample
     double fs = (double)bwa_get_sample_rate(e);
     double d = clk.valid ? (double)clk.sample + (t + clk.off - clk.host) * fs
-                         : (double)bwa_get_dsp_time(e) + (t - GetTime()) * fs;  // pre-stamp fallback
+                         : (double)bwa_get_dsp_time_frames(e) + (t - GetTime()) * fs;  // pre-stamp fallback
     return d > 0. ? (uint64_t)d : 0;
 }
 ```
@@ -317,16 +355,16 @@ while (!WindowShouldClose()) {
   display's. Measure draw→photons once (photodiode, or an AV-sync clapper against the
   array) and that one constant aligns the whole chain.
 - **The fallback is often enough.** Before the first stamped block (and always on the
-  manual sink) `dsp_at` degrades to pairing `bwa_get_dsp_time` with your clock:
+  manual sink) `dsp_at` degrades to pairing `bwa_get_dsp_time_frames` with your clock:
   block-granular, about 5 ms at 256/48 kHz, already under half a 60 Hz frame. The
   estimator buys sub-millisecond.
 - **The other direction needs no wall clock.** An event on the *audio* timeline (a cue
-  inside a track you scheduled) fires its visual when `bwa_get_dsp_time` crosses
+  inside a track you scheduled) fires its visual when `bwa_get_dsp_time_frames` crosses
   `start + cue`, or off `bwa_source_get_playhead_frames`.
 - **It holds for a two-hour show.** `clock_refresh` runs every frame, so crystal drift
   never accumulates; see "Long shows drift" under
   [Sources](#sources-control-thread-non-blocking).
-- **Unity**: `emitter.PlayAt(engine.DspTimeAt(tEvent))` is this whole recipe
+- **Unity**: `emitter.PlayAt(engine.DspTimeFramesAt(tEvent))` is this whole recipe
   ([integration.md](./integration.md)).
 
 ### Develop at the desk, run on the rig
@@ -807,6 +845,7 @@ void     bwa_source_queue(bwa_engine* e, bwa_source s, bwa_sound snd, bool loop)
 void     bwa_source_clear_queue(bwa_engine* e, bwa_source s);                        // drop the pending chain
 void     bwa_source_set_paused(bwa_engine* e, bwa_source s, bool paused);   // ramped; playhead freezes
 void     bwa_source_seek (bwa_engine* e, bwa_source s, uint64_t frame);     // click-free jump (in-memory)
+void     bwa_source_set_region(bwa_engine* e, bwa_source s, uint64_t start_frame, uint64_t end_frame); // play region
 bool     bwa_source_is_playing(bwa_engine* e, bwa_source s);  // control-thread poll; see below
 uint64_t bwa_source_get_playhead_frames(bwa_engine* e, bwa_source s); // CONTENT playhead, engine-rate frames
 bool     bwa_play_oneshot(bwa_engine* e, bwa_sound snd, float x, float y, float z, float gain); // false = dropped
@@ -831,8 +870,8 @@ its own slot while the new source starts immediately on a small reserve of spare
 
 **Scheduled starts are sample-accurate.** `bwa_source_play_at` begins output exactly when the
 engine's dsp clock reaches `start_sample`: silent until then, then starting at the precise in-block
-sample. Read "now" from `bwa_get_dsp_time` (device sample position, monotonic) and add a delay:
-`bwa_get_dsp_time(e) + sample_rate/2` plays half a second out. `0` means play immediately (same as
+sample. Read "now" from `bwa_get_dsp_time_frames` (device sample position, monotonic) and add a delay:
+`bwa_get_dsp_time_frames(e) + sample_rate/2` plays half a second out. `0` means play immediately (same as
 `bwa_source_play`); a start already in the past plays immediately, best-effort.
 
 **Loop a sub-region for intro→loop content.** `bwa_source_play_loop` plays from the start but
@@ -863,7 +902,7 @@ item is playing, watch the playhead reset across the seam; there's no separate e
 
 ```c
 // clock / scheduling - the time base for bwa_source_play_at:
-uint64_t bwa_get_dsp_time(bwa_engine* e);                       // current dsp-sample clock (device-anchored, monotonic)
+uint64_t bwa_get_dsp_time_frames(bwa_engine* e);                       // current dsp-sample clock (device-anchored, monotonic)
 bool     bwa_get_clock(bwa_engine* e, uint64_t* dsp_sample, uint64_t* host_time_ns); // device (sample, host-time) pair
 uint32_t bwa_get_output_latency_frames(bwa_engine* e);                 // device render->DAC latency, frames (0 = unknown)
 bool     bwa_get_clock_model(bwa_engine* e, bwa_clock_model* out); // fitted device-vs-host drift (ppm + its sigma)
@@ -871,15 +910,15 @@ bool     bwa_get_clock_model(bwa_engine* e, bwa_clock_model* out); // fitted dev
 
 **Syncing with graphics.** Two cases. Events on the **audio timeline** (a cue in a track you
 scheduled) never need wall time: keep the `start_sample` you passed to `play_at` and fire the
-visual when `bwa_get_dsp_time` crosses `start + cue` (or poll `bwa_source_get_playhead_frames`).
+visual when `bwa_get_dsp_time_frames` crosses `start + cue` (or poll `bwa_source_get_playhead_frames`).
 Events that originate on the **graphics side** need the wall→dsp mapping, and that is
 `bwa_get_clock`: the (output sample position, host time) pair the audio stack stamps inside each
 block callback (ASIO's `ASIOGetSamplePosition` pair, synthesized from QPC on the null sink).
 Because the pair is captured *in* the callback, the mapping
 `dsp_at(T) = sample + (T_ns − host_time_ns) · rate / 1e9` carries none of the
-block-plus-scheduling jitter that pairing `bwa_get_dsp_time` with your own clock read does.
+block-plus-scheduling jitter that pairing `bwa_get_dsp_time_frames` with your own clock read does.
 `host_time_ns` sits on a backend-defined epoch: anchor it against your clock once and re-sample
-per frame (the Unity binding's `Engine.DspTimeAt`/`RealtimeAt` do this with a decaying-max offset
+per frame (the Unity binding's `Engine.DspTimeFramesAt`/`RealtimeAt` do this with a decaying-max offset
 estimator). It returns **false with the outputs untouched** until a host-stamped block has
 rendered: before `bwa_start`, or under a driver that reports no `systemTime` (FlexASIO is one).
 The **manual** sink is the deliberate exception: it stamps a *nominal* time derived from the
@@ -895,7 +934,7 @@ the Digiface includes its Dante buffering), so sound scheduled for dsp time T re
 the host clock are different oscillators: 10 ppm is 36 ms an hour, a spec-worst ±50 ppm part
 ~180 ms. Re-anchoring off `bwa_get_clock` every frame makes that vanish, because you never
 integrate the error. The rule that follows: **schedule far-out events in dsp samples, not by
-predicting a future wall time**. Take `t0 = bwa_get_dsp_time` once at show start and place every
+predicting a future wall time**. Take `t0 = bwa_get_dsp_time_frames` once at show start and place every
 cue at `t0 + cue × rate`; now there is one clock in the system and drift is impossible rather
 than corrected.
 
@@ -935,22 +974,56 @@ did not finish. A completion superseded by a re-play of the same handle is dropp
 reported, so you cannot free or re-trigger the wrong play. Unpolled events are bounded and drop
 oldest; pass `dropped_out` to tell "nothing finished" from "I did not poll often enough".
 
+**A loop wrap is an event too.** A looping voice never ends, so `bwa_poll_ended` reports it
+exactly never. `bwa_poll_looped(e, out, cap, dropped_out)` is its sibling for the other boundary:
+it drains the handles whose voices WRAPPED at a loop point since the last call, oldest first, from
+the same drain `bwa_commit` runs. Pace experimental trials, cue a visual, or count repetitions
+with it.
+
+```c
+bwa_commit(e);
+bwa_source wrapped[32];
+uint32_t n = bwa_poll_looped(e, wrapped, 32, NULL);
+for (uint32_t i = 0; i < n; ++i) on_loop_boundary(wrapped[i]);
+```
+
+Both drains are ENGINE-WIDE and DESTRUCTIVE, so give each exactly one caller. A second caller
+consumes events belonging to somebody else's sources and those are simply never seen. In a binding
+that means the object owning the frame owns the drain and dispatches from it, which is what
+Unity's `Engine` and Godot's `BwaEngine` do. Drain after `bwa_commit`, which is the pass that
+fills both rings.
+
+Everything else matches `bwa_poll_ended`: handles come back as you knew them, one-shots are never
+reported, a wrap superseded by a re-play of the same handle is dropped, and unpolled events are
+bounded and drop oldest with their own `dropped_out` total. Two things are specific to it. It
+reports ONE ENTRY PER WRAP, not per block and not per poll, so a loop shorter than an audio block
+gives you several entries from one block rather than one. And the wrap point is the loop region's
+end when a region is set (`bwa_source_play_loop` or `bwa_source_set_region`), else the asset end.
+In-memory and bed voices only: a streamed source loops inside the stream, which this never sees.
+
+One case is deliberately not counted span by span. Shrink a region under a live cursor and the
+cursor catches up in a single step, reporting one wrap however many spans it skipped. Nothing
+played through those spans, so counting them would report a history that never happened.
+
 **Completion is also a poll, and that path is weaker.** `bwa_source_is_playing` is a latest-wins
 readback (like `bwa_get_listener_pose`): the audio thread republishes each source's playing state
 every block, gated on the handle's generation and on a play sequence, so a re-play on a handle whose
 voice already ended reads `true` immediately rather than lying until the next block. It reads `true`
 while a sound plays; `false` once a non-loop sound finishes, after `stop`, or for a stale handle.
-What it cannot do is see a sound shorter than your poll interval, which no amount of sequencing
-fixes. Use it for "is this still going", not for "did it finish".
+A play HELD on a still-decoding `bwa_sound_acquire_async` asset is the one case that reads `false`
+after you issued it: nothing is enqueued yet, so the readback has nothing to sequence against.
+Watch `bwa_sound_is_ready` for that. What it cannot do is see a sound shorter than your poll
+interval, which no amount of sequencing fixes. Use it for "is this still going", not for "did it
+finish".
 
 **The playhead is a poll too.** `bwa_source_get_playhead_frames` rides the same per-block
 republish: the voice's **content** position in engine-rate frames. It is correct exactly where
-deriving a playhead from `bwa_get_dsp_time` breaks: it freezes under pause, lands where a seek
+deriving a playhead from `bwa_get_dsp_time_frames` breaks: it freezes under pause, lands where a seek
 lands, follows a pitched voice at its actual rate, wraps with a loop, and for stream/push
 sources counts frames actually **consumed** (an underrun slips it, exactly like what you hear).
 A finished non-loop voice keeps reporting its final position; an idle voice, a still-held
 scheduled play, or a stale handle reads 0. Block-granular and one block behind a just-issued
-play/seek; for tighter scheduling, stay on `bwa_get_dsp_time` arithmetic.
+play/seek; for tighter scheduling, stay on `bwa_get_dsp_time_frames` arithmetic.
 
 **Pause and seek are click-free.**
 
@@ -959,9 +1032,38 @@ play/seek; for tighter scheduling, stay on `bwa_get_dsp_time` arithmetic.
   bed sounds. A paused voice still reads as *playing*: it hasn't ended.
 - `bwa_source_seek` jumps the content position (engine-rate frames). On a running voice: ramp out,
   jump, ramp back in (~10 ms end to end). On a paused voice the jump is immediate and it stays
-  paused. Past-the-end seeks wrap for loops and end one-shots.
+  paused. Past-the-end seeks wrap for loops and end one-shots. Issued after a play still held on a
+  `bwa_sound_acquire_async` decode, the seek rides with that play and lands with it.
 - Streamed sounds ignore seeks: the stream ring can't jump. `bwa_source_play` always restarts
   un-paused at frame 0.
+
+**The play region bounds the content, seek moves inside it.** `bwa_source_set_region(e, s,
+start_frame, end_frame)` limits the voice to `[start_frame, end_frame)` in engine-rate frames.
+`end_frame` 0 means the asset end, which is the default state. What happens at the out-point
+depends on the play, and that is the whole design:
+
+- A **non-looping** voice ENDS there, exactly as it would at the asset end. It reports through
+  `bwa_poll_ended`, and a queued sound (`bwa_source_queue`) chains as it would at any end.
+- A **looping** voice wraps back to `start_frame` and reports through `bwa_poll_looped`.
+
+So a loop region and a truncated one-shot are one call. Use it to cut a stimulus down to the
+window you want, or to loop a body without re-cutting the file.
+
+Set the region AFTER the play. The bounds resolve against the bound asset, and any `play` /
+`play_at` / `play_loop` RESETS the region, since a play restarts the source. `bwa_source_play_loop`
+is the same state set at play time. That order also holds while the asset is still decoding under
+`bwa_sound_acquire_async`: the region rides with the held play and lands with it.
+
+The region does not move the playhead. A region set mid-play takes effect at the next boundary: a
+cursor already past `end_frame` ends or wraps on the next block, and one before `start_frame` keeps
+playing until `end_frame`. That catch-up counts as ONE wrap in `bwa_poll_looped` however far past
+`end_frame` the cursor was. A seek lands INSIDE the region: below `start_frame` it clamps up to it,
+at or past `end_frame` it wraps (looping) or ends (one-shot). With the default region that is the
+behavior seek always had. An `end_frame` past the asset end means the asset end, and a
+`start_frame` at or past the asset end means the WHOLE clip rather than an empty region;
+`end_frame <= start_frame` with `end_frame != 0` is refused and sets `bwa_last_error`. In-memory
+and bed sounds only, the same scope as `bwa_source_seek`; streamed and push sources ignore it.
+Beds get the whole set under their own prefix: `bwa_bed_set_region` and `bwa_bed_play_loop`.
 
 **Fades are engine-side.** `bwa_source_fade_to` glides the gain over `seconds` on the audio thread
 (no per-frame scripting; `seconds <= 0` sets immediately). A later `set_gain` or fade replaces the
@@ -984,10 +1086,12 @@ transition. Beds are voices, so `bwa_bed_*` stops with everything else. A stoppe
 stays valid and re-playable. Only `bwa_play_oneshot`'s transient voices are recycled. Two things
 they do not do: a push source's voice stops like any other but its feed ring stays open (end it
 with `bwa_source_push_end` or `bwa_source_stop`), and neither call touches group gains, group
-pause, the global pause, or the master gain. A stop stops sound, it does not reset the mixer. One
-asymmetry: `bwa_stop_all` also drops the plays still waiting on an async decode
-(`bwa_sound_acquire_async`), which would otherwise start by themselves once their data lands.
-`bwa_group_stop` cannot, because an unbound held play has no voice to read a group from.
+pause, the global pause, or the master gain. A stop stops sound, it does not reset the mixer. Both
+also drop the plays still waiting on an async decode (`bwa_sound_acquire_async`), which would
+otherwise start by themselves once their data lands. `bwa_stop_all` drops every one.
+`bwa_group_stop` drops the ones issued on sources in that group. A play you issued and then
+stopped never sounds, whichever stop you used. A still-decoding play has not reached a voice yet,
+so the group it belongs to is the one its source was in when the stop ran.
 
 **Pitch** (`bwa_source_set_pitch`, 1 = native, clamped `[0.25, 4]`) resamples **in-memory** sounds
 with a fractional playback cursor (linear interpolation; the cursor stays integer + fraction, so a
@@ -1066,6 +1170,10 @@ bwa_sound bwa_load_ambix(bwa_engine* e, const char* path);   // AmbiX (ACN/SN3D)
 bwa_sound bwa_load_fuma (bwa_engine* e, const char* path);   // legacy FuMa B-format; converted at load
 bwa_bed   bwa_bed_create  (bwa_engine* e);
 void    bwa_bed_play    (bwa_engine* e, bwa_bed b, bwa_sound snd, bool loop);
+void    bwa_bed_play_at (bwa_engine* e, bwa_bed b, bwa_sound snd, bool loop,     // sample-accurate start
+                         uint64_t start_sample);
+void    bwa_bed_play_loop(bwa_engine* e, bwa_bed b, bwa_sound snd,               // intro -> loop region
+                         uint64_t loop_beg, uint64_t loop_end);
 void    bwa_bed_set_gain(bwa_engine* e, bwa_bed b, float linear);       // master gain, ramped
 void    bwa_bed_set_orientation(bwa_engine* e, bwa_bed b,               // full 3-axis (yaw/pitch/roll);
                               float yaw_rad, float pitch_rad, float roll_rad);   //   glided, live
@@ -1074,15 +1182,38 @@ void    bwa_bed_destroy (bwa_engine* e, bwa_bed b);
 
 // same voice machinery as the bwa_source_* calls of the same name - DELIBERATELY bed-named so bed
 // code never mixes prefixes (semantics under "Sources"):
+void    bwa_bed_stop_at     (bwa_engine* e, bwa_bed b, uint64_t stop_sample);
 void    bwa_bed_fade_to     (bwa_engine* e, bwa_bed b, float gain, float seconds);
 void    bwa_bed_fade_out    (bwa_engine* e, bwa_bed b, float seconds);   // fade, then click-free stop
 void    bwa_bed_set_paused  (bwa_engine* e, bwa_bed b, bool paused);     // freeze/resume in place
 void    bwa_bed_seek        (bwa_engine* e, bwa_bed b, uint64_t frame);
+void    bwa_bed_set_region  (bwa_engine* e, bwa_bed b,                   // play region, content frames
+                             uint64_t start_frame, uint64_t end_frame);
 void    bwa_bed_set_priority(bwa_engine* e, bwa_bed b, int priority);    // beds share the voice pool -
 void    bwa_bed_set_group   (bwa_engine* e, bwa_bed b, uint32_t group);  //   protect a music bed with 255
 bool    bwa_bed_is_playing  (bwa_engine* e, bwa_bed b);
 uint64_t bwa_bed_get_playhead_frames(bwa_engine* e, bwa_bed b);   // content playhead, engine-rate frames
 ```
+
+`bwa_bed_play_at` and `bwa_bed_play_loop` are separate entry points rather than aliases, because
+the asset check runs the other way round: they demand a multichannel asset where the
+`bwa_source_*` forms refuse one. Everything else in the second block is the same call under the
+bed prefix.
+
+What has **no** bed alias, and why:
+
+| not aliased | reason |
+|---|---|
+| `set_pos`, `set_spread`, `set_extent`, `set_size`, `set_proximity`, `set_attenuation_override`, `set_doppler`, `set_air_absorption` | a bed is world-locked and carries no position, so nothing distance- or direction-derived applies |
+| `set_occlusion`, `set_occlusion_manual`, `set_directivity`, `set_orientation` (the quaternion one) | same reason. `bwa_bed_set_orientation` is a different call: it rotates the recorded soundfield, not a dipole axis |
+| `set_reverb`, `set_reverb_send`, `set_reverb_distance`, `set_early_reflections`, `set_pathing` | the bed decode never writes the aux bus those sends read |
+| `set_channel` | a bed decodes to all speakers by definition, and the gain solve returns before the route is consulted |
+| `queue`, `clear_queue` | a bed does not chain. The queue is in-memory mono only, and the bed mix never pops it |
+| `preset`, `create_desc`, `apply`, `get_desc` | `bwa_source_desc` is a point-source configuration |
+| `set_pitch` | accepted, but a no-op on a bed (see `bwa_source_set_pitch`) |
+
+`bwa_poll_ended` and `bwa_poll_looped` report bed handles like any other, so they have no
+bed-named twin. They are engine-wide drains, not per-handle calls.
 
 `bwa_bed_set_orientation` orients the recorded field in 3 axes: yaw to line a capture up with the
 scene, pitch/roll to level a capture whose "front" wasn't upright. Positive **yaw** turns the
@@ -1409,7 +1540,9 @@ bwa_scene_set_mesh_mat(e, all_verts, nv, all_tris, nt, all_mats);
 ```
 
 Neither of those is order-dependent, and `bwa_box_mesh` is pure (no engine handle, no allocation), so
-composing never means re-deriving the box's winding and inward-facing normals yourself.
+composing never means re-deriving the box's winding and inward-facing normals yourself. Check its
+return value: it refuses the same dimensions `bwa_scene_set_ism_room` refuses, and there is no
+engine to carry a reason, so false is the whole report and it writes nothing.
 
 **Clearing geometry does not need a decoy.** `bwa_scene_set_mesh_mat(e, NULL, 0, NULL, 0, NULL)`
 removes the static mesh. A malformed partial mesh (vertices but no triangles, counts disagreeing with
@@ -1433,6 +1566,13 @@ at a low rate and publishes a per-source scalar (+ a 3-band transmission tilt fo
 directional without being occluded). The `_get_` reads return the latest published scalar for
 HUD/diagnostics and are safe to poll. Occlusion is a no-op without the Steam Audio build (use the
 manual path below).
+
+Both `_get_` reads gate on the **handle**, not on the publish slot alone. A stale, destroyed, or
+recycled handle reads the neutral value (1: clear, on-axis) the same instant
+`bwa_source_is_playing` goes false, which is the same rule `bwa_source_get_playhead_frames`
+follows. Without that gate the answer would be worse than one block stale: nothing rewrites the
+publish slot on a destroy, so a destroyed source would report its last occlusion forever. Every
+per-handle readback answers for the handle you hold, never for the slot's history.
 
 **Directivity works in every build.** Same weighted-dipole model, `|(1-w) + w·cos θ|^p`, two
 renderers: with a Steam scene the occlusion sim evaluates it (~10-30 Hz, published + ramped);
@@ -1751,16 +1891,72 @@ block's active count (playing, sound bound; paused voices count, they haven't en
 HUDs or health monitoring; it reads 0 until audio runs.
 
 `bwa_set_test_signal` drives a single **output channel** with a built-in signal (660 Hz sine or white
-noise), injected **after** the per-speaker align stage: a raw value straight on the channel.
+noise), injected **after** the per-speaker align stage, so it carries no trim, no delay and no room
+EQ. It is deaf to the calibration by design.
 `channel` is in `[0, bwa_get_channel_count())`; anything else is ignored.
 
-This is a speaker-check / wiring / calibration tool: walk a tone across every channel to confirm
-the channel→speaker map, find a dead speaker, set a trim. It is **not** a spatial path: it
-bypasses the panner, so don't use it to "place" a sound. Per-frame-safe, takes effect next block,
+That deafness is what makes it a speaker-check and wiring tool: walk a tone across every channel to
+confirm the channel→speaker map and find a dead speaker. It is **not** a spatial path: it bypasses the
+panner, so don't use it to "place" a sound. Per-frame-safe, takes effect next block,
 no `bwa_commit` needed. Any number of channels at once; `gain 0` / `BWA_TEST_OFF` silences one.
 Works in every profile (cave/cave_both: a raw tone on that Digiface channel; the headphone
 profiles: that bus channel HRTF'd as its virtual speaker; in `binaural` the tone rides the
 diffuse/virtual-speaker path, since only point sources render direct). Needs no SDK.
+
+It is **not a level check**, and that follows from where it enters. Post-align means the tone
+carries no `gain_db`, no `delay_ms` and none of the correction FIRs, so it sounds the same
+before and after calibration. That deafness is what makes it the right wiring tool, because a
+dead channel is dead whatever its trim says. To hear a trim, use the direct channel route
+below: it enters at the panner's output, so it takes the whole align stage.
+
+### Direct output-channel routing (the reference condition)
+
+```c
+#define BWA_CHANNEL_AUTO (-1)
+void     bwa_source_set_channel(bwa_engine* e, bwa_source s, int32_t channel);
+```
+
+`bwa_source_set_channel` plays a **source** out of exactly one output channel with no spatial
+processing. The one-hot gain vector goes in **at the panner's output**, upstream of the whole output
+stage, so the routed voice takes every align trim and delay, the room EQ, the master gain and the
+limiter. It is subject to the calibration by design, which is the opposite of the test signal above.
+`channel` is in `[0, bwa_get_channel_count())`; `BWA_CHANNEL_AUTO` restores normal
+panning. Out of range is refused and sets `bwa_last_error`. Per-frame-safe, no `bwa_commit` needed.
+
+`BWA_CHANNEL_AUTO` is the only negative value the call accepts. Any other negative is refused like
+a too-large index, not read as AUTO: a bad index that quietly means "restore panning" leaves the
+source panned, reports nothing, and reads as a single-speaker reference that never took.
+
+Two jobs. First, the psychophysics **ground truth**: drive one real speaker with a real stimulus
+and A/B it against the phantom the panner puts at the same place. Second, a wiring check you can
+run with content instead of a tone.
+
+**This is not `bwa_set_test_signal`.** That one injects a built-in sine or noise onto a raw channel
+AFTER the align stage, which makes it a wiring tool and not level-comparable with anything the
+engine renders. This one replaces the voice's panner solve with a one-hot gain vector, at the
+panner's output. Two consequences, and both are the point:
+
+- Entering upstream is what makes the reference comparable in level and in path with the phantom
+  you are testing against. Both sides take the same output stage.
+- The route is just another gain target, so switching it on or off RAMPS across a block. No click.
+
+**The route is dry by design.** While it is on, distance attenuation, spread/extent/size,
+near-widening, hole spread, CAP, dual-band, occlusion, directivity, the reverb and
+early-reflection sends, pathing, Doppler and air absorption are all suppressed. What reaches the
+speaker is the asset's samples times the source gain times the group and master gains, which is
+what "no spatial processing" has to mean if the condition is to be deterministic. Each suppression
+drives that stage's own target rather than switching it off, so entering and leaving the route
+glides the Doppler line and the shelves out instead of stepping them. Position and every knob those
+stages read are remembered and take effect again the moment you go back to `BWA_CHANNEL_AUTO`.
+Playback rate (`bwa_source_set_pitch`) and the pause gate still apply: they are content controls,
+not spatial ones. The route survives a `bwa_source_play`, so a reference source keeps its channel
+across trials.
+
+Mono point sources only. A bed voice (`bwa_bed_play`, a 4/9/16-channel asset) ignores the call and
+keeps decoding to all speakers; route a mono copy instead. The profiles: cave/cave_both put the
+content on that Digiface channel and speaker; `cave_sim` HRTFs that bus channel as its virtual
+speaker; `binaural` renders the voice as a point source AT that speaker's surveyed position, dry,
+because point voices never reach the bus there. That is the same thing your ears get in `cave_sim`.
 
 `bwa_get_bus_levels` is the matching **readback**: each output channel's last-block peak `|sample|`
 (linear), measured at the very end of the render, after align, the test signal, and the limiter.

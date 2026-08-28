@@ -8,15 +8,6 @@ for desk-side debugging. Unity and Unreal connect as thin control clients over a
 New to the vocabulary? [docs/glossary.md](docs/glossary.md) defines every term the docs use,
 grouped by topic. Each entry says what the term means for a decision.
 
-## Why self-hosted
-
-Going direct (no FMOD/Wwise) gives sample-accurate access to ASIO timing hooks. It
-also keeps the library game-engine-agnostic, so one library serves both engines with
-only a thin per-engine glue layer. The spatializer, mixer, output, and tracking all
-live in one process behind one audio callback. The experiment deploys as one system
-on the machine that runs the endpoint. There is no external renderer to author,
-synchronize, and maintain alongside it.
-
 ## Shape
 
 ```
@@ -61,8 +52,12 @@ synchronize, and maintain alongside it.
   global) and click-free seek; engine-side timed fades; **mix groups** for
   category gain/ducking; sample-accurate start and scheduled click-free stop
   against a device-anchored DSP clock (`bwa_source_play_at` / `bwa_source_stop_at`
-  / `bwa_get_dsp_time`); **intro→loop** regions (`bwa_source_play_loop`) and
-  **gapless chaining** into queued sounds (`bwa_source_queue`). Starts and stops are
+  / `bwa_get_dsp_time_frames`); **intro→loop** regions (`bwa_source_play_loop`) and
+  **play regions** (`bwa_source_set_region`) that loop a sub-range or cut a one-shot
+  short; **gapless chaining** into queued sounds (`bwa_source_queue`); **end and
+  loop-wrap events** (`bwa_poll_ended`, `bwa_poll_looped`) you drain after each
+  commit, because a clip shorter than your frame can start and finish unseen and a
+  looping voice never ends at all. Starts and stops are
   click-free (one-block gain ramps either way), including the scene-transition
   sweeps (`bwa_group_stop`, `bwa_stop_all`). A source's whole configuration is one
   printable, diffable struct (`bwa_source_desc`) you fill from a preset and apply
@@ -76,7 +71,9 @@ synchronize, and maintain alongside it.
   Audio HRTF decode, no speaker-array simulation in the direct path) and an
   **array-audition monitor** (`cave_sim`: the same speaker bus through virtual
   speakers, DBAP artifacts included), both to any 2-ch ASIO device; per-channel
-  test signal, output meters, voice gauge.
+  test signal, output meters, voice gauge; and a **direct single-speaker route**
+  (`bwa_source_set_channel`) that plays a real source out of one speaker with no
+  spatial processing, the ground-truth condition to A/B a phantom against.
 - **Real-time discipline**: no allocation, locks, or I/O on the audio thread;
   lock-free SPSC command/event rings; `bwa_commit` gives frame-coherent updates;
   every parameter change ramps; nothing steps.
@@ -172,7 +169,8 @@ Current gaps (may change):
   geometry needs the Steam scene.
 - Mono point sources only. Stereo assets downmix; the ambisonic bed is the only
   non-point path.
-- No completion callbacks; poll `bwa_source_is_playing`.
+- No completion callbacks. Ends and loop wraps come back as events you drain
+  (`bwa_poll_ended`, `bwa_poll_looped`), never as a call into your code.
 - No OGG/Opus; seek and pitch do not apply to streamed sounds.
 - Reflection/room configuration is load-time (occlusion meshes can be replaced live).
 

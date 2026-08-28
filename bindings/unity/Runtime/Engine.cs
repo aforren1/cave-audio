@@ -196,6 +196,7 @@ namespace BwAudio
         public bool Ready => _eng != IntPtr.Zero;
 
         readonly List<SourceBase> _sources = new();   // every source component (Emitter + PushEmitter), one registry
+        readonly List<AmbisonicBed> _beds = new();    // every bed component; the event route, see RegisterBed
         // The path->handle dictionary this used to keep is GONE: bwa_sound_acquire is a by-path cache
         // keyed on (path, flags) inside the engine, so the same clip returns the same handle and the
         // "ambix:"/"fuma:" key prefixes this binding invented (one path, several loaders) are the
@@ -512,15 +513,22 @@ namespace BwAudio
         /// <summary>Poll a handle a component is waiting on and report a decode that FAILED, once.
         /// Returns the handle while the load is still in flight (keep watching) and 0 once it has
         /// resolved either way, so the caller assigns the result back over its pending field.
+        /// <para><c>landed</c> separates the two ways it resolves: true means the data ARRIVED, which is
+        /// also the moment the engine adopted it and bound the play that was waiting (this call is one
+        /// of the pump points that does the adopting). False with a 0 return means the decode failed and
+        /// the play will never bind. Callers that latch anything on "has this play bound yet" need that
+        /// distinction; a bare 0 cannot give it.</para>
         /// <para>Shared by every component that opts into async loading (Emitter, AmbisonicBed), because
         /// the two silences it tells apart — "still decoding" and "the decode failed" — are the same
         /// distinction for all of them, and two copies of it would drift.</para></summary>
-        internal static uint WatchPendingLoad(uint pending, MonoBehaviour owner, string subject)
+        internal static uint WatchPendingLoad(uint pending, MonoBehaviour owner, string subject,
+                                              out bool landed)
         {
+            landed = false;
             if (pending == 0 || !owner) return 0;
             var engine = Instance;
             if (!engine) return 0;
-            if (engine.IsSoundReady(pending, out var error)) return 0;
+            if (engine.IsSoundReady(pending, out var error)) { landed = true; return 0; }
             if (error == null) return pending;                 // still decoding
             Debug.LogWarning("[" + owner.GetType().Name + "] async load failed on " + owner.name +
                              ", the " + subject + " stays silent: " + error);
@@ -639,13 +647,15 @@ namespace BwAudio
         /// <summary>Stop every voice in one mix group (0..7) — "kill the SFX, keep the dialog". Each voice
         /// takes the click-free stop path (a one-block fade, then end) and drops its pending Queue chain.
         /// Group gains and pause gates are untouched: a stop stops sound, it does not reset the mixer.
-        /// Source handles stay valid and re-playable, so an Emitter can Play again straight after.</summary>
+        /// Source handles stay valid and re-playable, so an Emitter can Play again straight after.
+        /// <para>It also drops this group's plays that are still waiting on an async decode, which would
+        /// otherwise start by themselves the moment their data landed. The group a still-decoding play
+        /// belongs to is the one its source was in when the stop ran.</para></summary>
         public void StopGroup(uint group) { if (Ready) Bwa.bwa_group_stop(_eng, group); }
 
         /// <summary>Stop every voice in the engine, beds included — the one-call scene transition. Same
         /// click-free path and the same "does not reset the mixer" rule as <see cref="StopGroup"/>. It
-        /// also drops plays still waiting on an async decode, which would otherwise start by themselves
-        /// the moment their data landed (StopGroup cannot: a held play has no voice to read a group from).
+        /// drops every play still waiting on an async decode, whatever group it was issued in.
         /// A PUSH voice stops like any other, but its feed ring is NOT ended — call PushEmitter.PushEnd
         /// yourself if you are done with it.</summary>
         public void StopAll() { if (Ready) Bwa.bwa_stop_all(_eng); }
@@ -738,12 +748,26 @@ namespace BwAudio
         /// tracker is connected (or the engine isn't running). Cheap; safe to poll every frame.</summary>
         public BwaTrackerState TrackerStatus => Ready ? Bwa.bwa_tracker_status(_eng) : BwaTrackerState.Disconnected;
 
-        /// <summary>The engine's dsp-sample clock (device-anchored, monotonic). Add to it to schedule a
-        /// sample-accurate start: <c>DspTime + sampleRate/2</c> plays half a second out.</summary>
-        public ulong DspTime => Ready ? Bwa.bwa_get_dsp_time(_eng) : 0;
+        /// <summary>The engine's dsp-sample clock in FRAMES (device-anchored, monotonic). Add to it to
+        /// schedule a sample-accurate start: <c>DspTimeFrames + sampleRate/2</c> plays half a second out.
+        /// <para>Named for its unit, and this is the sharpest name collision in the binding: Unity's own
+        /// <c>AudioSettings.dspTime</c> is a <c>double</c> of SECONDS. A bare <c>DspTime</c> here returning
+        /// a frame count reads as that call to every Unity developer, and the two are wrong by a factor of
+        /// the sample rate — which looks like a plausible-but-early cue rather than an obvious bug.</para>
+        /// Schedule with this one. It is exact, and it is what PlayAt and StopAt take.</summary>
+        public ulong DspTimeFrames => Ready ? Bwa.bwa_get_dsp_time_frames(_eng) : 0;
+
+        /// <summary>The seconds twin of <see cref="DspTimeFrames"/> (converted at the engine's sample
+        /// rate) — the like-for-like comparison against <c>AudioSettings.dspTime</c>. Both count from the
+        /// engine starting, not from the app, so only DIFFERENCES are comparable across the two clocks.
+        /// A convenience for display and logging: schedule with DspTimeFrames.</summary>
+        public double DspTimeSeconds
+        {
+            get { double fs = sampleRate; return fs > 0 ? DspTimeFrames / fs : 0.0; }
+        }
 
         /// <summary>The device's own (dsp sample ↔ host time) correspondence for the last rendered
-        /// block — the raw pair behind DspTimeAt/RealtimeAt, for callers who want to run their own
+        /// block — the raw pair behind DspTimeFramesAt/RealtimeAt, for callers who want to run their own
         /// clock model. hostTimeNs is monotonic nanoseconds on a backend-defined epoch. False until
         /// audio is running with a host-stamped backend.</summary>
         public bool GetClock(out ulong dspSample, out ulong hostTimeNs)
@@ -752,14 +776,23 @@ namespace BwAudio
             return Ready && Bwa.bwa_get_clock(_eng, out dspSample, out hostTimeNs);
         }
 
-        /// <summary>Device-reported render→DAC output latency, frames at the engine rate (the Digiface includes
-        /// its Dante network buffering). A sound scheduled for dsp time T is HEARD at T + OutputLatency —
-        /// fold it into AV alignment together with your measured display delay. 0 = unknown / no
-        /// physical output (the silent null-sink fallback).</summary>
-        public uint OutputLatency => Ready ? Bwa.bwa_get_output_latency_frames(_eng) : 0;
+        /// <summary>Device-reported render→DAC output latency, FRAMES at the engine rate (the Digiface
+        /// includes its Dante network buffering). A sound scheduled for dsp time T is HEARD at
+        /// T + OutputLatencyFrames — fold it into AV alignment together with your measured display delay.
+        /// 0 = unknown / no physical output (the silent null-sink fallback), which is also why the unit
+        /// belongs in the name: a device-less sink reports 0, and 0 is 0 in either unit.</summary>
+        public uint OutputLatencyFrames => Ready ? Bwa.bwa_get_output_latency_frames(_eng) : 0;
+
+        /// <summary>The seconds twin of <see cref="OutputLatencyFrames"/> (converted at the engine's
+        /// sample rate) — the unit AV-alignment arithmetic usually wants, since a measured display delay
+        /// is in seconds too.</summary>
+        public double OutputLatencySeconds
+        {
+            get { double fs = sampleRate; return fs > 0 ? OutputLatencyFrames / fs : 0.0; }
+        }
 
         /// <summary>How fast the device clock runs against the host clock, fitted over the per-block
-        /// stamps (~2 min window). DspTimeAt re-anchors every frame and needs none of this; reach for
+        /// stamps (~2 min window). DspTimeFramesAt re-anchors every frame and needs none of this; reach for
         /// it when something ELSE owns the timeline (video, timecode, another node), when you want a
         /// minutes-long extrapolation to hold, or to log the rig's drift. False until the fit has ~1 s
         /// of stamps, and again for ~1 s after a restart re-bases the device sample position.</summary>
@@ -784,35 +817,39 @@ namespace BwAudio
         /// when nothing dropped and when nothing could be measured; GetHealth tells them apart.</summary>
         public ulong Xruns => Ready ? Bwa.bwa_get_xruns(_eng) : 0;
 
-        /// <summary>Map a Time.realtimeSinceStartupAsDouble moment to the dsp-sample clock — THE way
-        /// to land a sound on a visual event: <c>emitter.PlayAt(engine.DspTimeAt(tEvent))</c> (schedule
-        /// with margin; a start in the past plays immediately). Built on the device's own block stamps
-        /// (GetClock) with a continuously refreshed epoch offset, so it self-corrects device↔OS clock
-        /// drift; typically accurate to well under a millisecond, falling back to block-granular
-        /// DspTime pairing (~one block) when no device stamp exists. For events that live on the AUDIO
-        /// timeline (cues in a scheduled track), skip wall time entirely — use t0 + cue×rate.</summary>
-        public ulong DspTimeAt(double realtime)
+        /// <summary>Map a Time.realtimeSinceStartupAsDouble moment (SECONDS) to the dsp-sample clock
+        /// (FRAMES) — THE way to land a sound on a visual event:
+        /// <c>emitter.PlayAt(engine.DspTimeFramesAt(tEvent))</c> (schedule with margin; a start in the
+        /// past plays immediately). Built on the device's own block stamps (GetClock) with a
+        /// continuously refreshed epoch offset, so it self-corrects device↔OS clock drift; typically
+        /// accurate to well under a millisecond, falling back to block-granular DspTimeFrames pairing
+        /// (~one block) when no device stamp exists. For events that live on the AUDIO timeline (cues in
+        /// a scheduled track), skip wall time entirely — use t0 + cue×rate.
+        /// <para>The name says the RETURN unit, like DspTimeFrames: this call crosses the two units, so
+        /// leaving it unmarked would be the one place the collision actually bites.</para></summary>
+        public ulong DspTimeFramesAt(double realtime)
         {
             RefreshClock();
             double fs = sampleRate;
             if (!_clkValid)
             {
-                double f = (double)DspTime + (realtime - Time.realtimeSinceStartupAsDouble) * fs;
+                double f = (double)DspTimeFrames + (realtime - Time.realtimeSinceStartupAsDouble) * fs;
                 return f > 0 ? (ulong)f : 0;
             }
             double dsp = _clkSampleD + (realtime + _clkOffset - _clkHostSec) * fs;
             return dsp > 0 ? (ulong)dsp : 0;
         }
 
-        /// <summary>Inverse of DspTimeAt: the Time.realtimeSinceStartupAsDouble moment at which a dsp
-        /// sample is RENDERED (add OutputLatency/sampleRate for when it is heard) — for firing visuals
-        /// off an audio-timeline event.</summary>
+        /// <summary>Inverse of DspTimeFramesAt: the Time.realtimeSinceStartupAsDouble moment at which a
+        /// dsp sample is RENDERED (add OutputLatencySeconds for when it is heard) — for firing visuals
+        /// off an audio-timeline event. No unit in the name: `Realtime` is Unity's own word for that
+        /// clock and it is seconds there too, and the parameter carries its unit (`dspSample`).</summary>
         public double RealtimeAt(ulong dspSample)
         {
             RefreshClock();
             double fs = sampleRate;
             if (!_clkValid)
-                return Time.realtimeSinceStartupAsDouble + ((double)dspSample - (double)DspTime) / fs;
+                return Time.realtimeSinceStartupAsDouble + ((double)dspSample - (double)DspTimeFrames) / fs;
             return _clkHostSec + ((double)dspSample - _clkSampleD) / fs - _clkOffset;
         }
 
@@ -1083,8 +1120,50 @@ namespace BwAudio
         // the same centralized per-frame push, before the listener + the one commit), all flowing
         // through the same snapshot — so a callback that mutates the registry mid-loop is safe no
         // matter which source kind fires it.
-        public void Register(SourceBase s)   { if (!_sources.Contains(s)) _sources.Add(s); }
-        public void Unregister(SourceBase s) => _sources.Remove(s);
+        public void Register(SourceBase s)
+        {
+            if (ReferenceEquals(s, null)) return;
+            if (!_sources.Contains(s)) _sources.Add(s);
+            if (s.NativeHandle != 0) _byHandle[s.NativeHandle] = s;   // the ended-event route (see DrainEnded)
+        }
+
+        public void Unregister(SourceBase s)
+        {
+            // ReferenceEquals, not `!s`: a component already torn down compares equal to null under
+            // Unity's overloaded operator, and its route still has to go or the map keeps the corpse.
+            if (ReferenceEquals(s, null)) return;
+            _sources.Remove(s);
+            // Removing here is what keeps the map from leaking and from misrouting. It cannot go stale
+            // in the meantime: rt bumps a slot's generation before reissuing it, so a source created
+            // after this one is destroyed never mints this key, and the engine drops any undrained
+            // ended event whose generation no longer matches.
+            if (_byHandle.TryGetValue(s.NativeHandle, out var cur) && ReferenceEquals(cur, s))
+                _byHandle.Remove(s.NativeHandle);
+        }
+
+        // Beds register HERE, in a second registry. A bed is a voice — the core reports its handle
+        // through bwa_poll_ended and bwa_poll_looped like any other — but AmbisonicBed is not a
+        // SourceBase, because a bed has no position and the source registry exists to PUSH one every
+        // frame. So the event drains and the post-commit pass consult this list too. Bed and source
+        // handles come out of ONE pool (bwa_bed_create IS bwa_source_create), so a handle is either a
+        // source's or a bed's and never both, which is what makes consulting the two maps in turn
+        // correct.
+        public void RegisterBed(AmbisonicBed b)
+        {
+            if (ReferenceEquals(b, null)) return;
+            if (!_beds.Contains(b)) _beds.Add(b);
+            if (b.NativeHandle != 0) _bedsByHandle[b.NativeHandle] = b;
+        }
+
+        public void UnregisterBed(AmbisonicBed b)
+        {
+            // ReferenceEquals, not `!b`: a component already torn down compares equal to null under
+            // Unity's overloaded operator, and its route still has to go or the map keeps the corpse.
+            if (ReferenceEquals(b, null)) return;
+            _beds.Remove(b);
+            if (_bedsByHandle.TryGetValue(b.NativeHandle, out var cur) && ReferenceEquals(cur, b))
+                _bedsByHandle.Remove(b.NativeHandle);
+        }
 
         void LateUpdate()
         {
@@ -1109,7 +1188,132 @@ namespace BwAudio
             }
             PushExtraListeners();                                  // ...the other occupants (commit-gated too)...
             Bwa.bwa_commit(_eng);                                    // ...then one atomic snapshot
+            // ...and only THEN the event drains. bwa_commit is what runs the pass that fills both rings,
+            // so polling before it reads a frame-old picture and delays every callback by a frame for no
+            // reason. Ended before looped is not load-bearing (the two rings are independent), but the
+            // post-commit pass must come after BOTH: it is where an emitter's halt fallback reads
+            // IsPlaying, and that read must not race the event describing the same end.
+            DrainEnded();
+            DrainLooped();
+            PostCommitPass();
         }
+
+        // Every handle bwa_poll_ended reports, routed to the source component that owns it. THIS is the
+        // one place that call may be made from: the drain is engine-wide and destructive, so a second
+        // caller anywhere would consume events belonging to somebody else's sources and they would
+        // simply never fire. Emitters take completions from here, never by polling for themselves.
+        readonly Dictionary<uint, SourceBase> _byHandle = new();   // native source handle -> owner
+        readonly Dictionary<uint, AmbisonicBed> _bedsByHandle = new();  // native bed handle -> owner (see RegisterBed)
+        static readonly uint[] _endedBuf = new uint[64];           // reused; bwa_poll_ended writes at most cap
+        ulong _endedDropped;                                       // the engine's running dropped total
+        bool _endedDropWarned;
+
+        void DrainEnded()
+        {
+            for (;;)
+            {
+                // Re-check every pass: an onFinished handler below is arbitrary user code and may have
+                // destroyed the Engine, which zeroes _eng.
+                if (!Ready) return;
+                uint n = Bwa.bwa_poll_ended(_eng, _endedBuf, (uint)_endedBuf.Length, out ulong dropped);
+                if (dropped != _endedDropped)
+                {
+                    _endedDropped = dropped;
+                    if (!_endedDropWarned)
+                    {
+                        _endedDropWarned = true;
+                        Debug.LogWarning("[bw_audio] " + dropped + " voice-completion events were dropped " +
+                                         "before they could be read, so that many onFinished callbacks " +
+                                         "never fired. The engine's ended ring is bounded and drops the " +
+                                         "OLDEST: something stalled Engine's LateUpdate. Watch " +
+                                         "Engine.EndedEventsDropped for the running total (this warns once).");
+                    }
+                }
+                for (int i = 0; i < (int)n; i++)
+                {
+                    // A handle with no route is normal, not an error: the source was destroyed after its
+                    // voice ended but before this drain, or it belongs to a source kind that has no
+                    // completion event.
+                    if (_byHandle.TryGetValue(_endedBuf[i], out var s) && s) s.NotifyEnded();
+                    else if (_bedsByHandle.TryGetValue(_endedBuf[i], out var b) && b) b.NotifyEnded();
+                }
+                if (n < (uint)_endedBuf.Length) break;             // drained
+            }
+        }
+
+        // The loop-boundary drain, alongside the ended one and under the same single-owner rule:
+        // bwa_poll_looped is engine-wide and destructive, so a second caller anywhere would eat wraps
+        // belonging to somebody else's sources. Deliberately NOT folded into DrainEnded — a wrap is not
+        // an end. The voice is still playing, so none of the completion latching applies to it, and
+        // entangling the two would put a "did this stop" question in the path of an event that means the
+        // opposite. One callback per WRAP: a short loop region can wrap several times in one audio block.
+        static readonly uint[] _loopedBuf = new uint[64];           // reused; bwa_poll_looped writes at most cap
+        ulong _loopedDropped;
+        bool _loopedDropWarned;
+
+        void DrainLooped()
+        {
+            for (;;)
+            {
+                // Re-check every pass: an onLoop handler below is arbitrary user code and may have
+                // destroyed the Engine, which zeroes _eng.
+                if (!Ready) return;
+                uint n = Bwa.bwa_poll_looped(_eng, _loopedBuf, (uint)_loopedBuf.Length, out ulong dropped);
+                if (dropped != _loopedDropped)
+                {
+                    _loopedDropped = dropped;
+                    if (!_loopedDropWarned)
+                    {
+                        _loopedDropWarned = true;
+                        Debug.LogWarning("[bw_audio] " + dropped + " loop-boundary events were dropped " +
+                                         "before they could be read, so that many onLoop callbacks never " +
+                                         "fired. The engine's loop ring is bounded and drops the OLDEST: " +
+                                         "either Engine's LateUpdate stalled, or a loop region is short " +
+                                         "enough to wrap faster than the frame rate reads it. Watch " +
+                                         "Engine.LoopEventsDropped for the running total (this warns once).");
+                    }
+                }
+                for (int i = 0; i < (int)n; i++)
+                {
+                    // No route is normal, not an error: a source destroyed between the wrap and this
+                    // drain, or a source kind with no loop event.
+                    if (_byHandle.TryGetValue(_loopedBuf[i], out var s) && s) s.NotifyLooped();
+                    else if (_bedsByHandle.TryGetValue(_loopedBuf[i], out var b) && b) b.NotifyLooped();
+                }
+                if (n < (uint)_loopedBuf.Length) break;            // drained
+            }
+        }
+
+        // The per-source post-commit pass, after BOTH drains, so a natural end is reported by its event
+        // and not by an emitter's own IsPlaying edge (Emitter.PostCommit). _pushBuf still holds this
+        // frame's snapshot; a handler above may have disabled entries, which the null + Live guards absorb.
+        void PostCommitPass()
+        {
+            if (!Ready) return;
+            foreach (var s in _pushBuf) if (s) s.PostCommit();
+            // Beds take the same pass, for the same reason: a bed's halt fallback reads
+            // bwa_bed_is_playing, and that read must not race the event describing the same end.
+            // Snapshotted like the sources are — an onFinished handler may disable a bed, which runs
+            // OnDisable -> UnregisterBed -> _beds.Remove mid-loop.
+            _bedBuf.Clear();
+            _bedBuf.AddRange(_beds);
+            foreach (var b in _bedBuf) if (b) b.PostCommit();
+        }
+
+        readonly List<AmbisonicBed> _bedBuf = new();   // reusable snapshot, like _pushBuf
+
+        /// <summary>How many voice-completion events the engine has DROPPED because nothing read them in
+        /// time (running total for the engine's lifetime). The ended ring is bounded and drops the oldest,
+        /// so a rising number means that many <c>Emitter.onFinished</c> callbacks never fired. It should
+        /// stay 0: it only moves if Engine's LateUpdate stopped running while sources kept ending.</summary>
+        public ulong EndedEventsDropped => _endedDropped;
+
+        /// <summary>How many loop-boundary events the engine has DROPPED because nothing read them in
+        /// time (running total for the engine's lifetime). A rising number means that many
+        /// <c>Emitter.onLoop</c> callbacks never fired. Unlike the ended total this one can move without
+        /// anything being wrong: a loop region shorter than a frame wraps more often than LateUpdate
+        /// reads it, so pace trials off the count you receive, not off the count you expected.</summary>
+        public ulong LoopEventsDropped => _loopedDropped;
 
         // The other occupants, for compromise panning. Commit-gated like the primary pose, so it belongs in
         // the same frame block. The engine takes at most BWA_EXTRA_LIS (3); the buffer is reused (no per-frame

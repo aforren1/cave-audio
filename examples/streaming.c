@@ -143,6 +143,12 @@ int main(int argc, char** argv) {
     }
     bwa_source_push_end(e, s2);                  /* end-of-data: the voice ends once the ring drains */
     printf("    pushed %.1f s; waiting for the ring to drain...\n", (double)pushed / RATE);
+    /* is_playing, not bwa_poll_ended, and deliberately. The drain is the better mechanism for
+     * "did it finish" (bwa_minimal walks it) because a sound shorter than a frame can start and
+     * end between two polls. Nothing here is shorter than a frame: this ring holds seconds of
+     * audio, so the readback cannot miss the transition and asking "is it still going" is what
+     * this code actually wants to know. A push voice DOES post a completion, so switching to
+     * the drain would work too. */
     while (bwa_source_is_playing(e, s2)) { bwa_commit(e); Sleep(16); }
     printf("    drained - the push source ended itself (one-way: a new take needs a new source)\n");
     bwa_source_destroy(e, s2);

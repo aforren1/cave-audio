@@ -73,7 +73,9 @@ cell ran before it, and a cold engine renders the same cell as a warm one.
 
 **The physical reference arm does not go through the engine.** Driving one speaker alone involves
 no panner and no knob. It is the floor everything else is quoted against, so it must not acquire
-dependencies on engine runtime state. It still builds its feed the direct way.
+dependencies on engine runtime state. It still builds its feed the direct way. The ABI has a live
+counterpart, `bwa_source_set_channel`, and it is for listening rather than for measuring: see "The
+physical reference arm" below for why the two stay separate.
 
 ## Two paths, one scorer
 
@@ -587,6 +589,16 @@ Two things to know before reading that table:
 Expect a triangle panner (VBAP) to show ~0 here even off-center, because it collapses onto the
 coincident speaker, while a distance-blurred panner (DBAP) spreads and pays a real penalty. That
 difference is a genuine characterization of the panners, not an artifact.
+
+**The by-ear version is a different signal, and that is deliberate.**
+`bwa_source_set_channel(e, s, i)` drives one speaker alone from a live engine, so a listener can
+A/B a phantom against a real source in the room while the array is running. It is the same
+*question*, not the same *path*. This arm builds its feed outside the engine so the floor it
+reports cannot pick up engine state. The live route runs a real voice with the panner's solve
+replaced by a one-hot vector, so it keeps the align trims, the room EQ, the master gain and the
+limiter, which is exactly what makes it level-comparable by ear with the phantom next to it. Read
+the numbers here, and use the route to hear what they mean.
+[hardware-validation.md](./hardware-validation.md#stage-5-by-ear-checks) has the trial.
 
 ### Stimulus, and where content dependence actually comes from
 

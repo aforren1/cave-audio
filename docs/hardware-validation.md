@@ -132,6 +132,9 @@ bwa_layout_tool cave_layout.json
 - [ ] Walk the test signal across every channel (the tool drives `bwa_set_test_signal`, a
       raw post-align tone on one output; no panner involved). For each channel, confirm by
       ear it's the intended box. Fix the channel map in the tool, not by re-patching Dante.
+      Post-align is the right choice here: a dead channel is dead whatever its trim says, so
+      the wiring check must not depend on a calibration you have not run yet. That is also
+      why this walk cannot double as the level check in Stage 2.
 - [ ] No dead channels: every speaker sounds, every gizmo lights (`bwa_get_bus_levels`
       feeds the meters).
 - [ ] Save. This layout is the input to calibration.
@@ -166,9 +169,15 @@ Then the real sequence:
 - [ ] **Review before accepting**: `bwa_calib_view before.json after.json`. The Diff tab
       highlights outliers. A swapped channel, bad mic spot, or bogus localize solve is one
       glance here. Only then overwrite the production layout.
-- [ ] **Verify audibly**: re-run the Stage 1 walk with the calibrated layout. Levels now
-      match speaker to speaker from the center. (Delay alignment has no by-ear check with
-      the built-in tools; trust the Diff numbers.)
+- [ ] **Verify audibly**, but not with the Stage 1 walk. `bwa_set_test_signal` injects
+      *after* the per-speaker align stage on purpose, so its tone carries no `gain_db`, no
+      `delay_ms`, and none of the `--eq` correction. It sounds the same before and after
+      calibration, which is what makes it a good wiring tool and a useless level check.
+      Use the **direct channel route** instead: play a real source through
+      `bwa_source_set_channel(e, s, ch)` and step `ch` across the array. That voice takes
+      the whole output stage, trims included, so levels now match speaker to speaker from
+      the center. (Delay alignment still has no by-ear check with the built-in tools; trust
+      the Diff numbers.)
 
 ### Zylia ZM-1 (if present)
 
@@ -382,6 +391,20 @@ The checks with no assertion: bring ears you trust.
 - [ ] **HRTF monitor quality** (the standing "remaining" item): `bwa_playground`,
       localization scene, headphones. Timbre, externalization, front/back: laterality is
       already pinned by tests; this is everything tests can't hear.
+- [ ] **Phantom against a real speaker** (`bwa_source_set_channel`): the by-ear half of
+      Stage 4b's physical reference arm, and the trial to run before the bake-off, because
+      every other trial below is a preference expressed against it. Pick a speaker, play a
+      stimulus out of it alone with `bwa_source_set_channel(e, s, i)`, then put the source
+      back on the panner (`BWA_CHANNEL_AUTO`) at that speaker's own surveyed position and
+      A/B the two. Both take the same output stage, so the comparison is level-matched and
+      the switch ramps rather than clicks. Listen for image size, timbre, and how far the
+      phantom has to be off-center before it separates from the real one. Two things to know
+      before you read your own verdict, both from
+      [validation.md](./validation.md#the-physical-reference-arm): at the array center a
+      symmetric array puts the phantom on the speaker, so the center is a **null control**
+      and the off-center listening spots carry the information; and VBAP collapses onto a
+      coincident speaker while DBAP spreads, so the two panners are expected to differ here.
+      Do this from at least one center and one off-center spot, or the null is all you hear.
 - [ ] **The knob bake-off**: playground's blind A/B/X harness over the live knobs
       (dual-band, DBAP vs SPCAP/VBAP, SPCAP focus, spread render modes, decorrelation, air
       absorption, max-rE…). N trials, one-sided binomial p-value: a knob that isn't
@@ -438,6 +461,7 @@ Every knob these trials need is already on the Unity binding. Only two cost a sc
 
 | Trial | Unity control | Cost |
 | --- | --- | --- |
+| Phantom against a real speaker | `Emitter.Channel` (`Bwa.CHANNEL_AUTO` to go back) | live |
 | Preset baseline | `Engine.situation` + `ApplySituation()` | live |
 | SPCAP focus | `spcapFocus` / `spcapDensity` | live |
 | Hole-aware floor | `holeSpread`, 0 against 1 | live |
@@ -460,6 +484,10 @@ this stage exists: **SPCAP focus** (the three measurements point different ways 
 the **hole-aware floor** (`bwa_validate` sees its cost and not its benefit), and **CAP** (its claim is
 about head rotation, which no measurement here reaches). Everything else in the table is a
 convenience. These three are the session.
+
+**Build the reference row before any of them.** The phantom-against-a-real-speaker A/B is one call
+and it is what the other three are judged against. A listener who has not heard the real speaker has
+no scale for "how much better", and the verdicts stop comparing across sessions.
 
 **Encode the two ordering rules, do not just read them.** The scene should refuse to run the tracked
 alignment trial before Stage 2 is accepted, because on an uncalibrated layout that knob measures

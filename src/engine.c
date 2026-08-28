@@ -7,7 +7,7 @@
  */
 #include "bw_audio.h"
 #include "frame.h"         /* BWA_ROOM_* identity basis + frame_qrot */
-#include "sane.h"         /* bwa_quat_unit, bwa_finite3, bwa_finite_clamp */
+#include "sane.h"         /* bwa_quat_unit, bwa_finite3_bounded, bwa_finite_bounded, bwa_finite_clamp */
 #include "sink.h"
 #include "rt.h"
 #include "assets.h"        /* by-path asset cache + loader thread (bwa_sound_acquire/_async) */
@@ -29,7 +29,7 @@
 #include "ism.h"
 #include "hpeq.h"           /* headphone correction EQ (bwa_load_headphone_eq) */
 
-#include <math.h>           /* isfinite (bwa_scene_set_ground) */
+#include <math.h>           /* isfinite (the ABI input guards) */
 #include <stdio.h>          /* snprintf (the backend readback string) */
 #include <stdlib.h>
 #include <string.h>
@@ -643,7 +643,7 @@ bwa_result bwa_tracker_connect(bwa_engine* e, const bwa_tracker_desc* d) {
     /* the same invariant bwa_start enforces: static room_eq is room correction at ONE point —
      * refuse to attach a moving (tracked) listener to it (docs/calibration.md). */
     if (layout_has_room_eq(e)) {
-        set_error(e, "bwa_tracker_connect: the layout carries static room_eq (fixed listener only) — "
+        set_error(e, "bwa_tracker_connect: the layout carries static room_eq (fixed listener only) - "
                      "recalibrate with --room-eq-grid for a tracked session");
         return BWA_ERR_CONFIG;
     }
@@ -875,23 +875,65 @@ void  bwa_bed_play(bwa_engine* e, bwa_bed b, bwa_sound snd, bool loop) {
             "bwa_bed_play: this async asset was acquired as mono - acquire it with BWA_LOAD_AMBIX or BWA_LOAD_FUMA"))
         return;
     if (rt_sound_channels(e->rt, snd) <= 1 && !rt_sound_pending(e->rt, snd)) {
-        set_error(e, "bwa_bed_play: asset is mono — load it with bwa_load_ambix (a 4/9/16-ch AmbiX file)");
+        set_error(e, "bwa_bed_play: asset is mono - load it with bwa_load_ambix (a 4/9/16-ch AmbiX file)");
         return;
     }
-    if (refuse_push_play(e, b, "bwa_bed_play: push source (bwa_source_create_push) — feed it with bwa_source_push"))
+    if (refuse_push_play(e, b, "bwa_bed_play: push source (bwa_source_create_push) - feed it with bwa_source_push"))
         return;
     rt_bed_play(e->rt, b, snd, loop);               /* direct: bypass bwa_source_play's mono-only guard.
                                                      * The bed-kind entry point, so a HELD play carries
                                                      * the kind into rt_sound_publish's re-check. */
 }
+/* The two scheduled/region play forms. They repeat bwa_bed_play's kind guards rather than call it,
+ * because the guard is what makes the prefix mean anything: routing them through bwa_source_play_at
+ * would reject the multichannel asset a bed exists to play. Each names ITSELF in its error, so a
+ * caller reading bwa_last_error learns which call it made. */
+void  bwa_bed_play_at(bwa_engine* e, bwa_bed b, bwa_sound snd, bool loop, uint64_t start_sample) {
+    if (!e) return;
+    if (refuse_pending_kind(e, snd, true,
+            "bwa_bed_play_at: this async asset was acquired as mono - acquire it with BWA_LOAD_AMBIX or BWA_LOAD_FUMA"))
+        return;
+    if (rt_sound_channels(e->rt, snd) <= 1 && !rt_sound_pending(e->rt, snd)) {
+        set_error(e, "bwa_bed_play_at: asset is mono - load it with bwa_load_ambix (a 4/9/16-ch AmbiX file)");
+        return;
+    }
+    if (refuse_push_play(e, b, "bwa_bed_play_at: push source (bwa_source_create_push) - feed it with bwa_source_push"))
+        return;
+    rt_bed_play_at(e->rt, b, snd, loop, start_sample);
+}
+void  bwa_bed_play_loop(bwa_engine* e, bwa_bed b, bwa_sound snd, uint64_t loop_beg, uint64_t loop_end) {
+    if (!e) return;
+    if (refuse_pending_kind(e, snd, true,
+            "bwa_bed_play_loop: this async asset was acquired as mono - acquire it with BWA_LOAD_AMBIX or BWA_LOAD_FUMA"))
+        return;
+    if (rt_sound_channels(e->rt, snd) <= 1 && !rt_sound_pending(e->rt, snd)) {
+        set_error(e, "bwa_bed_play_loop: asset is mono - load it with bwa_load_ambix (a 4/9/16-ch AmbiX file)");
+        return;
+    }
+    if (refuse_push_play(e, b, "bwa_bed_play_loop: push source (bwa_source_create_push) - feed it with bwa_source_push"))
+        return;
+    rt_bed_play_loop(e->rt, b, snd, loop_beg, loop_end);
+}
 void  bwa_bed_set_gain(bwa_engine* e, bwa_bed b, float linear)       { bwa_source_set_gain(e, b, linear); }
 void  bwa_bed_stop(bwa_engine* e, bwa_bed b)                         { bwa_source_stop(e, b); }
 void  bwa_bed_destroy(bwa_engine* e, bwa_bed b)                      { bwa_source_destroy(e, b); }
 /* the rest of the facade: same voice machinery, bed-named (see bw_audio.h — a bed IS a voice) */
+void  bwa_bed_stop_at(bwa_engine* e, bwa_bed b, uint64_t stop_sample) { bwa_source_stop_at(e, b, stop_sample); }
 void  bwa_bed_fade_to (bwa_engine* e, bwa_bed b, float gain, float seconds) { bwa_source_fade_to(e, b, gain, seconds); }
 void  bwa_bed_fade_out(bwa_engine* e, bwa_bed b, float seconds)      { bwa_source_fade_out(e, b, seconds); }
 void  bwa_bed_set_paused(bwa_engine* e, bwa_bed b, bool paused)      { bwa_source_set_paused(e, b, paused); }
 void  bwa_bed_seek(bwa_engine* e, bwa_bed b, uint64_t frame)         { bwa_source_seek(e, b, frame); }
+/* Alias of bwa_source_set_region, but it re-states the guard so bwa_last_error names the call the
+ * caller actually made. A facade whose whole point is that bed code never mixes prefixes must not
+ * answer a bed mistake with a bwa_source_* message. */
+void  bwa_bed_set_region(bwa_engine* e, bwa_bed b, uint64_t start_frame, uint64_t end_frame) {
+    if (!e) return;
+    if (end_frame != 0 && end_frame <= start_frame) {
+        set_error(e, "bwa_bed_set_region: end_frame must be 0 (the asset end) or greater than start_frame");
+        return;
+    }
+    rt_source_set_region(e->rt, b, start_frame, end_frame);
+}
 void  bwa_bed_set_priority(bwa_engine* e, bwa_bed b, int priority)   { bwa_source_set_priority(e, b, priority); }
 void  bwa_bed_set_group(bwa_engine* e, bwa_bed b, uint32_t group)    { bwa_source_set_group(e, b, group); }
 bool  bwa_bed_is_playing(bwa_engine* e, bwa_bed b)                   { return bwa_source_is_playing(e, b); }
@@ -971,9 +1013,10 @@ void bwa_source_destroy(bwa_engine* e, bwa_source s) {
 void bwa_source_set_pos(bwa_engine* e, bwa_source s, float x, float y, float z) {
     if (!e) return;
     /* Validate once at the ABI boundary: rt rejects non-finite internally, but the sims
-     * (steam_scene/steam_path) were fed the raw coordinates and have no guard of their own. */
+     * (steam_scene/steam_path) were fed the raw coordinates and have no guard of their own. Bounded,
+     * not merely finite: an absurd coordinate overflows the sims exactly as it does the panner. */
     const float p3[3] = { x, y, z };
-    if (!bwa_finite3(p3)) return;
+    if (!bwa_finite3_bounded(p3, BWA_MAX_COORD)) return;
     rt_source_set_pos(e->rt, s, x, y, z);
     uint16_t idx = (uint16_t)(s & 0xFFFFu);
     if (idx < BWA_VOICE_SLOTS) { e->src_pos[idx][0]=x; e->src_pos[idx][1]=y; e->src_pos[idx][2]=z; }  /* so set_pathing has the pos */
@@ -993,43 +1036,43 @@ void bwa_source_set_gain(bwa_engine* e, bwa_source s, float linear) {
 void bwa_source_play(bwa_engine* e, bwa_source s, bwa_sound snd, bool loop) {
     if (!e) return;
     if (rt_sound_channels(e->rt, snd) > 1) {        /* a multichannel asset is a bed, not a point source */
-        set_error(e, "bwa_source_play: asset is multichannel — use bwa_bed_play (or bwa_load_sound for a point source)");
+        set_error(e, "bwa_source_play: asset is multichannel - use bwa_bed_play (or bwa_load_sound for a point source)");
         return;
     }
     if (refuse_pending_kind(e, snd, false,          /* not decoded yet, but acquired as a bed */
             "bwa_source_play: this async asset was acquired as an ambisonic bed - use bwa_bed_play"))
         return;
-    if (refuse_push_play(e, s, "bwa_source_play: push source (bwa_source_create_push) — feed it with bwa_source_push"))
+    if (refuse_push_play(e, s, "bwa_source_play: push source (bwa_source_create_push) - feed it with bwa_source_push"))
         return;
     rt_source_play(e->rt, s, snd, loop);
 }
 void bwa_source_play_at(bwa_engine* e, bwa_source s, bwa_sound snd, bool loop, uint64_t start_sample) {
     if (!e) return;
     if (rt_sound_channels(e->rt, snd) > 1) {
-        set_error(e, "bwa_source_play_at: asset is multichannel — use a point source");
+        set_error(e, "bwa_source_play_at: asset is multichannel - use a point source");
         return;
     }
     if (refuse_pending_kind(e, snd, false,
             "bwa_source_play_at: this async asset was acquired as an ambisonic bed - use bwa_bed_play"))
         return;
-    if (refuse_push_play(e, s, "bwa_source_play_at: push source (bwa_source_create_push) — feed it with bwa_source_push"))
+    if (refuse_push_play(e, s, "bwa_source_play_at: push source (bwa_source_create_push) - feed it with bwa_source_push"))
         return;
     rt_source_play_at(e->rt, s, snd, loop, start_sample);
 }
 void bwa_source_play_loop(bwa_engine* e, bwa_source s, bwa_sound snd, uint64_t loop_beg, uint64_t loop_end) {
     if (!e) return;
     if (rt_sound_channels(e->rt, snd) > 1) {
-        set_error(e, "bwa_source_play_loop: asset is multichannel — use bwa_bed_play (or bwa_load_sound for a point source)");
+        set_error(e, "bwa_source_play_loop: asset is multichannel - use bwa_bed_play (or bwa_load_sound for a point source)");
         return;
     }
     if (refuse_pending_kind(e, snd, false,
             "bwa_source_play_loop: this async asset was acquired as an ambisonic bed - use bwa_bed_play"))
         return;
-    if (refuse_push_play(e, s, "bwa_source_play_loop: push source (bwa_source_create_push) — feed it with bwa_source_push"))
+    if (refuse_push_play(e, s, "bwa_source_play_loop: push source (bwa_source_create_push) - feed it with bwa_source_push"))
         return;
     rt_source_play_loop(e->rt, s, snd, loop_beg, loop_end);
 }
-uint64_t bwa_get_dsp_time(bwa_engine* e)                                     { return e ? rt_dsp_time(e->rt) : 0; }
+uint64_t bwa_get_dsp_time_frames(bwa_engine* e)                                     { return e ? rt_dsp_time(e->rt) : 0; }
 bool bwa_get_clock(bwa_engine* e, uint64_t* dsp_sample, uint64_t* host_time_ns) { return e ? rt_get_clock(e->rt, dsp_sample, host_time_ns) : false; }
 bool bwa_get_clock_model(bwa_engine* e, bwa_clock_model* out) {
     RtClockFit f;
@@ -1074,13 +1117,38 @@ void bwa_source_queue(bwa_engine* e, bwa_source s, bwa_sound snd, bool loop) {
                      : "bwa_source_queue: asset must be an in-memory mono sound (not a bed/stream/invalid)");
         return;
     }
-    if (refuse_push_play(e, s, "bwa_source_queue: push source (bwa_source_create_push) — feed it with bwa_source_push"))
+    if (refuse_push_play(e, s, "bwa_source_queue: push source (bwa_source_create_push) - feed it with bwa_source_push"))
         return;
     rt_source_queue(e->rt, s, snd, loop);
 }
 void bwa_source_clear_queue(bwa_engine* e, bwa_source s)                    { if (e) rt_source_clear_queue(e->rt, s); }
 void bwa_source_set_paused(bwa_engine* e, bwa_source s, bool paused)        { if (e) rt_source_set_paused(e->rt, s, paused); }
 void bwa_source_seek(bwa_engine* e, bwa_source s, uint64_t frame)           { if (e) rt_source_seek(e->rt, s, frame); }
+void bwa_source_set_region(bwa_engine* e, bwa_source s, uint64_t start_frame, uint64_t end_frame) {
+    if (!e) return;
+    if (end_frame != 0 && end_frame <= start_frame) {   /* rt refuses it too; report the reason here */
+        set_error(e, "bwa_source_set_region: end_frame must be 0 (the asset end) or greater than start_frame");
+        return;
+    }
+    rt_source_set_region(e->rt, s, start_frame, end_frame);
+}
+/* DIRECT output-channel route: the psychophysics ground-truth condition (one real speaker, no
+ * spatial processing), NOT bwa_set_test_signal - that one injects a built-in tone after the align
+ * stage, this one replaces the voice's panner solve with a one-hot vector, so it plays real content
+ * and stays on the same output stage and the same ramps as the phantom it is A/B'd against. */
+void bwa_source_set_channel(bwa_engine* e, bwa_source s, int32_t channel) {
+    if (!e) return;
+    /* BWA_CHANNEL_AUTO is the ONE negative that means anything. Folding every other negative into
+     * it (the guard used to test only the upper bound) makes a bad index look like it was taken:
+     * the source keeps panning, nothing is reported, and the caller reads a phantom as a
+     * single-speaker reference. Refuse it exactly as a too-large index is refused. */
+    if (channel != BWA_CHANNEL_AUTO && (channel < 0 || channel >= (int32_t)e->layout.count)) {
+        set_error(e, "bwa_source_set_channel: channel out of range (0 .. bwa_get_channel_count()-1, "
+                     "or BWA_CHANNEL_AUTO to restore spatial panning)");
+        return;
+    }
+    rt_source_set_channel(e->rt, s, (int)channel);
+}
 bool bwa_source_is_playing(bwa_engine* e, bwa_source s)                     { return e ? rt_source_is_playing(e->rt, s) : false; }
 uint64_t bwa_source_get_playhead_frames(bwa_engine* e, bwa_source s)               { return e ? rt_source_get_position(e->rt, s) : 0; }
 void bwa_set_test_signal(bwa_engine* e, uint32_t channel, bwa_test_kind kind, float gain) { if (e) rt_test_signal(e->rt, channel, (uint8_t)kind, gain); }
@@ -1177,6 +1245,11 @@ bool bwa_get_tuning(bwa_engine* e, bwa_tuning* out) {
 uint32_t bwa_poll_ended(bwa_engine* e, bwa_source* out, uint32_t cap, uint64_t* dropped_out) {
     if (!e) { if (dropped_out) *dropped_out = 0; return 0; }
     return rt_poll_ended(e->rt, out, cap, dropped_out);
+}
+
+uint32_t bwa_poll_looped(bwa_engine* e, bwa_source* out, uint32_t cap, uint64_t* dropped_out) {
+    if (!e) { if (dropped_out) *dropped_out = 0; return 0; }
+    return rt_poll_looped(e->rt, out, cap, dropped_out);
 }
 
 bool bwa_apply_tuning(bwa_engine* e, const bwa_tuning* t) {
@@ -1458,14 +1531,14 @@ bool bwa_play_oneshot(bwa_engine* e, bwa_sound snd, float x, float y, float z, f
         return false;
     }
     if (ch > 1) {
-        set_error(e, "bwa_play_oneshot: asset is multichannel — oneshots are point sources (use bwa_load_sound)");
+        set_error(e, "bwa_play_oneshot: asset is multichannel - oneshots are point sources (use bwa_load_sound)");
         return false;
     }
     if (!rt_play_oneshot(e->rt, snd, x, y, z, gain)) {
         /* The transient drops: no free voice (the steal reserve is not spent on fire-and-forget,
          * so oneshot spam can never evict a named source), or the command ring is momentarily
          * full. Both are load, not a caller bug — but the caller still gets to know. */
-        set_error(e, "bwa_play_oneshot: dropped — voice pool or command ring full, or a bad position/gain");
+        set_error(e, "bwa_play_oneshot: dropped - voice pool or command ring full, or a bad position/gain");
         return false;
     }
     return true;
@@ -1531,10 +1604,30 @@ bwa_material bwa_material_preset(bwa_engine* e, bwa_material_type preset) {
                     : bwa_material_define(e, BWA_PRESETS[preset].absorption, BWA_PRESETS[preset].scattering, BWA_PRESETS[preset].transmission);
 }
 
+#ifdef BWA_HAVE_STEAMAUDIO
+/* Caller-supplied triangle indices, checked ONCE before the geometry reaches phonon. Unlike every
+ * other guard in this file this is not a magnitude question: an index outside [0, nverts) is an
+ * out-of-bounds READ inside the ray tracer's BVH build, in third-party code we do not control, so
+ * a wrong VALUE is not the worst case here. The material token beside it is clamped rather than
+ * refused because a wrong material is only a wrong sound; a wrong index is a wrong memory access.
+ * O(ntris) on the control thread at mesh-add time, nowhere near the audio thread. */
+static bool mesh_geometry_ok(const float* verts, int nverts, const int* tris, int ntris) {
+    if (!verts || !tris || nverts <= 0 || ntris <= 0) return false;
+    for (int i = 0; i < ntris * 3; ++i)
+        if (tris[i] < 0 || tris[i] >= nverts) return false;
+    return true;
+}
+#endif
+
 void bwa_scene_set_mesh_mat(bwa_engine* e, const float* verts, int nverts, const int* tris, int ntris,
                            const bwa_material* tri_material) {
 #ifdef BWA_HAVE_STEAMAUDIO
     if (scene_locked(e)) return;
+    if (!mesh_geometry_ok(verts, nverts, tris, ntris)) {
+        set_error(e, "bwa_scene_set_mesh_mat: every triangle index must be in [0, nverts), and the "
+                     "mesh must be non-empty");
+        return;
+    }
     uint32_t nmat = e->num_materials;                    /* flatten the table to the arrays steam_scene wants */
     float absorption[BWA_MAX_MATERIALS*3], transmission[BWA_MAX_MATERIALS*3], scattering[BWA_MAX_MATERIALS];
     for (uint32_t k = 0; k < nmat; ++k) {
@@ -1549,10 +1642,33 @@ void bwa_scene_set_mesh_mat(bwa_engine* e, const float* verts, int nverts, const
 #endif
 }
 
-#ifdef BWA_HAVE_STEAMAUDIO
+/* A shoebox dimension must be positive AND bounded (BWA_MAX_ROOM_DIM, rt.h): ism.c mirrors the
+ * source across the faces, so an absurd-but-finite dimension is an absurd IMAGE POSITION, which is
+ * the coordinate-overflow class one step removed. Written one-sided so NaN and Inf fail both
+ * compares.
+ *
+ * ONE predicate for all three shoebox entry points, because they must agree exactly:
+ *  - bwa_scene_set_ism_room refuses the room outright;
+ *  - bwa_scene_set_box must re-test the ARGUMENTS rather than ism_room.valid, because a refused set
+ *    leaves an EARLIER good room valid and the ray-traced mesh would then be rebuilt from the
+ *    refused dimensions;
+ *  - bwa_box_mesh is PURE and exported, so a caller reaches it without an engine at all. Its
+ *    vertices are +/-w/2, 0..h, +/-d/2, and they legitimately flow on into bwa_scene_set_mesh_mat
+ *    or bwa_scene_add_dynamic_mesh, which take them as ROOM COORDINATES. Bounding the dimension at
+ *    BWA_MAX_ROOM_DIM (half BWA_MAX_COORD) therefore guarantees every emitted vertex is inside the
+ *    coordinate envelope the ABI promises, with the same bound the room calls use, so the recipe
+ *    the header documents (set_ism_room + box_mesh into one set_mesh_mat) can never half-succeed. */
+static bool ism_dims_ok(float w, float h, float d) {
+    return w > 0.f && w <= BWA_MAX_ROOM_DIM
+        && h > 0.f && h <= BWA_MAX_ROOM_DIM
+        && d > 0.f && d <= BWA_MAX_ROOM_DIM;
+}
+
 /* Emit triangle (i0,i1,i2) into tris[*n], flipping the last two indices if needed so the face normal
  * points toward `ctr` (the box center — inward; the listener is inside). Testing toward the ORIGIN
- * would degenerate for a floor-based box, whose bottom face contains the origin. */
+ * would degenerate for a floor-based box, whose bottom face contains the origin.
+ * NOT under BWA_HAVE_STEAMAUDIO: its only caller, bwa_box_mesh, is a pure exported helper that the
+ * header documents as SDK-free, so guarding this broke the link of every no-SDK build. */
 static void emit_inward(const float* v, const float ctr[3], int* tris, int* n, int i0, int i1, int i2) {
     const float *p0 = &v[i0*3], *p1 = &v[i1*3], *p2 = &v[i2*3];
     float e1x = p1[0]-p0[0], e1y = p1[1]-p0[1], e1z = p1[2]-p0[2];
@@ -1562,16 +1678,18 @@ static void emit_inward(const float* v, const float ctr[3], int* tris, int* n, i
     if (nx*(ctr[0]-cx) + ny*(ctr[1]-cy) + nz*(ctr[2]-cz) < 0.f) { int tmp = i1; i1 = i2; i2 = tmp; }   /* outward -> flip */
     tris[*n*3+0] = i0; tris[*n*3+1] = i1; tris[*n*3+2] = i2; (*n)++;
 }
-#endif
 
 /* The 8 vertices / 12 inward-facing triangles of a floor-based shoebox, and the per-triangle material
  * for each. Pure: no engine, no allocation, same contract as bwa_spcap_focus_default. It exists so a
  * caller composing a scene does not have to re-derive the box (both bindings did, including the
  * flip-toward-center subtlety) just to keep it alongside their own geometry. Writes 24 floats,
- * 36 ints and 12 materials. Returns false on non-positive dims or a NULL output. */
+ * 36 ints and 12 materials. Returns false, writing nothing, on a NULL output or a dimension
+ * ism_dims_ok refuses.
+ * The bool return IS the whole report: there is no engine here, so set_error/bwa_last_error are not
+ * reachable, exactly as for the other pure exports. */
 bool bwa_box_mesh(float w, float h, float d, const bwa_material faces[6],
                   float* out_verts, int* out_tris, bwa_material* out_tri_material) {
-    if (!(w > 0.f) || !(h > 0.f) || !(d > 0.f) || !out_verts || !out_tris) return false;
+    if (!ism_dims_ok(w, h, d) || !out_verts || !out_tris) return false;
     const float hw = w*0.5f, hd = d*0.5f;
     const float v[8*3] = {
         -hw, 0.f,-hd,   hw, 0.f,-hd,   hw, h,-hd,  -hw, h,-hd,
@@ -1596,9 +1714,11 @@ bool bwa_box_mesh(float w, float h, float d, const bwa_material faces[6],
  * scene. Splitting the two is why neither is order-dependent any more. */
 void bwa_scene_set_ism_room(bwa_engine* e, float w, float h, float d, const bwa_material faces[6]) {
     if (!e) return;
-    if (!(w > 0.f) || !(h > 0.f) || !(d > 0.f)) {
-        set_error(e, "scene box: w/h/d must be positive");   /* named for the caller, who may have
-                                                              * reached here through set_box */
+    if (!ism_dims_ok(w, h, d)) {
+        char msg[96];   /* formatted, not a literal, so the message cannot drift from the macro */
+        snprintf(msg, sizeof msg, "scene box: w/h/d must be positive and at most %g m",
+                 (double)BWA_MAX_ROOM_DIM);
+        set_error(e, msg);          /* named for the caller, who may have reached here via set_box */
         return;
     }
     e->ism_room.w = w; e->ism_room.h = h; e->ism_room.d = d;
@@ -1619,7 +1739,15 @@ void bwa_scene_set_ism_room(bwa_engine* e, float w, float h, float d, const bwa_
 void bwa_scene_set_box(bwa_engine* e, float w, float h, float d, const bwa_material faces[6]) {
     if (!e) return;
     bwa_scene_set_ism_room(e, w, h, d, faces);
-    if (!e->ism_room.valid) return;                /* set_ism_room rejected the dims and said why */
+    if (!ism_dims_ok(w, h, d)) return;             /* set_ism_room rejected the dims and said why.
+                                                    * Test the ARGUMENTS, not ism_room.valid: a
+                                                    * refused set leaves an EARLIER good room valid,
+                                                    * and the mesh below would then be built from
+                                                    * the refused dimensions. bwa_box_mesh now tests
+                                                    * the SAME predicate, so this line is the
+                                                    * backstop rather than the only defense - keep
+                                                    * both, because the two calls are independently
+                                                    * reachable and either could be loosened. */
 #ifdef BWA_HAVE_STEAMAUDIO
     if (scene_locked(e)) return;
     /* floor-based: x/z centered on the origin, y from 0 (the floor, where the room origin
@@ -1632,7 +1760,15 @@ void bwa_scene_set_box(bwa_engine* e, float w, float h, float d, const bwa_mater
 
 void bwa_scene_set_ground(bwa_engine* e, float y, bwa_material mat, bool pressure_release) {
     if (!e) return;
-    if (!isfinite(y)) { set_error(e, "bwa_scene_set_ground: y must be finite"); return; }
+    /* bounded, not merely finite: plane_only has no inside test, so the image is 2*y - src_y and an
+     * absurd-but-finite y overflows it straight to +Inf (BWA_MAX_COORD, rt.h). A plane HEIGHT is a
+     * room coordinate, so it takes the coordinate bound, not the room-dimension one. */
+    if (!bwa_finite_bounded(y, BWA_MAX_COORD)) {
+        char msg[96];   /* formatted, not a literal, so the message cannot drift from the macro */
+        snprintf(msg, sizeof msg, "bwa_scene_set_ground: y must be finite and within +/-%g m",
+                 (double)BWA_MAX_COORD);
+        set_error(e, msg); return;
+    }
     /* The outdoor degenerate of the box: ONE horizontal mirror plane at height y — the ground
      * bounce, the dominant early reflection when there is no room. Captured for the image-source
      * reflections with or without the Steam build (the plane lives in face slot 2, the box's -y).
@@ -1660,7 +1796,7 @@ void bwa_scene_set_ground(bwa_engine* e, float y, bwa_material mat, bool pressur
 void bwa_scene_set_pressure_release(bwa_engine* e, uint32_t face_mask) {
     if (!e) return;
     if (!e->ism_room.valid) {
-        set_error(e, "bwa_scene_set_pressure_release: no room — call bwa_scene_set_box (or _set_ground) first");
+        set_error(e, "bwa_scene_set_pressure_release: no room - call bwa_scene_set_box (or _set_ground) first");
         return;
     }
     /* Flag faces as pressure-release boundaries (bit f = face f, the bwa_scene_set_box order
@@ -1680,6 +1816,11 @@ int bwa_scene_add_dynamic_mesh(bwa_engine* e, const float* verts, int nverts, co
 #ifdef BWA_HAVE_STEAMAUDIO
     if (!e) return -1;
     if (!e->scene) { set_error(e, "bwa_scene_add_dynamic_mesh: no scene (needs the Steam Audio backend)"); return -1; }
+    if (!mesh_geometry_ok(verts, nverts, tris, ntris)) {
+        set_error(e, "bwa_scene_add_dynamic_mesh: every triangle index must be in [0, nverts), and "
+                     "the mesh must be non-empty");
+        return -1;
+    }
     uint32_t m = material; if (m >= e->num_materials) m = 0;      /* out-of-range token -> default */
     int h = steam_scene_add_dynamic_mesh(e->scene, verts, nverts, tris, ntris,
                                          e->materials[m].absorption, e->materials[m].scattering, e->materials[m].transmission);
@@ -1694,6 +1835,17 @@ void bwa_scene_set_dynamic_transform(bwa_engine* e, int handle, float x, float y
                                      float qx, float qy, float qz, float qw) {
 #ifdef BWA_HAVE_STEAMAUDIO
     if (!e || !e->scene) return;
+    /* The translation is a ROOM POSITION and takes the same bound as bwa_source_set_pos, for the
+     * reason stated there: it reaches the shared scene the occlusion, reflection and pathing sims
+     * read, and none of them guards its own input. Rejecting leaves the instance at its previous
+     * transform, which is what a dropped frame from the game already means. The quaternion needs no
+     * check: the normalize below falls back to s = 0 on a non-finite or degenerate q, which yields
+     * the identity rotation. */
+    const float t3[3] = { x, y, z };
+    if (!bwa_finite3_bounded(t3, BWA_MAX_COORD)) {
+        set_error(e, "bwa_scene_set_dynamic_transform: position out of range");
+        return;
+    }
     /* rigid local-to-room affine: rotation from the (normalized) quaternion + translation, row-major
      * to match phonon's IPLMatrix4x4. The Unity binding delivers room-space pos/quat (Room.Pos/Rot). */
     float n = qx*qx + qy*qy + qz*qz + qw*qw, s = (n > 1e-12f) ? 2.0f / n : 0.0f;
@@ -1722,7 +1874,7 @@ void bwa_scene_remove_dynamic_mesh(bwa_engine* e, int handle) {
 void bwa_source_set_early_reflections(bwa_engine* e, bwa_source s, bool on) {
     if (!e) return;
     if (on && !e->ism_room.valid) {
-        set_error(e, "bwa_source_set_early_reflections: no room — call bwa_scene_set_box (or bwa_scene_set_ground) first");
+        set_error(e, "bwa_source_set_early_reflections: no room - call bwa_scene_set_box (or bwa_scene_set_ground) first");
         return;
     }
 #ifdef BWA_HAVE_STEAMAUDIO
@@ -1733,7 +1885,7 @@ void bwa_source_set_early_reflections(bwa_engine* e, bwa_source s, bool on) {
     if (on && e->reflect && !e->ism_warned) {
         e->ism_warned = 1;
         set_error(e, "bwa_source_set_early_reflections: the Steam reflection bed is running and already "
-                     "renders early reflections — you will hear them twice. Use the FDN (bwa_fdn_config; "
+                     "renders early reflections - you will hear them twice. Use the FDN (bwa_fdn_config; "
                      "it takes the reverb tap instead) for the late tail, or drop the ISM.");
     }
 #endif

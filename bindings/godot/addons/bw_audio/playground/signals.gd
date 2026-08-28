@@ -179,7 +179,7 @@ func _write_mono(path: String, buf: PackedFloat32Array) -> void:
 
 
 ## 32-bit float WAV, matching the C++ writer's format so the two playgrounds load byte-alike
-## assets rather than one quantised copy.
+## assets rather than one quantized copy.
 func _write_wav(path: String, samples: PackedFloat32Array, channels: int) -> void:
 	var f := FileAccess.open(path, FileAccess.WRITE)
 	if f == null:

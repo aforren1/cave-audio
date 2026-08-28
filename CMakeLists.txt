@@ -484,6 +484,47 @@ if(BWA_BUILD_TESTS)
       test/steam_decode_test.c src/steam_decode.c)
   endif()
 
+  # ---- Unity binding: the PlayMode suite, under ctest (opt-in) ----
+  #
+  # The Unity binding was the one surface nothing in this repo ever EXECUTED: it is C#, it runs
+  # inside an editor, and every change to it was compile-verified only. bindings/unity/test~/ holds
+  # a PlayMode suite that drives the real components (Engine's per-frame pump and both event drains,
+  # Emitter's and AmbisonicBed's completion feeds, the region and seek calls) against the real
+  # bw_audio.dll on the offline sink.
+  #
+  # Opt-in for the same reason BWA_GODOT_EXE is: Unity is not a build dependency and CI has no
+  # editor, so a find_program that silently skipped would hide the suite instead of declaring it.
+  #   cmake ... -DBWA_UNITY_EXE="C:/.../6000.3.19f1/Editor/Unity.exe"
+  #
+  # The engine reaches the test project through bindings/unity/Runtime/Plugins/x86_64, which the
+  # bw_audio POST_BUILD above stages on every build - so `cmake --build` then `ctest` exercises the
+  # DLL that build produced, with no copy step to forget. The driver fails loudly if it is missing.
+  set(BWA_UNITY_EXE "" CACHE FILEPATH
+      "Unity editor binary; set it to run the Unity PlayMode suite under ctest")
+  # A short scratch path on purpose: Unity's Library/PackageCache paths are deep, and this project
+  # is disposable - the driver re-stages the manifest and every test source into it each run.
+  if(DEFINED ENV{LOCALAPPDATA})
+    set(_bwa_uproj "$ENV{LOCALAPPDATA}/Temp/bwa-uproj")
+  else()
+    set(_bwa_uproj "${CMAKE_BINARY_DIR}/uproj")
+  endif()
+  set(BWA_UNITY_TEST_PROJECT "${_bwa_uproj}" CACHE PATH
+      "Scratch Unity project the PlayMode suite runs in")
+  if(BWA_UNITY_EXE)
+    # MIN_TESTS is the floor the driver refuses to pass below. It exists because a run that
+    # discovered NOTHING is the failure this entry is most likely to have: raise it whenever a test
+    # is added, and never lower it to make a run go green.
+    add_test(NAME unity_playmode
+      COMMAND ${CMAKE_COMMAND} -DUNITY_EXE=${BWA_UNITY_EXE}
+              -DREPO=${CMAKE_SOURCE_DIR}
+              -DPROJECT_DIR=${BWA_UNITY_TEST_PROJECT}
+              -DMIN_TESTS=20
+              -P ${CMAKE_SOURCE_DIR}/bindings/unity/test~/run_unity_tests.cmake)
+    # The first run resolves packages and imports the project from scratch; later runs reuse its
+    # Library cache. RUN_SERIAL because the editor takes an exclusive lock on that project.
+    set_tests_properties(unity_playmode PROPERTIES TIMEOUT 1800 RUN_SERIAL TRUE)
+  endif()
+
   # ---- diagnostics (built under BWA_BUILD_TESTS, but NOT registered as ctests: they print reports
   # for eyeballing, with no pass/fail assertion) ----
   # Doppler-quality probe: prints an FFT spectrum of a Doppler-shifted signal, not a ctest.
@@ -556,7 +597,32 @@ endif()
 option(BWA_BUILD_GODOT "Build the Godot GDExtension binding (fetches godot-cpp)" OFF)
 if(BWA_BUILD_GODOT)
   enable_language(CXX)
+  # godot-cpp puts CMAKE_MSVC_RUNTIME_LIBRARY in the CACHE on purpose (its cmake/windows.cmake
+  # documents that it does so "for consumer target definitions") and picks the STATIC CRT. A cache
+  # entry outlives the subdirectory, so without this dance every target declared BELOW would be
+  # created with /MT while bwa_core above was built /MD, and linking the two together fails with
+  # unresolved __imp_* CRT symbols (bwa_calib_view, bwa_calibrate and bwa_validate all hit it).
+  # Save it here and put it back immediately AFTER the subdirectory, not around the fetch inside
+  # bindings/godot/CMakeLists.txt: bwa_gdextension is declared after that fetch and has to keep
+  # godot-cpp's choice, or the shipped GDExtension mismatches the static godot-cpp it links.
+  if(DEFINED CMAKE_MSVC_RUNTIME_LIBRARY)
+    set(BWA_MSVC_RUNTIME_SAVED "${CMAKE_MSVC_RUNTIME_LIBRARY}")
+  else()
+    unset(BWA_MSVC_RUNTIME_SAVED)
+  endif()
+
   add_subdirectory(bindings/godot)
+
+  if(DEFINED BWA_MSVC_RUNTIME_SAVED)
+    set(CMAKE_MSVC_RUNTIME_LIBRARY "${BWA_MSVC_RUNTIME_SAVED}" CACHE STRING
+        "Select the MSVC runtime library for use by compilers targeting the MSVC ABI." FORCE)
+    unset(BWA_MSVC_RUNTIME_SAVED)
+  else()
+    # It was undefined before, so leave it undefined: an empty cache string is NOT the same thing
+    # (CMake's own default under CMP0091 is the /MD selection, which is what the rest of the tree
+    # is compiled with).
+    unset(CMAKE_MSVC_RUNTIME_LIBRARY CACHE)
+  endif()
 endif()
 
 # ---- Optional: interactive playground (evaluate the binaural monitor by ear) ----

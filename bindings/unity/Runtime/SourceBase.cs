@@ -69,6 +69,7 @@ namespace BwAudio
         protected bool _paused;
         Vector2 _extent;
         float _attRef, _attRolloff, _attMin;   // SetAttenuationOverride mirror (standing state, like _extent)
+        int _channel = Bwa.CHANNEL_AUTO;       // direct output-channel route (standing state; see Channel)
         bool _attSet;
         Engine _owner;                         // the Engine this source was created under
 
@@ -140,6 +141,9 @@ namespace BwAudio
             // standing script-set state (Extent, SetAttenuationOverride) rides along, so it is replayed on
             // a re-enable exactly as before.
             ApplyDesc();
+            // Standing script-set state that is not a desc field, replayed like Extent so a re-enable
+            // does not silently put a reference source back on the panner mid-experiment.
+            if (_channel != Bwa.CHANNEL_AUTO) Bwa.bwa_source_set_channel(engine.Handle, _src, _channel);
             ApplyExtraSettings();
             SyncTransform();
             OnSourceReady();
@@ -161,10 +165,30 @@ namespace BwAudio
             }
         }
 
-        // Engine's per-frame entry point (Emitter layers the onFinished edge on top of the transform
-        // push). Every source kind runs through Engine's one snapshot loop, so a handler that disables
-        // or unregisters sources mid-loop is safe regardless of which kind fires it.
+        // Engine's per-frame entry point, BEFORE the commit (Emitter layers its async-load watch on top
+        // of the transform push). Every source kind runs through Engine's one snapshot loop, so a
+        // handler that disables or unregisters sources mid-loop is safe regardless of which kind fires it.
         internal virtual void FrameSync() => SyncTransform();
+
+        // Engine's second per-frame entry point, AFTER the commit and after the bwa_poll_ended drain.
+        // Completion work belongs here and not in FrameSync: the ended events are filled by the same
+        // pass bwa_commit runs, so anything that reasons about "did this end" must read the engine
+        // after the commit, or it reasons about the previous frame.
+        internal virtual void PostCommit() {}
+
+        // One handle bwa_poll_ended reported as ENDED, routed here by Engine (the single owner of that
+        // drain). Base does nothing: only Emitter has a completion event.
+        internal virtual void NotifyEnded() {}
+
+        // One handle bwa_poll_looped reported as WRAPPED, routed here by Engine (the single owner of that
+        // drain too). A wrap is not an end — the voice keeps playing — so nothing here touches the
+        // completion state. Base does nothing: only Emitter has a loop event.
+        internal virtual void NotifyLooped() {}
+
+        // The native source handle, for Engine's handle -> component route. 0 when the create failed.
+        // Deliberately NOT gated on _created: OnDisable clears that flag, and Unregister still has to
+        // find the map entry to remove it.
+        internal uint NativeHandle => _src;
 
         protected virtual void OnDisable()
         {
@@ -291,6 +315,58 @@ namespace BwAudio
             set { _paused = value; if (Live) Bwa.bwa_source_set_paused(Eng, _src, value); }
         }
 
+        /// <summary>Send this source out of exactly ONE output channel, with no spatial processing —
+        /// the psychophysics ground-truth condition (one real speaker, A/B'd against a phantom) and a
+        /// wiring check you can run with real content. Valid range is 0 to
+        /// <c>Engine.ChannelCount - 1</c>; <see cref="Bwa.CHANNEL_AUTO"/> (-1) restores normal panning,
+        /// and an out-of-range value is refused with a warning, leaving the source on the channel it
+        /// had - so this property never reports a route the voice is not on.
+        /// <para>Unlike a test signal, the routed voice keeps the whole output stage a panned voice gets
+        /// (align trims and delays, room EQ, master gain, limiter) and RAMPS in and out, so it is
+        /// level-comparable with the phantom. Everything distance- or direction-derived is suppressed
+        /// while it is on (attenuation, spread, occlusion, reverb sends, Doppler, air absorption) and
+        /// comes back the moment you go to CHANNEL_AUTO. Pitch and Paused still apply. Mono point
+        /// sources only. No unit suffix: a channel is a bare index, not a quantity.</para>
+        /// <para>Script-only, deliberately: this is a run-time experimental condition, not authored
+        /// configuration, so it is not serialized in the scene. It IS replayed across a re-enable.</para>
+        /// </summary>
+        public int Channel
+        {
+            get => _channel;
+            // Range-check HERE, and keep the old route on a refusal, so the getter can never report a
+            // channel the voice is not on: the engine refuses out of range too, but into Bwa.LastError,
+            // where nothing reading this property would see it. That is the whole failure mode — a
+            // reference source that quietly stays panned while the caller reads back a speaker index.
+            // Godot's BwaSource.set_channel refuses identically, on purpose: the two bindings must not
+            // disagree about what a route means.
+            //
+            // The two ends are knowable at different times, hence two checks. A negative is bad with NO
+            // channel count (CHANNEL_AUTO is the one negative that means anything), so it is refused
+            // even before this source is live. A too-large one needs the count, so it waits for Live
+            // and TryInit replays the cached value for the engine to judge when it can.
+            set
+            {
+                if (value != Bwa.CHANNEL_AUTO && value < 0)
+                {
+                    Debug.LogWarning("[" + GetType().Name + "] Channel " + value + " on " + name +
+                                     " refused: the only negative that means anything is " +
+                                     "Bwa.CHANNEL_AUTO (" + Bwa.CHANNEL_AUTO + "), which restores " +
+                                     "spatial panning. The source stays on channel " + _channel + ".");
+                    return;
+                }
+                if (Live && Engine.Instance && value >= (int)Engine.Instance.ChannelCount)
+                {
+                    Debug.LogWarning("[" + GetType().Name + "] Channel " + value + " on " + name +
+                                     " is out of range (0 to " + (Engine.Instance.ChannelCount - 1) +
+                                     ", or Bwa.CHANNEL_AUTO). The source stays on channel " +
+                                     _channel + ".");
+                    return;
+                }
+                _channel = value;
+                if (Live) Bwa.bwa_source_set_channel(Eng, _src, value);
+            }
+        }
+
         /// <summary>Drive occlusion from GAME LOGIC instead of the ray-traced sim — a door the gameplay
         /// knows about, underwater, muffled-by-menu. Works WITHOUT the Steam Audio build. `level` is
         /// broadband transmittance (1 = clear .. 0 = blocked); `bands` is an optional low/mid/high tilt in
@@ -308,14 +384,14 @@ namespace BwAudio
 
         /// <summary>Current playhead in engine-rate frames — AudioSource.timeSamples-get equivalent
         /// (latest-wins readback, ~one audio block of lag). Engine-owned truth where deriving it from
-        /// DspTime breaks: it freezes while Paused, lands where Seek lands, follows Pitch at the
+        /// DspTimeFrames breaks: it freezes while Paused, lands where SeekFrames lands, follows Pitch at the
         /// actual rate, and counts frames actually consumed for streamed clips and push voices.
         /// (The CONTENT position — unrelated to the source's spatial transform.)</summary>
-        public ulong Playhead => Live ? Bwa.bwa_source_get_playhead_frames(Eng, _src) : 0;
+        public ulong PlayheadFrames => Live ? Bwa.bwa_source_get_playhead_frames(Eng, _src) : 0;
 
-        /// <summary>Playhead in seconds — AudioSource.time-get equivalent (Playhead over the engine
+        /// <summary>PlayheadFrames in seconds — AudioSource.time-get equivalent (PlayheadFrames over the engine
         /// sample rate).</summary>
-        public double PlayheadSeconds => Engine.Instance ? Playhead / (double)Engine.Instance.sampleRate : 0.0;
+        public double PlayheadSeconds => Engine.Instance ? PlayheadFrames / (double)Engine.Instance.sampleRate : 0.0;
 
         // ---- bulk configuration (bwa_source_desc) ----------------------------------------------------
         // The per-property setters above stay the live, incremental path. This is the WHOLE field set in

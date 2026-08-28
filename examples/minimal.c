@@ -17,6 +17,11 @@
  * walks the calls layered over it (shared/async assets, a source's whole config as one struct,
  * click-free group stops) and shows which core calls each one replaces.
  *
+ * The last two steps cover the two EVENT drains. A binding runs both every frame, right after its
+ * commit: bwa_poll_ended (a voice finished) and bwa_poll_looped (a voice wrapped at its loop
+ * point). They get a step each here so each one is legible, and they are the only self-checked
+ * claims in the file -- see the check() note below.
+ *
  *   bwa_minimal [sound.wav] [--driver name]
  *     (no wav: a short ping is synthesized and used; no --driver: auto-pick the first
  *      ASIO driver with enough channels — name one to test a specific device. The rig's
@@ -57,6 +62,16 @@ static const char* ensure_ping(const char* wav_arg) {
 /* --tests: force the offline sink and cut the orbit short, so ctest runs this without a device.
  * The CALLS are identical either way; only the listening time goes. */
 static int g_tests = 0;
+
+/* The event drains at the end are CHECKED, so ctest running this catches a broken drain and not
+ * only a crash. Everything above them is a walkthrough with nothing to assert; these two have a
+ * definite right answer, so they get one. A check that cannot fail is worse than no check, so the
+ * loop count below is demanded with a margin rather than as "more than zero". */
+static int g_bad = 0;
+static void check(int ok, const char* what) {
+    printf("  %-44s %s\n", what, ok ? "ok" : "FAILED");
+    if (!ok) ++g_bad;
+}
 
 int main(int argc, char** argv) {
     const char* wav_arg = NULL, * driver = NULL;
@@ -142,19 +157,62 @@ int main(int argc, char** argv) {
                                                  * below starts on top of it (two overlapping dings,
                                                  * which by ear reads as a bug) */
 
-    /* completion: there are no callbacks -- play, then poll bwa_source_is_playing.
-     * The readback publishes per audio block, so give the play command a moment to land
-     * before trusting a false answer (this is what the Unity binding's poll does too). */
+    /* completion is an EVENT, and this is the drain a binding runs every frame. bwa_poll_ended
+     * hands back the sources whose voices finished since the last call, oldest first, and
+     * bwa_commit is the pass that fills it -- so commit, then drain. The handles come back exactly
+     * as you knew them, so comparing against `src` is how you dispatch.
+     * Polling bwa_source_is_playing instead is the weaker path: it republishes per AUDIO block, so
+     * a sound shorter than one frame can begin and end without ever once reading as playing. Keep
+     * is_playing for "is this still going", not for "did it finish". */
+    printf("waiting for a one-shot to finish, off the event drain...\n");
     bwa_source_play(e, src, ping, false);
     bwa_commit(e);
-    Sleep(50);
-    while (bwa_source_is_playing(e, src)) { bwa_commit(e); Sleep(16); }
-    printf("finished\n");
+    int ended = 0;
+    for (int t = 0; t < 200 && !ended; ++t) {    /* ~3 s cap; the ping is 0.5 s */
+        bwa_commit(e);                           /* the drain point */
+        bwa_source done[8];
+        uint32_t n = bwa_poll_ended(e, done, 8, NULL);
+        for (uint32_t i = 0; i < n; ++i) if (done[i] == src) ended = 1;
+        Sleep(16);
+    }
+    check(ended, "bwa_poll_ended reported the ping's end");
+
+    /* the OTHER boundary, and the one this installation runs on: a looping voice never ends, so
+     * bwa_poll_ended reports it exactly never. bwa_poll_looped is its sibling -- one entry per WRAP,
+     * from the same drain -- which is how you pace a trial off the content instead of off a frame
+     * timer. bwa_source_set_region picks where the wrap lands: it bounds the voice to
+     * [start, end) content frames, here the ping's first 100 ms, so it comes round about ten times
+     * a second. Set the region AFTER the play -- a play resolves the bounds against the asset and
+     * resets any region already set (bwa_source_play_loop is the same state set at play time). */
+    printf("pacing off the loop boundary (a 100 ms region of the ping, ~1 s)...\n");
+    bwa_source_play(e, src, ping, true);
+    bwa_source_set_region(e, src, 0, cfg.sample_rate / 10);
+    /* Drain first, and count only after. Both rings are ENGINE-WIDE and DESTRUCTIVE, and nothing
+     * above drained the loop one, so the orbit's own wraps are still queued -- counted here they
+     * would let this check pass on a region that never took. Drain what you did not ask for
+     * before you measure what you did. */
+    { bwa_source flush[64]; while (bwa_poll_looped(e, flush, 64, NULL) == 64) { } }
+    int wraps = 0;
+    for (int t = 0; t < 63; ++t) {               /* ~1 s at a 16 ms tick */
+        bwa_commit(e);
+        bwa_source hit[16];
+        uint32_t n = bwa_poll_looped(e, hit, 16, NULL);
+        for (uint32_t i = 0; i < n; ++i) if (hit[i] == src) ++wraps;
+        Sleep(16);
+    }
+    bwa_source_stop(e, src);
+    printf("  %d wraps\n", wraps);
+    /* ~10 expected. Demanded with a margin, not as "more than zero": if the region never reached
+     * the core the voice loops the whole 0.5 s ping and still wraps twice in this window, so a
+     * >0 check would pass against a region that did nothing at all. */
+    check(wraps >= 5, "bwa_poll_looped reported one entry per wrap");
 
     /* ---- teardown ---- */
     bwa_source_destroy(e, src);
     bwa_unload_sound(e, ping);                  /* safe order: retire is acked internally */
     bwa_stop(e);
     bwa_destroy(e);
+    if (g_bad) { printf("\nminimal: %d CHECK(S) FAILED\n", g_bad); return 1; }
+    printf("\nfinished\n");
     return 0;
 }

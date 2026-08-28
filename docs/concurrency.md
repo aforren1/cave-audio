@@ -104,6 +104,17 @@ commands need no explanation here; the few that carry protocol do:
 - `CMD_SOUND_RETIRE`: the control thread asks to free a sound, the audio thread
   acks once it has let go (the retire-ack handshake).
 - `CMD_SRC_STEAL`: fade a stolen voice out on its own slot, then free it.
+- `CMD_SET_REGION`: the play region in content frames (`bwa_source_set_region`). Resolved against
+  the bound asset into the SAME `loop_beg`/`loop_end` fields `CMD_PLAY` resolves the play-time loop
+  region into, so a region and an intro-to-loop cannot drift apart. It is also the one per-frame
+  command that can leave the mixer's cursor an unbounded distance past its own loop end, which is
+  why the seam wraps by modulo rather than by walking spans (see "Held plays" below and `loop_wrap`
+  in rt.c).
+- `CMD_SET_CHANNEL`: the direct output-channel route (`bwa_source_set_channel`). A discrete
+  control, not a per-frame value, so it applies at the drain and does not wait for the commit. It
+  re-dirties the voice, because the route IS the gain vector: `compute_gains` installs a one-hot
+  vector instead of the panner's solve, which is what makes the switch ramp like any other gain
+  change rather than click.
 
 `Cmd` is `type` + `handle` + a union of small payload arms (see rt.h).
 Most arms are a handle plus a bool or a float. `play` carries
@@ -141,8 +152,8 @@ producer. Keep it that way, or the relaxed/acquire/release scheme stops being
 sufficient.
 
 ```c
-enum { EVT_VOICE_ENDED = 0, EVT_SOUND_RETIRED };
-typedef struct { uint8_t type; uint32_t handle; } Evt;
+enum { EVT_VOICE_ENDED = 0, EVT_SOUND_RETIRED, EVT_VOICE_DONE, EVT_VOICE_LOOPED };
+typedef struct { uint8_t type, seq; uint32_t handle; } Evt;
 
 #define EVT_CAP 1024                  /* power of two */
 typedef struct { Evt slots[EVT_CAP]; _Atomic uint32_t write, read; } EvtRing;
@@ -160,6 +171,24 @@ static bool evt_push(EvtRing* r, const Evt* e) {
 
 (`cmd_push` is the same function modulo `RING_CAP`, with the control thread as
 producer.)
+
+The ring carries two KINDS of event, and the difference is the whole sizing argument. The first two
+types are **ownership acks**: the audio thread is handing a slot or a buffer back, and losing one
+leaks. The other two are **notices**: `EVT_VOICE_DONE` (a caller-owned voice finished, read by
+`bwa_poll_ended`) and `EVT_VOICE_LOOPED` (a voice wrapped at its loop point, read by
+`bwa_poll_looped`). A notice needs no control-side action, so nothing bounds how many the audio
+thread can emit between two drains: a voice re-arms with a bare `CMD_PLAY`, and a loop region
+shorter than a block wraps several times in one block. So notices YIELD. `evt_push_notice` posts
+one only while `voice_cap + sound_cap` slots remain free, and counts the refusal in that notice
+type's own counter, which `rt_poll_ended` and `rt_poll_looped` add into their `dropped_out`. A
+caller learns it missed events instead of silently losing them, and an ack can never be displaced.
+
+Yielding bounds the DAMAGE, not the count, so the mixer still owes a bound on what it emits.
+`loop_wrap` (rt.c) supplies it. Ordinary playback crosses at most four spans between two seam
+tests, because pitch is clamped at 4.0 and the seam is tested every sample, so every wrap up to
+that is posted. A larger skip means `bwa_source_set_region` moved the region under a resting
+cursor, which wrapped nothing, so it collapses to one notice. Without that split, one region change
+on a long loop could emit millions of notices in a single block.
 
 Three facts about the event path:
 
@@ -266,7 +295,7 @@ static void drain_commands(RtCore* c) {
 }
 ```
 
-## Two correctness points
+## Three correctness points
 
 - **A listener move dirties every voice**, since the panner gains are all
   listener-relative. That is the moving-observer case paying its cost:
@@ -279,6 +308,20 @@ static void drain_commands(RtCore* c) {
   need no round-trip. Only *sound buffers* do (generations don't protect
   freed memory). `CMD_SOUND_RETIRE` detaches references and acks back, so the
   control thread frees exactly once the audio thread has provably let go.
+- **Every per-handle readback gates on the handle table FIRST, then on the
+  publish slot.** The four are `rt_source_is_playing`, `rt_source_get_position`,
+  `rt_get_occlusion`, and `rt_get_directivity`. Each reads a word some other
+  thread published, tagged with the generation or the handle it was published
+  for. That tag alone is not enough: the tag does not change when the control
+  thread destroys the source, so a destroy followed by a read still matches and
+  still answers. How stale depends on the publisher. The mixer's words refresh
+  next block, so the answer is one block old; the occlusion sim's word is never
+  rewritten on a destroy at all, so it is stale forever. The handle table is
+  control-thread-owned and authoritative the instant the destroy runs, and
+  reading it costs the audio thread nothing, so all four take it first. A stale,
+  destroyed, or recycled handle then reads the neutral value (not playing, 0,
+  clear, on-axis) from all four at once, and the four can never contradict each
+  other about one handle. Any new per-handle readback follows the same order.
 
 ## Sound lifetime: the retire-ack handshake (control side)
 
@@ -462,17 +505,44 @@ release/acquire hand-off a synchronous load has always used, so the publish
 needs no barrier of its own and the mixer needs no new branch.
 
 A held play also carries the **kind** it was issued as, one byte per entry: point source, or bed
-(`rt_bed_play`). A reserved slot reports 0 channels, so the kind guards at the ABI boundary have
+(`rt_bed_play` / `_play_at` / `_play_loop`, one entry point per play form because the voice cannot
+be asked afterwards which kind the caller meant). A reserved slot reports 0 channels, so the kind guards at the ABI boundary have
 nothing to compare against and the check has to run again at the publish. `rt_sound_publish` drops
 a held play whose asset landed as the other kind instead of binding it, and counts the drop in
 `rt_held_kind_drops`, which `bwa_commit` turns into a `bwa_last_error` notice. The engine layer
 refuses the mismatch at the play call itself, because the asset cache knows the load flags, so this
 is the backstop rather than the first line.
 
-Cancellation follows the voice, not the asset: `rt_source_stop`, `rt_stop_all`,
-a newer play on the same source, an unload, and source destroy or steal all drop
-a pending held play. `rt_group_stop` is the one gap, because a held play is not
-yet bound to a voice and so has no group to match against.
+It carries the **play region** and a pending **seek** for a related reason. Both calls target a
+BOUND asset, so the documented order is play, then set the region or seek. A held play has not
+bound anything, so an enqueued `CMD_SET_REGION` would be consumed against an empty voice and the
+adoption's `source_bind` would then overwrite the region from the play call. Recording them on the
+held entry makes the documented order work unchanged: the region goes out inside the released
+`CMD_PLAY`, and the seek is re-issued straight after it, so the ring order matches a synchronous
+play-then-seek exactly. A newer play on the same source clears both, because it supersedes the
+whole held entry.
+
+Cancellation follows the voice, not the asset. `rt_source_stop`, `rt_stop_all`,
+`rt_group_stop`, a newer play on the same source, and an unload all delete the
+held entry outright. Destroying or stealing the source does not delete it, but
+its play still never sounds: `rt_sound_publish` checks the source handle for
+liveness before it binds, and a destroyed or stolen handle is no longer its
+slot's occupant. The entry then goes at the publish instead of at the destroy.
+
+`rt_group_stop` needs one extra piece to do it. A held play is not bound to a
+voice, and the voice is where the mix group lives, so the group stop has nothing
+on the audio thread to match against. `RtCore.group` is the answer: a
+control-side mirror of each source's group, one byte per voice slot, alongside
+`priority` and `play_seq` in the same control-owned block. The audio thread never
+reads it. `rt_source_set_group` and `rt_source_apply_cfg` write it, and only once
+their command push landed, so the mirror can never claim a group the voice did
+not take. `alloc_handle` resets it to 0, the group the voice's own create memset
+gives it, so a recycled slot never inherits the previous occupant's group.
+
+Both stops push the command first and drop the held plays only after that push
+lands. On a momentarily full ring the stop never reaches the audio thread, and
+clearing first would leave a half-effect: voices still playing, pending plays
+silently gone, and nothing the caller could read to tell.
 
 ### Doppler delay rings
 

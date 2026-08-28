@@ -11,7 +11,8 @@
  * The mixing is the full production path: mix_voice plays sound->pcm through the
  * listener-relative DBAP/SPCAP/VBAP 26-gain solve with per-block gain ramps, plus occlusion,
  * directivity, Doppler, air absorption, reflection/pathing sends, dual-band panning, the
- * ambisonic bed, streaming, pause/seek, and the output limiter. See NOTES.md for history.
+ * ambisonic bed, streaming, pause/seek, the direct output-channel route, and the output limiter.
+ * See NOTES.md for history.
  */
 #ifndef BWA_RT_H
 /* Upper bound for any linear gain the ABI accepts (+80 dB). Guards the finite-but-absurd case:
@@ -23,6 +24,34 @@
  * verbatim, and the align delay lines + room-EQ biquads sit BEFORE the limiter, so an overflow
  * lands in filter state that never recovers. +30 dBFS clears any legitimately hot float master. */
 #define BWA_MAX_SAMPLE 32.0f
+
+/* Upper bound (meters, per axis) for any room COORDINATE the ABI accepts: listener pose, source
+ * position, extra listeners, the tracked head pose. Third member of the same finite-but-absurd
+ * family as BWA_MAX_GAIN and BWA_MAX_SAMPLE, and the one the guards were missing. Every spatial
+ * solve starts from a SQUARED difference (dbap.c's dist2, the spread frame's normalize, the ISM
+ * path length), so a merely `isfinite` coordinate near FLT_MAX makes dx*dx overflow to +Inf; the
+ * normalize that follows is then Inf/Inf or Inf*0, which is NaN, and the NaN lands in the gain
+ * vector where the gcur ramp x + (t - x) * k can never leave it. 1e6 m keeps 3 * (2e6)^2 = 1.2e13
+ * far inside float range with room for every downstream multiply, and it is well past any real
+ * scene (the CAVE is 3 m across). */
+#define BWA_MAX_COORD 1.0e6f
+
+/* Upper bound (meters) for an ISM room DIMENSION (bwa_scene_set_ism_room / bwa_scene_set_box).
+ * Same finite-but-absurd family, but a dimension is NOT a coordinate: it is a positive extent, and
+ * ism.c MULTIPLIES it. Order 1 is the whole model (one mirror per face, six images) and the mirror
+ * is `2*plane - src`, so the +y face's image reaches 2h while the box's own inside test already
+ * pins src between the faces (|image_x| <= 1.5w, |image_y| <= 2h, |image_z| <= 1.5d). Half of
+ * BWA_MAX_COORD is exactly the largest of those factors, so every image ism.c hands to the panner
+ * lands back inside the envelope the ABI guarantees for a coordinate, instead of being an
+ * UNBOUNDED value derived from bounded ones. Without it, w = h = d = 3e38 passes the inside test
+ * and mirrors to +Inf, whose dist2 in the panner normalizes to NaN and sticks in the ISM gain ramp
+ * exactly as an absurd listener pose did. 500 km is far past any room anyone will model.
+ *
+ * bwa_scene_set_ground's `y` takes BWA_MAX_COORD instead, not this: a plane HEIGHT is a room
+ * coordinate, the same kind and units as a source position. plane_only has no inside test, so its
+ * one image can reach 3 * BWA_MAX_COORD (2*y - src_y); that is still 4.8e13 once squared and
+ * summed over three axes, which is where the headroom in BWA_MAX_COORD goes. */
+#define BWA_MAX_ROOM_DIM (0.5f * BWA_MAX_COORD)
 
 #define BWA_RT_H
 
@@ -80,7 +109,11 @@ enum {
                      * Cmd union at the width `exlis` already sets — a wider Cmd would tax every
                      * command in the ring for the benefit of this one. */
     CMD_GROUP_STOP, /* click-free stop of every voice in one mix group (rt_group_stop) */
-    CMD_STOP_ALL    /* click-free stop of every voice, whatever its group (rt_stop_all) */
+    CMD_STOP_ALL,   /* click-free stop of every voice, whatever its group (rt_stop_all) */
+    CMD_SET_CHANNEL,/* per-voice DIRECT output-channel route (rt_source_set_channel): the solve installs a
+                     * one-hot gain vector instead of the panner's, so the reference condition stays on the
+                     * same ramp + output stage as the phantom it is A/B'd against */
+    CMD_SET_REGION  /* per-voice play region [start,end) in content frames (rt_source_set_region) */
 };
 typedef struct {
     uint8_t  type;
@@ -106,6 +139,8 @@ typedef struct {
         struct { uint8_t on; }                         pause; /* per-voice pause gate (ramped; playhead freezes) */
         struct { uint64_t frame; }                     seek;  /* content position to jump to (in-memory sounds) */
         struct { uint32_t channel; uint8_t kind; float gain; } test;  /* debug channel injection */
+        struct { uint8_t on, ch; }                     outch; /* direct output-channel route (on = 0 restores panning) */
+        struct { uint64_t beg, end; }                  region;/* play region in content frames (end 0 = asset end) */
         struct { uint8_t on; }                         ldc;   /* per-voice loudness-compensated attenuation */
         struct { float p[BWA_EXTRA_LIS][3]; uint8_t n; } exlis; /* extra listeners (compromise panning) */
         struct { float radius; }                       size;  /* per-voice source radius (meters; 0 = point) */
@@ -145,7 +180,10 @@ typedef struct {
  * the handle stays the caller's, so drain_events records it for rt_poll_ended and recycles nothing.
  * They had to be separate: completion is not ownership, and the existing event only ever fired for
  * the handles the engine was taking back. */
-enum { EVT_VOICE_ENDED = 0, EVT_SOUND_RETIRED, EVT_VOICE_DONE };
+/* EVT_VOICE_LOOPED is the third kind, and it is a NOTICE like DONE: one per loop WRAP (the mixer's
+ * cursor reaching the region/clip end and jumping back), so it is unbounded per block and yields the
+ * ring's reserve exactly as DONE does. Same seq/gen gate on the control side, its own drop counter. */
+enum { EVT_VOICE_ENDED = 0, EVT_SOUND_RETIRED, EVT_VOICE_DONE, EVT_VOICE_LOOPED };
 typedef struct { uint8_t type, seq; uint32_t handle; } Evt;   /* seq: the play a DONE belongs to */
 
 typedef struct RtCore RtCore;   /* opaque */
@@ -217,7 +255,11 @@ void    rt_group_set_gain(RtCore* c, uint32_t group, float linear);   /* mix-gro
 void    rt_group_set_paused(RtCore* c, uint32_t group, bool paused);  /* mix-group pause (enqueue) */
 /* Click-free stop of a whole group / of everything (enqueue; one command each). Every matching
  * voice takes rt_source_stop's one-block fade and drops its pending chain. An out-of-range group
- * is ignored, as with the gain/pause calls. */
+ * is ignored, as with the gain/pause calls.
+ * Both also discard the matching HELD plays (the ones still waiting on an async decode), or those
+ * would start by themselves once their data landed. A held play has no voice, so rt_group_stop
+ * matches it on the control-side group mirror (RtCore.group) instead. Both drop the held plays
+ * only AFTER the command push landed, so a full ring leaves no half-effect. */
 void    rt_group_stop(RtCore* c, uint32_t group);
 void    rt_stop_all(RtCore* c);
 uint32_t rt_active_voices(RtCore* c);                     /* control thread: last block's active voice count */
@@ -267,6 +309,11 @@ void    rt_set_occlusion_eq(RtCore* c, uint32_t handle, float level, const float
 /* Full direct-effect publish: broadband level + 3-band tilt + directivity gain, in one handle-gated
  * store set. The off-thread sim calls this per source; the audio thread ramps level/dir and EQ. */
 void    rt_set_direct(RtCore* c, uint32_t handle, float level, const float bands[3], float dir);
+/* Control-thread readbacks. Both take the SAME liveness gate rt_source_is_playing and
+ * rt_source_get_position take: a destroyed, stale, or recycled handle reads the neutral value
+ * immediately (1 = clear / on-axis), not the dead voice's last publish. Publish for a handle that
+ * never came from rt_source_create and these report nothing back — the publish slot still holds it,
+ * but the readback refuses to speak for a slot with no live occupant. */
 float   rt_get_occlusion(RtCore* c, uint32_t handle);   /* control thread: published factor (1 = clear) */
 float   rt_get_directivity(RtCore* c, uint32_t handle); /* control thread: published gain (1 = on-axis) */
 
@@ -331,16 +378,33 @@ void rt_source_set_gain(RtCore* c, uint32_t h, float linear);
 void rt_source_play    (RtCore* c, uint32_t h, uint32_t sound, bool loop);
 void rt_source_play_at (RtCore* c, uint32_t h, uint32_t sound, bool loop, uint64_t start_sample);  /* sample-accurate */
 void rt_source_play_loop(RtCore* c, uint32_t h, uint32_t sound, uint64_t loop_beg, uint64_t loop_end);  /* intro->loop region */
-/* Same bind as rt_source_play, tagged as an ambisonic BED. A bed is the same voice on the same
- * path, so the only difference is the kind recorded for an async (held) play — the voice itself
- * cannot be asked later which kind the caller meant. engine.c's bwa_bed_play calls this. */
+/* The same binds as rt_source_play/_play_at/_play_loop, tagged as an ambisonic BED. A bed is the
+ * same voice on the same path, so the only difference is the kind recorded for an async (held)
+ * play — the voice itself cannot be asked later which kind the caller meant. engine.c's
+ * bwa_bed_play/_play_at/_play_loop call these. */
 void rt_bed_play       (RtCore* c, uint32_t h, uint32_t sound, bool loop);
+void rt_bed_play_at    (RtCore* c, uint32_t h, uint32_t sound, bool loop, uint64_t start_sample);
+void rt_bed_play_loop  (RtCore* c, uint32_t h, uint32_t sound, uint64_t loop_beg, uint64_t loop_end);
 void rt_source_stop    (RtCore* c, uint32_t h);
 void rt_source_stop_at (RtCore* c, uint32_t h, uint64_t stop_sample);   /* click-free stop when the dsp clock reaches it */
 void rt_source_queue   (RtCore* c, uint32_t h, uint32_t sound, bool loop);  /* chain: play after the current sound ends (gapless) */
 void rt_source_clear_queue(RtCore* c, uint32_t h);                     /* drop the pending chain */
 void rt_source_set_paused(RtCore* c, uint32_t h, bool paused);   /* ramped gate; the playhead freezes once silent */
 void rt_source_seek    (RtCore* c, uint32_t h, uint64_t frame);  /* click-free jump (in-memory sounds; streams ignore) */
+/* Play region [start,end) in CONTENT frames (in-memory + bed sounds; streams/push ignore, as seek does).
+ * end 0 = the asset end. It is the same voice state rt_source_play_loop resolves at play time, so a
+ * later play RESETS it; set it after the play. A non-looping voice ENDS at `end` (EVT_VOICE_DONE, the
+ * queue chains as at any end), a looping one wraps to `start` (EVT_VOICE_LOOPED). A degenerate
+ * end <= start (with end != 0) is refused on the control thread. */
+void rt_source_set_region(RtCore* c, uint32_t h, uint64_t start_frame, uint64_t end_frame);
+/* DIRECT output-channel route: send this voice's mono content to ONE bus channel with NO spatial
+ * processing (the psychophysics ground-truth / reference condition). channel < 0 = back to the panner.
+ * Implemented as a one-hot GAIN VECTOR at the panner's output, not a post-align injection, so the
+ * route ramps like any other gain change (invariant 4) and the per-speaker align trims/delays, room
+ * EQ, master gain and the limiter apply exactly as they do to a panned voice — which is what makes
+ * the reference LEVEL-COMPARABLE with the phantom. An out-of-range channel is refused here (the
+ * control thread; c->channels is fixed for the engine's life). Beds ignore it. */
+void rt_source_set_channel(RtCore* c, uint32_t h, int channel);
 void rt_source_set_doppler(RtCore* c, uint32_t h, bool on);          /* propagation: glided delay -> pitch from radial motion */
 void rt_source_set_air_absorption(RtCore* c, uint32_t h, bool on);   /* propagation: distance-driven HF low-pass */
 void rt_source_set_loudness_comp(RtCore* c, uint32_t h, bool on);    /* equal-loudness LF shelf vs attenuation */
@@ -389,6 +453,9 @@ void rt_read_pose(RtCore* c, float p[3], float q[4]);      /* control thread: ac
 bool rt_source_is_playing(RtCore* c, uint32_t h);         /* control thread: is the source's voice still playing? */
 /* control thread: drain handles whose voices ENDED since the last call (see rt.c) */
 uint32_t rt_poll_ended(RtCore* c, uint32_t* out, uint32_t cap, uint64_t* dropped_out);
+/* control thread: drain handles whose voices WRAPPED at a loop point since the last call. Same ring
+ * shape, same drop-oldest bound, its own counters (see rt.c). */
+uint32_t rt_poll_looped(RtCore* c, uint32_t* out, uint32_t cap, uint64_t* dropped_out);
 /* control thread: the live POST-CLAMP values of the knobs rt sanitizes (see rt.c) */
 void rt_get_spcap_sanitized(RtCore* c, float* focus, float* density);
 void rt_get_tuning_sanitized(RtCore* c, int* panner, int* spread_mode, float* near_spread,

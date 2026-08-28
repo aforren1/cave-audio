@@ -1032,7 +1032,7 @@ int zylia_survey_save(const char* path, const float caps_m[ZYLIA_MICS][3],
           "MOUNT'S BODY AXES (not room axes), indexed BY ASIO INPUT CHANNEL. Rotate by the mount's "
           "live pose before solving: installed as-is, every direction is wrong by whatever the mount "
           "was turned to at survey time. Encodes the channel order and the capsules' placement inside "
-          "the mount, NOT the array's orientation in the room — that is what the tracker supplies. "
+          "the mount, NOT the array's orientation in the room - that is what the tracker supplies. "
           "Specific to one physical ZM-1 rigidly coupled to one mount: re-survey if either changes."
         : "ZM-1 capsule survey. Positions are meters, relative to the array center, in ROOM axes "
           "(+X right, +Y up, -Z front), indexed BY ASIO INPUT CHANNEL. This file therefore encodes the "

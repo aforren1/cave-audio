@@ -13,7 +13,7 @@
  *
  * Determinism is the contract: an inline PCG32 stream drives every choice, no readback ever
  * feeds a decision, and no wall clock is consulted — the same seed replays the same call
- * sequence exactly. The one readback the sequence DOES consume is bwa_get_dsp_time (for
+ * sequence exactly. The one readback the sequence DOES consume is bwa_get_dsp_time_frames (for
  * play_at/stop_at deadlines), which on the manual sink is a pure function of blocks pumped, so
  * it is deterministic too. Any failure prints the seed + operation index + the repro line.
  *
@@ -330,7 +330,7 @@ static int render_once(Fz* z) {
         FAIL("output capture callback did not fire across a rendered block");
     z->renders++;
     g_total_renders++;
-    uint64_t t = bwa_get_dsp_time(z->e);
+    uint64_t t = bwa_get_dsp_time_frames(z->e);
     if (t < z->dsp_prev) FAIL("dsp clock went backwards (%llu -> %llu) with no restart",
                               (unsigned long long)z->dsp_prev, (unsigned long long)t);
     z->dsp_prev = t;
@@ -417,9 +417,9 @@ static int health(Fz* z) {
      * survives the re-base and legitimately(?) reads ahead for a block (see z->restarted). */
     if (!z->restarted) {
         uint64_t cs = 0, ct = 0;
-        if (bwa_get_clock(z->e, &cs, &ct) && cs > bwa_get_dsp_time(z->e))
+        if (bwa_get_clock(z->e, &cs, &ct) && cs > bwa_get_dsp_time_frames(z->e))
             FAIL("clock-pair sample runs ahead of the dsp clock (pair %llu, dsp %llu)",
-                 (unsigned long long)cs, (unsigned long long)bwa_get_dsp_time(z->e));
+                 (unsigned long long)cs, (unsigned long long)bwa_get_dsp_time_frames(z->e));
     }
 
     if (!z->toxic) {
@@ -612,7 +612,7 @@ static int do_op(Fz* z) {
         bwa_source h = pick_src(z, &c, &i);
         SClass sc;
         bwa_sound snd = pick_snd(z, &sc);
-        uint64_t now = bwa_get_dsp_time(e);   /* deterministic on the manual sink */
+        uint64_t now = bwa_get_dsp_time_frames(e);   /* deterministic on the manual sink */
         uint64_t at;
         switch (rnd(z, 4)) {
             case 0:  at = 0; break;                                /* == play now */
@@ -646,7 +646,7 @@ static int do_op(Fz* z) {
     case OP_STOP_AT: {
         HClass c;
         bwa_source h = pick_src(z, &c, NULL);
-        uint64_t now = bwa_get_dsp_time(e);
+        uint64_t now = bwa_get_dsp_time_frames(e);
         bwa_source_stop_at(e, h, chance(z, 1, 4) ? 0 : now + rnd(z, 8192));
         break;
     }
@@ -903,8 +903,22 @@ static int do_op(Fz* z) {
                 SClass sc;
                 bwa_sound snd = pick_snd(z, &sc);
                 bwa_bed_play(e, b, snd, chance(z, 1, 2));
-                if (sc != S_AMBIX && !bwa_last_error(e))
-                    FAIL("bed_play on a non-multichannel asset set no error");   /* documented sync check */
+                /* Demand the refusal only for the handles this harness KNOWS name a resolved,
+                 * non-bed asset. Two engine states legitimately set no error and neither is a bug:
+                 *   - a still-decoding async asset reports 0 channels and no kind yet, so
+                 *     bwa_bed_play admits it and rt holds the play (documented in engine.c);
+                 *   - an unloaded handle keeps RESOLVING until the audio thread acks the retire
+                 *     (rt_unload_sound only sets `retiring`), so a graveyard AmbiX handle still
+                 *     reads 4 channels and is a perfectly good bed.
+                 * Seed 73 op 1383 was the second one, and the ASSERTION was wrong, not the engine.
+                 * S_MONO and S_STREAM are fixture handles this harness owns, loads synchronously
+                 * (never pending) and re-points on every churn, so they are always a resolved
+                 * 1-channel asset; handle 0 can never resolve. Those three keep the real check -
+                 * "a mono asset played as a bed must be refused" - at full strength. S_STALE and
+                 * S_GARBAGE are excluded because the harness cannot know what they resolve to. */
+                if ((sc == S_MONO || sc == S_STREAM || sc == S_ZERO) && !bwa_last_error(e))
+                    FAIL("bed_play on a %s asset set no error",
+                         sc == S_MONO ? "mono" : sc == S_STREAM ? "streamed (1-channel)" : "zero-handle");
                 break;
             }
             case 3: { HClass c; bwa_bed b = pick_bed(z, &c); bwa_bed_set_gain(e, b, htox(z, 0.f, 2.f)); break; }
@@ -1182,7 +1196,7 @@ static int do_op(Fz* z) {
             }
             default: {
                 uint64_t cs = 0, ct = 0;
-                if (bwa_get_clock(e, &cs, &ct) && cs > bwa_get_dsp_time(e) && !z->restarted)
+                if (bwa_get_clock(e, &cs, &ct) && cs > bwa_get_dsp_time_frames(e) && !z->restarted)
                     FAIL("clock pair ahead of the dsp clock");
                 break;
             }
@@ -1363,7 +1377,7 @@ static int do_op(Fz* z) {
         if (bwa_source_is_playing(NULL, 1)) FAIL("is_playing(NULL engine) returned true");
         (void)bwa_last_error(NULL);
         (void)bwa_get_channel_count(NULL);
-        (void)bwa_get_dsp_time(NULL);
+        (void)bwa_get_dsp_time_frames(NULL);
         break;
     }
 

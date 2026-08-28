@@ -317,7 +317,7 @@ bool layout_load(const char* path, uint32_t sample_rate, Layout* out, char* err,
         out->rq_grid.npos = (uint8_t)np;
         for (int s = 0; s < nspk; ++s)               /* one room-correction scheme at a time */
             if (out->speakers[s].room_eq_count) {
-                set_err(err, errcap, "layout: carries both room_eq (static) and room_eq_grid (tracked) — pick one"); goto done;
+                set_err(err, errcap, "layout: carries both room_eq (static) and room_eq_grid (tracked) - pick one"); goto done;
             }
     }
 

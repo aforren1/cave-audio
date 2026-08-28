@@ -21,7 +21,7 @@ This is a UPM package: a verified P/Invoke layer (`Bwa`) plus two MonoBehaviours
 | `AudioSource.volume` | `Emitter.Gain` (and `FadeTo` / `FadeOut` - the engine runs the fade, no coroutine) |
 | `AudioSource.pitch` | `Emitter.Pitch` (glides; in-memory clips only) |
 | `AudioSource.priority` | `Emitter.Priority` (a full voice pool steals the LOWEST-priority source) |
-| `AudioSource.isPlaying` | `Emitter.IsPlaying` (+ an `onFinished` UnityEvent) |
+| `AudioSource.isPlaying` | `Emitter.IsPlaying` for "still going"; the `onFinished` and `onLoop` UnityEvents for "it ended" and "it wrapped" |
 | `AudioListener.volume` | `Engine.MasterGain` |
 | `AudioListener.pause` | `Engine.Paused` (every voice freezes; resume continues exactly) |
 | `AudioMixerGroup` (ducking) | mix groups: `Emitter.group` + `Engine.SetGroupGain` / `SetGroupPaused` |
@@ -77,6 +77,14 @@ The DLLs are gitignored build output, so a git-URL install pointed at **`main`**
 the C# with no engine behind it (`DllNotFoundException` on the first call), and `package.json` is not
 at the repo root there either. That is what the `unity` branch above exists to fix: CI publishes a
 built, root-level copy of the package to it. Against a working tree, use a local path.
+
+The package has a headless PlayMode suite in `test~/`, wired into ctest as `unity_playmode`. It runs
+the real components against the real DLL on the offline sink. Point CMake at an editor to register
+it (`-DBWA_UNITY_EXE="C:/.../Editor/Unity.exe"`); without that the test is skipped, because Unity is
+not a build dependency. See
+[docs/integration.md → Tests](../../docs/integration.md#tests) for what it covers and why it needs
+PlayMode. `test~/` never ships: the pack script stages `Runtime` and `Editor` only, and Unity itself
+ignores any folder whose name ends in `~`.
 
 > **License:** the engine is **GPLv3** (`bw_audio.dll` links the ASIO SDK under its GPLv3 option).
 > Internal use never triggers copyleft: it is a *distribution* condition. But shipping a Unity app
@@ -222,6 +230,39 @@ startup, so you can't flip it from a runtime script. It's a one-time project set
    listener, then one `bwa_commit`. The audio thread therefore never sees a half-moved frame, which
    is what makes the moving-observer case correct. Do not push from individual emitters.
 
+### Ends and loop boundaries are events
+
+`onFinished` and `onLoop` come from the engine's own event rings, not from watching a playing flag.
+Watching the flag cannot work: `IsPlaying` is a per-block readback, so a clip shorter than a frame
+may never once read as playing, and a looping voice never ends at all. `Engine` drains
+`bwa_poll_ended` and `bwa_poll_looped` once per `LateUpdate`, right after the commit that fills
+them, and routes each handle to the component that owns it. `AmbisonicBed` has both events too.
+
+`Engine` is the **only** caller of either drain. Both are engine-wide and destructive, so a second
+caller would eat events belonging to other components and their UnityEvents would never fire. Read
+`Engine.EndedEventsDropped` and `Engine.LoopEventsDropped` for what the engine had to throw away
+because nothing read it in time. The ended total should stay 0. The loop total can rise for a
+harmless reason: a loop region shorter than a frame wraps more often than any frame rate reads it.
+
+`onLoop` fires once per **wrap**, not once per frame. It is how you pace a trial off the content
+rather than off `Time.deltaTime`. `Emitter.SetRegionFrames` / `SetRegionSeconds` set what it wraps
+at: a play region loops a sub-range of the clip, or cuts a one-shot short. `AmbisonicBed` has the
+same pair. Set the region **after** the play, because a play resets it.
+
+### One speaker, no panning
+
+`Emitter.Channel = n` sends a source out of exactly one output channel with no spatial processing,
+and `Bwa.CHANNEL_AUTO` puts it back on the panner. That is the psychophysics ground-truth condition:
+a real speaker to A/B a phantom against, played with whatever content you like. It is not
+`Engine.TestSignal()`, which injects a built-in tone *after* the per-speaker align stage and is
+therefore not level-comparable with anything the engine renders.
+
+The routed voice keeps the whole output stage a panned voice gets (align trims and delays, room EQ,
+master gain, limiter) and the route ramps in and out instead of clicking. Everything distance- or
+direction-derived is suppressed while it is on and comes back the moment you go to `CHANNEL_AUTO`.
+Mono point sources only. It is script-only on purpose: a route is a run-time experimental condition,
+not scene configuration, so it is not serialized.
+
 ### Procedural audio - `PushEmitter`
 
 When the audio isn't a file but something you **generate** - a software synth, an engine model, a
@@ -325,6 +366,6 @@ acoustic geometry.
 Everything the CAVE needs but a desktop engine doesn't is on `Engine`: `ChannelCount` (the layout's
 speaker count - **size meter arrays with it, never hard-code 26**), `BusLevels()` (per-channel output
 peaks), `SpeakerPositions()`, `ActiveVoices`, `TestSignal()` (a raw tone on one speaker, for wiring
-checks), `DspTime` (schedule a sample-accurate start), and `extraListeners` - the *other* occupants,
+checks), `DspTimeFrames` (schedule a sample-accurate start), and `extraListeners` - the *other* occupants,
 so panning becomes a compromise across everyone in the room instead of exact for one head and wrong
 for the rest.

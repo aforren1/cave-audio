@@ -323,6 +323,11 @@ static char      g_cust_status[192];           /* last load result line */
 static int       g_cust_ok;
 static const char* backend_name;
 static int         backend_silent;
+/* Is this DLL the Steam Audio build? Latched from the FIRST engine's headphone-decode suffix
+ * ("steam HRTF ..." vs "simple-pan ..."), which is the one runtime signal the ABI exposes for a
+ * compile-time define that gates the WHOLE materials tier. Latched once because the render picker
+ * can later rebuild into BWA_PROFILE_CAVE, which names no decode at all. -1 = not probed yet. */
+static int         g_have_steam = -1;
 static const char* g_layout_path;          /* optional cave_layout.json; NULL = engine default grid */
 
 static Vector3 speakers[NSPK];
@@ -1060,6 +1065,7 @@ static void build_engine(int mode) {
     bwa_set_output_capture(e, capture_cb, NULL);             /* F9 records the binaural output to WAV */
     backend_name   = bwa_get_audio_backend(e);
     backend_silent = (strncmp(backend_name, "asio", 4) != 0);
+    if (g_have_steam < 0) g_have_steam = (strstr(backend_name, "steam HRTF") != NULL);   /* see the decl */
     g_nspk = (int)bwa_get_speakers(e, (float*)speakers, NSPK);   /* the geometry AND count the engine pans with */
     if (g_nspk < 1) g_nspk = 1;                          /* (a layout always has >= 4; keep the divides safe) */
     if (chan_active >= g_nspk) chan_active = 0;          /* a smaller array may have retired the walked channel */
@@ -2043,7 +2049,10 @@ static void register_tests(ImGuiTestEngine* te) {
         ctx->SetRef("playground");
         ctx->ItemCheck("**/dynamic wall [N]");
         IM_CHECK_EQ(rev_wall_on, 1);
-        IM_CHECK_GE(rev_wall, 0);                        /* a dynamic mesh was allocated in the reverb scene */
+        /* The dynamic-mesh table is Steam-scene state, so the two builds have DIFFERENT correct
+         * answers here and the assertion has to pick one. Accepting both would make it unfailable. */
+        if (g_have_steam) IM_CHECK_GE(rev_wall, 0);      /* a dynamic mesh was allocated in the reverb scene */
+        else              IM_CHECK_EQ(rev_wall, -1);     /* no-SDK: add_dynamic_mesh is a documented no-op */
         ctx->ItemCheck("**/auto-sweep [SPACE]");
         ctx->Yield(8);                                   /* the wall slides; the sims re-trace against it */
         ctx->ItemUncheck("**/dynamic wall [N]");

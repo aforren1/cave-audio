@@ -61,7 +61,8 @@ together: rE beside rV, the three panners in one place, the three reverb paths i
 
 **D** [DBAP](#dbap), [Deconvolution](#deconvolution), [Decorrelation](#decorrelation),
 [Delay trim](#delay-trim), [Density](#density), [Diffuseness](#diffuseness), [DirAC](#dirac),
-[Direct binaural field](#direct-binaural-field), [Directivity](#directivity),
+[Direct binaural field](#direct-binaural-field), [Direct channel route](#direct-channel-route),
+[Directivity](#directivity),
 [Distance attenuation](#distance-attenuation), [Doppler](#doppler), [Drift check](#drift-check),
 [Dual-band panning](#dual-band-panning)
 
@@ -1073,6 +1074,17 @@ mean, not the raw spread, because the spread is what the averaging already handl
 (`src/zylia.c:846`, with 1.0 dB of standard error taking it to 0). It reads the opposite way to
 [diffuseness](#diffuseness): **1 is good**. Below about 0.5 the capsules are not seeing one comb, so
 suspect a capsule fault or a capture that drifted.
+
+### Direct channel route
+
+`bwa_source_set_channel`: send one source's content to exactly ONE output channel, with every
+spatial and propagation stage bypassed (`src/rt.c`, `direct_channel_gains`). It is the live,
+in-engine form of the [physical reference arm](#physical-reference-arm) that `bwa_validate` builds
+offline, so the A/B a listener hears matches the one the measurement scores. It is installed as a
+one-hot gain vector at the panner's output, NOT as a post-align injection like
+`bwa_set_test_signal`, which is what keeps the reference on the same output stage, the same gain
+ramps and the same level scale as the phantom it is compared against. See
+[api.md](./api.md#direct-output-channel-routing-the-reference-condition).
 
 ### First-order ceiling
 

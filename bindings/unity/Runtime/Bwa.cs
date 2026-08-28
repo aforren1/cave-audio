@@ -276,9 +276,9 @@ namespace BwAudio
         // Scene transitions. Both take the SAME click-free path as bwa_source_stop (one-block fade, then
         // end), stop BEDS too, and drop each stopped voice's pending queue. Neither touches group gains,
         // group pause, the global pause, or the master gain: a stop stops sound, it does not reset the
-        // mixer. Stopped source handles stay valid and re-playable. bwa_stop_all additionally drops the
-        // plays still waiting on an async decode; bwa_group_stop cannot (an unbound held play has no
-        // voice to read a group from).
+        // mixer. Stopped source handles stay valid and re-playable. Both also drop the plays still
+        // waiting on an async decode, which would otherwise start by themselves once their data landed:
+        // bwa_stop_all drops every one, bwa_group_stop the ones issued on sources in that group.
         [DllImport(DLL, CallingConvention = CC)] public static extern void bwa_group_stop(IntPtr e, uint group);
         [DllImport(DLL, CallingConvention = CC)] public static extern void bwa_stop_all(IntPtr e);
         // Playback rate, clamped [0.25, 4] (glides across a block). In-memory sounds only — streams ignore it.
@@ -286,9 +286,9 @@ namespace BwAudio
         [DllImport(DLL, CallingConvention = CC)] public static extern void bwa_source_play(IntPtr e, uint s, uint snd, [MarshalAs(UnmanagedType.I1)] bool loop);
         [DllImport(DLL, CallingConvention = CC)] public static extern void bwa_source_play_at(IntPtr e, uint s, uint snd, [MarshalAs(UnmanagedType.I1)] bool loop, ulong startSample);
         [DllImport(DLL, CallingConvention = CC)] public static extern void bwa_source_play_loop(IntPtr e, uint s, uint snd, ulong loopBeg, ulong loopEnd);
-        [DllImport(DLL, CallingConvention = CC)] public static extern ulong bwa_get_dsp_time(IntPtr e);
+        [DllImport(DLL, CallingConvention = CC)] public static extern ulong bwa_get_dsp_time_frames(IntPtr e);
         // The device-stamped (output sample, host time ns) pair for the last rendered block — the
-        // jitter-free wall<->dsp bridge (see Engine.DspTimeAt). hostTimeNs is monotonic on a
+        // jitter-free wall<->dsp bridge (see Engine.DspTimeFramesAt). hostTimeNs is monotonic on a
         // backend-defined epoch. False (outputs zeroed) until a host-stamped block has rendered.
         [DllImport(DLL, CallingConvention = CC)] [return: MarshalAs(UnmanagedType.I1)] public static extern bool bwa_get_clock(IntPtr e, out ulong dspSample, out ulong hostTimeNs);
         // Device-reported render->DAC latency in frames (ASIOGetLatencies; the Digiface includes its Dante
@@ -309,6 +309,19 @@ namespace BwAudio
         // Global pause: EVERY voice (memory, streamed, bed) ramps out and freezes; resume continues exactly.
         [DllImport(DLL, CallingConvention = CC)] public static extern void bwa_set_paused(IntPtr e, [MarshalAs(UnmanagedType.I1)] bool paused);
         [DllImport(DLL, CallingConvention = CC)] public static extern void bwa_source_seek(IntPtr e, uint s, ulong frame);   // engine-rate frames; in-memory sounds
+        // Play REGION [startFrame, endFrame) in engine-rate frames; endFrame 0 = the asset end. A
+        // non-looping voice ENDS at endFrame (reported through bwa_poll_ended), a looping one wraps back
+        // to startFrame (reported through bwa_poll_looped). Set it AFTER the play: it resolves against the
+        // bound asset, and any play resets it. In-memory and bed sounds only.
+        [DllImport(DLL, CallingConvention = CC)] public static extern void bwa_source_set_region(IntPtr e, uint s, ulong startFrame, ulong endFrame);
+        // DIRECT output-channel route: this voice's content goes to ONE output channel with no spatial
+        // processing — the psychophysics ground-truth condition (a real speaker A/B'd against a phantom).
+        // CHANNEL_AUTO restores normal panning. NOT bwa_set_test_signal, which injects a built-in tone
+        // after the align stage and is therefore not level-comparable with a rendered source.
+        [DllImport(DLL, CallingConvention = CC)] public static extern void bwa_source_set_channel(IntPtr e, uint s, int channel);
+        /// <summary>BWA_CHANNEL_AUTO: the value <see cref="bwa_source_set_channel"/> takes to put a source
+        /// back on the panner.</summary>
+        public const int CHANNEL_AUTO = -1;
         [DllImport(DLL, CallingConvention = CC)] [return: MarshalAs(UnmanagedType.I1)] public static extern bool bwa_source_is_playing(IntPtr e, uint s);
         // Content playhead in engine-rate frames (latest-wins readback, ~one block of lag): freezes under
         // pause, lands where seek lands, follows pitch at the actual rate; streamed sounds report frames
@@ -334,6 +347,12 @@ namespace BwAudio
         // ---- ambisonic beds (world-locked diffuse soundfields) ----
         [DllImport(DLL, CallingConvention = CC)] public static extern uint bwa_bed_create(IntPtr e);
         [DllImport(DLL, CallingConvention = CC)] public static extern void bwa_bed_play(IntPtr e, uint b, uint snd, [MarshalAs(UnmanagedType.I1)] bool loop);
+        // The scheduled and intro-to-loop play forms. Separate ABI calls rather than bwa_source_*
+        // aliases because the multichannel-asset check runs the other way round: the source forms
+        // refuse the 4/9/16-channel file a bed exists to play. startSample is on the engine's dsp
+        // clock (bwa_get_dsp_time_frames); loopBeg/loopEnd are FRAMES into the asset.
+        [DllImport(DLL, CallingConvention = CC)] public static extern void bwa_bed_play_at(IntPtr e, uint b, uint snd, [MarshalAs(UnmanagedType.I1)] bool loop, ulong startSample);
+        [DllImport(DLL, CallingConvention = CC)] public static extern void bwa_bed_play_loop(IntPtr e, uint b, uint snd, ulong loopBeg, ulong loopEnd);
         [DllImport(DLL, CallingConvention = CC)] public static extern void bwa_bed_set_gain(IntPtr e, uint b, float linear);
         // Full 3-axis orientation of the soundfield, RADIANS, ROOM frame (level or tilt a capture, or spin
         // it slowly for effect). Positive yaw turns the field about the room's vertical axis from room +z
@@ -345,10 +364,13 @@ namespace BwAudio
         [DllImport(DLL, CallingConvention = CC)] public static extern void bwa_bed_stop(IntPtr e, uint b);
         [DllImport(DLL, CallingConvention = CC)] public static extern void bwa_bed_destroy(IntPtr e, uint b);
         // same voice machinery as the bwa_source_* calls of the same name, bed-named (a bed IS a voice)
+        [DllImport(DLL, CallingConvention = CC)] public static extern void bwa_bed_stop_at(IntPtr e, uint b, ulong stopSample);
         [DllImport(DLL, CallingConvention = CC)] public static extern void bwa_bed_fade_to(IntPtr e, uint b, float gain, float seconds);
         [DllImport(DLL, CallingConvention = CC)] public static extern void bwa_bed_fade_out(IntPtr e, uint b, float seconds);
         [DllImport(DLL, CallingConvention = CC)] public static extern void bwa_bed_set_paused(IntPtr e, uint b, [MarshalAs(UnmanagedType.I1)] bool paused);
         [DllImport(DLL, CallingConvention = CC)] public static extern void bwa_bed_seek(IntPtr e, uint b, ulong frame);
+        // FRAMES into the asset, both. endFrame 0 means the asset end.
+        [DllImport(DLL, CallingConvention = CC)] public static extern void bwa_bed_set_region(IntPtr e, uint b, ulong startFrame, ulong endFrame);
         [DllImport(DLL, CallingConvention = CC)] public static extern void bwa_bed_set_priority(IntPtr e, uint b, int priority);
         [DllImport(DLL, CallingConvention = CC)] public static extern void bwa_bed_set_group(IntPtr e, uint b, uint group);
         [DllImport(DLL, CallingConvention = CC)] [return: MarshalAs(UnmanagedType.I1)] public static extern bool bwa_bed_is_playing(IntPtr e, uint b);
@@ -466,7 +488,7 @@ namespace BwAudio
         // values and struct layouts only WITHIN a major.minor, so a DLL with a different major.minor may
         // marshal every struct in this file wrong — silent corruption, not a crash. Bump this alongside
         // any re-sync with a header whose BWA_VERSION moved.
-        public const uint BoundVersion = (0u << 16) | (12u << 8) | 0u;   // 0.12.0
+        public const uint BoundVersion = (0u << 16) | (13u << 8) | 0u;   // 0.13.0
 
         /// <summary>A packed BWA_VERSION as "major.minor.patch", for logs.</summary>
         public static string VersionString(uint v) => (v >> 16) + "." + ((v >> 8) & 0xFF) + "." + (v & 0xFF);
@@ -609,6 +631,11 @@ namespace BwAudio
         // Completion as an EVENT. Drains handles whose voices ended; prefer it over edge-detecting
         // bwa_source_is_playing, which misses any sound shorter than your frame interval.
         [DllImport(DLL, CallingConvention = CC)] public static extern uint bwa_poll_ended(IntPtr e, [Out] uint[] outHandles, uint cap, out ulong dropped);
+        // The loop-boundary sibling: drains the handles whose voices WRAPPED at a loop point. A looping
+        // voice never ends, so bwa_poll_ended reports it exactly never — this is how you pace trials or
+        // cue visuals off a loop. ONE entry per WRAP, so a short region wrapping several times inside one
+        // audio block yields several entries. Its own bounded, drop-oldest ring and its own dropped total.
+        [DllImport(DLL, CallingConvention = CC)] public static extern uint bwa_poll_looped(IntPtr e, [Out] uint[] outHandles, uint cap, out ulong dropped);
         // The ISM shoebox WITHOUT replacing the static mesh, and the box's own triangles, so the
         // box can be composed with your geometry instead of replacing it.
         [DllImport(DLL, CallingConvention = CC)] public static extern void bwa_scene_set_ism_room(IntPtr e, float w, float h, float d, uint[] faces);

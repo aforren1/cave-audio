@@ -69,6 +69,11 @@ void BwaSource::apply_all() {
 	if (paused) {
 		bwa_source_set_paused(ENG, src, true);
 	}
+	/* Standing state that is not a desc field, replayed like the manual occlusion below, so an
+	 * engine rebuild does not silently put a reference source back on the panner mid-experiment. */
+	if (channel != CHANNEL_AUTO) {
+		bwa_source_set_channel(ENG, src, (int32_t)channel);
+	}
 	if (occ_manual_set) {
 		if (occ_manual_banded) {
 			const float b[3] = { (float)occ_manual_bands.x, (float)occ_manual_bands.y,
@@ -387,6 +392,43 @@ void BwaSource::engine_gone() {
 	src = 0;
 }
 
+/* --- direct output-channel route --- */
+
+void BwaSource::set_channel(int ch) {
+	/* Range-check HERE when the answer is knowable, rather than let the core refuse it into
+	 * bwa_last_error and leave get_channel() reporting a route the voice is not on.
+	 *
+	 * CHANNEL_AUTO is the ONE negative that means anything, and the core refuses every other one
+	 * exactly as it refuses a too-large index (engine.c: folding them into AUTO would make a bad
+	 * index look like it was TAKEN - the source keeps panning, nothing is reported, and the caller
+	 * reads a phantom as a single-speaker reference). So this guard has to cover both ends, not just
+	 * the upper one.
+	 *
+	 * The two ends are knowable at different times, which is why they are two checks. A negative is
+	 * bad with NO channel count, so it is refused even before the engine is live. A too-large one
+	 * needs the count, so that half waits for LIVE and apply_all replays the cached value for the
+	 * core to judge at the moment it can. */
+	if (ch != CHANNEL_AUTO && ch < 0) {
+		UtilityFunctions::push_warning(vformat(
+				"%s (%s): channel %d is negative; the only negative that means anything is "
+				"BwaSource.CHANNEL_AUTO (%d), which restores spatial panning. "
+				"The source stays on channel %d.",
+				get_class(), get_name(), ch, CHANNEL_AUTO, channel));
+		return;
+	}
+	if (LIVE && ch >= owner->get_channel_count()) {
+		UtilityFunctions::push_warning(vformat(
+				"%s (%s): channel %d is out of range (0 to %d, or BwaSource.CHANNEL_AUTO); "
+				"the source stays on channel %d.",
+				get_class(), get_name(), ch, owner->get_channel_count() - 1, channel));
+		return;
+	}
+	channel = ch;
+	if (LIVE) {
+		bwa_source_set_channel(ENG, src, (int32_t)ch);
+	}
+}
+
 /* --- extent --- */
 
 void BwaSource::set_spread(float amount) {
@@ -590,6 +632,11 @@ void BwaSource::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("get_paused"), &BwaSource::get_paused);
 	ClassDB::bind_method(D_METHOD("stop"), &BwaSource::stop);
 
+	/* Methods, not a property: the direct route is a run-time experimental condition, so it should
+	 * not be serialized into a scene the way gain or spread is. See the header. */
+	ClassDB::bind_method(D_METHOD("set_channel", "channel"), &BwaSource::set_channel);
+	ClassDB::bind_method(D_METHOD("get_channel"), &BwaSource::get_channel);
+
 	ClassDB::bind_method(D_METHOD("set_spread", "amount"), &BwaSource::set_spread);
 	ClassDB::bind_method(D_METHOD("get_spread"), &BwaSource::get_spread);
 	ClassDB::bind_method(D_METHOD("set_extent", "width_height"), &BwaSource::set_extent);
@@ -687,6 +734,9 @@ void BwaSource::_bind_methods() {
 	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "early_reflections"), "set_early_reflections",
 			"get_early_reflections");
 	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "pathing"), "set_pathing", "get_pathing");
+
+	/* BwaSource.CHANNEL_AUTO — the value set_channel takes to restore spatial panning. */
+	BIND_CONSTANT(CHANNEL_AUTO);
 
 	BIND_ENUM_CONSTANT(DIR_OMNI);
 	BIND_ENUM_CONSTANT(DIR_CARDIOID);

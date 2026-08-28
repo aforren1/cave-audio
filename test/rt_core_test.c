@@ -147,6 +147,27 @@ int main(void) {
     for (int k = 0; k < 4; ++k) render2(c);
     CHECK(fabs(total_energy() / e4b - 1.0) < 0.02, "directivity restored to 1 ~ full energy");
 
+    /* 12. the dead-handle window on the SIM's publish slot (rt_get_occlusion, and the occ branch of
+     *     rt_get_directivity). Nothing ever rewrites occ_val/occ_dir on a destroy, so an ungated
+     *     readback reports the dead voice's last publish forever, not merely until the next block.
+     *     Read WITHOUT rendering after the destroy, and arm both words at 0 first so the margin is
+     *     unmistakable: a readback that trusts the publish reports ~0, a correct one reports the
+     *     neutral 1 (clear / on-axis). */
+    rt_set_direct(c, h4, 0.0f, flat, 0.0f);
+    CHECK(rt_get_occlusion(c, h4)   < 0.01f, "live handle reads the sim's blocked publish");
+    CHECK(rt_get_directivity(c, h4) < 0.01f, "live handle reads the sim's null publish");
+    rt_source_destroy(c, h4);                  /* no render: occ_handle still names h4 */
+    CHECK(fabsf(rt_get_occlusion(c, h4)   - 1.f) < 1e-6f,
+          "a destroyed handle reads clear occlusion BEFORE the next block");
+    CHECK(fabsf(rt_get_directivity(c, h4) - 1.f) < 1e-6f,
+          "a destroyed handle reads omni directivity BEFORE the next block");
+    /* and a hand-picked handle that was never allocated reads neutral too, not whatever the last
+     * publisher left in that slot's word. */
+    uint32_t never = BWA_MK_H(BWA_H_IDX(h4), 0);
+    rt_set_direct(c, never, 0.0f, flat, 0.0f);
+    CHECK(fabsf(rt_get_occlusion(c, never)   - 1.f) < 1e-6f, "an unallocated handle reads clear");
+    CHECK(fabsf(rt_get_directivity(c, never) - 1.f) < 1e-6f, "an unallocated handle reads omni");
+
     rt_destroy(c);
 
     /* channel test signal: drives a raw output channel (after align), only that channel */
@@ -309,6 +330,170 @@ int main(void) {
             rt_source_destroy(cg, g1); rt_source_destroy(cg, g2); rt_source_destroy(cg, g0);
             rt_commit(cg);
             rt_destroy(cg);
+        }
+    }
+
+    /* group stop vs the HELD plays (the ones still waiting on an async decode). A group stop that
+     * swept only VOICES left a held play in that group to start BY ITSELF the moment its decode
+     * landed - a sound beginning after the caller told the group to stop. rt_stop_all always did
+     * drop them; a group needed the control-side group mirror (RtCore.group), because a held play
+     * has no voice to read a group from.
+     *
+     * DETERMINISM BY ORDERING, NOT TIMING: a reserved slot stays reserved until this test calls
+     * rt_sound_publish, so every play below is GUARANTEED held and the window stays open for as
+     * long as the assertions need. Nothing here waits on a decode or a clock.
+     *
+     * BOTH ARMS MATTER. The negative arm alone would also pass an implementation that dropped
+     * EVERY held play unconditionally, so the kept group is asserted in the same publish. */
+    {
+        RtCore* cs = rt_create(8, 8, RATE, CH);
+        CHECK(cs != NULL, "rt_create (group stop vs held plays)");
+        if (cs) {
+            bwa_timestamp th = { 0, 0 };
+            uint32_t r1 = rt_sound_reserve(cs, err, sizeof err);   /* the stopped group's asset */
+            uint32_t r2 = rt_sound_reserve(cs, err, sizeof err);   /* the kept group's asset */
+            uint32_t hs = rt_source_create(cs), hk = rt_source_create(cs);
+            CHECK(r1 && r2 && hs && hk, "held group: two reserved slots + two sources");
+            set_pos_spk(cs, hs, 3);  rt_source_set_group(cs, hs, 1);   /* the group that gets stopped */
+            set_pos_spk(cs, hk, 20); rt_source_set_group(cs, hk, 2);   /* the group that does not */
+            rt_source_play(cs, hs, r1, true);      /* HELD: r1 is still an empty reserved slot */
+            rt_source_play(cs, hk, r2, true);      /* HELD too */
+            rt_commit(cs); render2(cs);
+            /* A PRECONDITION, not coverage: it makes the level baseline below mean something. The
+             * behavior it states (a held play is silent) is asserted for its own sake in the async
+             * staging section further down. */
+            CHECK(total_energy() < 1e-9, "held group: both plays are silent while held");
+
+            /* An out-of-range id is ignored for held plays exactly as it is for voices. 258 is the
+             * id that makes that OBSERVABLE: its low byte is 2, the KEPT group, so a range check
+             * moved below the sweep (or dropped) takes hk's held play here and the positive arm
+             * below goes red. An id whose low byte matched no live group could not tell. */
+            rt_group_stop(cs, 258u);
+            rt_group_stop(cs, 1);                  /* THE stop the held play has to obey */
+
+            SoundData p1 = make_test_pcm(1, 8 * N, 0.5f);
+            SoundData p2 = make_test_pcm(1, 8 * N, 0.5f);
+            CHECK(rt_sound_publish(cs, r1, &p1), "held group: publish the stopped group's asset");
+            CHECK(rt_sound_publish(cs, r2, &p2), "held group: publish the kept group's asset");
+            rt_commit(cs);
+            for (int b = 0; b < 4; ++b) rt_render(cs, bus, N, &th);   /* the block the decode lands in */
+            const double e3_stopped = chan_energy(3);
+            CHECK(!rt_source_is_playing(cs, hs),
+                  "held group: the stopped group's held play never starts");
+            /* the POSITIVE control, in the same publish: without it, dropping every held play
+             * whatever its group would pass every assertion above */
+            CHECK(rt_source_is_playing(cs, hk),
+                  "held group: a held play in ANOTHER group is untouched and starts");
+            CHECK(chan_energy(20) > 0.1, "held group: ...and is audible");
+
+            /* ...and not later either. Keep pumping well past the adoption: the held table is
+             * scanned at every publish, and a re-issue on any later pump would show up here.
+             * is_playing is the exact reading, so there is no energy twin of this line: an energy
+             * comparison against e3_stopped can only go red for a LATE start, which is the case
+             * this very assertion already decides. */
+            for (int b = 0; b < 8; ++b) { rt_commit(cs); rt_render(cs, bus, N, &th); }
+            CHECK(!rt_source_is_playing(cs, hs), "held group: ...and it does not start later either");
+
+            /* Calibrate the silence. A stopped source handle stays valid, so re-play the SAME
+             * source on the SAME asset: channel 3 lighting up now is what proves it was really
+             * silent above rather than merely aimed somewhere channel 3 cannot hear. The re-play
+             * line itself is a PRECONDITION - if it failed, the reference below would be junk. */
+            rt_source_stop(cs, hk);
+            rt_source_play(cs, hs, r1, true);
+            rt_commit(cs);
+            for (int b = 0; b < 4; ++b) rt_render(cs, bus, N, &th);
+            const double e3_replay = chan_energy(3);
+            CHECK(rt_source_is_playing(cs, hs) && e3_replay > 0.1,
+                  "held group: the same source re-plays the same asset");
+            CHECK(e3_stopped < e3_replay * 0.15,
+                  "held group: ...so the dropped play really was silent, not just quiet");
+
+            /* A RECYCLED slot must not inherit its predecessor's group, or a group stop would sweep
+             * held plays the new owner never put in that group. The free-list is LIFO, so the
+             * destroy below hands this exact slot straight back. */
+            rt_source_set_group(cs, hs, 5);
+            rt_source_destroy(cs, hs);
+            uint32_t hn = rt_source_create(cs);
+            CHECK(hn != 0 && BWA_H_IDX(hn) == BWA_H_IDX(hs), "held group: the recycled slot came back");
+            set_pos_spk(cs, hn, 3);                /* left in group 0: never told a group at all */
+            uint32_t r3 = rt_sound_reserve(cs, err, sizeof err);
+            rt_source_play(cs, hn, r3, true);      /* HELD */
+            rt_commit(cs); render2(cs);
+            rt_group_stop(cs, 5);                  /* the PREVIOUS occupant's group */
+            SoundData p3 = make_test_pcm(1, 8 * N, 0.5f);
+            CHECK(rt_sound_publish(cs, r3, &p3), "held group: publish for the recycled slot");
+            rt_commit(cs);
+            for (int b = 0; b < 4; ++b) rt_render(cs, bus, N, &th);
+            CHECK(rt_source_is_playing(cs, hn),
+                  "held group: a recycled slot does not inherit its predecessor's group");
+
+            /* The group also travels inside rt_source_apply_cfg (bwa_source_apply, the bulk path
+             * every binding uses at create), so the mirror has to move there too. Otherwise a
+             * source configured in bulk is invisible to the held-play sweep while its VOICE stops
+             * normally - the worst shape of this bug, since it only shows on async assets. */
+            uint32_t ha = rt_source_create(cs);
+            CHECK(ha != 0, "held group: apply_cfg source");
+            RtSrcCfg acfg; memset(&acfg, 0, sizeof acfg);
+            acfg.gain = 1.f; acfg.pitch = 1.f; acfg.group = 3;
+            rt_source_apply_cfg(cs, ha, &acfg);
+            set_pos_spk(cs, ha, 3);
+            uint32_t r4 = rt_sound_reserve(cs, err, sizeof err);
+            rt_source_play(cs, ha, r4, true);      /* HELD */
+            rt_commit(cs); render2(cs);
+            rt_group_stop(cs, 3);
+            SoundData p4 = make_test_pcm(1, 8 * N, 0.5f);
+            CHECK(rt_sound_publish(cs, r4, &p4), "held group: publish for the apply_cfg source");
+            rt_commit(cs);
+            for (int b = 0; b < 4; ++b) rt_render(cs, bus, N, &th);
+            CHECK(!rt_source_is_playing(cs, ha),
+                  "held group: a group set through rt_source_apply_cfg is swept too");
+
+            rt_source_destroy(cs, ha);
+            rt_source_destroy(cs, hn); rt_source_destroy(cs, hk);
+            rt_commit(cs);
+            rt_destroy(cs);
+        }
+    }
+
+    /* ROLLBACK on a full command ring. rt_group_stop pushes FIRST and only then drops the held
+     * plays, for the reason rt_stop_all states: a refused push means the stop never reaches the
+     * audio thread, and clearing first would leave a half-effect (voices still playing, pending
+     * plays silently gone) that the caller has no way to see. So a refused group stop is a whole
+     * no-op, held plays included. */
+    {
+        RtCore* cf = rt_create(8, 8, RATE, CH);
+        CHECK(cf != NULL, "rt_create (group stop, full ring)");
+        if (cf) {
+            bwa_timestamp tf = { 0, 0 };
+            uint32_t rf = rt_sound_reserve(cf, err, sizeof err);
+            uint32_t hf = rt_source_create(cf);
+            CHECK(rf && hf, "full ring: reserve + source");
+            set_pos_spk(cf, hf, 3);
+            rt_source_set_group(cf, hf, 1);
+            rt_source_play(cf, hf, rf, true);      /* HELD */
+            rt_commit(cf); render2(cf);            /* drained: the ring starts empty */
+
+            /* Fill it. The count is deliberately past any plausible RING_CAP, and the refusal is
+             * then CHECKED rather than assumed - a ring that silently grew would turn the whole
+             * block into a test of the ordinary path. rt_source_create_stream reports a full ring
+             * before it touches anything else, so the probe costs nothing. */
+            for (int i = 0; i < 6000; ++i) rt_source_set_gain(cf, hf, 0.5f);
+            CHECK(rt_source_create_stream(cf, err, sizeof err) == 0, "full ring: the ring really is full");
+
+            rt_group_stop(cf, 1);                  /* refused: CMD_GROUP_STOP cannot be pushed */
+
+            for (int b = 0; b < 2; ++b) rt_render(cf, bus, N, &tf);   /* drain, so the bind can land */
+            SoundData pf = make_test_pcm(1, 8 * N, 0.5f);
+            CHECK(rt_sound_publish(cf, rf, &pf), "full ring: publish under the held play");
+            rt_commit(cf);
+            for (int b = 0; b < 4; ++b) rt_render(cf, bus, N, &tf);
+            CHECK(rt_source_is_playing(cf, hf),
+                  "full ring: a refused group stop drops no held play (no half-effect)");
+            CHECK(chan_energy(3) > 0.1, "full ring: ...and the play is audible");
+
+            rt_source_destroy(cf, hf);
+            rt_commit(cf);
+            rt_destroy(cf);
         }
     }
 
@@ -819,6 +1004,47 @@ int main(void) {
             rt_source_destroy(cq, h2);
             rt_render(cq, bus, N, &ts);
             CHECK(rt_source_get_position(cq, h2) == 0, "a destroyed handle's position reads 0");
+
+            /* The same destroy WITHOUT an intervening block. The assertion just above renders first,
+             * so the audio thread has already consumed CMD_SRC_DESTROY and republished a zero — it
+             * cannot see a readback that trusts the stale publish, and for that reason it passed
+             * against the bug. Here the last published word still names this handle and still
+             * carries its generation, so only the control-side liveness gate can answer.
+             * The voice is driven 3 blocks in first so the margin is real: a readback that trusts
+             * the publish reports 3N, never a 0 it arrived at by accident. */
+            uint32_t h3 = rt_source_create(cq);
+            rt_source_set_pos(cq, h3, 1.f, 0.f, 1.f);
+            rt_source_play(cq, h3, sq, true);          /* looping, so it cannot end on its own */
+            rt_commit(cq);
+            for (int b = 0; b < 3; ++b) rt_render(cq, bus, N, &ts);
+            CHECK(rt_source_get_position(cq, h3) == (uint64_t)3 * N,
+                  "a live voice's position advances with the rendered blocks");
+            CHECK(rt_source_is_playing(cq, h3), "...and that live voice reads as playing");
+            rt_source_destroy(cq, h3);                 /* no render: the publish still names h3 */
+            CHECK(rt_source_get_position(cq, h3) == 0,
+                  "a destroyed handle's position reads 0 BEFORE the next block");
+            CHECK(!rt_source_is_playing(cq, h3),
+                  "a destroyed handle reads not-playing before the next block");
+            CHECK(!rt_source_is_playing(cq, h3) && rt_source_get_position(cq, h3) == 0,
+                  "the two readbacks agree about a dead handle");
+            rt_render(cq, bus, N, &ts);                /* let the audio thread retire the slot */
+
+            /* The contract the gate must NOT break: a voice that ENDED naturally still owns its
+             * handle, so it keeps reporting its final cursor. Same read with no render in between,
+             * to prove the gate lets a live-but-finished handle through rather than passing only
+             * because a block happened to run. 5N of content, non-loop. */
+            uint32_t h4 = rt_source_create(cq);
+            rt_source_set_pos(cq, h4, 1.f, 0.f, 1.f);
+            rt_source_play(cq, h4, sq, false);
+            rt_commit(cq);
+            for (int b = 0; b < 7; ++b) rt_render(cq, bus, N, &ts);   /* 7N > the 5N of content */
+            CHECK(!rt_source_is_playing(cq, h4), "the non-loop voice ended");
+            CHECK(rt_source_get_position(cq, h4) == (uint64_t)5 * N,
+                  "a voice that ENDED but was not destroyed keeps reporting its final position");
+            rt_source_destroy(cq, h4);
+            CHECK(rt_source_get_position(cq, h4) == 0,
+                  "...and reads 0 once that same handle is destroyed");
+            rt_render(cq, bus, N, &ts);
             rt_destroy(cq);
             remove("bwa_rt_seek.wav");
         } else if (cq) { CHECK(0, "write seek wav"); rt_destroy(cq); }
@@ -852,6 +1078,294 @@ int main(void) {
             rt_destroy(cr);
             remove("bwa_rt_loopreg.wav");
         } else if (cr) { CHECK(0, "write loop-region wav"); rt_destroy(cr); }
+    }
+
+    /* PLAY REGION (rt_source_set_region), set on an already-playing voice. Same two fields the
+     * play-time loop region resolves into, so the tests sit together: a NON-looping voice must END at
+     * the region end (early, and reported like any completion), a LOOPING one must wrap to the region
+     * start, a seek must land INSIDE the region, and a degenerate pair must be refused rather than
+     * reinterpreted. A 5N const sound throughout, so an end is only ever the region doing it. */
+    {
+        RtCore* cg = rt_create(4, 4, RATE, CH);
+        CHECK(cg != NULL, "rt_create (play region)");
+        if (cg && write_const_wav("bwa_rt_region.wav", 0.6f, 5 * N)) {
+            uint32_t sg = rt_load_sound(cg, "bwa_rt_region.wav", err, sizeof err);
+            bwa_timestamp ts = { 0, 0 };
+            /* (a) non-looping: the region end ends the voice, three blocks early. The control voice
+             *     (same asset, no region) is what makes this a real assertion rather than a race. */
+            uint32_t h  = rt_source_create(cg);
+            uint32_t hc = rt_source_create(cg);
+            rt_source_set_pos(cg, h,  1.f, 0.f, 1.f);
+            rt_source_set_pos(cg, hc, 1.f, 0.f, 1.f);
+            rt_source_play(cg, h,  sg, false);
+            rt_source_play(cg, hc, sg, false);
+            rt_source_set_region(cg, h, 0, (uint64_t)(2 * N));
+            rt_commit(cg);
+            rt_render(cg, bus, N, &ts);
+            rt_render(cg, bus, N, &ts);
+            CHECK(rt_source_is_playing(cg, h), "region: still playing through the region");
+            rt_render(cg, bus, N, &ts);                          /* cursor hit 2N: ends here */
+            CHECK(!rt_source_is_playing(cg, h), "region: a non-looping voice ENDS at end_frame");
+            CHECK(rt_source_is_playing(cg, hc), "region: the un-regioned control voice plays on (5N asset)");
+            rt_commit(cg);
+            uint32_t ev[16]; uint64_t drop = 0;
+            uint32_t ne = rt_poll_ended(cg, ev, 16, &drop);
+            CHECK(ne == 1 && ev[0] == h, "region: the early end reports through rt_poll_ended");
+
+            /* (b) looping: a region set mid-play wraps the cursor to start_frame, not to 0 */
+            uint32_t h2 = rt_source_create(cg);
+            rt_source_set_pos(cg, h2, 1.f, 0.f, 1.f);
+            rt_source_play(cg, h2, sg, true);
+            rt_commit(cg);
+            rt_render(cg, bus, N, &ts);                          /* 0 -> N */
+            rt_source_set_region(cg, h2, (uint64_t)N, (uint64_t)(3 * N));
+            rt_commit(cg);
+            rt_render(cg, bus, N, &ts);                          /* N -> 2N */
+            rt_render(cg, bus, N, &ts);                          /* 2N -> 3N (the region end) */
+            rt_render(cg, bus, N, &ts);                          /* wraps to N, then N -> 2N */
+            CHECK(rt_source_get_position(cg, h2) == (uint64_t)(2 * N),
+                  "region: a looping voice wraps to start_frame (=> 2N), not to 0 (would read N)");
+
+            /* (c) a seek below the region start clamps UP into the region */
+            rt_source_seek(cg, h2, 0);
+            rt_commit(cg);
+            rt_render(cg, bus, N, &ts);                          /* gate ramps out */
+            rt_render(cg, bus, N, &ts);                          /* seek lands at N, then N -> 2N */
+            CHECK(rt_source_get_position(cg, h2) == (uint64_t)(2 * N),
+                  "region: seek(0) clamps to start_frame (=> 2N; unclamped would read N)");
+
+            /* (d) a degenerate end <= start is refused, so the region above still holds */
+            rt_source_set_region(cg, h2, (uint64_t)(3 * N), (uint64_t)N);
+            rt_commit(cg);
+            /* "inside [N, 3N]" alone would be a coin flip: had the pair been ACCEPTED, the region
+             * would resolve to [0, N) and every block would land the cursor on exactly N, which is
+             * inside. So also demand a position ABOVE N, which only the untouched [N, 3N) produces. */
+            int inside = 1, above = 0;
+            for (int b = 0; b < 24; ++b) {
+                rt_render(cg, bus, N, &ts);
+                uint64_t pp = rt_source_get_position(cg, h2);
+                if (pp < (uint64_t)N || pp > (uint64_t)(3 * N)) inside = 0;
+                if (pp > (uint64_t)N) above = 1;
+            }
+            CHECK(inside && above, "region: a degenerate end <= start is refused (the live region is untouched)");
+
+            /* (e) a BED honors the same region. mix_bed resolves the identical loop_beg/loop_end
+             *     fields, so bwa_bed_set_region is an alias and not a new mechanism - but the mixer
+             *     dispatches on the ASSET's channel count, so every assertion above ran through
+             *     mix_voice and none of them would notice mix_bed losing the region. Same block
+             *     schedule as (b), so the same 2N answer means the same thing; a bed that ignored
+             *     the region would loop the whole 5N clip and read 4N. */
+            uint32_t rbed = rt_sound_reserve(cg, err, sizeof err);
+            SoundData bed4 = make_test_pcm(4, 5 * N, 0.25f);
+            CHECK(rbed != 0 && rt_sound_publish(cg, rbed, &bed4), "region: publish a 4-ch bed asset");
+            uint32_t hb = rt_source_create(cg);
+            rt_bed_play(cg, hb, rbed, true);                     /* looping bed, whole clip */
+            rt_commit(cg);
+            rt_render(cg, bus, N, &ts);                          /* 0 -> N */
+            rt_source_set_region(cg, hb, (uint64_t)N, (uint64_t)(3 * N));
+            rt_commit(cg);
+            rt_render(cg, bus, N, &ts);                          /* N -> 2N */
+            rt_render(cg, bus, N, &ts);                          /* 2N -> 3N (the region end) */
+            rt_render(cg, bus, N, &ts);                          /* wraps to N, then N -> 2N */
+            CHECK(rt_source_get_position(cg, hb) == (uint64_t)(2 * N),
+                  "region: a looping BED wraps to start_frame (=> 2N); ignoring it would read 4N");
+
+            rt_destroy(cg);
+            remove("bwa_rt_region.wav");
+        } else if (cg) { CHECK(0, "write region wav"); rt_destroy(cg); }
+    }
+
+    /* REGION CATCH-UP: a region set with the cursor FAR past the new end. Before rt_source_set_region
+     * existed the cursor could only ever sit a few frames past the seam (pitch overshoot), so the
+     * mixer walked the skip one span at a time and that walk was bounded. A region change breaks the
+     * bound: the walk becomes (cursor - start) / span iterations inside ONE bufferSwitch, each
+     * posting a loop notice. An hour-long loop at 48k re-regioned to one frame is order 1e8 of them,
+     * which is seconds of stall on the audio thread plus millions of fabricated wrap events.
+     *
+     * The failure is a stall and a flood, not a wrong sample, so the two OBSERVABLE consequences are
+     * what get pinned: where the cursor lands, and how many wraps the catch-up reports.
+     *
+     * Read the cursor assertion honestly. The modulo IS the walk's answer, so for mix_voice it holds
+     * either way and only guards the rewrite. It is a real discriminator for mix_bed, which used to
+     * slam the cursor to start_frame and throw the remainder away - the two mixers now answer the
+     * same call the same way. The EVENT count is the assertion that goes red against the old walk. */
+    {
+        RtCore* cf = rt_create(4, 4, RATE, CH);
+        CHECK(cf != NULL, "rt_create (region catch-up)");
+        if (cf) {
+            bwa_timestamp ts = { 0, 0 };
+            const uint32_t LONG = 120000u;          /* 2.5 s: 400+ spans of headroom past the park */
+            const uint32_t PARK = 100000u;
+            const uint32_t SPAN = 300u;             /* > one block, so ordinary playback adds <= 2 wraps */
+            uint32_t ev[32]; uint64_t d0 = 0, d1 = 0;
+
+            /* (a) point source */
+            uint32_t rl = rt_sound_reserve(cf, err, sizeof err);
+            SoundData lp = make_test_pcm(1, LONG, 0.5f);
+            CHECK(rl != 0 && lp.pcm != NULL && rt_sound_publish(cf, rl, &lp),
+                  "catch-up: publish the long mono asset");
+            uint32_t hv = rt_source_create(cf);
+            set_pos_spk(cf, hv, 7);
+            rt_source_play(cf, hv, rl, true);       /* looping, whole clip */
+            rt_source_seek(cf, hv, (uint64_t)PARK); /* park the cursor deep, without rendering 390 blocks */
+            rt_commit(cf);
+            rt_render(cf, bus, N, &ts);             /* gate ramps out */
+            rt_render(cf, bus, N, &ts);             /* the seek lands, then plays on */
+            const uint64_t parked = rt_source_get_position(cf, hv);
+            CHECK(parked >= (uint64_t)PARK, "catch-up: the cursor really is parked deep in the asset");
+            rt_commit(cf);
+            rt_poll_looped(cf, ev, 32, &d0);        /* clear the slate; d0 = the running dropped total */
+
+            rt_source_set_region(cf, hv, 0, (uint64_t)SPAN);
+            rt_commit(cf);
+            rt_render(cf, bus, N, &ts);             /* THE catch-up block */
+            rt_commit(cf);
+            uint32_t nf = rt_poll_looped(cf, ev, 32, &d1);
+            const uint64_t posted = (uint64_t)nf + (d1 - d0);   /* drained + everything the rings refused,
+                                                                 * so a flood cannot hide in a drop counter */
+            const uint32_t r  = (uint32_t)(parked % SPAN);
+            const uint32_t xp = ((r + (N - 1)) % SPAN) + 1;     /* wrap once, then advance the block */
+            printf("region catch-up: %llu wrap notice(s) for a %llu-span skip\n",
+                   (unsigned long long)posted, (unsigned long long)(parked / SPAN));
+            CHECK(posted >= 1 && posted <= 3,
+                  "catch-up: the skip reports ONE wrap (+ <= 2 from real playback), not one per span");
+            CHECK(rt_source_get_position(cf, hv) == (uint64_t)xp,
+                  "catch-up: the cursor lands on start + (cursor - start) mod span");
+
+            /* (b) the same call on a BED. mix_bed used to answer it differently (cursor = start_frame,
+             *     remainder discarded), which is only visible here: in ordinary playback a bed lands
+             *     exactly on the region end and the remainder is 0. */
+            uint32_t rb2 = rt_sound_reserve(cf, err, sizeof err);
+            SoundData bp = make_test_pcm(4, LONG, 0.25f);
+            CHECK(rb2 != 0 && bp.pcm != NULL && rt_sound_publish(cf, rb2, &bp),
+                  "catch-up: publish the long bed asset");
+            uint32_t hb2 = rt_source_create(cf);
+            rt_bed_play(cf, hb2, rb2, true);
+            rt_source_seek(cf, hb2, (uint64_t)PARK);
+            rt_commit(cf);
+            rt_render(cf, bus, N, &ts);
+            rt_render(cf, bus, N, &ts);
+            const uint64_t bparked = rt_source_get_position(cf, hb2);
+            CHECK(bparked >= (uint64_t)PARK, "catch-up: the bed cursor is parked deep too");
+            rt_source_set_region(cf, hb2, 0, (uint64_t)SPAN);
+            rt_commit(cf);
+            rt_render(cf, bus, N, &ts);
+            const uint32_t br = (uint32_t)(bparked % SPAN);
+            const uint32_t bxp = ((br + (N - 1)) % SPAN) + 1;
+            CHECK(br != 0, "catch-up: the bed park leaves a non-zero remainder (else this cannot fail)");
+            CHECK(rt_source_get_position(cf, hb2) == (uint64_t)bxp,
+                  "catch-up: a BED keeps the remainder too (discarding it would read N)");
+            rt_destroy(cf);
+        }
+    }
+
+    /* The other side of that bound: ordinary playback still reports EVERY wrap. At the pitch ceiling
+     * (4.0) the cursor advances 4 frames per sample, so a 1-frame region genuinely wraps 4 times
+     * between two seam tests and bwa_poll_looped owes all 4. This is the case the catch-up collapse
+     * must not swallow, and it is the only place the per-sample bound is exercised (the 100-frame
+     * region above wraps at most once per crossing whatever the pitch). */
+    {
+        RtCore* cp = rt_create(4, 4, RATE, CH);
+        CHECK(cp != NULL, "rt_create (per-wrap at pitch)");
+        if (cp) {
+            bwa_timestamp ts = { 0, 0 };
+            uint32_t rp = rt_sound_reserve(cp, err, sizeof err);
+            SoundData pp = make_test_pcm(1, 8 * N, 0.5f);
+            CHECK(rp != 0 && pp.pcm != NULL && rt_sound_publish(cp, rp, &pp), "per-wrap: publish the asset");
+            uint32_t hp = rt_source_create(cp);
+            set_pos_spk(cp, hp, 7);
+            rt_source_play(cp, hp, rp, true);
+            rt_source_set_pitch(cp, hp, 4.f);                  /* the clamp ceiling: 4 frames per sample */
+            rt_source_set_region(cp, hp, 0, 1);                /* the shortest legal region: span 1 */
+            rt_commit(cp);
+            rt_render(cp, bus, N, &ts);                        /* the pitch glide settles within one block */
+            rt_render(cp, bus, N, &ts);
+            rt_commit(cp);
+            uint32_t ev[32]; uint64_t d0 = 0, d1 = 0;
+            rt_poll_looped(cp, ev, 32, &d0);
+            rt_render(cp, bus, N, &ts);                        /* one settled block at pitch 4 */
+            rt_commit(cp);
+            uint32_t np = rt_poll_looped(cp, ev, 32, &d1);
+            const uint64_t posted = (uint64_t)np + (d1 - d0);
+            printf("per-wrap at pitch 4: %llu notices in one %d-frame block over a 1-frame region\n",
+                   (unsigned long long)posted, N);
+            /* 4 per sample over 256 samples = 1024. Both sides: coalescing to one per crossing reads
+             * 256, and collapsing the whole block reads 1, so the floor is what carries the test;
+             * the ceiling catches a runaway that stopped being bounded at all. */
+            CHECK(posted >= 900 && posted <= 1100,
+                  "per-wrap: pitch 4 over a 1-frame region reports ~4 wraps per sample, not 1");
+            rt_destroy(cp);
+        }
+    }
+
+    /* LOOP-BOUNDARY EVENT (rt_poll_looped). The gap it fills: a looping voice never ends, so
+     * rt_poll_ended reports it exactly never. The load-bearing property is that the notice is PER
+     * WRAP, not per block or per poll - the region here is 100 frames inside a 256-frame block, so
+     * one block must produce TWO wraps. Per-block coalescing would read 1 and this goes red. */
+    {
+        RtCore* cl = rt_create(4, 4, RATE, CH);
+        CHECK(cl != NULL, "rt_create (loop events)");
+        if (cl && write_const_wav("bwa_rt_loopev.wav", 0.5f, 5 * N)) {
+            uint32_t sl = rt_load_sound(cl, "bwa_rt_loopev.wav", err, sizeof err);
+            bwa_timestamp ts = { 0, 0 };
+            uint32_t h  = rt_source_create(cl);
+            uint32_t hn = rt_source_create(cl);                  /* a NON-looping control voice */
+            rt_source_set_pos(cl, h,  1.f, 0.f, 1.f);
+            rt_source_set_pos(cl, hn, 1.f, 0.f, 1.f);
+            rt_source_play_loop(cl, h, sl, 0, 100);              /* region [0, 100): 2 wraps per block */
+            rt_source_play(cl, hn, sl, false);
+            rt_commit(cl);
+            rt_render(cl, bus, N, &ts);
+            rt_commit(cl);                                       /* the drain rt_poll_looped reads from */
+            uint32_t ev[16]; uint64_t drop = 99;
+            uint32_t n1 = rt_poll_looped(cl, ev, 16, &drop);
+            printf("loop events: %u wrap(s) in one 256-frame block over a 100-frame region\n", n1);
+            CHECK(n1 == 2, "loop event: TWO wraps in one block are reported as two events (not coalesced)");
+            CHECK(n1 > 0 && ev[0] == h, "loop event: the handle comes back as the caller knows it");
+            CHECK(drop == 0, "loop event: nothing dropped at this depth");
+            CHECK(rt_poll_looped(cl, ev, 16, NULL) == 0, "loop event: a drained queue reads empty");
+            CHECK(rt_poll_ended(cl, ev, 16, NULL) == 0, "loop event: a wrap is NOT a completion (poll_ended empty)");
+
+            /* cap 0 / NULL out must not DRAIN, exactly like rt_poll_ended */
+            rt_render(cl, bus, N, &ts);
+            rt_commit(cl);
+            CHECK(rt_poll_looped(cl, ev, 0, &drop) == 0 && rt_poll_looped(cl, NULL, 16, NULL) == 0,
+                  "loop event: cap 0 / NULL out read nothing");
+            CHECK(rt_poll_looped(cl, ev, 16, NULL) >= 2,   /* 3 here; the count is block-phase dependent */
+                  "loop event: and did not consume the events");
+
+            /* the non-looping control voice runs to its natural end and reports a COMPLETION, never
+             * a wrap - so the two events cannot be the same event wearing two names */
+            for (int b = 0; b < 8; ++b) rt_render(cl, bus, N, &ts);
+            rt_commit(cl);
+            uint32_t nl = rt_poll_looped(cl, ev, 16, NULL);
+            int saw_hn = 0;
+            for (uint32_t i = 0; i < nl; ++i) if (ev[i] == hn) saw_hn = 1;
+            CHECK(!saw_hn, "loop event: a non-looping voice never reports a wrap");
+            uint32_t ne2 = rt_poll_ended(cl, ev, 16, NULL);
+            int saw_end = 0;
+            for (uint32_t i = 0; i < ne2; ++i) if (ev[i] == hn) saw_end = 1;
+            CHECK(saw_end, "loop event: the non-looping voice reported its completion instead");
+
+            /* a REGION loop wraps at the region out-point and must fire the same event */
+            uint32_t h3 = rt_source_create(cl);
+            rt_source_set_pos(cl, h3, 1.f, 0.f, 1.f);
+            rt_source_play(cl, h3, sl, true);
+            rt_commit(cl);
+            rt_render(cl, bus, N, &ts);
+            rt_commit(cl);
+            rt_poll_looped(cl, ev, 16, NULL);                    /* clear whatever the 5N asset owes */
+            rt_source_set_region(cl, h3, 0, 120);                /* wrap at 120, well inside a block */
+            rt_commit(cl);
+            rt_render(cl, bus, N, &ts);
+            rt_commit(cl);
+            uint32_t nr = rt_poll_looped(cl, ev, 16, NULL);
+            int saw_h3 = 0;
+            for (uint32_t i = 0; i < nr; ++i) if (ev[i] == h3) saw_h3 = 1;
+            CHECK(saw_h3, "loop event: a set_region loop wraps at the region out-point and fires");
+            rt_destroy(cl);
+            remove("bwa_rt_loopev.wav");
+        } else if (cl) { CHECK(0, "write loop-event wav"); rt_destroy(cl); }
     }
 
     /* scheduled STOP (rt_source_stop_at): when the dsp clock reaches stop_at the voice takes the
@@ -1033,7 +1547,7 @@ int main(void) {
      * refuses the mismatch at the call itself (the asset cache knows the load flags); this is the
      * backstop under that, so it is driven straight at rt where a mismatch can be constructed. */
     {
-        RtCore* ck = rt_create(4, 6, RATE, CH);
+        RtCore* ck = rt_create(8, 8, RATE, CH);   /* one voice per case below; a full pool would STEAL */
         CHECK(ck != NULL, "rt_create (async kind)");
         if (ck) {
             bwa_timestamp ts = { 0, 0 };
@@ -1086,6 +1600,59 @@ int main(void) {
             rt_render(ck, bus, N, &ts); rt_render(ck, bus, N, &ts);
             CHECK(rt_held_kind_drops(ck) == drops0 + 2, "async kind: a matching bed publish drops nothing");
             CHECK(rt_source_is_playing(ck, hok2), "async kind: a bed on a bed voice binds and plays");
+
+            /* 4. rt_bed_play_loop carries the kind too. The region play used to hardcode POINT
+             *    SOURCE, so a bed region issued against a still-decoding asset would land here as a
+             *    mismatch and be dropped - silently, and only in the async case. */
+            uint32_t rok3 = rt_sound_reserve(ck, err, sizeof err);
+            uint32_t hok3 = rt_source_create(ck);
+            rt_bed_play_loop(ck, hok3, rok3, 0, (uint64_t)(2 * N));
+            SoundData ok4b = make_test_pcm(4, 4 * N, 0.25f);
+            CHECK(rt_sound_publish(ck, rok3, &ok4b), "async kind: publish a bed for the bed REGION play");
+            rt_commit(ck);
+            rt_render(ck, bus, N, &ts); rt_render(ck, bus, N, &ts);
+            CHECK(rt_held_kind_drops(ck) == drops0 + 2, "async kind: a held bed REGION play is not a kind mismatch");
+            CHECK(rt_source_is_playing(ck, hok3), "async kind: ...and it binds and plays");
+
+            /* 5. a REGION set while the play is still HELD. Every layer documents the order "play,
+             *    THEN set the region" (the bounds resolve against the bound asset), but a held play
+             *    has not reached the audio thread: the command would be consumed against a voice
+             *    with no sound bound, and the adoption's bind would then reset both fields from the
+             *    play call. So the region has to ride with the held play.
+             *    Deterministic by construction, not by timing: the slot stays reserved until
+             *    rt_sound_publish runs on this very line, so the play below is GUARANTEED held. */
+            uint32_t rr = rt_sound_reserve(ck, err, sizeof err);
+            uint32_t hr = rt_source_create(ck);
+            CHECK(rr != 0 && hr != 0, "held region: reserve + source");
+            set_pos_spk(ck, hr, 7);
+            rt_source_play(ck, hr, rr, true);                     /* HELD: the slot is still empty */
+            rt_source_set_region(ck, hr, 0, (uint64_t)(2 * N));    /* the documented order */
+            SoundData ok1b = make_test_pcm(1, 8 * N, 0.5f);
+            CHECK(rt_sound_publish(ck, rr, &ok1b), "held region: publish mono under the held play");
+            rt_commit(ck);
+            rt_render(ck, bus, N, &ts);                           /* 0 -> N */
+            rt_render(ck, bus, N, &ts);                           /* N -> 2N, the region end */
+            rt_render(ck, bus, N, &ts);                           /* wraps to 0, then 0 -> N */
+            CHECK(rt_source_is_playing(ck, hr), "held region: the held play bound and runs");
+            CHECK(rt_source_get_position(ck, hr) == (uint64_t)N,
+                  "held region: the region survives the adoption (=> N; a lost region reads 3N)");
+
+            /* 6. a SEEK issued against a held play had the same hole and takes the same route: it
+             *    replays after the bind, so the audio thread sees exactly the ring order a
+             *    synchronous play-then-seek produces. */
+            uint32_t rs2 = rt_sound_reserve(ck, err, sizeof err);
+            uint32_t hs2 = rt_source_create(ck);
+            CHECK(rs2 != 0 && hs2 != 0, "held seek: reserve + source");
+            set_pos_spk(ck, hs2, 7);
+            rt_source_play(ck, hs2, rs2, true);                   /* HELD */
+            rt_source_seek(ck, hs2, (uint64_t)(4 * N));
+            SoundData ok1c = make_test_pcm(1, 8 * N, 0.5f);
+            CHECK(rt_sound_publish(ck, rs2, &ok1c), "held seek: publish mono under the held play");
+            rt_commit(ck);
+            rt_render(ck, bus, N, &ts);                           /* gate ramps out (seek pending) */
+            rt_render(ck, bus, N, &ts);                           /* the seek lands at 4N, then 4N -> 5N */
+            CHECK(rt_source_get_position(ck, hs2) == (uint64_t)(5 * N),
+                  "held seek: the seek survives the adoption (=> 5N; a lost seek reads 2N)");
             rt_destroy(ck);
         }
     }
@@ -1095,6 +1662,7 @@ int main(void) {
     printf("rt_core_test OK (rt_create bound, DBAP+commit+gen-drop, gain, occlusion/EQ/directivity, "
            "channel-test, master+groups+fades+global-pause, runtime-channel-count, voice-steal+priority, "
            "scheduled-play, clock-pair, streaming, push-sources+steal+parked-retire, pause/seek, "
-           "loop-region, scheduled-stop, gapless-chaining, position-readback, limiter, bus-meter verified)\n");
+           "loop-region, play-region, region-catch-up, loop-boundary-events, scheduled-stop, gapless-chaining, "
+           "position-readback, limiter, bus-meter, held-play region+seek verified)\n");
     return 0;
 }

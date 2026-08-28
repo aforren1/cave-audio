@@ -8,6 +8,9 @@
  *                                    or level/tilt a capture (pitch/roll)
  *   bwa_set_bed_renderer             matrix decode vs parametric (DirAC) — live A/B
  *   bwa_set_max_re                   max-rE decode weighting — live A/B
+ *   bwa_bed_play_at / _play_loop     a bed IS a voice: the scheduled start and the intro->loop
+ *   bwa_bed_set_region / _stop_at    region, and the scheduled click-free stop, bed-typed
+ *   bwa_poll_looped                  a looping voice never ends, so the WRAP is the event
  *
  * No assets needed: a 3rd-order AmbiX wav is synthesized (pink bursts from the FRONT, a click
  * train from the LEFT-UP, a low diffuse floor), plus the SAME field written in FuMa channel
@@ -127,6 +130,17 @@ static void ambix_to_fuma(const float* ambi, float* fuma, uint32_t frames) {
 static int g_tests = 0;
 static int ticks(int n) { return g_tests ? (n < 8 ? 1 : n / 8) : n; }
 
+/* Part 7 is self-checking: the A/Bs above are for your ears, but a scheduled start, a play
+ * region and a scheduled stop each have a definite right answer, so ctest running this catches a
+ * broken one instead of only a crash. Each check below is demanded with a MARGIN over what the
+ * broken mechanism would produce, because a check whose two sides both land near zero when the
+ * mechanism breaks is a coin flip. */
+static int g_bad = 0;
+static void check(int ok, const char* what) {
+    printf("   %-52s %s\n", what, ok ? "ok" : "FAILED");
+    if (!ok) ++g_bad;
+}
+
 /* run `secs` of the demo loop: per-frame commit, like an engine tick */
 static void run(bwa_engine* e, double secs, const char* msg) {
     if (msg) printf("%s\n", msg);
@@ -200,6 +214,66 @@ int main(int argc, char** argv) {
     bwa_bed_play(e, bed, legacy, true);                /* the FuMa load of the SAME field */
     run(e, 5, "6) the FuMa-loaded copy - converted at load, it should sound identical to (1)");
 
+    /* ---- 7) the bed's PLAYBACK surface: a bed is a voice, so it has the whole of one ----
+     * Every call here is the bwa_source_* call of the same name under the bed prefix, so bed code
+     * never mixes prefixes. They are separate entry points rather than aliases because the
+     * multichannel-asset check runs the other way round: these DEMAND a 4/9/16-ch asset where the
+     * bwa_source_* forms refuse one.
+     *
+     * This part is CHECKED (see check() above): unlike the A/Bs, each claim has a definite answer.
+     * The waits below are real Sleeps rather than run(), because what is being timed is the
+     * engine's own clock and compressing it would test nothing. */
+    printf("\n7) the bed's playback surface (scheduled start, play region, loop events, scheduled stop)\n");
+
+    /* 7a) bwa_bed_play_at: silent until the dsp clock reaches start_sample. Same time base as
+     *     bwa_source_play_at, so "now" comes from bwa_get_dsp_time_frames. */
+    bwa_bed_stop(e, bed);
+    for (int t = 0; t < 12; ++t) { bwa_commit(e); Sleep(16); }
+    bwa_bed_play_at(e, bed, field, true, bwa_get_dsp_time_frames(e) + RATE / 2);   /* 0.5 s out */
+    for (int t = 0; t < 9; ++t) { bwa_commit(e); Sleep(16); }                      /* ~0.15 s in */
+    uint64_t held = bwa_bed_get_playhead_frames(e, bed);
+    /* A play_at wired to the unscheduled call would be ~7000 frames in by now, so 0 is not a
+     * coin flip. The bound is generous: anything past the first block means it did not hold. */
+    check(held < 256, "bwa_bed_play_at held the field silent until its start sample");
+    for (int t = 0; t < 30; ++t) { bwa_commit(e); Sleep(16); }                     /* past the lead */
+    check(bwa_bed_get_playhead_frames(e, bed) > 0, "...and started once the clock reached it");
+
+    /* 7b) bwa_bed_set_region + bwa_poll_looped: bound the bed to [start, end) content frames. A
+     *     looping voice never ENDS, so bwa_poll_ended reports it exactly never; the wrap is the
+     *     event you get, one entry per wrap, drained after the commit that fills it. Set the
+     *     region AFTER the play - a play resolves the bounds against the asset and resets it. */
+    bwa_bed_play(e, bed, field, true);
+    bwa_bed_set_region(e, bed, 0, RATE / 5);                   /* the field's first 200 ms */
+    /* Drain first, and count only after. Both rings are ENGINE-WIDE and DESTRUCTIVE, and nothing
+     * above drained the loop one, so every wrap the parts above produced is still queued --
+     * counted here they would let this check pass on a region that never took. Drain what you
+     * did not ask for before you measure what you did. */
+    { bwa_source flush[64]; while (bwa_poll_looped(e, flush, 64, NULL) == 64) { } }
+    int wraps = 0;
+    for (int t = 0; t < 63; ++t) {                             /* ~1 s at a 16 ms tick */
+        bwa_commit(e);
+        bwa_source hit[16];
+        uint32_t n = bwa_poll_looped(e, hit, 16, NULL);
+        for (uint32_t i = 0; i < n; ++i) if (hit[i] == bed) ++wraps;
+        Sleep(16);
+    }
+    printf("   %d wraps of a 200 ms region in ~1 s\n", wraps);
+    /* ~5 expected. Demanded with a margin: the field is 4 s long, so a region that never reached
+     * the core gives exactly 0 here and a ">0" check would prove nothing about the region. */
+    check(wraps >= 3, "bwa_poll_looped reported the bed's wraps");
+
+    /* 7c) bwa_bed_stop_at: the scheduled click-free stop, same time base again. */
+    bwa_bed_stop_at(e, bed, bwa_get_dsp_time_frames(e) + RATE / 4);   /* 0.25 s out */
+    for (int t = 0; t < 6; ++t) { bwa_commit(e); Sleep(16); }         /* ~0.1 s in: still going */
+    check(bwa_bed_is_playing(e, bed), "bwa_bed_stop_at did not stop the bed immediately");
+    for (int t = 0; t < 25; ++t) { bwa_commit(e); Sleep(16); }        /* past the stop */
+    check(!bwa_bed_is_playing(e, bed), "...and stopped it once the clock reached it");
+
+    /* 7d) bwa_bed_play_loop is the same region set at PLAY time: play [0, loop_end), then repeat
+     *     [loop_beg, loop_end) - the intro-to-loop pattern, bed-typed. */
+    bwa_bed_play_loop(e, bed, field, RATE / 10, RATE / 5);     /* intro 0..200 ms, body 100..200 ms */
+    run(e, 1.5, "   intro -> loop body, via bwa_bed_play_loop");
+
     /* ---- teardown ---- */
     bwa_bed_fade_out(e, bed, 0.5f);
     run(e, 0.8, NULL);
@@ -210,6 +284,7 @@ int main(int argc, char** argv) {
     bwa_destroy(e);
     remove("bwa_demo_ambix.wav");
     remove("bwa_demo_fuma.wav");
+    if (g_bad) { printf("\nambisonic: %d CHECK(S) FAILED\n", g_bad); return 1; }
     printf("done\n");
     return 0;
 }

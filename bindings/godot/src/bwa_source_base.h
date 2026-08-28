@@ -39,6 +39,17 @@ public:
 
 	/* Called by BwaEngine once per frame, before the listener push and the commit. */
 	virtual void push_frame();
+	/* Called by BwaEngine once per frame, AFTER the commit and after both event drains. Anything
+	 * that reasons about "did this voice stop" belongs here: the events are filled by the same
+	 * pass bwa_commit runs, so a pre-commit reading is about the previous frame. */
+	virtual void post_commit() {}
+	/* One handle bwa_poll_ended / bwa_poll_looped reported, routed here by BwaEngine (the single
+	 * owner of both drains - see BwaEngine::get_ended_this_frame). Base does nothing: only BwaEmitter has
+	 * the signals. A wrap is NOT an end - the voice keeps playing - so the two never interact. */
+	virtual void notify_ended() {}
+	virtual void notify_looped() {}
+	/* The native handle, for BwaEngine's event routing. 0 when the source was never created. */
+	bwa_source native_handle() const { return src; }
 
 	/* --- level / routing --- */
 	void set_gain(float g);
@@ -55,6 +66,31 @@ public:
 	virtual void fade_out(float seconds);
 	void set_paused(bool p);
 	bool get_paused() const { return paused; }
+
+	/* --- direct output-channel route ---
+	 * Send this voice out of exactly ONE output channel with no spatial processing: the
+	 * psychophysics ground-truth condition (one real speaker, A/B'd against a phantom) and a
+	 * wiring check you can run with real content. Valid range is 0 to
+	 * BwaEngine.get_channel_count() - 1; CHANNEL_AUTO (-1) puts it back on the panner. An
+	 * out-of-range channel is refused with a warning and the source keeps the channel it had, so
+	 * get_channel() never reports a route the voice is not actually on. CHANNEL_AUTO is the only
+	 * negative that means anything: every other one is refused too, and refused BEFORE the engine
+	 * is live, because a negative needs no channel count to judge.
+	 *
+	 * NOT set_test_signal: that injects a built-in tone AFTER the align stage, which makes it a
+	 * wiring tool and not level-comparable with a rendered source. This replaces the panner's gain
+	 * vector, so the routed voice keeps the whole output stage a panned voice gets (align trims and
+	 * delays, room EQ, master gain, limiter) and RAMPS in and out. Everything distance- or
+	 * direction-derived is suppressed while it is on (attenuation, spread, occlusion, reverb sends,
+	 * Doppler, air absorption) and takes effect again the moment you go back to CHANNEL_AUTO; pitch
+	 * and pause still apply. Mono point sources only.
+	 *
+	 * No unit suffix: a channel is a bare index, not a quantity. Not an inspector property either -
+	 * this is a run-time experimental condition, not authored configuration - but it IS replayed if
+	 * the source is re-created, so a reference source keeps its channel across an engine rebuild. */
+	static constexpr int CHANNEL_AUTO = BWA_CHANNEL_AUTO;
+	void set_channel(int channel);
+	int get_channel() const { return channel; }
 
 	/* --- extent --- */
 	void set_spread(float amount);
@@ -171,6 +207,7 @@ private:
 	int group = 0;
 	bool paused = false;
 
+	int channel = CHANNEL_AUTO; /* direct output-channel route; see set_channel */
 	float spread = 0.0f;
 	Vector2 extent = Vector2(0.0f, 0.0f);
 	float size_m = 0.0f;

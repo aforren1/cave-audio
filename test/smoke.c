@@ -139,7 +139,7 @@ static int run_profile(bwa_profile profile, const char* name) {
             fprintf(stderr, "FAIL[%s]: bwa_get_clock has no pair after 30 ms of blocks\n", name);
             bwa_destroy(e); return 1;
         }
-        if (cs > bwa_get_dsp_time(e)) {   /* the pair is a rendered block's start — never ahead of the clock */
+        if (cs > bwa_get_dsp_time_frames(e)) {   /* the pair is a rendered block's start — never ahead of the clock */
             fprintf(stderr, "FAIL[%s]: clock-pair sample runs ahead of the dsp clock\n", name);
             bwa_destroy(e); return 1;
         }

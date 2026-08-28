@@ -65,8 +65,11 @@ func _ready() -> void:
 	_test_materials_and_scene()
 	_test_render_block()
 	await _test_emitter()
+	await _test_events_and_region()
+	await _test_held_play_ordering()
 	await _test_push_source()
 	await _test_bed()
+	await _test_bed_events_and_region()
 	await _test_clock()
 	await _test_assets_and_desc()
 	await _test_teardown_order()   # LAST: it frees the engine node
@@ -290,7 +293,7 @@ func _test_emitter() -> void:
 	# Gapless chaining, and the scheduled stop riding the dsp clock.
 	emitter.queue(clip, false)
 	emitter.clear_queue()
-	emitter.stop_at(engine.get_dsp_time() + 48000)
+	emitter.stop_at(engine.get_dsp_time_frames() + 48000)
 	emitter.play_loop(clip, 1000, 20000)
 	await _pump(4)
 	emitter.stop()
@@ -308,6 +311,473 @@ func _test_emitter() -> void:
 	var frames := engine.sound_get_frames(clip)
 	_check(absi(frames - engine.get_resolved_sample_rate()) < 2000,
 		"a 1 s clip should be about one sample rate long, got %d" % frames)
+
+
+## The two EVENT feeds (`finished`, `looped`) and the two new per-voice controls (the play
+## region, the direct output-channel route).
+##
+## `finished` is what this rewires: it used to edge-detect bwa_source_is_playing and, when a
+## clip never once read as playing, GUESS after a few frames that it "came and went
+## unobserved". A guess cannot tell a real sub-frame clip from a dropped play or a voice
+## stolen at onset, so it could announce the end of a sound that never played. It is driven
+## by bwa_poll_ended now. The explicit-halt cases stay on the edge, because the core posts no
+## completion for a halt at all - so both feeds are asserted here, and so is the rule that
+## neither fires twice for one end.
+##
+## A dedicated emitter keeps all of this away from _test_emitter's voice, which carries a
+## manual-occlusion publish, an attenuation override and a spread.
+func _test_events_and_region() -> void:
+	var tiny := Tone.write_ping("api_tiny", 880.0, 0.002)          # 96 frames: under one block
+	var loopclip := Tone.write_ping("api_loopclip", 440.0, 1.0)    # 48000 frames
+	var longclip := Tone.write_ping("api_longclip", 330.0, 5.0)    # 240000 frames
+
+	var ev := BwaEmitter.new()
+	ev.autoplay = false
+	ev.loop = false
+	ev.position = Vector3(0, 0, -2)
+	add_child(ev)
+	await _frames(2)                       # the engine created it, pushed it and committed
+
+	var fin := [0]
+	var wraps := [0]
+	var batch := [-1]
+	# The batch readback goes in the SAME handler, so it reads BwaEngine's snapshot at the one
+	# moment it is guaranteed populated: inside the drain that produced this signal.
+	ev.finished.connect(func() -> void:
+		fin[0] += 1
+		batch[0] = engine.get_ended_this_frame().size())
+	ev.looped.connect(func() -> void: wraps[0] += 1)
+
+	# 1. A clip SHORTER THAN A FRAME must report finished, once, off the event. This is the
+	#    whole defect: 96 frames come and go inside the first rendered block, so no poll of
+	#    is_playing can ever observe this voice playing.
+	ev.play_clip(tiny)
+	await _pump(4)
+	# NOT pinned here: that the drain runs AFTER the commit that fills the ring. Reversing the
+	# two still reports every end, one frame later, and no wait short enough to see that could
+	# be made stable - where the coroutine resumes inside the frame depends on every await
+	# above it. The ordering is a latency property; what these assertions cover is that the end
+	# is reported at all, and reported once.
+	await _frames(2)
+	_check(fin[0] == 1, "a sub-frame clip must report finished exactly once, got %d" % fin[0])
+	_check(not ev.is_playing(), "a finished sub-frame clip must not still claim to be playing")
+	_check(batch[0] >= 1, "get_ended_this_frame must hold the handle that produced the signal, got %d" % batch[0])
+
+	# 1b. play_at HOLDS the voice silent until the scheduled sample. The bed arm asserts this
+	#     (BwaBed case 1) and the emitter arm did not, so the older of the two scheduled-play
+	#     calls was the unchecked one. The lead is far longer than the first pump, so a play_at
+	#     wired to the unscheduled call would already be thousands of frames in by the check.
+	var rate := engine.get_resolved_sample_rate()
+	var block := engine.get_resolved_block_size()
+	var lead := 20 * block if _manual else rate / 2
+	ev.loop = true
+	ev.play_at(loopclip, engine.get_dsp_time_frames() + lead)
+	await _pump(10)
+	_check(ev.get_playhead_frames() == 0,
+		"play_at must hold the emitter silent until its scheduled sample, playhead is %d"
+			% ev.get_playhead_frames())
+	await _pump(60 if _manual else 200)
+	_check(ev.get_playhead_frames() > 0, "a scheduled emitter should be playing past its start sample")
+	ev.stop()
+	await _pump(4)
+
+	# 1c. play_loop's BODY confines the playhead - the region set at PLAY time, which is the
+	#     other half of the pair case 2 below sets AFTER the play. Manual only, for the reason
+	#     the bed arm gives: the rendered frame count is a fact there and a wall-clock guess on
+	#     the null sink. Frames [0, 9600) play once, then [9600, 19200) repeats; the 5 s clip is
+	#     240000 frames, so bounds that never reached the core leave the playhead far past them.
+	if _manual:
+		wraps[0] = 0
+		ev.play_loop(longclip, 9600, 19200)
+		await _pump(160)                   # 40960 frames: the intro plus two body laps
+		await _frames(2)
+		var body := ev.get_playhead_frames()
+		_check(body >= 9600 and body < 19200,
+			"a play_loop body must confine the emitter playhead to [9600, 19200), got %d" % body)
+		_check(wraps[0] >= 2, "an emitter play_loop body should have wrapped twice, got %d" % wraps[0])
+		ev.stop()
+		await _pump(4)
+
+	# 2. A loop REGION wraps, and every wrap is reported. 25600 rendered frames over a
+	#    4800-frame region is five wraps; a region that never reached the core would leave the
+	#    whole 48000-frame clip, which cannot wrap even once in that span.
+	fin[0] = 0
+	wraps[0] = 0
+	ev.loop = true
+	ev.play_clip(loopclip)
+	ev.set_region_frames(0, 4800)
+	await _pump(100)
+	await _frames(2)
+	_check(wraps[0] >= 4,
+		"a 4800-frame loop region should wrap at least 4 times in 25600 frames, got %d" % wraps[0])
+	# ...and a looping voice never ENDS, so the completion feed must stay silent for it.
+	_check(fin[0] == 0, "a looping voice must never report finished, got %d" % fin[0])
+
+	# 3. The seconds twin has to be the same call at the sample rate, not the same NUMBER.
+	#    0.1 s is 4800 frames here; passing the seconds straight through as frames would make
+	#    the region [0, 0), which the core refuses, leaving the whole clip and no wrap at all.
+	wraps[0] = 0
+	ev.play_clip(loopclip)
+	ev.set_region_seconds(0.0, 0.1)
+	await _pump(100)
+	await _frames(2)
+	_check(wraps[0] >= 4,
+		"set_region_seconds(0, 0.1) should wrap like set_region_frames(0, 4800), got %d" % wraps[0])
+	_check(not ev.has_method("set_region"), "the unit-ambiguous set_region() must stay gone")
+
+	# 4. A region ENDS a one-shot early. The clip is 5 s so that neither sink can reach its
+	#    real end inside this pump - the finish can only have come from the region.
+	fin[0] = 0
+	ev.loop = false
+	ev.play_clip(longclip)
+	ev.set_region_frames(0, 9600)
+	await _pump(80)
+	await _frames(2)
+	_check(fin[0] == 1, "a region end must finish a one-shot early, finished fired %d times" % fin[0])
+	_check(not ev.is_playing(), "the voice should have ended at the region end")
+
+	# 4b. A natural end AFTER the voice has been observed playing. This is the case where both
+	#     feeds are live at once: the drain reports the completion, and the is-playing edge sees
+	#     the same silence. Exactly one signal, or the ordering and the latch are wrong.
+	fin[0] = 0
+	ev.loop = false
+	ev.play_clip(loopclip)
+	await _pump(8)
+	await _frames(2)
+	_check(ev.is_playing(), "the voice should still be playing 8 blocks into a 1 s clip")
+	await _pump(200)                       # 51200 frames: past the clip's 48000
+	await _frames(2)
+	_check(fin[0] == 1,
+		"a natural end must report finished exactly once even after the voice was seen playing, got %d"
+			% fin[0])
+
+	# 5. An explicit stop() is not an end. The core posts no completion for it, and the node
+	#    drops its own edge detector, so NEITHER feed may speak.
+	fin[0] = 0
+	ev.loop = true
+	ev.play_clip(loopclip)
+	await _pump(8)
+	await _frames(2)
+	ev.stop()
+	await _pump(8)
+	await _frames(2)
+	_check(fin[0] == 0, "stop() must not report finished, got %d" % fin[0])
+
+	# 5b. The one interleaving where a halt and a real completion describe the SAME end. rt.c's
+	#     mix seam takes `ended = true` for a voice that is already stopping and whose clip runs
+	#     out in that same block, so a stop can be followed by a genuine completion event. Only
+	#     the manual sink can place a stop on that seam: 8 blocks in, 100 frames short of the end.
+	if _manual:
+		var seam := Tone.write_ping("api_seam", 660.0, 2148.0 / 48000.0)
+		fin[0] = 0
+		ev.loop = false
+		ev.play_clip(seam)
+		await _pump(8)                     # cursor at 2048, still short of the end
+		ev.stop()                          # ...and the next block both fades out AND runs out
+		await _pump(1)
+		await _frames(2)
+		_check(fin[0] == 0,
+			"a stop landing on the clip's last block must not report finished, got %d" % fin[0])
+
+	# 6. ...but a SCHEDULED stop is an arranged ending and still does. It takes the same
+	#    click-free path, which posts no completion either, so this is the narrow is-playing
+	#    fallback and nothing else. Exactly one: the fallback and the event must not double up.
+	fin[0] = 0
+	ev.play_clip(loopclip)
+	await _pump(4)
+	await _frames(2)
+	ev.stop_at(engine.get_dsp_time_frames() + 512)
+	await _pump(30)
+	await _frames(2)
+	_check(fin[0] == 1, "stop_at must report finished exactly once, got %d" % fin[0])
+
+	# 7. The direct output-channel route, read off the BUS. Manual only: render_block is the
+	#    only way to see which speaker a voice actually reached.
+	if _manual:
+		await _test_direct_channel(ev, loopclip)
+
+	# 8. Range. An out-of-range channel must not be cached, or get_channel() reports a route
+	#    the voice is not on - the quiet failure this binding exists to prevent.
+	ev.set_channel(2)
+	_check(ev.get_channel() == 2, "channel did not round-trip, got %d" % ev.get_channel())
+	ev.set_channel(9999)
+	_check(ev.get_channel() == 2,
+		"an out-of-range channel must be refused, not cached: got %d" % ev.get_channel())
+	# ...and the SAME for a negative that is not CHANNEL_AUTO. The ABI refuses every negative but
+	# that one on purpose: folding the rest into AUTO makes a bad index look like it was TAKEN, so
+	# the source keeps panning, nothing is reported, and the caller reads a phantom as a
+	# single-speaker reference. A guard that only bounds the top end passes -5 straight through.
+	ev.set_channel(-5)
+	_check(ev.get_channel() == 2,
+		"a negative channel that is not CHANNEL_AUTO must be refused, not cached: got %d"
+			% ev.get_channel())
+	ev.set_channel(BwaSource.CHANNEL_AUTO)
+	_check(ev.get_channel() == BwaSource.CHANNEL_AUTO, "CHANNEL_AUTO did not round-trip")
+
+	# 9. A negative TIME is refused too, for the same reason and with the same warning. Every one
+	#    of these arguments reaches the ABI unsigned, so a negative does not fail - it becomes
+	#    1.8e19, which is silence nobody can account for rather than an error.
+	ev.stop()
+	await _pump(4)
+	await _frames(2)
+	ev.loop = false
+	ev.play_at(loopclip, -1)
+	await _pump(4)
+	await _frames(2)
+	_check(not ev.is_playing(),
+		"play_at with a negative start sample must be refused; cast unsigned it schedules a start "
+		+ "12 million years out and leaves a voice that reads as playing and never sounds")
+
+	ev.play_clip(longclip)                 # 5 s: neither sink can reach its real end here
+	await _pump(8)
+	await _frames(2)
+	_check(ev.is_playing(), "the long clip should be playing before the seek")
+	ev.seek_frames(-1)
+	await _pump(8)
+	await _frames(2)
+	_check(ev.is_playing(),
+		"seek_frames with a negative frame must be refused; cast unsigned it lands past the end "
+		+ "and ends the one-shot")
+	ev.stop()
+
+	ev.free()
+
+
+## Two ORDERING rules about a play the core is still HOLDING, both of which a real clip cannot
+## test because it lands too fast to see.
+##
+## 1. A held play must not clear the duplicate-end latch. The core only bumps a slot's play
+##    counter at bind time, and that counter is the gate that drops a completion straggling in
+##    from the PREVIOUS play. A held play never binds, so the straggler is still deliverable and
+##    the latch is the only thing left standing in its way.
+## 2. A completion for the previous play must not tear down the state of a play still held.
+##
+## MANUAL only: only this sink can place a stop on the exact block a clip runs out (rt.c's mix
+## seam, which posts a completion for a voice that was already stopping) and then let the drain
+## deliver it with nothing else moving in between.
+##
+## The held plays below are issued against files that DO NOT EXIST, and that is what makes this a
+## test instead of a race. A decode that FAILS never publishes, so the core never fires the held
+## play, never reaches source_bind and never bumps the play counter: the window stays open for as
+## long as the assertions need it. A real clip closes it inside one frame, and the case would then
+## pass because the CORE dropped the straggler, proving nothing about this node. The
+## "the async load of ... failed" errors this prints are that choice working as intended, not a
+## defect: reporting a decode that can never land is what the failure path is for.
+func _test_held_play_ordering() -> void:
+	if not _manual:
+		return
+	# The completion batch read below is engine-wide, so nothing else may end in the same frame.
+	emitter.stop()
+	bed.stop()
+
+	# 2148 frames: eight 256-frame blocks leave 100, so block nine both fades the stop out AND runs
+	# the asset out. That is the seam.
+	var seam := Tone.write_ping("api_hold_seam", 660.0, 2148.0 / 48000.0)
+
+	var ev := BwaEmitter.new()
+	ev.autoplay = false
+	ev.loop = false
+	ev.position = Vector3(0, 0, -2)
+	add_child(ev)
+	await _frames(2)
+
+	var fin := [0]
+	var playing_in_handler := [false]
+	ev.finished.connect(func() -> void:
+		fin[0] += 1
+		# Read INSIDE the handler: notify_ended tears its state down before it emits, so this is
+		# the only moment at which the difference is visible.
+		playing_in_handler[0] = ev.is_playing())
+
+	# --- 1. a held play must not clear the latch -------------------------------------------------
+	# stop() arms the latch synchronously (an explicit halt is not an end, and Godot's `finished`
+	# stays silent for one). The seam block then posts a completion for that same play anyway.
+	# Everything up to the next await happens inside ONE frame, before BwaEngine drains anything.
+	await get_tree().process_frame        # the top of a frame: no push, commit or drain yet
+	ev.play_clip(seam)
+	for i in 8:
+		engine.render_block()             # cursor at 2048, still short of 2148
+	ev.stop()
+	engine.render_block()                 # the seam block: fades out AND runs out
+	ev.async_load = true
+	ev.play_clip("user://api_never_written_a.wav")   # held forever: this decode cannot succeed
+	await get_tree().process_frame        # ...BwaEngine's commit and drain ran in between
+
+	# The premise, and it carries two claims at once. A non-empty batch means the seam really did
+	# post a completion, AND that the held play really is unbound - had it bound, the core would
+	# have bumped the play counter and dropped this completion before the drain ever saw it.
+	var batch: int = engine.get_ended_this_frame().size()
+	_check(batch >= 1,
+		"the seam must deliver a completion while the held play is unbound, got %d" % batch)
+	_check(fin[0] == 0,
+		("a completion straggling in from a STOPPED play must stay suppressed: a play the core is "
+		+ "still holding has not bound, so it must not void the latch. finished fired %d times")
+			% fin[0])
+
+	# --- 2. a completion for the previous play must not cancel a held one ------------------------
+	# Same construction minus the stop, so A ends NATURALLY while B waits on a decode. The end
+	# belongs to A and may report; what it must not do is tear B down. It used to, which left
+	# is_loading() reading false while B decoded, the decode-failure report with nothing to fire
+	# it, and the state machine unable to reach PLAYING - so a later stop_at emitted no `finished`.
+	fin[0] = 0
+	playing_in_handler[0] = false
+	await get_tree().process_frame
+	ev.async_load = false
+	ev.play_clip(seam)
+	for i in 4:
+		engine.render_block()             # A is playing, well short of its end
+	ev.async_load = true
+	ev.play_clip("user://api_never_written_b.wav")   # held; A keeps playing underneath it
+	for i in 8:
+		engine.render_block()             # A runs out: a natural completion, no stop involved
+	await get_tree().process_frame
+
+	_check(fin[0] == 1,
+		"a natural end must still report while a later play is held, got %d" % fin[0])
+	_check(playing_in_handler[0],
+		"the previous play's completion cancelled a play still HELD on an async decode: the "
+		+ "emitter read as idle inside its own finished handler")
+
+	ev.free()
+
+	# --- 3. the same two rules on a BED ------------------------------------------------------------
+	# BwaBed carries its own copy of the latch and its own notify_ended, so it needs its own case:
+	# the two files share a design, not code, and the emitter's assertions cannot fail for the bed.
+	var bed_seam := Tone.write_ambix("api_hold_bedseam", Vector3(0, 0, 1), 440.0, 2148.0 / 48000.0)
+
+	var b := BwaBed.new()
+	b.autoplay = false
+	b.loop = false
+	add_child(b)
+	await _frames(2)
+
+	var bfin := [0]
+	var bplaying := [false]
+	b.finished.connect(func() -> void:
+		bfin[0] += 1
+		bplaying[0] = b.is_playing())
+
+	await get_tree().process_frame
+	b.play_clip(bed_seam)
+	for i in 8:
+		engine.render_block()
+	b.stop()                              # arms the latch; `finished` is silent for a stop
+	engine.render_block()                 # the seam block: fades out AND runs out
+	b.async_load = true
+	b.play_clip("user://api_never_written_c.wav")    # held forever
+	await get_tree().process_frame
+
+	var bbatch: int = engine.get_ended_this_frame().size()
+	_check(bbatch >= 1,
+		"the bed seam must deliver a completion while the held play is unbound, got %d" % bbatch)
+	_check(bfin[0] == 0,
+		("a completion straggling in from a STOPPED bed must stay suppressed: a play the core is "
+		+ "still holding has not bound, so it must not void the latch. finished fired %d times")
+			% bfin[0])
+
+	# ...and the same completion must not cancel the held play's state.
+	bfin[0] = 0
+	bplaying[0] = false
+	await get_tree().process_frame
+	b.async_load = false
+	b.play_clip(bed_seam)
+	for i in 4:
+		engine.render_block()
+	b.async_load = true
+	b.play_clip("user://api_never_written_d.wav")
+	for i in 8:
+		engine.render_block()             # the first field runs out: a natural completion
+	await get_tree().process_frame
+	_check(bfin[0] == 1,
+		"a natural bed end must still report while a later play is held, got %d" % bfin[0])
+	_check(bplaying[0],
+		"the previous play's completion cancelled a bed play still HELD on an async decode: the "
+		+ "bed read as idle inside its own finished handler")
+
+	b.free()
+
+
+## Per-channel energy of one rendered block (planar, channel-major).
+func _bus_energy() -> Array:
+	var buf := engine.render_block()
+	var chans := engine.get_channel_count()
+	var block := engine.get_resolved_block_size()
+	var e := []
+	e.resize(chans)
+	for c in chans:
+		var acc := 0.0
+		for i in block:
+			var v: float = buf[c * block + i]
+			acc += v * v
+		e[c] = acc
+	return e
+
+
+## The psychophysics reference condition: one speaker, no panning. Asserted on the BUS rather
+## than on a readback, because "did the gain vector actually become one-hot" is the claim.
+##
+## Two things keep this from being a coin flip. The bus is asserted SILENT first, so a decaying
+## reverb tail from the earlier tests fails here instead of quietly reading as leakage. And the
+## channel to route to is the one the PANNER uses least for this source, measured first: routing
+## to a channel the panner already favors would compare 0.99 against 0.90 and prove nothing.
+func _test_direct_channel(ev: BwaEmitter, clip: String) -> void:
+	var reverb_was: float = engine.reverb_gain
+	var er_was: float = engine.early_reflections_gain
+	# NOT stop_all(): the push source is created and consuming, and ending it here would break
+	# _test_push_source further down. Only the two voices that can still be ringing are stopped.
+	emitter.stop()
+	bed.stop()
+	engine.reverb_set_gain(0.0)
+	engine.early_reflections_set_gain(0.0)
+	for i in 200:
+		engine.render_block()              # let every tail and ramp reach zero
+	var quiet := _bus_energy()
+	var quiet_total := 0.0
+	for c in quiet.size():
+		quiet_total += quiet[c]
+	_check(quiet_total < 1e-9,
+		"the bus should be silent before the route test, got %.12f" % quiet_total)
+
+	# The panned reference reading, and the least-used channel it points at.
+	ev.loop = true
+	ev.set_channel(BwaSource.CHANNEL_AUTO)
+	ev.play_clip(clip)
+	await _frames(2)
+	for i in 40:
+		engine.render_block()
+	var auto := _bus_energy()
+	var auto_total := 0.0
+	for c in auto.size():
+		auto_total += auto[c]
+	_check(auto_total > 1e-6, "the panned source should make sound, got %.12f" % auto_total)
+	var far := 0
+	for c in auto.size():
+		if auto[c] < auto[far]:
+			far = c
+	var auto_frac: float = auto[far] / maxf(auto_total, 1e-30)
+	_check(auto_frac < 0.05,
+		"the panner's least-used channel (%d) should be near silent, got %f of the bus"
+			% [far, auto_frac])
+
+	# ...and the route moves ALL of it there. The two fractions are the same measurement of the
+	# same voice, so a set_channel that did nothing would leave this one at auto_frac.
+	ev.set_channel(far)
+	await _frames(2)
+	for i in 40:
+		engine.render_block()              # the route RAMPS in, like any other gain change
+	var routed := _bus_energy()
+	var routed_total := 0.0
+	for c in routed.size():
+		routed_total += routed[c]
+	_check(routed_total > 1e-6, "a routed source should still make sound, got %.12f" % routed_total)
+	var routed_frac: float = routed[far] / maxf(routed_total, 1e-30)
+	_check(routed_frac > 0.99,
+		"a source routed to channel %d should put ~all of its energy there, got %f of the bus"
+			% [far, routed_frac])
+
+	ev.stop()
+	engine.reverb_set_gain(reverb_was)
+	engine.early_reflections_set_gain(er_was)
 
 
 ## set_orientation must land the audible dipole on the NODE's facing (its -Z), through the
@@ -424,11 +894,211 @@ func _test_bed() -> void:
 	await _pump(10)
 
 
+## The bed's SCHEDULED play forms, its play region, and its two event feeds.
+##
+## A bed IS a voice, so bwa_poll_ended and bwa_poll_looped report bed handles like any other
+## and the whole of this exists on the same machinery BwaEmitter uses. What it can get wrong
+## is the ROUTE: BwaBed is a Node, not a BwaSource, so it is not in the source registry the
+## drain walks. Every assertion below is silent if the bed never reaches that route.
+##
+## The region assertions are deliberately RANGE assertions on the playhead. A region CONFINES
+## the playhead, which is true however many blocks were rendered - so the same check is exact
+## on the manual sink and still honest on the null one, where the block count is a wall clock.
+func _test_bed_events_and_region() -> void:
+	var rate := engine.get_resolved_sample_rate()
+	var block := engine.get_resolved_block_size()
+	var field := Tone.write_ambix("api_bed_field", Vector3(0, 0, 1), 330.0, 1.0)     # 48000 frames
+	var longfield := Tone.write_ambix("api_bed_long", Vector3(1, 0, 0), 220.0, 5.0)  # 240000 frames
+
+	var b := BwaBed.new()
+	b.autoplay = false
+	b.loop = false
+	add_child(b)
+	await _frames(2)                       # the engine created it and registered the route
+
+	var fin := [0]
+	var wraps := [0]
+	b.finished.connect(func() -> void: fin[0] += 1)
+	b.looped.connect(func() -> void: wraps[0] += 1)
+
+	# 1. play_at HOLDS the field silent until the scheduled sample. The lead is far longer than
+	#    the first pump, so a play_at wired to the unscheduled call would already be several
+	#    thousand frames in when the first check runs.
+	var lead := 20 * block if _manual else rate / 2
+	b.play_at(field, engine.get_dsp_time_frames() + lead)
+	await _pump(10)
+	_check(b.get_playhead_frames() == 0,
+		"play_at must hold the bed silent until its scheduled sample, playhead is %d"
+			% b.get_playhead_frames())
+	await _pump(60 if _manual else 200)
+	_check(b.get_playhead_frames() > 0, "a scheduled bed should be playing past its start sample")
+	b.stop()
+	await _pump(4)
+
+	# 2. play_loop's BODY confines the playhead. Manual only: it is the one sink where the
+	#    rendered frame count is a fact rather than a wall-clock guess, and this check needs
+	#    the intro to be behind the playhead before it samples. Frames [0, 9600) play once,
+	#    then [9600, 19200) repeats; 30720 rendered frames land at 11520. A play_loop that lost
+	#    its bounds would sit at 30720 instead.
+	if _manual:
+		wraps[0] = 0
+		b.play_loop(field, 9600, 19200)
+		await _pump(160)                   # 40960 frames: the intro plus two body laps
+		await _frames(2)
+		var body := b.get_playhead_frames()
+		_check(body >= 9600 and body < 19200,
+			"a play_loop body must confine the bed playhead to [9600, 19200), got %d" % body)
+		_check(wraps[0] >= 2, "a play_loop body should have wrapped twice, got %d" % wraps[0])
+		b.stop()
+		await _pump(4)
+
+	# 3. ...and every wrap is reported. 9600-frame laps over a 5 s field: without the loop
+	#    bounds reaching the core the field is 240000 frames long and cannot wrap even once in
+	#    this span, so the broken value here is a hard 0.
+	wraps[0] = 0
+	fin[0] = 0
+	b.play_loop(longfield, 0, 4800)
+	await _pump(100)
+	await _frames(2)
+	_check(wraps[0] >= 4,
+		"a 4800-frame bed loop body should wrap at least 4 times in 25600 frames, got %d" % wraps[0])
+	_check(fin[0] == 0, "a looping bed must never report finished, got %d" % fin[0])
+	b.stop()
+	await _pump(4)
+
+	# 4. set_region_frames, with a LATE start so the confinement is a value no default reaches:
+	#    a bed playing the same 5 s field with no region runs straight past 57600 and stays
+	#    past it, and wraps not once.
+	wraps[0] = 0
+	b.loop = true
+	b.play_clip(longfield)
+	b.set_region_frames(48000, 57600)
+	await _pump(400 if _manual else 200)
+	await _frames(2)
+	var head := b.get_playhead_frames()
+	_check(head >= 48000 and head < 57600,
+		"a bed region [48000, 57600) must confine the playhead there, got %d" % head)
+	_check(wraps[0] >= 4, "a 9600-frame bed region should wrap repeatedly, got %d" % wraps[0])
+
+	# 5. The seconds twin has to be the same call at the sample rate, not the same NUMBER.
+	#    0.1 s is 4800 frames here; passing the seconds straight through as frames would make
+	#    the region [0, 0), which the core refuses, leaving the whole 5 s field and no wrap.
+	wraps[0] = 0
+	b.play_clip(longfield)
+	b.set_region_seconds(0.0, 0.1)
+	await _pump(100)
+	await _frames(2)
+	_check(wraps[0] >= 4,
+		"set_region_seconds(0, 0.1) should wrap like set_region_frames(0, 4800), got %d" % wraps[0])
+	_check(not b.has_method("set_region"), "the bed's unit-ambiguous set_region() must stay gone")
+
+	# 6. A region ENDS a one-shot bed early, and that IS a completion. The field is 5 s so
+	#    neither sink can reach its real end inside this pump - the finish can only have come
+	#    from the region.
+	fin[0] = 0
+	b.loop = false
+	b.play_clip(longfield)
+	b.set_region_frames(0, 9600)
+	await _pump(80)
+	await _frames(2)
+	_check(fin[0] == 1, "a bed region end must finish a one-shot bed, finished fired %d times" % fin[0])
+	_check(not b.is_playing(), "the bed should have ended at its region end")
+
+	# 7. A natural end AFTER the bed has been observed playing: the case where both feeds are
+	#    live at once (the drain reports the completion, and the is-playing edge sees the same
+	#    silence). Exactly one signal, or the ordering and the latch are wrong.
+	fin[0] = 0
+	b.play_clip(field)
+	await _pump(8)
+	await _frames(2)
+	_check(b.is_playing(), "the bed should still be playing 8 blocks into a 1 s soundfield")
+	await _pump(200)                       # 51200 frames: past the field's 48000
+	await _frames(2)
+	_check(fin[0] == 1,
+		"a natural bed end must report finished exactly once even after it was seen playing, got %d"
+			% fin[0])
+
+	# 8. An explicit stop() is not an end. The core posts no completion for it, and the node
+	#    drops its own edge detector, so NEITHER feed may speak.
+	fin[0] = 0
+	b.loop = true
+	b.play_clip(longfield)
+	await _pump(8)
+	await _frames(2)
+	b.stop()
+	await _pump(8)
+	await _frames(2)
+	_check(fin[0] == 0, "a bed stop() must not report finished, got %d" % fin[0])
+
+	# 9. Nor is a group stop, which is the same rule reached from BwaEngine instead of the node.
+	#    A bed carries a mix group like any voice, and a bed that is not told reads the silence
+	#    as a natural end.
+	fin[0] = 0
+	b.set_group(3)
+	b.play_clip(longfield)
+	await _pump(8)
+	await _frames(2)
+	engine.group_stop(3)
+	await _pump(8)
+	await _frames(2)
+	_check(fin[0] == 0, "a group stop must not report finished on a bed, got %d" % fin[0])
+	b.set_group(0)
+
+	# 10. ...but a SCHEDULED stop is an arranged ending and still does. It takes the same
+	#     click-free path, which posts no completion either, so this is the narrow is-playing
+	#     fallback and nothing else. Exactly one: the fallback and the event must not double up.
+	fin[0] = 0
+	b.play_clip(longfield)
+	await _pump(4)
+	await _frames(2)
+	b.stop_at(engine.get_dsp_time_frames() + 512)
+	await _pump(30)
+	await _frames(2)
+	_check(fin[0] == 1, "a bed stop_at must report finished exactly once, got %d" % fin[0])
+
+	# 11. The one interleaving where a halt and a real completion describe the SAME end. rt.c's
+	#     mix seam takes `ended = true` for a voice already stopping whose asset runs out in that
+	#     same block, so a stop can be followed by a genuine completion event. A bed rides the
+	#     same seam, so it inherits the same latch - verified, not assumed. Only the manual sink
+	#     can place a stop there: 8 blocks in, 100 frames short of the end.
+	if _manual:
+		var seam := Tone.write_ambix("api_bed_seam", Vector3(0, 1, 0), 660.0, 2148.0 / 48000.0)
+		fin[0] = 0
+		b.loop = false
+		b.play_clip(seam)
+		await _pump(8)                     # cursor at 2048, still short of the end
+		b.stop()                           # ...and the next block both fades out AND runs out
+		await _pump(1)
+		await _frames(2)
+		_check(fin[0] == 0,
+			"a bed stop landing on the asset's last block must not report finished, got %d" % fin[0])
+
+	b.queue_free()
+	await _frames(2)
+
+
 func _test_clock() -> void:
-	var t := engine.get_dsp_time()
+	var t := engine.get_dsp_time_frames()
 	_check(t > 0, "dsp time should have advanced after all those blocks")
 	await _pump(4)
-	_check(engine.get_dsp_time() > t, "dsp time should be monotonic")
+	_check(engine.get_dsp_time_frames() > t, "dsp time should be monotonic")
+	# Same rule as get_output_latency and seek: the clock is FRAMES, and every host's dsp-time call
+	# is SECONDS (Unity's AudioSettings.dspTime is a seconds double), so the bare spelling would
+	# read as the other unit. It must not come back.
+	_check(not engine.has_method("get_dsp_time"),
+		"the unit-ambiguous get_dsp_time() must stay gone - it read as a seconds-valued call")
+	# The seconds twin, read next to a fresh frame count so only the blocks rendered BETWEEN the two
+	# calls separate them. A margin is demanded on top of the match: with the clock already this far
+	# along, frames/rate is well clear of 0, so a twin that just returned 0 (or the frame count
+	# unconverted) cannot land inside the tolerance by luck.
+	var f2 := engine.get_dsp_time_frames()
+	var secs := engine.get_dsp_time_seconds()
+	var rate := float(engine.get_resolved_sample_rate())
+	_check(rate > 0.0 and float(f2) / rate > 0.2,
+		"the clock must be well past zero, or the seconds check below proves nothing (%d frames)" % f2)
+	_check(absf(secs - float(f2) / rate) < 0.05,
+		"get_dsp_time_seconds should be the frame count over the rate (got %f, frames %d at %f Hz)"
+			% [secs, f2, rate])
 
 	var c := engine.get_clock()
 	_check(c.has("valid") and c.has("dsp_sample") and c.has("host_time_ns"),
@@ -624,6 +1294,12 @@ func _test_teardown_order() -> void:
 	_check(not bed.is_playing(), "a bed with no engine cannot be playing")
 	emitter.set_gain(0.5)
 	emitter.stop()
+	# A negative channel needs no channel count to judge, so it is refused with no engine at all -
+	# the other half of the guard case 8 covers live. Cached instead, get_channel() would report a
+	# route apply_all can only ever have the core refuse.
+	emitter.set_channel(-5)
+	_check(emitter.get_channel() == BwaSource.CHANNEL_AUTO,
+		"a negative channel must be refused even with no engine, got %d" % emitter.get_channel())
 	# Let the tree tick the survivors' _process with the engine gone - the exact frame
 	# that dereferenced the freed engine node before the detach protocol covered them.
 	await get_tree().process_frame
@@ -646,6 +1322,18 @@ func _pump(n: int) -> void:
 			engine.render_block()
 		return
 	await get_tree().create_timer(n * _block_seconds * 3.0 + 0.05).timeout
+
+
+## Advance n whole engine frames.
+##
+## TWO awaits per frame, and for the reason _test_directivity_aim gives: process_frame fires
+## BEFORE node processing, so a single await resumes with BwaEngine's push, commit and event
+## drain not yet run this frame. Anything reasoning about a SIGNAL has to wait the drain out,
+## which is what this is for; _pump only advances audio blocks.
+func _frames(n: int) -> void:
+	for i in n:
+		await get_tree().process_frame
+		await get_tree().process_frame
 
 
 func _finish() -> void:

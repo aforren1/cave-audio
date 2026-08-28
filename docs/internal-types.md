@@ -73,13 +73,20 @@ it is audio-thread-only (ramp state, filter histories), which is why it lives
 - **scheduling / streaming**: `oneshot` (self-recycling voice),
   `stream_pos` (absolute position into a stream's ring),
   `start_sample` (dsp-sample for a scheduled `bwa_source_play_at`),
-  `loop_beg`/`loop_end` (loop region for `bwa_source_play_loop`; resolved against the
-  asset at `CMD_PLAY`, 0/0 = whole clip; the mix seam wraps `cursor` to `loop_beg` at
-  `loop_end`), `stop_at`/`stop_sched` (a scheduled click-free stop, `bwa_source_stop_at`;
+  `loop_beg`/`loop_end` (the play region: `bwa_source_play_loop` sets it at play time and
+  `bwa_source_set_region` sets it later, and both resolve against the asset the same way, at
+  `CMD_PLAY` and `CMD_SET_REGION`; 0/0 = whole clip. At `loop_end` the mix seam hands `cursor` to
+  `loop_wrap` on a looping voice, which folds the overshoot by modulo and posts `EVT_VOICE_LOOPED`
+  per wrap, and ends a non-looping one. `mix_voice` and both `mix_bed` renderers share that helper,
+  so the two mixers answer one `bwa_source_set_region` the same way), `stop_at`/`stop_sched` (a scheduled click-free stop, `bwa_source_stop_at`;
   `rt_render` fires the one-block fade once the block reaches `stop_at`),
   `queue`/`queue_loop`/`queue_head`/`queue_len` (the gapless chain FIFO, depth `BWA_QUEUE`;
   entries are resolved `SoundData*` like `sound`, so `CMD_SOUND_RETIRE` NULL-tombstones any
   it frees; `mix_voice` pops the next valid entry at a non-looping end instead of stopping).
+- **direct output-channel route**: `out_ch_on` / `out_ch` (`bwa_source_set_channel`). The enable
+  is a separate byte so the voice-create memset leaves routing off, which a signed index whose zero
+  meant "channel 0" would not. `compute_gains` installs a one-hot vector instead of the panner's
+  solve, and `mix_voice` suppresses its per-sample spatial and propagation stages to match.
 - **dual-band panning**: `gtarget_lo` / `gcur_lo` (amplitude-normalized LF
   gain set), `xover_lp` (crossover one-pole state), `dual_mix` (0↔1 A/B
   crossfade factor).
@@ -184,8 +191,11 @@ The engine state sits at two levels.
 
 **`RtCore`** (rt.c, opaque behind [`src/rt.h`](../src/rt.h)) is the real-time
 core: the two rings, the voice table + `Listener`, the `Layout` + `Aligner`, and
-the control-side allocation state (`gen` / `inuse` / `priority` / `stealing` /
-free-lists, plus the `SoundSlot` table). The whole `bwa_*` API forwards to it.
+the control-side allocation state (`gen` / `inuse` / `priority` / `group` /
+`stealing` / free-lists, plus the `SoundSlot` table). The whole `bwa_*` API
+forwards to it. `group` is a mirror, not the truth: the voice owns its own mix
+group, and this copy exists so `rt_group_stop` can find the held plays of
+sources in that group. See [`concurrency.md`](./concurrency.md).
 
 **`bwa_engine`** (engine.c) is the ABI-facing shell around it:
 

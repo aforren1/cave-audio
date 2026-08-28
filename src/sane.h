@@ -37,9 +37,25 @@ static inline bool bwa_finite_clamp(float* v, float lo, float hi) {
  * bwa_finite_clamp wherever a bound exists — this one cannot catch finite-but-absurd. */
 static inline bool bwa_finite(float v) { return isfinite(v) != 0; }
 
-/* All three components finite: the position/direction triple guard, spelled once. */
-static inline bool bwa_finite3(const float* v) {
-    return isfinite(v[0]) && isfinite(v[1]) && isfinite(v[2]);
+/* The scalar sibling of bwa_finite3_bounded: finite AND within +/-lim, reject-only. Same reason the
+ * bound is a REQUIRED argument. Use it for a lone coordinate (bwa_scene_set_ground's plane height)
+ * where the triple form does not fit. */
+static inline bool bwa_finite_bounded(float v, float lim) { return v >= -lim && v <= lim; }
+
+/* All three components finite AND within +/-lim: the position-triple guard, spelled once. Reject-
+ * only, because every caller keeps its previous position, which is what a dropped update means.
+ *
+ * `lim` is a REQUIRED argument for the same reason bwa_finite_clamp's range is: a plain finite3
+ * cannot catch finite-but-absurd, and a coordinate is the one triple where that matters most.
+ * EVERY spatial solve begins with a SQUARED difference (dbap.c's dist2, the spread frame's
+ * normalize, the ISM path length), so a coordinate near FLT_MAX overflows dx*dx to +Inf before any
+ * downstream guard sees a number it could reject, and the Inf/Inf or Inf*0 of the normalize that
+ * follows is NaN. Callers pass BWA_MAX_COORD (rt.h), which is where the reasoning for the value
+ * lives. test_fuzz_api seeds 126/142/185 found this on the listener pose. */
+static inline bool bwa_finite3_bounded(const float* v, float lim) {
+    for (int i = 0; i < 3; ++i)
+        if (!(v[i] >= -lim && v[i] <= lim)) return false;   /* one-sided form: NaN fails both compares */
+    return true;
 }
 
 /* Make q (xyzw) a UNIT quaternion in place. Returns false when any component is non-finite, and the

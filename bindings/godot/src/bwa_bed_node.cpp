@@ -5,6 +5,7 @@
 #include <godot_cpp/variant/utility_functions.hpp>
 
 #include "bwa_engine_node.h"
+#include "bwa_guard.h"
 
 using namespace godot;
 
@@ -44,6 +45,7 @@ void BwaBed::_ready() {
 	}
 
 	owner->register_client(this); // for the engine-freed-first teardown order
+	owner->register_bed(this);   // ...and for the completion / loop event route
 	set_process(true);
 	if (autoplay) {
 		play();
@@ -66,7 +68,8 @@ void BwaBed::_exit_tree() {
 	if (!owner) {
 		return;
 	}
-	owner->unregister_client(this); // the child-exits-first order: drop us from its list
+	owner->unregister_client(this); // the child-exits-first order: drop us from its lists
+	owner->unregister_bed(this);
 	if (bed && owner->is_running()) {
 		bwa_bed_destroy(ENG, bed);
 	}
@@ -80,15 +83,48 @@ void BwaBed::engine_gone() {
 	bed = 0;
 }
 
+/* Resolve a clip to a loaded soundfield handle and arm the event state. False = nothing to
+ * play (load_ambisonic has already reported why). Shared by all three play forms so they
+ * cannot drift on which one clears the duplicate-end latch. */
+bool BwaBed::begin(const String &p, bwa_sound *out) {
+	if (!LIVE) {
+		return false;
+	}
+	const bwa_sound snd = owner->load_ambisonic(p, format == FORMAT_FUMA, async_load);
+	if (!snd) {
+		return false;
+	}
+	*out = snd;
+	playing_snd = snd;
+	pending_path = p;
+	state = PENDING;
+	pending_frames = 0;
+	/* A cache HIT is already resident, so only ask about a handle that can still be decoding.
+	 * Tri-state, because the question the latch below turns on is "did this play BIND", and only
+	 * `ready > 0` answers yes: 0 (still decoding) and -1 (the decode already failed) both mean the
+	 * core is HOLDING the play, control-side, and it never reached rt.c's source_bind. Reading -1 as
+	 * "not held" is also what used to let a failure that landed before this probe fall through to the
+	 * PENDING_GRACE timeout, which drops the play silently and reports nothing. */
+	const int ready = async_load ? owner->sound_ready_state(snd) : 1;
+	pending_async = ready <= 0;
+	if (!pending_async) {
+		/* Only a play that BINDS may void the previous end's duplicate suppression. A held play
+		 * never reaches source_bind, so the core never bumps play_seq - and play_seq is the gate
+		 * that would otherwise have dropped a completion straggling in from the previous play.
+		 * Clear the latch for a held play and that straggler passes both gates and fires
+		 * `finished` for a bed this node has already reported, or (after stop()) was told never to
+		 * report at all. The held case clears it in post_commit instead, on the frame the core
+		 * binds it. */
+		end_fired = false;
+	}
+	return true;
+}
+
 void BwaBed::play() { play_clip(clip); }
 
 void BwaBed::play_clip(const String &p) {
-	if (!LIVE) {
-		return;
-	}
-	const bwa_sound snd = owner->load_ambisonic(p, format == FORMAT_FUMA, async_load);
-	if (snd) {
-		playing_snd = snd;
+	bwa_sound snd;
+	if (begin(p, &snd)) {
 		/* A not-ready handle is fine here: the core holds the play control-side and starts the
 		 * field from the top on the block its data lands. It also skips the mono guard for a
 		 * still-loading asset, which reports 0 channels because nothing is decoded yet. */
@@ -96,12 +132,157 @@ void BwaBed::play_clip(const String &p) {
 	}
 }
 
+void BwaBed::play_at(const String &p, int64_t start_sample) {
+	if (!bwa_guard_nonneg(this, "play_at", "start_sample", start_sample)) {
+		return;
+	}
+	bwa_sound snd;
+	if (begin(p, &snd)) {
+		bwa_bed_play_at(ENG, bed, snd, loop, (uint64_t)start_sample);
+	}
+}
+
+void BwaBed::play_loop(const String &p, int64_t loop_beg, int64_t loop_end) {
+	if (!bwa_guard_nonneg(this, "play_loop", "loop_beg", loop_beg) ||
+			!bwa_guard_nonneg(this, "play_loop", "loop_end", loop_end)) {
+		return;
+	}
+	bwa_sound snd;
+	if (begin(p, &snd)) {
+		bwa_bed_play_loop(ENG, bed, snd, (uint64_t)loop_beg, (uint64_t)loop_end);
+	}
+}
+
+void BwaBed::stop_at(int64_t stop_sample) {
+	/* Deliberately NOT on_stopped_externally(): a scheduled stop is an arranged ending and
+	 * fires `finished`. It takes the same click-free path as stop(), which posts no completion
+	 * event, so the is-playing edge in post_commit() is what reports it. */
+	if (!bwa_guard_nonneg(this, "stop_at", "stop_sample", stop_sample)) {
+		return;
+	}
+	if (LIVE) {
+		bwa_bed_stop_at(ENG, bed, (uint64_t)stop_sample);
+	}
+}
+
+void BwaBed::set_region_frames(int64_t start_frame, int64_t end_frame) {
+	if (!bwa_guard_nonneg(this, "set_region_frames", "start_frame", start_frame) ||
+			!bwa_guard_nonneg(this, "set_region_frames", "end_frame", end_frame) || !LIVE) {
+		return;
+	}
+	bwa_bed_set_region(ENG, bed, (uint64_t)start_frame, (uint64_t)end_frame);
+}
+
+void BwaBed::set_region_seconds(double start_seconds, double end_seconds) {
+	if (!bwa_guard_nonneg(this, "set_region_seconds", "start_seconds", start_seconds) ||
+			!bwa_guard_nonneg(this, "set_region_seconds", "end_seconds", end_seconds) || !LIVE) {
+		return;
+	}
+	const int rate = owner->get_resolved_sample_rate();
+	if (rate > 0) {
+		/* 0 seconds means the asset end here too, and 0 * rate is 0, so the sentinel survives
+		 * the conversion without a special case. */
+		set_region_frames((int64_t)(start_seconds * (double)rate),
+				(int64_t)(end_seconds * (double)rate));
+	}
+}
+
+/* The AUTHORITATIVE end: BwaEngine drained this handle out of bwa_poll_ended after the commit.
+ * Nothing is guessed - the core posted the completion for this exact play of this exact
+ * generation - so a soundfield shorter than a frame reports correctly. */
+void BwaBed::notify_ended() {
+	/* The completion belongs to the play that ENDED, and that is never an async play still HELD: a
+	 * held play has not bound, so it cannot have ended. Tearing the pending fields down for it would
+	 * strand the play the caller is still waiting on - is_loading() would read false while it
+	 * decodes, the decode-failed report could never fire, and post_commit's IDLE case ignores `now`,
+	 * so the machine would never reach PLAYING and a later stop_at would emit no `finished`. */
+	if (!pending_async) {
+		state = IDLE;
+		playing_snd = 0;
+	}
+	if (end_fired) { /* the halt path already accounted for this end - see the header */
+		end_fired = false;
+		return;
+	}
+	emit_signal("finished");
+}
+
+/* A loop WRAP. No state change and no `end_fired` interaction: the bed is still playing, and
+ * both feeds of `finished` are about a voice going quiet. One signal per wrap, so a loop
+ * region shorter than a frame emits several times in one frame. */
+void BwaBed::notify_looped() { emit_signal("looped"); }
+
+void BwaBed::post_commit() {
+	if (!LIVE) {
+		return;
+	}
+	const bool now = bwa_bed_is_playing(ENG, bed);
+	switch (state) {
+		case PENDING:
+			if (pending_async) {
+				/* The HELD case is asked FIRST, because a held play has not bound and `now` therefore
+				 * says nothing about it: the core does not stop the previous play to wait, so a true
+				 * reading here is the PREVIOUS soundfield still running. Taking that as "the play
+				 * landed" dropped the watch while the decode was still in flight, which made
+				 * is_loading() lie and left a failure with nothing to report it. Ask the decode
+				 * instead, and spend no grace on it: the window reopens, from zero, on the frame the
+				 * data lands. */
+				const int ready = owner->sound_ready_state(playing_snd);
+				if (ready < 0) {
+					UtilityFunctions::push_error(
+							vformat("BwaBed (%s): the async load of \"%s\" failed: %s", get_name(),
+									pending_path, owner->get_last_error()));
+					state = IDLE;
+					pending_async = false;
+					playing_snd = 0;
+				} else if (ready > 0) {
+					/* The pump point that answered "ready" is the one that ADOPTED the decode and fired
+					 * the held play, so this is the frame the play bound - and the only place a held
+					 * play may void the previous end's duplicate suppression. See begin(). */
+					pending_async = false;
+					pending_frames = 0;
+					end_fired = false;
+				}
+			} else if (now) {
+				state = PLAYING; // the audio thread picked the play up; the halt edge is armed now
+			} else if (++pending_frames > PENDING_GRACE) {
+				/* Never observed playing and no completion event arrived either: a dropped play
+				 * or a voice stolen at onset. Stop CLAIMING it, but emit nothing - a soundfield
+				 * shorter than a frame lands in notify_ended long before this. */
+				state = IDLE;
+			}
+			break;
+		case PLAYING:
+			/* The explicit-HALT fallback, and only that: a natural end has already run through
+			 * notify_ended above (the drain precedes this pass), which left state IDLE, so the
+			 * silence it left behind is not an edge any more. What still reaches here is
+			 * stop_at. `end_fired` keeps a straggling completion event from doubling it. */
+			if (!now) {
+				state = IDLE;
+				end_fired = true;
+				emit_signal("finished");
+			}
+			break;
+		case IDLE:
+			break;
+	}
+}
+
+void BwaBed::on_stopped_externally() {
+	state = IDLE;
+	playing_snd = 0;
+	pending_async = false;
+	end_fired = true;
+}
+
 bool BwaBed::is_loading() const {
 	return LIVE && playing_snd && owner->sound_ready_state(playing_snd) == 0;
 }
 
 void BwaBed::stop() {
-	playing_snd = 0;   /* also cancels a play still held for an async decode (rt drops it) */
+	/* An explicit stop is not an end (see the header). It also cancels a play still waiting on
+	 * an async decode: the core drops that hold on the same call, so the detector must too. */
+	on_stopped_externally();
 	if (LIVE) {
 		bwa_bed_stop(ENG, bed);
 	}
@@ -151,20 +332,24 @@ void BwaBed::fade_to(float target, float seconds) {
 }
 
 void BwaBed::fade_out(float seconds) {
+	on_stopped_externally(); // ends on the stop path once silent - same rule as stop()
 	if (LIVE) {
 		bwa_bed_fade_out(ENG, bed, seconds);
 	}
 }
 
 void BwaBed::seek_frames(int64_t frame) {
+	if (!bwa_guard_nonneg(this, "seek_frames", "frame", frame)) {
+		return;   /* same refusal as BwaEmitter::seek_frames: an unguarded -1 reaches the ABI as 1.8e19 */
+	}
 	if (LIVE) {
 		bwa_bed_seek(ENG, bed, (uint64_t)frame);
 	}
 }
 
 void BwaBed::seek_seconds(double seconds) {
-	if (!LIVE || seconds < 0.0) {
-		return;
+	if (!bwa_guard_nonneg(this, "seek_seconds", "seconds", seconds) || !LIVE) {
+		return;   /* warns rather than returning in silence, like every other transport refusal */
 	}
 	const int rate = owner->get_resolved_sample_rate();
 	if (rate > 0) {
@@ -172,7 +357,12 @@ void BwaBed::seek_seconds(double seconds) {
 	}
 }
 
-bool BwaBed::is_playing() const { return LIVE && bwa_bed_is_playing(ENG, bed); }
+/* A just-issued play counts as playing, exactly as BwaEmitter::is_playing does and for the same
+ * reason: bwa_bed_play only ENQUEUES, so the raw readback says false until the audio thread
+ * consumes the command and the obvious `play(); if is_playing():` reads wrong for a frame. The two
+ * classes must not disagree about what "playing" means, and a play the core is still HOLDING on an
+ * async decode is outstanding in exactly the same sense. */
+bool BwaBed::is_playing() const { return state == PENDING || (LIVE && bwa_bed_is_playing(ENG, bed)); }
 
 int64_t BwaBed::get_playhead_frames() const {
 	return LIVE ? (int64_t)bwa_bed_get_playhead_frames(ENG, bed) : 0;
@@ -212,6 +402,14 @@ void BwaBed::_bind_methods() {
 
 	ClassDB::bind_method(D_METHOD("play"), &BwaBed::play);
 	ClassDB::bind_method(D_METHOD("play_clip", "path"), &BwaBed::play_clip);
+	ClassDB::bind_method(D_METHOD("play_at", "path", "start_sample"), &BwaBed::play_at);
+	ClassDB::bind_method(
+			D_METHOD("play_loop", "path", "loop_beg", "loop_end"), &BwaBed::play_loop);
+	ClassDB::bind_method(D_METHOD("stop_at", "stop_sample"), &BwaBed::stop_at);
+	ClassDB::bind_method(D_METHOD("set_region_frames", "start_frame", "end_frame"),
+			&BwaBed::set_region_frames);
+	ClassDB::bind_method(D_METHOD("set_region_seconds", "start_seconds", "end_seconds"),
+			&BwaBed::set_region_seconds);
 	ClassDB::bind_method(D_METHOD("stop"), &BwaBed::stop);
 	ClassDB::bind_method(D_METHOD("fade_to", "gain", "seconds"), &BwaBed::fade_to);
 	ClassDB::bind_method(D_METHOD("fade_out", "seconds"), &BwaBed::fade_out);
@@ -237,6 +435,14 @@ void BwaBed::_bind_methods() {
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "group", PROPERTY_HINT_RANGE, "0,7,1"), "set_group",
 			"get_group");
 	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "paused"), "set_paused", "get_paused");
+
+	/* The same pair BwaEmitter carries, and the same contract: `finished` means the soundfield
+	 * RAN OUT (a non-loop end, a region end) or that stop_at() landed - never that stop() or
+	 * fade_out() was called. */
+	ADD_SIGNAL(MethodInfo("finished"));
+	/* One per loop WRAP. A looping bed never finishes, so `finished` reports it never; this is
+	 * what paces a trial or cues a visual off an ambience loop. */
+	ADD_SIGNAL(MethodInfo("looped"));
 
 	BIND_ENUM_CONSTANT(FORMAT_AMBIX);
 	BIND_ENUM_CONSTANT(FORMAT_FUMA);

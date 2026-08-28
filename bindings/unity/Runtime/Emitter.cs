@@ -3,7 +3,7 @@
 // push. Audio files live under StreamingAssets and are decoded by the engine (not Unity's AudioClip).
 // The source-generic surface (lifecycle, gain/spread/occlusion/... knobs) lives on SourceBase —
 // this class adds the clip/playback half: Play and its scheduled/looping/queued variants, pitch,
-// seek, and the onFinished edge.
+// seek, the play region, and the onFinished/onLoop events.
 using System;
 using UnityEngine;
 using UnityEngine.Events;
@@ -29,16 +29,37 @@ namespace BwAudio
         [Header("Events")]
         [Tooltip("Fires when the source stops producing audio — a non-looping clip finished, or Stop().")]
         public UnityEvent onFinished = new UnityEvent();
+        [Tooltip("Fires each time a LOOPING clip wraps back to its loop start. A looping voice never " +
+                 "finishes, so onFinished reports it never — this is the event to pace experimental " +
+                 "trials or cue visuals from. One call per wrap, so a loop shorter than a frame fires " +
+                 "several times in one frame.")]
+        public UnityEvent onLoop = new UnityEvent();
 
-        bool _wasPlaying;     // for the play->stop edge that drives onFinished
+        // onFinished has two feeds, because the engine reports only one of the two ways a voice goes
+        // quiet. A voice that RAN OUT (a non-loop clip finished, a queue drained, a push feed drained)
+        // posts an ended EVENT the block it happens, which Engine drains with bwa_poll_ended and routes
+        // here — that path cannot miss a clip shorter than a frame, which is the whole reason it exists.
+        // An explicit HALT (Stop, StopAt, FadeOut, Engine.StopGroup/StopAll, a voice steal) posts no
+        // event at all: the engine's position is that a halt is not a completion. Unity's onFinished has
+        // always fired for those, so the IsPlaying edge below stays as the narrow fallback that covers
+        // exactly that gap. `_endFired` keeps the two from both reporting the same end.
+        bool _wasPlaying;     // we have seen the CURRENT play as playing, so a fall to silence is an end
+        bool _endFired;       // the edge fallback already reported this end; swallow the event if one follows
         uint _pending;        // an async handle bound to this source but not yet decoded (0 = none)
+
+        // _endFired is cleared by the next play that BINDS, and a play HELD on an async decode has not
+        // bound. The engine only bumps its per-slot play counter at bind time, and that counter is the
+        // gate that drops a completion straggling in from the PREVIOUS play; until it moves, the
+        // straggler is still deliverable and this latch is the only thing standing in its way. Clearing
+        // it on a held play therefore lets one end reach onFinished twice. Push() clears it instead, on
+        // the frame the load lands — which is the frame the engine binds the play.
 
         // ---- SourceBase hooks ------------------------------------------------------------------------
 
         protected override uint CreateSource(IntPtr eng) => Bwa.bwa_source_create(eng);
 
-        // Resets _wasPlaying so a recycled component never inherits a stale play edge.
-        protected override void ResetPlaybackState() { _wasPlaying = false; _pending = 0; }
+        // Resets the completion state so a recycled component never inherits a stale play edge.
+        protected override void ResetPlaybackState() { _wasPlaying = false; _endFired = false; _pending = 0; }
 
         // Pitch is a desc field, so the create-time bulk push carries it (SourceBase.TryInit) — there is
         // nothing left for this hook to do. The Pitch property is still the live, incremental path.
@@ -55,6 +76,7 @@ namespace BwAudio
         protected override void OnDisable()
         {
             _wasPlaying = false;                 // never carry a stale play edge into a re-enable
+            _endFired = false;
             base.OnDisable();
         }
 
@@ -67,14 +89,51 @@ namespace BwAudio
             // While an async load is in flight the source is bound and silent, which looks exactly like
             // a decode that FAILED — a failure never becomes ready. Engine.WatchPendingLoad polls it
             // until it resolves one way or the other and returns 0 once it has, so the watch stops.
-            _pending = Engine.WatchPendingLoad(_pending, this, "source");
+            _pending = Engine.WatchPendingLoad(_pending, this, "source", out bool landed);
+            // The probe above is a pump point, so `landed` is the very call that adopted the decode and
+            // released the held play into the engine — which makes this the moment the play BINDS, and
+            // the only moment a held play may void the previous end's duplicate suppression. See Play().
+            if (landed) _endFired = false;
+        }
 
-            // playback edge -> onFinished (poll the engine's per-source playing state). Best-effort: the
-            // play is observed a frame or two after Play() (it's a queued command), and a clip shorter
-            // than the frame interval may never read as playing, so onFinished can be missed for it.
+        /// <summary>The engine reported this source's voice as ENDED (Engine drained it from
+        /// bwa_poll_ended after the commit). Fires onFinished unless the halt fallback already did.
+        /// </summary>
+        internal override void NotifyEnded()
+        {
+            // The fallback runs a hair earlier in the frame than the event that describes the same end
+            // can be drained (the voice can end between this frame's drain and this frame's IsPlaying
+            // read), so ONE end can reach both feeds. Whichever reports first wins; this latch eats the
+            // straggler. It is cleared by the next play that BINDS, so a swallowed straggler can never
+            // eat a LATER end — including the sub-frame clip this whole path exists to catch.
+            if (_endFired) { _endFired = false; return; }
+            _wasPlaying = false;
+            onFinished.Invoke();
+        }
+
+        /// <summary>The engine reported this source's voice as having WRAPPED at a loop point (Engine
+        /// drained it from bwa_poll_looped after the commit). Called once per wrap.</summary>
+        internal override void NotifyLooped()
+        {
+            // Deliberately no latch and no _wasPlaying touch. A wrap is not an end: the voice is still
+            // playing, both feeds of onFinished are about a voice going quiet, and neither can produce a
+            // wrap — so there is nothing here to de-duplicate against and nothing to suppress.
+            onLoop.Invoke();
+        }
+
+        /// <summary>Called once per frame by Engine, after the commit and both event drains.</summary>
+        internal override void PostCommit()
+        {
+            if (!Live) return;
+
+            // The explicit-halt fallback (see the field comments). Reading AFTER the drain is what keeps
+            // a natural end from being reported twice: NotifyEnded has already cleared _wasPlaying by
+            // the time this runs, so the fall to silence it left behind is not an edge any more.
+            // A play held on an async decode never arms this: it honestly reads "not playing" while it
+            // waits, and _wasPlaying only latches on a voice actually observed playing.
             bool now = Bwa.bwa_source_is_playing(Eng, _src);
             if (now) _wasPlaying = true;
-            else if (_wasPlaying) { _wasPlaying = false; onFinished.Invoke(); }
+            else if (_wasPlaying) { _wasPlaying = false; _endFired = true; onFinished.Invoke(); }
         }
 
         // The clip handle for a play: async when opted in, which returns immediately and lets the engine
@@ -104,15 +163,16 @@ namespace BwAudio
             if (snd == 0) return;
             Bwa.bwa_source_play(Eng, _src, snd, loop);
             _paused = false;                                  // play restarts un-paused
-            _pending = held ? snd : 0;   // a READY play supersedes a still-pending earlier one
+            if (!held) _endFired = false;   // only a play that BINDS voids the previous end's suppression
+            _pending = held ? snd : 0;      // a READY play supersedes a still-pending earlier one
         }
 
         /// <summary>Sample-accurate scheduled play — AudioSource.PlayScheduled equivalent, on the
         /// engine's dsp clock instead of AudioSettings.dspTime: output begins exactly when
-        /// Engine.DspTime reaches `startSample`. Schedule with margin (at least a block; e.g.
-        /// <c>PlayAt(engine.DspTime + engine.sampleRate / 2)</c> starts half a second out); a start
+        /// Engine.DspTimeFrames reaches `startSample`. Schedule with margin (at least a block; e.g.
+        /// <c>PlayAt(engine.DspTimeFrames + engine.sampleRate / 2)</c> starts half a second out); a start
         /// already in the past plays immediately. Keep the startSample you passed —
-        /// <c>DspTime - startSample</c> is the sync clock for driving visuals (or poll Playhead).
+        /// <c>DspTimeFrames - startSample</c> is the sync clock for driving visuals (or poll PlayheadFrames).
         /// <para>With `loadAsync` on, the schedule is only as good as the decode: a start time that
         /// arrives before the data does plays as soon as the data lands, not at `startSample`.</para></summary>
         public void PlayAt(ulong startSample, string clipOverride = null)
@@ -122,7 +182,8 @@ namespace BwAudio
             if (snd == 0) return;
             Bwa.bwa_source_play_at(Eng, _src, snd, loop, startSample);
             _paused = false;
-            _pending = held ? snd : 0;   // a READY play supersedes a still-pending earlier one
+            if (!held) _endFired = false;   // only a play that BINDS voids the previous end's suppression
+            _pending = held ? snd : 0;      // a READY play supersedes a still-pending earlier one
         }
 
         /// <summary>Play with an intro→loop region: the intro <c>[0, loopBeg)</c> plays once, then the
@@ -137,10 +198,11 @@ namespace BwAudio
             if (snd == 0) return;
             Bwa.bwa_source_play_loop(Eng, _src, snd, loopBeg, loopEnd);
             _paused = false;
-            _pending = held ? snd : 0;   // a READY play supersedes a still-pending earlier one
+            if (!held) _endFired = false;   // only a play that BINDS voids the previous end's suppression
+            _pending = held ? snd : 0;      // a READY play supersedes a still-pending earlier one
         }
 
-        /// <summary>Schedule a click-free stop on the engine's dsp clock: when Engine.DspTime reaches
+        /// <summary>Schedule a click-free stop on the engine's dsp clock: when Engine.DspTimeFrames reaches
         /// stopSample the source fades out over one block and ends — never a hard cut, so it can't pop.
         /// Block-granular (silence lands within ~one block of stopSample); a stopSample in the past
         /// stops now; a later Play/PlayAt/PlayLoop clears it. Same time base as PlayAt.</summary>
@@ -178,10 +240,51 @@ namespace BwAudio
         /// <summary>Drop the pending gapless chain queued with Queue.</summary>
         public void ClearQueue() { if (Live) Bwa.bwa_source_clear_queue(Eng, _src); }
 
-        /// <summary>Jump to `samples` (engine-rate frames) into the clip — AudioSource.timeSamples-set
+        /// <summary>Jump to <c>frame</c> (engine-rate frames) into the clip — AudioSource.timeSamples-set
         /// equivalent, click-free (ramp-out → jump → ramp-in). In-memory clips only; streamed clips
-        /// ignore it. Past-the-end wraps a looping clip and ends a one-shot.</summary>
-        public void Seek(ulong samples) { if (Live) Bwa.bwa_source_seek(Eng, _src, samples); }
+        /// ignore it. Past-the-end wraps a looping clip and ends a one-shot.
+        /// <para>Named for its unit: <c>AudioSource.time</c> is SECONDS, so a bare Seek would read as
+        /// seconds to anyone coming from Unity's own API, and the two spellings differ by a factor of
+        /// the sample rate. Same reason as <see cref="SetRegionFrames"/> below.</para></summary>
+        public void SeekFrames(ulong frame) { if (Live) Bwa.bwa_source_seek(Eng, _src, frame); }
+
+        /// <summary>The seconds twin of <see cref="SeekFrames"/> (converted at the engine's sample
+        /// rate). A negative position is ignored.</summary>
+        public void SeekSeconds(double seconds)
+        {
+            if (!Live || seconds < 0.0) return;
+            double rate = Engine.Instance ? Engine.Instance.sampleRate : 0;
+            if (rate <= 0.0) return;
+            SeekFrames((ulong)(seconds * rate));
+        }
+
+        /// <summary>Bound playback to the region <c>[startFrame, endFrame)</c> of the clip, in engine-rate
+        /// frames; <c>endFrame</c> 0 means the clip end. A looping clip wraps back to <c>startFrame</c>
+        /// (and raises <see cref="onLoop"/>); a one-shot ENDS at <c>endFrame</c> exactly as it would at
+        /// the clip end (and raises <see cref="onFinished"/>). So a loop region and a truncated one-shot
+        /// are one call.
+        /// <para>Call it AFTER a Play: the bounds resolve against the bound clip, and any
+        /// Play/PlayAt/PlayLoop resets the region. It does not move the playhead, so a region set
+        /// mid-play takes effect at the next boundary. In-memory clips only; streamed clips ignore it.
+        /// An <c>endFrame</c> at or below <c>startFrame</c> (and not 0) is refused.</para>
+        /// <para>Named for its unit, like <see cref="PlayLoop"/>'s frames and the frames/seconds pair
+        /// below: a bare SetRegion would read as seconds to anyone coming from AudioSource.time, and the
+        /// two spellings differ by a factor of the sample rate.</para></summary>
+        public void SetRegionFrames(ulong startFrame, ulong endFrame)
+        {
+            if (Live) Bwa.bwa_source_set_region(Eng, _src, startFrame, endFrame);
+        }
+
+        /// <summary>The seconds twin of <see cref="SetRegionFrames"/> (converted at the engine's sample
+        /// rate). <c>endSeconds</c> 0 means the clip end, matching the frames form; a negative bound is
+        /// ignored.</summary>
+        public void SetRegionSeconds(double startSeconds, double endSeconds)
+        {
+            if (!Live || startSeconds < 0.0 || endSeconds < 0.0) return;
+            double rate = Engine.Instance ? Engine.Instance.sampleRate : 0;
+            if (rate <= 0.0) return;
+            SetRegionFrames((ulong)(startSeconds * rate), (ulong)(endSeconds * rate));
+        }
 
         /// <summary>Playback rate (1 = native, clamped [0.25, 4]); the rate GLIDES, so a change bends the
         /// pitch rather than stepping it. In-memory clips only — streamed clips ignore it.</summary>

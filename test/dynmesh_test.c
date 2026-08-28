@@ -12,7 +12,9 @@
  *      shutting down cleanly) pins the lock.
  *
  * Occlusion is a geometric visibility test (deterministic), published per source via rt_set_direct and
- * read back with rt_get_occlusion — no device, sound asset, or voice machinery needed.
+ * read back with rt_get_occlusion — no device or sound asset needed. The source handle DOES have to be
+ * a real one from rt_source_create: rt_get_occlusion gates on the control-side handle table, like every
+ * other per-handle readback, so a hand-picked integer would read a permanent 1.0 (clear).
  */
 #include "rt.h"
 #include "layout.h"
@@ -39,11 +41,16 @@ static float settle_occ(RtCore* rt, uint32_t handle) {
 }
 
 int main(void) {
-    const uint32_t SR = 48000, BLK = 256, H = 5 /* the occluded source's handle (idx 5) */;
+    const uint32_t SR = 48000, BLK = 256;
     RtCore* rt = rt_create(64, 64, SR, BWA_CHANNELS);
     if (!rt) { printf("FAIL: rt_create\n"); return 1; }
     Layout L = layout_default();
     rt_set_layout(rt, &L);
+
+    /* the occluded source. No sound is ever bound to it: the occlusion sim keys off the handle
+     * alone, and the readback only needs the slot to be a live one. */
+    const uint32_t H = rt_source_create(rt);
+    if (!H) { printf("FAIL: rt_source_create\n"); rt_destroy(rt); return 1; }
 
     /* listener at the center ear plane, source 3 m to +X on the same line */
     float lp[3] = { 0.0f, 1.5f, 0.0f }, lq[4] = { 0, 0, 0, 1 };

@@ -28,6 +28,7 @@
 #include <godot_cpp/variant/node_path.hpp>
 #include <godot_cpp/variant/packed_float32_array.hpp>
 #include <godot_cpp/variant/packed_int32_array.hpp>
+#include <godot_cpp/variant/packed_int64_array.hpp>
 #include <godot_cpp/variant/packed_vector3_array.hpp>
 #include <godot_cpp/variant/quaternion.hpp>
 #include <godot_cpp/variant/string.hpp>
@@ -41,6 +42,7 @@
 namespace godot {
 
 class BwaSource;
+class BwaBed;
 
 class BwaEngine : public Node {
 	GDCLASS(BwaEngine, Node)
@@ -225,9 +227,12 @@ public:
 	/* Scene transitions. Both take the click-free one-block fade every stop takes, both stop
 	 * beds (a bed is a voice), and both drop the stopped voices' pending queues. Neither
 	 * touches group gains, the pause gates, or the master gain: a stop stops sound, it does
-	 * not reset the mixer. stop_all additionally drops plays still waiting on an async
-	 * decode; group_stop cannot, because an unbound held play has no voice to read a group
-	 * from. Both tell the emitters so a scene change never reads as a `finished`. */
+	 * not reset the mixer. Both also drop the plays still waiting on an async decode, which
+	 * would otherwise start by themselves once their data landed: stop_all drops every one,
+	 * group_stop the ones issued on sources in that group. That is what makes the
+	 * on_stopped_externally() calls below correct rather than optimistic - clearing an
+	 * emitter's pending_async matches a core that really did cancel the play. Both tell the
+	 * emitters so a scene change never reads as a `finished`. */
 	void group_stop(int group);
 	void stop_all();
 	void reverb_set_gain(float linear);
@@ -250,9 +255,30 @@ public:
 	/* The engine's CURRENT tuning, so the inspector can be reconciled with live state instead of
 	 * shadowing every field by hand. */
 	godot::Dictionary get_live_tuning() const;
-	/* Handles whose voices ENDED since the last call. Completion as an event: BwaEmitter no longer
-	 * has to guess from is_playing, which cannot see a clip shorter than a frame. */
-	godot::PackedInt64Array poll_ended();
+	/* Handles whose voices ENDED, and handles whose voices WRAPPED at a loop point, as of this
+	 * frame's drain. Completion and loop boundaries as EVENTS: BwaEmitter no longer has to guess an
+	 * end from is_playing, which cannot see a clip shorter than a frame, and a looping voice never
+	 * ends at all so nothing but the wrap can pace a trial off it.
+	 *
+	 * These return THIS FRAME'S BATCH, not a fresh drain. They are NAMED for that: an earlier
+	 * poll_ended() drained destructively, and reusing that name for a non-destructive batch would
+	 * have turned a `while poll_ended().size() > 0` loop into a hang with no error. A rename fails
+	 * loudly instead. The ABI's bwa_poll_ended/_looped are
+	 * destructive and engine-wide, so exactly ONE caller may make them or the readers silently eat
+	 * each other's events - and BwaEngine has to be that caller, because it is what routes each
+	 * handle to the node that owns it. So the drain happens once per _process (right after the
+	 * commit that fills the rings) and both batches are kept here for the frame. Reading them twice
+	 * gives the same answer twice; not reading them loses nothing. A script whose process_priority
+	 * puts it BEFORE this node sees the previous frame's batch, which is a frame of lag, never a
+	 * miss. Most callers want the `finished` / `looped` signals instead. */
+	godot::PackedInt64Array get_ended_this_frame() const { return ended_this_frame; }
+	godot::PackedInt64Array get_looped_this_frame() const { return looped_this_frame; }
+	/* Events the ENGINE dropped because nothing drained them in time (running totals; both rings are
+	 * bounded and drop the OLDEST). A rising ended total means that many `finished` signals never
+	 * fired and something stalled the frame. A rising loop total can also just mean a loop region
+	 * short enough to wrap faster than the frame rate reads it - pace off the wraps you receive. */
+	int64_t get_ended_events_dropped() const { return (int64_t)ended_dropped; }
+	int64_t get_loop_events_dropped() const { return (int64_t)looped_dropped; }
 	bool apply_setup(Setup setup);
 	void set_dual_band_cap(bool on);
 	bool get_dual_band_cap() const { return dual_band_cap; }
@@ -344,7 +370,13 @@ public:
 	void scene_remove_dynamic_mesh(int handle);
 
 	/* --- clock / scheduling --- */
-	int64_t get_dsp_time() const;
+	/* Named for the UNIT, like the latency and seek pairs below and for the same reason: the engine
+	 * clock is FRAMES, and every host's dsp-time call is seconds (Unity's AudioSettings.dspTime is
+	 * a double of seconds; Godot's own AudioServer times are seconds too). Both units are exposed;
+	 * neither is spelled the colliding way. get_dsp_time_seconds is a convenience derived from the
+	 * frame count and the resolved rate - schedule with the FRAME value, which is exact. */
+	int64_t get_dsp_time_frames() const;
+	float get_dsp_time_seconds() const;
 	/* {valid: bool, dsp_sample: int, host_time_ns: int} — the jitter-free wall<->dsp pair. */
 	Dictionary get_clock() const;
 	/* Named for the UNIT, deliberately. Godot's own AudioServer.get_output_latency() returns
@@ -405,6 +437,13 @@ public:
 	 * detach protocol as sources, minus the per-frame pull. See bwa_client.h. */
 	void register_client(BwaEngineClient *c);
 	void unregister_client(BwaEngineClient *c);
+	/* Beds register a SECOND time, here. A bed is a voice - the core reports its handle through
+	 * bwa_poll_ended and bwa_poll_looped like any other - but BwaBed is a Node, not a BwaSource,
+	 * because a bed has no position. Rather than force it into the source registry (which exists
+	 * to PULL a transform every frame, the one thing a bed has none of), the event drain and the
+	 * post-commit pass consult this list too. */
+	void register_bed(BwaBed *b);
+	void unregister_bed(BwaBed *b);
 	/* A PROCESS-WIDE monotonic id, taken from a static counter on every successful start.
 	 * Material tokens belong to the engine instance that issued them, so BwaMaterial keys
 	 * its cache on this. It must be process-wide, not per-instance: a per-instance counter
@@ -426,12 +465,34 @@ private:
 	 * only way a room box and separate occluders can coexist. */
 	void build_static_scene();
 
+	/* The ONE call site of bwa_poll_ended / bwa_poll_looped (see poll_ended above for why it has
+	 * to be exactly one), run right after the commit that fills the rings. Routes each handle to
+	 * the registered source that owns it and keeps the batch for the frame. */
+	void drain_events();
+	/* handle -> registered source, by linear scan. A parallel map would have to be kept in step
+	 * with `sources` on every register/unregister/engine_gone, and a map that falls out of step
+	 * routes an event to a freed node; the vector IS the registry, so scanning it cannot. Source
+	 * counts here are small enough that this is not worth trading for that risk. */
+	BwaSource *source_for_handle(uint32_t h) const;
+	/* The same lookup over the bed registry. Bed and source handles come out of ONE pool
+	 * (bwa_bed_create IS bwa_source_create), so a handle is either a source's or a bed's and
+	 * never both - which is what makes consulting the two lists in turn correct. */
+	BwaBed *bed_for_handle(uint32_t h) const;
+
+	PackedInt64Array ended_this_frame;   /* this frame's drained batches, kept for            */
+	PackedInt64Array looped_this_frame;  /* get_ended/looped_this_frame (see their decls) */
+	uint64_t ended_dropped = 0;
+	uint64_t looped_dropped = 0;
+	bool ended_drop_warned = false;      /* the dropped warnings fire once, not once per frame */
+	bool loop_drop_warned = false;
+
 	static int next_generation; /* process-wide; see get_generation */
 
 	bwa_engine *eng = nullptr;
 	int generation = 0; /* 0 = never started; assigned from next_generation in _ready */
 	std::vector<BwaSource *> sources;
 	std::vector<BwaEngineClient *> clients;
+	std::vector<BwaBed *> beds; /* the event route; see register_bed */
 
 	/* One record per (path, flags) key this node acquired, holding exactly ONE reference.
 	 * A flat vector, not a map: the core does the deduplication and the refcounting now, so

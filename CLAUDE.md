@@ -217,9 +217,24 @@ Regression-preventing gotchas. Each has bitten before or guards a real invariant
   is TRUE, so the whole reject-non-finite guard family passes it, and then `bus * 3e38` OVERFLOWS to
   Inf. Gains are sticky, so every later block overflows too, and the Inf reaches the align delay line
   and the room-EQ biquads, whose IIR state holds it past any later correction. `test_fuzz_api` seed
-  12648430 found this on master gain; the whole linear-gain family is capped at `BWA_MAX_GAIN`
-  (`rt.h`, +80 dB) now. Any new value that SCALES the bus needs a magnitude cap, not just a finite
-  check. Note this is invisible to a reviewer scanning for missing guards — the guard is right there.
+  12648430 found this on master gain. Any new value that SCALES the bus needs a magnitude cap, not
+  just a finite check. Note this is invisible to a reviewer scanning for missing guards — the guard
+  is right there.
+  The same defect then turned up on POSITION, which is worth stating separately because the
+  overflow step is different: nothing multiplies a coordinate by the bus, but EVERY spatial solve
+  begins by SQUARING a coordinate difference (`dbap.c`'s dist2, the spread frame's normalize, the
+  ISM path length), so `dx*dx` on a 3e38 is +Inf before any downstream guard sees a number it could
+  reject, and the Inf/Inf or Inf*0 of the normalize that follows is NaN — which the gain ramp
+  `x + (t - x) * k` can never expel. `test_fuzz_api` seeds 126 / 142 / 185 found it on the listener
+  pose. Corollary: a value DERIVED from a bounded one is not automatically bounded. An ISM room
+  dimension is not a coordinate but `ism.c` mirrors the source across it (`2*plane - src`), so an
+  absurd-but-finite room is an absurd IMAGE position that reaches the panner the same way.
+  There are now THREE magnitude caps in this family, all in `rt.h`: `BWA_MAX_GAIN` (+80 dB, anything
+  that scales the bus), `BWA_MAX_SAMPLE` (+30 dBFS, any sample entering from outside) and
+  `BWA_MAX_COORD` (1e6 m, every room coordinate), plus `BWA_MAX_ROOM_DIM` derived from the last as
+  the factor one image-source mirror multiplies through. `sane.h` spells the checks
+  (`bwa_finite_clamp` / `bwa_finite_bounded` / `bwa_finite3_bounded`) with the bound as a REQUIRED
+  argument, so "I checked finite and forgot the magnitude" stops being expressible — use them.
 - **`powf(base, exp)` with a negative base and a NON-INTEGER exponent is NaN**, and one NaN
   poisons a whole normalized gain vector. `spcap.c`'s lobe `0.5 + 0.5*cos` rounds to ~-5e-8 for an
   antipodal speaker, which was harmless for as long as the focus exponent was the integer 12 and
@@ -299,8 +314,12 @@ Regression-preventing gotchas. Each has bitten before or guards a real invariant
   behind the null sink, which returns 0 — and 0 is 0 in any unit.
 - **Runtime-printed strings are ASCII.** An en-dash in a `push_warning` becomes mojibake on a
   Windows console codepage. Comments, docs and inspector hint strings keep their punctuation;
-  anything that can reach a console does not. `rg '"[^"]*[^\x00-\x7F][^"]*"' bindings/godot/src`
-  should stay empty.
+  anything that can reach a console does not. The rule is REPO-WIDE, not a Godot rule: every
+  `set_error` string reaches `bwa_last_error`, which every binding and every example prints. It was
+  only ever *checked* on `bindings/godot/src`, and `src/` had accumulated 14 em-dashed `set_error`
+  and `set_err` messages behind that gap (engine.c, layout.c, zylia.c) before anyone looked.
+  `rg -P '"[^"]*[^\x00-\x7F][^"]*"' src bindings/godot/src` should stay empty (the one hit it can
+  legitimately return is a quoted phrase inside a `//` comment, `asio_sink.cpp`).
 - **A shipped artifact must not cite a doc it does not ship.** Both packs run
   `tools/dist/doc-pointers.ps1`, which rewrites repo-doc references in the staged tree to
   permalinks at the packed commit and then fails the pack on any relative `.md` reference the
