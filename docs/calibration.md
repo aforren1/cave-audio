@@ -38,6 +38,39 @@ Use an **omnidirectional** measurement mic. It's flat and direction-independent,
 delay/level/response comes back uncolored. Measure *through* the acoustically-transparent screens.
 That's what the listener hears, and the trim captures the screen's slight HF loss automatically.
 
+### What the screens do
+
+An acoustically transparent screen is not transparent. It is close enough in the band the phantom
+validation works in (400 to 1200 Hz, where loss is a fraction of a dB and the response is near flat),
+and it is worst from about 2 kHz up, which is where pinna elevation cues and interaural level
+differences live. So the screens cost you more by ear than on any instrument in this repo.
+
+Three effects, in the order they matter:
+
+- **Per-speaker level and delay.** The first-order term. The trims absorb it, as long as you sweep
+  through the screen. That is the whole reason for the instruction above.
+- **A cavity comb.** A speaker mounted `d` behind the screen plane gets its own reflection back off
+  the screen, off whatever is behind the speaker, and out again, so its response carries notches near
+  `c/2d * (n + 1/2)`. At `d` = 0.35 m that is 245, 735 and 1225 Hz, inside the analysis band. Shallow,
+  since most of the energy transmits, but different per speaker, and a broadband trim cannot correct a
+  notch. Nothing here does: `room_eq` is LF modal cuts and sits below this.
+- **Angle-dependent transmission.** Loss rises with incidence, so an obliquely firing speaker is not
+  attenuated like a normally firing one, and the difference follows the listener.
+
+The first is common to a given speaker's whole path, so it cancels out of that speaker's measured
+direction: a per-bin complex scalar cannot rotate an intensity vector. The other two do **not** cancel
+for a phantom, which is a coherent sum over speakers that differ from each other. Screens are a
+phantom error term rather than a physical-source one, which is exactly what makes them invisible to
+`bwa_validate`'s reference arm.
+
+**Speakers that fire over the screen top are a different population.** In a CAVE the ceiling band
+clears the screen edge while every wall speaker fires through fabric. If the over-screen speakers run
+even 1 to 2 dB hot in band, phantom images pull upward. The collaborators' 24-speaker array has that
+split and measured that signature, a median +12° of upward elevation displacement, which the paper
+attributes to speaker density. Both mechanisms push the same way, so their data cannot separate them.
+Calibrating through the screens is what keeps the two populations comparable. Check it directly:
+split the per-speaker levels by whether the path crosses a screen, and compare.
+
 ## Air temperature
 
 Every range the survey solves is `c * delay`, and `c` moves about 0.6 m/s per degree C. A room at

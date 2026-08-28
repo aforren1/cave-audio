@@ -408,6 +408,15 @@ The checks with no assertion: bring ears you trust.
       and the off-center listening spots carry the information; and VBAP collapses onto a
       coincident speaker while DBAP spreads, so the two panners are expected to differ here.
       Do this from at least one center and one off-center spot, or the null is all you hear.
+- [ ] **The screens, and the two speaker populations.** The band Stage 4b measures in is the band
+      where the screens are most nearly transparent, so no instrument in this runbook can hear what
+      they cost. Their loss and comb land from about 2 kHz up, which is where pinna elevation cues
+      and high-frequency interaural level differences live. Two predictions to test by ear, both
+      invisible to the microphone: elevation is worse than the Stage 4b numbers imply, and a speaker
+      firing OVER the screen top sounds different in timbre from one firing through fabric. Play the
+      same stimulus out of one of each with `bwa_source_set_channel` and listen. If they still
+      differ after the trims, that difference is inside every phantom the array renders. See
+      [calibration.md](./calibration.md), "What the screens do".
 - [ ] **The knob bake-off**: playground's blind A/B/X harness over the live knobs
       (dual-band, DBAP vs SPCAP/VBAP, SPCAP focus, spread render modes, decorrelation, air
       absorption, max-rE…). N trials, one-sided binomial p-value: a knob that isn't
