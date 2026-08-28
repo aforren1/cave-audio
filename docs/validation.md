@@ -566,14 +566,36 @@ alone, no panning, and the estimator's answer is a real-source measurement. On b
 `--no-reference` skips it. It buys two things:
 
 **A floor.** The reported `physical floor` is what the chain costs before any panning happens:
-around 0.1° in anechoic simulate, larger on hardware, and the increase *is* the room's
-contribution plus your survey error. If it is not small, stop: a directly driven speaker that
-does not land on its surveyed position means nothing measured afterwards is interpretable. You find
-that out in seconds rather than after a session.
+around 0.1° in anechoic simulate, 1 to 3° on hardware.
+
+Do not read the simulate number as an instrument spec. It is the model's own self-consistency:
+simulate synthesizes the field from the same capsule table the estimator inverts, with no noise, no
+capsule tolerance, and no registration.
+
+The hardware number is dominated by registration rather than by the estimator. The collaborators'
+AES 161st Convention paper measures this same chain, on this same microphone, in an anechoic chamber,
+and reports **2.1°** for noise-like content. The same paper reports 0.1° repeat scatter within a
+position, a mount fit stable to about 2° day to day, and under 1° on a synthetic plane wave through
+the exact array geometry. The estimator is therefore not the limit. Their ground truth was a
+loudspeaker carried to each target at 1.63 m, where 6 cm of placement error is already 2.1°.
+
+The reference arm here moves nothing, so it should beat that. What is left is your speaker survey,
+the room, and the microphone's frame. A tracked mount measures the frame instead of fitting it, which
+retires the mount term and leaves the speaker survey dominant.
+
+**Above about 5°, stop.** A directly driven speaker that does not land on its surveyed position means
+nothing measured afterwards is interpretable. You find that out in seconds rather than after a
+session.
 
 **A matched contrast.** Render a phantom at speaker *i*'s own position. The tool then measures the
 same direction, room, and placement both ways, so the pair differences cleanly: the published
 physical-versus-phantom comparison, obtained without moving a loudspeaker.
+
+The floor is a bias, not scatter, so a matched contrast resolves differences well below it. Both arms
+are the same microphone in the same pose at the same bearing, so the microphone's frame cancels
+exactly. That is why the published phantom penalty of +2.6°, 95% interval [2.4, 2.9], is quoted
+beside a 2.1° floor without contradiction. Read absolute misses against the floor. Read contrasts
+against zero.
 
 Two things to know before reading that table:
 
@@ -609,10 +631,10 @@ entirely above the array's first-order ceiling is refused **with its frequency n
 Localization is strongly content-dependent, and it is natural to credit that entirely to the
 room. That is not the whole story:
 
-| | anechoic (simulate) | in a room |
-| --- | --- | --- |
-| **physical source** (one speaker) | content-**independent** | content-dependent (standing waves) |
-| **phantom** (many speakers) | content-**dependent** | more so |
+| | anechoic (simulate) | anechoic (measured) | in a room |
+| --- | --- | --- | --- |
+| **physical source** (one speaker) | content-**independent** | 2 to 6°, by bandwidth | content-dependent (standing waves) |
+| **phantom** (many speakers) | content-**dependent** | not measured | more so |
 
 Two mechanisms, not one:
 
@@ -626,10 +648,24 @@ interfere with, so it could only see the first mechanism. Measured here in simul
 content spread is about **0.1° for a physical source and tens of degrees for a phantom**. So a
 simulate run *does* show content dependence for phantoms, and that is a result rather than a fault.
 
-**The negative control is therefore the reference arm, not simulate.** A single driven speaker must
-localize the same whatever the content. If that ever stops holding, the analysis chain is at fault
-and every content finding built on it is an artifact. The `valid` ctest asserts exactly that and
-merely reports the phantom spread, whose size is a property of the array rather than a contract.
+The measured chamber column is the one place simulate is optimistic. A physical source there runs
+1.9° for applause up to 5.5° for a telephone ring, ordered by bandwidth, with no room at all.
+Simulate cannot show that. It has no noise for a narrow band to average badly, and nothing stresses
+the rigid-sphere mode-strength inversion, whose conditioning is worst at the low end of the band
+(`ka` is about 0.22 at 250 Hz, where the `ZY_REG` Tikhonov floor starts to bias it). Both are real
+properties of the chain on hardware. Treat a couple of degrees of chamber-grade content spread on a
+physical source as normal rather than as a fault.
+
+**The negative control is therefore the reference arm, not simulate.** In simulate a single driven
+speaker must localize the same whatever the content, to well under a degree. If that ever stops
+holding, the analysis chain is at fault and every content finding built on it is an artifact. The
+`valid` ctest asserts exactly that and merely reports the phantom spread, whose size is a property of
+the array rather than a contract.
+
+**On hardware that control needs broadband content and a tolerance.** A physical source in a real
+room is content-dependent too: the published CAVE measurements run 4.2° for applause and 33.0° for a
+250 Hz tone, off one loudspeaker that never moved. Applied literally on the rig, the simulate form of
+this control condemns a healthy chain. Compare broadband stimuli only, and allow a few degrees.
 
 One property to keep in mind when reading tone results: the error is *precisely wrong*. Sub-degree
 repeatable, tens of degrees biased. Repeats will agree beautifully with each other and with nothing

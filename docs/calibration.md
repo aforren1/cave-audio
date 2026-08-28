@@ -338,8 +338,8 @@ dodecahedral edge as the closest pair.
 The radius (49 mm) only feeds `zylia_localize`'s near-field solve. `zylia_doa` normalizes the fitted
 gradient, so the radius **cancels out of the direction entirely**: 49 versus 50 mm changes nothing.
 
-**Two things the table cannot give you**, and no off-hardware test can catch either, because both
-survive every structural check above:
+**Three things the table cannot give you**, and no off-hardware test can catch any of them, because
+all three survive every structural check above:
 
 - **Channel order**: node *i* here is not necessarily ASIO input *i*. A permutation still yields a
   confident direction, just the wrong one. `bwa_zylia_probe` resolves it: tap a capsule, see which
@@ -347,9 +347,14 @@ survive every structural check above:
 - **Azimuth reference**: nothing published says which capsule faces the device's front, so an unknown
   yaw offset rotates every DOA by a constant. Clap from a known direction in the Zylia tab; the
   discrepancy *is* the offset.
+- **Handedness**: a mirrored capsule numbering survives the structural checks too, because a reflected
+  dodecahedron is still a dodecahedron with the same rings. It survives the azimuth check as well: a
+  clap fits a rotation and cannot see a mirror. The collaborators' AES 161 measurements fit exactly
+  this, a fixed azimuth-handedness reflection present on every recording day, and it dominated their
+  mount fit.
 
-Pin both at the rig, or skip the question entirely and **measure the geometry** (below), which hands
-you the order and the orientation as a side effect.
+Pin all three at the rig, or skip the question entirely and **measure the geometry** (below), which
+hands you the order and the orientation as a side effect.
 
 ### The capsule self-survey (`zylia_survey`)
 

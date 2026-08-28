@@ -301,9 +301,12 @@ that table.
       from 17 capsules is fine, one you *believed* came from 19 is not.
 - [ ] **Read the physical floor FIRST.** The run drives each speaker alone and reports a
       `physical floor` before any phantom number. That is instrument + survey + room, and it
-      is the fastest possible check that the whole chain is sane. If a directly driven
-      speaker does not land near its surveyed position, stop and fix the layout, the survey
-      or the routing: nothing measured afterwards is interpretable.
+      is the fastest possible check that the whole chain is sane. **Expect 1 to 3 degrees.**
+      The same estimator on the same microphone measures 2.1 degrees in an anechoic chamber
+      against a loudspeaker that was carried to each target, and this arm carries nothing, so
+      a couple of degrees is healthy rather than disappointing (docs/validation.md, "The
+      physical reference arm"). **Above about 5 degrees, stop** and fix the layout, the
+      survey or the routing: nothing measured afterwards is interpretable.
 - [ ] **Sweet spot**: `bwa_validate --driver <name> --mic-in <n>`, first placement at the
       listening point. Note the matched physical-versus-phantom penalty is ~0 here by
       symmetry. That row is a null control, not a result. The off-center placements carry it,

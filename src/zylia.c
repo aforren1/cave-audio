@@ -32,14 +32,21 @@ void zylia_geometry(float dirs[ZYLIA_MICS][3], float* radius_m) {
      * Frame: the engine's room convention (+X right, +Y up, -Z front); azimuth measured from -Z toward
      * +X, elevation = asin(y). That is exactly what calib_view's zy_az/zy_el invert.
      *
-     * TWO THINGS THIS TABLE CANNOT TELL YOU, both of which must be pinned on the rig:
+     * THREE THINGS THIS TABLE CANNOT TELL YOU, all of which must be pinned on the rig:
      *   - CHANNEL ORDER: node i here is not necessarily ASIO input i. A permutation still yields a
      *     confident direction, just the wrong one. bwa_zylia_probe resolves it (tap a capsule, see
      *     which channel jumps).
      *   - AZIMUTH REFERENCE: nothing published says which capsule faces the device's front, so an
      *     unknown yaw offset rotates every DOA by a constant. Clap from a known direction in
      *     calib_view's Zylia tab; the discrepancy IS the offset.
-     * Both fall out for free if you run the capsule self-survey instead (docs/calibration.md).
+     *   - HANDEDNESS: a yaw is not the only way the table can be wrong. A MIRRORED capsule numbering
+     *     survives every structural check above, because a reflected dodecahedron is still a
+     *     dodecahedron with the same rings. It survives the azimuth check too, because a clap fits a
+     *     rotation and cannot see a mirror. The collaborators' AES 161 measurements fit exactly this,
+     *     a fixed azimuth-handedness reflection present on every recording day, and it DOMINATED
+     *     their mount fit.
+     * All of it falls out for free if you run the capsule self-survey instead (docs/calibration.md),
+     * which MEASURES positions and so cannot be fooled by a permutation, a rotation, or a mirror.
      */
     const double D2R = 3.14159265358979323846 / 180.0;
     const double A = asin(sqrt(5.0) / 3.0) / D2R;    /* 48.1897 deg — the +-48 rings                 */
