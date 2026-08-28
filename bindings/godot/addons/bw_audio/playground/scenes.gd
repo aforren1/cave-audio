@@ -1021,15 +1021,8 @@ class Underwater extends Base:
 		app.source.gain = app.SRC_GAIN
 		app.source.reverb = true             # the FDN renders whichever medium's tail
 		app.source.doppler = doppler
-		# This scene drives occlusion MANUALLY (the interface loss below), and the ABI is explicit
-		# that a source must not be driven from both: the ray-traced sim republishes every tick and
-		# wins. Say so here rather than inheriting whatever the previous scene left - the Occlusion
-		# scene turns the sim ON, so arriving from it used to leave both driving the same slot, and
-		# which one the readback saw came down to timing.
-		app.source.occlusion = false
 		app.source_pos = Vector3(0.0, app.WATER_Y + 0.8, -2.5)   # ABOVE: diving muffles it
 		under = false
-		_crossed = -1                        # force the first _apply_source to push, whatever it left
 		_apply_medium()
 
 	func key(code: int) -> void:
