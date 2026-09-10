@@ -14,10 +14,9 @@
  */
 #include "bw_audio.h"
 
-#include <conio.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include <windows.h>
+#include "portable.h"      /* bwa_sleep_ms + bwa_key_pressed: the demo's only OS calls */
 
 int main(int argc, char** argv) {
     bwa_desc cfg = { 0 };
@@ -46,15 +45,15 @@ int main(int argc, char** argv) {
 
     printf("backend    : %s\n", bwa_get_audio_backend(e));
     printf("rigid body : %s\n", (rb && rb[0]) ? rb : "(first in frame)");
-    printf("polling listener pose (press any key to quit)...\n");
+    printf("polling listener pose (press a key, or Enter off Windows, to quit)...\n");
 
-    while (!_kbhit()) {
+    while (!bwa_key_pressed()) {
         float p[3], q[4];
         bwa_get_listener_pose(e, p, q);
         printf("\rpos [% .3f % .3f % .3f]  quat [% .3f % .3f % .3f % .3f]   ",
                p[0], p[1], p[2], q[0], q[1], q[2], q[3]);
         fflush(stdout);
-        Sleep(33);                                 /* ~30 Hz readout */
+        bwa_sleep_ms(33);                                 /* ~30 Hz readout */
     }
 
     printf("\n");

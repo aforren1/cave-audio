@@ -150,6 +150,11 @@ src/
   steam_reflect.h/.c   reflection bed: IPLSimulator reflections -> ambisonic IR -> SH->26 bus tap (with-SDK). [materials]
   steam_path.h/.c      sound pathing: indirect routing -> per-voice shCoeffs -> SH-encode -> bus tap (with-SDK). [materials]
   natnet.c             OptiTrack pose ingest (off-wire, see docs/build.md). [M6]
+  os.h / os_win.c / os_posix.c  the OS portability shim: every platform call the engine makes
+                       OUTSIDE the sinks (threads, sleep + os_sleep_until_ns, the monotonic clock,
+                       mutex + rwlock, thread priority, strdup/strcasecmp, natnet's UDP sockets,
+                       BWA_EXPORT). Exactly one half compiles. Windows is the only platform with a
+                       device backend; elsewhere the library runs the null and manual sinks. [backends p2]
 test/                  ctest suite; targets are prefixed test_* (test_smoke, test_rt_core, test_rt_feature,
                        test_dsp, ...) so the built tools (bwa_*) and the tests sort apart in the bin dir.
                        The rt test is split: test_rt_core (concurrency/lifecycle spine) + test_rt_feature
@@ -190,11 +195,13 @@ ctest --test-dir build -C RelWithDebInfo      # runs the full test suite (test_*
 ```
 
 **Current state (M6 + occlusion).** The engine builds `bw_audio.dll` and the full ctest
-suite — 41 tests with the Steam Audio SDK, 36 without (the 5 SDK-gated ones are `reflect`,
+suite — 42 tests with the Steam Audio SDK, 37 without (the 5 SDK-gated ones are `reflect`,
 `bake`, `path`, `dynmesh`, `steam_decode`) — a count that INCLUDES the three GUI-tool suites
 (`calib_view`, `layout_tool`, `playground`), the four `validate_*` runs, and the four
 `example_*` runs (the console examples driven with `--tests`: offline sink, short waits), all
-under their build flags. `rt.c` is the concurrency
+under their build flags. On Linux or macOS at the DEFAULT options it is 30: the GUI and ASIO
+capture tools are WIN32-only targets there, which drops their suites and the `validate_*` runs
+on top of the SDK-gated five. `rt.c` is the concurrency
 spine (two SPSC rings, voice + sound tables, commit snapshot, generation handles, retire-ack)
 and the whole `bwa_*` API forwards to it. Spatialization (the DBAP/SPCAP/VBAP gain solve,
 layout load, per-speaker align), calibration (`bwa_calibrate`, the Zylia capsule survey),
@@ -267,9 +274,36 @@ Regression-preventing gotchas. Each has bitten before or guards a real invariant
   stamps every voice current, and swallows the change until the next bump, so the last set of a
   slider drag silently never takes. Same rule for any future live knob that uses a generation
   counter, and note this is untestable single-threaded, so the ordering comment is the guard.
-- **`/experimental:c11atomics`** is required on MSVC for the `stdatomic.h` in `rt.c`/`stream.c`
-  (and `steam_reflect.c` with the SDK) — wired per-file in CMake. `pose.h` uses Interlocked
-  intrinsics instead, so `natnet.c` and its tests need no flag.
+- **`/experimental:c11atomics`** is required on MSVC for every file that includes `stdatomic.h` —
+  wired per-file in CMake, where source properties are directory-scoped so one entry covers every
+  target compiling that file. The list is `rt.c`, `stream.c`, `assets.c`, `fdn.c`, `natnet.c`,
+  `engine.c`, `null_sink.c`, `profile_self.c`, `steam_scene.c`, `steam_path.c`, `steam_reflect.c`,
+  plus `test/os_test.c`, `test/natnet_test.c`, `test/audio_sink_test.c` and
+  `test/rt_feature_test.c`. Miss one and the error is a confusing `<stdatomic.h> is not yet
+  supported`, pointing at the header rather than at the missing flag.
+- **`pose.h` is the one HEADER that carries `stdatomic.h`, so nothing else may include it
+  casually.** Its seqlock moved off the Interlocked intrinsics onto C11 atomics (Boehm 2012: the
+  payload fields are relaxed atomics, and fences carry the ordering), which means every translation
+  unit that includes it needs the MSVC flag. `rt.h` and `natnet.h` therefore FORWARD-DECLARE
+  `PoseSlot` — include `pose.h` only where `pose_read`/`pose_write` are actually called, or the
+  flag spreads to twenty-odd files. Two consequences worth knowing: `_Atomic` is not C++, so
+  `pose.h` gives C++ the type as opaque and `examples/validate.cpp` reads the pose through
+  `natnet_read_pose` instead; and the payload is no longer memcpy-able, so a caller that used to
+  seed `slot.p` directly must go through `pose_write` or stop seeding (rt.c's readback did the
+  latter — `rt_read_pose` already falls back to the active fields).
+- **Nothing in `src/` outside the `*_sink` files may call the OS directly.** `src/os.h` is the
+  seam (threads, sleep, `os_sleep_until_ns`, the monotonic clock, mutex + rwlock, thread priority,
+  `strdup`/`strcasecmp`, UDP sockets, `BWA_EXPORT`), with `os_win.c` and `os_posix.c` behind it.
+  It must stay C++-includable, because `sink.h` includes it and the two C++ sinks include
+  `sink.h`: no `<stdatomic.h>`, no `<windows.h>`, no `<winsock2.h>` in that header, ever. The .c
+  files use C11 atomics directly instead. Tests may include `src/os.h`; examples are client code
+  of the public ABI and use `examples/portable.h` instead.
+- **A self-paced loop waits on an ABSOLUTE deadline, never a relative sleep.** `os_sleep_until_ns`
+  exists because a relative sleep is computed from a clock reading that is already stale, so its
+  error accumulates block after block. It also removes the reason the null sink used to call
+  `timeBeginPeriod(1)`, which is SYSTEM-WIDE in effect: a visual-only tool that happened to open
+  the offline sink held the whole machine at a 1 ms timer tick. Device-paced paths (the ASIO
+  callback, the WASAPI event wait) keep their own wait — the device is the clock there.
 - **Do not link the NatNet SDK.** It is proprietary and conflicts with GPLv3 under distribution.
   `natnet.c` parses the wire format off-wire (reference only, never linked).
 - **Proprietary VR-toolkit integrations (MiddleVR, Igloo) live OUTSIDE this repo**, in their own

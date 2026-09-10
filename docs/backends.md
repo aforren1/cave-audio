@@ -1,12 +1,14 @@
 # Device backends
 
-Status: **phases 0 and 1 are implemented**; phases 2 to 5 are still specification. The engine has
+Status: **phases 0, 1 and 2 are implemented**; phases 3 to 5 are still specification. The engine has
 four sinks today: ASIO (`src/asio_sink.cpp`), WASAPI (`src/wasapi_sink.cpp`), null
 (`src/null_sink.c`), and manual (`src/manual_sink.c`), over the two shared pieces
 (`src/sink_convert.h`, `src/sink_quant.c`) that phase 0 built. The ABI those needed is in place:
 the appended `bwa_sink_type` values, `bwa_desc.device` and `sink_flags`, the backend-agnostic
-device query, and `bwa_health.device_lost`, all in the 0.14 minor bump. What remains specified but
-not built is the OS shim (phase 2) and the CoreAudio, AAudio, JACK, and ALSA backends.
+device query, and `bwa_health.device_lost`, all in the 0.14 minor bump. Phase 2 put the OS shim in
+(`src/os.h`, `src/os_win.c`, `src/os_posix.c`), so the library, the tests and the console examples
+build and pass with gcc and clang on Linux and macOS, on the null and manual sinks. What remains is
+the CoreAudio, AAudio, JACK, and ALSA backends.
 
 Read [architecture.md](./architecture.md) for the bus seam first and
 [concurrency.md](./concurrency.md) for the audio-thread rules every backend inherits.
@@ -65,7 +67,7 @@ one more consumer of the bus. It must not touch the core.
 | AAudio    | Android 8.0 (API 26) and later | `AAudio*`                   | headphones on standalone VR headsets                       | 3 |
 
 Phase 2, between WASAPI and the rest, is the OS shim that lets the engine build off Windows at
-all. See [Phases](#phases).
+all. It is done: see [Phases](#phases).
 
 ### Linux and the array
 
@@ -411,9 +413,9 @@ confirm the test goes red before trusting it, per the CLAUDE.md trap.
 
 ### `src/os.h`, `src/os_win.c`, `src/os_posix.c`
 
-The portability shim. Not needed for WASAPI. Required before CoreAudio, ALSA, or AAudio,
-because those backends imply building the whole library off Windows, and the library calls
-Win32 outside the sinks. The inventory, from a grep of `src/`:
+**Implemented (phase 2).** The portability shim. Not needed for WASAPI. Required before CoreAudio,
+ALSA, or AAudio, because those backends imply building the whole library off Windows, and the
+library calls Win32 outside the sinks. The inventory, from a grep of `src/`:
 
 | Win32 use                                                   | files                                                              | shim                                  |
 |-------------------------------------------------------------|--------------------------------------------------------------------|---------------------------------------|
@@ -431,7 +433,58 @@ Win32 outside the sinks. The inventory, from a grep of `src/`:
 
 `test/` and `examples/` carry their own `Sleep`, `GetTickCount64`, and `<windows.h>` (13 test
 files, 14 examples). They move onto the shim in the same phase. Around 300 lines of shim plus a
-mechanical pass over about 40 files. `bw_audio.h` already handles `BWA_API` for non-Windows.
+mechanical pass over about 40 files. Tests may include `src/os.h`, because they compile the core
+in; examples are client code of the public ABI, so they get their own two-function
+`examples/portable.h` instead of reaching into `src/`.
+
+Four things the inventory above did not predict, found while implementing it:
+
+- **`SRWLOCK` is not `CRITICAL_SECTION`.** `steam_scene.c` guards the committed `IPLScene` with a
+  reader/writer lock: several sim threads borrow the scene for concurrent ray traces while the
+  owner takes it exclusively around `iplSceneCommit`. Collapsing that to a plain mutex would
+  serialize traces that have no reason to wait on each other, so the shim gains `os_rwlock`
+  (SRWLOCK on Windows, `pthread_rwlock_t` elsewhere) beside `os_mutex`.
+- **`pose.h` cannot be a C++-visible header any more.** Its payload fields are `_Atomic` now (see
+  below), and `_Atomic` is not C++. `examples/validate.cpp` reached the seqlock through
+  `natnet.h`, so `natnet.h` gained `natnet_read_pose` and the tool calls that; `pose.h` gives C++
+  the type as opaque. `rt.h` and `natnet.h` forward-declare `PoseSlot` rather than including
+  `pose.h`, which keeps `<stdatomic.h>` (and MSVC's `/experimental:c11atomics`) off the twenty-odd
+  translation units that only pass the slot around by pointer.
+- **`bwa_null_sink_skip_blocks` stays a plain `volatile int`.** It is declared in `sink.h`, which
+  the two C++ sinks include, so it cannot be an `_Atomic`. One test-thread writer and one
+  sink-thread read-and-clear on an aligned `int`: the ordering nobody depends on is the only thing
+  the change gives up.
+- **Path normalization was a Windows fact.** `assets.c` folded case and backslashes into the cache
+  key. On a POSIX filesystem `A.wav` and `a.wav` are different files and a backslash is an ordinary
+  character in a name, so folding either there would hand one cache entry to two files. Both folds
+  are now `_WIN32`-only, and the test section that pins them skips off Windows.
+
+#### The absolute-deadline sleep
+
+`os_sleep_until_ns(deadline_ns)` waits until a deadline on the `os_monotonic_ns` clock and returns
+at once if that time has passed. It exists because a SELF-PACED render loop cannot pace accurately
+with a relative sleep: the duration is computed from a clock reading that is already stale when the
+kernel sees it, so the error accumulates block after block.
+
+| platform | primitive |
+|----------|-----------|
+| Windows 10 1803 and later | `CreateWaitableTimerExW(CREATE_WAITABLE_TIMER_HIGH_RESOLUTION)`, one timer per thread in fiber-local storage so a thread exit closes it, then `SetWaitableTimerEx` with a negative relative due time and `WaitForSingleObject` |
+| Windows before 1803 | the create call fails with `ERROR_INVALID_PARAMETER`; fall back to `timeBeginPeriod(1)` plus `Sleep`, which is the only path that still touches the global timer resolution |
+| Linux, Android | `clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, ...)`, retried on `EINTR` |
+| macOS | `mach_wait_until` on the deadline converted back to mach ticks through `mach_timebase_info` |
+
+The point of the high-resolution timer is not only precision. `timeBeginPeriod` is system-wide in
+effect, so the old null-sink loop held the whole machine at a 1 ms timer tick for as long as a
+visual-only tool had the offline sink open. The sink no longer raises it at all.
+
+Only SELF-PACED paths use this: the null sink's block loop and the WASAPI sink's `host_paced_block`
+(what runs after the device is lost). Device-paced paths keep their own wait, because the device is
+the clock there: the WASAPI event wait and the ASIO callback are untouched.
+
+`test_os` measures it: 200 wakes 2 ms apart, reporting median and p99 lateness. A desk Windows
+machine gave 0.43 ms and 0.74 ms; WSL2 gave 0.13 ms and 0.33 ms. Forcing the pre-1803 fallback with
+the resolution left alone gave 5.6 ms and 13.0 ms, which is what the p50 assertion is there to
+catch.
 
 ## ABI changes
 
@@ -732,13 +785,23 @@ Steam Audio ships Android arm64 builds. The DSP is scalar C with no SSE intrinsi
 | `BWA_WITH_ALSA`      | ON on Linux when `find_package(ALSA)` succeeds | compiles `alsa_sink.c`, links `ALSA::ALSA`, defines `BWA_HAVE_ALSA` |
 | `BWA_WITH_AAUDIO`    | ON on `ANDROID`                 | compiles `aaudio_sink.c`, links `aaudio`, defines `BWA_HAVE_AAUDIO` |
 
-Every one of them is off on the other platforms and cannot be forced on. `BWA_WITH_ASIO` keeps
-its auto-detect. The `if(NOT WIN32) message(WARNING ...)` at the top of `CMakeLists.txt` goes
-in phase 2, together with: `-std=c11 -Wall -Wextra` on clang and gcc, `-fvisibility=hidden` on
-the library, `libbw_audio.so` and `.dylib` output names (the bindings load `bw_audio` and the
-platform prefix and suffix resolve on their own), and the `ws2_32` and `winmm` links wrapped in
-`if(WIN32)` (`bwa_core` links `ws2_32` unconditionally today). The `/experimental:c11atomics`
-per-file flags are already under `if(MSVC)`.
+Every one of them is off on the other platforms and cannot be forced on.
+
+Phase 2 did the rest of that list. The `if(NOT WIN32) message(WARNING ...)` is gone, replaced by
+a status line naming the platform and what it can open. gcc and clang get `-Wall -Wextra` per
+target (not globally, so the fetched third-party sources keep their own levels) and the library
+gets `-fvisibility=hidden`. `libbw_audio.so` and `.dylib` fall out of CMake's defaults, and the
+bindings load `bw_audio` either way. `ws2_32` and `winmm` moved behind one `bwa_link_os` helper,
+which also supplies pthreads and `libm` off Windows; the dll needs its own call, because it takes
+bwa_core's OBJECTS and so does not inherit its link interface.
+
+Two auto-detects gained a platform guard, both for the same reason: a dev checkout has the SDKs
+staged, so without the guard a Linux configure of that same tree "finds" a Windows artifact and
+fails at compile or link. `BWA_WITH_ASIO` now requires `WIN32` as well as the SDK, and Steam Audio
+requires the platform's import library (`lib/windows-x64/phonon.lib`) and not just `phonon.h`. The
+three GUI tools and the ASIO capture tools are WIN32-only targets, skipped with a status message
+elsewhere. The `/experimental:c11atomics` per-file flags are still under `if(MSVC)`; the list grew
+with the files that became atomic (see build.md).
 
 Steam Audio builds for macOS, Linux, and Android, but the recipe in `third_party/README.md` is
 the Windows one. A no-SDK build is fully viable (build.md, "Building without Steam Audio"), so
@@ -757,10 +820,17 @@ what needs a device, and make the device-dependent part **skip visibly** rather 
   rule, and the `sample_pos` rule at once, and a wrong stamp corrupts audio rather than merely
   failing a stamp assertion. Per the CLAUDE.md trap the pop arithmetic was broken on purpose and
   the test confirmed red before being trusted green.
-- **`test_os`** (phase 2): thread create and join, `os_sleep_ms` bounds, the monotonic clock
-  advancing at the right rate over 100 ms against the C clock, mutex exclusion under two
-  threads, the rewritten pose seqlock under a writer thread and a reader thread with torn-read
-  detection (a value pattern the reader can check).
+- **`test_os`** (phase 2, shipped): thread create and join, `os_sleep_ms` bounds, the monotonic
+  clock advancing at the right rate over 100 ms against the C clock, `os_sleep_until_ns` lateness
+  percentiles, mutex exclusion under two threads, and the rewritten pose seqlock under a writer
+  thread and a reader thread with torn-read detection (the writer stamps one generation number
+  into all seven payload fields, so a straddled read reads back a mix).
+
+  What that seqlock section pins, honestly: the ALGORITHM, not the memory ordering. Dropping the
+  writer's release store to relaxed and deleting the reader's acquire fence leaves it GREEN on
+  x86, because the hardware does not reorder those. Removing the reader's validating reload turns
+  it red at once (122,837 torn reads in a 400 ms run). The ordering is pinned by review and by the
+  fences being present, and the test says so rather than implying more.
 - **`test_audio_sink`** grows one section per compiled backend. Open the default device.
   Either the open returns NULL with a non-empty message, or the sink starts, delivers at least
   ten blocks in 200 ms with a constant `nframes` equal to `block_size()`, monotonic position
@@ -772,10 +842,13 @@ what needs a device, and make the device-dependent part **skip visibly** rather 
   The WASAPI section shipped with phase 1. Only the *specific* "no active render endpoint"
   message skips; any other open failure is a failure, because a machine WITH audio that cannot
   open it is exactly what the section exists to catch.
-- **The whole suite under `BWA_SINK_NULL` on `ubuntu-latest` and `macos-latest`** (phase 2).
-  This is the port's regression gate: 34 tests with no SDK, none of which touch a device. Add
-  the two jobs to `ci.yml` beside the Windows one. They are cheap (no phonon build) and they
-  catch a Win32 call sneaking back in.
+- **The whole suite under `BWA_SINK_NULL` on `ubuntu-latest` and `macos-latest`** (phase 2,
+  shipped). This is the port's regression gate: 30 tests at the default options, none of which
+  touch a device. The two jobs sit in `ci.yml` beside the Windows one. They are cheap (no phonon
+  build) and they catch a Win32 call sneaking back in. Note what the count means: off Windows the
+  GUI tools and the ASIO capture tools are skipped targets, so their suites and the four
+  `validate_*` runs are absent, on top of the five SDK-gated tests. The macOS job is unverified
+  locally.
 - **On hardware**, a "desk day" section for hardware-validation.md, one pass per backend on a
   real machine: the laterality tone left and right (never DC, per the trap); a ten-minute soak
   with a busy scene at a 256 block and zero `xruns` with `measured` true; and the reported
@@ -789,7 +862,7 @@ what needs a device, and make the device-dependent part **skip visibly** rather 
 |-------|------------------------------------------------------------------------|-----------------------------------------|-----------------------------|------------------------------|
 | 0 **(done)** | `sink_convert.h`, `sink_quant`, their tests; the ASIO sink onto `sink_convert` | nothing                        | none                        | ~400 lines                   |
 | 1 **(done)** | WASAPI sink; the ABI bump (enum, desc union and flags, device query, `device_lost`); `sink.c` AUTO order; both bindings mirror; docs | phase 0 | a Windows desk machine; the rig for the `cave_both` check | ~600 lines of sink, ~200 of ABI and bindings |
-| 2     | `os.h` shim; the library, tests, and examples build with clang and gcc; Linux and macOS CI jobs on the null sink | nothing (independent of phase 1) | none | ~300 lines of shim, a pass over ~40 files |
+| 2 **(done)** | `os.h` shim; the library, tests, and examples build with clang and gcc; Linux and macOS CI jobs on the null sink | nothing (independent of phase 1) | none | ~300 lines of shim, a pass over ~40 files |
 | 3     | AAudio sink; NDK toolchain wiring; phonon for Android; the bindings' Android packaging | phases 0 and 2         | a standalone headset        | ~300 lines plus the toolchain and packaging |
 | 4     | CoreAudio sink                                                         | phases 0 and 2                          | a Mac; the Digiface only for the optional 26-channel check | ~450 lines |
 | 5     | JACK sink, then ALSA sink                                              | phase 2                                 | a Linux box with a card, and one with PipeWire; the AES67 daemon and an AES67-mode Dante receiver for the array check | ~250 lines JACK, ~400 lines ALSA |
@@ -823,7 +896,32 @@ phase 5 ships, by the offline shape in
   (the `Sink` enum, `asio_driver` becomes `device` with the old setter kept, the no-ASIO
   warning that assumes `cave` needs ASIO).
 - `third_party/README.md`: the sink selection paragraph.
+- `examples/` (deferred until the backends settle): `playground.cpp` decides "silent" by an
+  `asio` prefix check on the backend string, so a WASAPI open shows as NO SOUND; use
+  `bwa_get_sink_type`. Its picker and `--list-drivers` enumerate ASIO only; list both backends
+  through `bwa_get_device_count` and set `cfg.device`. Same prefix check in `layout_tool.cpp`;
+  stale `--driver` and ASIO4ALL wording in `minimal.c`. The capture tools stay ASIO-only.
 - `NOTES.md`: the `engine.c` comment that says "WASAPI is future" and its NOTES twin.
+
+## Deferred follow-ups
+
+Known, deliberately not done yet. Each names its trigger.
+
+- **UTF-8 file paths on Windows.** The ABI speaks UTF-8, but every file open (`fopen` in
+  layout.c, hpeq.c, calib.c, zylia.c, and the dr_libs `*_init_file` openers in sound.c and
+  stream.c) hands the bytes to the C runtime, which reads them as the ANSI codepage. A
+  non-ASCII path fails to open on Windows today. Fix: an `os_fopen` in the shim that converts
+  to wide and calls `_wfopen`, and the `_w` variants of the dr_libs openers. About 30 lines.
+  Independent of the port; do it whenever a path with an accent bites.
+- **Blocking waits for the polling threads.** The asset loader (2 ms), the stream thread
+  (3 ms), and the three Steam sim threads all sleep-poll. Idle cost is invisible on a desk and
+  is battery on a headset, so the trigger is phase 3. Options: one event primitive in the shim,
+  or c89thread (condition variables, semaphores, events; public domain or MIT-0 like dr_libs),
+  or a core-only SDL3 behind `os.h`, which also brings rtkit realtime priority on Linux for
+  phase 5 and a precise sleep the shim now has on its own. Decide at phase 3 or 5, whichever
+  comes first. SDL_net is not a candidate for NatNet: it has no multicast join.
+- **The examples' backend awareness**, listed under
+  [What to update when implementing](#what-to-update-when-implementing).
 
 ## Verify before relying on it
 

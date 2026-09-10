@@ -29,7 +29,7 @@
 #include <math.h>
 #include <stdio.h>
 #include <string.h>
-#include <windows.h>
+#include "portable.h"      /* bwa_sleep_ms: the demo's only OS call */
 
 #define RATE 48000u
 
@@ -71,7 +71,7 @@ static const char* verdict(int ok, const char* good, const char* bad) {
 
 static void pump(bwa_engine* e, int ms) {         /* a "game loop" tick: commit, then wait */
     bwa_commit(e);
-    Sleep((DWORD)ms);
+    bwa_sleep_ms((unsigned)ms);
 }
 
 int main(int argc, char** argv) {

@@ -6,6 +6,7 @@
  * here allocates/locks on rt_render.
  */
 #include "rt.h"
+#include "pose.h"     /* the seqlock: the tracker slot the mixer samples + the readback slot */
 #include "sound.h"
 #include "stream.h"
 #include "layout.h"
@@ -29,9 +30,13 @@
 #include <stdlib.h>
 #include <string.h>
 
-#if defined(_MSC_VER)
-#include <xmmintrin.h>     /* _MM_SET_FLUSH_ZERO_MODE */
-#include <pmmintrin.h>     /* _MM_SET_DENORMALS_ZERO_MODE */
+/* Denormal flushing is an x86 MXCSR setting, not a compiler one, so the guard is the ARCHITECTURE
+ * rather than the compiler: gcc and clang on x86 want it as much as MSVC does, and ARM (Android,
+ * Apple silicon) has no MXCSR to set. */
+#if defined(_M_X64) || defined(_M_IX86) || defined(__x86_64__) || defined(__i386__)
+  #define BWA_X86_DENORMAL_FLUSH 1
+  #include <xmmintrin.h>     /* _MM_SET_FLUSH_ZERO_MODE */
+  #include <pmmintrin.h>     /* _MM_SET_DENORMALS_ZERO_MODE */
 #endif
 
 #define RING_CAP 4096          /* power of two; sized for a worst-case frame burst */
@@ -3185,7 +3190,7 @@ void rt_render(RtCore* c, float* bus, uint32_t nframes, const bwa_timestamp* ts)
         clk_fit_update(c, block_start, ts->system_time_ns, nframes);            /* + the drift model, same window */
         atomic_store_explicit(&c->clk_seq, cs + 2, memory_order_release);       /* even: pair + model consistent */
     }
-#if defined(_MSC_VER)
+#if defined(BWA_X86_DENORMAL_FLUSH)
     /* Flush denormals to zero on the audio thread: gain ramps toward 0 (e.g. a voice
      * moving off a channel) otherwise produce subnormals that stall the FP pipeline. */
     _MM_SET_FLUSH_ZERO_MODE(_MM_FLUSH_ZERO_ON);
@@ -4735,7 +4740,6 @@ RtCore* rt_create(uint32_t req_voice_cap, uint32_t sound_cap, uint32_t sample_ra
     }
     c->lis.q_active[3]  = 1.0f;        /* default head orientation = identity (facing +z) */
     c->lis.q_pending[3] = 1.0f;
-    c->readback.q[3]    = 1.0f;        /* readback identity until the first block publishes */
     atomic_store_explicit(&c->room_eq_dyn, 1, memory_order_relaxed);   /* tracked room EQ: on when a grid is present */
     atomic_store_explicit(&c->lc_on, 0, memory_order_relaxed);         /* tracked alignment: OFF (opt-in) */
     atomic_store_explicit(&c->lc_dead_m, 0.f, memory_order_relaxed);   /* 0 = the built-in defaults */
@@ -4767,7 +4771,9 @@ RtCore* rt_create(uint32_t req_voice_cap, uint32_t sound_cap, uint32_t sample_ra
      * layout arrives) — a pose-less client listens from the array center, not the floor origin */
     memcpy(c->lis.p_active,  c->layout.ref, sizeof c->lis.p_active);
     memcpy(c->lis.p_pending, c->layout.ref, sizeof c->lis.p_pending);
-    memcpy(c->readback.p,    c->layout.ref, sizeof c->readback.p);
+    /* The readback slot is left UNPUBLISHED (seq == 0). rt_read_pose falls back to lis.*_active
+     * for exactly that case, so seeding it would be dead code — and its payload is atomic now,
+     * which a memcpy is not the right access for. */
     c->aligner = align_create(channels, &c->layout, sample_rate);
     if (!c->aligner) { rt_destroy(c); return NULL; }
     build_bed_decode(c);                        /* ambisonic bed decode from the default layout */
@@ -4790,8 +4796,7 @@ void rt_set_layout(RtCore* c, const Layout* L) {
     /* re-default the listener to the new layout's nominal listening point (load-time: poses
      * pushed after start overwrite this every frame; a pose-less client hears from the center) */
     memcpy(c->lis.p_active,  c->layout.ref, sizeof c->lis.p_active);
-    memcpy(c->lis.p_pending, c->layout.ref, sizeof c->lis.p_pending);
-    memcpy(c->readback.p,    c->layout.ref, sizeof c->readback.p);
+    memcpy(c->lis.p_pending, c->layout.ref, sizeof c->lis.p_pending);   /* readback: see rt_create */
     build_bed_decode(c);                         /* re-derive the bed decode for the new geometry */
     c->rq_state = 0;                             /* new aligner starts flat: re-send the room-EQ targets */
     c->lc_state = 0;                             /* ... and the tracked-alignment targets */

@@ -5,7 +5,7 @@
  *   1. natnet_parse_frame — a pure, fully bounds-checked decoder of a NAT_FRAMEOFDATA payload
  *      down to the selected rigid body's pose. Unit-tested; safe on hostile/truncated input.
  *   2. the consumer — a UDP (multicast or unicast) data socket + a receiver thread that decodes
- *      each frame and publishes the pose into a seqlock. Windows/Winsock; on-hardware-pending.
+ *      each frame and publishes the pose into a seqlock. Sockets through os.h; on-hardware-pending.
  *
  * Wire format (from the documented protocol; cross-checked against the NatNet 4.5 SDK's
  * PacketClient sample — third_party/NatNet-4.5, referenced but never linked):
@@ -26,9 +26,10 @@
  *   The stamps feed pose prediction's velocity estimate (rt.c): server-clock stamps carry none
  *   of the network/scheduling jitter an arrival-time stamp does, and stay correct across a
  *   mid-session camera-rate change in Motive. Pre-4.1 the sections are not hoppable (skeletons
- *   would need full decoding), so the receiver falls back to stamping QPC at arrival.
+ *   would need full decoding), so the receiver falls back to the monotonic clock at arrival.
  */
 #include "natnet.h"
+#include "pose.h"        /* the seqlock slot the receiver publishes into */
 
 #include <stdlib.h>
 #include <string.h>
@@ -220,18 +221,16 @@ bool natnet_resolve_name(const uint8_t* p, size_t len, int major, int minor,
     return false;
 }
 
-/* ---- consumer (Winsock; on-hardware-pending) ------------------------------ */
+/* ---- consumer (UDP through the os.h shim; on-hardware-pending) ------------- */
 
-#define WIN32_LEAN_AND_MEAN
-#include <winsock2.h>
-#include <ws2tcpip.h>
-#include <windows.h>
+#include "os.h"
+#include <stdatomic.h>
 
 /* How the receiver derives pose_write_t's t_ns. Chosen ONCE at open and fixed for the
  * connection's lifetime — pose.h's contract is one writer, ONE clock, differences only, and a
  * per-frame fallback would splice two clocks into one velocity difference. */
 enum {
-    NN_STAMP_ARRIVAL = 0,   /* QPC at packet arrival (pre-4.1: the frame suffix is unreachable) */
+    NN_STAMP_ARRIVAL = 0,   /* the local monotonic clock at packet arrival (pre-4.1: the frame suffix is unreachable) */
     NN_STAMP_MIDEXPO,       /* CameraMidExposureTimestamp ticks -> ns (needs the handshake's clock
                              * frequency): the hardware capture instant — no network/scheduling
                              * jitter, immune to a mid-session camera-rate change in Motive */
@@ -241,21 +240,20 @@ enum {
 };
 
 struct NatNet {
-    SOCKET    sock;
-    HANDLE    thread;
-    volatile LONG stop;
+    os_socket sock;
+    os_thread thread;
+    _Atomic int stop;
     int       major, minor;
     int       stamp_mode;    /* NN_STAMP_* */
     double    ticks_to_ns;   /* NN_STAMP_MIDEXPO: 1e9 / server HighResClockFrequency */
     int32_t   rigid_body;
     PoseSlot  pose;
-    /* Liveness stamps, all on the LOCAL QPC clock (see natnet_status). last_frame: any FrameOfData
-     * received; last_pose: a valid pose published for the selected body; 0 = never. Written by the
-     * receiver thread with an interlocked 64-bit store, read by natnet_status on the control thread
-     * (a plain aligned 64-bit load is atomic on x64). qpc_freq is fixed at open. */
-    LONG64    qpc_freq;
-    volatile LONG64 last_frame_ticks;
-    volatile LONG64 last_pose_ticks;
+    /* Liveness stamps, both on the LOCAL monotonic clock in NANOSECONDS (see natnet_status).
+     * last_frame: any FrameOfData received; last_pose: a valid pose published for the selected
+     * body; 0 = never. Written by the receiver thread, read by natnet_status on the control
+     * thread - relaxed atomics, because a stamp orders nothing else. */
+    _Atomic uint64_t last_frame_ns;
+    _Atomic uint64_t last_pose_ns;
 };
 
 static void nn_err(char* err, size_t cap, const char* msg) {
@@ -277,23 +275,18 @@ static void to_room(const float src_p[3], const float src_q[4], float p[3], floa
  * it converts the frame suffix's CameraMidExposureTimestamp ticks to time; left 0 if absent. */
 static bool handshake_version(const NatNetConfig* cfg, int* major, int* minor, uint64_t* freq) {
     if (!cfg->server || !cfg->server[0]) return false;
-    SOCKET s = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
-    if (s == INVALID_SOCKET) return false;
-    DWORD tmo = 500;
-    setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (const char*)&tmo, sizeof tmo);
+    os_socket s = os_udp_open();
+    if (s == OS_INVALID_SOCKET) return false;
+    os_udp_set_rcvtimeo_ms(s, 500);
 
-    struct sockaddr_in srv; memset(&srv, 0, sizeof srv);
-    srv.sin_family = AF_INET;
-    srv.sin_port   = htons(cfg->command_port ? cfg->command_port : 1510);
-    inet_pton(AF_INET, cfg->server, &srv.sin_addr);
-
+    const uint16_t port = cfg->command_port ? cfg->command_port : 1510;
     uint8_t req[4]; uint16_t id = NAT_CONNECT, nb = 0;          /* {messageID, nDataBytes} */
     memcpy(req, &id, 2); memcpy(req + 2, &nb, 2);
-    sendto(s, (const char*)req, sizeof req, 0, (struct sockaddr*)&srv, sizeof srv);
+    os_udp_sendto(s, req, sizeof req, cfg->server, port);
 
     uint8_t buf[2048];
-    int got = recv(s, (char*)buf, sizeof buf, 0);
-    closesocket(s);
+    int got = os_udp_recv(s, buf, sizeof buf);
+    os_udp_close(s);
     if (got < 4) return false;
     uint16_t msg; memcpy(&msg, buf, 2);
     if (msg != NAT_SERVERINFO) return false;
@@ -311,58 +304,50 @@ static bool handshake_version(const NatNetConfig* cfg, int* major, int* minor, u
 static bool resolve_name_via_modeldef(const NatNetConfig* cfg, int major, int minor,
                                       const char* name, int32_t* out_id) {
     if (!cfg->server || !cfg->server[0]) return false;
-    SOCKET s = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
-    if (s == INVALID_SOCKET) return false;
-    DWORD tmo = 800;
-    setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (const char*)&tmo, sizeof tmo);
+    os_socket s = os_udp_open();
+    if (s == OS_INVALID_SOCKET) return false;
+    os_udp_set_rcvtimeo_ms(s, 800);
 
-    struct sockaddr_in srv; memset(&srv, 0, sizeof srv);
-    srv.sin_family = AF_INET;
-    srv.sin_port   = htons(cfg->command_port ? cfg->command_port : 1510);
-    inet_pton(AF_INET, cfg->server, &srv.sin_addr);
-
+    const uint16_t port = cfg->command_port ? cfg->command_port : 1510;
     uint8_t req[4]; uint16_t id = NAT_REQUEST_MODELDEF, nb = 0;
     memcpy(req, &id, 2); memcpy(req + 2, &nb, 2);
-    sendto(s, (const char*)req, sizeof req, 0, (struct sockaddr*)&srv, sizeof srv);
+    os_udp_sendto(s, req, sizeof req, cfg->server, port);
 
     bool found = false;
     for (int tries = 0; tries < 8 && !found; ++tries) {        /* skip any data frames that arrive first */
         uint8_t buf[65536];
-        int got = recv(s, (char*)buf, sizeof buf, 0);
+        int got = os_udp_recv(s, buf, sizeof buf);
         if (got < 4) break;
         uint16_t msg; memcpy(&msg, buf, 2);
         if (msg == NAT_MODELDEF)
             found = natnet_resolve_name(buf + 4, (size_t)got - 4, major, minor, name, out_id);
     }
-    closesocket(s);
+    os_udp_close(s);
     return found;
 }
 
-static bool valid_ipv4(const char* s) { struct in_addr a; return inet_pton(AF_INET, s, &a) == 1; }
-
-static DWORD WINAPI receiver(LPVOID arg) {
+static void receiver(void* arg) {
     NatNet* nn = (NatNet*)arg;
     uint8_t buf[65536];                                        /* max UDP datagram */
-    while (!nn->stop) {
-        int got = recvfrom(nn->sock, (char*)buf, sizeof buf, 0, NULL, NULL);
-        if (got == SOCKET_ERROR) {                             /* timeout is normal (200 ms, to re-poll stop); */
-            int e = WSAGetLastError();                         /* a HARD error must back off, not hot-spin a core */
-            if (e != WSAETIMEDOUT && e != WSAEWOULDBLOCK) Sleep(50);
+    while (!atomic_load_explicit(&nn->stop, memory_order_relaxed)) {
+        int got = os_udp_recv(nn->sock, buf, sizeof buf);
+        if (got < 0) {                                         /* timeout is normal (200 ms, to re-poll stop); */
+            if (got == OS_UDP_ERROR) os_sleep_ms(50);          /* a HARD error must back off, not hot-spin a core */
             continue;
         }
         if (got < 4) continue;                                 /* runt: re-poll stop */
         uint16_t msg, nbytes;
         memcpy(&msg, buf, 2); memcpy(&nbytes, buf + 2, 2);
         if (msg != NAT_FRAMEOFDATA) continue;
-        LARGE_INTEGER qc; QueryPerformanceCounter(&qc);        /* one read: liveness stamps + arrival stamp */
-        _InterlockedExchange64(&nn->last_frame_ticks, qc.QuadPart);   /* a data frame arrived (any body) */
+        const uint64_t now_ns = os_monotonic_ns();             /* one read: liveness stamps + arrival stamp */
+        atomic_store_explicit(&nn->last_frame_ns, now_ns, memory_order_relaxed);  /* a frame arrived (any body) */
         size_t plen = (size_t)got - 4;
         if (nbytes <= plen) plen = nbytes;                     /* trust the smaller of header/recv */
         float sp[3], sq[4];
         bool tv = true;
         NatNetStamps st;
         if (natnet_parse_frame(buf + 4, plen, nn->major, nn->minor, nn->rigid_body, sp, sq, &tv, &st) && tv) {
-            _InterlockedExchange64(&nn->last_pose_ticks, qc.QuadPart);  /* a valid pose for our body */
+            atomic_store_explicit(&nn->last_pose_ns, now_ns, memory_order_relaxed);  /* a valid pose for our body */
             float p[3], q[4];
             to_room(sp, sq, p, q);
             /* stamp with the connection's clock (stamp_mode, fixed at open): rt.c differences
@@ -372,22 +357,21 @@ static DWORD WINAPI receiver(LPVOID arg) {
              * mis-measures dt by the network + scheduling jitter (worst when a held-up thread
              * drains several frames back to back). A frame whose suffix didn't parse publishes
              * t_ns = 0 ("untimestamped") — prediction resets rather than mixing clocks. */
-            unsigned __int64 t_ns = 0;
+            uint64_t t_ns = 0;
             switch (nn->stamp_mode) {
             case NN_STAMP_MIDEXPO:
-                if (st.mid_exposure) t_ns = (unsigned __int64)((double)st.mid_exposure * nn->ticks_to_ns);
+                if (st.mid_exposure) t_ns = (uint64_t)((double)st.mid_exposure * nn->ticks_to_ns);
                 break;
             case NN_STAMP_FTS:
-                if (st.timestamp > 0.0) t_ns = (unsigned __int64)(st.timestamp * 1e9);
+                if (st.timestamp > 0.0) t_ns = (uint64_t)(st.timestamp * 1e9);
                 break;
             default:
-                t_ns = (unsigned __int64)((double)qc.QuadPart * 1e9 / (double)nn->qpc_freq);
+                t_ns = now_ns;                                 /* the arrival clock IS os_monotonic_ns now */
                 break;
             }
             pose_write_t(&nn->pose, p, q, t_ns);
         }
     }
-    return 0;
 }
 
 /* A body/stream is "current" if its last stamp is within this window. Loose enough that a couple
@@ -403,31 +387,38 @@ NatNetStatus natnet_classify(int64_t now, int64_t last_frame, int64_t last_pose,
 
 NatNetStatus natnet_status(const NatNet* nn) {
     if (!nn) return NN_STATUS_NO_DATA;
-    LARGE_INTEGER qc; QueryPerformanceCounter(&qc);
-    int64_t stale = nn->qpc_freq * NN_STALE_MS / 1000;
-    return natnet_classify(qc.QuadPart, nn->last_frame_ticks, nn->last_pose_ticks, stale);
+    const int64_t now   = (int64_t)os_monotonic_ns();
+    const int64_t frame = (int64_t)atomic_load_explicit(&nn->last_frame_ns, memory_order_relaxed);
+    const int64_t pose  = (int64_t)atomic_load_explicit(&nn->last_pose_ns,  memory_order_relaxed);
+    return natnet_classify(now, frame, pose, (int64_t)NN_STALE_MS * 1000000);
+}
+
+/* The pose, read out for a caller that is not the audio thread (bwa_validate's tracked placement).
+ * It exists so a C++ tool never has to include pose.h, whose seqlock is C11-atomics code. */
+bool natnet_read_pose(const NatNet* nn, float p[3], float q[4]) {
+    return nn && pose_read(&nn->pose, p, q);
 }
 
 NatNet* natnet_open(const NatNetConfig* cfg, char* err, size_t errcap) {
     if (!cfg) { nn_err(err, errcap, "natnet: null config"); return NULL; }
 
-    WSADATA wsa;
-    if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) { nn_err(err, errcap, "natnet: WSAStartup failed"); return NULL; }
+    if (os_net_startup() != 0) { nn_err(err, errcap, "natnet: socket startup failed"); return NULL; }
 
     NatNet* nn = (NatNet*)calloc(1, sizeof *nn);
-    if (!nn) { nn_err(err, errcap, "natnet: out of memory"); WSACleanup(); return NULL; }
-    nn->sock = INVALID_SOCKET;
+    if (!nn) { nn_err(err, errcap, "natnet: out of memory"); os_net_cleanup(); return NULL; }
+    nn->sock = OS_INVALID_SOCKET;
     nn->rigid_body = cfg->rigid_body;
-    nn->pose.q[3] = 1.0f;                                       /* identity until the first frame */
-    { LARGE_INTEGER qf; QueryPerformanceFrequency(&qf); nn->qpc_freq = qf.QuadPart; }
+    /* Identity until the first frame. A plain field store is no longer the right access now that
+     * pose.h's payload is atomic, and the slot stays "never published" either way (seq == 0). */
+    atomic_store_explicit(&nn->pose.q[3], 1.0f, memory_order_relaxed);
 
     /* inet_pton accepts only numeric IPv4 literals; a hostname or typo silently becomes 0.0.0.0,
      * which downstream surfaces as a misleading "server didn't respond" / "rigid body not found".
      * Reject a bad server/multicast address up front with a clear message. */
-    if (cfg->server && cfg->server[0] && !valid_ipv4(cfg->server)) {
+    if (cfg->server && cfg->server[0] && !os_ipv4_valid(cfg->server)) {
         nn_err(err, errcap, "natnet: tracker server must be a numeric IPv4 address (e.g. 192.168.1.10), not a hostname"); goto fail;
     }
-    if (cfg->multicast && cfg->multicast[0] && !valid_ipv4(cfg->multicast)) {
+    if (cfg->multicast && cfg->multicast[0] && !os_ipv4_valid(cfg->multicast)) {
         nn_err(err, errcap, "natnet: tracker multicast must be a numeric IPv4 multicast address (e.g. 239.255.42.99)"); goto fail;
     }
 
@@ -443,7 +434,7 @@ NatNet* natnet_open(const NatNetConfig* cfg, char* err, size_t errcap) {
 
     /* Pose stamp policy, fixed for the connection (see the NN_STAMP_* enum): the frame suffix's
      * server-clock stamps on 4.1..4.5 (mid-exposure ticks when the handshake gave the tick rate,
-     * fTimestamp seconds when the version was forced without a command channel), QPC at arrival
+     * fTimestamp seconds when the version was forced without a command channel), the local clock at arrival
      * otherwise — including bitstreams NEWER than the certified hop (stamps_supported), which
      * must degrade to a working arrival-clock prediction, not a dead one. rt.c only ever
      * differences the stamps, so which clock they're on is free to choose — but it must be ONE
@@ -466,40 +457,32 @@ NatNet* natnet_open(const NatNetConfig* cfg, char* err, size_t errcap) {
         nn->rigid_body = id;
     }
 
-    nn->sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
-    if (nn->sock == INVALID_SOCKET) { nn_err(err, errcap, "natnet: socket() failed"); goto fail; }
+    nn->sock = os_udp_open();
+    if (nn->sock == OS_INVALID_SOCKET) { nn_err(err, errcap, "natnet: socket() failed"); goto fail; }
 
-    BOOL reuse = TRUE;
-    setsockopt(nn->sock, SOL_SOCKET, SO_REUSEADDR, (const char*)&reuse, sizeof reuse);
-    DWORD tmo = 200;                                            /* so the thread can poll ->stop */
-    setsockopt(nn->sock, SOL_SOCKET, SO_RCVTIMEO, (const char*)&tmo, sizeof tmo);
+    os_udp_set_reuseaddr(nn->sock);
+    os_udp_set_rcvtimeo_ms(nn->sock, 200);                      /* so the thread can poll ->stop */
 
-    struct in_addr iface; iface.s_addr = htonl(INADDR_ANY);
-    if (cfg->local_iface && cfg->local_iface[0]) inet_pton(AF_INET, cfg->local_iface, &iface);
-
-    struct sockaddr_in addr; memset(&addr, 0, sizeof addr);
-    addr.sin_family = AF_INET;
-    addr.sin_port   = htons(cfg->data_port ? cfg->data_port : 1511);
-    addr.sin_addr.s_addr = htonl(INADDR_ANY);                  /* multicast bind to ANY, then join */
-    if (bind(nn->sock, (struct sockaddr*)&addr, sizeof addr) != 0) { nn_err(err, errcap, "natnet: bind() failed"); goto fail; }
+    /* multicast binds ANY, then joins */
+    if (os_udp_bind_any(nn->sock, cfg->data_port ? cfg->data_port : 1511) != 0) {
+        nn_err(err, errcap, "natnet: bind() failed"); goto fail;
+    }
 
     if (cfg->multicast && cfg->multicast[0]) {
-        struct ip_mreq mreq; memset(&mreq, 0, sizeof mreq);
-        inet_pton(AF_INET, cfg->multicast, &mreq.imr_multiaddr);
-        mreq.imr_interface = iface;
-        if (setsockopt(nn->sock, IPPROTO_IP, IP_ADD_MEMBERSHIP, (const char*)&mreq, sizeof mreq) != 0) {
+        if (os_udp_join_multicast(nn->sock, cfg->multicast, cfg->local_iface) != 0) {
             nn_err(err, errcap, "natnet: multicast join failed"); goto fail;
         }
     }
 
-    nn->thread = CreateThread(NULL, 0, receiver, nn, 0, NULL);
-    if (!nn->thread) { nn_err(err, errcap, "natnet: CreateThread failed"); goto fail; }
+    if (os_thread_create(&nn->thread, receiver, nn) != 0) {
+        nn_err(err, errcap, "natnet: receiver thread failed to start"); goto fail;
+    }
     return nn;
 
 fail:
-    if (nn->sock != INVALID_SOCKET) closesocket(nn->sock);
+    os_udp_close(nn->sock);
     free(nn);
-    WSACleanup();
+    os_net_cleanup();
     return NULL;
 }
 
@@ -507,13 +490,13 @@ const PoseSlot* natnet_pose(const NatNet* nn) { return nn ? &nn->pose : NULL; }
 
 void natnet_close(NatNet* nn) {
     if (!nn) return;
-    InterlockedExchange(&nn->stop, 1);
+    atomic_store_explicit(&nn->stop, 1, memory_order_relaxed);
     /* Join FIRST: the receiver's recvfrom has a 200 ms timeout, so it returns and sees ->stop
      * on its own within one tick. Closing the socket here (from another thread) before the join
-     * would risk the SOCKET handle being recycled by another subsystem and the receiver issuing
-     * recvfrom on a foreign socket. Close only after the thread has exited and released it. */
-    if (nn->thread) { WaitForSingleObject(nn->thread, INFINITE); CloseHandle(nn->thread); }
-    if (nn->sock != INVALID_SOCKET) closesocket(nn->sock);
+     * would risk the socket descriptor being recycled by another subsystem and the receiver
+     * issuing a receive on a foreign socket. Close only after the thread has exited. */
+    os_thread_join(&nn->thread);
+    os_udp_close(nn->sock);
     free(nn);
-    WSACleanup();
+    os_net_cleanup();
 }

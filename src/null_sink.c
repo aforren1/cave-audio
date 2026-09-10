@@ -5,31 +5,35 @@
  * and the in-memory array render the `binaural` profile relies on.
  *
  * The render callback runs on this thread and must stay alloc/lock/syscall-free per
- * the audio-thread invariants; the pacing (Sleep) happens *outside* the callback.
+ * the audio-thread invariants; the pacing wait happens *outside* the callback.
+ *
+ * Portable: the thread, the clock and the sleep go through os.h, so this sink — the one every
+ * platform gets, and the one CI runs on — builds wherever the library does.
  */
 #include "sink.h"
+#include "os.h"
 #include "profile.h"
 
+#include <stdatomic.h>
 #include <stdlib.h>
 #include <string.h>
 
-#define WIN32_LEAN_AND_MEAN
-#include <windows.h>
-#include <timeapi.h>        /* timeBeginPeriod/timeEndPeriod (link winmm) */
+/* The longest single pacing wait. Only bounds how long a stop request can sit unnoticed; the
+ * DEADLINE is absolute either way, so chopping the wait costs nothing in accuracy. */
+#define STOP_POLL_NS 5000000ull   /* 5 ms */
 
 typedef struct {
-    bwa_sink       base;
+    bwa_sink     base;
     uint32_t     sample_rate, block_size, channels;
-    bwa_render_fn   render;
+    bwa_render_fn render;
     void*        user;
     float*       bus;            /* planar channels * block_size */
-    HANDLE       thread;
-    volatile LONG stop_flag;
+    os_thread    thread;
+    _Atomic int  stop_flag;
 
-    /* Health counters (bwa_sink_health). Interlocked rather than stdatomic, the same choice pose.h
-     * makes: it keeps this file off the /experimental:c11atomics list. Written on the render thread,
-     * read from the control thread. */
-    volatile LONG64 h_blocks, h_dropouts, h_dropped_frames, h_late, h_render_ns_peak;
+    /* Health counters (bwa_sink_health): written on the render thread, read from the control
+     * thread. Relaxed — each is an independent count that orders nothing else. */
+    _Atomic uint64_t h_blocks, h_dropouts, h_dropped_frames, h_late, h_render_ns_peak;
 } NullSink;
 
 /* TEST HOOK — declared in sink.h (exported from the dll there), deliberately not in bw_audio.h:
@@ -41,60 +45,54 @@ void (*bwa_null_sink_tap)(const float* bus, uint32_t channels, uint32_t block_si
  * advances the reported device position by N EXTRA blocks, exactly as a device that clocked out
  * audio while we were not there to render it. It is the only way to exercise the dropout accounting
  * off-hardware: a real missed deadline needs a real device, but the arithmetic that turns a position
- * jump into a count is ordinary code and must not be shipped untested. Consumed once (reset to 0). */
-volatile LONG bwa_null_sink_skip_blocks = 0;
-
-static uint64_t qpc_now(void) {
-    LARGE_INTEGER c; QueryPerformanceCounter(&c);
-    return (uint64_t)c.QuadPart;
-}
-static uint64_t ticks_to_ns(uint64_t ticks, uint64_t freq) {
-    /* Split the scale so ticks*1e9 cannot overflow uint64 — the naive form wraps after
-     * only ~30 min at a 10 MHz QPC. This stays exact for centuries of runtime. */
-    return (ticks / freq) * 1000000000ull + (ticks % freq) * 1000000000ull / freq;
-}
+ * jump into a count is ordinary code and must not be shipped untested. Consumed once (reset to 0).
+ *
+ * Plain `volatile int`, not an atomic, because sink.h has to compile as C++ (asio_sink.cpp and
+ * wasapi_sink.cpp include it) and <stdatomic.h> cannot appear there. One test-thread writer, one
+ * sink-thread read-and-clear, aligned int: the ordering nobody depends on is the only thing lost. */
+volatile int bwa_null_sink_skip_blocks = 0;
 
 static void null_set_err(char* err, size_t cap, const char* msg) {
     if (err && cap) { strncpy(err, msg, cap - 1); err[cap - 1] = 0; }
 }
 
-static DWORD WINAPI null_thread(LPVOID arg) {
+static void null_thread(void* arg) {
     NullSink* s = (NullSink*)arg;
     BWA_THREAD_NAME("bw-audio (null)");       /* same render() the ASIO callback drives — profile w/o hardware */
-    LARGE_INTEGER lf; QueryPerformanceFrequency(&lf);
-    const uint64_t freq = (uint64_t)lf.QuadPart;
-    timeBeginPeriod(1);                      /* ~1ms Sleep granularity */
+    /* No os_timer_resolution_begin here any more: os_sleep_until_ns gets its precision from a
+     * high-resolution waitable timer, so a tool that merely happens to run this sink no longer
+     * raises the whole machine's timer resolution for as long as it is open. */
 
-    const uint64_t base   = qpc_now();
+    const uint64_t base   = os_monotonic_ns();
     const double block_ns = 1.0e9 * (double)s->block_size / (double)s->sample_rate;
     const uint64_t budget_ns = (uint64_t)s->block_size * 1000000000ull / (uint64_t)s->sample_rate;
     uint64_t sample_pos = 0, block_index = 0, predicted_pos = 0;
 
-    while (!s->stop_flag) {
+    while (!atomic_load_explicit(&s->stop_flag, memory_order_relaxed)) {
         /* The injected skip (bwa_null_sink_skip_blocks) advances the reported position without
          * rendering those blocks — what a starved device looks like from in here. */
-        const LONG skip = InterlockedExchange(&bwa_null_sink_skip_blocks, 0);
-        if (skip > 0) sample_pos += (uint64_t)skip * s->block_size;
+        const int skip = bwa_null_sink_skip_blocks;
+        if (skip > 0) { bwa_null_sink_skip_blocks = 0; sample_pos += (uint64_t)skip * s->block_size; }
 
         /* Same comparison the ASIO sink makes, through the same helper: where the last block said
          * this one would land, versus where it did. */
         if (predicted_pos) {
             const uint64_t lost = sink_position_gap(predicted_pos, sample_pos, s->block_size);
             if (lost) {
-                InterlockedIncrement64(&s->h_dropouts);
-                InterlockedExchangeAdd64(&s->h_dropped_frames, (LONG64)lost);
+                atomic_fetch_add_explicit(&s->h_dropouts, 1u, memory_order_relaxed);
+                atomic_fetch_add_explicit(&s->h_dropped_frames, lost, memory_order_relaxed);
             }
         }
         predicted_pos = sample_pos + s->block_size;
 
         bwa_timestamp ts = {
             .sample_pos     = sample_pos,
-            .system_time_ns = ticks_to_ns(qpc_now() - base, freq),
+            .system_time_ns = os_monotonic_ns() - base,
         };
         BWA_ZONE_BEGIN(zb, "null block");
-        const uint64_t t0 = qpc_now();
+        const uint64_t t0 = os_monotonic_ns();
         s->render(s->user, s->bus, s->block_size, &ts);   /* engine produces a block */
-        const uint64_t render_ns = ticks_to_ns(qpc_now() - t0, freq);
+        const uint64_t render_ns = os_monotonic_ns() - t0;
         if (bwa_null_sink_tap) bwa_null_sink_tap(s->bus, s->channels, s->block_size);
         /* null sink: the rendered bus is intentionally discarded. */
         BWA_ZONE_END(zb);
@@ -103,47 +101,44 @@ static DWORD WINAPI null_thread(LPVOID arg) {
         /* Overrunning the block period is real here, not simulated: this thread has a deadline and
          * the pacing loop below is what enforces it. On a device it is what eventually becomes a
          * dropout, so counting it off-hardware is the honest half of the measurement CI can do. */
-        if (render_ns > budget_ns) InterlockedIncrement64(&s->h_late);
-        for (;;) {
-            const LONG64 peak = s->h_render_ns_peak;
-            if ((LONG64)render_ns <= peak) break;
-            if (InterlockedCompareExchange64(&s->h_render_ns_peak, (LONG64)render_ns, peak) == peak) break;
+        if (render_ns > budget_ns) atomic_fetch_add_explicit(&s->h_late, 1u, memory_order_relaxed);
+        for (;;) {                                        /* CAS-max: one writer, so it settles at once */
+            uint64_t peak = atomic_load_explicit(&s->h_render_ns_peak, memory_order_relaxed);
+            if (render_ns <= peak) break;
+            if (atomic_compare_exchange_weak_explicit(&s->h_render_ns_peak, &peak, render_ns,
+                                                      memory_order_relaxed, memory_order_relaxed)) break;
         }
-        InterlockedIncrement64(&s->h_blocks);
+        atomic_fetch_add_explicit(&s->h_blocks, 1u, memory_order_relaxed);
 
         sample_pos  += s->block_size;
         block_index += 1;
 
-        /* pace to the next block deadline; stay responsive to stop */
-        const double target_ns = (double)block_index * block_ns;
-        for (;;) {
-            if (s->stop_flag) break;
-            const double elapsed_ns = (double)ticks_to_ns(qpc_now() - base, freq);
-            const double remain_ms  = (target_ns - elapsed_ns) / 1.0e6;
-            if (remain_ms <= 0.3) break;
-            Sleep(remain_ms > 2.0 ? (DWORD)(remain_ms - 1.0) : 0);
+        /* Pace to the block's ABSOLUTE deadline, counted from `base` rather than from the last
+         * wake, so a late block is caught up instead of pushing every later one back. The wait is
+         * chopped into STOP_POLL_NS pieces for one reason only: bwa_stop must not have to wait a
+         * whole block period, and there is no way to wake this timer early. */
+        const uint64_t deadline = base + (uint64_t)((double)block_index * block_ns);
+        while (!atomic_load_explicit(&s->stop_flag, memory_order_relaxed)) {
+            const uint64_t now = os_monotonic_ns();
+            if (now >= deadline) break;
+            const uint64_t piece = now + STOP_POLL_NS;
+            os_sleep_until_ns(piece < deadline ? piece : deadline);
         }
     }
-
-    timeEndPeriod(1);
-    return 0;
 }
 
 static int null_start(bwa_sink* base) {
     NullSink* s = (NullSink*)base;
-    if (s->thread) return 0;                 /* already running */
-    InterlockedExchange(&s->stop_flag, 0);
-    s->thread = CreateThread(NULL, 0, null_thread, s, 0, NULL);
-    return s->thread ? 0 : 1;
+    if (os_thread_valid(&s->thread)) return 0;   /* already running */
+    atomic_store_explicit(&s->stop_flag, 0, memory_order_relaxed);
+    return os_thread_create(&s->thread, null_thread, s);
 }
 
 static void null_stop(bwa_sink* base) {
     NullSink* s = (NullSink*)base;
-    if (!s->thread) return;
-    InterlockedExchange(&s->stop_flag, 1);
-    WaitForSingleObject(s->thread, INFINITE);
-    CloseHandle(s->thread);
-    s->thread = NULL;
+    if (!os_thread_valid(&s->thread)) return;
+    atomic_store_explicit(&s->stop_flag, 1, memory_order_relaxed);
+    os_thread_join(&s->thread);
 }
 
 static void null_close(bwa_sink* base) {
@@ -161,14 +156,15 @@ static uint32_t null_block_size(bwa_sink* base) { return ((NullSink*)base)->bloc
  * path is the same helper the ASIO sink uses, driven by the injection hook. measured = true. */
 static void null_health(bwa_sink* base, bwa_sink_health* out) {
     NullSink* s = (NullSink*)base;
-    out->blocks         = (uint64_t)s->h_blocks;
-    out->dropouts       = (uint64_t)s->h_dropouts;
-    out->dropped_frames = (uint64_t)s->h_dropped_frames;
+    out->blocks         = atomic_load_explicit(&s->h_blocks, memory_order_relaxed);
+    out->dropouts       = atomic_load_explicit(&s->h_dropouts, memory_order_relaxed);
+    out->dropped_frames = atomic_load_explicit(&s->h_dropped_frames, memory_order_relaxed);
     out->driver_resyncs = 0;                    /* no driver to report one */
-    out->late_blocks    = (uint64_t)s->h_late;
-    out->render_ns_peak = (uint64_t)s->h_render_ns_peak;
+    out->late_blocks    = atomic_load_explicit(&s->h_late, memory_order_relaxed);
+    out->render_ns_peak = atomic_load_explicit(&s->h_render_ns_peak, memory_order_relaxed);
     out->period_ns      = s->sample_rate
             ? (uint64_t)s->block_size * 1000000000ull / (uint64_t)s->sample_rate : 0;
+    out->device_lost    = 0;                    /* no device to lose */
     out->measured       = true;
 }
 

@@ -18,8 +18,7 @@
 
 #include <phonon.h>
 
-#define WIN32_LEAN_AND_MEAN
-#include <windows.h>
+#include "os.h"
 #include <math.h>
 #include <stdatomic.h>
 #include <stdio.h>
@@ -68,8 +67,8 @@ struct SteamReflect {
     uint32_t         seq_w;     /* writer's private copy of seq */
     IPLReflectionEffectParams pub;
 
-    HANDLE        thread;
-    volatile LONG stop;
+    os_thread     thread;
+    _Atomic int   stop;
 };
 
 /* phonon's identity basis (ahead = -z), not the room's (+z ahead) — harmless AND load-bearing to
@@ -108,11 +107,11 @@ static int refl_read(SteamReflect* r, IPLReflectionEffectParams* out) {
     return 0;
 }
 
-static DWORD WINAPI sim_thread(LPVOID arg) {
+static void sim_thread(void* arg) {
     SteamReflect* r = (SteamReflect*)arg;
     BWA_THREAD_NAME("bw-sim (reflections)");
-    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);  /* never preempt the audio callback */
-    while (!r->stop) {
+    os_thread_lower_priority();  /* never preempt the audio callback */
+    while (!atomic_load_explicit(&r->stop, memory_order_acquire)) {
         float lp[3], lq[4]; rt_read_pose(r->rt, lp, lq); (void)lq;
 
         IPLSimulationInputs in; memset(&in, 0, sizeof in);
@@ -151,9 +150,8 @@ static DWORD WINAPI sim_thread(LPVOID arg) {
         out.reflections.tanDevice = NULL; out.reflections.tanSlot = -1;
         refl_publish(r, &out.reflections);
 
-        Sleep(1000 / REFL_HZ);
+        os_sleep_ms(1000 / REFL_HZ);
     }
-    return 0;
 }
 
 void steam_reflect_tap(void* ud, float* bus, uint32_t n, const float* lp, const float* lq, const float* aux) {
@@ -328,8 +326,7 @@ SteamReflect* steam_reflect_create(SteamScene* scene, RtCore* rt, const Layout* 
     r->out26 = (float*)calloc((size_t)r->channels * block, sizeof(float));
     if (!r->ambi || !r->out26) goto fail;
 
-    r->thread = CreateThread(NULL, 0, sim_thread, r, 0, NULL);
-    if (!r->thread) goto fail;
+    if (os_thread_create(&r->thread, sim_thread, r) != 0) goto fail;
     return r;
 
 fail:
@@ -339,7 +336,8 @@ fail:
 
 void steam_reflect_destroy(SteamReflect* r) {
     if (!r) return;
-    if (r->thread) { InterlockedExchange(&r->stop, 1); WaitForSingleObject(r->thread, INFINITE); CloseHandle(r->thread); }
+    atomic_store_explicit(&r->stop, 1, memory_order_release);
+    os_thread_join(&r->thread);
     if (r->dec) iplAmbisonicsDecodeEffectRelease(&r->dec);
     if (r->refl) iplReflectionEffectRelease(&r->refl);
     if (r->bed) { iplSourceRemove(r->bed, r->sim); iplSourceRelease(&r->bed); }

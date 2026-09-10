@@ -28,6 +28,7 @@
 #define BWA_SINK_H
 
 #include "bw_audio.h"       /* bwa_sink_type: the vtable names its own backend */
+#include "os.h"             /* BWA_EXPORT (the internal test hooks below) */
 
 #include <stdbool.h>
 #include <stddef.h>
@@ -45,22 +46,24 @@
  * that lets a test (or a rig-side probe) see what actually goes to the device. Read your
  * accumulators only once rendering has stopped; the hook runs on the sink's render thread. */
 #ifdef BWA_BUILD_DLL
-__declspec(dllexport)
+BWA_EXPORT
 #endif
 extern void (*bwa_null_sink_tap)(const float* bus, uint32_t channels, uint32_t block_size);
 
 /* TEST HOOK (defined in null_sink.c, exported from the dll; deliberately not in bw_audio.h):
  * set it to N and the null sink's next block reports a device position N blocks further on than it
  * rendered — a synthetic dropout, so the health accounting can be tested without a device. Consumed
- * once. A real missed deadline cannot be produced offline; the arithmetic that counts one can. */
+ * once. A real missed deadline cannot be produced offline; the arithmetic that counts one can.
+ * Plain `volatile int`: this header must compile as C++ (the ASIO and WASAPI sinks include it),
+ * so it cannot be an _Atomic. One writer, one read-and-clear — see null_sink.c. */
 #ifdef BWA_BUILD_DLL
-__declspec(dllexport)
+BWA_EXPORT
 #endif
-extern volatile long bwa_null_sink_skip_blocks;
+extern volatile int bwa_null_sink_skip_blocks;
 
 /* Hardware-anchored timestamp captured at the top of each block. Mirrors what ASIO
  * delivers via ASIOTime (sample position + nanosecond systemTime); the null sink
- * synthesizes it from QueryPerformanceCounter. */
+ * synthesizes it from the platform monotonic clock (os_monotonic_ns). */
 typedef struct {
     uint64_t sample_pos;       /* running output sample-frame position             */
     uint64_t system_time_ns;   /* monotonic host time at block start, nanoseconds   */

@@ -32,7 +32,7 @@
 #include <math.h>
 #include <stdio.h>
 #include <string.h>
-#include <windows.h>
+#include "portable.h"      /* bwa_sleep_ms: the demo's only OS call */
 
 #define RATE 48000u
 
@@ -102,12 +102,12 @@ int main(int argc, char** argv) {
         bwa_source_set_pos(e, s1, 2.0f * cosf(a), 1.5f, 2.0f * sinf(a));
         bwa_set_listener_pose(e, 0.f, 1.5f, 0.f, 0.f, 0.f, 0.f, 1.f);
         bwa_commit(e);
-        Sleep(16);
+        bwa_sleep_ms(16);
     }
     printf("    still playing: %s (12 s of file left - stopping early)\n",
            bwa_source_is_playing(e, s1) ? "yes" : "no");
     bwa_source_fade_out(e, s1, 0.4f);           /* click-free stop */
-    Sleep(600);
+    bwa_sleep_ms(600);
     bwa_source_destroy(e, s1);
     bwa_unload_sound(e, music);                 /* closes the stream (retire-acked internally) */
 
@@ -139,7 +139,7 @@ int main(int argc, char** argv) {
         uint32_t took = bwa_source_push(e, s2, chunk, want);
         pushed += took;                          /* took < want only when the ring is full */
         bwa_commit(e);
-        Sleep(16);
+        bwa_sleep_ms(16);
     }
     bwa_source_push_end(e, s2);                  /* end-of-data: the voice ends once the ring drains */
     printf("    pushed %.1f s; waiting for the ring to drain...\n", (double)pushed / RATE);
@@ -149,7 +149,7 @@ int main(int argc, char** argv) {
      * audio, so the readback cannot miss the transition and asking "is it still going" is what
      * this code actually wants to know. A push voice DOES post a completion, so switching to
      * the drain would work too. */
-    while (bwa_source_is_playing(e, s2)) { bwa_commit(e); Sleep(16); }
+    while (bwa_source_is_playing(e, s2)) { bwa_commit(e); bwa_sleep_ms(16); }
     printf("    drained - the push source ended itself (one-way: a new take needs a new source)\n");
     bwa_source_destroy(e, s2);
 

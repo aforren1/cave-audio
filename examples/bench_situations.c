@@ -22,8 +22,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#define WIN32_LEAN_AND_MEAN
-#include <windows.h>
+#include "portable.h"      /* bwa_sleep_ms / bwa_now_us: the demo's only OS calls */
 
 /* per-zone profiler readout, exported from bw_audio when built -DBWA_PROFILE_SELF (see profile_self.h).
  * reset returns 1 if that build flag is on (0 = the accumulation is compiled out). */
@@ -35,8 +34,6 @@ __declspec(dllimport) int bwa_prof_report(void);
 #define WAVF "bwa_bench_sit.wav"
 static int g_zones;   /* "zones" arg: dump the per-zone breakdown for each situation */
 
-static double g_qpc_hz;
-static double now_us(void) { LARGE_INTEGER c; QueryPerformanceCounter(&c); return (double)c.QuadPart * 1.0e6 / g_qpc_hz; }
 
 /* minimal mono 32-bit-float WAV (mirrors profile_bench; avoids pulling in a writer) */
 static int write_sine_wav(const char* path, double freq, uint32_t sr, uint32_t frames) {
@@ -109,7 +106,7 @@ static int run_sit(const Sit* s, bwa_sound snd_unused, Stats* out, int K) {
     }
     bwa_commit(e);
 
-    if (s->settle_ms) Sleep((DWORD)s->settle_ms);          /* let occlusion/reflection/pathing sims publish */
+    if (s->settle_ms) bwa_sleep_ms((unsigned)s->settle_ms);          /* let occlusion/reflection/pathing sims publish */
     for (int b = 0; b < 128; ++b) bwa_render_block(e, NULL, NULL);   /* warm up (gain ramps, caches) */
 
     if (g_zones) bwa_prof_reset();                         /* start the per-zone tally over the timed window */
@@ -118,9 +115,9 @@ static int run_sit(const Sit* s, bwa_sound snd_unused, Stats* out, int K) {
     uint32_t nch = 0;
     for (int b = 0; b < K; ++b) {
         uint32_t c = 0, n = 0;
-        double t0 = now_us();
+        double t0 = bwa_now_us();
         const float* out = bwa_render_block(e, &c, &n);
-        double dt = now_us() - t0;
+        double dt = bwa_now_us() - t0;
         if (!out) { free(t); bwa_stop(e); bwa_destroy(e); return -1; }
         nch = c; t[b] = dt;
     }
@@ -143,7 +140,6 @@ int main(int argc, char** argv) {
         printf("note: 'zones' needs a dll built with -DBWA_PROFILE_SELF; showing totals only.\n");
         g_zones = 0;
     }
-    LARGE_INTEGER f; QueryPerformanceFrequency(&f); g_qpc_hz = (double)f.QuadPart;
     if (!write_sine_wav(WAVF, 220.0, SR, SR)) { printf("wav write failed\n"); return 1; }
 
     const double budget_us = 1.0e6 * (double)BLK / (double)SR;   /* 5333.3 us at 256/48k */

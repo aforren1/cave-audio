@@ -5,6 +5,7 @@
  */
 #include "sound.h"
 #include "rt.h"          /* BWA_MAX_SAMPLE: the file-sample cap (see scrub_samples) */
+#include "os.h"        /* os_strcasecmp: the extension sniff */
 
 #include <math.h>
 #include <stdlib.h>
@@ -34,12 +35,12 @@ static void set_err(char* err, size_t cap, const char* msg) {
  * releases it for all three decoders. NULL on failure. */
 static float* decode_any(const char* path, unsigned int* ch, unsigned int* rate, uint64_t* frames) {
     const char* ext = strrchr(path, '.');
-    if (ext && _stricmp(ext, ".flac") == 0) {
+    if (ext && os_strcasecmp(ext, ".flac") == 0) {
         drflac_uint64 f = 0;
         float* p = drflac_open_file_and_read_pcm_frames_f32(path, ch, rate, &f, NULL);
         *frames = (uint64_t)f; return p;
     }
-    if (ext && _stricmp(ext, ".mp3") == 0) {
+    if (ext && os_strcasecmp(ext, ".mp3") == 0) {
         drmp3_config cfg; drmp3_uint64 f = 0;
         float* p = drmp3_open_file_and_read_pcm_frames_f32(path, &cfg, &f, NULL);
         if (p) { *ch = cfg.channels; *rate = cfg.sampleRate; }

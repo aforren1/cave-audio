@@ -22,8 +22,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#define WIN32_LEAN_AND_MEAN
-#include <windows.h>          /* Sleep, for the streaming-fill wait */
+#include "os.h"              /* os_sleep_ms, for the streaming-fill wait */
 
 #define N    256
 #define CH   BWA_CHANNELS

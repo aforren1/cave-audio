@@ -58,11 +58,19 @@
 #include "sink.h"          /* bwa_timestamp, BWA_CHANNELS */
 #include "sound.h"         /* SoundData (for the async staging calls at the end of the assets block) */
 #include "layout.h"        /* Layout (for rt_set_layout) */
-#include "pose.h"          /* PoseSlot (for rt_set_tracker) */
 #include "ism.h"           /* IsmRoom (for rt_set_ism_room) */
 
 #include <stdbool.h>
 #include <stdint.h>
+
+/* The forward declaration, shared verbatim by rt.h and natnet.h so neither drags <stdatomic.h>
+ * (and with it MSVC's /experimental:c11atomics) into every translation unit that only passes the
+ * slot around by pointer. Guarded rather than repeated, because a redundant typedef is a C11-only
+ * allowance and not every compiler in play is in C11 mode. */
+#ifndef BWA_POSESLOT_FWD
+#define BWA_POSESLOT_FWD
+typedef struct PoseSlot PoseSlot;
+#endif
 
 /* Extra physical voice slots beyond the caller's requested pool (rt_create allocates
  * req_voice_cap + BWA_FADE_RESERVE). A full-pool steal fades the victim out on its own slot and

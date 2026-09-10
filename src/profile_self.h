@@ -9,6 +9,8 @@
 #ifndef BWA_PROFILE_SELF_H
 #define BWA_PROFILE_SELF_H
 
+#include "os.h"            /* BWA_EXPORT */
+
 #include <stdint.h>
 
 typedef struct { const char* name; uint64_t t0; } bwa_prof_zone;
@@ -21,10 +23,10 @@ void          bwa_prof__frame(void);
 /* readout — exported from the dll (a consumer declares them dllimport). reset clears the table and
  * returns 1 if the dll was built with -DBWA_PROFILE_SELF (0 = accumulation compiled out — nothing to
  * report). report prints one row per zone (calls, total ms, mean us, us/block) and returns the count. */
-#if defined(BWA_BUILD_DLL)
-  #define BWA_PROF_API __declspec(dllexport)
+#if defined(_WIN32) && !defined(BWA_BUILD_DLL)
+  #define BWA_PROF_API __declspec(dllimport)   /* a consumer importing from the dll */
 #else
-  #define BWA_PROF_API __declspec(dllimport)
+  #define BWA_PROF_API BWA_EXPORT
 #endif
 BWA_PROF_API int bwa_prof_reset(void);
 BWA_PROF_API int bwa_prof_report(void);

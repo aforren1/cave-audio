@@ -31,7 +31,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <windows.h>
+#include "portable.h"      /* bwa_sleep_ms: the demo's only OS call */
 
 #define RATE   48000u
 #define SECS   4u
@@ -144,7 +144,7 @@ static void check(int ok, const char* what) {
 /* run `secs` of the demo loop: per-frame commit, like an engine tick */
 static void run(bwa_engine* e, double secs, const char* msg) {
     if (msg) printf("%s\n", msg);
-    for (int t = 0; t < ticks((int)(secs * 60.0)); ++t) { bwa_commit(e); Sleep(16); }
+    for (int t = 0; t < ticks((int)(secs * 60.0)); ++t) { bwa_commit(e); bwa_sleep_ms(16); }
 }
 
 int main(int argc, char** argv) {
@@ -188,7 +188,7 @@ int main(int argc, char** argv) {
     printf("2) yaw: spinning the whole field (bwa_bed_set_orientation yaw glides, click-free)\n");
     for (int t = 0; t < ticks(8 * 60); ++t) {                 /* ~one slow turn over 8 s */
         bwa_bed_set_orientation(e, bed, 0.8f * (float)t / 60.0f, 0.f, 0.f);
-        bwa_commit(e); Sleep(16);
+        bwa_commit(e); bwa_sleep_ms(16);
     }
 
     printf("3) tilt: pitch +80 deg (bwa_bed_set_orientation) - the front content moves to the ceiling\n");
@@ -228,14 +228,14 @@ int main(int argc, char** argv) {
     /* 7a) bwa_bed_play_at: silent until the dsp clock reaches start_sample. Same time base as
      *     bwa_source_play_at, so "now" comes from bwa_get_dsp_time_frames. */
     bwa_bed_stop(e, bed);
-    for (int t = 0; t < 12; ++t) { bwa_commit(e); Sleep(16); }
+    for (int t = 0; t < 12; ++t) { bwa_commit(e); bwa_sleep_ms(16); }
     bwa_bed_play_at(e, bed, field, true, bwa_get_dsp_time_frames(e) + RATE / 2);   /* 0.5 s out */
-    for (int t = 0; t < 9; ++t) { bwa_commit(e); Sleep(16); }                      /* ~0.15 s in */
+    for (int t = 0; t < 9; ++t) { bwa_commit(e); bwa_sleep_ms(16); }                      /* ~0.15 s in */
     uint64_t held = bwa_bed_get_playhead_frames(e, bed);
     /* A play_at wired to the unscheduled call would be ~7000 frames in by now, so 0 is not a
      * coin flip. The bound is generous: anything past the first block means it did not hold. */
     check(held < 256, "bwa_bed_play_at held the field silent until its start sample");
-    for (int t = 0; t < 30; ++t) { bwa_commit(e); Sleep(16); }                     /* past the lead */
+    for (int t = 0; t < 30; ++t) { bwa_commit(e); bwa_sleep_ms(16); }                     /* past the lead */
     check(bwa_bed_get_playhead_frames(e, bed) > 0, "...and started once the clock reached it");
 
     /* 7b) bwa_bed_set_region + bwa_poll_looped: bound the bed to [start, end) content frames. A
@@ -255,7 +255,7 @@ int main(int argc, char** argv) {
         bwa_source hit[16];
         uint32_t n = bwa_poll_looped(e, hit, 16, NULL);
         for (uint32_t i = 0; i < n; ++i) if (hit[i] == bed) ++wraps;
-        Sleep(16);
+        bwa_sleep_ms(16);
     }
     printf("   %d wraps of a 200 ms region in ~1 s\n", wraps);
     /* ~5 expected. Demanded with a margin: the field is 4 s long, so a region that never reached
@@ -264,9 +264,9 @@ int main(int argc, char** argv) {
 
     /* 7c) bwa_bed_stop_at: the scheduled click-free stop, same time base again. */
     bwa_bed_stop_at(e, bed, bwa_get_dsp_time_frames(e) + RATE / 4);   /* 0.25 s out */
-    for (int t = 0; t < 6; ++t) { bwa_commit(e); Sleep(16); }         /* ~0.1 s in: still going */
+    for (int t = 0; t < 6; ++t) { bwa_commit(e); bwa_sleep_ms(16); }         /* ~0.1 s in: still going */
     check(bwa_bed_is_playing(e, bed), "bwa_bed_stop_at did not stop the bed immediately");
-    for (int t = 0; t < 25; ++t) { bwa_commit(e); Sleep(16); }        /* past the stop */
+    for (int t = 0; t < 25; ++t) { bwa_commit(e); bwa_sleep_ms(16); }        /* past the stop */
     check(!bwa_bed_is_playing(e, bed), "...and stopped it once the clock reached it");
 
     /* 7d) bwa_bed_play_loop is the same region set at PLAY time: play [0, loop_end), then repeat

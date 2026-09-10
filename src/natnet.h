@@ -8,15 +8,25 @@
  * that slot at block time (lower latency than routing pose through the command ring). On
  * NatNet 4.1+ the pose is stamped with the SERVER's clock from the frame suffix (capture-grid
  * time — pose prediction's velocity estimate sees none of the delivery jitter); pre-4.1 falls
- * back to QPC at arrival. One clock per connection, chosen at open (pose.h contract).
+ * back to the local monotonic clock at arrival. One clock per connection, chosen at open
+ * (pose.h contract).
  *
- * The socket/thread path is Windows-only and on-hardware-pending (needs a live Motive server);
- * the parser (natnet_parse_frame) is pure and unit-tested against synthetic packets.
+ * The socket/thread path goes through the os.h shim (Winsock or BSD sockets) and is
+ * on-hardware-pending (it needs a live Motive server); the parser (natnet_parse_frame) is pure
+ * and unit-tested against synthetic packets.
  */
 #ifndef BWA_NATNET_H
 #define BWA_NATNET_H
 
-#include "pose.h"
+/* The forward declaration, shared verbatim by rt.h and natnet.h so neither drags <stdatomic.h>
+ * (and with it MSVC's /experimental:c11atomics) into every translation unit that only passes the
+ * slot around by pointer. Guarded rather than repeated, because a redundant typedef is a C11-only
+ * allowance and not every compiler in play is in C11 mode. */
+#ifndef BWA_POSESLOT_FWD
+#define BWA_POSESLOT_FWD
+typedef struct PoseSlot PoseSlot;
+#endif
+
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -46,13 +56,19 @@ typedef struct {
  * spawn the receiver thread. Returns NULL on failure with a message in err. */
 NatNet*         natnet_open(const NatNetConfig* cfg, char* err, size_t errcap);
 
-/* The live pose slot the audio thread reads (stable for the NatNet's lifetime). */
+/* The live pose slot the audio thread reads (stable for the NatNet's lifetime). C only: the slot
+ * is a C11-atomics seqlock (pose.h), opaque to C++. */
 const PoseSlot* natnet_pose(const NatNet* nn);
+
+/* Read the latest published pose. The same seqlock sample the audio thread takes, wrapped so a
+ * caller off that thread (bwa_validate's tracked placement, a C++ tool) needs no pose.h. Returns
+ * false when nothing has been published yet or the read lost the race. */
+bool natnet_read_pose(const NatNet* nn, float p[3], float q[4]);
 
 /* Stop the receiver thread and release the socket. Call after the audio thread is stopped. */
 void            natnet_close(NatNet* nn);
 
-/* Stream liveness, derived from LOCAL (QPC) arrival stamps — deliberately NOT the pose slot's
+/* Stream liveness, derived from LOCAL monotonic arrival stamps — deliberately NOT the pose slot's
  * t_ns, which rides the server clock on NatNet 4.1+ and so can't be compared to a local now.
  * Control-thread poll; never blocks. Mirrors bwa_tracker_state minus DISCONNECTED (that case is
  * nn == NULL, resolved by the caller). NO_DATA = no FrameOfData packets recently; NO_BODY = frames

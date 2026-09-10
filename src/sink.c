@@ -177,7 +177,7 @@ bwa_sink* bwa_sink_open(uint32_t sample_rate, uint32_t block_size, uint32_t chan
          * resampler is the case that exists today). It has to reach the caller, because a clean
          * bwa_last_error after bwa_start is what says the device runs at the engine's rate. */
         if (s) { sink_set_err(err, errcap, msg); return s; }
-        if (msg[0] && !first_err[0]) { strncpy(first_err, msg, sizeof first_err - 1); }
+        if (msg[0] && !first_err[0]) snprintf(first_err, sizeof first_err, "%s", msg);   /* always NUL-terminated */
     }
 
     /* Every candidate was SKIPPED for the device name: the caller named a device no compiled

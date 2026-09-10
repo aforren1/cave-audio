@@ -6,8 +6,7 @@
 #include "dr_flac.h"
 #include "dr_mp3.h"
 
-#define WIN32_LEAN_AND_MEAN
-#include <windows.h>
+#include "os.h"
 #include <math.h>
 #include <stdatomic.h>
 #include <stdint.h>
@@ -49,21 +48,21 @@ struct StreamSet {
     uint32_t        rate;
     Stream*         slots[MAX_STREAMS];
     int             nslots;
-    CRITICAL_SECTION lock;      /* guards the slot array (open/close vs the thread's snapshot) */
-    HANDLE          thread;
-    volatile LONG   stop;
+    os_mutex    lock;           /* guards the slot array (open/close vs the thread's snapshot) */
+    os_thread   thread;
+    _Atomic int stop;
 };
 
 /* ---- decoder (streaming thread, except dec_open which is control-thread at stream_open) ---- */
 
 static int dec_open(Stream* s, const char* path) {
     const char* ext = strrchr(path, '.');
-    if (ext && _stricmp(ext, ".flac") == 0) {
+    if (ext && os_strcasecmp(ext, ".flac") == 0) {
         drflac* f = drflac_open_file(path, NULL);
         if (!f) return 0;
         s->dec = f; s->dtype = DT_FLAC;
         s->channels = f->channels; s->file_rate = f->sampleRate; s->total_frames = f->totalPCMFrameCount;
-    } else if (ext && _stricmp(ext, ".mp3") == 0) {
+    } else if (ext && os_strcasecmp(ext, ".mp3") == 0) {
         drmp3* m = (drmp3*)malloc(sizeof *m);
         if (!m || !drmp3_init_file(m, path, NULL)) { free(m); return 0; }
         s->dec = m; s->dtype = DT_MP3;
@@ -159,20 +158,20 @@ static void fill(Stream* s) {
  * cleared under the lock BEFORE the free, so no later snapshot can capture a dangling pointer. */
 static void stream_reap(StreamSet* set, Stream* s) {
     dec_close(s);
-    EnterCriticalSection(&set->lock);
+    os_mutex_lock(&set->lock);
     for (int i = 0; i < set->nslots; ++i) if (set->slots[i] == s) set->slots[i] = NULL;
-    LeaveCriticalSection(&set->lock);
+    os_mutex_unlock(&set->lock);
     free(s->ring); free(s->inter); free(s->mono); free(s);
 }
 
-static DWORD WINAPI stream_thread(LPVOID arg) {
+static void stream_thread(void* arg) {
     StreamSet* set = (StreamSet*)arg;
-    while (!set->stop) {
+    while (!atomic_load_explicit(&set->stop, memory_order_acquire)) {
         Stream* snap[MAX_STREAMS]; int n;
-        EnterCriticalSection(&set->lock);
+        os_mutex_lock(&set->lock);
         n = set->nslots;
         for (int i = 0; i < n; ++i) snap[i] = set->slots[i];
-        LeaveCriticalSection(&set->lock);
+        os_mutex_unlock(&set->lock);
 
         for (int i = 0; i < n; ++i) {
             Stream* s = snap[i];
@@ -196,9 +195,8 @@ static DWORD WINAPI stream_thread(LPVOID arg) {
             }
             if (st == ST_ACTIVE && !s->done) fill(s);
         }
-        Sleep(3);
+        os_sleep_ms(3);
     }
-    return 0;
 }
 
 /* ---- API ---- */
@@ -207,21 +205,23 @@ StreamSet* stream_set_create(uint32_t engine_rate) {
     StreamSet* set = (StreamSet*)calloc(1, sizeof *set);
     if (!set) return NULL;
     set->rate = engine_rate;
-    InitializeCriticalSection(&set->lock);
-    set->thread = CreateThread(NULL, 0, stream_thread, set, 0, NULL);
-    if (!set->thread) { DeleteCriticalSection(&set->lock); free(set); return NULL; }
+    if (os_mutex_init(&set->lock) != 0) { free(set); return NULL; }
+    if (os_thread_create(&set->thread, stream_thread, set) != 0) {
+        os_mutex_destroy(&set->lock); free(set); return NULL;
+    }
     return set;
 }
 
 void stream_set_destroy(StreamSet* set) {
     if (!set) return;
-    if (set->thread) { InterlockedExchange(&set->stop, 1); WaitForSingleObject(set->thread, INFINITE); CloseHandle(set->thread); }
+    atomic_store_explicit(&set->stop, 1, memory_order_release);
+    os_thread_join(&set->thread);
     for (int i = 0; i < set->nslots; ++i) {              /* thread is gone: reap any survivors directly
                                                           * (including closes the thread hadn't reached) */
         Stream* s = set->slots[i];
         if (s) stream_reap(set, s);
     }
-    DeleteCriticalSection(&set->lock);
+    os_mutex_destroy(&set->lock);
     free(set);
 }
 
@@ -229,11 +229,11 @@ static void set_err(char* err, size_t cap, const char* msg) { if (err && cap) { 
 
 /* register a stream in the set's slot array; 0 = no slot free */
 static int reg_slot(StreamSet* set, Stream* s) {
-    EnterCriticalSection(&set->lock);
+    os_mutex_lock(&set->lock);
     int slot = -1;
     for (int i = 0; i < MAX_STREAMS; ++i) if (!set->slots[i]) { slot = i; break; }
     if (slot >= 0) { set->slots[slot] = s; if (slot + 1 > set->nslots) set->nslots = slot + 1; }
-    LeaveCriticalSection(&set->lock);
+    os_mutex_unlock(&set->lock);
     return slot >= 0;
 }
 

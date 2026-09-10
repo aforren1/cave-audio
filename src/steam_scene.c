@@ -15,8 +15,8 @@
 
 #include <phonon.h>
 
-#define WIN32_LEAN_AND_MEAN
-#include <windows.h>
+#include "os.h"
+#include <stdatomic.h>
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -50,9 +50,9 @@ struct SteamScene {
     RtCore*       rt;
     uint32_t      voice_cap;
 
-    SRWLOCK       scene_srw;       /* guards the COMMITTED scene: exclusive around iplSceneCommit (this
+    os_rwlock     scene_srw;       /* guards the COMMITTED scene: exclusive around iplSceneCommit (this
                                     * thread), shared around a borrowing sim's ray trace (steam_scene_ray_lock) */
-    CRITICAL_SECTION lock;
+    os_mutex      lock;
     /* shadow: written by the control thread under lock, snapshotted by the sim thread. `features` is
      * a per-slot bitmask (occlusion and/or directivity) so a source can be directional WITHOUT being
      * occluded; an IPLSource exists iff features != 0. fwd is the source's forward axis (unit). */
@@ -85,8 +85,8 @@ struct SteamScene {
              IPLMaterial  mat;
              IPLMatrix4x4 xform; int xform_dirty; } *dyn_shadow;   /* [BWA_MAX_DYN_MESH], under `lock` */
 
-    HANDLE        thread;
-    volatile LONG stop;
+    os_thread     thread;
+    _Atomic int   stop;
 };
 
 static IPLMatrix4x4 mat_identity(void) {
@@ -133,8 +133,8 @@ static void oriented_cs(IPLCoordinateSpace3* cs, const float origin[3], const fl
  * held exclusive as one region, so a reader can never observe a partially-mutated scene (phonon queues
  * the add/remove/update and applies them at commit, but we don't rely on that being lock-free vs a
  * concurrent trace). Held only while there is real work, never on an idle tick. */
-static void scene_w_lock(SteamScene* s)   { AcquireSRWLockExclusive(&s->scene_srw); }
-static void scene_w_unlock(SteamScene* s) { ReleaseSRWLockExclusive(&s->scene_srw); }
+static void scene_w_lock(SteamScene* s)   { os_rwlock_lock(&s->scene_srw); }
+static void scene_w_unlock(SteamScene* s) { os_rwlock_unlock(&s->scene_srw); }
 
 /* (sim thread) rebuild the committed static mesh from the pending arrays */
 /* Adopt the pending mesh buffers (verts/tris/tri_mat/mats, all heap, ownership transferred) as the
@@ -143,9 +143,9 @@ static void scene_w_unlock(SteamScene* s) { ReleaseSRWLockExclusive(&s->scene_sr
  * rather than copying. The whole remove/create/add/commit runs under the exclusive scene lock (a rare
  * event — a full static-mesh swap — so holding the lock across the BVH build is fine). */
 static void mesh_mark_applied(SteamScene* s, uint32_t gen) {
-    EnterCriticalSection(&s->lock);
+    os_mutex_lock(&s->lock);
     if ((int32_t)(gen - s->mesh_gen_applied) > 0) s->mesh_gen_applied = gen;
-    LeaveCriticalSection(&s->lock);
+    os_mutex_unlock(&s->lock);
 }
 
 /* (either applier, called UNDER the exclusive scene lock) TRUE when a mesh of this generation or
@@ -155,9 +155,9 @@ static void mesh_mark_applied(SteamScene* s, uint32_t gen) {
  * its generation before releasing the scene lock (scene_w_lock -> s->lock nesting is the
  * established order here; see reconcile_dynamic's live_ack updates). */
 static int mesh_gen_stale(SteamScene* s, uint32_t gen) {
-    EnterCriticalSection(&s->lock);
+    os_mutex_lock(&s->lock);
     int stale = (int32_t)(gen - s->mesh_gen_applied) <= 0;
-    LeaveCriticalSection(&s->lock);
+    os_mutex_unlock(&s->lock);
     return stale;
 }
 
@@ -250,18 +250,18 @@ static void release_dyn(DynMesh* d) {
 static void reconcile_dynamic(SteamScene* s) {
     /* idle fast-path: one lock + a cheap scan. The vast majority of installs never add a dynamic mesh,
      * so skip the whole per-slot loop (and never touch the exclusive scene lock) when nothing is live. */
-    EnterCriticalSection(&s->lock);
+    os_mutex_lock(&s->lock);
     int any = 0;
     for (int i = 0; i < BWA_MAX_DYN_MESH; ++i)
         if (s->dyn_shadow[i].want || s->dyn_shadow[i].live_ack || s->dyn_shadow[i].verts) { any = 1; break; }
-    LeaveCriticalSection(&s->lock);
+    os_mutex_unlock(&s->lock);
     if (!any) return;
 
     char torn[BWA_MAX_DYN_MESH]; memset(torn, 0, sizeof torn);
     int main_dirty = 0, excl = 0;   /* excl: acquired lazily before the first main-scene mutation, held to commit */
     for (int i = 0; i < BWA_MAX_DYN_MESH; ++i) {
         /* snapshot this slot's desire under the lock; take ownership of pending-add geometry */
-        EnterCriticalSection(&s->lock);
+        os_mutex_lock(&s->lock);
         int want = s->dyn_shadow[i].want, ack = s->dyn_shadow[i].live_ack;
         int have_geo = (s->dyn_shadow[i].verts != NULL);
         IPLMatrix4x4 xform = s->dyn_shadow[i].xform; int xdirty = s->dyn_shadow[i].xform_dirty;
@@ -280,7 +280,7 @@ static void reconcile_dynamic(SteamScene* s) {
         } else if (want && ack && xdirty) {
             op = 2; s->dyn_shadow[i].xform_dirty = 0;
         }
-        LeaveCriticalSection(&s->lock);
+        os_mutex_unlock(&s->lock);
 
         /* Every main-scene mutation below runs under the exclusive scene lock, acquired on the FIRST
          * one and held through the commit — so the whole add/remove/update+commit batch is atomic vs a
@@ -290,10 +290,10 @@ static void reconcile_dynamic(SteamScene* s) {
             if (!excl) { scene_w_lock(s); excl = 1; }
             if (build_dyn(s, &s->dyn[i], bv, bnv, bt, bnt, &bm, &xform)) {
                 main_dirty = 1;
-                EnterCriticalSection(&s->lock); s->dyn_shadow[i].live_ack = 1; LeaveCriticalSection(&s->lock);
+                os_mutex_lock(&s->lock); s->dyn_shadow[i].live_ack = 1; os_mutex_unlock(&s->lock);
             } else {                                                       /* build failed: drop the request */
                 free(bv); free(bt);
-                EnterCriticalSection(&s->lock); s->dyn_shadow[i].want = 0; LeaveCriticalSection(&s->lock);
+                os_mutex_lock(&s->lock); s->dyn_shadow[i].want = 0; os_mutex_unlock(&s->lock);
             }
         } else if (op == 2 && s->dyn[i].live) {
             if (!excl) { scene_w_lock(s); excl = 1; }
@@ -311,11 +311,11 @@ static void reconcile_dynamic(SteamScene* s) {
     if (excl) scene_w_unlock(s);
     for (int i = 0; i < BWA_MAX_DYN_MESH; ++i) if (torn[i]) {              /* after the unlinking commit */
         release_dyn(&s->dyn[i]);                                          /* instance already unlinked: no lock needed */
-        EnterCriticalSection(&s->lock); s->dyn_shadow[i].live_ack = 0; LeaveCriticalSection(&s->lock);
+        os_mutex_lock(&s->lock); s->dyn_shadow[i].live_ack = 0; os_mutex_unlock(&s->lock);
     }
 }
 
-static DWORD WINAPI sim_thread(LPVOID arg) {
+static void sim_thread(void* arg) {
     SteamScene* s = (SteamScene*)arg;
     const uint32_t cap = s->voice_cap;
     uint32_t* snap_h    = (uint32_t*)malloc(cap * sizeof(uint32_t));
@@ -325,17 +325,17 @@ static DWORD WINAPI sim_thread(LPVOID arg) {
     float*    snap_dp   = (float*)malloc(cap * sizeof(float));        /* directivity power */
     float*    snap_fwd  = (float*)malloc(cap * 3 * sizeof(float));    /* source forward axis */
     if (!snap_h || !snap_p || !snap_feat || !snap_dw || !snap_dp || !snap_fwd) {
-        free(snap_h); free(snap_p); free(snap_feat); free(snap_dw); free(snap_dp); free(snap_fwd); return 0;
+        free(snap_h); free(snap_p); free(snap_feat); free(snap_dw); free(snap_dp); free(snap_fwd); return;
     }
     BWA_THREAD_NAME("bw-sim (occlusion)");
-    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);  /* never preempt the audio callback */
+    os_thread_lower_priority();  /* never preempt the audio callback */
 
-    while (!s->stop) {
+    while (!atomic_load_explicit(&s->stop, memory_order_acquire)) {
         /* 1. snapshot the shadow + take the pending mesh */
         IPLVector3* verts = NULL; IPLTriangle* tris = NULL; int nverts = 0, ntris = 0;
         IPLMaterial* mats = NULL; int nmat = 0; IPLint32* tri_mat = NULL; uint32_t mgen = 0;
         int do_clear = 0;
-        EnterCriticalSection(&s->lock);
+        os_mutex_lock(&s->lock);
         if (s->mesh_dirty) {
             s->mesh_dirty = 0;
             do_clear = s->pend_clear; s->pend_clear = 0;
@@ -345,7 +345,7 @@ static DWORD WINAPI sim_thread(LPVOID arg) {
             s->pend_verts = NULL; s->pend_tris = NULL;     /* ownership moves to the sim thread */
             s->pend_mats = NULL; s->pend_tri_mat = NULL;
         }
-        LeaveCriticalSection(&s->lock);
+        os_mutex_unlock(&s->lock);
         /* Chunked snapshot: this thread runs BELOW_NORMAL, so holding the CS across the whole
          * shadow while preempted stalls the control thread's per-frame set_pos (a priority
          * inversion measured as a frame hitch on a loaded machine). Each SLOT is still copied
@@ -353,7 +353,7 @@ static DWORD WINAPI sim_thread(LPVOID arg) {
          * everything republishes at SIM_HZ and the audio thread ramps every output. */
         for (uint32_t i0 = 0; i0 < cap; i0 += 32) {
             uint32_t i1 = i0 + 32 < cap ? i0 + 32 : cap;
-            EnterCriticalSection(&s->lock);
+            os_mutex_lock(&s->lock);
             for (uint32_t i = i0; i < i1; ++i) {
                 snap_h[i]    = s->shadow[i].handle;
                 snap_feat[i] = s->shadow[i].features;
@@ -362,7 +362,7 @@ static DWORD WINAPI sim_thread(LPVOID arg) {
                 snap_p[i*3+0]   = s->shadow[i].pos[0]; snap_p[i*3+1]   = s->shadow[i].pos[1]; snap_p[i*3+2]   = s->shadow[i].pos[2];
                 snap_fwd[i*3+0] = s->shadow[i].fwd[0]; snap_fwd[i*3+1] = s->shadow[i].fwd[1]; snap_fwd[i*3+2] = s->shadow[i].fwd[2];
             }
-            LeaveCriticalSection(&s->lock);
+            os_mutex_unlock(&s->lock);
         }
 
         /* 2. apply geometry change: the static mesh, then reconcile the instanced movers. Both mutate +
@@ -426,9 +426,9 @@ static DWORD WINAPI sim_thread(LPVOID arg) {
             /* shared scene lock: RunDirect ray-traces the committed scene, and commits no longer
              * come only from this thread (steam_scene_flush commits from the control thread) —
              * every trace holds the lock shared, every commit holds it exclusive. */
-            AcquireSRWLockShared(&s->scene_srw);
+            os_rwlock_lock_shared(&s->scene_srw);
             iplSimulatorRunDirect(s->simulator);
-            ReleaseSRWLockShared(&s->scene_srw);
+            os_rwlock_unlock_shared(&s->scene_srw);
             BWA_ZONE_END(zs);
         }
         for (uint32_t i = 0; i < cap; ++i) {
@@ -450,10 +450,9 @@ static DWORD WINAPI sim_thread(LPVOID arg) {
             rt_set_direct(s->rt, snap_h[i], level, bands, dir);
         }
 
-        Sleep(1000 / SIM_HZ);
+        os_sleep_ms(1000 / SIM_HZ);
     }
     free(snap_h); free(snap_p); free(snap_feat); free(snap_dw); free(snap_dp); free(snap_fwd);
-    return 0;
 }
 
 SteamScene* steam_scene_create(RtCore* rt, uint32_t sample_rate, uint32_t frame_size, uint32_t voice_cap,
@@ -469,8 +468,8 @@ SteamScene* steam_scene_create(RtCore* rt, uint32_t sample_rate, uint32_t frame_
     if (!s->shadow || !s->srcs || !s->dyn || !s->dyn_shadow) {
         free(s->shadow); free(s->srcs); free(s->dyn); free(s->dyn_shadow); free(s); return NULL;
     }
-    InitializeCriticalSection(&s->lock);
-    InitializeSRWLock(&s->scene_srw);
+    os_mutex_init(&s->lock);
+    os_rwlock_init(&s->scene_srw);
 
     IPLContextSettings cs; memset(&cs, 0, sizeof cs); cs.version = STEAMAUDIO_VERSION;
     if (iplContextCreate(&cs, &s->context) != IPL_STATUS_SUCCESS) goto fail;
@@ -505,8 +504,7 @@ SteamScene* steam_scene_create(RtCore* rt, uint32_t sample_rate, uint32_t frame_
     iplSimulatorSetScene(s->simulator, s->scene);
     iplSimulatorCommit(s->simulator);
 
-    s->thread = CreateThread(NULL, 0, sim_thread, s, 0, NULL);
-    if (!s->thread) goto fail;
+    if (os_thread_create(&s->thread, sim_thread, s) != 0) goto fail;
     return s;
 
 fail:
@@ -525,12 +523,12 @@ static void set_mesh_internal(SteamScene* s, const float* verts, int nverts, con
     /* Explicit CLEAR: no vertices, no triangles, no arrays. Distinguished from a malformed partial set
      * (dropped intact below) by requiring BOTH pointers null AND both counts non-positive. */
     if (!verts && !tris && nverts <= 0 && ntris <= 0) {
-        EnterCriticalSection(&s->lock);
+        os_mutex_lock(&s->lock);
         free(s->pend_verts); free(s->pend_tris); free(s->pend_mats); free(s->pend_tri_mat);
         s->pend_verts = NULL; s->pend_tris = NULL; s->pend_mats = NULL; s->pend_tri_mat = NULL;
         s->pend_nverts = s->pend_ntris = s->pend_nmat = 0;
         s->pend_clear = 1; s->mesh_dirty = 1; s->mesh_gen++;
-        LeaveCriticalSection(&s->lock);
+        os_mutex_unlock(&s->lock);
         return;
     }
     if (nverts <= 0 || ntris <= 0 || nmat <= 0) return;
@@ -552,7 +550,7 @@ static void set_mesh_internal(SteamScene* s, const float* verts, int nverts, con
         mi[i] = (idx >= 0 && idx < nmat) ? (IPLint32)idx : 0;
     }
 
-    EnterCriticalSection(&s->lock);
+    os_mutex_lock(&s->lock);
     free(s->pend_verts); free(s->pend_tris); free(s->pend_mats); free(s->pend_tri_mat);   /* drop un-consumed prior */
     s->pend_verts = v; s->pend_nverts = nverts;
     s->pend_tris = t;  s->pend_ntris = ntris;
@@ -561,7 +559,7 @@ static void set_mesh_internal(SteamScene* s, const float* verts, int nverts, con
     s->pend_clear = 0;                             /* a real set SUPERSEDES a staged clear; leaving the
                                                     * flag set would clear this very mesh instead */
     s->mesh_gen++;                                 /* steam_scene_flush waits for THIS gen to commit */
-    LeaveCriticalSection(&s->lock);
+    os_mutex_unlock(&s->lock);
 }
 
 /* Synchronously drive any STAGED static mesh through to a committed scene, from the CALLING thread.
@@ -580,7 +578,7 @@ void steam_scene_flush(SteamScene* s) {
     IPLMaterial* mats = NULL; int nmat = 0; IPLint32* tri_mat = NULL;
     uint32_t target, mgen = 0;
     int do_clear = 0;
-    EnterCriticalSection(&s->lock);
+    os_mutex_lock(&s->lock);
     target = s->mesh_gen;
     if (s->mesh_dirty) {
         s->mesh_dirty = 0;
@@ -590,7 +588,7 @@ void steam_scene_flush(SteamScene* s) {
         mats = s->pend_mats; nmat = s->pend_nmat; tri_mat = s->pend_tri_mat;
         s->pend_verts = NULL; s->pend_tris = NULL; s->pend_mats = NULL; s->pend_tri_mat = NULL;
     }
-    LeaveCriticalSection(&s->lock);
+    os_mutex_unlock(&s->lock);
     /* A staged CLEAR carries null buffers, so it MUST be recognised here. Falling through to the wait
      * below blocks on a generation the sim thread can no longer apply (mesh_dirty was just consumed
      * here), which hung bwa_start outright. */
@@ -599,11 +597,11 @@ void steam_scene_flush(SteamScene* s) {
     else {
         free(verts); free(tris); free(mats); free(tri_mat);
         for (;;) {                                 /* sim thread claimed it: wait for its commit */
-            EnterCriticalSection(&s->lock);
+            os_mutex_lock(&s->lock);
             int done = (int32_t)(s->mesh_gen_applied - target) >= 0;
-            LeaveCriticalSection(&s->lock);
+            os_mutex_unlock(&s->lock);
             if (done) break;
-            Sleep(1);
+            os_sleep_ms(1);
         }
     }
 }
@@ -633,10 +631,10 @@ void steam_scene_set_occlusion(SteamScene* s, uint32_t handle, int on) {
     if (!s) return;
     uint16_t idx = BWA_H_IDX(handle);
     if (idx >= s->voice_cap) return;
-    EnterCriticalSection(&s->lock);
+    os_mutex_lock(&s->lock);
     shadow_adopt(s, idx, handle);
     if (on) s->shadow[idx].features |= FEAT_OCC; else s->shadow[idx].features &= (uint8_t)~FEAT_OCC;
-    LeaveCriticalSection(&s->lock);
+    os_mutex_unlock(&s->lock);
 }
 
 /* weight 0 = omni (no directivity); 0.5 = cardioid; 1 = figure-8. power >= 1 sharpens the lobe. */
@@ -646,31 +644,31 @@ void steam_scene_set_directivity(SteamScene* s, uint32_t handle, float weight, f
     if (idx >= s->voice_cap) return;
     if (weight < 0.f) weight = 0.f; if (weight > 1.f) weight = 1.f;
     if (power  < 1.f) power  = 1.f;
-    EnterCriticalSection(&s->lock);
+    os_mutex_lock(&s->lock);
     shadow_adopt(s, idx, handle);
     if (weight > 0.f) { s->shadow[idx].features |= FEAT_DIR; s->shadow[idx].dir_weight = weight; s->shadow[idx].dir_power = power; }
     else              { s->shadow[idx].features &= (uint8_t)~FEAT_DIR; }
-    LeaveCriticalSection(&s->lock);
+    os_mutex_unlock(&s->lock);
 }
 
 void steam_scene_set_orientation(SteamScene* s, uint32_t handle, float fx, float fy, float fz) {
     if (!s) return;
     uint16_t idx = BWA_H_IDX(handle);
     if (idx >= s->voice_cap) return;
-    EnterCriticalSection(&s->lock);
+    os_mutex_lock(&s->lock);
     shadow_adopt(s, idx, handle);
     s->shadow[idx].fwd[0] = fx; s->shadow[idx].fwd[1] = fy; s->shadow[idx].fwd[2] = fz;
-    LeaveCriticalSection(&s->lock);
+    os_mutex_unlock(&s->lock);
 }
 
 void steam_scene_set_pos(SteamScene* s, uint32_t handle, float x, float y, float z) {
     if (!s) return;
     uint16_t idx = BWA_H_IDX(handle);
     if (idx >= s->voice_cap) return;
-    EnterCriticalSection(&s->lock);
+    os_mutex_lock(&s->lock);
     shadow_adopt(s, idx, handle);
     s->shadow[idx].pos[0] = x; s->shadow[idx].pos[1] = y; s->shadow[idx].pos[2] = z;
-    LeaveCriticalSection(&s->lock);
+    os_mutex_unlock(&s->lock);
 }
 
 /* On bwa_source_destroy: clear ALL features so the sim tears the IPLSource down and stops simulating
@@ -679,13 +677,13 @@ void steam_scene_source_gone(SteamScene* s, uint32_t handle) {
     if (!s) return;
     uint16_t idx = BWA_H_IDX(handle);
     if (idx >= s->voice_cap) return;
-    EnterCriticalSection(&s->lock);
+    os_mutex_lock(&s->lock);
     if (s->shadow[idx].handle == handle) s->shadow[idx].features = 0;
-    LeaveCriticalSection(&s->lock);
+    os_mutex_unlock(&s->lock);
 }
 
-void steam_scene_ray_lock(SteamScene* s)   { if (s) AcquireSRWLockShared(&s->scene_srw); }
-void steam_scene_ray_unlock(SteamScene* s) { if (s) ReleaseSRWLockShared(&s->scene_srw); }
+void steam_scene_ray_lock(SteamScene* s)   { if (s) os_rwlock_lock_shared(&s->scene_srw); }
+void steam_scene_ray_unlock(SteamScene* s) { if (s) os_rwlock_unlock_shared(&s->scene_srw); }
 
 /* Allocate a dynamic-mesh slot and stash its geometry + a single material for the sim thread to build.
  * The verts/tris are copied into heap arrays (ownership passes to the sim thread on build). A slot is
@@ -703,7 +701,7 @@ int steam_scene_add_dynamic_mesh(SteamScene* s, const float* verts, int nverts, 
     for (int b = 0; b < 3; ++b) { m.absorption[b] = absorption ? absorption[b] : 0.1f; m.transmission[b] = transmission ? transmission[b] : 0.05f; }
     m.scattering = scattering;
 
-    EnterCriticalSection(&s->lock);
+    os_mutex_lock(&s->lock);
     int slot = -1;
     for (int i = 0; i < BWA_MAX_DYN_MESH; ++i)
         if (!s->dyn_shadow[i].want && !s->dyn_shadow[i].live_ack && !s->dyn_shadow[i].verts) { slot = i; break; }
@@ -715,26 +713,26 @@ int steam_scene_add_dynamic_mesh(SteamScene* s, const float* verts, int nverts, 
         s->dyn_shadow[slot].xform = mat_identity();   /* until set_dynamic_transform */
         s->dyn_shadow[slot].xform_dirty = 0;
     }
-    LeaveCriticalSection(&s->lock);
+    os_mutex_unlock(&s->lock);
     if (slot < 0) { free(v); free(t); return -1; }
     return slot;
 }
 
 void steam_scene_set_dynamic_transform(SteamScene* s, int handle, const float m16[16]) {
     if (!s || handle < 0 || handle >= BWA_MAX_DYN_MESH || !m16) return;
-    EnterCriticalSection(&s->lock);
+    os_mutex_lock(&s->lock);
     if (s->dyn_shadow[handle].want) {                 /* ignore updates to a removed/unallocated slot */
         for (int r = 0; r < 4; ++r) for (int c = 0; c < 4; ++c) s->dyn_shadow[handle].xform.elements[r][c] = m16[r*4+c];
         s->dyn_shadow[handle].xform_dirty = 1;
     }
-    LeaveCriticalSection(&s->lock);
+    os_mutex_unlock(&s->lock);
 }
 
 void steam_scene_remove_dynamic_mesh(SteamScene* s, int handle) {
     if (!s || handle < 0 || handle >= BWA_MAX_DYN_MESH) return;
-    EnterCriticalSection(&s->lock);
+    os_mutex_lock(&s->lock);
     s->dyn_shadow[handle].want = 0;                   /* the sim tears down + clears live_ack */
-    LeaveCriticalSection(&s->lock);
+    os_mutex_unlock(&s->lock);
 }
 
 void* steam_scene_ipl_context(SteamScene* s) { return s ? (void*)s->context : NULL; }
@@ -743,7 +741,8 @@ int   steam_scene_ipl_scenetype(SteamScene* s) { return s ? (int)s->scene_type :
 
 void steam_scene_destroy(SteamScene* s) {
     if (!s) return;
-    if (s->thread) { InterlockedExchange(&s->stop, 1); WaitForSingleObject(s->thread, INFINITE); CloseHandle(s->thread); }
+    atomic_store_explicit(&s->stop, 1, memory_order_release);
+    os_thread_join(&s->thread);
     for (uint32_t i = 0; i < s->voice_cap; ++i)
         if (s->srcs && s->srcs[i]) { iplSourceRemove(s->srcs[i], s->simulator); iplSourceRelease(&s->srcs[i]); }
     /* dynamic movers: unlink every live instance, commit once so the scene drops its references, then
@@ -761,7 +760,8 @@ void steam_scene_destroy(SteamScene* s) {
     if (s->scene)     iplSceneRelease(&s->scene);
     if (s->embree)    iplEmbreeDeviceRelease(&s->embree);   /* after the scene that referenced it */
     if (s->context)   iplContextRelease(&s->context);
-    DeleteCriticalSection(&s->lock);
+    os_mutex_destroy(&s->lock);
+    os_rwlock_destroy(&s->scene_srw);
     free(s->mesh_verts); free(s->mesh_tris); free(s->mesh_mi); free(s->mesh_mats);
     free(s->pend_verts); free(s->pend_tris); free(s->pend_mats); free(s->pend_tri_mat);
     free(s->dyn); free(s->dyn_shadow);

@@ -21,8 +21,7 @@
 #include "sound.h"
 #include "bits.h"          /* bwa_pow2_ge */
 
-#define WIN32_LEAN_AND_MEAN
-#include <windows.h>
+#include "os.h"
 #include <stdatomic.h>
 #include <stdlib.h>
 #include <string.h>
@@ -62,26 +61,34 @@ struct AssetCache {
     uint32_t inflight;       /* control-side count of jobs enqueued whose result is not drained yet.
                               * Capped at AJOB_CAP, which is also the result ring's size, so the
                               * worker's result push can never fail and never has to block. */
-    HANDLE        thread;    /* started lazily on the first async acquire */
-    volatile LONG stop;
+    os_thread   thread;      /* started lazily on the first async acquire */
+    _Atomic int stop;
 };
 
 static void set_err(char* err, size_t cap, const char* msg) {
     if (err && cap) { strncpy(err, msg, cap - 1); err[cap - 1] = 0; }
 }
 
-/* Path normalization: ASCII case fold + backslash to forward slash. Deliberately nothing else -
- * no ".." collapse, no symlink or short-name resolution, no locale folding (which would mangle
- * UTF-8 bytes). Two spellings of one file that differ only in case or slash direction are the
- * cases that actually show up in a project's asset strings. */
+/* Path normalization: ASCII case fold + backslash to forward slash, ON WINDOWS ONLY. Deliberately
+ * nothing else - no ".." collapse, no symlink or short-name resolution, no locale folding (which
+ * would mangle UTF-8 bytes). Two spellings of one file that differ only in case or slash direction
+ * are the cases that actually show up in a project's asset strings.
+ *
+ * Both folds are Windows FACTS, not conveniences, which is why neither survives the port. On a
+ * POSIX filesystem "A.wav" and "a.wav" are two different files and a backslash is an ordinary
+ * character in a name, so folding either would make the cache hand one entry to two files - a
+ * wrong-asset bug, not a missed dedup. The loader opens the path the caller gave, so a spelling
+ * that does not name a file simply fails to load there, as it should. */
 static char* norm_path(const char* p) {
     const size_t n = strlen(p);
     char* s = (char*)malloc(n + 1);
     if (!s) return NULL;
     for (size_t i = 0; i < n; ++i) {
         char ch = p[i];
+#if defined(_WIN32)
         if (ch == '\\') ch = '/';
         else if (ch >= 'A' && ch <= 'Z') ch = (char)(ch - 'A' + 'a');
+#endif
         s[i] = ch;
     }
     s[n] = 0;
@@ -240,12 +247,13 @@ static uint32_t load_now(AssetCache* a, const char* path, uint32_t flags, char* 
 
 /* ---- loader thread ---- */
 
-static DWORD WINAPI loader_thread(LPVOID arg) {
+static void loader_thread(void* arg) {
     AssetCache* a = (AssetCache*)arg;
     for (;;) {
-        if (InterlockedCompareExchange(&a->stop, 0, 0)) break;   /* leftover jobs are reaped by destroy */
+        /* acquire: the stop store is the last thing destroy does before joining */
+        if (atomic_load_explicit(&a->stop, memory_order_acquire)) break;   /* leftover jobs: destroy reaps */
         AJob j;
-        if (!job_pop(&a->jobs, &j)) { Sleep(2); continue; }      /* a loader has no latency budget */
+        if (!job_pop(&a->jobs, &j)) { os_sleep_ms(2); continue; }   /* a loader has no latency budget */
         ARes r;
         memset(&r, 0, sizeof r);
         r.snd = j.snd;
@@ -255,7 +263,6 @@ static DWORD WINAPI loader_thread(LPVOID arg) {
          * impossible branch anyway, because leaking a decoded file would be the silent failure. */
         if (!res_push(&a->res, &r) && r.ok) sound_unload(&r.data);
     }
-    return 0;
 }
 
 /* ---- lifecycle ---- */
@@ -275,11 +282,9 @@ AssetCache* assets_create(RtCore* rt, uint32_t sample_rate, uint32_t sound_cap) 
 
 void assets_destroy(AssetCache* a) {
     if (!a) return;
-    if (a->thread) {                              /* join FIRST: nothing may touch the rings after */
-        InterlockedExchange(&a->stop, 1);
-        WaitForSingleObject(a->thread, INFINITE);
-        CloseHandle(a->thread);
-        a->thread = NULL;
+    if (os_thread_valid(&a->thread)) {            /* join FIRST: nothing may touch the rings after */
+        atomic_store_explicit(&a->stop, 1, memory_order_release);
+        os_thread_join(&a->thread);
     }
     AJob j;
     while (job_pop(&a->jobs, &j)) free(j.path);   /* never decoded */
@@ -308,7 +313,7 @@ void assets_pump(AssetCache* a) {
         if (!r.ok) {                              /* the slot stays reserved so the handle cannot be
                                                    * recycled under the caller; release frees it */
             en->failed = 1;
-            en->errmsg = _strdup(r.err);
+            en->errmsg = os_strdup(r.err);
             continue;
         }
         /* Ownership of r.data moves to the sound table here (control thread). A false return means
@@ -364,14 +369,14 @@ static uint32_t acquire_common(AssetCache* a, const char* path, uint32_t flags,
     by_idx_set(a, snd, (uint32_t)(en - a->tab) + 1u);
 
     if (defer) {
-        if (!a->thread) {                          /* lazily started: a session that never loads
+        if (!os_thread_valid(&a->thread)) {        /* lazily started: a session that never loads
                                                     * asynchronously never pays for a thread */
-            a->stop = 0;
-            a->thread = CreateThread(NULL, 0, loader_thread, a, 0, NULL);
+            atomic_store_explicit(&a->stop, 0, memory_order_relaxed);
+            os_thread_create(&a->thread, loader_thread, a);
         }
         AJob j = { NULL, flags, snd };
-        j.path = _strdup(path);                    /* raw path: the loader opens the file, not the key */
-        if (a->thread && j.path && job_push(&a->jobs, &j)) {
+        j.path = os_strdup(path);                  /* raw path: the loader opens the file, not the key */
+        if (os_thread_valid(&a->thread) && j.path && job_push(&a->jobs, &j)) {
             en->loading = 1;
             ++a->inflight;
         } else {                                   /* no worker: fall back to loading it right here,
@@ -381,11 +386,11 @@ static uint32_t acquire_common(AssetCache* a, const char* path, uint32_t flags,
             char lerr[160] = { 0 };
             if (!decode_by_flags(path, flags, a->rate, &d, lerr, sizeof lerr)) {
                 en->failed = 1;
-                en->errmsg = _strdup(lerr[0] ? lerr : "bwa_sound_acquire_async: load failed");
+                en->errmsg = os_strdup(lerr[0] ? lerr : "bwa_sound_acquire_async: load failed");
             } else if (!rt_sound_publish(a->rt, snd, &d)) {
                 sound_unload(&d);                  /* publish refused: the buffer is still ours */
                 en->failed = 1;
-                en->errmsg = _strdup("bwa_sound_acquire_async: the reserved sound slot went stale");
+                en->errmsg = os_strdup("bwa_sound_acquire_async: the reserved sound slot went stale");
             }
         }
     }

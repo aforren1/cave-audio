@@ -19,6 +19,7 @@
 #include "rt_test_util.h"
 #include "hole.h"        /* the hole-floor section derives its expected width straight from hole.c */
 #include "biquad.h"      /* the zero-band section pins the shared RBJ design's gain floor directly */
+#include "pose.h"        /* the tracked-listener + prediction sections publish through the seqlock */
 
 /* ---- tracked listener alignment helpers (rt_set_tracked_align) ----------------------------------
  * The expected per-channel comp: (|spk - ref| - |spk - listener|) * rate / c, with the set's minimum

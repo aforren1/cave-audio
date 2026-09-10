@@ -126,9 +126,17 @@ this build read the per-zone *proportions*, not the absolute block total.
   the three Steam Audio **sim threads** (`bw-sim (occlusion)`, `bw-sim (reflections)`,
   `bw-sim (pathing)`), and the NatNet receiver. The one real risk is the sim threads: they ray-trace at ~30 / 12 / 10 Hz
   respectively and are CPU-heavy, so at normal priority they could preempt the audio callback and
-  glitch it. The engine therefore drops all three to `THREAD_PRIORITY_BELOW_NORMAL` (`steam_scene.c`,
-  `steam_reflect.c`, `steam_path.c`). Tracy makes the interaction visible: the sim zones should
-  yield, never overlap an overrunning audio block.
+  glitch it. The engine therefore drops all three below normal priority through
+  `os_thread_lower_priority` (`steam_scene.c`, `steam_reflect.c`, `steam_path.c`). Tracy makes the
+  interaction visible: the sim zones should yield, never overlap an overrunning audio block.
+- **The null sink no longer raises the machine's timer resolution.** It used to bracket its render
+  loop with `timeBeginPeriod(1)`, which is system-wide in effect, so any tool that happened to open
+  the offline sink held the whole machine at a 1 ms timer tick for as long as it ran. The self-paced
+  loops now wait on an absolute deadline through `os_sleep_until_ns`, which uses a
+  high-resolution waitable timer on Windows 10 1803 and later and needs no global change to hit a
+  sub-millisecond wake. Measured on a desk machine over 200 wakes 2 ms apart: median lateness
+  0.43 ms, p99 0.74 ms, against 5.6 ms and 13.0 ms on the pre-1803 fallback path. Only that
+  fallback still touches `timeBeginPeriod`, and only for the length of one wait.
 
 ## Memory budget
 

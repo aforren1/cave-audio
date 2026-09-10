@@ -27,8 +27,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-#define WIN32_LEAN_AND_MEAN
-#include <windows.h>
+#include "os.h"
 
 #define SR   48000u
 #define BLK  256u
@@ -70,7 +69,7 @@ static int wait_ready(bwa_engine* e, bwa_sound snd) {
         /* is_ready leaves the error clear while a decode is merely in progress, so a message here
          * means the load FAILED (or the handle is not the cache's): it will never land. */
         if (bwa_last_error(e) != NULL) return 0;
-        Sleep(1);
+        os_sleep_ms(1);
     }
     return 0;
 }
@@ -102,7 +101,13 @@ int main(void) {
     bwa_sound a2 = bwa_sound_acquire(e, MONO, 0);
     CHECK(a2 == a1, "same path + flags dedups to the same handle");
 
-    /* ---- path normalization: case and slash direction ---- */
+    /* ---- path normalization: case and slash direction ----
+     * WINDOWS ONLY, because the normalization is (see norm_path in assets.c): a POSIX filesystem
+     * makes "A.wav" a different file from "a.wav" and a backslash an ordinary character in a name,
+     * so folding either there would be a wrong-asset bug rather than a dedup. Skipped rather than
+     * inverted: the check would have to assert that the odd spellings FAIL to load, and on a
+     * Windows drive mounted under WSL they succeed, so it would pin the mount and not the code. */
+#if defined(_WIN32)
     bwa_sound a3 = bwa_sound_acquire(e, "BWA_ASSETS_MONO.WAV", 0);
     CHECK(a3 == a1, "case-insensitive path dedups");
     bwa_sound a4 = bwa_sound_acquire(e, ".\\bwa_assets_mono.wav", 0);
@@ -113,6 +118,9 @@ int main(void) {
     CHECK(a5 == a4, "'.\\x' and './x' normalize to one entry");
     bwa_sound_release(e, a4);
     bwa_sound_release(e, a5);
+#else
+    printf("  skip case/backslash normalization (Windows-only behavior)\n");
+#endif
 
     /* ---- flags are part of the key ---- */
     bwa_sound st = bwa_sound_acquire(e, MONO, BWA_LOAD_STREAM);
@@ -144,9 +152,12 @@ int main(void) {
     bwa_unload_sound(e, owned);
 
     /* ---- release at zero actually unloads ---- */
-    /* a1 was acquired 3 times (a1, a2, a3). Two releases must leave it alive. */
+    /* a1 was acquired twice (a1, a2), plus a third time as a3 where the case-fold section above
+     * runs. Every release but the last must leave it alive. */
     bwa_sound_release(e, a1);
-    bwa_sound_release(e, a1);
+#if defined(_WIN32)
+    bwa_sound_release(e, a1);          /* the extra reference the case-fold section took */
+#endif
     CHECK(bwa_sound_get_frames(e, a1) == LEN, "the asset survives while references remain");
     bwa_sound_release(e, a1);
     render_energy(e, 2);                  /* let the audio side see CMD_SOUND_RETIRE and ack it */
@@ -333,7 +344,7 @@ int main(void) {
     CHECK(cx != 0, "async acquire (to be cancelled) returns a handle");
     bwa_sound_release(e, cx);             /* cancel; may or may not still be in flight */
     CHECK(bwa_sound_is_ready(e, cx) == false, "a cancelled load never reports ready");
-    for (int i = 0; i < 200; ++i) { bwa_commit(e); Sleep(1); }   /* let the worker's result arrive and be dropped */
+    for (int i = 0; i < 200; ++i) { bwa_commit(e); os_sleep_ms(1); }   /* let the worker's result arrive and be dropped */
     CHECK(render_energy(e, 2) >= 0.0, "the engine still renders after a cancelled load");
 
     /* re-acquiring the cancelled path must work and must produce a live asset */
@@ -346,7 +357,11 @@ int main(void) {
     /* MONO's entry is `again` by now: a1 was fully released above and the path re-acquired, so a
      * find must report the LIVE handle, not the retired one. */
     CHECK(bwa_sound_find(e, MONO, 0) == again, "find returns the resident handle");
+#if defined(_WIN32)   /* the case fold is Windows-only; see the normalization section above */
     CHECK(bwa_sound_find(e, "BWA_ASSETS_MONO.WAV", 0) == again, "find normalizes the path like acquire");
+#else
+    CHECK(bwa_sound_find(e, "BWA_ASSETS_MONO.WAV", 0) == 0, "find does NOT case-fold on a POSIX path");
+#endif
     CHECK(bwa_sound_find(e, MONO, 0) != a1, "find never reports a retired handle");
     CHECK(bwa_sound_find(e, MONO, BWA_LOAD_STREAM) == st, "find keys on flags too");
     CHECK(bwa_sound_find(e, BED, BWA_LOAD_AMBIX) == bed, "find locates the ambisonic entry");

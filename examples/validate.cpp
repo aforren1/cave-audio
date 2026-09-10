@@ -287,11 +287,11 @@ static int track_place(void* user, int li, float mic_out[3]) {
     }
     float p[3], q[4];
     for (int tries = 0; tries < 200; ++tries) {           /* ~2 s for a live pose to show up */
-        /* pose_read alone is NOT enough. It returns the last PUBLISHED pose forever, and natnet only
+        /* Reading the pose alone is NOT enough. It returns the last PUBLISHED pose forever, and natnet only
          * publishes tracking-valid frames, so from the second placement on an occluded stand or a
          * wrong streaming id would hand back the PREVIOUS placement's pose and be accepted as this
          * one's measurement. Gate on liveness, which is what natnet_status is for. */
-        if (natnet_status(T->nn) == NN_STATUS_LIVE && pose_read(natnet_pose(T->nn), p, q)) {
+        if (natnet_status(T->nn) == NN_STATUS_LIVE && natnet_read_pose(T->nn, p, q)) {
             track_apply(T, p, q, li, mic_out);
             return 1;
         }

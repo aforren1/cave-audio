@@ -462,3 +462,54 @@ jobs:
           $remote = "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git"
           ./tools/dist/publish-branch.ps1 -Branch unity -Source build/upm/package -Version $v -RemoteUrl $remote
           ./tools/dist/publish-branch.ps1 -Branch godot -Source build/godot/addon -Version $v -RemoteUrl $remote
+
+  # ---- portability gate (docs/backends.md phase 2) ---------------------------------------------
+  # These two jobs exist to catch a Win32 call sneaking back into the core, not to test audio: no
+  # runner has an audio device, and neither platform has a device backend yet, so both build the
+  # library, the console examples and the whole test suite on the null and manual sinks.
+  #
+  # No submodules and no SDKs: phonon is a Windows artifact in this repo (the CMake auto-detect
+  # requires the platform's import library, so a checkout with it staged still configures no-SDK
+  # here), and ASIO is Windows-only by definition. That also keeps these jobs cheap - a few minutes
+  # against the Windows job's phonon build.
+  #
+  # The macOS job is UNVERIFIED locally: the shim's Apple paths (mach_absolute_time,
+  # mach_wait_until, the SCHED_OTHER priority drop) were written from the documentation and have
+  # never run on a Mac. This job is the first thing that will execute them.
+  linux:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v6      # no submodules: no SDKs are built here
+
+      - name: Configure
+        run: |
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=RelWithDebInfo -DBWA_BUILD_TESTS=ON | tee configure.log
+          # Prove the port is actually being exercised, rather than a stale cache quietly
+          # re-enabling a Windows-only path.
+          grep -q "null and manual sinks only" configure.log
+          grep -q "Steam Audio disabled" configure.log
+
+      - name: Build
+        run: cmake --build build --config RelWithDebInfo
+
+      - name: Test
+        run: ctest --test-dir build -C RelWithDebInfo --output-on-failure
+
+  macos:
+    runs-on: macos-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Configure
+        run: |
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=RelWithDebInfo -DBWA_BUILD_TESTS=ON | tee configure.log
+          grep -q "null and manual sinks only" configure.log
+          grep -q "Steam Audio disabled" configure.log
+
+      - name: Build
+        run: cmake --build build --config RelWithDebInfo
+
+      - name: Test
+        run: ctest --test-dir build -C RelWithDebInfo --output-on-failure

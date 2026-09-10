@@ -62,6 +62,9 @@ extern "C" {
   #else
     #define BWA_API __declspec(dllimport)
   #endif
+#elif defined(__GNUC__) || defined(__clang__)
+  /* The library builds with -fvisibility=hidden, so the public ABI has to say so explicitly. */
+  #define BWA_API __attribute__((visibility("default")))
 #else
   #define BWA_API
 #endif

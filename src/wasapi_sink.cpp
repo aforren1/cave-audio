@@ -306,12 +306,10 @@ void host_paced_block(WasapiSink* s, uint64_t* next_ns) {
     if (*next_ns == 0 || now > *next_ns + block_ns * 8ull) *next_ns = now;
     sink_quant_pull(&s->quant, s->block, 0, false, now, discard_out, nullptr);
     *next_ns += block_ns;
-    const uint64_t after = sink_quant_now_ns();
-    if (*next_ns > after) {
-        const uint64_t wait_ns = *next_ns - after;
-        const DWORD ms = (DWORD)(wait_ns / 1000000ull);
-        if (ms) Sleep(ms);
-    }
+    /* An ABSOLUTE deadline through the shim: a whole-millisecond Sleep quantized every wait down
+     * and let the loop drift, and it needed the global timer resolution raised to do even that.
+     * Same clock as sink_quant_now_ns, which is os_monotonic_ns. */
+    os_sleep_until_ns(*next_ns);
 }
 
 DWORD WINAPI wasapi_thread(LPVOID arg) {

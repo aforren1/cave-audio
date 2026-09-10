@@ -6,8 +6,8 @@
 
 #include <phonon.h>
 
-#define WIN32_LEAN_AND_MEAN
-#include <windows.h>
+#include "os.h"
+#include <stdatomic.h>
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -44,12 +44,12 @@ struct SteamPath {
      * steam_path_source_gone) is swept by the sim thread — IPLSource released, handle cleared,
      * slot returned to the pool — because a long-running installation churns sources indefinitely
      * and claim-forever slots exhausted the table (and leaked IPLSources) at 64 distinct handles. */
-    CRITICAL_SECTION lock;
+    os_mutex      lock;
     struct { uint32_t handle; float pos[3]; uint8_t want, dead; IPLSource src; } srcs[PATH_MAX_SRC];
     int          nsrc;           /* high-water mark of ever-claimed slots (freed ones have handle 0) */
 
-    HANDLE        thread;
-    volatile LONG stop;
+    os_thread     thread;
+    _Atomic int   stop;
 };
 
 /* phonon's identity basis (ahead = -z), not the room's (+z ahead) — harmless here: pathing outputs
@@ -114,12 +114,12 @@ static int do_path_bake(SteamPath* sp, const Layout* L) {
 static void reconcile_sources(SteamPath* sp) {
     int changed = 0;
     for (int i = 0; i < PATH_MAX_SRC; ++i) {
-        EnterCriticalSection(&sp->lock);
+        os_mutex_lock(&sp->lock);
         int in_use      = (i < sp->nsrc) && sp->srcs[i].handle;
         uint32_t handle = in_use ? sp->srcs[i].handle : 0;
         int dead        = in_use && sp->srcs[i].dead;
         int need        = in_use && !dead && sp->srcs[i].want && !sp->srcs[i].src;
-        LeaveCriticalSection(&sp->lock);
+        os_mutex_unlock(&sp->lock);
         if (dead) {
             /* One final zero publish cuts the dying voice's indirect field (the audio thread drops
              * it anyway once the generation recycles); then release the phonon object and return
@@ -133,9 +133,9 @@ static void reconcile_sources(SteamPath* sp) {
                 iplSourceRelease(&sp->srcs[i].src);
                 changed = 1;
             }
-            EnterCriticalSection(&sp->lock);
+            os_mutex_lock(&sp->lock);
             sp->srcs[i].handle = 0; sp->srcs[i].want = 0; sp->srcs[i].dead = 0;
-            LeaveCriticalSection(&sp->lock);
+            os_mutex_unlock(&sp->lock);
             continue;
         }
         if (!need) continue;
@@ -203,7 +203,7 @@ static void normalize_eq(float eq[3]) {
  * zero path until then, which is also what a just-enabled blocked source would render). */
 void steam_path_set_source(SteamPath* sp, uint32_t handle, const float pos[3], int on) {
     if (!sp || !handle) return;
-    EnterCriticalSection(&sp->lock);
+    os_mutex_lock(&sp->lock);
     int slot = find_slot(sp, handle);
     if (slot < 0 && on) {
         for (int i = 0; i < sp->nsrc; ++i)         /* prefer a swept (freed) slot over growing */
@@ -212,7 +212,7 @@ void steam_path_set_source(SteamPath* sp, uint32_t handle, const float pos[3], i
         if (slot >= 0) { sp->srcs[slot].handle = handle; sp->srcs[slot].dead = 0; }   /* src stays NULL: the sim thread creates it */
     }
     if (slot >= 0) { sp->srcs[slot].pos[0]=pos[0]; sp->srcs[slot].pos[1]=pos[1]; sp->srcs[slot].pos[2]=pos[2]; sp->srcs[slot].want=(uint8_t)(on!=0); }
-    LeaveCriticalSection(&sp->lock);
+    os_mutex_unlock(&sp->lock);
 }
 
 /* CONTROL thread, on bwa_source_destroy: mark the slot for reclamation. The sim thread owns the
@@ -222,18 +222,18 @@ void steam_path_set_source(SteamPath* sp, uint32_t handle, const float pos[3], i
  * republish would intermittently hard-cut a recycled voice index's indirect field. */
 void steam_path_source_gone(SteamPath* sp, uint32_t handle) {
     if (!sp) return;
-    EnterCriticalSection(&sp->lock);
+    os_mutex_lock(&sp->lock);
     int slot = find_slot(sp, handle);
     if (slot >= 0) { sp->srcs[slot].want = 0; sp->srcs[slot].dead = 1; }
-    LeaveCriticalSection(&sp->lock);
+    os_mutex_unlock(&sp->lock);
 }
 
 void steam_path_set_pos(SteamPath* sp, uint32_t handle, float x, float y, float z) {
     if (!sp) return;
-    EnterCriticalSection(&sp->lock);
+    os_mutex_lock(&sp->lock);
     int slot = find_slot(sp, handle);                  /* update only; enabling is steam_path_set_source's job */
     if (slot >= 0) { sp->srcs[slot].pos[0]=x; sp->srcs[slot].pos[1]=y; sp->srcs[slot].pos[2]=z; }
-    LeaveCriticalSection(&sp->lock);
+    os_mutex_unlock(&sp->lock);
 }
 
 /* Test seam: ONLY valid with the sim thread not running (steam_path_start not called) — it
@@ -241,12 +241,12 @@ void steam_path_set_pos(SteamPath* sp, uint32_t handle, float x, float y, float 
 int steam_path_debug_run_get(SteamPath* sp, const float listener[3], uint32_t handle, float eq[3], float* sh) {
     if (!sp) return 0;
     reconcile_sources(sp);                       /* single-threaded here: create the claimed sources now */
-    EnterCriticalSection(&sp->lock);
+    os_mutex_lock(&sp->lock);
     int slot = find_slot(sp, handle);
     IPLSource src = (slot >= 0) ? sp->srcs[slot].src : NULL;
     float pos[3] = { 0, 0, 0 };
     if (slot >= 0) { pos[0]=sp->srcs[slot].pos[0]; pos[1]=sp->srcs[slot].pos[1]; pos[2]=sp->srcs[slot].pos[2]; }
-    LeaveCriticalSection(&sp->lock);
+    os_mutex_unlock(&sp->lock);
     if (!src) return 0;
     return run_get(sp, listener, src, pos, eq, sh);
 }
@@ -267,20 +267,20 @@ void steam_path_tap(void* ud, float* bus, uint32_t n, const float* lp, const flo
     for (uint32_t s=0;s<sp->channels;++s) for (uint32_t i=0;i<n;++i) bus[(size_t)s*n+i] += sp->out26[(size_t)s*n+i];
 }
 
-static DWORD WINAPI sim_thread(LPVOID arg) {
+static void sim_thread(void* arg) {
     SteamPath* sp = (SteamPath*)arg;
     BWA_THREAD_NAME("bw-sim (pathing)");
-    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);   /* never preempt the audio callback */
+    os_thread_lower_priority();   /* never preempt the audio callback */
     float eq[3], sh[BWA_AMBI_CH];
-    while (!sp->stop) {
+    while (!atomic_load_explicit(&sp->stop, memory_order_acquire)) {
         float lp[3], lq[4]; rt_read_pose(sp->rt, lp, lq); (void)lq;
         reconcile_sources(sp);                       /* create + commit here, NEVER on the control thread */
-        EnterCriticalSection(&sp->lock); int n = sp->nsrc; LeaveCriticalSection(&sp->lock);
+        os_mutex_lock(&sp->lock); int n = sp->nsrc; os_mutex_unlock(&sp->lock);
         for (int i = 0; i < n; ++i) {
-            EnterCriticalSection(&sp->lock);         /* snapshot the slot's shadow (no torn pos reads) */
+            os_mutex_lock(&sp->lock);         /* snapshot the slot's shadow (no torn pos reads) */
             uint32_t handle = sp->srcs[i].handle; uint8_t want = sp->srcs[i].want && !sp->srcs[i].dead;
             float pos[3] = { sp->srcs[i].pos[0], sp->srcs[i].pos[1], sp->srcs[i].pos[2] };
-            LeaveCriticalSection(&sp->lock);
+            os_mutex_unlock(&sp->lock);
             if (!handle) continue;                   /* swept slot: publishing its zeros would clobber
                                                       * whatever live voice now owns this index's pub */
             IPLSource src = sp->srcs[i].src;         /* sim-thread-owned */
@@ -289,12 +289,13 @@ static DWORD WINAPI sim_thread(LPVOID arg) {
             normalize_eq(eq);                        /* -> pure color (level already in sh); rt applies it pre-encode */
             rt_set_pathing(sp->rt, handle, sh, eq, sp->ambi_ch);
         }
-        Sleep(1000 / PATH_HZ);
+        os_sleep_ms(1000 / PATH_HZ);
     }
-    return 0;
 }
 
-void steam_path_start(SteamPath* sp) { if (sp && !sp->thread) sp->thread = CreateThread(NULL, 0, sim_thread, sp, 0, NULL); }
+void steam_path_start(SteamPath* sp) {
+    if (sp && !os_thread_valid(&sp->thread)) os_thread_create(&sp->thread, sim_thread, sp);
+}
 
 SteamPath* steam_path_create(SteamScene* scene, RtCore* rt, const Layout* L,
                              uint32_t sample_rate, uint32_t block, uint32_t order) {
@@ -307,7 +308,7 @@ SteamPath* steam_path_create(SteamScene* scene, RtCore* rt, const Layout* L,
     sp->scene_type = (IPLSceneType)steam_scene_ipl_scenetype(scene);
     if (!sp->ctx || !sp->scene_ipl) { free(sp); return NULL; }
     sp->rt = rt; sp->n = block; sp->order = order; sp->ambi_ch = (order+1)*(order+1); sp->sample_rate = sample_rate;
-    InitializeCriticalSection(&sp->lock);
+    os_mutex_init(&sp->lock);
 
     IPLSimulationSettings ss; memset(&ss,0,sizeof ss);
     ss.flags = IPL_SIMULATIONFLAGS_PATHING;
@@ -348,12 +349,13 @@ fail:
 
 void steam_path_destroy(SteamPath* sp) {
     if (!sp) return;
-    if (sp->thread) { InterlockedExchange(&sp->stop,1); WaitForSingleObject(sp->thread, INFINITE); CloseHandle(sp->thread); }
+    atomic_store_explicit(&sp->stop, 1, memory_order_release);
+    os_thread_join(&sp->thread);
     if (sp->dec) iplAmbisonicsDecodeEffectRelease(&sp->dec);
     free(sp->out26);
     for (int i=0;i<sp->nsrc;++i) if (sp->srcs[i].src) { iplSourceRemove(sp->srcs[i].src, sp->sim); iplSourceRelease(&sp->srcs[i].src); }
     if (sp->probes) { iplSimulatorRemoveProbeBatch(sp->sim, sp->probes); iplProbeBatchRelease(&sp->probes); }
     if (sp->sim) iplSimulatorRelease(&sp->sim);
-    DeleteCriticalSection(&sp->lock);
+    os_mutex_destroy(&sp->lock);
     free(sp);
 }

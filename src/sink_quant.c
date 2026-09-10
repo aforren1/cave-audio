@@ -2,36 +2,18 @@
  * sink_quant.c — the fixed-quantum adapter. See sink_quant.h for what it is for.
  *
  * The whole file is one loop and its accounting. It is pure (no device, no OS beyond the
- * monotonic clock), which is the point: the backends it serves cannot be tested on CI, so the
- * arithmetic they all share is tested on its own (test/sink_quant_test.c).
+ * monotonic clock, which goes through os.h), which is the point: the backends it serves cannot be
+ * tested on CI, so the arithmetic they all share is tested on its own (test/sink_quant_test.c).
+ * CoreAudio and AAudio will render through this same file, so it stays platform-free.
  */
 #include "sink_quant.h"
+#include "os.h"
 #include "profile.h"
 
 #include <stdlib.h>
 #include <string.h>
 
-#if defined(_WIN32)
-#define WIN32_LEAN_AND_MEAN
-#include <windows.h>
-#else
-#include <time.h>
-#endif
-
-uint64_t sink_quant_now_ns(void) {
-#if defined(_WIN32)
-    static uint64_t freq = 0;
-    if (!freq) { LARGE_INTEGER f; freq = QueryPerformanceFrequency(&f) ? (uint64_t)f.QuadPart : 1; }
-    LARGE_INTEGER c; QueryPerformanceCounter(&c);
-    const uint64_t t = (uint64_t)c.QuadPart;
-    /* Split the scale: t * 1e9 wraps uint64 after ~30 min at a 10 MHz QPC (same fix as null_sink.c). */
-    return (t / freq) * 1000000000ull + (t % freq) * 1000000000ull / freq;
-#else
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
-#endif
-}
+uint64_t sink_quant_now_ns(void) { return os_monotonic_ns(); }
 
 int sink_quant_init(SinkQuant* q, uint32_t sample_rate, uint32_t block, uint32_t channels,
                     uint32_t max_request, bwa_render_fn render, void* user) {

@@ -2,22 +2,43 @@
 
 ## Platform
 
-**Windows only.** ASIO is Windows-only; the Digiface is Windows/macOS. ASIO is only the
-Windows sink for the **array**. Headphone output has a second Windows backend, **WASAPI**
-(`src/wasapi_sink.cpp`), so a desk machine needs no ASIO driver at all: `binaural` and
+**Windows is the production platform.** ASIO is Windows-only; the Digiface is Windows and macOS.
+ASIO is only the Windows sink for the **array**. Headphone output has a second Windows backend,
+**WASAPI** (`src/wasapi_sink.cpp`), so a desk machine needs no ASIO driver at all: `binaural` and
 `cave_sim` open the Windows default output, and `cave_both` opens ASIO for the array and WASAPI
-for the monitor at the same time. The remaining backends (CoreAudio, JACK, ALSA, AAudio) and the
-OS shim the port needs are specified, not implemented, in [backends.md](./backends.md). Keep each
-backend's assumptions confined to its own `*_sink` file.
+for the monitor at the same time.
 
-Build system: CMake + MSVC (Visual Studio 2022 toolset). The core is C (C11 with
-`stdatomic.h`); Steam Audio and ASIO glue are C/C++.
+**The library, the tests and the console examples also build on Linux and macOS**, with gcc or
+clang, on the **null and manual sinks**. That is the whole platform surface off Windows for now:
+there is no device backend, so nothing reaches a speaker. What it buys is the offline path
+(`bwa_render_block` renders bit-identically anywhere), a place to run ThreadSanitizer, and a CI
+gate that catches a Win32 call sneaking back into the core. CoreAudio, JACK, ALSA and AAudio are
+specified, not implemented, in [backends.md](./backends.md). Keep each backend's assumptions
+confined to its own `*_sink` file.
 
-MSVC gates C11 atomics behind `/experimental:c11atomics`. CMake applies that flag per
-source file: `src/rt.c` and `src/stream.c` always, plus `src/steam_reflect.c` in the
-with-SDK build (its IR-publish seqlock uses `stdatomic.h` too). The flag applies both
-where the DLL compiles that file and in the test targets (`reflect`, `bake`) that
-compile it directly.
+Everything platform-specific OUTSIDE the sinks goes through one shim, `src/os.h`, with
+`src/os_win.c` and `src/os_posix.c` behind it: threads, sleep, the monotonic clock, an
+absolute-deadline sleep, mutexes and a reader/writer lock, thread priority, `strdup` and
+`strcasecmp`, and the UDP socket calls `natnet.c` makes. Nothing else in `src/` includes
+`windows.h`. The GUI tools (`bwa_playground`, `bwa_layout_tool`, `bwa_calib_view`) and the
+capture tools (`bwa_calibrate`, `bwa_validate`, `bwa_zylia_probe`) stay Windows-only targets and
+are skipped with a status message elsewhere.
+
+Build system: CMake, with MSVC (Visual Studio 2022 toolset) on Windows and gcc or clang
+elsewhere. The core is C (C11 with `stdatomic.h`); Steam Audio and ASIO glue are C/C++. Off
+Windows the library builds with `-fvisibility=hidden`, so the public ABI is what `BWA_API` marks
+and nothing else.
+
+MSVC gates C11 atomics behind `/experimental:c11atomics`. CMake applies that flag per source
+file, and source properties are directory-scoped so one entry covers every target that compiles
+the file. The list is `rt.c`, `stream.c`, `assets.c`, `fdn.c`, `natnet.c`, `engine.c`,
+`null_sink.c`, `profile_self.c`, `steam_scene.c`, `steam_path.c` and `steam_reflect.c`, plus the
+three test sources that reach the atomics directly (`test/os_test.c`, `test/natnet_test.c`,
+`test/audio_sink_test.c`, `test/rt_feature_test.c`).
+
+`src/pose.h` is the one HEADER that carries `stdatomic.h`, so `rt.h` and `natnet.h` forward-declare
+`PoseSlot` instead of including it. Include `pose.h` only where the seqlock is actually used, or
+the flag spreads to every consumer of those headers.
 
 The C++ files (`src/asio_sink.cpp`, `src/wasapi_sink.cpp`) need `/std:c++20` for designated
 initializers in their vtables. CMake asks for it per target rather than globally, so it cannot
@@ -26,12 +47,25 @@ leak into the vendored SDK sources.
 **Race-checking the rings.** The `test_rt_core` target drives the SPSC ring/commit logic
 off the real-time path (single-threaded, deterministic). It is what runs under
 `ctest` on MSVC; the spatial-feature half lives in `test_rt_feature`, and both share
-`test/rt_test_util.h`. The full ThreadSanitizer/Helgrind pass needs a
-**Clang or Linux** build: MSVC ships no TSan, and Helgrind is Valgrind/Linux. Build
-`rt.c` + a two-thread driver with `clang -fsanitize=thread`, or run under Helgrind.
-Then exercise one producer pushing commands while one consumer drains. Keep that
-driver off the real-time path: never let the sanitizer harness add allocation/locks
-to the callback.
+`test/rt_test_util.h`. `test_os` adds the genuinely concurrent part: two threads on the mutex,
+and a writer and a reader hammering the `pose.h` seqlock with torn-read detection.
+
+ThreadSanitizer needs a Linux or clang build, which the port now makes possible:
+
+```
+cmake -S . -B build-tsan -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+      -DCMAKE_C_FLAGS="-fsanitize=thread -g" \
+      -DCMAKE_EXE_LINKER_FLAGS=-fsanitize=thread \
+      -DCMAKE_SHARED_LINKER_FLAGS=-fsanitize=thread
+cmake --build build-tsan --target test_rt_core test_os
+./build-tsan/test_rt_core && ./build-tsan/test_os
+```
+
+Two things to know before reading a report. gcc warns that `atomic_thread_fence` is not modeled
+under `-fsanitize=thread`, so a fence-based seqlock (`pose.h`) can produce a FALSE report there;
+judge one against the code, not the tool. And a sanitizer build runs about two orders of magnitude
+slower, which is why `test_os` sets its contention floor low. Under WSL, ThreadSanitizer needs
+`setarch -R` (or `vm.mmap_rnd_bits=28`) or it aborts with "unexpected memory mapping".
 
 ## CMake options
 
@@ -217,8 +251,8 @@ older UPM parsers reject. When git cannot answer (no tag, shallow clone, no git 
 
 ## Continuous integration
 
-`.github/workflows/ci.yml` builds and tests on `windows-latest`, and doubles as the
-distribution channel:
+`.github/workflows/ci.yml` builds and tests on `windows-latest`, `ubuntu-latest` and
+`macos-latest`. The Windows job doubles as the distribution channel:
 
 - **ASIO is built.** The workflow fetches the SDK from Steinberg's official URL
   (cached between runs). The configure step fails loudly unless the log says
@@ -273,6 +307,13 @@ distribution channel:
   tag stamps the version into the packaged manifest (the committed `package.json`
   stays `0.0.0-dev`), so a tarball can never claim a version it isn't. See
   [Releasing](#releasing).
+- **Two more jobs guard the port, and ship nothing.** `linux` on `ubuntu-latest` and `macos`
+  on `macos-latest` check out without submodules, configure with no SDKs, build RelWithDebInfo,
+  and run the whole ctest suite on the null and manual sinks. They exist to catch a Win32 call
+  sneaking back into the core, so they assert on the configure log (`null and manual sinks only`,
+  `Steam Audio disabled`) rather than trusting the build to fail on its own. They are cheap: a few
+  minutes each against the Windows job's phonon build. The macOS job is UNVERIFIED locally, since
+  no Mac was at hand: it is the first thing that will ever execute the shim's Apple paths.
 - **A release carries FOUR assets**, because workflow artifacts expire (30 days) and a
   release doesn't:
   - `com.brainworks.bw_audio-<ver>.tgz`: the Unity package.

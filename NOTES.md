@@ -665,3 +665,67 @@ drift. `test_audio_sink` pins both halves: a healthy 200 ms run counts zero, the
 `Sleep` of two full buffers inside the render callback counts exactly one dropout of about 2860
 frames. The deliberate-red check made the threshold one notch too strict (four buffers instead of
 one) and the starve assertion went red before the rule was trusted.
+
+---
+
+**Device backends, phase 2 (`docs/backends.md`).** The OS shim: every platform call the engine made
+outside the sinks moved behind `src/os.h`, with `src/os_win.c` and `src/os_posix.c` behind that, so
+the library, the tests and the console examples build and pass with gcc and clang. The point is not
+Linux audio (there is no backend there yet) but the three things that fall out of it: the offline
+render path works anywhere, ThreadSanitizer becomes runnable, and CI gains a job that catches a
+Win32 call sneaking back into the core.
+
+Mechanically it is `Interlocked*` on `volatile LONG` becoming C11 atomics in the .c files,
+`CreateThread`/`Sleep`/`QueryPerformanceCounter`/`CRITICAL_SECTION`/`_strdup`/`_stricmp` becoming
+`os_*`, and Winsock becoming a wrapped UDP shim so `natnet.c` needs no socket header at all. Four
+things the spec's inventory did not predict, each of which changed a decision:
+
+The shim needed a READER/WRITER lock, not just a mutex. `steam_scene.c` guards its committed
+`IPLScene` with an `SRWLOCK` taken shared by borrowing sim threads and exclusively around
+`iplSceneCommit`; a plain mutex would have serialized ray traces that have no reason to wait on
+each other, so `os_rwlock` exists beside `os_mutex`.
+
+`pose.h` stopped being a header anything may include. The seqlock rewrite follows Boehm 2012: the
+payload fields are relaxed atomics (a seqlock reader deliberately reads data a writer may be
+writing, which on plain fields is undefined behavior rather than a stale value), and fences carry
+the ordering — a seq_cst fence after the writer's odd store, an acquire fence before the reader's
+validating reload. That puts `<stdatomic.h>` in the header, and with it MSVC's
+`/experimental:c11atomics` for every consumer. `rt.h` and `natnet.h` therefore forward-declare
+`PoseSlot`, which keeps the flag off about twenty translation units. Two knock-ons: `_Atomic` is
+not C++, so `examples/validate.cpp` now reads the pose through a new `natnet_read_pose` and the
+type is opaque to C++; and an atomic payload is not memcpy-able, so `rt.c`'s pre-seeding of the
+readback slot went away (`rt_read_pose` already fell back to the active fields when nothing had
+been published, which is exactly the case the seeding covered).
+
+Path normalization turned out to be a Windows FACT, not a convenience. `assets.c` folded case and
+backslashes into its cache key; on a POSIX filesystem `A.wav` and `a.wav` are different files and a
+backslash is an ordinary character in a name, so folding either there hands one cache entry to two
+files. Both folds are `_WIN32`-only now. The test section that pins them skips off Windows rather
+than asserting the inverse, because under WSL the Windows drive is mounted case-insensitively and
+the inverse assertion would pin the mount instead of the code.
+
+And two CMake auto-detects needed a platform guard for one reason: a dev checkout has the SDKs
+staged, so a Linux configure of that same tree found a Windows `phonon.h` and a Windows ASIO SDK
+and then failed at link. ASIO now requires `WIN32` as well as the SDK, and Steam Audio requires the
+platform's import library rather than just the header.
+
+**The self-paced loops moved to an absolute deadline.** `os_sleep_until_ns` waits on a deadline on
+the monotonic clock: a high-resolution waitable timer on Windows 10 1803+, `clock_nanosleep`
+with `TIMER_ABSTIME` on Linux, `mach_wait_until` on Apple. Two problems, one fix. A relative sleep
+is computed from a clock reading that is already stale when the kernel sees it, so pacing error
+accumulates. And the old way of making a relative sleep precise on Windows was `timeBeginPeriod(1)`,
+which is system-wide in effect — the null sink was holding the whole machine at a 1 ms timer tick
+for as long as any visual-only tool had the offline sink open. Only the pre-1803 fallback still
+touches it. Measured over 200 wakes 2 ms apart: median lateness 0.43 ms and p99 0.74 ms on a desk
+Windows machine, 0.13 ms and 0.33 ms under WSL2, against 5.6 ms and 13.0 ms with the fallback
+forced. Device-paced paths are untouched: the device is the clock there.
+
+**What the new `test_os` does and does not pin.** Threads, sleep bounds, the monotonic clock rate
+against the C clock, the deadline-sleep percentiles, mutex exclusion under two threads, and the
+seqlock under a writer and a reader with torn-read detection. The seqlock section pins the
+ALGORITHM, not the memory ordering, and says so: weakening the writer's release store to relaxed
+and deleting the reader's acquire fence leaves it green on x86, because the hardware does not
+reorder those. Removing the reader's validating reload turns it red at once — 122,837 torn reads in
+a 400 ms run. The deadline section's p50 bound is the one that catches a real regression: losing
+the high-resolution timer path degrades wakes to the 15.6 ms default granularity and fails it by an
+order of magnitude, which was confirmed by forcing exactly that.

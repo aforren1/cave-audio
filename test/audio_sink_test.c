@@ -15,8 +15,9 @@
 #include <stdio.h>
 #include <string.h>
 
-#define WIN32_LEAN_AND_MEAN
-#include <windows.h>
+#include "os.h"
+
+#include <stdatomic.h>
 
 #define SKIP_EXIT 77   /* ctest SKIP_RETURN_CODE; see CMakeLists.txt */
 
@@ -35,7 +36,7 @@ typedef struct {
     /* Set to N and the NEXT render blocks for N ms, once. That is a deliberate missed deadline:
      * the device drains while we hold its buffer, which is the only way to make a real dropout
      * happen on real hardware rather than assert about arithmetic. Consumed once. */
-    volatile LONG stall_ms_once;
+    _Atomic int   stall_ms_once;
 } Probe;
 
 static void probe_init(Probe* p, uint32_t channels) {
@@ -58,8 +59,8 @@ static void on_render(void* user, float* bus, uint32_t nframes, const bwa_timest
     /* The injected overrun. Sleeping on the audio thread is exactly what this must never do in
      * production, which is why it lives in a test hook and not in the sink. */
     {
-        const LONG stall = InterlockedExchange(&p->stall_ms_once, 0);
-        if (stall > 0) Sleep((DWORD)stall);
+        const int stall = atomic_exchange_explicit(&p->stall_ms_once, 0, memory_order_relaxed);
+        if (stall > 0) os_sleep_ms((unsigned)stall);
     }
 
     if (!p->first) {
@@ -114,9 +115,9 @@ static int test_injected_drop(void) {
     if (!s) { fprintf(stderr, "FAIL: inject open: %s\n", err[0] ? err : "(no message)"); return 0; }
     if (bwa_sink_start(s) != 0) { fprintf(stderr, "FAIL: inject start\n"); bwa_sink_close(s); return 0; }
 
-    Sleep(50);
-    bwa_null_sink_skip_blocks = (long)SKIP;     /* the device runs on for 3 blocks without us */
-    Sleep(100);
+    os_sleep_ms(50);
+    bwa_null_sink_skip_blocks = (int)SKIP;     /* the device runs on for 3 blocks without us */
+    os_sleep_ms(100);
     bwa_sink_stop(s);
 
     bwa_sink_health h;
@@ -196,7 +197,7 @@ static int test_wasapi(void) {
     if (bwa_sink_start(s) != 0) { fprintf(stderr, "FAIL: wasapi start\n"); bwa_sink_close(s); return 1; }
 
     /* --- phase 1: a healthy run --- */
-    Sleep(200);                                   /* ~37 blocks at 256/48000 = 5.33 ms */
+    os_sleep_ms(200);                                   /* ~37 blocks at 256/48000 = 5.33 ms */
 
     const uint32_t dev_frames = sink_wasapi_device_frames(s);
     const uint32_t per_frames = sink_wasapi_period_frames(s);
@@ -217,9 +218,9 @@ static int test_wasapi(void) {
     int starved = 0;
     if (armed) {
         /* Long enough that the buffer certainly empties: two full buffers plus slack. */
-        const DWORD stall_ms = (DWORD)(2u * dev_frames * 1000u / SR) + 20u;
-        InterlockedExchange(&p.stall_ms_once, (LONG)stall_ms);
-        Sleep(200 + (int)stall_ms);
+        const unsigned stall_ms = (2u * dev_frames * 1000u / SR) + 20u;
+        atomic_store_explicit(&p.stall_ms_once, (int)stall_ms, memory_order_relaxed);
+        os_sleep_ms(200u + stall_ms);
         starved = 1;
     }
 
@@ -296,7 +297,7 @@ int main(void) {
     const char* backend = bwa_sink_backend(s);
     if (bwa_sink_start(s) != 0) { fprintf(stderr, "FAIL: start\n"); bwa_sink_close(s); return 1; }
 
-    Sleep(200);                                  /* ~37 blocks at 256/48000 = 5.33 ms */
+    os_sleep_ms(200);                                  /* ~37 blocks at 256/48000 = 5.33 ms */
     bwa_sink_stop(s);                             /* joins the audio thread */
 
     /* thread is joined; reading the probe is race-free now */

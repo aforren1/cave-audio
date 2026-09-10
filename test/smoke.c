@@ -11,8 +11,7 @@
 #include <stdio.h>
 #include <string.h>
 
-#define WIN32_LEAN_AND_MEAN
-#include <windows.h>           /* Sleep */
+#include "os.h"               /* os_sleep_ms */
 
 static int run_profile(bwa_profile profile, const char* name) {
     bwa_desc cfg = {
@@ -128,7 +127,7 @@ static int run_profile(bwa_profile profile, const char* name) {
     bwa_bed_stop(e, bed);
     bwa_bed_destroy(e, bed);
 
-    Sleep(30);                          /* let the audio thread(s) run several blocks */
+    os_sleep_ms(30);                          /* let the audio thread(s) run several blocks */
 
     /* device clock pair + output latency through the full dll: the null sink stamps every block
      * from QPC, so a (sample, host-time) pair must exist, sit at/behind the dsp clock, and advance
@@ -143,7 +142,7 @@ static int run_profile(bwa_profile profile, const char* name) {
             fprintf(stderr, "FAIL[%s]: clock-pair sample runs ahead of the dsp clock\n", name);
             bwa_destroy(e); return 1;
         }
-        Sleep(15);                        /* > 2 blocks at 256/48k: the pair must move */
+        os_sleep_ms(15);                        /* > 2 blocks at 256/48k: the pair must move */
         uint64_t cs2 = 0, ct2 = 0;
         if (!bwa_get_clock(e, &cs2, &ct2) || cs2 <= cs || ct2 <= ct) {
             fprintf(stderr, "FAIL[%s]: clock pair does not advance with rendered blocks\n", name);
@@ -320,7 +319,13 @@ done:
  * observes the device-bound stereo the sink otherwise discards. The room frame is RH, +y up,
  * +z ahead: the identity listener's RIGHT ear is at -x (bw_audio.h BWA_ROOM_RIGHT), so a source
  * at (-1.5, 1.5, 0) must reach device channel 1 (R) — and channel 0 (L) after a 180-degree turn. */
-__declspec(dllimport) extern void (*bwa_null_sink_tap)(const float* bus, unsigned channels, unsigned block_size);
+/* Declared here rather than through sink.h, so this test stays a PUBLIC-ABI consumer; the hook
+ * itself is internal (sink.h). Off Windows it needs no import decoration, only the definition's
+ * default visibility. */
+#if defined(_WIN32)
+__declspec(dllimport)
+#endif
+extern void (*bwa_null_sink_tap)(const float* bus, unsigned channels, unsigned block_size);
 static double tap_sum[2];
 static void stereo_tap(const float* bus, unsigned channels, unsigned n) {
     if (channels != 2) return;
@@ -368,7 +373,7 @@ static int run_binaural_laterality(bwa_profile profile, const char* name) {
         if (bwa_start(e) != 0) { fprintf(stderr, "FAIL[lat]: bwa_start: %s\n", bwa_last_error(e)); goto done; }
         char backend[96];
         snprintf(backend, sizeof backend, "%s", bwa_get_audio_backend(e));   /* read while the sink is open */
-        Sleep(400);
+        os_sleep_ms(400);
         bwa_stop(e);                                        /* sink thread joined: tap_sum is safe to read */
         printf("smoke[lat] %s: -x ident L=%.3g R=%.3g\n", backend, tap_sum[0], tap_sum[1]);
         if (!(tap_sum[1] > tap_sum[0] * 1.1)) {
@@ -382,7 +387,7 @@ static int run_binaural_laterality(bwa_profile profile, const char* name) {
         bwa_commit(e);
         tap_sum[0] = tap_sum[1] = 0.0;
         if (bwa_start(e) != 0) { fprintf(stderr, "FAIL[lat]: restart: %s\n", bwa_last_error(e)); goto done; }
-        Sleep(400);
+        os_sleep_ms(400);
         bwa_stop(e);
         printf("smoke[lat] yaw180: L=%.3g R=%.3g\n", tap_sum[0], tap_sum[1]);
         if (!(tap_sum[0] > tap_sum[1] * 1.1)) {

@@ -22,8 +22,7 @@
 #include <stdio.h>
 #include <string.h>
 
-#define WIN32_LEAN_AND_MEAN
-#include <windows.h>           /* Sleep (the null-sink section only) */
+#include "os.h"               /* os_sleep_ms (the null-sink section only) */
 
 static int fails;
 #define CHECK(cond, ...) do { if (!(cond)) { ++fails;                                   \
@@ -766,7 +765,7 @@ static void nan_probe_settle(const char* what, poison_fn poison, int settle_ms) 
         if (!(pk > 1e-6)) { CHECK(0, "%s: probe voice is silent before the poison", what); bwa_destroy(e); return; }
     }
     poison(e, s);
-    if (settle_ms) Sleep((DWORD)settle_ms);              /* async publishers (the Steam sim thread)
+    if (settle_ms) os_sleep_ms((unsigned)settle_ms);              /* async publishers (the Steam sim thread)
                                                           * need a tick to land their value */
     bwa_commit(e);
     int r = render_blocks(e, 8);
@@ -1241,7 +1240,7 @@ static void refused_box_ray_traced_mesh(void) {
         bwa_destroy(e); return;
     }
     render_blocks(e, 4);              /* promote the pose: the sim traces from the PUBLISHED listener */
-    Sleep(OCC_SETTLE_MS);
+    os_sleep_ms(OCC_SETTLE_MS);
     const float occ_empty = bwa_source_get_occlusion(e, s);
     CHECK(occ_empty > 0.9f, "with no scene geometry the line of sight must read clear (%g)",
           (double)occ_empty);
@@ -1250,7 +1249,7 @@ static void refused_box_ray_traced_mesh(void) {
      * outside an 8x4x8 box. Without this the refusal assertion below could pass on an engine whose
      * set_box never built a mesh at all. */
     bwa_scene_set_box(e, 8.f, 4.f, 8.f, NULL);
-    Sleep(OCC_SETTLE_MS);
+    os_sleep_ms(OCC_SETTLE_MS);
     const float occ_boxed = bwa_source_get_occlusion(e, s);
     CHECK(occ_boxed < 0.5f, "an 8x4x8 box must occlude a source 100 m outside it (%g)",
           (double)occ_boxed);
@@ -1258,7 +1257,7 @@ static void refused_box_ray_traced_mesh(void) {
     clr(e);
     bwa_scene_set_box(e, ABSURD_ROOM_DIM, ABSURD_ROOM_DIM, ABSURD_ROOM_DIM, NULL);
     CHECK(bwa_last_error(e) != NULL, "an absurd set_box must be refused with a reason");
-    Sleep(OCC_SETTLE_MS);
+    os_sleep_ms(OCC_SETTLE_MS);
     const float occ_refused = bwa_source_get_occlusion(e, s);
     CHECK(occ_refused < 0.5f, "a REFUSED bwa_scene_set_box must leave the previous ray-traced mesh "
           "standing, not rebuild it from the refused dimensions (occlusion %g, was %g)",
@@ -1270,7 +1269,7 @@ static void refused_box_ray_traced_mesh(void) {
     bwa_scene_set_box(e, LEGAL_ROOM_DIM, LEGAL_ROOM_DIM, LEGAL_ROOM_DIM, NULL);
     CHECK(bwa_last_error(e) == NULL, "a %g m box must be ACCEPTED, not refused as absurd (%s)",
           (double)LEGAL_ROOM_DIM, bwa_last_error(e) ? bwa_last_error(e) : "");
-    Sleep(OCC_SETTLE_MS);
+    os_sleep_ms(OCC_SETTLE_MS);
     const float occ_huge = bwa_source_get_occlusion(e, s);
     CHECK(occ_huge > 0.9f, "an accepted %g m box must rebuild the ray-traced mesh - the source is "
           "inside it now, so the line of sight is clear again (%g)",
@@ -1318,7 +1317,7 @@ static void refused_dynamic_transform(void) {
 
     /* the probe's POWER check: the wall really does occlude when it sits between the two. */
     bwa_scene_set_dynamic_transform(e, wall, 1.5f, 1.5f, 0.f, 0.f, 0.f, 0.f, 1.f);
-    Sleep(OCC_SETTLE_MS);
+    os_sleep_ms(OCC_SETTLE_MS);
     const float occ_blocked = bwa_source_get_occlusion(e, s);
     CHECK(occ_blocked < 0.5f, "the wall must occlude while it sits between listener and source (%g)",
           (double)occ_blocked);
@@ -1326,7 +1325,7 @@ static void refused_dynamic_transform(void) {
     clr(e);
     bwa_scene_set_dynamic_transform(e, wall, ABSURD_COORD, 1.5f, 0.f, 0.f, 0.f, 0.f, 1.f);
     CHECK(bwa_last_error(e) != NULL, "an absurd dynamic transform must be refused with a reason");
-    Sleep(OCC_SETTLE_MS);
+    os_sleep_ms(OCC_SETTLE_MS);
     const float occ_refused = bwa_source_get_occlusion(e, s);
     CHECK(occ_refused < 0.5f, "a REFUSED bwa_scene_set_dynamic_transform must leave the instance "
           "where it was, not move it to the refused position (occlusion %g, was %g)",
@@ -1338,7 +1337,7 @@ static void refused_dynamic_transform(void) {
     bwa_scene_set_dynamic_transform(e, wall, -5.f, 1.5f, 0.f, 0.f, 0.f, 0.f, 1.f);
     CHECK(bwa_last_error(e) == NULL, "a legal dynamic transform must be ACCEPTED (%s)",
           bwa_last_error(e) ? bwa_last_error(e) : "");
-    Sleep(OCC_SETTLE_MS);
+    os_sleep_ms(OCC_SETTLE_MS);
     const float occ_moved = bwa_source_get_occlusion(e, s);
     CHECK(occ_moved > 0.9f, "an ACCEPTED transform must move the wall off the line of sight, "
           "clearing the occlusion (%g, was %g)", (double)occ_moved, (double)occ_blocked);
@@ -1387,7 +1386,7 @@ static void bad_triangle_indices(void) {
     }
     render_blocks(e, 4);              /* promote the pose: the sim traces from the PUBLISHED listener */
     bwa_scene_set_dynamic_transform(e, wall, 1.5f, 1.5f, 0.f, 0.f, 0.f, 0.f, 1.f);
-    Sleep(OCC_SETTLE_MS);
+    os_sleep_ms(OCC_SETTLE_MS);
     const float occ_walled = bwa_source_get_occlusion(e, s);
     CHECK(occ_walled < 0.5f, "the accepted wall must reach the ray tracer and occlude (%g)",
           (double)occ_walled);
@@ -1406,7 +1405,7 @@ static void bad_triangle_indices(void) {
     CHECK(bwa_last_error(e) != NULL, "set_mesh_mat must refuse a bad index too (it returns void, so "
           "bwa_last_error is the only way a caller can hear about it)");
 
-    Sleep(OCC_SETTLE_MS);
+    os_sleep_ms(OCC_SETTLE_MS);
     const float occ_after = bwa_source_get_occlusion(e, s);
     CHECK(occ_after < 0.5f, "a REFUSED mesh must leave the standing geometry alone, not half-apply "
           "(occlusion %g, was %g)", (double)occ_after, (double)occ_walled);
@@ -1939,7 +1938,7 @@ static void parser_abuse(void) {
           pk = 0;
           int ok = 1;
           for (int tries = 0; tries < 40 && pk <= 1e-6 && ok == 1; ++tries) {
-              Sleep(5);                                  /* let the streaming thread prebuffer/fill */
+              os_sleep_ms(5);                                  /* let the streaming thread prebuffer/fill */
               ok = render_peak(e, 2, &pk);
           }
           CHECK(ok == 1, "poisoned streamed samples must not reach the device (render=%d)", ok);
@@ -2058,7 +2057,7 @@ static void null_sink_lifecycle(void) {
     bwa_source_play(e, s, snd, true);
     bwa_source_set_pos(e, s, 1, 1.5f, 0);
     bwa_commit(e);
-    Sleep(30);                                           /* let several blocks land */
+    os_sleep_ms(30);                                           /* let several blocks land */
     CHECK(bwa_get_dsp_time_frames(e) > 0, "the audio thread must have rendered");
     /* stale traffic against the live thread */
     bwa_source stale = s ^ 0x10000u;
@@ -2067,11 +2066,11 @@ static void null_sink_lifecycle(void) {
     bwa_source_destroy(e, stale);
     bwa_play_oneshot(e, 0, 0, 0, 0, 1.f);
     bwa_commit(e);
-    Sleep(15);
+    os_sleep_ms(15);
     CHECK(bwa_source_is_playing(e, s), "the live voice must survive the stale traffic");
     CHECK(bwa_stop(e) == BWA_OK && bwa_stop(e) == BWA_OK, "stop twice");
     CHECK(bwa_start(e) == BWA_OK, "restart after stop");
-    Sleep(15);
+    os_sleep_ms(15);
     bwa_destroy(e);                                      /* destroy while running: must join + free */
 }
 

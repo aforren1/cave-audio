@@ -17,17 +17,30 @@ cmake_minimum_required(VERSION 3.20)
 # and the distribution/release version is the git tag (stamped into the Unity package at pack time).
 project(bw_audio LANGUAGES C)
 
-set(CMAKE_C_STANDARD 11)
+set(CMAKE_C_STANDARD 11)          # C11 atomics: src/os.h's shim leaves the shared state to them
 set(CMAKE_C_STANDARD_REQUIRED ON)
 
-if(NOT WIN32)
-  message(WARNING "bw_audio targets Windows (ASIO + Win32 audio thread). Non-Windows is unsupported for now.")
+# Platform: Windows is the production target (ASIO -> Digiface -> Dante) and the only one with
+# device backends so far. Everything else builds the library, the tests and the console examples on
+# the null and manual sinks, which is what the Linux and macOS CI jobs run. See docs/backends.md.
+if(WIN32)
+  message(STATUS "bw_audio: Windows - ASIO and WASAPI backends available")
+else()
+  message(STATUS "bw_audio: ${CMAKE_SYSTEM_NAME} - null and manual sinks only (no device backend yet)")
 endif()
 
 # The codebase uses standard C string functions (strncpy etc.); silence MSVC's
 # nonstandard *_s deprecation warnings rather than fork the code for one compiler.
 if(MSVC)
   add_compile_definitions(_CRT_SECURE_NO_WARNINGS)
+endif()
+
+# The gcc/clang counterpart of the /W4 the MSVC targets carry. Applied per target below, not
+# globally, so the fetched third-party sources keep their own warning levels.
+if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
+  set(BWA_C_WARNINGS -Wall -Wextra)
+else()
+  set(BWA_C_WARNINGS)
 endif()
 
 # ---- third-party single-header / single-file deps, fetched + pinned (not vendored) ----
@@ -62,6 +75,14 @@ if(BWA_TRACY)
   FetchContent_MakeAvailable(tracy)
 endif()
 
+# The OS portability shim (src/os.h): threads, sleep, the monotonic clock, mutexes, thread
+# priority, strdup/strcasecmp and the UDP socket calls natnet.c makes. Exactly one half compiles.
+if(WIN32)
+  set(BWA_OS_SRC src/os_win.c)
+else()
+  set(BWA_OS_SRC src/os_posix.c)
+endif()
+
 # ---- shared core (everything except the public ABI shim and the device sinks) ----
 # An OBJECT library so the off-RT-path tests can compile the core in directly and reach
 # its internals, without re-listing sources per target.
@@ -85,6 +106,7 @@ add_library(bwa_core OBJECT
   src/fdn.c
   src/ism.c
   src/natnet.c
+  ${BWA_OS_SRC}
   src/measure.c
   src/calib.c
   src/zylia.c
@@ -93,15 +115,39 @@ add_library(bwa_core OBJECT
   ${CJSON_C}
 )
 target_include_directories(bwa_core PUBLIC src include ${dr_libs_SOURCE_DIR} ${CJSON_INC})   # include/: frame.h consumes the BWA_ROOM_* basis
-target_link_libraries(bwa_core PUBLIC ws2_32)   # natnet.c uses Winsock (propagates to consumers)
+# The platform libraries. Named once here because three groups of targets need them: bwa_core, the
+# dll (which takes bwa_core's OBJECTS, so bwa_core's link interface does NOT reach it), and the few
+# tests that compile the shim in directly. libm is in the same list because it is the same kind of
+# fact: the MSVC CRT carries the math functions and glibc does not.
+function(bwa_link_os target scope)
+  if(WIN32)
+    target_link_libraries(${target} ${scope} ws2_32 winmm)   # ws2_32: the UDP shim; winmm: timeBeginPeriod
+  else()
+    find_package(Threads REQUIRED)
+    target_link_libraries(${target} ${scope} Threads::Threads m)
+  endif()
+endfunction()
+bwa_link_os(bwa_core PUBLIC)
+target_compile_options(bwa_core PRIVATE ${BWA_C_WARNINGS})
+# A shared library on gcc/clang exports everything by default; the public ABI says what it is
+# (BWA_API in bw_audio.h, BWA_EXPORT in src/os.h for the internal test hooks).
+set_target_properties(bwa_core PROPERTIES C_VISIBILITY_PRESET hidden POSITION_INDEPENDENT_CODE ON)
 if(MSVC)
   target_compile_options(bwa_core PRIVATE /W4)
-  # rt.c uses C11 <stdatomic.h>, gated behind /experimental:c11atomics (directory-scoped,
-  # so it applies wherever rt.c is compiled). cJSON is third-party: silence its warnings.
-  set_source_files_properties(src/rt.c PROPERTIES COMPILE_OPTIONS /experimental:c11atomics)
-  set_source_files_properties(src/stream.c PROPERTIES COMPILE_OPTIONS /experimental:c11atomics)
-  set_source_files_properties(src/assets.c PROPERTIES COMPILE_OPTIONS /experimental:c11atomics)   # the loader thread's two SPSC rings
-  set_source_files_properties(src/fdn.c PROPERTIES COMPILE_OPTIONS /experimental:c11atomics)   # the live wet-gain atomic
+  # C11 <stdatomic.h> is gated behind /experimental:c11atomics on MSVC. Source properties are
+  # DIRECTORY-scoped, so one entry covers every target in this file that compiles the file.
+  # cJSON is third-party: silence its warnings.
+  foreach(f src/rt.c            # the two SPSC rings, the commit snapshot, the clock seqlock
+            src/stream.c        # the per-stream ring cursors
+            src/assets.c        # the loader thread's job + result rings
+            src/fdn.c           # the live wet-gain atomic
+            src/natnet.c        # the pose seqlock (src/pose.h) + the receiver's stop flag
+            src/engine.c        # the hpeq handoff + the cave_both monitor seqlock
+            src/null_sink.c     # the health counters
+            src/profile_self.c  # the zone table
+            src/steam_scene.c src/steam_path.c)   # the sim threads' stop flags
+    set_source_files_properties(${f} PROPERTIES COMPILE_OPTIONS /experimental:c11atomics)
+  endforeach()
   set_source_files_properties(${CJSON_C} PROPERTIES COMPILE_OPTIONS /W0)
 endif()
 
@@ -115,13 +161,19 @@ add_library(bw_audio SHARED
   src/profile_self.c            # bwa_prof_reset/report exported unconditionally; accumulation gated by BWA_PROFILE_SELF
   $<TARGET_OBJECTS:bwa_core>
 )
+set_target_properties(bw_audio PROPERTIES C_VISIBILITY_PRESET hidden)
 target_include_directories(bw_audio PUBLIC include PRIVATE src ${dr_libs_SOURCE_DIR} ${CJSON_INC})
 target_compile_definitions(bw_audio PRIVATE BWA_BUILD_DLL)
+target_compile_options(bw_audio PRIVATE ${BWA_C_WARNINGS})
 if(MSVC)
   target_compile_options(bw_audio PRIVATE /W4)
 endif()
-if(WIN32)
-  target_link_libraries(bw_audio PRIVATE winmm ws2_32)   # winmm: timeBeginPeriod (null_sink); ws2_32: natnet
+bwa_link_os(bw_audio PRIVATE)
+if(NOT WIN32)
+  # INTERFACE too: the console examples do their own math (sinf for the test tones), and the MSVC
+  # CRT carries those while glibc splits them into libm. A client of the shared library that calls
+  # sinf needs the same line, so it belongs in the link interface rather than in each example.
+  target_link_libraries(bw_audio INTERFACE m)
 endif()
 
 if(BWA_TRACY)
@@ -148,8 +200,13 @@ endif()
 # and is NOT committed to this repo (third_party/README.md explains how to fetch it).
 set(ASIO_SDK_DIR "${CMAKE_SOURCE_DIR}/third_party/asiosdk" CACHE PATH "Steinberg ASIO SDK root")
 option(BWA_WITH_ASIO "Build the ASIO backend (needs the Steinberg ASIO SDK)" OFF)
-if(EXISTS "${ASIO_SDK_DIR}/common/asio.h")
+# WIN32 as well as the SDK: ASIO is a Windows driver model and asio_sink.cpp is a Windows source.
+# A checkout with the SDK fetched is the normal state on a dev machine, so without this guard a
+# Linux or macOS configure of the SAME tree would "find" it and then fail to compile.
+if(WIN32 AND EXISTS "${ASIO_SDK_DIR}/common/asio.h")
   set(BWA_WITH_ASIO ON)
+elseif(NOT WIN32)
+  set(BWA_WITH_ASIO OFF)
 endif()
 
 # Compile the Steinberg ASIO SDK host sources into a target that runs its own ASIO host (asiolist +
@@ -208,7 +265,12 @@ endif()
 # in src/ambisonics.c) is always built + tested; stage 2 (the ambisonics->binaural HRTF decode, gated
 # BWA_HAVE_STEAMAUDIO) supersedes the first-cut pan in binaural.c and lands with the SDK, on-SDK-verified.
 set(STEAMAUDIO_DIR "${CMAKE_SOURCE_DIR}/third_party/steam-audio-artifacts" CACHE PATH "Steam Audio (phonon) SDK root")
-if(EXISTS "${STEAMAUDIO_DIR}/include/phonon.h")
+# The staged tree only ever holds lib/windows-x64. A checkout WITH that artifact configured on
+# Linux would otherwise "find" the SDK from phonon.h alone and then fail at link, so the import
+# library has to be there too. Building phonon for the other platforms is its own follow-up
+# (docs/backends.md); until then a non-Windows build is a no-SDK build, which is fully viable.
+set(BWA_PHONON_LIB "${STEAMAUDIO_DIR}/lib/windows-x64/phonon.lib")
+if(WIN32 AND EXISTS "${STEAMAUDIO_DIR}/include/phonon.h" AND EXISTS "${BWA_PHONON_LIB}")
   set(BWA_STEAMAUDIO_FOUND TRUE)   # consumed by the with-SDK reflection test below
   target_sources(bw_audio PRIVATE src/steam_decode.c src/steam_scene.c src/steam_reflect.c src/steam_path.c)  # HRTF decode + occlusion + reflections + pathing (with-SDK)
   if(MSVC)   # steam_reflect.c uses C11 <stdatomic.h> (the IR-publish seqlock), like rt.c
@@ -345,8 +407,12 @@ if(BWA_BUILD_TESTS)
   endforeach()
 
   # lifecycle smoke against the public ABI / DLL
-  add_executable(test_smoke test/smoke.c)
+  # ${BWA_OS_SRC} + src/ on the include path buy exactly one thing: os_sleep_ms. The test itself
+  # stays a public-ABI consumer (it links the dll and declares the one internal hook it uses).
+  add_executable(test_smoke test/smoke.c ${BWA_OS_SRC})
+  target_include_directories(test_smoke PRIVATE src)
   target_link_libraries(test_smoke PRIVATE bw_audio)
+  bwa_link_os(test_smoke PRIVATE)
   add_test(NAME smoke COMMAND test_smoke)
   bwa_copy_runtime_dll(test_smoke)
 
@@ -369,16 +435,18 @@ if(BWA_BUILD_TESTS)
   # compiled device backend. The WASAPI section opens a live endpoint, so it is the one test here
   # that can legitimately be unrunnable; it exits 77 (see SKIP_RETURN_CODE below) rather than pass.
   add_executable(test_audio_sink test/audio_sink_test.c src/sink.c src/sink_quant.c
-                 src/null_sink.c src/manual_sink.c)
+                 src/null_sink.c src/manual_sink.c ${BWA_OS_SRC})
   target_include_directories(test_audio_sink PRIVATE src include)
-  if(WIN32)
-    target_link_libraries(test_audio_sink PRIVATE winmm)
-  endif()
+  target_compile_options(test_audio_sink PRIVATE ${BWA_C_WARNINGS})
+  bwa_link_os(test_audio_sink PRIVATE)
   if(BWA_WITH_WASAPI AND WIN32)
     target_sources(test_audio_sink PRIVATE src/wasapi_sink.cpp)
     target_compile_definitions(test_audio_sink PRIVATE BWA_HAVE_WASAPI)
     target_compile_features(test_audio_sink PRIVATE cxx_std_20)
     target_link_libraries(test_audio_sink PRIVATE ole32 avrt)
+  endif()
+  if(MSVC)   # the stall hook is a C11 atomic
+    set_source_files_properties(test/audio_sink_test.c PROPERTIES COMPILE_OPTIONS /experimental:c11atomics)
   endif()
   add_test(NAME audio_sink COMMAND test_audio_sink)
   # The WASAPI section opens a live endpoint. On a machine with no render endpoint (a CI runner)
@@ -389,17 +457,30 @@ if(BWA_BUILD_TESTS)
   # but the header. Pure, always runs — the backends that use it cannot be tested on CI.
   add_executable(test_sink_convert test/sink_convert_test.c)
   target_include_directories(test_sink_convert PRIVATE src include)
+  target_compile_options(test_sink_convert PRIVATE ${BWA_C_WARNINGS})
   add_test(NAME sink_convert COMMAND test_sink_convert)
 
   # The fixed-quantum adapter (src/sink_quant.c) every non-ASIO backend renders through. Also pure:
   # it fakes the device side, so the FIFO/timestamp/dropout arithmetic is pinned without hardware.
   add_executable(test_sink_quant test/sink_quant_test.c src/sink_quant.c src/sink.c
-                 src/null_sink.c src/manual_sink.c)
+                 src/null_sink.c src/manual_sink.c ${BWA_OS_SRC})
   target_include_directories(test_sink_quant PRIVATE src include)
-  if(WIN32)
-    target_link_libraries(test_sink_quant PRIVATE winmm)
-  endif()
+  target_compile_options(test_sink_quant PRIVATE ${BWA_C_WARNINGS})
+  bwa_link_os(test_sink_quant PRIVATE)
   add_test(NAME sink_quant COMMAND test_sink_quant)
+
+  # The OS shim itself (src/os.h): threads, sleep bounds, the monotonic clock against the C clock,
+  # mutex exclusion, and the rewritten pose seqlock under a writer + a reader thread with torn-read
+  # detection. Compiles the shim in directly rather than linking the core, so it stays runnable even
+  # if something else in the core stops building.
+  add_executable(test_os test/os_test.c ${BWA_OS_SRC})
+  target_include_directories(test_os PRIVATE src include)
+  target_compile_options(test_os PRIVATE ${BWA_C_WARNINGS})
+  bwa_link_os(test_os PRIVATE)
+  if(MSVC)
+    set_source_files_properties(test/os_test.c PROPERTIES COMPILE_OPTIONS /experimental:c11atomics)
+  endif()
+  add_test(NAME os COMMAND test_os)
 
   # off-RT-path checks that compile the core in (bwa_core PUBLIC includes propagate).
   # The old rt_test monolith is split in two (shared harness in test/rt_test_util.h):
@@ -416,6 +497,9 @@ if(BWA_BUILD_TESTS)
   add_executable(test_rt_feature test/rt_feature_test.c)
   target_link_libraries(test_rt_feature PRIVATE bwa_core)
   add_test(NAME rt_feature COMMAND test_rt_feature)
+  if(MSVC)   # publishes tracked poses through pose.h (the C11-atomics seqlock)
+    set_source_files_properties(test/rt_feature_test.c PROPERTIES COMPILE_OPTIONS /experimental:c11atomics)
+  endif()
 
   add_executable(test_sound test/sound_test.c)
   target_link_libraries(test_sound PRIVATE bwa_core)
@@ -432,8 +516,10 @@ if(BWA_BUILD_TESTS)
   # Deliberate MISUSE of the public ABI (NULLs, stale/recycled handles, wrong call order, boundary
   # and NaN arguments, cap exhaustion). Links the DLL, because misuse has to hit the real exported
   # entry points and their guards, not the internals.
-  add_executable(test_abuse test/abuse_test.c)
+  add_executable(test_abuse test/abuse_test.c ${BWA_OS_SRC})   # ${BWA_OS_SRC}: os_sleep_ms only
+  target_include_directories(test_abuse PRIVATE src)
   target_link_libraries(test_abuse PRIVATE bw_audio)
+  bwa_link_os(test_abuse PRIVATE)
   add_test(NAME abuse COMMAND test_abuse)
   bwa_copy_runtime_dll(test_abuse)
 
@@ -463,6 +549,9 @@ if(BWA_BUILD_TESTS)
   add_executable(test_natnet test/natnet_test.c)
   target_link_libraries(test_natnet PRIVATE bwa_core)
   add_test(NAME natnet COMMAND test_natnet)
+  if(MSVC)   # includes pose.h (the C11-atomics seqlock) directly
+    set_source_files_properties(test/natnet_test.c PROPERTIES COMPILE_OPTIONS /experimental:c11atomics)
+  endif()
 
   add_executable(test_ambi test/ambi_test.c)
   target_link_libraries(test_ambi PRIVATE bwa_core)
@@ -605,6 +694,14 @@ endif()
 # defines are clearer than routing IMGUI_USER_CONFIG through it.
 option(BWA_BUILD_PLAYGROUND "Build the interactive raylib playground + the layout tool (fetches raylib/imgui)" OFF)
 option(BWA_BUILD_CALIBVIEW "Build the imgui calibration report viewer (fetches imgui/implot/implot3d/test-engine)" OFF)
+# The three GUI tools are Windows-only for now: calib_view is on the win32 + d3d11 imgui backend,
+# and both raylib tools carry win32 resource scripts and the ASIO capture shells. Porting them is
+# not part of the OS shim (docs/backends.md, phase 2) - the LIBRARY is what has to build elsewhere.
+if(NOT WIN32 AND (BWA_BUILD_PLAYGROUND OR BWA_BUILD_CALIBVIEW))
+  message(STATUS "bw_audio: GUI tools skipped (Windows-only: win32/d3d11 imgui backend, ASIO capture)")
+  set(BWA_BUILD_PLAYGROUND OFF)
+  set(BWA_BUILD_CALIBVIEW OFF)
+endif()
 if(BWA_BUILD_PLAYGROUND OR BWA_BUILD_CALIBVIEW)
   enable_language(CXX)
   # SOURCE_SUBDIR points at a non-existent dir: populate sources only, never their own demo builds.
@@ -775,6 +872,12 @@ endif()
 # ---- Optional: speaker calibration tool (full-duplex ASIO sweep -> per-speaker delay/gain trims) ----
 # cmake -S . -B build -DBWA_BUILD_CALIBRATE=ON ; run with --simulate (no hardware) or on the rig.
 option(BWA_BUILD_CALIBRATE "Build the speaker calibration tool" OFF)
+# Same rule as the GUI tools: the calibration, validation and Zylia tools all run their own
+# full-duplex ASIO host, which is Windows-only.
+if(NOT WIN32 AND BWA_BUILD_CALIBRATE)
+  message(STATUS "bw_audio: calibration/validation tools skipped (Windows-only: full-duplex ASIO capture)")
+  set(BWA_BUILD_CALIBRATE OFF)
+endif()
 if(BWA_BUILD_CALIBRATE)
   enable_language(CXX)
   add_executable(bwa_calibrate examples/calibrate.cpp examples/calib_capture.cpp examples/asio_session.cpp)

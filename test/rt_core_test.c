@@ -758,7 +758,7 @@ int main(void) {
                 rt_source_set_pos(cst, h, 1.f, 0.f, 1.f);
                 rt_source_play(cst, h, ss, true);   /* loop a short file */
                 rt_commit(cst);
-                Sleep(60);                          /* let the streaming thread fill the ring */
+                os_sleep_ms(60);                          /* let the streaming thread fill the ring */
                 double e = 0;
                 for (int blk = 0; blk < 30; ++blk) { render2(cst); e += total_l2(); }
                 CHECK(e > 1e-3, "streamed voice produces audio through the mixer");

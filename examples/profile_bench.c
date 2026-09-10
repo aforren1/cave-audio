@@ -19,8 +19,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#define WIN32_LEAN_AND_MEAN
-#include <windows.h>
+#include "portable.h"      /* bwa_sleep_ms: the demo's only OS call */
 
 /* minimal mono 32-bit-float WAV (so we don't pull in a wav writer just for the bench) */
 static int write_sine_wav(const char* path, double freq, uint32_t sr, uint32_t frames) {
@@ -95,7 +94,7 @@ int main(int argc, char** argv) {
         }
         if (binaural) { float yaw = 0.2f * ph; bwa_set_listener_pose(e, 0, 1.5f, 0, 0, sinf(yaw * 0.5f), 0, cosf(yaw * 0.5f)); }
         bwa_commit(e);
-        Sleep(16);                            /* ~60 fps control rate */
+        bwa_sleep_ms(16);                            /* ~60 fps control rate */
     }
 
     bwa_stop(e); bwa_destroy(e);

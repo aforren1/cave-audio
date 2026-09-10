@@ -14,8 +14,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#define WIN32_LEAN_AND_MEAN
-#include <windows.h>
+#include "os.h"
 
 int main(void) {
     const uint32_t SR = 48000, BLK = 256;
@@ -42,7 +41,7 @@ int main(void) {
     SteamReflect* refl = steam_reflect_create(scene, rt, &L, SR, BLK, /*order*/1, /*ir*/0.4f, /*rays*/2048, /*bounces*/8, /*wet*/1.0f, /*bake*/1);
     if (!refl) { printf("FAIL: steam_reflect_create (baked)\n"); steam_scene_destroy(scene); free(bus); rt_destroy(rt); return 1; }
 
-    Sleep(600);                       /* let the sim thread look up + publish the baked reverb */
+    os_sleep_ms(600);                       /* let the sim thread look up + publish the baked reverb */
 
     double e[BWA_CHANNELS]; for (int s = 0; s < BWA_CHANNELS; ++s) e[s] = 0.0;
     float aux[256];

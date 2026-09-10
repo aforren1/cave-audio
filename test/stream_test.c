@@ -10,8 +10,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#define WIN32_LEAN_AND_MEAN
-#include <windows.h>
+#include "os.h"
 
 static int fails = 0;
 #define CHECK(c, msg) do { if (!(c)) { printf("FAIL: %s\n", msg); ++fails; } } while (0)
@@ -30,7 +29,7 @@ static void write_wav_f32_mono(const char* path, int n, int rate) {
     fclose(f);
 }
 
-static int wait_prebuffer(Stream* s) { for (int t = 0; t < 2000; ++t) { if (stream_prebuffered(s)) return 1; Sleep(1); } return 0; }
+static int wait_prebuffer(Stream* s) { for (int t = 0; t < 2000; ++t) { if (stream_prebuffered(s)) return 1; os_sleep_ms(1); } return 0; }
 
 int main(void) {
     const uint32_t RATE = 48000; const int N = 200000;   /* ~4 s, well past the 65536-sample ring */
@@ -57,7 +56,7 @@ int main(void) {
         uint64_t pos = 0; int mismatch = 0; float blk[256];
         for (int guard = 0; pos < (uint64_t)N && guard < 2000000; ++guard) {
             uint32_t got = stream_pull(s, pos, blk, 256);
-            if (got == 0) { if (stream_ended(s, pos)) break; Sleep(1); continue; }   /* underrun: wait */
+            if (got == 0) { if (stream_ended(s, pos)) break; os_sleep_ms(1); continue; }   /* underrun: wait */
             for (uint32_t k = 0; k < got; ++k) if (fabsf(blk[k] - patt(pos + k)) > 1e-6f) ++mismatch;
             pos += got;
         }
@@ -77,7 +76,7 @@ int main(void) {
         uint64_t target = (uint64_t)N + 5000;          /* read past the file end */
         for (int guard = 0; pos < target && guard < 2000000; ++guard) {
             uint32_t got = stream_pull(sl, pos, blk, 256);
-            if (got == 0) { Sleep(1); continue; }
+            if (got == 0) { os_sleep_ms(1); continue; }
             for (uint32_t k = 0; k < got; ++k) if (fabsf(blk[k] - patt((pos + k) % (uint64_t)N)) > 1e-6f) ++mismatch;
             pos += got;
         }

@@ -34,8 +34,8 @@
 #include <stdlib.h>
 #include <string.h>
 
-#define WIN32_LEAN_AND_MEAN
-#include <windows.h>           /* InterlockedExchange for the 'both' buffer handoff */
+#include "os.h"                /* threads/sleep/strdup; the Win32 calls used to be inline here */
+#include <stdatomic.h>         /* the hpeq handoff + the cave_both monitor seqlock */
 
 #define BWA_VOICE_CAP 256       /* max simultaneous sources (the user-visible pool) */
 /* Physical voice slots: rt_create adds a steal reserve, and a source created under pool pressure
@@ -113,8 +113,8 @@ struct bwa_engine {
      * count around its copy) makes the read tear-detectable, and mon_last (reader-owned last-good
      * block) is the wait-free fallback: one repeated block beats a torn one. */
     float*      mon_buf[2];       /* stereo double-buffer (each 2*cap) */
-    volatile LONG mon_idx;        /* index of the latest published buffer */
-    volatile LONG mon_seq[2];     /* per-buffer seqlock (producer increments around a rewrite) */
+    _Atomic int32_t  mon_idx;     /* index of the latest published buffer */
+    _Atomic uint32_t mon_seq[2];  /* per-buffer seqlock (producer increments around a rewrite) */
     float*      mon_last;         /* monitor-thread-owned copy of the last good block (2*cap) */
 
     NatNet*     tracker;          /* internal tracking (bwa_tracker_connect); NULL = pushed pose */
@@ -175,17 +175,17 @@ struct bwa_engine {
     void*         volatile capture_user;
 
     /* headphone correction EQ (bwa_load_headphone_eq / bwa_set_headphone_eq): the control thread
-     * parses into the BACK design slot, publishes idx then gen (Interlocked = full barriers), and
+     * parses into the BACK design slot, publishes idx then RELEASE-bumps gen, and
      * waits for the audio thread's ack before the slot may be rewritten (engine_hpeq ramps the old
      * correction out, adopts, ramps the new in — a click-free swap). hpeq_on is the ramped A/B. */
-    HpEqDesign    hpeq[2];
-    volatile LONG hpeq_idx;       /* published design slot; -1 = none loaded */
-    volatile LONG hpeq_gen;       /* bumped per publish; the audio thread adopts on change */
-    volatile LONG hpeq_ack;       /* audio thread: last adopted gen (the control-side wait) */
-    volatile LONG hpeq_on;        /* the A/B toggle (default 1: loading engages) */
-    HpEqState     hpeq_st;        /* audio-thread-only: filter histories + the applied mix */
-    LONG          hpeq_adopted;   /* audio-thread-only: last adopted gen */
-    int           hpeq_active;    /* audio-thread-only: adopted slot (-1 = none) */
+    HpEqDesign      hpeq[2];
+    _Atomic int32_t hpeq_idx;     /* published design slot; -1 = none loaded */
+    _Atomic int32_t hpeq_gen;     /* bumped per publish; the audio thread adopts on change */
+    _Atomic int32_t hpeq_ack;     /* audio thread: last adopted gen (the control-side wait) */
+    _Atomic int32_t hpeq_on;      /* the A/B toggle (default 1: loading engages) */
+    HpEqState       hpeq_st;      /* audio-thread-only: filter histories + the applied mix */
+    int32_t         hpeq_adopted; /* audio-thread-only: last adopted gen */
+    int             hpeq_active;  /* audio-thread-only: adopted slot (-1 = none) */
 };
 
 /* audio thread: hard-clamp a device-bound stereo block. The rt output limiter never sees the
@@ -213,19 +213,22 @@ static inline void engine_capture(bwa_engine* e, const float* planar, uint32_t c
  * nothing pending costs nothing. Runs on exactly one thread per engine: render_binaural
  * (binaural/cave_sim) or render_both_array's monitor decode (cave_both) — never both. */
 static void engine_hpeq(bwa_engine* e, float* stereo, uint32_t n) {
-    const LONG gen = e->hpeq_gen;                       /* volatile reads; published idx-before-gen */
+    /* ACQUIRE the generation BEFORE loading the slot index it publishes — the publish-then-flag
+     * rule in CLAUDE.md. The other order pairs a new generation with the previous index and
+     * swallows the load until something else bumps the counter. */
+    const int32_t gen = atomic_load_explicit(&e->hpeq_gen, memory_order_acquire);
     if (e->hpeq_adopted != gen) {
         if (e->hpeq_st.mix > 1e-4f && e->hpeq_active >= 0) {   /* old correction still audible: */
             hpeq_apply(&e->hpeq[e->hpeq_active], &e->hpeq_st, stereo, n, 0.f);   /* ramp it out */
             return;
         }
         e->hpeq_adopted = gen;                          /* silent: adopt + reset, ramp in below */
-        e->hpeq_active  = (int)e->hpeq_idx;
+        e->hpeq_active  = (int)atomic_load_explicit(&e->hpeq_idx, memory_order_relaxed);
         hpeq_state_reset(&e->hpeq_st);
-        InterlockedExchange(&e->hpeq_ack, gen);         /* the back slot is now free to rewrite */
+        atomic_store_explicit(&e->hpeq_ack, gen, memory_order_release);  /* back slot free to rewrite */
     }
     if (e->hpeq_active < 0) return;
-    const float tgt = e->hpeq_on ? 1.f : 0.f;
+    const float tgt = atomic_load_explicit(&e->hpeq_on, memory_order_relaxed) ? 1.f : 0.f;
     if (tgt == 0.f && e->hpeq_st.mix <= 1e-6f) { e->hpeq_st.mix = 0.f; return; }   /* settled off */
     hpeq_apply(&e->hpeq[e->hpeq_active], &e->hpeq_st, stereo, n, tgt);
 }
@@ -315,11 +318,16 @@ static void render_both_array(void* user, float* dev26, uint32_t n, const bwa_ti
     rt_render(e->rt, dev26, n, ts);
     engine_capture(e, dev26, e->layout.count, n);       /* primary output = the 26-ch array (post-limiter) */
     if (n != e->cap) return;                            /* off-spec block: skip the fixed-size monitor publish */
-    LONG cur = e->mon_idx;                              /* producer is the sole writer of mon_idx */
-    LONG bk  = 1 - cur;
+    const int32_t cur = atomic_load_explicit(&e->mon_idx, memory_order_relaxed);  /* sole writer */
+    const int32_t bk  = 1 - cur;
     float p[3], q[4];
     rt_get_listener(e->rt, p, q);
-    InterlockedIncrement(&e->mon_seq[bk]);              /* odd: rewrite in progress — a reader still on
+    /* Seqlock on the back buffer. The BUFFER itself stays plain float (an audio block is not
+     * something to make atomic); the counter carries the ordering, and the fence below is what
+     * keeps the buffer writes from sinking above the odd store. */
+    const uint32_t sq = atomic_load_explicit(&e->mon_seq[bk], memory_order_relaxed);
+    atomic_store_explicit(&e->mon_seq[bk], sq + 1u, memory_order_relaxed);
+    atomic_thread_fence(memory_order_seq_cst);          /* odd: rewrite in progress — a reader still on
                                                          * this buffer (drifted a full period behind on
                                                          * its own device clock) falls back to last-good */
 #ifdef BWA_HAVE_STEAMAUDIO
@@ -329,8 +337,8 @@ static void render_both_array(void* user, float* dev26, uint32_t n, const bwa_ti
     monitor_process(e->monitor, dev26, NULL, p, q, e->mon_buf[bk], n);
     engine_hpeq(e, e->mon_buf[bk], n);                  /* headphone correction on the monitor tap */
     engine_clamp2(e->mon_buf[bk], n);                   /* protection clamp (see engine_clamp2) */
-    InterlockedIncrement(&e->mon_seq[bk]);              /* even: stable (full barrier, before the publish) */
-    InterlockedExchange(&e->mon_idx, bk);               /* publish the back buffer (full barrier) */
+    atomic_store_explicit(&e->mon_seq[bk], sq + 2u, memory_order_release);  /* even: stable */
+    atomic_store_explicit(&e->mon_idx, bk, memory_order_release);           /* publish the back buffer */
 }
 
 /* cave_both, monitor thread: play the latest published stereo buffer. Wait-free: validate the
@@ -342,13 +350,14 @@ static void render_both_monitor(void* user, float* dev2, uint32_t n, const bwa_t
     memset(dev2, 0, sizeof(float) * (size_t)n * 2);
     if (n != e->cap) return;                            /* off-spec block: silence */
     for (int t = 0; t < 2; ++t) {
-        LONG cur = InterlockedCompareExchange(&e->mon_idx, 0, 0);      /* barriered read of the index */
-        LONG s0  = InterlockedCompareExchange(&e->mon_seq[cur], 0, 0);
-        if (s0 & 1) continue;                           /* producer mid-rewrite of this very buffer */
+        const int32_t  cur = atomic_load_explicit(&e->mon_idx, memory_order_acquire);
+        const uint32_t s0  = atomic_load_explicit(&e->mon_seq[cur], memory_order_acquire);
+        if (s0 & 1u) continue;                          /* producer mid-rewrite of this very buffer */
         const float* src = e->mon_buf[cur];             /* planar [L(cap), R(cap)], cap == n here */
         memcpy(dev2,     src,          sizeof(float) * n);  /* L */
         memcpy(dev2 + n, src + e->cap, sizeof(float) * n);  /* R */
-        LONG s1 = InterlockedCompareExchange(&e->mon_seq[cur], 0, 0);
+        atomic_thread_fence(memory_order_acquire);      /* the copy stays ABOVE the validating reload */
+        const uint32_t s1 = atomic_load_explicit(&e->mon_seq[cur], memory_order_relaxed);
         if (s0 == s1) {                                 /* no rewrite straddled the copy */
             memcpy(e->mon_last, dev2, sizeof(float) * (size_t)n * 2);  /* reader-owned last-good */
             return;
@@ -447,10 +456,10 @@ bwa_engine* bwa_create(const bwa_desc* cfg) {
 #endif
     /* OWN the path strings: the caller's buffers (e.g. a P/Invoke binding's marshalled UTF-8 temporaries)
      * may be freed once bwa_create returns, but bwa_start dereferences hrtf_path later — a shallow pointer
-     * copy would dangle. Copy here, free in bwa_destroy. _strdup-fail -> NULL = the documented default. */
-    e->cfg.layout_path = cfg->layout_path ? _strdup(cfg->layout_path) : NULL;
-    e->cfg.hrtf_path   = cfg->hrtf_path   ? _strdup(cfg->hrtf_path)   : NULL;
-    e->cfg.device      = cfg->device ? _strdup(cfg->device) : NULL;   /* asio_driver is the same field */
+     * copy would dangle. Copy here, free in bwa_destroy. A strdup failure -> NULL = the default. */
+    e->cfg.layout_path = os_strdup(cfg->layout_path);
+    e->cfg.hrtf_path   = os_strdup(cfg->hrtf_path);
+    e->cfg.device      = os_strdup(cfg->device);   /* asio_driver is the same field */
     return e;
 }
 
@@ -529,8 +538,9 @@ bwa_result bwa_start(bwa_engine* e) {
         e->mon_buf[0] = (float*)calloc((size_t)BWA_MAX_BLOCK * 2, sizeof(float));
         e->mon_buf[1] = (float*)calloc((size_t)BWA_MAX_BLOCK * 2, sizeof(float));
         e->mon_last   = (float*)calloc((size_t)BWA_MAX_BLOCK * 2, sizeof(float));
-        e->mon_idx = 0;
-        e->mon_seq[0] = e->mon_seq[1] = 0;              /* even = stable (calloc'd silence) */
+        atomic_store_explicit(&e->mon_idx, 0, memory_order_relaxed);
+        atomic_store_explicit(&e->mon_seq[0], 0u, memory_order_relaxed);
+        atomic_store_explicit(&e->mon_seq[1], 0u, memory_order_relaxed);   /* even = stable (calloc'd silence) */
         if (e->mon_buf[0] && e->mon_buf[1] && e->mon_last) {
             e->sink = bwa_sink_open(sr, bs, e->layout.count, e->cfg.sink, e->cfg.device, e->cfg.sink_flags,
                                     true, render_both_array, e, e->errbuf, sizeof e->errbuf);
@@ -688,7 +698,7 @@ bwa_result bwa_tracker_connect(bwa_engine* e, const bwa_tracker_desc* d) {
     e->tracker = nn;
     rt_set_tracker(e->rt, natnet_pose(nn));   /* release-published; the audio thread reads it next block */
     if (old) {
-        if (e->started) Sleep(50);            /* an in-flight block may still read the old pose slot */
+        if (e->started) os_sleep_ms(50);      /* an in-flight block may still read the old pose slot */
         natnet_close(old);
     }
     return BWA_OK;
@@ -699,7 +709,7 @@ void bwa_tracker_disconnect(bwa_engine* e) {
     NatNet* old = e->tracker;
     e->tracker = NULL;
     rt_set_tracker(e->rt, NULL);              /* back to the committed/pushed pose */
-    if (e->started) Sleep(50);                /* an in-flight block may still read the old pose slot */
+    if (e->started) os_sleep_ms(50);          /* an in-flight block may still read the old pose slot */
     natnet_close(old);
 }
 
@@ -1401,23 +1411,26 @@ void bwa_set_limiter_ceiling(bwa_engine* e, float linear) {
  * next load can't rewrite a slot the renderer is still reading. No renderer = no reader: skip the
  * wait when stopped, and on the MANUAL sink (its "audio thread" is the caller — the same thread
  * as this one, so waiting would only burn the timeout; single-threaded means no race either). */
-static void hpeq_publish(bwa_engine* e, LONG idx) {
-    InterlockedExchange(&e->hpeq_idx, idx);
-    const LONG gen = InterlockedIncrement(&e->hpeq_gen);
+static void hpeq_publish(bwa_engine* e, int32_t idx) {
+    atomic_store_explicit(&e->hpeq_idx, idx, memory_order_relaxed);
+    /* RELEASE on the generation bump, so the audio thread's acquire of it also acquires the index
+     * (and the parsed design behind it). Publish idx BEFORE gen — see engine_hpeq. */
+    const int32_t gen = atomic_fetch_add_explicit(&e->hpeq_gen, 1, memory_order_release) + 1;
     if (!e->started || e->profile == BWA_PROFILE_CAVE ||     /* cave: no headphone render, no ack */
         bwa_get_sink_type(e) == BWA_SINK_MANUAL) return;
-    for (int tries = 0; tries < 100 && e->hpeq_ack != gen; ++tries) Sleep(1);
+    for (int tries = 0; tries < 100 &&
+         atomic_load_explicit(&e->hpeq_ack, memory_order_acquire) != gen; ++tries) os_sleep_ms(1);
 }
 
 bwa_result bwa_load_headphone_eq(bwa_engine* e, const char* path) {
     if (!e) return BWA_ERR_CONFIG;
     clear_error(e);
     if (!path || !path[0]) {                         /* clear the correction (ramped out) */
-        if (e->hpeq_idx >= 0) hpeq_publish(e, -1);
+        if (atomic_load_explicit(&e->hpeq_idx, memory_order_relaxed) >= 0) hpeq_publish(e, -1);
         return BWA_OK;
     }
-    const LONG cur = e->hpeq_idx;
-    const LONG back = (cur == 0) ? 1 : 0;            /* -1 (none) writes slot 0 */
+    const int32_t cur  = atomic_load_explicit(&e->hpeq_idx, memory_order_relaxed);
+    const int32_t back = (cur == 0) ? 1 : 0;         /* -1 (none) writes slot 0 */
     if (!hpeq_parse(path, e->cfg.sample_rate, &e->hpeq[back], e->errbuf, sizeof e->errbuf)) {
         set_error(e, e->errbuf);                     /* parse failure keeps the previous EQ */
         return BWA_ERR_CONFIG;
@@ -1427,7 +1440,7 @@ bwa_result bwa_load_headphone_eq(bwa_engine* e, const char* path) {
 }
 
 void bwa_set_headphone_eq(bwa_engine* e, bool on) {
-    if (e) InterlockedExchange(&e->hpeq_on, on ? 1 : 0);
+    if (e) atomic_store_explicit(&e->hpeq_on, on ? 1 : 0, memory_order_relaxed);
 }
 
 /* Offline: SPCAP's geometry-derived default focus for an array of `n` speaker positions. Pure —

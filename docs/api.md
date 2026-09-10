@@ -757,9 +757,11 @@ with one more reference. Ask for the same path with different flags and you get 
 entries, because a file held in RAM and the same file streamed are two different assets. Flags 0
 means `bwa_load_sound`.
 
-Paths compare case-insensitively, and `/` and `\` are equivalent. Nothing else is normalized:
-`./sound.wav` and `sound.wav` are two entries. There is no `..` collapse and no symlink
-resolution.
+**On Windows**, paths compare case-insensitively and `/` and `\` are equivalent. Neither fold
+applies on Linux or macOS, where `A.wav` and `a.wav` are different files and a backslash is an
+ordinary character in a name, so folding them would hand one cache entry to two files. Nothing
+else is normalized on any platform: `./sound.wav` and `sound.wav` are two entries. There is no
+`..` collapse and no symlink resolution.
 
 A combination no loader can express is refused with a message in `bwa_last_error`, never narrowed
 to one of the two: `BWA_LOAD_AMBIX | BWA_LOAD_FUMA` (one file is in one format) and

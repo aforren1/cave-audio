@@ -33,7 +33,7 @@
 #include <math.h>
 #include <stdio.h>
 #include <string.h>
-#include <windows.h>
+#include "portable.h"      /* bwa_sleep_ms: the demo's only OS call */
 
 /* -- scaffolding, not part of the client pattern: hand-write a 0.5 s ping wav so
  *    the example runs with no assets. A real client ships files and skips this. -- */
@@ -127,10 +127,10 @@ int main(int argc, char** argv) {
         bwa_source_set_pos(e, src, 2.f * cosf(a), 1.5f, -2.f * sinf(a));
         bwa_set_listener_pose(e, 0.f, 1.5f, 0.f, 0.f, 0.f, 0.f, 1.f);   /* standing at the array center */
         bwa_commit(e);                          /* promote this frame's updates as one snapshot */
-        Sleep(16);                             /* ~60 Hz, like an engine tick */
+        bwa_sleep_ms(16);                             /* ~60 Hz, like an engine tick */
     }
     bwa_source_stop(e, src);
-    Sleep(400);                                 /* breathe: the looping ping restarts every 0.5 s, so
+    bwa_sleep_ms(400);                                 /* breathe: the looping ping restarts every 0.5 s, so
                                                  * whichever iteration is in flight gets cut by the
                                                  * (one-block, click-free) stop — without a gap its
                                                  * truncated attack lands right under the oneshot
@@ -152,7 +152,7 @@ int main(int argc, char** argv) {
      * it rather than assuming silence is the mix. */
     if (!bwa_play_oneshot(e, ping, -2.f, 1.5f, 0.f, 1.f))
         printf("oneshot dropped: %s\n", bwa_last_error(e));
-    Sleep(600);                                 /* let the 0.5 s ping ring out — a oneshot has no
+    bwa_sleep_ms(600);                                 /* let the 0.5 s ping ring out — a oneshot has no
                                                  * handle to poll, and without the wait the play
                                                  * below starts on top of it (two overlapping dings,
                                                  * which by ear reads as a bug) */
@@ -173,7 +173,7 @@ int main(int argc, char** argv) {
         bwa_source done[8];
         uint32_t n = bwa_poll_ended(e, done, 8, NULL);
         for (uint32_t i = 0; i < n; ++i) if (done[i] == src) ended = 1;
-        Sleep(16);
+        bwa_sleep_ms(16);
     }
     check(ended, "bwa_poll_ended reported the ping's end");
 
@@ -198,7 +198,7 @@ int main(int argc, char** argv) {
         bwa_source hit[16];
         uint32_t n = bwa_poll_looped(e, hit, 16, NULL);
         for (uint32_t i = 0; i < n; ++i) if (hit[i] == src) ++wraps;
-        Sleep(16);
+        bwa_sleep_ms(16);
     }
     bwa_source_stop(e, src);
     printf("  %d wraps\n", wraps);
