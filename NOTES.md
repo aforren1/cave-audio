@@ -729,3 +729,18 @@ reorder those. Removing the reader's validating reload turns it red at once — 
 a 400 ms run. The deadline section's p50 bound is the one that catches a real regression: losing
 the high-resolution timer path degrades wakes to the 15.6 ms default granularity and fails it by an
 order of magnitude, which was confirmed by forcing exactly that.
+
+**Linux gets device backends (backends.md phase 5).** `jack_sink.c` is the production path and the
+one sink that neither converts nor interleaves, because JACK ports are planar float already; it
+activates and connects at OPEN so a "the server has 2 playback ports and this sink has 26" error can
+reach `bwa_last_error`, and it parks xruns from JACK's notification thread for the process thread to
+fold into the adapter, which keeps every count in one place and stays clean under ThreadSanitizer.
+`alsa_sink.c` is the no-server path and the ONE backend with no fixed-quantum adapter: it writes, so
+it picks the size. Two things the shim gained for it. `os_thread_set_realtime(period_ns)` is what
+every self-paced render thread now calls, and the three platforms mean three different things by it
+(MMCSS "Pro Audio", `SCHED_FIFO`, `THREAD_TIME_CONSTRAINT_POLICY`); the Windows effect was measured
+rather than assumed, at p50 12 to 18 ms on an ordinary thread against 0.407 ms on the MMCSS one, on
+a box pinned at 100 percent CPU by unrelated work. And the null sink stopped stamping
+`os_monotonic_ns() - base`: on Apple Silicon's 41.67 ns tick the first block's stamp came out
+exactly 0, which `rt.c` reads as "no stamp", and macOS CI caught it as `bwa_get_clock` having no
+pair after 30 ms. It stamps the absolute clock now, like every other backend.

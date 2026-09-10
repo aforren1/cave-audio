@@ -38,7 +38,6 @@ extern "C" {
 #include <windows.h>
 #include <mmdeviceapi.h>
 #include <audioclient.h>
-#include <avrt.h>
 
 #include <atomic>
 #include <cstdio>
@@ -322,10 +321,14 @@ DWORD WINAPI wasapi_thread(LPVOID arg) {
     const HRESULT com = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
     const bool com_owned = SUCCEEDED(com);
 
-    /* "Pro Audio" is the MMCSS task the OS reserves for audio work: it lifts this thread above
-     * the normal scheduler classes for its share of each period. Reverted before the thread ends. */
-    DWORD mmcss_index = 0;
-    HANDLE mmcss = AvSetMmThreadCharacteristicsW(L"Pro Audio", &mmcss_index);
+    /* "Pro Audio" is the MMCSS task the OS reserves for audio work: it lifts this thread above the
+     * normal scheduler classes for its share of each period. Through the shim rather than inline,
+     * because every self-paced render thread wants the same thing and the platforms spell it three
+     * different ways (see os.h). It matters twice here: for the event-driven path, and for the
+     * host-paced fallback below, which is a plain timed loop with a deadline. Reverted before the
+     * thread ends. */
+    const bool rt = os_thread_set_realtime((uint64_t)s->block * 1000000000ull /
+                                           (uint64_t)s->sample_rate) == 0;
 
     /* A few periods: long enough that a busy machine does not trip it, short enough that a device
      * that stopped clocking is noticed within a block or two rather than hanging the engine. */
@@ -409,7 +412,7 @@ DWORD WINAPI wasapi_thread(LPVOID arg) {
         }
     }
 
-    if (mmcss) AvRevertMmThreadCharacteristics(mmcss);
+    if (rt) os_thread_clear_realtime();
     if (com_owned) CoUninitialize();
     return 0;
 }

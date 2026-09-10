@@ -1115,9 +1115,10 @@ func _test_clock() -> void:
 			"manual host time should be sample/rate, got %d expected ~%d"
 				% [c["host_time_ns"], expect_ns])
 	else:
-		# The null sink stamps real elapsed time from stream start, so only monotonicity is
-		# assertable - but that much must hold, or the seqlock is handing back garbage.
-		_check(c["host_time_ns"] > 0, "the null sink should stamp a real elapsed time")
+		# The null sink stamps the platform's monotonic clock, whose epoch is the platform's own,
+		# so only monotonicity is assertable - but that much must hold, or the seqlock is handing
+		# back garbage.
+		_check(c["host_time_ns"] > 0, "the null sink should stamp a real host time")
 		await _pump(10)
 		var c2 := engine.get_clock()
 		_check(c2["host_time_ns"] > c["host_time_ns"], "host time should advance")

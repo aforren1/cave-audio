@@ -8,6 +8,7 @@
 #include "os.h"
 
 #include <errno.h>
+#include <sched.h>       /* SCHED_FIFO + the priority range os_thread_set_realtime asks for */
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>       /* strcasecmp */
@@ -20,9 +21,14 @@
 #include <sys/time.h>
 
 #if defined(__APPLE__)
+#include <mach/mach_init.h>     /* mach_thread_self / mach_task_self */
+#include <mach/mach_port.h>     /* mach_port_deallocate: mach_thread_self hands out a send right */
 #include <mach/mach_time.h>
+#include <mach/thread_act.h>    /* thread_policy_set */
+#include <mach/thread_policy.h> /* THREAD_TIME_CONSTRAINT_POLICY */
 #else
-#include <sys/resource.h>  /* setpriority: Linux applies PRIO_PROCESS/0 to the CALLING THREAD */
+#include <sys/resource.h>  /* setpriority: Linux applies PRIO_PROCESS/0 to the CALLING THREAD.
+                            * Also getrlimit(RLIMIT_RTPRIO), the SCHED_FIFO permission probe. */
 #endif
 
 /* ---- threads ---- */
@@ -72,6 +78,91 @@ void os_thread_lower_priority(void) {
     /* Linux nice is per-thread, and PRIO_PROCESS with a 0 "who" means the calling thread. +5 is
      * the same intent as THREAD_PRIORITY_BELOW_NORMAL: yield to the audio thread, keep running. */
     (void)setpriority(PRIO_PROCESS, 0, 5);
+#endif
+}
+
+#if defined(__APPLE__)
+/* THREAD_TIME_CONSTRAINT_POLICY, which is what CoreAudio gives its own IO thread, and on Darwin
+ * this is not an optimization: the kernel COALESCES timers for ordinary threads, so a correct
+ * mach_wait_until on a plain thread still lands milliseconds late. CI on an Apple Silicon runner
+ * measured p50 2.7 ms and p99 9.8 ms against a 2 ms deadline, and os_sleep_ms(50) taking 100 ms,
+ * with the timebase conversions verified correct in both directions. A time-constraint thread is
+ * exempt from that coalescing.
+ *
+ * The triple is the standard shape: `period` is the render period, `computation` the CPU time the
+ * thread claims inside it, `constraint` the deadline it must finish by. A quarter and a half of
+ * the period are the conventional values, and preemptible stays 1 because the render loop sleeps
+ * rather than spins. */
+static uint32_t mach_ticks_of_ns(uint64_t ns) {
+    static mach_timebase_info_data_t tb;
+    if (tb.denom == 0) mach_timebase_info(&tb);
+    const uint64_t t = (ns / tb.numer) * tb.denom + (ns % tb.numer) * tb.denom / tb.numer;
+    return (t > 0xFFFFFFFFull) ? 0xFFFFFFFFu : (uint32_t)t;
+}
+
+int os_thread_set_realtime(uint64_t period_ns) {
+    if (period_ns == 0) period_ns = 5000000ull;     /* a nominal 5 ms if the caller has no period */
+    thread_time_constraint_policy_data_t pol;
+    pol.period      = mach_ticks_of_ns(period_ns);
+    pol.computation = mach_ticks_of_ns(period_ns / 4u);
+    pol.constraint  = mach_ticks_of_ns(period_ns / 2u);
+    pol.preemptible = 1;
+    const mach_port_t th = mach_thread_self();      /* a send right: it has to be given back */
+    const kern_return_t kr = thread_policy_set(th, THREAD_TIME_CONSTRAINT_POLICY,
+                                               (thread_policy_t)&pol,
+                                               THREAD_TIME_CONSTRAINT_POLICY_COUNT);
+    mach_port_deallocate(mach_task_self(), th);
+    return (kr == KERN_SUCCESS) ? 0 : (int)kr;
+}
+
+void os_thread_clear_realtime(void) {
+    thread_standard_policy_data_t pol;
+    memset(&pol, 0, sizeof pol);
+    const mach_port_t th = mach_thread_self();
+    thread_policy_set(th, THREAD_STANDARD_POLICY, (thread_policy_t)&pol,
+                      THREAD_STANDARD_POLICY_COUNT);
+    mach_port_deallocate(mach_task_self(), th);
+}
+#else
+/* SCHED_FIFO, not a nice value: a blocking-write render loop misses its deadline the moment a
+ * desktop task outranks it, and SCHED_OTHER has no way to say "always before that". min + 10 is
+ * rtprio 11 on Linux - above every ordinary task, and deliberately well under jackd's own thread
+ * (70 by default), which must always outrank a client. The policy is not deadline-based, so
+ * `period_ns` has nothing to say here. pthread_setschedparam RETURNS the errno rather than
+ * setting it. */
+int os_thread_set_realtime(uint64_t period_ns) {
+    (void)period_ns;
+    struct sched_param sp;
+    memset(&sp, 0, sizeof sp);
+    const int lo = sched_get_priority_min(SCHED_FIFO);
+    const int hi = sched_get_priority_max(SCHED_FIFO);
+    int prio = lo + 10;
+    if (prio > hi) prio = hi;
+    sp.sched_priority = prio;
+    return pthread_setschedparam(pthread_self(), SCHED_FIFO, &sp);
+}
+
+void os_thread_clear_realtime(void) {
+    struct sched_param sp;
+    memset(&sp, 0, sizeof sp);
+    (void)pthread_setschedparam(pthread_self(), SCHED_OTHER, &sp);
+}
+#endif
+
+bool os_thread_realtime_available(void) {
+#if defined(__linux__)
+    /* Exactly what the kernel checks: an unprivileged SCHED_FIFO request is granted while the
+     * requested priority fits inside RLIMIT_RTPRIO (the `audio` group's limits.d drop, or a
+     * systemd LimitRTPRIO). Root bypasses the limit, and so does CAP_SYS_NICE - which cannot be
+     * read from here, so a capability-only setup reads as "no" and merely produces a warning the
+     * successful attempt then contradicts. */
+    if (geteuid() == 0) return true;
+    struct rlimit rl;
+    if (getrlimit(RLIMIT_RTPRIO, &rl) != 0) return true;   /* cannot tell: let the attempt decide */
+    return rl.rlim_cur > 0;
+#else
+    /* Apple's time-constraint policy needs no privilege, so the attempt is the only judge. */
+    return true;
 #endif
 }
 

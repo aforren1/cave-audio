@@ -1,14 +1,14 @@
 # Device backends
 
-Status: **phases 0, 1 and 2 are implemented**; phases 3 to 5 are still specification. The engine has
-four sinks today: ASIO (`src/asio_sink.cpp`), WASAPI (`src/wasapi_sink.cpp`), null
-(`src/null_sink.c`), and manual (`src/manual_sink.c`), over the two shared pieces
-(`src/sink_convert.h`, `src/sink_quant.c`) that phase 0 built. The ABI those needed is in place:
-the appended `bwa_sink_type` values, `bwa_desc.device` and `sink_flags`, the backend-agnostic
-device query, and `bwa_health.device_lost`, all in the 0.14 minor bump. Phase 2 put the OS shim in
-(`src/os.h`, `src/os_win.c`, `src/os_posix.c`), so the library, the tests and the console examples
-build and pass with gcc and clang on Linux and macOS, on the null and manual sinks. What remains is
-the CoreAudio, AAudio, JACK, and ALSA backends.
+Status: **phases 0, 1, 2 and 5 are implemented**; phases 3 and 4 are still specification. The engine
+has six sinks today: ASIO (`src/asio_sink.cpp`), WASAPI (`src/wasapi_sink.cpp`), JACK
+(`src/jack_sink.c`), ALSA (`src/alsa_sink.c`), null (`src/null_sink.c`), and manual
+(`src/manual_sink.c`), over the two shared pieces (`src/sink_convert.h`, `src/sink_quant.c`) that
+phase 0 built. The ABI those needed is in place: the appended `bwa_sink_type` values,
+`bwa_desc.device` and `sink_flags`, the backend-agnostic device query, and `bwa_health.device_lost`,
+all in the 0.14 minor bump. Phase 2 put the OS shim in (`src/os.h`, `src/os_win.c`,
+`src/os_posix.c`), so the library, the tests and the console examples build and pass with gcc and
+clang on Linux and macOS. What remains is the AAudio and CoreAudio backends.
 
 Read [architecture.md](./architecture.md) for the bus seam first and
 [concurrency.md](./concurrency.md) for the audio-thread rules every backend inherits.
@@ -67,7 +67,7 @@ one more consumer of the bus. It must not touch the core.
 | AAudio    | Android 8.0 (API 26) and later | `AAudio*`                   | headphones on standalone VR headsets                       | 3 |
 
 Phase 2, between WASAPI and the rest, is the OS shim that lets the engine build off Windows at
-all. It is done: see [Phases](#phases).
+all. It is done, and so is phase 5: see [Phases](#phases).
 
 ### Linux and the array
 
@@ -219,7 +219,8 @@ dsp clock (`bwa_get_dsp_time_frames`, `bwa_source_play_at`) and the device-versu
 fit (`bwa_get_clock_model`). Definitions:
 
 - `sample_pos` is the **stream position of the block's first frame**: the number of frames the
-  sink has handed to the device before this block. Monotonic, frames, from stream start. This
+  sink has handed to the device before this block. Monotonic, frames, counted from the sink's
+  start. This
   is what ASIO's `samplePosition` is (the position of the buffer being filled), so the meaning
   does not move.
 - `system_time_ns` is the host monotonic clock at the moment the pair was captured, on the
@@ -426,6 +427,7 @@ library calls Win32 outside the sinks. The inventory, from a grep of `src/`:
 | `Interlocked*` on `volatile LONG`                           | engine.c (the hpeq handoff, the `cave_both` seqlock), assets.c, stream.c, steam_*.c, natnet.c, null_sink.c, profile_self.c | C11 `<stdatomic.h>`; MSVC already gets `/experimental:c11atomics` per file |
 | `_InterlockedExchange` intrinsics                           | pose.h                                                             | rewrite the seqlock on C11 atomics with acquire and release |
 | `SetThreadPriority(BELOW_NORMAL)`                           | steam_scene.c, steam_path.c, steam_reflect.c                       | `os_thread_lower_priority`            |
+| `AvSetMmThreadCharacteristics(L"Pro Audio")`                | wasapi_sink.cpp (was inline)                                       | `os_thread_set_realtime` / `_clear_realtime` |
 | `timeBeginPeriod`                                           | null_sink.c                                                        | Windows-only inside the shim, no-op elsewhere |
 | Winsock (`WSAStartup`, `socket`, `recvfrom`, `closesocket`) | natnet.c                                                           | a thin socket shim; BSD sockets need no startup and `close` |
 | `_strdup`, `_stricmp`                                       | engine.c, assets.c, stream.c, sound.c                              | `os_strdup`, `os_strcasecmp`          |
@@ -437,7 +439,8 @@ mechanical pass over about 40 files. Tests may include `src/os.h`, because they 
 in; examples are client code of the public ABI, so they get their own two-function
 `examples/portable.h` instead of reaching into `src/`.
 
-Four things the inventory above did not predict, found while implementing it:
+Six things the inventory above did not predict. Four were found while implementing phase 2, and
+two more came out of the macOS CI runner after it:
 
 - **`SRWLOCK` is not `CRITICAL_SECTION`.** `steam_scene.c` guards the committed `IPLScene` with a
   reader/writer lock: several sim threads borrow the scene for concurrent ray traces while the
@@ -458,6 +461,30 @@ Four things the inventory above did not predict, found while implementing it:
   key. On a POSIX filesystem `A.wav` and `a.wav` are different files and a backslash is an ordinary
   character in a name, so folding either there would hand one cache entry to two files. Both folds
   are now `_WIN32`-only, and the test section that pins them skips off Windows.
+- **Priority is not one call with three spellings.** `os_thread_set_realtime(period_ns)` is what
+  every SELF-PACED render thread now calls at its top, and the three platforms mean three different
+  things by it. Windows joins the "Pro Audio" MMCSS task, which the WASAPI sink used to ask for
+  inline. Linux asks for `SCHED_FIFO`, the one that can be REFUSED, which is why
+  `os_thread_realtime_available()` exists beside it: the ALSA sink has to report that degradation
+  through the open's `err` channel, and by the time its render thread exists that channel is gone.
+  Apple sets `THREAD_TIME_CONSTRAINT_POLICY`, and there it is not about priority at all: Darwin
+  COALESCES timers for threads without one, so a correct `mach_wait_until` lands milliseconds late
+  on an ordinary thread. The macOS CI runner measured p50 2.749 ms and p99 9.759 ms against a 2 ms
+  deadline, and `os_sleep_ms(50)` taking 100.7 ms, with the timebase conversions verified correct
+  in both directions. `period_ns` exists on the call for that platform alone.
+
+  The Windows effect is larger than it sounds, and it was measured rather than assumed: on a desk
+  machine pinned at 100 percent CPU by unrelated work, the same 200-wake measurement gave p50
+  12 to 18 ms on an ordinary thread and p50 0.407 ms with p99 0.811 ms on the MMCSS thread.
+- **The null sink stamped its own epoch, and a zero stamp reads as no stamp.** It used
+  `os_monotonic_ns() - base`, with `base` captured a few instructions earlier on the same thread.
+  Every other backend stamps the platform clock (`sink_quant_now_ns`, or QPC in the ASIO sink), so
+  this was the one backend with a private epoch. Worse, on a clock whose tick is coarse enough
+  (Apple Silicon's `mach_absolute_time` is 41.67 ns) the FIRST block's stamp came out exactly 0,
+  which `rt.c`'s publish gate reads as "no stamp": `bwa_get_clock` then had nothing until block 1,
+  and a late wake pushed that past the 30 ms window `test_smoke` allows. Windows and Linux avoided
+  it by clock resolution, not by design. The sink stamps the absolute monotonic clock now, and
+  `base` survives for the deadline arithmetic only.
 
 #### The absolute-deadline sleep
 
@@ -485,6 +512,13 @@ the clock there: the WASAPI event wait and the ASIO callback are untouched.
 machine gave 0.43 ms and 0.74 ms; WSL2 gave 0.13 ms and 0.33 ms. Forcing the pre-1803 fallback with
 the resolution left alone gave 5.6 ms and 13.0 ms, which is what the p50 assertion is there to
 catch.
+
+It measures ON A THREAD THAT ASKED FOR REAL-TIME, because that is how the sinks use the primitive,
+and on Darwin measuring anywhere else measures timer coalescing instead of the sleep. The Apple
+bound is deliberately gross, p50 under 20 ms and p99 under 50 ms: the tight bound exists to catch
+Windows losing its high-resolution timer path, Darwin has no counterpart to lose, and the only
+Apple data point anyone has is a virtualized CI runner. Tightening it wants a physical Mac, which
+is on the verify list.
 
 ## ABI changes
 
@@ -697,9 +731,9 @@ Open sequence:
    PipeWire config (`default.clock.quantum`), not the engine's.
 3. Register one output port per bus channel, `out_01` to `out_NN`, `JACK_DEFAULT_AUDIO_TYPE`,
    `JackPortIsOutput`. Register the process, xrun, and shutdown callbacks.
-4. `jack_activate` on `start()`, then connect: `jack_get_ports(device regex,
-   JACK_DEFAULT_AUDIO_TYPE, JackPortIsInput)`, physical ports when `device` is NULL, in order,
-   as many as the sink has. Fewer matching ports than channels is an error naming both counts.
+4. `jack_activate`, then connect: `jack_get_ports(device regex, JACK_DEFAULT_AUDIO_TYPE,
+   JackPortIsInput)`, physical ports when `device` is NULL, in order, as many as the sink has.
+   Fewer matching ports than channels is an error naming both counts.
 5. Read the playback latency range on the ports after connecting (rule 5).
 
 The process callback: `jack_get_cycle_times` for the pair, `quant_pull` with `nframes`,
@@ -707,10 +741,30 @@ copying each block channel into `jack_port_get_buffer` of its port. The xrun cal
 one dropout and converts `jack_get_xrun_delayed_usecs` to frames. The shutdown callback (the
 server went away) sets `device_lost` and starts the host-paced thread, per rule 4.
 
-Pin in build.md's Linux notes when this ships: the PipeWire graph rate and quantum
-(`default.clock.rate`, `default.clock.quantum`, and `clock.force-quantum` on a rig box). Note
-also that PipeWire links ports across devices with its own resampling, which would let
+The PipeWire graph rate and quantum are pinned in [build.md](./build.md), under "Linux notes".
+Note also that PipeWire links ports across devices with its own resampling, which would let
 `cave_both` be one 28-port client on Linux later; the two-sink design stands for now.
+
+Four things the implementation settled that the sequence above left open:
+
+- **Step 4 runs at `open()`, not at `start()`.** "The server offers 2 playback ports and this sink
+  has 26" is exactly the message a caller has to see, and `bwa_start` prints one fixed string for a
+  sink's `start()` failure while it surfaces an open failure verbatim. So the client activates and
+  connects during the open, and `start()` only lifts a gate that the process callback reads. Before
+  the gate opens, the callback writes silence into the ports, which is also what a patchbay wants to
+  see while the engine finishes starting.
+- **The xrun callback runs on a notification thread, not on the process thread.** It may not touch
+  the adapter's plain counters, so it parks the event and the frame estimate in two atomics and the
+  next process callback folds them in through `sink_quant_note_dropout`. Every count stays in one
+  place, and the whole thing stays race-free under ThreadSanitizer.
+- **The adapter never sees a device position.** JACK hands out exactly `nframes` every cycle, so
+  `written` telescopes to follow the server's frame counter and the queued-depth rule can never
+  fire. On a real xrun the server's counter jumps and that rule would report the same fault the
+  xrun callback already reported, so `quant_pull` is called with `device_pos_valid` clear and
+  `measured` is set from the xrun route instead.
+- **The buffer-size callback resizes nothing.** The adapter takes the count per pull, and its FIFO
+  is allocated for 8192 frames at open, so the callback only records the new size. A cycle larger
+  than that ceiling is silenced past it and booked as a dropout.
 
 ### ALSA
 
@@ -745,6 +799,36 @@ PipeWire and PulseAudio: their ALSA plugins answer `default`. Latency and timest
 theirs and are reported as they come. That is enough for a desk monitor, and on a PipeWire box
 AUTO has already tried JACK first. A rig on Linux uses a `hw:` device: a MADI or ADAT card, or
 the AES67 daemon's RAVENNA card, which is an ordinary ALSA PCM to the sink.
+
+Five things the implementation settled that the sequence above left open:
+
+- **Rule 3's pair is built from the PREVIOUS block's status.** `snd_pcm_status` can only be read
+  after a write, so the correspondence it gives, "the frame at `written - delay` was playing at
+  `htstamp`", stamps the NEXT block: that block starts `delay` frames later on the same stream, so
+  its host time is `htstamp + delay / rate`. The offset between a `sample_pos` and its host time is
+  then constant, which is all the drift fit needs. Before the first status, and after a restart, the
+  host clock stands in, and every stamp is floored at the previous one plus a nominal block so none
+  can step backward.
+- **`S24_LE` needs a conversion `sink_convert.h` does not carry.** The shared header's `int24` is
+  three packed bytes, which is `S24_3LE`. `S24_LE` is 24 valid bits inside a 32-bit container, so
+  the sink writes that container itself, from `sink_to_i32(v) >> 8`. The clamp and NaN rules stay in
+  the shared header, where the float becomes an integer; only the container is ALSA's business.
+- **The `SCHED_FIFO` question is asked at open, and answered on the thread.** The degradation has to
+  reach the caller through the open's `err` channel, and by the time the render thread exists that
+  channel is gone. So the open asks `os_thread_realtime_available()`, which reads `RLIMIT_RTPRIO`,
+  the same limit the kernel checks, and the render thread makes the actual
+  `os_thread_set_realtime()` attempt.
+- **`output_latency()` reports the buffer size until the first block.** The header promises a
+  constant, and `snd_pcm_delay` can only be read after a write, so the open's buffer-size figure
+  stands until the first successful write latches the measured delay in its place.
+- **`stop()` joins before it touches the PCM.** An `snd_pcm_t` is not thread-safe, so calling
+  `snd_pcm_drop` to cut short an in-flight `snd_pcm_writei` from the control thread is a race. The
+  wait costs one blocking write, which is one period.
+- **The device query SYNTHESIZES `default` when the hints do not carry it.**
+  `snd_device_name_hint` lists only PCMs that declare a hint block, and a `pcm.!default` in an
+  asoundrc declares none: that is exactly the PulseAudio and PipeWire plugin route, and every
+  user-defined default. So the one name `snd_pcm_open` always understands was missing from the
+  list. Index 0 is `default` whether or not a hint mentioned it.
 
 ### AAudio
 
@@ -839,9 +923,40 @@ what needs a device, and make the device-dependent part **skip visibly** rather 
   ctest skip code and the target carries `SKIP_RETURN_CODE 77`, so the dashboard says
   "skipped" and not "passed". The null and manual sections keep running everywhere.
 
-  The WASAPI section shipped with phase 1. Only the *specific* "no active render endpoint"
-  message skips; any other open failure is a failure, because a machine WITH audio that cannot
-  open it is exactly what the section exists to catch.
+  The WASAPI section shipped with phase 1 and the JACK and ALSA sections with phase 5. Only the
+  *specific* "there is no device" message skips ("no active render endpoint", "no jack server",
+  "no PCM named"); any other open failure is a failure, because a machine WITH audio that cannot
+  open it is exactly what the section exists to catch. The JACK section additionally skips on two
+  CONFIGURATIONS it cannot run against, a server at another rate and a server with fewer playback
+  ports than the run asked for, and prints the reason either way.
+
+  The results AGGREGATE across the sections: a failure anywhere fails, a section that actually ran
+  makes it a pass, and only "every device section had no device" reports the ctest skip. Returning
+  the first skip would hide a backend that ran beside one that could not.
+
+  Each section takes its device string from the environment (`BWA_TEST_ALSA_DEVICE`,
+  `BWA_TEST_JACK_PORTS`, plus `BWA_TEST_JACK_CHANNELS` for the width), so one binary reaches a
+  26-port rig, a dummy server, or a PulseAudio route without editing code. Do not point the ALSA
+  one at the hardware-free `null` PCM: it accepts writes as fast as they arrive and never paces, so
+  the device cannot run dry and the underrun assertion fails by construction. It rendered 257,811
+  blocks in the 470 ms a paced device spends on 76. Use it for the open sequence and the format
+  walk, nothing else.
+
+  Under ThreadSanitizer on Linux the suite reports ten races, and none is in a backend. Five are the
+  plain health counters in `sink_quant.c`, which `sink_quant.h` declares as a deliberate tradeoff
+  (monotonic counts nobody synchronizes on, kept a plain type so the file stays off MSVC's
+  `/experimental:c11atomics` list); a Linux backend is simply the first thing to exercise them under
+  the tool. Three are the sink test's own probe, read from the control thread while a sink runs, and
+  one is the `bwa_null_sink_skip_blocks` volatile int that `sink.h` documents for the same reason.
+  The last is inside a third-party `pthread_mutex_lock`. The JACK sink's xrun path reports nothing,
+  which is what the notification-thread parking above is for.
+
+  What the stall assertions can and cannot demand differs by backend, and the sections say which.
+  ALSA can demand both halves: `-EPIPE` is the device's own report, the stall outlasts the buffer by
+  a factor of two, and the frame estimate is a measurement. JACK can demand only the late block,
+  which the adapter times itself; whether the SERVER calls a late client an xrun is the server's
+  judgment, and a dummy or timer-driven backend need not. When no xrun arrives the section prints
+  that the xrun path went unexercised rather than passing quietly.
 - **The whole suite under `BWA_SINK_NULL` on `ubuntu-latest` and `macos-latest`** (phase 2,
   shipped). This is the port's regression gate: 30 tests at the default options, none of which
   touch a device. The two jobs sit in `ci.yml` beside the Windows one. They are cheap (no phonon
@@ -865,16 +980,14 @@ what needs a device, and make the device-dependent part **skip visibly** rather 
 | 2 **(done)** | `os.h` shim; the library, tests, and examples build with clang and gcc; Linux and macOS CI jobs on the null sink | nothing (independent of phase 1) | none | ~300 lines of shim, a pass over ~40 files |
 | 3     | AAudio sink; NDK toolchain wiring; phonon for Android; the bindings' Android packaging | phases 0 and 2         | a standalone headset        | ~300 lines plus the toolchain and packaging |
 | 4     | CoreAudio sink                                                         | phases 0 and 2                          | a Mac; the Digiface only for the optional 26-channel check | ~450 lines |
-| 5     | JACK sink, then ALSA sink                                              | phase 2                                 | a Linux box with a card, and one with PipeWire; the AES67 daemon and an AES67-mode Dante receiver for the array check | ~250 lines JACK, ~400 lines ALSA |
+| 5 **(done)** | JACK sink, then ALSA sink                                        | phase 2                                 | a Linux box with a card, and one with PipeWire; the AES67 daemon and an AES67-mode Dante receiver for the array check | ~250 lines JACK, ~400 lines ALSA |
 
 Phase 1 goes first because it fixes a live defect, removes a dependency for every desk user,
 and is the PC VR path. Phase 2 is independent of it and can run in parallel; it is mechanical
 and touches many files, so it wants its own review. Phases 3 to 5 depend only on phase 2 and
-not on each other, so their order is a scheduling choice; the one above follows the goals
-table: VR reach, then desk ease on the Mac, then Linux. CoreAudio is the cheapest of the three
-and can slot in whenever a Mac is at hand. The Linux experiments goal is partly served before
-phase 5 ships, by the offline shape in
-[Experiments from Psychtoolbox or PsychoPy](#experiments-from-psychtoolbox-or-psychopy).
+not on each other, so their order was a scheduling choice. Phase 5 went first of the three,
+because a Linux box with both a JACK server and an ALSA card was the hardware at hand. CoreAudio
+is the cheapest of the two that remain and can slot in whenever a Mac is available.
 
 ## What to update when implementing
 
@@ -925,6 +1038,10 @@ Known, deliberately not done yet. Each names its trigger.
 
 ## Verify before relying on it
 
+- [ ] `test_os` on a PHYSICAL Mac, so the Apple deadline bound can be tightened from the gross one
+      the coalescing evidence justifies. Everything Apple in the shim is CI-verified only: nobody
+      here has a Mac, and the `THREAD_TIME_CONSTRAINT_POLICY` call was written from the macOS CI
+      log plus the documentation.
 - [ ] The RME Digiface Dante's macOS driver: one CoreAudio device, 26 or more outputs at 48 kHz.
 - [ ] Whether the Digiface is USB Audio Class compliant, which decides if ALSA's `snd-usb-audio`
       sees it at all. RME's product page is the source; do not assume. (Even then it is a
@@ -935,7 +1052,27 @@ Known, deliberately not done yet. Each names its trigger.
 - [ ] `aes67-linux-daemon` and the RAVENNA ALSA kernel module build against the rig box's
       kernel, and their PTPv2 slave locks to the Dante leader in AES67 mode.
 - [ ] pipewire-jack on the box's PipeWire version honors a pinned quantum and reports port
-      latency; otherwise run JACK2's `jackd` on the card directly.
+      latency; otherwise run JACK2's `jackd` on the card directly. Everything verified so far ran
+      against JACK2's own `jackd` under WSL; pipewire-jack has never answered this sink.
+- [ ] The JACK sink against a REAL driver rather than `jackd -d dummy`. The dummy driver paces from
+      a timer, so what it cannot exercise is the xrun path (it never called the client late), the
+      port latency of a real card, and the buffer-size callback.
+- [x] The JACK shutdown path, by killing the server under a running engine. Verified against a
+      dummy `jackd` under WSL: `device_lost` set, the dsp clock kept advancing at real time on the
+      host-paced thread (23,808 frames in 500 ms against a nominal 24,000), and `bwa_stop` and
+      `bwa_destroy` both returned. What is still open is the same check on ALSA, where losing the
+      device means a write returning something other than `-EPIPE` or `-ESTRPIPE`, which needs real
+      hardware to unplug.
+- [ ] The ALSA sink against a REAL card. It has run against a `null` PCM (the API flow only, since
+      that PCM does not pace) and against the alsa-plugins PulseAudio route into WSLg, which is what
+      timed the blocks and produced the underruns. A `hw:` card is untested, and with it the whole
+      format walk past float32: `S32_LE`, `S24_3LE`, the `S24_LE` container, and `S16_LE` have
+      never converted a sample on a device that asked for them.
+- [ ] The ALSA sink at 26 channels. Every run so far was stereo, because no wide card was at hand.
+- [ ] `SCHED_FIFO` actually granted. Under WSL the `RLIMIT_RTPRIO` probe answers no and the sink
+      reports the degradation, which is the path that got exercised; the granted path has not run.
+- [ ] `-ESTRPIPE` recovery. A suspend needs a real power event to produce, so the resume loop and
+      its `driver_resyncs` tick are written and compiled but unexercised.
 - [ ] The minimum `IAudioClient3` shared period on the desk machine's driver. Onboard codecs
       often offer nothing under 10 ms; a 10 ms period is 480 frames at 48 kHz, so the monitor's
       added latency is one engine block plus that.

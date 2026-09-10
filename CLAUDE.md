@@ -71,8 +71,9 @@ include/bw_audio.h      Public C ABI (authoritative contract).
 src/
   engine.c             public ABI: lifecycle + sink + forwards per-frame calls to rt. [M0/M1/M2]
   rt.h / rt.c          rings, voice table, commit snapshot, generation handles, mixer. [M2]
-  sink.h / sink.c      device-sink abstraction + backend dispatch: the AUTO order (2-ch requests try
-                       WASAPI then ASIO, wider ones ASIO only) and the exact-match device rule. [M1/backends]
+  sink.h / sink.c      device-sink abstraction + backend dispatch: the AUTO order (Windows: 2-ch
+                       requests try WASAPI then ASIO, wider ones ASIO only. Linux: JACK then ALSA at
+                       every width) and the exact-match device rule. [M1/backends]
   sink_convert.h       planar float bus -> the device's format (f32/i32/i24/i16), planar or
                        interleaved. Moved out of asio_sink.cpp so every backend shares one set of
                        clamp + NaN rules. [backends]
@@ -82,6 +83,19 @@ src/
                        so nothing copies) and serves the device any count. Owns the per-block
                        timestamp rule, the written-versus-device-position dropout, and the
                        late_blocks/render_ns_peak accounting for every backend it serves. [backends]
+  jack_sink.c          JACK host (Linux): the production Linux path, and the one backend whose ports
+                       are PLANAR FLOAT already, so the bus copies straight out - no convert, no
+                       interleave. One JACK2 or pipewire-jack answers at RUN time; JackNoStartServer
+                       makes "no server" the fast fall-through to ALSA. Activates and connects at
+                       OPEN (that is where a port-count error can still reach the caller) and gates
+                       the render on start(). xruns arrive on a notification thread and are parked
+                       for the process thread to fold into the adapter. [backends p5]
+  alsa_sink.c          ALSA host (Linux): the no-server path - a raw `hw:` card for an experiment
+                       that wants the device clock, a MADI/AES67 card for a rig, a plug PCM for a
+                       desk monitor. The ONE backend with no fixed-quantum adapter: it writes, so it
+                       picks the size, and it writes whole engine blocks. Blocking snd_pcm_writei IS
+                       the pacing; -EPIPE is the underrun report; SCHED_FIFO is asked for and its
+                       refusal is a reported degradation, never a failure. [backends p5]
   null_sink.c          offline (no-hardware) sink: threaded silence + timestamps. [M1]
   manual_sink.c        offline/deterministic sink: no thread, the caller pumps (bwa_render_block). [M1]
   asio_sink.cpp        ASIO host: driver load, bufferSwitch, sample-pos timestamp. [M1]
@@ -152,9 +166,11 @@ src/
   natnet.c             OptiTrack pose ingest (off-wire, see docs/build.md). [M6]
   os.h / os_win.c / os_posix.c  the OS portability shim: every platform call the engine makes
                        OUTSIDE the sinks (threads, sleep + os_sleep_until_ns, the monotonic clock,
-                       mutex + rwlock, thread priority, strdup/strcasecmp, natnet's UDP sockets,
-                       BWA_EXPORT). Exactly one half compiles. Windows is the only platform with a
-                       device backend; elsewhere the library runs the null and manual sinks. [backends p2]
+                       mutex + rwlock, thread priority up (os_thread_set_realtime + its
+                       RLIMIT_RTPRIO probe) and down, strdup/strcasecmp, natnet's UDP sockets,
+                       BWA_EXPORT). Exactly one half compiles. Windows and Linux have device
+                       backends; macOS and Android run the null and manual sinks until phases 4
+                       and 3 land. [backends p2]
 test/                  ctest suite; targets are prefixed test_* (test_smoke, test_rt_core, test_rt_feature,
                        test_dsp, ...) so the built tools (bwa_*) and the tests sort apart in the bin dir.
                        The rt test is split: test_rt_core (concurrency/lifecycle spine) + test_rt_feature
@@ -184,9 +200,10 @@ third_party/           asiosdk/ (GPLv3 option, fetched not committed), steam-aud
 
 ## Build
 
-Target: **Windows only** (ASIO is Windows-only; the Digiface is Windows/macOS). CMake.
-A future cross-platform move means abstracting the device layer (ASIO is just the
-Windows sink) — do not bake any backend's assumptions outside its own `*_sink` file.
+Target: **Windows** is production (ASIO is Windows-only; the Digiface is Windows/macOS). CMake.
+Linux is a second host: JACK and ALSA are device backends there (docs/backends.md phase 5),
+macOS and Android build on the null/manual sinks until phases 4 and 3 land. Do not bake any
+backend's assumptions outside its own `*_sink` file.
 
 ```
 cmake -S . -B build -A x64      # default generator = newest installed Visual Studio
@@ -201,7 +218,9 @@ suite — 42 tests with the Steam Audio SDK, 37 without (the 5 SDK-gated ones ar
 `example_*` runs (the console examples driven with `--tests`: offline sink, short waits), all
 under their build flags. On Linux or macOS at the DEFAULT options it is 30: the GUI and ASIO
 capture tools are WIN32-only targets there, which drops their suites and the `validate_*` runs
-on top of the SDK-gated five. `rt.c` is the concurrency
+on top of the SDK-gated five. Phase 5 added no target, so that count is unchanged - the JACK and
+ALSA sections live inside `test_audio_sink`, and on a box with no server and no card that one test
+reports SKIPPED rather than passing. `rt.c` is the concurrency
 spine (two SPSC rings, voice + sound tables, commit snapshot, generation handles, retire-ack)
 and the whole `bwa_*` API forwards to it. Spatialization (the DBAP/SPCAP/VBAP gain solve,
 layout load, per-speaker align), calibration (`bwa_calibrate`, the Zylia capsule survey),
@@ -325,9 +344,12 @@ Regression-preventing gotchas. Each has bitten before or guards a real invariant
   to prevent. Both existing asmdefs also carried `noBwAudioReferences`, a mangled `noEngineReferences`
   that Unity silently ignores.
 - **Do not bake a backend's assumptions outside its own `*_sink` file.** ASIO is just the Windows
-  ARRAY sink and WASAPI just the Windows monitor sink; a future cross-platform move adds more
-  files behind the same seam and changes nothing else. The two shared pieces are deliberate
-  exceptions and carry no backend types: `sink_convert.h` and `sink_quant.c`.
+  ARRAY sink, WASAPI the Windows monitor sink, JACK and ALSA the Linux pair; the cross-platform
+  move added files behind the same seam and changed nothing else. The two shared pieces are
+  deliberate exceptions and carry no backend types: `sink_convert.h` and `sink_quant.c`. The one
+  thing that is NOT an exception is `alsa_sink.c`'s `S24_LE` interleave: the shared header's int24
+  is three PACKED bytes, and a 24-bit value in a 32-bit container is a different container, so the
+  sink writes the container itself and still takes its clamp and NaN rules from `sink_to_i32`.
 - **A device API that does not promise a fixed callback size must go through `sink_quant`.** ASIO
   is the only backend whose buffer size is fixed once buffers exist. WASAPI shared mode hands out
   `bufferFrameCount - GetCurrentPadding()`, which MOVES, and with the SDK the headphone decode is
@@ -469,7 +491,8 @@ freely. It still follows the US English rule above.
 - `docs/materials.md` — material/geometry model → Steam Audio occlusion + reflections → the bus.
 - `docs/integration.md` — Unity + Godot bindings + the per-engine coordinate seams; Unreal notes.
 - `docs/build.md` — platform, dependencies, licensing, Dante config.
-- `docs/backends.md` — SPEC (not implemented): WASAPI / CoreAudio / JACK / ALSA / AAudio sinks beside ASIO.
+- `docs/backends.md` — the sink contract + the backends beside ASIO. WASAPI (Windows), JACK + ALSA
+  (Linux) are IMPLEMENTED; CoreAudio and AAudio are still spec.
   The 10-rule sink contract (fixed quantum, timestamp pair, health, exact-rate policy), the fixed-quantum
   adapter, the OS shim inventory, the ABI bump (enum, `bwa_desc.device`, device query), AUTO order, phases.
   Linux reaches the array via AES67 into the Dante net (or a multichannel card); JACK is the Linux production

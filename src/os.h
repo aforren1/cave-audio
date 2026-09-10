@@ -62,6 +62,38 @@ bool os_thread_valid(const os_thread* t);
  * (a POSIX box with no permission to renice) simply runs the thread at normal priority. */
 void os_thread_lower_priority(void);
 
+/* Put the CALLING thread on the platform's real-time footing, for a render loop whose deadline is
+ * `period_ns`. Every SELF-PACED render thread calls this at its top and os_thread_clear_realtime
+ * before it returns: the null sink, the ALSA sink, and the WASAPI sink (whose event wait is
+ * device-paced but whose host-paced fallback is not).
+ *
+ * The three platforms mean three different things by it, and only one of them is about priority:
+ *
+ *   Windows  the "Pro Audio" MMCSS task, which is what the OS wants an audio thread to join;
+ *            THREAD_PRIORITY_TIME_CRITICAL if that is unavailable. `period_ns` is unused (MMCSS
+ *            takes a task name, not a period).
+ *   Linux    SCHED_FIFO through pthread_setschedparam. `period_ns` is unused (the policy is not
+ *            deadline-based). This is the one that can be REFUSED: an unprivileged process needs
+ *            RLIMIT_RTPRIO budget, so see os_thread_realtime_available below.
+ *   Apple    THREAD_TIME_CONSTRAINT_POLICY, which is what CoreAudio's own IO thread gets, and it
+ *            is not an optimization there: Darwin COALESCES timers for ordinary threads, so a
+ *            mach_wait_until on a plain thread lands milliseconds late however correct the
+ *            deadline arithmetic is. `period_ns` is the whole point of the call there.
+ *
+ * Returns 0 on success, or the platform error code. BEST EFFORT by contract: a refusal means the
+ * caller runs at normal priority, and it is the caller's business whether to say so. */
+int  os_thread_set_realtime(uint64_t period_ns);
+void os_thread_clear_realtime(void);   /* pair with a successful call, before the thread returns */
+
+/* Would os_thread_set_realtime succeed, without changing anything? Control thread.
+ *
+ * A sink asks BEFORE it starts its render thread, because the "running at normal priority"
+ * degradation has to reach the caller through the open's `err` channel (bwa_last_error after a
+ * successful bwa_start), and by the time the render thread exists that channel is gone. Linux
+ * reads RLIMIT_RTPRIO, which is exactly what the kernel checks; anywhere else it answers true and
+ * lets the attempt itself decide. */
+bool os_thread_realtime_available(void);
+
 /* ---- time ------------------------------------------------------------------------------- */
 
 void     os_sleep_ms(unsigned ms);

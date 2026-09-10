@@ -636,13 +636,19 @@ Embree (the SDK's `STEAMAUDIO_ENABLE_EMBREE` path) and ship `embree4.dll` + `tbb
 `bwa_desc.sink` decides which device backend opens. The full backend design, and the ones still
 to come, are in [backends.md](./backends.md).
 
-`BWA_SINK_AUTO` (the default) picks by channel count, because the two output paths want
-different hardware:
+`BWA_SINK_AUTO` (the default) picks per platform, and on Windows also by channel count, because
+there the two output paths want different hardware:
 
-| request                        | Windows order          |
-|--------------------------------|------------------------|
-| 2 channels (headphone profiles, the `cave_both` monitor) | WASAPI, ASIO, null |
-| more than 2 channels (the array) | ASIO, null           |
+| request                        | Windows order          | Linux order        |
+|--------------------------------|------------------------|--------------------|
+| 2 channels (headphone profiles, the `cave_both` monitor) | WASAPI, ASIO, null | JACK, ALSA, null |
+| more than 2 channels (the array) | ASIO, null           | JACK, ALSA, null   |
+
+The width does not split the Linux order, because nothing on Linux carries the "this transport is
+the array's" decision that ASIO carries on Windows: the same backend serves two channels and
+twenty-six. JACK goes first because it is the Linux production path, and `jack_client_open` carries
+`JackNoStartServer`, so a box with neither a JACK server nor PipeWire falls through to ALSA in
+about 4 ms instead of spawning a `jackd`.
 
 A headphone profile therefore opens the **Windows default output**, which is the device the
 headphones are on. That is the one behavior change from earlier versions: the old order picked
@@ -654,10 +660,16 @@ transport is a settled decision ([architecture.md](./architecture.md)).
 the profile finally opens both devices at once. The ASIO SDK holds one driver per process, which
 is why it could not before.
 
-Naming a backend is a **demand**. `BWA_SINK_ASIO` or `BWA_SINK_WASAPI` fails `bwa_start` loudly
-when the device does not open, instead of falling back to silence. A backend this build does not
-carry (`BWA_SINK_COREAUDIO`, `BWA_SINK_ALSA`, `BWA_SINK_AAUDIO`, `BWA_SINK_JACK` on Windows)
-fails with a message that says so.
+Naming a backend is a **demand**. `BWA_SINK_ASIO`, `BWA_SINK_WASAPI`, `BWA_SINK_JACK` and
+`BWA_SINK_ALSA` fail `bwa_start` loudly when the device does not open, instead of falling back to
+silence. A backend this build does not carry (`BWA_SINK_COREAUDIO` and `BWA_SINK_AAUDIO` anywhere,
+the Linux pair on Windows, the Windows pair on Linux) fails with a message that says so.
+
+`BWA_SINK_JACK` reads `bwa_desc.device` differently from every other backend, because JACK has
+ports rather than devices: there it is a `jack_get_ports` regular expression, such as
+`system:playback_` or `RAVENNA:playback_`, and NULL connects to the physical playback ports in
+order. The connections are a starting point. The patchbay can rewire them live, and the sink never
+reasserts them.
 
 `bwa_desc.device` names the device for whichever backend opens it. It matches **exactly** against
 the friendly name, then exactly against the stable id: no substring matching, because two
@@ -976,7 +988,8 @@ scheduled) never need wall time: keep the `start_sample` you passed to `play_at`
 visual when `bwa_get_dsp_time_frames` crosses `start + cue` (or poll `bwa_source_get_playhead_frames`).
 Events that originate on the **graphics side** need the wall→dsp mapping, and that is
 `bwa_get_clock`: the (output sample position, host time) pair the audio stack stamps inside each
-block callback (ASIO's `ASIOGetSamplePosition` pair, synthesized from QPC on the null sink).
+block callback (ASIO's `ASIOGetSamplePosition` pair; the platform's monotonic clock on the null
+sink).
 Because the pair is captured *in* the callback, the mapping
 `dsp_at(T) = sample + (T_ns − host_time_ns) · rate / 1e9` carries none of the
 block-plus-scheduling jitter that pairing `bwa_get_dsp_time_frames` with your own clock read does.

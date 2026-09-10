@@ -130,8 +130,9 @@ static int run_profile(bwa_profile profile, const char* name) {
     os_sleep_ms(30);                          /* let the audio thread(s) run several blocks */
 
     /* device clock pair + output latency through the full dll: the null sink stamps every block
-     * from QPC, so a (sample, host-time) pair must exist, sit at/behind the dsp clock, and advance
-     * with it; the null sink has no DAC, so its reported output latency must be 0. */
+     * with the platform monotonic clock, so a (sample, host-time) pair must exist, sit at/behind
+     * the dsp clock, and advance with it; the null sink has no DAC, so its reported output latency
+     * must be 0. */
     {
         uint64_t cs = 0, ct = 0;
         if (!bwa_get_clock(e, &cs, &ct) || ct == 0) {

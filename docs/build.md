@@ -8,13 +8,19 @@ ASIO is only the Windows sink for the **array**. Headphone output has a second W
 `cave_sim` open the Windows default output, and `cave_both` opens ASIO for the array and WASAPI
 for the monitor at the same time.
 
-**The library, the tests and the console examples also build on Linux and macOS**, with gcc or
-clang, on the **null and manual sinks**. That is the whole platform surface off Windows for now:
-there is no device backend, so nothing reaches a speaker. What it buys is the offline path
-(`bwa_render_block` renders bit-identically anywhere), a place to run ThreadSanitizer, and a CI
-gate that catches a Win32 call sneaking back into the core. CoreAudio, JACK, ALSA and AAudio are
-specified, not implemented, in [backends.md](./backends.md). Keep each backend's assumptions
-confined to its own `*_sink` file.
+**Linux has two device backends**, JACK (`src/jack_sink.c`) and ALSA (`src/alsa_sink.c`). JACK is
+the production path: one binary talks to a JACK2 server or to PipeWire through pipewire-jack, and
+which one answers is decided at run time by what the box has installed. ALSA is the no-server path,
+for an experiment that wants a raw card clock or a rig driving a multichannel card directly. Under
+`BWA_SINK_AUTO` a Linux box tries JACK, then ALSA, then the null sink, at any channel count. See
+[Linux notes](#linux-notes) below.
+
+**macOS builds the library, the tests and the console examples** with clang, on the **null and
+manual sinks**. That is the whole platform surface there for now: there is no device backend, so
+nothing reaches a speaker. What it buys is the offline path (`bwa_render_block` renders
+bit-identically anywhere), a place to run ThreadSanitizer, and a CI gate that catches a Win32 call
+sneaking back into the core. CoreAudio and AAudio are specified, not implemented, in
+[backends.md](./backends.md). Keep each backend's assumptions confined to its own `*_sink` file.
 
 Everything platform-specific OUTSIDE the sinks goes through one shim, `src/os.h`, with
 `src/os_win.c` and `src/os_posix.c` behind it: threads, sleep, the monotonic clock, an
@@ -76,6 +82,8 @@ Everything beyond the DLL + test suite is opt-in; the default build stays lean.
 | `BWA_BUILD_TESTS` | ON | the ctest suite (`test_*` targets) |
 | `BWA_WITH_ASIO` | OFF* | the ASIO backend. *Auto-flips ON when the SDK sits at `third_party/asiosdk/` |
 | `BWA_WITH_WASAPI` | ON | the WASAPI backend (headphone profiles, the `cave_both` monitor). Windows only, and forced OFF elsewhere. Needs no SDK: the headers ship with the Windows SDK, and it links `ole32` + `avrt` |
+| `BWA_WITH_JACK` | ON | the JACK backend. Linux only, and forced OFF elsewhere. Needs `pkg-config jack` to succeed (`libjack-jackd2-dev`, or pipewire-jack's development package); it turns itself off with a status line when that fails |
+| `BWA_WITH_ALSA` | ON | the ALSA backend. Linux only, and forced OFF elsewhere. Needs `find_package(ALSA)` to succeed (`libasound2-dev`); same self-disabling behavior |
 | `BWA_BUILD_PLAYGROUND` | OFF | `bwa_playground` + `bwa_layout_tool` (fetches raylib/rlImGui/imgui/test-engine) |
 | `BWA_BUILD_CALIBVIEW` | OFF | `bwa_calib_view` (fetches imgui/test-engine/implot/implot3d) |
 | `BWA_BUILD_CALIBRATE` | OFF | `bwa_calibrate` + `bwa_zylia_probe` |
@@ -114,6 +122,8 @@ What the SDK adds, and what you lose without it:
 | Steam Audio (C API)| binaural HRTF decode; occlusion, reflections (with baking), pathing - all implemented | Apache-2.0 (`steam-audio-source/LICENSE.md`) |
 | dr_libs (dr_wav 0.14.5 / dr_flac 0.13.3 / dr_mp3 0.7.3) | WAV/FLAC/MP3 decode (`sound.c`, `stream.c`) | public domain / MIT-0; FetchContent, pinned |
 | cJSON v1.7.19  | layout + calibration JSON                    | MIT; FetchContent, pinned                |
+| libjack        | the Linux JACK backend                       | LGPL-2.1, dynamically linked; pipewire-jack's drop-in (MIT) answers the same ABI |
+| alsa-lib       | the Linux ALSA backend                       | LGPL-2.1, dynamically linked             |
 | NatNet         | OptiTrack pose ingest                        | consume off-wire; see below              |
 
 Two dependencies live under `third_party/`: `asiosdk/`, and the Steam Audio pair
@@ -344,6 +354,69 @@ older UPM parsers reject. When git cannot answer (no tag, shallow clone, no git 
      public listing would invite installs into projects the GPLv3 would surprise). But
      the tarball IS what a registry would serve, so listing it later stays a config
      change rather than a rebuild. Preserving that costs nothing.
+
+## Linux notes
+
+Configuration the two Linux backends depend on. None of it is engine state: every item is a
+property of the box.
+
+### Real-time scheduling for the ALSA sink
+
+The ALSA sink owns its render thread and paces on blocking writes, so it asks for `SCHED_FIFO`. An
+unprivileged process gets it only when `RLIMIT_RTPRIO` allows the priority, which on most distros
+means membership of the `audio` group and a drop-in like this:
+
+```
+# /etc/security/limits.d/audio.conf
+@audio   -  rtprio     95
+@audio   -  memlock    unlimited
+```
+
+Log out and back in after adding yourself to the group. Without the budget the sink still opens and
+still runs, at normal priority, and it says so through `bwa_last_error` after a successful
+`bwa_start`. Treat that message as a warning that a busy desktop can starve the render thread, not
+as a failure.
+
+The JACK sink needs none of this. Its render callback runs on the server's process thread, which
+the server already put on `SCHED_FIFO`.
+
+### PipeWire graph rate and quantum
+
+PipeWire runs one graph for the whole box, and a JACK client joins it at the graph's rate and
+quantum. Two consequences.
+
+The rate must match `bwa_desc.sample_rate`, because a JACK client has no resampler. A desktop
+running its graph at 44.1 kHz fails the open with both rates named. Fix it in
+`~/.config/pipewire/pipewire.conf.d/10-clock.conf`:
+
+```
+context.properties = {
+    default.clock.rate     = 48000
+    default.clock.quantum  = 256
+}
+```
+
+The quantum is a preference the graph can move. Add `clock.force-quantum = 256` on a rig box to pin
+it. Pin it to the engine block size and the fixed-quantum adapter runs in pass-through, which costs
+no latency and no copy. Any other quantum works too, at one block of added latency.
+
+**The sink never calls `jack_set_buffer_size`.** On pipewire-jack that call forces the global
+quantum for every application on the box, which is the rig's decision to make in its own config,
+not the engine's.
+
+### Reaching the array
+
+Audinate ships no Dante host driver for Linux, so the Digiface plays no part in a Linux rig. Two
+routes reach 26 speakers, and the sink sees an ordinary card either way:
+
+- **A multichannel card wired to the amps.** A MADI or ADAT card with an in-kernel ALSA driver, or
+  a class-compliant USB interface. The Dante network is not involved.
+- **AES67 into the existing Dante network.** `aes67-linux-daemon` on the RAVENNA ALSA kernel module
+  presents a virtual ALSA card, and Dante devices in AES67 mode receive its multicast flows. The
+  configuration is on the Dante side, in Dante Controller. Nothing in a backend knows about AES67.
+
+[backends.md](./backends.md) has the full statement, including the hardware questions that are
+still open.
 
 ## Dante configuration
 

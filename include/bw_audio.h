@@ -118,7 +118,7 @@ typedef enum { BWA_DECODE_DEFAULT = 0,   /* reserved: the engine's current defau
  * to the silent offline sink - the engine keeps rendering with no device (the tools' visual-only
  * mode). On Windows a 2-channel request (the headphone profiles) tries WASAPI first, then ASIO;
  * a request wider than 2 channels (the array) tries ASIO only, because the array's transport is a
- * settled decision. Naming a backend is an explicit demand: an open failure fails bwa_start
+ * settled decision. On Linux it is JACK then ALSA at every width. Naming a backend is an explicit demand: an open failure fails bwa_start
  * loudly instead of hiding behind silence (production, or a speaker audition that must reach real
  * speakers), and a backend this build does not carry fails with a message saying so. NULL forces
  * the offline sink (CI, profiling, tracking-only tools). MANUAL creates no device and no thread.
@@ -129,9 +129,12 @@ typedef enum { BWA_SINK_AUTO = 0, BWA_SINK_ASIO = 1, BWA_SINK_NULL = 2,
                BWA_SINK_MANUAL = 3, /* no device/thread - pump blocks yourself with bwa_render_block */
                BWA_SINK_WASAPI = 4, /* Windows shared-mode (or exclusive, see BWA_SINK_FLAG_EXCLUSIVE) */
                BWA_SINK_COREAUDIO = 5,  /* macOS   - not in this build yet */
-               BWA_SINK_ALSA      = 6,  /* Linux   - not in this build yet */
+               BWA_SINK_ALSA      = 6,  /* Linux   - the no-server path: a raw hw: card, or a
+                                         * plug/server PCM for a desk monitor */
                BWA_SINK_AAUDIO    = 7,  /* Android - not in this build yet */
-               BWA_SINK_JACK      = 8,  /* Linux   - not in this build yet */
+               BWA_SINK_JACK      = 8,  /* Linux   - a JACK2 server or PipeWire through
+                                         * pipewire-jack; `device` is a PORT REGEX here, not a
+                                         * device name (JACK has ports, not devices) */
                BWA_SINK_FORCE_U32 = 0x7FFFFFFF } bwa_sink_type;
 
 /* bwa_desc.sink_flags bits. EXCLUSIVE takes the device away from every other application on the
@@ -534,7 +537,7 @@ BWA_API uint64_t bwa_get_dsp_time_frames(bwa_engine* e);
  * jitter-free wall<->dsp bridge for AV sync (pairing bwa_get_dsp_time_frames with your own clock read
  * carries up to a block of slack; this does not). Map with
  *   dsp_at(T) = dsp_sample + (T_ns - host_time_ns) * rate / 1e9,   then bwa_source_play_at.
- * host_time_ns rides a BACKEND-DEFINED epoch (null sink: from stream start) - anchor it against
+ * host_time_ns is the platform's monotonic clock on a BACKEND-DEFINED epoch - anchor it against
  * your own monotonic clock and refresh the offset per frame (clocks drift ~ppm). Returns false
  * (outputs untouched) until a host-stamped block renders; the manual sink stamps a nominal,
  * wall-free time (exact for arithmetic, not real wall time). Lock-free.

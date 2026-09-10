@@ -39,6 +39,12 @@ uint32_t sink_device_count(bwa_sink_type backend) {
 #ifdef BWA_HAVE_WASAPI
     case BWA_SINK_WASAPI: return sink_wasapi_device_count();
 #endif
+#ifdef BWA_HAVE_JACK
+    case BWA_SINK_JACK:   return sink_jack_device_count();
+#endif
+#ifdef BWA_HAVE_ALSA
+    case BWA_SINK_ALSA:   return sink_alsa_device_count();
+#endif
     default: return 0;   /* AUTO/NULL/MANUAL have no devices; so does a backend not built in */
     }
 }
@@ -51,6 +57,12 @@ bool sink_device_name(bwa_sink_type backend, uint32_t index, char* buf, uint32_t
 #endif
 #ifdef BWA_HAVE_WASAPI
     case BWA_SINK_WASAPI: return sink_wasapi_device_name(index, buf, cap);
+#endif
+#ifdef BWA_HAVE_JACK
+    case BWA_SINK_JACK:   return sink_jack_device_name(index, buf, cap);
+#endif
+#ifdef BWA_HAVE_ALSA
+    case BWA_SINK_ALSA:   return sink_alsa_device_name(index, buf, cap);
 #endif
     default: (void)index; return false;
     }
@@ -68,7 +80,34 @@ bool sink_device_id(bwa_sink_type backend, uint32_t index, char* buf, uint32_t c
 #ifdef BWA_HAVE_WASAPI
     case BWA_SINK_WASAPI: return sink_wasapi_device_id(index, buf, cap);
 #endif
+#ifdef BWA_HAVE_JACK
+    case BWA_SINK_JACK:   return sink_jack_device_id(index, buf, cap);
+#endif
+#ifdef BWA_HAVE_ALSA
+    case BWA_SINK_ALSA:   return sink_alsa_device_id(index, buf, cap);
+#endif
     default: (void)index; return false;
+    }
+}
+
+/* Does this build carry that backend at all? The AUTO loop asks so a missing one is SKIPPED
+ * silently, leaving the first real failure as the message a caller sees; an explicitly named
+ * backend goes through try_backend instead, which says "this build has no X backend" out loud. */
+static bool backend_compiled(bwa_sink_type t) {
+    switch (t) {
+#ifdef BWA_HAVE_ASIO
+    case BWA_SINK_ASIO:   return true;
+#endif
+#ifdef BWA_HAVE_WASAPI
+    case BWA_SINK_WASAPI: return true;
+#endif
+#ifdef BWA_HAVE_JACK
+    case BWA_SINK_JACK:   return true;
+#endif
+#ifdef BWA_HAVE_ALSA
+    case BWA_SINK_ALSA:   return true;
+#endif
+    default: return false;
     }
 }
 
@@ -104,6 +143,16 @@ static bwa_sink* try_backend(bwa_sink_type backend, uint32_t sample_rate, uint32
     case BWA_SINK_WASAPI:
         return bwa_wasapi_sink_open(sample_rate, block_size, channels, device, flags, exact_rate,
                                     render, user, msg, msgcap);
+#endif
+#ifdef BWA_HAVE_JACK
+    case BWA_SINK_JACK:
+        return bwa_jack_sink_open(sample_rate, block_size, channels, device, flags, exact_rate,
+                                  render, user, msg, msgcap);
+#endif
+#ifdef BWA_HAVE_ALSA
+    case BWA_SINK_ALSA:
+        return bwa_alsa_sink_open(sample_rate, block_size, channels, device, flags, exact_rate,
+                                  render, user, msg, msgcap);
 #endif
     default:
         break;
@@ -150,22 +199,35 @@ bwa_sink* bwa_sink_open(uint32_t sample_rate, uint32_t block_size, uint32_t chan
      * not whichever ASIO driver happens to be registered first — the old auto-pick could land on
      * the Digiface and play the monitor into Dante channels 1 and 2. Anything wider is the array,
      * and the array's transport is a locked decision: ASIO, or nothing. Multichannel WASAPI is
-     * never chosen here, because reaching it means an exclusive-mode grab of a WDM device. */
-    static const bwa_sink_type ORDER_STEREO[] = { BWA_SINK_WASAPI, BWA_SINK_ASIO };
-    static const bwa_sink_type ORDER_WIDE[]   = { BWA_SINK_ASIO };
-    const bwa_sink_type* order = (channels <= 2) ? ORDER_STEREO : ORDER_WIDE;
-    const uint32_t norder = (channels <= 2) ? 2u : 1u;
+     * never chosen here, because reaching it means an exclusive-mode grab of a WDM device.
+     *
+     * Off Windows the width does not split the order, because nothing on those platforms carries
+     * the "this transport is the array's" decision: the same backend serves two channels and
+     * twenty-six. The entries for backends a phase has not built yet are here on purpose - they
+     * are skipped by backend_compiled, and having the order already correct is what keeps landing
+     * one of those phases to a single file plus a CMake block. */
+    bwa_sink_type order[4];
+    uint32_t norder = 0;
+#if defined(_WIN32)
+    if (channels <= 2) order[norder++] = BWA_SINK_WASAPI;
+    order[norder++] = BWA_SINK_ASIO;
+#elif defined(__APPLE__)
+    order[norder++] = BWA_SINK_COREAUDIO;
+#elif defined(__ANDROID__)
+    if (channels <= 2) order[norder++] = BWA_SINK_AAUDIO;
+#elif defined(__linux__)
+    /* JACK first on Linux, at EVERY width. It is the production path (a rig box runs a server, and
+     * a desktop's PipeWire answers the same libjack), and jack_client_open carries JackNoStartServer
+     * so a box with neither falls through to ALSA in microseconds instead of forking a jackd. */
+    order[norder++] = BWA_SINK_JACK;
+    order[norder++] = BWA_SINK_ALSA;
+#endif
 
     char first_err[256] = {0};
     bool tried = false;               /* did any backend get as far as an open attempt? */
     for (uint32_t i = 0; i < norder; ++i) {
         const bwa_sink_type b = order[i];
-#if !defined(BWA_HAVE_ASIO)
-        if (b == BWA_SINK_ASIO) continue;
-#endif
-#if !defined(BWA_HAVE_WASAPI)
-        if (b == BWA_SINK_WASAPI) continue;
-#endif
+        if (!backend_compiled(b)) continue;             /* this build does not carry it */
         if (!backend_has_device(b, device)) continue;   /* rule 10: the name belongs to another backend */
 
         msg[0] = 0;

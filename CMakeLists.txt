@@ -25,6 +25,8 @@ set(CMAKE_C_STANDARD_REQUIRED ON)
 # the null and manual sinks, which is what the Linux and macOS CI jobs run. See docs/backends.md.
 if(WIN32)
   message(STATUS "bw_audio: Windows - ASIO and WASAPI backends available")
+elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+  message(STATUS "bw_audio: Linux - JACK and ALSA backends available")
 else()
   message(STATUS "bw_audio: ${CMAKE_SYSTEM_NAME} - null and manual sinks only (no device backend yet)")
 endif()
@@ -121,7 +123,9 @@ target_include_directories(bwa_core PUBLIC src include ${dr_libs_SOURCE_DIR} ${C
 # fact: the MSVC CRT carries the math functions and glibc does not.
 function(bwa_link_os target scope)
   if(WIN32)
-    target_link_libraries(${target} ${scope} ws2_32 winmm)   # ws2_32: the UDP shim; winmm: timeBeginPeriod
+    # ws2_32: the UDP shim. winmm: timeBeginPeriod. avrt: the "Pro Audio" MMCSS task every
+    # self-paced render thread joins through os_thread_set_realtime.
+    target_link_libraries(${target} ${scope} ws2_32 winmm avrt)
   else()
     find_package(Threads REQUIRED)
     target_link_libraries(${target} ${scope} Threads::Threads m)
@@ -252,11 +256,55 @@ if(BWA_WITH_WASAPI AND WIN32)
   target_compile_features(bw_audio PRIVATE cxx_std_20)
   target_sources(bw_audio PRIVATE src/wasapi_sink.cpp)
   target_compile_definitions(bw_audio PRIVATE BWA_HAVE_WASAPI)
-  target_link_libraries(bw_audio PRIVATE ole32 avrt)
+  target_link_libraries(bw_audio PRIVATE ole32)   # avrt comes from bwa_link_os (the MMCSS shim)
   message(STATUS "bw_audio: WASAPI backend ENABLED")
 else()
   set(BWA_WITH_WASAPI OFF)
   message(STATUS "bw_audio: WASAPI backend disabled (Windows only)")
+endif()
+
+# ---- JACK backend (Linux: the production path, and a PipeWire desktop) ----
+# No SDK to vendor. libjack is LGPL-2.1 and dynamically linked; pipewire-jack's drop-in libjack
+# (MIT) answers the same ABI, so which server the binary talks to is a RUN-TIME fact, not a build
+# one. ON wherever it can build, and it cannot be forced on elsewhere.
+option(BWA_WITH_JACK "Build the JACK backend (Linux only; needs libjack via pkg-config)" ON)
+if(BWA_WITH_JACK AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
+  find_package(PkgConfig QUIET)
+  if(PkgConfig_FOUND)
+    pkg_check_modules(BWA_JACK QUIET IMPORTED_TARGET jack)
+  endif()
+  if(BWA_JACK_FOUND)
+    target_sources(bw_audio PRIVATE src/jack_sink.c)
+    target_compile_definitions(bw_audio PRIVATE BWA_HAVE_JACK)
+    target_link_libraries(bw_audio PRIVATE PkgConfig::BWA_JACK)
+    message(STATUS "bw_audio: JACK backend ENABLED (libjack ${BWA_JACK_VERSION})")
+  else()
+    set(BWA_WITH_JACK OFF)
+    message(STATUS "bw_audio: JACK backend disabled (pkg-config found no jack; install libjack-jackd2-dev or pipewire-jack)")
+  endif()
+else()
+  set(BWA_WITH_JACK OFF)
+  message(STATUS "bw_audio: JACK backend disabled (Linux only)")
+endif()
+
+# ---- ALSA backend (Linux: the no-server path) ----
+# alsa-lib is LGPL-2.1, dynamically linked - one line in build.md's license inventory and nothing
+# else changes. Same rule as the two above: ON where it can build, unforceable elsewhere.
+option(BWA_WITH_ALSA "Build the ALSA backend (Linux only; needs alsa-lib)" ON)
+if(BWA_WITH_ALSA AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
+  find_package(ALSA QUIET)
+  if(ALSA_FOUND)
+    target_sources(bw_audio PRIVATE src/alsa_sink.c)
+    target_compile_definitions(bw_audio PRIVATE BWA_HAVE_ALSA)
+    target_link_libraries(bw_audio PRIVATE ALSA::ALSA)
+    message(STATUS "bw_audio: ALSA backend ENABLED (alsa-lib ${ALSA_VERSION_STRING})")
+  else()
+    set(BWA_WITH_ALSA OFF)
+    message(STATUS "bw_audio: ALSA backend disabled (find_package(ALSA) failed; install libasound2-dev)")
+  endif()
+else()
+  set(BWA_WITH_ALSA OFF)
+  message(STATUS "bw_audio: ALSA backend disabled (Linux only)")
 endif()
 
 # ---- optional Steam Audio backend (production binaural HRTF decode; later occlusion/reflections) ----
@@ -432,8 +480,9 @@ if(BWA_BUILD_TESTS)
   bwa_copy_runtime_dll(test_golden)
 
   # audio-loop check: drives the null sink directly (no core needed), plus one section per
-  # compiled device backend. The WASAPI section opens a live endpoint, so it is the one test here
-  # that can legitimately be unrunnable; it exits 77 (see SKIP_RETURN_CODE below) rather than pass.
+  # compiled device backend. Those sections open a live device (a WASAPI endpoint, a JACK server, an
+  # ALSA PCM), so they are the tests here that can legitimately be unrunnable; each exits 77 (see
+  # SKIP_RETURN_CODE below) rather than pass.
   add_executable(test_audio_sink test/audio_sink_test.c src/sink.c src/sink_quant.c
                  src/null_sink.c src/manual_sink.c ${BWA_OS_SRC})
   target_include_directories(test_audio_sink PRIVATE src include)
@@ -443,14 +492,25 @@ if(BWA_BUILD_TESTS)
     target_sources(test_audio_sink PRIVATE src/wasapi_sink.cpp)
     target_compile_definitions(test_audio_sink PRIVATE BWA_HAVE_WASAPI)
     target_compile_features(test_audio_sink PRIVATE cxx_std_20)
-    target_link_libraries(test_audio_sink PRIVATE ole32 avrt)
+    target_link_libraries(test_audio_sink PRIVATE ole32)
+  endif()
+  if(BWA_WITH_JACK)
+    target_sources(test_audio_sink PRIVATE src/jack_sink.c)
+    target_compile_definitions(test_audio_sink PRIVATE BWA_HAVE_JACK)
+    target_link_libraries(test_audio_sink PRIVATE PkgConfig::BWA_JACK)
+  endif()
+  if(BWA_WITH_ALSA)
+    target_sources(test_audio_sink PRIVATE src/alsa_sink.c)
+    target_compile_definitions(test_audio_sink PRIVATE BWA_HAVE_ALSA)
+    target_link_libraries(test_audio_sink PRIVATE ALSA::ALSA)
   endif()
   if(MSVC)   # the stall hook is a C11 atomic
     set_source_files_properties(test/audio_sink_test.c PROPERTIES COMPILE_OPTIONS /experimental:c11atomics)
   endif()
   add_test(NAME audio_sink COMMAND test_audio_sink)
-  # The WASAPI section opens a live endpoint. On a machine with no render endpoint (a CI runner)
-  # the sink fails cleanly and the test exits 77, which ctest reports as SKIPPED — never as a pass.
+  # The device sections open live devices. On a machine with none (a CI runner: no render endpoint,
+  # no JACK server, no sound card) each sink fails cleanly and the test exits 77, which ctest
+  # reports as SKIPPED — never as a pass.
   set_tests_properties(audio_sink PROPERTIES SKIP_RETURN_CODE 77)
 
   # The shared bus->device conversion (src/sink_convert.h): header-only, so the test needs nothing

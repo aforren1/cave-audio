@@ -68,6 +68,13 @@ static void null_thread(void* arg) {
     const uint64_t budget_ns = (uint64_t)s->block_size * 1000000000ull / (uint64_t)s->sample_rate;
     uint64_t sample_pos = 0, block_index = 0, predicted_pos = 0;
 
+    /* This loop has a real deadline, so it asks for the platform's real-time footing like any other
+     * render thread. Best effort, and the return value is deliberately ignored: an offline sink
+     * that could not get it just runs at normal priority, and there is no caller to tell. On Darwin
+     * the call is what exempts the pacing wait from timer coalescing, which is why an OFFLINE sink
+     * wants it at all. */
+    const bool rt = os_thread_set_realtime(budget_ns) == 0;
+
     while (!atomic_load_explicit(&s->stop_flag, memory_order_relaxed)) {
         /* The injected skip (bwa_null_sink_skip_blocks) advances the reported position without
          * rendering those blocks — what a starved device looks like from in here. */
@@ -85,9 +92,17 @@ static void null_thread(void* arg) {
         }
         predicted_pos = sample_pos + s->block_size;
 
+        /* The ABSOLUTE monotonic clock, not an offset from thread start. Two reasons, and the
+         * second is a bug this had. Every other backend stamps the platform clock (the WASAPI sink
+         * through sink_quant_now_ns, the ASIO sink through QPC), so subtracting `base` here made
+         * the null sink the one backend with its own epoch. And on a clock whose tick is coarse
+         * enough - Apple Silicon's mach_absolute_time is 41.67 ns - the FIRST block's stamp came
+         * out exactly 0, which rt.c's publish gate reads as "no stamp"; bwa_get_clock then had no
+         * pair until block 1, and a late wake on a loaded machine pushed that past the 30 ms window
+         * the smoke test allows. Caught by the macOS CI runner, not by review. */
         bwa_timestamp ts = {
             .sample_pos     = sample_pos,
-            .system_time_ns = os_monotonic_ns() - base,
+            .system_time_ns = os_monotonic_ns(),
         };
         BWA_ZONE_BEGIN(zb, "null block");
         const uint64_t t0 = os_monotonic_ns();
@@ -125,6 +140,8 @@ static void null_thread(void* arg) {
             os_sleep_until_ns(piece < deadline ? piece : deadline);
         }
     }
+
+    if (rt) os_thread_clear_realtime();
 }
 
 static int null_start(bwa_sink* base) {

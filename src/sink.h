@@ -13,6 +13,10 @@
  *   - null_sink.c  (always built): a threaded *offline* sink that paces blocks from
  *                  a high-resolution clock and discards the audio. Lets the engine
  *                  run with no hardware (desk dev, CI, the `binaural` array path).
+ *   - jack_sink.c  (BWA_HAVE_JACK):   Linux, a JACK2 server or PipeWire through pipewire-jack.
+ *                  Planar float ports, so the bus copies straight out with no conversion.
+ *   - alsa_sink.c  (BWA_HAVE_ALSA):   Linux, the no-server path. The one backend that needs no
+ *                  fixed-quantum adapter: it writes, so it picks the size.
  *   - manual_sink.c (always built): no thread; the caller pumps blocks (bwa_render_block).
  *
  * Two shared pieces sit under the backends rather than inside one of them: sink_convert.h (the
@@ -133,7 +137,8 @@ struct bwa_sink { const bwa_sink_vtbl* vt; };
 
 /* Open a sink for this format per `sink_type`. AUTO tries the platform's backends in the order
  * docs/backends.md fixes (on Windows: WASAPI then ASIO for a 2-channel request, ASIO only when
- * wider, then the null sink either way); a named backend is a demand and its failure returns
+ * wider; on Linux: JACK then ALSA at every width; then the null sink either way); a named backend
+ * is a demand and its failure returns
  * NULL. `device` names the device for whichever backend opens (NULL = that backend's default;
  * matched exactly against the name then the id, and under AUTO a backend with no such device is
  * skipped). `flags` is bwa_desc.sink_flags. `exact_rate` set means the device MUST run at
@@ -202,6 +207,49 @@ bool     sink_wasapi_device_id  (uint32_t index, char* buf, uint32_t cap);
  * which of the two cases the machine it runs on presents. Control thread, on an open sink. */
 uint32_t sink_wasapi_device_frames(bwa_sink* s);
 uint32_t sink_wasapi_period_frames(bwa_sink* s);
+#endif
+
+#ifdef BWA_HAVE_JACK
+/* The Linux production path: a JACK2 server or PipeWire through pipewire-jack, decided at run time
+ * by what the box has installed. `device` is a jack_get_ports REGEX, not a device name (JACK has
+ * ports, not devices); NULL connects to the physical playback ports in order. */
+bwa_sink* bwa_jack_sink_open(uint32_t sample_rate, uint32_t block_size, uint32_t channels,
+                          const char* device /* NULL = the physical playback ports */,
+                          uint32_t flags, bool exact_rate,
+                          bwa_render_fn render, void* user, char* err, size_t errcap);
+/* The distinct client prefixes of the physical playback ports ("system", "RAVENNA"), one device
+ * each, so a picker offers the card rather than 26 ports. The prefix IS the id. Control thread;
+ * opens a throwaway client, because asking the server anything needs a connection. */
+uint32_t sink_jack_device_count(void);
+bool     sink_jack_device_name(uint32_t index, char* buf, uint32_t cap);
+bool     sink_jack_device_id  (uint32_t index, char* buf, uint32_t cap);
+/* TEST/DIAGNOSTIC readback, internal on purpose (not in bw_audio.h): the server's current buffer
+ * size. The sink test needs it to size a deliberate stall and to say whether the adapter ran in
+ * pass-through. Control thread, on an open sink. */
+uint32_t sink_jack_period_frames(bwa_sink* s);
+uint32_t sink_jack_connected_ports(bwa_sink* s);
+bool     sink_jack_is_realtime(bwa_sink* s);
+#endif
+
+#ifdef BWA_HAVE_ALSA
+/* The Linux no-server path: a raw card (`hw:`, an exact device clock for an onset-precision
+ * experiment or a rig's MADI/AES67 card) or a plug/server PCM for a desk monitor. `device` is the
+ * PCM name; NULL opens `default`. The one backend with no fixed-quantum adapter: it writes, so it
+ * chooses the size, and it writes whole engine blocks. */
+bwa_sink* bwa_alsa_sink_open(uint32_t sample_rate, uint32_t block_size, uint32_t channels,
+                          const char* device /* NULL = the PCM named "default" */,
+                          uint32_t flags, bool exact_rate,
+                          bwa_render_fn render, void* user, char* err, size_t errcap);
+/* snd_device_name_hint's output-capable PCMs: NAME is the id, DESC's first line the friendly name,
+ * and `default` is listed first because ALSA has no other default. Control thread, opens nothing. */
+uint32_t sink_alsa_device_count(void);
+bool     sink_alsa_device_name(uint32_t index, char* buf, uint32_t cap);
+bool     sink_alsa_device_id  (uint32_t index, char* buf, uint32_t cap);
+/* TEST/DIAGNOSTIC readback, internal on purpose (not in bw_audio.h): what the device settled on.
+ * The sink test needs the buffer depth to size a stall that certainly underruns - the same reason
+ * the WASAPI pair above exists. Control thread, on an open sink. */
+uint32_t sink_alsa_period_frames(bwa_sink* s);
+uint32_t sink_alsa_buffer_frames(bwa_sink* s);
 #endif
 
 #endif /* BWA_SINK_H */

@@ -10,6 +10,7 @@
 #include <ws2tcpip.h>
 #include <windows.h>
 #include <timeapi.h>       /* timeBeginPeriod / timeEndPeriod (link winmm) */
+#include <avrt.h>          /* AvSetMmThreadCharacteristics: the "Pro Audio" MMCSS task (link avrt) */
 
 #include <stdlib.h>
 #include <string.h>
@@ -52,6 +53,42 @@ bool os_thread_valid(const os_thread* t) { return t && t->h != NULL; }
 void os_thread_lower_priority(void) {
     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
 }
+
+/* MMCSS, not a raw priority. "Pro Audio" is the task class the OS reserves for audio work: it
+ * lifts the thread above the normal scheduler classes for its share of each period, which is what
+ * an audio thread is supposed to ask for and what the WASAPI sink asked for inline before this
+ * moved behind the seam. THREAD_PRIORITY_TIME_CRITICAL is the fallback for a system where MMCSS
+ * refuses (the service is disabled), because a self-paced render loop still needs to outrank
+ * ordinary work. `period_ns` has no place in either: MMCSS takes a task name.
+ *
+ * Thread-local, because the handle belongs to the thread that joined the task and only that thread
+ * may revert it. */
+static __declspec(thread) HANDLE  g_mmcss      = NULL;
+static __declspec(thread) int     g_prio_raised = 0;
+
+int os_thread_set_realtime(uint64_t period_ns) {
+    (void)period_ns;
+    if (!g_mmcss) {
+        DWORD index = 0;
+        g_mmcss = AvSetMmThreadCharacteristicsW(L"Pro Audio", &index);
+    }
+    if (g_mmcss) return 0;
+    if (SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL)) {
+        g_prio_raised = 1;
+        return 0;
+    }
+    return (int)GetLastError();
+}
+
+void os_thread_clear_realtime(void) {
+    if (g_mmcss) { AvRevertMmThreadCharacteristics(g_mmcss); g_mmcss = NULL; }
+    if (g_prio_raised) {
+        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_NORMAL);
+        g_prio_raised = 0;
+    }
+}
+
+bool os_thread_realtime_available(void) { return true; }
 
 /* ---- time ---- */
 

@@ -13,6 +13,7 @@
 #include "sink.h"
 
 #include <stdio.h>
+#include <stdlib.h>       /* getenv: every device section's device string is overridable */
 #include <string.h>
 
 #include "os.h"
@@ -285,6 +286,362 @@ static int test_wasapi(void) {
 }
 #endif /* BWA_HAVE_WASAPI */
 
+#ifdef BWA_HAVE_JACK
+/* Rule 6 says a rate-mismatch message must carry the device's rate AND the engine's, because "it
+ * did not work" is not actionable and "it runs at 44100 and you asked for 48000" is. Both Linux
+ * sections check that the same way. */
+static int names_both_rates(const char* msg, uint32_t engine_rate, uint32_t other_rate) {
+    char a[32], b[32];
+    snprintf(a, sizeof a, "%u", engine_rate);
+    snprintf(b, sizeof b, "%u", other_rate);
+    return strstr(msg, a) != NULL && strstr(msg, b) != NULL;
+}
+#endif
+
+#ifdef BWA_HAVE_ALSA
+/* The same rule where only ONE of the two rates is known to the test: the requested rate must be
+ * named, and so must a device rate, whatever the device chose to report. So: the message names the
+ * request, and "runs at <n> Hz" names an n that is a real rate and not the request. */
+static int rejects_naming_both(const char* msg, uint32_t requested) {
+    char want[32];
+    snprintf(want, sizeof want, "%u", requested);
+    if (!strstr(msg, want)) return 0;
+    const char* at = strstr(msg, "runs at ");
+    if (!at) return 0;
+    const unsigned long dev = strtoul(at + 8, NULL, 10);
+    return dev > 0 && dev != (unsigned long)requested;
+}
+#endif
+
+#ifdef BWA_HAVE_JACK
+/* The JACK section. Same contract as the null sink above, against a live server: a stable callback
+ * at a CONSTANT nframes equal to block_size (the adapter's whole job, since the server's cycle need
+ * not be the engine block), monotonic position and time, measured health, a deliberate stall, a
+ * rate-mismatch open that must fail loudly, and a stop and close that return.
+ *
+ * BWA_TEST_JACK_PORTS overrides the port regex (the default is the physical playback ports) and
+ * BWA_TEST_JACK_CHANNELS the width, so one binary reaches a 26-port rig, a dummy server, or a
+ * PipeWire desktop without editing code.
+ *
+ * Returns 0 (ok), 1 (failed), or SKIP_EXIT when there is no server to talk to. */
+static int test_jack(void) {
+    const uint32_t SR = 48000, BS = 256;
+    const char* ports = getenv("BWA_TEST_JACK_PORTS");
+    if (ports && !*ports) ports = NULL;
+    uint32_t ch = 2;
+    {
+        const char* e = getenv("BWA_TEST_JACK_CHANNELS");
+        if (e) {
+            const long v = strtol(e, NULL, 10);
+            if (v >= 1 && v <= (long)BWA_CHANNELS) ch = (uint32_t)v;
+        }
+    }
+
+    Probe p;
+    probe_init(&p, ch);
+    char err[256] = {0};
+
+    bwa_sink* s = bwa_jack_sink_open(SR, BS, ch, ports, 0, false, on_render, &p, err, sizeof err);
+    if (!s) {
+        if (!err[0]) { fprintf(stderr, "FAIL: jack open failed with no message\n"); return 1; }
+        /* No server is the CI runner and any box without JACK or PipeWire. A server at another
+         * rate, or with fewer playback ports than this run asked for, is a CONFIGURATION the
+         * section cannot run against rather than a broken sink. All three skip, visibly, with the
+         * reason printed; anything else is a failure. */
+        if (strstr(err, "no jack server")) { printf("SKIP: %s\n", err); return SKIP_EXIT; }
+        if (strstr(err, "not the engine's")) {
+            char want[32];
+            snprintf(want, sizeof want, "%u Hz", SR);
+            if (!strstr(err, want)) {
+                fprintf(stderr, "FAIL: the rate-mismatch message does not name the engine rate: %s\n", err);
+                return 1;
+            }
+            printf("SKIP: %s\n", err);
+            return SKIP_EXIT;
+        }
+        if (strstr(err, "playback port")) { printf("SKIP: %s\n", err); return SKIP_EXIT; }
+        fprintf(stderr, "FAIL: jack open: %s\n", err);
+        return 1;
+    }
+    if (err[0]) printf("jack: opened with a degradation reported: %s\n", err);
+
+    const char* backend = bwa_sink_backend(s);
+    const uint32_t block   = bwa_sink_block_size(s);
+    const uint32_t latency = bwa_sink_output_latency(s);
+    const uint32_t period  = sink_jack_period_frames(s);
+    int ok = 1;
+    if (bwa_sink_type_of(s) != BWA_SINK_JACK) {
+        fprintf(stderr, "FAIL: jack sink reports the wrong backend type\n");
+        bwa_sink_close(s); return 1;
+    }
+    if (strncmp(backend, "jack:", 5) != 0) {
+        fprintf(stderr, "FAIL: backend string is '%s', want \"jack:<client prefix>\"\n", backend);
+        bwa_sink_close(s); return 1;
+    }
+    if (bwa_sink_start(s) != 0) { fprintf(stderr, "FAIL: jack start\n"); bwa_sink_close(s); return 1; }
+
+    /* --- phase 1: a healthy run ---
+     *
+     * Gated on the SERVER running its graph in real-time mode, which is the only configuration
+     * where a clean 200 ms was ever on offer. A server started with --no-realtime (jackd under WSL,
+     * where mlock and SCHED_FIFO are both refused) puts its process thread in the ordinary
+     * scheduler band, and a busy host then makes the client late through no fault of the sink.
+     * Measured: at 26 channels on such a box, this assertion passed on some runs and counted 1 to 4
+     * xruns on others. Reported rather than asserted there. */
+    const bool srv_rt = sink_jack_is_realtime(s);
+    os_sleep_ms(200);                                   /* ~37 blocks at 256/48000 = 5.33 ms */
+    bwa_sink_health h1;
+    bwa_sink_get_health(s, &h1);
+    if (h1.dropouts != 0) {
+        if (srv_rt) {
+            fprintf(stderr, "FAIL: %llu xruns on a healthy 200 ms run\n",
+                    (unsigned long long)h1.dropouts); ok = 0;
+        } else {
+            printf("  NOTE: %llu xruns on the healthy 200 ms run, on a server that is NOT in "
+                   "real-time mode; not asserted (see the comment).\n",
+                   (unsigned long long)h1.dropouts);
+        }
+    }
+
+    /* --- phase 2: stall the process callback past a full cycle on purpose --- */
+    const unsigned stall_ms = (period ? (4u * period * 1000u / SR) : 20u) + 20u;
+    atomic_store_explicit(&p.stall_ms_once, (int)stall_ms, memory_order_relaxed);
+    os_sleep_ms(200u + stall_ms);
+
+    bwa_sink_stop(s);                             /* closes the render gate */
+    os_sleep_ms(20);                              /* let the cycle that was in flight finish */
+
+    const unsigned long blocks = p.blocks;
+    if (blocks < 10) { fprintf(stderr, "FAIL: %lu blocks in 200 ms, want at least 10\n", blocks); ok = 0; }
+    if (block != BS) { fprintf(stderr, "FAIL: block_size() is %u, want the engine's %u\n", block, BS); ok = 0; }
+    if (!p.nframes_stable || p.nframes_first != BS) {
+        fprintf(stderr, "FAIL: nframes varied or was not the block size (first=%u, stable=%d)\n",
+                p.nframes_first, p.nframes_stable); ok = 0;
+    }
+    if (!p.time_monotonic) { fprintf(stderr, "FAIL: system_time_ns not monotonic\n"); ok = 0; }
+    if (!p.pos_monotonic)  { fprintf(stderr, "FAIL: sample_pos not monotonic\n");     ok = 0; }
+    if (p.last_sample_pos != (uint64_t)BS * (blocks - 1)) {
+        fprintf(stderr, "FAIL: sample_pos drift (last=%llu, expected=%llu)\n",
+                (unsigned long long)p.last_sample_pos, (unsigned long long)((uint64_t)BS * (blocks - 1)));
+        ok = 0;
+    }
+    if (latency == 0) {
+        fprintf(stderr, "FAIL: no playback latency read back from the connected ports\n"); ok = 0;
+    }
+    /* The routing landed, said directly rather than inferred from a nonzero latency. Every output
+     * port must reach a playback port, or that bus channel is audible nowhere. */
+    const uint32_t connected = sink_jack_connected_ports(s);
+    if (connected != ch) {
+        fprintf(stderr, "FAIL: %u of %u output ports are connected to a playback port\n", connected, ch);
+        ok = 0;
+    }
+
+    bwa_sink_health h;
+    bwa_sink_get_health(s, &h);
+    if (!h.measured) { fprintf(stderr, "FAIL: the server reports xruns directly, so measured must be true\n"); ok = 0; }
+    if (h.blocks != blocks) {
+        fprintf(stderr, "FAIL: health counted %llu blocks, the probe saw %lu\n",
+                (unsigned long long)h.blocks, blocks); ok = 0;
+    }
+    if (h.device_lost) { fprintf(stderr, "FAIL: the server was reported gone during a clean run\n"); ok = 0; }
+    if (h.period_ns == 0) { fprintf(stderr, "FAIL: no block period to measure the budget against\n"); ok = 0; }
+    /* Both counts are demanded, and both were confirmed against jackd's dummy driver, which does
+     * call a stalled client late (JackTimedDriver::Process XRun). A server that stayed silent
+     * through a stall of several cycles would be the finding, not a reason to soften this. */
+    if (h.late_blocks < 1) {
+        fprintf(stderr, "FAIL: a %u ms stall inside render() was not counted as a late block\n", stall_ms);
+        ok = 0;
+    }
+    if (h.dropouts < 1) {
+        fprintf(stderr, "FAIL: the process callback was stalled %u ms, past %u cycles, and the "
+                        "server reported no xrun\n", stall_ms, 4u); ok = 0;
+    }
+
+    printf("jack OK: backend=%s blocks=%lu block=%u period=%u latency=%u frames, %u/%u ports "
+           "connected, server %s%s\n",
+           backend, blocks, block, period, latency, connected, ch,
+           srv_rt ? "REALTIME" : "not realtime",
+           (period == block) ? " (adapter in pass-through)" : "");
+    printf("  measured=%d xruns=%llu dropped=%llu late=%llu resyncs=%llu (stall %u ms injected)\n",
+           h.measured ? 1 : 0, (unsigned long long)h.dropouts, (unsigned long long)h.dropped_frames,
+           (unsigned long long)h.late_blocks, (unsigned long long)h.driver_resyncs, stall_ms);
+    if (h.dropouts >= 1 && h.dropped_frames == 0) {
+        /* NOT a failure, and worth saying rather than asserting away. dropped_frames is the
+         * SERVER'S own measure (jack_get_xrun_delayed_usecs), and it can legitimately round to
+         * zero frames: jackd's dummy driver reported a 41 ms client stall as 19 us of graph
+         * lateness, which is under one frame at 48 kHz. The event count is the trustworthy half
+         * on this backend; ALSA's estimate, which the sink measures itself, is not. */
+        printf("  NOTE: the server measured the xrun as under one frame of delay, so dropped=0 is "
+               "its own number and not a lost count.\n");
+    }
+    bwa_sink_close(s);                            /* must return, not hang */
+
+    /* --- rule 6: a rate the server does not run must fail the open, naming BOTH rates --- */
+    {
+        const uint32_t other = 44100;
+        Probe q;
+        probe_init(&q, ch);
+        char e2[256] = {0};
+        bwa_sink* bad = bwa_jack_sink_open(other, BS, ch, ports, 0, false, on_render, &q, e2, sizeof e2);
+        if (bad) {
+            fprintf(stderr, "FAIL: a %u Hz open succeeded against a %u Hz server; JACK has no "
+                            "per-client resampler\n", other, SR);
+            bwa_sink_close(bad);
+            ok = 0;
+        } else if (!names_both_rates(e2, other, SR)) {
+            fprintf(stderr, "FAIL: the rate-mismatch message names only one rate: %s\n",
+                    e2[0] ? e2 : "(no message)");
+            ok = 0;
+        } else {
+            printf("  rate mismatch rejected: %s\n", e2);
+        }
+    }
+    return ok ? 0 : 1;
+}
+#endif /* BWA_HAVE_JACK */
+
+#ifdef BWA_HAVE_ALSA
+/* The ALSA section. Same contract, against a live PCM, with two differences that follow from the
+ * backend: there is no fixed-quantum adapter (the sink writes, so it picks the size, and the
+ * assertion below still pins that the size is the engine block), and a stall long enough to drain
+ * the buffer produces a real -EPIPE underrun, which the sink must count WITH a frame estimate.
+ *
+ * BWA_TEST_ALSA_DEVICE overrides the PCM name (the default is "default"), so one binary reaches
+ * "pulse", "plughw:0,0" or a rig's "hw:" card without editing code. Do NOT point it at the
+ * hardware-free "null" PCM: that one accepts writes as fast as they arrive and never paces, so the
+ * device cannot run dry and the underrun assertion below fails by construction. Measured: 257,811
+ * blocks in the same 470 ms a paced device renders 76 in. It is good for the open sequence and the
+ * format walk, nothing else.
+ *
+ * Returns 0 (ok), 1 (failed), or SKIP_EXIT when there is no PCM to open. */
+static int test_alsa(void) {
+    const uint32_t SR = 48000, BS = 256;
+    const char* dev = getenv("BWA_TEST_ALSA_DEVICE");
+    if (dev && !*dev) dev = NULL;
+
+    Probe p;
+    probe_init(&p, 2);
+    char err[256] = {0};
+
+    bwa_sink* s = bwa_alsa_sink_open(SR, BS, 2, dev, 0, false, on_render, &p, err, sizeof err);
+    if (!s) {
+        if (!err[0]) { fprintf(stderr, "FAIL: alsa open failed with no message\n"); return 1; }
+        /* "no PCM named" is the CI runner and any box with no sound card. Anything else is a real
+         * failure: a machine WITH a card that cannot open it is what this section exists to catch. */
+        if (strstr(err, "no PCM named")) { printf("SKIP: %s\n", err); return SKIP_EXIT; }
+        fprintf(stderr, "FAIL: alsa open: %s\n", err);
+        return 1;
+    }
+    /* Both degradations that can ride on a successful open reach the caller through here (rule 6's
+     * resampler, and a render thread with no real-time budget). Printed rather than asserted:
+     * which of them applies is a property of the box, not of the sink. */
+    if (err[0]) printf("alsa: opened with a degradation reported: %s\n", err);
+
+    const char* backend = bwa_sink_backend(s);
+    const uint32_t block  = bwa_sink_block_size(s);
+    const uint32_t period = sink_alsa_period_frames(s);
+    const uint32_t buffer = sink_alsa_buffer_frames(s);
+    int ok = 1;
+    if (bwa_sink_type_of(s) != BWA_SINK_ALSA) {
+        fprintf(stderr, "FAIL: alsa sink reports the wrong backend type\n");
+        bwa_sink_close(s); return 1;
+    }
+    if (strncmp(backend, "alsa:", 5) != 0) {
+        fprintf(stderr, "FAIL: backend string is '%s', want \"alsa:<pcm>\"\n", backend);
+        bwa_sink_close(s); return 1;
+    }
+    if (bwa_sink_start(s) != 0) { fprintf(stderr, "FAIL: alsa start\n"); bwa_sink_close(s); return 1; }
+
+    /* --- phase 1: a healthy run --- */
+    os_sleep_ms(200);                                   /* ~37 blocks at 256/48000 = 5.33 ms */
+    bwa_sink_health h1;
+    bwa_sink_get_health(s, &h1);
+    if (h1.dropouts != 0) {
+        fprintf(stderr, "FAIL: %llu underruns on a healthy 200 ms run\n",
+                (unsigned long long)h1.dropouts); ok = 0;
+    }
+    if (p.blocks < 10) {
+        fprintf(stderr, "FAIL: %lu blocks in 200 ms, want at least 10\n", p.blocks); ok = 0;
+    }
+
+    /* --- phase 2: starve it on purpose. Twice the buffer plus slack, so the device certainly runs
+     *     dry and snd_pcm_writei certainly returns -EPIPE. --- */
+    const unsigned stall_ms = (2u * buffer * 1000u / SR) + 40u;
+    atomic_store_explicit(&p.stall_ms_once, (int)stall_ms, memory_order_relaxed);
+    os_sleep_ms(200u + stall_ms);
+
+    bwa_sink_stop(s);                             /* joins the render thread */
+
+    const unsigned long blocks = p.blocks;
+    const uint32_t latency = bwa_sink_output_latency(s);
+    if (block != BS) { fprintf(stderr, "FAIL: block_size() is %u, want the engine's %u\n", block, BS); ok = 0; }
+    if (!p.nframes_stable || p.nframes_first != BS) {
+        fprintf(stderr, "FAIL: nframes varied or was not the block size (first=%u, stable=%d)\n",
+                p.nframes_first, p.nframes_stable); ok = 0;
+    }
+    if (!p.time_monotonic) { fprintf(stderr, "FAIL: system_time_ns not monotonic\n"); ok = 0; }
+    if (!p.pos_monotonic)  { fprintf(stderr, "FAIL: sample_pos not monotonic\n");     ok = 0; }
+    if (latency == 0) { fprintf(stderr, "FAIL: snd_pcm_delay reported no output latency\n"); ok = 0; }
+
+    bwa_sink_health h;
+    bwa_sink_get_health(s, &h);
+    if (!h.measured) { fprintf(stderr, "FAIL: the write reports underruns directly, so measured must be true\n"); ok = 0; }
+    if (h.blocks != blocks) {
+        fprintf(stderr, "FAIL: health counted %llu blocks, the probe saw %lu\n",
+                (unsigned long long)h.blocks, blocks); ok = 0;
+    }
+    if (h.device_lost) { fprintf(stderr, "FAIL: the device was reported lost during a clean run\n"); ok = 0; }
+    if (h.period_ns == 0) { fprintf(stderr, "FAIL: no block period to measure the budget against\n"); ok = 0; }
+    /* The honesty rule, and here it can be demanded in full rather than noted: -EPIPE is the
+     * device's own report, the stall outlasted the buffer by a factor of two, and the frame
+     * estimate is elapsed time minus that buffer, so both halves must be non-zero. */
+    if (h.dropouts < 1) {
+        fprintf(stderr, "FAIL: the render thread was stalled %u ms past a %u-frame buffer and no "
+                        "underrun was counted\n", stall_ms, buffer); ok = 0;
+    }
+    if (h.dropouts >= 1 && h.dropped_frames == 0) {
+        fprintf(stderr, "FAIL: an underrun was counted with 0 dropped frames\n"); ok = 0;
+    }
+    if (h.late_blocks < 1) {
+        fprintf(stderr, "FAIL: a %u ms stall inside render() was not counted as a late block\n",
+                stall_ms); ok = 0;
+    }
+
+    printf("alsa OK: backend=%s blocks=%lu block=%u period=%u buffer=%u latency=%u frames\n",
+           backend, blocks, block, period, buffer, latency);
+    printf("  measured=%d underruns=%llu dropped=%llu late=%llu resyncs=%llu (stall %u ms injected)\n",
+           h.measured ? 1 : 0, (unsigned long long)h.dropouts, (unsigned long long)h.dropped_frames,
+           (unsigned long long)h.late_blocks, (unsigned long long)h.driver_resyncs, stall_ms);
+    bwa_sink_close(s);                            /* must return, not hang */
+
+    /* --- rule 6: a rate the device cannot run must fail the open under exact_rate, naming BOTH
+     *     rates. A plug, default or server PCM can genuinely accept almost any rate by converting,
+     *     so a successful open there is REPORTED, not failed: the check does not apply to it. --- */
+    {
+        const uint32_t absurd = 999999;
+        Probe q;
+        probe_init(&q, 2);
+        char e2[256] = {0};
+        bwa_sink* bad = bwa_alsa_sink_open(absurd, BS, 2, dev, 0, true, on_render, &q, e2, sizeof e2);
+        if (bad) {
+            printf("  NOTE: PCM '%s' accepted %u Hz, so the exact-rate rejection is not applicable "
+                   "to it (a plug or server PCM converts anything)\n", dev ? dev : "default", absurd);
+            bwa_sink_close(bad);
+        } else if (!rejects_naming_both(e2, absurd)) {
+            /* Both: the rate that was asked for, and the rate the device would give instead.
+             * Which rate the device names is its own business (whatever set_rate_near answered),
+             * so the check is "a rate that is not the requested one", not a literal. */
+            fprintf(stderr, "FAIL: the rate-mismatch message must name both the requested rate and "
+                            "the device's; got: %s\n", e2[0] ? e2 : "(no message)");
+            ok = 0;
+        } else {
+            printf("  rate mismatch rejected: %s\n", e2);
+        }
+    }
+    return ok ? 0 : 1;
+}
+#endif /* BWA_HAVE_ALSA */
+
 int main(void) {
     Probe p;
     probe_init(&p, BWA_CHANNELS);
@@ -333,11 +690,32 @@ int main(void) {
     printf("audio sink OK: backend=%s blocks=%lu last_sample_pos=%llu last_ns=%llu\n",
            backend, blocks, (unsigned long long)p.last_sample_pos, (unsigned long long)p.last_ns);
 
+    /* One section per compiled device backend, and the results AGGREGATE: a failure anywhere fails
+     * the test, a section that actually ran makes the test a pass, and only "every device section
+     * had no device" reports the ctest skip. Returning the first skip instead would hide a backend
+     * that did run beside one that could not. */
+    int device_ran = 0, device_skipped = 0;
 #ifdef BWA_HAVE_WASAPI
     {
         const int rc = test_wasapi();
-        if (rc != 0) return rc;   /* 1 = failed, SKIP_EXIT = no endpoint on this machine */
+        if (rc == 1) return 1;
+        if (rc == SKIP_EXIT) device_skipped = 1; else device_ran = 1;
     }
 #endif
+#ifdef BWA_HAVE_JACK
+    {
+        const int rc = test_jack();
+        if (rc == 1) return 1;
+        if (rc == SKIP_EXIT) device_skipped = 1; else device_ran = 1;
+    }
+#endif
+#ifdef BWA_HAVE_ALSA
+    {
+        const int rc = test_alsa();
+        if (rc == 1) return 1;
+        if (rc == SKIP_EXIT) device_skipped = 1; else device_ran = 1;
+    }
+#endif
+    if (!device_ran && device_skipped) return SKIP_EXIT;
     return 0;
 }

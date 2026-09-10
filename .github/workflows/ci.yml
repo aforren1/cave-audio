@@ -463,10 +463,15 @@ jobs:
           ./tools/dist/publish-branch.ps1 -Branch unity -Source build/upm/package -Version $v -RemoteUrl $remote
           ./tools/dist/publish-branch.ps1 -Branch godot -Source build/godot/addon -Version $v -RemoteUrl $remote
 
-  # ---- portability gate (docs/backends.md phase 2) ---------------------------------------------
+  # ---- portability gate (docs/backends.md phases 2 and 5) --------------------------------------
   # These two jobs exist to catch a Win32 call sneaking back into the core, not to test audio: no
-  # runner has an audio device, and neither platform has a device backend yet, so both build the
-  # library, the console examples and the whole test suite on the null and manual sinks.
+  # runner has an audio device, so both build the library, the console examples and the whole test
+  # suite and run them on the null and manual sinks.
+  #
+  # The linux job DOES compile the two Linux backends (apt installs their dev packages) and asserts
+  # both configured, because a runner that quietly lost a header would otherwise turn the whole
+  # backend into dead code that nothing builds. Their sink-test sections then skip visibly on the
+  # runner: no JACK server is running and there is no sound card.
   #
   # No submodules and no SDKs: phonon is a Windows artifact in this repo (the CMake auto-detect
   # requires the platform's import library, so a checkout with it staged still configures no-SDK
@@ -482,12 +487,17 @@ jobs:
     steps:
       - uses: actions/checkout@v6      # no submodules: no SDKs are built here
 
+      - name: Install the Linux backends' dev packages
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev libjack-jackd2-dev
+
       - name: Configure
         run: |
           cmake -S . -B build -DCMAKE_BUILD_TYPE=RelWithDebInfo -DBWA_BUILD_TESTS=ON | tee configure.log
           # Prove the port is actually being exercised, rather than a stale cache quietly
-          # re-enabling a Windows-only path.
-          grep -q "null and manual sinks only" configure.log
+          # re-enabling a Windows-only path - and that both Linux backends really compiled.
+          grep -q "Linux - JACK and ALSA backends available" configure.log
+          grep -q "JACK backend ENABLED" configure.log
+          grep -q "ALSA backend ENABLED" configure.log
           grep -q "Steam Audio disabled" configure.log
 
       - name: Build
