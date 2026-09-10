@@ -52,7 +52,14 @@ public:
 	/* Mirrors bwa_profile: BINAURAL is the direct per-source headphone render, CAVE_SIM the
 	 * virtual-speaker array audition, CAVE_BOTH the rig plus that sim tap. */
 	enum Profile { PROFILE_CAVE = 0, PROFILE_BINAURAL = 1, PROFILE_CAVE_SIM = 2, PROFILE_CAVE_BOTH = 3 };
-	enum Sink { SINK_AUTO = 0, SINK_ASIO = 1, SINK_NULL = 2, SINK_MANUAL = 3 };
+	/* AUTO picks by channel count and platform: a headphone profile tries WASAPI then ASIO, the
+	 * array tries ASIO, and either falls back to the silent offline sink. COREAUDIO, ALSA, AAUDIO
+	 * and JACK are reserved values - the Windows build carries none of them yet. */
+	enum Sink { SINK_AUTO = 0, SINK_ASIO = 1, SINK_NULL = 2, SINK_MANUAL = 3,
+		SINK_WASAPI = 4, SINK_COREAUDIO = 5, SINK_ALSA = 6, SINK_AAUDIO = 7, SINK_JACK = 8 };
+	/* sink_flags bits. EXCLUSIVE takes a WASAPI endpoint from every other application on the
+	 * machine; leave it off for a monitor that shares its device with a game or a VR runtime. */
+	enum SinkFlags { SINK_FLAG_NONE = 0, SINK_FLAG_EXCLUSIVE = 1 };
 	/* Value 0 is RESERVED for default-init, mirroring the C enum: it means the engine's current
 	 * default rather than a named algorithm, so the default can move without an ABI break. */
 	enum BedDecoder { DECODE_DEFAULT = 0, DECODE_ALLRAD = 1, DECODE_EPAD = 2 };
@@ -93,8 +100,15 @@ public:
 	Sink get_sink() const { return sink; }
 	void set_layout_path(const String &p) { layout_path = p; }
 	String get_layout_path() const { return layout_path; }
-	void set_asio_driver(const String &d) { asio_driver = d; }
-	String get_asio_driver() const { return asio_driver; }
+	/* The device for whichever backend opens it: the exact name or id from get_devices(). Empty =
+	 * that backend's default. set_asio_driver is the old spelling of the same property, kept so
+	 * existing scenes and scripts keep working. */
+	void set_device(const String &d) { device = d; }
+	String get_device() const { return device; }
+	void set_asio_driver(const String &d) { device = d; }
+	String get_asio_driver() const { return device; }
+	void set_sink_flags(int f) { sink_flags = f; }
+	int get_sink_flags() const { return sink_flags; }
 	void set_sample_rate(int r) { sample_rate = r; }
 	int get_sample_rate() const { return sample_rate; }
 	void set_block_size(int b) { block_size = b; }
@@ -391,8 +405,10 @@ public:
 
 	/* --- device health: was the callback starved, and by whom ---
 	 * {measured, blocks, xruns, dropped_frames, driver_resyncs, late_blocks, stream_starves,
-	 * peak_load}. `measured` is false when this configuration cannot observe a dropout at all
-	 * (no engine, or a sink with no deadline), in which case a 0 xrun count proves nothing. */
+	 * peak_load, device_lost}. `measured` is false when this configuration cannot observe a
+	 * dropout at all (no engine, or a sink with no deadline), in which case a 0 xrun count proves
+	 * nothing. `device_lost` is true once the device went away: the engine keeps rendering from
+	 * the host clock, so nothing freezes, but the audio is silent until you restart it. */
 	Dictionary get_health() const;
 	int64_t get_xruns() const;
 
@@ -415,9 +431,15 @@ public:
 	PackedFloat32Array render_block();
 
 	/* --- static helpers (no engine needed) --- */
-	/* Every installed ASIO driver's name, in the order the ABI enumerates them — the values
-	 * asio_driver accepts. One call, no index loop; the count/name pair remains for a caller
-	 * that wants a single name. */
+	/* Every device `backend` offers, in the order the ABI enumerates them — the values `device`
+	 * accepts. One call, no index loop; the count/name pair remains for a caller that wants a
+	 * single name, and get_device_id gives the stable string to PERSIST (friendly names collide
+	 * between a headset and its dock, and change when a driver updates). */
+	static PackedStringArray get_devices(Sink backend);
+	static int get_device_count(Sink backend);
+	static String get_device_name(Sink backend, int index);
+	static String get_device_id(Sink backend, int index);
+	/* The ASIO-only spelling, kept because existing scenes call it: get_devices(SINK_ASIO). */
 	static PackedStringArray get_asio_drivers();
 	static int get_asio_driver_count();
 	static String get_asio_driver_name(int index);
@@ -513,9 +535,10 @@ private:
 
 	Profile profile = PROFILE_BINAURAL;
 	Sink sink = SINK_AUTO;
+	int sink_flags = SINK_FLAG_NONE;
 	BedDecoder bed_decoder = DECODE_DEFAULT;
 	String layout_path;
-	String asio_driver;
+	String device;
 	int sample_rate = 48000;
 	int block_size = 256;
 	bool embree = false;
@@ -564,6 +587,7 @@ private:
 
 VARIANT_ENUM_CAST(godot::BwaEngine::Profile);
 VARIANT_ENUM_CAST(godot::BwaEngine::Sink);
+VARIANT_ENUM_CAST(godot::BwaEngine::SinkFlags);
 VARIANT_ENUM_CAST(godot::BwaEngine::BedDecoder);
 VARIANT_ENUM_CAST(godot::BwaEngine::Setup);
 VARIANT_ENUM_CAST(godot::BwaEngine::Panner);

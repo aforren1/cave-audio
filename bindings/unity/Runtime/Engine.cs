@@ -25,13 +25,24 @@ namespace BwAudio
         [Clip(".json")] public string layoutFile = "cave_layout.json";
         public uint sampleRate = 48000;
         public uint blockSize = 256;
-        [Tooltip("Output-device policy. Auto: try ASIO, fall back to the SILENT offline sink (the " +
-                 "engine keeps rendering — the inspector flags the silent fallback). Asio: demand a " +
-                 "real device, so a missing driver fails startup loudly. Null: force the offline sink.")]
+        [Tooltip("Output-device policy. Auto: for a headphone profile try WASAPI then ASIO, for the " +
+                 "array try ASIO, and fall back to the SILENT offline sink either way (the engine " +
+                 "keeps rendering — the inspector flags the silent fallback). Naming a backend is a " +
+                 "demand, so a missing device fails startup loudly. Null: force the offline sink.")]
         public BwaSinkType sink = BwaSinkType.Auto;
-        [Tooltip("ASIO driver name to open. Empty = auto-pick the first registered driver with " +
-                 "enough output channels for the profile.")]
-        public string asioDriver = "";
+        [Tooltip("Device to open, for whichever backend opens it: the exact friendly name or stable " +
+                 "id from Engine.Devices. Empty = that backend's default (ASIO: the first driver with " +
+                 "enough output channels; WASAPI: the Windows default render endpoint).")]
+        // FormerlySerializedAs: this field was `asioDriver` through 0.13, so a scene saved then
+        // keeps its value instead of silently reverting to the backend default on load.
+        [UnityEngine.Serialization.FormerlySerializedAs("asioDriver")]
+        public string device = "";
+        [Tooltip("Backend options. Exclusive takes a WASAPI endpoint from every other application on " +
+                 "the machine; leave it off for a monitor that shares the device with a VR runtime.")]
+        public BwaSinkFlags sinkFlags = BwaSinkFlags.None;
+
+        /// <summary>The old spelling of <see cref="device"/>, kept so existing scripts compile.</summary>
+        public string asioDriver { get { return device; } set { device = value; } }
 
         [Header("Listener")]
         [Tooltip("The tracked head: your OptiTrack rigid body, or the XR camera at a desk. Required " +
@@ -255,7 +266,8 @@ namespace BwAudio
                 layoutPath = layoutFile.Length > 0 ? Path.Combine(Application.streamingAssetsPath, layoutFile) : null,
                 hrtfPath = null, sampleRate = sampleRate, blockSize = blockSize,
                 sink = sink,
-                asioDriver = asioDriver.Length > 0 ? asioDriver : null,
+                device = device.Length > 0 ? device : null,
+                sinkFlags = sinkFlags,
                 enablePathing = enablePathing,
                 bedDecoder = bedDecoder,
             };
@@ -876,9 +888,30 @@ namespace BwAudio
         /// after the per-speaker trims. NOT a spatial path (it bypasses the panner). gain 0 or Off silences.</summary>
         public void TestSignal(uint channel, BwaTestKind kind, float gain) { if (Ready) Bwa.bwa_set_test_signal(_eng, channel, kind, gain); }
 
-        // ---- ASIO driver enumeration (engine-free: no handle, safe before the Engine exists) ---------
-        /// <summary>Number of ASIO drivers registered on this machine — engine-free, so it works before an
-        /// Engine is created (populate a picker for `asioDriver`). Reads the registry fresh each call.</summary>
+        // ---- device enumeration (engine-free: no handle, safe before the Engine exists) --------------
+        /// <summary>Number of devices `backend` can offer — engine-free, so it works before an Engine
+        /// exists (populate a picker for `device`). Reads the OS list fresh each call. Auto, Null and
+        /// Manual report 0, and so does a backend this build does not carry.</summary>
+        public static uint DeviceCount(BwaSinkType backend) => Bwa.bwa_get_device_count(backend);
+
+        /// <summary>Device `index`'s friendly name on `backend`, or null when out of range.</summary>
+        public static string DeviceName(BwaSinkType backend, uint index) => Bwa.DeviceName(backend, index);
+
+        /// <summary>Device `index`'s STABLE id on `backend` — persist this rather than the friendly
+        /// name, which collides between a headset and its dock and changes when a driver updates.</summary>
+        public static string DeviceId(BwaSinkType backend, uint index) => Bwa.DeviceId(backend, index);
+
+        /// <summary>Every device `backend` offers, in enumeration order — the one call a picker actually
+        /// wants. The strings are exactly what `device` accepts (empty picks the backend's default).</summary>
+        public static string[] Devices(BwaSinkType backend)
+        {
+            uint n = DeviceCount(backend);
+            var names = new string[n];
+            for (uint i = 0; i < n; i++) names[i] = DeviceName(backend, i);
+            return names;
+        }
+
+        /// <summary>Number of ASIO drivers registered on this machine — DeviceCount(BwaSinkType.Asio).</summary>
         public static uint AsioDriverCount => Bwa.bwa_get_asio_driver_count();
 
         /// <summary>Registered ASIO driver `index`'s name (the exact string `asioDriver` expects), or null if

@@ -7,10 +7,18 @@
  * the asio_sink.c boundary — everything here is device-agnostic.
  *
  * Backends:
- *   - asio_sink.c  (BWA_HAVE_ASIO): drives a real ASIO driver (the Digiface in production).
+ *   - asio_sink.cpp  (BWA_HAVE_ASIO):   drives a real ASIO driver (the Digiface in production).
+ *   - wasapi_sink.cpp (BWA_HAVE_WASAPI): the Windows system mixer - the headphone profiles and
+ *                  the cave_both monitor, on the endpoint the headphones are actually on.
  *   - null_sink.c  (always built): a threaded *offline* sink that paces blocks from
  *                  a high-resolution clock and discards the audio. Lets the engine
  *                  run with no hardware (desk dev, CI, the `binaural` array path).
+ *   - manual_sink.c (always built): no thread; the caller pumps blocks (bwa_render_block).
+ *
+ * Two shared pieces sit under the backends rather than inside one of them: sink_convert.h (the
+ * bus -> device sample format, planar or interleaved) and sink_quant.h (the fixed-quantum
+ * adapter every backend that cannot pin its callback size renders through). See
+ * docs/backends.md for the contract a backend must meet.
  *
  * Bus layout: PLANAR, channel-major. For an N-channel bus of `nframes` samples,
  * channel `c` sample `i` lives at bus[c * nframes + i]. This matches the per-channel
@@ -18,6 +26,8 @@
  */
 #ifndef BWA_SINK_H
 #define BWA_SINK_H
+
+#include "bw_audio.h"       /* bwa_sink_type: the vtable names its own backend */
 
 #include <stdbool.h>
 #include <stddef.h>
@@ -78,6 +88,7 @@ typedef struct {
     uint64_t late_blocks;      /* OUR render overran the block period — we are the cause     */
     uint64_t render_ns_peak;   /* worst single-block render time                             */
     uint64_t period_ns;        /* the block period that budget is measured against; 0 = none */
+    uint32_t device_lost;      /* the device went away; the sink is host-pacing SILENCE       */
     bool     measured;         /* false = this backend cannot observe dropouts at all        */
 } bwa_sink_health;
 
@@ -93,6 +104,10 @@ typedef struct bwa_sink bwa_sink;
 /* Backend dispatch. Each concrete sink embeds `struct bwa_sink` as its FIRST member and
  * fills `vt`; the generic bwa_sink_* calls (in sink.c) dispatch through it. */
 typedef struct {
+    /* Which backend this is. The vtable carries it so bwa_get_sink_type reads a field instead of
+     * matching the backend STRING by prefix, which stopped scaling the moment a second backend
+     * could produce a name starting with the same letters. */
+    bwa_sink_type type;
     int         (*start)(bwa_sink*);
     void        (*stop)(bwa_sink*);
     void        (*close)(bwa_sink*);
@@ -113,19 +128,25 @@ typedef struct {
 
 struct bwa_sink { const bwa_sink_vtbl* vt; };
 
-/* Open a sink for this format per `sink_type` (bwa_sink_type: 0 = auto — ASIO if compiled in and
- * a driver opens, else the null sink; 1 = demand ASIO, failure returns NULL; 2 = force null).
- * `asio_driver` names the ASIO driver to open (NULL = auto-pick by channel count). On failure
- * returns NULL and writes a message to `err` (if err/errcap given). Does NOT start the audio
- * thread yet. */
+/* Open a sink for this format per `sink_type`. AUTO tries the platform's backends in the order
+ * docs/backends.md fixes (on Windows: WASAPI then ASIO for a 2-channel request, ASIO only when
+ * wider, then the null sink either way); a named backend is a demand and its failure returns
+ * NULL. `device` names the device for whichever backend opens (NULL = that backend's default;
+ * matched exactly against the name then the id, and under AUTO a backend with no such device is
+ * skipped). `flags` is bwa_desc.sink_flags. `exact_rate` set means the device MUST run at
+ * sample_rate or the open fails - the array's rule, since a resampled array shifts every
+ * per-speaker delay; clear lets a headphone backend fall back on the OS resampler and report the
+ * degradation through `err` on an otherwise successful open. On failure returns NULL and writes a
+ * message to `err` (if err/errcap given). Does NOT start the audio thread yet. */
 bwa_sink* bwa_sink_open(uint32_t sample_rate, uint32_t block_size, uint32_t channels,
-                     int sink_type, const char* asio_driver,
+                     bwa_sink_type sink_type, const char* device, uint32_t flags, bool exact_rate,
                      bwa_render_fn render, void* user, char* err, size_t errcap);
 
 int          bwa_sink_start(bwa_sink* s);   /* begin the callback loop; 0 = ok        */
 void         bwa_sink_stop(bwa_sink* s);    /* stop the loop; safe if already stopped */
 void         bwa_sink_close(bwa_sink* s);   /* stop (if needed) + release             */
-const char*  bwa_sink_backend(bwa_sink* s); /* e.g. "asio:Digiface" or "null"              */
+const char*  bwa_sink_backend(bwa_sink* s); /* "<backend>:<device>", or "null" / "manual" */
+bwa_sink_type bwa_sink_type_of(bwa_sink* s); /* the concrete backend; NULL sink -> BWA_SINK_NULL */
 uint32_t     bwa_sink_block_size(bwa_sink* s); /* actual frames per block; 0 if none  */
 uint32_t     bwa_sink_output_latency(bwa_sink* s); /* device render->DAC latency, frames; 0 = unknown */
 /* Manual/offline: render one block synchronously (bwa_render_block). NULL unless this is a manual
@@ -134,6 +155,13 @@ const float* bwa_sink_render_block(bwa_sink* s, uint32_t* channels, uint32_t* nf
 /* Sample the device-health counters. Always writes `out` (zeroed, measured = false, when there is
  * no sink or the backend measures nothing), so a caller never reads uninitialized counts. */
 void         bwa_sink_get_health(bwa_sink* s, bwa_sink_health* out);
+
+/* Engine-free device enumeration behind bwa_get_device_count/_name/_id: dispatches to whichever
+ * backend owns `backend`, and reports 0 for AUTO/NULL/MANUAL and for a backend this build does
+ * not carry. Control thread; opens nothing. */
+uint32_t sink_device_count(bwa_sink_type backend);
+bool     sink_device_name (bwa_sink_type backend, uint32_t index, char* buf, uint32_t cap);
+bool     sink_device_id   (bwa_sink_type backend, uint32_t index, char* buf, uint32_t cap);
 
 /* Backend constructors used by bwa_sink_open. null is always present; asio only when
  * BWA_HAVE_ASIO is defined (third_party/asiosdk vendored — see third_party/README.md). */
@@ -152,6 +180,25 @@ bwa_sink* bwa_asio_sink_open(uint32_t sample_rate, uint32_t block_size, uint32_t
  * it (the one place ASIO lives). */
 uint32_t sink_asio_driver_count(void);
 bool     sink_asio_driver_name(uint32_t index, char* buf, uint32_t cap);
+#endif
+
+#ifdef BWA_HAVE_WASAPI
+/* Windows system mixer. Shared mode by default (the VR runtime, the browser and the OS keep
+ * their own audio open on the same endpoint); BWA_SINK_FLAG_EXCLUSIVE takes the device. */
+bwa_sink* bwa_wasapi_sink_open(uint32_t sample_rate, uint32_t block_size, uint32_t channels,
+                          const char* device /* NULL = the default render endpoint */,
+                          uint32_t flags, bool exact_rate,
+                          bwa_render_fn render, void* user, char* err, size_t errcap);
+/* Endpoint enumeration (index 0 = the Windows default render endpoint). Control thread, no
+ * engine, opens nothing — wasapi_sink.cpp implements it, the one place WASAPI lives. */
+uint32_t sink_wasapi_device_count(void);
+bool     sink_wasapi_device_name(uint32_t index, char* buf, uint32_t cap);
+bool     sink_wasapi_device_id  (uint32_t index, char* buf, uint32_t cap);
+/* TEST/DIAGNOSTIC readback, internal on purpose (not in bw_audio.h): the shared-mode underrun rule
+ * is only armed when the endpoint's buffer is deeper than one period, so the sink test has to know
+ * which of the two cases the machine it runs on presents. Control thread, on an open sink. */
+uint32_t sink_wasapi_device_frames(bwa_sink* s);
+uint32_t sink_wasapi_period_frames(bwa_sink* s);
 #endif
 
 #endif /* BWA_SINK_H */

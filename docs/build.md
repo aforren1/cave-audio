@@ -2,10 +2,13 @@
 
 ## Platform
 
-**Windows only.** ASIO is Windows-only; the Digiface is Windows/macOS. A cross-platform move
-means abstracting the device layer. ASIO is only the Windows sink; elsewhere the backend
-would be ALSA/JACK (Linux) or CoreAudio (macOS). Keep ASIO assumptions
-confined to `asio_sink.cpp`.
+**Windows only.** ASIO is Windows-only; the Digiface is Windows/macOS. ASIO is only the
+Windows sink for the **array**. Headphone output has a second Windows backend, **WASAPI**
+(`src/wasapi_sink.cpp`), so a desk machine needs no ASIO driver at all: `binaural` and
+`cave_sim` open the Windows default output, and `cave_both` opens ASIO for the array and WASAPI
+for the monitor at the same time. The remaining backends (CoreAudio, JACK, ALSA, AAudio) and the
+OS shim the port needs are specified, not implemented, in [backends.md](./backends.md). Keep each
+backend's assumptions confined to its own `*_sink` file.
 
 Build system: CMake + MSVC (Visual Studio 2022 toolset). The core is C (C11 with
 `stdatomic.h`); Steam Audio and ASIO glue are C/C++.
@@ -15,6 +18,10 @@ source file: `src/rt.c` and `src/stream.c` always, plus `src/steam_reflect.c` in
 with-SDK build (its IR-publish seqlock uses `stdatomic.h` too). The flag applies both
 where the DLL compiles that file and in the test targets (`reflect`, `bake`) that
 compile it directly.
+
+The C++ files (`src/asio_sink.cpp`, `src/wasapi_sink.cpp`) need `/std:c++20` for designated
+initializers in their vtables. CMake asks for it per target rather than globally, so it cannot
+leak into the vendored SDK sources.
 
 **Race-checking the rings.** The `test_rt_core` target drives the SPSC ring/commit logic
 off the real-time path (single-threaded, deterministic). It is what runs under
@@ -34,6 +41,7 @@ Everything beyond the DLL + test suite is opt-in; the default build stays lean.
 |--------|---------|--------------|
 | `BWA_BUILD_TESTS` | ON | the ctest suite (`test_*` targets) |
 | `BWA_WITH_ASIO` | OFF* | the ASIO backend. *Auto-flips ON when the SDK sits at `third_party/asiosdk/` |
+| `BWA_WITH_WASAPI` | ON | the WASAPI backend (headphone profiles, the `cave_both` monitor). Windows only, and forced OFF elsewhere. Needs no SDK: the headers ship with the Windows SDK, and it links `ole32` + `avrt` |
 | `BWA_BUILD_PLAYGROUND` | OFF | `bwa_playground` + `bwa_layout_tool` (fetches raylib/rlImGui/imgui/test-engine) |
 | `BWA_BUILD_CALIBVIEW` | OFF | `bwa_calib_view` (fetches imgui/test-engine/implot/implot3d) |
 | `BWA_BUILD_CALIBRATE` | OFF | `bwa_calibrate` + `bwa_zylia_probe` |

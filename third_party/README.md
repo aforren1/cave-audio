@@ -38,16 +38,23 @@ sources (`common/asio.cpp`, `host/asiodrivers.cpp`, `host/pc/asiolist.cpp`) with
 `BWA_HAVE_ASIO`. Without it, only the offline null sink is built (`bw_audio: ASIO
 backend disabled`) and the library still builds and links.
 
-**Sink selection** (`bwa_desc.sink`; see `src/sink.c`):
-- `BWA_SINK_AUTO` (default) — try ASIO, fall back to the null (offline) sink if no usable device;
+**Sink selection** (`bwa_desc.sink`; see `src/sink.c`, and `docs/backends.md` for the full rules):
+- `BWA_SINK_AUTO` (default) — pick by channel count. A 2-channel request (the headphone
+  profiles, the `cave_both` monitor) tries WASAPI then ASIO; a wider one (the array) tries ASIO
+  only. Either falls back to the null (offline) sink when no device opens;
 - `BWA_SINK_NULL` — force the offline sink (CI, desk debugging, no hardware);
-- `BWA_SINK_ASIO` — require ASIO; if no driver opens it **fails** (no silent
-  null fallback), so a missing device surfaces instead of playing silence.
+- `BWA_SINK_ASIO` or `BWA_SINK_WASAPI` — require that backend; if it does not open, the start
+  **fails** (no silent null fallback), so a missing device surfaces instead of playing silence.
 
-The `cave`/`both` array path needs a driver exposing **≥26 output channels** (Dante
-Virtual Soundcard in production); `binaural` needs only 2. The auto-pick tries the
-registered drivers and uses the first that opens with enough outputs (pin one with
-`bwa_desc.asio_driver`); `bwa_get_audio_backend()` reports which one opened.
+The `cave`/`both` array path needs a driver exposing **≥26 output channels** (the RME Digiface
+Dante in production); `binaural` needs only 2, and gets them from an ordinary Windows endpoint
+with no ASIO driver installed. The ASIO auto-pick tries the registered drivers and uses the first
+that opens with enough outputs; pin one with `bwa_desc.device` (the old spelling `asio_driver`
+still works), and `bwa_get_audio_backend()` reports which one opened.
+
+WASAPI needs nothing vendored: its headers ship with the Windows SDK, so `src/wasapi_sink.cpp`
+builds by default on Windows (`BWA_WITH_WASAPI`, linking `ole32` + `avrt`) and adds no license
+obligation.
 
 ## NatNet SDK (OptiTrack pose, M6) — reference only, NOT linked
 

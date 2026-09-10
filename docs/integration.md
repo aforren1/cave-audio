@@ -225,10 +225,19 @@ The snippet shows the essential calls. The shipped `Bwa.cs` binds every `BWA_API
 - **Output stage + diagnostics**: `bwa_set_limiter` / `bwa_set_limiter_ceiling`,
   `bwa_get_bus_levels`, `bwa_set_test_signal`, `bwa_get_speakers` / `bwa_get_channel_count`
   (the layout's speaker count; see "Channel count" above; size meter/speaker
-  arrays with it, never a hard-coded 26); and the engine-free ASIO driver
-  enumeration `bwa_get_asio_driver_count` / `bwa_get_asio_driver_name`
-  (`Engine.AsioDriverCount` / `AsioDriverName`; static, for a driver picker
-  before `bwa_create`).
+  arrays with it, never a hard-coded 26); and the engine-free device enumeration
+  `bwa_get_device_count` / `bwa_get_device_name` / `bwa_get_device_id`
+  (`Engine.DeviceCount` / `DeviceName` / `DeviceId` / `Devices`, and Godot's
+  `BwaEngine.get_devices(backend)`; static, for a device picker before `bwa_create`).
+  Pass a concrete backend: `BwaSinkType.Asio` for ASIO drivers, `BwaSinkType.Wasapi`
+  for Windows endpoints. The ASIO-only spelling
+  (`bwa_get_asio_driver_count` / `_name`, `Engine.AsioDriverCount` / `AsioDriverName`)
+  stays as a wrapper. The chosen string goes in `bwa_desc.device`, the field both
+  bindings also still expose under its old name `asioDriver` / `asio_driver`, since it
+  is one field with two spellings. Prefer the **id** when you persist a choice:
+  friendly names collide between a headset and its dock. `sink_flags` carries
+  `BWA_SINK_FLAG_EXCLUSIVE` (`BwaSinkFlags.Exclusive`, `BwaEngine.SINK_FLAG_EXCLUSIVE`),
+  which takes a WASAPI endpoint from every other application and is off by default.
 - **Assets**: `bwa_sound_acquire` / `bwa_sound_release` (the shared, refcounted
   by-path tier) drive `Engine.Acquire`, and `Load` / `LoadStreaming` / `LoadAmbix` /
   `LoadFuma` are one call each over it with the matching `BwaLoadFlags`. The binding

@@ -173,6 +173,7 @@ static void null_health(bwa_sink* base, bwa_sink_health* out) {
 }
 
 static const bwa_sink_vtbl NULL_VT = {   /* designated: stop/close share a signature, so a positional swap would be silent */
+    .type = BWA_SINK_NULL,
     .start = null_start, .stop = null_stop, .close = null_close,
     .backend = null_backend, .block_size = null_block_size,
     .health = null_health,

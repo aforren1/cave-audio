@@ -52,7 +52,7 @@ extern "C" {
  * COMPATIBILITY. Bump it by hand only when the ABI changes. It is deliberately independent of
  * the distribution/release version (the git tag), which moves on its own cadence. */
 #define BWA_VERSION_MAJOR 0
-#define BWA_VERSION_MINOR 13
+#define BWA_VERSION_MINOR 14
 #define BWA_VERSION_PATCH 0
 #define BWA_VERSION ((BWA_VERSION_MAJOR << 16) | (BWA_VERSION_MINOR << 8) | BWA_VERSION_PATCH)
 
@@ -111,16 +111,31 @@ typedef enum { BWA_DECODE_DEFAULT = 0,   /* reserved: the engine's current defau
                BWA_DECODE_EPAD    = 2,
                BWA_DECODE_FORCE_U32 = 0x7FFFFFFF } bwa_bed_decoder;
 
-/* Output-device policy. AUTO (the default) tries ASIO and falls back to the silent offline sink
- * - the engine keeps rendering with no device (the tools' visual-only mode). ASIO is an explicit
- * demand: an open failure fails bwa_start loudly instead of hiding behind silence (production, or
- * a speaker audition that must reach real speakers). NULL forces the offline sink (CI, profiling,
- * tracking-only tools). bwa_get_audio_backend reports what actually opened. The headphone
- * profiles also name the decode in use, "(steam HRTF ...)" or "(simple-pan ...)". The HRTF
- * decode falls back to the simple pan silently, and a by-ear report needs to know which ran. */
+/* Output-device policy. AUTO (the default) picks by channel count and platform, then falls back
+ * to the silent offline sink - the engine keeps rendering with no device (the tools' visual-only
+ * mode). On Windows a 2-channel request (the headphone profiles) tries WASAPI first, then ASIO;
+ * a request wider than 2 channels (the array) tries ASIO only, because the array's transport is a
+ * settled decision. Naming a backend is an explicit demand: an open failure fails bwa_start
+ * loudly instead of hiding behind silence (production, or a speaker audition that must reach real
+ * speakers), and a backend this build does not carry fails with a message saying so. NULL forces
+ * the offline sink (CI, profiling, tracking-only tools). MANUAL creates no device and no thread.
+ * bwa_get_audio_backend reports what actually opened. The headphone profiles also name the decode
+ * in use, "(steam HRTF ...)" or "(simple-pan ...)". The HRTF decode falls back to the simple pan
+ * silently, and a by-ear report needs to know which ran. See docs/backends.md. */
 typedef enum { BWA_SINK_AUTO = 0, BWA_SINK_ASIO = 1, BWA_SINK_NULL = 2,
                BWA_SINK_MANUAL = 3, /* no device/thread - pump blocks yourself with bwa_render_block */
+               BWA_SINK_WASAPI = 4, /* Windows shared-mode (or exclusive, see BWA_SINK_FLAG_EXCLUSIVE) */
+               BWA_SINK_COREAUDIO = 5,  /* macOS   - not in this build yet */
+               BWA_SINK_ALSA      = 6,  /* Linux   - not in this build yet */
+               BWA_SINK_AAUDIO    = 7,  /* Android - not in this build yet */
+               BWA_SINK_JACK      = 8,  /* Linux   - not in this build yet */
                BWA_SINK_FORCE_U32 = 0x7FFFFFFF } bwa_sink_type;
+
+/* bwa_desc.sink_flags bits. EXCLUSIVE takes the device away from every other application on the
+ * machine, which is why it is off by default: a monitor shares the endpoint with the VR runtime,
+ * the browser, and the OS. Turn it on for the lowest latency and a fixed callback size, or to
+ * reach more than 2 channels on a WASAPI endpoint. Ignored by backends that have no such mode. */
+#define BWA_SINK_FLAG_EXCLUSIVE 0x1u
 
 /* Engine configuration. Zero-init and set what you need - every field's zero is its default. */
 typedef struct {
@@ -131,19 +146,32 @@ typedef struct {
                                  * rate-derived (96 kHz renders correctly in software), but rates
                                  * above 48 k are unverified against the real Digiface/Dante chain -
                                  * treat 48 kHz as supported until the rig confirms more. */
-    uint32_t     block_size;    /* render quantum, frames; 0 = 256. Also the ASIO buffer-size
-                                 * HINT - a driver may run its own size (the sinks adapt);
-                                 * bwa_get_block_size reads back the engine's resolved quantum. */
-    bwa_sink_type sink;         /* output-device policy; 0 = AUTO (ASIO, else the silent null sink) */
-    const char*  asio_driver;   /* ASIO driver name to open; NULL = auto-pick the first registered
-                                 * driver with enough output channels for the profile. */
+    uint32_t     block_size;    /* render quantum, frames; 0 = 256. Also the device PERIOD HINT -
+                                 * a driver or an OS mixer may run its own size, and the sinks
+                                 * adapt, but the render quantum handed to the DSP is exactly this
+                                 * regardless; bwa_get_block_size reads it back. */
+    bwa_sink_type sink;         /* output-device policy; 0 = AUTO (see bwa_sink_type) */
+    /* Device to open, for whichever backend opens it: the friendly name or the stable id from the
+     * device query below, matched EXACTLY (never by substring - two endpoints called "Speakers"
+     * are common). NULL = the backend's default device (ASIO: the first registered driver with
+     * enough output channels; WASAPI: the Windows default render endpoint). Under AUTO a backend
+     * that has no device by this name is skipped, so the name reaches the backend that owns it.
+     * `asio_driver` is the legacy spelling of the same field and still compiles. */
+    union {
+        const char* device;
+        const char* asio_driver;
+    };
     bool         embree;        /* ray-trace the acoustics sims on Intel Embree - needs an
                                  * Embree-enabled phonon build; falls back to the default ray
                                  * tracer (one stderr notice) otherwise. No-op without the SDK. */
     bool         enable_pathing;/* run the sound-pathing sim from bwa_start (needs scene geometry +
                                  * the Steam Audio build; sources opt in via bwa_source_set_pathing). */
     bwa_bed_decoder bed_decoder;   /* diffuse-bed SH->speaker decoder; 0 = the engine default. */
-    uint32_t     reserved[4];   /* zero; reserved so the struct can grow without an ABI break */
+    /* BWA_SINK_FLAG_* for whichever backend opens; 0 = default. Carved from what used to be
+     * reserved[0], so every field above keeps the offset it had and only the reserved tail
+     * shortens - a 0.13 caller's zeroed desc is still a valid 0.14 one. */
+    uint32_t     sink_flags;
+    uint32_t     reserved[3];   /* zero; reserved so the struct can grow without an ABI break */
 } bwa_desc;
 
 /* Result codes for the calls that can fail with a reason (everything else reports through
@@ -182,10 +210,12 @@ BWA_API void      bwa_destroy(bwa_engine* e);
  * lifecycle call wipes it. The string stays valid until the next bwa_* call on this engine. */
 BWA_API const char* bwa_last_error(bwa_engine* e);
 BWA_API uint32_t    bwa_get_version(void);   /* the DLL's BWA_VERSION - check against the header's */
-/* Backend actually in use after bwa_start: "asio:<driver>", "null" (offline/SILENT), or
- * "none" (not started); the headphone profiles also name the decode in use - "(steam HRTF
- * direct)" / "(simple-pan direct)" for BINAURAL, "(steam HRTF sim)" / "(simple-pan sim)" for
- * CAVE_SIM/CAVE_BOTH. Human-readable (logs/HUDs); program logic wants bwa_get_sink_type. */
+/* Backend actually in use after bwa_start, as "<backend>:<device>" - "asio:Digiface Dante",
+ * "wasapi:Headphones (Realtek Audio)" - or "null" (offline/SILENT), "manual", or "none" (not
+ * started). The device part is the OS's own name, UTF-8. The headphone profiles also name the
+ * decode in use - "(steam HRTF direct)" / "(simple-pan direct)" for BINAURAL, "(steam HRTF sim)" /
+ * "(simple-pan sim)" for CAVE_SIM/CAVE_BOTH. Human-readable (logs/HUDs); program logic wants
+ * bwa_get_sink_type. */
 BWA_API const char* bwa_get_audio_backend(bwa_engine* e);
 /* The RESOLVED engine config (zero-defaulted desc fields resolved), valid from bwa_create on.
  * Derive time from these - seconds = frames / bwa_get_sample_rate(e) - not from the desc you
@@ -194,17 +224,30 @@ BWA_API const char* bwa_get_audio_backend(bwa_engine* e);
 BWA_API uint32_t bwa_get_sample_rate(bwa_engine* e);   /* Hz */
 BWA_API uint32_t bwa_get_block_size (bwa_engine* e);   /* frames per render block */
 /* The sink actually running - the machine-readable side of bwa_get_audio_backend: after
- * bwa_start, AUTO has resolved to BWA_SINK_ASIO or BWA_SINK_NULL; before start (or after stop)
+ * bwa_start, AUTO has resolved to the concrete backend that opened; before start (or after stop)
  * it reports the configured policy. */
 BWA_API bwa_sink_type bwa_get_sink_type(bwa_engine* e);
 
-/* ---- ASIO device query (control thread; needs NO engine - call before bwa_create to populate a
- * driver picker for bwa_desc.asio_driver). Reads the OS's registered-driver list fresh each call
- * (a newly installed driver appears immediately). It loads, initializes, and opens nothing, so
- * it is safe alongside a running engine too. ---- */
+/* ---- Device query (control thread; needs NO engine - call before bwa_create to populate a
+ * device picker for bwa_desc.device). Reads the OS's list fresh each call, so a driver or an
+ * endpoint that appeared since the last call shows up immediately. It loads, initializes, and
+ * opens nothing, so it is safe alongside a running engine too.
+ *
+ * `backend` must be CONCRETE: AUTO, NULL, and MANUAL report 0 devices. A backend this build does
+ * not carry also reports 0. Index 0 is the platform default device where the backend has one
+ * (WASAPI's default render endpoint); ASIO has no default, so index 0 is just the first
+ * registered driver. ---- */
+BWA_API uint32_t bwa_get_device_count(bwa_sink_type backend);
+/* Copy device `index`'s friendly name into buf (always NUL-terminated, truncated to cap-1) - one
+ * of the two exact strings bwa_desc.device accepts. False = index out of range or no buffer. */
+BWA_API bool     bwa_get_device_name(bwa_sink_type backend, uint32_t index, char* buf, uint32_t cap);
+/* Copy device `index`'s STABLE id into buf - the other string bwa_desc.device accepts. Prefer it
+ * when you persist a choice, or when two devices share a friendly name (a headset and a dock
+ * often do). ASIO has no separate id, so it reports the driver name. False = out of range. */
+BWA_API bool     bwa_get_device_id(bwa_sink_type backend, uint32_t index, char* buf, uint32_t cap);
+/* The ASIO-only spelling, kept because both bindings and the calibration tools call it: exactly
+ * bwa_get_device_count/_name with backend = BWA_SINK_ASIO. */
 BWA_API uint32_t bwa_get_asio_driver_count(void);
-/* Copy driver `index`'s registered name into buf (always NUL-terminated, truncated to cap-1) -
- * the exact string bwa_desc.asio_driver expects. False = index out of range or no buffer. */
 BWA_API bool     bwa_get_asio_driver_name(uint32_t index, char* buf, uint32_t cap);
 
 /* ---- assets (control thread; file I/O; do at load time) ---- */
@@ -1093,6 +1136,11 @@ typedef struct bwa_health {
     uint64_t stream_starves;  /* a streamed voice's ring ran dry without the asset having ended     */
     float    peak_load;       /* worst single-block render time / block period. 1.0 = exactly at
                                * budget, so anything approaching it is living dangerously           */
+    uint32_t device_lost;     /* nonzero: the device went away (unplugged, a driver reset, the
+                               * session torn down). The engine keeps rendering, paced from the
+                               * host clock, so clocks and playheads stay live and the audio is
+                               * SILENT. Nothing reopens on its own - bwa_stop then bwa_start, or
+                               * leave it. Always 0 on a backend that cannot detect one           */
 } bwa_health;
 /* Fills `out` and returns whether the numbers MEAN anything. False = this configuration cannot
  * observe a dropout at all: no engine, not started, the manual sink (no clock, no deadline - an

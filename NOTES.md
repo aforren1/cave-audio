@@ -566,3 +566,102 @@ not a `test_smoke` extension: it links `bwa_core` alongside the DLL so it can cr
 `bwa_spcap_focus_default` against the internal `layout_derive_spcap_focus`, which the DLL does not
 export). It pins the sentinel by construction: `focus <= 0` must reproduce the gains you get by
 passing `bwa_spcap_focus_default`'s answer for the same array, bit for bit.
+
+---
+
+**Device backends, phases 0 and 1 (`docs/backends.md`).** Two shared pieces, then the WASAPI sink,
+then the ABI that lets a caller name either.
+
+`sink_convert.h` is `asio_sink.cpp`'s `convert_out`/`to_i32` moved out whole, plus interleaved
+variants of each format, because ASIO is the only API in the plan that hands you planar per-channel
+buffers. Nothing about the rules changed, deliberately including the one asymmetry: the i16 path
+clamps the FLOAT and scales, so full negative scale is -32767 where the i32 path gives INT32_MIN.
+Preserving that beat "fixing" it, since the difference is one LSB and the alternative is a silent
+change to bytes that reach a live driver. The NaN rule is the load-bearing one and is now stated in
+one place: NaN slips BOTH clamp compares, and float-to-int out of range is UB, which on speakers is
+a full-scale pop rather than the silence a limiter-off render needs.
+
+`sink_quant` is the fixed-quantum adapter, and it exists because ASIO is the ONLY backend whose
+callback size is fixed. WASAPI shared mode hands out `bufferFrameCount - GetCurrentPadding()` per
+event, which moves; with the SDK the headphone decode is built for one frame size and SILENCES any
+other (`steam_decode.c`'s `n != m->frame_size` guard). A backend that forwarded the device's own
+count would therefore produce silence on some machines and not others.
+
+The design decision inside it was the FIFO shape. The obvious frame-indexed ring is wrong: render()
+fills a planar bus whose channel stride IS nframes, so a block only lands in a frame-indexed ring
+through a per-channel copy. A ring of block-sized SLOTS already has that stride, so the engine
+renders straight into the FIFO and the backend converts straight out of it, no copy on either side.
+The cost is that a device request can span slots, so `sink_quant_out_fn` takes a frame offset and is
+called once per contiguous run. Pass-through (the device asked for exactly one block and the FIFO is
+empty) then falls out as one run with no residue rather than needing a separate path; it is counted
+(`h_passthrough`) so a backend that pins the device size can see it paid nothing.
+
+Two rules the spec is right to be emphatic about, both now pinned by `test_sink_quant`. Each
+rendered block's `sample_pos` is the device frame index its first sample lands on, not a block
+counter. And two blocks rendered inside ONE device callback must not share `system_time_ns`: the
+second gets the callback's host time plus the nominal duration of the frames queued ahead of it,
+because a repeated host time feeds the device-versus-host drift fit a zero-slope pair, which is
+worse than no pair at all.
+
+The test's shape is worth keeping. The render writes a value derived from its own TIMESTAMP, and the
+device side checks each frame against the value its own stream index implies, so one comparison pins
+three claims at once (ordered concatenation, nothing duplicated or dropped, and the sample_pos rule)
+and a wrong stamp corrupts audio rather than merely failing a stamp assertion, which is what a wrong
+stamp does in the field. Per the CLAUDE.md trap the pop arithmetic was broken on purpose (the slot
+retired one frame early) and the test went red on the concatenation AND the pass-through-versus-FIFO
+bit-identity checks before being trusted green.
+
+`wasapi_sink.cpp` closes a live defect: `cave_both` had never had a monitor on hardware, because the
+ASIO SDK holds one current driver per process and the second open was refused. Under AUTO the array
+takes ASIO and the 2-channel monitor request takes WASAPI, so the profile resolves on its own. The
+monitor is now opened for the ARRAY's block rather than `cfg.block_size`, which is what makes the
+"same buffer size" check pass when the driver picks its own size: the adapter can render exactly
+that. Shared mode is the default because a VR runtime, a browser and the OS all keep audio open on
+the same endpoint; `BWA_SINK_FLAG_EXCLUSIVE` opts out. A lost device (`AUDCLNT_E_DEVICE_INVALIDATED`,
+or the event simply not firing) sets `health.device_lost` and the sink degrades to the null-sink loop
+so clocks, playheads and scheduled plays keep advancing while the audio goes silent. Nothing reopens
+on its own, matching the existing gap on ASIO's reset request.
+
+The AUTO order is the one behavior change: a headphone profile on Windows now opens the Windows
+default output instead of the first registered ASIO driver, which on a rig machine could be the
+Digiface, playing the monitor into Dante channels 1 and 2. The array never chooses WASAPI. A `device`
+string matches EXACTLY against the friendly name then the stable id, and under AUTO a backend with no
+device by that name is skipped rather than opened on its default. This machine lists five render
+endpoints, three of them named "Speakers (...)", which is exactly why there is no substring matching
+and why the id is the string to persist.
+
+ABI: one minor bump, 0.13 to 0.14. `bwa_desc` keeps its layout, with `asio_driver` becoming an
+anonymous union alongside `device` (both spellings compile, and the C# and GDExtension field offsets
+do not move) and `sink_flags` carved out of `reserved[0]`. `bwa_health` gains `device_lost`, which is
+the layout change the bump covers. `bwa_get_sink_type` stops matching the backend STRING by prefix
+and reads a `type` field the vtable now carries, a rule that could not have survived a second backend
+whose name starts with the same letters.
+
+**The shared-mode WASAPI dropout, settled.** The first cut left `measured = true` on a shared stream
+whose dropout count was structurally zero, which is exactly the lie `measured` exists to prevent.
+The queued-depth rule cannot serve shared mode: the request size is `bufferFrameCount -
+GetCurrentPadding()`, which is precisely what the engine consumed since the last callback, so
+`written` telescopes to follow the device position and the depth never goes negative however late
+the render is.
+
+The obvious replacement, `GetCurrentPadding() == 0` at a wake, does not work either, and it took a
+live starve to show it. This client refills the buffer to FULL every event, and a starve leaves the
+stream event already signalled, so the catch-up wake returns immediately and reports the frames just
+written rather than an empty buffer. A render stalled past two full buffers produced zero
+padding-is-zero wakes on a real endpoint.
+
+What does work is the release interval, and it is a measurement rather than an inference: because
+every event tops the buffer up to full, the device holds `bufferFrameCount` frames after each
+`ReleaseBuffer` and runs dry exactly that many frames later. A release landing after that deadline
+proves the device had nothing of ours in between, and the excess IS the silent frame count. The same
+headroom argument the padding rule needed still applies and now decides `measured`: the buffer must
+be deeper than one period, or a normal cycle sits on the deadline and jitter reads as a fault. On
+this endpoint (1056-frame buffer, 480-frame period) the rule is armed; on a one-period endpoint
+`measured` reports false, which is the honest answer.
+
+The counters stay in `sink_quant` (`sink_quant_note_dropout`) rather than in the backend, so a
+backend that detects a fault its own way still reports through one readback path and the two cannot
+drift. `test_audio_sink` pins both halves: a healthy 200 ms run counts zero, then a one-shot
+`Sleep` of two full buffers inside the render callback counts exactly one dropout of about 2860
+frames. The deliberate-red check made the threshold one notch too strict (four buffers instead of
+one) and the starve assertion went red before the rule was trusted.

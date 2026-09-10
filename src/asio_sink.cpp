@@ -21,6 +21,9 @@ extern "C" {
 #include "sink.h"
 #include "profile.h"
 }
+/* Outside the extern "C" block on purpose: it is all static inline, so it has no linkage to
+ * declare, and it pulls in <string.h>, whose C++ overloads cannot be given C linkage. */
+#include "sink_convert.h"
 
 #include "asiosys.h"
 #include "asio.h"
@@ -51,6 +54,7 @@ struct AsioSink {
     void*           user;
     ASIOBufferInfo  bufferInfos[64];
     ASIOChannelInfo channelInfos[64];
+    sink_fmt        fmt[64];         /* channelInfos[c].type resolved at open (see asio_fmt) */
     ASIOCallbacks   callbacks;
     float*          bus;             /* planar channels * buffer_size; engine renders here */
     uint64_t        fallback_pos;    /* internal block counter for when the driver's sample position is invalid */
@@ -85,54 +89,22 @@ inline uint64_t asio64(unsigned long hi, unsigned long lo) {
 inline uint64_t samples_u64(const ASIOSamples& s)   { return asio64(s.hi, s.lo); }
 inline uint64_t timestamp_ns(const ASIOTimeStamp& t){ return asio64(t.hi, t.lo); }
 
-inline int32_t to_i32(float v) {
-    if (v >=  1.0f) return  2147483647;
-    if (v <= -1.0f) return -2147483647 - 1;
-    if (v != v)     return 0;       /* NaN (reachable with the limiter disabled): both clamps read
-                                     * false, and float->int out of range is UB. Silence, not a pop. */
-    return (int32_t)(v * 2147483647.0f);
-}
-
-/* Sample types convert_out knows how to write. Channels with any other type are
- * rejected at open(), so the audio callback never hits convert_out's default case. */
+/* Sample types the shared converter knows how to write. Channels with any other type are
+ * rejected at open(), so the audio callback never meets one. */
 inline bool type_supported(long type) {
     return type == ASIOSTFloat32LSB || type == ASIOSTInt32LSB ||
            type == ASIOSTInt24LSB   || type == ASIOSTInt16LSB;
 }
 
-/* Convert one channel of the planar float bus to the driver's native sample type. */
-void convert_out(void* dst, const float* src, long n, long type) {
+/* ASIO's sample-type constant -> the backend-agnostic one (sink_convert.h). Resolved ONCE per
+ * channel at open, so the callback indexes an array instead of re-deciding per block. The clamp
+ * and NaN rules moved to sink_convert.h with the conversion; they did not change. */
+inline sink_fmt asio_fmt(long type) {
     switch (type) {
-    case ASIOSTFloat32LSB:
-        memcpy(dst, src, (size_t)n * sizeof(float));
-        break;
-    case ASIOSTInt32LSB: {
-        int32_t* d = (int32_t*)dst;
-        for (long i = 0; i < n; ++i) d[i] = to_i32(src[i]);
-        break;
-    }
-    case ASIOSTInt24LSB: {
-        uint8_t* d = (uint8_t*)dst;                 /* packed 3-byte little-endian */
-        for (long i = 0; i < n; ++i) {
-            int32_t v = to_i32(src[i]) >> 8;        /* top 24 bits */
-            d[i*3+0] = (uint8_t)(v       & 0xFF);
-            d[i*3+1] = (uint8_t)((v >> 8)  & 0xFF);
-            d[i*3+2] = (uint8_t)((v >> 16) & 0xFF);
-        }
-        break;
-    }
-    case ASIOSTInt16LSB: {
-        int16_t* d = (int16_t*)dst;
-        for (long i = 0; i < n; ++i) {
-            float v = src[i];
-            v = v >  1.0f ?  1.0f : (v < -1.0f ? -1.0f : v);
-            if (v != v) v = 0.0f;   /* NaN slips both clamp compares; float->int16 would be UB */
-            d[i] = (int16_t)(v * 32767.0f);
-        }
-        break;
-    }
-    default:                                         /* unreachable: rejected at open() */
-        break;
+    case ASIOSTInt32LSB: return SINK_FMT_I32;
+    case ASIOSTInt24LSB: return SINK_FMT_I24;
+    case ASIOSTInt16LSB: return SINK_FMT_I16;
+    default:             return SINK_FMT_F32;   /* ASIOSTFloat32LSB; anything else was rejected */
     }
 }
 
@@ -207,7 +179,7 @@ ASIOTime* bufferSwitchTimeInfo(ASIOTime* timeInfo, long index, ASIOBool /*proces
     for (uint32_t c = 0; c < s->channels; ++c) {
         void*        dst = s->bufferInfos[c].buffers[index];
         const float* src = s->bus + (size_t)c * s->buffer_size;
-        convert_out(dst, src, s->buffer_size, s->channelInfos[c].type);
+        sink_convert_planar(dst, src, (uint32_t)s->buffer_size, s->fmt[c]);   /* ASIO buffers are PLANAR */
     }
     BWA_ZONE_END(zcv);
     if (s->post_output) ASIOOutputReady();
@@ -303,6 +275,7 @@ void asio_health(bwa_sink* base, bwa_sink_health* out) {
 }
 
 const bwa_sink_vtbl ASIO_VT = {   /* designated: stop/close share a signature, so a positional swap would be silent */
+    .type = BWA_SINK_ASIO,
     .start = asio_start, .stop = asio_stop, .close = asio_close,
     .backend = asio_backend, .block_size = asio_block_size,
     .output_latency = asio_output_latency,
@@ -490,6 +463,7 @@ extern "C" bwa_sink* bwa_asio_sink_open(uint32_t sample_rate, uint32_t block_siz
             ASIOExit(); asioDrivers->removeCurrentDriver(); free(s);
             return nullptr;
         }
+        s->fmt[c] = asio_fmt(s->channelInfos[c].type);
     }
 
     /* Allocate the bus and publish g_sink BEFORE ASIOCreateBuffers: a driver may pre-roll

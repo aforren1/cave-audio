@@ -75,16 +75,20 @@ static const struct { const char* name; float absorption[3], scattering, transmi
  *
  * NOTE: an ASIO driver picks its own buffer size, usually != cfg.block_size. binaural/cave_sim
  * size their render scratch to BWA_MAX_BLOCK and render whatever block the device dictates, so they
- * work with any driver. The 'cave_both' double-buffer still assumes the two devices share
- * cfg.block_size (a mismatched monitor block is silenced; the array renders any size). Live
- * headphone output works through a 2-ch ASIO driver (ASIO4ALL / FlexASIO / the Steinberg
- * built-in); WASAPI is future. */
+ * work with any driver. The 'cave_both' double-buffer still assumes the two devices render the same
+ * block (a mismatched monitor block is silenced; the array renders any size), which is why the
+ * monitor is opened for the ARRAY's block rather than cfg.block_size. Live headphone output goes to
+ * a WASAPI endpoint (wasapi_sink.cpp, the AUTO choice for a 2-channel request on Windows) or to a
+ * 2-ch ASIO driver; cave_both takes both at once, ASIO for the array and WASAPI for the monitor,
+ * which is the pair the one-driver-per-process ASIO SDK could never give it. */
 struct bwa_engine {
     bwa_desc    cfg;
     int         started;
     const char* last_error;        /* points at errbuf or a literal; NULL when clean */
     char        errbuf[256];
-    char        backend_buf[96];   /* bwa_get_audio_backend readback (device + which monitor is live) */
+    char        backend_buf[288];  /* bwa_get_audio_backend readback (device + which monitor is live).
+                                    * Sized for a WASAPI endpoint name, which is the OS's friendly
+                                    * string and can run well past an ASIO driver's 32 bytes. */
     bwa_profile   profile;
     int         panner;            /* mirror of bwa_set_panner (bwa_panner; 0 = DBAP) for the room_eq start guard */
 
@@ -446,7 +450,7 @@ bwa_engine* bwa_create(const bwa_desc* cfg) {
      * copy would dangle. Copy here, free in bwa_destroy. _strdup-fail -> NULL = the documented default. */
     e->cfg.layout_path = cfg->layout_path ? _strdup(cfg->layout_path) : NULL;
     e->cfg.hrtf_path   = cfg->hrtf_path   ? _strdup(cfg->hrtf_path)   : NULL;
-    e->cfg.asio_driver = cfg->asio_driver ? _strdup(cfg->asio_driver) : NULL;
+    e->cfg.device      = cfg->device ? _strdup(cfg->device) : NULL;   /* asio_driver is the same field */
     return e;
 }
 
@@ -508,12 +512,17 @@ bwa_result bwa_start(bwa_engine* e) {
     const uint32_t sr = e->cfg.sample_rate, bs = e->cfg.block_size;
     e->cap = bs;
 
+    /* exact_rate is the ARRAY's rule and only the array's: a resampled array shifts every
+     * per-speaker delay, which is the whole point of the alignment stage. A headphone sink may
+     * let the OS resample and report the degradation (bwa_last_error after a successful start). */
     if (e->profile == BWA_PROFILE_CAVE) {
-        e->sink = bwa_sink_open(sr, bs, e->layout.count, (int)e->cfg.sink, e->cfg.asio_driver, render_cave, e, e->errbuf, sizeof e->errbuf);
+        e->sink = bwa_sink_open(sr, bs, e->layout.count, e->cfg.sink, e->cfg.device, e->cfg.sink_flags,
+                                true, render_cave, e, e->errbuf, sizeof e->errbuf);
     } else if (e->profile == BWA_PROFILE_BINAURAL || e->profile == BWA_PROFILE_CAVE_SIM) {
         e->scratch26 = (float*)calloc((size_t)BWA_MAX_BLOCK * BWA_CHANNELS, sizeof(float));
         if (e->scratch26)
-            e->sink = bwa_sink_open(sr, bs, 2, (int)e->cfg.sink, e->cfg.asio_driver, render_binaural, e, e->errbuf, sizeof e->errbuf);
+            e->sink = bwa_sink_open(sr, bs, 2, e->cfg.sink, e->cfg.device, e->cfg.sink_flags,
+                                    false, render_binaural, e, e->errbuf, sizeof e->errbuf);
     } else { /* cave_both: a 26-ch array sink + a 2-ch monitor sink sharing a double-buffer */
         /* Size the handoff for ANY device block (the ASIO driver picks its own, != cfg.block_size in
          * general); cap is set to the ACTUAL array block below, once the sink reports it. */
@@ -523,14 +532,21 @@ bwa_result bwa_start(bwa_engine* e) {
         e->mon_idx = 0;
         e->mon_seq[0] = e->mon_seq[1] = 0;              /* even = stable (calloc'd silence) */
         if (e->mon_buf[0] && e->mon_buf[1] && e->mon_last) {
-            e->sink = bwa_sink_open(sr, bs, e->layout.count, (int)e->cfg.sink, e->cfg.asio_driver, render_both_array, e, e->errbuf, sizeof e->errbuf);
+            e->sink = bwa_sink_open(sr, bs, e->layout.count, e->cfg.sink, e->cfg.device, e->cfg.sink_flags,
+                                    true, render_both_array, e, e->errbuf, sizeof e->errbuf);
             if (e->sink) {
                 e->cap = bwa_sink_block_size(e->sink);   /* the array's real block; render_both_* gate on it */
-                e->sink_mon = bwa_sink_open(sr, bs, 2, (int)e->cfg.sink, e->cfg.asio_driver, render_both_monitor, e, e->errbuf, sizeof e->errbuf);
+                /* The monitor goes through the SAME bwa_sink_open, and that is what finally makes this
+                 * profile work on hardware: under AUTO a 2-channel request resolves to WASAPI while the
+                 * array holds the one ASIO driver the SDK allows per process. It is asked for the
+                 * ARRAY's block, not cfg.block_size, because the handoff below exchanges cap-sized
+                 * blocks and the fixed-quantum adapter can render exactly that. */
+                e->sink_mon = bwa_sink_open(sr, e->cap, 2, e->cfg.sink, e->cfg.device, e->cfg.sink_flags,
+                                            false, render_both_monitor, e, e->errbuf, sizeof e->errbuf);
                 /* the double-buffer handoff exchanges cap-sized blocks, so the two devices must agree.
                  * A mismatch would leave the monitor silent — fail with a clear message instead. */
                 if (e->sink_mon && bwa_sink_block_size(e->sink_mon) != e->cap) {
-                    set_error(e, "cave_both profile: the array and monitor ASIO devices must use the same buffer size");
+                    set_error(e, "cave_both profile: the array and monitor devices must render the same block size");
                     engine_close_devices(e);
                     return BWA_ERR_DEVICE;
                 }
@@ -543,6 +559,12 @@ bwa_result bwa_start(bwa_engine* e) {
         engine_close_devices(e);
         return BWA_ERR_DEVICE;
     }
+    /* The "succeeded but degraded" channel (bwa_last_error's documented exception): a sink that
+     * OPENED but had to accept something less than asked for writes the reason into errbuf and
+     * still returns a sink. A headphone backend falling back on the OS resampler is the case that
+     * exists today. Without this the message would sit in errbuf unreferenced and bwa_last_error
+     * would report a clean start. */
+    if (e->errbuf[0]) set_error(e, e->errbuf);
 
 #ifdef BWA_HAVE_STEAMAUDIO
     /* production HRTF decode for the headphone profiles. phonon's effect frameSize is fixed at
@@ -702,7 +724,7 @@ void bwa_destroy(bwa_engine* e) {
     rt_destroy(e->rt);
     free((void*)e->cfg.layout_path);                    /* owned copies from bwa_create */
     free((void*)e->cfg.hrtf_path);
-    free((void*)e->cfg.asio_driver);
+    free((void*)e->cfg.device);
     free(e);
 }
 
@@ -732,15 +754,12 @@ uint32_t bwa_get_sample_rate(bwa_engine* e) { return e ? e->cfg.sample_rate : 0;
 uint32_t bwa_get_block_size (bwa_engine* e) { return e ? e->cfg.block_size  : 0; }
 
 /* The machine-readable side of bwa_get_audio_backend: once a sink is open, AUTO has resolved to
- * what actually opened (derived from the sink's own backend id); otherwise the configured policy. */
+ * what actually opened; otherwise the configured policy. The sink's vtable NAMES its backend, so
+ * this no longer matches the human-readable backend string by prefix - a rule that could not have
+ * survived a second backend whose name starts with the same letters. */
 bwa_sink_type bwa_get_sink_type(bwa_engine* e) {
     if (!e) return BWA_SINK_NULL;
-    if (e->sink) {
-        const char* b = bwa_sink_backend(e->sink);
-        if (strncmp(b, "asio", 4) == 0) return BWA_SINK_ASIO;
-        if (strcmp(b, "manual") == 0)   return BWA_SINK_MANUAL;
-        return BWA_SINK_NULL;
-    }
+    if (e->sink) return bwa_sink_type_of(e->sink);
     return e->cfg.sink;
 }
 
@@ -828,24 +847,26 @@ uint32_t bwa_sound_get_channels(bwa_engine* e, bwa_sound snd) {
     return e ? (uint32_t)rt_sound_channels(e->rt, snd) : 0;
 }
 
-/* Engine-free device query: forwards to asio_sink.cpp's registry enumeration (a no-ASIO build
- * reports zero drivers — the null/offline sink is the only backend there anyway). */
-uint32_t bwa_get_asio_driver_count(void) {
-#ifdef BWA_HAVE_ASIO
-    return sink_asio_driver_count();
-#else
-    return 0;
-#endif
+/* Engine-free device query: forwards to sink.c, which dispatches to whichever backend owns the
+ * requested type (ASIO's registry list, WASAPI's endpoint enumeration). A backend this build does
+ * not carry, and AUTO/NULL/MANUAL, report zero devices rather than guessing. */
+uint32_t bwa_get_device_count(bwa_sink_type backend) {
+    return sink_device_count(backend);
+}
+bool bwa_get_device_name(bwa_sink_type backend, uint32_t index, char* buf, uint32_t cap) {
+    return sink_device_name(backend, index, buf, cap);
+}
+bool bwa_get_device_id(bwa_sink_type backend, uint32_t index, char* buf, uint32_t cap) {
+    return sink_device_id(backend, index, buf, cap);
 }
 
+/* The ASIO-only spelling, kept as a wrapper because both bindings and the calibration tools
+ * call it. */
+uint32_t bwa_get_asio_driver_count(void) {
+    return sink_device_count(BWA_SINK_ASIO);
+}
 bool bwa_get_asio_driver_name(uint32_t index, char* buf, uint32_t cap) {
-#ifdef BWA_HAVE_ASIO
-    return sink_asio_driver_name(index, buf, cap);
-#else
-    if (buf && cap) buf[0] = 0;
-    (void)index;
-    return false;
-#endif
+    return sink_device_name(BWA_SINK_ASIO, index, buf, cap);
 }
 
 bwa_sound bwa_load_ambix(bwa_engine* e, const char* path) {
@@ -1099,6 +1120,9 @@ bool bwa_get_health(bwa_engine* e, bwa_health* out) {
      * reported whether or not the device could be measured. */
     out->stream_starves = rt_stream_starves(e->rt);
     out->peak_load      = h.period_ns ? (float)((double)h.render_ns_peak / (double)h.period_ns) : 0.f;
+    /* Reported whether or not the device could be measured: "the device went away" is a fact the
+     * sink observed, not an inference from a position it may never have been given. */
+    out->device_lost    = h.device_lost;
     return h.measured;
 }
 

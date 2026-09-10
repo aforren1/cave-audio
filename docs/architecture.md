@@ -50,6 +50,13 @@ one channel per speaker. *Consumers* read that bus:
   *after* the panner, so it auditions the real array render (DBAP behavior and
   all), not an idealized version.
 
+A *device sink* is one file behind one small vtable (`src/sink.h`), so which OS API carries the
+bus is a detail the core never sees. Windows has two: ASIO for the array, and WASAPI
+(`src/wasapi_sink.cpp`) for a stereo monitor on an ordinary endpoint. `cave_both` runs both at
+once. Backends that cannot pin their callback size render through the fixed-quantum adapter
+(`src/sink_quant.c`), so the engine's block stays fixed whatever the device does. See
+[backends.md](./backends.md).
+
 The sim monitor is just a second consumer of the bus. Keep it that way. The
 abstraction set is: a **render target** (the bus), one or more **device sinks**
 consuming buses, and the monitor as a **bus→bus transform** (N→2) feeding a
@@ -241,10 +248,16 @@ orientation component.
 
 ## Locked decisions
 
-- **Transport: ASIO, not WDM.** WDM is a consumer path with its own mixing, resampling and
-  channel limits. ASIO is the multichannel low-latency route, and the only one that gives
-  you the timing hooks below. The CAVE's 26 channels make it mandatory. The device must
-  expose enough outputs for your layout: 26 for the CAVE array.
+- **Transport: ASIO for the array on Windows; any system backend for a stereo monitor.**
+  The array goes over ASIO and nothing else. The consumer paths (WDM, and WASAPI shared mode
+  over it) bring their own mixing, resampling and channel limits, and none of them give you the
+  timing hooks below. The CAVE's 26 channels make ASIO mandatory, and the device must expose
+  enough outputs for your layout: 26 for the CAVE array. A **stereo monitor** is a different
+  problem with a different answer: it wants the device the headphones are already on, it shares
+  that device with everything else the machine is playing, and its timing only has to be
+  consistent. So the headphone profiles open a WASAPI endpoint by default and the automatic
+  choice never routes the array there. Same rule stated once: the array picks the transport,
+  the monitor picks the device.
 - **ASIO SDK used directly** under its GPLv3 option (dual-licensed GPLv3/proprietary
   as of Oct 2025), for direct access to the timing hooks. See `docs/build.md` for
   copyleft notes.

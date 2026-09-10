@@ -133,8 +133,8 @@ render):
 | profile                 | what renders |
 |-------------------------|--------------|
 | `BWA_PROFILE_CAVE`      | bus → ASIO → Dante (production). Listener **position** only - real speakers, real ears. |
-| `BWA_PROFILE_BINAURAL`  | the first-class headphone render → any 2-ch ASIO device. Point sources (and their ISM reflections) skip the speaker panner: with the SDK each point voice gets its **own true HRTF convolution**, without it each SH-encodes at its **true** listener-relative direction into a shared field. Beds pass SH→SH, pathing sums in directly; only the FDN/reflection-bed tails ride the bus as virtual speakers. None of the array's phantom-source spread. Full **pose**. Render details: [spatialization.md](./spatialization.md#headphone-renders-direct-binaural-and-the-array-sim). |
-| `BWA_PROFILE_CAVE_SIM`  | bus → HRTF monitor → any 2-ch ASIO device (array auditioning). Each bus channel is a virtual speaker at its surveyed room position, DBAP artifacts included; full **pose** - head orientation turns the virtual array around you. |
+| `BWA_PROFILE_BINAURAL`  | the first-class headphone render → any 2-channel output device (a WASAPI endpoint on Windows, or an ASIO driver). Point sources (and their ISM reflections) skip the speaker panner: with the SDK each point voice gets its **own true HRTF convolution**, without it each SH-encodes at its **true** listener-relative direction into a shared field. Beds pass SH→SH, pathing sums in directly; only the FDN/reflection-bed tails ride the bus as virtual speakers. None of the array's phantom-source spread. Full **pose**. Render details: [spatialization.md](./spatialization.md#headphone-renders-direct-binaural-and-the-array-sim). |
+| `BWA_PROFILE_CAVE_SIM`  | bus → HRTF monitor → any 2-channel output device (array auditioning). Each bus channel is a virtual speaker at its surveyed room position, DBAP artifacts included; full **pose** - head orientation turns the virtual array around you. |
 | `BWA_PROFILE_CAVE_BOTH` | array to Dante + the `CAVE_SIM` monitor tap, concurrently. |
 
 Pick by question, not habit: *"what will the room do?"* is `CAVE_SIM`; it hears
@@ -379,16 +379,16 @@ render, for when headphones are the product rather than the probe.
 
 ```c
 // The rig's endpoint is an RME Digiface Dante. Its ASIO driver registers under RME's own
-// name, which is not the product name - enumerate with bwa_get_asio_driver_count/_name (or
-// bwa_calibrate --list-drivers) rather than hardcoding a guess. NULL auto-picks the first
-// driver with enough channels for the profile, which is usually what you want anyway.
+// name, which is not the product name - enumerate with bwa_get_device_count/_name (or
+// bwa_calibrate --list-drivers) rather than hardcoding a guess. NULL opens the backend's
+// default device, which is usually what you want anyway.
 bwa_desc cfg = { 0 };
 cfg.profile     = rig ? BWA_PROFILE_CAVE : BWA_PROFILE_CAVE_SIM;   // desk: audition the array render
 cfg.layout_path = rig ? "cave_layout.json" : NULL;         // desk: the default grid
-cfg.asio_driver = rig ? rig_driver_name : NULL;            // NULL = auto-pick
+cfg.device      = rig ? rig_driver_name : NULL;            // NULL = the backend's default
 bwa_engine* e = bwa_create(&cfg);
 if (bwa_start(e) != BWA_OK) { /* a rig layout that fails to load refuses to start */ }
-printf("backend: %s\n", bwa_get_audio_backend(e));         // "asio:<driver>" or "null"
+printf("backend: %s\n", bwa_get_audio_backend(e));         // "asio:<driver>", "wasapi:<endpoint>", "null"
 
 if (rig) {
     bwa_tracker_desc trk = { .server = "192.168.1.42" };   // Motive drives the listener
@@ -402,10 +402,11 @@ matter:
 - **Pose.** At the desk you push `bwa_set_listener_pose` per frame, and orientation turns the
   virtual array around your head. On the rig the tracker overrides it, and the array render
   uses position only.
-- **No device, still live.** With no usable ASIO driver the engine falls back to the silent
+- **No device, still live.** With no usable device the engine falls back to the silent
   null sink and keeps rendering (playing states, playheads, and clocks all advance), so CI and
-  visual-only demos run unchanged. Set `cfg.sink = BWA_SINK_ASIO` where silence would hide a
-  failure.
+  visual-only demos run unchanged. Name a backend in `cfg.sink` where silence would hide a
+  failure. At the desk you rarely need to: a headphone profile opens a WASAPI endpoint, so the
+  machine's ordinary output works with no driver to install.
 - **`BWA_PROFILE_CAVE_BOTH`** is the rig plus a monitor tap: the array over Dante and
   headphones at the operator's desk at once (the tap is the `CAVE_SIM` audition).
 
@@ -535,7 +536,7 @@ structs grow via reserved fields, but enum values and struct layouts are only gu
 major.minor). The resolved-config getters exist because every zero desc field means "default":
 `seconds = frames / bwa_get_sample_rate(e)` is always right, even when the desc said 0.
 `bwa_get_sink_type` is the machine-readable side of `bwa_get_audio_backend`: after `bwa_start`,
-`BWA_SINK_AUTO` has resolved to `ASIO` or `NULL`.
+`BWA_SINK_AUTO` has resolved to the concrete backend that opened.
 
 Every pointer argument across the API is **consumed before the call returns**: no call retains
 caller memory (`bwa_create` copies its path strings; descs, geometry, and position arrays are
@@ -549,13 +550,14 @@ Zero-init `bwa_desc` and set what you need; every field's zero is its default:
 | `layout_path`    | surveyed speaker geometry (JSON); cave/cave_both. NULL = the default 26-grid deliberately; a named file that fails to load fails `bwa_start` (`BWA_ERR_LAYOUT`) |
 | `hrtf_path`      | HRTF (SOFA) or NULL for built-in; the headphone profiles             |
 | `sample_rate`    | Hz; 0 = 48000, the **validated** rate. The DSP is rate-derived and 96 kHz renders correctly in software, but rates above 48 k are unverified against the real Digiface/Dante chain - treat 48 kHz as supported until the rig confirms more |
-| `block_size`     | render quantum, frames; 0 = 256. Also the ASIO buffer-size *hint* - a driver may run its own size (the sinks adapt); `bwa_get_block_size` reads back the resolved quantum |
-| `sink`           | output-device policy: `BWA_SINK_AUTO` (0, default - try ASIO, fall back to the silent null sink), `BWA_SINK_ASIO` (demand a device: an open failure fails `bwa_start` loudly), `BWA_SINK_NULL` (force the offline sink - CI, profiling, tracking-only), `BWA_SINK_MANUAL` (no device/thread - pump blocks yourself with `bwa_render_block`; deterministic, for golden tests) |
-| `asio_driver`    | ASIO driver name to open; NULL = auto-pick the first registered driver with enough output channels for the profile (the headphone profiles find a 2-ch driver, cave a ≥layout-count one) |
+| `block_size`     | render quantum, frames; 0 = 256. Also the device *period hint* - a driver or an OS mixer may run its own size, and the sinks adapt, but the quantum handed to the DSP is exactly this regardless; `bwa_get_block_size` reads it back |
+| `sink`           | output-device policy: `BWA_SINK_AUTO` (0, default - see [Sink policy](#sink-policy)), `BWA_SINK_ASIO` or `BWA_SINK_WASAPI` (demand that backend: an open failure fails `bwa_start` loudly), `BWA_SINK_NULL` (force the offline sink - CI, profiling, tracking-only), `BWA_SINK_MANUAL` (no device/thread - pump blocks yourself with `bwa_render_block`; deterministic, for golden tests) |
+| `device`         | device to open, for whichever backend opens it: the exact friendly name or the stable id from the [device query](#device-query-control-thread-no-engine-needed). NULL = that backend's default (ASIO: the first registered driver with enough output channels; WASAPI: the Windows default render endpoint). `asio_driver` is the legacy spelling of the same field |
 | `embree`         | ray-trace the acoustics sims on Intel Embree; silently falls back to the default tracer if the phonon build lacks it - see [Ray-tracing acceleration](#ray-tracing-acceleration-bwa_descembree) |
 | `enable_pathing` | run the sound-pathing sim from `bwa_start` (needs scene geometry + the Steam Audio build); sources opt in via `bwa_source_set_pathing` |
 | `bed_decoder`    | diffuse-bed SH→speaker decoder: 0 is the engine default (reserved, currently AllRAD), AllRAD (1) or EPAD (2) - see [Panner and layout query](#panner-and-layout-query-control-thread) |
-| `reserved[4]`    | zero; room to grow without an ABI break                             |
+| `sink_flags`     | backend options: `BWA_SINK_FLAG_EXCLUSIVE` opens a WASAPI endpoint in exclusive mode, which takes it from every other application on the machine. 0 (shared) is the default, because a monitor shares its endpoint with the game, the browser, and the OS |
+| `reserved[3]`    | zero; room to grow without an ABI break                             |
 
 ## Errors and return codes
 
@@ -613,7 +615,7 @@ update is corrected one frame later.
 ## Environment variables
 
 There are none. You configure everything through the API: the output device is
-`bwa_desc.sink`/`asio_driver`, Embree is `bwa_desc.embree`, pathing is `bwa_desc.enable_pathing`,
+`bwa_desc.sink`/`device`, Embree is `bwa_desc.embree`, pathing is `bwa_desc.enable_pathing`,
 reflection baking is `bwa_reflections_desc.bake`, and the OptiTrack connection is
 `bwa_tracker_connect` (all of these used to be `BWA_*` env vars). One door per knob.
 
@@ -629,20 +631,79 @@ applies to occlusion and reflections together. The vendored prebuilt `phonon.dll
 Embree-enabled, so the flag currently falls back; to activate it, drop in a `phonon` built with
 Embree (the SDK's `STEAMAUDIO_ENABLE_EMBREE` path) and ship `embree4.dll` + `tbb*.dll` alongside.
 
-## ASIO device query (control thread, no engine needed)
+## Sink policy
+
+`bwa_desc.sink` decides which device backend opens. The full backend design, and the ones still
+to come, are in [backends.md](./backends.md).
+
+`BWA_SINK_AUTO` (the default) picks by channel count, because the two output paths want
+different hardware:
+
+| request                        | Windows order          |
+|--------------------------------|------------------------|
+| 2 channels (headphone profiles, the `cave_both` monitor) | WASAPI, ASIO, null |
+| more than 2 channels (the array) | ASIO, null           |
+
+A headphone profile therefore opens the **Windows default output**, which is the device the
+headphones are on. That is the one behavior change from earlier versions: the old order picked
+the first registered ASIO driver, which on a rig machine could be the Digiface, and played the
+monitor into Dante channels 1 and 2. The array never chooses WASAPI, because the array's
+transport is a settled decision ([architecture.md](./architecture.md)).
+
+`cave_both` resolves on its own from that: the array takes ASIO and the monitor takes WASAPI, so
+the profile finally opens both devices at once. The ASIO SDK holds one driver per process, which
+is why it could not before.
+
+Naming a backend is a **demand**. `BWA_SINK_ASIO` or `BWA_SINK_WASAPI` fails `bwa_start` loudly
+when the device does not open, instead of falling back to silence. A backend this build does not
+carry (`BWA_SINK_COREAUDIO`, `BWA_SINK_ALSA`, `BWA_SINK_AAUDIO`, `BWA_SINK_JACK` on Windows)
+fails with a message that says so.
+
+`bwa_desc.device` names the device for whichever backend opens it. It matches **exactly** against
+the friendly name, then exactly against the stable id: no substring matching, because two
+endpoints called "Speakers" are common and a picker hands back an exact string. Under AUTO, a
+backend that has no device by that name is skipped rather than opened on its default, so the name
+reaches the backend that owns it.
+
+**Sample rate.** The array demands its rate: the device runs at `bwa_desc.sample_rate` or the open
+fails, since a resampled array shifts every per-speaker delay. A headphone sink may let the OS
+resample, and then reports the degradation through `bwa_last_error` after a **successful**
+`bwa_start`. Check it there.
+
+`bwa_last_error` carries the other AUTO degradations too, for the same reason. A start that fell
+through to the silent offline sink says why the real device did not open, and a `device` name no
+compiled backend has says that rather than opening a default. Both are successful starts, so the
+message is the only thing that tells you the room is about to be quiet.
+
+## Device query (control thread, no engine needed)
 
 ```c
+uint32_t bwa_get_device_count(bwa_sink_type backend);
+bool     bwa_get_device_name(bwa_sink_type backend, uint32_t index, char* buf, uint32_t cap);
+bool     bwa_get_device_id  (bwa_sink_type backend, uint32_t index, char* buf, uint32_t cap);
+// the ASIO-only spelling, kept for existing callers:
 uint32_t bwa_get_asio_driver_count(void);
-bool     bwa_get_asio_driver_name(uint32_t index, char* buf, uint32_t cap);  // NUL-terminated; false = out of range
+bool     bwa_get_asio_driver_name(uint32_t index, char* buf, uint32_t cap);
 ```
 
-Enumerate the OS's **registered** ASIO drivers: call before `bwa_create` to populate a device
-picker, then pass the chosen name as `bwa_desc.asio_driver`. Names are UTF-8 (converted from the
-registry's ANSI codepage and back, so a localized name round-trips). Nothing is loaded or opened
-(it reads the registry fresh on every call), so it's safe alongside a running engine. A
-registered driver isn't necessarily *openable* (hardware unplugged, exclusive-mode busy); the
-truth test is still `bwa_start` + `bwa_get_audio_backend`. A no-ASIO build reports zero drivers.
-The tools ride the same registry (`--list-drivers` on the CLIs, picker dropdowns in the GUIs).
+Enumerate what a backend can open: call before `bwa_create` to populate a device picker, then
+pass the chosen string as `bwa_desc.device`. `backend` must be concrete; `BWA_SINK_AUTO`,
+`BWA_SINK_NULL` and `BWA_SINK_MANUAL` report 0 devices, and so does a backend this build does not
+carry.
+
+Both strings are UTF-8 and both are accepted by `bwa_desc.device`. Prefer the **id** when you
+persist a choice: friendly names collide (a headset and its dock often share one) and change when
+a driver updates. ASIO has no separate id, so it reports the driver name for both.
+
+Index 0 is the platform default where the backend has one. WASAPI's index 0 is the Windows
+default render endpoint, and the rest follow with that one not repeated. ASIO has no default, so
+index 0 is just the first registered driver.
+
+Nothing is loaded or opened, and the list is read fresh on every call, so a driver or endpoint
+that appeared since the last call shows up and the query is safe alongside a running engine. A
+listed device is not necessarily *openable* (hardware unplugged, exclusive-mode busy); the truth
+test is still `bwa_start` + `bwa_get_audio_backend`. The tools ride the same query
+(`--list-drivers` on the CLIs, picker dropdowns in the GUIs).
 
 ## Assets (control thread, file I/O)
 
@@ -1972,6 +2033,7 @@ speaker gizmo from this.
 typedef struct bwa_health {
     uint64_t blocks, xruns, dropped_frames, driver_resyncs, late_blocks, stream_starves;
     float    peak_load;      // worst block's render time / block period
+    uint32_t device_lost;    // nonzero: the device went away; the engine is host-pacing silence
 } bwa_health;
 bool     bwa_get_health(bwa_engine* e, bwa_health* out);  // false = this setup cannot measure
 uint64_t bwa_get_xruns(bwa_engine* e);                    // the one-line form
@@ -1994,6 +2056,11 @@ The fields answer two different questions with two different fixes:
 - **`stream_starves`** is neither. The device kept its deadline and a *streamed voice* had nothing to
   give it, because the disk thread didn't refill in time; that block's tail rendered silence. It
   sounds identical to a clip ending, which is exactly why it is counted separately.
+- **`device_lost`** is none of the three. The device itself went away: unplugged, reset by its
+  driver, or its session torn down. The engine keeps rendering, paced from the host clock, so
+  clocks and playheads stay live and every scheduled play still lands - and the audio is silent.
+  **Nothing reopens on its own.** Call `bwa_stop` then `bwa_start` to pick a device up again, or
+  leave it and show the state. A backend that cannot detect a lost device always reports 0.
 
 Read them against `blocks`. One xrun in two million blocks is a machine hiccup; one in a thousand is
 a configuration to fix.

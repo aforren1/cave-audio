@@ -109,6 +109,7 @@ endif()
 add_library(bw_audio SHARED
   src/engine.c
   src/sink.c
+  src/sink_quant.c              # the fixed-quantum adapter every non-ASIO backend renders through
   src/null_sink.c
   src/manual_sink.c
   src/profile_self.c            # bwa_prof_reset/report exported unconditionally; accumulation gated by BWA_PROFILE_SELF
@@ -180,6 +181,25 @@ if(BWA_WITH_ASIO)
   message(STATUS "bw_audio: ASIO backend ENABLED (${ASIO_SDK_DIR})")
 else()
   message(STATUS "bw_audio: ASIO backend disabled (no SDK at ${ASIO_SDK_DIR}); null sink only")
+endif()
+
+# ---- WASAPI backend (Windows system mixer: the headphone profiles + the cave_both monitor) ----
+# No SDK to vendor - the headers ship with the Windows SDK - so this is ON wherever it can build,
+# and cannot be forced on elsewhere. ole32: COM + the endpoint enumerator. avrt: the "Pro Audio"
+# MMCSS class the render thread joins.
+option(BWA_WITH_WASAPI "Build the WASAPI backend (Windows only)" ON)
+if(BWA_WITH_WASAPI AND WIN32)
+  enable_language(CXX)
+  # C++20 on the DLL: wasapi_sink.cpp uses designated initializers (WASAPI_VT), which MSVC gates
+  # behind /std:c++20. Target-scoped, and idempotent with the ASIO block's identical request.
+  target_compile_features(bw_audio PRIVATE cxx_std_20)
+  target_sources(bw_audio PRIVATE src/wasapi_sink.cpp)
+  target_compile_definitions(bw_audio PRIVATE BWA_HAVE_WASAPI)
+  target_link_libraries(bw_audio PRIVATE ole32 avrt)
+  message(STATUS "bw_audio: WASAPI backend ENABLED")
+else()
+  set(BWA_WITH_WASAPI OFF)
+  message(STATUS "bw_audio: WASAPI backend disabled (Windows only)")
 endif()
 
 # ---- optional Steam Audio backend (production binaural HRTF decode; later occlusion/reflections) ----
@@ -345,13 +365,41 @@ if(BWA_BUILD_TESTS)
   add_test(NAME golden COMMAND test_golden)
   bwa_copy_runtime_dll(test_golden)
 
-  # audio-loop check: drives the null sink directly (no core needed)
-  add_executable(test_audio_sink test/audio_sink_test.c src/sink.c src/null_sink.c src/manual_sink.c)
-  target_include_directories(test_audio_sink PRIVATE src)
+  # audio-loop check: drives the null sink directly (no core needed), plus one section per
+  # compiled device backend. The WASAPI section opens a live endpoint, so it is the one test here
+  # that can legitimately be unrunnable; it exits 77 (see SKIP_RETURN_CODE below) rather than pass.
+  add_executable(test_audio_sink test/audio_sink_test.c src/sink.c src/sink_quant.c
+                 src/null_sink.c src/manual_sink.c)
+  target_include_directories(test_audio_sink PRIVATE src include)
   if(WIN32)
     target_link_libraries(test_audio_sink PRIVATE winmm)
   endif()
+  if(BWA_WITH_WASAPI AND WIN32)
+    target_sources(test_audio_sink PRIVATE src/wasapi_sink.cpp)
+    target_compile_definitions(test_audio_sink PRIVATE BWA_HAVE_WASAPI)
+    target_compile_features(test_audio_sink PRIVATE cxx_std_20)
+    target_link_libraries(test_audio_sink PRIVATE ole32 avrt)
+  endif()
   add_test(NAME audio_sink COMMAND test_audio_sink)
+  # The WASAPI section opens a live endpoint. On a machine with no render endpoint (a CI runner)
+  # the sink fails cleanly and the test exits 77, which ctest reports as SKIPPED — never as a pass.
+  set_tests_properties(audio_sink PROPERTIES SKIP_RETURN_CODE 77)
+
+  # The shared bus->device conversion (src/sink_convert.h): header-only, so the test needs nothing
+  # but the header. Pure, always runs — the backends that use it cannot be tested on CI.
+  add_executable(test_sink_convert test/sink_convert_test.c)
+  target_include_directories(test_sink_convert PRIVATE src include)
+  add_test(NAME sink_convert COMMAND test_sink_convert)
+
+  # The fixed-quantum adapter (src/sink_quant.c) every non-ASIO backend renders through. Also pure:
+  # it fakes the device side, so the FIFO/timestamp/dropout arithmetic is pinned without hardware.
+  add_executable(test_sink_quant test/sink_quant_test.c src/sink_quant.c src/sink.c
+                 src/null_sink.c src/manual_sink.c)
+  target_include_directories(test_sink_quant PRIVATE src include)
+  if(WIN32)
+    target_link_libraries(test_sink_quant PRIVATE winmm)
+  endif()
+  add_test(NAME sink_quant COMMAND test_sink_quant)
 
   # off-RT-path checks that compile the core in (bwa_core PUBLIC includes propagate).
   # The old rt_test monolith is split in two (shared harness in test/rt_test_util.h):

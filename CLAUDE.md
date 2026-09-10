@@ -71,9 +71,28 @@ include/bw_audio.h      Public C ABI (authoritative contract).
 src/
   engine.c             public ABI: lifecycle + sink + forwards per-frame calls to rt. [M0/M1/M2]
   rt.h / rt.c          rings, voice table, commit snapshot, generation handles, mixer. [M2]
-  sink.h / sink.c      device-sink abstraction + backend dispatch. [M1]
+  sink.h / sink.c      device-sink abstraction + backend dispatch: the AUTO order (2-ch requests try
+                       WASAPI then ASIO, wider ones ASIO only) and the exact-match device rule. [M1/backends]
+  sink_convert.h       planar float bus -> the device's format (f32/i32/i24/i16), planar or
+                       interleaved. Moved out of asio_sink.cpp so every backend shares one set of
+                       clamp + NaN rules. [backends]
+  sink_quant.h/.c      the FIXED-QUANTUM adapter. render() must always see the engine block, but no
+                       device API past ASIO promises a fixed callback size, so this renders whole
+                       blocks into a ring of block-sized SLOTS (the stride render() already wants,
+                       so nothing copies) and serves the device any count. Owns the per-block
+                       timestamp rule, the written-versus-device-position dropout, and the
+                       late_blocks/render_ns_peak accounting for every backend it serves. [backends]
   null_sink.c          offline (no-hardware) sink: threaded silence + timestamps. [M1]
+  manual_sink.c        offline/deterministic sink: no thread, the caller pumps (bwa_render_block). [M1]
   asio_sink.cpp        ASIO host: driver load, bufferSwitch, sample-pos timestamp. [M1]
+  wasapi_sink.cpp      WASAPI host: the headphone profiles + the cave_both monitor, on the endpoint
+                       the headphones are actually on. Shared mode by default (IAudioClient3 period;
+                       a VR runtime keeps its own audio open beside us), exclusive under
+                       BWA_SINK_FLAG_EXCLUSIVE. IAudioClock for the timestamp pair,
+                       AUDCLNT_E_DEVICE_INVALIDATED -> health.device_lost with the sink degrading to
+                       host-paced silence so the engine's clocks keep advancing. It is also what
+                       finally lets cave_both open TWO devices: the ASIO SDK allows one driver per
+                       process. [backends]
   sound.h / sound.c    wav decode to mono float via dr_wav (Sound table lives in rt.c). [M3]
   assets.h / assets.c  the SHARED-ownership asset tier: a by-path cache (key = normalized path +
                        load flags, so "one file, memory vs streamed vs ambisonic" is just different
@@ -162,7 +181,7 @@ third_party/           asiosdk/ (GPLv3 option, fetched not committed), steam-aud
 
 Target: **Windows only** (ASIO is Windows-only; the Digiface is Windows/macOS). CMake.
 A future cross-platform move means abstracting the device layer (ASIO is just the
-Windows sink) — do not bake ASIO assumptions outside `asio_sink.c`.
+Windows sink) — do not bake any backend's assumptions outside its own `*_sink` file.
 
 ```
 cmake -S . -B build -A x64      # default generator = newest installed Visual Studio
@@ -171,7 +190,7 @@ ctest --test-dir build -C RelWithDebInfo      # runs the full test suite (test_*
 ```
 
 **Current state (M6 + occlusion).** The engine builds `bw_audio.dll` and the full ctest
-suite — 39 tests with the Steam Audio SDK, 34 without (the 5 SDK-gated ones are `reflect`,
+suite — 41 tests with the Steam Audio SDK, 36 without (the 5 SDK-gated ones are `reflect`,
 `bake`, `path`, `dynmesh`, `steam_decode`) — a count that INCLUDES the three GUI-tool suites
 (`calib_view`, `layout_tool`, `playground`), the four `validate_*` runs, and the four
 `example_*` runs (the console examples driven with `--tests`: offline sink, short waits), all
@@ -271,8 +290,32 @@ Regression-preventing gotchas. Each has bitten before or guards a real invariant
   GUID per project and breaks every reference into it, which is the exact failure the script exists
   to prevent. Both existing asmdefs also carried `noBwAudioReferences`, a mangled `noEngineReferences`
   that Unity silently ignores.
-- **Do not bake ASIO assumptions outside `asio_sink.cpp`.** ASIO is just the Windows sink; a
-  future cross-platform move abstracts the device layer behind the sink seam.
+- **Do not bake a backend's assumptions outside its own `*_sink` file.** ASIO is just the Windows
+  ARRAY sink and WASAPI just the Windows monitor sink; a future cross-platform move adds more
+  files behind the same seam and changes nothing else. The two shared pieces are deliberate
+  exceptions and carry no backend types: `sink_convert.h` and `sink_quant.c`.
+- **A device API that does not promise a fixed callback size must go through `sink_quant`.** ASIO
+  is the only backend whose buffer size is fixed once buffers exist. WASAPI shared mode hands out
+  `bufferFrameCount - GetCurrentPadding()`, which MOVES, and with the SDK the headphone decode is
+  built for one frame size and SILENCES any other (`steam_decode.c`). A backend that passes the
+  device's own count to render() therefore produces silence on some machines and not others,
+  which is the worst shape a bug can take. Two rules travel with the adapter: the FIFO is a ring
+  of block-sized SLOTS rather than of frames, because render()'s planar channel stride IS nframes
+  and only a slot has that stride (a frame-indexed ring would need a copy per block); and two
+  blocks rendered inside ONE device callback must not share `system_time_ns`, or the
+  device-versus-host drift fit gets a zero-slope pair, which is worse than no pair. The corollary
+  bit twice over: extrapolating those stamps FORWARD lets the NEXT callback land behind them when
+  a device catches up after a fault, and a backward stamp is worse than a flat one, so the adapter
+  also floors each stamp at the previous one plus a nominal block.
+- **A device API's "obvious" fault signal may be structurally unreachable.** WASAPI shared mode
+  looks like it reports underruns through `GetCurrentPadding() == 0` at a wake. It never does: the
+  client refills the buffer to FULL every event, and a starve leaves the stream event already
+  signalled, so the catch-up wake returns immediately holding the frames just written. A live
+  starve produced zero such wakes. What works is the RELEASE INTERVAL exceeding the buffer depth,
+  which is a measurement rather than an inference. Two lessons past the one fact: `measured` must
+  follow whether the chosen rule has any HEADROOM (a one-period buffer leaves none, so it reports
+  false rather than a zero it could not earn), and a fault detector is not believable until a real
+  fault has been injected against it.
 - **A self-checking test that CANNOT FAIL is the default outcome, not a rare mistake.** It happened
   three times in the convenience-tier work alone. `examples/convenience.c` counted its failures and
   then returned 0 regardless, so it could only ever have caught a crash. `demo/api.gd` asserted
@@ -392,6 +435,13 @@ freely. It still follows the US English rule above.
 - `docs/materials.md` — material/geometry model → Steam Audio occlusion + reflections → the bus.
 - `docs/integration.md` — Unity + Godot bindings + the per-engine coordinate seams; Unreal notes.
 - `docs/build.md` — platform, dependencies, licensing, Dante config.
+- `docs/backends.md` — SPEC (not implemented): WASAPI / CoreAudio / JACK / ALSA / AAudio sinks beside ASIO.
+  The 10-rule sink contract (fixed quantum, timestamp pair, health, exact-rate policy), the fixed-quantum
+  adapter, the OS shim inventory, the ABI bump (enum, `bwa_desc.device`, device query), AUTO order, phases.
+  Linux reaches the array via AES67 into the Dante net (or a multichannel card); JACK is the Linux production
+  backend (runs on PipeWire via pipewire-jack), ALSA the no-server path. Goals per platform up top: Windows +
+  Android = dev ease + reach for head-mounted VR games; Mac = dev ease; Linux = future rig alternative + seated
+  headphone experiments (Psychtoolbox/PsychoPy, live or offline via the manual sink).
 - `docs/profiling.md` — Tracy instrumentation (`BWA_TRACY`), the headless benches (`profile_bench`/`bench_situations`), real-time scheduling + memory notes.
 - `docs/layout-schema.md` — `cave_layout.json` format: speaker geometry, per-speaker gain/delay, DBAP knobs.
 - `docs/calibration.md` — `bwa_calibrate`: acoustic position survey, delay/gain trims, room report → `cave_layout.json`.

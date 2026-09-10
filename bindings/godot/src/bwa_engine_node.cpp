@@ -56,7 +56,7 @@ void BwaEngine::_ready() {
 	}
 
 	const CharString layout_utf8 = to_os_path(layout_path).utf8();
-	const CharString driver_utf8 = asio_driver.utf8();
+	const CharString device_utf8 = device.utf8();
 
 	bwa_desc cfg = {};
 	cfg.profile = (bwa_profile)profile;
@@ -65,7 +65,8 @@ void BwaEngine::_ready() {
 	cfg.sample_rate = (uint32_t)sample_rate;
 	cfg.block_size = (uint32_t)block_size;
 	cfg.sink = (bwa_sink_type)sink;
-	cfg.asio_driver = asio_driver.is_empty() ? nullptr : driver_utf8.get_data();
+	cfg.device = device.is_empty() ? nullptr : device_utf8.get_data();
+	cfg.sink_flags = (uint32_t)sink_flags;
 	cfg.embree = embree;
 	cfg.enable_pathing = enable_pathing;
 	cfg.bed_decoder = (bwa_bed_decoder)bed_decoder;
@@ -1043,7 +1044,8 @@ float BwaEngine::get_output_latency_seconds() const {
 	return rate > 0 ? (float)get_output_latency_frames() / (float)rate : 0.0f;
 }
 
-/* {measured, blocks, xruns, dropped_frames, driver_resyncs, late_blocks, stream_starves, peak_load}
+/* {measured, blocks, xruns, dropped_frames, driver_resyncs, late_blocks, stream_starves, peak_load,
+ * device_lost}
  * — a Dictionary rather than a fistful of getters, because these numbers only mean anything
  * TOGETHER: a count without `blocks` under it has no scale, and any of them without `measured` may
  * be zero simply because this configuration cannot see a dropout. */
@@ -1059,6 +1061,7 @@ Dictionary BwaEngine::get_health() const {
 	d["late_blocks"] = (int64_t)h.late_blocks;
 	d["stream_starves"] = (int64_t)h.stream_starves;
 	d["peak_load"] = h.peak_load;
+	d["device_lost"] = h.device_lost != 0;
 	return d;
 }
 
@@ -1168,6 +1171,34 @@ PackedFloat32Array BwaEngine::render_block() {
 
 /* --- static helpers --- */
 
+int BwaEngine::get_device_count(Sink backend) { return (int)bwa_get_device_count((bwa_sink_type)backend); }
+
+String BwaEngine::get_device_name(Sink backend, int index) {
+	char buf[256];
+	if (index < 0 || !bwa_get_device_name((bwa_sink_type)backend, (uint32_t)index, buf, sizeof buf)) {
+		return String();
+	}
+	return String::utf8(buf);    /* the ABI speaks UTF-8 at every seam */
+}
+
+String BwaEngine::get_device_id(Sink backend, int index) {
+	char buf[256];
+	if (index < 0 || !bwa_get_device_id((bwa_sink_type)backend, (uint32_t)index, buf, sizeof buf)) {
+		return String();
+	}
+	return String::utf8(buf);
+}
+
+PackedStringArray BwaEngine::get_devices(Sink backend) {
+	const int n = get_device_count(backend);
+	PackedStringArray out;
+	out.resize(n);
+	for (int i = 0; i < n; ++i) {
+		out.set(i, get_device_name(backend, i));
+	}
+	return out;
+}
+
 int BwaEngine::get_asio_driver_count() { return (int)bwa_get_asio_driver_count(); }
 
 /* The one-call form: what you actually want before filling a dropdown or setting asio_driver.
@@ -1276,12 +1307,15 @@ PackedStringArray BwaEngine::_get_configuration_warnings() const {
 	 * array and nothing else, so on a machine with no rig it is silent by design. get_audio_backend()
 	 * reports it after the fact — this says it before the run. CaveSim is the profile that
 	 * auditions the array on headphones; Binaural is the direct headphone render. */
+	/* Cave is the ONLY profile this warning still applies to. The headphone profiles reach a
+	 * WASAPI endpoint now, so "no ASIO driver" stopped meaning "silence" for them; the array is
+	 * the one path whose transport is fixed to ASIO. */
 	if (profile == PROFILE_CAVE && sink != SINK_NULL && sink != SINK_MANUAL
 			&& BwaEngine::get_asio_driver_count() == 0) {
 		w.push_back("Profile is Cave (the 26-channel rig) but no ASIO driver is installed, so "
 					"this machine will render the array to nothing and you will hear silence. "
 					"Use CaveSim to audition the array on headphones, or Binaural for the "
-					"direct headphone render.");
+					"direct headphone render - both open an ordinary Windows output device.");
 	}
 	if (feed_listener && listener_path.is_empty()) {
 		w.push_back("Feed Listener is on but no listener node is set, so the listener never "
@@ -1330,7 +1364,9 @@ void BwaEngine::_bind_methods() {
 	M(set_profile, "profile"); M0(get_profile);
 	M(set_sink, "sink"); M0(get_sink);
 	M(set_layout_path, "path"); M0(get_layout_path);
-	M(set_asio_driver, "name"); M0(get_asio_driver);
+	M(set_device, "name"); M0(get_device);
+	M(set_asio_driver, "name"); M0(get_asio_driver);   /* the old spelling of set_device */
+	M(set_sink_flags, "flags"); M0(get_sink_flags);
 	M(set_sample_rate, "hz"); M0(get_sample_rate);
 	M(set_block_size, "frames"); M0(get_block_size);
 	M(set_bed_decoder, "decoder"); M0(get_bed_decoder);
@@ -1442,6 +1478,14 @@ void BwaEngine::_bind_methods() {
 #undef M0
 
 	ClassDB::bind_static_method(
+			"BwaEngine", D_METHOD("get_devices", "backend"), &BwaEngine::get_devices);
+	ClassDB::bind_static_method(
+			"BwaEngine", D_METHOD("get_device_count", "backend"), &BwaEngine::get_device_count);
+	ClassDB::bind_static_method("BwaEngine", D_METHOD("get_device_name", "backend", "index"),
+			&BwaEngine::get_device_name);
+	ClassDB::bind_static_method("BwaEngine", D_METHOD("get_device_id", "backend", "index"),
+			&BwaEngine::get_device_id);
+	ClassDB::bind_static_method(
 			"BwaEngine", D_METHOD("get_asio_drivers"), &BwaEngine::get_asio_drivers);
 	ClassDB::bind_static_method(
 			"BwaEngine", D_METHOD("get_asio_driver_count"), &BwaEngine::get_asio_driver_count);
@@ -1465,9 +1509,13 @@ void BwaEngine::_bind_methods() {
 						 "CaveBoth - rig + the sim tap:3"),
 			"set_profile", "get_profile");
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "sink", PROPERTY_HINT_ENUM,
-						 "Auto:0,ASIO - the rig:1,Null - silent/offline:2,Manual - render_block:3"),
+						 "Auto:0,ASIO - the rig:1,Null - silent/offline:2,Manual - render_block:3,"
+						 "WASAPI - Windows endpoint:4"),
 			"set_sink", "get_sink");
-	ADD_PROPERTY(PropertyInfo(Variant::STRING, "asio_driver"), "set_asio_driver", "get_asio_driver");
+	ADD_PROPERTY(PropertyInfo(Variant::STRING, "device"), "set_device", "get_device");
+	ADD_PROPERTY(PropertyInfo(Variant::INT, "sink_flags", PROPERTY_HINT_FLAGS,
+						 "Exclusive - take the device:1"),
+			"set_sink_flags", "get_sink_flags");
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "sample_rate"), "set_sample_rate", "get_sample_rate");
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "block_size"), "set_block_size", "get_block_size");
 
@@ -1580,6 +1628,9 @@ void BwaEngine::_bind_methods() {
 	BIND_ENUM_CONSTANT(PROFILE_CAVE_SIM); BIND_ENUM_CONSTANT(PROFILE_CAVE_BOTH);
 	BIND_ENUM_CONSTANT(SINK_AUTO); BIND_ENUM_CONSTANT(SINK_ASIO);
 	BIND_ENUM_CONSTANT(SINK_NULL); BIND_ENUM_CONSTANT(SINK_MANUAL);
+	BIND_ENUM_CONSTANT(SINK_WASAPI); BIND_ENUM_CONSTANT(SINK_COREAUDIO);
+	BIND_ENUM_CONSTANT(SINK_ALSA); BIND_ENUM_CONSTANT(SINK_AAUDIO); BIND_ENUM_CONSTANT(SINK_JACK);
+	BIND_ENUM_CONSTANT(SINK_FLAG_NONE); BIND_ENUM_CONSTANT(SINK_FLAG_EXCLUSIVE);
 	BIND_ENUM_CONSTANT(DECODE_DEFAULT); BIND_ENUM_CONSTANT(DECODE_ALLRAD); BIND_ENUM_CONSTANT(DECODE_EPAD);
 	BIND_ENUM_CONSTANT(SETUP_DEFAULT); BIND_ENUM_CONSTANT(SETUP_SEATED); BIND_ENUM_CONSTANT(SETUP_ROAMING);
 	BIND_ENUM_CONSTANT(PAN_DBAP); BIND_ENUM_CONSTANT(PAN_SPCAP); BIND_ENUM_CONSTANT(PAN_VBAP);

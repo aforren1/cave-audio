@@ -56,11 +56,26 @@ namespace BwAudio
         Ok = 0, ErrConfig, ErrDevice, ErrLayout, ErrHrtf, ErrState, ErrInternal, ErrTracker
     }
 
-    /// <summary>Mirrors bwa_sink_type: the output-device policy. Auto tries ASIO and falls back to
-    /// the silent offline sink (the engine keeps rendering — visual-only); Asio demands a real
-    /// device (an open failure fails bwa_start loudly); Null forces the offline sink; Manual is
-    /// the deterministic caller-pumped sink (bwa_render_block — offline/golden tests, not Unity).</summary>
-    public enum BwaSinkType : int { Auto = 0, Asio = 1, Null = 2, Manual = 3 }
+    /// <summary>Mirrors bwa_sink_type: the output-device policy. Auto picks by channel count and
+    /// platform, then falls back to the silent offline sink (the engine keeps rendering —
+    /// visual-only): on Windows a 2-channel request (the headphone profiles) tries Wasapi then
+    /// Asio, and anything wider tries Asio only, because the array's transport is settled. Naming
+    /// a backend is a demand — an open failure fails bwa_start loudly, and a backend this build
+    /// does not carry says so. Null forces the offline sink; Manual is the deterministic
+    /// caller-pumped sink (bwa_render_block — offline/golden tests, not Unity). CoreAudio, Alsa,
+    /// AAudio and Jack are reserved values; the Windows DLL carries none of them yet.</summary>
+    public enum BwaSinkType : int
+    {
+        Auto = 0, Asio = 1, Null = 2, Manual = 3,
+        Wasapi = 4, CoreAudio = 5, Alsa = 6, AAudio = 7, Jack = 8
+    }
+
+    /// <summary>Mirrors the BWA_SINK_FLAG_* bits for BwaDesc.sinkFlags. Exclusive takes the device
+    /// from every other application on the machine, so it is off by default: a monitor shares its
+    /// endpoint with the VR runtime, the browser and the OS. Turn it on for the lowest latency and
+    /// a fixed callback size, or to reach more than 2 channels on a WASAPI endpoint.</summary>
+    [System.Flags]
+    public enum BwaSinkFlags : uint { None = 0, Exclusive = 0x1 }
 
     /// <summary>Mirrors bwa_tracker_state: liveness of a connected tracker's stream (Engine.TrackerStatus).
     /// Disconnected = no tracker on this engine; NoData = connected but no frames arriving (check the
@@ -77,11 +92,20 @@ namespace BwAudio
         public uint sampleRate;                                         // 48000
         public uint blockSize;                                          // e.g. 256
         public BwaSinkType sink;                                        // device policy; 0 = Auto
-        [MarshalAs(UnmanagedType.LPUTF8Str)] public string asioDriver;  // ASIO driver name; null = auto-pick
+        // The device for whichever backend opens: the exact friendly name or stable id from the
+        // device query (Bwa.DeviceName / Bwa.DeviceId); null = that backend's default. This is the
+        // same field the C header still spells asio_driver; the AsioDriver property below keeps
+        // the old name working.
+        [MarshalAs(UnmanagedType.LPUTF8Str)] public string device;
         [MarshalAs(UnmanagedType.I1)] public bool embree;               // Embree ray tracing (falls back if absent)
         [MarshalAs(UnmanagedType.I1)] public bool enablePathing;        // sound-pathing sim at bwa_start (needs SDK + scene)
         public BwaBedDecoder bedDecoder;                                 // diffuse-bed decoder; 0 = the engine default
-        public uint reserved0, reserved1, reserved2, reserved3;         // matches reserved[4]; keep zero
+        public BwaSinkFlags sinkFlags;                                  // carved from reserved[0]; 0 = default
+        public uint reserved0, reserved1, reserved2;                    // matches reserved[3]; keep zero
+
+        /// <summary>The legacy spelling of <see cref="device"/>, kept so existing call sites
+        /// compile. One field, two names — setting either sets the same pointer.</summary>
+        public string asioDriver { get { return device; } set { device = value; } }
     }
 
     /// <summary>Mirrors bwa_tracker_desc: the OptiTrack/NatNet connection for internal tracking.
@@ -128,6 +152,10 @@ namespace BwAudio
         public ulong lateBlocks;      // our render overran the block period
         public ulong streamStarves;   // a streamed voice's ring ran dry without the asset ending
         public float peakLoad;        // worst block's render time / block period; 1.0 = at budget
+        // Nonzero: the device went away (unplugged, a driver reset, the session torn down). The
+        // engine keeps rendering from the host clock, so clocks and playheads stay live, and the
+        // audio is SILENT. Nothing reopens on its own — Stop() then Start(), or leave it.
+        public uint deviceLost;
     }
 
     [StructLayout(LayoutKind.Sequential)]
@@ -205,10 +233,16 @@ namespace BwAudio
         [DllImport(DLL, CallingConvention = CC)] public static extern BwaResult bwa_stop(IntPtr e);
         [DllImport(DLL, CallingConvention = CC)] public static extern void   bwa_destroy(IntPtr e);
         [DllImport(DLL, CallingConvention = CC)] public static extern IntPtr bwa_last_error(IntPtr e);     // PtrToStringUTF8; null = none
-        [DllImport(DLL, CallingConvention = CC)] public static extern IntPtr bwa_get_audio_backend(IntPtr e);  // "asio:<drv>" / "null" / "none"; binaural/both append "(steam HRTF|simple-pan monitor)"
+        [DllImport(DLL, CallingConvention = CC)] public static extern IntPtr bwa_get_audio_backend(IntPtr e);  // "<backend>:<device>" / "null" / "manual" / "none"; binaural/both append "(steam HRTF|simple-pan monitor)"
 
-        // ---- ASIO device query (engine-free; call before bwa_create to populate a driver picker for
-        // BwaDesc.asioDriver). Reads the OS's registered-driver list fresh each call; nothing is opened. ----
+        // ---- Device query (engine-free; call before bwa_create to populate a device picker for
+        // BwaDesc.device). Reads the OS's list fresh each call; nothing is opened. `backend` must be
+        // concrete — Auto, Null and Manual report 0, and so does a backend this build does not carry. ----
+        [DllImport(DLL, CallingConvention = CC)] public static extern uint bwa_get_device_count(BwaSinkType backend);
+        [DllImport(DLL, CallingConvention = CC)] [return: MarshalAs(UnmanagedType.I1)] public static extern bool bwa_get_device_name(BwaSinkType backend, uint index, [Out] byte[] buf, uint cap);
+        // The STABLE id: prefer it when persisting a choice, or when two devices share a friendly
+        // name (a headset and a dock often do). ASIO reports the driver name for both.
+        [DllImport(DLL, CallingConvention = CC)] [return: MarshalAs(UnmanagedType.I1)] public static extern bool bwa_get_device_id(BwaSinkType backend, uint index, [Out] byte[] buf, uint cap);
         [DllImport(DLL, CallingConvention = CC)] public static extern uint bwa_get_asio_driver_count();
         // Fills buf with driver `index`'s registered name (NUL-terminated, truncated to cap-1) — the exact
         // string BwaDesc.asioDriver expects. False = index out of range. The AsioDriverName helper below wraps it.
@@ -495,7 +529,7 @@ namespace BwAudio
         // Resolved engine config (zero-defaulted desc fields resolved at create) — derive seconds from these.
         [DllImport(DLL, CallingConvention = CC)] public static extern uint bwa_get_sample_rate(IntPtr e);
         [DllImport(DLL, CallingConvention = CC)] public static extern uint bwa_get_block_size(IntPtr e);
-        // The sink actually running (Auto resolved to Asio/Null once started) — the enum side of bwa_get_audio_backend.
+        // The sink actually running (Auto resolved to the concrete backend once started) — the enum side of bwa_get_audio_backend.
         [DllImport(DLL, CallingConvention = CC)] public static extern BwaSinkType bwa_get_sink_type(IntPtr e);
         // Read back the effective speaker layout (xyz = cap*3 floats, x,y,z per speaker); returns the count
         // FILLED (min(cap, count) — the bwa_get_bus_levels convention); xyz = null returns the total count.
@@ -682,7 +716,8 @@ namespace BwAudio
             return p == IntPtr.Zero ? null : Marshal.PtrToStringUTF8(p);
         }
 
-        /// <summary>Backend in use after bwa_start: "asio:&lt;driver&gt;", "null", or "none".</summary>
+        /// <summary>Backend in use after bwa_start: "&lt;backend&gt;:&lt;device&gt;" ("asio:Digiface Dante",
+        /// "wasapi:Headphones"), or "null", "manual", "none".</summary>
         public static string Backend(IntPtr e)
         {
             var p = bwa_get_audio_backend(e);
@@ -692,6 +727,26 @@ namespace BwAudio
         /// <summary>Registered ASIO driver `index`'s name (the exact string BwaDesc.asioDriver expects), or
         /// null if the index is out of range. Engine-free — call it before bwa_create (with
         /// bwa_get_asio_driver_count) to build a driver picker.</summary>
+        /// <summary>Device `index`'s friendly name on `backend` (one of the two exact strings
+        /// BwaDesc.device accepts), or null. Pair with bwa_get_device_count to build a picker.</summary>
+        public static string DeviceName(BwaSinkType backend, uint index)
+        {
+            var buf = new byte[256];
+            if (!bwa_get_device_name(backend, index, buf, (uint)buf.Length)) return null;
+            int n = System.Array.IndexOf(buf, (byte)0); if (n < 0) n = buf.Length;
+            return System.Text.Encoding.UTF8.GetString(buf, 0, n);
+        }
+
+        /// <summary>Device `index`'s stable id on `backend` — the string to PERSIST, since friendly
+        /// names collide and change. Null when the index is out of range.</summary>
+        public static string DeviceId(BwaSinkType backend, uint index)
+        {
+            var buf = new byte[256];
+            if (!bwa_get_device_id(backend, index, buf, (uint)buf.Length)) return null;
+            int n = System.Array.IndexOf(buf, (byte)0); if (n < 0) n = buf.Length;
+            return System.Text.Encoding.UTF8.GetString(buf, 0, n);
+        }
+
         public static string AsioDriverName(uint index)
         {
             var buf = new byte[256];
