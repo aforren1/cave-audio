@@ -116,7 +116,9 @@ src/
                        and hands the buffer over through an SPSC result ring; the control thread
                        publishes it (rt_sound_reserve/publish/abandon) and a play issued meanwhile
                        is HELD control-side until then, so the audio thread only ever sees a
-                       finished asset and gains no new branch. [assets]
+                       finished asset and gains no new branch. The loader BLOCKS on an os_event
+                       (signalled after every job push and at stop) rather than sleep-polling, so
+                       idle costs zero wakeups. [assets]
   layout.h / layout.c  speaker geometry load (cave_layout.json via cJSON) + default grid. [M4]
   measure.c/calib.c    bwa_calibrate DSP: sweep+deconvolution, trims, trilateration, room report. [calib]
   zylia.h / zylia.c    Zylia ZM-1: single-position speaker localization (TDOA + GN position) AND the
@@ -166,11 +168,12 @@ src/
   natnet.c             OptiTrack pose ingest (off-wire, see docs/build.md). [M6]
   os.h / os_win.c / os_posix.c  the OS portability shim: every platform call the engine makes
                        OUTSIDE the sinks (threads, sleep + os_sleep_until_ns, the monotonic clock,
-                       mutex + rwlock, thread priority up (os_thread_set_realtime + its
-                       RLIMIT_RTPRIO probe) and down, strdup/strcasecmp, natnet's UDP sockets,
-                       BWA_EXPORT). Exactly one half compiles. Windows and Linux have device
-                       backends; macOS and Android run the null and manual sinks until phases 4
-                       and 3 land. [backends p2]
+                       mutex + rwlock, os_event (auto-reset, sticky signal, monotonic timed wait),
+                       thread priority up (os_thread_set_realtime + its RLIMIT_RTPRIO probe) and
+                       down, strdup/strcasecmp, os_fopen + the UTF-8 path family, natnet's UDP
+                       sockets, BWA_EXPORT). Exactly one half compiles. Windows and Linux have
+                       device backends; macOS and Android run the null and manual sinks until
+                       phases 4 and 3 land. [backends p2]
 test/                  ctest suite; targets are prefixed test_* (test_smoke, test_rt_core, test_rt_feature,
                        test_dsp, ...) so the built tools (bwa_*) and the tests sort apart in the bin dir.
                        The rt test is split: test_rt_core (concurrency/lifecycle spine) + test_rt_feature
@@ -212,15 +215,16 @@ ctest --test-dir build -C RelWithDebInfo      # runs the full test suite (test_*
 ```
 
 **Current state (M6 + occlusion).** The engine builds `bw_audio.dll` and the full ctest
-suite — 42 tests with the Steam Audio SDK, 37 without (the 5 SDK-gated ones are `reflect`,
+suite — 45 tests with the Steam Audio SDK, 40 without (the 5 SDK-gated ones are `reflect`,
 `bake`, `path`, `dynmesh`, `steam_decode`) — a count that INCLUDES the three GUI-tool suites
 (`calib_view`, `layout_tool`, `playground`), the four `validate_*` runs, and the four
 `example_*` runs (the console examples driven with `--tests`: offline sink, short waits), all
-under their build flags. On Linux or macOS at the DEFAULT options it is 30: the GUI and ASIO
+under their build flags. On Linux or macOS at the DEFAULT options it is 33: the GUI and ASIO
 capture tools are WIN32-only targets there, which drops their suites and the `validate_*` runs
-on top of the SDK-gated five. Phase 5 added no target, so that count is unchanged - the JACK and
-ALSA sections live inside `test_audio_sink`, and on a box with no server and no card that one test
-reports SKIPPED rather than passing. `rt.c` is the concurrency
+on top of the SDK-gated five. Phase 5 added no target - the JACK and ALSA sections live inside
+`test_audio_sink`, and on a box with no server and no card that one test reports SKIPPED rather
+than passing. The UTF-8 path work added three (`utf8_path`, `idle`, `cave_both`), on every
+platform. `rt.c` is the concurrency
 spine (two SPSC rings, voice + sound tables, commit snapshot, generation handles, retire-ack)
 and the whole `bwa_*` API forwards to it. Spatialization (the DBAP/SPCAP/VBAP gain solve,
 layout load, per-speaker align), calibration (`bwa_calibrate`, the Zylia capsule survey),
@@ -350,6 +354,26 @@ Regression-preventing gotchas. Each has bitten before or guards a real invariant
   thing that is NOT an exception is `alsa_sink.c`'s `S24_LE` interleave: the shared header's int24
   is three PACKED bytes, and a 24-bit value in a 32-bit container is a different container, so the
   sink writes the container itself and still takes its clamp and NaN rules from `sink_to_i32`.
+- **`bwa_desc.device` and `sink_flags` describe the PRIMARY device only.** `cave_both` opens two,
+  and handing the array's device string to the monitor's open is not a harmless copy: on the rig
+  `device` names the ASIO driver, rule 10 SKIPS a backend that has no device by that name, so the
+  monitor's 2-channel AUTO request skips WASAPI, asks ASIO for a driver whose one process-wide slot
+  the array already holds, and falls to the SILENT null sink. Under `BWA_SINK_ASIO` it fails the
+  start outright. That is the defect WASAPI was added to fix, re-created one argument at a time, and
+  it is invisible offline: with no device string there is nothing to inherit, so every null-sink test
+  passes. The monitor opens AUTO with device NULL and flags 0. The exception reads the REQUESTED
+  sink, not the resolved one: an explicit null or manual keeps the monitor device-free, while an
+  AUTO array whose device is missing still gets a live monitor - reading the resolved sink there
+  would give silence on the one configuration where hearing the sim is how you learn the array never
+  opened. `test_cave_both` pins it against whatever stereo device AUTO finds.
+- **A device-name copy TRUNCATES, it does not fail.** `bwa_get_device_name` promises "always
+  NUL-terminated, truncated to cap-1", and `WideCharToMultiByte` straight into a short buffer does
+  the opposite: it returns 0 with `ERROR_INSUFFICIENT_BUFFER` and writes NOTHING, so a picker that
+  sized its buffer for the common case got an empty name and no error it could act on. The cut also
+  has to land on a UTF-8 character boundary, because half a character is an invalid string rather
+  than a shorter name - and it is a string the caller must be able to hand back as
+  `bwa_desc.device`. `sink_copy_device_name` in `sink.h` is the one implementation; every backend
+  uses it.
 - **A device API that does not promise a fixed callback size must go through `sink_quant`.** ASIO
   is the only backend whose buffer size is fixed once buffers exist. WASAPI shared mode hands out
   `bufferFrameCount - GetCurrentPadding()`, which MOVES, and with the SDK the headphone decode is

@@ -349,9 +349,7 @@ bool sink_jack_device_name(uint32_t index, char* buf, uint32_t cap) {
     char names[16][64];
     const uint32_t n = jack_prefixes(names, 16);
     if (index >= n) return false;
-    strncpy(buf, names[index], cap - 1);
-    buf[cap - 1] = 0;
-    return buf[0] != 0;
+    return sink_copy_device_name(buf, cap, names[index]);
 }
 
 bool sink_jack_device_id(uint32_t index, char* buf, uint32_t cap) {

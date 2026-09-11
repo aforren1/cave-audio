@@ -125,12 +125,21 @@ void set_err(char* err, size_t cap, const char* msg) {
 }
 
 /* Wide OS strings out to UTF-8 at this seam, the way the ASIO sink converts from CP_ACP. The ABI
- * speaks UTF-8 and both bindings marshal it that way. */
+ * speaks UTF-8 and both bindings marshal it that way.
+ *
+ * TRUNCATES rather than failing, because bwa_get_device_name promises the caller "always
+ * NUL-terminated, truncated to cap-1" and a picker sizing its buffer for the common case must get
+ * a short name rather than an empty one. WideCharToMultiByte straight into a small `out` does the
+ * opposite: it returns 0 with ERROR_INSUFFICIENT_BUFFER and writes nothing. So convert whole into
+ * a local buffer and copy back, and back the copy off any partial multibyte sequence - half a
+ * UTF-8 character is not a shorter name, it is an invalid string. */
 void utf8_of(const wchar_t* w, char* out, int outcap) {
     if (!out || outcap <= 0) return;
     out[0] = 0;
     if (!w) return;
-    if (WideCharToMultiByte(CP_UTF8, 0, w, -1, out, outcap, nullptr, nullptr) <= 0) out[0] = 0;
+    char full[1024];                       /* an endpoint friendly name is far under this */
+    if (WideCharToMultiByte(CP_UTF8, 0, w, -1, full, (int)sizeof full, nullptr, nullptr) <= 0) return;
+    sink_copy_device_name(out, (uint32_t)outcap, full);
 }
 
 /* ---- endpoint enumeration ------------------------------------------------------------- */

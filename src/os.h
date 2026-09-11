@@ -19,6 +19,7 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <stdio.h>         /* FILE: os_fopen below */
 
 #if !defined(_WIN32)
 #include <pthread.h>       /* C++-safe; the Windows branch pulls in no system header at all */
@@ -126,6 +127,63 @@ void os_sleep_until_ns(uint64_t deadline_ns);
  * Prefer os_sleep_until_ns, which needs none of this on a current Windows. */
 void os_timer_resolution_begin(void);
 void os_timer_resolution_end(void);
+
+/* ---- events ------------------------------------------------------------------------------ */
+
+/* An AUTO-RESET event: one signal releases exactly one waiter, and a signal that arrives before
+ * anyone waits is REMEMBERED, so the next wait returns at once. That last property is what makes
+ * this usable as a wake-up for a worker that polls a lock-free ring: the worker can check the ring,
+ * find it empty, and then wait, without a producer's signal in between being lost.
+ *
+ * It replaces the sleep-poll in the two worker threads that had no cadence of their own (the asset
+ * loader and the file-streaming refill). Both used to wake hundreds of times a second while idle.
+ * The three Steam sim threads are NOT polling - they run at a fixed simulation rate - so they keep
+ * their absolute-deadline sleep.
+ *
+ * Control thread and worker threads only, never the audio thread: signalling is a syscall.
+ * (CreateEventW on Windows; a mutex + condvar + flag elsewhere, timed on CLOCK_MONOTONIC so a
+ * wall-clock step cannot lengthen or shorten a wait.) */
+#if defined(_WIN32)
+typedef struct { void* h; } os_event;                   /* HANDLE, untyped to keep windows.h out */
+#else
+typedef struct { pthread_mutex_t m; pthread_cond_t c; int flag, live; } os_event;
+#endif
+
+int  os_event_init(os_event* e);        /* 0 = ok */
+void os_event_destroy(os_event* e);
+void os_event_signal(os_event* e);      /* wake one waiter, or arm the next wait */
+
+/* Wait for a signal. `timeout_ms` < 0 waits forever. Returns true when a signal was consumed and
+ * false on timeout. Spurious wakeups are absorbed: a false return means the timeout really elapsed. */
+bool os_event_wait(os_event* e, int timeout_ms);
+
+/* ---- files -------------------------------------------------------------------------------- */
+
+/* fopen with a UTF-8 path. The ABI speaks UTF-8 everywhere (bw_audio.h, "Coordinates and units"),
+ * but the Windows C runtime reads a narrow path in the process ANSI codepage, so a path with an
+ * accent or a CJK character simply fails to open there. This converts to UTF-16 and calls _wfopen;
+ * off Windows the bytes already mean what they say and it is plain fopen.
+ *
+ * EVERY file open in src/ goes through this. The one path that does NOT is `bwa_desc.hrtf_path`:
+ * that string is handed to phonon, which opens the SOFA file itself, so its encoding is the SDK's
+ * problem and not ours. */
+FILE* os_fopen(const char* utf8_path, const char* mode);
+
+/* Directory create, file delete, directory delete - the rest of the UTF-8 path family, so a tool or
+ * a test that writes beside its input is not the one place that falls back to the ANSI codepage.
+ * 0 = ok. os_mkdir returns 0 when the directory already exists. */
+int os_mkdir (const char* utf8_path);
+int os_remove(const char* utf8_path);
+int os_rmdir (const char* utf8_path);
+
+#if defined(_WIN32)
+/* UTF-8 to UTF-16 into a CALLER buffer, so no path conversion allocates. `out_cap` is in wchar_t
+ * units and the result is always terminated. 0 = ok; non-zero means the input was not valid UTF-8
+ * or did not fit. Exposed because the dr_libs decoders take the wide path themselves (sound.c,
+ * stream.c) rather than a FILE*. Windows only: nothing else needs a conversion. */
+#define OS_PATH_WIDE_MAX 2048          /* wchar_t units: 4 KB of stack, well past MAX_PATH */
+int os_utf8_to_wide(const char* utf8, wchar_t* out, size_t out_cap);
+#endif
 
 /* ---- mutex ------------------------------------------------------------------------------ */
 

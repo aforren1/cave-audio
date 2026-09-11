@@ -335,12 +335,124 @@ static void pose_torn_section(void) {
     CHECK(torn == 0, "no torn read in a contended run");
 }
 
+/* ---- events ------------------------------------------------------------------------------ */
+
+typedef struct { os_event* ev; unsigned delay_ms; _Atomic int fired; } Signaller;
+
+static void signaller_body(void* user) {
+    Signaller* g = (Signaller*)user;
+    os_sleep_ms(g->delay_ms);
+    atomic_store_explicit(&g->fired, 1, memory_order_release);
+    os_event_signal(g->ev);
+}
+
+static void event_section(void) {
+    printf("events\n");
+    os_event ev;
+    memset(&ev, 0, sizeof ev);
+    CHECK(os_event_init(&ev) == 0, "os_event_init");
+
+    /* A signal that arrives with nobody waiting must be REMEMBERED. This is the property the
+     * loader thread depends on: it checks its ring, finds it empty, and only then waits, so a job
+     * pushed in that window would otherwise be slept through until something else arrived. */
+    os_event_signal(&ev);
+    CHECK(os_event_wait(&ev, 0) == true, "a signal sent before the wait is not lost");
+    CHECK(os_event_wait(&ev, 0) == false, "auto-reset: the same signal does not satisfy a second wait");
+
+    /* A timeout must actually elapse. A spurious condvar wakeup is the failure this catches on the
+     * POSIX side: absorbed, the wait runs its course; reported, it returns early. */
+    {
+        const uint64_t t0 = os_monotonic_ns();
+        const bool got = os_event_wait(&ev, 50);
+        const double ms = (double)(os_monotonic_ns() - t0) / 1.0e6;
+        printf("       a 50 ms wait with no signal took %.2f ms\n", ms);
+        CHECK(!got, "an unsignalled wait reports a timeout");
+        CHECK(ms > 40.0 && ms < 400.0, "the timeout lands near its deadline (loose: any scheduler)");
+    }
+
+    /* A signal from ANOTHER thread wakes a blocked waiter promptly - the reason for the whole
+     * change. 5 ms is well inside the 2 s wait it interrupts, and the bound below is well under
+     * the 50 ms a waiter that MISSED the signal would have to fall back on. */
+    {
+        Signaller g;
+        memset(&g, 0, sizeof g);
+        g.ev = &ev; g.delay_ms = 5;
+        os_thread th;
+        memset(&th, 0, sizeof th);
+        CHECK(os_thread_create(&th, signaller_body, &g) == 0, "signaller thread started");
+        const uint64_t t0 = os_monotonic_ns();
+        const bool got = os_event_wait(&ev, 2000);
+        const double ms = (double)(os_monotonic_ns() - t0) / 1.0e6;
+        os_thread_join(&th);
+        printf("       a cross-thread signal after 5 ms woke the waiter at %.2f ms\n", ms);
+        CHECK(got, "the waiter consumed the other thread signal");
+        CHECK(ms < 45.0, "the waiter woke on the signal, not on the timeout");
+    }
+
+    /* An infinite wait must be wakeable too, or every stop would deadlock its join. */
+    {
+        Signaller g;
+        memset(&g, 0, sizeof g);
+        g.ev = &ev; g.delay_ms = 5;
+        os_thread th;
+        memset(&th, 0, sizeof th);
+        CHECK(os_thread_create(&th, signaller_body, &g) == 0, "signaller thread started (forever wait)");
+        CHECK(os_event_wait(&ev, -1) == true, "a wait with no timeout returns on a signal");
+        os_thread_join(&th);
+    }
+
+    os_event_destroy(&ev);
+    CHECK(os_event_wait(&ev, 0) == false, "a destroyed event answers cleanly instead of crashing");
+}
+
+/* ---- UTF-8 file paths ---------------------------------------------------------------------- */
+
+/* The shim half of the UTF-8 story; test_utf8_path covers the four subsystems that use it. The
+ * bytes are spelled as hex escapes because this repo passes MSVC no /utf-8 flag, so a UTF-8 source
+ * file would be read in the ANSI codepage - see the header comment in utf8_path_test.c. */
+static void file_section(void) {
+    printf("utf-8 file paths\n");
+#if defined(_WIN32)
+    {
+        wchar_t w[OS_PATH_WIDE_MAX];
+        CHECK(os_utf8_to_wide("bwa_" "\xC3\xA9", w, OS_PATH_WIDE_MAX) == 0, "os_utf8_to_wide accepts UTF-8");
+        CHECK(w[4] == (wchar_t)0x00E9 && w[5] == 0, "e-acute became one UTF-16 unit");
+        CHECK(os_utf8_to_wide("\xE9\x9F\xB3", w, OS_PATH_WIDE_MAX) == 0, "os_utf8_to_wide accepts a CJK character");
+        CHECK(w[0] == (wchar_t)0x97F3 && w[1] == 0, "the CJK character became one UTF-16 unit");
+        CHECK(os_utf8_to_wide("\xFF\xFE", w, OS_PATH_WIDE_MAX) != 0, "invalid UTF-8 is refused, not mangled");
+        CHECK(os_utf8_to_wide("abcdef", w, 3) != 0, "a path that does not fit the buffer fails");
+    }
+#endif
+    {
+        const char* dir  = "bwa_os_" "\xC3\xA9" "_" "\xE9\x9F\xB3";
+        const char* file = "bwa_os_" "\xC3\xA9" "_" "\xE9\x9F\xB3" "/f.txt";
+        CHECK(os_mkdir(dir) == 0, "os_mkdir with a non-ASCII name");
+        CHECK(os_mkdir(dir) == 0, "os_mkdir is idempotent on an existing directory");
+        FILE* f = os_fopen(file, "wb");
+        CHECK(f != NULL, "os_fopen creates a file under a non-ASCII directory");
+        if (f) { fputs("hello", f); fclose(f); }
+        f = os_fopen(file, "rb");
+        CHECK(f != NULL, "os_fopen reopens it");
+        if (f) {
+            char buf[8] = { 0 };
+            CHECK(fread(buf, 1, 5, f) == 5 && strcmp(buf, "hello") == 0, "the same bytes come back");
+            fclose(f);
+        }
+        CHECK(os_fopen(NULL, "rb") == NULL, "os_fopen(NULL) fails cleanly");
+        CHECK(os_remove(file) == 0, "os_remove");
+        CHECK(os_rmdir(dir) == 0, "os_rmdir");
+        CHECK(os_remove(file) != 0, "os_remove on a gone file reports failure");
+    }
+}
+
 int main(void) {
     printf("== os shim ==\n");
     thread_section();
     time_section();
     deadline_section();
     mutex_section();
+    event_section();
+    file_section();
     pose_basic_section();
     pose_torn_section();
     if (g_fail) printf("\nFAILED (%d)\n", g_fail);

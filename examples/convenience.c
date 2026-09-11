@@ -20,7 +20,8 @@
  *   [6] scene control   bwa_group_stop / bwa_stop_all: the click-free sweeps a scene transition
  *                       wants, instead of walking your own source list.
  *
- * Runs anywhere (binaural profile; silent null-sink fallback without an ASIO device).
+ * Runs anywhere: binaural profile out of the platform's default stereo output (WASAPI on
+ * Windows, JACK or ALSA on Linux), silent null-sink fallback without one.
  *
  *   bwa_convenience
  */
@@ -93,7 +94,7 @@ int main(int argc, char** argv) {
     if (!e) { fprintf(stderr, "bwa_create failed\n"); return 1; }
     if (bwa_start(e) != 0) { fprintf(stderr, "bwa_start: %s\n", bwa_last_error(e)); bwa_destroy(e); return 1; }
     const char* be = bwa_get_audio_backend(e);
-    printf("backend: %s%s\n", be, strncmp(be, "null", 4) == 0 ? "  (no ASIO device - silent run)" : "");
+    printf("backend: %s%s\n", be, strncmp(be, "null", 4) == 0 ? "  (no output device - silent run)" : "");
 
     /* ---- [1] shared assets: two systems, one load ------------------------------------------- */
     printf("\n[1] shared ownership: two independent systems ask for the same clip.\n");

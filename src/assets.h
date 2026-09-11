@@ -20,6 +20,7 @@
 #ifndef BWA_ASSETS_H
 #define BWA_ASSETS_H
 
+#include "os.h"          /* BWA_EXPORT (the internal test hook below) */
 #include "rt.h"          /* RtCore (opaque) */
 
 #include <stdbool.h>
@@ -27,6 +28,15 @@
 #include <stdint.h>
 
 typedef struct AssetCache AssetCache;
+
+/* TEST HOOK (defined in assets.c, exported from the dll; deliberately not in bw_audio.h): the
+ * number of passes the loader thread has made round its loop, process-wide. The loader BLOCKS on an
+ * event now instead of polling every 2 ms, so an idle session must not move this at all - which is
+ * exactly the regression a test can pin and a reader cannot. */
+#ifdef BWA_BUILD_DLL
+BWA_EXPORT
+#endif
+uint64_t bwa_assets_loader_wakeups(void);
 
 /* Load-flag bits. Must match bwa_load_flags in include/bw_audio.h (that header is the contract;
  * this is the internal mirror so assets.c does not include the public header). */

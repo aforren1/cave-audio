@@ -6,9 +6,10 @@
  *   per frame:  bwa_source_set_pos / bwa_set_listener_pose ... then ONE bwa_commit
  *   teardown:   bwa_source_destroy -> bwa_unload_sound -> bwa_stop -> bwa_destroy
  *
- * Runs anywhere: the binaural profile auto-picks a 2-ch ASIO device (headphones)
- * and falls back to the silent offline sink without one -- bwa_get_audio_backend says
- * which you got. Room frame is right-handed, +y up, +z forward, meters, origin on
+ * Runs anywhere: the binaural profile under BWA_SINK_AUTO opens the system default
+ * output -- on Windows that is WASAPI, so headphones sound with no ASIO driver
+ * installed at all -- and falls back to the silent offline sink if nothing opens;
+ * bwa_get_audio_backend says which you got. Room frame is right-handed, +y up, +z forward, meters, origin on
  * the FLOOR (Motive's default; an identity listener faces +z, right ear at -x, and
  * y is height above the floor); with no layout file the engine pans over its default
  * grid, a 3 m cube of 26 speakers with its center (the ear point) at (0, 1.5, 0).
@@ -22,13 +23,15 @@
  * point). They get a step each here so each one is legible, and they are the only self-checked
  * claims in the file -- see the check() note below.
  *
- *   bwa_minimal [sound.wav] [--driver name]
- *     (no wav: a short ping is synthesized and used; no --driver: auto-pick the first
- *      ASIO driver with enough channels — name one to test a specific device. The rig's
- *      Digiface registers under RME's own driver name, which is NOT the product name:
- *      read it off bwa_calibrate --list-drivers rather than guessing.)
+ *   bwa_minimal [sound.wav] [--device <name or id>] [--list-devices]
+ *     (no wav: a short ping is synthesized and used; no --device: the system default
+ *      output -- name one to pin a specific device, by friendly name or stable id, and
+ *      the backend that owns that name takes it. The rig's Digiface is an ASIO driver
+ *      registered under RME's own driver name, which is NOT the product name: read it
+ *      off --list-devices rather than guessing.)
  */
 #include "bw_audio.h"
+#include "devices.h"       /* the shared device query + --list-devices printout (bwa_ex_*) */
 
 #include <math.h>
 #include <stdio.h>
@@ -74,9 +77,13 @@ static void check(int ok, const char* what) {
 }
 
 int main(int argc, char** argv) {
-    const char* wav_arg = NULL, * driver = NULL;
+    const char* wav_arg = NULL, * device = NULL;
     for (int i = 1; i < argc; ++i) {
-        if (!strcmp(argv[i], "--driver") && i + 1 < argc) driver = argv[++i];
+        if (!strcmp(argv[i], "--device") && i + 1 < argc) device = argv[++i];
+        else if (!strcmp(argv[i], "--driver") && i + 1 < argc) {   /* the old ASIO-only spelling */
+            printf("note: --driver is the old ASIO-only spelling of --device <name or id>\n");
+            device = argv[++i];
+        } else if (!strcmp(argv[i], "--list-devices")) { bwa_ex_list_devices(BWA_SINK_AUTO); return 0; }
         else if (!strcmp(argv[i], "--tests")) g_tests = 1;
         else wav_arg = argv[i];
     }
@@ -88,7 +95,7 @@ int main(int argc, char** argv) {
                                                  * (BWA_PROFILE_CAVE_SIM auditions the array instead) */
     cfg.sample_rate    = 48000;
     cfg.block_size     = 256;
-    cfg.asio_driver    = driver;                /* NULL = auto-pick by channel count */
+    cfg.device         = device;                /* NULL = the backend's default output */
     if (g_tests) cfg.sink = BWA_SINK_NULL;      /* no device, deterministic */
     /* no tracker connected: this "game" pushes the listener pose itself */
 
@@ -98,8 +105,17 @@ int main(int argc, char** argv) {
         fprintf(stderr, "bwa_start: %s\n", bwa_last_error(e));
         bwa_destroy(e); return 1;
     }
+    /* a start that SUCCEEDS can still have degraded - a --device nothing matched, and the silent
+     * offline sink took over. The reason is here, and only until the next bwa_* call, so copy it
+     * before asking anything else. */
+    char why[192] = "";
+    { const char* err = bwa_last_error(e); if (err) snprintf(why, sizeof why, "%s", err); }
     const char* be = bwa_get_audio_backend(e);
-    printf("backend: %s%s\n", be, strcmp(be, "null") == 0 ? "  (no ASIO device - silent run)" : "");
+    /* the SINK type, not the string, is what says "silent": the string names whichever backend
+     * opened, and every real one makes sound. */
+    printf("backend: %s%s\n", be,
+           bwa_get_sink_type(e) == BWA_SINK_NULL ? "  (no output device opened - silent run)" : "");
+    if (why[0]) printf("  reason: %s\n", why);
 
     bwa_sound ping = bwa_load_sound(e, wav);      /* decoded + resampled now, off the hot path */
     if (!ping) {

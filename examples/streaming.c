@@ -23,7 +23,8 @@
  * load through the shared cache, where the streamed form and an in-RAM copy of one file are two
  * entries rather than a collision; see bwa_convenience.
  *
- * Runs anywhere (binaural profile; silent null-sink fallback without an ASIO device).
+ * Runs anywhere: binaural profile out of the platform's default stereo output (WASAPI on
+ * Windows, JACK or ALSA on Linux), silent null-sink fallback without one.
  *
  *   bwa_streaming
  */
@@ -85,7 +86,7 @@ int main(int argc, char** argv) {
     if (!e) { fprintf(stderr, "bwa_create failed\n"); return 1; }
     if (bwa_start(e) != 0) { fprintf(stderr, "bwa_start: %s\n", bwa_last_error(e)); bwa_destroy(e); return 1; }
     const char* be = bwa_get_audio_backend(e);
-    printf("backend: %s%s\n", be, strncmp(be, "null", 4) == 0 ? "  (no ASIO device - silent run)" : "");
+    printf("backend: %s%s\n", be, strncmp(be, "null", 4) == 0 ? "  (no output device - silent run)" : "");
 
     /* ---- part 1: stream a long file from disk ---- */
     printf("\n[1] file streaming: the 20 s file is NOT decoded into RAM - a background\n"

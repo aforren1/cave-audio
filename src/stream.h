@@ -14,11 +14,21 @@
 #ifndef BWA_STREAM_H
 #define BWA_STREAM_H
 
+#include "os.h"            /* BWA_EXPORT (the internal test hook below) */
+
 #include <stdint.h>
 #include <stddef.h>
 
 typedef struct StreamSet StreamSet;   /* the streaming thread + a pool of stream slots */
 typedef struct Stream    Stream;      /* one streaming playback (decoder + ring) */
+
+/* TEST HOOK (defined in stream.c, exported from the dll; deliberately not in bw_audio.h): the
+ * number of passes the streaming thread has made round its refill loop, process-wide. It waits on
+ * an event now, forever while nothing is open, so an engine with no stream must not move this. */
+#ifdef BWA_BUILD_DLL
+BWA_EXPORT
+#endif
+uint64_t bwa_stream_thread_wakeups(void);
 
 /* Create the set + start the streaming thread. `engine_rate` is the rate streams must match. */
 StreamSet* stream_set_create(uint32_t engine_rate);

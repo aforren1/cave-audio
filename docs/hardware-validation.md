@@ -89,7 +89,7 @@ the speakers land in their real places. By then you have run every tool once.
 ## Stage 0: device bring-up (no engine)
 
 ```
-bwa_calibrate --list-drivers        (or bwa_playground --list-drivers)
+bwa_calibrate --list-drivers        (or bwa_playground --list-devices, every backend)
 ```
 
 - [ ] The Digiface's ASIO driver is listed with ≥ your layout's speaker count of outputs (26 for
@@ -98,8 +98,11 @@ bwa_calibrate --list-drivers        (or bwa_playground --list-drivers)
       refused outright rather than fed silent channels.
 - [ ] Note the driver's **exact name** from this listing. RME registers under its own string,
       which is not the product name. Do not hardcode a guess at it.
-- [ ] `bwa_minimal` runs and prints `backend: asio`, not the null fallback. The null sink
-      keeps everything rendering silently, so a wrong driver *looks* alive: always check
+- [ ] `bwa_minimal --device "<the driver name you just noted>"` runs and prints
+      `backend: asio:<that name>`. Pass the name: with no `--device` the binaural profile
+      opens the machine's default output over WASAPI, which is a real device that makes
+      real sound and proves nothing about the Digiface. The null sink keeps everything
+      rendering silently too, so a wrong device *looks* alive either way: always check
       `bwa_get_audio_backend`.
 - [ ] `bwa_minimal`'s **device clock** line reads within ~±100 ppm of 48000 Hz *on the Digiface*,
       and repeat runs agree. It measures the device's true rate from two `bwa_get_clock`

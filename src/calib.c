@@ -2,6 +2,7 @@
 #include "calib.h"
 #include "layout.h"        /* BWA_RQ_GRID_MAX / BWA_ROOM_EQ_MAX (the room_eq_grid schema caps) */
 #include "sos.h"           /* BWA_SOS_MIN_MPS / BWA_SOS_MAX_MPS (the plausible-room guard) */
+#include "os.h"        /* os_fopen: UTF-8 paths on Windows */
 
 #include <cJSON.h>
 
@@ -117,7 +118,7 @@ void calib_check_drift(const double* range, const float (*pos)[3], const float m
 }
 
 static char* read_file(const char* path, long* len_out) {
-    FILE* f = fopen(path, "rb");
+    FILE* f = os_fopen(path, "rb");
     if (!f) return NULL;
     fseek(f, 0, SEEK_END); long len = ftell(f); fseek(f, 0, SEEK_SET);
     if (len < 0) { fclose(f); return NULL; }
@@ -159,7 +160,7 @@ int calib_write_layout(const char* in_path, const char* out_path,
 
     outtext = cJSON_Print(root);
     if (!outtext) FAIL("calib: failed to serialize layout");
-    FILE* f = fopen(out_path, "wb");
+    FILE* f = os_fopen(out_path, "wb");
     if (!f) FAIL("calib: cannot open output for writing");
     fwrite(outtext, 1, strlen(outtext), f); fclose(f);
     ok = 1;
@@ -213,7 +214,7 @@ int calib_write_sos(const char* in_path, const char* out_path, double mps, char*
 
     outtext = cJSON_Print(root);
     if (!outtext) FAIL("calib: failed to serialize layout");
-    FILE* f = fopen(out_path, "wb");
+    FILE* f = os_fopen(out_path, "wb");
     if (!f) FAIL("calib: cannot open output for writing");
     fwrite(outtext, 1, strlen(outtext), f); fclose(f);
     ok = 1;
@@ -258,7 +259,7 @@ int calib_write_eq(const char* in_path, const char* out_path, const float* taps,
     }
     outtext = cJSON_Print(root);
     if (!outtext) FAIL("calib: failed to serialize layout");
-    FILE* f = fopen(out_path, "wb");
+    FILE* f = os_fopen(out_path, "wb");
     if (!f) FAIL("calib: cannot open output for writing");
     fwrite(outtext, 1, strlen(outtext), f); fclose(f);
     ok = 1;
@@ -329,7 +330,7 @@ int calib_write_room_eq(const char* in_path, const char* out_path,
     }
     outtext = cJSON_Print(root);
     if (!outtext) FAIL("calib: failed to serialize layout");
-    FILE* f = fopen(out_path, "wb");
+    FILE* f = os_fopen(out_path, "wb");
     if (!f) FAIL("calib: cannot open output for writing");
     fwrite(outtext, 1, strlen(outtext), f); fclose(f);
     ok = 1;
@@ -568,7 +569,7 @@ int calib_write_room_eq_grid(const char* in_path, const char* out_path, const fl
 
     outtext = cJSON_Print(root);
     if (!outtext) FAIL("calib: failed to serialize layout");
-    FILE* f = fopen(out_path, "wb");
+    FILE* f = os_fopen(out_path, "wb");
     if (!f) FAIL("calib: cannot open output for writing");
     fwrite(outtext, 1, strlen(outtext), f); fclose(f);
     ok = 1;
@@ -617,7 +618,7 @@ int calib_write_positions(const char* in_path, const char* out_path, const float
 
     outtext = cJSON_Print(root);
     if (!outtext) FAIL("calib: failed to serialize layout");
-    FILE* f = fopen(out_path, "wb");
+    FILE* f = os_fopen(out_path, "wb");
     if (!f) FAIL("calib: cannot open output for writing");
     fwrite(outtext, 1, strlen(outtext), f); fclose(f);
     ok = 1;

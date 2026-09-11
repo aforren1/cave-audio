@@ -68,6 +68,24 @@ thread never blocks on any of them:
   learns about the asset only through an ordinary `CMD_PLAY`, so the loader adds
   no new audio-side channel and no new audio-side rule.
 
+Those last two are the only threads with no clock of their own, and both **wait**
+rather than poll (`os_event`, `src/os.h`). The loader waits forever on an empty
+job ring; the control thread signals after every push and at stop, so an idle
+session wakes it zero times and an async acquire reaches it at once.
+
+The streaming thread cannot go that far, and the reason is rule 1. Its consumer
+is the audio thread, and the audio thread may not signal anything, so nobody
+tells it that a ring has drained. It waits with a timeout instead: the shortest
+time any fillable ring could drain to empty at the engine rate, floored at 1 ms
+and capped at 3 ms. The cap is the flat cadence it used to sleep on, so an active
+stream is never served later than it was. With no fillable stream open the wait
+is infinite. The control thread signals on open, start, close and stop.
+
+A push stream is fed by the control thread and a finished one has nothing left to
+read, so neither counts as fillable. Both still get reaped on close, which
+signals. `bwa_health.stream_starves` is the counter that says whether the cadence
+is enough, and `test_idle` renders a streamed voice at real time to watch it.
+
 One rule generalizes across all of these: the audio thread owns its state and
 *samples* published values. Publishers never touch audio-thread fields directly.
 The audio side drops any publish for a stale or recycled handle. Everything

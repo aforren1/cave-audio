@@ -744,3 +744,36 @@ a box pinned at 100 percent CPU by unrelated work. And the null sink stopped sta
 `os_monotonic_ns() - base`: on Apple Silicon's 41.67 ns tick the first block's stamp came out
 exactly 0, which `rt.c` reads as "no stamp", and macOS CI caught it as `bwa_get_clock` having no
 pair after 30 ms. It stamps the absolute clock now, like every other backend.
+
+**Two deferred backend follow-ups, plus the defect the second one uncovered.** UTF-8 paths on
+Windows: the ABI has always said UTF-8 and the Windows C runtime has always read a narrow path in
+the ANSI codepage, so a path with an accent or a CJK character failed to open with nothing more
+informative than "cannot open file". `os_fopen` (UTF-16 plus `_wfopen`) now carries every `fopen`
+in `src/`, and the three dr_libs decoders take their `_w` openers; `sound.c` reaches one level
+deeper than the public wide API goes, because dr_flac and dr_mp3 publish a wide OPEN but no wide
+read-all, and it is the dr_libs implementation translation unit so the two private helpers are in
+scope. `hrtf_path` is the one path left alone: phonon opens the SOFA file itself. Blocking waits:
+the asset loader and the stream thread were the only two threads with no clock of their own, and
+both sleep-polled. They wait on an `os_event` now. The loader waits forever; the stream thread
+cannot, because its consumer is the audio thread and the audio thread may not signal, so it takes a
+timeout derived from the ring depths, floored at 1 ms and capped at the old 3 ms. Idle wakes went
+from 35 and 35 per 500 ms to 0 and 0 on a Windows desk box, and a streamed voice rendered at real
+time went from 2 stream starves to 0. Writing the idle test taught the same lesson twice: an
+absolute millisecond bound on the async-acquire latency passed alone and tripped once under the
+full suite, so it is a comparison against a 2 ms sleep-poll timed in the same process now; and the
+FIRST async acquire can never show the difference at all, because it is the call that starts the
+loader thread, whose first pass finds the job already in the ring.
+
+The `cave_both` monitor was inheriting `bwa_desc.device` and `sink_flags` from the array, which
+re-created the exact defect the WASAPI sink was added to fix. On the rig `device` names the ASIO
+driver; rule 10 skips a backend that has no device by that name, so the monitor's 2-channel AUTO
+request skipped WASAPI, asked ASIO for a driver whose one process-wide slot the array already held,
+and fell to the silent null sink. The profile had never had a live monitor. It opens AUTO with no
+device now. The reason this survived every test is worth keeping: with no device string there is
+nothing to inherit, so an offline suite cannot see it, and the arm that does see it needs a real
+stereo device. The exception clause reads the REQUESTED sink rather than the resolved one, so an
+AUTO array whose device is missing still gets a live monitor - silence on both is the worst answer
+on the one configuration where hearing the sim is how you find out the array never opened. The same
+work turned up `bwa_get_device_name` failing instead of truncating on WASAPI: `WideCharToMultiByte`
+into a short buffer returns 0 and writes nothing, so a picker got an empty name rather than the
+"truncated to cap-1" the header promises.

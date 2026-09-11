@@ -195,7 +195,7 @@ as `bwa_minimal` and needs no hardware.
 ```c
 bwa_desc cfg = { .profile = BWA_PROFILE_BINAURAL, .sample_rate = 48000, .block_size = 256 };
 bwa_engine* e = bwa_create(&cfg);
-bwa_start(e);                                    // no ASIO device? silent sink, keeps running
+bwa_start(e);                                    // no output device? silent sink, keeps running
 
 bwa_sound ping = bwa_load_sound(e, "ping.wav");    // WAV/FLAC/MP3, resampled at load
 bwa_source s   = bwa_source_create(e);
@@ -302,11 +302,14 @@ mis-correct the array.
 
 ![bwa_playground](docs/img/playground.png)
 
-The array sim (`cave_sim`) on headphones by default (auto-picked 2-ch ASIO driver;
-without one the engine falls back to the null sink and keeps rendering, visual-only,
-live, just silent). The panel's render picker switches to `binaural` (the direct
-per-source render, for by-ear A/Bs against the sim) or `cave` (the array itself over
-26-ch ASIO, the same harness pointed at real speakers on the rig machine). A
+The array sim (`cave_sim`) on headphones by default, out of the system default output
+(WASAPI on Windows). The panel's device combo lists every backend's devices, so you can
+pick an ASIO driver instead, and `--device <name or id>` does the same from the command
+line (`--list-devices` prints them). With no device at all the engine falls back to the
+null sink and keeps rendering, visual-only, live, just silent. The render picker switches
+to `binaural` (the direct per-source render, for by-ear A/Bs against the sim) or `cave`
+(the array itself over 26-ch ASIO, the same harness pointed at real speakers on the rig
+machine). A
 headphone-EQ field loads an AutoEq correction for your headphones.
 Scenes: localization, occlusion + materials, directivity, channel walk,
 reverb bed, an underwater medium boundary (live FDN retune, speed of sound,

@@ -12,8 +12,10 @@
 #include <timeapi.h>       /* timeBeginPeriod / timeEndPeriod (link winmm) */
 #include <avrt.h>          /* AvSetMmThreadCharacteristics: the "Pro Audio" MMCSS task (link avrt) */
 
+#include <limits.h>
 #include <stdlib.h>
 #include <string.h>
+#include <wchar.h>       /* _wfopen: the UTF-8 path family below */
 
 /* ---- threads ---- */
 
@@ -174,6 +176,68 @@ void os_sleep_until_ns(uint64_t deadline_ns) {
         Sleep(left_ms > 1 ? (DWORD)(left_ms - 1) : 0);
     }
     os_timer_resolution_end();
+}
+
+/* ---- events ---- */
+
+/* An auto-reset Win32 event IS the contract in os.h: SetEvent on an unwaited event leaves it
+ * signalled, so a producer's wake cannot be lost between a worker's ring check and its wait. */
+int os_event_init(os_event* e) {
+    if (!e) return 1;
+    e->h = (void*)CreateEventW(NULL, FALSE /* auto-reset */, FALSE /* initially clear */, NULL);
+    return e->h ? 0 : 1;
+}
+
+void os_event_destroy(os_event* e) {
+    if (!e || !e->h) return;
+    CloseHandle((HANDLE)e->h);
+    e->h = NULL;
+}
+
+void os_event_signal(os_event* e) { if (e && e->h) SetEvent((HANDLE)e->h); }
+
+bool os_event_wait(os_event* e, int timeout_ms) {
+    if (!e || !e->h) return false;
+    const DWORD ms = (timeout_ms < 0) ? INFINITE : (DWORD)timeout_ms;
+    return WaitForSingleObject((HANDLE)e->h, ms) == WAIT_OBJECT_0;
+}
+
+/* ---- files ---- */
+
+int os_utf8_to_wide(const char* utf8, wchar_t* out, size_t out_cap) {
+    if (!utf8 || !out || out_cap == 0 || out_cap > (size_t)INT_MAX) return 1;
+    out[0] = 0;
+    /* MB_ERR_INVALID_CHARS so a string that is NOT UTF-8 fails HERE, with a "cannot open" the
+     * caller already reports, rather than silently becoming a path full of U+FFFD. The ABI says
+     * UTF-8; a caller passing ANSI bytes is the caller's defect either way. */
+    return MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, utf8, -1, out, (int)out_cap) > 0 ? 0 : 1;
+}
+
+FILE* os_fopen(const char* utf8_path, const char* mode) {
+    if (!utf8_path || !mode) return NULL;
+    wchar_t wpath[OS_PATH_WIDE_MAX], wmode[8];
+    if (os_utf8_to_wide(utf8_path, wpath, OS_PATH_WIDE_MAX) != 0) return NULL;
+    if (os_utf8_to_wide(mode, wmode, sizeof wmode / sizeof wmode[0]) != 0) return NULL;
+    return _wfopen(wpath, wmode);
+}
+
+int os_mkdir(const char* utf8_path) {
+    wchar_t w[OS_PATH_WIDE_MAX];
+    if (os_utf8_to_wide(utf8_path, w, OS_PATH_WIDE_MAX) != 0) return 1;
+    if (CreateDirectoryW(w, NULL)) return 0;
+    return (GetLastError() == ERROR_ALREADY_EXISTS) ? 0 : 1;
+}
+
+int os_remove(const char* utf8_path) {
+    wchar_t w[OS_PATH_WIDE_MAX];
+    if (os_utf8_to_wide(utf8_path, w, OS_PATH_WIDE_MAX) != 0) return 1;
+    return DeleteFileW(w) ? 0 : 1;
+}
+
+int os_rmdir(const char* utf8_path) {
+    wchar_t w[OS_PATH_WIDE_MAX];
+    if (os_utf8_to_wide(utf8_path, w, OS_PATH_WIDE_MAX) != 0) return 1;
+    return RemoveDirectoryW(w) ? 0 : 1;
 }
 
 /* ---- mutex ---- */

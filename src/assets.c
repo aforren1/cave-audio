@@ -58,6 +58,7 @@ struct AssetCache {
 
     JobRing  jobs;
     ResRing  res;
+    os_event job_ev;         /* control -> loader wake-up: pushed a job, or asked it to stop */
     uint32_t inflight;       /* control-side count of jobs enqueued whose result is not drained yet.
                               * Capped at AJOB_CAP, which is also the result ring's size, so the
                               * worker's result push can never fail and never has to block. */
@@ -247,13 +248,28 @@ static uint32_t load_now(AssetCache* a, const char* path, uint32_t flags, char* 
 
 /* ---- loader thread ---- */
 
+/* TEST HOOK (see assets.h): every pass of the loader loop bumps this. It used to be a 2 ms
+ * sleep-poll, so an idle session woke this thread hundreds of times a second; on the event it is
+ * exactly one pass per job. Process-wide rather than per-cache because the hook is a free function
+ * and a session has one cache. */
+static _Atomic uint64_t g_loader_wakeups;
+
+uint64_t bwa_assets_loader_wakeups(void) {
+    return atomic_load_explicit(&g_loader_wakeups, memory_order_relaxed);
+}
+
 static void loader_thread(void* arg) {
     AssetCache* a = (AssetCache*)arg;
     for (;;) {
+        atomic_fetch_add_explicit(&g_loader_wakeups, 1, memory_order_relaxed);
         /* acquire: the stop store is the last thing destroy does before joining */
         if (atomic_load_explicit(&a->stop, memory_order_acquire)) break;   /* leftover jobs: destroy reaps */
         AJob j;
-        if (!job_pop(&a->jobs, &j)) { os_sleep_ms(2); continue; }   /* a loader has no latency budget */
+        /* Ring empty: BLOCK until a push (or the stop) signals. The event is auto-reset with a
+         * sticky flag, so a job pushed between the pop above and the wait below is not lost - the
+         * wait returns at once. That is what makes "idle costs nothing" and "an async acquire is
+         * picked up immediately" the same change. */
+        if (!job_pop(&a->jobs, &j)) { os_event_wait(&a->job_ev, -1); continue; }
         ARes r;
         memset(&r, 0, sizeof r);
         r.snd = j.snd;
@@ -272,11 +288,15 @@ AssetCache* assets_create(RtCore* rt, uint32_t sample_rate, uint32_t sound_cap) 
     AssetCache* a = (AssetCache*)calloc(1, sizeof *a);
     if (!a) return NULL;
     a->rt = rt; a->rate = sample_rate; a->sound_cap = sound_cap;
+    if (os_event_init(&a->job_ev) != 0) { free(a); return NULL; }
     a->cap    = bwa_pow2_ge(sound_cap * 2u);     /* load factor <= 0.5 at the live-entry bound */
     a->tab    = (AssetEntry*)calloc(a->cap, sizeof(AssetEntry));
     a->by_idx = (uint32_t*)  calloc(sound_cap, sizeof(uint32_t));
     a->park   = (uint32_t*)  calloc(sound_cap, sizeof(uint32_t));
-    if (!a->tab || !a->by_idx || !a->park) { free(a->tab); free(a->by_idx); free(a->park); free(a); return NULL; }
+    if (!a->tab || !a->by_idx || !a->park) {
+        os_event_destroy(&a->job_ev);
+        free(a->tab); free(a->by_idx); free(a->park); free(a); return NULL;
+    }
     return a;
 }
 
@@ -284,6 +304,7 @@ void assets_destroy(AssetCache* a) {
     if (!a) return;
     if (os_thread_valid(&a->thread)) {            /* join FIRST: nothing may touch the rings after */
         atomic_store_explicit(&a->stop, 1, memory_order_release);
+        os_event_signal(&a->job_ev);              /* it may be blocked forever on an empty ring */
         os_thread_join(&a->thread);
     }
     AJob j;
@@ -294,6 +315,7 @@ void assets_destroy(AssetCache* a) {
         if (a->tab[i].key && a->tab[i].key != TOMBSTONE) { free(a->tab[i].key); free(a->tab[i].errmsg); }
     }
     free(a->tab); free(a->by_idx); free(a->park);
+    os_event_destroy(&a->job_ev);
     free(a);
 }
 
@@ -379,6 +401,8 @@ static uint32_t acquire_common(AssetCache* a, const char* path, uint32_t flags,
         if (os_thread_valid(&a->thread) && j.path && job_push(&a->jobs, &j)) {
             en->loading = 1;
             ++a->inflight;
+            os_event_signal(&a->job_ev);           /* AFTER the push publishes it: the worker wakes
+                                                    * to a ring that already holds the job */
         } else {                                   /* no worker: fall back to loading it right here,
                                                     * so the caller still gets a usable asset */
             free(j.path);

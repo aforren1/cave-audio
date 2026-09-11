@@ -410,8 +410,10 @@ static void gen_pink_wav(const char* p) {
 /* (re)create the cave-profile engine + the (muted) preview source. layout_path NULL = default grid;
  * the preview rebuilds with a temp file written from spk[] so DBAP pans through the edited positions. */
 static void build_engine(const char* layout_path) {
-    /* demand a real device (BWA_SINK_ASIO): the audition drives REAL speakers — silence must fail
-     * loudly, not hide behind the null sink. A failed start leaves the editor running (below). */
+    /* demand ASIO (BWA_SINK_ASIO), not AUTO, even though the engine now carries other backends: the
+     * audition drives the REAL array, whose transport is ASIO, and silence must fail loudly rather
+     * than hide behind the null sink or land on a 2-ch desk output. A failed start leaves the editor
+     * running (below). */
     bwa_desc cfg = { };
     cfg.profile = BWA_PROFILE_CAVE; cfg.layout_path = layout_path;
     cfg.sample_rate = SR; cfg.block_size = 256;
@@ -419,13 +421,17 @@ static void build_engine(const char* layout_path) {
     e = bwa_create(&cfg);
     backend = "none"; audio = 0; pv_sound = 0; pv_src = 0;
     if (!e) return;
-    if (bwa_start(e) != 0) {
+    const bool started = (bwa_start(e) == 0);
+    if (!started) {
         const char* err = bwa_last_error(e);
         printf("bwa_start: %s - no audition (needs an ASIO device with an output per speaker); "
                "the editor still runs.\n", err ? err : "?");
     }
     backend = bwa_get_audio_backend(e);
-    audio = (strncmp(backend, "asio", 4) == 0);
+    /* what actually opened, not a string prefix - but the START RESULT gates it, because
+     * bwa_get_sink_type reports the configured policy until a sink exists, so a failed start would
+     * still answer BWA_SINK_ASIO (what we demanded) and light the audition up over silence. */
+    audio = started && (bwa_get_sink_type(e) == BWA_SINK_ASIO);
     pv_sound = bwa_load_sound(e, PREV_WAV);
     pv_src   = bwa_source_create(e);
     bwa_source_play(e, pv_src, pv_sound, true);
@@ -1337,7 +1343,7 @@ static void draw_hud(float cov_worst, float cov_mean) {
                            sel, sel, spk[sel].pos.x, spk[sel].pos.y, spk[sel].pos.z, seldel, seld);
     }
     if (audio) ImGui::TextColored(ImVec4(0.43f, 0.92f, 0.51f, 1), "audio: %s  (tone drives the selected channel)", backend);
-    else       ImGui::TextColored(ImVec4(0.92f, 0.67f, 0.43f, 1), "audio: none - editor only (needs an ASIO/Digiface device to audition)");
+    else       ImGui::TextColored(ImVec4(0.92f, 0.67f, 0.43f, 1), "audio: none - editor only (the audition demands the array's ASIO device, one output per speaker)");
     if (CON.loaded && !preview)
         ImGui::TextColored((con_bad || con_occ) ? ImVec4(0.96f, 0.51f, 0.51f, 1) : ImVec4(0.47f, 0.86f, 0.55f, 1),
                            "constraints: %d no-go  %d obstacle   %d out [K snap]  %d occluded (move clear)",

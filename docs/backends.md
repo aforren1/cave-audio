@@ -433,6 +433,50 @@ library calls Win32 outside the sinks. The inventory, from a grep of `src/`:
 | `_strdup`, `_stricmp`                                       | engine.c, assets.c, stream.c, sound.c                              | `os_strdup`, `os_strcasecmp`          |
 | `__declspec(dllexport)` on internal test hooks              | sink.h, profile_self.h                                             | one `BWA_EXPORT` macro: `__attribute__((visibility("default")))` off Windows, with `-fvisibility=hidden` on the library |
 
+Two more went in afterwards, neither of them a portability move. They are in the shim because the
+shim is where a platform difference belongs:
+
+| need                                                        | files                                                              | shim                                  |
+|-------------------------------------------------------------|--------------------------------------------------------------------|---------------------------------------|
+| a UTF-8 path that opens on Windows                          | layout.c, hpeq.c, calib.c, zylia.c, sound.c, stream.c              | `os_fopen`, `os_mkdir`, `os_remove`, `os_rmdir`, and `os_utf8_to_wide` for the dr_libs `_w` openers |
+| a worker that waits instead of polling                      | assets.c, stream.c                                                 | `os_event` (`_init`/`_destroy`/`_signal`/`_wait`) |
+
+**`os_fopen`** is the whole UTF-8 path story. The ABI speaks UTF-8, but the Windows C runtime reads
+a narrow path in the process ANSI codepage, so a path with an accent or a CJK character simply
+failed to open. `os_fopen` converts to UTF-16 and calls `_wfopen`; off Windows it is `fopen`, since
+the bytes there already mean what they say. Every `fopen` in `src/` goes through it, and the three
+dr_libs decoders take their `_w` openers on Windows through `os_utf8_to_wide`, which converts into
+a caller buffer so no path conversion allocates. One path does not go through it: `bwa_desc.hrtf_path`
+is handed to phonon, which opens the SOFA file itself, so its encoding is the SDK's problem.
+`test_utf8_path` writes a wav, a layout, and a headphone EQ file into a directory whose name carries
+both an accented Latin letter and a CJK character, then loads all four through the real loaders.
+
+**`os_event`** is an auto-reset event: one signal releases one waiter, and a signal that arrives
+before anyone waits is remembered, so a worker can check its ring, find it empty, and then wait
+without losing a push that landed in between. Windows gets `CreateEventW` plus
+`WaitForSingleObject`; elsewhere it is a mutex, a condvar and a flag, with the timed wait on
+`CLOCK_MONOTONIC` (`pthread_condattr_setclock`, or `pthread_cond_timedwait_relative_np` on Apple)
+so a wall-clock step cannot stretch or cut a wait. Spurious wakeups are absorbed: a `false` return
+means the timeout really elapsed.
+
+Two threads use it, and they use it differently:
+
+- **The asset loader** (`assets.c`) waits forever on an empty job ring. The control thread signals
+  after every job push and once at stop. Idle costs zero wakeups, and an async acquire is picked up
+  at once rather than at the next poll.
+- **The stream thread** (`stream.c`) cannot be purely event-driven, because its consumer is the
+  AUDIO thread and the audio thread may not signal (rule 1). So it waits with a timeout derived
+  from the rings: the shortest time any fillable ring could drain to empty at the engine rate,
+  floored at 1 ms and capped at 3 ms, the old flat cadence. An active stream is therefore never
+  served later than it was before; a ring that just reset is served sooner. With no fillable stream
+  open the wait is infinite, which is the whole saving. A push stream is fed by the control thread
+  and a finished one has nothing left to read, so neither counts as fillable; both still get reaped
+  on close, which signals. The control thread signals on open, start, close and stop.
+
+`test_idle` pins both: with nothing loading and nothing streaming, each thread's loop-iteration
+count must stay under 5 across 500 ms. Putting the sleeps back measured 35 and 35 on a Windows desk
+box, and more on a machine whose timer resolution something else has raised.
+
 `test/` and `examples/` carry their own `Sleep`, `GetTickCount64`, and `<windows.h>` (13 test
 files, 14 examples). They move onto the shim in the same phase. Around 300 lines of shim plus a
 mechanical pass over about 40 files. Tests may include `src/os.h`, because they compile the core
@@ -588,6 +632,27 @@ request takes WASAPI, and the adapter makes the monitor's block size equal the a
 "same buffer size" check in `bwa_start` passes. `bwa_start` opens the monitor for the **array's
 resolved block**, not `cfg.block_size`, which is the part that makes that true when the ASIO
 driver picks a size of its own.
+
+That only works because **`device` and `sink_flags` describe the primary device only**. The
+monitor opens with `BWA_SINK_AUTO`, no device name and no flags, so it takes the platform's
+default stereo device. Passing the array's `device` down to it re-creates the exact defect this
+backend was added to fix: on the rig `device` names the ASIO driver, rule 10 skips a backend
+that has no device by that name, so the monitor's 2-channel AUTO request skips WASAPI, asks
+ASIO for a driver whose one process-wide slot the array already holds, and falls to the silent
+null sink. Under `BWA_SINK_ASIO` it fails the start outright.
+
+The exception is a **requested** `BWA_SINK_NULL` or `BWA_SINK_MANUAL`: the monitor takes the
+same sink, so CI and an offline render stay device-free. The rule reads the sink you asked for,
+not the one that opened. An AUTO array whose device is missing falls to the null sink, and
+reading the resolved sink there would take the monitor down with it, which is silence on the one
+configuration where hearing the sim is how you find out the array never opened.
+
+`bwa_get_audio_backend` names both devices under this profile, array first:
+`asio:Digiface Dante + wasapi:Speakers (Realtek(R) Audio) (steam HRTF sim)`. It is
+human-readable only. Program logic reads `bwa_get_sink_type`, which reports the array.
+
+To pin the monitor's endpoint you need a `monitor_device` field, which does not exist yet. See
+[Deferred follow-ups](#deferred-follow-ups).
 
 ### Device query
 
@@ -1020,19 +1085,16 @@ is the cheapest of the two that remain and can slot in whenever a Mac is availab
 
 Known, deliberately not done yet. Each names its trigger.
 
-- **UTF-8 file paths on Windows.** The ABI speaks UTF-8, but every file open (`fopen` in
-  layout.c, hpeq.c, calib.c, zylia.c, and the dr_libs `*_init_file` openers in sound.c and
-  stream.c) hands the bytes to the C runtime, which reads them as the ANSI codepage. A
-  non-ASCII path fails to open on Windows today. Fix: an `os_fopen` in the shim that converts
-  to wide and calls `_wfopen`, and the `_w` variants of the dr_libs openers. About 30 lines.
-  Independent of the port; do it whenever a path with an accent bites.
-- **Blocking waits for the polling threads.** The asset loader (2 ms), the stream thread
-  (3 ms), and the three Steam sim threads all sleep-poll. Idle cost is invisible on a desk and
-  is battery on a headset, so the trigger is phase 3. Options: one event primitive in the shim,
-  or c89thread (condition variables, semaphores, events; public domain or MIT-0 like dr_libs),
-  or a core-only SDL3 behind `os.h`, which also brings rtkit realtime priority on Linux for
-  phase 5 and a precise sleep the shim now has on its own. Decide at phase 3 or 5, whichever
-  comes first. SDL_net is not a candidate for NatNet: it has no multicast join.
+- **A `monitor_device` field.** `bwa_desc.device` names the primary device, so the `cave_both`
+  monitor takes the platform default and cannot be pinned. That is right for the rig, where the
+  monitor is whatever headphones the operator has on. It is wrong for a machine with two
+  candidate endpoints and a preference. The fix is one more `bwa_desc` field out of the
+  reserved tail, with NULL keeping today's behavior. Do it when someone needs the monitor on a
+  named endpoint.
+- **Blocking waits for the three Steam sim threads.** The occlusion, pathing and reflection
+  sims run at a fixed rate (30 Hz and 10 Hz), so they are paced, not polling, and they cost
+  what their simulation costs. The asset loader and the stream thread were the polling pair and
+  they now block on `os_event`. Revisit the sim threads if a headset's battery says so.
 - **The examples' backend awareness**, listed under
   [What to update when implementing](#what-to-update-when-implementing).
 

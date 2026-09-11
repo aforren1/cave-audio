@@ -625,6 +625,31 @@ if(BWA_BUILD_TESTS)
   target_link_libraries(test_stream PRIVATE bwa_core)
   add_test(NAME stream COMMAND test_stream)
 
+  # Non-ASCII file paths through all four openers (sound / stream / layout / headphone EQ). The
+  # test writes its own fixture through the shim, so it never depends on the bug it pins.
+  add_executable(test_utf8_path test/utf8_path_test.c)
+  target_link_libraries(test_utf8_path PRIVATE bwa_core)
+  add_test(NAME utf8_path COMMAND test_utf8_path)
+
+  # cave_both's two devices: `bwa_desc.device` names the ARRAY, and must not reach the monitor.
+  # Two arms run anywhere (the device-free exception, and a foreign device string against whatever
+  # stereo device AUTO finds); the ASIO array arm needs real hardware and says so when it cannot run.
+  # ${BWA_OS_SRC} + src/ buy os_sleep_ms / os_fopen; the test is otherwise a public-ABI consumer
+  # that declares the two internal monitor hooks it uses.
+  add_executable(test_cave_both test/cave_both_test.c ${BWA_OS_SRC})
+  target_include_directories(test_cave_both PRIVATE src)
+  target_link_libraries(test_cave_both PRIVATE bw_audio)
+  bwa_link_os(test_cave_both PRIVATE)
+  add_test(NAME cave_both COMMAND test_cave_both)
+  bwa_copy_runtime_dll(test_cave_both)
+
+  # The two background threads that used to sleep-poll: idle wakeup counts + async-acquire latency.
+  # Links bwa_core ONLY - the wakeup counters are file-scope in assets.c and stream.c, so a target
+  # that also linked the dll would carry a second copy and read the one the engine never touches.
+  add_executable(test_idle test/idle_test.c)
+  target_link_libraries(test_idle PRIVATE bwa_core)
+  add_test(NAME idle COMMAND test_idle)
+
   add_executable(test_calib test/calib_test.c)
   target_link_libraries(test_calib PRIVATE bwa_core)
   add_test(NAME calib COMMAND test_calib)

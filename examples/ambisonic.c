@@ -20,8 +20,9 @@
  * spells the same two loads bwa_sound_acquire(path, BWA_LOAD_AMBIX) and BWA_LOAD_FUMA, which is
  * how one file can be resident in more than one form at once; see bwa_convenience.
  *
- * Runs anywhere: binaural profile, auto-picked 2-ch ASIO device, silent null-sink fallback
- * without one (bwa_get_audio_backend says which you got).
+ * Runs anywhere: binaural profile out of the platform's default stereo output (WASAPI on
+ * Windows, JACK or ALSA on Linux), with a silent null-sink fallback if nothing opens
+ * (bwa_get_audio_backend says which you got).
  *
  *   bwa_ambisonic
  */
@@ -141,6 +142,47 @@ static void check(int ok, const char* what) {
     if (!ok) ++g_bad;
 }
 
+/* The timing rule for part 7: no check may conclude from how long a SLEEP took. A sleep is a
+ * request, not a promise - a 16 ms sleep measured about 100 ms on the macOS CI runner, and a
+ * loaded Windows box does the same - so a fixed number of them says nothing about where the
+ * engine's clock is. Every claim about a SCHEDULED sample therefore reads bwa_get_dsp_time_frames
+ * at the moment of the check:
+ *   "not yet" checks are only meaningful while the clock is still short of the sample. Past it,
+ *   this run cannot tell a working schedule from a broken one, so it says INCONCLUSIVE rather
+ *   than passing (which would imply coverage it does not have) or failing (which would blame the
+ *   engine for a slow machine).
+ *   "it happened" checks wait for the CLOCK to reach the sample, bounded by wall time so a
+ *   stalled clock fails loudly instead of hanging. */
+static int g_incon = 0;
+static void inconclusive(const char* what, uint64_t sched, uint64_t now) {
+    printf("   %-52s INCONCLUSIVE (scheduled %llu, dsp clock %llu: this run\n"
+           "   %-52s  reached the sample before the check could look)\n",
+           what, (unsigned long long)sched, (unsigned long long)now, "");
+    ++g_incon;
+}
+
+/* Was the clock still short of `sched` when the readback just taken was read? Read the clock
+ * AFTER the readback: if it has not reached the sample now, it had not reached it then either.
+ * One block of slack covers the block the audio thread is inside. */
+static int was_before(bwa_engine* e, uint64_t sched, uint64_t* now_out) {
+    const uint64_t now = bwa_get_dsp_time_frames(e);
+    if (now_out) *now_out = now;
+    return now + bwa_get_block_size(e) <= sched;
+}
+
+/* Pump until the dsp clock reaches `target`. Bounded by WALL time, so a clock that stopped
+ * advancing (a dead sink) reports 0 and fails the check instead of hanging the example. */
+static int dsp_wait_until(bwa_engine* e, uint64_t target, uint64_t timeout_ms) {
+    const uint64_t t0 = bwa_ticks_ms();
+    while (bwa_get_dsp_time_frames(e) < target) {
+        if (bwa_ticks_ms() - t0 > timeout_ms) return 0;
+        bwa_commit(e);
+        bwa_sleep_ms(4);
+    }
+    bwa_commit(e);
+    return 1;
+}
+
 /* run `secs` of the demo loop: per-frame commit, like an engine tick */
 static void run(bwa_engine* e, double secs, const char* msg) {
     if (msg) printf("%s\n", msg);
@@ -172,7 +214,7 @@ int main(int argc, char** argv) {
     if (!e) { fprintf(stderr, "bwa_create failed\n"); return 1; }
     if (bwa_start(e) != 0) { fprintf(stderr, "bwa_start: %s\n", bwa_last_error(e)); bwa_destroy(e); return 1; }
     const char* be = bwa_get_audio_backend(e);
-    printf("backend: %s%s\n", be, strncmp(be, "null", 4) == 0 ? "  (no ASIO device - silent run)" : "");
+    printf("backend: %s%s\n", be, strncmp(be, "null", 4) == 0 ? "  (no output device - silent run)" : "");
 
     bwa_sound field = bwa_load_ambix(e, "bwa_demo_ambix.wav");
     bwa_sound legacy = bwa_load_fuma(e, "bwa_demo_fuma.wav");   /* converted at load: an AmbiX asset now */
@@ -222,21 +264,45 @@ int main(int argc, char** argv) {
      *
      * This part is CHECKED (see check() above): unlike the A/Bs, each claim has a definite answer.
      * The waits below are real Sleeps rather than run(), because what is being timed is the
-     * engine's own clock and compressing it would test nothing. */
+     * engine's own clock and compressing it would test nothing. The sleeps only PACE the loop:
+     * every verdict comes from bwa_get_dsp_time_frames, per the timing rule above the helpers. */
     printf("\n7) the bed's playback surface (scheduled start, play region, loop events, scheduled stop)\n");
 
     /* 7a) bwa_bed_play_at: silent until the dsp clock reaches start_sample. Same time base as
-     *     bwa_source_play_at, so "now" comes from bwa_get_dsp_time_frames. */
+     *     bwa_source_play_at, so "now" comes from bwa_get_dsp_time_frames. A FULL SECOND out: the
+     *     lead has to outlast the pacing sleeps below on the slowest machine that runs this, and
+     *     0.25 s did not on a CI runner where a 16 ms sleep took 100. */
+    const uint32_t block = bwa_get_block_size(e);
+    uint64_t now = 0;
     bwa_bed_stop(e, bed);
     for (int t = 0; t < 12; ++t) { bwa_commit(e); bwa_sleep_ms(16); }
-    bwa_bed_play_at(e, bed, field, true, bwa_get_dsp_time_frames(e) + RATE / 2);   /* 0.5 s out */
-    for (int t = 0; t < 9; ++t) { bwa_commit(e); bwa_sleep_ms(16); }                      /* ~0.15 s in */
-    uint64_t held = bwa_bed_get_playhead_frames(e, bed);
-    /* A play_at wired to the unscheduled call would be ~7000 frames in by now, so 0 is not a
-     * coin flip. The bound is generous: anything past the first block means it did not hold. */
-    check(held < 256, "bwa_bed_play_at held the field silent until its start sample");
-    for (int t = 0; t < 30; ++t) { bwa_commit(e); bwa_sleep_ms(16); }                     /* past the lead */
-    check(bwa_bed_get_playhead_frames(e, bed) > 0, "...and started once the clock reached it");
+    const uint64_t start_at = bwa_get_dsp_time_frames(e) + RATE;      /* 1 s out */
+    bwa_bed_play_at(e, bed, field, true, start_at);
+    /* five pacing ticks, not nine: each one can take 100 ms on a loaded box, and every ms spent
+     * here eats the lead the check needs. Five is still ~2400 frames of "an unscheduled play
+     * would be well into the asset by now" at nominal speed, which is the evidence this wants. */
+    for (int t = 0; t < 5; ++t) { bwa_commit(e); bwa_sleep_ms(16); }
+    const uint64_t held = bwa_bed_get_playhead_frames(e, bed);
+    if (!was_before(e, start_at, &now)) {
+        inconclusive("bwa_bed_play_at held the field silent", start_at, now);
+    } else {
+        /* A play_at wired to the unscheduled call would be thousands of frames in by now, so 0 is
+         * not a coin flip. The bound is generous: anything past the first block means it did not hold. */
+        check(held < block, "bwa_bed_play_at held the field silent until its start sample");
+    }
+    if (!dsp_wait_until(e, start_at + block, 10000)) {
+        check(0, "the dsp clock reached the start sample (it stalled)");
+    } else {
+        /* the playhead publishes per audio block, so poll for it rather than sleeping a fixed
+         * count: this ends the moment it moves, and only a playhead that NEVER moves pays the bound */
+        int started = 0;
+        for (uint64_t w0 = bwa_ticks_ms(); !started && bwa_ticks_ms() - w0 < 2000; ) {
+            bwa_commit(e);
+            started = bwa_bed_get_playhead_frames(e, bed) > 0;
+            if (!started) bwa_sleep_ms(4);
+        }
+        check(started, "...and started once the clock reached it");
+    }
 
     /* 7b) bwa_bed_set_region + bwa_poll_looped: bound the bed to [start, end) content frames. A
      *     looping voice never ENDS, so bwa_poll_ended reports it exactly never; the wrap is the
@@ -249,28 +315,60 @@ int main(int argc, char** argv) {
      * counted here they would let this check pass on a region that never took. Drain what you
      * did not ask for before you measure what you did. */
     { bwa_source flush[64]; while (bwa_poll_looped(e, flush, 64, NULL) == 64) { } }
+    /* The window is ONE SECOND OF DSP TIME, not 63 sleeps: on a machine where the sleeps run long
+     * the loop simply does fewer of them, and the expected wrap count is derived from the frames
+     * that actually elapsed rather than from the count that was asked for. */
+    const uint64_t region = RATE / 5;
+    const uint64_t w_beg = bwa_get_dsp_time_frames(e);
+    uint64_t w_end = w_beg;
     int wraps = 0;
-    for (int t = 0; t < 63; ++t) {                             /* ~1 s at a 16 ms tick */
+    for (uint64_t w0 = bwa_ticks_ms(); ; ) {
         bwa_commit(e);
         bwa_source hit[16];
-        uint32_t n = bwa_poll_looped(e, hit, 16, NULL);
-        for (uint32_t i = 0; i < n; ++i) if (hit[i] == bed) ++wraps;
+        uint32_t n;
+        while ((n = bwa_poll_looped(e, hit, 16, NULL)) > 0) {   /* drain fully: a long tick queues several */
+            for (uint32_t i = 0; i < n; ++i) if (hit[i] == bed) ++wraps;
+            if (n < 16) break;
+        }
+        w_end = bwa_get_dsp_time_frames(e);
+        if (w_end - w_beg >= RATE) break;                       /* a second of the engine's own time */
+        if (bwa_ticks_ms() - w0 > 10000) break;                 /* the clock stalled: the check below fails */
         bwa_sleep_ms(16);
     }
-    printf("   %d wraps of a 200 ms region in ~1 s\n", wraps);
-    /* ~5 expected. Demanded with a margin: the field is 4 s long, so a region that never reached
-     * the core gives exactly 0 here and a ">0" check would prove nothing about the region. */
-    check(wraps >= 3, "bwa_poll_looped reported the bed's wraps");
+    const uint64_t elapsed = w_end - w_beg;
+    const int expect = (int)(elapsed / region);                 /* one wrap per region length */
+    printf("   %d wraps of a 200 ms region in %.2f s of dsp time (about %d expected)\n",
+           wraps, (double)elapsed / RATE, expect);
+    /* Demanded against the frames that ACTUALLY elapsed, with the original margin: the field is 4 s
+     * long, so a region that never reached the core gives exactly 0 here and a ">0" check would
+     * prove nothing about the region. A stalled clock fails on the first term. */
+    check(elapsed >= RATE && wraps >= expect - 2, "bwa_poll_looped reported the bed's wraps");
 
-    /* 7c) bwa_bed_stop_at: the scheduled click-free stop, same time base again. */
-    bwa_bed_stop_at(e, bed, bwa_get_dsp_time_frames(e) + RATE / 4);   /* 0.25 s out */
-    for (int t = 0; t < 6; ++t) { bwa_commit(e); bwa_sleep_ms(16); }         /* ~0.1 s in: still going */
-    check(bwa_bed_is_playing(e, bed), "bwa_bed_stop_at did not stop the bed immediately");
-    for (int t = 0; t < 25; ++t) { bwa_commit(e); bwa_sleep_ms(16); }        /* past the stop */
-    check(!bwa_bed_is_playing(e, bed), "...and stopped it once the clock reached it");
+    /* 7c) bwa_bed_stop_at: the scheduled click-free stop, same time base again. A second out, for
+     *     the reason 7a is: 0.25 s was shorter than six sleeps on a loaded runner. */
+    const uint64_t stop_at = bwa_get_dsp_time_frames(e) + RATE;
+    bwa_bed_stop_at(e, bed, stop_at);
+    for (int t = 0; t < 4; ++t) { bwa_commit(e); bwa_sleep_ms(16); }  /* pacing only, and few: see 7a */
+    const int still_playing = bwa_bed_is_playing(e, bed);
+    if (!was_before(e, stop_at, &now))
+        inconclusive("bwa_bed_stop_at did not stop the bed at once", stop_at, now);
+    else
+        check(still_playing, "bwa_bed_stop_at did not stop the bed immediately");
+    if (!dsp_wait_until(e, stop_at + block, 10000)) {
+        check(0, "the dsp clock reached the stop sample (it stalled)");
+    } else {
+        int stopped = 0;                                          /* published per block: poll, do not sleep a count */
+        for (uint64_t w0 = bwa_ticks_ms(); !stopped && bwa_ticks_ms() - w0 < 2000; ) {
+            bwa_commit(e);
+            stopped = !bwa_bed_is_playing(e, bed);
+            if (!stopped) bwa_sleep_ms(4);
+        }
+        check(stopped, "...and stopped it once the clock reached it");
+    }
 
     /* 7d) bwa_bed_play_loop is the same region set at PLAY time: play [0, loop_end), then repeat
-     *     [loop_beg, loop_end) - the intro-to-loop pattern, bed-typed. */
+     *     [loop_beg, loop_end) - the intro-to-loop pattern, bed-typed. By ear only: it makes no
+     *     claim about a scheduled sample, so there is nothing here for a slow sleep to break. */
     bwa_bed_play_loop(e, bed, field, RATE / 10, RATE / 5);     /* intro 0..200 ms, body 100..200 ms */
     run(e, 1.5, "   intro -> loop body, via bwa_bed_play_loop");
 
@@ -284,6 +382,8 @@ int main(int argc, char** argv) {
     bwa_destroy(e);
     remove("bwa_demo_ambix.wav");
     remove("bwa_demo_fuma.wav");
+    if (g_incon) printf("\nambisonic: %d check(s) INCONCLUSIVE on this run - the machine was too slow\n"
+                        "  to look before the scheduled sample. Not a failure, and not a pass either.\n", g_incon);
     if (g_bad) { printf("\nambisonic: %d CHECK(S) FAILED\n", g_bad); return 1; }
     printf("done\n");
     return 0;

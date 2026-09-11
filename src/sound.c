@@ -35,6 +35,36 @@ static void set_err(char* err, size_t cap, const char* msg) {
  * releases it for all three decoders. NULL on failure. */
 static float* decode_any(const char* path, unsigned int* ch, unsigned int* rate, uint64_t* frames) {
     const char* ext = strrchr(path, '.');
+#if defined(_WIN32)
+    /* The narrow dr_libs openers hand the path to the CRT, which reads it in the process ANSI
+     * codepage, so a UTF-8 path with an accent or a CJK character never opens (docs/backends.md).
+     * Take the `_w` openers instead. dr_wav publishes a wide read-all; dr_flac and dr_mp3 publish
+     * only the wide OPEN, so the read-all under it is spelled out here - it is the exact body of
+     * their public narrow variants, reachable because THIS file is the dr_libs implementation
+     * translation unit. A dr_libs bump that renames either helper is a compile error here, not a
+     * silent fallback to the broken path. */
+    wchar_t wpath[OS_PATH_WIDE_MAX];
+    *ch = 0; *rate = 0; *frames = 0;
+    if (os_utf8_to_wide(path, wpath, OS_PATH_WIDE_MAX) != 0) return NULL;
+    if (ext && os_strcasecmp(ext, ".flac") == 0) {
+        drflac* fl = drflac_open_file_w(wpath, NULL);
+        if (!fl) return NULL;
+        drflac_uint64 f = 0;
+        float* p = drflac__full_read_and_close_f32(fl, ch, rate, &f);   /* closes fl either way */
+        *frames = (uint64_t)f; return p;
+    }
+    if (ext && os_strcasecmp(ext, ".mp3") == 0) {
+        drmp3 m; drmp3_config cfg; drmp3_uint64 f = 0;
+        memset(&cfg, 0, sizeof cfg);
+        if (!drmp3_init_file_w(&m, wpath, NULL)) return NULL;
+        float* p = drmp3__full_read_and_close_f32(&m, &cfg, &f);        /* uninits m either way */
+        if (p) { *ch = cfg.channels; *rate = cfg.sampleRate; }
+        *frames = (uint64_t)f; return p;
+    }
+    drwav_uint64 fw = 0;                              /* default / .wav */
+    float* pw = drwav_open_file_and_read_pcm_frames_f32_w(wpath, ch, rate, &fw, NULL);
+    *frames = (uint64_t)fw; return pw;
+#else
     if (ext && os_strcasecmp(ext, ".flac") == 0) {
         drflac_uint64 f = 0;
         float* p = drflac_open_file_and_read_pcm_frames_f32(path, ch, rate, &f, NULL);
@@ -49,6 +79,7 @@ static float* decode_any(const char* path, unsigned int* ch, unsigned int* rate,
     drwav_uint64 f = 0;                               /* default / .wav */
     float* p = drwav_open_file_and_read_pcm_frames_f32(path, ch, rate, &f, NULL);
     *frames = (uint64_t)f; return p;
+#endif
 }
 
 /* Scrub decoded samples in place: non-finite -> 0 (the same contract bwa_source_push documents) and

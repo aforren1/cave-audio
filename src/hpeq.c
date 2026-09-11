@@ -1,6 +1,7 @@
 /* hpeq.c — AutoEq ParametricEQ parser + the stereo biquad cascade. See hpeq.h. */
 #include "hpeq.h"
 #include "biquad.h"
+#include "os.h"        /* os_fopen: UTF-8 paths on Windows */
 
 #include <stdio.h>
 #include <string.h>
@@ -17,7 +18,7 @@ static void s_err(char* err, size_t cap, const char* msg, int lineno) {
 int hpeq_parse(const char* path, uint32_t sample_rate, HpEqDesign* d, char* err, size_t errcap) {
     memset(d, 0, sizeof *d);
     d->preamp = 1.0f;
-    FILE* f = fopen(path, "rb");
+    FILE* f = os_fopen(path, "rb");
     if (!f) {
         if (err && errcap) snprintf(err, errcap, "headphone EQ: cannot open %s", path);
         return 0;

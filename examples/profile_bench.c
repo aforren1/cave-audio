@@ -2,7 +2,7 @@
  * profile_bench.c — a headless, hardware-independent profiling load for Tracy.
  *
  * Forces the null sink (.sink = BWA_SINK_NULL), so the engine's render thread runs the FULL mix exactly
- * as the ASIO callback would, with no device needed. Spawns a representative moving voice load with
+ * as the device callback would, with no device needed. Spawns a representative moving voice load with
  * the propagation effects on (Doppler / air / reverb send / spread), then drives positions at a
  * ~60 Hz control rate (like a game client) for N seconds. Build with -DBWA_TRACY=ON and either
  * attach the Tracy GUI, or capture headless to a CSV budget report:

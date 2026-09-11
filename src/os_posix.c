@@ -14,6 +14,7 @@
 #include <strings.h>       /* strcasecmp */
 #include <time.h>
 #include <unistd.h>
+#include <sys/stat.h>     /* mkdir: the UTF-8 path family is plain POSIX here */
 
 #include <arpa/inet.h>
 #include <netinet/in.h>
@@ -218,6 +219,97 @@ void os_sleep_until_ns(uint64_t deadline_ns) {
 /* Windows-only: nanosleep already has the granularity timeBeginPeriod buys there. */
 void os_timer_resolution_begin(void) { }
 void os_timer_resolution_end(void)   { }
+
+/* ---- events ---- */
+
+/* A mutex + condvar + FLAG. The flag is not a detail: it is what makes a signal that arrives before
+ * anyone waits survive, which a bare pthread_cond_signal does not. The timed wait is on
+ * CLOCK_MONOTONIC (pthread_condattr_setclock), so a wall-clock step cannot stretch or cut a wait;
+ * Darwin has no condattr_setclock, and uses the relative_np wait instead for the same reason. */
+int os_event_init(os_event* e) {
+    if (!e) return 1;
+    e->flag = 0; e->live = 0;
+    if (pthread_mutex_init(&e->m, NULL) != 0) return 1;
+#if defined(__APPLE__)
+    if (pthread_cond_init(&e->c, NULL) != 0) { pthread_mutex_destroy(&e->m); return 1; }
+#else
+    pthread_condattr_t at;
+    if (pthread_condattr_init(&at) != 0) { pthread_mutex_destroy(&e->m); return 1; }
+    pthread_condattr_setclock(&at, CLOCK_MONOTONIC);
+    const int rc = pthread_cond_init(&e->c, &at);
+    pthread_condattr_destroy(&at);
+    if (rc != 0) { pthread_mutex_destroy(&e->m); return 1; }
+#endif
+    e->live = 1;
+    return 0;
+}
+
+void os_event_destroy(os_event* e) {
+    if (!e || !e->live) return;
+    pthread_cond_destroy(&e->c);
+    pthread_mutex_destroy(&e->m);
+    e->live = 0;
+}
+
+void os_event_signal(os_event* e) {
+    if (!e || !e->live) return;
+    pthread_mutex_lock(&e->m);
+    e->flag = 1;
+    pthread_cond_signal(&e->c);
+    pthread_mutex_unlock(&e->m);
+}
+
+bool os_event_wait(os_event* e, int timeout_ms) {
+    if (!e || !e->live) return false;
+    bool got = false;
+    pthread_mutex_lock(&e->m);
+    if (timeout_ms < 0) {
+        while (!e->flag) if (pthread_cond_wait(&e->c, &e->m) != 0) break;
+    } else {
+        /* Loop to the DEADLINE rather than waiting once: a spurious wakeup must not be reported as
+         * a timeout that has not happened yet, because the stream thread derives its refill cadence
+         * from this return. os_monotonic_ns is CLOCK_MONOTONIC here, the same clock the condvar was
+         * given, so the absolute timespec below is directly comparable. */
+        const uint64_t deadline = os_monotonic_ns() + (uint64_t)timeout_ms * 1000000ull;
+        while (!e->flag) {
+            const uint64_t now = os_monotonic_ns();
+            if (now >= deadline) break;
+#if defined(__APPLE__)
+            const uint64_t left = deadline - now;
+            struct timespec rel;
+            rel.tv_sec  = (time_t)(left / 1000000000ull);
+            rel.tv_nsec = (long)  (left % 1000000000ull);
+            const int rc = pthread_cond_timedwait_relative_np(&e->c, &e->m, &rel);
+#else
+            struct timespec ts;
+            ts.tv_sec  = (time_t)(deadline / 1000000000ull);
+            ts.tv_nsec = (long)  (deadline % 1000000000ull);
+            const int rc = pthread_cond_timedwait(&e->c, &e->m, &ts);
+#endif
+            if (rc != 0 && rc != ETIMEDOUT) break;      /* a broken condvar must not spin a core */
+        }
+    }
+    if (e->flag) { e->flag = 0; got = true; }
+    pthread_mutex_unlock(&e->m);
+    return got;
+}
+
+/* ---- files ---- */
+
+/* Nothing to convert: a POSIX path is bytes, and the ABI's bytes are already UTF-8. The whole
+ * family exists for the Windows half - see os.h. */
+FILE* os_fopen(const char* utf8_path, const char* mode) {
+    return (utf8_path && mode) ? fopen(utf8_path, mode) : NULL;
+}
+
+int os_mkdir(const char* utf8_path) {
+    if (!utf8_path) return 1;
+    if (mkdir(utf8_path, 0777) == 0) return 0;
+    return (errno == EEXIST) ? 0 : 1;
+}
+
+int os_remove(const char* utf8_path) { return (utf8_path && remove(utf8_path) == 0) ? 0 : 1; }
+int os_rmdir (const char* utf8_path) { return (utf8_path && rmdir (utf8_path) == 0) ? 0 : 1; }
 
 /* ---- mutex ---- */
 

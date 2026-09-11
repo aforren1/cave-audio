@@ -1,10 +1,11 @@
 /*
  * playground.cpp — interactive harness for bw_audio's binaural monitor, split into SCENES,
- * each auditioning one feature by ear on headphones (the binaural profile, output through a 2-ch
- * ASIO driver the engine auto-picks — ASIO4ALL / FlexASIO / the Steinberg built-in; without one the
- * engine falls back to the offline null sink and everything still renders, just silent). This is the
- * by-ear evaluation the automated tests can't do. Public C ABI only (bw_audio.h); raylib's raymath
- * provides the vector/quaternion math.
+ * each auditioning one feature by ear on headphones (the binaural profile, output through the
+ * Windows default output over WASAPI — whatever the headphones are plugged into. Pick an ASIO
+ * driver from the panel's device combo, or with --device, only when you want one; with no device
+ * at all the engine falls back to the offline null sink and everything still renders, just
+ * silent). This is the by-ear evaluation the automated tests can't do. Public C ABI only
+ * (bw_audio.h); raylib's raymath provides the vector/quaternion math.
  *
  * UI stack: the 3D scene (speakers with live level shading, source, head, room) stays raylib; every
  * control surface is Dear ImGui via rlImGui, themed like the station (bwa_theme.h) — the same split
@@ -75,6 +76,7 @@
  * Build: cmake -S . -B build -DBWA_BUILD_PLAYGROUND=ON && cmake --build build
  */
 #include "bw_audio.h"
+#include "devices.h"        /* the shared device query + --list-devices printout (bwa_ex_*) */
 #include "raylib.h"
 #include "raymath.h"
 #include "rlgl.h"           /* rlDrawRenderBatchActive: flush the 3D batch before a screenshot */
@@ -1002,7 +1004,13 @@ static int engine_mode;             /* which config the live engine was built in
  * room), or underwater (FDN + pressure-release surface plane) config, reloading assets + recreating
  * sources. Used at startup and on each config-boundary switch. */
 static bwa_sink_type g_sink_mode = BWA_SINK_AUTO;   /* --tests forces BWA_SINK_NULL (hermetic) */
-static const char*   g_asio_driver = NULL;          /* --driver <name>; NULL = auto-pick */
+static const char*   g_device = NULL;               /* --device <name or id>; NULL = the backend's default */
+static char          g_audio_err[256];              /* bwa_last_error from the last build_engine: the
+                                                     * start's failure, or the REASON a start that
+                                                     * SUCCEEDED still degraded (a device that would
+                                                     * not open, so the null sink took over). The
+                                                     * string the ABI hands back dies at the next
+                                                     * bwa_* call, so it is copied, not held. */
 static int           g_render_pick = 0;             /* the panel's render picker (rebuilds to switch):
                                                      * 0 = cave_sim (array audition on headphones, the
                                                      * default - the meters/gizmos read the bus),
@@ -1028,7 +1036,7 @@ static void build_engine(int mode) {
         .profile = g_render_pick == 2 ? BWA_PROFILE_CAVE
                  : g_render_pick == 1 ? BWA_PROFILE_BINAURAL : BWA_PROFILE_CAVE_SIM,
         .layout_path = g_layout_path, .hrtf_path = NULL,
-        .sample_rate = SR, .block_size = 256, .sink = g_sink_mode, .asio_driver = g_asio_driver,
+        .sample_rate = SR, .block_size = 256, .sink = g_sink_mode, .device = g_device,
         /* create-time: only the reverb scene cares, but it's harmless for the others */
         .bed_decoder = rev_decoder ? BWA_DECODE_EPAD : BWA_DECODE_ALLRAD,
     };
@@ -1057,14 +1065,28 @@ static void build_engine(int mode) {
         bwa_material wm = bwa_material_define(e, wabs, 0.05f, wtrn);
         bwa_scene_set_ground(e, WATER_Y, wm, true);          /* the surface, BEFORE bwa_start */
     }
-    if (bwa_start(e) != 0) {
+    g_audio_err[0] = '\0';
+    const bool started = (bwa_start(e) == 0);
+    if (!started) {
         const char* err = bwa_last_error(e);
-        printf("bwa_start: %s - no audio (install/select an ASIO driver, e.g. ASIO4ALL); the scene still runs.\n",
-               err ? err : "?");
+        snprintf(g_audio_err, sizeof g_audio_err, "%s", err ? err : "?");
+        printf("bwa_start: %s - no audio (pick another device with --device, or --list-devices to see them); "
+               "the scene still runs.\n", g_audio_err);
+    } else {
+        /* a start that SUCCEEDED can still have degraded: no device opened and the offline sink took
+         * over. That reason lives in bwa_last_error, and only until the next bwa_* call - read it here */
+        const char* err = bwa_last_error(e);
+        if (err) snprintf(g_audio_err, sizeof g_audio_err, "%s", err);
     }
     bwa_set_output_capture(e, capture_cb, NULL);             /* F9 records the binaural output to WAV */
     backend_name   = bwa_get_audio_backend(e);
-    backend_silent = (strncmp(backend_name, "asio", 4) != 0);
+    /* SILENT means no device is feeding audio. Which backend opened is not the question (WASAPI,
+     * ASIO and the rest all make sound), and MANUAL never happens here - this tool always runs a
+     * sink. The start result has to be part of it: bwa_get_sink_type reports the CONFIGURED policy
+     * until a sink exists, so after a failed start it still answers the backend that was asked for
+     * while bwa_get_audio_backend answers "none" - reading the type alone would paint a dead engine
+     * green. */
+    backend_silent = (!started || bwa_get_sink_type(e) == BWA_SINK_NULL);
     if (g_have_steam < 0) g_have_steam = (strstr(backend_name, "steam HRTF") != NULL);   /* see the decl */
     g_nspk = (int)bwa_get_speakers(e, (float*)speakers, NSPK);   /* the geometry AND count the engine pans with */
     if (g_nspk < 1) g_nspk = 1;                          /* (a layout always has >= 4; keep the divides safe) */
@@ -1147,26 +1169,44 @@ static void switch_scene(int idx) {
     scenes[idx].enter();
 }
 
-/* ---- driver picker (bwa_get_asio_driver_count/_name): choose the headphone driver from the
- * panel instead of restarting with --driver. bwa_desc.asio_driver is create-time, so a pick
- * REBUILDS the engine (the reverb scene's decoder-combo policy) and re-enters the current scene
- * (every scene's enter() is already rebuild-safe — switch_scene relies on that). ---- */
-static char g_drv_pick[64];                  /* the picked name g_asio_driver points at */
-/* Name snapshot: every bwa_get_asio_driver_* call reads the registry FRESH (see asio_sink.cpp), so
- * enumerating inside the open combo cost 1 + N registry scans PER FRAME and visibly stalled the UI
- * for as long as the list was open. Snapshot once per open instead; closing invalidates it, so
- * re-opening still picks up a driver installed since. */
-enum { DRV_MAX = 32 };
-static char g_drv_names[DRV_MAX][64];
-static int  g_drv_n = -1;                    /* -1 = no snapshot (combo closed) */
-static void drv_snapshot(void) {
-    uint32_t nd = bwa_get_asio_driver_count();
-    if (nd > (uint32_t)DRV_MAX) nd = (uint32_t)DRV_MAX;
-    g_drv_n = 0;
-    for (uint32_t i = 0; i < nd; ++i)
-        if (bwa_get_asio_driver_name(i, g_drv_names[g_drv_n], sizeof g_drv_names[0])) g_drv_n++;
+/* ---- device picker (bwa_get_device_count/_name/_id): choose the output from the panel instead of
+ * restarting with --device. Every backend this build carries is listed, in the order AUTO would try
+ * them (bwa_ex_backends), each entry labeled with its backend - "wasapi: Speakers (Realtek(R)
+ * Audio)", "asio: FlexASIO". Picking sets BOTH the backend (bwa_desc.sink) and the device
+ * (bwa_desc.device, by stable id), which are create-time, so a pick REBUILDS the engine (the reverb
+ * scene's decoder-combo policy) and re-enters the current scene (every scene's enter() is already
+ * rebuild-safe — switch_scene relies on that). ---- */
+static char g_dev_pick_id[256];              /* the picked id g_device points at (ids outlive names) */
+static char g_dev_pick_label[224];           /* "<backend>: <name>" for the combo preview */
+/* Snapshot on open: every bwa_get_device_* call re-reads the OS list (an ASIO registry scan, a
+ * WASAPI endpoint enumeration), so enumerating inside the open combo cost N such scans PER FRAME and
+ * visibly stalled the UI for as long as the list was open. Snapshot once per open instead; closing
+ * invalidates it, so re-opening still picks up a device plugged in since. */
+enum { DEV_MAX = 64 };
+struct DevEntry {
+    bwa_sink_type backend;
+    char label[224];                         /* "<backend>: <name>", what the combo shows */
+    char id[256];                            /* what bwa_desc.device gets */
+};
+static DevEntry g_devs[DEV_MAX];
+static int      g_dev_n = -1;                /* -1 = no snapshot (combo closed); else devices listed */
+static void dev_snapshot(void) {
+    char nm[192], id[256];
+    g_dev_n = 0;
+    for (int b = 0; b < BWA_EX_NBACKEND && g_dev_n < DEV_MAX; ++b) {
+        bwa_sink_type s = bwa_ex_backends[b];
+        uint32_t n = bwa_get_device_count(s);
+        for (uint32_t i = 0; i < n && g_dev_n < DEV_MAX; ++i) {
+            if (!bwa_get_device_name(s, i, nm, sizeof nm)) continue;
+            if (!bwa_get_device_id(s, i, id, sizeof id)) snprintf(id, sizeof id, "%s", nm);
+            DevEntry* d = &g_devs[g_dev_n++];
+            d->backend = s;
+            snprintf(d->label, sizeof d->label, "%s: %s", bwa_ex_backend_label(s), nm);
+            snprintf(d->id, sizeof d->id, "%s", id);
+        }
+    }
 }
-static void rebuild_for_driver(void) {
+static void rebuild_for_device(void) {
     if (e) { bwa_stop(e); bwa_destroy(e); e = NULL; }
     build_engine(engine_mode);
     scenes[cur_scene].enter();
@@ -1286,41 +1326,65 @@ static void draw_panel(void) {
 
     /* audio status + live output meters (bwa_get_bus_levels -> spk_lv, the same data shading the 3D gizmos) */
     ImGui::SeparatorText("output");
-    if (backend_silent) ImGui::TextColored(ImVec4(1.00f, 0.45f, 0.45f, 1.0f), "audio: %s - NO SOUND", backend_name);
-    else                ImGui::TextColored(ImVec4(0.45f, 0.92f, 0.55f, 1.0f), "audio: %s", backend_name);
+    /* WRAPPED, and two lines when silent: the panel is narrow and the backend string is now a whole
+     * device name (cave_both names TWO), so an unwrapped line clips off the right edge - and what
+     * clips first is the tail, which is exactly where "NO SOUND" and the device name live. */
+    ImGui::PushStyleColor(ImGuiCol_Text, backend_silent ? ImVec4(1.00f, 0.45f, 0.45f, 1.0f)
+                                                        : ImVec4(0.45f, 0.92f, 0.55f, 1.0f));
+    if (backend_silent) ImGui::TextWrapped("audio: %s\nNO SOUND - no output device opened", backend_name);
+    else                ImGui::TextWrapped("audio: %s", backend_name);
+    ImGui::PopStyleColor();
     if (backend_silent && ImGui::IsItemHovered(ImGuiHoveredFlags_ForTooltip))
-        ImGui::SetTooltip("no ASIO device opened - the offline null sink renders silently\n"
-                          "(pick a driver below, or run with --driver <name>)");
-    {   /* registered-driver picker: the list is snapshotted on open (drv_snapshot - the
-         * enumeration is a registry scan per call); picking rebuilds the engine */
+        ImGui::SetTooltip("no output device opened - the offline null sink renders silently, so the "
+                          "scene stays live\n(pick a device below, or run with --device <name or id>; "
+                          "--list-devices prints them)%s%s",
+                          g_audio_err[0] ? "\nreason: " : "", g_audio_err);
+    {   /* device picker across every backend this build carries: the list is snapshotted on open
+         * (dev_snapshot - each query re-reads the OS list); picking rebuilds the engine */
+        bwa_health hh;
+        if (e && bwa_get_health(e, &hh) && hh.device_lost) { /* the device went away mid-run: nothing reopens itself */
+            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.00f, 0.65f, 0.35f, 1.0f));
+            ImGui::TextWrapped("device LOST - unplugged or reset; silent until you pick again");
+            ImGui::PopStyleColor();
+        }
         ImGui::SetNextItemWidth(-FLT_MIN);
-        if (ImGui::BeginCombo("##drv", g_asio_driver ? g_asio_driver : "driver: (auto-pick)")) {
-            if (g_drv_n < 0) drv_snapshot();                 /* first frame of this open */
-            if (ImGui::Selectable("(auto-pick)", g_asio_driver == NULL) && g_asio_driver) {
-                g_asio_driver = NULL;
-                rebuild_for_driver();
+        if (ImGui::BeginCombo("##dev", g_device ? g_dev_pick_label : "device: (auto)")) {
+            if (g_dev_n < 0) dev_snapshot();                 /* first frame of this open */
+            /* only a picked device is undone here: with no device the sink mode is whatever the CLI
+             * asked for (AUTO, or the --sink the suite forces), and clicking (auto) must not
+             * silently open a real one. */
+            if (ImGui::Selectable("(auto)", g_device == NULL) && g_device) {
+                g_device = NULL;
+                g_sink_mode = BWA_SINK_AUTO;
+                rebuild_for_device();
             }
-            for (int i = 0; i < g_drv_n; ++i) {
-                const char* nm = g_drv_names[i];
-                bool sel = g_asio_driver && strcmp(g_asio_driver, nm) == 0;
-                if (ImGui::Selectable(nm, sel) && !sel) {
-                    snprintf(g_drv_pick, sizeof g_drv_pick, "%s", nm);
-                    g_asio_driver = g_drv_pick;
-                    rebuild_for_driver();
+            for (int i = 0; i < g_dev_n; ++i) {
+                const DevEntry* d = &g_devs[i];
+                bool sel = g_device && strcmp(g_device, d->id) == 0 && g_sink_mode == d->backend;
+                ImGui::PushID(i);                            /* two endpoints CAN share a friendly name */
+                if (ImGui::Selectable(d->label, sel) && !sel) {
+                    snprintf(g_dev_pick_id, sizeof g_dev_pick_id, "%s", d->id);
+                    snprintf(g_dev_pick_label, sizeof g_dev_pick_label, "%s", d->label);
+                    g_device = g_dev_pick_id;
+                    g_sink_mode = d->backend;                /* the backend that owns it, demanded */
+                    rebuild_for_device();
                 }
+                ImGui::PopID();
             }
             ImGui::EndCombo();
         } else {
-            g_drv_n = -1;                                    /* closed: re-scan on the next open */
+            g_dev_n = -1;                                    /* closed: re-scan on the next open */
         }
-        bwTip("ASIO driver for the output (bwa_desc.asio_driver). Create-time, so picking REBUILDS "
-              "the engine (brief gap). (auto-pick) = the first registered driver with enough "
-              "outputs. A registered driver can still fail to open (unplugged/busy) - the engine "
-              "falls back to the silent null sink; the audio line above is the truth.");
+        bwTip("Output device (bwa_desc.sink + bwa_desc.device). Create-time, so picking REBUILDS the "
+              "engine (brief gap). (auto) = the engine's own order for a 2-channel render: the "
+              "Windows default output over WASAPI first, then an ASIO driver. Picking an entry "
+              "DEMANDS that backend and that device by its stable id. A listed device can still fail "
+              "to open (unplugged, busy, too few outputs) - the engine falls back to the silent null "
+              "sink; the audio line above is the truth.");
     }
     {   /* render picker: cave_sim auditions the ARRAY render on headphones, binaural is the
          * direct per-source render, cave drives the REAL array over ASIO (the rig). Create-time
-         * like the driver, so switching rebuilds + re-enters. */
+         * like the device, so switching rebuilds + re-enters. */
         static const char* prof_names[3] = { "render: cave_sim (array audition)",
                                              "render: binaural (direct)",
                                              "render: cave (the array itself)" };
@@ -1328,21 +1392,22 @@ static void draw_panel(void) {
         ImGui::SetNextItemWidth(-FLT_MIN);
         if (ImGui::Combo("##prof", &pr, prof_names, 3) && pr != g_render_pick) {
             g_render_pick = pr;
-            rebuild_for_driver();                   /* same policy as the driver pick */
+            rebuild_for_device();                   /* same policy as the device pick */
         }
         bwTip("What renders (bwa_desc.profile) - the headphone pair A/Bs by ear on the same scene. "
               "cave_sim = the array render through virtual speakers, DBAP artifacts included; the "
               "meters below show exactly what lights the speakers. binaural = the first-class "
               "direct render (per-voice HRTF with the Steam build; point sources and beds bypass "
               "the speaker bus, so quiet meters there are CORRECT - only the FDN/reflection tails "
-              "still ride the bus). cave = the ARRAY ITSELF: 26-ch ASIO to the rig - the by-ear "
-              "harness pointed at real speakers (pick the Digiface driver above; with no "
-              ">=layout-count device the null sink runs visual-only). The audio line above names "
-              "the live decode for the headphone renders. Create-time: switching REBUILDS the "
-              "engine (brief gap).");
+              "still ride the bus). Both headphone renders go out whatever the device combo above "
+              "says, which under (auto) is the Windows default output. cave = the ARRAY ITSELF: "
+              "26-ch ASIO to the rig - the by-ear harness pointed at real speakers (pick the "
+              "Digiface ASIO entry above; with no >=layout-count device the null sink runs "
+              "visual-only). The audio line above names the live decode for the headphone renders. "
+              "Create-time: switching REBUILDS the engine (brief gap).");
     }
     {   /* headphone correction EQ (bwa_load_headphone_eq): correct YOUR headphones before judging
-         * either render by ear. Path survives the render/driver rebuilds (build_engine re-loads). */
+         * either render by ear. Path survives the render/device rebuilds (build_engine re-loads). */
         ImGui::SetNextItemWidth(-uiScaled(78.0f));
         bool go = ImGui::InputTextWithHint("##hpeq", "headphone EQ (AutoEq ParametricEQ.txt)",
                                            g_hpeq_path, sizeof g_hpeq_path,
@@ -1716,34 +1781,83 @@ static void register_tests(ImGuiTestEngine* te) {
     ImGuiTest* t;
 
     /* pure-logic checks ride the same suite (the station's pattern) — filterable via --tests logic */
-    t = IM_REGISTER_TEST(te, "logic", "driver_rebuild");   /* the panel picker's enumeration + rebuild path */
+    /* the panel picker's enumeration + rebuild path, across every backend. CI has no audio device at
+     * all, so each per-device assertion is conditional on a nonempty list and the run PRINTS which
+     * case it took - a silent skip here would read as coverage it did not have. */
+    t = IM_REGISTER_TEST(te, "logic", "device_rebuild");
     t->TestFunc = [](ImGuiTestContext*) {
-        char nm[64];
-        uint32_t nd = bwa_get_asio_driver_count();
-        for (uint32_t i = 0; i < nd && i < 4; ++i)         /* every listed index is readable */
-            IM_CHECK(bwa_get_asio_driver_name(i, nm, sizeof nm) && nm[0]);
-        IM_CHECK(!bwa_get_asio_driver_name(nd, nm, sizeof nm));   /* count itself = out of range */
-        g_asio_driver = NULL;                              /* "(auto-pick)" — the suite runs the null sink */
-        rebuild_for_driver();                              /* exactly what a combo pick runs */
+        char nm[192], id[256];
+        uint32_t total = 0;
+        for (int b = 0; b < BWA_EX_NBACKEND; ++b) {
+            bwa_sink_type s = bwa_ex_backends[b];
+            uint32_t nd = bwa_get_device_count(s);
+            total += nd;
+            IM_CHECK_EQ(nd, bwa_get_device_count(s));      /* a fresh read of the same list agrees */
+            for (uint32_t i = 0; i < nd && i < 4; ++i) {   /* every listed index reads back, NUL-terminated */
+                memset(nm, 'x', sizeof nm);                /* no NUL anywhere: the call must plant one */
+                IM_CHECK(bwa_get_device_name(s, i, nm, sizeof nm));
+                IM_CHECK(memchr(nm, '\0', sizeof nm) != NULL);
+                IM_CHECK_GT(strlen(nm), (size_t)0);
+                memset(id, 'x', sizeof id);
+                IM_CHECK(bwa_get_device_id(s, i, id, sizeof id));
+                IM_CHECK(memchr(id, '\0', sizeof id) != NULL);
+                IM_CHECK_GT(strlen(id), (size_t)0);
+                /* a buffer too small for the name must leave a terminated string and never overrun.
+                 * Whether it TRUNCATES or refuses is not asserted: the header promises "truncated to
+                 * cap-1", the WASAPI path returns false with an empty buffer instead, and that
+                 * mismatch belongs to the engine, not to this picker (which always passes a full
+                 * buffer). Pin only what a caller can rely on either way. */
+                char tiny[6];
+                memset(tiny, 'x', sizeof tiny);
+                (void)bwa_get_device_name(s, i, tiny, sizeof tiny);
+                IM_CHECK(memchr(tiny, '\0', sizeof tiny) != NULL);
+            }
+            IM_CHECK(!bwa_get_device_name(s, nd, nm, sizeof nm));   /* count itself = out of range */
+            IM_CHECK(!bwa_get_device_id(s, nd, id, sizeof id));
+        }
+        /* the ASIO-only spelling the calibration tools still call is the same list */
+        IM_CHECK_EQ(bwa_get_asio_driver_count(), bwa_get_device_count(BWA_SINK_ASIO));
+        /* no backend = no devices: a policy value is not a device list */
+        IM_CHECK_EQ(bwa_get_device_count(BWA_SINK_AUTO), 0u);
+        IM_CHECK_EQ(bwa_get_device_count(BWA_SINK_NULL), 0u);
+        IM_CHECK_EQ(bwa_get_device_count(BWA_SINK_MANUAL), 0u);
+        printf("[playground] device_rebuild: %u device(s) across %d backend(s) - %s\n",
+               total, BWA_EX_NBACKEND,
+               total ? "per-device checks RAN" : "no devices, per-device checks SKIPPED");
+        g_device = NULL;                                   /* "(auto)" — the suite runs the null sink */
+        rebuild_for_device();                              /* exactly what a combo pick runs */
         IM_CHECK(e != NULL);
         IM_CHECK_GE(bwa_get_channel_count(e), 4u);         /* the rebuilt engine is live */
+        IM_CHECK_EQ((int)bwa_get_sink_type(e), (int)BWA_SINK_NULL);   /* still hermetic after the rebuild */
     };
 
-    /* the driver combo's name SNAPSHOT: taken on the frame the list opens, dropped on close (the
-     * enumeration is a registry scan per call, so reading it per frame stalled the panel). */
-    t = IM_REGISTER_TEST(te, "viewer", "driver_combo_snapshot");
+    /* the device combo's SNAPSHOT: taken on the frame the list opens, dropped on close (each query
+     * re-reads the OS list, so reading it per frame stalled the panel). The list itself is every
+     * backend's devices plus the "(auto)" row. */
+    t = IM_REGISTER_TEST(te, "viewer", "device_combo_snapshot");
     t->TestFunc = [](ImGuiTestContext* ctx) {
         ctx->SetRef("playground");
-        IM_CHECK_EQ(g_drv_n, -1);                          /* closed: nothing held */
-        ctx->ItemClick("##drv");
+        IM_CHECK_EQ(g_dev_n, -1);                          /* closed: nothing held */
+        /* the count is taken on BOTH sides of the open and either is accepted: a headset or a dock
+         * really can arrive in the seconds this click takes, and the list is read fresh every time,
+         * so demanding one exact number would flake. The assertion that matters survives it - a
+         * picker listing one backend's devices misses BOTH counts by the other backend's. */
+        uint32_t before = 0, after = 0;
+        for (int b = 0; b < BWA_EX_NBACKEND; ++b) before += bwa_get_device_count(bwa_ex_backends[b]);
+        ctx->ItemClick("##dev");
         ctx->Yield();
-        IM_CHECK_GE(g_drv_n, 0);                           /* open: snapshotted (0 drivers is a valid list) */
-        uint32_t nd = bwa_get_asio_driver_count();
-        IM_CHECK_EQ((uint32_t)g_drv_n, nd < (uint32_t)DRV_MAX ? nd : (uint32_t)DRV_MAX);
-        ctx->ItemClick("**/(auto-pick)");                  /* already auto-pick: closes, no rebuild */
+        IM_CHECK_GE(g_dev_n, 0);                           /* open: snapshotted (0 devices is a valid list) */
+        for (int b = 0; b < BWA_EX_NBACKEND; ++b) after += bwa_get_device_count(bwa_ex_backends[b]);
+        if (before > (uint32_t)DEV_MAX) before = (uint32_t)DEV_MAX;
+        if (after  > (uint32_t)DEV_MAX) after  = (uint32_t)DEV_MAX;
+        IM_CHECK((uint32_t)g_dev_n == before || (uint32_t)g_dev_n == after);
+        printf("[playground] device_combo_snapshot: %d row(s) = %d device(s) + 1 (auto)\n", g_dev_n + 1, g_dev_n);
+        if (g_dev_n > 0)                                   /* each row carries its backend label */
+            IM_CHECK(strchr(g_devs[0].label, ':') != NULL);
+        ctx->ItemClick("**/(auto)");                       /* already (auto): closes, no rebuild */
         ctx->Yield();
-        IM_CHECK_EQ(g_drv_n, -1);                          /* closed again: the next open re-scans */
-        IM_CHECK(g_asio_driver == NULL);
+        IM_CHECK_EQ(g_dev_n, -1);                          /* closed again: the next open re-scans */
+        IM_CHECK(g_device == NULL);
     };
 
     t = IM_REGISTER_TEST(te, "logic", "abx_pvalue");
@@ -1767,7 +1881,7 @@ static void register_tests(ImGuiTestEngine* te) {
         }
     };
 
-    /* THE regression this harness exists to pin: with no ASIO device (the suite forces
+    /* THE regression this harness exists to pin: with no device at all (the suite forces
      * BWA_SINK_NULL) the engine must still be LIVE — null-sink fallback rendering in real
      * time, output meters flowing. A dead engine here once shipped as "visual-only mode". */
     t = IM_REGISTER_TEST(te, "viewer", "meters_live");
@@ -2126,16 +2240,23 @@ int main(int argc, char** argv) {
     char filter[64] = "";
     for (int i = 1; i < argc; ++i)
         if (!strcmp(argv[i], "--help") || !strcmp(argv[i], "-h")) {
-            printf("usage: bwa_playground [cave_layout.json] [--driver <asio driver>] [--list-drivers] [--tests [filter]]\n"
-                   "  audition the engine by ear on the binaural monitor (auto-picked 2-ch ASIO\n"
-                   "  driver; with no device it renders silently -- visual-only mode stays live)\n"
+            printf("usage: bwa_playground [cave_layout.json] [--device <name or id>] [--sink <backend>]\n"
+                   "                      [--list-devices] [--tests [filter]]\n"
+                   "  audition the engine by ear on the binaural monitor (by default the system\n"
+                   "  default output, over WASAPI on Windows; with no device it renders silently --\n"
+                   "  visual-only mode stays live)\n"
                    "  cave_layout.json   optional surveyed layout (default: ./cave_layout.json if\n"
                    "                     present, else the built-in grid); ./constraints.json is\n"
                    "                     drawn for orientation if present\n"
-                   "  --driver <name>    ASIO driver to open (default: auto-pick a 2-ch one; the\n"
-                   "                     panel's driver combo switches live)\n"
-                   "  --list-drivers     print the registered ASIO drivers and exit\n"
+                   "  --device <name>    device to open, by friendly name or stable id (default: the\n"
+                   "                     backend's own default; the panel's device combo switches\n"
+                   "                     live). The name alone is enough: the backend that owns it\n"
+                   "                     takes it\n"
+                   "  --sink <backend>   auto | wasapi | asio | null (default auto: wasapi then asio\n"
+                   "                     for a 2-ch render, then the silent offline sink)\n"
+                   "  --list-devices     print every backend's output devices, with ids, and exit\n"
                    "  --tests [filter]   run the UI test suite (offline) and exit pass/fail\n"
+                   "  --driver, --list-drivers are the old ASIO-only spellings, still accepted\n"
                    "  keys: TAB scene | WASD/RF source | Q/E head | 1-4 signal | SPACE auto-move | F11\n");
             return 0;
         }
@@ -2143,23 +2264,33 @@ int main(int argc, char** argv) {
         if (!strcmp(argv[i], "--tests") || !strcmp(argv[i], "--selftest")) {
             selftest = true;
             if (i + 1 < argc && argv[i + 1][0] != '-') snprintf(filter, sizeof filter, "%s", argv[i + 1]);
+        } else if (!strcmp(argv[i], "--device") && i + 1 < argc) {
+            g_device = argv[++i];                             /* pin the output (bwa_desc.device); sink stays AUTO,
+                                                               * so the backend that owns the name takes it */
+        } else if (!strcmp(argv[i], "--sink") && i + 1 < argc) {
+            if (!bwa_ex_parse_sink(argv[++i], &g_sink_mode)) {
+                printf("unknown --sink '%s' (auto | null | a backend this build carries)\n", argv[i]);
+                return 2;
+            }
+        } else if (!strcmp(argv[i], "--list-devices")) {      /* names + ids for --device / the panel combo */
+            bwa_ex_list_devices(BWA_SINK_AUTO);
+            return 0;
         } else if (!strcmp(argv[i], "--driver") && i + 1 < argc) {
-            g_asio_driver = argv[++i];                        /* pin the headphone driver (bwa_desc.asio_driver) */
-        } else if (!strcmp(argv[i], "--list-drivers")) {      /* names for --driver / the panel combo */
-            char nm[64];
-            uint32_t nd = bwa_get_asio_driver_count();
-            printf("registered ASIO drivers (%u):\n", nd);
-            for (uint32_t k = 0; k < nd; ++k)
-                if (bwa_get_asio_driver_name(k, nm, sizeof nm)) printf("  %2u. %s\n", k, nm);
+            printf("note: --driver is the old ASIO-only spelling of --device <name or id>\n");
+            g_device = argv[++i];
+        } else if (!strcmp(argv[i], "--list-drivers")) {      /* the ASIO slice of --list-devices */
+            printf("note: --list-drivers lists ASIO only; --list-devices lists every backend\n");
+            bwa_ex_list_devices(BWA_SINK_ASIO);
             return 0;
         }
     if (selftest) g_sink_mode = BWA_SINK_NULL;
 
-    /* Sink policy (interactive): engine default (AUTO) — try a 2-ch ASIO driver for headphones, fall
-     * back to the offline null sink. Do NOT demand BWA_SINK_ASIO: the fallback is what keeps
-     * visual-only mode live (no device -> the engine still renders in real time, so speaker
-     * activity, panning and occlusion still animate, just silent). The panel's audio line +
-     * meters keep the no-audio state visible. */
+    /* Sink policy (interactive): engine default (AUTO) — the system default output for the 2-ch
+     * headphone render (WASAPI on Windows, an ASIO driver next), falling back to the offline null
+     * sink. Do NOT demand a backend: the fallback is what keeps visual-only mode live (no device ->
+     * the engine still renders in real time, so speaker activity, panning and occlusion still
+     * animate, just silent). --device / --sink and the panel's combo are the deliberate overrides;
+     * the panel's audio line + meters keep the no-audio state visible. */
 
     /* optional surveyed layout: argv[1], else ./cave_layout.json if present, else the default grid.
      * selftest always uses the default grid — the suite must not depend on a machine-local file. */
@@ -2188,7 +2319,8 @@ int main(int argc, char** argv) {
     build_engine(0);                                          /* start in the interactive config (fills speakers[], g_head) */
     source_pos.y = g_head.y;                                  /* start the source on the ear plane */
     printf("layout: %s    audio backend: %s%s\n", g_layout_path ? g_layout_path : "default grid", backend_name,
-           backend_silent ? "   (SILENT - run with --driver <your headphone driver>)" : "");
+           backend_silent ? "   (SILENT - no output device opened; --list-devices, then --device <name>)" : "");
+    if (backend_silent && g_audio_err[0]) printf("  reason: %s\n", g_audio_err);
     if (cv_load("constraints.json", &g_con))                  /* orientation only; the layout tool edits against these */
         printf("constraints: bounds + %d no-go + %d obstacle box(es) drawn from ./constraints.json\n", g_con.nnogo, g_con.nobst);
 

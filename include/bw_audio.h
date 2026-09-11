@@ -86,7 +86,12 @@ typedef uint32_t bwa_bed;       /* an ambisonic-bed voice (world-locked soundfie
  *   CAVE_SIM  auditions the ARRAY RENDER on headphones: every bus channel becomes a virtual
  *             speaker at its surveyed position, DBAP artifacts included - what the room would
  *             do, not the best a headphone can do. CAVE_BOTH is the rig plus that sim tap.
- * BINAURAL/CAVE_SIM open a 2-ch device; CAVE/CAVE_BOTH open the array device. */
+ * BINAURAL/CAVE_SIM open a 2-ch device; CAVE/CAVE_BOTH open the array device. CAVE_BOTH opens TWO
+ * devices, and only `sink`, `device` and `sink_flags` below describe the ARRAY one: the monitor
+ * takes the platform's default stereo device on its own. That is what makes the profile work on
+ * Windows, where the array holds the one ASIO driver a process may have and the monitor needs a
+ * WASAPI endpoint. The exception is an explicit NULL or MANUAL sink, which the monitor follows so
+ * an offline render stays offline. */
 typedef enum {
     BWA_PROFILE_CAVE      = 0,  /* speaker bus -> ASIO/Digiface. Listener POSITION only. */
     BWA_PROFILE_BINAURAL  = 1,  /* direct per-source binaural -> stereo device. Full POSE. */
@@ -162,6 +167,11 @@ typedef struct {
      * are common). NULL = the backend's default device (ASIO: the first registered driver with
      * enough output channels; WASAPI: the Windows default render endpoint). Under AUTO a backend
      * that has no device by this name is skipped, so the name reaches the backend that owns it.
+     *
+     * It names the PRIMARY device only. Under CAVE_BOTH that is the array; the monitor opens the
+     * platform default on its own, because a name that belongs to the array's driver would be
+     * skipped by every backend the monitor could use and leave it silent. Pinning the monitor's
+     * endpoint wants a field of its own and does not have one yet (docs/backends.md).
      * `asio_driver` is the legacy spelling of the same field and still compiles. */
     union {
         const char* device;
@@ -173,7 +183,9 @@ typedef struct {
     bool         enable_pathing;/* run the sound-pathing sim from bwa_start (needs scene geometry +
                                  * the Steam Audio build; sources opt in via bwa_source_set_pathing). */
     bwa_bed_decoder bed_decoder;   /* diffuse-bed SH->speaker decoder; 0 = the engine default. */
-    /* BWA_SINK_FLAG_* for whichever backend opens; 0 = default. Carved from what used to be
+    /* BWA_SINK_FLAG_* for whichever backend opens the PRIMARY device; 0 = default. Like `device`
+     * it does not reach the CAVE_BOTH monitor: an exclusive-mode grab is a decision about the
+     * array's interface, not about the machine's headphone endpoint. Carved from what used to be
      * reserved[0], so every field above keeps the offset it had and only the reserved tail
      * shortens - a 0.13 caller's zeroed desc is still a valid 0.14 one. */
     uint32_t     sink_flags;
@@ -220,8 +232,9 @@ BWA_API uint32_t    bwa_get_version(void);   /* the DLL's BWA_VERSION - check ag
  * "wasapi:Headphones (Realtek Audio)" - or "null" (offline/SILENT), "manual", or "none" (not
  * started). The device part is the OS's own name, UTF-8. The headphone profiles also name the
  * decode in use - "(steam HRTF direct)" / "(simple-pan direct)" for BINAURAL, "(steam HRTF sim)" /
- * "(simple-pan sim)" for CAVE_SIM/CAVE_BOTH. Human-readable (logs/HUDs); program logic wants
- * bwa_get_sink_type. */
+ * "(simple-pan sim)" for CAVE_SIM/CAVE_BOTH. CAVE_BOTH has TWO devices and names both, array
+ * first: "asio:Digiface Dante + wasapi:Headphones (Realtek Audio) (steam HRTF sim)".
+ * Human-readable (logs/HUDs); program logic wants bwa_get_sink_type. Never parse this string. */
 BWA_API const char* bwa_get_audio_backend(bwa_engine* e);
 /* The RESOLVED engine config (zero-defaulted desc fields resolved), valid from bwa_create on.
  * Derive time from these - seconds = frames / bwa_get_sample_rate(e) - not from the desc you
@@ -229,9 +242,11 @@ BWA_API const char* bwa_get_audio_backend(bwa_engine* e);
  * buffer differently; bwa_get_output_latency_frames carries the real render->DAC delay). */
 BWA_API uint32_t bwa_get_sample_rate(bwa_engine* e);   /* Hz */
 BWA_API uint32_t bwa_get_block_size (bwa_engine* e);   /* frames per render block */
-/* The sink actually running - the machine-readable side of bwa_get_audio_backend: after
- * bwa_start, AUTO has resolved to the concrete backend that opened; before start (or after stop)
- * it reports the configured policy. */
+/* The sink actually running - the machine-readable side of bwa_get_audio_backend. Only a
+ * SUCCESSFUL bwa_start resolves it: from then on it names the concrete backend that opened. Before
+ * start, after stop, and after a FAILED start it reports the configured policy instead, so a start
+ * that was refused still answers the backend you demanded rather than what is running. Gate on
+ * bwa_start's result first; this call is not a substitute for it. */
 BWA_API bwa_sink_type bwa_get_sink_type(bwa_engine* e);
 
 /* ---- Device query (control thread; needs NO engine - call before bwa_create to populate a

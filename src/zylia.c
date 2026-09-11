@@ -2,6 +2,7 @@
  * zylia.c — single-position ZM-1 speaker localization. See zylia.h for the model + accuracy notes.
  */
 #include "zylia.h"
+#include "os.h"        /* os_fopen: UTF-8 paths on Windows */
 
 #include <math.h>
 #include <stdio.h>
@@ -1072,7 +1073,7 @@ int zylia_survey_save(const char* path, const float caps_m[ZYLIA_MICS][3],
     cJSON_Delete(root);
     if (!text) { zy_err(err, errcap, "zylia_survey_save: serialize failed"); return 0; }
 
-    FILE* f = fopen(path, "wb");
+    FILE* f = os_fopen(path, "wb");
     if (!f) { free(text); zy_err(err, errcap, "zylia_survey_save: cannot open file for writing"); return 0; }
     size_t n = strlen(text);
     size_t w = fwrite(text, 1, n, f);
@@ -1085,7 +1086,7 @@ int zylia_survey_save(const char* path, const float caps_m[ZYLIA_MICS][3],
 int zylia_survey_load(const char* path, ZyliaMount* mount_out, char* err, int errcap) {
     if (mount_out) memset(mount_out, 0, sizeof *mount_out);   /* absent fields => a room-axes survey */
     if (!path) { zy_err(err, errcap, "zylia_survey_load: null path"); return 0; }
-    FILE* f = fopen(path, "rb");
+    FILE* f = os_fopen(path, "rb");
     if (!f) { zy_err(err, errcap, "zylia_survey_load: cannot open file"); return 0; }
     fseek(f, 0, SEEK_END);
     long len = ftell(f);

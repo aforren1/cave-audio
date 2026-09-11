@@ -65,6 +65,20 @@ BWA_EXPORT
 #endif
 extern volatile int bwa_null_sink_skip_blocks;
 
+/* TEST HOOKS (defined in engine.c, exported from the dll; deliberately not in bw_audio.h): the
+ * cave_both MONITOR sink, which the public readbacks never describe - bwa_get_health and
+ * bwa_get_sink_type both report the ARRAY. A monitor that failed to open on its own device falls
+ * to the silent null sink, and only these two tell a test that apart from a live one.
+ * bwa_monitor_blocks returns 0 when there is no monitor sink. */
+#ifdef BWA_BUILD_DLL
+BWA_EXPORT
+#endif
+bwa_sink_type bwa_monitor_sink_type(bwa_engine* e);
+#ifdef BWA_BUILD_DLL
+BWA_EXPORT
+#endif
+uint64_t bwa_monitor_blocks(bwa_engine* e);
+
 /* Hardware-anchored timestamp captured at the top of each block. Mirrors what ASIO
  * delivers via ASIOTime (sample position + nanosecond systemTime); the null sink
  * synthesizes it from the platform monotonic clock (os_monotonic_ns). */
@@ -105,6 +119,25 @@ typedef struct {
  * be counted as one. Factored out of the backends so the accounting can be tested without a device
  * (test/health_test.c); `block` bounds the sane-jump window. */
 uint64_t sink_position_gap(uint64_t expected, uint64_t actual, uint32_t block);
+
+/* Copy a UTF-8 device name into a caller buffer under the contract bwa_get_device_name states:
+ * always NUL-terminated, truncated to cap-1, never failed for want of room. The one thing plain
+ * strncpy gets wrong is the CUT: a device name is UTF-8, so stopping mid-sequence leaves an
+ * invalid string rather than a shorter one, and a picker that renders it shows a replacement
+ * character it can never match back against bwa_desc.device. Steps back over continuation bytes
+ * (10xxxxxx) to land on a character boundary. Returns false only for no buffer or an empty result.
+ * Static inline because all four device backends need it and two of them are C++. */
+static inline bool sink_copy_device_name(char* dst, uint32_t cap, const char* src) {
+    if (!dst || cap == 0) return false;
+    dst[0] = 0;
+    if (!src) return false;
+    uint32_t n = 0;
+    while (src[n] && n < cap - 1) ++n;
+    if (src[n]) while (n > 0 && ((unsigned char)src[n] & 0xC0) == 0x80) --n;   /* only when cut */
+    for (uint32_t i = 0; i < n; ++i) dst[i] = src[i];
+    dst[n] = 0;
+    return n != 0;
+}
 
 typedef struct bwa_sink bwa_sink;
 

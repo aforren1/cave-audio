@@ -373,9 +373,7 @@ bool sink_alsa_device_name(uint32_t index, char* buf, uint32_t cap) {
     AlsaHint h[ALSA_MAX_HINTS];
     const uint32_t n = alsa_hints(h, ALSA_MAX_HINTS);
     if (index >= n) return false;
-    strncpy(buf, h[index].desc, cap - 1);
-    buf[cap - 1] = 0;
-    return buf[0] != 0;
+    return sink_copy_device_name(buf, cap, h[index].desc);
 }
 
 bool sink_alsa_device_id(uint32_t index, char* buf, uint32_t cap) {
@@ -384,9 +382,7 @@ bool sink_alsa_device_id(uint32_t index, char* buf, uint32_t cap) {
     AlsaHint h[ALSA_MAX_HINTS];
     const uint32_t n = alsa_hints(h, ALSA_MAX_HINTS);
     if (index >= n) return false;
-    strncpy(buf, h[index].name, cap - 1);
-    buf[cap - 1] = 0;
-    return buf[0] != 0;
+    return sink_copy_device_name(buf, cap, h[index].name);
 }
 
 /* ---- open ----------------------------------------------------------------------------------- */

@@ -3,6 +3,7 @@
  * Control thread / load time only.
  */
 #include "layout.h"
+#include "os.h"        /* os_fopen: UTF-8 paths on Windows */
 
 #include <math.h>
 #include <stdio.h>
@@ -99,7 +100,7 @@ Layout layout_default(void) {
 }
 
 static char* read_file(const char* path, char* err, size_t errcap) {
-    FILE* f = fopen(path, "rb");
+    FILE* f = os_fopen(path, "rb");
     if (!f) { set_err(err, errcap, "layout: cannot open file"); return NULL; }
     fseek(f, 0, SEEK_END);
     long n = ftell(f);

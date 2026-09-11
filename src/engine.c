@@ -86,9 +86,10 @@ struct bwa_engine {
     int         started;
     const char* last_error;        /* points at errbuf or a literal; NULL when clean */
     char        errbuf[256];
-    char        backend_buf[288];  /* bwa_get_audio_backend readback (device + which monitor is live).
+    char        backend_buf[448];  /* bwa_get_audio_backend readback (device + which monitor is live).
                                     * Sized for a WASAPI endpoint name, which is the OS's friendly
-                                    * string and can run well past an ASIO driver's 32 bytes. */
+                                    * string and can run well past an ASIO driver's 32 bytes - and
+                                    * cave_both names TWO devices, the array's and the monitor's. */
     bwa_profile   profile;
     int         panner;            /* mirror of bwa_set_panner (bwa_panner; 0 = DBAP) for the room_eq start guard */
 
@@ -550,8 +551,29 @@ bwa_result bwa_start(bwa_engine* e) {
                  * profile work on hardware: under AUTO a 2-channel request resolves to WASAPI while the
                  * array holds the one ASIO driver the SDK allows per process. It is asked for the
                  * ARRAY's block, not cfg.block_size, because the handoff below exchanges cap-sized
-                 * blocks and the fixed-quantum adapter can render exactly that. */
-                e->sink_mon = bwa_sink_open(sr, e->cap, 2, e->cfg.sink, e->cfg.device, e->cfg.sink_flags,
+                 * blocks and the fixed-quantum adapter can render exactly that.
+                 *
+                 * `device` and `sink_flags` describe the PRIMARY device only, so the monitor asks for
+                 * AUTO on the platform default with no flags. Inheriting them re-created the exact
+                 * defect WASAPI was added to fix: on the rig `device` names the array's ASIO driver,
+                 * and rule 10 (docs/backends.md) SKIPS a backend that has no device by that name - so
+                 * the monitor's 2-channel AUTO request skipped WASAPI, asked ASIO for a driver whose
+                 * one process-wide slot the array already held, and fell to the silent null sink.
+                 * Under BWA_SINK_ASIO it failed the start outright. The exception is the DEVICE-FREE
+                 * sinks: a caller who ASKED for null or manual wants an offline render, and CI must
+                 * not reach for a real endpoint behind its back.
+                 *
+                 * The exception reads the REQUESTED sink, not the resolved one, and the difference is
+                 * the case worth naming: an AUTO array whose device is missing falls to the null sink,
+                 * and reading the resolved type there would take the headphone monitor down with it -
+                 * silence everywhere, on the one configuration where hearing the sim is how you find
+                 * out the array never opened. An explicit null or manual still resolves to itself, so
+                 * offline stays offline either way.
+                 * Pinning the monitor's endpoint wants a `monitor_device` field; see backends.md. */
+                const bool mon_devfree = (e->cfg.sink == BWA_SINK_NULL || e->cfg.sink == BWA_SINK_MANUAL);
+                const bwa_sink_type mon_type = e->cfg.sink;
+                e->sink_mon = bwa_sink_open(sr, e->cap, 2,
+                                            mon_devfree ? mon_type : BWA_SINK_AUTO, NULL, 0,
                                             false, render_both_monitor, e, e->errbuf, sizeof e->errbuf);
                 /* the double-buffer handoff exchanges cap-sized blocks, so the two devices must agree.
                  * A mismatch would leave the monitor silent — fail with a clear message instead. */
@@ -744,6 +766,15 @@ const char* bwa_last_error(bwa_engine* e) {
 
 const char* bwa_get_audio_backend(bwa_engine* e) {
     if (!e || !e->sink) return "none";
+    if (e->profile == BWA_PROFILE_CAVE_BOTH && e->sink_mon) {
+        /* BOTH devices, because they are different devices now: the array's `device` no longer
+         * reaches the monitor, so "which endpoint is the monitor actually on" is a question only
+         * this string answers. Human-readable by contract - parse bwa_get_sink_type instead. */
+        snprintf(e->backend_buf, sizeof e->backend_buf, "%s + %s (%s sim)",
+                 bwa_sink_backend(e->sink), bwa_sink_backend(e->sink_mon),
+                 e->steam ? "steam HRTF" : "simple-pan");
+        return e->backend_buf;
+    }
     if (e->profile != BWA_PROFILE_CAVE) {
         /* name the decode too: the HRTF decode falls back to the simple-pan monitor SILENTLY
          * (steam_monitor_create is non-fatal), and a by-ear report is meaningless without knowing
@@ -771,6 +802,21 @@ bwa_sink_type bwa_get_sink_type(bwa_engine* e) {
     if (!e) return BWA_SINK_NULL;
     if (e->sink) return bwa_sink_type_of(e->sink);
     return e->cfg.sink;
+}
+
+/* TEST HOOKS (see sink.h; deliberately not in bw_audio.h). cave_both is the one profile with TWO
+ * devices, and the public health readback reports the array's. "The monitor is actually running on
+ * its own device" has no other observable: the backend string names it, but only a block count
+ * proves the second callback loop is turning. */
+BWA_EXPORT bwa_sink_type bwa_monitor_sink_type(bwa_engine* e) {
+    return (e && e->sink_mon) ? bwa_sink_type_of(e->sink_mon) : BWA_SINK_NULL;
+}
+
+BWA_EXPORT uint64_t bwa_monitor_blocks(bwa_engine* e) {
+    if (!e || !e->sink_mon) return 0;
+    bwa_sink_health h;
+    bwa_sink_get_health(e->sink_mon, &h);
+    return h.blocks;
 }
 
 /* ---- assets ---- */
