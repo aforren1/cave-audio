@@ -40,7 +40,8 @@ engine owns decoding, which also avoids Unity's 8-channel output cap entirely.
 ## Install
 
 **Windows x64 only** (ASIO is Windows-only). The released package **ships the native engine**.
-`bw_audio.dll` and `phonon.dll` are inside it, with import settings already configured. Nothing to build.
+`bw_audio.dll` is inside it, with import settings already configured. Nothing to build. It is one
+file: Steam Audio is linked into the engine rather than shipped beside it.
 
 ### From a git URL
 

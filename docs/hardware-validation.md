@@ -46,7 +46,8 @@ the speakers land in their real places. By then you have run every tool once.
 - [ ] **Build**: RelWithDebInfo with `-DBWA_BUILD_PLAYGROUND=ON -DBWA_BUILD_CALIBVIEW=ON
       -DBWA_BUILD_CALIBRATE=ON` (or the CI artifact, which carries all of it). Run
       `ctest --test-dir build -C RelWithDebInfo` green *before* leaving: never debug a known
-      failure through speakers. `phonon.dll` must sit beside `bw_audio.dll`.
+      failure through speakers. `bw_audio.dll` is the only library to carry: Steam Audio is
+      linked into it.
 - [ ] **Dante** configured per [build.md](./build.md): 48 kHz / 24-bit end-to-end, exactly
       **one leader clock** on the net and you know which node it is (the Digiface is hardware,
       so it can lead), ASIO buffer ~512–1024, Dante latency 4–10 ms to start. Work at 48 kHz:

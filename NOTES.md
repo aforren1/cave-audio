@@ -8,6 +8,26 @@ agent session while remaining findable.
 
 ---
 
+**Static phonon for Android (2026-09-15).** Both ABIs, built on a Windows host with the composite
+action's own steps and run on an x86_64 emulator: 37 of 38, the five SDK tests included (the red is
+`os`'s `os_sleep_until_ns` median-lateness bound, about 1.1 ms against 1 ms, which a no-SDK library
+of the same commit misses the same way on the same emulator), and
+`bwa_minimal` reports `backend: aaudio:default (steam HRTF direct)`. Android links pffft like every
+other platform, not FFTS. Two android-only upstream patches went into `third_party/patches/`: the
+scripts drop every `android-arm64` cmake-flag layer because they build that target as
+`android-armv8`, and they spell the NDK host tag `windows-x86_64` in six places. The engine link
+needed the system `log` library (phonon's logger calls `__android_log_print`) and
+`-Wl,--exclude-libs,ALL` (phonon's Android build sets no hidden visibility, so 3000-odd archive
+symbols were landing in the dynamic symbol table). Stripped arm64: 0.4 MB to 7.0 MB.
+
+**Static phonon (2026-09-15).** Steam Audio is linked statically. `third_party/steam-audio-artifacts/`
+went platform-neutral (`include/` plus `lib/<platform>/` holding phonon and the three companion
+archives it needs: mysofa, zlib, pffft), the CMake detect keys on that set
+rather than on a Windows import library, and `phonon.dll` left the Godot manifest, the Unity
+package, the CI artifact and the release zips. `bw_audio.dll` grew 859,648 to 7,677,440 bytes and
+the pair it replaced was 7,173,120, so one file costs 504,320 bytes more than two did. The recipe
+moved into a composite action so the Linux, macOS and Android phonon builds can call it.
+
 **Current state (M6 + occlusion):** builds `bw_audio.dll` + the test suite (nineteen ctests with the Steam
 Audio SDK, fifteen without; +`calib_view` with `BWA_BUILD_CALIBVIEW`, +`layout_tool` and
 +`playground` with `BWA_BUILD_PLAYGROUND`). `rt.c` is the concurrency spine
@@ -777,3 +797,33 @@ on the one configuration where hearing the sim is how you find out the array nev
 work turned up `bwa_get_device_name` failing instead of truncating on WASAPI: `WideCharToMultiByte`
 into a short buffer returns 0 and writes nothing, so a picker got an empty name rather than the
 "truncated to cap-1" the header promises.
+
+The AAudio sink (backends phase 3) cost two decisions the spec had left open, and both came from
+the same place: AAudio tells you less than the other APIs and you have to stop pretending
+otherwise. Dropouts are `getXRunCount`, which counts EVENTS and never their length, so
+`dropped_frames` stays 0 by design and the test asserts it stays 0 rather than accepting a
+plausible estimate from the callback interval. And a shared-mode stream opened at the engine rate
+reports the engine rate whether or not the service is resampling underneath it, so rule 6's
+"succeeded but degraded" channel had nothing to say until the sink started PROBING the device rate
+with a throwaway stream opened with everything unspecified. Both the emulator verification and the
+deliberate-red check landed: breaking the xrun fold on purpose turned the injected-stall assertion
+red before it was trusted green. What the emulator could not reach is on the verify list, and the
+honest headline there is that `test_os` is FLAKY on an emulator - six of ten runs pass, and the
+two that trip are its tightest timing bounds (p50 sleep lateness straddling 1 ms at 0.89 to 1.11,
+and a "past deadline returns at once" check that allows 1 ms between two clock reads), with
+SCHED_FIFO refused as Android refuses it for every app thread. The bounds were left alone rather
+than widened to fit a virtual machine nobody will ship on.
+
+Static phonon for Linux and macOS cost three fixes rather than the zero the "just call the
+composite action" plan assumed, and all three were silent. The action's `-t make` was an argparse
+ERROR, because both pinned scripts declare `--toolchain` with the five `vs20xx` spellings and
+nothing else. `LINKER_LANGUAGE CXX` on a project whose `project()` says `LANGUAGES C` does not
+error either: CMake emits an EMPTY link rule, so the build printed "Linking CXX shared library
+libbw_audio.so", exited 0, wrote no library, and every test still passed because the tests link
+`bwa_core`'s objects rather than the library. And `-fvisibility=hidden` does not contain a static
+phonon, because `IPLAPI` is `visibility("default")` inside phonon's own objects: 561 dynamic
+symbols came out of `libbw_audio.so`, 216 of them `ipl*`, until `-Wl,--exclude-libs,ALL` brought it
+back to the 173 `bwa_*` the ABI declares. The AVX trap also turned out to be the COMPILER and not
+the distribution: `-fabi-version=6` breaks `<future>` in `hrtf.cpp` on gcc 11.5 and 13.3 and
+compiles on 14.3, so CI (gcc 13) passes `-DSTEAMAUDIO_ENABLE_AVX=OFF` and a modern desk box does
+not have to.

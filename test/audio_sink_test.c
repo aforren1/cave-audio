@@ -298,10 +298,11 @@ static int names_both_rates(const char* msg, uint32_t engine_rate, uint32_t othe
 }
 #endif
 
-#ifdef BWA_HAVE_ALSA
+#if defined(BWA_HAVE_ALSA) || defined(BWA_HAVE_AAUDIO)
 /* The same rule where only ONE of the two rates is known to the test: the requested rate must be
  * named, and so must a device rate, whatever the device chose to report. So: the message names the
- * request, and "runs at <n> Hz" names an n that is a real rate and not the request. */
+ * request, and "runs at <n> Hz" names an n that is a real rate and not the request. Shared by the
+ * ALSA and AAudio sections, which both meet a device whose own rate the test cannot predict. */
 static int rejects_naming_both(const char* msg, uint32_t requested) {
     char want[32];
     snprintf(want, sizeof want, "%u", requested);
@@ -642,6 +643,170 @@ static int test_alsa(void) {
 }
 #endif /* BWA_HAVE_ALSA */
 
+#ifdef BWA_HAVE_AAUDIO
+/* The AAudio section. Same contract as the null sink above, against a live Android output stream:
+ * a stable callback at a CONSTANT nframes equal to block_size (the adapter's whole job, since
+ * setFramesPerDataCallback is a hint the OS may ignore), monotonic position and time, health that
+ * says what it can actually observe, a deliberate stall that must show up in the OS's own xrun
+ * count, a rate-mismatch open, and a stop and close that return.
+ *
+ * BWA_TEST_AAUDIO_DEVICE overrides the device id (the default is the default output), so one
+ * binary reaches a headset's built-in output or a Bluetooth route without editing code.
+ *
+ * Returns 0 (ok), 1 (failed), or SKIP_EXIT when there is no output stream to open. */
+static int test_aaudio(void) {
+    const uint32_t SR = 48000, BS = 256;
+    const char* dev = getenv("BWA_TEST_AAUDIO_DEVICE");
+    if (dev && !*dev) dev = NULL;
+
+    Probe p;
+    probe_init(&p, 2);
+    char err[256] = {0};
+
+    bwa_sink* s = bwa_aaudio_sink_open(SR, BS, 2, dev, 0, false, on_render, &p, err, sizeof err);
+    if (!s) {
+        if (!err[0]) { fprintf(stderr, "FAIL: aaudio open failed with no message\n"); return 1; }
+        /* "no usable AAudio output device" is a headless image and any box with the audio HAL
+         * switched off. Anything else is a real failure: a device WITH audio that cannot open it
+         * is exactly what this section exists to catch. */
+        if (strstr(err, "no usable AAudio output device")) { printf("SKIP: %s\n", err); return SKIP_EXIT; }
+        fprintf(stderr, "FAIL: aaudio open: %s\n", err);
+        return 1;
+    }
+    /* Rule 6's resampler and a refused exclusive mode both ride in on a SUCCESSFUL open. Printed
+     * rather than asserted: which of them applies is a property of the device, not of the sink. */
+    if (err[0]) printf("aaudio: opened with a degradation reported: %s\n", err);
+
+    const char* backend = bwa_sink_backend(s);
+    const uint32_t block  = bwa_sink_block_size(s);
+    const uint32_t burst  = sink_aaudio_burst_frames(s);
+    const uint32_t buffer = sink_aaudio_buffer_frames(s);
+    int ok = 1;
+    if (bwa_sink_type_of(s) != BWA_SINK_AAUDIO) {
+        fprintf(stderr, "FAIL: aaudio sink reports the wrong backend type\n");
+        bwa_sink_close(s); return 1;
+    }
+    if (strncmp(backend, "aaudio:", 7) != 0) {
+        fprintf(stderr, "FAIL: backend string is '%s', want \"aaudio:<device>\"\n", backend);
+        bwa_sink_close(s); return 1;
+    }
+    if (bwa_sink_start(s) != 0) { fprintf(stderr, "FAIL: aaudio start\n"); bwa_sink_close(s); return 1; }
+
+    /* --- phase 1: a healthy run ---
+     *
+     * The xrun count is REPORTED here, not asserted to be zero. Unlike the WASAPI and ALSA
+     * sections there is no configuration flag that says whether a clean 200 ms was ever on offer:
+     * the callback thread belongs to AAudio, and on a virtualized audio HAL (the emulator) or a
+     * busy headset the service can legitimately run dry through no fault of the sink. What this
+     * section CAN demand is that the injected stall below is seen, which is the assertion that
+     * goes red if the xrun fold breaks. */
+    os_sleep_ms(200);                                   /* ~37 blocks at 256/48000 = 5.33 ms */
+    bwa_sink_health h1;
+    bwa_sink_get_health(s, &h1);
+    if (h1.dropouts != 0)
+        printf("  NOTE: %llu xruns on the healthy 200 ms run; not asserted on this backend (see "
+               "the comment).\n", (unsigned long long)h1.dropouts);
+    if (p.blocks < 10) {
+        fprintf(stderr, "FAIL: %lu blocks in 200 ms, want at least 10\n", p.blocks); ok = 0;
+    }
+
+    /* --- phase 2: starve it on purpose. Twice the buffer plus slack, so the stream certainly runs
+     *     dry and the service certainly counts an underrun. --- */
+    const unsigned stall_ms = (2u * (buffer ? buffer : BS) * 1000u / SR) + 40u;
+    atomic_store_explicit(&p.stall_ms_once, (int)stall_ms, memory_order_relaxed);
+    os_sleep_ms(200u + stall_ms);
+
+    bwa_sink_stop(s);            /* waits out the stream state change: the callback is done */
+
+    const unsigned long blocks = p.blocks;
+    const uint32_t latency = bwa_sink_output_latency(s);
+    if (block != BS) { fprintf(stderr, "FAIL: block_size() is %u, want the engine's %u\n", block, BS); ok = 0; }
+    if (!p.nframes_stable || p.nframes_first != BS) {
+        fprintf(stderr, "FAIL: nframes varied or was not the block size (first=%u, stable=%d)\n",
+                p.nframes_first, p.nframes_stable); ok = 0;
+    }
+    if (!p.time_monotonic) { fprintf(stderr, "FAIL: system_time_ns not monotonic\n"); ok = 0; }
+    if (!p.pos_monotonic)  { fprintf(stderr, "FAIL: sample_pos not monotonic\n");     ok = 0; }
+    if (p.last_sample_pos != (uint64_t)BS * (blocks - 1)) {
+        fprintf(stderr, "FAIL: sample_pos drift (last=%llu, expected=%llu)\n",
+                (unsigned long long)p.last_sample_pos, (unsigned long long)((uint64_t)BS * (blocks - 1)));
+        ok = 0;
+    }
+    if (latency == 0) { fprintf(stderr, "FAIL: no output latency reported\n"); ok = 0; }
+
+    bwa_sink_health h;
+    bwa_sink_get_health(s, &h);
+    /* Rule 4's row: measured follows getTimestamp having answered. A stream that delivered tens of
+     * blocks has presented frames, so a false here means the device never reported a timestamp at
+     * all, which is a finding rather than a tolerance. */
+    if (!h.measured) {
+        fprintf(stderr, "FAIL: %lu blocks ran and getTimestamp never answered, so health reports "
+                        "unmeasured\n", blocks); ok = 0;
+    }
+    if (h.blocks != blocks) {
+        fprintf(stderr, "FAIL: health counted %llu blocks, the probe saw %lu\n",
+                (unsigned long long)h.blocks, blocks); ok = 0;
+    }
+    if (h.device_lost) { fprintf(stderr, "FAIL: the device was reported lost during a clean run\n"); ok = 0; }
+    if (h.period_ns == 0) { fprintf(stderr, "FAIL: no block period to measure the budget against\n"); ok = 0; }
+    /* The half the adapter measures itself, so it is demandable on every backend. */
+    if (h.late_blocks < 1) {
+        fprintf(stderr, "FAIL: a %u ms stall inside render() was not counted as a late block\n",
+                stall_ms); ok = 0;
+    }
+    /* The OS's own count. dropped_frames stays 0 by design on this backend: AAudio says how many
+     * times the stream ran dry and never for how long, and an estimate from the callback interval
+     * would be a guess dressed as a measurement. */
+    if (h.dropouts <= h1.dropouts) {
+        fprintf(stderr, "FAIL: the callback was stalled %u ms past a %u-frame buffer and "
+                        "getXRunCount did not rise (%llu before, %llu after)\n",
+                stall_ms, buffer, (unsigned long long)h1.dropouts, (unsigned long long)h.dropouts);
+        ok = 0;
+    }
+    if (h.dropped_frames != 0) {
+        fprintf(stderr, "FAIL: AAudio cannot measure the LENGTH of an underrun, so dropped_frames "
+                        "must stay 0; got %llu\n", (unsigned long long)h.dropped_frames); ok = 0;
+    }
+
+    printf("aaudio OK: backend=%s blocks=%lu block=%u burst=%u buffer=%u latency=%u frames%s\n",
+           backend, blocks, block, burst, buffer, latency,
+           (burst == block) ? " (adapter in pass-through)" : "");
+    printf("  measured=%d xruns=%llu dropped=%llu late=%llu resyncs=%llu (stall %u ms injected, "
+           "%llu xruns before it)\n", h.measured ? 1 : 0, (unsigned long long)h.dropouts,
+           (unsigned long long)h.dropped_frames, (unsigned long long)h.late_blocks,
+           (unsigned long long)h.driver_resyncs, stall_ms, (unsigned long long)h1.dropouts);
+    bwa_sink_close(s);                            /* must return, not hang */
+
+    /* --- rule 6: a rate the device cannot run. AAudio's shared mode may legitimately convert, so
+     *     an open that SUCCEEDS is acceptable only when it reported the degradation; one that
+     *     fails must name both the rate that was asked for and the device's. --- */
+    {
+        const uint32_t absurd = 999999;
+        Probe q;
+        probe_init(&q, 2);
+        char e2[256] = {0};
+        bwa_sink* bad = bwa_aaudio_sink_open(absurd, BS, 2, dev, 0, false, on_render, &q, e2, sizeof e2);
+        if (bad) {
+            if (!e2[0]) {
+                fprintf(stderr, "FAIL: a %u Hz open succeeded with no degradation reported; the OS "
+                                "cannot be running the device at that rate\n", absurd);
+                ok = 0;
+            } else {
+                printf("  rate mismatch accepted with a degradation: %s\n", e2);
+            }
+            bwa_sink_close(bad);
+        } else if (!rejects_naming_both(e2, absurd)) {
+            fprintf(stderr, "FAIL: the rate-mismatch message must name both the requested rate and "
+                            "the device's; got: %s\n", e2[0] ? e2 : "(no message)");
+            ok = 0;
+        } else {
+            printf("  rate mismatch rejected: %s\n", e2);
+        }
+    }
+    return ok ? 0 : 1;
+}
+#endif /* BWA_HAVE_AAUDIO */
+
 int main(void) {
     Probe p;
     probe_init(&p, BWA_CHANNELS);
@@ -712,6 +877,13 @@ int main(void) {
 #ifdef BWA_HAVE_ALSA
     {
         const int rc = test_alsa();
+        if (rc == 1) return 1;
+        if (rc == SKIP_EXIT) device_skipped = 1; else device_ran = 1;
+    }
+#endif
+#ifdef BWA_HAVE_AAUDIO
+    {
+        const int rc = test_aaudio();
         if (rc == 1) return 1;
         if (rc == SKIP_EXIT) device_skipped = 1; else device_ran = 1;
     }

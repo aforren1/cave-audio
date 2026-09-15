@@ -96,6 +96,20 @@ src/
                        picks the size, and it writes whole engine blocks. Blocking snd_pcm_writei IS
                        the pacing; -EPIPE is the underrun report; SCHED_FIFO is asked for and its
                        refusal is a reported degradation, never a failure. [backends p5]
+  aaudio_sink.c        AAudio host (Android): the headphone path on a standalone VR headset, and
+                       STEREO ONLY - Android carries no array transport, so AUTO sends anything
+                       wider straight to the offline sink and an explicit open says so. AAudio owns
+                       the callback thread and treats setFramesPerDataCallback as a HINT, so the
+                       fixed-quantum adapter is in the path. Dropouts are the OS's own
+                       getXRunCount DELTA with dropped_frames 0 (AAudio counts events, never their
+                       length); device_pos_valid is false, because the queued-depth rule would count
+                       the same starve twice. The device rate is PROBED before the real open (one
+                       throwaway stream, everything unspecified), since a shared-mode stream reports
+                       the rate it was asked for whether or not the service is resampling -
+                       without it rule 6 would have nothing to report. setUsage is never called:
+                       it is __INTRODUCED_IN(28) and this targets API 26. AAUDIO_ERROR_DISCONNECTED
+                       sets device_lost and starts the host-paced thread; nothing reopens.
+                       [backends p3]
   null_sink.c          offline (no-hardware) sink: threaded silence + timestamps. [M1]
   manual_sink.c        offline/deterministic sink: no thread, the caller pumps (bwa_render_block). [M1]
   asio_sink.cpp        ASIO host: driver load, bufferSwitch, sample-pos timestamp. [M1]
@@ -171,14 +185,22 @@ src/
                        mutex + rwlock, os_event (auto-reset, sticky signal, monotonic timed wait),
                        thread priority up (os_thread_set_realtime + its RLIMIT_RTPRIO probe) and
                        down, strdup/strcasecmp, os_fopen + the UTF-8 path family, natnet's UDP
-                       sockets, BWA_EXPORT). Exactly one half compiles. Windows and Linux have
-                       device backends; macOS and Android run the null and manual sinks until
-                       phases 4 and 3 land. [backends p2]
+                       sockets, BWA_EXPORT). Exactly one half compiles. Windows, Linux and Android
+                       have device backends; macOS runs the null and manual sinks until phase 4
+                       lands. Android takes the POSIX half unchanged (bionic has pthreads,
+                       clock_nanosleep, pthread_condattr_setclock); what it refuses is SCHED_FIFO
+                       for an app thread, which is the same reported degradation WSL produces.
+                       [backends p2]
 test/                  ctest suite; targets are prefixed test_* (test_smoke, test_rt_core, test_rt_feature,
                        test_dsp, ...) so the built tools (bwa_*) and the tests sort apart in the bin dir.
                        The rt test is split: test_rt_core (concurrency/lifecycle spine) + test_rt_feature
                        (spatial-feature DSP toggles), sharing test/rt_test_util.h. xval_data.h is
                        GENERATED (tools/xval) — don't hand-edit.
+tools/android/         run-tests.ps1: ctest cannot drive an Android target, so this pushes
+                       libbw_audio.so plus the test executables to /data/local/tmp/bwa over adb and
+                       runs each one there, mapping the skip code 77 through. It reads the test list
+                       out of the build dir's CTestTestfile.cmake, so it and ctest cannot disagree
+                       about what the suite IS. [backends p3]
 tools/xval/            gen_reference.py: cross-validation golden generator (scipy SH / l1-LP VBAP /
                        qhull AllRAD / bilinear RBJ / lfilter) -> test/xval_data.h for the xval ctest.
                        Needs numpy+scipy; ctest itself does not (the header is committed).
@@ -197,16 +219,23 @@ examples/              cave_layout.json (see docs/layout-schema.md); minimal.c (
                        streaming.c (disk streaming + push sources), convenience.c (the convenience
                        tier: shared/async assets, bwa_source_desc, group + scene stops, each part
                        naming the core calls it replaces) — console walkthroughs, built every build.
-third_party/           asiosdk/ (GPLv3 option, fetched not committed), steam-audio-source/ (submodule) + steam-audio-artifacts/ (built phonon SDK); dr_wav + cJSON are
+third_party/           asiosdk/ (GPLv3 option, fetched not committed), steam-audio-source/ (submodule) + steam-audio-artifacts/ (built phonon SDK, static archives per platform); dr_wav + cJSON are
                        fetched by CMake (FetchContent, pinned) — see third_party/README.md.
 ```
 
 ## Build
 
 Target: **Windows** is production (ASIO is Windows-only; the Digiface is Windows/macOS). CMake.
-Linux is a second host: JACK and ALSA are device backends there (docs/backends.md phase 5),
-macOS and Android build on the null/manual sinks until phases 4 and 3 land. Do not bake any
-backend's assumptions outside its own `*_sink` file.
+Linux is a second host: JACK and ALSA are device backends there (docs/backends.md phase 5).
+**Android** is a third: AAudio is a device backend there (phase 3), stereo only, cross-built with
+the NDK against API 26 or later - `tools/android/run-tests.ps1` runs the suite on a device or
+emulator, and docs/build.md's "Android" section has the toolchain. CI cross-builds both ABIs in its
+own `android` job and ships them as a fifth artifact (`bw_audio-android-<ver>`); both bindings carry
+the arm64-v8a library, and the Windows job takes it from that job rather than cross-building one of
+its own. It carries phonon too now, built per ABI by the same composite action; nothing in either
+binding's packaging changed for that, because phonon is linked STATICALLY and lands inside the
+engine library (which costs 0.4 MB -> 7.0 MB stripped on arm64).
+macOS builds on the null/manual sinks until phase 4 lands. Do not bake any backend's assumptions outside its own `*_sink` file.
 
 ```
 cmake -S . -B build -A x64      # default generator = newest installed Visual Studio
@@ -219,9 +248,15 @@ suite — 45 tests with the Steam Audio SDK, 40 without (the 5 SDK-gated ones ar
 `bake`, `path`, `dynmesh`, `steam_decode`) — a count that INCLUDES the three GUI-tool suites
 (`calib_view`, `layout_tool`, `playground`), the four `validate_*` runs, and the four
 `example_*` runs (the console examples driven with `--tests`: offline sink, short waits), all
-under their build flags. On Linux or macOS at the DEFAULT options it is 33: the GUI and ASIO
-capture tools are WIN32-only targets there, which drops their suites and the `validate_*` runs
-on top of the SDK-gated five. Phase 5 added no target - the JACK and ALSA sections live inside
+under their build flags. On Linux, macOS or Android at the DEFAULT options it is 33: the GUI and
+ASIO capture tools are WIN32-only targets there, which drops their suites and the `validate_*` runs
+on top of the SDK-gated five. Android runs those 33 through `tools/android/run-tests.ps1` rather
+than ctest, because the binaries are the device's. **Linux, macOS and Android now stage phonon
+too** (CI builds it per platform into `lib/linux-x64` / `lib/osx-universal` /
+`lib/android-arm64` + `lib/android-x64`), so the count there is **38**:
+those 33 plus the SDK-gated five. Linux is verified locally, 38/38 against a static phonon built
+with gcc 14.3; Android is verified locally too, 37/38 on an x86_64 emulator (the red is `os`'s
+sleep-lateness bound, which a no-SDK library of the same commit misses identically); macOS is CI-only. Phase 5 added no target - the JACK and ALSA sections live inside
 `test_audio_sink`, and on a box with no server and no card that one test reports SKIPPED rather
 than passing. The UTF-8 path work added three (`utf8_path`, `idle`, `cave_both`), on every
 platform. `rt.c` is the concurrency
@@ -231,7 +266,9 @@ layout load, per-speaker align), calibration (`bwa_calibrate`, the Zylia capsule
 validation (`bwa_validate`), and OptiTrack tracking (`natnet.c` + the seqlock pose handoff)
 are all implemented and covered by the off-hardware test suite.
 
-Four subsystems gate on `BWA_HAVE_STEAMAUDIO` (phonon built from the vendored submodule):
+Four subsystems gate on `BWA_HAVE_STEAMAUDIO` (phonon built from the vendored submodule and
+linked STATICALLY since 2026-09-15 — four archives under
+`third_party/steam-audio-artifacts/lib/<platform>/`, nothing beside the engine at runtime):
 `steam_decode.c` (the production HRTF monitor upgrade), `steam_scene.c` (automatic occlusion +
 transmission EQ + directivity), `steam_reflect.c` (the reflection bed), and `steam_path.c`
 (sound pathing). A no-SDK build is fully viable: the simple-pan binaural monitor, ISM early
@@ -303,7 +340,9 @@ Regression-preventing gotchas. Each has bitten before or guards a real invariant
   `engine.c`, `null_sink.c`, `profile_self.c`, `steam_scene.c`, `steam_path.c`, `steam_reflect.c`,
   plus `test/os_test.c`, `test/natnet_test.c`, `test/audio_sink_test.c` and
   `test/rt_feature_test.c`. Miss one and the error is a confusing `<stdatomic.h> is not yet
-  supported`, pointing at the header rather than at the missing flag.
+  supported`, pointing at the header rather than at the missing flag. The list is deliberately
+  MSVC-only, so a platform sink MSVC never compiles stays off it however many atomics it carries:
+  `jack_sink.c`, `alsa_sink.c` and `aaudio_sink.c` all use `stdatomic.h` and none belongs there.
 - **`pose.h` is the one HEADER that carries `stdatomic.h`, so nothing else may include it
   casually.** Its seqlock moved off the Interlocked intrinsics onto C11 atomics (Boehm 2012: the
   payload fields are relaxed atomics, and fences carry the ordering), which means every translation

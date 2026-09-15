@@ -1,14 +1,15 @@
 # Device backends
 
-Status: **phases 0, 1, 2 and 5 are implemented**; phases 3 and 4 are still specification. The engine
-has six sinks today: ASIO (`src/asio_sink.cpp`), WASAPI (`src/wasapi_sink.cpp`), JACK
-(`src/jack_sink.c`), ALSA (`src/alsa_sink.c`), null (`src/null_sink.c`), and manual
-(`src/manual_sink.c`), over the two shared pieces (`src/sink_convert.h`, `src/sink_quant.c`) that
-phase 0 built. The ABI those needed is in place: the appended `bwa_sink_type` values,
+Status: **phases 0, 1, 2, 3 and 5 are implemented**; phase 4 is still specification. The engine
+has seven sinks today: ASIO (`src/asio_sink.cpp`), WASAPI (`src/wasapi_sink.cpp`), JACK
+(`src/jack_sink.c`), ALSA (`src/alsa_sink.c`), AAudio (`src/aaudio_sink.c`), null
+(`src/null_sink.c`), and manual (`src/manual_sink.c`), over the two shared pieces
+(`src/sink_convert.h`, `src/sink_quant.c`) that phase 0 built.
+The ABI those needed is in place: the appended `bwa_sink_type` values,
 `bwa_desc.device` and `sink_flags`, the backend-agnostic device query, and `bwa_health.device_lost`,
 all in the 0.14 minor bump. Phase 2 put the OS shim in (`src/os.h`, `src/os_win.c`,
 `src/os_posix.c`), so the library, the tests and the console examples build and pass with gcc and
-clang on Linux and macOS. What remains is the AAudio and CoreAudio backends.
+clang on Linux, macOS and Android. What remains is the CoreAudio backend.
 
 Read [architecture.md](./architecture.md) for the bus seam first and
 [concurrency.md](./concurrency.md) for the audio-thread rules every backend inherits.
@@ -897,15 +898,15 @@ Five things the implementation settled that the sequence above left open:
 
 ### AAudio
 
-Files: `src/aaudio_sink.c`. Link `aaudio`. `ANDROID_PLATFORM` 26 or later in the NDK toolchain.
-Define `BWA_HAVE_AAUDIO`.
+**Implemented (phase 3).** Files: `src/aaudio_sink.c`. Link `aaudio`. `ANDROID_PLATFORM` 26 or
+later in the NDK toolchain. Define `BWA_HAVE_AAUDIO`.
 
 Builder: output direction, `AAUDIO_SHARING_MODE_SHARED` (exclusive under the flag; the OS
-grants it rarely), `AAUDIO_PERFORMANCE_MODE_LOW_LATENCY`, `AAUDIO_FORMAT_PCM_FLOAT`, 2 channels,
-the engine rate (shared mode converts when it must: rule 6), `setFramesPerDataCallback(block
-size)` as the hint it is, a data callback and an error callback. After open, set the buffer
-size to two bursts (`AAudioStream_setBufferSizeInFrames(2 * getFramesPerBurst())`) and read
-the actual value back for rule 5.
+grants it rarely), `AAUDIO_PERFORMANCE_MODE_LOW_LATENCY`, `AAUDIO_FORMAT_PCM_FLOAT`, the
+requested channel count, the engine rate, `setFramesPerDataCallback(block size)` as the hint it
+is, a data callback and an error callback. After open, the buffer size is set to two bursts
+(`AAudioStream_setBufferSizeInFrames(2 * getFramesPerBurst())`) and the actual value read back
+for rule 5.
 
 The data callback calls `quant_pull` with the frame count it was given and returns
 `AAUDIO_CALLBACK_RESULT_CONTINUE`. Position and time come from `AAudioStream_getTimestamp`,
@@ -915,14 +916,60 @@ read once per callback and tolerated when it fails early. Dropouts are the OS's 
 the sink only sets `device_lost` and the callback thread ends. The sink then starts a host-paced
 thread (the null-sink loop) so the engine keeps running, per rule 4.
 
+Four decisions the specification left open, and what each one settled on:
+
+- **Stereo only, said at the open.** Android AUTO already sends a wider request straight to the
+  offline sink, so the only caller that can reach a 26-channel AAudio open is an explicit
+  `BWA_SINK_AAUDIO` with an array layout. That gets a message naming the width rather than a
+  device error, because Android carries no array transport at all.
+- **`setUsage` is never called.** `AAudioStreamBuilder_setUsage` is `__INTRODUCED_IN(28)` and the
+  library targets API 26, so an unguarded call is a weak symbol that crashes on an API 26 device.
+  The default usage is `AAUDIO_USAGE_MEDIA`, which is right for a game. A headset build that wants
+  `AAUDIO_USAGE_GAME` can raise `ANDROID_PLATFORM` and add the call behind a runtime check.
+- **`device_pos_valid` is false at every pull.** AAudio reports the fault directly through
+  `getXRunCount`, and the adapter's queued-depth rule would count the same starve a second time:
+  the callback keeps asking for a burst whether or not the render was late, so `written` lags the
+  presented position by exactly the silence the service already counted. Same reasoning as JACK's.
+- **The device's own rate is probed before the real open.** A shared-mode stream opened AT the
+  engine rate reports the engine rate whether or not the service is resampling underneath, so
+  without a probe the sink could not tell a native 48 kHz device from a converted 44.1 kHz one and
+  rule 6's degradation channel would have nothing to say. The probe is one stream opened with
+  everything unspecified and closed again, on the control thread, which is the only way to ask
+  AAudio this from C. It also lets a failed open name both rates.
+
+`output_latency()` is latched once, not recomputed: `getFramesWritten` minus the presented
+position from the first successful timestamp, extrapolated to now at the nominal rate, plus what
+the adapter holds. `sink.h` promises the value stays constant for the life of the sink, so the
+buffer-size estimate from the open stands until that first timestamp replaces it.
+
+Verified on an Android 34 `google_apis` x86_64 emulator: a 960-frame burst, a 1920-frame buffer,
+1400 to 2050 frames of reported latency depending on the run, since it is latched off whichever
+callback first gets a timestamp, a constant 256-frame render quantum through the adapter, a
+monotonic timestamp pair, `measured` true, and an injected 120 ms stall that
+`AAudioStream_getXRunCount` did report as one xrun. Breaking the xrun fold on purpose turned that
+last assertion red, per the CLAUDE.md trap, before it was trusted green. `bwa_minimal` under AUTO
+opened `aaudio:default` and its clock model measured 48000.00 Hz over a 6 second run, +0.1 ppm,
+which is the timestamp pair checked through the whole engine rather than at the sink. The
+emulator's audio HAL is virtual, so its block counts wander (54 to 96 across identical runs) and
+say nothing; what it exercises is the code path.
+
 Consumers: standalone VR headsets (Meta Quest, Pico) through a Godot Android export
 (GDExtension, arm64-v8a) or a Unity Android build. The headset supplies the pose through the
 game engine; nothing tracks over the network. Two things ride along with the sink and are
-bigger than it. The NDK cross-build of the whole library: phase 2's shim covers the code, the
-toolchain wiring is this phase. And phonon for Android: the no-SDK fallback is a lateral pan
-that build.md calls useless for timbre, and a VR game is the case where timbre is the point.
-Steam Audio ships Android arm64 builds. The DSP is scalar C with no SSE intrinsics (a grep of
-`src/` finds none), so ARM needs no porting beyond the shim.
+bigger than it.
+
+The NDK cross-build of the whole library, and the packaging on top of it: phase 2's shim covers
+the code, the toolchain wiring landed with this phase, and the packaging landed with the
+follow-up. CI cross-builds both ABIs in its own `android` job, and both bindings carry the
+`arm64-v8a` library: the Unity package at `Runtime/Plugins/Android/arm64-v8a/libbw_audio.so`, the
+Godot addon at `addons/bw_audio/bin/` beside its own `arm64` extension. See build.md, "Android".
+
+And phonon for Android, which landed after it. CI builds the Steam Audio core statically for both
+ABIs and links it in, so a headset gets the real HRTF decode, automatic occlusion, pathing and the
+reflection bed rather than the fallback pan. The DSP is scalar C with no SSE intrinsics (a grep of
+`src/` finds none), so ARM needed no porting beyond the shim. The packaging needed no change at
+all: phonon links statically, so it lands inside `libbw_audio.so` and neither package gains a file.
+It costs size. The stripped arm64 library goes from 0.4 MB to 7.0 MB.
 
 ## CMake
 
@@ -947,14 +994,35 @@ bwa_core's OBJECTS and so does not inherit its link interface.
 Two auto-detects gained a platform guard, both for the same reason: a dev checkout has the SDKs
 staged, so without the guard a Linux configure of that same tree "finds" a Windows artifact and
 fails at compile or link. `BWA_WITH_ASIO` now requires `WIN32` as well as the SDK, and Steam Audio
-requires the platform's import library (`lib/windows-x64/phonon.lib`) and not just `phonon.h`. The
+requires the archive set under the platform's own `lib/<platform>/` and not just `phonon.h`. The
 three GUI tools and the ASIO capture tools are WIN32-only targets, skipped with a status message
 elsewhere. The `/experimental:c11atomics` per-file flags are still under `if(MSVC)`; the list grew
 with the files that became atomic (see build.md).
 
-Steam Audio builds for macOS, Linux, and Android, but the recipe in `third_party/README.md` is
-the Windows one. A no-SDK build is fully viable (build.md, "Building without Steam Audio"), so
-the port does not wait on phonon. Phonon on the other platforms is its own follow-up.
+Steam Audio now builds in CI for **Windows**, **Linux** and **macOS** as well, each job staging its
+own `lib/<platform>/` under its own cache key (a cache is scoped to the repository, not to the
+runner OS, so one shared key would have served the wrong archives). The follow-up turned out to be
+as small as predicted, because phonon links statically and nothing downstream changes, but it cost
+three fixes worth naming:
+
+- **`-t` is a Windows-only argument** in both pinned build scripts, so the composite action's
+  `make` default was an argparse error rather than a no-op. It passes `-t` on the Windows branch
+  only now.
+- **`enable_language(CXX)`** had to move into the phonon block. `project()` declares `LANGUAGES C`,
+  and the other `enable_language(CXX)` calls all sit under Windows-only features, so a Linux
+  configure set `LINKER_LANGUAGE CXX` on a project that had no CXX link rule. CMake does not error
+  on that: it emits an EMPTY link rule, and the build reports "Linking CXX shared library
+  libbw_audio.so", exits 0, and writes no library. Every test still passed, because the tests link
+  `bwa_core`'s objects rather than the library.
+- **`-Wl,--exclude-libs,ALL`** on the library. phonon's `IPLAPI` expands to
+  `__attribute__((visibility("default")))` in its own objects, so a static link re-exported every
+  `ipl*` entry point out of `libbw_audio.so` in spite of `-fvisibility=hidden`. That is not
+  cosmetic: a host that also loads a real `libphonon.so` (a Unity project with Valve's own plugin,
+  say) would have two definitions to choose between.
+
+A no-SDK build stays fully viable (build.md, "Building without Steam Audio"), so nothing here is
+required. What it buys is the real HRTF decode, automatic occlusion, pathing and the reflection bed
+on the two platforms that had none.
 
 ## Tests
 
@@ -988,10 +1056,11 @@ what needs a device, and make the device-dependent part **skip visibly** rather 
   ctest skip code and the target carries `SKIP_RETURN_CODE 77`, so the dashboard says
   "skipped" and not "passed". The null and manual sections keep running everywhere.
 
-  The WASAPI section shipped with phase 1 and the JACK and ALSA sections with phase 5. Only the
-  *specific* "there is no device" message skips ("no active render endpoint", "no jack server",
-  "no PCM named"); any other open failure is a failure, because a machine WITH audio that cannot
-  open it is exactly what the section exists to catch. The JACK section additionally skips on two
+  The WASAPI section shipped with phase 1, the JACK and ALSA sections with phase 5, and the AAudio
+  section with phase 3. Only the *specific* "there is no device" message skips ("no active render
+  endpoint", "no jack server", "no PCM named", "no usable AAudio output device"); any other open
+  failure is a failure, because a machine WITH audio that cannot open it is exactly what the
+  section exists to catch. The JACK section additionally skips on two
   CONFIGURATIONS it cannot run against, a server at another rate and a server with fewer playback
   ports than the run asked for, and prints the reason either way.
 
@@ -1000,8 +1069,9 @@ what needs a device, and make the device-dependent part **skip visibly** rather 
   the first skip would hide a backend that ran beside one that could not.
 
   Each section takes its device string from the environment (`BWA_TEST_ALSA_DEVICE`,
-  `BWA_TEST_JACK_PORTS`, plus `BWA_TEST_JACK_CHANNELS` for the width), so one binary reaches a
-  26-port rig, a dummy server, or a PulseAudio route without editing code. Do not point the ALSA
+  `BWA_TEST_AAUDIO_DEVICE`, `BWA_TEST_JACK_PORTS`, plus `BWA_TEST_JACK_CHANNELS` for the width), so
+  one binary reaches a 26-port rig, a dummy server, a PulseAudio route, or a headset's Bluetooth
+  output without editing code. Do not point the ALSA
   one at the hardware-free `null` PCM: it accepts writes as fast as they arrive and never paces, so
   the device cannot run dry and the underrun assertion fails by construction. It rendered 257,811
   blocks in the 470 ms a paced device spends on 76. Use it for the open sequence and the format
@@ -1021,14 +1091,29 @@ what needs a device, and make the device-dependent part **skip visibly** rather 
   a factor of two, and the frame estimate is a measurement. JACK can demand only the late block,
   which the adapter times itself; whether the SERVER calls a late client an xrun is the server's
   judgment, and a dummy or timer-driven backend need not. When no xrun arrives the section prints
-  that the xrun path went unexercised rather than passing quietly.
+  that the xrun path went unexercised rather than passing quietly. AAudio demands the late block
+  and the xrun COUNT rising, because `getXRunCount` was confirmed to move on an emulator, but never
+  `dropped_frames`: AAudio says how many times the stream ran dry and never for how long, so that
+  field is asserted to stay 0 rather than filled with a guess. What the AAudio section does NOT
+  demand is a clean healthy run, because nothing there says whether one was on offer - the callback
+  thread belongs to AAudio, and a virtualized HAL or a busy headset can run dry through no fault of
+  the sink. It prints the count instead.
+
+  The AAudio section runs through `tools/android/run-tests.ps1`, not through ctest: the test
+  binaries are ELF executables for the device and the host has nothing to run them with. The script
+  reads the test list out of the build directory's `CTestTestfile.cmake` (so it and ctest cannot
+  disagree about what the suite is), pushes `libbw_audio.so` and the executables to
+  `/data/local/tmp/bwa`, runs each under `adb` with `LD_LIBRARY_PATH` set, and maps the skip code 77
+  through. All 33 tests of a default no-SDK, no-tool build run there. Thirty-two pass every run;
+  `test_os` is flaky on an emulator, on its two tightest timing bounds alone. See the verify list.
 - **The whole suite under `BWA_SINK_NULL` on `ubuntu-latest` and `macos-latest`** (phase 2,
-  shipped). This is the port's regression gate: 30 tests at the default options, none of which
-  touch a device. The two jobs sit in `ci.yml` beside the Windows one. They are cheap (no phonon
-  build) and they catch a Win32 call sneaking back in. Note what the count means: off Windows the
-  GUI tools and the ASIO capture tools are skipped targets, so their suites and the four
-  `validate_*` runs are absent, on top of the five SDK-gated tests. The macOS job is unverified
-  locally.
+  shipped). This is the port's regression gate: **38 tests**, none of which touch a device. The two
+  jobs sit in `ci.yml` beside the Windows one and they catch a Win32 call sneaking back in. Note
+  what the count means: off Windows the GUI tools and the ASIO capture tools are skipped targets,
+  so their suites and the four `validate_*` runs are absent, which is what takes the Windows 45
+  down to 33; both jobs now build phonon, which adds the five SDK-gated tests back. A cold run pays
+  for that phonon build, a warm one restores it from the cache. The macOS job is unverified
+  locally, both its shim paths and its phonon build.
 - **On hardware**, a "desk day" section for hardware-validation.md, one pass per backend on a
   real machine: the laterality tone left and right (never DC, per the trap); a ten-minute soak
   with a busy scene at a 256 block and zero `xruns` with `measured` true; and the reported
@@ -1043,7 +1128,7 @@ what needs a device, and make the device-dependent part **skip visibly** rather 
 | 0 **(done)** | `sink_convert.h`, `sink_quant`, their tests; the ASIO sink onto `sink_convert` | nothing                        | none                        | ~400 lines                   |
 | 1 **(done)** | WASAPI sink; the ABI bump (enum, desc union and flags, device query, `device_lost`); `sink.c` AUTO order; both bindings mirror; docs | phase 0 | a Windows desk machine; the rig for the `cave_both` check | ~600 lines of sink, ~200 of ABI and bindings |
 | 2 **(done)** | `os.h` shim; the library, tests, and examples build with clang and gcc; Linux and macOS CI jobs on the null sink | nothing (independent of phase 1) | none | ~300 lines of shim, a pass over ~40 files |
-| 3     | AAudio sink; NDK toolchain wiring; phonon for Android; the bindings' Android packaging | phases 0 and 2         | a standalone headset        | ~300 lines plus the toolchain and packaging |
+| 3 **(done, except phonon)** | AAudio sink; NDK toolchain wiring; `tools/android/run-tests.ps1`; the CI cross-build of both ABIs and both bindings' Android packaging. Phonon for Android is NOT done and is its own follow-up | phases 0 and 2 | a standalone headset (an emulator covered the code paths) | ~400 lines of sink and test, plus the toolchain and the packaging |
 | 4     | CoreAudio sink                                                         | phases 0 and 2                          | a Mac; the Digiface only for the optional 26-channel check | ~450 lines |
 | 5 **(done)** | JACK sink, then ALSA sink                                        | phase 2                                 | a Linux box with a card, and one with PipeWire; the AES67 daemon and an AES67-mode Dante receiver for the array check | ~250 lines JACK, ~400 lines ALSA |
 
@@ -1051,8 +1136,9 @@ Phase 1 goes first because it fixes a live defect, removes a dependency for ever
 and is the PC VR path. Phase 2 is independent of it and can run in parallel; it is mechanical
 and touches many files, so it wants its own review. Phases 3 to 5 depend only on phase 2 and
 not on each other, so their order was a scheduling choice. Phase 5 went first of the three,
-because a Linux box with both a JACK server and an ALSA card was the hardware at hand. CoreAudio
-is the cheapest of the two that remain and can slot in whenever a Mac is available.
+because a Linux box with both a JACK server and an ALSA card was the hardware at hand, and phase 3
+second, because an Android emulator is a download rather than hardware. CoreAudio is the one that
+remains and can slot in whenever a Mac is available.
 
 ## What to update when implementing
 
@@ -1141,7 +1227,68 @@ Known, deliberately not done yet. Each names its trigger.
 - [ ] Standalone headsets: the AAudio native rate and burst size on the Quest and Pico
       generations in play (48 kHz and a 256-frame burst are typical; the block size should be
       a multiple of the burst), and that the Steam Audio Android build runs the mode-2
-      per-voice HRTF fleet within the headset's CPU budget.
+      per-voice HRTF fleet within the headset's CPU budget. The emulator answered 48 kHz with a
+      960-frame burst, which is a virtual HAL's number and not a headset's.
+- [ ] The AAudio MMAP path. `BWA_SINK_FLAG_EXCLUSIVE` is written and compiled but the emulator
+      grants only the legacy shared path, so `AAUDIO_SHARING_MODE_EXCLUSIVE` and the lower burst
+      it brings have never run. `AAUDIO_PERFORMANCE_MODE_LOW_LATENCY` is likewise requested and
+      granted nominally on an image that has no low-latency path to give.
+- [ ] `AAUDIO_ERROR_DISCONNECTED` on a REAL route change: unplug a headset or take a Bluetooth
+      device mid-run. `device_lost` must set, the host-paced thread must keep the dsp clock
+      advancing, and `bwa_stop` then `bwa_destroy` must both return. The error callback and its
+      host-thread handshake are the JACK shutdown path's twin, which WAS verified by killing a
+      server; the AAudio half is written and compiled and has never fired.
+- [x] Static phonon for Linux. Built with the composite action's own steps under WSL (NixOS, gcc
+      14.3.0), staged at `lib/linux-x64/`, and the whole suite run against it: **38 of 38**, the
+      five SDK-gated tests included. `readelf -d libbw_audio.so` names no phonon, and
+      `bwa_get_audio_backend` reports the `steam HRTF` suffix. What a static phonon adds to the
+      link is `libstdc++.so.6`, which a no-SDK build does not carry.
+- [ ] Static phonon for macOS, which runs ONLY in CI. Nobody here has a Mac, so the job's
+      `stage-dir: osx-universal` was read off `core/CMakeLists.txt` (which pins
+      `CMAKE_OSX_ARCHITECTURES "x86_64;arm64"` for every macOS build) rather than measured, and
+      the Xcode generator's tree layout has never been staged from. The configure assertion
+      (`Steam Audio ENABLED`) is what keeps a wrong guess loud instead of silently no-SDK.
+- [x] Static phonon for Android, on the emulator. Both ABIs built on a Windows host with the
+      composite action's own steps and staged at `lib/android-arm64/` and `lib/android-x64/`, and
+      the whole suite run on an x86_64 emulator (API 34): **37 of 38 every run**, the five SDK-gated
+      tests included, with and without the emulator's audio device. The one red is `os`, and it is
+      the emulator rather than this work: what fails is `os_sleep_until_ns` median lateness, which
+      measures about 1.1 ms against a 1 ms bound on an image that refuses a real-time priority, and
+      a no-SDK library of the same commit fails it the same way on the same emulator. Under host
+      load `audio_sink` joins it on a block-rate floor. `bwa_minimal` on the device reports
+      `backend: aaudio:default (steam HRTF direct)`. `readelf -d` names no phonon and no
+      `libc++_shared.so`: the NDK's CMake toolchain links libc++ statically, and the C ABI means
+      nothing C++ crosses the library boundary. What it costs is size, 0.4 MB stripped to 7.0 MB
+      on arm64. Two android-only upstream patches are in `third_party/patches/`. Nothing in either
+      binding's packaging changes: a static phonon ships inside the engine library.
+- [ ] The CPU budget for that decode ON a headset. The emulator says it is correct, not that it
+      fits: a Quest core is far slower than a desktop one, and the per-voice HRTF convolutions are
+      the part that scales with the scene. Measure with the headless bench (docs/profiling.md)
+      before committing a game to it.
+- [x] The Android packaging for both bindings. The library cross-builds in CI for both ABIs, and
+      both packages now carry the `arm64-v8a` library with its import settings: the Unity package at
+      `Runtime/Plugins/Android/arm64-v8a/libbw_audio.so` (a committed `PluginImporter` meta, Android
+      with CPU ARM64 and nothing else), the Godot addon at `addons/bw_audio/bin/` with the
+      `android.template_release.arm64` entries in its manifest. Both pack scripts refuse to pack
+      without them.
+- [ ] An exported build from either binding, ON a headset: a Godot Android export and a Unity
+      Android player. The packaging is verified only as far as the archives go (the files are in
+      them, at the paths the manifests name, with the import settings Unity needs). Nobody has yet
+      exported an APK, installed it, and heard the AAudio sink open under a game engine rather than
+      under `tools/android/run-tests.ps1`. That run is also what would catch a Godot exporter that
+      does not copy a listed Android dependency into the APK's `lib/` directory.
+- [ ] `test_os` on a physical Android device. It is FLAKY on an emulator and only on its two
+      tightest timing bounds: ten back-to-back runs on an idle image passed six times, with the
+      `os_sleep_until_ns` median lateness straddling its 1.00 ms bound at p50 0.89 to 1.11 ms
+      (p99 2.31 to 2.72 ms, max 2.43 to 3.11 ms), and one run also tripping "a past deadline
+      returns at once", which allows 1 ms between two clock reads around a call that does not wait.
+      Every other assertion passed every time. The `SCHED_FIFO` request is refused, as Android
+      refuses it for every app thread. The primitive is the right one
+      (`clock_nanosleep(TIMER_ABSTIME)`), so this reads as the virtual machine's scheduler rather
+      than the shim, but nothing has measured a real device. The bound was deliberately NOT widened
+      to fit one emulator - the same call the Apple row above makes, and for the same reason. A
+      headset that also flaps is the finding; a headset that sits well under is the reason to
+      leave it.
 - [ ] Which binding the experiments need first: the nanobind module for PsychoPy, or the MEX
       for Psychtoolbox and Octave. Neither is in this spec.
 - [ ] The ASIO reset-request plumbing, when it is written, uses the `device_lost` design above

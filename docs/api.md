@@ -637,9 +637,10 @@ ray tracer: faster, and the lever to pull if you raise scene complexity, ray cou
 high probe density. It is **opt-in and safe**: if the linked `phonon` was not built with Embree
 (or the Embree/TBB runtime is missing), the engine logs that Embree is unavailable and falls back
 to the default tracer (no failure). The engine creates the scene once and both sims share it, so the flag
-applies to occlusion and reflections together. The vendored prebuilt `phonon.dll` is **not**
-Embree-enabled, so the flag currently falls back; to activate it, drop in a `phonon` built with
-Embree (the SDK's `STEAMAUDIO_ENABLE_EMBREE` path) and ship `embree4.dll` + `tbb*.dll` alongside.
+applies to occlusion and reflections together. The `phonon` this repo builds and links is **not**
+Embree-enabled (the recipe passes `--minimal`), so the flag currently falls back; to activate it,
+build `phonon` with the SDK's `STEAMAUDIO_ENABLE_EMBREE` path and ship `embree4.dll` + `tbb*.dll`
+alongside.
 
 ## Sink policy
 
@@ -673,10 +674,17 @@ is why it could not before. The monitor asks for `BWA_SINK_AUTO` with no device 
 above, and the monitor would fall to silence. `bwa_get_audio_backend` names both devices under
 this profile, array first.
 
-Naming a backend is a **demand**. `BWA_SINK_ASIO`, `BWA_SINK_WASAPI`, `BWA_SINK_JACK` and
-`BWA_SINK_ALSA` fail `bwa_start` loudly when the device does not open, instead of falling back to
-silence. A backend this build does not carry (`BWA_SINK_COREAUDIO` and `BWA_SINK_AAUDIO` anywhere,
-the Linux pair on Windows, the Windows pair on Linux) fails with a message that says so.
+Naming a backend is a **demand**. `BWA_SINK_ASIO`, `BWA_SINK_WASAPI`, `BWA_SINK_JACK`,
+`BWA_SINK_ALSA` and `BWA_SINK_AAUDIO` fail `bwa_start` loudly when the device does not open,
+instead of falling back to silence. A backend this build does not carry (`BWA_SINK_COREAUDIO`
+anywhere, the Linux pair off Linux, the Windows pair off Windows, `BWA_SINK_AAUDIO` off Android)
+fails with a message that says so.
+
+`BWA_SINK_AAUDIO` is stereo only. Android carries no array transport, so a request wider than two
+channels fails the open with a message naming the width, and AUTO on Android sends one straight to
+the silent offline sink. Its `bwa_desc.device` is a decimal Android device id from Java's
+`AudioManager`, not a name: AAudio exposes no device list to native code, so the device query
+reports one entry, `default`, with id `0`.
 
 `BWA_SINK_JACK` reads `bwa_desc.device` differently from every other backend, because JACK has
 ports rather than devices: there it is a `jack_get_ports` regular expression, such as

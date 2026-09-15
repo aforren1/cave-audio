@@ -1,0 +1,158 @@
+# phonon: derive the NDK host tag instead of hard-coding the Windows one
+#
+# Steam Audio 4.8.1 (ValveSoftware/steam-audio). Apply to the third_party/steam-audio-source
+# submodule before building phonon for ANDROID (see ../README.md "Steam Audio" build recipe).
+# Only Android reads any of this, so no other platform applies it.
+#
+# THE BUG
+# An NDK holds one copy of its tools per HOST, under toolchains/llvm/prebuilt/<host tag>/ and
+# prebuilt/<host tag>/. The tag names the machine doing the building - windows-x86_64,
+# linux-x86_64, darwin-x86_64 - and says nothing about the Android target. The pinned scripts spell
+# it "windows-x86_64" in six places, so a phonon built for Android on any other host reaches for
+# paths that do not exist:
+#   core/CMakeLists.txt        the libc++ include directory that keeps <cmath> from picking up the
+#                              wrong math.h. A missing directory is not an error, so this one fails
+#                              LATER and somewhere else.
+#   core/build/build.py        CMAKE_MAKE_PROGRAM for the phonon tree.
+#   get_dependencies.py        the same, four times, one per Android target.
+#   get_dependencies.py        one PATH append, which also has "windows-x6_64" for a typo and so
+#                              has never pointed anywhere on any host.
+#
+# THE FIX
+# CMake's own Android support already resolves the tag into CMAKE_ANDROID_NDK_TOOLCHAIN_HOST_TAG,
+# which is what the two toolchain files here get (they set CMAKE_SYSTEM_NAME plus CMAKE_ANDROID_NDK
+# rather than sourcing the NDK's android.toolchain.cmake, so there is no ANDROID_TOOLCHAIN_ROOT to
+# read). Use that variable, and fall back to CMAKE_HOST_SYSTEM_NAME if some future CMake leaves it
+# empty. The two scripts get one helper each, keyed on sys.platform, which also picks make.exe
+# against make.
+#
+# VERIFIED on a Windows host, where the derived tag is the literal this replaces: both ABIs build
+# byte-comparable archives with the patch applied. The Linux-host path is what the patch is FOR and
+# is exercised by CI, not locally.
+diff --git a/core/CMakeLists.txt b/core/CMakeLists.txt
+index 9553e7f..de6fef0 100644
+--- a/core/CMakeLists.txt
++++ b/core/CMakeLists.txt
+@@ -183,7 +183,22 @@ if (IPL_OS_ANDROID)
+     # when including the cmath header from the standard library. This is because
+     # it picks up the wrong math.h. This line forces the compiler to look in
+     # the correct place first.
+-    include_directories(SYSTEM ${CMAKE_ANDROID_NDK}/toolchains/llvm/prebuilt/windows-x86_64/sysroot/usr/include/c++/v1)
++    #
++    # The prebuilt toolchain sits under a HOST tag, which says nothing about the Android target.
++    # That tag was hard-coded to the Windows one, so on a Linux or macOS host the path does not
++    # exist, the include does nothing, and the cmath failure it exists to prevent comes back.
++    # CMake's own Android support already worked the tag out; only derive one if it did not.
++    set(IPL_NDK_HOST_TAG "${CMAKE_ANDROID_NDK_TOOLCHAIN_HOST_TAG}")
++    if (NOT IPL_NDK_HOST_TAG)
++        if (CMAKE_HOST_SYSTEM_NAME STREQUAL "Windows")
++            set(IPL_NDK_HOST_TAG windows-x86_64)
++        elseif (CMAKE_HOST_SYSTEM_NAME STREQUAL "Darwin")
++            set(IPL_NDK_HOST_TAG darwin-x86_64)
++        else()
++            set(IPL_NDK_HOST_TAG linux-x86_64)
++        endif()
++    endif()
++    include_directories(SYSTEM ${CMAKE_ANDROID_NDK}/toolchains/llvm/prebuilt/${IPL_NDK_HOST_TAG}/sysroot/usr/include/c++/v1)
+ 
+     add_link_options(-static-libstdc++)
+ 
+diff --git a/core/build/build.py b/core/build/build.py
+index 88c2955..c64dd15 100644
+--- a/core/build/build.py
++++ b/core/build/build.py
+@@ -97,6 +97,19 @@ def run_cmake(program_name, args):
+ 
+     subprocess.check_call([program_name] + args, env=env)
+ 
++# The NDK's prebuilt binaries live under a HOST tag - windows-x86_64, linux-x86_64 or
++# darwin-x86_64 - which says nothing about the Android target being built.
++def ndk_host_tag():
++    if sys.platform == 'win32':
++        return 'windows-x86_64'
++    if sys.platform == 'darwin':
++        return 'darwin-x86_64'
++    return 'linux-x86_64'
++
++def ndk_make_program(ndk_path):
++    name = 'make.exe' if sys.platform == 'win32' else 'make'
++    return ndk_path + '/prebuilt/' + ndk_host_tag() + '/bin/' + name
++
+ # Runs the "generate" step.
+ def cmake_generate(args):
+     cmake_args = ['-G', generator_name(args)]
+@@ -136,7 +149,7 @@ def cmake_generate(args):
+         # For Android, point to the NDK installation using the ANDROID_NDK environment variable.
+         if os.environ.get('ANDROID_NDK') is not None:
+             cmake_args += ['-DCMAKE_ANDROID_NDK=' + os.environ.get('ANDROID_NDK')]
+-            cmake_args += ['-DCMAKE_MAKE_PROGRAM=' + os.environ.get('ANDROID_NDK') + '/prebuilt/windows-x86_64/bin/make.exe']
++            cmake_args += ['-DCMAKE_MAKE_PROGRAM=' + ndk_make_program(os.environ.get('ANDROID_NDK'))]
+ 
+     elif args.platform == 'ios':
+         cmake_args += ['-DCMAKE_TOOLCHAIN_FILE=' + root_dir() + '/build/toolchain_ios.cmake']
+diff --git a/core/build/get_dependencies.py b/core/build/get_dependencies.py
+index a52f2bf..71f04a1 100644
+--- a/core/build/get_dependencies.py
++++ b/core/build/get_dependencies.py
+@@ -478,6 +478,19 @@ def fetch_dependency(name, dep, platform):
+ def toolchain(suffix):
+     return os.path.join(os.getcwd(), 'build', 'toolchain_' + suffix + '.cmake')
+ 
++# The NDK's prebuilt binaries live under a HOST tag - windows-x86_64, linux-x86_64 or
++# darwin-x86_64 - which says nothing about the Android target being built.
++def ndk_host_tag():
++    if sys.platform == 'win32':
++        return 'windows-x86_64'
++    if sys.platform == 'darwin':
++        return 'darwin-x86_64'
++    return 'linux-x86_64'
++
++def ndk_make_program(ndk_path):
++    name = 'make.exe' if sys.platform == 'win32' else 'make'
++    return os.path.join(ndk_path, 'prebuilt', ndk_host_tag(), 'bin', name)
++
+ def configure_cmake(name, cmake_layers, platform, cmake, vs_version, ndk_path, emsdk_path, debug, shared_crt):
+     src_dir = os.path.join(os.getcwd(), 'deps-build', name, 'src', name)
+     build_dir = os.path.join(os.getcwd(), 'deps-build', name, 'build', platform)
+@@ -526,28 +539,28 @@ def configure_cmake(name, cmake_layers, platform, cmake, vs_version, ndk_path, e
+         cmake_args += ['-G', 'Unix Makefiles']
+         cmake_args += ['-DCMAKE_TOOLCHAIN_FILE=' + toolchain('android_armv7')]
+         cmake_args += ['-DCMAKE_ANDROID_NDK=' + ndk_path]
+-        cmake_args += ['-DCMAKE_MAKE_PROGRAM=' + os.path.join(ndk_path, 'prebuilt', 'windows-x86_64', 'bin', 'make.exe')]
++        cmake_args += ['-DCMAKE_MAKE_PROGRAM=' + ndk_make_program(ndk_path)]
+         cmake_args += ['-DCMAKE_BUILD_TYPE=' + ('Debug' if debug else 'Release')]
+         cmake_args += ['-DCMAKE_POSITION_INDEPENDENT_CODE=TRUE']
+     elif platform == 'android-armv8':
+         cmake_args += ['-G', 'Unix Makefiles']
+         cmake_args += ['-DCMAKE_TOOLCHAIN_FILE=' + toolchain('android_armv8')]
+         cmake_args += ['-DCMAKE_ANDROID_NDK=' + ndk_path]
+-        cmake_args += ['-DCMAKE_MAKE_PROGRAM=' + os.path.join(ndk_path, 'prebuilt', 'windows-x86_64', 'bin', 'make.exe')]
++        cmake_args += ['-DCMAKE_MAKE_PROGRAM=' + ndk_make_program(ndk_path)]
+         cmake_args += ['-DCMAKE_BUILD_TYPE=' + ('Debug' if debug else 'Release')]
+         cmake_args += ['-DCMAKE_POSITION_INDEPENDENT_CODE=TRUE']
+     elif platform == 'android-x86':
+         cmake_args += ['-G', 'Unix Makefiles']
+         cmake_args += ['-DCMAKE_TOOLCHAIN_FILE=' + toolchain('android_x86')]
+         cmake_args += ['-DCMAKE_ANDROID_NDK=' + ndk_path]
+-        cmake_args += ['-DCMAKE_MAKE_PROGRAM=' + os.path.join(ndk_path, 'prebuilt', 'windows-x86_64', 'bin', 'make.exe')]
++        cmake_args += ['-DCMAKE_MAKE_PROGRAM=' + ndk_make_program(ndk_path)]
+         cmake_args += ['-DCMAKE_BUILD_TYPE=' + ('Debug' if debug else 'Release')]
+         cmake_args += ['-DCMAKE_POSITION_INDEPENDENT_CODE=TRUE']
+     elif platform == 'android-x64':
+         cmake_args += ['-G', 'Unix Makefiles']
+         cmake_args += ['-DCMAKE_TOOLCHAIN_FILE=' + toolchain('android_x64')]
+         cmake_args += ['-DCMAKE_ANDROID_NDK=' + ndk_path]
+-        cmake_args += ['-DCMAKE_MAKE_PROGRAM=' + os.path.join(ndk_path, 'prebuilt', 'windows-x86_64', 'bin', 'make.exe')]
++        cmake_args += ['-DCMAKE_MAKE_PROGRAM=' + ndk_make_program(ndk_path)]
+         cmake_args += ['-DCMAKE_FIND_LIBRARY_CUSTOM_LIB_SUFFIX=64']
+         cmake_args += ['-DCMAKE_BUILD_TYPE=' + ('Debug' if debug else 'Release')]
+         cmake_args += ['-DCMAKE_POSITION_INDEPENDENT_CODE=TRUE']
+@@ -836,7 +849,7 @@ if args.clean is not None:
+ 
+ if target_platform.startswith('android-'):
+     os.environ['ANDROID_NDK'] = args.ndk
+-    os.environ['PATH'] += os.pathsep + os.path.join(args.ndk, 'prebuilt', 'windows-x6_64', 'bin')
++    os.environ['PATH'] += os.pathsep + os.path.join(args.ndk, 'prebuilt', ndk_host_tag(), 'bin')
+ elif target_platform == 'ios':
+     os.environ['SDKROOT'] = ''
+ 

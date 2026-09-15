@@ -1,7 +1,7 @@
 // Bwa.cs — P/Invoke binding for the bw_audio C ABI (include/bw_audio.h).
 //
 // Pure marshalling layer, no Unity dependency (so it compiles + can be unit-tested standalone; the
-// MonoBehaviour wrappers live in Engine.cs / Emitter.cs). Drop bw_audio.dll + phonon.dll in
+// MonoBehaviour wrappers live in Engine.cs / Emitter.cs). Drop bw_audio.dll in
 // Assets/Plugins/. THREADING: every call must come from ONE thread (Unity's main thread); the
 // per-frame calls are non-blocking. See docs/api.md + docs/concurrency.md.
 //

@@ -6,11 +6,12 @@
 #     repo's documented one-liner) and cached; it is dual-licensed GPLv3/proprietary
 #     and this project uses the GPLv3 option, consistent with the repo LICENSE — so
 #     the artifact is redistributable under GPLv3 (source = this repo at the commit).
-#   - Steam Audio: BUILT (the patched phonon core, recipe = third_party/README.md),
-#     cached on the submodule sha + patch hash — the first run pays the phonon
-#     build, later runs restore it. The with-SDK tests (reflect/bake/path/
-#     steam_decode) run, binaural is the real HRTF decode, and the artifact ships
-#     phonon.dll next to bw_audio.dll (the dll does not load without it).
+#   - Steam Audio: BUILT STATICALLY (the patched phonon core, recipe =
+#     third_party/README.md, driven by .github/actions/build-phonon), cached on the
+#     submodule sha + patch hash — the first run pays the phonon build, later runs
+#     restore it. The with-SDK tests (reflect/bake/path/steam_decode) run, binaural is
+#     the real HRTF decode, and phonon lives INSIDE bw_audio.dll: there is no second
+#     file to ship or to keep beside it. On a tag its corresponding source ships too.
 #   - Tools (playground/layout_tool/calib_view + calibrate/zylia_probe): BUILT and
 #     shipped in the artifact. Their imgui-test-engine UI suites need a display +
 #     OpenGL, which runners don't have — ctest excludes those three suites here
@@ -20,6 +21,11 @@
 #     are ordinary CI. Its own build trees (GODOTCPP_TARGET is build-wide, and a
 #     shippable addon needs both editor and template_release), cached on the pinned
 #     godot-cpp commit. Ships as a fourth release asset.
+#   - Android: CROSS-BUILT in its own job (arm64-v8a and x86_64, android-26), with a static
+#     phonon per ABI so an APK gets the HRTF decode, occlusion, pathing and the reflection bed
+#     inside libbw_audio.so, and shipped as a fifth artifact. It also builds the Godot GDExtension for arm64-v8a and
+#     hands both libraries to the Windows job, which is the only place that packs the
+#     bindings. No emulator: see the android job's own note.
 #   - Configs: x64 only. RelWithDebInfo is the full build (tested + tools);
 #     Debug builds the engine + bwa_minimal for downstream debugging (smoke-run).
 #
@@ -52,6 +58,12 @@ env:
 jobs:
   windows:
     runs-on: windows-latest
+    # The Android libraries are packed INTO both bindings, and only a Windows machine can pack them
+    # (the two flavours of the Godot extension and the engine DLL are MSVC builds). So this job waits
+    # for the cross-build rather than reproducing it: an NDK build inside this job would add the
+    # godot-cpp android compile to the longest job in the matrix, for a library ubuntu already has.
+    # The cost is the android job's wall time, which is minutes against this job's phonon build.
+    needs: android
     timeout-minutes: 75   # the uncached phonon build is the long pole; cached runs are far under
     steps:
       - uses: actions/checkout@v6
@@ -89,58 +101,16 @@ jobs:
           path: third_party/steam-audio-artifacts
           key: phonon-v1-${{ steps.phonon-key.outputs.sha }}-${{ hashFiles('third_party/patches/**') }}
 
+      # The recipe is a composite action so the Linux, macOS and Android phonon builds can call it
+      # instead of copying it (docs/backends.md). Its inputs are documented in the action itself.
       - name: Build phonon (cache miss only; recipe = third_party/README.md)
         if: steps.phonon.outputs.cache-hit != 'true'
-        shell: bash
-        env:
-          # The pinned deps (flatbuffers 1.12, zlib, pffft, mysofa) declare pre-3.5
-          # cmake_minimum_required, which CMake 4 refuses outright. This env var
-          # (honored by CMake >= 3.31.7 / 4.0) is the official escape hatch.
-          CMAKE_POLICY_VERSION_MINIMUM: "3.5"
-        run: |
-          git submodule update --init --depth 1 third_party/steam-audio-source \
-            || git submodule update --init third_party/steam-audio-source
-          # REQUIRED for directional reflections (upstream steam-audio#546):
-          git -C third_party/steam-audio-source apply ../patches/phonon-multiplyaccumulate-align.patch
-
-          # The pinned build scripts hard-code "Visual Studio 17 2022"; rewrite that to
-          # CMake's default generator (= the VS this runner actually has, and the same
-          # generator our own Configure step will use).
-          GEN="$(cmake --help | sed -n 's/^\* \(Visual Studio [0-9]* [0-9]*\).*/\1/p' | head -1)"
-          test -n "$GEN"
-          echo "using generator: $GEN"
-          sed -i "s/Visual Studio 17 2022/$GEN/g" \
-              third_party/steam-audio-source/core/build/build.py \
-              third_party/steam-audio-source/core/build/get_dependencies.py
-
-          # Everything /MD (the CRT gotcha in third_party/README.md); --minimal drops
-          # Embree/IPP/GPU/sample apps; skip phonon_test (CRT-fragile exe).
-          cd third_party/steam-audio-source/core/build
-          python get_dependencies.py --dependency flatbuffers -p windows -a x64 -t vs2022
-          for d in zlib pffft mysofa; do
-            python get_dependencies.py --dependency $d --sharedcrt -p windows -a x64 -t vs2022
-          done
-          python build.py -p windows -a x64 -t vs2022 -c release --minimal -o generate
-
-          # build.py makes its tree in the CWD (os.makedirs("windows-vs2022-x64")), so from
-          # core/build that is ./windows-vs2022-x64. Don't guess — locate the CMakeCache.
-          TREE=$(dirname "$(find . -maxdepth 3 -name CMakeCache.txt | head -1)")
-          test -n "$TREE" && test -d "$TREE" || { echo "generated tree not found:"; ls; exit 1; }
-          echo "phonon build tree: $TREE"
-          cmake -DSTEAMAUDIO_STATIC_RUNTIME=OFF "$TREE"
-          cmake --build "$TREE" --config Release --target phonon
-          cd ../../../..
-
-          # Stage where BWA_WITH_STEAMAUDIO auto-detects it. find: the build-tree
-          # layout is phonon's business; only the staged layout is ours.
-          ART=third_party/steam-audio-artifacts
-          mkdir -p "$ART/include" "$ART/lib/windows-x64"
-          CORE=third_party/steam-audio-source/core
-          cp "$CORE/src/core/phonon.h"                              "$ART/include/"
-          cp "$(find $CORE/build -name phonon_version.h | head -1)" "$ART/include/"
-          cp "$(find $CORE/build -name phonon.dll | head -1)"       "$ART/lib/windows-x64/"
-          cp "$(find $CORE/build -name phonon.lib | head -1)"       "$ART/lib/windows-x64/"
-          test -f "$ART/lib/windows-x64/phonon.dll" && test -f "$ART/include/phonon_version.h"
+        uses: ./.github/actions/build-phonon
+        with:
+          platform: windows
+          arch: x64
+          toolchain: vs2022
+          stage-dir: windows-x64
 
       - name: Configure
         shell: bash
@@ -167,7 +137,7 @@ jobs:
         run: ctest --test-dir build -C RelWithDebInfo --output-on-failure -E '^(playground|layout_tool|calib_view)$'
 
       - name: Smoke (Debug)
-        # the Debug dll ships too — prove it loads (incl. phonon.dll) and runs a lifecycle
+        # the Debug dll ships too — prove it loads and runs a lifecycle
         # (no device on the runner: the AUTO sink policy falls back to the silent null sink)
         run: build/Debug/bwa_minimal.exe
 
@@ -222,13 +192,23 @@ jobs:
           ctest --test-dir build-godot-editor -C RelWithDebInfo --output-on-failure \
                 --no-tests=error -R '^godot_'
 
+      # Both packs carry an Android library, and neither script can cross-build one here. The android
+      # job staged them under a FIXED artifact name (versioned names are for the artifacts a human
+      # downloads), so this step needs no version plumbing.
+      - name: Download the Android libraries (built by the android job)
+        uses: actions/download-artifact@v6
+        with:
+          name: android-pack-input
+          path: pack-android
+
       - name: Pack Godot addon
         id: packgd
         shell: pwsh
         run: |
           # -SkipBuild is wrong here: the editor tree is built but template_release is not, and
-          # pack.ps1 refuses to ship a manifest whose libraries are missing.
-          $a = @{ OutDir = 'dist/godot' }
+          # pack.ps1 refuses to ship a manifest whose libraries are missing. -AndroidFrom keeps it
+          # from trying to cross-build the third flavour on a runner with no NDK wired up.
+          $a = @{ OutDir = 'dist/godot'; AndroidFrom = (Resolve-Path 'pack-android/godot').Path }
           if ($env:GITHUB_REF -like 'refs/tags/v*') { $a.Version = $env:GITHUB_REF_NAME.TrimStart('v') }
           ./tools/godot/pack.ps1 @a
 
@@ -254,7 +234,6 @@ jobs:
           Copy-Item build/RelWithDebInfo/bw_audio.dll,
                     build/RelWithDebInfo/bw_audio.lib,
                     build/RelWithDebInfo/bw_audio.pdb,
-                    build/RelWithDebInfo/phonon.dll,
                     build/RelWithDebInfo/bwa_minimal.exe,
                     build/RelWithDebInfo/bwa_playground.exe,
                     build/RelWithDebInfo/bwa_layout_tool.exe,
@@ -264,7 +243,6 @@ jobs:
           Copy-Item build/Debug/bw_audio.dll,
                     build/Debug/bw_audio.lib,
                     build/Debug/bw_audio.pdb,
-                    build/Debug/phonon.dll,
                     build/Debug/bwa_minimal.exe dist/Debug/
           @"
           bw_audio win64 — limited distribution build
@@ -274,24 +252,76 @@ jobs:
                    silently, the 3D view + meters stay live); bwa_playground --help for keys
           needs    the Microsoft VC++ x64 runtime (vcruntime140*.dll). Any machine with
                    Visual Studio has it; otherwise https://aka.ms/vs/17/release/vc_redist.x64.exe
-          backends ASIO=yes  SteamAudio=yes (patched phonon 4.8.1+10: HRTF decode,
-                   occlusion, reflections, pathing — third_party/README.md)
-          contents RelWithDebInfo/ — bw_audio.dll/.lib/.pdb + phonon.dll (KEEP THEM
-                   TOGETHER: bw_audio.dll does not load without phonon.dll beside it),
+          backends ASIO=yes  SteamAudio=yes (patched phonon 4.8.1+10, linked STATICALLY:
+                   HRTF decode, occlusion, reflections, pathing — third_party/README.md)
+          contents RelWithDebInfo/ — bw_audio.dll/.lib/.pdb (phonon is inside the dll;
+                   there is no second library to keep beside it),
                    bwa_minimal.exe (smoke check: runs the whole client lifecycle, no
                    hardware needed), tools: bwa_playground / bwa_layout_tool /
                    bwa_calib_view (GUI — need a display), bwa_calibrate + bwa_zylia_probe
                    (console), cave_layout.json + constraints.json (example layout +
                    room, read by the tools from their own directory). Debug/ — engine
-                   dll/.lib/.pdb + phonon.dll + bwa_minimal. Root — include/bw_audio.h.
+                   dll/.lib/.pdb + bwa_minimal. Root — include/bw_audio.h.
                    x64 only.
           license  GPLv3 (LICENSE) + THIRD_PARTY-NOTICES.md. Complete corresponding
                    source: this repo at
                    https://github.com/aforren1/cave-audio/tree/${{ github.sha }}
                    PLUS the ASIO SDK source (statically linked into bw_audio.dll) in
                    asio-sdk-src.zip beside these files — also a separate release asset.
+                   Steam Audio is statically linked too (Apache-2.0); on a tagged
+                   release its source ships as bw_audio-steam-audio-src-<tag>.zip.
           "@ | Out-File -Encoding utf8 dist/DIST.txt
           Get-Content dist/DIST.txt
+
+      # Corresponding source for the OTHER statically linked dependency. phonon used to ship as its
+      # own DLL, which made the pinned-commit link enough; inside bw_audio.dll it is the same case as
+      # the ASIO SDK, so it gets the same treatment - the source beside the binary, not a URL to
+      # chase. Apache-2.0 does not demand this (section 4 wants the license and the notices, both of
+      # which ship already); GPLv3 section 6 governs the combined work, and shipping is cheaper than
+      # arguing about which half of the DLL a recipient is entitled to. Tags only: a cached run has
+      # no submodule checkout, and paying for one on every push to buy nothing would be silly.
+      - name: Stage Steam Audio corresponding source (tags only)
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: pwsh
+        run: |
+          $sha = (git rev-parse HEAD:third_party/steam-audio-source).Trim()
+          if (-not (Test-Path third_party/steam-audio-source/.git)) {
+            git submodule update --init --depth 1 third_party/steam-audio-source
+            if (-not $?) { git submodule update --init third_party/steam-audio-source }
+          }
+          $zip = (Join-Path (Get-Location) 'dist/steam-audio-src.zip')
+          if (Test-Path $zip) { Remove-Item $zip -Force }
+          # The COMMIT, not the working tree: the build step applies our patch in place, and the
+          # patch travels as itself (below) so a recipient can see exactly what we changed.
+          git -C third_party/steam-audio-source archive --format=zip --prefix="steam-audio-$sha/" -o $zip HEAD
+          if (-not $?) { throw "git archive of the steam-audio submodule failed" }
+          $readme = @"
+          Steam Audio corresponding source for bw_audio ${{ github.ref_name }}.
+
+          Upstream:  https://github.com/ValveSoftware/steam-audio
+          Commit:    $sha
+          License:   Apache-2.0 (LICENSE.md in the tree above)
+
+          bw_audio links this statically into bw_audio.dll. It is built with the recipe in
+          third_party/README.md ("Steam Audio"), BUILD_SHARED_LIBS=OFF and --minimal, after
+          applying the one patch in patches/ below. The tree here is the unpatched upstream
+          commit, so apply the patch to reproduce the build:
+
+            git apply patches/phonon-multiplyaccumulate-align.patch
+          "@
+          New-Item -ItemType Directory -Force dist/sa-extra/patches | Out-Null
+          $readme | Out-File -Encoding ascii dist/sa-extra/README.txt
+          Copy-Item third_party/patches/*.patch dist/sa-extra/patches/
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
+          $z = [IO.Compression.ZipFile]::Open($zip, 'Update')
+          try {
+            foreach ($f in Get-ChildItem dist/sa-extra -Recurse -File) {
+              $rel = $f.FullName.Substring((Resolve-Path dist/sa-extra).Path.Length + 1).Replace([char]92, '/')
+              [IO.Compression.ZipFileExtensions]::CreateEntryFromFile($z, $f.FullName, "steam-audio-$sha/$rel") | Out-Null
+            }
+          } finally { $z.Dispose() }
+          Remove-Item dist/sa-extra -Recurse -Force
+          "staged $zip ($([math]::Round((Get-Item $zip).Length / 1MB, 1)) MB)"
 
       # The Unity package. Packed on EVERY run (not just tags) so a broken package - a missing .meta,
       # a tarball that somehow lost its DLLs - fails the build rather than the release. On a tag the
@@ -309,7 +339,8 @@ jobs:
           # package folder (last config wins), so packing without it would ship the Debug engine.
           # NB: splat a HASHTABLE, not an array. Array splatting binds POSITIONALLY, so '-PluginsFrom'
           # would land in $Version and the trailing value would have no parameter left to bind to.
-          $a = @{ PluginsFrom = 'build/RelWithDebInfo'; OutDir = 'dist/unity' }
+          $a = @{ PluginsFrom = 'build/RelWithDebInfo'; OutDir = 'dist/unity'
+                  AndroidFrom = (Resolve-Path 'pack-android/unity').Path }
           if ($env:TAG) { $a.Version = $env:TAG }           # the tag is the version; pack stamps it into the manifest
           ./tools/upm/pack.ps1 @a
 
@@ -344,8 +375,8 @@ jobs:
           if-no-files-found: error
 
       # ---- release (tags only) -------------------------------------------------------------------
-      # The Release IS the distribution - there is no registry. FOUR assets: three audiences want
-      # different bytes, and the fourth is the GPLv3 corresponding source that must accompany them:
+      # The Release IS the distribution - there is no registry. FIVE assets: four audiences want
+      # different bytes, and the fifth is the GPLv3 corresponding source that must accompany them:
       #
       #   com.brainworks.bw_audio-<ver>.tgz   the Unity package (C# + the two DLLs, import settings set).
       #                                      Installs via Package Manager > "+" > "from tarball".
@@ -355,15 +386,22 @@ jobs:
       #   bw_audio-win64-<tag>.zip            the engine itself: dll/lib/pdb + bw_audio.h + the tools.
       #                                      The durable home for the native side - workflow artifacts
       #                                      expire, a release does not.
+      #   bw_audio-android-<tag>.zip          the Android engine: libbw_audio.so for arm64-v8a and
+      #                                      x86_64 + bw_audio.h. A no-SDK build (no phonon for
+      #                                      Android yet), staged whole by the android job.
       #   bw_audio-asio-sdk-src-<tag>.zip     the ASIO SDK source statically linked into bw_audio.dll,
       #                                      redistributed under its GPLv3 option. Corresponding source
       #                                      for the one GPL-covered component the repo does not itself
       #                                      carry (it is gitignored, fetched from Steinberg at build).
+      #   bw_audio-steam-audio-src-<tag>.zip  the Steam Audio source statically linked into the same
+      #                                      DLL (Apache-2.0), at its pinned commit, plus our patch.
+      #                                      Same parity argument as the ASIO zip: the source sits
+      #                                      beside the binary rather than behind a link.
       #
       # Keep the engine bundle a .zip, and the package the only .tgz on the release. Every UPM registry
       # speaks the npm protocol and keys on a single publishable tarball, so should this ever be listed
       # on one, that stays a config change rather than a rebuild. It costs nothing to preserve.
-      - name: Release (engine zip + Unity package tarball + ASIO SDK source zip)
+      - name: Release (engine zip + Android zip + Unity package tarball + the two source zips)
         if: startsWith(github.ref, 'refs/tags/')
         shell: pwsh
         env:
@@ -392,9 +430,23 @@ jobs:
           Copy-Item dist/asio-sdk-src.zip $src -Force
           $src = (Get-Item $src).FullName
 
+          # And the same for Steam Audio, which a static link put inside the same DLL. Staged by the
+          # "Stage Steam Audio corresponding source" step above (tags only).
+          $sasrc = "dist/bw_audio-steam-audio-src-$tag.zip"
+          Copy-Item dist/steam-audio-src.zip $sasrc -Force
+          $sasrc = (Get-Item $sasrc).FullName
+
+          # The Android bundle. The android job staged the whole tree (both ABIs, the header, the
+          # licenses, its own DIST.txt) and this job only zips it, so ONE step creates the release
+          # and there is never a second one to reconcile.
+          $and = "dist/bw_audio-android-$tag.zip"
+          Compress-Archive -Path pack-android/dist/* -DestinationPath $and -Force
+          $and = (Get-Item $and).FullName
+
           $notes = @"
-          Windows x64. Three downloads to use - the **Unity package**, the **Godot addon**, or the
-          **engine** itself - plus the **ASIO SDK source** (GPLv3 corresponding source; see License below).
+          Windows x64, plus an Android cross-build. Four downloads to use - the **Unity package**, the
+          **Godot addon**, the **engine** itself, or the **Android engine** - plus the **ASIO SDK
+          source** and the **Steam Audio source** (corresponding source; see License below).
 
           ## Unity
 
@@ -402,8 +454,8 @@ jobs:
           **Package Manager > ``+`` > *Install package from tarball...*** That is the whole install.
           (Or install from a git URL: ``https://github.com/aforren1/cave-audio.git#unity``.)
 
-          The package ships the native engine (``bw_audio.dll`` + ``phonon.dll``) with its import settings
-          already set - nothing to build. Requires **Unity 6**. Turn OFF Unity's built-in audio
+          The package ships the native engine (``bw_audio.dll``, one file: Steam Audio is linked into
+          it) with its import settings already set - nothing to build. Requires **Unity 6**. Turn OFF Unity's built-in audio
           (*Project Settings > Audio > Disable Unity Audio*): the engine owns the device.
 
           ## Godot
@@ -414,10 +466,20 @@ jobs:
 
           ## Engine (C ABI, tools)
 
-          ``bw_audio-win64-$tag.zip`` - ``bw_audio.dll`` / ``.lib`` / ``.pdb`` + ``phonon.dll`` (**keep the
-          pair together**, the dll will not load without it), ``bw_audio.h``, and the tools:
+          ``bw_audio-win64-$tag.zip`` - ``bw_audio.dll`` / ``.lib`` / ``.pdb`` (Steam Audio is **linked
+          statically**, so there is nothing to keep beside it), ``bw_audio.h``, and the tools:
           ``bwa_playground``, ``bwa_layout_tool``, ``bwa_calib_view``, ``bwa_calibrate``, ``bwa_zylia_probe``.
           Needs the MSVC x64 runtime. See ``DIST.txt`` inside for the exact commit.
+
+          ## Android
+
+          ``bw_audio-android-$tag.zip`` - ``libbw_audio.so`` for **arm64-v8a** (a standalone headset)
+          and **x86_64** (an emulator), plus ``bw_audio.h``. Built against **android-26**, output
+          through **AAudio**; there is no array transport on Android, so this is the headphone path.
+          Steam Audio is **linked statically inside it**, so the binaural path is the real HRTF
+          decode and there is no second library to ship beside it.
+          The Unity package and the Godot addon above carry the arm64-v8a library already, so install
+          one of those unless you are linking the C ABI yourself.
 
           ## License
 
@@ -427,11 +489,13 @@ jobs:
           proprietary-ASIO alternative.
 
           Complete corresponding source is this repo at the commit named in ``DIST.txt``, plus
-          ``bw_audio-asio-sdk-src-$tag.zip`` below (the ASIO SDK source compiled into the DLL).
+          ``bw_audio-asio-sdk-src-$tag.zip`` and ``bw_audio-steam-audio-src-$tag.zip`` below (the two
+          third-party sources compiled into the DLL).
           "@
-          # One .tgz (the Unity package) + the Godot addon .zip + the engine .zip + the ASIO SDK
-          # corresponding-source .zip. Keep the .tgz as the only package tarball - see the note above.
-          gh release create $tag $tgz $gd $zip $src --title "bw_audio $tag" --notes $notes
+          # One .tgz (the Unity package) + the Godot addon .zip + the engine .zip + the Android
+          # .zip + the two corresponding-source .zips. Keep the .tgz as the only package
+          # tarball - see the note above.
+          gh release create $tag $tgz $gd $zip $and $src $sasrc --title "bw_audio $tag" --notes $notes
 
       # ---- distribution branches (tags only) ------------------------------------------------------
       # The gh-pages idea applied to the bindings. `main` stays source-only; each binding also gets a
@@ -473,22 +537,291 @@ jobs:
   # backend into dead code that nothing builds. Their sink-test sections then skip visibly on the
   # runner: no JACK server is running and there is no sound card.
   #
-  # No submodules and no SDKs: phonon is a Windows artifact in this repo (the CMake auto-detect
-  # requires the platform's import library, so a checkout with it staged still configures no-SDK
-  # here), and ASIO is Windows-only by definition. That also keeps these jobs cheap - a few minutes
-  # against the Windows job's phonon build.
+  # Both jobs now BUILD PHONON, each into its own lib/<platform> and under its own cache key, so
+  # both run the with-SDK suite (38 tests) rather than the no-SDK one (33) and both assert
+  # "Steam Audio ENABLED". A cold run pays for the phonon build the way the windows job does; a
+  # warm one restores the archives and costs a few minutes. No ASIO: it is Windows-only by
+  # definition, and nothing here fetches it.
   #
-  # The macOS job is UNVERIFIED locally: the shim's Apple paths (mach_absolute_time,
-  # mach_wait_until, the SCHED_OTHER priority drop) were written from the documentation and have
-  # never run on a Mac. This job is the first thing that will execute them.
+  # The macOS job is UNVERIFIED locally in BOTH halves: the shim's Apple paths (mach_absolute_time,
+  # mach_wait_until, the SCHED_OTHER priority drop) were written from the documentation, and its
+  # phonon build was written from the pinned scripts. Nobody here has a Mac. This job is the first
+  # thing that will execute either.
+  #
+  # ANDROID IS CROSS-BUILT, in the job below, and deliberately WITHOUT an emulator. An emulator job is
+  # possible here: ubuntu-latest runners expose /dev/kvm, so reactivecircus/android-emulator-runner can
+  # boot an x86_64 system image and tools/android/run-tests.ps1 would push the suite onto it. What it
+  # costs is several minutes of image download plus boot on every run, and what it buys is thin - phase
+  # 3 verified the AAudio sink on a local emulator, and the numbers that matter (burst size, the MMAP
+  # path, a real route-change disconnect, the CPU budget) need a headset, which no runner has. The
+  # cross-BUILD is the part worth gating, and it is the cheap part.
+  # ---- Android cross-build (docs/backends.md phase 3 + the bindings' Android packaging) ---------
+  # Builds the library for both ABIs, proves the AAudio backend is in it, and produces the two things
+  # the Windows job cannot: the arm64-v8a engine library that both bindings package, and the Godot
+  # GDExtension for arm64-v8a (template_release, the flavour an exported game loads).
+  #
+  # Nothing RUNS here. The test executables are built, so a compile break in the suite still fails
+  # this job, but running them needs a device - that is what tools/android/run-tests.ps1 is for.
+  #
+  # Steam Audio: BUILT STATICALLY here too, once per ABI, through the same composite action the
+  # other three jobs call. An Android APK therefore carries the real HRTF decode, occlusion,
+  # pathing and the reflection bed inside libbw_audio.so, with nothing beside it.
+  #
+  # UNVERIFIED ON A LINUX HOST. The Android phonon build was verified on a Windows host, where the
+  # NDK host tag the pinned scripts hard-code happens to be the right one. This job is the first
+  # thing that runs it from linux-x86_64, which is what third_party/patches/phonon-android-*.patch
+  # exists for. Its loud failure mode is the configure assertion below: a patch that did not do its
+  # job leaves no lib/android-<abi> staged, the configure falls back to a no-SDK build, and the
+  # grep for "Steam Audio ENABLED" fails the job rather than shipping a quietly degraded library.
+  android:
+    runs-on: ubuntu-latest
+    # Two phonon builds on a cold cache are the long pole, as they are in the windows job; a warm
+    # cache restores both in seconds.
+    timeout-minutes: 90
+    outputs:
+      version: ${{ steps.ver.outputs.version }}
+    steps:
+      - uses: actions/checkout@v6      # no submodules: nothing here builds an SDK
+
+      - name: Version
+        id: ver
+        shell: bash
+        run: |
+          # The same rule tools/upm/pack.ps1 uses, so the Android artifact's name matches the others
+          # on a given run: the tag when there is one, else git describe, else the placeholder. A
+          # default (shallow) checkout has no tags, so a branch build lands on 0.0.0-dev here exactly
+          # as it does in the Windows job.
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            v="${GITHUB_REF_NAME#v}"
+          else
+            v="0.0.0-dev"
+            if d=$(git describe --tags --long --dirty --match 'v*' 2>/dev/null); then
+              if [[ "$d" =~ ^v?(.+)-([0-9]+)-g([0-9a-f]+)(-dirty)?$ ]]; then
+                if [ "${BASH_REMATCH[2]}" = 0 ]; then v="${BASH_REMATCH[1]}"
+                else v="${BASH_REMATCH[1]}-dev.${BASH_REMATCH[2]}.g${BASH_REMATCH[3]}"; fi
+              fi
+            fi
+          fi
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+          echo "android version: $v"
+
+      - name: NDK and generator
+        shell: bash
+        run: |
+          # The runner image documents four names. ANDROID_NDK_ROOT (and its twin ANDROID_NDK_HOME)
+          # is the image's DEFAULT NDK, r27 today; ANDROID_NDK_LATEST_HOME is the newest installed,
+          # which moves whenever the image adds one. Prefer the pinned default so a new image cannot
+          # change the compiler under this job silently, fall back to the latest, and fail loudly
+          # rather than let CMake configure a HOST build that would pass every check below.
+          NDK="${ANDROID_NDK_ROOT:-${ANDROID_NDK_HOME:-$ANDROID_NDK_LATEST_HOME}}"
+          test -n "$NDK" && test -f "$NDK/build/cmake/android.toolchain.cmake" || {
+            echo "no usable NDK: ANDROID_NDK_ROOT='$ANDROID_NDK_ROOT' ANDROID_NDK_LATEST_HOME='$ANDROID_NDK_LATEST_HOME'"
+            exit 1; }
+          echo "NDK=$NDK" >> "$GITHUB_ENV"
+          # The pinned Steam Audio scripts read the NDK from ANDROID_NDK and nowhere else, so the
+          # phonon steps below get it from the job environment rather than from an input.
+          echo "ANDROID_NDK=$NDK" >> "$GITHUB_ENV"
+          "$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/clang" --version | head -1
+          sudo apt-get update && sudo apt-get install -y ninja-build   # the NDK ships no generator
+
+      - name: Phonon cache key (submodule sha, no checkout needed)
+        id: phonon-key
+        shell: bash
+        run: echo "sha=$(git rev-parse HEAD:third_party/steam-audio-source)" >> "$GITHUB_OUTPUT"
+
+      # Two ABIs, two cache entries. Both stage into ONE artifacts tree - include/ is shared and the
+      # archives land in lib/android-arm64 and lib/android-x64 - so each entry carries the shared
+      # header plus its own lib dir, and the two restores merge into the tree CMake then detects.
+      # The key names the platform AND the ABI: a cache is scoped to the repository rather than to
+      # the runner OS, so jobs staging different lib/<platform> sets under one key would restore
+      # each other's archives.
+      - name: Cache phonon (arm64-v8a)
+        id: phonon-arm64
+        uses: actions/cache@v5
+        with:
+          path: |
+            third_party/steam-audio-artifacts/include
+            third_party/steam-audio-artifacts/lib/android-arm64
+          key: phonon-android-arm64-v1-${{ steps.phonon-key.outputs.sha }}-${{ hashFiles('third_party/patches/**') }}
+
+      - name: Build phonon (arm64-v8a; cache miss only; recipe = third_party/README.md)
+        if: steps.phonon-arm64.outputs.cache-hit != 'true'
+        uses: ./.github/actions/build-phonon
+        with:
+          platform: android
+          arch: arm64          # build.py's spelling; the deps tree calls the same target armv8
+          stage-dir: android-arm64
+
+      - name: Cache phonon (x86_64)
+        id: phonon-x64
+        uses: actions/cache@v5
+        with:
+          path: |
+            third_party/steam-audio-artifacts/include
+            third_party/steam-audio-artifacts/lib/android-x64
+          key: phonon-android-x64-v1-${{ steps.phonon-key.outputs.sha }}-${{ hashFiles('third_party/patches/**') }}
+
+      - name: Build phonon (x86_64; cache miss only; recipe = third_party/README.md)
+        if: steps.phonon-x64.outputs.cache-hit != 'true'
+        uses: ./.github/actions/build-phonon
+        with:
+          platform: android
+          arch: x64
+          stage-dir: android-x64
+
+      - name: Build both ABIs (android-26)
+        shell: bash
+        run: |
+          for abi in arm64-v8a x86_64; do
+            # ANDROID_STL is pinned, not left to default: a static phonon is C++, and c++_static
+            # puts libc++ INSIDE libbw_audio.so so nothing ships beside it. Safe because the ABI
+            # is C, so no C++ object crosses the library boundary. The NDK's CMake toolchain
+            # already defaults this way; Gradle's does not, so say it.
+            cmake -S . -B build-android-$abi -G Ninja \
+                  -DCMAKE_TOOLCHAIN_FILE="$NDK/build/cmake/android.toolchain.cmake" \
+                  -DANDROID_ABI=$abi -DANDROID_PLATFORM=android-26 -DANDROID_STL=c++_static \
+                  -DCMAKE_BUILD_TYPE=RelWithDebInfo -DBWA_BUILD_TESTS=ON | tee configure-$abi.log
+            # The artifact must contain the device path this platform HAS. A configure that quietly
+            # fell back to the null sink would ship a library that never opens a stream and say
+            # nothing about it - the same reason the Windows job greps for ASIO.
+            grep -q "AAudio backend ENABLED" configure-$abi.log
+            # And the HRTF decode. This is also the one loud signal that this ABI's phonon archives
+            # really got staged, whether they were built here or restored from the cache.
+            grep -q "Steam Audio ENABLED" configure-$abi.log
+            cmake --build build-android-$abi
+            test -f build-android-$abi/libbw_audio.so
+          done
+
+      - name: Cache godot-cpp build (android)
+        uses: actions/cache@v4
+        with:
+          # Same reasoning as the Windows godot-cpp cache: ~2100 generated binding files dwarf our
+          # nine sources. One flavour only here, because a headset runs no editor.
+          path: build-android-godot
+          key: godot-cpp-android-${{ env.GODOT_CPP_COMMIT }}-arm64
+
+      - name: Build the Godot GDExtension (arm64-v8a, template_release)
+        shell: bash
+        run: |
+          cmake -S . -B build-android-godot -G Ninja \
+                -DCMAKE_TOOLCHAIN_FILE="$NDK/build/cmake/android.toolchain.cmake" \
+                -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=android-26 -DANDROID_STL=c++_static \
+                -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+                -DBWA_BUILD_GODOT=ON -DGODOTCPP_TARGET=template_release
+          cmake --build build-android-godot --target bwa_gdextension
+          # The manifest names this exact file (bindings/godot/addons/bw_audio/bw_audio.gdextension),
+          # and the "lib" prefix is not cosmetic: an APK extracts only lib*.so from its lib/<abi>/.
+          test -f bindings/godot/addons/bw_audio/bin/libbw_audio_gd.android.template_release.arm64.so
+
+      - name: Stage dist
+        shell: bash
+        run: |
+          mkdir -p dist-android/lib/arm64-v8a dist-android/lib/x86_64 dist-android/include
+          cp build-android-arm64-v8a/libbw_audio.so dist-android/lib/arm64-v8a/
+          cp build-android-x86_64/libbw_audio.so    dist-android/lib/x86_64/
+          cp include/bw_audio.h                     dist-android/include/
+          cp LICENSE THIRD_PARTY-NOTICES.md         dist-android/
+          cat > dist-android/DIST.txt <<EOF
+          bw_audio android - limited distribution build
+          commit   ${{ github.sha }} (${{ github.ref_name }})
+          built    $(date -u +%Y-%m-%dT%H:%M:%S)Z  (GitHub Actions run ${{ github.run_id }})
+          abis     lib/arm64-v8a - a standalone headset (Quest, Pico)
+                   lib/x86_64    - the emulator (tools/android/run-tests.ps1 pushes onto one)
+                   both built against android-26, which is AAudio's own floor
+          backends AAudio=yes  SteamAudio=yes (STATIC). phonon is built from the pinned submodule
+                   for both ABIs and linked INSIDE libbw_audio.so, so the binaural path is the
+                   real HRTF decode and automatic occlusion, pathing and the reflection bed are
+                   all present. There is no second file to ship or to keep beside it.
+                   ISM early reflections, the FDN late tail and manual occlusion work as before.
+          no array there is no 26-channel transport on Android; this is the headphone path.
+                   A headset's pose reaches the engine through bwa_set_listener_pose.
+          contents lib/<abi>/libbw_audio.so + include/bw_audio.h. A Unity or Godot consumer
+                   wants the package or the addon instead - both already carry the arm64-v8a
+                   library with its import settings set.
+          license  GPLv3 (LICENSE) + THIRD_PARTY-NOTICES.md. No ASIO SDK here (it is a Windows
+                   driver model), so the complete corresponding source is this repo at
+                   https://github.com/aforren1/cave-audio/tree/${{ github.sha }}
+          EOF
+          cat dist-android/DIST.txt
+
+          # What the Windows job packs into the two bindings. A FIXED artifact name, because a
+          # versioned one would have to be threaded through the download step; the versioned
+          # artifact below is the one a human downloads.
+          #
+          # The packaged copies are STRIPPED of debug info, the standalone artifact's are not. That
+          # is the same split Windows already has: the addon and the tarball ship bw_audio.dll while
+          # its DWARF-equivalent sits in a .pdb they do not carry, and an APK pays for every byte it
+          # holds. The engine measures 20.7 MB down to 7.0 with static phonon in it (it was 2.5 down
+          # to 0.4 without), and the extension strips by about the same ratio, per release, on a
+          # branch that keeps every release.
+          mkdir -p pack-android/godot pack-android/unity
+          cp -r dist-android pack-android/dist
+          cp bindings/godot/addons/bw_audio/bin/libbw_audio_gd.android.template_release.arm64.so \
+             bindings/godot/addons/bw_audio/bin/libbw_audio.so pack-android/godot/
+          cp build-android-arm64-v8a/libbw_audio.so pack-android/unity/
+          "$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-strip" --strip-debug \
+             pack-android/godot/*.so pack-android/unity/*.so
+          ls -l pack-android/godot pack-android/unity
+
+      - name: Upload artifact (Android engine)
+        uses: actions/upload-artifact@v6
+        with:
+          name: bw_audio-android-${{ steps.ver.outputs.version }}-r${{ github.run_number }}
+          path: dist-android/
+          retention-days: 30
+          if-no-files-found: error
+
+      - name: Upload artifact (packing input for the windows job)
+        uses: actions/upload-artifact@v6
+        with:
+          name: android-pack-input
+          path: pack-android/
+          retention-days: 1      # an intra-run handoff, not a download
+          if-no-files-found: error
+
   linux:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 75   # the uncached phonon build is the long pole; cached runs are far under
     steps:
-      - uses: actions/checkout@v6      # no submodules: no SDKs are built here
+      - uses: actions/checkout@v6
+        # still no submodules by default: the composite action fetches steam-audio-source itself,
+        # and only on a phonon cache miss
 
       - name: Install the Linux backends' dev packages
         run: sudo apt-get update && sudo apt-get install -y libasound2-dev libjack-jackd2-dev
+
+      # The pinned build scripts are driven as `python`, not `python3`, and which of the two a
+      # runner image happens to put on PATH is not a promise. Pin it.
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+
+      - name: Phonon cache key (submodule sha, no checkout needed)
+        id: phonon-key
+        shell: bash
+        run: echo "sha=$(git rev-parse HEAD:third_party/steam-audio-source)" >> "$GITHUB_OUTPUT"
+
+      - name: Cache phonon (built Steam Audio core)
+        id: phonon
+        uses: actions/cache@v5
+        with:
+          path: third_party/steam-audio-artifacts
+          # Same key shape as the windows job, plus the PLATFORM. A cache is scoped to the
+          # repository and not to the runner OS, so three jobs staging three different
+          # lib/<platform> sets under one key would restore each other's archives.
+          key: phonon-linux-v1-${{ steps.phonon-key.outputs.sha }}-${{ hashFiles('third_party/patches/**') }}
+
+      - name: Build phonon (cache miss only; recipe = third_party/README.md)
+        if: steps.phonon.outputs.cache-hit != 'true'
+        uses: ./.github/actions/build-phonon
+        with:
+          platform: linux
+          arch: x64
+          stage-dir: linux-x64
+          # STEAMAUDIO_ENABLE_AVX defaults ON and adds -fabi-version=6, which breaks <future>
+          # inside hrtf.cpp on gcc 13 and older. Runner images ship gcc 13, so this is required
+          # here; gcc 14 compiles it either way. third_party/README.md has the measurement.
+          cmake-flags: -DSTEAMAUDIO_ENABLE_AVX=OFF
 
       - name: Configure
         run: |
@@ -498,28 +831,86 @@ jobs:
           grep -q "Linux - JACK and ALSA backends available" configure.log
           grep -q "JACK backend ENABLED" configure.log
           grep -q "ALSA backend ENABLED" configure.log
-          grep -q "Steam Audio disabled" configure.log
+          # The one loud signal that the phonon staging survived the cache round trip. A no-SDK
+          # build passes every test below, so nothing further down would notice.
+          grep -q "Steam Audio ENABLED" configure.log
 
       - name: Build
         run: cmake --build build --config RelWithDebInfo
 
+      - name: Check the library
+        run: |
+          # ctest below links bwa_core's OBJECTS, never this file, so nothing else here would
+          # notice its absence: a LINKER_LANGUAGE CXX with no CXX language enabled made CMake emit
+          # an EMPTY link rule, which prints "Linking CXX shared library", exits 0, and writes
+          # nothing (docs/backends.md).
+          test -s build/libbw_audio.so
+          # phonon is STATIC: nothing to load beside the library.
+          ! readelf -d build/libbw_audio.so | grep -q phonon
+          # -Wl,--exclude-libs,ALL holds: the bwa_* ABI is the whole export list.
+          test "$(nm -D --defined-only build/libbw_audio.so | grep -c ' ipl')" = 0
+
       - name: Test
+        # 38: the 33 a default off-Windows build registers, plus the five SDK-gated tests
+        # (reflect, bake, path, dynmesh, steam_decode).
         run: ctest --test-dir build -C RelWithDebInfo --output-on-failure
 
+  # UNVERIFIED LOCALLY, all of it: nobody here has a Mac, so this job is the first thing that
+  # executes either the shim's Apple paths or a macOS phonon build. Both decisions below came out
+  # of the pinned scripts rather than a run. build.py -p osx generates ONE tree named "osx" with
+  # the Xcode generator, and core/CMakeLists.txt sets CMAKE_OSX_ARCHITECTURES "x86_64;arm64" for
+  # every macOS build (get_dependencies.py passes the same pair to the three companions), so the
+  # archives are universal and osx-universal is the honest stage-dir - which is also the name the
+  # root CMakeLists prefers when more than one is staged. The failure mode is the configure
+  # assertion, not a silent no-SDK build.
   macos:
     runs-on: macos-latest
-    timeout-minutes: 20
+    timeout-minutes: 75
     steps:
       - uses: actions/checkout@v6
+
+      # `python`, not `python3`: see the linux job's copy of this step.
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+
+      - name: Phonon cache key (submodule sha, no checkout needed)
+        id: phonon-key
+        shell: bash
+        run: echo "sha=$(git rev-parse HEAD:third_party/steam-audio-source)" >> "$GITHUB_OUTPUT"
+
+      - name: Cache phonon (built Steam Audio core)
+        id: phonon
+        uses: actions/cache@v5
+        with:
+          path: third_party/steam-audio-artifacts
+          key: phonon-osx-v1-${{ steps.phonon-key.outputs.sha }}-${{ hashFiles('third_party/patches/**') }}
+
+      - name: Build phonon (cache miss only; recipe = third_party/README.md)
+        if: steps.phonon.outputs.cache-hit != 'true'
+        uses: ./.github/actions/build-phonon
+        with:
+          platform: osx
+          arch: x64          # ignored for osx: the tree is universal, see the job comment
+          stage-dir: osx-universal
+          # No AVX flag: -fabi-version=6 is a Linux-only branch in core/CMakeLists.txt, and
+          # Apple clang never sees it.
 
       - name: Configure
         run: |
           cmake -S . -B build -DCMAKE_BUILD_TYPE=RelWithDebInfo -DBWA_BUILD_TESTS=ON | tee configure.log
           grep -q "null and manual sinks only" configure.log
-          grep -q "Steam Audio disabled" configure.log
+          grep -q "Steam Audio ENABLED" configure.log
 
       - name: Build
         run: cmake --build build --config RelWithDebInfo
 
+      - name: Check the library
+        # The same empty-link-rule guard as the linux job. No output-name or output-directory
+        # override on the target and no -G here, so the default single-config Makefiles generator
+        # writes it to the build root under CMake's own Apple naming.
+        run: test -s build/libbw_audio.dylib
+
       - name: Test
+        # 38, the same arithmetic as the linux job above.
         run: ctest --test-dir build -C RelWithDebInfo --output-on-failure

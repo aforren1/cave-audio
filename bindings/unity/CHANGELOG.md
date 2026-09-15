@@ -4,6 +4,36 @@ All notable changes to `com.brainworks.bw_audio`.
 
 ## [Unreleased]
 
+### Added: the package ships an Android (arm64-v8a) plugin
+
+`Runtime/Plugins/Android/arm64-v8a/libbw_audio.so`, for a standalone-headset build. Its `.meta` is
+committed like every other one and enables the plugin for Android with CPU ARM64 and for nothing
+else, not the Editor; an installed package is immutable, so import settings that arrive wrong
+cannot be fixed in the Inspector. `DllImport("bw_audio")` is unchanged: Mono resolves that name to
+`libbw_audio.so` on Android exactly as it resolves it to `bw_audio.dll` on Windows, so no binding
+code moved.
+
+Output on Android is stereo through AAudio. There is no 26-channel transport there, so a wide
+request falls to the silent offline sink; use the binaural profile, and push the headset's head
+transform through the ordinary listener call. `tools/upm/pack.ps1` now REFUSES to pack without the
+library rather than shipping a package that installs, exports an APK, and throws on the headset.
+CI cross-builds it in a new `android` job and hands it to the packing job.
+
+It is a no-SDK build: there is no phonon for Android yet, so binaural is the fallback pan and
+automatic occlusion, pathing and the reflection bed are absent. ISM early reflections, the FDN late
+tail and manual occlusion all work. When an Android phonon lands, this package does not change:
+Steam Audio links statically, so it ends up inside `libbw_audio.so`.
+
+### Changed: the package ships ONE native library per platform (`phonon.dll` is gone)
+
+Steam Audio is now linked statically into the engine, so `Runtime/Plugins/x86_64/phonon.dll` and its
+`.meta` are gone from the package. `bw_audio.dll` is self-contained: same features, one file. There
+is nothing to keep beside it and nothing to copy into a build.
+
+If you are upgrading an existing project, delete the stale `phonon.dll` (and its `.meta`) that the
+old package left in `Packages/` or `Assets/`. It is dead weight now, and the engine never looks for
+it.
+
 ### Changed (breaking): `BWA_VERSION` -> 0.13.0, and `bwa_get_dsp_time` is gone
 
 The ABI version tracks compatibility, not releases, and this set of changes is not compatible with

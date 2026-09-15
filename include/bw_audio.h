@@ -136,7 +136,9 @@ typedef enum { BWA_SINK_AUTO = 0, BWA_SINK_ASIO = 1, BWA_SINK_NULL = 2,
                BWA_SINK_COREAUDIO = 5,  /* macOS   - not in this build yet */
                BWA_SINK_ALSA      = 6,  /* Linux   - the no-server path: a raw hw: card, or a
                                          * plug/server PCM for a desk monitor */
-               BWA_SINK_AAUDIO    = 7,  /* Android - not in this build yet */
+               BWA_SINK_AAUDIO    = 7,  /* Android - the headphone path on a standalone VR
+                                         * headset. STEREO ONLY; `device` is a decimal Android
+                                         * device id, not a name (AAudio has none from C) */
                BWA_SINK_JACK      = 8,  /* Linux   - a JACK2 server or PipeWire through
                                          * pipewire-jack; `device` is a PORT REGEX here, not a
                                          * device name (JACK has ports, not devices) */

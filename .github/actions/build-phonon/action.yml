@@ -1,0 +1,202 @@
+# Build the patched Steam Audio core (phonon) STATICALLY and stage it where CMake auto-detects it.
+#
+# One action, every platform. The windows, linux and macos jobs all call it (docs/backends.md)
+# rather than copying its steps, and the android job is the fourth caller.
+# The recipe it runs is the one in third_party/README.md, section "Steam Audio" - change both together.
+#
+# It does NOT cache. The caller owns the cache step (key = submodule sha + patch hash) and runs this
+# action on a miss, because only the caller knows which artifacts path it restored.
+#
+# INPUTS
+#   platform      build.py -p value: windows | linux | osx | android.        (required)
+#   arch          build.py -a value: x64 | arm64 | armv7 | x86.              (default: x64)
+#   toolchain     build.py -t value: vs2013 | vs2015 | vs2017 | vs2019 | vs2022. WINDOWS ONLY,
+#                 and IGNORED on every other platform - both pinned scripts accept only those
+#                 five spellings, and off Windows they pick the generator from -p alone (Unix
+#                 Makefiles for linux and android, Xcode for osx).       (default: vs2022)
+#   stage-dir     the lib/<stage-dir> directory to stage into, under
+#                 third_party/steam-audio-artifacts/lib/. Must match the name CMake looks for
+#                 (root CMakeLists.txt, BWA_PHONON_PLATFORMS): windows-x64, linux-x64,
+#                 osx-universal, android-arm64, ...                          (required)
+#   fft           which FFT dependency phonon links. pffft on every platform, Android included:
+#                 phonon can link FFTS there instead, but only behind a non-default
+#                 STEAMAUDIO_ENABLE_FFTS and with NEON turned off on arm64, so we do not.
+#                                                                            (default: pffft)
+#   cmake-flags   extra -D flags for the phonon configure, space separated. Known needs:
+#                 Linux on gcc 13 or older wants -DSTEAMAUDIO_ENABLE_AVX=OFF, because the default
+#                 ON adds -fabi-version=6 and that breaks <future> inside hrtf.cpp. Measured:
+#                 gcc 11.5 and 13.3 fail, gcc 14.3 passes. Runner images ship gcc 13.
+#                                                                            (default: empty)
+#   artifacts-dir where to stage. Leave it alone unless STEAMAUDIO_DIR is overridden too.
+#                 (default: third_party/steam-audio-artifacts)
+#
+# WHAT IT STAGES
+#   include/phonon.h, include/phonon_version.h
+#   lib/<stage-dir>/ the phonon archive plus its three companions (mysofa, zlib, pffft).
+#   phonon's own archive carries only its core and hrtf objects, so the companions link beside it.
+#   The step fails if any of the four is missing, so a half-staged tree never reaches the cache.
+#
+# CRT NOTE (Windows): everything must be /MD. That is --sharedcrt on the dependencies and
+# -DSTEAMAUDIO_STATIC_RUNTIME=OFF on phonon; mixing gives unresolved __imp_ symbols. Both are
+# applied below, so a caller does not have to remember.
+
+name: Build phonon (static)
+description: Build the patched Steam Audio core as static archives and stage them for CMake.
+
+inputs:
+  platform:
+    description: build.py -p value (windows, linux, osx, android)
+    required: true
+  arch:
+    description: build.py -a value (x64, arm64, armv7, x86)
+    required: false
+    default: x64
+  toolchain:
+    description: build.py -t value (vs2022 and the other vs20xx spellings). Windows only; ignored elsewhere
+    required: false
+    default: ''
+  stage-dir:
+    description: lib/<stage-dir> to stage into (windows-x64, linux-x64, osx-universal, android-arm64)
+    required: true
+  fft:
+    description: FFT dependency to build and link (pffft on every platform)
+    required: false
+    default: pffft
+  cmake-flags:
+    description: extra -D flags for the phonon configure, space separated
+    required: false
+    default: ''
+  artifacts-dir:
+    description: staging root (must match STEAMAUDIO_DIR)
+    required: false
+    default: third_party/steam-audio-artifacts
+
+runs:
+  using: composite
+  steps:
+    - name: Build and stage phonon (${{ inputs.stage-dir }}, static)
+      shell: bash
+      env:
+        # The pinned deps (flatbuffers 1.12, zlib, pffft, mysofa) declare pre-3.5
+        # cmake_minimum_required, which CMake 4 refuses outright. This env var
+        # (honored by CMake >= 3.31.7 / 4.0) is the official escape hatch.
+        CMAKE_POLICY_VERSION_MINIMUM: "3.5"
+        BWA_PLATFORM: ${{ inputs.platform }}
+        BWA_ARCH: ${{ inputs.arch }}
+        BWA_TOOLCHAIN: ${{ inputs.toolchain }}
+        BWA_STAGE_DIR: ${{ inputs.stage-dir }}
+        BWA_FFT: ${{ inputs.fft }}
+        BWA_CMAKE_FLAGS: ${{ inputs.cmake-flags }}
+        BWA_ART: ${{ inputs.artifacts-dir }}
+      run: |
+        set -eu
+
+        # -t is a WINDOWS-ONLY argument in BOTH pinned scripts. Their argparse accepts only the
+        # vs20xx values, so "make" or "ndk" is an argparse ERROR, not a no-op, and off Windows the
+        # flag buys nothing anyway: build.py picks Unix Makefiles for linux and android and Xcode
+        # for osx from -p alone, and get_dependencies.py does the same. So the flag travels only on
+        # the windows branch, and the input is ignored elsewhere.
+        TOPT=""
+        if [ "$BWA_PLATFORM" = "windows" ]; then TOPT="-t ${BWA_TOOLCHAIN:-vs2022}"; fi
+
+        git submodule update --init --depth 1 third_party/steam-audio-source \
+          || git submodule update --init third_party/steam-audio-source
+        # REQUIRED for directional reflections (upstream steam-audio#546):
+        git -C third_party/steam-audio-source apply ../patches/phonon-multiplyaccumulate-align.patch
+
+        if [ "$BWA_PLATFORM" = "android" ]; then
+          # Android needs more of the pinned scripts fixed than any other platform: they were
+          # written for a Windows host and for one spelling of the arm64 target. Each patch says
+          # what it fixes; all of them are android-only, so no other platform applies them.
+          for p in third_party/patches/phonon-android-*.patch; do
+            echo "applying $(basename "$p")"
+            git -C third_party/steam-audio-source apply "../patches/$(basename "$p")"
+          done
+          # Both scripts read the NDK from here (get_dependencies.py's --ndk defaults to it), and
+          # get_dependencies.py exits 1 without it. Fail on our own message rather than on theirs.
+          test -n "${ANDROID_NDK:-}" || { echo "android: set ANDROID_NDK before calling this action"; exit 1; }
+          echo "ANDROID_NDK=$ANDROID_NDK"
+        fi
+
+        if [ "$BWA_PLATFORM" = "windows" ]; then
+          # The pinned build scripts hard-code "Visual Studio 17 2022"; rewrite that to
+          # CMake's default generator (= the VS this runner actually has, and the same
+          # generator our own Configure step will use).
+          GEN="$(cmake --help | sed -n 's/^\* \(Visual Studio [0-9]* [0-9]*\).*/\1/p' | head -1)"
+          test -n "$GEN"
+          echo "using generator: $GEN"
+          sed -i "s/Visual Studio 17 2022/$GEN/g" \
+              third_party/steam-audio-source/core/build/build.py \
+              third_party/steam-audio-source/core/build/get_dependencies.py
+          SHAREDCRT="--sharedcrt"     # everything /MD; see the CRT note in this file's header
+        else
+          SHAREDCRT=""
+        fi
+
+        cd third_party/steam-audio-source/core/build
+        # flatbuffers is a BUILD TOOL (flatc), so it never takes the CRT flag and never links in.
+        python get_dependencies.py --dependency flatbuffers -p "$BWA_PLATFORM" -a "$BWA_ARCH" $TOPT
+        for d in zlib "$BWA_FFT" mysofa; do
+          python get_dependencies.py --dependency "$d" $SHAREDCRT -p "$BWA_PLATFORM" -a "$BWA_ARCH" $TOPT
+        done
+
+        # --minimal drops Embree / IPP / GPU / sample apps. Generate only: the configure below
+        # adds the two settings that make this a STATIC, /MD phonon.
+        python build.py -p "$BWA_PLATFORM" -a "$BWA_ARCH" $TOPT -c release --minimal -o generate
+
+        # build.py makes its tree in the CWD, and a single-config generator appends the config
+        # (linux-x64-release, not linux-x64). Don't guess - locate the CMakeCache. Prefer a tree
+        # whose name carries THIS platform and arch: Android calls this action twice in one
+        # checkout, once per ABI, so "the first CMakeCache" would hand the second call the first
+        # ABI's tree and stage one ABI's archives twice.
+        TREE=""
+        for d in $(find . -maxdepth 3 -name CMakeCache.txt); do
+          case "$(basename "$(dirname "$d")")" in
+            "$BWA_PLATFORM"*"$BWA_ARCH"*) TREE="$(dirname "$d")"; break ;;
+          esac
+        done
+        if [ -z "$TREE" ]; then TREE=$(dirname "$(find . -maxdepth 3 -name CMakeCache.txt | head -1)"); fi
+        test -n "$TREE" && test -d "$TREE" || { echo "generated tree not found:"; ls; exit 1; }
+        echo "phonon build tree: $TREE"
+        cmake -DSTEAMAUDIO_STATIC_RUNTIME=OFF -DBUILD_SHARED_LIBS=OFF $BWA_CMAKE_FLAGS "$TREE"
+        cmake --build "$TREE" --config Release --target phonon
+        PHONON_TREE="$(cd "$TREE" && pwd)"
+        cd ../../../..
+
+        # Stage where the root CMakeLists auto-detects it. find: the build-tree layout is phonon's
+        # business; only the staged layout is ours (third_party/README.md).
+        CORE=third_party/steam-audio-source/core
+        mkdir -p "$BWA_ART/include" "$BWA_ART/lib/$BWA_STAGE_DIR"
+        cp "$CORE/src/core/phonon.h"                                 "$BWA_ART/include/"
+        cp "$(find "$PHONON_TREE" -name phonon_version.h | head -1)"  "$BWA_ART/include/"
+
+        # Where get_dependencies.py put THIS target's companions. It names that directory after the
+        # target platform, and spells 64-bit ARM Android "armv8" where build.py says "arm64".
+        case "$BWA_PLATFORM" in
+          osx|ios|wasm) DEPPLAT="$BWA_PLATFORM" ;;
+          android)      if [ "$BWA_ARCH" = "arm64" ]; then DEPPLAT=android-armv8; else DEPPLAT="android-$BWA_ARCH"; fi ;;
+          *)            DEPPLAT="$BWA_PLATFORM-$BWA_ARCH" ;;
+        esac
+
+        if [ "$BWA_PLATFORM" = "windows" ]; then
+          NAMES="phonon.lib mysofa.lib zlibstatic.lib ${BWA_FFT}.lib"
+        else
+          NAMES="libphonon.a libmysofa.a libz.a lib${BWA_FFT}.a"
+        fi
+        for n in $NAMES; do
+          # This build tree first (phonon's own archive), then this target's dependency directory.
+          # Both are scoped, for the same reason TREE is: a second ABI must not stage the first's.
+          src="$(find "$PHONON_TREE" -name "$n" -type f | head -1)"
+          if [ -z "$src" ]; then
+            src="$(find "$CORE/deps" -path "*/$DEPPLAT/*" -name "$n" -type f | head -1)"
+          fi
+          test -n "$src" || { echo "staging FAILED: $n was not built ($DEPPLAT)"; exit 1; }
+          echo "staging $n <- $src"
+          cp "$src" "$BWA_ART/lib/$BWA_STAGE_DIR/"
+        done
+
+        # A half-staged tree must never reach the cache: the consuming configure treats a present
+        # but incomplete lib/<platform> as a fatal error, and a cache hit would make it permanent.
+        test -f "$BWA_ART/include/phonon_version.h"
+        for n in $NAMES; do test -f "$BWA_ART/lib/$BWA_STAGE_DIR/$n"; done
+        ls -l "$BWA_ART/lib/$BWA_STAGE_DIR"

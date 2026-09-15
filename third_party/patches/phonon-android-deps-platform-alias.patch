@@ -1,0 +1,63 @@
+# phonon deps: apply the android-arm64 cmake-flag layers to the android-armv8 build
+#
+# Steam Audio 4.8.1 (ValveSoftware/steam-audio). Apply to the third_party/steam-audio-source
+# submodule before building phonon for ANDROID arm64 (see ../README.md "Steam Audio" build recipe).
+# Needed on every host, unlike the sysroot patch beside it.
+#
+# THE BUG
+# get_dependencies.py builds the 64-bit ARM Android target under the name "android-armv8" (the name
+# of its toolchain file, toolchain_android_armv8.cmake), but dependencies.json spells the same
+# target "android-arm64". filter_dependency() already knows the two names mean one target, so the
+# right dependencies are selected. The cmake-FLAG layers did not: configure_cmake() and
+# get_configure_stamp() both test the platform name against the layer's list with a plain "in", so
+# every layer keyed on "android-arm64" was dropped from an arm64 build.
+#
+# WHAT IT COSTS
+# Silence, which is why this is worth patching rather than working around. PFFFT (the FFT phonon
+# links) loses -DTARGET_C_ARCH=armv8-a and -DTARGET_C_EXTRA=neon and builds with no -march at all;
+# its CMake treats an unset TARGET_C_ARCH as "none" and simply skips the flag, so the only evidence
+# is a missing line in the configure log. mysofa loses its -fPIC layer (harmless here: the android
+# branch of configure_cmake() already passes -DCMAKE_POSITION_INDEPENDENT_CODE=TRUE).
+# It is not always silent: FFTS, which is Android-only and optional, has its whole reason to build
+# in an android-arm64 layer (-DDISABLE_DYNAMIC_CODE=ON). Without it FFTS compiles its JIT path,
+# where src/ffts.c calls __clear_cache(long, long) against an NDK header that declares
+# __clear_cache(void*, void*), and clang 18 (NDK r27) stops on that as an error.
+#
+# THE FIX
+# One helper that returns the spellings of a platform name, used by both layer filters. Nothing else
+# changes: the build directories, the stamp files and the staged paths keep the "android-armv8"
+# spelling this script has always used.
+--- a/core/build/get_dependencies.py
++++ b/core/build/get_dependencies.py
+@@ -106,6 +106,13 @@ def filter_get_platform(dep, host_platform, target_platform):
+     is_tool = filter_is_tool(dep)
+     return host_platform if is_tool else target_platform
+
++def platform_spellings(platform):
++    # dependencies.json spells the 64-bit ARM Android target "android-arm64"; this script builds it
++    # under the name "android-armv8" (its toolchain file's own spelling). One target, two names.
++    if platform == "android-armv8":
++        return [platform, "android-arm64"]
++    return [platform]
++
+ def filter_dependency(dep, platform):
+     platforms = dep.get("platforms", [])
+     if len(platforms) > 0:
+@@ -319,7 +326,7 @@ def get_configure_stamp(dep, platform):
+             should_stamp = layer.get("stamp", True)
+             if should_stamp:
+                 platforms = layer.get("platforms", None)
+-                if platforms is not None and platform not in platforms:
++                if platforms is not None and not any(x in platforms for x in platform_spellings(platform)):
+                     continue
+
+                 stamp += layer.get("flags", [])
+@@ -565,7 +572,7 @@ def configure_cmake(name, cmake_layers, platform, cmake, vs_version, ndk_path, e
+         for cmake_layer in cmake_layers:
+             layer_platforms = cmake_layer.get("platforms", None)
+             if layer_platforms is not None and len(layer_platforms) > 0:
+-                if platform not in layer_platforms:
++                if not any(x in layer_platforms for x in platform_spellings(platform)):
+                     continue
+
+             layer_flags = cmake_layer.get("flags", None)

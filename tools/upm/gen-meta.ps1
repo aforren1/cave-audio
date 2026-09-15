@@ -33,7 +33,8 @@ function Get-BwGuid([string] $Relative) {
 
 # The importer block Unity writes for each asset kind. A native plugin is the interesting one: it must
 # name the platforms explicitly, because "Any Platform" would try to load a Windows x64 DLL on every
-# target. Editor: enabled so the plugin works in Play mode, not just in a build.
+# target. The Windows DLL keeps the Editor enabled, so the plugin works in Play mode and not only in
+# a build; the Android library does not, because the editor is not an Android player.
 function Get-BwImporter([string] $Path, [bool] $IsFolder) {
     if ($IsFolder) { return "folderAsset: yes`nDefaultImporter:`n  externalObjects: {}`n  userData:`n  assetBundleName:`n  assetBundleVariant:" }
     switch ([IO.Path]::GetExtension($Path).ToLowerInvariant()) {
@@ -80,6 +81,51 @@ PluginImporter:
   assetBundleVariant:
 '@.TrimEnd()
         }
+        # A native library under Plugins/Android/<abi>. Unity picks the ABI folder up as a hint, but
+        # the CPU setting is what the importer actually serializes, so it has to say ARM64 too.
+        # Enabled for Android and for NOTHING else: not Any (which would try to load an ARM ELF on
+        # every target), and not the Editor, which runs on the desktop where the x86_64 DLL above is
+        # the plugin. An installed package is immutable, so this cannot be fixed in the Inspector.
+        '.so' {
+            if ($Path -notmatch 'Plugins/Android/') {
+                throw "no importer rule for a .so outside Plugins/Android: $Path"
+            }
+            return @'
+PluginImporter:
+  externalObjects: {}
+  serializedVersion: 2
+  iconMap: {}
+  executionOrder: {}
+  defineConstraints: []
+  isPreloaded: 0
+  isOverridable: 0
+  isExplicitlyReferenced: 0
+  validateReferences: 1
+  platformData:
+  - first:
+      Any:
+    second:
+      enabled: 0
+      settings: {}
+  - first:
+      Android: Android
+    second:
+      enabled: 1
+      settings:
+        CPU: ARM64
+  - first:
+      Editor: Editor
+    second:
+      enabled: 0
+      settings:
+        CPU: AnyCPU
+        DefaultValueInitialized: true
+        OS: AnyOS
+  userData:
+  assetBundleName:
+  assetBundleVariant:
+'@.TrimEnd()
+        }
         { $_ -in '.md', '.json', '.txt' } {
             return "TextScriptImporter:`n  externalObjects: {}`n  userData:`n  assetBundleName:`n  assetBundleVariant:"
         }
@@ -89,12 +135,17 @@ PluginImporter:
     }
 }
 
-# Every asset that ships. The two DLLs are BUILD OUTPUT (gitignored) - but their .meta is not, so it is
-# generated here whether or not the DLL is currently staged on this machine.
+# Every asset that ships. The native libraries are BUILD OUTPUT (gitignored) - but their .meta is
+# not, so it is generated here whether or not the binary is currently staged on this machine. The
+# Android library is libbw_audio.so for arm64-v8a, which is the ABI every current standalone headset
+# runs. One library per platform: phonon has been linked STATICALLY into the engine library since
+# 2026-09-15, so no Steam Audio file ships beside it.
 $assets = @(
     'package.json', 'README.md', 'CHANGELOG.md',
     'Runtime', 'Runtime/Plugins', 'Runtime/Plugins/x86_64', 'Editor',
-    'Runtime/Plugins/x86_64/bw_audio.dll', 'Runtime/Plugins/x86_64/phonon.dll'
+    'Runtime/Plugins/x86_64/bw_audio.dll',
+    'Runtime/Plugins/Android', 'Runtime/Plugins/Android/arm64-v8a',
+    'Runtime/Plugins/Android/arm64-v8a/libbw_audio.so'
 )
 # RECURSE. An .asmdef governs its own folder and everything under it, so splitting the package into
 # assemblies (BwAudio, BwAudio.RigDay) necessarily means subfolders. A flat scan silently skips them,

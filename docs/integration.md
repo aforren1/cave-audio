@@ -497,6 +497,29 @@ which is a duplicate assembly name and a compile error.
   paths (real files on desktop builds) and keep audio assets out of Unity's
   import pipeline.
 
+### Android (standalone headsets)
+
+The package ships one Android library, `Runtime/Plugins/Android/arm64-v8a/libbw_audio.so`, which
+is the ABI every current standalone headset runs. Its `.meta` is committed with the rest, and it
+enables the plugin for Android with CPU ARM64 and for nothing else, not the Editor. An installed
+package is immutable, so those import settings cannot be fixed in the Inspector afterwards.
+
+`DllImport("bw_audio")` needs no change. Mono resolves that name to `libbw_audio.so` on Android
+and to `bw_audio.dll` on Windows, so the whole binding compiles and runs unchanged.
+
+Two differences from the desk build, both in what the engine does rather than in what you call:
+
+- **Output is stereo through AAudio.** Android carries no array transport, so a wide request falls
+  to the offline sink. Use `BWA_PROFILE_BINAURAL`, which is the headphone render.
+- **The pose comes from the headset.** Feed the head transform to `bwa_set_listener_pose` every
+  frame from the XR rig, the same call the CAVE tracker drives. Nothing tracks over the network
+  here.
+
+The Android library carries **Steam Audio inside it**, statically linked, so binaural is the real
+HRTF decode and automatic occlusion, pathing and the reflection bed all work, exactly as on the
+desk. The package gains no file for it and the import settings do not change. What it costs is
+size: the library is about 7 MB on arm64 rather than 0.4 MB, all of it inside the one `.so`.
+
 ## Godot
 
 **Implemented as a GDExtension: [`bindings/godot/`](../bindings/godot/).** Its
@@ -561,6 +584,27 @@ One platform trap with no Unity analogue: the engine opens files by OS path, and
 exported build `res://` lives inside the `.pck` where no OS path exists. Ship layouts and
 audio beside the executable or stage them into `user://` (`StreamingAssets`, one layer
 down).
+
+### Android export (standalone headsets)
+
+The addon ships an Android library beside the Windows pair:
+`addons/bw_audio/bin/libbw_audio_gd.android.template_release.arm64.so`, with the engine library
+`libbw_audio.so` next to it as a manifest `[dependencies]` entry so the exporter copies it into the
+APK too. The manifest names `android.template_release.arm64` and points `android.template_debug.arm64`
+at the same file, which is what the Windows entries do and for the same reason.
+
+The `lib` prefix on both files is required, not a convention: an APK extracts only `lib*.so` from
+its `lib/<abi>/` directory, so a prefix-less extension is not on disk when Godot tries to load it.
+
+Everything else is the desk build's behavior. Output is stereo through AAudio, because Android
+carries no array transport; the headset pose goes to the engine through `bwa_set_listener_pose`,
+which is `BwaEngine`'s listener push; and the `res://` trap above bites harder here, since an
+exported APK has no OS path inside its `.pck` at all.
+
+The Android library carries **Steam Audio inside it**, statically linked, so an exported APK gets
+the real HRTF decode along with occlusion, pathing and the reflection bed. The manifest gains no
+entry for it, because there is no second file: the cost is the engine library's own size, about
+7 MB on arm64 rather than 0.4 MB.
 
 ## Unreal (notes, not yet implemented)
 

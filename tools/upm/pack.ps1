@@ -7,16 +7,23 @@
 # it directly: Package Manager > "+" > "Install package from tarball...". No registry involved.
 #
 # It stages into a CLEAN directory before packing, which is not fussiness:
-#   npm falls back to .gitignore when a package has no .npmignore - and bw_audio.dll / phonon.dll ARE
-#   gitignored (they are build output). Packing bindings/unity in place therefore yields a tarball with
-#   no native plugin: it installs fine, then throws DllNotFoundException on the first engine call.
+#   npm falls back to .gitignore when a package has no .npmignore - and bw_audio.dll IS gitignored (it
+#   is build output). Packing bindings/unity in place therefore yields a tarball with no native plugin:
+#   it installs fine, then throws DllNotFoundException on the first engine call.
 #   Staging first means npm only ever sees what we put there.
 #
-# Only the engine build is a prereq (CMake stages the two DLLs into Runtime/Plugins/x86_64). The
+# Only the engine build is a prereq (CMake stages the engine DLL into Runtime/Plugins/x86_64). The
 # tarball is written with `tar`, which ships with Windows 10+ - no Node/npm anywhere in the pipeline.
 #
-#   cmake --build build --config RelWithDebInfo      # produces the DLLs
-#   powershell -File tools/upm/pack.ps1 [-Version 0.3.0] [-OutDir dist]
+#   cmake --build build --config RelWithDebInfo      # produces the engine DLL
+#   powershell -File tools/upm/pack.ps1 [-Version 0.3.0] [-OutDir dist] [-AndroidFrom <dir with libbw_audio.so>]
+#
+# The package also carries ONE Android library (Runtime/Plugins/Android/arm64-v8a/libbw_audio.so),
+# for a standalone-headset build. It is an NDK cross-build, so a Windows pack cannot produce it:
+# an Android build of this repo stages it there itself, and -AndroidFrom hands one over (which is
+# how CI passes the android job's artifact into the Windows pack). Missing, it FAILS the pack - a
+# tarball whose Android plugin is absent installs, builds an APK, and throws DllNotFoundException
+# on the headset, which is the latest possible place to find out.
 #
 # The GIT TAG is the single source of truth for the release version. -Version (CI passes the tag)
 # STAMPS the staged package.json, so the committed manifest is a placeholder (0.0.0-dev) that never
@@ -26,7 +33,8 @@
 param(
     [string] $Version,                 # optional: stamp this version into the tarball (e.g. from a v0.3.0 tag)
     [string] $OutDir,                  # default: <repo>/dist
-    [string] $PluginsFrom              # optional: build dir to take bw_audio.dll + phonon.dll FROM
+    [string] $PluginsFrom,             # optional: build dir to take bw_audio.dll FROM
+    [string] $AndroidFrom              # optional: dir to take the Android arm64 libbw_audio.so FROM
 )
 $ErrorActionPreference = 'Stop'
 $here = if ($PSScriptRoot) { $PSScriptRoot } else { Split-Path -Parent $MyInvocation.MyCommand.Path }
@@ -80,10 +88,11 @@ Write-Host "packing $($manifest.name) $pkgVersion"
 # Building Debug after RelWithDebInfo (as CI does) therefore leaves the DEBUG engine sitting in the
 # package folder. -PluginsFrom pins the config explicitly, so a release cannot ship a Debug DLL.
 $plugins = Join-Path $pkg 'Runtime/Plugins/x86_64'
+$winLibs = @('bw_audio.dll')
 if ($PluginsFrom) {
     $src = (Resolve-Path $PluginsFrom).Path
     Write-Host "taking the native plugins from $src"
-    foreach ($dll in 'bw_audio.dll', 'phonon.dll') {
+    foreach ($dll in $winLibs) {
         $from = Join-Path $src $dll
         $to   = Join-Path $plugins $dll
         if (-not (Test-Path $from)) { throw "$dll not found in $src" }
@@ -102,9 +111,30 @@ if ($PluginsFrom) {
         }
     }
 }
-foreach ($dll in 'bw_audio.dll', 'phonon.dll') {
+foreach ($dll in $winLibs) {
     if (-not (Test-Path (Join-Path $plugins $dll))) {
-        throw "$dll is missing from Runtime/Plugins/x86_64. Build the engine first: cmake --build build --config RelWithDebInfo (CMake stages both DLLs there), or pass -PluginsFrom build/RelWithDebInfo. A tarball without them installs, then fails at runtime."
+        throw "$dll is missing from Runtime/Plugins/x86_64. Build the engine first: cmake --build build --config RelWithDebInfo (CMake stages it there), or pass -PluginsFrom build/RelWithDebInfo. A tarball without it installs, then fails at runtime."
+    }
+}
+
+# ---- and so must the Android one -------------------------------------------------------------
+# One library per ABI, whatever the SDK state: phonon has been linked STATICALLY into the engine
+# library since 2026-09-15, so there is no second file to stage on any platform.
+$androidPlugins = Join-Path $pkg 'Runtime/Plugins/Android/arm64-v8a'
+$androidLibs = @('libbw_audio.so')
+if ($AndroidFrom) {
+    $src = (Resolve-Path $AndroidFrom).Path
+    Write-Host "taking the android arm64 plugin from $src"
+    New-Item -ItemType Directory -Force -Path $androidPlugins | Out-Null
+    foreach ($so in $androidLibs) {
+        $from = Join-Path $src $so
+        if (-not (Test-Path $from)) { throw "$so not found in $src" }
+        Copy-Item $from (Join-Path $androidPlugins $so) -Force
+    }
+}
+foreach ($so in $androidLibs) {
+    if (-not (Test-Path (Join-Path $androidPlugins $so))) {
+        throw "$so is missing from Runtime/Plugins/Android/arm64-v8a. Cross-build it (docs/build.md, 'Android': an arm64-v8a build stages it there itself) or pass -AndroidFrom <dir with $so>. A tarball without it installs, exports an APK, and throws DllNotFoundException on the headset."
     }
 }
 
@@ -188,7 +218,8 @@ if (-not (Test-Path $tgz)) { throw "tar did not produce $tgz" }
 
 # Prove the plugins actually made it in. This is the whole point of staging (see the header).
 $listing = & tar -tzf $tgz
-foreach ($need in 'package/Runtime/Plugins/x86_64/bw_audio.dll', 'package/Runtime/Plugins/x86_64/phonon.dll') {
+foreach ($need in 'package/Runtime/Plugins/x86_64/bw_audio.dll',
+                  'package/Runtime/Plugins/Android/arm64-v8a/libbw_audio.so') {
     if ($listing -notcontains $need) {
         throw "$need is MISSING from the tarball. It would install and then fail at runtime."
     }

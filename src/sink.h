@@ -17,6 +17,8 @@
  *                  Planar float ports, so the bus copies straight out with no conversion.
  *   - alsa_sink.c  (BWA_HAVE_ALSA):   Linux, the no-server path. The one backend that needs no
  *                  fixed-quantum adapter: it writes, so it picks the size.
+ *   - aaudio_sink.c (BWA_HAVE_AAUDIO): Android, the headphone path on a standalone VR headset.
+ *                  Stereo only - Android has no array transport.
  *   - manual_sink.c (always built): no thread; the caller pumps blocks (bwa_render_block).
  *
  * Two shared pieces sit under the backends rather than inside one of them: sink_convert.h (the
@@ -170,9 +172,10 @@ struct bwa_sink { const bwa_sink_vtbl* vt; };
 
 /* Open a sink for this format per `sink_type`. AUTO tries the platform's backends in the order
  * docs/backends.md fixes (on Windows: WASAPI then ASIO for a 2-channel request, ASIO only when
- * wider; on Linux: JACK then ALSA at every width; then the null sink either way); a named backend
- * is a demand and its failure returns
- * NULL. `device` names the device for whichever backend opens (NULL = that backend's default;
+ * wider; on Linux: JACK then ALSA at every width; on Android: AAudio for a 2-channel request and
+ * nothing for a wider one; then the null sink in every case); a named backend is a demand and its
+ * failure returns NULL.
+ * `device` names the device for whichever backend opens (NULL = that backend's default;
  * matched exactly against the name then the id, and under AUTO a backend with no such device is
  * skipped). `flags` is bwa_desc.sink_flags. `exact_rate` set means the device MUST run at
  * sample_rate or the open fails - the array's rule, since a resampled array shifts every
@@ -283,6 +286,28 @@ bool     sink_alsa_device_id  (uint32_t index, char* buf, uint32_t cap);
  * the WASAPI pair above exists. Control thread, on an open sink. */
 uint32_t sink_alsa_period_frames(bwa_sink* s);
 uint32_t sink_alsa_buffer_frames(bwa_sink* s);
+#endif
+
+#ifdef BWA_HAVE_AAUDIO
+/* Android, the headphone path on a standalone VR headset. STEREO ONLY: a wider request fails the
+ * open with a message saying so, because Android carries no array transport. `device` is a decimal
+ * Android device id (AudioManager.getDevices), not a name - AAudio has no device names from C;
+ * NULL opens the default output. Shared by default; BWA_SINK_FLAG_EXCLUSIVE asks for the MMAP path,
+ * which the OS grants rarely. */
+bwa_sink* bwa_aaudio_sink_open(uint32_t sample_rate, uint32_t block_size, uint32_t channels,
+                          const char* device /* NULL = the default output */,
+                          uint32_t flags, bool exact_rate,
+                          bwa_render_fn render, void* user, char* err, size_t errcap);
+/* One device, "default", with id "0". AAudio has no C enumeration - the device list lives in
+ * Java's AudioManager, which an NDK library has no JNIEnv to reach. Control thread, opens nothing. */
+uint32_t sink_aaudio_device_count(void);
+bool     sink_aaudio_device_name(uint32_t index, char* buf, uint32_t cap);
+bool     sink_aaudio_device_id  (uint32_t index, char* buf, uint32_t cap);
+/* TEST/DIAGNOSTIC readback, internal on purpose (not in bw_audio.h): the device's own quantum and
+ * the buffer the sink settled on. The sink test needs both to size a stall that certainly starves
+ * the stream - the same reason the WASAPI and ALSA pairs above exist. Control thread, on an open sink. */
+uint32_t sink_aaudio_burst_frames(bwa_sink* s);
+uint32_t sink_aaudio_buffer_frames(bwa_sink* s);
 #endif
 
 #endif /* BWA_SINK_H */

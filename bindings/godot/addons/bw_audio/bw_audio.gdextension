@@ -18,23 +18,34 @@ windows.editor.x86_64 = "res://addons/bw_audio/bin/bw_audio_gd.windows.editor.x8
 windows.template_debug.x86_64 = "res://addons/bw_audio/bin/bw_audio_gd.windows.template_release.x86_64.dll"
 windows.template_release.x86_64 = "res://addons/bw_audio/bin/bw_audio_gd.windows.template_release.x86_64.dll"
 
+; Android (arm64-v8a): what a standalone headset export loads. There is no editor flavour, because
+; no Godot editor runs on the headset - the same template_release library serves a debug export,
+; for the reason given above. The "lib" prefix is required: an APK extracts only lib*.so from its
+; lib/<abi>/ directory.
+android.template_debug.arm64 = "res://addons/bw_audio/bin/libbw_audio_gd.android.template_release.arm64.so"
+android.template_release.arm64 = "res://addons/bw_audio/bin/libbw_audio_gd.android.template_release.arm64.so"
+
 [dependencies]
 
 ; The OS resolves these as imports of the extension, from its own directory. Listing them
 ; makes the EXPORTER copy them next to the binary too — without that an exported game ships
 ; the extension alone and fails to load it, having worked perfectly in the editor.
 ;
-; phonon.dll is here because bw_audio.dll imports it in a Steam Audio build. It is not
-; referenced by any Godot code, so nothing else would ever pull it in.
+; The engine library is the only one named, on every platform: Steam Audio is linked STATICALLY into
+; it, so a with-SDK build and a no-SDK build carry the same one file.
 windows.editor.x86_64 = {
-  "res://addons/bw_audio/bin/bw_audio.dll": "",
-  "res://addons/bw_audio/bin/phonon.dll": ""
+  "res://addons/bw_audio/bin/bw_audio.dll": ""
 }
 windows.template_debug.x86_64 = {
-  "res://addons/bw_audio/bin/bw_audio.dll": "",
-  "res://addons/bw_audio/bin/phonon.dll": ""
+  "res://addons/bw_audio/bin/bw_audio.dll": ""
 }
 windows.template_release.x86_64 = {
-  "res://addons/bw_audio/bin/bw_audio.dll": "",
-  "res://addons/bw_audio/bin/phonon.dll": ""
+  "res://addons/bw_audio/bin/bw_audio.dll": ""
+}
+
+android.template_debug.arm64 = {
+  "res://addons/bw_audio/bin/libbw_audio.so": ""
+}
+android.template_release.arm64 = {
+  "res://addons/bw_audio/bin/libbw_audio.so": ""
 }

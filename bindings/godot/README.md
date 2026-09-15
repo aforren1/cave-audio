@@ -30,8 +30,9 @@ cmake --build build-godot --config RelWithDebInfo --target bwa_gdextension
 ```
 
 The build writes `bw_audio_gd.windows.editor.x86_64.dll` into
-`bindings/godot/addons/bw_audio/bin/` and copies `bw_audio.dll` (plus `phonon.dll` when
-the Steam Audio build is on) beside it. Then open `bindings/godot/` in Godot.
+`bindings/godot/addons/bw_audio/bin/` and copies `bw_audio.dll` beside it. That is the only
+library to copy: Steam Audio links statically into the engine DLL. Then open
+`bindings/godot/` in Godot.
 
 `GODOTCPP_TARGET` is a **build-wide** choice, so one configure tree produces one library
 flavor. It defaults to `editor` here. godot-cpp's own default is `template_debug`, which
@@ -52,7 +53,27 @@ install-from-file entry point. So unlike the Unity binding, you cannot install *
 `godot` distribution branch directly. It exists to satisfy a store listing that pulls a repo
 archive.
 
-Windows x64 only, because the engine's device path is ASIO.
+Windows x64 for the desktop, because the engine's device path there is ASIO, plus **Android
+arm64-v8a** for a standalone headset.
+
+### Android
+
+The addon carries `libbw_audio_gd.android.template_release.arm64.so` and the engine library
+`libbw_audio.so` beside the Windows pair, and the manifest lists both under
+`android.template_release.arm64` and `android.template_debug.arm64`. An Android export picks them
+up with no extra step: add the Android export template, export, and the exporter copies both into
+the APK.
+
+What differs on a headset:
+
+- Output is **stereo through AAudio**. There is no 26-channel transport on Android, so use the
+  binaural profile. A wider request falls to the silent offline sink.
+- The head pose comes from the **XR rig**, through the same listener push `BwaEngine` already does.
+- It is a **no-SDK build**: no Steam Audio for Android yet, so binaural is the fallback pan, and
+  automatic occlusion, pathing and the reflection bed are absent. Early reflections (ISM), the late
+  tail (FDN) and manual occlusion all work.
+- `res://` paths are worse here than on the desktop: an exported APK holds them inside the `.pck`,
+  where the engine's file loaders have no OS path to open. Stage layouts and audio into `user://`.
 
 <!-- dev -->
 ## Distribution
@@ -110,15 +131,17 @@ Both flavors are packed because either alone fails in a way that only shows up l
 works right up until someone exports. The script refuses to pack if either is missing, rather
 than shipping a manifest that promises libraries it does not carry.
 
-Two things it stages deliberately. First, it copies into a **clean** directory, because
-`addons/bw_audio/bin/` is gitignored build output: anything that packs the working tree
-naively yields an addon with no binaries. Second, `phonon.dll` is listed in the manifest's
-`[dependencies]` so Godot's **exporter** carries it. Nothing in Godot references phonon,
-because it is an import of `bw_audio.dll`. Without that entry an exported game ships the
-extension alone and fails to load it, after working perfectly in the editor.
+One thing it stages deliberately: it copies into a **clean** directory, because
+`addons/bw_audio/bin/` is gitignored build output, and anything that packs the working tree
+naively yields an addon with no binaries. The manifest's `[dependencies]` names
+`bw_audio.dll` so Godot's **exporter** carries it. Nothing in Godot references the engine
+library directly, because it is an import of the extension, and without that entry an
+exported game ships the extension alone and fails to load it, after working perfectly in
+the editor.
 
-A no-SDK build is supported (ISM + FDN + manual occlusion); packing one warns rather than
-fails, and says what is lost.
+A with-SDK build and a no-SDK build stage exactly the same files, because Steam Audio links
+statically into `bw_audio.dll`. A no-SDK build is supported (ISM + FDN + manual occlusion);
+it just loses the HRTF monitor and the ray-traced acoustics.
 
 ### godot-cpp version
 

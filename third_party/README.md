@@ -125,8 +125,10 @@ early reflections instead of omni-only. This is the open upstream issue
 [ValveSoftware/steam-audio#546](https://github.com/ValveSoftware/steam-audio/issues/546) (symptom only —
 no root cause/fix there yet); drop the patch once a fixed release lands.
 
-**Building phonon (minimal core, Windows x64).** This recipe produces a `phonon.dll`/`phonon.lib`
-that links cleanly into `bw_audio.dll`. Run from `third_party/steam-audio-source/core/build`:
+**Building phonon (minimal core, static, Windows x64).** This recipe produces the STATIC archives
+that link into `bw_audio.dll`. Static is the only supported mode: nothing ships beside the engine
+library on any platform, which is what deletes `phonon.dll` from the Godot manifest, the Unity
+package and the release zips. Run from `third_party/steam-audio-source/core/build`:
 
 ```sh
 git submodule update --init third_party/steam-audio-source   # fetch the pinned source
@@ -150,9 +152,13 @@ done
 #    core/build/windows-vs2022-x64 (the dir name comes from -t/-a, not the generator).
 python build.py -p windows -a x64 -t vs2022 -c release --minimal -o generate
 
-# 3. Build JUST the phonon target with the DYNAMIC CRT, and skip phonon_test (a CRT-fragile exe).
-#    Paths are relative to core/build — where you already are.
-cmake -DSTEAMAUDIO_STATIC_RUNTIME=OFF windows-vs2022-x64
+# 3. Build JUST the phonon target STATIC and with the DYNAMIC CRT, and skip phonon_test (a
+#    CRT-fragile exe). Paths are relative to core/build — where you already are.
+#    BUILD_SHARED_LIBS=OFF is the whole switch: core/src/core/CMakeLists.txt already branches on
+#    it, so no upstream change is needed, and phonon.h serves both modes unchanged (IPLAPI is
+#    __declspec(dllexport) only while STEAMAUDIO_BUILDING_CORE is defined, so a consumer never
+#    sees a dllimport to fight).
+cmake -DSTEAMAUDIO_STATIC_RUNTIME=OFF -DBUILD_SHARED_LIBS=OFF windows-vs2022-x64
 cmake --build windows-vs2022-x64 --config Release --target phonon
 ```
 
@@ -160,17 +166,147 @@ cmake --build windows-vs2022-x64 --config Release --target phonon
 > but its deps' CMake (mysofa especially) ignore the runtime flag and build `/MD`. Mixing them gives
 > `unresolved external __imp_fgetc / __stdio_common_vsscanf`. Make **everything `/MD`**: `--sharedcrt`
 > on the deps **and** `-DSTEAMAUDIO_STATIC_RUNTIME=OFF` on phonon. `/MD` also matches our `bw_audio.dll`.
+>
+> Static linking makes that choice travel. An archive carries its CRT in every object, so a `/MDd`
+> Debug consumer gets one `LNK2038` per member rather than a warning. The root `CMakeLists.txt`
+> therefore pins the **release** dynamic CRT for every config of a with-SDK build. Your own
+> application's CRT is its own business: it reaches this engine across a C ABI, never by sharing
+> CRT objects.
 
-**Stage it** where `BWA_WITH_STEAMAUDIO` auto-detects it (mirroring the ASIO block):
+**Stage it** where CMake auto-detects it. The layout is platform-neutral: one shared `include/`,
+and one `lib/<platform>/` per platform, so a checkout can carry several at once and a cross-build
+picks its own. `<platform>` is the name the root `CMakeLists.txt` looks for (`BWA_PHONON_PLATFORMS`):
 
 ```
 third_party/steam-audio-artifacts/
-  include/   phonon.h, phonon_version.h        # from core/src/core/ + the generated build dir
-  lib/windows-x64/   phonon.lib, phonon.dll    # from build/windows-vs2022-x64/src/core/Release/
+  include/               phonon.h, phonon_version.h   # core/src/core/ + the generated build dir
+  lib/windows-x64/       phonon.lib  mysofa.lib  zlibstatic.lib  pffft.lib
+  lib/linux-x64/         libphonon.a libmysofa.a libz.a         libpffft.a
+  lib/osx-universal/     libphonon.a libmysofa.a libz.a         libpffft.a
+  lib/android-arm64/     libphonon.a libmysofa.a libz.a         libpffft.a
+  lib/android-x64/       libphonon.a libmysofa.a libz.a         libpffft.a
 ```
 
-A prebuilt **release** zip is the lighter alternative if the ambisonics fix isn't needed. Apache-2.0
-permits redistribution, so the built binaries are kept out of git (gitignored) for size only.
+Four archives, not one: phonon's own archive carries only its `core` and `hrtf` objects, so its
+three third-party dependencies link beside it. The set is the same on every platform, Android
+included. `osx-arm64` and `osx-x64` are accepted too, and
+`osx-universal` wins when more than one is staged. **All four must be present**: a `lib/<platform>/`
+that exists but is incomplete fails the configure rather than falling back to a no-SDK build. The
+commonest way to reach that is an artifacts directory left over from the old shared staging (a
+`phonon.lib` beside a `phonon.dll`); rebuild with `BUILD_SHARED_LIBS=OFF` and restage.
 
-CI runs this same recipe (`.github/workflows/ci.yml`, "Build phonon" step) and caches the staged
-artifacts on the submodule sha + patch hash. If you change the recipe here, change it there too.
+The Windows archives come from `build/windows-vs2022-x64/src/core/Release/` (phonon) and
+`core/deps/<dep>/lib/windows-x64/release/` (the three companions).
+
+Apache-2.0 permits redistribution, so the built binaries are kept out of git (gitignored) for size
+only.
+
+CI runs this same recipe through the composite action `.github/actions/build-phonon/` (inputs:
+`platform`, `arch`, `toolchain`, `stage-dir`, `fft`, `cmake-flags`) and caches the staged artifacts
+on the submodule sha + patch hash. If you change the recipe here, change it there too.
+
+**Other platforms.** The scripts support them and nothing downloads from Valve: every linked
+dependency is cloned from GitHub at a pinned sha and built locally. Linux and macOS are built in
+CI the same way Windows is, by the same composite action. Traps found so far.
+
+- **`-t` is Windows only.** Both pinned scripts declare `--toolchain` with the five `vs20xx`
+  spellings and nothing else, so `-t make` or `-t ndk` is an argparse *error*, not a no-op. Off
+  Windows the flag buys nothing anyway: `build.py` picks Unix Makefiles for Linux and Android and
+  Xcode for macOS from `-p` alone. The action passes `-t` only on the Windows branch.
+- **Linux.** `build.py` names its tree `linux-x64-release`, not `linux-x64`, because a single-config
+  generator appends the config, so locate the tree by its `CMakeCache.txt` rather than by name. And
+  the default `STEAMAUDIO_ENABLE_AVX=ON` adds `-fabi-version=6`, which breaks `<future>` while
+  compiling `hrtf.cpp`: `no matching function for call to std::__uniq_ptr_data<...>`. The bound is
+  the **compiler**, not the distribution. Compiling the `hrtf` target on one machine gave gcc 11.5
+  FAIL, gcc 13.3 FAIL, gcc 14.3 PASS, so libstdc++ 14 is the first that survives the flag. Runner
+  images ship gcc 13, so CI passes `-DSTEAMAUDIO_ENABLE_AVX=OFF` (the action's `cmake-flags`
+  input), at the cost of phonon's AVX paths. Drop the flag once the runner's default compiler is
+  gcc 14 or newer.
+
+  The Linux archives come from `core/build/linux-x64-release/src/core/` (phonon) and
+  `core/deps/<dep>/lib/linux-x64/release/` (the three companions). Build one yourself with:
+
+  ```sh
+  export CMAKE_POLICY_VERSION_MINIMUM=3.5
+  cd third_party/steam-audio-source/core/build
+  python get_dependencies.py --dependency flatbuffers -p linux -a x64
+  for d in zlib pffft mysofa; do python get_dependencies.py --dependency $d -p linux -a x64; done
+  python build.py -p linux -a x64 -c release --minimal -o generate
+  cmake -DSTEAMAUDIO_STATIC_RUNTIME=OFF -DBUILD_SHARED_LIBS=OFF \
+        -DSTEAMAUDIO_ENABLE_AVX=OFF linux-x64-release
+  cmake --build linux-x64-release --target phonon
+  ```
+
+  There is no CRT question here: `--sharedcrt` and `STEAMAUDIO_STATIC_RUNTIME` are MSVC ideas, and
+  the flag does nothing off Windows. What does travel is the **C++ runtime**: a static phonon makes
+  `libbw_audio.so` a C++ link (`LINKER_LANGUAGE CXX`), so it gains a `libstdc++.so.6` dependency it
+  did not have. Build phonon with the same compiler family as the engine.
+- **macOS.** `build.py -p osx` generates ONE tree named `osx` with the Xcode generator (no config
+  suffix, because Xcode is multi-config). `core/CMakeLists.txt` sets
+  `CMAKE_OSX_ARCHITECTURES "x86_64;arm64"` for every macOS build and `get_dependencies.py` passes
+  the same pair to the three companions, so the archives are **universal** whichever Mac builds
+  them. That is why the stage dir is `osx-universal` rather than `osx-arm64`. The AVX flag is a
+  Linux-only branch in `core/CMakeLists.txt`, so Apple clang never needs it. **Untested outside
+  CI:** nobody here has a Mac, and the CI job is the first thing to run it.
+- **Android.** One phonon per ABI, both built in CI. The scripts need `ANDROID_NDK` set and pick
+  the toolchain file from `-a` (`toolchain_android_armv8.cmake` for `arm64`,
+  `toolchain_android_x64.cmake` for `x64`). Those files use CMake's own Android support rather than
+  the NDK's `android.toolchain.cmake`, so `CMAKE_ANDROID_NDK_TOOLCHAIN_HOST_TAG` is the variable
+  that names the host, and `ANDROID_STL` plays no part. The build targets android-21, which every
+  consumer of ours (android-26) links against without trouble.
+
+  Two more patches apply here, both android-only, and the composite action applies every
+  `patches/phonon-android-*.patch` when the platform is `android`. Each patch file states its own
+  reasoning:
+
+  - `phonon-android-deps-platform-alias.patch`, needed on **every** host. The scripts build the
+    64-bit ARM target as `android-armv8` but `dependencies.json` keys its flag layers on
+    `android-arm64`, and only the dependency *selection* knew the two names mean one target. Every
+    flag layer for arm64 was dropped, so pffft built with no `-march` at all and FFTS, if you turn
+    it on, does not compile.
+  - `phonon-android-host-sysroot.patch`, needed on a **Linux or macOS** host. The scripts spell the
+    NDK host tag `windows-x86_64` in six places: the libc++ include directory in
+    `core/CMakeLists.txt` and five `make` paths across the two scripts. The patch derives the tag
+    instead. Verified on a Windows host, where the derived tag is the literal it replaces; the
+    Linux-host path it exists for runs in CI.
+
+  **pffft, not FFTS.** Upstream can link FFTS on Android, and `get_dependencies.py` will build it,
+  but `STEAMAUDIO_ENABLE_FFTS` defaults OFF and phonon falls through to pffft on Android the same
+  as everywhere else. Leave it there: `dependencies.json` builds FFTS for arm64 with NEON **off**
+  and its JIT disabled, while pffft gets `-march=armv8-a` and NEON on. Turning FFTS on also costs a
+  third patch, because its dead cache-flush path calls `__clear_cache(long, long)` against an NDK
+  header that declares `__clear_cache(void*, void*)`, which clang 18 (NDK r27) rejects.
+
+  Android archives come from `core/build/android-<arch>-release/src/core/` (phonon) and
+  `core/deps/<dep>/lib/android-<armv8|x64>/release/` (the three companions). Build one yourself,
+  from a Windows host here, with:
+
+  ```sh
+  export ANDROID_NDK="$LOCALAPPDATA/Android/Sdk/ndk/27.3.13750724"
+  export CMAKE_POLICY_VERSION_MINIMUM=3.5
+  git -C third_party/steam-audio-source apply ../patches/phonon-android-deps-platform-alias.patch
+  git -C third_party/steam-audio-source apply ../patches/phonon-android-host-sysroot.patch
+  cd third_party/steam-audio-source/core/build
+  # flatbuffers is a TOOL dependency: the script reads "tool": true and builds it for the HOST
+  # whatever -p says, so it needs no separate host invocation. It still wants a valid -t, and
+  # a target of android still requires the NDK path, which is why both travel here.
+  python get_dependencies.py --dependency flatbuffers -p android -a arm64 -t vs2022
+  for d in zlib pffft mysofa; do
+    python get_dependencies.py --dependency $d -p android -a arm64 -t vs2022
+  done
+  python build.py -p android -a arm64 -t vs2022 -c release --minimal -o generate
+  cmake -DSTEAMAUDIO_STATIC_RUNTIME=OFF -DBUILD_SHARED_LIBS=OFF android-arm64-release
+  cmake --build android-arm64-release --target phonon
+  ```
+
+  Repeat with `-a x64` for the emulator ABI, staging into `lib/android-x64`. Measured on one
+  16-core desktop: about 2 minutes 20 seconds for phonon per ABI, plus about 2 minutes for the
+  one-time flatbuffers host build and 45 seconds for the three companions. `libphonon.a` is about
+  30 MB per ABI, which is debug information more than code: it takes `libbw_audio.so` from 0.4 MB
+  stripped to 7.0 MB.
+
+  Two things the engine link needs on Android, both wired in the root `CMakeLists.txt`. phonon's
+  logger calls `__android_log_print`, so the system `log` library goes on the end of the archive
+  list. And phonon's Android build sets no `-fvisibility=hidden` of its own, so
+  `-Wl,--exclude-libs,ALL` keeps its 3000-odd symbols out of the library's dynamic symbol table and
+  leaves the 171 `bwa_*` exports alone.

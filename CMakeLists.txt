@@ -25,6 +25,8 @@ set(CMAKE_C_STANDARD_REQUIRED ON)
 # the null and manual sinks, which is what the Linux and macOS CI jobs run. See docs/backends.md.
 if(WIN32)
   message(STATUS "bw_audio: Windows - ASIO and WASAPI backends available")
+elseif(ANDROID)
+  message(STATUS "bw_audio: Android (API ${ANDROID_PLATFORM_LEVEL}, ${ANDROID_ABI}) - AAudio backend available")
 elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux")
   message(STATUS "bw_audio: Linux - JACK and ALSA backends available")
 else()
@@ -83,6 +85,110 @@ if(WIN32)
   set(BWA_OS_SRC src/os_win.c)
 else()
   set(BWA_OS_SRC src/os_posix.c)
+endif()
+
+# ---- Steam Audio (phonon) detection ----
+# Detection only, and it runs HERE rather than beside the wiring below because it decides the whole
+# tree's C runtime (see the CRT note at the end of this block) and a target reads that at creation.
+# The wiring - sources, include dirs, link, BWA_HAVE_STEAMAUDIO - is further down, with the other
+# backends. Apache-2.0 (GPLv3-compatible). Auto-enabled when the built phonon SDK is vendored at
+# third_party/steam-audio-artifacts/ (third_party/README.md).
+set(STEAMAUDIO_DIR "${CMAKE_SOURCE_DIR}/third_party/steam-audio-artifacts" CACHE PATH "Steam Audio (phonon) SDK root")
+# phonon is linked STATICALLY (third_party/README.md): no phonon.dll, no libphonon.so, nothing to
+# ship beside the engine. phonon.h serves both link modes unchanged, because IPLAPI expands to
+# __declspec(dllexport) only while STEAMAUDIO_BUILDING_CORE is defined and to nothing for a consumer.
+#
+# Detection is keyed on the PLATFORM's lib dir plus the full static archive set, so the staged tree
+# is platform-neutral: include/ is shared, lib/<platform>/ holds one archive set per platform, and a
+# checkout can carry several at once. phonon's own archive holds only its core + hrtf objects, so its
+# three third-party deps link beside it. Today only windows-x64 is built; the other names below are
+# the contract the Linux, macOS and Android phonon builds stage into (docs/backends.md), not a claim
+# that they exist. A platform with no lib dir staged is a no-SDK build, which is fully viable.
+if(ANDROID)
+  if(ANDROID_ABI STREQUAL "arm64-v8a")
+    set(BWA_PHONON_PLATFORMS android-arm64)
+  elseif(ANDROID_ABI STREQUAL "x86_64")
+    set(BWA_PHONON_PLATFORMS android-x64)
+  elseif(ANDROID_ABI STREQUAL "armeabi-v7a")
+    set(BWA_PHONON_PLATFORMS android-armv7)
+  else()
+    set(BWA_PHONON_PLATFORMS "")
+  endif()
+elseif(WIN32)
+  set(BWA_PHONON_PLATFORMS windows-x64)
+elseif(APPLE)
+  set(BWA_PHONON_PLATFORMS osx-universal osx-arm64 osx-x64)   # first one staged wins
+elseif(UNIX)
+  set(BWA_PHONON_PLATFORMS linux-x64)
+else()
+  set(BWA_PHONON_PLATFORMS "")
+endif()
+
+set(BWA_PHONON_PLATFORM "")
+foreach(bwa_plat IN LISTS BWA_PHONON_PLATFORMS)
+  if(IS_DIRECTORY "${STEAMAUDIO_DIR}/lib/${bwa_plat}")
+    set(BWA_PHONON_PLATFORM "${bwa_plat}")
+    break()
+  endif()
+endforeach()
+
+set(BWA_PHONON_LIBS "")
+if(BWA_PHONON_PLATFORM)
+  set(BWA_PHONON_LIBDIR "${STEAMAUDIO_DIR}/lib/${BWA_PHONON_PLATFORM}")
+  # The archive set, in the platform's own spelling. Android builds pffft like every other platform:
+  # upstream can link FFTS there instead, but only behind a non-default flag and with NEON off.
+  if(BWA_PHONON_PLATFORM MATCHES "^windows")
+    set(bwa_phonon_names phonon.lib mysofa.lib zlibstatic.lib pffft.lib)
+  else()
+    set(bwa_phonon_names libphonon.a libmysofa.a libz.a libpffft.a)
+  endif()
+  set(bwa_phonon_missing "")
+  foreach(bwa_name IN LISTS bwa_phonon_names)
+    if(EXISTS "${BWA_PHONON_LIBDIR}/${bwa_name}")
+      list(APPEND BWA_PHONON_LIBS "${BWA_PHONON_LIBDIR}/${bwa_name}")
+    else()
+      list(APPEND bwa_phonon_missing "${bwa_name}")
+    endif()
+  endforeach()
+  if(NOT EXISTS "${STEAMAUDIO_DIR}/include/phonon.h")
+    list(APPEND bwa_phonon_missing "../../include/phonon.h")
+  endif()
+  # Android only: phonon's own logger calls __android_log_print, which lives in the system liblog.
+  # A SHARED phonon resolved that for itself; a static one hands the reference to whoever links it,
+  # so it goes on the end of the archive list and every consumer of BWA_PHONON_LIBS gets it.
+  if(ANDROID AND BWA_PHONON_LIBS)
+    list(APPEND BWA_PHONON_LIBS log)
+  endif()
+  # A staged tree that is PRESENT but incomplete is a configuration error, never a quiet fall to the
+  # no-SDK build: the commonest way to reach it is an artifacts dir left over from the old SHARED
+  # staging (phonon.lib beside a phonon.dll), and silently dropping the HRTF decode, occlusion,
+  # reflections and pathing out of that build is the worst possible way to find out.
+  if(bwa_phonon_missing)
+    string(REPLACE ";" " " bwa_phonon_missing_str "${bwa_phonon_missing}")
+    message(FATAL_ERROR
+      "Steam Audio staging at ${BWA_PHONON_LIBDIR} is INCOMPLETE: missing ${bwa_phonon_missing_str}. "
+      "phonon is linked statically now, so lib/<platform>/ must hold the phonon archive plus its "
+      "three companions (mysofa, zlib, pffft). A directory "
+      "holding phonon.lib beside a phonon.dll is the OLD SHARED layout: rebuild phonon with "
+      "BUILD_SHARED_LIBS=OFF and restage it, or delete ${STEAMAUDIO_DIR} for a no-SDK build. "
+      "Recipe and layout: third_party/README.md, section \"Steam Audio\".")
+  endif()
+endif()
+
+# The staged phonon is built RELEASE and /MD (third_party/README.md's CRT note), and a STATIC
+# archive CARRIES that choice where the old import library did not: a /MDd Debug consumer gets one
+# LNK2038 per archive member, not a warning. So when phonon is linked the whole tree uses the
+# release dynamic CRT in EVERY config. A Debug build keeps /Od, /Zi, /RTC1 and full symbols; what
+# it gives up is the debug CRT's own heap and iterator checks, which cost little here (the engine
+# is C and carries no STL of its own) and which -DBWA_ASAN=ON covers properly. Downstream is
+# unaffected: a consumer's /MDd application loading this DLL was always a two-CRT arrangement,
+# exactly as it was when phonon was its own /MD DLL beside it.
+#
+# CACHE, so godot-cpp's own "if not already cached" set in bindings/godot defers to this one and
+# the whole tree, extension included, agrees on one CRT.
+if(MSVC AND BWA_PHONON_LIBS)
+  set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreadedDLL" CACHE STRING
+      "Select the MSVC runtime library for use by compilers targeting the MSVC ABI." FORCE)
 endif()
 
 # ---- shared core (everything except the public ABI shim and the device sinks) ----
@@ -178,6 +284,34 @@ if(NOT WIN32)
   # CRT carries those while glibc splits them into libm. A client of the shared library that calls
   # sinf needs the same line, so it belongs in the link interface rather than in each example.
   target_link_libraries(bw_audio INTERFACE m)
+endif()
+
+# Dead-code strip, on the linkers whose spelling this is (GNU ld and lld: Linux and Android). Every
+# function and data item gets its own section so the linker can drop what no exported symbol
+# reaches - which is most of the library, since -fvisibility=hidden already says the bwa_* ABI is
+# the whole root set. Measured on Linux with a static phonon linked in: 7,214,352 stripped bytes
+# down to 7,066,008, for no build-time cost worth naming. MSVC gets the same effect from /OPT:REF,
+# which it applies to a release link by itself; Apple's ld64 spells it -dead_strip and no Mac was
+# available to verify that, so it stays off there rather than going in unmeasured.
+#
+# LTO was measured beside this and NOT taken: 7,066,008 stripped bytes down to 7,033,208, which is
+# 0.46 percent. phonon's archive is the bulk of the library and its objects are not LTO objects, so
+# the plugin only ever sees our own - not worth changing the codegen of a real-time DSP library
+# for, unprofiled.
+#
+# The obvious next question - phonon builds with only -fPIC -g -fvisibility=hidden, so the strip
+# above can only reach OUR objects - was measured too, and also NOT taken. Rebuilding phonon with
+# -ffunction-sections -fdata-sections (confirmed present in all 112 of its compile commands) took
+# 7,066,008 stripped bytes to 6,988,184: 77,824 bytes, 1.1 percent, with the suite still 38/38. The
+# reason it is so small is that a static archive already contributes only the MEMBERS something
+# references, so the coarse pass had happened before the linker ever looked at a section, and what
+# is left of phonon is reached through its factories and vtables. Against that, adopting it would
+# have to thread a space-bearing -DCMAKE_C_FLAGS through the composite action's word-split
+# cmake-flags input and bump every phonon cache key, since no key covers the flags.
+if(UNIX AND NOT APPLE)
+  target_compile_options(bwa_core PRIVATE -ffunction-sections -fdata-sections)
+  target_compile_options(bw_audio PRIVATE -ffunction-sections -fdata-sections)
+  target_link_options(bw_audio PRIVATE -Wl,--gc-sections)
 endif()
 
 if(BWA_TRACY)
@@ -307,48 +441,98 @@ else()
   message(STATUS "bw_audio: ALSA backend disabled (Linux only)")
 endif()
 
+# ---- AAudio backend (Android: headphones on a standalone VR headset) ----
+# No SDK to vendor and no license line to add: libaaudio is part of the Android system image and
+# the NDK ships its stub, so this is ON wherever it can build and cannot be forced on elsewhere.
+# ANDROID_PLATFORM 26 or later, which is AAudio's own floor.
+option(BWA_WITH_AAUDIO "Build the AAudio backend (Android only)" ON)
+if(BWA_WITH_AAUDIO AND ANDROID)
+  if(ANDROID_PLATFORM_LEVEL AND ANDROID_PLATFORM_LEVEL LESS 26)
+    message(FATAL_ERROR "BWA_WITH_AAUDIO=ON needs ANDROID_PLATFORM android-26 or later "
+                        "(AAudio arrived in Android 8.0); got ${ANDROID_PLATFORM}")
+  endif()
+  target_sources(bw_audio PRIVATE src/aaudio_sink.c)
+  target_compile_definitions(bw_audio PRIVATE BWA_HAVE_AAUDIO)
+  target_link_libraries(bw_audio PRIVATE aaudio)
+  message(STATUS "bw_audio: AAudio backend ENABLED")
+else()
+  set(BWA_WITH_AAUDIO OFF)
+  message(STATUS "bw_audio: AAudio backend disabled (Android only)")
+endif()
+
 # ---- optional Steam Audio backend (production binaural HRTF decode; later occlusion/reflections) ----
-# Apache-2.0 (GPLv3-compatible). Auto-enabled when the prebuilt phonon SDK is vendored at
-# third_party/steam-audio-artifacts/ (third_party/README.md). Stage 1 of the production monitor (the SH encode
-# in src/ambisonics.c) is always built + tested; stage 2 (the ambisonics->binaural HRTF decode, gated
-# BWA_HAVE_STEAMAUDIO) supersedes the first-cut pan in binaural.c and lands with the SDK, on-SDK-verified.
-set(STEAMAUDIO_DIR "${CMAKE_SOURCE_DIR}/third_party/steam-audio-artifacts" CACHE PATH "Steam Audio (phonon) SDK root")
-# The staged tree only ever holds lib/windows-x64. A checkout WITH that artifact configured on
-# Linux would otherwise "find" the SDK from phonon.h alone and then fail at link, so the import
-# library has to be there too. Building phonon for the other platforms is its own follow-up
-# (docs/backends.md); until then a non-Windows build is a no-SDK build, which is fully viable.
-set(BWA_PHONON_LIB "${STEAMAUDIO_DIR}/lib/windows-x64/phonon.lib")
-if(WIN32 AND EXISTS "${STEAMAUDIO_DIR}/include/phonon.h" AND EXISTS "${BWA_PHONON_LIB}")
+# The WIRING half. Detection ran near the top of this file, where it had to, so everything below
+# reads BWA_PHONON_LIBS rather than touching the staged tree again. Stage 1 of the production
+# monitor (the SH encode in src/ambisonics.c) is always built + tested; stage 2 (the
+# ambisonics->binaural HRTF decode, gated BWA_HAVE_STEAMAUDIO) supersedes the first-cut pan in
+# binaural.c and lands with the SDK, on-SDK-verified.
+if(BWA_PHONON_LIBS)
   set(BWA_STEAMAUDIO_FOUND TRUE)   # consumed by the with-SDK reflection test below
   target_sources(bw_audio PRIVATE src/steam_decode.c src/steam_scene.c src/steam_reflect.c src/steam_path.c)  # HRTF decode + occlusion + reflections + pathing (with-SDK)
   if(MSVC)   # steam_reflect.c uses C11 <stdatomic.h> (the IR-publish seqlock), like rt.c
     set_source_files_properties(src/steam_reflect.c PROPERTIES COMPILE_OPTIONS /experimental:c11atomics)
   endif()
   target_include_directories(bw_audio PRIVATE "${STEAMAUDIO_DIR}/include")
-  target_link_libraries(bw_audio PRIVATE "${STEAMAUDIO_DIR}/lib/windows-x64/phonon.lib")
+  target_link_libraries(bw_audio PRIVATE ${BWA_PHONON_LIBS})
   target_compile_definitions(bw_audio PRIVATE BWA_HAVE_STEAMAUDIO)
-  if(WIN32)
-    add_custom_command(TARGET bw_audio POST_BUILD
-      COMMAND ${CMAKE_COMMAND} -E copy_if_different
-              "${STEAMAUDIO_DIR}/lib/windows-x64/phonon.dll" $<TARGET_FILE_DIR:bw_audio>)   # runtime dep
+  # A static phonon is C++ and this library is mostly C. On Windows the C++ sinks already force the
+  # C++ link driver, but a platform that builds none of them would pick the C one and leave every
+  # std:: symbol in the archive unresolved, so say it here rather than let it depend on the backend.
+  #
+  # enable_language FIRST, and this is not defensive: project() declares LANGUAGES C, and the only
+  # other enable_language(CXX) calls sit under ASIO, WASAPI and the GUI tools, all Windows. Ask for
+  # a CXX link driver that the project never enabled and CMake does not error - it emits an EMPTY
+  # link rule, so ninja reports "Linking CXX shared library libbw_audio.so", exits 0, and writes no
+  # file at all. Every test still built (they link bwa_core's objects, not the library) and the
+  # first thing that noticed was an example failing to start.
+  enable_language(CXX)
+  set_target_properties(bw_audio PROPERTIES LINKER_LANGUAGE CXX)
+  if(UNIX AND NOT APPLE)   # GNU ld and lld: Linux and Android
+    # phonon's Android build sets no -fvisibility=hidden of its own, so every ipl::, flatbuffers::
+    # and libc++ symbol in the archive would land in this library's dynamic symbol table: about 3000
+    # exports beside our 173, and a name a second .so in the same app could bind to by accident.
+    # --exclude-libs is the NDK's own answer - it makes the symbols a STATIC archive contributes
+    # local. Our own objects are not in an archive, so the bwa_* exports are untouched.
+    #
+    # LINUX NEEDS IT TOO, and -fvisibility=hidden is not the answer there either: phonon's Linux
+    # build DOES set it, but IPLAPI is __attribute__((visibility("default"))) while
+    # STEAMAUDIO_BUILDING_CORE is defined, so the archive deliberately marks all 216 ipl* entry
+    # points exported. Measured on libbw_audio.so: 561 dynamic symbols without the flag, 173 (the
+    # bwa_* ABI, exactly) with it.
+    target_link_options(bw_audio PRIVATE -Wl,--exclude-libs,ALL)
   endif()
-  message(STATUS "bw_audio: Steam Audio ENABLED (${STEAMAUDIO_DIR}); binaural uses the HRTF decode")
+  if(MSVC)
+    # phonon's objects carry /GL, so the consuming link runs whole-program codegen and the linker
+    # drops incremental linking anyway - with an LNK4075 per target unless we say so first.
+    target_link_options(bw_audio PRIVATE /INCREMENTAL:NO)
+  endif()
+  message(STATUS "bw_audio: Steam Audio ENABLED (${STEAMAUDIO_DIR}, static, ${BWA_PHONON_PLATFORM}); binaural uses the HRTF decode")
 else()
   message(STATUS "bw_audio: Steam Audio disabled (no SDK at ${STEAMAUDIO_DIR}); binaural uses the first-cut pan")
 endif()
 
-# ---- stage runtime DLLs into the Unity package (bindings/unity/Runtime/Plugins/x86_64) ----
+# ---- stage runtime libraries into the Unity package (bindings/unity/Runtime/Plugins/<abi>) ----
 # Gitignored build artifacts; the UPM package picks them up so it "just works" after a build.
+# Unity keys a native plugin by its FOLDER as well as by the import settings in its .meta, so the
+# two ABIs land in two folders: x86_64 for the Windows editor and standalone player, Android/
+# arm64-v8a for a headset build. A x86_64 Android build stages nothing - the package ships one
+# Android ABI, which is the one every current standalone headset runs.
 if(WIN32)
   set(BWA_UNITY_PLUGINS "${CMAKE_SOURCE_DIR}/bindings/unity/Runtime/Plugins/x86_64")
   if(EXISTS "${BWA_UNITY_PLUGINS}")
     add_custom_command(TARGET bw_audio POST_BUILD
       COMMAND ${CMAKE_COMMAND} -E copy_if_different $<TARGET_FILE:bw_audio> "${BWA_UNITY_PLUGINS}")
-    if(BWA_STEAMAUDIO_FOUND)
-      add_custom_command(TARGET bw_audio POST_BUILD
-        COMMAND ${CMAKE_COMMAND} -E copy_if_different
-                "${STEAMAUDIO_DIR}/lib/windows-x64/phonon.dll" "${BWA_UNITY_PLUGINS}")
-    endif()
+  endif()
+elseif(ANDROID AND ANDROID_ABI STREQUAL "arm64-v8a")
+  # One library, whatever the SDK state: phonon is linked statically, so an Android phonon build
+  # lands INSIDE libbw_audio.so and stages nothing of its own. (This is where a PHONON HOOK used to
+  # sit, for the shared libphonon.so that a static link makes moot.)
+  set(BWA_UNITY_PLUGINS_ANDROID
+      "${CMAKE_SOURCE_DIR}/bindings/unity/Runtime/Plugins/Android/arm64-v8a")
+  if(EXISTS "${BWA_UNITY_PLUGINS_ANDROID}")
+    add_custom_command(TARGET bw_audio POST_BUILD
+      COMMAND ${CMAKE_COMMAND} -E copy_if_different
+              $<TARGET_FILE:bw_audio> "${BWA_UNITY_PLUGINS_ANDROID}")
   endif()
 endif()
 
@@ -373,20 +557,21 @@ function(bwa_copy_runtime_dll target)
   endif()
 endfunction()
 
-# Build one with-SDK Steam Audio test: link phonon + bwa_core, define BWA_HAVE_STEAMAUDIO, stage
-# phonon.dll next to the .exe, and register the ctest. steam_reflect.c's /experimental:c11atomics is
-# already set once in the SDK block above — source properties are directory-scoped, so it covers every
-# target here that compiles it.
+# Build one with-SDK Steam Audio test: link the phonon archive set + bwa_core, define
+# BWA_HAVE_STEAMAUDIO, and register the ctest. Nothing is staged next to the .exe: phonon is static.
+# steam_reflect.c's /experimental:c11atomics is already set once in the SDK block above — source
+# properties are directory-scoped, so it covers every target here that compiles it.
 # Usage: bwa_add_steam_test(<target> <ctest-name> <source>...)
 function(bwa_add_steam_test target test_name)
   add_executable(${target} ${ARGN})
   target_include_directories(${target} PRIVATE src "${STEAMAUDIO_DIR}/include")
-  target_link_libraries(${target} PRIVATE bwa_core "${STEAMAUDIO_DIR}/lib/windows-x64/phonon.lib")
+  target_link_libraries(${target} PRIVATE bwa_core ${BWA_PHONON_LIBS})
   target_compile_definitions(${target} PRIVATE BWA_HAVE_STEAMAUDIO)
-  if(WIN32)
-    add_custom_command(TARGET ${target} POST_BUILD
-      COMMAND ${CMAKE_COMMAND} -E copy_if_different
-              "${STEAMAUDIO_DIR}/lib/windows-x64/phonon.dll" $<TARGET_FILE_DIR:${target}>)
+  # These tests are pure C and the phonon archive is C++: without the C++ link driver every std::
+  # symbol in the archive goes unresolved.
+  set_target_properties(${target} PROPERTIES LINKER_LANGUAGE CXX)
+  if(MSVC)
+    target_link_options(${target} PRIVATE /INCREMENTAL:NO)   # /GL in the archive; see bw_audio above
   endif()
   add_test(NAME ${test_name} COMMAND ${target})
 endfunction()
@@ -503,6 +688,11 @@ if(BWA_BUILD_TESTS)
     target_sources(test_audio_sink PRIVATE src/alsa_sink.c)
     target_compile_definitions(test_audio_sink PRIVATE BWA_HAVE_ALSA)
     target_link_libraries(test_audio_sink PRIVATE ALSA::ALSA)
+  endif()
+  if(BWA_WITH_AAUDIO)
+    target_sources(test_audio_sink PRIVATE src/aaudio_sink.c)
+    target_compile_definitions(test_audio_sink PRIVATE BWA_HAVE_AAUDIO)
+    target_link_libraries(test_audio_sink PRIVATE aaudio)
   endif()
   if(MSVC)   # the stall hook is a C11 atomic
     set_source_files_properties(test/audio_sink_test.c PROPERTIES COMPILE_OPTIONS /experimental:c11atomics)
@@ -835,6 +1025,13 @@ if(BWA_BUILD_GODOT)
   # Save it here and put it back immediately AFTER the subdirectory, not around the fetch inside
   # bindings/godot/CMakeLists.txt: bwa_gdextension is declared after that fetch and has to keep
   # godot-cpp's choice, or the shipped GDExtension mismatches the static godot-cpp it links.
+  #
+  # A build tree whose cache still holds godot-cpp's /MT entry from BEFORE this dance existed hits
+  # the mismatch at the top of the file instead, where nothing here can save it: every target is
+  # created /MT, and the static phonon (built /MD, third_party/README.md's CRT note) then fails
+  # with one LNK2038 per archive member. A static archive CARRIES its CRT choice, where the old
+  # import library did not, so what used to link silently is now a wall of errors. The fix is to
+  # drop the stale entry: cmake -U CMAKE_MSVC_RUNTIME_LIBRARY -S . -B <tree>, or reconfigure clean.
   if(DEFINED CMAKE_MSVC_RUNTIME_LIBRARY)
     set(BWA_MSVC_RUNTIME_SAVED "${CMAKE_MSVC_RUNTIME_LIBRARY}")
   else()

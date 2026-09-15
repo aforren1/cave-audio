@@ -45,6 +45,9 @@ uint32_t sink_device_count(bwa_sink_type backend) {
 #ifdef BWA_HAVE_ALSA
     case BWA_SINK_ALSA:   return sink_alsa_device_count();
 #endif
+#ifdef BWA_HAVE_AAUDIO
+    case BWA_SINK_AAUDIO: return sink_aaudio_device_count();
+#endif
     default: return 0;   /* AUTO/NULL/MANUAL have no devices; so does a backend not built in */
     }
 }
@@ -63,6 +66,9 @@ bool sink_device_name(bwa_sink_type backend, uint32_t index, char* buf, uint32_t
 #endif
 #ifdef BWA_HAVE_ALSA
     case BWA_SINK_ALSA:   return sink_alsa_device_name(index, buf, cap);
+#endif
+#ifdef BWA_HAVE_AAUDIO
+    case BWA_SINK_AAUDIO: return sink_aaudio_device_name(index, buf, cap);
 #endif
     default: (void)index; return false;
     }
@@ -86,6 +92,9 @@ bool sink_device_id(bwa_sink_type backend, uint32_t index, char* buf, uint32_t c
 #ifdef BWA_HAVE_ALSA
     case BWA_SINK_ALSA:   return sink_alsa_device_id(index, buf, cap);
 #endif
+#ifdef BWA_HAVE_AAUDIO
+    case BWA_SINK_AAUDIO: return sink_aaudio_device_id(index, buf, cap);
+#endif
     default: (void)index; return false;
     }
 }
@@ -106,6 +115,9 @@ static bool backend_compiled(bwa_sink_type t) {
 #endif
 #ifdef BWA_HAVE_ALSA
     case BWA_SINK_ALSA:   return true;
+#endif
+#ifdef BWA_HAVE_AAUDIO
+    case BWA_SINK_AAUDIO: return true;
 #endif
     default: return false;
     }
@@ -153,6 +165,11 @@ static bwa_sink* try_backend(bwa_sink_type backend, uint32_t sample_rate, uint32
     case BWA_SINK_ALSA:
         return bwa_alsa_sink_open(sample_rate, block_size, channels, device, flags, exact_rate,
                                   render, user, msg, msgcap);
+#endif
+#ifdef BWA_HAVE_AAUDIO
+    case BWA_SINK_AAUDIO:
+        return bwa_aaudio_sink_open(sample_rate, block_size, channels, device, flags, exact_rate,
+                                    render, user, msg, msgcap);
 #endif
     default:
         break;

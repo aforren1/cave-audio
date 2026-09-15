@@ -21,13 +21,23 @@
 # GODOTCPP_TARGET is a build-WIDE choice in godot-cpp, so each flavour needs its own configure tree.
 # That is why this script exists at all rather than being one cmake invocation.
 #
+# A THIRD library ships beside those two: android arm64-v8a template_release, what a standalone
+# headset export loads. It is a cross-build, so it needs the NDK rather than MSVC. This script
+# builds it when an NDK is on the machine, takes it from -AndroidFrom when one is handed over (that
+# is how CI passes the android job's output into the Windows pack), and FAILS when it has neither -
+# the manifest promises the file, and an addon that ships the promise without the file fails at
+# load on a headset.
+#
 #   powershell -File tools/godot/pack.ps1 [-Version 0.3.0] [-OutDir dist/godot]
+#                                         [-AndroidFrom <dir with the two android .so files>]
 #
 # The GIT TAG is the single source of truth for the version, as with the Unity package.
 [CmdletBinding()]
 param(
     [string] $Version,                 # optional: stamp this version (e.g. from a v0.3.0 tag)
     [string] $OutDir,                  # default: <repo>/dist/godot
+    [string] $AndroidFrom,             # directory holding the PREBUILT Android arm64 pair (CI hands
+                                       # this over from the android job); default: build it here
     [switch] $SkipBuild                # reuse existing build trees (local iteration)
 )
 $ErrorActionPreference = 'Stop'
@@ -71,6 +81,86 @@ if (-not $SkipBuild) {
     }
 }
 
+# ---- the Android arm64 library ---------------------------------------------------------------
+# Two files, both named by the manifest: the extension itself and the engine library it imports.
+# They end up in addons/bw_audio/bin/ exactly like the Windows pair, so the manifest-driven staging
+# below needs no special case for them.
+$addonBin = Join-Path $addon 'bin'
+New-Item -ItemType Directory -Force -Path $addonBin | Out-Null
+$androidPair = @('libbw_audio_gd.android.template_release.arm64.so', 'libbw_audio.so')
+
+if ($AndroidFrom) {
+    $src = (Resolve-Path $AndroidFrom).Path
+    Write-Host "==> taking the android arm64 library from $src"
+    foreach ($f in $androidPair) {
+        $p = Join-Path $src $f
+        if (-not (Test-Path $p)) { throw "-AndroidFrom '$src' has no $f" }
+        Copy-Item $p $addonBin -Force
+    }
+} elseif (-not $SkipBuild) {
+    # The NDK, looked up the same way tools/android/run-tests.ps1 does it.
+    $sdk = $env:ANDROID_HOME
+    if (-not $sdk) { $sdk = $env:ANDROID_SDK_ROOT }
+    if (-not $sdk -and $env:LOCALAPPDATA) { $sdk = Join-Path $env:LOCALAPPDATA 'Android\Sdk' }
+    $ndk = $env:ANDROID_NDK_HOME
+    if (-not $ndk) { $ndk = $env:ANDROID_NDK_ROOT }
+    if (-not $ndk -and $sdk -and (Test-Path (Join-Path $sdk 'ndk'))) {
+        $newest = Get-ChildItem (Join-Path $sdk 'ndk') -Directory |
+                  Sort-Object Name -Descending | Select-Object -First 1
+        if ($newest) { $ndk = $newest.FullName }
+    }
+    if (-not $ndk -or -not (Test-Path (Join-Path $ndk 'build/cmake/android.toolchain.cmake'))) {
+        throw ("No Android NDK, and no -AndroidFrom. The addon's manifest names an android arm64 " +
+               "library, so packing without one would ship an addon that fails to load on a headset. " +
+               "Either set ANDROID_NDK_HOME (see docs/build.md, 'Android') or pass -AndroidFrom " +
+               "<dir holding $($androidPair -join ' + ')>, which is what CI does with the android job's artifact.")
+    }
+    # The NDK ships no generator; the SDK's cmake package brings a ninja, and one on PATH does too.
+    $ninja = $null
+    if ($sdk -and (Test-Path (Join-Path $sdk 'cmake'))) {
+        $ninja = Get-ChildItem (Join-Path $sdk 'cmake') -Directory | Sort-Object Name -Descending |
+                 ForEach-Object { Join-Path $_.FullName 'bin/ninja.exe' } |
+                 Where-Object { Test-Path $_ } | Select-Object -First 1
+    }
+    if (-not $ninja) {
+        $onPath = Get-Command ninja -ErrorAction SilentlyContinue
+        if ($onPath) { $ninja = $onPath.Source }
+    }
+    if (-not $ninja) { throw "No ninja for the android build: sdkmanager --install 'cmake;3.31.6', or put one on PATH" }
+
+    $tree = Join-Path $repo 'build-android-godot'
+    Write-Host "==> configuring android arm64-v8a (template_release)"
+    & cmake -S $repo -B $tree -G Ninja "-DCMAKE_MAKE_PROGRAM=$ninja" `
+        "-DCMAKE_TOOLCHAIN_FILE=$ndk/build/cmake/android.toolchain.cmake" `
+        -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=android-26 -DANDROID_STL=c++_static `
+        -DCMAKE_BUILD_TYPE=RelWithDebInfo -DBWA_BUILD_GODOT=ON -DGODOTCPP_TARGET=template_release
+    if ($LASTEXITCODE -ne 0) { throw 'configure failed for android arm64-v8a' }
+    Write-Host "==> building android arm64-v8a"
+    & cmake --build $tree --target bwa_gdextension      # its POST_BUILD copies libbw_audio.so along
+    if ($LASTEXITCODE -ne 0) { throw 'build failed for android arm64-v8a' }
+
+    # Strip the debug info out of the two files this addon SHIPS. The Windows pair already ships
+    # without its (a .pdb the addon does not carry), and an APK pays for every byte it holds: this
+    # is 11 MB down to 1.9 for the extension and 20.7 down to 7.0 for the engine, which carries a
+    # static phonon (it was 2.5 down to 0.4 before Android had one). A missing
+    # llvm-strip is a warning, not a failure - a fat library still loads. CI hands over binaries it
+    # has already stripped, so the -AndroidFrom path above needs none of this.
+    $strip = Get-ChildItem (Join-Path $ndk 'toolchains/llvm/prebuilt') -Directory -ErrorAction SilentlyContinue |
+             ForEach-Object { Join-Path $_.FullName 'bin/llvm-strip.exe' } |
+             Where-Object { Test-Path $_ } | Select-Object -First 1
+    if ($strip) {
+        foreach ($f in $androidPair) { & $strip --strip-debug (Join-Path $addonBin $f) }
+        if ($LASTEXITCODE -ne 0) { throw 'llvm-strip failed on the android libraries' }
+    } else {
+        Write-Warning "no llvm-strip in the NDK: shipping the android libraries with their debug info (large, but valid)."
+    }
+}
+foreach ($f in $androidPair) {
+    if (-not (Test-Path (Join-Path $addonBin $f))) {
+        throw "missing $f in addons/bw_audio/bin - build the android flavour (drop -SkipBuild) or pass -AndroidFrom"
+    }
+}
+
 # ---- stage ----------------------------------------------------------------------------------
 # Kept after packing, not cleaned up: tools/dist/publish-branch.ps1 pushes this exact tree to the
 # `godot` branch, where its root becomes addons/bw_audio/ - which is what the Asset Library needs,
@@ -99,7 +189,10 @@ foreach ($line in $manifest) {
     }
 }
 if ($want.Count -eq 0) { throw "no libraries found in bw_audio.gdextension - is the manifest intact?" }
-$want.Add('bw_audio.dll')      # not in [libraries]: the OS resolves it as an import of the extension
+# Not in [libraries]: the loader resolves the engine library as an import of the extension. Both
+# spellings, because the addon carries both platforms' binaries.
+$want.Add('bw_audio.dll')
+$want.Add('libbw_audio.so')
 
 foreach ($f in $want) {
     $p = Join-Path $binsrc $f
@@ -107,27 +200,8 @@ foreach ($f in $want) {
     Copy-Item $p (Join-Path $dest 'bin')
 }
 Write-Host "verified $($want.Count) binaries against the manifest"
-# phonon.dll only exists in a Steam Audio build. Its ABSENCE is legitimate (the no-SDK build is
-# supported: ISM + FDN + manual occlusion), so warn rather than fail - but say which addon this is,
-# because "no HRTF monitor" is otherwise a confusing thing to discover later.
-$phonon = Join-Path $binsrc 'phonon.dll'
-if (Test-Path $phonon) {
-    Copy-Item $phonon (Join-Path $dest 'bin')
-} else {
-    Write-Warning "phonon.dll not present: packing a NO-SDK addon (no HRTF monitor, no ray-traced occlusion/reflections/pathing)."
-    # The manifest's [dependencies] promises phonon.dll unconditionally (the SDK build is the
-    # normal one). A no-SDK pack must not ship that promise: the store requires listed files
-    # to be present, and Godot's exporter would fail on the missing entry. Strip the phonon
-    # lines from the STAGED copy - comma first, so the remaining dictionary stays parseable.
-    $mf = Join-Path $dest 'bw_audio.gdextension'
-    $text = [IO.File]::ReadAllText($mf)
-    $text = [regex]::Replace($text, ',\s*"res://addons/bw_audio/bin/phonon\.dll":\s*""', '')
-    # Guard on FUNCTIONAL references (res:// paths) only - the manifest's comments also say
-    # "phonon.dll" while explaining why it is listed, and prose is not a promise to load.
-    if ($text -match '"res://[^"]*phonon\.dll"') { throw "failed to strip phonon.dll from the staged manifest" }
-    [IO.File]::WriteAllText($mf, $text)
-    Write-Host "stripped phonon.dll from the staged manifest's [dependencies]"
-}
+# Phonon is linked statically into the engine library since 2026-09-15, so a Steam Audio build and a
+# no-SDK build stage exactly the same files and the manifest needs no [dependencies] surgery.
 
 # The playground ships WITH the addon: it lives inside addons/bw_audio/ precisely so it can
 # (its res:// paths work unchanged in any project), and it is the consumer demo - open
@@ -171,7 +245,9 @@ to silent visual-only mode without an ASIO device).
 
 Requires Godot 4.7 or newer: compatibility_minimum in the manifest now matches the 4.7
 extension API the binary is compiled against (earlier packs understated it as 4.4). The
-extension is Windows x64 only, because the engine's device path is ASIO.
+extension ships for Windows x64 (the desktop, where the engine's device path is ASIO) and
+for Android arm64-v8a (a standalone headset, stereo out through AAudio). The Android
+libraries are a NO-SDK build: no Steam Audio there yet, so binaural is the fallback pan.
 
 Licensed GPLv3 (see LICENSE). Complete corresponding source: this repo at the commit above.
 "@ | Set-Content -Path (Join-Path $dest 'DIST.txt') -Encoding ascii

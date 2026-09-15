@@ -53,11 +53,21 @@ target_compile_features(bwa_gdextension PRIVATE cxx_std_17)
 get_target_property(GODOTCPP_SUFFIX godot-cpp GODOTCPP_SUFFIX)
 
 set(BWA_GODOT_BIN "${CMAKE_CURRENT_SOURCE_DIR}/addons/bw_audio/bin")
+# The file name PREFIX is platform policy, not taste. Windows takes none (the manifest names
+# bw_audio_gd.windows...dll). Android REQUIRES "lib": an APK's lib/<abi>/ directory only extracts
+# files matching lib*.so, so a prefix-less extension installs and then cannot be dlopen'd - it is
+# not on disk at all. CMake's own default off Windows is "lib", so this only has to undo the
+# Windows setting. godot-cpp's own example manifest names its Android library the same way.
+if(WIN32)
+  set(BWA_GODOT_PREFIX "")
+else()
+  set(BWA_GODOT_PREFIX "lib")
+endif()
 set_target_properties(bwa_gdextension PROPERTIES
   CXX_EXTENSIONS OFF
   CXX_VISIBILITY_PRESET ${GODOTCPP_SYMBOL_VISIBILITY}
   POSITION_INDEPENDENT_CODE ON
-  PREFIX ""
+  PREFIX "${BWA_GODOT_PREFIX}"
   OUTPUT_NAME "bw_audio_gd${GODOTCPP_SUFFIX}"
   # The generator expression keeps MSVC from appending a per-config subdirectory — the
   # .gdextension manifest names one fixed path.
@@ -65,17 +75,12 @@ set_target_properties(bwa_gdextension PROPERTIES
   RUNTIME_OUTPUT_DIRECTORY "$<1:${BWA_GODOT_BIN}>"
   PDB_OUTPUT_DIRECTORY     "$<1:${BWA_GODOT_BIN}>")
 
-# bw_audio.dll (and phonon.dll, when the Steam Audio build is on) must sit beside the
-# extension: Godot loads the extension by absolute path, and Windows resolves its imports
-# from that directory.
+# bw_audio.dll must sit beside the extension: Godot loads the extension by absolute path, and
+# Windows resolves its imports from that directory. It is the only library to stage - Steam Audio
+# links statically into it, so a with-SDK build copies exactly what a no-SDK build copies.
 add_custom_command(TARGET bwa_gdextension POST_BUILD
   COMMAND ${CMAKE_COMMAND} -E copy_if_different
           $<TARGET_FILE:bw_audio> ${BWA_GODOT_BIN})
-if(BWA_STEAMAUDIO_FOUND AND WIN32)
-  add_custom_command(TARGET bwa_gdextension POST_BUILD
-    COMMAND ${CMAKE_COMMAND} -E copy_if_different
-            "${STEAMAUDIO_DIR}/lib/windows-x64/phonon.dll" ${BWA_GODOT_BIN})
-endif()
 
 # The coordinate seam is pure float math in src/bwa_room.h with no godot-cpp dependency,
 # so its property test builds and runs without the editor or the generated bindings.

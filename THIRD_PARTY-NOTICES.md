@@ -16,9 +16,11 @@ binaries.
   domain (Unlicense) or MIT No Attribution.
 - **cJSON** — MIT (text below). Copyright (c) 2009-2017 Dave Gamble and cJSON
   contributors.
-- **Steam Audio (`phonon.dll`)** — Apache License 2.0, Copyright Valve
-  Corporation. Ships alongside `bw_audio.dll` in with-SDK builds, including the
-  CI artifact; keep the two DLLs together.
+- **Steam Audio (phonon)** — Apache License 2.0, Copyright Valve Corporation.
+  Statically linked into `bw_audio.dll` in with-SDK builds, including the CI
+  artifact, together with the mysofa, zlib and pffft archives it links. Its
+  source, at the pinned commit and with the one patch this repo applies, ships as
+  `bw_audio-steam-audio-src-<tag>.zip` on each GitHub Release.
   License: https://github.com/ValveSoftware/steam-audio/blob/master/LICENSE.md
 
 ## In the tools (`bwa_playground`, `bwa_layout_tool`, `bwa_calib_view`)

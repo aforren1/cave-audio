@@ -15,11 +15,16 @@ for an experiment that wants a raw card clock or a rig driving a multichannel ca
 `BWA_SINK_AUTO` a Linux box tries JACK, then ALSA, then the null sink, at any channel count. See
 [Linux notes](#linux-notes) below.
 
+**Android has one device backend**, AAudio (`src/aaudio_sink.c`), which is the headphone path on
+a standalone VR headset. It is stereo only: Android carries no array transport, so a request wider
+than two channels falls to the offline sink. The library cross-builds with the NDK against API 26
+or later. See [Android](#android) below.
+
 **macOS builds the library, the tests and the console examples** with clang, on the **null and
 manual sinks**. That is the whole platform surface there for now: there is no device backend, so
 nothing reaches a speaker. What it buys is the offline path (`bwa_render_block` renders
 bit-identically anywhere), a place to run ThreadSanitizer, and a CI gate that catches a Win32 call
-sneaking back into the core. CoreAudio and AAudio are specified, not implemented, in
+sneaking back into the core. CoreAudio is specified, not implemented, in
 [backends.md](./backends.md). Keep each backend's assumptions confined to its own `*_sink` file.
 
 Everything platform-specific OUTSIDE the sinks goes through one shim, `src/os.h`, with
@@ -84,6 +89,7 @@ Everything beyond the DLL + test suite is opt-in; the default build stays lean.
 | `BWA_WITH_WASAPI` | ON | the WASAPI backend (headphone profiles, the `cave_both` monitor). Windows only, and forced OFF elsewhere. Needs no SDK: the headers ship with the Windows SDK, and it links `ole32` + `avrt` |
 | `BWA_WITH_JACK` | ON | the JACK backend. Linux only, and forced OFF elsewhere. Needs `pkg-config jack` to succeed (`libjack-jackd2-dev`, or pipewire-jack's development package); it turns itself off with a status line when that fails |
 | `BWA_WITH_ALSA` | ON | the ALSA backend. Linux only, and forced OFF elsewhere. Needs `find_package(ALSA)` to succeed (`libasound2-dev`); same self-disabling behavior |
+| `BWA_WITH_AAUDIO` | ON | the AAudio backend. Android only, and forced OFF elsewhere. Needs no SDK: the header ships with the NDK and it links `aaudio`. Fails the configure when `ANDROID_PLATFORM` is under `android-26`, which is AAudio's own floor |
 | `BWA_BUILD_PLAYGROUND` | OFF | `bwa_playground` + `bwa_layout_tool` (fetches raylib/rlImGui/imgui/test-engine) |
 | `BWA_BUILD_CALIBVIEW` | OFF | `bwa_calib_view` (fetches imgui/test-engine/implot/implot3d) |
 | `BWA_BUILD_CALIBRATE` | OFF | `bwa_calibrate` + `bwa_zylia_probe` |
@@ -93,7 +99,19 @@ Everything beyond the DLL + test suite is opt-in; the default build stays lean.
 | `BWA_BUILD_BENCH` | OFF | the profiling benches (`bwa_profile_bench` + `bwa_bench_situations`). See [profiling.md](./profiling.md) |
 
 Steam Audio has no option: CMake auto-enables it when the built phonon SDK sits at
-`third_party/steam-audio-artifacts/` (see `third_party/README.md`).
+`third_party/steam-audio-artifacts/` (see `third_party/README.md`). It is linked **statically**, as
+four archives under `lib/<platform>/`: phonon itself plus its three companions (mysofa, zlib and
+pffft). Nothing ships beside the engine library. If the directory for your platform is there but
+incomplete, the configure fails and says so, because silently dropping the HRTF decode, occlusion,
+reflections and pathing out of a build is the worst way to learn the staging is stale.
+
+CI builds and stages phonon for **Windows**, **Linux**, **macOS** and **Android** (one per ABI),
+each job into its own
+`lib/<platform>/` and under its own cache key. A checkout can carry several sets at once, and the
+detection picks the one for the platform you are configuring. The Android recipe is in
+`third_party/README.md`, including the two android-only patches it applies. The Linux recipe is there too, including
+the one flag it takes (`-DSTEAMAUDIO_ENABLE_AVX=OFF` on gcc 13 and older). The macOS build runs
+**only in CI**, because nobody here has a Mac to verify it on.
 
 ### Building without Steam Audio
 
@@ -124,6 +142,7 @@ What the SDK adds, and what you lose without it:
 | cJSON v1.7.19  | layout + calibration JSON                    | MIT; FetchContent, pinned                |
 | libjack        | the Linux JACK backend                       | LGPL-2.1, dynamically linked; pipewire-jack's drop-in (MIT) answers the same ABI |
 | alsa-lib       | the Linux ALSA backend                       | LGPL-2.1, dynamically linked             |
+| libaaudio      | the Android AAudio backend                   | part of the Android system image; the NDK ships the stub to link against. No license line to add |
 | NatNet         | OptiTrack pose ingest                        | consume off-wire; see below              |
 
 Two dependencies live under `third_party/`: `asiosdk/`, and the Steam Audio pair
@@ -157,10 +176,17 @@ The imgui and imgui_test_engine tags track each other. Bump them together.
 Everything above, sorted by what it actually ends up in:
 
 - **`bw_audio.dll`** (the artifact CI distributes, under this repo's GPLv3) links four
-  third-party components: the ASIO SDK under its **GPLv3** option, Steam Audio's
-  `phonon.dll` (**Apache-2.0**, a separate DLL loaded at runtime), dr_libs (**public
-  domain / MIT-0**, your choice), and cJSON (**MIT**). All four are GPLv3-compatible,
-  so distributing the DLL under GPLv3 is consistent.
+  third-party components: the ASIO SDK under its **GPLv3** option, Steam Audio
+  (**Apache-2.0**, statically linked, so phonon and its mysofa, zlib and pffft archives
+  are inside this DLL), dr_libs (**public domain / MIT-0**, your choice), and cJSON
+  (**MIT**). All four are GPLv3-compatible, so distributing the DLL under GPLv3 is
+  consistent. Two of them ship their source beside the binaries rather than behind a
+  link: `bw_audio-asio-sdk-src-<tag>.zip` and `bw_audio-steam-audio-src-<tag>.zip`.
+  Apache-2.0 does not require the second one (Steam Audio ships no `NOTICE` file, so
+  section 4(d) never triggers, and the pinned commit plus the in-repo patch is a
+  complete recipe). It ships anyway, for parity: once phonon is inside the DLL rather
+  than beside it, GPLv3 section 6 governs the combined work, and handing a recipient
+  the source costs a release asset instead of an argument.
 - **The GUI tools** (`bwa_playground`, `bwa_layout_tool`, `bwa_calib_view`, opt-in builds)
   additionally compile in imgui, implot, implot3d (**MIT**), raylib, rlImGui
   (**zlib/libpng**), the Roboto face (**Apache-2.0**), imgui_test_engine (**its own
@@ -168,6 +194,15 @@ Everything above, sorted by what it actually ends up in:
   The tools ship in the CI artifact; the notices ride along in
   [`THIRD_PARTY-NOTICES.md`](../THIRD_PARTY-NOTICES.md) (repo root, copied into the
   artifact). Keep that file in sync when a pin bumps.
+- **`libbw_audio.so`** (Linux, Android) links the same dr_libs and cJSON, plus whichever system
+  audio libraries the platform has: libjack and alsa-lib on Linux (**LGPL-2.1** both, dynamically
+  linked), libaaudio on Android. None of the three is redistributed, and libaaudio is part of the
+  Android system image, so it adds no notice at all. No ASIO there: it is a Windows driver model.
+- **The Android artifact** (`bw_audio-android-<ver>`, the `lib/arm64-v8a` and `lib/x86_64`
+  libraries, and the copies inside the Unity package and the Godot addon) is that same
+  `libbw_audio.so`, so it carries dr_libs, cJSON and a statically linked Steam Audio (**Apache-2.0**,
+  the same obligation the Windows DLL carries). No ASIO: it is a Windows driver model. It travels with `LICENSE`,
+  `THIRD_PARTY-NOTICES.md` and a `DIST.txt` naming the commit, like every other artifact.
 - **Never linked**: the NatNet SDK. `third_party/NatNetSDK/` sits in the tree as a
   **protocol reference only** (it is proprietary: OptiTrack's plugin license); no
   target compiles or links it, and it must never be distributed with this repo.
@@ -246,7 +281,7 @@ on purpose:
 
 Prefer to tag by hand? `git tag v0.3.0` works; the helper's only extra service is the CHANGELOG roll.
 
-That job builds, tests, stamps the version, and cuts a **GitHub Release** with four assets. The
+That job builds, tests, stamps the version, and cuts a **GitHub Release** with five assets. The
 Release IS the distribution: no registry, no token. The asset breakdown and the GPLv3 corresponding
 source that rides along are in [Continuous integration](#continuous-integration) below.
 
@@ -267,14 +302,18 @@ older UPM parsers reject. When git cannot answer (no tag, shallow clone, no git 
 - **ASIO is built.** The workflow fetches the SDK from Steinberg's official URL
   (cached between runs). The configure step fails loudly unless the log says
   `ASIO backend ENABLED`: the artifact must contain the production device path.
-- **Steam Audio is built, and cached.** CI runs the phonon recipe from
+- **Steam Audio is built static, and cached.** The recipe from
   [`third_party/README.md`](../third_party/README.md) (patched submodule, minimal
-  core, `/MD`). It caches `third_party/steam-audio-artifacts/` keyed on the
-  submodule sha + the patch hash: the first run pays the phonon build, every later
-  run restores it. The five with-SDK tests (`reflect`/`bake`/`path`/`dynmesh`/`steam_decode`)
-  run, and binaural is the real HRTF decode. One CI-only tweak: the pinned phonon
-  build scripts hard-code the VS 2022 generator, so the workflow rewrites that to
-  whatever Visual Studio the runner image has (via `vswhere`).
+  core, `/MD`, `BUILD_SHARED_LIBS=OFF`) lives in the composite action
+  `.github/actions/build-phonon/`, which takes a platform, an arch, a toolchain and a
+  staging directory. All four jobs call it, the android job twice, once per ABI. CI caches
+  `third_party/steam-audio-artifacts/` keyed on the submodule sha + the patch hash, with
+  the platform and, on Android, the ABI in the key so no job restores another's archives (a cache
+  is scoped to the repository, not to the runner OS): the
+  first run pays the phonon build, every later run restores it. The five with-SDK tests
+  (`reflect`/`bake`/`path`/`dynmesh`/`steam_decode`) run, and binaural is the real HRTF
+  decode. One CI-only tweak: the pinned phonon build scripts hard-code the VS 2022
+  generator, so the action rewrites that to whatever Visual Studio the runner image has.
 - **Tests force the null sink (`bwa_desc.sink = BWA_SINK_NULL`).** Runners have no audio hardware; forcing the
   null sink keeps runs deterministic instead of relying on fallback. The three GUI
   test suites (`playground`/`layout_tool`/`calib_view`) are built but excluded from
@@ -282,7 +321,10 @@ older UPM parsers reject. When git cannot answer (no tag, shallow clone, no git 
   them locally.
 - **Two configs, x64 only.** RelWithDebInfo is the full build: tested, tools and
   all. Debug builds the engine (`bw_audio` + `bwa_minimal`) and smoke-runs it, for
-  downstream debugging against a debug CRT.
+  stepping through engine code unoptimized. It uses the **release** CRT, like every
+  other config in a with-SDK build: the staged phonon archive is built `/MD`, and a
+  static archive carries that choice. Your own application's CRT is unaffected, since
+  it only ever loads this DLL across a C ABI.
 - **The tools are built and shipped.** CI configures with `BWA_BUILD_PLAYGROUND`,
   `BWA_BUILD_CALIBVIEW`, and `BWA_BUILD_CALIBRATE`, so the artifact carries
   `bwa_playground`, `bwa_layout_tool`, `bwa_calib_view` (GUI; they need a display),
@@ -293,19 +335,31 @@ older UPM parsers reject. When git cannot answer (no tag, shallow clone, no git 
   own release asset, plus the `unity`/`godot` distribution branches
   (installable git refs; see `bindings/godot/README.md` and the workflow header).
 - **The artifact is a GPLv3 distribution.** Each run uploads `RelWithDebInfo/`
-  (engine + phonon + tools) and `Debug/` (engine + phonon) plus `bw_audio.h`, the
+  (engine + tools) and `Debug/` (engine) plus `bw_audio.h`, the
   example layout + `constraints.json`, `LICENSE`, `THIRD_PARTY-NOTICES.md`, a
   `DIST.txt` naming the commit, and `asio-sdk-src.zip` (the statically linked ASIO
   SDK source, so the GPLv3 corresponding source travels with the binary rather
   than living behind a fetch URL).
-- **`bw_audio.dll` needs `phonon.dll` beside it.** With-SDK builds (including the CI
-  artifact) link `phonon.lib`, so the DLL won't load without `phonon.dll` in the
-  same directory; keep the pair together. The CMake post-build step and the Unity
-  plugin staging both copy it for you. Only a no-SDK build is self-contained (with
-  the simple-pan binaural fallback and acoustics calls as no-ops).
-- **Two audiences, two artifacts.** Every run uploads them separately: the engine
-  (`bw_audio-win64-<ver>-r<N>`: dll/lib/pdb + phonon + tools + header) and the Unity package
-  (`unity-package-<ver>-r<N>`: one `.tgz`). `<ver>` is the packed version (the tag on a release,
+- **`bw_audio.dll` stands alone.** Steam Audio is linked statically, so a with-SDK build
+  and a no-SDK build ship the same one file and there is nothing to keep beside it. This
+  used to be the opposite rule (a `phonon.dll` the loader needed in the same directory),
+  so delete any stale copy you find next to an engine build: it is dead weight, and the
+  DLL never looks for it.
+- **Android is cross-built in its own job.** `android` on `ubuntu-latest` configures with the
+  runner's NDK (`ANDROID_NDK_ROOT`, the image's pinned default, with `ANDROID_NDK_LATEST_HOME` as
+  the fallback) for `arm64-v8a` and `x86_64` at `android-26`, asserts the configure log says
+  `AAudio backend ENABLED` and `Steam Audio ENABLED`, and builds the library, the examples and the
+  tests. It builds a static phonon per ABI first, through the same composite action, so that second
+  assertion is also what proves the staging survived. Nothing runs
+  there: the binaries are the device's, which is what `tools\android\run-tests.ps1` is for. The
+  job also builds the Godot GDExtension for `arm64-v8a` and hands both libraries to the Windows
+  job, which is the only place that packs the bindings. It uploads
+  `bw_audio-android-<ver>-r<N>`: `lib/arm64-v8a/libbw_audio.so`, `lib/x86_64/libbw_audio.so`,
+  `include/bw_audio.h`, `LICENSE`, `THIRD_PARTY-NOTICES.md`, and a `DIST.txt` naming the commit.
+- **Two audiences, three artifacts.** Every run uploads them separately: the engine
+  (`bw_audio-win64-<ver>-r<N>`: dll/lib/pdb + tools + header), the Unity package
+  (`unity-package-<ver>-r<N>`: one `.tgz`) and the Godot addon (`godot-addon-<ver>-r<N>`), plus
+  the Android artifact above. `<ver>` is the packed version (the tag on a release,
   a git-describe dev version otherwise); the `r<N>` run number keeps re-runs of one commit from
   colliding on a name. Downloading one no longer drags in the other.
 - **The Unity package is packed every run, and released on a tag.**
@@ -318,27 +372,38 @@ older UPM parsers reject. When git cannot answer (no tag, shallow clone, no git 
   stays `0.0.0-dev`), so a tarball can never claim a version it isn't. See
   [Releasing](#releasing).
 - **Two more jobs guard the port, and ship nothing.** `linux` on `ubuntu-latest` and `macos`
-  on `macos-latest` check out without submodules, configure with no SDKs, build RelWithDebInfo,
-  and run the whole ctest suite on the null and manual sinks. They exist to catch a Win32 call
-  sneaking back into the core, so they assert on the configure log (`null and manual sinks only`,
-  `Steam Audio disabled`) rather than trusting the build to fail on its own. They are cheap: a few
-  minutes each against the Windows job's phonon build. The macOS job is UNVERIFIED locally, since
-  no Mac was at hand: it is the first thing that will ever execute the shim's Apple paths.
-- **A release carries FOUR assets**, because workflow artifacts expire (30 days) and a
+  on `macos-latest` build phonon, configure, build RelWithDebInfo, and run the whole ctest suite
+  on the null and manual sinks: **38 tests**, the 33 a default off-Windows build registers plus the
+  five SDK-gated ones. They exist to catch a Win32 call sneaking back into the core, so they assert
+  on the configure log rather than trusting the build to fail on its own: `linux` wants
+  `JACK backend ENABLED` and `ALSA backend ENABLED`, `macos` wants `null and manual sinks only`,
+  and both want `Steam Audio ENABLED`. That last assertion is the one that matters after a cache
+  round trip, because a build that quietly lost its phonon staging still passes every test.
+  Neither job fetches ASIO, which is Windows-only. A cold run pays for the phonon build the way the
+  Windows job does; a warm one restores the archives and costs a few minutes. The macOS job is
+  UNVERIFIED locally in both halves, since no Mac was at hand: it is the first thing that will ever
+  execute either the shim's Apple paths or a macOS phonon build.
+- **A release carries SIX assets**, because workflow artifacts expire (30 days) and a
   release doesn't:
   - `com.brainworks.bw_audio-<ver>.tgz`: the Unity package.
   - `bw_audio-godot-<ver>.zip`: the installable Godot addon.
-  - `bw_audio-win64-<tag>.zip`: the engine itself (`bw_audio.dll`/`.lib`/`.pdb` +
-    `phonon.dll`, `bw_audio.h`, and the tools). This is the durable download for a C/C++
+  - `bw_audio-win64-<tag>.zip`: the engine itself (`bw_audio.dll`/`.lib`/`.pdb`,
+    `bw_audio.h`, and the tools). This is the durable download for a C/C++
     consumer or the CAVE machine.
+  - `bw_audio-android-<tag>.zip`: the Android engine, `libbw_audio.so` for `arm64-v8a` and
+    `x86_64` plus `bw_audio.h`. For a native consumer only: the Unity package and the Godot
+    addon already carry the `arm64-v8a` library.
   - `bw_audio-asio-sdk-src-<tag>.zip`: the ASIO SDK source statically linked into the DLL,
     kept as its own asset so it accompanies the binaries (GPLv3 corresponding source)
     without bloating either the engine `.zip` or the `.tgz`.
+  - `bw_audio-steam-audio-src-<tag>.zip`: the Steam Audio source statically linked into the
+    same DLL, at its pinned commit, with the in-repo patch and a README naming the commit.
+    Same reason as the asset above, applied to the other statically linked dependency.
 
   All ship under GPLv3 (the `.zip` carries `LICENSE`, `THIRD_PARTY-NOTICES.md`, and
   `DIST.txt`, which names the commit and links the complete source; the `.tgz` carries
-  the same inside it, and both point at the SDK-source asset for the one GPL-covered
-  component the repo fetches rather than vendors): an app that ships this DLL to third
+  the same inside it, and both point at the two source assets for the third-party code the
+  repo fetches rather than vendors): an app that ships this DLL to third
   parties inherits GPLv3; see the ASIO section.
 
   Two constraints worth knowing before changing any of this:
@@ -417,6 +482,143 @@ routes reach 26 speakers, and the sink sees an ordinary card either way:
 
 [backends.md](./backends.md) has the full statement, including the hardware questions that are
 still open.
+
+## Android
+
+Android is the standalone-headset path: a Meta Quest or Pico runs Android, and its audio is an
+AAudio stream. Nothing here is VR-specific. The headset supplies the pose through the ordinary
+listener API, and the array never comes near this build.
+
+### Prerequisites
+
+| piece | what and where |
+|-------|----------------|
+| JDK 17 | the command-line tools need one. `winget install EclipseAdoptium.Temurin.17.JDK` |
+| Android command-line tools | unzip `commandlinetools-win-*.zip` from `dl.google.com/android/repository` into `%LOCALAPPDATA%\Android\Sdk\cmdline-tools\latest` |
+| NDK r27 or later | `sdkmanager --install "ndk;27.3.13750724"`. Set `ANDROID_NDK_HOME` to it |
+| platform-tools | `sdkmanager --install platform-tools`, for `adb` |
+| ninja | the NDK ships no generator. `sdkmanager --install "cmake;3.31.6"` brings one, and any ninja on `PATH` does as well |
+| the emulator (optional) | `sdkmanager --install emulator "system-images;android-34;google_apis;x86_64"`, then `avdmanager create avd -n bwa_x86 -k "system-images;android-34;google_apis;x86_64"` |
+
+Set `ANDROID_HOME` to the SDK root. Accept the licenses once with `sdkmanager --licenses`.
+
+### The two ABIs
+
+Build `arm64-v8a` for a headset and `x86_64` for the emulator. Nothing in the engine is
+architecture-specific: the DSP is scalar C with no intrinsics, so ARM needs no port.
+
+```powershell
+$ninja = "$env:ANDROID_HOME\cmake\3.31.6\bin\ninja.exe"   # or any ninja on PATH
+cmake -S . -B build-android-arm64 -G Ninja `
+  "-DCMAKE_MAKE_PROGRAM=$ninja" `
+  "-DCMAKE_TOOLCHAIN_FILE=$env:ANDROID_NDK_HOME/build/cmake/android.toolchain.cmake" `
+  -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=android-26 -DANDROID_STL=c++_static `
+  -DCMAKE_BUILD_TYPE=RelWithDebInfo
+cmake --build build-android-arm64
+```
+
+`ANDROID_STL` is pinned rather than left to default. A static phonon is C++, so the library needs a
+libc++ from somewhere, and `c++_static` puts it inside `libbw_audio.so` so nothing ships beside the
+engine. That is safe here because the ABI is C: no C++ type, exception or allocation crosses the
+library boundary, which is the case where two static copies of libc++ in one process cause trouble.
+The NDK's own CMake toolchain already defaults this way. Gradle's does not, so a project that
+builds this engine through `externalNativeBuild` should say it there too. `readelf -d` on the
+result names `libm`, `libaaudio`, `liblog`, `libdl` and `libc`, and nothing else.
+
+`tools\android\run-tests.ps1` does all of that for you, the ninja included. The explicit form is
+here for a CI script or a build system that wants the flags.
+
+The build produces `libbw_audio.so` and the test executables. The GUI tools, the capture tools and
+the ASIO backend are all Windows-only targets and are skipped with a status line.
+
+**Steam Audio is linked in**, statically, once a phonon for that ABI is staged at
+`third_party/steam-audio-artifacts/lib/android-arm64` or `.../android-x64` (CI builds and caches
+both; `third_party/README.md` has the recipe and the two android-only patches it needs). The
+configure says `Steam Audio ENABLED ... android-arm64`, the binaural path is the real HRTF decode,
+and occlusion, pathing and the reflection bed all work. What an APK pays for it is size: the
+stripped arm64 library is about 7 MB rather than 0.4 MB. Without a staged phonon the build is a
+no-SDK one and still works; see
+[Building without Steam Audio](#building-without-steam-audio).
+
+### Running the tests on a device
+
+`ctest` cannot drive an Android target, so `tools\android\run-tests.ps1` does it: it builds (or takes
+a build directory), pushes `libbw_audio.so` and the test executables to `/data/local/tmp/bwa`, runs
+each under `adb` with `LD_LIBRARY_PATH` set, and returns the worst exit code. The ctest skip code 77
+maps through, so a device with no audio reports SKIPPED and never a pass.
+
+```powershell
+tools\android\run-tests.ps1                                     # build and run the whole suite
+tools\android\run-tests.ps1 -BuildDir build-android-x86_64 -Tests audio_sink -Verbose
+```
+
+Start the emulator headless first:
+
+```
+emulator -avd bwa_x86 -no-window -no-boot-anim -gpu swiftshader_indirect
+```
+
+Check that hardware acceleration is available with `emulator -accel-check` before anything else.
+On Windows that means the Windows Hypervisor Platform feature, which needs an administrator and a
+reboot to turn on. Without it the emulator runs interpreted and the audio timing is meaningless.
+
+### Packaging a binding for Android
+
+Both bindings ship the `arm64-v8a` library, which is the ABI every current standalone headset
+runs. Where it lands:
+
+| package | path | how it gets there |
+|---------|------|-------------------|
+| Unity   | `Runtime/Plugins/Android/arm64-v8a/libbw_audio.so` | an `arm64-v8a` build of this repo stages it (CMake `POST_BUILD`), or `tools\upm\pack.ps1 -AndroidFrom <dir>` takes one |
+| Godot   | `addons/bw_audio/bin/libbw_audio.so` plus `libbw_audio_gd.android.template_release.arm64.so` | `tools\godot\pack.ps1` builds the pair when an NDK is on the machine, or takes it with `-AndroidFrom <dir>` |
+
+Both packs FAIL when the library is missing rather than packing without it. A package whose
+Android plugin is absent installs, exports an APK, and throws on the headset, which is the latest
+possible place to find out.
+
+The Godot extension must be named `lib*.so`. An APK extracts only files matching that from its
+`lib/<abi>/` directory, so a prefix-less extension is not on disk at all at load time. The
+`.gdextension` manifest names `android.template_release.arm64` and points
+`android.template_debug.arm64` at the same file, exactly as the Windows entries do: godot-cpp's
+debug flavor differs only in its own internal checks, and a listed library that is not shipped is
+a load failure.
+
+`DllImport("bw_audio")` needs no change on Android. Mono maps that name to `libbw_audio.so`, the
+same way it maps it to `bw_audio.dll` on Windows.
+
+The packaged copies are stripped of their debug info, the standalone Android artifact keeps its.
+That is the split Windows already has, where the shipped DLL leaves its symbols in a `.pdb` the
+packages do not carry. It is 11 MB down to 1.9 for the Godot extension and 2.5 down to 0.4 for the
+engine library, on an APK that pays for every byte.
+
+Neither package ships phonon for Android, because no Android phonon is built yet. When one is,
+nothing in either package changes: phonon links statically, so it lands inside `libbw_audio.so`
+and stages no file of its own. Build it with `.github/actions/build-phonon/` and stage it at
+`third_party/steam-audio-artifacts/lib/android-arm64/`. See
+[Building without Steam Audio](#building-without-steam-audio) for what a no-SDK build loses.
+
+### What the emulator can and cannot tell you
+
+The emulator's audio HAL is a virtual device, so treat its timing as indicative only. Two
+measurements from runs on an API 34 `google_apis` x86_64 image:
+
+- The AAudio section of `test_audio_sink` passes: a 960-frame burst, a 1920-frame buffer, a
+  constant 256-frame render quantum through the adapter, and an injected stall that
+  `AAudioStream_getXRunCount` did report. The xrun path is therefore exercised, not assumed.
+- `test_os` is FLAKY here, and only on its two tightest timing bounds. Ten back-to-back runs on an
+  idle emulator passed six times: the `os_sleep_until_ns` median lateness straddles its 1.00 ms
+  bound at p50 0.89 to 1.11 ms (p99 2.31 to 2.72 ms, max 2.43 to 3.11 ms), and one run also tripped
+  "a past deadline returns at once", which allows 1 ms between two clock reads around a call that
+  does not wait at all. Every other assertion in that test passed every time. The `SCHED_FIFO`
+  request is refused, as Android refuses it for every app thread.
+
+  Read that as the virtual machine's scheduler rather than the shim: the primitive is
+  `clock_nanosleep(TIMER_ABSTIME)` either way, a Windows desk box measures 0.43 ms and WSL2
+  0.13 ms, and a bound that a real device has never been measured against should not be widened to
+  fit an emulator. A physical headset measurement is on the verify list in
+  [backends.md](./backends.md).
+
+The other 32 tests of the 33-test suite pass on the emulator, every run.
 
 ## Dante configuration
 
