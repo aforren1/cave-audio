@@ -135,7 +135,16 @@ runs:
 
         cd third_party/steam-audio-source/core/build
         # flatbuffers is a BUILD TOOL (flatc), so it never takes the CRT flag and never links in.
-        python get_dependencies.py --dependency flatbuffers -p "$BWA_PLATFORM" -a "$BWA_ARCH" $TOPT
+        # gcc 13 (ubuntu-latest) flags a false positive in flatbuffers 1.12's reflection.cpp
+        # (-Werror=stringop-overflow inside <bits/stl_algobase.h>), and flatbuffers builds itself
+        # with -Werror. Reproduced on gcc 13.3 and absent on gcc 14 and clang. Demote that one
+        # warning for the host tool only: the env var reaches flatbuffers' fresh configure and
+        # nothing else, so phonon and its companions keep their own flags.
+        if [ "$BWA_PLATFORM" = "windows" ]; then
+          python get_dependencies.py --dependency flatbuffers -p "$BWA_PLATFORM" -a "$BWA_ARCH" $TOPT
+        else
+          CXXFLAGS="${CXXFLAGS:-} -Wno-error=stringop-overflow"             python get_dependencies.py --dependency flatbuffers -p "$BWA_PLATFORM" -a "$BWA_ARCH" $TOPT
+        fi
         for d in zlib "$BWA_FFT" mysofa; do
           python get_dependencies.py --dependency "$d" $SHAREDCRT -p "$BWA_PLATFORM" -a "$BWA_ARCH" $TOPT
         done
