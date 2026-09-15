@@ -101,16 +101,29 @@ runs:
 
         git submodule update --init --depth 1 third_party/steam-audio-source \
           || git submodule update --init third_party/steam-audio-source
+        # One job may call this action more than once on one checkout (the android job builds two
+        # ABIs), and the second call finds the submodule already patched, where a plain `git apply`
+        # fails with "patch does not apply". So: apply when it applies, skip when it is already in,
+        # and fail only when it is neither.
+        apply_once() {
+          local rel="../patches/$(basename "$1")"
+          if git -C third_party/steam-audio-source apply --check "$rel" 2>/dev/null; then
+            git -C third_party/steam-audio-source apply "$rel"; echo "applied $(basename "$1")"
+          elif git -C third_party/steam-audio-source apply --reverse --check "$rel" 2>/dev/null; then
+            echo "already applied $(basename "$1")"
+          else
+            echo "patch $(basename "$1") neither applies nor is already applied"; exit 1
+          fi
+        }
         # REQUIRED for directional reflections (upstream steam-audio#546):
-        git -C third_party/steam-audio-source apply ../patches/phonon-multiplyaccumulate-align.patch
+        apply_once third_party/patches/phonon-multiplyaccumulate-align.patch
 
         if [ "$BWA_PLATFORM" = "android" ]; then
           # Android needs more of the pinned scripts fixed than any other platform: they were
           # written for a Windows host and for one spelling of the arm64 target. Each patch says
           # what it fixes; all of them are android-only, so no other platform applies them.
           for p in third_party/patches/phonon-android-*.patch; do
-            echo "applying $(basename "$p")"
-            git -C third_party/steam-audio-source apply "../patches/$(basename "$p")"
+            apply_once "$p"
           done
           # Both scripts read the NDK from here (get_dependencies.py's --ndk defaults to it), and
           # get_dependencies.py exits 1 without it. Fail on our own message rather than on theirs.

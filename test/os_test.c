@@ -337,12 +337,16 @@ static void pose_torn_section(void) {
 
 /* ---- events ------------------------------------------------------------------------------ */
 
-typedef struct { os_event* ev; unsigned delay_ms; _Atomic int fired; } Signaller;
+typedef struct { os_event* ev; unsigned delay_ms; _Atomic int fired; _Atomic uint64_t t_signal; } Signaller;
 
 static void signaller_body(void* user) {
     Signaller* g = (Signaller*)user;
     os_sleep_ms(g->delay_ms);
     atomic_store_explicit(&g->fired, 1, memory_order_release);
+    /* Stamp the SIGNAL, not the sleep: a waiter's latency is measured from here. On a coalescing
+     * VM (the macOS CI runner) os_sleep_ms(5) has taken 55 ms, which is the sleep's fault, not the
+     * event's, and a from-start bound blamed the wrong primitive. */
+    atomic_store_explicit(&g->t_signal, os_monotonic_ns(), memory_order_release);
     os_event_signal(g->ev);
 }
 
@@ -382,11 +386,16 @@ static void event_section(void) {
         CHECK(os_thread_create(&th, signaller_body, &g) == 0, "signaller thread started");
         const uint64_t t0 = os_monotonic_ns();
         const bool got = os_event_wait(&ev, 2000);
-        const double ms = (double)(os_monotonic_ns() - t0) / 1.0e6;
+        const uint64_t t1 = os_monotonic_ns();
         os_thread_join(&th);
-        printf("       a cross-thread signal after 5 ms woke the waiter at %.2f ms\n", ms);
+        const uint64_t ts = atomic_load_explicit(&g.t_signal, memory_order_acquire);
+        const double ms = (double)(t1 - t0) / 1.0e6;
+        const double latency_ms = (ts && t1 > ts) ? (double)(t1 - ts) / 1.0e6 : 0.0;
+        printf("       a cross-thread signal after a 5 ms sleep woke the waiter at %.2f ms; wake latency past the signal %.2f ms\n", ms, latency_ms);
         CHECK(got, "the waiter consumed the other thread signal");
-        CHECK(ms < 45.0, "the waiter woke on the signal, not on the timeout");
+        /* The bound is on the EVENT, signal to wake. The sleep before it belongs to the scheduler and
+         * is reported, not asserted; a wait that ran to its 2000 ms timeout shows as got == false. */
+        CHECK(latency_ms < 45.0, "the waiter woke on the signal, not on the timeout");
     }
 
     /* An infinite wait must be wakeable too, or every stop would deadlock its join. */
