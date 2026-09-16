@@ -36,10 +36,13 @@ SDK="${BWA_SDK_DIR:-engine-sdk}"
 # which every step below inherits.
 bash tools/phonon/cibw-before-all-linux.sh
 
+# sed -n 1p rather than head -1: under pipefail, head closing the pipe after one line hands
+# the writer SIGPIPE (exit 141) and that becomes the pipeline's status. ldd did exactly that
+# on the first run. sed reads to EOF, so nothing upstream is ever cut off.
 echo "== toolchain =="
-gcc --version | head -1
-cmake --version | head -1
-ldd --version | head -1
+gcc --version | sed -n 1p
+cmake --version | sed -n 1p
+ldd --version | sed -n 1p
 
 cmake -S . -B "$BUILD" -DCMAKE_BUILD_TYPE=RelWithDebInfo -DBWA_BUILD_TESTS=ON | tee configure.log
 # The same four assertions the runner build used to make. Each one guards a silent degradation:

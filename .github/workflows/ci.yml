@@ -1821,12 +1821,19 @@ jobs:
           test -s engine-sdk/include/bw_audio.h
           test -s engine-sdk/lib/cmake/bw_audio/bw_audioConfig.cmake
           cmp build/libbw_audio.dylib engine-sdk/lib/libbw_audio.dylib
-          # Both slices survived the install, and the deployment target is the one the release
-          # wheel declares. vtool prints LC_BUILD_VERSION per slice; otool -l is the fallback.
+          # Both slices survived the install, and each carries the deployment target the release
+          # wheel declares. Per slice, because the two slices spell it differently: for a target
+          # below 10.14 ld writes LC_VERSION_MIN_MACOSX ("version 10.13") into the x86_64 slice,
+          # LC_BUILD_VERSION only exists from 10.14 up, and clang floors arm64 macOS at 11.0, so
+          # that slice says "minos 11.0". The first run grepped one string across both and
+          # could not pass.
           lipo -info engine-sdk/lib/libbw_audio.dylib | grep -q x86_64
           lipo -info engine-sdk/lib/libbw_audio.dylib | grep -q arm64
-          otool -l engine-sdk/lib/libbw_audio.dylib | grep -A3 LC_BUILD_VERSION \
-            | grep -qE 'minos[[:space:]]+10\.13'
+          otool -arch x86_64 -l engine-sdk/lib/libbw_audio.dylib \
+            | grep -A3 -E 'LC_VERSION_MIN_MACOSX|LC_BUILD_VERSION' \
+            | grep -qE '(version|minos)[[:space:]]+10\.13'
+          otool -arch arm64 -l engine-sdk/lib/libbw_audio.dylib \
+            | grep -A3 LC_BUILD_VERSION | grep -qE 'minos[[:space:]]+11\.0'
 
       # ---- the Octave MEX, against the SDK ---------------------------------------------------------
       # Its own tree, in bindings-only mode. The MATLAB half joins it below, once matlab-actions has
