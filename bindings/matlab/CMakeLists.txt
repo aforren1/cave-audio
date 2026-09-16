@@ -50,6 +50,21 @@ if(Matlab_FOUND AND Matlab_MEX_COMPILER)
     # host's; the universal engine dylib beside it loads in either.
     set_target_properties(bwa_mex_matlab PROPERTIES BUILD_RPATH "@loader_path" INSTALL_RPATH "@loader_path"
                                                     OSX_ARCHITECTURES "${CMAKE_HOST_SYSTEM_PROCESSOR}")
+    # Drop MATLAB's C++ MEX export map. FindMatlab hands the linker BOTH maps on macOS whenever
+    # the install has the C++ API (R2018a and later), and cppMexFunction.map names the three C++
+    # entry points (mexCreateMexFunction, mexDestroyMexFunction, mexFunctionAdapter) that a C
+    # MEX never defines. FindMatlab papers over that with -Wl,-U for the three, which the
+    # classic ld64 honored; the Xcode 15+ linker treats every name in an -exported_symbols_list
+    # as a required definition and fails the link with "referenced from <initial-undefines>".
+    # The C map (c_exportsmexfileversion.map: mexFunction + mexfilerequiredapiversion) stays,
+    # and it is all this gateway exports. Editing the flag string is the only handle: FindMatlab
+    # offers no option to choose one map, and the property is a single string, not a list.
+    get_target_property(_bwa_mex_lf bwa_mex_matlab LINK_FLAGS)
+    if(_bwa_mex_lf)
+      string(REGEX REPLACE " -Wl,-exported_symbols_list,[^ ]*cppMexFunction\\.map" "" _bwa_mex_lf "${_bwa_mex_lf}")
+      string(REGEX REPLACE " -Wl,-U,_mex(Create|Destroy)MexFunction| -Wl,-U,_mexFunctionAdapter" "" _bwa_mex_lf "${_bwa_mex_lf}")
+      set_target_properties(bwa_mex_matlab PROPERTIES LINK_FLAGS "${_bwa_mex_lf}")
+    endif()
   endif()
   add_custom_command(TARGET bwa_mex_matlab POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E make_directory "${BWA_MATLAB_OUT}"
