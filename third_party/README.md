@@ -242,10 +242,15 @@ CI the same way Windows is, by the same composite action. Traps found so far.
   `libbw_audio.so` a C++ link (`LINKER_LANGUAGE CXX`), so it gains a `libstdc++.so.6` dependency it
   did not have. Build phonon with the same compiler family as the engine.
 - **macOS.** `build.py -p osx` generates ONE tree named `osx` with the Xcode generator (no config
-  suffix, because Xcode is multi-config). `core/CMakeLists.txt` sets
-  `CMAKE_OSX_ARCHITECTURES "x86_64;arm64"` for every macOS build and `get_dependencies.py` passes
-  the same pair to the three companions, so the archives are **universal** whichever Mac builds
-  them. That is why the stage dir is `osx-universal` rather than `osx-arm64`. The AVX flag is a
+  suffix, because Xcode is multi-config). `core/CMakeLists.txt` looks as if it makes every macOS
+  build universal, but its `set(CMAKE_OSX_ARCHITECTURES "x86_64;arm64")` comes after `project()`,
+  which CMake ignores for languages already enabled, so the core archive comes out host-arch only
+  (arm64 on a current Mac) while `get_dependencies.py`, which passes the pair on the command line,
+  builds the three companions universal. CI hit exactly that: an arm64-only `libphonon.a` beside
+  universal companions, and the engine's x86_64 link failed. The composite action therefore passes
+  `-DCMAKE_OSX_ARCHITECTURES=x86_64;arm64` on the phonon configure itself and checks every staged
+  archive with `lipo -info` for both slices. Do the same when building by hand. That is why the
+  stage dir is `osx-universal` rather than `osx-arm64`. The AVX flag is a
   Linux-only branch in `core/CMakeLists.txt`, so Apple clang never needs it. **Untested outside
   CI:** nobody here has a Mac, and the CI job is the first thing to run it.
 - **Android.** One phonon per ABI, both built in CI. The scripts need `ANDROID_NDK` set and pick

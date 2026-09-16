@@ -404,8 +404,10 @@ older UPM parsers reject. When git cannot answer (no tag, shallow clone, no git 
   `THIRD_PARTY-NOTICES.md`, `DIST.txt`) and `bw_audio-macos-universal-<ver>-r<N>` (the same tree
   with `lib/libbw_audio.dylib`), plus the fixed-name pack inputs `linux-pack-input` and
   `macos-pack-input` that the Windows job downloads. The macOS build is **universal**
-  (`CMAKE_OSX_ARCHITECTURES="x86_64;arm64"`, which phonon's own archives already are) and the job
-  fails on a `lipo -info` that does not show both architectures.
+  (`CMAKE_OSX_ARCHITECTURES="x86_64;arm64"`, and the composite action passes the same pair to
+  phonon's own configure, because phonon's CMake does not make itself universal despite appearing
+  to; see `third_party/README.md`) and both the action and the job fail on a `lipo -info` that
+  does not show both architectures.
 - **The Windows job waits for all three cross-builds.** `needs: [android, linux, macos]`, because
   it is the only place that packs the bindings and each package carries every platform's engine
   library. The three run in parallel, so the wait is the slowest of them.

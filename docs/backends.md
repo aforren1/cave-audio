@@ -1244,9 +1244,11 @@ Known, deliberately not done yet. Each names its trigger.
       `bwa_get_audio_backend` reports the `steam HRTF` suffix. What a static phonon adds to the
       link is `libstdc++.so.6`, which a no-SDK build does not carry.
 - [ ] Static phonon for macOS, which runs ONLY in CI. Nobody here has a Mac, so the job's
-      `stage-dir: osx-universal` was read off `core/CMakeLists.txt` (which pins
-      `CMAKE_OSX_ARCHITECTURES "x86_64;arm64"` for every macOS build) rather than measured, and
-      the Xcode generator's tree layout has never been staged from. The configure assertion
+      `stage-dir: osx-universal` was read off `core/CMakeLists.txt`, and that reading was WRONG:
+      its `set(CMAKE_OSX_ARCHITECTURES ...)` comes after `project()` and does nothing, so the first
+      CI run staged an arm64-only core archive and the universal engine link failed. The action
+      now passes the architectures itself and lipo-checks every archive. The Xcode generator's
+      tree layout is staged from by CI and nowhere else. The configure assertion
       (`Steam Audio ENABLED`) is what keeps a wrong guess loud instead of silently no-SDK.
 - [x] Static phonon for Android, on the emulator. Both ABIs built on a Windows host with the
       composite action's own steps and staged at `lib/android-arm64/` and `lib/android-x64/`, and

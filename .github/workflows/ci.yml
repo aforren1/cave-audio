@@ -1097,7 +1097,7 @@ jobs:
         uses: actions/cache@v5
         with:
           path: third_party/steam-audio-artifacts
-          key: phonon-osx-v1-${{ steps.phonon-key.outputs.sha }}-${{ hashFiles('third_party/patches/**') }}
+          key: phonon-osx-v2-${{ steps.phonon-key.outputs.sha }}-${{ hashFiles('third_party/patches/**') }}
 
       - name: Build phonon (cache miss only; recipe = third_party/README.md)
         if: steps.phonon.outputs.cache-hit != 'true'

@@ -180,7 +180,14 @@ runs:
         if [ -z "$TREE" ]; then TREE=$(dirname "$(find . -maxdepth 3 -name CMakeCache.txt | head -1)"); fi
         test -n "$TREE" && test -d "$TREE" || { echo "generated tree not found:"; ls; exit 1; }
         echo "phonon build tree: $TREE"
-        cmake -DSTEAMAUDIO_STATIC_RUNTIME=OFF -DBUILD_SHARED_LIBS=OFF $BWA_CMAKE_FLAGS "$TREE"
+        # macOS: phonon's core/CMakeLists.txt sets CMAKE_OSX_ARCHITECTURES with a plain set() AFTER
+        # project(), which CMake ignores for languages already enabled, so the core archive comes out
+        # host-arch only (arm64 on macos-latest) while its companions, which get the flag on the
+        # command line, come out universal. The engine links universal, so say it here, where it
+        # counts, and prove it below with lipo.
+        OSXARCH=""
+        if [ "$BWA_PLATFORM" = "osx" ]; then OSXARCH="-DCMAKE_OSX_ARCHITECTURES=x86_64;arm64"; fi
+        cmake -DSTEAMAUDIO_STATIC_RUNTIME=OFF -DBUILD_SHARED_LIBS=OFF $OSXARCH $BWA_CMAKE_FLAGS "$TREE"
         cmake --build "$TREE" --config Release --target phonon
         PHONON_TREE="$(cd "$TREE" && pwd)"
         cd ../../../..
@@ -222,3 +229,13 @@ runs:
         test -f "$BWA_ART/include/phonon_version.h"
         for n in $NAMES; do test -f "$BWA_ART/lib/$BWA_STAGE_DIR/$n"; done
         ls -l "$BWA_ART/lib/$BWA_STAGE_DIR"
+        # A universal stage must hold BOTH slices in EVERY archive, or the engine's x86_64 link
+        # fails with "found architecture 'arm64', required architecture 'x86_64'" far from here.
+        if [ "$BWA_PLATFORM" = "osx" ]; then
+          for n in $NAMES; do
+            f="$BWA_ART/lib/$BWA_STAGE_DIR/$n"
+            lipo -info "$f"
+            lipo -info "$f" | grep -q x86_64 || { echo "staging FAILED: $n has no x86_64 slice"; exit 1; }
+            lipo -info "$f" | grep -q arm64  || { echo "staging FAILED: $n has no arm64 slice"; exit 1; }
+          done
+        fi
