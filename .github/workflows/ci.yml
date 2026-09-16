@@ -85,12 +85,12 @@ jobs:
     needs: [android, linux, macos, wheels]
     timeout-minutes: 75   # the uncached phonon build is the long pole; cached runs are far under
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         # no submodules by default: steam-audio-source is fetched only on a phonon cache miss
 
       - name: Cache ASIO SDK
         id: asiosdk
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: third_party/asiosdk
           key: asiosdk-v1   # bump manually to pick up a new Steinberg release
@@ -115,7 +115,7 @@ jobs:
 
       - name: Cache phonon (built Steam Audio core)
         id: phonon
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: third_party/steam-audio-artifacts
           key: phonon-v1-${{ steps.phonon-key.outputs.sha }}-${{ hashFiles('third_party/patches/**') }}
@@ -177,7 +177,7 @@ jobs:
       # second MEX is a follow-up. An Octave user on Windows builds with mkoctfile
       # (bindings/matlab/README.md), and the linux job publishes the one Octave MEX that CI makes.
       - name: Set up MATLAB
-        uses: matlab-actions/setup-matlab@v2
+        uses: matlab-actions/setup-matlab@v3
         with:
           # Pinned, so a new MathWorks release cannot change overnight what this job tested.
           release: R2024b
@@ -201,7 +201,7 @@ jobs:
           test -s bindings/matlab/bin/matlab/win-x64/bw_audio.dll
 
       - name: Test the MATLAB binding
-        uses: matlab-actions/run-command@v2
+        uses: matlab-actions/run-command@v3
         with:
           # run-command fails the step on an uncaught error, so raising IS the failure signal.
           # run_tests returns 77 when no MEX was staged, which is a failure here: the step above
@@ -226,7 +226,7 @@ jobs:
       # display or GL, so the demo scenes and the playground self-test are ordinary CI.
       - name: Cache Godot editor
         id: godot-cache
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: godot-bin
           key: godot-${{ env.GODOT_VERSION }}
@@ -244,7 +244,7 @@ jobs:
           test -f "godot-bin/Godot_v${V}_win64.exe"
 
       - name: Cache godot-cpp build
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           # Both trees: godot-cpp generates and compiles ~2100 binding files per flavour, which
           # dwarfs our own nine. Keyed on the PINNED COMMIT, so bumping it invalidates cleanly;
@@ -272,19 +272,19 @@ jobs:
       # job staged them under a FIXED artifact name (versioned names are for the artifacts a human
       # downloads), so this step needs no version plumbing.
       - name: Download the Android libraries (built by the android job)
-        uses: actions/download-artifact@v6
+        uses: actions/download-artifact@v8
         with:
           name: android-pack-input
           path: pack-android
 
       - name: Download the Linux libraries (built by the linux job)
-        uses: actions/download-artifact@v6
+        uses: actions/download-artifact@v8
         with:
           name: linux-pack-input
           path: pack-linux
 
       - name: Download the macOS libraries (built by the macos job)
-        uses: actions/download-artifact@v6
+        uses: actions/download-artifact@v8
         with:
           name: macos-pack-input
           path: pack-macos
@@ -293,7 +293,7 @@ jobs:
       # the pack-linux/pack-macos wheels - those are the per-runner fast gate, tagged for the
       # runner's own glibc and architecture, and they stay artifacts.
       - name: Download the release wheels (built by the wheels job)
-        uses: actions/download-artifact@v6
+        uses: actions/download-artifact@v8
         with:
           pattern: release-wheel-*
           merge-multiple: true
@@ -495,7 +495,7 @@ jobs:
             Select-Object FullName, Length
 
       - name: Upload artifact (MATLAB toolbox, every platform)
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v7
         with:
           name: bw_audio-matlab-${{ steps.pack.outputs.version }}-r${{ github.run_number }}
           path: dist/matlab/bw_audio-matlab/
@@ -506,7 +506,7 @@ jobs:
       # Built here rather than in a job of its own, because a wheel carries the ENGINE LIBRARY
       # inside it and that library is this job's MSVC build. The wheel is tagged cp312-abi3, so one
       # file per platform serves Python 3.12 and every later version.
-      - uses: astral-sh/setup-uv@v6
+      - uses: astral-sh/setup-uv@v10.1.0
         with:
           enable-cache: true
 
@@ -539,7 +539,7 @@ jobs:
           .wheelenv/Scripts/python bindings/python/examples/live_onset.py --tests
 
       - name: Upload artifact (Python wheel)
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v7
         with:
           name: bw_audio-python-win64-${{ steps.pack.outputs.version }}-r${{ github.run_number }}
           path: dist/python/
@@ -549,7 +549,7 @@ jobs:
       # Two artifacts, not one bag: the engine (native consumers - the C ABI, the tools, the CAVE
       # machine) and the Unity package (a single .tgz). Downloading one no longer drags in the other.
       - name: Upload artifact (engine + tools)
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v7
         with:
           # version-r<run> : the git-describe/tag version, plus the run number so re-runs of one commit don't collide
           name: bw_audio-win64-${{ steps.pack.outputs.version }}-r${{ github.run_number }}
@@ -563,7 +563,7 @@ jobs:
           if-no-files-found: error
 
       - name: Upload artifact (Godot addon)
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v7
         with:
           name: godot-addon-${{ steps.packgd.outputs.version }}-r${{ github.run_number }}
           path: dist/godot/
@@ -571,7 +571,7 @@ jobs:
           if-no-files-found: error
 
       - name: Upload artifact (Unity package)
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v7
         with:
           name: unity-package-${{ steps.pack.outputs.version }}-r${{ github.run_number }}
           path: dist/unity/
@@ -904,7 +904,7 @@ jobs:
     outputs:
       version: ${{ steps.ver.outputs.version }}
     steps:
-      - uses: actions/checkout@v6      # no submodules: nothing here builds an SDK
+      - uses: actions/checkout@v7      # no submodules: nothing here builds an SDK
 
       - name: Version
         id: ver
@@ -960,7 +960,7 @@ jobs:
       # each other's archives.
       - name: Cache phonon (arm64-v8a)
         id: phonon-arm64
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: |
             third_party/steam-audio-artifacts/include
@@ -977,7 +977,7 @@ jobs:
 
       - name: Cache phonon (x86_64)
         id: phonon-x64
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: |
             third_party/steam-audio-artifacts/include
@@ -1016,7 +1016,7 @@ jobs:
           done
 
       - name: Cache godot-cpp build (android)
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           # Same reasoning as the Windows godot-cpp cache: ~2100 generated binding files dwarf our
           # nine sources. One flavour only here, because a headset runs no editor.
@@ -1095,7 +1095,7 @@ jobs:
           ls -l pack-android/godot pack-android/unity
 
       - name: Upload artifact (Android engine)
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v7
         with:
           name: bw_audio-android-${{ steps.ver.outputs.version }}-r${{ github.run_number }}
           path: dist-android/
@@ -1103,7 +1103,7 @@ jobs:
           if-no-files-found: error
 
       - name: Upload artifact (packing input for the windows job)
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v7
         with:
           name: android-pack-input
           path: pack-android/
@@ -1118,7 +1118,7 @@ jobs:
     outputs:
       version: ${{ steps.ver.outputs.version }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         # still no submodules by default: the composite action fetches steam-audio-source itself,
         # and only on a phonon cache miss
 
@@ -1158,7 +1158,7 @@ jobs:
 
       # The pinned build scripts are driven as `python`, not `python3`, and which of the two a
       # runner image happens to put on PATH is not a promise. Pin it.
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: '3.x'
 
@@ -1169,7 +1169,7 @@ jobs:
 
       - name: Cache phonon (built Steam Audio core)
         id: phonon
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: third_party/steam-audio-artifacts
           # Same key shape as the windows job, plus the PLATFORM. A cache is scoped to the
@@ -1241,7 +1241,7 @@ jobs:
       # already produced - JACK, ALSA and a static phonon intact - instead of a second engine built
       # somewhere else. The Octave MEX above came from the same tree for the same reason.
       - name: Set up MATLAB
-        uses: matlab-actions/setup-matlab@v2
+        uses: matlab-actions/setup-matlab@v3
         with:
           # Pinned, so a new MathWorks release cannot change overnight what this job tested.
           release: R2024b
@@ -1269,7 +1269,7 @@ jobs:
           readelf -d "$mex" | grep -E 'RUNPATH|RPATH' | grep -q 'ORIGIN'
 
       - name: Test the MATLAB binding
-        uses: matlab-actions/run-command@v2
+        uses: matlab-actions/run-command@v3
         with:
           # run-command fails the step on an uncaught error, so raising IS the failure signal.
           # run_tests returns 77 when no MEX was staged, which is a failure here: the step above
@@ -1297,7 +1297,7 @@ jobs:
           ls -l pack-linux/matlab
 
       - name: Upload artifact (MATLAB and Octave binding)
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v7
         with:
           name: bw_audio-matlab-linux-x64-${{ steps.ver.outputs.version }}-r${{ github.run_number }}
           # BOTH interpreters' MEX files with the engine library beside each, plus the package a
@@ -1318,7 +1318,7 @@ jobs:
       # can be built, so it builds one and hands it over. Two flavours here, unlike Android's one,
       # because a Linux collaborator runs an EDITOR as well as exporting a game.
       - name: Cache godot-cpp build (linux)
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           # Both trees, keyed on the pinned commit, exactly as the windows job does it: godot-cpp
           # generates and compiles ~2100 binding files per flavour and our nine rebuild on top.
@@ -1408,7 +1408,7 @@ jobs:
       # Same argument as the Windows job: the wheel carries the engine library, and this is the job
       # that builds a Linux one. It rides into pack-linux/ as well, so the Windows job can attach it
       # to the one release without rebuilding anything.
-      - uses: astral-sh/setup-uv@v6
+      - uses: astral-sh/setup-uv@v10.1.0
         with:
           enable-cache: true
 
@@ -1444,7 +1444,7 @@ jobs:
           .wheelenv/bin/python bindings/python/examples/live_onset.py --tests
 
       - name: Upload artifact (Python wheel)
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v7
         with:
           name: bw_audio-python-linux-x64-${{ steps.ver.outputs.version }}-r${{ github.run_number }}
           path: pack-linux/python/
@@ -1452,7 +1452,7 @@ jobs:
           if-no-files-found: error
 
       - name: Upload artifact (Linux engine)
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v7
         with:
           name: bw_audio-linux-x64-${{ steps.ver.outputs.version }}-r${{ github.run_number }}
           path: dist-linux/
@@ -1460,7 +1460,7 @@ jobs:
           if-no-files-found: error
 
       - name: Upload artifact (packing input for the windows job)
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v7
         with:
           name: linux-pack-input
           path: pack-linux/
@@ -1483,10 +1483,10 @@ jobs:
     outputs:
       version: ${{ steps.ver.outputs.version }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       # `python`, not `python3`: see the linux job's copy of this step.
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: '3.x'
 
@@ -1516,7 +1516,7 @@ jobs:
 
       - name: Cache phonon (built Steam Audio core)
         id: phonon
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: third_party/steam-audio-artifacts
           key: phonon-osx-v2-${{ steps.phonon-key.outputs.sha }}-${{ hashFiles('third_party/patches/**') }}
@@ -1575,7 +1575,7 @@ jobs:
       # loads happily; the MEX itself is arm64 only, because MATLAB's own mex toolchain builds for
       # the architecture it is. An Intel Mac needs a MEX built on one, which nothing here has.
       - name: Set up MATLAB
-        uses: matlab-actions/setup-matlab@v2
+        uses: matlab-actions/setup-matlab@v3
         with:
           # Pinned, so a new MathWorks release cannot change overnight what this job tested.
           release: R2024b
@@ -1599,7 +1599,7 @@ jobs:
           otool -l "$mex" | grep -q '@loader_path'
 
       - name: Test the MATLAB binding
-        uses: matlab-actions/run-command@v2
+        uses: matlab-actions/run-command@v3
         with:
           # run-command fails the step on an uncaught error, so raising IS the failure signal.
           command: |
@@ -1621,7 +1621,7 @@ jobs:
       # key carries no arch (Godot matches feature tags, and "universal" is not one); the FILE name
       # keeps godot-cpp's spelling. The failure mode is loud: the test -s and lipo checks below.
       - name: Cache godot-cpp build (macos)
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: |
             build-godot-editor
@@ -1718,7 +1718,7 @@ jobs:
       # Same argument as the other two jobs. The wheel is NOT universal even though the engine
       # library inside it is: a wheel's platform tag names one architecture, so this ships for the
       # runner's own (arm64 on the current macos-latest image). Nothing else here changes.
-      - uses: astral-sh/setup-uv@v6
+      - uses: astral-sh/setup-uv@v10.1.0
         with:
           enable-cache: true
 
@@ -1748,7 +1748,7 @@ jobs:
           .wheelenv/bin/python bindings/python/examples/live_onset.py --tests
 
       - name: Upload artifact (Python wheel)
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v7
         with:
           name: bw_audio-python-macos-${{ steps.ver.outputs.version }}-r${{ github.run_number }}
           path: pack-macos/python/
@@ -1756,7 +1756,7 @@ jobs:
           if-no-files-found: error
 
       - name: Upload artifact (macOS engine)
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v7
         with:
           name: bw_audio-macos-universal-${{ steps.ver.outputs.version }}-r${{ github.run_number }}
           path: dist-macos/
@@ -1764,7 +1764,7 @@ jobs:
           if-no-files-found: error
 
       - name: Upload artifact (packing input for the windows job)
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v7
         with:
           name: macos-pack-input
           path: pack-macos/
@@ -1821,16 +1821,16 @@ jobs:
       # does not recognize, which is a good rule and this is not one of its options.
       CIBUILDWHEEL_VERSION: "4.2.1"
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         # no submodules: the phonon script fetches steam-audio-source itself, and only on a miss
 
       # `python`, not `python3`: both pinned Steam Audio scripts are driven that way, and on macOS
       # this job runs them on the runner rather than in a container.
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: '3.x'
 
-      - uses: astral-sh/setup-uv@v6
+      - uses: astral-sh/setup-uv@v10.1.0
         with:
           enable-cache: true
 
@@ -1849,7 +1849,7 @@ jobs:
       - name: Cache phonon (manylinux container build)
         id: phonon-linux
         if: matrix.platform == 'linux'
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: third_party/steam-audio-artifacts
           # The IMAGE is part of this key: archives built by one image must never be restored
@@ -1859,7 +1859,7 @@ jobs:
       - name: Cache phonon (built Steam Audio core)
         id: phonon-mac
         if: matrix.platform == 'macos'
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: third_party/steam-audio-artifacts
           key: phonon-osx-v2-${{ steps.phonon-key.outputs.sha }}-${{ hashFiles('third_party/patches/**') }}
@@ -1949,7 +1949,7 @@ jobs:
       # carries the only version a wheel has (the ABI version from bw_audio.h), and 30 days
       # because these are also the wheels a human wants off a branch build.
       - name: Upload artifact (release wheel)
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v7
         with:
           name: release-wheel-${{ matrix.platform }}
           path: wheelhouse/*.whl
