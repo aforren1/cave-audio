@@ -398,8 +398,12 @@ older UPM parsers reject. When git cannot answer (no tag, shallow clone, no git 
   execute either the shim's Apple paths or a macOS phonon build.
 - **Each of those two also builds a Godot GDExtension and ships an engine artifact**, the same way
   the android job does. Both flavors (`editor` and `template_release`) build in their own trees,
-  cached on the pinned godot-cpp commit, and the copies bound for the bindings are stripped while
-  the standalone artifact keeps its debug info. Uploads:
+  cached on the pinned godot-cpp commit, and the copies bound for the bindings are stripped. The
+  standalone artifact ships its library stripped too, with the symbols beside it as a separate
+  file (`libbw_audio.so.debug` on Linux and Android, found through the gnu_debuglink;
+  `libbw_audio.dylib.dSYM` on macOS), which is the split Windows already has with its `.pdb`: a
+  consumer copies the 7 MB of code and a debugger finds the symbols when the two sit together.
+  Uploads:
   `bw_audio-linux-x64-<ver>-r<N>` (`lib/libbw_audio.so`, `include/bw_audio.h`, `LICENSE`,
   `THIRD_PARTY-NOTICES.md`, `DIST.txt`) and `bw_audio-macos-universal-<ver>-r<N>` (the same tree
   with `lib/libbw_audio.dylib`), plus the fixed-name pack inputs `linux-pack-input` and
@@ -621,10 +625,12 @@ a load failure.
 `DllImport("bw_audio")` needs no change on Android. Mono maps that name to `libbw_audio.so`, the
 same way it maps it to `bw_audio.dll` on Windows.
 
-The packaged copies are stripped of their debug info, the standalone Android artifact keeps its.
-That is the split Windows already has, where the shipped DLL leaves its symbols in a `.pdb` the
-packages do not carry. It is 11 MB down to 1.9 for the Godot extension and 2.5 down to 0.4 for the
-engine library, on an APK that pays for every byte.
+The packaged copies are stripped of their debug info. The standalone Android artifact ships the
+same stripped library with its DWARF beside it as `libbw_audio.so.debug`, linked by gnu_debuglink,
+so a crash from a headset can be symbolized against the artifact it shipped from. That is the
+split Windows already has, where the shipped DLL leaves its symbols in a `.pdb` the packages do
+not carry. Stripping is 11 MB down to 1.9 for the Godot extension and 20.7 down to 7.4 for the
+engine library with phonon inside, on an APK that pays for every byte.
 
 Both packages ship phonon for Android, inside `libbw_audio.so`: it links statically, so it stages
 no file of its own and neither package gained an entry for it. What it costs is size, about 7 MB

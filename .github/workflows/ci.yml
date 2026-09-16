@@ -784,6 +784,12 @@ jobs:
           mkdir -p dist-android/lib/arm64-v8a dist-android/lib/x86_64 dist-android/include
           cp build-android-arm64-v8a/libbw_audio.so dist-android/lib/arm64-v8a/
           cp build-android-x86_64/libbw_audio.so    dist-android/lib/x86_64/
+          # Same symbol split as the linux job (see there), with the NDK's llvm-objcopy: the
+          # artifact's .so is the 7 MB of code, its DWARF sits beside it as .so.debug.
+          OBJCOPY="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-objcopy"
+          for abi in arm64-v8a x86_64; do
+            (cd "dist-android/lib/$abi"               && "$OBJCOPY" --only-keep-debug libbw_audio.so libbw_audio.so.debug               && "$OBJCOPY" --strip-debug --add-gnu-debuglink=libbw_audio.so.debug libbw_audio.so               && ls -l libbw_audio.so libbw_audio.so.debug)
+          done
           cp include/bw_audio.h                     dist-android/include/
           cp LICENSE THIRD_PARTY-NOTICES.md         dist-android/
           cat > dist-android/DIST.txt <<EOF
@@ -800,9 +806,11 @@ jobs:
                    ISM early reflections, the FDN late tail and manual occlusion work as before.
           no array there is no 26-channel transport on Android; this is the headphone path.
                    A headset's pose reaches the engine through bwa_set_listener_pose.
-          contents lib/<abi>/libbw_audio.so + include/bw_audio.h. A Unity or Godot consumer
-                   wants the package or the addon instead - both already carry the arm64-v8a
-                   library with its import settings set.
+          contents lib/<abi>/libbw_audio.so (stripped) + lib/<abi>/libbw_audio.so.debug (its
+                   DWARF, linked by gnu_debuglink: keep the two together to symbolize a crash,
+                   ship only the .so) + include/bw_audio.h. A Unity or Godot consumer wants the
+                   package or the addon instead - both already carry the arm64-v8a library with
+                   its import settings set.
           license  GPLv3 (LICENSE) + THIRD_PARTY-NOTICES.md. No ASIO SDK here (it is a Windows
                    driver model), so the complete corresponding source is this repo at
                    https://github.com/aforren1/cave-audio/tree/${{ github.sha }}
@@ -987,6 +995,11 @@ jobs:
         run: |
           mkdir -p dist-linux/lib dist-linux/include
           cp build/libbw_audio.so dist-linux/lib/
+          # Split the symbols out the way the Windows artifact ships a .pdb: the library a consumer
+          # copies is the 7 MB of code, and the ~25 MB of DWARF (most of it phonon's, built -g)
+          # sits beside it as libbw_audio.so.debug, found through the gnu_debuglink by any
+          # debugger that sees the two together. Run in the lib dir so the link is a basename.
+          (cd dist-linux/lib             && objcopy --only-keep-debug libbw_audio.so libbw_audio.so.debug             && objcopy --strip-debug --add-gnu-debuglink=libbw_audio.so.debug libbw_audio.so             && readelf -S libbw_audio.so | grep -q gnu_debuglink             && ls -l libbw_audio.so libbw_audio.so.debug)
           cp include/bw_audio.h   dist-linux/include/
           cp LICENSE THIRD_PARTY-NOTICES.md dist-linux/
           cat > dist-linux/DIST.txt <<EOF
@@ -1001,9 +1014,11 @@ jobs:
           no ASIO  ASIO is a Windows driver model. Linux reaches the 26-channel array through
                    JACK (a PipeWire desktop answers the same ABI) or a raw ALSA card; AES67 into
                    the Dante network is the transport. See docs/backends.md.
-          contents lib/libbw_audio.so + include/bw_audio.h. A Unity or Godot consumer wants the
-                   package or the addon instead - both carry this library already, stripped, with
-                   their import settings set.
+          contents lib/libbw_audio.so (stripped) + lib/libbw_audio.so.debug (its DWARF, linked
+                   by gnu_debuglink: keep the two together to debug, ship only the .so) +
+                   include/bw_audio.h. A Unity or Godot consumer wants the package or the addon
+                   instead - both carry this library already, stripped, with their import
+                   settings set.
           license  GPLv3 (LICENSE) + THIRD_PARTY-NOTICES.md. No ASIO SDK here, so the complete
                    corresponding source is this repo at
                    https://github.com/aforren1/cave-audio/tree/${{ github.sha }}
@@ -1180,6 +1195,15 @@ jobs:
         run: |
           mkdir -p dist-macos/lib dist-macos/include
           cp build/libbw_audio.dylib dist-macos/lib/
+          # The Apple spelling of the linux job's symbol split: the DWARF goes into a .dSYM bundle
+          # beside the library, then the same export-preserving strip the pack step uses (-S -x,
+          # never a bare strip on a dylib). Re-prove both slices survived it.
+          dsymutil dist-macos/lib/libbw_audio.dylib -o dist-macos/lib/libbw_audio.dylib.dSYM
+          strip -S -x dist-macos/lib/libbw_audio.dylib
+          test -s dist-macos/lib/libbw_audio.dylib
+          lipo -info dist-macos/lib/libbw_audio.dylib | grep -q x86_64
+          lipo -info dist-macos/lib/libbw_audio.dylib | grep -q arm64
+          ls -l dist-macos/lib; du -sh dist-macos/lib/libbw_audio.dylib.dSYM
           cp include/bw_audio.h      dist-macos/include/
           cp LICENSE THIRD_PARTY-NOTICES.md dist-macos/
           cat > dist-macos/DIST.txt <<EOF
@@ -1194,9 +1218,11 @@ jobs:
                    library, so clear the quarantine flag after unzipping:
                      xattr -dr com.apple.quarantine <this folder>
                    Shipping outside a lab needs a Developer ID signature and notarization.
-          contents lib/libbw_audio.dylib + include/bw_audio.h. A Unity or Godot consumer wants the
-                   package or the addon instead - both carry this library already, stripped, with
-                   their import settings set.
+          contents lib/libbw_audio.dylib (stripped) + lib/libbw_audio.dylib.dSYM (its symbols;
+                   keep the two together to symbolize a crash, ship only the dylib) +
+                   include/bw_audio.h. A Unity or Godot consumer wants the package or the addon
+                   instead - both carry this library already, stripped, with their import
+                   settings set.
           license  GPLv3 (LICENSE) + THIRD_PARTY-NOTICES.md. No ASIO SDK here, so the complete
                    corresponding source is this repo at
                    https://github.com/aforren1/cave-audio/tree/${{ github.sha }}
