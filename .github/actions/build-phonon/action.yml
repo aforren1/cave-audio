@@ -215,9 +215,12 @@ runs:
         for n in $NAMES; do
           # This build tree first (phonon's own archive), then this target's dependency directory.
           # Both are scoped, for the same reason TREE is: a second ABI must not stage the first's.
-          src="$(find "$PHONON_TREE" -name "$n" -type f | head -1)"
+          # Xcode also keeps a per-architecture INTERMEDIATE of every archive under
+          # Objects-normal/<arch>/ beside the fat one it lipo-creates; a bare find | head -1 staged
+          # the arm64 intermediate on macOS and the universal check below caught it. Skip those.
+          src="$(find "$PHONON_TREE" -name "$n" -type f -not -path "*/Objects-normal/*" | head -1)"
           if [ -z "$src" ]; then
-            src="$(find "$CORE/deps" -path "*/$DEPPLAT/*" -name "$n" -type f | head -1)"
+            src="$(find "$CORE/deps" -path "*/$DEPPLAT/*" -name "$n" -type f -not -path "*/Objects-normal/*" | head -1)"
           fi
           test -n "$src" || { echo "staging FAILED: $n was not built ($DEPPLAT)"; exit 1; }
           echo "staging $n <- $src"
