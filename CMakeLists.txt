@@ -504,7 +504,15 @@ if(BWA_PHONON_LIBS)
   if(MSVC)
     # phonon's objects carry /GL, so the consuming link runs whole-program codegen and the linker
     # drops incremental linking anyway - with an LNK4075 per target unless we say so first.
-    target_link_options(bw_audio PRIVATE /INCREMENTAL:NO)
+    # /OPT:REF: RelWithDebInfo passes /DEBUG, which turns unreferenced-function removal OFF by
+    # default, and a static phonon is where that costs: measured 7,677,440 -> ~6.8 MB with it on
+    # (most of the saving is phonon members nothing here calls). /OPT:ICF is deliberately NOT
+    # added: folding identical functions makes the shipped, debuggable RelWithDebInfo harder to
+    # step through, for a few hundred KB more.
+    # /IGNORE:4099: phonon's objects were compiled /Zi and name a core.pdb that is never staged
+    # beside the archive (nor shipped), so the linker would report one LNK4099 per member on
+    # every machine but the one that built phonon. They link without debug info, as on CI.
+    target_link_options(bw_audio PRIVATE /INCREMENTAL:NO /OPT:REF /IGNORE:4099)
   endif()
   message(STATUS "bw_audio: Steam Audio ENABLED (${STEAMAUDIO_DIR}, static, ${BWA_PHONON_PLATFORM}); binaural uses the HRTF decode")
 else()
@@ -592,7 +600,7 @@ function(bwa_add_steam_test target test_name)
   # symbol in the archive goes unresolved.
   set_target_properties(${target} PROPERTIES LINKER_LANGUAGE CXX)
   if(MSVC)
-    target_link_options(${target} PRIVATE /INCREMENTAL:NO)   # /GL in the archive; see bw_audio above
+    target_link_options(${target} PRIVATE /INCREMENTAL:NO /IGNORE:4099)   # /GL + no core.pdb; see bw_audio above
   endif()
   add_test(NAME ${test_name} COMMAND ${target})
 endfunction()
