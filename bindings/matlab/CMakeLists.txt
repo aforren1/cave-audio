@@ -43,7 +43,13 @@ if(Matlab_FOUND AND Matlab_MEX_COMPILER)
   if(UNIX AND NOT APPLE)
     set_target_properties(bwa_mex_matlab PROPERTIES BUILD_RPATH "$ORIGIN" INSTALL_RPATH "$ORIGIN")
   elseif(APPLE)
-    set_target_properties(bwa_mex_matlab PROPERTIES BUILD_RPATH "@loader_path" INSTALL_RPATH "@loader_path")
+    # HOST arch only, whatever CMAKE_OSX_ARCHITECTURES says. CI builds the engine UNIVERSAL
+    # (x86_64;arm64) and inherited that here, but MATLAB ships libmx/libmex for the ONE
+    # architecture it runs as, so the x86_64 half of a universal link finds no _mexAtExit and
+    # the link fails. A MEX only ever runs inside this machine's MATLAB, so its arch is the
+    # host's; the universal engine dylib beside it loads in either.
+    set_target_properties(bwa_mex_matlab PROPERTIES BUILD_RPATH "@loader_path" INSTALL_RPATH "@loader_path"
+                                                    OSX_ARCHITECTURES "${CMAKE_HOST_SYSTEM_PROCESSOR}")
   endif()
   add_custom_command(TARGET bwa_mex_matlab POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E make_directory "${BWA_MATLAB_OUT}"
@@ -64,7 +70,14 @@ endif()
 # else (Linux, macOS, and a Windows user who did add it) is found by the plain search.
 set(BWA_OCTAVE_HINTS "")
 if(WIN32)
-  file(GLOB BWA_OCTAVE_HINTS "$ENV{OCTAVE_HOME}/mingw64/bin"
+  # OCTAVE_HOME arrives from the environment, so on Windows it usually carries BACKSLASHES, which a
+  # glob pattern reads as escape characters rather than as separators. CMake 3.29 happens to match
+  # the mixed-separator string anyway; do not lean on that. Normalize, and the hint is then a plain
+  # CMake path like the two literals below. Those two cover the vendor installer's own locations; a
+  # Chocolatey octave.portable install (what CI uses) lands under its tools/ directory instead and
+  # is reached through OCTAVE_HOME.
+  file(TO_CMAKE_PATH "$ENV{OCTAVE_HOME}" BWA_OCTAVE_HOME)
+  file(GLOB BWA_OCTAVE_HINTS "${BWA_OCTAVE_HOME}/mingw64/bin"
                              "C:/Program Files/GNU Octave/Octave-*/mingw64/bin"
                              "C:/Octave/Octave-*/mingw64/bin")
 endif()

@@ -31,12 +31,15 @@
 #     way android does, so one addon and one Unity package carry every platform. Each also uploads
 #     a standalone engine artifact of its own. macOS builds UNIVERSAL (x86_64 + arm64) and is
 #     unsigned; see those jobs' notes.
-#   - MATLAB and Octave binding: the MEX is built INSIDE each desktop job, after that job's
-#     engine build, so it links that platform's engine (ASIO/WASAPI, JACK/ALSA, the universal
-#     dylib) rather than a second one. The Windows job assembles the three into ONE toolbox folder
-#     with a bin/<arch>/ per platform and ships it as a release asset. Octave's MEX is built on
-#     Linux only; Octave users elsewhere build it with mkoctfile. UNVERIFIED LOCALLY: no runner
-#     MATLAB is reachable from here, so those steps come from mathworks/ci-configuration-examples.
+#   - MATLAB and Octave binding: BOTH MEX files are built INSIDE each desktop job, after that
+#     job's engine build, so each links that platform's engine (ASIO/WASAPI, JACK/ALSA, the
+#     universal dylib) rather than a second one. Every desktop job installs Octave (apt on Linux,
+#     choco on Windows, brew on macOS) and runs the four octave_* ctests. The Windows job
+#     assembles all six binaries into ONE toolbox folder: bin/<arch>/ per platform, each holding
+#     that platform's MATLAB MEX, its Octave MEX and the ONE engine library both load. UNVERIFIED
+#     LOCALLY: no runner MATLAB is reachable from here, so every MATLAB step comes from
+#     mathworks/ci-configuration-examples. The Octave half is verified locally on Windows and
+#     Linux; the macOS one is not, like the rest of that job.
 #   - Python wheels: every desktop job builds one with `uv build --wheel` as its own fast gate,
 #     and a separate `wheels` job builds the two a RELEASE ships - Linux inside a manylinux
 #     container, macOS as one universal2 file - with cibuildwheel. Windows has no such job: its
@@ -131,32 +134,88 @@ jobs:
           toolchain: vs2022
           stage-dir: windows-x64
 
+      # ---- Octave (the second half of the MATLAB binding's toolchain) -----------------------------
+      # octave.portable, NOT the `octave` meta package. The meta package pulls octave.install, whose
+      # own script drives the vendor GUI installer with AUTOHOTKEY because its silent switches do not
+      # work - a thing to avoid on a headless runner. octave.portable just unzips the official
+      # ftp.gnu.org 7z and renames the folder, which is verifiable and cannot hang: its
+      # chocolateyInstall.ps1 extracts octave-9.2.0-w64.7z into
+      # <ChocolateyInstall>\lib\octave.portable\tools\ and renames it to `octave`, so mkoctfile.exe
+      # and octave-cli.exe land in tools\octave\mingw64\bin. That is the layout
+      # bindings/matlab/CMakeLists.txt already globs as $ENV{OCTAVE_HOME}/mingw64/bin, so pointing
+      # OCTAVE_HOME at it is the whole integration.
+      #
+      # The version is PINNED: it is the newest octave.portable carries (June 2024) and an unpinned
+      # install would let a new package change the compiler under this job overnight. The cost is a
+      # 436 MB download from ftp.gnu.org plus the unzip, which is minutes against this job's phonon
+      # build. If that ever bites, the alternative is a cached slim archive (pr0m1th3as/octave-ci
+      # does exactly that) at the price of a third-party release to trust.
+      - name: Install Octave
+        shell: pwsh
+        run: |
+          choco install octave.portable --version 9.2.0 -y --no-progress
+          # DISCOVER the install rather than hard-coding the path above: the package has renamed its
+          # unpacked folder before. Fail loudly HERE, where the reason is obvious, instead of letting
+          # CMake skip the Octave MEX and the configure grep report something vaguer.
+          $ci = if ($env:ChocolateyInstall) { $env:ChocolateyInstall } else { 'C:\ProgramData\chocolatey' }
+          $lib = Join-Path $ci 'lib\octave.portable'
+          $mk = Get-ChildItem $lib -Recurse -Filter mkoctfile.exe -ErrorAction SilentlyContinue |
+                Select-Object -First 1
+          if (-not $mk) { throw "mkoctfile.exe not found under $lib - did octave.portable change its layout?" }
+          # OCTAVE_HOME is the directory that CONTAINS mingw64\bin, which is the shape
+          # bindings/matlab/CMakeLists.txt globs. Assert that shape rather than assuming it, so a
+          # moved mkoctfile cannot silently produce a hint that points nowhere.
+          $bin = Split-Path $mk.FullName -Parent
+          if ($bin -notmatch '[\\/]mingw64[\\/]bin$') { throw "unexpected mkoctfile location: $bin" }
+          $oct = Split-Path (Split-Path $bin -Parent) -Parent
+          # FORWARD slashes: a backslash is an escape character in a CMake glob pattern, not a
+          # separator. The CMakeLists normalizes it as well; neither side relies on the other.
+          "OCTAVE_HOME=$($oct -replace '\\','/')" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+          & $mk.FullName --version
+          & (Join-Path $bin 'octave-cli.exe') --version | Select-Object -First 1
+
       - name: Configure
         shell: bash
         run: |
           # No -G pin: CMake defaults to the newest Visual Studio on the runner. Pinning
           # "Visual Studio 17 2022" broke when the windows-latest image dropped VS 2022.
           #
-          # No BWA_BUILD_MATLAB here: the windows-latest image carries neither MATLAB nor Octave,
-          # so the option would find no toolchain and build nothing. The linux job is where that
-          # binding is built and tested (docs/build.md, the CI section).
+          # BWA_BUILD_MATLAB=ON already here, for the OCTAVE half only: the step above installed
+          # Octave, and MATLAB arrives later (matlab-actions runs after the engine build). So this
+          # configure builds and REGISTERS the Octave MEX and its four ctests, the Build and Test
+          # steps below cover them with everything else, and the MATLAB reconfigure further down
+          # adds the MATLAB target on top. That is the same shape the linux job has.
           cmake -S . -B build -A x64 \
                 -DBWA_BUILD_PLAYGROUND=ON \
                 -DBWA_BUILD_CALIBVIEW=ON \
-                -DBWA_BUILD_CALIBRATE=ON | tee configure.log
+                -DBWA_BUILD_CALIBRATE=ON \
+                -DBWA_BUILD_MATLAB=ON | tee configure.log
           # the artifact must contain the production device path AND the HRTF decode —
           # fail loudly if either didn't wire up
           grep -q "ASIO backend ENABLED" configure.log
           grep -q "Steam Audio ENABLED" configure.log
+          # And the binding: BWA_BUILD_MATLAB skips SILENTLY when it finds no toolchain, which is
+          # exactly the shape that would let the Octave MEX stop being built without anyone noticing.
+          grep -q "Octave MEX enabled" configure.log
 
       - name: Build (RelWithDebInfo — everything)
-        run: cmake --build build --config RelWithDebInfo
+        shell: bash
+        run: |
+          cmake --build build --config RelWithDebInfo
+          # The Octave MEX is an ALL target, so it just built. ASSERT it, because octave_tests
+          # exits 77 (SKIPPED) when no MEX was staged for the running interpreter: a MEX that
+          # silently failed to stage would leave the Test step green. The engine DLL beside it is
+          # what the gateway loads, staged by the same driver script.
+          test -s bindings/matlab/bin/octave/win-x64/bwa_mex.mex
+          test -s bindings/matlab/bin/octave/win-x64/bw_audio.dll
 
       - name: Build (Debug — engine + smoke only)
         run: cmake --build build --config Debug --target bw_audio bwa_minimal
 
       - name: Test
-        # -E: the GUI UI suites need a display + OpenGL; everything else runs
+        # -E: the GUI UI suites need a display + OpenGL; everything else runs - including the four
+        # octave_* tests, which the configure above registered. No matlab_* yet: MATLAB is set up
+        # further down and its own run-command step is where those run.
         run: ctest --test-dir build -C RelWithDebInfo --output-on-failure -E '^(playground|layout_tool|calib_view)$'
 
       - name: Smoke (Debug)
@@ -175,9 +234,9 @@ jobs:
       # Inside this job, after the engine build, so the MEX links the DLL this job already produced
       # with ASIO, WASAPI and a static phonon intact, rather than a second engine built elsewhere.
       #
-      # No Octave here: the Windows runner has none, and installing one through choco to build a
-      # second MEX is a follow-up. An Octave user on Windows builds with mkoctfile
-      # (bindings/matlab/README.md), and the linux job publishes the one Octave MEX that CI makes.
+      # The OCTAVE half of this binding is already built and tested by then - see the Install Octave
+      # and Configure steps above. Only MATLAB waits until here, because only MATLAB needs an action
+      # to install it and a licensed run-command step to drive it.
       - name: Set up MATLAB
         uses: matlab-actions/setup-matlab@v3
         with:
@@ -460,22 +519,27 @@ jobs:
           if ($env:TAG) { $a.Version = $env:TAG }           # the tag is the version; pack stamps it into the manifest
           ./tools/upm/pack.ps1 @a
 
-      # ---- the MATLAB toolbox ----------------------------------------------------------------
-      # ONE folder a MATLAB user unzips and adds to their path, carrying every platform's MEX. A
-      # MEX is per platform (.mexw64, .mexa64, .mexmaca64) and the lab's MATLAB users are on
-      # Windows, so shipping only the one CI could build most cheaply would serve the wrong half.
-      # This job is where the three meet: it built the Windows pair and downloaded the other two
-      # in the pack inputs above.
+      # ---- the MATLAB and Octave toolbox ---------------------------------------------------------
+      # ONE folder a MATLAB or Octave user unzips and adds to their path, carrying every platform's
+      # MEX files. A MEX is per platform AND per interpreter (.mexw64/.mexa64/.mexmaca64 against
+      # .mex) and the lab's users are on Windows, so shipping only the one CI could build most
+      # cheaply would serve the wrong half. This job is where the three platforms meet: it built the
+      # Windows set and downloaded the other two in the pack inputs above.
       #
       # bin/<arch>/ uses MATLAB's OWN architecture names, which is what `computer('arch')` answers
       # and what +bwa/arch_dir.m looks for. The build tree's layout (bin/<matlab|octave>/...) is a
       # different one, on purpose: a build stages two interpreters side by side and a release
       # ships one.
       #
-      # No Octave MEX in here. Octave's extension is `.mex` on every platform, so three of them
-      # could not coexist under one name-per-arch layout without a second rule, and CI only builds
-      # one anyway (the linux job). Octave users build with mkoctfile; the linux artifact carries
-      # the one that exists.
+      # BOTH interpreters' MEX files ride in each bin/<arch>/. Octave's extension is `.mex` on every
+      # platform, but the layout is one directory PER ARCHITECTURE, so the three never meet: what
+      # shares a directory is one .mexw64 and one .mex, whose names differ. +bwa/setup.m looks for
+      # bwa_mex.<mexext> in bin/<arch_dir>(), and arch_dir maps Octave onto MATLAB's own names
+      # (win64 / glnxa64 / maca64), so each interpreter finds its own file with no second rule.
+      #
+      # The ENGINE LIBRARY is staged ONCE per architecture: both MEX files in a directory load the
+      # same bw_audio.dll / libbw_audio.so / libbw_audio.dylib, which is also the ABI check
+      # bwa.setup runs. Two copies would be two ABIs to keep in step.
       - name: Assemble the MATLAB toolbox
         shell: pwsh
         run: |
@@ -489,19 +553,24 @@ jobs:
           # GPLv3 travels with the binaries, the same rule every other pack here follows.
           Copy-Item LICENSE, THIRD_PARTY-NOTICES.md    "$tb/"
 
+          # The engine library comes from the MATLAB staging directory in each case, and only once
+          # per architecture: the Octave staging holds a byte-identical copy of the same build.
           Copy-Item bindings/matlab/bin/matlab/win-x64/bwa_mex.mexw64  "$tb/bin/win64/"
+          Copy-Item bindings/matlab/bin/octave/win-x64/bwa_mex.mex     "$tb/bin/win64/"
           Copy-Item bindings/matlab/bin/matlab/win-x64/bw_audio.dll    "$tb/bin/win64/"
           Copy-Item pack-linux/matlab/bwa_mex.mexa64                   "$tb/bin/glnxa64/"
+          Copy-Item pack-linux/matlab/bwa_mex.mex                      "$tb/bin/glnxa64/"
           Copy-Item pack-linux/matlab/libbw_audio.so                   "$tb/bin/glnxa64/"
           Copy-Item pack-macos/matlab/bwa_mex.mexmaca64                "$tb/bin/maca64/"
+          Copy-Item pack-macos/matlab/bwa_mex.mex                      "$tb/bin/maca64/"
           Copy-Item pack-macos/matlab/libbw_audio.dylib                "$tb/bin/maca64/"
 
-          # Assert all three BEFORE zipping. A toolbox missing one platform installs perfectly on
-          # the other two and fails only on somebody else's machine, which is the shape of defect
-          # this whole assembly exists to avoid.
-          foreach ($p in @("$tb/bin/win64/bwa_mex.mexw64",
-                           "$tb/bin/glnxa64/bwa_mex.mexa64",
-                           "$tb/bin/maca64/bwa_mex.mexmaca64")) {
+          # Assert all SIX BEFORE zipping. A toolbox missing one platform installs perfectly on the
+          # other two and fails only on somebody else's machine, which is the shape of defect this
+          # whole assembly exists to avoid - and the same is true one interpreter at a time.
+          foreach ($p in @("$tb/bin/win64/bwa_mex.mexw64",   "$tb/bin/win64/bwa_mex.mex",
+                           "$tb/bin/glnxa64/bwa_mex.mexa64", "$tb/bin/glnxa64/bwa_mex.mex",
+                           "$tb/bin/maca64/bwa_mex.mexmaca64", "$tb/bin/maca64/bwa_mex.mex")) {
             if (-not (Test-Path $p) -or (Get-Item $p).Length -eq 0) { throw "missing or empty: $p" }
           }
           Get-ChildItem -Recurse $tb | Where-Object { -not $_.PSIsContainer } |
@@ -617,7 +686,8 @@ jobs:
       #                                      would need a Developer ID signature.
       #   bw_audio-matlab-<tag>.zip           the MATLAB and Octave toolbox: the +bwa package, the
       #                                      examples, and bin/{win64,glnxa64,maca64} each holding
-      #                                      that platform's MEX plus its engine library. Unzip and
+      #                                      that platform's TWO MEX files (MATLAB's and Octave's)
+      #                                      plus the one engine library both load. Unzip and
       #                                      addpath; there is nothing to build.
       #   bw_audio-asio-sdk-src-<tag>.zip     the ASIO SDK source statically linked into bw_audio.dll,
       #                                      redistributed under its GPLv3 option. Corresponding source
@@ -685,8 +755,8 @@ jobs:
           Compress-Archive -Path pack-macos/dist/* -DestinationPath $mac -Force
           $mac = (Get-Item $mac).FullName
 
-          # The MATLAB and Octave toolbox: ONE folder carrying every platform's MEX plus that
-          # platform's engine library, assembled above from this job's Windows pair and the two
+          # The MATLAB and Octave toolbox: ONE folder carrying every platform's two MEX files plus
+          # that platform's engine library, assembled above from this job's Windows set and the two
           # pack inputs. A zip rather than a MATLAB Toolbox (.mltbx) because an .mltbx is a
           # MATLAB-only installer and this folder has to work in Octave too, where the install is
           # addpath and nothing else.
@@ -782,19 +852,15 @@ jobs:
           ``addpath('<where-you-unzipped>/bw_audio-matlab')``
 
           That is the whole install. The folder carries ``+bwa`` (the class layer), the examples,
-          and ``bin/win64``, ``bin/glnxa64`` and ``bin/maca64``, each holding that platform's MEX
-          plus its engine library; ``bwa.setup`` picks yours. Steam Audio is linked into each
-          library, so there is nothing to keep beside it. For Psychtoolbox: see
-          ``bindings/matlab/README.md`` for the timing recipe and the note on not fighting
-          PsychPortAudio for the same device.
+          and ``bin/win64``, ``bin/glnxa64`` and ``bin/maca64``, each holding that platform's **two**
+          MEX files - MATLAB's (``.mexw64`` / ``.mexa64`` / ``.mexmaca64``) and Octave's (``.mex``) -
+          plus the one engine library both of them load. ``bwa.setup`` picks the right one for the
+          interpreter you are in. Steam Audio is linked into each library, so there is nothing to
+          keep beside it. For Psychtoolbox: see ``bindings/matlab/README.md`` for the timing recipe
+          and the note on not fighting PsychPortAudio for the same device.
 
-          The MEX files here are **MATLAB's**. Octave needs its own (its extension is ``.mex`` on
-          every platform), and CI builds one only on Linux - it rides in the workflow artifact
-          ``bw_audio-matlab-linux-x64-*``. An Octave user on another platform builds it with
-          ``mkoctfile`` from the checkout; the README has the one command.
-
-          The macOS MEX is **arm64** and, like every other macOS binary here, **unsigned**: clear
-          the quarantine flag after unzipping, ``xattr -dr com.apple.quarantine <folder>``.
+          The macOS MEX files are **arm64** and, like every other macOS binary here, **unsigned**:
+          clear the quarantine flag after unzipping, ``xattr -dr com.apple.quarantine <folder>``.
 
           ## Python
 
@@ -1141,10 +1207,10 @@ jobs:
         # silently drops the backends.
         #
         # octave + octave-dev is the Octave half of the MATLAB and Octave binding's toolchain:
-        # mkoctfile builds the MEX, octave-cli runs its ctests. This is the ONLY job that
-        # builds an Octave MEX - no runner image carries Octave, and installing one on the
-        # other two is a follow-up. (The package is octave-dev since Ubuntu 22.04; the older
-        # liboctave-dev name does not resolve on a current runner.)
+        # mkoctfile builds the MEX, octave-cli runs its ctests. No runner image carries Octave,
+        # so each desktop job installs its own - choco on Windows, brew on macOS, apt here, which
+        # is by far the cheapest of the three. (The package is octave-dev since Ubuntu 22.04; the
+        # older liboctave-dev name does not resolve on a current runner.)
         run: |
           sudo apt-get update
           sudo apt-get install -y libasound2-dev libjack-jackd2-dev octave octave-dev
@@ -1312,13 +1378,16 @@ jobs:
                 error("bwa:ci", "the MATLAB binding reported %d failing check groups", rc);
             end
 
-      - name: Stage the MATLAB MEX for the windows job
+      - name: Stage the MEX files for the windows job
         shell: bash
         run: |
           # Into the fixed-name pack input the windows job already downloads, so assembling the
-          # cross-platform toolbox there costs no second handoff.
+          # cross-platform toolbox there costs no second handoff. BOTH interpreters' MEX files,
+          # and ONE engine library: the two staging directories hold the same build of it, and
+          # both MEX files load it out of the bin/glnxa64 they end up sharing.
           mkdir -p pack-linux/matlab
           cp bindings/matlab/bin/matlab/linux-x64/bwa_mex.mexa64 pack-linux/matlab/
+          cp bindings/matlab/bin/octave/linux-x64/bwa_mex.mex    pack-linux/matlab/
           cp build/libbw_audio.so pack-linux/matlab/
           strip --strip-debug pack-linux/matlab/libbw_audio.so
           ls -l pack-linux/matlab
@@ -1330,8 +1399,8 @@ jobs:
           # BOTH interpreters' MEX files with the engine library beside each, plus the package a
           # user adds to their path. Each MEX finds its library through an $ORIGIN runpath, so a
           # staged directory is self-contained. The cross-platform TOOLBOX (one folder, three
-          # architectures) is assembled in the windows job and shipped from there; this artifact
-          # is the Linux-only pair, and the only place the Octave MEX is published at all.
+          # architectures, both interpreters) is assembled in the windows job and shipped from
+          # there; this artifact is the Linux-only pair, in the build tree's own layout.
           path: |
             bindings/matlab/bin/
             bindings/matlab/+bwa/
@@ -1558,6 +1627,25 @@ jobs:
           # No AVX flag: -fabi-version=6 is a Linux-only branch in core/CMakeLists.txt, and
           # Apple clang never sees it.
 
+      # ---- Octave (the second half of the MATLAB binding's toolchain) -----------------------------
+      # UNVERIFIED LOCALLY, like the rest of this job. `octave` is a FORMULA, not a cask, so
+      # --formula only says out loud what brew would infer; it is there because a bare name is
+      # ambiguous in principle and this job has nobody to debug it. There is no lighter variant:
+      # the formula pulls ~27 dependencies including gcc, qt and ghostscript, which is minutes of
+      # bottle pouring on a cold run. That is the price of testing the binding where a Mac user
+      # would run it, and it is small against this job's phonon build.
+      #
+      # It puts mkoctfile and octave-cli in the brew prefix's bin, which is on PATH, so CMake's
+      # plain find_program finds both with no hint - the OCTAVE_HOME dance is Windows-only.
+      # mkoctfile compiles with whatever compiler Octave was built against (brew's gcc), and what
+      # it links is the UNIVERSAL dylib this job just built, so an arm64 .mex loads it happily.
+      # Nothing here is universal: like MATLAB's, the Octave MEX is the runner's own architecture.
+      - name: Install Octave
+        run: |
+          brew install --formula octave
+          mkoctfile --version
+          octave-cli --version | head -1
+
       - name: Configure
         run: |
           # UNIVERSAL, because the shipped artifact is one file for both Apple architectures and an
@@ -1565,13 +1653,27 @@ jobs:
           # already (core/CMakeLists.txt sets the same pair for every macOS build), so this costs
           # compile time and nothing else. The ctest suite below is built universal too and runs
           # natively on whichever arch the runner is.
+          #
+          # BWA_BUILD_MATLAB=ON already here, for the OCTAVE half only: the step above installed
+          # Octave, and MATLAB arrives later. So this configure builds and registers the Octave MEX
+          # and its four ctests, and the MATLAB reconfigure further down adds the MATLAB target on
+          # top. Same shape as the linux and windows jobs.
           cmake -S . -B build -DCMAKE_BUILD_TYPE=RelWithDebInfo -DBWA_BUILD_TESTS=ON \
-                -DCMAKE_OSX_ARCHITECTURES="x86_64;arm64" | tee configure.log
+                -DCMAKE_OSX_ARCHITECTURES="x86_64;arm64" -DBWA_BUILD_MATLAB=ON | tee configure.log
           grep -q "null and manual sinks only" configure.log
           grep -q "Steam Audio ENABLED" configure.log
+          # BWA_BUILD_MATLAB skips SILENTLY when it finds no toolchain, so without this the binding
+          # could stop being built here and nothing would say so.
+          grep -q "Octave MEX enabled" configure.log
 
       - name: Build
-        run: cmake --build build --config RelWithDebInfo
+        run: |
+          cmake --build build --config RelWithDebInfo
+          # The Octave MEX is an ALL target, so it just built. ASSERT it: octave_tests exits 77
+          # (SKIPPED) when no MEX was staged, so a MEX that failed to stage would leave the Test
+          # step green.
+          test -s bindings/matlab/bin/octave/macos-universal/bwa_mex.mex
+          test -s bindings/matlab/bin/octave/macos-universal/libbw_audio.dylib
 
       - name: Check the library
         # The same empty-link-rule guard as the linux job. No output-name or output-directory
@@ -1588,7 +1690,9 @@ jobs:
           ! otool -L build/libbw_audio.dylib | grep -q phonon
 
       - name: Test
-        # 38, the same arithmetic as the linux job above.
+        # 42, the same arithmetic as the linux job above: 33 + the five SDK-gated + the four the
+        # Octave binding adds. No matlab_* here either - MATLAB is set up further down and its own
+        # run-command step is where those run.
         run: ctest --test-dir build -C RelWithDebInfo --output-on-failure
 
       # ---- the MATLAB MEX ------------------------------------------------------------------------
@@ -1732,9 +1836,10 @@ jobs:
           # stripped, the standalone artifact's are not.
           mkdir -p pack-macos/godot pack-macos/unity pack-macos/matlab
           cp -r dist-macos pack-macos/dist
-          # The MATLAB MEX and its engine library, for the cross-platform toolbox the windows job
-          # assembles. arm64 MEX, universal dylib - see the MATLAB steps above.
+          # BOTH MEX files and ONE engine library, for the cross-platform toolbox the windows job
+          # assembles. arm64 MEX files, universal dylib - see the MATLAB and Octave steps above.
           cp bindings/matlab/bin/matlab/macos-universal/bwa_mex.mexmaca64 pack-macos/matlab/
+          cp bindings/matlab/bin/octave/macos-universal/bwa_mex.mex       pack-macos/matlab/
           cp build/libbw_audio.dylib pack-macos/matlab/
           strip -S -x pack-macos/matlab/libbw_audio.dylib
           cp bindings/godot/addons/bw_audio/bin/libbw_audio_gd.macos.editor.universal.dylib \

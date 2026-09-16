@@ -17,15 +17,12 @@ addpath('<where-you-unzipped>/bw_audio-matlab')
 ```
 
 That is the whole install. The folder carries `+bwa`, the examples, and `bin/win64`,
-`bin/glnxa64` and `bin/maca64`, each holding that platform's MEX plus its engine library.
-`bwa.setup` picks yours, and `bwa.Engine` calls `bwa.setup` for you.
+`bin/glnxa64` and `bin/maca64`, each holding that platform's **two** MEX files, MATLAB's
+(`.mexw64`, `.mexa64`, `.mexmaca64`) and Octave's (`.mex`), plus the one engine library both of
+them load. `bwa.setup` picks yours, and `bwa.Engine` calls `bwa.setup` for you.
 
-Two things to know. The MEX files in a release are **MATLAB's**: Octave's extension is `.mex` on
-every platform, so three of them cannot share this layout, and CI builds one Octave MEX only on
-Linux (it ships in the `bw_audio-matlab-linux-x64-*` workflow artifact). An Octave user on any
-other platform builds one from the checkout, which is the next section and one command. And the
-macOS binaries are **unsigned and un-notarized**, like every other macOS binary this project
-ships, so clear the quarantine flag after unzipping:
+One thing to know. The macOS binaries are **unsigned and un-notarized**, like every other macOS
+binary this project ships, so clear the quarantine flag after unzipping:
 
 ```
 xattr -dr com.apple.quarantine <folder>
@@ -44,7 +41,9 @@ cmake --build build --config RelWithDebInfo
 The MATLAB half needs MATLAB with a configured C compiler. Check with `mex.getCompilerConfigurations('C','Selected')`
 and run `mex -setup C` once if it is empty. The Octave half needs `mkoctfile`, which comes with
 Octave. On Windows the installer does not put it on `PATH`; CMake looks in
-`C:\Program Files\GNU Octave\Octave-*\mingw64\bin` for you, or set `OCTAVE_HOME`.
+`C:\Program Files\GNU Octave\Octave-*\mingw64\bin` for you, or set `OCTAVE_HOME` to the folder that
+contains `mingw64\bin`. A Chocolatey `octave.portable` install is somewhere else again
+(`<ChocolateyInstall>\lib\octave.portable\tools\octave`), which is what CI points `OCTAVE_HOME` at.
 
 The build stages each MEX with the engine library beside it, under
 `bindings/matlab/bin/<matlab|octave>/<platform>/`. Nothing there is committed. That layout is the
@@ -263,11 +262,16 @@ that quietly changed a gain, a position or a channel order cannot pass.
 
 ## CI
 
-The MEX is built inside each desktop CI job, after that job's engine build, so it links that
-platform's engine with its own backends intact. The `windows` job then assembles the three into
-the one toolbox folder a release ships. The Octave MEX is built and tested on Linux only, through
-ctest; installing Octave on the Windows and macOS runners is a follow-up, and an Octave user there
-builds with `mkoctfile` in the meantime.
+Both MEX files are built inside each desktop CI job, after that job's engine build, so each links
+that platform's engine with its own backends intact. The `windows` job then assembles all six into
+the one toolbox folder a release ships.
+
+Every desktop job installs Octave itself: `octave` and `octave-dev` from apt on Linux,
+`octave.portable` from Chocolatey on Windows, `octave` from Homebrew on macOS. Each configures with
+`BWA_BUILD_MATLAB=ON` before the engine build, so the Octave MEX is an ordinary `ALL` target and the
+four `octave_*` ctests run with the rest of the suite. MATLAB's half waits for the `matlab-actions`
+steps, because only MATLAB needs an action to install it and a licensed `run-command` step to drive
+it.
 
 ## Platform notes
 

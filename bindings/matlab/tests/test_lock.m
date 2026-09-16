@@ -62,6 +62,19 @@ script = ['addpath(''' strrep(fileparts(here), '''', '''''') '''); ' ...
 cmd = ['"' exe '" ' args ' "' strrep(script, '"', '""') '"'];
 [status, output] = system(cmd);
 
+% A child that never got past LICENSE CHECKOUT ran none of this, so it can say nothing about
+% the atexit path either way. That is what a GitHub-hosted runner does: matlab-actions
+% licenses only the interpreter inside its own run step, and a second `matlab -batch` it
+% spawns dies with "License checkout failed". Report the gap by name rather than fail on
+% it, and keep the check live everywhere a child CAN start (a lab machine, a self-hosted
+% runner with a license, every Octave). The match is deliberately on the license text and
+% not on a CI environment variable, so a licensed runner still runs the real check.
+if status ~= 0 && ~isempty(strfind(output, 'License checkout failed'))  %#ok<STREMP>
+    fprintf(['   %-58s SKIP  the child interpreter could not check out a license, so the ' ...
+             'atexit path went untested here\n'], 'a subprocess that exits with a live engine');
+    return
+end
+
 tcheck('a subprocess that exits with a live engine exits 0', status == 0, ...
        sprintf('status %d, output: %s', status, strtrim(output)));
 tcheck('the subprocess really had an engine open', ...

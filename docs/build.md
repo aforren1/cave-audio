@@ -397,8 +397,8 @@ older UPM parsers reject. When git cannot answer (no tag, shallow clone, no git 
   binding still builds and tests where the engine was just built, and they tag for the machine
   that built them. The Android job builds no wheel: there is no Python there.
   `bindings/python/README.md` is the manual.
-- **The MATLAB MEX is built inside each desktop job, and the three become one toolbox.** A MEX is
-  per platform, so the `windows`, `linux` and `macos` jobs each set up MATLAB with
+- **Both MEX files are built inside each desktop job, and the six become one toolbox.** A MEX is
+  per platform and per interpreter, so the `windows`, `linux` and `macos` jobs each set up MATLAB with
   [matlab-actions/setup-matlab](https://github.com/matlab-actions/setup-matlab) (no license token
   is needed on a GitHub-hosted runner for a public repository), reconfigure **the same build tree**
   with `BWA_BUILD_MATLAB=ON`, build only the MEX target, and run the suite and all three examples
@@ -408,18 +408,29 @@ older UPM parsers reject. When git cannot answer (no tag, shallow clone, no git 
   `MATLAB MEX enabled`, because the option skips silently when it finds no toolchain and a job that
   built nothing would otherwise pass.
   The `windows` job then assembles `bw_audio-matlab/`: `+bwa`, the examples, the README, the
-  licenses, and `bin/win64`, `bin/glnxa64` and `bin/maca64` each holding that platform's MEX plus
-  its engine library. It asserts all three are present before zipping. That folder uploads as
-  `bw_audio-matlab-<ver>-r<N>` and, on a tag, as `bw_audio-matlab-<tag>.zip`.
-  The macOS runner is Apple silicon, so its MEX is `.mexmaca64` against the universal dylib; an
-  Intel Mac would need a MEX built on one, which nothing here has.
-  **Octave is Linux-only in CI.** The `linux` job installs `octave` and `octave-dev` from apt
-  and runs `octave_tests` plus the three examples through ctest, and its artifact carries that MEX.
-  Installing Octave on the Windows and macOS runners is a documented follow-up; an Octave user on
-  those platforms builds with `mkoctfile`, which is one command.
-  **Unverified locally:** nothing here can run a GitHub-hosted MATLAB, so those steps were written
-  from [mathworks/ci-configuration-examples](https://github.com/mathworks/ci-configuration-examples)
-  rather than from a run. `bindings/matlab/README.md` is the manual.
+  licenses, and `bin/win64`, `bin/glnxa64` and `bin/maca64` each holding that platform's two MEX
+  files plus the one engine library both of them load. It asserts all six are present before
+  zipping. That folder uploads as `bw_audio-matlab-<ver>-r<N>` and, on a tag, as
+  `bw_audio-matlab-<tag>.zip`.
+  The macOS runner is Apple silicon, so its MEX files are arm64 against the universal dylib; an
+  Intel Mac would need MEX files built on one, which nothing here has.
+  **Octave is built and tested in all three desktop jobs.** Each installs its own: `octave` and
+  `octave-dev` from apt on Linux, `octave.portable` from Chocolatey on Windows, `octave` from
+  Homebrew on macOS. The Windows package is `octave.portable` and not the `octave` meta package,
+  because the meta package pulls `octave.install`, which drives the vendor GUI installer through
+  AutoHotkey. The portable one unzips the official archive from `ftp.gnu.org` and cannot hang.
+  Each job configures with `BWA_BUILD_MATLAB=ON` before the engine build, so the Octave MEX is an
+  ordinary `ALL` target and the four `octave_*` ctests run with the rest of the suite. Each job
+  asserts the configure log says `Octave MEX enabled` and that the MEX file staged, because
+  `octave_tests` exits 77 (SKIPPED) when no MEX is there for the running interpreter and a silent
+  miss would otherwise read as a pass. Only the MATLAB half waits for the `matlab-actions` steps,
+  because only MATLAB needs an action to install it and a licensed `run-command` step to drive it.
+  **Unverified locally:** nothing here can run a GitHub-hosted MATLAB, so every MATLAB step was
+  written from
+  [mathworks/ci-configuration-examples](https://github.com/mathworks/ci-configuration-examples)
+  rather than from a run, and the macOS Octave steps are unverified for the same reason the rest of
+  that job is: nobody here has a Mac. The Windows and Linux Octave halves are verified locally.
+  `bindings/matlab/README.md` is the manual.
 - **The `wheels` job builds the two wheels a release ships.** A wheel `uv build` produces on a
   runner is tagged for that runner: the image's glibc on Linux, the runner's own architecture on
   macOS. Neither is what a release hands a stranger. So a separate job runs
@@ -516,12 +527,13 @@ older UPM parsers reject. When git cannot answer (no tag, shallow clone, no git 
     Distribution outside the lab would need a Developer ID signature and notarization.
   - `bw_audio-matlab-<tag>.zip`: the MATLAB and Octave toolbox. `+bwa`, the examples, the
     README and the licenses, plus `bin/win64`, `bin/glnxa64` and `bin/maca64`, each holding that
-    platform's MEX and its engine library. Unzip it and `addpath` the folder; there is nothing to
-    build. The MEX files are MATLAB's, one per platform, built inside each desktop job. An Octave
-    user needs their own (Octave's extension is `.mex` everywhere, so three could not share this
-    layout), which `mkoctfile` builds in one command; CI builds the Linux one and ships it in the
-    `bw_audio-matlab-linux-x64-*` workflow artifact. The macOS MEX is arm64 and unsigned, so it
-    takes the same quarantine step as the macOS engine above.
+    platform's two MEX files and the one engine library both of them load. Unzip it and `addpath`
+    the folder; there is nothing to build. Every MEX is built inside that platform's own desktop
+    job, MATLAB's and Octave's alike, and `bwa.setup` picks the one for the interpreter you are
+    in. Octave's extension is `.mex` on every platform, which costs nothing here: the layout is one
+    directory per architecture, so what shares a directory is one `.mexw64` and one `.mex`. The
+    macOS MEX files are arm64 and unsigned, so they take the same quarantine step as the macOS
+    engine above.
   - `bw_audio-asio-sdk-src-<tag>.zip`: the ASIO SDK source statically linked into the DLL,
     kept as its own asset so it accompanies the binaries (GPLv3 corresponding source)
     without bloating either the engine `.zip` or the `.tgz`.

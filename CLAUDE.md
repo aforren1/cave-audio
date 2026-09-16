@@ -378,14 +378,22 @@ full-options Windows tree is 48 and the default Windows tree 41; `python_binding
 rather than failing when pytest is missing, because a C developer should not need it.
 `-DBWA_BUILD_MATLAB=ON` adds up to FOUR PER INTERPRETER it finds (`<matlab|octave>_tests` plus
 `_example_offline_render` / `_example_live_onset` / `_example_AudioTunnel3DDemo_bwa`), so a Windows
-box with both MATLAB and Octave installed reaches 53 (45 + 8) and 56 at full options, and a Linux
-box with Octave alone reaches 42 (38 + 4). Each suite exits 77 (SKIPPED) when the MEX for the running interpreter
+box with both MATLAB and Octave installed reaches 53 (45 + 8) and 56 at full options; a Linux or
+macOS box with Octave alone reaches 42 (38 + 4) and with both 46 (38 + 8). Each suite exits 77
+(SKIPPED) when the MEX for the running interpreter
 was not staged, and neither half is registered when its toolchain was not found at configure time -
-ctest cannot run a MATLAB test with no MATLAB. In CI the MATLAB MEX is built INSIDE each desktop
-job (so it links that job's own engine, backends intact) and the windows job assembles the three
-into ONE toolbox folder, bin/{win64,glnxa64,maca64}, shipped as a twelfth release asset; Octave is
-built and ctested on Linux only. Those MATLAB steps are UNVERIFIED LOCALLY - no runner MATLAB is
-reachable from here, so they follow mathworks/ci-configuration-examples. CI also
+ctest cannot run a MATLAB test with no MATLAB. In CI BOTH MEX files are built INSIDE each desktop
+job (so each links that job's own engine, backends intact) and the windows job assembles all six
+into ONE toolbox folder, bin/{win64,glnxa64,maca64} each holding that platform's pair plus the ONE
+engine library both load, shipped as a twelfth release asset. Every desktop job installs its own
+Octave (apt on Linux, chocolatey's `octave.portable` on Windows, homebrew on macOS), configures
+`BWA_BUILD_MATLAB=ON` before the engine build, and runs the four `octave_*` tests through ctest:
+that is the 42 the linux and macos jobs report, and on Windows 49 registered with 46 run (the three
+GUI suites need a display). MATLAB's four never run under ctest in CI - the license exists only
+inside matlab-actions' run-command, so each job drives them there instead. Those MATLAB steps are
+UNVERIFIED LOCALLY - no runner MATLAB is
+reachable from here, so they follow mathworks/ci-configuration-examples. The Windows Octave build
+IS verified locally (Octave 10.1.0, the four tests green); the macOS one is not. CI also
 builds a `cp312-abi3` WHEEL on each of the three desktops, installs it into a fresh venv, and runs
 that same pytest suite from the INSTALLED wheel rather than the source tree - shipped as
 `bw_audio-python-<platform>-<ver>`. Those three are the FAST GATE and are tagged for the runner
