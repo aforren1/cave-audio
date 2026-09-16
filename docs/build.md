@@ -203,6 +203,19 @@ Everything above, sorted by what it actually ends up in:
   `libbw_audio.so`, so it carries dr_libs, cJSON and a statically linked Steam Audio (**Apache-2.0**,
   the same obligation the Windows DLL carries). No ASIO: it is a Windows driver model. It travels with `LICENSE`,
   `THIRD_PARTY-NOTICES.md` and a `DIST.txt` naming the commit, like every other artifact.
+- **The Linux artifact** (`bw_audio-linux-x64-<ver>`, and the copies inside both bindings) is the
+  same `libbw_audio.so` again: dr_libs, cJSON and a statically linked Steam Audio, plus libjack and
+  alsa-lib (**LGPL-2.1** both) resolved at load time. Neither of those two is redistributed, so
+  neither adds a file to ship, but both add a notice line. No ASIO.
+- **The macOS artifact** (`bw_audio-macos-universal-<ver>`, and the copies inside both bindings) is
+  one universal `libbw_audio.dylib` carrying dr_libs, cJSON and a statically linked Steam Audio. No
+  system audio library at all yet, because macOS has no device backend, and no ASIO. It is **not
+  code-signed and not notarized**, which is a distribution question rather than a license one:
+  internal use clears the quarantine flag, and shipping outside the lab needs a Developer ID
+  signature and notarization.
+- **The Godot GDExtension** (`bw_audio_gd.*`, one per platform and flavor inside the addon) links
+  godot-cpp (**MIT**) beside the engine's C ABI. It ships with the addon's `LICENSE` and
+  `THIRD_PARTY-NOTICES.md`, like the engine library it sits next to.
 - **Never linked**: the NatNet SDK. `third_party/NatNetSDK/` sits in the tree as a
   **protocol reference only** (it is proprietary: OptiTrack's plugin license); no
   target compiles or links it, and it must never be distributed with this repo.
@@ -356,10 +369,10 @@ older UPM parsers reject. When git cannot answer (no tag, shallow clone, no git 
   job, which is the only place that packs the bindings. It uploads
   `bw_audio-android-<ver>-r<N>`: `lib/arm64-v8a/libbw_audio.so`, `lib/x86_64/libbw_audio.so`,
   `include/bw_audio.h`, `LICENSE`, `THIRD_PARTY-NOTICES.md`, and a `DIST.txt` naming the commit.
-- **Two audiences, three artifacts.** Every run uploads them separately: the engine
+- **Two audiences, separate artifacts.** Every run uploads them separately: the engine
   (`bw_audio-win64-<ver>-r<N>`: dll/lib/pdb + tools + header), the Unity package
   (`unity-package-<ver>-r<N>`: one `.tgz`) and the Godot addon (`godot-addon-<ver>-r<N>`), plus
-  the Android artifact above. `<ver>` is the packed version (the tag on a release,
+  the Android, Linux and macOS engine artifacts their own jobs upload. `<ver>` is the packed version (the tag on a release,
   a git-describe dev version otherwise); the `r<N>` run number keeps re-runs of one commit from
   colliding on a name. Downloading one no longer drags in the other.
 - **The Unity package is packed every run, and released on a tag.**
@@ -371,7 +384,7 @@ older UPM parsers reject. When git cannot answer (no tag, shallow clone, no git 
   tag stamps the version into the packaged manifest (the committed `package.json`
   stays `0.0.0-dev`), so a tarball can never claim a version it isn't. See
   [Releasing](#releasing).
-- **Two more jobs guard the port, and ship nothing.** `linux` on `ubuntu-latest` and `macos`
+- **Two more jobs guard the port, and they ship too.** `linux` on `ubuntu-latest` and `macos`
   on `macos-latest` build phonon, configure, build RelWithDebInfo, and run the whole ctest suite
   on the null and manual sinks: **38 tests**, the 33 a default off-Windows build registers plus the
   five SDK-gated ones. They exist to catch a Win32 call sneaking back into the core, so they assert
@@ -383,7 +396,20 @@ older UPM parsers reject. When git cannot answer (no tag, shallow clone, no git 
   Windows job does; a warm one restores the archives and costs a few minutes. The macOS job is
   UNVERIFIED locally in both halves, since no Mac was at hand: it is the first thing that will ever
   execute either the shim's Apple paths or a macOS phonon build.
-- **A release carries SIX assets**, because workflow artifacts expire (30 days) and a
+- **Each of those two also builds a Godot GDExtension and ships an engine artifact**, the same way
+  the android job does. Both flavors (`editor` and `template_release`) build in their own trees,
+  cached on the pinned godot-cpp commit, and the copies bound for the bindings are stripped while
+  the standalone artifact keeps its debug info. Uploads:
+  `bw_audio-linux-x64-<ver>-r<N>` (`lib/libbw_audio.so`, `include/bw_audio.h`, `LICENSE`,
+  `THIRD_PARTY-NOTICES.md`, `DIST.txt`) and `bw_audio-macos-universal-<ver>-r<N>` (the same tree
+  with `lib/libbw_audio.dylib`), plus the fixed-name pack inputs `linux-pack-input` and
+  `macos-pack-input` that the Windows job downloads. The macOS build is **universal**
+  (`CMAKE_OSX_ARCHITECTURES="x86_64;arm64"`, which phonon's own archives already are) and the job
+  fails on a `lipo -info` that does not show both architectures.
+- **The Windows job waits for all three cross-builds.** `needs: [android, linux, macos]`, because
+  it is the only place that packs the bindings and each package carries every platform's engine
+  library. The three run in parallel, so the wait is the slowest of them.
+- **A release carries EIGHT assets**, because workflow artifacts expire (30 days) and a
   release doesn't:
   - `com.brainworks.bw_audio-<ver>.tgz`: the Unity package.
   - `bw_audio-godot-<ver>.zip`: the installable Godot addon.
@@ -393,6 +419,13 @@ older UPM parsers reject. When git cannot answer (no tag, shallow clone, no git 
   - `bw_audio-android-<tag>.zip`: the Android engine, `libbw_audio.so` for `arm64-v8a` and
     `x86_64` plus `bw_audio.h`. For a native consumer only: the Unity package and the Godot
     addon already carry the `arm64-v8a` library.
+  - `bw_audio-linux-x64-<tag>.zip`: the Linux engine, `libbw_audio.so` plus `bw_audio.h`.
+    JACK and ALSA, no ASIO.
+  - `bw_audio-macos-universal-<tag>.zip`: the macOS engine, one universal `libbw_audio.dylib`
+    (x86_64 and arm64) plus `bw_audio.h`. No device backend yet, so it is the offline path.
+    It is **not code-signed and not notarized**: Gatekeeper blocks a downloaded unsigned library,
+    so clear the quarantine flag (`xattr -dr com.apple.quarantine <folder>`) after unzipping.
+    Distribution outside the lab would need a Developer ID signature and notarization.
   - `bw_audio-asio-sdk-src-<tag>.zip`: the ASIO SDK source statically linked into the DLL,
     kept as its own asset so it accompanies the binaries (GPLv3 corresponding source)
     without bloating either the engine `.zip` or the `.tgz`.
@@ -591,11 +624,44 @@ That is the split Windows already has, where the shipped DLL leaves its symbols 
 packages do not carry. It is 11 MB down to 1.9 for the Godot extension and 2.5 down to 0.4 for the
 engine library, on an APK that pays for every byte.
 
-Neither package ships phonon for Android, because no Android phonon is built yet. When one is,
-nothing in either package changes: phonon links statically, so it lands inside `libbw_audio.so`
-and stages no file of its own. Build it with `.github/actions/build-phonon/` and stage it at
-`third_party/steam-audio-artifacts/lib/android-arm64/`. See
+Both packages ship phonon for Android, inside `libbw_audio.so`: it links statically, so it stages
+no file of its own and neither package gained an entry for it. What it costs is size, about 7 MB
+on arm64 rather than 0.4 MB. See
 [Building without Steam Audio](#building-without-steam-audio) for what a no-SDK build loses.
+
+### Packaging a binding for Linux and macOS
+
+Both bindings carry those two as well, by the same rule. Where each library lands:
+
+| package | path | how it gets there |
+|---------|------|-------------------|
+| Unity   | `Runtime/Plugins/Linux/x86_64/libbw_audio.so` | a Linux build of this repo stages it (CMake `POST_BUILD`), or `tools\upm\pack.ps1 -LinuxFrom <dir>` takes one |
+| Unity   | `Runtime/Plugins/macOS/libbw_audio.dylib` | a macOS build stages it, or `-MacFrom <dir>` |
+| Godot   | `addons/bw_audio/bin/linux/libbw_audio.so` plus `bin/libbw_audio_gd.linux.{editor,template_release}.x86_64.so` | `tools\godot\pack.ps1 -LinuxFrom <dir>` |
+| Godot   | `addons/bw_audio/bin/libbw_audio.dylib` plus `bin/libbw_audio_gd.macos.{editor,template_release}.universal.dylib` | `tools\godot\pack.ps1 -MacFrom <dir>` |
+
+Neither is buildable on a Windows machine, so unlike Android there is no local toolchain path:
+both arrive prebuilt or the pack fails with a message naming the switch. CI hands over the
+`linux-pack-input` and `macos-pack-input` artifacts.
+
+The Godot addon keeps the **Linux** engine library one directory down, in `bin/linux/`. Android's
+has the same file name, `libbw_audio.so`, and one addon carries both. It is Linux that moves,
+because Android's path is the one an APK export resolves and no machine here can test that. The
+extension finds its engine library through an `$ORIGIN` run path: `$ORIGIN` for an exported game,
+where the exporter copies every dependency flat beside the binary, and `$ORIGIN/linux` for the
+editor. macOS uses `@loader_path` and keeps its `.dylib` at the top of `bin/`, where the name
+collides with nothing.
+
+The macOS libraries are **universal** (x86_64 and arm64) and **unsigned**. Gatekeeper blocks a
+downloaded unsigned library, so a Mac user clears the quarantine flag on the unzipped addon or
+package: `xattr -dr com.apple.quarantine <folder>`. Distribution outside the lab would need a
+Developer ID signature and notarization.
+
+`godot-cpp` names each library from its own suffix property, so the file names above are its
+spelling, not ours. macOS is the one platform where the manifest key and the file name differ:
+the key is `macos.editor` with no architecture, because Godot matches every dot-separated tag
+against the running platform's feature tags and a universal binary has no single one to name,
+while the file keeps godot-cpp's `.universal`.
 
 ### What the emulator can and cannot tell you
 

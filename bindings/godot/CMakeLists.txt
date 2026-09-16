@@ -75,12 +75,44 @@ set_target_properties(bwa_gdextension PROPERTIES
   RUNTIME_OUTPUT_DIRECTORY "$<1:${BWA_GODOT_BIN}>"
   PDB_OUTPUT_DIRECTORY     "$<1:${BWA_GODOT_BIN}>")
 
-# bw_audio.dll must sit beside the extension: Godot loads the extension by absolute path, and
-# Windows resolves its imports from that directory. It is the only library to stage - Steam Audio
-# links statically into it, so a with-SDK build copies exactly what a no-SDK build copies.
+# Where the ENGINE library is staged inside the addon. Windows, Android and macOS each name it
+# something nothing else names (bw_audio.dll, libbw_audio.so, libbw_audio.dylib), so those three
+# sit at the top of bin/. LINUX COLLIDES WITH ANDROID - both call it libbw_audio.so - and one
+# addon carries both, so Linux takes a subdirectory. It is Linux that moves, not Android, because
+# Android's spelling is the one already shipped, and its path is the one an APK export resolves,
+# which no machine here can test.
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND NOT ANDROID)
+  set(BWA_GODOT_ENGINE_DIR "${BWA_GODOT_BIN}/linux")
+else()
+  set(BWA_GODOT_ENGINE_DIR "${BWA_GODOT_BIN}")
+endif()
+
+# The engine library must be REACHABLE from the extension: Godot loads the extension by absolute
+# path, and the OS then resolves its imports. Windows searches the loading module's own directory,
+# and an Android APK puts every .so in one lib/<abi>/ that is already on the search path - but ELF
+# and Mach-O off Android search neither, so the extension carries its own relative run path.
+# $ORIGIN covers the exported game (the exporter copies every dependency flat beside the binary)
+# and $ORIGIN/linux the editor, where the addon tree keeps its subdirectory.
+#
+# BUILD_WITH_INSTALL_RPATH, because the file the BUILD writes is the file that SHIPS - it is
+# written straight into the addon. Without it CMake also bakes the build tree's own library
+# directories in, so a shipped extension would carry an absolute path off the machine that built
+# it, ahead of nothing useful. Nothing ever loads the extension from the build tree.
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND NOT ANDROID)
+  set_target_properties(bwa_gdextension PROPERTIES
+    BUILD_WITH_INSTALL_RPATH TRUE INSTALL_RPATH "$ORIGIN;$ORIGIN/linux")
+elseif(APPLE)
+  set_target_properties(bwa_gdextension PROPERTIES
+    BUILD_WITH_INSTALL_RPATH TRUE INSTALL_RPATH "@loader_path")
+endif()
+
+# The engine library must sit where the extension can find it (see above). It is the only library
+# to stage - Steam Audio links statically into it, so a with-SDK build copies exactly what a no-SDK
+# build copies.
 add_custom_command(TARGET bwa_gdextension POST_BUILD
+  COMMAND ${CMAKE_COMMAND} -E make_directory ${BWA_GODOT_ENGINE_DIR}
   COMMAND ${CMAKE_COMMAND} -E copy_if_different
-          $<TARGET_FILE:bw_audio> ${BWA_GODOT_BIN})
+          $<TARGET_FILE:bw_audio> ${BWA_GODOT_ENGINE_DIR})
 
 # The coordinate seam is pure float math in src/bwa_room.h with no godot-cpp dependency,
 # so its property test builds and runs without the editor or the generated bindings.

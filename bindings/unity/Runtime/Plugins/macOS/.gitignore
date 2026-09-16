@@ -1,0 +1,7 @@
+# libbw_audio.dylib is BUILD OUTPUT (staged here by a macOS build of this repo, and by CI when it
+# packs the UPM tarball) - never committed. Its .meta file IS committed: a package installed from
+# a registry is immutable, so the plugin's import settings (macOS universal, Editor on) cannot be
+# fixed in the Inspector afterwards - they have to ship. See tools/upm/gen-meta.ps1.
+*.dylib
+!.gitkeep
+!*.dylib.meta

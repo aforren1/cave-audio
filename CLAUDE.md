@@ -230,12 +230,22 @@ Linux is a second host: JACK and ALSA are device backends there (docs/backends.m
 **Android** is a third: AAudio is a device backend there (phase 3), stereo only, cross-built with
 the NDK against API 26 or later - `tools/android/run-tests.ps1` runs the suite on a device or
 emulator, and docs/build.md's "Android" section has the toolchain. CI cross-builds both ABIs in its
-own `android` job and ships them as a fifth artifact (`bw_audio-android-<ver>`); both bindings carry
+own `android` job and ships them as their own artifact (`bw_audio-android-<ver>`); both bindings carry
 the arm64-v8a library, and the Windows job takes it from that job rather than cross-building one of
 its own. It carries phonon too now, built per ABI by the same composite action; nothing in either
 binding's packaging changed for that, because phonon is linked STATICALLY and lands inside the
 engine library (which costs 0.4 MB -> 7.0 MB stripped on arm64).
 macOS builds on the null/manual sinks until phase 4 lands. Do not bake any backend's assumptions outside its own `*_sink` file.
+
+The `linux` and `macos` jobs SHIP the same way since 2026-09-15: each builds its own Godot
+GDExtension (both flavours) and uploads a standalone engine artifact (`bw_audio-linux-x64-<ver>`,
+`bw_audio-macos-universal-<ver>`, the latter a UNIVERSAL x86_64+arm64 build) plus a fixed-name
+`linux-pack-input` / `macos-pack-input` the Windows job downloads. So both bindings now carry FOUR
+platforms' engine libraries, a tagged release has EIGHT assets, and the Windows job `needs:
+[android, linux, macos]`. Two wrinkles worth knowing: the Godot addon keeps the Linux engine
+library in `bin/linux/` because Android's has the same file name (the extension finds it through an
+`$ORIGIN` run path), and the macOS binaries are UNSIGNED and un-notarized, so a downloaded addon or
+package needs its quarantine flag cleared before either editor loads it.
 
 ```
 cmake -S . -B build -A x64      # default generator = newest installed Visual Studio

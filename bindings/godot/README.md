@@ -53,8 +53,10 @@ install-from-file entry point. So unlike the Unity binding, you cannot install *
 `godot` distribution branch directly. It exists to satisfy a store listing that pulls a repo
 archive.
 
-Windows x64 for the desktop, because the engine's device path there is ASIO, plus **Android
-arm64-v8a** for a standalone headset.
+Four platforms: **Windows x64** for the desktop, where the engine's device path is ASIO,
+**Linux x86_64** (JACK or ALSA), **macOS universal** and **Android arm64-v8a** for a standalone
+headset. Each carries an editor library and an export library, except Android, which runs no
+editor.
 
 ### Android
 
@@ -69,11 +71,26 @@ What differs on a headset:
 - Output is **stereo through AAudio**. There is no 26-channel transport on Android, so use the
   binaural profile. A wider request falls to the silent offline sink.
 - The head pose comes from the **XR rig**, through the same listener push `BwaEngine` already does.
-- It is a **no-SDK build**: no Steam Audio for Android yet, so binaural is the fallback pan, and
-  automatic occlusion, pathing and the reflection bed are absent. Early reflections (ISM), the late
-  tail (FDN) and manual occlusion all work.
+- Steam Audio is **inside the library**, statically linked, so binaural is the real HRTF decode and
+  automatic occlusion, pathing and the reflection bed all work. It costs size: about 7 MB rather
+  than 0.4 MB.
 - `res://` paths are worse here than on the desktop: an exported APK holds them inside the `.pck`,
   where the engine's file loaders have no OS path to open. Stage layouts and audio into `user://`.
+
+### Linux and macOS
+
+Nothing to do: unzip the addon and open the project, the same as on Windows. The manifest names an
+editor and a template_release library for each, so the extension loads in the editor too.
+
+- **Linux** outputs through JACK (a PipeWire desktop answers the same ABI) or ALSA. Its engine
+  library sits in `bin/linux/`, one level down from the others, because Android's has the same file
+  name and one addon carries both. The extension finds it through an `$ORIGIN` run path, in the
+  editor and in an exported game alike.
+- **macOS** has **no device backend yet**, so the engine runs its offline sinks there: everything
+  works except making sound. Its libraries are universal (x86_64 and arm64).
+- The macOS libraries are **not signed or notarized**. Gatekeeper blocks a downloaded unsigned
+  library, so clear the quarantine flag once after unzipping:
+  `xattr -dr com.apple.quarantine addons/bw_audio`.
 
 <!-- dev -->
 ## Distribution

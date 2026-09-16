@@ -23,9 +23,14 @@
 #     godot-cpp commit. Ships as a fourth release asset.
 #   - Android: CROSS-BUILT in its own job (arm64-v8a and x86_64, android-26), with a static
 #     phonon per ABI so an APK gets the HRTF decode, occlusion, pathing and the reflection bed
-#     inside libbw_audio.so, and shipped as a fifth artifact. It also builds the Godot GDExtension for arm64-v8a and
+#     inside libbw_audio.so, and shipped as its own artifact. It also builds the Godot GDExtension for arm64-v8a and
 #     hands both libraries to the Windows job, which is the only place that packs the
 #     bindings. No emulator: see the android job's own note.
+#   - Linux and macOS: the two portability jobs SHIP too. Each builds its own Godot GDExtension
+#     (both flavours) and hands the extension plus the engine library to the Windows job, the same
+#     way android does, so one addon and one Unity package carry every platform. Each also uploads
+#     a standalone engine artifact of its own. macOS builds UNIVERSAL (x86_64 + arm64) and is
+#     unsigned; see those jobs' notes.
 #   - Configs: x64 only. RelWithDebInfo is the full build (tested + tools);
 #     Debug builds the engine + bwa_minimal for downstream debugging (smoke-run).
 #
@@ -58,12 +63,14 @@ env:
 jobs:
   windows:
     runs-on: windows-latest
-    # The Android libraries are packed INTO both bindings, and only a Windows machine can pack them
-    # (the two flavours of the Godot extension and the engine DLL are MSVC builds). So this job waits
-    # for the cross-build rather than reproducing it: an NDK build inside this job would add the
-    # godot-cpp android compile to the longest job in the matrix, for a library ubuntu already has.
-    # The cost is the android job's wall time, which is minutes against this job's phonon build.
-    needs: android
+    # Every other platform's libraries are packed INTO both bindings, and only a Windows machine can
+    # pack them (the two flavours of the Godot extension and the engine DLL are MSVC builds). So this
+    # job waits for the three cross-builds rather than reproducing them: an NDK build inside this job
+    # would add the godot-cpp android compile to the longest job in the matrix, for a library ubuntu
+    # already has, and a Linux or macOS build is not reproducible here at any price. The cost is the
+    # other jobs' wall time, which is minutes against this job's phonon build - and they run in
+    # parallel with each other.
+    needs: [android, linux, macos]
     timeout-minutes: 75   # the uncached phonon build is the long pole; cached runs are far under
     steps:
       - uses: actions/checkout@v6
@@ -201,14 +208,29 @@ jobs:
           name: android-pack-input
           path: pack-android
 
+      - name: Download the Linux libraries (built by the linux job)
+        uses: actions/download-artifact@v6
+        with:
+          name: linux-pack-input
+          path: pack-linux
+
+      - name: Download the macOS libraries (built by the macos job)
+        uses: actions/download-artifact@v6
+        with:
+          name: macos-pack-input
+          path: pack-macos
+
       - name: Pack Godot addon
         id: packgd
         shell: pwsh
         run: |
           # -SkipBuild is wrong here: the editor tree is built but template_release is not, and
-          # pack.ps1 refuses to ship a manifest whose libraries are missing. -AndroidFrom keeps it
-          # from trying to cross-build the third flavour on a runner with no NDK wired up.
-          $a = @{ OutDir = 'dist/godot'; AndroidFrom = (Resolve-Path 'pack-android/godot').Path }
+          # pack.ps1 refuses to ship a manifest whose libraries are missing. The three -*From
+          # switches keep it from trying to cross-build the other platforms on a runner that has
+          # no toolchain for any of them.
+          $a = @{ OutDir = 'dist/godot'; AndroidFrom = (Resolve-Path 'pack-android/godot').Path
+                  LinuxFrom = (Resolve-Path 'pack-linux/godot').Path
+                  MacFrom   = (Resolve-Path 'pack-macos/godot').Path }
           if ($env:GITHUB_REF -like 'refs/tags/v*') { $a.Version = $env:GITHUB_REF_NAME.TrimStart('v') }
           ./tools/godot/pack.ps1 @a
 
@@ -340,7 +362,9 @@ jobs:
           # NB: splat a HASHTABLE, not an array. Array splatting binds POSITIONALLY, so '-PluginsFrom'
           # would land in $Version and the trailing value would have no parameter left to bind to.
           $a = @{ PluginsFrom = 'build/RelWithDebInfo'; OutDir = 'dist/unity'
-                  AndroidFrom = (Resolve-Path 'pack-android/unity').Path }
+                  AndroidFrom = (Resolve-Path 'pack-android/unity').Path
+                  LinuxFrom   = (Resolve-Path 'pack-linux/unity').Path
+                  MacFrom     = (Resolve-Path 'pack-macos/unity').Path }
           if ($env:TAG) { $a.Version = $env:TAG }           # the tag is the version; pack stamps it into the manifest
           ./tools/upm/pack.ps1 @a
 
@@ -375,20 +399,28 @@ jobs:
           if-no-files-found: error
 
       # ---- release (tags only) -------------------------------------------------------------------
-      # The Release IS the distribution - there is no registry. FIVE assets: four audiences want
-      # different bytes, and the fifth is the GPLv3 corresponding source that must accompany them:
+      # The Release IS the distribution - there is no registry. EIGHT assets: six audiences want
+      # different bytes, and the last two are the GPLv3 corresponding source that must accompany them:
       #
-      #   com.brainworks.bw_audio-<ver>.tgz   the Unity package (C# + the two DLLs, import settings set).
+      #   com.brainworks.bw_audio-<ver>.tgz   the Unity package (C# + every platform's engine library,
+      #                                      import settings set).
       #                                      Installs via Package Manager > "+" > "from tarball".
-      #   bw_audio-godot-<ver>.zip            the Godot addon (GDExtension + the two DLLs, both the
-      #                                      editor and template_release library flavours). Unzip into
-      #                                      a project; a GDExtension loads on open, nothing to enable.
+      #   bw_audio-godot-<ver>.zip            the Godot addon (the GDExtension + the engine library for
+      #                                      every platform, in both the editor and template_release
+      #                                      flavours). Unzip into a project; a GDExtension loads on
+      #                                      open, nothing to enable.
       #   bw_audio-win64-<tag>.zip            the engine itself: dll/lib/pdb + bw_audio.h + the tools.
       #                                      The durable home for the native side - workflow artifacts
       #                                      expire, a release does not.
       #   bw_audio-android-<tag>.zip          the Android engine: libbw_audio.so for arm64-v8a and
-      #                                      x86_64 + bw_audio.h. A no-SDK build (no phonon for
-      #                                      Android yet), staged whole by the android job.
+      #                                      x86_64 + bw_audio.h, staged whole by the android job.
+      #   bw_audio-linux-x64-<tag>.zip        the Linux engine: libbw_audio.so + bw_audio.h, staged
+      #                                      whole by the linux job. JACK and ALSA, no ASIO.
+      #   bw_audio-macos-universal-<tag>.zip  the macOS engine: one universal libbw_audio.dylib
+      #                                      (x86_64 + arm64) + bw_audio.h, staged whole by the
+      #                                      macos job. UNSIGNED and un-notarized: a download needs
+      #                                      its quarantine flag cleared, and shipping outside a lab
+      #                                      would need a Developer ID signature.
       #   bw_audio-asio-sdk-src-<tag>.zip     the ASIO SDK source statically linked into bw_audio.dll,
       #                                      redistributed under its GPLv3 option. Corresponding source
       #                                      for the one GPL-covered component the repo does not itself
@@ -401,7 +433,7 @@ jobs:
       # Keep the engine bundle a .zip, and the package the only .tgz on the release. Every UPM registry
       # speaks the npm protocol and keys on a single publishable tarball, so should this ever be listed
       # on one, that stays a config change rather than a rebuild. It costs nothing to preserve.
-      - name: Release (engine zip + Android zip + Unity package tarball + the two source zips)
+      - name: Release (four engine zips + Godot addon + Unity package tarball + the two source zips)
         if: startsWith(github.ref, 'refs/tags/')
         shell: pwsh
         env:
@@ -443,10 +475,20 @@ jobs:
           Compress-Archive -Path pack-android/dist/* -DestinationPath $and -Force
           $and = (Get-Item $and).FullName
 
+          # The Linux and macOS bundles, by exactly the same rule: their own jobs staged the whole
+          # tree and this one only zips it.
+          $lnx = "dist/bw_audio-linux-x64-$tag.zip"
+          Compress-Archive -Path pack-linux/dist/* -DestinationPath $lnx -Force
+          $lnx = (Get-Item $lnx).FullName
+          $mac = "dist/bw_audio-macos-universal-$tag.zip"
+          Compress-Archive -Path pack-macos/dist/* -DestinationPath $mac -Force
+          $mac = (Get-Item $mac).FullName
+
           $notes = @"
-          Windows x64, plus an Android cross-build. Four downloads to use - the **Unity package**, the
-          **Godot addon**, the **engine** itself, or the **Android engine** - plus the **ASIO SDK
-          source** and the **Steam Audio source** (corresponding source; see License below).
+          Windows x64, plus Android, Linux and macOS cross-builds. Six downloads to use - the
+          **Unity package**, the **Godot addon**, or the engine itself for **Windows**, **Android**,
+          **Linux** or **macOS** - plus the **ASIO SDK source** and the **Steam Audio source**
+          (corresponding source; see License below).
 
           ## Unity
 
@@ -454,15 +496,19 @@ jobs:
           **Package Manager > ``+`` > *Install package from tarball...*** That is the whole install.
           (Or install from a git URL: ``https://github.com/aforren1/cave-audio.git#unity``.)
 
-          The package ships the native engine (``bw_audio.dll``, one file: Steam Audio is linked into
-          it) with its import settings already set - nothing to build. Requires **Unity 6**. Turn OFF Unity's built-in audio
+          The package ships the native engine for every platform it supports - ``bw_audio.dll``
+          (Windows), ``libbw_audio.so`` (Linux, Android) and ``libbw_audio.dylib`` (macOS, universal),
+          one file each: Steam Audio is linked into it - with their import settings already set,
+          nothing to build. Requires **Unity 6**. Turn OFF Unity's built-in audio
           (*Project Settings > Audio > Disable Unity Audio*): the engine owns the device.
 
           ## Godot
 
           Download ``bw_audio-godot-*.zip`` below and unzip it into your project so you end up with
           ``addons/bw_audio/``, then restart the editor. A GDExtension loads on project open - there is
-          no plugin to enable. Requires **Godot 4.4+** (built against 4.7).
+          no plugin to enable. Requires **Godot 4.4+** (built against 4.7). The addon carries the
+          editor and export libraries for **Windows x64**, **Linux x86_64** and **macOS universal**,
+          plus the **Android arm64-v8a** export library.
 
           ## Engine (C ABI, tools)
 
@@ -481,6 +527,21 @@ jobs:
           The Unity package and the Godot addon above carry the arm64-v8a library already, so install
           one of those unless you are linking the C ABI yourself.
 
+          ## Linux and macOS
+
+          ``bw_audio-linux-x64-$tag.zip`` - ``libbw_audio.so`` plus ``bw_audio.h``. Output goes
+          through **JACK** (a PipeWire desktop answers the same ABI) or **ALSA**; the 26-channel
+          array is reached over AES67 into the Dante network.
+
+          ``bw_audio-macos-universal-$tag.zip`` - one universal ``libbw_audio.dylib`` (x86_64 and
+          arm64) plus ``bw_audio.h``. macOS has **no device backend yet**, so this is the offline
+          path: rendering through the manual sink and the test suite. It is **not signed or
+          notarized**, so clear the quarantine flag after unzipping:
+          ``xattr -dr com.apple.quarantine <folder>``.
+
+          Both link Steam Audio statically, like every other build here. The Unity package and the
+          Godot addon carry both libraries already.
+
           ## License
 
           **GPLv3.** ``bw_audio.dll`` links the ASIO SDK under its GPLv3 option. Internal use never
@@ -492,10 +553,10 @@ jobs:
           ``bw_audio-asio-sdk-src-$tag.zip`` and ``bw_audio-steam-audio-src-$tag.zip`` below (the two
           third-party sources compiled into the DLL).
           "@
-          # One .tgz (the Unity package) + the Godot addon .zip + the engine .zip + the Android
-          # .zip + the two corresponding-source .zips. Keep the .tgz as the only package
-          # tarball - see the note above.
-          gh release create $tag $tgz $gd $zip $and $src $sasrc --title "bw_audio $tag" --notes $notes
+          # One .tgz (the Unity package) + the Godot addon .zip + the four engine .zips (Windows,
+          # Android, Linux, macOS) + the two corresponding-source .zips. Keep the .tgz as the only
+          # package tarball - see the note above.
+          gh release create $tag $tgz $gd $zip $and $lnx $mac $src $sasrc --title "bw_audio $tag" --notes $notes
 
       # ---- distribution branches (tags only) ------------------------------------------------------
       # The gh-pages idea applied to the bindings. `main` stays source-only; each binding also gets a
@@ -527,10 +588,14 @@ jobs:
           ./tools/dist/publish-branch.ps1 -Branch unity -Source build/upm/package -Version $v -RemoteUrl $remote
           ./tools/dist/publish-branch.ps1 -Branch godot -Source build/godot/addon -Version $v -RemoteUrl $remote
 
-  # ---- portability gate (docs/backends.md phases 2 and 5) --------------------------------------
+  # ---- portability gate, and two more shipping jobs (docs/backends.md phases 2 and 5) ----------
   # These two jobs exist to catch a Win32 call sneaking back into the core, not to test audio: no
   # runner has an audio device, so both build the library, the console examples and the whole test
   # suite and run them on the null and manual sinks.
+  #
+  # They SHIP as well, since 2026-09-15: each builds its own Godot GDExtension in both flavours,
+  # uploads a standalone engine artifact, and hands the Windows job a fixed-name pack input, exactly
+  # as the android job does. That is what lets one addon and one Unity package carry every platform.
   #
   # The linux job DOES compile the two Linux backends (apt installs their dev packages) and asserts
   # both configured, because a runner that quietly lost a header would otherwise turn the whole
@@ -781,7 +846,11 @@ jobs:
 
   linux:
     runs-on: ubuntu-latest
-    timeout-minutes: 75   # the uncached phonon build is the long pole; cached runs are far under
+    # On a cold cache this pays for phonon AND two godot-cpp trees (~2100 generated files each);
+    # a warm one restores both and runs in a fraction of it.
+    timeout-minutes: 120
+    outputs:
+      version: ${{ steps.ver.outputs.version }}
     steps:
       - uses: actions/checkout@v6
         # still no submodules by default: the composite action fetches steam-audio-source itself,
@@ -789,6 +858,27 @@ jobs:
 
       - name: Install the Linux backends' dev packages
         run: sudo apt-get update && sudo apt-get install -y libasound2-dev libjack-jackd2-dev
+
+      - name: Version
+        id: ver
+        shell: bash
+        run: |
+          # The same rule the android job and tools/upm/pack.ps1 use, so every artifact of one run
+          # carries the same version. A default (shallow) checkout has no tags, so a branch build
+          # lands on 0.0.0-dev here exactly as it does everywhere else.
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            v="${GITHUB_REF_NAME#v}"
+          else
+            v="0.0.0-dev"
+            if d=$(git describe --tags --long --dirty --match 'v*' 2>/dev/null); then
+              if [[ "$d" =~ ^v?(.+)-([0-9]+)-g([0-9a-f]+)(-dirty)?$ ]]; then
+                if [ "${BASH_REMATCH[2]}" = 0 ]; then v="${BASH_REMATCH[1]}"
+                else v="${BASH_REMATCH[1]}-dev.${BASH_REMATCH[2]}.g${BASH_REMATCH[3]}"; fi
+              fi
+            fi
+          fi
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+          echo "linux version: $v"
 
       # The pinned build scripts are driven as `python`, not `python3`, and which of the two a
       # runner image happens to put on PATH is not a promise. Pin it.
@@ -855,6 +945,106 @@ jobs:
         # (reflect, bake, path, dynmesh, steam_decode).
         run: ctest --test-dir build -C RelWithDebInfo --output-on-failure
 
+      # ---- the Godot extension, and what the Windows job packs -----------------------------------
+      # Same shape as the android job's contribution: this job is the only place a Linux GDExtension
+      # can be built, so it builds one and hands it over. Two flavours here, unlike Android's one,
+      # because a Linux collaborator runs an EDITOR as well as exporting a game.
+      - name: Cache godot-cpp build (linux)
+        uses: actions/cache@v4
+        with:
+          # Both trees, keyed on the pinned commit, exactly as the windows job does it: godot-cpp
+          # generates and compiles ~2100 binding files per flavour and our nine rebuild on top.
+          # runner.os keeps this entry apart from the Windows one under the same commit.
+          path: |
+            build-godot-editor
+            build-godot-template_release
+          key: godot-cpp-${{ env.GODOT_CPP_COMMIT }}-${{ runner.os }}
+
+      - name: Build the Godot GDExtension (linux x86_64, both flavours)
+        shell: bash
+        run: |
+          # No -G: the default Makefiles generator is on every runner image, and nothing here needs
+          # ninja. BWA_BUILD_TESTS stays ON for the same reason the windows job pins it - these
+          # trees are CACHED, and a stale entry with it off would silently change what they are.
+          for t in editor template_release; do
+            cmake -S . -B build-godot-$t -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+                  -DBWA_BUILD_GODOT=ON -DGODOTCPP_TARGET=$t -DBWA_BUILD_TESTS=ON
+            cmake --build build-godot-$t --target bwa_gdextension
+            ext=bindings/godot/addons/bw_audio/bin/libbw_audio_gd.linux.$t.x86_64.so
+            # The manifest names this exact file. The "lib" prefix is CMake's own default off
+            # Windows; the rest is godot-cpp's suffix property, so the two cannot drift.
+            test -s "$ext"
+            # And it must still LOAD the engine rather than having quietly absorbed it: the addon
+            # ships one engine library, and the manifest lists it as a dependency.
+            readelf -d "$ext" | grep -q 'NEEDED.*libbw_audio\.so'
+          done
+          # The POST_BUILD staged the engine library one directory down, because Android's has the
+          # same file name and one addon carries both.
+          test -s bindings/godot/addons/bw_audio/bin/linux/libbw_audio.so
+
+      - name: Stage dist
+        shell: bash
+        run: |
+          mkdir -p dist-linux/lib dist-linux/include
+          cp build/libbw_audio.so dist-linux/lib/
+          cp include/bw_audio.h   dist-linux/include/
+          cp LICENSE THIRD_PARTY-NOTICES.md dist-linux/
+          cat > dist-linux/DIST.txt <<EOF
+          bw_audio linux-x64 - limited distribution build
+          commit   ${{ github.sha }} (${{ github.ref_name }})
+          built    $(date -u +%Y-%m-%dT%H:%M:%S)Z  (GitHub Actions run ${{ github.run_id }})
+          built on ubuntu-latest (glibc); gcc, x86_64 only
+          backends JACK=yes  ALSA=yes  SteamAudio=yes (STATIC). phonon is built from the pinned
+                   submodule and linked INSIDE libbw_audio.so, so the binaural path is the real
+                   HRTF decode and automatic occlusion, pathing and the reflection bed are all
+                   present. There is no second file to ship or to keep beside it.
+          no ASIO  ASIO is a Windows driver model. Linux reaches the 26-channel array through
+                   JACK (a PipeWire desktop answers the same ABI) or a raw ALSA card; AES67 into
+                   the Dante network is the transport. See docs/backends.md.
+          contents lib/libbw_audio.so + include/bw_audio.h. A Unity or Godot consumer wants the
+                   package or the addon instead - both carry this library already, stripped, with
+                   their import settings set.
+          license  GPLv3 (LICENSE) + THIRD_PARTY-NOTICES.md. No ASIO SDK here, so the complete
+                   corresponding source is this repo at
+                   https://github.com/aforren1/cave-audio/tree/${{ github.sha }}
+                   plus Steam Audio (Apache-2.0, statically linked); on a tagged release its
+                   source ships as bw_audio-steam-audio-src-<tag>.zip.
+          EOF
+          cat dist-linux/DIST.txt
+
+          # What the Windows job packs into the two bindings, plus the whole dist tree so that job
+          # can zip it as a release asset without rebuilding anything. A FIXED artifact name: the
+          # versioned one below is the one a human downloads.
+          #
+          # The packaged copies are STRIPPED, the standalone artifact's are not - the same split
+          # Windows has, where the shipped DLL's symbols sit in a .pdb the packages do not carry.
+          mkdir -p pack-linux/godot pack-linux/unity
+          cp -r dist-linux pack-linux/dist
+          cp bindings/godot/addons/bw_audio/bin/libbw_audio_gd.linux.editor.x86_64.so \
+             bindings/godot/addons/bw_audio/bin/libbw_audio_gd.linux.template_release.x86_64.so \
+             build/libbw_audio.so pack-linux/godot/
+          cp build/libbw_audio.so pack-linux/unity/
+          # Each -*From directory is FLAT; both packs read the manifest to learn where each file
+          # belongs inside the package.
+          strip --strip-debug pack-linux/godot/*.so pack-linux/unity/*.so
+          ls -l pack-linux/godot pack-linux/unity
+
+      - name: Upload artifact (Linux engine)
+        uses: actions/upload-artifact@v6
+        with:
+          name: bw_audio-linux-x64-${{ steps.ver.outputs.version }}-r${{ github.run_number }}
+          path: dist-linux/
+          retention-days: 30
+          if-no-files-found: error
+
+      - name: Upload artifact (packing input for the windows job)
+        uses: actions/upload-artifact@v6
+        with:
+          name: linux-pack-input
+          path: pack-linux/
+          retention-days: 1      # an intra-run handoff, not a download
+          if-no-files-found: error
+
   # UNVERIFIED LOCALLY, all of it: nobody here has a Mac, so this job is the first thing that
   # executes either the shim's Apple paths or a macOS phonon build. Both decisions below came out
   # of the pinned scripts rather than a run. build.py -p osx generates ONE tree named "osx" with
@@ -865,7 +1055,11 @@ jobs:
   # assertion, not a silent no-SDK build.
   macos:
     runs-on: macos-latest
-    timeout-minutes: 75
+    # Same arithmetic as the linux job, and every compile here is UNIVERSAL, so it is two
+    # codegen passes per file.
+    timeout-minutes: 120
+    outputs:
+      version: ${{ steps.ver.outputs.version }}
     steps:
       - uses: actions/checkout@v6
 
@@ -873,6 +1067,25 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.x'
+
+      - name: Version
+        id: ver
+        shell: bash
+        run: |
+          # The same rule as the android and linux jobs; see the android job's copy.
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            v="${GITHUB_REF_NAME#v}"
+          else
+            v="0.0.0-dev"
+            if d=$(git describe --tags --long --dirty --match 'v*' 2>/dev/null); then
+              if [[ "$d" =~ ^v?(.+)-([0-9]+)-g([0-9a-f]+)(-dirty)?$ ]]; then
+                if [ "${BASH_REMATCH[2]}" = 0 ]; then v="${BASH_REMATCH[1]}"
+                else v="${BASH_REMATCH[1]}-dev.${BASH_REMATCH[2]}.g${BASH_REMATCH[3]}"; fi
+              fi
+            fi
+          fi
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+          echo "macos version: $v"
 
       - name: Phonon cache key (submodule sha, no checkout needed)
         id: phonon-key
@@ -898,7 +1111,13 @@ jobs:
 
       - name: Configure
         run: |
-          cmake -S . -B build -DCMAKE_BUILD_TYPE=RelWithDebInfo -DBWA_BUILD_TESTS=ON | tee configure.log
+          # UNIVERSAL, because the shipped artifact is one file for both Apple architectures and an
+          # Intel Mac is still a machine a collaborator has. phonon's own archives are universal
+          # already (core/CMakeLists.txt sets the same pair for every macOS build), so this costs
+          # compile time and nothing else. The ctest suite below is built universal too and runs
+          # natively on whichever arch the runner is.
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=RelWithDebInfo -DBWA_BUILD_TESTS=ON \
+                -DCMAKE_OSX_ARCHITECTURES="x86_64;arm64" | tee configure.log
           grep -q "null and manual sinks only" configure.log
           grep -q "Steam Audio ENABLED" configure.log
 
@@ -909,8 +1128,117 @@ jobs:
         # The same empty-link-rule guard as the linux job. No output-name or output-directory
         # override on the target and no -G here, so the default single-config Makefiles generator
         # writes it to the build root under CMake's own Apple naming.
-        run: test -s build/libbw_audio.dylib
+        run: |
+          test -s build/libbw_audio.dylib
+          # A universal build that silently produced ONE slice is the failure this job cannot see
+          # any other way: it links, it tests, and it fails on half the Macs that download it.
+          lipo -info build/libbw_audio.dylib
+          lipo -info build/libbw_audio.dylib | grep -q x86_64
+          lipo -info build/libbw_audio.dylib | grep -q arm64
+          # phonon is STATIC: nothing to load beside the library.
+          ! otool -L build/libbw_audio.dylib | grep -q phonon
 
       - name: Test
         # 38, the same arithmetic as the linux job above.
         run: ctest --test-dir build -C RelWithDebInfo --output-on-failure
+
+      # ---- the Godot extension, and what the Windows job packs -----------------------------------
+      # UNVERIFIED LOCALLY, like the rest of this job. Every file name below comes from godot-cpp's
+      # own CMake: it sets OUTPUT_NAME to its GODOTCPP_SUFFIX property, whose arch component is the
+      # literal "universal" when CMAKE_OSX_ARCHITECTURES holds both, and it never sets the FRAMEWORK
+      # property, so CMake writes a plain lib*.dylib rather than a .framework bundle. The manifest
+      # key carries no arch (Godot matches feature tags, and "universal" is not one); the FILE name
+      # keeps godot-cpp's spelling. The failure mode is loud: the test -s and lipo checks below.
+      - name: Cache godot-cpp build (macos)
+        uses: actions/cache@v4
+        with:
+          path: |
+            build-godot-editor
+            build-godot-template_release
+          key: godot-cpp-${{ env.GODOT_CPP_COMMIT }}-${{ runner.os }}
+
+      - name: Build the Godot GDExtension (macos universal, both flavours)
+        shell: bash
+        run: |
+          for t in editor template_release; do
+            cmake -S . -B build-godot-$t -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+                  -DCMAKE_OSX_ARCHITECTURES="x86_64;arm64" \
+                  -DBWA_BUILD_GODOT=ON -DGODOTCPP_TARGET=$t -DBWA_BUILD_TESTS=ON
+            cmake --build build-godot-$t --target bwa_gdextension
+            ext=bindings/godot/addons/bw_audio/bin/libbw_audio_gd.macos.$t.universal.dylib
+            test -s "$ext"
+            lipo -info "$ext" | grep -q x86_64
+            lipo -info "$ext" | grep -q arm64
+            # It must still LOAD the engine rather than having quietly absorbed it: the addon ships
+            # one engine library, and the manifest lists it as a dependency.
+            otool -L "$ext" | grep -q libbw_audio.dylib
+          done
+          test -s bindings/godot/addons/bw_audio/bin/libbw_audio.dylib
+
+      - name: Stage dist
+        shell: bash
+        run: |
+          mkdir -p dist-macos/lib dist-macos/include
+          cp build/libbw_audio.dylib dist-macos/lib/
+          cp include/bw_audio.h      dist-macos/include/
+          cp LICENSE THIRD_PARTY-NOTICES.md dist-macos/
+          cat > dist-macos/DIST.txt <<EOF
+          bw_audio macos-universal - limited distribution build
+          commit   ${{ github.sha }} (${{ github.ref_name }})
+          built    $(date -u +%Y-%m-%dT%H:%M:%S)Z  (GitHub Actions run ${{ github.run_id }})
+          arches   one UNIVERSAL library, x86_64 + arm64 ($(lipo -info dist-macos/lib/libbw_audio.dylib))
+          backends none. macOS has no device backend yet (CoreAudio is docs/backends.md phase 4),
+                   so this runs the null and manual sinks: offline rendering and the test suite.
+                   SteamAudio=yes (STATIC), so the binaural path is the real HRTF decode.
+          unsigned NOT code-signed and NOT notarized. Gatekeeper blocks a downloaded unsigned
+                   library, so clear the quarantine flag after unzipping:
+                     xattr -dr com.apple.quarantine <this folder>
+                   Shipping outside a lab needs a Developer ID signature and notarization.
+          contents lib/libbw_audio.dylib + include/bw_audio.h. A Unity or Godot consumer wants the
+                   package or the addon instead - both carry this library already, stripped, with
+                   their import settings set.
+          license  GPLv3 (LICENSE) + THIRD_PARTY-NOTICES.md. No ASIO SDK here, so the complete
+                   corresponding source is this repo at
+                   https://github.com/aforren1/cave-audio/tree/${{ github.sha }}
+                   plus Steam Audio (Apache-2.0, statically linked); on a tagged release its
+                   source ships as bw_audio-steam-audio-src-<tag>.zip.
+          EOF
+          cat dist-macos/DIST.txt
+
+          # What the Windows job packs into the two bindings, plus the whole dist tree so that job
+          # can zip it as a release asset. Same split as android and linux: the packaged copies are
+          # stripped, the standalone artifact's are not.
+          mkdir -p pack-macos/godot pack-macos/unity
+          cp -r dist-macos pack-macos/dist
+          cp bindings/godot/addons/bw_audio/bin/libbw_audio_gd.macos.editor.universal.dylib \
+             bindings/godot/addons/bw_audio/bin/libbw_audio_gd.macos.template_release.universal.dylib \
+             build/libbw_audio.dylib pack-macos/godot/
+          cp build/libbw_audio.dylib pack-macos/unity/
+          # -S drops the debug map, -x every local symbol. Both are what Xcode itself does to a
+          # shared library ("Strip Style: Non-Global Symbols"), and they leave the global symbol
+          # table the dynamic linker binds against - which -fvisibility=hidden has already reduced
+          # to the bwa_* ABI. A bare `strip` is the one to avoid here: on a Mach-O dylib it will
+          # take the exported entries with it and the result no longer loads.
+          strip -S -x pack-macos/godot/*.dylib pack-macos/unity/*.dylib
+          # Prove the strip did not damage them.
+          for f in pack-macos/godot/*.dylib pack-macos/unity/*.dylib; do
+            test -s "$f"
+            lipo -info "$f" | grep -q arm64
+          done
+          ls -l pack-macos/godot pack-macos/unity
+
+      - name: Upload artifact (macOS engine)
+        uses: actions/upload-artifact@v6
+        with:
+          name: bw_audio-macos-universal-${{ steps.ver.outputs.version }}-r${{ github.run_number }}
+          path: dist-macos/
+          retention-days: 30
+          if-no-files-found: error
+
+      - name: Upload artifact (packing input for the windows job)
+        uses: actions/upload-artifact@v6
+        with:
+          name: macos-pack-input
+          path: pack-macos/
+          retention-days: 1      # an intra-run handoff, not a download
+          if-no-files-found: error

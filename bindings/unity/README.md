@@ -39,9 +39,15 @@ engine owns decoding, which also avoids Unity's 8-channel output cap entirely.
 
 ## Install
 
-**Windows x64 only** (ASIO is Windows-only). The released package **ships the native engine**.
-`bw_audio.dll` is inside it, with import settings already configured. Nothing to build. It is one
-file: Steam Audio is linked into the engine rather than shipped beside it.
+**Four platforms**: Windows x64, Linux x86_64, macOS (universal) and Android arm64-v8a. The
+released package **ships the native engine** for every one of them, with import settings already
+configured. Nothing to build, and one file per platform: Steam Audio is linked into the engine
+rather than shipped beside it.
+
+The array itself is Windows only, because ASIO is. Linux reaches it over AES67 through JACK or
+ALSA; macOS has no device backend yet, so it renders offline; Android is the headphone path on a
+standalone headset. The macOS library is unsigned, so clear its quarantine flag once after
+installing a downloaded package: `xattr -dr com.apple.quarantine <the imported package folder>`.
 
 ### From a git URL
 
@@ -52,7 +58,7 @@ https://github.com/aforren1/cave-audio.git#unity
 ```
 
 `unity` is a distribution branch whose **root** is the package: `package.json` at the top level, with
-the two DLLs already in it. That is the only layout UPM's git installer accepts. CI republishes the
+every platform's engine library already in it. That is the only layout UPM's git installer accepts. CI republishes the
 branch on every `v*` tag. Once a tag exists, use a tag ref (`#v0.4.0`) to pin a release instead of
 tracking the branch.
 

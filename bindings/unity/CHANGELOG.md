@@ -4,6 +4,31 @@ All notable changes to `com.brainworks.bw_audio`.
 
 ## [Unreleased]
 
+### Added: the package ships Linux (x86_64) and macOS (universal) plugins
+
+`Runtime/Plugins/Linux/x86_64/libbw_audio.so` and `Runtime/Plugins/macOS/libbw_audio.dylib`, so the
+package now covers all four platforms the engine builds for. Both `.meta` files are committed like
+every other one, and unlike the Android one they enable the **Editor** as well as the player: a
+Linux or macOS collaborator opens the project and presses Play. Linux is x86_64 for the Linux
+editor and the `LinuxStandalone64` player; macOS is `AnyCPU` for the macOS editor and
+`StandaloneOSX`, because the one file is universal (x86_64 and arm64).
+
+`DllImport("bw_audio")` is unchanged again: Mono resolves that name to `libbw_audio.so` on Linux
+and `libbw_audio.dylib` on macOS.
+
+What differs is the device. Linux outputs through JACK (a PipeWire desktop answers the same ABI) or
+ALSA, and can reach the 26-channel array over AES67. macOS has no device backend yet, so the engine
+runs its offline sinks there: everything works except making sound.
+
+The macOS library is **not code-signed or notarized**. A `.dylib` that arrives inside a downloaded
+tarball carries a quarantine flag and the Editor refuses to load it, so clear it once after
+installing: `xattr -dr com.apple.quarantine <the imported package folder>`. Distribution outside a
+lab would need a Developer ID signature and notarization.
+
+`tools/upm/pack.ps1` refuses to pack without either library, the same way it already refuses
+without the Android one, and CI builds both in the `linux` and `macos` jobs and hands them to the
+packing job.
+
 ### Added: the package ships an Android (arm64-v8a) plugin
 
 `Runtime/Plugins/Android/arm64-v8a/libbw_audio.so`, for a standalone-headset build. Its `.meta` is
@@ -19,10 +44,9 @@ transform through the ordinary listener call. `tools/upm/pack.ps1` now REFUSES t
 library rather than shipping a package that installs, exports an APK, and throws on the headset.
 CI cross-builds it in a new `android` job and hands it to the packing job.
 
-It is a no-SDK build: there is no phonon for Android yet, so binaural is the fallback pan and
-automatic occlusion, pathing and the reflection bed are absent. ISM early reflections, the FDN late
-tail and manual occlusion all work. When an Android phonon lands, this package does not change:
-Steam Audio links statically, so it ends up inside `libbw_audio.so`.
+Steam Audio is inside that library too, linked statically, so binaural on a headset is the real
+HRTF decode and automatic occlusion, pathing and the reflection bed all work. The package gains no
+file for it; what it costs is size, about 7 MB rather than 0.4 MB.
 
 ### Changed: the package ships ONE native library per platform (`phonon.dll` is gone)
 

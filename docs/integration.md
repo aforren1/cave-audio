@@ -520,6 +520,38 @@ HRTF decode and automatic occlusion, pathing and the reflection bed all work, ex
 desk. The package gains no file for it and the import settings do not change. What it costs is
 size: the library is about 7 MB on arm64 rather than 0.4 MB, all of it inside the one `.so`.
 
+### Linux and macOS (the other two desktops)
+
+The package ships an engine library for each, beside the Windows one:
+
+| platform | file | enabled for |
+|----------|------|-------------|
+| Linux    | `Runtime/Plugins/Linux/x86_64/libbw_audio.so` | the Linux editor and the `LinuxStandalone64` player, x86_64 |
+| macOS    | `Runtime/Plugins/macOS/libbw_audio.dylib` | the macOS editor and `StandaloneOSX`, AnyCPU (the file is universal) |
+
+Both `.meta` files are committed with the rest and both enable the **editor**, not only the
+player, which the Android one deliberately does not. A Linux or macOS collaborator opens the
+project and presses Play, and the plugin loads in their editor. An installed package is immutable,
+so those settings ship correct or not at all.
+
+`DllImport("bw_audio")` needs no change here either. Mono resolves that name to `libbw_audio.so`
+on Linux and `libbw_audio.dylib` on macOS.
+
+What differs is the device, and only the device:
+
+- **Linux** outputs through JACK (a PipeWire desktop answers the same ABI) or ALSA. The array is
+  reachable over AES67 into the Dante network, so this is a real rig path and not only a desk one.
+- **macOS** has **no device backend yet** (CoreAudio is `docs/backends.md` phase 4). The engine
+  runs on the null and manual sinks there: offline rendering, and everything that does not make
+  sound.
+
+The macOS library is **universal** (x86_64 and arm64) and **unsigned**. Unity itself does not care,
+but Gatekeeper does: a `.dylib` downloaded inside a tarball carries a quarantine flag, and the
+editor then refuses to load it. Clear it once after installing, on the package folder Unity
+imported into (`Library/PackageCache/...`) or on the tarball's extracted tree:
+`xattr -dr com.apple.quarantine <folder>`. Shipping a signed build to anyone outside the lab needs
+a Developer ID signature and notarization, which nothing here does yet.
+
 ## Godot
 
 **Implemented as a GDExtension: [`bindings/godot/`](../bindings/godot/).** Its
@@ -605,6 +637,36 @@ The Android library carries **Steam Audio inside it**, statically linked, so an 
 the real HRTF decode along with occlusion, pathing and the reflection bed. The manifest gains no
 entry for it, because there is no second file: the cost is the engine library's own size, about
 7 MB on arm64 rather than 0.4 MB.
+
+### Linux and macOS (the other two desktops)
+
+The addon carries an `editor` and a `template_release` library for each, so the extension loads in
+a Linux or macOS **editor** as well as in an exported game. The manifest names them:
+
+| platform | extension | engine library |
+|----------|-----------|----------------|
+| Linux    | `bin/libbw_audio_gd.linux.{editor,template_release}.x86_64.so` | `bin/linux/libbw_audio.so` |
+| macOS    | `bin/libbw_audio_gd.macos.{editor,template_release}.universal.dylib` | `bin/libbw_audio.dylib` |
+
+Two things to know about those paths:
+
+- **Linux keeps its engine library one directory down.** Android's has the same file name, and one
+  addon carries both. The extension finds it through an `$ORIGIN` run path, which covers the editor
+  (`$ORIGIN/linux`) and an exported game (`$ORIGIN`, where the exporter copies every dependency
+  flat beside the binary). macOS uses `@loader_path` and needs no subdirectory.
+- **The macOS manifest keys carry no architecture.** `macos.editor`, not `macos.editor.universal`:
+  Godot matches every dot-separated tag against the running platform's feature tags, and
+  `universal` is not one. The file name keeps godot-cpp's own `.universal` spelling, which is the
+  one place a key and a file name deliberately differ.
+
+The device story is the engine's, not the binding's: Linux outputs through JACK or ALSA, and macOS
+has no device backend yet, so it runs the null and manual sinks. Everything the binding exposes
+behaves the same on all four platforms.
+
+The macOS libraries are **unsigned and un-notarized**. An addon unzipped from a download carries a
+quarantine flag and the editor refuses to load it, so clear it once:
+`xattr -dr com.apple.quarantine addons/bw_audio`. Shipping to anyone outside the lab needs a
+Developer ID signature and notarization.
 
 ## Unreal (notes, not yet implemented)
 

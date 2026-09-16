@@ -16,14 +16,23 @@
 # tarball is written with `tar`, which ships with Windows 10+ - no Node/npm anywhere in the pipeline.
 #
 #   cmake --build build --config RelWithDebInfo      # produces the engine DLL
-#   powershell -File tools/upm/pack.ps1 [-Version 0.3.0] [-OutDir dist] [-AndroidFrom <dir with libbw_audio.so>]
+#   powershell -File tools/upm/pack.ps1 [-Version 0.3.0] [-OutDir dist]
+#                                       [-AndroidFrom <dir>] [-LinuxFrom <dir>] [-MacFrom <dir>]
 #
-# The package also carries ONE Android library (Runtime/Plugins/Android/arm64-v8a/libbw_audio.so),
-# for a standalone-headset build. It is an NDK cross-build, so a Windows pack cannot produce it:
-# an Android build of this repo stages it there itself, and -AndroidFrom hands one over (which is
-# how CI passes the android job's artifact into the Windows pack). Missing, it FAILS the pack - a
-# tarball whose Android plugin is absent installs, builds an APK, and throws DllNotFoundException
-# on the headset, which is the latest possible place to find out.
+# The package carries the engine for FOUR platforms, one folder each, because Unity keys a native
+# plugin by its folder as well as by the import settings in its .meta:
+#
+#   Runtime/Plugins/x86_64/bw_audio.dll                  the Windows desktop (and its editor)
+#   Runtime/Plugins/Android/arm64-v8a/libbw_audio.so     a standalone headset
+#   Runtime/Plugins/Linux/x86_64/libbw_audio.so          the Linux desktop (and its editor)
+#   Runtime/Plugins/macOS/libbw_audio.dylib              macOS, universal (and its editor)
+#
+# The last three are cross-builds a Windows pack cannot produce. A native build of this repo on
+# each of those platforms stages its own, and -AndroidFrom / -LinuxFrom / -MacFrom hand one over
+# (which is how CI passes the android, linux and macos jobs' artifacts into the Windows pack).
+# Missing, any of them FAILS the pack - a tarball whose plugin for a platform is absent installs,
+# builds, and throws DllNotFoundException on that platform, which is the latest possible place to
+# find out.
 #
 # The GIT TAG is the single source of truth for the release version. -Version (CI passes the tag)
 # STAMPS the staged package.json, so the committed manifest is a placeholder (0.0.0-dev) that never
@@ -34,7 +43,9 @@ param(
     [string] $Version,                 # optional: stamp this version into the tarball (e.g. from a v0.3.0 tag)
     [string] $OutDir,                  # default: <repo>/dist
     [string] $PluginsFrom,             # optional: build dir to take bw_audio.dll FROM
-    [string] $AndroidFrom              # optional: dir to take the Android arm64 libbw_audio.so FROM
+    [string] $AndroidFrom,             # optional: dir to take the Android arm64 libbw_audio.so FROM
+    [string] $LinuxFrom,               # optional: dir to take the Linux x86_64 libbw_audio.so FROM
+    [string] $MacFrom                  # optional: dir to take the macOS universal libbw_audio.dylib FROM
 )
 $ErrorActionPreference = 'Stop'
 $here = if ($PSScriptRoot) { $PSScriptRoot } else { Split-Path -Parent $MyInvocation.MyCommand.Path }
@@ -138,6 +149,35 @@ foreach ($so in $androidLibs) {
     }
 }
 
+# ---- and the two other desktops ---------------------------------------------------------------
+# Same rule, one folder per platform. Neither is buildable on a Windows machine at all - there is
+# no cross-toolchain here the way there is for Android - so each arrives prebuilt or the pack
+# fails. A native Linux or macOS build of this repo stages its own copy (CMakeLists.txt does it
+# POST_BUILD), which is what makes a pack run on those machines need no switch.
+$crossDesktops = @(
+    @{ Name = 'linux'; Dir = 'Runtime/Plugins/Linux/x86_64'; File = 'libbw_audio.so'
+       From = $LinuxFrom; Switch = '-LinuxFrom'; Input = 'linux-pack-input/unity' },
+    @{ Name = 'macos'; Dir = 'Runtime/Plugins/macOS';        File = 'libbw_audio.dylib'
+       From = $MacFrom;   Switch = '-MacFrom';   Input = 'macos-pack-input/unity' }
+)
+foreach ($p in $crossDesktops) {
+    $dir = Join-Path $pkg $p.Dir
+    if ($p.From) {
+        $src = (Resolve-Path $p.From).Path
+        Write-Host "taking the $($p.Name) plugin from $src"
+        New-Item -ItemType Directory -Force -Path $dir | Out-Null
+        $from = Join-Path $src $p.File
+        if (-not (Test-Path $from)) { throw "$($p.File) not found in $src" }
+        Copy-Item $from (Join-Path $dir $p.File) -Force
+    }
+    if (-not (Test-Path (Join-Path $dir $p.File))) {
+        throw ("$($p.File) is missing from $($p.Dir). Build this repo on $($p.Name) (it stages the " +
+               "library there itself) or pass $($p.Switch) <dir with $($p.File)> - CI hands over the " +
+               "$($p.Name) job's artifact, $($p.Input). A tarball without it installs, then throws " +
+               "DllNotFoundException the first time anyone runs it on $($p.Name).")
+    }
+}
+
 # ---- stage ---------------------------------------------------------------------------------------
 $stage = Join-Path $repo 'build/upm/package'
 if (Test-Path $stage) { Remove-Item $stage -Recurse -Force }
@@ -219,7 +259,9 @@ if (-not (Test-Path $tgz)) { throw "tar did not produce $tgz" }
 # Prove the plugins actually made it in. This is the whole point of staging (see the header).
 $listing = & tar -tzf $tgz
 foreach ($need in 'package/Runtime/Plugins/x86_64/bw_audio.dll',
-                  'package/Runtime/Plugins/Android/arm64-v8a/libbw_audio.so') {
+                  'package/Runtime/Plugins/Android/arm64-v8a/libbw_audio.so',
+                  'package/Runtime/Plugins/Linux/x86_64/libbw_audio.so',
+                  'package/Runtime/Plugins/macOS/libbw_audio.dylib') {
     if ($listing -notcontains $need) {
         throw "$need is MISSING from the tarball. It would install and then fail at runtime."
     }

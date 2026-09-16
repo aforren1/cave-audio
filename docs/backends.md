@@ -1271,6 +1271,18 @@ Known, deliberately not done yet. Each names its trigger.
       with CPU ARM64 and nothing else), the Godot addon at `addons/bw_audio/bin/` with the
       `android.template_release.arm64` entries in its manifest. Both pack scripts refuse to pack
       without them.
+- [ ] A MAC COLLABORATOR loading both packages for the first time: the Unity package imported into
+      a project on macOS (the Editor picks the `.dylib` up, `DllImport("bw_audio")` resolves, Play
+      runs the offline sink) and the Godot addon unzipped into a project (the editor loads
+      `macos.editor` and the extension finds `libbw_audio.dylib` through `@loader_path`). Both are
+      built and name-checked in CI and neither has ever been opened on a Mac. Expect Gatekeeper
+      first: the libraries are unsigned, so the quarantine flag on a downloaded archive has to be
+      cleared (`xattr -dr com.apple.quarantine <folder>`) before either editor will load them.
+- [ ] The same on LINUX: the Unity package in a Linux editor, and the Godot addon in a Linux
+      editor. The Linux extension is the one whose engine library sits in `bin/linux/` rather than
+      beside it, so what this check really exercises is the `$ORIGIN` run path - and an exported
+      Linux game exercises the other half of it, where the exporter flattens every dependency
+      beside the binary.
 - [ ] An exported build from either binding, ON a headset: a Godot Android export and a Unity
       Android player. The packaging is verified only as far as the archives go (the files are in
       them, at the paths the manifests name, with the import settings Unity needs). Nobody has yet

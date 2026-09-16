@@ -513,10 +513,11 @@ endif()
 
 # ---- stage runtime libraries into the Unity package (bindings/unity/Runtime/Plugins/<abi>) ----
 # Gitignored build artifacts; the UPM package picks them up so it "just works" after a build.
-# Unity keys a native plugin by its FOLDER as well as by the import settings in its .meta, so the
-# two ABIs land in two folders: x86_64 for the Windows editor and standalone player, Android/
-# arm64-v8a for a headset build. A x86_64 Android build stages nothing - the package ships one
-# Android ABI, which is the one every current standalone headset runs.
+# Unity keys a native plugin by its FOLDER as well as by the import settings in its .meta, so each
+# platform lands in its own: x86_64 for the Windows editor and standalone player, Android/
+# arm64-v8a for a headset build, Linux/x86_64 and macOS for the other two desktops (editor and
+# player alike). A x86_64 Android build stages nothing - the package ships one Android ABI, which
+# is the one every current standalone headset runs.
 if(WIN32)
   set(BWA_UNITY_PLUGINS "${CMAKE_SOURCE_DIR}/bindings/unity/Runtime/Plugins/x86_64")
   if(EXISTS "${BWA_UNITY_PLUGINS}")
@@ -533,6 +534,26 @@ elseif(ANDROID AND ANDROID_ABI STREQUAL "arm64-v8a")
     add_custom_command(TARGET bw_audio POST_BUILD
       COMMAND ${CMAKE_COMMAND} -E copy_if_different
               $<TARGET_FILE:bw_audio> "${BWA_UNITY_PLUGINS_ANDROID}")
+  endif()
+elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND NOT ANDROID
+       AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|amd64|AMD64)$")
+  # The folder names the ABI, so an arm64 Linux build stages nothing rather than dropping an
+  # aarch64 ELF into a folder whose .meta promises x86_64.
+  set(BWA_UNITY_PLUGINS_LINUX "${CMAKE_SOURCE_DIR}/bindings/unity/Runtime/Plugins/Linux/x86_64")
+  if(EXISTS "${BWA_UNITY_PLUGINS_LINUX}")
+    add_custom_command(TARGET bw_audio POST_BUILD
+      COMMAND ${CMAKE_COMMAND} -E copy_if_different
+              $<TARGET_FILE:bw_audio> "${BWA_UNITY_PLUGINS_LINUX}")
+  endif()
+elseif(APPLE)
+  # The SHIPPED file is universal (CI builds with CMAKE_OSX_ARCHITECTURES "x86_64;arm64"). A local
+  # single-arch build stages here too, which is what makes a Mac developer's own build run in their
+  # own editor; the .meta says AnyCPU either way, and only CI's copy reaches a package.
+  set(BWA_UNITY_PLUGINS_MACOS "${CMAKE_SOURCE_DIR}/bindings/unity/Runtime/Plugins/macOS")
+  if(EXISTS "${BWA_UNITY_PLUGINS_MACOS}")
+    add_custom_command(TARGET bw_audio POST_BUILD
+      COMMAND ${CMAKE_COMMAND} -E copy_if_different
+              $<TARGET_FILE:bw_audio> "${BWA_UNITY_PLUGINS_MACOS}")
   endif()
 endif()
 

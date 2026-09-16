@@ -81,14 +81,59 @@ PluginImporter:
   assetBundleVariant:
 '@.TrimEnd()
         }
-        # A native library under Plugins/Android/<abi>. Unity picks the ABI folder up as a hint, but
-        # the CPU setting is what the importer actually serializes, so it has to say ARM64 too.
-        # Enabled for Android and for NOTHING else: not Any (which would try to load an ARM ELF on
-        # every target), and not the Editor, which runs on the desktop where the x86_64 DLL above is
-        # the plugin. An installed package is immutable, so this cannot be fixed in the Inspector.
+        # A native ELF library. Two folders take one, and they mean different things:
+        #
+        #   Plugins/Android/<abi>  a headset build. Unity picks the ABI folder up as a hint, but the
+        #                          CPU setting is what the importer actually serializes, so it has to
+        #                          say ARM64 too. Enabled for Android and for NOTHING else: not Any
+        #                          (which would try to load an ARM ELF on every target), and not the
+        #                          Editor, which runs on the desktop.
+        #   Plugins/Linux/x86_64   a Linux desktop. Enabled for the Linux EDITOR as well as the
+        #                          player, exactly as the Windows DLL above is: a Linux collaborator
+        #                          has to be able to press Play. The Editor OS and CPU spellings are
+        #                          Unity's own (EditorPluginOSArchitecture: AnyOS/OSX/Windows/Linux).
+        #
+        # An installed package is immutable, so neither can be fixed in the Inspector afterwards.
         '.so' {
+            if ($Path -match 'Plugins/Linux/') {
+                return @'
+PluginImporter:
+  externalObjects: {}
+  serializedVersion: 2
+  iconMap: {}
+  executionOrder: {}
+  defineConstraints: []
+  isPreloaded: 0
+  isOverridable: 0
+  isExplicitlyReferenced: 0
+  validateReferences: 1
+  platformData:
+  - first:
+      Any:
+    second:
+      enabled: 0
+      settings: {}
+  - first:
+      Editor: Editor
+    second:
+      enabled: 1
+      settings:
+        CPU: x86_64
+        DefaultValueInitialized: true
+        OS: Linux
+  - first:
+      Standalone: Linux64
+    second:
+      enabled: 1
+      settings:
+        CPU: x86_64
+  userData:
+  assetBundleName:
+  assetBundleVariant:
+'@.TrimEnd()
+            }
             if ($Path -notmatch 'Plugins/Android/') {
-                throw "no importer rule for a .so outside Plugins/Android: $Path"
+                throw "no importer rule for a .so outside Plugins/Android or Plugins/Linux: $Path"
             }
             return @'
 PluginImporter:
@@ -126,6 +171,51 @@ PluginImporter:
   assetBundleVariant:
 '@.TrimEnd()
         }
+        # A macOS native library. Unity accepts a plain .dylib as well as a .bundle
+        # (DesktopPluginImporterExtension.IsUsableOnOSX tests for both), and one UNIVERSAL file
+        # covers Intel and Apple silicon - which is why both CPU fields say AnyCPU rather than
+        # naming an architecture. Enabled for the macOS editor as well as the player, for the same
+        # reason the Linux .so is: a Mac collaborator has to be able to press Play.
+        '.dylib' {
+            if ($Path -notmatch 'Plugins/macOS/') {
+                throw "no importer rule for a .dylib outside Plugins/macOS: $Path"
+            }
+            return @'
+PluginImporter:
+  externalObjects: {}
+  serializedVersion: 2
+  iconMap: {}
+  executionOrder: {}
+  defineConstraints: []
+  isPreloaded: 0
+  isOverridable: 0
+  isExplicitlyReferenced: 0
+  validateReferences: 1
+  platformData:
+  - first:
+      Any:
+    second:
+      enabled: 0
+      settings: {}
+  - first:
+      Editor: Editor
+    second:
+      enabled: 1
+      settings:
+        CPU: AnyCPU
+        DefaultValueInitialized: true
+        OS: OSX
+  - first:
+      Standalone: OSXUniversal
+    second:
+      enabled: 1
+      settings:
+        CPU: AnyCPU
+  userData:
+  assetBundleName:
+  assetBundleVariant:
+'@.TrimEnd()
+        }
         { $_ -in '.md', '.json', '.txt' } {
             return "TextScriptImporter:`n  externalObjects: {}`n  userData:`n  assetBundleName:`n  assetBundleVariant:"
         }
@@ -136,16 +226,21 @@ PluginImporter:
 }
 
 # Every asset that ships. The native libraries are BUILD OUTPUT (gitignored) - but their .meta is
-# not, so it is generated here whether or not the binary is currently staged on this machine. The
-# Android library is libbw_audio.so for arm64-v8a, which is the ABI every current standalone headset
-# runs. One library per platform: phonon has been linked STATICALLY into the engine library since
-# 2026-09-15, so no Steam Audio file ships beside it.
+# not, so it is generated here whether or not the binary is currently staged on this machine. Four
+# platforms, four folders, because Unity keys a native plugin by its folder as well as by the import
+# settings in its .meta: x86_64 (the Windows desktop), Android/arm64-v8a (the ABI every current
+# standalone headset runs), Linux/x86_64 and macOS (one universal file for both Apple
+# architectures). One library per platform: phonon has been linked STATICALLY into the engine
+# library since 2026-09-15, so no Steam Audio file ships beside it.
 $assets = @(
     'package.json', 'README.md', 'CHANGELOG.md',
     'Runtime', 'Runtime/Plugins', 'Runtime/Plugins/x86_64', 'Editor',
     'Runtime/Plugins/x86_64/bw_audio.dll',
     'Runtime/Plugins/Android', 'Runtime/Plugins/Android/arm64-v8a',
-    'Runtime/Plugins/Android/arm64-v8a/libbw_audio.so'
+    'Runtime/Plugins/Android/arm64-v8a/libbw_audio.so',
+    'Runtime/Plugins/Linux', 'Runtime/Plugins/Linux/x86_64',
+    'Runtime/Plugins/Linux/x86_64/libbw_audio.so',
+    'Runtime/Plugins/macOS', 'Runtime/Plugins/macOS/libbw_audio.dylib'
 )
 # RECURSE. An .asmdef governs its own folder and everything under it, so splitting the package into
 # assemblies (BwAudio, BwAudio.RigDay) necessarily means subfolders. A flat scan silently skips them,

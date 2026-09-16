@@ -1,0 +1,7 @@
+# libbw_audio.so is BUILD OUTPUT (staged here by a Linux build of this repo, and by CI when it
+# packs the UPM tarball) - never committed. Its .meta file IS committed: a package installed from
+# a registry is immutable, so the plugin's import settings (Linux x86_64, Editor on) cannot be
+# fixed in the Inspector afterwards - they have to ship. See tools/upm/gen-meta.ps1.
+*.so
+!.gitkeep
+!*.so.meta

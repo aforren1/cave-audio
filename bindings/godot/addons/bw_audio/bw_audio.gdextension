@@ -25,6 +25,20 @@ windows.template_release.x86_64 = "res://addons/bw_audio/bin/bw_audio_gd.windows
 android.template_debug.arm64 = "res://addons/bw_audio/bin/libbw_audio_gd.android.template_release.arm64.so"
 android.template_release.arm64 = "res://addons/bw_audio/bin/libbw_audio_gd.android.template_release.arm64.so"
 
+; Linux x86_64: an editor flavour (a Linux collaborator opens the project) and the release one an
+; exported game loads, with template_debug pointed at it for the reason given above.
+linux.editor.x86_64 = "res://addons/bw_audio/bin/libbw_audio_gd.linux.editor.x86_64.so"
+linux.template_debug.x86_64 = "res://addons/bw_audio/bin/libbw_audio_gd.linux.template_release.x86_64.so"
+linux.template_release.x86_64 = "res://addons/bw_audio/bin/libbw_audio_gd.linux.template_release.x86_64.so"
+
+; macOS: ONE library per flavour, for both Apple architectures. The key carries no arch because
+; Godot matches every dot-separated tag against the running platform's feature tags, and a
+; universal binary has no single one to name - the FILE name still carries godot-cpp's own
+; ".universal", which is the suffix its CMake builds when CMAKE_OSX_ARCHITECTURES holds both.
+macos.editor = "res://addons/bw_audio/bin/libbw_audio_gd.macos.editor.universal.dylib"
+macos.template_debug = "res://addons/bw_audio/bin/libbw_audio_gd.macos.template_release.universal.dylib"
+macos.template_release = "res://addons/bw_audio/bin/libbw_audio_gd.macos.template_release.universal.dylib"
+
 [dependencies]
 
 ; The OS resolves these as imports of the extension, from its own directory. Listing them
@@ -48,4 +62,28 @@ android.template_debug.arm64 = {
 }
 android.template_release.arm64 = {
   "res://addons/bw_audio/bin/libbw_audio.so": ""
+}
+
+; Linux keeps its engine library one directory down: it has the same file name as Android's, and
+; one addon carries both. The extension finds it through an $ORIGIN run path (bindings/godot/
+; CMakeLists.txt); the exporter still copies it flat beside the game binary, which the same run
+; path covers.
+linux.editor.x86_64 = {
+  "res://addons/bw_audio/bin/linux/libbw_audio.so": ""
+}
+linux.template_debug.x86_64 = {
+  "res://addons/bw_audio/bin/linux/libbw_audio.so": ""
+}
+linux.template_release.x86_64 = {
+  "res://addons/bw_audio/bin/linux/libbw_audio.so": ""
+}
+
+macos.editor = {
+  "res://addons/bw_audio/bin/libbw_audio.dylib": ""
+}
+macos.template_debug = {
+  "res://addons/bw_audio/bin/libbw_audio.dylib": ""
+}
+macos.template_release = {
+  "res://addons/bw_audio/bin/libbw_audio.dylib": ""
 }
