@@ -13,7 +13,7 @@ cmake --build build --config RelWithDebInfo
 
 This fetches Tracy and links its client into `bw_audio.dll`. The client is built **on-demand**, so it
 costs almost nothing until a profiler actually connects. Without `-DBWA_TRACY=ON`, the macros in
-[`src/profile.h`](../src/profile.h) compile to nothing: no dependency, no overhead.
+[`src/core/profile.h`](../src/core/profile.h) compile to nothing: no dependency, no overhead.
 
 ## What's instrumented
 
@@ -102,7 +102,7 @@ a 16-voice load with all propagation effects + the reflection bed measures ~458 
 The Tracy CLI tools need a server dependency stack (zlib/png/bzip2/brotli via pkg-config or vcpkg)
 that isn't always around. For a headless per-zone breakdown with **zero external dependencies**, build
 with `-DBWA_PROFILE_SELF=ON` (mutually exclusive with `-DBWA_TRACY`). The same `BWA_ZONE_*` macros
-then feed a tiny in-process accumulator (`src/profile_self.c`) instead of Tracy, and
+then feed a tiny in-process accumulator (`src/core/profile_self.c`) instead of Tracy, and
 `bwa_bench_situations zones` prints a per-zone table (calls / total ms / mean us / **us/block**) under each situation:
 
 ```

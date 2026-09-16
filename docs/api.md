@@ -1488,7 +1488,7 @@ over pure multicast), so bursty packet delivery doesn't shake the estimate and a
 change in Motive doesn't mis-scale it. Older streams (and streams **newer** than the parser's
 certified suffix layout) fall back to stamping at packet arrival, so prediction keeps working
 either way. (If a future Motive outruns the parser, the unicast-only `Bitstream` command can pin
-the server to a known syntax; see `src/natnet.c`.)
+the server to a known syntax; see `src/tracking/natnet.c`.)
 Set `lead_s` to your measured motion-to-ears latency (in seconds); too much lead **overshoots on
 direction changes**, so start at the measured value, not above it (clamped at 0.2 s). The engine does
 not predict orientation (it only feeds the headphone decodes). Internal tracking only (needs a

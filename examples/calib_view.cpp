@@ -32,14 +32,14 @@
 #include "imgui_te_ui.h"
 
 extern "C" {                       /* engine internals (C, no extern-C guards of their own) */
-#include "layout.h"
-#include "sound.h"
-#include "sos.h"                   /* room-temperature speed of sound (the capsule survey scales with it) */
+#include "core/layout.h"
+#include "core/sound.h"
+#include "dsp/sos.h"                   /* room-temperature speed of sound (the capsule survey scales with it) */
 #include "zylia_capture.h"         /* ZM-1 ASIO shell + ZpShared (pulls in zylia.h: tdoa/doa) */
 }
 #include "calib_capture.h"         /* sweep constants + the simulate/ASIO capture backends (Capture tab) */
-#include "measure.h"               /* measurement DSP (self-guarded extern "C") */
-#include "calib.h"                 /* trims solve + layout writeback (self-guarded extern "C") */
+#include "calib/measure.h"               /* measurement DSP (self-guarded extern "C") */
+#include "calib/calib.h"                 /* trims solve + layout writeback (self-guarded extern "C") */
 
 #include <atomic>
 #include <thread>

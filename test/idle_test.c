@@ -6,7 +6,7 @@
  * no stream open still woke both threads continuously. Invisible on a desk, battery on a headset.
  * How MANY wakes that was depends on the platform timer: a Windows desk box at the default 15.6 ms
  * tick measured 34 + 34 per 500 ms, and the same code with the resolution raised (which any open
- * device sink used to do) reaches ~250 + ~170. Both now block on an os_event (src/os.h); the stream
+ * device sink used to do) reaches ~250 + ~170. Both now block on an os_event (src/os/os.h); the stream
  * thread keeps a bounded timeout only while a ring is actually draining, because its consumer is the
  * AUDIO thread and the audio thread may not signal.
  *
@@ -19,10 +19,10 @@
  * a target that linked both bwa_core and the dll would compile a SECOND copy of them into itself
  * and read the copy the engine never touches.
  */
-#include "assets.h"
-#include "os.h"
-#include "rt.h"
-#include "stream.h"
+#include "core/assets.h"
+#include "os/os.h"
+#include "core/rt.h"
+#include "core/stream.h"
 
 #include <stdio.h>
 #include <string.h>

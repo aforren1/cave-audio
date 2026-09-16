@@ -2,7 +2,7 @@
  * ism_test.c — the image-source geometry (ism.c): six first-order mirrors of a shoebox, their
  * positions, and the per-band reflection coefficients. Pure geometry, no audio thread.
  */
-#include "ism.h"
+#include "acoustics/ism.h"
 
 #include <math.h>
 #include <stdio.h>

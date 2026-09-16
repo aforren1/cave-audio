@@ -5,7 +5,7 @@
  * wavefront), then check: (1) zylia_doa recovers the direction within a degree, (2) zylia_localize
  * recovers the full position to sub-mm on exact data, (3) the DOA is latency-independent.
  */
-#include "zylia.h"
+#include "calib/zylia.h"
 
 #include <math.h>
 #include <stdio.h>

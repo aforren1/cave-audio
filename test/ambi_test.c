@@ -2,7 +2,7 @@
  * ambi_test.c — the 3rd-order ACN/SN3D spherical-harmonic encode (front half of the production
  * binaural monitor). Checks known SH values at the cardinal directions and basic sanity.
  */
-#include "ambisonics.h"
+#include "spatial/ambisonics.h"
 
 #include <math.h>
 #include <stdint.h>

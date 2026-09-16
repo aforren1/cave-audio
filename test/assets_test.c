@@ -27,7 +27,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-#include "os.h"
+#include "os/os.h"
 
 #define SR   48000u
 #define BLK  256u

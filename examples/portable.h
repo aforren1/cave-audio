@@ -4,7 +4,7 @@
  * The examples are CLIENT code of the public ABI (include/bw_audio.h): they show what a game or an
  * experiment writes, so they deliberately do not reach into src/. That leaves them one gap a real
  * client also has — "wait a frame" and "what time is it" — and this header is that gap and nothing
- * else. src/os.h is the ENGINE's shim; this is the demo's, and the two never mix.
+ * else. src/os/os.h is the ENGINE's shim; this is the demo's, and the two never mix.
  */
 #ifndef BWA_EXAMPLES_PORTABLE_H
 #define BWA_EXAMPLES_PORTABLE_H

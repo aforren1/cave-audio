@@ -7,9 +7,9 @@
  *   - the direct-binaural field (BWA_PROFILE_BINAURAL, cardioid fallback decode): laterality,
  *     the 180° flip, median balance, and the cardioid level.
  */
-#include "binaural.h"
-#include "layout.h"
-#include "ambisonics.h"
+#include "binaural/binaural.h"
+#include "core/layout.h"
+#include "spatial/ambisonics.h"
 
 #include <math.h>
 #include <stdio.h>

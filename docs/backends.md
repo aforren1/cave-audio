@@ -1,14 +1,14 @@
 # Device backends
 
 Status: **phases 0, 1, 2, 3 and 5 are implemented**; phase 4 is still specification. The engine
-has seven sinks today: ASIO (`src/asio_sink.cpp`), WASAPI (`src/wasapi_sink.cpp`), JACK
-(`src/jack_sink.c`), ALSA (`src/alsa_sink.c`), AAudio (`src/aaudio_sink.c`), null
-(`src/null_sink.c`), and manual (`src/manual_sink.c`), over the two shared pieces
-(`src/sink_convert.h`, `src/sink_quant.c`) that phase 0 built.
+has seven sinks today: ASIO (`src/sink/asio_sink.cpp`), WASAPI (`src/sink/wasapi_sink.cpp`), JACK
+(`src/sink/jack_sink.c`), ALSA (`src/sink/alsa_sink.c`), AAudio (`src/sink/aaudio_sink.c`), null
+(`src/sink/null_sink.c`), and manual (`src/sink/manual_sink.c`), over the two shared pieces
+(`src/sink/sink_convert.h`, `src/sink/sink_quant.c`) that phase 0 built.
 The ABI those needed is in place: the appended `bwa_sink_type` values,
 `bwa_desc.device` and `sink_flags`, the backend-agnostic device query, and `bwa_health.device_lost`,
-all in the 0.14 minor bump. Phase 2 put the OS shim in (`src/os.h`, `src/os_win.c`,
-`src/os_posix.c`), so the library, the tests and the console examples build and pass with gcc and
+all in the 0.14 minor bump. Phase 2 put the OS shim in (`src/os/os.h`, `src/os/os_win.c`,
+`src/os/os_posix.c`), so the library, the tests and the console examples build and pass with gcc and
 clang on Linux, macOS and Android. What remains is the CoreAudio backend.
 
 Read [architecture.md](./architecture.md) for the bus seam first and
@@ -54,7 +54,7 @@ Three concrete problems the backends fix, in order of pain:
   end.
 
 What does not change: ASIO stays the Windows array transport (a locked decision in
-architecture.md), the bus seam stays, and the render contract in `src/sink.h` stays. A backend is
+architecture.md), the bus seam stays, and the render contract in `src/sink/sink.h` stays. A backend is
 one more consumer of the bus. It must not touch the core.
 
 ## Scope
@@ -133,7 +133,7 @@ Out of scope, on purpose:
 
 ## What stays fixed
 
-`src/sink.h` is the contract. A backend is one file that fills the vtable:
+`src/sink/sink.h` is the contract. A backend is one file that fills the vtable:
 
 ```c
 typedef struct {
@@ -361,14 +361,14 @@ rewire them live, and the sink never reasserts them.
 Build these before the first backend. They are pure, so they get the hardware-free tests the
 backends cannot.
 
-### `src/sink_convert.h`
+### `src/sink/sink_convert.h`
 
 Planar float in, one of {float32, int32, int24 packed, int16} out, planar or interleaved.
 Moved out of `asio_sink.cpp` with its NaN and clamp rules intact; the ASIO sink keeps calling
 the planar variants. Around 120 lines. Test: every format times both layouts, the clamps, NaN
 to 0, and a 26-channel interleave round trip.
 
-### `src/sink_quant.h`, `src/sink_quant.c`
+### `src/sink/sink_quant.h`, `src/sink/sink_quant.c`
 
 The fixed-quantum adapter. Owns: the engine block size `B`, the channel count, a FIFO of
 rendered blocks, the render function, the health counters the adapter can measure
@@ -413,7 +413,7 @@ concatenation of the rendered blocks, nothing duplicated or dropped; each render
 is bit-identical to the FIFO path. Then break it on purpose (an off-by-one in the pop) and
 confirm the test goes red before trusting it, per the CLAUDE.md trap.
 
-### `src/os.h`, `src/os_win.c`, `src/os_posix.c`
+### `src/os/os.h`, `src/os/os_win.c`, `src/os/os_posix.c`
 
 **Implemented (phase 2).** The portability shim. Not needed for WASAPI. Required before CoreAudio,
 ALSA, or AAudio, because those backends imply building the whole library off Windows, and the
@@ -480,7 +480,7 @@ box, and more on a machine whose timer resolution something else has raised.
 
 `test/` and `examples/` carry their own `Sleep`, `GetTickCount64`, and `<windows.h>` (13 test
 files, 14 examples). They move onto the shim in the same phase. Around 300 lines of shim plus a
-mechanical pass over about 40 files. Tests may include `src/os.h`, because they compile the core
+mechanical pass over about 40 files. Tests may include `src/os/os.h`, because they compile the core
 in; examples are client code of the public ABI, so they get their own two-function
 `examples/portable.h` instead of reaching into `src/`.
 
@@ -603,7 +603,7 @@ and AAudio requests exclusive sharing. Off by default, because exclusive mode ta
 device from every other application on a desk machine, and shared mode with an
 `IAudioClient3` period is low-latency enough for a monitor.
 
-`bwa_sink_health` (internal, `src/sink.h`) gains `device_lost` in the same change, because the
+`bwa_sink_health` (internal, `src/sink/sink.h`) gains `device_lost` in the same change, because the
 flag has to reach `engine.c` from the sink somehow. It is not ABI.
 
 ### AUTO order
@@ -690,7 +690,7 @@ The parts of each API that are not obvious, and the decisions taken.
 
 ### WASAPI
 
-Files: `src/wasapi_sink.cpp` (COM is nicer from C++, and the DLL already compiles C++20 for
+Files: `src/sink/wasapi_sink.cpp` (COM is nicer from C++, and the DLL already compiles C++20 for
 the ASIO sink). Link `ole32`, `avrt`. Define `BWA_HAVE_WASAPI`. Windows 10 1607 or later for
 `IAudioClient3`; fall back to `IAudioClient` on older builds.
 
@@ -745,7 +745,7 @@ CI: GitHub's Windows runners have no audio endpoint, so `GetDefaultAudioEndpoint
 
 ### CoreAudio
 
-Files: `src/coreaudio_sink.c`. The HAL is a C API; no Objective-C. Link the `CoreAudio` and
+Files: `src/sink/coreaudio_sink.c`. The HAL is a C API; no Objective-C. Link the `CoreAudio` and
 `CoreFoundation` frameworks. Define `BWA_HAVE_COREAUDIO`.
 
 The HAL, not AUHAL, because the array needs the device's raw channel count and no converter
@@ -777,7 +777,7 @@ one device, and that the count at 48 kHz is 26 or more.
 
 ### JACK
 
-Files: `src/jack_sink.c`. `pkg-config jack` in CMake, link `jack`. The same binary runs on
+Files: `src/sink/jack_sink.c`. `pkg-config jack` in CMake, link `jack`. The same binary runs on
 JACK2 (`libjack`, LGPL-2.1) and on PipeWire (pipewire-jack's drop-in `libjack`, MIT); which one
 answers is decided at run time by what the box has installed. Define `BWA_HAVE_JACK`.
 
@@ -834,7 +834,7 @@ Four things the implementation settled that the sequence above left open:
 
 ### ALSA
 
-Files: `src/alsa_sink.c`. `find_package(ALSA)` in CMake, link `ALSA::ALSA`. alsa-lib is
+Files: `src/sink/alsa_sink.c`. `find_package(ALSA)` in CMake, link `ALSA::ALSA`. alsa-lib is
 LGPL-2.1, dynamically linked, so the license inventory in build.md gains one line and nothing
 else changes. Define `BWA_HAVE_ALSA`.
 
@@ -898,7 +898,7 @@ Five things the implementation settled that the sequence above left open:
 
 ### AAudio
 
-**Implemented (phase 3).** Files: `src/aaudio_sink.c`. Link `aaudio`. `ANDROID_PLATFORM` 26 or
+**Implemented (phase 3).** Files: `src/sink/aaudio_sink.c`. Link `aaudio`. `ANDROID_PLATFORM` 26 or
 later in the NDK toolchain. Define `BWA_HAVE_AAUDIO`.
 
 Builder: output direction, `AAUDIO_SHARING_MODE_SHARED` (exclusive under the flag; the OS

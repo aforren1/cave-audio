@@ -3,7 +3,7 @@
  *
  * Why this is its own test: the ABI speaks UTF-8, but the Windows C runtime reads a narrow path in
  * the process ANSI codepage, so a path with an accent or a CJK character used to fail to open with
- * a plain "cannot open file". The fix (src/os.h: os_fopen, os_utf8_to_wide, and the dr_libs `_w`
+ * a plain "cannot open file". The fix (src/os/os.h: os_fopen, os_utf8_to_wide, and the dr_libs `_w`
  * openers) is spread across four subsystems that share nothing else, so the check belongs where it
  * can name all four: the whole-file decoder (sound.c), the streaming decoder (stream.c), the layout
  * JSON reader (layout.c), and the headphone-EQ parser (hpeq.c).
@@ -17,11 +17,11 @@
  * "bwa_utf8_<e-acute>_<U+97F3>": one Latin accented letter (2 UTF-8 bytes) and one CJK character
  * (3 bytes), split across string literals so no hex escape can swallow the character after it.
  */
-#include "hpeq.h"
-#include "layout.h"
-#include "os.h"
-#include "sound.h"
-#include "stream.h"
+#include "binaural/hpeq.h"
+#include "core/layout.h"
+#include "os/os.h"
+#include "core/sound.h"
+#include "core/stream.h"
 
 #include <stdio.h>
 #include <string.h>

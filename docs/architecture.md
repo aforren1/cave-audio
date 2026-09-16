@@ -50,11 +50,11 @@ one channel per speaker. *Consumers* read that bus:
   *after* the panner, so it auditions the real array render (DBAP behavior and
   all), not an idealized version.
 
-A *device sink* is one file behind one small vtable (`src/sink.h`), so which OS API carries the
+A *device sink* is one file behind one small vtable (`src/sink/sink.h`), so which OS API carries the
 bus is a detail the core never sees. Windows has two: ASIO for the array, and WASAPI
-(`src/wasapi_sink.cpp`) for a stereo monitor on an ordinary endpoint. `cave_both` runs both at
+(`src/sink/wasapi_sink.cpp`) for a stereo monitor on an ordinary endpoint. `cave_both` runs both at
 once. Backends that cannot pin their callback size render through the fixed-quantum adapter
-(`src/sink_quant.c`), so the engine's block stays fixed whatever the device does. See
+(`src/sink/sink_quant.c`), so the engine's block stays fixed whatever the device does. See
 [backends.md](./backends.md).
 
 The sim monitor is just a second consumer of the bus. Keep it that way. The
@@ -205,7 +205,7 @@ The tap ordering is deliberate, not incidental:
 
 ### How wide is the bus?
 
-**The layout's speaker count.** `BWA_CHANNELS` (26, `src/sink.h`) is the compile-time
+**The layout's speaker count.** `BWA_CHANNELS` (26, `src/sink/sink.h`) is the compile-time
 *capacity*. The **active** count is whatever the loaded `cave_layout.json` declares
 (any N in 4..26, fixed at `bwa_create`). Everything downstream follows that count.
 The CAVE installation is 26 speakers. That is the target deployment, not an engine
@@ -264,10 +264,10 @@ orientation component.
 - **Steam Audio via its C API** (not the Unity/FMOD integration). The C API supports
   custom speaker layouts (`IPLSpeakerLayout` with `IPL_SPEAKERLAYOUTTYPE_CUSTOM`,
   unit-direction speakers); the integrations do not expose this. The same dependency
-  carries the whole acoustics stack: the binaural HRTF decode (`src/steam_decode.c`),
-  occlusion + per-band transmission EQ + directivity (`src/steam_scene.c`), the
-  reflection bed with an optional baked mode (`src/steam_reflect.c`), and sound
-  pathing (`src/steam_path.c`), all wired up in `src/engine.c` at `bwa_start`.
+  carries the whole acoustics stack: the binaural HRTF decode (`src/binaural/steam_decode.c`),
+  occlusion + per-band transmission EQ + directivity (`src/acoustics/steam_scene.c`), the
+  reflection bed with an optional baked mode (`src/acoustics/steam_reflect.c`), and sound
+  pathing (`src/acoustics/steam_path.c`), all wired up in `src/engine.c` at `bwa_start`.
 - **Spatialization: listener-relative DBAP**, recomputed per frame from tracked
   position. Pure ambisonics' single sweet spot does not survive a 3×3 m roam. SPCAP
   and VBAP are selectable for fixed-listener installs. The full argument and the
@@ -285,11 +285,11 @@ The engine core links four external pieces:
 - **Steam Audio (phonon)**: HRTF decode, occlusion, reflections, pathing. Optional:
   auto-detected at `third_party/steam-audio-artifacts/` (`BWA_HAVE_STEAMAUDIO`).
   Without it, the simple-pan monitor is the fallback.
-- **dr_libs** (dr_wav/dr_flac/dr_mp3): WAV/FLAC/MP3 decode in `src/sound.c`.
-- **cJSON**: `cave_layout.json` parsing in `src/layout.c`.
+- **dr_libs** (dr_wav/dr_flac/dr_mp3): WAV/FLAC/MP3 decode in `src/core/sound.c`.
+- **cJSON**: `cave_layout.json` parsing in `src/core/layout.c`.
 
 CMake fetches and pins dr_libs and cJSON. Neither is vendored. The NatNet
-(OptiTrack) consumer is first-party code in `src/natnet.c`, written off-wire. The
+(OptiTrack) consumer is first-party code in `src/tracking/natnet.c`, written off-wire. The
 proprietary SDK is a wire-format reference only, never linked.
 
 The opt-in tools carry their own stack, and the engine links none of it:

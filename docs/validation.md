@@ -887,8 +887,8 @@ through different capsules, which separates capsule error from field structure f
 
 | file | what |
 | --- | --- |
-| `src/valid.c` / `valid.h` | the engine render, the propagation to the capsules, scoring, statistics. Hardware-free, unit-tested |
-| `src/zylia.c` | the estimators: intensity DOA, integrity, SRP-PHAT cross-check, comb depth |
+| `src/calib/valid.c` / `valid.h` | the engine render, the propagation to the capsules, scoring, statistics. Hardware-free, unit-tested |
+| `src/calib/zylia.c` | the estimators: intensity DOA, integrity, SRP-PHAT cross-check, comb depth |
 | `examples/validate.cpp` | `bwa_validate`, the session driver |
 | `examples/valid_capture.cpp` | full-duplex ASIO. **Rig-bound, not verified on hardware** |
 | `test/valid_test.c` | the `valid` ctest: statistics, the feed/analytic agreement, the engine-versus-direct regression, determinism, the per-knob effects, the sweep |

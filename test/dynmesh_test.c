@@ -16,15 +16,15 @@
  * a real one from rt_source_create: rt_get_occlusion gates on the control-side handle table, like every
  * other per-handle readback, so a hand-picked integer would read a permanent 1.0 (clear).
  */
-#include "rt.h"
-#include "layout.h"
-#include "steam_scene.h"
-#include "steam_reflect.h"
+#include "core/rt.h"
+#include "core/layout.h"
+#include "acoustics/steam_scene.h"
+#include "acoustics/steam_reflect.h"
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include "os.h"
+#include "os/os.h"
 
 /* row-major 4x4 pure translation (identity rotation), phonon IPLMatrix4x4 order (translation column) */
 static void trans_m16(float m[16], float x, float y, float z) {

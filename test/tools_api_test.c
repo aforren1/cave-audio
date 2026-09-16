@@ -10,7 +10,7 @@
  * No engine is created anywhere here. These calls take no handle by contract.
  */
 #include "bw_audio.h"
-#include "layout.h"            /* bwa_core: layout_derive_spcap_focus, the derivation under test */
+#include "core/layout.h"            /* bwa_core: layout_derive_spcap_focus, the derivation under test */
 
 #include <math.h>
 #include <stdio.h>

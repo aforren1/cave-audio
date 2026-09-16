@@ -14,7 +14,7 @@
  * dsp_test.c and rt_feature_test.c.
  */
 #include "rt_test_util.h"
-#include "sound.h"        /* SoundData, for the async-staging (rt_sound_publish) section */
+#include "core/sound.h"        /* SoundData, for the async-staging (rt_sound_publish) section */
 
 /* A decoded asset built by hand, so the async-staging section can publish a KIND of its choosing
  * into a reserved slot without a file behind it. rt_sound_publish takes ownership of the pcm and

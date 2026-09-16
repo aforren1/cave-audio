@@ -21,12 +21,12 @@
  * opt-in: cmake -DBWA_BUILD_CALIBRATE=ON.
  */
 extern "C" {
-#include "measure.h"
-#include "calib.h"
-#include "layout.h"
-#include "zylia.h"
-#include "sink.h"          /* BWA_CHANNELS */
-#include "sos.h"           /* room-temperature speed of sound: --temp / --c, or the layout's */
+#include "calib/measure.h"
+#include "calib/calib.h"
+#include "core/layout.h"
+#include "calib/zylia.h"
+#include "sink/sink.h"          /* BWA_CHANNELS */
+#include "dsp/sos.h"           /* room-temperature speed of sound: --temp / --c, or the layout's */
 }
 #include "calib_capture.h" /* sweep constants + the simulate/ASIO capture backends */
 

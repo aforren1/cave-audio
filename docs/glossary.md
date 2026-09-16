@@ -128,10 +128,10 @@ The three point-source panners and the knobs that shape them. Full treatment:
 ### Blur
 
 DBAP's `rolloff_r`, the `r` in the blurred source-to-speaker distance
-`d_k = sqrt(|src - spk_k|^2 + r^2)` (`src/dbap.c:21`, `src/dbap.c:34`). Larger `r` spreads a source
+`d_k = sqrt(|src - spk_k|^2 + r^2)` (`src/spatial/dbap.c:21`, `src/spatial/dbap.c:34`). Larger `r` spreads a source
 over more speakers. It also removes the singularity when a source lands exactly on a speaker, so it
 is not optional. Omit `dbap.rolloff_r` from the layout file and the loader derives it as `0.25 x`
-the mean centroid-to-speaker distance (`src/layout.c:326`), which is a starting point to dial
+the mean centroid-to-speaker distance (`src/core/layout.c:326`), which is a starting point to dial
 against the real array, not a finished tuning. Schema:
 [layout-schema.md](./layout-schema.md#fields).
 
@@ -139,7 +139,7 @@ against the real array, not a finished tuning. Schema:
 
 `bwa_set_dual_band_cap` (Menzies and Fazi), a projection on top of the selected panner that
 corrects the [dual-band](#dual-band-panning) low band's **interaural time difference** for the
-tracked head **orientation**. The constraint is one scalar, `rV . e == u_s . e` (`src/cap.c:57`),
+tracked head **orientation**. The constraint is one scalar, `rV . e == u_s . e` (`src/spatial/cap.c:57`),
 so the ITD comes out exact and stays exact as the head turns, which plain dual-band does not do.
 A speaker the panner left silent stays silent. With the head facing the source, it reduces to the
 selected panner. It saturates at the most lateral speaker lit rather than going negative. See
@@ -148,7 +148,7 @@ selected panner. It saturates at the most lateral speaker lit rather than going 
 ### Constant power
 
 Normalizing a gain vector so `sum g_k^2 = gain^2`. Every panner here ends this way
-(`src/dbap.c:47`, `src/spcap.c:69`), because at high frequencies the ear localizes by energy. The
+(`src/spatial/dbap.c:47`, `src/spatial/spcap.c:69`), because at high frequencies the ear localizes by energy. The
 consequence to hold onto: constant power is the **rE-optimal** normalization. It is the wrong one
 below about 700 Hz, which is what [dual-band panning](#dual-band-panning) exists to fix.
 
@@ -157,29 +157,29 @@ below about 700 Hz, which is what [dual-band panning](#dual-band-panning) exists
 Distance-based amplitude panning, the engine's production panner and the only one built for a
 **moving** listener. Per speaker it combines a blurred proximity weight `1/d_k^2` with a
 listener-relative directional weight `0.5 + 0.5*cos` and then normalizes for constant power
-(`src/dbap.c:22`, `src/dbap.c:34-47`). It never touches a convex hull, so the classic Lossius
+(`src/spatial/dbap.c:22`, `src/spatial/dbap.c:34-47`). It never touches a convex hull, so the classic Lossius
 hull-projection failures outside the array cannot happen. Pick it whenever the listener is tracked.
 See [spatialization.md](./spatialization.md#implemented-formulation-dbapc).
 
 ### Density
 
 SPCAP's placement-correction exponent. It sets how sharply `sum cos^density` over the front
-hemisphere counts a speaker's local neighbors (`src/spcap.c:34`). The default is a flat 2.0 with no
-geometry link at all (`src/layout.h:95`), unlike [focus](#focus). It is a live knob
+hemisphere counts a speaker's local neighbors (`src/spatial/spcap.c:34`). The default is a flat 2.0 with no
+geometry link at all (`src/core/layout.h:95`), unlike [focus](#focus). It is a live knob
 (`bwa_set_spcap_focus`). It invalidates SPCAP's cached correction when it moves, so dragging it is
 more expensive than dragging focus. Inert under DBAP and VBAP.
 
 ### Distance attenuation
 
 The source-to-listener level curve, `clamp((ref/max(d,ref))^rolloff, min, 1)`
-(`src/layout.h:98`, `src/layout.h:101`). One implementation serves every panner, the per-source
+(`src/core/layout.h:98`, `src/core/layout.h:101`). One implementation serves every panner, the per-source
 override, and loudness compensation's tracker, so there is exactly one curve in the system. It is
 separate from [occlusion](#occlusion) and from the reflection sim's own distance handling, which
 stay off precisely so nothing counts distance twice.
 
 ### Dual-band panning
 
-Splitting each source at a 700 Hz complementary first-order crossover (`src/rt.c:65`) and
+Splitting each source at a 700 Hz complementary first-order crossover (`src/core/rt.c:65`) and
 normalizing the low band for **amplitude** (`sum g = gain`, which maximizes [rV](#rv)) while the
 high band keeps [constant power](#constant-power). Off by default, a live A/B. It is sweet-spot
 dependent like VBAP, so whether it helps a roaming listener is a rig call, not a settled one. See
@@ -198,13 +198,13 @@ primary-relative. See
 ### Focus
 
 SPCAP's lobe exponent: the per-speaker weight is `((1+cos)/2)^focus` toward the source's bearing
-from the listener (`src/spcap.c:60`). The default comes from the array's mean
-nearest-neighbor angle, clamped to 1..64 (`src/layout.c:58-61`). The 26-speaker cube grid lands
+from the listener (`src/spatial/spcap.c:60`). The default comes from the array's mean
+nearest-neighbor angle, clamped to 1..64 (`src/core/layout.c:58-61`). The 26-speaker cube grid lands
 on 12.7. It is the knob that trades image tightness against [comb depth](#comb-depth), and
 [validation.md](./validation.md#focus-and-where-the-sweep-has-power) puts numbers on the trade.
 Trap: the moment the default stopped being the integer 12, `powf` of a slightly negative lobe
 with a fractional exponent returned NaN and silenced whole gain vectors. The code clamps the lobe
-at 0 now (`src/spcap.c:64`). Any future non-integer exponent reopens that class of bug.
+at 0 now (`src/spatial/spcap.c:64`). Any future non-integer exponent reopens that class of bug.
 
 ### Listener-relative panning
 
@@ -216,7 +216,7 @@ within roughly 16 cm of its center at 1 kHz, and the CAVE listener roams about 3
 
 ### Placement correction
 
-SPCAP's `1/local-density` per-speaker weight (`src/spcap.c:30-36`), the thing that stops a
+SPCAP's `1/local-density` per-speaker weight (`src/spatial/spcap.c:30-36`), the thing that stops a
 **cluster** of speakers from pulling an image toward it. The engine caches it and rebuilds it only
 when the listener or the layout changes, which is what keeps the per-voice solve allocation-free. It
 is the point-source counterpart of what [AllRAD](#allrad) does for the diffuse layer.
@@ -233,7 +233,7 @@ tool's scoring changed. See
 ### SPCAP
 
 Speaker-placement correction amplitude panning, the recommended **fixed-observer** panner
-(`src/spcap.c`). It weights every speaker by a smooth [focus](#focus) lobe, scales by the
+(`src/spatial/spcap.c`). It weights every speaker by a smooth [focus](#focus) lobe, scales by the
 [placement correction](#placement-correction), then normalizes for constant power. The lobe is
 never identically zero across the sphere, so a source over a layout hole fades rather than cutting
 out. Pick SPCAP for a seated install, DBAP for a roaming one.
@@ -256,9 +256,9 @@ tracking fixes horizontal displacement and does not fix height. See
 ### VBAP
 
 Vector-base amplitude panning: the 2 or 3 speakers of the hull triangle containing the source carry
-it, and every other speaker is silent (`src/vbap.c:34`). It is the sharpest of the three panners and
+it, and every other speaker is silent (`src/spatial/vbap.c:34`). It is the sharpest of the three panners and
 also fixed-observer. It needs a clean triangulation, and it falls back to DBAP on a non-triangulable
-array (`src/vbap.c:30`, `src/vbap.c:32`). It shares `hull.c` with AllRAD's decode. Judge a VBAP
+array (`src/spatial/vbap.c:30`, `src/spatial/vbap.c:32`). It shares `hull.c` with AllRAD's decode. Judge a VBAP
 layout by [Frank spread](#frank-spread), not by [rE error](#re-error).
 
 ## Energy-vector metrics and layout scoring
@@ -285,7 +285,7 @@ your render. See [layout-schema.md](./layout-schema.md#authoring-with-bwa_layout
 ### Bootstrap interval
 
 A percentile bootstrap confidence interval on a **median**, fixed seed so a reported interval is
-reproducible (`src/valid.h:256-258`). Medians rather than means throughout, because localization
+reproducible (`src/calib/valid.h:256-258`). Medians rather than means throughout, because localization
 error is heavy-tailed and a mean follows the few directions that fail badly. "The interval excludes
 zero" is the claim worth making. See [validation.md](./validation.md#reading-the-output).
 
@@ -311,7 +311,7 @@ you where in the room to stand; that is the [badness map](#badness-map).
 ### Frank spread
 
 The modeled perceived source **width** in degrees, `186.4 * (1 - |rE|) + 10.7`
-(`examples/layout_tool.cpp:554`, `src/valid.c:365`), a function of the energy vector's **length**
+(`examples/layout_tool.cpp:554`, `src/calib/valid.c:365`), a function of the energy vector's **length**
 alone. [rE error](#re-error) reads the same vector's *direction*, so raising SPCAP
 [focus](#focus) can improve spread and worsen direction at once. Against acoustic measurement,
 rE direction predicts DBAP cells and Frank spread predicts VBAP cells; the layout tool defaults
@@ -346,7 +346,7 @@ while the reverse is benign. Optimize `fixed` only for a permanently seated inst
 
 The layout tool's rE error is **not** a plain great-circle angle by default: `loc_err_deg`
 (`examples/layout_tool.cpp:439`) scales the elevation component by `elev_wt` (default 0.3), with
-near-vertical targets falling back to the raw angle. `src/valid.c:361` computes the plain `acos`
+near-vertical targets falling back to the raw angle. `src/calib/valid.c:361` computes the plain `acos`
 instead, so a layout-tool degree and a `valid_re_proxy` degree are **not the same unit** unless
 you turn the weight off. Do not compare them casually.
 
@@ -362,7 +362,7 @@ layout file; the engine ignores them. See
 
 The Gerzon **energy vector**: the gain-squared-weighted sum of unit speaker directions seen from the
 listener, `rE = sum_k g_k^2 * dir_k / sum_k g_k^2` (`examples/layout_tool.cpp:537-552`,
-`src/valid.c:341-351`). Its direction models where a listener localizes the phantom above roughly
+`src/calib/valid.c:341-351`). Its direction models where a listener localizes the phantom above roughly
 700 Hz and its length models how tight the image is.
 
 The limitation worth stating up front: `rE` is a **static statistic over a gain vector**. It knows
@@ -388,7 +388,7 @@ The **velocity vector**, the amplitude-weighted (not energy-weighted) direction 
 low-frequency localization, where the ear reads summed pressure. The engine never computes `rV`
 explicitly. It appears as the reason [dual-band panning](#dual-band-panning) normalizes the sub-700
 Hz band for amplitude, and as the reason [max-rE](#max-re)'s band-split variant leaves the low band
-untapered (`src/rt.c:2244`).
+untapered (`src/core/rt.c:2244`).
 
 ## Ambisonics, beds and decoders
 
@@ -399,12 +399,12 @@ treatment: [spatialization.md](./spatialization.md#diffuse-bed-decode-allrad-ver
 
 Ambisonic Channel Number, the channel ordering the engine uses: channel `k` carries degree
 `l = floor(sqrt(k))`, running W, Y, Z, X, then the five second-order channels, then the seven
-third-order ones (`src/ambisonics.c:9-31`). Every SH loop in the codebase recovers `l` that way, so
+third-order ones (`src/spatial/ambisonics.c:9-31`). Every SH loop in the codebase recovers `l` that way, so
 `floor(sqrtf(k))` is the idiom to look for.
 
 ### AllRAD
 
-All-Round Ambisonic Decoding (Zotter and Frank 2012), the **default** bed decoder (`src/allrad.c`):
+All-Round Ambisonic Decoding (Zotter and Frank 2012), the **default** bed decoder (`src/spatial/allrad.c`):
 sampling-decode to a dense uniform virtual layout (240 Fibonacci-sphere directions), VBAP each
 virtual loudspeaker onto the real array's hull, then energy-normalize. The uniform virtual layer
 keeps the decode well-conditioned; VBAP absorbs the real array's irregularity. Cost is a heavier
@@ -433,13 +433,13 @@ An ambisonic asset played as a whole soundfield rather than as a positioned sour
 a recorded scene. Beds decode through a fixed SH-to-speaker matrix built at load, or through the
 [parametric bed renderer](#parametric-bed-rendering). In the direct binaural profile a bed passes
 SH to SH into the [direct binaural field](#direct-binaural-field) with one diagonal per channel
-(`src/ambisonics.c:178`) instead of decoding to speakers and re-encoding. See
+(`src/spatial/ambisonics.c:178`) instead of decoding to speakers and re-encoding. See
 [api.md](./api.md#ambisonic-beds-control-thread).
 
 ### Diffuseness
 
 Two related meanings, both "how plane-wave-like is this field", both 0..1 with 0 a clean plane
-wave. The first is the DirAC bed analysis `psi = 1 - |I|/E` (`src/rt.c:2319`), which splits a band
+wave. The first is the DirAC bed analysis `psi = 1 - |I|/E` (`src/core/rt.c:2319`), which splits a band
 into direct `sqrt(1-psi)` and diffuse `sqrt(psi)` streams. The second is the trust number
 `zylia_intensity_doa` returns beside a direction. A high value there means you measured the
 reverberant tail, so the direction is not believable. Diffuseness reads the **opposite** way to
@@ -451,12 +451,12 @@ Directional audio coding (Pulkki). The analysis model behind the
 [parametric bed renderer](#parametric-bed-rendering): per band, take a direction plus a
 [diffuseness](#diffuseness) from the first-order channels and render two streams. The engine runs it
 first-order in 4 coarse time-domain bands with one-pole crossovers at 200, 800 and 3200 Hz
-(`src/rt.c:82-84`) rather than through an STFT, which keeps it block-rate and latency-free.
+(`src/core/rt.c:82-84`) rather than through an STFT, which keeps it block-rate and latency-free.
 
 ### EPAD
 
 Energy-Preserving Ambisonic Decoding (Zotter, Pomberger and Noisternig 2012), the opt-in bed
-decoder (`src/epad.c`): the **polar factor** of the transposed encode matrix,
+decoder (`src/spatial/epad.c`): the **polar factor** of the transposed encode matrix,
 `D = c * Y^T (YY^T)^(-1/2)`, built by a 16x16 Jacobi eigensolve at load. The trade against
 [AllRAD](#allrad): EPAD makes a panned plane wave's decoded energy constant over direction **by
 construction**, while AllRAD tends to localize a touch sharper. Which wins on the real 26 is a
@@ -466,8 +466,8 @@ by-ear A/B. Measured numbers:
 ### Imaginary loudspeaker
 
 An AllRAD device for holes in the array. If no real speaker lies within 60 degrees of a pole
-(`src/allrad.c:24`), the decoder adds a fictitious speaker there to close the triangulation. It then
-**discards** that speaker's decode share (`src/allrad.c:77`). Without it, a floor-less array's hull
+(`src/spatial/allrad.c:24`), the decoder adds a fictitious speaker there to close the triangulation. It then
+**discards** that speaker's decode share (`src/spatial/allrad.c:77`). Without it, a floor-less array's hull
 spans the nadir with triangles of bottom-ring speakers, and downward diffuse energy smears onto
 them. The cube grid's
 roughly 55 degree nadir gap stays under the threshold, so genuinely covered poles are untouched.
@@ -476,9 +476,9 @@ roughly 55 degree nadir gap stays under the threshold, so genuinely covered pole
 
 A per-degree taper applied to the SH signal before the bed decode matrix, `w_l = P_l(r)` with `r`
 the largest zero of `P_{order+1}`, renormalized so diffuse energy matches the untapered decode
-(`src/ambisonics.c:61-72`). Trades a little directional sharpness for a smoother, more robust
+(`src/spatial/ambisonics.c:61-72`). Trades a little directional sharpness for a smoother, more robust
 image away from the center. **Band-split max-rE** (`bwa_set_max_re_split`) tapers only above the
-700 Hz crossover, leaving the [rV](#rv)-optimal plain decode below (`src/rt.c:2244`), the Gerzon
+700 Hz crossover, leaving the [rV](#rv)-optimal plain decode below (`src/core/rt.c:2244`), the Gerzon
 split. Score a layout's [bed metric](#bed-metric) with the same setting the install ships.
 
 ### NFC-HOA
@@ -503,19 +503,19 @@ See [spatialization.md](./spatialization.md#parametric-bed-rendering-bwa_set_bed
 ### Sampling decode
 
 Also called the projection decode or SAD: `decode[s][k] = (2l+1) * Y_k(dir_s) / N`
-(`src/ambisonics.c:54`). Exact on a perfectly uniform array, and it over-energizes dense regions on
+(`src/spatial/ambisonics.c:54`). Exact on a perfectly uniform array, and it over-energizes dense regions on
 an irregular one because every speaker radiates a fixed diffuse energy regardless of where it sits.
 It is **not** a selectable decoder here. It survives only as the automatic fallback when a degenerate
 layout defeats AllRAD or EPAD, and as the energy reference both of those normalize to
-(`src/allrad.c:93`, `src/epad.c:109`).
+(`src/spatial/allrad.c:93`, `src/spatial/epad.c:109`).
 
 ### SN3D and N3D
 
 Two SH normalization conventions. The engine encodes **SN3D** (the AmbiX convention,
-`src/ambisonics.c:9`). N3D is the fully orthonormal one, related per degree by `sqrt(2l+1)`
-(`src/epad.c:62`). EPAD builds in N3D because its energy property holds in the orthonormal
+`src/spatial/ambisonics.c:9`). N3D is the fully orthonormal one, related per degree by `sqrt(2l+1)`
+(`src/spatial/epad.c:62`). EPAD builds in N3D because its energy property holds in the orthonormal
 basis. phonon wants orthonormal real SH, so the monitor encode rescales per degree by
-`sqrt(2l+1)/sqrt(4*pi)` (`src/ambisonics.c:153-160`). If you are chasing a level or direction bug in
+`sqrt(2l+1)/sqrt(4*pi)` (`src/spatial/ambisonics.c:153-160`). If you are chasing a level or direction bug in
 the binaural path, the normalization is where to look first. See
 [spatialization.md](./spatialization.md#headphone-renders-direct-binaural-and-the-array-sim).
 
@@ -528,7 +528,7 @@ Giving a source angular size without moving its perceived direction or its loudn
 
 `bwa_set_decorrelation`, off by default: a spread source's energy splits into a coherent share on
 the normal path and an incoherent share through **per-speaker sparse velvet-noise filters**
-(30 taps over 30 ms, `src/rt.c:77-78`; Valimaki and Schlecht). Split amplitude `sqrt(spread)`,
+(30 taps over 30 ms, `src/core/rt.c:77-78`; Valimaki and Schlecht). Split amplitude `sqrt(spread)`,
 ramped, power-conserving; time-domain, no onset latency. The same bank renders the parametric
 bed's diffuse stream. It and [spectral widening](#spectral-widening) are two answers to
 [phantom collapse](#phantom-collapse); A/B them and keep the winner.
@@ -545,7 +545,7 @@ straight overhead is undefined, as it is in BS.2127.
 
 `bwa_set_hole_spread`, an engine-wide policy for arrays with **holes**: it floors a source's
 [spread](#spread) by the angular gap from the source bearing to the nearest speaker bearing,
-`floor = strength * clamp((gap - knee)/(pi/2 - knee), 0, 1)` (`src/hole.c:53`), where `knee` is
+`floor = strength * clamp((gap - knee)/(pi/2 - knee), 0, 1)` (`src/spatial/hole.c:53`), where `knee` is
 the array's own mean speaker spacing. It exists because the hull closes a hole with a big
 triangle of distant speakers, a split image rather than a phantom. A source with no speaker near
 it is not a point, so it renders honestly wide instead. An array that surrounds the listener
@@ -555,7 +555,7 @@ derives no floor at any bearing. See [spatialization.md](./spatialization.md).
 
 The default spread render (`BWA_SPREAD_LOBE`): blend the panner's point gains toward a
 width-controlled lobe `(0.5*(1+cos))^q` centered on the source direction, with
-`q = 1.5 + (1-spread)*6` (`src/rt.c:1168`), then renormalize to the panner's own power. One solve,
+`q = 1.5 + (1-spread)*6` (`src/core/rt.c:1168`), then renormalize to the panner's own power. One solve,
 smooth and cheap. The catch is that the extent is a **reshaping of gains solved for a point**, so it
 does not inherit the selected panner's character the way [MDAP](#mdap) does.
 
@@ -587,7 +587,7 @@ mechanism [comb depth](#comb-depth) measures. See
 
 `bwa_source_set_size`, the **metric** parametrization of spread: a radius in meters. The spread is
 floored at the angle the radius subtends from the tracked listener, `asin(r/d)/(pi/2)`
-(`src/rt.c:1412`), capped at 1 once the listener is inside the source. Prefer it when the content has
+(`src/core/rt.c:1412`), capped at 1 once the listener is inside the source. Prefer it when the content has
 a physical size, because a 2 m waterfall then *stays* 2 m wide as you walk, where an angular spread
 would change physical size with distance. The larger of spread and the size-derived floor wins.
 
@@ -595,7 +595,7 @@ would change physical size with distance. The larger of spread and the size-deri
 
 `BWA_SPREAD_SPECTRAL`, spread mode 2 (Zotter and Frank's phantom-source widening). The source splits
 into 6 complementary one-pole bands with crossovers at 250, 700, 1800, 4500 and 10000 Hz
-(`src/rt.c:71-73`). The engine pans each band to its **own direction** inside the spread cone, every
+(`src/core/rt.c:71-73`). The engine pans each band to its **own direction** inside the spread cone, every
 one a real panner solve. The ear integrates the scattered spectrum into width. Because different
 frequencies come from different speakers, there are **no coherent copies to collapse or comb**:
 extent without decorrelation noise. Costs about 6 band filters plus 6 gain sets per wide voice, and
@@ -627,7 +627,7 @@ Three implementations overlap here and they are complementary. Read
 
 A material's per-band fraction of energy absorbed on reflection, 0..1 (1 is dead, 0 is a perfect
 mirror), in Steam Audio's 3-band low/mid/high model. The [image-source](#image-source-method) path
-converts it to a pressure reflection coefficient as `sqrt(1 - absorption)` (`src/ism.c:41`). See
+converts it to a pressure reflection coefficient as `sqrt(1 - absorption)` (`src/acoustics/ism.c:41`). See
 [materials.md](./materials.md#the-acoustic-material-model).
 
 ### Anisotropic decay
@@ -649,7 +649,7 @@ baked result: the bake froze the geometry, so use real-time reflections if the s
 
 The frequency-dependent loss a [pathed](#pathing) sound picks up bending around an occluder
 (phonon's `eqCoeffs`, beside `shCoeffs`' direction and level). The engine normalizes it to a pure
-tilt (loudest band 1, floored at 0.0625, `src/steam_path.c:167`), so it adds color without
+tilt (loudest band 1, floored at 0.0625, `src/acoustics/steam_path.c:167`), so it adds color without
 disturbing the level. It applies to the un-occluded signal *before* the SH encode. See
 [materials.md](./materials.md#sound-pathing-bwa_descenable_pathing).
 
@@ -670,13 +670,13 @@ the only one with parallax. See [materials.md](./materials.md#choosing-an-acoust
 
 ### FDN
 
-A 16-line feedback delay network (`src/fdn.c`), the phonon-free **late tail**. Householder feedback
+A 16-line feedback delay network (`src/acoustics/fdn.c`), the phonon-free **late tail**. Householder feedback
 (orthogonal, so the decay filters are the only loss), line delays spread 23 to 90 ms and kept
-co-prime-ish so modes do not stack (`src/fdn.c:29-32`), two-band decay filters per line derived as
-`g = 10^(-3 * len / (rt60_eff * fs))` (`src/fdn.c:67`). Each line is assigned a Fibonacci-sphere
+co-prime-ish so modes do not stack (`src/acoustics/fdn.c:29-32`), two-band decay filters per line derived as
+`g = 10^(-3 * len / (rt60_eff * fs))` (`src/acoustics/fdn.c:67`). Each line is assigned a Fibonacci-sphere
 direction and rendered as a plane wave through the bed decode, which is what makes
 [anisotropic decay](#anisotropic-decay) possible. Deterministic CPU, infinite tail, designable
-decay. Defaults: 1.2 s low, 0.7 s high, 2000 Hz crossover (`src/fdn.c:127`).
+decay. Defaults: 1.2 s low, 0.7 s high, 2000 Hz crossover (`src/acoustics/fdn.c:127`).
 
 ### Hybrid reverb
 
@@ -687,7 +687,7 @@ hybrid unconditionally. See
 
 ### Image-source method
 
-`src/ism.c`, first-order specular reflections for a shoebox: the engine renders each of the six
+`src/acoustics/ism.c`, first-order specular reflections for a shoebox: the engine renders each of the six
 mirror images as **a point source through its own listener-relative panner**. A reflection therefore
 gets the right direction, distance attenuation, and **parallax**, which a listener-centric bed
 structurally cannot give. Cost is O(N) in sources against the bed's O(1), so opt in on the few
@@ -708,13 +708,13 @@ How much of the direct path a surface blocks, a scalar 0..1 from a ray query, ap
 **mono voice upstream of panning** with a 3-band [transmission](#transmission) EQ (so a wall
 *muffles*, not merely attenuates). Volumetric, so partial cover attenuates smoothly. It does not
 enter the gain solve and does not dirty the voice. The fold is
-`raw[b] = occlusion + (1 - occlusion) * transmission[b]` (`src/steam_scene.c:394`). See
+`raw[b] = occlusion + (1 - occlusion) * transmission[b]` (`src/acoustics/steam_scene.c:394`). See
 [materials.md](./materials.md#direct-sound-per-source-occlusion-not-distance).
 
 ### Pathing
 
 Routing sound around occluders and through portals over a baked probe-to-probe visibility graph
-(`src/steam_path.c`). A pathing voice SH-encodes its **un-occluded** signal into a shared ambisonic
+(`src/acoustics/steam_path.c`). A pathing voice SH-encodes its **un-occluded** signal into a shared ambisonic
 accumulator, because the indirect path goes around the occluder and the direct-path occlusion must
 not apply to it. It only does anything where the scene has real occluders. See
 [materials.md](./materials.md#sound-pathing-bwa_descenable_pathing).
@@ -730,7 +730,7 @@ See [materials.md](./materials.md#reflections--reverb-a-diffuse-ambisonic-bed).
 ### RT60
 
 The time for a decaying field to drop 60 dB. `bwa_calibrate --room` measures it by Schroeder backward
-integration, reading T20 from the -5 dB to -25 dB span and tripling it (`src/measure.c:123-136`).
+integration, reading T20 from the -5 dB to -25 dB span and tripling it (`src/calib/measure.c:123-136`).
 
 **Do not copy a measured RT60 into the engine's reverb settings.** The room's own decay is a
 **floor**: you cannot render a space deader than the room you are standing in, and setting the
@@ -779,14 +779,14 @@ SH-encode at their **true** listener-relative direction, so none of the array's 
 reaches the ears. Beds pass SH to SH into it, and [pathing](#pathing) sums in raw. With the SDK
 each point voice additionally gets its own `IPLBinauralEffect`, and spread power-splits between
 point tap and field. Without the SDK the fallback is two opposed cardioids
-(`src/binaural.c:63-75`): fine for routing and gross laterality, useless for timbre. See
+(`src/binaural/binaural.c:63-75`): fine for routing and gross laterality, useless for timbre. See
 [spatialization.md](./spatialization.md#headphone-renders-direct-binaural-and-the-array-sim).
 
 ### Headphone correction EQ
 
 `bwa_load_headphone_eq`: an AutoEq `ParametricEQ.txt` parsed into an RBJ biquad cascade applied to
-the **final stereo** of every headphone profile (`src/hpeq.c`, preamp at `src/hpeq.c:33`, section
-build at `src/hpeq.c:61`). It is the headphone-side counterpart of the array's per-speaker align
+the **final stereo** of every headphone profile (`src/binaural/hpeq.c`, preamp at `src/binaural/hpeq.c:33`, section
+build at `src/binaural/hpeq.c:61`). It is the headphone-side counterpart of the array's per-speaker align
 stage. Personalized [SOFA](#sofa) HRTFs correct the *ears*, this corrects the *transducer*, and they
 compose. A `Filter` line that does not parse fails loudly rather than shipping a silently partial
 correction. See [api.md](./api.md#headphone-correction-eq-control-thread).
@@ -823,7 +823,7 @@ The efficiency trick behind both headphone profiles: treat each bus channel as a
 at its surveyed direction relative to the head, encode into ambisonics with a fixed matrix, sum
 the [direct binaural field](#direct-binaural-field) in, and run **one** ambisonics-to-binaural
 decode instead of 26 HRTF convolutions. One function (`ambi_encode_phonon`,
-`src/ambisonics.c:166`) does the encode for both consumers, so they cannot drift in convention.
+`src/spatial/ambisonics.c:166`) does the encode for both consumers, so they cannot drift in convention.
 
 ## Per-source propagation effects
 
@@ -834,7 +834,7 @@ Physically motivated per-voice DSP, all opt-in and all phonon-free. See
 ### Air absorption
 
 A distance-driven one-pole low-pass on the direct path: cutoff about 18 kHz at zero distance, falling
-650 Hz per meter, floored at 1200 Hz (`src/rt.c:51-53`). Subtle in-room, pronounced for far virtual
+650 Hz per meter, floored at 1200 Hz (`src/core/rt.c:51-53`). Subtle in-room, pronounced for far virtual
 sources. Steam Audio's own `airAbsorption` flag stays **off** so the engine does not apply the
 effect twice.
 
@@ -844,7 +844,7 @@ Rendering a voice through its acoustic propagation delay, `distance / c`, on a p
 delay ring. The engine does not compute the pitch shift: it falls out of the changing delay, because
 the read tap's glide rate *is* the resampling ratio `1 - v_radial/c`. So you never supply a
 velocity. The
-delay saturates past 8 m to bound the ring (`src/rt.c:49`). This is a **per-source** delay and
+delay saturates past 8 m to bound the ring (`src/core/rt.c:49`). This is a **per-source** delay and
 composes with the per-speaker align delay, which does a different job.
 
 ### Loudness compensation
@@ -852,19 +852,19 @@ composes with the per-speaker align delay, which does a different job.
 `bwa_source_set_loudness_comp`, the perceptual counterpart of distance attenuation. At lower levels
 the ear loses LF sensitivity (the ISO 226 contours), so an attenuated source reads *thin* as well as
 far. A one-pole LF shelf boosts by **0.4 dB per dB** of attenuation the panner applied, capped at
-+8 dB (`src/rt.c:1766-1768`). A stylization, not physics: strict realism leaves it off.
++8 dB (`src/core/rt.c:1766-1768`). A stylization, not physics: strict realism leaves it off.
 
 ### Near-field proximity boost
 
 The near-distance mirror of loudness compensation: an LF shelf rising linearly from 0 dB at 1 m to
-+6 dB at distance 0, corner 300 Hz (`src/rt.c:57-60`). It renders the spherical-wavefront proximity
++6 dB at distance 0, corner 300 Hz (`src/core/rt.c:57-60`). It renders the spherical-wavefront proximity
 effect, so "at arm's length" reads as bass rather than only as level. Load-bearing in a walkable
 volume where sources really do reach the head.
 
 ### Reverb send
 
 The per-voice wet feed into the reflection tap, ramped from 0.25 at 1 m to 1.0 at 6 m
-(`src/rt.c:61-64`), so distant sources sit wetter. The engine taps the send **before** Doppler and
+(`src/core/rt.c:61-64`), so distant sources sit wetter. The engine taps the send **before** Doppler and
 air absorption, which is why those two do not color the reverb feed.
 
 ## Calibration and the acoustic survey
@@ -914,7 +914,7 @@ See [calibration.md](./calibration.md#modes).
 ### Deconvolution
 
 Recovering a speaker's impulse response from a recorded [exponential sweep](#exponential-sweep) by
-regularized inverse filtering (`measure_response` in `src/measure.c`). Two numbers come out of the
+regularized inverse filtering (`measure_response` in `src/calib/measure.c`). Two numbers come out of the
 result: the direct-path **delay** (system latency plus time of flight) and the broadband **level**.
 One sample at 48 kHz is 7 mm, and sub-sample peak interpolation gets well below that. The accuracy
 limit is your mic position and your assumed [speed of sound](#speed-of-sound), not the acoustics.
@@ -977,10 +977,10 @@ in a moving-listener session. What no EQ fixes is **decay**. See
 ### Speed of sound
 
 Two different quantities wear this name and confusing them is a real error: **measurement `c`**
-(`src/sos.h`), a property of the room being surveyed (`331.3 + 0.606 * t_c`, guarded to
+(`src/dsp/sos.h`), a property of the room being surveyed (`331.3 + 0.606 * t_c`, guarded to
 306-380 m/s, riding the layout as `reference.speed_of_sound_mps`), and **engine `c`**
-(`BWA_SPEED_OF_SOUND`, `src/rt.c:46`), a live medium and creative control for
-[Doppler](#doppler). `src/sos.h:12` states the separation explicitly. See
+(`BWA_SPEED_OF_SOUND`, `src/core/rt.c:46`), a live medium and creative control for
+[Doppler](#doppler). `src/dsp/sos.h:12` states the separation explicitly. See
 [calibration.md](./calibration.md#air-temperature).
 
 ### Survey spread
@@ -996,7 +996,7 @@ Unrelated to source [spread](#spread), which is a width. See
 
 `bwa_set_tracked_align`, off by default: the per-speaker delay and gain trims re-referenced from
 the layout's reference point (`Layout.ref`, the array centroid by default) onto the **tracked** listener, so time coherence follows the head
-(`src/rt.c:2692`, `listener_align_track`). Opt-in because every delay change is a resampling event: a
+(`src/core/rt.c:2692`, `listener_align_track`). Opt-in because every delay change is a resampling event: a
 walking listener Doppler-shifts the entire array at once. A dead zone and a slew rate limit bound
 that; a faster listener gets a lagging alignment rather than a warbling one. The
 tracked-position sibling of [tracked room EQ](#tracked-room-eq). See
@@ -1036,14 +1036,14 @@ arrival time of its own. See
 ### Angular miss
 
 The great-circle angle between where a source was supposed to come from and where the estimator says
-it came from, `ValidCell.miss_deg` (`src/valid.h:68`). It is the number nobody has, and the number
+it came from, `ValidCell.miss_deg` (`src/calib/valid.h:129`). It is the number nobody has, and the number
 every proxy in this repo is a proxy for. Read it as an **excess** over the [physical floor](#physical-floor),
 never as an absolute.
 
 ### Capsule integrity
 
 `zylia_check_capsules`, run **before** believing any direction. It flags `DEAD`, `HOT`, `CLIPPED` and
-`INCOHERENT` capsules (`src/zylia.h:120-123`) against the array's own **robust median**, so a fault
+`INCOHERENT` capsules (`src/calib/zylia.h:120-123`) against the array's own **robust median**, so a fault
 cannot define the baseline it is judged by. The flags array drops straight in as the `exclude`
 argument to either estimator. **Report every exclusion**: a direction from 17 capsules is fine, a
 direction from 17 capsules you believed came from 19 is not. See
@@ -1052,14 +1052,14 @@ direction from 17 capsules you believed came from 19 is not. See
 ### Cell
 
 One measured or simulated data point: a panner, a solve mode, a listening position, a target
-direction, and what came back (`ValidCell`, `src/valid.h:56-76`). A cell carries **both** an
+direction, and what came back (`ValidCell`, `src/calib/valid.h:56-76`). A cell carries **both** an
 [angular miss](#angular-miss) and a [comb depth](#comb-depth), and the two estimators refuse
 independently, so `ok` and `comb_ok` are separate flags.
 
 ### Comb depth
 
 The spectral ripple a phantom's coherent copies impose, in dB: the **interdecile range** of the
-detrended sub-band spectrum (`src/zylia.c:818`), averaged over the included capsules. 0 dB is a
+detrended sub-band spectrum (`src/calib/zylia.c:818`), averaged over the included capsules. 0 dB is a
 flat response, what a single coherent arrival gives. Three traps: the axis is **frequency, not
 the capsules** (all 19 capsules see nearly the same comb; they average its noise down, they do
 not sample it independently); it **cannot come from [rE](#re)**, which knows nothing about
@@ -1071,14 +1071,14 @@ arrival times or frequency; and **two equal copies null completely**, so tighten
 
 The believability number beside a [comb depth](#comb-depth): the **standard error** of the capsule
 mean, not the raw spread, because the spread is what the averaging already handled
-(`src/zylia.c:846`, with 1.0 dB of standard error taking it to 0). It reads the opposite way to
+(`src/calib/zylia.c:846`, with 1.0 dB of standard error taking it to 0). It reads the opposite way to
 [diffuseness](#diffuseness): **1 is good**. Below about 0.5 the capsules are not seeing one comb, so
 suspect a capsule fault or a capture that drifted.
 
 ### Direct channel route
 
 `bwa_source_set_channel`: send one source's content to exactly ONE output channel, with every
-spatial and propagation stage bypassed (`src/rt.c`, `direct_channel_gains`). It is the live,
+spatial and propagation stage bypassed (`src/core/rt.c`, `direct_channel_gains`). It is the live,
 in-engine form of the [physical reference arm](#physical-reference-arm) that `bwa_validate` builds
 offline, so the A/B a listener hears matches the one the measurement scores. It is installed as a
 one-hot gain vector at the panner's output, NOT as a post-align injection like
@@ -1088,7 +1088,7 @@ ramps and the same level scale as the phantom it is compared against. See
 
 ### First-order ceiling
 
-`ZYLIA_FOA_FMAX`, 1200 Hz (`src/zylia.h:89`): a 49 mm sphere hits `kr` about 1 there, above which
+`ZYLIA_FOA_FMAX`, 1200 Hz (`src/calib/zylia.h:89`): a 49 mm sphere hits `kr` about 1 there, above which
 the first-order [mode strength](#mode-strength) inversion stops being trustworthy. A band lying
 entirely above it makes the call **refuse**, deliberately: a confident wrong direction is worse
 than no direction. [SRP-PHAT](#srp-phat) reaches 3300 Hz and is the only path that sees above the
@@ -1105,7 +1105,7 @@ on the raw signals. See
 ### Matched-cell contrast
 
 A median of **paired** differences over the same cells measured two ways, with a
-[bootstrap interval](#bootstrap-interval) (`valid_contrast`, `src/valid.h:260-266`). A median of
+[bootstrap interval](#bootstrap-interval) (`valid_contrast`, `src/calib/valid.h:260-266`). A median of
 differences and a difference of medians are not the same number; only the first is a statement
 about the same cells. Two traps: drop cells where either side failed first, and **never pool the
 physical-versus-phantom contrast across placements** (its distribution is bimodal, so a pooled
@@ -1141,7 +1141,7 @@ afterwards is interpretable. There is a comb-depth floor too. See
 
 **The array's own speakers are physical sources at known positions**, so driving speaker `i`
 alone gives a real-source measurement through the same chain in the same room, with nothing moved
-(`src/valid.h:189-216`). It buys a [physical floor](#physical-floor), a
+(`src/calib/valid.h:189-216`). It buys a [physical floor](#physical-floor), a
 [matched-cell contrast](#matched-cell-contrast), and the negative control for content dependence.
 It is about 0 at the array center by symmetry (the center row is a null control), and VBAP shows
 about 0 even off-center because it collapses onto the coincident speaker: a genuine
@@ -1151,7 +1151,7 @@ characterization, not an artifact. See
 ### Precisely wrong
 
 The property of a tone measurement: **sub-degree repeatable and tens of degrees biased**
-(`src/valid.h:117-118`). Repeats will agree beautifully with each other and with nothing else. Never
+(`src/calib/valid.h:117-118`). Repeats will agree beautifully with each other and with nothing else. Never
 read repeatability as accuracy. It is the single most quotable reason to state the
 [stimulus](#stimulus) beside any number.
 
@@ -1183,7 +1183,7 @@ returning a confidently over-fitted answer. Use it to check a number, not to be 
 ### Stimulus
 
 What the harness plays. Broadband (a 24-tone sum across 420-1150 Hz) is the default and the
-**optimistic** end of the range; `--tone <hz>` is the pathological end (`src/valid.h:127-130`).
+**optimistic** end of the range; `--tone <hz>` is the pathological end (`src/calib/valid.h:127-130`).
 The analysis band follows the stimulus, and a tone whose band lies entirely above the
 [first-order ceiling](#first-order-ceiling) is refused with its frequency named. Content
 dependence has **two** mechanisms (the room's standing waves, and the phantom's own free-field

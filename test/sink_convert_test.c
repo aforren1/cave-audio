@@ -1,13 +1,13 @@
 /*
- * sink_convert_test.c — the shared bus-to-device conversion (src/sink_convert.h).
+ * sink_convert_test.c — the shared bus-to-device conversion (src/sink/sink_convert.h).
  *
  * This code runs on the audio thread of every backend, and CI has no device to catch it on, so
  * the whole thing is pinned here: each format in both layouts, the clamps at and past full
  * scale, the NaN rule, and a 26-channel interleave round trip at the FIFO's stride (the shape
  * sink_quant hands a backend, where the channel stride is NOT nframes).
  */
-#include "sink_convert.h"
-#include "sink.h"          /* BWA_CHANNELS: the round trip runs at the real bus width */
+#include "sink/sink_convert.h"
+#include "sink/sink.h"          /* BWA_CHANNELS: the round trip runs at the real bus width */
 
 #include <math.h>
 #include <stdio.h>

@@ -1,7 +1,7 @@
 /* measure_test.c — the calibration measurement DSP, verified against a synthetic capture with a
  * known delay + gain + low-pass. Proves measure_response without the rig (the ASIO capture is the
  * only untested piece). */
-#include "measure.h"
+#include "calib/measure.h"
 
 #include <math.h>
 #include <stdio.h>

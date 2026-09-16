@@ -25,13 +25,13 @@
  * those; their contracts live in the dsp/rt property tests, and their shared cores (the
  * hull/VBAP solve, the SH encode, the biquads) are exactly what this test pins.
  */
-#include "layout.h"
-#include "hull.h"
-#include "allrad.h"
-#include "epad.h"
-#include "ambisonics.h"
-#include "biquad.h"
-#include "align.h"
+#include "core/layout.h"
+#include "spatial/hull.h"
+#include "spatial/allrad.h"
+#include "spatial/epad.h"
+#include "spatial/ambisonics.h"
+#include "dsp/biquad.h"
+#include "spatial/align.h"
 
 #include "xval_data.h"
 

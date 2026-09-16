@@ -4,13 +4,13 @@
  * is reported at the end, and a looping stream wraps. The audio side here pulls as fast as it can, so
  * it deliberately outruns the decode thread and exercises the underrun path too.
  */
-#include "stream.h"
+#include "core/stream.h"
 
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include "os.h"
+#include "os/os.h"
 
 static int fails = 0;
 #define CHECK(c, msg) do { if (!(c)) { printf("FAIL: %s\n", msg); ++fails; } } while (0)

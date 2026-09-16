@@ -1,7 +1,7 @@
 /* calib_test.c — the calibration trim solve + layout writeback, verified without the rig. */
-#include "calib.h"
-#include "layout.h"        /* BWA_ROOM_EQ_MAX (the room_eq writeback round-trip) */
-#include "sos.h"           /* the temperature parsers + the plausible-c guard */
+#include "calib/calib.h"
+#include "core/layout.h"        /* BWA_ROOM_EQ_MAX (the room_eq writeback round-trip) */
+#include "dsp/sos.h"           /* the temperature parsers + the plausible-c guard */
 
 #include <cJSON.h>
 #include <math.h>

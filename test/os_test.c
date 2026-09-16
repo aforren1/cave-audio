@@ -1,5 +1,5 @@
 /*
- * os_test.c — the OS portability shim (src/os.h) and the seqlock built on top of it (src/pose.h).
+ * os_test.c — the OS portability shim (src/os/os.h) and the seqlock built on top of it (src/tracking/pose.h).
  *
  * Why this exists: phase 2 of docs/backends.md moved every Win32 call the engine made outside the
  * sinks behind one seam, and rewrote pose.h's seqlock from Interlocked intrinsics onto C11 atomics.
@@ -9,8 +9,8 @@
  *
  * On the torn-read section, read the comment above pose_torn_section before trusting it green.
  */
-#include "os.h"
-#include "pose.h"
+#include "os/os.h"
+#include "tracking/pose.h"
 
 #include <stdatomic.h>
 #include <stdio.h>

@@ -12,9 +12,9 @@
  *
  *   doppler_fft [f_in_hz=1000] [vel_mps=8] [blocks_per_commit=3]
  */
-#include "rt.h"
-#include "layout.h"
-#include "fft.h"
+#include "core/rt.h"
+#include "core/layout.h"
+#include "dsp/fft.h"
 #include "dr_wav.h"
 
 #include <math.h>

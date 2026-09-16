@@ -6,35 +6,35 @@
  * assets on the control thread (bwa_load_sound: WAV/FLAC/MP3). No DSP runs here.
  */
 #include "bw_audio.h"
-#include "frame.h"         /* BWA_ROOM_* identity basis + frame_qrot */
-#include "sane.h"         /* bwa_quat_unit, bwa_finite3_bounded, bwa_finite_bounded, bwa_finite_clamp */
-#include "sink.h"
-#include "rt.h"
-#include "assets.h"        /* by-path asset cache + loader thread (bwa_sound_acquire/_async) */
-#include "layout.h"
-#include "dbap.h"          /* offline panner evaluation (bwa_panner_gains_batch) */
-#include "spcap.h"
-#include "vbap.h"
-#include "ambisonics.h"    /* offline bed evaluation (bwa_bed_gains_batch) */
-#include "allrad.h"
-#include "epad.h"
-#include "binaural.h"
-#include "natnet.h"
-#include "steam_decode.h"   /* phonon-free interfaces; impls linked only when BWA_HAVE_STEAMAUDIO */
-#include "profile.h"
-#include "steam_scene.h"
-#include "steam_reflect.h"
-#include "steam_path.h"
-#include "fdn.h"
-#include "ism.h"
-#include "hpeq.h"           /* headphone correction EQ (bwa_load_headphone_eq) */
+#include "core/frame.h"         /* BWA_ROOM_* identity basis + frame_qrot */
+#include "core/sane.h"         /* bwa_quat_unit, bwa_finite3_bounded, bwa_finite_bounded, bwa_finite_clamp */
+#include "sink/sink.h"
+#include "core/rt.h"
+#include "core/assets.h"        /* by-path asset cache + loader thread (bwa_sound_acquire/_async) */
+#include "core/layout.h"
+#include "spatial/dbap.h"          /* offline panner evaluation (bwa_panner_gains_batch) */
+#include "spatial/spcap.h"
+#include "spatial/vbap.h"
+#include "spatial/ambisonics.h"    /* offline bed evaluation (bwa_bed_gains_batch) */
+#include "spatial/allrad.h"
+#include "spatial/epad.h"
+#include "binaural/binaural.h"
+#include "tracking/natnet.h"
+#include "binaural/steam_decode.h"   /* phonon-free interfaces; impls linked only when BWA_HAVE_STEAMAUDIO */
+#include "core/profile.h"
+#include "acoustics/steam_scene.h"
+#include "acoustics/steam_reflect.h"
+#include "acoustics/steam_path.h"
+#include "acoustics/fdn.h"
+#include "acoustics/ism.h"
+#include "binaural/hpeq.h"           /* headphone correction EQ (bwa_load_headphone_eq) */
 
 #include <math.h>           /* isfinite (the ABI input guards) */
 #include <stdio.h>          /* snprintf (the backend readback string) */
 #include <stdlib.h>
 #include <string.h>
 
-#include "os.h"                /* threads/sleep/strdup; the Win32 calls used to be inline here */
+#include "os/os.h"                /* threads/sleep/strdup; the Win32 calls used to be inline here */
 #include <stdatomic.h>         /* the hpeq handoff + the cave_both monitor seqlock */
 
 #define BWA_VOICE_CAP 256       /* max simultaneous sources (the user-visible pool) */

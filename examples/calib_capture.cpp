@@ -3,7 +3,7 @@
  * bwa_calib_view's Capture tab share ONE copy of the sweep-capture backends.
  */
 #include "calib_capture.h"
-#include "sos.h"                       /* BWA_SOS_REF_MPS + the plausible-c guard */
+#include "dsp/sos.h"                       /* BWA_SOS_REF_MPS + the plausible-c guard */
 
 #include <cmath>
 #include <cstdio>

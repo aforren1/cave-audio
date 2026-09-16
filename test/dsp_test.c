@@ -8,16 +8,16 @@
  *   - the hole-aware spread floor engages on a barrel (open poles) and is inert on the
  *     surrounding cube grid.
  */
-#include "layout.h"
-#include "dbap.h"
-#include "spcap.h"
-#include "vbap.h"
-#include "cap.h"
-#include "hole.h"
-#include "align.h"
-#include "ambisonics.h"
-#include "allrad.h"
-#include "epad.h"
+#include "core/layout.h"
+#include "spatial/dbap.h"
+#include "spatial/spcap.h"
+#include "spatial/vbap.h"
+#include "spatial/cap.h"
+#include "spatial/hole.h"
+#include "spatial/align.h"
+#include "spatial/ambisonics.h"
+#include "spatial/allrad.h"
+#include "spatial/epad.h"
 
 #include <math.h>
 #include <stdio.h>

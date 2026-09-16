@@ -99,7 +99,7 @@ holes with big triangles of distant speakers, so a source aimed into one is carr
 speakers far apart. At exact nadir on a symmetric barrel the containing triangle is an
 antipodal pair 113 degrees apart: a split image, not a phantom.
 
-The obvious fix is [allrad.c](../src/allrad.c)'s imaginary pole speaker, which the bed
+The obvious fix is [allrad.c](../src/spatial/allrad.c)'s imaginary pole speaker, which the bed
 decode already uses, or VISR's `<virtualspeaker>` with explicit routes. **It was tried and
 it makes point-source localization worse.** Measured on a jittered barrel, rE direction
 error against the intended bearing:

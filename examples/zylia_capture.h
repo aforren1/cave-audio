@@ -9,7 +9,7 @@
 #ifndef BWA_ZYLIA_CAPTURE_H
 #define BWA_ZYLIA_CAPTURE_H
 
-#include "zylia.h"
+#include "calib/zylia.h"
 
 #define ZP_SNAP_N   4096      /* transient snapshot: ~85 ms at 48 kHz (clap + a little room) */
 #define ZP_SNAP_PRE 512       /* pre-roll kept before the trigger point (onset never clipped) */

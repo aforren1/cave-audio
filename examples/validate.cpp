@@ -32,8 +32,8 @@
 /* valid.h / layout.h / zylia.h are C headers with no extern "C" of their own (the codebase keeps
  * them that way and wraps at the C++ call site — see calib_capture.h). */
 extern "C" {
-#include "valid.h"
-#include "natnet.h"
+#include "calib/valid.h"
+#include "tracking/natnet.h"
 }
 #include "valid_capture.h"
 #include "bw_audio.h"

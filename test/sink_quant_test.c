@@ -1,5 +1,5 @@
 /*
- * sink_quant_test.c — the fixed-quantum adapter (src/sink_quant.c).
+ * sink_quant_test.c — the fixed-quantum adapter (src/sink/sink_quant.c).
  *
  * Every backend past ASIO leans on this, and none of them can be tested on CI, so the adapter
  * carries the weight alone. The design that makes it testable: the render writes a value derived
@@ -12,7 +12,7 @@
  * Per CLAUDE.md: the pop arithmetic was broken on purpose (rd_off advanced by run + 1) and this
  * test went red on the concatenation check before being trusted green.
  */
-#include "sink_quant.h"
+#include "sink/sink_quant.h"
 
 #include <stdio.h>
 #include <stdlib.h>

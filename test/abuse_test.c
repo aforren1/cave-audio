@@ -22,7 +22,7 @@
 #include <stdio.h>
 #include <string.h>
 
-#include "os.h"               /* os_sleep_ms (the null-sink section only) */
+#include "os/os.h"               /* os_sleep_ms (the null-sink section only) */
 
 static int fails;
 #define CHECK(cond, ...) do { if (!(cond)) { ++fails;                                   \

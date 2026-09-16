@@ -3,8 +3,8 @@
 How surface **materials** shape simulated **occlusion**, **reflections/reverb**, and **sound
 pathing**, and how that audio reaches the speaker array (26 in the CAVE) and the binaural monitor.
 Two implementations now exist behind these features: Steam Audio's ray tracer
-(`src/steam_scene.c`, `src/steam_reflect.c`, `src/steam_path.c`, gated on the SDK build) and a
-phonon-free geometric path (`src/ism.c` early reflections + `src/fdn.c` late reverb + manual
+(`src/acoustics/steam_scene.c`, `src/acoustics/steam_reflect.c`, `src/acoustics/steam_path.c`, gated on the SDK build) and a
+phonon-free geometric path (`src/acoustics/ism.c` early reflections + `src/acoustics/fdn.c` late reverb + manual
 occlusion). **Read "Choosing an acoustics path" first.** They are complementary, not rivals, and
 the recommended configuration mixes them. See [api.md](./api.md)'s "Feature overview" for what's
 implemented and tested across the engine. See [glossary.md](./glossary.md) for a one-line lookup of

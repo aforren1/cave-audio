@@ -6,15 +6,15 @@
  * ray-tracing. Verifies the bake ran and produced a usable, DIRECTIONAL reverb out of baked data —
  * the +X-near listener must still get +X-biased reverb, not silence and not omni.
  */
-#include "rt.h"
-#include "layout.h"
-#include "steam_scene.h"
-#include "steam_reflect.h"
+#include "core/rt.h"
+#include "core/layout.h"
+#include "acoustics/steam_scene.h"
+#include "acoustics/steam_reflect.h"
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include "os.h"
+#include "os/os.h"
 
 int main(void) {
     const uint32_t SR = 48000, BLK = 256;

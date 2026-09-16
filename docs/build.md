@@ -4,18 +4,18 @@
 
 **Windows is the production platform.** ASIO is Windows-only; the Digiface is Windows and macOS.
 ASIO is only the Windows sink for the **array**. Headphone output has a second Windows backend,
-**WASAPI** (`src/wasapi_sink.cpp`), so a desk machine needs no ASIO driver at all: `binaural` and
+**WASAPI** (`src/sink/wasapi_sink.cpp`), so a desk machine needs no ASIO driver at all: `binaural` and
 `cave_sim` open the Windows default output, and `cave_both` opens ASIO for the array and WASAPI
 for the monitor at the same time.
 
-**Linux has two device backends**, JACK (`src/jack_sink.c`) and ALSA (`src/alsa_sink.c`). JACK is
+**Linux has two device backends**, JACK (`src/sink/jack_sink.c`) and ALSA (`src/sink/alsa_sink.c`). JACK is
 the production path: one binary talks to a JACK2 server or to PipeWire through pipewire-jack, and
 which one answers is decided at run time by what the box has installed. ALSA is the no-server path,
 for an experiment that wants a raw card clock or a rig driving a multichannel card directly. Under
 `BWA_SINK_AUTO` a Linux box tries JACK, then ALSA, then the null sink, at any channel count. See
 [Linux notes](#linux-notes) below.
 
-**Android has one device backend**, AAudio (`src/aaudio_sink.c`), which is the headphone path on
+**Android has one device backend**, AAudio (`src/sink/aaudio_sink.c`), which is the headphone path on
 a standalone VR headset. It is stereo only: Android carries no array transport, so a request wider
 than two channels falls to the offline sink. The library cross-builds with the NDK against API 26
 or later. See [Android](#android) below.
@@ -27,8 +27,8 @@ bit-identically anywhere), a place to run ThreadSanitizer, and a CI gate that ca
 sneaking back into the core. CoreAudio is specified, not implemented, in
 [backends.md](./backends.md). Keep each backend's assumptions confined to its own `*_sink` file.
 
-Everything platform-specific OUTSIDE the sinks goes through one shim, `src/os.h`, with
-`src/os_win.c` and `src/os_posix.c` behind it: threads, sleep, the monotonic clock, an
+Everything platform-specific OUTSIDE the sinks goes through one shim, `src/os/os.h`, with
+`src/os/os_win.c` and `src/os/os_posix.c` behind it: threads, sleep, the monotonic clock, an
 absolute-deadline sleep, mutexes and a reader/writer lock, thread priority, `strdup` and
 `strcasecmp`, and the UDP socket calls `natnet.c` makes. Nothing else in `src/` includes
 `windows.h`. The GUI tools (`bwa_playground`, `bwa_layout_tool`, `bwa_calib_view`) and the
@@ -47,11 +47,11 @@ the file. The list is `rt.c`, `stream.c`, `assets.c`, `fdn.c`, `natnet.c`, `engi
 three test sources that reach the atomics directly (`test/os_test.c`, `test/natnet_test.c`,
 `test/audio_sink_test.c`, `test/rt_feature_test.c`).
 
-`src/pose.h` is the one HEADER that carries `stdatomic.h`, so `rt.h` and `natnet.h` forward-declare
+`src/tracking/pose.h` is the one HEADER that carries `stdatomic.h`, so `rt.h` and `natnet.h` forward-declare
 `PoseSlot` instead of including it. Include `pose.h` only where the seqlock is actually used, or
 the flag spreads to every consumer of those headers.
 
-The C++ files (`src/asio_sink.cpp`, `src/wasapi_sink.cpp`) need `/std:c++20` for designated
+The C++ files (`src/sink/asio_sink.cpp`, `src/sink/wasapi_sink.cpp`) need `/std:c++20` for designated
 initializers in their vtables. CMake asks for it per target rather than globally, so it cannot
 leak into the vendored SDK sources.
 
@@ -736,7 +736,7 @@ Keep the callback allocation-free and lock-free per the invariants in `CLAUDE.md
 
 ### Implementation note
 
-This sequence lives in `src/asio_sink.cpp`, behind the device-agnostic `src/sink.h`
+This sequence lives in `src/sink/asio_sink.cpp`, behind the device-agnostic `src/sink/sink.h`
 seam, so ASIO types never leak into the engine. It compiles only when the ASIO SDK is
 vendored. Fetch the SDK per [`../third_party/README.md`](../third_party/README.md);
 CMake auto-detects `third_party/asiosdk/` and prints `ASIO backend ENABLED`. Without

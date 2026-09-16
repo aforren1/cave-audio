@@ -2,7 +2,7 @@
 
 The spine of the engine is two SPSC rings and a voice table. A hard split
 separates the control thread from the audio thread. That spine lives in
-[`src/rt.c`](../src/rt.c) / [`src/rt.h`](../src/rt.h).
+[`src/core/rt.c`](../src/core/rt.c) / [`src/core/rt.h`](../src/core/rt.h).
 The `Voice`, `SoundData`, `Layout`, `Listener`, and `RtCore` structs are documented in
 [`internal-types.md`](./internal-types.md).
 
@@ -25,7 +25,7 @@ Two threads carry the core:
 The bus is **N channels wide, where N is the loaded layout's speaker count**
 (`RtCore.channels`, 4..26; 26 for the CAVE array and for the default grid). It is
 fixed for the engine's lifetime: resolved at `bwa_create`, before `rt_create`.
-`BWA_CHANNELS` (26, [`src/sink.h`](../src/sink.h)) is only the compile-time
+`BWA_CHANNELS` (26, [`src/sink/sink.h`](../src/sink/sink.h)) is only the compile-time
 *capacity* that sizes the fixed arrays.
 
 The two threads communicate through two SPSC rings:
@@ -41,7 +41,7 @@ into the audio thread. Every channel is wait-free on the audio side. The audio
 thread never blocks on any of them:
 
 - **NatNet receiver thread** (`bwa_tracker_connect`): publishes the tracked head pose
-  through a single-slot seqlock (`PoseSlot`, [`src/pose.h`](../src/pose.h)).
+  through a single-slot seqlock (`PoseSlot`, [`src/tracking/pose.h`](../src/tracking/pose.h)).
   `rt_render` samples the freshest pose once per block. If the position moved,
   it dirties every voice. If the reader loses the seqlock race it keeps the
   previous pose: bounded retries, never a block. The audio thread publishes
@@ -58,7 +58,7 @@ thread never blocks on any of them:
   write the back `PathPub` slot, flip `path_idx` with release).
 - **Streaming thread** (`stream.c`): decodes file chunks into per-stream SPSC
   rings. `mix_voice` drains them with `stream_pull`: pure ring reads, no I/O
-  (see [`src/stream.h`](../src/stream.h)).
+  (see [`src/core/stream.h`](../src/core/stream.h)).
 - **Asset loader thread** (`assets.c`, started lazily by the first
   `bwa_sound_acquire_async`): decodes and resamples a file off the control
   thread. This one is the odd member of the list, because it does not publish
@@ -69,7 +69,7 @@ thread never blocks on any of them:
   no new audio-side channel and no new audio-side rule.
 
 Those last two are the only threads with no clock of their own, and both **wait**
-rather than poll (`os_event`, `src/os.h`). The loader waits forever on an empty
+rather than poll (`os_event`, `src/os/os.h`). The loader waits forever on an empty
 job ring; the control thread signals after every push and at stop, so an idle
 session wakes it zero times and an async acquire reaches it at once.
 
@@ -111,7 +111,7 @@ sampled is ramped in, never slammed.
 ## Command type and ring
 
 Fixed-size POD slots, no framing. The command `enum` is the authoritative
-list: it lives in [`rt.h`](../src/rt.h) and grows as features land. Most
+list: it lives in [`rt.h`](../src/core/rt.h) and grows as features land. Most
 commands need no explanation here; the few that carry protocol do:
 
 - `CMD_SRC_CREATE`: async activation of a handle the control thread already
@@ -431,7 +431,7 @@ with the device's planar buffer (`cave` profile) or a scratch buffer
    bus) and the path tap (decodes the accumulated ambisonic field onto the
    bus): `RtBusTap` / `RtPathTap` in rt.h. Both run *before* align, so their
    output gets the per-speaker trims too.
-8. **`align_process`** ([`src/align.c`](../src/align.c)): the per-speaker
+8. **`align_process`** ([`src/spatial/align.c`](../src/spatial/align.c)): the per-speaker
    output stage: correction FIR, room-EQ modal cuts, gain trim, delay line.
 9. **Test signal.** `bwa_set_test_signal` injects its sine/noise onto a raw channel
    *after* align: a wiring check, outside the spatial path.
@@ -451,7 +451,7 @@ the same thread right after; then `monitor_process` / `steam_monitor_process`
 decodes to the 2-ch device). Neither the direct field nor the point taps ever
 cross a thread: `rt_render` fills them and the same callback consumes them before
 returning. Device output likewise goes through the `bwa_sink` abstraction
-([`src/sink.h`](../src/sink.h)). The render callback fills the device's planar
+([`src/sink/sink.h`](../src/sink/sink.h)). The render callback fills the device's planar
 buffers directly.
 
 `mix_voice` interpolates `gcur → gtarget` across the block, never slams the new

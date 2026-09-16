@@ -9,7 +9,7 @@ defines those terms in one line each.
 This file pins the protocol fields that [`concurrency.md`](./concurrency.md)
 reasons about and summarizes the per-subsystem field groups around them. It
 tracks the *shape* of the structs, not every field; the full definitions live in
-[`src/rt.c`](../src/rt.c). When a detail matters, read the struct.
+[`src/core/rt.c`](../src/core/rt.c). When a detail matters, read the struct.
 
 The thread-ownership rules from [`concurrency.md`](./concurrency.md) apply: the
 **audio thread** owns the DSP state (`Voice`, the bus, `Listener.*_active`);
@@ -19,7 +19,7 @@ tables, and asset (`SoundSlot`) memory.
 ## Handles
 
 `bwa_source` / `bwa_sound` are `uint32_t = (index | generation<<16)`: the
-`BWA_H_IDX` / `BWA_H_GEN` / `BWA_MK_H` macros in [`src/rt.h`](../src/rt.h). Index
+`BWA_H_IDX` / `BWA_H_GEN` / `BWA_MK_H` macros in [`src/core/rt.h`](../src/core/rt.h). Index
 and generation are each 16-bit, so the voice and sound tables are each ≤ 65536
 slots and generations wrap at 2¹⁶. The wrap is safe: a stale handle only has to
 differ from the *current* occupant of the slot.
@@ -57,7 +57,7 @@ typedef struct {
 } Voice;
 ```
 
-`BWA_CHANNELS` (26) is defined in [`src/sink.h`](../src/sink.h) and is the
+`BWA_CHANNELS` (26) is defined in [`src/sink/sink.h`](../src/sink/sink.h) and is the
 **capacity**, not the count. Every `[BWA_CHANNELS]` array in these structs (gain
 vectors, the bed decode matrix, the meters) is sized to that capacity, but only
 the first `RtCore.channels` entries are used. `channels` is the loaded layout's
@@ -119,7 +119,7 @@ the reflection/pathing taps receive it too. With a tracker connected,
 
 ## Sound (control thread owns; audio thread only reads via const*)
 
-A sound is two structs: the **payload** ([`src/sound.h`](../src/sound.h)) and
+A sound is two structs: the **payload** ([`src/core/sound.h`](../src/core/sound.h)) and
 the **lifecycle wrapper** (rt.c; the sound table is a `SoundSlot[]`):
 
 ```c
@@ -159,7 +159,7 @@ while the audio thread is stopped (`rt_set_layout`). Its `count` is the engine's
 channel count. The loader accepts 4..`BWA_CHANNELS` speakers whose indices form a
 complete `0..count-1` permutation. A layout with fewer than `BWA_CHANNELS` speakers
 leaves the tail `speakers[]` entries at the default grid's values (harmless:
-`count` gates every consumer). From [`src/layout.h`](../src/layout.h):
+`count` gates every consumer). From [`src/core/layout.h`](../src/core/layout.h):
 
 ```c
 typedef struct { float fc, gain_db, q; } RoomEqSection;   /* cut-only by schema */
@@ -189,7 +189,7 @@ typedef struct {
 
 The engine state sits at two levels.
 
-**`RtCore`** (rt.c, opaque behind [`src/rt.h`](../src/rt.h)) is the real-time
+**`RtCore`** (rt.c, opaque behind [`src/core/rt.h`](../src/core/rt.h)) is the real-time
 core: the two rings, the voice table + `Listener`, the `Layout` + `Aligner`, and
 the control-side allocation state (`gen` / `inuse` / `priority` / `group` /
 `stealing` / free-lists, plus the `SoundSlot` table). The whole `bwa_*` API
@@ -238,7 +238,7 @@ reference):
   rate-derived attack/release coefficients.
 - **pathing publish**: the `PathPub` double buffer + `path_idx` flip atomics,
   the `path_accum` ambisonic scratch, the path tap pointer.
-- **pose**: the `tracker` (`const PoseSlot*`, [`src/pose.h`](../src/pose.h))
+- **pose**: the `tracker` (`const PoseSlot*`, [`src/tracking/pose.h`](../src/tracking/pose.h))
   and the `readback` `PoseSlot` the audio thread publishes each block.
 - **streaming**: the `StreamSet` (background thread + ring pool) and the
   per-block `stream_scratch`.
@@ -288,5 +288,5 @@ Two things that are *not* helpers here:
   thread), not a bus tap. The engine creates Steam Audio's phonon objects at
   `bwa_start`, and the decode runs inside the sink render callback.
 - **Device output** goes through the `bwa_sink` abstraction
-  ([`src/sink.h`](../src/sink.h)), whose render callback fills the device's
+  ([`src/sink/sink.h`](../src/sink/sink.h)), whose render callback fills the device's
   planar buffers directly.

@@ -10,13 +10,13 @@
  * ctest target maps to SKIP_RETURN_CODE, and the dashboard says skipped. Any other failure is a
  * failure.
  */
-#include "sink.h"
+#include "sink/sink.h"
 
 #include <stdio.h>
 #include <stdlib.h>       /* getenv: every device section's device string is overridable */
 #include <string.h>
 
-#include "os.h"
+#include "os/os.h"
 
 #include <stdatomic.h>
 

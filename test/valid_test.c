@@ -17,7 +17,7 @@
  * into an assumption. So the assertions cover the machinery and the geometrically necessary
  * relationships; the comparison itself is printed for a human to read.
  */
-#include "valid.h"
+#include "calib/valid.h"
 #include "bw_audio.h"
 
 #include <math.h>

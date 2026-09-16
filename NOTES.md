@@ -689,7 +689,7 @@ one) and the starve assertion went red before the rule was trusted.
 ---
 
 **Device backends, phase 2 (`docs/backends.md`).** The OS shim: every platform call the engine made
-outside the sinks moved behind `src/os.h`, with `src/os_win.c` and `src/os_posix.c` behind that, so
+outside the sinks moved behind `src/os/os.h`, with `src/os/os_win.c` and `src/os/os_posix.c` behind that, so
 the library, the tests and the console examples build and pass with gcc and clang. The point is not
 Linux audio (there is no backend there yet) but the three things that fall out of it: the offline
 render path works anywhere, ThreadSanitizer becomes runnable, and CI gains a job that catches a

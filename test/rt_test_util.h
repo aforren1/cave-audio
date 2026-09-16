@@ -12,17 +12,17 @@
 #ifndef RT_TEST_UTIL_H
 #define RT_TEST_UTIL_H
 
-#include "rt.h"
-#include "layout.h"
-#include "ambisonics.h"   /* BWA_AMBI_CH for the pathing accumulator capture */
-#include "ism.h"          /* IsmRoom for the early-reflection section */
+#include "core/rt.h"
+#include "core/layout.h"
+#include "spatial/ambisonics.h"   /* BWA_AMBI_CH for the pathing accumulator capture */
+#include "acoustics/ism.h"          /* IsmRoom for the early-reflection section */
 #include "dr_wav.h"
 
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include "os.h"              /* os_sleep_ms, for the streaming-fill wait */
+#include "os/os.h"              /* os_sleep_ms, for the streaming-fill wait */
 
 #define N    256
 #define CH   BWA_CHANNELS

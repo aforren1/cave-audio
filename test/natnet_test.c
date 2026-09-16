@@ -5,8 +5,8 @@
  * the frame-suffix stamps (4.1+/4.5+ section hop), and rejects truncated/old-version input
  * without over-reading.
  */
-#include "natnet.h"
-#include "pose.h"
+#include "tracking/natnet.h"
+#include "tracking/pose.h"
 
 #include <stdio.h>
 #include <string.h>

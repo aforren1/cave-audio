@@ -10,10 +10,10 @@
  * Compiles the core in (bwa_core); dr_wav's impl comes from sound.c, included here only for
  * the write API used to synthesize test files.
  */
-#include "rt.h"
-#include "layout.h"
-#include "sound.h"
-#include "ambisonics.h"   /* the SN3D encode, for the FuMa conversion check */
+#include "core/rt.h"
+#include "core/layout.h"
+#include "core/sound.h"
+#include "spatial/ambisonics.h"   /* the SN3D encode, for the FuMa conversion check */
 #include "dr_wav.h"
 
 #include <math.h>

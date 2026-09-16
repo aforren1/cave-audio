@@ -9,8 +9,8 @@
  *     dies measurably faster than the -x side's (the Directional-FDN property);
  *   - a long silent run stays exactly finite (lossless-prototype stability + decay losses).
  */
-#include "fdn.h"
-#include "layout.h"
+#include "acoustics/fdn.h"
+#include "core/layout.h"
 
 #include <math.h>
 #include <stdio.h>

@@ -33,12 +33,12 @@ third_party/asiosdk/
 ```
 
 **Build wiring:** with the SDK present, `cmake` prints
-`bw_audio: ASIO backend ENABLED` and compiles `src/asio_sink.cpp` plus the SDK host
+`bw_audio: ASIO backend ENABLED` and compiles `src/sink/asio_sink.cpp` plus the SDK host
 sources (`common/asio.cpp`, `host/asiodrivers.cpp`, `host/pc/asiolist.cpp`) with
 `BWA_HAVE_ASIO`. Without it, only the offline null sink is built (`bw_audio: ASIO
 backend disabled`) and the library still builds and links.
 
-**Sink selection** (`bwa_desc.sink`; see `src/sink.c`, and `docs/backends.md` for the full rules):
+**Sink selection** (`bwa_desc.sink`; see `src/sink/sink.c`, and `docs/backends.md` for the full rules):
 - `BWA_SINK_AUTO` (default) — pick by channel count. A 2-channel request (the headphone
   profiles, the `cave_both` monitor) tries WASAPI then ASIO; a wider one (the array) tries ASIO
   only. Either falls back to the null (offline) sink when no device opens;
@@ -52,7 +52,7 @@ with no ASIO driver installed. The ASIO auto-pick tries the registered drivers a
 that opens with enough outputs; pin one with `bwa_desc.device` (the old spelling `asio_driver`
 still works), and `bwa_get_audio_backend()` reports which one opened.
 
-WASAPI needs nothing vendored: its headers ship with the Windows SDK, so `src/wasapi_sink.cpp`
+WASAPI needs nothing vendored: its headers ship with the Windows SDK, so `src/sink/wasapi_sink.cpp`
 builds by default on Windows (`BWA_WITH_WASAPI`, linking `ole32` + `avrt`) and adds no license
 obligation.
 
@@ -60,7 +60,7 @@ obligation.
 
 NaturalPoint's NatNet SDK is **proprietary** and would conflict with GPLv3 under
 distribution, so the engine parses the documented FrameOfData wire protocol itself in
-`src/natnet.c` and **does not link the SDK**. A local copy (gitignored, not redistributed)
+`src/tracking/natnet.c` and **does not link the SDK**. A local copy (gitignored, not redistributed)
 is useful only as a wire-format reference — the sample
 `Samples/PacketClient/PacketClient.cpp` `Unpack*` functions are the authoritative layout,
 and `include/NatNetTypes.h` has the message IDs / default ports / multicast group.

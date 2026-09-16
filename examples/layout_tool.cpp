@@ -63,7 +63,7 @@
 #include "rlgl.h"            /* rlDrawRenderBatchActive: flush the 3D batch before a screenshot */
 #include "speaker_gizmo.h"   /* the "real speaker" glyph (cabinet + cone aimed at the listener) */
 #include "cJSON.h"
-#include "sos.h"             /* BWA_SOS_REF_MPS: the delay-alignment speed of sound, layout-carried */
+#include "dsp/sos.h"             /* BWA_SOS_REF_MPS: the delay-alignment speed of sound, layout-carried */
 #include "constraints_view.h"   /* constraints.json load + box drawing, shared with the playground */
 #include "axes_hud.h"        /* screen-corner XYZ triad, shared with the playground */
 

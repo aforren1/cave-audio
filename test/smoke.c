@@ -11,7 +11,7 @@
 #include <stdio.h>
 #include <string.h>
 
-#include "os.h"               /* os_sleep_ms */
+#include "os/os.h"               /* os_sleep_ms */
 
 static int run_profile(bwa_profile profile, const char* name) {
     bwa_desc cfg = {

@@ -24,12 +24,12 @@
 #include <stdio.h>
 #include <string.h>
 
-#include "os.h"          /* os_sleep_ms, os_fopen, os_remove */
+#include "os/os.h"          /* os_sleep_ms, os_fopen, os_remove */
 
 #define SKIP_EXIT 77     /* ctest SKIP_RETURN_CODE; see CMakeLists.txt */
 #define LAYOUT    "bwa_cave_both_layout.json"
 
-/* Internal test hooks (declared in src/sink.h, defined in engine.c, exported from the dll; not
+/* Internal test hooks (declared in src/sink/sink.h, defined in engine.c, exported from the dll; not
  * public ABI). The public readbacks describe the ARRAY sink - nothing public can see the monitor. */
 extern bwa_sink_type bwa_monitor_sink_type(bwa_engine* e);
 extern uint64_t      bwa_monitor_blocks(bwa_engine* e);

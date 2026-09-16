@@ -25,8 +25,8 @@
 #ifdef __cplusplus
 extern "C" {
 #endif
-#include "layout.h"
-#include "zylia.h"
+#include "core/layout.h"
+#include "calib/zylia.h"
 #ifdef __cplusplus
 }
 #endif

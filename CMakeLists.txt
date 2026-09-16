@@ -17,7 +17,7 @@ cmake_minimum_required(VERSION 3.20)
 # and the distribution/release version is the git tag (stamped into the Unity package at pack time).
 project(bw_audio LANGUAGES C)
 
-set(CMAKE_C_STANDARD 11)          # C11 atomics: src/os.h's shim leaves the shared state to them
+set(CMAKE_C_STANDARD 11)          # C11 atomics: src/os/os.h's shim leaves the shared state to them
 set(CMAKE_C_STANDARD_REQUIRED ON)
 
 # Platform: Windows is the production target (ASIO -> Digiface -> Dante) and the only one with
@@ -79,12 +79,12 @@ if(BWA_TRACY)
   FetchContent_MakeAvailable(tracy)
 endif()
 
-# The OS portability shim (src/os.h): threads, sleep, the monotonic clock, mutexes, thread
+# The OS portability shim (src/os/os.h): threads, sleep, the monotonic clock, mutexes, thread
 # priority, strdup/strcasecmp and the UDP socket calls natnet.c makes. Exactly one half compiles.
 if(WIN32)
-  set(BWA_OS_SRC src/os_win.c)
+  set(BWA_OS_SRC src/os/os_win.c)
 else()
-  set(BWA_OS_SRC src/os_posix.c)
+  set(BWA_OS_SRC src/os/os_posix.c)
 endif()
 
 # ---- Steam Audio (phonon) detection ----
@@ -195,31 +195,31 @@ endif()
 # An OBJECT library so the off-RT-path tests can compile the core in directly and reach
 # its internals, without re-listing sources per target.
 add_library(bwa_core OBJECT
-  src/rt.c
-  src/sound.c
-  src/assets.c
-  src/layout.c
-  src/dbap.c
-  src/spcap.c
-  src/vbap.c
-  src/cap.c
-  src/hole.c
-  src/hull.c
-  src/align.c
-  src/binaural.c
-  src/hpeq.c
-  src/ambisonics.c
-  src/allrad.c
-  src/epad.c
-  src/fdn.c
-  src/ism.c
-  src/natnet.c
+  src/core/rt.c
+  src/core/sound.c
+  src/core/assets.c
+  src/core/layout.c
+  src/spatial/dbap.c
+  src/spatial/spcap.c
+  src/spatial/vbap.c
+  src/spatial/cap.c
+  src/spatial/hole.c
+  src/spatial/hull.c
+  src/spatial/align.c
+  src/binaural/binaural.c
+  src/binaural/hpeq.c
+  src/spatial/ambisonics.c
+  src/spatial/allrad.c
+  src/spatial/epad.c
+  src/acoustics/fdn.c
+  src/acoustics/ism.c
+  src/tracking/natnet.c
   ${BWA_OS_SRC}
-  src/measure.c
-  src/calib.c
-  src/zylia.c
-  src/valid.c
-  src/stream.c
+  src/calib/measure.c
+  src/calib/calib.c
+  src/calib/zylia.c
+  src/calib/valid.c
+  src/core/stream.c
   ${CJSON_C}
 )
 target_include_directories(bwa_core PUBLIC src include ${dr_libs_SOURCE_DIR} ${CJSON_INC})   # include/: frame.h consumes the BWA_ROOM_* basis
@@ -240,22 +240,22 @@ endfunction()
 bwa_link_os(bwa_core PUBLIC)
 target_compile_options(bwa_core PRIVATE ${BWA_C_WARNINGS})
 # A shared library on gcc/clang exports everything by default; the public ABI says what it is
-# (BWA_API in bw_audio.h, BWA_EXPORT in src/os.h for the internal test hooks).
+# (BWA_API in bw_audio.h, BWA_EXPORT in src/os/os.h for the internal test hooks).
 set_target_properties(bwa_core PROPERTIES C_VISIBILITY_PRESET hidden POSITION_INDEPENDENT_CODE ON)
 if(MSVC)
   target_compile_options(bwa_core PRIVATE /W4)
   # C11 <stdatomic.h> is gated behind /experimental:c11atomics on MSVC. Source properties are
   # DIRECTORY-scoped, so one entry covers every target in this file that compiles the file.
   # cJSON is third-party: silence its warnings.
-  foreach(f src/rt.c            # the two SPSC rings, the commit snapshot, the clock seqlock
-            src/stream.c        # the per-stream ring cursors
-            src/assets.c        # the loader thread's job + result rings
-            src/fdn.c           # the live wet-gain atomic
-            src/natnet.c        # the pose seqlock (src/pose.h) + the receiver's stop flag
+  foreach(f src/core/rt.c            # the two SPSC rings, the commit snapshot, the clock seqlock
+            src/core/stream.c        # the per-stream ring cursors
+            src/core/assets.c        # the loader thread's job + result rings
+            src/acoustics/fdn.c           # the live wet-gain atomic
+            src/tracking/natnet.c        # the pose seqlock (src/tracking/pose.h) + the receiver's stop flag
             src/engine.c        # the hpeq handoff + the cave_both monitor seqlock
-            src/null_sink.c     # the health counters
-            src/profile_self.c  # the zone table
-            src/steam_scene.c src/steam_path.c)   # the sim threads' stop flags
+            src/sink/null_sink.c     # the health counters
+            src/core/profile_self.c  # the zone table
+            src/acoustics/steam_scene.c src/acoustics/steam_path.c)   # the sim threads' stop flags
     set_source_files_properties(${f} PROPERTIES COMPILE_OPTIONS /experimental:c11atomics)
   endforeach()
   set_source_files_properties(${CJSON_C} PROPERTIES COMPILE_OPTIONS /W0)
@@ -264,11 +264,11 @@ endif()
 # ---- core library (public C ABI in include/bw_audio.h) ----
 add_library(bw_audio SHARED
   src/engine.c
-  src/sink.c
-  src/sink_quant.c              # the fixed-quantum adapter every non-ASIO backend renders through
-  src/null_sink.c
-  src/manual_sink.c
-  src/profile_self.c            # bwa_prof_reset/report exported unconditionally; accumulation gated by BWA_PROFILE_SELF
+  src/sink/sink.c
+  src/sink/sink_quant.c              # the fixed-quantum adapter every non-ASIO backend renders through
+  src/sink/null_sink.c
+  src/sink/manual_sink.c
+  src/core/profile_self.c            # bwa_prof_reset/report exported unconditionally; accumulation gated by BWA_PROFILE_SELF
   $<TARGET_OBJECTS:bwa_core>
 )
 set_target_properties(bw_audio PROPERTIES C_VISIBILITY_PRESET hidden)
@@ -325,7 +325,7 @@ if(BWA_TRACY)
 endif()
 
 # In-process zone profiler (mutually exclusive with Tracy): headless per-zone numbers with no server
-# tooling. Routes profile.h's zone macros into src/profile_self.c on both compile groups.
+# tooling. Routes profile.h's zone macros into src/core/profile_self.c on both compile groups.
 option(BWA_PROFILE_SELF "Instrument with the built-in in-process zone profiler (bwa_prof_report)" OFF)
 if(BWA_PROFILE_SELF AND NOT BWA_TRACY)
   target_compile_definitions(bwa_core PRIVATE BWA_PROFILE_SELF)
@@ -371,7 +371,7 @@ if(BWA_WITH_ASIO)
   # C++20 on the DLL: asio_sink.cpp uses designated initializers (ASIO_VT) — MSVC needs /std:c++20 for
   # those. Target-scoped (not a global set()) so it can't leak into other targets or the vendored SDK.
   target_compile_features(bw_audio PRIVATE cxx_std_20)
-  target_sources(bw_audio PRIVATE src/asio_sink.cpp)   # the engine's own output-only ASIO sink
+  target_sources(bw_audio PRIVATE src/sink/asio_sink.cpp)   # the engine's own output-only ASIO sink
   bwa_add_asio_host(bw_audio)
   message(STATUS "bw_audio: ASIO backend ENABLED (${ASIO_SDK_DIR})")
 else()
@@ -388,7 +388,7 @@ if(BWA_WITH_WASAPI AND WIN32)
   # C++20 on the DLL: wasapi_sink.cpp uses designated initializers (WASAPI_VT), which MSVC gates
   # behind /std:c++20. Target-scoped, and idempotent with the ASIO block's identical request.
   target_compile_features(bw_audio PRIVATE cxx_std_20)
-  target_sources(bw_audio PRIVATE src/wasapi_sink.cpp)
+  target_sources(bw_audio PRIVATE src/sink/wasapi_sink.cpp)
   target_compile_definitions(bw_audio PRIVATE BWA_HAVE_WASAPI)
   target_link_libraries(bw_audio PRIVATE ole32)   # avrt comes from bwa_link_os (the MMCSS shim)
   message(STATUS "bw_audio: WASAPI backend ENABLED")
@@ -408,7 +408,7 @@ if(BWA_WITH_JACK AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
     pkg_check_modules(BWA_JACK QUIET IMPORTED_TARGET jack)
   endif()
   if(BWA_JACK_FOUND)
-    target_sources(bw_audio PRIVATE src/jack_sink.c)
+    target_sources(bw_audio PRIVATE src/sink/jack_sink.c)
     target_compile_definitions(bw_audio PRIVATE BWA_HAVE_JACK)
     target_link_libraries(bw_audio PRIVATE PkgConfig::BWA_JACK)
     message(STATUS "bw_audio: JACK backend ENABLED (libjack ${BWA_JACK_VERSION})")
@@ -428,7 +428,7 @@ option(BWA_WITH_ALSA "Build the ALSA backend (Linux only; needs alsa-lib)" ON)
 if(BWA_WITH_ALSA AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
   find_package(ALSA QUIET)
   if(ALSA_FOUND)
-    target_sources(bw_audio PRIVATE src/alsa_sink.c)
+    target_sources(bw_audio PRIVATE src/sink/alsa_sink.c)
     target_compile_definitions(bw_audio PRIVATE BWA_HAVE_ALSA)
     target_link_libraries(bw_audio PRIVATE ALSA::ALSA)
     message(STATUS "bw_audio: ALSA backend ENABLED (alsa-lib ${ALSA_VERSION_STRING})")
@@ -451,7 +451,7 @@ if(BWA_WITH_AAUDIO AND ANDROID)
     message(FATAL_ERROR "BWA_WITH_AAUDIO=ON needs ANDROID_PLATFORM android-26 or later "
                         "(AAudio arrived in Android 8.0); got ${ANDROID_PLATFORM}")
   endif()
-  target_sources(bw_audio PRIVATE src/aaudio_sink.c)
+  target_sources(bw_audio PRIVATE src/sink/aaudio_sink.c)
   target_compile_definitions(bw_audio PRIVATE BWA_HAVE_AAUDIO)
   target_link_libraries(bw_audio PRIVATE aaudio)
   message(STATUS "bw_audio: AAudio backend ENABLED")
@@ -463,14 +463,14 @@ endif()
 # ---- optional Steam Audio backend (production binaural HRTF decode; later occlusion/reflections) ----
 # The WIRING half. Detection ran near the top of this file, where it had to, so everything below
 # reads BWA_PHONON_LIBS rather than touching the staged tree again. Stage 1 of the production
-# monitor (the SH encode in src/ambisonics.c) is always built + tested; stage 2 (the
+# monitor (the SH encode in src/spatial/ambisonics.c) is always built + tested; stage 2 (the
 # ambisonics->binaural HRTF decode, gated BWA_HAVE_STEAMAUDIO) supersedes the first-cut pan in
 # binaural.c and lands with the SDK, on-SDK-verified.
 if(BWA_PHONON_LIBS)
   set(BWA_STEAMAUDIO_FOUND TRUE)   # consumed by the with-SDK reflection test below
-  target_sources(bw_audio PRIVATE src/steam_decode.c src/steam_scene.c src/steam_reflect.c src/steam_path.c)  # HRTF decode + occlusion + reflections + pathing (with-SDK)
+  target_sources(bw_audio PRIVATE src/binaural/steam_decode.c src/acoustics/steam_scene.c src/acoustics/steam_reflect.c src/acoustics/steam_path.c)  # HRTF decode + occlusion + reflections + pathing (with-SDK)
   if(MSVC)   # steam_reflect.c uses C11 <stdatomic.h> (the IR-publish seqlock), like rt.c
-    set_source_files_properties(src/steam_reflect.c PROPERTIES COMPILE_OPTIONS /experimental:c11atomics)
+    set_source_files_properties(src/acoustics/steam_reflect.c PROPERTIES COMPILE_OPTIONS /experimental:c11atomics)
   endif()
   target_include_directories(bw_audio PRIVATE "${STEAMAUDIO_DIR}/include")
   target_link_libraries(bw_audio PRIVATE ${BWA_PHONON_LIBS})
@@ -697,29 +697,29 @@ if(BWA_BUILD_TESTS)
   # compiled device backend. Those sections open a live device (a WASAPI endpoint, a JACK server, an
   # ALSA PCM), so they are the tests here that can legitimately be unrunnable; each exits 77 (see
   # SKIP_RETURN_CODE below) rather than pass.
-  add_executable(test_audio_sink test/audio_sink_test.c src/sink.c src/sink_quant.c
-                 src/null_sink.c src/manual_sink.c ${BWA_OS_SRC})
+  add_executable(test_audio_sink test/audio_sink_test.c src/sink/sink.c src/sink/sink_quant.c
+                 src/sink/null_sink.c src/sink/manual_sink.c ${BWA_OS_SRC})
   target_include_directories(test_audio_sink PRIVATE src include)
   target_compile_options(test_audio_sink PRIVATE ${BWA_C_WARNINGS})
   bwa_link_os(test_audio_sink PRIVATE)
   if(BWA_WITH_WASAPI AND WIN32)
-    target_sources(test_audio_sink PRIVATE src/wasapi_sink.cpp)
+    target_sources(test_audio_sink PRIVATE src/sink/wasapi_sink.cpp)
     target_compile_definitions(test_audio_sink PRIVATE BWA_HAVE_WASAPI)
     target_compile_features(test_audio_sink PRIVATE cxx_std_20)
     target_link_libraries(test_audio_sink PRIVATE ole32)
   endif()
   if(BWA_WITH_JACK)
-    target_sources(test_audio_sink PRIVATE src/jack_sink.c)
+    target_sources(test_audio_sink PRIVATE src/sink/jack_sink.c)
     target_compile_definitions(test_audio_sink PRIVATE BWA_HAVE_JACK)
     target_link_libraries(test_audio_sink PRIVATE PkgConfig::BWA_JACK)
   endif()
   if(BWA_WITH_ALSA)
-    target_sources(test_audio_sink PRIVATE src/alsa_sink.c)
+    target_sources(test_audio_sink PRIVATE src/sink/alsa_sink.c)
     target_compile_definitions(test_audio_sink PRIVATE BWA_HAVE_ALSA)
     target_link_libraries(test_audio_sink PRIVATE ALSA::ALSA)
   endif()
   if(BWA_WITH_AAUDIO)
-    target_sources(test_audio_sink PRIVATE src/aaudio_sink.c)
+    target_sources(test_audio_sink PRIVATE src/sink/aaudio_sink.c)
     target_compile_definitions(test_audio_sink PRIVATE BWA_HAVE_AAUDIO)
     target_link_libraries(test_audio_sink PRIVATE aaudio)
   endif()
@@ -732,23 +732,23 @@ if(BWA_BUILD_TESTS)
   # reports as SKIPPED — never as a pass.
   set_tests_properties(audio_sink PROPERTIES SKIP_RETURN_CODE 77)
 
-  # The shared bus->device conversion (src/sink_convert.h): header-only, so the test needs nothing
+  # The shared bus->device conversion (src/sink/sink_convert.h): header-only, so the test needs nothing
   # but the header. Pure, always runs — the backends that use it cannot be tested on CI.
   add_executable(test_sink_convert test/sink_convert_test.c)
   target_include_directories(test_sink_convert PRIVATE src include)
   target_compile_options(test_sink_convert PRIVATE ${BWA_C_WARNINGS})
   add_test(NAME sink_convert COMMAND test_sink_convert)
 
-  # The fixed-quantum adapter (src/sink_quant.c) every non-ASIO backend renders through. Also pure:
+  # The fixed-quantum adapter (src/sink/sink_quant.c) every non-ASIO backend renders through. Also pure:
   # it fakes the device side, so the FIFO/timestamp/dropout arithmetic is pinned without hardware.
-  add_executable(test_sink_quant test/sink_quant_test.c src/sink_quant.c src/sink.c
-                 src/null_sink.c src/manual_sink.c ${BWA_OS_SRC})
+  add_executable(test_sink_quant test/sink_quant_test.c src/sink/sink_quant.c src/sink/sink.c
+                 src/sink/null_sink.c src/sink/manual_sink.c ${BWA_OS_SRC})
   target_include_directories(test_sink_quant PRIVATE src include)
   target_compile_options(test_sink_quant PRIVATE ${BWA_C_WARNINGS})
   bwa_link_os(test_sink_quant PRIVATE)
   add_test(NAME sink_quant COMMAND test_sink_quant)
 
-  # The OS shim itself (src/os.h): threads, sleep bounds, the monotonic clock against the C clock,
+  # The OS shim itself (src/os/os.h): threads, sleep bounds, the monotonic clock against the C clock,
   # mutex exclusion, and the rewritten pose seqlock under a writer + a reader thread with torn-read
   # detection. Compiles the shim in directly rather than linking the core, so it stays runnable even
   # if something else in the core stops building.
@@ -905,24 +905,24 @@ if(BWA_BUILD_TESTS)
     # Directional reflection-bed check: drives steam_reflect_tap directly, asserts the reverb is
     # directional. Needs the alignment patch.
     bwa_add_steam_test(test_reflect reflect
-      test/reflect_test.c src/steam_scene.c src/steam_reflect.c)
+      test/reflect_test.c src/acoustics/steam_scene.c src/acoustics/steam_reflect.c)
 
     bwa_add_steam_test(test_bake bake
-      test/bake_test.c src/steam_scene.c src/steam_reflect.c)
+      test/bake_test.c src/acoustics/steam_scene.c src/acoustics/steam_reflect.c)
 
     # Pathing: routes a source around an occluding wall (visibility bake + pathing sim).
     bwa_add_steam_test(test_path path
-      test/path_test.c src/steam_scene.c src/steam_path.c)
+      test/path_test.c src/acoustics/steam_scene.c src/acoustics/steam_path.c)
 
     # Dynamic (instanced) occluder + shared-scene-lock: a movable wall added at runtime blocks the
     # source when slid between it and the listener, clears when moved away/removed — while a reflect
     # bed reads the same scene concurrently (pins Path B + blocker 1).
     bwa_add_steam_test(test_dynmesh dynmesh
-      test/dynmesh_test.c src/steam_scene.c src/steam_reflect.c)
+      test/dynmesh_test.c src/acoustics/steam_scene.c src/acoustics/steam_reflect.c)
 
     # HRTF decode (production monitor): the 26->stereo Steam Audio decode runs + preserves laterality.
     bwa_add_steam_test(test_steam_decode steam_decode
-      test/steam_decode_test.c src/steam_decode.c)
+      test/steam_decode_test.c src/binaural/steam_decode.c)
   endif()
 
   # ---- Unity binding: the PlayMode suite, under ctest (opt-in) ----
@@ -1121,7 +1121,7 @@ if(BWA_BUILD_PLAYGROUND)
   # with imgui_test_engine driving the panel under ctest (`--tests`). Compiles its own cJSON copy.
   add_executable(bwa_layout_tool examples/layout_tool.cpp ${CJSON_C}
     ${rlimgui_SOURCE_DIR}/rlImGui.cpp ${BWA_IMGUI_SOURCES})
-  target_include_directories(bwa_layout_tool PRIVATE src ${CJSON_INC} ${rlimgui_SOURCE_DIR} ${BWA_IMGUI_INC})  # src/: sos.h (the layout-carried speed of sound)
+  target_include_directories(bwa_layout_tool PRIVATE src ${CJSON_INC} ${rlimgui_SOURCE_DIR} ${BWA_IMGUI_INC})  # src/: dsp/sos.h (the layout-carried speed of sound)
   # STB_IMAGE_WRITE_STATIC: raylib's rtextures embeds stb_image_write with external linkage, and so
   # does the test engine's capture tool — making the latter's copy static avoids the LNK2005 clash.
   target_compile_definitions(bwa_layout_tool PRIVATE ${BWA_IMGUI_DEFS} NO_FONT_AWESOME STB_IMAGE_WRITE_STATIC)

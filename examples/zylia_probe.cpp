@@ -17,7 +17,7 @@
  *
  * Build: -DBWA_BUILD_CALIBRATE=ON with the ASIO SDK (same gate as calibrate).
  */
-#include "zylia.h"
+#include "calib/zylia.h"
 #include "zylia_capture.h"
 
 #include <stdio.h>

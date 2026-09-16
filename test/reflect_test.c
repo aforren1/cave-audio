@@ -9,15 +9,15 @@
  * crash without it). It drives steam_reflect_tap directly with a known aux send, so it needs no
  * device, sound asset, or voice machinery.
  */
-#include "rt.h"
-#include "layout.h"
-#include "steam_scene.h"
-#include "steam_reflect.h"
+#include "core/rt.h"
+#include "core/layout.h"
+#include "acoustics/steam_scene.h"
+#include "acoustics/steam_reflect.h"
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include "os.h"
+#include "os/os.h"
 
 int main(void) {
     const uint32_t SR = 48000, BLK = 256;

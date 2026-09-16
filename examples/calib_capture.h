@@ -15,7 +15,7 @@
 #ifdef __cplusplus
 extern "C" {
 #endif
-#include "layout.h"
+#include "core/layout.h"
 #ifdef __cplusplus
 }
 #endif

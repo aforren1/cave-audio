@@ -455,7 +455,7 @@ reloads it.
 ## Calibration writeback (unknown fields survive)
 
 `bwa_calibrate` writes its results back into this file, and it does so
-non-destructively. Every `calib_write_*` function (`src/calib.c`) re-parses the
+non-destructively. Every `calib_write_*` function (`src/calib/calib.c`) re-parses the
 original JSON, mutates only its target fields (`gain_db`/`delay_ms` for the trims,
 `eq`, `room_eq`, `room_eq_grid`, `position` for the survey), and re-serializes the
 whole root.

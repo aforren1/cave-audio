@@ -70,127 +70,171 @@ See `docs/concurrency.md` for the full model and reference code.
 include/bw_audio.h      Public C ABI (authoritative contract).
 src/
   engine.c             public ABI: lifecycle + sink + forwards per-frame calls to rt. [M0/M1/M2]
-  rt.h / rt.c          rings, voice table, commit snapshot, generation handles, mixer. [M2]
-  sink.h / sink.c      device-sink abstraction + backend dispatch: the AUTO order (Windows: 2-ch
-                       requests try WASAPI then ASIO, wider ones ASIO only. Linux: JACK then ALSA at
-                       every width) and the exact-match device rule. [M1/backends]
-  sink_convert.h       planar float bus -> the device's format (f32/i32/i24/i16), planar or
-                       interleaved. Moved out of asio_sink.cpp so every backend shares one set of
-                       clamp + NaN rules. [backends]
-  sink_quant.h/.c      the FIXED-QUANTUM adapter. render() must always see the engine block, but no
-                       device API past ASIO promises a fixed callback size, so this renders whole
-                       blocks into a ring of block-sized SLOTS (the stride render() already wants,
-                       so nothing copies) and serves the device any count. Owns the per-block
-                       timestamp rule, the written-versus-device-position dropout, and the
-                       late_blocks/render_ns_peak accounting for every backend it serves. [backends]
-  jack_sink.c          JACK host (Linux): the production Linux path, and the one backend whose ports
-                       are PLANAR FLOAT already, so the bus copies straight out - no convert, no
-                       interleave. One JACK2 or pipewire-jack answers at RUN time; JackNoStartServer
-                       makes "no server" the fast fall-through to ALSA. Activates and connects at
-                       OPEN (that is where a port-count error can still reach the caller) and gates
-                       the render on start(). xruns arrive on a notification thread and are parked
-                       for the process thread to fold into the adapter. [backends p5]
-  alsa_sink.c          ALSA host (Linux): the no-server path - a raw `hw:` card for an experiment
-                       that wants the device clock, a MADI/AES67 card for a rig, a plug PCM for a
-                       desk monitor. The ONE backend with no fixed-quantum adapter: it writes, so it
-                       picks the size, and it writes whole engine blocks. Blocking snd_pcm_writei IS
-                       the pacing; -EPIPE is the underrun report; SCHED_FIFO is asked for and its
-                       refusal is a reported degradation, never a failure. [backends p5]
-  aaudio_sink.c        AAudio host (Android): the headphone path on a standalone VR headset, and
-                       STEREO ONLY - Android carries no array transport, so AUTO sends anything
-                       wider straight to the offline sink and an explicit open says so. AAudio owns
-                       the callback thread and treats setFramesPerDataCallback as a HINT, so the
-                       fixed-quantum adapter is in the path. Dropouts are the OS's own
-                       getXRunCount DELTA with dropped_frames 0 (AAudio counts events, never their
-                       length); device_pos_valid is false, because the queued-depth rule would count
-                       the same starve twice. The device rate is PROBED before the real open (one
-                       throwaway stream, everything unspecified), since a shared-mode stream reports
-                       the rate it was asked for whether or not the service is resampling -
-                       without it rule 6 would have nothing to report. setUsage is never called:
-                       it is __INTRODUCED_IN(28) and this targets API 26. AAUDIO_ERROR_DISCONNECTED
-                       sets device_lost and starts the host-paced thread; nothing reopens.
-                       [backends p3]
-  null_sink.c          offline (no-hardware) sink: threaded silence + timestamps. [M1]
-  manual_sink.c        offline/deterministic sink: no thread, the caller pumps (bwa_render_block). [M1]
-  asio_sink.cpp        ASIO host: driver load, bufferSwitch, sample-pos timestamp. [M1]
-  wasapi_sink.cpp      WASAPI host: the headphone profiles + the cave_both monitor, on the endpoint
-                       the headphones are actually on. Shared mode by default (IAudioClient3 period;
-                       a VR runtime keeps its own audio open beside us), exclusive under
-                       BWA_SINK_FLAG_EXCLUSIVE. IAudioClock for the timestamp pair,
-                       AUDCLNT_E_DEVICE_INVALIDATED -> health.device_lost with the sink degrading to
-                       host-paced silence so the engine's clocks keep advancing. It is also what
-                       finally lets cave_both open TWO devices: the ASIO SDK allows one driver per
-                       process. [backends]
-  sound.h / sound.c    wav decode to mono float via dr_wav (Sound table lives in rt.c). [M3]
-  assets.h / assets.c  the SHARED-ownership asset tier: a by-path cache (key = normalized path +
-                       load flags, so "one file, memory vs streamed vs ambisonic" is just different
-                       entries) with a refcount, over the SAME rt loaders bwa_load_* drives — the
-                       Dictionary<path,handle> every binding was rebuilding, moved inward. Plus ONE
-                       loader thread for bwa_sound_acquire_async: it decodes off the control thread
-                       and hands the buffer over through an SPSC result ring; the control thread
-                       publishes it (rt_sound_reserve/publish/abandon) and a play issued meanwhile
-                       is HELD control-side until then, so the audio thread only ever sees a
-                       finished asset and gains no new branch. The loader BLOCKS on an os_event
-                       (signalled after every job push and at stop) rather than sleep-polling, so
-                       idle costs zero wakeups. [assets]
-  layout.h / layout.c  speaker geometry load (cave_layout.json via cJSON) + default grid. [M4]
-  measure.c/calib.c    bwa_calibrate DSP: sweep+deconvolution, trims, trilateration, room report. [calib]
-  zylia.h / zylia.c    Zylia ZM-1: single-position speaker localization (TDOA + GN position) AND the
-                       validation-grade estimators — active-intensity DOA, capsule integrity,
-                       SRP-PHAT cross-check, comb depth (spectral ripple: what coherent multi-speaker
-                       copies cost in timbre, the measurable side of SPCAP focus). [calib]
-  valid.h / valid.c    phantom-localization validation: render a source, measure where the array
-                       actually put it (feeds/simulate/score + medians, bootstrap, matched-cell
-                       contrasts). The PHANTOM arm renders through a REAL ENGINE CORE (a cached
-                       RtCore + push voice, limiter off, ramps settled, deterministic timestamp --
-                       the same path bwa_render_block/BWA_SINK_MANUAL drives), so every live A/B knob
-                       (ValidRender: focus/density, dual-band, CAP, hole spread, tracked align,
-                       spread mode/decorrelation/near spread) is sweepable and valid_simulate just
-                       propagates those feeds to the 19 capsules. The PHYSICAL REFERENCE arm (drive
-                       one speaker alone = a real source, so a phantom miss reads against a floor --
-                       also the comb-depth floor) deliberately does NOT: no panner, no knob, no
-                       engine state. valid_speaker_feeds_direct is the pre-engine builder, kept as
-                       the regression baseline the ctest pins the engine render against. Also
-                       stimulus selection (broadband or a tone, analysis band follows). Drives
-                       bwa_validate. [validation]
-  dbap.h / dbap.c      listener-relative, constant-power DBAP gain solve. [M4]
-  cap.h / cap.c        compensated amplitude panning: projects the dual-band LOW band so the rendered
-                       ITD matches a real source's for the head's CURRENT orientation. NOT a panner -
-                       a modifier on whatever panner is selected, so it reduces to that panner facing
-                       the source. The one place head ORIENTATION reaches the speaker path.
-                       bwa_set_dual_band_cap. [spatialization]
-  hole.h / hole.c      hole-aware spread floor: a source aimed where the array has NO speaker (the
-                       barrel's open poles) is floored WIDE instead of split across the hull triangle
-                       that closes the hole. Cached per listener like spcap/vbap; bwa_set_hole_spread. [spatialization]
-  fdn.h / fdn.c        directional FDN reverb bed (phonon-free; takes the reflection bus tap). [innovations]
-  ism.h / ism.c        image-source EARLY reflections: shoebox mirrors, panned as point sources. [innovations]
-  align.h / align.c    per-speaker gain trim + delay-line output stage. [M4] Also the tracked-listener
-                       re-reference (bwa_set_tracked_align): re-aims the trims from the layout's fixed
-                       ref onto the live head, slewed + dead-zoned because every delay change is a
-                       resampling event. Off = the exact integer tap, bit-identical. [spatialization]
-  binaural.h/binaural.c  head-oriented 26->stereo monitor + the no-SDK cardioid decode of the
-                       direct-binaural field (Steam Audio HRTF is the upgrade). [M5]
-  hpeq.h / hpeq.c      headphone correction EQ: AutoEq ParametricEQ.txt -> RBJ biquad cascade on
-                       the headphone profiles' final stereo (bwa_load_headphone_eq). [binaural]
-  ambisonics.h/.c      3rd-order ACN/SN3D encode (+ ambi_encode_phonon, the monitor-basis encode
-                       shared by steam_decode and rt's direct mode). [M5]
-  steam_decode.h/.c    production ambisonics->stereo HRTF decode via phonon (with-SDK); sums the
-                       direct field into the virtual-speaker encode pre-decode. [M5]
-  steam_scene.h/.c     materials occlusion: IPLScene+IPLSimulator on a sim thread (with-SDK). [materials]
-  steam_reflect.h/.c   reflection bed: IPLSimulator reflections -> ambisonic IR -> SH->26 bus tap (with-SDK). [materials]
-  steam_path.h/.c      sound pathing: indirect routing -> per-voice shCoeffs -> SH-encode -> bus tap (with-SDK). [materials]
-  natnet.c             OptiTrack pose ingest (off-wire, see docs/build.md). [M6]
-  os.h / os_win.c / os_posix.c  the OS portability shim: every platform call the engine makes
-                       OUTSIDE the sinks (threads, sleep + os_sleep_until_ns, the monotonic clock,
-                       mutex + rwlock, os_event (auto-reset, sticky signal, monotonic timed wait),
-                       thread priority up (os_thread_set_realtime + its RLIMIT_RTPRIO probe) and
-                       down, strdup/strcasecmp, os_fopen + the UTF-8 path family, natnet's UDP
-                       sockets, BWA_EXPORT). Exactly one half compiles. Windows, Linux and Android
-                       have device backends; macOS runs the null and manual sinks until phase 4
-                       lands. Android takes the POSIX half unchanged (bionic has pthreads,
-                       clock_nanosleep, pthread_condattr_setclock); what it refuses is SCHED_FIFO
-                       for an app thread, which is the same reported degradation WSL produces.
-                       [backends p2]
+  core/
+    rt.h / rt.c          rings, voice table, commit snapshot, generation handles, mixer. [M2]
+    sound.h / sound.c    wav decode to mono float via dr_wav (Sound table lives in rt.c). [M3]
+    assets.h / assets.c  the SHARED-ownership asset tier: a by-path cache (key = normalized path +
+                         load flags, so "one file, memory vs streamed vs ambisonic" is just different
+                         entries) with a refcount, over the SAME rt loaders bwa_load_* drives — the
+                         Dictionary<path,handle> every binding was rebuilding, moved inward. Plus ONE
+                         loader thread for bwa_sound_acquire_async: it decodes off the control thread
+                         and hands the buffer over through an SPSC result ring; the control thread
+                         publishes it (rt_sound_reserve/publish/abandon) and a play issued meanwhile
+                         is HELD control-side until then, so the audio thread only ever sees a
+                         finished asset and gains no new branch. The loader BLOCKS on an os_event
+                         (signalled after every job push and at stop) rather than sleep-polling, so
+                         idle costs zero wakeups. [assets]
+    layout.h / layout.c  speaker geometry load (cave_layout.json via cJSON) + default grid. [M4]
+    stream.h / stream.c  background file streaming for long sounds (music / ambience), so
+                         they never decode the whole file into RAM: a streaming thread fills
+                         a per-stream SPSC ring from disk. [streaming]
+    sane.h               input sanitizing for values crossing the ABI into audio-thread state:
+                         the bwa_finite_* checks over the BWA_MAX_* caps, with the bound a
+                         REQUIRED argument (see Traps). Header-only.
+    bits.h               bit-twiddling shared by the engine and the offline DSP. Header-only.
+    frame.h              the room frame identity basis (BWA_ROOM_*) plus frame_qrot, consumed
+                         from one place. The convention itself is public ABI contract.
+    profile.h            the zone-profiling seam: Tracy macros that compile to nothing unless
+                         BWA_TRACY is defined. [profiling]
+    profile_self.h/.c    the headless in-process zone profiler behind BWA_PROFILE_SELF:
+                         per-zone numbers with no server tooling (bwa_prof_report). [profiling]
+  os/
+    os.h / os_win.c / os_posix.c  the OS portability shim: every platform call the engine makes
+                         OUTSIDE the sinks (threads, sleep + os_sleep_until_ns, the monotonic clock,
+                         mutex + rwlock, os_event (auto-reset, sticky signal, monotonic timed wait),
+                         thread priority up (os_thread_set_realtime + its RLIMIT_RTPRIO probe) and
+                         down, strdup/strcasecmp, os_fopen + the UTF-8 path family, natnet's UDP
+                         sockets, BWA_EXPORT). Exactly one half compiles. Windows, Linux and Android
+                         have device backends; macOS runs the null and manual sinks until phase 4
+                         lands. Android takes the POSIX half unchanged (bionic has pthreads,
+                         clock_nanosleep, pthread_condattr_setclock); what it refuses is SCHED_FIFO
+                         for an app thread, which is the same reported degradation WSL produces.
+                         [backends p2]
+  sink/
+    sink.h / sink.c      device-sink abstraction + backend dispatch: the AUTO order (Windows: 2-ch
+                         requests try WASAPI then ASIO, wider ones ASIO only. Linux: JACK then ALSA at
+                         every width) and the exact-match device rule. [M1/backends]
+    sink_convert.h       planar float bus -> the device's format (f32/i32/i24/i16), planar or
+                         interleaved. Moved out of asio_sink.cpp so every backend shares one set of
+                         clamp + NaN rules. [backends]
+    sink_quant.h/.c      the FIXED-QUANTUM adapter. render() must always see the engine block, but no
+                         device API past ASIO promises a fixed callback size, so this renders whole
+                         blocks into a ring of block-sized SLOTS (the stride render() already wants,
+                         so nothing copies) and serves the device any count. Owns the per-block
+                         timestamp rule, the written-versus-device-position dropout, and the
+                         late_blocks/render_ns_peak accounting for every backend it serves. [backends]
+    jack_sink.c          JACK host (Linux): the production Linux path, and the one backend whose ports
+                         are PLANAR FLOAT already, so the bus copies straight out - no convert, no
+                         interleave. One JACK2 or pipewire-jack answers at RUN time; JackNoStartServer
+                         makes "no server" the fast fall-through to ALSA. Activates and connects at
+                         OPEN (that is where a port-count error can still reach the caller) and gates
+                         the render on start(). xruns arrive on a notification thread and are parked
+                         for the process thread to fold into the adapter. [backends p5]
+    alsa_sink.c          ALSA host (Linux): the no-server path - a raw `hw:` card for an experiment
+                         that wants the device clock, a MADI/AES67 card for a rig, a plug PCM for a
+                         desk monitor. The ONE backend with no fixed-quantum adapter: it writes, so it
+                         picks the size, and it writes whole engine blocks. Blocking snd_pcm_writei IS
+                         the pacing; -EPIPE is the underrun report; SCHED_FIFO is asked for and its
+                         refusal is a reported degradation, never a failure. [backends p5]
+    aaudio_sink.c        AAudio host (Android): the headphone path on a standalone VR headset, and
+                         STEREO ONLY - Android carries no array transport, so AUTO sends anything
+                         wider straight to the offline sink and an explicit open says so. AAudio owns
+                         the callback thread and treats setFramesPerDataCallback as a HINT, so the
+                         fixed-quantum adapter is in the path. Dropouts are the OS's own
+                         getXRunCount DELTA with dropped_frames 0 (AAudio counts events, never their
+                         length); device_pos_valid is false, because the queued-depth rule would count
+                         the same starve twice. The device rate is PROBED before the real open (one
+                         throwaway stream, everything unspecified), since a shared-mode stream reports
+                         the rate it was asked for whether or not the service is resampling -
+                         without it rule 6 would have nothing to report. setUsage is never called:
+                         it is __INTRODUCED_IN(28) and this targets API 26. AAUDIO_ERROR_DISCONNECTED
+                         sets device_lost and starts the host-paced thread; nothing reopens.
+                         [backends p3]
+    null_sink.c          offline (no-hardware) sink: threaded silence + timestamps. [M1]
+    manual_sink.c        offline/deterministic sink: no thread, the caller pumps (bwa_render_block). [M1]
+    asio_sink.cpp        ASIO host: driver load, bufferSwitch, sample-pos timestamp. [M1]
+    wasapi_sink.cpp      WASAPI host: the headphone profiles + the cave_both monitor, on the endpoint
+                         the headphones are actually on. Shared mode by default (IAudioClient3 period;
+                         a VR runtime keeps its own audio open beside us), exclusive under
+                         BWA_SINK_FLAG_EXCLUSIVE. IAudioClock for the timestamp pair,
+                         AUDCLNT_E_DEVICE_INVALIDATED -> health.device_lost with the sink degrading to
+                         host-paced silence so the engine's clocks keep advancing. It is also what
+                         finally lets cave_both open TWO devices: the ASIO SDK allows one driver per
+                         process. [backends]
+  spatial/
+    dbap.h / dbap.c      listener-relative, constant-power DBAP gain solve. [M4]
+    spcap.h / spcap.c    Speaker-Placement Correction Amplitude Panning: the smooth,
+                         all-speaker, power-conserving panner for the FIXED-observer case.
+                         [spatialization]
+    vbap.h / vbap.c      Vector Base Amplitude Panning: the hull triangle that contains the
+                         source bearing carries it, at constant power. [spatialization]
+    hull.h / hull.c      convex-hull triangulation of unit directions + the VBAP gains within
+                         it. Pure and alloc-free; shared by allrad.c (the load-time decode
+                         build) and vbap.c. [spatialization]
+    allrad.h / allrad.c  All-Round Ambisonic Decoding for the diffuse layer: the SH->26
+                         bed-decode matrix built over a virtual layer (bed_decoder = 1).
+                         [spatialization]
+    epad.h / epad.c      Energy-Preserving Ambisonic Decoding for the diffuse layer, same
+                         shape and convention (bed_decoder = 2). [spatialization]
+    cap.h / cap.c        compensated amplitude panning: projects the dual-band LOW band so the rendered
+                         ITD matches a real source's for the head's CURRENT orientation. NOT a panner -
+                         a modifier on whatever panner is selected, so it reduces to that panner facing
+                         the source. The one place head ORIENTATION reaches the speaker path.
+                         bwa_set_dual_band_cap. [spatialization]
+    hole.h / hole.c      hole-aware spread floor: a source aimed where the array has NO speaker (the
+                         barrel's open poles) is floored WIDE instead of split across the hull triangle
+                         that closes the hole. Cached per listener like spcap/vbap; bwa_set_hole_spread. [spatialization]
+    align.h / align.c    per-speaker gain trim + delay-line output stage. [M4] Also the tracked-listener
+                         re-reference (bwa_set_tracked_align): re-aims the trims from the layout's fixed
+                         ref onto the live head, slewed + dead-zoned because every delay change is a
+                         resampling event. Off = the exact integer tap, bit-identical. [spatialization]
+    ambisonics.h/.c      3rd-order ACN/SN3D encode (+ ambi_encode_phonon, the monitor-basis encode
+                         shared by steam_decode and rt's direct mode). [M5]
+  acoustics/
+    fdn.h / fdn.c        directional FDN reverb bed (phonon-free; takes the reflection bus tap). [innovations]
+    ism.h / ism.c        image-source EARLY reflections: shoebox mirrors, panned as point sources. [innovations]
+    steam_scene.h/.c     materials occlusion: IPLScene+IPLSimulator on a sim thread (with-SDK). [materials]
+    steam_reflect.h/.c   reflection bed: IPLSimulator reflections -> ambisonic IR -> SH->26 bus tap (with-SDK). [materials]
+    steam_path.h/.c      sound pathing: indirect routing -> per-voice shCoeffs -> SH-encode -> bus tap (with-SDK). [materials]
+  binaural/
+    binaural.h/binaural.c  head-oriented 26->stereo monitor + the no-SDK cardioid decode of the
+                         direct-binaural field (Steam Audio HRTF is the upgrade). [M5]
+    hpeq.h / hpeq.c      headphone correction EQ: AutoEq ParametricEQ.txt -> RBJ biquad cascade on
+                         the headphone profiles' final stereo (bwa_load_headphone_eq). [binaural]
+    steam_decode.h/.c    production ambisonics->stereo HRTF decode via phonon (with-SDK); sums the
+                         direct field into the virtual-speaker encode pre-decode. [M5]
+  dsp/
+    biquad.h             RBJ "Audio EQ Cookbook" coefficients, a0-normalized, Direct Form I.
+                         Shared by the transmission/pathing EQ, the room EQ and the headphone EQ.
+    fft.h                small in-place radix-2 FFT (double precision) for the OFFLINE DSP:
+                         measurement and the Doppler probe. NEVER the audio thread.
+    sos.h                speed of sound for the MEASUREMENT tools and the layout schema. Control
+                         side only, never the audio thread.
+  tracking/
+    natnet.c             OptiTrack pose ingest (off-wire, see docs/build.md). [M6]
+    pose.h               the lock-free single-slot pose handoff (seqlock) from the receiver
+                         thread to the audio thread. The ONE header that carries stdatomic.h,
+                         so nothing else may include it casually (see Traps). [M6]
+  calib/
+    measure.c/calib.c    bwa_calibrate DSP: sweep+deconvolution, trims, trilateration, room report. [calib]
+    zylia.h / zylia.c    Zylia ZM-1: single-position speaker localization (TDOA + GN position) AND the
+                         validation-grade estimators — active-intensity DOA, capsule integrity,
+                         SRP-PHAT cross-check, comb depth (spectral ripple: what coherent multi-speaker
+                         copies cost in timbre, the measurable side of SPCAP focus). [calib]
+    valid.h / valid.c    phantom-localization validation: render a source, measure where the array
+                         actually put it (feeds/simulate/score + medians, bootstrap, matched-cell
+                         contrasts). The PHANTOM arm renders through a REAL ENGINE CORE (a cached
+                         RtCore + push voice, limiter off, ramps settled, deterministic timestamp --
+                         the same path bwa_render_block/BWA_SINK_MANUAL drives), so every live A/B knob
+                         (ValidRender: focus/density, dual-band, CAP, hole spread, tracked align,
+                         spread mode/decorrelation/near spread) is sweepable and valid_simulate just
+                         propagates those feeds to the 19 capsules. The PHYSICAL REFERENCE arm (drive
+                         one speaker alone = a real source, so a phantom miss reads against a floor --
+                         also the comb-depth floor) deliberately does NOT: no panner, no knob, no
+                         engine state. valid_speaker_feeds_direct is the pre-engine builder, kept as
+                         the regression baseline the ctest pins the engine render against. Also
+                         stimulus selection (broadband or a tone, analysis band follows). Drives
+                         bwa_validate. [validation]
 test/                  ctest suite; targets are prefixed test_* (test_smoke, test_rt_core, test_rt_feature,
                        test_dsp, ...) so the built tools (bwa_*) and the tests sort apart in the bin dir.
                        The rt test is split: test_rt_core (concurrency/lifecycle spine) + test_rt_feature
@@ -363,12 +407,12 @@ Regression-preventing gotchas. Each has bitten before or guards a real invariant
   `natnet_read_pose` instead; and the payload is no longer memcpy-able, so a caller that used to
   seed `slot.p` directly must go through `pose_write` or stop seeding (rt.c's readback did the
   latter — `rt_read_pose` already falls back to the active fields).
-- **Nothing in `src/` outside the `*_sink` files may call the OS directly.** `src/os.h` is the
+- **Nothing in `src/` outside the `*_sink` files may call the OS directly.** `src/os/os.h` is the
   seam (threads, sleep, `os_sleep_until_ns`, the monotonic clock, mutex + rwlock, thread priority,
   `strdup`/`strcasecmp`, UDP sockets, `BWA_EXPORT`), with `os_win.c` and `os_posix.c` behind it.
   It must stay C++-includable, because `sink.h` includes it and the two C++ sinks include
   `sink.h`: no `<stdatomic.h>`, no `<windows.h>`, no `<winsock2.h>` in that header, ever. The .c
-  files use C11 atomics directly instead. Tests may include `src/os.h`; examples are client code
+  files use C11 atomics directly instead. Tests may include `src/os/os.h`; examples are client code
   of the public ABI and use `examples/portable.h` instead.
 - **A self-paced loop waits on an ABSOLUTE deadline, never a relative sleep.** `os_sleep_until_ns`
   exists because a relative sleep is computed from a clock reading that is already stale, so its

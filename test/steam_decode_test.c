@@ -8,10 +8,10 @@
  * preserves laterality — right speaker -> right ear, left -> left, and a 180-degree head turn flips it.
  * It does NOT judge HRTF *quality* (that stays the by-ear check); it proves the decode actually works.
  */
-#include "steam_decode.h"
-#include "layout.h"
-#include "rt.h"            /* the live-composition probe drives the real DBAP bus + pose plumbing */
-#include "sink.h"          /* BWA_CHANNELS */
+#include "binaural/steam_decode.h"
+#include "core/layout.h"
+#include "core/rt.h"            /* the live-composition probe drives the real DBAP bus + pose plumbing */
+#include "sink/sink.h"          /* BWA_CHANNELS */
 
 #include <math.h>
 #include <stdio.h>
