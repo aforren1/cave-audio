@@ -166,9 +166,11 @@ jobs:
 
       # ---- the MATLAB MEX ------------------------------------------------------------------------
       # UNVERIFIED LOCALLY on a runner: written from the patterns in
-      # https://github.com/mathworks/ci-configuration-examples. setup-matlab needs no license token
-      # on a GitHub-hosted runner for a public repository, and MSVC - already here for the engine -
-      # is a compiler MATLAB supports for MEX on Windows.
+      # https://github.com/mathworks/ci-configuration-examples. On a GitHub-hosted runner for a
+      # public repository no license token is needed, but the license only exists INSIDE the
+      # matlab-actions run-* steps (a shell step's `matlab` launch is unlicensed), so anything
+      # that has to run MATLAB code goes through run-command. MSVC - already here for the
+      # engine - is a compiler MATLAB supports for MEX on Windows.
       #
       # Inside this job, after the engine build, so the MEX links the DLL this job already produced
       # with ASIO, WASAPI and a static phonon intact, rather than a second engine built elsewhere.
@@ -182,12 +184,23 @@ jobs:
           # Pinned, so a new MathWorks release cannot change overnight what this job tested.
           release: R2024b
 
+      - name: Find matlabroot
+        # setup-matlab puts the launcher on PATH but not matlabroot, and FindMatlab wants the
+        # root. Ask MATLAB itself rather than guessing the install layout - but through
+        # run-command, not `matlab -batch` in a shell step: on a public repository the license
+        # is granted ONLY inside matlab-actions' run-* steps, and a direct launch dies with
+        # "License checkout failed" (it did, on the first run of these steps).
+        uses: matlab-actions/run-command@v3
+        with:
+          command: |
+            f = fopen(getenv("GITHUB_ENV"), "a");
+            fprintf(f, "MATLAB_ROOT=%s\n", matlabroot);
+            fclose(f);
+
       - name: Configure and build the MATLAB MEX
         shell: bash
         run: |
-          # setup-matlab puts the launcher on PATH but not matlabroot, and FindMatlab wants the
-          # root. Ask MATLAB itself rather than guessing the install layout.
-          root="$(matlab -batch 'disp(matlabroot)' | tail -1 | tr -d '\r')"
+          root="$MATLAB_ROOT"
           echo "matlabroot: $root"
           test -d "$root"
           # The SAME build tree. Reconfiguring only adds the MATLAB target; nothing rebuilds.
@@ -1127,13 +1140,14 @@ jobs:
         # nothing here reaches the link line. The packages still have to be present or CMake
         # silently drops the backends.
         #
-        # octave + liboctave-dev is the MATLAB and Octave binding's toolchain: mkoctfile builds
-        # the MEX, octave-cli runs its ctests. This is the ONLY job that can do it - no runner
-        # image carries MATLAB or Octave otherwise, and MATLAB needs a license CI does not have
-        # (matlab-actions/setup-matlab is the follow-up if that changes).
+        # octave + octave-dev is the Octave half of the MATLAB and Octave binding's toolchain:
+        # mkoctfile builds the MEX, octave-cli runs its ctests. This is the ONLY job that
+        # builds an Octave MEX - no runner image carries Octave, and installing one on the
+        # other two is a follow-up. (The package is octave-dev since Ubuntu 22.04; the older
+        # liboctave-dev name does not resolve on a current runner.)
         run: |
           sudo apt-get update
-          sudo apt-get install -y libasound2-dev libjack-jackd2-dev octave liboctave-dev
+          sudo apt-get install -y libasound2-dev libjack-jackd2-dev octave octave-dev
 
       - name: Version
         id: ver
@@ -1234,8 +1248,10 @@ jobs:
       # ---- the MATLAB MEX ------------------------------------------------------------------------
       # UNVERIFIED LOCALLY, all of it: nobody here can run a GitHub-hosted MATLAB, so these steps
       # come from the patterns in https://github.com/mathworks/ci-configuration-examples rather
-      # than from a run. setup-matlab needs no license token on a GitHub-hosted runner for a public
-      # repository.
+      # than from a run. On a GitHub-hosted runner for a public repository no license token is
+      # needed, but the license only exists INSIDE the matlab-actions run-* steps: a shell
+      # step's own `matlab` launch is unlicensed, so anything that has to run MATLAB code
+      # goes through run-command.
       #
       # They live INSIDE this job, after the engine build, so the MEX links the library this job
       # already produced - JACK, ALSA and a static phonon intact - instead of a second engine built
@@ -1246,12 +1262,23 @@ jobs:
           # Pinned, so a new MathWorks release cannot change overnight what this job tested.
           release: R2024b
 
+      - name: Find matlabroot
+        # setup-matlab puts the launcher on PATH but not matlabroot, and FindMatlab wants the
+        # root. Ask MATLAB itself rather than guessing the install layout - but through
+        # run-command, not `matlab -batch` in a shell step: on a public repository the license
+        # is granted ONLY inside matlab-actions' run-* steps, and a direct launch dies with
+        # "License checkout failed" (it did, on the first run of these steps).
+        uses: matlab-actions/run-command@v3
+        with:
+          command: |
+            f = fopen(getenv("GITHUB_ENV"), "a");
+            fprintf(f, "MATLAB_ROOT=%s\n", matlabroot);
+            fclose(f);
+
       - name: Configure and build the MATLAB MEX
         shell: bash
         run: |
-          # setup-matlab puts the launcher on PATH but not matlabroot, and FindMatlab wants the
-          # root. Ask MATLAB itself rather than guessing the install layout.
-          root="$(matlab -batch 'disp(matlabroot)' | tail -1 | tr -d '\r')"
+          root="$MATLAB_ROOT"
           echo "matlabroot: $root"
           test -d "$root"
           # The SAME build tree. Reconfiguring only adds the MATLAB target; nothing rebuilds.
@@ -1580,10 +1607,23 @@ jobs:
           # Pinned, so a new MathWorks release cannot change overnight what this job tested.
           release: R2024b
 
+      - name: Find matlabroot
+        # setup-matlab puts the launcher on PATH but not matlabroot, and FindMatlab wants the
+        # root. Ask MATLAB itself rather than guessing the install layout - but through
+        # run-command, not `matlab -batch` in a shell step: on a public repository the license
+        # is granted ONLY inside matlab-actions' run-* steps, and a direct launch dies with
+        # "License checkout failed" (it did, on the first run of these steps).
+        uses: matlab-actions/run-command@v3
+        with:
+          command: |
+            f = fopen(getenv("GITHUB_ENV"), "a");
+            fprintf(f, "MATLAB_ROOT=%s\n", matlabroot);
+            fclose(f);
+
       - name: Configure and build the MATLAB MEX
         shell: bash
         run: |
-          root="$(matlab -batch 'disp(matlabroot)' | tail -1 | tr -d '\r')"
+          root="$MATLAB_ROOT"
           echo "matlabroot: $root"
           test -d "$root"
           # The SAME build tree. Reconfiguring only adds the MATLAB target; nothing rebuilds.

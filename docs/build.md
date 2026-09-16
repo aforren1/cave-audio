@@ -413,7 +413,7 @@ older UPM parsers reject. When git cannot answer (no tag, shallow clone, no git 
   `bw_audio-matlab-<ver>-r<N>` and, on a tag, as `bw_audio-matlab-<tag>.zip`.
   The macOS runner is Apple silicon, so its MEX is `.mexmaca64` against the universal dylib; an
   Intel Mac would need a MEX built on one, which nothing here has.
-  **Octave is Linux-only in CI.** The `linux` job installs `octave` and `liboctave-dev` from apt
+  **Octave is Linux-only in CI.** The `linux` job installs `octave` and `octave-dev` from apt
   and runs `octave_tests` plus the three examples through ctest, and its artifact carries that MEX.
   Installing Octave on the Windows and macOS runners is a documented follow-up; an Octave user on
   those platforms builds with `mkoctfile`, which is one command.
