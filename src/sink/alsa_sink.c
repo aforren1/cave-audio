@@ -30,11 +30,136 @@
 
 #include <alsa/asoundlib.h>
 
+#include <alloca.h>   /* ALSA_ALLOCA: the alloca the asoundlib macros used to hide */
+
 #include <errno.h>
 #include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+/* ---- the run-time loader ------------------------------------------------------------------- */
+
+/* WHY THE LIBRARY IS NOT LINKED. Same reason as jack_sink.c, which states it at length:
+ * libbw_audio.so must load on a box with no sound card and no alsa-lib at all, so a missing
+ * library is one backend reporting UNAVAILABLE rather than the whole library failing to load.
+ * The headers stay a BUILD-time dependency - every type, enum and constant below comes from
+ * them, and only the symbols move to run time.
+ *
+ * TWO TRAPS ALSA ADDS over JACK. The snd_pcm_*_params_alloca family is a MACRO that expands to
+ * a snd_*_sizeof() call, which is an ordinary library symbol, so the macros are respelled over
+ * the table below (ALSA_ALLOCA) rather than used. And snd_strerror is a library symbol too,
+ * although it looks like strerror: every error path that names a reason goes through the table.
+ *
+ * CONTROL THREAD ONLY for the loading. The render thread READS the table (snd_pcm_writei,
+ * snd_pcm_status and their friends), but it is written only here, before the thread exists. */
+#define ALSA_SONAME "libasound.so.2"
+
+/* name, return type, parameter list. One list generates the typedefs, the table and the resolve
+ * loop, so the three cannot drift apart. */
+#define ALSA_SYMBOLS(X) \
+    X(snd_pcm_open,                            int,                (snd_pcm_t**, const char*, snd_pcm_stream_t, int)) \
+    X(snd_pcm_close,                           int,                (snd_pcm_t*)) \
+    X(snd_pcm_prepare,                         int,                (snd_pcm_t*)) \
+    X(snd_pcm_resume,                          int,                (snd_pcm_t*)) \
+    X(snd_pcm_drop,                            int,                (snd_pcm_t*)) \
+    X(snd_pcm_writei,                          snd_pcm_sframes_t,  (snd_pcm_t*, const void*, snd_pcm_uframes_t)) \
+    X(snd_pcm_status,                          int,                (snd_pcm_t*, snd_pcm_status_t*)) \
+    X(snd_pcm_status_sizeof,                   size_t,             (void)) \
+    X(snd_pcm_status_get_htstamp,              void,               (const snd_pcm_status_t*, snd_htimestamp_t*)) \
+    X(snd_pcm_status_get_delay,                snd_pcm_sframes_t,  (const snd_pcm_status_t*)) \
+    X(snd_pcm_hw_params,                       int,                (snd_pcm_t*, snd_pcm_hw_params_t*)) \
+    X(snd_pcm_hw_params_sizeof,                size_t,             (void)) \
+    X(snd_pcm_hw_params_any,                   int,                (snd_pcm_t*, snd_pcm_hw_params_t*)) \
+    X(snd_pcm_hw_params_set_access,            int,                (snd_pcm_t*, snd_pcm_hw_params_t*, snd_pcm_access_t)) \
+    X(snd_pcm_hw_params_test_format,           int,                (snd_pcm_t*, snd_pcm_hw_params_t*, snd_pcm_format_t)) \
+    X(snd_pcm_hw_params_set_format,            int,                (snd_pcm_t*, snd_pcm_hw_params_t*, snd_pcm_format_t)) \
+    X(snd_pcm_hw_params_set_rate_resample,     int,                (snd_pcm_t*, snd_pcm_hw_params_t*, unsigned int)) \
+    X(snd_pcm_hw_params_set_rate,              int,                (snd_pcm_t*, snd_pcm_hw_params_t*, unsigned int, int)) \
+    X(snd_pcm_hw_params_set_rate_near,         int,                (snd_pcm_t*, snd_pcm_hw_params_t*, unsigned int*, int*)) \
+    X(snd_pcm_hw_params_set_channels,          int,                (snd_pcm_t*, snd_pcm_hw_params_t*, unsigned int)) \
+    X(snd_pcm_hw_params_get_channels_min,      int,                (const snd_pcm_hw_params_t*, unsigned int*)) \
+    X(snd_pcm_hw_params_get_channels_max,      int,                (const snd_pcm_hw_params_t*, unsigned int*)) \
+    X(snd_pcm_hw_params_set_period_size_near,  int,                (snd_pcm_t*, snd_pcm_hw_params_t*, snd_pcm_uframes_t*, int*)) \
+    X(snd_pcm_hw_params_get_period_size,       int,                (const snd_pcm_hw_params_t*, snd_pcm_uframes_t*, int*)) \
+    X(snd_pcm_hw_params_set_buffer_size_near,  int,                (snd_pcm_t*, snd_pcm_hw_params_t*, snd_pcm_uframes_t*)) \
+    X(snd_pcm_hw_params_get_buffer_size,       int,                (const snd_pcm_hw_params_t*, snd_pcm_uframes_t*)) \
+    X(snd_pcm_sw_params,                       int,                (snd_pcm_t*, snd_pcm_sw_params_t*)) \
+    X(snd_pcm_sw_params_sizeof,                size_t,             (void)) \
+    X(snd_pcm_sw_params_current,               int,                (snd_pcm_t*, snd_pcm_sw_params_t*)) \
+    X(snd_pcm_sw_params_set_tstamp_mode,       int,                (snd_pcm_t*, snd_pcm_sw_params_t*, snd_pcm_tstamp_t)) \
+    X(snd_pcm_sw_params_set_tstamp_type,       int,                (snd_pcm_t*, snd_pcm_sw_params_t*, snd_pcm_tstamp_type_t)) \
+    X(snd_pcm_sw_params_set_start_threshold,   int,                (snd_pcm_t*, snd_pcm_sw_params_t*, snd_pcm_uframes_t)) \
+    X(snd_device_name_hint,                    int,                (int, const char*, void***)) \
+    X(snd_device_name_get_hint,                char*,              (const void*, const char*)) \
+    X(snd_device_name_free_hint,               int,                (void**)) \
+    X(snd_strerror,                            const char*,        (int))
+
+#define ALSA_TYPEDEF(n, r, a) typedef r (*n##_pfn) a;
+ALSA_SYMBOLS(ALSA_TYPEDEF)
+#undef ALSA_TYPEDEF
+
+#define ALSA_FIELD(n, r, a) n##_pfn n;
+typedef struct { ALSA_SYMBOLS(ALSA_FIELD) } AlsaApi;
+#undef ALSA_FIELD
+
+static AlsaApi al;                      /* every call site reads al.<symbol> */
+static os_dl   al_lib;
+static char    al_lib_name[128];        /* what al_lib was opened as; the cache key */
+static char    al_err[224];             /* ASCII: it reaches bwa_last_error */
+
+/* The <alsa/asoundlib.h> alloca macros, over the table. Same shape as the originals: the object
+ * lands on the CALLER's stack and is zeroed, so nothing in the render loop allocates. */
+#define ALSA_ALLOCA(kind, var)                            \
+    do {                                                  \
+        const size_t sz_ = al.kind##_sizeof();             \
+        (var) = (kind##_t*)alloca(sz_);                    \
+        memset((var), 0, sz_);                             \
+    } while (0)
+
+/* Resolve the table, once. Returns false with al_err set when the library or any symbol is
+ * missing, and a later call RETRIES - a box where alsa-lib was installed after the first attempt
+ * finds it. bwa_sink_dl_override (sink.h) re-aims the loader, which is how the test reaches this
+ * path on a box that has ALSA.
+ *
+ * Resolves into a LOCAL and commits on success, and never closes the old handle, both for the
+ * reasons jack_load gives: a failed load must leave a running sink's table intact. */
+static bool alsa_load(void) {
+    const char* want = bwa_sink_dl_override ? bwa_sink_dl_override : ALSA_SONAME;
+    if (al_lib && strcmp(al_lib_name, want) == 0) return true;
+
+    os_dl h = os_dl_open(want);
+    if (!h) {
+        /* "could not be loaded" is a STABLE phrase: the sink test matches it to tell a visible
+         * ctest SKIP from a real failure, the same way it matches "no PCM named". */
+        snprintf(al_err, sizeof al_err,
+                 "alsa: %s could not be loaded, so this build cannot reach an ALSA PCM; install "
+                 "alsa-lib (libasound2), or use the JACK backend", want);
+        return false;
+    }
+
+    AlsaApi t;
+    memset(&t, 0, sizeof t);
+#define ALSA_RESOLVE(n, r, a)                                                     \
+    do {                                                                          \
+        t.n = (n##_pfn)os_dl_sym(h, #n);                                          \
+        if (!t.n) {                                                               \
+            snprintf(al_err, sizeof al_err,                                       \
+                     "alsa: %s has no symbol %s, so it is not a usable alsa-lib", \
+                     want, #n);                                                   \
+            os_dl_close(h);                                                       \
+            return false;                                                         \
+        }                                                                         \
+    } while (0);
+    ALSA_SYMBOLS(ALSA_RESOLVE)
+#undef ALSA_RESOLVE
+
+    al     = t;
+    al_lib = h;
+    snprintf(al_lib_name, sizeof al_lib_name, "%s", want);
+    al_err[0] = 0;
+    return true;
+}
 
 typedef struct {
     bwa_sink base;
@@ -110,7 +235,7 @@ static void alsa_thread(void* arg) {
 
     const uint64_t sane     = (uint64_t)s->block * 4096ull;   /* the same window sink_position_gap uses */
     snd_pcm_status_t* status = NULL;
-    snd_pcm_status_alloca(&status);         /* on this thread's stack: nothing allocates in the loop */
+    ALSA_ALLOCA(snd_pcm_status, status);         /* on this thread's stack: nothing allocates in the loop */
 
     uint64_t pos = 0;                       /* frames handed to the device: the stream position */
     uint64_t host_next_ns = 0;
@@ -167,7 +292,7 @@ static void alsa_thread(void* arg) {
         while (done < s->block && !atomic_load_explicit(&s->stop_flag, memory_order_relaxed)) {
             const uint8_t* p = (const uint8_t*)s->frames
                              + (size_t)done * s->channels * s->bytes_per_sample;
-            const snd_pcm_sframes_t w = snd_pcm_writei(s->pcm, p, s->block - done);
+            const snd_pcm_sframes_t w = al.snd_pcm_writei(s->pcm, p, s->block - done);
             if (w >= 0) { done += (uint32_t)w; continue; }
 
             if (w == -EPIPE) {
@@ -188,7 +313,7 @@ static void alsa_thread(void* arg) {
                  * lands on the device's stream rather than on our own, now-behind one. */
                 pos += lost;
                 pair_valid = false;                 /* the old correspondence died with the stream */
-                if (snd_pcm_prepare(s->pcm) < 0) { atomic_store_explicit(&s->lost, 1u, memory_order_relaxed); break; }
+                if (al.snd_pcm_prepare(s->pcm) < 0) { atomic_store_explicit(&s->lost, 1u, memory_order_relaxed); break; }
                 last_good_ns = os_monotonic_ns();
                 continue;
             }
@@ -197,8 +322,8 @@ static void alsa_thread(void* arg) {
                  * "not yet", then prepare. This is the driver reporting a discontinuity to us
                  * rather than us inferring one, which is what driver_resyncs means. */
                 int r;
-                while ((r = snd_pcm_resume(s->pcm)) == -EAGAIN) os_sleep_ms(10);
-                if (r < 0 && snd_pcm_prepare(s->pcm) < 0) {
+                while ((r = al.snd_pcm_resume(s->pcm)) == -EAGAIN) os_sleep_ms(10);
+                if (r < 0 && al.snd_pcm_prepare(s->pcm) < 0) {
                     atomic_store_explicit(&s->lost, 1u, memory_order_relaxed);
                     break;
                 }
@@ -221,10 +346,10 @@ static void alsa_thread(void* arg) {
         /* The device half of rule 3's pair, plus rule 5's latency on the first pass. htstamp is
          * CLOCK_MONOTONIC because the sw_params asked for it, which is the clock os_monotonic_ns
          * reads on Linux - the two are directly comparable. */
-        if (status && snd_pcm_status(s->pcm, status) == 0) {
+        if (status && al.snd_pcm_status(s->pcm, status) == 0) {
             snd_htimestamp_t h;
-            snd_pcm_status_get_htstamp(status, &h);
-            const snd_pcm_sframes_t delay = snd_pcm_status_get_delay(status);
+            al.snd_pcm_status_get_htstamp(status, &h);
+            const snd_pcm_sframes_t delay = al.snd_pcm_status_get_delay(status);
             const uint64_t d = (delay > 0) ? (uint64_t)delay : 0;
             if (h.tv_sec || h.tv_nsec) {
                 pair_ns = (uint64_t)h.tv_sec * 1000000000ull + (uint64_t)h.tv_nsec
@@ -260,13 +385,13 @@ static void alsa_stop(bwa_sink* base) {
      * snd_pcm_writei is a race. The wait costs at most one blocking write, which is one period.
      * Rule 8: close() returns only once the loop has left. */
     os_thread_join(&s->thread);
-    if (s->pcm) { snd_pcm_drop(s->pcm); snd_pcm_prepare(s->pcm); }   /* leave it restartable */
+    if (s->pcm) { al.snd_pcm_drop(s->pcm); al.snd_pcm_prepare(s->pcm); }   /* leave it restartable */
 }
 
 static void alsa_close(bwa_sink* base) {
     AlsaSink* s = (AlsaSink*)base;
     alsa_stop(base);
-    if (s->pcm) { snd_pcm_close(s->pcm); s->pcm = NULL; }
+    if (s->pcm) { al.snd_pcm_close(s->pcm); s->pcm = NULL; }
     free(s->frames);
     free(s->bus);
     free(s);
@@ -318,18 +443,21 @@ static const bwa_sink_vtbl ALSA_VT = {   /* designated: stop/close share a signa
 typedef struct { char name[128]; char desc[128]; } AlsaHint;
 
 static uint32_t alsa_hints(AlsaHint* out, uint32_t cap) {
+    /* No alsa-lib is exactly "no device": the count is 0, every name query fails, and rule 10 then
+     * skips this backend under AUTO the same way an absent PCM already does. */
+    if (!alsa_load()) return 0;
     void** hints = NULL;
-    if (snd_device_name_hint(-1, "pcm", &hints) != 0 || !hints) return 0;
+    if (al.snd_device_name_hint(-1, "pcm", &hints) != 0 || !hints) return 0;
     uint32_t n = 0;
     int default_at = -1;
     for (uint32_t i = 0; hints[i] && n < cap; ++i) {
-        char* io = snd_device_name_get_hint(hints[i], "IOID");
+        char* io = al.snd_device_name_get_hint(hints[i], "IOID");
         const bool output = (io == NULL) || (strcmp(io, "Output") == 0);
         free(io);
         if (!output) continue;
-        char* nm = snd_device_name_get_hint(hints[i], "NAME");
+        char* nm = al.snd_device_name_get_hint(hints[i], "NAME");
         if (!nm) continue;
-        char* ds = snd_device_name_get_hint(hints[i], "DESC");
+        char* ds = al.snd_device_name_get_hint(hints[i], "DESC");
         snprintf(out[n].name, sizeof out[n].name, "%s", nm);
         if (ds) {
             char* nl = strchr(ds, '\n');
@@ -343,7 +471,7 @@ static uint32_t alsa_hints(AlsaHint* out, uint32_t cap) {
         free(ds);
         ++n;
     }
-    snd_device_name_free_hint(hints);
+    al.snd_device_name_free_hint(hints);
     if (default_at > 0) {                       /* rotate `default` to index 0 */
         AlsaHint tmp = out[default_at];
         for (int k = default_at; k > 0; --k) out[k] = out[k - 1];
@@ -409,6 +537,14 @@ bwa_sink* bwa_alsa_sink_open(uint32_t sample_rate, uint32_t block_size, uint32_t
         alsa_set_err(err, errcap, "alsa: bad arguments");
         return NULL;
     }
+    /* The library is resolved here, not at load time, so a box with no alsa-lib still loads the
+     * engine. The message names the library, because "alsa: open failed" would send the reader
+     * looking for a sound card that was never the problem. */
+    if (!alsa_load()) {
+        alsa_set_err(err, errcap, al_err);
+        return NULL;
+    }
+
     const char* pcm_name = (device && *device) ? device : "default";
     /* 256 because that is what engine.c's errbuf holds, and BOTH degradations can apply at once (a
      * plug PCM on a box with no real-time budget). Anything longer is silently truncated there,
@@ -416,36 +552,36 @@ bwa_sink* bwa_alsa_sink_open(uint32_t sample_rate, uint32_t block_size, uint32_t
     char degraded[256] = {0};
 
     snd_pcm_t* pcm = NULL;
-    int e = snd_pcm_open(&pcm, pcm_name, SND_PCM_STREAM_PLAYBACK, 0);
+    int e = al.snd_pcm_open(&pcm, pcm_name, SND_PCM_STREAM_PLAYBACK, 0);
     if (e < 0 || !pcm) {
         char m[256];
         if (e == -ENOENT || e == -ENODEV || e == -ENXIO) {
             /* The runner case and the headless-box case. The phrase is stable on purpose: the sink
              * test matches it to decide between a visible ctest SKIP and a real failure. */
             snprintf(m, sizeof m, "alsa: no PCM named '%s' on this machine (%s)",
-                     pcm_name, snd_strerror(e));
+                     pcm_name, al.snd_strerror(e));
         } else {
-            snprintf(m, sizeof m, "alsa: could not open PCM '%s' (%s)", pcm_name, snd_strerror(e));
+            snprintf(m, sizeof m, "alsa: could not open PCM '%s' (%s)", pcm_name, al.snd_strerror(e));
         }
         alsa_set_err(err, errcap, m);
         return NULL;
     }
 
     snd_pcm_hw_params_t* hw = NULL;
-    snd_pcm_hw_params_alloca(&hw);
-    if (snd_pcm_hw_params_any(pcm, hw) < 0) {
+    ALSA_ALLOCA(snd_pcm_hw_params, hw);
+    if (al.snd_pcm_hw_params_any(pcm, hw) < 0) {
         char m[192];
         snprintf(m, sizeof m, "alsa: PCM '%s' offers no usable configuration", pcm_name);
         alsa_set_err(err, errcap, m);
-        snd_pcm_close(pcm);
+        al.snd_pcm_close(pcm);
         return NULL;
     }
 
-    if (snd_pcm_hw_params_set_access(pcm, hw, SND_PCM_ACCESS_RW_INTERLEAVED) < 0) {
+    if (al.snd_pcm_hw_params_set_access(pcm, hw, SND_PCM_ACCESS_RW_INTERLEAVED) < 0) {
         char m[192];
         snprintf(m, sizeof m, "alsa: PCM '%s' does not take interleaved read/write access", pcm_name);
         alsa_set_err(err, errcap, m);
-        snd_pcm_close(pcm);
+        al.snd_pcm_close(pcm);
         return NULL;
     }
 
@@ -454,8 +590,8 @@ bwa_sink* bwa_alsa_sink_open(uint32_t sample_rate, uint32_t block_size, uint32_t
     uint32_t bytes = 4;
     bool have_fmt = false;
     for (size_t i = 0; i < sizeof ALSA_FORMATS / sizeof *ALSA_FORMATS && !have_fmt; ++i) {
-        if (snd_pcm_hw_params_test_format(pcm, hw, ALSA_FORMATS[i].a) != 0) continue;
-        if (snd_pcm_hw_params_set_format(pcm, hw, ALSA_FORMATS[i].a) < 0) continue;
+        if (al.snd_pcm_hw_params_test_format(pcm, hw, ALSA_FORMATS[i].a) != 0) continue;
+        if (al.snd_pcm_hw_params_set_format(pcm, hw, ALSA_FORMATS[i].a) < 0) continue;
         fmt      = ALSA_FORMATS[i].f;
         in32     = ALSA_FORMATS[i].in32;
         bytes    = in32 ? 4u : sink_fmt_bytes(ALSA_FORMATS[i].f);
@@ -465,7 +601,7 @@ bwa_sink* bwa_alsa_sink_open(uint32_t sample_rate, uint32_t block_size, uint32_t
         char m[224];
         snprintf(m, sizeof m, "alsa: PCM '%s' accepts none of float32, int32, int24, int16", pcm_name);
         alsa_set_err(err, errcap, m);
-        snd_pcm_close(pcm);
+        al.snd_pcm_close(pcm);
         return NULL;
     }
 
@@ -474,21 +610,21 @@ bwa_sink* bwa_alsa_sink_open(uint32_t sample_rate, uint32_t block_size, uint32_t
      * a `plug` PCM would silently satisfy the request instead of failing it. A headphone open on a
      * plug, default or server PCM keeps the converter and reports the degradation. */
     const bool raw = (strncmp(pcm_name, "hw:", 3) == 0);
-    if (raw || exact_rate) snd_pcm_hw_params_set_rate_resample(pcm, hw, 0);
+    if (raw || exact_rate) al.snd_pcm_hw_params_set_rate_resample(pcm, hw, 0);
 
-    if (snd_pcm_hw_params_set_rate(pcm, hw, sample_rate, 0) < 0) {
+    if (al.snd_pcm_hw_params_set_rate(pcm, hw, sample_rate, 0) < 0) {
         /* Name BOTH rates: "it did not work" is useless, "it runs at 44100 and you asked for
          * 48000" is actionable. set_rate_near on the same params answers what it would give. */
         unsigned int near_rate = sample_rate;
         int dir = 0;
-        snd_pcm_hw_params_set_rate_near(pcm, hw, &near_rate, &dir);
+        al.snd_pcm_hw_params_set_rate_near(pcm, hw, &near_rate, &dir);
         char m[256];
         snprintf(m, sizeof m, "alsa: PCM '%s' runs at %u Hz, not the engine's %u Hz, and this open "
                               "must not resample; pick a plug or default PCM, or match "
                               "bwa_desc.sample_rate to the device",
                  pcm_name, near_rate, sample_rate);
         alsa_set_err(err, errcap, m);
-        snd_pcm_close(pcm);
+        al.snd_pcm_close(pcm);
         return NULL;
     }
     if (!raw && !exact_rate) {
@@ -500,15 +636,15 @@ bwa_sink* bwa_alsa_sink_open(uint32_t sample_rate, uint32_t block_size, uint32_t
                  pcm_name, sample_rate);
     }
 
-    if (snd_pcm_hw_params_set_channels(pcm, hw, channels) < 0) {
+    if (al.snd_pcm_hw_params_set_channels(pcm, hw, channels) < 0) {
         unsigned int mn = 0, mx = 0;
-        snd_pcm_hw_params_get_channels_min(hw, &mn);
-        snd_pcm_hw_params_get_channels_max(hw, &mx);
+        al.snd_pcm_hw_params_get_channels_min(hw, &mn);
+        al.snd_pcm_hw_params_get_channels_max(hw, &mx);
         char m[224];
         snprintf(m, sizeof m, "alsa: PCM '%s' offers %u..%u channels, not the %u requested",
                  pcm_name, mn, mx, channels);
         alsa_set_err(err, errcap, m);
-        snd_pcm_close(pcm);
+        al.snd_pcm_close(pcm);
         return NULL;
     }
 
@@ -521,36 +657,36 @@ bwa_sink* bwa_alsa_sink_open(uint32_t sample_rate, uint32_t block_size, uint32_t
     const bool tight = (flags & BWA_SINK_FLAG_TIGHT_BUFFER) != 0;
     snd_pcm_uframes_t period = block_size;
     int dir = 0;
-    snd_pcm_hw_params_set_period_size_near(pcm, hw, &period, &dir);
+    al.snd_pcm_hw_params_set_period_size_near(pcm, hw, &period, &dir);
     snd_pcm_uframes_t buffer = period * (tight ? 2u : 3u);
-    snd_pcm_hw_params_set_buffer_size_near(pcm, hw, &buffer);
+    al.snd_pcm_hw_params_set_buffer_size_near(pcm, hw, &buffer);
 
-    if ((e = snd_pcm_hw_params(pcm, hw)) < 0) {
+    if ((e = al.snd_pcm_hw_params(pcm, hw)) < 0) {
         char m[224];
         snprintf(m, sizeof m, "alsa: PCM '%s' refused the negotiated configuration (%s)",
-                 pcm_name, snd_strerror(e));
+                 pcm_name, al.snd_strerror(e));
         alsa_set_err(err, errcap, m);
-        snd_pcm_close(pcm);
+        al.snd_pcm_close(pcm);
         return NULL;
     }
-    snd_pcm_hw_params_get_period_size(hw, &period, &dir);
-    snd_pcm_hw_params_get_buffer_size(hw, &buffer);
+    al.snd_pcm_hw_params_get_period_size(hw, &period, &dir);
+    al.snd_pcm_hw_params_get_buffer_size(hw, &buffer);
 
     /* sw_params: the timestamp has to be on CLOCK_MONOTONIC or it cannot be compared with
      * os_monotonic_ns, and the start threshold has to be a full buffer or the stream starts on the
      * first period and underruns before the second arrives. */
     snd_pcm_sw_params_t* sw = NULL;
-    snd_pcm_sw_params_alloca(&sw);
-    if (snd_pcm_sw_params_current(pcm, sw) == 0) {
-        snd_pcm_sw_params_set_tstamp_mode(pcm, sw, SND_PCM_TSTAMP_ENABLE);
-        snd_pcm_sw_params_set_tstamp_type(pcm, sw, SND_PCM_TSTAMP_TYPE_MONOTONIC);
-        snd_pcm_sw_params_set_start_threshold(pcm, sw, buffer);
-        if ((e = snd_pcm_sw_params(pcm, sw)) < 0) {
+    ALSA_ALLOCA(snd_pcm_sw_params, sw);
+    if (al.snd_pcm_sw_params_current(pcm, sw) == 0) {
+        al.snd_pcm_sw_params_set_tstamp_mode(pcm, sw, SND_PCM_TSTAMP_ENABLE);
+        al.snd_pcm_sw_params_set_tstamp_type(pcm, sw, SND_PCM_TSTAMP_TYPE_MONOTONIC);
+        al.snd_pcm_sw_params_set_start_threshold(pcm, sw, buffer);
+        if ((e = al.snd_pcm_sw_params(pcm, sw)) < 0) {
             char m[224];
             snprintf(m, sizeof m, "alsa: PCM '%s' refused the software parameters (%s)",
-                     pcm_name, snd_strerror(e));
+                     pcm_name, al.snd_strerror(e));
             alsa_set_err(err, errcap, m);
-            snd_pcm_close(pcm);
+            al.snd_pcm_close(pcm);
             return NULL;
         }
     }
@@ -558,7 +694,7 @@ bwa_sink* bwa_alsa_sink_open(uint32_t sample_rate, uint32_t block_size, uint32_t
     AlsaSink* s = (AlsaSink*)calloc(1, sizeof *s);
     if (!s) {
         alsa_set_err(err, errcap, "alsa: out of memory");
-        snd_pcm_close(pcm);
+        al.snd_pcm_close(pcm);
         return NULL;
     }
     s->base.vt        = &ALSA_VT;
@@ -580,7 +716,7 @@ bwa_sink* bwa_alsa_sink_open(uint32_t sample_rate, uint32_t block_size, uint32_t
     if (!s->bus || !s->frames) {
         alsa_set_err(err, errcap, "alsa: the render buffers could not be allocated");
         free(s->frames); free(s->bus); free(s);
-        snd_pcm_close(pcm);
+        al.snd_pcm_close(pcm);
         return NULL;
     }
 

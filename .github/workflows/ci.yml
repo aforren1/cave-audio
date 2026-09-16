@@ -642,9 +642,10 @@ jobs:
           The wheel version is the **ABI version** from ``bw_audio.h``, not this tag, so it can
           never claim a version the library is not. PsychoPy uses this package directly; see
           ``bindings/python/README.md``. The Linux wheel is ``manylinux_2_28`` (glibc 2.28 or
-          newer: RHEL 8, Debian 10, Ubuntu 18.10 and later) and expects ``libasound.so.2`` and
-          ``libjack.so.0`` on the machine, which is every Linux desktop that plays audio. The
-          macOS wheel is one ``universal2`` file for both Apple architectures.
+          newer: RHEL 8, Debian 10, Ubuntu 18.10 and later). It imports with neither
+          ``libasound.so.2`` nor ``libjack.so.0`` installed: the engine loads each at run time, so
+          the JACK and ALSA backends are available when their libraries are. The macOS wheel is
+          one ``universal2`` file for both Apple architectures.
 
           ## License
 
@@ -969,6 +970,9 @@ jobs:
         # and only on a phonon cache miss
 
       - name: Install the Linux backends' dev packages
+        # HEADERS only: the two sinks dlopen libjack.so.0 and libasound.so.2 at run time, so
+        # nothing here reaches the link line. The packages still have to be present or CMake
+        # silently drops the backends.
         run: sudo apt-get update && sudo apt-get install -y libasound2-dev libjack-jackd2-dev
 
       - name: Version
@@ -1051,6 +1055,12 @@ jobs:
           ! readelf -d build/libbw_audio.so | grep -q phonon
           # -Wl,--exclude-libs,ALL holds: the bwa_* ABI is the whole export list.
           test "$(nm -D --defined-only build/libbw_audio.so | grep -c ' ipl')" = 0
+          # The two Linux backends load their libraries at RUN TIME (os_dl_*), so neither may be
+          # in NEEDED and neither may leave an undefined symbol behind. A box with no JACK and no
+          # sound card has to load this file and run the offline sink; linking either library
+          # would make its absence a failure of the whole library instead of of one backend.
+          ! readelf -d build/libbw_audio.so | grep -E 'NEEDED.*(libasound|libjack)'
+          test "$(nm -D --undefined-only build/libbw_audio.so | grep -cE ' (snd_|jack_)')" = 0
 
       - name: Test
         # 38: the 33 a default off-Windows build registers, plus the five SDK-gated tests
@@ -1593,9 +1603,11 @@ jobs:
           # The engine library and the extension, side by side inside the package.
           test -s wheel-inspect/bw_audio/libbw_audio.so
           ls wheel-inspect/bw_audio/_bwa*.so
-          # auditwheel must have grafted NOTHING. libasound and libjack are excluded on purpose
-          # (a bundled libjack cannot match the running server, and libasound is on every Linux
-          # desktop); everything else the engine needs is in the manylinux policy. A
+          # auditwheel must have grafted NOTHING. The engine dlopens libasound and libjack, so
+          # neither is in its NEEDED list and the --exclude flags now hold trivially; they and
+          # these two assertions stay as GUARDS, because bundling either was always wrong (a
+          # bundled libjack cannot match the running server, and libasound is on every Linux
+          # desktop). Everything else the engine needs is in the manylinux policy. A
           # bw_audio.libs/ directory here means the repair vendored something, which would also
           # mean it rewrote the extension's runpath.
           ! test -d wheel-inspect/bw_audio.libs

@@ -578,6 +578,10 @@ static int test_jack(void) {
          * rate, or with fewer playback ports than this run asked for, is a CONFIGURATION the
          * section cannot run against rather than a broken sink. All three skip, visibly, with the
          * reason printed; anything else is a failure. */
+        /* And a box with no libjack at all, which is a SKIP for the same reason: the library is
+         * loaded at run time now, so its absence is a missing device rather than a broken sink.
+         * The UNAVAILABLE path itself is demanded by test_dl_unavailable, which needs no library. */
+        if (strstr(err, "could not be loaded")) { printf("SKIP: %s\n", err); return SKIP_EXIT; }
         if (strstr(err, "no jack server")) { printf("SKIP: %s\n", err); return SKIP_EXIT; }
         if (strstr(err, "not the engine's")) {
             char want[32];
@@ -811,6 +815,9 @@ static int test_alsa(void) {
         if (!err[0]) { fprintf(stderr, "FAIL: alsa open failed with no message\n"); return 1; }
         /* "no PCM named" is the CI runner and any box with no sound card. Anything else is a real
          * failure: a machine WITH a card that cannot open it is what this section exists to catch. */
+        /* No libasound is a SKIP for the same reason "no PCM" is: the library loads at run time,
+         * so its absence is a missing device. test_dl_unavailable demands that path itself. */
+        if (strstr(err, "could not be loaded")) { printf("SKIP: %s\n", err); return SKIP_EXIT; }
         if (strstr(err, "no PCM named")) { printf("SKIP: %s\n", err); return SKIP_EXIT; }
         fprintf(stderr, "FAIL: alsa open: %s\n", err);
         return 1;
@@ -1199,6 +1206,134 @@ static int test_aaudio(void) {
 }
 #endif /* BWA_HAVE_AAUDIO */
 
+#if defined(BWA_HAVE_JACK) || defined(BWA_HAVE_ALSA)
+/* ---- the UNAVAILABLE path: a Linux backend whose library will not load ----------------------
+ *
+ * The two Linux backends dlopen their libraries at run time (jack_sink.c, alsa_sink.c), so a box
+ * with neither still loads libbw_audio.so and runs the offline sink. That path is the interesting
+ * one and it is exactly the one a developer box cannot reach, because a developer box HAS the
+ * libraries. bwa_sink_dl_override (sink.h, a dll-exported test hook, not public ABI) re-aims both
+ * loaders at a soname that cannot exist, which is the same failure to the sink as a missing
+ * library.
+ *
+ * WHAT IS DEMANDED, per backend: the device count is 0, an explicit open fails with a message
+ * NAMING the library, and clearing the override makes the next open find the real one again. The
+ * retry assertion holds on a box with the libraries and on a box without: it demands only that the
+ * message stop naming the override, and a loader that ignored the override would already have
+ * failed the assertion above it.
+ *
+ * ONE HOOK SERVES BOTH backends on purpose, which is why the AUTO check below lands on the null
+ * sink rather than on the other Linux backend: with neither library loadable there is no next
+ * backend to fall through TO. What it proves is the part that matters, that the reason survives
+ * the fall-through instead of being replaced by silence. */
+#define DL_NOWHERE "libbwa_no_such_library.so.999"
+
+static int dl_unavailable_backend(bwa_sink_type type, const char* label, const char* soname,
+                                  bwa_sink* (*open_fn)(uint32_t, uint32_t, uint32_t, const char*,
+                                                       uint32_t, bool, bwa_render_fn, void*,
+                                                       char*, size_t)) {
+    const uint32_t SR = 48000, BS = 256;
+    Probe q; probe_init(&q, 2);
+    int ok = 1;
+
+    bwa_sink_dl_override = DL_NOWHERE;
+
+    const uint32_t n = sink_device_count(type);
+    if (n != 0) {
+        fprintf(stderr, "FAIL: %s reports %u devices with no library loaded\n", label, n);
+        ok = 0;
+    }
+
+    char err[256] = {0};
+    bwa_sink* s = open_fn(SR, BS, 2, NULL, 0, false, on_render, &q, err, sizeof err);
+    if (s) {
+        fprintf(stderr, "FAIL: %s opened against " DL_NOWHERE "\n", label);
+        bwa_sink_close(s);
+        ok = 0;
+    } else if (!strstr(err, DL_NOWHERE)) {
+        fprintf(stderr, "FAIL: %s failed without naming the library it could not load: %s\n",
+                label, err[0] ? err : "(no message)");
+        ok = 0;
+    } else {
+        printf("%s unavailable: %s\n", label, err);
+    }
+
+    /* An explicitly NAMED backend is a demand, so the failure must reach the caller through
+     * bwa_sink_open too rather than being softened into the null sink. */
+    char err2[256] = {0};
+    bwa_sink* named = bwa_sink_open(SR, BS, 2, type, NULL, 0, false, on_render, &q,
+                                    err2, sizeof err2);
+    if (named) {
+        fprintf(stderr, "FAIL: an explicit %s open succeeded with no library\n", label);
+        bwa_sink_close(named);
+        ok = 0;
+    } else if (!strstr(err2, DL_NOWHERE)) {
+        fprintf(stderr, "FAIL: the explicit %s failure lost the library name: %s\n",
+                label, err2[0] ? err2 : "(no message)");
+        ok = 0;
+    }
+
+    /* THE RETRY. The loader caches by soname and re-resolves when it changes, so a library
+     * installed after a failed attempt is found on the next open. Clearing the hook is the same
+     * event. A box with no real library still fails here - it just has to stop blaming the
+     * override, and it names `soname` instead. */
+    bwa_sink_dl_override = NULL;
+    char err3[256] = {0};
+    bwa_sink* again = open_fn(SR, BS, 2, NULL, 0, false, on_render, &q, err3, sizeof err3);
+    if (again) {
+        bwa_sink_close(again);
+        printf("%s retry: the real %s loaded and a sink opened\n", label, soname);
+    } else if (strstr(err3, DL_NOWHERE)) {
+        fprintf(stderr, "FAIL: %s did not retry after the override was cleared: %s\n", label, err3);
+        ok = 0;
+    } else {
+        printf("%s retry: back to the real loader (%s)\n", label, err3[0] ? err3 : "(no message)");
+    }
+    return ok;
+}
+
+static int test_dl_unavailable(void) {
+    int ok = 1;
+#ifdef BWA_HAVE_JACK
+    if (!dl_unavailable_backend(BWA_SINK_JACK, "jack", "libjack.so.0", bwa_jack_sink_open)) ok = 0;
+#endif
+#ifdef BWA_HAVE_ALSA
+    if (!dl_unavailable_backend(BWA_SINK_ALSA, "alsa", "libasound.so.2", bwa_alsa_sink_open)) ok = 0;
+#endif
+
+    /* AUTO with neither library loadable: the null sink, and the first backend's reason carried
+     * out on the degradation channel. A silent null sink here would read exactly like working
+     * hardware that happens to be muted. */
+    {
+        Probe q; probe_init(&q, 2);
+        char err[256] = {0};
+        bwa_sink_dl_override = DL_NOWHERE;
+        bwa_sink* s = bwa_sink_open(48000, 256, 2, BWA_SINK_AUTO, NULL, 0, false, on_render, &q,
+                                    err, sizeof err);
+        bwa_sink_dl_override = NULL;
+        if (!s) {
+            fprintf(stderr, "FAIL: AUTO opened nothing at all with the Linux libraries absent\n");
+            ok = 0;
+        } else {
+            if (bwa_sink_type_of(s) != BWA_SINK_NULL) {
+                fprintf(stderr, "FAIL: AUTO did not fall through to the offline sink (%s)\n",
+                        bwa_sink_backend(s));
+                ok = 0;
+            }
+            if (!strstr(err, DL_NOWHERE)) {
+                fprintf(stderr, "FAIL: AUTO dropped the reason it fell through: %s\n",
+                        err[0] ? err : "(no message)");
+                ok = 0;
+            } else {
+                printf("auto fall-through kept the reason: %s\n", err);
+            }
+            bwa_sink_close(s);
+        }
+    }
+    return ok;
+}
+#endif /* BWA_HAVE_JACK || BWA_HAVE_ALSA */
+
 int main(void) {
     Probe p;
     probe_init(&p, BWA_CHANNELS);
@@ -1251,6 +1386,12 @@ int main(void) {
      * the test, a section that actually ran makes the test a pass, and only "every device section
      * had no device" reports the ctest skip. Returning the first skip instead would hide a backend
      * that did run beside one that could not. */
+#if defined(BWA_HAVE_JACK) || defined(BWA_HAVE_ALSA)
+    /* Before the live sections: this one needs no device, so its verdict should not depend on
+     * whether a server or a card happens to be up on the machine running the suite. */
+    if (!test_dl_unavailable()) return 1;
+#endif
+
     int device_ran = 0, device_skipped = 0;
 #ifdef BWA_HAVE_WASAPI
     {

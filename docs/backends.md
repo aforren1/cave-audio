@@ -63,8 +63,8 @@ one more consumer of the bus. It must not touch the core.
 |-----------|----------------------|---------------------------------------|------------------------------------------------------------|-------|
 | WASAPI    | Windows 10 and later | MMDevice + `IAudioClient3` (COM)      | headphone profiles, the `cave_both` monitor, any 2-ch use. Multichannel through exclusive mode is possible but not the production path | 1 |
 | CoreAudio | macOS 11 and later   | the HAL (`AudioDevice*`, not AUHAL)   | headphones at the desk; the array too if the Digiface's macOS driver exposes 26 outputs | 4 |
-| JACK      | Linux: a JACK server, or PipeWire through pipewire-jack | libjack (`jack_client_open`, the process callback) | the Linux production path: headphones on a PipeWire desktop, the array through a multichannel card or the AES67 virtual card, per-speaker port routing in the host's patchbay | 5 |
-| ALSA      | Linux                | alsa-lib (`snd_pcm_*`)                | the no-server path: headphones on a bare box (an experiment wanting the raw device clock), or the array on a `hw:` card (MADI, ADAT, or the AES67 daemon's card) opened directly | 5 |
+| JACK      | Linux: a JACK server, or PipeWire through pipewire-jack | libjack, loaded at run time (`jack_client_open`, the process callback) | the Linux production path: headphones on a PipeWire desktop, the array through a multichannel card or the AES67 virtual card, per-speaker port routing in the host's patchbay | 5 |
+| ALSA      | Linux                | alsa-lib, loaded at run time (`snd_pcm_*`) | the no-server path: headphones on a bare box (an experiment wanting the raw device clock), or the array on a `hw:` card (MADI, ADAT, or the AES67 daemon's card) opened directly | 5 |
 | AAudio    | Android 8.0 (API 26) and later | `AAudio*`                   | headphones on standalone VR headsets                       | 3 |
 
 Phase 2, between WASAPI and the rest, is the OS shim that lets the engine build off Windows at
@@ -464,6 +464,7 @@ shim is where a platform difference belongs:
 |-------------------------------------------------------------|--------------------------------------------------------------------|---------------------------------------|
 | a UTF-8 path that opens on Windows                          | layout.c, hpeq.c, calib.c, zylia.c, sound.c, stream.c              | `os_fopen`, `os_mkdir`, `os_remove`, `os_rmdir`, and `os_utf8_to_wide` for the dr_libs `_w` openers |
 | a worker that waits instead of polling                      | assets.c, stream.c                                                 | `os_event` (`_init`/`_destroy`/`_signal`/`_wait`) |
+| a device library loaded at run time                         | jack_sink.c, alsa_sink.c                                           | `os_dl_open`, `os_dl_sym`, `os_dl_close` |
 
 **`os_fopen`** is the whole UTF-8 path story. The ABI speaks UTF-8, but the Windows C runtime reads
 a narrow path in the process ANSI codepage, so a path with an accent or a CJK character simply
@@ -474,6 +475,14 @@ a caller buffer so no path conversion allocates. One path does not go through it
 is handed to phonon, which opens the SOFA file itself, so its encoding is the SDK's problem.
 `test_utf8_path` writes a wav, a layout, and a headphone EQ file into a directory whose name carries
 both an accented Latin letter and a CJK character, then loads all four through the real loaders.
+
+**`os_dl_*`** is `dlopen` with `RTLD_NOW | RTLD_LOCAL` on POSIX and `LoadLibraryW` on Windows, and
+it is control-thread only, because opening a library is file I/O. It exists for the two Linux
+device backends, which load `libjack.so.0` and `libasound.so.2` themselves rather than linking
+them. `RTLD_NOW` makes a library that is missing one of the symbols a backend calls fail the load
+instead of aborting on the first call into it, and `RTLD_LOCAL` keeps what the library drags in out
+of the global symbol namespace. Nothing on Windows calls it yet; the Windows half is there so the
+shim has one API rather than a Linux-only corner.
 
 **`os_event`** is an auto-reset event: one signal releases one waiter, and a signal that arrives
 before anyone waits is remembered, so a worker can check its ring, find it empty, and then wait
@@ -813,9 +822,29 @@ one device, and that the count at 48 kHz is 26 or more.
 
 ### JACK
 
-Files: `src/sink/jack_sink.c`. `pkg-config jack` in CMake, link `jack`. The same binary runs on
-JACK2 (`libjack`, LGPL-2.1) and on PipeWire (pipewire-jack's drop-in `libjack`, MIT); which one
-answers is decided at run time by what the box has installed. Define `BWA_HAVE_JACK`.
+Files: `src/sink/jack_sink.c`. `pkg-config jack` in CMake for the HEADERS only. The same binary
+runs on JACK2 (`libjack`, LGPL-2.1) and on PipeWire (pipewire-jack's drop-in `libjack`, MIT);
+which one answers is decided at run time by what the box has installed. Define `BWA_HAVE_JACK`.
+
+The library is not linked. The sink loads `libjack.so.0` with `os_dl_open` on the first device
+query or open, resolves every symbol it calls into one table, and keeps it for the life of the
+process. So `libbw_audio.so` names neither `libjack` in its `NEEDED` list nor any `jack_` symbol
+in its undefined symbols, and a box with no JACK loads the engine and runs the offline sink.
+pipewire-jack ships the same soname, so nothing about "which server answers" changes.
+
+A library that will not load is exactly NO DEVICE:
+
+- `bwa_get_device_count(BWA_SINK_JACK)` returns 0, so rule 10 skips the backend under AUTO the
+  same way a missing device name does.
+- An explicit `BWA_SINK_JACK` open fails, and the message names the library it could not load.
+  Under AUTO the reason travels out on the degradation channel when nothing else opens either,
+  so a caller that lands on the offline sink can read why.
+- The attempt is made again on the next open. A library installed after a failed attempt is
+  found without restarting the process.
+
+The headers stay a build-time requirement: every type, enum and callback signature comes from
+them, and the symbol table is generated from one X-macro list, so the typedefs, the table and the
+resolve loop cannot drift apart.
 
 This is the smallest sink of the set and the closest to ASIO: a fixed-size callback, float
 non-interleaved ports that match the bus layout, an xrun callback, a filtered time pair, and
@@ -870,9 +899,17 @@ Four things the implementation settled that the sequence above left open:
 
 ### ALSA
 
-Files: `src/sink/alsa_sink.c`. `find_package(ALSA)` in CMake, link `ALSA::ALSA`. alsa-lib is
-LGPL-2.1, dynamically linked, so the license inventory in build.md gains one line and nothing
-else changes. Define `BWA_HAVE_ALSA`.
+Files: `src/sink/alsa_sink.c`. `find_package(ALSA)` in CMake for the HEADERS only. alsa-lib is
+LGPL-2.1, so the license inventory in build.md gains one line and nothing else changes. Define
+`BWA_HAVE_ALSA`.
+
+The library is not linked, for the reason the JACK section gives above and with the same
+semantics: the sink loads `libasound.so.2` at the first device query or open, an absent library
+is exactly no device, the failure message names the library, and the next open tries again.
+
+Two things ALSA adds. The `snd_pcm_hw_params_alloca` family is a macro that expands to a
+`snd_*_sizeof()` call, which is an ordinary library symbol, so the sink spells the macro itself
+over its table. And `snd_strerror` is a library symbol too, although it reads like `strerror`.
 
 Open sequence, all through `snd_pcm_hw_params_*`:
 
@@ -1018,8 +1055,8 @@ It costs size. The stripped arm64 library goes from 0.4 MB to 7.0 MB.
 |----------------------|---------------------------------|-----------------------------------------------------------------|
 | `BWA_WITH_WASAPI`    | ON on `WIN32`                   | compiles `wasapi_sink.cpp`, links `ole32 avrt`, defines `BWA_HAVE_WASAPI` |
 | `BWA_WITH_COREAUDIO` | ON on `APPLE`                   | compiles `coreaudio_sink.c`, links the frameworks, defines `BWA_HAVE_COREAUDIO` |
-| `BWA_WITH_JACK`      | ON on Linux when `pkg-config jack` succeeds | compiles `jack_sink.c`, links `jack`, defines `BWA_HAVE_JACK` |
-| `BWA_WITH_ALSA`      | ON on Linux when `find_package(ALSA)` succeeds | compiles `alsa_sink.c`, links `ALSA::ALSA`, defines `BWA_HAVE_ALSA` |
+| `BWA_WITH_JACK`      | ON on Linux when `pkg-config jack` succeeds | compiles `jack_sink.c`, takes its INCLUDE DIRS only (the sink dlopens `libjack.so.0`), defines `BWA_HAVE_JACK` |
+| `BWA_WITH_ALSA`      | ON on Linux when `find_package(ALSA)` succeeds | compiles `alsa_sink.c`, takes its INCLUDE DIRS only (the sink dlopens `libasound.so.2`), defines `BWA_HAVE_ALSA` |
 | `BWA_WITH_AAUDIO`    | ON on `ANDROID`                 | compiles `aaudio_sink.c`, links `aaudio`, defines `BWA_HAVE_AAUDIO` |
 
 Every one of them is off on the other platforms and cannot be forced on.
@@ -1105,9 +1142,29 @@ what needs a device, and make the device-dependent part **skip visibly** rather 
   CONFIGURATIONS it cannot run against, a server at another rate and a server with fewer playback
   ports than the run asked for, and prints the reason either way.
 
+  The two Linux backends add one more skip phrase, "could not be loaded", because they load their
+  libraries at run time: a box with no libjack has no JACK device, which is a skip and not a
+  failure.
+
   The results AGGREGATE across the sections: a failure anywhere fails, a section that actually ran
   makes it a pass, and only "every device section had no device" reports the ctest skip. Returning
   the first skip would hide a backend that ran beside one that could not.
+
+  **The unavailable-library section** runs before all of them and needs no device, because it is
+  the path a developer box cannot otherwise reach: the box has the libraries. `bwa_sink_dl_override`
+  (an internal test hook in `sink.h`, not public ABI) re-aims both run-time loaders at a soname
+  that cannot exist, which is the same failure to a sink as a missing library. Per backend it
+  demands a device count of 0, an explicit open that fails NAMING the library, and a next open that
+  finds the real library again once the hook is cleared. Then it demands that AUTO with neither
+  library loadable lands on the offline sink and carries the first backend's reason out on the
+  degradation channel, because a silent offline sink reads exactly like working hardware that
+  happens to be muted.
+
+  One hook serves both backends on purpose, which is why the AUTO check lands on the offline sink
+  rather than on the other Linux backend: with neither library loadable there is no next backend to
+  fall through to. The cost of that fall-through was measured at about 3 microseconds per absent
+  library, against the 3.7 milliseconds an explicit JACK open costs when libjack IS present and has
+  to find out there is no server.
 
   Each section takes its device string from the environment (`BWA_TEST_ALSA_DEVICE`,
   `BWA_TEST_AAUDIO_DEVICE`, `BWA_TEST_JACK_PORTS`, plus `BWA_TEST_JACK_CHANNELS` for the width), so

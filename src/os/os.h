@@ -221,6 +221,32 @@ void os_rwlock_unlock(os_rwlock* l);
 void os_rwlock_lock_shared(os_rwlock* l);   /* shared (many readers) */
 void os_rwlock_unlock_shared(os_rwlock* l);
 
+/* ---- dynamic libraries ------------------------------------------------------------------- */
+
+/* Load a shared library by SONAME and look symbols up in it. CONTROL THREAD ONLY: os_dl_open maps
+ * a file, which is file I/O, so nothing here may be called from the audio thread.
+ *
+ * It exists for the two Linux device backends. libjack and libasound are not build-time
+ * dependencies of the shipped library: a box with neither must still load libbw_audio.so and run
+ * the offline sink, so the backends resolve their symbols at run time and report themselves
+ * UNAVAILABLE when the library is absent (docs/backends.md). Nothing on Windows uses this yet; the
+ * Windows half exists so the shim has ONE API rather than a Linux-only corner.
+ *
+ * `name` is a plain SONAME or path ("libjack.so.0"), UTF-8, and the platform's own search rules
+ * apply (LD_LIBRARY_PATH plus the cache on POSIX, the DLL search order on Windows). The handle is
+ * LOCAL: nothing the library brings in joins the global symbol namespace, so two backends that
+ * happened to share a symbol name cannot bind to each other's copy. Every symbol is resolved at
+ * open (RTLD_NOW), so a half-usable library fails the load instead of aborting on the first call
+ * into a missing symbol.
+ *
+ * os_dl_sym returns a void* by dlsym's own convention; casting it to the function pointer type is
+ * the caller's job and is what POSIX guarantees works. NULL means the symbol is not there. */
+typedef void* os_dl;
+
+os_dl os_dl_open (const char* name);          /* NULL on failure */
+void* os_dl_sym  (os_dl h, const char* symbol);  /* NULL when absent */
+void  os_dl_close(os_dl h);                   /* a no-op on NULL */
+
 /* ---- strings ---------------------------------------------------------------------------- */
 
 char* os_strdup(const char* s);              /* NULL in, NULL out; free() the result */

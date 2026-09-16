@@ -12,8 +12,12 @@ for the monitor at the same time.
 the production path: one binary talks to a JACK2 server or to PipeWire through pipewire-jack, and
 which one answers is decided at run time by what the box has installed. ALSA is the no-server path,
 for an experiment that wants a raw card clock or a rig driving a multichannel card directly. Under
-`BWA_SINK_AUTO` a Linux box tries JACK, then ALSA, then the null sink, at any channel count. See
-[Linux notes](#linux-notes) below.
+`BWA_SINK_AUTO` a Linux box tries JACK, then ALSA, then the null sink, at any channel count.
+
+Neither library is linked. Both sinks load libjack and alsa-lib at run time, so the development
+packages are a BUILD-time requirement (for the headers) and the libraries themselves are optional
+at run time: a box with neither loads `libbw_audio.so` and runs the offline sink, and each backend
+reports itself unavailable with the library named. See [Linux notes](#linux-notes) below.
 
 **Android has one device backend**, AAudio (`src/sink/aaudio_sink.c`), which is the headphone path on
 a standalone VR headset. It is stereo only: Android carries no array transport, so a request wider
@@ -87,8 +91,8 @@ Everything beyond the DLL + test suite is opt-in; the default build stays lean.
 | `BWA_BUILD_TESTS` | ON | the ctest suite (`test_*` targets) |
 | `BWA_WITH_ASIO` | OFF* | the ASIO backend. *Auto-flips ON when the SDK sits at `third_party/asiosdk/` |
 | `BWA_WITH_WASAPI` | ON | the WASAPI backend (headphone profiles, the `cave_both` monitor). Windows only, and forced OFF elsewhere. Needs no SDK: the headers ship with the Windows SDK, and it links `ole32` + `avrt` |
-| `BWA_WITH_JACK` | ON | the JACK backend. Linux only, and forced OFF elsewhere. Needs `pkg-config jack` to succeed (`libjack-jackd2-dev`, or pipewire-jack's development package); it turns itself off with a status line when that fails |
-| `BWA_WITH_ALSA` | ON | the ALSA backend. Linux only, and forced OFF elsewhere. Needs `find_package(ALSA)` to succeed (`libasound2-dev`); same self-disabling behavior |
+| `BWA_WITH_JACK` | ON | the JACK backend. Linux only, and forced OFF elsewhere. Needs `pkg-config jack` to succeed for the HEADERS (`libjack-jackd2-dev`, or pipewire-jack's development package); it turns itself off with a status line when that fails. The library itself is loaded at run time, never linked |
+| `BWA_WITH_ALSA` | ON | the ALSA backend. Linux only, and forced OFF elsewhere. Needs `find_package(ALSA)` to succeed for the HEADERS (`libasound2-dev`); same self-disabling behavior, and the same run-time load |
 | `BWA_WITH_AAUDIO` | ON | the AAudio backend. Android only, and forced OFF elsewhere. Needs no SDK: the header ships with the NDK and it links `aaudio`. Fails the configure when `ANDROID_PLATFORM` is under `android-26`, which is AAudio's own floor |
 | `BWA_BUILD_PLAYGROUND` | OFF | `bwa_playground` + `bwa_layout_tool` (fetches raylib/rlImGui/imgui/test-engine) |
 | `BWA_BUILD_CALIBVIEW` | OFF | `bwa_calib_view` (fetches imgui/test-engine/implot/implot3d) |
@@ -141,8 +145,8 @@ What the SDK adds, and what you lose without it:
 | Steam Audio (C API)| binaural HRTF decode; occlusion, reflections (with baking), pathing - all implemented | Apache-2.0 (`steam-audio-source/LICENSE.md`) |
 | dr_libs (dr_wav 0.14.5 / dr_flac 0.13.3 / dr_mp3 0.7.3) | WAV/FLAC/MP3 decode (`sound.c`, `stream.c`) | public domain / MIT-0; FetchContent, pinned |
 | cJSON v1.7.19  | layout + calibration JSON                    | MIT; FetchContent, pinned                |
-| libjack        | the Linux JACK backend                       | LGPL-2.1, dynamically linked; pipewire-jack's drop-in (MIT) answers the same ABI |
-| alsa-lib       | the Linux ALSA backend                       | LGPL-2.1, dynamically linked             |
+| libjack        | the Linux JACK backend                       | LGPL-2.1. Headers at build time, `libjack.so.0` loaded at run time (never linked); pipewire-jack's drop-in (MIT) answers the same ABI |
+| alsa-lib       | the Linux ALSA backend                       | LGPL-2.1. Headers at build time, `libasound.so.2` loaded at run time (never linked) |
 | libaaudio      | the Android AAudio backend                   | part of the Android system image; the NDK ships the stub to link against. No license line to add |
 | NatNet         | OptiTrack pose ingest                        | consume off-wire; see below              |
 
@@ -196,8 +200,8 @@ Everything above, sorted by what it actually ends up in:
   [`THIRD_PARTY-NOTICES.md`](../THIRD_PARTY-NOTICES.md) (repo root, copied into the
   artifact). Keep that file in sync when a pin bumps.
 - **`libbw_audio.so`** (Linux, Android) links the same dr_libs and cJSON, plus whichever system
-  audio libraries the platform has: libjack and alsa-lib on Linux (**LGPL-2.1** both, dynamically
-  linked), libaaudio on Android. None of the three is redistributed, and libaaudio is part of the
+  audio libraries the platform has: libjack and alsa-lib on Linux (**LGPL-2.1** both, loaded at run
+  time with `dlopen` rather than linked), libaaudio on Android. None of the three is redistributed, and libaaudio is part of the
   Android system image, so it adds no notice at all. No ASIO there: it is a Windows driver model.
 - **The Android artifact** (`bw_audio-android-<ver>`, the `lib/arm64-v8a` and `lib/x86_64`
   libraries, and the copies inside the Unity package and the Godot addon) is that same
@@ -206,8 +210,9 @@ Everything above, sorted by what it actually ends up in:
   `THIRD_PARTY-NOTICES.md` and a `DIST.txt` naming the commit, like every other artifact.
 - **The Linux artifact** (`bw_audio-linux-x64-<ver>`, and the copies inside both bindings) is the
   same `libbw_audio.so` again: dr_libs, cJSON and a statically linked Steam Audio, plus libjack and
-  alsa-lib (**LGPL-2.1** both) resolved at load time. Neither of those two is redistributed, so
-  neither adds a file to ship, but both add a notice line. No ASIO.
+  alsa-lib (**LGPL-2.1** both) loaded with `dlopen` on the first device query or open. Neither of
+  those two is redistributed, so neither adds a file to ship, but both add a notice line. Neither
+  is required to be present: the library loads and runs the offline sink without them. No ASIO.
 - **The macOS artifact** (`bw_audio-macos-universal-<ver>`, and the copies inside both bindings) is
   one universal `libbw_audio.dylib` carrying dr_libs, cJSON and a statically linked Steam Audio. No
   system audio library at all yet, because macOS has no device backend, and no ASIO. It is **not
@@ -410,12 +415,14 @@ older UPM parsers reject. When git cannot answer (no tag, shallow clone, no git 
     image and compiler that produced them, and rebuilds when the stamp does not match, so a
     developer's own `lib/linux-x64` cannot ride into a wheel on the project copy cibuildwheel
     puts in the container.
-  - **auditwheel repairs with `--exclude libasound.so.2 --exclude libjack.so.0`.** Bundling
-    either one is wrong: `libjack` has to be the library the running JACK server uses, and
-    `libasound` is on every Linux desktop already. Everything else the engine needs is in the
-    manylinux policy, so a correct repair grafts nothing at all, which is also what keeps the
-    extension's `$ORIGIN` runpath intact. The wheel therefore expects `libasound.so.2` and
-    `libjack.so.0` on the machine that imports it.
+  - **auditwheel repairs with `--exclude libasound.so.2 --exclude libjack.so.0`.** The engine
+    loads both at run time, so neither is in its `NEEDED` list and auditwheel would not see them
+    anyway; the flags stay as GUARDS, and the job still asserts that no `libasound` or `libjack`
+    landed in the wheel. Bundling either one was always wrong: `libjack` has to be the library the
+    running JACK server uses, and `libasound` is on every Linux desktop already. Everything else
+    the engine needs is in the manylinux policy, so a correct repair grafts nothing at all, which
+    is also what keeps the extension's `$ORIGIN` runpath intact. The wheel imports on a machine
+    with NEITHER library; each backend simply reports itself unavailable.
   - **macOS is one `universal2` wheel** for x86_64 and arm64, with
     `MACOSX_DEPLOYMENT_TARGET=10.13`. That is the only deployment target anything in this tree
     names (phonon's own `CMakeLists.txt`), and it is cibuildwheel's universal2 default, so the
@@ -520,6 +527,23 @@ older UPM parsers reject. When git cannot answer (no tag, shallow clone, no git 
 
 Configuration the two Linux backends depend on. None of it is engine state: every item is a
 property of the box.
+
+### The backend libraries are optional at run time
+
+`libbw_audio.so` links neither libjack nor alsa-lib. Each sink loads its own library on the first
+device query or open:
+
+| backend | soname loaded      | supplied by                                     |
+|---------|--------------------|-------------------------------------------------|
+| JACK    | `libjack.so.0`     | `libjack-jackd2-0`, or pipewire-jack's drop-in   |
+| ALSA    | `libasound.so.2`   | `libasound2`, on every Linux desktop that plays audio |
+
+So the development packages are needed to BUILD (the headers give the types and the callback
+signatures) and the libraries are optional to RUN. A box with neither loads the library, reports a
+device count of 0 for both backends, and falls through to the offline sink with the first
+backend's reason on `bwa_last_error`. An explicit `BWA_SINK_JACK` or `BWA_SINK_ALSA` open fails
+with the missing library named. Install a library later and the next open finds it; nothing has to
+restart.
 
 ### Real-time scheduling for the ALSA sink
 

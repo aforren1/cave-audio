@@ -103,7 +103,9 @@ src/
                          OUTSIDE the sinks (threads, sleep + os_sleep_until_ns, the monotonic clock,
                          mutex + rwlock, os_event (auto-reset, sticky signal, monotonic timed wait),
                          thread priority up (os_thread_set_realtime + its RLIMIT_RTPRIO probe) and
-                         down, strdup/strcasecmp, os_fopen + the UTF-8 path family, natnet's UDP
+                         down, strdup/strcasecmp, os_fopen + the UTF-8 path family, os_dl_open/_sym/
+                         _close (the run-time library load the two Linux sinks use; the Windows half
+                         is LoadLibraryW and has no caller yet), natnet's UDP
                          sockets, BWA_EXPORT). Exactly one half compiles. Windows, Linux and Android
                          have device backends; macOS runs the null and manual sinks until phase 4
                          lands. Android takes the POSIX half unchanged (bionic has pthreads,
@@ -129,13 +131,22 @@ src/
                          makes "no server" the fast fall-through to ALSA. Activates and connects at
                          OPEN (that is where a port-count error can still reach the caller) and gates
                          the render on start(). xruns arrive on a notification thread and are parked
-                         for the process thread to fold into the adapter. [backends p5]
+                         for the process thread to fold into the adapter. libjack is NOT LINKED:
+                         the sink dlopens libjack.so.0 through os_dl_* and resolves its 23 symbols
+                         into one table (an X-macro list generates the typedefs, the table and the
+                         resolve loop together), so a box with no JACK still loads the engine. A
+                         library that will not load is exactly "no device": count 0, an AUTO skip,
+                         and an explicit open that fails naming the library; the next open retries.
+                         [backends p5]
     alsa_sink.c          ALSA host (Linux): the no-server path - a raw `hw:` card for an experiment
                          that wants the device clock, a MADI/AES67 card for a rig, a plug PCM for a
                          desk monitor. The ONE backend with no fixed-quantum adapter: it writes, so it
                          picks the size, and it writes whole engine blocks. Blocking snd_pcm_writei IS
                          the pacing; -EPIPE is the underrun report; SCHED_FIFO is asked for and its
-                         refusal is a reported degradation, never a failure. [backends p5]
+                         refusal is a reported degradation, never a failure. libasound is NOT
+                         LINKED either - same loader shape, 36 symbols, and the snd_*_alloca macros
+                         plus snd_strerror respelled over the table because they are library calls
+                         too. [backends p5]
     aaudio_sink.c        AAudio host (Android): the headphone path on a standalone VR headset, and
                          STEREO ONLY - Android carries no array transport, so AUTO sends anything
                          wider straight to the offline sink and an explicit open says so. AAudio owns
@@ -455,6 +466,14 @@ Regression-preventing gotchas. Each has bitten before or guards a real invariant
   `timeBeginPeriod(1)`, which is SYSTEM-WIDE in effect: a visual-only tool that happened to open
   the offline sink held the whole machine at a 1 ms timer tick. Device-paced paths (the ASIO
   callback, the WASAPI event wait) keep their own wait — the device is the clock there.
+- **An ALSA "macro" can be a library CALL.** `snd_pcm_hw_params_alloca(&hw)` looks like pure
+  stack arithmetic and expands to `alloca(snd_pcm_hw_params_sizeof())` - a symbol like any other,
+  and one of three (`_status`, `_hw_params`, `_sw_params`). `snd_strerror` is another, behind a
+  name that reads like libc. Moving `alsa_sink.c` onto a dlopen'd libasound therefore could not be
+  driven by grepping `snd_*(` alone: the three `_alloca` call sites carry no library name at all.
+  What CATCHES the class is the link line, not the reading: with nothing linked, a missed symbol is
+  an undefined reference at build time rather than a crash on a machine that has no alsa-lib. The
+  CI assertion is the same shape - `nm -D --undefined-only | grep -cE ' (snd_|jack_)'` must be 0.
 - **Do not link the NatNet SDK.** It is proprietary and conflicts with GPLv3 under distribution.
   `natnet.c` parses the wire format off-wire (reference only, never linked).
 - **Proprietary VR-toolkit integrations (MiddleVR, Igloo) live OUTSIDE this repo**, in their own

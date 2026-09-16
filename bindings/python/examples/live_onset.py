@@ -100,8 +100,7 @@ def run(sink, profile, trials, lead_seconds, device=None, verbose=True):
 
         click = make_click()
         src = e.create_push_source()
-        src.set_pos(0.0, 1.5, 2.0)
-        e.commit()
+        src.set_pos(0.0, 1.5, 2.0)   # commit-gated, and this layer commits it for you
 
         clock = WallToDsp(e)
         for trial in range(trials):
@@ -122,6 +121,9 @@ def run(sink, profile, trials, lead_seconds, device=None, verbose=True):
                 print("trial {0}: scheduled for dsp sample {1} (now {2})".format(
                     trial, start, e.dsp_time_frames))
 
+            # Nothing is pending here (the position auto-committed above), so this commit is for
+            # the EVENT rings: bwa_commit runs the pass that fills them, and a loop that polls
+            # them wants one per iteration. A trial loop that moved the source would need it too.
             e.commit()
             deadline = time.perf_counter() + lead_seconds + 0.05
             while time.perf_counter() < deadline:

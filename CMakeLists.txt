@@ -233,8 +233,11 @@ function(bwa_link_os target scope)
     # self-paced render thread joins through os_thread_set_realtime.
     target_link_libraries(${target} ${scope} ws2_32 winmm avrt)
   else()
+    # CMAKE_DL_LIBS: os_dl_open/_sym/_close. -ldl on an older glibc, empty on a current one and on
+    # Android and Apple, where dlopen lives in libc. It belongs here rather than beside the Linux
+    # backends, because the shim is what calls it and every target that compiles the shim needs it.
     find_package(Threads REQUIRED)
-    target_link_libraries(${target} ${scope} Threads::Threads m)
+    target_link_libraries(${target} ${scope} Threads::Threads m ${CMAKE_DL_LIBS})
   endif()
 endfunction()
 bwa_link_os(bwa_core PUBLIC)
@@ -398,10 +401,15 @@ else()
 endif()
 
 # ---- JACK backend (Linux: the production path, and a PipeWire desktop) ----
-# No SDK to vendor. libjack is LGPL-2.1 and dynamically linked; pipewire-jack's drop-in libjack
-# (MIT) answers the same ABI, so which server the binary talks to is a RUN-TIME fact, not a build
-# one. ON wherever it can build, and it cannot be forced on elsewhere.
-option(BWA_WITH_JACK "Build the JACK backend (Linux only; needs libjack via pkg-config)" ON)
+# No SDK to vendor. libjack is LGPL-2.1 and pipewire-jack's drop-in libjack (MIT) answers the same
+# ABI, so which server the binary talks to is a RUN-TIME fact, not a build one.
+#
+# HEADERS ONLY, and this is the point of the block: jack_sink.c dlopens libjack.so.0 and resolves
+# every symbol itself (os_dl_*), so nothing libjack defines is an undefined reference in
+# libbw_audio.so and a box with no JACK loads the library and runs the offline sink. pkg-config
+# still has to find jack, because the types, enums and callback signatures come from its headers -
+# the INCLUDE DIRECTORIES of the imported target are taken, the link interface is not.
+option(BWA_WITH_JACK "Build the JACK backend (Linux only; needs the libjack HEADERS via pkg-config)" ON)
 if(BWA_WITH_JACK AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
   find_package(PkgConfig QUIET)
   if(PkgConfig_FOUND)
@@ -410,8 +418,8 @@ if(BWA_WITH_JACK AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
   if(BWA_JACK_FOUND)
     target_sources(bw_audio PRIVATE src/sink/jack_sink.c)
     target_compile_definitions(bw_audio PRIVATE BWA_HAVE_JACK)
-    target_link_libraries(bw_audio PRIVATE PkgConfig::BWA_JACK)
-    message(STATUS "bw_audio: JACK backend ENABLED (libjack ${BWA_JACK_VERSION})")
+    target_include_directories(bw_audio PRIVATE ${BWA_JACK_INCLUDE_DIRS})
+    message(STATUS "bw_audio: JACK backend ENABLED (libjack ${BWA_JACK_VERSION} headers; loaded at run time)")
   else()
     set(BWA_WITH_JACK OFF)
     message(STATUS "bw_audio: JACK backend disabled (pkg-config found no jack; install libjack-jackd2-dev or pipewire-jack)")
@@ -422,16 +430,17 @@ else()
 endif()
 
 # ---- ALSA backend (Linux: the no-server path) ----
-# alsa-lib is LGPL-2.1, dynamically linked - one line in build.md's license inventory and nothing
-# else changes. Same rule as the two above: ON where it can build, unforceable elsewhere.
-option(BWA_WITH_ALSA "Build the ALSA backend (Linux only; needs alsa-lib)" ON)
+# alsa-lib is LGPL-2.1 - one line in build.md's license inventory and nothing else changes.
+# HEADERS ONLY, same rule as JACK above: alsa_sink.c dlopens libasound.so.2 at run time, so
+# find_package(ALSA) is asked for its include directory and not for its link interface.
+option(BWA_WITH_ALSA "Build the ALSA backend (Linux only; needs the alsa-lib HEADERS)" ON)
 if(BWA_WITH_ALSA AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
   find_package(ALSA QUIET)
   if(ALSA_FOUND)
     target_sources(bw_audio PRIVATE src/sink/alsa_sink.c)
     target_compile_definitions(bw_audio PRIVATE BWA_HAVE_ALSA)
-    target_link_libraries(bw_audio PRIVATE ALSA::ALSA)
-    message(STATUS "bw_audio: ALSA backend ENABLED (alsa-lib ${ALSA_VERSION_STRING})")
+    target_include_directories(bw_audio PRIVATE ${ALSA_INCLUDE_DIRS})
+    message(STATUS "bw_audio: ALSA backend ENABLED (alsa-lib ${ALSA_VERSION_STRING} headers; loaded at run time)")
   else()
     set(BWA_WITH_ALSA OFF)
     message(STATUS "bw_audio: ALSA backend disabled (find_package(ALSA) failed; install libasound2-dev)")
@@ -708,15 +717,17 @@ if(BWA_BUILD_TESTS)
     target_compile_features(test_audio_sink PRIVATE cxx_std_20)
     target_link_libraries(test_audio_sink PRIVATE ole32)
   endif()
+  # Headers only, the same way bw_audio takes them: the test drives the very same run-time loader,
+  # which is what lets it prove the UNAVAILABLE path through bwa_sink_dl_override.
   if(BWA_WITH_JACK)
     target_sources(test_audio_sink PRIVATE src/sink/jack_sink.c)
     target_compile_definitions(test_audio_sink PRIVATE BWA_HAVE_JACK)
-    target_link_libraries(test_audio_sink PRIVATE PkgConfig::BWA_JACK)
+    target_include_directories(test_audio_sink PRIVATE ${BWA_JACK_INCLUDE_DIRS})
   endif()
   if(BWA_WITH_ALSA)
     target_sources(test_audio_sink PRIVATE src/sink/alsa_sink.c)
     target_compile_definitions(test_audio_sink PRIVATE BWA_HAVE_ALSA)
-    target_link_libraries(test_audio_sink PRIVATE ALSA::ALSA)
+    target_include_directories(test_audio_sink PRIVATE ${ALSA_INCLUDE_DIRS})
   endif()
   if(BWA_WITH_AAUDIO)
     target_sources(test_audio_sink PRIVATE src/sink/aaudio_sink.c)

@@ -7,6 +7,10 @@ and no audio thread: you pump one block at a time on your own thread, the clock 
 counter, and a fixed input with a fixed call sequence renders bit-identically every run. PsychoPy
 or PsychPortAudio then plays the file with its own sample-accurate scheduler.
 
+Positions are commit-gated in the engine, and this binding commits them for you, so the render
+loop below is just a set and a push. Wrap several writes in `with e.frame():` when they must land
+as one snapshot (README, "Commit model").
+
 Run it:      uv run examples/offline_render.py
 Check it:    uv run examples/offline_render.py --tests
 """
@@ -34,8 +38,7 @@ def render(profile, seconds=SECONDS, sample_rate=SR, block_size=BLK):
     try:
         src = e.create_push_source()
         src.set_gain(0.5)
-        e.listener.set_pose(0.0, 1.5, 0.0)
-        e.commit()
+        e.listener.set_pose(0.0, 1.5, 0.0)   # commit-gated, and this layer commits it for you
         e.start()
 
         nblocks = int(round(seconds * sample_rate / block_size))
@@ -46,7 +49,6 @@ def render(profile, seconds=SECONDS, sample_rate=SR, block_size=BLK):
             # Move the source: one full turn over the render, at 2 m out and head height.
             angle = 2.0 * math.pi * (t0 / (seconds * sample_rate))
             src.set_pos(2.0 * math.sin(angle), 1.5, 2.0 * math.cos(angle))
-            e.commit()          # positions are commit-gated: without this nothing moves
 
             # Feed the voice one block of tone, then pull one block of output.
             i = np.arange(t0, t0 + block_size, dtype=np.float64)
@@ -118,7 +120,7 @@ def selftest():
     again = render(bwa.Profile.CAVE, seconds=0.25)
     check("the offline render is bit-identical run to run", np.array_equal(cave, again))
 
-    # A moving source must actually move, or the commit is not doing its job.
+    # A moving source must actually move, or the auto-commit is not doing its job.
     front = cave[:, : BLK * 4]
     back = cave[:, -BLK * 4:]
     check("the source moved across the render", not np.allclose(front, back, atol=1e-6))

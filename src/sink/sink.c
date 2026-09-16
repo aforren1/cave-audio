@@ -13,6 +13,10 @@ static void sink_set_err(char* err, size_t cap, const char* msg) {
     if (err && cap) { strncpy(err, msg, cap - 1); err[cap - 1] = 0; }
 }
 
+/* The run-time-loader test hook (sink.h). Lives here rather than in either Linux backend so one
+ * definition serves both and so a build that carries neither still exports it. */
+const char* bwa_sink_dl_override = NULL;
+
 /* Human name for a message. Fixed strings stay ASCII (the repo rule: every one of these reaches
  * bwa_last_error, which every binding and example prints to a console). */
 static const char* backend_label(bwa_sink_type t) {

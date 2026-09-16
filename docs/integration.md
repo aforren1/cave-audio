@@ -696,7 +696,10 @@ Two layers, unlike Unity's one and Godot's one:
   fails when a new ABI call arrives unbound, so this layer cannot drift.
 - `bw_audio` is the **Pythonic layer**, pure Python over the raw one: an `Engine` context manager,
   `Sound`, `Source`, `PushSource`, `Bed` and `Listener` objects, and exceptions instead of return
-  codes. It adds no semantics. Both layers drive the same engine, so anything the Pythonic layer
+  codes. It adds one semantic, the commit model: a commit-gated write commits itself, or lands
+  with the rest of an `Engine.frame()` block, which is this binding's answer to the per-frame
+  commit Unity and Godot make for you (the README's "Commit model" states the three modes).
+  Both layers drive the same engine, so anything the Pythonic layer
   does not wrap you reach through `Engine.raw`.
 
 **One ABI call is deliberately not bound.** `bwa_set_output_capture` installs a callback that the

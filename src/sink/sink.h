@@ -67,6 +67,20 @@ BWA_EXPORT
 #endif
 extern volatile int bwa_null_sink_skip_blocks;
 
+/* TEST HOOK (defined in sink.c, exported from the dll; deliberately not in bw_audio.h): the SONAME
+ * the run-time loaders in jack_sink.c and alsa_sink.c pass to os_dl_open. NULL (the default) means
+ * each backend uses its own real soname. Point it at a name that cannot be loaded and both Linux
+ * backends report themselves UNAVAILABLE, which is the only way a test can reach that path on a
+ * box that has the libraries installed.
+ *
+ * Control thread, and set it before the sink you want to affect is opened: a backend that already
+ * resolved its symbols keeps the library it resolved them from (jack_sink.c says why it is never
+ * unloaded). Clearing it makes the next open retry the real soname. */
+#ifdef BWA_BUILD_DLL
+BWA_EXPORT
+#endif
+extern const char* bwa_sink_dl_override;
+
 /* TEST HOOKS (defined in engine.c, exported from the dll; deliberately not in bw_audio.h): the
  * cave_both MONITOR sink, which the public readbacks never describe - bwa_get_health and
  * bwa_get_sink_type both report the ARRAY. A monitor that failed to open on its own device falls

@@ -7,6 +7,7 @@
  */
 #include "os/os.h"
 
+#include <dlfcn.h>      /* os_dl_*: the two Linux device backends load their libraries at run time */
 #include <errno.h>
 #include <sched.h>       /* SCHED_FIFO + the priority range os_thread_set_realtime asks for */
 #include <stdlib.h>
@@ -350,6 +351,22 @@ void os_rwlock_lock(os_rwlock* l)          { if (l && l->live) pthread_rwlock_wr
 void os_rwlock_unlock(os_rwlock* l)        { if (l && l->live) pthread_rwlock_unlock(&l->rw); }
 void os_rwlock_lock_shared(os_rwlock* l)   { if (l && l->live) pthread_rwlock_rdlock(&l->rw); }
 void os_rwlock_unlock_shared(os_rwlock* l) { if (l && l->live) pthread_rwlock_unlock(&l->rw); }
+
+/* ---- dynamic libraries ---- */
+
+/* RTLD_NOW so a library missing one of the symbols a backend needs fails HERE rather than on the
+ * first call into it, and RTLD_LOCAL so nothing it drags in joins the global namespace. */
+os_dl os_dl_open(const char* name) {
+    if (!name || !*name) return NULL;
+    return dlopen(name, RTLD_NOW | RTLD_LOCAL);
+}
+
+void* os_dl_sym(os_dl h, const char* symbol) {
+    if (!h || !symbol) return NULL;
+    return dlsym(h, symbol);
+}
+
+void os_dl_close(os_dl h) { if (h) dlclose(h); }
 
 /* ---- strings ---- */
 

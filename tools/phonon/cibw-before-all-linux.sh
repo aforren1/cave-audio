@@ -34,9 +34,10 @@ cd "$ROOT"
 
 # ---- 1. the Linux backends' dev packages -----------------------------------------------------
 # alsa-lib-devel is in AppStream and jack-audio-connection-kit-devel is in EPEL; the manylinux_2_28
-# image enables both repositories already. The wheel links libasound and libjack rather than
-# dlopening them, so a missing header here does not fail the build - it silently drops a backend.
-# Hence the pkg-config assertions below: a wheel with no JACK and no ALSA must fail the job.
+# image enables both repositories already. The sinks DLOPEN libasound and libjack, but they compile
+# against these headers, so a missing header here does not fail the build - it silently drops a
+# backend. Hence the pkg-config assertions below: a wheel with no JACK and no ALSA must fail the
+# job.
 dnf -y install alsa-lib-devel jack-audio-connection-kit-devel
 pkg-config --exists alsa || { echo "ALSA dev package missing after install"; exit 1; }
 pkg-config --exists jack || { echo "JACK dev package missing after install"; exit 1; }

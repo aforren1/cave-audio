@@ -121,9 +121,10 @@ test-command = [
 # run an experiment on.
 manylinux-x86_64-image = "manylinux_2_28"
 before-all = "bash {project}/tools/phonon/cibw-before-all-linux.sh"
-# auditwheel would otherwise copy libasound and libjack INTO the wheel, which is wrong for both:
-# libjack has to be the one the running JACK server uses, and libasound is on every Linux desktop
-# already. --exclude leaves them as ordinary dependencies. Everything else the engine needs
+# The engine DLOPENS libasound and libjack, so neither is in its NEEDED list and auditwheel has
+# nothing to graft. --exclude stays as a GUARD: copying either one in was always wrong (libjack has
+# to be the one the running JACK server uses, and libasound is on every Linux desktop already), and
+# the flag keeps that true if a future backend ever links one. Everything else the engine needs
 # (libstdc++, libgcc, libm, libpthread) is in the manylinux policy, so a correct repair grafts
 # nothing at all and never rewrites the extension's $ORIGIN runpath.
 repair-wheel-command = "auditwheel repair --exclude libasound.so.2 --exclude libjack.so.0 -w {dest_dir} {wheel}"

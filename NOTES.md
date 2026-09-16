@@ -22,6 +22,7 @@ C-only step and is what proves the binding reaches the same DSP: perturbing the 
 10 cm moved the energy total 168.17 to 193.05, well outside the 2e-3 tolerance, so the test was
 seen red before it was trusted green. Worth knowing about that tolerance: it absorbs a 0.2 percent
 nudge of the constant itself, so it catches a DSP change and not a typo in the reference.
+The Pythonic layer then took on ONE semantic of its own (2026-09-16): it commits for you, because Python has no frame to hang the per-frame `bwa_commit` on the way Unity and Godot do, with `Engine.frame()` as the coherence path, a flush before every play so "set the position, play it" cannot render at the old one, and `autocommit=False` to get the C semantics back.
 
 **Static phonon for Android (2026-09-15).** Both ABIs, built on a Windows host with the composite
 action's own steps and run on an x86_64 emulator: 37 of 38, the five SDK tests included (the red is
@@ -858,3 +859,18 @@ and both examples passing inside the container. Two small facts worth keeping: a
 every tag a wheel is eligible for, so the filename carries `manylinux_2_27` as well and an equality
 assertion on the name would have failed; and with `libasound` and `libjack` excluded the repair
 grafts nothing at all, which is what leaves the extension's `$ORIGIN` runpath untouched.
+
+The Linux backends stopped linking their libraries. `libbw_audio.so` had `libjack.so.0` and
+`libasound.so.2` in its `NEEDED` list, which made a box with neither fail to load the WHOLE library
+rather than lose one backend, so `jack_sink.c` and `alsa_sink.c` now `dlopen` them through a new
+`os_dl_open`/`_sym`/`_close` trio in the shim and resolve 23 and 36 symbols into one table each. A
+library that will not load is exactly "no device": a count of 0, an AUTO skip, and an explicit open
+that fails naming the library, with the reason carried out on the degradation channel when AUTO
+lands on the offline sink. Three things worth keeping. The ALSA `snd_pcm_*_params_alloca` macros
+expand to a `snd_*_sizeof()` CALL and `snd_strerror` is a library symbol too, so neither could be
+found by reading the call sites for library-looking names; what catches them is the empty link
+line, where a missed symbol is an undefined reference at build time. The fall-through is cheap:
+about 3 us per absent library, against the 3.7 ms an explicit JACK open costs when libjack IS
+present and has to find out there is no server. And the whole path is testable on a box that HAS
+the libraries, through a `bwa_sink_dl_override` hook that re-aims both loaders at a soname that
+cannot exist; breaking the retry on purpose (caching the outcome forever) turns that section red.

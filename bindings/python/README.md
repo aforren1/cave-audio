@@ -20,7 +20,6 @@ with bwa.Engine(profile=bwa.Profile.BINAURAL) as engine:
     click = engine.load_sound("click.wav")
     source = engine.create_source()
     source.set_pos(1.0, 1.5, 2.0)
-    engine.commit()
     source.play(click)
 ```
 
@@ -44,10 +43,11 @@ it:
 The wheel contains the engine library, so there is nothing to install beside it. Steam Audio is
 linked statically into the engine, so there is no second library either. The Linux filename can
 name more than one tag (`manylinux_2_27_x86_64.manylinux_2_28_x86_64`): auditwheel records every
-tag the wheel qualifies for, and the lowest one is what it needs. The Linux wheel is the one
-with a runtime expectation: it links ALSA and JACK, so `libasound.so.2` and `libjack.so.0` have to
-be on the machine. Both come with any Linux desktop that plays audio (`libjack` also arrives with
-`pipewire-jack`).
+tag the wheel qualifies for, and the lowest one is what it needs. The Linux wheel imports with
+neither `libasound.so.2` nor `libjack.so.0` on the machine: the engine loads each of them at run
+time, so the JACK or ALSA backend is available when its library is installed, and unavailable with
+the library named when it is not. Both come with any Linux desktop that plays audio (`libjack` also
+arrives with `pipewire-jack`).
 
 CI also builds a wheel on each runner with plain `uv build --wheel`, one per job. Those are the
 **fast gate**, not the release: they are tagged for the runner image's own glibc and architecture.
@@ -92,7 +92,8 @@ Three places where a literal binding cannot express the C:
 **`bw_audio` is the Pythonic layer.** Pure Python over the raw layer. It gives you an `Engine`
 context manager, `Sound`, `Source`, `PushSource`, `Bed` and `Listener` objects, exceptions instead
 of return codes, and the one-control-thread guard below. It adds no semantics of its own, so when
-a method's behavior is in question, the header comment is the answer.
+a method's behavior is in question, the header comment is the answer. It adds one semantic and
+only one: it commits for you. See "Commit model" below.
 
 Mix the layers freely. `Engine.raw` is the raw handle and `Source.handle` is the raw source, so
 anything the Pythonic layer does not wrap you can still call:
@@ -128,17 +129,67 @@ engine = bwa.Engine()          # guarded, the default
 engine = bwa.Engine(thread_guard=False)   # you funnel your own calls through one thread
 ```
 
-The raw layer has no guard. Two other rules travel with the contract:
-
-- Every per-frame call is non-blocking. It encodes a command and returns.
-- Position and pose are commit-gated. Push them every frame, then call `Engine.commit()` once,
-  last. Forget the commit and everything renders at its last committed position: sounds play,
-  nothing moves.
+The raw layer has no guard. One other rule travels with the contract: every per-frame call is
+non-blocking. It encodes a command and returns.
 
 The GIL is released around the calls that block or do file I/O, which is the lifecycle, the loads,
 the headphone EQ, the tracker connect, the scene rebuilds, and `render_block`. Another Python
 thread runs while those are in flight. Per-frame calls keep the GIL, because they are non-blocking
 ring writes and releasing would cost more than the call.
+
+## Commit model
+
+Position and pose are **commit-gated** in the ABI. They write pending fields, and only
+`bwa_commit` promotes them as one coherent snapshot. Forget the commit and everything renders at
+its last committed position: sounds play, nothing moves.
+
+Unity and Godot never make you think about it, because both have a frame: their bindings push
+every position, then commit once per frame, and your code never calls commit at all. Python has no
+frame to hang that on, so this binding gives you three modes.
+
+**Autocommit, the default.** Every commit-gated write commits itself. Nothing to remember, and a
+script that sets a position and plays a sound is correct with no ceremony.
+
+```python
+source.set_pos(1.0, 1.5, 2.0)      # committed for you
+source.play(click)
+```
+
+**A frame block, for a loop.** `Engine.frame()` groups a frame's writes into one commit, taken at
+the block's exit. This is the coherence path, and the one to use in a game-style loop or around
+any multi-source update whose intermediate state must not be rendered: two sources that move
+together are then rendered as having moved together, rather than one per commit.
+
+```python
+while running:
+    with engine.frame():
+        for source, position in scene:
+            source.set_pos(*position)
+        engine.listener.set_pose(*head)
+```
+
+Blocks nest and commit once, at the outermost exit. An exception leaving the block still commits:
+a half-pending scene outlives the exception and renders at mixed positions from then on, which is
+a worse failure and a harder one to read. The exception propagates unchanged.
+
+A play call inside a block flushes a pending write FIRST, even in a block, so "set the position,
+play it" always sounds where you put it. `Source.play`, `play_at`, `play_loop` and `queue`, the
+three `Bed` play calls, and `Engine.play_oneshot` are the flush points. `PushSource.push` is not:
+a push is a per-frame feed rather than a play, and a loop that pushes every source would commit on
+the first push and land the rest of the frame's positions late.
+
+**Autocommit off, for your own frame loop.** `Engine(autocommit=False)`, or the `autocommit`
+property, gives the C semantics back: nothing commits but `Engine.commit()`, a frame block's exit
+included. Use it when you drive the loop and want exactly one commit per iteration.
+
+Three things are worth knowing whichever mode you use. `Engine.commit()` is always there and
+always `bwa_commit`. Only position and pose are gated, so gain, spread, orientation and the rest
+land on the next audio block by themselves and get no commit. And commit is what fills the event
+rings, so `poll_ended()` and `poll_looped()` read a frame-old picture without one ahead of them.
+
+**The raw layer does none of this.** `bw_audio._bwa` is the C semantics exactly: no pending flag,
+no autocommit, no flush. Mixing the layers is fine, but a raw `_bwa.source_set_pos` stays pending
+until you commit.
 
 ## The offline shape
 
@@ -154,7 +205,6 @@ import bw_audio as bwa
 engine = bwa.Engine(profile=bwa.Profile.BINAURAL, sink=bwa.SinkType.MANUAL)
 source = engine.create_push_source()
 source.set_pos(2.0, 1.5, 0.0)
-engine.commit()
 engine.start()
 
 blocks = []

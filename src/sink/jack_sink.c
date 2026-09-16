@@ -45,6 +45,109 @@
 #include <stdlib.h>
 #include <string.h>
 
+/* ---- the run-time loader ------------------------------------------------------------------- */
+
+/* WHY THE LIBRARY IS NOT LINKED. libbw_audio.so has to load on a box with no JACK at all - a
+ * headless CI runner, a Python wheel on a server, an experiment box that only ever wanted the
+ * offline sink. Linking libjack makes libjack's absence a failure of the WHOLE library rather than
+ * of one backend, and the loader hides nothing: a missing library is exactly "no device" (a device
+ * count of 0, an AUTO skip, and an explicit open that fails naming the library). The headers are
+ * still a build-time dependency - every type, enum and callback signature below comes from them.
+ *
+ * pipewire-jack ships a drop-in libjack.so.0, so the soname is the same one on either kind of box
+ * and which server answers stays the run-time fact it always was.
+ *
+ * CONTROL THREAD ONLY. Every entry in the table is read from the process callback, but it is
+ * WRITTEN only here, before any client exists. */
+#define JACK_SONAME "libjack.so.0"
+
+/* name, return type, parameter list. One list generates the typedefs, the table and the resolve
+ * loop, so the three cannot drift apart. */
+#define JACK_SYMBOLS(X) \
+    X(jack_client_open,               jack_client_t*, (const char*, jack_options_t, jack_status_t*, ...)) \
+    X(jack_client_close,              int,            (jack_client_t*)) \
+    X(jack_activate,                  int,            (jack_client_t*)) \
+    X(jack_deactivate,                int,            (jack_client_t*)) \
+    X(jack_get_client_name,           const char*,    (jack_client_t*)) \
+    X(jack_get_sample_rate,           jack_nframes_t, (jack_client_t*)) \
+    X(jack_get_buffer_size,           jack_nframes_t, (jack_client_t*)) \
+    X(jack_is_realtime,               int,            (jack_client_t*)) \
+    X(jack_port_register,             jack_port_t*,   (jack_client_t*, const char*, const char*, unsigned long, unsigned long)) \
+    X(jack_port_get_buffer,           void*,          (jack_port_t*, jack_nframes_t)) \
+    X(jack_port_name,                 const char*,    (const jack_port_t*)) \
+    X(jack_port_connected,            int,            (const jack_port_t*)) \
+    X(jack_port_get_latency_range,    void,           (jack_port_t*, jack_latency_callback_mode_t, jack_latency_range_t*)) \
+    X(jack_recompute_total_latencies, int,            (jack_client_t*)) \
+    X(jack_connect,                   int,            (jack_client_t*, const char*, const char*)) \
+    X(jack_get_ports,                 const char**,   (jack_client_t*, const char*, const char*, unsigned long)) \
+    X(jack_free,                      void,           (void*)) \
+    X(jack_set_process_callback,      int,            (jack_client_t*, JackProcessCallback, void*)) \
+    X(jack_set_buffer_size_callback,  int,            (jack_client_t*, JackBufferSizeCallback, void*)) \
+    X(jack_set_xrun_callback,         int,            (jack_client_t*, JackXRunCallback, void*)) \
+    X(jack_on_shutdown,               void,           (jack_client_t*, JackShutdownCallback, void*)) \
+    X(jack_get_cycle_times,           int,            (const jack_client_t*, jack_nframes_t*, jack_time_t*, jack_time_t*, float*)) \
+    X(jack_get_xrun_delayed_usecs,    float,          (jack_client_t*))
+
+#define JACK_TYPEDEF(n, r, a) typedef r (*n##_pfn) a;
+JACK_SYMBOLS(JACK_TYPEDEF)
+#undef JACK_TYPEDEF
+
+#define JACK_FIELD(n, r, a) n##_pfn n;
+typedef struct { JACK_SYMBOLS(JACK_FIELD) } JackApi;
+#undef JACK_FIELD
+
+static JackApi jk;                      /* every call site reads jk.<symbol> */
+static os_dl   jk_lib;
+static char    jk_lib_name[128];        /* what jk_lib was opened as; the cache key */
+static char    jk_err[224];             /* ASCII: it reaches bwa_last_error */
+
+/* Resolve the table, once. Returns false with jk_err set when the library or any symbol is missing,
+ * and a later call RETRIES - a box where libjack was installed after the first attempt finds it.
+ * bwa_sink_dl_override (sink.h) re-aims the loader, which is how the test reaches this path on a
+ * box that has JACK.
+ *
+ * RESOLVE INTO A LOCAL, COMMIT ON SUCCESS. A failed load must leave the live table alone: a sink
+ * opened earlier is still calling through it from the process thread, and a half-cleared table
+ * would be a null call rather than a reported failure. For the same reason the old handle is never
+ * closed on a re-aim - unloading libjack under a running client would take its threads with it.
+ * Only the test hook can change the name, and it changes it at most twice per run. */
+static bool jack_load(void) {
+    const char* want = bwa_sink_dl_override ? bwa_sink_dl_override : JACK_SONAME;
+    if (jk_lib && strcmp(jk_lib_name, want) == 0) return true;
+
+    os_dl h = os_dl_open(want);
+    if (!h) {
+        /* "could not be loaded" is a STABLE phrase: the sink test matches it to tell a visible
+         * ctest SKIP from a real failure, the same way it matches "no jack server". */
+        snprintf(jk_err, sizeof jk_err,
+                 "jack: %s could not be loaded, so this build cannot reach a JACK server; install "
+                 "JACK2 (libjack-jackd2-0) or pipewire-jack, or use the ALSA backend", want);
+        return false;
+    }
+
+    JackApi t;
+    memset(&t, 0, sizeof t);
+#define JACK_RESOLVE(n, r, a)                                                         \
+    do {                                                                              \
+        t.n = (n##_pfn)os_dl_sym(h, #n);                                              \
+        if (!t.n) {                                                                   \
+            snprintf(jk_err, sizeof jk_err,                                           \
+                     "jack: %s has no symbol %s, so it is not a usable JACK library", \
+                     want, #n);                                                       \
+            os_dl_close(h);                                                           \
+            return false;                                                             \
+        }                                                                             \
+    } while (0);
+    JACK_SYMBOLS(JACK_RESOLVE)
+#undef JACK_RESOLVE
+
+    jk     = t;
+    jk_lib = h;
+    snprintf(jk_lib_name, sizeof jk_lib_name, "%s", want);
+    jk_err[0] = 0;
+    return true;
+}
+
 /* The bus copies straight into the port buffers, so this has to hold. It does on every JACK and
  * pipewire-jack build in existence; the assert is here so a build where it stopped holding fails
  * at compile time rather than by writing halves of samples. */
@@ -116,7 +219,7 @@ static int jack_process(jack_nframes_t nframes, void* arg) {
     JackOut o;
     o.channels = s->channels;
     for (uint32_t c = 0; c < s->channels; ++c)
-        o.dst[c] = (float*)jack_port_get_buffer(s->ports[c], nframes);
+        o.dst[c] = (float*)jk.jack_port_get_buffer(s->ports[c], nframes);
 
     if (!atomic_load_explicit(&s->running, memory_order_acquire)) {
         for (uint32_t c = 0; c < s->channels; ++c)
@@ -132,7 +235,7 @@ static int jack_process(jack_nframes_t nframes, void* arg) {
         jack_nframes_t cur_frames = 0;
         jack_time_t cur_usecs = 0, next_usecs = 0;
         float period_usecs = 0.0f;
-        if (jack_get_cycle_times(s->client, &cur_frames, &cur_usecs, &next_usecs, &period_usecs) == 0)
+        if (jk.jack_get_cycle_times(s->client, &cur_frames, &cur_usecs, &next_usecs, &period_usecs) == 0)
             host_ns = (uint64_t)cur_usecs * 1000ull;
         else
             host_ns = sink_quant_now_ns();
@@ -173,7 +276,7 @@ static int jack_process(jack_nframes_t nframes, void* arg) {
  * how long the graph was late. */
 static int jack_xrun(void* arg) {
     JackSink* s = (JackSink*)arg;
-    const float usecs = jack_get_xrun_delayed_usecs(s->client);
+    const float usecs = jk.jack_get_xrun_delayed_usecs(s->client);
     uint64_t frames = 0;
     if (usecs > 0.0f)
         frames = (uint64_t)((double)usecs * 1.0e-6 * (double)s->sample_rate);
@@ -242,8 +345,8 @@ static void jack_close(bwa_sink* base) {
      * out of the graph and waits for its process callback; jack_client_close ends the notification
      * threads, which is what makes the host_started read below safe. */
     if (s->client) {
-        if (s->activated) jack_deactivate(s->client);
-        jack_client_close(s->client);
+        if (s->activated) jk.jack_deactivate(s->client);
+        jk.jack_client_close(s->client);
         s->client = NULL;
     }
     /* 1 is the transient state INSIDE the shutdown callback, between claiming the slot and
@@ -286,14 +389,14 @@ uint32_t sink_jack_period_frames(bwa_sink* base) {
 
 bool sink_jack_is_realtime(bwa_sink* base) {
     JackSink* s = (JackSink*)base;
-    return s->client && jack_is_realtime(s->client) != 0;
+    return s->client && jk.jack_is_realtime(s->client) != 0;
 }
 
 uint32_t sink_jack_connected_ports(bwa_sink* base) {
     JackSink* s = (JackSink*)base;
     uint32_t n = 0;
     for (uint32_t c = 0; c < s->channels; ++c)
-        if (s->ports[c] && jack_port_connected(s->ports[c]) > 0) ++n;
+        if (s->ports[c] && jk.jack_port_connected(s->ports[c]) > 0) ++n;
     return n;
 }
 
@@ -314,10 +417,13 @@ static const bwa_sink_vtbl JACK_VT = {   /* designated: stop/close share a signa
  * there is no lighter way to ask. */
 static uint32_t jack_prefixes(char out[][64], uint32_t cap) {
     uint32_t n = 0;
+    /* No libjack is exactly "no device": the count is 0, every name query fails, and rule 10 then
+     * skips this backend under AUTO the same way "no server" already does. */
+    if (!jack_load()) return 0;
     jack_status_t st = 0;
-    jack_client_t* c = jack_client_open("bw_audio_probe", JackNoStartServer, &st);
+    jack_client_t* c = jk.jack_client_open("bw_audio_probe", JackNoStartServer, &st);
     if (!c) return 0;
-    const char** ports = jack_get_ports(c, NULL, JACK_DEFAULT_AUDIO_TYPE,
+    const char** ports = jk.jack_get_ports(c, NULL, JACK_DEFAULT_AUDIO_TYPE,
                                         JackPortIsPhysical | JackPortIsInput);
     if (ports) {
         for (uint32_t i = 0; ports[i] && n < cap; ++i) {
@@ -332,9 +438,9 @@ static uint32_t jack_prefixes(char out[][64], uint32_t cap) {
             out[n][len] = 0;
             ++n;
         }
-        jack_free((void*)ports);
+        jk.jack_free((void*)ports);
     }
-    jack_client_close(c);
+    jk.jack_client_close(c);
     return n;
 }
 
@@ -369,8 +475,16 @@ bwa_sink* bwa_jack_sink_open(uint32_t sample_rate, uint32_t block_size, uint32_t
         return NULL;
     }
 
+    /* The library is resolved here, not at load time, so a box with no JACK still loads the engine.
+     * The message names the library, because "jack: open failed" would send the reader looking for
+     * a server that was never the problem. */
+    if (!jack_load()) {
+        jack_set_err(err, errcap, jk_err);
+        return NULL;
+    }
+
     jack_status_t st = 0;
-    jack_client_t* client = jack_client_open("bw_audio", JackNoStartServer, &st);
+    jack_client_t* client = jk.jack_client_open("bw_audio", JackNoStartServer, &st);
     if (!client) {
         /* JackNoStartServer is what makes this the FAST path to ALSA under AUTO: a box with
          * neither a JACK server nor PipeWire fails here in microseconds instead of forking a
@@ -387,7 +501,7 @@ bwa_sink* bwa_jack_sink_open(uint32_t sample_rate, uint32_t block_size, uint32_t
     /* Rule 6, and it does not relax for a headphone open: JACK has no per-client resampler, so a
      * mismatch is a hard failure with BOTH rates in the message. A PipeWire desktop running its
      * graph at 44.1 kHz needs default.clock.rate = 48000, or an engine created at 44100. */
-    const uint32_t srv_rate = (uint32_t)jack_get_sample_rate(client);
+    const uint32_t srv_rate = (uint32_t)jk.jack_get_sample_rate(client);
     if (srv_rate != sample_rate) {
         char m[240];
         snprintf(m, sizeof m, "jack: the server runs at %u Hz, not the engine's %u Hz, and a JACK "
@@ -395,14 +509,14 @@ bwa_sink* bwa_jack_sink_open(uint32_t sample_rate, uint32_t block_size, uint32_t
                               "default.clock.rate) or match bwa_desc.sample_rate to it",
                  srv_rate, sample_rate);
         jack_set_err(err, errcap, m);
-        jack_client_close(client);
+        jk.jack_client_close(client);
         return NULL;
     }
 
     JackSink* s = (JackSink*)calloc(1, sizeof *s);
     if (!s) {
         jack_set_err(err, errcap, "jack: out of memory");
-        jack_client_close(client);
+        jk.jack_client_close(client);
         return NULL;
     }
     s->base.vt     = &JACK_VT;
@@ -410,20 +524,20 @@ bwa_sink* bwa_jack_sink_open(uint32_t sample_rate, uint32_t block_size, uint32_t
     s->channels    = channels;
     s->block       = block_size;
     s->client      = client;
-    atomic_store_explicit(&s->period, (uint32_t)jack_get_buffer_size(client), memory_order_relaxed);
+    atomic_store_explicit(&s->period, (uint32_t)jk.jack_get_buffer_size(client), memory_order_relaxed);
 
     /* One output port per bus channel, out_01..out_NN, in bus order. The patchbay sees the array
      * channel numbers rather than a pair of anonymous stereo ports. */
     for (uint32_t c = 0; c < channels; ++c) {
         char pname[16];
         snprintf(pname, sizeof pname, "out_%02u", (unsigned)(c + 1));
-        s->ports[c] = jack_port_register(client, pname, JACK_DEFAULT_AUDIO_TYPE, JackPortIsOutput, 0);
+        s->ports[c] = jk.jack_port_register(client, pname, JACK_DEFAULT_AUDIO_TYPE, JackPortIsOutput, 0);
         if (!s->ports[c]) {
             char m[192];
             snprintf(m, sizeof m, "jack: the server refused output port %u of %u (a client port "
                                   "limit?)", (unsigned)(c + 1), channels);
             jack_set_err(err, errcap, m);
-            jack_client_close(client);
+            jk.jack_client_close(client);
             free(s);
             return NULL;
         }
@@ -434,21 +548,21 @@ bwa_sink* bwa_jack_sink_open(uint32_t sample_rate, uint32_t block_size, uint32_t
     if (sink_quant_init(&s->quant, sample_rate, block_size, channels, JACK_MAX_PERIOD,
                         render, user) != 0) {
         jack_set_err(err, errcap, "jack: the fixed-quantum adapter could not be allocated");
-        jack_client_close(client);
+        jk.jack_client_close(client);
         free(s);
         return NULL;
     }
     s->q_capacity = s->quant.slots * s->quant.block;
 
-    jack_set_process_callback(client, jack_process, s);
-    jack_set_buffer_size_callback(client, jack_bufsize, s);
-    jack_set_xrun_callback(client, jack_xrun, s);
-    jack_on_shutdown(client, jack_shutdown, s);
+    jk.jack_set_process_callback(client, jack_process, s);
+    jk.jack_set_buffer_size_callback(client, jack_bufsize, s);
+    jk.jack_set_xrun_callback(client, jack_xrun, s);
+    jk.jack_on_shutdown(client, jack_shutdown, s);
 
-    if (jack_activate(client) != 0) {
+    if (jk.jack_activate(client) != 0) {
         jack_set_err(err, errcap, "jack: the client could not be activated");
         sink_quant_free(&s->quant);
-        jack_client_close(client);
+        jk.jack_client_close(client);
         free(s);
         return NULL;
     }
@@ -458,8 +572,8 @@ bwa_sink* bwa_jack_sink_open(uint32_t sample_rate, uint32_t block_size, uint32_t
      * "RAVENNA:playback_"), NULL the physical playback ports in order. The connections are a
      * STARTING POINT - the patchbay can rewire them live and the sink never reasserts them. */
     const char** targets = (device && *device)
-        ? jack_get_ports(client, device, JACK_DEFAULT_AUDIO_TYPE, JackPortIsInput)
-        : jack_get_ports(client, NULL, JACK_DEFAULT_AUDIO_TYPE, JackPortIsPhysical | JackPortIsInput);
+        ? jk.jack_get_ports(client, device, JACK_DEFAULT_AUDIO_TYPE, JackPortIsInput)
+        : jk.jack_get_ports(client, NULL, JACK_DEFAULT_AUDIO_TYPE, JackPortIsPhysical | JackPortIsInput);
     uint32_t ntargets = 0;
     if (targets) while (targets[ntargets]) ++ntargets;
 
@@ -470,7 +584,7 @@ bwa_sink* bwa_jack_sink_open(uint32_t sample_rate, uint32_t block_size, uint32_t
                  ntargets, ntargets == 1 ? "" : "s", ntargets == 1 ? "es" : "",
                  (device && *device) ? device : "the physical playback ports", channels);
         jack_set_err(err, errcap, m);
-        if (targets) jack_free((void*)targets);
+        if (targets) jk.jack_free((void*)targets);
         /* The sink is live in the graph by now, and a server shutdown between activate and here
          * would have started the host-paced thread. jack_close is the one teardown that accounts
          * for that, so use it rather than a hand-rolled unwind that could free the adapter under
@@ -482,22 +596,22 @@ bwa_sink* bwa_jack_sink_open(uint32_t sample_rate, uint32_t block_size, uint32_t
     char prefix[64] = {0};
     uint32_t connected = 0;
     for (uint32_t c = 0; c < channels; ++c) {
-        if (jack_connect(client, jack_port_name(s->ports[c]), targets[c]) == 0) ++connected;
+        if (jk.jack_connect(client, jk.jack_port_name(s->ports[c]), targets[c]) == 0) ++connected;
         if (c == 0) {
             const char* colon = strchr(targets[0], ':');
             const size_t len = colon ? (size_t)(colon - targets[0]) : strlen(targets[0]);
             if (len && len < sizeof prefix) { memcpy(prefix, targets[0], len); prefix[len] = 0; }
         }
     }
-    jack_free((void*)targets);
+    jk.jack_free((void*)targets);
 
     /* Rule 5: the server recomputes port latency on connect, and the client has to ask for the
      * recomputation before reading it back. Max over the ports, because the bus plays as one. */
-    jack_recompute_total_latencies(client);
+    jk.jack_recompute_total_latencies(client);
     uint32_t lat = 0;
     for (uint32_t c = 0; c < channels; ++c) {
         jack_latency_range_t r = { 0, 0 };
-        jack_port_get_latency_range(s->ports[c], JackPlaybackLatency, &r);
+        jk.jack_port_get_latency_range(s->ports[c], JackPlaybackLatency, &r);
         if ((uint32_t)r.max > lat) lat = (uint32_t)r.max;
     }
     /* Plus what the adapter holds. A server period equal to the engine block is the pass-through
@@ -507,7 +621,7 @@ bwa_sink* bwa_jack_sink_open(uint32_t sample_rate, uint32_t block_size, uint32_t
     s->latency_frames = lat;
 
     if (prefix[0]) snprintf(s->name, sizeof s->name, "jack:%s", prefix);
-    else           snprintf(s->name, sizeof s->name, "jack:%s", jack_get_client_name(client));
+    else           snprintf(s->name, sizeof s->name, "jack:%s", jk.jack_get_client_name(client));
 
     /* Rule 6's "succeeded but degraded" channel. A connection the server refused leaves that bus
      * channel audible nowhere, which is a silent-speaker defect if it goes unsaid. */

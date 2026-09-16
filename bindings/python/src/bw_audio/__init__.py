@@ -6,11 +6,13 @@ Two layers, and you can mix them freely:
   the ``bwa_`` prefix, with the header's own argument names and units. Nothing is renamed or
   re-unitted. Read ``include/bw_audio.h`` or ``docs/api.md`` and you are reading this layer.
 * ``bw_audio`` is this module: an ``Engine`` context manager and small handle objects over it.
-  It adds ergonomics and one safety guard, and no semantics of its own.
+  It adds ergonomics, one safety guard, and one convenience with semantics: it commits for you.
+  See ``Engine.autocommit`` and ``Engine.frame``.
 
 The threading contract is the engine's, not Python's: every call must come from ONE control
 thread. ``Engine`` records the thread that created it and raises from any other, unless you pass
-``thread_guard=False``. The raw layer has no guard.
+``thread_guard=False``. The raw layer has no guard, and no auto-commit either: it is the C
+semantics and nothing else.
 
 ``bwa_set_output_capture`` is deliberately not bound. Its callback runs on the audio thread, where
 an interpreter must never run. Use the manual sink and ``Engine.render_block()`` instead.
@@ -18,6 +20,7 @@ an interpreter must never run. Use the manual sink and ``Engine.render_block()``
 
 from __future__ import annotations
 
+import contextlib
 import enum
 import os
 import sys
@@ -313,29 +316,37 @@ class Source(_Handle):
 
     # ---- transport
     def play(self, sound, loop: bool = False) -> None:
+        """Start this sound. Flushes a pending position first, so "move it, play it" renders there."""
         self._e._check_thread()
+        self._e._flush()
         _bwa.source_play(self._e._raw, self._h, int(sound), loop)
 
     def play_at(self, sound, start_frame: int, loop: bool = False) -> None:
         """Begin output exactly when the dsp clock reaches ``start_frame``.
 
         Get "now" from ``Engine.dsp_time_frames`` and add a delay. A start already in the past
-        plays immediately; 0 means play now.
+        plays immediately; 0 means play now. Flushes a pending position first, like ``play``.
         """
         self._e._check_thread()
+        self._e._flush()
         _bwa.source_play_at(self._e._raw, self._h, int(sound), loop, int(start_frame))
 
     def play_loop(self, sound, loop_beg: int = 0, loop_end: int = 0) -> None:
         """Play from the start but wrap from ``loop_end`` back to ``loop_beg`` (intro then body).
 
-        Frames are engine-rate. ``loop_end`` 0 means the clip end.
+        Frames are engine-rate. ``loop_end`` 0 means the clip end. Flushes a pending position first.
         """
         self._e._check_thread()
+        self._e._flush()
         _bwa.source_play_loop(self._e._raw, self._h, int(sound), int(loop_beg), int(loop_end))
 
     def queue(self, sound, loop: bool = False) -> None:
-        """Chain a sound to start the instant the current one ends. Queue AFTER the play."""
+        """Chain a sound to start the instant the current one ends. Queue AFTER the play.
+
+        Flushes a pending position first, like the play calls: it schedules audio.
+        """
         self._e._check_thread()
+        self._e._flush()
         _bwa.source_queue(self._e._raw, self._h, int(sound), loop)
 
     def clear_queue(self) -> None:
@@ -383,9 +394,14 @@ class Source(_Handle):
 
     # ---- per-frame state
     def set_pos(self, x: float, y: float, z: float) -> None:
-        """Room space, meters. Commit-gated: it lands at the next ``Engine.commit()``."""
+        """Room space, meters. Commit-gated: it lands at the next commit.
+
+        Auto-committed (see ``Engine.autocommit``); inside ``Engine.frame()`` it lands at block
+        exit.
+        """
         self._e._check_thread()
         _bwa.source_set_pos(self._e._raw, self._h, float(x), float(y), float(z))
+        self._e._touch()
 
     def set_orientation(self, qx: float, qy: float, qz: float, qw: float) -> None:
         self._e._check_thread()
@@ -480,7 +496,13 @@ class PushSource(Source):
     """
 
     def push(self, frames) -> int:
-        """Push mono float32 samples. Returns the count accepted; fewer means the ring is full."""
+        """Push mono float32 samples. Returns the count accepted; fewer means the ring is full.
+
+        Not a flush point, unlike the play calls. A push is the per-frame FEED of a voice, and a
+        frame loop that pushes every source would commit on the first push and render the rest of
+        the frame's positions late. Inside ``Engine.frame()`` a position set beside a push lands at
+        block exit, which is still before the next ``Engine.render_block()``.
+        """
         self._e._check_thread()
         np = _np()
         buf = np.ascontiguousarray(frames, dtype=np.float32).reshape(-1)
@@ -505,15 +527,19 @@ class Bed(_Handle):
     """
 
     def play(self, sound, loop: bool = False) -> None:
+        """Start this soundfield. Flushes a pending listener pose first, like ``Source.play``."""
         self._e._check_thread()
+        self._e._flush()
         _bwa.bed_play(self._e._raw, self._h, int(sound), loop)
 
     def play_at(self, sound, start_frame: int, loop: bool = False) -> None:
         self._e._check_thread()
+        self._e._flush()
         _bwa.bed_play_at(self._e._raw, self._h, int(sound), loop, int(start_frame))
 
     def play_loop(self, sound, loop_beg: int = 0, loop_end: int = 0) -> None:
         self._e._check_thread()
+        self._e._flush()
         _bwa.bed_play_loop(self._e._raw, self._h, int(sound), int(loop_beg), int(loop_end))
 
     def stop(self) -> None:
@@ -537,7 +563,11 @@ class Bed(_Handle):
         _bwa.bed_set_gain(self._e._raw, self._h, float(linear))
 
     def set_orientation(self, yaw_rad: float, pitch_rad: float = 0.0, roll_rad: float = 0.0) -> None:
-        """Turn the whole soundfield. Applied roll, then pitch, then yaw."""
+        """Turn the whole soundfield. Applied roll, then pitch, then yaw.
+
+        Not commit-gated: it lands on the next audio block by itself, so it needs no commit and
+        gets no auto-commit. Only position and pose are gated.
+        """
         self._e._check_thread()
         _bwa.bed_set_orientation(self._e._raw, self._h, float(yaw_rad), float(pitch_rad), float(roll_rad))
 
@@ -605,11 +635,15 @@ class Listener:
 
         The array render ignores orientation (real speakers, real ears); only the headphone
         renders read it. Identity faces ``ROOM_AHEAD``.
+
+        Auto-committed (see ``Engine.autocommit``); inside ``Engine.frame()`` it lands at block
+        exit.
         """
         self._e._check_thread()
         _bwa.set_listener_pose(
             self._e._raw, float(px), float(py), float(pz), float(qx), float(qy), float(qz), float(qw)
         )
+        self._e._touch()
 
     def get_pose(self):
         """The pose the engine is rendering with, as ``((x, y, z), (qx, qy, qz, qw))``."""
@@ -617,14 +651,19 @@ class Listener:
         return _bwa.get_listener_pose(self._e._raw)
 
     def set_extra(self, xyz=None) -> None:
-        """The OTHER occupants' positions, for compromise panning. None restores one listener."""
+        """The OTHER occupants' positions, for compromise panning. None restores one listener.
+
+        Commit-gated like the pose. Auto-committed (see ``Engine.autocommit``); inside
+        ``Engine.frame()`` it lands at block exit.
+        """
         self._e._check_thread()
         if xyz is None:
             _bwa.set_extra_listeners(self._e._raw, None)
-            return
-        np = _np()
-        arr = np.ascontiguousarray(xyz, dtype=np.float32).reshape(-1, 3)
-        _bwa.set_extra_listeners(self._e._raw, arr)
+        else:
+            np = _np()
+            arr = np.ascontiguousarray(xyz, dtype=np.float32).reshape(-1, 3)
+            _bwa.set_extra_listeners(self._e._raw, arr)
+        self._e._touch()
 
     def set_pose_prediction(self, lead_s: float) -> None:
         """Extrapolate the TRACKED position by ``lead_s`` seconds. 0 is off. Needs a tracker."""
@@ -643,10 +682,12 @@ class Engine:
         with bw_audio.Engine(profile=Profile.CAVE, sink=SinkType.MANUAL) as e:
             snd = e.load_sound("click.wav")
             src = e.create_source()
-            src.set_pos(1.0, 1.5, 0.0)
-            e.commit()
+            src.set_pos(1.0, 1.5, 0.0)      # committed for you
             src.play(snd)
             block = e.render_block()
+
+    Position and pose are commit-gated in the ABI, and this layer commits them for you. Read
+    ``autocommit`` and ``frame`` for the three modes and for when you want the frame block instead.
 
     Every field of ``bwa_desc`` is a keyword argument with the ABI's own zero default. Pass
     ``desc=`` a raw ``_bwa.desc`` instead to set them as a struct.
@@ -667,6 +708,7 @@ class Engine:
         sink_flags: int = 0,
         desc=None,
         thread_guard: bool = True,
+        autocommit: bool = True,
     ):
         if desc is None:
             desc = _bwa.desc()
@@ -684,6 +726,9 @@ class Engine:
 
         self._owner_thread = threading.get_ident() if thread_guard else None
         self._started = False
+        self._autocommit = bool(autocommit)
+        self._frame_depth = 0
+        self._dirty = False
         raw = _bwa.create(desc)
         if raw is None:
             raise BwaError("bwa_create failed: {0}".format(_bwa.last_error(None) or "no reason reported"))
@@ -701,6 +746,81 @@ class Engine:
                     self._owner_thread, threading.get_ident()
                 )
             )
+
+    # ---- the commit model
+    @property
+    def autocommit(self) -> bool:
+        """Commit a commit-gated write for you. True by default.
+
+        The ABI gates position and pose behind ``bwa_commit``, and a client that forgets it plays
+        sounds that never move. Python has no frame loop to hang one commit on, so this layer
+        commits after every such write instead, unless you are inside ``frame()``.
+
+        Set it False to get the C semantics back: nothing commits but ``commit()``, including a
+        ``frame()`` block's exit. Do that when you drive your own frame loop and want one commit
+        per iteration with no chance of a second.
+        """
+        return self._autocommit
+
+    @autocommit.setter
+    def autocommit(self, on: bool) -> None:
+        self._autocommit = bool(on)
+
+    @property
+    def pending(self) -> bool:
+        """Is a commit-gated write waiting for a commit? For a test or an assertion, not a loop."""
+        return self._dirty
+
+    def _touch(self) -> None:
+        """A commit-gated field was written. Land it now, or at the frame block's exit."""
+        self._dirty = True
+        if self._autocommit and self._frame_depth == 0:
+            self.commit()
+
+    def _flush(self) -> None:
+        """Land a pending write before something that starts or schedules audio.
+
+        This runs INSIDE a frame block too, because "set the position, play it" must never render
+        the first block at the old position. A block with no pending write commits nothing.
+        """
+        if self._dirty and self._autocommit:
+            self.commit()
+
+    @contextlib.contextmanager
+    def frame(self):
+        """Group this frame's writes into ONE commit, taken at the block's exit.
+
+        This is the coherence path. Inside the block a position or pose write only marks state
+        pending, so no block renders half of your update: two sources that move together are
+        rendered as having moved together.
+
+        ::
+
+            while running:
+                with engine.frame():
+                    for src, p in scene:
+                        src.set_pos(*p)
+                    engine.listener.set_pose(*head)
+
+        One block per iteration of a game-style loop, or around any multi-source update whose
+        intermediate state must not be rendered. Nesting is allowed and commits once, at the
+        outermost exit.
+
+        An exception leaving the block STILL commits. A half-pending scene outlives the exception
+        and would render at mixed positions from then on, which is a worse failure than the
+        exception itself and much harder to read. The exception propagates unchanged.
+
+        A play call inside the block flushes first (see ``Source.play``), and an explicit
+        ``commit()`` inside it lands at once and leaves nothing for the exit.
+        """
+        self._check_thread()
+        self._frame_depth += 1
+        try:
+            yield self
+        finally:
+            self._frame_depth -= 1
+            if self._frame_depth == 0 and self._dirty and self._autocommit:
+                self.commit()
 
     # ---- lifecycle
     def start(self) -> None:
@@ -901,19 +1021,28 @@ class Engine:
         return Bed(self, h)
 
     def play_oneshot(self, sound, x: float, y: float, z: float, gain: float = 1.0) -> bool:
-        """Fire and forget at a position. No handle; it never steals a voice, so it may be dropped."""
+        """Fire and forget at a position. No handle; it never steals a voice, so it may be dropped.
+
+        Flushes a pending listener pose first, like the other play calls.
+        """
         self._check_thread()
+        self._flush()
         return _bwa.play_oneshot(self._raw, int(sound), float(x), float(y), float(z), float(gain))
 
     # ---- events and frame boundary
     def commit(self) -> None:
         """Promote this frame's positions and pose as one snapshot, and drain the event ring.
 
-        Once per frame, last. Forget it and everything renders at its last committed position:
-        sounds play, nothing moves.
+        ``bwa_commit`` itself, and always available. You rarely need it: ``autocommit`` calls it
+        for you after a commit-gated write, and ``frame()`` calls it once at a block's exit. Call
+        it yourself when you turned ``autocommit`` off, or to land a block's writes early.
+
+        It also runs the pass that FILLS the event rings, so ``poll_ended()`` and ``poll_looped()``
+        read a frame-old picture without a commit ahead of them.
         """
         self._check_thread()
         _bwa.commit(self._raw)
+        self._dirty = False
 
     def poll_ended(self, cap: int = 64):
         """Handles whose voices ENDED since the last call, and the running dropped total.

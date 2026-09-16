@@ -280,6 +280,28 @@ void os_rwlock_unlock(os_rwlock* l)        { if (l) ReleaseSRWLockExclusive(srw_
 void os_rwlock_lock_shared(os_rwlock* l)   { if (l) AcquireSRWLockShared(srw_of(l)); }
 void os_rwlock_unlock_shared(os_rwlock* l) { if (l) ReleaseSRWLockShared(srw_of(l)); }
 
+/* ---- dynamic libraries ---- */
+
+/* LoadLibraryW rather than LoadLibraryA, for the same reason os_fopen calls _wfopen: the shim's
+ * strings are UTF-8 and the narrow entry point reads the process ANSI codepage. Nothing in the
+ * engine loads a library this way today - the two Linux device backends are the only callers - so
+ * this half exists to keep the shim ONE API rather than a Linux-only corner. */
+os_dl os_dl_open(const char* name) {
+    if (!name || !*name) return NULL;
+    wchar_t w[OS_PATH_WIDE_MAX];
+    if (os_utf8_to_wide(name, w, OS_PATH_WIDE_MAX) != 0) return NULL;
+    return (os_dl)LoadLibraryW(w);
+}
+
+void* os_dl_sym(os_dl h, const char* symbol) {
+    if (!h || !symbol) return NULL;
+    /* GetProcAddress hands back a FARPROC; the cast to void* is the same object/function pointer
+     * pun dlsym's signature forces on every POSIX caller, and it is what the callers cast back. */
+    return (void*)GetProcAddress((HMODULE)h, symbol);
+}
+
+void os_dl_close(os_dl h) { if (h) FreeLibrary((HMODULE)h); }
+
 /* ---- strings ---- */
 
 char* os_strdup(const char* s) { return s ? _strdup(s) : NULL; }
