@@ -23,6 +23,12 @@
 
 set -eu
 
+# cibuildwheel mounts the checkout at /project and runs this as root, while the files belong to
+# the runner's user; git refuses such a repository ("dubious ownership") and the recipe's
+# submodule and patch steps go through git. Trust every path in this throwaway container. (Docker
+# Desktop on Windows presents the mount as root-owned, which is why a local run never showed it.)
+git config --global --add safe.directory '*'
+
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$ROOT"
 
