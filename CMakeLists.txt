@@ -381,6 +381,14 @@ if(UNIX AND NOT APPLE)
   target_compile_options(bwa_core PRIVATE -ffunction-sections -fdata-sections)
   target_compile_options(bw_audio PRIVATE -ffunction-sections -fdata-sections)
   target_link_options(bw_audio PRIVATE -Wl,--gc-sections)
+  # A GNU build id, EXPLICITLY. Debian's and Ubuntu's gcc pass --build-id through their specs,
+  # so a runner build always had one; the manylinux image's gcc does not, and the first
+  # container-built engine carried no .note.gnu.build-id at all. Two consumers need it: the
+  # CI check that the release wheel's stripped engine is the SAME LINK as the tested SDK's
+  # (bytes cannot be compared across a strip, the note survives one), and the split
+  # libbw_audio.so.debug sidecar, which gdb and every symbolizer match to the binary by this
+  # id before they fall back to the gnu_debuglink name. Costs 20 bytes.
+  target_link_options(bw_audio PRIVATE -Wl,--build-id=sha1)
 endif()
 
 if(BWA_TRACY)

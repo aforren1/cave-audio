@@ -2239,8 +2239,11 @@ jobs:
           # THE ONE-ENGINE ASSERTION. The wheel's copy is stripped by the binding's own install
           # rule, so it cannot be compared byte for byte; the GNU build id survives --strip-debug
           # and identifies the link that produced both.
-          a=$(readelf -n engine-sdk/lib/libbw_audio.so        | grep -A1 'Build ID' | tail -1)
-          b=$(readelf -n wheel-inspect/bw_audio/libbw_audio.so | grep -A1 'Build ID' | tail -1)
+          # The engine is linked with --build-id=sha1 on purpose (root CMakeLists): the manylinux
+          # gcc emits none by default, and the first run compared two empty strings here.
+          # readelf prints the id on its own line, `Build ID: <hex>`, so match that directly.
+          a=$(readelf -n engine-sdk/lib/libbw_audio.so        | grep -oE 'Build ID: [0-9a-f]+')
+          b=$(readelf -n wheel-inspect/bw_audio/libbw_audio.so | grep -oE 'Build ID: [0-9a-f]+')
           echo "sdk [$a] wheel [$b]"
           test -n "$a" && test "$a" = "$b"
 
