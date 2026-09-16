@@ -535,6 +535,12 @@ NB_MODULE(_bwa, m) {
         return cm;
     }, "e"_a, "The device-vs-host clock fit, or None until it has about a second of stamps.");
     m.def("get_output_latency_frames", [](Engine& e) { return bwa_get_output_latency_frames(live(e)); }, "e"_a);
+    /* No engine argument, and no GIL release: it is a counter read, and the round trip through
+     * nanobind is already most of the cost that bounds the sandwich (see bw_audio.ClockBridge). */
+    m.def("host_time_ns", &bwa_host_time_ns,
+          "The engine's host clock right now, in nanoseconds on the same epoch get_clock's "
+          "host_time_ns uses. QPC on Windows, mach_absolute_time on macOS, CLOCK_MONOTONIC on "
+          "Linux and Android. No engine needed.");
 
     /* ---- push sources ---- */
     m.def("source_create_push", [](Engine& e) { return bwa_source_create_push(live(e)); }, "e"_a);

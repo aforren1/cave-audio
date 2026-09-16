@@ -4,6 +4,21 @@ All notable changes to `com.brainworks.bw_audio`.
 
 ## [Unreleased]
 
+### Added: `Engine.HostTimeNs`, a direct read of the engine's host clock (ABI 0.15.0)
+
+`bwa_host_time_ns` reads the same monotonic clock `GetClock`'s `hostTimeNs` is stamped with (QPC on
+Windows, `CLOCK_MONOTONIC` on Linux and Android, `mach_absolute_time` on macOS). It takes no engine
+handle, so it works before an `Engine` exists.
+
+Sandwich it between two reads of your own clock and the epoch offset becomes a measurement with an
+error bound you can see, instead of an estimate: `a = Time.realtimeSinceStartupAsDouble;
+h = Engine.HostTimeNs; b = Time.realtimeSinceStartupAsDouble;` gives `offset = h*1e-9 - (a+b)/2`,
+bounded by `(b-a)/2`, with no convergence period.
+
+`DspTimeFramesAt` and `RealtimeAt` are unchanged and remain the default path: their decaying-max
+estimator over the block stamps needs no extra call and self-corrects drift. Reach for `HostTimeNs`
+when you want a bounded one-shot anchor, or have another timeline to reconcile.
+
 ### Added: the package ships Linux (x86_64) and macOS (universal) plugins
 
 `Runtime/Plugins/Linux/x86_64/libbw_audio.so` and `Runtime/Plugins/macOS/libbw_audio.dylib`, so the

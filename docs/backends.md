@@ -115,12 +115,24 @@ numpy view so the offline shape costs no copy. PsychoPy is Python, so it uses th
 directly. `bindings/python/examples/offline_render.py` and `live_onset.py` are the two shapes above,
 runnable.
 
-Psychtoolbox is the one still open. It is MATLAB or Octave: a MEX on the classic C MEX API, which
-Octave implements, and not the MATLAB-only C++ Data API. It does not exist yet.
+**The MATLAB and Octave binding exists too** ([`bindings/matlab/`](../bindings/matlab/)). It is the
+MEX this section used to describe as future work: one gateway dispatching on a subcommand string,
+the shape PsychPortAudio uses, written against the classic C MEX API, which Octave implements, and
+not the MATLAB-only C++ Data API. One source builds a binary for each interpreter. Psychtoolbox is
+MATLAB or Octave, so it uses that package, and
+`bindings/matlab/examples/offline_render.m` and `live_onset.m` are the two shapes above, runnable.
+`AudioTunnel3DDemo_bwa.m` is a third: Psychtoolbox's own `AudioTunnel3DDemo2` idea, re-done against
+this engine.
 
-One rule holds for both, and the Python binding enforces it by refusing to expose the call: never
-install the audio-thread capture tap (`bwa_set_output_capture`) from an interpreter, even through a
-wrapper that takes the GIL. The manual sink is the offline path.
+One rule the MEX carries that the Python binding does not have to: PsychPortAudio and the engine
+must not open the same device exclusively. Either the engine owns the device, or PsychPortAudio
+does and the engine pre-renders through the manual sink, or both run shared and give up the lowest
+latency.
+
+One rule holds for both bindings, and both enforce it by refusing to expose the call: never install
+the audio-thread capture tap (`bwa_set_output_capture`) from an interpreter, even through a wrapper
+that takes the GIL. The manual sink is the offline path. The MEX keeps the subcommand and raises
+with the reason, so a reader finds the explanation where they looked for the call.
 
 Out of scope, on purpose:
 
@@ -1443,8 +1455,8 @@ Known, deliberately not done yet. Each names its trigger.
       to fit one emulator - the same call the Apple row above makes, and for the same reason. A
       headset that also flaps is the finding; a headset that sits well under is the reason to
       leave it.
-- [ ] Which binding the experiments need first: the nanobind module for PsychoPy, or the MEX
-      for Psychtoolbox and Octave. Neither is in this spec.
+- [ ] Which binding the experiments reach for first, now that both exist: the nanobind module for
+      PsychoPy, or the MEX for Psychtoolbox and Octave. Both are off-hardware verified only.
 - [ ] The ASIO reset-request plumbing, when it is written, uses the `device_lost` design above
       rather than a second mechanism.
 - [ ] `cave_both` on the rig: ASIO for the array and WASAPI for the monitor, at once, with the

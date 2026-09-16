@@ -290,7 +290,31 @@ bindings/
                        ${CMAKE_SOURCE_DIR} and a top-level project here would silently ship a
                        no-SDK, no-ASIO engine. The package version is BWA_VERSION from the header,
                        so a wheel cannot claim a version the library is not. Audience: PsychoPy
-                       (Psychtoolbox is MATLAB and gets a MEX later).
+                       (Psychtoolbox is MATLAB and Octave, and gets the MEX below).
+  matlab/              ONE classic-C-MEX gateway (opt-in -DBWA_BUILD_MATLAB=ON), for Psychtoolbox.
+                       Two layers like python's: bwa_mex is the RAW 1:1 ABI, dispatching on a
+                       SUBCOMMAND STRING (`bwa_mex('source_play', h, src, snd, false)`) because that
+                       is PsychPortAudio's own shape and this audience reads it without being told;
+                       +bwa is the class layer (Engine / Source / PushSource / Bed / Sound /
+                       Listener / ClockBridge, plus Const for the enums) carrying the SAME
+                       auto-commit model the python layer has, in the form MATLAB can express
+                       (beginFrame/endFrame plus an onCleanup-based frame()). Same one EXCLUSION,
+                       bwa_set_output_capture, kept as a subcommand that REFUSES with the reason so
+                       a reader finds it where they looked. The API pin is the whole portability
+                       story: the classic C MEX API is what OCTAVE implements, so one source builds
+                       for both interpreters — but they need different BINARIES (different mexext,
+                       different compiler), staged apart under bin/<matlab|octave>/<platform>/ and
+                       picked at run time by +bwa/setup.m. The one-control-thread rule is free here
+                       (a MEX call runs on the interpreter's main thread), so what needs care is
+                       LIFETIME: mexLock while any engine is live so `clear mex` cannot unload the
+                       gateway under a running audio thread, and mexAtExit stops + destroys the rest.
+                       render_block hands back an [nframes, channels] single matrix, a COPY where
+                       python's is a view (an mxArray cannot alias engine memory) — one memcpy and no
+                       transpose, because the planar block IS column-major for that shape. Octave's
+                       classdef support is partial and the layer is written to the intersection; the
+                       one construct that BITES rather than failing to parse is a reference cycle
+                       (Octave refcounts handle objects), so Engine.listener is DEPENDENT and not a
+                       stored object pointing back.
   unreal/              module + component — planned, not yet implemented (docs/integration.md has the notes).
 docs/                  Specs. Start here.
 examples/              cave_layout.json (see docs/layout-schema.md); minimal.c (the client lifecycle),
@@ -351,7 +375,17 @@ than passing. The UTF-8 path work added three (`utf8_path`, `idle`, `cave_both`)
 platform. `-DBWA_BUILD_PYTHON=ON` adds three more on top of whatever the rest of the flags give
 (`python_bindings` plus `python_example_offline_render` / `python_example_live_onset`), so the
 full-options Windows tree is 48 and the default Windows tree 41; `python_bindings` reports SKIPPED
-rather than failing when pytest is missing, because a C developer should not need it. CI also
+rather than failing when pytest is missing, because a C developer should not need it.
+`-DBWA_BUILD_MATLAB=ON` adds up to FOUR PER INTERPRETER it finds (`<matlab|octave>_tests` plus
+`_example_offline_render` / `_example_live_onset` / `_example_AudioTunnel3DDemo_bwa`), so a Windows
+box with both MATLAB and Octave installed reaches 53 (45 + 8) and 56 at full options, and a Linux
+box with Octave alone reaches 42 (38 + 4). Each suite exits 77 (SKIPPED) when the MEX for the running interpreter
+was not staged, and neither half is registered when its toolchain was not found at configure time -
+ctest cannot run a MATLAB test with no MATLAB. In CI the MATLAB MEX is built INSIDE each desktop
+job (so it links that job's own engine, backends intact) and the windows job assembles the three
+into ONE toolbox folder, bin/{win64,glnxa64,maca64}, shipped as a twelfth release asset; Octave is
+built and ctested on Linux only. Those MATLAB steps are UNVERIFIED LOCALLY - no runner MATLAB is
+reachable from here, so they follow mathworks/ci-configuration-examples. CI also
 builds a `cp312-abi3` WHEEL on each of the three desktops, installs it into a fresh venv, and runs
 that same pytest suite from the INSTALLED wheel rather than the source tree - shipped as
 `bw_audio-python-<platform>-<ver>`. Those three are the FAST GATE and are tagged for the runner

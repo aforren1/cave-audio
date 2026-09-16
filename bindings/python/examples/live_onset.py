@@ -3,9 +3,10 @@
 
 The engine owns the device and the experiment schedules onsets ahead of time. Wall time and the
 dsp-sample clock are different clocks, so the recipe is docs/api.md's "Land a sound on a visual
-event": map your wall time to a dsp sample with the driver-stamped pair (`Engine.clock`), subtract
-the device's render-to-DAC delay (`Engine.output_latency_frames`), and schedule with
-`Source.play_at`.
+event". `Engine.bridge()` is that recipe: it measures the offset between `time.perf_counter()` and
+the engine's host clock by sandwiching `bw_audio.host_time_ns()` between two reads of yours, then
+maps a wall time to a dsp sample with the driver-stamped pair. `ClockBridge.play_at` also takes off
+the device's render-to-DAC delay (`Engine.output_latency_frames`) for you.
 
 The one thing the engine cannot see is YOUR display delay. Measure draw-to-photons once, with a
 photodiode or an AV-sync clapper, and that single constant aligns the whole chain.
@@ -30,49 +31,6 @@ BLK = 256
 DISPLAY_SECONDS = 0.030   # draw -> photons. Yours to measure; this is a plausible placeholder.
 
 
-class WallToDsp:
-    """The wall-clock to dsp-sample bridge from docs/api.md, in Python.
-
-    The driver-stamped (sample, host time) pair is exact, so the only thing to estimate is the
-    constant epoch offset between the device's host clock and `time.perf_counter()`. Each refresh
-    observes one candidate offset; a decaying max converges on the true one and tracks ppm drift,
-    which is what makes this hold for a two-hour session instead of only near the anchor.
-    """
-
-    def __init__(self, engine):
-        self.e = engine
-        self.valid = False
-        self.sample = 0
-        self.host = 0.0
-        self.off = 0.0
-
-    def refresh(self):
-        """Call once per frame, before any `at()`."""
-        pair = self.e.clock
-        if pair is None:
-            self.valid = False
-            return
-        cs, ct = pair
-        host = ct * 1e-9
-        cand = host - time.perf_counter()
-        if not self.valid or cs < self.sample or abs(cand - self.off) > 0.5:
-            self.off = cand                      # first pair, a device restart, an epoch change
-        else:
-            self.off = max(cand, self.off - 2e-6)  # decaying max
-        self.sample, self.host, self.valid = cs, host, True
-
-    def at(self, wall_seconds):
-        """A `time.perf_counter()` reading, as a dsp sample."""
-        fs = float(self.e.sample_rate)
-        if self.valid:
-            d = self.sample + (wall_seconds + self.off - self.host) * fs
-        else:
-            # Before the first stamped block: pair the block counter with your own clock. That is
-            # block-granular, about 5 ms at 256/48 kHz, already under half a 60 Hz frame.
-            d = self.e.dsp_time_frames + (wall_seconds - time.perf_counter()) * fs
-        return max(0, int(d))
-
-
 def make_click():
     """A short decaying click, pushed rather than loaded, so the example needs no asset."""
     n = SR // 10
@@ -90,10 +48,12 @@ def run(sink, profile, trials, lead_seconds, device=None, verbose=True):
     scheduled = []
     try:
         e.start()
+        clock = e.bridge()          # time.perf_counter by default; the offset is measured here
         if verbose:
             print("backend: {0}".format(e.backend))
             print("output latency: {0} frames ({1:.1f} ms)".format(
                 e.output_latency_frames, e.output_latency_seconds * 1e3))
+            print("clock offset measured to within {0:.1f} us".format(clock.error_ns * 1e-3))
             h = e.health
             print("dropout counters: {0}".format(
                 "measurable" if h is not None else "NOT measurable on this sink"))
@@ -102,19 +62,17 @@ def run(sink, profile, trials, lead_seconds, device=None, verbose=True):
         src = e.create_push_source()
         src.set_pos(0.0, 1.5, 2.0)   # commit-gated, and this layer commits it for you
 
-        clock = WallToDsp(e)
         for trial in range(trials):
-            clock.refresh()
-
             # The visual event: drawn now, seen one display delay later.
             t_seen = time.perf_counter() + lead_seconds + DISPLAY_SECONDS
-            heard = clock.at(t_seen)
+            heard = clock.dsp_at(t_seen)
             latency = e.output_latency_frames
             start = heard - latency if heard > latency else 0
 
             # A push source has no play call, so this trial pushes its samples and the ENGINE
             # consumes them as its clock reaches them. For a file asset the whole trial is
-            # `src.play_at(sound, start)` instead, which is the sample-accurate form.
+            # `clock.play_at(src, thump, t_seen)`, which is the sample-accurate form and subtracts
+            # the output latency itself.
             src.push(click)
             scheduled.append((start, e.dsp_time_frames))
             if verbose:
@@ -130,6 +88,12 @@ def run(sink, profile, trials, lead_seconds, device=None, verbose=True):
                 time.sleep(0.005)
 
         if verbose:
+            # One refresh per session is plenty for perf_counter, which IS the engine's clock. The
+            # number to watch over a long session is the drift between the DEVICE and the host.
+            clock.refresh()
+            ppm = clock.drift_ppm
+            print("device drift: {0}".format(
+                "not fitted yet" if ppm is None else "{0:+.2f} ppm".format(ppm)))
             h = e.health
             if h is not None:
                 print("xruns {0} in {1} blocks, peak load {2:.2f}".format(h.xruns, h.blocks, h.peak_load))
@@ -191,11 +155,28 @@ def selftest():
           "{0} against {1}".format(lead_frames, want))
 
     with bwa.Engine(sink=bwa.SinkType.NULL, sample_rate=SR, block_size=BLK) as e:
-        c = WallToDsp(e)
-        c.refresh()
+        c = e.bridge()
+        # The bound is what the sandwich BUYS over an estimator: it is measured, not assumed.
+        check("the two-reads error bound is under 100 us", c.error_ns < 100e3,
+              "{0:.1f} us".format(c.error_ns * 1e-3))
         # Without a stamped pair the bridge must still answer, block-granular, rather than fail.
-        check("the bridge answers before the first stamped block", c.at(time.perf_counter()) >= 0)
-        check("a past wall time clamps at 0", c.at(time.perf_counter() - 1e6) == 0)
+        check("the bridge answers before the first stamped block", c.dsp_at(time.perf_counter()) >= 0)
+        check("a past wall time clamps at 0", c.dsp_at(time.perf_counter() - 1e6) == 0)
+
+        e.start()
+        deadline = time.perf_counter() + 1.0
+        while e.clock is None and time.perf_counter() < deadline:
+            time.sleep(0.01)
+        c.refresh()
+        now_dsp = c.dsp_at(time.perf_counter())
+        # "Now" on your clock is the engine's "now" to within the stamp age plus the bound. A few
+        # blocks of slack covers a host-paced sink and a preempted interpreter.
+        check("dsp_at(now) is within a few blocks of dsp_time_frames",
+              abs(now_dsp - e.dsp_time_frames) < 8 * BLK,
+              "{0} against {1}".format(now_dsp, e.dsp_time_frames))
+        t = time.perf_counter() + 0.25
+        check("dsp_at and time_at round-trip", abs(c.time_at(c.dsp_at(t)) - t) < 1e-3,
+              "{0:.6f} against {1:.6f}".format(c.time_at(c.dsp_at(t)), t))
 
     print("FAILURES: {0}".format(failures) if failures else "all checks passed")
     return 1 if failures else 0

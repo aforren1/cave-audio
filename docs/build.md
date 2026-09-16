@@ -99,6 +99,7 @@ Everything beyond the DLL + test suite is opt-in; the default build stays lean.
 | `BWA_BUILD_CALIBRATE` | OFF | `bwa_calibrate` + `bwa_zylia_probe` |
 | `BWA_BUILD_GODOT` | OFF | the Godot GDExtension (fetches godot-cpp - a multi-minute first build). `GODOTCPP_TARGET` picks the library flavor (`editor` default); `tools/godot/pack.ps1` builds both shippable ones. See `bindings/godot/README.md` |
 | `BWA_BUILD_PYTHON` | OFF | the Python binding (`_bwa`, nanobind). Needs Python 3.9 or later with `nanobind` importable by the interpreter CMake finds; 3.12 or later gets the stable ABI. Adds three ctests (`python_bindings` plus the two examples). `uv build --wheel` in `bindings/python` takes this same path. See `bindings/python/README.md` |
+| `BWA_BUILD_MATLAB` | OFF | the MATLAB and Octave binding (`bwa_mex`, a classic C MEX gateway). Builds whichever of the two toolchains CMake finds, and both when both are there: MATLAB through `matlab_add_mex` (needs a configured C compiler, `mex -setup C`), Octave through `mkoctfile`. Adds up to four ctests per interpreter found. See `bindings/matlab/README.md` |
 | `BWA_ASAN` | OFF | builds `test_sound` with AddressSanitizer (MSVC; needs tests ON) |
 | `BWA_TRACY` | OFF | Tracy profiler instrumentation (fetches Tracy; collects only while a profiler is attached). See [profiling.md](./profiling.md) |
 | `BWA_BUILD_BENCH` | OFF | the profiling benches (`bwa_profile_bench` + `bwa_bench_situations`). See [profiling.md](./profiling.md) |
@@ -396,6 +397,29 @@ older UPM parsers reject. When git cannot answer (no tag, shallow clone, no git 
   binding still builds and tests where the engine was just built, and they tag for the machine
   that built them. The Android job builds no wheel: there is no Python there.
   `bindings/python/README.md` is the manual.
+- **The MATLAB MEX is built inside each desktop job, and the three become one toolbox.** A MEX is
+  per platform, so the `windows`, `linux` and `macos` jobs each set up MATLAB with
+  [matlab-actions/setup-matlab](https://github.com/matlab-actions/setup-matlab) (no license token
+  is needed on a GitHub-hosted runner for a public repository), reconfigure **the same build tree**
+  with `BWA_BUILD_MATLAB=ON`, build only the MEX target, and run the suite and all three examples
+  through `matlab-actions/run-command`. Building in place is the point: the MEX links the engine
+  that job already produced, with ASIO and WASAPI on Windows, JACK and ALSA on Linux, and the
+  universal dylib on macOS, and nothing is rebuilt. Each job asserts the configure log says
+  `MATLAB MEX enabled`, because the option skips silently when it finds no toolchain and a job that
+  built nothing would otherwise pass.
+  The `windows` job then assembles `bw_audio-matlab/`: `+bwa`, the examples, the README, the
+  licenses, and `bin/win64`, `bin/glnxa64` and `bin/maca64` each holding that platform's MEX plus
+  its engine library. It asserts all three are present before zipping. That folder uploads as
+  `bw_audio-matlab-<ver>-r<N>` and, on a tag, as `bw_audio-matlab-<tag>.zip`.
+  The macOS runner is Apple silicon, so its MEX is `.mexmaca64` against the universal dylib; an
+  Intel Mac would need a MEX built on one, which nothing here has.
+  **Octave is Linux-only in CI.** The `linux` job installs `octave` and `liboctave-dev` from apt
+  and runs `octave_tests` plus the three examples through ctest, and its artifact carries that MEX.
+  Installing Octave on the Windows and macOS runners is a documented follow-up; an Octave user on
+  those platforms builds with `mkoctfile`, which is one command.
+  **Unverified locally:** nothing here can run a GitHub-hosted MATLAB, so those steps were written
+  from [mathworks/ci-configuration-examples](https://github.com/mathworks/ci-configuration-examples)
+  rather than from a run. `bindings/matlab/README.md` is the manual.
 - **The `wheels` job builds the two wheels a release ships.** A wheel `uv build` produces on a
   runner is tagged for that runner: the image's glibc on Linux, the runner's own architecture on
   macOS. Neither is what a release hands a stranger. So a separate job runs
@@ -473,7 +497,7 @@ older UPM parsers reject. When git cannot answer (no tag, shallow clone, no git 
 - **The Windows job waits for all three cross-builds.** `needs: [android, linux, macos]`, because
   it is the only place that packs the bindings and each package carries every platform's engine
   library. The three run in parallel, so the wait is the slowest of them.
-- **A release carries ELEVEN assets**, because workflow artifacts expire (30 days) and a
+- **A release carries TWELVE assets**, because workflow artifacts expire (30 days) and a
   release doesn't:
   - `com.brainworks.bw_audio-<ver>.tgz`: the Unity package.
   - `bw_audio-godot-<ver>.zip`: the installable Godot addon.
@@ -490,6 +514,14 @@ older UPM parsers reject. When git cannot answer (no tag, shallow clone, no git 
     It is **not code-signed and not notarized**: Gatekeeper blocks a downloaded unsigned library,
     so clear the quarantine flag (`xattr -dr com.apple.quarantine <folder>`) after unzipping.
     Distribution outside the lab would need a Developer ID signature and notarization.
+  - `bw_audio-matlab-<tag>.zip`: the MATLAB and Octave toolbox. `+bwa`, the examples, the
+    README and the licenses, plus `bin/win64`, `bin/glnxa64` and `bin/maca64`, each holding that
+    platform's MEX and its engine library. Unzip it and `addpath` the folder; there is nothing to
+    build. The MEX files are MATLAB's, one per platform, built inside each desktop job. An Octave
+    user needs their own (Octave's extension is `.mex` everywhere, so three could not share this
+    layout), which `mkoctfile` builds in one command; CI builds the Linux one and ships it in the
+    `bw_audio-matlab-linux-x64-*` workflow artifact. The macOS MEX is arm64 and unsigned, so it
+    takes the same quarantine step as the macOS engine above.
   - `bw_audio-asio-sdk-src-<tag>.zip`: the ASIO SDK source statically linked into the DLL,
     kept as its own asset so it accompanies the binaries (GPLv3 corresponding source)
     without bloating either the engine `.zip` or the `.tgz`.

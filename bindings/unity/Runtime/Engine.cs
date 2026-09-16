@@ -896,6 +896,17 @@ namespace BwAudio
         /// Manual report 0, and so does a backend this build does not carry.</summary>
         public static uint DeviceCount(BwaSinkType backend) => Bwa.bwa_get_device_count(backend);
 
+        /// <summary>The engine's host clock right now, NANOSECONDS on the same backend-defined epoch
+        /// GetClock's hostTimeNs uses (QPC on Windows, CLOCK_MONOTONIC on Linux and Android,
+        /// mach_absolute_time on macOS). Engine-free, so it answers before an Engine exists.
+        /// <para>Sandwich it between two reads of your own clock to MEASURE the epoch offset rather
+        /// than estimate it: <c>a = Time.realtimeSinceStartupAsDouble; h = Engine.HostTimeNs;
+        /// b = Time.realtimeSinceStartupAsDouble;</c> gives <c>offset = h*1e-9 - (a+b)/2</c> with the
+        /// error bounded by <c>(b-a)/2</c> and no convergence period. DspTimeFramesAt's decaying-max
+        /// estimator over block stamps stays the default and needs no such read; this is for a caller
+        /// that wants a bounded, one-shot anchor, or that has its own timeline to reconcile.</para></summary>
+        public static ulong HostTimeNs => Bwa.bwa_host_time_ns();
+
         /// <summary>Device `index`'s friendly name on `backend`, or null when out of range.</summary>
         public static string DeviceName(BwaSinkType backend, uint index) => Bwa.DeviceName(backend, index);
 

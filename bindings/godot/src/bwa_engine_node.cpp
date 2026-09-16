@@ -1173,6 +1173,10 @@ PackedFloat32Array BwaEngine::render_block() {
 
 int BwaEngine::get_device_count(Sink backend) { return (int)bwa_get_device_count((bwa_sink_type)backend); }
 
+/* int64_t rather than the ABI's uint64_t because Godot's Variant has no unsigned int: the clock is
+ * a monotonic counter of nanoseconds, which does not reach the sign bit for ~292 years of uptime. */
+int64_t BwaEngine::get_host_time_ns() { return (int64_t)bwa_host_time_ns(); }
+
 String BwaEngine::get_device_name(Sink backend, int index) {
 	char buf[256];
 	if (index < 0 || !bwa_get_device_name((bwa_sink_type)backend, (uint32_t)index, buf, sizeof buf)) {
@@ -1491,6 +1495,8 @@ void BwaEngine::_bind_methods() {
 			"BwaEngine", D_METHOD("get_asio_driver_count"), &BwaEngine::get_asio_driver_count);
 	ClassDB::bind_static_method("BwaEngine", D_METHOD("get_asio_driver_name", "index"),
 			&BwaEngine::get_asio_driver_name);
+	ClassDB::bind_static_method(
+			"BwaEngine", D_METHOD("get_host_time_ns"), &BwaEngine::get_host_time_ns);
 	ClassDB::bind_static_method("BwaEngine", D_METHOD("get_version"), &BwaEngine::get_version);
 	ClassDB::bind_static_method("BwaEngine", D_METHOD("room_ahead"), &BwaEngine::room_ahead);
 	ClassDB::bind_static_method("BwaEngine", D_METHOD("room_up"), &BwaEngine::room_up);

@@ -874,3 +874,40 @@ about 3 us per absent library, against the 3.7 ms an explicit JACK open costs wh
 present and has to find out there is no server. And the whole path is testable on a box that HAS
 the libraries, through a `bwa_sink_dl_override` hook that re-aims both loaders at a soname that
 cannot exist; breaking the retry on purpose (caching the outcome forever) turns that section red.
+
+**A direct host-clock read (`bwa_host_time_ns`, ABI 0.14 to 0.15, 2026-09-16).** Every backend
+stamps `bwa_timestamp.system_time_ns` on the OS monotonic clock, but nothing let a CLIENT read that
+clock, so mapping a caller's wall time onto the dsp clock meant estimating the epoch offset from the
+block stamps: the decaying max in `Engine.DspTimeFramesAt`, `api.md`'s `clock_refresh`, and
+`live_onset.py`'s inline bridge. That estimator works and stays as the fallback, but it has a
+convergence period and no error bound. One engine-free counter read turns the offset into a
+measurement: `a = my_clock(); h = bwa_host_time_ns(); b = my_clock()` gives `h - (a+b)/2` with the
+error bounded by `(b-a)/2`, which the caller can SEE. Measured on this Windows box through nanobind
+it is about 0.1 us, against the estimator's unbounded, unknowable error. The survey that had to
+come first: WASAPI, ALSA, AAudio and the null sink read `os_monotonic_ns` (or the same
+`CLOCK_MONOTONIC` through the device API), ASIO takes the driver's `ASIOTime.systemTime`, which on
+Windows is the high-resolution counter and falls back to QPC when the driver omits it, and JACK
+takes `jack_get_cycle_times`, which is `CLOCK_MONOTONIC` microseconds through the server's DLL
+filter. Same clock everywhere, so the offset holds on all five. The manual sink is the one
+exception and always was: its stamps are synthesized from the sample position, so they are exact
+for arithmetic and unrelated to wall time. The Python side is `Engine.bridge() -> ClockBridge`
+(`offset_ns`, `error_ns`, `dsp_at`, `time_at`, `play_at`, `drift_ppm`), which is what PsychoPy
+wants: its `core.getTime` is `perf_counter`, which IS this clock on every platform. The trap worth
+carrying is in the table that went into `api.md`: `time.monotonic` on Windows is `GetTickCount64`
+at about 15.6 ms, and Psychtoolbox `GetSecs` on Linux is `CLOCK_REALTIME`, which NTP steps. Neither
+is wrong to use, both just need re-measuring at a different rate, and the binding does not police
+the caller's clock.
+
+**A MATLAB and Octave binding (a MEX gateway, 2026-09-16).** `bindings/matlab/` closes the last
+binding `docs/backends.md` had open, for Psychtoolbox. One `bwa_mex` gateway dispatching on a
+subcommand string, which is PsychPortAudio's own shape, plus a `+bwa` class layer carrying the same
+auto-commit model the Python layer has. Three findings are worth the line. The classic C MEX API
+pin is what makes ONE source serve both interpreters, but they still need different binaries, so
+the build stages them apart and `+bwa/setup.m` picks at run time. Octave refcounts handle objects
+and cannot collect a REFERENCE CYCLE, so a stored `Engine.listener` pointing back at the engine
+made `clear e` leak the device until the interpreter exited; it is a dependent property now, and
+the suite's own mexLock-based leak check is what caught it. And MinGW's `ld` as shipped with Octave
+10.1 for Windows hits an internal error ("aborting at ldlang.c:527 in compare_section") linking this
+object with no sort order requested, which `-Wl,--sort-section=name` fixes outright; the same
+mkoctfile needs `-Wl,-rpath,\$ORIGIN` escaped on Linux, because it hands its link line to a shell
+that would otherwise expand it to an empty runpath.

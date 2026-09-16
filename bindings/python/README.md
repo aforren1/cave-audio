@@ -28,7 +28,7 @@ with bwa.Engine(profile=bwa.Profile.BINAURAL) as engine:
 From a wheel:
 
 ```
-uv pip install bw_audio-0.14.0-cp312-abi3-win_amd64.whl
+uv pip install bw_audio-0.15.0-cp312-abi3-win_amd64.whl
 ```
 
 Releases carry one wheel per platform, and each one is built for more than the machine that built
@@ -90,8 +90,8 @@ Three places where a literal binding cannot express the C:
   raises instead of reading freed memory.
 
 **`bw_audio` is the Pythonic layer.** Pure Python over the raw layer. It gives you an `Engine`
-context manager, `Sound`, `Source`, `PushSource`, `Bed` and `Listener` objects, exceptions instead
-of return codes, and the one-control-thread guard below. It adds no semantics of its own, so when
+context manager, `Sound`, `Source`, `PushSource`, `Bed`, `Listener` and `ClockBridge` objects,
+exceptions instead of return codes, and the one-control-thread guard below. It adds no semantics of its own, so when
 a method's behavior is in question, the header comment is the answer. It adds one semantic and
 only one: it commits for you. See "Commit model" below.
 
@@ -228,20 +228,34 @@ writing a wav with numpy alone.
 ## The live shape
 
 The engine owns the device and you schedule onsets ahead of time. Wall time and the dsp-sample
-clock are different clocks, so map one to the other with the driver-stamped pair, subtract the
-device's render-to-DAC delay, and schedule:
+clock are different clocks, so `Engine.bridge()` measures the offset between them and maps one to
+the other:
 
 ```python
-pair = engine.clock                      # (dsp_sample, host_time_ns), stamped inside the callback
-heard = wall_to_dsp(t_event)             # your wall clock -> a dsp sample
-latency = engine.output_latency_frames   # render -> DAC
-source.play_at(sound, max(0, heard - latency))
+clock = engine.bridge()                  # measures now; default caller clock is time.perf_counter
+print(clock.error_ns)                    # the bound on that measurement, in nanoseconds
+
+clock.play_at(source, sound, t_event)    # heard at t_event: it takes off the output latency
+dsp = clock.dsp_at(t_event)              # or do it yourself
+t = clock.time_at(dsp)                   # the inverse
 ```
 
-The engine reports its own output chain. It cannot see your display delay: measure draw to photons
-once, with a photodiode or an AV-sync clapper, and that one constant aligns the whole chain. The
-full recipe, including the drift-tracking offset estimator, is
-[docs/api.md](../../docs/api.md#land-a-sound-on-a-visual-event); a Python version of it is in
+The bridge sandwiches `bw_audio.host_time_ns()`, which reads the engine's own host clock, between
+two reads of yours. The error is bounded by half that round trip, reported as `error_ns`, and there
+is no convergence period: one `refresh()` is a measurement, not an estimate. `drift_ppm` is the
+device clock against the host clock, for a session long enough to care.
+
+Pass your own clock when the experiment already has one: `engine.bridge(clock=psychopy_timer)`.
+The default, `time.perf_counter`, IS the engine's clock on every platform, so its offset never goes
+stale. `time.monotonic` is a different clock on Windows with about 15.6 ms of granularity, so a
+sandwich around it measures that granularity: do not use it. Psychtoolbox `GetSecs` matches on
+Windows and macOS but is `CLOCK_REALTIME` on Linux, which NTP steps, so re-measure per trial there.
+The bridge does not police your clock, and any clock works. The per-platform table is in
+[docs/api.md](../../docs/api.md#land-a-sound-on-a-visual-event).
+
+`play_at` subtracts the ENGINE's render-to-DAC delay only. It cannot see your display delay, or any
+delay past the DAC in an amplifier or a wireless headphone: measure draw to photons once, with a
+photodiode or an AV-sync clapper, and fold that constant into `t_event`. A worked version is in
 [`examples/live_onset.py`](examples/live_onset.py).
 
 When onset precision is the measurement, open the card directly rather than through a system mixer.

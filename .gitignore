@@ -92,3 +92,12 @@ bindings/python/**/*.egg-info/
 # cibuildwheel writes its output here, at the repo root, because the project root it is given is
 # the repository (the build needs the whole tree). See bindings/python/pyproject.toml.
 /wheelhouse/
+
+# MATLAB and Octave binding: the staged MEX binaries and the engine library beside them, plus the
+# per-interpreter build leftovers. One source, two builds; neither binary is committed.
+bindings/matlab/bin/
+*.mexw64
+*.mexa64
+*.mexmaci64
+*.mexmaca64
+*.mex

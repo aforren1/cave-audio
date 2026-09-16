@@ -525,6 +525,12 @@ host's dsp-time call is seconds: Unity's `AudioSettings.dspTime` is a seconds `d
 own `AudioServer` times are seconds too. Schedule with the frame value. It is the exact one, and it
 is what `play_at` and `stop_at` take.
 
+`BwaEngine.get_host_time_ns()` is static and follows the same rule. It reads the engine's own host
+clock, the one `get_clock()`'s `host_time_ns` is stamped with, so you can measure the offset from
+any clock of yours: read yours, call this, read yours again, and the offset is the middle value
+minus the mean of the two, with the error bounded by half the span. It needs no engine, so it
+answers before `BwaEngine` enters the tree.
+
 The rule behind all four, if you are adding a call: **a unit belongs in the name when the quantity
 has two live units in this engine.** Time does - frames and seconds are both real here - so every
 time-valued name says which. Nothing else does: distances are meters, frequencies Hz, angles

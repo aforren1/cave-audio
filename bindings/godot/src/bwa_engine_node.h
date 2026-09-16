@@ -450,6 +450,13 @@ public:
 	static PackedStringArray get_asio_drivers();
 	static int get_asio_driver_count();
 	static String get_asio_driver_name(int index);
+	/* The engine's host clock right now, NANOSECONDS on the same epoch get_clock's host_time_ns
+	 * uses (QPC on Windows, CLOCK_MONOTONIC on Linux and Android, mach_absolute_time on macOS).
+	 * Engine-free, so it answers before an engine exists. Sandwich it between two reads of your own
+	 * clock and the epoch offset stops being an estimate: the error is bounded by half the span you
+	 * just measured. Named for the UNIT because the ABI's two live time units meet here, and NOT
+	 * get_host_time(), which would read as Godot's own seconds-valued time calls. */
+	static int64_t get_host_time_ns();
 	static int get_version();
 	/* The room frame's identity basis, straight from the ABI's own BWA_ROOM_* data. Derive
 	 * "move the source to the listener's right" from these rather than writing a sign: room

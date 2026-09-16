@@ -52,7 +52,7 @@ extern "C" {
  * COMPATIBILITY. Bump it by hand only when the ABI changes. It is deliberately independent of
  * the distribution/release version (the git tag), which moves on its own cadence. */
 #define BWA_VERSION_MAJOR 0
-#define BWA_VERSION_MINOR 14
+#define BWA_VERSION_MINOR 15
 #define BWA_VERSION_PATCH 0
 #define BWA_VERSION ((BWA_VERSION_MAJOR << 16) | (BWA_VERSION_MINOR << 8) | BWA_VERSION_PATCH)
 
@@ -593,6 +593,41 @@ BWA_API uint64_t bwa_get_dsp_time_frames(bwa_engine* e);
  * wall-free time (exact for arithmetic, not real wall time). Lock-free.
  * Full recipe (epochs, graphics-side events, Unity helpers): docs/api.md, "Syncing with graphics". */
 BWA_API bool     bwa_get_clock(bwa_engine* e, uint64_t* dsp_sample, uint64_t* host_time_ns);
+/* A direct read of the clock bwa_get_clock's host_time_ns is stamped with: nanoseconds, the same
+ * BACKEND-DEFINED epoch, monotonic, only DIFFERENCES mean anything. Engine-free - no handle, so it
+ * is callable before bwa_create and after bwa_destroy. Control thread (it is a plain counter read,
+ * but the ABI makes no audio-thread promise). Per platform it is QPC on Windows,
+ * mach_absolute_time on macOS, and CLOCK_MONOTONIC on Linux and Android.
+ *
+ * WHY: it turns "what is the offset between my clock and the engine's" from an estimate into a
+ * measurement. Sandwich this call between two reads of your own clock:
+ *     a = my_clock(); h = bwa_host_time_ns(); b = my_clock();
+ *     offset = h - (a + b) / 2;                 // my_clock time T  ->  host ns  T + offset
+ * The error is bounded by (b - a) / 2, which you can SEE, and there is no convergence period -
+ * one sandwich is enough, and you can repeat it whenever you want a tighter bound or a fresh
+ * anchor. The alternative, a decaying max over the per-block bwa_get_clock stamps, stays valid and
+ * is the fallback for a caller who cannot reach this call (an older DLL, or a host whose clock is
+ * only readable from another process). See docs/api.md, "Syncing with graphics".
+ *
+ * Whether your own clock IS this clock: on Windows and macOS most "high-resolution" clocks are,
+ * because there is only one such counter (Python time.perf_counter is QPC on Windows and mach on
+ * macOS; Psychtoolbox GetSecs the same). On Linux they diverge: perf_counter is CLOCK_MONOTONIC and
+ * matches, Psychtoolbox GetSecs is CLOCK_REALTIME and does NOT (it steps with NTP and the system
+ * clock). Python time.monotonic does not match on Windows - it is GetTickCount64, ~15.6 ms
+ * granularity. When your clock is a different clock the offset still works, it just re-measures at
+ * whatever rate the two clocks drift apart, so re-run the sandwich periodically.
+ *
+ * Two backends stamp with a DRIVER-supplied host time rather than reading this clock, and both are
+ * still the same OS clock: an ASIO driver's ASIOTime.systemTime comes from the system's
+ * high-resolution counter (QPC), and the sink falls back to QPC itself when the driver omits it;
+ * JACK's jack_get_cycle_times reports CLOCK_MONOTONIC microseconds through the server's DLL, so
+ * the stamp is FILTERED (smoothed against the device clock) but on the same base. WASAPI (IAudioClock
+ * reports its position paired with the QPC value at that instant), ALSA (CLOCK_MONOTONIC htstamp),
+ * AAudio (getTimestamp asked for CLOCK_MONOTONIC) and the null sink are all on this clock too.
+ * The manual sink is the one exception: its stamps are SYNTHESIZED from the sample position, so
+ * they are exact for arithmetic and unrelated to any wall clock - an offset measured against it
+ * means nothing. */
+BWA_API uint64_t bwa_host_time_ns(void);
 /* How fast the device clock runs against the host clock. bwa_get_clock's pair is an exact INSTANT,
  * an extrapolation at the nominal rate drifts. The two are different oscillators, and 10 ppm is
  * 36 ms per hour, which is the whole long-show AV-sync problem. This is the slope: an exponentially

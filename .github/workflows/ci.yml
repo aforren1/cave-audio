@@ -31,6 +31,12 @@
 #     way android does, so one addon and one Unity package carry every platform. Each also uploads
 #     a standalone engine artifact of its own. macOS builds UNIVERSAL (x86_64 + arm64) and is
 #     unsigned; see those jobs' notes.
+#   - MATLAB and Octave binding: the MEX is built INSIDE each desktop job, after that job's
+#     engine build, so it links that platform's engine (ASIO/WASAPI, JACK/ALSA, the universal
+#     dylib) rather than a second one. The Windows job assembles the three into ONE toolbox folder
+#     with a bin/<arch>/ per platform and ships it as a release asset. Octave's MEX is built on
+#     Linux only; Octave users elsewhere build it with mkoctfile. UNVERIFIED LOCALLY: no runner
+#     MATLAB is reachable from here, so those steps come from mathworks/ci-configuration-examples.
 #   - Python wheels: every desktop job builds one with `uv build --wheel` as its own fast gate,
 #     and a separate `wheels` job builds the two a RELEASE ships - Linux inside a manylinux
 #     container, macOS as one universal2 file - with cibuildwheel. Windows has no such job: its
@@ -130,6 +136,10 @@ jobs:
         run: |
           # No -G pin: CMake defaults to the newest Visual Studio on the runner. Pinning
           # "Visual Studio 17 2022" broke when the windows-latest image dropped VS 2022.
+          #
+          # No BWA_BUILD_MATLAB here: the windows-latest image carries neither MATLAB nor Octave,
+          # so the option would find no toolchain and build nothing. The linux job is where that
+          # binding is built and tested (docs/build.md, the CI section).
           cmake -S . -B build -A x64 \
                 -DBWA_BUILD_PLAYGROUND=ON \
                 -DBWA_BUILD_CALIBVIEW=ON \
@@ -153,6 +163,59 @@ jobs:
         # the Debug dll ships too — prove it loads and runs a lifecycle
         # (no device on the runner: the AUTO sink policy falls back to the silent null sink)
         run: build/Debug/bwa_minimal.exe
+
+      # ---- the MATLAB MEX ------------------------------------------------------------------------
+      # UNVERIFIED LOCALLY on a runner: written from the patterns in
+      # https://github.com/mathworks/ci-configuration-examples. setup-matlab needs no license token
+      # on a GitHub-hosted runner for a public repository, and MSVC - already here for the engine -
+      # is a compiler MATLAB supports for MEX on Windows.
+      #
+      # Inside this job, after the engine build, so the MEX links the DLL this job already produced
+      # with ASIO, WASAPI and a static phonon intact, rather than a second engine built elsewhere.
+      #
+      # No Octave here: the Windows runner has none, and installing one through choco to build a
+      # second MEX is a follow-up. An Octave user on Windows builds with mkoctfile
+      # (bindings/matlab/README.md), and the linux job publishes the one Octave MEX that CI makes.
+      - name: Set up MATLAB
+        uses: matlab-actions/setup-matlab@v2
+        with:
+          # Pinned, so a new MathWorks release cannot change overnight what this job tested.
+          release: R2024b
+
+      - name: Configure and build the MATLAB MEX
+        shell: bash
+        run: |
+          # setup-matlab puts the launcher on PATH but not matlabroot, and FindMatlab wants the
+          # root. Ask MATLAB itself rather than guessing the install layout.
+          root="$(matlab -batch 'disp(matlabroot)' | tail -1 | tr -d '\r')"
+          echo "matlabroot: $root"
+          test -d "$root"
+          # The SAME build tree. Reconfiguring only adds the MATLAB target; nothing rebuilds.
+          cmake -S . -B build -DBWA_BUILD_MATLAB=ON -DMatlab_ROOT_DIR="$root" | tee matlab-configure.log
+          # LOUD on the one failure these steps exist to catch: FindMatlab not locating the
+          # action's install. The option skips SILENTLY when it finds no toolchain, so without
+          # this the job would build nothing, run nothing, and pass.
+          grep -q "MATLAB MEX enabled" matlab-configure.log
+          cmake --build build --config RelWithDebInfo --target bwa_mex_matlab
+          test -s bindings/matlab/bin/matlab/win-x64/bwa_mex.mexw64
+          test -s bindings/matlab/bin/matlab/win-x64/bw_audio.dll
+
+      - name: Test the MATLAB binding
+        uses: matlab-actions/run-command@v2
+        with:
+          # run-command fails the step on an uncaught error, so raising IS the failure signal.
+          # run_tests returns 77 when no MEX was staged, which is a failure here: the step above
+          # was supposed to stage one.
+          command: |
+            cd("bindings/matlab/tests");
+            rc = run_tests();
+            cd(fullfile("..", "examples"));
+            rc = rc + offline_render("--tests");
+            rc = rc + live_onset("--tests");
+            rc = rc + AudioTunnel3DDemo_bwa("--tests");
+            if rc ~= 0
+                error("bwa:ci", "the MATLAB binding reported %d failing check groups", rc);
+            end
 
       # ---- Godot binding ---------------------------------------------------------------------
       # Its own build trees, because GODOTCPP_TARGET is a build-WIDE choice in godot-cpp: one
@@ -384,6 +447,61 @@ jobs:
           if ($env:TAG) { $a.Version = $env:TAG }           # the tag is the version; pack stamps it into the manifest
           ./tools/upm/pack.ps1 @a
 
+      # ---- the MATLAB toolbox ----------------------------------------------------------------
+      # ONE folder a MATLAB user unzips and adds to their path, carrying every platform's MEX. A
+      # MEX is per platform (.mexw64, .mexa64, .mexmaca64) and the lab's MATLAB users are on
+      # Windows, so shipping only the one CI could build most cheaply would serve the wrong half.
+      # This job is where the three meet: it built the Windows pair and downloaded the other two
+      # in the pack inputs above.
+      #
+      # bin/<arch>/ uses MATLAB's OWN architecture names, which is what `computer('arch')` answers
+      # and what +bwa/arch_dir.m looks for. The build tree's layout (bin/<matlab|octave>/...) is a
+      # different one, on purpose: a build stages two interpreters side by side and a release
+      # ships one.
+      #
+      # No Octave MEX in here. Octave's extension is `.mex` on every platform, so three of them
+      # could not coexist under one name-per-arch layout without a second rule, and CI only builds
+      # one anyway (the linux job). Octave users build with mkoctfile; the linux artifact carries
+      # the one that exists.
+      - name: Assemble the MATLAB toolbox
+        shell: pwsh
+        run: |
+          $tb = 'dist/matlab/bw_audio-matlab'
+          New-Item -ItemType Directory -Force `
+            "$tb/bin/win64", "$tb/bin/glnxa64", "$tb/bin/maca64" | Out-Null
+
+          Copy-Item -Recurse bindings/matlab/+bwa      "$tb/"
+          Copy-Item -Recurse bindings/matlab/examples  "$tb/"
+          Copy-Item bindings/matlab/README.md          "$tb/"
+          # GPLv3 travels with the binaries, the same rule every other pack here follows.
+          Copy-Item LICENSE, THIRD_PARTY-NOTICES.md    "$tb/"
+
+          Copy-Item bindings/matlab/bin/matlab/win-x64/bwa_mex.mexw64  "$tb/bin/win64/"
+          Copy-Item bindings/matlab/bin/matlab/win-x64/bw_audio.dll    "$tb/bin/win64/"
+          Copy-Item pack-linux/matlab/bwa_mex.mexa64                   "$tb/bin/glnxa64/"
+          Copy-Item pack-linux/matlab/libbw_audio.so                   "$tb/bin/glnxa64/"
+          Copy-Item pack-macos/matlab/bwa_mex.mexmaca64                "$tb/bin/maca64/"
+          Copy-Item pack-macos/matlab/libbw_audio.dylib                "$tb/bin/maca64/"
+
+          # Assert all three BEFORE zipping. A toolbox missing one platform installs perfectly on
+          # the other two and fails only on somebody else's machine, which is the shape of defect
+          # this whole assembly exists to avoid.
+          foreach ($p in @("$tb/bin/win64/bwa_mex.mexw64",
+                           "$tb/bin/glnxa64/bwa_mex.mexa64",
+                           "$tb/bin/maca64/bwa_mex.mexmaca64")) {
+            if (-not (Test-Path $p) -or (Get-Item $p).Length -eq 0) { throw "missing or empty: $p" }
+          }
+          Get-ChildItem -Recurse $tb | Where-Object { -not $_.PSIsContainer } |
+            Select-Object FullName, Length
+
+      - name: Upload artifact (MATLAB toolbox, every platform)
+        uses: actions/upload-artifact@v6
+        with:
+          name: bw_audio-matlab-${{ steps.pack.outputs.version }}-r${{ github.run_number }}
+          path: dist/matlab/bw_audio-matlab/
+          retention-days: 30
+          if-no-files-found: error
+
       # ---- Python wheel (nanobind) --------------------------------------------------------------
       # Built here rather than in a job of its own, because a wheel carries the ENGINE LIBRARY
       # inside it and that library is this job's MSVC build. The wheel is tagged cp312-abi3, so one
@@ -440,6 +558,7 @@ jobs:
             !dist/unity/**
             !dist/godot/**
             !dist/python/**
+            !dist/matlab/**
           retention-days: 30
           if-no-files-found: error
 
@@ -460,7 +579,7 @@ jobs:
           if-no-files-found: error
 
       # ---- release (tags only) -------------------------------------------------------------------
-      # The Release IS the distribution - there is no registry. ELEVEN assets: seven audiences want
+      # The Release IS the distribution - there is no registry. TWELVE assets: eight audiences want
       # different bytes, three of them are one Python wheel per platform, and the last two are the
       # GPLv3 corresponding source that must accompany all of it:
       #
@@ -483,6 +602,10 @@ jobs:
       #                                      macos job. UNSIGNED and un-notarized: a download needs
       #                                      its quarantine flag cleared, and shipping outside a lab
       #                                      would need a Developer ID signature.
+      #   bw_audio-matlab-<tag>.zip           the MATLAB and Octave toolbox: the +bwa package, the
+      #                                      examples, and bin/{win64,glnxa64,maca64} each holding
+      #                                      that platform's MEX plus its engine library. Unzip and
+      #                                      addpath; there is nothing to build.
       #   bw_audio-asio-sdk-src-<tag>.zip     the ASIO SDK source statically linked into bw_audio.dll,
       #                                      redistributed under its GPLv3 option. Corresponding source
       #                                      for the one GPL-covered component the repo does not itself
@@ -498,7 +621,7 @@ jobs:
       # Keep the engine bundle a .zip, and the package the only .tgz on the release. Every UPM registry
       # speaks the npm protocol and keys on a single publishable tarball, so should this ever be listed
       # on one, that stays a config change rather than a rebuild. It costs nothing to preserve.
-      - name: Release (four engine zips + Godot addon + Unity package tarball + three Python wheels + the two source zips)
+      - name: Release (four engine zips + Godot addon + Unity package tarball + MATLAB toolbox + three Python wheels + the two source zips)
         if: startsWith(github.ref, 'refs/tags/')
         shell: pwsh
         env:
@@ -549,6 +672,15 @@ jobs:
           Compress-Archive -Path pack-macos/dist/* -DestinationPath $mac -Force
           $mac = (Get-Item $mac).FullName
 
+          # The MATLAB and Octave toolbox: ONE folder carrying every platform's MEX plus that
+          # platform's engine library, assembled above from this job's Windows pair and the two
+          # pack inputs. A zip rather than a MATLAB Toolbox (.mltbx) because an .mltbx is a
+          # MATLAB-only installer and this folder has to work in Octave too, where the install is
+          # addpath and nothing else.
+          $mtb = "dist/bw_audio-matlab-$tag.zip"
+          Compress-Archive -Path dist/matlab/bw_audio-matlab -DestinationPath $mtb -Force
+          $mtb = (Get-Item $mtb).FullName
+
           # The three Python wheels, attached as-is rather than zipped: pip and uv install a .whl
           # directly from a URL, and wrapping it would make the one-liner in the notes a two-step.
           # Each is already versioned by its own filename (the ABI version from the header), so
@@ -573,10 +705,10 @@ jobs:
           $whl | ForEach-Object { Write-Host "release wheel: $(Split-Path $_ -Leaf)" }
 
           $notes = @"
-          Windows x64, plus Android, Linux and macOS cross-builds. Six downloads to use - the
-          **Unity package**, the **Godot addon**, or the engine itself for **Windows**, **Android**,
-          **Linux** or **macOS** - plus the **ASIO SDK source** and the **Steam Audio source**
-          (corresponding source; see License below).
+          Windows x64, plus Android, Linux and macOS cross-builds. Seven downloads to use - the
+          **Unity package**, the **Godot addon**, the **MATLAB and Octave toolbox**, or the engine
+          itself for **Windows**, **Android**, **Linux** or **macOS** - plus the **ASIO SDK source**
+          and the **Steam Audio source** (corresponding source; see License below).
 
           ## Unity
 
@@ -630,6 +762,27 @@ jobs:
           Both link Steam Audio statically, like every other build here. The Unity package and the
           Godot addon carry both libraries already.
 
+          ## MATLAB and Octave
+
+          ``bw_audio-matlab-$tag.zip`` - unzip it anywhere, then in MATLAB or Octave:
+
+          ``addpath('<where-you-unzipped>/bw_audio-matlab')``
+
+          That is the whole install. The folder carries ``+bwa`` (the class layer), the examples,
+          and ``bin/win64``, ``bin/glnxa64`` and ``bin/maca64``, each holding that platform's MEX
+          plus its engine library; ``bwa.setup`` picks yours. Steam Audio is linked into each
+          library, so there is nothing to keep beside it. For Psychtoolbox: see
+          ``bindings/matlab/README.md`` for the timing recipe and the note on not fighting
+          PsychPortAudio for the same device.
+
+          The MEX files here are **MATLAB's**. Octave needs its own (its extension is ``.mex`` on
+          every platform), and CI builds one only on Linux - it rides in the workflow artifact
+          ``bw_audio-matlab-linux-x64-*``. An Octave user on another platform builds it with
+          ``mkoctfile`` from the checkout; the README has the one command.
+
+          The macOS MEX is **arm64** and, like every other macOS binary here, **unsigned**: clear
+          the quarantine flag after unzipping, ``xattr -dr com.apple.quarantine <folder>``.
+
           ## Python
 
           ``bw_audio-*.whl`` - one wheel per platform (Windows x64, Linux x86_64 **manylinux**,
@@ -659,9 +812,9 @@ jobs:
           third-party sources compiled into the DLL).
           "@
           # One .tgz (the Unity package) + the Godot addon .zip + the four engine .zips (Windows,
-          # Android, Linux, macOS) + the two corresponding-source .zips + the three Python wheels.
-          # Keep the .tgz as the only package tarball - see the note above.
-          gh release create $tag $tgz $gd $zip $and $lnx $mac $src $sasrc @whl --title "bw_audio $tag" --notes $notes
+          # Android, Linux, macOS) + the MATLAB toolbox .zip + the two corresponding-source .zips
+          # + the three Python wheels. Keep the .tgz as the only package tarball - see the note above.
+          gh release create $tag $tgz $gd $zip $and $lnx $mac $mtb $src $sasrc @whl --title "bw_audio $tag" --notes $notes
 
       # ---- distribution branches (tags only) ------------------------------------------------------
       # The gh-pages idea applied to the bindings. `main` stays source-only; each binding also gets a
@@ -973,7 +1126,14 @@ jobs:
         # HEADERS only: the two sinks dlopen libjack.so.0 and libasound.so.2 at run time, so
         # nothing here reaches the link line. The packages still have to be present or CMake
         # silently drops the backends.
-        run: sudo apt-get update && sudo apt-get install -y libasound2-dev libjack-jackd2-dev
+        #
+        # octave + liboctave-dev is the MATLAB and Octave binding's toolchain: mkoctfile builds
+        # the MEX, octave-cli runs its ctests. This is the ONLY job that can do it - no runner
+        # image carries MATLAB or Octave otherwise, and MATLAB needs a license CI does not have
+        # (matlab-actions/setup-matlab is the follow-up if that changes).
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libasound2-dev libjack-jackd2-dev octave liboctave-dev
 
       - name: Version
         id: ver
@@ -1031,7 +1191,7 @@ jobs:
 
       - name: Configure
         run: |
-          cmake -S . -B build -DCMAKE_BUILD_TYPE=RelWithDebInfo -DBWA_BUILD_TESTS=ON | tee configure.log
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=RelWithDebInfo -DBWA_BUILD_TESTS=ON                 -DBWA_BUILD_MATLAB=ON | tee configure.log
           # Prove the port is actually being exercised, rather than a stale cache quietly
           # re-enabling a Windows-only path - and that both Linux backends really compiled.
           grep -q "Linux - JACK and ALSA backends available" configure.log
@@ -1040,6 +1200,9 @@ jobs:
           # The one loud signal that the phonon staging survived the cache round trip. A no-SDK
           # build passes every test below, so nothing further down would notice.
           grep -q "Steam Audio ENABLED" configure.log
+          # The MATLAB binding is opt-in and skips SILENTLY when its toolchain is missing, which
+          # is exactly the shape that would let it stop being built without anyone noticing.
+          grep -q "Octave MEX enabled" configure.log
 
       - name: Build
         run: cmake --build build --config RelWithDebInfo
@@ -1063,9 +1226,92 @@ jobs:
           test "$(nm -D --undefined-only build/libbw_audio.so | grep -cE ' (snd_|jack_)')" = 0
 
       - name: Test
-        # 38: the 33 a default off-Windows build registers, plus the five SDK-gated tests
-        # (reflect, bake, path, dynmesh, steam_decode).
+        # 42: the 33 a default off-Windows build registers, plus the five SDK-gated tests
+        # (reflect, bake, path, dynmesh, steam_decode), plus the four the Octave binding adds
+        # (octave_tests and its three examples). No matlab_* here: there is no MATLAB on a runner.
         run: ctest --test-dir build -C RelWithDebInfo --output-on-failure
+
+      # ---- the MATLAB MEX ------------------------------------------------------------------------
+      # UNVERIFIED LOCALLY, all of it: nobody here can run a GitHub-hosted MATLAB, so these steps
+      # come from the patterns in https://github.com/mathworks/ci-configuration-examples rather
+      # than from a run. setup-matlab needs no license token on a GitHub-hosted runner for a public
+      # repository.
+      #
+      # They live INSIDE this job, after the engine build, so the MEX links the library this job
+      # already produced - JACK, ALSA and a static phonon intact - instead of a second engine built
+      # somewhere else. The Octave MEX above came from the same tree for the same reason.
+      - name: Set up MATLAB
+        uses: matlab-actions/setup-matlab@v2
+        with:
+          # Pinned, so a new MathWorks release cannot change overnight what this job tested.
+          release: R2024b
+
+      - name: Configure and build the MATLAB MEX
+        shell: bash
+        run: |
+          # setup-matlab puts the launcher on PATH but not matlabroot, and FindMatlab wants the
+          # root. Ask MATLAB itself rather than guessing the install layout.
+          root="$(matlab -batch 'disp(matlabroot)' | tail -1 | tr -d '\r')"
+          echo "matlabroot: $root"
+          test -d "$root"
+          # The SAME build tree. Reconfiguring only adds the MATLAB target; nothing rebuilds.
+          cmake -S . -B build -DMatlab_ROOT_DIR="$root" | tee matlab-configure.log
+          # LOUD on the one failure these steps exist to catch: FindMatlab not locating the
+          # action's install. The option skips SILENTLY when it finds no toolchain, so without
+          # this the job would build nothing, run nothing, and pass.
+          grep -q "MATLAB MEX enabled" matlab-configure.log
+          cmake --build build --target bwa_mex_matlab
+          mex=bindings/matlab/bin/matlab/linux-x64/bwa_mex.mexa64
+          test -s "$mex"
+          test -s bindings/matlab/bin/matlab/linux-x64/libbw_audio.so
+          # It has to find the engine library BESIDE it, not on a system path: the staged pair is
+          # what a user copies, and an empty runpath would only fail on their machine.
+          readelf -d "$mex" | grep -E 'RUNPATH|RPATH' | grep -q 'ORIGIN'
+
+      - name: Test the MATLAB binding
+        uses: matlab-actions/run-command@v2
+        with:
+          # run-command fails the step on an uncaught error, so raising IS the failure signal.
+          # run_tests returns 77 when no MEX was staged, which is a failure here: the step above
+          # was supposed to stage one.
+          command: |
+            cd("bindings/matlab/tests");
+            rc = run_tests();
+            cd(fullfile("..", "examples"));
+            rc = rc + offline_render("--tests");
+            rc = rc + live_onset("--tests");
+            rc = rc + AudioTunnel3DDemo_bwa("--tests");
+            if rc ~= 0
+                error("bwa:ci", "the MATLAB binding reported %d failing check groups", rc);
+            end
+
+      - name: Stage the MATLAB MEX for the windows job
+        shell: bash
+        run: |
+          # Into the fixed-name pack input the windows job already downloads, so assembling the
+          # cross-platform toolbox there costs no second handoff.
+          mkdir -p pack-linux/matlab
+          cp bindings/matlab/bin/matlab/linux-x64/bwa_mex.mexa64 pack-linux/matlab/
+          cp build/libbw_audio.so pack-linux/matlab/
+          strip --strip-debug pack-linux/matlab/libbw_audio.so
+          ls -l pack-linux/matlab
+
+      - name: Upload artifact (MATLAB and Octave binding)
+        uses: actions/upload-artifact@v6
+        with:
+          name: bw_audio-matlab-linux-x64-${{ steps.ver.outputs.version }}-r${{ github.run_number }}
+          # BOTH interpreters' MEX files with the engine library beside each, plus the package a
+          # user adds to their path. Each MEX finds its library through an $ORIGIN runpath, so a
+          # staged directory is self-contained. The cross-platform TOOLBOX (one folder, three
+          # architectures) is assembled in the windows job and shipped from there; this artifact
+          # is the Linux-only pair, and the only place the Octave MEX is published at all.
+          path: |
+            bindings/matlab/bin/
+            bindings/matlab/+bwa/
+            bindings/matlab/examples/
+            bindings/matlab/README.md
+          retention-days: 30
+          if-no-files-found: error
 
       # ---- the Godot extension, and what the Windows job packs -----------------------------------
       # Same shape as the android job's contribution: this job is the only place a Linux GDExtension
@@ -1318,6 +1564,55 @@ jobs:
         # 38, the same arithmetic as the linux job above.
         run: ctest --test-dir build -C RelWithDebInfo --output-on-failure
 
+      # ---- the MATLAB MEX ------------------------------------------------------------------------
+      # UNVERIFIED LOCALLY, like the rest of this job, and doubly so: written from the patterns in
+      # https://github.com/mathworks/ci-configuration-examples, on a machine nobody here has.
+      # Inside this job, after the engine build, so the MEX links the universal dylib this job
+      # already produced rather than a second engine built elsewhere.
+      #
+      # macos-latest is APPLE SILICON, so MATLAB is the arm64 build and its MEX extension is
+      # .mexmaca64. The engine dylib beside it is UNIVERSAL (x86_64 + arm64), which an arm64 MATLAB
+      # loads happily; the MEX itself is arm64 only, because MATLAB's own mex toolchain builds for
+      # the architecture it is. An Intel Mac needs a MEX built on one, which nothing here has.
+      - name: Set up MATLAB
+        uses: matlab-actions/setup-matlab@v2
+        with:
+          # Pinned, so a new MathWorks release cannot change overnight what this job tested.
+          release: R2024b
+
+      - name: Configure and build the MATLAB MEX
+        shell: bash
+        run: |
+          root="$(matlab -batch 'disp(matlabroot)' | tail -1 | tr -d '\r')"
+          echo "matlabroot: $root"
+          test -d "$root"
+          # The SAME build tree. Reconfiguring only adds the MATLAB target; nothing rebuilds.
+          cmake -S . -B build -DBWA_BUILD_MATLAB=ON -DMatlab_ROOT_DIR="$root" | tee matlab-configure.log
+          # LOUD on the one failure these steps exist to catch: the option skips SILENTLY when it
+          # finds no toolchain, so without this the job would build nothing and pass.
+          grep -q "MATLAB MEX enabled" matlab-configure.log
+          cmake --build build --target bwa_mex_matlab
+          mex=bindings/matlab/bin/matlab/macos-universal/bwa_mex.mexmaca64
+          test -s "$mex"
+          test -s bindings/matlab/bin/matlab/macos-universal/libbw_audio.dylib
+          # It has to find the engine library BESIDE it rather than on a system path.
+          otool -l "$mex" | grep -q '@loader_path'
+
+      - name: Test the MATLAB binding
+        uses: matlab-actions/run-command@v2
+        with:
+          # run-command fails the step on an uncaught error, so raising IS the failure signal.
+          command: |
+            cd("bindings/matlab/tests");
+            rc = run_tests();
+            cd(fullfile("..", "examples"));
+            rc = rc + offline_render("--tests");
+            rc = rc + live_onset("--tests");
+            rc = rc + AudioTunnel3DDemo_bwa("--tests");
+            if rc ~= 0
+                error("bwa:ci", "the MATLAB binding reported %d failing check groups", rc);
+            end
+
       # ---- the Godot extension, and what the Windows job packs -----------------------------------
       # UNVERIFIED LOCALLY, like the rest of this job. Every file name below comes from godot-cpp's
       # own CMake: it sets OUTPUT_NAME to its GODOTCPP_SUFFIX property, whose arch component is the
@@ -1395,8 +1690,13 @@ jobs:
           # What the Windows job packs into the two bindings, plus the whole dist tree so that job
           # can zip it as a release asset. Same split as android and linux: the packaged copies are
           # stripped, the standalone artifact's are not.
-          mkdir -p pack-macos/godot pack-macos/unity
+          mkdir -p pack-macos/godot pack-macos/unity pack-macos/matlab
           cp -r dist-macos pack-macos/dist
+          # The MATLAB MEX and its engine library, for the cross-platform toolbox the windows job
+          # assembles. arm64 MEX, universal dylib - see the MATLAB steps above.
+          cp bindings/matlab/bin/matlab/macos-universal/bwa_mex.mexmaca64 pack-macos/matlab/
+          cp build/libbw_audio.dylib pack-macos/matlab/
+          strip -S -x pack-macos/matlab/libbw_audio.dylib
           cp bindings/godot/addons/bw_audio/bin/libbw_audio_gd.macos.editor.universal.dylib \
              bindings/godot/addons/bw_audio/bin/libbw_audio_gd.macos.template_release.universal.dylib \
              build/libbw_audio.dylib pack-macos/godot/

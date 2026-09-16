@@ -1124,6 +1124,19 @@ func _test_clock() -> void:
 		_check(c2["host_time_ns"] > c["host_time_ns"], "host time should advance")
 		_check(c2["dsp_sample"] > c["dsp_sample"], "dsp sample should advance")
 
+	# The static host-clock read: the same clock, on the same epoch, the pair above is stamped
+	# with. That is what lets a caller MEASURE the offset to its own clock rather than estimate it.
+	var h0 := BwaEngine.get_host_time_ns()
+	var h1 := BwaEngine.get_host_time_ns()
+	_check(h0 > 0 and h1 >= h0, "get_host_time_ns should read a positive, monotonic clock")
+	if not _manual:
+		# A fresh read must sit just AFTER the last block stamp, not an epoch away from it. The
+		# manual sink is excluded because its stamps are synthesized from the sample position.
+		var age := h0 - int(c["host_time_ns"])
+		_check(age >= 0 and age < 1_000_000_000,
+			"a fresh host read should sit just after the last block stamp (got %d, stamp %d)"
+				% [h0, c["host_time_ns"]])
+
 	# Both units, and the name that no longer collides with AudioServer.get_output_latency()
 	# (which is SECONDS). A device-less sink reports 0, which is 0 in either unit — exactly why
 	# the collision hid: the assertion below cannot tell the units apart, and neither could a

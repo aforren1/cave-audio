@@ -7,9 +7,9 @@ engine, only control calls on the main thread. The one inbound exception is the 
 push-source feed (`bwa_source_push`): caller-generated PCM *into* the engine,
 on the same control thread. It is a source feed, not a render path.
 
-[Python](#python) is the one binding here that is not a game engine. It has no transform to
-convert and no frame to ride, so the sections below on coordinates and per-frame pushing do not
-apply to it. Everything else does.
+[Python](#python) and [MATLAB and Octave](#matlab-and-octave) are the two bindings here that are
+not game engines. Neither has a transform to convert or a frame to ride, so the sections below on
+coordinates and per-frame pushing do not apply to them. Everything else does.
 
 If a term in the binding surface is unfamiliar, [glossary.md](./glossary.md) defines it in one
 line and points at the doc that owns it.
@@ -722,6 +722,11 @@ The GIL is released around the calls the header marks as blocking or doing I/O, 
 whose spelling could collide, but a reader moving between the bindings should not have to relearn
 which one a bare name means.
 
+**`Engine.bridge()` is the timing seam**: it sandwiches `bwa_host_time_ns` between two reads of
+your clock, so the offset from `time.perf_counter` (or any experiment clock you pass) to the
+dsp-sample clock is a measurement with a stated error bound rather than the estimator the game
+bindings run per frame.
+
 `render_block` returns a **read-only numpy view of the engine's own buffer**, valid until the next
 call. That is the one place this binding hands out memory it does not own, and it is what makes an
 offline render cost no copy. Pass `copy=True` when you keep the block.
@@ -730,6 +735,67 @@ The wheel carries the engine library inside the package, like the Unity package 
 addon carry theirs. One wheel per platform, tagged `cp312-abi3`, runs on Python 3.12 and every
 later version. A release builds the Linux one for `manylinux_2_28` and the macOS one as
 `universal2`, so each file serves more than the machine that built it.
+
+## MATLAB and Octave
+
+**Implemented as a MEX gateway: [`bindings/matlab/`](../bindings/matlab/).** Its
+[README](../bindings/matlab/README.md) is the manual: install, the two layers, the commit model,
+the timing recipe, coexisting with PsychPortAudio. This section carries only what belongs in the
+cross-binding comparison.
+
+Like Python it is not a game-engine binding, so there is no coordinate seam and no per-frame push.
+The audience is Psychtoolbox, which is MATLAB or Octave, where PsychoPy is Python. The two
+experiment shapes are the same two [backends.md](./backends.md) describes.
+
+**One source, two binaries.** The gateway is written against the classic C MEX API, which Octave
+implements, and not the MATLAB-only C++ Data API. MATLAB and Octave still need different binaries
+(different MEX extensions, different compilers), so the build produces both and
+`bwa.setup` picks the one for the interpreter it is running in. The C API pin is what keeps that a
+packaging difference rather than a source fork.
+
+**One MEX file with a subcommand string**, `bwa_mex('source_play', h, src, snd, false)`, rather
+than one MEX per call. That is PsychPortAudio's own shape and what this audience reads without
+being told. Each subcommand is a C entry point minus the `bwa_` prefix, so it maps onto the Python
+raw layer one for one.
+
+Two layers, like Python's:
+
+- `bwa_mex` is the **raw layer**. Handles are `uint64` scalars, out-parameters become extra
+  outputs, and a `bool` plus out-struct call returns `[]` on false. A test pins the subcommand
+  count, so an ABI call added and left unbound goes red.
+- The **`+bwa` package** is the class layer: `Engine`, `Source`, `PushSource`, `Bed`, `Sound`,
+  `Listener` and `ClockBridge`, plus `Const` for the enums. It adds the same commit model Python
+  adds, in the form MATLAB can express: a commit-gated write commits itself, or lands with the
+  rest of a frame block. MATLAB has no `with`, so the block is `beginFrame`/`endFrame` and an
+  `onCleanup`-based `frame()` that commits when you clear it.
+
+**The same ABI call is not bound**, and for the same reason: `bwa_set_output_capture` runs its
+callback on the audio thread. The subcommand exists and refuses with that reason, so a reader finds
+the explanation where they looked.
+
+**The threading contract is satisfied by construction here**, unlike Python's. A MEX call runs on
+the interpreter's main thread, so the one-control-thread rule needs no guard. Parallel-pool workers
+are separate processes and an engine handle does not travel to one. What does need care is
+lifetime: the gateway is `mexLock`ed while any engine is live, so `clear mex` cannot unload it
+under a running audio thread, and a `mexAtExit` handler stops and destroys whatever is live so
+quitting never leaves a device open.
+
+**`Engine.bridge()` is the timing seam**, the same one Python has: it sandwiches `bwa_host_time_ns`
+between two reads of your clock, and reports the sandwich width as the error bound. It defaults to
+Psychtoolbox's `GetSecs` when that is usable, because that is what the rest of the experiment times
+against, and to a monotonic `tic`/`toc` otherwise.
+
+`render_block` returns an `[nframes, channels]` `single` matrix, and it is a **copy** where
+Python's is a view. An `mxArray` cannot alias memory the engine owns and overwrites. The copy costs
+one `memcpy` and no transpose, because the engine's planar block already has MATLAB's column-major
+layout for that shape.
+
+**Octave's classdef support is partial**, and the class layer is written to the intersection: no
+property validation syntax, no `arguments` blocks, no access lists on methods, and no `isvalid`.
+The one construct that bites rather than fails to parse is reference cycles. Octave refcounts handle
+objects and cannot collect a cycle, so `Engine.listener` is a DEPENDENT property that builds a
+`Listener` on demand rather than a stored object pointing back at the engine. Stored, the engine
+would outlive its variable and hold its device until the interpreter exited.
 
 ## Unreal (notes, not yet implemented)
 

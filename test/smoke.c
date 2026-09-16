@@ -153,6 +153,15 @@ static int run_profile(bwa_profile profile, const char* name) {
             fprintf(stderr, "FAIL[%s]: null sink reports a nonzero output latency\n", name);
             bwa_destroy(e); return 1;
         }
+        /* bwa_host_time_ns must be the SAME clock the stamps are on, which is the whole promise a
+         * caller measures its own clock against. A fresh read therefore sits just after the last
+         * stamp; an epoch or a scale error would show as a wild age rather than a small one. */
+        const uint64_t now_ns = bwa_host_time_ns();
+        if (now_ns < ct2 || now_ns - ct2 > 1000000000ull) {
+            fprintf(stderr, "FAIL[%s]: bwa_host_time_ns %llu is not on the stamp's clock (stamp %llu)\n",
+                    name, (unsigned long long)now_ns, (unsigned long long)ct2);
+            bwa_destroy(e); return 1;
+        }
     }
 
     /* device health through the full dll. The null sink has a real thread on a real deadline, so it
@@ -830,6 +839,18 @@ done:
 }
 
 int main(void) {
+    /* Engine-free, so it has to answer before any bwa_create, and it has to be a real ns clock. */
+    {
+        const uint64_t h0 = bwa_host_time_ns();
+        os_sleep_ms(20);
+        const uint64_t h1 = bwa_host_time_ns();
+        const uint64_t d  = h1 - h0;
+        if (h0 == 0 || h1 < h0 || d < 15000000ull || d > 500000000ull) {
+            fprintf(stderr, "FAIL: bwa_host_time_ns over a 20 ms sleep read %llu ns\n",
+                    (unsigned long long)d);
+            return 1;
+        }
+    }
     if (run_profile(BWA_PROFILE_CAVE,      "cave"))      return 1;
     if (run_profile(BWA_PROFILE_BINAURAL,  "binaural"))  return 1;
     if (run_profile(BWA_PROFILE_CAVE_SIM,  "cave_sim"))  return 1;

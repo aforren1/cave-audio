@@ -25,6 +25,7 @@ import enum
 import os
 import sys
 import threading
+import time
 from typing import TYPE_CHECKING, Optional, Tuple
 
 if sys.platform == "win32":
@@ -50,6 +51,7 @@ __all__ = [
     "PushSource",
     "Bed",
     "Listener",
+    "ClockBridge",
     "Profile",
     "SinkType",
     "Result",
@@ -73,6 +75,7 @@ __all__ = [
     "ROOM_UP",
     "ROOM_RIGHT",
     "list_devices",
+    "host_time_ns",
     "abi_version",
     "header_abi_version",
     "check_abi",
@@ -209,6 +212,20 @@ def list_devices(backend) -> list:
     for i in range(_bwa.get_device_count(backend)):
         out.append((_bwa.get_device_name(backend, i), _bwa.get_device_id(backend, i)))
     return out
+
+
+# ---------------------------------------------------------------------------- host clock
+
+
+def host_time_ns() -> int:
+    """The engine's host clock right now, in nanoseconds (``bwa_host_time_ns``).
+
+    The same clock and the same epoch ``Engine.clock``'s ``host_time_ns`` is stamped with: QPC on
+    Windows, ``mach_absolute_time`` on macOS, ``CLOCK_MONOTONIC`` on Linux. Monotonic, and only
+    differences mean anything. Needs no engine, so you can measure your clock against it before
+    ``Engine(...)``. ``Engine.bridge()`` wraps it into the offset measurement you actually want.
+    """
+    return _bwa.host_time_ns()
 
 
 # ---------------------------------------------------------------------------- pure solves
@@ -671,6 +688,139 @@ class Listener:
         _bwa.set_pose_prediction(self._e._raw, float(lead_s))
 
 
+# ---------------------------------------------------------------------------- clock bridge
+
+
+class ClockBridge:
+    """Maps YOUR clock to the engine's dsp-sample clock, both directions.
+
+    Build one with ``Engine.bridge()``. It measures the constant epoch offset between the engine's
+    host clock and your clock by sandwiching ``host_time_ns()`` between two reads of yours::
+
+        a = clock(); h = host_time_ns(); b = clock()
+        offset_ns = h - (a + b) / 2 * 1e9
+
+    The error is bounded by ``(b - a) / 2``, reported as ``error_ns``, and there is no convergence
+    period: one sandwich is a measurement, not an estimate. Call ``refresh()`` whenever you want a
+    fresh anchor, which for a long session means occasionally, because two crystals drift apart.
+    ``drift_ppm`` says how fast the device clock runs against the host clock.
+
+    Which clock is yours matters only for how fast the offset goes stale. ``time.perf_counter`` IS
+    the engine's clock on every platform (QPC on Windows, mach_absolute_time on macOS,
+    CLOCK_MONOTONIC on Linux), so its offset is stable to the measurement bound. ``time.monotonic``
+    is NOT the same clock on Windows: it is GetTickCount64, about 15.6 ms of granularity, so the
+    sandwich measures that granularity rather than anything useful. Psychtoolbox ``GetSecs`` matches
+    on Windows and macOS but is CLOCK_REALTIME on Linux, which NTP steps. Any clock still works.
+    The bridge does not police yours.
+    """
+
+    __slots__ = ("_e", "_clock", "_offset_ns", "_error_ns")
+
+    def __init__(self, engine: "Engine", clock=None, rounds: int = 5):
+        self._e = engine
+        self._clock = clock if clock is not None else time.perf_counter
+        self._offset_ns = 0.0
+        self._error_ns = 0.0
+        self.refresh(rounds)
+
+    def refresh(self, rounds: int = 5) -> float:
+        """Re-measure the offset. Returns the error bound in nanoseconds (also ``error_ns``).
+
+        Takes ``rounds`` sandwiches and keeps the tightest, because a Python round trip is
+        occasionally preempted and the best of a few costs microseconds.
+        """
+        best_err = None
+        best_off = 0.0
+        for _ in range(max(1, int(rounds))):
+            a = self._clock()
+            h = _bwa.host_time_ns()
+            b = self._clock()
+            err = (b - a) * 0.5e9
+            if best_err is None or err < best_err:
+                best_err = err
+                best_off = float(h) - (a + b) * 0.5e9
+        self._offset_ns = best_off
+        self._error_ns = float(best_err)
+        return self._error_ns
+
+    @property
+    def offset_ns(self) -> float:
+        """Engine host nanoseconds minus your clock in nanoseconds, as of the last measurement."""
+        return self._offset_ns
+
+    @property
+    def error_ns(self) -> float:
+        """Half the round-trip span of the tightest sandwich: the bound on ``offset_ns``."""
+        return self._error_ns
+
+    @property
+    def drift_ppm(self):
+        """Device clock against host clock in parts per million, or None until the fit has stamps."""
+        m = self._e.clock_model
+        return None if m is None else m.ppm
+
+    def _rate_hz(self) -> float:
+        """The fitted device rate where the model has one, else the nominal rate.
+
+        The fit is what keeps a MINUTES-long extrapolation true; over one frame the nominal rate is
+        indistinguishable.
+        """
+        m = self._e.clock_model
+        if m is not None and m.rate_hz > 0.0:
+            return float(m.rate_hz)
+        return float(self._e.sample_rate)
+
+    def host_ns(self, t_seconds: float) -> float:
+        """A reading of your clock, as engine host nanoseconds."""
+        return float(t_seconds) * 1e9 + self._offset_ns
+
+    def dsp_at(self, t_seconds: float) -> int:
+        """The dsp sample that corresponds to a reading of YOUR clock. Never negative.
+
+        Uses the driver-stamped pair, which is exact. Before the first stamped block it falls back
+        to pairing ``Engine.dsp_time_frames`` with a fresh clock read, which is block-granular
+        (about 5 ms at 256 frames and 48 kHz).
+        """
+        rate = self._rate_hz()
+        pair = self._e.clock
+        if pair is None:
+            d = self._e.dsp_time_frames + (float(t_seconds) - self._clock()) * rate
+        else:
+            cs, ct = pair
+            d = cs + (self.host_ns(t_seconds) - float(ct)) * rate * 1e-9
+        return int(d) if d > 0.0 else 0
+
+    def time_at(self, dsp_sample: int) -> float:
+        """The inverse: a dsp sample, as a reading of YOUR clock in seconds."""
+        rate = self._rate_hz()
+        pair = self._e.clock
+        if pair is None:
+            return self._clock() + (float(dsp_sample) - self._e.dsp_time_frames) / rate
+        cs, ct = pair
+        host = float(ct) + (float(dsp_sample) - float(cs)) * 1e9 / rate
+        return (host - self._offset_ns) * 1e-9
+
+    def play_at(self, source, sound, t_seconds: float, loop: bool = False) -> int:
+        """Play ``sound`` on ``source`` so it reaches the DAC at ``t_seconds`` on your clock.
+
+        The argument order is ``Source.play_at``'s with the source in front, so the sound comes
+        before the time in both, and the MATLAB bridge spells it the same way.
+
+        Subtracts the device's render-to-DAC latency and schedules with ``Source.play_at``. Returns
+        the dsp sample it scheduled. That latency is the ENGINE's output chain only: your display
+        delay and any headphone or amplifier delay past the DAC are yours to measure and to fold
+        into ``t_seconds``.
+        """
+        heard = self.dsp_at(t_seconds)
+        latency = self._e.output_latency_frames
+        start = heard - latency if heard > latency else 0
+        source.play_at(sound, start, loop)
+        return start
+
+    def __repr__(self) -> str:
+        return "<ClockBridge offset_ns={0:.0f} error_ns={1:.0f}>".format(self._offset_ns, self._error_ns)
+
+
 # ---------------------------------------------------------------------------- engine
 
 
@@ -951,6 +1101,15 @@ class Engine:
     @property
     def output_latency_seconds(self) -> float:
         return self.output_latency_frames / float(self.sample_rate)
+
+    def bridge(self, clock=None, rounds: int = 5) -> ClockBridge:
+        """A ``ClockBridge`` from YOUR clock to the dsp-sample clock, measured on the spot.
+
+        ``clock`` is any callable returning monotonic seconds and defaults to
+        ``time.perf_counter``, which is the engine's own clock on every platform. The offset is
+        measured at construction, so the bridge is usable immediately, even before ``start()``.
+        """
+        return ClockBridge(self, clock, rounds)
 
     # ---- assets
     def load_sound(self, path: str, streaming: bool = False) -> Sound:

@@ -1010,6 +1010,18 @@ if(BWA_BUILD_PYTHON)
   add_subdirectory(bindings/python)
 endif()
 
+# ---- Optional: MATLAB and Octave binding (a classic C MEX gateway) ----
+# Opt-in, because it needs MATLAB or Octave installed and the default build needs neither:
+#   cmake -S . -B build -DBWA_BUILD_MATLAB=ON
+# It builds whichever of the two it finds, and both when both are there, from ONE source: the
+# classic C MEX API is what Octave implements, so the MATLAB-only C++ Data API is off the table.
+# Each half registers its own ctests (the suite plus the three examples in --tests mode).
+# See bindings/matlab/CMakeLists.txt and bindings/matlab/README.md.
+option(BWA_BUILD_MATLAB "Build the MATLAB and Octave binding (a MEX gateway; needs MATLAB or mkoctfile)" OFF)
+if(BWA_BUILD_MATLAB)
+  add_subdirectory(bindings/matlab)
+endif()
+
 # ---- Shared Dear ImGui stack for the GUI tools (bwa_calib_view, bwa_layout_tool) ----
 # One pinned copy of imgui + imgui_test_engine, compiled INTO each tool as target sources (not a
 # library: the test-engine define below must be seen by every imgui-including TU of an executable,

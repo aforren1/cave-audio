@@ -52,7 +52,9 @@ Terms used here without definition are in [glossary.md](./glossary.md).
   events (`bwa_poll_looped`) beside completion events,
   sample-accurate scheduled starts against a device-anchored DSP clock. The device's own
   block stamps bridge that clock to wall time for AV sync, with the device-vs-host drift
-  fitted in ppm for shows long enough to care.
+  fitted in ppm for shows long enough to care. `bwa_host_time_ns` reads that host clock
+  directly, with no engine, so a client measures the offset to its own clock to a bound it
+  can see instead of estimating it.
 - Tracking: OptiTrack/NatNet ingested in-process; the audio thread samples the
   freshest head pose at block time.
 - Diagnostics: per-channel test tone, direct output-channel routing of a real source
@@ -297,41 +299,47 @@ device's own block stamps (`bwa_get_clock`), subtract the device's render→DAC 
 `GetTime()` is the app clock, and any monotonic seconds clock works as long as you use
 the same one throughout.
 
-```c
-/* The wall<->dsp bridge. The driver-stamped (sample, host time) pair is exact, so the
- * only thing to estimate is the constant epoch offset between the device's host clock
- * and GetTime(). Each frame observes (offset - pair age); a decaying max converges on
- * the true offset and tracks ppm drift. Same estimator as the Unity binding's DspTimeFramesAt. */
-static struct { bool valid; uint64_t sample; double host, off; } clk;
+The one unknown in that mapping is the epoch offset between your clock and the engine's
+host clock. `bwa_host_time_ns` reads the engine's host clock directly, so you measure the
+offset instead of estimating it: sandwich one call between two reads of your own clock and
+the error is bounded by half the span you just measured. There is no convergence period.
 
-static void clock_refresh(bwa_engine* e) {
-    uint64_t cs, ct;
-    if (!bwa_get_clock(e, &cs, &ct)) { clk.valid = false; return; }
-    double host = ct * 1e-9, cand = host - GetTime();
-    if (!clk.valid || cs < clk.sample || fabs(cand - clk.off) > 0.5)
-        clk.off = cand;                          // first pair / device restart / epoch change
-    else
-        clk.off = fmax(cand, clk.off - 2e-6);    // decaying max
-    clk.sample = cs; clk.host = host; clk.valid = true;
+```c
+/* The wall<->dsp bridge. Two measurements and no estimator: the driver-stamped pair is
+ * exact, and the epoch offset between GetTime() and the engine's host clock comes from a
+ * sandwich around bwa_host_time_ns. Both are the same OS clock on Windows and macOS
+ * (QPC, mach_absolute_time), so the offset is stable and one measurement holds; measure
+ * again when you want a tighter bound or after the machine has been asleep. */
+static double clk_off_ns;      /* GetTime() nanoseconds -> engine host nanoseconds */
+
+static double clock_measure(void) {          /* returns the error bound, in ns */
+    double a = GetTime();
+    uint64_t h = bwa_host_time_ns();
+    double b = GetTime();
+    clk_off_ns = (double)h - (a + b) * 0.5e9;
+    return (b - a) * 0.5e9;                  /* the bound: half the round trip */
 }
 
-static uint64_t dsp_at(bwa_engine* e, double t) {   // GetTime() seconds -> dsp sample
+static uint64_t dsp_at(bwa_engine* e, double t) {   /* GetTime() seconds -> dsp sample */
     double fs = (double)bwa_get_sample_rate(e);
-    double d = clk.valid ? (double)clk.sample + (t + clk.off - clk.host) * fs
-                         : (double)bwa_get_dsp_time_frames(e) + (t - GetTime()) * fs;  // pre-stamp fallback
+    uint64_t cs, ct;
+    double d;
+    if (bwa_get_clock(e, &cs, &ct))
+        d = (double)cs + (t * 1e9 + clk_off_ns - (double)ct) * fs * 1e-9;
+    else
+        d = (double)bwa_get_dsp_time_frames(e) + (t - GetTime()) * fs;  /* pre-stamp fallback */
     return d > 0. ? (uint64_t)d : 0;
 }
 ```
 
-The game loop schedules against it:
+Call `clock_measure()` once at startup and print the bound it returns: it is the accuracy
+of everything downstream. The game loop then schedules against `dsp_at`:
 
 ```c
 const double display_s = 0.030;      // draw -> photons: measure once, one constant
 double anim_start = -1.;
 
 while (!WindowShouldClose()) {
-    clock_refresh(e);                             // once per frame, before any dsp_at
-
     if (IsKeyPressed(KEY_SPACE)) {                // swing starts now, impact lands in 0.5 s
         double t_seen  = GetTime() + 0.5 + display_s;   // when the impact frame is SEEN
         uint64_t heard = dsp_at(e, t_seen);
@@ -357,18 +365,67 @@ while (!WindowShouldClose()) {
   (`bwa_get_output_latency_frames`; the Digiface includes its Dante buffering) but cannot see your
   display's. Measure draw→photons once (photodiode, or an AV-sync clapper against the
   array) and that one constant aligns the whole chain.
-- **The fallback is often enough.** Before the first stamped block (and always on the
-  manual sink) `dsp_at` degrades to pairing `bwa_get_dsp_time_frames` with your clock:
-  block-granular, about 5 ms at 256/48 kHz, already under half a 60 Hz frame. The
-  estimator buys sub-millisecond.
+- **The pre-stamp fallback is often enough.** Before the first stamped block (and always on
+  the manual sink) `dsp_at` degrades to pairing `bwa_get_dsp_time_frames` with your clock:
+  block-granular, about 5 ms at 256/48 kHz, already under half a 60 Hz frame. The stamped
+  pair buys sub-millisecond.
 - **The other direction needs no wall clock.** An event on the *audio* timeline (a cue
   inside a track you scheduled) fires its visual when `bwa_get_dsp_time_frames` crosses
   `start + cue`, or off `bwa_source_get_playhead_frames`.
-- **It holds for a two-hour show.** `clock_refresh` runs every frame, so crystal drift
-  never accumulates; see "Long shows drift" under
+- **It holds for a two-hour show.** The measured offset is constant while both clocks are
+  the same OS clock, and what still moves is the DEVICE against the host: read
+  `bwa_get_clock_model` for that, or re-measure now and then. See "Long shows drift" under
   [Sources](#sources-control-thread-non-blocking).
 - **Unity**: `emitter.PlayAt(engine.DspTimeFramesAt(tEvent))` is this whole recipe
-  ([integration.md](./integration.md)).
+  ([integration.md](./integration.md)). **Python**: `Engine.bridge()` returns a
+  `ClockBridge` that does the sandwich for you and exposes `dsp_at`, `time_at`, `play_at`
+  and the bound it measured.
+
+**Is your clock the engine's clock?** `bwa_host_time_ns` is the OS monotonic clock, and most
+high-resolution clocks on the same machine are that clock. The offset method works either way.
+What changes is how fast the offset goes stale: same clock means it never does, different
+clocks means re-measure at whatever rate they drift apart, and a clock that NTP can step
+means re-measure often.
+
+| Clock | Windows | macOS | Linux |
+| --- | --- | --- | --- |
+| `bwa_host_time_ns` (the engine) | QPC | `mach_absolute_time` | `CLOCK_MONOTONIC` |
+| Python `time.perf_counter` | QPC | `mach_absolute_time` | `CLOCK_MONOTONIC` |
+| Python `time.monotonic` | `GetTickCount64`, about 15.6 ms | `mach_absolute_time` | `CLOCK_MONOTONIC` |
+| PsychoPy `core.getTime` | QPC (it calls `perf_counter`) | `mach_absolute_time` | `CLOCK_MONOTONIC` |
+| Psychtoolbox `GetSecs` | QPC | `mach_absolute_time` | `CLOCK_REALTIME` |
+| Unity `Time.realtimeSinceStartupAsDouble` | QPC | `mach_absolute_time` | `CLOCK_MONOTONIC` |
+
+Two rows need care. Python `time.monotonic` on Windows is a different clock with about 15.6 ms
+of granularity, so a sandwich around it measures that granularity and nothing else: use
+`time.perf_counter`. Psychtoolbox `GetSecs` on Linux is `CLOCK_REALTIME`, which NTP steps and
+slews, so the offset moves under you: re-measure per trial, or take your timestamps from a
+`CLOCK_MONOTONIC` source instead.
+
+**The fallback recipe.** When you cannot call `bwa_host_time_ns` (an older library, or a host
+whose clock only another process can read), estimate the offset from the block stamps instead:
+each refresh observes `offset - pair age`, and a decaying max over those converges on the true
+offset while tracking drift. It is what the Unity binding's `DspTimeFramesAt` does and it works
+well. It just has a convergence period and no error bound, which is exactly what the direct
+read removes.
+
+```c
+static struct { bool valid; uint64_t sample; double host, off; } clk;
+
+static void clock_refresh(bwa_engine* e) {     /* once per frame, before any dsp_at */
+    uint64_t cs, ct;
+    if (!bwa_get_clock(e, &cs, &ct)) { clk.valid = false; return; }
+    double host = ct * 1e-9, cand = host - GetTime();
+    if (!clk.valid || cs < clk.sample || fabs(cand - clk.off) > 0.5)
+        clk.off = cand;                          // first pair / device restart / epoch change
+    else
+        clk.off = fmax(cand, clk.off - 2e-6);    // decaying max
+    clk.sample = cs; clk.host = host; clk.valid = true;
+}
+```
+
+Call it once per frame before any `dsp_at`, and have `dsp_at` read `clk.sample`, `clk.host`
+and `clk.off` instead of the live pair and the measured offset.
 
 ### Develop at the desk, run on the rig
 
@@ -1060,6 +1117,7 @@ item is playing, watch the playhead reset across the seam; there's no separate e
 // clock / scheduling - the time base for bwa_source_play_at:
 uint64_t bwa_get_dsp_time_frames(bwa_engine* e);                       // current dsp-sample clock (device-anchored, monotonic)
 bool     bwa_get_clock(bwa_engine* e, uint64_t* dsp_sample, uint64_t* host_time_ns); // device (sample, host-time) pair
+uint64_t bwa_host_time_ns(void);                                       // that host clock, read directly (no engine)
 uint32_t bwa_get_output_latency_frames(bwa_engine* e);                 // device render->DAC latency, frames (0 = unknown)
 bool     bwa_get_clock_model(bwa_engine* e, bwa_clock_model* out); // fitted device-vs-host drift (ppm + its sigma)
 ```
@@ -1074,9 +1132,12 @@ sink).
 Because the pair is captured *in* the callback, the mapping
 `dsp_at(T) = sample + (T_ns − host_time_ns) · rate / 1e9` carries none of the
 block-plus-scheduling jitter that pairing `bwa_get_dsp_time_frames` with your own clock read does.
-`host_time_ns` sits on a backend-defined epoch: anchor it against your clock once and re-sample
-per frame (the Unity binding's `Engine.DspTimeFramesAt`/`RealtimeAt` do this with a decaying-max offset
-estimator). It returns **false with the outputs untouched** until a host-stamped block has
+`host_time_ns` sits on a backend-defined epoch, and `bwa_host_time_ns` reads that same clock
+directly with no engine handle, so you measure the offset to your own clock rather than estimate
+it: `a = my_clock(); h = bwa_host_time_ns(); b = my_clock();` gives `offset = h - (a+b)/2` with the
+error bounded by `(b-a)/2`. See "Land a sound on a visual event" for the whole recipe, the
+per-platform clock table, and the decaying-max estimator that remains the fallback (it is what the
+Unity binding's `Engine.DspTimeFramesAt`/`RealtimeAt` use). It returns **false with the outputs untouched** until a host-stamped block has
 rendered: before `bwa_start`, or under a driver that reports no `systemTime` (FlexASIO is one).
 The **manual** sink is the deliberate exception: it stamps a *nominal* time derived from the
 sample position (`sample / rate`), so a fixed call sequence renders bit-identically; treat that

@@ -28,6 +28,7 @@
 #include "acoustics/fdn.h"
 #include "acoustics/ism.h"
 #include "binaural/hpeq.h"           /* headphone correction EQ (bwa_load_headphone_eq) */
+#include "os/os.h"                   /* os_monotonic_ns (bwa_host_time_ns) */
 
 #include <math.h>           /* isfinite (the ABI input guards) */
 #include <stdio.h>          /* snprintf (the backend readback string) */
@@ -914,6 +915,14 @@ bool bwa_get_device_name(bwa_sink_type backend, uint32_t index, char* buf, uint3
 }
 bool bwa_get_device_id(bwa_sink_type backend, uint32_t index, char* buf, uint32_t cap) {
     return sink_device_id(backend, index, buf, cap);
+}
+
+/* Engine-free too, and for the same reason: the host clock is a property of the PROCESS, not of an
+ * engine. Every backend that stamps bwa_timestamp.system_time_ns itself reads this same counter
+ * (the two that take a driver-supplied stamp read the same OS clock underneath - see bw_audio.h),
+ * so a caller can measure its own clock against it before bwa_create and reuse the offset. */
+uint64_t bwa_host_time_ns(void) {
+    return os_monotonic_ns();
 }
 
 /* The ASIO-only spelling, kept as a wrapper because both bindings and the calibration tools
