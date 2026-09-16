@@ -144,11 +144,44 @@ typedef enum { BWA_SINK_AUTO = 0, BWA_SINK_ASIO = 1, BWA_SINK_NULL = 2,
                                          * device name (JACK has ports, not devices) */
                BWA_SINK_FORCE_U32 = 0x7FFFFFFF } bwa_sink_type;
 
-/* bwa_desc.sink_flags bits. EXCLUSIVE takes the device away from every other application on the
- * machine, which is why it is off by default: a monitor shares the endpoint with the VR runtime,
- * the browser, and the OS. Turn it on for the lowest latency and a fixed callback size, or to
- * reach more than 2 channels on a WASAPI endpoint. Ignored by backends that have no such mode. */
-#define BWA_SINK_FLAG_EXCLUSIVE 0x1u
+/* bwa_desc.sink_flags bits. All three are opt-in, and all three trade something a shared,
+ * resampling, comfortably-buffered device gives you for free. None of them reaches the CAVE_BOTH
+ * monitor: like `device`, they describe the PRIMARY device only (the monitor opens the platform
+ * default shared, with no flags, which is the whole reason cave_both can hold an ASIO array and a
+ * WASAPI headphone endpoint at once). docs/api.md's "Latency classes" maps these onto
+ * PsychPortAudio's 0..4 if you are porting a psychophysics rig.
+ *
+ * EXCLUSIVE takes the endpoint away from EVERY OTHER APPLICATION on the machine - a VR runtime,
+ * the browser, the OS sounds - for as long as the engine holds it, which is why it is off by
+ * default. It buys the lowest latency and a fixed callback size, and on a WASAPI endpoint it is
+ * also the only way past 2 channels.
+ *   WASAPI: AUDCLNT_SHAREMODE_EXCLUSIVE, one-period buffer, the device's own format walk.
+ *   AAudio: AAUDIO_SHARING_MODE_EXCLUSIVE (the MMAP path) when the device grants it.
+ *   ASIO/JACK/ALSA(hw:): no-op, those paths are already exclusive by construction.
+ *
+ * EXACT_RATE refuses a device that cannot run at bwa_desc.sample_rate: the open FAILS naming both
+ * rates instead of accepting the OS's resampler. The ARRAY sinks already behave this way; this
+ * flag extends the same strictness to the headphone sinks, where the default is to accept a
+ * resampled rate and report the degradation through bwa_last_error (docs/backends.md rule 6).
+ * Use it when a measured rate is part of the experiment, not a preference.
+ *   WASAPI: shared mode drops AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM and demands that
+ *           IsFormatSupported take the rate as-is; exclusive mode already demanded it.
+ *   ALSA:   snd_pcm_hw_params_set_rate_resample(0) plus an exact rate, so a plug PCM cannot
+ *           silently resample.
+ *   AAudio: the probed device rate must equal the engine rate.
+ *   JACK:   the server owns the rate; a mismatch already fails the open.
+ *
+ * TIGHT_BUFFER asks the backend for the SMALLEST device buffer it can take, trading dropout
+ * margin for latency. Expect underruns on a loaded machine; it is for a quiet rig, not a default.
+ *   ALSA:   2 periods instead of 3.
+ *   AAudio: one burst instead of two.
+ *   WASAPI: no-op. Exclusive mode already runs a one-period buffer, and shared mode's buffer
+ *           belongs to the OS mixer.
+ *   ASIO/JACK: no-op, the driver or the server owns the buffer.
+ * bwa_get_output_latency_frames reports what you actually got. */
+#define BWA_SINK_FLAG_EXCLUSIVE    0x1u
+#define BWA_SINK_FLAG_EXACT_RATE   0x2u
+#define BWA_SINK_FLAG_TIGHT_BUFFER 0x4u
 
 /* Engine configuration. Zero-init and set what you need - every field's zero is its default. */
 typedef struct {

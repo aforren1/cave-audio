@@ -256,6 +256,24 @@ bindings/
                        self-checking test scenes (CI fixtures, never shipped). No 1:1 shim — each call lives on the class owning
                        its handle (BwaEngine / BwaSource → BwaEmitter, BwaPushSource / BwaBed), plus
                        BwaMaterial, Bwa{Acoustic,Dynamic}Geometry, BwaRoomBox, BwaSpeakerView.
+  python/              nanobind extension (opt-in -DBWA_BUILD_PYTHON=ON; scikit-build-core wheel via
+                       `uv build --wheel`). TWO layers, unlike the other two bindings: bw_audio._bwa
+                       is the RAW 1:1 ABI (C name minus the bwa_ prefix, C field names, C units) and
+                       bw_audio is a thin Pythonic layer over it (Engine context manager, Sound /
+                       Source / PushSource / Bed / Listener, exceptions from bwa_result). The one
+                       EXCLUSION is bwa_set_output_capture — its callback runs on the audio thread
+                       and an interpreter must never run there (invariant 1, and docs/backends.md
+                       says so for this binding by name); the manual sink + render_block is the
+                       offline path, handing back a READ-ONLY numpy view of the engine's own planar
+                       buffer with no copy. The GIL is released around the blocking/IO calls and
+                       render_block; the one-control-thread rule gets a runtime guard here (Python
+                       makes threads cheap where a game loop made the rule free). pyproject.toml
+                       points scikit-build-core at the REPO ROOT with BWA_BUILD_PYTHON=ON, never at
+                       bindings/python — the ASIO and phonon lookups resolve against
+                       ${CMAKE_SOURCE_DIR} and a top-level project here would silently ship a
+                       no-SDK, no-ASIO engine. The package version is BWA_VERSION from the header,
+                       so a wheel cannot claim a version the library is not. Audience: PsychoPy
+                       (Psychtoolbox is MATLAB and gets a MEX later).
   unreal/              module + component — planned, not yet implemented (docs/integration.md has the notes).
 docs/                  Specs. Start here.
 examples/              cave_layout.json (see docs/layout-schema.md); minimal.c (the client lifecycle),
@@ -313,7 +331,13 @@ with gcc 14.3; Android is verified locally too, 37/38 on an x86_64 emulator (the
 sleep-lateness bound, which a no-SDK library of the same commit misses identically); macOS is CI-only. Phase 5 added no target - the JACK and ALSA sections live inside
 `test_audio_sink`, and on a box with no server and no card that one test reports SKIPPED rather
 than passing. The UTF-8 path work added three (`utf8_path`, `idle`, `cave_both`), on every
-platform. `rt.c` is the concurrency
+platform. `-DBWA_BUILD_PYTHON=ON` adds three more on top of whatever the rest of the flags give
+(`python_bindings` plus `python_example_offline_render` / `python_example_live_onset`), so the
+full-options Windows tree is 48 and the default Windows tree 41; `python_bindings` reports SKIPPED
+rather than failing when pytest is missing, because a C developer should not need it. CI also
+builds a `cp312-abi3` WHEEL on each of the three desktops, installs it into a fresh venv, and runs
+that same pytest suite from the INSTALLED wheel rather than the source tree - shipped as
+`bw_audio-python-<platform>-<ver>` and, on a tag, as three more release assets. `rt.c` is the concurrency
 spine (two SPSC rings, voice + sound tables, commit snapshot, generation handles, retire-ack)
 and the whole `bwa_*` API forwards to it. Spatialization (the DBAP/SPCAP/VBAP gain solve,
 layout load, per-speaker align), calibration (`bwa_calibrate`, the Zylia capsule survey),
@@ -489,6 +513,17 @@ Regression-preventing gotchas. Each has bitten before or guards a real invariant
   follow whether the chosen rule has any HEADROOM (a one-period buffer leaves none, so it reports
   false rather than a zero it could not earn), and a fault detector is not believable until a real
   fault has been injected against it.
+- **A DEVICE POSITION is not a wall clock, so a stall sized against the buffer can miss the
+  dropout it injects.** The exclusive-mode rule is the queued depth: `written` against what
+  IAudioClock reports the device consumed. But GetPosition counts frames READ FROM OUR BUFFER, and
+  a starved device is not reading any, so during a stall the position advances by only about HALF
+  the wall time. On a Realtek endpoint an exclusive buffer is one 144-frame period (3 ms), and the
+  "two buffers plus slack" stall that is exactly right for the shared-mode release-interval rule
+  came to 36 ms and tripped the depth rule at ONE of the three block sizes tried. 150 ms trips it
+  at all three, every run. The shape to remember: when a fault detector reads a DEVICE-reported
+  quantity, size the injection against that quantity's own behavior under fault, not against the
+  buffer arithmetic that looks like it should govern. And a stall that fires sometimes is worse
+  than one that never fires, because it reads as flakiness rather than as a finding.
 - **A self-checking test that CANNOT FAIL is the default outcome, not a rare mistake.** It happened
   three times in the convenience-tier work alone. `examples/convenience.c` counted its failures and
   then returned 0 regardless, so it could only ever have caught a crash. `demo/api.gd` asserted

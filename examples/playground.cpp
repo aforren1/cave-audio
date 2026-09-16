@@ -1005,6 +1005,11 @@ static int engine_mode;             /* which config the live engine was built in
  * sources. Used at startup and on each config-boundary switch. */
 static bwa_sink_type g_sink_mode = BWA_SINK_AUTO;   /* --tests forces BWA_SINK_NULL (hermetic) */
 static const char*   g_device = NULL;               /* --device <name or id>; NULL = the backend's default */
+static uint32_t      g_sink_flags = 0;              /* bwa_desc.sink_flags: --exclusive/--exact-rate/
+                                                     * --tight-buffer, or the panel's checkboxes.
+                                                     * Create-time like the device, so a change
+                                                     * rebuilds (rebuild_for_device). */
+static uint32_t      g_block = 256;                 /* --latency-class moves this; the render quantum */
 static char          g_audio_err[256];              /* bwa_last_error from the last build_engine: the
                                                      * start's failure, or the REASON a start that
                                                      * SUCCEEDED still degraded (a device that would
@@ -1036,9 +1041,10 @@ static void build_engine(int mode) {
         .profile = g_render_pick == 2 ? BWA_PROFILE_CAVE
                  : g_render_pick == 1 ? BWA_PROFILE_BINAURAL : BWA_PROFILE_CAVE_SIM,
         .layout_path = g_layout_path, .hrtf_path = NULL,
-        .sample_rate = SR, .block_size = 256, .sink = g_sink_mode, .device = g_device,
+        .sample_rate = SR, .block_size = g_block, .sink = g_sink_mode, .device = g_device,
         /* create-time: only the reverb scene cares, but it's harmless for the others */
         .bed_decoder = rev_decoder ? BWA_DECODE_EPAD : BWA_DECODE_ALLRAD,
+        .sink_flags = g_sink_flags,   /* exclusive / exact-rate / tight-buffer; 0 = shared, roomy */
     };
     e = bwa_create(&cfg);
     if (!e) { printf("bwa_create failed\n"); exit(1); }
@@ -1381,6 +1387,34 @@ static void draw_panel(void) {
               "DEMANDS that backend and that device by its stable id. A listed device can still fail "
               "to open (unplugged, busy, too few outputs) - the engine falls back to the silent null "
               "sink; the audio line above is the truth.");
+    }
+    {   /* the three sink_flags bits beside the picker. Create-time like the device, so each one
+         * rebuilds; the line under them is what the choice actually bought (the device's own
+         * render-to-DAC delay, which is the number worth watching - not the block size). */
+        uint32_t f = g_sink_flags;
+        bool ex = (f & BWA_SINK_FLAG_EXCLUSIVE) != 0;
+        bool xr = (f & BWA_SINK_FLAG_EXACT_RATE) != 0;
+        bool tb = (f & BWA_SINK_FLAG_TIGHT_BUFFER) != 0;
+        if (ImGui::Checkbox("exclusive", &ex)) f = ex ? (f | BWA_SINK_FLAG_EXCLUSIVE) : (f & ~BWA_SINK_FLAG_EXCLUSIVE);
+        bwTip("BWA_SINK_FLAG_EXCLUSIVE: take the endpoint from every other application, including a "
+              "VR runtime and the browser, for as long as this engine holds it. Lowest latency and "
+              "a fixed callback size. Create-time, so toggling REBUILDS the engine.");
+        ImGui::SameLine();
+        if (ImGui::Checkbox("exact rate", &xr)) f = xr ? (f | BWA_SINK_FLAG_EXACT_RATE) : (f & ~BWA_SINK_FLAG_EXACT_RATE);
+        bwTip("BWA_SINK_FLAG_EXACT_RATE: fail the open if the device cannot run at the engine's "
+              "rate, instead of letting the OS resample. Without it a headphone sink accepts the "
+              "resampler and reports the degradation (the audio line's tooltip).");
+        ImGui::SameLine();
+        if (ImGui::Checkbox("tight buffer", &tb)) f = tb ? (f | BWA_SINK_FLAG_TIGHT_BUFFER) : (f & ~BWA_SINK_FLAG_TIGHT_BUFFER);
+        bwTip("BWA_SINK_FLAG_TIGHT_BUFFER: ask the backend for the smallest device buffer it can "
+              "take, trading dropout margin for latency. A no-op on WASAPI (exclusive mode already "
+              "runs one period, and a shared buffer belongs to the OS mixer).");
+        if (f != g_sink_flags) { g_sink_flags = f; rebuild_for_device(); }
+        char fl[64];
+        const uint32_t lat = e ? bwa_get_output_latency_frames(e) : 0u;
+        ImGui::TextDisabled("flags: %s   out: %u fr (%.1f ms)",
+                            bwa_ex_sink_flags_string(g_sink_flags, fl, sizeof fl), lat,
+                            1000.0f * (float)lat / (float)SR);
     }
     {   /* render picker: cave_sim auditions the ARRAY render on headphones, binaural is the
          * direct per-source render, cave drives the REAL array over ASIO (the rig). Create-time
@@ -2241,7 +2275,8 @@ int main(int argc, char** argv) {
     for (int i = 1; i < argc; ++i)
         if (!strcmp(argv[i], "--help") || !strcmp(argv[i], "-h")) {
             printf("usage: bwa_playground [cave_layout.json] [--device <name or id>] [--sink <backend>]\n"
-                   "                      [--list-devices] [--tests [filter]]\n"
+                   "                      [--exclusive] [--exact-rate] [--tight-buffer]\n"
+                   "                      [--latency-class N] [--list-devices] [--tests [filter]]\n"
                    "  audition the engine by ear on the binaural monitor (by default the system\n"
                    "  default output, over WASAPI on Windows; with no device it renders silently --\n"
                    "  visual-only mode stays live)\n"
@@ -2253,15 +2288,23 @@ int main(int argc, char** argv) {
                    "                     live). The name alone is enough: the backend that owns it\n"
                    "                     takes it\n"
                    "  --sink <backend>   auto | wasapi | asio | null (default auto: wasapi then asio\n"
-                   "                     for a 2-ch render, then the silent offline sink)\n"
-                   "  --list-devices     print every backend's output devices, with ids, and exit\n"
+                   "                     for a 2-ch render, then the silent offline sink)\n");
+            bwa_ex_print_sink_flag_help();
+            printf("  --list-devices     print every backend's output devices, with ids, and exit\n"
                    "  --tests [filter]   run the UI test suite (offline) and exit pass/fail\n"
                    "  --driver, --list-drivers are the old ASIO-only spellings, still accepted\n"
                    "  keys: TAB scene | WASD/RF source | Q/E head | 1-4 signal | SPACE auto-move | F11\n");
             return 0;
         }
     for (int i = 1; i < argc; ++i)
-        if (!strcmp(argv[i], "--tests") || !strcmp(argv[i], "--selftest")) {
+        if (bwa_ex_parse_sink_flag(argv[i], &g_sink_flags)) {   /* --exclusive and friends */
+            continue;
+        } else if (!strcmp(argv[i], "--latency-class") && i + 1 < argc) {
+            if (!bwa_ex_parse_latency_class(argv[++i], &g_sink_flags, &g_block)) {
+                printf("--latency-class takes 0..4\n");
+                return 2;
+            }
+        } else if (!strcmp(argv[i], "--tests") || !strcmp(argv[i], "--selftest")) {
             selftest = true;
             if (i + 1 < argc && argv[i + 1][0] != '-') snprintf(filter, sizeof filter, "%s", argv[i + 1]);
         } else if (!strcmp(argv[i], "--device") && i + 1 < argc) {
@@ -2283,7 +2326,10 @@ int main(int argc, char** argv) {
             bwa_ex_list_devices(BWA_SINK_ASIO);
             return 0;
         }
-    if (selftest) g_sink_mode = BWA_SINK_NULL;
+    /* The suite is hermetic: the offline sink, and the flags and block size back at their defaults
+     * however the command line arrived. A latency class is about a real device, and the suite must
+     * not render at a different quantum depending on the arguments someone passed it. */
+    if (selftest) { g_sink_mode = BWA_SINK_NULL; g_sink_flags = 0; g_block = 256; }
 
     /* Sink policy (interactive): engine default (AUTO) — the system default output for the 2-ch
      * headphone render (WASAPI on Windows, an ASIO driver next), falling back to the offline null

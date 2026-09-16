@@ -1,0 +1,77 @@
+[build-system]
+# nanobind is PINNED EXACTLY, the same rule the root CMakeLists uses for dr_libs, cJSON and imgui:
+# it generates the extension's whole binding layer, so a floating version would change the built
+# artifact without a commit. Bump it deliberately. scikit-build-core is a build driver and takes a
+# floor instead.
+requires = ["scikit-build-core>=0.10", "nanobind==3.0.1"]
+build-backend = "scikit_build_core.build"
+
+[project]
+name = "bw_audio"
+dynamic = ["version"]
+description = "Python binding for the bw_audio spatial audio engine (26-speaker CAVE array, binaural headphone render)"
+readme = "README.md"
+requires-python = ">=3.9"
+license = "GPL-3.0-only"
+authors = [{ name = "Brainworks" }]
+keywords = ["spatial audio", "ambisonics", "binaural", "psychophysics", "psychopy", "CAVE"]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Intended Audience :: Science/Research",
+  "Programming Language :: C",
+  "Programming Language :: Python :: 3",
+  "Topic :: Multimedia :: Sound/Audio",
+]
+dependencies = ["numpy>=1.23"]
+
+[project.optional-dependencies]
+test = ["pytest>=7"]
+
+[project.urls]
+Homepage = "https://github.com/aforren1/cave-audio"
+Documentation = "https://github.com/aforren1/cave-audio/blob/main/docs/api.md"
+
+# ---------------------------------------------------------------------------------------------
+# The CMake source dir is the REPO ROOT, not this directory. The root CMakeLists resolves the ASIO
+# SDK and the staged phonon against ${CMAKE_SOURCE_DIR}, so anything that makes this directory the
+# top-level project silently produces a no-SDK, no-ASIO engine. bindings/python/CMakeLists.txt says
+# the same thing at more length.
+#
+# The cost of that choice is that an SDIST cannot be built from here: the sources it would need sit
+# above the project directory. Build wheels (`uv build --wheel`), or build from a repo checkout.
+# ---------------------------------------------------------------------------------------------
+[tool.scikit-build]
+cmake.source-dir = "../.."
+cmake.version = ">=3.20"
+build-dir = "build/{wheel_tag}"
+# src layout on purpose: with the package at the project root, a `pytest` run from this
+# directory would import the SOURCE tree, which holds no extension, and fail on `_bwa`.
+wheel.packages = ["src/bw_audio"]
+# Only the extension, so a wheel build does not also compile the test suite and the tools.
+build.targets = ["_bwa"]
+# Version-specific by default; the override below promotes it to abi3 on a Python that can.
+wheel.py-api = ""
+
+[tool.scikit-build.cmake.define]
+BWA_BUILD_PYTHON = "ON"
+BWA_BUILD_TESTS = "OFF"
+
+# One wheel per platform instead of one per Python. nanobind's STABLE_ABI targets the 3.12 limited
+# API, so the tag can only be claimed by a build that actually used it - hence the version guard
+# rather than a flat `py-api = "cp312"`, which would mislabel a 3.11 build.
+[[tool.scikit-build.overrides]]
+if.python-version = ">=3.12"
+wheel.py-api = "cp312"
+
+# The package version is the ABI version in include/bw_audio.h, read at build time. A wheel can
+# therefore never claim a version the library is not. The RELEASE version is the git tag, as for
+# the Unity package and the Godot addon; the two streams are deliberately independent (docs/build.md,
+# "Releasing").
+[tool.scikit-build.metadata.version]
+provider = "scikit_build_core.metadata.regex"
+input = "../../include/bw_audio.h"
+regex = '''(?sm)^#define\s+BWA_VERSION_MAJOR\s+(?P<major>\d+).*?^#define\s+BWA_VERSION_MINOR\s+(?P<minor>\d+).*?^#define\s+BWA_VERSION_PATCH\s+(?P<patch>\d+)'''
+result = "{major}.{minor}.{patch}"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

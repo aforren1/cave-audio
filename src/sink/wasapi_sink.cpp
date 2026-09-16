@@ -21,6 +21,11 @@
  * headphone decode silences any other size), so every callback goes through sink_quant, which
  * renders whole engine blocks and hands the device whatever it asked for.
  *
+ * THE OTHER TWO sink_flags bits need no code here. EXACT_RATE arrives folded into `exact_rate`
+ * (sink.c), which the shared path below already honors by refusing the OS resampler and naming
+ * both rates; exclusive mode never had a resampler to refuse. TIGHT_BUFFER is a no-op: exclusive
+ * mode already runs a one-period buffer, and a shared-mode buffer belongs to the OS mixer.
+ *
  * AUDIO THREAD. The render thread does exactly what null_sink.c's does: wait, stamp, render,
  * convert, hand over, account. Everything it needs is allocated at open. No locks, no logging,
  * no allocation past the COM calls WASAPI itself makes inside GetBuffer/ReleaseBuffer.
@@ -85,6 +90,7 @@ struct WasapiSink {
     uint32_t   latency_frames;     /* render->DAC, constant for the life of the sink                  */
     sink_fmt   fmt;
     bool       exclusive;
+    bool       align_retry;        /* AUDCLNT_E_BUFFER_SIZE_NOT_ALIGNED fired and was re-tried    */
 
     IMMDevice*           dev;
     IAudioClient*        client;
@@ -528,6 +534,20 @@ void wasapi_health(bwa_sink* base, bwa_sink_health* out) {
 extern "C" uint32_t sink_wasapi_device_frames(bwa_sink* base) { return ((WasapiSink*)base)->device_frames; }
 extern "C" uint32_t sink_wasapi_period_frames(bwa_sink* base) { return ((WasapiSink*)base)->period_frames; }
 
+/* The other two readbacks the exclusive-mode test needs, and neither is inferable from outside:
+ * which format the exclusive walk landed on, and whether the device made us do the
+ * AUDCLNT_E_BUFFER_SIZE_NOT_ALIGNED dance. A test that cannot say which of those paths it
+ * exercised is reporting coverage it does not have. */
+extern "C" const char* sink_wasapi_format_name(bwa_sink* base) {
+    switch (((WasapiSink*)base)->fmt) {
+    case SINK_FMT_I32: return "int32";
+    case SINK_FMT_I24: return "int24";
+    case SINK_FMT_I16: return "int16";
+    default:           return "float32";
+    }
+}
+extern "C" bool sink_wasapi_align_retry(bwa_sink* base) { return ((WasapiSink*)base)->align_retry; }
+
 const bwa_sink_vtbl WASAPI_VT = {   /* designated: stop/close share a signature, so a positional swap would be silent */
     .type = BWA_SINK_WASAPI,
     .start = wasapi_start, .stop = wasapi_stop, .close = wasapi_close,
@@ -632,6 +652,7 @@ extern "C" bwa_sink* bwa_wasapi_sink_open(uint32_t sample_rate, uint32_t block_s
     sink_fmt chosen = SINK_FMT_F32;
     bool converting = false;           /* the OS is resampling/reformatting for us (rule 6)   */
     uint32_t period_frames = block_size;
+    bool align_retry = false;
     char degraded[192] = {0};
 
     if (exclusive) {
@@ -664,6 +685,7 @@ extern "C" bwa_sink* bwa_wasapi_sink_open(uint32_t sample_rate, uint32_t block_s
             /* The documented dance: the device tells us the size it actually wants through
              * GetBufferSize, and the client has to be thrown away and rebuilt to use it. */
             UINT32 aligned = 0;
+            align_retry = true;
             client->GetBufferSize(&aligned);
             client->Release(); client = nullptr;
             if (aligned && SUCCEEDED(dev->Activate(__uuidof(IAudioClient), CLSCTX_ALL, nullptr, (void**)&client)) && client) {
@@ -815,6 +837,7 @@ extern "C" bwa_sink* bwa_wasapi_sink_open(uint32_t sample_rate, uint32_t block_s
     s->period_frames = period_frames ? period_frames : device_frames;
     s->fmt           = chosen;
     s->exclusive     = exclusive;
+    s->align_retry   = align_retry;
     s->dev           = dev;
     s->client        = client;
     s->rc            = rc;

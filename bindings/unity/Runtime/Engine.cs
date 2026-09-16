@@ -38,7 +38,9 @@ namespace BwAudio
         [UnityEngine.Serialization.FormerlySerializedAs("asioDriver")]
         public string device = "";
         [Tooltip("Backend options. Exclusive takes a WASAPI endpoint from every other application on " +
-                 "the machine; leave it off for a monitor that shares the device with a VR runtime.")]
+                 "the machine; leave it off for a monitor that shares the device with a VR runtime. " +
+                 "ExactRate fails the open rather than letting the OS resample. TightBuffer takes " +
+                 "the smallest device buffer the backend can, trading dropout margin for latency.")]
         public BwaSinkFlags sinkFlags = BwaSinkFlags.None;
 
         /// <summary>The old spelling of <see cref="device"/>, kept so existing scripts compile.</summary>

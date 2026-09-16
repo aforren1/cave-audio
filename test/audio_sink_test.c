@@ -284,6 +284,235 @@ static int test_wasapi(void) {
     bwa_sink_close(s);                            /* must return, not hang */
     return ok ? 0 : 1;
 }
+
+/* Both subsections below open through bwa_sink_open rather than bwa_wasapi_sink_open, on purpose:
+ * that is the path a caller's bwa_desc.sink_flags actually takes, and it is where
+ * BWA_SINK_FLAG_EXACT_RATE is folded into the backend's exact_rate argument. Calling the backend
+ * directly would test the sink and skip the policy. A named backend is a DEMAND, so there is no
+ * silent null-sink fallback to mistake for a pass. */
+static bwa_sink* wasapi_open(uint32_t sr, uint32_t bs, uint32_t flags, Probe* p,
+                             char* err, size_t errcap) {
+    err[0] = 0;
+    return bwa_sink_open(sr, bs, 2, BWA_SINK_WASAPI, NULL, flags, false, on_render, p, err, errcap);
+}
+
+/* EXCLUSIVE MODE (BWA_SINK_FLAG_EXCLUSIVE). Three claims, none of which the shared-mode section
+ * above can make:
+ *   1. it is LOWER LATENCY than a shared open at the same block, which is the whole reason to pay
+ *      for it (the endpoint leaves every other application on the machine);
+ *   2. health.measured is TRUE, because exclusive mode uses sink_quant's device-position DEPTH
+ *      rule rather than the shared release-interval rule;
+ *   3. an injected stall trips that depth rule - one dropout, with a nonzero frame count.
+ * Claim 3 is the one that had never been exercised anywhere: every earlier live dropout in this
+ * file came through the shared-mode release-interval rule or the null sink's own accounting.
+ *
+ * A block size the endpoint refuses is PRINTED and skipped, not failed: an exclusive-mode device
+ * period is the driver's to set, and a device that will not do 64 frames is not a defect here.
+ *
+ * Returns 0 (ok), 1 (failed), or SKIP_EXIT when there is no endpoint at all. */
+static int test_wasapi_exclusive(void) {
+    const uint32_t SR = 48000;
+    const uint32_t SIZES[3] = { 256, 128, 64 };
+    char err[256] = {0};
+
+    Probe pb;
+    probe_init(&pb, 2);
+    bwa_sink* sh = wasapi_open(SR, 256, 0, &pb, err, sizeof err);
+    if (!sh) {
+        if (strstr(err, "no active render endpoint")) {
+            printf("SKIP: wasapi exclusive: %s\n", err);
+            return SKIP_EXIT;
+        }
+        fprintf(stderr, "FAIL: wasapi exclusive: the shared baseline open failed: %s\n", err);
+        return 1;
+    }
+    const uint32_t shared_lat = bwa_sink_output_latency(sh);
+    bwa_sink_close(sh);
+    printf("wasapi exclusive: shared baseline at 256 = %u frames (%.1f ms)\n",
+           shared_lat, 1000.0 * (double)shared_lat / (double)SR);
+
+    int ok = 1, ran = 0;
+    for (int i = 0; i < 3; ++i) {
+        const uint32_t BS = SIZES[i];
+        Probe p;
+        probe_init(&p, 2);
+        char e2[256] = {0};
+        bwa_sink* s = wasapi_open(SR, BS, BWA_SINK_FLAG_EXCLUSIVE, &p, e2, sizeof e2);
+        if (!s) {
+            printf("  %3u frames: REFUSED - %s\n", BS, e2[0] ? e2 : "(no message)");
+            continue;
+        }
+        ran = 1;
+        const uint32_t lat  = bwa_sink_output_latency(s);
+        const uint32_t devf = sink_wasapi_device_frames(s);
+        const uint32_t perf = sink_wasapi_period_frames(s);
+        printf("  %3u frames: latency=%u (%.1f ms) buffer=%u period=%u format=%s align-retry=%s\n",
+               BS, lat, 1000.0 * (double)lat / (double)SR, devf, perf,
+               sink_wasapi_format_name(s), sink_wasapi_align_retry(s) ? "yes" : "no");
+
+        if (BS == 256 && lat >= shared_lat) {
+            fprintf(stderr, "FAIL: exclusive at 256 reports %u frames, no better than shared's %u; "
+                            "exclusive mode exists to be lower\n", lat, shared_lat);
+            ok = 0;
+        }
+        if (bwa_sink_block_size(s) != BS) {
+            fprintf(stderr, "FAIL: block_size() is %u, want the engine's %u\n",
+                    bwa_sink_block_size(s), BS); ok = 0;
+        }
+        if (bwa_sink_start(s) != 0) {
+            fprintf(stderr, "FAIL: exclusive start at %u frames\n", BS);
+            bwa_sink_close(s); ok = 0; continue;
+        }
+
+        os_sleep_ms(200);
+        bwa_sink_health h1;
+        bwa_sink_get_health(s, &h1);
+        if (h1.dropouts != 0) {
+            fprintf(stderr, "FAIL: %llu dropouts on a healthy 200 ms exclusive run at %u frames\n",
+                    (unsigned long long)h1.dropouts, BS); ok = 0;
+        }
+
+        /* The injected stall. "Two buffers plus slack" is the right size for the shared-mode rule
+         * above and is NOT enough here, which is worth knowing: an exclusive-mode buffer on this
+         * class of endpoint is one 3 ms period, and IAudioClock's position advances by only about
+         * half the wall time the stream is starved - it counts frames READ FROM OUR BUFFER, and a
+         * starved device is not reading any. A 36 ms stall over a 144-frame buffer therefore
+         * produced a gap on one block size out of three, which reads as a flaky test rather than
+         * as what it is. 150 ms is long enough that the partial advance still clears the buffer at
+         * every size, measured. */
+        const unsigned stall_ms = (2u * devf * 1000u / SR) + 150u;
+        atomic_store_explicit(&p.stall_ms_once, (int)stall_ms, memory_order_relaxed);
+        os_sleep_ms(200u + stall_ms);
+        bwa_sink_stop(s);
+
+        bwa_sink_health h;
+        bwa_sink_get_health(s, &h);
+        if (!p.nframes_stable || p.nframes_first != BS) {
+            fprintf(stderr, "FAIL: nframes varied or was not the block size (first=%u, stable=%d)\n",
+                    p.nframes_first, p.nframes_stable); ok = 0;
+        }
+        if (!p.time_monotonic) { fprintf(stderr, "FAIL: system_time_ns not monotonic\n"); ok = 0; }
+        if (!p.pos_monotonic)  { fprintf(stderr, "FAIL: sample_pos not monotonic\n");     ok = 0; }
+        /* Exclusive mode reads the device's own position every callback, so it can always judge.
+         * An unmeasured exclusive stream means IAudioClock never answered. */
+        if (!h.measured) {
+            fprintf(stderr, "FAIL: an exclusive stream must report measured (the depth rule reads "
+                            "IAudioClock every callback)\n"); ok = 0;
+        }
+        if (h.dropouts != 1) {
+            fprintf(stderr, "FAIL: one %u ms stall past two buffers, but the depth rule counted "
+                            "%llu dropouts (want exactly 1: it re-anchors to the device position "
+                            "after each one)\n", stall_ms, (unsigned long long)h.dropouts); ok = 0;
+        }
+        if (h.dropouts >= 1 && h.dropped_frames == 0) {
+            fprintf(stderr, "FAIL: the depth rule counted a dropout with 0 dropped frames; the gap "
+                            "IS the frame count there, so zero means the arithmetic is wrong\n");
+            ok = 0;
+        }
+        if (h.device_lost) { fprintf(stderr, "FAIL: the device was reported lost\n"); ok = 0; }
+        printf("      stall %u ms -> dropouts=%llu dropped=%llu late=%llu measured=%d blocks=%lu\n",
+               stall_ms, (unsigned long long)h.dropouts, (unsigned long long)h.dropped_frames,
+               (unsigned long long)h.late_blocks, h.measured ? 1 : 0, p.blocks);
+        bwa_sink_close(s);
+    }
+
+    if (!ran) {
+        /* Every size refused. The endpoint exists, so this is not the no-device skip - but it is
+         * also not a defect in this code, and saying "passed" would be a lie. */
+        printf("SKIP: wasapi exclusive: this endpoint refused exclusive mode at 256, 128 and 64\n");
+        return SKIP_EXIT;
+    }
+    return ok ? 0 : 1;
+}
+
+/* The first decimal run in a message, so a rate the sink REPORTED can be compared rather than
+ * assumed. Both messages below open with the endpoint's own rate. 0 = no digits. */
+static uint32_t first_uint(const char* s) {
+    for (; s && *s; ++s)
+        if (*s >= '0' && *s <= '9') return (uint32_t)strtoul(s, NULL, 10);
+    return 0;
+}
+
+/* EXACT RATE (BWA_SINK_FLAG_EXACT_RATE), the strictness PsychPortAudio spells
+ * paMacCoreFailIfConversionRequired / eStreamOptionMatchFormat. Shared mode's DEFAULT is to accept
+ * the OS resampler and report the degradation (rule 6); with the flag the open must fail instead,
+ * and the message must name BOTH rates, because "it did not work" is not actionable.
+ *
+ * ORDER MATTERS HERE, and the first draft of this test had it backwards. Asking the STRICT open
+ * first and treating its success as "the endpoint takes that rate" cannot distinguish an endpoint
+ * that takes both rates from a build where the flag is not wired up at all: unwiring the fold in
+ * sink.c turned this test SKIP rather than red, which is the cannot-fail test CLAUDE.md warns
+ * about. So the DEFAULT open goes first and its rule-6 degradation is the ground truth about what
+ * the OS is resampling. Only a rate that open PROVED is resampled goes to the strict one, where a
+ * success is then unambiguously a failure of the flag.
+ *
+ * Returns 0 (ok), 1 (failed), or SKIP_EXIT when there is no endpoint at all. */
+static int test_wasapi_exact_rate(void) {
+    /* Step 1: find a rate this endpoint does NOT take natively, from the default open's own
+     * degradation report. 48 kHz is the engine's rate and the likeliest endpoint rate, so a
+     * mismatch there is worth knowing about; 44.1 is the fallback probe. */
+    const uint32_t PROBE[2] = { 48000, 44100 };
+    uint32_t miss = 0, dev_rate = 0;
+    char degraded[256] = {0};
+    for (int i = 0; i < 2 && !miss; ++i) {
+        Probe p;
+        probe_init(&p, 2);
+        char e[256] = {0};
+        bwa_sink* s = wasapi_open(PROBE[i], 256, 0, &p, e, sizeof e);
+        if (!s) {
+            if (strstr(e, "no active render endpoint")) {
+                printf("SKIP: wasapi exact-rate: %s\n", e);
+                return SKIP_EXIT;
+            }
+            fprintf(stderr, "FAIL: a default (shared, resampling allowed) open at %u Hz must "
+                            "succeed; it failed: %s\n", PROBE[i], e);
+            return 1;
+        }
+        if (strstr(e, "resampling")) {      /* rule 6's degradation: this rate is NOT native */
+            miss     = PROBE[i];
+            dev_rate = first_uint(e);
+            snprintf(degraded, sizeof degraded, "%s", e);
+        }
+        bwa_sink_close(s);
+    }
+    if (!miss) {
+        /* Nothing to refuse: the endpoint takes both probe rates without conversion. Not a pass. */
+        printf("SKIP: wasapi exact-rate: this endpoint takes 48000 and 44100 Hz natively in shared "
+               "mode, so there is no resampled open to refuse\n");
+        return SKIP_EXIT;
+    }
+    printf("wasapi exact-rate: the endpoint runs at %u Hz, so %u Hz is resampled by default\n",
+           dev_rate, miss);
+    printf("  without the flag: open OK, degraded - %s\n", degraded);
+
+    /* Step 2: the SAME open with the flag must fail, naming both rates and the reason. */
+    Probe p2;
+    probe_init(&p2, 2);
+    char e1[256] = {0};
+    bwa_sink* bad = wasapi_open(miss, 256, BWA_SINK_FLAG_EXACT_RATE, &p2, e1, sizeof e1);
+    if (bad) {
+        bwa_sink_close(bad);
+        fprintf(stderr, "FAIL: %u Hz was resampled on the open above, so BWA_SINK_FLAG_EXACT_RATE "
+                        "must refuse it - the open succeeded instead, which means the flag never "
+                        "reached the backend\n", miss);
+        return 1;
+    }
+    int ok = 1;
+    char want_miss[16], want_dev[16];
+    snprintf(want_miss, sizeof want_miss, "%u", miss);
+    snprintf(want_dev,  sizeof want_dev,  "%u", dev_rate);
+    if (!strstr(e1, want_miss) || !dev_rate || !strstr(e1, want_dev)) {
+        fprintf(stderr, "FAIL: the strict-open failure must name BOTH rates (the device's %u and "
+                        "the engine's %u); it said: %s\n", dev_rate, miss, e1);
+        ok = 0;
+    }
+    if (!strstr(e1, "must not resample")) {
+        fprintf(stderr, "FAIL: the strict-open failure does not say why: %s\n", e1);
+        ok = 0;
+    }
+    printf("  with the flag:    open REFUSED - %s\n", e1);
+    return ok ? 0 : 1;
+}
 #endif /* BWA_HAVE_WASAPI */
 
 #ifdef BWA_HAVE_JACK
@@ -511,10 +740,63 @@ static int test_jack(void) {
  * "pulse", "plughw:0,0" or a rig's "hw:" card without editing code. Do NOT point it at the
  * hardware-free "null" PCM: that one accepts writes as fast as they arrive and never paces, so the
  * device cannot run dry and the underrun assertion below fails by construction. Measured: 257,811
- * blocks in the same 470 ms a paced device renders 76 in. It is good for the open sequence and the
- * format walk, nothing else.
+ * blocks in the same 470 ms a paced device renders 76 in. It is good for the open sequence, the
+ * format walk and the hw-params negotiation (alsa_tight_buffer uses it for exactly that), and
+ * nothing else.
  *
  * Returns 0 (ok), 1 (failed), or SKIP_EXIT when there is no PCM to open. */
+
+/* BWA_SINK_FLAG_TIGHT_BUFFER on one PCM: open it twice, plain and tight, and compare what the
+ * device granted. Returns 1 for ok, 0 for a failure, and prints either way.
+ *
+ * `hard` is the difference between a claim and a report, and it exists because a SERVER PCM can
+ * refuse: the ALSA pulse plugin returns three periods whether or not the smaller buffer is asked
+ * for, measured, so demanding two on whatever PCM the box happens to offer would fail a correct
+ * sink. The hardware-free "null" PCM has no such constraint (nothing paces it, so nothing bounds
+ * its buffer) and every ALSA install has one, so that is where the claim is demanded - the same
+ * split the section header describes for the format walk. One rule is hard on every PCM: a tight
+ * open must never come back DEEPER than the default one. */
+static int alsa_tight_buffer(const char* pcm, int hard, uint32_t SR, uint32_t BS) {
+    Probe q0, q1;
+    probe_init(&q0, 2);
+    probe_init(&q1, 2);
+    char e0[256] = {0}, e1[256] = {0};
+    bwa_sink* a = bwa_sink_open(SR, BS, 2, BWA_SINK_ALSA, pcm, 0, false, on_render, &q0, e0, sizeof e0);
+    bwa_sink* b = bwa_sink_open(SR, BS, 2, BWA_SINK_ALSA, pcm, BWA_SINK_FLAG_TIGHT_BUFFER,
+                                false, on_render, &q1, e1, sizeof e1);
+    int ok = 1;
+    if (!a || !b) {
+        /* The default open already succeeded once for the section's own PCM, and "null" is always
+         * there, so a failure here is real either way. */
+        fprintf(stderr, "FAIL: PCM '%s' refused the %s open: %s\n", pcm ? pcm : "default",
+                a ? "tight-buffer" : "plain", (a ? e1 : e0)[0] ? (a ? e1 : e0) : "(no message)");
+        ok = 0;
+    } else {
+        const uint32_t p0 = sink_alsa_period_frames(a), b0 = sink_alsa_buffer_frames(a);
+        const uint32_t p1 = sink_alsa_period_frames(b), b1 = sink_alsa_buffer_frames(b);
+        printf("  tight buffer on '%s': period=%u buffer=%u (plain: period=%u buffer=%u)\n",
+               pcm ? pcm : "default", p1, b1, p0, b0);
+        if (b1 > b0) {
+            fprintf(stderr, "FAIL: TIGHT_BUFFER made the buffer DEEPER on '%s' (%u frames against "
+                            "the plain open's %u)\n", pcm ? pcm : "default", b1, b0); ok = 0;
+        }
+        if (p1 == 0 || b1 != 2u * p1) {
+            if (hard) {
+                fprintf(stderr, "FAIL: TIGHT_BUFFER must settle on two periods on '%s'; it reports "
+                                "buffer=%u against period=%u\n", pcm ? pcm : "default", b1, p1);
+                ok = 0;
+            } else {
+                printf("      NOTE: this PCM did not grant two periods (buffer=%u, period=%u); a "
+                       "server PCM bounds its own buffer\n", b1, p1);
+            }
+        }
+    }
+    if (a) bwa_sink_close(a);
+    if (b) bwa_sink_close(b);
+    return ok;
+}
+
+/* The ALSA section proper. Returns 0 (ok), 1 (failed), or SKIP_EXIT when there is no PCM. */
 static int test_alsa(void) {
     const uint32_t SR = 48000, BS = 256;
     const char* dev = getenv("BWA_TEST_ALSA_DEVICE");
@@ -638,6 +920,47 @@ static int test_alsa(void) {
         } else {
             printf("  rate mismatch rejected: %s\n", e2);
         }
+    }
+
+    /* --- BWA_SINK_FLAG_TIGHT_BUFFER: three periods of buffer become two. Read back from the sink
+     *     rather than assumed, because set_buffer_size_near is a REQUEST and the device rounds it
+     *     to whatever it can do. Run twice: once on the section's real PCM, where the result is
+     *     REPORTED, and once on "null", where it is DEMANDED. See alsa_tight_buffer. --- */
+    if (!alsa_tight_buffer(dev, 0, SR, BS)) ok = 0;
+    if (!alsa_tight_buffer("null", 1, SR, BS)) ok = 0;
+
+    /* --- BWA_SINK_FLAG_EXACT_RATE: the flag must reach the backend as exact_rate does. The
+     *     assertion is that the two AGREE at an absurd rate, which is what goes red if the fold in
+     *     sink.c is removed: without it the flag open falls back on the plug PCM's converter and
+     *     succeeds while the argument open refuses. A hw: PCM refuses both, which agrees too. --- */
+    {
+        const uint32_t absurd = 999999;
+        Probe q1, q2;
+        probe_init(&q1, 2);
+        probe_init(&q2, 2);
+        char ea[256] = {0}, eb[256] = {0};
+        bwa_sink* by_arg  = bwa_alsa_sink_open(absurd, BS, 2, dev, 0, true, on_render, &q1, ea, sizeof ea);
+        bwa_sink* by_flag = bwa_sink_open(absurd, BS, 2, BWA_SINK_ALSA, dev,
+                                          BWA_SINK_FLAG_EXACT_RATE, false, on_render, &q2, eb, sizeof eb);
+        if ((by_arg != NULL) != (by_flag != NULL)) {
+            fprintf(stderr, "FAIL: BWA_SINK_FLAG_EXACT_RATE and the exact_rate argument disagree at "
+                            "%u Hz (argument %s, flag %s); the flag is not reaching the backend\n",
+                    absurd, by_arg ? "opened" : "refused", by_flag ? "opened" : "refused");
+            ok = 0;
+        } else if (!by_flag) {
+            if (!rejects_naming_both(eb, absurd)) {
+                fprintf(stderr, "FAIL: the flag's rejection must name both rates; got: %s\n",
+                        eb[0] ? eb : "(no message)");
+                ok = 0;
+            } else {
+                printf("  exact-rate flag rejected %u Hz: %s\n", absurd, eb);
+            }
+        } else {
+            printf("  NOTE: PCM '%s' accepts %u Hz either way, so the flag has nothing to refuse\n",
+                   dev ? dev : "default", absurd);
+        }
+        if (by_arg)  bwa_sink_close(by_arg);
+        if (by_flag) bwa_sink_close(by_flag);
     }
     return ok ? 0 : 1;
 }
@@ -803,6 +1126,75 @@ static int test_aaudio(void) {
             printf("  rate mismatch rejected: %s\n", e2);
         }
     }
+
+    /* --- BWA_SINK_FLAG_TIGHT_BUFFER: one burst instead of two, read back with
+     *     AAudioStream_getBufferSizeInFrames. The device can refuse to go that low (the service
+     *     clamps against the stream's capacity), so a REFUSED request is printed rather than
+     *     failed - what must hold is that it did not come back DEEPER than the default. Opened
+     *     through bwa_sink_open, the path a caller's bwa_desc.sink_flags actually takes. --- */
+    {
+        Probe q;
+        probe_init(&q, 2);
+        char e3[256] = {0};
+        bwa_sink* t = bwa_sink_open(SR, BS, 2, BWA_SINK_AAUDIO, dev, BWA_SINK_FLAG_TIGHT_BUFFER,
+                                    false, on_render, &q, e3, sizeof e3);
+        if (!t) {
+            fprintf(stderr, "FAIL: the same device refused a tight-buffer open: %s\n",
+                    e3[0] ? e3 : "(no message)");
+            ok = 0;
+        } else {
+            const uint32_t tburst  = sink_aaudio_burst_frames(t);
+            const uint32_t tbuffer = sink_aaudio_buffer_frames(t);
+            printf("  tight buffer: burst=%u buffer=%u frames (default was burst=%u buffer=%u)\n",
+                   tburst, tbuffer, burst, buffer);
+            if (tbuffer > buffer) {
+                fprintf(stderr, "FAIL: TIGHT_BUFFER asked for one burst and got %u frames, DEEPER "
+                                "than the default open's %u\n", tbuffer, buffer); ok = 0;
+            }
+            /* The demandable half. Where the default open actually got the two bursts it asked
+             * for, the tight one must come back SHALLOWER - otherwise the flag reached nothing.
+             * Where the service had already clamped the default to one burst there is nothing
+             * left to give, and that is reported instead of failed. */
+            if (buffer > burst && tbuffer >= buffer) {
+                fprintf(stderr, "FAIL: the default open got %u frames (burst %u) and the tight one "
+                                "got %u; TIGHT_BUFFER bought nothing\n", buffer, burst, tbuffer);
+                ok = 0;
+            } else if (buffer <= burst) {
+                printf("  NOTE: the default open was already one burst deep (%u), so there is "
+                       "nothing for TIGHT_BUFFER to shrink on this device\n", buffer);
+            }
+            if (tburst && tbuffer != tburst) {
+                printf("  NOTE: the service did not grant exactly one burst (%u); it settled on "
+                       "%u frames\n", tburst, tbuffer);
+            }
+            bwa_sink_close(t);
+        }
+    }
+
+    /* --- BWA_SINK_FLAG_EXACT_RATE: the rate open above was ACCEPTED with a degradation, which is
+     *     rule 6's default. The flag must turn that same open into a refusal, checked against the
+     *     device-rate probe rather than the stream's own report (a shared-mode stream reports the
+     *     rate it was asked for whether or not the service is resampling). --- */
+    {
+        const uint32_t absurd = 999999;
+        Probe q;
+        probe_init(&q, 2);
+        char e4[256] = {0};
+        bwa_sink* strict = bwa_sink_open(absurd, BS, 2, BWA_SINK_AAUDIO, dev,
+                                         BWA_SINK_FLAG_EXACT_RATE, false, on_render, &q, e4, sizeof e4);
+        if (strict) {
+            fprintf(stderr, "FAIL: BWA_SINK_FLAG_EXACT_RATE must refuse a %u Hz open on a device "
+                            "that does not run at that rate; it opened instead\n", absurd);
+            bwa_sink_close(strict);
+            ok = 0;
+        } else if (!rejects_naming_both(e4, absurd)) {
+            fprintf(stderr, "FAIL: the flag's rejection must name both rates; got: %s\n",
+                    e4[0] ? e4 : "(no message)");
+            ok = 0;
+        } else {
+            printf("  exact-rate flag rejected %u Hz: %s\n", absurd, e4);
+        }
+    }
     return ok ? 0 : 1;
 }
 #endif /* BWA_HAVE_AAUDIO */
@@ -863,6 +1255,16 @@ int main(void) {
 #ifdef BWA_HAVE_WASAPI
     {
         const int rc = test_wasapi();
+        if (rc == 1) return 1;
+        if (rc == SKIP_EXIT) device_skipped = 1; else device_ran = 1;
+    }
+    {
+        const int rc = test_wasapi_exclusive();
+        if (rc == 1) return 1;
+        if (rc == SKIP_EXIT) device_skipped = 1; else device_ran = 1;
+    }
+    {
+        const int rc = test_wasapi_exact_rate();
         if (rc == 1) return 1;
         if (rc == SKIP_EXIT) device_skipped = 1; else device_ran = 1;
     }

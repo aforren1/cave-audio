@@ -984,6 +984,21 @@ if(BWA_BUILD_TESTS)
   endif()
 endif()
 
+# ---- Optional: Python binding (nanobind) ----
+# Opt-in, because it needs a Python 3.9+ interpreter with nanobind importable and the default build
+# has no Python dependency at all:
+#   cmake -S . -B build -DBWA_BUILD_PYTHON=ON
+# It registers three more ctests (the pytest suite plus the two examples in --tests mode). This is
+# ALSO the path a wheel build takes: bindings/python/pyproject.toml points scikit-build-core at THIS
+# file with the option on, rather than making bindings/python its own project, because the ASIO and
+# phonon lookups above resolve against ${CMAKE_SOURCE_DIR} and would miss from anywhere else. See
+# bindings/python/CMakeLists.txt and bindings/python/README.md.
+option(BWA_BUILD_PYTHON "Build the Python binding (nanobind; needs Python 3.9+ with nanobind)" OFF)
+if(BWA_BUILD_PYTHON)
+  enable_language(CXX)
+  add_subdirectory(bindings/python)
+endif()
+
 # ---- Shared Dear ImGui stack for the GUI tools (bwa_calib_view, bwa_layout_tool) ----
 # One pinned copy of imgui + imgui_test_engine, compiled INTO each tool as target sources (not a
 # library: the test-engine define below must be seen by every imgui-including TU of an executable,

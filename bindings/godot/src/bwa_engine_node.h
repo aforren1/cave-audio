@@ -57,9 +57,16 @@ public:
 	 * and JACK are reserved values - the Windows build carries none of them yet. */
 	enum Sink { SINK_AUTO = 0, SINK_ASIO = 1, SINK_NULL = 2, SINK_MANUAL = 3,
 		SINK_WASAPI = 4, SINK_COREAUDIO = 5, SINK_ALSA = 6, SINK_AAUDIO = 7, SINK_JACK = 8 };
-	/* sink_flags bits. EXCLUSIVE takes a WASAPI endpoint from every other application on the
-	 * machine; leave it off for a monitor that shares its device with a game or a VR runtime. */
-	enum SinkFlags { SINK_FLAG_NONE = 0, SINK_FLAG_EXCLUSIVE = 1 };
+	/* sink_flags bits (bwa_desc.sink_flags). EXCLUSIVE takes a WASAPI endpoint from every other
+	 * application on the machine; leave it off for a monitor that shares its device with a game
+	 * or a VR runtime. EXACT_RATE fails the open when the device cannot run at the engine rate,
+	 * instead of letting the OS resample. TIGHT_BUFFER asks the backend for the smallest device
+	 * buffer it can take, trading dropout margin for latency. None of them reaches the CaveBoth
+	 * monitor. docs/api.md's "Latency classes" has the per-backend table. */
+	enum SinkFlags {
+		SINK_FLAG_NONE = 0, SINK_FLAG_EXCLUSIVE = 1,
+		SINK_FLAG_EXACT_RATE = 2, SINK_FLAG_TIGHT_BUFFER = 4,
+	};
 	/* Value 0 is RESERVED for default-init, mirroring the C enum: it means the engine's current
 	 * default rather than a named algorithm, so the default can move without an ABI break. */
 	enum BedDecoder { DECODE_DEFAULT = 0, DECODE_ALLRAD = 1, DECODE_EPAD = 2 };

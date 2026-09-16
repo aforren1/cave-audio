@@ -107,12 +107,20 @@ Two integration shapes, and the second needs no Linux backend at all:
   sample-accurate scheduler. This works on Windows today and on Linux after phase 2. It is the
   shape to start with for any experiment that can pre-render.
 
-The bindings are the open item, not the backends. PsychoPy is Python: a nanobind extension
-over the C ABI, one compiled module per platform, with `bwa_render_block`'s engine-owned block
-exposed as a zero-copy array view for the offline shape. Psychtoolbox is MATLAB or Octave: a
-MEX on the classic C MEX API, which Octave implements, and not the MATLAB-only C++ Data API.
-Neither exists yet. One rule for both: never install the audio-thread capture tap from an
-interpreter, even through a wrapper that takes the GIL; the manual sink is the offline path.
+**The Python binding exists** ([`bindings/python/`](../bindings/python/), and
+[integration.md](./integration.md) puts it beside Unity and Godot). It is the nanobind extension
+this section used to describe as future work: one wheel per platform, tagged `cp312-abi3`, with the
+engine library inside it, and with `bwa_render_block`'s engine-owned block exposed as a read-only
+numpy view so the offline shape costs no copy. PsychoPy is Python, so it uses that package
+directly. `bindings/python/examples/offline_render.py` and `live_onset.py` are the two shapes above,
+runnable.
+
+Psychtoolbox is the one still open. It is MATLAB or Octave: a MEX on the classic C MEX API, which
+Octave implements, and not the MATLAB-only C++ Data API. It does not exist yet.
+
+One rule holds for both, and the Python binding enforces it by refusing to expose the call: never
+install the audio-thread capture tap (`bwa_set_output_capture`) from an interpreter, even through a
+wrapper that takes the GIL. The manual sink is the offline path.
 
 Out of scope, on purpose:
 
@@ -288,6 +296,13 @@ nothing). Nothing reopens on its own.
 The adapter adds the frames it holds in its FIFO. The value stays constant for the life of the
 sink, as the header promises.
 
+`BWA_SINK_FLAG_TIGHT_BUFFER` in `bwa_desc.sink_flags` asks the backend for the smallest device
+buffer it can take, which moves this number and nothing else about the contract. ALSA asks for 2
+periods instead of 3, AAudio for 1 burst instead of 2. WASAPI ignores it: exclusive mode already
+runs a one-period buffer, and a shared-mode buffer belongs to the OS mixer. So do ASIO and JACK,
+where the driver or the server owns the buffer. The device can always refuse, so read the result
+back through `output_latency()` rather than assuming the request was granted.
+
 ### 6. Sample rate
 
 The engine is built at `cfg.sample_rate` and cannot change it after `bwa_create`. Two policies,
@@ -303,6 +318,14 @@ chosen by the `exact_rate` argument the engine passes to `bwa_sink_open`:
   (`bwa_last_error` after a successful `bwa_start`; the header documents that convention next
   to `bwa_last_error`). The timestamp pair is then in the stream's rate, which is the engine's,
   so nothing downstream changes.
+
+A caller can demand the array's strictness on a headphone sink with
+`BWA_SINK_FLAG_EXACT_RATE` in `bwa_desc.sink_flags`. `bwa_sink_open` ORs that bit into the
+`exact_rate` argument before any backend sees either, so there is one notion of "must not
+resample" and no backend reads the flag itself. It is PsychPortAudio's
+`paMacCoreFailIfConversionRequired`, and it belongs to an experiment where the rate is part of the
+measurement rather than a preference. The default without the flag is unchanged: the headphone
+sink accepts the OS resampler and reports the degradation.
 
 CoreAudio and JACK have no per-client resampler, so a headphone open fails on a mismatch there
 too. JACK's rate is the server's (`jack_get_sample_rate`); a PipeWire desktop that runs its
@@ -598,10 +621,16 @@ uint32_t reserved[3];
 the backend's default device (ASIO: the first driver with enough outputs, as today). The
 anonymous union keeps `asio_driver` compiling and keeps the C# and GDExtension field offsets.
 
-`sink_flags` has one bit for now: `BWA_SINK_FLAG_EXCLUSIVE`. WASAPI opens in exclusive mode
-and AAudio requests exclusive sharing. Off by default, because exclusive mode takes the
-device from every other application on a desk machine, and shared mode with an
-`IAudioClient3` period is low-latency enough for a monitor.
+`sink_flags` carries three bits, all opt-in and all describing the PRIMARY device only:
+
+| bit | value | effect |
+|-----|-------|--------|
+| `BWA_SINK_FLAG_EXCLUSIVE` | 0x1 | WASAPI opens in exclusive mode, AAudio requests exclusive sharing. Off by default, because exclusive mode takes the device from every other application on a desk machine, and shared mode with an `IAudioClient3` period is low-latency enough for a monitor |
+| `BWA_SINK_FLAG_EXACT_RATE` | 0x2 | rule 6's array strictness on a headphone sink: the open fails naming both rates rather than accepting the OS resampler. Folded into `bwa_sink_open`'s `exact_rate` argument, so no backend reads the bit |
+| `BWA_SINK_FLAG_TIGHT_BUFFER` | 0x4 | rule 5's smallest device buffer: ALSA 2 periods instead of 3, AAudio 1 burst instead of 2. A no-op on WASAPI, ASIO and JACK |
+
+`docs/api.md` maps PsychPortAudio's latency classes 0 to 4 onto these three bits and a block
+size.
 
 `bwa_sink_health` (internal, `src/sink/sink.h`) gains `device_lost` in the same change, because the
 flag has to reach `engine.c` from the sink somehow. It is not ABI.
@@ -718,6 +747,13 @@ EVENTCALLBACK, hns, hns, fmt, NULL)` with the buffer duration equal to the perio
 client, and initialize again. Exclusive mode gives a fixed callback size, so the adapter runs
 in pass-through when it equals the block size, and multichannel is possible. The array
 through WASAPI stays a possibility, not a recommendation.
+
+`BWA_SINK_FLAG_TIGHT_BUFFER` does nothing on this backend, deliberately. The exclusive path
+already initializes with the buffer duration equal to the device period, which is the smallest
+buffer WASAPI will accept, and a shared-mode buffer is the OS mixer's. `BWA_SINK_FLAG_EXACT_RATE`
+needs no code either: it arrives folded into `exact_rate`, and the shared path already refuses a
+resampled rate that way. What one desk endpoint gives, measured with
+`bwa_get_output_latency_frames` at 48 kHz, is in `docs/api.md` under "Latency classes".
 
 PC VR: a headset's audio (the Oculus or SteamVR endpoint) is a shared-mode WASAPI endpoint.
 The runtime can make it the default output; otherwise `device` names it, by friendly name or
@@ -846,9 +882,12 @@ Open sequence, all through `snd_pcm_hw_params_*`:
 3. Rate: `snd_pcm_hw_params_set_rate_resample(0)` for a `hw:` device and for any device under
    `exact_rate`, then `set_rate` exact. A `plug` or `default` PCM under a headphone open may
    resample; report it (rule 6).
-4. Channels exact. Period size near the block size; buffer size near three periods. Read both
-   back. The write loop writes whole engine blocks, so the adapter is not needed: the period
-   is a device-side number and the sink's `block_size()` stays the engine's.
+4. Channels exact. Period size near the block size; buffer size near three periods, or two under
+   `BWA_SINK_FLAG_TIGHT_BUFFER`. Read both back: `set_buffer_size_near` is a request, and a
+   server PCM can bound it. The ALSA PulseAudio plugin returns three periods either way,
+   measured, while the hardware-free `null` PCM grants two. The write loop writes whole engine
+   blocks, so the adapter is not needed: the period is a device-side number and the sink's
+   `block_size()` stays the engine's.
 5. sw_params: `set_tstamp_mode(SND_PCM_TSTAMP_ENABLE)` and
    `set_tstamp_type(SND_PCM_TSTAMP_TYPE_MONOTONIC)` so `snd_pcm_status_get_htstamp` is on the
    same clock as `os_monotonic_ns`. `set_start_threshold` to one buffer so the stream starts
@@ -906,7 +945,9 @@ grants it rarely), `AAUDIO_PERFORMANCE_MODE_LOW_LATENCY`, `AAUDIO_FORMAT_PCM_FLO
 requested channel count, the engine rate, `setFramesPerDataCallback(block size)` as the hint it
 is, a data callback and an error callback. After open, the buffer size is set to two bursts
 (`AAudioStream_setBufferSizeInFrames(2 * getFramesPerBurst())`) and the actual value read back
-for rule 5.
+for rule 5. `BWA_SINK_FLAG_TIGHT_BUFFER` asks for ONE burst there instead, which keeps no margin
+at all: every late callback is then an xrun. The emulator grants it (960 frames instead of 1920),
+and the read-back is what says whether a given device did.
 
 The data callback calls `quant_pull` with the frame count it was given and returns
 `AAUDIO_CALLBACK_RESULT_CONTINUE`. Position and time come from `AAudioStream_getTimestamp`,
@@ -1086,6 +1127,36 @@ what needs a device, and make the device-dependent part **skip visibly** rather 
   The last is inside a third-party `pthread_mutex_lock`. The JACK sink's xrun path reports nothing,
   which is what the notification-thread parking above is for.
 
+  **The sink_flags subsections.** Three more sections cover `bwa_desc.sink_flags`, and all of them
+  open through `bwa_sink_open` rather than through a backend's own open, because that is the path a
+  caller's flags actually take and it is where `EXACT_RATE` is folded into `exact_rate`.
+
+  The WASAPI EXCLUSIVE subsection opens the default endpoint at 256, 128 and 64 frames, skipping
+  and printing any size the device refuses. It asserts lower latency than a shared open at the same
+  block, `measured` true, and the injected stall producing exactly ONE dropout with a nonzero frame
+  count. That last one is the queued-depth rule, which nothing else in the suite had ever
+  exercised: every earlier live dropout came through the shared-mode release-interval rule or the
+  null sink. It also prints which format the walk chose and whether the alignment retry fired, so a
+  reader knows which device-dependent paths the run actually went down. The stall is sized at 150 ms
+  rather than at "two buffers plus slack" for a reason worth repeating: an exclusive buffer is one
+  device period, three milliseconds on an onboard codec, and `IAudioClock` advances by only about
+  half the wall time a starved stream spends starved, since it counts frames read FROM OUR BUFFER.
+  A 36 ms stall tripped the rule at one block size out of three.
+
+  The WASAPI EXACT_RATE subsection has an ORDER that matters. It asks the DEFAULT open first and
+  takes rule 6's degradation as ground truth about what the OS is resampling, then demands that the
+  same open with the flag fails naming both rates. The first draft did it the other way round, and
+  a build with the fold removed came out SKIP rather than red, because a strict open that succeeds
+  cannot distinguish "the endpoint takes both rates" from "the flag went nowhere".
+
+  ALSA checks TIGHT_BUFFER twice: reported on the section's own PCM, demanded on the hardware-free
+  `null` PCM. The split exists because the ALSA PulseAudio plugin returns three periods whether or
+  not two are asked for, so demanding two on whatever PCM the box offers would fail a correct sink,
+  while `null` bounds nothing and every install has one. Its EXACT_RATE check asserts that the flag
+  and the `exact_rate` argument AGREE at an absurd rate, which is exactly what breaks when the fold
+  goes. AAudio demands that the tight open come back shallower than the default one wherever the
+  default actually got its two bursts.
+
   What the stall assertions can and cannot demand differs by backend, and the sections say which.
   ALSA can demand both halves: `-EPIPE` is the device's own report, the stall outlasts the buffer by
   a factor of two, and the frame estimate is a measurement. JACK can demand only the late block,
@@ -1221,9 +1292,21 @@ Known, deliberately not done yet. Each names its trigger.
       reports the degradation, which is the path that got exercised; the granted path has not run.
 - [ ] `-ESTRPIPE` recovery. A suspend needs a real power event to produce, so the resume loop and
       its `driver_resyncs` tick are written and compiled but unexercised.
-- [ ] The minimum `IAudioClient3` shared period on the desk machine's driver. Onboard codecs
-      often offer nothing under 10 ms; a 10 ms period is 480 frames at 48 kHz, so the monitor's
-      added latency is one engine block plus that.
+- [x] The minimum `IAudioClient3` shared period on the desk machine's driver. Onboard codecs
+      often offer nothing under 10 ms, and this one is exactly that: `test_audio_sink` reports a
+      480-frame period against a 1056-frame buffer on a Realtek endpoint at 48 kHz, so the
+      shared-mode underrun rule is armed there and the monitor's added latency is one engine block
+      plus 10 ms. A codec that answers a shorter period has not been seen yet.
+- [x] WASAPI EXCLUSIVE mode on a real endpoint, which until now was written and compiled and had
+      never opened. `test_audio_sink`'s exclusive subsection opens the default endpoint at 256,
+      128 and 64 frames and exercises the queued-depth dropout rule, which no other test reached:
+      an injected stall produces exactly one dropout with a nonzero frame count at every size.
+      Measured latency on a Realtek endpoint at 48 kHz: 736 frames shared, then 544, 416 and 352
+      frames exclusive at those three block sizes. Two things it did NOT reach, and both are still
+      open. The format walk stopped at the FIRST accepted entry, `int24`, so float32, int32 and
+      int16 have still never converted a sample in exclusive mode. And
+      `AUDCLNT_E_BUFFER_SIZE_NOT_ALIGNED` never fired: this driver takes its own 144-frame period
+      at any request, so the realign-and-retry path is still unexercised.
 - [ ] Standalone headsets: the AAudio native rate and burst size on the Quest and Pico
       generations in play (48 kHz and a 256-frame burst are typical; the block size should be
       a multiple of the burst), and that the Steam Audio Android build runs the mode-2

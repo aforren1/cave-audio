@@ -7,6 +7,10 @@ engine, only control calls on the main thread. The one inbound exception is the 
 push-source feed (`bwa_source_push`): caller-generated PCM *into* the engine,
 on the same control thread. It is a source feed, not a render path.
 
+[Python](#python) is the one binding here that is not a game engine. It has no transform to
+convert and no frame to ride, so the sections below on coordinates and per-frame pushing do not
+apply to it. Everything else does.
+
 If a term in the binding surface is unfamiliar, [glossary.md](./glossary.md) defines it in one
 line and points at the doc that owns it.
 
@@ -235,9 +239,13 @@ The snippet shows the essential calls. The shipped `Bwa.cs` binds every `BWA_API
   stays as a wrapper. The chosen string goes in `bwa_desc.device`, the field both
   bindings also still expose under its old name `asioDriver` / `asio_driver`, since it
   is one field with two spellings. Prefer the **id** when you persist a choice:
-  friendly names collide between a headset and its dock. `sink_flags` carries
-  `BWA_SINK_FLAG_EXCLUSIVE` (`BwaSinkFlags.Exclusive`, `BwaEngine.SINK_FLAG_EXCLUSIVE`),
-  which takes a WASAPI endpoint from every other application and is off by default.
+  friendly names collide between a headset and its dock. `sink_flags` carries three bits, all off
+  by default and all exposed in both bindings (Unity's `[Flags] BwaSinkFlags` on
+  `Engine.sinkFlags`, Godot's `BwaEngine.SINK_FLAG_*` on the inspector's `sink_flags`):
+  `Exclusive` takes a WASAPI endpoint from every other application, including the VR runtime, so
+  leave it off in a headset build; `ExactRate` fails the open rather than letting the OS resample;
+  `TightBuffer` takes the smallest device buffer the backend can. See api.md's "Latency classes",
+  which maps PsychPortAudio's classes 0 to 4 onto them.
 - **Assets**: `bwa_sound_acquire` / `bwa_sound_release` (the shared, refcounted
   by-path tier) drive `Engine.Acquire`, and `Load` / `LoadStreaming` / `LoadAmbix` /
   `LoadFuma` are one call each over it with the matching `BwaLoadFlags`. The binding
@@ -667,6 +675,57 @@ The macOS libraries are **unsigned and un-notarized**. An addon unzipped from a 
 quarantine flag and the editor refuses to load it, so clear it once:
 `xattr -dr com.apple.quarantine addons/bw_audio`. Shipping to anyone outside the lab needs a
 Developer ID signature and notarization.
+
+## Python
+
+**Implemented as a nanobind extension: [`bindings/python/`](../bindings/python/).** Its
+[README](../bindings/python/README.md) is the manual: install, the two layers, the two experiment
+shapes, the traps. This section carries only what belongs in the cross-binding comparison.
+
+It is not a game-engine binding, so most of this page does not apply to it. There is no coordinate
+seam, because there is no host engine to convert from: you pass room coordinates. There is no
+centralized per-frame push, because there is no frame. What the binding adds instead is the two
+shapes a psychophysics experiment takes, and the audience is PsychoPy
+([backends.md](./backends.md) covers why).
+
+Two layers, unlike Unity's one and Godot's one:
+
+- `bw_audio._bwa` is the **raw layer**, one function for each C entry point, named by its C name
+  without the `bwa_` prefix, so `bwa_source_play` is `_bwa.source_play`. Enums keep their C
+  spelling without the type prefix; structs keep their C field names. A test parses the header and
+  fails when a new ABI call arrives unbound, so this layer cannot drift.
+- `bw_audio` is the **Pythonic layer**, pure Python over the raw one: an `Engine` context manager,
+  `Sound`, `Source`, `PushSource`, `Bed` and `Listener` objects, and exceptions instead of return
+  codes. It adds no semantics. Both layers drive the same engine, so anything the Pythonic layer
+  does not wrap you reach through `Engine.raw`.
+
+**One ABI call is deliberately not bound.** `bwa_set_output_capture` installs a callback that the
+engine runs on the **audio thread**, and an interpreter must never run there: taking the GIL inside
+a device callback allocates, blocks on a lock, and runs arbitrary bytecode. The offline path is the
+manual sink and `render_block`, which hands back the same post-limiter samples on the caller's own
+thread. No other binding has this exclusion, because no other binding has a global interpreter
+lock to take.
+
+**The threading contract is stricter to state and easier to break here**, because Python makes
+threads cheap. Unity and Godot get the one-control-thread rule for free from their main loop;
+Python does not. So `Engine` records the thread that created it and raises from any other, with an
+opt-out for a caller who funnels their own calls through one thread. The raw layer has no guard.
+The GIL is released around the calls the header marks as blocking or doing I/O, and around
+`render_block`, so another Python thread runs while those are in flight.
+
+**Units follow the same rule as the other two bindings**, and for the same reason: `seek_frames` /
+`seek_seconds`, `set_region_frames` / `set_region_seconds`, `dsp_time_frames` /
+`dsp_time_seconds`, `output_latency_frames` / `output_latency_seconds`. Python has no host engine
+whose spelling could collide, but a reader moving between the bindings should not have to relearn
+which one a bare name means.
+
+`render_block` returns a **read-only numpy view of the engine's own buffer**, valid until the next
+call. That is the one place this binding hands out memory it does not own, and it is what makes an
+offline render cost no copy. Pass `copy=True` when you keep the block.
+
+The wheel carries the engine library inside the package, like the Unity package and the Godot
+addon carry theirs. One wheel per platform, tagged `cp312-abi3`, runs on Python 3.12 and every
+later version.
 
 ## Unreal (notes, not yet implemented)
 

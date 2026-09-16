@@ -492,8 +492,12 @@ bwa_sink* bwa_aaudio_sink_open(uint32_t sample_rate, uint32_t block_size, uint32
         s->capacity_frames = (cap > 0) ? (uint32_t)cap : (2u * s->burst);
     }
     /* Two bursts: the shallowest buffer that still survives one late callback, which is what
-     * AAUDIO_PERFORMANCE_MODE_LOW_LATENCY is for. The device decides what it can actually give. */
-    AAudioStream_setBufferSizeInFrames(s->stream, (int32_t)(2u * s->burst));
+     * AAUDIO_PERFORMANCE_MODE_LOW_LATENCY is for. BWA_SINK_FLAG_TIGHT_BUFFER asks for ONE burst
+     * instead, which keeps no margin at all - every late callback is an xrun. The device decides
+     * what it can actually give, so read it back. */
+    AAudioStream_setBufferSizeInFrames(s->stream,
+                                       (int32_t)(((flags & BWA_SINK_FLAG_TIGHT_BUFFER) ? 1u : 2u)
+                                                 * s->burst));
     {
         const int32_t bs = AAudioStream_getBufferSizeInFrames(s->stream);
         s->buffer_frames = (bs > 0) ? (uint32_t)bs : (2u * s->burst);

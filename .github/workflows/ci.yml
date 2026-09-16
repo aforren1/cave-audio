@@ -368,6 +368,50 @@ jobs:
           if ($env:TAG) { $a.Version = $env:TAG }           # the tag is the version; pack stamps it into the manifest
           ./tools/upm/pack.ps1 @a
 
+      # ---- Python wheel (nanobind) --------------------------------------------------------------
+      # Built here rather than in a job of its own, because a wheel carries the ENGINE LIBRARY
+      # inside it and that library is this job's MSVC build. The wheel is tagged cp312-abi3, so one
+      # file per platform serves Python 3.12 and every later version.
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+
+      - name: Build the Python wheel
+        shell: bash
+        run: |
+          uv python install 3.12
+          # --python 3.12 pins the tag rather than inheriting whatever the runner image has on
+          # PATH. Anything 3.12 or later produces the same abi3 wheel; pinning makes the ASSERTION
+          # below meaningful instead of a report of the image's default.
+          (cd bindings/python && uv build --wheel --python 3.12 --out-dir "$GITHUB_WORKSPACE/dist/python")
+          whl=$(ls "$GITHUB_WORKSPACE"/dist/python/*.whl)
+          echo "built $(basename "$whl")"
+          # The stable ABI is the whole point of the 3.12 floor: without it there would be one
+          # wheel per Python per platform. A version-specific tag here means nanobind's STABLE_ABI
+          # did not engage, so fail rather than ship a wheel that only runs on one interpreter.
+          case "$(basename "$whl")" in
+            *-cp312-abi3-*) : ;;
+            *) echo "expected a cp312-abi3 wheel, got $(basename "$whl")"; exit 1 ;;
+          esac
+
+      - name: Test the Python wheel (from the INSTALLED wheel, not the source tree)
+        shell: bash
+        run: |
+          uv venv --python 3.12 .wheelenv
+          uv pip install --python .wheelenv pytest numpy "$GITHUB_WORKSPACE"/dist/python/*.whl
+          # No PYTHONPATH and no build tree on the path: this is the wheel a user would install.
+          .wheelenv/Scripts/python -m pytest -q --color=no bindings/python/tests
+          .wheelenv/Scripts/python bindings/python/examples/offline_render.py --tests
+          .wheelenv/Scripts/python bindings/python/examples/live_onset.py --tests
+
+      - name: Upload artifact (Python wheel)
+        uses: actions/upload-artifact@v6
+        with:
+          name: bw_audio-python-win64-${{ steps.pack.outputs.version }}-r${{ github.run_number }}
+          path: dist/python/
+          retention-days: 30
+          if-no-files-found: error
+
       # Two artifacts, not one bag: the engine (native consumers - the C ABI, the tools, the CAVE
       # machine) and the Unity package (a single .tgz). Downloading one no longer drags in the other.
       - name: Upload artifact (engine + tools)
@@ -379,6 +423,7 @@ jobs:
             dist/
             !dist/unity/**
             !dist/godot/**
+            !dist/python/**
           retention-days: 30
           if-no-files-found: error
 
@@ -433,7 +478,7 @@ jobs:
       # Keep the engine bundle a .zip, and the package the only .tgz on the release. Every UPM registry
       # speaks the npm protocol and keys on a single publishable tarball, so should this ever be listed
       # on one, that stays a config change rather than a rebuild. It costs nothing to preserve.
-      - name: Release (four engine zips + Godot addon + Unity package tarball + the two source zips)
+      - name: Release (four engine zips + Godot addon + Unity package tarball + three Python wheels + the two source zips)
         if: startsWith(github.ref, 'refs/tags/')
         shell: pwsh
         env:
@@ -483,6 +528,14 @@ jobs:
           $mac = "dist/bw_audio-macos-universal-$tag.zip"
           Compress-Archive -Path pack-macos/dist/* -DestinationPath $mac -Force
           $mac = (Get-Item $mac).FullName
+
+          # The three Python wheels, attached as-is rather than zipped: pip and uv install a .whl
+          # directly from a URL, and wrapping it would make the one-liner in the notes a two-step.
+          # Each is already versioned by its own filename (the ABI version from the header), so
+          # unlike the engine bundles above there is nothing to rename per tag.
+          $whl = @(Get-Item dist/python/*.whl, pack-linux/python/*.whl, pack-macos/python/*.whl |
+                   ForEach-Object { $_.FullName })
+          if ($whl.Count -ne 3) { throw "expected 3 Python wheels (win/linux/macos), found $($whl.Count)" }
 
           $notes = @"
           Windows x64, plus Android, Linux and macOS cross-builds. Six downloads to use - the
@@ -542,6 +595,19 @@ jobs:
           Both link Steam Audio statically, like every other build here. The Unity package and the
           Godot addon carry both libraries already.
 
+          ## Python
+
+          ``bw_audio-*.whl`` - one wheel per platform (Windows x64, Linux x86_64, macOS arm64),
+          tagged ``cp312-abi3``, so each one runs on **Python 3.12 and every later version**. The
+          engine library is inside the wheel; there is nothing to install beside it.
+
+          ``uv pip install <url-of-the-wheel>``
+
+          The wheel version is the **ABI version** from ``bw_audio.h``, not this tag, so it can
+          never claim a version the library is not. PsychoPy uses this package directly; see
+          ``bindings/python/README.md``. The Linux wheel is tagged for the CI runner's glibc rather
+          than manylinux, so it needs that glibc or newer.
+
           ## License
 
           **GPLv3.** ``bw_audio.dll`` links the ASIO SDK under its GPLv3 option. Internal use never
@@ -554,9 +620,9 @@ jobs:
           third-party sources compiled into the DLL).
           "@
           # One .tgz (the Unity package) + the Godot addon .zip + the four engine .zips (Windows,
-          # Android, Linux, macOS) + the two corresponding-source .zips. Keep the .tgz as the only
-          # package tarball - see the note above.
-          gh release create $tag $tgz $gd $zip $and $lnx $mac $src $sasrc --title "bw_audio $tag" --notes $notes
+          # Android, Linux, macOS) + the two corresponding-source .zips + the three Python wheels.
+          # Keep the .tgz as the only package tarball - see the note above.
+          gh release create $tag $tgz $gd $zip $and $lnx $mac $src $sasrc @whl --title "bw_audio $tag" --notes $notes
 
       # ---- distribution branches (tags only) ------------------------------------------------------
       # The gh-pages idea applied to the bindings. `main` stays source-only; each binding also gets a
@@ -1044,6 +1110,53 @@ jobs:
           strip --strip-debug pack-linux/godot/*.so pack-linux/unity/*.so
           ls -l pack-linux/godot pack-linux/unity
 
+      # ---- Python wheel (nanobind) --------------------------------------------------------------
+      # Same argument as the Windows job: the wheel carries the engine library, and this is the job
+      # that builds a Linux one. It rides into pack-linux/ as well, so the Windows job can attach it
+      # to the one release without rebuilding anything.
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+
+      - name: Build the Python wheel
+        shell: bash
+        run: |
+          uv python install 3.12
+          # Straight into pack-linux/, the fixed-name tree the Windows job already downloads, so
+          # the release step there attaches this wheel without a second handoff.
+          (cd bindings/python && uv build --wheel --python 3.12 --out-dir "$GITHUB_WORKSPACE/pack-linux/python")
+          whl=$(ls "$GITHUB_WORKSPACE"/pack-linux/python/*.whl)
+          echo "built $(basename "$whl")"
+          case "$(basename "$whl")" in
+            *-cp312-abi3-*) : ;;
+            *) echo "expected a cp312-abi3 wheel, got $(basename "$whl")"; exit 1 ;;
+          esac
+          # The wheel is tagged for THIS RUNNER'S glibc, not manylinux: it runs on the ubuntu-latest
+          # image's glibc or newer, and not on an older distribution. Building from a checkout
+          # always works. A manylinux build is a follow-up (bindings/python/README.md says so too).
+          python3 -c "import sys;print('glibc floor:', __import__('platform').libc_ver())"
+          # And the extension must find the engine library BESIDE it rather than on the system path.
+          unzip -o -q "$whl" -d "$GITHUB_WORKSPACE/wheel-inspect"
+          readelf -d "$GITHUB_WORKSPACE"/wheel-inspect/bw_audio/_bwa*.so | grep -E 'RUNPATH|RPATH' | grep -q 'ORIGIN'
+          test -s "$GITHUB_WORKSPACE"/wheel-inspect/bw_audio/libbw_audio.so
+
+      - name: Test the Python wheel (from the INSTALLED wheel, not the source tree)
+        shell: bash
+        run: |
+          uv venv --python 3.12 .wheelenv
+          uv pip install --python .wheelenv pytest numpy "$GITHUB_WORKSPACE"/pack-linux/python/*.whl
+          .wheelenv/bin/python -m pytest -q --color=no bindings/python/tests
+          .wheelenv/bin/python bindings/python/examples/offline_render.py --tests
+          .wheelenv/bin/python bindings/python/examples/live_onset.py --tests
+
+      - name: Upload artifact (Python wheel)
+        uses: actions/upload-artifact@v6
+        with:
+          name: bw_audio-python-linux-x64-${{ steps.ver.outputs.version }}-r${{ github.run_number }}
+          path: pack-linux/python/
+          retention-days: 30
+          if-no-files-found: error
+
       - name: Upload artifact (Linux engine)
         uses: actions/upload-artifact@v6
         with:
@@ -1252,6 +1365,47 @@ jobs:
             lipo -info "$f" | grep -q arm64
           done
           ls -l pack-macos/godot pack-macos/unity
+
+      # ---- Python wheel (nanobind) --------------------------------------------------------------
+      # Same argument as the other two jobs. The wheel is NOT universal even though the engine
+      # library inside it is: a wheel's platform tag names one architecture, so this ships for the
+      # runner's own (arm64 on the current macos-latest image). Nothing else here changes.
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+
+      - name: Build the Python wheel
+        shell: bash
+        run: |
+          uv python install 3.12
+          (cd bindings/python && uv build --wheel --python 3.12 --out-dir "$GITHUB_WORKSPACE/pack-macos/python")
+          whl=$(ls "$GITHUB_WORKSPACE"/pack-macos/python/*.whl)
+          echo "built $(basename "$whl")"
+          case "$(basename "$whl")" in
+            *-cp312-abi3-*) : ;;
+            *) echo "expected a cp312-abi3 wheel, got $(basename "$whl")"; exit 1 ;;
+          esac
+          # The extension must find the engine library beside it, not on the system path.
+          unzip -o -q "$whl" -d "$GITHUB_WORKSPACE/wheel-inspect"
+          otool -l "$GITHUB_WORKSPACE"/wheel-inspect/bw_audio/_bwa*.so | grep -q '@loader_path'
+          test -s "$GITHUB_WORKSPACE"/wheel-inspect/bw_audio/libbw_audio.dylib
+
+      - name: Test the Python wheel (from the INSTALLED wheel, not the source tree)
+        shell: bash
+        run: |
+          uv venv --python 3.12 .wheelenv
+          uv pip install --python .wheelenv pytest numpy "$GITHUB_WORKSPACE"/pack-macos/python/*.whl
+          .wheelenv/bin/python -m pytest -q --color=no bindings/python/tests
+          .wheelenv/bin/python bindings/python/examples/offline_render.py --tests
+          .wheelenv/bin/python bindings/python/examples/live_onset.py --tests
+
+      - name: Upload artifact (Python wheel)
+        uses: actions/upload-artifact@v6
+        with:
+          name: bw_audio-python-macos-${{ steps.ver.outputs.version }}-r${{ github.run_number }}
+          path: pack-macos/python/
+          retention-days: 30
+          if-no-files-found: error
 
       - name: Upload artifact (macOS engine)
         uses: actions/upload-artifact@v6

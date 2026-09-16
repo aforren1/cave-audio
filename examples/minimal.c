@@ -78,9 +78,22 @@ static void check(int ok, const char* what) {
 
 int main(int argc, char** argv) {
     const char* wav_arg = NULL, * device = NULL;
+    uint32_t sink_flags = 0, block = 256;
     for (int i = 1; i < argc; ++i) {
+        if (bwa_ex_parse_sink_flag(argv[i], &sink_flags)) continue;   /* --exclusive and friends */
         if (!strcmp(argv[i], "--device") && i + 1 < argc) device = argv[++i];
-        else if (!strcmp(argv[i], "--driver") && i + 1 < argc) {   /* the old ASIO-only spelling */
+        else if (!strcmp(argv[i], "--latency-class") && i + 1 < argc) {
+            if (!bwa_ex_parse_latency_class(argv[++i], &sink_flags, &block)) {
+                printf("--latency-class takes 0..4\n");
+                return 2;
+            }
+        } else if (!strcmp(argv[i], "--help") || !strcmp(argv[i], "-h")) {
+            printf("usage: bwa_minimal [sound.wav] [--device <name or id>] [--list-devices]\n"
+                   "                   [--exclusive] [--exact-rate] [--tight-buffer]\n"
+                   "                   [--latency-class N] [--tests]\n");
+            bwa_ex_print_sink_flag_help();
+            return 0;
+        } else if (!strcmp(argv[i], "--driver") && i + 1 < argc) {   /* the old ASIO-only spelling */
             printf("note: --driver is the old ASIO-only spelling of --device <name or id>\n");
             device = argv[++i];
         } else if (!strcmp(argv[i], "--list-devices")) { bwa_ex_list_devices(BWA_SINK_AUTO); return 0; }
@@ -94,8 +107,9 @@ int main(int argc, char** argv) {
     cfg.profile        = BWA_PROFILE_BINAURAL;  /* desk profile: direct per-source HRTF -> stereo
                                                  * (BWA_PROFILE_CAVE_SIM auditions the array instead) */
     cfg.sample_rate    = 48000;
-    cfg.block_size     = 256;
+    cfg.block_size     = block;                 /* 256, or whatever --latency-class asked for */
     cfg.device         = device;                /* NULL = the backend's default output */
+    cfg.sink_flags     = sink_flags;            /* 0 = shared, resampling allowed, roomy buffer */
     if (g_tests) cfg.sink = BWA_SINK_NULL;      /* no device, deterministic */
     /* no tracker connected: this "game" pushes the listener pose itself */
 
@@ -116,6 +130,13 @@ int main(int argc, char** argv) {
     printf("backend: %s%s\n", be,
            bwa_get_sink_type(e) == BWA_SINK_NULL ? "  (no output device opened - silent run)" : "");
     if (why[0]) printf("  reason: %s\n", why);
+    {   /* what the flags actually bought: the device's own render->DAC delay, not the block size */
+        char fl[64];
+        const uint32_t lat = bwa_get_output_latency_frames(e);
+        printf("sink flags: %s   output latency: %u frames (%.1f ms)\n",
+               bwa_ex_sink_flags_string(sink_flags, fl, sizeof fl), lat,
+               1000.0 * (double)lat / (double)bwa_get_sample_rate(e));
+    }
 
     bwa_sound ping = bwa_load_sound(e, wav);      /* decoded + resampled now, off the hot path */
     if (!ping) {

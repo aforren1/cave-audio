@@ -70,12 +70,19 @@ namespace BwAudio
         Wasapi = 4, CoreAudio = 5, Alsa = 6, AAudio = 7, Jack = 8
     }
 
-    /// <summary>Mirrors the BWA_SINK_FLAG_* bits for BwaDesc.sinkFlags. Exclusive takes the device
-    /// from every other application on the machine, so it is off by default: a monitor shares its
-    /// endpoint with the VR runtime, the browser and the OS. Turn it on for the lowest latency and
-    /// a fixed callback size, or to reach more than 2 channels on a WASAPI endpoint.</summary>
+    /// <summary>Mirrors the BWA_SINK_FLAG_* bits for BwaDesc.sinkFlags. None of them reaches the
+    /// CaveBoth monitor: like the device name, they describe the primary device only.
+    /// Exclusive takes the endpoint from every other application on the machine, so it is off by
+    /// default: a monitor shares its endpoint with the VR runtime, the browser and the OS. Turn it
+    /// on for the lowest latency and a fixed callback size, or to reach more than 2 channels on a
+    /// WASAPI endpoint.
+    /// ExactRate fails the open when the device cannot run at the engine rate, instead of letting
+    /// the OS resample and reporting the degradation (the default for a headphone sink).
+    /// TightBuffer asks the backend for the smallest device buffer it can take (ALSA: 2 periods,
+    /// AAudio: 1 burst; a no-op on WASAPI), trading dropout margin for latency.
+    /// docs/api.md's "Latency classes" maps PsychPortAudio's 0..4 onto these.</summary>
     [System.Flags]
-    public enum BwaSinkFlags : uint { None = 0, Exclusive = 0x1 }
+    public enum BwaSinkFlags : uint { None = 0, Exclusive = 0x1, ExactRate = 0x2, TightBuffer = 0x4 }
 
     /// <summary>Mirrors bwa_tracker_state: liveness of a connected tracker's stream (Engine.TrackerStatus).
     /// Disconnected = no tracker on this engine; NoData = connected but no frames arriving (check the

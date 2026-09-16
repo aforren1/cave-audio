@@ -94,6 +94,7 @@ Everything beyond the DLL + test suite is opt-in; the default build stays lean.
 | `BWA_BUILD_CALIBVIEW` | OFF | `bwa_calib_view` (fetches imgui/test-engine/implot/implot3d) |
 | `BWA_BUILD_CALIBRATE` | OFF | `bwa_calibrate` + `bwa_zylia_probe` |
 | `BWA_BUILD_GODOT` | OFF | the Godot GDExtension (fetches godot-cpp - a multi-minute first build). `GODOTCPP_TARGET` picks the library flavor (`editor` default); `tools/godot/pack.ps1` builds both shippable ones. See `bindings/godot/README.md` |
+| `BWA_BUILD_PYTHON` | OFF | the Python binding (`_bwa`, nanobind). Needs Python 3.9 or later with `nanobind` importable by the interpreter CMake finds; 3.12 or later gets the stable ABI. Adds three ctests (`python_bindings` plus the two examples). `uv build --wheel` in `bindings/python` takes this same path. See `bindings/python/README.md` |
 | `BWA_ASAN` | OFF | builds `test_sound` with AddressSanitizer (MSVC; needs tests ON) |
 | `BWA_TRACY` | OFF | Tracy profiler instrumentation (fetches Tracy; collects only while a profiler is attached). See [profiling.md](./profiling.md) |
 | `BWA_BUILD_BENCH` | OFF | the profiling benches (`bwa_profile_bench` + `bwa_bench_situations`). See [profiling.md](./profiling.md) |
@@ -294,9 +295,14 @@ on purpose:
 
 Prefer to tag by hand? `git tag v0.3.0` works; the helper's only extra service is the CHANGELOG roll.
 
-That job builds, tests, stamps the version, and cuts a **GitHub Release** with five assets. The
-Release IS the distribution: no registry, no token. The asset breakdown and the GPLv3 corresponding
-source that rides along are in [Continuous integration](#continuous-integration) below.
+That job builds, tests, stamps the version, and cuts a **GitHub Release**. The Release IS the
+distribution: no registry, no token. The asset breakdown and the GPLv3 corresponding source that
+rides along are in [Continuous integration](#continuous-integration) below.
+
+The Python wheel is the one asset whose filename does **not** carry the tag. Its version is the ABI
+version read out of `include/bw_audio.h` at build time, which is a third thing a wheel could claim
+and must not: a wheel that said `0.5.0` while the library inside it answered `0.14.0` to
+`bwa_get_version` would be unfixable from the outside. See `bindings/python/README.md`.
 
 ### Dev versions
 
@@ -375,6 +381,19 @@ older UPM parsers reject. When git cannot answer (no tag, shallow clone, no git 
   the Android, Linux and macOS engine artifacts their own jobs upload. `<ver>` is the packed version (the tag on a release,
   a git-describe dev version otherwise); the `r<N>` run number keeps re-runs of one commit from
   colliding on a name. Downloading one no longer drags in the other.
+- **The Python wheel is built and tested on all three desktops.** The `windows`, `linux` and
+  `macos` jobs each run `uv build --wheel` in `bindings/python`, assert the filename is tagged
+  `cp312-abi3` (a version-specific tag means nanobind's stable ABI did not engage, which would
+  mean one wheel per Python instead of one per platform), install it into a fresh venv, and run the
+  pytest suite and both examples **from the installed wheel** rather than from the source tree.
+  Each uploads `bw_audio-python-<platform>-<ver>-r<N>`. The wheel carries the engine library inside
+  the package, so it is that job's own build, which is why there is no separate wheel job. The
+  Linux and macOS jobs stage theirs into the fixed-name pack input the Windows job already
+  downloads, so the release attaches all three without rebuilding anything. Two facts about the
+  Linux wheel: it is tagged for the runner image's **glibc**, not manylinux, so it needs that glibc
+  or newer; and a manylinux build is a follow-up rather than a limitation of the binding, since
+  building from a checkout always works. The Android job builds no wheel: there is no Python there.
+  `bindings/python/README.md` is the manual.
 - **The Unity package is packed every run, and released on a tag.**
   `tools/upm/pack.ps1` produces `com.brainworks.bw_audio-<version>.tgz`, the C#
   binding with both DLLs inside it, so a broken package (a missing `.meta`, a lost
@@ -415,7 +434,7 @@ older UPM parsers reject. When git cannot answer (no tag, shallow clone, no git 
 - **The Windows job waits for all three cross-builds.** `needs: [android, linux, macos]`, because
   it is the only place that packs the bindings and each package carries every platform's engine
   library. The three run in parallel, so the wait is the slowest of them.
-- **A release carries EIGHT assets**, because workflow artifacts expire (30 days) and a
+- **A release carries ELEVEN assets**, because workflow artifacts expire (30 days) and a
   release doesn't:
   - `com.brainworks.bw_audio-<ver>.tgz`: the Unity package.
   - `bw_audio-godot-<ver>.zip`: the installable Godot addon.
@@ -438,6 +457,11 @@ older UPM parsers reject. When git cannot answer (no tag, shallow clone, no git 
   - `bw_audio-steam-audio-src-<tag>.zip`: the Steam Audio source statically linked into the
     same DLL, at its pinned commit, with the in-repo patch and a README naming the commit.
     Same reason as the asset above, applied to the other statically linked dependency.
+  - `bw_audio-<abi>-cp312-abi3-<platform>.whl`, three of them (Windows x64, Linux x86_64, macOS
+    arm64): the Python binding, with the engine library inside the wheel. Attached as wheels rather
+    than zipped, because `pip` and `uv` install a `.whl` straight from a URL. `<abi>` is the ABI
+    version from `bw_audio.h`, not the tag; `abi3` means one wheel serves Python 3.12 and every
+    later version.
 
   All ship under GPLv3 (the `.zip` carries `LICENSE`, `THIRD_PARTY-NOTICES.md`, and
   `DIST.txt`, which names the commit and links the complete source; the `.tgz` carries

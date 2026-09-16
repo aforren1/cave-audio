@@ -180,8 +180,10 @@ struct bwa_sink { const bwa_sink_vtbl* vt; };
  * skipped). `flags` is bwa_desc.sink_flags. `exact_rate` set means the device MUST run at
  * sample_rate or the open fails - the array's rule, since a resampled array shifts every
  * per-speaker delay; clear lets a headphone backend fall back on the OS resampler and report the
- * degradation through `err` on an otherwise successful open. On failure returns NULL and writes a
- * message to `err` (if err/errcap given). Does NOT start the audio thread yet. */
+ * degradation through `err` on an otherwise successful open. BWA_SINK_FLAG_EXACT_RATE in `flags`
+ * is the caller asking for that same rule, and bwa_sink_open ORs it into exact_rate before any
+ * backend sees either - a backend reads `exact_rate` and never that bit. On failure returns NULL
+ * and writes a message to `err` (if err/errcap given). Does NOT start the audio thread yet. */
 bwa_sink* bwa_sink_open(uint32_t sample_rate, uint32_t block_size, uint32_t channels,
                      bwa_sink_type sink_type, const char* device, uint32_t flags, bool exact_rate,
                      bwa_render_fn render, void* user, char* err, size_t errcap);
@@ -243,6 +245,11 @@ bool     sink_wasapi_device_id  (uint32_t index, char* buf, uint32_t cap);
  * which of the two cases the machine it runs on presents. Control thread, on an open sink. */
 uint32_t sink_wasapi_device_frames(bwa_sink* s);
 uint32_t sink_wasapi_period_frames(bwa_sink* s);
+/* Which format the exclusive-mode walk chose ("float32"/"int32"/"int24"/"int16"; always "float32"
+ * in shared mode, which never walks), and whether the AUDCLNT_E_BUFFER_SIZE_NOT_ALIGNED retry
+ * fired. Both are device-dependent paths the exclusive test has to be able to NAME. */
+const char* sink_wasapi_format_name(bwa_sink* s);
+bool        sink_wasapi_align_retry(bwa_sink* s);
 #endif
 
 #ifdef BWA_HAVE_JACK

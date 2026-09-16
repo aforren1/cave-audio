@@ -401,7 +401,9 @@ static const struct { snd_pcm_format_t a; sink_fmt f; bool in32; const char* lab
 bwa_sink* bwa_alsa_sink_open(uint32_t sample_rate, uint32_t block_size, uint32_t channels,
                              const char* device, uint32_t flags, bool exact_rate,
                              bwa_render_fn render, void* user, char* err, size_t errcap) {
-    (void)flags;   /* ALSA has no shared/exclusive distinction: a hw: PCM IS exclusive */
+    /* BWA_SINK_FLAG_EXCLUSIVE is a no-op here: ALSA has no shared/exclusive distinction, and a
+     * hw: PCM IS exclusive. EXACT_RATE arrived folded into exact_rate (sink.c). TIGHT_BUFFER is
+     * read at the buffer negotiation below. */
 
     if (!render || channels == 0 || channels > BWA_CHANNELS || block_size == 0 || sample_rate == 0) {
         alsa_set_err(err, errcap, "alsa: bad arguments");
@@ -512,11 +514,15 @@ bwa_sink* bwa_alsa_sink_open(uint32_t sample_rate, uint32_t block_size, uint32_t
 
     /* The period is a DEVICE-side number: it sizes the buffer and decides how often the card
      * interrupts, and the write loop hands over whole engine blocks regardless. Three periods of
-     * buffer is the usual compromise between latency and tolerance of a late block. */
+     * buffer is the usual compromise between latency and tolerance of a late block;
+     * BWA_SINK_FLAG_TIGHT_BUFFER asks for two instead, which is one period of margin against a
+     * late block rather than two. The device still decides - set_buffer_size_near may round up,
+     * so sink_alsa_buffer_frames reports what was actually granted. */
+    const bool tight = (flags & BWA_SINK_FLAG_TIGHT_BUFFER) != 0;
     snd_pcm_uframes_t period = block_size;
     int dir = 0;
     snd_pcm_hw_params_set_period_size_near(pcm, hw, &period, &dir);
-    snd_pcm_uframes_t buffer = period * 3;
+    snd_pcm_uframes_t buffer = period * (tight ? 2u : 3u);
     snd_pcm_hw_params_set_buffer_size_near(pcm, hw, &buffer);
 
     if ((e = snd_pcm_hw_params(pcm, hw)) < 0) {

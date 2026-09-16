@@ -80,3 +80,12 @@ bwa_bench.wav
 
 # test_smoke ergonomics scratch (tone written into the working dir on every run)
 bwa_ergo_tone.wav
+
+# Python binding: the scikit-build-core build tree, the wheel, and the byte-code caches.
+# (*.pyd is not in the *.dll rule above, so it needs its own line.)
+bindings/python/build/
+bindings/python/dist/
+bindings/python/.venv/
+bindings/python/**/__pycache__/
+bindings/python/**/*.egg-info/
+*.pyd

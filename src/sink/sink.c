@@ -198,6 +198,13 @@ bwa_sink* bwa_sink_open(uint32_t sample_rate, uint32_t block_size, uint32_t chan
     if (sink_type == BWA_SINK_NULL)
         return bwa_null_sink_open(sample_rate, block_size, channels, render, user, err, errcap);
 
+    /* BWA_SINK_FLAG_EXACT_RATE is the caller asking for the ARRAY's rate rule on a sink that would
+     * otherwise accept the OS resampler (rule 6). Folded in here, once, so every backend keeps a
+     * single notion of "must not resample" and none of them has to read the flag itself. The
+     * engine's own exact_rate argument still wins where it is set: a caller cannot turn the
+     * array's rule OFF, only turn it on somewhere it was not. */
+    exact_rate = exact_rate || (flags & BWA_SINK_FLAG_EXACT_RATE) != 0;
+
     char msg[256] = {0};
 
     /* An explicitly named backend is a DEMAND: its failure surfaces instead of hiding behind the

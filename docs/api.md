@@ -566,7 +566,7 @@ Zero-init `bwa_desc` and set what you need; every field's zero is its default:
 | `embree`         | ray-trace the acoustics sims on Intel Embree; silently falls back to the default tracer if the phonon build lacks it - see [Ray-tracing acceleration](#ray-tracing-acceleration-bwa_descembree) |
 | `enable_pathing` | run the sound-pathing sim from `bwa_start` (needs scene geometry + the Steam Audio build); sources opt in via `bwa_source_set_pathing` |
 | `bed_decoder`    | diffuse-bed SH→speaker decoder: 0 is the engine default (reserved, currently AllRAD), AllRAD (1) or EPAD (2) - see [Panner and layout query](#panner-and-layout-query-control-thread) |
-| `sink_flags`     | backend options for the PRIMARY device (like `device`, it does not reach the `cave_both` monitor): `BWA_SINK_FLAG_EXCLUSIVE` opens a WASAPI endpoint in exclusive mode, which takes it from every other application on the machine. 0 (shared) is the default, because a monitor shares its endpoint with the game, the browser, and the OS |
+| `sink_flags`     | backend options for the PRIMARY device (like `device`, they do not reach the `cave_both` monitor); 0 is the default, and every bit is opt-in. `BWA_SINK_FLAG_EXCLUSIVE` opens a WASAPI endpoint in exclusive mode (AAudio: the MMAP path), which takes the device from every other application on the machine, so a monitor that shares its endpoint with the game, the browser and the OS leaves it off. `BWA_SINK_FLAG_EXACT_RATE` fails the open when the device cannot run at `sample_rate`, instead of accepting the OS resampler. `BWA_SINK_FLAG_TIGHT_BUFFER` takes the smallest device buffer the backend can, trading dropout margin for latency. See [Latency classes](#latency-classes) |
 | `reserved[3]`    | zero; room to grow without an ABI break                             |
 
 ## Errors and return codes
@@ -707,6 +707,60 @@ resample, and then reports the degradation through `bwa_last_error` after a **su
 through to the silent offline sink says why the real device did not open, and a `device` name no
 compiled backend has says that rather than opening a default. Both are successful starts, so the
 message is the only thing that tells you the room is about to be quiet.
+
+### Latency classes
+
+`bwa_desc.sink_flags` holds three opt-in bits. Each one trades something a shared, resampling,
+comfortably buffered device gives you for free:
+
+| flag | what the backend does |
+|------|-----------------------|
+| `BWA_SINK_FLAG_EXCLUSIVE` (0x1) | WASAPI opens the endpoint in exclusive mode, AAudio asks for the MMAP path. ASIO, JACK and a `hw:` ALSA PCM are already exclusive, so it is a no-op there |
+| `BWA_SINK_FLAG_EXACT_RATE` (0x2) | the open fails, naming both rates, when the device cannot run at `sample_rate`. WASAPI shared mode drops its auto-convert flag, ALSA turns the library resampler off, AAudio checks its device-rate probe. The array sinks behave this way already |
+| `BWA_SINK_FLAG_TIGHT_BUFFER` (0x4) | the smallest device buffer the backend can take: ALSA asks for 2 periods instead of 3, AAudio for 1 burst instead of 2. WASAPI exclusive mode already runs one period and shared mode's buffer belongs to the OS mixer, so it is a no-op there, and so are ASIO and JACK |
+
+None of them reaches the `cave_both` monitor. Like `device`, they describe the primary device, and
+an exclusive grab is a decision about the array's interface rather than about the machine's
+headphone endpoint.
+
+If you are porting a psychophysics rig, PsychToolbox's `PsychPortAudio('Open', ...,
+reqlatencyclass)` maps onto these. The tools take `--latency-class N` and set both columns:
+
+| PsychPortAudio class | flags | `block_size` |
+|----------------------|-------|--------------|
+| 0, do not care | none | 512 |
+| 1, low latency | none | 256 |
+| 2, aggressive | `EXCLUSIVE` | 256 |
+| 3, critical | `EXCLUSIVE` + `TIGHT_BUFFER` | 128 |
+| 4, match the format | `EXCLUSIVE` + `TIGHT_BUFFER` + `EXACT_RATE` | 128 |
+
+Classes 0 and 1 are shared mode with the OS free to convert, which is what PsychPortAudio's
+`paWinWasapiAutoConvert` does. Class 4 adds the strictness it spells
+`paMacCoreFailIfConversionRequired` on macOS and `eStreamOptionMatchFormat` on Windows: fail rather
+than convert.
+
+The block size is a hint. Read the result back rather than assuming it:
+`bwa_get_output_latency_frames` reports the real render-to-DAC delay.
+
+Measured on one desk machine, a Realtek onboard endpoint at 48 kHz, with
+`bwa_get_output_latency_frames`:
+
+| open | latency |
+|------|---------|
+| shared, 256-frame blocks | 736 frames, 15.3 ms |
+| exclusive, 256-frame blocks | 544 frames, 11.3 ms |
+| exclusive, 128-frame blocks | 416 frames, 8.7 ms |
+| exclusive, 64-frame blocks | 352 frames, 7.3 ms |
+
+Two seconds of each ran with no dropout. Your endpoint will differ: this driver forces a 144-frame
+exclusive period whatever the engine block is, so most of what the smaller blocks buy is the
+adapter holding less.
+
+**Exclusive mode takes the device.** While the engine holds it, no other application on the
+machine can open that endpoint: not the VR runtime, not the browser, not the OS sounds. On a
+headset that is usually wrong, because the runtime needs its own audio. On a dedicated rig it is
+usually right. `TIGHT_BUFFER` is the same kind of trade in the other direction: it removes the
+margin that absorbs a late block, so expect dropouts on a loaded machine.
 
 ## Device query (control thread, no engine needed)
 

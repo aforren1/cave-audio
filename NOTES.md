@@ -8,6 +8,21 @@ agent session while remaining findable.
 
 ---
 
+**Python binding (2026-09-16).** `bindings/python/`, nanobind on the stable ABI (cp312-abi3, one
+wheel per platform), two layers: a raw 1:1 `bw_audio._bwa` over all 166 bindable ABI calls and a
+thin Pythonic `bw_audio` over that. `bwa_set_output_capture` is the only exclusion, and the reason
+is invariant 1 rather than difficulty. Three decisions worth the record. The wheel build points
+scikit-build-core at the REPO ROOT (`cmake.source-dir = "../.."` plus `BWA_BUILD_PYTHON=ON`), not
+at `bindings/python`, because the root CMakeLists resolves the ASIO SDK and the staged phonon
+against `${CMAKE_SOURCE_DIR}`: an `add_subdirectory` arrangement configures, builds, tests green
+and ships a no-SDK, no-ASIO engine. The package moved to a `src/` layout after a `pytest` run from
+`bindings/python` imported the source tree, which holds no extension. And the golden test is
+`test/golden_test.c`'s own scenario and its own constants driven from Python, which needed no
+C-only step and is what proves the binding reaches the same DSP: perturbing the source position by
+10 cm moved the energy total 168.17 to 193.05, well outside the 2e-3 tolerance, so the test was
+seen red before it was trusted green. Worth knowing about that tolerance: it absorbs a 0.2 percent
+nudge of the constant itself, so it catches a DSP change and not a typo in the reference.
+
 **Static phonon for Android (2026-09-15).** Both ABIs, built on a Windows host with the composite
 action's own steps and run on an x86_64 emulator: 37 of 38, the five SDK tests included (the red is
 `os`'s `os_sleep_until_ns` median-lateness bound, about 1.1 ms against 1 ms, which a no-SDK library
