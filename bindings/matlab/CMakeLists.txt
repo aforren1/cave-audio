@@ -13,6 +13,15 @@
 
 set(BWA_MATLAB_DIR "${CMAKE_CURRENT_SOURCE_DIR}")
 
+# The engine as a BUILD DEPENDENCY, which only exists in-tree: under -DBWA_ENGINE_SDK the engine is
+# an imported target and there is nothing here to rebuild when it changes. The MATLAB MEX gets this
+# for free through target_link_libraries; the Octave one is a custom command and has to say it.
+if(TARGET bw_audio)
+  set(BWA_ENGINE_DEP bw_audio)
+else()
+  set(BWA_ENGINE_DEP "")
+endif()
+
 # The same platform string +bwa/platform_dir.m computes. It is deliberately not computer('arch'):
 # that answers 'win64' in MATLAB and 'mingw32-x86_64' in Octave for one machine.
 if(WIN32)
@@ -38,7 +47,7 @@ if(Matlab_FOUND AND Matlab_MEX_COMPILER)
   # source compiles in both places; -R2018a would give this file mxGetDoubles semantics Octave has
   # no twin for. Nothing here touches complex data, so the pin costs nothing and buys portability.
   matlab_add_mex(NAME bwa_mex_matlab SRC "${BWA_MATLAB_DIR}/src/bwa_mex.c"
-                 OUTPUT_NAME bwa_mex LINK_TO bw_audio R2017b)
+                 OUTPUT_NAME bwa_mex LINK_TO bwa::bw_audio R2017b)
   target_include_directories(bwa_mex_matlab PRIVATE "${CMAKE_SOURCE_DIR}/include")
   if(UNIX AND NOT APPLE)
     set_target_properties(bwa_mex_matlab PROPERTIES BUILD_RPATH "$ORIGIN" INSTALL_RPATH "$ORIGIN")
@@ -69,7 +78,7 @@ if(Matlab_FOUND AND Matlab_MEX_COMPILER)
   add_custom_command(TARGET bwa_mex_matlab POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E make_directory "${BWA_MATLAB_OUT}"
     COMMAND ${CMAKE_COMMAND} -E copy_if_different $<TARGET_FILE:bwa_mex_matlab> "${BWA_MATLAB_OUT}"
-    COMMAND ${CMAKE_COMMAND} -E copy_if_different $<TARGET_FILE:bw_audio>        "${BWA_MATLAB_OUT}"
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different $<TARGET_FILE:bwa::bw_audio>   "${BWA_MATLAB_OUT}"
     COMMENT "Staging the MATLAB MEX at ${BWA_MATLAB_OUT}")
   set(BWA_MATLAB_ANY ON)
   message(STATUS "bw_audio: MATLAB MEX enabled (${Matlab_ROOT_DIR})")
@@ -108,13 +117,19 @@ if(BWA_MKOCTFILE)
             -DBWA_MKOCTFILE=${BWA_MKOCTFILE}
             -DBWA_SRC=${BWA_MATLAB_DIR}/src/bwa_mex.c
             -DBWA_INCLUDE=${CMAKE_SOURCE_DIR}/include
-            -DBWA_ENGINE_LIB=$<TARGET_LINKER_FILE:bw_audio>
+            -DBWA_ENGINE_LIB=$<TARGET_LINKER_FILE:bwa::bw_audio>
+            # The RUNTIME file as well as the link file, because the two are not in one directory
+            # in every mode: an SDK install puts the Windows import library under lib/ and the DLL
+            # under bin/, where the build tree had them side by side. Off Windows they are the
+            # same file and the driver script ignores this one.
+            -DBWA_ENGINE_DLL=$<TARGET_FILE:bwa::bw_audio>
             -DBWA_OUT=${BWA_OCTAVE_MEX}
             -DBWA_STAMP=${BWA_OCTAVE_STAMP}
             -P "${BWA_MATLAB_DIR}/cmake/mkoctfile_mex.cmake"
     # The driver script is a dependency too: it carries the link flags, so changing one has to
     # relink. Nothing else here would notice.
-    DEPENDS "${BWA_MATLAB_DIR}/src/bwa_mex.c" "${BWA_MATLAB_DIR}/cmake/mkoctfile_mex.cmake" bw_audio
+    DEPENDS "${BWA_MATLAB_DIR}/src/bwa_mex.c" "${BWA_MATLAB_DIR}/cmake/mkoctfile_mex.cmake"
+            ${BWA_ENGINE_DEP}
     COMMENT "Building the Octave MEX at ${BWA_OCTAVE_MEX}"
     VERBATIM)
   add_custom_target(bwa_mex_octave ALL DEPENDS "${BWA_OCTAVE_STAMP}")

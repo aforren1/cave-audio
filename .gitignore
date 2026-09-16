@@ -2,6 +2,10 @@
 /build/
 /build*/
 /out/
+# the engine SDK install tree (cmake --install ... --component bwa_sdk). CI writes it here, and
+# cibuildwheel copies the whole working directory into its container, so it must never be a
+# committed file either.
+/engine-sdk/
 # CI staging + the packed UPM tarball (tools/upm/pack.ps1)
 /dist/
 # scratch folder

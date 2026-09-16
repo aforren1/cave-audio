@@ -352,3 +352,26 @@ against its own source directory, so anything that makes `bindings/python` the t
 would silently produce a wheel with no ASIO and no Steam Audio. There is one arrangement, and a
 repository-root configure with `-DBWA_BUILD_PYTHON=ON` runs exactly the same code a wheel build
 does.
+
+### Against a prebuilt engine
+
+A plain `uv build --wheel` compiles the whole engine inside its own isolated build directory. If
+you already have an engine you want the wheel to carry, install it as an
+[engine SDK](../../docs/build.md#the-engine-sdk) and point the build at it:
+
+```
+cmake -S ../.. -B ../../build -A x64
+cmake --build ../../build --config RelWithDebInfo
+cmake --install ../../build --prefix /path/to/sdk --component bwa_sdk --config RelWithDebInfo
+
+uv build --wheel --python 3.12 -C cmake.define.BWA_ENGINE_SDK=/path/to/sdk
+```
+
+`uv build` forwards `-C` to scikit-build-core, which puts `cmake.define.*` on the CMake command
+line. The root `CMakeLists.txt` then compiles nothing under `src/` and the wheel carries the
+library out of that SDK. This is how CI builds every wheel it ships, so the file a user installs
+is the file that platform's ctest run tested.
+
+The package checks at import that the engine it loaded reports the same `BWA_VERSION` the
+extension was compiled against, and raises `ImportError` naming both versions when it does not. A
+wheel built from one tree cannot trip it; the guard is there for the SDK path.

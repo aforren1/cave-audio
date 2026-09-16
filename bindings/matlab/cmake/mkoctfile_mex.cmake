@@ -5,7 +5,9 @@
 # script the string is data. (mkoctfile then runs its own inner shell, which is a separate
 # problem with its own fix below.)
 #
-# Expects: BWA_MKOCTFILE, BWA_SRC, BWA_INCLUDE, BWA_ENGINE_LIB, BWA_OUT, BWA_STAMP.
+# Expects: BWA_MKOCTFILE, BWA_SRC, BWA_INCLUDE, BWA_ENGINE_LIB, BWA_ENGINE_DLL, BWA_OUT,
+# BWA_STAMP. BWA_ENGINE_LIB is what the MEX LINKS against (the import library on Windows);
+# BWA_ENGINE_DLL is what it LOADS. Off Windows they are one file.
 
 get_filename_component(_outdir "${BWA_OUT}" DIRECTORY)
 file(MAKE_DIRECTORY "${_outdir}")
@@ -58,8 +60,10 @@ endif()
 
 # The engine library goes beside the MEX, so the staged directory is self-contained.
 if(WIN32)
-  # BWA_ENGINE_LIB is the IMPORT library on Windows; the DLL beside it is what loads at run time.
-  file(COPY "${_engdir}/${_engname}.dll" DESTINATION "${_outdir}")
+  # The DLL is named explicitly rather than derived from the import library's directory: an engine
+  # SDK install puts the two in SEPARATE directories (lib/ and bin/), so the old sibling assumption
+  # copied nothing and the staged MEX then failed to load on a machine with no engine on PATH.
+  file(COPY "${BWA_ENGINE_DLL}" DESTINATION "${_outdir}")
 else()
   file(COPY "${BWA_ENGINE_LIB}" DESTINATION "${_outdir}")
 endif()

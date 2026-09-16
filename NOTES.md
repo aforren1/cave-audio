@@ -8,6 +8,47 @@ agent session while remaining findable.
 
 ---
 
+**Engine SDK: one engine per platform (2026-09-16).** Every binding used to link the in-tree
+`bw_audio` target, so a desktop CI job compiled the engine FOUR times - once for its ctest run,
+once per Godot extension flavour, and once more inside the wheel build's isolated scikit-build-core
+tree - and the `wheels` job compiled a fifth and sixth. Four of those were shipped as if they were
+the same file. The fix is an install tree (`install(TARGETS ... EXPORT)` + a generated
+`bw_audioConfig.cmake`, component `bwa_sdk`) and ONE switch at the root, `-DBWA_ENGINE_SDK=<dir>`,
+which makes the root compile nothing under src/ and import `bwa::bw_audio` instead. In-tree that
+name is an ALIAS, so the four binding CMakeLists changed by one word each and take the engine file
+from `$<TARGET_FILE:bwa::bw_audio>`.
+
+Three things were learned doing it. The first is that a build tree carries install rules it does
+not own: the first unfiltered `cmake --install` produced an SDK containing raylib's headers and
+import library and the whole Python wheel payload, and the mirror image is worse, because
+scikit-build-core installs every component by default and a wheel would have grown a second engine
+at `bin/`. Hence `bwa_sdk` / `bwa_python` and `install.components` in pyproject. The second is that
+an import library and its DLL are siblings in a BUILD tree and not in an INSTALL tree, which broke
+the Octave MEX staging (`mkoctfile_mex.cmake` derived the DLL from the .lib's directory); the
+runtime path is passed explicitly now. The third is about the import-time ABI guard the Python
+package gained to match `+bwa/setup.m`'s: the first version formatted its message from
+`VERSION_MAJOR/MINOR/PATCH` while comparing `VERSION`, and a deliberately broken run printed
+"compiled against 0.15.0 ... reports 0.15.0" - a real mismatch that reads as a broken check. Both
+sides of the message are decoded from the two numbers the condition compared now. The guard was
+broken on purpose, seen red, and restored.
+
+LINUX was the interesting decision. A `manylinux_2_28` wheel needs an engine built against glibc
+2.28 and `ubuntu-latest` carries 2.39, so the two Linux engines were not redundant, they were
+different - and the one a stranger pip-installed was the one nothing had tested. The engine build
+and its ctest moved INTO the manylinux image (`tools/ci/build-engine-manylinux.sh`, a `docker run`
+with the workspace mounted, reusing the before-all script cibuildwheel already had for its dnf
+packages and its phonon). Only the engine step is containerized: MATLAB does not install in
+AlmaLinux 8 and the Godot toolchain is the runner's, and neither needs to, because a binding
+compiled on the runner against a glibc-2.28 shared object is an ordinary ABI client. The container
+runs as root, so everything it writes is root-owned - which costs nothing only because the
+bindings now configure their own trees and never write into the engine's. The `wheels` job then
+builds no engine and no phonon at all, which is what pays for its new `needs: [linux, macos]`.
+macOS needed one matching change: the engine is built with `CMAKE_OSX_DEPLOYMENT_TARGET=10.13`
+now, because the universal2 wheel DECLARES 10.13 and a dylib built for the runner's own macOS
+would install anywhere and load nowhere older.
+
+---
+
 **Python binding (2026-09-16).** `bindings/python/`, nanobind on the stable ABI (cp312-abi3, one
 wheel per platform), two layers: a raw 1:1 `bw_audio._bwa` over all 166 bindable ABI calls and a
 thin Pythonic `bw_audio` over that. `bwa_set_output_capture` is the only exclusion, and the reason

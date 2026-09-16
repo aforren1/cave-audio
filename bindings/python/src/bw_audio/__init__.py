@@ -40,6 +40,27 @@ if sys.platform == "win32":
 
 from . import _bwa  # noqa: E402
 
+# ABI guard, at import, and deliberately the same one +bwa/setup.m runs for the MEX gateway:
+# ``_bwa.VERSION`` is the BWA_VERSION the extension was COMPILED against and ``get_version()`` is
+# what the engine library it just loaded REPORTS. A wheel built from one tree cannot disagree with
+# itself, so this only ever fires when the two came from different builds - which is possible now
+# that a package can be built against a prebuilt engine SDK (docs/build.md). One C call, at import.
+_lib_version = _bwa.get_version()
+if _lib_version != _bwa.VERSION:
+    # Both sides of the message are decoded from the two numbers the CONDITION compared, not read
+    # back out of VERSION_MAJOR/MINOR/PATCH. A message sourced from other attributes can print two
+    # identical triples for a real mismatch, which reads as a broken check rather than a finding.
+    _fmt = "{0}.{1}.{2}".format
+    raise ImportError(
+        "bw_audio ABI mismatch: the extension was compiled against "
+        + _fmt((_bwa.VERSION >> 16) & 0xFF, (_bwa.VERSION >> 8) & 0xFF, _bwa.VERSION & 0xFF)
+        + " but the engine library it loaded reports "
+        + _fmt((_lib_version >> 16) & 0xFF, (_lib_version >> 8) & 0xFF, _lib_version & 0xFF)
+        + ". They are from different builds. Rebuild both from one tree, or point the build at "
+        "the matching engine SDK."
+    )
+del _lib_version
+
 if TYPE_CHECKING:  # pragma: no cover
     import numpy as np
 

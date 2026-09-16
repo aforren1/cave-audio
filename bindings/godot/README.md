@@ -38,6 +38,13 @@ library to copy: Steam Audio links statically into the engine DLL. Then open
 flavor. It defaults to `editor` here. godot-cpp's own default is `template_debug`, which
 builds fine and then does not load in the editor, so the addon would look broken. A shipping
 build wants a second tree with `-DGODOTCPP_TARGET=template_release`.
+
+Each of those trees compiles the whole engine as well, so a shipping build compiles it twice. Add
+`-DBWA_ENGINE_SDK=/path/to/sdk` to link a prebuilt engine instead (see
+[the engine SDK](../../docs/build.md#the-engine-sdk)); the extension then links that library and
+its post-build step stages that exact file into the addon. `tools/godot/pack.ps1` takes the same
+path through `-EngineSdk <dir>`, and CI always passes it, so the engine inside a released addon is
+the one that platform's ctest run tested.
 <!-- /dev -->
 
 ## Install

@@ -60,6 +60,26 @@ bwa.setup();                          % finds the MEX for THIS interpreter and c
 `bwa.Engine` calls `bwa.setup` for you, so adding the one directory is the whole install. Set
 `BWA_MATLAB_BIN` to point somewhere else, for instance at a copied release directory.
 
+### Against a prebuilt engine
+
+You do not have to compile the engine to build a MEX. Install an
+[engine SDK](../../docs/build.md#the-engine-sdk) once, from a checkout or from a release engine
+artifact, and configure the binding against it:
+
+```
+cmake -S . -B build-bind -DBWA_ENGINE_SDK=/path/to/sdk -DBWA_BUILD_MATLAB=ON
+cmake --build build-bind --config RelWithDebInfo
+```
+
+Nothing under `src/` compiles, no test or tool is registered, and the staging is the same: each MEX
+lands under `bindings/matlab/bin/<matlab|octave>/<platform>/` with the SDK's engine library beside
+it. This is how CI builds both gateways, so the library a MEX loads is the one that platform's
+ctest run tested.
+
+`bwa.setup` already guards the seam this opens: it compares the gateway's compiled `BWA_VERSION`
+against `bwa_mex('get_version')` and errors with `bwa:abiMismatch` when the two are from different
+builds.
+
 ## Two layers
 
 `bwa_mex` is the raw layer: one subcommand per `bw_audio.h` entry point, named by its C name minus

@@ -49,6 +49,11 @@ build-dir = "build/{wheel_tag}"
 wheel.packages = ["src/bw_audio"]
 # Only the extension, so a wheel build does not also compile the test suite and the tools.
 build.targets = ["_bwa"]
+# And only the wheel's OWN install rules. The root CMakeLists also installs the engine SDK
+# (component bwa_sdk: the header, the import library, the CMake package files), which is a
+# different product for a different consumer. scikit-build-core installs every component unless
+# told which, so naming this one is what keeps a second copy of the engine out of the wheel.
+install.components = ["bwa_python"]
 # Version-specific by default; the override below promotes it to abi3 on a Python that can.
 wheel.py-api = ""
 

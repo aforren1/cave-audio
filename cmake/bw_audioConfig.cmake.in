@@ -1,0 +1,23 @@
+# CMake package config for the bw_audio ENGINE SDK - the install tree the root CMakeLists writes
+# with `cmake --install <build> --prefix <sdk>`. Consumed two ways:
+#
+#   find_package(bw_audio CONFIG REQUIRED PATHS <sdk>)    - any C client, in its own project
+#   cmake -S . -B <tree> -DBWA_ENGINE_SDK=<sdk> ...       - this repo, building bindings ONLY
+#
+# Either way the one name it provides is the imported target `bwa::bw_audio`, which is also what
+# the in-tree build aliases the real target to. A binding therefore links one spelling and never
+# asks which mode it is in. See docs/build.md, "The engine SDK".
+
+@PACKAGE_INIT@
+
+include(CMakeFindDependencyMacro)
+# The POSIX half of the engine links pthreads PRIVATE. A private dependency of a SHARED library is
+# not a consumer's problem at link time, but CMake still records the imported target name, so the
+# name has to exist when the targets file is read.
+if(NOT WIN32)
+  find_dependency(Threads)
+endif()
+
+include("${CMAKE_CURRENT_LIST_DIR}/bw_audioTargets.cmake")
+
+check_required_components(bw_audio)

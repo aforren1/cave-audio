@@ -54,7 +54,7 @@ find_package(nanobind CONFIG REQUIRED)
 # NB_STATIC: nanobind's own runtime is linked into this one extension. There is only one extension
 # here, so a shared libnanobind would be a second file to ship for no sharing.
 nanobind_add_module(_bwa ${BWA_PY_STABLE_ABI} NB_STATIC src/bwa_module.cpp)
-target_link_libraries(_bwa PRIVATE bw_audio)
+target_link_libraries(_bwa PRIVATE bwa::bw_audio)
 target_include_directories(_bwa PRIVATE "${CMAKE_SOURCE_DIR}/include")
 
 if(APPLE)
@@ -67,8 +67,13 @@ endif()
 # install(TARGETS) for the extension so CMake rewrites its RPATH at install time; install(FILES) for
 # the engine, because TARGETS would also want a destination for the Windows import library and a
 # wheel has no use for one.
-install(TARGETS _bwa LIBRARY DESTINATION bw_audio RUNTIME DESTINATION bw_audio)
-install(FILES $<TARGET_FILE:bw_audio> DESTINATION bw_audio)
+#
+# COMPONENT bwa_python on every rule, and pyproject.toml's `install.components` names it. The root
+# CMakeLists also carries the engine SDK's install rules (component bwa_sdk), and scikit-build-core
+# installs EVERY component unless told otherwise - so without this a wheel would carry a second
+# copy of the engine at bin/ plus the header and the CMake package files.
+install(TARGETS _bwa COMPONENT bwa_python LIBRARY DESTINATION bw_audio RUNTIME DESTINATION bw_audio)
+install(FILES $<TARGET_FILE:bwa::bw_audio> DESTINATION bw_audio COMPONENT bwa_python)
 
 # STRIP the installed engine library on the ELF and Mach-O platforms. It is not tidiness: a static
 # phonon is built -g, so its DWARF is about 25 MB against the 7 MB of code, and a wheel carries the
@@ -83,13 +88,14 @@ if(NOT WIN32)
     set(BWA_PY_STRIP_ARGS --strip-debug)
   endif()
   install(CODE "execute_process(COMMAND \"${CMAKE_STRIP}\" ${BWA_PY_STRIP_ARGS}
-                  \"\${CMAKE_INSTALL_PREFIX}/bw_audio/$<TARGET_FILE_NAME:bw_audio>\")")
+                  \"\${CMAKE_INSTALL_PREFIX}/bw_audio/$<TARGET_FILE_NAME:bwa::bw_audio>\")"
+          COMPONENT bwa_python)
 endif()
 
 # GPLv3 travels with the binary, the same rule the Unity and Godot packs follow: the pack
 # copies the repo's own LICENSE rather than keeping a second copy under the binding.
 install(FILES "${CMAKE_SOURCE_DIR}/LICENSE" "${CMAKE_SOURCE_DIR}/THIRD_PARTY-NOTICES.md"
-        DESTINATION bw_audio)
+        DESTINATION bw_audio COMPONENT bwa_python)
 
 # ---- the build tree's own importable copy ----
 # ctest and a developer both want `import bw_audio` without building a wheel first, and the layout
@@ -100,7 +106,7 @@ set(BWA_PY_STAGE "${CMAKE_BINARY_DIR}/python-package/bw_audio")
 add_custom_command(TARGET _bwa POST_BUILD
   COMMAND ${CMAKE_COMMAND} -E make_directory "${BWA_PY_STAGE}"
   COMMAND ${CMAKE_COMMAND} -E copy_if_different $<TARGET_FILE:_bwa>      "${BWA_PY_STAGE}"
-  COMMAND ${CMAKE_COMMAND} -E copy_if_different $<TARGET_FILE:bw_audio>  "${BWA_PY_STAGE}"
+  COMMAND ${CMAKE_COMMAND} -E copy_if_different $<TARGET_FILE:bwa::bw_audio> "${BWA_PY_STAGE}"
   COMMAND ${CMAKE_COMMAND} -E copy_if_different
           "${CMAKE_CURRENT_SOURCE_DIR}/src/bw_audio/__init__.py"             "${BWA_PY_STAGE}"
   COMMAND ${CMAKE_COMMAND} -E copy_if_different

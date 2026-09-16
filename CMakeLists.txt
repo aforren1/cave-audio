@@ -11,6 +11,11 @@
 #   - the ctest suite (BWA_BUILD_TESTS, ON by default).
 #   - opt-in tools: bwa_calibrate (-DBWA_BUILD_CALIBRATE), bwa_calib_view (-DBWA_BUILD_CALIBVIEW),
 #     bwa_playground + bwa_layout_tool (-DBWA_BUILD_PLAYGROUND), Godot binding (-DBWA_BUILD_GODOT).
+#
+# TWO MODES. By default this file compiles the engine and everything above. With
+# -DBWA_ENGINE_SDK=<dir> it compiles NOTHING from src/: it imports a prebuilt engine out of that
+# install tree and builds only the bindings. One engine binary per platform then serves every
+# package that ships on it. See docs/build.md, "The engine SDK".
 cmake_minimum_required(VERSION 3.20)
 # No project VERSION here: nothing consumes ${PROJECT_VERSION}, and two version streams own the real
 # numbers - the ABI version lives in include/bw_audio.h (BWA_VERSION*, what bwa_get_version returns),
@@ -37,6 +42,59 @@ endif()
 # nonstandard *_s deprecation warnings rather than fork the code for one compiler.
 if(MSVC)
   add_compile_definitions(_CRT_SECURE_NO_WARNINGS)
+endif()
+
+list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
+include(bwa_bindings)
+
+# ---- SDK MODE: bindings only, against a prebuilt engine ----------------------------------------
+# -DBWA_ENGINE_SDK=<dir> points at the install tree `cmake --install` writes from an ordinary build
+# of this same file. Nothing under src/ is compiled here, no test or tool is registered, and the
+# engine the bindings link is the file that tree already holds - so the wheel, the MEX pair and the
+# GDExtension on one platform all ship the ONE binary that platform's ctest run tested.
+#
+# The repo root stays the CMake source dir either way, which is what lets pyproject.toml keep
+# `cmake.source-dir = "../.."` and a wheel build reach SDK mode through one -D.
+#
+# `return()` rather than wrapping the rest of the file in an if(): the engine build below is ~1100
+# lines and re-indenting it would hide the one thing this block does.
+set(BWA_ENGINE_SDK "" CACHE PATH
+    "Build ONLY the bindings, against the prebuilt engine SDK installed at this prefix")
+if(BWA_ENGINE_SDK)
+  if(NOT IS_DIRECTORY "${BWA_ENGINE_SDK}")
+    message(FATAL_ERROR "BWA_ENGINE_SDK=${BWA_ENGINE_SDK} is not a directory. It must be the "
+                        "prefix a `cmake --install` of this project wrote (docs/build.md).")
+  endif()
+  # NO_DEFAULT_PATH: a bw_audio installed somewhere else on the machine must never answer instead
+  # of the tree that was named. A wrong engine here is the exact failure this mode exists to avoid.
+  find_package(bw_audio CONFIG REQUIRED PATHS "${BWA_ENGINE_SDK}" NO_DEFAULT_PATH)
+  message(STATUS "bw_audio: SDK MODE - bindings only, against ${BWA_ENGINE_SDK}")
+  # The configurations the SDK actually carries. An SDK installed from a RelWithDebInfo build and
+  # consumed from a Debug tree works (CMake falls back to whatever the imported target has), but it
+  # is worth SAYING which binary is about to be shipped rather than leaving it to be inferred.
+  get_target_property(BWA_SDK_CONFIGS bwa::bw_audio IMPORTED_CONFIGURATIONS)
+  message(STATUS "bw_audio: SDK ABI version ${bw_audio_VERSION}, configurations: ${BWA_SDK_CONFIGS}")
+
+  # Same option and the same enable_testing() the in-tree path has, so each binding registers its
+  # ctests here exactly as it does there.
+  option(BWA_BUILD_TESTS "Build the bw_audio tests" ON)
+  if(BWA_BUILD_TESTS)
+    enable_testing()
+  endif()
+
+  # Nothing under src/ is compiled here, so every engine-side option is inert. Say so: a flag that
+  # is quietly dropped is how someone spends an afternoon looking for a tool this tree was never
+  # going to build.
+  foreach(opt BWA_BUILD_PLAYGROUND BWA_BUILD_CALIBVIEW BWA_BUILD_CALIBRATE BWA_BUILD_BENCH
+              BWA_TRACY BWA_PROFILE_SELF BWA_ASAN)
+    if(${opt})
+      message(WARNING "bw_audio: ${opt} is IGNORED under BWA_ENGINE_SDK - this tree builds bindings "
+                      "only. Build it in an ordinary (engine) tree instead.")
+    endif()
+  endforeach()
+
+  bwa_add_bindings()
+  return()
 endif()
 
 # The gcc/clang counterpart of the /W4 the MSVC targets carry. Applied per target below, not
@@ -275,7 +333,15 @@ add_library(bw_audio SHARED
   $<TARGET_OBJECTS:bwa_core>
 )
 set_target_properties(bw_audio PROPERTIES C_VISIBILITY_PRESET hidden)
-target_include_directories(bw_audio PUBLIC include PRIVATE src ${dr_libs_SOURCE_DIR} ${CJSON_INC})
+# ONE name for the engine in BOTH root modes: in-tree this aliases the real target, and SDK mode
+# imports a target of the same spelling out of the installed package. Every binding links
+# `bwa::bw_audio` and never asks which mode built it.
+add_library(bwa::bw_audio ALIAS bw_audio)
+# BUILD_INTERFACE / INSTALL_INTERFACE rather than a bare `include`: a source-tree path in the link
+# interface is an install(EXPORT) error, and the SDK below exports this target.
+target_include_directories(bw_audio
+  PUBLIC $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include> $<INSTALL_INTERFACE:include>
+  PRIVATE src ${dr_libs_SOURCE_DIR} ${CJSON_INC})
 target_compile_definitions(bw_audio PRIVATE BWA_BUILD_DLL)
 target_compile_options(bw_audio PRIVATE ${BWA_C_WARNINGS})
 if(MSVC)
@@ -527,6 +593,71 @@ if(BWA_PHONON_LIBS)
 else()
   message(STATUS "bw_audio: Steam Audio disabled (no SDK at ${STEAMAUDIO_DIR}); binaural uses the first-cut pan")
 endif()
+
+# ---- the engine SDK: the install tree every binding can link against instead of rebuilding ------
+# `cmake --install <build> --prefix <sdk> [--config <cfg>]` writes:
+#
+#   <sdk>/include/bw_audio.h
+#   <sdk>/lib/cmake/bw_audio/{bw_audioConfig,bw_audioConfigVersion,bw_audioTargets*}.cmake
+#   <sdk>/lib/{bw_audio.lib | libbw_audio.so | libbw_audio.dylib}
+#   <sdk>/bin/{bw_audio.dll, bw_audio.pdb}                                        (Windows only)
+#
+# It is the whole reason SDK MODE at the top of this file exists, and it is also just a normal
+# CMake package: a C client outside this repo does find_package(bw_audio CONFIG) against it.
+#
+# NOTHING IS STRIPPED HERE. The library goes in as the build produced it - unstripped on Linux and
+# macOS, with its .pdb beside it on Windows - because the consumers that want symbols gone already
+# remove them at their own staging step (the dist packs split them into a sidecar, the Python
+# install(FILES) strips its copy) and an SDK that arrived pre-stripped could not feed those.
+# EVERY rule here carries COMPONENT bwa_sdk, and the install command names it:
+#
+#   cmake --install <build> --prefix <sdk> --component bwa_sdk --config RelWithDebInfo
+#
+# The component is not tidiness. This build tree also holds install rules it does not own -
+# raylib's, when the playground is on - and rules it owns for a DIFFERENT destination: the Python
+# binding installs the wheel's contents (component bwa_python). One unfiltered install would mix
+# all three into one prefix, and the wheel would grow a second copy of the engine at bin/.
+set(BWA_INSTALL_CMAKEDIR "lib/cmake/bw_audio")
+
+install(TARGETS bw_audio EXPORT bw_audioTargets COMPONENT bwa_sdk
+        RUNTIME DESTINATION bin            # the DLL on Windows
+        LIBRARY DESTINATION lib            # the .so / .dylib
+        ARCHIVE DESTINATION lib)           # the Windows import library
+# No INCLUDES DESTINATION: the target already carries $<INSTALL_INTERFACE:include>, and both would
+# put the same directory in the exported interface twice.
+install(FILES include/bw_audio.h DESTINATION include COMPONENT bwa_sdk)
+# GPLv3 travels with the binary, the same rule the wheel and both packs follow.
+install(FILES LICENSE THIRD_PARTY-NOTICES.md DESTINATION . COMPONENT bwa_sdk)
+if(MSVC)
+  # OPTIONAL: a config without debug info (Release) generates no .pdb, and asking for one that was
+  # never written would fail the install rather than skip it.
+  install(FILES $<TARGET_PDB_FILE:bw_audio> DESTINATION bin COMPONENT bwa_sdk OPTIONAL)
+endif()
+install(EXPORT bw_audioTargets NAMESPACE bwa:: FILE bw_audioTargets.cmake
+        DESTINATION "${BWA_INSTALL_CMAKEDIR}" COMPONENT bwa_sdk)
+
+# The package version is the ABI version in include/bw_audio.h - the same number bwa_get_version
+# returns and the same one the Python wheel takes its version from. There is no second stream to
+# keep in step: read it out of the header.
+file(STRINGS include/bw_audio.h BWA_VERSION_LINES REGEX "^#define BWA_VERSION_(MAJOR|MINOR|PATCH) ")
+foreach(part MAJOR MINOR PATCH)
+  string(REGEX MATCH "#define BWA_VERSION_${part} ([0-9]+)" _m "${BWA_VERSION_LINES}")
+  set(BWA_V_${part} "${CMAKE_MATCH_1}")
+endforeach()
+set(BWA_ABI_VERSION "${BWA_V_MAJOR}.${BWA_V_MINOR}.${BWA_V_PATCH}")
+
+include(CMakePackageConfigHelpers)
+configure_package_config_file(cmake/bw_audioConfig.cmake.in
+  "${CMAKE_CURRENT_BINARY_DIR}/bw_audioConfig.cmake"
+  INSTALL_DESTINATION "${BWA_INSTALL_CMAKEDIR}")
+# SameMinorVersion: struct layouts and enum values are only guaranteed inside one major.minor
+# (include/bw_audio.h), which is the same rule the MATLAB and Python load-time guards enforce.
+write_basic_package_version_file(
+  "${CMAKE_CURRENT_BINARY_DIR}/bw_audioConfigVersion.cmake"
+  VERSION "${BWA_ABI_VERSION}" COMPATIBILITY SameMinorVersion)
+install(FILES "${CMAKE_CURRENT_BINARY_DIR}/bw_audioConfig.cmake"
+              "${CMAKE_CURRENT_BINARY_DIR}/bw_audioConfigVersion.cmake"
+        DESTINATION "${BWA_INSTALL_CMAKEDIR}" COMPONENT bwa_sdk)
 
 # ---- stage runtime libraries into the Unity package (bindings/unity/Runtime/Plugins/<abi>) ----
 # Gitignored build artifacts; the UPM package picks them up so it "just works" after a build.
@@ -995,33 +1126,6 @@ if(BWA_BUILD_TESTS)
   endif()
 endif()
 
-# ---- Optional: Python binding (nanobind) ----
-# Opt-in, because it needs a Python 3.9+ interpreter with nanobind importable and the default build
-# has no Python dependency at all:
-#   cmake -S . -B build -DBWA_BUILD_PYTHON=ON
-# It registers three more ctests (the pytest suite plus the two examples in --tests mode). This is
-# ALSO the path a wheel build takes: bindings/python/pyproject.toml points scikit-build-core at THIS
-# file with the option on, rather than making bindings/python its own project, because the ASIO and
-# phonon lookups above resolve against ${CMAKE_SOURCE_DIR} and would miss from anywhere else. See
-# bindings/python/CMakeLists.txt and bindings/python/README.md.
-option(BWA_BUILD_PYTHON "Build the Python binding (nanobind; needs Python 3.9+ with nanobind)" OFF)
-if(BWA_BUILD_PYTHON)
-  enable_language(CXX)
-  add_subdirectory(bindings/python)
-endif()
-
-# ---- Optional: MATLAB and Octave binding (a classic C MEX gateway) ----
-# Opt-in, because it needs MATLAB or Octave installed and the default build needs neither:
-#   cmake -S . -B build -DBWA_BUILD_MATLAB=ON
-# It builds whichever of the two it finds, and both when both are there, from ONE source: the
-# classic C MEX API is what Octave implements, so the MATLAB-only C++ Data API is off the table.
-# Each half registers its own ctests (the suite plus the three examples in --tests mode).
-# See bindings/matlab/CMakeLists.txt and bindings/matlab/README.md.
-option(BWA_BUILD_MATLAB "Build the MATLAB and Octave binding (a MEX gateway; needs MATLAB or mkoctfile)" OFF)
-if(BWA_BUILD_MATLAB)
-  add_subdirectory(bindings/matlab)
-endif()
-
 # ---- Shared Dear ImGui stack for the GUI tools (bwa_calib_view, bwa_layout_tool) ----
 # One pinned copy of imgui + imgui_test_engine, compiled INTO each tool as target sources (not a
 # library: the test-engine define below must be seen by every imgui-including TU of an executable,
@@ -1076,47 +1180,6 @@ if(BWA_BUILD_PLAYGROUND OR BWA_BUILD_CALIBVIEW)
     IMGUI_ENABLE_TEST_ENGINE
     IMGUI_TEST_ENGINE_ENABLE_COROUTINE_STDTHREAD_IMPL=1
     IMGUI_TEST_ENGINE_ENABLE_CAPTURE=1)
-endif()
-
-# ---- Optional: Godot GDExtension binding ----
-# Opt-in (it fetches godot-cpp, whose generated bindings are a multi-minute first build):
-# cmake -S . -B build -DBWA_BUILD_GODOT=ON. See bindings/godot/CMakeLists.txt.
-option(BWA_BUILD_GODOT "Build the Godot GDExtension binding (fetches godot-cpp)" OFF)
-if(BWA_BUILD_GODOT)
-  enable_language(CXX)
-  # godot-cpp puts CMAKE_MSVC_RUNTIME_LIBRARY in the CACHE on purpose (its cmake/windows.cmake
-  # documents that it does so "for consumer target definitions") and picks the STATIC CRT. A cache
-  # entry outlives the subdirectory, so without this dance every target declared BELOW would be
-  # created with /MT while bwa_core above was built /MD, and linking the two together fails with
-  # unresolved __imp_* CRT symbols (bwa_calib_view, bwa_calibrate and bwa_validate all hit it).
-  # Save it here and put it back immediately AFTER the subdirectory, not around the fetch inside
-  # bindings/godot/CMakeLists.txt: bwa_gdextension is declared after that fetch and has to keep
-  # godot-cpp's choice, or the shipped GDExtension mismatches the static godot-cpp it links.
-  #
-  # A build tree whose cache still holds godot-cpp's /MT entry from BEFORE this dance existed hits
-  # the mismatch at the top of the file instead, where nothing here can save it: every target is
-  # created /MT, and the static phonon (built /MD, third_party/README.md's CRT note) then fails
-  # with one LNK2038 per archive member. A static archive CARRIES its CRT choice, where the old
-  # import library did not, so what used to link silently is now a wall of errors. The fix is to
-  # drop the stale entry: cmake -U CMAKE_MSVC_RUNTIME_LIBRARY -S . -B <tree>, or reconfigure clean.
-  if(DEFINED CMAKE_MSVC_RUNTIME_LIBRARY)
-    set(BWA_MSVC_RUNTIME_SAVED "${CMAKE_MSVC_RUNTIME_LIBRARY}")
-  else()
-    unset(BWA_MSVC_RUNTIME_SAVED)
-  endif()
-
-  add_subdirectory(bindings/godot)
-
-  if(DEFINED BWA_MSVC_RUNTIME_SAVED)
-    set(CMAKE_MSVC_RUNTIME_LIBRARY "${BWA_MSVC_RUNTIME_SAVED}" CACHE STRING
-        "Select the MSVC runtime library for use by compilers targeting the MSVC ABI." FORCE)
-    unset(BWA_MSVC_RUNTIME_SAVED)
-  else()
-    # It was undefined before, so leave it undefined: an empty cache string is NOT the same thing
-    # (CMake's own default under CMP0091 is the /MD selection, which is what the rest of the tree
-    # is compiled with).
-    unset(CMAKE_MSVC_RUNTIME_LIBRARY CACHE)
-  endif()
 endif()
 
 # ---- Optional: interactive playground (evaluate the binaural monitor by ear) ----
@@ -1278,3 +1341,9 @@ if(BWA_BUILD_CALIBRATE)
     bwa_add_asio_host(bwa_zylia_probe)
   endif()
 endif()
+
+# ---- the optional bindings (Python / MATLAB + Octave / Godot) ------------------------------------
+# LAST, and through the shared macro in cmake/bwa_bindings.cmake, because SDK MODE at the top of
+# this file calls the same macro. One list of bindings, two ways in. Every one of them links
+# `bwa::bw_audio`, which is the alias declared beside the target above.
+bwa_add_bindings()

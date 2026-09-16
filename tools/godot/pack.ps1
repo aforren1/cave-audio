@@ -34,6 +34,7 @@
 #
 #   powershell -File tools/godot/pack.ps1 [-Version 0.3.0] [-OutDir dist/godot]
 #                                         [-AndroidFrom <dir>] [-LinuxFrom <dir>] [-MacFrom <dir>]
+#                                         [-EngineSdk <dir>]
 #
 # Each -*From directory is FLAT: the script reads the manifest to learn which files that platform
 # needs and where inside bin/ they belong, and takes them out of the directory by name.
@@ -47,7 +48,11 @@ param(
                                        # this over from the android job); default: build it here
     [string] $LinuxFrom,               # directory holding the PREBUILT linux x86_64 libraries
     [string] $MacFrom,                 # directory holding the PREBUILT macos universal libraries
-    [switch] $SkipBuild                # reuse existing build trees (local iteration)
+    [switch] $SkipBuild,               # reuse existing build trees (local iteration)
+    [string] $EngineSdk                # build the two extension flavours against a PREBUILT engine
+                                       # SDK (cmake --install ... --component bwa_sdk) instead of
+                                       # compiling the engine once per flavour. CI passes the tree
+                                       # its own ctest run tested, so the addon ships that binary.
 )
 $ErrorActionPreference = 'Stop'
 $here = if ($PSScriptRoot) { $PSScriptRoot } else { Split-Path -Parent $MyInvocation.MyCommand.Path }
@@ -126,7 +131,12 @@ if (-not $SkipBuild) {
         # which caches them; turning tests off here would persist into the cache and leave the
         # next run's ctest selecting nothing - and an empty selection reads as a pass. Only the
         # bwa_gdextension target is built below, so leaving tests enabled costs nothing.
-        & cmake -S $repo -B $tree -A x64 -DBWA_BUILD_GODOT=ON "-DGODOTCPP_TARGET=$target"
+        # -DBWA_ENGINE_SDK turns the root CMakeLists into bindings-only mode, so each flavour
+        # links the prebuilt engine instead of compiling a second and a third copy of it. Without
+        # it the two trees build the whole engine again, which is what they did before.
+        $sdkArg = @()
+        if ($EngineSdk) { $sdkArg = @("-DBWA_ENGINE_SDK=$EngineSdk") }
+        & cmake -S $repo -B $tree -A x64 -DBWA_BUILD_GODOT=ON "-DGODOTCPP_TARGET=$target" @sdkArg
         if ($LASTEXITCODE -ne 0) { throw "configure failed for $target" }
         Write-Host "==> building $target"
         & cmake --build $tree --config RelWithDebInfo --target bwa_gdextension

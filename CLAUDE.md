@@ -262,6 +262,13 @@ tools/phonon/          build-phonon.sh: THE phonon recipe (env-driven: BWA_PLATF
                        cibw-before-all-linux.sh, which builds phonon INSIDE the manylinux container
                        that links the Python wheel (a composite action runs on the runner, so it
                        cannot). cibw-before-all-macos.sh is the universal2 side. [python wheels]
+tools/ci/              build-engine-manylinux.sh: the LINUX engine, built, ctested and installed as
+                       an SDK INSIDE the manylinux_2_28 image. A manylinux wheel needs a glibc-2.28
+                       engine and ubuntu-latest carries 2.39, so CI used to build two Linux engines
+                       and ship the one nothing had tested. Only the engine step is containerized -
+                       MATLAB and the Godot toolchain do not install in AlmaLinux 8 and do not need
+                       to, since a binding compiled on the runner against a glibc-2.28 shared object
+                       is an ordinary ABI client. [engine sdk]
 tools/xval/            gen_reference.py: cross-validation golden generator (scipy SH / l1-LP VBAP /
                        qhull AllRAD / bilinear RBJ / lfilter) -> test/xval_data.h for the xval ctest.
                        Needs numpy+scipy; ctest itself does not (the header is committed).
@@ -316,6 +323,15 @@ bindings/
                        (Octave refcounts handle objects), so Engine.listener is DEPENDENT and not a
                        stored object pointing back.
   unreal/              module + component — planned, not yet implemented (docs/integration.md has the notes).
+cmake/                 bw_audioConfig.cmake.in + bwa_bindings.cmake. The first is the package config
+                       the ENGINE SDK installs (`cmake --install <build> --prefix <sdk> --component
+                       bwa_sdk`), which is how a binding links a PREBUILT engine instead of
+                       compiling one: `-DBWA_ENGINE_SDK=<sdk>` at the root compiles nothing under
+                       src/, imports `bwa::bw_audio` from there and includes the bindings only. The
+                       second holds the three binding add_subdirectory blocks in ONE macro, because
+                       both root modes call it and a second copy would let one mode gain a binding
+                       the other has not. In-tree, `bwa::bw_audio` is an ALIAS of the real target,
+                       so a binding never asks which mode built it. [engine sdk]
 docs/                  Specs. Start here.
 examples/              cave_layout.json (see docs/layout-schema.md); minimal.c (the client lifecycle),
                        ambisonic.c (beds: AmbiX/FuMa load, rotate/tilt, renderer + max-rE A/B),
@@ -355,6 +371,27 @@ cmake -S . -B build -A x64      # default generator = newest installed Visual St
 cmake --build build --config RelWithDebInfo
 ctest --test-dir build -C RelWithDebInfo      # runs the full test suite (test_* targets)
 ```
+
+**Two root modes, and ONE engine per platform.** A plain configure is the above. With
+`-DBWA_ENGINE_SDK=<dir>` the root compiles NOTHING under src/ - no engine, no test, no tool - and
+instead imports `bwa::bw_audio` out of an install tree a previous build wrote
+(`cmake --install <build> --prefix <dir> --component bwa_sdk`), then includes whichever bindings
+are enabled. The component matters: the same tree carries raylib's install rules and the Python
+binding's, and an unfiltered install mixes all three into one prefix. Both modes hand the bindings
+the one name `bwa::bw_audio` and take the engine file from `$<TARGET_FILE:bwa::bw_audio>`, and the
+repo root stays the CMake source dir either way, which is what lets pyproject keep
+`cmake.source-dir = "../.."`; a wheel reaches SDK mode through
+`uv build --wheel -C cmake.define.BWA_ENGINE_SDK=<dir>`. This exists because each binding used to
+pull the engine in as a source dependency: a desktop CI job compiled the engine for its ctest run,
+again for each of the two Godot flavours, and again inside the wheel build - four binaries that
+were only meant to be the same. CI now installs the SDK right after ctest and configures every
+binding against it, and each staging step asserts the file it staged against the SDK's. The Linux
+engine is built inside the manylinux_2_28 container (tools/ci/build-engine-manylinux.sh) so the
+release wheel and the tested binary are the same file; the `wheels` job builds no engine and no
+phonon and therefore `needs: [linux, macos]`. Local test counts do not change - configure
+everything in one tree and you get the same suite. What changes is CI's per-tree split: the engine
+tree registers 45 on Windows at full options and 38 off it, and each job's bindings tree registers
+the binding tests alone.
 
 **Current state (M6 + occlusion).** The engine builds `bw_audio.dll` and the full ctest
 suite — 45 tests with the Steam Audio SDK, 40 without (the 5 SDK-gated ones are `reflect`,
@@ -618,6 +655,19 @@ Regression-preventing gotchas. Each has bitten before or guards a real invariant
   newer than the source. Half an hour went into "the hook is broken" that was really an unrebuilt
   DLL. `touch` the file after any restore, and when a result contradicts the code you are reading,
   suspect the binary before the logic.
+- **A build tree carries install rules it does not own, so an SDK install must name a
+  COMPONENT.** `cmake --install <build> --prefix <sdk>` with no `--component` writes raylib's
+  headers and import library, and the Python binding's wheel payload, into the same prefix as the
+  engine SDK - and the mirror image is worse: scikit-build-core installs EVERY component by
+  default, so a wheel built from a tree that also has the SDK rules grows a second copy of the
+  engine at `bin/` plus the header and the CMake package files. The two halves are `bwa_sdk` and
+  `bwa_python`, and `pyproject.toml` names the second in `install.components`. Both were seen
+  before the split, in the same install listing.
+- **An import library and the runtime file are siblings in a BUILD TREE and not in an INSTALL
+  TREE.** `mkoctfile_mex.cmake` derived the DLL to stage from `$<TARGET_LINKER_FILE>`'s directory,
+  which is right for `build/RelWithDebInfo/` and wrong for an SDK, where the .lib is under `lib/`
+  and the .dll under `bin/`. It copies nothing and fails only later, on a machine with no engine on
+  PATH. The runtime path is passed explicitly now (`BWA_ENGINE_DLL`).
 - **`test/xval_data.h` is GENERATED** by `tools/xval/gen_reference.py` — don't hand-edit.
   Regenerating needs numpy + scipy; ctest stays hermetic on the committed header.
 - **`-DBWA_ASAN=ON`** builds `test_sound` under AddressSanitizer — the control-side

@@ -45,7 +45,7 @@ add_library(bwa_gdextension SHARED
   src/bwa_geometry.cpp
   src/bwa_speaker_view.cpp)
 
-target_link_libraries(bwa_gdextension PRIVATE godot-cpp bw_audio)
+target_link_libraries(bwa_gdextension PRIVATE godot-cpp bwa::bw_audio)
 target_compile_features(bwa_gdextension PRIVATE cxx_std_17)
 
 # godot-cpp hands the platform/target/arch suffix out as a target property, so the built file
@@ -112,7 +112,7 @@ endif()
 add_custom_command(TARGET bwa_gdextension POST_BUILD
   COMMAND ${CMAKE_COMMAND} -E make_directory ${BWA_GODOT_ENGINE_DIR}
   COMMAND ${CMAKE_COMMAND} -E copy_if_different
-          $<TARGET_FILE:bw_audio> ${BWA_GODOT_ENGINE_DIR})
+          $<TARGET_FILE:bwa::bw_audio> ${BWA_GODOT_ENGINE_DIR})
 
 # The coordinate seam is pure float math in src/bwa_room.h with no godot-cpp dependency,
 # so its property test builds and runs without the editor or the generated bindings.

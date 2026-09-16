@@ -100,6 +100,7 @@ Everything beyond the DLL + test suite is opt-in; the default build stays lean.
 | `BWA_BUILD_GODOT` | OFF | the Godot GDExtension (fetches godot-cpp - a multi-minute first build). `GODOTCPP_TARGET` picks the library flavor (`editor` default); `tools/godot/pack.ps1` builds both shippable ones. See `bindings/godot/README.md` |
 | `BWA_BUILD_PYTHON` | OFF | the Python binding (`_bwa`, nanobind). Needs Python 3.9 or later with `nanobind` importable by the interpreter CMake finds; 3.12 or later gets the stable ABI. Adds three ctests (`python_bindings` plus the two examples). `uv build --wheel` in `bindings/python` takes this same path. See `bindings/python/README.md` |
 | `BWA_BUILD_MATLAB` | OFF | the MATLAB and Octave binding (`bwa_mex`, a classic C MEX gateway). Builds whichever of the two toolchains CMake finds, and both when both are there: MATLAB through `matlab_add_mex` (needs a configured C compiler, `mex -setup C`), Octave through `mkoctfile`. Adds up to four ctests per interpreter found. See `bindings/matlab/README.md` |
+| `BWA_ENGINE_SDK` | empty | build ONLY the bindings, against a prebuilt engine installed at this prefix. Nothing under `src/` compiles, and no test or tool is registered. See [The engine SDK](#the-engine-sdk) |
 | `BWA_ASAN` | OFF | builds `test_sound` with AddressSanitizer (MSVC; needs tests ON) |
 | `BWA_TRACY` | OFF | Tracy profiler instrumentation (fetches Tracy; collects only while a profiler is attached). See [profiling.md](./profiling.md) |
 | `BWA_BUILD_BENCH` | OFF | the profiling benches (`bwa_profile_bench` + `bwa_bench_situations`). See [profiling.md](./profiling.md) |
@@ -118,6 +119,79 @@ detection picks the one for the platform you are configuring. The Android recipe
 `third_party/README.md`, including the two android-only patches it applies. The Linux recipe is there too, including
 the one flag it takes (`-DSTEAMAUDIO_ENABLE_AVX=OFF` on gcc 13 and older). The macOS build runs
 **only in CI**, because nobody here has a Mac to verify it on.
+
+### The engine SDK
+
+Build the engine once, then link every binding against that one file.
+
+An ordinary build compiles the engine into whatever tree you configured. That is fine for one
+build, but each binding used to pull the engine in as a source dependency, so a job that built the
+engine, two Godot extension flavors and a wheel compiled the engine four times and shipped four
+files that were only meant to be the same. The SDK removes that.
+
+**Install it.** Any build tree can produce one:
+
+```
+cmake -S . -B build -A x64
+cmake --build build --config RelWithDebInfo
+cmake --install build --prefix /path/to/sdk --component bwa_sdk --config RelWithDebInfo
+```
+
+`--component bwa_sdk` is required. The same tree also carries raylib's install rules and the
+Python binding's, and an unfiltered install mixes all three into one prefix.
+
+What you get:
+
+```
+<sdk>/include/bw_audio.h
+<sdk>/lib/cmake/bw_audio/          bw_audioConfig.cmake + the version file + the exported targets
+<sdk>/lib/                         bw_audio.lib | libbw_audio.so | libbw_audio.dylib
+<sdk>/bin/                         bw_audio.dll + bw_audio.pdb            (Windows only)
+<sdk>/LICENSE, THIRD_PARTY-NOTICES.md
+```
+
+Nothing is stripped. The library goes in as the build produced it, because the consumers that want
+symbols gone already remove them at their own staging step.
+
+**Use it from this repo.** One switch turns the root into bindings-only mode:
+
+```
+cmake -S . -B build-bind -A x64 -DBWA_ENGINE_SDK=/path/to/sdk -DBWA_BUILD_MATLAB=ON
+cmake --build build-bind --config RelWithDebInfo
+ctest --test-dir build-bind -C RelWithDebInfo
+```
+
+The configure prints `bw_audio: SDK MODE`, the ABI version the SDK carries and the configurations
+it holds. `ctest -N` in that tree lists the binding tests and nothing else. The repo root stays the
+CMake source directory in both modes, and both give the bindings one target name,
+`bwa::bw_audio`, so a binding never asks which mode built it.
+
+Use the same configuration on both sides where you can. An SDK installed from a RelWithDebInfo
+build and consumed from a Debug tree works (CMake falls back to whatever configuration the imported
+target holds), but the SDK-mode configure prints what it found so you can see it.
+
+**Use it for a wheel.** `uv build` passes a config setting through to scikit-build-core, which puts
+it on the CMake command line:
+
+```
+cd bindings/python
+uv build --wheel --python 3.12 -C cmake.define.BWA_ENGINE_SDK=/path/to/sdk
+```
+
+Without it, the wheel build compiles a second full engine inside its own isolated build directory.
+
+**Use it from your own project.** It is a normal CMake package, so a C client outside this repo
+needs no part of this repo:
+
+```cmake
+find_package(bw_audio CONFIG REQUIRED PATHS /path/to/sdk)
+target_link_libraries(my_app PRIVATE bwa::bw_audio)
+```
+
+**The guard.** The gateway and the library can now come from different builds, so both scripted
+bindings check at load. `+bwa/setup.m` compares the MEX gateway's compiled `BWA_VERSION` against
+`bwa_get_version()`; `bw_audio/__init__.py` does the same at import and raises `ImportError`. A
+package built from one tree cannot trip either one.
 
 ### Building without Steam Audio
 
@@ -324,6 +398,22 @@ older UPM parsers reject. When git cannot answer (no tag, shallow clone, no git 
 `.github/workflows/ci.yml` builds and tests on `windows-latest`, `ubuntu-latest` and
 `macos-latest`. The Windows job doubles as the distribution channel:
 
+- **One engine per platform.** Each desktop job builds the engine once, runs ctest on it, and
+  installs it as an [engine SDK](#the-engine-sdk). Every binding in that job then configures with
+  `-DBWA_ENGINE_SDK` against that tree: the MATLAB MEX, the Octave MEX, both Godot extension
+  flavors and the wheel. So the binary a package ships is the binary that job tested, and each job
+  builds one engine where it used to build four. Every step that stages the engine somewhere
+  asserts the staged file against the SDK's, byte for byte where it can and by build id or UUID
+  where the copy is stripped, so the claim cannot rot quietly.
+- **The Linux engine is built inside the manylinux container.** A `manylinux_2_28` wheel needs an
+  engine built against glibc 2.28 and `ubuntu-latest` carries 2.39, so until this the repository
+  built two Linux engines: one on the runner for ctest, the MEX pair and the Godot addon, and a
+  second inside cibuildwheel for the release wheel. `tools/ci/build-engine-manylinux.sh` now
+  builds, tests and installs the one Linux engine inside that image, and everything else takes it
+  from there. Only the engine step runs in the container. MATLAB and the Godot toolchain do not
+  install in AlmaLinux 8 and do not need to: a binding compiled on the runner against a
+  glibc-2.28 shared object is an ordinary ABI client, and the reverse is what does not work.
+
 - **ASIO is built.** The workflow fetches the SDK from Steinberg's official URL
   (cached between runs). The configure step fails loudly unless the log says
   `ASIO backend ENABLED`: the artifact must contain the production device path.
@@ -400,11 +490,11 @@ older UPM parsers reject. When git cannot answer (no tag, shallow clone, no git 
 - **Both MEX files are built inside each desktop job, and the six become one toolbox.** A MEX is
   per platform and per interpreter, so the `windows`, `linux` and `macos` jobs each set up MATLAB with
   [matlab-actions/setup-matlab](https://github.com/matlab-actions/setup-matlab) (no license token
-  is needed on a GitHub-hosted runner for a public repository), reconfigure **the same build tree**
-  with `BWA_BUILD_MATLAB=ON`, build only the MEX target, and run the suite and all three examples
-  through `matlab-actions/run-command`. Building in place is the point: the MEX links the engine
-  that job already produced, with ASIO and WASAPI on Windows, JACK and ALSA on Linux, and the
-  universal dylib on macOS, and nothing is rebuilt. Each job asserts the configure log says
+  is needed on a GitHub-hosted runner for a public repository), reconfigure **the same bindings
+  tree** the Octave MEX used, build only the MEX target, and run the suite and all three examples
+  through `matlab-actions/run-command`. Linking the job's own engine is the point: the MEX loads
+  the SDK's library, with ASIO and WASAPI on Windows, JACK and ALSA on Linux, and the universal
+  dylib on macOS, and no engine is compiled there at all. Each job asserts the configure log says
   `MATLAB MEX enabled`, because the option skips silently when it finds no toolchain and a job that
   built nothing would otherwise pass.
   The `windows` job then assembles `bw_audio-matlab/`: `+bwa`, the examples, the README, the
@@ -419,9 +509,9 @@ older UPM parsers reject. When git cannot answer (no tag, shallow clone, no git 
   Homebrew on macOS. The Windows package is `octave.portable` and not the `octave` meta package,
   because the meta package pulls `octave.install`, which drives the vendor GUI installer through
   AutoHotkey. The portable one unzips the official archive from `ftp.gnu.org` and cannot hang.
-  Each job configures with `BWA_BUILD_MATLAB=ON` before the engine build, so the Octave MEX is an
-  ordinary `ALL` target and the four `octave_*` ctests run with the rest of the suite. Each job
-  asserts the configure log says `Octave MEX enabled` and that the MEX file staged, because
+  Each job configures its own bindings tree with `BWA_BUILD_MATLAB=ON` against the engine SDK,
+  builds the Octave MEX there and runs the four `octave_*` ctests. Each job asserts the configure
+  log says both `SDK MODE` and `Octave MEX enabled`, and that the MEX file staged, because
   `octave_tests` exits 77 (SKIPPED) when no MEX is there for the running interpreter and a silent
   miss would otherwise read as a pass. Only the MATLAB half waits for the `matlab-actions` steps,
   because only MATLAB needs an action to install it and a licensed `run-command` step to drive it.
@@ -438,18 +528,25 @@ older UPM parsers reject. When git cannot answer (no tag, shallow clone, no git 
   release takes the Windows wheel from the `windows` job and these two from here. Windows is not
   in this job: a Windows wheel already names one ABI and one architecture, so there is nothing a
   container could add.
+  - **Neither wheel builds an engine.** The job downloads the engine SDK the `linux` and `macos`
+    jobs installed and hands cibuildwheel the path, so it compiles the nanobind extension and
+    nothing else, and builds no phonon at all. The cost is that the job now `needs: [linux,
+    macos]` instead of running beside them; what it gives back is a phonon build and an engine
+    build per platform.
   - **Linux is `manylinux_2_28`** (AlmaLinux 8, glibc 2.28: RHEL 8, Debian 10, Ubuntu 18.10 and
     later). The floor is set by the C++ toolchain, not by the engine: a static phonon is a C++
     link, and `manylinux_2_28` carries a `gcc-toolset` new enough to compile it where
     `manylinux2014` does not. It is also the image whose repositories still carry the two device
     backends' headers.
-  - **Everything the Linux wheel links is built inside that container**, phonon included.
-    `tools/phonon/cibw-before-all-linux.sh` installs `alsa-lib-devel` and
-    `jack-audio-connection-kit-devel`, then runs `tools/phonon/build-phonon.sh`, the same one
-    recipe the composite action runs. It writes a stamp beside the staged archives naming the
-    image and compiler that produced them, and rebuilds when the stamp does not match, so a
-    developer's own `lib/linux-x64` cannot ride into a wheel on the project copy cibuildwheel
-    puts in the container.
+  - **Everything the Linux wheel links is built in that image**, phonon included, but the
+    `linux` job is where it happens now. `tools/phonon/cibw-before-all-linux.sh` installs
+    `alsa-lib-devel` and `jack-audio-connection-kit-devel`, then runs
+    `tools/phonon/build-phonon.sh`, the same one recipe the composite action runs. It writes a
+    stamp beside the staged archives naming the image and compiler that produced them, and
+    rebuilds when the stamp does not match, so a developer's own `lib/linux-x64` cannot ride into
+    a wheel on the project copy cibuildwheel puts in the container. The `wheels` job overrides
+    cibuildwheel's `before-all` to nothing, because the engine arrives prebuilt. Run cibuildwheel
+    by hand from a checkout and the `pyproject.toml` before-all still does the full job.
   - **auditwheel repairs with `--exclude libasound.so.2 --exclude libjack.so.0`.** The engine
     loads both at run time, so neither is in its `NEEDED` list and auditwheel would not see them
     anyway; the flags stay as GUARDS, and the job still asserts that no `libasound` or `libjack`
@@ -461,13 +558,16 @@ older UPM parsers reject. When git cannot answer (no tag, shallow clone, no git 
   - **macOS is one `universal2` wheel** for x86_64 and arm64, with
     `MACOSX_DEPLOYMENT_TARGET=10.13`. That is the only deployment target anything in this tree
     names (phonon's own `CMakeLists.txt`), and it is cibuildwheel's universal2 default, so the
-    wheel's tag is predictable. Clang raises the arm64 slice to 11.0 by itself.
+    wheel's tag is predictable. Clang raises the arm64 slice to 11.0 by itself. The `macos` job
+    now builds the engine with `CMAKE_OSX_DEPLOYMENT_TARGET=10.13` to match, and asserts it: a
+    `macosx_10_13_universal2` wheel carrying a dylib built for the runner's own macOS installs
+    anywhere and loads nowhere older.
   - **The suite runs against the installed wheel**, inside the container on Linux, the same rule
     the three per-runner jobs follow. Nothing in it opens a device, so a container is enough.
-  - The job caches the container-built phonon like every other job caches its own. cibuildwheel
-    copies the project into the container and copies only the wheel back out, so the job builds
-    phonon first with a plain `docker run` of the same image, which puts the archives in the
-    workspace where the cache can see them. The stamp is what makes the second build skip.
+  - The `linux` job caches the container-built phonon under a key that names the image, and the
+    `wheels` job pins the same image. They have to agree: the engine the wheel carries is that
+    job's, and a wheel whose extension is compiled in one image against an engine from another is
+    the mismatch a manylinux tag promises is absent. Bump the two pins together.
 - **The Unity package is packed every run, and released on a tag.**
   `tools/upm/pack.ps1` produces `com.brainworks.bw_audio-<version>.tgz`, the C#
   binding with both DLLs inside it, so a broken package (a missing `.meta`, a lost
@@ -478,10 +578,12 @@ older UPM parsers reject. When git cannot answer (no tag, shallow clone, no git 
   stays `0.0.0-dev`), so a tarball can never claim a version it isn't. See
   [Releasing](#releasing).
 - **Two more jobs guard the port, and they ship too.** `linux` on `ubuntu-latest` and `macos`
-  on `macos-latest` build phonon, configure, build RelWithDebInfo, and run the whole ctest suite
-  on the null and manual sinks: **38 tests**, the 33 a default off-Windows build registers plus the
-  five SDK-gated ones. They exist to catch a Win32 call sneaking back into the core, so they assert
-  on the configure log rather than trusting the build to fail on its own: `linux` wants
+  on `macos-latest` build phonon, configure, build RelWithDebInfo, and run the whole engine ctest
+  suite on the null and manual sinks: **38 tests**, the 33 a default off-Windows build registers
+  plus the five SDK-gated ones. The binding tests are not in that count any more: they run in each
+  job's own bindings tree against the SDK. On Linux the engine half of that happens inside the
+  manylinux container. Both jobs exist to catch a Win32 call sneaking back into the core, so they
+  assert on the configure log rather than trusting the build to fail on its own: `linux` wants
   `JACK backend ENABLED` and `ALSA backend ENABLED`, `macos` wants `null and manual sinks only`,
   and both want `Steam Audio ENABLED`. That last assertion is the one that matters after a cache
   round trip, because a build that quietly lost its phonon staging still passes every test.
