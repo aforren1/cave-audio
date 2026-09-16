@@ -201,9 +201,20 @@ The Windows archives come from `build/windows-vs2022-x64/src/core/Release/` (pho
 Apache-2.0 permits redistribution, so the built binaries are kept out of git (gitignored) for size
 only.
 
-CI runs this same recipe through the composite action `.github/actions/build-phonon/` (inputs:
-`platform`, `arch`, `toolchain`, `stage-dir`, `fft`, `cmake-flags`) and caches the staged artifacts
-on the submodule sha + patch hash. If you change the recipe here, change it there too.
+The recipe above is also a script: `tools/phonon/build-phonon.sh`, driven by environment
+variables (`BWA_PLATFORM`, `BWA_ARCH`, `BWA_TOOLCHAIN`, `BWA_STAGE_DIR`, `BWA_FFT`,
+`BWA_CMAKE_FLAGS`, `BWA_ART`) that match the composite action's inputs one for one. It finds the
+repository root from its own path, so it runs from anywhere. Two callers, and neither carries a
+copy of the steps:
+
+- the composite action `.github/actions/build-phonon/`, which the windows, android, linux and
+  macos CI jobs call. It caches nothing; the caller owns the cache step (key = submodule sha plus
+  patch hash);
+- `tools/phonon/cibw-before-all-linux.sh`, which builds phonon inside the manylinux container that
+  links the Python wheel. That path cannot use the action, because a composite action runs on the
+  runner.
+
+If you change the recipe here, change the script too.
 
 **Other platforms.** The scripts support them and nothing downloads from Valve: every linked
 dependency is cloned from GitHub at a pinned sha and built locally. Linux and macOS are built in

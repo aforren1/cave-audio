@@ -75,3 +75,71 @@ result = "{major}.{minor}.{patch}"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+
+# ---------------------------------------------------------------------------------------------
+# cibuildwheel: the wheels a RELEASE ships for Linux and macOS.
+#
+# WHY IT EXISTS BESIDE THE PLAIN BUILD. `uv build --wheel` on a runner tags the wheel for THAT
+# machine: the runner image's glibc on Linux, the runner's own architecture on macOS. Neither is
+# what a release should hand a stranger. cibuildwheel builds the Linux wheel inside a manylinux
+# container and the macOS wheel for both Apple architectures at once, so one file per platform
+# installs anywhere. The three per-runner `uv build` steps stay exactly as they are: they are the
+# FAST GATE, one per job, proving the binding still builds and tests on each desktop before this
+# slower job runs at all. Windows is not here - there is nothing to gain, since a Windows wheel
+# already names one ABI and one architecture and the windows job's wheel IS the release's.
+#
+# Run it the way CI does, from the REPOSITORY ROOT:
+#     uvx cibuildwheel --platform linux bindings/python
+# The package directory is bindings/python, but the project root has to be the repository, for
+# the same reason cmake.source-dir points at "../..": the build needs the whole tree. cibuildwheel
+# copies the working directory into the container, so the working directory is the repository.
+# ---------------------------------------------------------------------------------------------
+[tool.cibuildwheel]
+# ONE wheel per platform. nanobind's STABLE_ABI targets the 3.12 limited API, the overrides above
+# claim cp312-abi3 only on a build that used it, and a cp312 build is the one that does - so
+# building any later interpreter would produce the same file under a second name.
+build = "cp312-*"
+# musl has no phonon here (the before-all builds one glibc phonon, in the manylinux image) and no
+# audience: PsychoPy on Alpine is not a thing anyone is asking for.
+skip = "*musllinux*"
+test-requires = ["pytest", "numpy"]
+# The INSTALLED wheel, in cibuildwheel's own fresh venv, with no source tree on the path - the
+# same rule the three per-runner jobs follow. Nothing here touches a device: every engine in the
+# suite is the null or the manual sink, which is what lets it run inside a container.
+test-command = [
+  "pytest -q --color=no {project}/bindings/python/tests",
+  "python {project}/bindings/python/examples/offline_render.py --tests",
+  "python {project}/bindings/python/examples/live_onset.py --tests",
+]
+
+[tool.cibuildwheel.linux]
+# manylinux_2_28 (AlmaLinux 8, glibc 2.28), not the older manylinux2014: the engine links a C++
+# static phonon, so the image's C++ toolchain is the floor that matters, and 2_28 carries a
+# gcc-toolset new enough to compile it where manylinux2014's does not. It is also the image whose
+# repositories still carry the two device backends' headers - CentOS 7's are on vault. glibc 2.28
+# is RHEL 8, Debian 10 and Ubuntu 18.10 or newer, which covers every machine this engine would
+# run an experiment on.
+manylinux-x86_64-image = "manylinux_2_28"
+before-all = "bash {project}/tools/phonon/cibw-before-all-linux.sh"
+# auditwheel would otherwise copy libasound and libjack INTO the wheel, which is wrong for both:
+# libjack has to be the one the running JACK server uses, and libasound is on every Linux desktop
+# already. --exclude leaves them as ordinary dependencies. Everything else the engine needs
+# (libstdc++, libgcc, libm, libpthread) is in the manylinux policy, so a correct repair grafts
+# nothing at all and never rewrites the extension's $ORIGIN runpath.
+repair-wheel-command = "auditwheel repair --exclude libasound.so.2 --exclude libjack.so.0 -w {dest_dir} {wheel}"
+
+[tool.cibuildwheel.macos]
+# ONE wheel for both Apple architectures. The engine library inside it is universal already
+# whenever CI builds it, so this only says the extension must be too.
+archs = ["universal2"]
+before-all = "bash {project}/tools/phonon/cibw-before-all-macos.sh"
+# MACOSX_DEPLOYMENT_TARGET matches the only deployment target anything in this tree names:
+# phonon's core/CMakeLists.txt asks for 10.13 and the engine asks for nothing, so 10.13 is the
+# number the archives inside the wheel were built for. It is cibuildwheel's own universal2
+# default too, which keeps the wheel's tag predictable. Clang raises the arm64 slice to 11.0 by
+# itself, because no Mac ran arm64 before it.
+#
+# ARCHFLAGS rather than -DCMAKE_OSX_ARCHITECTURES: scikit-build-core translates ARCHFLAGS into
+# that CMake variable itself, and its own SKBUILD_CMAKE_DEFINE escape hatch separates defines
+# with a semicolon - the same character the value needs.
+environment = { MACOSX_DEPLOYMENT_TARGET = "10.13", ARCHFLAGS = "-arch x86_64 -arch arm64" }

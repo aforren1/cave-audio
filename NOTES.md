@@ -842,3 +842,19 @@ back to the 173 `bwa_*` the ABI declares. The AVX trap also turned out to be the
 the distribution: `-fabi-version=6` breaks `<future>` in `hrtf.cpp` on gcc 11.5 and 13.3 and
 compiles on 14.3, so CI (gcc 13) passes `-DSTEAMAUDIO_ENABLE_AVX=OFF` and a modern desk box does
 not have to.
+
+The manylinux wheel cost one factoring and one guard. The composite action's shell body became
+`tools/phonon/build-phonon.sh` because a composite action runs on the RUNNER and a wheel's phonon
+has to come from the container that links it, so the recipe needed two callers and could not stay
+inside a YAML `run:`. The guard is the stamp beside the staged archives: cibuildwheel copies the
+whole project directory into the container, a developer's own `lib/linux-x64` rides along, static
+archives link happily whatever compiler made them, and the result would be a manylinux wheel with
+a phonon built against a newer libstdc++ than the policy allows. The stamp names the image and the
+compiler major version, a host staging has none, and the mismatch deletes the directory rather
+than reusing it. Verified locally: the run on a Windows host through Docker Desktop discarded the
+gcc 14.3 WSL archives, rebuilt phonon in the image in 232 s, and produced
+`bw_audio-0.14.0-cp312-abi3-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl` with 55 pytest tests
+and both examples passing inside the container. Two small facts worth keeping: auditwheel names
+every tag a wheel is eligible for, so the filename carries `manylinux_2_27` as well and an equality
+assertion on the name would have failed; and with `libasound` and `libjack` excluded the repair
+grafts nothing at all, which is what leaves the extension's `$ORIGIN` runpath untouched.

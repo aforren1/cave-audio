@@ -245,6 +245,12 @@ tools/android/         run-tests.ps1: ctest cannot drive an Android target, so t
                        runs each one there, mapping the skip code 77 through. It reads the test list
                        out of the build dir's CTestTestfile.cmake, so it and ctest cannot disagree
                        about what the suite IS. [backends p3]
+tools/phonon/          build-phonon.sh: THE phonon recipe (env-driven: BWA_PLATFORM, BWA_ARCH,
+                       BWA_STAGE_DIR, BWA_CMAKE_FLAGS, BWA_ART). Two callers and no second copy of
+                       the steps - the composite action .github/actions/build-phonon, and
+                       cibw-before-all-linux.sh, which builds phonon INSIDE the manylinux container
+                       that links the Python wheel (a composite action runs on the runner, so it
+                       cannot). cibw-before-all-macos.sh is the universal2 side. [python wheels]
 tools/xval/            gen_reference.py: cross-validation golden generator (scipy SH / l1-LP VBAP /
                        qhull AllRAD / bilinear RBJ / lfilter) -> test/xval_data.h for the xval ctest.
                        Needs numpy+scipy; ctest itself does not (the header is committed).
@@ -337,7 +343,12 @@ full-options Windows tree is 48 and the default Windows tree 41; `python_binding
 rather than failing when pytest is missing, because a C developer should not need it. CI also
 builds a `cp312-abi3` WHEEL on each of the three desktops, installs it into a fresh venv, and runs
 that same pytest suite from the INSTALLED wheel rather than the source tree - shipped as
-`bw_audio-python-<platform>-<ver>` and, on a tag, as three more release assets. `rt.c` is the concurrency
+`bw_audio-python-<platform>-<ver>`. Those three are the FAST GATE and are tagged for the runner
+that built them; a separate `wheels` job builds the two a RELEASE ships with cibuildwheel
+(`manylinux_2_28` in a container, macOS `universal2`), which is why the phonon recipe is now ONE
+script, `tools/phonon/build-phonon.sh`, that both the composite action and the container's
+before-all call - a composite action runs on the runner, and a wheel's phonon has to come from the
+image that links it. `rt.c` is the concurrency
 spine (two SPSC rings, voice + sound tables, commit snapshot, generation handles, retire-ack)
 and the whole `bwa_*` API forwards to it. Spatialization (the DBAP/SPCAP/VBAP gain solve,
 layout load, per-speaker align), calibration (`bwa_calibrate`, the Zylia capsule survey),

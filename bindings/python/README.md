@@ -32,9 +32,27 @@ From a wheel:
 uv pip install bw_audio-0.14.0-cp312-abi3-win_amd64.whl
 ```
 
-Releases carry one wheel per platform. The wheel contains the engine library, so there is nothing
-to install beside it. Steam Audio is linked statically into the engine, so there is no second
-library either.
+Releases carry one wheel per platform, and each one is built for more than the machine that built
+it:
+
+| Platform | Tag | Runs on |
+| --- | --- | --- |
+| Windows | `cp312-abi3-win_amd64` | Windows x64 |
+| Linux | `cp312-abi3-manylinux_2_28_x86_64` | glibc 2.28 or newer: RHEL 8, Debian 10, Ubuntu 18.10 and later |
+| macOS | `cp312-abi3-macosx_10_13_universal2` | Intel and Apple silicon, one file |
+
+The wheel contains the engine library, so there is nothing to install beside it. Steam Audio is
+linked statically into the engine, so there is no second library either. The Linux filename can
+name more than one tag (`manylinux_2_27_x86_64.manylinux_2_28_x86_64`): auditwheel records every
+tag the wheel qualifies for, and the lowest one is what it needs. The Linux wheel is the one
+with a runtime expectation: it links ALSA and JACK, so `libasound.so.2` and `libjack.so.0` have to
+be on the machine. Both come with any Linux desktop that plays audio (`libjack` also arrives with
+`pipewire-jack`).
+
+CI also builds a wheel on each runner with plain `uv build --wheel`, one per job. Those are the
+**fast gate**, not the release: they are tagged for the runner image's own glibc and architecture.
+The wheels a release ships are built with cibuildwheel, in a manylinux container on Linux and for
+both architectures at once on macOS. See [docs/build.md](../../docs/build.md#continuous-integration).
 
 From source, in a checkout of this repository:
 
@@ -227,12 +245,9 @@ Two version streams, and they move independently.
 Nothing for you to do, but do not move `bw_audio.dll` out of the package.
 
 **Linux and macOS.** The extension carries an RPATH of `$ORIGIN` or `@loader_path`, so it finds the
-engine library beside it.
-
-**Linux wheels are tagged for the building machine's glibc, not manylinux.** CI builds them on the
-`ubuntu-latest` image, so a wheel runs on that glibc or newer and not on an older distribution.
-Building from a checkout always works. A manylinux build is a follow-up, not a limitation of the
-binding.
+engine library beside it. The release wheels keep it: every library the wheel does not already
+carry is a system one, so the repair step (auditwheel or delocate) bundles nothing and never
+rewrites that path.
 
 **Stable ABI.** Built with Python 3.12 or later, the wheel is tagged `cp312-abi3` and runs on 3.12
 and every later Python, one wheel per platform. Built with an older Python, it falls back to a

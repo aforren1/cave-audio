@@ -89,3 +89,6 @@ bindings/python/.venv/
 bindings/python/**/__pycache__/
 bindings/python/**/*.egg-info/
 *.pyd
+# cibuildwheel writes its output here, at the repo root, because the project root it is given is
+# the repository (the build needs the whole tree). See bindings/python/pyproject.toml.
+/wheelhouse/

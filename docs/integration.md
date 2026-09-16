@@ -725,7 +725,8 @@ offline render cost no copy. Pass `copy=True` when you keep the block.
 
 The wheel carries the engine library inside the package, like the Unity package and the Godot
 addon carry theirs. One wheel per platform, tagged `cp312-abi3`, runs on Python 3.12 and every
-later version.
+later version. A release builds the Linux one for `manylinux_2_28` and the macOS one as
+`universal2`, so each file serves more than the machine that built it.
 
 ## Unreal (notes, not yet implemented)
 

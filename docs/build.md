@@ -387,13 +387,45 @@ older UPM parsers reject. When git cannot answer (no tag, shallow clone, no git 
   mean one wheel per Python instead of one per platform), install it into a fresh venv, and run the
   pytest suite and both examples **from the installed wheel** rather than from the source tree.
   Each uploads `bw_audio-python-<platform>-<ver>-r<N>`. The wheel carries the engine library inside
-  the package, so it is that job's own build, which is why there is no separate wheel job. The
-  Linux and macOS jobs stage theirs into the fixed-name pack input the Windows job already
-  downloads, so the release attaches all three without rebuilding anything. Two facts about the
-  Linux wheel: it is tagged for the runner image's **glibc**, not manylinux, so it needs that glibc
-  or newer; and a manylinux build is a follow-up rather than a limitation of the binding, since
-  building from a checkout always works. The Android job builds no wheel: there is no Python there.
+  the package, so it is that job's own build. These three are the **fast gate**: they prove the
+  binding still builds and tests where the engine was just built, and they tag for the machine
+  that built them. The Android job builds no wheel: there is no Python there.
   `bindings/python/README.md` is the manual.
+- **The `wheels` job builds the two wheels a release ships.** A wheel `uv build` produces on a
+  runner is tagged for that runner: the image's glibc on Linux, the runner's own architecture on
+  macOS. Neither is what a release hands a stranger. So a separate job runs
+  [cibuildwheel](https://cibuildwheel.pypa.io/) on `ubuntu-latest` and `macos-latest`, and the
+  release takes the Windows wheel from the `windows` job and these two from here. Windows is not
+  in this job: a Windows wheel already names one ABI and one architecture, so there is nothing a
+  container could add.
+  - **Linux is `manylinux_2_28`** (AlmaLinux 8, glibc 2.28: RHEL 8, Debian 10, Ubuntu 18.10 and
+    later). The floor is set by the C++ toolchain, not by the engine: a static phonon is a C++
+    link, and `manylinux_2_28` carries a `gcc-toolset` new enough to compile it where
+    `manylinux2014` does not. It is also the image whose repositories still carry the two device
+    backends' headers.
+  - **Everything the Linux wheel links is built inside that container**, phonon included.
+    `tools/phonon/cibw-before-all-linux.sh` installs `alsa-lib-devel` and
+    `jack-audio-connection-kit-devel`, then runs `tools/phonon/build-phonon.sh`, the same one
+    recipe the composite action runs. It writes a stamp beside the staged archives naming the
+    image and compiler that produced them, and rebuilds when the stamp does not match, so a
+    developer's own `lib/linux-x64` cannot ride into a wheel on the project copy cibuildwheel
+    puts in the container.
+  - **auditwheel repairs with `--exclude libasound.so.2 --exclude libjack.so.0`.** Bundling
+    either one is wrong: `libjack` has to be the library the running JACK server uses, and
+    `libasound` is on every Linux desktop already. Everything else the engine needs is in the
+    manylinux policy, so a correct repair grafts nothing at all, which is also what keeps the
+    extension's `$ORIGIN` runpath intact. The wheel therefore expects `libasound.so.2` and
+    `libjack.so.0` on the machine that imports it.
+  - **macOS is one `universal2` wheel** for x86_64 and arm64, with
+    `MACOSX_DEPLOYMENT_TARGET=10.13`. That is the only deployment target anything in this tree
+    names (phonon's own `CMakeLists.txt`), and it is cibuildwheel's universal2 default, so the
+    wheel's tag is predictable. Clang raises the arm64 slice to 11.0 by itself.
+  - **The suite runs against the installed wheel**, inside the container on Linux, the same rule
+    the three per-runner jobs follow. Nothing in it opens a device, so a container is enough.
+  - The job caches the container-built phonon like every other job caches its own. cibuildwheel
+    copies the project into the container and copies only the wheel back out, so the job builds
+    phonon first with a plain `docker run` of the same image, which puts the archives in the
+    workspace where the cache can see them. The stamp is what makes the second build skip.
 - **The Unity package is packed every run, and released on a tag.**
   `tools/upm/pack.ps1` produces `com.brainworks.bw_audio-<version>.tgz`, the C#
   binding with both DLLs inside it, so a broken package (a missing `.meta`, a lost
@@ -457,11 +489,12 @@ older UPM parsers reject. When git cannot answer (no tag, shallow clone, no git 
   - `bw_audio-steam-audio-src-<tag>.zip`: the Steam Audio source statically linked into the
     same DLL, at its pinned commit, with the in-repo patch and a README naming the commit.
     Same reason as the asset above, applied to the other statically linked dependency.
-  - `bw_audio-<abi>-cp312-abi3-<platform>.whl`, three of them (Windows x64, Linux x86_64, macOS
-    arm64): the Python binding, with the engine library inside the wheel. Attached as wheels rather
-    than zipped, because `pip` and `uv` install a `.whl` straight from a URL. `<abi>` is the ABI
-    version from `bw_audio.h`, not the tag; `abi3` means one wheel serves Python 3.12 and every
-    later version.
+  - `bw_audio-<abi>-cp312-abi3-<platform>.whl`, three of them: Windows x64 from the `windows`
+    job, `manylinux_2_28_x86_64` and macOS `universal2` from the `wheels` job. The Python
+    binding, with the engine library inside the wheel. Attached as wheels rather than zipped,
+    because `pip` and `uv` install a `.whl` straight from a URL. `<abi>` is the ABI version from
+    `bw_audio.h`, not the tag; `abi3` means one wheel serves Python 3.12 and every later version.
+    The release step asserts one wheel per platform and the tag each one carries.
 
   All ship under GPLv3 (the `.zip` carries `LICENSE`, `THIRD_PARTY-NOTICES.md`, and
   `DIST.txt`, which names the commit and links the complete source; the `.tgz` carries

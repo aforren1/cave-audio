@@ -31,6 +31,10 @@
 #     way android does, so one addon and one Unity package carry every platform. Each also uploads
 #     a standalone engine artifact of its own. macOS builds UNIVERSAL (x86_64 + arm64) and is
 #     unsigned; see those jobs' notes.
+#   - Python wheels: every desktop job builds one with `uv build --wheel` as its own fast gate,
+#     and a separate `wheels` job builds the two a RELEASE ships - Linux inside a manylinux
+#     container, macOS as one universal2 file - with cibuildwheel. Windows has no such job: its
+#     wheel already names one ABI and one architecture.
 #   - Configs: x64 only. RelWithDebInfo is the full build (tested + tools);
 #     Debug builds the engine + bwa_minimal for downstream debugging (smoke-run).
 #
@@ -70,7 +74,9 @@ jobs:
     # already has, and a Linux or macOS build is not reproducible here at any price. The cost is the
     # other jobs' wall time, which is minutes against this job's phonon build - and they run in
     # parallel with each other.
-    needs: [android, linux, macos]
+    # The wheels job joins that list for the release: it builds the manylinux and universal2
+    # wheels, and the release step below attaches them beside this job's Windows one.
+    needs: [android, linux, macos, wheels]
     timeout-minutes: 75   # the uncached phonon build is the long pole; cached runs are far under
     steps:
       - uses: actions/checkout@v6
@@ -219,6 +225,16 @@ jobs:
         with:
           name: macos-pack-input
           path: pack-macos
+
+      # The two RELEASE wheels: manylinux and universal2, built by the wheels job. They are not
+      # the pack-linux/pack-macos wheels - those are the per-runner fast gate, tagged for the
+      # runner's own glibc and architecture, and they stay artifacts.
+      - name: Download the release wheels (built by the wheels job)
+        uses: actions/download-artifact@v6
+        with:
+          pattern: release-wheel-*
+          merge-multiple: true
+          path: wheelhouse
 
       - name: Pack Godot addon
         id: packgd
@@ -444,8 +460,9 @@ jobs:
           if-no-files-found: error
 
       # ---- release (tags only) -------------------------------------------------------------------
-      # The Release IS the distribution - there is no registry. EIGHT assets: six audiences want
-      # different bytes, and the last two are the GPLv3 corresponding source that must accompany them:
+      # The Release IS the distribution - there is no registry. ELEVEN assets: seven audiences want
+      # different bytes, three of them are one Python wheel per platform, and the last two are the
+      # GPLv3 corresponding source that must accompany all of it:
       #
       #   com.brainworks.bw_audio-<ver>.tgz   the Unity package (C# + every platform's engine library,
       #                                      import settings set).
@@ -474,6 +491,9 @@ jobs:
       #                                      DLL (Apache-2.0), at its pinned commit, plus our patch.
       #                                      Same parity argument as the ASIO zip: the source sits
       #                                      beside the binary rather than behind a link.
+      #   bw_audio-<abi>-cp312-abi3-*.whl    the Python binding, three of them: win_amd64 from this
+      #                                      job, manylinux_2_28_x86_64 and macosx universal2 from
+      #                                      the wheels job. The engine library is inside each one.
       #
       # Keep the engine bundle a .zip, and the package the only .tgz on the release. Every UPM registry
       # speaks the npm protocol and keys on a single publishable tarball, so should this ever be listed
@@ -533,9 +553,24 @@ jobs:
           # directly from a URL, and wrapping it would make the one-liner in the notes a two-step.
           # Each is already versioned by its own filename (the ABI version from the header), so
           # unlike the engine bundles above there is nothing to rename per tag.
-          $whl = @(Get-Item dist/python/*.whl, pack-linux/python/*.whl, pack-macos/python/*.whl |
-                   ForEach-Object { $_.FullName })
-          if ($whl.Count -ne 3) { throw "expected 3 Python wheels (win/linux/macos), found $($whl.Count)" }
+          #
+          # Windows comes from THIS job, Linux and macOS from the wheels job: those two are the
+          # manylinux and universal2 wheels, not the per-runner ones in pack-linux/pack-macos,
+          # which are tagged for their runner's glibc and architecture and stay artifacts. Assert
+          # exactly one per platform AND the tag each one has to carry, because a wheel that
+          # quietly fell back to a runner tag is a wheel that fails on the machine it was built
+          # for the most: somebody else's.
+          $whlWin = @(Get-Item dist/python/*.whl)
+          $whlLnx = @(Get-Item wheelhouse/*-manylinux*.whl)
+          $whlMac = @(Get-Item wheelhouse/*-macosx*.whl)
+          if ($whlWin.Count -ne 1) { throw "expected 1 Windows wheel, found $($whlWin.Count)" }
+          if ($whlLnx.Count -ne 1) { throw "expected 1 manylinux wheel, found $($whlLnx.Count)" }
+          if ($whlMac.Count -ne 1) { throw "expected 1 macOS wheel, found $($whlMac.Count)" }
+          if ($whlWin[0].Name -notlike '*-cp312-abi3-win_amd64.whl') { throw "not a cp312-abi3 win_amd64 wheel: $($whlWin[0].Name)" }
+          if ($whlLnx[0].Name -notlike '*-cp312-abi3-manylinux_*_x86_64.whl') { throw "not a cp312-abi3 manylinux wheel: $($whlLnx[0].Name)" }
+          if ($whlMac[0].Name -notlike '*-cp312-abi3-macosx_*_universal2.whl') { throw "not a cp312-abi3 universal2 wheel: $($whlMac[0].Name)" }
+          $whl = @($whlWin[0].FullName, $whlLnx[0].FullName, $whlMac[0].FullName)
+          $whl | ForEach-Object { Write-Host "release wheel: $(Split-Path $_ -Leaf)" }
 
           $notes = @"
           Windows x64, plus Android, Linux and macOS cross-builds. Six downloads to use - the
@@ -597,16 +632,19 @@ jobs:
 
           ## Python
 
-          ``bw_audio-*.whl`` - one wheel per platform (Windows x64, Linux x86_64, macOS arm64),
-          tagged ``cp312-abi3``, so each one runs on **Python 3.12 and every later version**. The
-          engine library is inside the wheel; there is nothing to install beside it.
+          ``bw_audio-*.whl`` - one wheel per platform (Windows x64, Linux x86_64 **manylinux**,
+          macOS **universal2**), tagged ``cp312-abi3``, so each one runs on **Python 3.12 and every
+          later version**. The engine library is inside the wheel; there is nothing to install
+          beside it.
 
           ``uv pip install <url-of-the-wheel>``
 
           The wheel version is the **ABI version** from ``bw_audio.h``, not this tag, so it can
           never claim a version the library is not. PsychoPy uses this package directly; see
-          ``bindings/python/README.md``. The Linux wheel is tagged for the CI runner's glibc rather
-          than manylinux, so it needs that glibc or newer.
+          ``bindings/python/README.md``. The Linux wheel is ``manylinux_2_28`` (glibc 2.28 or
+          newer: RHEL 8, Debian 10, Ubuntu 18.10 and later) and expects ``libasound.so.2`` and
+          ``libjack.so.0`` on the machine, which is every Linux desktop that plays audio. The
+          macOS wheel is one ``universal2`` file for both Apple architectures.
 
           ## License
 
@@ -1421,4 +1459,187 @@ jobs:
           name: macos-pack-input
           path: pack-macos/
           retention-days: 1      # an intra-run handoff, not a download
+          if-no-files-found: error
+
+  # ---- the RELEASE Python wheels (manylinux + universal2) --------------------------------------
+  # The three per-runner `uv build --wheel` steps above are the FAST GATE: one per desktop job,
+  # proving the binding still builds and tests where the engine was just built. What they cannot
+  # produce is a wheel a stranger can install. `uv build` tags for the MACHINE - the runner image's
+  # glibc on Linux, the runner's own architecture on macOS - so the Linux wheel refused an older
+  # distribution and the macOS wheel served one of the two Apple architectures.
+  #
+  # This job fixes both, and only those two: it runs cibuildwheel, which builds the Linux wheel
+  # INSIDE a manylinux container and the macOS wheel for x86_64 and arm64 at once. Windows is
+  # deliberately absent - a Windows wheel already names one ABI and one architecture, so the
+  # windows job's own wheel IS the release's and there is nothing for a container to add.
+  #
+  # The release step in the windows job therefore attaches the Windows wheel from that job and
+  # these two from here. The per-runner Linux and macOS wheels stay as artifacts and stop being
+  # release assets.
+  #
+  # Everything the Linux wheel links is built inside the container, phonon included, by
+  # tools/phonon/cibw-before-all-linux.sh over the one recipe in tools/phonon/build-phonon.sh -
+  # the same script the composite action runs. That is why the recipe is a script now: a composite
+  # action runs on the RUNNER, and the archives have to come from the image that links them.
+  #
+  # macOS side: UNVERIFIED LOCALLY, like the macos job. Nobody here has a Mac, so the universal2
+  # build, delocate's repair and the deployment target below came out of cibuildwheel's
+  # documentation. The failure modes are all loud (the tag assertion, lipo, otool).
+  wheels:
+    name: wheels (${{ matrix.platform }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            platform: linux
+          - os: macos-latest
+            platform: macos
+    runs-on: ${{ matrix.os }}
+    # A cold phonon cache dominates, exactly as it does in the other jobs.
+    timeout-minutes: 150
+    env:
+      # ONE reference to the build image, read in two places: the prime step's `docker run` below,
+      # and cibuildwheel itself. They MUST be the same image, or the stamp the before-all script
+      # writes beside the staged archives will not match and every run rebuilds phonon inside the
+      # container. A digest rather than a tag for the same reason a submodule is a sha. This is
+      # cibuildwheel 4.2.1's own pin for the `manylinux_2_28` alias; bump it by running
+      # cibuildwheel and reading the digest it prints when it starts the container.
+      # UNUSED on macOS: cibuildwheel reads this option only for a Linux build.
+      CIBW_MANYLINUX_X86_64_IMAGE: quay.io/pypa/manylinux_2_28_x86_64@sha256:53390351aeb4688114b02c36a23b3e6ce1166ee9b7afc5df1a4f776354fc764c
+      # NOT named CIBW_*: cibuildwheel rejects environment variables with that prefix that it
+      # does not recognize, which is a good rule and this is not one of its options.
+      CIBUILDWHEEL_VERSION: "4.2.1"
+    steps:
+      - uses: actions/checkout@v6
+        # no submodules: the phonon script fetches steam-audio-source itself, and only on a miss
+
+      # `python`, not `python3`: both pinned Steam Audio scripts are driven that way, and on macOS
+      # this job runs them on the runner rather than in a container.
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+
+      - name: Phonon cache key (submodule sha, no checkout needed)
+        id: phonon-key
+        shell: bash
+        run: echo "sha=$(git rev-parse HEAD:third_party/steam-audio-source)" >> "$GITHUB_OUTPUT"
+
+      # Two cache steps rather than one with a conditional key, because the macOS entry has to be
+      # BYTE-IDENTICAL to the macos job's: that job builds the same universal archives, and one
+      # shared entry means only one of the two ever pays for them. On a cold cache the two jobs
+      # run at the same time and both build; one of them then loses the save with an "already
+      # exists" warning, which costs a build and nothing else. The Linux entry cannot be shared
+      # with the linux job - those archives are the ubuntu image's gcc, and the whole point here
+      # is that this wheel's phonon comes from the manylinux image.
+      - name: Cache phonon (manylinux container build)
+        id: phonon-linux
+        if: matrix.platform == 'linux'
+        uses: actions/cache@v5
+        with:
+          path: third_party/steam-audio-artifacts
+          # The IMAGE is part of this key: archives built by one image must never be restored
+          # into another. So are the scripts, because they are the recipe.
+          key: phonon-manylinux-v1-${{ env.CIBW_MANYLINUX_X86_64_IMAGE }}-${{ steps.phonon-key.outputs.sha }}-${{ hashFiles('third_party/patches/**', 'tools/phonon/**') }}
+
+      - name: Cache phonon (built Steam Audio core)
+        id: phonon-mac
+        if: matrix.platform == 'macos'
+        uses: actions/cache@v5
+        with:
+          path: third_party/steam-audio-artifacts
+          key: phonon-osx-v2-${{ steps.phonon-key.outputs.sha }}-${{ hashFiles('third_party/patches/**') }}
+
+      # cibuildwheel copies the project INTO the container and copies only the wheel back out, so
+      # a phonon built by its before_all step never reaches the workspace and could never be
+      # cached. Build it here instead, in the same image, through the same script: the staged
+      # archives land in the workspace, the cache saves them, and the before_all inside
+      # cibuildwheel finds the stamp and skips straight past the build.
+      - name: Prime the phonon staging inside the manylinux image
+        if: matrix.platform == 'linux' && steps.phonon-linux.outputs.cache-hit != 'true'
+        run: |
+          docker run --rm -v "$GITHUB_WORKSPACE:/project" -w /project \
+            "$CIBW_MANYLINUX_X86_64_IMAGE" bash tools/phonon/cibw-before-all-linux.sh
+
+      # The package directory is bindings/python, but the working directory has to be the
+      # REPOSITORY: the build needs the whole tree (cmake.source-dir is "../.."), and cibuildwheel
+      # copies the working directory into the container. Same reason pyproject.toml points
+      # scikit-build-core at the repo root.
+      - name: Build the wheel (cibuildwheel)
+        run: uvx cibuildwheel@${{ env.CIBUILDWHEEL_VERSION }} --platform ${{ matrix.platform }} bindings/python
+
+      - name: Check the manylinux wheel
+        if: matrix.platform == 'linux'
+        shell: bash
+        run: |
+          whl=$(ls wheelhouse/*.whl)
+          # tr: BSD wc pads its count with spaces, so the macOS copy of this line needs it.
+          test "$(ls wheelhouse/*.whl | wc -l | tr -d ' ')" = 1
+          echo "built $(basename "$whl")"
+          # manylinux_2_28, not the runner's glibc, and still one wheel for every Python from
+          # 3.12. The name carries TWO platform tags: auditwheel found the wheel eligible for
+          # manylinux_2_27 as well and says so in the filename, so match the end of the name
+          # rather than the whole of it.
+          case "$(basename "$whl")" in
+            *-cp312-abi3-*manylinux_2_28_x86_64.whl) : ;;
+            *) echo "expected a cp312-abi3 manylinux_2_28_x86_64 wheel, got $(basename "$whl")"; exit 1 ;;
+          esac
+          unzip -l "$whl"
+          unzip -o -q "$whl" -d wheel-inspect
+          # The engine library and the extension, side by side inside the package.
+          test -s wheel-inspect/bw_audio/libbw_audio.so
+          ls wheel-inspect/bw_audio/_bwa*.so
+          # auditwheel must have grafted NOTHING. libasound and libjack are excluded on purpose
+          # (a bundled libjack cannot match the running server, and libasound is on every Linux
+          # desktop); everything else the engine needs is in the manylinux policy. A
+          # bw_audio.libs/ directory here means the repair vendored something, which would also
+          # mean it rewrote the extension's runpath.
+          ! test -d wheel-inspect/bw_audio.libs
+          ! find wheel-inspect -name 'libasound*' -o -name 'libjack*' | grep .
+          # And the $ORIGIN link survived, so the extension still finds the engine beside it.
+          readelf -d wheel-inspect/bw_audio/_bwa*.so | grep -E 'RUNPATH|RPATH' | grep -q 'ORIGIN'
+
+      - name: Check the universal2 wheel
+        if: matrix.platform == 'macos'
+        shell: bash
+        run: |
+          whl=$(ls wheelhouse/*.whl)
+          # tr: BSD wc pads its count with spaces, so the macOS copy of this line needs it.
+          test "$(ls wheelhouse/*.whl | wc -l | tr -d ' ')" = 1
+          echo "built $(basename "$whl")"
+          case "$(basename "$whl")" in
+            *-cp312-abi3-macosx_*_universal2.whl) : ;;
+            *) echo "expected cp312-abi3-macosx_*_universal2, got $(basename "$whl")"; exit 1 ;;
+          esac
+          unzip -l "$whl"
+          unzip -o -q "$whl" -d wheel-inspect
+          test -s wheel-inspect/bw_audio/libbw_audio.dylib
+          # BOTH slices in BOTH binaries. A universal2 wheel whose engine library is one
+          # architecture links, installs, imports on the runner, and fails on half the Macs that
+          # download it - the same failure the macos job's lipo checks exist to prevent.
+          for f in wheel-inspect/bw_audio/libbw_audio.dylib wheel-inspect/bw_audio/_bwa*.so; do
+            lipo -info "$f"
+            lipo -info "$f" | grep -q x86_64
+            lipo -info "$f" | grep -q arm64
+          done
+          # delocate should have had nothing to do: the engine dylib links system frameworks only,
+          # and the extension finds the engine through @loader_path.
+          otool -L wheel-inspect/bw_audio/_bwa*.so
+          otool -l wheel-inspect/bw_audio/_bwa*.so | grep -q '@loader_path'
+          ! test -d wheel-inspect/bw_audio/.dylibs
+
+      # A FIXED artifact name, like the other jobs' pack inputs: the windows job downloads these
+      # two by name for the release. No version in the name, because a wheel's filename already
+      # carries the only version a wheel has (the ABI version from bw_audio.h), and 30 days
+      # because these are also the wheels a human wants off a branch build.
+      - name: Upload artifact (release wheel)
+        uses: actions/upload-artifact@v6
+        with:
+          name: release-wheel-${{ matrix.platform }}
+          path: wheelhouse/*.whl
+          retention-days: 30
           if-no-files-found: error
