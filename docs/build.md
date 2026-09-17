@@ -396,7 +396,7 @@ older UPM parsers reject. When git cannot answer (no tag, shallow clone, no git 
 ## Continuous integration
 
 `.github/workflows/ci.yml` builds and tests on `windows-latest`, `ubuntu-latest` and
-`macos-latest`. The Windows job doubles as the distribution channel:
+`macos-latest`. A separate `package` job is the distribution channel:
 
 - **One engine per platform.** Each desktop job builds the engine once, runs ctest on it, and
   installs it as an [engine SDK](#the-engine-sdk). Every binding in that job then configures with
@@ -467,7 +467,7 @@ older UPM parsers reject. When git cannot answer (no tag, shallow clone, no git 
   tests. It builds a static phonon per ABI first, through the same composite action, so that second
   assertion is also what proves the staging survived. Nothing runs
   there: the binaries are the device's, which is what `tools\android\run-tests.ps1` is for. The
-  job also builds the Godot GDExtension for `arm64-v8a` and hands both libraries to the Windows
+  job also builds the Godot GDExtension for `arm64-v8a` and hands both libraries to the `package`
   job, which is the only place that packs the bindings. It uploads
   `bw_audio-android-<ver>-r<N>`: `lib/arm64-v8a/libbw_audio.so`, `lib/x86_64/libbw_audio.so`,
   `include/bw_audio.h`, `LICENSE`, `THIRD_PARTY-NOTICES.md`, and a `DIST.txt` naming the commit.
@@ -497,7 +497,7 @@ older UPM parsers reject. When git cannot answer (no tag, shallow clone, no git 
   dylib on macOS, and no engine is compiled there at all. Each job asserts the configure log says
   `MATLAB MEX enabled`, because the option skips silently when it finds no toolchain and a job that
   built nothing would otherwise pass.
-  The `windows` job then assembles `bw_audio-matlab/`: `+bwa`, the examples, the README, the
+  The `package` job then assembles `bw_audio-matlab/`: `+bwa`, the examples, the README, the
   licenses, and `bin/win64`, `bin/glnxa64` and `bin/maca64` each holding that platform's two MEX
   files plus the one engine library both of them load. It asserts all six are present before
   zipping. That folder uploads as `bw_audio-matlab-<ver>-r<N>` and, on a tag, as
@@ -525,7 +525,7 @@ older UPM parsers reject. When git cannot answer (no tag, shallow clone, no git 
   runner is tagged for that runner: the image's glibc on Linux, the runner's own architecture on
   macOS. Neither is what a release hands a stranger. So a separate job runs
   [cibuildwheel](https://cibuildwheel.pypa.io/) on `ubuntu-latest` and `macos-latest`, and the
-  release takes the Windows wheel from the `windows` job and these two from here. Windows is not
+  release takes the Windows wheel from the `windows` job's pack input and these two from here. Windows is not
   in this job: a Windows wheel already names one ABI and one architecture, so there is nothing a
   container could add.
   - **Neither wheel builds an engine.** The job downloads the engine SDK the `linux` and `macos`
@@ -602,14 +602,21 @@ older UPM parsers reject. When git cannot answer (no tag, shallow clone, no git 
   `bw_audio-linux-x64-<ver>-r<N>` (`lib/libbw_audio.so`, `include/bw_audio.h`, `LICENSE`,
   `THIRD_PARTY-NOTICES.md`, `DIST.txt`) and `bw_audio-macos-universal-<ver>-r<N>` (the same tree
   with `lib/libbw_audio.dylib`), plus the fixed-name pack inputs `linux-pack-input` and
-  `macos-pack-input` that the Windows job downloads. The macOS build is **universal**
+  `macos-pack-input` that the `package` job downloads. The macOS build is **universal**
   (`CMAKE_OSX_ARCHITECTURES="x86_64;arm64"`, and the composite action passes the same pair to
   phonon's own configure, because phonon's CMake does not make itself universal despite appearing
   to; see `third_party/README.md`) and both the action and the job fail on a `lipo -info` that
   does not show both architectures.
-- **The Windows job waits for all three cross-builds.** `needs: [android, linux, macos]`, because
-  it is the only place that packs the bindings and each package carries every platform's engine
-  library. The three run in parallel, so the wait is the slowest of them.
+- **Building and packing are two jobs.** The `windows` job builds and tests the Windows engine,
+  both MEX gateways, both Godot extension flavors and the Python wheel, and it waits for nothing.
+  It ends by uploading `windows-pack-input`, the same fixed-name handoff the other three jobs make.
+  The `package` job compiles nothing: it waits for all five build jobs
+  (`needs: [windows, android, linux, macos, wheels]`), downloads the four pack inputs and the
+  release wheels, packs the Godot addon, the Unity package and the MATLAB toolbox, and on a tag
+  creates the release. Each package carries every platform's engine library, which is why one job
+  has to see them all. Splitting it out is what lets the longest job in the matrix start at once
+  instead of behind the cross-builds, and it keeps the per-platform engine artifacts available
+  when packing fails, because the job that built each one uploads it.
 - **A release carries TWELVE assets**, because workflow artifacts expire (30 days) and a
   release doesn't:
   - `com.brainworks.bw_audio-<ver>.tgz`: the Unity package.

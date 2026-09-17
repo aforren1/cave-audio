@@ -350,7 +350,7 @@ Linux is a second host: JACK and ALSA are device backends there (docs/backends.m
 the NDK against API 26 or later - `tools/android/run-tests.ps1` runs the suite on a device or
 emulator, and docs/build.md's "Android" section has the toolchain. CI cross-builds both ABIs in its
 own `android` job and ships them as their own artifact (`bw_audio-android-<ver>`); both bindings carry
-the arm64-v8a library, and the Windows job takes it from that job rather than cross-building one of
+the arm64-v8a library, and the `package` job takes it from that job rather than cross-building one of
 its own. It carries phonon too now, built per ABI by the same composite action; nothing in either
 binding's packaging changed for that, because phonon is linked STATICALLY and lands inside the
 engine library (which costs 0.4 MB -> 7.0 MB stripped on arm64).
@@ -359,9 +359,18 @@ macOS builds on the null/manual sinks until phase 4 lands. Do not bake any backe
 The `linux` and `macos` jobs SHIP the same way since 2026-09-15: each builds its own Godot
 GDExtension (both flavours) and uploads a standalone engine artifact (`bw_audio-linux-x64-<ver>`,
 `bw_audio-macos-universal-<ver>`, the latter a UNIVERSAL x86_64+arm64 build) plus a fixed-name
-`linux-pack-input` / `macos-pack-input` the Windows job downloads. So both bindings now carry FOUR
-platforms' engine libraries, a tagged release has EIGHT assets, and the Windows job `needs:
-[android, linux, macos]`. Two wrinkles worth knowing: the Godot addon keeps the Linux engine
+`linux-pack-input` / `macos-pack-input` the `package` job downloads. So both bindings now carry FOUR
+platforms' engine libraries and a tagged release has EIGHT assets.
+
+BUILDING AND PACKING ARE TWO JOBS since 2026-09-16. `windows` builds and tests the Windows engine
+and every binding that links it, waits for NOTHING, and ends by uploading its own fixed-name
+`windows-pack-input` the way the other three jobs do. `package` is the one that waits (`needs:
+[windows, android, linux, macos, wheels]`): it compiles nothing, downloads the four pack inputs plus
+the release wheels, packs the Godot addon, the Unity package and the MATLAB toolbox, and on a tag
+cuts the release. The per-platform engine artifacts are uploaded by the jobs that built them, so
+they survive a packing failure. Two consequences in the scripts: the windows job now builds the
+`template_release` Godot flavour itself (the pack used to), and `tools/godot/pack.ps1` has a
+`-WindowsFrom` switch beside its three cross-platform ones. Two wrinkles worth knowing: the Godot addon keeps the Linux engine
 library in `bin/linux/` because Android's has the same file name (the extension finds it through an
 `$ORIGIN` run path), and the macOS binaries are UNSIGNED and un-notarized, so a downloaded addon or
 package needs its quarantine flag cleared before either editor loads it.
@@ -420,7 +429,7 @@ macOS box with Octave alone reaches 42 (38 + 4) and with both 46 (38 + 8). Each 
 (SKIPPED) when the MEX for the running interpreter
 was not staged, and neither half is registered when its toolchain was not found at configure time -
 ctest cannot run a MATLAB test with no MATLAB. In CI BOTH MEX files are built INSIDE each desktop
-job (so each links that job's own engine, backends intact) and the windows job assembles all six
+job (so each links that job's own engine, backends intact) and the `package` job assembles all six
 into ONE toolbox folder, bin/{win64,glnxa64,maca64} each holding that platform's pair plus the ONE
 engine library both load, shipped as a twelfth release asset. Every desktop job installs its own
 Octave (apt on Linux, chocolatey's `octave.portable` on Windows, homebrew on macOS), configures

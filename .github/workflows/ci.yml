@@ -17,6 +17,15 @@
 # Godot toolchain do not install in AlmaLinux 8, and they do not need to - a binding compiled on
 # the runner against a glibc-2.28 shared object is an ordinary ABI client.
 #
+# BUILDING AND PACKING ARE TWO JOBS. `windows` builds and tests the Windows engine and every
+# binding that links it, and it waits for NOTHING: it starts with android, linux and macos rather
+# than after them, which is where most of this workflow's wall time used to go. It ends by handing
+# over a fixed-name `windows-pack-input`, the same way the other three jobs do. `package` is the
+# one that waits (`needs: [windows, android, linux, macos, wheels]`): it downloads the four pack
+# inputs plus the release wheels, packs the Godot addon, the Unity package and the MATLAB toolbox,
+# and on a tag creates the release. It compiles nothing. The per-platform engine artifacts are
+# uploaded by the jobs that built them, so they exist even when packing fails.
+#
 # Scope (deliberate, see third_party/README.md):
 #   - ASIO backend: BUILT. The SDK is fetched from Steinberg's official URL (the
 #     repo's documented one-liner) and cached; it is dual-licensed GPLv3/proprietary
@@ -40,17 +49,17 @@
 #   - Android: CROSS-BUILT in its own job (arm64-v8a and x86_64, android-26), with a static
 #     phonon per ABI so an APK gets the HRTF decode, occlusion, pathing and the reflection bed
 #     inside libbw_audio.so, and shipped as its own artifact. It also builds the Godot GDExtension for arm64-v8a and
-#     hands both libraries to the Windows job, which is the only place that packs the
+#     hands both libraries to the package job, which is the only place that packs the
 #     bindings. No emulator: see the android job's own note.
 #   - Linux and macOS: the two portability jobs SHIP too. Each builds its own Godot GDExtension
-#     (both flavours) and hands the extension plus the engine library to the Windows job, the same
+#     (both flavours) and hands the extension plus the engine library to the package job, the same
 #     way android does, so one addon and one Unity package carry every platform. Each also uploads
 #     a standalone engine artifact of its own. macOS builds UNIVERSAL (x86_64 + arm64) and is
 #     unsigned; see those jobs' notes.
 #   - MATLAB and Octave binding: BOTH MEX files are built INSIDE each desktop job, after that
 #     job's engine build, so each links that platform's engine (ASIO/WASAPI, JACK/ALSA, the
 #     universal dylib) rather than a second one. Every desktop job installs Octave (apt on Linux,
-#     choco on Windows, brew on macOS) and runs the four octave_* ctests. The Windows job
+#     choco on Windows, brew on macOS) and runs the four octave_* ctests. The package job
 #     assembles all six binaries into ONE toolbox folder: bin/<arch>/ per platform, each holding
 #     that platform's MATLAB MEX, its Octave MEX and the ONE engine library both load. UNVERIFIED
 #     LOCALLY: no runner MATLAB is reachable from here, so every MATLAB step comes from
@@ -82,7 +91,7 @@ concurrency:
   cancel-in-progress: true
 
 permissions:
-  contents: write       # the release step attaches the .tgz; everything else is read-only
+  contents: read        # least privilege: only the `package` job writes, and it asks for it itself
 
 env:
   # The Godot editor CI tests against, and the godot-cpp commit the extension builds against.
@@ -95,20 +104,41 @@ env:
 jobs:
   windows:
     runs-on: windows-latest
-    # Every other platform's libraries are packed INTO both bindings, and only a Windows machine can
-    # pack them (the two flavours of the Godot extension and the engine DLL are MSVC builds). So this
-    # job waits for the three cross-builds rather than reproducing them: an NDK build inside this job
-    # would add the godot-cpp android compile to the longest job in the matrix, for a library ubuntu
-    # already has, and a Linux or macOS build is not reproducible here at any price. The cost is the
-    # other jobs' wall time, which is minutes against this job's phonon build - and they run in
-    # parallel with each other.
-    # The wheels job joins that list for the release: it builds the manylinux and universal2
-    # wheels, and the release step below attaches them beside this job's Windows one.
-    needs: [android, linux, macos, wheels]
+    # NO `needs`. This job builds and tests the Windows engine, the two MEX gateways, both Godot
+    # extension flavours and the Python wheel, all against the one engine SDK it installs - and
+    # none of that wants a line from another platform. It used to wait for the three cross-builds
+    # and for the wheels job, because the SAME job also packed the bindings and cut the release.
+    # That packing is the `package` job now, so the longest job in the matrix starts at t=0 and
+    # the cross-builds run beside it instead of in front of it.
+    #
+    # What the pack still needs from a Windows machine - the engine, the two extension flavours,
+    # the MEX pair and the wheel - leaves here as the fixed-name `windows-pack-input` artifact at
+    # the end of the job, exactly as android, linux and macos hand theirs over.
     timeout-minutes: 75   # the uncached phonon build is the long pole; cached runs are far under
     steps:
       - uses: actions/checkout@v7
         # no submodules by default: steam-audio-source is fetched only on a phonon cache miss
+
+      - name: Version
+        id: ver
+        shell: bash
+        run: |
+          # The same rule the android, linux and macos jobs use, and the same one tools/upm/pack.ps1
+          # derives in the package job, so every artifact of one run carries the same version. This
+          # job no longer runs the pack, so it needs its own copy to name the two artifacts below.
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            v="${GITHUB_REF_NAME#v}"
+          else
+            v="0.0.0-dev"
+            if d=$(git describe --tags --long --dirty --match 'v*' 2>/dev/null); then
+              if [[ "$d" =~ ^v?(.+)-([0-9]+)-g([0-9a-f]+)(-dirty)?$ ]]; then
+                if [ "${BASH_REMATCH[2]}" = 0 ]; then v="${BASH_REMATCH[1]}"
+                else v="${BASH_REMATCH[1]}-dev.${BASH_REMATCH[2]}.g${BASH_REMATCH[3]}"; fi
+              fi
+            fi
+          fi
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+          echo "windows version: $v"
 
       - name: Cache ASIO SDK
         id: asiosdk
@@ -361,7 +391,9 @@ jobs:
       # ---- Godot binding ---------------------------------------------------------------------
       # Its own build trees, because GODOTCPP_TARGET is a build-WIDE choice in godot-cpp: one
       # tree yields one library flavour, and a shippable addon needs two (editor for the editor,
-      # template_release for exported games). tools/godot/pack.ps1 builds both.
+      # template_release for exported games). The test step below builds the editor one and runs
+      # the Godot ctests on it; the step after builds the release one, because the pack that used
+      # to build it runs in the package job now, on a runner with no engine SDK.
       #
       # Unlike the three imgui tools, these tests DO run here: Godot's --headless mode needs no
       # display or GL, so the demo scenes and the playground self-test are ordinary CI.
@@ -417,60 +449,27 @@ jobs:
           ctest --test-dir build-godot-editor -C RelWithDebInfo --output-on-failure \
                 --no-tests=error -R '^godot_'
 
-      # Both packs carry an Android library, and neither script can cross-build one here. The android
-      # job staged them under a FIXED artifact name (versioned names are for the artifacts a human
-      # downloads), so this step needs no version plumbing.
-      - name: Download the Android libraries (built by the android job)
-        uses: actions/download-artifact@v8
-        with:
-          name: android-pack-input
-          path: pack-android
-
-      - name: Download the Linux libraries (built by the linux job)
-        uses: actions/download-artifact@v8
-        with:
-          name: linux-pack-input
-          path: pack-linux
-
-      - name: Download the macOS libraries (built by the macos job)
-        uses: actions/download-artifact@v8
-        with:
-          name: macos-pack-input
-          path: pack-macos
-
-      # The two RELEASE wheels: manylinux and universal2, built by the wheels job. They are not
-      # the pack-linux/pack-macos wheels - those are the per-runner fast gate, tagged for the
-      # runner's own glibc and architecture, and they stay artifacts.
-      - name: Download the release wheels (built by the wheels job)
-        uses: actions/download-artifact@v8
-        with:
-          pattern: release-wheel-*
-          merge-multiple: true
-          path: wheelhouse
-
-      - name: Pack Godot addon
-        id: packgd
-        shell: pwsh
+      - name: Build the Godot GDExtension (windows, template_release)
+        shell: bash
         run: |
-          # -SkipBuild is wrong here: the editor tree is built but template_release is not, and
-          # pack.ps1 refuses to ship a manifest whose libraries are missing. The three -*From
-          # switches keep it from trying to cross-build the other platforms on a runner that has
-          # no toolchain for any of them.
-          # EngineSdk: pack.ps1 configures both flavours itself, and without it each one
-          # compiles a full engine. With it they link the SDK this job installed, which is the
-          # engine the Windows half of the addon then ships.
-          $a = @{ OutDir = 'dist/godot'; AndroidFrom = (Resolve-Path 'pack-android/godot').Path
-                  LinuxFrom = (Resolve-Path 'pack-linux/godot').Path
-                  MacFrom   = (Resolve-Path 'pack-macos/godot').Path
-                  EngineSdk = (Resolve-Path 'engine-sdk').Path }
-          if ($env:GITHUB_REF -like 'refs/tags/v*') { $a.Version = $env:GITHUB_REF_NAME.TrimStart('v') }
-          ./tools/godot/pack.ps1 @a
+          # The flavour an EXPORTED game loads. tools/godot/pack.ps1 used to configure and build it
+          # as part of packing; the pack is in the package job now and compiles nothing, so the
+          # second flavour is built here - in the tree the godot-cpp cache above already covers, and
+          # against the same engine SDK the editor flavour links.
+          cmake -S . -B build-godot-template_release -A x64 \
+                -DBWA_ENGINE_SDK="$GITHUB_WORKSPACE/engine-sdk" \
+                -DBWA_BUILD_GODOT=ON -DGODOTCPP_TARGET=template_release -DBWA_BUILD_TESTS=ON
+          cmake --build build-godot-template_release --config RelWithDebInfo --target bwa_gdextension
+          # The manifest names this exact file, and the addon ships the SDK's engine beside it.
+          test -s bindings/godot/addons/bw_audio/bin/bw_audio_gd.windows.template_release.x86_64.dll
+          cmp engine-sdk/bin/bw_audio.dll bindings/godot/addons/bw_audio/bin/bw_audio.dll
 
       - name: Stage dist
         shell: pwsh
         run: |
-          # -Force = mkdir -p (safe on DIRECTORIES; it truncates only files). Needed since the
-          # Godot pack step runs first and already creates dist/godot, so dist/ exists here.
+          # -Force = mkdir -p (safe on DIRECTORIES; it truncates only files). dist/ does not exist
+          # yet in this job - the packing steps that used to create it moved to the package job -
+          # and the wheel step below adds dist/python beside what this one stages.
           New-Item -ItemType Directory -Force dist, dist/RelWithDebInfo, dist/Debug | Out-Null
           Copy-Item include/bw_audio.h,
                     LICENSE,
@@ -527,6 +526,198 @@ jobs:
           "@ | Out-File -Encoding utf8 dist/DIST.txt
           Get-Content dist/DIST.txt
 
+      # ---- Python wheel (nanobind) --------------------------------------------------------------
+      # Built here rather than in a job of its own, because a wheel carries the ENGINE LIBRARY
+      # inside it and that library is this job's MSVC build. The wheel is tagged cp312-abi3, so one
+      # file per platform serves Python 3.12 and every later version.
+      - uses: astral-sh/setup-uv@v10.1.0
+        with:
+          enable-cache: true
+
+      - name: Build the Python wheel
+        shell: bash
+        run: |
+          uv python install 3.12
+          # --python 3.12 pins the tag rather than inheriting whatever the runner image has on
+          # PATH. Anything 3.12 or later produces the same abi3 wheel; pinning makes the ASSERTION
+          # below meaningful instead of a report of the image's default.
+          #
+          # -C cmake.define.BWA_ENGINE_SDK: scikit-build-core forwards a config setting of that
+          # shape straight to the CMake command line, which is what puts the root CMakeLists into
+          # bindings-only mode. Without it the wheel build compiles a SECOND full engine inside its
+          # own isolated build directory, and the wheel then carries a file this job never tested.
+          (cd bindings/python && uv build --wheel --python 3.12 \
+              -C cmake.define.BWA_ENGINE_SDK="$GITHUB_WORKSPACE/engine-sdk" \
+              --out-dir "$GITHUB_WORKSPACE/dist/python")
+          whl=$(ls "$GITHUB_WORKSPACE"/dist/python/*.whl)
+          echo "built $(basename "$whl")"
+          # The engine inside the wheel is the SDK's, byte for byte.
+          unzip -o -q "$whl" -d "$GITHUB_WORKSPACE/wheel-inspect"
+          cmp engine-sdk/bin/bw_audio.dll "$GITHUB_WORKSPACE/wheel-inspect/bw_audio/bw_audio.dll"
+          # The stable ABI is the whole point of the 3.12 floor: without it there would be one
+          # wheel per Python per platform. A version-specific tag here means nanobind's STABLE_ABI
+          # did not engage, so fail rather than ship a wheel that only runs on one interpreter.
+          case "$(basename "$whl")" in
+            *-cp312-abi3-*) : ;;
+            *) echo "expected a cp312-abi3 wheel, got $(basename "$whl")"; exit 1 ;;
+          esac
+
+      - name: Test the Python wheel (from the INSTALLED wheel, not the source tree)
+        shell: bash
+        run: |
+          uv venv --python 3.12 .wheelenv
+          uv pip install --python .wheelenv pytest numpy "$GITHUB_WORKSPACE"/dist/python/*.whl
+          # No PYTHONPATH and no build tree on the path: this is the wheel a user would install.
+          .wheelenv/Scripts/python -m pytest -q --color=no bindings/python/tests
+          .wheelenv/Scripts/python bindings/python/examples/offline_render.py --tests
+          .wheelenv/Scripts/python bindings/python/examples/live_onset.py --tests
+
+      - name: Upload artifact (Python wheel)
+        uses: actions/upload-artifact@v7
+        with:
+          name: bw_audio-python-win64-${{ steps.ver.outputs.version }}-r${{ github.run_number }}
+          path: dist/python/
+          retention-days: 30
+          if-no-files-found: error
+
+      # The engine artifact stays in THIS job, and deliberately: a native consumer's download
+      # should exist whenever the engine built and tested, whether or not the cross-platform
+      # packing downstream succeeded. The Unity package and the Godot addon are the package job's.
+      - name: Upload artifact (engine + tools)
+        uses: actions/upload-artifact@v7
+        with:
+          # version-r<run> : the git-describe/tag version, plus the run number so re-runs of one commit don't collide
+          name: bw_audio-win64-${{ steps.ver.outputs.version }}-r${{ github.run_number }}
+          path: |
+            dist/
+            !dist/python/**
+          retention-days: 30
+          if-no-files-found: error
+
+      # ---- what the package job packs ------------------------------------------------------------
+      # A FIXED artifact name, like the android, linux and macos pack inputs: the versioned
+      # artifacts above are the ones a human downloads, this one is an intra-run handoff.
+      #
+      # dist/ rides along whole (minus the wheel, which travels in its own directory) so the release
+      # step there can zip the Windows engine bundle and the ASIO source without rebuilding
+      # anything - the same rule the other three jobs follow. The binding directories are FLAT,
+      # because that is the shape both pack scripts read a prebuilt platform out of.
+      - name: Stage the packing input
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force `
+            pack-windows/dist, pack-windows/godot, pack-windows/unity,
+            pack-windows/matlab, pack-windows/python | Out-Null
+          Copy-Item -Recurse dist/RelWithDebInfo, dist/Debug pack-windows/dist/
+          Copy-Item dist/bw_audio.h, dist/LICENSE, dist/THIRD_PARTY-NOTICES.md,
+                    dist/DIST.txt, dist/asio-sdk-src.zip pack-windows/dist/
+          # The two extension flavours and the engine library the manifest names for windows.
+          # pack.ps1 takes them by name out of a flat -WindowsFrom directory, the same way it
+          # takes the android, linux and macos sets.
+          $gb = 'bindings/godot/addons/bw_audio/bin'
+          Copy-Item "$gb/bw_audio_gd.windows.editor.x86_64.dll",
+                    "$gb/bw_audio_gd.windows.template_release.x86_64.dll",
+                    "$gb/bw_audio.dll" pack-windows/godot/
+          Copy-Item build/RelWithDebInfo/bw_audio.dll pack-windows/unity/
+          # BOTH interpreters' MEX files and ONE engine library, for the toolbox the package job
+          # assembles - the same three files the linux and macos jobs stage.
+          Copy-Item bindings/matlab/bin/matlab/win-x64/bwa_mex.mexw64,
+                    bindings/matlab/bin/octave/win-x64/bwa_mex.mex,
+                    bindings/matlab/bin/matlab/win-x64/bw_audio.dll pack-windows/matlab/
+          # The Windows release wheel. The linux and macos jobs' per-runner wheels stay artifacts;
+          # this one IS the release's, because a Windows wheel already names one ABI and one
+          # architecture and the wheels job builds no Windows wheel.
+          Copy-Item dist/python/*.whl pack-windows/python/
+          Get-ChildItem -Recurse pack-windows | Where-Object { -not $_.PSIsContainer } |
+            Select-Object FullName, Length
+
+      - name: Upload artifact (packing input for the package job)
+        uses: actions/upload-artifact@v7
+        with:
+          name: windows-pack-input
+          path: pack-windows/
+          retention-days: 1      # an intra-run handoff, not a download
+          if-no-files-found: error
+
+  # ---- packing and the release ------------------------------------------------------------------
+  # Every other platform's libraries are packed INTO both bindings, and only a Windows machine can
+  # pack them: tools/upm/pack.ps1, tools/godot/pack.ps1, tools/upm/gen-meta.ps1 and
+  # tools/dist/doc-pointers.ps1 are PowerShell, and the Windows halves of both packages are MSVC
+  # builds. So this job waits for the four build jobs rather than reproducing any of them.
+  #
+  # It COMPILES NOTHING. Every binary it ships was built and tested by the job that owns that
+  # platform and arrived in that job's fixed-name pack input; this one downloads the four, packs
+  # the Godot addon, the Unity package and the MATLAB toolbox, and on a tag creates the release.
+  # Splitting it out of the windows job is what lets the Windows engine build start at t=0.
+  #
+  # The wheels job is in `needs` for the release: it builds the manylinux and universal2 wheels,
+  # and the release step attaches them beside the windows job's own.
+  package:
+    runs-on: windows-latest
+    needs: [windows, android, linux, macos, wheels]
+    permissions:
+      contents: write     # the release step attaches the assets and the branch push writes refs
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+        # Same checkout the windows job uses - no submodules. The Steam Audio source step below
+        # inits the one submodule it needs, on tags only, and everything else here is either in
+        # the tree already (the pack scripts, +bwa, the addon sources) or in a pack input.
+
+      # Every platform arrives the same way: a FIXED artifact name (versioned names are for the
+      # artifacts a human downloads), so none of these steps needs version plumbing.
+      - name: Download the Windows libraries (built by the windows job)
+        uses: actions/download-artifact@v8
+        with:
+          name: windows-pack-input
+          path: pack-windows
+
+      - name: Download the Android libraries (built by the android job)
+        uses: actions/download-artifact@v8
+        with:
+          name: android-pack-input
+          path: pack-android
+
+      - name: Download the Linux libraries (built by the linux job)
+        uses: actions/download-artifact@v8
+        with:
+          name: linux-pack-input
+          path: pack-linux
+
+      - name: Download the macOS libraries (built by the macos job)
+        uses: actions/download-artifact@v8
+        with:
+          name: macos-pack-input
+          path: pack-macos
+
+      # The two RELEASE wheels: manylinux and universal2, built by the wheels job. They are not
+      # the pack-linux/pack-macos wheels - those are the per-runner fast gate, tagged for the
+      # runner's own glibc and architecture, and they stay artifacts.
+      - name: Download the release wheels (built by the wheels job)
+        uses: actions/download-artifact@v8
+        with:
+          pattern: release-wheel-*
+          merge-multiple: true
+          path: wheelhouse
+
+      - name: Pack Godot addon
+        id: packgd
+        shell: pwsh
+        run: |
+          # -SkipBuild plus FOUR -*From switches: this job compiles nothing, so every platform
+          # arrives prebuilt, Windows included. The windows job builds both Windows flavours
+          # against the engine SDK it tested, which is the engine the Windows half of the addon
+          # ships; -EngineSdk is therefore not passed here, because nothing is configured.
+          # pack.ps1 still refuses to ship a manifest whose libraries are missing, so a pack input
+          # that lost a file fails here rather than at load time on somebody's machine.
+          $a = @{ OutDir = 'dist/godot'; SkipBuild = $true
+                  WindowsFrom = (Resolve-Path 'pack-windows/godot').Path
+                  AndroidFrom = (Resolve-Path 'pack-android/godot').Path
+                  LinuxFrom = (Resolve-Path 'pack-linux/godot').Path
+                  MacFrom   = (Resolve-Path 'pack-macos/godot').Path }
+          if ($env:GITHUB_REF -like 'refs/tags/v*') { $a.Version = $env:GITHUB_REF_NAME.TrimStart('v') }
+          ./tools/godot/pack.ps1 @a
+
       # Corresponding source for the OTHER statically linked dependency. phonon used to ship as its
       # own DLL, which made the pinned-commit link enough; inside bw_audio.dll it is the same case as
       # the ASIO SDK, so it gets the same treatment - the source beside the binary, not a URL to
@@ -538,6 +729,9 @@ jobs:
         if: startsWith(github.ref, 'refs/tags/')
         shell: pwsh
         run: |
+          # dist/ exists by now (the Godot pack above writes dist/godot), but this step creates the
+          # archive INSIDE it, so say so rather than depend on step order.
+          New-Item -ItemType Directory -Force dist | Out-Null
           $sha = (git rev-parse HEAD:third_party/steam-audio-source).Trim()
           if (-not (Test-Path third_party/steam-audio-source/.git)) {
             git submodule update --init --depth 1 third_party/steam-audio-source
@@ -589,11 +783,13 @@ jobs:
         env:
           TAG: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || '' }}
         run: |
-          # -PluginsFrom pins RelWithDebInfo: the Debug build above ALSO POST_BUILD-stages into the
-          # package folder (last config wins), so packing without it would ship the Debug engine.
+          # -PluginsFrom is the windows job's RelWithDebInfo engine, staged into the pack input.
+          # It still has to be passed: Runtime/Plugins/x86_64 is a package folder a local build
+          # POST_BUILD-stages into, so packing without it could ship whatever a previous run left
+          # there. All four platforms now arrive the same way.
           # NB: splat a HASHTABLE, not an array. Array splatting binds POSITIONALLY, so '-PluginsFrom'
           # would land in $Version and the trailing value would have no parameter left to bind to.
-          $a = @{ PluginsFrom = 'build/RelWithDebInfo'; OutDir = 'dist/unity'
+          $a = @{ PluginsFrom = (Resolve-Path 'pack-windows/unity').Path; OutDir = 'dist/unity'
                   AndroidFrom = (Resolve-Path 'pack-android/unity').Path
                   LinuxFrom   = (Resolve-Path 'pack-linux/unity').Path
                   MacFrom     = (Resolve-Path 'pack-macos/unity').Path }
@@ -611,6 +807,8 @@ jobs:
       # and what +bwa/arch_dir.m looks for. The build tree's layout (bin/<matlab|octave>/...) is a
       # different one, on purpose: a build stages two interpreters side by side and a release
       # ships one.
+      #
+      # Every platform's set arrives in its pack input, Windows included: this job builds nothing.
       #
       # BOTH interpreters' MEX files ride in each bin/<arch>/. Octave's extension is `.mex` on every
       # platform, but the layout is one directory PER ARCHITECTURE, so the three never meet: what
@@ -636,9 +834,9 @@ jobs:
 
           # The engine library comes from the MATLAB staging directory in each case, and only once
           # per architecture: the Octave staging holds a byte-identical copy of the same build.
-          Copy-Item bindings/matlab/bin/matlab/win-x64/bwa_mex.mexw64  "$tb/bin/win64/"
-          Copy-Item bindings/matlab/bin/octave/win-x64/bwa_mex.mex     "$tb/bin/win64/"
-          Copy-Item bindings/matlab/bin/matlab/win-x64/bw_audio.dll    "$tb/bin/win64/"
+          Copy-Item pack-windows/matlab/bwa_mex.mexw64                 "$tb/bin/win64/"
+          Copy-Item pack-windows/matlab/bwa_mex.mex                    "$tb/bin/win64/"
+          Copy-Item pack-windows/matlab/bw_audio.dll                   "$tb/bin/win64/"
           Copy-Item pack-linux/matlab/bwa_mex.mexa64                   "$tb/bin/glnxa64/"
           Copy-Item pack-linux/matlab/bwa_mex.mex                      "$tb/bin/glnxa64/"
           Copy-Item pack-linux/matlab/libbw_audio.so                   "$tb/bin/glnxa64/"
@@ -662,76 +860,6 @@ jobs:
         with:
           name: bw_audio-matlab-${{ steps.pack.outputs.version }}-r${{ github.run_number }}
           path: dist/matlab/bw_audio-matlab/
-          retention-days: 30
-          if-no-files-found: error
-
-      # ---- Python wheel (nanobind) --------------------------------------------------------------
-      # Built here rather than in a job of its own, because a wheel carries the ENGINE LIBRARY
-      # inside it and that library is this job's MSVC build. The wheel is tagged cp312-abi3, so one
-      # file per platform serves Python 3.12 and every later version.
-      - uses: astral-sh/setup-uv@v10.1.0
-        with:
-          enable-cache: true
-
-      - name: Build the Python wheel
-        shell: bash
-        run: |
-          uv python install 3.12
-          # --python 3.12 pins the tag rather than inheriting whatever the runner image has on
-          # PATH. Anything 3.12 or later produces the same abi3 wheel; pinning makes the ASSERTION
-          # below meaningful instead of a report of the image's default.
-          #
-          # -C cmake.define.BWA_ENGINE_SDK: scikit-build-core forwards a config setting of that
-          # shape straight to the CMake command line, which is what puts the root CMakeLists into
-          # bindings-only mode. Without it the wheel build compiles a SECOND full engine inside its
-          # own isolated build directory, and the wheel then carries a file this job never tested.
-          (cd bindings/python && uv build --wheel --python 3.12 \
-              -C cmake.define.BWA_ENGINE_SDK="$GITHUB_WORKSPACE/engine-sdk" \
-              --out-dir "$GITHUB_WORKSPACE/dist/python")
-          whl=$(ls "$GITHUB_WORKSPACE"/dist/python/*.whl)
-          echo "built $(basename "$whl")"
-          # The engine inside the wheel is the SDK's, byte for byte.
-          unzip -o -q "$whl" -d "$GITHUB_WORKSPACE/wheel-inspect"
-          cmp engine-sdk/bin/bw_audio.dll "$GITHUB_WORKSPACE/wheel-inspect/bw_audio/bw_audio.dll"
-          # The stable ABI is the whole point of the 3.12 floor: without it there would be one
-          # wheel per Python per platform. A version-specific tag here means nanobind's STABLE_ABI
-          # did not engage, so fail rather than ship a wheel that only runs on one interpreter.
-          case "$(basename "$whl")" in
-            *-cp312-abi3-*) : ;;
-            *) echo "expected a cp312-abi3 wheel, got $(basename "$whl")"; exit 1 ;;
-          esac
-
-      - name: Test the Python wheel (from the INSTALLED wheel, not the source tree)
-        shell: bash
-        run: |
-          uv venv --python 3.12 .wheelenv
-          uv pip install --python .wheelenv pytest numpy "$GITHUB_WORKSPACE"/dist/python/*.whl
-          # No PYTHONPATH and no build tree on the path: this is the wheel a user would install.
-          .wheelenv/Scripts/python -m pytest -q --color=no bindings/python/tests
-          .wheelenv/Scripts/python bindings/python/examples/offline_render.py --tests
-          .wheelenv/Scripts/python bindings/python/examples/live_onset.py --tests
-
-      - name: Upload artifact (Python wheel)
-        uses: actions/upload-artifact@v7
-        with:
-          name: bw_audio-python-win64-${{ steps.pack.outputs.version }}-r${{ github.run_number }}
-          path: dist/python/
-          retention-days: 30
-          if-no-files-found: error
-
-      # Two artifacts, not one bag: the engine (native consumers - the C ABI, the tools, the CAVE
-      # machine) and the Unity package (a single .tgz). Downloading one no longer drags in the other.
-      - name: Upload artifact (engine + tools)
-        uses: actions/upload-artifact@v7
-        with:
-          # version-r<run> : the git-describe/tag version, plus the run number so re-runs of one commit don't collide
-          name: bw_audio-win64-${{ steps.pack.outputs.version }}-r${{ github.run_number }}
-          path: |
-            dist/
-            !dist/unity/**
-            !dist/godot/**
-            !dist/python/**
-            !dist/matlab/**
           retention-days: 30
           if-no-files-found: error
 
@@ -788,9 +916,9 @@ jobs:
       #                                      DLL (Apache-2.0), at its pinned commit, plus our patch.
       #                                      Same parity argument as the ASIO zip: the source sits
       #                                      beside the binary rather than behind a link.
-      #   bw_audio-<abi>-cp312-abi3-*.whl    the Python binding, three of them: win_amd64 from this
-      #                                      job, manylinux_2_28_x86_64 and macosx universal2 from
-      #                                      the wheels job. The engine library is inside each one.
+      #   bw_audio-<abi>-cp312-abi3-*.whl    the Python binding, three of them: win_amd64 from the
+      #                                      windows job, manylinux_2_28_x86_64 and macosx universal2
+      #                                      from the wheels job. The engine library is inside each one.
       #
       # Keep the engine bundle a .zip, and the package the only .tgz on the release. Every UPM registry
       # speaks the npm protocol and keys on a single publishable tarball, so should this ever be listed
@@ -808,20 +936,23 @@ jobs:
           # repo laid out as an installable project, which this is not.
           $gd  = (Get-Item dist/godot/*.zip).FullName
 
-          # The engine bundle: everything staged in dist/ EXCEPT the Unity package (which ships on its
-          # own). GPLv3 travels with it - LICENSE, THIRD_PARTY-NOTICES.md and DIST.txt (which names the
-          # commit and links the complete source) are already staged there.
+          # The engine bundle: what the windows job staged in its dist/ and handed over. GPLv3
+          # travels with it - LICENSE, THIRD_PARTY-NOTICES.md and DIST.txt (which names the commit
+          # and links the complete source) are already in there. Named explicitly rather than
+          # globbed, so the ASIO source zip beside them stays its own asset.
           $zip = "dist/bw_audio-win64-$tag.zip"
-          Compress-Archive -Path dist/RelWithDebInfo, dist/Debug, dist/bw_audio.h, dist/LICENSE,
-                                 dist/THIRD_PARTY-NOTICES.md, dist/DIST.txt `
+          Compress-Archive -Path pack-windows/dist/RelWithDebInfo, pack-windows/dist/Debug,
+                                 pack-windows/dist/bw_audio.h, pack-windows/dist/LICENSE,
+                                 pack-windows/dist/THIRD_PARTY-NOTICES.md, pack-windows/dist/DIST.txt `
                            -DestinationPath $zip -Force
           $zip = (Get-Item $zip).FullName
 
-          # GPLv3 corresponding source for the ASIO SDK (staged in dist/asio-sdk-src.zip). It ships as
-          # its OWN release asset - deliberately NOT inside the engine .zip or the Unity .tgz - so it
-          # sits in the same place as the binaries without bloating them (GPLv3 section 6d).
+          # GPLv3 corresponding source for the ASIO SDK (staged by the windows job, which is the one
+          # that fetches the SDK). It ships as its OWN release asset - deliberately NOT inside the
+          # engine .zip or the Unity .tgz - so it sits in the same place as the binaries without
+          # bloating them (GPLv3 section 6d).
           $src = "dist/bw_audio-asio-sdk-src-$tag.zip"
-          Copy-Item dist/asio-sdk-src.zip $src -Force
+          Copy-Item pack-windows/dist/asio-sdk-src.zip $src -Force
           $src = (Get-Item $src).FullName
 
           # And the same for Steam Audio, which a static link put inside the same DLL. Staged by the
@@ -831,8 +962,9 @@ jobs:
           $sasrc = (Get-Item $sasrc).FullName
 
           # The Android bundle. The android job staged the whole tree (both ABIs, the header, the
-          # licenses, its own DIST.txt) and this job only zips it, so ONE step creates the release
-          # and there is never a second one to reconcile.
+          # licenses, its own DIST.txt) and this job only zips it - which is now the rule for every
+          # platform, Windows included, so ONE step creates the release and there is never a second
+          # one to reconcile.
           $and = "dist/bw_audio-android-$tag.zip"
           Compress-Archive -Path pack-android/dist/* -DestinationPath $and -Force
           $and = (Get-Item $and).FullName
@@ -847,8 +979,7 @@ jobs:
           $mac = (Get-Item $mac).FullName
 
           # The MATLAB and Octave toolbox: ONE folder carrying every platform's two MEX files plus
-          # that platform's engine library, assembled above from this job's Windows set and the two
-          # pack inputs. A zip rather than a MATLAB Toolbox (.mltbx) because an .mltbx is a
+          # that platform's engine library, assembled above from the three pack inputs. A zip rather than a MATLAB Toolbox (.mltbx) because an .mltbx is a
           # MATLAB-only installer and this folder has to work in Octave too, where the install is
           # addpath and nothing else.
           $mtb = "dist/bw_audio-matlab-$tag.zip"
@@ -860,13 +991,14 @@ jobs:
           # Each is already versioned by its own filename (the ABI version from the header), so
           # unlike the engine bundles above there is nothing to rename per tag.
           #
-          # Windows comes from THIS job, Linux and macOS from the wheels job: those two are the
-          # manylinux and universal2 wheels, not the per-runner ones in pack-linux/pack-macos,
+          # Windows comes from the windows job's pack input, Linux and macOS from the wheels job:
+          # those two are the manylinux and universal2 wheels, not the per-runner ones in
+          # pack-linux/pack-macos,
           # which are tagged for their runner's glibc and architecture and stay artifacts. Assert
           # exactly one per platform AND the tag each one has to carry, because a wheel that
           # quietly fell back to a runner tag is a wheel that fails on the machine it was built
           # for the most: somebody else's.
-          $whlWin = @(Get-Item dist/python/*.whl)
+          $whlWin = @(Get-Item pack-windows/python/*.whl)
           $whlLnx = @(Get-Item wheelhouse/*-manylinux*.whl)
           $whlMac = @(Get-Item wheelhouse/*-macosx*.whl)
           if ($whlWin.Count -ne 1) { throw "expected 1 Windows wheel, found $($whlWin.Count)" }
@@ -1022,7 +1154,7 @@ jobs:
   # suite and run them on the null and manual sinks.
   #
   # They SHIP as well, since 2026-09-15: each builds its own Godot GDExtension in both flavours,
-  # uploads a standalone engine artifact, and hands the Windows job a fixed-name pack input, exactly
+  # uploads a standalone engine artifact, and hands the package job a fixed-name pack input, exactly
   # as the android job does. That is what lets one addon and one Unity package carry every platform.
   #
   # The linux job DOES compile the two Linux backends (apt installs their dev packages) and asserts
@@ -1050,7 +1182,7 @@ jobs:
   # cross-BUILD is the part worth gating, and it is the cheap part.
   # ---- Android cross-build (docs/backends.md phase 3 + the bindings' Android packaging) ---------
   # Builds the library for both ABIs, proves the AAudio backend is in it, and produces the two things
-  # the Windows job cannot: the arm64-v8a engine library that both bindings package, and the Godot
+  # no other job can: the arm64-v8a engine library that both bindings package, and the Godot
   # GDExtension for arm64-v8a (template_release, the flavour an exported game loads).
   #
   # Nothing RUNS here. The test executables are built, so a compile break in the suite still fails
@@ -1245,7 +1377,7 @@ jobs:
           EOF
           cat dist-android/DIST.txt
 
-          # What the Windows job packs into the two bindings. A FIXED artifact name, because a
+          # What the package job packs into the two bindings. A FIXED artifact name, because a
           # versioned one would have to be threaded through the download step; the versioned
           # artifact below is the one a human downloads.
           #
@@ -1272,7 +1404,7 @@ jobs:
           retention-days: 30
           if-no-files-found: error
 
-      - name: Upload artifact (packing input for the windows job)
+      - name: Upload artifact (packing input for the package job)
         uses: actions/upload-artifact@v7
         with:
           name: android-pack-input
@@ -1484,10 +1616,10 @@ jobs:
                 error("bwa:ci", "the MATLAB binding reported %d failing check groups", rc);
             end
 
-      - name: Stage the MEX files for the windows job
+      - name: Stage the MEX files for the package job
         shell: bash
         run: |
-          # Into the fixed-name pack input the windows job already downloads, so assembling the
+          # Into the fixed-name pack input the package job already downloads, so assembling the
           # cross-platform toolbox there costs no second handoff. BOTH interpreters' MEX files,
           # and ONE engine library: the two staging directories hold the same build of it, and
           # both MEX files load it out of the bin/glnxa64 they end up sharing.
@@ -1505,7 +1637,7 @@ jobs:
           # BOTH interpreters' MEX files with the engine library beside each, plus the package a
           # user adds to their path. Each MEX finds its library through an $ORIGIN runpath, so a
           # staged directory is self-contained. The cross-platform TOOLBOX (one folder, three
-          # architectures, both interpreters) is assembled in the windows job and shipped from
+          # architectures, both interpreters) is assembled in the package job and shipped from
           # there; this artifact is the Linux-only pair, in the build tree's own layout.
           path: |
             bindings/matlab/bin/
@@ -1515,7 +1647,7 @@ jobs:
           retention-days: 30
           if-no-files-found: error
 
-      # ---- the Godot extension, and what the Windows job packs -----------------------------------
+      # ---- the Godot extension, and what the package job packs -----------------------------------
       # Same shape as the android job's contribution: this job is the only place a Linux GDExtension
       # can be built, so it builds one and hands it over. Two flavours here, unlike Android's one,
       # because a Linux collaborator runs an EDITOR as well as exporting a game.
@@ -1598,7 +1730,7 @@ jobs:
           EOF
           cat dist-linux/DIST.txt
 
-          # What the Windows job packs into the two bindings, plus the whole dist tree so that job
+          # What the package job packs into the two bindings, plus the whole dist tree so that job
           # can zip it as a release asset without rebuilding anything. A FIXED artifact name: the
           # versioned one below is the one a human downloads.
           #
@@ -1616,8 +1748,8 @@ jobs:
           ls -l pack-linux/godot pack-linux/unity
 
       # ---- Python wheel (nanobind) --------------------------------------------------------------
-      # Same argument as the Windows job: the wheel carries the engine library, and this is the job
-      # that builds a Linux one. It rides into pack-linux/ as well, so the Windows job can attach it
+      # Same argument as the windows job: the wheel carries the engine library, and this is the job
+      # that builds a Linux one. It rides into pack-linux/ as well, so the package job can attach it
       # to the one release without rebuilding anything.
       - uses: astral-sh/setup-uv@v10.1.0
         with:
@@ -1627,7 +1759,7 @@ jobs:
         shell: bash
         run: |
           uv python install 3.12
-          # Straight into pack-linux/, the fixed-name tree the Windows job already downloads, so
+          # Straight into pack-linux/, the fixed-name tree the package job already downloads, so
           # the release step there attaches this wheel without a second handoff.
           (cd bindings/python && uv build --wheel --python 3.12 --out-dir "$GITHUB_WORKSPACE/pack-linux/python")
           whl=$(ls "$GITHUB_WORKSPACE"/pack-linux/python/*.whl)
@@ -1670,7 +1802,7 @@ jobs:
           retention-days: 30
           if-no-files-found: error
 
-      - name: Upload artifact (packing input for the windows job)
+      - name: Upload artifact (packing input for the package job)
         uses: actions/upload-artifact@v7
         with:
           name: linux-pack-input
@@ -1930,7 +2062,7 @@ jobs:
                 error("bwa:ci", "the MATLAB binding reported %d failing check groups", rc);
             end
 
-      # ---- the Godot extension, and what the Windows job packs -----------------------------------
+      # ---- the Godot extension, and what the package job packs -----------------------------------
       # UNVERIFIED LOCALLY, like the rest of this job. Every file name below comes from godot-cpp's
       # own CMake: it sets OUTPUT_NAME to its GODOTCPP_SUFFIX property, whose arch component is the
       # literal "universal" when CMAKE_OSX_ARCHITECTURES holds both, and it never sets the FRAMEWORK
@@ -2012,12 +2144,12 @@ jobs:
           EOF
           cat dist-macos/DIST.txt
 
-          # What the Windows job packs into the two bindings, plus the whole dist tree so that job
+          # What the package job packs into the two bindings, plus the whole dist tree so that job
           # can zip it as a release asset. Same split as android and linux: the packaged copies are
           # stripped, the standalone artifact's are not.
           mkdir -p pack-macos/godot pack-macos/unity pack-macos/matlab
           cp -r dist-macos pack-macos/dist
-          # BOTH MEX files and ONE engine library, for the cross-platform toolbox the windows job
+          # BOTH MEX files and ONE engine library, for the cross-platform toolbox the package job
           # assembles. arm64 MEX files, universal dylib - see the MATLAB and Octave steps above.
           cp bindings/matlab/bin/matlab/macos-universal/bwa_mex.mexmaca64 pack-macos/matlab/
           cp bindings/matlab/bin/octave/macos-universal/bwa_mex.mex       pack-macos/matlab/
@@ -2105,7 +2237,7 @@ jobs:
           retention-days: 1      # an intra-run handoff, not a download
           if-no-files-found: error
 
-      - name: Upload artifact (packing input for the windows job)
+      - name: Upload artifact (packing input for the package job)
         uses: actions/upload-artifact@v7
         with:
           name: macos-pack-input
@@ -2125,7 +2257,7 @@ jobs:
   # deliberately absent - a Windows wheel already names one ABI and one architecture, so the
   # windows job's own wheel IS the release's and there is nothing for a container to add.
   #
-  # The release step in the windows job therefore attaches the Windows wheel from that job and
+  # The release step in the package job therefore attaches the Windows wheel from that job and
   # these two from here. The per-runner Linux and macOS wheels stay as artifacts and stop being
   # release assets.
   #
@@ -2294,7 +2426,7 @@ jobs:
           echo "sdk [$a] wheel [$b]"
           test -n "$a" && test "$a" = "$b"
 
-      # A FIXED artifact name, like the other jobs' pack inputs: the windows job downloads these
+      # A FIXED artifact name, like the other jobs' pack inputs: the package job downloads these
       # two by name for the release. No version in the name, because a wheel's filename already
       # carries the only version a wheel has (the ABI version from bw_audio.h), and 30 days
       # because these are also the wheels a human wants off a branch build.

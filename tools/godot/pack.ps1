@@ -28,13 +28,17 @@
 # macos jobs built. Android additionally builds HERE when an NDK is on the machine, because that is
 # the one cross-build a Windows developer commonly has a toolchain for.
 #
+# -WindowsFrom takes the local pair PREBUILT too, which is what CI's packaging job passes: it packs
+# on a runner that compiles nothing, so the two flavours arrive from the job that built and tested
+# the engine they link. A developer packing locally leaves it off and the two build here as before.
+#
 # Missing any of them FAILS the pack. The manifest promises every file, and an addon that ships the
 # promise without the file fails at load on that platform - on a headset, on a collaborator's Mac,
 # which is the latest possible place to find out.
 #
 #   powershell -File tools/godot/pack.ps1 [-Version 0.3.0] [-OutDir dist/godot]
-#                                         [-AndroidFrom <dir>] [-LinuxFrom <dir>] [-MacFrom <dir>]
-#                                         [-EngineSdk <dir>]
+#                                         [-WindowsFrom <dir>] [-AndroidFrom <dir>]
+#                                         [-LinuxFrom <dir>] [-MacFrom <dir>] [-EngineSdk <dir>]
 #
 # Each -*From directory is FLAT: the script reads the manifest to learn which files that platform
 # needs and where inside bin/ they belong, and takes them out of the directory by name.
@@ -44,6 +48,8 @@
 param(
     [string] $Version,                 # optional: stamp this version (e.g. from a v0.3.0 tag)
     [string] $OutDir,                  # default: <repo>/dist/godot
+    [string] $WindowsFrom,             # directory holding the PREBUILT windows x64 pair + the engine
+                                       # dll (CI's packaging job hands this over); default: build here
     [string] $AndroidFrom,             # directory holding the PREBUILT Android arm64 pair (CI hands
                                        # this over from the android job); default: build it here
     [string] $LinuxFrom,               # directory holding the PREBUILT linux x86_64 libraries
@@ -123,7 +129,9 @@ function Copy-PrebuiltPlatform([string] $Platform, [string] $From, [string] $Swi
 }
 
 # ---- build both library flavours ------------------------------------------------------------
-if (-not $SkipBuild) {
+# Skipped when the pair arrives prebuilt: -WindowsFrom is the same handoff the other three
+# platforms have always used, and CI's packaging job passes it with -SkipBuild.
+if (-not $SkipBuild -and -not $WindowsFrom) {
     foreach ($target in @('editor', 'template_release')) {
         $tree = Join-Path $repo "build-godot-$target"
         Write-Host "==> configuring $target"
@@ -149,6 +157,10 @@ if (-not $SkipBuild) {
 # engine library it imports), so the staging below needs no special case for any of them.
 New-Item -ItemType Directory -Force -Path $addonBin | Out-Null
 $androidPair = Get-PlatformFiles 'android'
+
+# Windows, when it did not build here. The files are named by the manifest like every other
+# platform's, so this needs no special case either.
+if ($WindowsFrom) { Copy-PrebuiltPlatform 'windows' $WindowsFrom '-WindowsFrom' }
 
 if ($AndroidFrom) {
     Copy-PrebuiltPlatform 'android' $AndroidFrom '-AndroidFrom'
@@ -221,7 +233,7 @@ if ($MacFrom)   { Copy-PrebuiltPlatform 'macos' $MacFrom   '-MacFrom' }
 # do about it. Shipping an addon whose manifest lists a file it does not carry is a load failure on
 # that platform and nowhere else, which is the worst shape this bug can take.
 $hints = @{
-    windows = "build both flavours here (drop -SkipBuild)"
+    windows = "build both flavours here (drop -SkipBuild), or pass -WindowsFrom <dir> - CI passes the windows job's artifact (windows-pack-input/godot)"
     android = "build it with an NDK on this machine (docs/build.md, 'Android'), or pass -AndroidFrom <dir> - CI passes the android job's artifact"
     linux   = "no Linux toolchain here: pass -LinuxFrom <dir> - CI passes the linux job's artifact (linux-pack-input/godot)"
     macos   = "no macOS toolchain here: pass -MacFrom <dir> - CI passes the macos job's artifact (macos-pack-input/godot)"
