@@ -4,6 +4,8 @@ All notable changes to `com.brainworks.bw_audio`.
 
 ## [Unreleased]
 
+Synchronized version numbers.
+
 ## [0.7.0]
 
 ### Added: `Engine.HostTimeNs`, a direct read of the engine's host clock (ABI 0.15.0)
