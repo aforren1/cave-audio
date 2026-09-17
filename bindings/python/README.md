@@ -31,14 +31,26 @@ From a wheel:
 uv pip install bw_audio-0.15.0-cp312-abi3-win_amd64.whl
 ```
 
-Releases carry one wheel per platform, and each one is built for more than the machine that built
-it:
+Wheels cover **Python 3.10 and later** on all three desktops. A release carries nine of them: three
+per platform, named by the Python they serve.
+
+| Python | Tag |
+| --- | --- |
+| 3.10 | `cp310-cp310-<platform>` |
+| 3.11 | `cp311-cp311-<platform>` |
+| 3.12 and every later version | `cp312-abi3-<platform>` |
+
+The 3.12 wheel is built on the stable ABI, so one file serves 3.12, 3.13, 3.14 and what comes next.
+3.10 and 3.11 predate that limited API and each needs its own file. Pick the file that matches your
+interpreter and your platform.
+
+Each platform tag is built for more than the machine that built it:
 
 | Platform | Tag | Runs on |
 | --- | --- | --- |
-| Windows | `cp312-abi3-win_amd64` | Windows x64 |
-| Linux | `cp312-abi3-manylinux_2_28_x86_64` | glibc 2.28 or newer: RHEL 8, Debian 10, Ubuntu 18.10 and later |
-| macOS | `cp312-abi3-macosx_10_13_universal2` | Intel and Apple silicon, one file |
+| Windows | `win_amd64` | Windows x64 |
+| Linux | `manylinux_2_28_x86_64` | glibc 2.28 or newer: RHEL 8, Debian 10, Ubuntu 18.10 and later |
+| macOS | `macosx_10_13_universal2` | Intel and Apple silicon, one file |
 
 The wheel contains the engine library, so there is nothing to install beside it. Steam Audio is
 linked statically into the engine, so there is no second library either. The Linux filename can
@@ -50,9 +62,10 @@ the library named when it is not. Both come with any Linux desktop that plays au
 arrives with `pipewire-jack`).
 
 CI also builds a wheel on each runner with plain `uv build --wheel`, one per job. Those are the
-**fast gate**, not the release: they are tagged for the runner image's own glibc and architecture.
-The wheels a release ships are built with cibuildwheel, in a manylinux container on Linux and for
-both architectures at once on macOS. See [docs/build.md](../../docs/build.md#continuous-integration).
+**fast gate**, not the release: they are tagged for the runner image's own glibc and architecture,
+and for the one interpreter the step pins. The wheels a release ships are built with cibuildwheel,
+once per Python, in a manylinux container on Linux and for both architectures at once on macOS.
+See [docs/build.md](../../docs/build.md#continuous-integration).
 
 From source, in a checkout of this repository:
 
@@ -306,7 +319,9 @@ Two version streams, and they move independently.
 
 **Windows.** Windows does not search a `.pyd`'s own directory for its dependent DLLs, so
 `__init__.py` calls `os.add_dll_directory` on the package directory before importing the extension.
-Nothing for you to do, but do not move `bw_audio.dll` out of the package.
+Nothing for you to do, but do not move `bw_audio.dll` out of the package. The release wheels are
+not repaired for the same reason: a repair tool renames the libraries it vendors, and this package
+needs the engine to keep its own name beside the extension.
 
 **Linux and macOS.** The extension carries an RPATH of `$ORIGIN` or `@loader_path`, so it finds the
 engine library beside it. The release wheels keep it: every library the wheel does not already
@@ -314,8 +329,12 @@ carry is a system one, so the repair step (auditwheel or delocate) bundles nothi
 rewrites that path.
 
 **Stable ABI.** Built with Python 3.12 or later, the wheel is tagged `cp312-abi3` and runs on 3.12
-and every later Python, one wheel per platform. Built with an older Python, it falls back to a
-version-specific build and the configure step says so.
+and every later Python, one file per platform. Built with 3.10 or 3.11, it is version-specific and
+the configure step says so. That is not a fallback to apologize for: it is why a release ships
+three wheels per platform instead of one.
+
+**The floor is Python 3.10.** The pinned nanobind declares `Requires-Python >=3.10`, so a source
+build on 3.9 cannot get its build dependency, and no wheel is built for it.
 
 ## Testing
 

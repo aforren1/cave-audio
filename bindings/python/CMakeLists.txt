@@ -17,7 +17,10 @@
 
 # Interpreter first: the stable-ABI decision below needs its version, and the component set differs
 # either side of it.
-find_package(Python 3.9 COMPONENTS Interpreter REQUIRED)
+# 3.10 is the floor: the pinned nanobind (pyproject.toml, build-system.requires) declares
+# `Requires-Python: >=3.10`, so an older interpreter cannot get as far as this file in a wheel
+# build and would fail at find_package(nanobind) in a repo-root configure.
+find_package(Python 3.10 COMPONENTS Interpreter REQUIRED)
 
 if(Python_VERSION VERSION_GREATER_EQUAL 3.12)
   # Development.SABIModule is what links against python3.dll / libpython3.so rather than a
@@ -27,11 +30,14 @@ if(Python_VERSION VERSION_GREATER_EQUAL 3.12)
   set(BWA_PY_STABLE_ABI STABLE_ABI)
   message(STATUS "bw_audio: Python binding on the STABLE ABI (abi3, cp312+) with Python ${Python_VERSION}")
 else()
-  find_package(Python 3.9 COMPONENTS Interpreter Development.Module REQUIRED)
+  # 3.10 and 3.11 take this path, and a release builds a wheel for each of them: the limited API
+  # nanobind's STABLE_ABI targets does not exist before 3.12, so there is no one file that covers
+  # them. This is not a fallback to apologize for, it is the other half of the shipped matrix.
+  find_package(Python 3.10 COMPONENTS Interpreter Development.Module REQUIRED)
   set(BWA_PY_STABLE_ABI "")
   message(STATUS "bw_audio: Python binding is VERSION-SPECIFIC - Python ${Python_VERSION} predates "
                  "the 3.12 limited API nanobind's STABLE_ABI targets. The wheel will only run on "
-                 "this Python. Build with 3.12 or later for one abi3 wheel per platform.")
+                 "this Python. Build with 3.12 or later for the abi3 wheel that covers the rest.")
 endif()
 
 # nanobind ships its CMake config inside the package, so the interpreter that will import the

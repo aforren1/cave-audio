@@ -3,6 +3,9 @@
 # it generates the extension's whole binding layer, so a floating version would change the built
 # artifact without a commit. Bump it deliberately. scikit-build-core is a build driver and takes a
 # floor instead.
+#
+# nanobind 3.0.1 declares `Requires-Python: >=3.10` itself, so this pin IS the floor below:
+# `requires-python` cannot be lower than what the build backend can install.
 requires = ["scikit-build-core>=0.10", "nanobind==3.0.1"]
 build-backend = "scikit_build_core.build"
 
@@ -11,7 +14,9 @@ name = "bw_audio"
 dynamic = ["version"]
 description = "Python binding for the bw_audio spatial audio engine (26-speaker CAVE array, binaural headphone render)"
 readme = "README.md"
-requires-python = ">=3.9"
+# 3.10 is the floor twice over: the pinned nanobind needs it, and it is the oldest Python a
+# release wheel is built for. A source build on 3.9 is not supported.
+requires-python = ">=3.10"
 license = "GPL-3.0-only"
 authors = [{ name = "Brainworks" }]
 keywords = ["spatial audio", "ambisonics", "binaural", "psychophysics", "psychopy", "CAVE"]
@@ -82,16 +87,16 @@ result = "{major}.{minor}.{patch}"
 testpaths = ["tests"]
 
 # ---------------------------------------------------------------------------------------------
-# cibuildwheel: the wheels a RELEASE ships for Linux and macOS.
+# cibuildwheel: the wheels a RELEASE ships, on all three desktops.
 #
 # WHY IT EXISTS BESIDE THE PLAIN BUILD. `uv build --wheel` on a runner tags the wheel for THAT
-# machine: the runner image's glibc on Linux, the runner's own architecture on macOS. Neither is
-# what a release should hand a stranger. cibuildwheel builds the Linux wheel inside a manylinux
-# container and the macOS wheel for both Apple architectures at once, so one file per platform
-# installs anywhere. The three per-runner `uv build` steps stay exactly as they are: they are the
-# FAST GATE, one per job, proving the binding still builds and tests on each desktop before this
-# slower job runs at all. Windows is not here - there is nothing to gain, since a Windows wheel
-# already names one ABI and one architecture and the windows job's wheel IS the release's.
+# machine: the runner image's glibc on Linux, the runner's own architecture on macOS, and on every
+# platform the one interpreter the step happened to pin. None of that is what a release should hand
+# a stranger. cibuildwheel builds each Python in turn, the Linux wheels inside a manylinux
+# container and the macOS wheels for both Apple architectures at once, so the set installs
+# anywhere. The three per-runner `uv build` steps stay exactly as they are: they are the FAST GATE,
+# one per job, proving the binding still builds and tests on each desktop before this slower job
+# runs at all.
 #
 # Run it the way CI does, from the REPOSITORY ROOT:
 #     uvx cibuildwheel --platform linux bindings/python
@@ -100,10 +105,15 @@ testpaths = ["tests"]
 # copies the working directory into the container, so the working directory is the repository.
 # ---------------------------------------------------------------------------------------------
 [tool.cibuildwheel]
-# ONE wheel per platform. nanobind's STABLE_ABI targets the 3.12 limited API, the overrides above
-# claim cp312-abi3 only on a build that used it, and a cp312 build is the one that does - so
-# building any later interpreter would produce the same file under a second name.
-build = "cp312-*"
+# THREE wheels per platform, and only three. nanobind's STABLE_ABI targets the 3.12 limited API,
+# so the cp312 build is tagged cp312-abi3 and runs on 3.12 and EVERY later Python: adding cp313 or
+# cp314 here would build the same file again under a second name. 3.10 and 3.11 predate that
+# limited API, so the overrides above leave them version-specific and each needs its own wheel.
+# 3.10 is the floor - the pinned nanobind cannot install below it.
+#
+# The selector also settles two exclusions without a skip rule: `cp*` never matches PyPy, and the
+# per-platform `archs` below never offer a 32-bit target.
+build = ["cp310-*", "cp311-*", "cp312-*"]
 # musl has no phonon here (the before-all builds one glibc phonon, in the manylinux image) and no
 # audience: PsychoPy on Alpine is not a thing anyone is asking for.
 skip = "*musllinux*"
@@ -134,9 +144,36 @@ before-all = "bash {project}/tools/phonon/cibw-before-all-linux.sh"
 # nothing at all and never rewrites the extension's $ORIGIN runpath.
 repair-wheel-command = "auditwheel repair --exclude libasound.so.2 --exclude libjack.so.0 -w {dest_dir} {wheel}"
 
+[tool.cibuildwheel.windows]
+# x64 only. The engine is an x64 build everywhere else in this repository (CI configures
+# `-A x64`), and cibuildwheel's `auto` would otherwise offer x86 as well.
+#
+# No before-all: Windows never had one, and the engine arrives prebuilt from the engine SDK the
+# windows job installed. Nothing here builds phonon.
+archs = ["AMD64"]
+# NO REPAIR. cibuildwheel runs `delvewheel repair` on Windows by default, and this wheel must not
+# be repaired for two independent reasons.
+#
+# It FAILS outright: delvewheel walks the extension's imports, reaches bw_audio.dll and raises
+# `FileNotFoundError: Unable to find library: bw_audio.dll` - the engine is already inside the
+# package, beside the .pyd, which is not a directory delvewheel searches.
+#
+# And a repair that did succeed would be worse than none. delvewheel MANGLES the name of every
+# library it vendors (bw_audio.dll becomes bw_audio-<hash>.dll in a bw_audio.libs/ directory) and
+# patches the load path into the extension. That breaks the one rule this package's Windows half
+# rests on: the engine sits beside the extension and __init__.py reaches it with
+# os.add_dll_directory. It would also break the CI assertion that the engine inside the wheel is
+# the engine SDK's byte for byte.
+#
+# There is nothing to graft anyway. phonon is linked statically into the engine, the ASIO SDK too,
+# and the MSVC runtime is a system dependency delvewheel excludes by default - which is the same
+# answer auditwheel and delocate give on the other two platforms.
+repair-wheel-command = ""
+
 [tool.cibuildwheel.macos]
-# ONE wheel for both Apple architectures. The engine library inside it is universal already
-# whenever CI builds it, so this only says the extension must be too.
+# Every wheel covers both Apple architectures. The engine library inside it is universal already
+# whenever CI builds it, so this only says the extension must be too. cibuildwheel gets the
+# universal2 python.org installer for each interpreter it builds, 3.10 and 3.11 included.
 archs = ["universal2"]
 before-all = "bash {project}/tools/phonon/cibw-before-all-macos.sh"
 # MACOSX_DEPLOYMENT_TARGET matches the only deployment target anything in this tree names:

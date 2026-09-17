@@ -109,11 +109,11 @@ Two integration shapes, and the second needs no Linux backend at all:
 
 **The Python binding exists** ([`bindings/python/`](../bindings/python/), and
 [integration.md](./integration.md) puts it beside Unity and Godot). It is the nanobind extension
-this section used to describe as future work: one wheel per platform, tagged `cp312-abi3`, with the
-engine library inside it, and with `bwa_render_block`'s engine-owned block exposed as a read-only
-numpy view so the offline shape costs no copy. PsychoPy is Python, so it uses that package
-directly. `bindings/python/examples/offline_render.py` and `live_onset.py` are the two shapes above,
-runnable.
+this section used to describe as future work: wheels for Python 3.10 and later on all three
+desktops, with the engine library inside each one, and with `bwa_render_block`'s engine-owned
+block exposed as a read-only numpy view so the offline shape costs no copy. PsychoPy is Python, so
+it uses that package directly. `bindings/python/examples/offline_render.py` and `live_onset.py` are
+the two shapes above, runnable.
 
 **The MATLAB and Octave binding exists too** ([`bindings/matlab/`](../bindings/matlab/)). It is the
 MEX this section used to describe as future work: one gateway dispatching on a subcommand string,

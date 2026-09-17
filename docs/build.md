@@ -98,7 +98,7 @@ Everything beyond the DLL + test suite is opt-in; the default build stays lean.
 | `BWA_BUILD_CALIBVIEW` | OFF | `bwa_calib_view` (fetches imgui/test-engine/implot/implot3d) |
 | `BWA_BUILD_CALIBRATE` | OFF | `bwa_calibrate` + `bwa_zylia_probe` |
 | `BWA_BUILD_GODOT` | OFF | the Godot GDExtension (fetches godot-cpp - a multi-minute first build). `GODOTCPP_TARGET` picks the library flavor (`editor` default); `tools/godot/pack.ps1` builds both shippable ones. See `bindings/godot/README.md` |
-| `BWA_BUILD_PYTHON` | OFF | the Python binding (`_bwa`, nanobind). Needs Python 3.9 or later with `nanobind` importable by the interpreter CMake finds; 3.12 or later gets the stable ABI. Adds three ctests (`python_bindings` plus the two examples). `uv build --wheel` in `bindings/python` takes this same path. See `bindings/python/README.md` |
+| `BWA_BUILD_PYTHON` | OFF | the Python binding (`_bwa`, nanobind). Needs Python 3.10 or later with `nanobind` importable by the interpreter CMake finds; 3.12 or later gets the stable ABI. Adds three ctests (`python_bindings` plus the two examples). `uv build --wheel` in `bindings/python` takes this same path. See `bindings/python/README.md` |
 | `BWA_BUILD_MATLAB` | OFF | the MATLAB and Octave binding (`bwa_mex`, a classic C MEX gateway). Builds whichever of the two toolchains CMake finds, and both when both are there: MATLAB through `matlab_add_mex` (needs a configured C compiler, `mex -setup C`), Octave through `mkoctfile`. Adds up to four ctests per interpreter found. See `bindings/matlab/README.md` |
 | `BWA_ENGINE_SDK` | empty | build ONLY the bindings, against a prebuilt engine installed at this prefix. Nothing under `src/` compiles, and no test or tool is registered. See [The engine SDK](#the-engine-sdk) |
 | `BWA_ASAN` | OFF | builds `test_sound` with AddressSanitizer (MSVC; needs tests ON) |
@@ -379,9 +379,9 @@ That job builds, tests, stamps the version, and cuts a **GitHub Release**. The R
 distribution: no registry, no token. The asset breakdown and the GPLv3 corresponding source that
 rides along are in [Continuous integration](#continuous-integration) below.
 
-The Python wheel is the one asset whose filename does **not** carry the tag. Its version is the ABI
-version read out of `include/bw_audio.h` at build time, which is a third thing a wheel could claim
-and must not: a wheel that said `0.5.0` while the library inside it answered `0.14.0` to
+The Python wheels are the assets whose filenames do **not** carry the tag. A wheel's version is the
+ABI version read out of `include/bw_audio.h` at build time, which is a third thing a wheel could
+claim and must not: a wheel that said `0.5.0` while the library inside it answered `0.14.0` to
 `bwa_get_version` would be unfixable from the outside. See `bindings/python/README.md`.
 
 ### Dev versions
@@ -477,15 +477,16 @@ older UPM parsers reject. When git cannot answer (no tag, shallow clone, no git 
   the Android, Linux and macOS engine artifacts their own jobs upload. `<ver>` is the packed version (the tag on a release,
   a git-describe dev version otherwise); the `r<N>` run number keeps re-runs of one commit from
   colliding on a name. Downloading one no longer drags in the other.
-- **The Python wheel is built and tested on all three desktops.** The `windows`, `linux` and
-  `macos` jobs each run `uv build --wheel` in `bindings/python`, assert the filename is tagged
-  `cp312-abi3` (a version-specific tag means nanobind's stable ABI did not engage, which would
-  mean one wheel per Python instead of one per platform), install it into a fresh venv, and run the
-  pytest suite and both examples **from the installed wheel** rather than from the source tree.
-  Each uploads `bw_audio-python-<platform>-<ver>-r<N>`. The wheel carries the engine library inside
-  the package, so it is that job's own build. These three are the **fast gate**: they prove the
-  binding still builds and tests where the engine was just built, and they tag for the machine
-  that built them. The Android job builds no wheel: there is no Python there.
+- **A Python wheel is built and tested on all three desktops, as the fast gate.** The `windows`,
+  `linux` and `macos` jobs each run `uv build --wheel --python 3.12` in `bindings/python`, assert
+  the filename is tagged `cp312-abi3` (a version-specific tag means nanobind's stable ABI did not
+  engage, which would mean a wheel per Python on 3.12 and later too), install it into a fresh venv,
+  and run the pytest suite and both examples **from the installed wheel** rather than from the
+  source tree. Each uploads `bw_audio-python-<platform>-<ver>-r<N>`. The wheel carries the engine
+  library inside the package, so it is that job's own build. These three prove the binding still
+  builds and tests where the engine was just built, and they tag for the machine that built them,
+  which is why **none of them is a release asset**: the release wheels all come from the `wheels`
+  job below. The Android job builds no wheel: there is no Python there.
   `bindings/python/README.md` is the manual.
 - **Both MEX files are built inside each desktop job, and the six become one toolbox.** A MEX is
   per platform and per interpreter, so the `windows`, `linux` and `macos` jobs each set up MATLAB with
@@ -521,18 +522,36 @@ older UPM parsers reject. When git cannot answer (no tag, shallow clone, no git 
   rather than from a run, and the macOS Octave steps are unverified for the same reason the rest of
   that job is: nobody here has a Mac. The Windows and Linux Octave halves are verified locally.
   `bindings/matlab/README.md` is the manual.
-- **The `wheels` job builds the two wheels a release ships.** A wheel `uv build` produces on a
-  runner is tagged for that runner: the image's glibc on Linux, the runner's own architecture on
-  macOS. Neither is what a release hands a stranger. So a separate job runs
-  [cibuildwheel](https://cibuildwheel.pypa.io/) on `ubuntu-latest` and `macos-latest`, and the
-  release takes the Windows wheel from the `windows` job's pack input and these two from here. Windows is not
-  in this job: a Windows wheel already names one ABI and one architecture, so there is nothing a
-  container could add.
-  - **Neither wheel builds an engine.** The job downloads the engine SDK the `linux` and `macos`
-    jobs installed and hands cibuildwheel the path, so it compiles the nanobind extension and
-    nothing else, and builds no phonon at all. The cost is that the job now `needs: [linux,
-    macos]` instead of running beside them; what it gives back is a phonon build and an engine
-    build per platform.
+- **The `wheels` job builds the nine wheels a release ships.** A wheel `uv build` produces on a
+  runner is tagged for that runner and for one interpreter: the image's glibc on Linux, the
+  runner's own architecture on macOS, and cp312 everywhere because that is what the step pins. None
+  of that is what a release hands a stranger. So a separate job runs
+  [cibuildwheel](https://cibuildwheel.pypa.io/) on `windows-latest`, `ubuntu-latest` and
+  `macos-latest`, and every release wheel comes from there.
+  - **Three wheels per platform: `cp310`, `cp311` and `cp312-abi3`.** nanobind's `STABLE_ABI`
+    targets the 3.12 limited API, so the cp312 build is tagged `abi3` and one file covers Python
+    3.12 and every later version. 3.10 and 3.11 predate that limited API, so each needs a
+    version-specific wheel. 3.10 is the floor, set by the pinned nanobind, which declares
+    `Requires-Python >=3.10`. Building cp313 or cp314 would produce the cp312 file again under
+    another name, so `pyproject.toml`'s `build` selector names exactly those three.
+  - **Windows is in this job.** It used to be left out because a Windows wheel already names one
+    ABI and one architecture. That was true and beside the point: the argument was about the
+    platform tag, and what one wheel could not cover was the interpreter. Nothing containerizes
+    there; cibuildwheel installs each CPython with nuget and builds in place.
+  - **cibuildwheel's Windows repair is turned off.** `delvewheel repair` is the default, and it
+    fails on this wheel (`Unable to find library: bw_audio.dll`, because the engine sits inside the
+    package beside the extension rather than on the search path). A repair that worked would be
+    worse: delvewheel renames every library it vendors, which breaks both the byte-identical
+    engine check and the `os.add_dll_directory` rule the package's Windows half relies on. There is
+    nothing to graft anyway, which is the same answer auditwheel and delocate give.
+  - **No wheel builds an engine.** The job downloads the engine SDK each desktop job installed and
+    hands cibuildwheel the path, so it compiles the nanobind extension and nothing else, and builds
+    no phonon at all. The cost is that the job `needs: [windows, linux, macos]` instead of running
+    beside them; what it gives back is a phonon build and an engine build per platform.
+  - **The SDK path is passed with forward slashes on Windows.** cibuildwheel parses
+    `CIBW_CONFIG_SETTINGS` with `shlex.split` in POSIX mode, where a backslash is an escape
+    character, so `D:\a\cave-audio\engine-sdk` reaches scikit-build-core as
+    `D:acave-audioengine-sdk` with no error anywhere. CMake takes forward slashes on Windows.
   - **Linux is `manylinux_2_28`** (AlmaLinux 8, glibc 2.28: RHEL 8, Debian 10, Ubuntu 18.10 and
     later). The floor is set by the C++ toolchain, not by the engine: a static phonon is a C++
     link, and `manylinux_2_28` carries a `gcc-toolset` new enough to compile it where
@@ -617,7 +636,7 @@ older UPM parsers reject. When git cannot answer (no tag, shallow clone, no git 
   has to see them all. Splitting it out is what lets the longest job in the matrix start at once
   instead of behind the cross-builds, and it keeps the per-platform engine artifacts available
   when packing fails, because the job that built each one uploads it.
-- **A release carries TWELVE assets**, because workflow artifacts expire (30 days) and a
+- **A release carries EIGHTEEN assets**, because workflow artifacts expire (30 days) and a
   release doesn't:
   - `com.brainworks.bw_audio-<ver>.tgz`: the Unity package.
   - `bw_audio-godot-<ver>.zip`: the installable Godot addon.
@@ -649,12 +668,14 @@ older UPM parsers reject. When git cannot answer (no tag, shallow clone, no git 
   - `bw_audio-steam-audio-src-<tag>.zip`: the Steam Audio source statically linked into the
     same DLL, at its pinned commit, with the in-repo patch and a README naming the commit.
     Same reason as the asset above, applied to the other statically linked dependency.
-  - `bw_audio-<abi>-cp312-abi3-<platform>.whl`, three of them: Windows x64 from the `windows`
-    job, `manylinux_2_28_x86_64` and macOS `universal2` from the `wheels` job. The Python
-    binding, with the engine library inside the wheel. Attached as wheels rather than zipped,
-    because `pip` and `uv` install a `.whl` straight from a URL. `<abi>` is the ABI version from
-    `bw_audio.h`, not the tag; `abi3` means one wheel serves Python 3.12 and every later version.
-    The release step asserts one wheel per platform and the tag each one carries.
+  - `bw_audio-<abi>-<python>-<platform>.whl`, **nine** of them, all from the `wheels` job: three
+    Pythons (`cp310-cp310`, `cp311-cp311`, `cp312-abi3`) on each of `win_amd64`,
+    `manylinux_2_28_x86_64` and macOS `universal2`. The Python binding, with the engine library
+    inside each wheel. Attached as wheels rather than zipped, because `pip` and `uv` install a
+    `.whl` straight from a URL. `<abi>` is the ABI version from `bw_audio.h`, not the tag. Together
+    they cover Python 3.10 and later: `abi3` means the cp312 wheel serves 3.12 and every later
+    version, and 3.10 and 3.11 get their own files. The release step asserts three wheels per
+    platform and the tag each one carries.
 
   All ship under GPLv3 (the `.zip` carries `LICENSE`, `THIRD_PARTY-NOTICES.md`, and
   `DIST.txt`, which names the commit and links the complete source; the `.tgz` carries

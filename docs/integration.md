@@ -732,9 +732,10 @@ call. That is the one place this binding hands out memory it does not own, and i
 offline render cost no copy. Pass `copy=True` when you keep the block.
 
 The wheel carries the engine library inside the package, like the Unity package and the Godot
-addon carry theirs. One wheel per platform, tagged `cp312-abi3`, runs on Python 3.12 and every
-later version. A release builds the Linux one for `manylinux_2_28` and the macOS one as
-`universal2`, so each file serves more than the machine that built it.
+addon carry theirs. A release ships three wheels per platform, covering Python 3.10 and later: the
+`cp312-abi3` one runs on 3.12 and every later version, and 3.10 and 3.11 get a wheel each. The
+Linux wheels are built for `manylinux_2_28` and the macOS ones as `universal2`, so each file serves
+more than the machine that built it.
 
 ## MATLAB and Octave
 

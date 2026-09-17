@@ -360,7 +360,8 @@ The `linux` and `macos` jobs SHIP the same way since 2026-09-15: each builds its
 GDExtension (both flavours) and uploads a standalone engine artifact (`bw_audio-linux-x64-<ver>`,
 `bw_audio-macos-universal-<ver>`, the latter a UNIVERSAL x86_64+arm64 build) plus a fixed-name
 `linux-pack-input` / `macos-pack-input` the `package` job downloads. So both bindings now carry FOUR
-platforms' engine libraries and a tagged release has EIGHT assets.
+platforms' engine libraries and a tagged release has EIGHTEEN assets (nine of them Python wheels,
+see below).
 
 BUILDING AND PACKING ARE TWO JOBS since 2026-09-16. `windows` builds and tests the Windows engine
 and every binding that links it, waits for NOTHING, and ends by uploading its own fixed-name
@@ -431,7 +432,7 @@ was not staged, and neither half is registered when its toolchain was not found 
 ctest cannot run a MATLAB test with no MATLAB. In CI BOTH MEX files are built INSIDE each desktop
 job (so each links that job's own engine, backends intact) and the `package` job assembles all six
 into ONE toolbox folder, bin/{win64,glnxa64,maca64} each holding that platform's pair plus the ONE
-engine library both load, shipped as a twelfth release asset. Every desktop job installs its own
+engine library both load, shipped as its own release asset. Every desktop job installs its own
 Octave (apt on Linux, chocolatey's `octave.portable` on Windows, homebrew on macOS), configures
 `BWA_BUILD_MATLAB=ON` before the engine build, and runs the four `octave_*` tests through ctest:
 that is the 42 the linux and macos jobs report, and on Windows 49 registered with 46 run (the three
@@ -443,8 +444,14 @@ IS verified locally (Octave 10.1.0, the four tests green); the macOS one is not.
 builds a `cp312-abi3` WHEEL on each of the three desktops, installs it into a fresh venv, and runs
 that same pytest suite from the INSTALLED wheel rather than the source tree - shipped as
 `bw_audio-python-<platform>-<ver>`. Those three are the FAST GATE and are tagged for the runner
-that built them; a separate `wheels` job builds the two a RELEASE ships with cibuildwheel
-(`manylinux_2_28` in a container, macOS `universal2`), which is why the phonon recipe is now ONE
+that built them AND for the one interpreter the step pins, so none of them is a release asset; a
+separate `wheels` job builds the NINE a RELEASE ships with cibuildwheel, on all three desktops
+(`manylinux_2_28` in a container, macOS `universal2`, Windows in place with nuget-installed
+CPythons). Three per platform: `cp310` and `cp311` version-specific, `cp312-abi3` covering 3.12 and
+every later Python, which is nanobind's stable-ABI floor; 3.10 is the language floor, set by the
+pinned nanobind's own `Requires-Python`. cibuildwheel's Windows `delvewheel` repair is turned OFF -
+it fails on this wheel and a working repair would mangle the engine's filename out from under
+`os.add_dll_directory`. The wheels job is also why the phonon recipe is now ONE
 script, `tools/phonon/build-phonon.sh`, that both the composite action and the container's
 before-all call - a composite action runs on the runner, and a wheel's phonon has to come from the
 image that links it. `rt.c` is the concurrency
