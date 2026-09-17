@@ -1,6 +1,6 @@
 # Third-party notices
 
-Notice text accompanying bw_audio binary distributions. `https://github.com/aforren1/cave-audio/blob/bd3af4e584a5/docs/build.md` has the
+Notice text accompanying bw_audio binary distributions. `https://github.com/aforren1/cave-audio/blob/d6a8ed6f80ec/docs/build.md` has the
 full dependency and licensing discussion; this file is what ships next to the
 binaries.
 

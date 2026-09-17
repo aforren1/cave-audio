@@ -3,7 +3,7 @@
 // Pure marshalling layer, no Unity dependency (so it compiles + can be unit-tested standalone; the
 // MonoBehaviour wrappers live in Engine.cs / Emitter.cs). Drop bw_audio.dll in
 // Assets/Plugins/. THREADING: every call must come from ONE thread (Unity's main thread); the
-// per-frame calls are non-blocking. See https://github.com/aforren1/cave-audio/blob/bd3af4e584a5/docs/api.md + https://github.com/aforren1/cave-audio/blob/bd3af4e584a5/docs/concurrency.md.
+// per-frame calls are non-blocking. See https://github.com/aforren1/cave-audio/blob/d6a8ed6f80ec/docs/api.md + https://github.com/aforren1/cave-audio/blob/d6a8ed6f80ec/docs/concurrency.md.
 //
 // Marshalling rules that matter here:
 //   * C `bool` is 1 byte  -> [MarshalAs(UnmanagedType.I1)].
@@ -40,7 +40,7 @@ namespace BwAudio
 
     /// <summary>Mirrors bwa_source_kind: what a source IS, which is what bwa_source_preset fills a
     /// complete BwaSourceDesc for. Nothing in the preset table is measured — a kind differs from
-    /// Default only where a doc already argues the case. See https://github.com/aforren1/cave-audio/blob/bd3af4e584a5/docs/api.md, "What each preset rests on".</summary>
+    /// Default only where a doc already argues the case. See https://github.com/aforren1/cave-audio/blob/d6a8ed6f80ec/docs/api.md, "What each preset rests on".</summary>
     public enum BwaSourceKind : int { Default = 0, Prop = 1, Voice = 2, Ambience = 3, Ui = 4 }
 
     /// <summary>Mirrors bwa_material_type: the engine's built-in acoustic materials, in ABI order
@@ -80,7 +80,7 @@ namespace BwAudio
     /// the OS resample and reporting the degradation (the default for a headphone sink).
     /// TightBuffer asks the backend for the smallest device buffer it can take (ALSA: 2 periods,
     /// AAudio: 1 burst; a no-op on WASAPI), trading dropout margin for latency.
-    /// https://github.com/aforren1/cave-audio/blob/bd3af4e584a5/docs/api.md's "Latency classes" maps PsychPortAudio's 0..4 onto these.</summary>
+    /// https://github.com/aforren1/cave-audio/blob/d6a8ed6f80ec/docs/api.md's "Latency classes" maps PsychPortAudio's 0..4 onto these.</summary>
     [System.Flags]
     public enum BwaSinkFlags : uint { None = 0, Exclusive = 0x1, ExactRate = 0x2, TightBuffer = 0x4 }
 

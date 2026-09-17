@@ -438,7 +438,7 @@ namespace BwAudio
         /// inspector fields, and push the lot in one call. This is also the source RESET the API had no
         /// way to express before — <c>ApplyPreset(BwaSourceKind.Default)</c>.
         /// <para>Nothing in the preset table is measured. A kind differs from Default only where a doc
-        /// already argues the case (https://github.com/aforren1/cave-audio/blob/bd3af4e584a5/docs/api.md, "What each preset rests on"), so treat it as a starting
+        /// already argues the case (https://github.com/aforren1/cave-audio/blob/d6a8ed6f80ec/docs/api.md, "What each preset rests on"), so treat it as a starting
         /// point and edit what you disagree with.</para></summary>
         public void ApplyPreset(BwaSourceKind kind)
         {

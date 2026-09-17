@@ -39,7 +39,7 @@ namespace BwAudio.EditorTools
             // Fill every knob above from one of the engine's own source presets (bwa_source_preset).
             // It writes the FIELDS, undoably, rather than configuring the source behind the inspector's
             // back — the fields stay the source of truth. Nothing in that table is measured: it is a
-            // starting point, not a recommendation (https://github.com/aforren1/cave-audio/blob/bd3af4e584a5/docs/api.md, "What each preset rests on").
+            // starting point, not a recommendation (https://github.com/aforren1/cave-audio/blob/d6a8ed6f80ec/docs/api.md, "What each preset rests on").
             EditorGUILayout.Space();
             using (new EditorGUILayout.HorizontalScope())
             {

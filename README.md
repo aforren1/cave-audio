@@ -89,19 +89,19 @@ The package has a headless PlayMode suite in `test~/`, wired into ctest as `unit
 the real components against the real DLL on the offline sink. Point CMake at an editor to register
 it (`-DBWA_UNITY_EXE="C:/.../Editor/Unity.exe"`); without that the test is skipped, because Unity is
 not a build dependency. See
-[docs/integration.md → Tests](https://github.com/aforren1/cave-audio/blob/bd3af4e584a5/docs/integration.md#tests) for what it covers and why it needs
+[docs/integration.md → Tests](https://github.com/aforren1/cave-audio/blob/d6a8ed6f80ec/docs/integration.md#tests) for what it covers and why it needs
 PlayMode. `test~/` never ships: the pack script stages `Runtime` and `Editor` only, and Unity itself
 ignores any folder whose name ends in `~`.
 
 > **License:** the engine is **GPLv3** (`bw_audio.dll` links the ASIO SDK under its GPLv3 option).
 > Internal use never triggers copyleft: it is a *distribution* condition. But shipping a Unity app
 > containing this DLL to third parties would place that app under GPLv3. See
-> [`docs/build.md`](https://github.com/aforren1/cave-audio/blob/bd3af4e584a5/docs/build.md) for the proprietary-ASIO alternative.
+> [`docs/build.md`](https://github.com/aforren1/cave-audio/blob/d6a8ed6f80ec/docs/build.md) for the proprietary-ASIO alternative.
 
 ## Releasing (maintainers)
 
 The canonical whole-repo release process (version model, steps, dev versions) lives in
-[docs/build.md → Releasing](https://github.com/aforren1/cave-audio/blob/bd3af4e584a5/docs/build.md#releasing). This is the Unity-package view of it.
+[docs/build.md → Releasing](https://github.com/aforren1/cave-audio/blob/d6a8ed6f80ec/docs/build.md#releasing). This is the Unity-package view of it.
 
 **The GitHub Release is the distribution** - there's no registry, no token, and nothing to keep in sync.
 
@@ -124,7 +124,7 @@ A release carries four assets. **Two matter here**: this package
 (`com.brainworks.bw_audio-<ver>.tgz`) and the engine on its own (`bw_audio-win64-<tag>.zip` -
 dll/lib/header/tools, for C/C++ consumers and the CAVE machine). The other two are the Godot addon
 and the ASIO SDK corresponding source. See
-[docs/build.md](https://github.com/aforren1/cave-audio/blob/bd3af4e584a5/docs/build.md#continuous-integration) for the full breakdown.
+[docs/build.md](https://github.com/aforren1/cave-audio/blob/d6a8ed6f80ec/docs/build.md#continuous-integration) for the full breakdown.
 
 Locally:
 

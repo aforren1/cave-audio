@@ -1,7 +1,7 @@
 // Engine.cs — the manager. ONE per scene (singleton). Owns the engine handle, loads assets, and
 // runs the CENTRALIZED per-frame push: all sources, then the listener, then one commit — so every
 // block the audio thread sees is internally consistent (Unity does not order LateUpdate across
-// components, so per-emitter pushes could commit a half-moved frame). See https://github.com/aforren1/cave-audio/blob/bd3af4e584a5/docs/integration.md.
+// components, so per-emitter pushes could commit a half-moved frame). See https://github.com/aforren1/cave-audio/blob/d6a8ed6f80ec/docs/integration.md.
 using System;
 using System.Collections.Generic;
 using System.IO;
