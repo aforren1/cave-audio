@@ -161,8 +161,8 @@ jobs:
       # chocolateyInstall.ps1 extracts octave-9.2.0-w64.7z into
       # <ChocolateyInstall>\lib\octave.portable\tools\ and renames it to `octave`, so mkoctfile.exe
       # and octave-cli.exe land in tools\octave\mingw64\bin. That is the layout
-      # bindings/matlab/CMakeLists.txt already globs as $ENV{OCTAVE_HOME}/mingw64/bin, so pointing
-      # OCTAVE_HOME at it is the whole integration.
+      # bindings/matlab/CMakeLists.txt globs as $ENV{OCTAVE_HOME}/bin, so pointing OCTAVE_HOME at
+      # the mingw64 directory is the whole integration.
       #
       # The version is PINNED: it is the newest octave.portable carries (June 2024) and an unpinned
       # install would let a new package change the compiler under this job overnight. The cost is a
@@ -181,15 +181,26 @@ jobs:
           $mk = Get-ChildItem $lib -Recurse -Filter mkoctfile.exe -ErrorAction SilentlyContinue |
                 Select-Object -First 1
           if (-not $mk) { throw "mkoctfile.exe not found under $lib - did octave.portable change its layout?" }
-          # OCTAVE_HOME is the directory that CONTAINS mingw64\bin, which is the shape
-          # bindings/matlab/CMakeLists.txt globs. Assert that shape rather than assuming it, so a
-          # moved mkoctfile cannot silently produce a hint that points nowhere.
+          # OCTAVE_HOME is OCTAVE'S OWN variable, not a name this repository made up: it is the
+          # install PREFIX, which on Windows is the mingw64 directory (include/, lib/ and
+          # share/ sit under it), and mkoctfile derives every path it passes the compiler
+          # from it. The first run exported the directory ABOVE mingw64, because that was
+          # the shape the CMake glob wanted, and mkoctfile then looked for mex.h under
+          # <that>/include, where nothing is. CMake globs $ENV{OCTAVE_HOME}/bin now, and
+          # this asserts the shape rather than assuming it, so a moved mkoctfile cannot
+          # silently produce a hint that points nowhere.
           $bin = Split-Path $mk.FullName -Parent
           if ($bin -notmatch '[\\/]mingw64[\\/]bin$') { throw "unexpected mkoctfile location: $bin" }
-          $oct = Split-Path (Split-Path $bin -Parent) -Parent
+          $oct = Split-Path $bin -Parent
           # FORWARD slashes: a backslash is an escape character in a CMake glob pattern, not a
           # separator. The CMakeLists normalizes it as well; neither side relies on the other.
-          "OCTAVE_HOME=$($oct -replace '\\','/')" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+          $oct = $oct -replace '\\','/'
+          "OCTAVE_HOME=$oct" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+          # Prove the prefix is right the way the build will use it: with OCTAVE_HOME set,
+          # mkoctfile's own idea of the Octave include directory must hold mex.h.
+          $env:OCTAVE_HOME = $oct
+          $inc = (& $mk.FullName -p OCTINCLUDEDIR).Trim()
+          if (-not (Test-Path (Join-Path $inc 'mex.h'))) { throw "no mex.h under $inc - OCTAVE_HOME=$oct is not the prefix mkoctfile expects" }
           & $mk.FullName --version
           & (Join-Path $bin 'octave-cli.exe') --version | Select-Object -First 1
 

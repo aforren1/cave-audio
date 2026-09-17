@@ -94,14 +94,18 @@ endif()
 # else (Linux, macOS, and a Windows user who did add it) is found by the plain search.
 set(BWA_OCTAVE_HINTS "")
 if(WIN32)
-  # OCTAVE_HOME arrives from the environment, so on Windows it usually carries BACKSLASHES, which a
-  # glob pattern reads as escape characters rather than as separators. CMake 3.29 happens to match
-  # the mixed-separator string anyway; do not lean on that. Normalize, and the hint is then a plain
+  # OCTAVE_HOME is OCTAVE'S variable and keeps Octave's meaning: the install PREFIX, which on
+  # Windows is the mingw64 directory, and the one mkoctfile derives its include and library paths
+  # from. It must NOT be read as "the folder above mingw64": that shape made this glob find
+  # mkoctfile and then made mkoctfile look for mex.h under a directory with no headers, which is
+  # how the first CI run failed. The environment value usually carries BACKSLASHES, which a glob
+  # pattern reads as escape characters rather than as separators. CMake 3.29 happens to match the
+  # mixed-separator string anyway; do not lean on that. Normalize, and the hint is then a plain
   # CMake path like the two literals below. Those two cover the vendor installer's own locations; a
   # Chocolatey octave.portable install (what CI uses) lands under its tools/ directory instead and
   # is reached through OCTAVE_HOME.
   file(TO_CMAKE_PATH "$ENV{OCTAVE_HOME}" BWA_OCTAVE_HOME)
-  file(GLOB BWA_OCTAVE_HINTS "${BWA_OCTAVE_HOME}/mingw64/bin"
+  file(GLOB BWA_OCTAVE_HINTS "${BWA_OCTAVE_HOME}/bin"
                              "C:/Program Files/GNU Octave/Octave-*/mingw64/bin"
                              "C:/Octave/Octave-*/mingw64/bin")
 endif()

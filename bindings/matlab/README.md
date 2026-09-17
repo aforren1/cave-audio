@@ -41,9 +41,12 @@ cmake --build build --config RelWithDebInfo
 The MATLAB half needs MATLAB with a configured C compiler. Check with `mex.getCompilerConfigurations('C','Selected')`
 and run `mex -setup C` once if it is empty. The Octave half needs `mkoctfile`, which comes with
 Octave. On Windows the installer does not put it on `PATH`; CMake looks in
-`C:\Program Files\GNU Octave\Octave-*\mingw64\bin` for you, or set `OCTAVE_HOME` to the folder that
-contains `mingw64\bin`. A Chocolatey `octave.portable` install is somewhere else again
-(`<ChocolateyInstall>\lib\octave.portable\tools\octave`), which is what CI points `OCTAVE_HOME` at.
+`C:\Program Files\GNU Octave\Octave-*\mingw64\bin` for you, or set `OCTAVE_HOME` to the `mingw64`
+folder itself. That is Octave's own variable and its own meaning, the install prefix, and
+`mkoctfile` derives its include path from it: point it one level up and the MEX build stops at
+`mex.h: No such file or directory`. A Chocolatey `octave.portable` install is somewhere else
+again (`<ChocolateyInstall>\lib\octave.portable\tools\octave\mingw64`), which is what CI points
+`OCTAVE_HOME` at.
 
 The build stages each MEX with the engine library beside it, under
 `bindings/matlab/bin/<matlab|octave>/<platform>/`. Nothing there is committed. That layout is the
