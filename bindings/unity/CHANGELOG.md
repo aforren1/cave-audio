@@ -4,6 +4,8 @@ All notable changes to `com.brainworks.bw_audio`.
 
 ## [Unreleased]
 
+## [0.16.0]
+
 Synchronized version numbers.
 
 ## [0.7.0]
