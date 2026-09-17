@@ -675,6 +675,7 @@ jobs:
     needs: [windows, android, linux, macos, wheels]
     permissions:
       contents: write     # the release step attaches the assets and the branch push writes refs
+      actions: write      # deleting this run's handoff artifacts at the end
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
@@ -1187,6 +1188,27 @@ jobs:
           $remote = "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git"
           ./tools/dist/publish-branch.ps1 -Branch unity -Source build/upm/package -Version $v -RemoteUrl $remote
           ./tools/dist/publish-branch.ps1 -Branch godot -Source build/godot/addon -Version $v -RemoteUrl $remote
+
+      # ---- prune the handoff artifacts ------------------------------------------------------------
+      # The four `*-pack-input` and three `*-engine-sdk` artifacts exist only to move files between
+      # jobs of THIS run. Their retention is already one day, but for that day they sit on the run
+      # page beside the real downloads, seven distractions next to the dozen a person might want.
+      # So delete them once everything that reads them has succeeded. On SUCCESS only: a failed
+      # package job is re-run with "re-run failed jobs", which reads these same artifacts, and
+      # deleting them would turn one failure into two. `release-wheel-*` stays: on a branch push it
+      # is the only place the manylinux and universal2 wheels exist at all.
+      - name: Prune the handoff artifacts
+        if: success()
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh api --paginate "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/artifacts" \
+            --jq '.artifacts[] | select(.name | test("-(pack-input|engine-sdk)$")) | "\(.id) \(.name)"' \
+          | while read -r id name; do
+              echo "deleting $name ($id)"
+              gh api -X DELETE "repos/$GITHUB_REPOSITORY/actions/artifacts/$id"
+            done
 
   # ---- portability gate, and two more shipping jobs (docs/backends.md phases 2 and 5) ----------
   # These two jobs exist to catch a Win32 call sneaking back into the core, not to test audio: no
