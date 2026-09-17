@@ -1,9 +1,9 @@
 // Bwa.cs — P/Invoke binding for the bw_audio C ABI (include/bw_audio.h).
 //
 // Pure marshalling layer, no Unity dependency (so it compiles + can be unit-tested standalone; the
-// MonoBehaviour wrappers live in Engine.cs / Emitter.cs). Drop bw_audio.dll + phonon.dll in
+// MonoBehaviour wrappers live in Engine.cs / Emitter.cs). Drop bw_audio.dll in
 // Assets/Plugins/. THREADING: every call must come from ONE thread (Unity's main thread); the
-// per-frame calls are non-blocking. See https://github.com/aforren1/cave-audio/blob/fb85546ccff1/docs/api.md + https://github.com/aforren1/cave-audio/blob/fb85546ccff1/docs/concurrency.md.
+// per-frame calls are non-blocking. See https://github.com/aforren1/cave-audio/blob/bd3af4e584a5/docs/api.md + https://github.com/aforren1/cave-audio/blob/bd3af4e584a5/docs/concurrency.md.
 //
 // Marshalling rules that matter here:
 //   * C `bool` is 1 byte  -> [MarshalAs(UnmanagedType.I1)].
@@ -30,6 +30,19 @@ namespace BwAudio
     public enum BwaSpreadMode : int { Lobe = 0, Mdap = 1, Spectral = 2 }
     public enum BwaBedRenderer : int { Matrix = 0, Parametric = 1 }
 
+    /// <summary>Mirrors bwa_load_flags: which loader the shared asset cache uses for a path. The cache
+    /// key is (path, flags), so the SAME file held in RAM and streamed are two different entries — which
+    /// is exactly the multi-key case a binding-side dictionary had to special-case. None = the in-memory
+    /// mono loader (bwa_load_sound). Combinations no loader can express (Ambix|Fuma, Stream with either)
+    /// are REFUSED with a message in bwa_last_error, never narrowed to one of them.</summary>
+    [Flags]
+    public enum BwaLoadFlags : uint { None = 0, Stream = 1 << 0, Ambix = 1 << 1, Fuma = 1 << 2 }
+
+    /// <summary>Mirrors bwa_source_kind: what a source IS, which is what bwa_source_preset fills a
+    /// complete BwaSourceDesc for. Nothing in the preset table is measured — a kind differs from
+    /// Default only where a doc already argues the case. See https://github.com/aforren1/cave-audio/blob/bd3af4e584a5/docs/api.md, "What each preset rests on".</summary>
+    public enum BwaSourceKind : int { Default = 0, Prop = 1, Voice = 2, Ambience = 3, Ui = 4 }
+
     /// <summary>Mirrors bwa_material_type: the engine's built-in acoustic materials, in ABI order
     /// (the value indexes the engine's coefficient table).</summary>
     public enum BwaMaterialPreset : int
@@ -43,11 +56,33 @@ namespace BwAudio
         Ok = 0, ErrConfig, ErrDevice, ErrLayout, ErrHrtf, ErrState, ErrInternal, ErrTracker
     }
 
-    /// <summary>Mirrors bwa_sink_type: the output-device policy. Auto tries ASIO and falls back to
-    /// the silent offline sink (the engine keeps rendering — visual-only); Asio demands a real
-    /// device (an open failure fails bwa_start loudly); Null forces the offline sink; Manual is
-    /// the deterministic caller-pumped sink (bwa_render_block — offline/golden tests, not Unity).</summary>
-    public enum BwaSinkType : int { Auto = 0, Asio = 1, Null = 2, Manual = 3 }
+    /// <summary>Mirrors bwa_sink_type: the output-device policy. Auto picks by channel count and
+    /// platform, then falls back to the silent offline sink (the engine keeps rendering —
+    /// visual-only): on Windows a 2-channel request (the headphone profiles) tries Wasapi then
+    /// Asio, and anything wider tries Asio only, because the array's transport is settled. Naming
+    /// a backend is a demand — an open failure fails bwa_start loudly, and a backend this build
+    /// does not carry says so. Null forces the offline sink; Manual is the deterministic
+    /// caller-pumped sink (bwa_render_block — offline/golden tests, not Unity). CoreAudio, Alsa,
+    /// AAudio and Jack are reserved values; the Windows DLL carries none of them yet.</summary>
+    public enum BwaSinkType : int
+    {
+        Auto = 0, Asio = 1, Null = 2, Manual = 3,
+        Wasapi = 4, CoreAudio = 5, Alsa = 6, AAudio = 7, Jack = 8
+    }
+
+    /// <summary>Mirrors the BWA_SINK_FLAG_* bits for BwaDesc.sinkFlags. None of them reaches the
+    /// CaveBoth monitor: like the device name, they describe the primary device only.
+    /// Exclusive takes the endpoint from every other application on the machine, so it is off by
+    /// default: a monitor shares its endpoint with the VR runtime, the browser and the OS. Turn it
+    /// on for the lowest latency and a fixed callback size, or to reach more than 2 channels on a
+    /// WASAPI endpoint.
+    /// ExactRate fails the open when the device cannot run at the engine rate, instead of letting
+    /// the OS resample and reporting the degradation (the default for a headphone sink).
+    /// TightBuffer asks the backend for the smallest device buffer it can take (ALSA: 2 periods,
+    /// AAudio: 1 burst; a no-op on WASAPI), trading dropout margin for latency.
+    /// https://github.com/aforren1/cave-audio/blob/bd3af4e584a5/docs/api.md's "Latency classes" maps PsychPortAudio's 0..4 onto these.</summary>
+    [System.Flags]
+    public enum BwaSinkFlags : uint { None = 0, Exclusive = 0x1, ExactRate = 0x2, TightBuffer = 0x4 }
 
     /// <summary>Mirrors bwa_tracker_state: liveness of a connected tracker's stream (Engine.TrackerStatus).
     /// Disconnected = no tracker on this engine; NoData = connected but no frames arriving (check the
@@ -64,11 +99,20 @@ namespace BwAudio
         public uint sampleRate;                                         // 48000
         public uint blockSize;                                          // e.g. 256
         public BwaSinkType sink;                                        // device policy; 0 = Auto
-        [MarshalAs(UnmanagedType.LPUTF8Str)] public string asioDriver;  // ASIO driver name; null = auto-pick
+        // The device for whichever backend opens: the exact friendly name or stable id from the
+        // device query (Bwa.DeviceName / Bwa.DeviceId); null = that backend's default. This is the
+        // same field the C header still spells asio_driver; the AsioDriver property below keeps
+        // the old name working.
+        [MarshalAs(UnmanagedType.LPUTF8Str)] public string device;
         [MarshalAs(UnmanagedType.I1)] public bool embree;               // Embree ray tracing (falls back if absent)
         [MarshalAs(UnmanagedType.I1)] public bool enablePathing;        // sound-pathing sim at bwa_start (needs SDK + scene)
         public BwaBedDecoder bedDecoder;                                 // diffuse-bed decoder; 0 = the engine default
-        public uint reserved0, reserved1, reserved2, reserved3;         // matches reserved[4]; keep zero
+        public BwaSinkFlags sinkFlags;                                  // carved from reserved[0]; 0 = default
+        public uint reserved0, reserved1, reserved2;                    // matches reserved[3]; keep zero
+
+        /// <summary>The legacy spelling of <see cref="device"/>, kept so existing call sites
+        /// compile. One field, two names — setting either sets the same pointer.</summary>
+        public string asioDriver { get { return device; } set { device = value; } }
     }
 
     /// <summary>Mirrors bwa_tracker_desc: the OptiTrack/NatNet connection for internal tracking.
@@ -115,6 +159,10 @@ namespace BwAudio
         public ulong lateBlocks;      // our render overran the block period
         public ulong streamStarves;   // a streamed voice's ring ran dry without the asset ending
         public float peakLoad;        // worst block's render time / block period; 1.0 = at budget
+        // Nonzero: the device went away (unplugged, a driver reset, the session torn down). The
+        // engine keeps rendering from the host clock, so clocks and playheads stay live, and the
+        // audio is SILENT. Nothing reopens on its own — Stop() then Start(), or leave it.
+        public uint deviceLost;
     }
 
     [StructLayout(LayoutKind.Sequential)]
@@ -141,6 +189,43 @@ namespace BwAudio
         public uint  reserved0, reserved1, reserved2;   // matches reserved[3]; keep zero
     }
 
+    /// <summary>Mirrors bwa_source_desc: every per-source CONFIGURATION knob in one struct, the same
+    /// fill-then-apply shape as Bwa.BwaTuning (which does it for the ENGINE knobs) and with the same
+    /// structSize guard for the same reason: THIS STRUCT'S ZERO IS NOT ITS DEFAULT (a zero-filled one
+    /// means gain 0 = silence and pitch 0 = invalid), so a zero-init mistake must fail loudly. NEVER
+    /// apply a default(BwaSourceDesc) — always start from Bwa.SourcePreset.
+    /// <para>What is deliberately OUT: position and orientation (per-frame, commit-gated, so they belong
+    /// to the frame loop), playback state (an apply must never restart a sound), and the manual-occlusion
+    /// LEVEL (a live per-frame value; the desc carries only the occlusion on/off).</para></summary>
+    [StructLayout(LayoutKind.Sequential)]
+    public struct BwaSourceDesc
+    {
+        public uint  structSize;        // set by Bwa.SourcePreset / bwa_source_get_desc; apply refuses a wrong one
+        public float gain;              // linear; 1 = unity
+        public float pitch;             // playback rate; 1 = native, clamped [0.25, 4]
+        public int   priority;          // steal priority 0..255; 128 = default
+        public uint  group;             // mix group 0..7
+        public float spread;            // angular width 0 = point .. 1 = wide
+        public float extentHeight;      // vertical extent 0..1 when >= 0 (spread is then the WIDTH); < 0 = isotropic
+        public float sizeMeters;        // metric radius (m); 0 = point
+        public float reverbSend;        // wet-send level; 1 = default
+        public float attenRefDist;      // distance-curve override: <= 0 = no override (the layout's curve)
+        public float attenRolloff;      // ... its exponent; 0 = constant level at any distance
+        public float attenMinGain;      // ... its floor, 0..1
+        public float directivityWeight; // 0 = omni (off) .. 0.5 = cardioid .. 1 = figure-8
+        public float directivityPower;  // ... lobe sharpness, >= 1; 1 = default
+        [MarshalAs(UnmanagedType.I1)] public bool doppler;
+        [MarshalAs(UnmanagedType.I1)] public bool airAbsorption;
+        [MarshalAs(UnmanagedType.I1)] public bool loudnessComp;
+        [MarshalAs(UnmanagedType.I1)] public bool proximity;
+        [MarshalAs(UnmanagedType.I1)] public bool occlusion;
+        [MarshalAs(UnmanagedType.I1)] public bool earlyReflections;
+        [MarshalAs(UnmanagedType.I1)] public bool reverb;
+        [MarshalAs(UnmanagedType.I1)] public bool reverbDistance;
+        [MarshalAs(UnmanagedType.I1)] public bool pathing;
+        public uint r0, r1, r2, r3;     // matches reserved[4]; keep zero
+    }
+
     /// <summary>Raw P/Invoke entry points — every BWA_API function in include/bw_audio.h except
     /// bwa_set_output_capture (an audio-thread callback) and bwa_render_block (the manual-sink
     /// golden-render path), which Unity never uses.</summary>
@@ -155,10 +240,16 @@ namespace BwAudio
         [DllImport(DLL, CallingConvention = CC)] public static extern BwaResult bwa_stop(IntPtr e);
         [DllImport(DLL, CallingConvention = CC)] public static extern void   bwa_destroy(IntPtr e);
         [DllImport(DLL, CallingConvention = CC)] public static extern IntPtr bwa_last_error(IntPtr e);     // PtrToStringUTF8; null = none
-        [DllImport(DLL, CallingConvention = CC)] public static extern IntPtr bwa_get_audio_backend(IntPtr e);  // "asio:<drv>" / "null" / "none"; binaural/both append "(steam HRTF|simple-pan monitor)"
+        [DllImport(DLL, CallingConvention = CC)] public static extern IntPtr bwa_get_audio_backend(IntPtr e);  // "<backend>:<device>" / "null" / "manual" / "none"; binaural/both append "(steam HRTF|simple-pan monitor)"
 
-        // ---- ASIO device query (engine-free; call before bwa_create to populate a driver picker for
-        // BwaDesc.asioDriver). Reads the OS's registered-driver list fresh each call; nothing is opened. ----
+        // ---- Device query (engine-free; call before bwa_create to populate a device picker for
+        // BwaDesc.device). Reads the OS's list fresh each call; nothing is opened. `backend` must be
+        // concrete — Auto, Null and Manual report 0, and so does a backend this build does not carry. ----
+        [DllImport(DLL, CallingConvention = CC)] public static extern uint bwa_get_device_count(BwaSinkType backend);
+        [DllImport(DLL, CallingConvention = CC)] [return: MarshalAs(UnmanagedType.I1)] public static extern bool bwa_get_device_name(BwaSinkType backend, uint index, [Out] byte[] buf, uint cap);
+        // The STABLE id: prefer it when persisting a choice, or when two devices share a friendly
+        // name (a headset and a dock often do). ASIO reports the driver name for both.
+        [DllImport(DLL, CallingConvention = CC)] [return: MarshalAs(UnmanagedType.I1)] public static extern bool bwa_get_device_id(BwaSinkType backend, uint index, [Out] byte[] buf, uint cap);
         [DllImport(DLL, CallingConvention = CC)] public static extern uint bwa_get_asio_driver_count();
         // Fills buf with driver `index`'s registered name (NUL-terminated, truncated to cap-1) — the exact
         // string BwaDesc.asioDriver expects. False = index out of range. The AsioDriverName helper below wraps it.
@@ -184,6 +275,30 @@ namespace BwAudio
         [DllImport(DLL, CallingConvention = CC)] public static extern ulong bwa_sound_get_frames(IntPtr e, uint snd);
         [DllImport(DLL, CallingConvention = CC)] public static extern uint  bwa_sound_get_channels(IntPtr e, uint snd);
 
+        // ---- shared-ownership asset cache (load time; file I/O) ----
+        // The by-path, refcounted tier over the same four loaders above: the key is (path, flags), the
+        // same key returns the SAME handle with one more reference, and the last release unloads through
+        // the retire-ack path (safe while playing). Engine.Load/LoadAmbix/LoadFuma ride this instead of a
+        // binding-side dictionary. Do NOT mix tiers on one handle: bwa_unload_sound on an acquired handle
+        // is refused, and so is bwa_sound_release on a handle the cache does not own.
+        [DllImport(DLL, CallingConvention = CC)] public static extern uint bwa_sound_acquire(IntPtr e, [MarshalAs(UnmanagedType.LPUTF8Str)] string path, BwaLoadFlags flags);
+        // Async twin: a usable handle IMMEDIATELY, decoded on the engine's loader thread. Play it at once —
+        // the source binds and stays SILENT until the data lands, then starts from the top. bwa_play_oneshot
+        // and bwa_source_queue REFUSE a not-ready handle (neither can be held), so check bwa_sound_is_ready
+        // before those two. BWA_LOAD_STREAM loads synchronously here.
+        [DllImport(DLL, CallingConvention = CC)] public static extern uint bwa_sound_acquire_async(IntPtr e, [MarshalAs(UnmanagedType.LPUTF8Str)] string path, BwaLoadFlags flags);
+        // Has the data landed? True for anything acquired synchronously; false for a handle the cache does
+        // not own. A decode that FAILED never becomes ready and puts its reason in bwa_last_error AT THIS
+        // CALL — that is the only way to tell "still decoding" (no error) from "failed" (an error). Calling
+        // it also adopts finished loads, as does bwa_commit.
+        [DllImport(DLL, CallingConvention = CC)] [return: MarshalAs(UnmanagedType.I1)] public static extern bool bwa_sound_is_ready(IntPtr e, uint snd);
+        [DllImport(DLL, CallingConvention = CC)] public static extern void bwa_sound_release(IntPtr e, uint snd);
+        // The handle for (path, flags) if the cache ALREADY holds it, else 0. Pure lookup: never loads,
+        // never takes a reference. Probe with THIS, not with bwa_sound_acquire, whose miss path loads the
+        // file (and loads it mono, so a bed would answer 1 channel). The handle is borrowed: do not
+        // release against it.
+        [DllImport(DLL, CallingConvention = CC)] public static extern uint bwa_sound_find(IntPtr e, [MarshalAs(UnmanagedType.LPUTF8Str)] string path, BwaLoadFlags flags);
+
         // ---- sources (per-frame; non-blocking) ----
         [DllImport(DLL, CallingConvention = CC)] public static extern uint bwa_source_create(IntPtr e);
         [DllImport(DLL, CallingConvention = CC)] public static extern void bwa_source_set_priority(IntPtr e, uint s, int priority);
@@ -199,16 +314,29 @@ namespace BwAudio
         [DllImport(DLL, CallingConvention = CC)] public static extern void bwa_source_set_group(IntPtr e, uint s, uint group);
         [DllImport(DLL, CallingConvention = CC)] public static extern void bwa_group_set_gain(IntPtr e, uint group, float linear);
         [DllImport(DLL, CallingConvention = CC)] public static extern void bwa_group_set_paused(IntPtr e, uint group, [MarshalAs(UnmanagedType.I1)] bool paused);
+        // Scene transitions. Both take the SAME click-free path as bwa_source_stop (one-block fade, then
+        // end), stop BEDS too, and drop each stopped voice's pending queue. Neither touches group gains,
+        // group pause, the global pause, or the master gain: a stop stops sound, it does not reset the
+        // mixer. Stopped source handles stay valid and re-playable. Both also drop the plays still
+        // waiting on an async decode, which would otherwise start by themselves once their data landed:
+        // bwa_stop_all drops every one, bwa_group_stop the ones issued on sources in that group.
+        [DllImport(DLL, CallingConvention = CC)] public static extern void bwa_group_stop(IntPtr e, uint group);
+        [DllImport(DLL, CallingConvention = CC)] public static extern void bwa_stop_all(IntPtr e);
         // Playback rate, clamped [0.25, 4] (glides across a block). In-memory sounds only — streams ignore it.
         [DllImport(DLL, CallingConvention = CC)] public static extern void bwa_source_set_pitch(IntPtr e, uint s, float rate);
         [DllImport(DLL, CallingConvention = CC)] public static extern void bwa_source_play(IntPtr e, uint s, uint snd, [MarshalAs(UnmanagedType.I1)] bool loop);
         [DllImport(DLL, CallingConvention = CC)] public static extern void bwa_source_play_at(IntPtr e, uint s, uint snd, [MarshalAs(UnmanagedType.I1)] bool loop, ulong startSample);
         [DllImport(DLL, CallingConvention = CC)] public static extern void bwa_source_play_loop(IntPtr e, uint s, uint snd, ulong loopBeg, ulong loopEnd);
-        [DllImport(DLL, CallingConvention = CC)] public static extern ulong bwa_get_dsp_time(IntPtr e);
+        [DllImport(DLL, CallingConvention = CC)] public static extern ulong bwa_get_dsp_time_frames(IntPtr e);
         // The device-stamped (output sample, host time ns) pair for the last rendered block — the
-        // jitter-free wall<->dsp bridge (see Engine.DspTimeAt). hostTimeNs is monotonic on a
+        // jitter-free wall<->dsp bridge (see Engine.DspTimeFramesAt). hostTimeNs is monotonic on a
         // backend-defined epoch. False (outputs zeroed) until a host-stamped block has rendered.
         [DllImport(DLL, CallingConvention = CC)] [return: MarshalAs(UnmanagedType.I1)] public static extern bool bwa_get_clock(IntPtr e, out ulong dspSample, out ulong hostTimeNs);
+        // A direct read of the clock bwa_get_clock stamps with (QPC on Windows, CLOCK_MONOTONIC on
+        // Linux/Android, mach_absolute_time on macOS). No handle: it is a property of the process, so
+        // it works before bwa_create. Sandwich it between two reads of your own clock to MEASURE the
+        // epoch offset instead of estimating it (see Engine.HostTimeNs).
+        [DllImport(DLL, CallingConvention = CC)] public static extern ulong bwa_host_time_ns();
         // Device-reported render->DAC latency in frames (ASIOGetLatencies; the Digiface includes its Dante
         // buffering). 0 = unknown / no physical output (null sink).
         [DllImport(DLL, CallingConvention = CC)] public static extern uint bwa_get_output_latency_frames(IntPtr e);
@@ -227,6 +355,19 @@ namespace BwAudio
         // Global pause: EVERY voice (memory, streamed, bed) ramps out and freezes; resume continues exactly.
         [DllImport(DLL, CallingConvention = CC)] public static extern void bwa_set_paused(IntPtr e, [MarshalAs(UnmanagedType.I1)] bool paused);
         [DllImport(DLL, CallingConvention = CC)] public static extern void bwa_source_seek(IntPtr e, uint s, ulong frame);   // engine-rate frames; in-memory sounds
+        // Play REGION [startFrame, endFrame) in engine-rate frames; endFrame 0 = the asset end. A
+        // non-looping voice ENDS at endFrame (reported through bwa_poll_ended), a looping one wraps back
+        // to startFrame (reported through bwa_poll_looped). Set it AFTER the play: it resolves against the
+        // bound asset, and any play resets it. In-memory and bed sounds only.
+        [DllImport(DLL, CallingConvention = CC)] public static extern void bwa_source_set_region(IntPtr e, uint s, ulong startFrame, ulong endFrame);
+        // DIRECT output-channel route: this voice's content goes to ONE output channel with no spatial
+        // processing — the psychophysics ground-truth condition (a real speaker A/B'd against a phantom).
+        // CHANNEL_AUTO restores normal panning. NOT bwa_set_test_signal, which injects a built-in tone
+        // after the align stage and is therefore not level-comparable with a rendered source.
+        [DllImport(DLL, CallingConvention = CC)] public static extern void bwa_source_set_channel(IntPtr e, uint s, int channel);
+        /// <summary>BWA_CHANNEL_AUTO: the value <see cref="bwa_source_set_channel"/> takes to put a source
+        /// back on the panner.</summary>
+        public const int CHANNEL_AUTO = -1;
         [DllImport(DLL, CallingConvention = CC)] [return: MarshalAs(UnmanagedType.I1)] public static extern bool bwa_source_is_playing(IntPtr e, uint s);
         // Content playhead in engine-rate frames (latest-wins readback, ~one block of lag): freezes under
         // pause, lands where seek lands, follows pitch at the actual rate; streamed sounds report frames
@@ -252,6 +393,12 @@ namespace BwAudio
         // ---- ambisonic beds (world-locked diffuse soundfields) ----
         [DllImport(DLL, CallingConvention = CC)] public static extern uint bwa_bed_create(IntPtr e);
         [DllImport(DLL, CallingConvention = CC)] public static extern void bwa_bed_play(IntPtr e, uint b, uint snd, [MarshalAs(UnmanagedType.I1)] bool loop);
+        // The scheduled and intro-to-loop play forms. Separate ABI calls rather than bwa_source_*
+        // aliases because the multichannel-asset check runs the other way round: the source forms
+        // refuse the 4/9/16-channel file a bed exists to play. startSample is on the engine's dsp
+        // clock (bwa_get_dsp_time_frames); loopBeg/loopEnd are FRAMES into the asset.
+        [DllImport(DLL, CallingConvention = CC)] public static extern void bwa_bed_play_at(IntPtr e, uint b, uint snd, [MarshalAs(UnmanagedType.I1)] bool loop, ulong startSample);
+        [DllImport(DLL, CallingConvention = CC)] public static extern void bwa_bed_play_loop(IntPtr e, uint b, uint snd, ulong loopBeg, ulong loopEnd);
         [DllImport(DLL, CallingConvention = CC)] public static extern void bwa_bed_set_gain(IntPtr e, uint b, float linear);
         // Full 3-axis orientation of the soundfield, RADIANS, ROOM frame (level or tilt a capture, or spin
         // it slowly for effect). Positive yaw turns the field about the room's vertical axis from room +z
@@ -263,10 +410,13 @@ namespace BwAudio
         [DllImport(DLL, CallingConvention = CC)] public static extern void bwa_bed_stop(IntPtr e, uint b);
         [DllImport(DLL, CallingConvention = CC)] public static extern void bwa_bed_destroy(IntPtr e, uint b);
         // same voice machinery as the bwa_source_* calls of the same name, bed-named (a bed IS a voice)
+        [DllImport(DLL, CallingConvention = CC)] public static extern void bwa_bed_stop_at(IntPtr e, uint b, ulong stopSample);
         [DllImport(DLL, CallingConvention = CC)] public static extern void bwa_bed_fade_to(IntPtr e, uint b, float gain, float seconds);
         [DllImport(DLL, CallingConvention = CC)] public static extern void bwa_bed_fade_out(IntPtr e, uint b, float seconds);
         [DllImport(DLL, CallingConvention = CC)] public static extern void bwa_bed_set_paused(IntPtr e, uint b, [MarshalAs(UnmanagedType.I1)] bool paused);
         [DllImport(DLL, CallingConvention = CC)] public static extern void bwa_bed_seek(IntPtr e, uint b, ulong frame);
+        // FRAMES into the asset, both. endFrame 0 means the asset end.
+        [DllImport(DLL, CallingConvention = CC)] public static extern void bwa_bed_set_region(IntPtr e, uint b, ulong startFrame, ulong endFrame);
         [DllImport(DLL, CallingConvention = CC)] public static extern void bwa_bed_set_priority(IntPtr e, uint b, int priority);
         [DllImport(DLL, CallingConvention = CC)] public static extern void bwa_bed_set_group(IntPtr e, uint b, uint group);
         [DllImport(DLL, CallingConvention = CC)] [return: MarshalAs(UnmanagedType.I1)] public static extern bool bwa_bed_is_playing(IntPtr e, uint b);
@@ -384,14 +534,14 @@ namespace BwAudio
         // values and struct layouts only WITHIN a major.minor, so a DLL with a different major.minor may
         // marshal every struct in this file wrong — silent corruption, not a crash. Bump this alongside
         // any re-sync with a header whose BWA_VERSION moved.
-        public const uint BoundVersion = (0u << 16) | (11u << 8) | 0u;   // 0.11.0
+        public const uint BoundVersion = (0u << 16) | (13u << 8) | 0u;   // 0.13.0
 
         /// <summary>A packed BWA_VERSION as "major.minor.patch", for logs.</summary>
         public static string VersionString(uint v) => (v >> 16) + "." + ((v >> 8) & 0xFF) + "." + (v & 0xFF);
         // Resolved engine config (zero-defaulted desc fields resolved at create) — derive seconds from these.
         [DllImport(DLL, CallingConvention = CC)] public static extern uint bwa_get_sample_rate(IntPtr e);
         [DllImport(DLL, CallingConvention = CC)] public static extern uint bwa_get_block_size(IntPtr e);
-        // The sink actually running (Auto resolved to Asio/Null once started) — the enum side of bwa_get_audio_backend.
+        // The sink actually running (Auto resolved to the concrete backend once started) — the enum side of bwa_get_audio_backend.
         [DllImport(DLL, CallingConvention = CC)] public static extern BwaSinkType bwa_get_sink_type(IntPtr e);
         // Read back the effective speaker layout (xyz = cap*3 floats, x,y,z per speaker); returns the count
         // FILLED (min(cap, count) — the bwa_get_bus_levels convention); xyz = null returns the total count.
@@ -495,12 +645,43 @@ namespace BwAudio
             public uint r0, r1, r2, r3;
         }
 
+        // Source configuration. Same fill-then-apply shape as the engine tuning above, for a SOURCE:
+        // fill a BwaSourceDesc from a kind's preset, edit what you disagree with, apply it. NEVER apply a
+        // default(BwaSourceDesc) — its zero is not its default, which is what structSize makes fail loudly.
+        // The preset call is PURE (no engine handle), so it works in edit mode with nothing running.
+        [DllImport(DLL, CallingConvention = CC)] public static extern void bwa_source_preset(BwaSourceKind kind, out BwaSourceDesc outDesc);
+        [DllImport(DLL, CallingConvention = CC)] public static extern uint bwa_source_create_desc(IntPtr e, in BwaSourceDesc d);
+        // ONE ring command for the fifteen knobs the audio thread owns. Out-of-range FINITE values clamp
+        // exactly as the individual setters clamp them; NaN/Inf refuses the whole apply (false + an error).
+        // A stale handle is the usual silent no-op and still returns TRUE — the desc was valid, the source
+        // was not. earlyReflections with no room set leaves them off, says so in bwa_last_error, and still
+        // returns true (the rest of the configuration landed).
+        [DllImport(DLL, CallingConvention = CC)] [return: MarshalAs(UnmanagedType.I1)]
+        public static extern bool bwa_source_apply(IntPtr e, uint s, in BwaSourceDesc d);
+        // What the source is SET to (not what the sim is doing to it — that is bwa_source_get_occlusion /
+        // bwa_source_get_directivity). Fills structSize, so a readback hands straight back to apply.
+        [DllImport(DLL, CallingConvention = CC)] [return: MarshalAs(UnmanagedType.I1)]
+        public static extern bool bwa_source_get_desc(IntPtr e, uint s, out BwaSourceDesc outDesc);
+
+        /// <summary>A complete BwaSourceDesc for `kind` (with structSize filled). Pure: no engine, so it
+        /// works in edit mode. Start every desc here — the struct's zero is not its default.</summary>
+        public static BwaSourceDesc SourcePreset(BwaSourceKind kind)
+        {
+            bwa_source_preset(kind, out var d);
+            return d;
+        }
+
         [DllImport(DLL, CallingConvention = CC)] public static extern void bwa_tuning_preset(BwaSetup setup, out BwaTuning outTuning);
         [DllImport(DLL, CallingConvention = CC)] [return: MarshalAs(UnmanagedType.I1)]
         public static extern bool bwa_get_tuning(IntPtr e, out BwaTuning outTuning);
         // Completion as an EVENT. Drains handles whose voices ended; prefer it over edge-detecting
         // bwa_source_is_playing, which misses any sound shorter than your frame interval.
         [DllImport(DLL, CallingConvention = CC)] public static extern uint bwa_poll_ended(IntPtr e, [Out] uint[] outHandles, uint cap, out ulong dropped);
+        // The loop-boundary sibling: drains the handles whose voices WRAPPED at a loop point. A looping
+        // voice never ends, so bwa_poll_ended reports it exactly never — this is how you pace trials or
+        // cue visuals off a loop. ONE entry per WRAP, so a short region wrapping several times inside one
+        // audio block yields several entries. Its own bounded, drop-oldest ring and its own dropped total.
+        [DllImport(DLL, CallingConvention = CC)] public static extern uint bwa_poll_looped(IntPtr e, [Out] uint[] outHandles, uint cap, out ulong dropped);
         // The ISM shoebox WITHOUT replacing the static mesh, and the box's own triangles, so the
         // box can be composed with your geometry instead of replacing it.
         [DllImport(DLL, CallingConvention = CC)] public static extern void bwa_scene_set_ism_room(IntPtr e, float w, float h, float d, uint[] faces);
@@ -547,7 +728,8 @@ namespace BwAudio
             return p == IntPtr.Zero ? null : Marshal.PtrToStringUTF8(p);
         }
 
-        /// <summary>Backend in use after bwa_start: "asio:&lt;driver&gt;", "null", or "none".</summary>
+        /// <summary>Backend in use after bwa_start: "&lt;backend&gt;:&lt;device&gt;" ("asio:Digiface Dante",
+        /// "wasapi:Headphones"), or "null", "manual", "none".</summary>
         public static string Backend(IntPtr e)
         {
             var p = bwa_get_audio_backend(e);
@@ -557,6 +739,26 @@ namespace BwAudio
         /// <summary>Registered ASIO driver `index`'s name (the exact string BwaDesc.asioDriver expects), or
         /// null if the index is out of range. Engine-free — call it before bwa_create (with
         /// bwa_get_asio_driver_count) to build a driver picker.</summary>
+        /// <summary>Device `index`'s friendly name on `backend` (one of the two exact strings
+        /// BwaDesc.device accepts), or null. Pair with bwa_get_device_count to build a picker.</summary>
+        public static string DeviceName(BwaSinkType backend, uint index)
+        {
+            var buf = new byte[256];
+            if (!bwa_get_device_name(backend, index, buf, (uint)buf.Length)) return null;
+            int n = System.Array.IndexOf(buf, (byte)0); if (n < 0) n = buf.Length;
+            return System.Text.Encoding.UTF8.GetString(buf, 0, n);
+        }
+
+        /// <summary>Device `index`'s stable id on `backend` — the string to PERSIST, since friendly
+        /// names collide and change. Null when the index is out of range.</summary>
+        public static string DeviceId(BwaSinkType backend, uint index)
+        {
+            var buf = new byte[256];
+            if (!bwa_get_device_id(backend, index, buf, (uint)buf.Length)) return null;
+            int n = System.Array.IndexOf(buf, (byte)0); if (n < 0) n = buf.Length;
+            return System.Text.Encoding.UTF8.GetString(buf, 0, n);
+        }
+
         public static string AsioDriverName(uint index)
         {
             var buf = new byte[256];

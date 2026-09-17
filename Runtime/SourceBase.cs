@@ -69,6 +69,7 @@ namespace BwAudio
         protected bool _paused;
         Vector2 _extent;
         float _attRef, _attRolloff, _attMin;   // SetAttenuationOverride mirror (standing state, like _extent)
+        int _channel = Bwa.CHANNEL_AUTO;       // direct output-channel route (standing state; see Channel)
         bool _attSet;
         Engine _owner;                         // the Engine this source was created under
 
@@ -133,32 +134,17 @@ namespace BwAudio
                 return true;                                // don't retry a genuine failure forever
             }
 
-            var eng = engine.Handle;
-            Bwa.bwa_source_set_gain(eng, _src, gain);
-            Bwa.bwa_source_set_priority(eng, _src, priority);
-            if (group != 0) Bwa.bwa_source_set_group(eng, _src, (uint)group);
+            // ONE bwa_source_apply for the whole field set instead of the fifteen-or-so setters this used
+            // to issue. The engine packs the audio-thread knobs into a SINGLE ring command, which is what
+            // makes this worth doing: bwa_play_oneshot already documents dropping when the ring is
+            // momentarily full, so spawning a prefab that issued fifteen commands was real pressure. The
+            // standing script-set state (Extent, SetAttenuationOverride) rides along, so it is replayed on
+            // a re-enable exactly as before.
+            ApplyDesc();
+            // Standing script-set state that is not a desc field, replayed like Extent so a re-enable
+            // does not silently put a reference source back on the panner mid-experiment.
+            if (_channel != Bwa.CHANNEL_AUTO) Bwa.bwa_source_set_channel(engine.Handle, _src, _channel);
             ApplyExtraSettings();
-
-            // The engine defaults every opt-in below to OFF/point/unity, so only push what differs — a
-            // fresh source already IS the default (this runs again on every re-enable).
-            if (occlusion)        Bwa.bwa_source_set_occlusion(eng, _src, true);
-            if (earlyReflections) Bwa.bwa_source_set_early_reflections(eng, _src, true);
-            if (reflections)
-            {
-                Bwa.bwa_source_set_reverb(eng, _src, true);
-                if (reflectionSend != 1f)  Bwa.bwa_source_set_reverb_send(eng, _src, reflectionSend);
-                if (reflectionDistance)    Bwa.bwa_source_set_reverb_distance(eng, _src, true);
-            }
-            if (pathing)       Bwa.bwa_source_set_pathing(eng, _src, true);
-            if (spread > 0f)   Bwa.bwa_source_set_spread(eng, _src, spread);
-            if (_extent.x > 0f || _extent.y > 0f) Bwa.bwa_source_set_extent(eng, _src, _extent.x, _extent.y);   // a script-set anisotropic extent, re-asserted after a re-enable
-            if (sizeMeters > 0f) Bwa.bwa_source_set_size(eng, _src, sizeMeters);
-            if (_attSet)       Bwa.bwa_source_set_attenuation_override(eng, _src, _attRef, _attRolloff, _attMin);   // standing state, replayed like _extent
-            if (doppler)       Bwa.bwa_source_set_doppler(eng, _src, true);
-            if (airAbsorption) Bwa.bwa_source_set_air_absorption(eng, _src, true);
-            if (loudnessComp)  Bwa.bwa_source_set_loudness_comp(eng, _src, true);
-            if (proximity)     Bwa.bwa_source_set_proximity(eng, _src, true);
-            if (directivity != BwaDirectivity.Omni) ApplyDirectivity();   // fresh source defaults to omni, so skip the no-op
             SyncTransform();
             OnSourceReady();
             engine.Register(this);
@@ -179,10 +165,30 @@ namespace BwAudio
             }
         }
 
-        // Engine's per-frame entry point (Emitter layers the onFinished edge on top of the transform
-        // push). Every source kind runs through Engine's one snapshot loop, so a handler that disables
-        // or unregisters sources mid-loop is safe regardless of which kind fires it.
+        // Engine's per-frame entry point, BEFORE the commit (Emitter layers its async-load watch on top
+        // of the transform push). Every source kind runs through Engine's one snapshot loop, so a
+        // handler that disables or unregisters sources mid-loop is safe regardless of which kind fires it.
         internal virtual void FrameSync() => SyncTransform();
+
+        // Engine's second per-frame entry point, AFTER the commit and after the bwa_poll_ended drain.
+        // Completion work belongs here and not in FrameSync: the ended events are filled by the same
+        // pass bwa_commit runs, so anything that reasons about "did this end" must read the engine
+        // after the commit, or it reasons about the previous frame.
+        internal virtual void PostCommit() {}
+
+        // One handle bwa_poll_ended reported as ENDED, routed here by Engine (the single owner of that
+        // drain). Base does nothing: only Emitter has a completion event.
+        internal virtual void NotifyEnded() {}
+
+        // One handle bwa_poll_looped reported as WRAPPED, routed here by Engine (the single owner of that
+        // drain too). A wrap is not an end — the voice keeps playing — so nothing here touches the
+        // completion state. Base does nothing: only Emitter has a loop event.
+        internal virtual void NotifyLooped() {}
+
+        // The native source handle, for Engine's handle -> component route. 0 when the create failed.
+        // Deliberately NOT gated on _created: OnDisable clears that flag, and Unregister still has to
+        // find the map entry to remove it.
+        internal uint NativeHandle => _src;
 
         protected virtual void OnDisable()
         {
@@ -200,7 +206,7 @@ namespace BwAudio
 
         /// <summary>Stop this source — AudioSource.Stop equivalent, the click-free stop path (a push
         /// voice ends exactly like a drained PushEnd).</summary>
-        public void Stop() { if (Live) Bwa.bwa_source_stop(Eng, _src); }
+        public virtual void Stop() { if (Live) Bwa.bwa_source_stop(Eng, _src); }
 
         /// <summary>Linear gain — AudioSource.volume equivalent; applies immediately if live. Cancels a
         /// running FadeTo/FadeOut (an explicit gain wins over a fade).</summary>
@@ -309,6 +315,58 @@ namespace BwAudio
             set { _paused = value; if (Live) Bwa.bwa_source_set_paused(Eng, _src, value); }
         }
 
+        /// <summary>Send this source out of exactly ONE output channel, with no spatial processing —
+        /// the psychophysics ground-truth condition (one real speaker, A/B'd against a phantom) and a
+        /// wiring check you can run with real content. Valid range is 0 to
+        /// <c>Engine.ChannelCount - 1</c>; <see cref="Bwa.CHANNEL_AUTO"/> (-1) restores normal panning,
+        /// and an out-of-range value is refused with a warning, leaving the source on the channel it
+        /// had - so this property never reports a route the voice is not on.
+        /// <para>Unlike a test signal, the routed voice keeps the whole output stage a panned voice gets
+        /// (align trims and delays, room EQ, master gain, limiter) and RAMPS in and out, so it is
+        /// level-comparable with the phantom. Everything distance- or direction-derived is suppressed
+        /// while it is on (attenuation, spread, occlusion, reverb sends, Doppler, air absorption) and
+        /// comes back the moment you go to CHANNEL_AUTO. Pitch and Paused still apply. Mono point
+        /// sources only. No unit suffix: a channel is a bare index, not a quantity.</para>
+        /// <para>Script-only, deliberately: this is a run-time experimental condition, not authored
+        /// configuration, so it is not serialized in the scene. It IS replayed across a re-enable.</para>
+        /// </summary>
+        public int Channel
+        {
+            get => _channel;
+            // Range-check HERE, and keep the old route on a refusal, so the getter can never report a
+            // channel the voice is not on: the engine refuses out of range too, but into Bwa.LastError,
+            // where nothing reading this property would see it. That is the whole failure mode — a
+            // reference source that quietly stays panned while the caller reads back a speaker index.
+            // Godot's BwaSource.set_channel refuses identically, on purpose: the two bindings must not
+            // disagree about what a route means.
+            //
+            // The two ends are knowable at different times, hence two checks. A negative is bad with NO
+            // channel count (CHANNEL_AUTO is the one negative that means anything), so it is refused
+            // even before this source is live. A too-large one needs the count, so it waits for Live
+            // and TryInit replays the cached value for the engine to judge when it can.
+            set
+            {
+                if (value != Bwa.CHANNEL_AUTO && value < 0)
+                {
+                    Debug.LogWarning("[" + GetType().Name + "] Channel " + value + " on " + name +
+                                     " refused: the only negative that means anything is " +
+                                     "Bwa.CHANNEL_AUTO (" + Bwa.CHANNEL_AUTO + "), which restores " +
+                                     "spatial panning. The source stays on channel " + _channel + ".");
+                    return;
+                }
+                if (Live && Engine.Instance && value >= (int)Engine.Instance.ChannelCount)
+                {
+                    Debug.LogWarning("[" + GetType().Name + "] Channel " + value + " on " + name +
+                                     " is out of range (0 to " + (Engine.Instance.ChannelCount - 1) +
+                                     ", or Bwa.CHANNEL_AUTO). The source stays on channel " +
+                                     _channel + ".");
+                    return;
+                }
+                _channel = value;
+                if (Live) Bwa.bwa_source_set_channel(Eng, _src, value);
+            }
+        }
+
         /// <summary>Drive occlusion from GAME LOGIC instead of the ray-traced sim — a door the gameplay
         /// knows about, underwater, muffled-by-menu. Works WITHOUT the Steam Audio build. `level` is
         /// broadband transmittance (1 = clear .. 0 = blocked); `bands` is an optional low/mid/high tilt in
@@ -326,14 +384,138 @@ namespace BwAudio
 
         /// <summary>Current playhead in engine-rate frames — AudioSource.timeSamples-get equivalent
         /// (latest-wins readback, ~one audio block of lag). Engine-owned truth where deriving it from
-        /// DspTime breaks: it freezes while Paused, lands where Seek lands, follows Pitch at the
+        /// DspTimeFrames breaks: it freezes while Paused, lands where SeekFrames lands, follows Pitch at the
         /// actual rate, and counts frames actually consumed for streamed clips and push voices.
         /// (The CONTENT position — unrelated to the source's spatial transform.)</summary>
-        public ulong Playhead => Live ? Bwa.bwa_source_get_playhead_frames(Eng, _src) : 0;
+        public ulong PlayheadFrames => Live ? Bwa.bwa_source_get_playhead_frames(Eng, _src) : 0;
 
-        /// <summary>Playhead in seconds — AudioSource.time-get equivalent (Playhead over the engine
+        /// <summary>PlayheadFrames in seconds — AudioSource.time-get equivalent (PlayheadFrames over the engine
         /// sample rate).</summary>
-        public double PlayheadSeconds => Engine.Instance ? Playhead / (double)Engine.Instance.sampleRate : 0.0;
+        public double PlayheadSeconds => Engine.Instance ? PlayheadFrames / (double)Engine.Instance.sampleRate : 0.0;
+
+        // ---- bulk configuration (bwa_source_desc) ----------------------------------------------------
+        // The per-property setters above stay the live, incremental path. This is the WHOLE field set in
+        // one call, which is what the create-time push uses and what a preset needs. The inspector fields
+        // remain the source of truth in both directions: BuildDesc reads them, ApplyPreset writes them.
+
+        /// <summary>This component's whole configuration as a BwaSourceDesc, starting from the engine's
+        /// own defaults so every field is set (never build one from default(BwaSourceDesc) — its zero is
+        /// not its default). Position, orientation and playback state are deliberately not in it.</summary>
+        public BwaSourceDesc BuildDesc()
+        {
+            var d = Bwa.SourcePreset(BwaSourceKind.Default);
+            WriteDesc(ref d);
+            return d;
+        }
+
+        /// <summary>Push this component's whole field set to the engine in ONE call. Safe any time (it
+        /// no-ops before the source exists, and the create-time push replays the fields anyway). False
+        /// means the source isn't live, or the engine refused the desc (a NaN in a field).</summary>
+        public bool ApplyDesc() => ApplyDesc(BuildDesc());
+
+        /// <summary>Push an explicit desc — read one back with <see cref="TryGetDesc"/>, edit it, hand it
+        /// back. This does NOT update the inspector fields, so a later per-property edit or re-enable
+        /// pushes the fields again; use <see cref="ApplyPreset"/> when you want both to move.</summary>
+        public bool ApplyDesc(in BwaSourceDesc d)
+        {
+            if (!Live) return false;
+            if (Bwa.bwa_source_apply(Eng, _src, in d)) return true;
+            Debug.LogWarning("[" + GetType().Name + "] source apply refused on " + name + ": " + Bwa.LastError(Eng));
+            return false;
+        }
+
+        /// <summary>Read back what the ENGINE has this source configured at (what you set, not what the
+        /// sim is currently doing — that is <see cref="Occlusion"/>). False for a source that isn't
+        /// live.</summary>
+        public bool TryGetDesc(out BwaSourceDesc d)
+        {
+            if (Live) return Bwa.bwa_source_get_desc(Eng, _src, out d);
+            d = default;
+            return false;
+        }
+
+        /// <summary>Configure this source as a KIND: fill the engine's preset for it, mirror it into the
+        /// inspector fields, and push the lot in one call. This is also the source RESET the API had no
+        /// way to express before — <c>ApplyPreset(BwaSourceKind.Default)</c>.
+        /// <para>Nothing in the preset table is measured. A kind differs from Default only where a doc
+        /// already argues the case (https://github.com/aforren1/cave-audio/blob/bd3af4e584a5/docs/api.md, "What each preset rests on"), so treat it as a starting
+        /// point and edit what you disagree with.</para></summary>
+        public void ApplyPreset(BwaSourceKind kind)
+        {
+            var d = Bwa.SourcePreset(kind);
+            ReadDesc(in d);      // keep the inspector truthful about what the engine is running
+            ApplyDesc(in d);
+        }
+
+        /// <summary>Fill `d` from this component's fields. Override to add a subclass's own knobs (Emitter
+        /// adds pitch); call base first.</summary>
+        protected virtual void WriteDesc(ref BwaSourceDesc d)
+        {
+            d.gain     = gain;
+            d.priority = priority;
+            d.group    = (uint)group;
+            // A script-set anisotropic extent wins over the isotropic slider, which is the engine's own
+            // last-call-wins rule between set_spread and set_extent (and the reason TryInit used to
+            // re-assert the extent right after the spread).
+            if (_extent.x > 0f || _extent.y > 0f) { d.spread = _extent.x; d.extentHeight = _extent.y; }
+            else                                  { d.spread = spread;    d.extentHeight = -1f; }
+            d.sizeMeters = sizeMeters;
+            d.reverbSend = reflectionSend;
+            if (_attSet) { d.attenRefDist = _attRef; d.attenRolloff = _attRolloff; d.attenMinGain = _attMin; }
+            // Same mapping bwa_source_set_directivity_preset uses: omni = weight 0 (off, power 1),
+            // cardioid = 0.5, figure-8 = 1, with the component's sharpness on the non-omni patterns.
+            d.directivityWeight = directivity == BwaDirectivity.Omni     ? 0f
+                                : directivity == BwaDirectivity.Cardioid ? 0.5f : 1f;
+            d.directivityPower  = directivity == BwaDirectivity.Omni ? 1f : directivityPower;
+            d.doppler          = doppler;
+            d.airAbsorption    = airAbsorption;
+            d.loudnessComp     = loudnessComp;
+            d.proximity        = proximity;
+            d.occlusion        = occlusion;
+            d.earlyReflections = earlyReflections;
+            d.reverb           = reflections;
+            d.reverbDistance   = reflectionDistance;
+            d.pathing          = pathing;
+        }
+
+        /// <summary>Write `d` into this component's fields (the inverse of <see cref="WriteDesc"/>).
+        /// Override alongside it; call base first.</summary>
+        protected virtual void ReadDesc(in BwaSourceDesc d)
+        {
+            gain     = d.gain;
+            priority = d.priority;
+            group    = (int)d.group;
+            spread   = d.spread;
+            _extent  = d.extentHeight >= 0f ? new Vector2(d.spread, d.extentHeight) : Vector2.zero;
+            sizeMeters     = d.sizeMeters;
+            reflectionSend = d.reverbSend;
+            _attSet   = d.attenRefDist > 0f;
+            _attRef   = d.attenRefDist; _attRolloff = d.attenRolloff; _attMin = d.attenMinGain;
+            directivity = d.directivityWeight <= 0f    ? BwaDirectivity.Omni
+                        : d.directivityWeight >= 0.99f ? BwaDirectivity.Figure8 : BwaDirectivity.Cardioid;
+            if (directivity != BwaDirectivity.Omni) directivityPower = d.directivityPower;
+            doppler            = d.doppler;
+            airAbsorption      = d.airAbsorption;
+            loudnessComp       = d.loudnessComp;
+            proximity          = d.proximity;
+            occlusion          = d.occlusion;
+            earlyReflections   = d.earlyReflections;
+            reflections        = d.reverb;
+            reflectionDistance = d.reverbDistance;
+            pathing            = d.pathing;
+        }
+
+        // Unity's editor Reset (the component's context menu, and adding it to a GameObject). Unity has
+        // already restored the field initializers by the time this runs; re-filling from the engine's own
+        // BWA_SRC_DEFAULT keeps the two in step if a default ever moves. bwa_source_preset is PURE, so it
+        // needs no running engine — but it IS a P/Invoke, and a project that has not staged bw_audio.dll
+        // yet would throw here, where the field initializers are already the right answer.
+        protected virtual void Reset()
+        {
+            try { ApplyPreset(BwaSourceKind.Default); }
+            catch (DllNotFoundException) { }
+            catch (EntryPointNotFoundException) { }
+        }
 
         // Push this source's directivity pattern + sharpness. The preset call sets the pattern (and,
         // for Omni, turns directivity off); a non-omni pattern then re-issues with directivityPower, since

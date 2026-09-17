@@ -4,6 +4,648 @@ All notable changes to `com.brainworks.bw_audio`.
 
 ## [Unreleased]
 
+## [0.7.0]
+
+### Added: `Engine.HostTimeNs`, a direct read of the engine's host clock (ABI 0.15.0)
+
+`bwa_host_time_ns` reads the same monotonic clock `GetClock`'s `hostTimeNs` is stamped with (QPC on
+Windows, `CLOCK_MONOTONIC` on Linux and Android, `mach_absolute_time` on macOS). It takes no engine
+handle, so it works before an `Engine` exists.
+
+Sandwich it between two reads of your own clock and the epoch offset becomes a measurement with an
+error bound you can see, instead of an estimate: `a = Time.realtimeSinceStartupAsDouble;
+h = Engine.HostTimeNs; b = Time.realtimeSinceStartupAsDouble;` gives `offset = h*1e-9 - (a+b)/2`,
+bounded by `(b-a)/2`, with no convergence period.
+
+`DspTimeFramesAt` and `RealtimeAt` are unchanged and remain the default path: their decaying-max
+estimator over the block stamps needs no extra call and self-corrects drift. Reach for `HostTimeNs`
+when you want a bounded one-shot anchor, or have another timeline to reconcile.
+
+### Added: the package ships Linux (x86_64) and macOS (universal) plugins
+
+`Runtime/Plugins/Linux/x86_64/libbw_audio.so` and `Runtime/Plugins/macOS/libbw_audio.dylib`, so the
+package now covers all four platforms the engine builds for. Both `.meta` files are committed like
+every other one, and unlike the Android one they enable the **Editor** as well as the player: a
+Linux or macOS collaborator opens the project and presses Play. Linux is x86_64 for the Linux
+editor and the `LinuxStandalone64` player; macOS is `AnyCPU` for the macOS editor and
+`StandaloneOSX`, because the one file is universal (x86_64 and arm64).
+
+`DllImport("bw_audio")` is unchanged again: Mono resolves that name to `libbw_audio.so` on Linux
+and `libbw_audio.dylib` on macOS.
+
+What differs is the device. Linux outputs through JACK (a PipeWire desktop answers the same ABI) or
+ALSA, and can reach the 26-channel array over AES67. macOS has no device backend yet, so the engine
+runs its offline sinks there: everything works except making sound.
+
+The macOS library is **not code-signed or notarized**. A `.dylib` that arrives inside a downloaded
+tarball carries a quarantine flag and the Editor refuses to load it, so clear it once after
+installing: `xattr -dr com.apple.quarantine <the imported package folder>`. Distribution outside a
+lab would need a Developer ID signature and notarization.
+
+`tools/upm/pack.ps1` refuses to pack without either library, the same way it already refuses
+without the Android one, and CI builds both in the `linux` and `macos` jobs and hands them to the
+packing job.
+
+### Added: the package ships an Android (arm64-v8a) plugin
+
+`Runtime/Plugins/Android/arm64-v8a/libbw_audio.so`, for a standalone-headset build. Its `.meta` is
+committed like every other one and enables the plugin for Android with CPU ARM64 and for nothing
+else, not the Editor; an installed package is immutable, so import settings that arrive wrong
+cannot be fixed in the Inspector. `DllImport("bw_audio")` is unchanged: Mono resolves that name to
+`libbw_audio.so` on Android exactly as it resolves it to `bw_audio.dll` on Windows, so no binding
+code moved.
+
+Output on Android is stereo through AAudio. There is no 26-channel transport there, so a wide
+request falls to the silent offline sink; use the binaural profile, and push the headset's head
+transform through the ordinary listener call. `tools/upm/pack.ps1` now REFUSES to pack without the
+library rather than shipping a package that installs, exports an APK, and throws on the headset.
+CI cross-builds it in a new `android` job and hands it to the packing job.
+
+Steam Audio is inside that library too, linked statically, so binaural on a headset is the real
+HRTF decode and automatic occlusion, pathing and the reflection bed all work. The package gains no
+file for it; what it costs is size, about 7 MB rather than 0.4 MB.
+
+### Changed: the package ships ONE native library per platform (`phonon.dll` is gone)
+
+Steam Audio is now linked statically into the engine, so `Runtime/Plugins/x86_64/phonon.dll` and its
+`.meta` are gone from the package. `bw_audio.dll` is self-contained: same features, one file. There
+is nothing to keep beside it and nothing to copy into a build.
+
+If you are upgrading an existing project, delete the stale `phonon.dll` (and its `.meta`) that the
+old package left in `Packages/` or `Assets/`. It is dead weight now, and the engine never looks for
+it.
+
+### Changed (breaking): `BWA_VERSION` -> 0.13.0, and `bwa_get_dsp_time` is gone
+
+The ABI version tracks compatibility, not releases, and this set of changes is not compatible with
+0.12.0. `bwa_get_dsp_time` was renamed to `bwa_get_dsp_time_frames`, so a symbol was REMOVED, and
+seven calls were added: `bwa_source_set_channel`, `bwa_source_set_region`, `bwa_poll_looped`, and
+the four bed aliases `bwa_bed_play_at`, `bwa_bed_play_loop`, `bwa_bed_stop_at` and
+`bwa_bed_set_region`.
+
+0.12.0 was never tagged, so it was tempting to fold this into it. Do not. Binaries stamped 0.12.0
+already exist with the old symbol set, and telling two different ABIs apart is the only thing
+`bwa_get_version` is for. A stale GDExtension built before the rename is exactly the case it has to
+catch, and it can only catch it if the numbers differ.
+
+### Fixed: the engine could put a NaN on the bus, and a play region could stall the audio thread
+
+Two real-time correctness bugs, both on calls documented as safe to make every frame.
+
+`isfinite` is not a range check. A finite but absurd coordinate such as `3e38` passed every guard,
+and then the first thing any spatial solve does is square a coordinate difference, which overflows
+to infinity, and the normalize that follows produces a NaN. Gains are sticky, so once one voice was
+poisoned every later block was too, and the value reached the align delay line and the room EQ
+biquads, whose IIR state holds it past any later correction. Coordinates and room dimensions are now
+bounded, not merely checked for finiteness, and the bound is a required argument to the check so the
+mistake is no longer expressible. This accounted for five fuzz seeds.
+
+`bwa_source_set_region` could make audio-thread work unbounded and caller-controlled. Setting a small
+region on a voice that had been looping for a while made the wrap seam walk back one span at a time,
+which for an hour-long loop re-regioned to one frame is on the order of a hundred million iterations
+inside a single buffer callback. It is a modulo now, and one shared helper serves all three seam
+sites so a bed and a source can no longer answer the same call differently.
+
+Also fixed: a play region or a seek issued after an async play was silently lost, on exactly the call
+order the documentation prescribes; destroyed handles reported stale playheads, directivity and
+occlusion; triangle indices were handed to the ray tracer without being checked against the vertex
+count, which is an out-of-bounds read rather than a wrong value; and a group stop left held plays to
+start by themselves.
+
+### Fixed: `Engine.StopGroup` left a still-decoding play to start after the stop
+
+`StopAll` dropped the plays still waiting on an async decode. `StopGroup` did not, so a play issued
+against a `LoadAsync` handle in that group started by itself the moment its decode landed. That is a
+sound beginning after you told the group to stop, and only on async assets, which is the hardest
+shape to catch by ear.
+
+The engine now tracks each source's mix group on the control side as well, so a group stop can find
+the pending plays that belong to it. `StopGroup` drops this group's held plays; `StopAll` still drops
+every one. Both push the stop command before dropping anything, so a momentarily full command ring
+leaves no half-effect. The group a still-decoding play belongs to is the one its source was in when
+the stop ran.
+
+### Fixed: `SourceBase.Channel` cached a route the engine had refused
+
+The setter pushed whatever it was handed and cached it. The engine refuses an index outside
+`0 .. ChannelCount - 1`, and refuses every negative but `Bwa.CHANNEL_AUTO`, but it refuses into
+`bwa_last_error` where nothing reading the property would ever see it. So `Channel = 99` left the
+source PANNED while `Channel` answered 99, which is exactly how a reference source gets read as a
+single-speaker ground truth in an experiment that is really hearing a phantom.
+
+It now refuses out of range with a warning and keeps the route the source had, matching Godot's
+`BwaSource.set_channel`. The negative half is checked even before the source is live, because a
+negative needs no channel count to judge. `ChannelRouteTests` pins both halves, warnings included
+(`LogAssert.Expect`, so a silent refusal fails the test).
+
+### Fixed: a play held on an async decode voided the duplicate-end suppression
+
+`onFinished` has two feeds and a one-shot latch that keeps one end from reaching both. The latch was
+cleared by the next play. A play HELD on an async decode is not a play the engine has bound: it
+bumps a voice's play counter only at bind time, and that counter is the gate that drops a completion
+straggling in from the PREVIOUS play. Until it moves the straggler is still deliverable, so clearing
+the latch on a held play opened the way for one end to be reported twice. The case that produces the
+straggler is a stop landing on the block a clip runs out in, which the engine posts a completion for
+anyway.
+
+The latch is now cleared by the next play that BINDS: at the call for a synchronous play, and on the
+frame the data lands for a held one. `AmbisonicBed` had the same latch and the same defect and takes
+the same fix. `Engine.WatchPendingLoad` gained an `out bool landed` so a component can tell "the
+decode arrived" from "the decode failed", which is the same distinction as "the play bound".
+
+`CompletionTests.HeldPlayVoidsSuppressionOnceItBinds` pins the half that is decidable by ordering:
+a held play must void the suppression once it binds, or the clip it eventually plays reports no end
+at all. The double-fire itself is NOT covered here and the test says so. Unity arms the latch only
+inside `Emitter.PostCommit`, which `Engine` runs after the ended drain in the same `LateUpdate`, so
+the window is the microseconds between those two calls and no ordering the harness can impose widens
+it. Godot's `demo/api.gd` covers that half deterministically, because `BwaEmitter.stop()` arms its
+latch synchronously.
+
+### Added: a headless PlayMode suite, so the binding is EXECUTED and not only compiled
+
+Every change below this line was compile-verified only. Nothing in the repo had ever run the Unity
+binding's runtime behavior, and behavioral confidence was inference from the Godot binding driving
+the same C ABI through equivalent machinery. `bindings/unity/test~/` closes that: 20 PlayMode tests
+that drive the real components against the real `bw_audio.dll` on the offline sink, registered as the
+`unity_playmode` ctest behind `-DBWA_UNITY_EXE=<editor>`. Details and the feasibility notes are in
+`https://github.com/aforren1/cave-audio/blob/bd3af4e584a5/docs/integration.md` -> "Tests".
+
+What it pins, in the order the risk sits: a sub-frame clip fires `onFinished` exactly once (the case
+the drain replaced the `IsPlaying` edge for); a natural end fires once and not twice with both feeds
+armed; `Stop()` still fires, which is Unity's contract and not Godot's; a stop scheduled onto the
+clip's final block fires once; a looping source raises `onLoop` per wrap and `onFinished` never;
+`SetRegionFrames` confines the playhead and truncates a one-shot; the seconds spellings of the region
+and the seek agree with the frames ones exactly; a bed raises both events through Engine's second
+handle map, and bed and source events do not cross; and `EndedEventsDropped` / `LoopEventsDropped`
+rise when starved and stay at zero when pumped.
+
+Two properties keep it from being a suite that cannot fail, which is the default outcome for a test
+suite rather than a rare mistake:
+
+- **Determinism comes from ordering, not from timing.** Several tests turn the `Engine` component
+  off for a stretch. Only `bwa_commit` is frame-gated, so a play still reaches the audio thread and
+  a voice starts, plays and ends while nothing commits, drains, or polls is-playing. Turning the
+  pump back on gives exactly one pump against a known state. "Fires exactly once" is then decidable
+  rather than a race the test happens to win.
+- **Every test was falsified.** Each one was run against a deliberately broken binding and confirmed
+  to go red: `NotifyEnded` made a no-op (the old `IsPlaying` edge) fails the sub-frame test;
+  dropping `_wasPlaying = false` makes the natural end fire twice; removing the halt fallback loses
+  `Stop()`; dropping the rate conversion in `SeekSeconds` / `SetRegionSeconds` lands the playhead on
+  frame 1 instead of 48000; removing Engine's bed-map lookup loses every bed event; pinning either
+  dropped counter at 0, or at "always one more", fails its own test.
+
+The suite also carries its own vacuity guards. One test asserts the sub-frame clip really is shorter
+than a frame at the measured frame interval (1.33 ms against 33 ms, 25x), because that claim is what
+the headline test rests on. One asserts the bed fixture loads as 4-channel B-format through the
+AmbiX loader, because the same file taken through the default mono loader reports one channel and
+would have made the check vacuous. And the ctest driver judges `results.xml` rather than the exit
+code, refusing a run that discovered fewer tests than expected or skipped any.
+
+### Added: a convenience tier over the core ABI (`BWA_VERSION` -> 0.12.0)
+
+Four additions in the same spirit, all of them control-thread sugar over calls that already existed.
+The C ABI sat one tier below what a client actually writes, so every client rebuilt the same three
+things by hand. `https://github.com/aforren1/cave-audio/blob/bd3af4e584a5/docs/api.md` gains an "API tiers" section that states the split and the guarantee
+that goes with it: a convenience call writes the same command ring and lands in the same mixer, so
+nothing new reaches the audio thread and there is no second render path.
+
+- **Shared asset ownership: `bwa_sound_acquire` / `bwa_sound_release`.** A by-path, refcounted cache
+  keyed on `(normalized path, flags)`, with the four loaders folded into one `bwa_load_flags`
+  parameter (`BWA_LOAD_STREAM`, `BWA_LOAD_AMBIX`, `BWA_LOAD_FUMA`). Both bindings had already built
+  this privately, and the Godot side had to carry a `unload_sound_path` fan-out precisely because one
+  path can be cached under several keys. That is the engine's own key, so it is the engine's job now.
+  The explicit-ownership loaders (`bwa_load_sound` and siblings) are unchanged; mixing the two tiers
+  on one handle is refused with an error string rather than silently corrupting the refcount.
+- **Async loading: `bwa_sound_acquire_async` / `bwa_sound_is_ready`.** Returns a usable handle
+  immediately and decodes on a lazily started loader thread, for content that arrives mid-session.
+  A play issued against a not-yet-ready handle is held on the control thread and re-issued as an
+  ordinary `CMD_PLAY` once the data lands, so playback starts from frame 0 with nothing skipped. The
+  audio thread never sees a reserved slot and gained no new branch. See `https://github.com/aforren1/cave-audio/blob/bd3af4e584a5/docs/concurrency.md`,
+  "Async asset staging".
+- **Source configuration: `bwa_source_desc` with `bwa_source_preset`, `bwa_source_create_desc`,
+  `bwa_source_apply`, `bwa_source_get_desc`.** There were 24 per-source setters and readback for two
+  of them, so configuring one prop took 15 or more calls, and nothing could print or reset a source.
+  This is the same fill-then-apply shape as `bwa_tuning` and it carries the same `struct_size` guard
+  for the same reason: this struct's zero is not its default (gain 0 is silence, pitch 0 is invalid),
+  so a zero-initialized struct must fail loudly. Position, orientation, and playback state are
+  deliberately excluded; they are per-frame, not configuration. `bwa_source_apply` is one ring
+  command, and the payload packs inside the union's existing width, so no other command pays for it.
+- **Scene transitions: `bwa_group_stop` and `bwa_stop_all`.** Mix groups had gain and pause but no
+  stop. Both ride the existing one-block fade, so they are click-free (invariant 4), and both stop
+  beds and drop pending play queues. Neither resets the mixer: group gains, pause gates, and master
+  gain survive, so a re-played scene returns at the levels the client dialed.
+
+`Bwa.BoundVersion` moves to 0.12.0 to match the header. The Unity binding rides all four additions
+now, in the entry below, and `Engine.cs`'s `Dictionary<string, uint> _sounds` is gone with them.
+
+The Godot migration turned out to delete less than the sentence here first claimed. Its
+deduplication, its reference counting, and the four-prefix key fan-out ("m:", "s:", "a:", "f:") all
+go, because that fan-out existed only for the want of a shared key. The path-to-handle RECORD stays,
+but for a narrower job than it had: `unload_sound_path` releases the references this NODE holds and
+no others, and `sound_is_ready` answers only for keys this node acquired. The metadata getters do
+not use it at all any more. They go through `bwa_sound_find` (below), which the migration added for
+exactly this and which answers for any resident path, not just the ones this node loaded.
+
+A fourth console walkthrough, `examples/convenience.c` (`bwa_convenience`), demonstrates the whole
+tier against a running engine: two systems acquiring one clip and getting one decode, the same file
+resident in RAM and streamed at once, a probe that does not load, a handle handed out before its PCM
+exists, a source configured and read back through one struct, and the two scene-transition stops.
+Every part ends by naming the core calls it replaces, because the claim of this tier is that the two
+spellings are the same audio. The three existing examples keep teaching the explicit tier and now
+point at it. `examples/playground.cpp`'s per-source scene reset became one `bwa_source_apply`.
+
+All four console examples now run under ctest as `example_*`. A new `--tests` flag forces the offline
+sink, so the suite never depends on an ASIO driver being installed, and cuts the listening time
+(17 seconds for all four). They exercise the real ABI end to end, which catches a change that still
+compiles but misbehaves, and `bwa_convenience` verifies every claim it prints and exits nonzero on a
+mismatch rather than only proving it did not crash.
+
+### Added: the bed playback surface, and completion + loop events on beds
+
+Both bindings exported `bwa_bed_play` but none of the four scheduled or region forms the C ABI
+carries beside it, and neither could tell a client that a bed had ENDED or WRAPPED.
+
+- **Unity** `AmbisonicBed` gains `PlayAt(startSample)`, `PlayLoop(loopBeg, loopEnd)`,
+  `StopAt(stopSample)`, `SetRegionFrames(startFrame, endFrame)` and `SetRegionSeconds`, over the
+  new `bwa_bed_play_at`, `bwa_bed_play_loop`, `bwa_bed_stop_at` and `bwa_bed_set_region` P/Invoke
+  declarations. Every one of those quantities is FRAMES, so the region call carries its unit in its
+  name, beside a seconds twin, exactly as `Emitter.SetRegionFrames` does.
+- **Godot** `BwaBed` gains the same five as `play_at` / `play_loop` / `stop_at` /
+  `set_region_frames` / `set_region_seconds`.
+- **Events.** `AmbisonicBed` gains `onFinished` and `onLoop`, and `BwaBed` the `finished` and
+  `looped` signals, with the emitter's contract on both sides. A bed IS a voice, so the core had
+  been reporting bed handles through `bwa_poll_ended` and `bwa_poll_looped` all along. What was
+  missing was the ROUTE: a bed is not a source component in either binding (it has no position, and
+  the source registry exists to push one every frame), so the drain never found an owner for a bed
+  handle and dropped it silently. Each binding now keeps a second handle map for beds, consulted
+  when a handle belongs to no source. Bed and source handles come out of one pool, so a handle is a
+  source's or a bed's and never both.
+- The halt fallback comes with them: an explicit halt posts no completion event at all, so a bed
+  keeps the same narrow is-playing edge an emitter does, read after the drain, with the same
+  one-shot latch so a halt and a straggling completion describing one end cannot both report it.
+  Godot's `BwaBed` needs the emitter's full three-state machine for this. A two-flag version looked
+  equivalent and was not: a stop is enqueued, so the bed still reads as playing for a block
+  afterward and re-armed the edge, which then fell to silence as a spurious `finished`. The Godot
+  demo caught it.
+
+### Added: loop events, play regions, and the single-speaker route
+
+Three ABI additions, added because a collaborator's Max/MSP and Spat5 rig could do things this
+engine could not: play arbitrary content out of exactly one speaker, take an event at a loop
+boundary, and bound playback to a region inside a file.
+
+- **`Emitter.onLoop`**, from `bwa_poll_looped`. A looping voice never ends, so `onFinished`
+  reports it exactly never, and pacing an experimental trial or cueing a visual off a loop had no
+  event at all. `Engine` drains this ring beside the ended one, under the same single-owner rule
+  and at the same point (after `bwa_commit`, which is what fills both), and dispatches through the
+  same handle-to-component map. It is NOT entangled with `onFinished`: a wrap does not mean the
+  voice stopped, so none of the completion latching applies to it. One callback per WRAP, so a
+  loop region shorter than a frame fires several times in one frame.
+  `Engine.LoopEventsDropped` surfaces the ring's own dropped total, which unlike the ended one
+  can rise without anything being wrong.
+- **`Emitter.SetRegionFrames` / `SetRegionSeconds`**, from `bwa_source_set_region`. Bound the
+  clip to `[start, end)`: a looping voice wraps back to `start`, a one-shot ENDS at `end` exactly
+  as it would at the clip end, so a loop region and a truncated one-shot are one call. Both
+  spellings, and no bare `SetRegion`, for the reason the repo already spells `seek_frames` and
+  `get_output_latency_frames` in Godot: the two differ by a factor of the sample rate, and a
+  caller arriving from `AudioSource.time` guesses seconds.
+- **`SourceBase.Channel`** (with `Bwa.CHANNEL_AUTO`), from `bwa_source_set_channel`. Sends one
+  source out of one speaker with no spatial processing: the psychophysics ground-truth condition,
+  a real speaker to A/B a phantom against. Not `bwa_set_test_signal`, which injects a built-in
+  tone after the per-speaker align stage and is therefore not level-comparable with a rendered
+  source. Script-only rather than a serialized inspector field, because a route is a run-time
+  experimental condition and not authored configuration; it is replayed across a re-enable.
+
+### Changed (breaking): `Emitter.Seek` is `SeekFrames`, beside a new `SeekSeconds`
+
+`Seek(ulong)` took engine-rate FRAMES under a bare name. `AudioSource.time` is seconds, so a caller
+arriving from Unity's own API reads the bare spelling as seconds, and the two differ by a factor of
+the sample rate. That is the same defect the Godot binding already spells around with
+`seek_frames` / `seek_seconds`, and the same reason `SetRegionFrames` / `SetRegionSeconds` landed
+above with no bare `SetRegion`. `Seek` was the last call in the Emitter surface still taking the
+bare form.
+
+`Emitter.Seek(ulong samples)` becomes `Emitter.SeekFrames(ulong frame)`, and `SeekSeconds(double
+seconds)` converts at the engine's sample rate exactly as `SetRegionSeconds` does (a negative
+position is ignored, and it is inert with no engine). There is no alias and no `[Obsolete]`
+forwarder: nothing ships against this yet, so the correct spelling is worth more than the
+compatibility.
+
+Those three names are settled in the next entry, as a set.
+
+### Changed (breaking): the time-unit sweep, and the 0.5.0 decision reversed
+
+**0.5.0 decided to KEEP `SourceBase.Playhead` / `PlayheadSeconds`, `AmbisonicBed.Playhead` and
+`Engine.OutputLatency`** (see "Changed - units in names, where they earn it" below), on the argument
+that `AudioSource.timeSamples` versus `time` is Unity's own spelling of the frames-versus-seconds
+pairing and that there was no host collision to fix. **That decision is reversed.** Two things
+changed under it:
+
+- The argument covered `Seek` equally well, and `Seek` was renamed to `SeekFrames` above, beside a
+  new `SetRegionFrames` / `SetRegionSeconds` pair that never had a bare spelling. So the 0.5.0
+  reasoning was left half-applied: the same surface now spelled the unit in some places and leaned
+  on Unity's precedent in others, which is worse than either rule applied consistently.
+- The "no host collision" half is simply false for the clock. **Unity's own `AudioSettings.dspTime`
+  is a `double` of SECONDS**, and `Engine.DspTime` returned a `ulong` of FRAMES. That is the exact
+  defect the repo already spells around in Godot (`AudioServer.get_output_latency()` is seconds), in
+  the opposite unit and under a nearly identical name. It is also the hardest one to notice, because
+  the two are wrong by a factor of the sample rate, which reads as a plausible-but-early cue.
+
+Renamed, with no alias and no `[Obsolete]` forwarder (nothing ships against this yet):
+
+| Old | New |
+| --- | --- |
+| `SourceBase.Playhead` | `SourceBase.PlayheadFrames` |
+| `AmbisonicBed.Playhead` | `AmbisonicBed.PlayheadFrames` |
+| `Engine.OutputLatency` | `Engine.OutputLatencyFrames` |
+| `Engine.DspTime` | `Engine.DspTimeFrames` |
+| `Engine.DspTimeAt(realtime)` | `Engine.DspTimeFramesAt(realtime)` |
+
+Added beside them, so every frames-valued reading has its seconds twin: `AmbisonicBed.PlayheadSeconds`
+(a bed and a source now read alike, and match Godot's `BwaBed`), `Engine.OutputLatencySeconds` (the
+unit AV-alignment arithmetic wants, since a measured display delay is seconds too), and
+`Engine.DspTimeSeconds` (the like-for-like comparison against `AudioSettings.dspTime`; only
+DIFFERENCES are comparable, since the two clocks have different epochs).
+
+`Engine.RealtimeAt(dspSample)` is deliberately NOT renamed: `Realtime` is Unity's own word for that
+clock and it is seconds there too, so the name already agrees with its unit, and the parameter
+carries its own.
+
+The C ABI and the Godot binding move with it, so all three layers say the same thing:
+
+| Layer | Old | New |
+| --- | --- | --- |
+| C | `bwa_get_dsp_time` | `bwa_get_dsp_time_frames` |
+| Godot | `BwaEngine.get_dsp_time()` | `get_dsp_time_frames()` + new `get_dsp_time_seconds()` |
+
+That was the last bare time-valued name in the C ABI. `start_sample` / `stop_sample` /
+`dsp_sample` keep the `sample` spelling of the same unit, as 0.5.0 decided.
+
+### Fixed: `Emitter.onFinished` missed any clip shorter than a frame
+
+The event was driven by edge-detecting `bwa_source_is_playing` once per frame, which is exactly the
+mechanism the header tells clients not to use for completion: "you may never observe a sound shorter
+than your poll interval as playing. That is exactly why `bwa_poll_ended` exists." A footstep, a UI
+click, a short impact could come and go entirely between two `LateUpdate` calls and `onFinished`
+would never fire. The code comment admitted the miss rather than fixing it.
+
+`Engine` now drains `bwa_poll_ended` and routes each handle to the source component that owns it.
+
+- **`Engine` is the single owner of the drain.** The drain is engine-wide and destructive, so a
+  second caller would consume other components' completions and those would silently never fire.
+  `Engine.Register`/`Unregister` keep a handle to component map for the dispatch, removed with the
+  source so it neither leaks nor outlives a handle. A generation is bumped before a slot is reissued,
+  so a later source cannot mint a key this map still holds.
+- **Polled after `bwa_commit`, in the same `LateUpdate`.** The ended ring is filled by the pass
+  `bwa_commit` runs, so polling before it would read a frame-old picture.
+- **The `IsPlaying` edge survives as a narrow fallback, because an explicit HALT posts no event.**
+  `bwa_source_stop`, `stop_at`, `fade_out`, `bwa_group_stop` and `bwa_stop_all` all take the
+  click-free stop path, which sets the voice not-playing without posting a completion (the engine's
+  position is that a halt is not a completion, and a stolen voice is not one either). Unity's
+  `onFinished` has always fired for those, so it still does. The fallback reads AFTER the drain, so a
+  natural end is reported by its event and not twice; a latch absorbs the one interleaving where a
+  voice ends between the drain and the read.
+- **`Engine.EndedEventsDropped` surfaces `dropped_out`.** The ended ring is bounded and drops the
+  oldest, so a non-zero total means that many `onFinished` callbacks never fired. A warning names it
+  once, on the first increase.
+
+### Fixed: the async tests could not tell whether they had covered the held-play window
+
+Review turned up a test that could not fail. Both the C asset test and the Godot demo fixture claimed
+to cover the window in which a play waits on a decode, and neither could know whether it had: a small
+asset usually decodes before the first render, so the play binds immediately, the held path goes
+untouched, and every assertion still passes.
+
+The fix is ordering, not machinery. A finished decode is adopted only at a pump point
+(`bwa_sound_acquire`, `bwa_sound_is_ready`, `bwa_sound_find`, `bwa_sound_release`, `bwa_commit`), and
+`bwa_source_play` is not one of them, so a play issued straight after `bwa_sound_acquire_async` with
+nothing pumping in between is guaranteed to be held. `test/assets_test.c` now does exactly that and
+asserts it, using `bwa_sound_get_channels` (0 while the slot is reserved, and it does not pump) as
+the witness. Checked in both directions: inserting a readiness check before the play makes those
+assertions fail, which is the silent way the coverage was being lost.
+
+A `bwa_set_loader_stall` diagnostic was built for this first and then removed. It worked, but it put
+a call in the public ABI that existed only for testing, and ordering gets the same guarantee for
+nothing. Two cases genuinely cannot be pinned this way and now say so instead of implying otherwise:
+cancelling an in-flight load (`bwa_sound_release` pumps on entry, so the decode may already be
+adopted) and the Godot fixture (the binding checks readiness on its way to playing). Both assert the
+outcome, which holds either way, and neither claims to have exercised the hold.
+
+### Added: `bwa_sound_find`, a by-path probe that does not load
+
+Migrating both bindings onto the shared asset tier turned up one gap, and both hit it independently:
+there was no way to ask "which handle does this path have" without `bwa_sound_acquire`, whose miss
+path *loads* the file. Godot has three public methods that are by path (`unload_sound_path`,
+`sound_get_frames`, `sound_get_channels`), and probing them with an acquire would have reinstated
+exactly the hidden-decode bug those getters were fixed for in an earlier release. It would also have
+decoded mono, so an ambisonic bed would report 1 channel forever.
+
+`bwa_sound_find(engine, path, flags)` returns the handle for a key the cache already holds, or 0. It
+never loads, never touches the disk, and never takes a reference, so the handle it returns is
+borrowed: read metadata from it, do not release against it. A still-loading async entry answers with
+its handle (it is resident; ask `bwa_sound_is_ready` about the data), while a failed one answers 0
+because it holds nothing to answer about.
+
+Godot's `find_loaded_sound` now asks the engine instead of scanning its own record, so it answers for
+any resident path rather than only the ones loaded through the node. Unity's `SoundFrames` and
+`SoundChannels` probe first, so asking a resident clip its length no longer takes a reference.
+
+Failure stays deliberately uncached on the synchronous path: a failed `bwa_sound_acquire` records
+nothing and the next call retries the file, which is what a late-appearing file wants. A client that
+asks in a loop should remember its own failures, which is why `Engine` keeps a small set of failed
+keys rather than re-hitting the disk every frame.
+
+### Added: the Unity binding rides the convenience tier
+
+`Bwa.cs` binds the eleven new entry points: `bwa_sound_acquire`, `bwa_sound_acquire_async`,
+`bwa_sound_is_ready`, `bwa_sound_find`, `bwa_sound_release`, `bwa_group_stop`, `bwa_stop_all`,
+`bwa_source_preset`, `bwa_source_create_desc`, `bwa_source_apply`, and `bwa_source_get_desc`,
+with `BwaLoadFlags`,
+`BwaSourceKind`, and the `BwaSourceDesc` struct. That file claims to bind every `BWA_API` function
+except `bwa_set_output_capture` and `bwa_render_block`, a claim that has been false before, so it was
+re-checked by diffing the header's `BWA_API` list against the file's `DllImport` list: those two are
+the only difference.
+
+`BwaSourceDesc` follows the `BwaTuning` precedent field for field, including the `structSize` guard
+and `UnmanagedType.I1` for the C `bool`. `Engine.Awake` now proves that layout rather than trusting
+it: `bwa_source_preset` is pure and fills `struct_size` with the engine's own `sizeof`, so comparing
+it against `Marshal.SizeOf<BwaSourceDesc>()` catches a field the binding got wrong. A mismatch there
+is not a crash, it is the marshaller handing the engine a short buffer to read past, so the check
+refuses to start for the same reason the version check does.
+
+**`Engine`'s asset dictionary is gone.** The `"ambix:"` and `"fuma:"` key prefixes existed only
+because the ABI had four separate loaders; the engine keys on `(path, flags)` itself now, so
+`Engine.Acquire(clip, flags)` is the one path and `Load` / `LoadAmbix` / `LoadFuma` are one-liners
+over it. `LoadStreaming` comes free with the flag. Behavior is unchanged: the same clip returns the
+same handle, assets live for the engine's lifetime, and `bwa_destroy` frees them whatever the
+refcount, so there is nothing to release at teardown. One small map survives, and it holds no
+handles: a **negative** cache of clips that failed to load. A synchronous acquire that fails inserts
+no cache entry, so without it a missing clip would re-open the file and re-log the warning on every
+`Play`.
+
+**Async loading is opt-in per emitter.** `Emitter.loadAsync` routes `Play` through
+`Engine.AcquireAsync`: the call returns at once and the source stays silent until the data lands,
+then starts from the clip's first frame. It is off by default because the CAVE's normal path is
+load-time and synchronous. The not-ready window is handled where the ABI says it must be:
+`Emitter.Queue` and `Emitter.PlayOneShot` refuse a still-decoding clip and say so, because neither
+can be held, and the emitter polls `bwa_sound_is_ready` while a load is in flight so a decode that
+FAILS gets reported instead of leaving a silent source and no explanation.
+
+**Sources configure in one call.** `SourceBase` gains `BuildDesc`, `ApplyDesc`, `TryGetDesc`,
+`ApplyPreset(kind)`, and the editor `Reset`, and the create-time push is now a single
+`bwa_source_apply` instead of the seventeen setters it used to issue. That matters when a prefab
+spawns: the engine packs the audio-thread knobs into one ring command, and `bwa_play_oneshot`
+already documents dropping when the ring is momentarily full. The per-property setters and
+`OnValidate`'s live re-push are untouched, so an inspector drag still behaves exactly as before. The
+inspector fields stay the source of truth in both directions, which is why `ApplyPreset` writes them
+rather than configuring the source behind their back, and why the new preset picker in the source
+inspector is undoable. `bwa_source_preset` is pure, but it is still a P/Invoke, so both entry points
+into it from the editor (the picker's Apply button and the component's `Reset`) catch
+`DllNotFoundException`: a project that has not staged `bw_audio.dll` yet would otherwise throw from
+inside `OnInspectorGUI` and lose the whole inspector on every repaint.
+
+`Engine.StopGroup(group)` and `Engine.StopAll()` sit beside the existing group gain and pause
+wrappers. Both are click-free, both stop beds, and neither resets the mixer.
+
+### Added: `AmbisonicBed` loads asynchronously too
+
+`AmbisonicBed.loadAsync` is the opt-in `Emitter` already had, on the component that gains most from
+it: a bed is a 4, 9, or 16 channel file and usually a long one, so it is the biggest in-frame decode
+a scene does. `Play` routes through `Engine.AcquireAsync`, returns at once, and the field starts from
+its first frame on the block its data lands. It is off by default for the same reason the emitter's
+is, that the CAVE's normal path is load-time and synchronous.
+
+The acquire flags carry the kind, and that is what makes an async bed play safe. `fumaClip` picks
+`BWA_LOAD_AMBIX` or `BWA_LOAD_FUMA`, and the engine judges the play against those flags rather than
+against a channel count, because a still-decoding asset reports 0 channels and has no count to judge.
+A handle acquired as mono is refused at `bwa_bed_play` itself, and as a backstop a held play whose
+asset lands as the other kind is dropped rather than bound, with the `bwa_commit` that dropped it
+reporting so. The window between the acquire and the decode is guarded at both ends: the bed either
+plays as a soundfield or does not play at all.
+
+A bed is world-locked, so it has no per-frame push to hang a readiness poll on the way an emitter
+does. The watch is a coroutine that exists only while a load is in flight, which is why a bed still
+costs nothing per frame when it is not loading. The poll itself is now `Engine.WatchPendingLoad`,
+shared by both components: a decode that FAILS never becomes ready, so silence alone cannot separate
+"still decoding" from "failed", and the one warning that separates them has a single implementation
+instead of two that drift. `Emitter` keeps its behavior and the exact wording of its warning.
+
+### Added: the Godot binding rides the convenience tier
+
+**`BwaEngine`'s asset cache is the engine's now.** The `"m:"` / `"s:"` / `"a:"` / `"f:"` key
+prefixes are gone, and with them the fan-out `unload_sound_path` had to do over all four. They
+existed only because the ABI had four separate loaders with no shared key. `load_sound` and
+`load_ambisonic` are one-liners over one `acquire_sound(path, flags, async)`, and the binding no
+longer deduplicates or counts references.
+
+What could NOT be deleted, and why: `unload_sound_path(path)` and `sound_is_ready(path, flags)` are
+questions about the references this NODE owns, and the ABI cannot answer those. So `BwaEngine` keeps
+a flat record of the `(path, flags)` keys it acquired, holding one reference each. It is an ownership
+ledger now, not a cache. `sound_get_frames(path)` and `sound_get_channels(path)` do not consult it:
+they go through `bwa_sound_find` (added for this, above), which never loads on a miss and so
+cannot restore the hidden-decode bug those getters were fixed for.
+
+**Three new by-path calls on `BwaEngine`:** `preload_sound(path, flags)` warms the cache before the
+first play, `preload_sound_async(path, flags)` starts the decode without a player, and
+`sound_is_ready(path, flags)` reports the landing. `flags` is a bound bitfield, `LOAD_MEMORY` /
+`LOAD_STREAM` / `LOAD_AMBIX` / `LOAD_FUMA`, so the four loaders are one argument here too.
+`group_stop(group)` and `stop_all()` join the group gain and pause wrappers.
+
+**Async loading is opt-in per player.** `async_load` on `BwaEmitter` and on `BwaBed` is off by
+default, for the same reason as Unity's: the CAVE's normal path is load-time and synchronous. A bed
+gets the switch as well because a soundfield is the case that most wants it. The not-ready window is
+handled where it bites: an emitter's end detector reads the voice as "not playing" for the whole
+hold, so it would spend its four-frame grace and announce a `finished` for a sound that had not
+started. The grace now only runs once the handle is READY, and a decode that FAILS is reported and
+clears the detector instead of leaving it pending forever. `is_loading()` exposes the window, and
+`queue` stays synchronous because the core refuses to resolve a queue entry against a not-ready
+handle.
+
+**Sources configure in one value.** `BwaSource` gains `get_desc()`, `apply_desc(dict)`,
+`reset_to_preset(kind)`, and the static, engine-free `BwaSource.get_preset(kind)`, mirroring
+`get_setup_tuning` / `apply_setup` for the engine knobs, and for the same stated reason: a
+Dictionary can be printed and diffed. `apply_desc` OVERLAYS, so only the keys present change and a
+`get_desc` round trip is a no-op. Creation now goes through `bwa_source_create_desc`, so a source
+arrives configured in one ring command instead of fifteen, and the desc is validated before a voice
+is allocated. `BwaPushSource` creates first and applies second, since a push voice has no
+`create_desc` form. Applying a desc writes the node's own properties too, so the inspector cannot
+disagree with what the engine is rendering.
+
+`demo/api.tscn` covers the lot on both sinks: the preset table, the desc round trip and overlay, the
+preload and unload path, the async landing with a check that no `finished` fires during the hold,
+and both scene stops.
+
+### Fixed: an async asset could be bound as the wrong KIND, silently
+
+Found in review of the async tier, before it shipped.
+
+The engine tells a mono point source from an ambisonic bed by channel count, and both play calls
+guard on it: `bwa_source_play` refuses a multichannel asset, `bwa_bed_play` requires one. A
+still-decoding `bwa_sound_acquire_async` handle reports 0 channels, so it passed both guards. Play a
+pending AmbiX handle on a point source and the play was accepted, held, and bound to a bed when the
+decode landed. The mixer dispatches on the asset, so it then rendered as a soundfield, and the
+spread, directivity, and panner settings the caller had dialed in did nothing. Nothing reported
+this, at the call or afterwards. A pending mono asset sailed through `bwa_bed_play` the same way.
+`bwa_play_oneshot` and `bwa_source_queue` were never affected, because they refuse a not-ready
+handle outright.
+
+The load flags already fix the kind at acquire time, and the asset cache keeps them per entry, so
+the mismatch is now refused at the play call itself with the reason in `bwa_last_error`. That is
+where a caller can still do something about it. Behind that, a held play carries the kind it was
+issued as (one byte), and `rt_sound_publish` re-checks it against the real channel count once the
+data lands: a mismatch is dropped rather than bound, and the `bwa_commit` that dropped it says so
+through `bwa_last_error`, so a client that never polls readiness is not left with silence and no
+trace. Beds reach the core through their own `rt_bed_play` entry point now, because a voice cannot
+be asked afterwards which kind the caller meant.
+
+That backstop notice is the one exception to the documented `bwa_last_error` rule, which says a
+per-frame call that merely enqueues never sets it and that you should read it right after the call
+you are checking. The drop belongs to a play call that returned successfully several frames earlier,
+so there is no call to attribute it to. Both `bwa_last_error` and `bwa_commit` now say this at their
+declarations rather than leaving the header contradicting itself.
+
+### Fixed: a play could cancel a voice steal, and stale-handle directivity could poison a live source
+
+Both are pre-existing holes that the convenience tier made easier to reach, found in review of it.
+
+`CMD_PLAY` cleared a voice's `stopping` flag unconditionally, which silently downgraded a
+steal-in-progress. `CMD_STOP` right beside it already knew not to do that. A steal has already handed
+the caller a replacement handle on a reserve slot and is waiting on the victim to fade, free, and
+acknowledge; resurrecting the victim cancels that acknowledgement, so its `stealing` flag stays set
+and the source can never be stolen again for as long as it lives, leaving the pool a slot short. A
+client playing a mid-steal handle could always reach this. What changed is that `rt_sound_publish`
+can now re-issue a held play by itself, so the engine could do it to itself at the timing of a
+decode landing. `CMD_PLAY` now refuses to downgrade a steal.
+
+`bwa_source_set_directivity` wrote its control-side cache with only a bounds check, no generation
+gate, even though the comment on that cache block claims every per-source setter is gated. A stale
+handle could therefore scribble a value that the slot's NEXT occupant inherited. That used to be
+harmless, because the rt and sim calls drop a stale handle on their own. It stopped being harmless
+when `bwa_source_apply` began reading that cache to skip a directivity change that already matches,
+and `bwa_source_get_desc` began reporting from it: the apply would conclude "already matches" and
+skip a real change, so the source rendered omni while the readback claimed figure-8. Now gated like
+every other setter.
+
+Two smaller hardening fixes alongside: `rt_unload_sound` now refuses a reserved (async, not yet
+published) sound slot, which is the invariant the staging comment states and the function it names
+(unreachable through the public ABI today, so this guards the next internal caller); and
+`rt_stop_all` pushes its command before dropping held plays, so a momentarily full ring no longer
+leaves the half-effect of voices still playing with the pending plays silently gone.
+
+### Fixed: a stopped one-shot leaked its voice slot forever
+
+`pause_gate`'s stop-finalize freed the voice slot only for a steal. A one-shot's handle is
+engine-internal, so nothing else ever recycles it, and the natural-end path had always done this
+free. The bug was unreachable until now because no public call could stop a one-shot mid-play; the
+new voice-table sweeps reach it, and without the fix a scene transition would burn a slot per
+one-shot until the pool ran dry. Found while testing `bwa_stop_all`, with a regression test that
+fails without the fix.
+
+### Fixed: a recycled source slot inherited the previous occupant's directivity
+
+`bwa_source_create` did not reset the control-side `src_fwd` / `src_dirw` / `src_dirp` / `src_pos`
+caches for a reused slot, while rt had already cleared the corresponding `Voice`. The two now agree.
+
 ## [0.6.0]
 
 ### Fixed: the default speaker grid was unreachable, and the binding claimed a failed layout was survivable
@@ -87,7 +729,7 @@ where matching a 3-vector is not, so the ITD comes out exact and stays exact as 
 - Not implemented: the published method's near-field ILD arm (one first-order filter per image). It
   needs per-speaker frequency-dependent gain, which would make this a render mode rather than a
   gain-vector modifier. The near-field proximity shelf and near-listener widening cover adjacent
-  ground. See https://github.com/aforren1/cave-audio/blob/fb85546ccff1/docs/spatialization.md for how this differs from VISR's own CAP, which minimizes energy
+  ground. See https://github.com/aforren1/cave-audio/blob/bd3af4e584a5/docs/spatialization.md for how this differs from VISR's own CAP, which minimizes energy
   and permits negative gains where this minimizes change from the seed and does not.
 
 ### Added: situation tuning (`bwa_tuning_preset` / `bwa_apply_tuning`)
@@ -111,7 +753,7 @@ sits or roams. `bwa_setup` names that, `bwa_tuning_preset` fills a complete `bwa
 - **Seated and roaming differ in exactly three fields** today (`panner`, `dual_band`,
   `dual_band_cap`), and `smoke` asserts that count. That is not an oversight, it is what the evidence
   supports: most knobs are still rig-day questions and are left at the engine default rather than
-  guessed. https://github.com/aforren1/cave-audio/blob/fb85546ccff1/docs/api.md carries a per-field evidence table marking each value as measured, design
+  guessed. https://github.com/aforren1/cave-audio/blob/bd3af4e584a5/docs/api.md carries a per-field evidence table marking each value as measured, design
   intent, or unmeasured, so a preset cannot quietly become folklore.
 
 ### Fixed: a finite but un-normalized listener quaternion poisoned the render
@@ -184,7 +826,7 @@ tell, so all four are fixed at the C level and the workarounds can go.
 - **`bwa_source_is_playing` no longer lies about a RE-play.** The published word carries a play
   SEQUENCE now, because it alone cannot tell "not playing, before your play" from "after it": same
   generation, same 0 bit. A re-play on a handle whose voice already ended used to read false until
-  the next rendered block, while `https://github.com/aforren1/cave-audio/blob/fb85546ccff1/docs/api.md` claimed the opposite in as many words. Prefer
+  the next rendered block, while `https://github.com/aforren1/cave-audio/blob/bd3af4e584a5/docs/api.md` claimed the opposite in as many words. Prefer
   `bwa_poll_ended` for completion regardless; is_playing still cannot see a clip shorter than your
   poll interval, and no sequence fixes that.
 - **Scene composition no longer needs a lie or a re-derivation.** `bwa_scene_set_mesh_mat` **clears**
@@ -284,7 +926,7 @@ sidelobes bend rE even at center, and the taper suppresses them.
 - This is the **diffuse layer only**. Point-source panning is untouched, and so is `BWA_PROFILE_BINAURAL`,
   where the taper is gated off anyway. What changes is ambisonic beds, the reflection bed and the FDN
   reverb's line render.
-- The rig trial in `https://github.com/aforren1/cave-audio/blob/fb85546ccff1/docs/hardware-validation.md` now **confirms rather than gates**. If the rig
+- The rig trial in `https://github.com/aforren1/cave-audio/blob/bd3af4e584a5/docs/hardware-validation.md` now **confirms rather than gates**. If the rig
   disagrees, revert the default. Turn it off with `bwa_set_max_re(e, false)`.
 - `bwa_set_max_re_split` stays OFF. Nothing in the evidence speaks to the band split, so the broadband
   taper remains the incumbent.
@@ -406,7 +1048,7 @@ routes, **was tried and made point-source localization worse**: rE direction err
 intended bearing rose from 14 degrees to 26 (routed to the rim) or 30 (share discarded) at 60 degrees
 below the horizon, and only the exact pole improved. An imaginary speaker is a triangulation vertex,
 so it claims a share of every direction in the hole and drags it poleward. No code change; the
-measurements and the reasoning are recorded in https://github.com/aforren1/cave-audio/blob/fb85546ccff1/docs/spatialization.md so nobody repeats it.
+measurements and the reasoning are recorded in https://github.com/aforren1/cave-audio/blob/bd3af4e584a5/docs/spatialization.md so nobody repeats it.
 
 ### Added: SPCAP focus/density tuning, and an ABI break to score it (`BWA_VERSION` → 0.11.0)
 
@@ -491,7 +1133,7 @@ previous result and reporting before/after scores plus ear-plane occupancy.
   content wants (spherical uniformity), not only for the point-source panners.
   `epad` / `allrad` / `maxre` tokens (GUI: bed decode combo + max-rE checkbox)
   grade the decode the install actually ships.
-- The measured tradeoffs live in https://github.com/aforren1/cave-audio/blob/fb85546ccff1/docs/layout-schema.md (pin-count trend, the
+- The measured tradeoffs live in https://github.com/aforren1/cave-audio/blob/bd3af4e584a5/docs/layout-schema.md (pin-count trend, the
   visual-wedge verdict per panner, the leash-matching caveat). Headline: narrow
   conditions express requirements, they are not accuracy shortcuts; DBAP gained
   nothing in the wedge from wedge-only optimization, VBAP's fixed solve did.
@@ -540,7 +1182,7 @@ one in this ABI - frames and seconds are both real - so every time-valued name n
 Distances (meters), frequencies (Hz), angles (radians) and gains (linear) have no competitor and
 stay unmarked, carrying the unit on the value (`radius_m`, `xover_hz`, `yaw_rad`) where it helps.
 A decibel value must say `_db`, since linear is the unmarked default. Stated in
-https://github.com/aforren1/cave-audio/blob/fb85546ccff1/docs/api.md → "Coordinates and units".
+https://github.com/aforren1/cave-audio/blob/bd3af4e584a5/docs/api.md → "Coordinates and units".
 
 - **Three C symbols renamed** (the only frames-valued names that did not say so):
   `bwa_get_output_latency` → `bwa_get_output_latency_frames`, `bwa_source_get_playhead` →
@@ -553,6 +1195,9 @@ https://github.com/aforren1/cave-audio/blob/fb85546ccff1/docs/api.md → "Coordi
 - **Unity is unaffected at the C# level** - only the P/Invoke declarations follow the C symbols.
   `Playhead` / `PlayheadSeconds` and `OutputLatency` keep their names: `AudioSource.timeSamples`
   vs `time` is Unity's own spelling of the same pairing, and there is no host collision to fix.
+  **REVERSED in [Unreleased]** ("the time-unit sweep, and the 0.5.0 decision reversed"). The
+  no-collision half was wrong for the clock (`AudioSettings.dspTime` is a seconds `double`), and the
+  precedent half stopped applying once `Seek` became `SeekFrames`.
 - Deliberately NOT renamed: the `sample`/`frame` synonym (`start_sample`, `dsp_sample`), which
   denotes the same thing for mono voices and has never misled anyone, and `ir_seconds` → `ir_s`
   for consistency with its `_s` siblings. Both are churn against a frozen-soon ABI.
@@ -591,8 +1236,8 @@ interpreted. Both stayed invisible off-hardware, because the null sink returns t
   `Engine.AsioDrivers`. The count/name pair remains, but it was undocumented and had to be found by
   grepping the DLL's strings.
 - **The release artifacts no longer ship dangling doc pointers.** The 0.4.0 zip contained
-  `playground.gd` and `scenes.gd` citing `https://github.com/aforren1/cave-audio/blob/fb85546ccff1/docs/api.md` and `THIRD_PARTY-NOTICES.md` citing
-  `https://github.com/aforren1/cave-audio/blob/fb85546ccff1/docs/build.md`, none of which are in the zip. Both packs now run `tools/dist/doc-pointers.ps1`,
+  `playground.gd` and `scenes.gd` citing `https://github.com/aforren1/cave-audio/blob/bd3af4e584a5/docs/api.md` and `THIRD_PARTY-NOTICES.md` citing
+  `https://github.com/aforren1/cave-audio/blob/bd3af4e584a5/docs/build.md`, none of which are in the zip. Both packs now run `tools/dist/doc-pointers.ps1`,
   which rewrites every repo-doc reference in the staged tree to a permalink at the packed commit
   and then FAILS the pack if any relative `.md` reference is left that the stage cannot satisfy.
   The Unity tarball had the same bug and is fixed the same way.
@@ -767,7 +1412,7 @@ with the ones a scene actually authors surfaced on the components:
   handle) - unified in `SourceBase.TryInit`.
 - **`ProjectCheck` warning** pointed at the wrong menu: "Tools → Engine → Disable Unity Audio" now
   reads "Tools → BwAudio → Disable Unity Audio", matching the actual `MenuItem` path.
-- **Docs**: the README and `https://github.com/aforren1/cave-audio/blob/fb85546ccff1/docs/integration.md` "1:1" claims now name the two deliberately-unbound
+- **Docs**: the README and `https://github.com/aforren1/cave-audio/blob/bd3af4e584a5/docs/integration.md` "1:1" claims now name the two deliberately-unbound
   calls instead of overclaiming. The README's live-A/B list gains SPECTRAL spread and max-rE, and
   its load-time list names the bed decoder as AllRAD / EPAD (sampling is no longer selectable).
 
@@ -965,7 +1610,7 @@ one door per knob.
   (mirrored by the existing `BwaMaterialPreset`) instead of a name string - the misspelled-name
   footgun is gone, and the C# `PresetName` shim with it. Custom materials are unchanged:
   `bwa_material_define` returns the same kind of `bwa_material` token.
-- **Readback naming unified**: `bwa_get_channel_count`, `bwa_get_dsp_time`,
+- **Readback naming unified**: `bwa_get_channel_count`, `bwa_get_dsp_time_frames`,
   `bwa_get_audio_backend` (were `bwa_channel_count`/`bwa_dsp_time`/`bwa_audio_backend`), and the
   test tone is a setter like its siblings: `bwa_set_test_signal` (was `bwa_test_signal`).
 - **The last env vars moved into `BwaDesc`** - there are now NO environment variables:

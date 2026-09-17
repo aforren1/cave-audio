@@ -118,9 +118,14 @@ namespace BwAudio.EditorTools
             EditorGUILayout.LabelField("Live", EditorStyles.boldLabel);
 
             string backend = Bwa.Backend(a.Handle) ?? "?";
-            var kind = backend.StartsWith("asio:") ? MessageType.Info : MessageType.Warning;
+            // A real device is anything that is not the silent offline sink or the caller-pumped one.
+            // Checking for the "asio:" prefix stopped being the right test the moment a headphone
+            // profile could legitimately open a WASAPI endpoint instead.
+            bool live = !(backend == "null" || backend.StartsWith("null ") ||
+                          backend == "manual" || backend.StartsWith("manual ") || backend == "none");
+            var kind = live ? MessageType.Info : MessageType.Warning;
             EditorGUILayout.HelpBox(
-                $"backend: {backend}{(backend == "null" ? "  (SILENT — no audio device)" : "")}\n" +
+                $"backend: {backend}{(live ? "" : "  (SILENT — no audio device)")}\n" +
                 $"channels: {a.ChannelCount}\n" +
                 $"active voices: {a.ActiveVoices}", kind);
 

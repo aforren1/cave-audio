@@ -21,7 +21,7 @@ This is a UPM package: a verified P/Invoke layer (`Bwa`) plus two MonoBehaviours
 | `AudioSource.volume` | `Emitter.Gain` (and `FadeTo` / `FadeOut` - the engine runs the fade, no coroutine) |
 | `AudioSource.pitch` | `Emitter.Pitch` (glides; in-memory clips only) |
 | `AudioSource.priority` | `Emitter.Priority` (a full voice pool steals the LOWEST-priority source) |
-| `AudioSource.isPlaying` | `Emitter.IsPlaying` (+ an `onFinished` UnityEvent) |
+| `AudioSource.isPlaying` | `Emitter.IsPlaying` for "still going"; the `onFinished` and `onLoop` UnityEvents for "it ended" and "it wrapped" |
 | `AudioListener.volume` | `Engine.MasterGain` |
 | `AudioListener.pause` | `Engine.Paused` (every voice freezes; resume continues exactly) |
 | `AudioMixerGroup` (ducking) | mix groups: `Emitter.group` + `Engine.SetGroupGain` / `SetGroupPaused` |
@@ -39,8 +39,15 @@ engine owns decoding, which also avoids Unity's 8-channel output cap entirely.
 
 ## Install
 
-**Windows x64 only** (ASIO is Windows-only). The released package **ships the native engine**.
-`bw_audio.dll` and `phonon.dll` are inside it, with import settings already configured. Nothing to build.
+**Four platforms**: Windows x64, Linux x86_64, macOS (universal) and Android arm64-v8a. The
+released package **ships the native engine** for every one of them, with import settings already
+configured. Nothing to build, and one file per platform: Steam Audio is linked into the engine
+rather than shipped beside it.
+
+The array itself is Windows only, because ASIO is. Linux reaches it over AES67 through JACK or
+ALSA; macOS has no device backend yet, so it renders offline; Android is the headphone path on a
+standalone headset. The macOS library is unsigned, so clear its quarantine flag once after
+installing a downloaded package: `xattr -dr com.apple.quarantine <the imported package folder>`.
 
 ### From a git URL
 
@@ -51,7 +58,7 @@ https://github.com/aforren1/cave-audio.git#unity
 ```
 
 `unity` is a distribution branch whose **root** is the package: `package.json` at the top level, with
-the two DLLs already in it. That is the only layout UPM's git installer accepts. CI republishes the
+every platform's engine library already in it. That is the only layout UPM's git installer accepts. CI republishes the
 branch on every `v*` tag. Once a tag exists, use a tag ref (`#v0.4.0`) to pin a release instead of
 tracking the branch.
 
@@ -78,15 +85,23 @@ the C# with no engine behind it (`DllNotFoundException` on the first call), and 
 at the repo root there either. That is what the `unity` branch above exists to fix: CI publishes a
 built, root-level copy of the package to it. Against a working tree, use a local path.
 
+The package has a headless PlayMode suite in `test~/`, wired into ctest as `unity_playmode`. It runs
+the real components against the real DLL on the offline sink. Point CMake at an editor to register
+it (`-DBWA_UNITY_EXE="C:/.../Editor/Unity.exe"`); without that the test is skipped, because Unity is
+not a build dependency. See
+[docs/integration.md → Tests](https://github.com/aforren1/cave-audio/blob/bd3af4e584a5/docs/integration.md#tests) for what it covers and why it needs
+PlayMode. `test~/` never ships: the pack script stages `Runtime` and `Editor` only, and Unity itself
+ignores any folder whose name ends in `~`.
+
 > **License:** the engine is **GPLv3** (`bw_audio.dll` links the ASIO SDK under its GPLv3 option).
 > Internal use never triggers copyleft: it is a *distribution* condition. But shipping a Unity app
 > containing this DLL to third parties would place that app under GPLv3. See
-> [`docs/build.md`](https://github.com/aforren1/cave-audio/blob/fb85546ccff1/docs/build.md) for the proprietary-ASIO alternative.
+> [`docs/build.md`](https://github.com/aforren1/cave-audio/blob/bd3af4e584a5/docs/build.md) for the proprietary-ASIO alternative.
 
 ## Releasing (maintainers)
 
 The canonical whole-repo release process (version model, steps, dev versions) lives in
-[docs/build.md → Releasing](https://github.com/aforren1/cave-audio/blob/fb85546ccff1/docs/build.md#releasing). This is the Unity-package view of it.
+[docs/build.md → Releasing](https://github.com/aforren1/cave-audio/blob/bd3af4e584a5/docs/build.md#releasing). This is the Unity-package view of it.
 
 **The GitHub Release is the distribution** - there's no registry, no token, and nothing to keep in sync.
 
@@ -109,7 +124,7 @@ A release carries four assets. **Two matter here**: this package
 (`com.brainworks.bw_audio-<ver>.tgz`) and the engine on its own (`bw_audio-win64-<tag>.zip` -
 dll/lib/header/tools, for C/C++ consumers and the CAVE machine). The other two are the Godot addon
 and the ASIO SDK corresponding source. See
-[docs/build.md](https://github.com/aforren1/cave-audio/blob/fb85546ccff1/docs/build.md#continuous-integration) for the full breakdown.
+[docs/build.md](https://github.com/aforren1/cave-audio/blob/bd3af4e584a5/docs/build.md#continuous-integration) for the full breakdown.
 
 Locally:
 
@@ -222,6 +237,39 @@ startup, so you can't flip it from a runtime script. It's a one-time project set
    listener, then one `bwa_commit`. The audio thread therefore never sees a half-moved frame, which
    is what makes the moving-observer case correct. Do not push from individual emitters.
 
+### Ends and loop boundaries are events
+
+`onFinished` and `onLoop` come from the engine's own event rings, not from watching a playing flag.
+Watching the flag cannot work: `IsPlaying` is a per-block readback, so a clip shorter than a frame
+may never once read as playing, and a looping voice never ends at all. `Engine` drains
+`bwa_poll_ended` and `bwa_poll_looped` once per `LateUpdate`, right after the commit that fills
+them, and routes each handle to the component that owns it. `AmbisonicBed` has both events too.
+
+`Engine` is the **only** caller of either drain. Both are engine-wide and destructive, so a second
+caller would eat events belonging to other components and their UnityEvents would never fire. Read
+`Engine.EndedEventsDropped` and `Engine.LoopEventsDropped` for what the engine had to throw away
+because nothing read it in time. The ended total should stay 0. The loop total can rise for a
+harmless reason: a loop region shorter than a frame wraps more often than any frame rate reads it.
+
+`onLoop` fires once per **wrap**, not once per frame. It is how you pace a trial off the content
+rather than off `Time.deltaTime`. `Emitter.SetRegionFrames` / `SetRegionSeconds` set what it wraps
+at: a play region loops a sub-range of the clip, or cuts a one-shot short. `AmbisonicBed` has the
+same pair. Set the region **after** the play, because a play resets it.
+
+### One speaker, no panning
+
+`Emitter.Channel = n` sends a source out of exactly one output channel with no spatial processing,
+and `Bwa.CHANNEL_AUTO` puts it back on the panner. That is the psychophysics ground-truth condition:
+a real speaker to A/B a phantom against, played with whatever content you like. It is not
+`Engine.TestSignal()`, which injects a built-in tone *after* the per-speaker align stage and is
+therefore not level-comparable with anything the engine renders.
+
+The routed voice keeps the whole output stage a panned voice gets (align trims and delays, room EQ,
+master gain, limiter) and the route ramps in and out instead of clicking. Everything distance- or
+direction-derived is suppressed while it is on and comes back the moment you go to `CHANNEL_AUTO`.
+Mono point sources only. It is script-only on purpose: a route is a run-time experimental condition,
+not scene configuration, so it is not serialized.
+
 ### Procedural audio - `PushEmitter`
 
 When the audio isn't a file but something you **generate** - a software synth, an engine model, a
@@ -325,6 +373,6 @@ acoustic geometry.
 Everything the CAVE needs but a desktop engine doesn't is on `Engine`: `ChannelCount` (the layout's
 speaker count - **size meter arrays with it, never hard-code 26**), `BusLevels()` (per-channel output
 peaks), `SpeakerPositions()`, `ActiveVoices`, `TestSignal()` (a raw tone on one speaker, for wiring
-checks), `DspTime` (schedule a sample-accurate start), and `extraListeners` - the *other* occupants,
+checks), `DspTimeFrames` (schedule a sample-accurate start), and `extraListeners` - the *other* occupants,
 so panning becomes a compromise across everyone in the room instead of exact for one head and wrong
 for the rest.
