@@ -1,10 +1,13 @@
 # Third-party notices
 
-Notice text accompanying bw_audio binary distributions. `https://github.com/aforren1/cave-audio/blob/fb85546ccff1/docs/build.md` has the
+Notice text accompanying bw_audio binary distributions. `https://github.com/aforren1/cave-audio/blob/bd3af4e584a5/docs/build.md` has the
 full dependency and licensing discussion; this file is what ships next to the
 binaries.
 
-## In `bw_audio.dll`
+## In the engine library (`bw_audio.dll`, `libbw_audio.so`, `libbw_audio.dylib`)
+
+The ASIO SDK below is in the Windows DLL only, because ASIO is a Windows driver model.
+Everything else is in every platform's build of the library.
 
 - **Steinberg ASIO SDK** — used under its GPLv3 option. This repository and the
   distributed DLL are GPLv3 (see `LICENSE`). (c) Steinberg Media Technologies GmbH.
@@ -16,16 +19,18 @@ binaries.
   domain (Unlicense) or MIT No Attribution.
 - **cJSON** — MIT (text below). Copyright (c) 2009-2017 Dave Gamble and cJSON
   contributors.
-- **Steam Audio (`phonon.dll`)** — Apache License 2.0, Copyright Valve
-  Corporation. Ships alongside `bw_audio.dll` in with-SDK builds, including the
-  CI artifact; keep the two DLLs together.
+- **Steam Audio (phonon)** — Apache License 2.0, Copyright Valve Corporation.
+  Statically linked into `bw_audio.dll` in with-SDK builds, including the CI
+  artifact, together with the mysofa, zlib and pffft archives it links. Its
+  source, at the pinned commit and with the one patch this repo applies, ships as
+  `bw_audio-steam-audio-src-<tag>.zip` on each GitHub Release.
   License: https://github.com/ValveSoftware/steam-audio/blob/master/LICENSE.md
 
 ## In the tools (`bwa_playground`, `bwa_layout_tool`, `bwa_calib_view`)
 
 - **godot-cpp** — MIT (text below). Copyright (c) 2017-present Godot Engine
   contributors. Statically linked into the Godot extension
-  (`bw_audio_gd.*.dll`) only — no other artifact carries it.
+  (`bw_audio_gd.*`, one per platform and flavor) only — no other artifact carries it.
 - **Dear ImGui** — MIT (text below). Copyright (c) 2014-2026 Omar Cornut.
 - **ImPlot** — MIT (text below). Copyright (c) 2020 Evan Pezent.
 - **ImPlot3D** — MIT (text below). Copyright (c) 2024-2026 Breno Cunha Queiroz.

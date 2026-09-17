@@ -1,5 +1,5 @@
-bw_audio for Godot 0.6.0
-commit fb85546ccff1f4a8619916979d9c3d4b060826a2
+bw_audio for Godot 0.7.0
+commit bd3af4e584a5ba423e60d717747815d01fa9c5d5
 
 Install: copy addons/bw_audio/ into your Godot project, then enable nothing - a GDExtension
 loads on project open. Restart the editor after copying. To hear it work, open
@@ -8,6 +8,14 @@ to silent visual-only mode without an ASIO device).
 
 Requires Godot 4.7 or newer: compatibility_minimum in the manifest now matches the 4.7
 extension API the binary is compiled against (earlier packs understated it as 4.4). The
-extension is Windows x64 only, because the engine's device path is ASIO.
+extension ships for Windows x64 (the desktop, where the engine's device path is ASIO),
+Linux x86_64 (JACK or ALSA), macOS universal (headphones only, no device backend yet)
+and Android arm64-v8a (a standalone headset, stereo out through AAudio). Every one of
+them carries Steam Audio linked statically inside the engine library, so binaural is the
+real HRTF decode everywhere.
+
+The macOS libraries are NOT code-signed or notarized. Gatekeeper blocks a downloaded
+unsigned library, so clear the quarantine flag after unzipping:
+  xattr -dr com.apple.quarantine addons/bw_audio
 
 Licensed GPLv3 (see LICENSE). Complete corresponding source: this repo at the commit above.

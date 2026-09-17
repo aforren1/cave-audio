@@ -13,7 +13,7 @@
 ##   5 Blind A/B/X    - double-blind over live knobs, with a binomial p-value
 ##   6 Ambisonic bed  - a world-locked 3rd-order field; spin, tilt, renderer, max-rE
 ##   7 Reverb bed     - a shoebox + reverb; REBUILDS the engine on entry/exit
-##   8 Underwater     - the https://github.com/aforren1/cave-audio/blob/fb85546ccff1/docs/api.md "listener submerges" recipe: dive and the FDN retunes
+##   8 Underwater     - the https://github.com/aforren1/cave-audio/blob/bd3af4e584a5/docs/api.md "listener submerges" recipe: dive and the FDN retunes
 ##                      LIVE, the speed of sound glides, crossing sources muffle, and the
 ##                      pressure-release surface throws the Lloyd's-mirror bounce. Rebuilds
 ##                      like scene 7 (its FDN is load-time), phonon-free.
@@ -455,18 +455,23 @@ func _run_selftest() -> void:
 	var wat = scenes[7]
 	wat.update(1.0 / 60.0)                 # source starts above the surface, listener in air
 	if source.get_occlusion_factor() < 0.9:
-		push_error("playground: underwater scene occluded a clear same-side path")
+		push_error("playground: underwater scene occluded a clear same-side path (factor %.2f, %s)"
+			% [source.get_occlusion_factor(), wat.debug_state()])
 		fail += 1
 	wat.set_submerged(true)
 	wat.update(1.0 / 60.0)                 # the path now crosses the surface
 	if source.get_occlusion_factor() > 0.1:
-		push_error("playground: diving did not muffle the cross-surface source (factor %.2f)"
-			% source.get_occlusion_factor())
+		# The state comes with it because a bare factor cannot tell the two causes apart: crossed=0
+		# means the scene never pushed the interface loss, while crossed=1 with sim=true means the
+		# ray-traced sim republished over it (the ABI says the sim wins, so both must never be on).
+		push_error("playground: diving did not muffle the cross-surface source (factor %.2f, %s)"
+			% [source.get_occlusion_factor(), wat.debug_state()])
 		fail += 1
 	wat.set_submerged(false)
 	wat.update(1.0 / 60.0)
 	if source.get_occlusion_factor() < 0.9:
-		push_error("playground: surfacing did not clear the crossing occlusion")
+		push_error("playground: surfacing did not clear the crossing occlusion (factor %.2f, %s)"
+			% [source.get_occlusion_factor(), wat.debug_state()])
 		fail += 1
 	switch_scene(0)
 	if not engine.is_running():

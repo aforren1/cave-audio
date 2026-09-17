@@ -5,7 +5,8 @@ Library / Asset Store, which download a repository archive at a pinned commit, c
 addon WITH its binaries - which are deliberately not committed to `main`.
 
 The addon is `addons/bw_audio/`: a GDExtension control client for the bw_audio spatial
-audio engine (26-speaker CAVE array over ASIO, binaural monitor). Windows x64 only.
+audio engine (26-speaker CAVE array over ASIO, binaural monitor). Windows x64, Linux
+x86_64, macOS universal and Android arm64-v8a.
 
 - Install: copy `addons/bw_audio/` into your project, restart the editor. Nothing to enable.
 - Try it: open `addons/bw_audio/playground/playground.tscn` and press play.

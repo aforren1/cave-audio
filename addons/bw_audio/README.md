@@ -17,7 +17,44 @@ install-from-file entry point. So unlike the Unity binding, you cannot install *
 `godot` distribution branch directly. It exists to satisfy a store listing that pulls a repo
 archive.
 
-Windows x64 only, because the engine's device path is ASIO.
+Four platforms: **Windows x64** for the desktop, where the engine's device path is ASIO,
+**Linux x86_64** (JACK or ALSA), **macOS universal** and **Android arm64-v8a** for a standalone
+headset. Each carries an editor library and an export library, except Android, which runs no
+editor.
+
+### Android
+
+The addon carries `libbw_audio_gd.android.template_release.arm64.so` and the engine library
+`libbw_audio.so` beside the Windows pair, and the manifest lists both under
+`android.template_release.arm64` and `android.template_debug.arm64`. An Android export picks them
+up with no extra step: add the Android export template, export, and the exporter copies both into
+the APK.
+
+What differs on a headset:
+
+- Output is **stereo through AAudio**. There is no 26-channel transport on Android, so use the
+  binaural profile. A wider request falls to the silent offline sink.
+- The head pose comes from the **XR rig**, through the same listener push `BwaEngine` already does.
+- Steam Audio is **inside the library**, statically linked, so binaural is the real HRTF decode and
+  automatic occlusion, pathing and the reflection bed all work. It costs size: about 7 MB rather
+  than 0.4 MB.
+- `res://` paths are worse here than on the desktop: an exported APK holds them inside the `.pck`,
+  where the engine's file loaders have no OS path to open. Stage layouts and audio into `user://`.
+
+### Linux and macOS
+
+Nothing to do: unzip the addon and open the project, the same as on Windows. The manifest names an
+editor and a template_release library for each, so the extension loads in the editor too.
+
+- **Linux** outputs through JACK (a PipeWire desktop answers the same ABI) or ALSA. Its engine
+  library sits in `bin/linux/`, one level down from the others, because Android's has the same file
+  name and one addon carries both. The extension finds it through an `$ORIGIN` run path, in the
+  editor and in an exported game alike.
+- **macOS** has **no device backend yet**, so the engine runs its offline sinks there: everything
+  works except making sound. Its libraries are universal (x86_64 and arm64).
+- The macOS libraries are **not signed or notarized**. Gatekeeper blocks a downloaded unsigned
+  library, so clear the quarantine flag once after unzipping:
+  `xattr -dr com.apple.quarantine addons/bw_audio`.
 
 ## Coordinate seam
 
@@ -92,15 +129,25 @@ A/B tool.
 **`BwaSource : Node3D`** (abstract) - everything a spatial voice can do regardless of where
 its audio comes from: gain, priority, group, fades, pause, spread/extent/size, Doppler, air
 absorption, loudness compensation, attenuation override, occlusion (ray-traced or manual),
-directivity, reverb sends, early reflections, pathing.
+directivity, reverb sends, early reflections, pathing, and `set_channel()`, the direct
+output-channel route. The settings among those are also
+readable and writable as one Dictionary: `get_desc()`, `apply_desc()`, `reset_to_preset()`,
+and the static `BwaSource.get_preset()`. What a source is DOING stays out of that Dictionary:
+fades, pause, and the per-frame manual occlusion level are calls, not configuration.
 
 **`BwaEmitter : BwaSource`** - plays a file. Adds `play`/`play_at`/`play_loop`/`stop_at`,
-gapless `queue`, `seek_frames`/`seek_seconds`, `pitch`, and a `finished` signal.
+gapless `queue`, `seek_frames`/`seek_seconds`, `set_region_frames`/`set_region_seconds`,
+`pitch`, `async_load` with `is_loading()`, and the `finished` and `looped` signals.
 
 **`BwaPushSource : BwaSource`** - you feed it PCM. Adds `push`/`push_space`/`push_end`.
 
 **`BwaBed : Node`** - a world-locked ambisonic soundfield. A `Node`, not a `Node3D`: a bed
-has no position, only an orientation.
+has no position, only an orientation. It takes the same `async_load` opt-in as `BwaEmitter`,
+which is where a soundfield usually wants it: 4 to 16 channels of long recording. A bed is a
+voice, so it carries the emitter's playback surface too: `play`/`play_at`/`play_loop`/
+`stop_at`, `seek_frames`/`seek_seconds`, `set_region_frames`/`set_region_seconds`, and the
+`finished` and `looped` signals. It does not carry the spatial calls, because a bed is
+world-locked and has no position.
 
 **`BwaMaterial : Resource`** - an acoustic material as a `.tres`. Either a built-in preset
 or custom 3-band coefficients. The preset is an **enum, not a string**: the core answers an
@@ -158,25 +205,140 @@ play/seek/pitch on a push voice, so a single node with a mode flag would leave t
 visible in the inspector and silently inert. That is the exact class of quiet failure this
 binding tries to make unrepresentable.
 
-### Two things that bite anything polling a voice
+### One speaker, no panning
 
-`bwa_source_play` only **enqueues**, and `bwa_source_is_playing` is a per-block republish,
-so for a frame or two after a play the raw readback honestly says "not playing".
-`BwaEmitter` absorbs that window. A just-issued play counts as playing, and only a voice
-actually *observed* playing can fire `finished`. Without that, a naive edge detector fires
-`finished` on frame one of every sound.
+`set_channel(n)` sends a source out of exactly one output channel with no spatial processing,
+and `BwaSource.CHANNEL_AUTO` puts it back on the panner. That is the psychophysics
+ground-truth condition: a real speaker to A/B a phantom against, played with whatever content
+you like. It is not `BwaEngine.set_test_signal()`, which injects a built-in tone after the
+per-speaker align stage and is therefore not level-comparable with a rendered source.
 
-If you would rather not poll at all, `BwaEngine.poll_ended()` returns the voices that
-finished since the last call, so you can drive your own bookkeeping off that instead of
-edge-detecting `is_playing`.
+The routed voice keeps the whole output stage a panned voice gets - align trims and delays,
+room EQ, master gain, limiter - and the route ramps in and out instead of clicking. Everything
+distance- or direction-derived is suppressed while it is on (attenuation, spread, occlusion,
+the reverb and reflection sends, Doppler, air absorption) and takes effect again the moment you
+go back to `CHANNEL_AUTO`. Pitch and pause still apply. Mono point sources only.
 
-`finished` means the sound **ran out** - a non-loop end, a drained queue. An explicit
-`stop()` or `fade_out()` never fires it; `stop_at()` deliberately does, because a scheduled
-stop is an arranged ending and the caller wants to know when it landed.
+It is a method, not an exported property: a route is a run-time experimental condition, not
+scene configuration, so it is not serialized. It IS replayed if the source is re-created.
+
+A channel outside `0 .. BwaEngine.get_channel_count() - 1` is refused with a warning and the
+source keeps the route it had, so `get_channel()` never reports a speaker the voice is not on.
+`CHANNEL_AUTO` is the only negative that means anything, so every other negative is refused too,
+and refused with no engine at all: a negative needs no channel count to judge.
+
+The same rule runs through the transport calls. Every time-valued argument (`play_at`,
+`play_loop`, `stop_at`, `seek_frames`, `set_region_frames` and their seconds twins) reaches the
+engine unsigned, so a negative does not fail. It becomes an enormous positive: -1 frames is
+1.8e19, about twelve million years of dsp clock, which schedules a start for never and leaves a
+voice that reads as playing and stays silent. All of them refuse a negative with a warning.
+
+### Ends and loop boundaries are events
+
+`finished` and `looped` come from the engine's own event rings, not from watching a playing
+flag. Watching the flag cannot work: `bwa_source_is_playing` is a per-block republish, so a
+clip shorter than a frame may never once read as playing, and a looping voice never ends at
+all. `BwaEngine` drains `bwa_poll_ended` and `bwa_poll_looped` once per `_process`, right
+after the commit that fills them, and routes each handle to the node that owns it.
+
+`BwaEngine` is the ONLY caller of either drain. Both are engine-wide and destructive, so a
+second caller would eat events belonging to other nodes and their signals would never fire.
+`BwaEngine.get_ended_this_frame()` and `get_looped_this_frame()` hand you **this frame's batch** rather than
+draining again, so reading them costs nothing and misses nothing.
+`get_ended_events_dropped()` and `get_loop_events_dropped()` carry the running totals of what
+the engine dropped because nothing read it in time. The ended total should stay 0. The loop
+total can rise for a harmless reason: a loop region shorter than a frame wraps more often than
+any frame rate reads it, so pace trials off the wraps you receive.
+
+`looped` fires once per WRAP, not once per frame.
+
+`finished` means the sound **ran out** - a non-loop end, a drained queue, a play region's end.
+An explicit `stop()` or `fade_out()` never fires it; `stop_at()` deliberately does, because a
+scheduled stop is an arranged ending and the caller wants to know when it landed. The engine
+posts no event for any halt, so `stop_at` rides a narrow is-playing edge instead, read after
+the drain. A one-shot latch keeps a halt and a completion that describe the same end from both
+being reported.
+
+`bwa_source_play` only **enqueues**, so for a frame or two after a play the raw readback
+honestly says "not playing". `BwaEmitter.is_playing()` absorbs that window by counting a
+just-issued play as playing. If a play is dropped or its voice stolen at onset the engine
+posts nothing at all, and the node drops that claim after a few frames without inventing a
+`finished` for a sound that never played.
 
 `bwa_set_output_capture` is **not bound, on purpose.** Its callback runs on the audio
 thread, where calling into GDScript would allocate and take the interpreter lock - exactly
 what invariant 1 forbids. Use the MANUAL sink and `render_block()` for capture instead.
+
+### Assets: the engine owns the cache
+
+The core holds a by-path, reference-counted asset cache, keyed on the **path plus the load
+flags**. A file kept in RAM and the same file streamed are two assets, which is why the key
+carries the flags. Nodes acquire through the engine node, so the same clip on twenty emitters
+loads once.
+
+`preload_sound(path, flags)` warms it before the first play. `flags` is a `BwaEngine`
+bitfield: `LOAD_MEMORY` (0, the default), `LOAD_STREAM`, `LOAD_AMBIX`, `LOAD_FUMA`. The core
+refuses a combination no loader can express, such as AmbiX with FuMa.
+
+`unload_sound_path(path)` drops this node's reference to **every** form of the path. Other
+holders keep theirs, so nothing is pulled out from under a playing voice.
+
+`sound_get_frames(path)` and `sound_get_channels(path)` are **cached-only** on purpose. They
+ask the core through `bwa_sound_find`, a pure lookup that never loads and never takes a
+reference, so a path the engine has not loaded reports 0 instead of decoding as a side effect.
+An earlier version decoded on the miss, and it always decoded MONO, so an ambisonic bed
+answered 1 channel forever.
+
+`BwaEngine` still records the `(path, flags)` keys it acquired, but only to know which
+references are **its own**: `unload_sound_path` releases exactly those, and `sound_is_ready`
+answers only for them. That record is the last asset state left in the binding. The
+deduplication, the reference counting, and the lifetime are the engine's.
+
+### Loading late, without stalling the frame
+
+`async_load` on `BwaEmitter` and `BwaBed` is an **opt-in**, and off by default: the CAVE's
+normal path is load-time and synchronous. Turn it on for content that appears mid-session.
+
+A play against a still-decoding clip is held on the control thread. The voice binds, stays
+silent, and starts from the top of the clip on the block the data lands, so nothing clicks and
+no frames are skipped. `is_loading()` covers that window. `finished` is not fired in it: a
+sound that has not started cannot have ended.
+
+`BwaEngine.preload_sound_async(path, flags)` starts a decode without a player, and
+`sound_is_ready(path, flags)` reports the landing. False covers three cases, so do not poll it
+without knowing which: still decoding, the decode failed, or this engine never acquired that
+`(path, flags)` pair at all. Only the failure reports itself, through `get_last_error()`.
+
+Two calls refuse a not-ready handle rather than hold it, so the binding always loads them
+synchronously: `play_oneshot`, which owns no handle to start later, and `BwaEmitter.queue`,
+whose entry resolves at bind time.
+
+### Configuring a source in one value
+
+Twenty-plus setters describe a source, and until now nothing read your settings back. The two
+getters that existed report what the simulation is currently doing, not what you asked for. `get_desc()`
+returns the whole configuration as a Dictionary, so you can print it, diff two sources, and
+find the one that sounds wrong:
+
+```gdscript
+print(emitter.get_desc())
+emitter.apply_desc({"gain": 0.5, "occlusion": true})   # only the keys you pass change
+emitter.reset_to_preset(BwaSource.KIND_PROP)           # back to a clean configuration
+print(BwaSource.get_preset(BwaSource.KIND_AMBIENCE))   # static: no engine needed
+```
+
+The kinds are `KIND_DEFAULT`, `KIND_PROP`, `KIND_VOICE`, `KIND_AMBIENCE`, and `KIND_UI`. They
+name what a source **is**. Nothing in the table is measured: a kind differs from the default
+only where [docs/api.md](https://github.com/aforren1/cave-audio/blob/bd3af4e584a5/docs/api.md) argues the case, and every other field sits at the
+engine default.
+
+Position, orientation, and playback state are deliberately **out**. Position and orientation
+are per-frame and commit-gated, so they belong to the frame loop. Playback is what a source is
+doing, not what it is, and an apply must never restart a sound. The manual occlusion level is
+out for the same reason: it is a measurement the game publishes each frame.
+
+Applying a desc updates the node's own properties too, so the inspector never disagrees with
+what the engine is rendering.
 
 ### Picking the profile, and the device
 
@@ -184,7 +346,7 @@ what invariant 1 forbids. Use the MANUAL sink and `render_block()` for capture i
 value does rather than just naming it. The short version: **Binaural** is the direct
 headphone render (the default, and what you want at a desk), **CaveSim** auditions the
 26-speaker array over those same headphones, **Cave** drives the rig and nothing else. On a
-machine with no rig, Cave is correctly, deliberately silent. [docs/api.md](https://github.com/aforren1/cave-audio/blob/fb85546ccff1/docs/api.md)
+machine with no rig, Cave is correctly, deliberately silent. [docs/api.md](https://github.com/aforren1/cave-audio/blob/bd3af4e584a5/docs/api.md)
 has the full "pick by question, not habit" table.
 
 Whatever you pick, `get_audio_backend()` reports what actually happened, decode included:
@@ -246,7 +408,18 @@ trap: passing `1.5` lands on frame 1 and the clip just restarts. The engine's ow
 frames everywhere (`play_at`, `stop_at`, `play_loop`, `get_playhead_frames`) because that is what
 the dsp clock counts; the `_seconds` twins are conveniences over the resolved sample rate.
 
-The rule behind all three, if you are adding a call: **a unit belongs in the name when the quantity
+`get_dsp_time_frames()` / `get_dsp_time_seconds()` complete the set. The clock is frames, and every
+host's dsp-time call is seconds: Unity's `AudioSettings.dspTime` is a seconds `double`, and Godot's
+own `AudioServer` times are seconds too. Schedule with the frame value. It is the exact one, and it
+is what `play_at` and `stop_at` take.
+
+`BwaEngine.get_host_time_ns()` is static and follows the same rule. It reads the engine's own host
+clock, the one `get_clock()`'s `host_time_ns` is stamped with, so you can measure the offset from
+any clock of yours: read yours, call this, read yours again, and the offset is the middle value
+minus the mean of the two, with the error bounded by half the span. It needs no engine, so it
+answers before `BwaEngine` enters the tree.
+
+The rule behind all four, if you are adding a call: **a unit belongs in the name when the quantity
 has two live units in this engine.** Time does - frames and seconds are both real here - so every
 time-valued name says which. Nothing else does: distances are meters, frequencies Hz, angles
 radians, gains linear (a decibel value would have to say `_db`), and suffixing those would add
