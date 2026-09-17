@@ -14,6 +14,7 @@ It exists for two experiment shapes, described in
 Python, so it uses this package directly. Psychtoolbox is MATLAB and gets its own MEX binding later.
 
 ```python
+import time
 import bw_audio as bwa
 
 with bwa.Engine(profile=bwa.Profile.BINAURAL) as engine:
@@ -21,6 +22,8 @@ with bwa.Engine(profile=bwa.Profile.BINAURAL) as engine:
     source = engine.create_source()
     source.set_pos(1.0, 1.5, 2.0)
     source.play(click)
+    while source.is_playing():   # leaving the block closes the engine, which cuts the sound
+        time.sleep(0.01)
 ```
 
 ## Install
@@ -305,15 +308,13 @@ Full statement: [docs/api.md](../../docs/api.md#coordinates-and-units).
 
 ## Versions
 
-Two version streams, and they move independently.
-
-- **The package version is the ABI version**, `BWA_VERSION_*` in `include/bw_audio.h`, read from the
-  header at build time. A wheel can therefore never claim a version the library is not.
-  `bw_audio.abi_version()` reports what the loaded library says, `bw_audio.header_abi_version()`
-  what the extension was compiled against, and `bw_audio.check_abi()` raises when the two disagree
-  on major.minor.
-- **The release version is the git tag**, the same one the Unity package and the Godot addon carry.
-  It moves on its own cadence. See [docs/build.md](../../docs/build.md#releasing).
+One number. The package version is `BWA_VERSION_*` in `include/bw_audio.h`, read from the header
+at build time, so a wheel can never claim a version the library is not. The release script writes
+the git tag into that header before tagging, and CI refuses a tag that disagrees, so a wheel from
+release `vX.Y.Z` is `bw_audio-X.Y.Z` and the Unity package and the Godot addon carry the same
+number. `bw_audio.abi_version()` reports what the loaded library says,
+`bw_audio.header_abi_version()` what the extension was compiled against, and `bw_audio.check_abi()`
+raises when the two disagree on major.minor. See [docs/build.md](../../docs/build.md#releasing).
 
 ## Platform notes
 

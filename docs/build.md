@@ -352,37 +352,51 @@ marshaling pose through the engine each frame.
 ## Releasing
 
 The **git tag is the single source of truth for the release version.** You cut a release by
-pushing a `v*` tag; nothing else carries a version to bump. Two version streams stay separate,
-on purpose:
+pushing a `v*` tag. One number in the tree has to agree with it, and the release script keeps it
+so:
 
-- **Release version:** the tag (`v0.3.0`). `tools/upm/pack.ps1` stamps it into the packaged
-  `package.json` at build time, so the committed manifest is a permanent `0.0.0-dev` placeholder.
-  Nothing to keep in sync.
-- **ABI version:** `BWA_VERSION_*` in `include/bw_audio.h`, what `bwa_get_version()` returns. It
-  tracks binary compatibility (struct and enum layout) and moves only when the ABI changes. Bump it
-  by hand, independent of any release.
+- **The tag** (`v0.3.0`) names the release. `tools/upm/pack.ps1` stamps it into the packaged
+  `package.json` and the Godot manifest at build time, so the committed manifests are a permanent
+  `0.0.0-dev` placeholder.
+- **`BWA_VERSION_*` in `include/bw_audio.h`** is what `bwa_get_version()` returns and what the
+  Python wheels, the MEX gateways and the CMake package report. `tools/release.ps1` sets it to the
+  tag it cuts, and CI fails a `v*` tag whose header says something else, first thing in the
+  `windows` job. So a wheel out of release `v0.3.0` is `bw_audio-0.3.0`, and a client that checks
+  `bwa_get_version()` against the header sees the release number. Do not edit the defines by
+  hand: a patch release moves them too.
+
+Before 0.16.0 the header carried its own ABI counter (0.15.0 at the last such release) beside the
+tag (v0.7.0), and a wheel's version could not be related to the release it came from. The two
+were merged by continuing the header's sequence, which is why the tags jump from v0.7.0 to
+v0.16.0.
+
+Why not generate the header from CMake with a `.h.in` template? Because the header is consumed
+without CMake: `mkoctfile` compiles against it, a C client copies it, the engine SDK ships it. A
+generated header exists only after a configure. The committed header stays the source, and
+everything else reads the three defines out of it.
 
 ### Steps
 
 1. **Fill in the CHANGELOG.** Entries land under `## [Unreleased]` in
    `bindings/unity/CHANGELOG.md` as features merge.
 2. **Cut it:** `powershell -File tools/release.ps1 0.3.0`. The helper validates the version and
-   refuses if the tag already exists, the tree is dirty, or `[Unreleased]` is empty. It then rolls
-   `## [Unreleased]` to `## [0.3.0]` (leaving a fresh empty `[Unreleased]`), commits that, and
-   creates an annotated `v0.3.0` tag. `-DryRun` previews the roll and changes nothing; `-Push` also
-   pushes.
+   refuses if the tag already exists, the tree is dirty, or `[Unreleased]` is empty. It then sets
+   `BWA_VERSION_*` in the header to `0.3.0`, rolls `## [Unreleased]` to `## [0.3.0]` (leaving a
+   fresh empty `[Unreleased]`), commits both, and creates an annotated `v0.3.0` tag. `-DryRun`
+   previews both edits and changes nothing; `-Push` also pushes.
 3. **Push:** `git push --follow-tags`. The tag triggers the CI release job.
 
-Prefer to tag by hand? `git tag v0.3.0` works; the helper's only extra service is the CHANGELOG roll.
+Prefer to tag by hand? `git tag v0.3.0` works if you set the header first; CI refuses the tag
+otherwise.
 
 That job builds, tests, stamps the version, and cuts a **GitHub Release**. The Release IS the
 distribution: no registry, no token. The asset breakdown and the GPLv3 corresponding source that
 rides along are in [Continuous integration](#continuous-integration) below.
 
-The Python wheels are the assets whose filenames do **not** carry the tag. A wheel's version is the
-ABI version read out of `include/bw_audio.h` at build time, which is a third thing a wheel could
-claim and must not: a wheel that said `0.5.0` while the library inside it answered `0.14.0` to
-`bwa_get_version` would be unfixable from the outside. See `bindings/python/README.md`.
+The Python wheels take their version from `include/bw_audio.h` at build time rather than from the
+tag, so a wheel can never claim a version the library inside it does not answer to
+`bwa_get_version`. The header check above is what makes that number the tag's. See
+`bindings/python/README.md`.
 
 ### Dev versions
 
@@ -672,7 +686,8 @@ older UPM parsers reject. When git cannot answer (no tag, shallow clone, no git 
     Pythons (`cp310-cp310`, `cp311-cp311`, `cp312-abi3`) on each of `win_amd64`,
     `manylinux_2_28_x86_64` and macOS `universal2`. The Python binding, with the engine library
     inside each wheel. Attached as wheels rather than zipped, because `pip` and `uv` install a
-    `.whl` straight from a URL. `<abi>` is the ABI version from `bw_audio.h`, not the tag. Together
+    `.whl` straight from a URL. `<abi>` is `BWA_VERSION` from `bw_audio.h`, which is the tag's
+    number. Together
     they cover Python 3.10 and later: `abi3` means the cp312 wheel serves 3.12 and every later
     version, and 3.10 and 3.11 get their own files. The release step asserts three wheels per
     platform and the tag each one carries.

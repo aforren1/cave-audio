@@ -17,9 +17,13 @@
 # install tree and builds only the bindings. One engine binary per platform then serves every
 # package that ships on it. See docs/build.md, "The engine SDK".
 cmake_minimum_required(VERSION 3.20)
-# No project VERSION here: nothing consumes ${PROJECT_VERSION}, and two version streams own the real
-# numbers - the ABI version lives in include/bw_audio.h (BWA_VERSION*, what bwa_get_version returns),
-# and the distribution/release version is the git tag (stamped into the Unity package at pack time).
+# No project VERSION here: nothing consumes ${PROJECT_VERSION}, and the real number lives in
+# include/bw_audio.h (BWA_VERSION*, what bwa_get_version returns). tools/release.ps1 sets it to the
+# tag it cuts and CI refuses a tag that disagrees, so the header, the wheels, the MEX, the CMake
+# package and the release name are one number; the Unity and Godot manifests take it from the tag
+# at pack time. A generated header (configure_file over a .h.in) would put the number in CMake
+# instead, but this header is consumed without CMake (mkoctfile, a C client, the shipped SDK), so
+# it stays a committed file and the source.
 project(bw_audio LANGUAGES C)
 
 set(CMAKE_C_STANDARD 11)          # C11 atomics: src/os/os.h's shim leaves the shared state to them
@@ -644,9 +648,9 @@ endif()
 install(EXPORT bw_audioTargets NAMESPACE bwa:: FILE bw_audioTargets.cmake
         DESTINATION "${BWA_INSTALL_CMAKEDIR}" COMPONENT bwa_sdk)
 
-# The package version is the ABI version in include/bw_audio.h - the same number bwa_get_version
-# returns and the same one the Python wheel takes its version from. There is no second stream to
-# keep in step: read it out of the header.
+# The package version is BWA_VERSION in include/bw_audio.h - the same number bwa_get_version
+# returns, the Python wheel takes its version from, and a release is tagged with. Read it out of
+# the header.
 file(STRINGS include/bw_audio.h BWA_VERSION_LINES REGEX "^#define BWA_VERSION_(MAJOR|MINOR|PATCH) ")
 foreach(part MAJOR MINOR PATCH)
   string(REGEX MATCH "#define BWA_VERSION_${part} ([0-9]+)" _m "${BWA_VERSION_LINES}")

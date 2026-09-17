@@ -73,10 +73,10 @@ BWA_BUILD_TESTS = "OFF"
 if.python-version = ">=3.12"
 wheel.py-api = "cp312"
 
-# The package version is the ABI version in include/bw_audio.h, read at build time. A wheel can
-# therefore never claim a version the library is not. The RELEASE version is the git tag, as for
-# the Unity package and the Godot addon; the two streams are deliberately independent (docs/build.md,
-# "Releasing").
+# The package version is BWA_VERSION in include/bw_audio.h, read at build time. A wheel can
+# therefore never claim a version the library is not. It is also the release version: the release
+# script writes the tag into the header and CI refuses a tag that disagrees, so a wheel out of
+# release vX.Y.Z is bw_audio-X.Y.Z (docs/build.md, "Releasing").
 [tool.scikit-build.metadata.version]
 provider = "scikit_build_core.metadata.regex"
 input = "../../include/bw_audio.h"

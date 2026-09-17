@@ -49,8 +49,10 @@ extern "C" {
 /* Header/DLL ABI version. bwa_get_version() returns the DLL's BWA_VERSION so a client can verify
  * the binary matches the header it compiled against (the desc structs grow via reserved fields,
  * but enum VALUES and struct layouts are only guaranteed within a major.minor). This tracks ABI
- * COMPATIBILITY. Bump it by hand only when the ABI changes. It is deliberately independent of
- * the distribution/release version (the git tag), which moves on its own cadence. */
+ * COMPATIBILITY. It is ALSO the release version: tools/release.ps1 sets these three defines to the
+ * tag it cuts, CI refuses a v-tag whose header disagrees, and so the wheels, the MEX gateways, the
+ * CMake package and bwa_get_version() all answer the same number a GitHub release carries. Do not
+ * edit them by hand; a release moves them, and a patch release moves them too. */
 #define BWA_VERSION_MAJOR 0
 #define BWA_VERSION_MINOR 15
 #define BWA_VERSION_PATCH 0

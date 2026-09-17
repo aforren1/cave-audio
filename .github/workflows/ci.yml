@@ -120,6 +120,24 @@ jobs:
       - uses: actions/checkout@v7
         # no submodules by default: steam-audio-source is fetched only on a phonon cache miss
 
+      # ---- one version -----------------------------------------------------------------------------
+      # BWA_VERSION_* in the header is what every built thing reports (bwa_get_version, the wheel
+      # filename, the MEX, the CMake package), and the tag is what the release is called. They are
+      # ONE number by contract: tools/release.ps1 writes the tag into the header before tagging.
+      # A hand-made tag can break that, so a v-tag whose header says something else fails HERE,
+      # first thing, before any job spends an hour building a release that would contradict itself.
+      - name: Check the header version against the tag
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        run: |
+          h=$(sed -nE 's/^#define BWA_VERSION_MAJOR ([0-9]+).*/\1/p' include/bw_audio.h).$(sed -nE 's/^#define BWA_VERSION_MINOR ([0-9]+).*/\1/p' include/bw_audio.h).$(sed -nE 's/^#define BWA_VERSION_PATCH ([0-9]+).*/\1/p' include/bw_audio.h)
+          t="${GITHUB_REF_NAME#v}"
+          echo "header BWA_VERSION $h, tag $t"
+          if [ "$h" != "$t" ]; then
+            echo "::error::include/bw_audio.h says $h but this tag is v$t. Cut releases with tools/release.ps1, which sets the header to the tag."
+            exit 1
+          fi
+
       - name: Version
         id: ver
         shell: bash
@@ -1013,8 +1031,9 @@ jobs:
 
           # The NINE Python wheels, attached as-is rather than zipped: pip and uv install a .whl
           # directly from a URL, and wrapping it would make the one-liner in the notes a two-step.
-          # Each is already versioned by its own filename (the ABI version from the header), so
-          # unlike the engine bundles above there is nothing to rename per tag.
+          # Each is already versioned by its own filename (BWA_VERSION from the header, which the
+          # check at the top of the windows job pins to this tag), so unlike the engine bundles
+          # above there is nothing to rename per tag.
           #
           # All nine come from the wheels job, Windows included since it joined that matrix. The
           # per-runner wheels the three desktop jobs build are the fast gate - tagged for their
@@ -1135,8 +1154,9 @@ jobs:
 
           ``uv pip install <url-of-the-wheel>``
 
-          The wheel version is the **ABI version** from ``bw_audio.h``, not this tag, so it can
-          never claim a version the library is not. PsychoPy uses this package directly; see
+          The wheel version is this tag's number, read from ``bw_audio.h`` at build time, so
+          ``bw_audio.abi_version()`` inside it answers the same number. PsychoPy uses this package
+          directly; see
           ``bindings/python/README.md``. The Linux wheel is ``manylinux_2_28`` (glibc 2.28 or
           newer: RHEL 8, Debian 10, Ubuntu 18.10 and later). It imports with neither
           ``libasound.so.2`` nor ``libjack.so.0`` installed: the engine loads each at run time, so
@@ -2576,7 +2596,7 @@ jobs:
 
       # A FIXED artifact name, like the other jobs' pack inputs: the package job downloads these
       # three by name for the release. No version in the name, because a wheel's filename already
-      # carries the only version a wheel has (the ABI version from bw_audio.h), and 30 days
+      # carries the only version a wheel has (BWA_VERSION from bw_audio.h), and 30 days
       # because these are also the wheels a human wants off a branch build.
       - name: Upload artifact (release wheels)
         uses: actions/upload-artifact@v7
