@@ -36,15 +36,20 @@ if [ -z "$(ls -A "$DIST")" ]; then
 fi
 
 rm -rf "$OUT"
-mkdir -p "$OUT/dist" "$OUT/example"
-# The site root MIRRORS bindings/web: dist/ and example/ side by side, so the example page's
+mkdir -p "$OUT/dist" "$OUT/example" "$OUT/playground"
+# The site root MIRRORS bindings/web: dist/, example/ and playground/ side by side, so each page's
 # `../dist/index.js` import and its `../coi-serviceworker.js` script tag resolve the same way they
 # do under example/serve.mjs (which serves the repo root). Rewriting paths at stage time would be a
-# second copy of the page's layout. -a would carry ownership and timestamps that
+# second copy of the pages' layout. -a would carry ownership and timestamps that
 # upload-pages-artifact has no use for; contents and the directory shape are the whole payload.
+#
+# dist/ carries vendor/ too (three.js, fetched and hashed by tools/wasm/fetch-web-vendor.sh). The
+# playground imports it from there rather than from a CDN, which under COEP require-corp is the
+# difference between a page and a blank screen.
 cp -R "$DIST"/. "$OUT/dist"/
 cp -R "$HERE/../example"/. "$OUT/example"/
 rm -f "$OUT/example/serve.mjs"   # the local dev server is not a page asset
+cp -R "$HERE/../playground"/. "$OUT/playground"/
 
 # The overlay, and it OVERWRITES: the deploy shell owns the site root, because the service worker
 # registers from its own URL and only a root registration scopes over example/.
@@ -61,15 +66,23 @@ cp "$HERE/coi-serviceworker.LICENSE" "$OUT/coi-serviceworker.LICENSE"
 # lose it silently.
 : > "$OUT/.nojekyll"
 
-# The demo page the shell links to. Not fatal - the build may name it differently and the shell
+# The demo pages the shell links to. Not fatal - the build may name them differently and the shell
 # still reports isolation - but a broken link is the first thing anyone sees.
-if [ ! -f "$OUT/example/index.html" ]; then
-  echo "::warning::no example/index.html in the artifact; the shell's demo link will 404"
-elif ! grep -q "coi-serviceworker.js" "$OUT/example/index.html"; then
-  # A visitor who lands on example/index.html FIRST (a deep link, a bookmark) has no service
-  # worker registered yet, so that page is not isolated and the engine cannot start. The fix is
-  # one script tag in the example page; the shell cannot register on its behalf.
-  echo "::warning::example/index.html does not load ../coi-serviceworker.js - a deep link to it will not be cross-origin isolated"
+for demo in example playground; do
+  if [ ! -f "$OUT/$demo/index.html" ]; then
+    echo "::warning::no $demo/index.html in the artifact; the shell's link to it will 404"
+  elif ! grep -q "coi-serviceworker.js" "$OUT/$demo/index.html"; then
+    # A visitor who lands on a demo page FIRST (a deep link, a bookmark) has no service worker
+    # registered yet, so that page is not isolated and the engine cannot start. The fix is one
+    # script tag in the page; the shell cannot register on its behalf.
+    echo "::warning::$demo/index.html does not load ../coi-serviceworker.js - a deep link to it will not be cross-origin isolated"
+  fi
+done
+
+# The playground is the one page with a third-party dependency, and it is the one the
+# vendor-everything rule exists for. A missing vendor/ is a blank screen, not a degraded demo.
+if [ -f "$OUT/playground/index.html" ] && [ ! -f "$OUT/dist/vendor/three/three.module.js" ]; then
+  echo "::warning::no dist/vendor/three in the artifact; the playground will not load. Run tools/wasm/fetch-web-vendor.sh"
 fi
 
 # The same-origin rule, checked rather than asserted in prose. hrefs are deliberately not matched:

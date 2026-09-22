@@ -56,7 +56,15 @@ the `bw_audio.dll` list.
   `bindings/web/deploy/coi-serviceworker.js`; it adds the COOP/COEP headers GitHub Pages cannot.
   https://github.com/gzuidhof/coi-serviceworker
 
-## MIT License (godot-cpp, Dear ImGui, ImPlot, ImPlot3D, cJSON, coi-serviceworker)
+- **three.js** — MIT (text below). Copyright (c) 2010-2026 three.js authors. Version **0.186.0**,
+  pinned. NOT committed: `tools/wasm/fetch-web-vendor.sh` fetches `build/three.module.js`,
+  `build/three.core.js` and `LICENSE` into `bindings/web/dist/vendor/three/` at build time, checks
+  each against a sha256 recorded in that script, and `bindings/web/deploy/stage.sh` copies them
+  into the Pages artifact. The upstream `LICENSE` text travels with the files. The playground page
+  imports it from there because the site is served under COEP require-corp, where a CDN script is
+  blocked. https://github.com/mrdoob/three.js
+
+## MIT License (godot-cpp, Dear ImGui, ImPlot, ImPlot3D, cJSON, coi-serviceworker, three.js)
 
 Permission is hereby granted, free of charge, to any person obtaining a copy of
 this software and associated documentation files (the "Software"), to deal in

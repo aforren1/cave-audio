@@ -49,6 +49,7 @@ export const OPS = Object.freeze({
   HEALTH: "health",       /* {}                                    -> the health object   */
   INFO: "info",           /* {}                                    -> the info object     */
   INVOKE: "invoke",       /* { name, args } -> engine.invoke(name, ...args)               */
+  INVOKE_BUF: "invokebuf",/* { name, args } with BUFFER arguments; see host.js's invokeBuf  */
   RAW: "raw",             /* { name, args } -> raw[name](...args); no engine pointer      */
   START: "start",
   STOP: "stop",

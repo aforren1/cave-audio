@@ -6,8 +6,8 @@
 <title>bw_audio on the web</title>
 <!--
   The GitHub Pages landing shell. It is NOT the demo: it registers the COOP/COEP service worker,
-  reports whether the page ended up cross-origin isolated, and links to the demo the web build
-  stages at example/index.html.
+  reports whether the page ended up cross-origin isolated, and links to the two demos the web
+  build stages, at playground/index.html and example/index.html.
 
   EVERYTHING THIS PAGE LOADS IS SAME-ORIGIN, and that is a rule rather than a style choice. The
   service worker serves COEP: require-corp, under which a cross-origin script, style or font
@@ -28,7 +28,8 @@
   td.v { font-family: ui-monospace, Consolas, monospace; }
   .ok { color: #1a7f37; } .bad { color: #b3261e; }
   a.demo {
-    display: inline-block; padding: .6rem 1rem; border: 1px solid currentColor;
+    display: inline-block; padding: .6rem 1rem; margin: 0 .5rem .5rem 0;
+    border: 1px solid currentColor;
     border-radius: .4rem; text-decoration: none; font-weight: 600;
   }
   .note { font-size: .9rem; opacity: .75; }
@@ -63,7 +64,14 @@
   <tr><th>Service worker controlling this page</th><td class="v" id="sw">checking</td></tr>
 </table>
 
-<p id="cta"><a class="demo" href="example/index.html">Open the demo</a></p>
+<p id="cta">
+  <a class="demo" href="playground/index.html">Open the playground</a>
+  <a class="demo" href="example/index.html">Open the minimal example</a>
+</p>
+<p class="note">The playground is the engine's demo scenes with three.js visuals: localization,
+  the 26-speaker channel walk, occlusion, directivity, the underwater boundary and a blind A/B/X
+  test. The minimal example is one source orbiting your head and nothing else. Headphones for
+  both.</p>
 <p class="note" id="why"></p>
 
 <p class="note">
@@ -94,7 +102,7 @@
     document.getElementById("why").textContent =
       "Not isolated yet. If this is your first visit the page reloads itself once; after that, " +
       "a persistent false means the service worker did not register (a private window, or a " +
-      "browser with service workers disabled). The demo refuses to start rather than fall back " +
+      "browser with service workers disabled). The demos refuse to start rather than fall back " +
       "to a single-threaded engine.";
     document.getElementById("cta").style.opacity = ".5";
   }

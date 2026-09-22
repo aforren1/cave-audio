@@ -106,6 +106,7 @@ export class Host {
       case OPS.HEALTH: return e.health();
       case OPS.INFO: return this.info();
       case OPS.INVOKE: return e.invoke(msg.name, ...(msg.args || []));
+      case OPS.INVOKE_BUF: return this.invokeBuf(msg.name, msg.args || []);
       case OPS.RAW: {
         const fn = this.raw[msg.name];
         if (!fn) throw new BwaError(`bw_audio has no call named bwa_${msg.name}`);
@@ -121,6 +122,69 @@ export class Host {
       case OPS.RENDER: return this.renderBlock();
       case OPS.FRAME: this.applyFrame(); return null;
       default: throw new BwaError(`unknown op '${op}'`);
+    }
+  }
+
+  /**
+   * `invoke`, for the raw calls whose arguments are POINTERS.
+   *
+   * WHY IT EXISTS. `invoke` marshals scalars, which is most of the ABI, and a page therefore could
+   * not reach the calls a VISUAL client needs most: `bwa_get_bus_levels` and `bwa_get_speakers`
+   * fill a float array, `bwa_scene_set_mesh_mat` takes two, `bwa_source_set_occlusion_manual`
+   * takes a 3-band tilt. A page cannot allocate wasm heap itself - the module lives on the control
+   * thread, and in the default topology that is another thread entirely - so the alloc, the copy
+   * in, the copy out and the free all have to happen here, around the one call.
+   *
+   * WHAT IT DOES NOT DO, deliberately: it does not lay out STRUCTS. JS has no offsetof, so a
+   * caller building a `bwa_fdn_desc` by hand would hard-code field offsets a header change could
+   * move without a word - the exact reason `src/bwa_web.c` exists. An array of one scalar type is
+   * a different thing: `float[3]` is three floats in every ABI. A struct-taking call needs a
+   * field-by-field wrapper in bwa_web.c, not a byte buffer from here.
+   *
+   * An argument is a plain number, or one of:
+   *   { f32: [...] } | { i32: [...] } | { u32: [...] }   copied IN, passed as a pointer
+   *   { out: "f32"|"i32"|"u32", len: n }                 zeroed, passed in, read back OUT
+   *
+   * @param {string} name the C name minus `bwa_`
+   * @param {Array} args
+   * @returns {*} the call's own return when there is no `out` argument, else
+   *   `{ value, out: [TypedArray, ...] }` with one entry per `out`, in argument order.
+   */
+  invokeBuf(name, args = []) {
+    const raw = this.raw;
+    const temps = [];
+    const outs = [];
+    const call = new Array(args.length);
+    try {
+      for (let i = 0; i < args.length; ++i) {
+        const a = args[i];
+        if (a === null || a === undefined || typeof a !== "object") { call[i] = a; continue; }
+        const kind = a.out || ("f32" in a ? "f32" : "i32" in a ? "i32" : "u32" in a ? "u32" : null);
+        if (kind !== "f32" && kind !== "i32" && kind !== "u32")
+          throw new BwaError(`invokeBuf("${name}"): argument ${i} is neither a number nor a ` +
+                             `{f32|i32|u32} buffer nor an {out, len} readback`);
+        const src = a.out ? null : a[kind];
+        const len = a.out ? (a.len | 0) : src.length;
+        if (!(len > 0)) throw new BwaError(`invokeBuf("${name}"): argument ${i} has no length`);
+        const ptr = raw.alloc(len * 4);
+        if (!ptr) throw new BwaError(`invokeBuf("${name}"): out of wasm heap for argument ${i}`);
+        temps.push(ptr);
+        /* raw.f32 and friends are GETTERS, re-read here on purpose: -sALLOW_MEMORY_GROWTH
+         * detaches and replaces the views whenever the heap grows, and the alloc above is
+         * exactly where that happens. */
+        if (src) raw[kind].set(src, ptr >> 2);
+        else raw.u8.fill(0, ptr, ptr + len * 4);
+        if (a.out) outs.push({ ptr, len, kind });
+        call[i] = ptr;
+      }
+      const value = this.engine.invoke(name, ...call);
+      if (!outs.length) return value;
+      /* A copy, because the heap under it is freed in the `finally` below and, in the default
+       * topology, would be a structured clone across the Worker boundary anyway. */
+      const out = outs.map((o) => raw[o.kind].slice(o.ptr >> 2, (o.ptr >> 2) + o.len));
+      return { value, out };
+    } finally {
+      for (const ptr of temps) raw.free(ptr);
     }
   }
 

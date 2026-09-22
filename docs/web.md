@@ -739,6 +739,16 @@ In order, and the first three are no longer on this list because they are built.
 6. **A memory-buffer asset entry point**, or the decision that the push feed is the answer. The
    binding took the push feed, so this is now a question about streaming and about
    `bwa_load_sound`, not about whether a page can play a wav.
+7. **A way to put a file in the wasm file system.** `FS` is not in the module's
+   `EXPORTED_RUNTIME_METHODS`, so `bwa_desc.layout_path` and `bwa_desc.hrtf_path` have nothing to
+   open. Nothing needs it yet: the engine's default grid is the same 26-speaker geometry
+   `examples/cave_layout.json` describes, and the playground reads the positions back with
+   `bwa_get_speakers`. The day a page wants a surveyed layout or its own SOFA file, it is one link
+   flag and one `writeFile` on the binding.
+8. **A struct-taking wrapper in `bwa_web.c`.** `invokeBuf` marshals arrays, deliberately not
+   structs, so three calls are out of reach: `bwa_fdn_config`, `bwa_reflections_config` and
+   `bwa_apply_tuning`. That is why the playground has no reverb bed scene. Each needs a field by
+   field wrapper beside `bwaw_create`, in the shape that file already establishes.
 
 ## What the runtime added
 
@@ -756,6 +766,11 @@ On top of [What the spike changed](#what-the-spike-changed) below.
 - `cmake/bwa_bindings.cmake`, `bindings/web/CMakeLists.txt`: a fourth binding, opt-in and
   Emscripten-only.
 - `bindings/web/`: the two layers, the transport, the example page, the node suite, the README.
+- `bindings/web/playground/`: the browser port of `examples/playground.cpp`, with three.js visuals
+  and six scenes, plus `tests/run-playground.mjs` that drives it in headless Chromium.
+- `bindings/web/src/host.js`, `client.js`: `invokeBuf`, which reaches the raw calls whose arguments
+  are pointers. A page cannot allocate wasm heap of its own, so the alloc, the copy and the free
+  happen around the one call on the control thread.
 - `tools/wasm/gen-abi.mjs`: the raw layer and the export list, generated from the header.
 - `tools/wasm/build-web.sh`: the one recipe for a shippable `dist/`.
 - `tools/wasm/build-wasm.sh`: `BWA_WASM_PROXY` for the `-sPROXY_TO_PTHREAD` measurement.

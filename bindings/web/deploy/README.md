@@ -1,7 +1,7 @@
 # Pages deploy
 
-The GitHub Pages half of the web build. The wasm engine, the JS binding and the demo page are
-built elsewhere and land in `bindings/web/dist/`. This directory turns that tree into a site that
+The GitHub Pages half of the web build. The wasm engine, the JS binding and the demo pages' third
+party are built elsewhere and land in `bindings/web/dist/`. This directory turns that tree into a site that
 is **cross-origin isolated**, which is what `SharedArrayBuffer` needs and what GitHub Pages cannot
 give you with headers.
 
@@ -9,8 +9,8 @@ give you with headers.
 |------|------------|
 | `coi-serviceworker.js` | vendored [coi-serviceworker](https://github.com/gzuidhof/coi-serviceworker), MIT, pinned by commit in its header. Do not hand-edit it. |
 | `coi-serviceworker.LICENSE` | the MIT text that travels with it. |
-| `index.html` | the landing shell. Registers the worker, reports isolation, links to the demo. |
-| `stage.sh` | assembles the artifact: `dist/`, plus this shell and the worker at the root, plus `.nojekyll`. |
+| `index.html` | the landing shell. Registers the worker, reports isolation, links to the two demos. |
+| `stage.sh` | assembles the artifact: `dist/`, `example/`, `playground/`, plus this shell and the worker at the root, plus `.nojekyll`. |
 
 `.github/workflows/pages.yml` runs the build, runs `stage.sh` and deploys. Nothing else in the
 repository reads this directory.
@@ -36,10 +36,10 @@ isolated. The script registers one and reloads the page once. The second load is
 worker, so it is isolated, and `crossOriginIsolated` is true from then on. The landing shell shows
 both states, which is why its answers can flip a moment after it opens.
 
-Two things follow. A private window with service workers disabled never becomes isolated, and the
+Two things follow. A private window with service workers disabled never becomes isolated, and a
 demo must refuse to start rather than fall back to a single-threaded engine. And the worker's
 scope comes from its own URL, so the script must stay at the site root: from there it controls
-`example/` too.
+`example/` and `playground/` too.
 
 ## Every asset must be same-origin
 
@@ -49,9 +49,10 @@ site is fine, because a navigation is not a subresource, but a script, a stylesh
 image, a wasm module or a worker is not.
 
 So: **vendor it, do not link it**. The landing shell loads nothing but its own inline CSS and the
-worker. The rule applies to everything the build puts in `dist/` as well. When the playground port
-arrives it must ship three.js inside the artifact, not pull it from a CDN, and the same goes for
-any font or icon set.
+worker. The rule applies to everything the build puts in `dist/` as well. The playground is the one
+page that has a third-party dependency, and it obeys the rule: `tools/wasm/fetch-web-vendor.sh`
+fetches a pinned, hashed three.js into `dist/vendor/three/` at build time, and the page imports it
+from there. Any future font or icon set goes the same way.
 
 `stage.sh` greps the staged tree for cross-origin `src`, `import`, `importScripts` and `url()`
 references and prints a warning for each. It warns rather than fails, because the check reads text
@@ -60,25 +61,27 @@ otherwise.
 
 ## What this expects from the build
 
-The site root mirrors `bindings/web`: `stage.sh` copies `bindings/web/dist/` to `dist/` and
-`bindings/web/example/` to `example/` (minus the local dev server), then puts this directory's
-files at the root. So the example page's `../dist/index.js` import resolves on the site exactly as
-it does under `example/serve.mjs`, and the root is owned by the shell:
+The site root mirrors `bindings/web`: `stage.sh` copies `bindings/web/dist/` to `dist/`,
+`bindings/web/example/` to `example/` (minus the local dev server) and
+`bindings/web/playground/` to `playground/`, then puts this directory's files at the root. So each
+page's `../dist/index.js` import resolves on the site exactly as it does under
+`example/serve.mjs`, and the root is owned by the shell:
 
 - **`index.html` at the root is the landing shell.** It has to own the root, because that is
   where the worker registers.
 - **`coi-serviceworker.js` and `coi-serviceworker.LICENSE` at the root belong to this directory.**
 
-The shell links to **`example/index.html`**. That path is the one assumption this directory makes
-about the example. Change the example and this shell together, or `stage.sh` warns that the demo
-link will 404.
+The shell links to **`playground/index.html`** and **`example/index.html`**. Those two paths are
+the assumptions this directory makes about the build. Change a demo and this shell together, or
+`stage.sh` warns that the link will 404. It also warns when `dist/vendor/three` is missing, because
+a playground with no three.js is a blank screen rather than a degraded demo.
 
-One more thing the example page must do: **load the worker itself**, with
+One more thing every demo page must do: **load the worker itself**, with
 `<script src="../coi-serviceworker.js"></script>` before anything that touches
-`SharedArrayBuffer`. A visitor who follows a deep link straight to `example/index.html` has never
-run the landing shell, so no worker is registered yet and that page is not isolated. The shell
-cannot register on another page's behalf. `stage.sh` warns when the example page does not
-reference the script.
+`SharedArrayBuffer`. A visitor who follows a deep link straight to `example/index.html` or
+`playground/index.html` has never run the landing shell, so no worker is registered yet and that
+page is not isolated. The shell cannot register on another page's behalf. `stage.sh` warns when a
+demo page does not reference the script.
 
 ## Enable Pages, once
 
@@ -112,6 +115,19 @@ python -m http.server 8080 --directory bindings/web/_site
 puts you in. Open `http://localhost:8080/`, let it reload once, and read the table. All four rows
 green means the worker is doing its job. `localhost` counts as a secure context, so a plain
 `http://` origin is enough here and nowhere else.
+
+**One trap on Windows.** Python's `mimetypes` reads the registry, where `.mjs` is often
+`text/plain`, and a module script served with that type is rejected: the demo fails with
+`Failed to fetch dynamically imported module`. GitHub Pages serves `.mjs` as `text/javascript`, so
+this is a host quirk and not a property of the site. Register the type instead of chasing it:
+
+```sh
+python -c "import mimetypes,functools,http.server as h; \
+           mimetypes.add_type('text/javascript','.mjs'); \
+           mimetypes.add_type('application/wasm','.wasm'); \
+           h.test(HandlerClass=functools.partial(h.SimpleHTTPRequestHandler, \
+                  directory='bindings/web/_site'), port=8080)"
+```
 
 ## Update the vendored worker
 

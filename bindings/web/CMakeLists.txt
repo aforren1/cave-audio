@@ -95,6 +95,16 @@ if(BWA_NODE)
            COMMAND ${BWA_NODE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/run-browser.mjs
            WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
   set_tests_properties(web_browser PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 180)
+  # The PLAYGROUND page, in the same headless Chromium. web_browser proves the SINK; this proves
+  # the demo on top of it - that the page starts on that sink, that the coordinate seam puts a
+  # source on the listener's left both on screen and in the ears, and that the channel walk's bus
+  # meter lights the channel it drove. It SKIPS (77) with no browser, no dist/ and no vendored
+  # three.js, the last of which needs network (tools/wasm/fetch-web-vendor.sh), so a rebuild-free
+  # checkout is not a failing build.
+  add_test(NAME web_playground
+           COMMAND ${BWA_NODE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/run-playground.mjs
+           WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+  set_tests_properties(web_playground PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 300)
 else()
   message(STATUS "bw_audio: web binding tests skipped (no node found)")
 endif()

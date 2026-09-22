@@ -1,0 +1,135 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>bw_audio playground</title>
+<!--
+  The browser port of examples/playground.cpp: the engine's demo scenes, rendered with three.js and
+  heard through the binaural AudioWorklet sink.
+
+  EVERYTHING THIS PAGE LOADS IS SAME-ORIGIN. The site is served under COEP require-corp, where a
+  cross-origin script, style or font without Cross-Origin-Resource-Policy is BLOCKED, not slowed.
+  three.js is vendored into dist/vendor/ by tools/wasm/fetch-web-vendor.sh; there is no CDN here and
+  there must never be one. bindings/web/deploy/README.md states the rule.
+-->
+<style>
+  :root {
+    color-scheme: dark;
+    --bg: #0d1117; --panel: #151b24; --line: #29313d; --ink: #dde3ea; --dim: #97a3b2;
+    --accent: #4ade80; --bad: #f0685e;
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; }
+  body {
+    background: var(--bg); color: var(--ink);
+    font: 14px/1.5 system-ui, -apple-system, Segoe UI, sans-serif;
+    display: flex; flex-direction: column;
+  }
+  header {
+    padding: .6rem 1rem; border-bottom: 1px solid var(--line);
+    display: flex; align-items: baseline; gap: 1rem; flex-wrap: wrap;
+  }
+  header h1 { font-size: 1rem; margin: 0; font-weight: 650; }
+  header p { margin: 0; color: var(--dim); font-size: .85rem; }
+  header a { color: var(--dim); }
+  #layout { flex: 1; display: flex; min-height: 0; }
+  #panel {
+    width: 22rem; min-width: 18rem; overflow-y: auto;
+    border-right: 1px solid var(--line); background: var(--panel); padding: .9rem 1rem 3rem;
+  }
+  #viewWrap { flex: 1; position: relative; min-width: 0; }
+  canvas#view { width: 100%; height: 100%; display: block; }
+  #startPanel {
+    position: absolute; inset: 0; display: grid; place-content: center; gap: 1rem;
+    text-align: center; padding: 2rem;
+  }
+  button {
+    font: inherit; color: var(--ink); background: #1e2733;
+    border: 1px solid var(--line); border-radius: .4rem; padding: .45rem .8rem; cursor: pointer;
+  }
+  button:hover:not(:disabled) { border-color: var(--accent); }
+  button:disabled { opacity: .5; cursor: default; }
+  #go { font-size: 1.05rem; padding: .7rem 1.4rem; }
+  h2 { font-size: .78rem; text-transform: uppercase; letter-spacing: .06em;
+       color: var(--dim); margin: 1.4rem 0 .5rem; font-weight: 650; }
+  h2:first-of-type { margin-top: 0; }
+  select, input[type=range] { width: 100%; font: inherit; }
+  select { background: #1e2733; color: var(--ink); border: 1px solid var(--line);
+           border-radius: .3rem; padding: .3rem; }
+  .ctl { margin: 0 0 .75rem; }
+  .ctl > label { display: block; font-size: .8rem; color: var(--dim); margin-bottom: .2rem; }
+  .slider { display: flex; align-items: center; gap: .5rem; }
+  .slider output { min-width: 6.5rem; text-align: right; font-variant-numeric: tabular-nums;
+                   font-size: .8rem; color: var(--dim); }
+  .toggle { display: flex; align-items: center; gap: .5rem; cursor: pointer; }
+  .buttons { display: flex; flex-wrap: wrap; gap: .35rem; }
+  .buttons button { flex: 1 1 auto; font-size: .85rem; }
+  .hint, .note { margin: .25rem 0 0; font-size: .76rem; color: var(--dim); }
+  .note { margin: .6rem 0; }
+  table { border-collapse: collapse; width: 100%; font-size: .82rem; }
+  th, td { text-align: left; padding: .15rem .4rem .15rem 0; vertical-align: top; }
+  th { font-weight: 400; color: var(--dim); width: 50%; }
+  td { font-variant-numeric: tabular-nums; }
+  #meter { height: .6rem; background: #1e2733; border-radius: .3rem; overflow: hidden; margin: .3rem 0; }
+  #meterFill { height: 100%; width: 0; background: linear-gradient(90deg, #3d8f5a, var(--accent)); }
+  #meterText { font-size: .76rem; color: var(--dim); }
+  #log { margin-top: 1rem; font-size: .78rem; color: var(--dim); white-space: pre-wrap; }
+  .bad { color: var(--bad); }
+  #sceneBlurb { color: var(--dim); font-size: .85rem; margin: .4rem 0 .8rem; }
+</style>
+</head>
+<body>
+
+<!--
+  GitHub Pages cannot send COOP/COEP, so the deploy overlay puts coi-serviceworker.js at the site
+  root and every page registers it BEFORE anything touching SharedArrayBuffer. Under a dev server
+  that sets the real headers this 404s harmlessly.
+-->
+<script src="../coi-serviceworker.js"></script>
+
+<header>
+  <h1>bw_audio playground</h1>
+  <p>The CAVE engine's demo scenes, in a browser. Headphones, please.</p>
+  <p><a href="../">back to the landing page</a></p>
+</header>
+
+<div id="layout">
+  <div id="panel">
+    <h2>scene</h2>
+    <select id="scenePick"></select>
+    <p id="sceneBlurb"></p>
+
+    <h2>bus meter</h2>
+    <div id="meter"><div id="meterFill"></div></div>
+    <div id="meterText">not started</div>
+
+    <h2>scene controls</h2>
+    <div id="sceneControls"></div>
+
+    <h2>readout</h2>
+    <table id="readout"></table>
+
+    <h2>engine</h2>
+    <div id="globalControls"></div>
+    <table id="health"></table>
+
+    <div id="log"></div>
+  </div>
+
+  <div id="viewWrap">
+    <canvas id="view"></canvas>
+    <div id="startPanel">
+      <p>A browser resumes an AudioContext only from a user gesture, so nothing can make a sound
+         until you click. Put headphones on first: every scene is rendered for two ears.</p>
+      <p><button id="go">Start</button></p>
+      <p style="color:var(--dim);font-size:.85rem">
+         Drag in the view to orbit, the wheel to zoom, and drag the red marker to move the source.
+      </p>
+    </div>
+  </div>
+</div>
+
+<script type="module" src="./main.js"></script>
+</body>
+</html>

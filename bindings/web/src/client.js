@@ -271,6 +271,15 @@ export class BwaEngine {
 
   /** Any of the engine-taking raw calls, by C name minus `bwa_`. See bindings/web/README.md. */
   invoke(name, ...args) { return this._call(OPS.INVOKE, { name, args }); }
+  /**
+   * The same, for the calls whose arguments are POINTERS: an argument may be `{f32|i32|u32: [...]}`
+   * to copy an array in, or `{out: "f32"|"i32"|"u32", len: n}` to read one back. With any `out` the
+   * result is `{value, out: [TypedArray, ...]}`; with none it is the call's own return. This is how
+   * a page reaches `get_bus_levels`, `get_speakers`, the mesh calls and the 3-band occlusion tilt.
+   * It does not build structs - see `host.js`'s `invokeBuf` for why.
+   * @returns {Promise<*>}
+   */
+  invokeBuf(name, ...args) { return this._call(OPS.INVOKE_BUF, { name, args }); }
   /** Any raw call that takes NO engine pointer: `host_time_ns`, `get_device_count`, ... */
   raw(name, ...args) { return this._call(OPS.RAW, { name, args }); }
 

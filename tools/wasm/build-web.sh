@@ -28,6 +28,10 @@
 # because AUDIO_WORKLET is on; a worker script on some settings) plus the binding's own
 # JavaScript, flat. The copy is a glob rather than a list for that reason: emcc decides how many
 # side files there are, and a list would be a second copy of that decision.
+#
+# Plus `vendor/`, the demo pages' pinned browser third party, fetched by
+# tools/wasm/fetch-web-vendor.sh. dist/ is the tree bindings/web/deploy/stage.sh publishes, so a
+# file staged here reaches the site and nothing large lands in git.
 set -eu
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -65,6 +69,12 @@ for f in "$OUT_DIR"/bw_audio.*; do
   cp -f "$f" "$BWA_WEB_DIST/"
 done
 cp -f bindings/web/src/*.js "$BWA_WEB_DIST/"
+
+# The playground's browser third party (three.js), pinned and hashed, into dist/vendor/. It is a
+# separate script because it needs only curl: a developer with no emsdk can still fill vendor/, and
+# the playground's ctest can tell "no engine" from "no three.js". Under COEP require-corp a CDN
+# script is BLOCKED, so the demo ships its own copy (bindings/web/deploy/README.md).
+bash "$ROOT/tools/wasm/fetch-web-vendor.sh"
 
 echo "build-web: staged $BWA_WEB_DIST"
 ls -l "$BWA_WEB_DIST"

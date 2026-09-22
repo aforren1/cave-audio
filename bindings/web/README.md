@@ -145,6 +145,7 @@ import { BwaEngine, Profile, SinkType, SinkFlags, BwaError } from "./dist/index.
 | `renderBlock()` | promise | manual sink only. `{channels, nframes, data}`, planar, a copy |
 | `setMasterGain(linear)` | promise | |
 | `invoke(name, ...args)` | promise | any raw call that takes the engine pointer |
+| `invokeBuf(name, ...args)` | promise | the same, for raw calls whose arguments are pointers |
 | `raw(name, ...args)` | promise | any raw call that does not |
 | `refreshInfo()` | promise | |
 
@@ -167,6 +168,41 @@ is `bwa_source_set_reverb_send(e, src, 0.3f)`. Units are the C units. Frame-valu
 frames, because Web Audio speaks seconds everywhere and mixing the two is how the Godot binding
 shipped a bug.
 
+### `invokeBuf`, for the calls that take pointers
+
+`invoke` marshals scalars, which is most of the ABI. It cannot reach the calls that fill or read an
+array, and those are the ones a page with a picture in it needs first: `bwa_get_bus_levels` and
+`bwa_get_speakers` fill floats, `bwa_scene_set_mesh_mat` and `bwa_scene_add_dynamic_mesh` take two
+arrays each, `bwa_source_set_occlusion_manual` takes a 3-band tilt. A page cannot allocate wasm heap
+for itself, because the module lives on the control thread, which in the default topology is another
+thread. So `invokeBuf` does the alloc, the copy in, the copy out and the free around the one call.
+
+An argument is a plain number, or one of:
+
+```js
+{ f32: [...] } | { i32: [...] } | { u32: [...] }   // copied IN, passed as a pointer
+{ out: "f32" | "i32" | "u32", len: n }             // zeroed, passed in, read back OUT
+```
+
+With any `out` the result is `{value, out: [TypedArray, ...]}`, one entry per `out` in argument
+order. With none it is the call's own return.
+
+```js
+const r = await engine.invokeBuf("get_bus_levels", { out: "f32", len: 26 }, 26);
+r.value;     // the count filled
+r.out[0];    // a Float32Array of the last block's per-channel peaks
+
+const mesh = await engine.invokeBuf("scene_add_dynamic_mesh",
+                                    { f32: verts }, 4, { i32: tris }, 2, material);
+```
+
+It does **not** lay out structs, and that is deliberate. JavaScript has no `offsetof`, so a caller
+building a `bwa_fdn_desc` by hand would hard-code field offsets a header change could move without
+a word. That is the reason `src/bwa_web.c` exists at all. An array of one scalar type is a different
+thing, because `float[3]` is three floats in every ABI. A struct-taking call needs a field by field
+wrapper in `bwa_web.c`, not a byte buffer from here. Three calls are out of reach until one is
+written: `bwa_fdn_config`, `bwa_reflections_config` and `bwa_apply_tuning`.
+
 ## Where the audio comes from
 
 There is no synchronous file system in a browser, so `bwa_load_sound` has nothing to open unless
@@ -177,6 +213,71 @@ it handles the formats a page actually gets served.
 
 Pace the feed on the ring's own space (`src.space()`), not on the animation frame: a background tab
 gets fewer frames and the audio thread does not slow down with it.
+
+## Playground
+
+`playground/index.html` is the browser port of `examples/playground.cpp`: the engine's demo scenes,
+with three.js visuals and the binaural AudioWorklet sink. It ships in the Pages artifact beside the
+minimal example, at `/playground/`.
+
+```
+node bindings/web/example/serve.mjs      # then open http://localhost:8181/playground/
+```
+
+Six scenes, each self-contained and switchable from the panel:
+
+| scene | what it shows |
+|-------|---------------|
+| Localization | a click orbiting your head, draggable, with the panner, spread, dual band, Doppler and air absorption knobs |
+| Channel walk | `bwa_set_test_signal` on one bus channel at a time, with the 26 speaker gizmos lit from `bwa_get_bus_levels` |
+| Occlusion and materials | a wall as a dynamic mesh with a material, and the ray tracer's own occlusion factor |
+| Directivity | the weighted-dipole patterns, with `bwa_source_get_directivity` under the drawing of the lobe |
+| Medium boundary | the underwater interface loss, the muffle, the speed of sound and the surface's inverted bounce |
+| Blind A/B/X | two settings of one knob, a hidden X, and a one-sided binomial p-value |
+
+The default profile is `BWA_PROFILE_CAVE_SIM`, because the playground is the CAVE auditioned: every
+point source pans through the real DBAP, SPCAP or VBAP solve into the 26-channel bus, and the bus is
+HRTF-decoded to stereo. So a lit cone is a channel the panner really solved for.
+`BWA_PROFILE_BINAURAL` is in the picker beside it and rebuilds the engine, which is a create-time
+change; your AudioContext survives it. The channel walk forces CAVE_SIM for itself, because the
+binaural profile has no bus to walk.
+
+### The coordinate seam
+
+The room frame is `+z` ahead, `+y` up and therefore `+x` LEFT (`BWA_ROOM_*`). three.js uses the
+same three axes, so the conversion is the identity and `playground/frame.js` is the one place that
+says so. The half that is not free is the CAMERA: the default view stands BEHIND the listener, at
+room `-z` looking toward `+z`, so that a source on the listener's left draws on the left of the
+screen as well as sounding there. `tests/run-playground.mjs` asserts both halves at once.
+
+### What is not in it
+
+The reverb bed scene the native playground has. Enabling a late reverb is `bwa_fdn_config` or
+`bwa_reflections_config`, both struct-taking calls this binding does not marshal (see `invokeBuf`
+above). A scene picker must not offer something that does nothing, so it is absent rather than
+empty. The medium boundary scene says the same thing in its own panel: it has the boundary and the
+medium, and no room tail.
+
+### No layout file, and why none is needed
+
+There is no synchronous file system in a browser and this binding cannot write into the wasm one:
+`FS` is not in the module's `EXPORTED_RUNTIME_METHODS`, so `bwa_desc.layout_path` has nothing to
+open. It does not matter here. The engine's default grid IS the geometry `examples/cave_layout.json`
+describes, speaker for speaker: a 3 by 3 by 3 boundary grid at plus or minus 1.5 m with `y` at 0,
+1.5 and 3, minus the center, 26 in all. The only thing the file adds is the measured per-speaker
+delay trim, which nothing in a browser demo can hear. The page reads the positions back with
+`bwa_get_speakers` rather than assuming them, so the gizmos are the engine's layout whatever it
+turns out to be.
+
+### three.js
+
+Vendored, never linked from a CDN: under COEP `require-corp` a cross-origin script without
+`Cross-Origin-Resource-Policy` is blocked, not slowed. `tools/wasm/fetch-web-vendor.sh` fetches a
+pinned three.js (0.186.0) into `dist/vendor/three/` and checks each file against a sha256 recorded
+in the script, and `tools/wasm/build-web.sh` calls it. `dist/` is a build output, so the repository
+carries no 2 MB file and the Pages artifact still gets one. The script needs only curl, so a
+developer with no Emscripten toolchain can still fill `vendor/`. There is no OrbitControls addon:
+the orbit is 30 lines in `world.js`, which is one fewer file to pin.
 
 ## Tests
 
@@ -209,3 +310,25 @@ drives the `"worker"` topology on the null sink, which is the only place that pa
 node has no `Worker`, so the module Worker, the postMessage protocol and the frame slab across a
 thread boundary are browser-only. What it cannot prove is that it sounds right; nobody has listened
 yet.
+
+The playground has its own, in the same shape:
+
+```
+ctest --test-dir <build> -R web_playground
+node bindings/web/tests/run-playground.mjs         # or directly
+```
+
+`web_browser` proves the sink. This proves the demo on top of it. The runner's server appends one
+script tag to the playground's HTML for a request carrying `?__drive=1`, so the page a visitor loads
+carries no test code and the check still drives the real page through `window.__bwaPlayground`, the
+hook `playground/main.js` documents. What it asserts: the page starts on the worklet sink with 26
+bus channels read back from `bwa_get_speakers`; a source at room `+x` draws on the left of the
+screen AND is louder in the left ear, measured by rendering the page's own click through a second
+engine on the manual sink (`playground/probe.js`); the channel walk lights the channel it drove and
+nothing else within 20 dB; a wall across the line of sight drops the occlusion factor and moving it
+away restores it; a figure-of-eight source nulls at 90 degrees; and the profile rebuild lands back
+on the worklet sink and renders. It skips when it finds no browser, no `dist/` or no vendored
+three.js.
+
+The stimulus is the click, never DC. CLAUDE.md's first trap is a DC-driven laterality assertion that
+shipped a left and right mirror.
