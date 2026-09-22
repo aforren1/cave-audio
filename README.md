@@ -9,6 +9,10 @@ control clients over a C ABI. No rendered audio crosses that boundary, only cont
 New to the vocabulary? [docs/glossary.md](docs/glossary.md) defines every term the docs use,
 grouped by topic. Each entry says what the term means for a decision.
 
+**Hear it now.** The engine runs in a browser: [aforren1.github.io/cave-audio](https://aforren1.github.io/cave-audio/)
+is the minimal orbit and the six-scene playground, the same WebAssembly build of the same
+code, on headphones. Chromium is what it is tested in. Every push to main redeploys it.
+
 ## Status
 
 Every subsystem is implemented and covered off hardware: the ctest suite, cross-validation
@@ -128,6 +132,7 @@ and tracking at the boundary. See [`docs/integration.md`](./docs/integration.md)
 | [Godot](./bindings/godot/) | GDExtension addon, one class per handle; the by-ear playground ships inside it | games, the CAVE show |
 | [Python](./bindings/python/) | nanobind wheel, a raw 1:1 layer plus a Pythonic one | PsychoPy experiments |
 | [MATLAB and Octave](./bindings/matlab/) | classic C MEX toolbox, one gateway on subcommand strings | Psychtoolbox experiments |
+| [Web](./bindings/web/) | ES module over the WebAssembly build: a raw 1:1 layer plus an `Engine` layer, the control thread on a Worker, output through a Wasm Audio Worklet | browser demos and headphone experiments |
 | Unreal | planned, notes only | games |
 
 ## Recommended settings per setup
@@ -296,6 +301,7 @@ bwa_commit(e);
 | [`docs/hardware-validation.md`](./docs/hardware-validation.md) | the rig-day runbook and its pass criteria |
 | [`docs/glossary.md`](./docs/glossary.md) | one-line definitions for the whole vocabulary |
 | [`docs/build.md`](./docs/build.md) | platform, dependencies, licensing, Dante config |
+| [`docs/web.md`](./docs/web.md) | the WebAssembly target: toolchains, the worklet sink, the binding, hosting, what is measured |
 
 Contributor-facing notes live in [`docs/internal-types.md`](./docs/internal-types.md),
 [`docs/profiling.md`](./docs/profiling.md), and `CLAUDE.md` (agent working notes, not
@@ -307,7 +313,10 @@ Opt-in, in workflow order (design, calibrate, audition). `bwa_layout_tool` and
 `bwa_playground` build on Windows and Linux: they are raylib plus Dear ImGui and nothing
 else. `bwa_calib_view` is a Windows-only target, because it is on the win32 and d3d11
 ImGui backend and it links the full-duplex ASIO capture. So are the capture tools
-(`bwa_calibrate`, `bwa_validate`, `bwa_zylia_probe`), for the ASIO half alone.
+(`bwa_calibrate`, `bwa_validate`, `bwa_zylia_probe`), for the ASIO half alone. The
+browser playground under [`bindings/web/playground/`](./bindings/web/playground/) is a port
+of `bwa_playground`'s scenes on three.js, minus the reverb bed; it is the one you can open
+without building anything.
 
 ```
 cmake -S . -B build -DBWA_BUILD_PLAYGROUND=ON -DBWA_BUILD_CALIBVIEW=ON -DBWA_BUILD_CALIBRATE=ON
@@ -425,10 +434,14 @@ so the library, the tests, the console examples, and the two raylib tools
 | Linux | JACK or ALSA, through a multichannel card or AES67 into the Dante net. Neither route is tested. | JACK or ALSA |
 | Android | none. Android carries no array transport. | AAudio, stereo only |
 | macOS | none yet | none yet. CoreAudio is specified, not written. |
+| Web | none | a Wasm Audio Worklet, stereo. Emscripten with threads, so the page must be cross-origin isolated |
 
 macOS runs the null and manual sinks, so the offline render path works there and nothing
-reaches a speaker. [`docs/backends.md`](./docs/backends.md) has the sink contract and the
-per-backend rules.
+reaches a speaker. The web build keeps the engine's two-thread model over
+`SharedArrayBuffer`, which is why it needs the isolation headers; on GitHub Pages a service
+worker supplies them. A wasi-sdk build of the same core runs the offline suite under
+wasmtime and is the CI leg. [`docs/backends.md`](./docs/backends.md) has the sink contract
+and the per-backend rules, [`docs/web.md`](./docs/web.md) the browser side.
 
 **GPLv3** ([`LICENSE`](./LICENSE)). Third-party components keep their own licenses; see
 [`docs/build.md`](./docs/build.md) and
