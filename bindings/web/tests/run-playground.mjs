@@ -8,7 +8,7 @@
  * other way to hand a script a result. It SKIPS (exit 77, ctest's skip code) when it finds no
  * browser, no engine build, or no vendored three.js.
  *
- *   node bindings/web/tests/run-playground.mjs [--browser <path>] [--keep]
+ *   node bindings/web/tests/run-playground.mjs [--browser <path>] [--keep] [--site <staged dir>]
  *
  * WHAT IT DRIVES, and what run-browser.mjs already covers so this does not. run-browser.mjs proves
  * the SINK: the setup chain, process() on the worklet thread, the audio clock, the suspend and
@@ -30,13 +30,21 @@ import { fileURLToPath } from "node:url";
 const ROOT = resolve(fileURLToPath(new URL("../../..", import.meta.url)));
 const PORT = 8190;
 const SKIP = 77;
-const PAGE = "/bindings/web/playground/index.html";
 
 const args = process.argv.slice(2);
 const argOf = (name) => {
   const i = args.indexOf(name);
   return i >= 0 ? args[i + 1] : null;
 };
+
+/* --site <dir>: drive a STAGED site (the output of bindings/web/deploy/stage.sh) instead of the
+ * repo tree. Same driver, same assertions, but the pages are the rewritten copies with the
+ * content-addressed dist-<hash>/ imports, which is the one thing the repo-tree run cannot check.
+ * The driver is served from the repo at a virtual path either way, so it never has to be staged. */
+const SITE = argOf("--site") ? resolve(argOf("--site")) : null;
+const SERVE_ROOT = SITE || ROOT;
+const PAGE = SITE ? "/playground/index.html" : "/bindings/web/playground/index.html";
+const DRIVER = "/__bwa_playground_driver.js";
 
 const CANDIDATES = [
   argOf("--browser"),
@@ -55,13 +63,20 @@ if (!browser) {
   console.log("no Chromium found; skipping the playground check (pass --browser <path> to force one)");
   process.exit(SKIP);
 }
-if (!existsSync(join(ROOT, "bindings/web/dist/bw_audio.mjs"))) {
-  console.log("bindings/web/dist is not built; run tools/wasm/build-web.sh");
-  process.exit(SKIP);
-}
-if (!existsSync(join(ROOT, "bindings/web/dist/vendor/three/three.module.js"))) {
-  console.log("bindings/web/dist/vendor is empty; run tools/wasm/fetch-web-vendor.sh (it needs network)");
-  process.exit(SKIP);
+if (SITE) {
+  if (!existsSync(join(SITE, "playground/index.html"))) {
+    console.log(`no playground/index.html under --site ${SITE}; run bindings/web/deploy/stage.sh first`);
+    process.exit(SKIP);
+  }
+} else {
+  if (!existsSync(join(ROOT, "bindings/web/dist/bw_audio.mjs"))) {
+    console.log("bindings/web/dist is not built; run tools/wasm/build-web.sh");
+    process.exit(SKIP);
+  }
+  if (!existsSync(join(ROOT, "bindings/web/dist/vendor/three/three.module.js"))) {
+    console.log("bindings/web/dist/vendor is empty; run tools/wasm/fetch-web-vendor.sh (it needs network)");
+    process.exit(SKIP);
+  }
 }
 
 const TYPES = {
@@ -95,17 +110,22 @@ const server = createServer((req, res) => {
   const path = decodeURIComponent(url.pathname);
 
   if (path === PAGE && url.searchParams.has("__drive")) {
-    const html = readFileSync(join(ROOT, normalize(path)), "utf8").replace(
+    const html = readFileSync(join(SERVE_ROOT, normalize(path)), "utf8").replace(
       "</body>",
-      '<script type="module" src="/bindings/web/tests/playground_driver.js"></script>\n</body>'
+      `<script type="module" src="${DRIVER}"></script>\n</body>`
     );
     res.writeHead(200, { ...ISOLATION, "Content-Type": TYPES[".html"] });
     res.end(html);
     return;
   }
+  if (path === DRIVER) {
+    res.writeHead(200, { ...ISOLATION, "Content-Type": TYPES[".js"] });
+    createReadStream(join(ROOT, "bindings/web/tests/playground_driver.js")).pipe(res);
+    return;
+  }
 
-  const file = join(ROOT, normalize(path));
-  if (!file.startsWith(ROOT)) { res.writeHead(403).end(); return; }
+  const file = join(SERVE_ROOT, normalize(path));
+  if (!file.startsWith(SERVE_ROOT)) { res.writeHead(403).end(); return; }
   let st;
   try { st = statSync(file); } catch { res.writeHead(404).end(); return; }
   if (st.isDirectory()) { res.writeHead(404).end(); return; }

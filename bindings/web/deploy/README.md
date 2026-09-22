@@ -61,11 +61,15 @@ otherwise.
 
 ## What this expects from the build
 
-The site root mirrors `bindings/web`: `stage.sh` copies `bindings/web/dist/` to `dist/`,
+The site root mirrors `bindings/web`: `stage.sh` copies `bindings/web/dist/` to `dist-<hash>/`,
 `bindings/web/example/` to `example/` (minus the local dev server) and
-`bindings/web/playground/` to `playground/`, then puts this directory's files at the root. So each
-page's `../dist/index.js` import resolves on the site exactly as it does under
-`example/serve.mjs`, and the root is owned by the shell:
+`bindings/web/playground/` to `playground/`, then puts this directory's files at the root. The
+hash is the build's own content, and the pages' `../dist/` imports are rewritten to it at stage
+time. That is what keeps a returning visitor's cached modules from being mixed with a new build:
+Pages serves everything with a ten-minute `max-age`, and the first playground deploy died on a
+cached pre-playground `client.js` next to a fresh `rig.js`. A changed build is a new URL; an
+unchanged one keeps its URL and its cache. So each page's `../dist/index.js` import resolves on
+the site exactly as it does under `example/serve.mjs`, and the root is owned by the shell:
 
 - **`index.html` at the root is the landing shell.** It has to own the root, because that is
   where the worker registers.

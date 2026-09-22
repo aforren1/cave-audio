@@ -51,6 +51,30 @@ cp -R "$HERE/../example"/. "$OUT/example"/
 rm -f "$OUT/example/serve.mjs"   # the local dev server is not a page asset
 cp -R "$HERE/../playground"/. "$OUT/playground"/
 
+# CONTENT-ADDRESS dist/. GitHub Pages serves everything with `Cache-Control: max-age=600`, and a
+# returning visitor's browser keeps whatever it fetched inside that window. The first playground
+# deploy hit exactly this: the visitor's cached client.js came from the deploy BEFORE the one that
+# added invokeBuf, the new playground/rig.js had never been cached, and the page died on
+# "this.engine.invokeBuf is not a function". The dangerous form is bw_audio.mjs and bw_audio.wasm
+# from two different builds, which does not throw a readable error at all. So dist/ is staged
+# under a name derived from its own contents, and the pages' `../dist/` imports are rewritten to
+# match: a changed build is a new URL, an unchanged one is the same URL and stays cacheable. The
+# glue itself resolves its side files relative to import.meta.url, so nothing inside dist/ needs
+# rewriting, and the pages reference dist/ only through that one `../dist/` prefix (checked below).
+hash=$(cd "$OUT/dist" && find . -type f | LC_ALL=C sort | xargs sha256sum | sha256sum | cut -c1-12)
+DISTDIR="dist-$hash"
+mv "$OUT/dist" "$OUT/$DISTDIR"
+for f in $(find "$OUT/example" "$OUT/playground" -type f \( -name '*.html' -o -name '*.js' -o -name '*.mjs' \)); do
+  sed -i "s|\.\./dist/|../$DISTDIR/|g" "$f"
+done
+# Every real reference is the `../dist/` prefix the rewrite targets, so any survivor is a path
+# shape the rewrite does not know (prose in comments is free to say "dist/").
+left=$(grep -rIn '\.\./dist/' "$OUT/example" "$OUT/playground" --include='*.html' --include='*.js' --include='*.mjs' || true)
+if [ -n "$left" ]; then
+  echo "::warning::a page still references ../dist/ after the rewrite:"; echo "$left"
+fi
+echo "dist staged as $DISTDIR"
+
 # The overlay, and it OVERWRITES: the deploy shell owns the site root, because the service worker
 # registers from its own URL and only a root registration scopes over example/.
 if [ -f "$OUT/index.html" ]; then
@@ -81,8 +105,8 @@ done
 
 # The playground is the one page with a third-party dependency, and it is the one the
 # vendor-everything rule exists for. A missing vendor/ is a blank screen, not a degraded demo.
-if [ -f "$OUT/playground/index.html" ] && [ ! -f "$OUT/dist/vendor/three/three.module.js" ]; then
-  echo "::warning::no dist/vendor/three in the artifact; the playground will not load. Run tools/wasm/fetch-web-vendor.sh"
+if [ -f "$OUT/playground/index.html" ] && [ ! -f "$OUT/$DISTDIR/vendor/three/three.module.js" ]; then
+  echo "::warning::no $DISTDIR/vendor/three in the artifact; the playground will not load. Run tools/wasm/fetch-web-vendor.sh"
 fi
 
 # The same-origin rule, checked rather than asserted in prose. hrefs are deliberately not matched:
