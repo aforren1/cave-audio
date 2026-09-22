@@ -162,9 +162,14 @@ export CMAKE_POLICY_VERSION_MINIMUM=3.5
 python get_dependencies.py --dependency flatbuffers -p windows -a x64 -t vs2022
 
 # 1.5. Patch the flatbuffers include tree that step 1 just produced (see third_party/patches/).
-#      Only current clang needs it; it is inert on the others.
-git -C ../deps/flatbuffers apply \
-    ../../../../patches/deps-flatbuffers-tablekeycomparator.patch
+#      Only current clang needs it; it is inert on the others. Run git FROM THE SUBMODULE ROOT
+#      with --directory: inside a repository, git apply ignores patch paths outside its current
+#      directory and exits 0 having changed nothing, so `git -C ../deps/flatbuffers apply` is a
+#      silent no-op. Then check the file, not the exit code.
+git -C ../.. apply --directory=core/deps/flatbuffers \
+    ../patches/deps-flatbuffers-tablekeycomparator.patch   # git -C resolves this from ../..
+grep -q "TableKeyComparator &operator=(const TableKeyComparator &other));" \
+    ../deps/flatbuffers/include/flatbuffers/flatbuffers.h || echo "PATCH DID NOT LAND"
 
 for d in zlib pffft mysofa; do
   python get_dependencies.py --dependency $d --sharedcrt -p windows -a x64 -t vs2022

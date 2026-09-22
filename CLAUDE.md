@@ -795,6 +795,16 @@ Regression-preventing gotchas. Each has bitten before or guards a real invariant
   `-lwasi-emulated-process-clocks`) each have a comment in `tools/wasm/wasi-sdk.toolchain.cmake`.
   Also: `os` under wasmtime is the same sleep-lateness flake the Android emulator shows (32/33 then
   33/33 on back-to-back runs); it passes in isolation.
+- **`git apply` INSIDE a repository is a silent no-op for paths outside the current directory.**
+  It resolves the patch's paths against the repository root, and "patched paths outside the
+  directory are ignored", so `git -C core/deps/flatbuffers apply` (a directory inside the
+  steam-audio submodule's repo) matched nothing, exited 0 for `--check`, for `--reverse --check` AND
+  for the apply, printed "applied", and left the header unpatched; phonon then died on the exact
+  line the patch removes (Pages run 35716986768). It passed locally because the scratch copy had no
+  `.git`, where git apply behaves like patch(1). `build-phonon.sh` now runs from the submodule root
+  with `--directory=core/deps/flatbuffers` and GREPS for the patched line afterward. General form: a
+  check whose positive and negative BOTH pass is not a check, so after any patch step assert on the
+  file's content, not on the tool's exit code.
 - **A shipped artifact must not cite a doc it does not ship.** Both packs run
   `tools/dist/doc-pointers.ps1`, which rewrites repo-doc references in the staged tree to
   permalinks at the packed commit and then fails the pack on any relative `.md` reference the

@@ -118,17 +118,30 @@ fi
 # neither. `git apply` needs no repository, which is what makes this work inside the container AND
 # on the downloaded dependency tree below, which is a plain directory of copied headers.
 #
-# apply_once <tree> <patch>. The patch path is absolute so one function serves trees at two
-# different depths; the tree is where the patch's own a/ and b/ paths are rooted.
+# apply_once <tree> <patch> [<subdir>]. The patch path is absolute so one function serves trees at
+# two different depths. <tree> is a directory git runs IN; <subdir>, when given, is prepended to the
+# patch's own a/ and b/ paths (git apply --directory).
+#
+# WHY THE THIRD ARGUMENT EXISTS, because the bug it fixes passed CI's own check: `git apply` run
+# INSIDE a repository resolves the patch's paths against the repository root, and "patched paths
+# outside the current directory are ignored". core/deps/flatbuffers is inside the submodule's
+# repository, so `git -C core/deps/flatbuffers apply` found no path under its directory, ignored the
+# whole patch, exited 0 for --check and for the apply, and printed "applied" while the header stayed
+# unpatched - phonon then failed on the exact line the patch removes (Pages run 35716986768). A
+# scratch copy with no .git behaved like plain patch(1) and hid it. Run from the submodule root with
+# --directory=core/deps/flatbuffers and the same file is reached either way. The caller ALSO greps
+# the result, because a check that can pass vacuously is not a check.
 apply_once() {
   local tree="$1" name; name="$(basename "$2")"
   local abs="$ROOT/third_party/patches/$name"
-  if git -C "$tree" apply --check "$abs" 2>/dev/null; then
-    git -C "$tree" apply "$abs"; echo "applied $name"
-  elif git -C "$tree" apply --reverse --check "$abs" 2>/dev/null; then
+  local dopt=""
+  if [ -n "${3:-}" ]; then dopt="--directory=$3"; fi
+  if git -C "$tree" apply $dopt --check "$abs" 2>/dev/null; then
+    git -C "$tree" apply $dopt "$abs"; echo "applied $name"
+  elif git -C "$tree" apply $dopt --reverse --check "$abs" 2>/dev/null; then
     echo "already applied $name"
   else
-    echo "patch $name neither applies nor is already applied (tree: $tree)"; exit 1
+    echo "patch $name neither applies nor is already applied (tree: $tree${3:+/$3})"; exit 1
   fi
 }
 SUBMODULE=third_party/steam-audio-source
@@ -197,7 +210,9 @@ fi
 # the submodule ones at the top: the tree it lands on does not exist until get_dependencies.py has
 # cloned, built and copied it. The target is the COPIED include tree, which is what phonon then
 # compiles against; flatc itself builds either way. The patch file says what it fixes.
-apply_once "$ROOT/$CORE/deps/flatbuffers" third_party/patches/deps-flatbuffers-tablekeycomparator.patch
+apply_once "$SUBMODULE" third_party/patches/deps-flatbuffers-tablekeycomparator.patch core/deps/flatbuffers
+# Prove it landed. The one line the patch introduces; absent means the apply was a no-op.
+grep -q "TableKeyComparator &operator=(const TableKeyComparator &other));"   "$CORE/deps/flatbuffers/include/flatbuffers/flatbuffers.h"   || { echo "deps-flatbuffers patch reported applied but the header is unchanged"; exit 1; }
 for d in zlib "$BWA_FFT" mysofa; do
   "$PY" get_dependencies.py --dependency "$d" $SHAREDCRT -p "$BWA_PLATFORM" -a "$BWA_ARCH" $TOPT
 done
