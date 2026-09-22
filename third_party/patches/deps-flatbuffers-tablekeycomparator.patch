@@ -1,0 +1,50 @@
+# flatbuffers 1.12: delete TableKeyComparator::operator= instead of defining it
+#
+# NOT a phonon patch. This one lands on a DEPENDENCY that phonon's own
+# core/build/get_dependencies.py downloads: flatbuffers, pinned to 6df40a24 (v1.12.0) in
+# core/build/dependencies.json. Apply it to
+# third_party/steam-audio-source/core/deps/flatbuffers, the copied include tree that phonon
+# compiles against, AFTER get_dependencies.py has run (see ../../tools/phonon/build-phonon.sh
+# and ../README.md "Steam Audio").
+#
+# THE BUG
+# TableKeyComparator holds its buffer by reference (vector_downward &buf_) and then defines a
+# private copy assignment that assigns to it:
+#
+#   TableKeyComparator &operator=(const TableKeyComparator &other) { buf_ = other.buf_; ... }
+#
+# A reference member cannot be reseated, so buf_ = other.buf_ resolves to
+# vector_downward::operator=, which flatbuffers itself has deleted. Older compilers let the body
+# pass because nothing instantiates it. Current clang diagnoses the body of a template member at
+# instantiation and rejects it outright:
+#
+#   flatbuffers.h:1875:12: error: overload resolution selected deleted operator '='
+#          buf_ = other.buf_;
+#
+# It is a COMPILER-VERSION problem, not a platform problem. It first showed up here compiling
+# phonon for wasm in the emscripten/emsdk container (emcc 6.0.10, clang 24) and the same pin still
+# builds with MSVC, with gcc 13 and 14, and with the NDK's clang 18. The patch is inert wherever
+# the compiler already accepts the code, so it travels on every platform rather than waiting for
+# the next toolchain bump to rediscover it.
+#
+# THE FIX
+# Upstream's own: declare the operator deleted with the macro flatbuffers already uses for exactly
+# this (FLATBUFFERS_DELETE_FUNC, base.h, which expands to "= delete" on C++11 and to a private
+# declaration otherwise). Nothing calls it, so deleting it removes a defect and no behavior.
+# Drop this patch when the pin moves past flatbuffers 1.12.
+diff --git a/include/flatbuffers/flatbuffers.h b/include/flatbuffers/flatbuffers.h
+--- a/include/flatbuffers/flatbuffers.h
++++ b/include/flatbuffers/flatbuffers.h
+@@ -1871,10 +1871,8 @@ class FlatBufferBuilder {
+     vector_downward &buf_;
+ 
+    private:
+-    TableKeyComparator &operator=(const TableKeyComparator &other) {
+-      buf_ = other.buf_;
+-      return *this;
+-    }
++    FLATBUFFERS_DELETE_FUNC(
++        TableKeyComparator &operator=(const TableKeyComparator &other));
+   };
+   /// @endcond
+ 

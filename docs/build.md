@@ -35,9 +35,12 @@ Everything platform-specific OUTSIDE the sinks goes through one shim, `src/os/os
 `src/os/os_win.c` and `src/os/os_posix.c` behind it: threads, sleep, the monotonic clock, an
 absolute-deadline sleep, mutexes and a reader/writer lock, thread priority, `strdup` and
 `strcasecmp`, and the UDP socket calls `natnet.c` makes. Nothing else in `src/` includes
-`windows.h`. The GUI tools (`bwa_playground`, `bwa_layout_tool`, `bwa_calib_view`) and the
-capture tools (`bwa_calibrate`, `bwa_validate`, `bwa_zylia_probe`) stay Windows-only targets and
-are skipped with a status message elsewhere.
+`windows.h`. `bwa_calib_view` and the capture tools (`bwa_calibrate`, `bwa_validate`,
+`bwa_zylia_probe`) stay Windows-only targets and are skipped with a status message elsewhere:
+the viewer is on the win32 and d3d11 ImGui backend, and all four link the full-duplex ASIO
+capture. The other two GUI tools, `bwa_layout_tool` and `bwa_playground`, are not Windows-bound.
+They are raylib plus Dear ImGui, so `-DBWA_BUILD_PLAYGROUND=ON` builds them on Linux as well, and
+their `--tests` suites pass there against a display or under `xvfb-run`.
 
 Build system: CMake, with MSVC (Visual Studio 2022 toolset) on Windows and gcc or clang
 elsewhere. The core is C (C11 with `stdatomic.h`); Steam Audio and ASIO glue are C/C++. Off
@@ -837,8 +840,11 @@ result names `libm`, `libaaudio`, `liblog`, `libdl` and `libc`, and nothing else
 `tools\android\run-tests.ps1` does all of that for you, the ninja included. The explicit form is
 here for a CI script or a build system that wants the flags.
 
-The build produces `libbw_audio.so` and the test executables. The GUI tools, the capture tools and
-the ASIO backend are all Windows-only targets and are skipped with a status line.
+The build produces `libbw_audio.so` and the test executables. `bwa_calib_view`, the capture tools
+and the ASIO backend are all Windows-only targets and are skipped with a status line. The two
+raylib tools build on a desktop host, not here: they open a desktop OpenGL window, and Android is
+not one. Passing `-DBWA_BUILD_PLAYGROUND=ON` to an Android configure turns the option off with a
+status line rather than failing inside raylib.
 
 **Steam Audio is linked in**, statically, once a phonon for that ABI is staged at
 `third_party/steam-audio-artifacts/lib/android-arm64` or `.../android-x64` (CI builds and caches

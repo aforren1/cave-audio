@@ -791,10 +791,14 @@ jobs:
 
           bw_audio links this statically into bw_audio.dll. It is built with the recipe in
           third_party/README.md ("Steam Audio"), BUILD_SHARED_LIBS=OFF and --minimal, after
-          applying the one patch in patches/ below. The tree here is the unpatched upstream
+          applying the patches in patches/ below. The tree here is the unpatched upstream
           commit, so apply the patch to reproduce the build:
 
             git apply patches/phonon-multiplyaccumulate-align.patch
+
+          The other files in patches/ are not patches to this tree. The phonon-android-* ones
+          apply to it too but only for an Android build, and deps-flatbuffers-* applies to a
+          dependency that core/build/get_dependencies.py downloads, not to anything here.
           "@
           New-Item -ItemType Directory -Force dist/sa-extra/patches | Out-Null
           $readme | Out-File -Encoding ascii dist/sa-extra/README.txt

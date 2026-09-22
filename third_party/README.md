@@ -116,7 +116,9 @@ conversion fix the v4.8.1 binaries lack. Two reasons the source is the right ven
    NatNet). See [../docs/spatialization.md](../docs/spatialization.md) / [../docs/materials.md](../docs/materials.md).
 2. **Gets the fix.** Building from the pinned commit yields a `phonon` lib that includes it.
 
-There is also one **local patch** we apply before building (`third_party/patches/`): phonon 4.8.1's
+There are **local patches** in `third_party/patches/`, and they land on two different trees.
+
+One is on the submodule and every platform applies it: phonon 4.8.1's
 complex `ArrayMath::multiplyAccumulate` reads its accumulator with an *aligned* SSE load on the path
 it takes when the accumulator is *misaligned* — which it always is for the odd ambisonic channels
 (the per-channel FFT stride is `8 mod 16` bytes), so any multichannel reflection effect access-violates
@@ -124,6 +126,21 @@ at channel 1. The one-line fix (`load`→`loadu`) is what lets the reflection be
 early reflections instead of omni-only. This is the open upstream issue
 [ValveSoftware/steam-audio#546](https://github.com/ValveSoftware/steam-audio/issues/546) (symptom only —
 no root cause/fix there yet); drop the patch once a fixed release lands.
+
+The other lands on a **downloaded dependency** rather than on phonon, and it is the only one that
+does: `deps-flatbuffers-tablekeycomparator.patch`. flatbuffers 1.12 defines a private
+`TableKeyComparator::operator=` whose body assigns to a reference member, which resolves to a
+deleted `vector_downward::operator=`. Current clang diagnoses that body at instantiation and
+rejects it (`overload resolution selected deleted operator '='`). Upstream's fix is to declare the
+operator deleted, which is what the patch does, and nothing calls it either way. This is a
+compiler-version problem, not a platform problem: the same pin still builds with MSVC, with gcc 13
+and 14, and with the NDK's clang 18, and it first showed up compiling phonon for wasm in the
+emscripten container. The patch travels on every platform for that reason, and is inert wherever
+the compiler already accepts the code. Drop it when the pin moves past flatbuffers 1.12.
+
+That patch has to be applied **after** `get_dependencies.py`, not before, because the tree it
+lands on does not exist until then: the target is `core/deps/flatbuffers`, the copied include tree
+phonon compiles against. `flatc` itself builds either way.
 
 **Building phonon (minimal core, static, Windows x64).** This recipe produces the STATIC archives
 that link into `bw_audio.dll`. Static is the only supported mode: nothing ships beside the engine
@@ -143,6 +160,12 @@ export CMAKE_POLICY_VERSION_MINIMUM=3.5
 # 1. Fetch ONLY the required deps, with the SHARED CRT (/MD) — see the CRT note below.
 #    flatbuffers is a build tool (flatc); zlib/pffft/mysofa are linked into phonon.
 python get_dependencies.py --dependency flatbuffers -p windows -a x64 -t vs2022
+
+# 1.5. Patch the flatbuffers include tree that step 1 just produced (see third_party/patches/).
+#      Only current clang needs it; it is inert on the others.
+git -C ../deps/flatbuffers apply \
+    ../../../../patches/deps-flatbuffers-tablekeycomparator.patch
+
 for d in zlib pffft mysofa; do
   python get_dependencies.py --dependency $d --sharedcrt -p windows -a x64 -t vs2022
 done
@@ -185,6 +208,7 @@ third_party/steam-audio-artifacts/
   lib/osx-universal/     libphonon.a libmysofa.a libz.a         libpffft.a
   lib/android-arm64/     libphonon.a libmysofa.a libz.a         libpffft.a
   lib/android-x64/       libphonon.a libmysofa.a libz.a         libpffft.a
+  lib/wasm32/            libphonon.a libmysofa.a libz.a         libpffft.a
 ```
 
 Four archives, not one: phonon's own archive carries only its `core` and `hrtf` objects, so its
@@ -203,7 +227,8 @@ only.
 
 The recipe above is also a script: `tools/phonon/build-phonon.sh`, driven by environment
 variables (`BWA_PLATFORM`, `BWA_ARCH`, `BWA_TOOLCHAIN`, `BWA_STAGE_DIR`, `BWA_FFT`,
-`BWA_CMAKE_FLAGS`, `BWA_ART`) that match the composite action's inputs one for one. It finds the
+`BWA_CMAKE_FLAGS`, `BWA_ART`, `BWA_PYTHON`) that match the composite action's inputs one for one,
+plus `ANDROID_NDK` on Android and `EMSDK` on wasm. It finds the
 repository root from its own path, so it runs from anywhere. Two callers, and neither carries a
 copy of the steps:
 
@@ -326,3 +351,36 @@ CI the same way Windows is, by the same composite action. Traps found so far.
   list. And phonon's Android build sets no `-fvisibility=hidden` of its own, so
   `-Wl,--exclude-libs,ALL` keeps its 3000-odd symbols out of the library's dynamic symbol table and
   leaves the 171 `bwa_*` exports alone.
+- **WebAssembly.** Not in CI: there is no web job yet, so this leg is a developer recipe that
+  [../docs/web.md](../docs/web.md) explains the point of. `build.py -p wasm` builds ONE tree,
+  `wasm-release`, through Emscripten's own CMake toolchain file, which it finds from `EMSDK`. Set
+  that variable or the script crashes inside theirs. There is no architecture in the tree name, so
+  the script matches the tree on the platform alone here, and `BWA_ARCH` only picks the dependency
+  directory (`core/deps/<dep>/lib/wasm/`). The stage dir is `wasm32`.
+
+  Everything is built `-pthread`, on both halves, and that is not a preference. The engine's wasm
+  build needs threads, a `-pthread` module is a shared-memory module, and wasm-ld refuses an object
+  that carries neither the atomics nor the bulk-memory feature: `--shared-memory is disallowed by
+  api_context.cpp.o because it was not compiled with 'atomics' or 'bulk-memory' features`. The
+  script exports `CFLAGS` and `CXXFLAGS` for the three companions, which `get_dependencies.py`
+  gives no flag argument of their own, and adds `-DCMAKE_C_FLAGS` and `-DCMAKE_CXX_FLAGS` to the
+  phonon configure. A caller's `BWA_CMAKE_FLAGS` still wins, because CMake keeps the last of a
+  repeated `-D`.
+
+  Build one in the container the recipe is verified in, from the repo root:
+
+  ```sh
+  docker run --rm -v "$PWD:/ph" -w /ph \
+      -e BWA_PLATFORM=wasm -e BWA_STAGE_DIR=wasm32 \
+      emscripten/emsdk:latest tools/phonon/build-phonon.sh
+  ```
+
+  The image ships `python3` and no `python`, which is why the script resolves the interpreter
+  itself rather than making you drop a shim on `PATH` (`BWA_PYTHON` overrides).
+
+  Verified 2026-09-21 on `emscripten/emsdk:latest` (emcc 6.0.10), from a checkout with no `deps`
+  and no build tree: all four archives staged in about 20 minutes on one 8-core desktop,
+  `libphonon.a` 6.85 MB and the three companions 47 kB to 103 kB. An engine built against that
+  stage runs `test_steam_decode` under node and it reports `steam_decode_test OK`. What is NOT
+  green yet is the rest of the with-SDK suite, for a reason on the engine side rather than here:
+  [../docs/web.md](../docs/web.md) says which.

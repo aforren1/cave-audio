@@ -1085,8 +1085,9 @@ Two auto-detects gained a platform guard, both for the same reason: a dev checko
 staged, so without the guard a Linux configure of that same tree "finds" a Windows artifact and
 fails at compile or link. `BWA_WITH_ASIO` now requires `WIN32` as well as the SDK, and Steam Audio
 requires the archive set under the platform's own `lib/<platform>/` and not just `phonon.h`. The
-three GUI tools and the ASIO capture tools are WIN32-only targets, skipped with a status message
-elsewhere. The `/experimental:c11atomics` per-file flags are still under `if(MSVC)`; the list grew
+calibration viewer and the ASIO capture tools are WIN32-only targets, skipped with a status message
+elsewhere. The other two GUI tools are not: `bwa_layout_tool` and `bwa_playground` are raylib plus
+Dear ImGui, so `-DBWA_BUILD_PLAYGROUND=ON` builds them on Linux too. The `/experimental:c11atomics` per-file flags are still under `if(MSVC)`; the list grew
 with the files that became atomic (see build.md).
 
 Steam Audio now builds in CI for **Windows**, **Linux** and **macOS** as well, each job staging its
@@ -1249,9 +1250,13 @@ what needs a device, and make the device-dependent part **skip visibly** rather 
 - **The whole suite under `BWA_SINK_NULL` on `ubuntu-latest` and `macos-latest`** (phase 2,
   shipped). This is the port's regression gate: **38 tests**, none of which touch a device. The two
   jobs sit in `ci.yml` beside the Windows one and they catch a Win32 call sneaking back in. Note
-  what the count means: off Windows the GUI tools and the ASIO capture tools are skipped targets,
-  so their suites and the four `validate_*` runs are absent, which is what takes the Windows 45
-  down to 33; both jobs now build phonon, which adds the five SDK-gated tests back. A cold run pays
+  what the count means: off Windows `bwa_calib_view` and the ASIO capture tools are skipped
+  targets, so the viewer's suite and the four `validate_*` runs are absent, and the two raylib
+  tools are behind an option the jobs leave off, which together take the Windows 45 down to 33;
+  both jobs now build phonon, which adds the five SDK-gated tests back. Configure a Linux tree with
+  `-DBWA_BUILD_PLAYGROUND=ON` and the `playground` and `layout_tool` suites come back too, for 40
+  with phonon and 35 without. They need a display, so run ctest inside an X or Wayland session, or
+  under `xvfb-run`. Measured on Ubuntu 22.04, gcc 11.4, software GL. A cold run pays
   for that phonon build, a warm one restores it from the cache. The macOS job is unverified
   locally, both its shim paths and its phonon build.
 - **On hardware**, a "desk day" section for hardware-validation.md, one pass per backend on a

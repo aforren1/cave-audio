@@ -29,6 +29,15 @@ project(bw_audio LANGUAGES C)
 set(CMAKE_C_STANDARD 11)          # C11 atomics: src/os/os.h's shim leaves the shared state to them
 set(CMAKE_C_STANDARD_REQUIRED ON)
 
+# ONE name for "this is a wasm32 target", because the two toolchains that produce one spell
+# themselves differently and every branch below would otherwise have to name both. WASI is
+# wasi-sdk (tools/wasm/wasi-sdk.toolchain.cmake); Emscripten is emcc's own toolchain file. They
+# agree on everything this file cares about: no device backend, no shared library, no dlopen.
+# See docs/web.md.
+if(CMAKE_SYSTEM_NAME STREQUAL "WASI" OR EMSCRIPTEN)
+  set(BWA_WASM TRUE)
+endif()
+
 # Platform: Windows is the production target (ASIO -> Digiface -> Dante) and the only one with
 # device backends so far. Everything else builds the library, the tests and the console examples on
 # the null and manual sinks, which is what the Linux and macOS CI jobs run. See docs/backends.md.
@@ -38,6 +47,9 @@ elseif(ANDROID)
   message(STATUS "bw_audio: Android (API ${ANDROID_PLATFORM_LEVEL}, ${ANDROID_ABI}) - AAudio backend available")
 elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux")
   message(STATUS "bw_audio: Linux - JACK and ALSA backends available")
+elseif(BWA_WASM)
+  message(STATUS "bw_audio: ${CMAKE_SYSTEM_NAME} (wasm32) - null and manual sinks only; "
+                 "the AudioWorklet sink is the HOST's job (docs/web.md)")
 else()
   message(STATUS "bw_audio: ${CMAKE_SYSTEM_NAME} - null and manual sinks only (no device backend yet)")
 endif()
@@ -176,6 +188,12 @@ if(ANDROID)
   else()
     set(BWA_PHONON_PLATFORMS "")
   endif()
+elseif(BWA_WASM)
+  # Before WIN32/APPLE/UNIX: Emscripten sets UNIX, so a plain elseif chain would look for a
+  # linux-x64 phonon in a wasm tree. tools/phonon/build-phonon.sh stages here with
+  # BWA_STAGE_DIR=wasm32; the archives are Emscripten's, so a wasi-sdk tree will not link them and
+  # must simply not have them staged.
+  set(BWA_PHONON_PLATFORMS wasm32)
 elseif(WIN32)
   set(BWA_PHONON_PLATFORMS windows-x64)
 elseif(APPLE)
@@ -327,7 +345,17 @@ if(MSVC)
 endif()
 
 # ---- core library (public C ABI in include/bw_audio.h) ----
-add_library(bw_audio SHARED
+# STATIC on wasm, SHARED everywhere else. This is not a preference: wasm32 has no position-
+# independent shared library in either toolchain's default sysroot, and asking for one gets
+# `relocation R_WASM_MEMORY_ADDR_LEB cannot be used against symbol 'mparams'; recompile with
+# -fPIC` out of wasi-libc's own dlmalloc.o. A wasm host links the engine INTO its module anyway -
+# there is nothing on the other side of a .so boundary to load it. See docs/web.md.
+if(BWA_WASM)
+  set(BWA_LIB_KIND STATIC)
+else()
+  set(BWA_LIB_KIND SHARED)
+endif()
+add_library(bw_audio ${BWA_LIB_KIND}
   src/engine.c
   src/sink/sink.c
   src/sink/sink_quant.c              # the fixed-quantum adapter every non-ASIO backend renders through
@@ -1152,13 +1180,27 @@ endif()
 # defines are clearer than routing IMGUI_USER_CONFIG through it.
 option(BWA_BUILD_PLAYGROUND "Build the interactive raylib playground + the layout tool (fetches raylib/imgui)" OFF)
 option(BWA_BUILD_CALIBVIEW "Build the imgui calibration report viewer (fetches imgui/implot/implot3d/test-engine)" OFF)
-# The three GUI tools are Windows-only for now: calib_view is on the win32 + d3d11 imgui backend,
-# and both raylib tools carry win32 resource scripts and the ASIO capture shells. Porting them is
-# not part of the OS shim (docs/backends.md, phase 2) - the LIBRARY is what has to build elsewhere.
-if(NOT WIN32 AND (BWA_BUILD_PLAYGROUND OR BWA_BUILD_CALIBVIEW))
-  message(STATUS "bw_audio: GUI tools skipped (Windows-only: win32/d3d11 imgui backend, ASIO capture)")
-  set(BWA_BUILD_PLAYGROUND OFF)
+# Only ONE of the three GUI tools is Windows-bound, and the reason is per tool:
+#   bwa_calib_view       IS. It is on the win32 + d3d11 imgui backend and it links the ASIO capture
+#                        shells (zylia_capture / calib_capture / asio_session). Porting it is not
+#                        part of the OS shim (docs/backends.md, phase 2) - the LIBRARY is what has
+#                        to build elsewhere.
+#   bwa_playground       are NOT. Each links bw_audio + raylib + rlImGui + imgui and nothing else;
+#   bwa_layout_tool      no capture shell, no ASIO, no win32 API. Their only Windows pieces are
+#                        bwa_tool_icon (the .rc) and bwa_copy_runtime_dll, and both are already
+#                        if(WIN32) no-ops elsewhere. raylib supplies the window and GL on X11 or
+#                        Wayland, so BWA_BUILD_PLAYGROUND is honored on every platform raylib
+#                        builds for. Their ctest entries need a DISPLAY - see the add_test calls.
+if(NOT WIN32 AND BWA_BUILD_CALIBVIEW)
+  message(STATUS "bw_audio: bwa_calib_view skipped (Windows-only: win32/d3d11 imgui backend, ASIO capture)")
   set(BWA_BUILD_CALIBVIEW OFF)
+endif()
+# The raylib tools are DESKTOP tools: raylib's desktop platform wants X11, Wayland, Cocoa or win32,
+# and neither an Android cross-build nor a wasm tree has one. Refuse the option here with a status
+# line rather than let it fail three FetchContent steps later inside raylib's own configure.
+if((ANDROID OR BWA_WASM) AND BWA_BUILD_PLAYGROUND)
+  message(STATUS "bw_audio: raylib tools skipped (${CMAKE_SYSTEM_NAME}: no desktop window system)")
+  set(BWA_BUILD_PLAYGROUND OFF)
 endif()
 if(BWA_BUILD_PLAYGROUND OR BWA_BUILD_CALIBVIEW)
   enable_language(CXX)
@@ -1225,7 +1267,10 @@ if(BWA_BUILD_PLAYGROUND)
   bwa_tool_icon(bwa_playground)
   bwa_copy_runtime_dll(bwa_playground)
   if(BWA_BUILD_TESTS)
-    add_test(NAME playground COMMAND bwa_playground --tests)       # the GUI itself, driven by fake inputs
+    # The GUI itself, driven by fake inputs. Needs a window: on Windows that is always there, off it
+    # the runner needs a DISPLAY (an X or Wayland session, or `xvfb-run ctest` - the software GL path
+    # is enough, both suites pass under it). With none, GLFW fails to init and the tool aborts.
+    add_test(NAME playground COMMAND bwa_playground --tests)
   endif()
 
   # Speaker-layout authoring tool: place the 26 speakers + identify each by ear (the channel test
@@ -1243,7 +1288,7 @@ if(BWA_BUILD_PLAYGROUND)
   bwa_tool_icon(bwa_layout_tool)
   bwa_copy_runtime_dll(bwa_layout_tool)
   if(BWA_BUILD_TESTS)
-    add_test(NAME layout_tool COMMAND bwa_layout_tool --tests)     # the GUI itself, driven by fake inputs
+    add_test(NAME layout_tool COMMAND bwa_layout_tool --tests)     # same DISPLAY note as playground above
   endif()
 endif()
 
@@ -1352,6 +1397,24 @@ if(BWA_BUILD_CALIBRATE)
   if(BWA_WITH_ASIO)
     bwa_add_asio_host(bwa_zylia_probe)
   endif()
+endif()
+
+# ---- wasm with phonon: every executable takes the C++ link driver --------------------------------
+# On the desktops bw_audio is SHARED and phonon's C++ never leaves it. On wasm it is STATIC (see
+# BWA_LIB_KIND), so phonon's archive reaches every consumer's own link and a plain C executable
+# fails on `__cxa_throw`, `operator delete(void*, unsigned long)` and
+# `std::__2::__shared_weak_count::*`. bwa_add_steam_test already sets the property for its own
+# targets; this applies the same fix to every executable in this directory once they all exist.
+# MEASURED on emcc 6.0.10. The link-flag route does not work: `-lc++ -lc++abi` picks emcc's
+# -noexcept variants and `-fexceptions` then fails on `__cxa_begin_catch` (docs/web.md).
+if(BWA_WASM AND BWA_PHONON_LIBS)
+  get_property(_bwa_dir_targets DIRECTORY PROPERTY BUILDSYSTEM_TARGETS)
+  foreach(_t IN LISTS _bwa_dir_targets)
+    get_target_property(_kind ${_t} TYPE)
+    if(_kind STREQUAL "EXECUTABLE")
+      set_target_properties(${_t} PROPERTIES LINKER_LANGUAGE CXX)
+    endif()
+  endforeach()
 endif()
 
 # ---- the optional bindings (Python / MATLAB + Octave / Godot) ------------------------------------

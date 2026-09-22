@@ -269,6 +269,18 @@ tools/ci/              build-engine-manylinux.sh: the LINUX engine, built, ctest
                        MATLAB and the Godot toolchain do not install in AlmaLinux 8 and do not need
                        to, since a binding compiled on the runner against a glibc-2.28 shared object
                        is an ordinary ABI client. [engine sdk]
+tools/wasm/            wasi-sdk.toolchain.cmake + build-wasm.sh: the wasm32 build. TWO toolchains and they
+                       are not interchangeable: wasi-sdk (wasm32-wasip1-threads, plain clang, a STATIC
+                       libbw_audio.a plus the offline test binaries, 33/33 under wasmtime) is the CI and
+                       offline leg; Emscripten with -pthread is the browser leg (Web Audio + Workers;
+                       35/38 under node with the wasm phonon staged, the three reds being `os` and
+                       `idle`, control-on-main-thread blocking waits, and `fuzz_api`, a phonon throw
+                       aborting the module because the wasm phonon has exceptions off). The
+                       toolchain file names the four link flags a run needs and what breaks without each;
+                       the shadow-stack one is the trap below. Null and manual sinks only: the AudioWorklet
+                       sink is the HOST's job. os_posix.c is the shim (BWA_OS_NO_SCHED + wasi socket stubs),
+                       following the Android precedent. Decided 2026-09-21: faithful two-thread over
+                       SharedArrayBuffer, control on a Worker, COOP/COEP accepted. docs/web.md. [wasm]
 tools/xval/            gen_reference.py: cross-validation golden generator (scipy SH / l1-LP VBAP /
                        qhull AllRAD / bilinear RBJ / lfilter) -> test/xval_data.h for the xval ctest.
                        Needs numpy+scipy; ctest itself does not (the header is committed).
@@ -408,9 +420,14 @@ suite — 45 tests with the Steam Audio SDK, 40 without (the 5 SDK-gated ones ar
 `bake`, `path`, `dynmesh`, `steam_decode`) — a count that INCLUDES the three GUI-tool suites
 (`calib_view`, `layout_tool`, `playground`), the four `validate_*` runs, and the four
 `example_*` runs (the console examples driven with `--tests`: offline sink, short waits), all
-under their build flags. On Linux, macOS or Android at the DEFAULT options it is 33: the GUI and
-ASIO capture tools are WIN32-only targets there, which drops their suites and the `validate_*` runs
-on top of the SDK-gated five. Android runs those 33 through `tools/android/run-tests.ps1` rather
+under their build flags. On Linux, macOS or Android at the DEFAULT options it is 33: `calib_view`
+and the ASIO capture tools are WIN32-only targets there, which drops the viewer's suite and the
+`validate_*` runs on top of the SDK-gated five, and `layout_tool` + `playground` sit behind
+`BWA_BUILD_PLAYGROUND`, which defaults OFF. Those two are NOT Windows-bound (raylib + rlImGui +
+imgui and nothing else, since 2026-09-21) - turn the option on in a Linux tree and their suites come
+back, for 40 with phonon and 35 without, MEASURED on Ubuntu 22.04 / gcc 11.4. They need a DISPLAY:
+a WSLg or X session, or `xvfb-run ctest` (software GL passes both suites). Android runs those 33
+through `tools/android/run-tests.ps1` rather
 than ctest, because the binaries are the device's. **Linux, macOS and Android now stage phonon
 too** (CI builds it per platform into `lib/linux-x64` / `lib/osx-universal` /
 `lib/android-arm64` + `lib/android-x64`), so the count there is **38**:
@@ -476,9 +493,10 @@ sinks, monitor, and FDN. `bwa_get_channel_count()` reads it back. A failed expli
 leaves `bwa_create` usable on the 26-grid fallback (reason via `bwa_last_error`), but `bwa_start`
 refuses it with `BWA_ERR_LAYOUT` — only `layout_path = NULL` runs the default grid.
 
-The three GUI tools are on the imgui stack — `calib_view` on imgui + implot + implot3d,
-`layout_tool` and `playground` on rlImGui (a raylib 3D scene under imgui panels) — and each has
-a `--tests` suite that drives the real UI under ctest.
+The three GUI tools are on the imgui stack — `calib_view` on imgui + implot + implot3d (win32 +
+d3d11, so WINDOWS-ONLY, and it links the ASIO capture shells too), `layout_tool` and `playground`
+on rlImGui (a raylib 3D scene under imgui panels, and PORTABLE — they build and pass on Linux) —
+and each has a `--tests` suite that drives the real UI under ctest.
 
 For the feature-level catalog — every `bwa_*` call and what it does — see docs/api.md's
 "Feature overview". NOTES.md holds the historical per-feature narration this section used to carry.
@@ -709,6 +727,16 @@ Regression-preventing gotchas. Each has bitten before or guards a real invariant
   and `set_err` messages behind that gap (engine.c, layout.c, zylia.c) before anyone looked.
   `rg -P '"[^"]*[^\x00-\x7F][^"]*"' src bindings/godot/src` should stay empty (the one hit it can
   legitimately return is a quoted phrase inside a `//` comment, `asio_sink.cpp`).
+- **wasm-ld's default shadow stack (64 KB) is too small for the engine, and the failure does not
+  say so.** The shadow-stack pointer wraps past zero and the next write lands near 4 GB, so wasmtime
+  reports `memory fault at wasm address 0xffff46fc` with a backtrace naming whatever libc function
+  was running. It presented first as `FAIL: rt_create`, then as `test_golden` spinning for minutes
+  on 0.25 s of audio. Bisected: 64 KB and 128 KB fault, 256 KB and up pass; the toolchain file asks
+  for 1 MB (`BWA_WASM_STACK_SIZE`), and that one flag took the suite from 14/33 to 33/33. The
+  other three load-bearing flags (`--import-memory --export-memory`, `--max-memory`,
+  `-lwasi-emulated-process-clocks`) each have a comment in `tools/wasm/wasi-sdk.toolchain.cmake`.
+  Also: `os` under wasmtime is the same sleep-lateness flake the Android emulator shows (32/33 then
+  33/33 on back-to-back runs); it passes in isolation.
 - **A shipped artifact must not cite a doc it does not ship.** Both packs run
   `tools/dist/doc-pointers.ps1`, which rewrites repo-doc references in the staged tree to
   permalinks at the packed commit and then fails the pack on any relative `.md` reference the
@@ -802,3 +830,8 @@ freely. It still follows the US English rule above.
   ambisonic decoders, spread/decorrelation, acoustics paths, binaural, calibration + validation
   coinages), each entry short, formula-cited to `file:line`, and linked to the doc that owns it.
   Threading vocabulary is deliberately excluded (concurrency.md owns it).
+- `docs/web.md` — the WebAssembly target: measured toolchain verdicts (wasi-sdk, Emscripten, zig),
+  the OS shim under wasm, the threading decision (two threads over SharedArrayBuffer, control on a
+  Worker) and the alternatives considered, the SPSC rings over SAB, the AudioWorklet sink through
+  `sink_quant`, which invariants survive, the JS/TS binding shape, COOP/COEP hosting, phonon under
+  wasm. Nothing browser-side is built yet; the offline core is.

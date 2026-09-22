@@ -1,15 +1,25 @@
 /*
- * os_posix.c — the POSIX half of the os.h shim (Linux, macOS, Android). The Windows half is
+ * os_posix.c — the POSIX half of the os.h shim (Linux, macOS, Android, WASI). The Windows half is
  * os_win.c; exactly one of the two is compiled.
  *
  * Apple differs in two places only, both marked: the monotonic clock goes through
  * mach_absolute_time, and lowering a thread's priority has no per-thread nice.
+ *
+ * WASI (wasm32-wasip1-threads) takes this half the way Android does - pthreads, C11 atomics,
+ * clock_nanosleep(TIMER_ABSTIME) and pthread_condattr_setclock(CLOCK_MONOTONIC) are all there, so
+ * the rings, the events and the self-paced loops are unchanged. Three things are NOT there and
+ * each degrades rather than fails: thread SCHEDULING (marked BWA_OS_NO_SCHED below, because
+ * Emscripten lands in the same branch for a different reason), BSD SOCKETS (marked `__wasi__` -
+ * no wasi-libc socket(), so natnet reports no tracker, which is the same answer a box with no
+ * Motive on it gives), and dlopen (wasi-libc's stub always returns NULL, which is already the
+ * "library not present" path the two Linux backends handle).
+ *
+ * See docs/web.md for the toolchain flags a wasm build needs and what the browser side still owes.
  */
 #include "os/os.h"
 
 #include <dlfcn.h>      /* os_dl_*: the two Linux device backends load their libraries at run time */
 #include <errno.h>
-#include <sched.h>       /* SCHED_FIFO + the priority range os_thread_set_realtime asks for */
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>       /* strcasecmp */
@@ -17,10 +27,29 @@
 #include <unistd.h>
 #include <sys/stat.h>     /* mkdir: the UTF-8 path family is plain POSIX here */
 
+/* No thread SCHEDULING on this target. Two ways to get here and they fail DIFFERENTLY, which is
+ * why one macro covers both rather than each branch naming a platform:
+ *   wasi-libc     has no <sched.h> policies and no sys/resource.h at all, so it is a COMPILE
+ *                 error - the include itself is a hard #error.
+ *   Emscripten    declares sched_get_priority_min/max and pthread_setschedparam in its headers
+ *                 and defines them only in the pthreads build, so a single-threaded build gets
+ *                 `wasm-ld: error: undefined symbol: sched_get_priority_min` at LINK time, on
+ *                 every target that pulls this file in. MEASURED on emcc 6.0.10.
+ * Either way the answer is the same one Android gives for a refused SCHED_FIFO: a reported
+ * degradation, never a failure. */
+#if defined(__wasi__) || (defined(__EMSCRIPTEN__) && !defined(__EMSCRIPTEN_PTHREADS__))
+#define BWA_OS_NO_SCHED 1
+#endif
+
+#if !defined(BWA_OS_NO_SCHED)
+#include <sched.h>       /* SCHED_FIFO + the priority range os_thread_set_realtime asks for */
+#endif
+#if !defined(__wasi__)
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
 #include <sys/time.h>
+#endif
 
 #if defined(__APPLE__)
 #include <mach/mach_init.h>     /* mach_thread_self / mach_task_self */
@@ -28,9 +57,10 @@
 #include <mach/mach_time.h>
 #include <mach/thread_act.h>    /* thread_policy_set */
 #include <mach/thread_policy.h> /* THREAD_TIME_CONSTRAINT_POLICY */
-#else
+#elif !defined(__wasi__)
 #include <sys/resource.h>  /* setpriority: Linux applies PRIO_PROCESS/0 to the CALLING THREAD.
-                            * Also getrlimit(RLIMIT_RTPRIO), the SCHED_FIFO permission probe. */
+                            * Also getrlimit(RLIMIT_RTPRIO), the SCHED_FIFO permission probe.
+                            * wasi-libc's copy is a hard #error: WASI has no process clocks. */
 #endif
 
 /* ---- threads ---- */
@@ -67,7 +97,11 @@ void os_thread_join(os_thread* t) {
 bool os_thread_valid(const os_thread* t) { return t && t->live != 0; }
 
 void os_thread_lower_priority(void) {
-#if defined(__APPLE__)
+#if defined(BWA_OS_NO_SCHED)
+    /* No thread priorities at all: wasi-libc has no sys/resource.h and no sched policies, and the
+     * browser equivalent (a Web Worker) exposes no priority knob either. The sim threads simply
+     * run at the one priority everything else has. */
+#elif defined(__APPLE__)
     /* No per-thread nice on Darwin. Stay in SCHED_OTHER and take the bottom of its band; a
      * failure is fine, the thread just runs at the default priority. */
     struct sched_param sp;
@@ -125,6 +159,12 @@ void os_thread_clear_realtime(void) {
                       THREAD_STANDARD_POLICY_COUNT);
     mach_port_deallocate(mach_task_self(), th);
 }
+#elif defined(BWA_OS_NO_SCHED)
+/* Nothing to ask and nobody to ask it of. ENOTSUP is the same answer Android's refused SCHED_FIFO
+ * produces, and the caller already treats a non-zero return as a reported degradation rather than
+ * a failure (docs/backends.md, rule 9). */
+int  os_thread_set_realtime(uint64_t period_ns) { (void)period_ns; return ENOTSUP; }
+void os_thread_clear_realtime(void) { }
 #else
 /* SCHED_FIFO, not a nice value: a blocking-write render loop misses its deadline the moment a
  * desktop task outranks it, and SCHED_OTHER has no way to say "always before that". min + 10 is
@@ -152,7 +192,9 @@ void os_thread_clear_realtime(void) {
 #endif
 
 bool os_thread_realtime_available(void) {
-#if defined(__linux__)
+#if defined(BWA_OS_NO_SCHED)
+    return false;   /* say so up front, so the sink reports the degradation through the open's err */
+#elif defined(__linux__)
     /* Exactly what the kernel checks: an unprivileged SCHED_FIFO request is granted while the
      * requested priority fits inside RLIMIT_RTPRIO (the `audio` group's limits.d drop, or a
      * systemd LimitRTPRIO). Root bypasses the limit, and so does CAP_SYS_NICE - which cannot be
@@ -382,6 +424,44 @@ int os_strcasecmp(const char* a, const char* b) { return strcasecmp(a, b); }
 
 /* ---- UDP sockets ---- */
 
+#if defined(__wasi__)
+/* wasi-libc has no socket(), and a browser has no UDP at all - a WebSocket or WebTransport relay
+ * is the only way a NatNet stream reaches a page, and that is a HOST-side job, not this shim's.
+ * So every call fails the way it does on a machine with no network: natnet.c's open gives up, the
+ * tracker reports unavailable, and the listener stays on whatever pose the control thread sets.
+ * os_net_startup still succeeds, because it only ever meant "Winsock is initialized". */
+int  os_net_startup(void) { return 0; }
+void os_net_cleanup(void) { }
+
+os_socket os_udp_open(void) { return OS_INVALID_SOCKET; }
+void os_udp_close(os_socket s) { (void)s; }
+int  os_udp_set_rcvtimeo_ms(os_socket s, unsigned ms) { (void)s; (void)ms; return 1; }
+int  os_udp_set_reuseaddr(os_socket s) { (void)s; return 1; }
+int  os_udp_bind_any(os_socket s, uint16_t port) { (void)s; (void)port; return 1; }
+int  os_udp_join_multicast(os_socket s, const char* g, const char* i) { (void)s; (void)g; (void)i; return 1; }
+int  os_udp_sendto(os_socket s, const void* b, size_t n, const char* ip, uint16_t p) {
+    (void)s; (void)b; (void)n; (void)ip; (void)p; return -1;
+}
+int  os_udp_recv(os_socket s, void* b, size_t cap) { (void)s; (void)b; (void)cap; return OS_UDP_ERROR; }
+
+/* The one call here that is pure string work and has a real answer without a socket. natnet.c
+ * validates a configured address before it ever opens one, and a config check must not depend on
+ * whether this platform can then connect. Four dot-separated decimal octets, nothing else. */
+bool os_ipv4_valid(const char* s) {
+    if (!s) return false;
+    for (int part = 0; part < 4; ++part) {
+        if (*s < '0' || *s > '9') return false;
+        int v = 0, digits = 0;
+        const char* first = s;
+        while (*s >= '0' && *s <= '9') { v = v * 10 + (*s++ - '0'); if (++digits > 3) return false; }
+        if (v > 255) return false;
+        if (digits > 1 && *first == '0') return false;   /* inet_pton rejects "01.2.3.4"; so do we */
+        if (part < 3) { if (*s++ != '.') return false; }
+    }
+    return *s == 0;
+}
+#else
+
 int  os_net_startup(void) { return 0; }     /* BSD sockets need no startup */
 void os_net_cleanup(void) { }
 
@@ -439,3 +519,4 @@ bool os_ipv4_valid(const char* s) {
     struct in_addr a;
     return s && inet_pton(AF_INET, s, &a) == 1;
 }
+#endif /* !__wasi__ */

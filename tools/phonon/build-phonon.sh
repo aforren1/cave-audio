@@ -15,7 +15,7 @@
 # this script on a miss, because only the caller knows which artifacts path it restored.
 #
 # ENVIRONMENT (one for one with the composite action's inputs)
-#   BWA_PLATFORM    build.py -p value: windows | linux | osx | android.          (required)
+#   BWA_PLATFORM    build.py -p value: windows | linux | osx | android | wasm.   (required)
 #   BWA_ARCH        build.py -a value: x64 | arm64 | armv7 | x86.                (default: x64)
 #   BWA_TOOLCHAIN   build.py -t value: vs2013 | vs2015 | vs2017 | vs2019 | vs2022. WINDOWS ONLY,
 #                   and IGNORED on every other platform - both pinned scripts accept only those
@@ -34,7 +34,23 @@
 #                   Measured: gcc 11.5 and 13.3 fail, gcc 14.3 passes.           (default: empty)
 #   BWA_ART         where to stage. Relative to the repo root, or absolute. Leave it alone unless
 #                   STEAMAUDIO_DIR is overridden too.   (default: third_party/steam-audio-artifacts)
+#   BWA_PYTHON      the interpreter that runs the two pinned scripts. Resolved automatically, and
+#                   only worth setting where neither `python` nor `python3` is the one you want:
+#                   the emsdk container ships python3 and no `python`.   (default: autodetected)
 #   ANDROID_NDK     required when BWA_PLATFORM is android; both pinned scripts read it.
+#   EMSDK           required when BWA_PLATFORM is wasm; both pinned scripts read it (build.py
+#                   builds the Emscripten toolchain-file path out of it and crashes when it is
+#                   unset). The emscripten/emsdk container exports it already.
+#
+# WASM NOTE. The wasm leg is -pthread on BOTH halves, and that is not a preference. The engine's
+# own wasm build needs threads (the control thread, the asset loader and the stream refill are all
+# threads), a -pthread module is a SHARED-MEMORY module, and wasm-ld refuses to put an object that
+# carries no atomics or bulk-memory features into one:
+#   wasm-ld: error: --shared-memory is disallowed by api_context.cpp.o because it was not
+#            compiled with 'atomics' or 'bulk-memory' features.
+# So phonon and its companions are built with -pthread here without being asked. The companions
+# go through get_dependencies.py, which takes no flag argument, so the only lever on them is the
+# environment CMake reads at their first configure. See docs/web.md.
 #
 # WHAT IT STAGES
 #   include/phonon.h, include/phonon_version.h
@@ -54,13 +70,23 @@ set -eu
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$ROOT"
 
-: "${BWA_PLATFORM:?set BWA_PLATFORM (windows|linux|osx|android)}"
-: "${BWA_STAGE_DIR:?set BWA_STAGE_DIR (windows-x64|linux-x64|osx-universal|android-arm64|...)}"
+: "${BWA_PLATFORM:?set BWA_PLATFORM (windows|linux|osx|android|wasm)}"
+: "${BWA_STAGE_DIR:?set BWA_STAGE_DIR (windows-x64|linux-x64|osx-universal|android-arm64|wasm32|...)}"
 BWA_ARCH="${BWA_ARCH:-x64}"
 BWA_TOOLCHAIN="${BWA_TOOLCHAIN:-}"
 BWA_FFT="${BWA_FFT:-pffft}"
 BWA_CMAKE_FLAGS="${BWA_CMAKE_FLAGS:-}"
 BWA_ART="${BWA_ART:-third_party/steam-audio-artifacts}"
+
+# Both pinned scripts are invoked as `python`, which several images do not carry: the emsdk
+# container has python3 alone. Resolve the interpreter once here rather than making every caller
+# drop a shim on PATH first.
+PY="${BWA_PYTHON:-}"
+if [ -z "$PY" ]; then
+  if command -v python >/dev/null 2>&1; then PY=python; else PY=python3; fi
+fi
+command -v "$PY" >/dev/null 2>&1 || { echo "no python interpreter: set BWA_PYTHON"; exit 1; }
+echo "python: $PY ($("$PY" --version 2>&1))"
 
 # The pinned deps (flatbuffers 1.12, zlib, pffft, mysofa) declare pre-3.5 cmake_minimum_required,
 # which CMake 4 refuses outright. This env var (honored by CMake >= 3.31.7 / 4.0) is the official
@@ -87,33 +113,56 @@ if [ ! -f third_party/steam-audio-source/core/build/build.py ]; then
 fi
 
 # One caller may run this more than once on one checkout (the android job builds two ABIs), and
-# the second call finds the submodule already patched, where a plain `git apply` fails with "patch
-# does not apply". So: apply when it applies, skip when it is already in, and fail only when it is
-# neither. `git apply` needs no repository, which is what makes this work inside the container.
+# the second call finds the tree already patched, where a plain `git apply` fails with "patch does
+# not apply". So: apply when it applies, skip when it is already in, and fail only when it is
+# neither. `git apply` needs no repository, which is what makes this work inside the container AND
+# on the downloaded dependency tree below, which is a plain directory of copied headers.
+#
+# apply_once <tree> <patch>. The patch path is absolute so one function serves trees at two
+# different depths; the tree is where the patch's own a/ and b/ paths are rooted.
 apply_once() {
-  local rel="../patches/$(basename "$1")"
-  if git -C third_party/steam-audio-source apply --check "$rel" 2>/dev/null; then
-    git -C third_party/steam-audio-source apply "$rel"; echo "applied $(basename "$1")"
-  elif git -C third_party/steam-audio-source apply --reverse --check "$rel" 2>/dev/null; then
-    echo "already applied $(basename "$1")"
+  local tree="$1" name; name="$(basename "$2")"
+  local abs="$ROOT/third_party/patches/$name"
+  if git -C "$tree" apply --check "$abs" 2>/dev/null; then
+    git -C "$tree" apply "$abs"; echo "applied $name"
+  elif git -C "$tree" apply --reverse --check "$abs" 2>/dev/null; then
+    echo "already applied $name"
   else
-    echo "patch $(basename "$1") neither applies nor is already applied"; exit 1
+    echo "patch $name neither applies nor is already applied (tree: $tree)"; exit 1
   fi
 }
+SUBMODULE=third_party/steam-audio-source
+CORE="$SUBMODULE/core"
 # REQUIRED for directional reflections (upstream steam-audio#546):
-apply_once third_party/patches/phonon-multiplyaccumulate-align.patch
+apply_once "$SUBMODULE" third_party/patches/phonon-multiplyaccumulate-align.patch
 
 if [ "$BWA_PLATFORM" = "android" ]; then
   # Android needs more of the pinned scripts fixed than any other platform: they were written for
   # a Windows host and for one spelling of the arm64 target. Each patch says what it fixes; all of
   # them are android-only, so no other platform applies them.
   for p in third_party/patches/phonon-android-*.patch; do
-    apply_once "$p"
+    apply_once "$SUBMODULE" "$p"
   done
   # Both scripts read the NDK from here (get_dependencies.py's --ndk defaults to it), and
   # get_dependencies.py exits 1 without it. Fail on our own message rather than on theirs.
   test -n "${ANDROID_NDK:-}" || { echo "android: set ANDROID_NDK before calling this script"; exit 1; }
   echo "ANDROID_NDK=$ANDROID_NDK"
+fi
+
+if [ "$BWA_PLATFORM" = "wasm" ]; then
+  # build.py reads EMSDK with no default and concatenates it into the toolchain-file path, so an
+  # unset one is a TypeError deep inside their script. Say it here instead. emcc itself has to be
+  # on PATH for the companions, which get_dependencies.py builds through the same toolchain file.
+  test -n "${EMSDK:-}" || { echo "wasm: set EMSDK (run inside emscripten/emsdk, or source emsdk_env.sh)"; exit 1; }
+  command -v emcc >/dev/null 2>&1 || { echo "wasm: emcc is not on PATH"; exit 1; }
+  echo "EMSDK=$EMSDK  ($(emcc --version | head -1))"
+  # -pthread on BOTH halves; see the WASM NOTE in this file's header for why it is mandatory.
+  # The companions have no flag argument, so the environment is the only lever on them, and the
+  # phonon configure below takes it as -D flags. Ours go FIRST so a caller's BWA_CMAKE_FLAGS can
+  # still override them: for a repeated -D, CMake keeps the last.
+  export CFLAGS="${CFLAGS:-} -pthread"
+  export CXXFLAGS="${CXXFLAGS:-} -pthread"
+  BWA_CMAKE_FLAGS="-DCMAKE_C_FLAGS=-pthread -DCMAKE_CXX_FLAGS=-pthread $BWA_CMAKE_FLAGS"
 fi
 
 if [ "$BWA_PLATFORM" = "windows" ]; then
@@ -131,7 +180,7 @@ else
   SHAREDCRT=""
 fi
 
-cd third_party/steam-audio-source/core/build
+cd "$CORE/build"
 # flatbuffers is a BUILD TOOL (flatc), so it never takes the CRT flag and never links in.
 # gcc 13 (ubuntu-latest) flags a false positive in flatbuffers 1.12's reflection.cpp
 # (-Werror=stringop-overflow inside <bits/stl_algobase.h>), and flatbuffers builds itself with
@@ -139,28 +188,41 @@ cd third_party/steam-audio-source/core/build
 # host tool only: the env var reaches flatbuffers' fresh configure and nothing else, so phonon and
 # its companions keep their own flags.
 if [ "$BWA_PLATFORM" = "windows" ]; then
-  python get_dependencies.py --dependency flatbuffers -p "$BWA_PLATFORM" -a "$BWA_ARCH" $TOPT
+  "$PY" get_dependencies.py --dependency flatbuffers -p "$BWA_PLATFORM" -a "$BWA_ARCH" $TOPT
 else
   CXXFLAGS="${CXXFLAGS:-} -Wno-error=stringop-overflow" \
-    python get_dependencies.py --dependency flatbuffers -p "$BWA_PLATFORM" -a "$BWA_ARCH" $TOPT
+    "$PY" get_dependencies.py --dependency flatbuffers -p "$BWA_PLATFORM" -a "$BWA_ARCH" $TOPT
 fi
+# THE ONE PATCH ON A DOWNLOADED DEPENDENCY, and the reason this step is here rather than beside
+# the submodule ones at the top: the tree it lands on does not exist until get_dependencies.py has
+# cloned, built and copied it. The target is the COPIED include tree, which is what phonon then
+# compiles against; flatc itself builds either way. The patch file says what it fixes.
+apply_once "$ROOT/$CORE/deps/flatbuffers" third_party/patches/deps-flatbuffers-tablekeycomparator.patch
 for d in zlib "$BWA_FFT" mysofa; do
-  python get_dependencies.py --dependency "$d" $SHAREDCRT -p "$BWA_PLATFORM" -a "$BWA_ARCH" $TOPT
+  "$PY" get_dependencies.py --dependency "$d" $SHAREDCRT -p "$BWA_PLATFORM" -a "$BWA_ARCH" $TOPT
 done
 
 # --minimal drops Embree / IPP / GPU / sample apps. Generate only: the configure below adds the
 # two settings that make this a STATIC, /MD phonon.
-python build.py -p "$BWA_PLATFORM" -a "$BWA_ARCH" $TOPT -c release --minimal -o generate
+"$PY" build.py -p "$BWA_PLATFORM" -a "$BWA_ARCH" $TOPT -c release --minimal -o generate
 
 # build.py makes its tree in the CWD, and a single-config generator appends the config
 # (linux-x64-release, not linux-x64). Don't guess - locate the CMakeCache. Prefer a tree whose
 # name carries THIS platform and arch: Android calls this twice in one checkout, once per ABI, so
 # "the first CMakeCache" would hand the second call the first ABI's tree and stage one ABI's
 # archives twice.
+# Not every platform puts the arch in the name, though: build.py names the osx, ios and wasm trees
+# from -p and the config alone (wasm-release, not wasm-x64-release), so an arch in the pattern
+# matches nothing there and the match has to drop it. Those three build one tree per checkout, so
+# dropping it costs no precision.
+case "$BWA_PLATFORM" in
+  osx|ios|wasm) TREEPAT="$BWA_PLATFORM*" ;;
+  *)            TREEPAT="$BWA_PLATFORM*$BWA_ARCH*" ;;
+esac
 TREE=""
 for d in $(find . -maxdepth 3 -name CMakeCache.txt); do
   case "$(basename "$(dirname "$d")")" in
-    "$BWA_PLATFORM"*"$BWA_ARCH"*) TREE="$(dirname "$d")"; break ;;
+    $TREEPAT) TREE="$(dirname "$d")"; break ;;
   esac
 done
 if [ -z "$TREE" ]; then TREE=$(dirname "$(find . -maxdepth 3 -name CMakeCache.txt | head -1)"); fi
@@ -180,7 +242,6 @@ cd "$ROOT"
 
 # Stage where the root CMakeLists auto-detects it. find: the build-tree layout is phonon's
 # business; only the staged layout is ours (third_party/README.md).
-CORE=third_party/steam-audio-source/core
 mkdir -p "$BWA_ART/include" "$BWA_ART/lib/$BWA_STAGE_DIR"
 cp "$CORE/src/core/phonon.h"                                 "$BWA_ART/include/"
 cp "$(find "$PHONON_TREE" -name phonon_version.h | head -1)"  "$BWA_ART/include/"

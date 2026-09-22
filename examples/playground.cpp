@@ -104,6 +104,15 @@
 #include <string.h>
 #include <time.h>
 
+/* Case-insensitive compare: POSIX spells it strcasecmp in <strings.h>, MSVC only declares _stricmp.
+ * One name here rather than an #if at the call site. */
+#if defined(_WIN32)
+#define bwa_strcasecmp _stricmp
+#else
+#include <strings.h>
+#define bwa_strcasecmp strcasecmp
+#endif
+
 #define SR   48000u
 #define NSPK 26                 /* array CAPACITY; g_nspk is the engine's ACTIVE count (the layout's) */
 
@@ -1263,7 +1272,7 @@ static void load_custom_bed(const char* path, int fuma) {
 }
 static void load_custom_auto(const char* path) {
     const char* dot = strrchr(path, '.');
-    if (dot && _stricmp(dot, ".amb") == 0) { load_custom_bed(path, 1); return; }   /* .amb = FuMa by convention */
+    if (dot && bwa_strcasecmp(dot, ".amb") == 0) { load_custom_bed(path, 1); return; }   /* .amb = FuMa by convention */
     bwa_sound s = bwa_load_ambix(e, path);               /* 4/9/16 channels -> it's a soundfield */
     if (s) {
         if (g_cust_bed) bwa_unload_sound(e, g_cust_bed);
