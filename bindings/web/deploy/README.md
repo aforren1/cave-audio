@@ -10,7 +10,7 @@ give you with headers.
 | `coi-serviceworker.js` | vendored [coi-serviceworker](https://github.com/gzuidhof/coi-serviceworker), MIT, pinned by commit in its header. Do not hand-edit it. |
 | `coi-serviceworker.LICENSE` | the MIT text that travels with it. |
 | `index.html` | the landing shell. Registers the worker, reports isolation, links to the two demos. |
-| `stage.sh` | assembles the artifact: `dist/`, `example/`, `playground/`, plus this shell and the worker at the root, plus `.nojekyll`. |
+| `stage.sh` | assembles the artifact: `dist/`, `example/`, `playground/`, `xr/`, plus this shell and the worker at the root, plus `.nojekyll`. |
 
 `.github/workflows/pages.yml` runs the build, runs `stage.sh` and deploys. Nothing else in the
 repository reads this directory.
@@ -39,7 +39,7 @@ both states, which is why its answers can flip a moment after it opens.
 Two things follow. A private window with service workers disabled never becomes isolated, and a
 demo must refuse to start rather than fall back to a single-threaded engine. And the worker's
 scope comes from its own URL, so the script must stay at the site root: from there it controls
-`example/` and `playground/` too.
+`example/`, `playground/` and `xr/` too.
 
 ## Every asset must be same-origin
 
@@ -49,10 +49,10 @@ site is fine, because a navigation is not a subresource, but a script, a stylesh
 image, a wasm module or a worker is not.
 
 So: **vendor it, do not link it**. The landing shell loads nothing but its own inline CSS and the
-worker. The rule applies to everything the build puts in `dist/` as well. The playground is the one
-page that has a third-party dependency, and it obeys the rule: `tools/wasm/fetch-web-vendor.sh`
-fetches a pinned, hashed three.js into `dist/vendor/three/` at build time, and the page imports it
-from there. Any future font or icon set goes the same way.
+worker. The rule applies to everything the build puts in `dist/` as well. The playground and the XR
+page are the pages that have a third-party dependency, and they obey the rule:
+`tools/wasm/fetch-web-vendor.sh` fetches a pinned, hashed three.js into `dist/vendor/three/` at
+build time, and both pages import it from there. Any future font or icon set goes the same way.
 
 `stage.sh` greps the staged tree for cross-origin `src`, `import`, `importScripts` and `url()`
 references and prints a warning for each. It warns rather than fails, because the check reads text
@@ -63,7 +63,9 @@ otherwise.
 
 The site root mirrors `bindings/web`: `stage.sh` copies `bindings/web/dist/` to `dist-<hash>/`,
 `bindings/web/example/` to `example/` (minus the local dev server) and
-`bindings/web/playground/` to `playground/`, then puts this directory's files at the root. The
+`bindings/web/playground/` to `playground/` and `bindings/web/xr/` to `xr/`, then puts this
+directory's files at the root. The XR page imports from `../playground/`, so the two directories
+are staged together or its imports 404. The
 hash is the build's own content, and the pages' `../dist/` imports are rewritten to it at stage
 time. That is what keeps a returning visitor's cached modules from being mixed with a new build:
 Pages serves everything with a ten-minute `max-age`, and the first playground deploy died on a
@@ -75,10 +77,11 @@ the site exactly as it does under `example/serve.mjs`, and the root is owned by 
   where the worker registers.
 - **`coi-serviceworker.js` and `coi-serviceworker.LICENSE` at the root belong to this directory.**
 
-The shell links to **`playground/index.html`** and **`example/index.html`**. Those two paths are
-the assumptions this directory makes about the build. Change a demo and this shell together, or
+The shell links to **`playground/index.html`**, **`xr/index.html`** and
+**`example/index.html`**. Those three paths are the assumptions this directory makes about the
+build. Change a demo and this shell together, or
 `stage.sh` warns that the link will 404. It also warns when `dist/vendor/three` is missing, because
-a playground with no three.js is a blank screen rather than a degraded demo.
+a playground or an XR page with no three.js is a blank screen rather than a degraded demo.
 
 One more thing every demo page must do: **load the worker itself**, with
 `<script src="../coi-serviceworker.js"></script>` before anything that touches

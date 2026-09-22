@@ -124,6 +124,12 @@ export class BwaEngine {
    * @param {number} [opts.sinkFlags] BWA_SINK_FLAG_*
    * @param {string} [opts.layoutPath] cave_layout.json inside the wasm file system
    * @param {string} [opts.hrtfPath] a SOFA file inside the wasm file system
+   * @param {Object<string, Uint8Array>} [opts.files] files to write into that file system BEFORE
+   *        `bwa_create` runs. A layout or a SOFA file has to be there already, because create
+   *        opens it inside its own call; `writeFile` afterwards is too late for those two.
+   * @param {object} [opts.module] "main" topology only: an engine module this page has already
+   *        instantiated (`engine.module`). Rebuilding an engine on it costs no second copy of the
+   *        wasm and no second pthread pool.
    * @returns {Promise<BwaEngine>}
    */
   static async create(opts = {}) {
@@ -179,8 +185,10 @@ export class BwaEngine {
     this.topology = topology;
 
     if (topology === "main") {
-      const factory = (await import(/* @vite-ignore */ wasmUrl)).default;
-      const M = await factory({});
+      /* A module the page already has, when it hands one over. Instantiating a second copy of a
+       * 6 MB wasm plus its pthread pool for every engine is what a profile rebuild would otherwise
+       * cost, and the dead copy's Workers do not go away. */
+      const M = opts.module ?? await (await import(/* @vite-ignore */ wasmUrl)).default({});
       this._module = M;
       if (opts.audioContext) {
         if (typeof M.emscriptenRegisterAudioObject !== "function") {
@@ -196,7 +204,9 @@ export class BwaEngine {
       }
       const { Host } = await import("./host.js");
       this._host = new Host();
-      this.info = await this._host.init({ moduleFactory: async () => M, engine: engineOpts, slab });
+      this.info = await this._host.init({
+        moduleFactory: async () => M, engine: engineOpts, slab, files: opts.files,
+      });
       return;
     }
 
@@ -213,7 +223,7 @@ export class BwaEngine {
         p.reject(err);
       }
     };
-    this.info = await this._call(OPS.INIT, { wasmUrl, engine: engineOpts, slab });
+    this.info = await this._call(OPS.INIT, { wasmUrl, engine: engineOpts, slab, files: opts.files });
   }
 
   _call(op, msg = {}) {
@@ -298,6 +308,47 @@ export class BwaEngine {
   async createBed() {
     const h = await this._call(OPS.CREATE, { kind: "bed" });
     return new ClientHandle(this, h);
+  }
+
+  /**
+   * Put a file in the module's file system, where the engine can open it by path. See `host.js`'s
+   * `writeFile`. A layout or a SOFA file is read INSIDE `bwa_create`, so those two go in through
+   * `create({ files })`; this is for anything a running engine opens later.
+   * @param {string} path absolute, inside the wasm file system
+   * @param {Uint8Array|ArrayBuffer} data
+   * @returns {Promise<number>} bytes written
+   */
+  writeFile(path, data) { return this._call(OPS.WRITE_FILE, { path, data }); }
+
+  /** "main" topology only: the instantiated engine module, to hand back to `create({ module })`. */
+  get module() { return this._module ?? null; }
+
+  /**
+   * The sink's `AudioWorkletNode`, once the asynchronous setup chain has built it, or null.
+   *
+   * WHY A PAGE WANTS IT. The sink connects the node to the context's destination, and Web Audio
+   * offers no tap on a destination, so without this a page cannot meter, record or route what it
+   * is actually hearing - and `bwa_set_output_capture`, which would be the other way, is not bound
+   * in any layer because its callback runs on the audio thread. Connecting an AnalyserNode to this
+   * node is ADDITIVE: the sink's own connection to the destination stays, so a tap cannot mute the
+   * page.
+   *
+   * The node is created asynchronously after `start()`, so this reads null for a few frames. It is
+   * "main" topology plus `SinkType.WORKLET` only; every other case has no node to give.
+   */
+  outputNode() {
+    const M = this._module;
+    if (!M || !this.audioContext || typeof M.emscriptenGetAudioObject !== "function") return null;
+    if (typeof AudioWorkletNode === "undefined") return null;
+    /* Emscripten's audio objects are handles into one small table, minted in creation order: the
+     * context the page registered, then the sink's node. Scanning it is the only lookup the glue
+     * offers - there is no "the node for this context" call. The bootstrap's own AudioWorkletNode
+     * is never registered, so nothing else here can match. */
+    for (let h = 1; h <= 64; ++h) {
+      const o = M.emscriptenGetAudioObject(h);
+      if (o instanceof AudioWorkletNode && o.context === this.audioContext) return o;
+    }
+    return null;
   }
 
   async start() { this.info = await this._call(OPS.START); return this.info; }

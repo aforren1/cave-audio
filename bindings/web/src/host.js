@@ -28,12 +28,17 @@ export class Host {
   }
 
   /**
-   * @param {object} msg the INIT payload: { moduleFactory | wasmUrl, engine, slab }
+   * @param {object} msg the INIT payload: { moduleFactory | wasmUrl, engine, slab, files }
    */
   async init(msg) {
     const factory = msg.moduleFactory ?? (await import(/* @vite-ignore */ msg.wasmUrl)).default;
     const M = await factory(msg.moduleArgs ?? {});
     this.raw = makeRaw(M);
+    /* BEFORE the engine, not after: bwa_create OPENS bwa_desc.layout_path and bwa_desc.hrtf_path
+     * inside that one call, so a file a caller means the engine to read has to already be in the
+     * module's file system. That is what `files` is for, and why a later writeFile cannot serve a
+     * layout. */
+    for (const [path, data] of Object.entries(msg.files ?? {})) this.writeFile(path, data);
     this.engine = new Engine(this.raw, msg.engine ?? {});
     if (msg.slab) {
       this.u32 = new Uint32Array(msg.slab);
@@ -121,6 +126,7 @@ export class Host {
       }
       case OPS.RENDER: return this.renderBlock();
       case OPS.FRAME: this.applyFrame(); return null;
+      case OPS.WRITE_FILE: return this.writeFile(msg.path, msg.data);
       default: throw new BwaError(`unknown op '${op}'`);
     }
   }
@@ -186,6 +192,43 @@ export class Host {
     } finally {
       for (const ptr of temps) raw.free(ptr);
     }
+  }
+
+  /**
+   * Put a file in the module's file system, where the engine can open it.
+   *
+   * WHY IT EXISTS. `bwa_desc.layout_path` and `bwa_desc.hrtf_path` are PATHS, and the engine opens
+   * them with an ordinary fopen. A browser has no synchronous file system for that fopen to reach,
+   * so the only place such a path can point is MEMFS, the module's own in-memory one. A page gets
+   * bytes from a `<input type="file">`, a fetch or a string; this is where those bytes become a
+   * path. It is deliberately NOT how audio gets in - see the README's "Where the audio comes from":
+   * a wav belongs in a push source through the browser's own decoder.
+   *
+   * MEMFS is per MODULE INSTANCE and lives in its heap, so a file written here is gone when the
+   * module goes and costs its own size in wasm memory. Write the layout, not the sample library.
+   *
+   * @param {string} path an absolute path inside the module file system, "/cave_layout.json"
+   * @param {Uint8Array|ArrayBuffer} data the file's bytes
+   * @returns {number} bytes written
+   */
+  writeFile(path, data) {
+    const FS = this.raw.module.FS;
+    if (!FS) {
+      throw new BwaError(
+        "bw_audio: this module was linked without FS in EXPORTED_RUNTIME_METHODS, so nothing can " +
+        "put a file where the engine can open it. Rebuild with tools/wasm/build-web.sh."
+      );
+    }
+    if (typeof path !== "string" || !path) throw new BwaError("writeFile: path must be a string");
+    const bytes = data instanceof Uint8Array ? data : new Uint8Array(data);
+    const cut = path.lastIndexOf("/");
+    if (cut > 0) {
+      /* A directory that already exists throws EEXIST rather than returning, and a path whose
+       * parent is there is the common case. */
+      try { FS.mkdirTree(path.slice(0, cut)); } catch { /* already there */ }
+    }
+    FS.writeFile(path, bytes);
+    return bytes.length;
   }
 
   /**

@@ -47,7 +47,15 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  deploy:
+  # TWO JOBS, build then deploy, and the split is not cosmetic. deploy-pages exchanges an OIDC token
+  # for the deployment, and it fetches that token from the runner's token endpoint. Run INSIDE the
+  # emsdk container that request has to cross the container boundary, and run 35731244092 died on
+  # exactly that: "Failed to get ID Token ... Request timeout" after a build that had already
+  # succeeded twice from the same container. Two earlier deploys happened to get through. So the
+  # container job builds and UPLOADS the artifact, and a plain runner job, the shape GitHub's own
+  # starter workflow uses, does the deploy. A second benefit: `gh run rerun --failed` redoes the
+  # deploy alone instead of rebuilding.
+  build:
     runs-on: ubuntu-latest
     # PINNED, and it is the version docs/web.md measured the whole wasm leg against (Emscripten
     # 6.0.10: 35 of 38 ctests with phonon staged). `latest` would let a toolchain bump change the
@@ -56,11 +64,6 @@ jobs:
       image: emscripten/emsdk:6.0.10
     permissions:
       contents: read
-      pages: write        # create the deployment
-      id-token: write     # the OIDC token deploy-pages exchanges for it
-    environment:
-      name: github-pages
-      url: ${{ steps.deploy.outputs.page_url }}
     # A cold phonon cache is the long pole here exactly as it is in ci.yml: about 20 minutes on a
     # desktop (docs/web.md), and a warm cache restores it in seconds.
     timeout-minutes: 90
@@ -162,6 +165,18 @@ jobs:
         with:
           path: bindings/web/_site
 
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest      # NOT in the container; see the note on the jobs: line
+    permissions:
+      contents: read
+      pages: write        # create the deployment
+      id-token: write     # the OIDC token deploy-pages exchanges for it
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    timeout-minutes: 15
+    steps:
       - name: Deploy to GitHub Pages
         id: deploy
         uses: actions/deploy-pages@v5

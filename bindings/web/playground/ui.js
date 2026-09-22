@@ -83,6 +83,19 @@ function build(it) {
       }
       return row(it.label, w, it.hint);
     }
+    case "file": {
+      /* The value is the FILE's text, read here, so a scene or the page never touches a FileReader.
+       * The input is reset after every pick, or choosing the same file twice fires nothing. */
+      const i = document.createElement("input");
+      i.type = "file";
+      if (it.accept) i.accept = it.accept;
+      i.addEventListener("change", async () => {
+        const f = i.files && i.files[0];
+        i.value = "";
+        if (f) await it.set(await f.text(), f.name);
+      });
+      return row(it.label, i, it.hint);
+    }
     case "note": {
       const p = document.createElement("p");
       p.className = "note";

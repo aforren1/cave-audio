@@ -6,8 +6,8 @@
 <title>bw_audio on the web</title>
 <!--
   The GitHub Pages landing shell. It is NOT the demo: it registers the COOP/COEP service worker,
-  reports whether the page ended up cross-origin isolated, and links to the two demos the web
-  build stages, at playground/index.html and example/index.html.
+  reports whether the page ended up cross-origin isolated, and links to the three demos the web
+  build stages, at playground/index.html, xr/index.html and example/index.html.
 
   EVERYTHING THIS PAGE LOADS IS SAME-ORIGIN, and that is a rule rather than a style choice. The
   service worker serves COEP: require-corp, under which a cross-origin script, style or font
@@ -66,12 +66,16 @@
 
 <p id="cta">
   <a class="demo" href="playground/index.html">Open the playground</a>
+  <a class="demo" href="xr/index.html">Open it in VR</a>
   <a class="demo" href="example/index.html">Open the minimal example</a>
 </p>
 <p class="note">The playground is the engine's demo scenes with three.js visuals: localization,
   the 26-speaker channel walk, occlusion, directivity, the underwater boundary and a blind A/B/X
-  test. The minimal example is one source orbiting your head and nothing else. Headphones for
-  both.</p>
+  test. The XR page is the same scenes with your head in them: in an immersive-vr session the
+  viewer pose becomes the engine's listener pose every frame, so a source stays where it is in the
+  room while you turn. It needs a headset, and it says so and sends you back here if it finds
+  none. The minimal example is one source orbiting your head and nothing else. Headphones for all
+  three.</p>
 <p class="note" id="why"></p>
 
 <p class="note">

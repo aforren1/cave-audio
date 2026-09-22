@@ -30,6 +30,20 @@ async function main() {
   if (started !== true) throw new Error(`the page did not start (${started}); page log: ${pageLog()}`);
   ok("the page started from the Start button");
 
+  /* ---- the start affordance is GONE once the engine is up, and something says what is running.
+   * `hidden` alone did not do it: the UA's [hidden] rule loses to the panel's own id selector, so
+   * the "a browser resumes an AudioContext only from a user gesture" text sat over the scene for
+   * the whole session. Assert the COMPUTED style, because the attribute was already true. ---- */
+  {
+    const v = pg.state().view;
+    if (v.startPanelShown) fail("the Start panel is still displayed over the running scene");
+    else ok("the Start panel is gone once the engine is running");
+    if (!v.status) fail("no status line replaced it");
+    else if (!/cave_sim/.test(v.status) || !/sink worklet/.test(v.status) || !/context running/.test(v.status))
+      fail(`the status line does not name profile, sink and context state: "${v.status}"`);
+    else ok(`the status line reads "${v.status}"`);
+  }
+
   /* ---- the sink is the one this demo exists for ---- */
   let s = pg.state();
   if (!/^worklet/.test(String(s.backend))) fail(`backend is "${s.backend}", not the worklet sink`);
@@ -72,6 +86,93 @@ async function main() {
   if (!(R.right > R.left * MARGIN))
     fail(`a source on the listener's RIGHT (-x) was not louder in the right ear by ${MARGIN}x`);
   else ok("a source at room -x is louder in the RIGHT ear");
+
+  /* ---- the meters and the cones FOLLOW the live bus, on the page's own default stimulus.
+   *
+   * This is the assertion the channel walk below could not make. That one drives
+   * `bwa_set_test_signal`, which is on CONTINUOUSLY, so it passed while every ordinary scene read
+   * "silent" and every cone stayed dark. The default stimulus is a click train whose burst is 2 ms
+   * in every 250 ms, `bwa_get_bus_levels` publishes the LAST BLOCK's peak, and the page sampled it
+   * every 120 ms - 22 blocks apart, so it saw 1 block in 22 and the click was in none of them
+   * (measured: 0 of ~40 slow samples, 15 of 437 fast ones). What is asserted here is the DRAWN
+   * state: the cone shading and the meter strip's width, not the numbers behind them. ---- */
+  await pg.selectScene("localization");
+  pg.setSignal(0);                          /* the click train: the page's default */
+  pg.setSourceRoom([1.5, 1.5, 0.5]);
+  await waitFor(() => pg.tapReady(), 8000, "the output tap on the sink's node");
+  {
+    let cone = 0;
+    let strip = 0;
+    let out = 0;
+    const t0 = performance.now();
+    while (performance.now() - t0 < 2500) {
+      const v = pg.state().view;
+      cone = Math.max(cone, ...v.coneLevels);
+      strip = Math.max(strip, parseFloat(v.meterWidth) || 0);
+      out = Math.max(out, parseFloat(v.outWidth[0]) || 0, parseFloat(v.outWidth[1]) || 0);
+      await sleep(40);
+    }
+    ok(`click train: brightest cone ${cone.toFixed(2)}, bus strip ${strip.toFixed(0)}%, ` +
+       `output strip ${out.toFixed(0)}%`);
+    if (!(cone > 0.15)) fail(`the speaker cones never lit past ${cone.toFixed(3)} while a source played`);
+    else ok("the speaker cones follow the live bus");
+    if (!(strip > 10)) fail(`the bus meter strip never went past ${strip.toFixed(0)}%`);
+    else ok("the bus meter strip follows the live bus");
+    if (!(out > 10)) fail(`the output meter strips never went past ${out.toFixed(0)}%`);
+    else ok("the output meter strips follow what the AudioContext is playing");
+  }
+
+  /* ---- a stimulus change is HEARD promptly, measured on the live output.
+   *
+   * The feed paces on the ring's space, and the ring holds 1.37 s: filling it put up to a second
+   * of the OLD stimulus ahead of the audio clock, so a menu change took about that long to arrive.
+   * The queue is a latency budget now (rig.js's QUEUE_MS), and this measures the budget the only
+   * way that counts - the time from the switch to the moment the output is continuously carrying
+   * the new signal. ---- */
+  {
+    pg.setSignal(2);                        /* pink noise: continuous, so "hot" means arrived */
+    await sleep(900);
+    pg.outputPeaks();
+    await sleep(300);
+    const ref = pg.outputPeaks();
+    const steady = Math.max(ref.rmsL, ref.rmsR);
+    const thresh = steady * 0.3;
+    /* The reference has to BE something. A page whose queue is a second deep has not started
+     * playing the pink noise yet when this is measured, so `steady` comes back at silence, the
+     * threshold collapses to zero and the detector below fires on the first read it takes - a
+     * test that passes hardest exactly where the defect is worst (measured: "heard after 19 ms"
+     * with the queue put back to 1.4 s). */
+    if (!(steady > 1e-4)) {
+      fail(`the live output was silent 1.2 s after switching to pink noise (${db(steady)} dB), ` +
+           "so the latency below cannot be measured");
+    }
+    pg.setSignal(0);                        /* back to the click train: mostly silence */
+    await sleep(700);
+    pg.outputPeaks();
+    const t0 = performance.now();
+    pg.setSignal(2);
+    /* A RUN, not one sample: a click also makes the output hot, for about as long as the
+     * analyser's 10.7 ms window. Eight consecutive hot reads is 40 ms of continuous signal, which
+     * a 2 ms burst cannot fake, and the time reported is the FIRST of them, so the run length is
+     * not added to the answer. */
+    let run = 0;
+    let firstHot = -1;
+    let heard = -1;
+    while (performance.now() - t0 < 2000) {
+      await sleep(5);
+      const p = pg.outputPeaks();
+      const hot = Math.max(p.rmsL, p.rmsR) > thresh;
+      if (!hot) { run = 0; firstHot = -1; continue; }
+      if (run === 0) firstHot = performance.now() - t0;
+      if (++run >= 8) { heard = firstHot; break; }
+    }
+    ok(`stimulus switch heard after ${heard < 0 ? "never" : heard.toFixed(0) + " ms"} ` +
+       `(steady pink RMS ${db(steady)} dB, threshold ${db(thresh)} dB)`);
+    if (heard < 0) fail("the new stimulus never arrived on the output within 2 s");
+    else if (heard > 150) fail(`the new stimulus took ${heard.toFixed(0)} ms to be heard; the budget is 150`);
+    else ok("a stimulus change reaches the output inside the latency budget");
+    pg.setSignal(0);
+  }
 
   /* ---- SCENE 2: the channel walk lights the channel it drove ---- */
   await pg.selectScene("channel-walk");
@@ -142,7 +243,15 @@ async function main() {
   else if (!(offAxis < 0.2)) fail(`a figure-8 turned 90 degrees read ${offAxis.toFixed(3)}, expected about 0`);
   else ok("the directivity gain follows the aim");
 
-  /* ---- the profile rebuild: the other render, on the same AudioContext ---- */
+  /* ---- the profile rebuild, and whether anything comes OUT of it.
+   *
+   * The old check asked whether the rebuilt engine rendered blocks, and it passed while the page
+   * was silent: a sink whose worklet never came up host-paces silence and counts blocks exactly
+   * the same way (rule 4). Two things say the difference. `device_lost` is the sink's own report
+   * that the host-paced thread is doing the pacing, and the analyser tap on the sink's node is the
+   * audio itself. Both are asserted in both directions, because the cause - a second
+   * `registerProcessor` in one AudioContext's worklet scope - breaks every rebuild after the
+   * first, not only the first one. ---- */
   await pg.selectScene("localization");
   await pg.setProfile(1);                   /* BWA_PROFILE_BINAURAL */
   await sleep(700);
@@ -150,18 +259,37 @@ async function main() {
   if (b.profile !== 1) fail("the engine did not rebuild into the binaural profile");
   else if (!/^worklet/.test(String(b.backend)))
     fail(`after the rebuild the backend is "${b.backend}", not the worklet sink`);
-  else ok(`rebuilt into the binaural profile on the same AudioContext: "${b.backend}"`);
+  else ok(`rebuilt into the binaural profile: "${b.backend}"`);
   const bh0 = pg.state().health;
   await sleep(600);
   const bh1 = pg.state().health;
   if (bh1.blocks - bh0.blocks < 30)
     fail(`the rebuilt engine rendered only ${bh1.blocks - bh0.blocks} blocks in 600 ms`);
   else ok(`the rebuilt engine renders (${bh1.blocks - bh0.blocks} blocks in 600 ms)`);
+  if (bh1.deviceLost !== 0)
+    fail("after the rebuild the sink is host-pacing silence: the AudioWorklet never came back");
+  else ok("after the rebuild the AudioWorklet is still driving (device_lost 0)");
+  /* The cones ARE dark in this profile, and that is correct rather than broken: point voices never
+   * reach the 26-channel bus here. The page has to say so where the cones are. */
+  {
+    const v = pg.state().view;
+    if (!/bypass the bus/.test(String(v.status)) || !/binaural/.test(String(v.meterText)))
+      fail(`binaural does not explain the dark cones: status "${v.status}", meter "${v.meterText}"`);
+    else ok("binaural says why the cones are dark, on the view and in the panel");
+  }
+  await audibleLaterality(pg, "binaural");
+
   /* A bus scene must drag the profile back by itself, because binaural has no bus to walk. */
   await pg.selectScene("channel-walk");
   if (pg.state().profile !== 2) fail("the channel walk did not force the CAVE_SIM profile back");
   else ok("the channel walk forced CAVE_SIM back for itself");
   await pg.setProfile(2);
+  await pg.selectScene("localization");
+  await sleep(500);
+  if (pg.state().health.deviceLost !== 0)
+    fail("back in cave_sim the sink is host-pacing silence: the second rebuild lost the worklet");
+  else ok("back in cave_sim the AudioWorklet is still driving");
+  await audibleLaterality(pg, "cave_sim");
 
   /* ---- every other scene at least enters and runs without an engine error ---- */
   for (const id of pg.scenes) {
@@ -172,6 +300,113 @@ async function main() {
   const errs = pg.state().errors;
   if (errs.length) fail(`the page logged ${errs.length} engine error(s): ${errs.join(" | ")}`);
   else ok(`all ${pg.scenes.length} scenes entered and ran with no engine error`);
+
+  /* ---- a layout file, uploaded, loaded and DRAWN. Last, because the refusal case below logs an
+   * engine error on purpose and the check above counts those. ---- */
+  await pg.selectScene("localization");
+  await layoutChecks(pg);
+}
+
+/**
+ * Is a source on the listener's left louder in the left ear, in the audio the AudioContext is
+ * really playing?
+ *
+ * The offline probe (probe.js) answers the same question through a second engine on the manual
+ * sink, which is deterministic and says nothing about whether the page is audible. This one reads
+ * the AnalyserNode pair the page hangs on the sink's own node, so it fails when the output is
+ * silent - which is exactly the defect a rebuilt engine had. Pink noise, never DC: CLAUDE.md's
+ * first trap is a DC laterality assertion that shipped a left/right mirror.
+ */
+async function audibleLaterality(pg, label) {
+  const MARGIN = 1.3;
+  const at = async (p) => {
+    pg.setSourceRoom(p);
+    await sleep(450);                       /* the queue, plus the gain ramp settling */
+    pg.outputPeaks();
+    await sleep(450);
+    return pg.outputPeaks();
+  };
+  pg.setSignal(2);                          /* pink noise: continuous, so RMS means something */
+  await waitFor(() => pg.tapReady(), 8000, "the output tap after the rebuild");
+  const left = await at([2.0, 1.5, 0.0]);
+  const right = await at([-2.0, 1.5, 0.0]);
+  pg.setSignal(0);
+  ok(`${label} live output: +x source L ${db(left.rmsL)} R ${db(left.rmsR)} dB, ` +
+     `-x source L ${db(right.rmsL)} R ${db(right.rmsR)} dB`);
+  if (!(left.rmsL > 1e-5) || !(right.rmsR > 1e-5))
+    fail(`${label}: the live output is silent, so the page makes no sound`);
+  else if (!(left.rmsL > left.rmsR * MARGIN))
+    fail(`${label}: a source at room +x was not louder in the LEFT ear of the live output`);
+  else if (!(right.rmsR > right.rmsL * MARGIN))
+    fail(`${label}: a source at room -x was not louder in the RIGHT ear of the live output`);
+  else ok(`${label}: the live output carries the source, on the correct side`);
+}
+
+/** A small, valid cave_layout.json with one speaker somewhere no default grid puts one. */
+function testLayout(n = 8, odd = [0.37, 2.13, -1.91]) {
+  const speakers = [];
+  for (let i = 0; i < n; ++i) {
+    const a = (2 * Math.PI * i) / n;
+    speakers.push({
+      index: i,
+      position: i === 3 ? odd.slice() : [2 * Math.cos(a), 1.2, 2 * Math.sin(a)],
+      gain_db: 0,
+      delay_ms: 0,
+    });
+  }
+  return { schema_version: 1, speakers };
+}
+
+async function layoutChecks(pg) {
+  const odd = [0.37, 2.13, -1.91];
+  const doc = testLayout(8, odd);
+  const loaded = await pg.loadLayout(JSON.stringify(doc), "driver-8.json");
+  const s = pg.state();
+  if (!loaded || s.speakerCount !== 8) {
+    fail(`the uploaded 8-speaker layout did not load (${s.speakerCount} speakers): ${pageLog()}`);
+  } else {
+    ok(`an uploaded layout rebuilt the array: ${s.speakerCount} speakers, ` +
+       `${s.channelCount} bus channels`);
+    /* The DISTINCTIVE speaker, read back out of the engine rather than out of the file: this is
+     * what says the engine loaded the upload and not something that happened to be there. */
+    const got = s.layout.speakers.slice(9, 12);
+    const near = got.every((v, i) => Math.abs(v - odd[i]) < 1e-3);
+    if (!near) fail(`bwa_get_speakers put speaker 3 at ${got.map((v) => v.toFixed(2))}, expected ${odd}`);
+    else ok(`bwa_get_speakers reads speaker 3 back at ${got.map((v) => v.toFixed(2)).join(", ")}`);
+    if (s.view.coneLevels.length !== 8)
+      fail(`${s.view.coneLevels.length} cones are drawn for an 8-speaker layout`);
+    else ok("the scene draws one cone per loaded speaker");
+    if (!/layout driver-8\.json/.test(String(s.view.status)))
+      fail(`the status line does not name the loaded layout: "${s.view.status}"`);
+    else ok("the status line names the loaded layout");
+  }
+
+  /* A file the PAGE can refuse, without an engine rebuild. */
+  const tooFew = await pg.loadLayout(JSON.stringify(testLayout(3)), "too-few.json");
+  if (tooFew !== false) fail("a 3-speaker layout was not refused");
+  else if (pg.state().speakerCount !== 8)
+    fail("a refused layout still rebuilt the engine");
+  else ok("a layout with too few speakers is refused before the engine is touched");
+
+  /* A file the page CANNOT refuse but the engine does: gain_db 99 is outside the loader's
+   * [-100, 24]. The engine's rule is that create stays usable on the default grid and START then
+   * refuses with BWA_ERR_LAYOUT, so what the page owes is the reason and a working engine. */
+  const bad = testLayout(8);
+  bad.speakers[2].gain_db = 99;
+  const refused = await pg.loadLayout(JSON.stringify(bad), "bad-gain.json");
+  const after = pg.state();
+  if (refused !== false) fail("the engine accepted a layout with gain_db 99");
+  else if (!after.errors.some((e) => /refused that layout/.test(e)))
+    fail(`the page did not report the engine's refusal: ${after.errors.join(" | ")}`);
+  else if (after.speakerCount !== 26)
+    fail(`after the refusal the page is on a ${after.speakerCount}-speaker layout, not the default grid`);
+  else if (after.health && after.health.deviceLost !== 0)
+    fail("after the refusal the sink is host-pacing silence");
+  else ok(`an engine-refused layout is reported and the page falls back to the default grid`);
+
+  await pg.loadLayout(null, null);
+  if (pg.state().speakerCount !== 26) fail("the page did not go back to the 26-speaker grid");
+  else ok("the page goes back to the default grid");
 }
 
 function pageLog() {

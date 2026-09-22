@@ -56,4 +56,5 @@ export const OPS = Object.freeze({
   DESTROY: "destroy",
   RENDER: "render",       /* manual sink only: pump one block -> Float32Array (a COPY)    */
   FRAME: "frame",         /* the slab apply + one commit. No reply, by design.            */
+  WRITE_FILE: "writefile",/* { path, data: Uint8Array } -> bytes written into the wasm FS */
 });

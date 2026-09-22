@@ -3,15 +3,20 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>bw_audio playground</title>
+<title>bw_audio XR</title>
 <!--
-  The browser port of examples/playground.cpp: the engine's demo scenes, rendered with three.js and
-  heard through the binaural AudioWorklet sink.
+  The head-tracked half of the playground. Same engine, same scenes, same 26-channel bus; what
+  changes is that an immersive-vr session's viewer pose becomes the engine's listener pose every
+  frame, so the binaural render follows your head.
 
   EVERYTHING THIS PAGE LOADS IS SAME-ORIGIN. The site is served under COEP require-corp, where a
   cross-origin script, style or font without Cross-Origin-Resource-Policy is BLOCKED, not slowed.
-  three.js is vendored into dist/vendor/ by tools/wasm/fetch-web-vendor.sh; there is no CDN here and
-  there must never be one. bindings/web/deploy/README.md states the rule.
+  three.js is vendored into dist/vendor/ by tools/wasm/fetch-web-vendor.sh; there is no CDN here
+  and there must never be one. bindings/web/deploy/README.md states the rule.
+
+  The CSS below is the playground's, copied. The two pages have no shared stylesheet because
+  neither has an external stylesheet at all, which is the vendor-everything rule taken to its
+  simplest end. bindings/web/README.md's "XR" section lists this among the duplications.
 -->
 <style>
   :root {
@@ -42,25 +47,15 @@
   canvas#view { width: 100%; height: 100%; display: block; }
   #startPanel {
     position: absolute; inset: 0; display: grid; place-content: center; gap: 1rem;
-    text-align: center; padding: 2rem;
+    text-align: center; padding: 2rem; max-width: 40rem; margin: 0 auto;
   }
-  /* The UA's `[hidden] { display: none }` is a TYPE-selector rule and loses to the id selector
-     above, so `startPanel.hidden = true` left the start text sitting over the running scene. It
-     has to be said again here, at this specificity. */
-  #startPanel[hidden] { display: none; }
-  #status {
-    position: absolute; left: .6rem; top: .6rem; padding: .3rem .55rem;
-    background: rgba(13, 17, 23, .72); border: 1px solid var(--line); border-radius: .3rem;
-    font-size: .76rem; color: var(--dim); font-variant-numeric: tabular-nums; pointer-events: none;
-  }
-  #status[hidden] { display: none; }
   button {
     font: inherit; color: var(--ink); background: #1e2733;
     border: 1px solid var(--line); border-radius: .4rem; padding: .45rem .8rem; cursor: pointer;
   }
   button:hover:not(:disabled) { border-color: var(--accent); }
   button:disabled { opacity: .5; cursor: default; }
-  #go { font-size: 1.05rem; padding: .7rem 1.4rem; }
+  #enter { font-size: 1.05rem; padding: .7rem 1.4rem; }
   h2 { font-size: .78rem; text-transform: uppercase; letter-spacing: .06em;
        color: var(--dim); margin: 1.4rem 0 .5rem; font-weight: 650; }
   h2:first-of-type { margin-top: 0; }
@@ -81,14 +76,14 @@
   th, td { text-align: left; padding: .15rem .4rem .15rem 0; vertical-align: top; }
   th { font-weight: 400; color: var(--dim); width: 50%; }
   td { font-variant-numeric: tabular-nums; }
-  .meterRow { display: flex; align-items: center; gap: .4rem; margin: .25rem 0; }
-  .meterRow > span { width: 3.2rem; font-size: .74rem; color: var(--dim); }
-  #meter, .meter { flex: 1; height: .6rem; background: #1e2733; border-radius: .3rem; overflow: hidden; }
-  #meterFill, .meter > div { height: 100%; width: 0; background: linear-gradient(90deg, #3d8f5a, var(--accent)); }
+  #meter { height: .6rem; background: #1e2733; border-radius: .3rem; overflow: hidden; margin: .3rem 0; }
+  #meterFill { height: 100%; width: 0; background: linear-gradient(90deg, #3d8f5a, var(--accent)); }
   #meterText { font-size: .76rem; color: var(--dim); }
   #log { margin-top: 1rem; font-size: .78rem; color: var(--dim); white-space: pre-wrap; }
   .bad { color: var(--bad); }
   #sceneBlurb { color: var(--dim); font-size: .85rem; margin: .4rem 0 .8rem; }
+  #mapping { width: 100%; }
+  #mapping th { width: 42%; color: var(--accent); font-weight: 400; }
 </style>
 </head>
 <body>
@@ -101,45 +96,71 @@
 <script src="../coi-serviceworker.js"></script>
 
 <header>
-  <h1>bw_audio playground</h1>
-  <p>The CAVE engine's demo scenes, in a browser. Headphones, please.</p>
-  <p><a href="../">back to the landing page</a></p>
+  <h1>bw_audio XR</h1>
+  <p>The playground with your head in it. Headphones, and a headset.</p>
+  <p><a href="../playground/">the flat playground</a> &middot; <a href="../">back to the landing page</a></p>
 </header>
 
 <div id="layout">
   <div id="panel">
     <h2>scene</h2>
-    <select id="scenePick"></select>
     <p id="sceneBlurb"></p>
 
-    <h2>meters</h2>
-    <div class="meterRow"><span>bus</span><div id="meter"><div id="meterFill"></div></div></div>
-    <div class="meterRow"><span>out L</span><div class="meter"><div id="outL"></div></div></div>
-    <div class="meterRow"><span>out R</span><div class="meter"><div id="outR"></div></div></div>
+    <h2>bus meter</h2>
+    <div id="meter"><div id="meterFill"></div></div>
     <div id="meterText">not started</div>
 
-    <h2>scene controls</h2>
-    <div id="sceneControls"></div>
+    <h2>options</h2>
+    <!--
+      The SAME descriptor list the in-world panel paints (xr/options.js). Before a session it is
+      the only menu there is; inside one it keeps running, which is what makes a desktop browser
+      useful for setting a scene up before you put the headset on.
+    -->
+    <div id="menu"></div>
 
     <h2>readout</h2>
     <table id="readout"></table>
 
-    <h2>engine</h2>
-    <div id="globalControls"></div>
-    <table id="health"></table>
+    <h2>session</h2>
+    <table id="status"></table>
+
+    <h2>controllers</h2>
+    <table id="mapping">
+      <tr><th>trigger, on the panel</th><td>press the control the ray is on</td></tr>
+      <tr><th>trigger or grip, elsewhere</th><td>grab the source with the nearer hand and carry it</td></tr>
+      <tr><th>thumbstick X</th><td>slide the source left and right, relative to where you look</td></tr>
+      <tr><th>thumbstick Y</th><td>push the source away, or pull it in</td></tr>
+      <tr><th>grip and thumbstick Y</th><td>raise and lower the source</td></tr>
+      <tr><th>thumbstick Y, on the panel</th><td>scroll the menu</td></tr>
+    </table>
 
     <div id="log"></div>
   </div>
 
   <div id="viewWrap">
     <canvas id="view"></canvas>
-    <div id="status" hidden></div>
+    <!-- Offered as the dom-overlay root. A runtime that grants one gets the DOM menu; see
+         xr/panel.js for why an immersive-vr session almost never does. -->
+    <div id="overlay" hidden></div>
     <div id="startPanel">
+      <p>An immersive-vr session feeds the engine your head pose every frame, so a source stays
+         where it is in the room while you turn. That is the one thing the flat playground cannot
+         show you.</p>
       <p>A browser resumes an AudioContext only from a user gesture, so nothing can make a sound
-         until you click. Put headphones on first: every scene is rendered for two ears.</p>
-      <p><button id="go">Start</button></p>
+         until you press a button. Put headphones on first: every scene is rendered for two ears.</p>
+      <p id="xrState">checking for an immersive-vr device</p>
+      <p>
+        <button id="enter">Enter VR</button>
+        <button id="flat">Start flat preview</button>
+      </p>
+      <p id="noXr" hidden style="color:var(--dim);font-size:.85rem">
+        Without WebXR the flat preview is all this page can offer, and
+        <a href="../playground/">the flat playground</a> does the same thing with more scenes'
+        worth of controls.
+      </p>
       <p style="color:var(--dim);font-size:.85rem">
-         Drag in the view to orbit, the wheel to zoom, and drag the red marker to move the source.
+        In the flat preview, drag in the view to orbit, the wheel to zoom, and drag the red marker
+        to move the source.
       </p>
     </div>
   </div>

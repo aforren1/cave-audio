@@ -42,7 +42,7 @@ sinks, and nothing else: no device backend, no shared library.
 | Emscripten 6.0.10, `-pthread` | builds the same tree. **31 of 33 pass** under node: `os` times out and `idle` fails. Both are the main thread blocking, see below. Needs `-sSTACK_SIZE=1048576 -sDEFAULT_PTHREAD_STACK_SIZE=1048576`, which `tools/wasm/build-wasm.sh` passes; without them the same tree gives 13 of 33. |
 | Emscripten 6.0.10, `-pthread`, phonon staged | **35 of 38 pass** through `tools/wasm/build-wasm.sh` verbatim in the emsdk container, 2026-09-22. All five SDK-gated tests pass, the four simulator ones included (`reflect`, `bake`, `path`, `dynmesh`, `steam_decode`). The three failures are the same `os` and `idle`, plus `fuzz_api`: see [Steam Audio under wasm](#steam-audio-phonon-under-wasm). |
 | Emscripten 6.0.10, `-pthread`, phonon staged, **`-sPROXY_TO_PTHREAD`** | **36 of 38**, 2026-09-22, through `BWA_WASM_PROXY=1 tools/wasm/build-wasm.sh`. `idle` goes GREEN (1.63 s), which is the finding: main() on a pthread leaves the main thread's event loop running, and the asset loader's wake arrives. `os` still times out and `fuzz_api` still fails. |
-| Emscripten 6.0.10, `-pthread`, phonon staged, the WEB build | `bindings/web` links (`bw_audio.mjs` 120 kB, `bw_audio.wasm` 6.4 MB with a static phonon) and its **17 node tests pass**, 2026-09-22, through `tools/wasm/build-web.sh`. Null sink, manual sink, the generated raw layer against the module's real exports, and a manual-sink render that pins laterality. No browser was involved. |
+| Emscripten 6.0.10, `-pthread`, phonon staged, the WEB build | `bindings/web` links (`bw_audio.mjs` 120 kB, `bw_audio.wasm` 6.4 MB with a static phonon) and its **29 node tests pass**, 2026-09-22, through `tools/wasm/build-web.sh`. Null sink, manual sink, the generated raw layer against the module's real exports, and a manual-sink render that pins laterality. No browser was involved. |
 | Emscripten 6.0.10, no `-pthread` | builds and links. **13 of 33 pass**: `rt_create` fails, because `stream_set_create` cannot start its refill thread. |
 | zig cc 0.13 | compiles the DSP. No threads at all: see [Toolchains](#toolchains). |
 
@@ -449,6 +449,29 @@ one topology that needs it. Three ways out, none of them tried:
    trampoline to reach it. Measured to be the right shape for the engine, untried for the binding.
 3. Web Audio grows an AudioContext a Worker can create, which is a specification change.
 
+### One AudioContext, one engine
+
+Measured 2026-09-22, on the playground's profile switch, and it is a platform property rather than
+a binding bug: **a second engine cannot open on an AudioContext that has already carried one.**
+
+Emscripten's worklet bootstrap calls `audioWorklet.addModule(bw_audio.mjs)`, and that script runs
+`registerProcessor("em-bootstrap", ...)` in the context's own `AudioWorkletGlobalScope`. A scope is
+per AudioContext and survives the node, so the second `addModule` re-runs the same registration in
+the same scope. It throws, the promise the glue never catches rejects, the setup chain stops, no
+node is ever created, and the sink does what rule 4 says for a device that is not there: it
+host-paces silence with `device_lost` set. The engine keeps rendering, `bwa_health` keeps counting
+blocks, and the page is silent. Every later rebuild on that context fails the same way.
+
+So a create-time change - the profile, a layout file - replaces the AudioContext. The page owns it
+and can, and the wasm module is reused across the rebuild (`BwaEngine.create({ module })`), because
+instantiating a second 6 MB module per switch leaks both it and its pthread pool.
+
+Two lessons past the one fact. A health block cannot tell silence from sound on this platform: the
+host-paced fallback counts blocks exactly like a working sink, so "the rebuilt engine renders" was
+a green check over a silent page. And a page has no tap on `AudioContext.destination`, so
+`BwaEngine.outputNode()` now hands back the sink's own node for an AnalyserNode to sit beside -
+which is what the playground's check measures the rebuild with.
+
 ### Where the audio comes from
 
 The second of the two options this note weighed, and it needed no ABI: decode in JavaScript with
@@ -458,7 +481,17 @@ no asset served. A memory-buffer asset entry point is still not in the engine an
 needed for this path.
 
 Pace the feed on the ring's own space (`bwa_source_push_space`), not on the animation frame: a
-background tab gets fewer frames and the audio thread does not slow down with it.
+background tab gets fewer frames and the audio thread does not slow down with it. Pace it, do not
+FILL it: the ring holds 65536 frames, which is 1.37 s of audio that has to play before anything new
+can be heard. The playground queues about 100 ms.
+
+### Files the engine opens
+
+`bwa_desc.layout_path` and `bwa_desc.hrtf_path` are paths, opened with an ordinary `fopen` inside
+`bwa_create`. The module exports `FS`, so the only file system those paths can name is the module's
+own MEMFS, and the binding writes into it: `create({ files })` for the two paths create itself
+opens, `engine.writeFile(path, bytes)` for anything later. The playground's layout upload is the
+first user. Audio still goes the other way, through a push source.
 
 ### Build and test
 
@@ -472,7 +505,7 @@ BWA_BUILD_WEB=ON`, and stages a self-contained `bindings/web/dist/`: `bw_audio.m
 server-side step. `node bindings/web/example/serve.mjs` serves it with the two isolation headers.
 
 The module is linked `-sENVIRONMENT=web,worker,node` so the SHIPPED artifact is the TESTED one:
-`ctest -R web_bindings` runs 17 node tests against it. `bindings/web/README.md` has the whole
+`ctest -R web_bindings` runs 29 node tests against it. `bindings/web/README.md` has the whole
 public surface.
 
 ## What is verified and what is not
@@ -483,11 +516,13 @@ Worth stating plainly, because the sink is the part a reader will most want to t
 wasm32 phonon staged:
 
 - `worklet_sink.c` compiles clean at `-Wall -Wextra` and links into `bw_audio.mjs`.
-- the web module builds and its 17 node tests pass: the generated raw layer against the module's
+- the web module builds and its 29 node tests pass: the generated raw layer against the module's
   own exports, engine create/start/stop/destroy on the null sink, the commit model, handle
-  generation gating, a push source's ring, and a manual-sink render that pins laterality with the
-  frame slab driving the position. The laterality test was BROKEN ON PURPOSE (the frame apply
-  disabled) and confirmed red before being trusted green.
+  generation gating, a push source's ring, a manual-sink render that pins laterality with the
+  frame slab driving the position, and the file-system seam (a layout written through `FS` is the
+  layout `bwa_create` loads, and one the loader rejects refuses at `bwa_start`). The laterality
+  test was BROKEN ON PURPOSE (the frame apply disabled) and confirmed red before being trusted
+  green; so was each layout test.
 - the engine suite: 35 of 38 without `-sPROXY_TO_PTHREAD`, 36 of 38 with it.
 
 - **the AudioWorklet sink in a real browser**, through `bindings/web/tests/run-browser.mjs`, which
@@ -527,6 +562,26 @@ wasm32 phonon staged:
 - **the example page loads**, served by `example/serve.mjs` and dumped from headless Chrome: the
   page is cross-origin isolated, its module script imports `dist/index.js` without throwing, and
   the start button is there. The click path itself is the same code the check above drives.
+- **the XR page's head-pose path**, through `bindings/web/tests/run-xr.mjs`, which loads
+  `bindings/web/xr/` twice in headless Chrome: once with `navigator.xr` deleted, which is the
+  no-WebXR state the page has to report and recover from, and once with a minimal fake one that
+  opens an `immersive-vr` session against a synthetic `XRFrame` whose viewer pose the check
+  chooses. That runs the whole chain: the XR reference space to room seam in both signs on every
+  axis, the per-frame `bwa_set_listener_pose` and commit, the page-side prediction lead in meters,
+  the in-world menu and its ray hit test, the controller grab and the thumbstick nudge. Two
+  assertions close the loop on the audio rather than on the arithmetic. `bwa_get_listener_pose`
+  reads the turned head back out of the page's own engine, and a second engine on the manual sink
+  renders the page's live pose, so a source the listener looks at comes out 0.9 dB off center
+  while the same source with the head turned a quarter comes out 11 dB into one ear, both ways
+  round. The seam has a browser-free node test beside it, `tests/xr_frame.test.mjs`, which checks
+  it against `BWA_ROOM_AHEAD`, `BWA_ROOM_UP` and `BWA_ROOM_RIGHT` rather than against the algebra
+  the module derives. Every assertion in both was broken on purpose and confirmed red first.
+
+**Not verified** on the XR page: that three.js renders it. Headless Chrome has no XR device, so
+the fake session cannot be bound to a framebuffer, and the page is deliberately built so the pose
+path does not care. Stereo rendering, the projection layer, a real runtime's controller poses and
+gamepad layout, reprojection, and every latency number are headset work. So is the question the
+page exists to ask, which is whether the image stays put when you turn your head.
 
 **Not verified**: that it sounds right. Nobody has listened. A headless browser has no speaker, so
 what the check proves is that the path runs and is paced by the audio clock, not that the HRTF
@@ -739,12 +794,10 @@ In order, and the first three are no longer on this list because they are built.
 6. **A memory-buffer asset entry point**, or the decision that the push feed is the answer. The
    binding took the push feed, so this is now a question about streaming and about
    `bwa_load_sound`, not about whether a page can play a wav.
-7. **A way to put a file in the wasm file system.** `FS` is not in the module's
-   `EXPORTED_RUNTIME_METHODS`, so `bwa_desc.layout_path` and `bwa_desc.hrtf_path` have nothing to
-   open. Nothing needs it yet: the engine's default grid is the same 26-speaker geometry
-   `examples/cave_layout.json` describes, and the playground reads the positions back with
-   `bwa_get_speakers`. The day a page wants a surveyed layout or its own SOFA file, it is one link
-   flag and one `writeFile` on the binding.
+7. ~~A way to put a file in the wasm file system.~~ **Built**, 2026-09-22: `FS` is in
+   `EXPORTED_RUNTIME_METHODS`, the binding writes through it (`create({ files })` and
+   `engine.writeFile`), and the playground uploads a `cave_layout.json` with it. It cost one link
+   flag and one method, as predicted. A SOFA file is still not safe to accept from a user: see 5.
 8. **A struct-taking wrapper in `bwa_web.c`.** `invokeBuf` marshals arrays, deliberately not
    structs, so three calls are out of reach: `bwa_fdn_config`, `bwa_reflections_config` and
    `bwa_apply_tuning`. That is why the playground has no reverb bed scene. Each needs a field by
@@ -767,10 +820,27 @@ On top of [What the spike changed](#what-the-spike-changed) below.
   Emscripten-only.
 - `bindings/web/`: the two layers, the transport, the example page, the node suite, the README.
 - `bindings/web/playground/`: the browser port of `examples/playground.cpp`, with three.js visuals
-  and six scenes, plus `tests/run-playground.mjs` that drives it in headless Chromium.
+  and six scenes, plus `tests/run-playground.mjs` that drives it in headless Chromium. Its check
+  measures the AUDIBLE output now, through an AnalyserNode pair on `engine.outputNode()`: the
+  speaker cones and the meter strips have to move while the default click train plays, a stimulus
+  change has to reach the output inside 150 ms, and a profile rebuild has to keep `device_lost` at
+  0 and still put a `+x` source in the left ear. Each of those replaced a check that a silent page
+  passed.
+- `bindings/web/xr/`: the head-tracked sibling of that page. In an `immersive-vr` session the
+  viewer pose becomes the engine's listener pose every XR animation frame, which is the one thing
+  headphones and a mouse cannot demonstrate. It imports the playground's rig, scenes, gizmos and
+  control builder, and adds four things of its own: `frame_xr.js`, the XR reference space to room
+  seam (a 180 degree yaw, derived and tested, NOT the mirror the two "+x" conventions suggest);
+  `session.js`, whose pose path deliberately does not depend on the renderer binding; `panel.js`,
+  the in-world menu, because DOM Overlay is an AR-only feature in practice; and a page-side
+  prediction lead, because `bwa_set_pose_prediction` only leads the engine's own tracker and is
+  inert for a pushed pose. `tests/run-xr.mjs` and `tests/xr_frame.test.mjs` are its checks, and
+  `bindings/web/README.md` has the derivation in full.
 - `bindings/web/src/host.js`, `client.js`: `invokeBuf`, which reaches the raw calls whose arguments
   are pointers. A page cannot allocate wasm heap of its own, so the alloc, the copy and the free
-  happen around the one call on the control thread.
+  happen around the one call on the control thread. Plus `writeFile` and `create({ files })` for
+  the two `bwa_desc` fields that are PATHS, `create({ module })` so a rebuild costs no second
+  module, and `outputNode()` so a page can tap what it is playing.
 - `tools/wasm/gen-abi.mjs`: the raw layer and the export list, generated from the header.
 - `tools/wasm/build-web.sh`: the one recipe for a shippable `dist/`.
 - `tools/wasm/build-wasm.sh`: `BWA_WASM_PROXY` for the `-sPROXY_TO_PTHREAD` measurement.

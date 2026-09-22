@@ -36,20 +36,25 @@ if [ -z "$(ls -A "$DIST")" ]; then
 fi
 
 rm -rf "$OUT"
-mkdir -p "$OUT/dist" "$OUT/example" "$OUT/playground"
-# The site root MIRRORS bindings/web: dist/, example/ and playground/ side by side, so each page's
+mkdir -p "$OUT/dist" "$OUT/example" "$OUT/playground" "$OUT/xr"
+# The site root MIRRORS bindings/web: dist/, example/, playground/ and xr/ side by side, so each page's
 # `../dist/index.js` import and its `../coi-serviceworker.js` script tag resolve the same way they
 # do under example/serve.mjs (which serves the repo root). Rewriting paths at stage time would be a
 # second copy of the pages' layout. -a would carry ownership and timestamps that
 # upload-pages-artifact has no use for; contents and the directory shape are the whole payload.
 #
 # dist/ carries vendor/ too (three.js, fetched and hashed by tools/wasm/fetch-web-vendor.sh). The
-# playground imports it from there rather than from a CDN, which under COEP require-corp is the
-# difference between a page and a blank screen.
+# playground and the XR page import it from there rather than from a CDN, which under COEP
+# require-corp is the difference between a page and a blank screen.
 cp -R "$DIST"/. "$OUT/dist"/
 cp -R "$HERE/../example"/. "$OUT/example"/
 rm -f "$OUT/example/serve.mjs"   # the local dev server is not a page asset
 cp -R "$HERE/../playground"/. "$OUT/playground"/
+# xr/ is the head-tracked sibling of playground/. It IMPORTS from ../playground/ (the scenes, the
+# rig, the gizmos, the control builder), so the two directories have to be staged together or the
+# XR page's imports 404. There is no bundler here and that is the point: the browser resolves
+# `../playground/rig.js` on the site exactly as it does in the repo tree.
+cp -R "$HERE/../xr"/. "$OUT/xr"/
 
 # CONTENT-ADDRESS dist/. GitHub Pages serves everything with `Cache-Control: max-age=600`, and a
 # returning visitor's browser keeps whatever it fetched inside that window. The first playground
@@ -64,12 +69,12 @@ cp -R "$HERE/../playground"/. "$OUT/playground"/
 hash=$(cd "$OUT/dist" && find . -type f | LC_ALL=C sort | xargs sha256sum | sha256sum | cut -c1-12)
 DISTDIR="dist-$hash"
 mv "$OUT/dist" "$OUT/$DISTDIR"
-for f in $(find "$OUT/example" "$OUT/playground" -type f \( -name '*.html' -o -name '*.js' -o -name '*.mjs' \)); do
+for f in $(find "$OUT/example" "$OUT/playground" "$OUT/xr" -type f \( -name '*.html' -o -name '*.js' -o -name '*.mjs' \)); do
   sed -i "s|\.\./dist/|../$DISTDIR/|g" "$f"
 done
 # Every real reference is the `../dist/` prefix the rewrite targets, so any survivor is a path
 # shape the rewrite does not know (prose in comments is free to say "dist/").
-left=$(grep -rIn '\.\./dist/' "$OUT/example" "$OUT/playground" --include='*.html' --include='*.js' --include='*.mjs' || true)
+left=$(grep -rIn '\.\./dist/' "$OUT/example" "$OUT/playground" "$OUT/xr" --include='*.html' --include='*.js' --include='*.mjs' || true)
 if [ -n "$left" ]; then
   echo "::warning::a page still references ../dist/ after the rewrite:"; echo "$left"
 fi
@@ -92,7 +97,7 @@ cp "$HERE/coi-serviceworker.LICENSE" "$OUT/coi-serviceworker.LICENSE"
 
 # The demo pages the shell links to. Not fatal - the build may name them differently and the shell
 # still reports isolation - but a broken link is the first thing anyone sees.
-for demo in example playground; do
+for demo in example playground xr; do
   if [ ! -f "$OUT/$demo/index.html" ]; then
     echo "::warning::no $demo/index.html in the artifact; the shell's link to it will 404"
   elif ! grep -q "coi-serviceworker.js" "$OUT/$demo/index.html"; then
@@ -103,10 +108,11 @@ for demo in example playground; do
   fi
 done
 
-# The playground is the one page with a third-party dependency, and it is the one the
-# vendor-everything rule exists for. A missing vendor/ is a blank screen, not a degraded demo.
-if [ -f "$OUT/playground/index.html" ] && [ ! -f "$OUT/$DISTDIR/vendor/three/three.module.js" ]; then
-  echo "::warning::no $DISTDIR/vendor/three in the artifact; the playground will not load. Run tools/wasm/fetch-web-vendor.sh"
+# The playground and the XR page are the pages with a third-party dependency, and they are what
+# the vendor-everything rule exists for. A missing vendor/ is a blank screen, not a degraded demo.
+if { [ -f "$OUT/playground/index.html" ] || [ -f "$OUT/xr/index.html" ]; } &&
+   [ ! -f "$OUT/$DISTDIR/vendor/three/three.module.js" ]; then
+  echo "::warning::no $DISTDIR/vendor/three in the artifact; the playground and the XR page will not load. Run tools/wasm/fetch-web-vendor.sh"
 fi
 
 # The same-origin rule, checked rather than asserted in prose. hrefs are deliberately not matched:

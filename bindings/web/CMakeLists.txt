@@ -56,8 +56,15 @@ target_link_options(bwa_web PRIVATE
   # engine library needs: nothing else references a bwa_* symbol in this link.
   "-sEXPORTED_FUNCTIONS=@${CMAKE_CURRENT_SOURCE_DIR}/src/exported_functions.json"
   # emscriptenRegisterAudioObject is how a PAGE hands the worklet sink the AudioContext it created
-  # inside its own user-gesture handler (worklet_sink.c takes the handle as bwa_desc.device).
-  -sEXPORTED_RUNTIME_METHODS=stackSave,stackAlloc,stackRestore,stringToUTF8,lengthBytesUTF8,UTF8ToString,HEAPU8,HEAP32,HEAPU32,HEAPF32,HEAPF64,emscriptenRegisterAudioObject,emscriptenGetAudioObject
+  # inside its own user-gesture handler (worklet_sink.c takes the handle as bwa_desc.device);
+  # emscriptenGetAudioObject is the reverse lookup BwaEngine.outputNode() needs to hand a page the
+  # node the sink built, because Web Audio has no tap on a destination.
+  #
+  # FS is the file system, and bwa_desc.layout_path is why: the engine opens a layout with an
+  # ordinary fopen, and a browser has no synchronous file system for that fopen to reach, so the
+  # only path that can ever resolve is one in the module's own MEMFS. Exporting FS is what lets the
+  # binding's writeFile put a file there (bindings/web/README.md, "Files the engine opens").
+  -sEXPORTED_RUNTIME_METHODS=stackSave,stackAlloc,stackRestore,stringToUTF8,lengthBytesUTF8,UTF8ToString,HEAPU8,HEAP32,HEAPU32,HEAPF32,HEAPF64,emscriptenRegisterAudioObject,emscriptenGetAudioObject,FS
 )
 
 # STAGING IS THE SCRIPT'S, not a POST_BUILD step. emcc decides how many side files it emits (the
@@ -105,6 +112,17 @@ if(BWA_NODE)
            COMMAND ${BWA_NODE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/run-playground.mjs
            WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
   set_tests_properties(web_playground PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 300)
+
+  # The XR page, in the same headless Chromium. web_playground proves the flat demo; this proves
+  # the head-tracked one: the XR-reference-space-to-room seam in both signs, the per-frame listener
+  # pose (read back with bwa_get_listener_pose), the page-side prediction lead, the in-world menu
+  # and the controller grab. It loads the page TWICE, once with navigator.xr deleted and once with
+  # a fake one, because two of the page's three states are decided before any injected script could
+  # change them. SKIPS (77) with no browser, no dist/ and no vendored three.js, like web_playground.
+  add_test(NAME web_xr
+           COMMAND ${BWA_NODE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/run-xr.mjs
+           WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+  set_tests_properties(web_xr PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 420)
 else()
   message(STATUS "bw_audio: web binding tests skipped (no node found)")
 endif()

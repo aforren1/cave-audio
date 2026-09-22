@@ -130,6 +130,8 @@ import { BwaEngine, Profile, SinkType, SinkFlags, BwaError } from "./dist/index.
 | `device` | `bwa_desc.device` |
 | `sinkFlags` | `BWA_SINK_FLAG_*` |
 | `layoutPath`, `hrtfPath` | paths inside the wasm file system |
+| `files` | `{path: Uint8Array}` written into that file system before `bwa_create` runs |
+| `module` | `"main"` topology only: an engine module this page already instantiated |
 
 ### On the engine
 
@@ -148,6 +150,9 @@ import { BwaEngine, Profile, SinkType, SinkFlags, BwaError } from "./dist/index.
 | `invokeBuf(name, ...args)` | promise | the same, for raw calls whose arguments are pointers |
 | `raw(name, ...args)` | promise | any raw call that does not |
 | `refreshInfo()` | promise | |
+| `writeFile(path, bytes)` | promise | put a file where the engine can open it. See below |
+| `module` | object | `"main"` topology: the instantiated module, to reuse with `create({module})` |
+| `outputNode()` | sync | the sink's `AudioWorkletNode`, or null. See below |
 
 ### On a source
 
@@ -203,6 +208,49 @@ thing, because `float[3]` is three floats in every ABI. A struct-taking call nee
 wrapper in `bwa_web.c`, not a byte buffer from here. Three calls are out of reach until one is
 written: `bwa_fdn_config`, `bwa_reflections_config` and `bwa_apply_tuning`.
 
+### Files the engine opens
+
+Two `bwa_desc` fields are PATHS: `layout_path` and `hrtf_path`. The engine opens them with an
+ordinary `fopen` inside `bwa_create`, and a browser has no synchronous file system for that to
+reach, so the only path that can ever resolve is one inside the module's own in-memory file system.
+The module exports `FS` for that reason, and the binding wraps it:
+
+```js
+const bytes = new TextEncoder().encode(await file.text());
+const engine = await BwaEngine.create({
+  audioContext: ctx,
+  files: { "/cave_layout.json": bytes },     // written BEFORE bwa_create
+  layoutPath: "/cave_layout.json",
+});
+```
+
+Use `files` for those two, not `engine.writeFile(path, bytes)`. `create` opens the layout inside its
+own call, so a write afterwards is too late. `writeFile` is for anything a RUNNING engine opens
+later, and it works in both topologies (the bytes travel to the control thread with the message).
+
+The file lives in the module's heap and dies with the module, so write a layout, not a sample
+library. Audio still goes the other way, through a push source: see "Where the audio comes from".
+
+A layout the engine rejects does not fail `create`. The engine stays usable on the default grid and
+`bwa_start` then refuses with `BWA_ERR_LAYOUT`, carrying the reason through `bwa_last_error`, so the
+throw a page has to catch and show comes from `start()` and not from `create()`.
+
+### Tapping the output
+
+`outputNode()` hands back the `AudioWorkletNode` the sink built, once its asynchronous setup chain
+has, so a page can meter, record or route what it is really playing. Web Audio offers no tap on a
+destination, and `bwa_set_output_capture` is not bound in any layer because its callback would run
+on the audio thread. Connecting to the node is additive - the sink's own connection to the
+destination stays - so a tap cannot mute the page:
+
+```js
+const node = engine.outputNode();            // null until the setup chain finishes
+const split = ctx.createChannelSplitter(2);
+node.connect(split);                         // beside the sink's own connection, not instead of it
+```
+
+It is `"main"` topology plus `SinkType.WORKLET` only. Everything else has no node to give.
+
 ## Where the audio comes from
 
 There is no synchronous file system in a browser, so `bwa_load_sound` has nothing to open unless
@@ -239,8 +287,46 @@ The default profile is `BWA_PROFILE_CAVE_SIM`, because the playground is the CAV
 point source pans through the real DBAP, SPCAP or VBAP solve into the 26-channel bus, and the bus is
 HRTF-decoded to stereo. So a lit cone is a channel the panner really solved for.
 `BWA_PROFILE_BINAURAL` is in the picker beside it and rebuilds the engine, which is a create-time
-change; your AudioContext survives it. The channel walk forces CAVE_SIM for itself, because the
-binaural profile has no bus to walk.
+change. The channel walk forces CAVE_SIM for itself, because the binaural profile has no bus to
+walk.
+
+A rebuild replaces the AudioContext too, and that is not tidiness. Emscripten's audio-worklet
+bootstrap runs `audioWorklet.addModule()` and registers its processors by name in the context's own
+worklet scope, so a second engine on the same context registers the same name twice, which throws.
+The setup chain then never finishes, no node is ever connected, and the sink does what rule 4 says
+for a device that is not there: it host-paces silence. The engine goes on rendering and the page
+goes quiet. A fresh context is a fresh worklet scope. The wasm module is reused across the rebuild
+(`create({ module })`), so the switch costs no second copy of the engine.
+
+### The meters
+
+Two, because the two profiles put the audio in different places.
+
+The speaker cones and the bus strip are `bwa_get_bus_levels`, sampled on a 4 ms interval rather
+than on the animation frame. That readback is the LAST BLOCK's peak, a block is 5.3 ms, and the
+page used to read it every 120 ms: it saw one block in 22 and the default stimulus is a click train
+whose burst is 2 ms in every 250 ms, so the meter read "silent" and the cones stayed dark while the
+click was plainly audible. The tick holds the peak and the frame loop consumes it.
+
+The two output strips are the stereo the AudioContext is playing, read from an AnalyserNode pair on
+`engine.outputNode()`. In `BWA_PROFILE_BINAURAL` the point voices bypass the bus entirely, so the
+bus meter there shows only the diffuse field and the panel says so; the output strips are the ones
+with your ears' content in them.
+
+### The layout upload
+
+The panel takes a `cave_layout.json` (the format is [docs/layout-schema.md](../../docs/layout-schema.md),
+and `examples/cave_layout.json` is the reference) and rebuilds the array on it. The page checks the
+three mistakes anyone makes first - not JSON, a count outside 4 to 26, a position that is not a
+number - and the engine is the authority for the rest: a file it refuses is reported with its own
+`bwa_last_error` text and the page falls back to the default grid, because an engine whose
+`bwa_start` refused is an engine nobody can hear. The cones are placed from `bwa_get_speakers`
+afterwards, so what is drawn is what the engine loaded. The schema carries no per-speaker
+orientation, so the cones keep aiming at the array's nominal listening point.
+
+The stimulus feed is a latency budget rather than a full ring: about 100 ms queued ahead of the
+audio clock. The push ring holds 1.37 s and filling it meant a stimulus change waited for the old
+one to drain.
 
 ### The coordinate seam
 
@@ -258,16 +344,14 @@ above). A scene picker must not offer something that does nothing, so it is abse
 empty. The medium boundary scene says the same thing in its own panel: it has the boundary and the
 medium, and no room tail.
 
-### No layout file, and why none is needed
+### The default layout
 
-There is no synchronous file system in a browser and this binding cannot write into the wasm one:
-`FS` is not in the module's `EXPORTED_RUNTIME_METHODS`, so `bwa_desc.layout_path` has nothing to
-open. It does not matter here. The engine's default grid IS the geometry `examples/cave_layout.json`
-describes, speaker for speaker: a 3 by 3 by 3 boundary grid at plus or minus 1.5 m with `y` at 0,
-1.5 and 3, minus the center, 26 in all. The only thing the file adds is the measured per-speaker
-delay trim, which nothing in a browser demo can hear. The page reads the positions back with
-`bwa_get_speakers` rather than assuming them, so the gizmos are the engine's layout whatever it
-turns out to be.
+With no file uploaded the engine runs its default grid, which IS the geometry
+`examples/cave_layout.json` describes, speaker for speaker: a 3 by 3 by 3 boundary grid at plus or
+minus 1.5 m with `y` at 0, 1.5 and 3, minus the center, 26 in all. The only thing the file adds is
+the measured per-speaker delay trim, which nothing in a browser demo can hear. The page reads the
+positions back with `bwa_get_speakers` rather than assuming them, so the gizmos are the engine's
+layout whatever it turns out to be.
 
 ### three.js
 
@@ -278,6 +362,141 @@ in the script, and `tools/wasm/build-web.sh` calls it. `dist/` is a build output
 carries no 2 MB file and the Pages artifact still gets one. The script needs only curl, so a
 developer with no Emscripten toolchain can still fill `vendor/`. There is no OrbitControls addon:
 the orbit is 30 lines in `world.js`, which is one fewer file to pin.
+
+## XR
+
+`xr/index.html` is the playground with your head in it. Same engine, same scenes, same 26-channel
+bus. What it adds is the one thing headphones and a mouse cannot show you: in an `immersive-vr`
+session the viewer pose from every XR animation frame becomes the engine's listener pose, position
+and orientation both, so the binaural render follows your head and a source stays where it is in
+the room while you turn.
+
+```
+node bindings/web/example/serve.mjs      # then open http://localhost:8181/xr/
+```
+
+It has three states and says which one it is in.
+
+| state | what you get |
+|-------|--------------|
+| no WebXR | a note saying so, a link to the flat playground, and a flat preview that still starts the engine |
+| WebXR, no session | a normal three.js view, an Enter VR button, and the menu as DOM |
+| in session | stereo through the headset, the menu as a panel in the room, and the head tracking |
+
+The Enter VR click is also the user gesture that lets the page resume its `AudioContext`, so the
+engine starts there. `rig.js` is the playground's, unchanged: the worklet sink, the push source,
+the stimulus, and `BWA_PROFILE_CAVE_SIM` by default with `BWA_PROFILE_BINAURAL` in the picker.
+
+### The coordinate seam, again, and the other half of it
+
+`playground/frame.js` owns the room to three.js map and finds it to be the identity.
+`xr/frame_xr.js` owns the half the flat page never needs: the XR reference space to room map, for a
+position and for an orientation.
+
+Work it out from the two conventions. The room frame is `+y` up, `+z` ahead and `+x` LEFT. A WebXR
+viewer is `+y` up, `-z` ahead and `+x` right. So the head-local basis map sends room ahead to `-z`,
+room up to `+y`, and room `+x` to `-x`, which is `diag(-1, 1, -1)`.
+
+**That is a rotation, not a mirror.** Its determinant is `+1`. It is 180 degrees about the up axis.
+The tempting reading, that `+x` LEFT against `+x` right means a reflection across the YZ plane, is
+wrong, and it is wrong in the direction a static test never catches: a reflection and a yaw agree
+about where a source SITS and disagree about which way a head is FACING. The handedness flip a
+reflection would introduce is already spent by the second sign, the one on the forward axis,
+because the two conventions disagree about ahead as well as about left. Two sign flips compose to a
+proper rotation.
+
+The space map is the same rotation, by choice, so that the direction a user already faces when the
+session starts becomes room ahead. With a `local-floor` reference space, XR `y = 0` is the physical
+floor and room `y = 0` is the room floor, so the vertical axis needs no offset at all. Composing
+the two gives `q_room = qY * q_xr * qY` with `qY = (0, 1, 0, 0)`, which multiplies out to
+`(x, y, z, w) -> (x, -y, z, -w)`. An identity XR orientation is an identity room orientation.
+
+`tests/xr_frame.test.mjs` checks all of that under node, against the ABI's own basis vectors rather
+than against the algebra, so a mis-derivation fails whatever it wrote. `world_xr.js` applies the
+same rotation to the three.js group that carries the XR camera, and the test pins the two together.
+If they ever disagreed, the picture and the sound would disagree about where you are.
+
+### The menu is a panel in the room
+
+The WebXR DOM Overlay module is specified for handheld AR, and every shipping runtime grants it
+only on an `immersive-ar` session. Ask for it on `immersive-vr` and either the feature is refused
+or `session.domOverlayState` comes back undefined, which would leave a headset user looking at a
+menu that exists only on a screen behind them. So the page asks for `dom-overlay` as an optional
+feature, uses the DOM menu if the runtime says it granted one, and otherwise paints an in-world
+panel: a plane at arm's length, facing you, with a canvas texture, selected by a controller ray.
+
+Both renderers take the same control descriptors. `playground/ui.js` turns them into DOM and
+`xr/panel.js` paints them, so the option set is the flat playground's option set and a scene's own
+knobs reach XR with no XR code in the scene.
+
+### Controllers
+
+| input | what it does |
+|-------|--------------|
+| trigger, on the panel | press the control the ray is on |
+| trigger or grip, elsewhere | grab the source with the nearer hand and carry it |
+| thumbstick X | slide the source left and right, relative to where you are looking |
+| thumbstick Y | push the source away, or pull it in |
+| grip and thumbstick Y | raise and lower the source |
+| thumbstick Y, on the panel | scroll the menu |
+
+A press is resolved in that order, because a ray that lands on the panel is unambiguous and a grab
+is not. The page prints the table beside the view.
+
+### Pose prediction, and why the page does it
+
+`bwa_set_pose_prediction` leads the pose the engine's OWN tracker publishes. `src/core/rt.c` reads
+it inside the branch that follows a NatNet connection, so a pose pushed through
+`bwa_set_listener_pose` never passes through it, and on this page that call is inert. The lead has
+to happen where the poses are, which is the page. `xr/frame_xr.js` carries a `PoseLead` that copies
+the engine's own shape: an exponential average over about 100 ms, a speed cap, and a reset across a
+gap.
+
+WebXR already returns a viewer pose predicted to the frame's DISPLAY time, so the eyes are taken
+care of and the knob here is the extra distance to the EARS, which is the output latency plus one
+block. The default is 30 ms and the slider runs to 80. Orientation is not led, because the engine
+does not lead it either and an overshooting head rotation is far more audible than an overshooting
+position.
+
+### What it shares, and what it duplicates
+
+It imports `playground/rig.js`, `playground/scenes/`, `playground/stimulus.js`, `playground/ui.js`
+and `playground/world.js` (by subclass), so the audio, the scenes, the gizmos and the control
+builder are one copy. Three things are duplicated, and each is marked in the file that carries it:
+
+- the global control descriptors (scene, profile, stimulus, master gain) are re-spelled in
+  `xr/options.js`, because `playground/main.js` builds them inline and exports nothing.
+- `xr/probe.js` is `playground/probe.js` with a head ORIENTATION argument added. The playground's
+  version hard-codes an identity listener quaternion, which is right for a page whose head never
+  turns and useless here.
+- the page's CSS, because neither page has an external stylesheet.
+
+### Tests
+
+```
+ctest --test-dir <build> -R web_xr
+node bindings/web/tests/run-xr.mjs                               # or directly
+node bindings/web/tests/run-xr.mjs --site bindings/web/_site     # or against a staged site
+```
+
+It loads the page twice, because two of the three states are decided before any injected script
+could change them. The first pass deletes `navigator.xr` and checks the no-WebXR state. The second
+installs a minimal fake one, so an `immersive-vr` session opens against a synthetic `XRFrame` whose
+viewer pose the check chooses.
+
+What the fake proves: the seam, in both signs, on every axis; that the pose reaches the engine,
+read back through `bwa_get_listener_pose`; that a source the listener looks at renders centered
+while the same source with the head turned a quarter renders hard to the other ear, measured
+through a second engine on the manual sink; the prediction lead, in meters; the in-world panel
+including its ray hit test; the grab; and the thumbstick nudge. What it cannot prove: three.js
+stereo rendering, the projection layer, a real runtime's controller poses or gamepad layout,
+reprojection, and latency. Those need a headset, and nobody has worn one yet.
+
+The seam itself also has a node test with no browser in it, which runs inside `web_bindings`:
+
+```
+node --test bindings/web/tests/xr_frame.test.mjs
+```
 
 ## Tests
 
@@ -322,13 +541,23 @@ node bindings/web/tests/run-playground.mjs         # or directly
 script tag to the playground's HTML for a request carrying `?__drive=1`, so the page a visitor loads
 carries no test code and the check still drives the real page through `window.__bwaPlayground`, the
 hook `playground/main.js` documents. What it asserts: the page starts on the worklet sink with 26
-bus channels read back from `bwa_get_speakers`; a source at room `+x` draws on the left of the
-screen AND is louder in the left ear, measured by rendering the page's own click through a second
-engine on the manual sink (`playground/probe.js`); the channel walk lights the channel it drove and
-nothing else within 20 dB; a wall across the line of sight drops the occlusion factor and moving it
-away restores it; a figure-of-eight source nulls at 90 degrees; and the profile rebuild lands back
-on the worklet sink and renders. It skips when it finds no browser, no `dist/` or no vendored
+bus channels read back from `bwa_get_speakers`, and the Start panel is gone with a status line in
+its place; a source at room `+x` draws on the left of the screen AND is louder in the left ear,
+measured by rendering the page's own click through a second engine on the manual sink
+(`playground/probe.js`); the speaker cones and both meter strips MOVE while the default click train
+plays; a stimulus change reaches the output inside 150 ms; the channel walk lights the channel it
+drove and nothing else within 20 dB; a wall across the line of sight drops the occlusion factor and
+moving it away restores it; a figure-of-eight source nulls at 90 degrees; the profile rebuild lands
+back on the worklet sink, keeps `device_lost` at 0 and still puts a `+x` source in the left ear of
+the LIVE output, in both directions; and an uploaded layout rebuilds the array, reads back through
+`bwa_get_speakers` with the position it was given, while a layout the engine refuses is reported and
+falls back to the default grid. It skips when it finds no browser, no `dist/` or no vendored
 three.js.
+
+The live-output assertions read an AnalyserNode pair on `engine.outputNode()`, and they are there
+because a health block cannot tell silence from sound: a sink whose worklet never came up
+host-paces silence and counts blocks exactly like a working one. The offline probe cannot tell
+either, because it renders its own engine.
 
 The stimulus is the click, never DC. CLAUDE.md's first trap is a DC-driven laterality assertion that
 shipped a left and right mirror.
