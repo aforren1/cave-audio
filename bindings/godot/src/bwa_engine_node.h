@@ -53,10 +53,11 @@ public:
 	 * virtual-speaker array audition, CAVE_BOTH the rig plus that sim tap. */
 	enum Profile { PROFILE_CAVE = 0, PROFILE_BINAURAL = 1, PROFILE_CAVE_SIM = 2, PROFILE_CAVE_BOTH = 3 };
 	/* AUTO picks by channel count and platform: a headphone profile tries WASAPI then ASIO, the
-	 * array tries ASIO, and either falls back to the silent offline sink. COREAUDIO, ALSA, AAUDIO
-	 * and JACK are reserved values - the Windows build carries none of them yet. */
+	 * array tries ASIO, and either falls back to the silent offline sink. COREAUDIO, ALSA, AAUDIO,
+	 * JACK and WORKLET are reserved values - the Windows build carries none of them. */
 	enum Sink { SINK_AUTO = 0, SINK_ASIO = 1, SINK_NULL = 2, SINK_MANUAL = 3,
-		SINK_WASAPI = 4, SINK_COREAUDIO = 5, SINK_ALSA = 6, SINK_AAUDIO = 7, SINK_JACK = 8 };
+		SINK_WASAPI = 4, SINK_COREAUDIO = 5, SINK_ALSA = 6, SINK_AAUDIO = 7, SINK_JACK = 8,
+		SINK_WORKLET = 9 };
 	/* sink_flags bits (bwa_desc.sink_flags). EXCLUSIVE takes a WASAPI endpoint from every other
 	 * application on the machine; leave it off for a monitor that shares its device with a game
 	 * or a VR runtime. EXACT_RATE fails the open when the device cannot run at the engine rate,

@@ -1,0 +1,103 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>bw_audio on the web</title>
+<!--
+  The GitHub Pages landing shell. It is NOT the demo: it registers the COOP/COEP service worker,
+  reports whether the page ended up cross-origin isolated, and links to the demo the web build
+  stages at example/index.html.
+
+  EVERYTHING THIS PAGE LOADS IS SAME-ORIGIN, and that is a rule rather than a style choice. The
+  service worker serves COEP: require-corp, under which a cross-origin script, style or font
+  without Cross-Origin-Resource-Policy is BLOCKED. There is no CDN here and there must never be
+  one; see README.md next to this file.
+-->
+<style>
+  :root { color-scheme: light dark; }
+  body {
+    margin: 0 auto; padding: 2rem 1rem; max-width: 46rem;
+    font: 16px/1.55 system-ui, sans-serif;
+  }
+  h1 { font-size: 1.6rem; margin: 0 0 .25rem; }
+  p.sub { margin: 0 0 2rem; opacity: .7; }
+  table { border-collapse: collapse; width: 100%; margin: 0 0 1.5rem; }
+  th, td { text-align: left; padding: .5rem .6rem; border-bottom: 1px solid rgba(128,128,128,.35); }
+  th { font-weight: 600; width: 60%; }
+  td.v { font-family: ui-monospace, Consolas, monospace; }
+  .ok { color: #1a7f37; } .bad { color: #b3261e; }
+  a.demo {
+    display: inline-block; padding: .6rem 1rem; border: 1px solid currentColor;
+    border-radius: .4rem; text-decoration: none; font-weight: 600;
+  }
+  .note { font-size: .9rem; opacity: .75; }
+  code { font-family: ui-monospace, Consolas, monospace; }
+</style>
+<!--
+  Classic script, and FIRST: it registers itself as a service worker from
+  document.currentScript.src, so its own URL decides the worker's scope. At the site root that
+  scope covers example/ too. Loaded as a module it would have no currentScript and register
+  nothing.
+-->
+<script>
+  // Configure coi-serviceworker before it runs. require-corp, not credentialless: that is the
+  // header docs/web.md ("Hosting") commits to, and it is what makes the vendor-everything rule
+  // above enforceable instead of advisory. coepDegrade would quietly retry in the weaker mode,
+  // which is the silent fallback the same section rules out.
+  window.coi = {
+    coepCredentialless: () => false,
+    coepDegrade: () => false,
+  };
+</script>
+<script src="coi-serviceworker.js"></script>
+</head>
+<body>
+<h1>bw_audio on the web</h1>
+<p class="sub">A spatial audio engine built for wasm, running the desktop two-thread model.</p>
+
+<table>
+  <tr><th>Cross-origin isolated</th><td class="v" id="coi">checking</td></tr>
+  <tr><th>SharedArrayBuffer</th><td class="v" id="sab">checking</td></tr>
+  <tr><th>Secure context</th><td class="v" id="sec">checking</td></tr>
+  <tr><th>Service worker controlling this page</th><td class="v" id="sw">checking</td></tr>
+</table>
+
+<p id="cta"><a class="demo" href="example/index.html">Open the demo</a></p>
+<p class="note" id="why"></p>
+
+<p class="note">
+  The engine needs <code>SharedArrayBuffer</code>, which every browser gates behind cross-origin
+  isolation. GitHub Pages cannot send the two headers that grant it, so a service worker adds them
+  to every response it serves. The cost is one automatic reload on your first visit, which is why
+  the answers above can flip a moment after the page opens.
+</p>
+
+<script>
+  // Plain ES5-ish DOM work on purpose: this page must report a failure in whatever browser it
+  // runs in, including one too old for the engine itself.
+  function set(id, good, text) {
+    var el = document.getElementById(id);
+    el.textContent = text;
+    el.className = "v " + (good ? "ok" : "bad");
+    return good;
+  }
+  var isolated = set("coi", window.crossOriginIsolated === true,
+                     window.crossOriginIsolated === true ? "true" : String(window.crossOriginIsolated));
+  set("sab", typeof SharedArrayBuffer !== "undefined",
+      typeof SharedArrayBuffer !== "undefined" ? "available" : "undefined");
+  set("sec", window.isSecureContext === true, window.isSecureContext === true ? "true" : "false");
+  var ctl = !!(navigator.serviceWorker && navigator.serviceWorker.controller);
+  set("sw", ctl, ctl ? "yes" : "no");
+
+  if (!isolated) {
+    document.getElementById("why").textContent =
+      "Not isolated yet. If this is your first visit the page reloads itself once; after that, " +
+      "a persistent false means the service worker did not register (a private window, or a " +
+      "browser with service workers disabled). The demo refuses to start rather than fall back " +
+      "to a single-threaded engine.";
+    document.getElementById("cta").style.opacity = ".5";
+  }
+</script>
+</body>
+</html>

@@ -161,6 +161,28 @@ src/
                          it is __INTRODUCED_IN(28) and this targets API 26. AAUDIO_ERROR_DISCONNECTED
                          sets device_lost and starts the host-paced thread; nothing reopens.
                          [backends p3]
+    worklet_sink.c       Wasm Audio Worklet host (the browser): the headphone path on a PAGE, and
+                         STEREO ONLY - a browser carries no array transport, so AUTO sends anything
+                         wider to the offline sink the way Android does. The worklet's process()
+                         callback IS the audio thread (Emscripten instantiates the module in the
+                         AudioWorkletGlobalScope against the SAME shared memory), and it gets 128
+                         frames always, so the fixed-quantum adapter is in the path and has its
+                         easiest customer: 128 divides every sensible block, and the output buffer
+                         is PLANAR FLOAT already, so the runs copy straight out like JACK's.
+                         Every webaudio.h call is PROXIED to the browser main thread, because
+                         `new AudioContext()` needs a Window and emscripten's handle table is a
+                         per-scope JS variable. `device` is a decimal AudioContext HANDLE, so a page
+                         keeps the context it created in its gesture handler and keeps the right to
+                         resume it. A SUSPENDED context is the normal state and is treated as rule
+                         4's host-paced degradation (silence, clocks keep advancing, device_lost
+                         set), which means two pullers on one SinkQuant: they share a WAIT-FREE
+                         try-lock where whoever finds it taken BAILS, never waits. Health is
+                         measured=false, because Web Audio reports no position, no xrun and no
+                         underrun of any kind; late_blocks and render_ns_peak are still real.
+                         VERIFIED in headless Chrome (bindings/web/tests/run-browser.mjs, the
+                         `web_browser` ctest): worklet:1 renders at the audio clock and the
+                         suspend/resume handoff flips device_lost both ways. Nobody has LISTENED
+                         to it. [web]
     null_sink.c          offline (no-hardware) sink: threaded silence + timestamps. [M1]
     manual_sink.c        offline/deterministic sink: no thread, the caller pumps (bwa_render_block). [M1]
     asio_sink.cpp        ASIO host: driver load, bufferSwitch, sample-pos timestamp. [M1]
@@ -281,6 +303,11 @@ tools/wasm/            wasi-sdk.toolchain.cmake + build-wasm.sh: the wasm32 buil
                        sink is the HOST's job. os_posix.c is the shim (BWA_OS_NO_SCHED + wasi socket stubs),
                        following the Android precedent. Decided 2026-09-21: faithful two-thread over
                        SharedArrayBuffer, control on a Worker, COOP/COEP accepted. docs/web.md. [wasm]
+tools/wasm/            build-wasm.sh (THE engine recipe for wasm32: wasi-sdk or emsdk, and
+                       BWA_WASM_PROXY=1 for the -sPROXY_TO_PTHREAD shape docs/web.md's decision
+                       wants), wasi-sdk.toolchain.cmake, build-web.sh (THE shippable-page recipe:
+                       BWA_WITH_WORKLET + BWA_BUILD_WEB, staged into bindings/web/dist/) and
+                       gen-abi.mjs (the web binding's raw layer + export list, from the header).
 tools/xval/            gen_reference.py: cross-validation golden generator (scipy SH / l1-LP VBAP /
                        qhull AllRAD / bilinear RBJ / lfilter) -> test/xval_data.h for the xval ctest.
                        Needs numpy+scipy; ctest itself does not (the header is committed).
@@ -334,6 +361,28 @@ bindings/
                        one construct that BITES rather than failing to parse is a reference cycle
                        (Octave refcounts handle objects), so Engine.listener is DEPENDENT and not a
                        stored object pointing back.
+  web/                 JS/ES-module binding (opt-in -DBWA_BUILD_WEB=ON, Emscripten only; built by
+                       tools/wasm/build-web.sh into a self-contained bindings/web/dist/ with no
+                       bundler and no server-side step). TWO LAYERS like python's: src/raw.js is the
+                       RAW 1:1 ABI (C name minus bwa_, C units) built from src/abi.js, which is
+                       GENERATED from the header by tools/wasm/gen-abi.mjs along with the
+                       -sEXPORTED_FUNCTIONS list - so the layer cannot drift and the module cannot
+                       carry a call it never heard of. src/engine.js is the thin idiomatic layer
+                       (Engine / Sound / Source / PushSource / Bed / Listener, the same auto-commit
+                       model python's has). Same ONE EXCLUSION, bwa_set_output_capture, absent from
+                       BOTH layers rather than present-and-refusing. The one-control-thread rule is
+                       STRUCTURAL here: the engine pointer lives only in the control Worker, and the
+                       page reaches it through src/client.js over a small typed postMessage
+                       protocol. The PER-FRAME path is a SharedArrayBuffer frame slab plus ONE
+                       message (pose + N moved source positions + one commit), because a message
+                       per call spreads one visual frame's writes across several audio blocks, which
+                       is exactly what CMD_COMMIT exists to prevent. TWO TOPOLOGIES, and the second
+                       is a measured deviation from docs/web.md's decision: "worker" (the default,
+                       every sink but WORKLET) and "main" (the ONLY one where the AudioWorklet sink
+                       can open, because new AudioContext() needs a Window and emscripten proxies
+                       none of its Web Audio). example/ is a one-button page + serve.mjs, the tiny
+                       COOP/COEP node server a local try needs. tests/ runs under node against the
+                       SHIPPED module (-sENVIRONMENT includes node for that). [web]
   unreal/              module + component — planned, not yet implemented (docs/integration.md has the notes).
 cmake/                 bw_audioConfig.cmake.in + bwa_bindings.cmake. The first is the package config
                        the ENGINE SDK installs (`cmake --install <build> --prefix <sdk> --component
@@ -436,14 +485,22 @@ with gcc 14.3; Android is verified locally too, 37/38 on an x86_64 emulator (the
 sleep-lateness bound, which a no-SDK library of the same commit misses identically); macOS is CI-only. Phase 5 added no target - the JACK and ALSA sections live inside
 `test_audio_sink`, and on a box with no server and no card that one test reports SKIPPED rather
 than passing. The UTF-8 path work added three (`utf8_path`, `idle`, `cave_both`), on every
-platform. `-DBWA_BUILD_PYTHON=ON` adds three more on top of whatever the rest of the flags give
-(`python_bindings` plus `python_example_offline_render` / `python_example_live_onset`), so the
-full-options Windows tree is 48 and the default Windows tree 41; `python_bindings` reports SKIPPED
-rather than failing when pytest is missing, because a C developer should not need it.
-`-DBWA_BUILD_MATLAB=ON` adds up to FOUR PER INTERPRETER it finds (`<matlab|octave>_tests` plus
-`_example_offline_render` / `_example_live_onset` / `_example_AudioTunnel3DDemo_bwa`), so a Windows
-box with both MATLAB and Octave installed reaches 53 (45 + 8) and 56 at full options; a Linux or
-macOS box with Octave alone reaches 42 (38 + 4) and with both 46 (38 + 8). Each suite exits 77
+platform. `-DBWA_BUILD_PYTHON=ON` adds four more on top of whatever the rest of the flags give
+(`python_bindings` plus `python_example_minimal` / `python_example_offline_render` /
+`python_example_live_onset`), so the full-options Windows tree is 49 and the default Windows tree
+42; `python_bindings` reports SKIPPED rather than failing when pytest is missing, because a C
+developer should not need it. The `minimal` example is the SAME demo in every binding since
+2026-09-22 (a hand-spelled LCG click orbiting the head, docs/integration.md "The minimal
+example"), so a change to the stimulus is a change to five files plus the web page.
+`-DBWA_BUILD_WEB=ON` is EMSCRIPTEN-ONLY and adds two (`web_bindings`, 17 node tests against the
+module that was just linked; `web_browser`, the AudioWorklet sink driven in headless Chromium),
+each SKIPPING rather than failing when node or a browser is missing. It changes no desktop count,
+because a desktop configure refuses the option with a status line.
+`-DBWA_BUILD_MATLAB=ON` adds up to FIVE PER INTERPRETER it finds (`<matlab|octave>_tests` plus
+`_example_minimal` / `_example_offline_render` / `_example_live_onset` /
+`_example_AudioTunnel3DDemo_bwa`), so a Windows box with both MATLAB and Octave installed reaches
+55 (45 + 10) and 59 at full options; a Linux or macOS box with Octave alone reaches 43 (38 + 5) and
+with both 48 (38 + 10). Each suite exits 77
 (SKIPPED) when the MEX for the running interpreter
 was not staged, and neither half is registered when its toolchain was not found at configure time -
 ctest cannot run a MATLAB test with no MATLAB. In CI BOTH MEX files are built INSIDE each desktop
@@ -555,7 +612,8 @@ Regression-preventing gotchas. Each has bitten before or guards a real invariant
   `test/rt_feature_test.c`. Miss one and the error is a confusing `<stdatomic.h> is not yet
   supported`, pointing at the header rather than at the missing flag. The list is deliberately
   MSVC-only, so a platform sink MSVC never compiles stays off it however many atomics it carries:
-  `jack_sink.c`, `alsa_sink.c` and `aaudio_sink.c` all use `stdatomic.h` and none belongs there.
+  `jack_sink.c`, `alsa_sink.c`, `aaudio_sink.c` and `worklet_sink.c` all use `stdatomic.h` and
+  none belongs there.
 - **`pose.h` is the one HEADER that carries `stdatomic.h`, so nothing else may include it
   casually.** Its seqlock moved off the Interlocked intrinsics onto C11 atomics (Boehm 2012: the
   payload fields are relaxed atomics, and fences carry the ordering), which means every translation
@@ -809,6 +867,8 @@ freely. It still follows the US English rule above.
 - `docs/materials.md` — material/geometry model → Steam Audio occlusion + reflections → the bus.
 - `docs/integration.md` — Unity + Godot bindings + the per-engine coordinate seams; Unreal notes.
 - `docs/build.md` — platform, dependencies, licensing, Dante config.
+- `docs/web.md` — the browser target: the settled two-thread decision, the toolchain measurements,
+  the AudioWorklet sink and the JS binding as built, and the list of what a browser has never run.
 - `docs/backends.md` — the sink contract + the backends beside ASIO. WASAPI (Windows), JACK + ALSA
   (Linux) are IMPLEMENTED; CoreAudio and AAudio are still spec.
   The 10-rule sink contract (fixed quantum, timestamp pair, health, exact-rate policy), the fixed-quantum

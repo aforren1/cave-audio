@@ -19,6 +19,10 @@ This directory is both things at once:
   `addons/bw_audio/playground/playground.tscn` to hear it; the default main scene is the
   smoke test, which quits as soon as it has asserted.
 
+The shortest thing to run first is `demo/minimal.tscn`: a click orbits the listener's head for
+six seconds and the scene quits. Every other binding of this engine ships the same demo with the
+same stimulus, so the four are comparable by ear.
+
 ## Build
 
 The extension is a CMake target in the main build, opt-in because fetching and

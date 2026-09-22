@@ -160,7 +160,8 @@ NB_MODULE(_bwa, m) {
         .value("COREAUDIO", BWA_SINK_COREAUDIO)
         .value("ALSA",      BWA_SINK_ALSA)
         .value("AAUDIO",    BWA_SINK_AAUDIO)
-        .value("JACK",      BWA_SINK_JACK);
+        .value("JACK",      BWA_SINK_JACK)
+        .value("WORKLET",   BWA_SINK_WORKLET);
 
     nb::enum_<bwa_result>(m, "result", nb::is_arithmetic())
         .value("OK",           BWA_OK)

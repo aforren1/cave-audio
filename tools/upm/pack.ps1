@@ -199,6 +199,13 @@ foreach ($dir in 'Runtime', 'Editor') {
     Copy-Item (Join-Path $pkg $dir) $stage -Recurse
     Copy-Item (Join-Path $pkg "$dir.meta") $stage
 }
+# Samples~ ships too, and it is the one staged folder that carries NO .meta files. A '~' suffix
+# makes a folder invisible to Unity's importer: nothing under it is an asset until the user presses
+# Import in the Package Manager, at which point Unity copies it into Assets/ and mints the GUIDs
+# there. package.json's "samples" array is what puts the Import button on the package page.
+if (Test-Path (Join-Path $pkg 'Samples~')) {
+    Copy-Item (Join-Path $pkg 'Samples~') $stage -Recurse
+}
 # git bookkeeping never ships (and a staged .gitignore would make npm re-apply its rules to the tree)
 Get-ChildItem $stage -Recurse -Force -Include '.gitignore', '.gitkeep' | Remove-Item -Force
 
@@ -233,13 +240,16 @@ $commit = try { (& git -C $repo rev-parse HEAD).Trim() } catch { 'main' }
 # ---- every asset must carry a .meta ---------------------------------------------------------------
 # A file arriving without one gets a fresh random GUID in EACH project, so a scene that references the
 # script breaks across machines ("Missing (Mono Script)"). Catch that here, not in a user's project.
+# Anything under a '~' folder is exempt: Unity never imports it, so it has no GUID to pin.
 $missing = @()
 $missing += Get-ChildItem $stage -Recurse -File |
     Where-Object { $_.Extension -ne '.meta' -and -not (Test-Path ($_.FullName + '.meta')) } |
-    ForEach-Object { $_.FullName.Substring($stage.Length + 1) }
+    ForEach-Object { $_.FullName.Substring($stage.Length + 1) } |
+    Where-Object { $_ -notmatch '~' }
 $missing += Get-ChildItem $stage -Recurse -Directory |
     Where-Object { -not (Test-Path ($_.FullName + '.meta')) } |
-    ForEach-Object { $_.FullName.Substring($stage.Length + 1) }
+    ForEach-Object { $_.FullName.Substring($stage.Length + 1) } |
+    Where-Object { $_ -notmatch '~' }
 if ($missing.Count) {
     throw ("no .meta for: " + ($missing -join ', ') + "`nRun: powershell -File tools/upm/gen-meta.ps1")
 }

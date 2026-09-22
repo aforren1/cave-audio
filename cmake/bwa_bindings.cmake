@@ -1,4 +1,4 @@
-# The three optional BINDING subdirectories, in ONE place because the root CMakeLists has two
+# The four optional BINDING subdirectories, in ONE place because the root CMakeLists has two
 # modes and both have to include exactly the same set:
 #
 #   in-tree      - the engine is compiled here and `bwa::bw_audio` aliases it.
@@ -36,6 +36,19 @@ macro(bwa_add_bindings)
   option(BWA_BUILD_MATLAB "Build the MATLAB and Octave binding (a MEX gateway; needs MATLAB or mkoctfile)" OFF)
   if(BWA_BUILD_MATLAB)
     add_subdirectory(bindings/matlab)
+  endif()
+
+  # ---- Optional: web binding (an ES module for a browser page) ----
+  # Opt-in and Emscripten-only: it is an emcc link with its own JS glue, and there is nothing for
+  # it to produce on a desktop toolchain. tools/wasm/build-web.sh is the one caller and turns
+  # BWA_WITH_WORKLET on beside it, because a page with no AudioWorklet sink makes no sound.
+  # See bindings/web/CMakeLists.txt and bindings/web/README.md.
+  option(BWA_BUILD_WEB "Build the web binding (Emscripten only; an ES module + the worklet sink)" OFF)
+  if(BWA_BUILD_WEB AND EMSCRIPTEN)
+    add_subdirectory(bindings/web)
+  elseif(BWA_BUILD_WEB)
+    message(STATUS "bw_audio: web binding skipped (Emscripten only; run tools/wasm/build-web.sh)")
+    set(BWA_BUILD_WEB OFF)
   endif()
 
   # ---- Optional: Godot GDExtension binding ----

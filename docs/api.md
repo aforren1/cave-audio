@@ -4,7 +4,9 @@ From a consumer's side this is a **control-only** API: no audio buffers, no
 device, no queue, no threads. You get an opaque engine handle, sounds, positioned
 sources, and per-frame updates. Declarations in
 [`include/bw_audio.h`](../include/bw_audio.h) carry their contracts as comments;
-[`examples/minimal.c`](../examples/minimal.c) runs the whole client lifecycle;
+[`examples/minimal.c`](../examples/minimal.c) runs the whole client lifecycle, orbiting a
+click around the listener's head (every binding ships that same demo, and
+[integration.md](./integration.md) says why the stimulus is a click);
 [`examples/ambisonic.c`](../examples/ambisonic.c) walks the bed API (AmbiX/FuMa loading,
 rotation/tilt, the renderer and max-rE A/Bs), [`examples/streaming.c`](../examples/streaming.c)
 walks disk streaming + push sources, and [`examples/convenience.c`](../examples/convenience.c)

@@ -1,0 +1,167 @@
+# Pages: build the browser demo and publish it to GitHub Pages on every push to main.
+#
+# WHY A SECOND WORKFLOW. ci.yml owns the engine and the five bindings that link it, and it is
+# already the long pole of the repository. This one compiles a different target (wasm32, through
+# Emscripten) for a different consumer (a page, not a package), and nothing it produces is a
+# release asset. Keeping it apart means a red demo never blocks a release, and a Pages deploy
+# never waits on MATLAB.
+#
+# WHY THE SERVICE WORKER. The web design is the faithful two-thread model over SharedArrayBuffer
+# (docs/web.md, "The decision"), and every browser gates SharedArrayBuffer behind cross-origin
+# isolation:
+#
+#   Cross-Origin-Opener-Policy: same-origin
+#   Cross-Origin-Embedder-Policy: require-corp
+#
+# GitHub Pages sends neither and cannot be told to. So the artifact carries a service worker that
+# adds both to every response it serves (coi-serviceworker, vendored under bindings/web/deploy/),
+# the landing page registers it and reloads once, and the demo is isolated from then on. The cost
+# lands on the ARTIFACT: under require-corp a cross-origin subresource without
+# Cross-Origin-Resource-Policy is BLOCKED, so everything the pages load has to be vendored into
+# the tree. bindings/web/deploy/README.md states that rule for whoever adds the next page, and
+# stage.sh warns when the staged tree breaks it.
+#
+# THE WHOLE JOB RUNS IN THE EMSDK CONTAINER, which is what lets the phonon composite action work
+# here unchanged: it is a thin wrapper that maps its inputs onto tools/phonon/build-phonon.sh's
+# environment, and that script needs EMSDK and emcc in the environment it runs in. A `docker run`
+# for the build steps alone would leave the action on the runner, where neither exists.
+#
+# WHAT THE OWNER HAS TO DO ONCE. Settings > Pages > Source: GitHub Actions (or
+# `gh api -X POST repos/:owner/:repo/pages -f build_type=workflow`). Until then the deploy step
+# fails with "Get Pages site failed" and nothing else in this workflow is wrong.
+name: pages
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read        # least privilege; the deploy job asks for the two it needs itself
+
+# One deployment at a time, and queued runs are NOT cancelled: a push that lands mid-deploy must
+# not leave the site half-published. This is the opposite of ci.yml's rule, where cancelling a
+# superseded build is free.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    # PINNED, and it is the version docs/web.md measured the whole wasm leg against (Emscripten
+    # 6.0.10: 35 of 38 ctests with phonon staged). `latest` would let a toolchain bump change the
+    # demo overnight, which is the same reason the phonon submodule is a sha.
+    container:
+      image: emscripten/emsdk:6.0.10
+    permissions:
+      contents: read
+      pages: write        # create the deployment
+      id-token: write     # the OIDC token deploy-pages exchanges for it
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    # A cold phonon cache is the long pole here exactly as it is in ci.yml: about 20 minutes on a
+    # desktop (docs/web.md), and a warm cache restores it in seconds.
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v7
+        # no submodules: steam-audio-source is fetched by the phonon script, on a cache miss only
+
+      - name: Toolchain
+        shell: bash
+        run: |
+          # The image ships cmake, git and python3 but NO ninja, and both scripts below configure
+          # with -G Ninja. It also ships no `python`, which tools/phonon/build-phonon.sh resolves
+          # for itself.
+          apt-get update && apt-get install -y --no-install-recommends ninja-build
+          # The container runs as root over a workspace checked out by the same root, so git is
+          # happy today. Say it anyway: the phonon script runs `git submodule update`, and an
+          # image that ever changes the container user would break that with an ownership error
+          # whose message names neither this file nor that script.
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          # EMSDK is what build.py concatenates its toolchain-file path out of; unset, it crashes
+          # inside Valve's script rather than here.
+          test -n "${EMSDK:-}"
+          emcc --version | head -1
+          cmake --version | head -1
+          ninja --version
+
+      - name: Phonon cache key (submodule sha, no checkout needed)
+        id: phonon-key
+        shell: bash
+        run: echo "sha=$(git rev-parse HEAD:third_party/steam-audio-source)" >> "$GITHUB_OUTPUT"
+
+      # Same scheme as ci.yml's four phonon caches: the submodule sha plus the patch hash. It adds
+      # tools/phonon/** the way the linux entry does, because the wasm leg of the recipe lives in
+      # that script (the -pthread defaults on both halves, the flatbuffers patch, the interpreter
+      # resolution) and archives built by an older copy must not be restored into a newer one.
+      # The key names the platform for the same reason the android ones name the ABI: a cache is
+      # scoped to the repository, so entries staging different lib/<platform> sets would restore
+      # each other's archives.
+      - name: Cache phonon (wasm32)
+        id: phonon
+        uses: actions/cache@v6
+        with:
+          path: |
+            third_party/steam-audio-artifacts/include
+            third_party/steam-audio-artifacts/lib/wasm32
+          key: phonon-wasm32-v1-${{ steps.phonon-key.outputs.sha }}-${{ hashFiles('third_party/patches/**', 'tools/phonon/**') }}
+
+      # The same composite action the windows, android, linux and macos jobs call. It takes wasm
+      # as a platform because the script does; `arch` is left at its default because build.py
+      # names the wasm build tree without one (docs/web.md, "What the spike changed").
+      #
+      # Cost of a miss: about 20 minutes, and a 6.9 MB libphonon.a. It buys the real HRTF decode,
+      # which is the one SDK-gated thing a headphone demo cares about.
+      - name: Build phonon (cache miss only; recipe = third_party/README.md)
+        if: steps.phonon.outputs.cache-hit != 'true'
+        uses: ./.github/actions/build-phonon
+        with:
+          platform: wasm
+          stage-dir: wasm32
+
+      - name: Build the web target
+        shell: bash
+        env:
+          # The emsdk branch of tools/wasm/build-wasm.sh. Harmless for build-web.sh, which is an
+          # Emscripten build by definition.
+          BWA_WASM_TOOLCHAIN: emsdk
+        run: |
+          # TWO NAMES ON PURPOSE. The web runtime and its JS binding are being written alongside
+          # this workflow, and the script that produces bindings/web/dist/ may land as either
+          # tools/wasm/build-web.sh (a build that stages a page) or as an extended
+          # tools/wasm/build-wasm.sh (today's engine build). Check which exists rather than
+          # guessing, and fail loudly when neither does.
+          #
+          # NOTE on the fallback: today's build-wasm.sh also RUNS the suite under node, and
+          # docs/web.md records three known-red tests there (os, idle, fuzz_api). Until it either
+          # separates the build from the test or is superseded by build-web.sh, that branch fails
+          # the job before it can deploy. That is deliberate: a green deploy of a tree whose tests
+          # nobody looked at is worse than a red workflow.
+          if [ -f tools/wasm/build-web.sh ]; then
+            echo "using tools/wasm/build-web.sh"
+            bash tools/wasm/build-web.sh
+          elif [ -f tools/wasm/build-wasm.sh ]; then
+            echo "::warning::tools/wasm/build-web.sh not found; falling back to build-wasm.sh, which also runs the suite"
+            bash tools/wasm/build-wasm.sh
+          else
+            echo "::error::no web build script under tools/wasm/"
+            exit 1
+          fi
+
+      - name: Stage the Pages artifact
+        shell: bash
+        # Copies bindings/web/dist/ in, overlays the deploy shell and the service worker at the
+        # root, writes .nojekyll, and prints the tree. It is the one place that decides what the
+        # site contains, so a developer can run it locally and get the same answer.
+        run: bash bindings/web/deploy/stage.sh
+
+      - name: Upload the Pages artifact
+        uses: actions/upload-pages-artifact@v5
+        with:
+          path: bindings/web/_site
+
+      - name: Deploy to GitHub Pages
+        id: deploy
+        uses: actions/deploy-pages@v5

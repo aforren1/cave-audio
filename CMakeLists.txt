@@ -575,6 +575,26 @@ else()
   message(STATUS "bw_audio: AAudio backend disabled (Android only)")
 endif()
 
+# ---- Wasm Audio Worklet backend (the browser: headphones on a page) ----
+# Emscripten only, and OFF by default even there. -sAUDIO_WORKLET pulls in -sWASM_WORKERS and
+# changes emscripten_get_now into a per-scope runtime probe for every target that links the
+# library, so it is not something the wasi leg or a plain node ctest run should pay for by
+# accident. tools/wasm/build-web.sh turns it on; tools/wasm/build-wasm.sh does not.
+#
+# The two link flags are PUBLIC on purpose: bw_audio is STATIC on wasm (see BWA_LIB_KIND), so the
+# AudioWorklet glue is emitted at the CONSUMER's link, and a consumer that linked this library
+# without them would build clean and then find emscripten_create_audio_context undefined.
+option(BWA_WITH_WORKLET "Build the Wasm Audio Worklet backend (Emscripten only)" OFF)
+if(BWA_WITH_WORKLET AND EMSCRIPTEN)
+  target_sources(bw_audio PRIVATE src/sink/worklet_sink.c)
+  target_compile_definitions(bw_audio PUBLIC BWA_HAVE_WORKLET)
+  target_link_options(bw_audio PUBLIC -sAUDIO_WORKLET=1 -sWASM_WORKERS=1)
+  message(STATUS "bw_audio: Wasm Audio Worklet backend ENABLED")
+else()
+  set(BWA_WITH_WORKLET OFF)
+  message(STATUS "bw_audio: Wasm Audio Worklet backend disabled (Emscripten only, opt-in)")
+endif()
+
 # ---- optional Steam Audio backend (production binaural HRTF decode; later occlusion/reflections) ----
 # The WIRING half. Detection ran near the top of this file, where it had to, so everything below
 # reads BWA_PHONON_LIBS rather than touching the staged tree again. Stage 1 of the production

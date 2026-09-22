@@ -241,6 +241,11 @@ reproducible. Keep a golden render on the synchronous DSP, or on the manual occl
 [`examples/offline_render.py`](examples/offline_render.py) is this shape end to end, including
 writing a wav with numpy alone.
 
+Before either shape, run [`examples/minimal.py`](examples/minimal.py). It orbits a click around the
+listener's head for six seconds and quits, which is the smallest realistic client and the fastest
+way to hear that the binding works. Every other binding of this engine ships the same demo with the
+same stimulus, so the four are comparable by ear. See `docs/integration.md`, "The minimal example".
+
 ## The live shape
 
 The engine owns the device and you schedule onsets ahead of time. Wall time and the dsp-sample
@@ -347,8 +352,8 @@ uv run --extra test pytest
 `uv run` builds and installs the project into its environment first, so pytest runs against the
 installed package rather than the source tree.
 
-The suite also runs under ctest as `python_bindings`, with the two examples as
-`python_example_offline_render` and `python_example_live_onset`:
+The suite also runs under ctest as `python_bindings`, with the three examples as
+`python_example_minimal`, `python_example_offline_render` and `python_example_live_onset`:
 
 ```
 cmake -S . -B build -DBWA_BUILD_PYTHON=ON

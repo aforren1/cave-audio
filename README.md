@@ -258,16 +258,18 @@ bwa_sdk`) and configure with `-DBWA_ENGINE_SDK=<sdk>`. That mode compiles nothin
 Usage docs live in [`docs/api.md`](./docs/api.md): quickstart, profiles, the threading
 contract, coordinates, how-to guides for the common setups, error handling, environment
 variables, then a per-call reference. [`examples/minimal.c`](./examples/minimal.c) runs
-the whole client lifecycle and needs no hardware.
+the whole client lifecycle and needs no hardware: it orbits a click around the listener's
+head for six seconds. Every binding ships the same demo, so put headphones on and compare
+them ([`docs/integration.md`](./docs/integration.md), "The minimal example").
 
 ```c
 bwa_desc cfg = { .profile = BWA_PROFILE_BINAURAL, .sample_rate = 48000, .block_size = 256 };
 bwa_engine* e = bwa_create(&cfg);
 bwa_start(e);                                    // no output device? silent sink, keeps running
 
-bwa_sound ping = bwa_load_sound(e, "ping.wav");    // WAV/FLAC/MP3, resampled at load
-bwa_source s   = bwa_source_create(e);
-bwa_source_play(e, s, ping, /*loop*/ true);
+bwa_sound click = bwa_load_sound(e, "click.wav");  // WAV/FLAC/MP3, resampled at load
+bwa_source s     = bwa_source_create(e);
+bwa_source_play(e, s, click, /*loop*/ true);
 
 // per frame, from one thread:
 bwa_set_listener_pose(e, px,py,pz, qx,qy,qz,qw);

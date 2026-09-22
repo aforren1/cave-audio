@@ -73,8 +73,8 @@ output/*
 # playground scratch (the demo generates this at startup, removes it on clean exit)
 playground_src.wav
 
-# bwa_minimal scratch (synthesized ping, regenerated every argument-less run)
-bwa_minimal_ping.wav
+# bwa_minimal scratch (the synthesized click, regenerated every argument-less run)
+bwa_minimal_click.wav
 
 # icon preview contact sheet (gen_icons.py regenerates it; the .ico files ARE committed)
 /examples/icons/preview_sheet.png
@@ -89,6 +89,9 @@ bwa_ergo_tone.wav
 # (*.pyd is not in the *.dll rule above, so it needs its own line.)
 bindings/python/build/
 bindings/python/dist/
+# The web build's self-contained output and the staged Pages artifact (tools/wasm, bindings/web/deploy).
+bindings/web/dist/
+bindings/web/_site/
 bindings/python/.venv/
 bindings/python/**/__pycache__/
 bindings/python/**/*.egg-info/

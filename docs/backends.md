@@ -212,6 +212,7 @@ The new APIs do not promise a fixed callback size:
 | JACK                           | fixed per cycle (`jack_get_buffer_size`); a buffer-size callback announces a change, which PipeWire does when another client asks for a smaller quantum |
 | ALSA                           | you write, so you choose: fixed                              |
 | AAudio                         | `setFramesPerDataCallback` is a hint; the callback can deliver other sizes |
+| Wasm Audio Worklet             | fixed at 128 frames by the Web Audio 1.0 spec, and not negotiable. The 1.1 `renderSizeHint` moves it; nothing makes it vary |
 
 So every backend except ALSA goes through the **fixed-quantum adapter** (`sink_quant`, below).
 It renders whole engine blocks into a small FIFO and hands the device any count it asks for.
@@ -271,6 +272,7 @@ Where each backend gets the pair:
 | JACK      | `jack_get_cycle_times` at the top of the process callback: `current_frames` and `current_usecs`, the server's DLL-filtered pair in microseconds on `CLOCK_MONOTONIC`. Filtered, so the drift fit reads the DLL rather than the raw device, the way a QPC-synthesized ASIO stamp does |
 | ALSA      | `snd_pcm_status` after the write: `snd_pcm_status_get_htstamp` and `_get_delay`, with the timestamp type set to monotonic in the sw_params |
 | AAudio    | `AAudioStream_getTimestamp(stream, CLOCK_MONOTONIC, &pos, &ns)`. Fails until the stream has run a little; keep the previous pair and set `measured` only after the first success |
+| Wasm Audio Worklet | the adapter's own stream position, and `os_monotonic_ns` for the host half. The processor scope's `currentFrame` is the same number by construction (one `process()` call per quantum while the node is connected), so reading it would cost a wasm-to-JS transition per quantum for a value the sink holds. One caveat, and it is invisible: under `-sAUDIO_WORKLET` Emscripten resolves `emscripten_get_now` per scope, and `AudioWorkletGlobalScope` has no `performance`, so the audio thread's monotonic clock falls back to `Date.now`. Same epoch as the control thread's, a thousand times coarser, and not guaranteed monotonic, which makes the adapter's never-step-backward rule load-bearing rather than defensive |
 
 ### 4. Health
 
@@ -286,6 +288,16 @@ does today.
 | `dropped_frames` | **exclusive:** the size of that deficit. **shared:** the release interval minus the buffer depth, at the nominal rate. Not an estimate: it is the measured excess | the gap                                    | `jack_get_xrun_delayed_usecs` at the nominal rate | the elapsed monotonic time since the last good write minus the buffer depth, at the nominal rate | unknown: 0                          |
 | `driver_resyncs` | 0                                                        | the `kAudioDeviceProcessorOverload` listener | 0                                         | `-ESTRPIPE` (a suspend), after recovery         | 0                                   |
 | `measured`       | **exclusive:** once `GetPosition` has succeeded. **shared:** `bufferFrameCount > period`, and nothing to do with `IAudioClock`. The release-interval rule needs headroom between a normal cycle and the dry deadline; with a one-period buffer a normal cycle sits on it and ordinary jitter would read as a fault, so the honest answer is that the configuration cannot judge | once a timestamp with both flags arrived   | always (the server reports xruns directly)  | always (the write reports underruns directly)     | once `getTimestamp` has succeeded   |
+
+The **Wasm Audio Worklet** has no column because every cell would say the same thing: Web Audio
+reports no device position, no xrun count and no underrun signal of any kind. `currentFrame`
+advances by exactly one quantum per callback whether or not the output starved, and a browser
+renders several quanta back to back inside one system audio callback, so a per-callback
+host-interval rule would false-positive on every ordinary batch. So `measured` is **false**, which
+is the contract's way of saying "cannot know". `late_blocks` and `render_ns_peak` are real, because
+the adapter measures those for every backend it serves, and they are the numbers a page should
+watch. `device_lost` is set while the sink is host-pacing, which on this platform means a suspended
+AudioContext as often as a lost one.
 
 One field is added to the public `bwa_health` in the same ABI bump (see
 [ABI](#abi-changes)): `device_lost`. A lost device makes the sink behave like the null sink,
@@ -304,6 +316,7 @@ nothing). Nothing reopens on its own.
 | JACK      | the max over the sink's ports of `jack_port_get_latency_range(port, JackPlaybackLatency)`, read after the connections are made (the server recomputes on connect) |
 | ALSA      | `snd_pcm_delay` right after a write, which is the buffer fill                                            |
 | AAudio    | `getFramesWritten - pos` from the timestamp pair, extrapolated to now at the nominal rate; `getBufferSizeInFrames` when the timestamp is not yet available |
+| Wasm Audio Worklet | `AudioContext.baseLatency + outputLatency`, in seconds, read once at open. `webaudio.h` has no accessor for either, so the sink reads the two properties off the context object itself. 0 when the browser reports neither, which is "unknown" and not "none" |
 
 The adapter adds the frames it holds in its FIFO. The value stays constant for the life of the
 sink, as the header promises.
@@ -355,6 +368,7 @@ Who owns the audio thread, and what to do about its priority:
 | JACK      | the server's process thread     | already `SCHED_FIFO`; the server started it. Do nothing                 |
 | ALSA      | the sink's own, blocking writes | try `SCHED_FIFO` through `pthread_setschedparam`; on `EPERM` run at normal priority and report the degradation (needs `RLIMIT_RTPRIO` or the `audio` group; document in build.md) |
 | AAudio    | AAudio's callback thread        | already elevated under `AAUDIO_PERFORMANCE_MODE_LOW_LATENCY`. Do nothing |
+| Wasm Audio Worklet | the browser's audio rendering thread | already the highest-priority context a page can get, and a browser offers no knob. `os_thread_set_realtime` returns `ENOTSUP` on wasm anyway (docs/web.md, the OS shim) |
 
 The sink's thread, where it has one, does exactly what `null_sink.c`'s does: wait, stamp,
 render, convert, hand over, account. Name it with `BWA_THREAD_NAME` so Tracy shows it.
@@ -620,7 +634,7 @@ its layout, and both bindings mirror the changes (`bindings/unity/Runtime/Bwa.cs
 ```c
 typedef enum { BWA_SINK_AUTO = 0, BWA_SINK_ASIO = 1, BWA_SINK_NULL = 2, BWA_SINK_MANUAL = 3,
                BWA_SINK_WASAPI = 4, BWA_SINK_COREAUDIO = 5, BWA_SINK_ALSA = 6, BWA_SINK_AAUDIO = 7,
-               BWA_SINK_JACK = 8,
+               BWA_SINK_JACK = 8, BWA_SINK_WORKLET = 9,
                BWA_SINK_FORCE_U32 = 0x7FFFFFFF } bwa_sink_type;
 ```
 
@@ -666,6 +680,7 @@ Per platform, and on Windows per requested channel count:
 | macOS    | CoreAudio, null                | CoreAudio, null             |
 | Linux    | JACK, ALSA, null               | JACK, ALSA, null            |
 | Android  | AAudio, null                   | null                        |
+| Browser  | Wasm Audio Worklet, null       | null                        |
 
 This is the one behavior change: a headphone profile on Windows under AUTO opens the
 Windows default output instead of the first registered ASIO driver. That is the device the
@@ -1061,6 +1076,55 @@ reflection bed rather than the fallback pan. The DSP is scalar C with no SSE int
 all: phonon links statically, so it lands inside `libbw_audio.so` and neither package gains a file.
 It costs size. The stripped arm64 library goes from 0.4 MB to 7.0 MB.
 
+### Wasm Audio Worklet
+
+The browser, through Emscripten's Wasm Audio Worklets. `src/sink/worklet_sink.c`, and
+[web.md](./web.md) is the document that owns the platform.
+
+It is the easiest customer the fixed-quantum adapter will ever have. An AudioWorklet's `process()`
+gets 128 frames, always, and 128 divides every sensible block size, so one rendered engine block
+feeds exactly `block / 128` callbacks with no partial slot. The output buffer is planar float
+already (`AudioSampleFrame.data` is `data[channel * samplesPerChannel + i]`), which is the bus
+layout, so the adapter's runs copy straight out with no conversion and no interleave. That is the
+same property the JACK sink has.
+
+**Stereo only**, said at the open. A page can build a wide AudioContext and none of the array
+profiles has a transport there, so AUTO sends anything wider to the offline sink, the way Android
+does.
+
+**Every `webaudio.h` call runs on the browser main thread**, and two facts force it: `new
+AudioContext()` needs a `Window`, which a Worker global scope is not, and Emscripten's handle
+table (`emAudio` in `libwebaudio.js`) is an ordinary per-thread JavaScript variable, so a handle
+minted on one thread means nothing on another. None of it is proxied by Emscripten. The sink
+proxies its own setup with `emscripten_proxy_sync` and calls through directly when it is already
+there. Nothing in the render path proxies anything.
+
+**`device` is a decimal AudioContext handle**, not a name, the same shape AAudio's decimal Android
+device id takes. A page creates its AudioContext inside its own user-gesture handler, registers it
+with `emscriptenRegisterAudioObject`, and hands the engine the number. NULL lets the sink create
+one. The page keeps the right to resume it, which matters because only a user gesture may.
+
+**A suspended context is a host-paced degradation, not a failure**, and on this platform it is the
+normal state: every page starts suspended and a suspended context renders no quanta at all, so
+`process()` is never called and the engine's dsp clock, playheads and fades would simply stop. Rule
+4 already has the answer for a device that went away, and this sink gives the same one: a
+host-paced thread paces silence so the clocks keep advancing, and `device_lost` says so.
+
+The handoff between that thread and the worklet is the one piece with no precedent in the other
+backends. Both pull the same `SinkQuant`, which is single-threaded by contract, so they share a
+**wait-free try-lock**: whoever finds it taken bails at once rather than waiting. The worklet
+writes one quantum of silence; the host thread skips one period. It is not a mutex and the audio
+thread never blocks, which is what keeps invariant 1. It is contended only in the single quantum
+where a context resumes or suspends, so bailing is the right answer rather than a cost. The host
+thread decides the worklet is live from a heartbeat the `process()` callback bumps, and stands
+down after eight quiet block periods.
+
+**Teardown has no thread to join.** Returning `false` from `process()` is the only "this processor
+is done" the API offers. `close()` sets a flag, destroys the node on the main thread (which stops
+the browser scheduling it), and then waits for the heartbeat to go quiet before it frees anything
+the callback touches. The wait is bounded, because a suspended context never calls `process()` at
+all and would otherwise hang the close forever.
+
 ## CMake
 
 | option               | default                         | effect                                                          |
@@ -1070,6 +1134,7 @@ It costs size. The stripped arm64 library goes from 0.4 MB to 7.0 MB.
 | `BWA_WITH_JACK`      | ON on Linux when `pkg-config jack` succeeds | compiles `jack_sink.c`, takes its INCLUDE DIRS only (the sink dlopens `libjack.so.0`), defines `BWA_HAVE_JACK` |
 | `BWA_WITH_ALSA`      | ON on Linux when `find_package(ALSA)` succeeds | compiles `alsa_sink.c`, takes its INCLUDE DIRS only (the sink dlopens `libasound.so.2`), defines `BWA_HAVE_ALSA` |
 | `BWA_WITH_AAUDIO`    | ON on `ANDROID`                 | compiles `aaudio_sink.c`, links `aaudio`, defines `BWA_HAVE_AAUDIO` |
+| `BWA_WITH_WORKLET`   | **OFF**, Emscripten only        | compiles `worklet_sink.c`, adds `-sAUDIO_WORKLET=1 -sWASM_WORKERS=1` to the link, defines `BWA_HAVE_WORKLET`. Off by default even on Emscripten, because those flags change `emscripten_get_now` into a per-scope runtime probe for every target that links the library and the CI leg must not pay for that. `tools/wasm/build-web.sh` turns it on; `tools/wasm/build-wasm.sh` does not |
 
 Every one of them is off on the other platforms and cannot be forced on.
 
@@ -1276,6 +1341,7 @@ what needs a device, and make the device-dependent part **skip visibly** rather 
 | 3 **(done, except phonon)** | AAudio sink; NDK toolchain wiring; `tools/android/run-tests.ps1`; the CI cross-build of both ABIs and both bindings' Android packaging. Phonon for Android is NOT done and is its own follow-up | phases 0 and 2 | a standalone headset (an emulator covered the code paths) | ~400 lines of sink and test, plus the toolchain and the packaging |
 | 4     | CoreAudio sink                                                         | phases 0 and 2                          | a Mac; the Digiface only for the optional 26-channel check | ~450 lines |
 | 5 **(done)** | JACK sink, then ALSA sink                                        | phase 2                                 | a Linux box with a card, and one with PipeWire; the AES67 daemon and an AES67-mode Dante receiver for the array check | ~250 lines JACK, ~400 lines ALSA |
+| 6 **(done)** | Wasm Audio Worklet sink; the `BWA_SINK_WORKLET` enum value; `sink.c`'s browser AUTO entry; `bindings/web` and `tools/wasm/build-web.sh` | phase 2, and the wasm spike in [web.md](./web.md) | a browser, and a headless Chromium is enough: `ctest -R web_browser` drives the sink end to end and skips where there is none. Nobody has LISTENED to it yet | ~450 lines of sink, ~900 of binding |
 
 Phase 1 goes first because it fixes a live defect, removes a dependency for every desk user,
 and is the PC VR path. Phase 2 is independent of it and can run in parallel; it is mechanical

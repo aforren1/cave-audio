@@ -148,6 +148,16 @@ if(BWA_BUILD_TESTS)
         FIXTURES_REQUIRED godot_project)
     endforeach()
 
+    # minimal.tscn is the Godot copy of examples/minimal.c, and the only demo scene meant to
+    # be RUN BY HAND as well as by ctest. It ships on the AUTO sink for that reason, so the
+    # test asks for the offline one explicitly rather than relying on a runner having no
+    # device. Its lap is six seconds of wall time, hence the roomier timeout.
+    add_test(NAME godot_minimal
+      COMMAND "${BWA_GODOT_EXE}" --headless --path "${CMAKE_CURRENT_SOURCE_DIR}"
+              "res://demo/minimal.tscn" -- "--tests")
+    set_tests_properties(godot_minimal PROPERTIES TIMEOUT 180
+      FIXTURES_REQUIRED godot_project)
+
     # The API surface runs on BOTH sinks, and neither run is redundant. MANUAL has no audio
     # thread, so blocks advance only when the scene pumps them and the assertions can be
     # exact — but nothing is concurrent there: one thread on the command ring, one thread on

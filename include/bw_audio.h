@@ -144,6 +144,9 @@ typedef enum { BWA_SINK_AUTO = 0, BWA_SINK_ASIO = 1, BWA_SINK_NULL = 2,
                BWA_SINK_JACK      = 8,  /* Linux   - a JACK2 server or PipeWire through
                                          * pipewire-jack; `device` is a PORT REGEX here, not a
                                          * device name (JACK has ports, not devices) */
+               BWA_SINK_WORKLET   = 9,  /* Browser - an Emscripten Wasm Audio Worklet. STEREO
+                                         * ONLY; `device` is a decimal AudioContext HANDLE, not a
+                                         * name (Web Audio enumerates no output devices) */
                BWA_SINK_FORCE_U32 = 0x7FFFFFFF } bwa_sink_type;
 
 /* bwa_desc.sink_flags bits. All three are opt-in, and all three trade something a shared,

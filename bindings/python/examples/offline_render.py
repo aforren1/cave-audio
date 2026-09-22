@@ -25,6 +25,7 @@ import wave
 import numpy as np
 
 import bw_audio as bwa
+import stimulus
 
 SR = 48000
 BLK = 256
@@ -32,7 +33,11 @@ SECONDS = 2.0
 
 
 def render(profile, seconds=SECONDS, sample_rate=SR, block_size=BLK):
-    """Render a 440 Hz source orbiting the listener. Returns (channels, frames) float32."""
+    """Render the shared click orbiting the listener. Returns (channels, frames) float32.
+
+    Same stimulus as `minimal.py` and `examples/minimal.c`, so a rendered file and a live run
+    are comparable by ear.
+    """
     e = bwa.Engine(profile=profile, sample_rate=sample_rate, block_size=block_size,
                    sink=bwa.SinkType.MANUAL)
     try:
@@ -41,8 +46,10 @@ def render(profile, seconds=SECONDS, sample_rate=SR, block_size=BLK):
         e.listener.set_pose(0.0, 1.5, 0.0)   # commit-gated, and this layer commits it for you
         e.start()
 
+        period = stimulus.click_period(sample_rate)
         nblocks = int(round(seconds * sample_rate / block_size))
         out = []
+        cursor = 0
         for b in range(nblocks):
             t0 = b * block_size
 
@@ -50,9 +57,12 @@ def render(profile, seconds=SECONDS, sample_rate=SR, block_size=BLK):
             angle = 2.0 * math.pi * (t0 / (seconds * sample_rate))
             src.set_pos(2.0 * math.sin(angle), 1.5, 2.0 * math.cos(angle))
 
-            # Feed the voice one block of tone, then pull one block of output.
-            i = np.arange(t0, t0 + block_size, dtype=np.float64)
-            src.push((0.25 * np.sin(2.0 * math.pi * 440.0 * i / sample_rate)).astype(np.float32))
+            # Feed the voice one block of the click period, wrapping, then pull one block out.
+            take = min(block_size, period.size - cursor)
+            src.push(period[cursor:cursor + take])
+            if take < block_size:
+                src.push(period[:block_size - take])
+            cursor = (cursor + block_size) % period.size
 
             block = e.render_block()
             out.append(np.array(block, copy=True))   # the view dies at the next render_block
@@ -112,18 +122,26 @@ def selftest():
     check("binaural render is finite", bool(np.all(np.isfinite(binaural))))
     check("binaural render is not silent", float(np.abs(binaural).max()) > 0.0)
 
-    cave = render(bwa.Profile.CAVE, seconds=0.25)
+    # One second is one lap AND four click periods, so a burst lands on each quarter turn.
+    cave = render(bwa.Profile.CAVE, seconds=1.0)
     check("cave render is the array width", cave.shape[0] >= 4, str(cave.shape))
     check("cave render is not silent", float(np.abs(cave).max()) > 0.0)
 
     # The whole reason this shape exists: the same calls twice give the same samples.
-    again = render(bwa.Profile.CAVE, seconds=0.25)
+    again = render(bwa.Profile.CAVE, seconds=1.0)
     check("the offline render is bit-identical run to run", np.array_equal(cave, again))
 
-    # A moving source must actually move, or the auto-commit is not doing its job.
-    front = cave[:, : BLK * 4]
-    back = cave[:, -BLK * 4:]
-    check("the source moved across the render", not np.allclose(front, back, atol=1e-6))
+    # A moving source must actually move, or the auto-commit is not doing its job. Compare the
+    # burst a quarter of the way round against the one three quarters round: opposite sides of
+    # the listener, so the loudest speaker cannot be the same one. Comparing the FIRST and LAST
+    # blocks instead would pass on a source that never moved, because both would be silence.
+    def loudest_at(t_seconds):
+        i = int(t_seconds * SR)
+        window = cave[:, i:i + SR // 100].astype(np.float64)
+        return int(np.argmax(np.sum(window * window, axis=1)))
+
+    check("the source moved across the render", loudest_at(0.25) != loudest_at(0.75),
+          "speaker {0} against {1}".format(loudest_at(0.25), loudest_at(0.75)))
 
     print("FAILURES: {0}".format(failures) if failures else "all checks passed")
     return 1 if failures else 0

@@ -27,6 +27,7 @@ static const char* backend_label(bwa_sink_type t) {
     case BWA_SINK_ALSA:      return "alsa";
     case BWA_SINK_AAUDIO:    return "aaudio";
     case BWA_SINK_JACK:      return "jack";
+    case BWA_SINK_WORKLET:   return "worklet";
     case BWA_SINK_NULL:      return "null";
     case BWA_SINK_MANUAL:    return "manual";
     default:                 return "auto";
@@ -52,6 +53,9 @@ uint32_t sink_device_count(bwa_sink_type backend) {
 #ifdef BWA_HAVE_AAUDIO
     case BWA_SINK_AAUDIO: return sink_aaudio_device_count();
 #endif
+#ifdef BWA_HAVE_WORKLET
+    case BWA_SINK_WORKLET: return sink_worklet_device_count();
+#endif
     default: return 0;   /* AUTO/NULL/MANUAL have no devices; so does a backend not built in */
     }
 }
@@ -73,6 +77,9 @@ bool sink_device_name(bwa_sink_type backend, uint32_t index, char* buf, uint32_t
 #endif
 #ifdef BWA_HAVE_AAUDIO
     case BWA_SINK_AAUDIO: return sink_aaudio_device_name(index, buf, cap);
+#endif
+#ifdef BWA_HAVE_WORKLET
+    case BWA_SINK_WORKLET: return sink_worklet_device_name(index, buf, cap);
 #endif
     default: (void)index; return false;
     }
@@ -99,6 +106,9 @@ bool sink_device_id(bwa_sink_type backend, uint32_t index, char* buf, uint32_t c
 #ifdef BWA_HAVE_AAUDIO
     case BWA_SINK_AAUDIO: return sink_aaudio_device_id(index, buf, cap);
 #endif
+#ifdef BWA_HAVE_WORKLET
+    case BWA_SINK_WORKLET: return sink_worklet_device_id(index, buf, cap);
+#endif
     default: (void)index; return false;
     }
 }
@@ -122,6 +132,9 @@ static bool backend_compiled(bwa_sink_type t) {
 #endif
 #ifdef BWA_HAVE_AAUDIO
     case BWA_SINK_AAUDIO: return true;
+#endif
+#ifdef BWA_HAVE_WORKLET
+    case BWA_SINK_WORKLET: return true;
 #endif
     default: return false;
     }
@@ -174,6 +187,11 @@ static bwa_sink* try_backend(bwa_sink_type backend, uint32_t sample_rate, uint32
     case BWA_SINK_AAUDIO:
         return bwa_aaudio_sink_open(sample_rate, block_size, channels, device, flags, exact_rate,
                                     render, user, msg, msgcap);
+#endif
+#ifdef BWA_HAVE_WORKLET
+    case BWA_SINK_WORKLET:
+        return bwa_worklet_sink_open(sample_rate, block_size, channels, device, flags, exact_rate,
+                                     render, user, msg, msgcap);
 #endif
     default:
         break;
@@ -241,6 +259,12 @@ bwa_sink* bwa_sink_open(uint32_t sample_rate, uint32_t block_size, uint32_t chan
     order[norder++] = BWA_SINK_ASIO;
 #elif defined(__APPLE__)
     order[norder++] = BWA_SINK_COREAUDIO;
+#elif defined(__EMSCRIPTEN__)
+    /* Before __linux__ and __APPLE__: Emscripten defines neither, but it DOES define __unix__ via
+     * its sysroot, and a plain elseif chain that reached a host-platform branch here would offer a
+     * backend no browser carries. A wider request falls straight through to the offline sink, the
+     * same answer Android gives for the same reason - a page has no array transport. */
+    if (channels <= 2) order[norder++] = BWA_SINK_WORKLET;
 #elif defined(__ANDROID__)
     if (channels <= 2) order[norder++] = BWA_SINK_AAUDIO;
 #elif defined(__linux__)

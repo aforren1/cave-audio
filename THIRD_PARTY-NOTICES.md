@@ -50,7 +50,13 @@ Everything else is in every platform's build of the library.
 `bwa_calibrate` and `bwa_zylia_probe` are console tools; they add nothing beyond
 the `bw_audio.dll` list.
 
-## MIT License (godot-cpp, Dear ImGui, ImPlot, ImPlot3D, cJSON)
+## In the web demo (GitHub Pages artifact)
+
+- **coi-serviceworker** — MIT (text below). Copyright (c) 2021 Guido Zuidhof. Vendored at
+  `bindings/web/deploy/coi-serviceworker.js`; it adds the COOP/COEP headers GitHub Pages cannot.
+  https://github.com/gzuidhof/coi-serviceworker
+
+## MIT License (godot-cpp, Dear ImGui, ImPlot, ImPlot3D, cJSON, coi-serviceworker)
 
 Permission is hereby granted, free of charge, to any person obtaining a copy of
 this software and associated documentation files (the "Software"), to deal in

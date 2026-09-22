@@ -243,8 +243,12 @@ The engine reports what it actually opened through `e.backend`, so check rather 
 ## Examples
 
 Each runs as a function, and each takes `--tests` for a self-check that forces an offline sink and
-exits nonzero on a failure. ctest runs all three under both interpreters.
+exits nonzero on a failure. ctest runs all four under both interpreters.
 
+- `examples/minimal.m` orbits a click around the listener's head for six seconds and quits. Start
+  here: it is the smallest realistic client, and every other binding of this engine ships the same
+  demo with the same stimulus, so the four are comparable by ear. See `docs/integration.md`,
+  "The minimal example".
 - `examples/offline_render.m` renders a moving source to a matrix and writes a wav, with no device.
   The manual sink is bit-identical run to run, which is what makes a pre-rendered stimulus set
   reproducible.

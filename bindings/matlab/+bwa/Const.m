@@ -35,6 +35,7 @@ classdef Const
         SINK_ALSA      = 6
         SINK_AAUDIO    = 7
         SINK_JACK      = 8
+        SINK_WORKLET   = 9
 
         % bwa_desc.sink_flags bits, for the PRIMARY device only.
         SINK_FLAG_EXCLUSIVE    = 1

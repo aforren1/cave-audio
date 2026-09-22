@@ -1,11 +1,13 @@
 # Web (WebAssembly)
 
-Status: **draft, and a spike stands behind it**. The engine core builds for wasm32 and the whole
-offline suite passes there. Steam Audio builds for wasm too, the HRTF decode test passes against
-it, and `tools/phonon/build-phonon.sh` builds and stages that phonon from one command. Nothing
-about the browser side is built: there is no AudioWorklet sink, no JS binding, and no web CI job.
-This note says what the spike measured, what was decided on top of it, and what a real web target
-would still have to do.
+Status: **the runtime is built and a browser runs it**. The engine core builds for wasm32 and the
+offline suite passes there. Steam Audio builds for wasm too and the HRTF decode test passes against
+it. On top of that there is now an AudioWorklet sink (`src/sink/worklet_sink.c`), a two-layer
+JavaScript binding (`bindings/web`) and a demo page. A headless Chromium drives the sink end to end
+and reports `worklet:1 (steam HRTF direct)` rendering at the audio clock, including the suspended
+and resumed handoff. What has NOT happened is a person listening to it: nothing here says the image
+is right, only that the path runs. Read
+[What is verified and what is not](#what-is-verified-and-what-is-not) for the exact line.
 
 Read [backends.md](./backends.md) for the sink contract first and
 [concurrency.md](./concurrency.md) for the audio-thread rules, because the interesting question on
@@ -39,11 +41,13 @@ sinks, and nothing else: no device backend, no shared library.
 | wasi-sdk 25, `wasm32-wasip1-threads` | builds the library and all 35 test and example binaries. **33 of 33 ctests pass** under wasmtime 27. |
 | Emscripten 6.0.10, `-pthread` | builds the same tree. **31 of 33 pass** under node: `os` times out and `idle` fails. Both are the main thread blocking, see below. Needs `-sSTACK_SIZE=1048576 -sDEFAULT_PTHREAD_STACK_SIZE=1048576`, which `tools/wasm/build-wasm.sh` passes; without them the same tree gives 13 of 33. |
 | Emscripten 6.0.10, `-pthread`, phonon staged | **35 of 38 pass** through `tools/wasm/build-wasm.sh` verbatim in the emsdk container, 2026-09-22. All five SDK-gated tests pass, the four simulator ones included (`reflect`, `bake`, `path`, `dynmesh`, `steam_decode`). The three failures are the same `os` and `idle`, plus `fuzz_api`: see [Steam Audio under wasm](#steam-audio-phonon-under-wasm). |
+| Emscripten 6.0.10, `-pthread`, phonon staged, **`-sPROXY_TO_PTHREAD`** | **36 of 38**, 2026-09-22, through `BWA_WASM_PROXY=1 tools/wasm/build-wasm.sh`. `idle` goes GREEN (1.63 s), which is the finding: main() on a pthread leaves the main thread's event loop running, and the asset loader's wake arrives. `os` still times out and `fuzz_api` still fails. |
+| Emscripten 6.0.10, `-pthread`, phonon staged, the WEB build | `bindings/web` links (`bw_audio.mjs` 120 kB, `bw_audio.wasm` 6.4 MB with a static phonon) and its **17 node tests pass**, 2026-09-22, through `tools/wasm/build-web.sh`. Null sink, manual sink, the generated raw layer against the module's real exports, and a manual-sink render that pins laterality. No browser was involved. |
 | Emscripten 6.0.10, no `-pthread` | builds and links. **13 of 33 pass**: `rt_create` fails, because `stream_set_create` cannot start its refill thread. |
 | zig cc 0.13 | compiles the DSP. No threads at all: see [Toolchains](#toolchains). |
 
-Every row is a **no-SDK** build. A with-SDK wasm build is further along than the rest of this note
-once implied and is not green yet, for a reason that has nothing to do with phonon: see
+The first two rows are **no-SDK** builds; the rest carry the wasm phonon. The one with-SDK red
+that is phonon's is the exception model: see
 [Steam Audio (phonon) under wasm](#steam-audio-phonon-under-wasm).
 
 The wasi run is the useful number, because it is the same suite the Linux and macOS jobs run at
@@ -211,6 +215,25 @@ loader's wake, both on the main thread, under node, which is the permissive case
 refuse outright. That measurement is why "control thread lives on a Worker" is part of the
 decision and not a recommendation inside it.
 
+**`-sPROXY_TO_PTHREAD` is the C-side proof of the same point, and it is measured.** It runs `main()`
+on a pthread and leaves the browser (or node) main thread free to run its event loop, which is
+exactly the shape the decision asks for. `tools/wasm/build-wasm.sh` takes `BWA_WASM_PROXY=1` for it.
+Numbers from one machine, same tree, same commit, both through the script verbatim in the
+`emscripten/emsdk:latest` container on 2026-09-22:
+
+| link | result |
+|------|--------|
+| without `-sPROXY_TO_PTHREAD` | 35 of 38. Failures: `os` (timeout), `idle`, `fuzz_api` |
+| with `-sPROXY_TO_PTHREAD`    | **36 of 38**. Failures: `os` (timeout), `fuzz_api` |
+
+So `idle` goes green and `os` does not. `idle` is the one that mattered: it is the asset loader's
+wake, the thing a page's asset path depends on, and it now arrives. `os` still times out, and the
+cause is NOT yet pinned - it is a hang rather than a lateness bound, and the per-test output was
+not captured on the run that produced these numbers. `fuzz_api` is unrelated and already explained
+under [Steam Audio (phonon) under wasm](#steam-audio-phonon-under-wasm): the wasm phonon is built
+with exceptions off, so a deliberately garbage SOFA file aborts the module. Do not hand a web host
+a user-supplied `bwa_desc.hrtf_path`.
+
 ### Considered and rejected: control on the audio thread (the kwaa shape)
 
 One module in the AudioWorklet, no shared memory, no `-pthread`. Control calls arrive by
@@ -258,32 +281,71 @@ Two things to watch:
 
 ## The AudioWorklet sink
 
-An AudioWorklet's `process()` gets **128 frames**, always, and that is not negotiable. The engine's
-block is 256 by default. You could set `bwa_desc.block_size` to 128 and skip the adapter entirely,
-and that is worth measuring, but do not design around it: 128 frames is 2.7 ms at 48 kHz, so every
-per-block cost in the mixer is paid twice as often, and with the SDK the HRTF decode is built for
-one frame size and silences any other.
+Built: `src/sink/worklet_sink.c`, `BWA_SINK_WORKLET`, behind the `BWA_WITH_WORKLET` CMake option.
+[backends.md](./backends.md) carries it in the contract's tables like every other backend; this
+section is the part that is specific to a browser.
 
-`src/sink/sink_quant.c` is exactly the seam for this, and it is the seam by design: it renders whole
-engine blocks into a ring of block-sized slots and serves the device any count. WASAPI shared mode,
-AAudio and CoreAudio all go through it for the same reason. An AudioWorklet sink is the easiest
-customer it will ever have, because 128 divides every sensible block size, so one rendered block
-feeds exactly `block_size / 128` callbacks with no partial slot.
+An AudioWorklet's `process()` gets **128 frames**, always. `src/sink/sink_quant.c` is the seam for
+that, and this is the easiest customer it will ever have: 128 divides every sensible block size, so
+one rendered engine block feeds exactly `block / 128` callbacks with no partial slot. The output
+buffer is planar float already (`AudioSampleFrame.data` is `data[channel * samplesPerChannel + i]`),
+which is the bus layout, so the adapter's runs copy straight out with no conversion and no
+interleave. The sink is small for that reason.
 
-So the sink is small: open, allocate the adapter, and in `process()` pull 128 frames per channel out
-of `sink_quant` into the output bus. It owns the timestamp pair like every other backend, and the
-two rules that travel with the adapter apply unchanged: one `system_time_ns` per rendered block even
-when several blocks land in one callback, and each stamp floored at the previous one plus a nominal
-block.
+Four decisions in it are worth reading before changing anything.
 
-What it reports for health is worth deciding up front rather than guessing. An AudioWorklet has no
-device position, so `device_pos_valid` is false, the same answer AAudio gives. The honest dropout
-signal is the render deadline: `currentTime` advancing by more than one quantum between callbacks.
-`AudioContext.baseLatency` and `outputLatency` are the output-latency inputs.
+**Where the Web Audio calls run.** On the browser main thread, always, and two facts force it:
+`new AudioContext()` needs a `Window`, which a Worker global scope is not, and Emscripten's handle
+table (`emAudio` in `libwebaudio.js`) is an ordinary per-thread JavaScript variable, so a handle
+minted on one thread means nothing on another. Emscripten proxies none of it: its own audio-worklet
+tests all call `emscripten_create_audio_context` from `main()` on the main thread, and there is no
+`PROXY_TO_PTHREAD` variant among them. The sink therefore proxies its setup with
+`emscripten_proxy_sync` and calls through directly when it is already there. This is also the
+reason the binding has two topologies; see [A JavaScript binding](#a-javascript-binding).
 
-Channel count: a page can ask for a wide `AudioContext`, but the array profiles have no transport
-here. Web is a **stereo** target. Treat anything wider the way Android's AAudio sink does: AUTO
-sends it to the offline sink and an explicit open says why.
+**The suspended context.** A browser starts an AudioContext suspended and only a user gesture may
+resume it. A suspended context renders no quanta at all, so `process()` is never called, so nothing
+pulls the adapter and the engine's dsp clock, playheads and fades would stop. That is not a device
+fault and must not read as one. Rule 4 already has the answer for a device that went away and the
+sink gives the same one: a host-paced thread paces silence so the clocks keep advancing, and
+`device_lost` says so. On this platform that is the NORMAL state until the button is pressed.
+
+The handoff between that thread and the worklet has no precedent in the other backends, because
+no other backend has two pullers. Both pull the same `SinkQuant`, which is single-threaded by
+contract, so they share a **wait-free try-lock**: whoever finds it taken bails immediately. The
+worklet writes one quantum of silence, the host thread skips one period. It is not a mutex and the
+audio thread never blocks, which is what keeps invariant 1. It is contended only in the single
+quantum where a context resumes or suspends. The host thread decides the worklet is live from a
+heartbeat `process()` bumps, and stands down after eight quiet block periods.
+
+**What it cannot measure, which is everything the device would have told you.** Web Audio exposes
+no xrun counter, no device position and no underrun signal. `currentFrame` in the processor scope
+advances by exactly one quantum per callback whether or not the output starved, and a browser
+renders several quanta back to back inside one system audio callback, so the "`currentTime`
+advanced by more than a quantum" rule this note proposed before the sink existed would
+false-positive on every ordinary batch. So `measured` is **false** and `device_pos_valid` is false:
+a zero dropout count means "cannot know". `late_blocks` and `render_ns_peak` come from the adapter
+and are real. `AudioContext.baseLatency + outputLatency` is the output latency, read once at open
+off the context object, because `webaudio.h` has no accessor for either.
+
+**The clock, and a trap that is invisible.** `sample_pos` is the adapter's own stream position, not
+`currentFrame`: rule 3 defines it as the frames handed to the device before this block, which is
+what the adapter counts, and while the node is connected `currentFrame` minus its value at the
+first callback IS that number. Reading it would cost a wasm-to-JS transition per quantum for a
+value the sink holds. The host half is `os_monotonic_ns` like every other backend, and here is the
+trap: under `-sAUDIO_WORKLET` Emscripten resolves `emscripten_get_now` PER SCOPE, and
+`AudioWorkletGlobalScope` has no `performance`, so the audio thread's monotonic clock falls back to
+`Date.now`. Same epoch as the control thread's `performance.timeOrigin + performance.now`, a
+thousand times coarser, and not guaranteed monotonic. The adapter's rule that a stamp never steps
+backward is load-bearing here rather than defensive.
+
+**Channel count**: stereo, said at the open. AUTO sends anything wider to the offline sink, the way
+Android's AAudio sink does.
+
+**Teardown** has no thread to join. Returning `false` from `process()` is the only "this processor
+is done" the API offers, so `close()` sets a flag, destroys the node on the main thread, and waits
+for the heartbeat to go quiet before freeing anything the callback touches. The wait is bounded,
+because a suspended context never calls `process()` and would otherwise hang the close forever.
 
 ## Which invariants survive
 
@@ -292,9 +354,11 @@ From CLAUDE.md's list:
 1. **No allocation, locks, syscalls or file I/O on the audio thread.** Survives, and half of it is
    free: an AudioWorklet has no file system to do I/O against. What you must not do is take the
    control-on-audio-thread shape and then pretend otherwise.
-2. **One control thread.** Survives, and needs a guard. JS makes it easy to call from the main
-   thread and a Worker in the same page. The Python binding already carries a runtime guard for
-   exactly this reason; a JS binding should carry the same one.
+2. **One control thread.** Survives, and in the `"worker"` topology it needs no guard: the engine
+   pointer exists only inside the control Worker, so a second caller has nothing to call with. The
+   Python binding needed a runtime guard because Python makes threads cheap inside one address
+   space; JavaScript's threads are separate realms, which turns the same rule into a structural
+   one. The `"main"` topology has no second thread to be wrong from either.
 3. **Audio thread owns DSP state.** Survives with shared memory. Meaningless without it.
 4. **Gains ramp, never jump.** Untouched. Pure DSP.
 5. **Generation counts gate handle reuse.** Untouched.
@@ -318,25 +382,158 @@ Two answers, and the second is better:
 Disk streaming (`src/core/stream.c`) has no direct equivalent. The nearest shape is a JS-side
 fetch that feeds a push source, which moves the refill cadence out of the engine.
 
-## A JS/TS binding
+## A JavaScript binding
 
-Mirror `bindings/python`'s two layers, for the same reason it has two:
+Built: `bindings/web`. Two layers, mirroring `bindings/python` for the reason it has two.
 
-- a **raw layer** that is the C ABI one for one, C names minus the `bwa_` prefix, C field names, C
-  units. It is what you debug against and what a generated binding can stay honest about.
-- a **thin idiomatic layer** over it: an `Engine` that owns the context and the worklet, `Source`,
-  `PushSource`, `Bed`, `Listener`, errors thrown from `bwa_result`.
+- **`src/raw.js` is the raw layer**: the C ABI one for one, C names minus the `bwa_` prefix, C
+  argument order, C units. The table it is built from is GENERATED out of `include/bw_audio.h` by
+  `tools/wasm/gen-abi.mjs` (167 entries), so a call cannot drift from the header, and
+  `tests/raw_layer.test.mjs` checks the generated table against the module's real wasm exports, so
+  the table cannot claim a symbol the engine does not carry. The same generator writes the
+  `-sEXPORTED_FUNCTIONS` list, which is also what forces the archive members into a static link.
+- **`src/engine.js` is the idiomatic layer**: `Engine`, `Sound`, `Source`, `PushSource`, `Bed`,
+  `Listener`, with the Python layer's auto-commit model. A commit-gated write lands at once unless
+  you are inside `frame()`, which defers to one commit at the block's exit.
 
-Two rules the other bindings learned the hard way apply here as written. Do not borrow a host name
-with a different unit: Web Audio speaks seconds everywhere, and the engine's frame-valued calls must
-keep saying `Frames` (see the Godot `get_output_latency` note in CLAUDE.md). And exclude
-`bwa_set_output_capture`: its callback runs on the audio thread, and a JS callback must never run
-there. The manual sink plus `bwa_render_block` is the offline path, the same exclusion the Python
-and MATLAB bindings make.
+`bwa_set_output_capture` is excluded from BOTH layers, so it is absent rather than
+present-and-broken. Its callback runs on the audio thread. The manual sink plus `renderBlock()` is
+the offline path, the same exclusion Python and MATLAB make.
 
-Async is the one genuinely new surface. Creating an `AudioContext` needs a user gesture, loading the
-worklet module is a promise, and so is fetching the wasm. The idiomatic layer should own all of that
-behind one `await Engine.create(...)` and leave the raw layer synchronous.
+Units follow the rule the Godot binding learned the hard way: Web Audio speaks seconds everywhere
+and the frame-valued calls keep saying frames (`seekFrames` beside `seekSeconds`).
+
+### The page talks to a Worker, and the frame is batched
+
+`src/client.js` is what a page imports. The idiomatic layer lives on the control thread and the
+page reaches it over `postMessage`, which was a choice between two options and is the cheaper one
+per frame.
+
+The per-frame path is a **SharedArrayBuffer frame slab plus one message**. `setPose` and
+`setPosition` write the slab in place and cost nothing; `pushFrame()` publishes with one atomic
+store and one small message, and the control side applies the whole frame inside a single
+`engine.frame()`, which is a single `CMD_COMMIT`. The alternative, proxying each raw call, puts one
+structured clone per call on that path: a frame with a pose and 32 sources is 33 messages, each
+landing on the Worker's task queue in its own turn, so one visual frame's writes reach the mixer
+spread across several audio blocks. That is the incoherence invariant 6 exists to prevent. Only
+sources that moved are written, and a sequence number makes a burst collapse to its newest state
+rather than replaying stale ones.
+
+Everything that is not per frame is a promise. `invoke(name, ...args)` reaches any of the 167 calls
+with the engine pointer supplied, which is why the ergonomic surface stays small.
+
+### Two topologies, and why the second one exists
+
+| topology | control thread | AudioWorklet sink |
+|----------|----------------|-------------------|
+| `"worker"` (default) | a dedicated module Worker | no |
+| `"main"` | the page's main thread | yes |
+
+`"worker"` is this note's decision, implemented: the engine pointer exists only inside the Worker,
+so invariant 2 is structural rather than guarded, and the control side may block, which it must.
+
+`"main"` exists because of the Emscripten property the sink section records: the AudioContext can
+only be created on the thread that owns the module's `Window`, and the handle table is per-scope.
+So the module instance that owns the sink must be the page's main-thread one, and today an audible
+page pays for its sound with the Worker control thread. What that costs: `destroy()` joins threads
+on the main thread (Emscripten busy-waits and pumps its queue, so it survives, but it is a stall),
+and a page that used async assets or streaming would meet the `idle` failure measured above.
+
+This is a deviation from the decision at the top of this note, taken knowingly and scoped to the
+one topology that needs it. Three ways out, none of them tried:
+
+1. Emscripten proxies its `webaudio.h` entry points to the main runtime thread. `worklet_sink.c`
+   already calls through `emscripten_proxy_sync`, so nothing in the C would change.
+2. `-sPROXY_TO_PTHREAD` with the control layer driven from the main-pthread, which needs the
+   binding's JavaScript to run in that pthread's Worker scope (`--pre-js` puts it there) and a C
+   trampoline to reach it. Measured to be the right shape for the engine, untried for the binding.
+3. Web Audio grows an AudioContext a Worker can create, which is a specification change.
+
+### Where the audio comes from
+
+The second of the two options this note weighed, and it needed no ABI: decode in JavaScript with
+`AudioContext.decodeAudioData` and feed the float samples to a **push source**. The demo page does
+exactly that, and falls back to a synthesized tone when no file is supplied so the page works with
+no asset served. A memory-buffer asset entry point is still not in the engine and is still not
+needed for this path.
+
+Pace the feed on the ring's own space (`bwa_source_push_space`), not on the animation frame: a
+background tab gets fewer frames and the audio thread does not slow down with it.
+
+### Build and test
+
+```
+tools/wasm/build-web.sh
+```
+
+It regenerates the raw layer from the header, configures with `BWA_WITH_WORKLET=ON
+BWA_BUILD_WEB=ON`, and stages a self-contained `bindings/web/dist/`: `bw_audio.mjs` (120 kB),
+`bw_audio.wasm` (6.4 MB with a static phonon), and the binding's JavaScript. No bundler and no
+server-side step. `node bindings/web/example/serve.mjs` serves it with the two isolation headers.
+
+The module is linked `-sENVIRONMENT=web,worker,node` so the SHIPPED artifact is the TESTED one:
+`ctest -R web_bindings` runs 17 node tests against it. `bindings/web/README.md` has the whole
+public surface.
+
+## What is verified and what is not
+
+Worth stating plainly, because the sink is the part a reader will most want to trust.
+
+**Verified**, on 2026-09-22, in the `emscripten/emsdk:latest` container (emcc 6.0.10) with the
+wasm32 phonon staged:
+
+- `worklet_sink.c` compiles clean at `-Wall -Wextra` and links into `bw_audio.mjs`.
+- the web module builds and its 17 node tests pass: the generated raw layer against the module's
+  own exports, engine create/start/stop/destroy on the null sink, the commit model, handle
+  generation gating, a push source's ring, and a manual-sink render that pins laterality with the
+  frame slab driving the position. The laterality test was BROKEN ON PURPOSE (the frame apply
+  disabled) and confirmed red before being trusted green.
+- the engine suite: 35 of 38 without `-sPROXY_TO_PTHREAD`, 36 of 38 with it.
+
+- **the AudioWorklet sink in a real browser**, through `bindings/web/tests/run-browser.mjs`, which
+  serves the page cross-origin isolated and drives it in headless Chrome 153. One run's notes:
+
+  ```
+  ok   cross-origin isolated
+  ok   AudioContext running at 48000 Hz
+  ok   backend "worklet:1 (steam HRTF direct)", sink type 9
+  ok   output latency 736 frames (context baseLatency 0.01, outputLatency 0)
+  ok   451 blocks in 2.43 s of wall time (2.41 s of audio)
+  ok   the render is paced by the audio clock
+  ok   device_lost is 0: the AudioWorklet is driving, not the host-paced fallback
+  ok   health.measured is false, as the backend promises
+  ok   suspended: 107 blocks in 600 ms, device_lost 1
+  ok   resumed:   112 blocks in 600 ms, device_lost 0
+  ok   destroy returned
+  ok   worker topology backend "null (steam HRTF direct)"
+  ok   worker topology rendered 111 blocks in 600 ms
+  ok   the worklet sink is not reachable from a Worker, as expected: AudioContext is not defined
+  ```
+
+  That covers the async setup chain, the node connect, `process()` on the AudioWorklet thread
+  pulling the adapter, the audio clock pacing the render, and the suspended-to-running handoff in
+  BOTH directions, which is the try-lock and the heartbeat. The last two lines are also what makes
+  the `device_lost is 0` assertion discriminating rather than decorative: the same page shows it
+  going to 1 under a real condition. It runs as `ctest -R web_browser` and SKIPS when it finds no
+  Chromium. The 736-frame latency is the context's own 10 ms plus the one block the adapter can
+  hold, which is also the check that the `baseLatency` read works at all: `sink.h` says 0 means
+  unknown. The last two lines are the DEFAULT topology, which node cannot reach: a real module
+  Worker holding the engine, the postMessage protocol, the frame slab across a thread boundary,
+  the engine's own threads as NESTED workers, and a `destroy()` that joins them from a Worker
+  rather than from the main thread. The last line is the two-topology split itself, MEASURED
+  rather than reasoned: opening `BWA_SINK_WORKLET` from the control Worker fails with
+  `AudioContext is not defined`. Note that the check has to START the engine, not just create it:
+  no sink is opened until `bwa_start`, so a create that resolves proves nothing.
+- **the example page loads**, served by `example/serve.mjs` and dumped from headless Chrome: the
+  page is cross-origin isolated, its module script imports `dist/index.js` without throwing, and
+  the start button is there. The click path itself is the same code the check above drives.
+
+**Not verified**: that it sounds right. Nobody has listened. A headless browser has no speaker, so
+what the check proves is that the path runs and is paced by the audio clock, not that the HRTF
+image is correct - and the wasm build uses phonon's real HRTF, so a by-ear pass is worth having.
+Also unverified: the `baseLatency` read (headless Chrome reports one, but not one anybody has
+compared against a stopwatch), the `Date.now` clock fallback's effect on `bwa_get_clock_model`, and
+anything on a browser that is not Chromium.
 
 ## Hosting
 
@@ -362,6 +559,21 @@ hosting rule.
 There is deliberately **no non-isolated fallback build**. A page that silently drops to the
 single-threaded shape looks like the real thing and is not, which is the one outcome worse than
 refusing to start.
+
+The demo is hosted on GitHub Pages, which cannot set either header, so the site carries a service
+worker that adds them to every response it serves (coi-serviceworker, vendored under
+`bindings/web/deploy/`). Every page registers it and reloads once, and `crossOriginIsolated` is
+true from the second load on: measured in headless Edge against a server that sends no headers,
+including a cold deep link into `example/`. `.github/workflows/pages.yml` builds the wasm engine
+and phonon in the `emscripten/emsdk` container on every push to main, stages the artifact with
+`bindings/web/deploy/stage.sh` (the site root mirrors `bindings/web`: `dist/` and `example/` side
+by side, the shell and the worker at the root) and deploys it to
+`https://aforren1.github.io/cave-audio/`.
+
+The worker does not soften the CORP rule, it moves it. Every asset the pages load has to be
+same-origin or send `Cross-Origin-Resource-Policy`, so the artifact vendors what it needs and
+loads nothing from a CDN. A three.js page vendors three.js. `bindings/web/deploy/README.md` states
+the rule and `stage.sh` warns when the staged tree breaks it.
 
 ## What a no-SDK web build loses
 
@@ -504,23 +716,49 @@ Note what phonon costs here: `libphonon.a` alone is 6.9 MB, and on Android a sta
 stripped library from 0.4 MB to 7.0 MB. A 7 MB wasm download is a different proposition from a 7 MB
 `.so` on a headset.
 
-## What would have to be built
+## What is left
 
-In order, smallest first:
+In order, and the first three are no longer on this list because they are built.
 
-1. **An AudioWorklet sink** over `sink_quant`, stereo only, behind `BWA_HAVE_AUDIOWORKLET` and
-   inside its own `*_sink.c` like every other backend. Nothing outside that file changes.
-2. **A memory-buffer asset entry point**, or the decision to route every asset through the push
-   feed instead. Pick one; do not leave both half-done.
-3. **A JS/TS binding**, two layers, with the one-control-thread runtime guard.
-4. **A CI job.** The wasi leg is the cheap one and already gives a real signal: it runs the same 33
-   ctests the Linux job runs. Add it before the browser work, not after.
-5. **phonon**, if the HRTF is wanted, and it is further along than expected: it builds, it links,
-   and all five SDK-gated tests pass with `-pthread` on both sides, the simulator paths included.
-   The recipe is wired into `tools/phonon/build-phonon.sh` and the flatbuffers patch is in
-   `third_party/patches/`. What is left is the exception model (`fuzz_api`, above: a phonon
-   rebuild with `-fwasm-exceptions` on both halves) and the CI side of it (a `wasm32` cache key,
-   and a job that calls the script).
+1. **Listen to it.** The headless check proves the path runs; it cannot say the image is right,
+   and the wasm build carries phonon's real HRTF, so a by-ear pass on a page is worth having. It
+   is the same open item `docs/hardware-validation.md` holds for the desktop headphone path.
+2. **The control thread for the audible topology.** Today `SinkType.WORKLET` needs the module on
+   the page's main thread, which is a deviation from the decision at the top of this note. The
+   three ways out are named under
+   [Two topologies](#two-topologies-and-why-the-second-one-exists).
+3. **A CI job.** The wasi leg is the cheap one and already gives a real signal: it runs the same
+   suite the Linux job runs. The web leg is `tools/wasm/build-web.sh` plus `ctest -R web_bindings`,
+   which needs only node.
+4. **`os` under `-sPROXY_TO_PTHREAD`.** It times out rather than failing a bound, and the cause is
+   not pinned. It is the one red that is not explained.
+5. **The phonon exception model.** `fuzz_api` aborts the module on a garbage SOFA file because the
+   wasm phonon is built with exceptions off. The likely fix is `-fwasm-exceptions` on both halves,
+   which is a phonon rebuild and was not tried. Until it is, a web host must not pass a
+   user-supplied file as `bwa_desc.hrtf_path`.
+6. **A memory-buffer asset entry point**, or the decision that the push feed is the answer. The
+   binding took the push feed, so this is now a question about streaming and about
+   `bwa_load_sound`, not about whether a page can play a wav.
+
+## What the runtime added
+
+On top of [What the spike changed](#what-the-spike-changed) below.
+
+- `src/sink/worklet_sink.c`: the backend, and the only new file in `src/`.
+- `src/sink/sink.h`, `src/sink/sink.c`: the declarations, the dispatch, the device query and the
+  browser AUTO entry. One `#elif defined(__EMSCRIPTEN__)` branch, placed BEFORE the `__linux__` and
+  `__APPLE__` ones because Emscripten's sysroot defines `__unix__` and a plain chain would offer a
+  backend no browser carries.
+- `include/bw_audio.h`: `BWA_SINK_WORKLET = 9`, appended.
+- `CMakeLists.txt`: the `BWA_WITH_WORKLET` block. OFF by default even on Emscripten, because
+  `-sAUDIO_WORKLET` pulls in `-sWASM_WORKERS` and changes `emscripten_get_now` for every target
+  that links the library, and the CI leg must not pay for that.
+- `cmake/bwa_bindings.cmake`, `bindings/web/CMakeLists.txt`: a fourth binding, opt-in and
+  Emscripten-only.
+- `bindings/web/`: the two layers, the transport, the example page, the node suite, the README.
+- `tools/wasm/gen-abi.mjs`: the raw layer and the export list, generated from the header.
+- `tools/wasm/build-web.sh`: the one recipe for a shippable `dist/`.
+- `tools/wasm/build-wasm.sh`: `BWA_WASM_PROXY` for the `-sPROXY_TO_PTHREAD` measurement.
 
 ## What the spike changed
 

@@ -1,0 +1,178 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>bw_audio - orbiting source</title>
+<style>
+  :root { color-scheme: light dark; }
+  body { font: 14px/1.5 system-ui, sans-serif; margin: 0; padding: 24px; max-width: 46rem; }
+  h1 { font-size: 1.2rem; margin: 0 0 .25rem; }
+  p.sub { margin: 0 0 1.25rem; opacity: .7; }
+  button { font: inherit; padding: .5rem 1rem; }
+  table { border-collapse: collapse; margin-top: 1rem; width: 100%; }
+  th, td { text-align: left; padding: .2rem .6rem .2rem 0; font-variant-numeric: tabular-nums; }
+  th { font-weight: 600; opacity: .7; width: 12rem; }
+  #log { white-space: pre-wrap; margin-top: 1rem; opacity: .8; }
+  .bad { color: #c0392b; }
+</style>
+</head>
+<body>
+<h1>bw_audio on the web</h1>
+<p class="sub">One source orbiting your head, rendered by the engine's binaural profile through a
+Wasm Audio Worklet. Headphones.</p>
+
+<p>
+  <button id="go">Start (needs a click: a browser resumes an AudioContext only from a gesture)</button>
+  <label style="margin-left:1rem">wav <input id="file" type="file" accept="audio/*"></label>
+</p>
+
+<table id="stats"></table>
+<div id="log"></div>
+
+<!-- GitHub Pages cannot send COOP/COEP, so the deploy overlay puts coi-serviceworker.js at the
+     site root and every page registers it before touching SharedArrayBuffer. Under
+     example/serve.mjs the headers are real and this 404s harmlessly. -->
+<script src="../coi-serviceworker.js"></script>
+<script type="module">
+import { BwaEngine, Profile } from "../dist/index.js";
+
+const logEl = document.getElementById("log");
+const statsEl = document.getElementById("stats");
+const log = (s, bad) => { logEl.innerHTML += (bad ? `<span class="bad">${s}</span>` : s) + "\n"; };
+
+if (!globalThis.crossOriginIsolated) {
+  log("This page is NOT cross-origin isolated, so SharedArrayBuffer is unavailable and the " +
+      "engine cannot run its two-thread model. Serve it with bindings/web/example/serve.mjs, " +
+      "which sets the two headers. There is deliberately no single-threaded fallback.", true);
+}
+
+let engine = null;
+let pcm = null;          /* the mono sample the push source is fed from */
+let readPos = 0;
+
+/* THE minimal-example stimulus, the same one every binding's minimal example plays
+ * (docs/integration.md, "The minimal example"): one 250 ms period holding a 2 ms Hann-windowed
+ * noise burst at -12 dBFS, then silence, so four clicks a second. A click and not a tone because
+ * the cues that place a source in elevation and front to back live in the spectrum. The noise is
+ * a hand-spelled LCG rather than Math.random so the six copies are sample-identical; the Hann
+ * divisor is N-1 and the normalize-to-peak pass is part of the spec. A wav dropped on the file
+ * input replaces it, decoded by decodeAudioData: the browser's own decoder hands back float
+ * samples and the engine's PUSH SOURCE takes them, so the ABI needs no memory-buffer asset call. */
+function synthesize(rate) {
+  const period = Math.round(rate * 0.25);
+  const burst = Math.round(rate * 0.002);
+  const out = new Float32Array(period);
+  let state = 12345;
+  let peak = 0;
+  const b = new Float64Array(burst);
+  for (let i = 0; i < burst; ++i) {
+    state = (Math.imul(state, 1664525) + 1013904223) >>> 0;
+    const u = ((state >>> 8) & 0xffffff) / 8388608.0 - 1.0;
+    const w = 0.5 - 0.5 * Math.cos((2 * Math.PI * i) / (burst - 1));
+    b[i] = w * u;
+    peak = Math.max(peak, Math.abs(b[i]));
+  }
+  const scale = 0.251189 / peak;                  /* -12 dBFS exactly at the peak sample */
+  for (let i = 0; i < burst; ++i) out[i] = b[i] * scale;
+  return out;
+}
+
+document.getElementById("file").addEventListener("change", async (ev) => {
+  const f = ev.target.files[0];
+  if (!f) return;
+  const ctx = new AudioContext();
+  const buf = await ctx.decodeAudioData(await f.arrayBuffer());
+  /* The engine's sources are MONO: fold whatever the file has. The spatialization is the
+   * engine's job and a stereo asset would only fight it. */
+  const n = buf.length;
+  const mix = new Float32Array(n);
+  for (let c = 0; c < buf.numberOfChannels; ++c) {
+    const ch = buf.getChannelData(c);
+    for (let i = 0; i < n; ++i) mix[i] += ch[i] / buf.numberOfChannels;
+  }
+  await ctx.close();
+  pcm = mix;
+  readPos = 0;
+  log(`loaded ${f.name}: ${n} frames at ${buf.sampleRate} Hz`);
+});
+
+document.getElementById("go").addEventListener("click", async () => {
+  document.getElementById("go").disabled = true;
+  try {
+    /* The AudioContext is created HERE, inside the gesture handler, and the page keeps it: the
+     * engine's worklet sink adopts it by handle (bwa_desc.device) rather than making one of its
+     * own, so resuming it stays the page's business. */
+    const ctx = new AudioContext({ latencyHint: "interactive" });
+    await ctx.resume();
+
+    engine = await BwaEngine.create({
+      audioContext: ctx,              /* selects SinkType.WORKLET and the "main" topology */
+      profile: Profile.BINAURAL,
+      blockSize: 256,
+    });
+    log(`engine ${engine.info.sampleRate} Hz, block ${engine.info.blockSize}, ` +
+        `${engine.info.channelCount} ch, backend "${engine.info.backend}"`);
+    if (engine.info.lastError) log(`open note: ${engine.info.lastError}`);
+
+    if (!pcm) pcm = synthesize(engine.info.sampleRate);
+
+    const src = await engine.createPushSource();
+    await src.setGain(1.0);
+    await engine.start();
+    log(`started; context "${ctx.state}", output latency ${engine.info.outputLatencyFrames} frames`);
+
+    /* The listener stands at ear height looking down +Z (BWA_ROOM_AHEAD), identity orientation:
+     * the same pose every binding's minimal example uses. */
+    engine.listener.setPose(0, 1.5, 0, 0, 0, 0, 1);
+
+    const chunk = new Float32Array(1024);
+    const t0 = performance.now();
+    const tick = async () => {
+      if (!engine) return;
+      /* Feed the ring. Pace on the ring's own space rather than on the frame rate: a tab in the
+       * background gets fewer animation frames and the audio thread does not slow down with it. */
+      let space = await src.space();
+      while (space >= chunk.length) {
+        for (let i = 0; i < chunk.length; ++i) {
+          chunk[i] = pcm[readPos];
+          readPos = (readPos + 1) % pcm.length;
+        }
+        await src.push(chunk);
+        space -= chunk.length;
+      }
+
+      /* One lap every 6 seconds, 2 m out, at ear height: x = 2 sin(a), y = 1.5, z = 2 cos(a),
+       * the orbit every minimal example shares. +X is left for an identity listener, so it starts
+       * dead ahead and passes the LEFT ear first. */
+      const a = ((performance.now() - t0) / 6000) * Math.PI * 2;
+      src.setPosition(Math.sin(a) * 2, 1.5, Math.cos(a) * 2);
+      engine.pushFrame();               /* one message, one commit: the frame is coherent */
+
+      requestAnimationFrame(tick);
+    };
+    requestAnimationFrame(tick);
+
+    setInterval(async () => {
+      if (!engine) return;
+      const h = await engine.health();
+      const rows = [
+        ["AudioContext state", ctx.state],
+        ["blocks rendered", h.blocks],
+        ["xruns (measured?)", `${h.xruns} (${h.measured ? "yes" : "no - Web Audio reports none"})`],
+        ["dropped frames", h.droppedFrames],
+        ["late blocks", h.lateBlocks],
+        ["stream starves", h.streamStarves],
+        ["peak load", h.peakLoad.toFixed(3)],
+        ["device_lost (host-paced)", h.deviceLost],
+        ["active voices", await engine.invoke("get_active_voices")],
+        ["dsp time (frames)", await engine.invoke("get_dsp_time_frames")],
+      ];
+      statsEl.innerHTML = rows.map(([k, v]) => `<tr><th>${k}</th><td>${v}</td></tr>`).join("");
+    }, 250);
+  } catch (err) {
+    log(String(err && err.message ? err.message : err), true);
+  }
+});
+</script>
+</body>
+</html>

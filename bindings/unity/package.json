@@ -10,5 +10,12 @@
   "licensesUrl": "https://github.com/aforren1/cave-audio/blob/main/LICENSE",
   "documentationUrl": "https://github.com/aforren1/cave-audio/blob/main/docs/integration.md",
   "changelogUrl": "https://github.com/aforren1/cave-audio/blob/main/bindings/unity/CHANGELOG.md",
-  "hideInEditor": false
+  "hideInEditor": false,
+  "samples": [
+    {
+      "displayName": "Minimal orbit",
+      "description": "A click orbits the listener's head for six seconds. Synthesizes its own stimulus, so it needs no audio asset. The same demo every other binding ships.",
+      "path": "Samples~/MinimalOrbit"
+    }
+  ]
 }

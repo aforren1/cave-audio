@@ -18,6 +18,11 @@
 #                        Leave it empty to build only.                    (default: empty)
 #   BWA_WASM_BUILD_DIR   where to build.                     (default: build-wasm-$TOOLCHAIN)
 #   BWA_WASM_MAX_MEMORY  the shared-memory ceiling in bytes, wasi only.   (default: 512 MB)
+#   BWA_WASM_PROXY       1 = link the emsdk executables with -sPROXY_TO_PTHREAD, so main() runs on
+#                        a pthread and the browser (or node) main thread keeps its event loop.
+#                        This is the shape docs/web.md's decision requires of a page - the control
+#                        side must not be the main thread - and it is what turns the `os` and
+#                        `idle` failures green. emsdk only.                    (default: empty)
 #   CMAKE_MAKE_PROGRAM   a ninja binary, when ninja is not on PATH. Forwarded to the configure,
 #                        because a toolchain file that sets CMAKE_FIND_ROOT_PATH_MODE_PROGRAM cannot
 #                        be relied on to find one that only a shell PATH knows about. A Windows host
@@ -53,6 +58,12 @@ case "$BWA_WASM_TOOLCHAIN" in
       -DCMAKE_BUILD_TYPE=Release $MAKE_PROGRAM_FLAG
     ;;
   emsdk)
+    # PROXY_TO_PTHREAD is the measured difference between the two emsdk rows in docs/web.md. Both
+    # failures it fixes are the SAME finding: os_sleep_ms and os_event_wait block, and a blocked
+    # main thread is a slow test under node and a hard error in a browser. With it, main() runs on
+    # a pthread and both go green. The pool grows by one, because main now occupies a slot.
+    PROXY_FLAGS=""
+    if [ -n "${BWA_WASM_PROXY:-}" ]; then PROXY_FLAGS="-sPROXY_TO_PTHREAD"; fi
     # emcmake supplies the toolchain file and sets CMAKE_CROSSCOMPILING_EMULATOR to its own node,
     # so ctest runs the suite with no further help. ALLOW_MEMORY_GROWTH is emscripten's spelling of
     # the --max-memory headroom the wasi side needs for the same reason: a shared memory that
@@ -64,7 +75,7 @@ case "$BWA_WASM_TOOLCHAIN" in
     # point CMAKE_MAKE_PROGRAM at one.
     emcmake cmake -S . -B "$BWA_WASM_BUILD_DIR" -G Ninja -DCMAKE_BUILD_TYPE=Release $MAKE_PROGRAM_FLAG \
       -DCMAKE_C_FLAGS="-pthread" -DCMAKE_CXX_FLAGS="-pthread" \
-      -DCMAKE_EXE_LINKER_FLAGS="-pthread -sALLOW_MEMORY_GROWTH=1 -sPTHREAD_POOL_SIZE=8 -sEXIT_RUNTIME=1 -sSTACK_SIZE=1048576 -sDEFAULT_PTHREAD_STACK_SIZE=1048576"
+      -DCMAKE_EXE_LINKER_FLAGS="-pthread -sALLOW_MEMORY_GROWTH=1 -sPTHREAD_POOL_SIZE=9 -sEXIT_RUNTIME=1 -sSTACK_SIZE=1048576 -sDEFAULT_PTHREAD_STACK_SIZE=1048576 $PROXY_FLAGS"
     ;;
   *)
     echo "BWA_WASM_TOOLCHAIN must be wasi or emsdk, got '$BWA_WASM_TOOLCHAIN'"; exit 1 ;;

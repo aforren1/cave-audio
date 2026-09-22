@@ -165,7 +165,7 @@ if(BWA_BUILD_TESTS)
              COMMAND "${Matlab_MAIN_PROGRAM}" -batch "exit(run_tests())")
     set_tests_properties(matlab_tests PROPERTIES
       WORKING_DIRECTORY "${BWA_M_TESTS_DIR}" TIMEOUT 900 SKIP_RETURN_CODE 77)
-    foreach(ex offline_render live_onset AudioTunnel3DDemo_bwa)
+    foreach(ex minimal offline_render live_onset AudioTunnel3DDemo_bwa)
       add_test(NAME matlab_example_${ex}
                COMMAND "${Matlab_MAIN_PROGRAM}" -batch "exit(${ex}('--tests'))")
       set_tests_properties(matlab_example_${ex} PROPERTIES
@@ -178,7 +178,7 @@ if(BWA_BUILD_TESTS)
              COMMAND "${BWA_OCTAVE_CLI}" --no-gui --quiet --eval "exit(run_tests())")
     set_tests_properties(octave_tests PROPERTIES
       WORKING_DIRECTORY "${BWA_M_TESTS_DIR}" TIMEOUT 900 SKIP_RETURN_CODE 77)
-    foreach(ex offline_render live_onset AudioTunnel3DDemo_bwa)
+    foreach(ex minimal offline_render live_onset AudioTunnel3DDemo_bwa)
       add_test(NAME octave_example_${ex}
                COMMAND "${BWA_OCTAVE_CLI}" --no-gui --quiet --eval "exit(${ex}('--tests'))")
       set_tests_properties(octave_example_${ex} PROPERTIES

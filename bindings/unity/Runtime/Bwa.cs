@@ -67,7 +67,7 @@ namespace BwAudio
     public enum BwaSinkType : int
     {
         Auto = 0, Asio = 1, Null = 2, Manual = 3,
-        Wasapi = 4, CoreAudio = 5, Alsa = 6, AAudio = 7, Jack = 8
+        Wasapi = 4, CoreAudio = 5, Alsa = 6, AAudio = 7, Jack = 8, Worklet = 9
     }
 
     /// <summary>Mirrors the BWA_SINK_FLAG_* bits for BwaDesc.sinkFlags. None of them reaches the

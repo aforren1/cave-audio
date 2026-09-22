@@ -1,0 +1,207 @@
+<!doctype html>
+<!--
+  browser.html - the self-checking page run-browser.mjs drives in headless Chrome.
+
+  It is the only test in this binding that exercises the AudioWorklet sink, because the sink needs
+  a browser and node has no Web Audio. What it proves, and the list is deliberately short because
+  a headless browser has no speaker to listen to:
+
+    - the async setup chain completes: worklet thread, processor, node, connect;
+    - process() is really being called on the AudioWorklet thread, which is what pulls the
+      fixed-quantum adapter and therefore what makes the engine render at all;
+    - the HOST-PACED fallback stood down, which is the `device_lost == 0` assertion. That is the
+      one that distinguishes "the worklet is driving" from "the sink is pacing silence because the
+      context never started", and both produce blocks;
+    - the render is paced by the AUDIO clock and not by a runaway host thread, which is the
+      elapsed-versus-rendered check.
+
+  It posts its verdict back to the runner's server, because a headless browser has no other way to
+  tell a script what it found.
+-->
+<html lang="en">
+<head><meta charset="utf-8"><title>bw_audio browser check</title></head>
+<body>
+<pre id="out">running</pre>
+<script type="module">
+import { BwaEngine, Profile } from "../dist/index.js";
+
+const notes = [];
+const fail = (m) => { notes.push("FAIL " + m); };
+const ok = (m) => { notes.push("ok   " + m); };
+
+async function main() {
+  if (!globalThis.crossOriginIsolated) throw new Error("not cross-origin isolated");
+  ok("cross-origin isolated");
+
+  /* --autoplay-policy=no-user-gesture-required lets this run with no click. A real page must do
+   * it from a gesture handler; see example/index.html. */
+  const ctx = new AudioContext({ latencyHint: "interactive" });
+  await ctx.resume();
+  if (ctx.state !== "running") fail(`the AudioContext is "${ctx.state}", not running`);
+  else ok(`AudioContext running at ${ctx.sampleRate} Hz`);
+
+  const engine = await BwaEngine.create({
+    audioContext: ctx,
+    profile: Profile.BINAURAL,
+    blockSize: 256,
+  });
+  ok(`engine up: ${engine.info.sampleRate} Hz, block ${engine.info.blockSize}`);
+
+  const src = await engine.createPushSource();
+  await engine.start();
+  /* AFTER start, not before: no sink is open until bwa_start, so bwa_get_audio_backend reads
+   * "none" until then and an assertion placed above would be testing nothing. */
+  ok(`backend "${engine.info.backend}", sink type ${engine.info.sinkType}`);
+  if (!/^worklet/.test(engine.info.backend))
+    fail(`the worklet sink did not open: "${engine.info.backend}"`);
+  if (engine.info.sinkType !== 9) fail(`sink type ${engine.info.sinkType}, expected 9 (WORKLET)`);
+  if (engine.info.lastError) ok(`open note: ${engine.info.lastError}`);
+  /* Rule 5, and the only line in the sink that runs JavaScript of its own: baseLatency +
+   * outputLatency read off the context object, because webaudio.h has no accessor. 0 means
+   * "unknown" per sink.h, so a nonzero here is what says the read worked. */
+  ok(`output latency ${engine.info.outputLatencyFrames} frames ` +
+     `(context baseLatency ${ctx.baseLatency}, outputLatency ${ctx.outputLatency})`);
+  if (!engine.info.outputLatencyFrames)
+    fail("output_latency is 0: the baseLatency read did not work");
+  engine.listener.setPose(0, 0, 0, 0, 0, 0, 1);
+  src.setPosition(0, 0, 2);
+  engine.pushFrame();
+
+  /* Feed a tone so the render has something to do. Tones, never DC. */
+  const rate = engine.info.sampleRate;
+  let phase = 0;
+  const chunk = new Float32Array(1024);
+  const feed = async () => {
+    let space = await src.space();
+    while (space >= chunk.length) {
+      for (let i = 0; i < chunk.length; ++i) {
+        chunk[i] = 0.3 * Math.sin(2 * Math.PI * 440 * (phase++ / rate));
+      }
+      await src.push(chunk);
+      space -= chunk.length;
+    }
+  };
+
+  const t0 = performance.now();
+  const h0 = await engine.health();
+  for (let i = 0; i < 40; ++i) { await feed(); await new Promise((r) => setTimeout(r, 50)); }
+  const h1 = await engine.health();
+  const elapsedS = (performance.now() - t0) / 1000;
+
+  const rendered = h1.blocks - h0.blocks;
+  const renderedS = (rendered * engine.info.blockSize) / rate;
+  ok(`${rendered} blocks in ${elapsedS.toFixed(2)} s of wall time (${renderedS.toFixed(2)} s of audio)`);
+
+  if (rendered < 100) fail(`only ${rendered} blocks rendered in ${elapsedS.toFixed(2)} s`);
+  /* The audio clock, not a free-running host thread: a real output paces this within a few
+   * percent, and the host-paced fallback would too, which is why device_lost is checked next. */
+  if (renderedS < elapsedS * 0.5 || renderedS > elapsedS * 1.6)
+    fail(`the render is not paced by the audio clock: ${renderedS.toFixed(2)} s of audio in ` +
+         `${elapsedS.toFixed(2)} s`);
+  else ok("the render is paced by the audio clock");
+
+  if (h1.deviceLost !== 0)
+    fail("device_lost is set: the sink is host-pacing silence, so process() is NOT being called");
+  else ok("device_lost is 0: the AudioWorklet is driving, not the host-paced fallback");
+
+  if (h1.measured !== false) fail("health.measured should be false on this backend");
+  else ok("health.measured is false, as the backend promises");
+
+  /* THE SUSPENDED-CONTEXT HANDOFF, in both directions. This is the most novel code in the sink
+   * and the only place two things pull one SinkQuant, so it is the part most worth driving from a
+   * real browser. Suspending stops process() being called at all: the engine's clocks must keep
+   * advancing on host-paced silence (rule 4) and device_lost must say so. Resuming must hand the
+   * pacing back without either side wedging on the try-lock. */
+  await ctx.suspend();
+  const hs0 = await engine.health();
+  await new Promise((r) => setTimeout(r, 600));
+  const hs1 = await engine.health();
+  ok(`suspended: ${hs1.blocks - hs0.blocks} blocks in 600 ms, device_lost ${hs1.deviceLost}`);
+  if (hs1.deviceLost !== 1)
+    fail("a suspended context did not set device_lost: the host-paced fallback never took over");
+  if (hs1.blocks - hs0.blocks < 40)
+    fail(`the clocks stalled while suspended: only ${hs1.blocks - hs0.blocks} blocks in 600 ms`);
+
+  await ctx.resume();
+  await new Promise((r) => setTimeout(r, 600));
+  await feed();
+  const hr0 = await engine.health();
+  await new Promise((r) => setTimeout(r, 600));
+  await feed();
+  const hr1 = await engine.health();
+  ok(`resumed: ${hr1.blocks - hr0.blocks} blocks in 600 ms, device_lost ${hr1.deviceLost}`);
+  if (hr1.deviceLost !== 0)
+    fail("device_lost stayed set after the context resumed: the worklet did not take the pacing back");
+  if (hr1.blocks - hr0.blocks < 40)
+    fail(`nothing rendered after the resume: ${hr1.blocks - hr0.blocks} blocks in 600 ms`);
+
+  if (ctx.state !== "running") fail(`the context ended as "${ctx.state}"`);
+
+  await engine.destroy();
+  ok("destroy returned");
+  await ctx.close();
+
+  /* THE DEFAULT TOPOLOGY, which node cannot reach: a real module Worker holding the engine, the
+   * postMessage protocol, and the frame slab across a thread boundary. It runs on the NULL sink,
+   * because the AudioWorklet sink is the one thing a Worker cannot open (see client.js). Worth
+   * driving here for one reason past coverage: the engine's own threads become NESTED workers,
+   * and that is where a browser is most likely to say no. */
+  const w = await BwaEngine.create({ topology: "worker", sink: 2, profile: Profile.BINAURAL });
+  ok(`worker topology: ${w.info.sampleRate} Hz, block ${w.info.blockSize}`);
+  const ws = await w.createSource();
+  await w.start();
+  ok(`worker topology backend "${w.info.backend}"`);
+  w.listener.setPose(0, 0, 0, 0, 0, 0, 1);
+  ws.setPosition(1, 0, 1);
+  w.pushFrame();
+  const wh0 = await w.health();
+  await new Promise((r) => setTimeout(r, 600));
+  const wh1 = await w.health();
+  ok(`worker topology rendered ${wh1.blocks - wh0.blocks} blocks in 600 ms`);
+  if (wh1.blocks - wh0.blocks < 40)
+    fail(`the control Worker's engine did not render: ${wh1.blocks - wh0.blocks} blocks in 600 ms`);
+  await w.destroy();
+  ok("worker topology destroyed");
+
+  /* THE CLAIM THAT SPLITS THE TWO TOPOLOGIES, measured rather than reasoned: the AudioWorklet sink
+   * cannot open from a Worker, because `new AudioContext()` needs a Window. It is asserted as "did
+   * not succeed" rather than "threw this", because the failure mode is a JS exception crossing the
+   * wasm boundary inside emscripten's own library function and that can take the Worker down
+   * rather than return an error - which is itself the reason a page must not try it. Raced against
+   * a timeout so a dead Worker does not hang the run. */
+  /* START, not create: no sink is opened until bwa_start, so a create that resolves proves
+   * nothing at all. */
+  const attempt = (async () => {
+    const e = await BwaEngine.create({ topology: "worker", sink: 9, profile: Profile.BINAURAL });
+    try {
+      await e.start();
+      return { opened: true, engine: e, why: `backend "${e.info.backend}"` };
+    } catch (err) {
+      try { await e.destroy(); } catch {}
+      return { opened: false, why: String(err && err.message || err) };
+    }
+  })().catch((err) => ({ opened: false, why: String(err && err.message || err) }));
+  const outcome = await Promise.race([
+    attempt,
+    new Promise((r) => setTimeout(() => r({ opened: false, why: "the Worker never answered" }), 8000)),
+  ]);
+  if (outcome.opened) {
+    fail("the AudioWorklet sink OPENED from a Worker; the two-topology split is unnecessary");
+    try { await outcome.engine.destroy(); } catch {}
+  } else {
+    ok(`the worklet sink is not reachable from a Worker, as expected: ${outcome.why}`);
+  }
+}
+
+main().then(() => report(null)).catch((e) => report(e));
+
+function report(err) {
+  if (err) notes.push("FAIL threw: " + (err && err.stack ? err.stack : String(err)));
+  const bad = notes.filter((n) => n.startsWith("FAIL"));
+  const body = { pass: bad.length === 0, notes };
+  document.getElementById("out").textContent = JSON.stringify(body, null, 1);
+  fetch("/__result", { method: "POST", body: JSON.stringify(body) }).catch(() => {});
+}
+</script>
+</body>
+</html>

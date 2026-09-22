@@ -70,3 +70,56 @@ static func write_ping(name: String, freq: float, seconds: float, rate: int = 48
 
 	f.close()
 	return path
+
+
+## THE CLICK: the stimulus every binding's minimal example plays, spelled out once.
+##
+## One 250 ms period at 48 kHz, holding a 2 ms Hann-windowed noise burst at -12 dBFS peak
+## followed by silence. Looped, that is four clicks a second, and an orbit reads as a
+## trajectory rather than as a level pan. A tone would not do: the cues that place a source
+## in elevation and front-back live in the SPECTRUM, and a narrowband tone carries almost
+## none of them.
+##
+## The noise comes from a 32-bit LCG written out here rather than from randf(), because every
+## binding's copy of this stimulus has to produce the same samples and no two languages'
+## generators agree. examples/minimal.c is the reference.
+const CLICK_PEAK := 0.251189            # -12 dBFS
+const CLICK_PERIOD_SECONDS := 0.25      # four clicks a second
+const CLICK_BURST_SECONDS := 0.002
+
+
+## One period of the stimulus: the burst, then silence.
+static func click_period(rate: int = 48000) -> PackedFloat32Array:
+	var period := int(round(CLICK_PERIOD_SECONDS * rate))
+	var nburst := int(round(CLICK_BURST_SECONDS * rate))
+
+	var burst := PackedFloat64Array()
+	burst.resize(nburst)
+	var state := 12345
+	var peak := 0.0
+	for i in nburst:
+		state = (state * 1664525 + 1013904223) & 0xFFFFFFFF
+		var u := float((state >> 8) & 0xFFFFFF) / 8388608.0 - 1.0   # [-1, 1)
+		var w := 0.5 - 0.5 * cos(TAU * float(i) / float(nburst - 1))
+		burst[i] = w * u
+		peak = maxf(peak, absf(burst[i]))
+
+	var scale: float = CLICK_PEAK / peak if peak > 0.0 else 0.0     # exactly -12 dBFS at the crest
+	var out := PackedFloat32Array()
+	out.resize(period)
+	out.fill(0.0)
+	for i in nburst:
+		out[i] = burst[i] * scale
+	return out
+
+
+## Writes one period as a mono 16-bit wav under user:// and returns its path.
+static func write_click(name: String, rate: int = 48000) -> String:
+	var samples := click_period(rate)
+	var f := _open_wav("user://%s.wav" % name, 1, samples.size(), rate)
+	if f == null:
+		return ""
+	for s in samples:
+		f.store_16(int(clampf(s, -1.0, 1.0) * 32767.0) & 0xFFFF)
+	f.close()
+	return "user://%s.wav" % name

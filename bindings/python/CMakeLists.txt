@@ -133,8 +133,8 @@ if(BWA_BUILD_TESTS)
     TIMEOUT 300
     SKIP_RETURN_CODE 77)
 
-  # The two examples, in --tests mode, like the console examples the C build registers.
-  foreach(ex offline_render live_onset)
+  # The examples, in --tests mode, like the console examples the C build registers.
+  foreach(ex minimal offline_render live_onset)
     add_test(NAME python_example_${ex}
              COMMAND "${Python_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/examples/${ex}.py" --tests)
     set_tests_properties(python_example_${ex} PROPERTIES

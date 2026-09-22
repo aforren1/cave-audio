@@ -228,6 +228,12 @@ startup, so you can't flip it from a runtime script. It's a one-time project set
 
 ## Use
 
+Hear it working first: **Package Manager -> BwAudio -> Samples -> Minimal orbit -> Import**. The
+sample is one MonoBehaviour that orbits a click around the listener's head for six seconds, on an
+`Engine` plus a `PushEmitter`, and it synthesizes its own stimulus so it needs no audio asset.
+Every other binding of this engine ships the same demo, which makes them comparable by ear (see
+`docs/integration.md`, "The minimal example").
+
 1. Add **`Engine`** to one GameObject (it's a singleton, `DontDestroyOnLoad`). Set the profile,
    the `listener` transform (your OptiTrack head rigid body or XR camera), and - optionally -
    reflections and a room box (both load-time).

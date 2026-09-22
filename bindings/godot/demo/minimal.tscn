@@ -1,0 +1,19 @@
+[gd_scene load_steps=2 format=3]
+
+[ext_resource type="Script" path="res://demo/minimal.gd" id="1"]
+
+[node name="Minimal" type="Node3D"]
+script = ExtResource("1")
+
+[node name="BwaEngine" type="BwaEngine" parent="."]
+profile = 1
+sink = 0
+listener = NodePath("../Listener")
+
+[node name="Listener" type="Node3D" parent="."]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 1.5, 0)
+
+[node name="Emitter" type="BwaEmitter" parent="."]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 1.5, 2)
+autoplay = false
+loop = true

@@ -19,6 +19,8 @@
  *                  fixed-quantum adapter: it writes, so it picks the size.
  *   - aaudio_sink.c (BWA_HAVE_AAUDIO): Android, the headphone path on a standalone VR headset.
  *                  Stereo only - Android has no array transport.
+ *   - worklet_sink.c (BWA_HAVE_WORKLET): the browser, through an Emscripten Wasm Audio Worklet.
+ *                  Stereo only - a page carries no array transport. See docs/web.md.
  *   - manual_sink.c (always built): no thread; the caller pumps blocks (bwa_render_block).
  *
  * Two shared pieces sit under the backends rather than inside one of them: sink_convert.h (the
@@ -329,6 +331,36 @@ bool     sink_aaudio_device_id  (uint32_t index, char* buf, uint32_t cap);
  * the stream - the same reason the WASAPI and ALSA pairs above exist. Control thread, on an open sink. */
 uint32_t sink_aaudio_burst_frames(bwa_sink* s);
 uint32_t sink_aaudio_buffer_frames(bwa_sink* s);
+#endif
+
+#ifdef BWA_HAVE_WORKLET
+/* The browser, through an Emscripten Wasm Audio Worklet. STEREO ONLY: a wider request fails the
+ * open with a message saying so, because a page carries no array transport. `device` is a decimal
+ * Emscripten AudioContext HANDLE (emscriptenRegisterAudioObject), not a name - Web Audio has no
+ * enumerable output devices, and a page that created the context inside its own user-gesture
+ * handler keeps the right to resume it; NULL lets the sink create one. */
+bwa_sink* bwa_worklet_sink_open(uint32_t sample_rate, uint32_t block_size, uint32_t channels,
+                          const char* device /* NULL = a context the sink creates */,
+                          uint32_t flags, bool exact_rate,
+                          bwa_render_fn render, void* user, char* err, size_t errcap);
+/* One device, "default", with id "0". A browser exposes no output device list without a
+ * permission prompt, and an AudioContext follows the browser's own default output. Control
+ * thread, opens nothing. */
+uint32_t sink_worklet_device_count(void);
+bool     sink_worklet_device_name(uint32_t index, char* buf, uint32_t cap);
+bool     sink_worklet_device_id  (uint32_t index, char* buf, uint32_t cap);
+/* TEST/DIAGNOSTIC readbacks, internal on purpose (not in bw_audio.h). Unlike every other backend,
+ * this one's device setup is ASYNCHRONOUS: emscripten_start_wasm_audio_worklet_thread_async and
+ * the processor creation both complete after bwa_sink_start has returned, so "did the worklet come
+ * up?" cannot be a start() return value. sink_worklet_state reports it (0 idle, 1 starting, 2
+ * live, 3 failed). sink_worklet_context hands back the AudioContext handle, which is what a page
+ * needs to resume the context from a user gesture. sink_worklet_context_state is Web Audio's own
+ * state enum (0 suspended, 1 running, 2 closed, 3 interrupted) and PROXIES to the browser main
+ * thread, so it blocks briefly - control thread only, never per frame. */
+uint32_t sink_worklet_state(bwa_sink* s);
+int32_t  sink_worklet_context(bwa_sink* s);
+uint32_t sink_worklet_quantum(bwa_sink* s);
+uint32_t sink_worklet_context_state(bwa_sink* s);
 #endif
 
 #endif /* BWA_SINK_H */

@@ -14,6 +14,34 @@ coordinates and per-frame pushing do not apply to them. Everything else does.
 If a term in the binding surface is unfamiliar, [glossary.md](./glossary.md) defines it in one
 line and points at the doc that owns it.
 
+## The minimal example
+
+Every binding ships the same demo, and it is the fastest way to hear that a binding works. A click
+orbits the listener's head at ear height, 2 m out, one lap in about 6 s, in the binaural profile.
+Run it with headphones on and the click should travel: in front of you, past your left ear, behind
+your head, past your right ear.
+
+The stimulus is a broadband click rather than a tone because the cues that place a source in
+elevation and front to back live in the spectrum. A tone carries almost none of them, so an orbit
+made with one reads as a level pan instead of as a trajectory.
+
+Each copy synthesizes the same signal, so you can compare the bindings by ear: one 250 ms period
+holding a 2 ms Hann-windowed noise burst at -12 dBFS peak, then silence, which comes to four clicks
+a second. The noise is a written-out 32-bit LCG, not the language's own generator, because no two
+languages' generators agree. [`examples/minimal.c`](../examples/minimal.c) is the reference copy.
+
+| binding | the demo | run it |
+|---|---|---|
+| C | [`examples/minimal.c`](../examples/minimal.c) | `bwa_minimal` |
+| Unity | [`bindings/unity/Samples~/MinimalOrbit/`](../bindings/unity/Samples~/MinimalOrbit/) | import the sample from the Package Manager |
+| Godot | [`bindings/godot/demo/minimal.gd`](../bindings/godot/demo/minimal.gd) | `godot --path bindings/godot res://demo/minimal.tscn` |
+| Python | [`bindings/python/examples/minimal.py`](../bindings/python/examples/minimal.py) | `uv run examples/minimal.py` |
+| MATLAB or Octave | [`bindings/matlab/examples/minimal.m`](../bindings/matlab/examples/minimal.m) | `minimal` |
+| Web | [`bindings/web/example/index.html`](../bindings/web/example/index.html) | `node bindings/web/example/serve.mjs`, then open the page and press Start |
+
+Every copy also takes `--tests`, which forces the offline sink and self-checks, so ctest runs the
+lot with no audio device attached.
+
 ## Coordinate seam (the part that silently ruins spatial audio)
 
 The engine works in **room space: right-handed, +Y up, +Z forward, meters, origin on
@@ -76,7 +104,10 @@ pass `--temp` to `bwa_calibrate` once and the layout remembers it. Do not copy o
 ## Unity
 
 **Implemented as a UPM package: [`bindings/unity/`](../bindings/unity/) (`com.brainworks.bw_audio`).**
-See its [README](../bindings/unity/README.md) for install + plugin staging.
+See its [README](../bindings/unity/README.md) for install + plugin staging. Start with the
+**Minimal orbit** sample ([`Samples~/MinimalOrbit/`](../bindings/unity/Samples~/MinimalOrbit/)),
+which the Package Manager imports into your project: it is the orbiting click described above, on
+an `Engine` plus a `PushEmitter`, and it needs no audio asset.
 
 Four core pieces:
 
@@ -564,7 +595,9 @@ a Developer ID signature and notarization, which nothing here does yet.
 
 **Implemented as a GDExtension: [`bindings/godot/`](../bindings/godot/).** Its
 [README](../bindings/godot/README.md) is the manual: install, the node reference, the
-traps. This section carries only what belongs in the cross-engine comparison.
+traps. This section carries only what belongs in the cross-engine comparison. Start with
+[`demo/minimal.tscn`](../bindings/godot/demo/minimal.tscn), the orbiting click on a `BwaEngine`
+plus a `BwaEmitter`.
 
 No 1:1 binding layer: GDExtension needs no P/Invoke shim, so every call lives as a method
 on the class owning its handle (`BwaEngine`, `BwaSource` → `BwaEmitter`/`BwaPushSource`,
@@ -680,7 +713,9 @@ Developer ID signature and notarization.
 
 **Implemented as a nanobind extension: [`bindings/python/`](../bindings/python/).** Its
 [README](../bindings/python/README.md) is the manual: install, the two layers, the two experiment
-shapes, the traps. This section carries only what belongs in the cross-binding comparison.
+shapes, the traps. This section carries only what belongs in the cross-binding comparison. Start
+with [`examples/minimal.py`](../bindings/python/examples/minimal.py), the orbiting click; the two
+experiment shapes are `offline_render.py` and `live_onset.py` beside it.
 
 It is not a game-engine binding, so most of this page does not apply to it. There is no coordinate
 seam, because there is no host engine to convert from: you pass room coordinates. There is no
@@ -742,7 +777,9 @@ more than the machine that built it.
 **Implemented as a MEX gateway: [`bindings/matlab/`](../bindings/matlab/).** Its
 [README](../bindings/matlab/README.md) is the manual: install, the two layers, the commit model,
 the timing recipe, coexisting with PsychPortAudio. This section carries only what belongs in the
-cross-binding comparison.
+cross-binding comparison. Start with
+[`examples/minimal.m`](../bindings/matlab/examples/minimal.m), the orbiting click; the two
+experiment shapes are `offline_render.m` and `live_onset.m` beside it.
 
 Like Python it is not a game-engine binding, so there is no coordinate seam and no per-frame push.
 The audience is Psychtoolbox, which is MATLAB or Octave, where PsychoPy is Python. The two
