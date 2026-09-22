@@ -141,7 +141,9 @@ apply_once() {
   elif git -C "$tree" apply $dopt --reverse --check "$abs" 2>/dev/null; then
     echo "already applied $name"
   else
-    echo "patch $name neither applies nor is already applied (tree: $tree${3:+/$3})"; exit 1
+    echo "patch $name neither applies nor is already applied (tree: $tree${3:+/$3}); git says:"
+    git -C "$tree" apply $dopt --check "$abs" || true    # the reason, this time on stderr
+    exit 1
   fi
 }
 SUBMODULE=third_party/steam-audio-source
@@ -210,9 +212,12 @@ fi
 # the submodule ones at the top: the tree it lands on does not exist until get_dependencies.py has
 # cloned, built and copied it. The target is the COPIED include tree, which is what phonon then
 # compiles against; flatc itself builds either way. The patch file says what it fixes.
-apply_once "$SUBMODULE" third_party/patches/deps-flatbuffers-tablekeycomparator.patch core/deps/flatbuffers
+# ABSOLUTE paths from here on: the cd above moved us into core/build, and a relative $SUBMODULE
+# from there names nothing, so git dies before the check runs and the failure reads as "neither
+# applies nor is already applied" (Pages run 35717926513).
+apply_once "$ROOT/$SUBMODULE" third_party/patches/deps-flatbuffers-tablekeycomparator.patch core/deps/flatbuffers
 # Prove it landed. The one line the patch introduces; absent means the apply was a no-op.
-grep -q "TableKeyComparator &operator=(const TableKeyComparator &other));"   "$CORE/deps/flatbuffers/include/flatbuffers/flatbuffers.h"   || { echo "deps-flatbuffers patch reported applied but the header is unchanged"; exit 1; }
+grep -q "TableKeyComparator &operator=(const TableKeyComparator &other));"   "$ROOT/$CORE/deps/flatbuffers/include/flatbuffers/flatbuffers.h"   || { echo "deps-flatbuffers patch reported applied but the header is unchanged"; exit 1; }
 for d in zlib "$BWA_FFT" mysofa; do
   "$PY" get_dependencies.py --dependency "$d" $SHAREDCRT -p "$BWA_PLATFORM" -a "$BWA_ARCH" $TOPT
 done
