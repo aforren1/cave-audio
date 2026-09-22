@@ -3439,7 +3439,13 @@ void rt_render(RtCore* c, float* bus, uint32_t nframes, const bwa_timestamp* ts)
     }
     /* master gain: one ramped scalar over everything mixed so far (voices, beds, reverb/path taps),
      * applied PRE-align so the per-speaker trims and the raw channel-test signal stay calibrated.
-     * Skipped entirely while settled at unity. */
+     * Skipped entirely while settled at unity.
+     * The direct-binaural render is part of "everything": under BWA_PROFILE_BINAURAL point voices
+     * never touch the speaker bus (they live in ambi_direct, and in mode 2 in their dv_mono point
+     * taps), so scaling the bus alone left the knob INERT in that profile - the web playground's
+     * slider did nothing on headphones while the same slider worked in cave_sim (measured 2026-09-22
+     * through the manual sink: 0.10 ratio in cave and cave_sim, 1.00 in binaural). The same ramp
+     * runs over every buffer the decode reads, so the profiles cannot drift apart again. */
     {
         const float mg_tgt = atomic_load_explicit(&c->master_gain, memory_order_relaxed);
         if (mg_tgt != 1.f || c->master_g_cur != 1.f) {
@@ -3448,6 +3454,21 @@ void rt_render(RtCore* c, float* bus, uint32_t nframes, const bwa_timestamp* ts)
                 float g = c->master_g_cur;
                 float* p = &bus[(size_t)ch * nframes];
                 for (uint32_t i = 0; i < nframes; ++i) { p[i] *= g; g += step; }
+            }
+            if (c->direct_blk) {
+                for (uint32_t k = 0; k < BWA_AMBI_CH; ++k) {
+                    float g = c->master_g_cur;
+                    float* p = c->ambi_direct + (size_t)k * nframes;
+                    for (uint32_t i = 0; i < nframes; ++i) { p[i] *= g; g += step; }
+                }
+                if (c->direct_on == 2 && c->dv_mono && c->dv_view) {
+                    for (uint32_t s = 0; s < c->voice_cap; ++s) {
+                        if (!c->dv_view[s].active) continue;     /* only the taps published this block */
+                        float g = c->master_g_cur;
+                        float* p = c->dv_mono + (size_t)s * BWA_RT_MAX_BLOCK;
+                        for (uint32_t i = 0; i < nframes; ++i) { p[i] *= g; g += step; }
+                    }
+                }
             }
             c->master_g_cur = mg_tgt;                  /* land exactly */
         }

@@ -685,7 +685,8 @@ BWA_API uint32_t   bwa_source_push_space(bwa_engine* e, bwa_source s);
 BWA_API void       bwa_source_push_end(bwa_engine* e, bwa_source s);
 
 /* ---- global mix control (control thread; live, per-frame-safe) ---- */
-/* Master gain: one ramped scalar over the whole mix - voices, beds, reverb/pathing - applied
+/* Master gain: one ramped scalar over the whole mix - voices, beds, reverb/pathing, and the
+ * direct-binaural field under BWA_PROFILE_BINAURAL - applied
  * BEFORE the per-speaker align stage (trims and the raw channel-test signal stay calibrated) and
  * before the limiter (which still guards the sum). The volume knob / scene fade. It ramps across a
  * block, so slider drags never zipper. */

@@ -809,6 +809,16 @@ Regression-preventing gotchas. Each has bitten before or guards a real invariant
   the cd, and the failure path now prints git's own reason. General form: a check whose positive and
   negative BOTH pass is not a check, so after any patch step assert on the file's content, not on the
   tool's exit code, and never hide the stderr of the command whose exit code you branch on.
+- **A global stage that scales "the bus" is not global once a profile bypasses the bus.**
+  `bwa_set_master_gain` ramped the 26-channel speaker bus pre-align, and under
+  `BWA_PROFILE_BINAURAL` point voices never touch that bus (they live in `ambi_direct` and, in mode
+  2, the `dv_mono` point taps), so the knob was INERT on headphones and worked on the array sim. It
+  shipped through every test because the tests checked it on the bus. Found from the web playground's
+  slider, 2026-09-22; measured through the manual sink at 0.10 / 0.10 / 1.00 across cave, cave_sim
+  and binaural before the fix. Rule: anything described as "over the whole mix" (master gain, global
+  pause, a scene fade) must be applied to EVERY buffer a decoder reads, and its test must run in
+  every profile, because the direct render is a second output path, not a second consumer of the
+  first. `bindings/web/tests/master_gain.test.mjs` and the two `rt_feature` checks pin it.
 - **A shipped artifact must not cite a doc it does not ship.** Both packs run
   `tools/dist/doc-pointers.ps1`, which rewrites repo-doc references in the staged tree to
   permalinks at the packed commit and then fails the pack on any relative `.md` reference the

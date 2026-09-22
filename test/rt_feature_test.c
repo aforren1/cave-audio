@@ -1872,6 +1872,13 @@ int main(void) {
             const double a1 = atten_curve(1.f, LD.atten_ref_m, LD.atten_rolloff, LD.atten_min_lin);
             const double w1 = d ? d[0 * N + (N - 1)] : 0.0;
             CHECK(d && fabs(w1 - a1 * 0.2820948) < 2e-3, "direct: W = atten * Y00 for a unit source");
+            /* the master gain reaches the direct field. It used to scale the speaker bus alone, which
+             * this profile does not use for point voices, so the knob was inert on headphones
+             * (found from the web playground's slider, 2026-09-22). Two blocks: one ramps, one lands. */
+            rt_set_master_gain(cd, 0.5f); render2(cd); render2(cd);
+            const double w_half = d ? d[0 * N + (N - 1)] : 0.0;
+            CHECK(d && fabs(w_half - 0.5 * a1 * 0.2820948) < 2e-3, "direct: master gain 0.5 halves the SH field");
+            rt_set_master_gain(cd, 1.f); render2(cd); render2(cd);
             /* the first-order lateral channel carries the direction: |Y(ACN1)| = atten * Y1 (a pure
              * -x source has no front/up component; laterality itself is pinned in monitor_test /
              * steam_decode_test, which decode this exact basis) */
@@ -1929,6 +1936,10 @@ int main(void) {
             if (vi >= 0) {
                 CHECK(fabs(dv[vi].mono[N - 1] - a1) < 2e-3, "mode2: slot = source x atten at spread 0");
                 CHECK(dv[vi].dir[0] < -0.9f, "mode2: the published dir points at room -x");
+                /* the master gain reaches the per-voice point tap too (same defect as the SH field) */
+                rt_set_master_gain(c2, 0.5f); render2(c2); render2(c2);
+                CHECK(fabs(dv[vi].mono[N - 1] - 0.5 * a1) < 2e-3, "mode2: master gain 0.5 halves the point tap");
+                rt_set_master_gain(c2, 1.f); render2(c2); render2(c2);
             }
             const float* fld = rt_direct_ambi(c2);
             double fe = 0; for (int k = 0; fld && k < 16 * N; ++k) fe += fabs(fld[k]);
