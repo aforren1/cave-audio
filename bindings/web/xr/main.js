@@ -30,9 +30,9 @@ import { SCENES } from "../playground/scenes/index.js";
 import { renderControls, renderReadout } from "../playground/ui.js";
 import { XrWorld } from "./world_xr.js";
 import { MenuPanel } from "./panel.js";
-import { Hands } from "./hands.js";
+import { Hands, stepSource } from "./hands.js";
 import { XrRuntime } from "./session.js";
-import { buildOptions, statusRows, profileName, DEFAULT_LEAD_S } from "./options.js";
+import { buildOptions, statusRows, profileName, DEFAULT_LEAD_S, XR_DEFAULT_BLOCK } from "./options.js";
 import { qrot, earSideOf } from "./frame_xr.js";
 
 const el = (id) => document.getElementById(id);
@@ -49,6 +49,9 @@ const app = {
   wantProfile: Profile.CAVE_SIM,
   masterGain: 1,
   leadSeconds: DEFAULT_LEAD_S,
+  blockSize: XR_DEFAULT_BLOCK,
+  latencyHint: "interactive",
+  rebuilding: Promise.resolve(),
   lastT: 0,
   slowT: 0,
   errors: [],
@@ -142,9 +145,7 @@ async function selectScene(id) {
    * page's own choice comes back when you leave. Same rule as the flat playground. */
   const want = next.needsBus ? Profile.CAVE_SIM : app.wantProfile;
   if (app.rig.profile !== want) {
-    await app.rig.setProfile(want);
-    app.ctx.srcHandle = app.rig.src.handle;
-    app.world.setSpeakers(app.rig.speakers, app.rig.speakerCount);
+    await rebuildEngine(want);
     log(`profile -> ${profileName(want)} (engine rebuilt)`);
   }
 
@@ -154,13 +155,49 @@ async function selectScene(id) {
   refreshMenu();
 }
 
+/** A fresh AudioContext with the page's current latency hint. */
+function makeAudioContext() {
+  return new AudioContext({ latencyHint: app.latencyHint });
+}
+
+/**
+ * Tear the engine down and build another one on a NEW AudioContext: a different profile, block
+ * size or latency hint, all create-time. This is `Rig.rebuild` spelled out here rather than
+ * called, because Rig.rebuild hard-codes the "interactive" hint, and the XR page needs the hint
+ * and the block to survive every rebuild, the profile switch included. The two reasons for a new
+ * context are Rig.rebuild's (a second engine on one context never finishes its worklet setup), and
+ * the new context needs no gesture of its own: the Enter VR or preview press already unlocked
+ * audio for this document. The wasm module is reused, as there.
+ *
+ * Serialized: two menu presses in a row must not interleave two teardowns.
+ */
+function rebuildEngine(profile = app.rig.profile) {
+  const run = async () => {
+    const r = app.rig;
+    const module = r.module;
+    const layoutBytes = r.layoutBytes ?? null;
+    const oldCtx = r.ctx;
+    await r.destroy();
+    try { await oldCtx?.close(); } catch { /* already closed */ }
+    const ctx = makeAudioContext();
+    await ctx.resume();
+    const info = await r.open({ audioContext: ctx, profile, blockSize: app.blockSize,
+                                layoutBytes, module });
+    r.health = null;                     /* the old engine's counters are not this one's */
+    app.ctx.srcHandle = r.src.handle;
+    app.world.setSpeakers(r.speakers, r.speakerCount);
+    return info;
+  };
+  const p = app.rebuilding.then(run, run);
+  app.rebuilding = p.catch(() => {});
+  return p;
+}
+
 async function setProfile(p) {
   app.wantProfile = p;
   const want = app.scene?.needsBus ? Profile.CAVE_SIM : p;
   if (app.rig.profile === want) { refreshMenu(); return app.rig.engine?.info; }
-  const info = await app.rig.setProfile(want);
-  app.ctx.srcHandle = app.rig.src.handle;
-  app.world.setSpeakers(app.rig.speakers, app.rig.speakerCount);
+  const info = await rebuildEngine(want);
   await app.scene?.enter(app.ctx);
   await app.rig.engine.setMasterGain(app.masterGain);
   log(`profile -> ${profileName(want)} (engine rebuilt)`);
@@ -168,8 +205,35 @@ async function setProfile(p) {
   return info;
 }
 
+/**
+ * Change the engine block and/or the AudioContext latency hint, for an A/B on the headset. Both
+ * are fixed at create time, so either one rebuilds the engine and the context, like a profile
+ * switch. The health counters restart with the new engine, which is what an A/B wants.
+ * @param {{blockSize?: number, latencyHint?: string}} opts
+ */
+async function setEngineOptions({ blockSize, latencyHint } = {}) {
+  const nb = blockSize ?? app.blockSize;
+  const nh = latencyHint ?? app.latencyHint;
+  if (nb === app.blockSize && nh === app.latencyHint) { refreshMenu(); return app.rig.engine?.info; }
+  app.blockSize = nb;
+  app.latencyHint = nh;
+  if (!app.rig.engine) { refreshMenu(); return null; }   /* not started: the next open takes them */
+  const info = await rebuildEngine();
+  await app.scene?.enter(app.ctx);
+  await app.rig.engine.setMasterGain(app.masterGain);
+  log(`engine rebuilt: block ${info.blockSize}, latency hint "${app.latencyHint}"`);
+  refreshMenu();
+  return info;
+}
+
 app.selectScene = selectScene;
 app.setProfile = setProfile;
+app.setEngineOptions = (o) => setEngineOptions(o).catch((e) => log(`rebuild: ${e.message}`, true));
+app.stepSource = (what) => {
+  if (!app.ctx) return;
+  stepSource(app.ctx, what);
+  onSourceMoved();
+};
 app.refresh = refreshMenu;
 
 /* ------------------------------------------------------------------ the frame */
@@ -209,6 +273,9 @@ function step(nowMs, frame, runtime) {
   app.rig.engine?.pushFrame();
 
   /* ---- the picture ---- */
+  /* In session you ARE the head; the gizmo would sit at your eyes. Set every frame rather than
+   * once at enter, because the session's first frames run before enter() has returned. */
+  app.world.setImmersive(!!runtime?.presenting);
   app.world.setHead(app.ctx.headRoom, app.ctx.headQuat);
   app.world.setSource(app.ctx.sourceRoom);
   app.world.setSpeakerLevels(busPeaks(), dt, app.ctx.highlight);
@@ -227,6 +294,7 @@ function step(nowMs, frame, runtime) {
     app.panel?.refresh();          /* a scene's own state moves under the menu; repaint at 4 Hz */
     app.rig.poll().then(() => {
       if (!app.running) return;
+      noteHealth(nowMs);
       renderReadout(el("readout"), app.scene ? app.scene.readout(app.ctx) : []);
       renderReadout(el("status"), statusRows(app));
       const { peak } = app.rig.loudestChannel();
@@ -259,6 +327,20 @@ function busPeaks() {
   return r.lastPeaks ?? r.busLevels ?? null;
 }
 
+/**
+ * Keep five seconds of health samples so the panel can show a RECENT late-block rate. peak_load
+ * and the totals run since the engine started and so carry the start-up blocks (the first renders
+ * build the decoder state); a count over the last few seconds is what an A/B on the headset reads.
+ */
+function noteHealth(nowMs) {
+  const h = app.rig.health;
+  if (!h) { app.healthHist = []; return; }
+  const hist = (app.healthHist ||= []);
+  if (hist.length && h.blocks < hist[hist.length - 1].blocks) hist.length = 0;   /* a rebuild */
+  hist.push({ t: nowMs, blocks: h.blocks, late: h.lateBlocks });
+  while (hist.length > 2 && nowMs - hist[0].t > 5000) hist.shift();
+}
+
 function onSourceMoved() {
   if (app.scene?.state) { app.scene.state.auto = false; app.scene.state.flyby = false; }
 }
@@ -273,7 +355,7 @@ async function startEngine() {
   /* The AudioContext is created HERE, inside the gesture handler, and the page keeps it. The
    * Enter VR click IS that gesture, which is the whole reason the engine starts from this button
    * and not on load: a browser resumes an AudioContext only from a user gesture. */
-  const ctx = new AudioContext({ latencyHint: "interactive" });
+  const ctx = makeAudioContext();
   await ctx.resume();
 
   app.world = new XrWorld(el("view"));
@@ -281,7 +363,8 @@ async function startEngine() {
   app.hands = new Hands(app.panel);
   globalThis.addEventListener("resize", () => app.world.resize());
 
-  const info = await app.rig.open({ audioContext: ctx, profile: app.wantProfile });
+  const info = await app.rig.open({ audioContext: ctx, profile: app.wantProfile,
+                                   blockSize: app.blockSize });
   log(`engine up: ${info.sampleRate} Hz, block ${info.blockSize}, ${info.channelCount} bus ` +
       `channels, backend "${info.backend}"`);
   if (info.lastError) log(`open note: ${info.lastError}`);
@@ -342,7 +425,7 @@ async function enterVr() {
       onFrame: (t, frame, rt) => step(t, frame, rt),
       onEnd: () => {
         app.hands?.detach();
-        app.world.endPresenting();
+        app.world.endPresenting();          /* also shows the head gizmo again */
         app.panel.visible = false;
         app.ctx.headRoom = [0, 1.5, 0];
         app.ctx.headQuat = [0, 0, 0, 1];
@@ -406,6 +489,9 @@ globalThis.__bwaXr = {
   },
   setSourceRoom(p) { onSourceMoved(); app.ctx.sourceRoom = [p[0], p[1], p[2]]; },
   setLeadSeconds(s) { app.leadSeconds = s; refreshMenu(); },
+  setEngineOptions,
+  stepSource: (what) => app.stepSource(what),
+  statusRows: () => statusRows(app).map(([k, v]) => [k, String(v)]),
   state: () => ({
     xrSupported: app.xrSupported,
     presenting: !!app.xr?.presenting,
@@ -421,6 +507,8 @@ globalThis.__bwaXr = {
     sinkType: app.rig.engine?.info.sinkType ?? null,
     sampleRate: app.rig.engine?.info.sampleRate ?? 0,
     blockSize: app.rig.engine?.info.blockSize ?? 0,
+    latencyHint: app.latencyHint,
+    headGizmoVisible: app.world?.headGizmoVisible() ?? null,
     channelCount: app.rig.engine?.info.channelCount ?? 0,
     speakerCount: app.rig.speakerCount ?? 0,
     headRoom: app.ctx?.headRoom ?? null,

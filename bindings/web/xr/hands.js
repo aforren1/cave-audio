@@ -17,6 +17,12 @@
  *   grip + thumbstick Y   raise and lower the source instead
  *   thumbstick Y       while pointing at the menu, scroll it
  *
+ * HANDS, no controllers (Galaxy XR, a Quest with its controllers down): a hand is an input source
+ * with a `hand` and usually no gamepad. A pinch fires select, so pinch-and-hold on the source
+ * grabs it and carries it in all three axes, the same as a trigger. There is no squeeze and no
+ * thumbstick, so what the stick did (slide, push/pull, raise/lower) is also a row of buttons on the
+ * panel (`stepSource`, wired in options.js). Hand joints are never drawn.
+ *
  * A press is resolved in that order on purpose: the menu wins over the grab, because a ray that
  * lands on the panel is unambiguous and a grab is not.
  */
@@ -121,6 +127,8 @@ export class Hands {
        * a hand, and drawing the grip sphere at a gaze pose put a dot in front of the user's eyes
        * (reported from a phone, 2026-09-22). */
       h.mode = src.targetRayMode || "tracked-pointer";
+      h.hand = !!src.hand;
+      h.hasStick = !!(src.gamepad && src.gamepad.axes && src.gamepad.axes.length >= 2);
       h.p = p;
       h.q = q;
       /* The target ray points down the controller's own -z, like every other XR "forward". Once
@@ -238,6 +246,8 @@ export class Hands {
     return this.state.map((h, i) => ({
       present: h.present,
       mode: h.present ? h.mode : null,
+      hand: h.present ? h.hand : false,
+      hasStick: h.present ? h.hasStick : false,
       grabbing: this.grabbing === i,
       pointingAtMenu: !!h.hit,
       position: h.present ? h.p.map((v) => Math.round(v * 1000) / 1000) : null,
@@ -245,9 +255,30 @@ export class Hands {
   }
 }
 
+/**
+ * Move the source one step, relative to where the head is LOOKING, the way the thumbstick does.
+ * The controller-free path: a hand has no stick, so the panel's buttons call this.
+ * @param {object} ctx the scene context (`sourceRoom` is written, `headQuat` read)
+ * @param {"left"|"right"|"ahead"|"back"|"up"|"down"} what
+ * @param {number} [meters]
+ */
+export function stepSource(ctx, what, meters = 0.25) {
+  const right = qrot(ctx.headQuat, [-1, 0, 0]);          /* BWA_ROOM_RIGHT, turned with the head */
+  const ahead = qrot(ctx.headQuat, [0, 0, 1]);
+  const v = {
+    right, left: [-right[0], -right[1], -right[2]],
+    ahead, back: [-ahead[0], -ahead[1], -ahead[2]],
+    up: [0, 1, 0], down: [0, -1, 0],
+  }[what];
+  if (!v) return;
+  const s = ctx.sourceRoom;
+  ctx.sourceRoom = clampRoom([s[0] + v[0] * meters, s[1] + v[1] * meters, s[2] + v[2] * meters]);
+}
+
 function newHand() {
   return {
-    present: false, mode: "tracked-pointer", p: [0, 0, 0], q: [0, 0, 0, 1], dir: [0, 0, 1],
+    present: false, mode: "tracked-pointer", hand: false, hasStick: false,
+    p: [0, 0, 0], q: [0, 0, 0, 1], dir: [0, 0, 1],
     select: false, squeeze: false, pending: false, hit: null,
     axes: [0, 0], grabOffset: [0, 0, 0],
   };

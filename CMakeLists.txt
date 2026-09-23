@@ -875,7 +875,8 @@ if(BWA_BUILD_TESTS)
   target_include_directories(test_smoke PRIVATE src)
   target_link_libraries(test_smoke PRIVATE bw_audio)
   bwa_link_os(test_smoke PRIVATE)
-  add_test(NAME smoke COMMAND test_smoke)
+  # the argument is the playgrounds' default layout, loaded through bwa_create and read back
+  add_test(NAME smoke COMMAND test_smoke "${CMAKE_SOURCE_DIR}/examples/dome_24.json")
   bwa_copy_runtime_dll(test_smoke)
 
   # The PURE tools API (bwa_spcap_focus_default / bwa_panner_gains_batch): no engine handle, so it
@@ -1286,6 +1287,11 @@ if(BWA_BUILD_PLAYGROUND)
   target_link_libraries(bwa_playground PRIVATE bw_audio raylib)
   bwa_tool_icon(bwa_playground)
   bwa_copy_runtime_dll(bwa_playground)
+  # The demo's default array when no cave_layout.json is in the CWD: staged beside the exe, because
+  # the playground resolves it relative to its own path (a double-click or a ctest run has any CWD).
+  add_custom_command(TARGET bwa_playground POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            ${CMAKE_SOURCE_DIR}/examples/dome_24.json $<TARGET_FILE_DIR:bwa_playground>)
   if(BWA_BUILD_TESTS)
     # The GUI itself, driven by fake inputs. Needs a window: on Windows that is always there, off it
     # the runner needs a DISPLAY (an X or Wayland session, or `xvfb-run ctest` - the software GL path

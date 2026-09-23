@@ -142,6 +142,13 @@ static void seed_default(void) {
     for (int i = 0; i < g_nspk; ++i) { spk[i].pos = dome_pos(i, g_nspk); spk[i].gain_db = 0.0f; spk[i].pin = 0; }
 }
 
+/* listening_point_m: the file's declared listening point (the engine uses it instead of the
+ * centroid). The tool has no editor for its x/z (every view assumes the ears at x = z = 0), so it
+ * only ROUND-TRIPS a declared one: y follows the "obs ear y" slider, x/z pass through, and a file
+ * without the field stays without it. Dropping it on save would silently move a dome's listener. */
+static int   g_lp_set;
+static float g_lp_x, g_lp_z;
+
 /* load positions/gain + dbap knobs from an existing cave_layout.json; returns #speakers read (0 = none).
  * The file's speaker COUNT becomes the edited layout's count (4..NSPK — the engine loader's range). */
 static int load_json(const char* path) {
@@ -156,6 +163,7 @@ static int load_json(const char* path) {
     if (!root) return 0;
 
     int loaded = 0;
+    float lp_y_pending = 0.0f;
     cJSON* spks = cJSON_GetObjectItemCaseSensitive(root, "speakers");
     if (cJSON_IsArray(spks)) {
         int n = cJSON_GetArraySize(spks);
@@ -180,6 +188,21 @@ static int load_json(const char* path) {
             cJSON* pj = cJSON_GetObjectItemCaseSensitive(sp, "pin");
             spk[idx].pin = (cJSON_IsString(pj) && strcmp(pj->valuestring, "plane") == 0) ? 1 : 0;
             ++loaded;
+        }
+    }
+    {
+        cJSON* lp = cJSON_GetObjectItemCaseSensitive(root, "listening_point_m");
+        g_lp_set = 0;
+        if (cJSON_IsArray(lp) && cJSON_GetArraySize(lp) == 3) {
+            cJSON* x = cJSON_GetArrayItem(lp, 0);
+            cJSON* y = cJSON_GetArrayItem(lp, 1);
+            cJSON* z = cJSON_GetArrayItem(lp, 2);
+            if (cJSON_IsNumber(x) && cJSON_IsNumber(y) && cJSON_IsNumber(z)) {
+                g_lp_set = 1;
+                g_lp_x = (float)x->valuedouble;
+                g_lp_z = (float)z->valuedouble;
+                if (y->valuedouble > 0.0 && y->valuedouble <= 3.0) lp_y_pending = (float)y->valuedouble;
+            }
         }
     }
     cJSON* psj = cJSON_GetObjectItemCaseSensitive(root, "pin_slab_m");
@@ -213,6 +236,7 @@ static int load_json(const char* path) {
             if (cJSON_IsNumber(mg)) dist_min_db  = (float)mg->valuedouble;
         }
     }
+    if (lp_y_pending > 0.0f) obs_height = lp_y_pending;   /* the declared point wins over ears_m */
     cJSON_Delete(root);
     return loaded;
 }
@@ -223,7 +247,7 @@ static int save_json(const char* path) {
     if (!f) return 0;
     /* delay_ms time-aligns arrivals at the LISTENING POINT (ears at obs_height), not the floor
      * origin — since the +z-forward/floor-origin move, distance-to-origin would skew alignment. */
-    const Vector3 ear = { 0.0f, obs_height, 0.0f };
+    const Vector3 ear = { g_lp_set ? g_lp_x : 0.0f, obs_height, g_lp_set ? g_lp_z : 0.0f };
     float dmax = 0.0f;
     for (int i = 0; i < g_nspk; ++i) { float d = Vector3Distance(spk[i].pos, ear); if (d > dmax) dmax = d; }
     fprintf(f,
@@ -237,6 +261,7 @@ static int save_json(const char* path) {
     int npin = 0;
     for (int i = 0; i < g_nspk; ++i) npin += spk[i].pin;
     if (npin) fprintf(f, "  \"pin_slab_m\": %g,\n", pin_slab_m);   /* authoring-only, like \"pin\"; the engine ignores it */
+    if (g_lp_set) fprintf(f, "  \"listening_point_m\": [%.4f, %.4f, %.4f],\n", g_lp_x, obs_height, g_lp_z);
     fprintf(f, "  \"speakers\": [\n");
     for (int i = 0; i < g_nspk; ++i) {
         float d = Vector3Distance(spk[i].pos, ear);
@@ -1764,6 +1789,43 @@ static void register_tests(ImGuiTestEngine* te) {
         IM_CHECK_LT(fabsf(pin_slab_m - 0.4f), 1e-5f);
         pin_slab_m = 0.3f;
         dbap_r = 0.5f; seed_default(); layout_dirty = 1;
+    };
+
+    /* a declared listening_point_m round-trips (y rides the ear slider), the engine loads it as its
+     * listening point, and a file without one is saved without one */
+    t = IM_REGISTER_TEST(te, "logic", "listening_point");
+    t->TestFunc = [](ImGuiTestContext*) {
+        const float keep_h = obs_height;
+        seed_default();
+        g_lp_set = 1; g_lp_x = 0.2f; g_lp_z = -0.1f; obs_height = 1.3f;
+        IM_CHECK(save_json(TEST_OUT));
+        g_lp_set = 0; g_lp_x = g_lp_z = 0.0f; obs_height = 1.4f;
+        IM_CHECK(load_json(TEST_OUT) > 0);
+        IM_CHECK_EQ(g_lp_set, 1);
+        IM_CHECK_LT(fabsf(g_lp_x - 0.2f), 1e-4f);
+        IM_CHECK_LT(fabsf(g_lp_z + 0.1f), 1e-4f);
+        IM_CHECK_LT(fabsf(obs_height - 1.3f), 1e-4f);
+        {   /* the engine reads it: a fresh engine's listener sits at the declared point */
+            bwa_desc cfg; memset(&cfg, 0, sizeof cfg);
+            cfg.profile = BWA_PROFILE_CAVE; cfg.sample_rate = SR; cfg.block_size = 256;
+            cfg.layout_path = TEST_OUT;
+            bwa_engine* te2 = bwa_create(&cfg);
+            IM_CHECK(te2 != NULL);
+            if (te2) {
+                float p[3], q[4];
+                bwa_get_listener_pose(te2, p, q);
+                IM_CHECK_LT(fabsf(p[0] - 0.2f), 1e-3f);
+                IM_CHECK_LT(fabsf(p[1] - 1.3f), 1e-3f);
+                IM_CHECK_LT(fabsf(p[2] + 0.1f), 1e-3f);
+                bwa_destroy(te2);
+            }
+        }
+        g_lp_set = 0;
+        IM_CHECK(save_json(TEST_OUT));
+        g_lp_set = 1;
+        IM_CHECK(load_json(TEST_OUT) > 0);
+        IM_CHECK_EQ(g_lp_set, 0);                                 /* absent stays absent */
+        obs_height = keep_h; seed_default(); layout_dirty = 1;
     };
 
     /* a SMALLER array (a collaborator's 24 speakers): the count round-trips through the file, the

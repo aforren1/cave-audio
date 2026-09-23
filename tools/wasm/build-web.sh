@@ -74,6 +74,9 @@ for f in "$OUT_DIR"/bw_audio.*; do
   cp -f "$f" "$BWA_WEB_DIST/"
 done
 cp -f bindings/web/src/*.js "$BWA_WEB_DIST/"
+# The playground's default array (tools/layout/gen_dome.py writes it). In dist/ rather than beside
+# the page so it rides the same content-addressed URL as the engine that loads it.
+cp -f examples/dome_24.json "$BWA_WEB_DIST/"
 
 # The playground's browser third party (three.js), pinned and hashed, into dist/vendor/. It is a
 # separate script because it needs only curl: a developer with no emsdk can still fill vendor/, and

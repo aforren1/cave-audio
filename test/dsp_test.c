@@ -161,6 +161,20 @@ static int write_layout_n(const char* path, int n, int bad_index) {
     return 1;
 }
 
+/* The first `n` default-grid speakers plus a top-level "listening_point_m": <lp> (raw JSON text). */
+static int write_layout_lp(const char* path, int n, const char* lp) {
+    FILE* f = fopen(path, "wb");
+    if (!f) return 0;
+    static Layout g; layout_default(&g);
+    fprintf(f, "{ \"listening_point_m\": %s, \"speakers\": [\n", lp);
+    for (int k = 0; k < n; ++k)
+        fprintf(f, "  {\"index\":%d,\"position\":[%g,%g,%g]}%s\n", k, g.speakers[k].pos[0],
+                g.speakers[k].pos[1], g.speakers[k].pos[2], (k == n - 1) ? "" : ",");
+    fprintf(f, "] }\n");
+    fclose(f);
+    return 1;
+}
+
 /* A BARREL: 8 perimeter positions x 3 heights, no top or bottom cap — the CAVE array's real shape
  * (speakers mount in the band between the screen cube and the truss, so nothing covers the poles).
  * 24 speakers, 1.5 m radius, ear-height listener. */
@@ -806,6 +820,38 @@ int main(void) {
             CHECK(fabs(B.rolloff_r - 0.25 * s / B.count) < 1e-5,
                   "omitted rolloff_r derives from the mean centroid->speaker distance");
         }
+        {   /* no listening_point_m in the file -> ref is the centroid, exactly as before the field */
+            double c[3] = { 0, 0, 0 };
+            for (uint32_t k = 0; k < B.count; ++k)
+                for (int i = 0; i < 3; ++i) c[i] += B.speakers[k].pos[i];
+            int same = 1;
+            for (int i = 0; i < 3; ++i) if (fabs(B.ref[i] - c[i] / B.count) > 1e-5) same = 0;
+            CHECK(same, "a layout without listening_point_m reports the centroid as ref");
+        }
+        /* a declared listening point overrides the centroid, and the blur follows it */
+        write_layout_lp(NJ, 24, "[0.25, 1.2, -0.5]");
+        CHECK(layout_load(NJ, RATE, &B, err, sizeof err), err[0] ? err : "a layout with listening_point_m loads");
+        CHECK(fabsf(B.ref[0] - 0.25f) < 1e-6f && fabsf(B.ref[1] - 1.2f) < 1e-6f && fabsf(B.ref[2] + 0.5f) < 1e-6f,
+              "listening_point_m becomes ref");
+        {
+            double s = 0;
+            for (uint32_t k = 0; k < B.count; ++k) {
+                double dx = B.speakers[k].pos[0] - 0.25, dy = B.speakers[k].pos[1] - 1.2,
+                       dz = B.speakers[k].pos[2] + 0.5;
+                s += sqrt(dx * dx + dy * dy + dz * dz);
+            }
+            CHECK(fabs(B.rolloff_r - 0.25 * s / B.count) < 1e-5,
+                  "the derived blur is measured from the declared listening point");
+        }
+        {   /* malformed values reject the file, naming the field */
+            const char* bad[] = { "[0, 1.5]", "[0, 1.5, 0, 1]", "[0, 2e6, 0]", "[0, \"a\", 0]", "\"center\"", "[0, 1e999, 0]" };
+            for (size_t i = 0; i < sizeof bad / sizeof bad[0]; ++i) {
+                write_layout_lp(NJ, 24, bad[i]);
+                err[0] = 0;
+                CHECK(!layout_load(NJ, RATE, &B, err, sizeof err), "a malformed listening_point_m is rejected");
+                CHECK(strstr(err, "listening_point_m") != NULL, "the rejection names listening_point_m");
+            }
+        }
         write_layout_n(NJ, 3, -1);
         CHECK(!layout_load(NJ, RATE, &B, err, sizeof err), "fewer than 4 speakers is rejected");
         write_layout_n(NJ, BWA_MAX_CHANNELS, -1);
@@ -841,6 +887,38 @@ int main(void) {
             }
         }
         if (!found) printf("note: examples/cave_layout.json not found from CWD; integration check skipped\n");
+    }
+
+    /* 8b. the playgrounds' default array (examples/dome_24.json, tools/layout/gen_dome.py): 24
+     * speakers on a 2 m sphere around (0, 1.5, 0), none below the floor. The generator promises
+     * that geometry; this pins that the committed file still delivers it through the loader. */
+    {
+        const char* cands[] = { "examples/dome_24.json", "../examples/dome_24.json",
+                                "../../examples/dome_24.json", "../../../examples/dome_24.json" };
+        static Layout DM;
+        int found = 0;
+        for (size_t i = 0; i < sizeof cands / sizeof cands[0]; ++i) {
+            FILE* probe = fopen(cands[i], "rb");
+            if (probe) {
+                fclose(probe);
+                found = 1;
+                CHECK(layout_load(cands[i], RATE, &DM, err, sizeof err), err[0] ? err : "load examples/dome_24.json");
+                CHECK(DM.count == 24, "examples/dome_24.json has 24 speakers");
+                int floor_ok = 1, radius_ok = 1;
+                for (uint32_t k = 0; k < DM.count; ++k) {
+                    const float* q = DM.speakers[k].pos;
+                    double dx = q[0], dy = q[1] - 1.5, dz = q[2];
+                    if (q[1] < 0.f) floor_ok = 0;
+                    if (fabs(sqrt(dx * dx + dy * dy + dz * dz) - 2.0) > 1e-3) radius_ok = 0;
+                }
+                CHECK(floor_ok, "no dome speaker sits below the floor");
+                CHECK(radius_ok, "every dome speaker is 2.0 m (+-1 mm) from (0, 1.5, 0)");
+                CHECK(fabs(DM.ref[0]) < 1e-3 && fabs(DM.ref[1] - 1.5) < 1e-3 && fabs(DM.ref[2]) < 1e-3,
+                      "the dome's ref is its declared listening point (0, 1.5, 0), not the centroid");
+                break;
+            }
+        }
+        if (!found) printf("note: examples/dome_24.json not found from CWD; dome check skipped\n");
     }
 
     /* 9. SPCAP panner: localization, constant power, multi-speaker spread, non-negative gains */

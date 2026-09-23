@@ -17,8 +17,8 @@ Terms used here without definition are in [glossary.md](./glossary.md).
 
 ## Feature overview
 
-- Listener-relative spatialization over the speaker array (26 speakers on the
-  CAVE; any layout of 4 to `BWA_MAX_CHANNELS` (64) speakers works, and with no layout the
+- Listener-relative spatialization over the speaker array (the CAVE starts with 24
+  speakers and has room to grow; any layout of 4 to `BWA_MAX_CHANNELS` (64) speakers works, and with no layout the
   engine runs the 26-speaker `BWA_DEFAULT_GRID`), recomputed per audio block from the tracked head
   position: DBAP for a moving listener (the default), SPCAP/VBAP for a fixed one,
   an optional dual-band mode, per-source angular spread. SPCAP's lobe width defaults
@@ -134,7 +134,7 @@ starts as soon as you call, not at some later tick; you still adopt the result a
 ## Profiles and the master bus
 
 Every voice is panned into an in-memory **master bus**, one channel per speaker
-(26 on the CAVE array; see [Channel count](#channel-count)). The profile selects
+(24 on the CAVE array today; see [Channel count](#channel-count)). The profile selects
 who consumes it (and, for `BWA_PROFILE_BINAURAL`, changes how point sources
 render):
 
@@ -1497,7 +1497,7 @@ void bwa_set_bed_renderer(bwa_engine* e, bwa_bed_renderer renderer);   // live A
 Two renderers sit behind the same bed API:
 
 - **matrix** (default): the static SH→speaker decode above (AllRAD or EPAD per
-  `bwa_desc.bed_decoder`). Cheap and robust, but a 26-speaker array is sparse for a matrix
+  `bwa_desc.bed_decoder`). Cheap and robust, but an array of two dozen speakers is sparse for a matrix
   decode (directional content blurs) and the decode is world-locked around the array center.
 - **parametric** (`BWA_BED_PARAMETRIC`): first-order **DirAC-style** rendering. Per band, the
   non-diffuse stream is re-panned through the engine's own listener-relative panner, so a
@@ -2406,8 +2406,16 @@ center) with no path.
 `BWA_MAX_CHANNELS` (64) is only the *capacity*. It is a transport bound, not a rig detail: an
 ASIO, MADI or Dante endpoint carries 64 channels. A collaborator's 24-speaker array loads a
 24-entry layout into the same binary, the device opens 24 channels, and every consumer (panners,
-beds, reverb, monitor, calibration) follows. The CAVE is 26 today. A 36-speaker CAVE is a new
-layout file, not a recompile.
+beds, reverb, monitor, calibration) follows. The CAVE starts with 24 speakers and has room to
+grow. A 36-speaker CAVE is a new layout file, not a recompile.
+
+The three playgrounds (`bwa_playground`, the web page, the Godot addon's scene) do not run the
+default grid. They load `examples/dome_24.json`, a generated 24-speaker dome (2 m around a
+listening point 1.5 m up, spread evenly over the sphere above the floor), unless you give them a
+surveyed file. See the README's `bwa_playground` section for the lookup order.
+
+A layout can declare its listening point with `listening_point_m`; without it the engine listens
+from the array centroid (see [layout-schema.md](./layout-schema.md)).
 
 `BWA_DEFAULT_GRID` (26) is the default grid's count, not the capacity. The two numbers were the
 same before the capacity rose to 64, so do not use one where you mean the other.

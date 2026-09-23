@@ -16,13 +16,19 @@ thread. Three consumers read the result:
 **The speaker count in this file IS the engine's channel count.** Any N in **4..64** works
 (64 = `BWA_MAX_CHANNELS`, the compile-time capacity, which is the transport's bound). The count is
 fixed for the engine's lifetime and readable back with `bwa_get_channel_count` /
-`bwa_get_speakers`. The CAVE array is 26. A collaborator rig of any size in that range loads its
+`bwa_get_speakers`. The CAVE array starts with 24 and has room to grow. A collaborator rig of any size in that range loads its
 own N-speaker file into the same binary.
 
 A complete, valid example lives at [`../examples/cave_layout.json`](../examples/cave_layout.json):
 a 3×3×3 boundary grid minus the center = exactly 26 speakers, floor-origin, y layers at
 0 / 1.5 / 3 m, ears nominally at 1.5. That is the same shape as the built-in default grid
 (`BWA_DEFAULT_GRID`, 26 speakers) the engine runs with no file.
+
+A second valid file, [`../examples/dome_24.json`](../examples/dome_24.json), is the playgrounds'
+default array: 24 speakers on a 2 m sphere around (0, 1.5, 0), spread evenly over the part above
+the floor. `tools/layout/gen_dome.py` generates it; regenerate it rather than editing it. Its
+`note` field says so, since JSON has no comments. It declares `listening_point_m: [0, 1.5, 0]`,
+because the floor cut makes it top-heavy: its centroid sits at about y = 1.75 m.
 
 ## Authoring with `bwa_layout_tool`
 
@@ -348,6 +354,7 @@ cannot see the problem it most needs to.
   "schema_version": 1,
   "units":            { "position": "meters", "gain": "decibels", "delay": "milliseconds" },
   "coordinate_space": "room, right-handed, +y up, +z forward (matches OptiTrack/Motive default); origin ON THE FLOOR at the working-area center (x/z); y = height above the floor",
+  "listening_point_m": [0.0, 1.5, 0.0],     // optional; omit it and the engine uses the array centroid
   "reference": {
     "alignment":          "max-distance",   // how delay_ms was derived (documentation only)
     "ears_m":             1.4,              // the listening-point height it was derived AT
@@ -373,11 +380,12 @@ cannot see the problem it most needs to.
 |-------|------|---------|
 | `schema_version` | int | reserved for breaking format changes. The loader currently ignores it - it is neither validated nor stored. |
 | `units` | object | documentation only. The loader always converts dB → linear gain and ms → samples at the engine rate (positions are read as meters); changing this field has no effect. |
-| `coordinate_space` | string | documentation of the frame; positions MUST match the `coordinate_space` value above (**room space**, floor origin). The engine works in it and the Unity/Unreal binding converts at its boundary; full seam: [`integration.md`](./integration.md) → "Coordinate seam". The engine derives its **nominal listening point from the array centroid** (world-locked bed/monitor decode directions + the default listener position), so the origin's exact spot is not load-bearing. |
+| `coordinate_space` | string | documentation of the frame; positions MUST match the `coordinate_space` value above (**room space**, floor origin). The engine works in it and the Unity/Unreal binding converts at its boundary; full seam: [`integration.md`](./integration.md) → "Coordinate seam". The engine's **nominal listening point** (world-locked bed/monitor decode directions + the default listener position) is `listening_point_m` when the file has it, else the array centroid, so the origin's exact spot is not load-bearing. |
+| `listening_point_m` | `[x, y, z]` float (optional) | the nominal listening point, in room meters in the same frame as the speakers. Omit it and the engine uses the array centroid, which is right for a symmetric array. Set it for a top-heavy one: a floor-cut dome or a rig with more speakers overhead puts the centroid above your ears. It sets where a pose-less listener stands, where the world-locked decodes aim from, and the point the derived `rolloff_r` and SPCAP focus measure the array from. Exactly three finite numbers, each within ±1e6 m, or the file is rejected. `bwa_layout_tool` keeps it on save, with `y` following its ear-height slider. |
 | `reference` | object | provenance for the alignment values. Informational - the engine applies `delay_ms` as written. |
 | `reference.speed_of_sound_mps` | float (optional) | the room-temperature speed of sound the survey and the delay derivation assumed. `bwa_calibrate` records the value it used (`--temp` / `--c`) and reads it back on the next run, so a rig sets its temperature once; `bwa_layout_tool` reads it too, so both tools agree on one file. Range `306..380` m/s. Absent means the 20 C reference, 343.0. See [`calibration.md`](./calibration.md) -> "Air temperature". |
 | `reference.ears_m` | float (optional) | authoring only, engine-ignored: the listening-point height (meters above the floor) that `delay_ms` was time-aligned at, and the anchor the optimizer scored against. `bwa_layout_tool` writes it from `ears=<m>` and reads it back on load, so a file reopens at its own anchor. Without it, reopening a 1.2 m layout and saving silently re-aligns every delay to the 1.4 m default. An explicit `ears=<m>` on the command line still wins (it parses after the load). |
-| `dbap.rolloff_r` | float | the **blur** knob `r` from [`spatialization.md`](./spatialization.md): larger spreads energy over more speakers. Must be > 0; the loader floors it at 0.001 m (1 mm), below any audible blur. **Omit it and the loader derives it from the geometry**: `0.25 ×` the mean centroid→speaker distance (Sundstrom 2021 recommends 0.2–0.5 of it) - ~0.53 m on the default grid. An explicit value always wins; treat the derived one as the starting point to dial against the real array. |
+| `dbap.rolloff_r` | float | the **blur** knob `r` from [`spatialization.md`](./spatialization.md): larger spreads energy over more speakers. Must be > 0; the loader floors it at 0.001 m (1 mm), below any audible blur. **Omit it and the loader derives it from the geometry**: `0.25 ×` the mean listening-point→speaker distance, the centroid unless `listening_point_m` is set (Sundstrom 2021 recommends 0.2–0.5 of it) - ~0.53 m on the default grid. An explicit value always wins; treat the derived one as the starting point to dial against the real array. |
 | `dbap.distance_attenuation` | object | the source→listener distance-attenuation curve (the second tuning knob). The loader reads only `reference_distance_m` (> 0), `rolloff` (> 0), and `min_gain_db` (≤ 0; floors the attenuation). `model` is ignored - the inverse curve is the only one implemented. |
 | `pin_slab_m` | float (optional) | authoring only, engine-ignored: half-height of the ear-plane slab that `"pin": "plane"` speakers are confined to. Written by `bwa_layout_tool` when any speaker is pinned. |
 | `speakers[]` | array | **4..64** speaker records (64 = the compile-time `BWA_MAX_CHANNELS` capacity). **The speaker count IS the engine's channel count** - a 24-speaker install loads a 24-entry file into the same binary. Order is not significant for DBAP, but `index` is the channel the speaker maps to on the bus / ASIO output, and the indices must form a complete `0..N-1` permutation. |

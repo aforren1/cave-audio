@@ -19,6 +19,60 @@ import { SCENES } from "../playground/scenes/index.js";
 /** The lead a headset starts with. docs/web.md and the XR section of the README explain it. */
 export const DEFAULT_LEAD_S = 0.03;
 
+/**
+ * The engine block the XR page opens with: ONE Web Audio render quantum. At 256 the worklet sink's
+ * fixed-quantum adapter renders a whole 256-frame block inside every OTHER process() call and only
+ * copies out in the one between, so the render cost lands in half the callbacks at twice the size.
+ * On a mobile SoC running cave_sim (an HRTF convolution per virtual speaker) that spike was the
+ * crackle reported from a Galaxy XR (2026-09-23). At 128 every callback renders one block straight
+ * into its slot and copies it out: the adapter's pass-through case. The panel lets you A/B it.
+ */
+export const XR_DEFAULT_BLOCK = 128;
+export const BLOCK_CHOICES = [128, 256, 512];
+/** AudioContext latencyHint values offered. "interactive" is the default; "playback" asks the
+ * browser for a bigger device buffer, trading latency for headroom. */
+export const LATENCY_HINTS = ["interactive", "playback"];
+
+/** Web Audio's render quantum: 128 in 1.0; a 1.1 context may report its own. */
+export function quantumOf(app) {
+  const q = app.rig?.ctx?.renderQuantumSize;
+  return Number.isFinite(q) && q > 0 ? q : 128;
+}
+
+function pct(x) { return `${Math.round(x * 100)}%`; }
+
+/**
+ * The render load in one line, for the in-world panel (the DOM status table is out of sight in a
+ * headset). ASCII only: it can reach a console through the log.
+ *
+ * peakLoad is bwa_health.peak_load: the WORST single block's render time over one BLOCK period,
+ * since the engine started. When the block is bigger than the quantum the whole block still
+ * renders inside ONE process() call, so the number that matters for that call is the same time
+ * over one QUANTUM period: peakLoad * block / quantum.
+ */
+/** Late blocks over the recent window main.js keeps, or null before there are two samples. */
+export function recentLate(app) {
+  const hist = app.healthHist;
+  if (!hist || hist.length < 2) return null;
+  const a = hist[0], b = hist[hist.length - 1];
+  return { late: b.late - a.late, blocks: b.blocks - a.blocks, seconds: (b.t - a.t) / 1000 };
+}
+
+export function healthLine(app) {
+  const i = app.rig.engine?.info;
+  const h = app.rig.health;
+  if (!i || !h) return "audio health: waiting for the first poll";
+  const q = quantumOf(app);
+  const ratio = i.blockSize / q;
+  const perCall = h.peakLoad * ratio;
+  const r = recentLate(app);
+  const recent = r ? `${r.late} of ${r.blocks} in the last ${r.seconds.toFixed(0)} s` : "measuring";
+  return `Audio: block ${i.blockSize} / quantum ${q} (${ratio >= 1 ? ratio : ratio.toFixed(2)} ` +
+         `quanta per block). Late blocks: ${recent}; ${h.lateBlocks} of ${h.blocks} since start. ` +
+         `Peak render since start (includes start-up): ${pct(h.peakLoad)} of a block, ` +
+         `${pct(perCall)} of one process() call. Latency hint "${app.latencyHint ?? "interactive"}".`;
+}
+
 export function profileName(p) {
   return p === Profile.BINAURAL ? "binaural" : p === Profile.CAVE_SIM ? "cave_sim" : String(p);
 }
@@ -46,6 +100,30 @@ export function buildOptions(app) {
       hint: "A create-time choice, so switching rebuilds the engine. Your AudioContext survives it.",
     },
     {
+      /* A note with a LABEL: the panel's list signature reads the label, so the live text below
+       * repaints at 4 Hz without resetting the scroll. ui.js ignores the label on a note. */
+      kind: "note", label: "audio health",
+      get text() { return healthLine(app); },
+    },
+    {
+      kind: "select", label: "engine block (frames)",
+      options: BLOCK_CHOICES.map((b) => (b === XR_DEFAULT_BLOCK ? `${b} (one quantum, default)` : `${b}`)),
+      get: () => Math.max(0, BLOCK_CHOICES.indexOf(app.blockSize ?? XR_DEFAULT_BLOCK)),
+      set: (v) => { app.setEngineOptions({ blockSize: BLOCK_CHOICES[v] }); },
+      hint: "A create-time choice, so switching rebuilds the engine and the AudioContext. " +
+            "128 renders one block per Web Audio callback; bigger blocks render a whole block " +
+            "inside one callback and nothing in the next.",
+    },
+    {
+      kind: "select", label: "output latency hint",
+      options: ["interactive (default)", "playback (bigger device buffer)"],
+      get: () => Math.max(0, LATENCY_HINTS.indexOf(app.latencyHint ?? "interactive")),
+      set: (v) => { app.setEngineOptions({ latencyHint: LATENCY_HINTS[v] }); },
+      hint: "Fixed when an AudioContext is created, so switching builds a new context and a new " +
+            "engine. It needs no new gesture: the Enter VR press already unlocked audio for this " +
+            "page. Try playback if the audio crackles and the late-block count stays at 0.",
+    },
+    {
       kind: "select", label: "stimulus", options: app.rig.stimulusNames(),
       get: () => app.rig.signal,
       set: (v) => { app.rig.setSignal(v); re(); },
@@ -65,9 +143,19 @@ export function buildOptions(app) {
       hint: "WebXR already predicts the pose to DISPLAY time, so this is the extra distance to " +
             "the EARS: output latency plus one block. Too much overshoots on a direction change.",
     },
-    { kind: "note", text: "Trigger on the panel presses a control. Trigger or grip away from it " +
-                          "grabs the source with the nearer hand. Thumbstick X slides it, Y " +
-                          "pushes it away, grip plus Y raises it." },
+    {
+      /* What the thumbstick does, for hands: a hand has a pinch and nothing else. */
+      kind: "buttons", label: "move source (no thumbstick needed)",
+      items: ["left", "right", "up", "down"].map((w) => ({ label: w, onClick: () => app.stepSource(w) })),
+    },
+    {
+      kind: "buttons",
+      items: ["ahead", "back"].map((w) => ({ label: w, onClick: () => app.stepSource(w) })),
+    },
+    { kind: "note", text: "Trigger or pinch on the panel presses a control. Trigger, grip or " +
+                          "pinch-and-hold away from it grabs the source with the nearer hand and " +
+                          "carries it. Thumbstick X slides it, Y pushes it away, grip plus Y " +
+                          "raises it; with hands, use the move buttons above." },
   ];
   const own = app.scene && app.ctx ? app.scene.controls(app.ctx) : [];
   return items.concat(own);
@@ -94,9 +182,25 @@ export function statusRows(app) {
     rows.push(["bus channels", `${i.channelCount}`]);
     rows.push(["output latency", `${i.outputLatencyFrames} frames`]);
   }
+  const c = app.rig.ctx;
+  rows.push(["latency hint", app.latencyHint ?? "interactive"]);
+  if (c && Number.isFinite(c.baseLatency)) {
+    const out = Number.isFinite(c.outputLatency) ? `${(c.outputLatency * 1000).toFixed(1)} ms` : "-";
+    rows.push(["context latency (base / output)", `${(c.baseLatency * 1000).toFixed(1)} ms / ${out}`]);
+  }
+  if (i) {
+    const q = quantumOf(app);
+    rows.push(["block / quantum", `${i.blockSize} / ${q} = ${i.blockSize / q}`]);
+  }
   if (h) {
     rows.push(["blocks rendered", h.blocks]);
-    rows.push(["late blocks", h.lateBlocks]);
+    rows.push(["late blocks (since start)", h.lateBlocks]);
+    const r = recentLate(app);
+    if (r) rows.push(["late blocks (recent)", `${r.late} of ${r.blocks} in ${r.seconds.toFixed(1)} s`]);
+    /* bwa_health.peak_load: worst block render time over one block period, since start, so it
+     * includes the start-up blocks. */
+    rows.push(["peak load (per block)", pct(h.peakLoad)]);
+    if (i) rows.push(["peak load (per process() call)", pct(h.peakLoad * i.blockSize / quantumOf(app))]);
     rows.push(["device lost (host-paced)", h.deviceLost]);
   }
   return rows;

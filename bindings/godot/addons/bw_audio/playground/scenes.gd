@@ -47,7 +47,7 @@ class Base extends RefCounted:
 
 
 ## ============================ 1. Localization (pure DBAP) ============================
-## Move a source around a 26-speaker array and hear where it lands. SPACE auto-sweeps on
+## Move a source around the speaker array and hear where it lands. SPACE auto-sweeps on
 ## three incommensurate periods so the source covers the whole space rather than repeating a
 ## short loop; X is a fast straight flyby, which with Doppler on is the race-car pitch sweep.
 class Localization extends Base:

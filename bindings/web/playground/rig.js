@@ -49,6 +49,22 @@ const ZERO_PROBE = () => ({ l: 0, r: 0, msL: 0, msR: 0, n: 0 });
 /** Where an uploaded layout lands in the module's file system. MEMFS, so it dies with the module. */
 export const LAYOUT_PATH = "/cave_layout.json";
 
+/** The page's DEFAULT array: the generated 24-speaker dome (examples/dome_24.json, written by
+ * tools/layout/gen_dome.py), which build-web.sh stages into dist/. Same-origin like every other
+ * asset, and under the `../dist/` prefix so the site's content-addressed rewrite covers it. */
+export const DOME_URL = new URL("../dist/dome_24.json", import.meta.url);
+export const DOME_NAME = "dome_24.json";
+
+/**
+ * Fetch the dome's bytes, ready for `open({ layoutBytes })` or `setLayout`.
+ * @returns {Promise<Uint8Array>}
+ */
+export async function fetchDome() {
+  const r = await fetch(DOME_URL);
+  if (!r.ok) throw new Error(`${DOME_URL.pathname}: HTTP ${r.status}`);
+  return new Uint8Array(await r.arrayBuffer());
+}
+
 /** Where the stimulus wavs land, in the same file system. They die with the module too. */
 const STIM_DIR = "/stim";
 /** The index the uploaded clip takes in the picker: after every built-in signal. */
@@ -75,7 +91,7 @@ export class Rig {
     this.outProbe = ZERO_PROBE();             /* the same measurement, on a check's own clock */
     this.activeVoices = 0;
     this.health = null;
-    this.layoutBytes = null;                  /* the uploaded layout, kept across rebuilds */
+    this.layoutBytes = null;                  /* the loaded layout (dome or upload), kept across rebuilds */
     this.layoutName = null;
     this.module = null;                       /* the wasm module, reused by every rebuild */
     this._pollBusy = false;
@@ -91,7 +107,8 @@ export class Rig {
    * @param {AudioContext} opts.audioContext
    * @param {number} [opts.profile]
    * @param {number} [opts.blockSize]
-   * @param {Uint8Array} [opts.layoutBytes] a cave_layout.json to load instead of the default grid
+   * @param {Uint8Array} [opts.layoutBytes] a cave_layout.json to load; null runs the engine's
+   *   built-in grid. The playground passes the dome (fetchDome); the XR page passes nothing.
    * @param {object} [opts.module] an engine module to build on instead of instantiating one
    */
   async open({ audioContext, profile = Profile.CAVE_SIM, blockSize = 256,
@@ -99,12 +116,11 @@ export class Rig {
     this.ctx = audioContext;
     this.profile = profile;
     this.layoutBytes = layoutBytes;
-    /* No layoutPath by default. The engine's default grid IS the BWA_DEFAULT_GRID (26) geometry
-     * examples/cave_layout.json describes (a 3x3x3 boundary grid at +/-1.5 m, y 0/1.5/3, minus the
-     * center), and the page reads the positions back with bwa_get_speakers rather than assuming
-     * them - so the gizmos are the engine's layout whatever it turns out to be. An UPLOADED layout
-     * takes the other route: its bytes go into the module's file system before bwa_create, because
-     * create opens that path inside its own call. */
+    /* No layoutPath without bytes: the engine then runs its built-in BWA_DEFAULT_GRID (26), the
+     * 3x3x3 boundary grid examples/cave_layout.json describes. With bytes (the dome, or an upload)
+     * they go into the module's file system before bwa_create, because create opens that path
+     * inside its own call. Either way the page reads the positions back with bwa_get_speakers
+     * rather than assuming them, so the gizmos are the engine's layout whatever it turns out to be. */
     this.engine = await BwaEngine.create({
       audioContext,
       profile,
@@ -176,9 +192,9 @@ export class Rig {
   }
 
   /**
-   * Rebuild the engine on an uploaded `cave_layout.json`. `null` goes back to the default grid.
+   * Rebuild the engine on a `cave_layout.json`'s bytes. `null` runs the engine's built-in grid.
    * The caller validates the JSON first; the ENGINE is still the authority, and a file it rejects
-   * leaves a usable engine on the default grid whose `bwa_start` then refuses with BWA_ERR_LAYOUT
+   * leaves a usable engine on the built-in grid whose `bwa_start` then refuses with BWA_ERR_LAYOUT
    * (CLAUDE.md). That throw is the caller's to report.
    * @param {Uint8Array|null} bytes
    */

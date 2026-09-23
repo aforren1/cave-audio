@@ -421,8 +421,8 @@ ordering and normalization. The engine converts it on load. See
 ### Ambisonic order
 
 `N`, where the channel count is `(N+1)^2`. The engine defaults to **3rd order, 16 channels**
-(`BWA_AMBI_CH`), the sweet spot for the CAVE's 26-speaker array (4th order's 25 channels nearly match the
-26 HRTF convolutions it exists to avoid; 1st to 2nd visibly blurs). The reflection bed runs
+(`BWA_AMBI_CH`), the sweet spot for the CAVE's 24-speaker array (4th order's 25 channels would exceed the
+24 HRTF convolutions it exists to avoid; 1st to 2nd visibly blurs). The reflection bed runs
 **lower** order (default 1) on purpose: diffuse energy carries spaciousness, not primary
 localization. See
 [spatialization.md](./spatialization.md#headphone-renders-direct-binaural-and-the-array-sim).
@@ -459,7 +459,7 @@ Energy-Preserving Ambisonic Decoding (Zotter, Pomberger and Noisternig 2012), th
 decoder (`src/spatial/epad.c`): the **polar factor** of the transposed encode matrix,
 `D = c * Y^T (YY^T)^(-1/2)`, built by a 16x16 Jacobi eigensolve at load. The trade against
 [AllRAD](#allrad): EPAD makes a panned plane wave's decoded energy constant over direction **by
-construction**, while AllRAD tends to localize a touch sharper. Which wins on the real 26 is a
+construction**, while AllRAD tends to localize a touch sharper. Which wins on the real array is a
 by-ear A/B. Measured numbers:
 [spatialization.md](./spatialization.md#diffuse-bed-decode-allrad-versus-epad).
 

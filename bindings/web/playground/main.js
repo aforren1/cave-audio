@@ -20,8 +20,8 @@
  * way in: a headless browser cannot click a slider and read a cone's color. It exposes the same
  * state the controls write, so the check drives the real scene rather than a test-only path.
  */
-import { Profile, MAX_CHANNELS, DEFAULT_GRID } from "../dist/index.js";
-import { Rig } from "./rig.js";
+import { Profile, MAX_CHANNELS } from "../dist/index.js";
+import { Rig, fetchDome, DOME_NAME } from "./rig.js";
 import { World } from "./world.js";
 import { renderControls, renderReadout } from "./ui.js";
 import { screenSideOf } from "./frame.js";
@@ -36,6 +36,7 @@ const app = {
   ctx: null,
   running: false,
   wantProfile: Profile.CAVE_SIM,
+  domeBytes: null,        /* the default array's file (rig.js fetchDome), null when it did not load */
   lastT: 0,
   slowT: 0,
   errors: [],
@@ -146,7 +147,7 @@ function drawStatus() {
     `sink ${i.backend}`,
     `context ${app.rig.ctx?.state ?? "-"}`,
     `${app.rig.speakerCount} speakers`,
-    app.rig.layoutName ? `layout ${app.rig.layoutName}` : "default grid",
+    app.rig.layoutName ? `layout ${app.rig.layoutName}` : "engine default grid",
   ];
   /* Said next to the cones, not only in the panel: in this profile they are dark because the
    * voices never reach the bus, and a dark array with no explanation reads as a broken meter. */
@@ -178,12 +179,12 @@ function drawControls() {
       kind: "file", label: "speaker layout (cave_layout.json)", accept: ".json,application/json",
       set: (text, name) => loadLayout(text, name),
       hint: "Rebuilds the array on the surveyed geometry in the file, and the cones follow " +
-            `bwa_get_speakers. Leave it alone for the default ${DEFAULT_GRID}-speaker grid.`,
+            `bwa_get_speakers. Leave it alone for the default 24-speaker dome (${DOME_NAME}).`,
     },
-    ...(app.rig.layoutName
+    ...(app.rig.layoutName !== DOME_NAME && app.domeBytes
       ? [{
           kind: "buttons", label: "",
-          items: [{ label: "back to the default grid", onClick: () => loadLayout(null, null) }],
+          items: [{ label: "back to the 24-speaker dome", onClick: () => loadLayout(null, null) }],
         }]
       : []),
     {
@@ -252,31 +253,34 @@ function validateLayout(text) {
 }
 
 /**
- * Rebuild the array on an uploaded layout, or on the default grid when `text` is null.
+ * Rebuild the array on an uploaded layout, or back on the page's default (the dome) when `text` is
+ * null. The engine's built-in grid is only what runs when the dome itself could not be fetched.
  * @param {string|null} text
  * @param {string|null} name the file name, for the status line
  */
 async function loadLayout(text, name) {
-  let bytes = null;
+  let bytes = app.domeBytes;
+  let label = app.domeBytes ? DOME_NAME : null;
   if (text !== null) {
     const problem = validateLayout(text);
     if (problem) { log(`layout "${name}": ${problem}`, true); return false; }
     bytes = new TextEncoder().encode(text);
+    label = name;
   }
   try {
     await app.rig.setLayout(bytes);
-    app.rig.layoutName = name;
+    app.rig.layoutName = label;
     afterRebuild();
     await app.scene?.enter(app.ctx);
-    log(`layout -> ${name ?? "the default grid"}: ${app.rig.speakerCount} speakers, engine rebuilt`);
+    log(`layout -> ${label ?? "the engine default grid"}: ${app.rig.speakerCount} speakers, engine rebuilt`);
   } catch (e) {
     /* The engine is the authority, and it refuses a bad layout in TWO steps (CLAUDE.md): create
-     * stays usable on the default grid, and START refuses with BWA_ERR_LAYOUT carrying the reason.
+     * stays usable on the built-in grid, and START refuses with BWA_ERR_LAYOUT carrying the reason.
      * That throw lands here, and the page has to SAY it rather than sit silent - then go back to a
-     * layout that does start, or there is nothing to listen to. */
+     * layout that does start (the dome), or there is nothing to listen to. */
     log(`the engine refused that layout: ${e.message}`, true);
-    app.rig.layoutName = null;
-    await app.rig.setLayout(null);
+    app.rig.layoutName = app.domeBytes ? DOME_NAME : null;
+    await app.rig.setLayout(app.domeBytes);
     afterRebuild();
     await app.scene?.enter(app.ctx);
     drawControls();
@@ -435,7 +439,17 @@ async function start() {
     app.world = new World(el("view"));
     globalThis.addEventListener("resize", () => app.world.resize());
 
-    const info = await app.rig.open({ audioContext: ctx, profile: app.wantProfile });
+    /* The page's array is the 24-speaker dome, fetched once and kept for every rebuild and for the
+     * "back to the dome" button. A missing file is reported and the engine's built-in grid runs. */
+    try {
+      app.domeBytes = await fetchDome();
+    } catch (e) {
+      app.domeBytes = null;
+      log(`no ${DOME_NAME} (${e.message}); running the engine's built-in grid instead`, true);
+    }
+    const info = await app.rig.open({ audioContext: ctx, profile: app.wantProfile,
+                                      layoutBytes: app.domeBytes });
+    app.rig.layoutName = app.domeBytes ? DOME_NAME : null;
     log(`engine up: ${info.sampleRate} Hz, block ${info.blockSize}, ${info.channelCount} bus ` +
         `channels, backend "${info.backend}"`);
     if (info.lastError) log(`open note: ${info.lastError}`);
@@ -529,7 +543,7 @@ globalThis.__bwaPlayground = {
   invoke(name, ...args) { return app.rig.engine.invoke(name, ...args); },
   /** Load a clip the way the audio file input does. Takes the file's bytes, as that input hands them over. */
   loadClip(bytes, name) { return loadClip(bytes, name); },
-  /** Upload a layout the way the file input does. `null` goes back to the default grid. */
+  /** Upload a layout the way the file input does. `null` goes back to the dome. */
   loadLayout(text, name) { return loadLayout(text, name); },
   /** Switch the page's render profile, which rebuilds the engine. Same path the picker takes. */
   async setProfile(p) {

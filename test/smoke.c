@@ -838,7 +838,48 @@ done:
     return rc;
 }
 
-int main(void) {
+/* the playgrounds' default array, through the public ABI: examples/dome_24.json must create a
+ * 24-channel engine whose bwa_get_speakers readback is the generator's geometry (every speaker
+ * 2.0 m from (0, 1.5, 0), none below the floor). ctest passes the file's SOURCE-TREE path; a run
+ * that cannot see that tree (an Android device, a wasm runtime) says so and skips. */
+static int run_dome_layout(const char* path) {
+    FILE* probe = path ? fopen(path, "rb") : NULL;
+    if (!probe) { printf("note: dome layout '%s' not reachable; dome check skipped\n", path ? path : "(none)"); return 0; }
+    fclose(probe);
+    bwa_desc cfg = {
+        .profile     = BWA_PROFILE_CAVE,
+        .layout_path = path,
+        .sink        = BWA_SINK_NULL,
+    };
+    bwa_engine* e = bwa_create(&cfg);
+    if (!e) { fprintf(stderr, "FAIL[dome]: bwa_create returned NULL\n"); return 1; }
+    int rc = 1;
+    float xyz[3 * BWA_MAX_CHANNELS];
+    const uint32_t n = bwa_get_speakers(e, xyz, BWA_MAX_CHANNELS);
+    if (bwa_get_channel_count(e) != 24 || n != 24) {
+        const char* err = bwa_last_error(e);
+        fprintf(stderr, "FAIL[dome]: %s loaded %u speakers (channels %u), want 24: %s\n", path, n,
+                bwa_get_channel_count(e), err ? err : "(no error)");
+        goto done;
+    }
+    for (uint32_t k = 0; k < n; ++k) {
+        const float* q = xyz + 3 * k;
+        const double dy = q[1] - 1.5, r = sqrt((double)q[0] * q[0] + dy * dy + (double)q[2] * q[2]);
+        if (q[1] < 0.f || fabs(r - 2.0) > 1e-3) {
+            fprintf(stderr, "FAIL[dome]: speaker %u at (%g, %g, %g): y must be >= 0 and |p - (0,1.5,0)| = 2 m, got %g\n",
+                    k, q[0], q[1], q[2], r);
+            goto done;
+        }
+    }
+    if (bwa_start(e) != 0) { fprintf(stderr, "FAIL[dome]: bwa_start: %s\n", bwa_last_error(e)); goto done; }
+    bwa_stop(e);
+    rc = 0;
+done:
+    bwa_destroy(e);
+    return rc;
+}
+
+int main(int argc, char** argv) {
     /* Engine-free, so it has to answer before any bwa_create, and it has to be a real ns clock. */
     {
         const uint64_t h0 = bwa_host_time_ns();
@@ -857,6 +898,7 @@ int main(void) {
     if (run_profile(BWA_PROFILE_CAVE_BOTH, "cave_both")) return 1;
     if (run_room_eq_guard())                          return 1;
     if (run_layout_strict())                          return 1;
+    if (run_dome_layout(argc > 1 ? argv[1] : NULL))  return 1;
     if (run_push_guard())                             return 1;
     if (run_binaural_laterality(BWA_PROFILE_BINAURAL, "binaural")) return 1;   /* the direct render */
     if (run_binaural_laterality(BWA_PROFILE_CAVE_SIM, "cave_sim")) return 1;   /* the array audition */
@@ -865,6 +907,6 @@ int main(void) {
     if (run_bed_batch())                              return 1;
     if (run_tuning())                                 return 1;
     if (run_ergonomics())                             return 1;
-    printf("smoke OK (cave, binaural, cave_sim, cave_both lifecycles; room_eq start guard; push kind guards; binaural + cave_sim laterality; headphone EQ; material release/reuse; bed gains batch; situation tuning; completion events + tuning readback + box mesh)\n");
+    printf("smoke OK (cave, binaural, cave_sim, cave_both lifecycles; room_eq start guard; dome layout; push kind guards; binaural + cave_sim laterality; headphone EQ; material release/reuse; bed gains batch; situation tuning; completion events + tuning readback + box mesh)\n");
     return 0;
 }

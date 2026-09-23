@@ -34,7 +34,7 @@ the 3×3 m roam, against 5.0°/25.5° for tracked DBAP on the same speakers. The
 static decode is the best render on the array at the center, and it loses 3× to the
 tracked panner everywhere else. The physics sets that scale. An order-N decode
 reconstructs the field only within roughly N·c/(2πf) of the center, about 16 cm
-at 1 kHz for 3rd order. No order the CAVE's 26 speakers can drive reaches a 3 m working
+at 1 kHz for 3rd order. No order the CAVE's 24 speakers can drive reaches a 3 m working
 volume.
 
 > **Fixed-observer installs are a supported mode.** The case above is the *moving*,
@@ -639,7 +639,7 @@ Two decode implementations sit behind the same seam:
   laterality, not timbre or externalization.
 
 The production decode is efficient: do **not** run one HRTF convolution per bus
-channel (26 of them on the CAVE array):
+channel (24 of them on the CAVE array):
 1. Treat each bus channel as a virtual speaker at its surveyed room **direction**
    relative to the listener. This is where head **orientation** enters: rotate the
    speaker directions with the head.
@@ -670,9 +670,9 @@ so they cannot drift apart):
   `test_ambi` only checks m≥0 and will not catch a mirror.
 
 **Ambisonic order:** default to **3rd order (16 channels, 3D)** for the
-encode/decode. This is the right balance for the CAVE's 26-speaker array: order `N` uses
+encode/decode. This is the right balance for the CAVE's 24-speaker array: order `N` uses
 `(N+1)²` channels, so 3rd order is 16 and 4th is 25. By 4th order the ambisonic bus
-is nearly as wide as doing the 26 HRTF convolutions directly, which defeats the
+is wider than doing the 24 HRTF convolutions directly, which defeats the
 purpose. 1st–2nd order (4–9 ch) noticeably blurs the directionality the array is
 there to reproduce. Expose the order as a config/build knob (alongside `r` and the
 distance curve) so you can trade it against CPU on the monitor path, but 3rd order
@@ -725,7 +725,7 @@ non-triangulable fallback.
   time (`xval` pins it against numpy's SVD polar factor). A degenerate array falls
   back to sampling. Loudness-versus-direction is EPAD's win (the `dsp` test measures
   CV ≈ 0.09 versus sampling's 0.95 on a clustered array). AllRAD tends to localize a
-  touch sharper. Which sounds better on the real 26 is a by-ear A/B.
+  touch sharper. Which sounds better on the real array is a by-ear A/B.
 
 Validated against the cube grid + a deliberately clustered array (per-direction
 energy CV / rE error): on the near-uniform cube AllRAD matches sampling (≈7% CV, a
@@ -760,7 +760,7 @@ The fix is three fixed per-order IIR sections on the bed SH channels
 ## Parametric bed rendering (`bwa_set_bed_renderer`, live A/B)
 
 Any matrix decode, sampling or AllRAD, has two limits on this rig. The array is
-sparse for 3rd-order content: 26 speakers on the CAVE, so directional material
+sparse for 3rd-order content: 24 speakers on the CAVE, so directional material
 blurs. The decode is also locked to the array center, and walking off-center skews a
 recorded field in exactly the way the engine's listener-relative panning was built
 to avoid.

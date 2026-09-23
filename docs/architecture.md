@@ -6,7 +6,7 @@ spatial-audio term it uses, see [glossary.md](./glossary.md).
 ## Goal
 
 Render spatialized audio for a CAVE. A tracked observer moves within a ~3×3 m area
-inside a **26-speaker array**. A game engine (Unity and/or Unreal) drives it.
+inside a **24-speaker array** (with room to grow). A game engine (Unity and/or Unreal) drives it.
 Output goes to an **RME Digiface Dante** over **ASIO**. Latency and timing
 precision are first-class requirements.
 
@@ -209,8 +209,8 @@ The tap ordering is deliberate, not incidental:
 *capacity*, set by the transport: an ASIO, MADI or Dante endpoint carries 64 channels. The
 **active** count is whatever the loaded `cave_layout.json` declares (any N in
 4..`BWA_MAX_CHANNELS`, fixed at `bwa_create`). With no layout, it is `BWA_DEFAULT_GRID` (26),
-the built-in grid. Everything downstream follows that count. The CAVE installation is 26
-speakers. That is the target deployment, not an engine limit. Details and the failed-load fence: [api.md](./api.md#channel-count).
+the built-in grid. Everything downstream follows that count. The CAVE installation starts
+with 24 speakers and has room to grow. That is the target deployment, not an engine limit. Details and the failed-load fence: [api.md](./api.md#channel-count).
 
 ## Profiles
 
@@ -253,7 +253,7 @@ orientation component.
   The array goes over ASIO and nothing else. The consumer paths (WDM, and WASAPI shared mode
   over it) bring their own mixing, resampling and channel limits, and none of them give you the
   timing hooks below. An array's channel count makes ASIO mandatory, and the device must expose
-  enough outputs for your layout: 26 for the CAVE array. A **stereo monitor** is a different
+  enough outputs for your layout: 24 for the CAVE array today. A **stereo monitor** is a different
   problem with a different answer: it wants the device the headphones are already on, it shares
   that device with everything else the machine is playing, and its timing only has to be
   consistent. So the headphone profiles open a WASAPI endpoint by default and the automatic

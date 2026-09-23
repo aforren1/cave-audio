@@ -1,7 +1,7 @@
 # bw_audio
 
 Self-hosted spatial audio engine for a CAVE installation. It drives a speaker array (up
-to 64 channels; the CAVE has 26) over ASIO into an RME Digiface Dante. A second path
+to 64 channels; the CAVE starts with 24, with room to grow) over ASIO into an RME Digiface Dante. A second path
 does **binaural HRTF headphone rendering**: a first-class direct render, plus an array-audition monitor
 for desk-side debugging. Game engines and experiment frameworks connect as thin
 control clients over a C ABI. No rendered audio crosses that boundary, only control.
@@ -11,7 +11,7 @@ grouped by topic. Each entry says what the term means for a decision.
 
 **Hear it now.** The engine runs in a browser: [aforren1.github.io/cave-audio](https://aforren1.github.io/cave-audio/)
 is the minimal orbit and the six-scene playground, the same WebAssembly build of the same
-code, on headphones. Chromium is what it is tested in. Every push to main redeploys it.
+code, on headphones. The playground runs a generated 24-speaker dome by default. Chromium is what it is tested in. Every push to main redeploys it.
 
 ## Status
 
@@ -20,9 +20,9 @@ goldens against independent implementations, the simulate modes of the calibrati
 validation tools, and off-wire parser tests.
 
 **Nothing is verified on the rig yet.** Do not read a green test run as a working
-26-speaker array. These parts need the hardware:
+speaker array. These parts need the hardware:
 
-- the 26-channel ASIO path into the Digiface, and the full-duplex capture that both
+- the multichannel ASIO path into the Digiface, and the full-duplex capture that both
   measurement tools use,
 - live Motive tracking. The NatNet parser and its lifecycle are tested off-wire only.
 - the Zylia channel order and azimuth reference. Both survive every off-hardware check,
@@ -408,6 +408,14 @@ null sink and keeps rendering, visual-only, live, just silent. The render picker
 to `binaural` (the direct per-source render, for by-ear A/Bs against the sim) or `cave`
 (the array itself over ASIO, the same harness pointed at real speakers on the rig
 machine). A headphone-EQ field loads an AutoEq correction for your headphones.
+
+The array is a generated 24-speaker dome by default: `examples/dome_24.json`, 2 m around a
+listening point 1.5 m above the floor, spread evenly over the part of the sphere above the
+floor (`tools/layout/gen_dome.py` writes it, and CMake copies it next to the exe). To audition a
+surveyed array instead, pass its file (`bwa_playground my_layout.json`) or put a
+`cave_layout.json` in the working directory. The order is: the argument, `./cave_layout.json`,
+the dome, then the engine's built-in 26-speaker grid. The startup line says which one loaded.
+The web and Godot playgrounds default to the same dome.
 
 Scenes: localization, occlusion + materials, directivity, channel walk,
 reverb bed, an underwater medium boundary (live FDN retune, speed of sound,

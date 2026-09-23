@@ -70,7 +70,7 @@ conversion with a known-position test source before trusting anything else.
 ## Channel count
 
 The engine's channel count is **the layout's speaker count** (4..`BWA_MAX_CHANNELS`, which is
-64), not a constant. The CAVE array is 26; a smaller or larger rig loads its own file. Read
+64), not a constant. The CAVE array starts with 24 and has room to grow; a smaller or larger rig loads its own file. Read
 it back with `bwa_get_channel_count` (or `bwa_get_speakers`, which returns the same number) and size any
 meter / speaker-gizmo / channel-test array from it. Never hard-code a speaker count in a binding.
 
@@ -602,7 +602,10 @@ plus a `BwaEmitter`.
 No 1:1 binding layer: GDExtension needs no P/Invoke shim, so every call lives as a method
 on the class owning its handle (`BwaEngine`, `BwaSource` → `BwaEmitter`/`BwaPushSource`,
 `BwaBed`), plus scene-authored acoustics (`BwaMaterial`, `Bwa{Acoustic,Dynamic}Geometry`,
-`BwaRoomBox`) and a live `BwaSpeakerView`. The by-ear playground ships inside the addon.
+`BwaRoomBox`) and a live `BwaSpeakerView`. The by-ear playground ships inside the addon, with its default
+array: `dome_24.json`, the same generated 24-speaker dome the native and web playgrounds load.
+Pass a surveyed file as a user argument (`godot ... -- my_layout.json`) or put a
+`cave_layout.json` beside the executable or in the project root to use that instead.
 
 The 0.12.0 convenience tier lands as three things. Assets: `BwaEngine` no longer keeps a cache
 of its own. It acquires through the core's `(path, flags)` cache, and keeps only a record of

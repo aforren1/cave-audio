@@ -54,7 +54,8 @@ typedef struct {
 typedef struct {
     Speaker  speakers[BWA_CHANNELS];
     uint32_t count;                 /* 4..BWA_CHANNELS once validated (the engine's channel count) */
-    /* nominal listening point = the array CENTROID, computed at load. The world-locked decodes
+    /* nominal listening point = the file's `listening_point_m` when it declares one, else the array
+     * CENTROID, computed at load. The world-locked decodes
      * (ambisonic/reflection/pathing beds, the monitor's virtual-speaker encode) take their speaker
      * DIRECTIONS from here, and it is the engine's default listener pose — so the room origin can
      * sit anywhere (canonically on the floor, Motive-style) without skewing a decode. */

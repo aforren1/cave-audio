@@ -16,10 +16,11 @@ const ok = (m) => notes.push("ok   " + m);
 const fail = (m) => notes.push("FAIL " + m);
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-/* BWA_DEFAULT_GRID, the page's layout when nothing was uploaded. A literal because this is a
- * classic script the runner injects and it cannot import the binding; constants.test.mjs pins the
- * exported value to the same number, so the two cannot drift apart unnoticed. */
-const DEFAULT_GRID = 26;
+/* The page's layout when nothing was uploaded: examples/dome_24.json, the generated 24-speaker
+ * dome, fetched from dist/. Not BWA_DEFAULT_GRID (26): the page passes a layout, so the engine's
+ * built-in grid only runs if that fetch fails, and that failure is what these pins catch. */
+const DOME = 24;
+const DOME_NAME = "dome_24.json";
 
 const db = (x) => (20 * Math.log10(Math.max(x, 1e-9))).toFixed(1);
 
@@ -60,12 +61,27 @@ async function main() {
   else ok(`backend "${s.backend}"`);
   if (s.sinkType !== 9) fail(`sink type ${s.sinkType}, expected 9 (WORKLET)`);
   else ok("sink type 9 (WORKLET)");
-  if (s.channelCount !== DEFAULT_GRID)
-    fail(`${s.channelCount} bus channels, expected the ${DEFAULT_GRID} of the default grid`);
-  else ok(`${DEFAULT_GRID} bus channels`);
-  if (s.speakerCount !== DEFAULT_GRID)
-    fail(`bwa_get_speakers gave ${s.speakerCount} speakers, expected ${DEFAULT_GRID}`);
-  else ok(`bwa_get_speakers read back ${DEFAULT_GRID} speaker positions`);
+  if (s.channelCount !== DOME)
+    fail(`${s.channelCount} bus channels, expected the ${DOME} of the default dome`);
+  else ok(`${DOME} bus channels`);
+  if (s.speakerCount !== DOME)
+    fail(`bwa_get_speakers gave ${s.speakerCount} speakers, expected ${DOME}`);
+  else ok(`bwa_get_speakers read back ${DOME} speaker positions`);
+  {   /* the dome's geometry, read back out of the engine: 2 m from (0, 1.5, 0), none below the floor */
+    const p = s.layout.speakers;
+    let worst = 0, lowest = Infinity;
+    for (let k = 0; k < s.speakerCount; ++k) {
+      const x = p[3 * k], y = p[3 * k + 1], z = p[3 * k + 2];
+      worst = Math.max(worst, Math.abs(Math.hypot(x, y - 1.5, z) - 2.0));
+      lowest = Math.min(lowest, y);
+    }
+    if (!(worst < 1e-3) || !(lowest >= 0))
+      fail(`the default layout is not the dome: radius error ${worst.toFixed(4)} m, lowest y ${lowest}`);
+    else ok(`the default layout is the dome (radius error ${(worst * 1000).toFixed(2)} mm, lowest y ${lowest.toFixed(3)} m)`);
+    if (!String(s.view.status).includes("layout " + DOME_NAME))
+      fail(`the status line does not name ${DOME_NAME}: "${s.view.status}"`);
+    else ok(`the status line names ${DOME_NAME}`);
+  }
 
   /* ---- SCENE 1: the coordinate seam, on screen and in the ears ---- */
   await pg.selectScene("localization");
@@ -265,7 +281,7 @@ async function main() {
   const st = pg.sceneState();
   if (!st) throw new Error("the channel-walk scene exposed no state");
   st.auto = false;
-  for (const ch of [0, 7, 19, 25]) {
+  for (const ch of [0, 7, 19, DOME - 1]) {   /* the last is the layout's last channel */
     st.channel = ch;
     await sleep(500);
     const now = pg.state();
@@ -480,8 +496,9 @@ async function layoutChecks(pg) {
   else ok("a layout with too few speakers is refused before the engine is touched");
 
   /* A file the page CANNOT refuse but the engine does: gain_db 99 is outside the loader's
-   * [-100, 24]. The engine's rule is that create stays usable on the default grid and START then
-   * refuses with BWA_ERR_LAYOUT, so what the page owes is the reason and a working engine. */
+   * [-100, 24]. The engine's rule is that create stays usable on its built-in grid and START then
+   * refuses with BWA_ERR_LAYOUT, so what the page owes is the reason and a working engine, which it
+   * gets by going back to the dome. */
   const bad = testLayout(8);
   bad.speakers[2].gain_db = 99;
   const refused = await pg.loadLayout(JSON.stringify(bad), "bad-gain.json");
@@ -489,15 +506,19 @@ async function layoutChecks(pg) {
   if (refused !== false) fail("the engine accepted a layout with gain_db 99");
   else if (!after.errors.some((e) => /refused that layout/.test(e)))
     fail(`the page did not report the engine's refusal: ${after.errors.join(" | ")}`);
-  else if (after.speakerCount !== DEFAULT_GRID)
-    fail(`after the refusal the page is on a ${after.speakerCount}-speaker layout, not the default grid`);
+  else if (after.speakerCount !== DOME || after.layout.name !== DOME_NAME)
+    fail(`after the refusal the page is on a ${after.speakerCount}-speaker layout (${after.layout.name}), not the dome`);
   else if (after.health && after.health.deviceLost !== 0)
     fail("after the refusal the sink is host-pacing silence");
-  else ok(`an engine-refused layout is reported and the page falls back to the default grid`);
+  else ok(`an engine-refused layout is reported and the page falls back to the dome`);
 
+  /* reset: back to the dome from an upload, not to the engine's built-in grid */
+  await pg.loadLayout(JSON.stringify(testLayout(8)), "driver-8b.json");
   await pg.loadLayout(null, null);
-  if (pg.state().speakerCount !== DEFAULT_GRID) fail("the page did not go back to the default grid");
-  else ok("the page goes back to the default grid");
+  const reset = pg.state();
+  if (reset.speakerCount !== DOME || reset.layout.name !== DOME_NAME)
+    fail(`reset left the page on ${reset.speakerCount} speakers (${reset.layout.name}), not the dome`);
+  else ok("reset goes back to the dome");
 }
 
 /**

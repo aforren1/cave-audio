@@ -2,7 +2,7 @@
 
 Unity **control client** for the bw_audio spatial-audio engine. Unity is a *thin* client: it sends
 control (source positions, triggers, listener pose) over the engine's C ABI. **No audio crosses the
-boundary.** The engine renders the 26-speaker CAVE array over ASIO/Dante and a binaural monitor.
+boundary.** The engine renders the CAVE's speaker array (24 to start) over ASIO/Dante and a binaural monitor.
 
 This is a UPM package: a verified P/Invoke layer (`Bwa`) plus two MonoBehaviours - a scene manager
 (`Engine`) and a positional emitter (`Emitter`) - and the coordinate seam (`Room`).
@@ -70,7 +70,7 @@ Install package from tarball…**. That's the whole install.
 
 Either route pins by hand rather than resolving, so neither notifies you of upgrades. Take the newer
 one and install it again. (This package isn't on a registry: it exists to drive one specific
-26-speaker CAVE, and the audience is people who already have the repo.)
+CAVE, and the audience is people who already have the repo.)
 
 ### From source (developing the engine itself)
 
@@ -146,7 +146,7 @@ Two things that will bite if forgotten:
   that could ever serve this speaks the npm protocol, and keys on a single publishable tarball. One
   `.tgz` per release keeps that door open at zero cost.
 
-Not on a registry, and deliberately so: this drives one specific 26-speaker CAVE, so the audience is
+Not on a registry, and deliberately so: this drives one specific CAVE, so the audience is
 people who already have the repo. A tarball costs them one click. The tarball *is* the artifact a
 registry would serve, so listing it later is a config change, not a rebuild.
 

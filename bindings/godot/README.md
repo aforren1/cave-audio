@@ -612,6 +612,14 @@ positive run from passing vacuously.
 However you installed, open `addons/bw_audio/playground/playground.tscn` and press play.
 Without an ASIO device it falls back to silent visual-only mode and says so in the HUD.
 
+The array is `dome_24.json` from the same folder: a generated 24-speaker dome, 2 m around a
+listening point 1.5 m up, spread evenly over the sphere above the floor. To audition a
+surveyed array, pass its path as a user argument (`godot ... -- my_layout.json`) or put a
+`cave_layout.json` beside the executable or in the project root. The order is: the argument,
+`cave_layout.json`, the dome, then the engine's built-in 26-speaker grid. The playground copies
+the dome to `user://` before it loads it, because the engine opens files by OS path and an
+exported `.pck` has none.
+
 <!-- dev -->
 It is the Godot port of `examples/playground.cpp`. From the source tree:
 
@@ -653,7 +661,8 @@ With no ASIO device the engine falls back to the null sink and everything still 
 silent. Visual-only is a supported state, not a failure, and the HUD says so.
 
 <!-- dev -->
-`godot_playground` walks all eight scenes headless, crosses the reverb and underwater
+`godot_playground` checks that it runs on the dome (24 speakers, none below the floor, all
+2 m from the center), then walks all eight scenes headless, crosses the reverb and underwater
 boundaries both ways, and renders each HUD. It cannot judge how anything *sounds* - that is the tool's job, not the
 test's - but it does catch the scene machinery and the rebuild falling over.
 

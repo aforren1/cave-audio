@@ -8,7 +8,7 @@ extends the engine or verifies it on hardware, against these specs.
 ## What this is
 
 A self-hosted native (C/C++) spatial audio engine for a CAVE installation. It
-drives a **speaker array (up to 64 channels; the CAVE installation is 26)** over **ASIO**
+drives a **speaker array (up to 64 channels; the CAVE installation starts with 24)** over **ASIO**
 into an **RME Digiface Dante** (a hardware Dante endpoint), with **binaural (HRTF) headphone output** as a second path — a
 first-class direct render (`BWA_PROFILE_BINAURAL`) and an array-audition monitor
 (`BWA_PROFILE_CAVE_SIM`). Unity and
@@ -24,7 +24,7 @@ and a clean, engine-agnostic core. See `docs/architecture.md` for the why.
 ## The seam that organizes everything
 
 Sources → per-voice **listener-relative DBAP** panning → an in-memory
-**N-channel master bus** (N = the layout's speaker count; 26 on the CAVE). The bus has
+**N-channel master bus** (N = the layout's speaker count; 24 on the CAVE). The bus has
 *consumers*:
 - **ASIO device** (production): writes the speaker bus straight to the Digiface.
 - **Array-sim monitor** (`cave_sim`, and `cave_both`'s tap): treats each bus channel
@@ -312,6 +312,9 @@ tools/wasm/            wasi-sdk.toolchain.cmake + build-wasm.sh: the wasm32 buil
                        into bindings/web/dist/, three.js fetched by fetch-web-vendor.sh with sha256
                        pins) and gen-abi.mjs (the web binding's raw layer + export list, from the
                        header). docs/web.md. [wasm]
+tools/layout/          gen_dome.py: the playgrounds' default array, a 24-speaker dome evenly spread over
+                       the sphere ABOVE the floor. Writes examples/dome_24.json and the Godot addon's
+                       copy (playground/dome_24.json) - regenerate, never hand-edit either. Stdlib only.
 tools/xval/            gen_reference.py: cross-validation golden generator (scipy SH / l1-LP VBAP /
                        qhull AllRAD / bilinear RBJ / lfilter) -> test/xval_data.h for the xval ctest.
                        Needs numpy+scipy; ctest itself does not (the header is committed).
@@ -562,8 +565,10 @@ layout_path. A failed explicit layout load leaves `bwa_create` usable on that gr
 `bwa_last_error`), but `bwa_start` refuses it with `BWA_ERR_LAYOUT` - only `layout_path = NULL`
 runs the default grid. The capacity and the default grid are DIFFERENT numbers since the cap went
 26 -> 64: never use one where you mean the other. Tests that build a core with no layout use
-`BWA_DEFAULT_GRID`; fixed arrays use `BWA_MAX_CHANNELS`; loops use the active count. The rig is
-26 today and may grow to 36, which is a layout file, not a recompile.
+`BWA_DEFAULT_GRID`; fixed arrays use `BWA_MAX_CHANNELS`; loops use the active count. The rig
+starts with 24 and may grow to 36, which is a layout file, not a recompile. The three playgrounds
+(native, web, Godot) default to a generated 24-speaker DOME (`examples/dome_24.json`, from
+`tools/layout/gen_dome.py`), not the default grid: argument > ./cave_layout.json > dome > grid.
 
 The three GUI tools are on the imgui stack — `calib_view` on imgui + implot + implot3d (win32 +
 d3d11, so WINDOWS-ONLY, and it links the ASIO capture shells too), `layout_tool` and `playground`
@@ -853,7 +858,7 @@ Regression-preventing gotchas. Each has bitten before or guards a real invariant
 - Do not introduce FMOD/Wwise or route audio through the engine's mixer.
 - Do not use Unity's built-in audio (8-channel cap) or the device's WDM/DirectSound
   driver (a consumer path: its own mixing, resampling, and no timing hooks).
-  The array's channel count (26 on the CAVE) requires ASIO. This is settled.
+  The array's channel count (24 on the CAVE) requires ASIO. This is settled.
 - Do not pan via pure ambisonics for localized point sources — the listener moves
   across ~3×3 m and a single sweet spot fails. DBAP is recomputed per frame from
   tracked position. See `docs/spatialization.md`.

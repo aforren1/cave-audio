@@ -384,7 +384,7 @@ The panel takes a `cave_layout.json` (the format is [docs/layout-schema.md](../.
 and `examples/cave_layout.json` is the reference) and rebuilds the array on it. The page checks the
 three mistakes anyone makes first - not JSON, a count outside 4 to `MAX_CHANNELS` (64), a position that is not a
 number - and the engine is the authority for the rest: a file it refuses is reported with its own
-`bwa_last_error` text and the page falls back to the default grid, because an engine whose
+`bwa_last_error` text and the page falls back to the 24-speaker dome, because an engine whose
 `bwa_start` refused is an engine nobody can hear. The cones are placed from `bwa_get_speakers`
 afterwards, so what is drawn is what the engine loaded. The schema carries no per-speaker
 orientation, so the cones keep aiming at the array's nominal listening point.
@@ -408,12 +408,16 @@ medium, and no room tail.
 
 ### The default layout
 
-With no file uploaded the engine runs its default grid, which IS the geometry
-`examples/cave_layout.json` describes, speaker for speaker: a 3 by 3 by 3 boundary grid at plus or
-minus 1.5 m with `y` at 0, 1.5 and 3, minus the center, 26 in all (`DEFAULT_GRID`). The only thing the file adds is
-the measured per-speaker delay trim, which nothing in a browser demo can hear. The page reads the
-positions back with `bwa_get_speakers` rather than assuming them, so the gizmos are the engine's
-layout whatever it turns out to be.
+With no file uploaded the page loads `examples/dome_24.json`: a generated 24-speaker dome, 2 m
+around a listening point 1.5 m above the floor, spread evenly over the part of the sphere above the
+floor (`tools/layout/gen_dome.py` writes it). `tools/wasm/build-web.sh` stages it into `dist/`, so
+it is same-origin and rides the content-addressed `dist-<hash>/` URL on the site. The upload
+replaces it, and "back to the 24-speaker dome" returns to it. The engine's own built-in grid
+(`DEFAULT_GRID`, 26) runs only when the dome cannot be fetched, and the page logs that as an error.
+The page reads the positions back with `bwa_get_speakers` rather than assuming them, so the gizmos
+are the engine's layout whatever it turns out to be.
+
+The XR page shares `rig.js` but not this default: it still runs the engine's built-in grid.
 
 ### three.js
 
@@ -621,8 +625,9 @@ node bindings/web/tests/run-playground.mjs         # or directly
 `web_browser` proves the sink. This proves the demo on top of it. The runner's server appends one
 script tag to the playground's HTML for a request carrying `?__drive=1`, so the page a visitor loads
 carries no test code and the check still drives the real page through `window.__bwaPlayground`, the
-hook `playground/main.js` documents. What it asserts: the page starts on the worklet sink with 26
-(`BWA_DEFAULT_GRID`) bus channels read back from `bwa_get_speakers`, and the Start panel is gone with a status line in
+hook `playground/main.js` documents. What it asserts: the page starts on the worklet sink with the dome's 24 bus
+channels, every speaker read back from `bwa_get_speakers` 2 m from the center and none below the
+floor, and the Start panel is gone with a status line in
 its place; a source at room `+x` draws on the left of the screen AND is louder in the left ear,
 measured by rendering the page's own click through a second engine on the manual sink
 (`playground/probe.js`); the speaker cones and both meter strips MOVE while the default click train
@@ -634,7 +639,7 @@ rebuild lands
 back on the worklet sink, keeps `device_lost` at 0 and still puts a `+x` source in the left ear of
 the LIVE output, in both directions; and an uploaded layout rebuilds the array, reads back through
 `bwa_get_speakers` with the position it was given, while a layout the engine refuses is reported and
-falls back to the default grid. It skips when it finds no browser, no `dist/` or no vendored
+falls back to the dome, and a reset returns to the dome. It skips when it finds no browser, no `dist/` or no vendored
 three.js.
 
 The live-output assertions read an AnalyserNode pair on `engine.outputNode()`, and they are there

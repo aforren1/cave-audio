@@ -601,6 +601,12 @@ wasm32 phonon staged:
   round. The seam has a browser-free node test beside it, `tests/xr_frame.test.mjs`, which checks
   it against `BWA_ROOM_AHEAD`, `BWA_ROOM_UP` and `BWA_ROOM_RIGHT` rather than against the algebra
   the module derives. Every assertion in both was broken on purpose and confirmed red first.
+  Since 2026-09-23 it also pins the Galaxy XR fixes: the head gizmo is hidden in session and back
+  in the flat preview, the engine opens at block 128, the status table reads `128 / 128 = 1` and
+  carries both peak-load rows, the session asks for `hand-tracking`, a gamepad-less hand input
+  grabs on a pinch and carries the source in height and depth, the panel's move buttons move it,
+  and a block-256 rebuild and a `playback` latency-hint rebuild both come back driven by the
+  worklet. Each new pin was broken once and went red.
 
 **Not verified** on the XR page: that three.js renders it. Headless Chrome has no XR device, so
 the fake session cannot be bound to a framebuffer, and the page is deliberately built so the pose
@@ -848,7 +854,8 @@ On top of [What the spike changed](#what-the-spike-changed) below.
   Emscripten-only.
 - `bindings/web/`: the two layers, the transport, the example page, the node suite, the README.
 - `bindings/web/playground/`: the browser port of `examples/playground.cpp`, with three.js visuals
-  and six scenes, plus `tests/run-playground.mjs` that drives it in headless Chromium. Its check
+  and six scenes, on the generated 24-speaker dome (`examples/dome_24.json`, staged into `dist/`
+  by `build-web.sh`) until you upload a layout, plus `tests/run-playground.mjs` that drives it in headless Chromium. Its check
   measures the AUDIBLE output now, through an AnalyserNode pair on `engine.outputNode()`: the
   speaker cones and the meter strips have to move while the default click train plays, a stimulus
   change has to reach the output inside 150 ms, and a profile rebuild has to keep `device_lost` at
@@ -864,6 +871,32 @@ On top of [What the spike changed](#what-the-spike-changed) below.
   prediction lead, because `bwa_set_pose_prediction` only leads the engine's own tracker and is
   inert for a pushed pose. `tests/run-xr.mjs` and `tests/xr_frame.test.mjs` are its checks, and
   `bindings/web/README.md` has the derivation in full.
+
+  The XR page opens the engine at block 128, one Web Audio render quantum, and not the rig's
+  default 256. At 256 the worklet sink's fixed-quantum adapter renders a whole 256-frame block
+  inside every second `process()` call and only copies out in the call between, so the render
+  cost lands in half the callbacks at twice the size. At 128 every call renders one block
+  straight into its slot and copies it out, which is the adapter's pass-through case, and the
+  adapter holds no extra block of latency. Nothing in the engine refuses 128: phonon's frame size
+  is whatever the engine block is, and the scratch buffers are sized to the 8192-frame ceiling.
+  This came from a Galaxy XR report of crackle under `cave_sim`. It is a hypothesis about a
+  mobile SoC, not a measurement, and per-block overhead is higher at 128, so the panel offers
+  128, 256 and 512 and an `interactive` or `playback` latency hint. Either one rebuilds the engine
+  and the AudioContext. No new gesture is needed, because the Enter VR press already unlocked
+  audio for the document.
+
+  What to read on the headset: the panel's "audio health" line. Late blocks in the last 5 s is
+  the number for an A/B. Peak load runs since the engine started, so it includes the start-up
+  blocks: headless desktop Chrome shows 330 to 480 percent from those alone, with 2 to 4 late
+  blocks. "Per process() call" is the peak scaled by block over quantum, because a bigger block
+  still renders inside one call. If the audio crackles while late blocks stay flat, the render is
+  keeping up and the device buffer is not, so try `playback`.
+
+  The page also asks for `hand-tracking` as an optional feature. A pinch is `select`, so
+  pinch-and-hold grabs the source and carries it on all three axes. A hand has no thumbstick, so
+  the panel has move buttons (left, right, up, down, ahead, back, 0.25 m each, relative to where
+  you look). Hand joints are not drawn. The playground's head gizmo is hidden in session, because
+  it sits at the tracked pose and its nose cone floated 22 cm in front of the eyes.
 - `bindings/web/src/host.js`, `client.js`: `invokeBuf`, which reaches the raw calls whose arguments
   are pointers. A page cannot allocate wasm heap of its own, so the alloc, the copy and the free
   happen around the one call on the control thread. Plus `writeFile` and `create({ files })` for

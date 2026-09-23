@@ -35,6 +35,8 @@
   /* BWA_DEFAULT_GRID. A literal because this classic script cannot import the binding;
    * constants.test.mjs pins the exported value to the same number. */
   var DEFAULT_GRID = 26;
+  /* The XR page's engine block: one Web Audio render quantum (xr/options.js XR_DEFAULT_BLOCK). */
+  var XR_BLOCK = 128;
 
   var notes = [];
   function ok(m) { notes.push("ok   " + m); }
@@ -92,6 +94,7 @@
     quat: { x: 0, y: 0, z: 0, w: 1 },
     lost: false,
     session: null,
+    lastInit: null,
     controllers: [],
   };
   globalThis.__fakeXr = fake;
@@ -187,8 +190,9 @@
       configurable: true,
       value: {
         isSessionSupported: function (mode) { return Promise.resolve(mode === "immersive-vr"); },
-        requestSession: function (mode) {
+        requestSession: function (mode, init) {
           if (mode !== "immersive-vr") return Promise.reject(new Error("unsupported mode"));
+          fake.lastInit = init || null;
           fake.session = makeSession();
           return Promise.resolve(fake.session);
         },
@@ -256,6 +260,10 @@
     else ok("bwa_get_speakers read back " + DEFAULT_GRID + " speaker positions");
     if (s.presenting) fail("the page claims to be presenting with no WebXR");
     else ok("not presenting, as there is no device");
+    if (s.blockSize !== XR_BLOCK) fail("the engine opened at block " + s.blockSize + ", expected " + XR_BLOCK);
+    else ok("the engine opened at block " + XR_BLOCK + ", one render quantum");
+    if (s.headGizmoVisible !== true) fail("the flat preview hides the head gizmo (" + s.headGizmoVisible + ")");
+    else ok("the flat preview draws the head gizmo");
 
     /* The head sits at the nominal listening pose and does not move, which is exactly the thing
      * this page exists to improve on. */
@@ -264,7 +272,9 @@
     else ok("the flat preview's listener is at the nominal pose " + JSON.stringify(s.headRoom.map(r3)));
 
     var labels = labelsOf(xr.menuItems());
-    var want = ["scene", "render profile", "stimulus", "master gain", "pose prediction lead"];
+    var want = ["scene", "render profile", "audio health", "engine block (frames)",
+                "output latency hint", "stimulus", "master gain", "pose prediction lead",
+                "move source (no thumbstick needed)"];
     for (var i = 0; i < want.length; ++i) {
       if (labels.indexOf(want[i]) < 0) fail('the menu has no "' + want[i] + '" control');
     }
@@ -314,6 +324,29 @@
     ok("an immersive-vr session opened and the engine is up");
 
     var s = xr.state();
+    var feats = (fake.lastInit && fake.lastInit.optionalFeatures) || [];
+    if (feats.indexOf("hand-tracking") < 0) fail("the session did not ask for hand-tracking: " + JSON.stringify(feats));
+    else ok("the session asks for hand-tracking as an optional feature");
+    /* The Galaxy XR report: the head gizmo sat at the tracked pose, nose cone 0.22 m in front of
+     * the eyes. In session it must not be drawn at all. */
+    var gizmoHidden = await waitFor(function () { return xr.state().headGizmoVisible === false; }, 3000,
+                                    "the head gizmo to hide").catch(function () { return false; });
+    if (!gizmoHidden) fail("the head gizmo is drawn in the immersive session (" + xr.state().headGizmoVisible + ")");
+    else ok("the head gizmo is hidden in the immersive session");
+    if (s.blockSize !== XR_BLOCK) fail("in session the engine runs at block " + s.blockSize + ", expected " + XR_BLOCK);
+    else ok("in session the engine runs at block " + XR_BLOCK);
+    await waitFor(function () { return xr.state().health; }, 15000, "the first health poll in session");
+    var rows = {};
+    xr.statusRows().forEach(function (r) { rows[r[0]] = r[1]; });
+    if (rows["block / quantum"] !== XR_BLOCK + " / 128 = 1")
+      fail('the status table reads block / quantum "' + rows["block / quantum"] + '"');
+    else ok('the status table reads block / quantum "' + rows["block / quantum"] + '"');
+    if (!/^\d+%$/.test(rows["peak load (per block)"] || "") ||
+        !/^\d+%$/.test(rows["peak load (per process() call)"] || ""))
+      fail("the status table has no peak load rows: " + JSON.stringify(rows));
+    else ok("peak load " + rows["peak load (per block)"] + " per block, " +
+            rows["peak load (per process() call)"] + " per process() call, late blocks " +
+            rows["late blocks (since start)"] + " (headless desktop, not a headset)");
     if (s.refSpaceType !== "local-floor")
       fail('the page took a "' + s.refSpaceType + '" reference space, expected local-floor');
     else ok("local-floor reference space, so room y is the real floor with no offset");
@@ -573,6 +606,91 @@
     else ok("the thumbstick nudges the source toward the listener's right (" +
             r3(n1[0] - n0[0]) + " m of room x)");
 
+    /* ---- hands, no controllers (Galaxy XR): a pinch is select, there is no gamepad ---- */
+    var savedC = fake.controllers.slice();
+    var hand = {
+      handedness: "right",
+      targetRayMode: "tracked-pointer",
+      profiles: ["generic-hand-select"],
+      targetRaySpace: { __space: "hand-ray" },
+      gripSpace: { __space: "hand-grip" },
+      gamepad: null,
+      hand: {},
+      pos: roomPointToXr([0.0, 1.5, 1.2]),
+      quat: roomQuatToXr(quatFromTo([0, 0, 1], [0, -1, 0])),
+      present: true,
+    };
+    fake.controllers.length = 0;
+    fake.controllers.push(hand);
+    xr.setSourceRoom([0.0, 1.5, 1.2]);
+    await sleep(200);
+    var hr = xr.hands();
+    if (!hr || !hr[0].present || !hr[0].hand || hr[0].hasStick)
+      fail("a hand input is not reported as a present hand with no stick: " + JSON.stringify(hr && hr[0]));
+    else ok("a hand input is reported as a hand with no thumbstick");
+    fake.session.dispatch("selectstart", { inputSource: hand });
+    await sleep(200);
+    if (!xr.hands()[0].grabbing) fail("a pinch at the source did not grab it");
+    else ok("a pinch at the source grabs it");
+    var hs0 = xr.state().sourceRoom.slice();
+    hand.pos = { x: hand.pos.x, y: hand.pos.y + 0.3, z: hand.pos.z - 0.3 };   /* XR -z is room +z */
+    await sleep(250);
+    var hs1 = xr.state().sourceRoom.slice();
+    if (Math.abs(hs1[1] - hs0[1] - 0.3) > 0.02 || Math.abs(hs1[2] - hs0[2] - 0.3) > 0.02)
+      fail("a pinch-and-hold did not carry the source up and ahead: moved " +
+           JSON.stringify([hs1[0] - hs0[0], hs1[1] - hs0[1], hs1[2] - hs0[2]].map(r3)));
+    else ok("pinch-and-hold carries the source in height and depth too (+0.3 m y, +0.3 m z)");
+    fake.session.dispatch("selectend", { inputSource: hand });
+    await sleep(150);
+    if (xr.hands()[0].grabbing) fail("releasing the pinch did not release the source");
+    else ok("releasing the pinch released the source");
+    fake.controllers.length = 0;
+    for (var hi = 0; hi < savedC.length; ++hi) fake.controllers.push(savedC[hi]);
+    await sleep(150);
+
+    /* The thumbstick's job, as panel buttons. Press "up" through the panel. */
+    var moveIndex = -1;
+    xr.menuItems().forEach(function (it, i) { if (it.label === "move source (no thumbstick needed)") moveIndex = i; });
+    xr.setSourceRoom([0.0, 1.5, 1.2]);
+    await sleep(150);
+    var up0 = xr.state().sourceRoom[1];
+    if (moveIndex < 0) fail("no move-source buttons on the panel");
+    else if (!(await pressRow(xr, moveIndex, 0.625))) fail("the controller ray never reached the move-source row");
+    else {
+      await sleep(250);
+      var up1 = xr.state().sourceRoom[1];
+      if (Math.abs(up1 - up0 - 0.25) > 0.01) fail('the "up" button moved the source ' + r3(up1 - up0) + " m in y");
+      else ok('the panel "up" button raises the source 0.25 m, no thumbstick needed');
+    }
+
+    /* ---- the engine block and latency hint A/B: each rebuilds engine and context ---- */
+    await xr.setEngineOptions({ blockSize: 256 });
+    await waitFor(function () { return xr.state().health; }, 15000, "health after the block-256 rebuild");
+    var b0 = xr.state();
+    if (b0.blockSize !== 256) fail("after choosing block 256 the engine runs at " + b0.blockSize);
+    else ok("choosing block 256 rebuilt the engine at 256");
+    var bh0 = b0.health;
+    await sleep(700);
+    var bh1 = xr.state().health;
+    if (bh1.blocks - bh0.blocks < 40 || bh1.deviceLost !== 0)
+      fail("after the block-256 rebuild the worklet is not driving (" + (bh1.blocks - bh0.blocks) +
+           " blocks in 700 ms, device_lost " + bh1.deviceLost + ")");
+    else ok("the block-256 engine renders (" + (bh1.blocks - bh0.blocks) + " blocks in 700 ms)");
+    await xr.setEngineOptions({ blockSize: XR_BLOCK, latencyHint: "playback" });
+    await waitFor(function () { return xr.state().health; }, 15000, "health after the playback rebuild");
+    var p0 = xr.state();
+    if (p0.blockSize !== XR_BLOCK || p0.latencyHint !== "playback")
+      fail("after choosing block " + XR_BLOCK + " and playback the page reads block " + p0.blockSize +
+           ', hint "' + p0.latencyHint + '"');
+    else ok("block " + XR_BLOCK + ' with latency hint "playback" rebuilt the engine');
+    var ph0 = p0.health;
+    await sleep(700);
+    var ph1 = xr.state().health;
+    if (ph1.blocks - ph0.blocks < 40 || ph1.deviceLost !== 0)
+      fail("after the playback rebuild the worklet is not driving (" + (ph1.blocks - ph0.blocks) + " blocks)");
+    else ok("the playback-hint engine renders (" + (ph1.blocks - ph0.blocks) + " blocks in 700 ms)");
+    await xr.setEngineOptions({ latencyHint: "interactive" });
+
     /* ---- the scene picker, from inside the session ---- */
     var sceneBefore = xr.state().sceneId;
     var pressed = await pressRow(xr, 0, 0.5);
@@ -589,6 +707,8 @@
     await fake.session.end();
     await waitFor(function () { return !xr.state().presenting; }, 8000, "the session to end");
     ok("ending the session returned the page to the flat preview");
+    if (xr.state().headGizmoVisible !== true) fail("the head gizmo did not come back in the flat preview");
+    else ok("the head gizmo is back in the flat preview");
     var menuAfter = xr.menu();
     if (menuAfter && menuAfter.visible) fail("the in-world menu is still visible after the session ended");
     else ok("the in-world menu went away with the session");

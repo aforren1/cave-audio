@@ -59,7 +59,10 @@ export class XrRuntime {
    */
   async enter({ renderer, domOverlayRoot, onFrame, onEnd }) {
     if (!navigator.xr) throw new Error("this browser has no WebXR");
-    const init = { optionalFeatures: ["local-floor", "bounded-floor"] };
+    /* "hand-tracking" is OPTIONAL and nothing here draws a joint: asking for it is what lets a
+     * controller-free headset (Galaxy XR, a Quest with its controllers down) expose the hands as
+     * input sources at all, so a pinch fires select. A runtime without hands ignores it. */
+    const init = { optionalFeatures: ["local-floor", "bounded-floor", "hand-tracking"] };
     if (domOverlayRoot) {
       init.optionalFeatures.push("dom-overlay");
       init.domOverlay = { root: domOverlayRoot };

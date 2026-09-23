@@ -16,7 +16,7 @@
  *
  * Scenes (cycle with TAB):
  *   1 Localization      — pure listener-relative DBAP. Move a source, turn your head, switch the
- *                         test signal (1-4); hear it localize around the 26-speaker array. SPACE
+ *                         test signal (1-4); hear it localize around the speaker array. SPACE
  *                         auto-moves it: orbit + near/far + high/low, sweeping the whole space.
  *                         Opt-in per-source effects: V Doppler, B air absorption, C source size, M dual-band
  *                         (amplitude LF / power HF panning), X a fast straight flyby (X+V = race-car pitch sweep).
@@ -72,7 +72,8 @@
  * it (load-time: applying rebuilds the engine).
  * Needs the Steam Audio build for occlusion/materials/directivity/reverb; without it those are no-ops.
  * Usage: bwa_playground [cave_layout.json] — audition with your surveyed layout (renders + pans with the
- *        engine's actual speaker positions); with no arg it auto-loads ./cave_layout.json or the default grid.
+ *        engine's actual speaker positions); with no arg it auto-loads ./cave_layout.json, else the
+ *        24-speaker dome staged beside the exe (examples/dome_24.json), else the engine's default grid.
  * Build: cmake -S . -B build -DBWA_BUILD_PLAYGROUND=ON && cmake --build build
  */
 #include "bw_audio.h"
@@ -339,12 +340,13 @@ static int         backend_silent;
  * compile-time define that gates the WHOLE materials tier. Latched once because the render picker
  * can later rebuild into BWA_PROFILE_CAVE, which names no decode at all. -1 = not probed yet. */
 static int         g_have_steam = -1;
-static const char* g_layout_path;          /* optional cave_layout.json; NULL = engine default grid */
+static const char* g_layout_path;          /* argv[1], ./cave_layout.json or the shipped dome; NULL = engine default grid */
+static char        g_dome_path[1024];      /* dome_24.json beside the exe, "" when it was not staged */
 
 static Vector3 speakers[NSPK];
 static int     g_nspk = NSPK;     /* the engine's ACTIVE channel count (bwa_get_speakers); the layout's */
 static float   g_spcap_def;       /* SPCAP's geometry-derived default focus for the loaded layout */
-static Vector3 g_head;            /* the ear point = array centroid (the engine's nominal listening point);
+static Vector3 g_head;            /* the ear point = the engine's nominal listening point (listening_point_m, else the centroid);
                                    * room origin is on the FLOOR, so the head is NOT at the origin */
 static Vector3 source_pos = { 1.5f, 0.0f, 0.0f };   /* y re-based to ear height once the layout is known */
 static float   head_yaw, source_yaw;
@@ -1106,9 +1108,13 @@ static void build_engine(int mode) {
     g_nspk = (int)bwa_get_speakers(e, (float*)speakers, NSPK);   /* the geometry AND count the engine pans with */
     if (g_nspk < 1) g_nspk = 1;                          /* (a layout always has >= 4; keep the divides safe) */
     if (chan_active >= g_nspk) chan_active = 0;          /* a smaller array may have retired the walked channel */
-    g_head = Vector3{ 0, 0, 0 };                         /* ear point = array centroid (the engine's own ref) */
-    for (int i = 0; i < g_nspk; ++i) g_head = Vector3Add(g_head, speakers[i]);
-    g_head = Vector3Scale(g_head, 1.0f / (float)g_nspk);
+    {   /* ear point = the engine's own nominal listening point: the layout's listening_point_m, else
+         * the array centroid. A fresh engine's listener sits there until this tool sets a pose, so
+         * the pose readback IS that point, with no second copy of the loader's rule here. */
+        float p[3], q[4];
+        bwa_get_listener_pose(e, p, q);
+        g_head = Vector3{ p[0], p[1], p[2] };
+    }
     /* what SPCAP's focus knob falls back to on THIS array (bwa_spcap_focus_default is pure, so it
      * reads the geometry we just pulled back rather than any engine state) */
     g_spcap_def = bwa_spcap_focus_default((const float*)speakers, (uint32_t)g_nspk);
@@ -1927,6 +1933,26 @@ static void register_tests(ImGuiTestEngine* te) {
     /* THE regression this harness exists to pin: with no device at all (the suite forces
      * BWA_SINK_NULL) the engine must still be LIVE — null-sink fallback rendering in real
      * time, output meters flowing. A dead engine here once shipped as "visual-only mode". */
+    /* the suite runs on the shipped dome (staged beside the exe by CMake), never on the engine grid
+     * or a CWD file: 24 speakers, none below the floor, all 2 m from (0, 1.5, 0). */
+    t = IM_REGISTER_TEST(te, "viewer", "dome_layout");
+    t->TestFunc = [](ImGuiTestContext* ctx) {
+        (void)ctx;
+        IM_CHECK(g_dome_path[0] != 0);                    /* dome_24.json was staged beside the exe */
+        IM_CHECK(g_layout_path == g_dome_path);
+        IM_CHECK_EQ(g_nspk, 24);
+        IM_CHECK_EQ(bwa_get_channel_count(e), 24u);
+        for (int k = 0; k < g_nspk; ++k) {
+            IM_CHECK_GE(speakers[k].y, 0.0f);
+            IM_CHECK_LT(fabsf(Vector3Distance(speakers[k], Vector3{ 0.f, 1.5f, 0.f }) - 2.0f), 1e-3f);
+        }
+        /* the head sits at the file's declared listening_point_m (the sphere center), not the
+         * centroid, which the floor cut lifts to ~1.75 m */
+        IM_CHECK_LT(fabsf(g_head.x), 1e-3f);
+        IM_CHECK_LT(fabsf(g_head.y - 1.5f), 1e-3f);
+        IM_CHECK_LT(fabsf(g_head.z), 1e-3f);
+    };
+
     t = IM_REGISTER_TEST(te, "viewer", "meters_live");
     t->TestFunc = [](ImGuiTestContext* ctx) {
         /* fallback engaged; NOT "none" (dead engine). Prefix match: the headphone profiles append
@@ -2290,7 +2316,8 @@ int main(int argc, char** argv) {
                    "  default output, over WASAPI on Windows; with no device it renders silently --\n"
                    "  visual-only mode stays live)\n"
                    "  cave_layout.json   optional surveyed layout (default: ./cave_layout.json if\n"
-                   "                     present, else the built-in grid); ./constraints.json is\n"
+                   "                     present, else the 24-speaker dome_24.json beside the exe,\n"
+                   "                     else the engine's built-in grid); ./constraints.json is\n"
                    "                     drawn for orientation if present\n"
                    "  --device <name>    device to open, by friendly name or stable id (default: the\n"
                    "                     backend's own default; the panel's device combo switches\n"
@@ -2347,13 +2374,21 @@ int main(int argc, char** argv) {
      * animate, just silent). --device / --sink and the panel's combo are the deliberate overrides;
      * the panel's audio line + meters keep the no-audio state visible. */
 
-    /* optional surveyed layout: argv[1], else ./cave_layout.json if present, else the default grid.
-     * selftest always uses the default grid — the suite must not depend on a machine-local file. */
+    /* layout: argv[1], else ./cave_layout.json if present, else the dome staged beside the exe, else
+     * the engine's default grid. The dome resolves against the EXE, not the CWD: a double-click or a
+     * ctest run starts anywhere. selftest skips the first two (the suite must not depend on a
+     * machine-local file), so it runs on the dome CMake staged. */
     g_layout_path = (!selftest && argc > 1 && argv[1][0] != '-') ? argv[1] : NULL;
     if (!selftest && !g_layout_path) {
         FILE* lf = fopen("cave_layout.json", "rb");
         if (lf) { fclose(lf); g_layout_path = "cave_layout.json"; }
     }
+    snprintf(g_dome_path, sizeof g_dome_path, "%sdome_24.json", GetApplicationDirectory());
+    {
+        FILE* df = fopen(g_dome_path, "rb");
+        if (df) fclose(df); else g_dome_path[0] = 0;
+    }
+    if (!g_layout_path && g_dome_path[0]) g_layout_path = g_dome_path;
 
     /* synthesize the localization test signals to wav (the engine loads sounds from file) */
     float* sigbuf = (float*)malloc((size_t)SIGLEN * sizeof(float));
@@ -2373,7 +2408,9 @@ int main(int argc, char** argv) {
     wall_basis(wall_n, &wall_u, &wall_v);
     build_engine(0);                                          /* start in the interactive config (fills speakers[], g_head) */
     source_pos.y = g_head.y;                                  /* start the source on the ear plane */
-    printf("layout: %s    audio backend: %s%s\n", g_layout_path ? g_layout_path : "default grid", backend_name,
+    printf("layout: %s (%d speakers%s)    audio backend: %s%s\n",
+           g_layout_path ? g_layout_path : "engine default grid", g_nspk,
+           g_layout_path == g_dome_path ? ", shipped dome" : "", backend_name,
            backend_silent ? "   (SILENT - no output device opened; --list-devices, then --device <name>)" : "");
     if (backend_silent && g_audio_err[0]) printf("  reason: %s\n", g_audio_err);
     if (cv_load("constraints.json", &g_con))                  /* orientation only; the layout tool edits against these */

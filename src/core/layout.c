@@ -3,6 +3,8 @@
  * Control thread / load time only.
  */
 #include "core/layout.h"
+#include "core/rt.h"      /* BWA_MAX_COORD */
+#include "core/sane.h"    /* bwa_finite3_bounded */
 #include "os/os.h"        /* os_fopen: UTF-8 paths on Windows */
 
 #include <math.h>
@@ -329,8 +331,27 @@ bool layout_load(const char* path, uint32_t sample_rate, Layout* out, char* err,
     out->count             = (uint32_t)nspk;
     out->max_delay_samples = maxdelay;
     layout_compute_ref(out);                  /* nominal listening point = the surveyed array's centroid */
+    {   /* ...unless the file declares one. The centroid is only the listening point of a SYMMETRIC
+         * array: a top-heavy one (a floor-cut dome, a rig with more overhead speakers) puts it above
+         * the ears. Set BEFORE the blur and SPCAP derivations below, because both describe the
+         * array as heard from the listening point. */
+        cJSON* lp = cJSON_GetObjectItemCaseSensitive(root, "listening_point_m");
+        if (lp) {
+            float v[3] = { NAN, NAN, NAN };
+            if (cJSON_IsArray(lp) && cJSON_GetArraySize(lp) == 3)
+                for (int i = 0; i < 3; ++i) {
+                    cJSON* c = cJSON_GetArrayItem(lp, i);
+                    if (cJSON_IsNumber(c)) v[i] = (float)c->valuedouble;
+                }
+            if (!bwa_finite3_bounded(v, BWA_MAX_COORD)) {
+                set_err(err, errcap, "layout: listening_point_m must be [x, y, z], finite, within +/-1e6 m");
+                goto done;
+            }
+            memcpy(out->ref, v, sizeof v);
+        }
+    }
     if (!have_rolloff) {
-        /* file omits the blur: derive it from the geometry, r = 0.25 x the mean centroid->speaker
+        /* file omits the blur: derive it from the geometry, r = 0.25 x the mean ref->speaker
          * distance (Sundstrom 2021 recommends 0.2-0.5 of it; docs/spatialization.md). An explicit
          * value in the file always wins; layout_default's constant only covers the no-file grid. */
         double s = 0.0;

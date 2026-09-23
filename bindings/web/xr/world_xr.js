@@ -107,6 +107,22 @@ export class XrWorld extends World {
     h.grip.scale.setScalar(hot ? 1.35 : 1.0);
   }
 
+  /**
+   * Show or hide the playground's head gizmo. In session the gizmo sits AT the tracked viewer
+   * pose, so its nose cone (0.22 m ahead of the head center) floated in front of the user's eyes
+   * as a big orange blob (reported from a Galaxy XR, 2026-09-23). You are the head in XR; the
+   * gizmo is for the flat preview only. Called on session start and end whether or not the
+   * renderer bound, because the pose path runs either way. The head-to-source line still starts
+   * at the head, which is right: it points from you to the source.
+   * @param {boolean} on true while an immersive session is up
+   */
+  setImmersive(on) {
+    if (this.head) this.head.visible = !on;
+  }
+
+  /** Whether the head gizmo is drawn, for the check. */
+  headGizmoVisible() { return !!(this.head && this.head.visible); }
+
   hideHands() {
     for (const h of this.hands) h.group.visible = false;
   }
@@ -138,6 +154,7 @@ export class XrWorld extends World {
    */
   endPresenting() {
     this.hideHands();
+    this.setImmersive(false);
     if (!this.presenting) return;
     this.rig.remove(this.camera);
     this.renderer.xr.enabled = false;
