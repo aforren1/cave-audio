@@ -18,6 +18,11 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 const db = (x) => (20 * Math.log10(Math.max(x, 1e-9))).toFixed(1);
 
+/* The bound on "a stimulus change is heard". One engine block is 5.3 ms, the worklet sink's own
+ * queue is a few more, and the analyser window this is measured through is 10.7 ms. 60 ms leaves
+ * room for a headless browser's scheduling and still fails an accidental return of the queue. */
+const SWITCH_MS = 60;
+
 async function main() {
   if (!globalThis.crossOriginIsolated) throw new Error("the page is not cross-origin isolated");
   ok("cross-origin isolated");
@@ -124,11 +129,11 @@ async function main() {
 
   /* ---- a stimulus change is HEARD promptly, measured on the live output.
    *
-   * The feed paces on the ring's space, and the ring holds 1.37 s: filling it put up to a second
-   * of the OLD stimulus ahead of the audio clock, so a menu change took about that long to arrive.
-   * The queue is a latency budget now (rig.js's QUEUE_MS), and this measures the budget the only
-   * way that counts - the time from the switch to the moment the output is continuously carrying
-   * the new signal. ---- */
+   * There is no queue to drain any more: each stimulus is a loaded sound and a switch is one
+   * `bwa_source_play`, which the engine ramps up over its first block. So the honest bound is one
+   * block plus the sink's own latency plus the analyser's 10.7 ms window, and this asserts a tight
+   * one. With the old push feed the same measurement read the feed's budget instead (100 ms by
+   * design, and up to 1.4 s when the ring was filled rather than paced). ---- */
   {
     pg.setSignal(2);                        /* pink noise: continuous, so "hot" means arrived */
     await sleep(900);
@@ -169,9 +174,83 @@ async function main() {
     ok(`stimulus switch heard after ${heard < 0 ? "never" : heard.toFixed(0) + " ms"} ` +
        `(steady pink RMS ${db(steady)} dB, threshold ${db(thresh)} dB)`);
     if (heard < 0) fail("the new stimulus never arrived on the output within 2 s");
-    else if (heard > 150) fail(`the new stimulus took ${heard.toFixed(0)} ms to be heard; the budget is 150`);
-    else ok("a stimulus change reaches the output inside the latency budget");
+    else if (heard > SWITCH_MS) fail(`the new stimulus took ${heard.toFixed(0)} ms to be heard; the bound is ${SWITCH_MS}`);
+    else ok("a stimulus change reaches the output inside one block plus the sink's latency");
     pg.setSignal(0);
+  }
+
+  /* ---- a main-thread stall makes NO hole in the sound.
+   *
+   * This is the point of the change. The page used to feed a push source from a 20 ms timer on
+   * this thread with about 100 ms queued ahead of the audio clock, so any stall longer than the
+   * queue - a garbage collection, a window drag, a heavy three.js frame on a weak GPU - was a gap
+   * in the audio and the engine counted it as a push-ring starve. Reported as "the click train
+   * becomes inaudible for short periods" (2026-09-22). Now the stimulus is a loaded sound the
+   * engine loops itself, so the page can stop running altogether and the sound goes on.
+   *
+   * A busy loop is the stall, because no timer and no frame can fire while it runs. What is
+   * asserted: not one new starve, the audio thread went on rendering through it, and the output is
+   * still carrying the signal afterwards. Confirmed RED against the previous feed-based rig.js
+   * (which starved on the first 400 ms stall). ---- */
+  {
+    await pg.setSignal(2);                  /* pink noise: continuous, so a gap is a gap */
+    await sleep(800);
+    const h0 = pg.state().health;
+    const STALL_MS = 400;
+    const t0 = performance.now();
+    while (performance.now() - t0 < STALL_MS) { /* hold the main thread */ }
+    await sleep(700);                       /* the health poll runs at 120 ms; let it read */
+    const h1 = pg.state().health;
+    const blocks = h1.blocks - h0.blocks;
+    ok(`main-thread stall of ${STALL_MS} ms: stream starves ${h0.streamStarves} -> ` +
+       `${h1.streamStarves}, ${blocks} blocks rendered across it`);
+    if (h1.streamStarves !== h0.streamStarves)
+      fail(`a ${STALL_MS} ms main-thread stall starved the engine ` +
+           `(${h0.streamStarves} -> ${h1.streamStarves}); the page is in the audio path again`);
+    else ok("a main-thread stall produced no starve: the page is not in the audio path");
+    /* The audio thread is on the AudioWorklet thread and owes nothing to this one. 1.1 s of wall
+     * clock is about 206 blocks at 48 kHz / 256; 150 is a margin, not a coin flip. */
+    if (blocks < 150) fail(`only ${blocks} blocks were rendered across the stall and the wait after it`);
+    else ok("the audio thread rendered straight through the stall");
+    pg.outputPeaks();
+    await sleep(400);
+    const after = pg.outputPeaks();
+    if (!(Math.max(after.rmsL, after.rmsR) > 1e-4))
+      fail(`the live output is silent after the stall (${db(Math.max(after.rmsL, after.rmsR))} dB)`);
+    else ok(`the output still carries the stimulus after the stall ` +
+            `(${db(Math.max(after.rmsL, after.rmsR))} dB RMS)`);
+    await pg.setSignal(0);
+  }
+
+  /* ---- a clip the visitor drops on the page becomes a loaded sound too.
+   *
+   * The same route as the built-in stimuli: the browser decodes it, the rig folds it to mono,
+   * writes it as a wav and loads it. A wav is what the file input would hand over, so the check
+   * builds one. If the load failed the page logs an engine error, which the "no engine error"
+   * assertion further down would catch as well.
+   *
+   * The INDEX is what says the clip is the thing playing. The level below only says the output is
+   * not silent, and it would pass on the previous stimulus: measured at -43 dB against a clip that
+   * loaded at -10.6 dB, with the load deliberately skipped. ---- */
+  {
+    const before = pg.state().stimuli.length;
+    const heard0 = await pg.loadClip(driverWav(0.5, 660), "driver-tone.wav");
+    await sleep(600);
+    const after = pg.state();
+    if (heard0 !== true) fail(`the page refused an uploaded clip: ${pageLog()}`);
+    else if (after.stimuli.length !== before + 1)
+      fail(`the stimulus picker did not gain the uploaded clip (${after.stimuli.length} entries)`);
+    else if (after.stimulus !== before)
+      fail(`the uploaded clip is not the stimulus playing (index ${after.stimulus})`);
+    else ok(`an uploaded clip loaded and became the stimulus ("${after.stimuli[before]}")`);
+    pg.outputPeaks();
+    await sleep(400);
+    const p = pg.outputPeaks();
+    if (!(Math.max(p.rmsL, p.rmsR) > 1e-4))
+      fail(`the uploaded clip is silent on the live output (${db(Math.max(p.rmsL, p.rmsR))} dB)`);
+    else ok(`the uploaded clip is audible on the live output (${db(Math.max(p.rmsL, p.rmsR))} dB RMS)`);
+    await pg.setSignal(0);
+    if (pg.state().stimuli.length !== before + 1) fail("the uploaded clip left the picker");
   }
 
   /* ---- SCENE 2: the channel walk lights the channel it drove ---- */
@@ -266,9 +345,12 @@ async function main() {
   if (bh1.blocks - bh0.blocks < 30)
     fail(`the rebuilt engine rendered only ${bh1.blocks - bh0.blocks} blocks in 600 ms`);
   else ok(`the rebuilt engine renders (${bh1.blocks - bh0.blocks} blocks in 600 ms)`);
-  if (bh1.deviceLost !== 0)
-    fail("after the rebuild the sink is host-pacing silence: the AudioWorklet never came back");
-  else ok("after the rebuild the AudioWorklet is still driving (device_lost 0)");
+  {
+    const live = await waitDeviceLive(pg);
+    if (live < 0)
+      fail("after the rebuild the sink is still host-pacing silence: the AudioWorklet never came back");
+    else ok(`after the rebuild the AudioWorklet is driving again (device_lost 0 after ${live.toFixed(0)} ms)`);
+  }
   /* The cones ARE dark in this profile, and that is correct rather than broken: point voices never
    * reach the 26-channel bus here. The page has to say so where the cones are. */
   {
@@ -286,9 +368,11 @@ async function main() {
   await pg.setProfile(2);
   await pg.selectScene("localization");
   await sleep(500);
-  if (pg.state().health.deviceLost !== 0)
-    fail("back in cave_sim the sink is host-pacing silence: the second rebuild lost the worklet");
-  else ok("back in cave_sim the AudioWorklet is still driving");
+  {
+    const live = await waitDeviceLive(pg);
+    if (live < 0) fail("back in cave_sim the sink is host-pacing silence: the second rebuild lost the worklet");
+    else ok(`back in cave_sim the AudioWorklet is driving (device_lost 0 after ${live.toFixed(0)} ms)`);
+  }
   await audibleLaterality(pg, "cave_sim");
 
   /* ---- every other scene at least enters and runs without an engine error ---- */
@@ -407,6 +491,47 @@ async function layoutChecks(pg) {
   await pg.loadLayout(null, null);
   if (pg.state().speakerCount !== 26) fail("the page did not go back to the 26-speaker grid");
   else ok("the page goes back to the default grid");
+}
+
+/**
+ * Wait for the sink to stop host-pacing, and say how long it took.
+ *
+ * `device_lost` is the sink's report that the AudioWorklet's heartbeat has gone quiet, and after a
+ * REBUILD it is quiet for as long as the new context's asynchronous setup chain takes:
+ * `addModule`, the node, the connect. That is a browser's own scheduling and on a loaded machine
+ * it can run past a fixed sleep, so a single read at a fixed moment measures the machine and not
+ * the engine (measured: the same read failed on the old build too, so it is not a regression -
+ * it is a badly posed question). What the check MEANS is that the worklet comes back at all,
+ * which is exactly what the defect behind it - a second `registerProcessor` in one context's
+ * worklet scope - makes impossible forever. So poll, with a deadline.
+ * @returns {number} milliseconds until it cleared, or -1 if it never did
+ */
+async function waitDeviceLive(pg, ms = 4000) {
+  const t0 = performance.now();
+  for (;;) {
+    const h = pg.state().health;
+    if (h && h.deviceLost === 0) return performance.now() - t0;
+    if (performance.now() - t0 > ms) return -1;
+    await sleep(60);
+  }
+}
+
+/** A mono float32 wav of a tone, which is what the page's audio file input hands to `loadClip`. */
+function driverWav(seconds, hz) {
+  const rate = 48000;
+  const n = Math.round(rate * seconds);
+  const buf = new ArrayBuffer(44 + n * 4);
+  const v = new DataView(buf);
+  const tag = (o, t) => { for (let i = 0; i < t.length; ++i) v.setUint8(o + i, t.charCodeAt(i)); };
+  tag(0, "RIFF"); v.setUint32(4, 36 + n * 4, true); tag(8, "WAVE");
+  tag(12, "fmt "); v.setUint32(16, 16, true);
+  v.setUint16(20, 3, true); v.setUint16(22, 1, true);
+  v.setUint32(24, rate, true); v.setUint32(28, rate * 4, true);
+  v.setUint16(32, 4, true); v.setUint16(34, 32, true);
+  tag(36, "data"); v.setUint32(40, n * 4, true);
+  const out = new Float32Array(buf, 44);
+  for (let i = 0; i < n; ++i) out[i] = 0.3 * Math.sin((2 * Math.PI * hz * i) / rate);
+  return buf;
 }
 
 function pageLog() {

@@ -51,9 +51,14 @@ else
   echo "build-web: no node on PATH; using the committed bindings/web/src/abi.js"
 fi
 
+# -msimd128 on the engine's own code: the mixer, the panner ramps and the align stage are straight
+# float loops that clang vectorizes, every browser that ships threads ships SIMD, and the wasm
+# phonon is built with it already (IPL_OS_WASM). Without it a headphone page on a slow machine ran
+# the worklet close enough to its budget that dual-band panning (a second gain vector and a
+# crossover per voice) pushed blocks late and the click train dropped out (reported 2026-09-22).
 emcmake cmake -S . -B "$BWA_WEB_BUILD_DIR" -G Ninja -DCMAKE_BUILD_TYPE=Release $MAKE_PROGRAM_FLAG \
   -DBWA_WITH_WORKLET=ON -DBWA_BUILD_WEB=ON \
-  -DCMAKE_C_FLAGS="-pthread" -DCMAKE_CXX_FLAGS="-pthread"
+  -DCMAKE_C_FLAGS="-pthread -msimd128" -DCMAKE_CXX_FLAGS="-pthread -msimd128"
 
 cmake --build "$BWA_WEB_BUILD_DIR" --target bwa_web
 

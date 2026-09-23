@@ -228,8 +228,9 @@ Use `files` for those two, not `engine.writeFile(path, bytes)`. `create` opens t
 own call, so a write afterwards is too late. `writeFile` is for anything a RUNNING engine opens
 later, and it works in both topologies (the bytes travel to the control thread with the message).
 
-The file lives in the module's heap and dies with the module, so write a layout, not a sample
-library. Audio still goes the other way, through a push source: see "Where the audio comes from".
+The file lives in the module's heap and dies with the module, so mind what you write: a layout, a
+stimulus loop, a sound effect. Not a sample library and not an hour of music, which is what
+streaming exists for and what a browser has no answer to yet. See "Where the audio comes from".
 
 A layout the engine rejects does not fail `create`. The engine stays usable on the default grid and
 `bwa_start` then refuses with `BWA_ERR_LAYOUT`, carrying the reason through `bwa_last_error`, so the
@@ -254,13 +255,38 @@ It is `"main"` topology plus `SinkType.WORKLET` only. Everything else has no nod
 ## Where the audio comes from
 
 There is no synchronous file system in a browser, so `bwa_load_sound` has nothing to open unless
-you put a file in the wasm file system first. The route this binding takes instead is the one
-`docs/web.md` recommends: decode in JavaScript with `AudioContext.decodeAudioData`, which is the
-browser's own optimized decoder, and feed the float samples to a **push source**. No new ABI, and
-it handles the formats a page actually gets served.
+you put a file in the wasm file system first. There are two routes, and the first one is the
+default.
 
-Pace the feed on the ring's own space (`src.space()`), not on the animation frame: a background tab
-gets fewer frames and the audio thread does not slow down with it.
+**A sound the engine owns.** Get float samples any way you like, wrap them in a wav header, write
+the file with `engine.writeFile` and load it with `bwa_load_sound`. The engine then owns the
+samples: it loops them sample accurately, and the page is not in the audio path at all.
+
+```js
+await engine.writeFile("/stim/click.wav", wavBytes);       // any time, not only before create
+const snd = await engine.invoke("load_sound", "/stim/click.wav");
+await src.play(snd, true);                                 // looped by the audio thread
+```
+
+The browser's own decoder gets you there from any format it serves: `decodeAudioData`, fold the
+channels down to the mono a point source takes, re-wrap as a wav. `playground/wav.js` does the
+wrapping, in one function; the engine reads wav, flac and mp3 through dr_wav and resamples at
+load.
+
+**A push source**, for audio the page makes or receives as it goes: a synthesizer, a microphone, a
+network stream. The engine's one inbound exception, and a source feed rather than a render path.
+`example/index.html` is that demo.
+
+Prefer the first for anything you have in full before it starts, and that is not a style
+preference. A push feed keeps the page in the audio path forever, and a page stalls: a garbage
+collection, a window drag, a heavy frame on a weak GPU, a tab losing focus. Any stall longer than
+what you queued ahead is a hole in the sound, and the engine counts it as a stream starve
+(`bwa_health.streamStarves`). The playground fed its stimuli that way and the holes were audible
+(2026-09-22); it loads them now, and the same 400 ms stall makes no sound at all.
+
+If you do push, pace the feed on the ring's own space (`src.space()`), not on the animation frame:
+a background tab gets fewer frames and the audio thread does not slow down with it. And pace it
+rather than fill it: the ring holds 1.37 s, all of which has to play before anything new is heard.
 
 ## Playground
 
@@ -306,12 +332,37 @@ The speaker cones and the bus strip are `bwa_get_bus_levels`, sampled on a 4 ms 
 than on the animation frame. That readback is the LAST BLOCK's peak, a block is 5.3 ms, and the
 page used to read it every 120 ms: it saw one block in 22 and the default stimulus is a click train
 whose burst is 2 ms in every 250 ms, so the meter read "silent" and the cones stayed dark while the
-click was plainly audible. The tick holds the peak and the frame loop consumes it.
+click was plainly audible. The tick holds the peak and the frame loop consumes it. The strip then
+falls at the rate the cones and the output strips fall at, because a click's peak lands in about
+one animation frame in fifteen and an instantaneous strip reads silent between them.
 
 The two output strips are the stereo the AudioContext is playing, read from an AnalyserNode pair on
 `engine.outputNode()`. In `BWA_PROFILE_BINAURAL` the point voices bypass the bus entirely, so the
 bus meter there shows only the diffuse field and the panel says so; the output strips are the ones
 with your ears' content in them.
+
+### The stimuli are loaded sounds, not a feed
+
+Every stimulus the page plays is a fixed buffer: the click train's 250 ms period, two seconds of
+pink noise, the bursts, the tone (`playground/stimulus.js`). Each one is encoded as a float32 wav
+once, written into the module's file system and loaded with `bwa_load_sound`, and one ordinary
+source plays it with `loop = true`. A stimulus change is one `bwa_source_play`, which the engine
+ramps click free over its first block. Your own clip goes the same way: the picker under the
+stimulus menu decodes it with the browser, folds it to mono and loads it.
+
+It used to feed a push source from a 20 ms timer on the main thread with 100 ms queued ahead of
+the audio clock, and that was wrong in both directions. A stall longer than the queue was a hole
+in the sound, which is what "the click train becomes inaudible for short periods" was (reported
+2026-09-22; headless Chrome on a fast desktop collected 31 to 37 stream starves in one ordinary
+check run before anyone stalled anything on purpose). And the queue was also the switch latency: a
+menu change waited for the old signal to drain.
+
+Both numbers moved. A stimulus switch is heard after 6 to 16 ms, where the feed took 97 to 170. A
+deliberate 400 ms main-thread stall now produces zero starves, where the feed produced 45 to 59. The health table keeps
+one row for it, `stream starves`, and it stays at zero because nothing on the page feeds the
+engine any more. If you hear a dropout now, it is the audio thread, and the `late blocks` row is
+where it shows. `run-playground.mjs` asserts both halves: the switch bound, and the stall making
+no starve while the audio thread renders straight through it.
 
 ### The layout upload
 
@@ -324,9 +375,6 @@ number - and the engine is the authority for the rest: a file it refuses is repo
 afterwards, so what is drawn is what the engine loaded. The schema carries no per-speaker
 orientation, so the cones keep aiming at the array's nominal listening point.
 
-The stimulus feed is a latency budget rather than a full ring: about 100 ms queued ahead of the
-audio clock. The push ring holds 1.37 s and filling it meant a stimulus change waited for the old
-one to drain.
 
 ### The coordinate seam
 
@@ -384,8 +432,8 @@ It has three states and says which one it is in.
 | in session | stereo through the headset, the menu as a panel in the room, and the head tracking |
 
 The Enter VR click is also the user gesture that lets the page resume its `AudioContext`, so the
-engine starts there. `rig.js` is the playground's, unchanged: the worklet sink, the push source,
-the stimulus, and `BWA_PROFILE_CAVE_SIM` by default with `BWA_PROFILE_BINAURAL` in the picker.
+engine starts there. `rig.js` is the playground's, unchanged: the worklet sink, the source, the
+looped stimuli, and `BWA_PROFILE_CAVE_SIM` by default with `BWA_PROFILE_BINAURAL` in the picker.
 
 ### The coordinate seam, again, and the other half of it
 
@@ -561,9 +609,11 @@ bus channels read back from `bwa_get_speakers`, and the Start panel is gone with
 its place; a source at room `+x` draws on the left of the screen AND is louder in the left ear,
 measured by rendering the page's own click through a second engine on the manual sink
 (`playground/probe.js`); the speaker cones and both meter strips MOVE while the default click train
-plays; a stimulus change reaches the output inside 150 ms; the channel walk lights the channel it
+plays; a stimulus change reaches the output inside 60 ms; the channel walk lights the channel it
 drove and nothing else within 20 dB; a wall across the line of sight drops the occlusion factor and
-moving it away restores it; a figure-of-eight source nulls at 90 degrees; the profile rebuild lands
+moving it away restores it; a figure-of-eight source nulls at 90 degrees; a 400 ms main-thread
+stall makes no stream starve and the output still carries the stimulus afterwards; the profile
+rebuild lands
 back on the worklet sink, keeps `device_lost` at 0 and still puts a `+x` source in the left ear of
 the LIVE output, in both directions; and an uploaded layout rebuilds the array, reads back through
 `bwa_get_speakers` with the position it was given, while a layout the engine refuses is reported and

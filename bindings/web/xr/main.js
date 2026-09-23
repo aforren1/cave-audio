@@ -9,7 +9,8 @@
  * turn, because there is nothing to turn.
  *
  * THE AUDIO IS THE PLAYGROUND'S, unchanged. `playground/rig.js` owns the engine, the worklet
- * sink, the push source and the stimulus; `playground/scenes/` owns the scenes; `playground/
+ * sink, the source and the looped stimuli (the engine loops them itself, so this page's frame
+ * loop carries no audio work at all); `playground/scenes/` owns the scenes; `playground/
  * world.js` owns every gizmo. This page adds the XR seam, the session, the controllers and a menu
  * that works at arm's length, and nothing else. Anything that looks like it belongs to the demo
  * rather than to XR should be imported, not rewritten.
@@ -221,7 +222,6 @@ function step(nowMs, frame, runtime) {
   }
   app.world.render();
 
-  app.rig.feed();
   if (nowMs - app.slowT > 250) {
     app.slowT = nowMs;
     app.panel?.refresh();          /* a scene's own state moves under the menu; repaint at 4 Hz */
@@ -300,7 +300,6 @@ async function startEngine() {
   app.running = true;
   await selectScene(SCENES[0].id);
   requestAnimationFrame((t) => step(t, null, null));
-  setInterval(() => app.rig.feed(), 20);     /* the ring's own pacing, not the frame rate */
   /* FASTER THAN A BLOCK, because bwa_get_bus_levels publishes the last BLOCK's peak and anything
    * slower reads one block in N. playground/rig.js carries the measurement behind the number. */
   if (typeof app.rig.meterTick === "function") {

@@ -8,7 +8,7 @@
  * the device is wrong. On the rig you walk the room and point at the speaker you hear. Here the
  * CAVE_SIM decode puts that one virtual speaker on your headphones, at its surveyed direction.
  *
- * The push source is muted while this scene runs, because the point is one channel at a time.
+ * The stimulus source is muted while this scene runs, because the point is one channel at a time.
  */
 const KINDS = ["sine", "noise"];
 

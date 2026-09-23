@@ -379,6 +379,10 @@ Two answers, and the second is better:
   and push the float samples in through the existing push-source feed. No new ABI, and it handles
   the formats a page actually gets served.
 
+A third answer beat both and is what shipped: write the wav into the module's own file system and
+let `bwa_load_sound` open it there. See [Where the audio comes from](#where-the-audio-comes-from)
+below, which records what the push feed cost when it was the default.
+
 Disk streaming (`src/core/stream.c`) has no direct equivalent. The nearest shape is a JS-side
 fetch that feeds a push source, which moves the refill cadence out of the engine.
 
@@ -474,24 +478,45 @@ which is what the playground's check measures the rebuild with.
 
 ### Where the audio comes from
 
-The second of the two options this note weighed, and it needed no ABI: decode in JavaScript with
-`AudioContext.decodeAudioData` and feed the float samples to a **push source**. The demo page does
-exactly that, and falls back to a synthesized tone when no file is supplied so the page works with
-no asset served. A memory-buffer asset entry point is still not in the engine and is still not
-needed for this path.
+Both of the two options this note weighed are built, and the one it ranked second turned out to be
+the fallback rather than the default.
 
-Pace the feed on the ring's own space (`bwa_source_push_space`), not on the animation frame: a
+**A loaded sound, through MEMFS.** The third option, which nothing above predicted because the file
+system work had not happened yet: write a wav into the module's own file system with
+`engine.writeFile` and load it with `bwa_load_sound`. No memory-buffer entry point, no ABI change,
+and the engine owns the samples, so it loops them sample accurately and the page is out of the
+audio path. The playground does this with every stimulus it plays (`playground/wav.js` wraps a
+`Float32Array` in a 44-byte header) and with a clip the visitor drops on it, decoded by
+`decodeAudioData` and folded to mono first.
+
+**A push source**, for audio a page makes or receives as it goes. `example/index.html` is that
+demo, and it falls back to a synthesized click when no file is supplied so the page works with no
+asset served.
+
+The push feed was the playground's default until 2026-09-22 and it was the wrong one, for a reason
+worth keeping: a push feed puts the PAGE in the audio path, and a page's main thread stalls. A
+garbage collection, a window drag, a heavy frame on a weak GPU, a tab losing focus. Any stall
+longer than what is queued ahead is a hole in the sound. It was reported by ear ("the click train
+becomes inaudible for short periods"), and the engine had been counting it all along as a stream
+starve: 31 to 37 in one ordinary headless check run, and 45 to 59 more from a single deliberate
+400 ms stall. Loading the same stimuli instead took both to zero, and took a stimulus switch from
+97 to 170 ms down to 6 to 16 ms, because the queue was also the switch latency.
+
+So the rule is the shape of the audio, not the platform: a buffer you have in full before it starts
+belongs to the engine, and a push source is for the stream you do not have yet. If you do push,
+pace the feed on the ring's own space (`bwa_source_push_space`), not on the animation frame: a
 background tab gets fewer frames and the audio thread does not slow down with it. Pace it, do not
 FILL it: the ring holds 65536 frames, which is 1.37 s of audio that has to play before anything new
-can be heard. The playground queues about 100 ms.
+can be heard.
 
 ### Files the engine opens
 
 `bwa_desc.layout_path` and `bwa_desc.hrtf_path` are paths, opened with an ordinary `fopen` inside
 `bwa_create`. The module exports `FS`, so the only file system those paths can name is the module's
 own MEMFS, and the binding writes into it: `create({ files })` for the two paths create itself
-opens, `engine.writeFile(path, bytes)` for anything later. The playground's layout upload is the
-first user. Audio still goes the other way, through a push source.
+opens, `engine.writeFile(path, bytes)` for anything later. The playground's layout upload was the
+first user; its stimuli are the second, and they are why audio no longer has to go the other way
+through a push source.
 
 ### Build and test
 
@@ -791,9 +816,12 @@ In order, and the first three are no longer on this list because they are built.
    wasm phonon is built with exceptions off. The likely fix is `-fwasm-exceptions` on both halves,
    which is a phonon rebuild and was not tried. Until it is, a web host must not pass a
    user-supplied file as `bwa_desc.hrtf_path`.
-6. **A memory-buffer asset entry point**, or the decision that the push feed is the answer. The
-   binding took the push feed, so this is now a question about streaming and about
-   `bwa_load_sound`, not about whether a page can play a wav.
+6. ~~A memory-buffer asset entry point, or the decision that the push feed is the answer.~~
+   **Answered**, 2026-09-22, and by neither of those: a page writes a wav into MEMFS and calls
+   `bwa_load_sound`, so the engine owns the samples and loops them itself. The push feed stays for
+   audio a page generates or receives as it goes. What is genuinely left here is STREAMING: a
+   sound too long to sit in the module's heap has no answer, because `bwa_load_sound_streaming`
+   reads a real file system as it plays.
 7. ~~A way to put a file in the wasm file system.~~ **Built**, 2026-09-22: `FS` is in
    `EXPORTED_RUNTIME_METHODS`, the binding writes through it (`create({ files })` and
    `engine.writeFile`), and the playground uploads a `cave_layout.json` with it. It cost one link

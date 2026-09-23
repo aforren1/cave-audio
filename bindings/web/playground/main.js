@@ -7,11 +7,9 @@
  * makes a visual frame coherent at the mixer (invariant 6), and it is the reason a scene never
  * calls `pushFrame` itself.
  *
- * THE FEED IS NOT ON THIS LOOP. `rig.feed()` paces on the push ring's own space, not on the
- * animation frame, because a background tab gets fewer frames and the audio thread does not slow
- * down with it. It is kicked from here and from an interval, and it is re-entrancy guarded. What
- * it does NOT do is fill the ring: the queue is a latency budget (rig.js's QUEUE_MS), because
- * everything already queued has to play before a stimulus change can be heard.
+ * THERE IS NO AUDIO ON THIS LOOP, and that is deliberate. Every stimulus is a loaded sound the
+ * engine loops by itself (rig.js), so a slow frame, a garbage collection or a tab losing focus
+ * cannot make a hole in the sound. The loop only moves things and draws.
  *
  * THE METERS ARE NOT ON THIS LOOP EITHER, and for the opposite reason: `bwa_get_bus_levels` is the
  * LAST BLOCK's peak, a block is 5.3 ms, and an animation frame is three of them. Sampling on the
@@ -25,7 +23,6 @@
 import { Profile } from "../dist/index.js";
 import { Rig } from "./rig.js";
 import { World } from "./world.js";
-import { SIGNALS } from "./stimulus.js";
 import { renderControls, renderReadout } from "./ui.js";
 import { screenSideOf } from "./frame.js";
 import { SCENES } from "./scenes/index.js";
@@ -128,9 +125,10 @@ function profileName(p) {
  * Everything the page has to redo after `rig.rebuild` - a profile switch or a layout load.
  *
  * A rebuild is a NEW ENGINE and a new AudioContext, so every handle the page was holding is stale:
- * the push source's, the speaker positions, the scene's per-source knobs, and the master gain,
- * which is engine state and comes back at 1. Doing it in one place is what keeps the two callers
- * (the profile picker and the layout upload) from drifting apart.
+ * the source's, the loaded stimuli's (the rig reloads them), the speaker positions, the scene's
+ * per-source knobs, and the master gain, which is engine state and comes back at 1. Doing it in
+ * one place is what keeps the two callers (the profile picker and the layout upload) from
+ * drifting apart.
  */
 function afterRebuild() {
   app.ctx.srcHandle = app.rig.src.handle;
@@ -189,9 +187,17 @@ function drawControls() {
         }]
       : []),
     {
-      kind: "select", label: "stimulus", options: SIGNALS.map((s) => s.name),
+      kind: "select", label: "stimulus", options: app.rig.stimulusNames(),
       get: () => app.rig.signal,
       set: (v) => app.rig.setSignal(v),
+      hint: "Each one is a wav the engine loaded and loops itself, so a switch is one " +
+            "bwa_source_play and is heard inside a block.",
+    },
+    {
+      kind: "file", label: "your own clip (wav, flac, mp3)", accept: "audio/*", binary: true,
+      set: (bytes, name) => loadClip(bytes, name),
+      hint: "Decoded by the browser, folded to mono, and loaded as an engine asset the same way " +
+            "the built-in stimuli are.",
     },
     {
       kind: "slider", label: "master gain", min: 0, max: 1.5, step: 0.01,
@@ -280,6 +286,29 @@ async function loadLayout(text, name) {
   return true;
 }
 
+/**
+ * Load a clip the visitor picked and make it the stimulus.
+ *
+ * The browser decodes it (`decodeAudioData` takes wav, flac, mp3 and whatever else it ships), the
+ * rig folds it to mono, writes it as a wav into the module's file system and loads it with
+ * `bwa_load_sound` - the same route every built-in stimulus takes. Nothing about it is streamed
+ * from the page, so a clip an hour long is a bad idea for a different reason (it lives in the
+ * module's heap) and not because the page has to keep up with it.
+ * @param {ArrayBuffer} bytes
+ * @param {string} name
+ */
+async function loadClip(bytes, name) {
+  try {
+    const got = await app.rig.setUpload(bytes, name);
+    log(`stimulus -> ${name}: ${got.frames} frames at ${got.rate} Hz, loaded and looping`);
+  } catch (e) {
+    log(`could not use "${name}": ${e.message}`, true);
+    return false;
+  }
+  drawControls();
+  return true;
+}
+
 /* ------------------------------------------------------------------ the frame loop */
 
 function frame(now) {
@@ -305,7 +334,6 @@ function frame(now) {
   app.scene?.draw?.(app.ctx);
   app.world.render();
 
-  app.rig.feed();
   drawMeters();
   if (now - app.slowT > 120) {
     app.slowT = now;
@@ -342,13 +370,20 @@ function drawMeters() {
     l: Math.max(out.l, (app.outHold?.l ?? 0) * 0.86),      /* a gentle fall, so a click is seen */
     r: Math.max(out.r, (app.outHold?.r ?? 0) * 0.86),
   };
+  /* The bus strip FALLS the way the output strips and the cones do, and for the same reason: the
+   * click is a 2 ms burst in every 250 ms, so its peak is in about one animation frame in fifteen
+   * and an instantaneous strip reads silent between them. It read silent while the cones beside it
+   * were lit, which is the meter contradicting itself in front of you. */
   const { channel, peak } = app.rig.loudestChannel();
-  el("meterFill").style.width = meterWidth(peak);
+  const fell = (app.busHold ?? 0) * 0.86;
+  if (channel >= 0 && peak >= fell) app.busHoldCh = channel;   /* the channel the reading belongs to */
+  app.busHold = Math.max(peak, fell);
+  el("meterFill").style.width = meterWidth(app.busHold);
   el("outL").style.width = meterWidth(app.outHold.l);
   el("outR").style.width = meterWidth(app.outHold.r);
-  const bus = channel < 0 || peak <= 1e-6
+  const bus = app.busHold <= 1e-6 || app.busHoldCh === undefined
     ? "bus silent"
-    : `bus ch ${channel} at ${(20 * Math.log10(peak)).toFixed(1)} dBFS`;
+    : `bus ch ${app.busHoldCh} at ${(20 * Math.log10(app.busHold)).toFixed(1)} dBFS`;
   const ears = `out L ${dbText(app.outHold.l)} R ${dbText(app.outHold.r)}`;
   el("meterText").textContent = app.rig.profile === Profile.BINAURAL
     ? `${bus} - binaural renders point voices straight to the ears, so only the diffuse field ` +
@@ -375,7 +410,10 @@ function healthRows() {
     ["device lost (host-paced)", h.deviceLost],
     ["active voices", app.rig.activeVoices],
     ["AudioContext", app.rig.ctx?.state ?? "-"],
-    ["queued ahead", `${((app.rig.queued ?? 0) / i.sampleRate * 1000).toFixed(0)} ms`],
+    /* Zero, and it stays zero: nothing on this page feeds the engine. The row is here because a
+     * non-zero value would mean an asset ran dry, which after the push feed went away can only be
+     * a streamed sound - and there are none. */
+    ["stream starves", h.streamStarves],
   ];
 }
 
@@ -428,7 +466,6 @@ async function start() {
     app.running = true;
     await selectScene(SCENES[0].id);
     requestAnimationFrame(frame);
-    setInterval(() => app.rig.feed(), 20);   /* the ring's own pacing, not the frame rate */
     /* FASTER THAN A BLOCK (5.3 ms at 48 kHz / 256), because bwa_get_bus_levels publishes the last
      * BLOCK's peak and anything slower reads one block in N and misses the rest - which is how a
      * plainly audible click train read as "silent". rig.meterTick() holds the peak between reads. */
@@ -483,10 +520,15 @@ globalThis.__bwaPlayground = {
       status: el("status").hidden ? null : el("status").textContent,
     },
     layout: { name: app.rig.layoutName, speakers: Array.from(app.rig.speakers.slice(0, app.rig.speakerCount * 3)) },
-    queuedFrames: app.rig.queued ?? 0,
+    stimulus: app.rig.signal,
+    stimuli: app.rig.stimulusNames(),
   }),
-  /** The stimulus picker, by index into stimulus.js's SIGNALS. */
-  setSignal(i) { app.rig.setSignal(i); },
+  /** The stimulus picker, by index into rig.stimulusNames(). Resolves once the switch is issued. */
+  setSignal(i) { return app.rig.setSignal(i); },
+  /** Any engine call by ABI name, the way a scene's ctx.set reaches it; for a check that needs a knob no control owns. */
+  invoke(name, ...args) { return app.rig.engine.invoke(name, ...args); },
+  /** Load a clip the way the audio file input does. Takes the file's bytes, as that input hands them over. */
+  loadClip(bytes, name) { return loadClip(bytes, name); },
   /** Upload a layout the way the file input does. `null` goes back to the default grid. */
   loadLayout(text, name) { return loadLayout(text, name); },
   /** Switch the page's render profile, which rebuilds the engine. Same path the picker takes. */

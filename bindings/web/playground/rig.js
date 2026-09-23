@@ -1,11 +1,28 @@
 /**
- * rig.js - the audio half: one engine, one push source, the feed, and the two meters.
+ * rig.js - the audio half: one engine, one source, the looped stimuli, and the two meters.
  *
- * WHY A PUSH SOURCE AND NOT AN ASSET. There is no synchronous file system in a browser, so
- * `bwa_load_sound` has nothing to open unless a file is already in the wasm file system. The route
- * the binding recommends is the one here: make or decode the samples in JavaScript and feed a PUSH
- * source, which is the engine's one inbound exception and a source feed rather than a render path.
- * (A LAYOUT is the other half of that story and goes the other way - see `setLayout` below.)
+ * THE PAGE IS NOT IN THE AUDIO PATH, and that is the whole shape of this file.
+ *
+ * It used to be. Every stimulus was fed to a PUSH source from a 20 ms timer on the page's main
+ * thread, holding about 100 ms of audio ahead of the audio clock, because the binding's advice for
+ * "a browser has no synchronous file system" was to decode in JavaScript and push. A main thread
+ * stalls, though: a garbage collection, a window drag, a heavy three.js frame on a weak GPU, a tab
+ * losing focus. Any stall longer than the queue is a HOLE IN THE SOUND, and the engine counts each
+ * one as a push-ring starve. Reported as "the click train becomes inaudible for short periods"
+ * (2026-09-22), and headless Chrome on a fast desktop collected 31 to 37 starves in one ordinary
+ * check run before anyone stalled anything deliberately - and 45 to 59 more from one 400 ms stall.
+ *
+ * Every stimulus here is a FIXED BUFFER (see stimulus.js), and the engine loops a sound
+ * sample-accurately with no help from anybody. So each one is encoded once as a float32 wav
+ * (wav.js), written into the module's own file system with `engine.writeFile`, and loaded with
+ * `bwa_load_sound`; one ordinary source then plays it with `loop = true`. A stimulus change is one
+ * `bwa_source_play`, which the engine ramps click-free inside a block, so the switch is heard at
+ * once rather than after a queue drains. Nothing the page does afterwards can make a gap: the page
+ * can stop running altogether and the sound goes on.
+ *
+ * The push source is still the right answer for audio the page GENERATES or STREAMS as it goes
+ * (bindings/web/example/index.html is that demo, and the README documents it). It is the wrong
+ * answer for a loop that is known in full before it starts.
  *
  * WHY CAVE_SIM IS THE DEFAULT PROFILE. The playground is the CAVE, auditioned. In
  * `BWA_PROFILE_CAVE_SIM` every point source pans through the real DBAP/SPCAP/VBAP solve into the
@@ -14,9 +31,6 @@
  * one. `BWA_PROFILE_BINAURAL` is offered beside it because it is the other thing the engine does:
  * point voices bypass the panner entirely and get their own HRTF convolution. Switching between
  * them is a CREATE-time change, so it rebuilds the engine.
- *
- * THE FEED IS PACED ON THE RING, not on the animation frame: a background tab gets fewer frames
- * and the audio thread does not slow down with it. But it is also BOUNDED - see QUEUE_MS.
  *
  * TWO METERS, because the two profiles put the audio in different places.
  *   `busPeaks` is `bwa_get_bus_levels`: the 26 array channels, which is what the speaker cones
@@ -28,33 +42,26 @@
  */
 import { BwaEngine, Profile } from "../dist/index.js";
 import { SIGNALS } from "./stimulus.js";
-
-/** Frames per push. One push is one call into the engine, so this is a granularity, not a depth. */
-const CHUNK = 1024;
-
-/**
- * How far AHEAD of the audio clock the push ring may run, in milliseconds.
- *
- * The ring holds 65536 frames (1.37 s at 48 kHz) and filling it is easy, which is exactly what
- * makes it wrong: everything already queued has to play before anything new does, so a stimulus
- * change took a second to be heard. The queue is a LATENCY BUDGET, not a buffer to fill. 100 ms is
- * about 19 engine blocks: far more than the 16 ms an animation frame costs, enough to ride out a
- * rAF that slows down, and short enough that a menu change is heard as soon as you let go.
- */
-const QUEUE_MS = 100;
+import { encodeWavFloat32, foldToMono } from "./wav.js";
 
 const ZERO_PROBE = () => ({ l: 0, r: 0, msL: 0, msR: 0, n: 0 });
 
 /** Where an uploaded layout lands in the module's file system. MEMFS, so it dies with the module. */
 export const LAYOUT_PATH = "/cave_layout.json";
 
+/** Where the stimulus wavs land, in the same file system. They die with the module too. */
+const STIM_DIR = "/stim";
+/** The index the uploaded clip takes in the picker: after every built-in signal. */
+const UPLOAD_INDEX = SIGNALS.length;
+
 export class Rig {
   constructor() {
     this.engine = null;
     this.ctx = null;
     this.src = null;
-    this.pcm = null;
-    this.readPos = 0;
+    this.sounds = [];                         /* one bwa_sound per SIGNALS entry, loaded at open */
+    this.upload = null;                       /* {name, pcm, rate} an uploaded clip, kept across rebuilds */
+    this.uploadSound = 0;
     this.signal = 0;
     this.profile = Profile.CAVE_SIM;
     this.channelCount = 0;
@@ -69,8 +76,6 @@ export class Rig {
     this.layoutBytes = null;                  /* the uploaded layout, kept across rebuilds */
     this.layoutName = null;
     this.module = null;                       /* the wasm module, reused by every rebuild */
-    this._chunk = new Float32Array(CHUNK);
-    this._busy = false;
     this._pollBusy = false;
     this._meterBusy = false;
     this._tap = null;
@@ -110,11 +115,10 @@ export class Rig {
        * the context, because only the page may create or resume one. */
     });
     this.module = this.engine.module;
-    this.src = await this.engine.createPushSource();
+    /* An ORDINARY source, not a push source: the engine owns the samples and the loop. */
+    this.src = await this.engine.createSource();
     await this.src.setGain(0.9);
-    /* The empty ring IS its capacity, and the ABI has no other way to ask. The feed budget below
-     * is expressed as queued frames, which is capacity minus space. */
-    this.ringCap = await this.src.space();
+    await this._loadStimuli();
     await this.engine.start();
 
     this.channelCount = this.engine.info.channelCount;
@@ -122,7 +126,7 @@ export class Rig {
     this.speakers = got.out[0];
     this.speakerCount = got.value;
 
-    this.setSignal(this.signal);
+    await this.setSignal(this.signal);
     this.busPeaks.fill(0);
     this.lastPeaks.fill(0);
     this.outLevels = { l: 0, r: 0 };
@@ -179,49 +183,89 @@ export class Rig {
     return this.rebuild({ layoutBytes: bytes });
   }
 
-  /** Swap the looped stimulus. Index into `stimulus.js`'s SIGNALS. */
-  setSignal(i) {
-    this.signal = i;
-    this.pcm = SIGNALS[i].make(this.engine.info.sampleRate);
-    this.readPos = 0;
+  /* ---------------------------------------------------------------- the stimuli, as assets */
+
+  /**
+   * Encode every stimulus as a wav, write it where the engine can open it, and load it.
+   *
+   * Once per engine, so a REBUILD reloads them: the sounds belong to the engine that loaded them
+   * and a new engine knows nothing of the old handles. The FILES are once per module, because a
+   * rebuild reuses the module and MEMFS goes with it - hence the rate check rather than a boolean,
+   * since the only thing that could invalidate them is a new AudioContext at another rate.
+   *
+   * The wavs are at the ENGINE's rate, which is the AudioContext's, so the loader's resampler has
+   * nothing to do.
+   */
+  async _loadStimuli() {
+    const rate = this.engine.info.sampleRate;
+    const write = this._stimRate !== rate;
+    this.sounds = [];
+    for (const sig of SIGNALS) {
+      const path = `${STIM_DIR}/${sig.id}.wav`;
+      if (write) await this.engine.writeFile(path, encodeWavFloat32(sig.make(rate), rate));
+      const snd = await this.engine.invoke("load_sound", path);
+      if (!snd) throw new Error(`the engine could not load the "${sig.name}" stimulus (${path})`);
+      this.sounds.push(snd);
+    }
+    this._stimRate = rate;
+    this.uploadSound = 0;
+    if (this.upload) await this._loadUpload();
   }
 
-  /** Frames already queued ahead of the audio clock, and the most we allow. */
-  queueBudget() {
-    return Math.round((this.engine.info.sampleRate * QUEUE_MS) / 1000);
+  /** The uploaded clip, through the same route. Its own path, so a reload replaces the file. */
+  async _loadUpload() {
+    const path = `${STIM_DIR}/upload.wav`;
+    await this.engine.writeFile(path, encodeWavFloat32(this.upload.pcm, this.upload.rate));
+    const snd = await this.engine.invoke("load_sound", path);
+    if (!snd) throw new Error(`the engine could not load "${this.upload.name}"`);
+    const old = this.uploadSound;
+    this.uploadSound = snd;
+    /* Unload AFTER the replacement is in hand, and after the switch below has played it: an
+     * unload is retire-acked internally, so it is safe on a sound that is still sounding, but a
+     * gap between the two would be an audible hole for no reason. */
+    if (old && old !== snd) {
+      if (this.signal === UPLOAD_INDEX) await this.setSignal(UPLOAD_INDEX);
+      await this.engine.invoke("unload_sound", old);
+    }
   }
 
   /**
-   * Top the push ring up to the latency budget. Re-entrant-safe: an overlapping call returns at
-   * once rather than interleaving two writers into one SPSC ring.
+   * Decode an uploaded file with the browser's own decoder, fold it to mono, and make it the
+   * stimulus. It survives a rebuild the way an uploaded layout does.
+   * @param {ArrayBuffer} bytes the file as it came off the input
+   * @param {string} name for the picker
    */
-  async feed() {
-    if (this._busy || !this.src || !this.pcm) return;
-    this._busy = true;
-    try {
-      const budget = this.queueBudget();
-      let queued = this.ringCap - (await this.src.space());
-      this.queued = queued;
-      let guard = 8;                     /* a cap, so nothing here can stall the frame */
-      while (queued + CHUNK <= budget && guard-- > 0) {
-        const c = this._chunk;
-        for (let i = 0; i < CHUNK; ++i) {
-          c[i] = this.pcm[this.readPos];
-          this.readPos = (this.readPos + 1) % this.pcm.length;
-        }
-        const took = await this.src.push(c);
-        queued += took;
-        this.queued = queued;
-        if (took < CHUNK) break;         /* the ring said no: nothing to gain by asking again */
-      }
-    } catch (e) {
-      /* Usually a destroy racing the frame loop, and the loop stops on its own. Kept rather than
-       * swallowed, because a feed that fails for any other reason is silence with no symptom. */
-      this.feedError = String(e && e.message ? e.message : e);
-      this.feedErrors = (this.feedErrors || 0) + 1;
-    } finally {
-      this._busy = false;
-    }
+  async setUpload(bytes, name) {
+    const buf = await this.ctx.decodeAudioData(bytes);
+    this.upload = { name, pcm: foldToMono(buf), rate: Math.round(buf.sampleRate) };
+    await this._loadUpload();
+    /* _loadUpload already switched if the upload slot was the one playing; a second play here
+     * would only restart the clip it just started. */
+    if (this.signal !== UPLOAD_INDEX) await this.setSignal(UPLOAD_INDEX);
+    return { frames: this.upload.pcm.length, rate: this.upload.rate };
+  }
+
+  /** The picker's labels: the built-in signals, and the uploaded clip when there is one. */
+  stimulusNames() {
+    const names = SIGNALS.map((s) => s.name);
+    if (this.upload) names.push(`uploaded: ${this.upload.name}`);
+    return names;
+  }
+
+  /**
+   * Swap the looped stimulus. Index into `stimulusNames()`.
+   *
+   * ONE `bwa_source_play`, looping. A play on an already-playing source restarts it from frame 0
+   * with a one-block gain ramp, so the switch is click-free and lands inside a block - there is no
+   * queue of old audio to drain first, which is what a 100 ms feed budget was buying at the price
+   * of a 100 ms hole whenever the page stalled for longer.
+   */
+  async setSignal(i) {
+    const snd = i === UPLOAD_INDEX ? this.uploadSound : this.sounds[i];
+    if (!snd) return;
+    this.signal = i;
+    if (!this.engine || !this.src) return;
+    await this.src.play(snd, true);
   }
 
   /**

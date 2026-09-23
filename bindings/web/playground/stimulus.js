@@ -1,5 +1,6 @@
 /**
- * stimulus.js - the signals the playground's push source is fed from.
+ * stimulus.js - the signals the playground loops. Each one is a fixed buffer, one period long,
+ * which the rig encodes as a wav and hands to the engine to loop (rig.js says why).
  *
  * `click()` is THE minimal-example stimulus, character for character the same function
  * bindings/web/example/index.html carries and the one docs/integration.md's "The minimal example"
@@ -101,10 +102,16 @@ export function tone(rate, hz = 1000) {
   return out;
 }
 
-/** The picker's table: label, and the builder that fills the ring. */
+/**
+ * The picker's table: a label, a file-name stem, and the builder.
+ *
+ * `id` is the stem of the wav the rig writes into the module's file system (`/stim/<id>.wav`) and
+ * loads with `bwa_load_sound`, because every one of these is a FIXED buffer and the engine loops a
+ * loaded sound by itself. See rig.js: the page is deliberately not in the audio path.
+ */
 export const SIGNALS = [
-  { name: "click train (default)", make: click },
-  { name: "pink bursts", make: bursts },
-  { name: "pink noise", make: pink },
-  { name: "1 kHz tone (ambiguous)", make: (r) => tone(r, 1000) },
+  { id: "click", name: "click train (default)", make: click },
+  { id: "bursts", name: "pink bursts", make: bursts },
+  { id: "pink", name: "pink noise", make: pink },
+  { id: "tone1k", name: "1 kHz tone (ambiguous)", make: (r) => tone(r, 1000) },
 ];

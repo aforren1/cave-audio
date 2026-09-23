@@ -14,7 +14,6 @@
  * the same thing where a reader will look for it.
  */
 import { Profile } from "../dist/index.js";
-import { SIGNALS } from "../playground/stimulus.js";
 import { SCENES } from "../playground/scenes/index.js";
 
 /** The lead a headset starts with. docs/web.md and the XR section of the README explain it. */
@@ -47,7 +46,7 @@ export function buildOptions(app) {
       hint: "A create-time choice, so switching rebuilds the engine. Your AudioContext survives it.",
     },
     {
-      kind: "select", label: "stimulus", options: SIGNALS.map((s) => s.name),
+      kind: "select", label: "stimulus", options: app.rig.stimulusNames(),
       get: () => app.rig.signal,
       set: (v) => { app.rig.setSignal(v); re(); },
     },
